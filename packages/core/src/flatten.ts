@@ -41,14 +41,31 @@ function recurseCubic(
   depth: number,
   out: number[],
 ): void {
-  // Distance of control points from the chord (x0,y0)->(x3,y3).
+  if (depth >= MAX_DEPTH) {
+    return; // flat enough; caller pushes the endpoint
+  }
   const dx = x3 - x0;
   const dy = y3 - y0;
-  const d1 = Math.abs((x1 - x3) * dy - (y1 - y3) * dx);
-  const d2 = Math.abs((x2 - x3) * dy - (y2 - y3) * dx);
   const chordSq = dx * dx + dy * dy;
-  if (depth >= MAX_DEPTH || (d1 + d2) * (d1 + d2) <= tolSq * chordSq) {
-    return; // flat enough; caller pushes the endpoint
+  const DEGENERATE = 1e-12;
+  if (chordSq > DEGENERATE) {
+    // Non-degenerate chord: deviation of control points from the chord line.
+    const d1 = Math.abs((x1 - x3) * dy - (y1 - y3) * dx);
+    const d2 = Math.abs((x2 - x3) * dy - (y2 - y3) * dx);
+    if ((d1 + d2) * (d1 + d2) <= tolSq * chordSq) {
+      return; // flat enough; caller pushes the endpoint
+    }
+  } else {
+    // Degenerate chord (coincident endpoints, e.g. a loop): the chord-line test
+    // is meaningless, so measure how far the control points stray from the start.
+    const e1x = x1 - x0;
+    const e1y = y1 - y0;
+    const e2x = x2 - x0;
+    const e2y = y2 - y0;
+    const spreadSq = Math.max(e1x * e1x + e1y * e1y, e2x * e2x + e2y * e2y);
+    if (spreadSq <= tolSq) {
+      return; // control points hug the start point; treat as flat
+    }
   }
   // de Casteljau subdivision at t=0.5
   const x01 = (x0 + x1) / 2;
@@ -104,9 +121,15 @@ export function flattenArc(
   } else if (counterclockwise && delta > 0) {
     delta -= Math.PI * 2;
   }
-  // Max angular step that keeps sagitta within tolerance: 2*acos(1 - tol/r).
-  const ratio = r > 0 ? Math.max(0, 1 - tolerance / r) : 0;
-  const maxStep = 2 * Math.acos(Math.min(1, ratio)) || Math.PI / 8;
+  // Largest angular step whose chord stays within `tolerance` of the arc:
+  // step = 2*acos(1 - tolerance/r). Handle the degenerate ends explicitly.
+  const ratio = r > 0 ? 1 - tolerance / r : -1;
+  const maxStep =
+    ratio <= 0
+      ? Math.PI / 2 // tolerance >= r (or r<=0): coarse but valid
+      : ratio >= 1
+        ? Math.PI / 32 // tolerance ~0: maximum (finite) refinement
+        : 2 * Math.acos(ratio);
   const steps = Math.max(1, Math.ceil(Math.abs(delta) / maxStep));
   for (let i = 1; i <= steps; i++) {
     const a = startAngle + (delta * i) / steps;
