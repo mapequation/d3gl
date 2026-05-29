@@ -19,7 +19,7 @@ describe("tessellateFill", () => {
   it("treats a polygon with a hole as outer ring + hole ring", () => {
     const outer: Subpath = { points: [0, 0, 10, 0, 10, 10, 0, 10], closed: true };
     const hole: Subpath = { points: [3, 3, 7, 3, 7, 7, 3, 7], closed: true };
-    // Holes are signalled by winding; tessellateFill takes (outer, holes[]).
+    // Holes are signalled to earcut via holeIndices; tessellateFill takes (outer, holes[]).
     const { indices } = tessellateFill([outer], [[hole]]);
     // A square-with-square-hole triangulates into 8 triangles = 24 indices.
     expect(indices.length).toBe(24);
