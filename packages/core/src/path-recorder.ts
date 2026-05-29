@@ -83,12 +83,14 @@ export class PathRecorder implements PathContext {
     this.cy = this.current!.points[len - 1]!;
   }
 
-  arcTo(x1: number, y1: number, x2: number, y2: number, radius: number): void {
-    // Minimal arcTo: approximate by a line to the tangent corner. d3 generators
-    // rarely emit arcTo; full tangent-arc support is deferred until a consumer needs it.
-    this.lineTo(x1, y1);
-    this.lineTo(x2, y2);
-    void radius;
+  arcTo(_x1: number, _y1: number, _x2: number, _y2: number, _radius: number): void {
+    // arcTo draws a tangent arc between two segments — NOT a polyline through the
+    // control points. A naive line approximation would silently diverge from the
+    // CanvasContext backend (which forwards to the real Canvas arcTo), so rather
+    // than record geometry that is subtly wrong, we fail fast. d3's path-emitting
+    // generators do not use arcTo; implement a real tangent-arc flattening when a
+    // consumer actually needs it.
+    throw new Error("PathRecorder.arcTo is not implemented yet");
   }
 
   rect(x: number, y: number, w: number, h: number): void {

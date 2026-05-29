@@ -60,4 +60,10 @@ describe("PathRecorder", () => {
     expect(sp.closed).toBe(true);
     expect(sp.points).toEqual([0, 0, 10, 0, 10, 20, 0, 20]);
   });
+
+  it("throws on arcTo rather than recording subtly wrong geometry", () => {
+    const r = new PathRecorder();
+    r.moveTo(0, 0);
+    expect(() => r.arcTo(10, 0, 10, 10, 5)).toThrow(/not implemented/);
+  });
 });

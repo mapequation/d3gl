@@ -36,6 +36,9 @@ importers:
       '@types/earcut':
         specifier: ^2.1.4
         version: 2.1.4
+      '@types/geojson':
+        specifier: ^7946.0.14
+        version: 7946.0.16
       d3-geo:
         specifier: ^3.1.1
         version: 3.1.1
