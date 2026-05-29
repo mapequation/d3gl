@@ -1,0 +1,16 @@
+{
+  "name": "@d3gl/core",
+  "version": "0.0.0",
+  "type": "module",
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "scripts": {
+    "build": "tsc -b"
+  },
+  "dependencies": {
+    "earcut": "^3.0.0"
+  },
+  "devDependencies": {
+    "@types/earcut": "^2.1.4"
+  }
+}
