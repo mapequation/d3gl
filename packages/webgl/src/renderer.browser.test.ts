@@ -124,3 +124,65 @@ describe("GroupRenderer fill", () => {
     device.destroy();
   });
 });
+
+describe("GroupRenderer stroke + transform", () => {
+  it("renders stroke geometry in the stroke color", async () => {
+    const { device, framebuffer } = await setup();
+    const scene = new Scene();
+    // a centered box with a thick border; fill transparent (default), stroke green
+    scene.group("cells", (g) => {
+      g.drawable("box", (ctx) => ctx.rect(16, 16, 32, 32), { lineWidth: 8 });
+    });
+    scene.setStroke("cells", "box", "#00ff00");
+    const renderer = new GroupRenderer(device, scene.buffers("cells"));
+    renderer.setTransform(clipFromView({ k: 1, x: 0, y: 0 }, W, H));
+
+    const pass = device.beginRenderPass({ framebuffer, clearColor: [0, 0, 0, 1] });
+    renderer.render(pass);
+    pass.end();
+    device.submit();
+
+    // a pixel on the top edge of the box (pixel-y≈16, readback y≈H-16) should be green stroke
+    const edge = pixel(device, framebuffer, 32, H - 16);
+    expect(edge[1]).toBeGreaterThan(150);
+    // the box center should be clear (fill is transparent default)
+    const center = pixel(device, framebuffer, 32, H - 32);
+    expect(center[1]).toBeLessThan(80);
+
+    renderer.destroy();
+    framebuffer.destroy();
+    device.destroy();
+  });
+
+  it("moves geometry by changing only the transform uniform", async () => {
+    const { device, framebuffer } = await setup();
+    const scene = new Scene();
+    // a small square in the top-left pixel region [0,16]x[0,16]
+    scene.group("cells", (g) => g.drawable("s", (ctx) => ctx.rect(0, 0, 16, 16)));
+    scene.setFill("cells", "s", "#ff0000");
+    const renderer = new GroupRenderer(device, scene.buffers("cells"));
+
+    const draw = () => {
+      const pass = device.beginRenderPass({ framebuffer, clearColor: [0, 0, 0, 1] });
+      renderer.render(pass);
+      pass.end();
+      device.submit();
+    };
+
+    // Identity: square occupies top-left pixels (readback y is bottom-up).
+    renderer.setTransform(clipFromView({ k: 1, x: 0, y: 0 }, W, H));
+    draw();
+    expect(pixel(device, framebuffer, 8, H - 8)[0]).toBeGreaterThan(200); // present top-left
+    expect(pixel(device, framebuffer, 40, H - 8)[0]).toBeLessThan(40); // absent to the right
+
+    // Pan right by 32px: square should now be at x≈32..48 (only transform changed).
+    renderer.setTransform(clipFromView({ k: 1, x: 32, y: 0 }, W, H));
+    draw();
+    expect(pixel(device, framebuffer, 8, H - 8)[0]).toBeLessThan(40); // gone from top-left
+    expect(pixel(device, framebuffer, 40, H - 8)[0]).toBeGreaterThan(200); // moved right
+
+    renderer.destroy();
+    framebuffer.destroy();
+    device.destroy();
+  });
+});
