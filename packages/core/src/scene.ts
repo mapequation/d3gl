@@ -185,16 +185,23 @@ export class Scene {
   }
 }
 
-/** Parse a CSS color string into RGBA bytes and write it at drawableId. */
+/** Clamp to a 0–255 byte (CSS clamps out-of-range channels; Uint8Array would wrap). */
+function toByte(v: number): number {
+  return Math.max(0, Math.min(255, Math.round(v)));
+}
+
+/**
+ * Parse a CSS color string into RGBA bytes and write it at drawableId.
+ *
+ * An unparseable color yields NaN channels from d3-color; we fail fast rather
+ * than silently render opaque black, which would mask a typo'd color string.
+ */
 function writeColor(table: number[], drawableId: number, color: string): void {
   const c = rgb(color);
-  const r = Number.isNaN(c.r) ? 0 : Math.round(c.r);
-  const g = Number.isNaN(c.g) ? 0 : Math.round(c.g);
-  const b = Number.isNaN(c.b) ? 0 : Math.round(c.b);
-  const a = Math.round((Number.isNaN(c.opacity) ? 1 : c.opacity) * 255);
+  if (Number.isNaN(c.r)) throw new Error(`invalid color: ${color}`);
   const off = drawableId * 4;
-  table[off] = r;
-  table[off + 1] = g;
-  table[off + 2] = b;
-  table[off + 3] = a;
+  table[off] = toByte(c.r);
+  table[off + 1] = toByte(c.g);
+  table[off + 2] = toByte(c.b);
+  table[off + 3] = toByte((Number.isNaN(c.opacity) ? 1 : c.opacity) * 255);
 }

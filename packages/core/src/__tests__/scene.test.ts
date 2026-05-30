@@ -171,4 +171,16 @@ describe("Scene color & flag tables", () => {
     const scene = twoCells();
     expect(() => scene.setFill("cells", "zzz", "#fff")).toThrow(/unknown drawable/i);
   });
+
+  it("throws on an unparseable color rather than silently rendering black", () => {
+    const scene = twoCells();
+    expect(() => scene.setFill("cells", "a", "not-a-color")).toThrow(/invalid color/i);
+  });
+
+  it("clamps out-of-range numeric channels to 0..255 (no Uint8 wrap)", () => {
+    const scene = twoCells();
+    scene.setFill("cells", "a", "rgb(300, -5, 128)");
+    const buf = scene.buffers("cells");
+    expect(Array.from(buf.fillColors.slice(0, 4))).toEqual([255, 0, 128, 255]);
+  });
 });
