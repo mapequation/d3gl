@@ -51,12 +51,13 @@ describe("performance budget", () => {
     }
     const recolorMs = (performance.now() - t1) / cycles;
 
-    console.log(`[perf] buildMs=${buildMs.toFixed(1)} recolorMs=${recolorMs.toFixed(1)}`);
-
-    // A recolor cycle must be cheap. If recolor secretly re-tessellated, it would
-    // cost ~buildMs each; assert it is well under that (generous tripwire), and
-    // under a generous absolute ceiling to catch gross regressions.
-    expect(recolorMs).toBeLessThan(Math.max(buildMs, 50));
+    // A recolor cycle must be MUCH cheaper than a geometry build. If recolor
+    // secretly re-tessellated it would cost ~buildMs each, so require it to stay
+    // under a fraction of buildMs — this enforces the recolor-<<-build invariant
+    // even on fast hardware (where buildMs itself is small). The small absolute
+    // floor (5ms) only absorbs timer noise; it never lets recolor approach build.
+    expect(recolorMs).toBeLessThan(Math.max(buildMs * 0.25, 5));
+    // Gross-regression ceiling regardless of build cost.
     expect(recolorMs).toBeLessThan(250);
 
     // Correctness: the final recolor actually took effect.

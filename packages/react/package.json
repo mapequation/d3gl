@@ -8,9 +8,7 @@
   "dependencies": {
     "@d3gl/core": "workspace:*",
     "@d3gl/webgl": "workspace:*",
-    "@d3gl/geo": "workspace:*",
     "@luma.gl/core": "^9.3.3",
-    "@luma.gl/engine": "^9.3.3",
     "@luma.gl/webgl": "^9.3.3"
   },
   "peerDependencies": { "react": "^19", "react-dom": "^19" },

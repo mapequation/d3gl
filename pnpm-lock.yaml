@@ -106,18 +106,12 @@ importers:
       '@d3gl/core':
         specifier: workspace:*
         version: link:../core
-      '@d3gl/geo':
-        specifier: workspace:*
-        version: link:../geo
       '@d3gl/webgl':
         specifier: workspace:*
         version: link:../webgl
       '@luma.gl/core':
         specifier: ^9.3.3
         version: 9.3.3
-      '@luma.gl/engine':
-        specifier: ^9.3.3
-        version: 9.3.3(@luma.gl/core@9.3.3)(@luma.gl/shadertools@9.3.3(@luma.gl/core@9.3.3))
       '@luma.gl/webgl':
         specifier: ^9.3.3
         version: 9.3.3(@luma.gl/core@9.3.3)
