@@ -9,3 +9,5 @@ export {
 } from "./palette.js";
 export type { PaletteDimensions } from "./palette.js";
 export { GroupRenderer } from "./renderer.js";
+export { pickAt } from "./pick.js";
+export { toPNG } from "./png.js";
