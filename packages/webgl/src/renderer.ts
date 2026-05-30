@@ -106,10 +106,14 @@ export class GroupRenderer {
       bindings,
       uniforms,
       topology: "triangle-list" as const,
+      // For indexed draws luma derives the draw count from the index buffer; this
+      // is the index count and is accepted but redundant.
       vertexCount: indices.length,
     };
 
     const fillModel = new Model(device, { ...common, vs: FILL_VS, fs: FILL_FS });
+    // pickModel shares geometry/bindings/uniforms with fillModel; it is drawn only
+    // by renderPick() (GPU color-picking, added in a later task).
     const pickModel = new Model(device, { ...common, vs: FILL_VS, fs: PICK_FS });
     return { positionBuffer, idBuffer, indexBuffer, colorTexture, flagsTexture, fillModel, pickModel, uniforms };
   }
