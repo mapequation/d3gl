@@ -1,2 +1,2 @@
-// @d3gl/webgl - WebGL2 rendering via luma.gl v9
-export {};
+export { clipFromView } from "./transform.js";
+export type { ViewTransform } from "./transform.js";
