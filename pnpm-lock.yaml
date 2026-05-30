@@ -78,6 +78,9 @@ importers:
 
   packages/webgl:
     dependencies:
+      '@d3gl/core':
+        specifier: workspace:*
+        version: link:../core
       '@luma.gl/core':
         specifier: ^9.3.3
         version: 9.3.3

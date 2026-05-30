@@ -9,6 +9,7 @@
     "test": "vitest run --config vitest.config.ts"
   },
   "dependencies": {
+    "@d3gl/core": "workspace:*",
     "@luma.gl/core": "^9.3.3",
     "@luma.gl/engine": "^9.3.3",
     "@luma.gl/webgl": "^9.3.3"

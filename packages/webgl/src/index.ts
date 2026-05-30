@@ -8,3 +8,4 @@ export {
   decodePickColor,
 } from "./palette.js";
 export type { PaletteDimensions } from "./palette.js";
+export { GroupRenderer } from "./renderer.js";
