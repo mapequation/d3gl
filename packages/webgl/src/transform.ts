@@ -16,14 +16,12 @@ export interface ViewTransform {
  * Composed (cx,cy,1) = M (px,py,1), so pan/zoom is a single uniform update and
  * the GPU never re-projects geometry.
  */
-export function clipFromView(t: ViewTransform, width: number, height: number): Float64Array {
+export function clipFromView(t: ViewTransform, width: number, height: number): Float32Array {
   const sx = (2 * t.k) / width;
   const sy = (-2 * t.k) / height;
   const tx = (2 * t.x) / width - 1;
   const ty = 1 - (2 * t.y) / height;
-  // column-major layout: [col0row0, col0row1, col0row2, col1row0, ...]
-  // Float64 preserves exact arithmetic (e.g. 2/width * width = 2) so callers
-  // can use strict equality on boundary values. luma.gl accepts both typed
-  // array flavours for mat3 uniforms.
-  return new Float64Array([sx, 0, 0, 0, sy, 0, tx, ty, 1]);
+  // column-major: [col0, col1, col2]. Float32 is the GPU's mat3 type and matches
+  // the renderer's transform signature; callers should compare with tolerance.
+  return new Float32Array([sx, 0, 0, 0, sy, 0, tx, ty, 1]);
 }
