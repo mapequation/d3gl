@@ -4,6 +4,7 @@ import { webgl2Adapter } from "@luma.gl/webgl";
 import { Scene } from "@d3gl/core";
 import { GroupRenderer } from "./renderer.js";
 import { clipFromView } from "./transform.js";
+import { decodePickColor } from "./palette.js";
 
 const W = 64;
 const H = 64;
@@ -180,6 +181,53 @@ describe("GroupRenderer stroke + transform", () => {
     draw();
     expect(pixel(device, framebuffer, 8, H - 8)[0]).toBeLessThan(40); // gone from top-left
     expect(pixel(device, framebuffer, 40, H - 8)[0]).toBeGreaterThan(200); // moved right
+
+    renderer.destroy();
+    framebuffer.destroy();
+    device.destroy();
+  });
+});
+
+describe("GroupRenderer picking", () => {
+  it("encodes drawableId per pixel and decodes back to the right drawable", async () => {
+    const { device, framebuffer } = await setup();
+    const scene = twoHalves();
+    scene.setFill("cells", "a", "#ff0000");
+    scene.setFill("cells", "b", "#0000ff");
+    const renderer = new GroupRenderer(device, scene.buffers("cells"));
+    renderer.setTransform(clipFromView({ k: 1, x: 0, y: 0 }, W, H));
+
+    const pass = device.beginRenderPass({ framebuffer, clearColor: [0, 0, 0, 1] });
+    renderer.renderPick(pass);
+    pass.end();
+    device.submit();
+
+    const a = pixel(device, framebuffer, 16, 32);
+    const b = pixel(device, framebuffer, 48, 32);
+    expect(decodePickColor(a[0]!, a[1]!, a[2]!)).toBe(0); // drawable "a" -> id 0
+    expect(decodePickColor(b[0]!, b[1]!, b[2]!)).toBe(1); // drawable "b" -> id 1
+
+    renderer.destroy();
+    framebuffer.destroy();
+    device.destroy();
+  });
+
+  it("decodes the cleared background to -1 (no drawable)", async () => {
+    const { device, framebuffer } = await setup();
+    const scene = new Scene();
+    scene.group("cells", (g) => g.drawable("s", (ctx) => ctx.rect(0, 0, 8, 8)));
+    scene.setFill("cells", "s", "#ff0000");
+    const renderer = new GroupRenderer(device, scene.buffers("cells"));
+    renderer.setTransform(clipFromView({ k: 1, x: 0, y: 0 }, W, H));
+
+    const pass = device.beginRenderPass({ framebuffer, clearColor: [0, 0, 0, 1] });
+    renderer.renderPick(pass);
+    pass.end();
+    device.submit();
+
+    // far corner is empty
+    const empty = pixel(device, framebuffer, 60, 4);
+    expect(decodePickColor(empty[0]!, empty[1]!, empty[2]!)).toBe(-1);
 
     renderer.destroy();
     framebuffer.destroy();

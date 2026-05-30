@@ -163,6 +163,15 @@ export class GroupRenderer {
     if (this.stroke) this.stroke.fillModel.draw(renderPass);
   }
 
+  /**
+   * Draw the fill geometry with each drawable's id encoded as an RGB color, for
+   * GPU color-picking. Render this into a dedicated offscreen pass, then read the
+   * pixel under the cursor and decode it with decodePickColor().
+   */
+  renderPick(renderPass: RenderPass): void {
+    if (this.fill) this.fill.pickModel.draw(renderPass);
+  }
+
   destroy(): void {
     for (const pass of this.passes()) {
       pass.positionBuffer.destroy();
