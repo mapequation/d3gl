@@ -19,8 +19,9 @@ void main() {
   ivec2 cs = textureSize(u_colorTable, 0);
   v_color = texelFetch(u_colorTable, ivec2(id % cs.x, id / cs.x), 0);
   ivec2 fsz = textureSize(u_flags, 0);
-  float vis = texelFetch(u_flags, ivec2(id % fsz.x, id / fsz.x), 0).r;
-  if (vis <= 0.0) {
+  // r8 byte -> integer; visibility is bit 0 (matches @d3gl/core flag semantics).
+  int flags = int(texelFetch(u_flags, ivec2(id % fsz.x, id / fsz.x), 0).r * 255.0 + 0.5);
+  if ((flags & 1) == 0) {
     gl_Position = vec4(2.0, 2.0, 2.0, 1.0); // outside clip space -> culled
     return;
   }

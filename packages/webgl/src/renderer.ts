@@ -18,6 +18,8 @@ interface Pass {
   pickModel: Model;
   /** Shared uniforms object — mutated in-place by setTransform so the next draw picks it up. */
   uniforms: Record<string, unknown>;
+  /** Drawable count at build time; updateColors must be called with the same count. */
+  drawableCount: number;
 }
 
 /**
@@ -115,7 +117,7 @@ export class GroupRenderer {
     // pickModel shares geometry/bindings/uniforms with fillModel; it is drawn only
     // by renderPick() (GPU color-picking, added in a later task).
     const pickModel = new Model(device, { ...common, vs: FILL_VS, fs: PICK_FS });
-    return { positionBuffer, idBuffer, indexBuffer, colorTexture, flagsTexture, fillModel, pickModel, uniforms };
+    return { positionBuffer, idBuffer, indexBuffer, colorTexture, flagsTexture, fillModel, pickModel, uniforms, drawableCount: count };
   }
 
   private passes(): Pass[] {
@@ -126,6 +128,10 @@ export class GroupRenderer {
    * Re-upload the color and flag tables from fresh buffers. Touches only the
    * palette/flags textures — geometry buffers are untouched, so this is the cheap
    * recolor / show-hide hot path.
+   *
+   * Precondition: the drawable set is unchanged (same count) — this is recolor /
+   * show-hide, not a geometry change. Adding or removing drawables requires a new
+   * GroupRenderer. A count mismatch throws rather than silently corrupting.
    */
   updateColors(buffers: GroupBuffers): void {
     if (this.fill) this.writeTables(this.fill, buffers.fillColors, buffers.flags);
@@ -133,7 +139,14 @@ export class GroupRenderer {
   }
 
   private writeTables(pass: Pass, colors: Uint8Array, flags: Uint8Array): void {
-    const dims = paletteDimensions(colors.length / 4);
+    const count = colors.length / 4;
+    if (count !== pass.drawableCount) {
+      throw new Error(
+        `updateColors drawable count ${count} != ${pass.drawableCount} at build time; ` +
+          `create a new GroupRenderer for a changed drawable set`,
+      );
+    }
+    const dims = paletteDimensions(count);
     pass.colorTexture.writeData(padPalette(colors, dims), {
       x: 0,
       y: 0,
