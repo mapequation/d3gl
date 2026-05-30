@@ -4,13 +4,28 @@ import { tessellateFill } from "./tessellate.js";
 import { expandStroke } from "./stroke.js";
 import { rgb } from "d3-color";
 
-/** Contiguous slice a drawable occupies within a group's shared buffers. */
+/**
+ * Contiguous slice a drawable occupies within a group's shared buffers.
+ *
+ * A drawable may legitimately have an empty fill or stroke (e.g. an open polyline
+ * has no fill): in that case `vertexCount`/`indexCount` are 0 and `*Offset` is the
+ * cursor at the time of registration. Consumers must treat `indexCount === 0` as
+ * "nothing to draw" and skip it — never issue a draw over `[offset, offset)`.
+ */
 export interface DrawableRange {
   fill: { vertexOffset: number; vertexCount: number; indexOffset: number; indexCount: number };
   stroke: { vertexOffset: number; vertexCount: number; indexOffset: number; indexCount: number };
 }
 
-/** GPU-ready typed arrays for one group. Vertices are [x, y, drawableId]. */
+/**
+ * GPU-ready typed arrays for one group. Vertices are [x, y, drawableId].
+ *
+ * `drawableId` is stored as a Float32 component and indexes the per-drawable
+ * side-tables (`fillColors`/`strokeColors`/`flags`). Float32 represents integers
+ * exactly only up to 2^24 (~16.7M), which caps the number of drawables per group;
+ * far above realistic use, but the shader's integer cast of this component would
+ * silently break past that ceiling.
+ */
 export interface GroupBuffers {
   fillVertices: Float32Array;
   fillIndices: Uint32Array;
