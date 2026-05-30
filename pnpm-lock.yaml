@@ -95,6 +95,12 @@ importers:
         specifier: ^7946.0.14
         version: 7946.0.16
 
+  packages/labels:
+    dependencies:
+      '@d3gl/webgl':
+        specifier: workspace:*
+        version: link:../webgl
+
   packages/svg:
     dependencies:
       '@d3gl/core':
