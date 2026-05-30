@@ -68,4 +68,59 @@ describe("GroupRenderer fill", () => {
     framebuffer.destroy();
     device.destroy();
   });
+
+  it("recolors via a texture update without recreating geometry", async () => {
+    const { device, framebuffer } = await setup();
+    const scene = twoHalves();
+    scene.setFill("cells", "a", "#ff0000");
+    scene.setFill("cells", "b", "#0000ff");
+    const renderer = new GroupRenderer(device, scene.buffers("cells"));
+    renderer.setTransform(clipFromView({ k: 1, x: 0, y: 0 }, W, H));
+
+    const draw = () => {
+      const pass = device.beginRenderPass({ framebuffer, clearColor: [0, 0, 0, 1] });
+      renderer.render(pass);
+      pass.end();
+      device.submit();
+    };
+    draw();
+    expect(pixel(device, framebuffer, 16, 32)[0]).toBeGreaterThan(200); // a is red
+
+    // Recolor a -> green and push only the color table.
+    scene.setFill("cells", "a", "#00ff00");
+    renderer.updateColors(scene.buffers("cells"));
+    draw();
+    const a = pixel(device, framebuffer, 16, 32);
+    expect(a[1]).toBeGreaterThan(200); // now green
+    expect(a[0]).toBeLessThan(40);
+
+    renderer.destroy();
+    framebuffer.destroy();
+    device.destroy();
+  });
+
+  it("hides a drawable when its visible flag is cleared", async () => {
+    const { device, framebuffer } = await setup();
+    const scene = twoHalves();
+    scene.setFill("cells", "a", "#ff0000");
+    scene.setFill("cells", "b", "#0000ff");
+    const renderer = new GroupRenderer(device, scene.buffers("cells"));
+    renderer.setTransform(clipFromView({ k: 1, x: 0, y: 0 }, W, H));
+
+    scene.setFlag("cells", "a", 0); // hide a
+    renderer.updateColors(scene.buffers("cells"));
+
+    const pass = device.beginRenderPass({ framebuffer, clearColor: [0, 0, 0, 1] });
+    renderer.render(pass);
+    pass.end();
+    device.submit();
+
+    const a = pixel(device, framebuffer, 16, 32);
+    expect(a[0]).toBeLessThan(40); // a's region shows the clear color, not red
+    expect(pixel(device, framebuffer, 48, 32)[2]).toBeGreaterThan(200); // b still blue
+
+    renderer.destroy();
+    framebuffer.destroy();
+    device.destroy();
+  });
 });

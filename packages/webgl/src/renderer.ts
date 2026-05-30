@@ -122,6 +122,32 @@ export class GroupRenderer {
     return [this.fill, this.stroke].filter((p): p is Pass => p !== null);
   }
 
+  /**
+   * Re-upload the color and flag tables from fresh buffers. Touches only the
+   * palette/flags textures — geometry buffers are untouched, so this is the cheap
+   * recolor / show-hide hot path.
+   */
+  updateColors(buffers: GroupBuffers): void {
+    if (this.fill) this.writeTables(this.fill, buffers.fillColors, buffers.flags);
+    if (this.stroke) this.writeTables(this.stroke, buffers.strokeColors, buffers.flags);
+  }
+
+  private writeTables(pass: Pass, colors: Uint8Array, flags: Uint8Array): void {
+    const dims = paletteDimensions(colors.length / 4);
+    pass.colorTexture.writeData(padPalette(colors, dims), {
+      x: 0,
+      y: 0,
+      width: dims.width,
+      height: dims.height,
+    });
+    pass.flagsTexture.writeData(padFlags(flags, dims), {
+      x: 0,
+      y: 0,
+      width: dims.width,
+      height: dims.height,
+    });
+  }
+
   /** Set the view transform (column-major mat3) for pan/zoom. */
   setTransform(m: Float32Array): void {
     this.transform = m;
