@@ -5,3 +5,5 @@ export { tessellateFill } from "./tessellate.js";
 export type { FillGeometry } from "./tessellate.js";
 export { signedArea, pointInRing, groupRings } from "./rings.js";
 export type { RingGroup } from "./rings.js";
+export { expandStroke } from "./stroke.js";
+export type { StrokeGeometry } from "./stroke.js";
