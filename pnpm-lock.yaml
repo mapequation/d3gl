@@ -76,6 +76,22 @@ importers:
         specifier: ^3.2.0
         version: 3.2.0
 
+  packages/geo:
+    dependencies:
+      '@d3gl/core':
+        specifier: workspace:*
+        version: link:../core
+      d3-geo:
+        specifier: ^3.1.1
+        version: 3.1.1
+    devDependencies:
+      '@types/d3-geo':
+        specifier: ^3.1.0
+        version: 3.1.0
+      '@types/geojson':
+        specifier: ^7946.0.14
+        version: 7946.0.16
+
   packages/svg:
     dependencies:
       '@d3gl/core':
