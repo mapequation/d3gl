@@ -45,6 +45,16 @@ describe("groupRings", () => {
     expect(groups[0]!.outer.points).toEqual(ccwSquare().points);
   });
 
+  it("assigns two separate interior rings as two holes of the same outer", () => {
+    // big outer 0..30, two disjoint interior holes
+    const outer: Subpath = { points: [0, 0, 30, 0, 30, 30, 0, 30], closed: true };
+    const hole1: Subpath = { points: [3, 3, 3, 9, 9, 9, 9, 3], closed: true };
+    const hole2: Subpath = { points: [20, 20, 20, 26, 26, 26, 26, 20], closed: true };
+    const groups = groupRings([outer, hole1, hole2]);
+    expect(groups).toHaveLength(1);
+    expect(groups[0]!.holes).toHaveLength(2);
+  });
+
   it("keeps two disjoint rings as two separate outers", () => {
     const a = ccwSquare();
     const b: Subpath = { points: [20, 20, 30, 20, 30, 30, 20, 30], closed: true };
