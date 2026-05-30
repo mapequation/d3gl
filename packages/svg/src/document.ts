@@ -10,6 +10,9 @@ export interface SvgPath {
  * Assemble styled paths into a standalone SVG document string. Paths with an
  * empty `d` are skipped. `fill` defaults to "none" when only a stroke is given,
  * otherwise to the provided fill.
+ *
+ * Style strings (`fill`/`stroke`) are interpolated verbatim and are NOT escaped —
+ * pass trusted CSS color values (e.g. d3-scale output), not untrusted input.
  */
 export function svgDocument(width: number, height: number, paths: readonly SvgPath[]): string {
   const body = paths

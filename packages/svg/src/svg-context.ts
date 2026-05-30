@@ -11,11 +11,12 @@ function fmt(n: number): string {
  * vector export: re-run a d3 generator (geoPath, d3-shape, …) into this context
  * and read `toPath()`. Curves map to native C/Q commands; arcs are flattened to
  * line segments (correct geometry; geo export is polygons/lines, so this is rare).
+ *
+ * `tolerance` controls only arc flattening and is independent of a `PathRecorder`'s
+ * tolerance — pass the same value if you need the SVG arc density to match the GPU.
  */
 export class SvgPathContext implements PathContext {
   private d = "";
-  private cx = 0;
-  private cy = 0;
 
   constructor(public tolerance = 0.25) {}
 
@@ -29,26 +30,18 @@ export class SvgPathContext implements PathContext {
 
   moveTo(x: number, y: number): void {
     this.d += `M${fmt(x)},${fmt(y)}`;
-    this.cx = x;
-    this.cy = y;
   }
 
   lineTo(x: number, y: number): void {
     this.d += `L${fmt(x)},${fmt(y)}`;
-    this.cx = x;
-    this.cy = y;
   }
 
   quadraticCurveTo(cpx: number, cpy: number, x: number, y: number): void {
     this.d += `Q${fmt(cpx)},${fmt(cpy)},${fmt(x)},${fmt(y)}`;
-    this.cx = x;
-    this.cy = y;
   }
 
   bezierCurveTo(cp1x: number, cp1y: number, cp2x: number, cp2y: number, x: number, y: number): void {
     this.d += `C${fmt(cp1x)},${fmt(cp1y)},${fmt(cp2x)},${fmt(cp2y)},${fmt(x)},${fmt(y)}`;
-    this.cx = x;
-    this.cy = y;
   }
 
   arc(x: number, y: number, radius: number, startAngle: number, endAngle: number, counterclockwise = false): void {
@@ -69,8 +62,6 @@ export class SvgPathContext implements PathContext {
 
   rect(x: number, y: number, w: number, h: number): void {
     this.d += `M${fmt(x)},${fmt(y)}L${fmt(x + w)},${fmt(y)}L${fmt(x + w)},${fmt(y + h)}L${fmt(x)},${fmt(y + h)}Z`;
-    this.cx = x;
-    this.cy = y;
   }
 
   closePath(): void {
