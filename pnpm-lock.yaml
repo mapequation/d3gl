@@ -81,6 +81,9 @@ importers:
       '@d3gl/core':
         specifier: workspace:*
         version: link:../core
+      '@d3gl/webgl':
+        specifier: workspace:*
+        version: link:../webgl
       d3-geo:
         specifier: ^3.1.1
         version: 3.1.1
