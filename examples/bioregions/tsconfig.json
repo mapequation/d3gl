@@ -3,6 +3,7 @@
   "compilerOptions": {
     "jsx": "react-jsx",
     "noEmit": true,
+    "resolveJsonModule": true,
     "paths": {
       "@d3gl/core": ["../../packages/core/src/index.ts"],
       "@d3gl/geo": ["../../packages/geo/src/index.ts"],

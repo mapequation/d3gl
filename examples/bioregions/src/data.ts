@@ -1,9 +1,16 @@
-import type { Feature, FeatureCollection, Polygon } from "geojson";
+import { geoContains } from "d3-geo";
+import type { GeoProjection } from "d3-geo";
+import type { GroupBuilder } from "@d3gl/core";
+import { feature } from "topojson-client";
+import type { Feature, FeatureCollection, MultiPolygon, Point, Polygon } from "geojson";
+import land110m from "world-atlas/land-110m.json";
 
 /** A synthetic grid cell with a continuous value and a categorical bioregion. */
 export interface Cell {
   id: string;
   geometry: Polygon;
+  /** Cell centroid [lon, lat] — used for the land-clip containment test. */
+  center: [number, number];
   /** Continuous field in [0, 1] (heatmap). */
   value: number;
   /** Categorical bioregion id in 0..7. */
@@ -43,7 +50,13 @@ export function makeCells(): Cell[] {
           ],
         ],
       };
-      cells.push({ id: `${col}-${row}`, geometry, value, bioregion });
+      cells.push({
+        id: `${col}-${row}`,
+        geometry,
+        center: [lon + STEP / 2, lat + STEP / 2],
+        value,
+        bioregion,
+      });
     }
   }
   return cells;
@@ -57,4 +70,88 @@ export function cellsToFeatureCollection(cells: readonly Cell[]): FeatureCollect
     geometry: c.geometry,
   }));
   return { type: "FeatureCollection", features };
+}
+
+/** A GeoJSON object d3-geo can fill that isn't part of the strict GeoJSON spec. */
+export type Sphere = { type: "Sphere" };
+
+/** The land outline (Natural Earth 110m) plus a sphere to fill as ocean. */
+export interface World {
+  sphere: Sphere;
+  land: MultiPolygon;
+}
+
+// Derive the topojson Topology type from feature()'s own signature so we don't
+// take a direct dependency on the (transitive) topojson-specification types.
+type Topology = Parameters<typeof feature>[0];
+
+/**
+ * Convert the bundled world-atlas TopoJSON into a land MultiPolygon and a sphere.
+ * The 110m dataset is already wound for d3-geo's spherical fill, so it renders
+ * its interior (the land), not the complement.
+ */
+export function loadWorld(): World {
+  const topo = land110m as unknown as Topology;
+  const fc = feature(topo, topo.objects.land!) as unknown as FeatureCollection<MultiPolygon>;
+  return { sphere: { type: "Sphere" }, land: fc.features[0]!.geometry };
+}
+
+/** A few well-known cities to show point geometry rendered alongside the grid. */
+export interface City {
+  id: string;
+  name: string;
+  geometry: Point;
+}
+
+export function makeCities(): City[] {
+  const places: [string, number, number][] = [
+    ["London", -0.13, 51.51],
+    ["New York", -74.01, 40.71],
+    ["Tokyo", 139.69, 35.69],
+    ["Sydney", 151.21, -33.87],
+    ["Cape Town", 18.42, -33.92],
+    ["Rio de Janeiro", -43.2, -22.91],
+    ["Nairobi", 36.82, -1.29],
+    ["Mumbai", 72.88, 19.08],
+  ];
+  return places.map(([name, lon, lat]) => ({
+    id: name,
+    name,
+    geometry: { type: "Point", coordinates: [lon, lat] },
+  }));
+}
+
+/**
+ * A Scene.group builder that draws each city as a small filled dot. geoPath emits
+ * a Point as moveTo + arc with no closePath, and the fill pipeline only fills
+ * closed subpaths (that's how it tells area generators from line generators), so
+ * we project each point and trace a closed circle directly via the PathContext.
+ * Radius is in projected pixels at the base zoom (dots scale with zoom).
+ */
+export function cityMarkers(
+  cities: readonly City[],
+  projection: GeoProjection,
+  radius = 4,
+): (g: GroupBuilder) => void {
+  return (g) => {
+    for (const c of cities) {
+      const p = projection(c.geometry.coordinates as [number, number]);
+      if (!p) continue;
+      const [x, y] = p;
+      g.drawable(c.id, (ctx) => {
+        ctx.moveTo(x + radius, y);
+        ctx.arc(x, y, radius, 0, Math.PI * 2);
+        ctx.closePath();
+      });
+    }
+  };
+}
+
+/** Ids of the cells whose centroid falls on land — the set kept when clipping. */
+export function cellsOnLand(cells: readonly Cell[], land: MultiPolygon): Set<string> {
+  const onLand = new Set<string>();
+  for (const c of cells) {
+    if (geoContains(land, c.center)) onLand.add(c.id);
+  }
+  return onLand;
 }
