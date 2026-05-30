@@ -12,6 +12,9 @@
   },
   "devDependencies": {
     "@types/d3-geo": "^3.1.0",
-    "@types/geojson": "^7946.0.14"
+    "@types/geojson": "^7946.0.14",
+    "@luma.gl/core": "^9.3.3",
+    "@luma.gl/engine": "^9.3.3",
+    "@luma.gl/webgl": "^9.3.3"
   }
 }

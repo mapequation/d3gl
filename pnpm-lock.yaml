@@ -158,6 +158,15 @@ importers:
         specifier: ^3.1.1
         version: 3.1.1
     devDependencies:
+      '@luma.gl/core':
+        specifier: ^9.3.3
+        version: 9.3.3
+      '@luma.gl/engine':
+        specifier: ^9.3.3
+        version: 9.3.3(@luma.gl/core@9.3.3)(@luma.gl/shadertools@9.3.3(@luma.gl/core@9.3.3))
+      '@luma.gl/webgl':
+        specifier: ^9.3.3
+        version: 9.3.3(@luma.gl/core@9.3.3)
       '@types/d3-geo':
         specifier: ^3.1.0
         version: 3.1.0
