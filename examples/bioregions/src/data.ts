@@ -28,14 +28,17 @@ export function makeCells(): Cell[] {
       const value = clamp01(0.5 + 0.5 * Math.sin(lonR * 2) * Math.cos(latR * 3));
       const field = (Math.sin(lon / 40) + Math.cos(lat / 30)) * 0.5 + 1; // ~[0,2]
       const bioregion = Math.min(7, Math.max(0, Math.floor((field / 2) * 8)));
+      // Clockwise ring: d3-geo's spherical geoPath fills the small cell interior,
+      // not its complement (the whole sphere minus the cell). A counter-clockwise
+      // ring would project every cell to a giant map-covering polygon.
       const geometry: Polygon = {
         type: "Polygon",
         coordinates: [
           [
             [lon, lat],
-            [lon + STEP, lat],
-            [lon + STEP, lat + STEP],
             [lon, lat + STEP],
+            [lon + STEP, lat + STEP],
+            [lon + STEP, lat],
             [lon, lat],
           ],
         ],
