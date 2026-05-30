@@ -12,6 +12,23 @@ describe("expandStroke", () => {
     expect(vertices).toEqual([0, 1, 0, -1, 10, 1, 10, -1]);
   });
 
+  it("offsets a vertical segment along x (perpendicular sign on the other axis)", () => {
+    const sp: Subpath = { points: [0, 0, 0, 10], closed: false };
+    const { vertices } = expandStroke(sp, 2);
+    // dir (0,1) => normal (-1,0): offsets in x by ∓1
+    expect(vertices).toEqual([-1, 0, 1, 0, -1, 10, 1, 10]);
+  });
+
+  it("skips a zero-length segment and its dead join without corrupting indices", () => {
+    const sp: Subpath = { points: [0, 0, 0, 0, 10, 0], closed: false };
+    const { vertices, indices } = expandStroke(sp, 2);
+    // only the live segment (pt1->pt2) survives; the repeated-point join is skipped
+    expect(indices.length).toBe(6);
+    expect(vertices).toEqual([0, 1, 0, -1, 10, 1, 10, -1]);
+    const vertexCount = vertices.length / 2;
+    for (const i of indices) expect(i).toBeLessThan(vertexCount);
+  });
+
   it("adds a bevel join at an interior corner of an open polyline", () => {
     const sp: Subpath = { points: [0, 0, 10, 0, 10, 10], closed: false };
     const { vertices, indices } = expandStroke(sp, 2);
