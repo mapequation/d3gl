@@ -2,6 +2,7 @@ import { PathRecorder } from "./path-recorder.js";
 import { groupRings } from "./rings.js";
 import { tessellateFill } from "./tessellate.js";
 import { expandStroke } from "./stroke.js";
+import { rgb } from "d3-color";
 
 /** Contiguous slice a drawable occupies within a group's shared buffers. */
 export interface DrawableRange {
@@ -142,6 +143,32 @@ export class Scene {
     return data.ranges[drawableId]!;
   }
 
+  /** Resolve a group + domain id to its drawableId, or throw. */
+  private drawableIdOf(name: string, id: string | number): { data: GroupData; drawableId: number } {
+    const data = this.get(name);
+    const drawableId = data.idToDrawable.get(String(id));
+    if (drawableId === undefined) throw new Error(`unknown drawable: ${String(id)}`);
+    return { data, drawableId };
+  }
+
+  /** Set a drawable's fill color (any CSS color string). Hot-swappable. */
+  setFill(name: string, id: string | number, color: string): void {
+    const { data, drawableId } = this.drawableIdOf(name, id);
+    writeColor(data.fillColors, drawableId, color);
+  }
+
+  /** Set a drawable's stroke color (any CSS color string). Hot-swappable. */
+  setStroke(name: string, id: string | number, color: string): void {
+    const { data, drawableId } = this.drawableIdOf(name, id);
+    writeColor(data.strokeColors, drawableId, color);
+  }
+
+  /** Set a drawable's flag byte (e.g. bit 0 = visible). Hot-swappable. */
+  setFlag(name: string, id: string | number, flags: number): void {
+    const { data, drawableId } = this.drawableIdOf(name, id);
+    data.flags[drawableId] = flags & 0xff;
+  }
+
   /** Assemble GPU-ready typed arrays for a group. */
   buffers(name: string): GroupBuffers {
     const data = this.get(name);
@@ -156,4 +183,18 @@ export class Scene {
       drawableCount: data.ranges.length,
     };
   }
+}
+
+/** Parse a CSS color string into RGBA bytes and write it at drawableId. */
+function writeColor(table: number[], drawableId: number, color: string): void {
+  const c = rgb(color);
+  const r = Number.isNaN(c.r) ? 0 : Math.round(c.r);
+  const g = Number.isNaN(c.g) ? 0 : Math.round(c.g);
+  const b = Number.isNaN(c.b) ? 0 : Math.round(c.b);
+  const a = Math.round((Number.isNaN(c.opacity) ? 1 : c.opacity) * 255);
+  const off = drawableId * 4;
+  table[off] = r;
+  table[off + 1] = g;
+  table[off + 2] = b;
+  table[off + 3] = a;
 }

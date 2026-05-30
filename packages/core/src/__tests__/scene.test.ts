@@ -115,3 +115,60 @@ describe("Scene geometry", () => {
     expect(() => scene.range("cells", "zzz")).toThrow(/unknown drawable/i);
   });
 });
+
+describe("Scene color & flag tables", () => {
+  function twoCells() {
+    const scene = new Scene();
+    scene.group("cells", (g) => {
+      g.drawable("a", (ctx) => ctx.rect(0, 0, 10, 10), { lineWidth: 1 });
+      g.drawable("b", (ctx) => ctx.rect(20, 0, 10, 10), { lineWidth: 1 });
+    });
+    return scene;
+  }
+
+  it("setFill writes RGBA into the fill color table by domain id", () => {
+    const scene = twoCells();
+    scene.setFill("cells", "b", "#ff0000");
+    const buf = scene.buffers("cells");
+    // drawable "b" is drawableId 1 => bytes at offset 4
+    expect(Array.from(buf.fillColors.slice(4, 8))).toEqual([255, 0, 0, 255]);
+    // drawable "a" remains the default transparent
+    expect(Array.from(buf.fillColors.slice(0, 4))).toEqual([0, 0, 0, 0]);
+  });
+
+  it("parses rgb()/named colors and opacity into bytes", () => {
+    const scene = twoCells();
+    scene.setFill("cells", "a", "rgba(0, 128, 255, 0.5)");
+    const buf = scene.buffers("cells");
+    const [r, g, b, a] = Array.from(buf.fillColors.slice(0, 4));
+    expect([r, g, b]).toEqual([0, 128, 255]);
+    expect(a).toBeGreaterThan(120); // ~0.5*255
+    expect(a).toBeLessThan(135);
+  });
+
+  it("setStroke writes the stroke color table without touching geometry", () => {
+    const scene = twoCells();
+    const before = scene.buffers("cells");
+    const fillBefore = Array.from(before.fillVertices);
+    const strokeBefore = Array.from(before.strokeVertices);
+    scene.setStroke("cells", "a", "#00ff00");
+    const after = scene.buffers("cells");
+    expect(Array.from(after.strokeColors.slice(0, 4))).toEqual([0, 255, 0, 255]);
+    // geometry buffers are byte-for-byte unchanged by recolor
+    expect(Array.from(after.fillVertices)).toEqual(fillBefore);
+    expect(Array.from(after.strokeVertices)).toEqual(strokeBefore);
+  });
+
+  it("setFlag toggles the per-drawable flag byte", () => {
+    const scene = twoCells();
+    scene.setFlag("cells", "a", 0); // hide
+    const buf = scene.buffers("cells");
+    expect(buf.flags[0]).toBe(0);
+    expect(buf.flags[1]).toBe(1);
+  });
+
+  it("throws when styling an unknown drawable", () => {
+    const scene = twoCells();
+    expect(() => scene.setFill("cells", "zzz", "#fff")).toThrow(/unknown drawable/i);
+  });
+});
