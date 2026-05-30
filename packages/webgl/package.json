@@ -1,0 +1,16 @@
+{
+  "name": "@d3gl/webgl",
+  "version": "0.0.0",
+  "type": "module",
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "scripts": {
+    "build": "tsc -b",
+    "test": "vitest run --config vitest.config.ts"
+  },
+  "dependencies": {
+    "@luma.gl/core": "^9.3.3",
+    "@luma.gl/engine": "^9.3.3",
+    "@luma.gl/webgl": "^9.3.3"
+  }
+}
