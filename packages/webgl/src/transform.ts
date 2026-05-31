@@ -1,9 +1,5 @@
-/** A d3-zoom-style transform: uniform scale `k` then pixel translation (x, y). */
-export interface ViewTransform {
-  k: number;
-  x: number;
-  y: number;
-}
+import type { ViewTransform } from "@d3gl/core";
+export type { ViewTransform };
 
 /**
  * Build a column-major 3x3 matrix mapping *reference pixel* coordinates
