@@ -1,0 +1,57 @@
+import type { RenderLayer, ViewTransform, DrawableVector } from "@d3gl/core";
+import { SvgPathContext } from "./svg-context.js";
+
+function rgba([r, g, b, a]: readonly [number, number, number, number]): string {
+  return `rgba(${r}, ${g}, ${b}, ${(a / 255).toFixed(4)})`;
+}
+
+function pathD(d: DrawableVector): string {
+  const ctx = new SvgPathContext();
+  for (const s of d.subpaths) {
+    const p = s.points;
+    if (p.length < 2) continue;
+    ctx.moveTo(p[0]!, p[1]!);
+    for (let i = 2; i < p.length; i += 2) ctx.lineTo(p[i]!, p[i + 1]!);
+    if (s.closed) ctx.closePath();
+  }
+  return ctx.toPath();
+}
+
+/** A full SVG document for the given layers under a view transform. */
+export function svgFromLayers(width: number, height: number, layers: readonly RenderLayer[], t: ViewTransform): string {
+  const defs: string[] = [];
+  const groups: string[] = [];
+  for (const layer of layers) {
+    // A clipPath def referencing the named clip layer's silhouette.
+    let clipAttr = "";
+    if (layer.clipTo) {
+      const src = layers.find((l) => l.name === layer.clipTo);
+      if (src) {
+        const id = `clip-${layer.name}`;
+        const paths = src.drawables
+          .filter((d) => (d.flags & 1) !== 0)
+          .map((d) => `<path d="${pathD(d)}" />`)
+          .join("");
+        defs.push(`<clipPath id="${id}">${paths}</clipPath>`);
+        clipAttr = ` clip-path="url(#${id})"`;
+      }
+    }
+    const paths = layer.drawables
+      .filter((d) => (d.flags & 1) !== 0)
+      .map((d) => {
+        const fill = d.fill[3] > 0 ? rgba(d.fill) : "none";
+        const attrs = [`d="${pathD(d)}"`, `fill="${fill}"`];
+        if (d.stroke[3] > 0 && d.lineWidth > 0) {
+          attrs.push(`stroke="${rgba(d.stroke)}"`, `stroke-width="${d.lineWidth}"`);
+        }
+        return `<path ${attrs.join(" ")} />`;
+      })
+      .join("");
+    groups.push(`<g${clipAttr}>${paths}</g>`);
+  }
+  const transform = `translate(${t.x}, ${t.y}) scale(${t.k})`;
+  return (
+    `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}">` +
+    `<defs>${defs.join("")}</defs><g transform="${transform}">${groups.join("")}</g></svg>`
+  );
+}
