@@ -1,0 +1,15 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "jsx": "react-jsx",
+    "noEmit": true,
+    "resolveJsonModule": true,
+    "paths": {
+      "@d3gl/core": ["../../packages/core/src/index.ts"],
+      "@d3gl/map": ["../../packages/map/src/index.ts"],
+      "@d3gl/labels": ["../../packages/labels/src/index.ts"]
+    }
+  },
+  "include": ["src"],
+  "exclude": ["src/layout.test.ts"]
+}
