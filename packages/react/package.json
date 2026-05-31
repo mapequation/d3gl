@@ -7,15 +7,19 @@
   "scripts": { "build": "tsc -b" },
   "dependencies": {
     "@d3gl/core": "workspace:*",
+    "@d3gl/map": "workspace:*",
     "@d3gl/webgl": "workspace:*",
     "@luma.gl/core": "^9.3.3",
-    "@luma.gl/webgl": "^9.3.3"
+    "@luma.gl/webgl": "^9.3.3",
+    "d3-geo": "^3.1.1"
   },
   "peerDependencies": { "react": "^19", "react-dom": "^19" },
   "devDependencies": {
     "react": "^19.2.6",
     "react-dom": "^19.2.6",
     "@types/react": "^19.2.15",
-    "@types/react-dom": "^19.2.3"
+    "@types/react-dom": "^19.2.3",
+    "@types/d3-geo": "^3.1.0",
+    "d3-geo": "^3.1.1"
   }
 }
