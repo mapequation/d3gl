@@ -166,11 +166,29 @@ Wraps the existing `GroupRenderer` (one per layer) and adds stencil clipping:
   the mask. Then draw the clipped layer with stencil compare `equal`, reference `1`, no
   stencil write → only fragments inside the mask survive. Unclipped layers draw with the
   stencil test disabled.
-- Exact luma v9.3 API (Model `parameters` stencil fields, `RenderPass.setStencilReference`,
-  framebuffer stencil format) is confirmed by the **spike (Task 0)**. Fallback if the
-  stencil path is impractical: render the mask to an `r8unorm` texture and `discard` in
-  the clipped layer's fragment shader (reuses existing framebuffer/texture machinery,
-  allows antialiased edges).
+- **Confirmed by the spike** (`packages/webgl/src/stencil-spike.browser.test.ts`). luma
+  v9.3's WebGL backend has quirks that dictate the exact recipe (baked into the test):
+  - Framebuffer needs `depthStencilAttachment: "depth24plus-stencil8"`; the **onscreen**
+    default framebuffer is obtained with a stencil via
+    `canvasContext.getCurrentFramebuffer({ depthStencilFormat: "depth24plus-stencil8" })`.
+  - The render pass clears stencil with `clearStencil: 0`.
+  - luma **hardcodes the stencil reference to 0** in WebGL (ignores
+    `RenderPassParameters.stencilReference`). So the mask is written with
+    `stencilCompare: "equal"` (passes against the cleared 0) + `stencilPassOperation:
+    "increment-clamp"` → stencil becomes 1 under the mask; the clipped layer draws where
+    `stencilCompare: "not-equal"` (≠ 0).
+  - Stencil ops apply **only if all three** (`stencilPassOperation`,
+    `stencilFailOperation`, `stencilDepthFailOperation`) are set; `stencilCompare:
+    "always"` **disables** the stencil test (so unclipped layers use it; a writing mask
+    must use a non-always compare).
+  - The clear writes only the masked stencil bits, so **confine read and write to bit 0**
+    (`stencilReadMask: 0x01`, `stencilWriteMask: 0x01`) or garbage upper bits read as ≠ 0.
+  - `colorMask` as a Model parameter is **not honored**; suppress the mask's own color via
+    the render pass (`pass.setParameters({ colorMask: 0 })` then reset to `0xF`) or use a
+    genuinely-visible clip layer (e.g. land fill) as the mask.
+- Fallback (not needed, kept for reference): render the mask to an `r8unorm` texture and
+  `discard` in the clipped layer's fragment shader — reuses existing framebuffer/texture
+  machinery and allows antialiased edges.
 - `toPNG()` keeps the existing framebuffer readback. `toSVG()` delegates to the SVG
   serializer over the layers' drawables (vector export from the GPU view).
 
