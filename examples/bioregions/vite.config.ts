@@ -15,6 +15,7 @@ export default defineConfig({
       "@d3gl/canvas": pkg("canvas"),
       "@d3gl/webgl": pkg("webgl"),
       "@d3gl/geo": pkg("geo"),
+      "@d3gl/map": pkg("map"),
       "@d3gl/svg": pkg("svg"),
       "@d3gl/labels": pkg("labels"),
     },

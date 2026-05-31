@@ -1,259 +1,121 @@
-import { useEffect, useMemo, useRef, useState } from "react";
-import { geoNaturalEarth1, geoPath } from "d3-geo";
+import React, { useEffect, useMemo, useRef, useState } from "react";
+import { geoNaturalEarth1 } from "d3-geo";
 import { scaleSequential } from "d3-scale";
 import { interpolateViridis, schemeCategory10 } from "d3-scale-chromatic";
-import { select } from "d3-selection";
-import { zoom as d3zoom, type D3ZoomEvent } from "d3-zoom";
-import { Scene } from "@d3gl/core";
-import { fitProjection, featureGroup, type GeoInput } from "@d3gl/geo";
-import { D3GL, type D3GLGroup, type MapController } from "@d3gl/react";
-import { SvgPathContext, svgDocument } from "@d3gl/svg";
-import {
-  makeCells,
-  makeCities,
-  cityMarkers,
-  loadWorld,
-  cellsOnLand,
-  cellsToFeatureCollection,
-  type Cell,
-} from "./data.js";
+import { fitProjection } from "@d3gl/geo";
+import { GeoMap } from "@d3gl/react";
+import type { GeoMap as Engine, HoverHit } from "@d3gl/map";
+import type { GeoInput } from "@d3gl/geo";
+import { makeCells, makeCities, makeGraticule, makeRoute, makeCluster, cellsToFeatureCollection, loadWorld, type Cell } from "./data.js";
 
 const WIDTH = 900;
 const HEIGHT = 450;
-
 const OCEAN = "#0e2238";
 const LAND = "#243042";
+const GRAT = "#2c3b52";
+const ROUTE = "#ffd166";
 const CITY = "#ff5a5a";
 
 type Mode = "heatmap" | "bioregion";
+type BackendType = "webgl" | "canvas" | "svg";
 
 const heat = scaleSequential(interpolateViridis).domain([0, 1]);
-
-function cellColor(cell: Cell, mode: Mode): string {
-  return mode === "heatmap" ? heat(cell.value) : schemeCategory10[cell.bioregion % 10]!;
-}
-
-/** Recolor every cell for the current mode (a texture write, no re-tessellation). */
-function applyColors(scene: Scene, cells: readonly Cell[], mode: Mode): void {
-  for (const c of cells) scene.setFill("cells", c.id, cellColor(c, mode));
-}
-
-/** Show/hide cells: when clipping, only cells whose centroid is on land stay visible. */
-function applyClip(scene: Scene, cells: readonly Cell[], onLand: Set<string>, clip: boolean): void {
-  for (const c of cells) scene.setFlag("cells", c.id, clip && !onLand.has(c.id) ? 0 : 1);
-}
-
-interface Tooltip {
-  left: number;
-  top: number;
-  text: string;
-}
+const cellColor = (c: Cell, mode: Mode) => (mode === "heatmap" ? heat(c.value) : schemeCategory10[c.bioregion % 10]!);
 
 export function App(): React.ReactElement {
+  const [backend, setBackend] = useState<BackendType>("webgl");
   const [mode, setMode] = useState<Mode>("heatmap");
   const [clip, setClip] = useState(false);
-  const [zoom, setZoom] = useState({ k: 1, x: 0, y: 0 });
-  const [tooltip, setTooltip] = useState<Tooltip | null>(null);
+  const [tooltip, setTooltip] = useState<{ left: number; top: number; text: string } | null>(null);
 
-  const controllerRef = useRef<MapController | null>(null);
-  const wrapperRef = useRef<HTMLDivElement>(null);
+  const mapRef = useRef<Engine | null>(null);
+  const modeRef = useRef(mode); modeRef.current = mode;
+  const wrapRef = useRef<HTMLDivElement>(null);
 
-  // Build cells, cities, world, projection and scene once. geoPath projects every
-  // feature ONCE here; afterwards the GPU recolors, shows/hides, and pans/zooms.
-  const { cells, cities, projection, scene, onLand, initialGroups } = useMemo(() => {
+  const { cells, cellById, projection } = useMemo(() => {
     const cells = makeCells();
-    const cities = makeCities();
+    const projection = fitProjection(geoNaturalEarth1(), cellsToFeatureCollection(cells), WIDTH, HEIGHT);
+    const cellById = new Map(cells.map((c) => [c.id, c] as const));
+    return { cells, cellById, projection };
+  }, []);
+
+  const onReady = (map: Engine): void => {
+    mapRef.current = map;
     const world = loadWorld();
-    const projection = fitProjection(
-      geoNaturalEarth1(),
-      cellsToFeatureCollection(cells),
-      WIDTH,
-      HEIGHT,
-    );
-    const onLand = cellsOnLand(cells, world.land);
-
-    const scene = new Scene();
-    // Background: the ocean sphere then the land outline (different GeoJSON object
-    // types — Sphere and MultiPolygon — rendered through the same path pipeline).
-    // Sphere isn't part of the strict GeoJSON union, but d3-geo fills it; cast it.
-    const background: GeoInput[] = [world.sphere as unknown as GeoInput, world.land];
-    scene.group(
-      "background",
-      featureGroup(background, projection, {
-        id: (_geom, i) => (i === 0 ? "ocean" : "land"),
-      }),
-    );
-    scene.setFill("background", "ocean", OCEAN);
-    scene.setFill("background", "land", LAND);
-
-    scene.group(
-      "cells",
-      featureGroup(cells.map((c) => c.geometry), projection, {
-        id: (_geom, i) => cells[i]!.id,
-        lineWidth: 0.25,
-      }),
-    );
-    applyColors(scene, cells, "heatmap");
-
-    // Cities: Point data, projected to small filled dots via a closed-arc builder.
-    scene.group("markers", cityMarkers(cities, projection));
-    for (const c of cities) scene.setFill("markers", c.id, CITY);
-
-    const initialGroups: D3GLGroup[] = [
-      { name: "background", buffers: scene.buffers("background") },
-      { name: "cells", buffers: scene.buffers("cells") },
-      { name: "markers", buffers: scene.buffers("markers") },
-    ];
-    return { cells, cities, projection, scene, onLand, initialGroups };
-  }, []);
-
-  // Recolor (mode) and show/hide (clip) — both are texture writes, no re-tessellation.
-  useEffect(() => {
-    const controller = controllerRef.current;
-    if (!controller) return;
-    applyColors(scene, cells, mode);
-    applyClip(scene, cells, onLand, clip);
-    controller.updateColors("cells", scene.buffers("cells"));
-    controller.render();
-  }, [mode, clip, scene, cells, onLand]);
-
-  // Wire d3-zoom on the wrapper -> transform state (the consumer "zoom glue").
-  useEffect(() => {
-    const el = wrapperRef.current;
-    if (!el) return;
-    const behavior = d3zoom<HTMLDivElement, unknown>()
-      .scaleExtent([1, 50])
-      .on("zoom", (event: D3ZoomEvent<HTMLDivElement, unknown>) => {
-        const t = event.transform;
-        setZoom({ k: t.k, x: t.x, y: t.y });
-      });
-    const selection = select(el);
-    selection.call(behavior);
-    return () => {
-      selection.on(".zoom", null);
-    };
-  }, []);
-
-  const onPointerMove = (e: React.PointerEvent<HTMLDivElement>): void => {
-    const controller = controllerRef.current;
-    const el = wrapperRef.current;
-    if (!controller || !el) return;
-    const rect = el.getBoundingClientRect();
-    const x = e.clientX - rect.left;
-    const y = e.clientY - rect.top;
-    // Prefer a city under the cursor, then fall back to the grid cell.
-    const cityId = controller.pick("markers", x, y);
-    if (cityId >= 0 && cityId < cities.length) {
-      setTooltip({ left: x + 12, top: y + 12, text: `📍 ${cities[cityId]!.name}` });
-      return;
-    }
-    const id = controller.pick("cells", x, y);
-    if (id < 0 || id >= cells.length || (clip && !onLand.has(cells[id]!.id))) {
-      setTooltip(null);
-      return;
-    }
-    const cell = cells[id]!;
-    setTooltip({
-      left: x + 12,
-      top: y + 12,
-      text: `cell ${cell.id} · value ${cell.value.toFixed(3)} · bioregion ${cell.bioregion}`,
+    const cities = makeCities();
+    // Layer order = paint order: ocean, land(clip source), graticule, cells, route, points.
+    map.layer("ocean", [world.sphere as unknown as GeoInput], { fill: OCEAN });
+    map.layer("land", [world.land], { fill: LAND });
+    map.layer("graticule", [makeGraticule()], { stroke: GRAT, lineWidth: 0.5 });
+    map.layer("cells", cells.map((c) => c.geometry), {
+      id: (_g: unknown, i: number) => cells[i]!.id,
+      fill: (_g: unknown, i: number) => cellColor(cells[i]!, modeRef.current),
+      lineWidth: 0.2,
+      stroke: "#0003",
+      clipTo: clip ? "land" : undefined,
     });
+    map.layer("route", [makeRoute()], { stroke: ROUTE, lineWidth: 1.5 });
+    map.layer("cities", cities.map((c) => c.geometry), { id: (_g: unknown, i: number) => cities[i]!.id, fill: CITY, pointRadius: 3.5 });
+    map.layer("cluster", [makeCluster()], { fill: "#4dd0e1", pointRadius: 3 });
+    map.enableZoom([1, 50]);
+    map.render();
+  };
+
+  useEffect(() => { mapRef.current?.recolor("cells"); }, [mode]);
+  useEffect(() => { mapRef.current?.setClip("cells", clip ? "land" : undefined); }, [clip]);
+
+  const onHover = (hit: HoverHit | null, ev: PointerEvent): void => {
+    const el = wrapRef.current;
+    if (!hit || !el) { setTooltip(null); return; }
+    const r = el.getBoundingClientRect();
+    const left = ev.clientX - r.left + 12, top = ev.clientY - r.top + 12;
+    if (hit.layer === "cells") {
+      const c = cellById.get(hit.id as string);
+      if (c) setTooltip({ left, top, text: `cell ${c.id} · value ${c.value.toFixed(3)} · bioregion ${c.bioregion}` });
+    } else if (hit.layer === "cities") {
+      setTooltip({ left, top, text: `📍 ${hit.id}` });
+    } else {
+      setTooltip({ left, top, text: hit.layer });
+    }
   };
 
   const exportPNG = (): void => {
-    const controller = controllerRef.current;
-    if (!controller) return;
-    download(controller.toPNG(), "bioregions.png");
+    try { download(mapRef.current!.toPNG(), "bioregions.png"); }
+    catch { alert("PNG export needs the WebGL or Canvas backend."); }
   };
-
   const exportSVG = (): void => {
-    const path = (geom: Parameters<ReturnType<typeof geoPath>>[0]): string => {
-      const ctx = new SvgPathContext();
-      geoPath(projection, ctx)(geom);
-      return ctx.toPath();
-    };
-    const paths = [
-      { d: path({ type: "Sphere" }), fill: OCEAN, stroke: "none", strokeWidth: 0 },
-      { d: path(loadWorldLand()), fill: LAND, stroke: "none", strokeWidth: 0 },
-      ...cells
-        .filter((cell) => !clip || onLand.has(cell.id))
-        .map((cell) => ({
-          d: path(cell.geometry),
-          fill: cellColor(cell, mode),
-          stroke: "#0003",
-          strokeWidth: 0.25,
-        })),
-      ...cities.map((c) => ({ d: path(c.geometry), fill: CITY, stroke: "none", strokeWidth: 0 })),
-    ];
-    const svg = svgDocument(WIDTH, HEIGHT, paths);
+    const svg = mapRef.current?.toSVG() ?? "";
     download(`data:image/svg+xml;charset=utf-8,${encodeURIComponent(svg)}`, "bioregions.svg");
   };
 
   return (
     <div style={{ padding: 16 }}>
-      <h1 style={{ fontSize: 18, fontWeight: 600 }}>d3gl — bioregions mini</h1>
-      <div style={{ display: "flex", gap: 8, marginBottom: 12 }}>
-        <button onClick={() => setMode("heatmap")} disabled={mode === "heatmap"}>
-          Heatmap
-        </button>
-        <button onClick={() => setMode("bioregion")} disabled={mode === "bioregion"}>
-          Bioregions
-        </button>
+      <h1 style={{ fontSize: 18, fontWeight: 600 }}>d3gl — bioregions ({backend})</h1>
+      <div style={{ display: "flex", gap: 8, marginBottom: 12, flexWrap: "wrap" }}>
+        {(["webgl", "canvas", "svg"] as const).map((b) => (
+          <button key={b} onClick={() => setBackend(b)} disabled={backend === b}>{b}</button>
+        ))}
+        <span style={{ width: 12 }} />
+        <button onClick={() => setMode("heatmap")} disabled={mode === "heatmap"}>Heatmap</button>
+        <button onClick={() => setMode("bioregion")} disabled={mode === "bioregion"}>Bioregions</button>
         <button onClick={() => setClip((c) => !c)}>{clip ? "Unclip" : "Clip to land"}</button>
         <button onClick={exportPNG}>Export PNG</button>
         <button onClick={exportSVG}>Export SVG</button>
-        <span style={{ opacity: 0.6, alignSelf: "center" }}>
-          scroll to zoom, drag to pan · {cells.length} cells
-        </span>
       </div>
-      <div
-        ref={wrapperRef}
-        onPointerMove={onPointerMove}
-        onPointerLeave={() => setTooltip(null)}
-        style={{ position: "relative", width: WIDTH, height: HEIGHT, background: "#111", cursor: "crosshair" }}
-      >
-        <D3GL
-          width={WIDTH}
-          height={HEIGHT}
-          transform={zoom}
-          groups={initialGroups}
-          onReady={(c) => {
-            controllerRef.current = c;
-          }}
-        />
+      <div ref={wrapRef} style={{ position: "relative", width: WIDTH, height: HEIGHT, background: "#111", cursor: "crosshair" }}>
+        <GeoMap width={WIDTH} height={HEIGHT} projection={projection} backend={backend} onReady={onReady} onHover={onHover} />
         {tooltip && (
-          <div
-            style={{
-              position: "absolute",
-              left: tooltip.left,
-              top: tooltip.top,
-              pointerEvents: "none",
-              background: "rgba(0,0,0,0.85)",
-              border: "1px solid #444",
-              borderRadius: 4,
-              padding: "4px 8px",
-              fontSize: 12,
-              whiteSpace: "nowrap",
-            }}
-          >
+          <div style={{ position: "absolute", left: tooltip.left, top: tooltip.top, pointerEvents: "none", background: "rgba(0,0,0,0.85)", border: "1px solid #444", borderRadius: 4, padding: "4px 8px", fontSize: 12, whiteSpace: "nowrap" }}>
             {tooltip.text}
           </div>
         )}
       </div>
+      <p style={{ opacity: 0.6, fontSize: 12 }}>{cells.length} cells · scroll to zoom, drag to pan · switch backend above (SVG is slower at scale)</p>
     </div>
   );
 }
 
-// loadWorld() reparses the topology; cache the land geometry for SVG export.
-let _land: ReturnType<typeof loadWorld>["land"] | null = null;
-function loadWorldLand(): ReturnType<typeof loadWorld>["land"] {
-  if (!_land) _land = loadWorld().land;
-  return _land;
-}
-
 function download(href: string, filename: string): void {
   const a = document.createElement("a");
-  a.href = href;
-  a.download = filename;
-  a.click();
+  a.href = href; a.download = filename; a.click();
 }

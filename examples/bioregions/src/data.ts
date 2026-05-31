@@ -1,15 +1,13 @@
-import { geoContains } from "d3-geo";
-import type { GeoProjection } from "d3-geo";
-import type { GroupBuilder } from "@d3gl/core";
+import { geoGraticule } from "d3-geo";
+import type { Feature, FeatureCollection, LineString, MultiLineString, MultiPoint, MultiPolygon, Point, Polygon } from "geojson";
 import { feature } from "topojson-client";
-import type { Feature, FeatureCollection, MultiPolygon, Point, Polygon } from "geojson";
 import land110m from "world-atlas/land-110m.json";
 
 /** A synthetic grid cell with a continuous value and a categorical bioregion. */
 export interface Cell {
   id: string;
   geometry: Polygon;
-  /** Cell centroid [lon, lat] — used for the land-clip containment test. */
+  /** Cell centroid [lon, lat]. */
   center: [number, number];
   /** Continuous field in [0, 1] (heatmap). */
   value: number;
@@ -17,13 +15,13 @@ export interface Cell {
   bioregion: number;
 }
 
-const STEP = 4; // degrees
+const STEP = 6; // degrees (coarser for SVG perf)
 
 function clamp01(x: number): number {
   return Math.max(0, Math.min(1, x));
 }
 
-/** Generate a global grid of 4°×4° cells with smooth synthetic fields. */
+/** Generate a global grid of 6°×6° cells with smooth synthetic fields. */
 export function makeCells(): Cell[] {
   const cells: Cell[] = [];
   let col = 0;
@@ -35,9 +33,6 @@ export function makeCells(): Cell[] {
       const value = clamp01(0.5 + 0.5 * Math.sin(lonR * 2) * Math.cos(latR * 3));
       const field = (Math.sin(lon / 40) + Math.cos(lat / 30)) * 0.5 + 1; // ~[0,2]
       const bioregion = Math.min(7, Math.max(0, Math.floor((field / 2) * 8)));
-      // Clockwise ring: d3-geo's spherical geoPath fills the small cell interior,
-      // not its complement (the whole sphere minus the cell). A counter-clockwise
-      // ring would project every cell to a giant map-covering polygon.
       const geometry: Polygon = {
         type: "Polygon",
         coordinates: [
@@ -87,8 +82,6 @@ type Topology = Parameters<typeof feature>[0];
 
 /**
  * Convert the bundled world-atlas TopoJSON into a land MultiPolygon and a sphere.
- * The 110m dataset is already wound for d3-geo's spherical fill, so it renders
- * its interior (the land), not the complement.
  */
 export function loadWorld(): World {
   const topo = land110m as unknown as Topology;
@@ -115,43 +108,29 @@ export function makeCities(): City[] {
     ["Mumbai", 72.88, 19.08],
   ];
   return places.map(([name, lon, lat]) => ({
-    id: name,
-    name,
-    geometry: { type: "Point", coordinates: [lon, lat] },
+    id: name!,
+    name: name!,
+    geometry: { type: "Point", coordinates: [lon!, lat!] },
   }));
 }
 
-/**
- * A Scene.group builder that draws each city as a small filled dot. geoPath emits
- * a Point as moveTo + arc with no closePath, and the fill pipeline only fills
- * closed subpaths (that's how it tells area generators from line generators), so
- * we project each point and trace a closed circle directly via the PathContext.
- * Radius is in projected pixels at the base zoom (dots scale with zoom).
- */
-export function cityMarkers(
-  cities: readonly City[],
-  projection: GeoProjection,
-  radius = 4,
-): (g: GroupBuilder) => void {
-  return (g) => {
-    for (const c of cities) {
-      const p = projection(c.geometry.coordinates as [number, number]);
-      if (!p) continue;
-      const [x, y] = p;
-      g.drawable(c.id, (ctx) => {
-        ctx.moveTo(x + radius, y);
-        ctx.arc(x, y, radius, 0, Math.PI * 2);
-        ctx.closePath();
-      });
-    }
+/** A 20° graticule as one MultiLineString feature. */
+export function makeGraticule(): Feature<MultiLineString> {
+  return { type: "Feature", properties: {}, geometry: geoGraticule().step([20, 20])() };
+}
+
+/** A great-circle-ish route as a LineString feature (London -> New York -> Tokyo). */
+export function makeRoute(): Feature<LineString> {
+  return {
+    type: "Feature", properties: {},
+    geometry: { type: "LineString", coordinates: [[-0.13, 51.51], [-74.01, 40.71], [139.69, 35.69]] },
   };
 }
 
-/** Ids of the cells whose centroid falls on land — the set kept when clipping. */
-export function cellsOnLand(cells: readonly Cell[], land: MultiPolygon): Set<string> {
-  const onLand = new Set<string>();
-  for (const c of cells) {
-    if (geoContains(land, c.center)) onLand.add(c.id);
-  }
-  return onLand;
+/** A cluster of locations as one MultiPoint feature. */
+export function makeCluster(): Feature<MultiPoint> {
+  return {
+    type: "Feature", properties: {},
+    geometry: { type: "MultiPoint", coordinates: [[18.42, -33.92], [151.21, -33.87], [-43.2, -22.91], [36.82, -1.29], [72.88, 19.08]] },
+  };
 }

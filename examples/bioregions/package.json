@@ -9,8 +9,10 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
+    "@d3gl/canvas": "workspace:*",
     "@d3gl/core": "workspace:*",
     "@d3gl/geo": "workspace:*",
+    "@d3gl/map": "workspace:*",
     "@d3gl/react": "workspace:*",
     "@d3gl/svg": "workspace:*",
     "d3-geo": "^3.1.1",
