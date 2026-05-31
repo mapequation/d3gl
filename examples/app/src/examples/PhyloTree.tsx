@@ -40,6 +40,7 @@ export function PhyloTree(): React.ReactElement {
   const [layoutMode, setLayoutMode] = useState<LayoutMode>("rectangular");
   const [backend, setBackend] = useState<BackendType>("webgl");
   const [tips, setTips] = useState(128);
+  const [markerMode, setMarkerMode] = useState<"world" | "screen">("world");
   const [tooltip, setTooltip] = useState<{ left: number; top: number; text: string } | null>(null);
 
   const chartRef = useRef<Plot | null>(null);
@@ -198,7 +199,8 @@ export function PhyloTree(): React.ReactElement {
     chart.points("nodes", tipNodes, {
       x: (n: AugNode) => n.px,
       y: (n: AugNode) => n.py,
-      radius: 2.6,
+      radius: markerMode === "screen" ? 3.5 : 2.6,
+      sizeMode: markerMode, // "world" scales with zoom; "screen" stays constant like labels
       fill: (n: AugNode) => schemeCategory10[n.data.group % 10] ?? "#888",
       id: (_n: AugNode, i: number) => `t${i}`,
     });
@@ -208,7 +210,7 @@ export function PhyloTree(): React.ReactElement {
 
     // Update labels with base transform
     labelLayer.update(anchors, baseT, { width: W, height: H });
-  }, [layoutMode, tips]);
+  }, [layoutMode, tips, markerMode]);
 
   const exportPNG = (): void => {
     try { download(chartRef.current!.toPNG(), "phylotree.png"); }
@@ -229,6 +231,10 @@ export function PhyloTree(): React.ReactElement {
         <span style={{ width: 8 }} />
         <button onClick={() => setLayoutMode("rectangular")} disabled={layoutMode === "rectangular"}>Rectangular</button>
         <button onClick={() => setLayoutMode("radial")} disabled={layoutMode === "radial"}>Radial</button>
+        <span style={{ width: 8 }} />
+        <button onClick={() => setMarkerMode((m) => (m === "world" ? "screen" : "world"))}>
+          markers: {markerMode}
+        </button>
         <span style={{ width: 8 }} />
         <label style={{ fontSize: 13 }}>
           Tips: {tips}
