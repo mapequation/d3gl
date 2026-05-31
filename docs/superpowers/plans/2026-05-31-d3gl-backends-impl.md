@@ -20,6 +20,24 @@ This is Plan 2 of 4. Depends on Plan 1 (core): `Backend`, `RenderLayer`, `ViewTr
 `DrawableVector`, `Scene.drawables()`. WebGL stencil recipe proven in
 `packages/webgl/src/stencil-spike.browser.test.ts`.
 
+**Test & package setup (read first):**
+- **Node** tests (`*.test.ts`, e.g. the serializer) are collected by the **root**
+  `vitest.config.ts`; run them from the repo root with `corepack pnpm@9.15.9 test
+  <pattern>` (or `corepack pnpm@9.15.9 exec vitest run <pattern>`). The root config excludes
+  `*.browser.test.ts`.
+- **Browser** tests (`*.browser.test.ts`) need a per-package browser config. `@d3gl/webgl`
+  and `@d3gl/geo` already have `vitest.config.ts` (browser, Playwright/Chromium). For
+  `@d3gl/svg` and `@d3gl/canvas`, **create** `packages/<pkg>/vitest.config.ts` copied
+  verbatim from `packages/geo/vitest.config.ts`. Run browser tests from inside the package:
+  `cd packages/<pkg> && corepack pnpm@9.15.9 exec vitest run --config vitest.config.ts <pattern>`.
+  `vitest`, `@vitest/browser-playwright`, and `playwright` resolve from the workspace root
+  (geo uses them without listing them) — no need to add them to the package.
+- **Workspace deps to add** (then run `corepack pnpm@9.15.9 install` from the repo root to
+  relink): `@d3gl/canvas` → add `@d3gl/svg: "workspace:*"`; `@d3gl/webgl` → add
+  `@d3gl/svg: "workspace:*"`. `@d3gl/svg` already depends on `@d3gl/core`.
+- The `@luma.gl/*` packages needed by the WebGL browser test are already in
+  `@d3gl/webgl`'s devDeps.
+
 Shared helper used in several tasks — convert an RGBA byte tuple to a CSS color (alpha 0 ⇒
 "none" for fill/stroke skipping):
 ```ts
@@ -74,7 +92,7 @@ describe("svgFromLayers", () => {
 });
 ```
 
-- [ ] **Step 2: Run it, verify it fails.** `cd packages/svg && corepack pnpm@9.15.9 test serialize` → FAIL.
+- [ ] **Step 2: Run it, verify it fails.** From the repo root: `corepack pnpm@9.15.9 test serialize` (Node test via root config) → FAIL.
 
 - [ ] **Step 3: Implement** `packages/svg/src/serialize.ts`:
 
@@ -140,7 +158,7 @@ export function svgFromLayers(width: number, height: number, layers: readonly Re
 
 Export `svgFromLayers` (and `rgba` is internal). Add `@d3gl/core` to `packages/svg/package.json` deps if not present.
 
-- [ ] **Step 4: Run tests, verify pass.** `cd packages/svg && corepack pnpm@9.15.9 test` → all pass.
+- [ ] **Step 4: Run tests, verify pass.** From repo root: `corepack pnpm@9.15.9 test serialize` → pass; full `corepack pnpm@9.15.9 test` still green.
 
 - [ ] **Step 5: Commit:** `git commit -m "feat(svg): svgFromLayers — serialize render layers (with clipPath + view transform) to SVG"`
 
@@ -152,7 +170,7 @@ Export `svgFromLayers` (and `rgba` is internal). Add `@d3gl/core` to `packages/s
 - Create: `packages/svg/src/svg-backend.ts`
 - Modify: `packages/svg/src/index.ts`
 - Test: `packages/svg/src/__tests__/svg-backend.browser.test.ts`
-- Add browser vitest config if `@d3gl/svg` lacks one (copy `packages/webgl/vitest.config.ts`); ensure Node `vitest.config.ts` excludes `*.browser.test.ts` like the webgl package.
+- Create `packages/svg/vitest.config.ts` (copy `packages/geo/vitest.config.ts`) per the Test setup note.
 
 Context: `SvgBackend implements Backend` building a live DOM `<svg>` inside the host
 element. It uses `svgFromLayers` to produce markup, then sets it via `innerHTML` of the
@@ -195,7 +213,7 @@ describe("SvgBackend", () => {
 ```
 
 - [ ] **Step 2: Run it, verify it fails.**
-`cd packages/svg && corepack pnpm@9.15.9 exec vitest run --config vitest.browser.config.ts svg-backend` → FAIL.
+`cd packages/svg && corepack pnpm@9.15.9 exec vitest run --config vitest.config.ts svg-backend` → FAIL.
 
 - [ ] **Step 3: Implement** `SvgBackend`:
 
@@ -250,7 +268,8 @@ intentional — the engine routes PNG through a raster backend; document it.
 **Files:**
 - Create: `packages/canvas/src/canvas-backend.ts`
 - Modify: `packages/canvas/src/index.ts`, `packages/canvas/package.json` (dep `@d3gl/svg` for `toSVG`, `@d3gl/core`)
-- Test: `packages/canvas/src/__tests__/canvas-backend.browser.test.ts` (+ browser vitest config as in Task 2)
+- Test: `packages/canvas/src/__tests__/canvas-backend.browser.test.ts`
+- Create `packages/canvas/vitest.config.ts` (copy `packages/geo/vitest.config.ts`) per the Test setup note.
 
 Context: `CanvasBackend implements Backend`, immediate-mode replay of `DrawableVector`
 subpaths into a 2D context. Clear in identity transform, then draw under
