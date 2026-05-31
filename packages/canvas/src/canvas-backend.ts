@@ -41,20 +41,35 @@ export class CanvasBackend implements Backend {
         ctx.save();
         ctx.beginPath();
         for (const d of clipSrc.drawables) if ((d.flags & 1) !== 0) {
-          for (const s of d.subpaths) {
-            const p = s.points; if (p.length < 2) continue;
-            ctx.moveTo(p[0]!, p[1]!);
-            for (let i = 2; i < p.length; i += 2) ctx.lineTo(p[i]!, p[i + 1]!);
-            if (s.closed) ctx.closePath();
+          if (d.circles.length > 0) {
+            for (const c of d.circles) { ctx.arc(c.x, c.y, c.r, 0, 2 * Math.PI); ctx.closePath(); }
+          } else {
+            for (const s of d.subpaths) {
+              const p = s.points; if (p.length < 2) continue;
+              ctx.moveTo(p[0]!, p[1]!);
+              for (let i = 2; i < p.length; i += 2) ctx.lineTo(p[i]!, p[i + 1]!);
+              if (s.closed) ctx.closePath();
+            }
           }
         }
         ctx.clip();
       }
       for (const d of layer.drawables) {
         if ((d.flags & 1) === 0) continue;
-        trace(ctx, d);
-        if (d.fill[3] > 0) { ctx.fillStyle = css(d.fill); ctx.fill(); }
-        if (d.stroke[3] > 0 && d.lineWidth > 0) { ctx.strokeStyle = css(d.stroke); ctx.lineWidth = d.lineWidth; ctx.stroke(); }
+        if (d.circles.length > 0) {
+          // Circle drawable: arc per circle, honoring active clip.
+          for (const c of d.circles) {
+            ctx.beginPath();
+            ctx.arc(c.x, c.y, c.r, 0, 2 * Math.PI);
+            ctx.closePath();
+            if (d.fill[3] > 0) { ctx.fillStyle = css(d.fill); ctx.fill(); }
+            if (d.stroke[3] > 0 && d.lineWidth > 0) { ctx.strokeStyle = css(d.stroke); ctx.lineWidth = d.lineWidth; ctx.stroke(); }
+          }
+        } else {
+          trace(ctx, d);
+          if (d.fill[3] > 0) { ctx.fillStyle = css(d.fill); ctx.fill(); }
+          if (d.stroke[3] > 0 && d.lineWidth > 0) { ctx.strokeStyle = css(d.stroke); ctx.lineWidth = d.lineWidth; ctx.stroke(); }
+        }
       }
       if (clipSrc) ctx.restore();
     }
