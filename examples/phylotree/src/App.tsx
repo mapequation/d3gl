@@ -155,15 +155,32 @@ export function App(): React.ReactElement {
     // Rebuild anchors for label layer
     // width/height drive collision culling — without them every label renders
     // (0×0 boxes never overlap). ~6.2px/char at the 11px label font, +a little pad.
-    const anchors: LabelAnchor[] = tipNodes.map((n, i) => ({
-      id: `t${i}`,
-      refX: n.px,
-      refY: n.py,
-      text: n.data.name,
-      width: n.data.name.length * 6.2 + 6,
-      height: 14,
-      priority: n.data.length,
-    }));
+    const GAP = 6;
+    const anchors: LabelAnchor[] = tipNodes.map((n, i) => {
+      const base = {
+        id: `t${i}`,
+        refX: n.px,
+        refY: n.py,
+        text: n.data.name,
+        width: n.data.name.length * 6.2 + 6,
+        height: 14,
+        priority: n.data.length,
+        transformOrigin: "0 0",
+      };
+      if (layoutMode === "radial") {
+        const a = n.angle ?? 0;
+        const deg = (a * 180) / Math.PI;
+        // Left half: flip 180° (keeps text upright) and anchor the right edge, so the
+        // label reads outward away from the centre — same trick as d3's radial-tree.
+        const onLeft = Math.cos(a) < 0;
+        const transform = onLeft
+          ? `rotate(${deg + 180}deg) translate(${-GAP}px, -50%) translate(-100%, 0)`
+          : `rotate(${deg}deg) translate(${GAP}px, -50%)`;
+        return { ...base, transform };
+      }
+      // Rectangular: start just to the right of the tip, vertically centred.
+      return { ...base, transform: `translate(${GAP}px, -50%)` };
+    });
     anchorsRef.current = anchors;
 
     // Re-add layers (preserves backend; transform preserved via transformRef)
