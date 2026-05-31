@@ -155,9 +155,18 @@ export class GeoMap {
     this.handle?.backend.setTransform(this.transform);
     this.render();
   }
+  private swapToken = 0;
   private async swapBackend(type: BackendType): Promise<void> {
+    // Guard against concurrent/overlapping swaps (e.g. rapid backend toggles):
+    // only the latest swap installs its backend; superseded ones self-clean.
+    const token = ++this.swapToken;
     const old = this.handle;
     const next = await createBackend(type, this.host, this.opts.width, this.opts.height);
+    if (token !== this.swapToken) {
+      next.backend.destroy();
+      if (next.element !== this.host) next.element.remove();
+      return;
+    }
     old?.backend.destroy();
     if (old && old.element !== this.host) old.element.remove();
     this.handle = next;

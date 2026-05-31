@@ -28,4 +28,22 @@ describe("WebGLBackend", () => {
     expect(right[3]).toBeLessThan(40); // clipped out -> transparent
     backend.destroy();
   });
+
+  it("also clips on the ONSCREEN render() path (needs a stencil on the canvas buffer)", async () => {
+    const canvas = document.createElement("canvas");
+    canvas.width = 64; canvas.height = 64;
+    document.body.appendChild(canvas);
+    const backend = await WebGLBackend.create(canvas, { width: 64, height: 64 });
+    const mask = rectLayer("mask", 0, 0, 32, 64, "rgb(0,0,0)");
+    const red = rectLayer("red", 0, 0, 64, 64, "rgb(255,0,0)", "mask");
+    backend.setLayers([mask, red]);
+    backend.setTransform({ k: 1, x: 0, y: 0 });
+    // Reads the canvas default framebuffer after the onscreen render() — the path
+    // the live view uses. Regression guard: without webgl:{stencil:true} this fails.
+    const left = backend.readScreenPixel(16, 32);
+    const right = backend.readScreenPixel(48, 32);
+    expect(left[0]).toBeGreaterThan(200);   // inside mask -> red
+    expect(right[0]).toBeLessThan(40);      // clipped out
+    backend.destroy();
+  });
 });

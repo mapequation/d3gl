@@ -33,6 +33,9 @@ export class WebGLBackend implements Backend {
       adapters: [webgl2Adapter],
       type: "webgl",
       createCanvasContext: { canvas, useDevicePixels: false },
+      // Request a stencil buffer on the canvas drawing buffer so the ONSCREEN
+      // render path can clip via the stencil test (WebGL defaults stencil:false).
+      webgl: { stencil: true },
     });
     const offscreen = device.createFramebuffer({
       width: opts.width,
@@ -108,6 +111,16 @@ export class WebGLBackend implements Backend {
 
   toSVG(): string {
     return svgFromLayers(this.width, this.height, this.order.map((n) => this.layers.get(n)!), this.viewTransform);
+  }
+
+  /** Read a pixel from the ONSCREEN canvas default framebuffer after render(). Test aid. */
+  readScreenPixel(x: number, y: number): number[] {
+    this.render();
+    const gl = (this.device as unknown as { gl: WebGL2RenderingContext }).gl;
+    gl.bindFramebuffer(gl.READ_FRAMEBUFFER, null);
+    const p = new Uint8Array(4);
+    gl.readPixels(Math.floor(x), Math.floor(this.height - 1 - y), 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, p);
+    return [p[0]!, p[1]!, p[2]!, p[3]!];
   }
 
   /** Read a pixel from the offscreen framebuffer (renders first). Flips y for WebGL origin. */
