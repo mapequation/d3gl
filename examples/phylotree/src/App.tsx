@@ -60,14 +60,6 @@ function drawLink(ctx: PathContext, link: AugLink, mode: LayoutMode): void {
   }
 }
 
-function dot(ctx: PathContext, px: number, py: number, r: number): void {
-  // moveTo + closePath so the circle is a CLOSED subpath: required for the WebGL
-  // fill tessellator and for hit-testing (both only handle closed fills).
-  ctx.moveTo(px + r, py);
-  ctx.arc(px, py, r, 0, 2 * Math.PI);
-  ctx.closePath();
-}
-
 export function App(): React.ReactElement {
   const [layoutMode, setLayoutMode] = useState<LayoutMode>("rectangular");
   const [backend, setBackend] = useState<BackendType>("webgl");
@@ -190,8 +182,10 @@ export function App(): React.ReactElement {
       lineWidth: 0.6,
     });
 
-    chart.layer("nodes", tipNodes, {
-      draw: (ctx: PathContext, n: AugNode) => dot(ctx, n.px, n.py, 2.2),
+    chart.points("nodes", tipNodes, {
+      x: (n: AugNode) => n.px,
+      y: (n: AugNode) => n.py,
+      radius: 2.6,
       fill: (n: AugNode) => schemeCategory10[n.data.group % 10] ?? "#888",
       id: (_n: AugNode, i: number) => `t${i}`,
     });

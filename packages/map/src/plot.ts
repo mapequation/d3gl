@@ -11,6 +11,16 @@ export interface PlotLayerOptions<D = any> {
   id?: (d: D, i: number) => string | number;
 }
 
+export interface PlotPointOptions<D = any> {
+  x: (d: D, i: number) => number;
+  y: (d: D, i: number) => number;
+  radius?: number | ((d: D, i: number) => number);
+  fill?: string | ((d: D, i: number) => string);
+  stroke?: string | ((d: D, i: number) => string);
+  id?: (d: D, i: number) => string | number;
+  clipTo?: string;
+}
+
 export class Plot extends BaseEngine {
   constructor(host: HTMLElement, opts: PlotOptions) { super(host, opts.width, opts.height, opts.backend ?? "webgl"); }
   layer<D>(name: string, data: readonly D[], opts: PlotLayerOptions<D>): this {
@@ -19,6 +29,16 @@ export class Plot extends BaseEngine {
     const drawOpts = opts.lineWidth != null ? { lineWidth: opts.lineWidth } : undefined;
     const build = (g: GroupBuilder): void => {
       list.forEach((d, i) => g.drawable(ids[i]!, (ctx: PathContext) => opts.draw(ctx, d, i), drawOpts));
+    };
+    this.registerLayer({ name, data: list, ids, fill: opts.fill, stroke: opts.stroke, clipTo: opts.clipTo, build });
+    return this;
+  }
+  points<D>(name: string, data: readonly D[], opts: PlotPointOptions<D>): this {
+    const list = data as D[];
+    const ids = list.map((d, i) => (opts.id ? opts.id(d, i) : i));
+    const resolveRadius = typeof opts.radius === "function" ? opts.radius : (_d: D, _i: number) => (opts.radius as number | undefined) ?? 3;
+    const build = (g: GroupBuilder): void => {
+      list.forEach((d, i) => g.point(ids[i]!, opts.x(d, i), opts.y(d, i), resolveRadius(d, i)));
     };
     this.registerLayer({ name, data: list, ids, fill: opts.fill, stroke: opts.stroke, clipTo: opts.clipTo, build });
     return this;
