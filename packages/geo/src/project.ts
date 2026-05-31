@@ -27,6 +27,11 @@ export interface FeatureAccessors<F> {
  * A Scene.group builder that projects each GeoJSON feature ONCE with `projection`
  * (via geoPath into the drawable's PathContext) and registers it as a drawable.
  * After this, the GPU renders, recolors, and pans/zooms without re-projecting.
+ *
+ * Winding matters: geoPath fills on the sphere, so a ring's orientation selects
+ * the region it encloses. A ring wound the wrong way is treated as its complement
+ * (the whole sphere minus the region) and projects to a giant, map-covering
+ * polygon — if every cell renders as one solid fill, rewind your rings.
  */
 export function featureGroup<F extends GeoInput>(
   features: readonly F[],

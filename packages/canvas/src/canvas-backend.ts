@@ -1,0 +1,65 @@
+import type { Backend, RenderLayer, ViewTransform, DrawableVector } from "@d3gl/core";
+import { svgFromLayers } from "@d3gl/svg";
+
+function trace(ctx: CanvasRenderingContext2D, d: DrawableVector): void {
+  ctx.beginPath();
+  for (const s of d.subpaths) {
+    const p = s.points;
+    if (p.length < 2) continue;
+    ctx.moveTo(p[0]!, p[1]!);
+    for (let i = 2; i < p.length; i += 2) ctx.lineTo(p[i]!, p[i + 1]!);
+    if (s.closed) ctx.closePath();
+  }
+}
+const css = (c: readonly [number, number, number, number]) => `rgba(${c[0]}, ${c[1]}, ${c[2]}, ${(c[3] / 255).toFixed(4)})`;
+
+export class CanvasBackend implements Backend {
+  private ctx: CanvasRenderingContext2D;
+  private layers: RenderLayer[] = [];
+  private transform: ViewTransform = { k: 1, x: 0, y: 0 };
+
+  constructor(private canvas: HTMLCanvasElement, private width: number, private height: number) {
+    const ctx = canvas.getContext("2d");
+    if (!ctx) throw new Error("CanvasBackend: 2D context unavailable");
+    this.ctx = ctx;
+  }
+  setLayers(layers: RenderLayer[]): void { this.layers = layers; }
+  updateLayer(name: string, layer: RenderLayer): void {
+    const i = this.layers.findIndex((l) => l.name === name);
+    if (i >= 0) this.layers[i] = layer; else this.layers.push(layer);
+  }
+  setTransform(t: ViewTransform): void { this.transform = t; }
+  render(): void {
+    const { ctx } = this;
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.clearRect(0, 0, this.width, this.height);
+    const t = this.transform;
+    ctx.setTransform(t.k, 0, 0, t.k, t.x, t.y);
+    for (const layer of this.layers) {
+      const clipSrc = layer.clipTo ? this.layers.find((l) => l.name === layer.clipTo) : undefined;
+      if (clipSrc) {
+        ctx.save();
+        ctx.beginPath();
+        for (const d of clipSrc.drawables) if ((d.flags & 1) !== 0) {
+          for (const s of d.subpaths) {
+            const p = s.points; if (p.length < 2) continue;
+            ctx.moveTo(p[0]!, p[1]!);
+            for (let i = 2; i < p.length; i += 2) ctx.lineTo(p[i]!, p[i + 1]!);
+            if (s.closed) ctx.closePath();
+          }
+        }
+        ctx.clip();
+      }
+      for (const d of layer.drawables) {
+        if ((d.flags & 1) === 0) continue;
+        trace(ctx, d);
+        if (d.fill[3] > 0) { ctx.fillStyle = css(d.fill); ctx.fill(); }
+        if (d.stroke[3] > 0 && d.lineWidth > 0) { ctx.strokeStyle = css(d.stroke); ctx.lineWidth = d.lineWidth; ctx.stroke(); }
+      }
+      if (clipSrc) ctx.restore();
+    }
+  }
+  toPNG(): string { this.render(); return this.canvas.toDataURL("image/png"); }
+  toSVG(): string { return svgFromLayers(this.width, this.height, this.layers, this.transform); }
+  destroy(): void { this.layers = []; }
+}

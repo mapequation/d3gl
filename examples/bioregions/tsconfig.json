@@ -1,0 +1,17 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "jsx": "react-jsx",
+    "noEmit": true,
+    "resolveJsonModule": true,
+    "paths": {
+      "@d3gl/core": ["../../packages/core/src/index.ts"],
+      "@d3gl/canvas": ["../../packages/canvas/src/index.ts"],
+      "@d3gl/geo": ["../../packages/geo/src/index.ts"],
+      "@d3gl/map": ["../../packages/map/src/index.ts"],
+      "@d3gl/react": ["../../packages/react/src/index.ts"],
+      "@d3gl/svg": ["../../packages/svg/src/index.ts"]
+    }
+  },
+  "include": ["src"]
+}

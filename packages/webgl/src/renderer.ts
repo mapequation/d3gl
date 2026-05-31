@@ -161,6 +161,19 @@ export class GroupRenderer {
     });
   }
 
+  private static STENCIL = {
+    off:   { depthCompare: "always", depthWriteEnabled: false, stencilCompare: "always" },
+    write: { depthCompare: "always", depthWriteEnabled: false, stencilCompare: "equal", stencilReadMask: 0x01, stencilWriteMask: 0x01, stencilPassOperation: "increment-clamp", stencilFailOperation: "keep", stencilDepthFailOperation: "keep" },
+    test:  { depthCompare: "always", depthWriteEnabled: false, stencilCompare: "not-equal", stencilReadMask: 0x01, stencilWriteMask: 0x01, stencilPassOperation: "keep", stencilFailOperation: "keep", stencilDepthFailOperation: "keep" },
+  } as const;
+
+  /** Switch stencil state for clipping. "write" = clip source (mask), "test" = clipped layer, "off" = normal. */
+  setStencil(mode: "off" | "write" | "test"): void {
+    const params = GroupRenderer.STENCIL[mode] as Record<string, unknown>;
+    if (this.fill) this.fill.fillModel.setParameters(params);
+    if (this.stroke) this.stroke.fillModel.setParameters(params);
+  }
+
   /** Set the view transform (column-major mat3) for pan/zoom. */
   setTransform(m: Float32Array): void {
     this.transform = m;
