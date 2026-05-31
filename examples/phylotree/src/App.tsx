@@ -33,18 +33,31 @@ type AugLink = HierarchyLink<TreeNode> & {
   target: AugNode;
 };
 
+const CX = W / 2;
+const CY = H / 2;
+
 function drawLink(ctx: PathContext, link: AugLink, mode: LayoutMode): void {
   const s = link.source;
   const t = link.target;
   if (mode === "rectangular") {
-    // Elbow: from source (px=depth, py=vertical) to target
+    // Elbow: vertical at the parent depth, then out to the child.
     ctx.moveTo(s.px, s.py);
-    ctx.lineTo(s.px, t.py); // horizontal elbow at source depth
-    ctx.lineTo(t.px, t.py); // then out to target depth
-  } else {
-    // Radial: straight line from source to target
-    ctx.moveTo(s.px, s.py);
+    ctx.lineTo(s.px, t.py);
     ctx.lineTo(t.px, t.py);
+  } else {
+    // Radial step: arc along the PARENT radius from parent angle to child angle,
+    // then a radial line out to the child — a clean radial dendrogram (no crossings).
+    const sr = s.radius ?? 0;
+    const sa = s.angle ?? 0;
+    const ta = t.angle ?? 0;
+    const tr = t.radius ?? 0;
+    const steps = Math.max(1, Math.ceil(Math.abs(ta - sa) / 0.12));
+    ctx.moveTo(CX + sr * Math.cos(sa), CY + sr * Math.sin(sa));
+    for (let i = 1; i <= steps; i++) {
+      const a = sa + ((ta - sa) * i) / steps;
+      ctx.lineTo(CX + sr * Math.cos(a), CY + sr * Math.sin(a));
+    }
+    ctx.lineTo(CX + tr * Math.cos(ta), CY + tr * Math.sin(ta));
   }
 }
 
@@ -122,11 +135,15 @@ export function App(): React.ReactElement {
     const tipNodes = nodes.filter((n) => !n.children);
 
     // Rebuild anchors for label layer
+    // width/height drive collision culling — without them every label renders
+    // (0×0 boxes never overlap). ~6.2px/char at the 11px label font, +a little pad.
     const anchors: LabelAnchor[] = tipNodes.map((n, i) => ({
       id: `t${i}`,
       refX: n.px,
       refY: n.py,
       text: n.data.name,
+      width: n.data.name.length * 6.2 + 6,
+      height: 14,
       priority: n.data.length,
     }));
     anchorsRef.current = anchors;
@@ -213,7 +230,7 @@ export function App(): React.ReactElement {
         {/* Plot host: canvas/WebGL/SVG renders here */}
         <div ref={hostRef} style={{ position: "absolute", inset: 0 }} />
         {/* Label overlay: absolutely positioned over the canvas */}
-        <div ref={labelContainerRef} style={{ position: "absolute", inset: 0, pointerEvents: "none", overflow: "hidden" }} />
+        <div ref={labelContainerRef} style={{ position: "absolute", inset: 0, pointerEvents: "none", overflow: "hidden", fontSize: 11, lineHeight: "14px", color: "#dfe", textShadow: "0 1px 2px #000" }} />
         {tooltip && (
           <div style={{
             position: "absolute",
