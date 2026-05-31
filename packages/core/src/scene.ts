@@ -38,6 +38,10 @@ export interface GroupBuffers {
   /** One byte of flags per drawable (bit 0 = visible). */
   flags: Uint8Array;
   drawableCount: number;
+  /** Stride-4 float array: [x, y, radius, drawableId] per circle. */
+  pointCenters: Float32Array;
+  /** Total number of circles across all drawables. */
+  pointCount: number;
 }
 
 export interface DrawableOpts {
@@ -47,6 +51,10 @@ export interface DrawableOpts {
 
 export interface GroupBuilder {
   drawable(id: string | number, draw: (ctx: PathRecorder) => void, opts?: DrawableOpts): void;
+  /** A single filled circle at (x, y) with the given radius (reference px). */
+  point(id: string | number, x: number, y: number, radius: number): void;
+  /** Multiple circles (one drawable, e.g. a GeoJSON MultiPoint). */
+  points(id: string | number, centers: readonly [number, number][], radius: number): void;
 }
 
 /** Mutable accumulation for one group while building / before buffer assembly. */
@@ -63,6 +71,8 @@ class GroupData {
   subpaths: Subpath[][] = [];
   ids: (string | number)[] = [];
   lineWidths: number[] = [];
+  /** One array of circle centers per drawable (empty for path drawables). */
+  circles: { x: number; y: number; r: number }[][] = [];
   constructor(public readonly tolerance: number) {}
 }
 
@@ -73,6 +83,7 @@ export interface DrawableVector {
   stroke: [number, number, number, number];
   lineWidth: number;
   flags: number;
+  circles: { x: number; y: number; r: number }[];
 }
 
 export class Scene {
@@ -85,6 +96,8 @@ export class Scene {
     const data = new GroupData(this.tolerance);
     const builder: GroupBuilder = {
       drawable: (id, draw, opts) => this.addDrawable(data, id, draw, opts),
+      point: (id, x, y, radius) => this.addCircleDrawable(data, id, [[x, y]], radius),
+      points: (id, centers, radius) => this.addCircleDrawable(data, id, centers, radius),
     };
     build(builder);
     this.groups.set(name, data);
@@ -158,6 +171,33 @@ export class Scene {
     data.fillColors.push(0, 0, 0, 0);
     data.strokeColors.push(0, 0, 0, 0);
     data.flags.push(1);
+    // Path drawables have no circle geometry.
+    data.circles.push([]);
+  }
+
+  private addCircleDrawable(
+    data: GroupData,
+    id: string | number,
+    centers: readonly [number, number][],
+    r: number,
+  ): void {
+    const drawableId = data.ranges.length;
+    data.idToDrawable.set(String(id), drawableId);
+    data.subpaths.push([]);
+    data.circles.push(centers.map(([x, y]) => ({ x, y, r })));
+    data.ids.push(id);
+    data.lineWidths.push(0);
+    // Zero fill+stroke range to keep ranges index-aligned with drawableId.
+    const fillVertexOffset = data.fillVerts.length / 3;
+    const strokeVertexOffset = data.strokeVerts.length / 3;
+    data.ranges.push({
+      fill: { vertexOffset: fillVertexOffset, vertexCount: 0, indexOffset: data.fillIdx.length, indexCount: 0 },
+      stroke: { vertexOffset: strokeVertexOffset, vertexCount: 0, indexOffset: data.strokeIdx.length, indexCount: 0 },
+    });
+    // Defaults: transparent colors, visible flag (bit 0).
+    data.fillColors.push(0, 0, 0, 0);
+    data.strokeColors.push(0, 0, 0, 0);
+    data.flags.push(1);
   }
 
   private get(name: string): GroupData {
@@ -210,12 +250,20 @@ export class Scene {
       stroke: [data.strokeColors[i * 4]!, data.strokeColors[i * 4 + 1]!, data.strokeColors[i * 4 + 2]!, data.strokeColors[i * 4 + 3]!],
       lineWidth: data.lineWidths[i]!,
       flags: data.flags[i]!,
+      circles: data.circles[i]!,
     }));
   }
 
   /** Assemble GPU-ready typed arrays for a group. */
   buffers(name: string): GroupBuffers {
     const data = this.get(name);
+    // Build the pointCenters buffer: stride 4 = [x, y, radius, drawableId].
+    const pointFlat: number[] = [];
+    for (let i = 0; i < data.circles.length; i++) {
+      for (const c of data.circles[i]!) {
+        pointFlat.push(c.x, c.y, c.r, i);
+      }
+    }
     return {
       fillVertices: new Float32Array(data.fillVerts),
       fillIndices: new Uint32Array(data.fillIdx),
@@ -225,6 +273,8 @@ export class Scene {
       strokeColors: new Uint8Array(data.strokeColors),
       flags: new Uint8Array(data.flags),
       drawableCount: data.ranges.length,
+      pointCenters: new Float32Array(pointFlat),
+      pointCount: pointFlat.length / 4,
     };
   }
 }

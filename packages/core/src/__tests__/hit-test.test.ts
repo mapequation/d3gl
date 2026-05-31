@@ -26,4 +26,12 @@ describe("HitIndex", () => {
     expect(idx.pick(50, 50)).toBe("line");   // on the line, hidden fill skipped
     expect(idx.pick(50, 70)).toBe(null);     // far from line, fill hidden
   });
+
+  it("hits circle drawables within the radius", () => {
+    const scene = new Scene();
+    scene.group("g", (b) => b.point("dot", 50, 50, 5));
+    const idx = new HitIndex(scene.drawables("g"));
+    expect(idx.pick(52, 52)).toBe("dot");   // inside r=5
+    expect(idx.pick(60, 60)).toBe(null);    // outside
+  });
 });
