@@ -23,7 +23,6 @@ type BackendType = "webgl" | "canvas" | "svg";
 interface AugNode extends HierarchyNode<TreeNode> {
   px: number;
   py: number;
-  dist: number;
   angle?: number;
   radius?: number;
 }
@@ -62,7 +61,11 @@ function drawLink(ctx: PathContext, link: AugLink, mode: LayoutMode): void {
 }
 
 function dot(ctx: PathContext, px: number, py: number, r: number): void {
+  // moveTo + closePath so the circle is a CLOSED subpath: required for the WebGL
+  // fill tessellator and for hit-testing (both only handle closed fills).
+  ctx.moveTo(px + r, py);
   ctx.arc(px, py, r, 0, 2 * Math.PI);
+  ctx.closePath();
 }
 
 export function App(): React.ReactElement {
@@ -91,6 +94,21 @@ export function App(): React.ReactElement {
 
     const labelLayer = new LabelLayer(labelContainer, (a) => a.text);
     labelLayerRef.current = labelLayer;
+
+    // Register hover once (re-registering on every rebuild leaks listeners). pick()
+    // always uses the engine's current layers, so this stays correct across rebuilds.
+    chart.on("hover", (hit: HoverHit | null, ev: PointerEvent) => {
+      const el = wrapRef.current;
+      if (!hit || hit.layer !== "nodes" || !el) { setTooltip(null); return; }
+      const node = hit.datum as AugNode | null;
+      if (!node) { setTooltip(null); return; }
+      const r = el.getBoundingClientRect();
+      setTooltip({
+        left: ev.clientX - r.left + 12,
+        top: ev.clientY - r.top + 12,
+        text: `${node.data.name} · branch ${node.data.length.toFixed(3)}`,
+      });
+    });
 
     // Manual d3-zoom on the wrapper div
     const zoomBehavior = d3zoom<HTMLDivElement, unknown>()
@@ -163,23 +181,6 @@ export function App(): React.ReactElement {
 
     // Restore zoom transform
     chart.setTransform(transformRef.current);
-
-    // Setup hover
-    chart.on("hover", (hit: HoverHit | null, ev: PointerEvent) => {
-      const el = wrapRef.current;
-      if (!hit || !el) { setTooltip(null); return; }
-      const r = el.getBoundingClientRect();
-      const left = ev.clientX - r.left + 12;
-      const top = ev.clientY - r.top + 12;
-      if (hit.layer === "nodes") {
-        const node = hit.datum as AugNode | null;
-        if (node) {
-          setTooltip({ left, top, text: `${node.data.name} · len ${node.data.length.toFixed(3)}` });
-        }
-      } else {
-        setTooltip(null);
-      }
-    });
 
     // Update labels with current transform
     labelLayer.update(anchors, transformRef.current, { width: W, height: H });

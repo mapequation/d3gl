@@ -10,7 +10,6 @@ import type { TreeNode } from "./tree.js";
 export interface PositionedNode {
   px: number;
   py: number;
-  dist: number;
   angle?: number;
   radius?: number;
 }
@@ -18,46 +17,35 @@ export interface PositionedNode {
 export type PNode = HierarchyNode<TreeNode> & PositionedNode;
 
 /**
- * Rectangular phylogram.
- * px = pad + cumulative branch length * sx  (horizontal = depth axis)
- * py = pad + clusterX                        (vertical = leaf spacing axis)
+ * Rectangular dated phylogram. The main axis is TIME: tips (time 0, the present)
+ * align at the right edge; the root (oldest) is at the left. py is leaf spacing.
  */
 export function layoutRectangular(root: TreeNode, width: number, height: number, pad = 40): HierarchyNode<TreeNode> {
   const h = hierarchy(root, (d) => d.children);
-  // cluster().size([cross-axis, main-axis]) — we set cross = height, main = 1 (we override with branch lengths)
   cluster<TreeNode>().size([height - 2 * pad, 1])(h);
-  // cumulative distance from root
-  let maxDist = 0;
-  h.eachBefore((n: any) => {
-    n.dist = (n.parent ? n.parent.dist : 0) + n.data.length;
-    maxDist = Math.max(maxDist, n.dist);
-  });
-  const sx = (width - 2 * pad) / (maxDist || 1);
-  // n.x from cluster() is the cross-axis position (vertical), n.dist is the depth (horizontal)
+  const maxTime = h.data.time || 1;            // the root's age
+  const sw = width - 2 * pad;
   h.each((n: any) => {
-    n.px = pad + n.dist * sx;  // horizontal = depth
-    n.py = pad + n.x;          // vertical = cluster cross-axis
+    // (maxTime - time)/maxTime: root -> 0 (left), tips (time 0) -> 1 (right, aligned).
+    n.px = pad + ((maxTime - n.data.time) / maxTime) * sw;
+    n.py = pad + n.x;                          // cluster cross-axis = leaf spacing
   });
   return h;
 }
 
 /**
- * Radial phylogram.
- * px, py = Cartesian canvas coordinates from angle + radius.
+ * Radial dated phylogram: radius is TIME, so all tips (time 0) sit on the outer
+ * rim (aligned at the present) and the root is at the centre.
  */
 export function layoutRadial(root: TreeNode, width: number, height: number, pad = 30): HierarchyNode<TreeNode> {
   const h = hierarchy(root, (d) => d.children);
   cluster<TreeNode>().size([2 * Math.PI, 1])(h);
-  let maxDist = 0;
-  h.eachBefore((n: any) => {
-    n.dist = (n.parent ? n.parent.dist : 0) + n.data.length;
-    maxDist = Math.max(maxDist, n.dist);
-  });
+  const maxTime = h.data.time || 1;
   const R = Math.min(width, height) / 2 - pad;
   const cx = width / 2, cy = height / 2;
   h.each((n: any) => {
-    const a = n.x;  // angle from cluster (0..2π)
-    const r = (n.dist / (maxDist || 1)) * R;
+    const a = n.x;                             // angle from cluster (0..2π)
+    const r = ((maxTime - n.data.time) / maxTime) * R;   // tips (time 0) -> R
     n.angle = a;
     n.radius = r;
     n.px = cx + r * Math.cos(a);
