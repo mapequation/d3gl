@@ -8,6 +8,7 @@
     "build": "tsc -b"
   },
   "dependencies": {
-    "@d3gl/core": "workspace:*"
+    "@d3gl/core": "workspace:*",
+    "@d3gl/svg": "workspace:*"
   }
 }
