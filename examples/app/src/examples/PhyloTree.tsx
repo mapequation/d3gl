@@ -176,17 +176,21 @@ export function PhyloTree(): React.ReactElement {
     });
     anchorsRef.current = anchors;
 
+    // Pick the appropriate generator once per layout rebuild, then bind its
+    // rendering context per draw call. d3-shape's .context() types expect
+    // CanvasRenderingContext2D, but PathContext is a structural subset that
+    // d3-shape actually uses — cast once here rather than on every draw call.
+    type CtxGen = { context(ctx: PathContext): { (d: AugLink): void } };
+    const gen: CtxGen =
+      layoutMode === "rectangular"
+        ? (rectLink as unknown as CtxGen)  // linkHorizontal: cubic bezier elbow
+        : (radLink as unknown as CtxGen);  // linkRadial: cubic bezier in polar
+
     // Re-add layers (preserves backend; transform set above)
     chart.layer("links", links, {
-      draw: (ctx: PathContext, l: AugLink) => {
-        if (layoutMode === "rectangular") {
-          // linkHorizontal emits smooth cubic bezier links
-          (rectLink as any).context(ctx)(l);
-        } else {
-          // linkRadial emits smooth cubic bezier links in polar coords around origin
-          (radLink as any).context(ctx)(l);
-        }
-      },
+      // Each draw call receives a fresh PathContext for its drawable path.
+      // Binding .context(ctx) routes moveTo / bezierCurveTo into d3gl's renderer.
+      draw: (ctx: PathContext, l: AugLink) => gen.context(ctx)(l),
       stroke: "#8aa",
       lineWidth: 0.6,
     });
