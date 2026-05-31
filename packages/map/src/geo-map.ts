@@ -59,6 +59,15 @@ export class GeoMap {
     return this;
   }
 
+  /** Toggle/replace a layer's clip source without rebuilding geometry. */
+  setClip(name: string, clipTo?: string): this {
+    const spec = this.specs.find((s) => s.name === name);
+    if (!spec) return this;
+    spec.opts = { ...spec.opts, clipTo };
+    this.pushLayers();
+    return this;
+  }
+
   recolor(name: string): this {
     const spec = this.specs.find((s) => s.name === name);
     if (!spec) return this;
