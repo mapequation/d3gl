@@ -50,7 +50,14 @@ export class GroupRenderer {
   private stroke: Pass | null;
   private point: PointPass | null;
 
-  constructor(private readonly device: Device, buffers: GroupBuffers) {
+  constructor(
+    private readonly device: Device,
+    buffers: GroupBuffers,
+    /** Viewport width in device pixels (for screen-mode point sizing). */
+    private viewportWidth = 0,
+    /** Viewport height in device pixels (for screen-mode point sizing). */
+    private viewportHeight = 0,
+  ) {
     this.fill = this.buildPass(
       buffers.fillVertices,
       buffers.fillIndices,
@@ -231,7 +238,11 @@ export class GroupRenderer {
       a_pointId: pointIdBuffer,
     };
     const bindings = { u_colorTable: colorTexture, u_flags: flagsTexture };
-    const uniforms: Record<string, unknown> = { u_transform: this.transform };
+    const uniforms: Record<string, unknown> = {
+      u_transform: this.transform,
+      u_pointScreen: 0,
+      u_viewport: new Float32Array([this.viewportWidth, this.viewportHeight]),
+    };
 
     const model = new Model(device, {
       vs: POINT_VS,
@@ -341,6 +352,13 @@ export class GroupRenderer {
       pass.uniforms["u_transform"] = m;
     }
     if (this.point) this.point.uniforms["u_transform"] = m;
+  }
+
+  /** Switch the point size mode for the next render. Default "world" (scales with zoom). */
+  setPointSizeMode(mode: "world" | "screen"): void {
+    if (this.point) {
+      this.point.uniforms["u_pointScreen"] = mode === "screen" ? 1.0 : 0.0;
+    }
   }
 
   /** Draw the fill, stroke, then point passes into an open render pass. */

@@ -40,6 +40,8 @@ precision highp float;
 uniform mat3 u_transform;
 uniform highp sampler2D u_colorTable;
 uniform highp sampler2D u_flags;
+uniform float u_pointScreen;
+uniform vec2 u_viewport;
 in vec2 a_center;
 in vec2 a_corner;
 in float a_radius;
@@ -54,9 +56,11 @@ void main() {
   int flags = int(texelFetch(u_flags, ivec2(id % fsz.x, id / fsz.x), 0).r * 255.0 + 0.5);
   if ((flags & 1) == 0) { gl_Position = vec4(2.0, 2.0, 2.0, 1.0); return; }
   v_local = a_corner;
-  vec2 world = a_center + a_corner * a_radius;
-  vec3 p = u_transform * vec3(world, 1.0);
-  gl_Position = vec4(p.xy, 0.0, 1.0);
+  vec3 c = u_transform * vec3(a_center, 1.0);
+  vec2 off = (u_pointScreen > 0.5)
+    ? a_corner * a_radius * vec2(2.0 / u_viewport.x, -2.0 / u_viewport.y)
+    : (u_transform * vec3(a_center + a_corner * a_radius, 1.0)).xy - c.xy;
+  gl_Position = vec4(c.xy + off, 0.0, 1.0);
 }`;
 
 export const POINT_FS = `#version 300 es

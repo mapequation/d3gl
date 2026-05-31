@@ -19,6 +19,8 @@ export interface PlotPointOptions<D = any> {
   stroke?: string | ((d: D, i: number) => string);
   id?: (d: D, i: number) => string | number;
   clipTo?: string;
+  /** "world" (default): radius scales with zoom. "screen": constant pixel size. */
+  sizeMode?: "world" | "screen";
 }
 
 export class Plot extends BaseEngine {
@@ -40,7 +42,7 @@ export class Plot extends BaseEngine {
     const build = (g: GroupBuilder): void => {
       list.forEach((d, i) => g.point(ids[i]!, opts.x(d, i), opts.y(d, i), resolveRadius(d, i)));
     };
-    this.registerLayer({ name, data: list, ids, fill: opts.fill, stroke: opts.stroke, clipTo: opts.clipTo, build });
+    this.registerLayer({ name, data: list, ids, fill: opts.fill, stroke: opts.stroke, clipTo: opts.clipTo, pointSizeMode: opts.sizeMode, build });
     return this;
   }
 }

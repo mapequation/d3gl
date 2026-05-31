@@ -38,7 +38,12 @@ function drawableElements(d: DrawableVector): string {
 export function svgFromLayers(width: number, height: number, layers: readonly RenderLayer[], t: ViewTransform): string {
   const defs: string[] = [];
   const groups: string[] = [];
+  // Screen-mode point drawables are emitted in a separate untransformed group on top.
+  const screenCircleGroups: string[] = [];
+
   for (const layer of layers) {
+    const screenMode = layer.pointSizeMode === "screen";
+
     // A clipPath def referencing the named clip layer's silhouette.
     let clipAttr = "";
     if (layer.clipTo) {
@@ -58,15 +63,43 @@ export function svgFromLayers(width: number, height: number, layers: readonly Re
         clipAttr = ` clip-path="url(#${id})"`;
       }
     }
-    const elements = layer.drawables
-      .filter((d) => (d.flags & 1) !== 0)
-      .map(drawableElements)
-      .join("");
-    groups.push(`<g${clipAttr}>${elements}</g>`);
+
+    if (screenMode) {
+      // Emit circles at screen coords in a separate untransformed group.
+      const elements = layer.drawables
+        .filter((d) => (d.flags & 1) !== 0)
+        .map((d) => {
+          const fill = d.fill[3] > 0 ? rgba(d.fill) : "none";
+          const strokeAttrs =
+            d.stroke[3] > 0 && d.lineWidth > 0
+              ? ` stroke="${rgba(d.stroke)}" stroke-width="${d.lineWidth}"`
+              : "";
+          if (d.circles.length > 0) {
+            return d.circles
+              .map((c) => {
+                const sx = t.k * c.x + t.x;
+                const sy = t.k * c.y + t.y;
+                return `<circle cx="${sx}" cy="${sy}" r="${c.r}" fill="${fill}"${strokeAttrs} />`;
+              })
+              .join("");
+          }
+          return "";
+        })
+        .join("");
+      if (elements) screenCircleGroups.push(`<g>${elements}</g>`);
+    } else {
+      const elements = layer.drawables
+        .filter((d) => (d.flags & 1) !== 0)
+        .map(drawableElements)
+        .join("");
+      groups.push(`<g${clipAttr}>${elements}</g>`);
+    }
   }
   const transform = `translate(${t.x}, ${t.y}) scale(${t.k})`;
   return (
     `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}">` +
-    `<defs>${defs.join("")}</defs><g transform="${transform}">${groups.join("")}</g></svg>`
+    `<defs>${defs.join("")}</defs><g transform="${transform}">${groups.join("")}</g>` +
+    (screenCircleGroups.length > 0 ? screenCircleGroups.join("") : "") +
+    `</svg>`
   );
 }

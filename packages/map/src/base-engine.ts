@@ -13,6 +13,7 @@ interface LayerSpec {
   fill?: Accessor<any, string>;
   stroke?: Accessor<any, string>;
   clipTo?: string;
+  pointSizeMode?: "world" | "screen";
   build: (g: GroupBuilder) => void;   // rebuilds the Scene group (geo or draw)
 }
 
@@ -116,7 +117,7 @@ export abstract class BaseEngine {
     });
   }
   private renderLayer(spec: LayerSpec): RenderLayer {
-    return { name: spec.name, buffers: this.scene.buffers(spec.name), drawables: this.scene.drawables(spec.name), clipTo: spec.clipTo };
+    return { name: spec.name, buffers: this.scene.buffers(spec.name), drawables: this.scene.drawables(spec.name), clipTo: spec.clipTo, pointSizeMode: spec.pointSizeMode };
   }
   private pushLayers(): void {
     this.handle?.backend.setLayers(this.specs.map((s) => this.renderLayer(s)));

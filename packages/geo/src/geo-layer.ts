@@ -9,6 +9,8 @@ export interface GeoLayerOptions<F> {
   lineWidth?: number;
   /** Dot radius in projected px for Point/MultiPoint. */
   pointRadius?: number;
+  /** "world" (default): radius scales with zoom. "screen": constant pixel size. */
+  sizeMode?: "world" | "screen";
 }
 
 function geomOf(input: GeoInput): GeoJSON.Geometry | null {

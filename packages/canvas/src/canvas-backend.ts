@@ -54,16 +54,29 @@ export class CanvasBackend implements Backend {
         }
         ctx.clip();
       }
+      const screenMode = layer.pointSizeMode === "screen";
       for (const d of layer.drawables) {
         if ((d.flags & 1) === 0) continue;
         if (d.circles.length > 0) {
           // Circle drawable: arc per circle, honoring active clip.
           for (const c of d.circles) {
-            ctx.beginPath();
-            ctx.arc(c.x, c.y, c.r, 0, 2 * Math.PI);
-            ctx.closePath();
-            if (d.fill[3] > 0) { ctx.fillStyle = css(d.fill); ctx.fill(); }
-            if (d.stroke[3] > 0 && d.lineWidth > 0) { ctx.strokeStyle = css(d.stroke); ctx.lineWidth = d.lineWidth; ctx.stroke(); }
+            if (screenMode) {
+              // Draw in identity transform at projected screen coords (constant pixel radius).
+              ctx.save();
+              ctx.setTransform(1, 0, 0, 1, 0, 0);
+              ctx.beginPath();
+              ctx.arc(t.k * c.x + t.x, t.k * c.y + t.y, c.r, 0, 2 * Math.PI);
+              ctx.closePath();
+              if (d.fill[3] > 0) { ctx.fillStyle = css(d.fill); ctx.fill(); }
+              if (d.stroke[3] > 0 && d.lineWidth > 0) { ctx.strokeStyle = css(d.stroke); ctx.lineWidth = d.lineWidth; ctx.stroke(); }
+              ctx.restore();
+            } else {
+              ctx.beginPath();
+              ctx.arc(c.x, c.y, c.r, 0, 2 * Math.PI);
+              ctx.closePath();
+              if (d.fill[3] > 0) { ctx.fillStyle = css(d.fill); ctx.fill(); }
+              if (d.stroke[3] > 0 && d.lineWidth > 0) { ctx.strokeStyle = css(d.stroke); ctx.lineWidth = d.lineWidth; ctx.stroke(); }
+            }
           }
         } else {
           trace(ctx, d);
