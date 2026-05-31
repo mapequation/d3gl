@@ -8,4 +8,4 @@ export type { RingGroup } from "./rings.js";
 export { expandStroke } from "./stroke.js";
 export type { StrokeGeometry } from "./stroke.js";
 export { Scene } from "./scene.js";
-export type { GroupBuffers, GroupBuilder, DrawableRange, DrawableOpts } from "./scene.js";
+export type { GroupBuffers, GroupBuilder, DrawableRange, DrawableOpts, DrawableVector } from "./scene.js";

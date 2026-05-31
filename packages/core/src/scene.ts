@@ -3,6 +3,7 @@ import { groupRings } from "./rings.js";
 import { tessellateFill } from "./tessellate.js";
 import { expandStroke } from "./stroke.js";
 import { rgb } from "d3-color";
+import type { Subpath } from "./path-context.js";
 
 /**
  * Contiguous slice a drawable occupies within a group's shared buffers.
@@ -59,7 +60,19 @@ class GroupData {
   fillColors: number[] = []; // flat RGBA, 4 per drawable
   strokeColors: number[] = [];
   flags: number[] = [];
+  subpaths: Subpath[][] = [];
+  ids: (string | number)[] = [];
+  lineWidths: number[] = [];
   constructor(public readonly tolerance: number) {}
+}
+
+export interface DrawableVector {
+  id: string | number;
+  subpaths: Subpath[];
+  fill: [number, number, number, number];
+  stroke: [number, number, number, number];
+  lineWidth: number;
+  flags: number;
 }
 
 export class Scene {
@@ -88,6 +101,9 @@ export class Scene {
     const subpaths = recorder.subpaths;
     const drawableId = data.ranges.length;
     data.idToDrawable.set(String(id), drawableId);
+    data.subpaths.push(subpaths.map((s) => ({ closed: s.closed, points: s.points.slice() })));
+    data.ids.push(id);
+    data.lineWidths.push(opts?.lineWidth ?? 0);
 
     // ---- Fill ----
     const fillVertexOffset = data.fillVerts.length / 3;
@@ -182,6 +198,19 @@ export class Scene {
   setFlag(name: string, id: string | number, flags: number): void {
     const { data, drawableId } = this.drawableIdOf(name, id);
     data.flags[drawableId] = flags & 0xff;
+  }
+
+  /** Return the vector view of all drawables in a group. */
+  drawables(name: string): DrawableVector[] {
+    const data = this.get(name);
+    return data.ids.map((id, i) => ({
+      id,
+      subpaths: data.subpaths[i]!,
+      fill: [data.fillColors[i * 4]!, data.fillColors[i * 4 + 1]!, data.fillColors[i * 4 + 2]!, data.fillColors[i * 4 + 3]!],
+      stroke: [data.strokeColors[i * 4]!, data.strokeColors[i * 4 + 1]!, data.strokeColors[i * 4 + 2]!, data.strokeColors[i * 4 + 3]!],
+      lineWidth: data.lineWidths[i]!,
+      flags: data.flags[i]!,
+    }));
   }
 
   /** Assemble GPU-ready typed arrays for a group. */
