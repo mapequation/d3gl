@@ -39,10 +39,8 @@ function distToSegments(px: number, py: number, pts: number[]): number {
 
 export class HitIndex {
   private entries: Entry[] = [];
-  private tolerance: number;
 
   constructor(drawables: readonly DrawableVector[], tolerance = 1) {
-    this.tolerance = tolerance;
     for (const d of drawables) {
       if ((d.flags & 1) === 0) continue; // hidden never hits
       const closed = d.subpaths.filter((s) => s.closed && s.points.length >= 6);

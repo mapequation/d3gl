@@ -29,12 +29,18 @@ importers:
 
   examples/bioregions:
     dependencies:
+      '@d3gl/canvas':
+        specifier: workspace:*
+        version: link:../../packages/canvas
       '@d3gl/core':
         specifier: workspace:*
         version: link:../../packages/core
       '@d3gl/geo':
         specifier: workspace:*
         version: link:../../packages/geo
+      '@d3gl/map':
+        specifier: workspace:*
+        version: link:../../packages/map
       '@d3gl/react':
         specifier: workspace:*
         version: link:../../packages/react
@@ -111,6 +117,9 @@ importers:
       '@d3gl/core':
         specifier: workspace:*
         version: link:../core
+      '@d3gl/svg':
+        specifier: workspace:*
+        version: link:../svg
 
   packages/core:
     dependencies:
@@ -189,11 +198,63 @@ importers:
         specifier: workspace:*
         version: link:../webgl
 
+  packages/map:
+    dependencies:
+      '@d3gl/canvas':
+        specifier: workspace:*
+        version: link:../canvas
+      '@d3gl/core':
+        specifier: workspace:*
+        version: link:../core
+      '@d3gl/geo':
+        specifier: workspace:*
+        version: link:../geo
+      '@d3gl/svg':
+        specifier: workspace:*
+        version: link:../svg
+      '@d3gl/webgl':
+        specifier: workspace:*
+        version: link:../webgl
+      d3-geo:
+        specifier: ^3.1.1
+        version: 3.1.1
+      d3-selection:
+        specifier: ^3.0.0
+        version: 3.0.0
+      d3-zoom:
+        specifier: ^3.0.0
+        version: 3.0.0
+    devDependencies:
+      '@luma.gl/core':
+        specifier: ^9.3.3
+        version: 9.3.3
+      '@luma.gl/engine':
+        specifier: ^9.3.3
+        version: 9.3.3(@luma.gl/core@9.3.3)(@luma.gl/shadertools@9.3.3(@luma.gl/core@9.3.3))
+      '@luma.gl/webgl':
+        specifier: ^9.3.3
+        version: 9.3.3(@luma.gl/core@9.3.3)
+      '@types/d3-geo':
+        specifier: ^3.1.0
+        version: 3.1.0
+      '@types/d3-selection':
+        specifier: ^3.0.10
+        version: 3.0.11
+      '@types/d3-zoom':
+        specifier: ^3.0.8
+        version: 3.0.8
+      '@types/geojson':
+        specifier: ^7946.0.14
+        version: 7946.0.16
+
   packages/react:
     dependencies:
       '@d3gl/core':
         specifier: workspace:*
         version: link:../core
+      '@d3gl/map':
+        specifier: workspace:*
+        version: link:../map
       '@d3gl/webgl':
         specifier: workspace:*
         version: link:../webgl
@@ -203,7 +264,13 @@ importers:
       '@luma.gl/webgl':
         specifier: ^9.3.3
         version: 9.3.3(@luma.gl/core@9.3.3)
+      d3-geo:
+        specifier: ^3.1.1
+        version: 3.1.1
     devDependencies:
+      '@types/d3-geo':
+        specifier: ^3.1.0
+        version: 3.1.0
       '@types/react':
         specifier: ^19.2.15
         version: 19.2.15
@@ -228,6 +295,9 @@ importers:
       '@d3gl/core':
         specifier: workspace:*
         version: link:../core
+      '@d3gl/svg':
+        specifier: workspace:*
+        version: link:../svg
       '@luma.gl/core':
         specifier: ^9.3.3
         version: 9.3.3
