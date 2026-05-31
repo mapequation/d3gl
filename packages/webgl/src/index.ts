@@ -1,5 +1,6 @@
 export { clipFromView } from "./transform.js";
 export type { ViewTransform } from "./transform.js";
+export { WebGLBackend } from "./webgl-backend.js";
 export {
   paletteDimensions,
   padPalette,
