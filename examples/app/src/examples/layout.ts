@@ -1,11 +1,13 @@
 import { hierarchy, cluster, type HierarchyNode } from "d3-hierarchy";
+import { pointRadial } from "d3-shape";
 import type { TreeNode } from "./tree.js";
 
 /**
  * Extended node with final canvas coordinates (px, py).
  * px = horizontal axis (depth / branch length direction)
  * py = vertical axis (leaf spacing direction)
- * For radial: px, py are the Cartesian canvas coordinates.
+ * For radial: px, py are origin-centered Cartesian coordinates (can be negative).
+ *   The view is centered via the d3-zoom transform (translate CX, CY).
  */
 export interface PositionedNode {
   px: number;
@@ -36,20 +38,25 @@ export function layoutRectangular(root: TreeNode, width: number, height: number,
 /**
  * Radial dated phylogram: radius is TIME, so all tips (time 0) sit on the outer
  * rim (aligned at the present) and the root is at the centre.
+ *
+ * IMPORTANT: px, py are origin-centred (can be negative). The caller must set the
+ * view transform to translate(CX, CY) so the tree is centred on screen.
+ * This allows linkRadial() to work correctly (it computes around origin).
  */
 export function layoutRadial(root: TreeNode, width: number, height: number, pad = 30): HierarchyNode<TreeNode> {
   const h = hierarchy(root, (d) => d.children);
   cluster<TreeNode>().size([2 * Math.PI, 1])(h);
   const maxTime = h.data.time || 1;
   const R = Math.min(width, height) / 2 - pad;
-  const cx = width / 2, cy = height / 2;
   h.each((n: any) => {
     const a = n.x;                             // angle from cluster (0..2π)
     const r = ((maxTime - n.data.time) / maxTime) * R;   // tips (time 0) -> R
     n.angle = a;
     n.radius = r;
-    n.px = cx + r * Math.cos(a);
-    n.py = cy + r * Math.sin(a);
+    // pointRadial(angle, radius) returns [x, y] origin-centred
+    const [px, py] = pointRadial(a, r);
+    n.px = px;
+    n.py = py;
   });
   return h;
 }

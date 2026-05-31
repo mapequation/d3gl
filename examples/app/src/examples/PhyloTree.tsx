@@ -2,6 +2,7 @@ import React, { useEffect, useRef, useState } from "react";
 import { schemeCategory10 } from "d3-scale-chromatic";
 import { select } from "d3-selection";
 import { zoom as d3zoom, type D3ZoomEvent, zoomIdentity } from "d3-zoom";
+import { linkHorizontal, linkRadial } from "d3-shape";
 import { plot, type Plot } from "@d3gl/map";
 import type { HoverHit } from "@d3gl/map";
 import { LabelLayer } from "@d3gl/labels";
@@ -35,32 +36,7 @@ type AugLink = HierarchyLink<TreeNode> & {
 const CX = W / 2;
 const CY = H / 2;
 
-function drawLink(ctx: PathContext, link: AugLink, mode: LayoutMode): void {
-  const s = link.source;
-  const t = link.target;
-  if (mode === "rectangular") {
-    // Elbow: vertical at the parent depth, then out to the child.
-    ctx.moveTo(s.px, s.py);
-    ctx.lineTo(s.px, t.py);
-    ctx.lineTo(t.px, t.py);
-  } else {
-    // Radial step: arc along the PARENT radius from parent angle to child angle,
-    // then a radial line out to the child — a clean radial dendrogram (no crossings).
-    const sr = s.radius ?? 0;
-    const sa = s.angle ?? 0;
-    const ta = t.angle ?? 0;
-    const tr = t.radius ?? 0;
-    const steps = Math.max(1, Math.ceil(Math.abs(ta - sa) / 0.12));
-    ctx.moveTo(CX + sr * Math.cos(sa), CY + sr * Math.sin(sa));
-    for (let i = 1; i <= steps; i++) {
-      const a = sa + ((ta - sa) * i) / steps;
-      ctx.lineTo(CX + sr * Math.cos(a), CY + sr * Math.sin(a));
-    }
-    ctx.lineTo(CX + tr * Math.cos(ta), CY + tr * Math.sin(ta));
-  }
-}
-
-export function App(): React.ReactElement {
+export function PhyloTree(): React.ReactElement {
   const [layoutMode, setLayoutMode] = useState<LayoutMode>("rectangular");
   const [backend, setBackend] = useState<BackendType>("webgl");
   const [tips, setTips] = useState(128);
@@ -73,6 +49,8 @@ export function App(): React.ReactElement {
   const labelContainerRef = useRef<HTMLDivElement>(null);
   const wrapRef = useRef<HTMLDivElement>(null);
   const anchorsRef = useRef<LabelAnchor[]>([]);
+  // Store zoom behavior ref so we can reset transform on layout switch
+  const zoomBehaviorRef = useRef<ReturnType<typeof d3zoom<HTMLDivElement, unknown>> | null>(null);
 
   // Initial mount: create plot engine + label layer + zoom behavior
   useEffect(() => {
@@ -111,6 +89,7 @@ export function App(): React.ReactElement {
         chart.setTransform(t);
         labelLayer.update(anchorsRef.current, t, { width: W, height: H });
       });
+    zoomBehaviorRef.current = zoomBehavior;
     select(wrapper as Element).call(zoomBehavior as any);
 
     return () => {
@@ -132,7 +111,9 @@ export function App(): React.ReactElement {
   useEffect(() => {
     const chart = chartRef.current;
     const labelLayer = labelLayerRef.current;
-    if (!chart || !labelLayer) return;
+    const wrapper = wrapRef.current;
+    const zoomBehavior = zoomBehaviorRef.current;
+    if (!chart || !labelLayer || !wrapper || !zoomBehavior) return;
 
     const tree = makeTree(tips);
     const h =
@@ -143,6 +124,26 @@ export function App(): React.ReactElement {
     const nodes = h.descendants() as AugNode[];
     const links = h.links() as unknown as AugLink[];
     const tipNodes = nodes.filter((n) => !n.children);
+
+    // Reset zoom base transform on layout switch:
+    // - Rectangular: identity (world coords are canvas coords)
+    // - Radial: translate(CX, CY) so origin-centred coords render centred on screen
+    const baseTransform =
+      layoutMode === "radial"
+        ? zoomIdentity.translate(CX, CY)
+        : zoomIdentity;
+    const baseT: ViewTransform = { k: baseTransform.k, x: baseTransform.x, y: baseTransform.y };
+    select(wrapper as Element).call((zoomBehavior as any).transform, baseTransform);
+    transformRef.current = baseT;
+
+    // Build d3-shape link generators bound to PathContext.
+    // linkHorizontal / linkRadial call moveTo + bezierCurveTo on the context.
+    const rectLink = linkHorizontal<AugLink, AugNode>()
+      .x((d) => d.px)
+      .y((d) => d.py);
+    const radLink = linkRadial<AugLink, AugNode>()
+      .angle((d) => d.angle ?? 0)
+      .radius((d) => d.radius ?? 0);
 
     // Rebuild anchors for label layer
     // width/height drive collision culling — without them every label renders
@@ -175,9 +176,17 @@ export function App(): React.ReactElement {
     });
     anchorsRef.current = anchors;
 
-    // Re-add layers (preserves backend; transform preserved via transformRef)
+    // Re-add layers (preserves backend; transform set above)
     chart.layer("links", links, {
-      draw: (ctx: PathContext, l: AugLink) => drawLink(ctx, l, layoutMode),
+      draw: (ctx: PathContext, l: AugLink) => {
+        if (layoutMode === "rectangular") {
+          // linkHorizontal emits smooth cubic bezier links
+          (rectLink as any).context(ctx)(l);
+        } else {
+          // linkRadial emits smooth cubic bezier links in polar coords around origin
+          (radLink as any).context(ctx)(l);
+        }
+      },
       stroke: "#8aa",
       lineWidth: 0.6,
     });
@@ -190,11 +199,11 @@ export function App(): React.ReactElement {
       id: (_n: AugNode, i: number) => `t${i}`,
     });
 
-    // Restore zoom transform
-    chart.setTransform(transformRef.current);
+    // Apply the base transform to the engine
+    chart.setTransform(baseT);
 
-    // Update labels with current transform
-    labelLayer.update(anchors, transformRef.current, { width: W, height: H });
+    // Update labels with base transform
+    labelLayer.update(anchors, baseT, { width: W, height: H });
   }, [layoutMode, tips]);
 
   const exportPNG = (): void => {

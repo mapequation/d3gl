@@ -6,7 +6,7 @@ import { fitProjection } from "@d3gl/geo";
 import { GeoMap } from "@d3gl/react";
 import type { GeoMap as Engine, HoverHit } from "@d3gl/map";
 import type { GeoInput } from "@d3gl/geo";
-import { makeCells, makeCities, makeGraticule, makeRoute, makeCluster, cellsToFeatureCollection, loadWorld, type Cell } from "./data.js";
+import { makeCells, makeCities, makeGraticule, makeRoute, makeCluster, cellsToFeatureCollection, loadWorld, type Cell } from "./bioregions-data.js";
 
 const WIDTH = 900;
 const HEIGHT = 450;
@@ -22,7 +22,7 @@ type BackendType = "webgl" | "canvas" | "svg";
 const heat = scaleSequential(interpolateViridis).domain([0, 1]);
 const cellColor = (c: Cell, mode: Mode) => (mode === "heatmap" ? heat(c.value) : schemeCategory10[c.bioregion % 10]!);
 
-export function App(): React.ReactElement {
+export function Bioregions(): React.ReactElement {
   const [backend, setBackend] = useState<BackendType>("webgl");
   const [mode, setMode] = useState<Mode>("heatmap");
   const [clip, setClip] = useState(false);

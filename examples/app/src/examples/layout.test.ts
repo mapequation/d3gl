@@ -13,11 +13,13 @@ describe("tree layout", () => {
     }
     expect(h.links().length).toBe(ns.length - 1);
   });
-  it("radial: finite px/py coords within the viewport", () => {
+  it("radial: finite px/py coords (origin-centred, centred by view transform)", () => {
     const h = layoutRadial(makeTree(64), 800, 600) as any;
     for (const n of h.descendants()) {
       expect(Number.isFinite(n.px)).toBe(true);
       expect(Number.isFinite(n.py)).toBe(true);
+      // origin-centred: tip radius <= min(800,600)/2 - pad = 270
+      expect(Math.hypot(n.px, n.py)).toBeLessThanOrEqual(280);
     }
   });
 });
