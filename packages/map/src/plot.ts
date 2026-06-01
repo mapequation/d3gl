@@ -16,7 +16,9 @@ export interface PlotLayerOptions<D = any> {
   draw: (ctx: CanvasRenderingContext2D, datum: D, index: number) => void;
   fill?: string | ((d: D, i: number) => string);
   stroke?: string | ((d: D, i: number) => string);
-  lineWidth?: number; clipTo?: string;
+  /** A constant width, or a per-datum width (e.g. branch thickness ∝ subtended terminals). */
+  lineWidth?: number | ((d: D, i: number) => number);
+  clipTo?: string;
   id?: (d: D, i: number) => string | number;
 }
 
@@ -37,13 +39,18 @@ export class Plot extends BaseEngine {
   layer<D>(name: string, data: readonly D[], opts: PlotLayerOptions<D>): this {
     const list = data as D[];
     const ids = list.map((d, i) => (opts.id ? opts.id(d, i) : i));
-    const drawOpts = opts.lineWidth != null ? { lineWidth: opts.lineWidth } : undefined;
+    const lw = opts.lineWidth;
+    const widthOf = typeof lw === "function" ? lw : (_d: D, _i: number) => lw as number;
     const build = (g: GroupBuilder): void => {
       // d3gl's PathContext implements the path-building subset d3 generators use;
       // present it as CanvasRenderingContext2D (the type their .context()/geoPath
       // expect) so user draw code needs no cast. Single internal cast here.
       list.forEach((d, i) =>
-        g.drawable(ids[i]!, (ctx: PathContext) => opts.draw(ctx as unknown as CanvasRenderingContext2D, d, i), drawOpts),
+        g.drawable(
+          ids[i]!,
+          (ctx: PathContext) => opts.draw(ctx as unknown as CanvasRenderingContext2D, d, i),
+          lw != null ? { lineWidth: widthOf(d, i) } : undefined,
+        ),
       );
     };
     this.registerLayer({ name, data: list, ids, fill: opts.fill, stroke: opts.stroke, clipTo: opts.clipTo, build });
