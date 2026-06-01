@@ -1,3 +1,5 @@
+import type { RegionSet } from "./parsimony.js";
+
 export interface TreeNode {
   name: string;
   group: number;
@@ -6,6 +8,12 @@ export interface TreeNode {
   /** Age before present, in [0, 1]. Tips are at 0 (the present); the root is oldest. */
   time: number;
   children?: TreeNode[];
+  /** Bioregion distribution: at tips the current distribution, at internal nodes the
+   *  Fitch-reconstructed ancestral range. Set by parsimony.calcMaximumParsimony(). */
+  ranges?: RegionSet;
+  /** Number of subtended terminals (Fig. 3 branch-thickness metric). Set by
+   *  parsimony.aggregateSpeciesCount(). */
+  speciesCount?: number;
 }
 
 /** Deterministic LCG so trees are stable across renders (no Math.random in render path). */
