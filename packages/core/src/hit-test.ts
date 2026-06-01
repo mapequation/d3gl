@@ -9,6 +9,8 @@ interface Entry {
   rings: RingGroup[];       // for filled (outer/holes are Subpath objects)
   strokes: Subpath[];       // for stroke hit-test
   halfWidth: number;
+  circles: { x: number; y: number; r: number }[];
+  tolerance: number;
 }
 
 function bounds(subpaths: Subpath[]): [number, number, number, number] {
@@ -44,13 +46,25 @@ export class HitIndex {
     for (const d of drawables) {
       if ((d.flags & 1) === 0) continue; // hidden never hits
       const closed = d.subpaths.filter((s) => s.closed && s.points.length >= 6);
-      const [minX, minY, maxX, maxY] = bounds(d.subpaths);
+      const circles = d.circles;
+
+      // Compute bounding box from subpaths and/or circle extents.
+      let [minX, minY, maxX, maxY] = bounds(d.subpaths);
+      for (const c of circles) {
+        if (c.x - c.r < minX) minX = c.x - c.r;
+        if (c.x + c.r > maxX) maxX = c.x + c.r;
+        if (c.y - c.r < minY) minY = c.y - c.r;
+        if (c.y + c.r > maxY) maxY = c.y + c.r;
+      }
+
       this.entries.push({
         id: d.id, minX, minY, maxX, maxY,
         filled: closed.length > 0,
         rings: closed.length > 0 ? groupRings(closed) : [],
         strokes: d.lineWidth > 0 ? d.subpaths : [],
         halfWidth: d.lineWidth / 2 + tolerance,
+        circles,
+        tolerance,
       });
     }
   }
@@ -67,6 +81,9 @@ export class HitIndex {
       }
       if (e.strokes.length > 0) {
         for (const s of e.strokes) if (distToSegments(x, y, s.points) <= e.halfWidth) return e.id;
+      }
+      for (const c of e.circles) {
+        if (Math.hypot(x - c.x, y - c.y) <= c.r + e.tolerance) return e.id;
       }
     }
     return null;

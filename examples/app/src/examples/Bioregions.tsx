@@ -6,15 +6,15 @@ import { fitProjection } from "@d3gl/geo";
 import { GeoMap } from "@d3gl/react";
 import type { GeoMap as Engine, HoverHit } from "@d3gl/map";
 import type { GeoInput } from "@d3gl/geo";
-import { makeCells, makeCities, makeGraticule, makeRoute, makeCluster, cellsToFeatureCollection, loadWorld, type Cell } from "./data.js";
+import { makeCells, makeCities, makeGraticule, makeRoute, makeCluster, cellsToFeatureCollection, loadWorld, BASE_STEP, type Cell } from "./bioregions-data.js";
 
 const WIDTH = 900;
 const HEIGHT = 450;
-const OCEAN = "#0e2238";
-const LAND = "#243042";
-const GRAT = "#2c3b52";
-const ROUTE = "#ffd166";
-const CITY = "#ff5a5a";
+const OCEAN = "#d4e6f5";
+const LAND = "#e7e7e0";
+const GRAT = "#bcc6d0";
+const ROUTE = "#e8932f";
+const CITY = "#e23b2f";
 
 type Mode = "heatmap" | "bioregion";
 type BackendType = "webgl" | "canvas" | "svg";
@@ -22,22 +22,26 @@ type BackendType = "webgl" | "canvas" | "svg";
 const heat = scaleSequential(interpolateViridis).domain([0, 1]);
 const cellColor = (c: Cell, mode: Mode) => (mode === "heatmap" ? heat(c.value) : schemeCategory10[c.bioregion % 10]!);
 
-export function App(): React.ReactElement {
+export function Bioregions(): React.ReactElement {
   const [backend, setBackend] = useState<BackendType>("webgl");
   const [mode, setMode] = useState<Mode>("heatmap");
-  const [clip, setClip] = useState(false);
+  const [clip, setClip] = useState(true);
+  // Cell-size exponent: step = BASE_STEP * 2^exp, exp ∈ [-3, 3]. Smaller ⇒ far more
+  // cells (a stress test): exp -3 ≈ 0.75° ≈ 115k cells; exp 3 = 48° ≈ a few hundred.
+  const [sizeExp, setSizeExp] = useState(0);
   const [tooltip, setTooltip] = useState<{ left: number; top: number; text: string } | null>(null);
 
   const mapRef = useRef<Engine | null>(null);
   const modeRef = useRef(mode); modeRef.current = mode;
   const wrapRef = useRef<HTMLDivElement>(null);
 
+  const step = BASE_STEP * Math.pow(2, sizeExp);
   const { cells, cellById, projection } = useMemo(() => {
-    const cells = makeCells();
+    const cells = makeCells(step);
     const projection = fitProjection(geoNaturalEarth1(), cellsToFeatureCollection(cells), WIDTH, HEIGHT);
     const cellById = new Map(cells.map((c) => [c.id, c] as const));
     return { cells, cellById, projection };
-  }, []);
+  }, [step]);
 
   const onReady = (map: Engine): void => {
     mapRef.current = map;
@@ -101,16 +105,32 @@ export function App(): React.ReactElement {
         <button onClick={() => setClip((c) => !c)}>{clip ? "Unclip" : "Clip to land"}</button>
         <button onClick={exportPNG}>Export PNG</button>
         <button onClick={exportSVG}>Export SVG</button>
+        <span style={{ width: 12 }} />
+        <label style={{ fontSize: 13 }}>
+          cell {step >= 1 ? `${step}°` : `${step.toFixed(3)}°`}
+          <input
+            type="range"
+            min={0}
+            max={3}
+            step={1}
+            value={sizeExp}
+            onChange={(e) => setSizeExp(Number(e.target.value))}
+            title="cell size = 1° × 2^exp (smaller = more cells)"
+            style={{ marginLeft: 6, verticalAlign: "middle" }}
+          />
+        </label>
       </div>
-      <div ref={wrapRef} style={{ position: "relative", width: WIDTH, height: HEIGHT, background: "#111", cursor: "crosshair" }}>
+      <div ref={wrapRef} style={{ position: "relative", width: WIDTH, height: HEIGHT, background: "#fff", border: "1px solid #e2e2e2", borderRadius: 6, cursor: "crosshair" }}>
         <GeoMap width={WIDTH} height={HEIGHT} projection={projection} backend={backend} onReady={onReady} onHover={onHover} />
         {tooltip && (
-          <div style={{ position: "absolute", left: tooltip.left, top: tooltip.top, pointerEvents: "none", background: "rgba(0,0,0,0.85)", border: "1px solid #444", borderRadius: 4, padding: "4px 8px", fontSize: 12, whiteSpace: "nowrap" }}>
+          <div style={{ position: "absolute", left: tooltip.left, top: tooltip.top, pointerEvents: "none", background: "rgba(255,255,255,0.96)", border: "1px solid #ccc", borderRadius: 4, padding: "4px 8px", fontSize: 12, whiteSpace: "nowrap", color: "#222", boxShadow: "0 1px 4px rgba(0,0,0,0.15)" }}>
             {tooltip.text}
           </div>
         )}
       </div>
-      <p style={{ opacity: 0.6, fontSize: 12 }}>{cells.length} cells · scroll to zoom, drag to pan · switch backend above (SVG is slower at scale)</p>
+      <p style={{ opacity: 0.6, fontSize: 12 }}>
+        {cells.length.toLocaleString()} cells · scroll to zoom, drag to pan · drag the cell-size slider to stress test (SVG is slower at scale)
+      </p>
     </div>
   );
 }

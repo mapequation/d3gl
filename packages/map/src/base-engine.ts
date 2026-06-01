@@ -1,0 +1,139 @@
+import { select } from "d3-selection";
+import { zoom as d3zoom, type D3ZoomEvent } from "d3-zoom";
+import { Scene, HitIndex, type GroupBuilder, type RenderLayer, type ViewTransform } from "@d3gl/core";
+import { createBackend, type BackendType, type BackendHandle } from "./backend-factory.js";
+
+export type Accessor<D, T> = T | ((d: D, i: number) => T);
+export interface HoverHit { layer: string; id: string | number; datum: unknown; }
+
+interface LayerSpec {
+  name: string;
+  data: any[];
+  ids: (string | number)[];
+  fill?: Accessor<any, string>;
+  stroke?: Accessor<any, string>;
+  clipTo?: string;
+  pointSizeMode?: "world" | "screen";
+  build: (g: GroupBuilder) => void;   // rebuilds the Scene group (geo or draw)
+}
+
+export abstract class BaseEngine {
+  protected scene = new Scene();
+  protected specs: LayerSpec[] = [];
+  protected hitIndexes = new Map<string, HitIndex>();
+  protected transform: ViewTransform = { k: 1, x: 0, y: 0 };
+  protected handle: BackendHandle | null = null;
+  protected ready: Promise<void>;
+  private hoverCb: ((hit: HoverHit | null, ev: PointerEvent) => void) | null = null;
+  private swapToken = 0;
+
+  constructor(protected host: HTMLElement, protected width: number, protected height: number, backend: BackendType) {
+    this.ready = this.swapBackend(backend);
+  }
+  whenReady(): Promise<void> { return this.ready; }
+
+  /** Register/replace a layer: build its Scene group, apply accessors, index, push. */
+  protected registerLayer(spec: LayerSpec): void {
+    this.scene.group(spec.name, spec.build);
+    this.applyAccessors(spec);
+    this.specs = this.specs.filter((s) => s.name !== spec.name).concat(spec);
+    this.hitIndexes.set(spec.name, new HitIndex(this.scene.drawables(spec.name)));
+    this.pushLayers();
+  }
+
+  recolor(name: string): this {
+    const spec = this.specs.find((s) => s.name === name);
+    if (!spec) return this;
+    this.applyAccessors(spec);
+    this.handle?.backend.updateLayer(name, this.renderLayer(spec));
+    this.render();
+    return this;
+  }
+  setClip(name: string, clipTo?: string): this {
+    const spec = this.specs.find((s) => s.name === name);
+    if (!spec) return this;
+    spec.clipTo = clipTo;
+    this.pushLayers();
+    return this;
+  }
+  setBackend(type: BackendType): this { this.ready = this.swapBackend(type); return this; }
+  setTransform(t: ViewTransform): this { this.transform = t; this.handle?.backend.setTransform(t); this.render(); return this; }
+  enableZoom(extent: [number, number] = [1, 100]): this {
+    const sel = select(this.host as Element);
+    const behavior = d3zoom<Element, unknown>().scaleExtent(extent).on("zoom", (e: D3ZoomEvent<Element, unknown>) => {
+      this.setTransform({ k: e.transform.k, x: e.transform.x, y: e.transform.y });
+    });
+    (sel as any).call(behavior);
+    return this;
+  }
+  on(event: "hover", cb: (hit: HoverHit | null, ev: PointerEvent) => void): this {
+    if (event === "hover") {
+      this.hoverCb = cb;
+      this.host.addEventListener("pointermove", this.onPointerMove);
+      this.host.addEventListener("pointerleave", this.onPointerLeave);
+    }
+    return this;
+  }
+  pick(x: number, y: number): HoverHit | null {
+    const px = (x - this.transform.x) / this.transform.k;
+    const py = (y - this.transform.y) / this.transform.k;
+    for (let i = this.specs.length - 1; i >= 0; i--) {
+      const spec = this.specs[i]!;
+      const id = this.hitIndexes.get(spec.name)?.pick(px, py);
+      if (id != null) {
+        const di = spec.ids.indexOf(id);
+        return { layer: spec.name, id, datum: di >= 0 ? spec.data[di] : null };
+      }
+    }
+    return null;
+  }
+  render(): this { this.handle?.backend.render(); return this; }
+  toSVG(): string { return this.handle?.backend.toSVG() ?? ""; }
+  toPNG(): string { return this.handle?.backend.toPNG() ?? ""; }
+  destroy(): void {
+    this.host.removeEventListener("pointermove", this.onPointerMove);
+    this.host.removeEventListener("pointerleave", this.onPointerLeave);
+    this.handle?.backend.destroy();
+    if (this.handle && this.handle.element !== this.host) this.handle.element.remove();
+    this.handle = null;
+  }
+
+  private onPointerMove = (e: PointerEvent): void => {
+    if (!this.hoverCb) return;
+    const r = this.host.getBoundingClientRect();
+    this.hoverCb(this.pick(e.clientX - r.left, e.clientY - r.top), e);
+  };
+  private onPointerLeave = (e: PointerEvent): void => { this.hoverCb?.(null, e); };
+  private resolve<T>(a: Accessor<any, T> | undefined, d: any, i: number): T | undefined {
+    return typeof a === "function" ? (a as (d: any, i: number) => T)(d, i) : a;
+  }
+  private applyAccessors(spec: LayerSpec): void {
+    spec.data.forEach((d, i) => {
+      const id = spec.ids[i]!;
+      const fill = this.resolve(spec.fill, d, i);
+      if (fill) this.scene.setFill(spec.name, id, fill);
+      const stroke = this.resolve(spec.stroke, d, i);
+      if (stroke) this.scene.setStroke(spec.name, id, stroke);
+    });
+  }
+  private renderLayer(spec: LayerSpec): RenderLayer {
+    return { name: spec.name, buffers: this.scene.buffers(spec.name), drawables: this.scene.drawables(spec.name), clipTo: spec.clipTo, pointSizeMode: spec.pointSizeMode };
+  }
+  private pushLayers(): void {
+    this.handle?.backend.setLayers(this.specs.map((s) => this.renderLayer(s)));
+    this.handle?.backend.setTransform(this.transform);
+    this.render();
+  }
+  private async swapBackend(type: BackendType): Promise<void> {
+    const token = ++this.swapToken;
+    const old = this.handle;
+    const next = await createBackend(type, this.host, this.width, this.height);
+    if (token !== this.swapToken) { next.backend.destroy(); if (next.element !== this.host) next.element.remove(); return; }
+    old?.backend.destroy();
+    if (old && old.element !== this.host) old.element.remove();
+    this.handle = next;
+    next.backend.setLayers(this.specs.map((s) => this.renderLayer(s)));
+    next.backend.setTransform(this.transform);
+    next.backend.render();
+  }
+}

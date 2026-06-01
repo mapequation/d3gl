@@ -11,6 +11,11 @@ export interface LabelAnchor {
   width?: number;
   height?: number;
   priority?: number;
+  /** Optional CSS transform applied at the anchor point (origin = the anchor). The
+   *  consumer owns layout-specific placement (gap offset, radial rotation, etc.). */
+  transform?: string;
+  /** transform-origin for the node; defaults to "0 0" (the anchor point). */
+  transformOrigin?: string;
 }
 
 /**
@@ -44,6 +49,8 @@ export class LabelLayer {
       height: a.height,
       priority: a.priority,
       text: a.text,
+      transform: a.transform,
+      transformOrigin: a.transformOrigin,
     }));
     const visible = cullLabels(boxes, { viewport });
     const seen = new Set<string>();
@@ -69,6 +76,8 @@ export class LabelLayer {
       });
       node.style.left = `${Math.round(box.x)}px`;
       node.style.top = `${Math.round(box.y)}px`;
+      node.style.transform = (box.transform as string) ?? "";
+      node.style.transformOrigin = (box.transformOrigin as string) ?? "0 0";
     }
 
     for (const [key, node] of this.nodes) {

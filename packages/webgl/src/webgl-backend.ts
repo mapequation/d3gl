@@ -53,7 +53,7 @@ export class WebGLBackend implements Backend {
     this.layers.clear();
     this.order = [];
     for (const layer of newLayers) {
-      const renderer = new GroupRenderer(this.device, layer.buffers);
+      const renderer = new GroupRenderer(this.device, layer.buffers, this.width, this.height);
       renderer.setTransform(this.clipMatrix);
       this.renderers.set(layer.name, renderer);
       this.layers.set(layer.name, layer);
@@ -67,7 +67,7 @@ export class WebGLBackend implements Backend {
       existing.updateColors(layer.buffers);
       this.layers.set(name, layer);
     } else {
-      const renderer = new GroupRenderer(this.device, layer.buffers);
+      const renderer = new GroupRenderer(this.device, layer.buffers, this.width, this.height);
       renderer.setTransform(this.clipMatrix);
       this.renderers.set(name, renderer);
       this.layers.set(name, layer);
@@ -98,6 +98,7 @@ export class WebGLBackend implements Backend {
       const r = this.renderers.get(name)!;
       const layer = this.layers.get(name)!;
       r.setStencil(clipSources.has(name) ? "write" : layer.clipTo ? "test" : "off");
+      r.setPointSizeMode(layer.pointSizeMode ?? "world");
       r.render(pass);
     }
     pass.end();

@@ -3,7 +3,7 @@ import type { Device, Texture, RenderPass } from "@luma.gl/core";
 import { Model } from "@luma.gl/engine";
 import type { GroupBuffers } from "@d3gl/core";
 import { paletteDimensions, padPalette, padFlags } from "./palette.js";
-import { FILL_VS, FILL_FS, PICK_FS } from "./shaders.js";
+import { FILL_VS, FILL_FS, PICK_FS, POINT_VS, POINT_FS } from "./shaders.js";
 
 const identity = (): Float32Array => new Float32Array([1, 0, 0, 0, 1, 0, 0, 0, 1]);
 
@@ -22,6 +22,23 @@ interface Pass {
   drawableCount: number;
 }
 
+/** GPU resources for the analytic point pass. */
+interface PointPass {
+  centerBuffer: Buffer;
+  cornerBuffer: Buffer;
+  radiusBuffer: Buffer;
+  pointIdBuffer: Buffer;
+  indexBuffer: Buffer;
+  /** Color/flags textures — either shared with fill pass or owned. */
+  colorTexture: Texture;
+  flagsTexture: Texture;
+  /** Whether this pass owns the textures (false = borrowed from fill pass). */
+  ownsTextures: boolean;
+  model: Model;
+  uniforms: Record<string, unknown>;
+  drawableCount: number;
+}
+
 /**
  * Renders one Scene group on the GPU. Geometry is uploaded once; pan/zoom is a
  * transform-uniform update and recolor/visibility is a palette/flags texture
@@ -31,8 +48,16 @@ export class GroupRenderer {
   private transform = identity();
   private fill: Pass | null;
   private stroke: Pass | null;
+  private point: PointPass | null;
 
-  constructor(private readonly device: Device, buffers: GroupBuffers) {
+  constructor(
+    private readonly device: Device,
+    buffers: GroupBuffers,
+    /** Viewport width in device pixels (for screen-mode point sizing). */
+    private viewportWidth = 0,
+    /** Viewport height in device pixels (for screen-mode point sizing). */
+    private viewportHeight = 0,
+  ) {
     this.fill = this.buildPass(
       buffers.fillVertices,
       buffers.fillIndices,
@@ -45,6 +70,7 @@ export class GroupRenderer {
       buffers.strokeColors,
       buffers.flags,
     );
+    this.point = this.buildPointPass(buffers);
   }
 
   private buildPass(
@@ -120,6 +146,131 @@ export class GroupRenderer {
     return { positionBuffer, idBuffer, indexBuffer, colorTexture, flagsTexture, fillModel, pickModel, uniforms, drawableCount: count };
   }
 
+  private buildPointPass(buffers: GroupBuffers): PointPass | null {
+    const N = buffers.pointCount;
+    if (N === 0) return null;
+    const device = this.device;
+    const pc = buffers.pointCenters; // stride 4: [x, y, radius, drawableId]
+
+    // Expand each circle to a quad (4 verts, 6 indices).
+    const centerData = new Float32Array(N * 4 * 2);
+    const cornerData = new Float32Array(N * 4 * 2);
+    const radiusData = new Float32Array(N * 4);
+    const pointIdData = new Float32Array(N * 4);
+    const indexData = new Uint32Array(N * 6);
+
+    const corners: [number, number][] = [[-1, -1], [1, -1], [1, 1], [-1, 1]];
+
+    for (let i = 0; i < N; i++) {
+      const cx = pc[i * 4]!;
+      const cy = pc[i * 4 + 1]!;
+      const r = pc[i * 4 + 2]!;
+      const drawId = pc[i * 4 + 3]!;
+      for (let v = 0; v < 4; v++) {
+        const vi = i * 4 + v;
+        centerData[vi * 2] = cx;
+        centerData[vi * 2 + 1] = cy;
+        cornerData[vi * 2] = corners[v]![0];
+        cornerData[vi * 2 + 1] = corners[v]![1];
+        radiusData[vi] = r;
+        pointIdData[vi] = drawId;
+      }
+      const base = i * 4;
+      const ii = i * 6;
+      indexData[ii] = base;
+      indexData[ii + 1] = base + 1;
+      indexData[ii + 2] = base + 2;
+      indexData[ii + 3] = base;
+      indexData[ii + 4] = base + 2;
+      indexData[ii + 5] = base + 3;
+    }
+
+    const centerBuffer = device.createBuffer({ data: centerData });
+    const cornerBuffer = device.createBuffer({ data: cornerData });
+    const radiusBuffer = device.createBuffer({ data: radiusData });
+    const pointIdBuffer = device.createBuffer({ data: pointIdData });
+    const indexBuffer = device.createBuffer({
+      data: indexData,
+      usage: Buffer.INDEX,
+      indexType: "uint32",
+    });
+
+    // Reuse fill pass textures if available, else build from fillColors/flags.
+    let colorTexture: Texture;
+    let flagsTexture: Texture;
+    let ownsTextures: boolean;
+    if (this.fill) {
+      colorTexture = this.fill.colorTexture;
+      flagsTexture = this.fill.flagsTexture;
+      ownsTextures = false;
+    } else {
+      const count = buffers.fillColors.length / 4;
+      const dims = paletteDimensions(count);
+      colorTexture = device.createTexture({
+        data: padPalette(buffers.fillColors, dims),
+        width: dims.width,
+        height: dims.height,
+        format: "rgba8unorm",
+        mipLevels: 1,
+        sampler: { minFilter: "nearest", magFilter: "nearest" },
+      });
+      flagsTexture = device.createTexture({
+        data: padFlags(buffers.flags, dims),
+        width: dims.width,
+        height: dims.height,
+        format: "r8unorm",
+        mipLevels: 1,
+        sampler: { minFilter: "nearest", magFilter: "nearest" },
+      });
+      ownsTextures = true;
+    }
+
+    const bufferLayout = [
+      { name: "a_center", format: "float32x2" as const },
+      { name: "a_corner", format: "float32x2" as const },
+      { name: "a_radius", format: "float32" as const },
+      { name: "a_pointId", format: "float32" as const },
+    ];
+    const attributes = {
+      a_center: centerBuffer,
+      a_corner: cornerBuffer,
+      a_radius: radiusBuffer,
+      a_pointId: pointIdBuffer,
+    };
+    const bindings = { u_colorTable: colorTexture, u_flags: flagsTexture };
+    const uniforms: Record<string, unknown> = {
+      u_transform: this.transform,
+      u_pointScreen: 0,
+      u_viewport: new Float32Array([this.viewportWidth, this.viewportHeight]),
+    };
+
+    const model = new Model(device, {
+      vs: POINT_VS,
+      fs: POINT_FS,
+      bufferLayout,
+      attributes,
+      indexBuffer,
+      bindings,
+      uniforms,
+      topology: "triangle-list" as const,
+      vertexCount: indexData.length,
+    });
+
+    return {
+      centerBuffer,
+      cornerBuffer,
+      radiusBuffer,
+      pointIdBuffer,
+      indexBuffer,
+      colorTexture,
+      flagsTexture,
+      ownsTextures,
+      model,
+      uniforms,
+      drawableCount: buffers.drawableCount,
+    };
+  }
+
   private passes(): Pass[] {
     return [this.fill, this.stroke].filter((p): p is Pass => p !== null);
   }
@@ -136,6 +287,11 @@ export class GroupRenderer {
   updateColors(buffers: GroupBuffers): void {
     if (this.fill) this.writeTables(this.fill, buffers.fillColors, buffers.flags);
     if (this.stroke) this.writeTables(this.stroke, buffers.strokeColors, buffers.flags);
+    // If the point pass owns its own textures (no fill pass), update them too.
+    if (this.point?.ownsTextures) {
+      this.writePointTables(this.point, buffers.fillColors, buffers.flags);
+    }
+    // If point borrows from fill, fill's writeTables above already updated those textures.
   }
 
   private writeTables(pass: Pass, colors: Uint8Array, flags: Uint8Array): void {
@@ -161,6 +317,19 @@ export class GroupRenderer {
     });
   }
 
+  private writePointTables(pp: PointPass, colors: Uint8Array, flags: Uint8Array): void {
+    const count = colors.length / 4;
+    if (count !== pp.drawableCount) {
+      throw new Error(
+        `updateColors drawable count ${count} != ${pp.drawableCount} at build time; ` +
+          `create a new GroupRenderer for a changed drawable set`,
+      );
+    }
+    const dims = paletteDimensions(count);
+    pp.colorTexture.writeData(padPalette(colors, dims), { x: 0, y: 0, width: dims.width, height: dims.height });
+    pp.flagsTexture.writeData(padFlags(flags, dims), { x: 0, y: 0, width: dims.width, height: dims.height });
+  }
+
   private static STENCIL = {
     off:   { depthCompare: "always", depthWriteEnabled: false, stencilCompare: "always" },
     write: { depthCompare: "always", depthWriteEnabled: false, stencilCompare: "equal", stencilReadMask: 0x01, stencilWriteMask: 0x01, stencilPassOperation: "increment-clamp", stencilFailOperation: "keep", stencilDepthFailOperation: "keep" },
@@ -172,6 +341,7 @@ export class GroupRenderer {
     const params = GroupRenderer.STENCIL[mode] as Record<string, unknown>;
     if (this.fill) this.fill.fillModel.setParameters(params);
     if (this.stroke) this.stroke.fillModel.setParameters(params);
+    if (this.point) this.point.model.setParameters(params);
   }
 
   /** Set the view transform (column-major mat3) for pan/zoom. */
@@ -181,12 +351,21 @@ export class GroupRenderer {
     for (const pass of this.passes()) {
       pass.uniforms["u_transform"] = m;
     }
+    if (this.point) this.point.uniforms["u_transform"] = m;
   }
 
-  /** Draw the fill then stroke passes into an open render pass. */
+  /** Switch the point size mode for the next render. Default "world" (scales with zoom). */
+  setPointSizeMode(mode: "world" | "screen"): void {
+    if (this.point) {
+      this.point.uniforms["u_pointScreen"] = mode === "screen" ? 1.0 : 0.0;
+    }
+  }
+
+  /** Draw the fill, stroke, then point passes into an open render pass. */
   render(renderPass: RenderPass): void {
     if (this.fill) this.fill.fillModel.draw(renderPass);
     if (this.stroke) this.stroke.fillModel.draw(renderPass);
+    if (this.point) this.point.model.draw(renderPass);
   }
 
   /**
@@ -207,6 +386,19 @@ export class GroupRenderer {
       pass.flagsTexture.destroy();
       pass.fillModel.destroy();
       pass.pickModel.destroy();
+    }
+    if (this.point) {
+      this.point.centerBuffer.destroy();
+      this.point.cornerBuffer.destroy();
+      this.point.radiusBuffer.destroy();
+      this.point.pointIdBuffer.destroy();
+      this.point.indexBuffer.destroy();
+      this.point.model.destroy();
+      // Only destroy textures if they are owned (not shared with fill pass).
+      if (this.point.ownsTextures) {
+        this.point.colorTexture.destroy();
+        this.point.flagsTexture.destroy();
+      }
     }
   }
 }

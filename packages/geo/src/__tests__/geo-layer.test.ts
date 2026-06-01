@@ -12,7 +12,7 @@ function build(features: any[], opts: any) {
 }
 
 describe("geoLayer", () => {
-  it("renders Point/MultiPoint as filled dots (closed subpaths)", () => {
+  it("renders Point/MultiPoint as analytic circle drawables", () => {
     const scene = build(
       [
         { type: "Point", coordinates: [0, 0] },
@@ -22,8 +22,11 @@ describe("geoLayer", () => {
     );
     const ds = scene.drawables("g");
     expect(ds.length).toBe(2);
-    expect(ds[0]!.subpaths[0]!.closed).toBe(true);          // dot is fillable
-    expect(ds[1]!.subpaths.length).toBeGreaterThanOrEqual(2); // two dots in one drawable
+    // Points are circle drawables (center+radius), not flattened polygons.
+    expect(ds[0]!.subpaths.length).toBe(0);
+    expect(ds[0]!.circles.length).toBe(1);
+    expect(ds[0]!.circles[0]!.r).toBe(4);
+    expect(ds[1]!.circles.length).toBe(2); // two circles in one MultiPoint drawable
   });
 
   it("renders Polygon (closed) and LineString (open stroke)", () => {
