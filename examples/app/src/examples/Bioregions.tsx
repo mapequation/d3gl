@@ -110,12 +110,12 @@ export function Bioregions(): React.ReactElement {
           cell {step >= 1 ? `${step}°` : `${step.toFixed(3)}°`}
           <input
             type="range"
-            min={-3}
+            min={0}
             max={3}
             step={1}
             value={sizeExp}
             onChange={(e) => setSizeExp(Number(e.target.value))}
-            title="cell size = 6° × 2^exp (smaller = more cells)"
+            title="cell size = 1° × 2^exp (smaller = more cells)"
             style={{ marginLeft: 6, verticalAlign: "middle" }}
           />
         </label>

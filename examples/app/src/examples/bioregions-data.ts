@@ -16,7 +16,7 @@ export interface Cell {
 }
 
 /** Base cell size in degrees; the example scales it by powers of two via a slider. */
-export const BASE_STEP = 6;
+export const BASE_STEP = 1;
 
 function clamp01(x: number): number {
   return Math.max(0, Math.min(1, x));
