@@ -18,19 +18,19 @@ export function App(): React.ReactElement {
   const [selected, setSelected] = useState<ExampleId>("bioregions");
 
   return (
-    <div style={{ display: "flex", minHeight: "100vh", background: "#0b0b0c", color: "#eee" }}>
+    <div style={{ display: "flex", minHeight: "100vh", background: "#ffffff", color: "#222" }}>
       {/* Left drawer */}
       <nav style={{
         width: 200,
         minWidth: 200,
-        background: "#111318",
-        borderRight: "1px solid #222",
+        background: "#f6f7f9",
+        borderRight: "1px solid #e2e2e2",
         padding: "16px 0",
         display: "flex",
         flexDirection: "column",
         gap: 4,
       }}>
-        <div style={{ padding: "0 16px 12px", fontSize: 13, fontWeight: 700, letterSpacing: "0.06em", color: "#666", textTransform: "uppercase" }}>
+        <div style={{ padding: "0 16px 12px", fontSize: 13, fontWeight: 700, letterSpacing: "0.06em", color: "#999", textTransform: "uppercase" }}>
           d3gl examples
         </div>
         {EXAMPLES.map((ex) => (
@@ -42,10 +42,10 @@ export function App(): React.ReactElement {
               width: "100%",
               padding: "8px 16px",
               textAlign: "left",
-              background: selected === ex.id ? "#1e2a3a" : "transparent",
-              color: selected === ex.id ? "#7eb8f7" : "#ccc",
+              background: selected === ex.id ? "#e8f0fe" : "transparent",
+              color: selected === ex.id ? "#1a73e8" : "#444",
               border: "none",
-              borderLeft: selected === ex.id ? "3px solid #4a9eff" : "3px solid transparent",
+              borderLeft: selected === ex.id ? "3px solid #1a73e8" : "3px solid transparent",
               cursor: "pointer",
               fontSize: 14,
               fontFamily: "inherit",

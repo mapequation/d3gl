@@ -10,11 +10,11 @@ import { makeCells, makeCities, makeGraticule, makeRoute, makeCluster, cellsToFe
 
 const WIDTH = 900;
 const HEIGHT = 450;
-const OCEAN = "#0e2238";
-const LAND = "#243042";
-const GRAT = "#2c3b52";
-const ROUTE = "#ffd166";
-const CITY = "#ff5a5a";
+const OCEAN = "#d4e6f5";
+const LAND = "#e7e7e0";
+const GRAT = "#bcc6d0";
+const ROUTE = "#e8932f";
+const CITY = "#e23b2f";
 
 type Mode = "heatmap" | "bioregion";
 type BackendType = "webgl" | "canvas" | "svg";
@@ -102,10 +102,10 @@ export function Bioregions(): React.ReactElement {
         <button onClick={exportPNG}>Export PNG</button>
         <button onClick={exportSVG}>Export SVG</button>
       </div>
-      <div ref={wrapRef} style={{ position: "relative", width: WIDTH, height: HEIGHT, background: "#111", cursor: "crosshair" }}>
+      <div ref={wrapRef} style={{ position: "relative", width: WIDTH, height: HEIGHT, background: "#fff", border: "1px solid #e2e2e2", borderRadius: 6, cursor: "crosshair" }}>
         <GeoMap width={WIDTH} height={HEIGHT} projection={projection} backend={backend} onReady={onReady} onHover={onHover} />
         {tooltip && (
-          <div style={{ position: "absolute", left: tooltip.left, top: tooltip.top, pointerEvents: "none", background: "rgba(0,0,0,0.85)", border: "1px solid #444", borderRadius: 4, padding: "4px 8px", fontSize: 12, whiteSpace: "nowrap" }}>
+          <div style={{ position: "absolute", left: tooltip.left, top: tooltip.top, pointerEvents: "none", background: "rgba(255,255,255,0.96)", border: "1px solid #ccc", borderRadius: 4, padding: "4px 8px", fontSize: 12, whiteSpace: "nowrap", color: "#222", boxShadow: "0 1px 4px rgba(0,0,0,0.15)" }}>
             {tooltip.text}
           </div>
         )}

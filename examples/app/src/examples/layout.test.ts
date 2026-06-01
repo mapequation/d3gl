@@ -1,25 +1,36 @@
 import { describe, it, expect } from "vitest";
 import { makeTree } from "./tree.js";
-import { layoutRectangular, layoutRadial } from "./layout.js";
+import { layoutRectangular, layoutRadial, nodeXY } from "./layout.js";
 
 describe("tree layout", () => {
-  it("rectangular: finite px/py coords, leaves at increasing depth", () => {
-    const h = layoutRectangular(makeTree(64), 800, 600);
-    const ns = h.descendants() as any[];
+  it("rectangular: finite coords, one link per non-root node", () => {
+    const h = layoutRectangular(makeTree(64), 800, 600, "linear");
+    const ns = h.descendants();
     expect(ns.length).toBeGreaterThan(64);
     for (const n of ns) {
-      expect(Number.isFinite(n.px)).toBe(true);
-      expect(Number.isFinite(n.py)).toBe(true);
+      const [x, y] = nodeXY(n, "rectangular");
+      expect(Number.isFinite(x)).toBe(true);
+      expect(Number.isFinite(y)).toBe(true);
     }
-    expect(h.links().length).toBe(ns.length - 1);
+    expect(h.links().length).toBe(ns.length - 1); // HierarchyPointLink[], no cast
   });
-  it("radial: finite px/py coords (origin-centred, centred by view transform)", () => {
-    const h = layoutRadial(makeTree(64), 800, 600) as any;
+
+  it("radial: finite origin-centred coords within the disc", () => {
+    const h = layoutRadial(makeTree(64), 800, 600, "linear");
     for (const n of h.descendants()) {
-      expect(Number.isFinite(n.px)).toBe(true);
-      expect(Number.isFinite(n.py)).toBe(true);
-      // origin-centred: tip radius <= min(800,600)/2 - pad = 270
-      expect(Math.hypot(n.px, n.py)).toBeLessThanOrEqual(280);
+      const [x, y] = nodeXY(n, "radial");
+      expect(Number.isFinite(x)).toBe(true);
+      expect(Number.isFinite(y)).toBe(true);
+      expect(Math.hypot(x, y)).toBeLessThanOrEqual(280); // <= min(800,600)/2 - pad
+    }
+  });
+
+  it("log time scale also yields finite coords", () => {
+    const h = layoutRadial(makeTree(128), 800, 600, "log");
+    for (const n of h.descendants()) {
+      const [x, y] = nodeXY(n, "radial");
+      expect(Number.isFinite(x)).toBe(true);
+      expect(Number.isFinite(y)).toBe(true);
     }
   });
 });

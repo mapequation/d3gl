@@ -1,62 +1,71 @@
-import { hierarchy, cluster, type HierarchyNode } from "d3-hierarchy";
+import { hierarchy, cluster, type HierarchyPointNode } from "d3-hierarchy";
 import { pointRadial } from "d3-shape";
+import { scaleLinear, scaleSymlog } from "d3-scale";
 import type { TreeNode } from "./tree.js";
 
+export type LayoutMode = "rectangular" | "radial";
+export type TimeScaleKind = "linear" | "log";
+
 /**
- * Extended node with final canvas coordinates (px, py).
- * px = horizontal axis (depth / branch length direction)
- * py = vertical axis (leaf spacing direction)
- * For radial: px, py are origin-centered Cartesian coordinates (can be negative).
- *   The view is centered via the d3-zoom transform (translate CX, CY).
+ * Map a node's age (time before present; tips = 0, root = maxAge) to a position.
+ * `present` is the coordinate for age 0, `root` the coordinate for the oldest node.
+ * `scaleSymlog` is used for "log" because it is defined at 0 (unlike scaleLog).
  */
-export interface PositionedNode {
-  px: number;
-  py: number;
-  angle?: number;
-  radius?: number;
+function timePosition(kind: TimeScaleKind, maxAge: number, present: number, root: number): (age: number) => number {
+  if (kind === "log") {
+    const s = scaleSymlog().domain([0, maxAge]).range([present, root]);
+    return (age) => s(age);
+  }
+  const s = scaleLinear().domain([0, maxAge]).range([present, root]);
+  return (age) => s(age);
 }
 
-export type PNode = HierarchyNode<TreeNode> & PositionedNode;
-
 /**
- * Rectangular dated phylogram. The main axis is TIME: tips (time 0, the present)
- * align at the right edge; the root (oldest) is at the left. py is leaf spacing.
+ * Rectangular dated phylogram. Uses d3's HierarchyPointNode coordinates directly:
+ * `x` = vertical leaf-spacing axis, `y` = horizontal time axis. Tips (age 0) align at
+ * the right (the present); the root (oldest) sits at the left.
  */
-export function layoutRectangular(root: TreeNode, width: number, height: number, pad = 40): HierarchyNode<TreeNode> {
-  const h = hierarchy(root, (d) => d.children);
-  cluster<TreeNode>().size([height - 2 * pad, 1])(h);
-  const maxTime = h.data.time || 1;            // the root's age
-  const sw = width - 2 * pad;
-  h.each((n: any) => {
-    // (maxTime - time)/maxTime: root -> 0 (left), tips (time 0) -> 1 (right, aligned).
-    n.px = pad + ((maxTime - n.data.time) / maxTime) * sw;
-    n.py = pad + n.x;                          // cluster cross-axis = leaf spacing
+export function layoutRectangular(
+  root: TreeNode,
+  width: number,
+  height: number,
+  time: TimeScaleKind,
+  pad = 40,
+): HierarchyPointNode<TreeNode> {
+  const h = cluster<TreeNode>().size([height - 2 * pad, 1])(hierarchy(root, (d) => d.children));
+  const maxAge = h.data.time || 1;
+  const pos = timePosition(time, maxAge, width - pad, pad); // age 0 → right, age max → left
+  h.each((n) => {
+    n.x += pad;
+    n.y = pos(n.data.time);
   });
   return h;
 }
 
 /**
- * Radial dated phylogram: radius is TIME, so all tips (time 0) sit on the outer
- * rim (aligned at the present) and the root is at the centre.
- *
- * IMPORTANT: px, py are origin-centred (can be negative). The caller must set the
- * view transform to translate(CX, CY) so the tree is centred on screen.
- * This allows linkRadial() to work correctly (it computes around origin).
+ * Radial dated phylogram. d3 convention: `x` = angle (0..2π), `y` = radius (= time).
+ * Tips (age 0) sit on the outer rim, the root at the centre. Cartesian positions come
+ * from `d3.pointRadial(x, y)` and are origin-centred — the caller centres the view with
+ * a `translate(CX, CY)` transform (which also lets `d3.linkRadial()` work unmodified).
  */
-export function layoutRadial(root: TreeNode, width: number, height: number, pad = 30): HierarchyNode<TreeNode> {
-  const h = hierarchy(root, (d) => d.children);
-  cluster<TreeNode>().size([2 * Math.PI, 1])(h);
-  const maxTime = h.data.time || 1;
+export function layoutRadial(
+  root: TreeNode,
+  width: number,
+  height: number,
+  time: TimeScaleKind,
+  pad = 30,
+): HierarchyPointNode<TreeNode> {
+  const h = cluster<TreeNode>().size([2 * Math.PI, 1])(hierarchy(root, (d) => d.children));
+  const maxAge = h.data.time || 1;
   const R = Math.min(width, height) / 2 - pad;
-  h.each((n: any) => {
-    const a = n.x;                             // angle from cluster (0..2π)
-    const r = ((maxTime - n.data.time) / maxTime) * R;   // tips (time 0) -> R
-    n.angle = a;
-    n.radius = r;
-    // pointRadial(angle, radius) returns [x, y] origin-centred
-    const [px, py] = pointRadial(a, r);
-    n.px = px;
-    n.py = py;
+  const pos = timePosition(time, maxAge, R, 0); // age 0 → R (rim), age max → 0 (centre)
+  h.each((n) => {
+    n.y = pos(n.data.time); // x stays the cluster angle
   });
   return h;
+}
+
+/** Cartesian world coordinates for a node, for points / labels / hit-testing. */
+export function nodeXY(n: HierarchyPointNode<TreeNode>, mode: LayoutMode): [number, number] {
+  return mode === "radial" ? pointRadial(n.x, n.y) : [n.y, n.x];
 }

@@ -4,7 +4,16 @@ import type { BackendType } from "./backend-factory.js";
 
 export interface PlotOptions { width: number; height: number; backend?: BackendType; }
 export interface PlotLayerOptions<D = any> {
-  draw: (ctx: PathContext, datum: D, index: number) => void;
+  /**
+   * Draw one datum's geometry by emitting path commands. The context is typed as
+   * `CanvasRenderingContext2D` so d3 generators that render to a context —
+   * `d3.linkHorizontal()`, `d3.linkRadial()`, `d3.line()`, `d3.arc()`,
+   * `geoPath(projection, ctx)`, `d3.ribbon()`, … — accept it directly with no cast.
+   * Only the path-building subset (moveTo/lineTo/bezierCurveTo/quadraticCurveTo/
+   * arc/arcTo/rect/closePath) is implemented; fills/strokes come from the layer
+   * options below, not from context state.
+   */
+  draw: (ctx: CanvasRenderingContext2D, datum: D, index: number) => void;
   fill?: string | ((d: D, i: number) => string);
   stroke?: string | ((d: D, i: number) => string);
   lineWidth?: number; clipTo?: string;
@@ -30,7 +39,12 @@ export class Plot extends BaseEngine {
     const ids = list.map((d, i) => (opts.id ? opts.id(d, i) : i));
     const drawOpts = opts.lineWidth != null ? { lineWidth: opts.lineWidth } : undefined;
     const build = (g: GroupBuilder): void => {
-      list.forEach((d, i) => g.drawable(ids[i]!, (ctx: PathContext) => opts.draw(ctx, d, i), drawOpts));
+      // d3gl's PathContext implements the path-building subset d3 generators use;
+      // present it as CanvasRenderingContext2D (the type their .context()/geoPath
+      // expect) so user draw code needs no cast. Single internal cast here.
+      list.forEach((d, i) =>
+        g.drawable(ids[i]!, (ctx: PathContext) => opts.draw(ctx as unknown as CanvasRenderingContext2D, d, i), drawOpts),
+      );
     };
     this.registerLayer({ name, data: list, ids, fill: opts.fill, stroke: opts.stroke, clipTo: opts.clipTo, build });
     return this;
