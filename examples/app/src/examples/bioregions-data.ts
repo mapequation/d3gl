@@ -15,19 +15,20 @@ export interface Cell {
   bioregion: number;
 }
 
-const STEP = 6; // degrees (coarser for SVG perf)
+/** Base cell size in degrees; the example scales it by powers of two via a slider. */
+export const BASE_STEP = 6;
 
 function clamp01(x: number): number {
   return Math.max(0, Math.min(1, x));
 }
 
-/** Generate a global grid of 6°×6° cells with smooth synthetic fields. */
-export function makeCells(): Cell[] {
+/** Generate a global grid of `step`°×`step`° cells with smooth synthetic fields. */
+export function makeCells(step: number = BASE_STEP): Cell[] {
   const cells: Cell[] = [];
   let col = 0;
-  for (let lon = -180; lon < 180; lon += STEP, col++) {
+  for (let lon = -180; lon < 180; lon += step, col++) {
     let row = 0;
-    for (let lat = -90; lat < 90; lat += STEP, row++) {
+    for (let lat = -90; lat < 90; lat += step, row++) {
       const lonR = (lon * Math.PI) / 180;
       const latR = (lat * Math.PI) / 180;
       const value = clamp01(0.5 + 0.5 * Math.sin(lonR * 2) * Math.cos(latR * 3));
@@ -38,9 +39,9 @@ export function makeCells(): Cell[] {
         coordinates: [
           [
             [lon, lat],
-            [lon, lat + STEP],
-            [lon + STEP, lat + STEP],
-            [lon + STEP, lat],
+            [lon, lat + step],
+            [lon + step, lat + step],
+            [lon + step, lat],
             [lon, lat],
           ],
         ],
@@ -48,7 +49,7 @@ export function makeCells(): Cell[] {
       cells.push({
         id: `${col}-${row}`,
         geometry,
-        center: [lon + STEP / 2, lat + STEP / 2],
+        center: [lon + step / 2, lat + step / 2],
         value,
         bioregion,
       });

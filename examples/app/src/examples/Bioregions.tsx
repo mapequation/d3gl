@@ -6,7 +6,7 @@ import { fitProjection } from "@d3gl/geo";
 import { GeoMap } from "@d3gl/react";
 import type { GeoMap as Engine, HoverHit } from "@d3gl/map";
 import type { GeoInput } from "@d3gl/geo";
-import { makeCells, makeCities, makeGraticule, makeRoute, makeCluster, cellsToFeatureCollection, loadWorld, type Cell } from "./bioregions-data.js";
+import { makeCells, makeCities, makeGraticule, makeRoute, makeCluster, cellsToFeatureCollection, loadWorld, BASE_STEP, type Cell } from "./bioregions-data.js";
 
 const WIDTH = 900;
 const HEIGHT = 450;
@@ -25,19 +25,23 @@ const cellColor = (c: Cell, mode: Mode) => (mode === "heatmap" ? heat(c.value) :
 export function Bioregions(): React.ReactElement {
   const [backend, setBackend] = useState<BackendType>("webgl");
   const [mode, setMode] = useState<Mode>("heatmap");
-  const [clip, setClip] = useState(false);
+  const [clip, setClip] = useState(true);
+  // Cell-size exponent: step = BASE_STEP * 2^exp, exp ∈ [-3, 3]. Smaller ⇒ far more
+  // cells (a stress test): exp -3 ≈ 0.75° ≈ 115k cells; exp 3 = 48° ≈ a few hundred.
+  const [sizeExp, setSizeExp] = useState(0);
   const [tooltip, setTooltip] = useState<{ left: number; top: number; text: string } | null>(null);
 
   const mapRef = useRef<Engine | null>(null);
   const modeRef = useRef(mode); modeRef.current = mode;
   const wrapRef = useRef<HTMLDivElement>(null);
 
+  const step = BASE_STEP * Math.pow(2, sizeExp);
   const { cells, cellById, projection } = useMemo(() => {
-    const cells = makeCells();
+    const cells = makeCells(step);
     const projection = fitProjection(geoNaturalEarth1(), cellsToFeatureCollection(cells), WIDTH, HEIGHT);
     const cellById = new Map(cells.map((c) => [c.id, c] as const));
     return { cells, cellById, projection };
-  }, []);
+  }, [step]);
 
   const onReady = (map: Engine): void => {
     mapRef.current = map;
@@ -101,6 +105,20 @@ export function Bioregions(): React.ReactElement {
         <button onClick={() => setClip((c) => !c)}>{clip ? "Unclip" : "Clip to land"}</button>
         <button onClick={exportPNG}>Export PNG</button>
         <button onClick={exportSVG}>Export SVG</button>
+        <span style={{ width: 12 }} />
+        <label style={{ fontSize: 13 }}>
+          cell {step >= 1 ? `${step}°` : `${step.toFixed(3)}°`}
+          <input
+            type="range"
+            min={-3}
+            max={3}
+            step={1}
+            value={sizeExp}
+            onChange={(e) => setSizeExp(Number(e.target.value))}
+            title="cell size = 6° × 2^exp (smaller = more cells)"
+            style={{ marginLeft: 6, verticalAlign: "middle" }}
+          />
+        </label>
       </div>
       <div ref={wrapRef} style={{ position: "relative", width: WIDTH, height: HEIGHT, background: "#fff", border: "1px solid #e2e2e2", borderRadius: 6, cursor: "crosshair" }}>
         <GeoMap width={WIDTH} height={HEIGHT} projection={projection} backend={backend} onReady={onReady} onHover={onHover} />
@@ -110,7 +128,9 @@ export function Bioregions(): React.ReactElement {
           </div>
         )}
       </div>
-      <p style={{ opacity: 0.6, fontSize: 12 }}>{cells.length} cells · scroll to zoom, drag to pan · switch backend above (SVG is slower at scale)</p>
+      <p style={{ opacity: 0.6, fontSize: 12 }}>
+        {cells.length.toLocaleString()} cells · scroll to zoom, drag to pan · drag the cell-size slider to stress test (SVG is slower at scale)
+      </p>
     </div>
   );
 }

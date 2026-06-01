@@ -2,7 +2,7 @@ import React, { useEffect, useRef, useState } from "react";
 import { schemeCategory10 } from "d3-scale-chromatic";
 import { select } from "d3-selection";
 import { zoom as d3zoom, type D3ZoomEvent, zoomIdentity } from "d3-zoom";
-import { link as d3link, linkRadial, curveLinear, curveStep, curveBumpX, pointRadial } from "d3-shape";
+import { link as d3link, linkRadial, curveLinear, curveStepBefore, curveBumpX, pointRadial } from "d3-shape";
 import type { HierarchyPointNode, HierarchyPointLink } from "d3-hierarchy";
 import { plot, type Plot, type HoverHit } from "@d3gl/map";
 import { LabelLayer, type LabelAnchor } from "@d3gl/labels";
@@ -28,7 +28,7 @@ type PLink = HierarchyPointLink<TreeNode>;
  */
 function makeLinkDraw(mode: LayoutMode, curve: CurveMode): (ctx: CanvasRenderingContext2D, l: PLink) => void {
   if (mode === "rectangular") {
-    const factory = curve === "linear" ? curveLinear : curve === "step" ? curveStep : curveBumpX;
+    const factory = curve === "linear" ? curveLinear : curve === "step" ? curveStepBefore : curveBumpX;
     const gen = d3link<PLink, PNode>(factory).x((d) => d.y).y((d) => d.x); // x=time depth, y=leaf row
     return (ctx, l) => { gen.context(ctx); gen(l); };
   }
@@ -44,18 +44,16 @@ function makeLinkDraw(mode: LayoutMode, curve: CurveMode): (ctx: CanvasRendering
       ctx.lineTo(tx, ty);
     };
   }
-  // radial "step": arc along the parent radius from parent angle to child angle, then a
-  // radial line out to the child. pointRadial uses screen angle = (angle - π/2).
+  // radial "step": a circular arc along the parent radius from the parent angle to the
+  // child angle, then a radial line out to the child. pointRadial's screen angle is
+  // (angle - π/2). Use the built-in ctx.arc (flattened consistently across backends);
+  // anticlockwise = ta < sa sweeps the short way to the child.
   return (ctx, l) => {
     const r0 = l.source.y;
     const sa = l.source.x - Math.PI / 2;
     const ta = l.target.x - Math.PI / 2;
-    const steps = Math.max(1, Math.ceil(Math.abs(ta - sa) / 0.12));
     ctx.moveTo(r0 * Math.cos(sa), r0 * Math.sin(sa));
-    for (let i = 1; i <= steps; i++) {
-      const a = sa + ((ta - sa) * i) / steps;
-      ctx.lineTo(r0 * Math.cos(a), r0 * Math.sin(a));
-    }
+    ctx.arc(0, 0, r0, sa, ta, ta < sa);
     const [tx, ty] = pointRadial(l.target.x, l.target.y);
     ctx.lineTo(tx, ty);
   };
