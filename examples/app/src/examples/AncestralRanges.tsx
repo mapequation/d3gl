@@ -89,12 +89,22 @@ function topRegion(node: PNode): number | undefined {
   return node.data.clusters?.clusters[0]?.clusterId;
 }
 
-function labelTransform(mode: LayoutMode, angle: number, gap: number): string {
-  if (mode !== "radial") return `translate(${gap}px, -50%)`;
+// Rotation/centering only — the constant-px gap from the node is the LabelAnchor `offset`
+// (which the LabelLayer also uses for collision, so labels keep their distance and don't
+// overlap as you zoom).
+function labelTransform(mode: LayoutMode, angle: number): string {
+  if (mode !== "radial") return "";
   const deg = (angle * 180) / Math.PI - 90;
   return Math.sin(angle) < 0
-    ? `rotate(${deg + 180}deg) translate(${-gap}px, -50%) translate(-100%, 0)`
-    : `rotate(${deg}deg) translate(${gap}px, -50%)`;
+    ? `rotate(${deg + 180}deg) translate(-100%, -50%)`
+    : `rotate(${deg}deg) translate(0, -50%)`;
+}
+/** Constant screen-px offset from the node: rightward (rectangular) or outward along the
+ *  radius (radial). Vertical centering for rectangular is folded in as -height/2. */
+function labelOffset(mode: LayoutMode, angle: number, gap: number, height: number): [number, number] {
+  if (mode !== "radial") return [gap, -height / 2];
+  const a = angle - Math.PI / 2; // pointRadial's outward direction
+  return [Math.cos(a) * gap, Math.sin(a) * gap];
 }
 
 interface Tip { left: number; top: number; name: string; kind: string; rows: { name: string; color: string; count: number }[]; }
@@ -204,11 +214,14 @@ export function AncestralRanges(): React.ReactElement {
     const GAP = 8;
     anchorsRef.current = tipNodes.map((n, i) => {
       const [px, py] = nodeXY(n, layoutMode);
+      const h = 14;
       return {
         id: `t${i}`, refX: px, refY: py, text: n.data.name,
-        width: n.data.name.length * 6.2 + 6, height: 14,
+        width: n.data.name.length * 6.2 + 6, height: h,
         priority: n.data.speciesCount ?? 1,
-        transformOrigin: "0 0", transform: labelTransform(layoutMode, n.x, GAP),
+        transformOrigin: "0 0",
+        offset: labelOffset(layoutMode, n.x, GAP, h),
+        transform: labelTransform(layoutMode, n.x),
       };
     });
 
