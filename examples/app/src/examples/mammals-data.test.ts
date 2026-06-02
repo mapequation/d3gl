@@ -47,8 +47,10 @@ describe("assignBioregions", () => {
       for (const r of set.clusters) {
         expect(r.clusterId).toBeGreaterThanOrEqual(0);
         expect(r.clusterId).toBeLessThan(REGION_NAMES.length);
+        expect(r.count).toBeGreaterThanOrEqual(1); // synthetic occurrence count
         usedRegions.add(r.clusterId);
       }
+      expect(set.totCount).toBe(set.clusters.reduce((s, r) => s + r.count, 0));
       if (set.clusters.length === 1) single++;
     }
     expect(single / ls.length).toBeGreaterThanOrEqual(0.6); // most species in one region

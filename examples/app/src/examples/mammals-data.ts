@@ -73,8 +73,11 @@ export function makeMammalTree(nTips: number, seed = 1): TreeNode {
 /**
  * Assign each leaf a bioregion distribution that clusters phylogenetically: a clade
  * inherits a "home" region, shifting to a random region with small probability
- * (vicariance). ~18% of species also spill into a second region. Returns the
- * `clustersPerSpecies` map consumed by `calcMaximumParsimony`. Deterministic for `seed`.
+ * (vicariance). ~18% of species also spill into a second region. `count` is a synthetic
+ * number of occurrences — large in the home region, small in the spillover one — so the
+ * aggregated distribution (and the pie wedges) vary in size. Returns the
+ * `clustersPerSpecies` map consumed by `calcMaximumParsimony` / `aggregateClusters`.
+ * Deterministic for `seed`.
  */
 export function assignBioregions(root: TreeNode, nRegions = REGION_NAMES.length, seed = 1): ClustersPerSpecies {
   const rnd = mulberry32((seed ^ 0x9e3779b9) >>> 0);
@@ -82,9 +85,12 @@ export function assignBioregions(root: TreeNode, nRegions = REGION_NAMES.length,
   const walk = (node: TreeNode, home: number): void => {
     const h = rnd() < 0.15 ? Math.floor(rnd() * nRegions) : home; // vicariance shift
     if (!node.children) {
-      const ids = [h];
-      if (rnd() < 0.18) ids.push((h + 1 + Math.floor(rnd() * (nRegions - 1))) % nRegions); // spillover
-      out[node.name] = { totCount: ids.length, clusters: ids.map((clusterId) => ({ clusterId, count: 1 })) };
+      const clusters = [{ clusterId: h, count: 5 + Math.floor(rnd() * 26) }]; // home: 5–30 occurrences
+      if (rnd() < 0.18) {
+        const other = (h + 1 + Math.floor(rnd() * (nRegions - 1))) % nRegions; // spillover: 1–6
+        clusters.push({ clusterId: other, count: 1 + Math.floor(rnd() * 6) });
+      }
+      out[node.name] = { totCount: clusters.reduce((s, c) => s + c.count, 0), clusters };
       return;
     }
     node.children.forEach((c) => walk(c, h));
