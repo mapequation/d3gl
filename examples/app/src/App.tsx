@@ -1,9 +1,9 @@
 import React, { useEffect, useRef, useState } from "react";
 import { Bioregions } from "./examples/Bioregions.js";
 import { PhyloTree } from "./examples/PhyloTree.js";
-import { InfomapBioregions } from "./examples/InfomapBioregions.js";
+import { AncestralRanges } from "./examples/AncestralRanges.js";
 
-type ExampleId = "bioregions" | "phylotree" | "infomap";
+type ExampleId = "bioregions" | "phylotree" | "ancestral";
 
 interface Example {
   id: ExampleId;
@@ -13,7 +13,7 @@ interface Example {
 const EXAMPLES: Example[] = [
   { id: "bioregions", label: "Bioregions" },
   { id: "phylotree", label: "Phylogenetic tree" },
-  { id: "infomap", label: "Infomap Bioregions" },
+  { id: "ancestral", label: "Ancestral ranges" },
 ];
 
 export function App(): React.ReactElement {
@@ -63,7 +63,7 @@ export function App(): React.ReactElement {
       <main style={{ flex: 1, minWidth: 0, overflow: "auto" }}>
         {selected === "bioregions" && <Bioregions />}
         {selected === "phylotree" && <PhyloTree />}
-        {selected === "infomap" && <InfomapBioregions />}
+        {selected === "ancestral" && <AncestralRanges />}
       </main>
     </div>
   );
