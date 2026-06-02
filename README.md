@@ -13,29 +13,58 @@ uploaded to the GPU a single time; **pan/zoom is one transform-matrix uniform** 
 **recolor / show-hide is one texture write** — neither re-projects or re-tessellates.
 Recoloring 4096 cells measures ~61× cheaper than the initial geometry build.
 
-## Packages
+## Install
 
-| Package | Responsibility |
-| --- | --- |
-| `@d3gl/core` | `PathContext` interface, curve flattening, `PathRecorder`, ring grouping, earcut fill tessellation, stroke expansion, the retained **`Scene`** (packed buffers + color/flag side-tables) |
-| `@d3gl/canvas` | Canvas2D passthrough `PathContext` |
-| `@d3gl/webgl` | luma.gl v9 WebGL2 `GroupRenderer` — palette-texture color by `drawableId`, `mat3` transform uniform, texture-write recolor, GPU picking; `clipFromView`, `pickAt`, `toPNG` |
-| `@d3gl/geo` | `fitProjection` + `featureGroup` (project any GeoJSON once with any d3 projection), `referenceFromScreen`/`lonLatFromScreen`, `viewTransform` |
-| `@d3gl/svg` | `SvgPathContext` + `svgDocument` (publication vector export) |
-| `@d3gl/labels` | `cullLabels` (viewport + collision) + `LabelLayer` (HTML overlay; geometry stays on the GPU, only visible labels enter the DOM) |
-| `@d3gl/react` | headless `MapController` + the `<D3GL>` React component |
+d3gl ships as a **single package with subpath exports** — one install, modular
+imports, tree-shakeable:
 
-Dependency direction: `core ← canvas/svg`, `core ← webgl ← geo/labels/react`.
+```sh
+npm i @mapequation/d3gl
+# React components also need: npm i react react-dom   (optional peer deps)
+```
+
+```ts
+import { Scene } from "@mapequation/d3gl";           // core (root entry)
+import { geoMap, plot } from "@mapequation/d3gl/map";
+import { fitProjection } from "@mapequation/d3gl/geo";
+import { D3GL } from "@mapequation/d3gl/react";
+// also: /webgl  /canvas  /svg  /labels
+```
+
+## Modules
+
+`@mapequation/d3gl` is one published package built from these modules (under
+`packages/d3gl/src/<name>`), each exposed as a subpath export; the root entry is
+`core`.
+
+| Subpath | Module | Responsibility |
+| --- | --- | --- |
+| *(root)* | `core` | `PathContext` interface, curve flattening, `PathRecorder`, ring grouping, earcut fill tessellation, stroke expansion, the retained **`Scene`** (packed buffers + color/flag side-tables) |
+| `/canvas` | `canvas` | Canvas2D passthrough `PathContext` |
+| `/webgl` | `webgl` | luma.gl v9 WebGL2 `GroupRenderer` — palette-texture color by `drawableId`, `mat3` transform uniform, texture-write recolor, GPU picking; `clipFromView`, `pickAt`, `toPNG` |
+| `/geo` | `geo` | `fitProjection` + `featureGroup` (project any GeoJSON once with any d3 projection), `referenceFromScreen`/`lonLatFromScreen`, `viewTransform` |
+| `/svg` | `svg` | `SvgPathContext` + `svgDocument` (publication vector export) |
+| `/labels` | `labels` | `cullLabels` (viewport + collision) + `LabelLayer` (HTML overlay; geometry stays on the GPU, only visible labels enter the DOM) |
+| `/map` | `map` | `geoMap` (project-once map engine) + `plot` (generic 2D engine), d3-zoom wiring, backend selection |
+| `/react` | `react` | headless `MapController` + the `<D3GL>` React component |
+
+Dependency direction: `core ← canvas/svg`, `core ← webgl ← geo/labels/map/react`.
+
+> **Why one package with subpaths instead of many?** Tree-shaking keeps unused
+> code out of your bundle either way, so the modular structure is preserved
+> through subpaths while you install and version a single package. luma.gl is a
+> regular dependency (the WebGL backend is the default); `react`/`react-dom` are
+> *optional* peer dependencies, needed only for the `/react` subpath.
 
 ## Quick start (React)
 
 ```tsx
-import { Scene } from "@d3gl/core";
-import { fitProjection, featureGroup, viewTransform } from "@d3gl/geo";
+import { Scene } from "@mapequation/d3gl";
+import { fitProjection, featureGroup, viewTransform } from "@mapequation/d3gl/geo";
+import { D3GL } from "@mapequation/d3gl/react";
 import { geoNaturalEarth1 } from "d3-geo";
 import { scaleSequential } from "d3-scale";
 import { interpolateViridis } from "d3-scale-chromatic";
-import { D3GL } from "@d3gl/react";
 
 const projection = fitProjection(geoNaturalEarth1(), featureCollection, width, height);
 
@@ -58,27 +87,33 @@ Recolor at any time with `scene.setFill(...)` + `controller.updateColors("cells"
 
 ## Development
 
-This is a pnpm workspace (TypeScript, Vitest). The CPU layers test in Node; the WebGL,
-DOM, and React layers test in headless Chromium via Vitest browser mode + Playwright.
+This is a pnpm workspace (TypeScript, Vitest). The CPU modules test in Node; the WebGL,
+DOM, and React modules test in headless Chromium via Vitest browser mode + Playwright.
 
 ```sh
 pnpm install
 pnpm exec playwright install chromium    # one-time, for browser tests
 
-pnpm test                                 # Node unit tests (all packages)
-pnpm -r exec tsc --noEmit                 # typecheck
+pnpm test                                # Node unit tests
+pnpm build                               # build the published bundle (tsup)
+pnpm -r exec tsc --noEmit                # typecheck
 
-# Browser suites (per package):
-pnpm --filter @d3gl/webgl  exec vitest run --config vitest.config.ts
-pnpm --filter @d3gl/labels exec vitest run --config vitest.config.ts
-pnpm --filter @d3gl/react  exec vitest run --config vitest.config.ts
+# Browser suites (WebGL / DOM / React), all in one run:
+pnpm --filter @mapequation/d3gl test:browser
 ```
 
-`*.browser.test.ts(x)` run only via each package's `vitest.config.ts`; the root Node
+`*.browser.test.ts(x)` run only via `packages/d3gl/vitest.config.ts`; the root Node
 config excludes them.
 
 > **Environment note:** if a bare `pnpm` is unavailable or broken (e.g. a stale asdf
-> shim), use `corepack pnpm@9 …` in place of `pnpm …` for every command above.
+> shim), use `corepack pnpm@9.15.9 …` in place of `pnpm …` for every command above.
+
+## Releases
+
+Versioning and publishing of `@mapequation/d3gl` are automated with
+[Changesets](https://github.com/changesets/changesets). Add a changeset
+(`pnpm changeset`) in any PR that should appear in a release; merging the
+generated "Version Packages" PR publishes to npm. See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Roadmap (not yet in v1)
 

@@ -2,10 +2,10 @@ import React, { useEffect, useMemo, useRef, useState } from "react";
 import { geoNaturalEarth1 } from "d3-geo";
 import { scaleSequential } from "d3-scale";
 import { interpolateViridis, schemeCategory10 } from "d3-scale-chromatic";
-import { fitProjection } from "@d3gl/geo";
-import { GeoMap } from "@d3gl/react";
-import type { GeoMap as Engine, HoverHit } from "@d3gl/map";
-import type { GeoInput } from "@d3gl/geo";
+import { fitProjection } from "@mapequation/d3gl/geo";
+import { GeoMap } from "@mapequation/d3gl/react";
+import type { GeoMap as Engine, HoverHit } from "@mapequation/d3gl/map";
+import type { GeoInput } from "@mapequation/d3gl/geo";
 import { makeCells, makeCities, makeGraticule, makeRoute, makeCluster, cellsToFeatureCollection, loadWorld, BASE_STEP, type Cell } from "./bioregions-data.js";
 
 const WIDTH = 900;

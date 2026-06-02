@@ -5,9 +5,9 @@ import { select } from "d3-selection";
 import { zoom as d3zoom, type D3ZoomEvent, zoomIdentity } from "d3-zoom";
 import { link as d3link, linkRadial, curveLinear, curveStepBefore, curveBumpX, pointRadial } from "d3-shape";
 import type { HierarchyPointNode, HierarchyPointLink } from "d3-hierarchy";
-import { plot, type Plot, type HoverHit } from "@d3gl/map";
-import { LabelLayer, type LabelAnchor } from "@d3gl/labels";
-import type { ViewTransform } from "@d3gl/core";
+import { plot, type Plot, type HoverHit } from "@mapequation/d3gl/map";
+import { LabelLayer, type LabelAnchor } from "@mapequation/d3gl/labels";
+import type { ViewTransform } from "@mapequation/d3gl";
 import { makeTree, type TreeNode } from "./tree.js";
 import { layoutRectangular, layoutRadial, nodeXY, type LayoutMode, type TimeScaleKind } from "./layout.js";
 
