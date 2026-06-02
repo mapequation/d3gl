@@ -28,7 +28,7 @@ export function Bioregions(): React.ReactElement {
   const [clip, setClip] = useState(true);
   // Cell-size exponent: step = BASE_STEP * 2^exp, exp ∈ [-3, 3]. Smaller ⇒ far more
   // cells (a stress test): exp -3 ≈ 0.75° ≈ 115k cells; exp 3 = 48° ≈ a few hundred.
-  const [sizeExp, setSizeExp] = useState(0);
+  const [sizeExp, setSizeExp] = useState(2);
   const [tooltip, setTooltip] = useState<{ left: number; top: number; text: string } | null>(null);
 
   const mapRef = useRef<Engine | null>(null);
