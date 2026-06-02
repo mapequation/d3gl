@@ -16,7 +16,6 @@ import { calcMaximumParsimony, calcMaximumParsimonyPreliminaryPhase, aggregateCl
 const W = 900;
 const H = 600;
 const CX = W / 2;
-const CY = H / 2;
 const LINE_BASE = 1.6; // branch width when thickness scaling is off
 const LINE_MIN = 1, LINE_MAX = 22; // branch-width range when scaling by subtended terminals
 
@@ -84,9 +83,10 @@ function pieSlices(node: PNode): { clusterId: number; count: number; a0: number;
   });
 }
 
-/** The bioregion with the most occurrences in a node's subtree (clusters is sorted by count). */
+/** The dominant region of a node's DISPLAYED range — the highest-count slice within the
+ *  reconstructed range (so the branch color matches the pie, never a region outside it). */
 function topRegion(node: PNode): number | undefined {
-  return node.data.clusters?.clusters[0]?.clusterId;
+  return pieSlices(node)[0]?.clusterId;
 }
 
 // Rotation/centering only — the constant-px gap from the node is the LabelAnchor `offset`
@@ -112,7 +112,7 @@ interface Tip { left: number; top: number; name: string; kind: string; rows: { n
 export function AncestralRanges(): React.ReactElement {
   const [layoutMode, setLayoutMode] = useState<LayoutMode>("radial");
   const [backend, setBackend] = useState<BackendType>("webgl");
-  const [tips, setTips] = useState(256);
+  const [tips, setTips] = useState(64);
   const [thickness, setThickness] = useState(true);
   const [pies, setPies] = useState(true);
   const [sizeMode, setSizeMode] = useState<SizeMode>("world");
@@ -128,6 +128,9 @@ export function AncestralRanges(): React.ReactElement {
   const wrapRef = useRef<HTMLDivElement>(null);
   const anchorsRef = useRef<LabelAnchor[]>([]);
   const zoomBehaviorRef = useRef<ReturnType<typeof d3zoom<HTMLDivElement, unknown>> | null>(null);
+  // Identifies the current geometry (layout + tip count). The view is reset to base only when
+  // this changes — toggles like phase/thickness/pies keep the user's current pan/zoom.
+  const viewKeyRef = useRef("");
 
   useEffect(() => {
     const host = hostRef.current;
@@ -191,25 +194,37 @@ export function AncestralRanges(): React.ReactElement {
 
     const root = layoutMode === "rectangular"
       ? layoutRectangular(tree, W, H, "linear")
-      : layoutRadial(tree, W, H, "linear");
+      // Radial is a half-circle "sunset" fan (Fig. 3a): leaves span π, centred on north.
+      : layoutRadial(tree, W, H, "linear", 50, Math.PI, -Math.PI / 2);
     const links = root.links();
     const tipNodes = root.leaves();
     const totalSpecies = root.data.speciesCount ?? 1;
 
     const widthScale = scaleSqrt().domain([1, totalSpecies]).range([LINE_MIN, LINE_MAX]);
     const widthBase = (n: PNode): number => (thickness ? widthScale(n.data.speciesCount ?? 1) : LINE_BASE);
+    // World mode: pie diameter = the incoming branch width (scales with zoom). Screen mode:
+    // a fixed pixel size so even small-clade nodes stay visible when zoomed in.
+    const SCREEN_PIE_R = 8;
+    const pieR = (n: PNode): number => (sizeMode === "screen" ? SCREEN_PIE_R : widthBase(n) / 2);
 
     const pieSpecs: PieSpec[] = pies
       ? root.descendants().map((n) => {
           const [cx, cy] = nodeXY(n, layoutMode);
-          return { cx, cy, rBase: widthBase(n) / 2, node: n, slices: pieSlices(n) };
+          return { cx, cy, rBase: pieR(n), node: n, slices: pieSlices(n) };
         }).filter((p) => p.slices.length > 0)
       : [];
 
-    const base = layoutMode === "radial" ? zoomIdentity.translate(CX, CY) : zoomIdentity;
-    const baseT: ViewTransform = { k: base.k, x: base.x, y: base.y };
-    select(wrapper).call(zoomBehavior.transform, base);
-    transformRef.current = baseT;
+    // Centre a half-circle fan vertically; full radial / rectangular keep their origins.
+    const R = layoutMode === "radial" ? Math.max(...tipNodes.map((n) => n.y)) : 0;
+    const base = layoutMode === "radial" ? zoomIdentity.translate(CX, (H + R) / 2) : zoomIdentity;
+    // Reset the view to base only when the geometry changes (layout / tip count); otherwise
+    // keep the user's current pan/zoom across style toggles.
+    const viewKey = `${layoutMode}:${tips}`;
+    const reset = viewKeyRef.current !== viewKey;
+    viewKeyRef.current = viewKey;
+    const view: ViewTransform = reset ? { k: base.k, x: base.x, y: base.y } : transformRef.current;
+    if (reset) select(wrapper).call(zoomBehavior.transform, base);
+    transformRef.current = view;
 
     const GAP = 8;
     anchorsRef.current = tipNodes.map((n, i) => {
@@ -254,11 +269,13 @@ export function AncestralRanges(): React.ReactElement {
       lineWidth: (w: Wedge) => (w.single ? 0 : Math.min(0.5, w.r * 0.16)),
       anchor: (w: Wedge) => [w.cx, w.cy], // pin the pie; screen mode keeps it constant-size
       sizeMode,
+      // Screen mode: declutter overlapping fixed-size pies on zoom (bigger clades win).
+      declutter: sizeMode === "screen" ? SCREEN_PIE_R * 2 + 2 : undefined,
       id: (_w, i) => i,
     });
 
-    chart.setTransform(baseT);
-    labelLayer.update(anchorsRef.current, baseT, { width: W, height: H });
+    chart.setTransform(view);
+    labelLayer.update(anchorsRef.current, view, { width: W, height: H });
   }, [layoutMode, tips, thickness, pies, sizeMode, curve, phase]);
 
   const exportPNG = (): void => {

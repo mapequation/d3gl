@@ -26,6 +26,9 @@ export interface PlotLayerOptions<D = any> {
   /** Glyph anchor in world coords per datum. In "screen" sizeMode the drawable is rendered
    *  at a constant pixel size around this point (e.g. a pie pinned to a tree node). */
   anchor?: (d: D, i: number) => [number, number];
+  /** Screen-space declutter radius (px): on each zoom, hide anchored glyphs that overlap an
+   *  already-kept one (earlier data wins). Pairs with `anchor` + "screen" sizeMode. */
+  declutter?: number;
 }
 
 export interface PlotPointOptions<D = any> {
@@ -60,7 +63,7 @@ export class Plot extends BaseEngine {
         ),
       );
     };
-    this.registerLayer({ name, data: list, ids, fill: opts.fill, stroke: opts.stroke, clipTo: opts.clipTo, sizeMode: opts.sizeMode, build });
+    this.registerLayer({ name, data: list, ids, fill: opts.fill, stroke: opts.stroke, clipTo: opts.clipTo, sizeMode: opts.sizeMode, declutter: opts.declutter, build });
     return this;
   }
   points<D>(name: string, data: readonly D[], opts: PlotPointOptions<D>): this {

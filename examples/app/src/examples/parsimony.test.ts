@@ -90,6 +90,69 @@ describe("calcMaximumParsimony (two-phase, correct Fitch rules)", () => {
   });
 });
 
+// Rigorous correctness check: for single-region leaves (classic Fitch), the final set at
+// each internal node must equal the set of states it takes in SOME minimum-cost full
+// assignment. Brute-force that over many random trees and compare to calcMaximumParsimony.
+describe("calcMaximumParsimony equals brute-force optimal-state sets (random trees)", () => {
+  function mulberry32(seed: number): () => number {
+    let a = seed >>> 0;
+    return () => { a |= 0; a = (a + 0x6d2b79f5) | 0; let t = Math.imul(a ^ (a >>> 15), 1 | a); t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t; return ((t ^ (t >>> 14)) >>> 0) / 4294967296; };
+  }
+  function randomTree(n: number, rnd: () => number, ctr: { i: number }, R: number): TreeNode {
+    if (n <= 1) { const region = Math.floor(rnd() * R); return { name: `L${ctr.i++}`, group: 0, length: 1, time: 0, _region: region } as TreeNode & { _region: number }; }
+    const left = 1 + Math.floor(rnd() * (n - 1));
+    return { name: `I${ctr.i++}`, group: 0, length: 1, time: 1, children: [randomTree(left, rnd, ctr, R), randomTree(n - left, rnd, ctr, R)] };
+  }
+  function leafRegion(n: TreeNode): number { return (n as TreeNode & { _region: number })._region; }
+
+  function bruteForceSets(root: TreeNode, R: number): Map<TreeNode, Set<number>> {
+    const internals: TreeNode[] = [];
+    const collect = (n: TreeNode): void => { if (n.children) { internals.push(n); n.children.forEach(collect); } };
+    collect(root);
+    const k = internals.length;
+    const state = new Map<TreeNode, number>();
+    const cost = (): number => {
+      let c = 0;
+      const walk = (n: TreeNode): void => {
+        if (!n.children) return;
+        const s = state.get(n)!;
+        for (const ch of n.children) { c += (ch.children ? state.get(ch)! : leafRegion(ch)) !== s ? 1 : 0; walk(ch); }
+      };
+      walk(root);
+      return c;
+    };
+    let best = Infinity;
+    const sets = new Map<TreeNode, Set<number>>(internals.map((n) => [n, new Set<number>()]));
+    const total = R ** k;
+    for (let code = 0; code < total; code++) {
+      let c = code;
+      for (const n of internals) { state.set(n, c % R); c = Math.floor(c / R); }
+      const cc = cost();
+      if (cc < best) { best = cc; for (const n of internals) sets.set(n, new Set([state.get(n)!])); }
+      else if (cc === best) { for (const n of internals) sets.get(n)!.add(state.get(n)!); }
+    }
+    return sets;
+  }
+
+  it("matches on 60 random trees", () => {
+    const R = 3;
+    for (let trial = 0; trial < 60; trial++) {
+      const rnd = mulberry32(trial + 1);
+      const nLeaves = 3 + Math.floor(rnd() * 5); // 3..7 leaves → ≤6 internal, 3^6 enum
+      const tree = randomTree(nLeaves, rnd, { i: 0 }, R);
+      const cps: ClustersPerSpecies = {};
+      const collectLeaves = (n: TreeNode): void => { if (n.children) n.children.forEach(collectLeaves); else cps[n.name] = { totCount: 1, clusters: [{ clusterId: leafRegion(n), count: 1 }] }; };
+      collectLeaves(tree);
+      const expected = bruteForceSets(tree, R);
+      calcMaximumParsimony(tree, cps);
+      for (const [node, want] of expected) {
+        const got = new Set((node.ranges?.clusters ?? []).map((r) => r.clusterId));
+        expect([...got].sort()).toEqual([...want].sort());
+      }
+    }
+  });
+});
+
 describe("aggregateClusters (occurrence counts summed up the tree)", () => {
   const t = (): TreeNode => node("r", node("x", node("y", leaf("a"), leaf("b")), leaf("c")), node("z", leaf("d")));
   // a: A×3 · b: A×2,C×1 · c: none · d: C×4

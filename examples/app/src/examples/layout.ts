@@ -54,13 +54,20 @@ export function layoutRadial(
   height: number,
   time: TimeScaleKind,
   pad = 30,
+  angleExtent = 2 * Math.PI,
+  angleStart = 0,
 ): HierarchyPointNode<TreeNode> {
-  const h = cluster<TreeNode>().size([2 * Math.PI, 1])(hierarchy(root, (d) => d.children));
+  const h = cluster<TreeNode>().size([angleExtent, 1])(hierarchy(root, (d) => d.children));
   const maxAge = h.data.time || 1;
-  const R = Math.min(width, height) / 2 - pad;
+  // A partial fan (e.g. a half-circle "sunset") can use a larger radius: the leaves span only
+  // part of the disc, so it is bounded by half the width and the full height rather than the
+  // inscribed circle.
+  const half = angleExtent < 2 * Math.PI - 1e-9;
+  const R = (half ? Math.min(width / 2, height) : Math.min(width, height) / 2) - pad;
   const pos = timePosition(time, maxAge, R, 0); // age 0 → R (rim), age max → 0 (centre)
   h.each((n) => {
-    n.y = pos(n.data.time); // x stays the cluster angle
+    n.x += angleStart; // shift the fan's angular origin (e.g. centre a half-fan on "north")
+    n.y = pos(n.data.time);
   });
   return h;
 }
