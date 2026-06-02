@@ -3,7 +3,7 @@ import { schemeCategory10 } from "d3-scale-chromatic";
 import { scaleOrdinal, scaleSqrt } from "d3-scale";
 import { select } from "d3-selection";
 import { zoom as d3zoom, type D3ZoomEvent, zoomIdentity } from "d3-zoom";
-import { link as d3link, linkRadial, curveStepBefore } from "d3-shape";
+import { link as d3link, linkRadial, curveLinear, curveStepBefore, curveBumpX, pointRadial } from "d3-shape";
 import type { HierarchyPointNode, HierarchyPointLink } from "d3-hierarchy";
 import { plot, type Plot, type HoverHit } from "@d3gl/map";
 import { LabelLayer, type LabelAnchor } from "@d3gl/labels";
@@ -11,17 +11,19 @@ import type { ViewTransform } from "@d3gl/core";
 import type { TreeNode } from "./tree.js";
 import { layoutRectangular, layoutRadial, nodeXY, type LayoutMode } from "./layout.js";
 import { makeMammalTree, assignBioregions, REGION_NAMES } from "./mammals-data.js";
-import { calcMaximumParsimony, aggregateClusters, aggregateSpeciesCount } from "./parsimony.js";
+import { calcMaximumParsimony, calcMaximumParsimonyPreliminaryPhase, aggregateClusters, aggregateSpeciesCount } from "./parsimony.js";
 
 const W = 900;
 const H = 600;
 const CX = W / 2;
 const CY = H / 2;
 const LINE_BASE = 1.6; // branch width when thickness scaling is off
-const LINE_MIN = 1.6, LINE_MAX = 22; // branch-width range when scaling by subtended terminals
+const LINE_MIN = 1, LINE_MAX = 22; // branch-width range when scaling by subtended terminals
 
 type BackendType = "webgl" | "canvas" | "svg";
 type SizeMode = "world" | "screen";
+type CurveMode = "linear" | "step" | "bump";
+type Phase = "final" | "preliminary";
 type PNode = HierarchyPointNode<TreeNode>;
 type PLink = HierarchyPointLink<TreeNode>;
 
@@ -34,19 +36,38 @@ interface Wedge { cx: number; cy: number; r: number; a0: number; a1: number; clu
 /** Per-node pie before sizing: center, base radius, and angular slices (size-independent). */
 interface PieSpec { cx: number; cy: number; rBase: number; node: PNode; slices: { clusterId: number; count: number; a0: number; a1: number }[]; }
 
-function makeLinkDraw(mode: LayoutMode): (ctx: CanvasRenderingContext2D, l: PLink) => void {
+function makeLinkDraw(mode: LayoutMode, curve: CurveMode): (ctx: CanvasRenderingContext2D, l: PLink) => void {
   if (mode === "rectangular") {
-    const gen = d3link<PLink, PNode>(curveStepBefore).x((d) => d.y).y((d) => d.x);
+    const factory = curve === "linear" ? curveLinear : curve === "step" ? curveStepBefore : curveBumpX;
+    const gen = d3link<PLink, PNode>(factory).x((d) => d.y).y((d) => d.x);
     return (ctx, l) => { gen.context(ctx); gen(l); };
   }
-  const gen = linkRadial<PLink, PNode>().angle((d) => d.x).radius((d) => d.y);
-  return (ctx, l) => { gen.context(ctx); gen(l); };
+  if (curve === "bump") {
+    const gen = linkRadial<PLink, PNode>().angle((d) => d.x).radius((d) => d.y);
+    return (ctx, l) => { gen.context(ctx); gen(l); };
+  }
+  if (curve === "linear") {
+    return (ctx, l) => {
+      const [sx, sy] = pointRadial(l.source.x, l.source.y);
+      const [tx, ty] = pointRadial(l.target.x, l.target.y);
+      ctx.moveTo(sx, sy); ctx.lineTo(tx, ty);
+    };
+  }
+  // radial "step": arc along the parent radius to the child angle, then a radial line out.
+  return (ctx, l) => {
+    const r0 = l.source.y;
+    const sa = l.source.x - Math.PI / 2;
+    const ta = l.target.x - Math.PI / 2;
+    ctx.moveTo(r0 * Math.cos(sa), r0 * Math.sin(sa));
+    ctx.arc(0, 0, r0, sa, ta, ta < sa);
+    const [tx, ty] = pointRadial(l.target.x, l.target.y);
+    ctx.lineTo(tx, ty);
+  };
 }
 
-/** The node's displayed distribution: the parsimony ancestral range set (membership),
- *  each region sized by its aggregated occurrence count (sorted by count). If every set
- *  region has zero count (rare — a region reconstructed only from a sibling clade), fall
- *  back to equal slices so the range is still visible. */
+/** The node's displayed distribution: the reconstructed range set (membership), each region
+ *  sized by its aggregated occurrence count (sorted by count). Falls back to equal slices if
+ *  every set region has zero count (a region reconstructed only from a sibling clade). */
 function pieSlices(node: PNode): { clusterId: number; count: number; a0: number; a1: number }[] {
   const counts = new Map((node.data.clusters?.clusters ?? []).map((r) => [r.clusterId, r.count]));
   const regs = (node.data.ranges?.clusters ?? [])
@@ -63,6 +84,11 @@ function pieSlices(node: PNode): { clusterId: number; count: number; a0: number;
   });
 }
 
+/** The bioregion with the most occurrences in a node's subtree (clusters is sorted by count). */
+function topRegion(node: PNode): number | undefined {
+  return node.data.clusters?.clusters[0]?.clusterId;
+}
+
 function labelTransform(mode: LayoutMode, angle: number, gap: number): string {
   if (mode !== "radial") return `translate(${gap}px, -50%)`;
   const deg = (angle * 180) / Math.PI - 90;
@@ -71,6 +97,8 @@ function labelTransform(mode: LayoutMode, angle: number, gap: number): string {
     : `rotate(${deg}deg) translate(${gap}px, -50%)`;
 }
 
+interface Tip { left: number; top: number; name: string; kind: string; rows: { name: string; color: string; count: number }[]; }
+
 export function AncestralRanges(): React.ReactElement {
   const [layoutMode, setLayoutMode] = useState<LayoutMode>("radial");
   const [backend, setBackend] = useState<BackendType>("webgl");
@@ -78,7 +106,9 @@ export function AncestralRanges(): React.ReactElement {
   const [thickness, setThickness] = useState(true);
   const [pies, setPies] = useState(true);
   const [sizeMode, setSizeMode] = useState<SizeMode>("world");
-  const [tooltip, setTooltip] = useState<{ left: number; top: number; text: string } | null>(null);
+  const [curve, setCurve] = useState<CurveMode>("step");
+  const [phase, setPhase] = useState<Phase>("final");
+  const [tooltip, setTooltip] = useState<Tip | null>(null);
 
   const chartRef = useRef<Plot | null>(null);
   const labelLayerRef = useRef<LabelLayer | null>(null);
@@ -88,7 +118,6 @@ export function AncestralRanges(): React.ReactElement {
   const wrapRef = useRef<HTMLDivElement>(null);
   const anchorsRef = useRef<LabelAnchor[]>([]);
   const zoomBehaviorRef = useRef<ReturnType<typeof d3zoom<HTMLDivElement, unknown>> | null>(null);
-  // The latest layer-rebuild closure (built by the data effect; called on zoom in screen mode).
   const rebuildRef = useRef<((k: number) => void) | null>(null);
   const sizeModeRef = useRef<SizeMode>(sizeMode); sizeModeRef.current = sizeMode;
   const pendingKRef = useRef(1);
@@ -111,9 +140,11 @@ export function AncestralRanges(): React.ReactElement {
       const w = hit.datum as Wedge | null;
       if (!w) { setTooltip(null); return; }
       const r = el.getBoundingClientRect();
-      const dist = pieSlices(w.node).map((s) => `${REGION_NAMES[s.clusterId] ?? `#${s.clusterId}`} ${s.count}`).join(", ");
-      const kind = w.node.children ? "ancestral range" : "distribution";
-      setTooltip({ left: ev.clientX - r.left + 12, top: ev.clientY - r.top + 12, text: `${w.node.data.name} · ${kind}: ${dist}` });
+      const rows = pieSlices(w.node).map((s) => ({ name: REGION_NAMES[s.clusterId] ?? `#${s.clusterId}`, color: regionColor(s.clusterId), count: s.count }));
+      setTooltip({
+        left: ev.clientX - r.left + 12, top: ev.clientY - r.top + 12,
+        name: w.node.data.name, kind: w.node.children ? "ancestral range" : "current distribution", rows,
+      });
     });
 
     const scheduleRebuild = (): void => {
@@ -128,7 +159,7 @@ export function AncestralRanges(): React.ReactElement {
         pendingKRef.current = t.k;
         chart.setTransform(t);
         labelLayer.update(anchorsRef.current, t, { width: W, height: H });
-        if (sizeModeRef.current === "screen") scheduleRebuild(); // keep pies/branches constant px
+        if (sizeModeRef.current === "screen") scheduleRebuild();
       });
     zoomBehaviorRef.current = zoomBehavior;
     select(wrapper).call(zoomBehavior);
@@ -151,11 +182,12 @@ export function AncestralRanges(): React.ReactElement {
     const zoomBehavior = zoomBehaviorRef.current;
     if (!chart || !labelLayer || !wrapper || !zoomBehavior) return;
 
-    // Build the tree, occurrence-count distribution, ancestral ranges (Fitch) and counts.
+    // Build the tree, occurrence-count distribution, and the chosen Fitch phase.
     const tree = makeMammalTree(tips, 1);
     const cps = assignBioregions(tree, REGION_NAMES.length, 1);
     aggregateClusters(tree, cps);
-    calcMaximumParsimony(tree, cps);
+    if (phase === "final") calcMaximumParsimony(tree, cps);
+    else calcMaximumParsimonyPreliminaryPhase(tree, cps);
     aggregateSpeciesCount(tree);
 
     const root = layoutMode === "rectangular"
@@ -165,7 +197,6 @@ export function AncestralRanges(): React.ReactElement {
     const tipNodes = root.leaves();
     const totalSpecies = root.data.speciesCount ?? 1;
 
-    // Branch width ∝ subtended terminals; pie diameter = the node's incoming branch width.
     const widthScale = scaleSqrt().domain([1, totalSpecies]).range([LINE_MIN, LINE_MAX]);
     const widthBase = (n: PNode): number => (thickness ? widthScale(n.data.speciesCount ?? 1) : LINE_BASE);
 
@@ -193,16 +224,14 @@ export function AncestralRanges(): React.ReactElement {
       };
     });
 
-    const drawLink = makeLinkDraw(layoutMode);
+    const drawLink = makeLinkDraw(layoutMode, curve);
 
-    // Rebuild the branch + pie layers at a given zoom k. In "screen" mode sizes are divided
-    // by k so they render at a constant pixel size (the backend re-multiplies by k); in
-    // "world" mode they scale with zoom. Pie angles are precomputed; only radius changes.
     const rebuild = (k: number): void => {
       const scale = sizeModeRef.current === "screen" ? 1 / k : 1;
       chart.layer("links", links, {
         draw: (ctx, l) => drawLink(ctx, l),
-        stroke: "#777",
+        // Color each branch by the child clade's most-occurring bioregion.
+        stroke: (l: PLink) => { const t = topRegion(l.target); return t == null ? "#777" : regionColor(t); },
         lineWidth: (l: PLink) => widthBase(l.target) * scale,
       });
       const wedges: Wedge[] = [];
@@ -212,12 +241,14 @@ export function AncestralRanges(): React.ReactElement {
       }
       chart.layer("pies", wedges, {
         draw: (ctx, w) => {
-          if (w.single) { ctx.moveTo(w.cx + w.r, w.cy); ctx.arc(w.cx, w.cy, w.r, 0, 2 * Math.PI); } // full circle, no center seam
+          // Single-region node: a full circle. closePath() so the subpath is closed and the
+          // WebGL fill tessellator (which fills only closed subpaths) renders it like Canvas/SVG.
+          if (w.single) { ctx.moveTo(w.cx + w.r, w.cy); ctx.arc(w.cx, w.cy, w.r, 0, 2 * Math.PI); ctx.closePath(); }
           else { ctx.moveTo(w.cx, w.cy); ctx.arc(w.cx, w.cy, w.r, w.a0, w.a1); ctx.closePath(); }
         },
         fill: (w: Wedge) => regionColor(w.clusterId),
         stroke: "#ffffff",
-        lineWidth: (w: Wedge) => (w.single ? 0 : Math.min(0.5, w.r * 0.16)), // thin separators, none on circles
+        lineWidth: (w: Wedge) => (w.single ? 0 : Math.min(0.5, w.r * 0.16)),
         id: (_w, i) => i,
       });
     };
@@ -226,7 +257,7 @@ export function AncestralRanges(): React.ReactElement {
 
     chart.setTransform(baseT);
     labelLayer.update(anchorsRef.current, baseT, { width: W, height: H });
-  }, [layoutMode, tips, thickness, pies, sizeMode]);
+  }, [layoutMode, tips, thickness, pies, sizeMode, curve, phase]);
 
   const exportPNG = (): void => {
     try { download(chartRef.current!.toPNG(), "ancestral-ranges.png"); }
@@ -244,11 +275,11 @@ export function AncestralRanges(): React.ReactElement {
   return (
     <div style={{ padding: 16, color: "#222" }}>
       <h1 style={{ fontSize: 18, fontWeight: 600, margin: "0 0 4px" }}>
-        Ancestral ranges — mammal tree with Fitch reconstruction ({layoutMode}, {tips} species)
+        Ancestral ranges — mammal tree with Fitch reconstruction ({layoutMode}, {tips} species, {phase})
       </h1>
       <p style={{ margin: "0 0 12px", fontSize: 12, opacity: 0.7 }}>
         Pies show the bioregion distribution (current at tips, most-parsimonious ancestral range at internal nodes), sized by
-        occurrence count; branch thickness and pie diameter scale with the number of subtended species. A standalone Fig. 3a test.
+        occurrence count; branches are colored by the descendant clade's dominant bioregion and scaled to subtended species. A standalone Fig. 3a test.
       </p>
       <div style={{ display: "flex", gap: 6, marginBottom: 12, flexWrap: "wrap", alignItems: "center" }}>
         {(["webgl", "canvas", "svg"] as const).map((b) => (
@@ -257,6 +288,14 @@ export function AncestralRanges(): React.ReactElement {
         <Sep />
         {(["rectangular", "radial"] as const).map((m) => (
           <button key={m} style={btn(layoutMode === m)} onClick={() => setLayoutMode(m)}>{m}</button>
+        ))}
+        <Sep />
+        {(["linear", "step", "bump"] as const).map((c) => (
+          <button key={c} style={btn(curve === c)} onClick={() => setCurve(c)}>{c}</button>
+        ))}
+        <Sep />
+        {(["preliminary", "final"] as const).map((p) => (
+          <button key={p} style={btn(phase === p)} onClick={() => setPhase(p)}>{p}</button>
         ))}
         <Sep />
         <button style={btn(thickness)} onClick={() => setThickness((v) => !v)}>thickness</button>
@@ -279,9 +318,23 @@ export function AncestralRanges(): React.ReactElement {
         {tooltip && (
           <div style={{
             position: "absolute", left: tooltip.left, top: tooltip.top, pointerEvents: "none",
-            background: "rgba(255,255,255,0.96)", border: "1px solid #ccc", borderRadius: 4,
-            padding: "4px 8px", fontSize: 12, whiteSpace: "nowrap", color: "#222", boxShadow: "0 1px 4px rgba(0,0,0,0.15)", zIndex: 10,
-          }}>{tooltip.text}</div>
+            background: "rgba(255,255,255,0.97)", border: "1px solid #ccc", borderRadius: 4,
+            padding: "5px 8px", fontSize: 12, whiteSpace: "nowrap", color: "#222", boxShadow: "0 1px 4px rgba(0,0,0,0.15)", zIndex: 10,
+          }}>
+            <div style={{ fontWeight: 600, marginBottom: 3 }}>{tooltip.name}</div>
+            <div style={{ opacity: 0.6, marginBottom: 4 }}>{tooltip.kind}</div>
+            <table style={{ borderCollapse: "collapse" }}>
+              <tbody>
+                {tooltip.rows.map((r) => (
+                  <tr key={r.name}>
+                    <td style={{ paddingRight: 6 }}><span style={{ display: "inline-block", width: 9, height: 9, borderRadius: 2, background: r.color }} /></td>
+                    <td style={{ paddingRight: 10 }}>{r.name}</td>
+                    <td style={{ textAlign: "right", fontVariantNumeric: "tabular-nums" }}>{r.count}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
         )}
       </div>
 
@@ -293,7 +346,7 @@ export function AncestralRanges(): React.ReactElement {
           </span>
         ))}
       </div>
-      <p style={{ opacity: 0.6, fontSize: 12 }}>scroll to zoom · drag to pan · hover a pie for the species and its ranges · toggle size: world/screen</p>
+      <p style={{ opacity: 0.6, fontSize: 12 }}>scroll to zoom · drag to pan · hover a node for its range table · toggle size: world/screen · preliminary/final = Fitch phase</p>
     </div>
   );
 }
