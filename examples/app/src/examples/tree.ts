@@ -1,3 +1,5 @@
+import type { RegionSet } from "./parsimony.js";
+
 export interface TreeNode {
   name: string;
   group: number;
@@ -6,6 +8,15 @@ export interface TreeNode {
   /** Age before present, in [0, 1]. Tips are at 0 (the present); the root is oldest. */
   time: number;
   children?: TreeNode[];
+  /** Reconstructed ancestral range *set* (membership): species' present regions at tips,
+   *  the most-parsimonious ancestral set at internal nodes. Set by calcMaximumParsimony(). */
+  ranges?: RegionSet;
+  /** Occurrence-count *distribution*: leaf counts summed up the tree, sorted by descending
+   *  count. Sizes the pie wedges. Set by parsimony.aggregateClusters(). */
+  clusters?: RegionSet;
+  /** Number of subtended terminals (Fig. 3 branch-thickness metric). Set by
+   *  parsimony.aggregateSpeciesCount(). */
+  speciesCount?: number;
 }
 
 /** Deterministic LCG so trees are stable across renders (no Math.random in render path). */

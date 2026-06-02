@@ -17,6 +17,20 @@ function pathD(d: DrawableVector): string {
   return ctx.toPath();
 }
 
+/** Path d-string for an anchored glyph at a constant pixel size: each vertex offset from
+ *  the anchor is kept as-is around the anchor's projected screen position (ox, oy). */
+function pathDScreen(d: DrawableVector, ax: number, ay: number, ox: number, oy: number): string {
+  const ctx = new SvgPathContext();
+  for (const s of d.subpaths) {
+    const p = s.points;
+    if (p.length < 2) continue;
+    ctx.moveTo(ox + (p[0]! - ax), oy + (p[1]! - ay));
+    for (let i = 2; i < p.length; i += 2) ctx.lineTo(ox + (p[i]! - ax), oy + (p[i + 1]! - ay));
+    if (s.closed) ctx.closePath();
+  }
+  return ctx.toPath();
+}
+
 /** Render one drawable's fill/stroke attributes as a string of SVG elements. */
 function drawableElements(d: DrawableVector): string {
   const fill = d.fill[3] > 0 ? rgba(d.fill) : "none";
@@ -42,7 +56,7 @@ export function svgFromLayers(width: number, height: number, layers: readonly Re
   const screenCircleGroups: string[] = [];
 
   for (const layer of layers) {
-    const screenMode = layer.pointSizeMode === "screen";
+    const screenMode = layer.sizeMode === "screen";
 
     // A clipPath def referencing the named clip layer's silhouette.
     let clipAttr = "";
@@ -65,28 +79,29 @@ export function svgFromLayers(width: number, height: number, layers: readonly Re
     }
 
     if (screenMode) {
-      // Emit circles at screen coords in a separate untransformed group.
-      const elements = layer.drawables
-        .filter((d) => (d.flags & 1) !== 0)
-        .map((d) => {
-          const fill = d.fill[3] > 0 ? rgba(d.fill) : "none";
-          const strokeAttrs =
-            d.stroke[3] > 0 && d.lineWidth > 0
-              ? ` stroke="${rgba(d.stroke)}" stroke-width="${d.lineWidth}"`
-              : "";
-          if (d.circles.length > 0) {
-            return d.circles
-              .map((c) => {
-                const sx = t.k * c.x + t.x;
-                const sy = t.k * c.y + t.y;
-                return `<circle cx="${sx}" cy="${sy}" r="${c.r}" fill="${fill}"${strokeAttrs} />`;
-              })
-              .join("");
-          }
-          return "";
-        })
-        .join("");
-      if (elements) screenCircleGroups.push(`<g>${elements}</g>`);
+      // Screen sizeMode: circles and anchored glyphs render at constant pixel size in an
+      // untransformed group; non-anchored paths stay in the transformed group but with a
+      // constant pixel stroke width (divide by k, which the group's scale(k) re-multiplies).
+      const screenEls: string[] = [];
+      const worldEls: string[] = [];
+      for (const d of layer.drawables) {
+        if ((d.flags & 1) === 0) continue;
+        const fill = d.fill[3] > 0 ? rgba(d.fill) : "none";
+        const hasStroke = d.stroke[3] > 0 && d.lineWidth > 0;
+        if (d.circles.length > 0) {
+          const sa = hasStroke ? ` stroke="${rgba(d.stroke)}" stroke-width="${d.lineWidth}"` : "";
+          screenEls.push(d.circles.map((c) => `<circle cx="${t.k * c.x + t.x}" cy="${t.k * c.y + t.y}" r="${c.r}" fill="${fill}"${sa} />`).join(""));
+        } else if (d.anchor) {
+          const [ax, ay] = d.anchor;
+          const sa = hasStroke ? ` stroke="${rgba(d.stroke)}" stroke-width="${d.lineWidth}"` : "";
+          screenEls.push(`<path d="${pathDScreen(d, ax, ay, t.k * ax + t.x, t.k * ay + t.y)}" fill="${fill}"${sa} />`);
+        } else {
+          const sa = hasStroke ? ` stroke="${rgba(d.stroke)}" stroke-width="${d.lineWidth / t.k}"` : "";
+          worldEls.push(`<path d="${pathD(d)}" fill="${fill}"${sa} />`);
+        }
+      }
+      if (worldEls.length) groups.push(`<g${clipAttr}>${worldEls.join("")}</g>`);
+      if (screenEls.length) screenCircleGroups.push(`<g>${screenEls.join("")}</g>`);
     } else {
       const elements = layer.drawables
         .filter((d) => (d.flags & 1) !== 0)

@@ -51,7 +51,7 @@ describe("point size mode: screen vs world", () => {
       scene.setFill("pts", "a", "rgba(255,0,0,255)");
       const r = new GroupRenderer(device, scene.buffers("pts"), W, H);
       r.setTransform(clipFromView({ k, x: tx, y: ty }, W, H));
-      r.setPointSizeMode(sizeMode);
+      r.setSizeMode(sizeMode);
       const pass = device.beginRenderPass({ framebuffer: fb, clearColor: [0, 0, 0, 0] });
       r.render(pass);
       pass.end();

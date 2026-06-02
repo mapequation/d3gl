@@ -13,7 +13,11 @@ interface LayerSpec {
   fill?: Accessor<any, string>;
   stroke?: Accessor<any, string>;
   clipTo?: string;
-  pointSizeMode?: "world" | "screen";
+  sizeMode?: "world" | "screen";
+  /** Screen-space declutter radius (px). When set, on each transform the engine hides
+   *  anchored glyphs whose projected anchor falls within this radius of an already-kept one
+   *  (grouped by anchor, earlier drawables win) — constant-size markers stop overlapping. */
+  declutter?: number;
   build: (g: GroupBuilder) => void;   // rebuilds the Scene group (geo or draw)
 }
 
@@ -57,7 +61,55 @@ export abstract class BaseEngine {
     return this;
   }
   setBackend(type: BackendType): this { this.ready = this.swapBackend(type); return this; }
-  setTransform(t: ViewTransform): this { this.transform = t; this.handle?.backend.setTransform(t); this.render(); return this; }
+  setTransform(t: ViewTransform): this {
+    this.transform = t;
+    this.handle?.backend.setTransform(t);
+    for (const spec of this.specs) if (spec.declutter) this.declutterLayer(spec, t);
+    this.render();
+    return this;
+  }
+
+  /**
+   * Hide anchored glyphs that overlap in screen space, keeping earlier (e.g. larger-clade)
+   * ones. Drawables sharing an exact anchor (a pie's wedges) are one unit. A uniform grid
+   * of cell size = radius makes neighbour checks O(1) average, so this is cheap enough to run
+   * on every zoom; it only toggles visibility flags (no geometry rebuild).
+   */
+  private declutterLayer(spec: LayerSpec, t: ViewTransform): void {
+    const radius = spec.declutter!;
+    if (!(radius > 0)) return;
+    const draws = this.scene.drawables(spec.name);
+    const groups = new Map<string, { ax: number; ay: number; ids: (string | number)[] }>();
+    for (const d of draws) {
+      if (!d.anchor) continue;
+      const key = `${d.anchor[0]},${d.anchor[1]}`;
+      const g = groups.get(key) ?? { ax: d.anchor[0], ay: d.anchor[1], ids: [] };
+      g.ids.push(d.id);
+      groups.set(key, g);
+    }
+    if (groups.size === 0) return;
+    const r2 = radius * radius;
+    const grid = new Map<string, { x: number; y: number }[]>();
+    const visible = new Set<string | number>();
+    for (const g of groups.values()) {
+      const sx = t.k * g.ax + t.x, sy = t.k * g.ay + t.y;
+      const cx = Math.floor(sx / radius), cy = Math.floor(sy / radius);
+      let occluded = false;
+      for (let i = -1; i <= 1 && !occluded; i++)
+        for (let j = -1; j <= 1 && !occluded; j++) {
+          for (const p of grid.get(`${cx + i},${cy + j}`) ?? []) {
+            const dx = p.x - sx, dy = p.y - sy;
+            if (dx * dx + dy * dy < r2) { occluded = true; break; }
+          }
+        }
+      if (!occluded) {
+        (grid.get(`${cx},${cy}`) ?? grid.set(`${cx},${cy}`, []).get(`${cx},${cy}`)!).push({ x: sx, y: sy });
+        for (const id of g.ids) visible.add(id);
+      }
+    }
+    for (const d of draws) this.scene.setFlag(spec.name, d.id, !d.anchor || visible.has(d.id) ? 1 : 0);
+    this.handle?.backend.updateLayer(spec.name, this.renderLayer(spec));
+  }
   enableZoom(extent: [number, number] = [1, 100]): this {
     const sel = select(this.host as Element);
     const behavior = d3zoom<Element, unknown>().scaleExtent(extent).on("zoom", (e: D3ZoomEvent<Element, unknown>) => {
@@ -117,7 +169,7 @@ export abstract class BaseEngine {
     });
   }
   private renderLayer(spec: LayerSpec): RenderLayer {
-    return { name: spec.name, buffers: this.scene.buffers(spec.name), drawables: this.scene.drawables(spec.name), clipTo: spec.clipTo, pointSizeMode: spec.pointSizeMode };
+    return { name: spec.name, buffers: this.scene.buffers(spec.name), drawables: this.scene.drawables(spec.name), clipTo: spec.clipTo, sizeMode: spec.sizeMode };
   }
   private pushLayers(): void {
     this.handle?.backend.setLayers(this.specs.map((s) => this.renderLayer(s)));

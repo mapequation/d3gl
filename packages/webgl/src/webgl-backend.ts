@@ -98,7 +98,7 @@ export class WebGLBackend implements Backend {
       const r = this.renderers.get(name)!;
       const layer = this.layers.get(name)!;
       r.setStencil(clipSources.has(name) ? "write" : layer.clipTo ? "test" : "off");
-      r.setPointSizeMode(layer.pointSizeMode ?? "world");
+      r.setSizeMode(layer.sizeMode ?? "world");
       r.render(pass);
     }
     pass.end();

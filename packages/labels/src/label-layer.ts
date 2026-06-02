@@ -11,8 +11,14 @@ export interface LabelAnchor {
   width?: number;
   height?: number;
   priority?: number;
-  /** Optional CSS transform applied at the anchor point (origin = the anchor). The
-   *  consumer owns layout-specific placement (gap offset, radial rotation, etc.). */
+  /**
+   * A constant screen-pixel offset [dx, dy] from the projected anchor, applied to BOTH the
+   * rendered position and the collision box — so it stays a fixed distance from the node at
+   * any zoom, and culling reflects where the label actually sits (no overlap as you zoom in).
+   */
+  offset?: [number, number];
+  /** Optional CSS transform applied at the (offset) anchor point. The consumer owns
+   *  layout-specific placement (radial rotation, etc.); use `offset` for the gap. */
   transform?: string;
   /** transform-origin for the node; defaults to "0 0" (the anchor point). */
   transformOrigin?: string;
@@ -40,11 +46,11 @@ export class LabelLayer {
     transform: ViewTransform,
     viewport: { width: number; height: number },
   ): void {
-    // reference -> screen: screen = k*ref + (x,y)
+    // reference -> screen: screen = k*ref + (x,y), plus the constant-px offset.
     const boxes: LabelBox[] = anchors.map((a) => ({
       id: a.id,
-      x: transform.k * a.refX + transform.x,
-      y: transform.k * a.refY + transform.y,
+      x: transform.k * a.refX + transform.x + (a.offset?.[0] ?? 0),
+      y: transform.k * a.refY + transform.y + (a.offset?.[1] ?? 0),
       width: a.width,
       height: a.height,
       priority: a.priority,

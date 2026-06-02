@@ -21,7 +21,7 @@ export class GeoMap extends BaseEngine {
     const list = Array.isArray(features) ? (features as F[]) : [features as F];
     const ids = list.map((f, i) => (opts.id ? opts.id(f, i) : i));
     this.registerLayer({
-      name, data: list as any[], ids, fill: opts.fill, stroke: opts.stroke, clipTo: opts.clipTo, pointSizeMode: opts.sizeMode,
+      name, data: list as any[], ids, fill: opts.fill, stroke: opts.stroke, clipTo: opts.clipTo, sizeMode: opts.sizeMode,
       build: geoLayer(list as any[], this.opts.projection, { id: (_f, i) => ids[i]!, lineWidth: opts.lineWidth, pointRadius: opts.pointRadius, sizeMode: opts.sizeMode }),
     });
     return this;
