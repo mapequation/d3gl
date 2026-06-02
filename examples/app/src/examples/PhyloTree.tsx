@@ -1,5 +1,6 @@
 import React, { useEffect, useRef, useState } from "react";
 import { schemeCategory10 } from "d3-scale-chromatic";
+import { scaleSqrt } from "d3-scale";
 import { select } from "d3-selection";
 import { zoom as d3zoom, type D3ZoomEvent, zoomIdentity } from "d3-zoom";
 import { link as d3link, linkRadial, curveLinear, curveStepBefore, curveBumpX, pointRadial } from "d3-shape";
@@ -59,14 +60,19 @@ function makeLinkDraw(mode: LayoutMode, curve: CurveMode): (ctx: CanvasRendering
   };
 }
 
-/** A label's CSS transform: rectangular = gap to the right; radial = along the angle,
- *  flipped on the left half so text stays upright and reads outward (d3 radial-tree). */
-function labelTransform(mode: LayoutMode, angle: number, gap: number): string {
-  if (mode !== "radial") return `translate(${gap}px, -50%)`;
+/** Rotation/centering only; the constant-px gap from the tip is the LabelAnchor `offset`. */
+function labelTransform(mode: LayoutMode, angle: number): string {
+  if (mode !== "radial") return "";
   const deg = (angle * 180) / Math.PI - 90; // pointRadial's 0 = north; align with the radius
   return Math.sin(angle) < 0
-    ? `rotate(${deg + 180}deg) translate(${-gap}px, -50%) translate(-100%, 0)`
-    : `rotate(${deg}deg) translate(${gap}px, -50%)`;
+    ? `rotate(${deg + 180}deg) translate(-100%, -50%)`
+    : `rotate(${deg}deg) translate(0, -50%)`;
+}
+/** Constant screen-px offset: rightward (rectangular) or outward along the radius (radial). */
+function labelOffset(mode: LayoutMode, angle: number, gap: number, height: number): [number, number] {
+  if (mode !== "radial") return [gap, -height / 2];
+  const a = angle - Math.PI / 2;
+  return [Math.cos(a) * gap, Math.sin(a) * gap];
 }
 
 export function PhyloTree(): React.ReactElement {
@@ -75,7 +81,8 @@ export function PhyloTree(): React.ReactElement {
   const [curve, setCurve] = useState<CurveMode>("step");
   const [timeScale, setTimeScale] = useState<TimeScaleKind>("linear");
   const [tips, setTips] = useState(128);
-  const [markerMode, setMarkerMode] = useState<"world" | "screen">("screen");
+  const [sizeMode, setSizeMode] = useState<"world" | "screen">("screen");
+  const [thickness, setThickness] = useState(false);
   const [tooltip, setTooltip] = useState<{ left: number; top: number; text: string } | null>(null);
 
   const chartRef = useRef<Plot | null>(null);
@@ -153,6 +160,7 @@ export function PhyloTree(): React.ReactElement {
     transformRef.current = baseT;
 
     const GAP = 7;
+    const H_LBL = 14;
     const anchors: LabelAnchor[] = tipNodes.map((n, i) => {
       const [px, py] = nodeXY(n, layoutMode);
       return {
@@ -161,31 +169,35 @@ export function PhyloTree(): React.ReactElement {
         refY: py,
         text: n.data.name,
         width: n.data.name.length * 6.2 + 6,
-        height: 14,
+        height: H_LBL,
         priority: n.data.length,
         transformOrigin: "0 0",
-        transform: labelTransform(layoutMode, n.x, GAP),
+        offset: labelOffset(layoutMode, n.x, GAP, H_LBL),
+        transform: labelTransform(layoutMode, n.x),
       };
     });
     anchorsRef.current = anchors;
 
+    // Branch width ∝ number of subtended leaves (toggle); constant px in "screen" sizeMode.
+    const widthScale = scaleSqrt().domain([1, tips]).range([0.6, 8]);
     const drawLink = makeLinkDraw(layoutMode, curve);
     chart.layer("links", links, {
       draw: (ctx, l) => drawLink(ctx, l), // ctx is CanvasRenderingContext2D — d3 generators accept it directly
       stroke: "#555",
-      lineWidth: 0.8,
+      lineWidth: thickness ? (l: PLink) => widthScale(l.target.leaves().length) : 0.8,
+      sizeMode,
     });
     chart.points("nodes", tipNodes, {
       x: (n) => nodeXY(n, layoutMode)[0],
       y: (n) => nodeXY(n, layoutMode)[1],
-      radius: markerMode === "screen" ? 3.2 : 2.6,
-      sizeMode: markerMode,
+      radius: sizeMode === "screen" ? 3.2 : 2.6,
+      sizeMode,
       fill: (n) => schemeCategory10[n.data.group % 10] ?? "#888",
       id: (_n, i) => `t${i}`,
     });
     chart.setTransform(baseT);
     labelLayer.update(anchors, baseT, { width: W, height: H });
-  }, [layoutMode, tips, markerMode, curve, timeScale]);
+  }, [layoutMode, tips, sizeMode, thickness, curve, timeScale]);
 
   const exportPNG = (): void => {
     try { download(chartRef.current!.toPNG(), "phylotree.png"); }
@@ -222,8 +234,9 @@ export function PhyloTree(): React.ReactElement {
           <button key={s} style={btn(timeScale === s)} onClick={() => setTimeScale(s)}>{s} time</button>
         ))}
         <Sep />
-        <button style={btn(false)} onClick={() => setMarkerMode((m) => (m === "world" ? "screen" : "world"))}>
-          markers: {markerMode}
+        <button style={btn(thickness)} onClick={() => setThickness((v) => !v)}>thickness</button>
+        <button style={btn(false)} onClick={() => setSizeMode((m) => (m === "world" ? "screen" : "world"))}>
+          size: {sizeMode}
         </button>
         <Sep />
         <label style={{ fontSize: 13 }}>
