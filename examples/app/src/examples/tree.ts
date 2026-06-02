@@ -8,9 +8,12 @@ export interface TreeNode {
   /** Age before present, in [0, 1]. Tips are at 0 (the present); the root is oldest. */
   time: number;
   children?: TreeNode[];
-  /** Bioregion distribution: at tips the current distribution, at internal nodes the
-   *  Fitch-reconstructed ancestral range. Set by parsimony.calcMaximumParsimony(). */
+  /** Reconstructed ancestral range *set* (membership): species' present regions at tips,
+   *  the most-parsimonious ancestral set at internal nodes. Set by calcMaximumParsimony(). */
   ranges?: RegionSet;
+  /** Occurrence-count *distribution*: leaf counts summed up the tree, sorted by descending
+   *  count. Sizes the pie wedges. Set by parsimony.aggregateClusters(). */
+  clusters?: RegionSet;
   /** Number of subtended terminals (Fig. 3 branch-thickness metric). Set by
    *  parsimony.aggregateSpeciesCount(). */
   speciesCount?: number;

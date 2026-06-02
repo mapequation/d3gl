@@ -3,6 +3,7 @@ import type { TreeNode } from "./tree.js";
 import {
   calcMaximumParsimonyPreliminaryPhase,
   calcMaximumParsimony,
+  aggregateClusters,
   aggregateSpeciesCount,
   type ClustersPerSpecies,
 } from "./parsimony.js";
@@ -58,21 +59,27 @@ describe("calcMaximumParsimonyPreliminaryPhase", () => {
   });
 });
 
-describe("calcMaximumParsimony (two-phase)", () => {
-  it("fig 2b: final phase narrows node 0 to {A}", () => {
+// Two-phase Fitch results below are the GENUINELY-CORRECT optimal-state sets (verified by
+// hand against the most-parsimonious reconstructions), NOT the bioregions1 outputs — its
+// final phase reads node.byUnion instead of node.clusters.byUnion, so Rule IV never fires
+// and Rules IV/V are effectively skipped, producing wrong sets for figs 2d and 2f.
+describe("calcMaximumParsimony (two-phase, correct Fitch rules)", () => {
+  it("fig 2b: node 0 → {A} (Rule II)", () => {
     const t = calcMaximumParsimony(tree3(), cps({ "00": [A], "01": [C], "1": [A] }));
     expect(regions(t, "0")).toEqual([A]);
     expect(regions(t, "root")).toEqual([A]);
   });
-  it("fig 2d: node 0 stays {A,C}, root {A,C,G}", () => {
+  it("fig 2d: node 0 → {A,C,G} (Rule IV, expanded ambiguity)", () => {
+    // {A,C}∪{G} all reach optimal cost 2: node0 ∈ {A,C,G} all appear in some MPR.
     const t = calcMaximumParsimony(tree3(), cps({ "00": [A], "01": [C], "1": [G] }));
-    expect(regions(t, "0")).toEqual([A, C]);
+    expect(regions(t, "0")).toEqual([A, C, G]);
     expect(regions(t, "root")).toEqual([A, C, G]);
   });
-  it("fig 2f: node 00 narrows to {A}", () => {
+  it("fig 2f: nodes 00 and 0 → {A,C} (Rule V, encompassing ambiguity)", () => {
+    // MPRs (cost 2): (00,0,root) ∈ {(A,A,A),(A,A,C),(C,C,C)} ⇒ 00,0,root all = {A,C}.
     const t = calcMaximumParsimony(tree4(), cps({ "000": [A], "001": [C], "01": [A], "1": [C] }));
-    expect(regions(t, "00")).toEqual([A]);
-    expect(regions(t, "0")).toEqual([A]);
+    expect(regions(t, "00")).toEqual([A, C]);
+    expect(regions(t, "0")).toEqual([A, C]);
     expect(regions(t, "1")).toEqual([C]);
     expect(regions(t, "root")).toEqual([A, C]);
   });
@@ -80,6 +87,33 @@ describe("calcMaximumParsimony (two-phase)", () => {
     const t = calcMaximumParsimony(tree3(), cps({ "00": [A], "01": [C], "1": [A] }));
     expect(regions(t, "00")).toEqual([A]);
     expect(regions(t, "01")).toEqual([C]);
+  });
+});
+
+describe("aggregateClusters (occurrence counts summed up the tree)", () => {
+  const t = (): TreeNode => node("r", node("x", node("y", leaf("a"), leaf("b")), leaf("c")), node("z", leaf("d")));
+  // a: A×3 · b: A×2,C×1 · c: none · d: C×4
+  const data: ClustersPerSpecies = {
+    a: { totCount: 3, clusters: [{ clusterId: A, count: 3 }] },
+    b: { totCount: 3, clusters: [{ clusterId: A, count: 2 }, { clusterId: C, count: 1 }] },
+    d: { totCount: 4, clusters: [{ clusterId: C, count: 4 }] },
+  };
+  const countOf = (root: TreeNode, name: string): Record<number, number> =>
+    Object.fromEntries((find(root, name).clusters?.clusters ?? []).map((r) => [r.clusterId, r.count]));
+
+  it("sums leaf counts up the tree and reports totCount", () => {
+    const root = aggregateClusters(t(), data);
+    expect(countOf(root, "a")).toEqual({ [A]: 3 });
+    expect(countOf(root, "y")).toEqual({ [A]: 5, [C]: 1 });   // a+b
+    expect(countOf(root, "x")).toEqual({ [A]: 5, [C]: 1 });   // +c (empty)
+    expect(countOf(root, "r")).toEqual({ [A]: 5, [C]: 5 });   // +d
+    expect(find(root, "r").clusters?.totCount).toBe(10);
+  });
+
+  it("sorts a node's regions by descending count", () => {
+    const root = aggregateClusters(t(), data);
+    const yc = find(root, "y").clusters!.clusters;
+    expect(yc.map((r) => r.clusterId)).toEqual([A, C]); // 5 before 1
   });
 });
 
