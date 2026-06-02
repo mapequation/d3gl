@@ -1,0 +1,91 @@
+{
+  "name": "@mapequation/d3gl",
+  "version": "0.1.0",
+  "description": "GPU-accelerated rendering for d3 — especially maps with GeoJSON and grid-cell data, with switchable SVG / Canvas2D / WebGL2 backends.",
+  "license": "MIT",
+  "author": "Daniel Edler",
+  "homepage": "https://github.com/mapequation/d3gl#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mapequation/d3gl.git"
+  },
+  "bugs": {
+    "url": "https://github.com/mapequation/d3gl/issues"
+  },
+  "keywords": [
+    "d3",
+    "webgl",
+    "gpu",
+    "canvas",
+    "svg",
+    "geojson",
+    "map",
+    "visualization",
+    "luma.gl"
+  ],
+  "type": "module",
+  "sideEffects": false,
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": { "types": "./dist/index.d.ts", "import": "./dist/index.js" },
+    "./canvas": { "types": "./dist/canvas.d.ts", "import": "./dist/canvas.js" },
+    "./webgl": { "types": "./dist/webgl.d.ts", "import": "./dist/webgl.js" },
+    "./svg": { "types": "./dist/svg.d.ts", "import": "./dist/svg.js" },
+    "./geo": { "types": "./dist/geo.d.ts", "import": "./dist/geo.js" },
+    "./labels": { "types": "./dist/labels.d.ts", "import": "./dist/labels.js" },
+    "./map": { "types": "./dist/map.d.ts", "import": "./dist/map.js" },
+    "./react": { "types": "./dist/react.d.ts", "import": "./dist/react.js" },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsup",
+    "test:browser": "vitest run --config vitest.config.ts",
+    "prepublishOnly": "tsup"
+  },
+  "dependencies": {
+    "@luma.gl/core": "^9.3.3",
+    "@luma.gl/engine": "^9.3.3",
+    "@luma.gl/webgl": "^9.3.3",
+    "earcut": "^3.0.0",
+    "d3-color": "^3.1.0",
+    "d3-geo": "^3.1.1",
+    "d3-selection": "^3.0.0",
+    "d3-zoom": "^3.0.0"
+  },
+  "peerDependencies": {
+    "react": "^19",
+    "react-dom": "^19"
+  },
+  "peerDependenciesMeta": {
+    "react": { "optional": true },
+    "react-dom": { "optional": true }
+  },
+  "devDependencies": {
+    "@types/d3-color": "^3.1.3",
+    "@types/d3-geo": "^3.1.0",
+    "@types/d3-scale": "^4.0.8",
+    "@types/d3-scale-chromatic": "^3.0.3",
+    "@types/d3-selection": "^3.0.10",
+    "@types/d3-shape": "^3.1.6",
+    "@types/d3-zoom": "^3.0.8",
+    "@types/earcut": "^2.1.4",
+    "@types/geojson": "^7946.0.14",
+    "@types/react": "^19.2.15",
+    "@types/react-dom": "^19.2.3",
+    "d3-scale": "^4.0.2",
+    "d3-scale-chromatic": "^3.1.0",
+    "d3-shape": "^3.2.0",
+    "react": "^19.2.6",
+    "react-dom": "^19.2.6"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}
