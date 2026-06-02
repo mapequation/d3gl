@@ -38,3 +38,32 @@ describe("plot layer lineWidth", () => {
     chart.destroy();
   });
 });
+
+describe("plot sizeMode: screen", () => {
+  it("non-anchored path: stroke width is constant px (lineWidth ÷ k)", async () => {
+    const chart = plot(host(), { width: 200, height: 200, backend: "svg" });
+    await chart.whenReady();
+    chart.layer("links", [{ y: 10 }], {
+      draw: (ctx, d) => { ctx.moveTo(0, d.y); ctx.lineTo(100, d.y); },
+      stroke: "#000000", lineWidth: 4, sizeMode: "screen",
+    });
+    chart.setTransform({ k: 2, x: 0, y: 0 });
+    expect(chart.toSVG()).toContain('stroke-width="2"'); // 4 / k=2 → renders 4px under scale(2)
+    chart.destroy();
+  });
+
+  it("anchored glyph: rendered at a constant size around the projected anchor", async () => {
+    const chart = plot(host(), { width: 200, height: 200, backend: "svg" });
+    await chart.whenReady();
+    chart.layer("glyph", [{}], {
+      draw: (ctx) => { ctx.moveTo(95, 95); ctx.lineTo(105, 95); ctx.lineTo(105, 105); ctx.lineTo(95, 105); ctx.closePath(); },
+      fill: "#ff0000", anchor: () => [100, 100], sizeMode: "screen",
+    });
+    chart.setTransform({ k: 3, x: 0, y: 0 });
+    const svg = chart.toSVG();
+    // Anchor projects to k*100 = 300; vertex offsets (±5) stay ±5 regardless of k → 295..305.
+    expect(svg).toContain("295");
+    expect(svg).toContain("305");
+    chart.destroy();
+  });
+});

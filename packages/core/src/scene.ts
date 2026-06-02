@@ -42,11 +42,22 @@ export interface GroupBuffers {
   pointCenters: Float32Array;
   /** Total number of circles across all drawables. */
   pointCount: number;
+  /** Per-fill-vertex anchor [x, y] (parallel to fillVertices) for screen sizeMode. */
+  fillAnchors: Float32Array;
+  /** Per-stroke-vertex anchor [x, y] (parallel to strokeVertices) for screen sizeMode. */
+  strokeAnchors: Float32Array;
 }
 
 export interface DrawableOpts {
   /** Stroke width in coordinate units. 0/undefined => no stroke geometry. */
   lineWidth?: number;
+  /**
+   * Optional glyph anchor in world coordinates. When set, in "screen" sizeMode the whole
+   * drawable (fill + stroke) is rendered at a constant pixel size around the projected
+   * anchor (e.g. a pie or symbol pinned to a node). When unset, fills stay in world space
+   * and strokes render at a constant pixel *width* about their own centerline.
+   */
+  anchor?: [number, number];
 }
 
 export interface GroupBuilder {
@@ -71,6 +82,11 @@ class GroupData {
   subpaths: Subpath[][] = [];
   ids: (string | number)[] = [];
   lineWidths: number[] = [];
+  /** Per-drawable glyph anchor (null = none), for screen sizeMode. */
+  anchors: ([number, number] | null)[] = [];
+  /** Per-fill-vertex / per-stroke-vertex anchors (flat x,y), parallel to the vertex arrays. */
+  fillAnchors: number[] = [];
+  strokeAnchors: number[] = [];
   /** One array of circle centers per drawable (empty for path drawables). */
   circles: { x: number; y: number; r: number }[][] = [];
   constructor(public readonly tolerance: number) {}
@@ -84,6 +100,8 @@ export interface DrawableVector {
   lineWidth: number;
   flags: number;
   circles: { x: number; y: number; r: number }[];
+  /** Glyph anchor in world coords (null = none); used by backends for screen sizeMode. */
+  anchor: [number, number] | null;
 }
 
 export class Scene {
@@ -117,6 +135,8 @@ export class Scene {
     data.subpaths.push(subpaths.map((s) => ({ closed: s.closed, points: s.points.slice() })));
     data.ids.push(id);
     data.lineWidths.push(opts?.lineWidth ?? 0);
+    const anchor = opts?.anchor ?? null;
+    data.anchors.push(anchor);
 
     // ---- Fill ----
     const fillVertexOffset = data.fillVerts.length / 3;
@@ -129,7 +149,10 @@ export class Scene {
       const fg = tessellateFill(polygons, holes);
       const baseVertex = data.fillVerts.length / 3;
       for (let i = 0; i < fg.vertices.length; i += 2) {
-        data.fillVerts.push(fg.vertices[i]!, fg.vertices[i + 1]!, drawableId);
+        const x = fg.vertices[i]!, y = fg.vertices[i + 1]!;
+        data.fillVerts.push(x, y, drawableId);
+        // Anchor at the glyph center if given, else at the vertex itself (offset 0 ⇒ stays world).
+        data.fillAnchors.push(anchor ? anchor[0] : x, anchor ? anchor[1] : y);
       }
       for (const ix of fg.indices) data.fillIdx.push(baseVertex + ix);
     }
@@ -146,6 +169,9 @@ export class Scene {
         const baseVertex = data.strokeVerts.length / 3;
         for (let i = 0; i < sg.vertices.length; i += 2) {
           data.strokeVerts.push(sg.vertices[i]!, sg.vertices[i + 1]!, drawableId);
+          // Glyph: anchor at the center (whole outline scales). Else: per-vertex centerline
+          // anchor (constant-width stroke about its own line).
+          data.strokeAnchors.push(anchor ? anchor[0] : sg.anchors[i]!, anchor ? anchor[1] : sg.anchors[i + 1]!);
         }
         for (const ix of sg.indices) data.strokeIdx.push(baseVertex + ix);
       }
@@ -187,6 +213,7 @@ export class Scene {
     data.circles.push(centers.map(([x, y]) => ({ x, y, r })));
     data.ids.push(id);
     data.lineWidths.push(0);
+    data.anchors.push(null);
     // Zero fill+stroke range to keep ranges index-aligned with drawableId.
     const fillVertexOffset = data.fillVerts.length / 3;
     const strokeVertexOffset = data.strokeVerts.length / 3;
@@ -251,6 +278,7 @@ export class Scene {
       lineWidth: data.lineWidths[i]!,
       flags: data.flags[i]!,
       circles: data.circles[i]!,
+      anchor: data.anchors[i]!,
     }));
   }
 
@@ -275,6 +303,8 @@ export class Scene {
       drawableCount: data.ranges.length,
       pointCenters: new Float32Array(pointFlat),
       pointCount: pointFlat.length / 4,
+      fillAnchors: new Float32Array(data.fillAnchors),
+      strokeAnchors: new Float32Array(data.strokeAnchors),
     };
   }
 }

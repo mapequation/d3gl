@@ -5,6 +5,13 @@ export interface StrokeGeometry {
   vertices: number[];
   /** Triangle indices into `vertices` (3 per triangle). */
   indices: number[];
+  /**
+   * Per-vertex centerline anchor (interleaved x,y, one pair per vertex). The point on the
+   * polyline that each stroke vertex was offset from by the half-width normal. Backends use
+   * it for "screen" sizeMode: keep the anchor in world space but render the (vertex − anchor)
+   * offset at a constant pixel size, giving a constant-width stroke independent of zoom.
+   */
+  anchors: number[];
 }
 
 /**
@@ -22,10 +29,11 @@ export interface StrokeGeometry {
 export function expandStroke(subpath: Subpath, width: number): StrokeGeometry {
   const vertices: number[] = [];
   const indices: number[] = [];
+  const anchors: number[] = [];
   const pts = subpath.points;
   const n = pts.length / 2;
   const half = width / 2;
-  if (n < 2 || width <= 0) return { vertices, indices };
+  if (n < 2 || width <= 0) return { vertices, indices, anchors };
 
   const px = (i: number) => pts[2 * i]!;
   const py = (i: number) => pts[2 * i + 1]!;
@@ -47,6 +55,7 @@ export function expandStroke(subpath: Subpath, width: number): StrokeGeometry {
     const ny = dx * half;
     const base = vertices.length / 2;
     vertices.push(ax + nx, ay + ny, ax - nx, ay - ny, bx + nx, by + ny, bx - nx, by - ny);
+    anchors.push(ax, ay, ax, ay, bx, by, bx, by);
     indices.push(base + 0, base + 1, base + 2, base + 2, base + 1, base + 3);
   }
 
@@ -76,10 +85,11 @@ export function expandStroke(subpath: Subpath, width: number): StrokeGeometry {
     const nnx = -ndy * half;
     const nny = ndx * half;
     const base = vertices.length / 2;
-    // center, prevLeft, nextLeft, prevRight, nextRight
+    // center, prevLeft, nextLeft, prevRight, nextRight — all anchored at the corner (cx, cy).
     vertices.push(cx, cy, cx + pnx, cy + pny, cx + nnx, cy + nny, cx - pnx, cy - pny, cx - nnx, cy - nny);
+    anchors.push(cx, cy, cx, cy, cx, cy, cx, cy, cx, cy);
     indices.push(base + 0, base + 1, base + 2, base + 0, base + 3, base + 4);
   }
 
-  return { vertices, indices };
+  return { vertices, indices, anchors };
 }

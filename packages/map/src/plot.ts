@@ -20,6 +20,12 @@ export interface PlotLayerOptions<D = any> {
   lineWidth?: number | ((d: D, i: number) => number);
   clipTo?: string;
   id?: (d: D, i: number) => string | number;
+  /** "world" (default): geometry scales with zoom. "screen": constant pixel size — anchored
+   *  glyphs keep their size, strokes keep their pixel width. See `anchor`. */
+  sizeMode?: "world" | "screen";
+  /** Glyph anchor in world coords per datum. In "screen" sizeMode the drawable is rendered
+   *  at a constant pixel size around this point (e.g. a pie pinned to a tree node). */
+  anchor?: (d: D, i: number) => [number, number];
 }
 
 export interface PlotPointOptions<D = any> {
@@ -41,6 +47,7 @@ export class Plot extends BaseEngine {
     const ids = list.map((d, i) => (opts.id ? opts.id(d, i) : i));
     const lw = opts.lineWidth;
     const widthOf = typeof lw === "function" ? lw : (_d: D, _i: number) => lw as number;
+    const anchorOf = opts.anchor;
     const build = (g: GroupBuilder): void => {
       // d3gl's PathContext implements the path-building subset d3 generators use;
       // present it as CanvasRenderingContext2D (the type their .context()/geoPath
@@ -49,11 +56,11 @@ export class Plot extends BaseEngine {
         g.drawable(
           ids[i]!,
           (ctx: PathContext) => opts.draw(ctx as unknown as CanvasRenderingContext2D, d, i),
-          lw != null ? { lineWidth: widthOf(d, i) } : undefined,
+          lw != null || anchorOf ? { lineWidth: lw != null ? widthOf(d, i) : 0, anchor: anchorOf?.(d, i) } : undefined,
         ),
       );
     };
-    this.registerLayer({ name, data: list, ids, fill: opts.fill, stroke: opts.stroke, clipTo: opts.clipTo, build });
+    this.registerLayer({ name, data: list, ids, fill: opts.fill, stroke: opts.stroke, clipTo: opts.clipTo, sizeMode: opts.sizeMode, build });
     return this;
   }
   points<D>(name: string, data: readonly D[], opts: PlotPointOptions<D>): this {
@@ -63,7 +70,7 @@ export class Plot extends BaseEngine {
     const build = (g: GroupBuilder): void => {
       list.forEach((d, i) => g.point(ids[i]!, opts.x(d, i), opts.y(d, i), resolveRadius(d, i)));
     };
-    this.registerLayer({ name, data: list, ids, fill: opts.fill, stroke: opts.stroke, clipTo: opts.clipTo, pointSizeMode: opts.sizeMode, build });
+    this.registerLayer({ name, data: list, ids, fill: opts.fill, stroke: opts.stroke, clipTo: opts.clipTo, sizeMode: opts.sizeMode, build });
     return this;
   }
 }

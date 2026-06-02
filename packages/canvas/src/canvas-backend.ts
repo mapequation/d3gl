@@ -54,7 +54,11 @@ export class CanvasBackend implements Backend {
         }
         ctx.clip();
       }
-      const screenMode = layer.pointSizeMode === "screen";
+      const screenMode = layer.sizeMode === "screen";
+      const fillStroke = (d: DrawableVector, strokeW: number): void => {
+        if (d.fill[3] > 0) { ctx.fillStyle = css(d.fill); ctx.fill(); }
+        if (d.stroke[3] > 0 && strokeW > 0) { ctx.strokeStyle = css(d.stroke); ctx.lineWidth = strokeW; ctx.stroke(); }
+      };
       for (const d of layer.drawables) {
         if ((d.flags & 1) === 0) continue;
         if (d.circles.length > 0) {
@@ -67,21 +71,35 @@ export class CanvasBackend implements Backend {
               ctx.beginPath();
               ctx.arc(t.k * c.x + t.x, t.k * c.y + t.y, c.r, 0, 2 * Math.PI);
               ctx.closePath();
-              if (d.fill[3] > 0) { ctx.fillStyle = css(d.fill); ctx.fill(); }
-              if (d.stroke[3] > 0 && d.lineWidth > 0) { ctx.strokeStyle = css(d.stroke); ctx.lineWidth = d.lineWidth; ctx.stroke(); }
+              fillStroke(d, d.lineWidth);
               ctx.restore();
             } else {
               ctx.beginPath();
               ctx.arc(c.x, c.y, c.r, 0, 2 * Math.PI);
               ctx.closePath();
-              if (d.fill[3] > 0) { ctx.fillStyle = css(d.fill); ctx.fill(); }
-              if (d.stroke[3] > 0 && d.lineWidth > 0) { ctx.strokeStyle = css(d.stroke); ctx.lineWidth = d.lineWidth; ctx.stroke(); }
+              fillStroke(d, d.lineWidth);
             }
           }
+        } else if (screenMode && d.anchor) {
+          // Anchored glyph: render at a constant pixel size around the projected anchor.
+          const [ax, ay] = d.anchor;
+          const ox = t.k * ax + t.x, oy = t.k * ay + t.y;
+          ctx.save();
+          ctx.setTransform(1, 0, 0, 1, 0, 0);
+          ctx.beginPath();
+          for (const s of d.subpaths) {
+            const p = s.points; if (p.length < 2) continue;
+            ctx.moveTo(ox + (p[0]! - ax), oy + (p[1]! - ay));
+            for (let i = 2; i < p.length; i += 2) ctx.lineTo(ox + (p[i]! - ax), oy + (p[i + 1]! - ay));
+            if (s.closed) ctx.closePath();
+          }
+          fillStroke(d, d.lineWidth);
+          ctx.restore();
         } else {
+          // World path. In screen mode, stroke width is constant px: divide by k since the
+          // context is scaled by k (so k * lineWidth/k = lineWidth device px).
           trace(ctx, d);
-          if (d.fill[3] > 0) { ctx.fillStyle = css(d.fill); ctx.fill(); }
-          if (d.stroke[3] > 0 && d.lineWidth > 0) { ctx.strokeStyle = css(d.stroke); ctx.lineWidth = d.lineWidth; ctx.stroke(); }
+          fillStroke(d, screenMode ? d.lineWidth / t.k : d.lineWidth);
         }
       }
       if (clipSrc) ctx.restore();

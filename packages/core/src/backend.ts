@@ -14,8 +14,12 @@ export interface RenderLayer {
   drawables: DrawableVector[];
   /** Name of an earlier layer whose filled silhouette clips this one. */
   clipTo?: string;
-  /** "world" (default): radius in reference px, scales with zoom. "screen": constant px. */
-  pointSizeMode?: "world" | "screen";
+  /**
+   * "world" (default): geometry scales with zoom. "screen": constant pixel size — points and
+   * anchored glyphs keep a constant radius/size around their projected anchor, and strokes
+   * keep a constant pixel width about their world centerline. Applies to all geometry types.
+   */
+  sizeMode?: "world" | "screen";
 }
 
 /** A renderer for a Scene, implemented per target (WebGL / Canvas / SVG). */

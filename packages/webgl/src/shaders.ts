@@ -9,7 +9,10 @@ precision highp float;
 uniform mat3 u_transform;
 uniform highp sampler2D u_colorTable;
 uniform highp sampler2D u_flags;
+uniform float u_screen;     // 1.0 = screen sizeMode (constant px), 0.0 = world
+uniform vec2 u_viewport;    // device px, for screen sizeMode
 in vec2 a_position;
+in vec2 a_anchor;
 in float a_drawableId;
 out vec4 v_color;
 flat out float v_id;
@@ -25,8 +28,16 @@ void main() {
     gl_Position = vec4(2.0, 2.0, 2.0, 1.0); // outside clip space -> culled
     return;
   }
-  vec3 p = u_transform * vec3(a_position, 1.0);
-  gl_Position = vec4(p.xy, 0.0, 1.0);
+  // World: project the vertex directly. Screen: project the anchor, then add the
+  // (vertex - anchor) offset at a constant pixel size (clip = 2px / viewport).
+  vec2 pos;
+  if (u_screen > 0.5) {
+    vec3 ca = u_transform * vec3(a_anchor, 1.0);
+    pos = ca.xy + (a_position - a_anchor) * vec2(2.0 / u_viewport.x, -2.0 / u_viewport.y);
+  } else {
+    pos = (u_transform * vec3(a_position, 1.0)).xy;
+  }
+  gl_Position = vec4(pos, 0.0, 1.0);
 }`;
 
 export const FILL_FS = `#version 300 es

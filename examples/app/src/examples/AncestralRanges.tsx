@@ -118,10 +118,6 @@ export function AncestralRanges(): React.ReactElement {
   const wrapRef = useRef<HTMLDivElement>(null);
   const anchorsRef = useRef<LabelAnchor[]>([]);
   const zoomBehaviorRef = useRef<ReturnType<typeof d3zoom<HTMLDivElement, unknown>> | null>(null);
-  const rebuildRef = useRef<((k: number) => void) | null>(null);
-  const sizeModeRef = useRef<SizeMode>(sizeMode); sizeModeRef.current = sizeMode;
-  const pendingKRef = useRef(1);
-  const rafRef = useRef(0);
 
   useEffect(() => {
     const host = hostRef.current;
@@ -147,19 +143,13 @@ export function AncestralRanges(): React.ReactElement {
       });
     });
 
-    const scheduleRebuild = (): void => {
-      if (rafRef.current) return;
-      rafRef.current = requestAnimationFrame(() => { rafRef.current = 0; rebuildRef.current?.(pendingKRef.current); });
-    };
     const zoomBehavior = d3zoom<HTMLDivElement, unknown>()
       .scaleExtent([0.4, 200])
       .on("zoom", (e: D3ZoomEvent<HTMLDivElement, unknown>) => {
         const t = { k: e.transform.k, x: e.transform.x, y: e.transform.y };
         transformRef.current = t;
-        pendingKRef.current = t.k;
-        chart.setTransform(t);
+        chart.setTransform(t); // sizeMode is baked into the layers; the backend keeps screen sizes constant
         labelLayer.update(anchorsRef.current, t, { width: W, height: H });
-        if (sizeModeRef.current === "screen") scheduleRebuild();
       });
     zoomBehaviorRef.current = zoomBehavior;
     select(wrapper).call(zoomBehavior);
@@ -168,7 +158,6 @@ export function AncestralRanges(): React.ReactElement {
       chart.destroy();
       labelLayer.destroy();
       select(wrapper).on(".zoom", null);
-      if (rafRef.current) cancelAnimationFrame(rafRef.current);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -211,7 +200,6 @@ export function AncestralRanges(): React.ReactElement {
     const baseT: ViewTransform = { k: base.k, x: base.x, y: base.y };
     select(wrapper).call(zoomBehavior.transform, base);
     transformRef.current = baseT;
-    pendingKRef.current = baseT.k;
 
     const GAP = 8;
     anchorsRef.current = tipNodes.map((n, i) => {
@@ -226,34 +214,35 @@ export function AncestralRanges(): React.ReactElement {
 
     const drawLink = makeLinkDraw(layoutMode, curve);
 
-    const rebuild = (k: number): void => {
-      const scale = sizeModeRef.current === "screen" ? 1 / k : 1;
-      chart.layer("links", links, {
-        draw: (ctx, l) => drawLink(ctx, l),
-        // Color each branch by the child clade's most-occurring bioregion.
-        stroke: (l: PLink) => { const t = topRegion(l.target); return t == null ? "#777" : regionColor(t); },
-        lineWidth: (l: PLink) => widthBase(l.target) * scale,
-      });
-      const wedges: Wedge[] = [];
-      for (const p of pieSpecs) {
-        const single = p.slices.length === 1;
-        for (const s of p.slices) wedges.push({ cx: p.cx, cy: p.cy, r: p.rBase * scale, a0: s.a0, a1: s.a1, clusterId: s.clusterId, count: s.count, single, node: p.node });
-      }
-      chart.layer("pies", wedges, {
-        draw: (ctx, w) => {
-          // Single-region node: a full circle. closePath() so the subpath is closed and the
-          // WebGL fill tessellator (which fills only closed subpaths) renders it like Canvas/SVG.
-          if (w.single) { ctx.moveTo(w.cx + w.r, w.cy); ctx.arc(w.cx, w.cy, w.r, 0, 2 * Math.PI); ctx.closePath(); }
-          else { ctx.moveTo(w.cx, w.cy); ctx.arc(w.cx, w.cy, w.r, w.a0, w.a1); ctx.closePath(); }
-        },
-        fill: (w: Wedge) => regionColor(w.clusterId),
-        stroke: "#ffffff",
-        lineWidth: (w: Wedge) => (w.single ? 0 : Math.min(0.5, w.r * 0.16)),
-        id: (_w, i) => i,
-      });
-    };
-    rebuildRef.current = rebuild;
-    rebuild(baseT.k);
+    // Build the layers once with the chosen sizeMode. In "screen" mode the backend keeps
+    // branch widths and pie diameters at a constant pixel size around their world anchors as
+    // you zoom — no per-zoom rebuild needed (the core sizeMode handles it).
+    chart.layer("links", links, {
+      draw: (ctx, l) => drawLink(ctx, l),
+      // Color each branch by the child clade's most-occurring bioregion.
+      stroke: (l: PLink) => { const t = topRegion(l.target); return t == null ? "#777" : regionColor(t); },
+      lineWidth: (l: PLink) => widthBase(l.target),
+      sizeMode,
+    });
+    const wedges: Wedge[] = [];
+    for (const p of pieSpecs) {
+      const single = p.slices.length === 1;
+      for (const s of p.slices) wedges.push({ cx: p.cx, cy: p.cy, r: p.rBase, a0: s.a0, a1: s.a1, clusterId: s.clusterId, count: s.count, single, node: p.node });
+    }
+    chart.layer("pies", wedges, {
+      draw: (ctx, w) => {
+        // Single-region node: a full circle. closePath() so the subpath is closed and the
+        // WebGL fill tessellator (which fills only closed subpaths) renders it like Canvas/SVG.
+        if (w.single) { ctx.moveTo(w.cx + w.r, w.cy); ctx.arc(w.cx, w.cy, w.r, 0, 2 * Math.PI); ctx.closePath(); }
+        else { ctx.moveTo(w.cx, w.cy); ctx.arc(w.cx, w.cy, w.r, w.a0, w.a1); ctx.closePath(); }
+      },
+      fill: (w: Wedge) => regionColor(w.clusterId),
+      stroke: "#ffffff",
+      lineWidth: (w: Wedge) => (w.single ? 0 : Math.min(0.5, w.r * 0.16)),
+      anchor: (w: Wedge) => [w.cx, w.cy], // pin the pie; screen mode keeps it constant-size
+      sizeMode,
+      id: (_w, i) => i,
+    });
 
     chart.setTransform(baseT);
     labelLayer.update(anchorsRef.current, baseT, { width: W, height: H });

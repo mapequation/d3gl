@@ -11,6 +11,7 @@ const identity = (): Float32Array => new Float32Array([1, 0, 0, 0, 1, 0, 0, 0, 1
 interface Pass {
   positionBuffer: Buffer;
   idBuffer: Buffer;
+  anchorBuffer: Buffer;
   indexBuffer: Buffer;
   colorTexture: Texture;
   flagsTexture: Texture;
@@ -63,12 +64,14 @@ export class GroupRenderer {
       buffers.fillIndices,
       buffers.fillColors,
       buffers.flags,
+      buffers.fillAnchors,
     );
     this.stroke = this.buildPass(
       buffers.strokeVertices,
       buffers.strokeIndices,
       buffers.strokeColors,
       buffers.flags,
+      buffers.strokeAnchors,
     );
     this.point = this.buildPointPass(buffers);
   }
@@ -78,6 +81,7 @@ export class GroupRenderer {
     indices: Uint32Array,
     colors: Uint8Array,
     flags: Uint8Array,
+    anchors: Float32Array,
   ): Pass | null {
     if (indices.length === 0) return null;
     const device = this.device;
@@ -94,6 +98,7 @@ export class GroupRenderer {
     }
     const positionBuffer = device.createBuffer({ data: pos });
     const idBuffer = device.createBuffer({ data: ids });
+    const anchorBuffer = device.createBuffer({ data: anchors });
     const indexBuffer = device.createBuffer({
       data: indices,
       usage: Buffer.INDEX,
@@ -121,12 +126,17 @@ export class GroupRenderer {
 
     const bufferLayout = [
       { name: "a_position", format: "float32x2" as const },
+      { name: "a_anchor", format: "float32x2" as const },
       { name: "a_drawableId", format: "float32" as const },
     ];
-    const attributes = { a_position: positionBuffer, a_drawableId: idBuffer };
+    const attributes = { a_position: positionBuffer, a_anchor: anchorBuffer, a_drawableId: idBuffer };
     const bindings = { u_colorTable: colorTexture, u_flags: flagsTexture };
     // Use a shared uniforms object so setTransform mutations are picked up on the next draw.
-    const uniforms: Record<string, unknown> = { u_transform: this.transform };
+    const uniforms: Record<string, unknown> = {
+      u_transform: this.transform,
+      u_screen: 0,
+      u_viewport: new Float32Array([this.viewportWidth, this.viewportHeight]),
+    };
     const common = {
       bufferLayout,
       attributes,
@@ -143,7 +153,7 @@ export class GroupRenderer {
     // pickModel shares geometry/bindings/uniforms with fillModel; it is drawn only
     // by renderPick() (GPU color-picking, added in a later task).
     const pickModel = new Model(device, { ...common, vs: FILL_VS, fs: PICK_FS });
-    return { positionBuffer, idBuffer, indexBuffer, colorTexture, flagsTexture, fillModel, pickModel, uniforms, drawableCount: count };
+    return { positionBuffer, idBuffer, anchorBuffer, indexBuffer, colorTexture, flagsTexture, fillModel, pickModel, uniforms, drawableCount: count };
   }
 
   private buildPointPass(buffers: GroupBuffers): PointPass | null {
@@ -354,11 +364,15 @@ export class GroupRenderer {
     if (this.point) this.point.uniforms["u_transform"] = m;
   }
 
-  /** Switch the point size mode for the next render. Default "world" (scales with zoom). */
-  setPointSizeMode(mode: "world" | "screen"): void {
-    if (this.point) {
-      this.point.uniforms["u_pointScreen"] = mode === "screen" ? 1.0 : 0.0;
-    }
+  /**
+   * Switch the size mode for the next render. "screen" renders fill/stroke (via the
+   * anchor + offset model) and points at a constant pixel size; "world" scales with zoom.
+   * Default "world".
+   */
+  setSizeMode(mode: "world" | "screen"): void {
+    const s = mode === "screen" ? 1.0 : 0.0;
+    for (const pass of this.passes()) pass.uniforms["u_screen"] = s;
+    if (this.point) this.point.uniforms["u_pointScreen"] = s;
   }
 
   /** Draw the fill, stroke, then point passes into an open render pass. */
@@ -381,6 +395,7 @@ export class GroupRenderer {
     for (const pass of this.passes()) {
       pass.positionBuffer.destroy();
       pass.idBuffer.destroy();
+      pass.anchorBuffer.destroy();
       pass.indexBuffer.destroy();
       pass.colorTexture.destroy();
       pass.flagsTexture.destroy();
