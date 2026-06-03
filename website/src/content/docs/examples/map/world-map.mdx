@@ -1,6 +1,16 @@
 ---
 title: World map
-description: Placeholder — content added in a later task.
+description: The simplest d3gl map — land and ocean projected with d3-geo.
 ---
 
-Coming soon.
+import ExampleFrame from "../../../../components/ExampleFrame.astro";
+
+The smallest possible map: fill a sphere as ocean, then draw the Natural Earth land outline,
+projected once with `geoNaturalEarth1()`. Switch the backend and export with the control bar.
+
+<ExampleFrame
+  id="world-map"
+  files={["world-map/index.ts", "shared/geo-data.ts"]}
+  width={900}
+  height={450}
+/>
