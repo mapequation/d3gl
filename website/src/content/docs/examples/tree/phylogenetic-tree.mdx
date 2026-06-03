@@ -1,6 +1,17 @@
 ---
 title: Phylogenetic tree
-description: Placeholder — content added in a later task.
+description: A minimal d3gl tree — d3-hierarchy layout + d3-shape links on the GPU.
 ---
 
-Coming soon.
+import ExampleFrame from "../../../../components/ExampleFrame.astro";
+
+The smallest tree example: lay out a 64-tip phylogram with `d3-hierarchy`'s `cluster`, then draw
+the branches with a `d3.link()` generator straight into the d3gl context. No settings — just the
+backend switch and export.
+
+<ExampleFrame
+  id="phylogenetic-tree"
+  files={["phylogenetic-tree/index.ts", "shared/tree.ts", "shared/layout.ts"]}
+  width={900}
+  height={560}
+/>
