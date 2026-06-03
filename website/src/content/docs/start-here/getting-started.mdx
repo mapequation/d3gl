@@ -1,6 +1,47 @@
 ---
 title: Getting started
-description: Placeholder — content added in a later task.
+description: Install d3gl and render your first GPU-accelerated d3 scene.
 ---
 
-Coming soon.
+d3's generators (`d3-geo`'s `geoPath`, `d3-shape`, `d3-hierarchy` links) don't draw; they
+emit path commands to a **context**. d3gl implements that same context across **SVG /
+Canvas2D / WebGL2**, so any context-driven d3 generator can render on the GPU unchanged.
+Geometry is projected & tessellated **once**; pan/zoom is one transform-matrix uniform and
+recolor/show-hide is one texture write.
+
+## Install
+
+```sh
+npm i @mapequation/d3gl
+# React components also need:  npm i react react-dom   (optional peer deps)
+```
+
+## Modules
+
+`@mapequation/d3gl` is one package with subpath exports; the root entry is `core`.
+
+| Subpath | Responsibility |
+| --- | --- |
+| *(root)* | `Scene`, `PathContext`, tessellation, stroke expansion, hit-testing |
+| `/canvas` | Canvas2D backend |
+| `/webgl` | luma.gl v9 WebGL2 backend (palette-texture color, GPU picking, PNG export) |
+| `/svg` | SVG backend + vector export |
+| `/geo` | projection + GeoJSON project-once helpers, inverse projection |
+| `/labels` | HTML label overlay with culling |
+| `/map` | `geoMap` + `plot` engines with d3-zoom wiring |
+| `/react` | headless `MapController` + `<D3GL>` component |
+
+## Quick start
+
+```ts
+import { plot } from "@mapequation/d3gl/map";
+import { line } from "d3-shape";
+
+const chart = plot(document.querySelector("#chart")!, { width: 640, height: 400, backend: "webgl" });
+const gen = line<[number, number]>().x((d) => d[0]).y((d) => d[1]);
+chart.layer("series", [points], { draw: (ctx, d) => { gen.context(ctx); gen(d); }, stroke: "#1a73e8", lineWidth: 1.5 });
+chart.enableZoom();
+```
+
+See the [Examples](/d3gl/examples/tree/phylogenetic-tree/) for full, runnable demos, and the
+[Reference](/d3gl/reference/) for the API of each module.

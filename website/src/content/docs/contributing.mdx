@@ -1,6 +1,11 @@
 ---
 title: Contributing
-description: Placeholder — content added in a later task.
+description: How to set up the repo and contribute to d3gl.
 ---
 
-Coming soon.
+Contributions are welcome. The repository is a pnpm workspace; setup, test commands, and
+the release process live in **[CONTRIBUTING.md](https://github.com/mapequation/d3gl/blob/main/CONTRIBUTING.md)**.
+
+In short: `corepack pnpm@9.15.9 install`, then `pnpm test` (Node) and
+`pnpm --filter @mapequation/d3gl test:browser` (WebGL/DOM). d3gl is MIT-licensed, and
+contributions are accepted under the same license (inbound = outbound).
