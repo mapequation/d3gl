@@ -6,7 +6,7 @@
   "type": "module",
   "packageManager": "pnpm@9.15.9",
   "scripts": {
-    "dev": "pnpm --filter @d3gl/example dev",
+    "dev": "pnpm --filter @d3gl/website dev",
     "build": "pnpm -r build",
     "build:lib": "pnpm --filter @mapequation/d3gl build",
     "test": "vitest run",
