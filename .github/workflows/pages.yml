@@ -33,16 +33,13 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
-      # Project site lives at https://mapequation.github.io/d3gl/, so the app
-      # must be built with that base path. The example aliases the @d3gl/*
-      # workspace source directly, so no library build step is needed.
-      - name: Build example app
-        run: pnpm --filter @d3gl/example build --base=/d3gl/
+      - name: Build website
+        run: pnpm --filter @d3gl/website build
 
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3
         with:
-          path: examples/app/dist
+          path: website/dist
 
   deploy:
     needs: build
