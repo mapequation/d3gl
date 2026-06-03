@@ -1,40 +1,39 @@
 ---
-title: Welcome to Starlight
-description: Get started building your docs site with Starlight.
-template: splash # Remove or comment out this line to display the site sidebar on this page.
+title: d3gl
+description: GPU-accelerated rendering for d3 — SVG, Canvas2D, and WebGL2 from one API.
+template: splash
 hero:
-  tagline: Congrats on setting up a new Starlight project!
-  image:
-    file: ../../assets/houston.webp
+  tagline: GPU-accelerated rendering for d3 — SVG, Canvas2D, and WebGL2 from one API.
   actions:
-    - text: Example Guide
-      link: /guides/example/
+    - text: Get started
+      link: /start-here/getting-started/
       icon: right-arrow
-    - text: Read the Starlight docs
-      link: https://starlight.astro.build
+      variant: primary
+    - text: View on GitHub
+      link: https://github.com/mapequation/d3gl
       icon: external
       variant: minimal
 ---
 
-import { Card, CardGrid } from '@astrojs/starlight/components';
-
-## Next steps
+import { Card, CardGrid } from "@astrojs/starlight/components";
 
 <CardGrid stagger>
-	<Card title="Update content" icon="pencil">
-		Edit `src/content/docs/index.mdx` to see this page change.
-	</Card>
-	<Card title="Change page layout" icon="document">
-		Delete `template: splash` in `src/content/docs/index.mdx` to display a
-		sidebar on this page.
-	</Card>
-	<Card title="Add new content" icon="add-document">
-		Add Markdown or MDX files to `src/content/docs` to create new pages.
-	</Card>
-	<Card title="Configure your site" icon="setting">
-		Edit your `sidebar` and other config in `astro.config.mjs`.
-	</Card>
-	<Card title="Read the docs" icon="open-book">
-		Learn more in [the Starlight Docs](https://starlight.astro.build/).
-	</Card>
+  <Card title="Familiar d3 contexts" icon="seti:typescript">
+    Context-driven d3 generators (`geoPath`, `d3-shape`, `d3-hierarchy` links) render unchanged.
+  </Card>
+  <Card title="Three backends, one API" icon="puzzle">
+    Switch between SVG, Canvas2D, and WebGL2 without touching your drawing code.
+  </Card>
+  <Card title="Project & tessellate once" icon="rocket">
+    Geometry is uploaded once; pan/zoom is a single transform-matrix uniform.
+  </Card>
+  <Card title="GPU recolor & picking" icon="random">
+    Recolor or show/hide is one texture write; hit-testing is GPU-accelerated.
+  </Card>
+  <Card title="GeoJSON & maps" icon="earth">
+    Project any GeoJSON with any d3 projection and render the result on the GPU.
+  </Card>
+  <Card title="Publication export" icon="document">
+    Export crisp PNG and SVG straight from the same scene.
+  </Card>
 </CardGrid>
