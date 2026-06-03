@@ -13,6 +13,7 @@ export default defineConfig({
   integrations: [
     starlight({
       title: "d3gl",
+      customCss: ["./src/styles/example.css"],
       social: [{ icon: "github", label: "GitHub", href: "https://github.com/mapequation/d3gl" }],
       sidebar: [
         { label: "Start Here", items: [{ label: "Getting started", slug: "start-here/getting-started" }] },

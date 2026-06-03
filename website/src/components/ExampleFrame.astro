@@ -1,0 +1,24 @@
+---
+import CodeTabs from "./CodeTabs.astro";
+import type { ControlSpec } from "../examples/types.js";
+
+interface Props { id: string; controls?: ControlSpec[]; files: string[]; width?: number; height?: number }
+const { id, controls = [], files, width = 900, height = 560 } = Astro.props;
+
+// All example sources as raw strings, resolved at build time.
+const raw = import.meta.glob("../examples/**/*.ts", { query: "?raw", import: "default", eager: true }) as Record<string, string>;
+const tabs = files.map((f) => ({
+  name: f.split("/").pop()!,
+  code: raw[`../examples/${f}`] ?? `// missing: ${f}`,
+  lang: "ts",
+}));
+---
+<div class="d3gl-example" data-example={id} data-controls={JSON.stringify(controls)}>
+  <div class="d3gl-bar" data-control-bar></div>
+  <div class="d3gl-canvas" data-canvas style={`width:${width}px;height:${height}px`}></div>
+  <CodeTabs files={tabs} />
+</div>
+<script>
+  import { setupExample } from "./example-runtime.ts";
+  document.querySelectorAll<HTMLElement>(".d3gl-example").forEach((el) => { setupExample(el); });
+</script>
