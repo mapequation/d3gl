@@ -20,16 +20,14 @@ npm i @mapequation/d3gl
 
 `@mapequation/d3gl` is one package with subpath exports; the root entry is `core`.
 
-| Subpath | Responsibility |
-| --- | --- |
-| *(root)* | `Scene`, `PathContext`, tessellation, stroke expansion, hit-testing |
-| `/canvas` | Canvas2D backend |
-| `/webgl` | luma.gl v9 WebGL2 backend (palette-texture color, GPU picking, PNG export) |
-| `/svg` | SVG backend + vector export |
-| `/geo` | projection + GeoJSON project-once helpers, inverse projection |
-| `/labels` | HTML label overlay with culling |
-| `/map` | `geoMap` + `plot` engines with d3-zoom wiring |
-| `/react` | headless `MapController` + `<D3GL>` component |
+- **`core`** *(root)* — `Scene`, `PathContext`, tessellation, stroke expansion, hit-testing
+- **`/canvas`** — Canvas2D backend
+- **`/webgl`** — luma.gl v9 WebGL2 backend (palette-texture color, GPU picking, PNG export)
+- **`/svg`** — SVG backend + vector export
+- **`/geo`** — projection + GeoJSON project-once helpers, inverse projection
+- **`/labels`** — HTML label overlay with culling
+- **`/map`** — `geoMap` + `plot` engines with d3-zoom wiring
+- **`/react`** — headless `MapController` + `<D3GL>` component
 
 ## Quick start
 
