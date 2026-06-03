@@ -123,7 +123,7 @@ across examples.
 | **Ancestral ranges** | full tree; thickness, **final** ancestral ranges, and pies **always on** (no toggles) | **rect/radial**, **linear/step/bump**, **screen/world** |
 | **World map** | land/water only | none |
 | **GeoJSON features** | land/water + lines + points + **city labels** + one extra polygon (shows every feature type), rendered statically | none |
-| **Heatmap** | grid **clipped to land**; **hover → value** | none |
+| **Heatmap** | grid **clipped to land**; **hover → value**; **zoom/pan** | **cell-size** slider (1°/2°/4°/8°) |
 
 All examples additionally share (from the control bar): the `webgl/canvas/svg`
 switch, the backend-aware export button, and the perf readout.
