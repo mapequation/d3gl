@@ -1,6 +1,21 @@
 ---
 title: Heatmap
-description: Placeholder — content added in a later task.
+description: A value grid clipped to land, with hover read-out — recolor is one texture write.
 ---
 
-Coming soon.
+import ExampleFrame from "../../../../components/ExampleFrame.astro";
+
+A synthetic value field on a grid, colored with `interpolateViridis` and **clipped to the land
+outline**. Hover any cell to read its value, scroll to zoom, and drag the **cell-size** slider to
+change grid resolution (1° ≈ 65k cells — a WebGL stress test; SVG is slower at scale). The geometry
+is projected once regardless of backend.
+
+<ExampleFrame
+  id="heatmap"
+  files={["heatmap/index.ts", "shared/geo-data.ts"]}
+  controls={[
+    { type: "range", key: "cells", label: "Cell size", min: 0, max: 3, step: 1, value: 2, display: ["1°", "2°", "4°", "8°"] }
+  ]}
+  width={900}
+  height={450}
+/>
