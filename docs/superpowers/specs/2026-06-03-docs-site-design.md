@@ -14,6 +14,12 @@ per-module API Reference. The `examples/app` package is removed.
 
 - New **private** workspace package **`website/`** (`@d3gl/website`), Astro +
   `@astrojs/starlight`. Replaces and deletes `examples/app`.
+- **Scaffold via the official command** to pull the latest Astro + Starlight:
+  `pnpm create astro@latest website -- --template starlight` (run from the repo
+  root), then adapt it into the workspace — set the package name to
+  `@d3gl/website` and `private: true`, add the Vite alias and `base` path,
+  reconcile the pinned dependency versions with the monorepo. Do **not**
+  hand-pick versions; take what the template installs.
 - The site consumes d3gl by **aliasing each subpath to source** in the Astro
   Vite config — `@mapequation/d3gl` → `packages/d3gl/src/core/index.ts`,
   `@mapequation/d3gl/<m>` → `packages/d3gl/src/<m>/index.ts` (the same alias the
@@ -71,8 +77,9 @@ export interface ExampleOptions {
 
 export interface ExampleHandle {
   dispose(): void;        // tear down listeners / GPU resources
-  exportPNG(): string;    // data URL
-  exportSVG(): string;    // SVG markup
+  // Export the current rendering. The format matches the active backend:
+  // "svg" backend → SVG markup; "webgl"/"canvas" → PNG data URL.
+  exportImage(): { format: "svg" | "png"; data: string };
 }
 
 export function mount(el: HTMLElement, opts: ExampleOptions): ExampleHandle;
@@ -96,7 +103,9 @@ A shared `ExampleFrame.astro` renders three parts and wires them with a client
    - **Perf readout** (FPS / frame time / JS heap) — a vanilla `perfMeter(el)`
      rAF loop, ported from the old `Stats` component, shown in **every** example.
    - Universal **`webgl / canvas / svg`** segmented switch.
-   - **Export PNG** / **Export SVG** buttons (call `handle.exportPNG/SVG()`).
+   - A **single export button** tied to the active backend: labelled
+     **"Export SVG"** for the `svg` backend and **"Export PNG"** otherwise; it
+     calls `handle.exportImage()` and triggers a download.
    - Any **example-specific toggles** (see table).
 3. **Code panel** — browser-like **file tabs**; each tab's content is the
    **`?raw` import of the exact source file** that runs the demo (single source
@@ -116,8 +125,8 @@ across examples.
 | **GeoJSON features** | land/water + lines + points + **city labels** + one extra polygon (shows every feature type), rendered statically | none |
 | **Heatmap** | grid **clipped to land**; **hover → value** | none |
 
-All examples additionally share: the `webgl/canvas/svg` switch, PNG/SVG export,
-and the perf readout (from the control bar).
+All examples additionally share (from the control bar): the `webgl/canvas/svg`
+switch, the backend-aware export button, and the perf readout.
 
 ### Shared example data/util
 
