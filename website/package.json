@@ -1,0 +1,41 @@
+{
+  "name": "@d3gl/website",
+  "type": "module",
+  "version": "0.0.1",
+  "private": true,
+  "scripts": {
+    "dev": "astro dev",
+    "start": "astro dev",
+    "build": "astro build",
+    "preview": "astro preview",
+    "astro": "astro"
+  },
+  "dependencies": {
+    "@astrojs/starlight": "^0.39.3",
+    "@mapequation/d3gl": "workspace:*",
+    "astro": "^6.3.1",
+    "d3-geo": "^3.1.1",
+    "d3-hierarchy": "^3.1.2",
+    "d3-scale": "^4.0.2",
+    "d3-scale-chromatic": "^3.1.0",
+    "d3-selection": "^3.0.0",
+    "d3-shape": "^3.2.0",
+    "d3-zoom": "^3.0.0",
+    "sharp": "^0.34.5",
+    "topojson-client": "^3.1.0",
+    "world-atlas": "^2.0.2"
+  },
+  "devDependencies": {
+    "@types/d3-geo": "^3.1.0",
+    "@types/d3-hierarchy": "^3.1.7",
+    "@types/d3-scale": "^4.0.8",
+    "@types/d3-scale-chromatic": "^3.0.3",
+    "@types/d3-selection": "^3.0.10",
+    "@types/d3-shape": "^3.1.6",
+    "@types/d3-zoom": "^3.0.8",
+    "@types/geojson": "^7946.0.14",
+    "@types/topojson-client": "^3.1.5",
+    "starlight-typedoc": "^0.21.0",
+    "typedoc": "^0.28.0"
+  }
+}
