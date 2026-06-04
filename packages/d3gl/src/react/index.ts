@@ -17,3 +17,5 @@ export { D3GL } from "./D3GL.js";
 export type { D3GLProps, D3GLGroup } from "./D3GL.js";
 export { GeoMap } from "./GeoMap.js";
 export type { GeoMapProps } from "./GeoMap.js";
+export { Plot, Layer, Points } from "./Plot.js";
+export type { PlotProps, LayerProps, PointsProps } from "./Plot.js";
