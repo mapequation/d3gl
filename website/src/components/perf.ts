@@ -12,12 +12,12 @@ export function createPerfMeter(el: HTMLElement): () => void {
     "gap-2.5",
     "font-mono",
     "text-xs",
-    "text-[var(--sl-color-gray-2)]",
+    "text-muted-foreground",
   );
   el.innerHTML =
-    '<span class="d3gl-perf-item">fps <b class="text-[var(--sl-color-white)] [font-variant-numeric:tabular-nums]" data-fps>0</b></span>' +
-    '<span class="d3gl-perf-item">frame <b class="text-[var(--sl-color-white)] [font-variant-numeric:tabular-nums]" data-ms>0</b> ms</span>' +
-    '<span class="d3gl-perf-item" data-heap-wrap hidden>heap <b class="text-[var(--sl-color-white)] [font-variant-numeric:tabular-nums]" data-heap>0</b> MB</span>';
+    '<span class="d3gl-perf-item">fps <b class="text-foreground [font-variant-numeric:tabular-nums]" data-fps>0</b></span>' +
+    '<span class="d3gl-perf-item">frame <b class="text-foreground [font-variant-numeric:tabular-nums]" data-ms>0</b> ms</span>' +
+    '<span class="d3gl-perf-item" data-heap-wrap hidden>heap <b class="text-foreground [font-variant-numeric:tabular-nums]" data-heap>0</b> MB</span>';
   const fpsEl = el.querySelector("[data-fps]")!;
   const msEl = el.querySelector("[data-ms]")!;
   const heapWrap = el.querySelector("[data-heap-wrap]") as HTMLElement;

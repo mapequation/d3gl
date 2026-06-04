@@ -1,5 +1,10 @@
 ---
 import CodeTabs from "./CodeTabs.astro";
+import { Button } from "@/components/starwind/button";
+import { ButtonGroup } from "@/components/starwind/button-group";
+import { Separator } from "@/components/starwind/separator";
+import { Slider } from "@/components/starwind/slider";
+import { SEGMENT_ACTIVE_OVERRIDE } from "./controls.js";
 import type { ControlSpec } from "../examples/types.js";
 
 interface Props { id: string; controls?: ControlSpec[]; files: string[]; width?: number; height?: number; defaults?: Record<string, unknown> }
@@ -12,10 +17,89 @@ const tabs = files.map((f) => ({
   code: raw[`../examples/${f}`] ?? `// missing: ${f}`,
   lang: "ts",
 }));
+
+const backends = ["webgl", "canvas", "svg"] as const;
+// Segmented example controls vs. range sliders are rendered differently.
+const segmented = controls.filter((c) => c.type !== "range") as Extract<ControlSpec, { options: string[] }>[];
+const ranges = controls.filter((c) => c.type === "range") as Extract<ControlSpec, { type: "range" }>[];
+const hasControlsRow = segmented.length > 0 || ranges.length > 0;
+
+const segLabel = "text-muted-foreground text-[13px]";
 ---
-<div class="d3gl-example my-6 overflow-hidden rounded-lg border border-[var(--sl-color-gray-5)]" data-example={id} data-controls={JSON.stringify(controls)} data-defaults={JSON.stringify(defaults)}>
-  <div class="flex flex-wrap items-center gap-2.5 border-b border-[var(--sl-color-gray-5)] bg-[var(--sl-color-gray-6)] px-2.5 py-2 text-[13px]" data-status-bar></div>
-  <div class="flex flex-wrap items-center gap-2.5 border-b border-[var(--sl-color-gray-5)] bg-[var(--sl-color-gray-6)] px-2.5 py-2 text-[13px] empty:hidden" data-controls-row></div>
+<div
+  class="d3gl-example bg-card text-foreground border-border my-6 overflow-hidden rounded-lg border"
+  data-example={id}
+  data-defaults={JSON.stringify(defaults)}
+>
+  <!-- Status row: backend switch (left), export (after), perf (right). -->
+  <div class="flex flex-wrap items-center gap-x-4 gap-y-2 px-3 py-2.5">
+    <ButtonGroup aria-label="Rendering backend" data-backend-group>
+      {backends.map((b) => (
+        <Button
+          type="button"
+          variant="outline"
+          size="sm"
+          class={b === "webgl" ? SEGMENT_ACTIVE_OVERRIDE : undefined}
+          data-backend={b}
+          data-active={b === "webgl" ? "" : undefined}
+        >
+          {b}
+        </Button>
+      ))}
+    </ButtonGroup>
+
+    <Button type="button" variant="outline" size="sm" data-export>Export PNG</Button>
+
+    <div class="ml-auto" data-perf></div>
+  </div>
+
+  {hasControlsRow && (
+    <div class="px-3 pb-1">
+      <Separator class="w-24" />
+    </div>
+  )}
+
+  {hasControlsRow && (
+    <div class="flex flex-wrap items-center gap-x-5 gap-y-2.5 px-3 pt-2 pb-3">
+      {segmented.map((c) => (
+        <div class="flex items-center gap-2">
+          <span class={segLabel}>{c.label}</span>
+          <ButtonGroup aria-label={c.label} data-control-key={c.key}>
+            {c.options.map((opt, i) => (
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                class={i === 0 ? SEGMENT_ACTIVE_OVERRIDE : undefined}
+                data-control-value={opt}
+                data-active={i === 0 ? "" : undefined}
+              >
+                {opt}
+              </Button>
+            ))}
+          </ButtonGroup>
+        </div>
+      ))}
+
+      {ranges.map((c) => (
+        <div class="flex items-center gap-3">
+          <span class={segLabel} data-range-label={c.key}>{c.label}</span>
+          <Slider
+            class="w-40"
+            variant="primary"
+            min={c.min}
+            max={c.max}
+            step={c.step}
+            defaultValue={c.value}
+            aria-label={c.label}
+            data-control-key={c.key}
+            data-display={c.display ? JSON.stringify(c.display) : undefined}
+          />
+        </div>
+      ))}
+    </div>
+  )}
+
   <div class="d3gl-canvas relative w-full bg-white" data-canvas data-max-width={width} style={`height:${height}px`}></div>
   <CodeTabs files={tabs} />
 </div>
