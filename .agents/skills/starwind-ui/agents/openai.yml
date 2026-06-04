@@ -1,0 +1,6 @@
+interface:
+  display_name: "Starwind UI"
+  short_description: "Builds Starwind UI components for Astro."
+  icon_small: "./assets/starwind-small.png"
+  icon_large: "./assets/starwind.png"
+  default_prompt: "Use $starwind-ui to install, compose, or theme Starwind UI components in my Astro project."
