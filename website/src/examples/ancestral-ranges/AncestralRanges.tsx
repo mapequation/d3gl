@@ -10,6 +10,16 @@ export default function AncestralRanges() {
         { key: "layout", label: "Layout", options: ["rectangular", "radial"] },
         { key: "curve", label: "Links", options: ["linear", "step", "bump"] },
         { key: "coords", label: "Coords", options: ["screen", "world"] },
+        {
+          type: "range",
+          key: "tips",
+          label: "Tips",
+          min: 5,
+          max: 9,
+          step: 1,
+          value: 6,
+          display: ["32", "64", "128", "256", "512"],
+        },
       ]}
       width={900}
       height={620}

@@ -1,6 +1,5 @@
 import { schemeCategory10 } from "d3-scale-chromatic";
 import { scaleOrdinal, scaleSqrt } from "d3-scale";
-import { zoomIdentity } from "d3-zoom";
 import { link as d3link, linkRadial, curveLinear, curveStepBefore, curveBumpX, pointRadial } from "d3-shape";
 import type { HierarchyPointNode, HierarchyPointLink } from "d3-hierarchy";
 import { plot } from "@mapequation/d3gl/map";
@@ -12,7 +11,6 @@ import { makeMammalTree, assignBioregions, REGION_NAMES } from "../shared/mammal
 import { calcMaximumParsimony, aggregateClusters, aggregateSpeciesCount } from "../shared/parsimony.js";
 
 const LINE_MIN = 1, LINE_MAX = 22; // branch-width range when scaling by subtended terminals
-const TIPS = 64; // fixed mammal-tree size (the source's initial tips value)
 
 type SizeMode = "world" | "screen";
 type CurveMode = "linear" | "step" | "bump";
@@ -26,21 +24,45 @@ const regionColor = scaleOrdinal<number, string>()
 interface Wedge { cx: number; cy: number; r: number; a0: number; a1: number; clusterId: number; count: number; single: boolean; node: PNode; }
 interface PieSpec { cx: number; cy: number; rBase: number; node: PNode; slices: { clusterId: number; count: number; a0: number; a1: number }[]; }
 
-function makeLinkDraw(mode: LayoutMode, curve: CurveMode): (ctx: CanvasRenderingContext2D, l: PLink) => void {
+/** Wrap a canvas-like context so every path call is shifted by (ox, oy). Used for radial
+ *  generators (linkRadial) that emit coordinates around the origin. */
+function offsetCtx(ctx: CanvasRenderingContext2D, ox: number, oy: number): CanvasRenderingContext2D {
+  return {
+    beginPath: () => ctx.beginPath(),
+    closePath: () => ctx.closePath(),
+    moveTo: (x: number, y: number) => ctx.moveTo(x + ox, y + oy),
+    lineTo: (x: number, y: number) => ctx.lineTo(x + ox, y + oy),
+    quadraticCurveTo: (cx: number, cy: number, x: number, y: number) => ctx.quadraticCurveTo(cx + ox, cy + oy, x + ox, y + oy),
+    bezierCurveTo: (c1x: number, c1y: number, c2x: number, c2y: number, x: number, y: number) =>
+      ctx.bezierCurveTo(c1x + ox, c1y + oy, c2x + ox, c2y + oy, x + ox, y + oy),
+    arc: (x: number, y: number, r: number, a0: number, a1: number, ccw?: boolean) => ctx.arc(x + ox, y + oy, r, a0, a1, ccw),
+  } as unknown as CanvasRenderingContext2D;
+}
+
+/**
+ * A link-drawing closure for the chosen layout/curve. Radial layouts are origin-centred by
+ * d3-shape's `pointRadial`/`linkRadial`; `center` ([ox, oy], the canvas centre) is baked into
+ * the emitted coordinates so the radial tree is centred at the IDENTITY transform (no centring
+ * `setTransform`, so the user's zoom survives layout/curve toggles).
+ */
+function makeLinkDraw(mode: LayoutMode, curve: CurveMode, center: [number, number]): (ctx: CanvasRenderingContext2D, l: PLink) => void {
+  const [ox, oy] = center;
   if (mode === "rectangular") {
     const factory = curve === "linear" ? curveLinear : curve === "step" ? curveStepBefore : curveBumpX;
     const gen = d3link<PLink, PNode>(factory).x((d) => d.y).y((d) => d.x);
     return (ctx, l) => { gen.context(ctx); gen(l); };
   }
   if (curve === "bump") {
+    // linkRadial emits curves around (0,0); wrap the context in an offsetting proxy so the
+    // figure lands at the canvas centre (the d3gl path context has no translate()).
     const gen = linkRadial<PLink, PNode>().angle((d) => d.x).radius((d) => d.y);
-    return (ctx, l) => { gen.context(ctx); gen(l); };
+    return (ctx, l) => { gen.context(offsetCtx(ctx, ox, oy)); gen(l); };
   }
   if (curve === "linear") {
     return (ctx, l) => {
       const [sx, sy] = pointRadial(l.source.x, l.source.y);
       const [tx, ty] = pointRadial(l.target.x, l.target.y);
-      ctx.moveTo(sx, sy); ctx.lineTo(tx, ty);
+      ctx.moveTo(sx + ox, sy + oy); ctx.lineTo(tx + ox, ty + oy);
     };
   }
   // radial "step": arc along the parent radius to the child angle, then a radial line out.
@@ -48,10 +70,10 @@ function makeLinkDraw(mode: LayoutMode, curve: CurveMode): (ctx: CanvasRendering
     const r0 = l.source.y;
     const sa = l.source.x - Math.PI / 2;
     const ta = l.target.x - Math.PI / 2;
-    ctx.moveTo(r0 * Math.cos(sa), r0 * Math.sin(sa));
-    ctx.arc(0, 0, r0, sa, ta, ta < sa);
+    ctx.moveTo(r0 * Math.cos(sa) + ox, r0 * Math.sin(sa) + oy);
+    ctx.arc(ox, oy, r0, sa, ta, ta < sa);
     const [tx, ty] = pointRadial(l.target.x, l.target.y);
-    ctx.lineTo(tx, ty);
+    ctx.lineTo(tx + ox, ty + oy);
   };
 }
 
@@ -104,110 +126,126 @@ function labelOffset(mode: LayoutMode, angle: number, gap: number, height: numbe
  * (screen | world) from the harness options. Pure d3gl; the harness owns the
  * controls, backend, export, and zoom.
  */
-export const setup: ImperativeSetup = (host, { width, height, backend, options }) => {
+export const setup: ImperativeSetup = (host, { width, height, backend }) => {
   const W = width, H = height;
-  const CX = W / 2;
-  const layoutMode = (options.layout as LayoutMode) ?? "rectangular";
-  const curve = (options.curve as CurveMode) ?? "step";
-  const sizeMode = (options.coords as SizeMode) ?? "screen";
 
   // HTML label overlay over the canvas (host is positioned `relative` by the harness).
   const labelEl = document.createElement("div");
   labelEl.className = "absolute inset-0 pointer-events-none overflow-hidden text-[11px] leading-[14px] text-[#333]";
 
   const chart = plot(host, { width: W, height: H, backend });
-
-  // Build the tree, occurrence-count distribution, and the final Fitch phase (unconditional).
-  const tree = makeMammalTree(TIPS, 1);
-  const cps = assignBioregions(tree, REGION_NAMES.length, 1);
-  aggregateClusters(tree, cps);
-  calcMaximumParsimony(tree, cps);
-  aggregateSpeciesCount(tree);
-
-  const root = layoutMode === "rectangular"
-    ? layoutRectangular(tree, W, H, "linear")
-    // Radial is a half-circle "sunset" fan (Fig. 3a): leaves span π, centred on north.
-    : layoutRadial(tree, W, H, "linear", 50, Math.PI, -Math.PI / 2);
-  const links = root.links();
-  const tipNodes = root.leaves();
-  const totalSpecies = root.data.speciesCount ?? 1;
-
-  const widthScale = scaleSqrt().domain([1, totalSpecies]).range([LINE_MIN, LINE_MAX]);
-  const widthBase = (n: PNode): number => widthScale(n.data.speciesCount ?? 1);
-  // World mode: pie diameter = the incoming branch width (scales with zoom). Screen mode:
-  // a fixed pixel size so even small-clade nodes stay visible when zoomed in.
-  const SCREEN_PIE_R = 8;
-  const pieR = (n: PNode): number => (sizeMode === "screen" ? SCREEN_PIE_R : widthBase(n) / 2);
-
-  const pieSpecs: PieSpec[] = root.descendants().map((n) => {
-    const [cx, cy] = nodeXY(n, layoutMode);
-    return { cx, cy, rBase: pieR(n), node: n, slices: pieSlices(n) };
-  }).filter((p) => p.slices.length > 0);
-
-  // Centre a half-circle fan vertically; full radial / rectangular keep their origins.
-  const R = layoutMode === "radial" ? Math.max(...tipNodes.map((n) => n.y)) : 0;
-  const base = layoutMode === "radial" ? zoomIdentity.translate(CX, (H + R) / 2) : zoomIdentity;
-  const view = { k: base.k, x: base.x, y: base.y };
-
-  const GAP = 8;
-  const anchors: LabelAnchor[] = tipNodes.map((n, i) => {
-    const [px, py] = nodeXY(n, layoutMode);
-    const h = 14;
-    return {
-      id: `t${i}`, refX: px, refY: py, text: n.data.name,
-      width: n.data.name.length * 6.2 + 6, height: h,
-      priority: n.data.speciesCount ?? 1,
-      transformOrigin: "0 0",
-      offset: labelOffset(layoutMode, n.x, GAP, h),
-      transform: labelTransform(layoutMode, n.x),
-    };
-  });
-
-  const drawLink = makeLinkDraw(layoutMode, curve);
-
-  chart.layer("links", links, {
-    draw: (ctx, l) => drawLink(ctx, l),
-    // Color each branch by the child clade's most-occurring bioregion.
-    stroke: (l: PLink) => { const t = topRegion(l.target); return t == null ? "#777" : regionColor(t); },
-    lineWidth: (l: PLink) => widthBase(l.target),
-    sizeMode,
-  });
-
-  const wedges: Wedge[] = [];
-  for (const p of pieSpecs) {
-    const single = p.slices.length === 1;
-    for (const s of p.slices) wedges.push({ cx: p.cx, cy: p.cy, r: p.rBase, a0: s.a0, a1: s.a1, clusterId: s.clusterId, count: s.count, single, node: p.node });
-  }
-  chart.layer("pies", wedges, {
-    draw: (ctx, w) => {
-      // Single-region node: a full circle. closePath() so the subpath is closed and the
-      // WebGL fill tessellator (which fills only closed subpaths) renders it like Canvas/SVG.
-      if (w.single) { ctx.moveTo(w.cx + w.r, w.cy); ctx.arc(w.cx, w.cy, w.r, 0, 2 * Math.PI); ctx.closePath(); }
-      else { ctx.moveTo(w.cx, w.cy); ctx.arc(w.cx, w.cy, w.r, w.a0, w.a1); ctx.closePath(); }
-    },
-    fill: (w: Wedge) => regionColor(w.clusterId),
-    stroke: "#ffffff",
-    lineWidth: (w: Wedge) => (w.single ? 0 : Math.min(0.5, w.r * 0.16)),
-    anchor: (w: Wedge) => [w.cx, w.cy], // pin the pie; screen mode keeps it constant-size
-    sizeMode,
-    // Screen mode: declutter overlapping fixed-size pies on zoom (bigger clades win).
-    declutter: sizeMode === "screen" ? SCREEN_PIE_R * 2 + 2 : undefined,
-    id: (_w, i) => i,
-  });
-
-  chart.setTransform(view);
-  chart.render();
-
   host.appendChild(labelEl);
   const labels = new LabelLayer(labelEl, (a) => a.text);
-  const updateLabels = (t = view) => labels.update(anchors, t, { width: W, height: H });
-  updateLabels();
 
+  // Label anchors are rebuilt by `render`; the zoom handler keeps them aligned with the GPU
+  // geometry. The transform stays at identity in both layouts (radial centering is baked into
+  // the world coordinates below), so the user's zoom/pan is never reset by an option change.
+  let anchors: LabelAnchor[] = [];
+  let view: { k: number; x: number; y: number } = { k: 1, x: 0, y: 0 };
+  const updateLabels = (t = view): void => {
+    view = t;
+    labels.update(anchors, t, { width: W, height: H });
+  };
   // Scroll to zoom, drag to pan; keep the HTML tip labels aligned with the GPU geometry.
-  // `enableZoom` seeds d3-zoom from the chart's current transform (`view`, set above), so the
-  // first gesture is seamless — radial layouts centre the half-circle fan via `base`,
-  // rectangular `base` is identity.
   chart.enableZoom([0.5, 40], (t) => updateLabels(t));
 
-  return { engine: chart, dispose: () => labels.destroy() };
+  return {
+    engine: chart,
+    // (Re)build all option-dependent layers on the existing chart. Never touches the transform,
+    // so toggling layout/curve/coords or growing the tree preserves the current zoom/pan.
+    render: (options) => {
+      const tips = 2 ** ((options.tips as number) ?? 6); // 2^exp tips (exp 5..9 → 32..512)
+      const layoutMode = (options.layout as LayoutMode) ?? "rectangular";
+      const curve = (options.curve as CurveMode) ?? "step";
+      const sizeMode = (options.coords as SizeMode) ?? "screen";
+
+      // Build the tree, occurrence-count distribution, and the final Fitch phase (unconditional).
+      const tree = makeMammalTree(tips, 1);
+      const cps = assignBioregions(tree, REGION_NAMES.length, 1);
+      aggregateClusters(tree, cps);
+      calcMaximumParsimony(tree, cps);
+      aggregateSpeciesCount(tree);
+
+      const root = layoutMode === "rectangular"
+        ? layoutRectangular(tree, W, H, "linear")
+        // Radial is a half-circle "sunset" fan (Fig. 3a): leaves span π, centred on north.
+        : layoutRadial(tree, W, H, "linear", 50, Math.PI, -Math.PI / 2);
+      const links = root.links();
+      const tipNodes = root.leaves();
+      const totalSpecies = root.data.speciesCount ?? 1;
+
+      // Bake the radial centering into WORLD coordinates so the fan is centred at the IDENTITY
+      // transform (no centring setTransform → zoom survives a layout toggle). Rectangular keeps
+      // d3's origin (offset [0,0]). The half-circle fan's vertical centre is (H + R) / 2.
+      const R = layoutMode === "radial" ? Math.max(...tipNodes.map((n) => n.y)) : 0;
+      const center: [number, number] = layoutMode === "radial" ? [W / 2, (H + R) / 2] : [0, 0];
+      const [ox, oy] = center;
+      const xy = (n: PNode): [number, number] => {
+        const [x, y] = nodeXY(n, layoutMode);
+        return [x + ox, y + oy];
+      };
+
+      const widthScale = scaleSqrt().domain([1, totalSpecies]).range([LINE_MIN, LINE_MAX]);
+      const widthBase = (n: PNode): number => widthScale(n.data.speciesCount ?? 1);
+      // World mode: pie diameter = the incoming branch width (scales with zoom). Screen mode:
+      // a fixed pixel size so even small-clade nodes stay visible when zoomed in.
+      const SCREEN_PIE_R = 8;
+      const pieR = (n: PNode): number => (sizeMode === "screen" ? SCREEN_PIE_R : widthBase(n) / 2);
+
+      const pieSpecs: PieSpec[] = root.descendants().map((n) => {
+        const [cx, cy] = xy(n);
+        return { cx, cy, rBase: pieR(n), node: n, slices: pieSlices(n) };
+      }).filter((p) => p.slices.length > 0);
+
+      const GAP = 8;
+      anchors = tipNodes.map((n, i) => {
+        const [px, py] = xy(n);
+        const h = 14;
+        return {
+          id: `t${i}`, refX: px, refY: py, text: n.data.name,
+          width: n.data.name.length * 6.2 + 6, height: h,
+          priority: n.data.speciesCount ?? 1,
+          transformOrigin: "0 0",
+          offset: labelOffset(layoutMode, n.x, GAP, h),
+          transform: labelTransform(layoutMode, n.x),
+        };
+      });
+
+      const drawLink = makeLinkDraw(layoutMode, curve, center);
+
+      chart.layer("links", links, {
+        draw: (ctx, l) => drawLink(ctx, l),
+        // Color each branch by the child clade's most-occurring bioregion.
+        stroke: (l: PLink) => { const t = topRegion(l.target); return t == null ? "#777" : regionColor(t); },
+        lineWidth: (l: PLink) => widthBase(l.target),
+        sizeMode,
+      });
+
+      const wedges: Wedge[] = [];
+      for (const p of pieSpecs) {
+        const single = p.slices.length === 1;
+        for (const s of p.slices) wedges.push({ cx: p.cx, cy: p.cy, r: p.rBase, a0: s.a0, a1: s.a1, clusterId: s.clusterId, count: s.count, single, node: p.node });
+      }
+      chart.layer("pies", wedges, {
+        draw: (ctx, w) => {
+          // Single-region node: a full circle. closePath() so the subpath is closed and the
+          // WebGL fill tessellator (which fills only closed subpaths) renders it like Canvas/SVG.
+          if (w.single) { ctx.moveTo(w.cx + w.r, w.cy); ctx.arc(w.cx, w.cy, w.r, 0, 2 * Math.PI); ctx.closePath(); }
+          else { ctx.moveTo(w.cx, w.cy); ctx.arc(w.cx, w.cy, w.r, w.a0, w.a1); ctx.closePath(); }
+        },
+        fill: (w: Wedge) => regionColor(w.clusterId),
+        stroke: "#ffffff",
+        lineWidth: (w: Wedge) => (w.single ? 0 : Math.min(0.5, w.r * 0.16)),
+        anchor: (w: Wedge) => [w.cx, w.cy], // pin the pie; screen mode keeps it constant-size
+        sizeMode,
+        // Screen mode: declutter overlapping fixed-size pies on zoom (bigger clades win).
+        declutter: sizeMode === "screen" ? SCREEN_PIE_R * 2 + 2 : undefined,
+        id: (_w, i) => i,
+      });
+
+      chart.render();
+      updateLabels(); // re-place labels at the CURRENT transform (preserved across option changes)
+    },
+    dispose: () => labels.destroy(),
+  };
 };

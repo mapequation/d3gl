@@ -15,7 +15,7 @@ import type {
 // ---------------------------------------------------------------------------
 
 const SEG_BASE =
-  "inline-flex h-9 items-center justify-center px-4 text-sm font-medium transition-colors outline-none focus-visible:ring-3 focus-visible:ring-outline/50";
+  "inline-flex h-6 items-center justify-center px-2 py-0.5 text-[11px] font-medium transition-colors outline-none focus-visible:ring-2 focus-visible:ring-outline/50";
 
 /** A joined segmented switch (shared borders, equal height); active = primary. */
 function Segmented<T extends string>(props: {
@@ -26,8 +26,8 @@ function Segmented<T extends string>(props: {
 }) {
   const { label, value, options, onChange } = props;
   return (
-    <div className="flex items-center gap-2">
-      {label && <span className="text-muted-foreground text-[13px]">{label}</span>}
+    <div className="flex items-center gap-1.5">
+      {label && <span className="text-muted-foreground text-[11px]">{label}</span>}
       <div role="group" aria-label={label} className="inline-flex isolate">
         {options.map((opt, i) => {
           const active = opt === value;
@@ -68,7 +68,7 @@ function ActionButton(props: { onClick: () => void; children: ReactNode }) {
     <button
       type="button"
       onClick={props.onClick}
-      className="inline-flex h-9 items-center justify-center rounded-md border border-border bg-background px-4 text-sm font-medium text-foreground transition-colors outline-none hover:bg-muted focus-visible:ring-3 focus-visible:ring-outline/50"
+      className="inline-flex h-6 items-center justify-center rounded-md border border-border bg-background px-2 py-0.5 text-[11px] font-medium text-foreground transition-colors outline-none hover:bg-muted focus-visible:ring-2 focus-visible:ring-outline/50"
     >
       {props.children}
     </button>
@@ -86,13 +86,13 @@ function RangeSlider(props: {
   useEffect(() => setLive(props.value), [props.value]);
   const display = spec.display?.[(live - spec.min) / spec.step] ?? String(live);
   return (
-    <div className="flex items-center gap-3">
-      <span className="text-muted-foreground text-[13px]">
+    <div className="flex h-6 items-center gap-1.5">
+      <span className="text-muted-foreground text-[11px]">
         {spec.label} {display}
       </span>
       <input
         type="range"
-        className="accent-primary w-40"
+        className="accent-primary h-1 w-32"
         aria-label={spec.label}
         min={spec.min}
         max={spec.max}
@@ -270,7 +270,7 @@ export default function Example(props: ExampleProps) {
   return (
     <div className="d3gl-live bg-card text-foreground">
       {/* Status row: backend switch (left), export, perf (right). */}
-      <div className="flex flex-wrap items-center gap-x-4 gap-y-2 px-3 py-2.5">
+      <div className="flex flex-wrap items-center gap-x-3 gap-y-1.5 px-3 py-2">
         <Segmented value={backend} options={BACKENDS} onChange={setBackend} />
         <ActionButton onClick={onExport}>
           {backend === "svg" ? "Export SVG" : "Export PNG"}
@@ -283,7 +283,7 @@ export default function Example(props: ExampleProps) {
           <div className="px-3 pb-1">
             <div className="border-border h-px w-24 border-t" />
           </div>
-          <div className="flex flex-wrap items-center gap-x-5 gap-y-2.5 px-3 pt-2 pb-3">
+          <div className="flex flex-wrap items-center gap-x-4 gap-y-2 px-3 pt-1.5 pb-2.5">
             {segmented.map((c) => (
               <Segmented
                 key={c.key}

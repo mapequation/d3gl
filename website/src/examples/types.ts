@@ -28,14 +28,28 @@ export interface ExampleContext {
 
 /**
  * Imperative example: build the d3gl engine into `host` and return it. May also
- * return an object with the engine plus optional extra cleanup (e.g. disposing a
- * LabelLayer). The `.ts` module exporting this is what the code tab shows, so it
- * stays pure d3gl with zero framework/plumbing.
+ * return an object with the engine plus:
+ *   - `render(options)` — (re)builds the option-dependent layers on the EXISTING
+ *     engine when a control changes, so the engine (and its zoom/pan) is reused.
+ *     It MUST NOT reset the engine's transform (base/initial view setup belongs in
+ *     `setup`), otherwise zoom is lost on every option change.
+ *   - `dispose()` — optional extra cleanup (e.g. disposing a LabelLayer).
+ *
+ * If a `setup` returns just an engine (or omits `render`), the harness recreates
+ * the engine on option changes — backward compatible for controls-free examples.
+ * The `.ts` module exporting this is what the code tab shows, so it stays pure
+ * d3gl with zero framework/plumbing.
  */
 export type ImperativeSetup = (
   host: HTMLElement,
   ctx: Omit<ExampleContext, "registerEngine">,
-) => ExampleEngine | { engine: ExampleEngine; dispose?: () => void };
+) =>
+  | ExampleEngine
+  | {
+      engine: ExampleEngine;
+      render?: (options: Record<string, unknown>) => void;
+      dispose?: () => void;
+    };
 
 /** Declares one example-specific control rendered in the shared control bar. */
 export type ControlSpec =
