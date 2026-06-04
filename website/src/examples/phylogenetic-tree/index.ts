@@ -11,6 +11,7 @@ type PNode = HierarchyPointNode<TreeNode>;
 type PLink = HierarchyPointLink<TreeNode>;
 
 export function mount(el: HTMLElement, opts: ExampleOptions): ExampleHandle {
+  const sizeMode = (opts.coords as "world" | "screen") ?? "world";
   const root = layoutRectangular(makeTree(64), W, H, "linear");
   const links = root.links();
   const tips = root.leaves();
@@ -23,13 +24,16 @@ export function mount(el: HTMLElement, opts: ExampleOptions): ExampleHandle {
     draw: (ctx, l) => { gen.context(ctx); gen(l); },
     stroke: "#555",
     lineWidth: 0.8,
+    sizeMode,
   });
   chart.points("nodes", tips, {
     x: (n) => nodeXY(n, "rectangular")[0],
     y: (n) => nodeXY(n, "rectangular")[1],
     radius: 2.6,
     fill: (n) => schemeCategory10[n.data.group % 10] ?? "#888",
+    sizeMode,
   });
+  chart.enableZoom([0.5, 40]);
   chart.render();
 
   return {

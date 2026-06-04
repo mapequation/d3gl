@@ -103,10 +103,9 @@ export function mount(el: HTMLElement, opts: ExampleOptions): ExampleHandle {
   const curve = (opts.curve as CurveMode) ?? "step";
   const sizeMode = (opts.coords as SizeMode) ?? "screen";
 
-  // Position the canvas and a label overlay in a relative wrapper.
-  el.style.position = "relative";
+  // A label overlay over the canvas; ExampleFrame's canvas wrapper is `relative`.
   const labelEl = document.createElement("div");
-  labelEl.style.cssText = "position:absolute;inset:0;pointer-events:none;overflow:hidden;font-size:11px;line-height:14px;color:#333;";
+  labelEl.className = "absolute inset-0 pointer-events-none overflow-hidden text-[11px] leading-[14px] text-[#333]";
 
   const chart = plot(el, { width: W, height: H, backend: opts.backend });
 
@@ -193,7 +192,14 @@ export function mount(el: HTMLElement, opts: ExampleOptions): ExampleHandle {
 
   el.appendChild(labelEl);
   const labels = new LabelLayer(labelEl, (a) => a.text);
-  labels.update(anchors, view, { width: W, height: H });
+  const updateLabels = (t = view) => labels.update(anchors, t, { width: W, height: H });
+  updateLabels();
+
+  // Scroll to zoom, drag to pan; keep the HTML tip labels aligned with the GPU geometry.
+  // Seed d3-zoom's state with the layout's base transform so the first gesture is seamless
+  // (radial layouts centre the half-circle fan via `base`; rectangular `base` is identity).
+  (el as unknown as { __zoom?: typeof base }).__zoom = base;
+  chart.enableZoom([0.5, 40], (t) => updateLabels(t));
 
   return {
     dispose: () => { labels.destroy(); labelEl.remove(); chart.destroy(); },
