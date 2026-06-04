@@ -3,20 +3,13 @@ title: Ancestral ranges
 description: A dated phylogeny with Fitch-parsimony ancestral-range pies, sized by occurrence.
 ---
 
-import ExampleFrame from "../../../../components/ExampleFrame.astro";
+import ExampleCard from "../../../../components/ExampleCard.astro";
+import AncestralRanges from "../../../../examples/ancestral-ranges/AncestralRanges.tsx";
 
 A mammal phylogeny with ancestral ranges reconstructed by Fitch maximum parsimony. Branch width
 encodes subtended terminals; node pies show the count-weighted range distribution (final phase).
 Toggle the layout, link curve, and coordinate mode.
 
-<ExampleFrame
-  id="ancestral-ranges"
-  files={["ancestral-ranges/index.ts", "shared/parsimony.ts", "shared/mammals-data.ts", "shared/tree.ts", "shared/layout.ts"]}
-  controls={[
-    { key: "layout", label: "Layout", options: ["rectangular", "radial"] },
-    { key: "curve", label: "Links", options: ["linear", "step", "bump"] },
-    { key: "coords", label: "Coords", options: ["screen", "world"] }
-  ]}
-  width={900}
-  height={620}
-/>
+<ExampleCard files={["ancestral-ranges/draw.ts"]}>
+  <AncestralRanges client:visible slot="demo" />
+</ExampleCard>

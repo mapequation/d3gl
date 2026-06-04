@@ -5,7 +5,7 @@ import { link as d3link, linkRadial, curveLinear, curveStepBefore, curveBumpX, p
 import type { HierarchyPointNode, HierarchyPointLink } from "d3-hierarchy";
 import { plot } from "@mapequation/d3gl/map";
 import { LabelLayer, type LabelAnchor } from "@mapequation/d3gl/labels";
-import type { ExampleHandle, ExampleOptions, ExampleSize } from "../types.js";
+import type { ImperativeSetup } from "../types.js";
 import type { TreeNode } from "../shared/tree.js";
 import { layoutRectangular, layoutRadial, nodeXY, type LayoutMode } from "../shared/layout.js";
 import { makeMammalTree, assignBioregions, REGION_NAMES } from "../shared/mammals-data.js";
@@ -96,18 +96,26 @@ function labelOffset(mode: LayoutMode, angle: number, gap: number, height: numbe
   return [Math.cos(a) * gap, Math.sin(a) * gap];
 }
 
-export function mount(el: HTMLElement, opts: ExampleOptions, size: ExampleSize): ExampleHandle {
-  const { width: W, height: H } = size;
+/**
+ * A mammal phylogeny with ancestral ranges reconstructed by Fitch maximum
+ * parsimony: branch width encodes subtended terminals, node pies show the
+ * count-weighted range distribution (always on). Reads `layout`
+ * (rectangular | radial), `curve` (linear | step | bump), and `coords`
+ * (screen | world) from the harness options. Pure d3gl; the harness owns the
+ * controls, backend, export, and zoom.
+ */
+export const setup: ImperativeSetup = (host, { width, height, backend, options }) => {
+  const W = width, H = height;
   const CX = W / 2;
-  const layoutMode = (opts.layout as LayoutMode) ?? "rectangular";
-  const curve = (opts.curve as CurveMode) ?? "step";
-  const sizeMode = (opts.coords as SizeMode) ?? "screen";
+  const layoutMode = (options.layout as LayoutMode) ?? "rectangular";
+  const curve = (options.curve as CurveMode) ?? "step";
+  const sizeMode = (options.coords as SizeMode) ?? "screen";
 
-  // A label overlay over the canvas; ExampleFrame's canvas wrapper is `relative`.
+  // HTML label overlay over the canvas (host is positioned `relative` by the harness).
   const labelEl = document.createElement("div");
   labelEl.className = "absolute inset-0 pointer-events-none overflow-hidden text-[11px] leading-[14px] text-[#333]";
 
-  const chart = plot(el, { width: W, height: H, backend: opts.backend });
+  const chart = plot(host, { width: W, height: H, backend });
 
   // Build the tree, occurrence-count distribution, and the final Fitch phase (unconditional).
   const tree = makeMammalTree(TIPS, 1);
@@ -190,7 +198,7 @@ export function mount(el: HTMLElement, opts: ExampleOptions, size: ExampleSize):
   chart.setTransform(view);
   chart.render();
 
-  el.appendChild(labelEl);
+  host.appendChild(labelEl);
   const labels = new LabelLayer(labelEl, (a) => a.text);
   const updateLabels = (t = view) => labels.update(anchors, t, { width: W, height: H });
   updateLabels();
@@ -201,11 +209,5 @@ export function mount(el: HTMLElement, opts: ExampleOptions, size: ExampleSize):
   // rectangular `base` is identity.
   chart.enableZoom([0.5, 40], (t) => updateLabels(t));
 
-  let currentBackend = opts.backend;
-  return {
-    dispose: () => { labels.destroy(); labelEl.remove(); chart.destroy(); },
-    setBackend: (b) => { currentBackend = b; chart.setBackend(b); },
-    exportImage: () =>
-      currentBackend === "svg" ? { format: "svg", data: chart.toSVG() } : { format: "png", data: chart.toPNG() },
-  };
-}
+  return { engine: chart, dispose: () => labels.destroy() };
+};

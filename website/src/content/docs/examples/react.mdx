@@ -4,7 +4,6 @@ description: Use d3gl from React — the `<GeoMap>` wrapper or the imperative en
 ---
 
 import ExampleCard from "../../../components/ExampleCard.astro";
-import ExampleFrame from "../../../components/ExampleFrame.astro";
 import WorldMapReact from "../../../examples/react-world-map/WorldMapReact.tsx";
 import PhyloTreeReact from "../../../examples/react-phylogenetic-tree/PhyloTreeReact.tsx";
 
@@ -32,12 +31,13 @@ you add layers, enable zoom, and render once. It takes `width`, `height`, a d3-g
 The same 64-tip rectangular phylogram as the vanilla simple-tree example
 (`d3.link(curveStepBefore)` branches, `schemeCategory10` tip nodes), rendered from
 React. Rather than a wrapper component, this drives the imperative `plot` engine
-directly: a mount effect creates `plot(host, …)` once, builds the link layer and tip
-points, enables zoom, and renders; a separate `[backend]` effect calls
+directly through the `<Imperative>` helper, which IS the React-effect pattern: a mount
+effect creates `plot(host, …)` once (reusing the pure d3gl `draw.ts` shared with the
+vanilla tree example), enables zoom, and renders; a separate `[backend]` effect calls
 `chart.setBackend()` so switching backend preserves the current zoom/pan; cleanup tears
 it down with `chart.destroy()`. This is a valid, common pattern for using any
 imperative engine from React.
 
-<ExampleFrame id="react-phylogenetic-tree" react files={["react-phylogenetic-tree/PhyloTreeReact.tsx"]} width={720} height={460}>
-  <PhyloTreeReact client:only="react" slot="canvas" width={720} height={460} />
-</ExampleFrame>
+<ExampleCard files={["react-phylogenetic-tree/PhyloTreeReact.tsx"]}>
+  <PhyloTreeReact client:visible slot="demo" />
+</ExampleCard>

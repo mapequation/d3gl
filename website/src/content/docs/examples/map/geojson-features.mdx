@@ -3,15 +3,13 @@ title: GeoJSON features
 description: Every GeoJSON geometry type rendered on one map, with HTML city labels.
 ---
 
-import ExampleFrame from "../../../../components/ExampleFrame.astro";
+import ExampleCard from "../../../../components/ExampleCard.astro";
+import GeoJsonFeatures from "../../../../examples/geojson-features/GeoJsonFeatures.tsx";
 
 One map exercising every GeoJSON geometry type — `MultiPolygon` (land), `Polygon` (the green
 region), `MultiLineString` (graticule), `LineString` (the route), `Point` (cities), and
-`MultiPoint` (the cluster) — plus an HTML `LabelLayer` overlay for city names.
+`MultiPoint` (the cluster) — plus an HTML `LabelLayer` overlay for city names that tracks zoom.
 
-<ExampleFrame
-  id="geojson-features"
-  files={["geojson-features/index.ts", "shared/geo-data.ts"]}
-  width={900}
-  height={450}
-/>
+<ExampleCard files={["geojson-features/draw.ts"]}>
+  <GeoJsonFeatures client:visible slot="demo" />
+</ExampleCard>
