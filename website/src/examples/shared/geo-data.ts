@@ -136,10 +136,11 @@ export function makeCluster(): Feature<MultiPoint> {
   };
 }
 
-/** A standalone Polygon feature (a box over the Sahara) to showcase polygon geometry. */
+/** A standalone Polygon feature (a box over the Sahara) to showcase polygon geometry.
+ *  Wound CLOCKWISE so d3-geo fills the small box (not the sphere complement). */
 export function makeDemoPolygon(): Feature<Polygon> {
   return {
     type: "Feature", properties: { name: "demo-region" },
-    geometry: { type: "Polygon", coordinates: [[[0, 15], [30, 15], [30, 30], [0, 30], [0, 15]]] },
+    geometry: { type: "Polygon", coordinates: [[[0, 15], [0, 30], [30, 30], [30, 15], [0, 15]]] },
   };
 }

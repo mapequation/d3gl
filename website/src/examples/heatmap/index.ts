@@ -3,7 +3,6 @@ import { scaleSequential } from "d3-scale";
 import { interpolateViridis } from "d3-scale-chromatic";
 import { geoMap, type HoverHit } from "@mapequation/d3gl/map";
 import { fitProjection } from "@mapequation/d3gl/geo";
-import type { GeoInput } from "@mapequation/d3gl/geo";
 import type { ExampleHandle, ExampleOptions } from "../types.js";
 import { makeCells, cellsToFeatureCollection, loadWorld, type Cell } from "../shared/geo-data.js";
 
@@ -25,7 +24,7 @@ export function mount(el: HTMLElement, opts: ExampleOptions): ExampleHandle {
   el.appendChild(tip);
 
   const map = geoMap(el, { width: W, height: H, projection, backend: opts.backend });
-  map.layer("ocean", [world.sphere as unknown as GeoInput], { fill: "#d4e6f5" });
+  map.layer("ocean", [world.sphere], { fill: "#d4e6f5" });
   map.layer("land", [world.land], { fill: "#e7e7e0" });
   map.layer("cells", cells.map((c) => c.geometry), {
     id: (_g, i) => cells[i]!.id,
