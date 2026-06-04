@@ -1,7 +1,9 @@
 import { describe, it, expect } from "vitest";
-import { geoEquirectangular } from "d3-geo";
+import { geoEquirectangular, geoNaturalEarth1 } from "d3-geo";
 import { Scene } from "../../core/index.js";
 import { fitProjection, featureGroup } from "../project.js";
+import { geoLayer } from "../geo-layer.js";
+import type { GeoInput } from "../project.js";
 
 const featureA: GeoJSON.Feature = {
   type: "Feature",
@@ -51,5 +53,19 @@ describe("featureGroup", () => {
     const scene = new Scene();
     scene.group("land", featureGroup([featureA], projection, { id: () => "a" }));
     expect(scene.buffers("land").strokeIndices.length).toBe(0);
+  });
+});
+
+describe("GeoInput accepts a GeoJSON Sphere without casts", () => {
+  it("fitProjection + geoLayer take { type: 'Sphere' } and build a fillable ocean", () => {
+    // No `as any` / `as unknown as GeoInput`: a Sphere is a first-class GeoInput now.
+    const sphere: GeoInput = { type: "Sphere" };
+    const projection = fitProjection(geoNaturalEarth1(), sphere, 256, 128);
+    const scene = new Scene();
+    scene.group("ocean", geoLayer([sphere], projection, { id: () => "ocean" }));
+    // The sphere outline becomes one fillable drawable (the whole-globe silhouette).
+    const buf = scene.buffers("ocean");
+    expect(buf.drawableCount).toBe(1);
+    expect(buf.fillIndices.length).toBeGreaterThanOrEqual(6);
   });
 });

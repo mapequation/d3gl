@@ -10,6 +10,15 @@ export class SvgBackend implements Backend {
     this.root = document.createElementNS("http://www.w3.org/2000/svg", "svg");
     this.root.setAttribute("width", String(width));
     this.root.setAttribute("height", String(height));
+    // A viewBox is essential: it defines the user-coordinate system (0,0..W,H) that the
+    // inner markup is drawn in and lets the SVG scale its content to fit the viewport the
+    // way a <canvas> raster buffer does. Without it, CSS that resizes the element (e.g. a
+    // docs theme's `svg { max-width:100%; height:auto }`) leaves content pinned at 1 user
+    // unit = 1px in the top-left, so the map appears shifted/zoomed vs the canvas/webgl
+    // backends. `xMidYMid meet` keeps the same uniform-fit, centered mapping a scaled
+    // raster gets.
+    this.root.setAttribute("viewBox", `0 0 ${width} ${height}`);
+    this.root.setAttribute("preserveAspectRatio", "xMidYMid meet");
     host.appendChild(this.root);
   }
   setLayers(layers: RenderLayer[]): void { this.layers = layers; }

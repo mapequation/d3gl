@@ -1,9 +1,16 @@
 import { geoPath } from "d3-geo";
-import type { GeoProjection } from "d3-geo";
+import type { GeoProjection, GeoSphere } from "d3-geo";
 import type { GroupBuilder, PathContext } from "../core/index.js";
 
-/** A GeoJSON object d3-geo can project + render (feature, geometry, or collection). */
-export type GeoInput = GeoJSON.GeoJSON;
+/**
+ * A GeoJSON object d3-geo can project + render (feature, geometry, or collection),
+ * plus the GeoJSON-adjacent `GeoSphere` (`{ type: "Sphere" }`) that d3-geo's
+ * projections and `geoPath` accept natively to draw the whole-globe outline (the
+ * ocean/graticule background). `GeoSphere` isn't part of the GeoJSON spec, so it
+ * has to be unioned in explicitly — without it, callers must cast a Sphere with
+ * `as any` / `as unknown as GeoInput`.
+ */
+export type GeoInput = GeoJSON.GeoJSON | GeoSphere;
 
 /** Fit a d3 projection so `object`'s bounds fill a width x height viewport. Mutates + returns it. */
 export function fitProjection<P extends GeoProjection>(
