@@ -1,6 +1,6 @@
 {
   "name": "@mapequation/d3gl",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "GPU-accelerated rendering for d3 — especially maps with GeoJSON and grid-cell data, with switchable SVG / Canvas2D / WebGL2 backends.",
   "license": "MIT",
   "author": "Daniel Edler",
@@ -29,14 +29,38 @@
   "module": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "exports": {
-    ".": { "types": "./dist/index.d.ts", "import": "./dist/index.js" },
-    "./canvas": { "types": "./dist/canvas.d.ts", "import": "./dist/canvas.js" },
-    "./webgl": { "types": "./dist/webgl.d.ts", "import": "./dist/webgl.js" },
-    "./svg": { "types": "./dist/svg.d.ts", "import": "./dist/svg.js" },
-    "./geo": { "types": "./dist/geo.d.ts", "import": "./dist/geo.js" },
-    "./labels": { "types": "./dist/labels.d.ts", "import": "./dist/labels.js" },
-    "./map": { "types": "./dist/map.d.ts", "import": "./dist/map.js" },
-    "./react": { "types": "./dist/react.d.ts", "import": "./dist/react.js" },
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./canvas": {
+      "types": "./dist/canvas.d.ts",
+      "import": "./dist/canvas.js"
+    },
+    "./webgl": {
+      "types": "./dist/webgl.d.ts",
+      "import": "./dist/webgl.js"
+    },
+    "./svg": {
+      "types": "./dist/svg.d.ts",
+      "import": "./dist/svg.js"
+    },
+    "./geo": {
+      "types": "./dist/geo.d.ts",
+      "import": "./dist/geo.js"
+    },
+    "./labels": {
+      "types": "./dist/labels.d.ts",
+      "import": "./dist/labels.js"
+    },
+    "./map": {
+      "types": "./dist/map.d.ts",
+      "import": "./dist/map.js"
+    },
+    "./react": {
+      "types": "./dist/react.d.ts",
+      "import": "./dist/react.js"
+    },
     "./package.json": "./package.json"
   },
   "files": [
@@ -64,8 +88,12 @@
     "react-dom": "^19"
   },
   "peerDependenciesMeta": {
-    "react": { "optional": true },
-    "react-dom": { "optional": true }
+    "react": {
+      "optional": true
+    },
+    "react-dom": {
+      "optional": true
+    }
   },
   "devDependencies": {
     "@types/d3-color": "^3.1.3",
