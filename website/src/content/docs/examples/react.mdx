@@ -4,6 +4,8 @@ description: Use d3gl from React — the `<GeoMap>` wrapper or the imperative en
 ---
 
 import ExampleFrame from "../../../components/ExampleFrame.astro";
+import WorldMapReact from "../../../examples/react-world-map/WorldMapReact.tsx";
+import PhyloTreeReact from "../../../examples/react-phylogenetic-tree/PhyloTreeReact.tsx";
 
 d3gl works two ways from React. It ships a thin React wrapper at
 `@mapequation/d3gl/react` — the `<GeoMap>` component, which mounts the project-once
@@ -20,7 +22,9 @@ you add layers, enable zoom, and render once. It takes `width`, `height`, a d3-g
 `backend` prop changes the component keeps the engine alive and calls
 `map.setBackend()` — no remount — so the layers and the current zoom/pan are preserved.
 
-<ExampleFrame id="react-world-map" files={["react-world-map/WorldMapReact.tsx"]} width={720} height={380} />
+<ExampleFrame id="react-world-map" react files={["react-world-map/WorldMapReact.tsx"]} width={720} height={380}>
+  <WorldMapReact client:only="react" slot="canvas" width={720} height={380} />
+</ExampleFrame>
 
 ## Phylogenetic tree
 
@@ -33,4 +37,6 @@ points, enables zoom, and renders; a separate `[backend]` effect calls
 it down with `chart.destroy()`. This is a valid, common pattern for using any
 imperative engine from React.
 
-<ExampleFrame id="react-phylogenetic-tree" files={["react-phylogenetic-tree/PhyloTreeReact.tsx"]} width={720} height={460} />
+<ExampleFrame id="react-phylogenetic-tree" react files={["react-phylogenetic-tree/PhyloTreeReact.tsx"]} width={720} height={460}>
+  <PhyloTreeReact client:only="react" slot="canvas" width={720} height={460} />
+</ExampleFrame>

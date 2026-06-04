@@ -7,8 +7,8 @@ import { Slider } from "@/components/starwind/slider";
 import { SEGMENT_ACTIVE_OVERRIDE } from "./controls.js";
 import type { ControlSpec } from "../examples/types.js";
 
-interface Props { id: string; controls?: ControlSpec[]; files: string[]; width?: number; height?: number; defaults?: Record<string, unknown> }
-const { id, controls = [], files, width = 900, height = 560, defaults = {} } = Astro.props;
+interface Props { id: string; controls?: ControlSpec[]; files: string[]; width?: number; height?: number; defaults?: Record<string, unknown>; react?: boolean }
+const { id, controls = [], files, width = 900, height = 560, defaults = {}, react = false } = Astro.props;
 
 // All example sources as raw strings, resolved at build time.
 const raw = import.meta.glob("../examples/**/*.{ts,tsx}", { query: "?raw", import: "default", eager: true }) as Record<string, string>;
@@ -30,6 +30,8 @@ const segLabel = "text-muted-foreground text-[13px]";
   class="d3gl-example bg-card text-foreground border-border my-6 overflow-hidden rounded-lg border"
   data-example={id}
   data-defaults={JSON.stringify(defaults)}
+  data-react={react ? "true" : undefined}
+  data-backend={react ? "webgl" : undefined}
 >
   <!-- Status row: backend switch (left), export (after), perf (right). -->
   <div class="flex flex-wrap items-center gap-x-4 gap-y-2 px-3 py-2.5">
@@ -100,7 +102,9 @@ const segLabel = "text-muted-foreground text-[13px]";
     </div>
   )}
 
-  <div class="d3gl-canvas relative w-full bg-white" data-canvas data-max-width={width} style={`height:${height}px`}></div>
+  <div class="d3gl-canvas relative w-full bg-white" data-canvas data-max-width={width} style={`height:${height}px`}>
+    {react && <slot name="canvas" />}
+  </div>
   <CodeTabs files={tabs} />
 </div>
 <script>

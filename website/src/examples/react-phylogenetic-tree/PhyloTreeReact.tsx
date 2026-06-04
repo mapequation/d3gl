@@ -1,4 +1,4 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import { schemeCategory10 } from "d3-scale-chromatic";
 import { link as d3link, curveStepBefore } from "d3-shape";
 import type { HierarchyPointNode, HierarchyPointLink } from "d3-hierarchy";
@@ -10,26 +10,36 @@ type PNode = HierarchyPointNode<TreeNode>;
 type PLink = HierarchyPointLink<TreeNode>;
 
 export interface PhyloTreeReactProps {
-  backend: BackendType;
-  width: number;
-  height: number;
-  onEngine: (engine: Plot) => void;
+  /** Fixed render size; the ExampleFrame canvas slot sizes the frame to match. */
+  width?: number;
+  height?: number;
 }
 
 /**
- * A pure renderer for the 64-tip rectangular phylogram (`d3.link(curveStepBefore)`
- * branches, `schemeCategory10` tip nodes), mirroring the vanilla simple-tree example.
- * The shared Astro control bar drives `backend`/size via props — no status bar here.
- *
- * Rather than the `<GeoMap>` wrapper, this drives the imperative `plot` engine directly.
- * The engine is created ONCE in a mount effect (and torn down on unmount); backend changes
- * are handled in a SEPARATE effect that calls `chart.setBackend()` (preserving zoom/pan) —
- * so we never recreate the chart on a backend swap.
+ * The 64-tip rectangular phylogram (`d3.link(curveStepBefore)` branches, `schemeCategory10`
+ * tip nodes), mirroring the vanilla simple-tree example, rendered as a genuine Astro island.
+ * There is NO control bar here — the shared ExampleFrame status bar drives it via scoped DOM
+ * events. Rather than the `<GeoMap>` wrapper this drives the imperative `plot` engine directly:
+ * a mount effect creates `plot(host, …)` once (and tears it down on unmount); a separate
+ * `[backend]` effect calls `chart.setBackend()` so switching backend preserves zoom/pan.
  */
-export default function PhyloTreeReact({ backend, width, height, onEngine }: PhyloTreeReactProps) {
+export default function PhyloTreeReact({ width = 720, height = 460 }: PhyloTreeReactProps) {
+  const ref = useRef<HTMLDivElement>(null);
   const hostRef = useRef<HTMLDivElement>(null);
   const chartRef = useRef<Plot | null>(null);
+  const [backend, setBackend] = useState<BackendType>("webgl");
 
+  // Connect to the surrounding ExampleFrame control bar (read initial backend + subscribe).
+  useEffect(() => {
+    const frame = ref.current?.closest<HTMLElement>(".d3gl-example");
+    if (!frame) return;
+    setBackend((frame.dataset.backend as BackendType) ?? "webgl");
+    const onSetBackend = (e: Event): void => setBackend((e as CustomEvent<BackendType>).detail);
+    frame.addEventListener("d3gl:setbackend", onSetBackend);
+    return () => frame.removeEventListener("d3gl:setbackend", onSetBackend);
+  }, []);
+
+  // Build the chart once; backend is handled in a separate effect (preserves zoom).
   useEffect(() => {
     const host = hostRef.current;
     if (!host) return;
@@ -41,7 +51,10 @@ export default function PhyloTreeReact({ backend, width, height, onEngine }: Phy
     // Rectangular step links via a d3-shape link generator drawing into the d3gl context.
     const gen = d3link<PLink, PNode>(curveStepBefore).x((d) => d.y).y((d) => d.x);
 
-    const chart = plot(host, { width, height, backend });
+    // Create with the frame's current backend so the first paint matches the control bar.
+    const frame = ref.current?.closest<HTMLElement>(".d3gl-example");
+    const initial = (frame?.dataset.backend as BackendType) ?? "webgl";
+    const chart = plot(host, { width, height, backend: initial });
     chartRef.current = chart;
     chart.layer("links", links, {
       draw: (ctx, l) => { gen.context(ctx); gen(l); },
@@ -56,15 +69,29 @@ export default function PhyloTreeReact({ backend, width, height, onEngine }: Phy
     });
     chart.enableZoom([0.5, 40]);
     chart.render();
-    onEngine(chart);
+
+    // Publish an export handle to the shared control bar.
+    frame?.dispatchEvent(
+      new CustomEvent("d3gl:ready", {
+        detail: {
+          exportImage: () =>
+            frame.dataset.backend === "svg"
+              ? { format: "svg" as const, data: chart.toSVG() }
+              : { format: "png" as const, data: chart.toPNG() },
+        },
+      }),
+    );
 
     return () => { chart.destroy(); chartRef.current = null; };
-    // Build once on mount; backend is handled in a separate effect (preserves zoom).
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   // Swap backend in place so the current zoom/pan is preserved (no recreate).
   useEffect(() => { chartRef.current?.setBackend(backend); }, [backend]);
 
-  return <div ref={hostRef} style={{ position: "relative", width, height }} />;
+  return (
+    <div ref={ref}>
+      <div ref={hostRef} style={{ position: "relative", width, height }} />
+    </div>
+  );
 }

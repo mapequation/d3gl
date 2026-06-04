@@ -5,8 +5,13 @@ import { createPerfMeter } from "./perf.js";
 // Lazy importers for every example module, keyed by path.
 const loaders = import.meta.glob("../examples/*/index.ts") as Record<string, () => Promise<{ mount: MountFn }>>;
 
+/** Export handle a React island publishes to its frame via the `d3gl:ready` event. */
+interface ReactExportHandle { exportImage(): { format: "svg" | "png"; data: string }; }
+
 /** Wire one [data-example] element: pre-rendered control bar + live canvas + perf, with re-mount on change. */
 export async function setupExample(root: HTMLElement): Promise<void> {
+  if (root.dataset.react === "true") { setupReactExample(root); return; }
+
   const id = root.dataset.example!;
   const path = `../examples/${id}/index.ts`;
   const loader = loaders[path];
@@ -130,4 +135,59 @@ export async function setupExample(root: HTMLElement): Promise<void> {
     resizeTimer = setTimeout(remount, 150);
   });
   ro.observe(canvas);
+}
+
+/**
+ * Wire a React example frame. The example is rendered as a genuine Astro island in the
+ * canvas slot (so `@vitejs/plugin-react` installs its Fast-Refresh preamble) — we do NOT
+ * load a module or call `mount()`. The SAME control bar drives it via scoped DOM events:
+ *   - backend switch → set `data-backend` + dispatch `d3gl:setbackend` (island swaps backend
+ *     in place via React state → engine.setBackend, so zoom/pan is preserved),
+ *   - the island dispatches `d3gl:ready` with an `exportImage()` handle once its engine is up,
+ *   - export button calls that handle; perf meter runs as usual.
+ */
+function setupReactExample(root: HTMLElement): void {
+  const id = root.dataset.example!;
+
+  // The island hydrates AFTER this script runs, so register the listener first; it then
+  // catches the island's `d3gl:ready` on mount. (Guarded in case of any ordering quirk.)
+  let exportHandle: ReactExportHandle | null = null;
+  root.addEventListener("d3gl:ready", (e) => {
+    exportHandle = (e as CustomEvent<ReactExportHandle>).detail;
+  });
+
+  const backend = (): string => root.dataset.backend ?? "webgl";
+
+  // Backend-aware export button (relabels per backend).
+  const exportBtn = root.querySelector<HTMLButtonElement>("[data-export]");
+  const refreshExport = (): void => {
+    if (exportBtn) exportBtn.textContent = backend() === "svg" ? "Export SVG" : "Export PNG";
+  };
+  refreshExport();
+  exportBtn?.addEventListener("click", () => {
+    if (!exportHandle) return;
+    const out = exportHandle.exportImage();
+    if (out.format === "svg") {
+      download(`data:image/svg+xml;charset=utf-8,${encodeURIComponent(out.data)}`, `${id}.svg`);
+    } else {
+      download(out.data, `${id}.png`);
+    }
+  });
+
+  // Backend segmented switch → update state + tell the island (in-place swap, preserves zoom).
+  const backendGroup = root.querySelector<HTMLElement>("[data-backend-group]");
+  backendGroup?.querySelectorAll<HTMLElement>("[data-backend]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      if (btn.hasAttribute("data-active")) return;
+      setActive(backendGroup, btn);
+      const next = btn.dataset.backend!;
+      root.dataset.backend = next;
+      refreshExport();
+      root.dispatchEvent(new CustomEvent("d3gl:setbackend", { detail: next }));
+    });
+  });
+
+  // Perf meter — pushed to the far right of the status row, same as vanilla frames.
+  const perf = root.querySelector<HTMLElement>("[data-perf]");
+  if (perf) createPerfMeter(perf);
 }
