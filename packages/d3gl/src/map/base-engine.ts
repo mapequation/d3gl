@@ -1,5 +1,5 @@
 import { select } from "d3-selection";
-import { zoom as d3zoom, type D3ZoomEvent } from "d3-zoom";
+import { zoom as d3zoom, zoomIdentity, type D3ZoomEvent } from "d3-zoom";
 import { Scene, HitIndex, type GroupBuilder, type RenderLayer, type ViewTransform } from "../core/index.js";
 import { createBackend, type BackendType, type BackendHandle } from "./backend-factory.js";
 
@@ -123,6 +123,11 @@ export abstract class BaseEngine {
       onTransform?.(t);
     });
     (sel as any).call(behavior);
+    // Seed d3-zoom's internal transform from the engine's CURRENT view so a non-identity base
+    // (e.g. a centering translate set via setTransform before enableZoom) is respected, and
+    // zoom-to-cursor deltas measure from it rather than from identity.
+    const t = this.transform;
+    (sel as any).call(behavior.transform, zoomIdentity.translate(t.x, t.y).scale(t.k));
     return this;
   }
   on(event: "hover", cb: (hit: HoverHit | null, ev: PointerEvent) => void): this {
