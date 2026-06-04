@@ -1,0 +1,15 @@
+---
+// Override of Starlight's header SocialIcons: show the current d3gl version to
+// the left of the social icons (GitHub), then render Starlight's default icons.
+import Default from "@astrojs/starlight/components/SocialIcons.astro";
+import pkg from "../../../packages/d3gl/package.json";
+---
+
+<a
+  class="d3gl-version"
+  href={`https://www.npmjs.com/package/@mapequation/d3gl/v/${pkg.version}`}
+  target="_blank"
+  rel="noopener noreferrer"
+  title={`@mapequation/d3gl v${pkg.version} on npm`}
+>v{pkg.version}</a>
+<Default><slot /></Default>

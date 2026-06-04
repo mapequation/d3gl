@@ -74,6 +74,7 @@ export default defineConfig({
     title: "d3gl",
     customCss: ["./src/styles/global.css"],
     social: [{ icon: "github", label: "GitHub", href: "https://github.com/mapequation/d3gl" }],
+    components: { SocialIcons: "./src/components/SocialIcons.astro" },
     plugins: [typeDocPlugin],
     sidebar: [
       { label: "Start Here", items: [{ label: "Getting started", slug: "getting-started" }] },
