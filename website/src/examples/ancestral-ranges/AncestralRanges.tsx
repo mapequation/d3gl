@@ -7,7 +7,7 @@ export default function AncestralRanges() {
   return (
     <Example
       controls={[
-        { key: "layout", label: "Layout", options: ["rectangular", "radial"] },
+        { key: "layout", label: "Layout", options: ["radial", "rectangular"] },
         { key: "curve", label: "Links", options: ["linear", "step", "bump"] },
         { key: "coords", label: "Coords", options: ["screen", "world"] },
         {
@@ -15,12 +15,13 @@ export default function AncestralRanges() {
           key: "tips",
           label: "Tips",
           min: 5,
-          max: 9,
+          max: 14,
           step: 1,
-          value: 6,
-          display: ["32", "64", "128", "256", "512"],
+          value: 8,
+          display: ["32", "64", "128", "256", "512", "1024", "2048", "4096", "8192", "16384"],
         },
       ]}
+      defaults={{ curve: "bump", coords: "world" }}
       width={900}
       height={620}
     >
