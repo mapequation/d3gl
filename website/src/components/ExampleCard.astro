@@ -1,0 +1,20 @@
+---
+import CodeTabs from "./CodeTabs.astro";
+
+interface Props { files: string[] }
+const { files } = Astro.props;
+
+// All example sources as raw strings, resolved at build time.
+const raw = import.meta.glob("../examples/**/*.{ts,tsx}", { query: "?raw", import: "default", eager: true }) as Record<string, string>;
+const tabs = files.map((f) => ({
+  name: f.split("/").pop()!,
+  code: raw[`../examples/${f}`] ?? `// missing: ${f}`,
+  lang: f.endsWith(".tsx") ? "tsx" : "ts",
+}));
+---
+<div class="d3gl-card bg-card text-foreground border-border my-6 overflow-hidden rounded-lg border">
+  <slot name="demo" />
+  <div class="border-border border-t px-3 pb-1">
+    <CodeTabs files={tabs} />
+  </div>
+</div>

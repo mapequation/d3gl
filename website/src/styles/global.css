@@ -203,7 +203,8 @@
      stair-step). Neutralise margins on everything inside the example frame so
      the status row and the controls row each stay a clean, vertically centred
      line. */
-  .d3gl-example :where(div, span, button, [data-slot], [role="group"]) {
+  .d3gl-example :where(div, span, button, [data-slot], [role="group"]),
+  .d3gl-live :where(div, span, button, [data-slot], [role="group"]) {
     margin: 0;
   }
 }

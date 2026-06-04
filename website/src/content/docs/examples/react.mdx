@@ -3,6 +3,7 @@ title: React
 description: Use d3gl from React — the `<GeoMap>` wrapper or the imperative engine in an effect.
 ---
 
+import ExampleCard from "../../../components/ExampleCard.astro";
 import ExampleFrame from "../../../components/ExampleFrame.astro";
 import WorldMapReact from "../../../examples/react-world-map/WorldMapReact.tsx";
 import PhyloTreeReact from "../../../examples/react-phylogenetic-tree/PhyloTreeReact.tsx";
@@ -22,9 +23,9 @@ you add layers, enable zoom, and render once. It takes `width`, `height`, a d3-g
 `backend` prop changes the component keeps the engine alive and calls
 `map.setBackend()` — no remount — so the layers and the current zoom/pan are preserved.
 
-<ExampleFrame id="react-world-map" react files={["react-world-map/WorldMapReact.tsx"]} width={720} height={380}>
-  <WorldMapReact client:only="react" slot="canvas" width={720} height={380} />
-</ExampleFrame>
+<ExampleCard files={["react-world-map/WorldMapReact.tsx"]}>
+  <WorldMapReact client:visible slot="demo" />
+</ExampleCard>
 
 ## Phylogenetic tree
 

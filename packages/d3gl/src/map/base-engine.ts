@@ -30,6 +30,7 @@ export abstract class BaseEngine {
   protected ready: Promise<void>;
   private hoverCb: ((hit: HoverHit | null, ev: PointerEvent) => void) | null = null;
   private swapToken = 0;
+  private destroyed = false;
 
   constructor(protected host: HTMLElement, protected width: number, protected height: number, backend: BackendType) {
     this.ready = this.swapBackend(backend);
@@ -155,6 +156,12 @@ export abstract class BaseEngine {
   toSVG(): string { return this.handle?.backend.toSVG() ?? ""; }
   toPNG(): string { return this.handle?.backend.toPNG() ?? ""; }
   destroy(): void {
+    this.destroyed = true;
+    // Invalidate any in-flight swapBackend so a pending backend that resolves
+    // after destroy() bails and removes its own element (instead of orphaning a
+    // canvas in the host — which happens when the engine is destroyed before its
+    // first backend has finished initializing, e.g. a React recreate on resize).
+    this.swapToken++;
     this.host.removeEventListener("pointermove", this.onPointerMove);
     this.host.removeEventListener("pointerleave", this.onPointerLeave);
     this.handle?.backend.destroy();
@@ -192,7 +199,9 @@ export abstract class BaseEngine {
     const token = ++this.swapToken;
     const old = this.handle;
     const next = await createBackend(type, this.host, this.width, this.height);
-    if (token !== this.swapToken) { next.backend.destroy(); if (next.element !== this.host) next.element.remove(); return; }
+    // A newer swap superseded this one, or the engine was destroyed mid-flight:
+    // tear down the freshly created backend so it never orphans an element.
+    if (token !== this.swapToken || this.destroyed) { next.backend.destroy(); if (next.element !== this.host) next.element.remove(); return; }
     old?.backend.destroy();
     if (old && old.element !== this.host) old.element.remove();
     this.handle = next;
