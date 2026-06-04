@@ -2,11 +2,18 @@
 @import "@astrojs/starlight-tailwind";
 @import "tailwindcss/theme.css" layer(theme);
 @import "tailwindcss/utilities.css" layer(utilities);
+@import "tw-animate-css";
+@plugin "@tailwindcss/forms";
 
 /* ---------------------------------------------------------------------------
    Starwind UI tokens (merged here instead of a separate starwind.css so there
    is ONE Starlight-loaded stylesheet and the layer order above is preserved).
    `starwind.config.json` points its `tailwind.css` at THIS file.
+
+   Imports above are kept Starlight-compatible: we DO NOT use the bare
+   `@import "tailwindcss"` form (which would double Tailwind's preflight and
+   fight Starlight's base styles). Instead we pull in only theme + utilities
+   and let `@astrojs/starlight-tailwind` reconcile the rest.
 
    Dark-mode bridge: Starlight toggles `data-theme="dark"` on <html>, not a
    `.dark` class. Starwind's components read the `dark` custom-variant, so we
@@ -61,7 +68,7 @@
   --color-sidebar-outline: var(--sidebar-outline);
 }
 
-/* Light theme — red "Oxide" accent. */
+/* Light theme — red "Oxide" primary, teal secondary. */
 :root {
   --background: var(--color-white);
   --foreground: var(--color-neutral-950);
@@ -70,19 +77,19 @@
   --popover: var(--color-white);
   --popover-foreground: var(--color-neutral-950);
   --primary: var(--color-red-700);
-  --primary-foreground: var(--color-white);
+  --primary-foreground: var(--color-neutral-50);
   --primary-accent: var(--color-red-700);
-  --secondary: var(--color-neutral-200);
-  --secondary-foreground: var(--color-neutral-950);
-  --secondary-accent: var(--color-neutral-950);
+  --secondary: var(--color-teal-700);
+  --secondary-foreground: var(--color-neutral-50);
+  --secondary-accent: var(--color-teal-700);
   --muted: var(--color-neutral-100);
   --muted-foreground: var(--color-neutral-600);
   --accent: var(--color-neutral-100);
   --accent-foreground: var(--color-neutral-900);
   --info: var(--color-sky-300);
   --info-foreground: var(--color-sky-950);
-  --success: var(--color-green-300);
-  --success-foreground: var(--color-green-950);
+  --success: var(--color-lime-400);
+  --success-foreground: var(--color-lime-950);
   --warning: var(--color-amber-300);
   --warning-foreground: var(--color-amber-950);
   --error: var(--color-red-700);
@@ -95,7 +102,7 @@
   /* sidebar variables */
   --sidebar-background: var(--color-neutral-50);
   --sidebar-foreground: var(--color-neutral-950);
-  --sidebar-primary: var(--color-red-700);
+  --sidebar-primary: var(--color-blue-700);
   --sidebar-primary-foreground: var(--color-neutral-50);
   --sidebar-accent: var(--color-neutral-100);
   --sidebar-accent-foreground: var(--color-neutral-900);
@@ -103,7 +110,8 @@
   --sidebar-outline: var(--color-neutral-400);
 }
 
-/* Dark theme — bridged to Starlight's data-theme="dark". */
+/* Dark theme — bridged to Starlight's data-theme="dark". Blue primary, purple
+   secondary. */
 [data-theme="dark"] {
   --background: var(--color-neutral-950);
   --foreground: var(--color-neutral-50);
@@ -111,32 +119,32 @@
   --card-foreground: var(--color-neutral-50);
   --popover: var(--color-neutral-800);
   --popover-foreground: var(--color-neutral-50);
-  --primary: var(--color-red-600);
-  --primary-foreground: var(--color-white);
-  --primary-accent: var(--color-red-400);
-  --secondary: var(--color-neutral-800);
+  --primary: var(--color-blue-700);
+  --primary-foreground: var(--color-neutral-50);
+  --primary-accent: var(--color-blue-400);
+  --secondary: var(--color-purple-700);
   --secondary-foreground: var(--color-neutral-50);
-  --secondary-accent: var(--color-neutral-50);
+  --secondary-accent: var(--color-purple-400);
   --muted: var(--color-neutral-800);
   --muted-foreground: var(--color-neutral-400);
   --accent: var(--color-neutral-700);
   --accent-foreground: var(--color-neutral-100);
   --info: var(--color-sky-300);
   --info-foreground: var(--color-sky-950);
-  --success: var(--color-green-300);
-  --success-foreground: var(--color-green-950);
+  --success: var(--color-lime-400);
+  --success-foreground: var(--color-lime-950);
   --warning: var(--color-amber-300);
   --warning-foreground: var(--color-amber-950);
   --error: var(--color-red-800);
   --error-foreground: var(--color-neutral-50);
-  --border: --alpha(var(--color-neutral-50) / 10%);
-  --input: --alpha(var(--color-neutral-50) / 15%);
+  --border: var(--color-neutral-800);
+  --input: var(--color-neutral-700);
   --outline: var(--color-neutral-500);
 
   /* sidebar variables */
   --sidebar-background: var(--color-neutral-900);
   --sidebar-foreground: var(--color-neutral-50);
-  --sidebar-primary: var(--color-red-600);
+  --sidebar-primary: var(--color-blue-700);
   --sidebar-primary-foreground: var(--color-neutral-50);
   --sidebar-accent: var(--color-neutral-800);
   --sidebar-accent-foreground: var(--color-neutral-100);
@@ -145,27 +153,37 @@
 }
 
 /* ---------------------------------------------------------------------------
-   Starlight accent — red "Oxide" so docs links + active sidebar item match.
+   Starlight chrome accent — follows the primary per mode so docs links + the
+   active sidebar item match the starwind theme (red in light, blue in dark).
    Starlight reads these from :root[data-theme='light' | 'dark'].
 --------------------------------------------------------------------------- */
 :root[data-theme="light"] {
   --sl-color-accent-low: #fbd5cb;
-  --sl-color-accent: #b91c1c;
+  --sl-color-accent: #b91c1c; /* red-700 */
   --sl-color-accent-high: #7a1414;
 }
 :root[data-theme="dark"] {
-  --sl-color-accent-low: #4c0f0f;
-  --sl-color-accent: #ef4444;
-  --sl-color-accent-high: #fbc4b8;
+  --sl-color-accent-low: #11214a;
+  --sl-color-accent: #2563eb; /* blue-600/700 */
+  --sl-color-accent-high: #bfdbfe;
 }
 
-/* Starwind base hooks (scoped so they don't fight Starlight's own preflight). */
+/* ---------------------------------------------------------------------------
+   Base resets — this is what gives every starwind component its proper border
+   token + the focus outline, and makes buttons show the pointer cursor. These
+   live in the `base` layer (declared first in the cascade above) so Starlight's
+   own base styles — including its sidebar hover — still win where they overlap.
+
+   Deliberately NO global `body { bg-background text-foreground }`: Starlight
+   manages the page background and text per theme; overriding it here would
+   break Starlight's theming and its no-flash behaviour.
+--------------------------------------------------------------------------- */
 @layer base {
-  [data-slot] {
-    border-color: var(--border);
+  * {
+    @apply border-border outline-outline/50;
   }
-  button[data-slot] {
-    cursor: pointer;
+  button {
+    @apply cursor-pointer;
   }
 }
 
@@ -178,10 +196,14 @@
   }
 
   /* The example frame is rendered inside Starlight markdown content, which adds
-     vertical margins to flow elements (including our control buttons/sliders).
-     Neutralise those margins so the segmented ButtonGroup stays a clean,
-     vertically-aligned row instead of stair-stepping. */
-  .d3gl-example :where(button, [data-slot], [role="group"]) {
+     vertical margins to adjacent flow elements — including our control buttons,
+     sliders, AND the per-control wrapper <div>s in the controls row. Those
+     stray top margins push every control after the first down by ~16px, so a
+     flex `items-center` row no longer shares one centre-line (the wrappers
+     stair-step). Neutralise margins on everything inside the example frame so
+     the status row and the controls row each stay a clean, vertically centred
+     line. */
+  .d3gl-example :where(div, span, button, [data-slot], [role="group"]) {
     margin: 0;
   }
 }
