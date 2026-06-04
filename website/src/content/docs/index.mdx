@@ -6,7 +6,7 @@ hero:
   tagline: GPU-accelerated rendering for d3 — SVG, Canvas2D, and WebGL2 from one API.
   actions:
     - text: Get started
-      link: /start-here/getting-started/
+      link: /d3gl/start-here/getting-started/
       icon: right-arrow
       variant: primary
     - text: View on GitHub
@@ -17,12 +17,12 @@ hero:
 
 import { Card, CardGrid } from "@astrojs/starlight/components";
 
-<CardGrid stagger>
-  <Card title="Familiar d3 contexts" icon="seti:typescript">
-    Context-driven d3 generators (`geoPath`, `d3-shape`, `d3-hierarchy` links) render unchanged.
-  </Card>
+<CardGrid>
   <Card title="Three backends, one API" icon="puzzle">
     Switch between SVG, Canvas2D, and WebGL2 without touching your drawing code.
+  </Card>
+  <Card title="Familiar d3 contexts" icon="seti:typescript">
+    Context-driven d3 generators (`geoPath`, `d3-shape`, `d3-hierarchy` links) render unchanged.
   </Card>
   <Card title="Project & tessellate once" icon="rocket">
     Geometry is uploaded once; pan/zoom is a single transform-matrix uniform.
