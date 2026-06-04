@@ -31,11 +31,22 @@ const typeDocPlugin = starlightTypeDoc({
   tsconfig: "../packages/d3gl/tsconfig.json",
   output: "reference",
   sidebar: { label: "Reference", collapsed: true },
-  // Each module's `@packageDocumentation` overview lives on its module index
-  // page; `entryFileName: "index"` names those pages `index.md` (instead of the
-  // default `README.md`, which starlight-typedoc strips for multi-entry-point
-  // setups) so the overview survives and tops each module reference page.
-  typeDoc: { entryFileName: "index" },
+  typeDoc: {
+    // Each module's `@packageDocumentation` overview lives on its module index
+    // page; `entryFileName: "index"` names those pages `index.md` (instead of
+    // the default `README.md`, which starlight-typedoc strips for multi-entry-
+    // point setups) so the overview survives and tops each module reference page.
+    entryFileName: "index",
+    // Render index sections (the Reference root's module list, and each module
+    // page's Classes/Interfaces/Functions lists) as tables with a Description
+    // column. On the root this turns the bare list of 8 modules into a scannable
+    // table where each module shows the first line of its `@packageDocumentation`
+    // summary, so readers can tell modules apart before clicking in.
+    indexFormat: "table",
+    // The summary column links to the symbol; an explicit type column would just
+    // repeat "Module" for every row, so keep the table to name + description.
+    tableColumnSettings: { hideSources: true },
+  },
 });
 
 export default defineConfig({
