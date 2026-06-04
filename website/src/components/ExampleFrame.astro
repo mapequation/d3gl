@@ -11,11 +11,11 @@ interface Props { id: string; controls?: ControlSpec[]; files: string[]; width?:
 const { id, controls = [], files, width = 900, height = 560, defaults = {} } = Astro.props;
 
 // All example sources as raw strings, resolved at build time.
-const raw = import.meta.glob("../examples/**/*.ts", { query: "?raw", import: "default", eager: true }) as Record<string, string>;
+const raw = import.meta.glob("../examples/**/*.{ts,tsx}", { query: "?raw", import: "default", eager: true }) as Record<string, string>;
 const tabs = files.map((f) => ({
   name: f.split("/").pop()!,
   code: raw[`../examples/${f}`] ?? `// missing: ${f}`,
-  lang: "ts",
+  lang: f.endsWith(".tsx") ? "tsx" : "ts",
 }));
 
 const backends = ["webgl", "canvas", "svg"] as const;

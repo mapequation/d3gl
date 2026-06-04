@@ -3,19 +3,14 @@ title: React
 description: Use d3gl from React — the `<GeoMap>` wrapper or the imperative engine in an effect.
 ---
 
-import { Code } from "@astrojs/starlight/components";
-import WorldMapReact from "../../../examples/react/WorldMapReact.tsx";
-import worldMapSrc from "../../../examples/react/WorldMapReact.tsx?raw";
-import PhyloTreeReact from "../../../examples/react/PhyloTreeReact.tsx";
-import phyloTreeSrc from "../../../examples/react/PhyloTreeReact.tsx?raw";
-import statusBarSrc from "../../../examples/react/StatusBar.tsx?raw";
+import ExampleFrame from "../../../components/ExampleFrame.astro";
 
 d3gl works two ways from React. It ships a thin React wrapper at
 `@mapequation/d3gl/react` — the `<GeoMap>` component, which mounts the project-once
 map engine for you — and, since the engine is plain imperative JavaScript, you can
-also drive it directly from a `useEffect`. Both examples below share a small React
-status bar (backend switch, export, live perf) styled with the same theme tokens as
-the vanilla examples.
+also drive it directly from a `useEffect`. Both examples below render through the same
+universal control bar as every other example on this site (backend switch, export,
+live perf); the React component just receives `backend` and the canvas size as props.
 
 ## World map
 
@@ -23,25 +18,19 @@ the vanilla examples.
 you add layers, enable zoom, and render once. It takes `width`, `height`, a d3-geo
 `projection`, and an optional `backend` (`"webgl"`, `"canvas"`, or `"svg"`). When the
 `backend` prop changes the component keeps the engine alive and calls
-`map.setBackend()` — no remount — so the layers and zoom state are preserved.
+`map.setBackend()` — no remount — so the layers and the current zoom/pan are preserved.
 
-<WorldMapReact client:visible />
-
-<Code code={worldMapSrc} lang="tsx" title="WorldMapReact.tsx" />
+<ExampleFrame id="react-world-map" files={["react-world-map/WorldMapReact.tsx"]} width={720} height={380} />
 
 ## Phylogenetic tree
 
 The same 64-tip rectangular phylogram as the vanilla simple-tree example
 (`d3.link(curveStepBefore)` branches, `schemeCategory10` tip nodes), rendered from
 React. Rather than a wrapper component, this drives the imperative `plot` engine
-directly inside a `useEffect`: create `plot(host, …)`, build the link layer and tip
-points, `enableZoom`, `render`, and tear it down with `chart.destroy()` on cleanup.
-This is a valid, common pattern for using any imperative engine from React.
+directly: a mount effect creates `plot(host, …)` once, builds the link layer and tip
+points, enables zoom, and renders; a separate `[backend]` effect calls
+`chart.setBackend()` so switching backend preserves the current zoom/pan; cleanup tears
+it down with `chart.destroy()`. This is a valid, common pattern for using any
+imperative engine from React.
 
-<PhyloTreeReact client:visible />
-
-<Code code={phyloTreeSrc} lang="tsx" title="PhyloTreeReact.tsx" />
-
-Both examples share this status bar component:
-
-<Code code={statusBarSrc} lang="tsx" title="StatusBar.tsx" />
+<ExampleFrame id="react-phylogenetic-tree" files={["react-phylogenetic-tree/PhyloTreeReact.tsx"]} width={720} height={460} />
