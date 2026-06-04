@@ -208,3 +208,18 @@
     margin: 0;
   }
 }
+
+/* Version badge shown to the left of the header social icons (see SocialIcons override). */
+@layer components {
+  .d3gl-version {
+    align-self: center;
+    font-size: var(--sl-text-xs);
+    font-variant-numeric: tabular-nums;
+    color: var(--sl-color-gray-3);
+    text-decoration: none;
+    white-space: nowrap;
+  }
+  .d3gl-version:hover {
+    color: var(--sl-color-text-accent);
+  }
+}
