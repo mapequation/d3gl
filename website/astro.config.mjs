@@ -30,13 +30,31 @@ const typeDocPlugin = starlightTypeDoc({
   entryPoints: referenceEntryPoints,
   tsconfig: "../packages/d3gl/tsconfig.json",
   output: "reference",
-  sidebar: { label: "Reference", collapsed: true },
+  // `readmeLabel` is the visible label of the "Overview" link that
+  // starlight-typedoc injects at the top of each module group once the TypeDoc
+  // `readme` option (below) is configured — this is what makes each module's
+  // overview page reachable from the sidebar.
+  sidebar: { label: "Reference", collapsed: true, readmeLabel: "Overview" },
   typeDoc: {
     // Each module's `@packageDocumentation` overview lives on its module index
     // page; `entryFileName: "index"` names those pages `index.md` (instead of
     // the default `README.md`, which starlight-typedoc strips for multi-entry-
     // point setups) so the overview survives and tops each module reference page.
     entryFileName: "index",
+    // starlight-typedoc only emits the "Overview" sidebar link inside each
+    // module group when the TypeDoc `readme` option is configured (it gates the
+    // readmeUrls map on `isReadmeConfigured`, which is false for the default
+    // `readme: "none"`). Pointing it at the package README makes each module's
+    // generated `index.md` (its `@packageDocumentation` overview page) register
+    // as a reachable "Overview" entry under the module's sidebar group.
+    readme: fileURLToPath(
+      new URL("../packages/d3gl/README.md", import.meta.url),
+    ),
+    // Without this, configuring `readme` would split the Reference root into a
+    // separate README page + a `modules.md` table page. `mergeReadme: true`
+    // keeps a single root `index.md` that appends the scannable module table
+    // under the README, so the root stays the clickable module table.
+    mergeReadme: true,
     // Render index sections (the Reference root's module list, and each module
     // page's Classes/Interfaces/Functions lists) as tables with a Description
     // column. On the root this turns the bare list of 8 modules into a scannable
