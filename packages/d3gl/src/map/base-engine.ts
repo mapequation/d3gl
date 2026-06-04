@@ -110,10 +110,17 @@ export abstract class BaseEngine {
     for (const d of draws) this.scene.setFlag(spec.name, d.id, !d.anchor || visible.has(d.id) ? 1 : 0);
     this.handle?.backend.updateLayer(spec.name, this.renderLayer(spec));
   }
-  enableZoom(extent: [number, number] = [1, 100]): this {
+  /**
+   * Enable scroll-to-zoom / drag-to-pan via d3-zoom, clamped to `extent`. The optional
+   * `onTransform` callback fires after each `setTransform` during zoom — use it to keep an
+   * HTML overlay (e.g. a `LabelLayer`) aligned with the GPU geometry as the view changes.
+   */
+  enableZoom(extent: [number, number] = [1, 100], onTransform?: (t: ViewTransform) => void): this {
     const sel = select(this.host as Element);
     const behavior = d3zoom<Element, unknown>().scaleExtent(extent).on("zoom", (e: D3ZoomEvent<Element, unknown>) => {
-      this.setTransform({ k: e.transform.k, x: e.transform.x, y: e.transform.y });
+      const t: ViewTransform = { k: e.transform.k, x: e.transform.x, y: e.transform.y };
+      this.setTransform(t);
+      onTransform?.(t);
     });
     (sel as any).call(behavior);
     return this;
