@@ -1,0 +1,13 @@
+@layer base, starlight, theme, components, utilities;
+@import "@astrojs/starlight-tailwind";
+@import "tailwindcss/theme.css" layer(theme);
+@import "tailwindcss/utilities.css" layer(utilities);
+
+/* The live canvas/svg the example backends render into are dynamically inserted,
+   so they can't carry utility classes; keep this one display rule. */
+@layer components {
+  .d3gl-canvas canvas,
+  .d3gl-canvas svg {
+    display: block;
+  }
+}

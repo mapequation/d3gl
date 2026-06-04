@@ -35,6 +35,8 @@ npm i @mapequation/d3gl
 import { plot } from "@mapequation/d3gl/map";
 import { line } from "d3-shape";
 
+const points: [number, number][] = [[0, 0], [100, 80], [200, 40], [320, 160], [440, 90]];
+
 const chart = plot(document.querySelector("#chart")!, { width: 640, height: 400, backend: "webgl" });
 const gen = line<[number, number]>().x((d) => d[0]).y((d) => d[1]);
 chart.layer("series", [points], { draw: (ctx, d) => { gen.context(ctx); gen(d); }, stroke: "#1a73e8", lineWidth: 1.5 });

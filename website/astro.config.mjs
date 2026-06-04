@@ -4,6 +4,7 @@ import starlight from "@astrojs/starlight";
 // `typeDocSidebarGroup` is the sidebar placeholder injected where the generated
 // Reference group should appear.
 import starlightTypeDoc, { typeDocSidebarGroup } from "starlight-typedoc";
+import tailwindcss from "@tailwindcss/vite";
 import { fileURLToPath } from "node:url";
 
 // Alias each @mapequation/d3gl subpath to its TypeScript source so the docs run
@@ -41,11 +42,11 @@ export default defineConfig({
   integrations: [
     starlight({
       title: "d3gl",
-      customCss: ["./src/styles/example.css"],
+      customCss: ["./src/styles/global.css"],
       social: [{ icon: "github", label: "GitHub", href: "https://github.com/mapequation/d3gl" }],
       plugins: [typeDocPlugin],
       sidebar: [
-        { label: "Start Here", items: [{ label: "Getting started", slug: "start-here/getting-started" }] },
+        { label: "Start Here", items: [{ label: "Getting started", slug: "getting-started" }] },
         {
           label: "Examples",
           items: [
@@ -62,6 +63,7 @@ export default defineConfig({
     }),
   ],
   vite: {
+    plugins: [tailwindcss()],
     resolve: {
       alias: [
         { find: "@mapequation/d3gl/canvas", replacement: mod("canvas") },

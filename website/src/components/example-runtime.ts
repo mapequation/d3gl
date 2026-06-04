@@ -14,11 +14,18 @@ export async function setupExample(root: HTMLElement): Promise<void> {
   if (!loader) { console.error("Unknown example", id); return; }
   const { mount } = await loader();
 
-  const bar = root.querySelector<HTMLElement>("[data-control-bar]")!;
+  const statusBar = root.querySelector<HTMLElement>("[data-status-bar]");
+  const controlsRow = root.querySelector<HTMLElement>("[data-controls-row]");
+  // Fall back gracefully if only one container exists.
+  const status = statusBar ?? controlsRow!;
+  const row = controlsRow ?? statusBar!;
   const canvas = root.querySelector<HTMLElement>("[data-canvas]")!;
 
   const opts: ExampleOptions = { backend: "webgl" };
   for (const c of controls) opts[c.key] = c.type === "range" ? c.value : c.options[0];
+  // Seed any page-supplied defaults after per-control defaults, before first mount.
+  const defaults = JSON.parse(root.dataset.defaults || "{}");
+  Object.assign(opts, defaults);
 
   let handle: ExampleHandle | null = null;
   const remount = (): void => {
@@ -27,26 +34,13 @@ export async function setupExample(root: HTMLElement): Promise<void> {
     handle = mount(canvas, { ...opts });
   };
 
-  // perf meter (left)
-  const perf = document.createElement("div");
-  bar.appendChild(perf);
-  createPerfMeter(perf);
-
-  // backend switch
-  bar.appendChild(segmented("", ["webgl", "canvas", "svg"], "webgl", (v) => {
+  // Status bar (top line): backend switch (left), export button, then perf (far right).
+  // backend switch — first/left
+  status.appendChild(segmented("", ["webgl", "canvas", "svg"], "webgl", (v) => {
     opts.backend = v as ExampleOptions["backend"];
     exportBtn.refresh();
     remount();
   }));
-
-  // example-specific controls (segmented toggles or range sliders)
-  for (const c of controls) {
-    if (c.type === "range") {
-      bar.appendChild(slider(c.label, c, (v) => { opts[c.key] = v; remount(); }));
-    } else {
-      bar.appendChild(segmented(c.label, c.options, c.options[0]!, (v) => { opts[c.key] = v; remount(); }));
-    }
-  }
 
   // single backend-aware export button
   const exportBtn = actionButton(
@@ -61,7 +55,22 @@ export async function setupExample(root: HTMLElement): Promise<void> {
       }
     },
   ) as HTMLButtonElement & { refresh: () => void };
-  bar.appendChild(exportBtn);
+  status.appendChild(exportBtn);
+
+  // perf meter — pushed to the far right
+  const perf = document.createElement("div");
+  perf.classList.add("ml-auto");
+  status.appendChild(perf);
+  createPerfMeter(perf);
+
+  // example-specific controls (segmented toggles or range sliders) on their own row
+  for (const c of controls) {
+    if (c.type === "range") {
+      row.appendChild(slider(c.label, c, (v) => { opts[c.key] = v; remount(); }));
+    } else {
+      row.appendChild(segmented(c.label, c.options, c.options[0]!, (v) => { opts[c.key] = v; remount(); }));
+    }
+  }
 
   remount();
 }

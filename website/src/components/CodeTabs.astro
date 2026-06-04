@@ -1,38 +1,12 @@
 ---
-import { Code } from "@astrojs/starlight/components";
+import { Tabs, TabItem, Code } from "@astrojs/starlight/components";
 interface FileTab { name: string; code: string; lang?: string }
 const { files } = Astro.props as { files: FileTab[] };
 ---
-<div class="d3gl-code">
-  <div class="d3gl-code-tabs" role="tablist">
-    {files.map((f, i) => (
-      <button class:list={["d3gl-code-tab", { "is-active": i === 0 }]} data-tab={i} role="tab">{f.name}</button>
-    ))}
-  </div>
-  {files.map((f, i) => (
-    <div class:list={["d3gl-code-panel", { "is-active": i === 0 }]} data-panel={i}>
-      <button class="d3gl-copy" data-copy={i} title="Copy to clipboard" aria-label="Copy to clipboard">⧉</button>
-      <Code code={f.code} lang={(f.lang as any) ?? "ts"} />
-    </div>
+<Tabs>
+  {files.map((f) => (
+    <TabItem label={f.name}>
+      <Code code={f.code} lang={(f.lang as any) ?? "ts"} title={f.name} />
+    </TabItem>
   ))}
-</div>
-<script>
-  document.querySelectorAll<HTMLElement>(".d3gl-code").forEach((root) => {
-    const tabs = root.querySelectorAll<HTMLButtonElement>(".d3gl-code-tab");
-    const panels = root.querySelectorAll<HTMLElement>(".d3gl-code-panel");
-    tabs.forEach((tab) => tab.addEventListener("click", () => {
-      const i = tab.dataset.tab!;
-      tabs.forEach((t) => t.classList.toggle("is-active", t.dataset.tab === i));
-      panels.forEach((p) => p.classList.toggle("is-active", p.dataset.panel === i));
-    }));
-    root.querySelectorAll<HTMLButtonElement>(".d3gl-copy").forEach((btn) => {
-      btn.addEventListener("click", async () => {
-        const panel = root.querySelector<HTMLElement>(`.d3gl-code-panel[data-panel="${btn.dataset.copy}"]`);
-        const text = panel?.querySelector("code")?.textContent ?? "";
-        await navigator.clipboard.writeText(text);
-        btn.textContent = "✓";
-        setTimeout(() => { btn.textContent = "⧉"; }, 1200);
-      });
-    });
-  });
-</script>
+</Tabs>
