@@ -85,35 +85,14 @@ for (const c of cells) scene.setFill("cells", c.id, color(c.value));
 
 Recolor at any time with `scene.setFill(...)` + `controller.updateColors("cells", scene.buffers("cells"))` — a texture write, no re-tessellation. Pan/zoom by passing a new `transform`.
 
-## Development
+## Documentation
 
-This is a pnpm workspace (TypeScript, Vitest). The CPU modules test in Node; the WebGL,
-DOM, and React modules test in headless Chromium via Vitest browser mode + Playwright.
+Full docs, runnable examples, and the API reference live at
+**https://mapequation.github.io/d3gl/**.
 
-```sh
-pnpm install
-pnpm exec playwright install chromium    # one-time, for browser tests
+## Contributing & development
 
-pnpm test                                # Node unit tests
-pnpm build                               # build the published bundle (tsup)
-pnpm -r exec tsc --noEmit                # typecheck
-
-# Browser suites (WebGL / DOM / React), all in one run:
-pnpm --filter @mapequation/d3gl test:browser
-```
-
-`*.browser.test.ts(x)` run only via `packages/d3gl/vitest.config.ts`; the root Node
-config excludes them.
-
-> **Environment note:** if a bare `pnpm` is unavailable or broken (e.g. a stale asdf
-> shim), use `corepack pnpm@9.15.9 …` in place of `pnpm …` for every command above.
-
-## Releases
-
-Versioning and publishing of `@mapequation/d3gl` are automated with
-[Changesets](https://github.com/changesets/changesets). Add a changeset
-(`pnpm changeset`) in any PR that should appear in a release; merging the
-generated "Version Packages" PR publishes to npm. See [CONTRIBUTING.md](CONTRIBUTING.md).
+See [CONTRIBUTING.md](CONTRIBUTING.md) for workspace setup, tests, and the release process.
 
 ## Roadmap (not yet in v1)
 

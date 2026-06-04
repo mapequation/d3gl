@@ -1,0 +1,47 @@
+---
+title: React
+description: Use d3gl from React — the `<GeoMap>` map wrapper and the declarative `<Plot>` / `<Layer>` / `<Points>` components.
+---
+
+import ExampleCard from "../../../components/ExampleCard.astro";
+import WorldMapReact from "../../../examples/react-world-map/WorldMapReact.tsx";
+import PhyloTreeReact from "../../../examples/react-phylogenetic-tree/PhyloTreeReact.tsx";
+
+d3gl ships first-class React bindings at `@mapequation/d3gl/react`. For maps there is
+`<GeoMap>`, which mounts the project-once map engine for you. For everything else —
+trees, generic 2D plots — there is a fully declarative API: a `<Plot>` element with
+`<Layer>` and `<Points>` children. You describe the chart as JSX; `<Plot>` builds the
+imperative `plot` engine under the hood, translates each child into an `engine.layer`
+/ `engine.points` call (sibling order = paint order), and manages the lifecycle — no
+`useEffect`, no DOM, no engine plumbing in your component. Both examples below render
+through the same universal control bar as every other example on this site (backend
+switch, export, live perf); the components just receive `backend` and the canvas size
+as props.
+
+## World map
+
+`<GeoMap>` mounts the map engine and hands it back via the `onReady` callback, where
+you add layers, enable zoom, and render once. It takes `width`, `height`, a d3-geo
+`projection`, and an optional `backend` (`"webgl"`, `"canvas"`, or `"svg"`). When the
+`backend` prop changes the component keeps the engine alive and calls
+`map.setBackend()` — no remount — so the layers and the current zoom/pan are preserved.
+
+<ExampleCard files={["react-world-map/WorldMapReact.tsx"]}>
+  <WorldMapReact client:visible slot="demo" />
+</ExampleCard>
+
+## Phylogenetic tree
+
+The same 64-tip rectangular phylogram as the vanilla simple-tree example
+(`d3.link(curveStepBefore)` branches, `schemeCategory10` tip nodes), written
+declaratively with `<Plot>`. The whole chart is JSX: a `<Layer>` draws the branches
+with a d3-shape link generator straight into the d3gl context, a `<Points>` places the
+coloured tip nodes, and `zoom={[0.5, 40]}` enables scroll-to-zoom / drag-to-pan. The
+layout is recomputed for the harness-measured `width`/`height`. There is no `useEffect`
+and no engine handling in the component — `<Plot>` builds the `plot` engine, applies the
+children, and hands it back through `onReady` so the harness can drive export and
+backend switching (which preserves the current zoom/pan).
+
+<ExampleCard files={["react-phylogenetic-tree/PhyloTreeReact.tsx"]}>
+  <PhyloTreeReact client:visible slot="demo" />
+</ExampleCard>

@@ -1,0 +1,26 @@
+{
+  "extends": "astro/tsconfigs/strict",
+  "include": [
+    ".astro/types.d.ts",
+    "**/*"
+  ],
+  "exclude": [
+    "dist"
+  ],
+  "compilerOptions": {
+    "paths": {
+      "@mapequation/d3gl": [
+        "../packages/d3gl/src/core/index.ts"
+      ],
+      "@mapequation/d3gl/*": [
+        "../packages/d3gl/src/*/index.ts"
+      ],
+      "@/*": [
+        "src/*"
+      ]
+    },
+    "baseUrl": ".",
+    "jsx": "react-jsx",
+    "jsxImportSource": "react"
+  }
+}

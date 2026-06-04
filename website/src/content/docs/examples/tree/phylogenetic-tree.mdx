@@ -1,0 +1,31 @@
+---
+title: Phylogenetic tree
+description: A minimal d3gl tree — d3-hierarchy layout + d3-shape links on the GPU, in world and screen coordinates.
+---
+
+import ExampleCard from "../../../../components/ExampleCard.astro";
+import PhyloTree from "../../../../examples/phylogenetic-tree/PhyloTree.tsx";
+
+The smallest tree example: lay out a 64-tip phylogram with `d3-hierarchy`'s `cluster`, then draw
+the branches with a `d3.link()` generator straight into the d3gl context. Scroll to zoom, drag to
+pan. The two variants below render the **same** tree but differ in how node and line sizes behave
+under zoom — world coordinates vs. screen coordinates.
+
+## World-space nodes
+
+Node radii and branch widths are in world units, so they scale with the view: zoom in and the dots
+and lines grow with everything else.
+
+<ExampleCard files={["phylogenetic-tree/draw.ts"]}>
+  <PhyloTree client:visible slot="demo" />
+</ExampleCard>
+
+## Screen-space nodes
+
+The same module with `coords: "screen"`. Node radii and line widths are now in screen pixels and
+stay constant as you zoom — only their positions move with the view, so glyphs stay legible at any
+zoom level (handy when zooming into a dense subtree).
+
+<ExampleCard files={["phylogenetic-tree/draw.ts"]}>
+  <PhyloTree coords="screen" client:visible slot="demo" />
+</ExampleCard>

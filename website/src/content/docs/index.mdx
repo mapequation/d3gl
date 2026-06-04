@@ -1,0 +1,39 @@
+---
+title: d3gl
+description: GPU-accelerated rendering for d3 — SVG, Canvas2D, and WebGL2 from one API.
+template: splash
+hero:
+  tagline: GPU-accelerated rendering for d3 — SVG, Canvas2D, and WebGL2 from one API.
+  actions:
+    - text: Get started
+      link: /d3gl/getting-started/
+      icon: right-arrow
+      variant: primary
+    - text: View on GitHub
+      link: https://github.com/mapequation/d3gl
+      icon: external
+      variant: minimal
+---
+
+import { Card, CardGrid } from "@astrojs/starlight/components";
+
+<CardGrid>
+  <Card title="Three backends, one API" icon="puzzle">
+    Switch between SVG, Canvas2D, and WebGL2 without touching your drawing code.
+  </Card>
+  <Card title="Familiar d3 contexts" icon="seti:typescript">
+    Context-driven d3 generators (`geoPath`, `d3-shape`, `d3-hierarchy` links) render unchanged.
+  </Card>
+  <Card title="Project & tessellate once" icon="rocket">
+    Geometry is uploaded once; pan/zoom is a single transform-matrix uniform.
+  </Card>
+  <Card title="GPU recolor & picking" icon="random">
+    Recolor or show/hide is one texture write; hit-testing is GPU-accelerated.
+  </Card>
+  <Card title="GeoJSON & maps" icon="earth">
+    Project any GeoJSON with any d3 projection and render the result on the GPU.
+  </Card>
+  <Card title="Publication export" icon="document">
+    Export crisp PNG and SVG straight from the same scene.
+  </Card>
+</CardGrid>

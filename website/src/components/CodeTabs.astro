@@ -1,0 +1,12 @@
+---
+import { Tabs, TabItem, Code } from "@astrojs/starlight/components";
+interface FileTab { name: string; code: string; lang?: string }
+const { files } = Astro.props as { files: FileTab[] };
+---
+<Tabs>
+  {files.map((f) => (
+    <TabItem label={f.name}>
+      <Code code={f.code} lang={(f.lang as any) ?? "ts"} title={f.name} />
+    </TabItem>
+  ))}
+</Tabs>

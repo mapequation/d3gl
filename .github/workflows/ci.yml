@@ -31,3 +31,6 @@ jobs:
 
       - name: Node unit tests
         run: pnpm test
+
+      - name: Build website (smoke)
+        run: pnpm --filter @d3gl/website build

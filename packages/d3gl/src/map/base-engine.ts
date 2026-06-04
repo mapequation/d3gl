@@ -1,5 +1,5 @@
 import { select } from "d3-selection";
-import { zoom as d3zoom, type D3ZoomEvent } from "d3-zoom";
+import { zoom as d3zoom, zoomIdentity, type D3ZoomEvent } from "d3-zoom";
 import { Scene, HitIndex, type GroupBuilder, type RenderLayer, type ViewTransform } from "../core/index.js";
 import { createBackend, type BackendType, type BackendHandle } from "./backend-factory.js";
 
@@ -30,6 +30,7 @@ export abstract class BaseEngine {
   protected ready: Promise<void>;
   private hoverCb: ((hit: HoverHit | null, ev: PointerEvent) => void) | null = null;
   private swapToken = 0;
+  private destroyed = false;
 
   constructor(protected host: HTMLElement, protected width: number, protected height: number, backend: BackendType) {
     this.ready = this.swapBackend(backend);
@@ -110,12 +111,24 @@ export abstract class BaseEngine {
     for (const d of draws) this.scene.setFlag(spec.name, d.id, !d.anchor || visible.has(d.id) ? 1 : 0);
     this.handle?.backend.updateLayer(spec.name, this.renderLayer(spec));
   }
-  enableZoom(extent: [number, number] = [1, 100]): this {
+  /**
+   * Enable scroll-to-zoom / drag-to-pan via d3-zoom, clamped to `extent`. The optional
+   * `onTransform` callback fires after each `setTransform` during zoom — use it to keep an
+   * HTML overlay (e.g. a `LabelLayer`) aligned with the GPU geometry as the view changes.
+   */
+  enableZoom(extent: [number, number] = [1, 100], onTransform?: (t: ViewTransform) => void): this {
     const sel = select(this.host as Element);
     const behavior = d3zoom<Element, unknown>().scaleExtent(extent).on("zoom", (e: D3ZoomEvent<Element, unknown>) => {
-      this.setTransform({ k: e.transform.k, x: e.transform.x, y: e.transform.y });
+      const t: ViewTransform = { k: e.transform.k, x: e.transform.x, y: e.transform.y };
+      this.setTransform(t);
+      onTransform?.(t);
     });
     (sel as any).call(behavior);
+    // Seed d3-zoom's internal transform from the engine's CURRENT view so a non-identity base
+    // (e.g. a centering translate set via setTransform before enableZoom) is respected, and
+    // zoom-to-cursor deltas measure from it rather than from identity.
+    const t = this.transform;
+    (sel as any).call(behavior.transform, zoomIdentity.translate(t.x, t.y).scale(t.k));
     return this;
   }
   on(event: "hover", cb: (hit: HoverHit | null, ev: PointerEvent) => void): this {
@@ -143,6 +156,12 @@ export abstract class BaseEngine {
   toSVG(): string { return this.handle?.backend.toSVG() ?? ""; }
   toPNG(): string { return this.handle?.backend.toPNG() ?? ""; }
   destroy(): void {
+    this.destroyed = true;
+    // Invalidate any in-flight swapBackend so a pending backend that resolves
+    // after destroy() bails and removes its own element (instead of orphaning a
+    // canvas in the host — which happens when the engine is destroyed before its
+    // first backend has finished initializing, e.g. a React recreate on resize).
+    this.swapToken++;
     this.host.removeEventListener("pointermove", this.onPointerMove);
     this.host.removeEventListener("pointerleave", this.onPointerLeave);
     this.handle?.backend.destroy();
@@ -180,7 +199,9 @@ export abstract class BaseEngine {
     const token = ++this.swapToken;
     const old = this.handle;
     const next = await createBackend(type, this.host, this.width, this.height);
-    if (token !== this.swapToken) { next.backend.destroy(); if (next.element !== this.host) next.element.remove(); return; }
+    // A newer swap superseded this one, or the engine was destroyed mid-flight:
+    // tear down the freshly created backend so it never orphans an element.
+    if (token !== this.swapToken || this.destroyed) { next.backend.destroy(); if (next.element !== this.host) next.element.remove(); return; }
     old?.backend.destroy();
     if (old && old.element !== this.host) old.element.remove();
     this.handle = next;
