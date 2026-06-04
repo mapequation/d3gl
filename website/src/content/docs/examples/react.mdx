@@ -1,0 +1,21 @@
+---
+title: React
+description: Use d3gl from React with the `<GeoMap>` component.
+---
+
+import { Code } from "@astrojs/starlight/components";
+import WorldMapReact from "../../../examples/react/WorldMapReact.tsx";
+import src from "../../../examples/react/WorldMapReact.tsx?raw";
+
+d3gl ships a thin React wrapper at `@mapequation/d3gl/react`. The vanilla examples
+drive the imperative engine directly (`geoMap(el, …).layer(…).render()`); this one
+renders the same world map through the `<GeoMap>` component instead.
+
+`<GeoMap>` mounts the project-once map engine for you and hands the engine back via
+the `onReady` callback, where you add layers and render once. It also takes `width`,
+`height`, a d3-geo `projection`, and an optional `backend` (`"webgl"`, `"canvas"`,
+or `"svg"`).
+
+<WorldMapReact client:visible />
+
+<Code code={src} lang="tsx" title="WorldMapReact.tsx" />

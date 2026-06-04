@@ -7,6 +7,8 @@ import starlightTypeDoc, { typeDocSidebarGroup } from "starlight-typedoc";
 import tailwindcss from "@tailwindcss/vite";
 import { fileURLToPath } from "node:url";
 
+import react from "@astrojs/react";
+
 // Alias each @mapequation/d3gl subpath to its TypeScript source so the docs run
 // against the live library with no build step. Subpath aliases precede the root.
 const mod = (name) =>
@@ -39,29 +41,28 @@ const typeDocPlugin = starlightTypeDoc({
 export default defineConfig({
   site: "https://mapequation.github.io",
   base: "/d3gl/",
-  integrations: [
-    starlight({
-      title: "d3gl",
-      customCss: ["./src/styles/global.css"],
-      social: [{ icon: "github", label: "GitHub", href: "https://github.com/mapequation/d3gl" }],
-      plugins: [typeDocPlugin],
-      sidebar: [
-        { label: "Start Here", items: [{ label: "Getting started", slug: "getting-started" }] },
-        {
-          label: "Examples",
-          items: [
-            { label: "Phylogenetic tree", slug: "examples/tree/phylogenetic-tree" },
-            { label: "Ancestral ranges", slug: "examples/tree/ancestral-ranges" },
-            { label: "World map", slug: "examples/map/world-map" },
-            { label: "GeoJSON features", slug: "examples/map/geojson-features" },
-            { label: "Heatmap", slug: "examples/map/heatmap" },
-          ],
-        },
-        typeDocSidebarGroup,
-        { label: "Contributing", items: [{ label: "Contributing", slug: "contributing" }] },
-      ],
-    }),
-  ],
+  integrations: [starlight({
+    title: "d3gl",
+    customCss: ["./src/styles/global.css"],
+    social: [{ icon: "github", label: "GitHub", href: "https://github.com/mapequation/d3gl" }],
+    plugins: [typeDocPlugin],
+    sidebar: [
+      { label: "Start Here", items: [{ label: "Getting started", slug: "getting-started" }] },
+      {
+        label: "Examples",
+        items: [
+          { label: "Phylogenetic tree", slug: "examples/tree/phylogenetic-tree" },
+          { label: "Ancestral ranges", slug: "examples/tree/ancestral-ranges" },
+          { label: "World map", slug: "examples/map/world-map" },
+          { label: "GeoJSON features", slug: "examples/map/geojson-features" },
+          { label: "Heatmap", slug: "examples/map/heatmap" },
+          { label: "React", slug: "examples/react" },
+        ],
+      },
+      typeDocSidebarGroup,
+      { label: "Contributing", items: [{ label: "Contributing", slug: "contributing" }] },
+    ],
+  }), react()],
   vite: {
     plugins: [tailwindcss()],
     resolve: {
