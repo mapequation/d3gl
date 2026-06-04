@@ -36,9 +36,11 @@ export function mount(el: HTMLElement, opts: ExampleOptions, size: ExampleSize):
   chart.enableZoom([0.5, 40]);
   chart.render();
 
+  let currentBackend = opts.backend;
   return {
     dispose: () => chart.destroy(),
+    setBackend: (b) => { currentBackend = b; chart.setBackend(b); },
     exportImage: () =>
-      opts.backend === "svg" ? { format: "svg", data: chart.toSVG() } : { format: "png", data: chart.toPNG() },
+      currentBackend === "svg" ? { format: "svg", data: chart.toSVG() } : { format: "png", data: chart.toPNG() },
   };
 }

@@ -15,9 +15,11 @@ export function mount(el: HTMLElement, opts: ExampleOptions, size: ExampleSize):
   map.layer("land", [world.land], { fill: LAND, stroke: "#9aa3ad", lineWidth: 0.5 });
   map.enableZoom([1, 50]);
   map.render();
+  let currentBackend = opts.backend;
   return {
     dispose: () => map.destroy(),
+    setBackend: (b) => { currentBackend = b; map.setBackend(b); },
     exportImage: () =>
-      opts.backend === "svg" ? { format: "svg", data: map.toSVG() } : { format: "png", data: map.toPNG() },
+      currentBackend === "svg" ? { format: "svg", data: map.toSVG() } : { format: "png", data: map.toPNG() },
   };
 }

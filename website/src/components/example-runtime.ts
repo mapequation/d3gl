@@ -65,15 +65,18 @@ export async function setupExample(root: HTMLElement): Promise<void> {
     }
   });
 
-  // Backend segmented switch.
+  // Backend segmented switch. Swap in place (preserving zoom/pan via engine.setBackend)
+  // when the example supports it; only fall back to a full remount otherwise.
   const backendGroup = root.querySelector<HTMLElement>("[data-backend-group]");
   backendGroup?.querySelectorAll<HTMLElement>("[data-backend]").forEach((btn) => {
     btn.addEventListener("click", () => {
       if (btn.hasAttribute("data-active")) return;
       setActive(backendGroup, btn);
-      opts.backend = btn.dataset.backend as ExampleOptions["backend"];
+      const next = btn.dataset.backend as ExampleOptions["backend"];
+      opts.backend = next; // keep in sync so a later genuine remount uses the right backend
       refreshExport();
-      remount();
+      if (handle?.setBackend) handle.setBackend(next);
+      else remount();
     });
   });
 

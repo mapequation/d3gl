@@ -10,6 +10,12 @@ export interface ExampleHandle {
   /** Tear down listeners and GPU resources. */
   dispose(): void;
   /**
+   * Switch the rendering backend in place, preserving the current zoom/pan view and
+   * layers (the engine's `setBackend` re-pushes layer specs + transform onto the new
+   * backend). Omit if the example can't swap backend without a full remount.
+   */
+  setBackend?(backend: Backend): void;
+  /**
    * Export the current rendering. The format matches the active backend:
    * "svg" → SVG markup; "webgl"/"canvas" → a PNG data URL.
    */

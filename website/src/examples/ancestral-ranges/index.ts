@@ -201,9 +201,11 @@ export function mount(el: HTMLElement, opts: ExampleOptions, size: ExampleSize):
   // rectangular `base` is identity.
   chart.enableZoom([0.5, 40], (t) => updateLabels(t));
 
+  let currentBackend = opts.backend;
   return {
     dispose: () => { labels.destroy(); labelEl.remove(); chart.destroy(); },
+    setBackend: (b) => { currentBackend = b; chart.setBackend(b); },
     exportImage: () =>
-      opts.backend === "svg" ? { format: "svg", data: chart.toSVG() } : { format: "png", data: chart.toPNG() },
+      currentBackend === "svg" ? { format: "svg", data: chart.toSVG() } : { format: "png", data: chart.toPNG() },
   };
 }
