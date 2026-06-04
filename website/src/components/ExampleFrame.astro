@@ -16,7 +16,7 @@ const tabs = files.map((f) => ({
 <div class="d3gl-example my-6 overflow-hidden rounded-lg border border-[var(--sl-color-gray-5)]" data-example={id} data-controls={JSON.stringify(controls)} data-defaults={JSON.stringify(defaults)}>
   <div class="flex flex-wrap items-center gap-2.5 border-b border-[var(--sl-color-gray-5)] bg-[var(--sl-color-gray-6)] px-2.5 py-2 text-[13px]" data-status-bar></div>
   <div class="flex flex-wrap items-center gap-2.5 border-b border-[var(--sl-color-gray-5)] bg-[var(--sl-color-gray-6)] px-2.5 py-2 text-[13px] empty:hidden" data-controls-row></div>
-  <div class="d3gl-canvas relative max-w-full overflow-auto bg-white" data-canvas style={`width:${width}px;height:${height}px`}></div>
+  <div class="d3gl-canvas relative w-full bg-white" data-canvas data-max-width={width} style={`height:${height}px`}></div>
   <CodeTabs files={tabs} />
 </div>
 <script>

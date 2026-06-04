@@ -3,13 +3,13 @@ import { scaleSequential } from "d3-scale";
 import { interpolateViridis } from "d3-scale-chromatic";
 import { geoMap, type HoverHit } from "@mapequation/d3gl/map";
 import { fitProjection } from "@mapequation/d3gl/geo";
-import type { ExampleHandle, ExampleOptions } from "../types.js";
+import type { ExampleHandle, ExampleOptions, ExampleSize } from "../types.js";
 import { makeCells, cellsToFeatureCollection, loadWorld, type Cell } from "../shared/geo-data.js";
 
-const W = 900, H = 450;
 const heat = scaleSequential(interpolateViridis).domain([0, 1]);
 
-export function mount(el: HTMLElement, opts: ExampleOptions): ExampleHandle {
+export function mount(el: HTMLElement, opts: ExampleOptions, size: ExampleSize): ExampleHandle {
+  const { width: W, height: H } = size;
   const exp = (opts.cells as number) ?? 2;    // grid-size exponent from the slider
   const step = 2 ** exp;                       // degrees: exp 0→1°, 1→2°, 2→4°, 3→8°
   const cells = makeCells(step);

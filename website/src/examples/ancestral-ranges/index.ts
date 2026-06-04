@@ -5,14 +5,12 @@ import { link as d3link, linkRadial, curveLinear, curveStepBefore, curveBumpX, p
 import type { HierarchyPointNode, HierarchyPointLink } from "d3-hierarchy";
 import { plot } from "@mapequation/d3gl/map";
 import { LabelLayer, type LabelAnchor } from "@mapequation/d3gl/labels";
-import type { ExampleHandle, ExampleOptions } from "../types.js";
+import type { ExampleHandle, ExampleOptions, ExampleSize } from "../types.js";
 import type { TreeNode } from "../shared/tree.js";
 import { layoutRectangular, layoutRadial, nodeXY, type LayoutMode } from "../shared/layout.js";
 import { makeMammalTree, assignBioregions, REGION_NAMES } from "../shared/mammals-data.js";
 import { calcMaximumParsimony, aggregateClusters, aggregateSpeciesCount } from "../shared/parsimony.js";
 
-const W = 900, H = 620;
-const CX = W / 2;
 const LINE_MIN = 1, LINE_MAX = 22; // branch-width range when scaling by subtended terminals
 const TIPS = 64; // fixed mammal-tree size (the source's initial tips value)
 
@@ -98,7 +96,9 @@ function labelOffset(mode: LayoutMode, angle: number, gap: number, height: numbe
   return [Math.cos(a) * gap, Math.sin(a) * gap];
 }
 
-export function mount(el: HTMLElement, opts: ExampleOptions): ExampleHandle {
+export function mount(el: HTMLElement, opts: ExampleOptions, size: ExampleSize): ExampleHandle {
+  const { width: W, height: H } = size;
+  const CX = W / 2;
   const layoutMode = (opts.layout as LayoutMode) ?? "rectangular";
   const curve = (opts.curve as CurveMode) ?? "step";
   const sizeMode = (opts.coords as SizeMode) ?? "screen";
@@ -196,9 +196,9 @@ export function mount(el: HTMLElement, opts: ExampleOptions): ExampleHandle {
   updateLabels();
 
   // Scroll to zoom, drag to pan; keep the HTML tip labels aligned with the GPU geometry.
-  // Seed d3-zoom's state with the layout's base transform so the first gesture is seamless
-  // (radial layouts centre the half-circle fan via `base`; rectangular `base` is identity).
-  (el as unknown as { __zoom?: typeof base }).__zoom = base;
+  // `enableZoom` seeds d3-zoom from the chart's current transform (`view`, set above), so the
+  // first gesture is seamless — radial layouts centre the half-circle fan via `base`,
+  // rectangular `base` is identity.
   chart.enableZoom([0.5, 40], (t) => updateLabels(t));
 
   return {

@@ -16,7 +16,12 @@ export interface ExampleHandle {
   exportImage(): { format: "svg" | "png"; data: string };
 }
 
-export type MountFn = (el: HTMLElement, opts: ExampleOptions) => ExampleHandle;
+/** Display size (CSS px) of the canvas container, measured at mount time. The example
+ *  should render at exactly this size (1:1, drawing-buffer == display) so pointer, GPU
+ *  geometry and HTML label overlays all share one coordinate space. */
+export interface ExampleSize { width: number; height: number; }
+
+export type MountFn = (el: HTMLElement, opts: ExampleOptions, size: ExampleSize) => ExampleHandle;
 
 /** Declares one example-specific control rendered in the shared control bar. */
 export type ControlSpec =

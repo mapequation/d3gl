@@ -28,10 +28,20 @@ export async function setupExample(root: HTMLElement): Promise<void> {
   Object.assign(opts, defaults);
 
   let handle: ExampleHandle | null = null;
+  let lastWidth = 0;
+  // Render at the container's actual display size so the drawing buffer, pointer space and
+  // any HTML label overlay all coincide (1:1) — this is what keeps zoom-to-cursor centred.
+  const measure = (): { width: number; height: number } => {
+    const rect = canvas.getBoundingClientRect();
+    return { width: Math.round(rect.width), height: Math.round(rect.height) };
+  };
   const remount = (): void => {
+    const size = measure();
+    if (size.width === 0 || size.height === 0) return; // not laid out yet; ResizeObserver retries
+    lastWidth = size.width;
     handle?.dispose();
     canvas.innerHTML = "";
-    handle = mount(canvas, { ...opts });
+    handle = mount(canvas, { ...opts }, size);
   };
 
   // Status bar (top line): backend switch (left), export button, then perf (far right).
@@ -73,4 +83,15 @@ export async function setupExample(root: HTMLElement): Promise<void> {
   }
 
   remount();
+
+  // Re-render at the new size when the column width changes (responsive / layout settle).
+  // Debounced; ignores height-only changes and sub-pixel jitter.
+  let resizeTimer: ReturnType<typeof setTimeout> | undefined;
+  const ro = new ResizeObserver(() => {
+    const { width } = measure();
+    if (width === 0 || Math.abs(width - lastWidth) < 2) return;
+    clearTimeout(resizeTimer);
+    resizeTimer = setTimeout(remount, 150);
+  });
+  ro.observe(canvas);
 }

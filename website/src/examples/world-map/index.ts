@@ -1,13 +1,13 @@
 import { geoNaturalEarth1 } from "d3-geo";
 import { geoMap } from "@mapequation/d3gl/map";
 import { fitProjection } from "@mapequation/d3gl/geo";
-import type { ExampleHandle, ExampleOptions } from "../types.js";
+import type { ExampleHandle, ExampleOptions, ExampleSize } from "../types.js";
 import { loadWorld } from "../shared/geo-data.js";
 
-const W = 900, H = 450;
 const OCEAN = "#d4e6f5", LAND = "#e3e6ea";
 
-export function mount(el: HTMLElement, opts: ExampleOptions): ExampleHandle {
+export function mount(el: HTMLElement, opts: ExampleOptions, size: ExampleSize): ExampleHandle {
+  const { width: W, height: H } = size;
   const world = loadWorld();
   const projection = fitProjection(geoNaturalEarth1(), { type: "Sphere" }, W, H);
   const map = geoMap(el, { width: W, height: H, projection, backend: opts.backend });

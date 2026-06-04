@@ -2,15 +2,15 @@ import { schemeCategory10 } from "d3-scale-chromatic";
 import { link as d3link, curveStepBefore } from "d3-shape";
 import type { HierarchyPointNode, HierarchyPointLink } from "d3-hierarchy";
 import { plot } from "@mapequation/d3gl/map";
-import type { ExampleHandle, ExampleOptions } from "../types.js";
+import type { ExampleHandle, ExampleOptions, ExampleSize } from "../types.js";
 import { makeTree, type TreeNode } from "../shared/tree.js";
 import { layoutRectangular, nodeXY } from "../shared/layout.js";
 
-const W = 900, H = 560;
 type PNode = HierarchyPointNode<TreeNode>;
 type PLink = HierarchyPointLink<TreeNode>;
 
-export function mount(el: HTMLElement, opts: ExampleOptions): ExampleHandle {
+export function mount(el: HTMLElement, opts: ExampleOptions, size: ExampleSize): ExampleHandle {
+  const { width: W, height: H } = size;
   const sizeMode = (opts.coords as "world" | "screen") ?? "world";
   const root = layoutRectangular(makeTree(64), W, H, "linear");
   const links = root.links();
