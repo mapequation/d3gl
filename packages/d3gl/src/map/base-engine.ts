@@ -14,6 +14,9 @@ interface LayerSpec {
   stroke?: Accessor<any, string>;
   clipTo?: string;
   sizeMode?: "world" | "screen";
+  /** When true, this layer is dropped from the render during an active rotation
+   *  drag (and not re-projected per frame); it re-projects + reappears on release. */
+  hideOnRotation?: boolean;
   /** Screen-space declutter radius (px). When set, on each transform the engine hides
    *  anchored glyphs whose projected anchor falls within this radius of an already-kept one
    *  (grouped by anchor, earlier drawables win) — constant-size markers stop overlapping. */
@@ -31,6 +34,11 @@ export abstract class BaseEngine {
   private hoverCb: ((hit: HoverHit | null, ev: PointerEvent) => void) | null = null;
   private swapToken = 0;
   private destroyed = false;
+  /** True while a rotation drag is in progress (set by enableRotation). Layers
+   *  flagged hideOnRotation are excluded from the render while this is true. */
+  protected rotating = false;
+  /** Detaches the currently-attached interaction (zoom or rotation), if any. */
+  private interactionCleanup: (() => void) | null = null;
 
   constructor(protected host: HTMLElement, protected width: number, protected height: number, backend: BackendType) {
     this.ready = this.swapBackend(backend);
@@ -41,7 +49,9 @@ export abstract class BaseEngine {
   protected registerLayer(spec: LayerSpec): void {
     this.scene.group(spec.name, spec.build);
     this.applyAccessors(spec);
-    this.specs = this.specs.filter((s) => s.name !== spec.name).concat(spec);
+    const at = this.specs.findIndex((s) => s.name === spec.name);
+    if (at >= 0) this.specs[at] = spec;
+    else this.specs.push(spec);
     this.hitIndexes.set(spec.name, new HitIndex(this.scene.drawables(spec.name)));
     this.pushLayers();
   }
@@ -62,6 +72,17 @@ export abstract class BaseEngine {
     return this;
   }
   setBackend(type: BackendType): this { this.ready = this.swapBackend(type); return this; }
+  /** Detach the current pan/zoom or rotation interaction (no-op if none). */
+  disableInteraction(): this {
+    this.interactionCleanup?.();
+    this.interactionCleanup = null;
+    return this;
+  }
+  /** Subclasses (GeoMap.enableRotation) register their interaction teardown here.
+   *  Call disableInteraction() first if replacing an existing interaction. */
+  protected setInteractionCleanup(fn: () => void): void {
+    this.interactionCleanup = fn;
+  }
   setTransform(t: ViewTransform): this {
     this.transform = t;
     this.handle?.backend.setTransform(t);
@@ -117,6 +138,7 @@ export abstract class BaseEngine {
    * HTML overlay (e.g. a `LabelLayer`) aligned with the GPU geometry as the view changes.
    */
   enableZoom(extent: [number, number] = [1, 100], onTransform?: (t: ViewTransform) => void): this {
+    this.disableInteraction();
     const sel = select(this.host as Element);
     const behavior = d3zoom<Element, unknown>().scaleExtent(extent).on("zoom", (e: D3ZoomEvent<Element, unknown>) => {
       const t: ViewTransform = { k: e.transform.k, x: e.transform.x, y: e.transform.y };
@@ -129,6 +151,7 @@ export abstract class BaseEngine {
     // zoom-to-cursor deltas measure from it rather than from identity.
     const t = this.transform;
     (sel as any).call(behavior.transform, zoomIdentity.translate(t.x, t.y).scale(t.k));
+    this.interactionCleanup = () => { (sel as any).on(".zoom", null); };
     return this;
   }
   on(event: "hover", cb: (hit: HoverHit | null, ev: PointerEvent) => void): this {
@@ -190,8 +213,12 @@ export abstract class BaseEngine {
   private renderLayer(spec: LayerSpec): RenderLayer {
     return { name: spec.name, buffers: this.scene.buffers(spec.name), drawables: this.scene.drawables(spec.name), clipTo: spec.clipTo, sizeMode: spec.sizeMode };
   }
+  /** Specs to actually render: hidden-on-rotation layers drop out mid-drag. */
+  private renderSpecs(): LayerSpec[] {
+    return this.specs.filter((s) => !(this.rotating && s.hideOnRotation));
+  }
   private pushLayers(): void {
-    this.handle?.backend.setLayers(this.specs.map((s) => this.renderLayer(s)));
+    this.handle?.backend.setLayers(this.renderSpecs().map((s) => this.renderLayer(s)));
     this.handle?.backend.setTransform(this.transform);
     this.render();
   }
@@ -205,7 +232,7 @@ export abstract class BaseEngine {
     old?.backend.destroy();
     if (old && old.element !== this.host) old.element.remove();
     this.handle = next;
-    next.backend.setLayers(this.specs.map((s) => this.renderLayer(s)));
+    next.backend.setLayers(this.renderSpecs().map((s) => this.renderLayer(s)));
     next.backend.setTransform(this.transform);
     next.backend.render();
   }
