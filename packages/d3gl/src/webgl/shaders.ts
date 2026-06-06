@@ -115,7 +115,7 @@ void main() {
   vec2 px = u_center + vec2(r.x, -r.y) * u_scale;
   vec2 clip = vec2(px.x / u_viewport.x * 2.0 - 1.0, 1.0 - px.y / u_viewport.y * 2.0);
   gl_Position = vec4(clip, 0.0, 1.0);
-  v_uv = vec2(a_lonLat.x / 360.0 + 0.5, 0.5 - a_lonLat.y / 180.0);
+  v_uv = vec2(a_lonLat.x / 360.0 + 0.5, 0.5 + a_lonLat.y / 180.0);
 }`;
 
 export const GLOBE_FS = `#version 300 es

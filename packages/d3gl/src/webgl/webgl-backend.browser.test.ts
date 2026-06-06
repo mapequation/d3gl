@@ -102,4 +102,22 @@ describe("WebGLBackend", () => {
     backend.setGlobeMode(false);                // back to flat path, no throw
     backend.destroy();
   });
+
+  it("globe is not vertically flipped: north content renders at the top of the disc", async () => {
+    const canvas = document.createElement("canvas"); canvas.width = 128; canvas.height = 128;
+    document.body.appendChild(canvas);
+    const backend = await WebGLBackend.create(canvas, { width: 128, height: 128 });
+    // Texture 256x128: top half (north) red, bottom half (south) blue.
+    const north = rectLayer("north", 0, 0, 256, 64, "rgb(255,0,0)");
+    const south = rectLayer("south", 0, 64, 256, 64, "rgb(0,0,255)");
+    backend.setLayers([north, south]);
+    backend.setTransform({ k: 1, x: 0, y: 0 });
+    backend.setGlobeMode(true, 256, 128);
+    // At identity rotation the north pole projects to the top of the disc.
+    const top = backend.readScreenPixel(64, 24);     // upper part of the disc
+    const bottom = backend.readScreenPixel(64, 104);  // lower part of the disc
+    expect(top[0]).toBeGreaterThan(top[2]);     // top is red-dominant (north)
+    expect(bottom[2]).toBeGreaterThan(bottom[0]); // bottom is blue-dominant (south)
+    backend.destroy();
+  });
 });

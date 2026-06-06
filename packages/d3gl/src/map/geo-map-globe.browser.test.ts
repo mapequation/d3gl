@@ -183,4 +183,48 @@ describe("geoMap projections + rotation", () => {
     expect((flat as any).projection.scale()).toBe(fs0); // affine path leaves projection.scale unchanged
     flat.destroy();
   });
+
+  it("enableZoom on an unready webgl globe does not throw (backend resolves later)", async () => {
+    const host = mount();
+    const map = geoMap(host, { width: 200, height: 200, projection: geoOrthographic().fitSize([200,200], sphere), backend: "webgl" });
+    map.layer("land", [land()], { fill: "rgb(0,128,0)" });
+    expect(() => map.enableZoom([0.5, 8])).not.toThrow(); // called before whenReady()
+    await map.whenReady();
+    await Promise.resolve(); // let the deferred init microtask run
+    expect((map as any).gpuGlobe).toBe(true);
+    map.destroy();
+  });
+
+  it("switching from the GPU globe to a flat projection tears down globe mode", async () => {
+    const host = mount();
+    const map = geoMap(host, { width: 200, height: 200, projection: geoOrthographic().fitSize([200,200], sphere), backend: "webgl" });
+    await map.whenReady();
+    map.layer("land", [land()], { fill: "rgb(0,128,0)" });
+    map.enableZoom([0.5, 8]);
+    await Promise.resolve();
+    expect((map as any).gpuGlobe).toBe(true);
+    map.setProjection(geoMercator().fitSize([200,200], sphere));
+    expect((map as any).gpuGlobe).toBe(false); // flat now → affine path, no throw
+    map.destroy();
+  });
+
+  it("switching backend off webgl keeps the spherical projection rotating on the CPU", async () => {
+    const host = mount();
+    const map = geoMap(host, { width: 200, height: 200, projection: geoOrthographic().fitSize([200,200], sphere), backend: "webgl" });
+    await map.whenReady();
+    map.layer("land", [land()], { fill: "rgb(0,128,0)" });
+    map.enableZoom([0.5, 8]);
+    await Promise.resolve();
+    expect((map as any).gpuGlobe).toBe(true);
+    map.setBackend("canvas");
+    await map.whenReady();
+    expect((map as any).gpuGlobe).toBe(false); // canvas → CPU rotation re-established
+    // A drag now rotates via the CPU path (projection.rotate changes), no throw.
+    const r = host.getBoundingClientRect();
+    host.dispatchEvent(new PointerEvent("pointerdown", { clientX: r.left+100, clientY: r.top+100, bubbles: true }));
+    host.dispatchEvent(new PointerEvent("pointermove", { clientX: r.left+140, clientY: r.top+108, bubbles: true }));
+    host.dispatchEvent(new PointerEvent("pointerup", { clientX: r.left+140, clientY: r.top+108, bubbles: true }));
+    expect((map as any).projection.rotate()[0]).not.toBe(0);
+    map.destroy();
+  });
 });

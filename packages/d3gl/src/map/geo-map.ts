@@ -44,6 +44,15 @@ export class GeoMap extends BaseEngine {
   private gpuGlobe = false;
   /** While baking, layers are projected with THIS (equirect) instead of this.projection. */
   private bakeProjection: GeoProjection | null = null;
+  /** The last requested interaction, so it can be re-applied (re-dispatched CPU vs GPU)
+   *  after a projection or backend switch. */
+  private interactionRequest: { extent: [number, number]; onTransform?: (t: ViewTransform) => void } | null = null;
+
+  /** Null-safe accessor for the WebGL globe backend (null before the async backend resolves). */
+  private globeBackend(): Partial<GlobeBackend> | null {
+    const b = this.backend();
+    return b ? (b as Partial<GlobeBackend>) : null;
+  }
 
   constructor(host: HTMLElement, opts: GeoMapOptions) {
     super(host, opts.width, opts.height, opts.backend ?? "webgl");
@@ -65,16 +74,22 @@ export class GeoMap extends BaseEngine {
   /** Swap the projection on the existing map: re-project every layer once and
    *  reset the affine view to identity (the caller fits the new projection). */
   setProjection(projection: GeoProjection): this {
+    this.disableInteraction();          // leave any active globe/zoom cleanly
     this.projection = projection;
     this.evalGpuGlobe();
     this.rebuildLayers();
     this.setTransform({ k: 1, x: 0, y: 0 });
+    const req = this.interactionRequest;
+    if (req) this.enableZoom(req.extent, req.onTransform); // re-dispatch for the new projection
     return this;
   }
 
   override setBackend(type: BackendType): this {
+    this.disableInteraction();
     super.setBackend(type);
     this.evalGpuGlobe();
+    const req = this.interactionRequest;
+    if (req) this.enableZoom(req.extent, req.onTransform);
     return this;
   }
 
@@ -82,6 +97,7 @@ export class GeoMap extends BaseEngine {
    *  gets versor rotation (drag) + wheel-zoom bounded by `extent`; a flat projection
    *  gets d3-zoom affine pan/zoom. `extent` sets the zoom limits for both. */
   override enableZoom(extent: [number, number] = [1, 100], onTransform?: (t: ViewTransform) => void): this {
+    this.interactionRequest = { extent, onTransform };
     if (this.isSpherical()) return this.enableRotation({ scaleExtent: extent });
     return super.enableZoom(extent, onTransform);
   }
@@ -121,7 +137,7 @@ export class GeoMap extends BaseEngine {
       q0 = versor(r0);
       active = true;
       this.setInteracting(true);
-      host.setPointerCapture?.(e.pointerId);
+      try { host.setPointerCapture?.(e.pointerId); } catch { /* synthetic event: no active pointer */ }
     };
     const move = (e: PointerEvent): void => {
       if (!active || !v0 || !q0) return;
@@ -139,7 +155,7 @@ export class GeoMap extends BaseEngine {
       // Clear the flag directly (no extra push) so the rebuild below re-projects and
       // re-pushes every layer — including the hidden ones — at the final rotation.
       this.interacting = false;
-      host.releasePointerCapture?.(e.pointerId);
+      try { host.releasePointerCapture?.(e.pointerId); } catch { /* synthetic event: no active pointer */ }
       this.rebuildLayers(); // re-project all (incl. hidden) at the final rotation
     };
     const wheel = (e: WheelEvent): void => {
@@ -185,17 +201,16 @@ export class GeoMap extends BaseEngine {
     let texW = BASE_W, texH = BASE_H;
     let viewScale = 1;
     let rebakeTimer: ReturnType<typeof setTimeout> | null = null;
-
-    const gb = this.backend() as Partial<GlobeBackend>;
-    // No globe-capable backend (shouldn't happen given gpuGlobe gate) — fall through
-    // to leave the map static rather than throw.
-    if (!gb.setGlobeMode || !gb.setGlobeRotation) return this;
+    // The backend may not have resolved yet (enableZoom can be called synchronously
+    // right after geoMap(...)); defer backend-dependent init via whenReady(). Cancelled
+    // if the interaction is torn down before the backend is ready.
+    let cancelled = false;
 
     const applyBake = (): void => {
       this.bakeProjection = geoEquirectangular().fitSize([texW, texH], { type: "Sphere" });
       this.rebuildLayers(); // re-register every layer via buildSpec → now equirect
       this.bakeProjection = null; // back to orthographic state for future CPU use / cleanup
-      (this.backend() as Partial<GlobeBackend>).setGlobeMode?.(true, texW, texH);
+      this.globeBackend()?.setGlobeMode?.(true, texW, texH);
     };
 
     // --- versor trackball (same math as the CPU path; only the per-frame effect differs) ---
@@ -223,7 +238,7 @@ export class GeoMap extends BaseEngine {
       const q1 = versor.multiply(q0, versor.delta(v0, versor.cartesian(inv)));
       const rot = versor.rotation(q1);
       this.projection.rotate(rot); // keep rotation as state; the GPU sphere shows it
-      (this.backend() as Partial<GlobeBackend>).setGlobeRotation?.(rotationMatrix(rot));
+      this.globeBackend()?.setGlobeRotation?.(rotationMatrix(rot));
       opts.onRotate?.(rot);
     };
     const up = (e: PointerEvent): void => {
@@ -254,21 +269,25 @@ export class GeoMap extends BaseEngine {
     host.addEventListener("pointercancel", up);
     host.addEventListener("wheel", wheel, { passive: false });
     this.setInteractionCleanup(() => {
+      cancelled = true;
       host.removeEventListener("pointerdown", down);
       host.removeEventListener("pointermove", move);
       host.removeEventListener("pointerup", up);
       host.removeEventListener("pointercancel", up);
       host.removeEventListener("wheel", wheel);
       if (rebakeTimer) clearTimeout(rebakeTimer);
-      (this.backend() as Partial<GlobeBackend>).setGlobeMode?.(false);
+      this.globeBackend()?.setGlobeMode?.(false);
       this.bakeProjection = null;
       this.rebuildLayers(); // restore normal orthographic geometry
       this.setTransform({ k: 1, x: 0, y: 0 });
     });
 
-    applyBake();
-    gb.setGlobeRotation?.(rotationMatrix(this.projection.rotate()));
-    this.render();
+    void this.whenReady().then(() => {
+      if (cancelled) return;
+      applyBake();
+      this.globeBackend()?.setGlobeRotation?.(rotationMatrix(this.projection.rotate()));
+      this.render();
+    });
     return this;
   }
 
