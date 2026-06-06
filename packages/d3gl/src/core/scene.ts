@@ -112,13 +112,27 @@ export class Scene {
   /** Build (or rebuild) a named group. The callback registers drawables. */
   group(name: string, build: (g: GroupBuilder) => void): void {
     const data = new GroupData(this.tolerance);
-    const builder: GroupBuilder = {
+    build(this.builderFor(data));
+    this.groups.set(name, data);
+  }
+
+  /** Append more drawables to an existing group (vs group(), which replaces it).
+   *  Drawable ids continue after the current ones; a duplicate id throws. */
+  appendToGroup(name: string, build: (g: GroupBuilder) => void): void {
+    build(this.builderFor(this.get(name)));
+  }
+
+  /** Number of drawables currently registered in a group. */
+  drawableCount(name: string): number {
+    return this.get(name).ranges.length;
+  }
+
+  private builderFor(data: GroupData): GroupBuilder {
+    return {
       drawable: (id, draw, opts) => this.addDrawable(data, id, draw, opts),
       point: (id, x, y, radius) => this.addCircleDrawable(data, id, [[x, y]], radius),
       points: (id, centers, radius) => this.addCircleDrawable(data, id, centers, radius),
     };
-    build(builder);
-    this.groups.set(name, data);
   }
 
   private addDrawable(
@@ -127,6 +141,7 @@ export class Scene {
     draw: (ctx: PathRecorder) => void,
     opts?: DrawableOpts,
   ): void {
+    if (data.idToDrawable.has(String(id))) throw new Error(`duplicate drawable id: ${String(id)}`);
     const recorder = new PathRecorder(data.tolerance);
     draw(recorder);
     const subpaths = recorder.subpaths;
@@ -207,6 +222,7 @@ export class Scene {
     centers: readonly [number, number][],
     r: number,
   ): void {
+    if (data.idToDrawable.has(String(id))) throw new Error(`duplicate drawable id: ${String(id)}`);
     const drawableId = data.ranges.length;
     data.idToDrawable.set(String(id), drawableId);
     data.subpaths.push([]);
