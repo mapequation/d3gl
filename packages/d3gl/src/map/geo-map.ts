@@ -1,5 +1,6 @@
-import { type GeoProjection } from "d3-geo";
+import { type GeoProjection, geoEquirectangular } from "d3-geo";
 import { geoLayer } from "../geo/index.js";
+import { isOrthographic, rotationMatrix } from "../geo/orthographic.js";
 import versor, { type Angles, type Vec3, type Quaternion } from "../geo/versor.js";
 import { BaseEngine, type HoverHit, type LayerSpec } from "./base-engine.js";
 import type { BackendType } from "./backend-factory.js";
@@ -29,13 +30,29 @@ export interface RotationOptions {
 
 interface LayerDef { name: string; list: any[]; opts: LayerOptions; }
 
+/** WebGL-only globe methods, feature-detected at runtime (other backends lack them). */
+type GlobeBackend = {
+  setGlobeMode(on: boolean, w?: number, h?: number): void;
+  setGlobeRotation(m: Float32Array): void;
+};
+
 export class GeoMap extends BaseEngine {
   private projection: GeoProjection;
   private defs: LayerDef[] = [];
+  /** True when the backend is WebGL and the projection is orthographic: rotation is
+   *  driven on the GPU (bake layers to an equirect texture, spin a textured sphere). */
+  private gpuGlobe = false;
+  /** While baking, layers are projected with THIS (equirect) instead of this.projection. */
+  private bakeProjection: GeoProjection | null = null;
 
   constructor(host: HTMLElement, opts: GeoMapOptions) {
     super(host, opts.width, opts.height, opts.backend ?? "webgl");
     this.projection = opts.projection;
+    this.evalGpuGlobe();
+  }
+
+  private evalGpuGlobe(): void {
+    this.gpuGlobe = this.backendType() === "webgl" && isOrthographic(this.projection);
   }
 
   layer<F>(name: string, features: F | readonly F[], opts: LayerOptions<F> = {}): this {
@@ -49,8 +66,15 @@ export class GeoMap extends BaseEngine {
    *  reset the affine view to identity (the caller fits the new projection). */
   setProjection(projection: GeoProjection): this {
     this.projection = projection;
+    this.evalGpuGlobe();
     this.rebuildLayers();
     this.setTransform({ k: 1, x: 0, y: 0 });
+    return this;
+  }
+
+  override setBackend(type: BackendType): this {
+    super.setBackend(type);
+    this.evalGpuGlobe();
     return this;
   }
 
@@ -73,6 +97,7 @@ export class GeoMap extends BaseEngine {
    *  on the CPU per frame. Layers flagged hideOnInteraction are hidden mid-drag. */
   enableRotation(opts: RotationOptions = {}): this {
     this.disableInteraction();
+    if (this.gpuGlobe) return this.enableGpuGlobe(opts);
     const host = this.host;
     const [minK, maxK] = opts.scaleExtent ?? [0.5, 8];
     const scale0 = this.projection.scale();
@@ -147,6 +172,106 @@ export class GeoMap extends BaseEngine {
     return this;
   }
 
+  /** GPU globe path: bake every layer once into an equirect texture, then drive the
+   *  textured sphere's rotation uniform on drag (no per-frame re-tessellation). Wheel
+   *  zoom scales the sphere via the view transform and re-bakes at higher resolution
+   *  only when crossing a power-of-2 boundary. */
+  private enableGpuGlobe(opts: RotationOptions): this {
+    const host = this.host;
+    const [minK, maxK] = opts.scaleExtent ?? [0.5, 8];
+    const BASE_W = 2048, BASE_H = 1024;
+    const maxLevel = (() => { let l = 0; while (BASE_W << (l + 1) <= 8192) l++; return l; })();
+    let level = 0;
+    let texW = BASE_W, texH = BASE_H;
+    let viewScale = 1;
+    let rebakeTimer: ReturnType<typeof setTimeout> | null = null;
+
+    const gb = this.backend() as Partial<GlobeBackend>;
+    // No globe-capable backend (shouldn't happen given gpuGlobe gate) — fall through
+    // to leave the map static rather than throw.
+    if (!gb.setGlobeMode || !gb.setGlobeRotation) return this;
+
+    const applyBake = (): void => {
+      this.bakeProjection = geoEquirectangular().fitSize([texW, texH], { type: "Sphere" });
+      this.rebuildLayers(); // re-register every layer via buildSpec → now equirect
+      this.bakeProjection = null; // back to orthographic state for future CPU use / cleanup
+      (this.backend() as Partial<GlobeBackend>).setGlobeMode?.(true, texW, texH);
+    };
+
+    // --- versor trackball (same math as the CPU path; only the per-frame effect differs) ---
+    let v0: Vec3 | null = null;
+    let q0: Quaternion | null = null;
+    let r0: Angles = [0, 0, 0];
+    let active = false;
+    const at = (e: PointerEvent): [number, number] => {
+      const r = host.getBoundingClientRect();
+      return [e.clientX - r.left, e.clientY - r.top];
+    };
+    const down = (e: PointerEvent): void => {
+      const inv = this.projection.invert?.(at(e));
+      if (!inv) return;
+      v0 = versor.cartesian(inv);
+      r0 = this.projection.rotate();
+      q0 = versor(r0);
+      active = true;
+      try { host.setPointerCapture?.(e.pointerId); } catch { /* synthetic event: no active pointer */ }
+    };
+    const move = (e: PointerEvent): void => {
+      if (!active || !v0 || !q0) return;
+      const inv = this.projection.rotate(r0).invert?.(at(e));
+      if (!inv) return;
+      const q1 = versor.multiply(q0, versor.delta(v0, versor.cartesian(inv)));
+      const rot = versor.rotation(q1);
+      this.projection.rotate(rot); // keep rotation as state; the GPU sphere shows it
+      (this.backend() as Partial<GlobeBackend>).setGlobeRotation?.(rotationMatrix(rot));
+      opts.onRotate?.(rot);
+    };
+    const up = (e: PointerEvent): void => {
+      if (!active) return;
+      active = false;
+      try { host.releasePointerCapture?.(e.pointerId); } catch { /* synthetic event: no active pointer */ }
+    };
+    const wheel = (e: WheelEvent): void => {
+      e.preventDefault();
+      viewScale = Math.max(minK, Math.min(maxK, viewScale * Math.exp(-e.deltaY * 0.001)));
+      this.setTransform({ k: viewScale, x: 0, y: 0 }); // globe draw scales the sphere by k
+      const newLevel = Math.max(0, Math.min(maxLevel, Math.floor(Math.log2(viewScale))));
+      if (newLevel !== level) {
+        if (rebakeTimer) clearTimeout(rebakeTimer);
+        rebakeTimer = setTimeout(() => {
+          rebakeTimer = null;
+          level = newLevel;
+          texW = BASE_W << level; texH = BASE_H << level;
+          applyBake();
+          this.render();
+        }, 200);
+      }
+    };
+
+    host.addEventListener("pointerdown", down);
+    host.addEventListener("pointermove", move);
+    host.addEventListener("pointerup", up);
+    host.addEventListener("pointercancel", up);
+    host.addEventListener("wheel", wheel, { passive: false });
+    this.setInteractionCleanup(() => {
+      host.removeEventListener("pointerdown", down);
+      host.removeEventListener("pointermove", move);
+      host.removeEventListener("pointerup", up);
+      host.removeEventListener("pointercancel", up);
+      host.removeEventListener("wheel", wheel);
+      if (rebakeTimer) clearTimeout(rebakeTimer);
+      (this.backend() as Partial<GlobeBackend>).setGlobeMode?.(false);
+      this.bakeProjection = null;
+      this.rebuildLayers(); // restore normal orthographic geometry
+      this.setTransform({ k: 1, x: 0, y: 0 });
+    });
+
+    applyBake();
+    gb.setGlobeRotation?.(rotationMatrix(this.projection.rotate()));
+    this.render();
+    return this;
+  }
+
   /** Re-register layers against the current projection (re-project once). During a
    *  rotation drag, skipHidden avoids re-projecting hideOnInteraction layers. */
   private rebuildLayers(o: { skipHidden?: boolean } = {}): void {
@@ -161,7 +286,7 @@ export class GeoMap extends BaseEngine {
     return {
       name, data: list, ids, fill: opts.fill, stroke: opts.stroke, clipTo: opts.clipTo,
       sizeMode: opts.sizeMode, hideOnInteraction: opts.hideOnInteraction,
-      build: geoLayer(list, this.projection, { id: (_f, i) => ids[i]!, lineWidth: opts.lineWidth, pointRadius: opts.pointRadius, sizeMode: opts.sizeMode }),
+      build: geoLayer(list, this.bakeProjection ?? this.projection, { id: (_f, i) => ids[i]!, lineWidth: opts.lineWidth, pointRadius: opts.pointRadius, sizeMode: opts.sizeMode }),
     };
   }
 }

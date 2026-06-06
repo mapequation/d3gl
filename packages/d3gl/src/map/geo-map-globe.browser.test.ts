@@ -135,6 +135,30 @@ describe("geoMap projections + rotation", () => {
     map.destroy();
   });
 
+  it("uses the GPU globe path on webgl + orthographic, CPU otherwise", async () => {
+    const host = mount();
+    const gpu = geoMap(host, { width: 200, height: 200, projection: geoOrthographic().fitSize([200, 200], sphere), backend: "webgl" });
+    await gpu.whenReady();
+    gpu.layer("land", [land()], { fill: "rgb(0,128,0)" });
+    gpu.enableZoom([0.5, 8]);
+    expect((gpu as any).gpuGlobe).toBe(true);
+    // A drag updates projection.rotate() but must NOT throw and must not depend on CPU rebuild.
+    const r = host.getBoundingClientRect();
+    host.dispatchEvent(new PointerEvent("pointerdown", { clientX: r.left + 100, clientY: r.top + 100, bubbles: true }));
+    host.dispatchEvent(new PointerEvent("pointermove", { clientX: r.left + 140, clientY: r.top + 110, bubbles: true }));
+    host.dispatchEvent(new PointerEvent("pointerup", { clientX: r.left + 140, clientY: r.top + 110, bubbles: true }));
+    expect((gpu as any).projection.rotate()[0]).not.toBe(0); // rotated
+    gpu.destroy();
+
+    const host2 = mount();
+    const cpu = geoMap(host2, { width: 200, height: 200, projection: geoOrthographic().fitSize([200, 200], sphere), backend: "canvas" });
+    await cpu.whenReady();
+    cpu.layer("land", [land()], { fill: "rgb(0,128,0)" });
+    cpu.enableZoom([0.5, 8]);
+    expect((cpu as any).gpuGlobe).toBe(false); // canvas → CPU path
+    cpu.destroy();
+  });
+
   it("enableZoom dispatches: rotation for spherical, affine zoom for flat", async () => {
     // Spherical (orthographic): enableZoom attaches the rotation wheel handler
     // (wheel changes projection.scale), not d3-zoom.

@@ -1,6 +1,6 @@
 import { select } from "d3-selection";
 import { zoom as d3zoom, zoomIdentity, type D3ZoomEvent } from "d3-zoom";
-import { Scene, HitIndex, type GroupBuilder, type RenderLayer, type ViewTransform } from "../core/index.js";
+import { Scene, HitIndex, type Backend, type GroupBuilder, type RenderLayer, type ViewTransform } from "../core/index.js";
 import { createBackend, type BackendType, type BackendHandle } from "./backend-factory.js";
 
 export type Accessor<D, T> = T | ((d: D, i: number) => T);
@@ -32,6 +32,7 @@ export abstract class BaseEngine {
   protected transform: ViewTransform = { k: 1, x: 0, y: 0 };
   protected handle: BackendHandle | null = null;
   protected ready: Promise<void>;
+  private currentBackend: BackendType;
   private hoverCb: ((hit: HoverHit | null, ev: PointerEvent) => void) | null = null;
   private swapToken = 0;
   private destroyed = false;
@@ -42,9 +43,14 @@ export abstract class BaseEngine {
   private interactionCleanup: (() => void) | null = null;
 
   constructor(protected host: HTMLElement, protected width: number, protected height: number, backend: BackendType) {
+    this.currentBackend = backend;
     this.ready = this.swapBackend(backend);
   }
   whenReady(): Promise<void> { return this.ready; }
+  /** The currently-active backend type (set by the constructor / swapBackend). */
+  protected backendType(): BackendType { return this.currentBackend; }
+  /** The live backend instance, or null before the first swap resolves. */
+  protected backend(): Backend | null { return this.handle?.backend ?? null; }
 
   /** Register/replace a layer: build its Scene group, apply accessors, index, push. */
   protected registerLayer(spec: LayerSpec): void {
@@ -250,6 +256,7 @@ export abstract class BaseEngine {
     this.render();
   }
   private async swapBackend(type: BackendType): Promise<void> {
+    this.currentBackend = type;
     const token = ++this.swapToken;
     const old = this.handle;
     const next = await createBackend(type, this.host, this.width, this.height);
