@@ -73,10 +73,13 @@ export abstract class BaseEngine {
    * other) so a duplicate throws before any mutation — the append is atomic. The
    * Scene-level dup guard remains as a backstop.
    */
-  protected appendToLayer(name: string, items: readonly any[], ids: (string | number)[], build: (g: GroupBuilder) => void): void {
+  protected appendToLayer(name: string, items: readonly any[], ids: readonly (string | number)[], build: (g: GroupBuilder) => void): void {
     const spec = this.specs.find((s) => s.name === name);
     if (!spec) throw new Error(`unknown layer: ${name}`);
     if (items.length === 0) return;
+    // ids and items must stay parallel — a mismatch would desync spec.data/spec.ids
+    // (which applyAccessors and pick index in lockstep).
+    if (ids.length !== items.length) throw new Error(`appendToLayer: ids.length (${ids.length}) !== items.length (${items.length})`);
     const existing = new Set(spec.ids.map(String));
     const seen = new Set<string>();
     for (const id of ids) {
