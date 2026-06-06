@@ -21,3 +21,4 @@ export { geoMap, GeoMap } from "./geo-map.js";
 export type { GeoMapOptions, LayerOptions, HoverHit } from "./geo-map.js";
 export { plot, Plot } from "./plot.js";
 export type { PlotOptions, PlotLayerOptions, PlotPointOptions } from "./plot.js";
+export { LayerHandle } from "./layer-handle.js";
