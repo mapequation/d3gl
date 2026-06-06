@@ -26,6 +26,14 @@ export interface RenderLayer {
 export interface Backend {
   setLayers(layers: RenderLayer[]): void;
   updateLayer(name: string, layer: RenderLayer): void;
+  /**
+   * Append-only fast path (optional). Same observable result as
+   * `updateLayer(name, layer)`, but a backend MAY upload only the tail of each
+   * buffer — the drawables/vertices added at or after `addedFrom` (the drawable
+   * index where the appended range begins). Backends that don't implement this are
+   * driven via `updateLayer` (full re-upload). No backend implements it yet.
+   */
+  appendToLayer?(name: string, layer: RenderLayer, addedFrom: number): void;
   setTransform(t: ViewTransform): void;
   render(): void;
   toPNG(): string;

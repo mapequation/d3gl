@@ -63,6 +63,43 @@ export abstract class BaseEngine {
     this.pushLayers();
   }
 
+  /**
+   * Append items to an already-registered layer: build only the new drawables,
+   * extend the spec's data/ids, color the new range, grow the hit index, and
+   * re-push just this layer. `ids` are caller-resolved (continuing the index or
+   * honoring the layer's id accessor).
+   *
+   * Validates all new ids up-front (against the layer's existing ids and each
+   * other) so a duplicate throws before any mutation — the append is atomic. The
+   * Scene-level dup guard remains as a backstop.
+   */
+  protected appendToLayer(name: string, items: readonly any[], ids: (string | number)[], build: (g: GroupBuilder) => void): void {
+    const spec = this.specs.find((s) => s.name === name);
+    if (!spec) throw new Error(`unknown layer: ${name}`);
+    if (items.length === 0) return;
+    const existing = new Set(spec.ids.map(String));
+    const seen = new Set<string>();
+    for (const id of ids) {
+      const key = String(id);
+      if (existing.has(key) || seen.has(key)) throw new Error(`duplicate drawable id: ${key}`);
+      seen.add(key);
+    }
+    const drawOffset = this.scene.drawableCount(name); // drawables, not data (culling may differ)
+    this.scene.appendToGroup(name, build);
+    spec.data.push(...items);
+    spec.ids.push(...ids);
+    this.applyAccessors(spec, spec.data.length - items.length);
+    this.hitIndexes.get(name)?.append(this.scene.drawables(name).slice(drawOffset));
+    // Skip the GPU push for a layer hidden mid-interaction (mirrors recolor): the
+    // gesture-end rebuild re-projects + re-pushes the full extended list.
+    if (this.interacting && spec.hideOnInteraction) return;
+    const rl = this.renderLayer(spec);
+    const backend = this.handle?.backend;
+    if (backend?.appendToLayer) backend.appendToLayer(name, rl, drawOffset);
+    else backend?.updateLayer(name, rl);
+    this.render();
+  }
+
   recolor(name: string): this {
     const spec = this.specs.find((s) => s.name === name);
     if (!spec) return this;
@@ -228,20 +265,21 @@ export abstract class BaseEngine {
   private resolve<T>(a: Accessor<any, T> | undefined, d: any, i: number): T | undefined {
     return typeof a === "function" ? (a as (d: any, i: number) => T)(d, i) : a;
   }
-  private applyAccessors(spec: LayerSpec): void {
+  private applyAccessors(spec: LayerSpec, start = 0): void {
     // A spec has one id per datum, but the built group may have fewer drawables —
     // e.g. geoLayer culls back-hemisphere points on a globe, so those ids have no
     // drawable. Only color the ids actually present (setFill/Stroke throw on
     // unknown ids), which keeps the typo guard for genuinely-missing drawables.
     const present = new Set(this.scene.drawables(spec.name).map((dr) => dr.id));
-    spec.data.forEach((d, i) => {
+    for (let i = start; i < spec.data.length; i++) {
+      const d = spec.data[i]!;
       const id = spec.ids[i]!;
-      if (!present.has(id)) return;
+      if (!present.has(id)) continue;
       const fill = this.resolve(spec.fill, d, i);
       if (fill) this.scene.setFill(spec.name, id, fill);
       const stroke = this.resolve(spec.stroke, d, i);
       if (stroke) this.scene.setStroke(spec.name, id, stroke);
-    });
+    }
   }
   private renderLayer(spec: LayerSpec): RenderLayer {
     return { name: spec.name, buffers: this.scene.buffers(spec.name), drawables: this.scene.drawables(spec.name), clipTo: spec.clipTo, sizeMode: spec.sizeMode };
