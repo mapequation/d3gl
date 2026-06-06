@@ -203,7 +203,8 @@ export default function Example(props: ExampleProps) {
   const [options, setOptions] = useState<Record<string, unknown>>(() => {
     const o: Record<string, unknown> = {};
     for (const c of controls) {
-      o[c.key] = c.type === "range" ? c.value : c.options[0];
+      o[c.key] =
+        c.type === "range" ? c.value : c.type === "select" ? (c.value ?? c.options[0]) : c.options[0];
     }
     for (const [k, v] of Object.entries(defaults)) if (k !== "backend") o[k] = v;
     return o;
@@ -236,7 +237,11 @@ export default function Example(props: ExampleProps) {
     engineRef.current = engine;
   };
 
-  const segmented = controls.filter((c) => c.type !== "range") as Extract<
+  const selects = controls.filter((c) => c.type === "select") as Extract<
+    ControlSpec,
+    { type: "select" }
+  >[];
+  const segmented = controls.filter((c) => c.type !== "range" && c.type !== "select") as Extract<
     ControlSpec,
     { options: string[] }
   >[];
@@ -244,7 +249,7 @@ export default function Example(props: ExampleProps) {
     ControlSpec,
     { type: "range" }
   >[];
-  const hasControlsRow = segmented.length > 0 || ranges.length > 0;
+  const hasControlsRow = segmented.length > 0 || ranges.length > 0 || selects.length > 0;
 
   const onExport = (): void => {
     const engine = engineRef.current;
@@ -300,6 +305,20 @@ export default function Example(props: ExampleProps) {
                 value={Number(options[c.key])}
                 onCommit={(v) => setOptions((o) => ({ ...o, [c.key]: v }))}
               />
+            ))}
+            {selects.map((c) => (
+              <label key={c.key} className="flex items-center gap-1.5">
+                <span className="text-muted-foreground text-[11px]">{c.label}</span>
+                <select
+                  className="border-border bg-background text-foreground focus-visible:ring-outline/50 h-6 rounded-md border px-1.5 text-[11px] outline-none focus-visible:ring-2"
+                  value={String(options[c.key])}
+                  onChange={(e) => setOptions((o) => ({ ...o, [c.key]: e.target.value }))}
+                >
+                  {c.options.map((opt) => (
+                    <option key={opt} value={opt}>{opt}</option>
+                  ))}
+                </select>
+              </label>
             ))}
           </div>
         </>

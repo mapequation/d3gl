@@ -72,4 +72,13 @@ export type ControlSpec =
       value: number;
       /** Optional per-step display labels, indexed by (value - min) / step (e.g. ["1°","2°"]). */
       display?: string[];
+    }
+  | {
+      type: "select";
+      key: string;
+      label: string;
+      /** Option values (value === visible label). */
+      options: string[];
+      /** Default value (else options[0]). */
+      value?: string;
     };
