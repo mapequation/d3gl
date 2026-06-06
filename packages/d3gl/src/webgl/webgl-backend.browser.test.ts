@@ -63,4 +63,26 @@ describe("WebGLBackend", () => {
     expect(right[0]).toBeLessThan(40);      // clipped out
     backend.destroy();
   });
+
+  it("globe mode bakes layers and draws a textured sphere; rotation repaints without throwing", async () => {
+    const canvas = document.createElement("canvas");
+    canvas.width = 128; canvas.height = 128;
+    document.body.appendChild(canvas);
+    const backend = await WebGLBackend.create(canvas, { width: 128, height: 128 });
+    // A full-texture green rect = the baked equirect "map" (texture is 256x128 below).
+    const ocean = rectLayer("ocean", 0, 0, 256, 128, "rgb(0,128,0)");
+    backend.setLayers([ocean]);
+    backend.setTransform({ k: 1, x: 0, y: 0 });
+    backend.setGlobeMode(true, 256, 128);
+    const center = backend.readScreenPixel(64, 64);
+    expect(center[1]).toBeGreaterThan(80);      // green sphere at centre
+    const corner = backend.readScreenPixel(4, 4);
+    expect(corner[3]).toBeLessThan(40);         // outside the disc → clear
+    // Rotation must not throw and keeps the sphere painted (uniform map).
+    const rotY = new Float32Array([0,0,-1, 0,1,0, 1,0,0]);
+    expect(() => backend.setGlobeRotation(rotY)).not.toThrow();
+    expect(backend.readScreenPixel(64, 64)[1]).toBeGreaterThan(80);
+    backend.setGlobeMode(false);                // back to flat path, no throw
+    backend.destroy();
+  });
 });

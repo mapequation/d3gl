@@ -6,6 +6,7 @@ import { GroupRenderer } from "./renderer.js";
 import { clipFromView } from "./transform.js";
 import { toPNG } from "./png.js";
 import { svgFromLayers } from "../svg/index.js";
+import { GlobeRenderer } from "./globe.js";
 
 export interface WebGLBackendOptions {
   width: number;
@@ -18,6 +19,10 @@ export class WebGLBackend implements Backend {
   private order: string[] = [];
   private clipMatrix: Float32Array;
   private viewTransform: ViewTransform = { k: 1, x: 0, y: 0 };
+  private globe: GlobeRenderer | null = null; // non-null ⇒ globe mode active
+  private bakeDirty = true;
+  private bakeW = 2048;
+  private bakeH = 1024;
 
   private constructor(
     private readonly device: Device,
@@ -59,6 +64,7 @@ export class WebGLBackend implements Backend {
       this.layers.set(layer.name, layer);
       this.order.push(layer.name);
     }
+    this.bakeDirty = true;
   }
 
   updateLayer(name: string, layer: RenderLayer): void {
@@ -73,6 +79,7 @@ export class WebGLBackend implements Backend {
       this.layers.set(name, layer);
       this.order.push(name);
     }
+    this.bakeDirty = true;
   }
 
   setTransform(t: ViewTransform): void {
@@ -81,10 +88,60 @@ export class WebGLBackend implements Backend {
     for (const r of this.renderers.values()) r.setTransform(this.clipMatrix);
   }
 
+  /** Enter/leave globe mode. texW/texH = equirect bake size. Idempotent re-entry resizes. */
+  setGlobeMode(on: boolean, texW = 2048, texH = 1024): void {
+    if (on) {
+      if (!this.globe) this.globe = new GlobeRenderer(this.device, texW, texH, this.width, this.height);
+      else this.globe.setTextureSize(texW, texH);
+      this.bakeW = texW;
+      this.bakeH = texH;
+      this.bakeDirty = true;
+    } else if (this.globe) {
+      this.globe.destroy();
+      this.globe = null;
+    }
+  }
+
+  /** Update the globe rotation (mat3, column-major) and repaint. No re-bake. */
+  setGlobeRotation(m: Float32Array): void { this.globe?.setRotation(m); this.render(); }
+
   render(): void {
+    if (this.globe) { this.renderGlobe(); return; }
     const cc = this.device.getDefaultCanvasContext();
     const fb = cc.getCurrentFramebuffer({ depthStencilFormat: "depth24plus-stencil8" });
     this.drawInto(fb);
+  }
+
+  private renderGlobe(): void {
+    const g = this.globe!;
+    if (this.bakeDirty) { this.bakeLayers(g.bakeTarget()); this.bakeDirty = false; }
+    const cc = this.device.getDefaultCanvasContext();
+    const out = cc.getCurrentFramebuffer({ depthStencilFormat: "depth24plus-stencil8" });
+    const pass = this.device.beginRenderPass({ framebuffer: out, clearColor: [0, 0, 0, 0], clearDepth: 1 });
+    const baseRadius = Math.min(this.width, this.height) * 0.45;
+    const k = this.viewTransform.k;
+    g.draw(pass, baseRadius * k, [this.width / 2 + this.viewTransform.x, this.height / 2 + this.viewTransform.y]);
+    pass.end();
+    this.device.submit();
+  }
+
+  private bakeLayers(fb: Framebuffer): void {
+    const texMatrix = clipFromView({ k: 1, x: 0, y: 0 }, this.bakeW, this.bakeH);
+    for (const r of this.renderers.values()) r.setTransform(texMatrix);
+    const clipSources = new Set<string>();
+    for (const name of this.order) { const ct = this.layers.get(name)?.clipTo; if (ct) clipSources.add(ct); }
+    const pass = this.device.beginRenderPass({ framebuffer: fb, clearColor: [0, 0, 0, 0], clearStencil: 0, clearDepth: 1 });
+    for (const name of this.order) {
+      const r = this.renderers.get(name)!;
+      const layer = this.layers.get(name)!;
+      r.setStencil(clipSources.has(name) ? "write" : layer.clipTo ? "test" : "off");
+      r.setSizeMode(layer.sizeMode ?? "world");
+      r.render(pass);
+    }
+    pass.end();
+    this.device.submit();
+    // Restore the on-screen clip matrix for any non-globe use.
+    for (const r of this.renderers.values()) r.setTransform(this.clipMatrix);
   }
 
   private drawInto(framebuffer: Framebuffer): void {
@@ -141,6 +198,8 @@ export class WebGLBackend implements Backend {
     this.renderers.clear();
     this.layers.clear();
     this.order = [];
+    this.globe?.destroy();
+    this.globe = null;
     this.offscreen.destroy();
     this.device.destroy();
   }
