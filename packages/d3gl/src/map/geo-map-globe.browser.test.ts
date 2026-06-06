@@ -48,6 +48,19 @@ describe("geoMap projections + rotation", () => {
     map.destroy();
   });
 
+  it("destroy() detaches rotation listeners (no events on a destroyed engine)", async () => {
+    const host = mount();
+    const map = geoMap(host, { width: 200, height: 200, projection: geoOrthographic().fitSize([200, 200], sphere), backend: "canvas" });
+    await map.whenReady();
+    map.layer("land", [land()], { fill: "rgb(0,128,0)" });
+    map.enableRotation();
+
+    map.destroy();
+    const scaleAfter = (map as any).projection.scale();
+    host.dispatchEvent(new WheelEvent("wheel", { deltaY: -100, bubbles: true, cancelable: true }));
+    expect((map as any).projection.scale()).toBe(scaleAfter); // listener removed on destroy
+  });
+
   it("hideOnRotation drops the layer from the render only while rotating", async () => {
     const host = mount();
     const map = geoMap(host, { width: 200, height: 200, projection: geoOrthographic().fitSize([200, 200], sphere), backend: "canvas" });

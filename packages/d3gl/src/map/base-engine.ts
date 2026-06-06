@@ -60,8 +60,12 @@ export abstract class BaseEngine {
     const spec = this.specs.find((s) => s.name === name);
     if (!spec) return this;
     this.applyAccessors(spec);
-    this.handle?.backend.updateLayer(name, this.renderLayer(spec));
-    this.render();
+    // Don't touch the backend for a layer that's hidden mid-rotation (setLayers
+    // already dropped it); it re-projects + repaints on drag release.
+    if (!(this.rotating && spec.hideOnRotation)) {
+      this.handle?.backend.updateLayer(name, this.renderLayer(spec));
+      this.render();
+    }
     return this;
   }
   setClip(name: string, clipTo?: string): this {
@@ -180,6 +184,9 @@ export abstract class BaseEngine {
   toPNG(): string { return this.handle?.backend.toPNG() ?? ""; }
   destroy(): void {
     this.destroyed = true;
+    // Detach pan/zoom or rotation listeners so a trailing wheel/pointer event can't
+    // fire on a destroyed engine (destroy() otherwise only removes hover listeners).
+    this.disableInteraction();
     // Invalidate any in-flight swapBackend so a pending backend that resolves
     // after destroy() bails and removes its own element (instead of orphaning a
     // canvas in the host — which happens when the engine is destroyed before its
