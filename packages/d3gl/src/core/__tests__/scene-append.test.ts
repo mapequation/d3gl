@@ -48,4 +48,27 @@ describe("Scene.appendToGroup", () => {
     const s = new Scene();
     expect(() => s.appendToGroup("nope", () => {})).toThrow(/unknown group/);
   });
+
+  it("produces identical fill+stroke buffers for an appended drawable vs a single build", () => {
+    const built = new Scene();
+    built.group("g", (b) => {
+      b.drawable("a", (ctx) => ctx.rect(0, 0, 10, 10), { lineWidth: 1 });
+      b.drawable("b", (ctx) => ctx.rect(20, 0, 10, 10), { lineWidth: 1 });
+    });
+    const appended = new Scene();
+    appended.group("g", (b) => b.drawable("a", (ctx) => ctx.rect(0, 0, 10, 10), { lineWidth: 1 }));
+    appended.appendToGroup("g", (b) => b.drawable("b", (ctx) => ctx.rect(20, 0, 10, 10), { lineWidth: 1 }));
+
+    const x = built.buffers("g");
+    const y = appended.buffers("g");
+    expect(Array.from(y.fillVertices)).toEqual(Array.from(x.fillVertices));
+    expect(Array.from(y.fillIndices)).toEqual(Array.from(x.fillIndices));
+    expect(Array.from(y.strokeVertices)).toEqual(Array.from(x.strokeVertices));
+    expect(Array.from(y.strokeIndices)).toEqual(Array.from(x.strokeIndices));
+  });
+
+  it("drawableCount throws for an unknown group", () => {
+    const s = new Scene();
+    expect(() => s.drawableCount("nope")).toThrow(/unknown group/);
+  });
 });

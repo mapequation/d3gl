@@ -117,7 +117,11 @@ export class Scene {
   }
 
   /** Append more drawables to an existing group (vs group(), which replaces it).
-   *  Drawable ids continue after the current ones; a duplicate id throws. */
+   *  New drawables' integer drawableIds continue after the existing ones; a
+   *  duplicate domain id (the caller's string/number id) throws. NOTE: not atomic
+   *  across a multi-drawable build — if a later drawable in the batch throws, earlier
+   *  ones are already committed. Callers needing all-or-nothing (the engine append
+   *  path) validate ids before calling. */
   appendToGroup(name: string, build: (g: GroupBuilder) => void): void {
     build(this.builderFor(this.get(name)));
   }
@@ -141,12 +145,13 @@ export class Scene {
     draw: (ctx: PathRecorder) => void,
     opts?: DrawableOpts,
   ): void {
-    if (data.idToDrawable.has(String(id))) throw new Error(`duplicate drawable id: ${String(id)}`);
+    const key = String(id);
+    if (data.idToDrawable.has(key)) throw new Error(`duplicate drawable id: ${String(id)}`);
     const recorder = new PathRecorder(data.tolerance);
     draw(recorder);
     const subpaths = recorder.subpaths;
     const drawableId = data.ranges.length;
-    data.idToDrawable.set(String(id), drawableId);
+    data.idToDrawable.set(key, drawableId);
     data.subpaths.push(subpaths.map((s) => ({ closed: s.closed, points: s.points.slice() })));
     data.ids.push(id);
     data.lineWidths.push(opts?.lineWidth ?? 0);
@@ -222,9 +227,10 @@ export class Scene {
     centers: readonly [number, number][],
     r: number,
   ): void {
-    if (data.idToDrawable.has(String(id))) throw new Error(`duplicate drawable id: ${String(id)}`);
+    const key = String(id);
+    if (data.idToDrawable.has(key)) throw new Error(`duplicate drawable id: ${String(id)}`);
     const drawableId = data.ranges.length;
-    data.idToDrawable.set(String(id), drawableId);
+    data.idToDrawable.set(key, drawableId);
     data.subpaths.push([]);
     data.circles.push(centers.map(([x, y]) => ({ x, y, r })));
     data.ids.push(id);
