@@ -93,3 +93,38 @@ void main() {
     float((id >> 16) & 255) / 255.0,
     1.0);
 }`;
+
+// GLOBE_VS / GLOBE_FS — render a UV-sphere sampling an equirectangular map texture.
+// Uniforms: u_rotation (mat3, applied to surface direction), u_scale (px radius),
+// u_center (px), u_viewport (px). Attribute a_lonLat (degrees).
+export const GLOBE_VS = `#version 300 es
+precision highp float;
+in vec2 a_lonLat;
+uniform mat3 u_rotation;
+uniform float u_scale;
+uniform vec2 u_center;
+uniform vec2 u_viewport;
+out vec2 v_uv;
+out float v_front;
+void main() {
+  float lon = radians(a_lonLat.x);
+  float lat = radians(a_lonLat.y);
+  vec3 dir = vec3(cos(lat) * sin(lon), sin(lat), cos(lat) * cos(lon));
+  vec3 r = u_rotation * dir;
+  v_front = r.z;
+  vec2 px = u_center + vec2(r.x, -r.y) * u_scale;
+  vec2 clip = vec2(px.x / u_viewport.x * 2.0 - 1.0, 1.0 - px.y / u_viewport.y * 2.0);
+  gl_Position = vec4(clip, 0.0, 1.0);
+  v_uv = vec2(a_lonLat.x / 360.0 + 0.5, 0.5 - a_lonLat.y / 180.0);
+}`;
+
+export const GLOBE_FS = `#version 300 es
+precision highp float;
+in vec2 v_uv;
+in float v_front;
+uniform sampler2D u_map;
+out vec4 fragColor;
+void main() {
+  if (v_front <= 0.0) discard;
+  fragColor = texture(u_map, v_uv);
+}`;
