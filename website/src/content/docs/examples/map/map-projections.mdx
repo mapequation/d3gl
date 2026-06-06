@@ -13,10 +13,15 @@ d3-zoom pan/zoom. Switching projection calls `map.setProjection(...)`, which
 re-projects the existing layers; spherical projections then `enableRotation()`,
 flat ones `enableZoom()`.
 
+On top of the base map (ocean, graticule, land) it draws GeoJSON feature layers:
+a fine grid of cells clipped to land (many small polygons), a region polygon, a
+route line, and city points.
+
 <ExampleCard files={["map-projections/draw.ts"]}>
   <MapProjections client:visible slot="demo" />
 </ExampleCard>
 
-Dragging a globe re-projects the land on the CPU each frame. For dense layers,
-mark them `hideOnRotation` so only the cheap layers move during the drag and the
-full detail re-projects once on release.
+Dragging a globe re-projects the land on the CPU each frame. The **Features**
+toggle flags those feature layers `hideOnInteraction`: while you rotate (or
+zoom/pan) only the cheap land re-projects, and the dense features reappear when
+the gesture ends.

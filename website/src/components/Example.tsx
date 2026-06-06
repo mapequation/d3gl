@@ -310,7 +310,7 @@ export default function Example(props: ExampleProps) {
               <label key={c.key} className="flex items-center gap-1.5">
                 <span className="text-muted-foreground text-[11px]">{c.label}</span>
                 <select
-                  className="border-border bg-background text-foreground focus-visible:ring-outline/50 h-6 rounded-md border px-1.5 text-[11px] outline-none focus-visible:ring-2"
+                  className="border-border bg-background text-foreground focus-visible:ring-outline/50 h-6 rounded-md border py-0 pr-1 pl-1.5 text-[11px] leading-none outline-none focus-visible:ring-2"
                   value={String(options[c.key])}
                   onChange={(e) => setOptions((o) => ({ ...o, [c.key]: e.target.value }))}
                 >
