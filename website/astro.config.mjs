@@ -86,6 +86,7 @@ export default defineConfig({
           { label: "World map", slug: "examples/map/world-map" },
           { label: "GeoJSON features", slug: "examples/map/geojson-features" },
           { label: "Heatmap", slug: "examples/map/heatmap" },
+          { label: "Map projections", slug: "examples/map/map-projections" },
           { label: "React", slug: "examples/react" },
         ],
       },
