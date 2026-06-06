@@ -6,7 +6,7 @@ import { createBackend, type BackendType, type BackendHandle } from "./backend-f
 export type Accessor<D, T> = T | ((d: D, i: number) => T);
 export interface HoverHit { layer: string; id: string | number; datum: unknown; }
 
-interface LayerSpec {
+export interface LayerSpec {
   name: string;
   data: any[];
   ids: (string | number)[];
