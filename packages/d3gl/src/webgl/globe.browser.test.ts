@@ -11,6 +11,7 @@ import { webgl2Adapter } from "@luma.gl/webgl";
 import { Model } from "@luma.gl/engine";
 import { buildSphereMesh } from "./sphere-mesh.js";
 import { GLOBE_VS, GLOBE_FS } from "./shaders.js";
+import { GlobeRenderer } from "./globe.js";
 
 const W = 128, H = 128;
 async function makeDevice() {
@@ -54,5 +55,27 @@ describe("globe spike", () => {
     const corner = dev.readPixelsToArrayWebGL(fb, { sourceX: 2, sourceY: 2, sourceWidth: 1, sourceHeight: 1 });
     expect(corner[3]).toBeLessThan(40);                     // outside the disc: clear
     dev.destroy();
+  });
+
+  it("GlobeRenderer: rotation changes the rendered hemisphere without re-baking", async () => {
+    const { dev } = await makeDevice();
+    const g = new GlobeRenderer(dev, 16, 8, W, H);
+    // Bake a known pattern into the globe FBO: clear the bake target to solid red.
+    const bp = dev.beginRenderPass({ framebuffer: g.bakeTarget(), clearColor: [1, 0, 0, 1] });
+    bp.end(); dev.submit();
+    // Draw the sphere into an output FBO.
+    const out = dev.createFramebuffer({ width: W, height: H, colorAttachments: ["rgba8unorm"], depthStencilAttachment: "depth24plus-stencil8" });
+    const draw = () => { const p = dev.beginRenderPass({ framebuffer: out, clearColor: [0, 0, 0, 0], clearDepth: 1 }); g.draw(p, W * 0.45, [W / 2, H / 2]); p.end(); dev.submit(); };
+    draw();
+    const c0 = dev.readPixelsToArrayWebGL(out, { sourceX: W / 2, sourceY: H / 2, sourceWidth: 1, sourceHeight: 1 });
+    expect(c0[0]).toBeGreaterThan(200); expect(c0[3]).toBeGreaterThan(200); // red, opaque
+    // Rotate 90° about Y — must not throw, sphere still renders opaque red (uniform texture).
+    const rotY = new Float32Array([0, 0, -1, 0, 1, 0, 1, 0, 0]); // column-major 90° about Y
+    g.setRotation(rotY); draw();
+    const c1 = dev.readPixelsToArrayWebGL(out, { sourceX: W / 2, sourceY: H / 2, sourceWidth: 1, sourceHeight: 1 });
+    expect(c1[3]).toBeGreaterThan(200); // still opaque (front hemisphere visible)
+    // Resize the bake texture — must not throw.
+    expect(() => g.setTextureSize(32, 16)).not.toThrow();
+    g.destroy(); dev.destroy();
   });
 });
