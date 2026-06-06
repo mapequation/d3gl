@@ -6,7 +6,7 @@ import { createBackend, type BackendType, type BackendHandle } from "./backend-f
 export type Accessor<D, T> = T | ((d: D, i: number) => T);
 export interface HoverHit { layer: string; id: string | number; datum: unknown; }
 
-interface LayerSpec {
+export interface LayerSpec {
   name: string;
   data: any[];
   ids: (string | number)[];
@@ -14,6 +14,10 @@ interface LayerSpec {
   stroke?: Accessor<any, string>;
   clipTo?: string;
   sizeMode?: "world" | "screen";
+  /** When true, this layer is dropped from the render while the user is interacting
+   *  (a rotation drag, or a zoom/pan gesture) — and not re-projected per rotation
+   *  frame; it re-projects + reappears when the interaction ends. */
+  hideOnInteraction?: boolean;
   /** Screen-space declutter radius (px). When set, on each transform the engine hides
    *  anchored glyphs whose projected anchor falls within this radius of an already-kept one
    *  (grouped by anchor, earlier drawables win) — constant-size markers stop overlapping. */
@@ -31,6 +35,11 @@ export abstract class BaseEngine {
   private hoverCb: ((hit: HoverHit | null, ev: PointerEvent) => void) | null = null;
   private swapToken = 0;
   private destroyed = false;
+  /** True while the user is interacting (a rotation drag, or a zoom/pan gesture).
+   *  Layers flagged hideOnInteraction are excluded from the render while this is true. */
+  protected interacting = false;
+  /** Detaches the currently-attached interaction (zoom or rotation), if any. */
+  private interactionCleanup: (() => void) | null = null;
 
   constructor(protected host: HTMLElement, protected width: number, protected height: number, backend: BackendType) {
     this.ready = this.swapBackend(backend);
@@ -41,7 +50,9 @@ export abstract class BaseEngine {
   protected registerLayer(spec: LayerSpec): void {
     this.scene.group(spec.name, spec.build);
     this.applyAccessors(spec);
-    this.specs = this.specs.filter((s) => s.name !== spec.name).concat(spec);
+    const at = this.specs.findIndex((s) => s.name === spec.name);
+    if (at >= 0) this.specs[at] = spec;
+    else this.specs.push(spec);
     this.hitIndexes.set(spec.name, new HitIndex(this.scene.drawables(spec.name)));
     this.pushLayers();
   }
@@ -50,8 +61,12 @@ export abstract class BaseEngine {
     const spec = this.specs.find((s) => s.name === name);
     if (!spec) return this;
     this.applyAccessors(spec);
-    this.handle?.backend.updateLayer(name, this.renderLayer(spec));
-    this.render();
+    // Don't touch the backend for a layer that's hidden mid-interaction (setLayers
+    // already dropped it); it re-projects + repaints when the interaction ends.
+    if (!(this.interacting && spec.hideOnInteraction)) {
+      this.handle?.backend.updateLayer(name, this.renderLayer(spec));
+      this.render();
+    }
     return this;
   }
   setClip(name: string, clipTo?: string): this {
@@ -62,6 +77,27 @@ export abstract class BaseEngine {
     return this;
   }
   setBackend(type: BackendType): this { this.ready = this.swapBackend(type); return this; }
+  /** Detach the current pan/zoom or rotation interaction (no-op if none). */
+  disableInteraction(): this {
+    this.interactionCleanup?.();
+    this.interactionCleanup = null;
+    this.interacting = false;
+    return this;
+  }
+  /** Subclasses (GeoMap.enableRotation) register their interaction teardown here.
+   *  Call disableInteraction() first if replacing an existing interaction. */
+  protected setInteractionCleanup(fn: () => void): void {
+    this.interactionCleanup = fn;
+  }
+  /** Toggle the interacting flag. When it changes AND some layer opts into
+   *  hideOnInteraction, re-push so those layers drop out / come back at the
+   *  gesture boundary. A no-op (beyond the flag) when no layer opts in, so
+   *  zoom/pan on ordinary maps keeps zero overhead. */
+  protected setInteracting(v: boolean): void {
+    if (this.interacting === v) return;
+    this.interacting = v;
+    if (this.specs.some((s) => s.hideOnInteraction)) this.pushLayers();
+  }
   setTransform(t: ViewTransform): this {
     this.transform = t;
     this.handle?.backend.setTransform(t);
@@ -117,18 +153,23 @@ export abstract class BaseEngine {
    * HTML overlay (e.g. a `LabelLayer`) aligned with the GPU geometry as the view changes.
    */
   enableZoom(extent: [number, number] = [1, 100], onTransform?: (t: ViewTransform) => void): this {
+    this.disableInteraction();
     const sel = select(this.host as Element);
-    const behavior = d3zoom<Element, unknown>().scaleExtent(extent).on("zoom", (e: D3ZoomEvent<Element, unknown>) => {
-      const t: ViewTransform = { k: e.transform.k, x: e.transform.x, y: e.transform.y };
-      this.setTransform(t);
-      onTransform?.(t);
-    });
+    const behavior = d3zoom<Element, unknown>().scaleExtent(extent)
+      .on("start", () => this.setInteracting(true))
+      .on("zoom", (e: D3ZoomEvent<Element, unknown>) => {
+        const t: ViewTransform = { k: e.transform.k, x: e.transform.x, y: e.transform.y };
+        this.setTransform(t);
+        onTransform?.(t);
+      })
+      .on("end", () => this.setInteracting(false));
     (sel as any).call(behavior);
     // Seed d3-zoom's internal transform from the engine's CURRENT view so a non-identity base
     // (e.g. a centering translate set via setTransform before enableZoom) is respected, and
     // zoom-to-cursor deltas measure from it rather than from identity.
     const t = this.transform;
     (sel as any).call(behavior.transform, zoomIdentity.translate(t.x, t.y).scale(t.k));
+    this.interactionCleanup = () => { (sel as any).on(".zoom", null); };
     return this;
   }
   on(event: "hover", cb: (hit: HoverHit | null, ev: PointerEvent) => void): this {
@@ -157,6 +198,9 @@ export abstract class BaseEngine {
   toPNG(): string { return this.handle?.backend.toPNG() ?? ""; }
   destroy(): void {
     this.destroyed = true;
+    // Detach pan/zoom or rotation listeners so a trailing wheel/pointer event can't
+    // fire on a destroyed engine (destroy() otherwise only removes hover listeners).
+    this.disableInteraction();
     // Invalidate any in-flight swapBackend so a pending backend that resolves
     // after destroy() bails and removes its own element (instead of orphaning a
     // canvas in the host — which happens when the engine is destroyed before its
@@ -179,8 +223,14 @@ export abstract class BaseEngine {
     return typeof a === "function" ? (a as (d: any, i: number) => T)(d, i) : a;
   }
   private applyAccessors(spec: LayerSpec): void {
+    // A spec has one id per datum, but the built group may have fewer drawables —
+    // e.g. geoLayer culls back-hemisphere points on a globe, so those ids have no
+    // drawable. Only color the ids actually present (setFill/Stroke throw on
+    // unknown ids), which keeps the typo guard for genuinely-missing drawables.
+    const present = new Set(this.scene.drawables(spec.name).map((dr) => dr.id));
     spec.data.forEach((d, i) => {
       const id = spec.ids[i]!;
+      if (!present.has(id)) return;
       const fill = this.resolve(spec.fill, d, i);
       if (fill) this.scene.setFill(spec.name, id, fill);
       const stroke = this.resolve(spec.stroke, d, i);
@@ -190,8 +240,12 @@ export abstract class BaseEngine {
   private renderLayer(spec: LayerSpec): RenderLayer {
     return { name: spec.name, buffers: this.scene.buffers(spec.name), drawables: this.scene.drawables(spec.name), clipTo: spec.clipTo, sizeMode: spec.sizeMode };
   }
+  /** Specs to actually render: hidden-on-interaction layers drop out mid-gesture. */
+  private renderSpecs(): LayerSpec[] {
+    return this.specs.filter((s) => !(this.interacting && s.hideOnInteraction));
+  }
   private pushLayers(): void {
-    this.handle?.backend.setLayers(this.specs.map((s) => this.renderLayer(s)));
+    this.handle?.backend.setLayers(this.renderSpecs().map((s) => this.renderLayer(s)));
     this.handle?.backend.setTransform(this.transform);
     this.render();
   }
@@ -205,7 +259,7 @@ export abstract class BaseEngine {
     old?.backend.destroy();
     if (old && old.element !== this.host) old.element.remove();
     this.handle = next;
-    next.backend.setLayers(this.specs.map((s) => this.renderLayer(s)));
+    next.backend.setLayers(this.renderSpecs().map((s) => this.renderLayer(s)));
     next.backend.setTransform(this.transform);
     next.backend.render();
   }

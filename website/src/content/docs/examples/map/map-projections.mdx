@@ -1,0 +1,27 @@
+---
+title: Map projections
+description: Pick any d3-geo projection — spherical ones become a drag-to-rotate globe.
+---
+
+import ExampleCard from "../../../../components/ExampleCard.astro";
+import MapProjections from "../../../../examples/map-projections/MapProjections.tsx";
+
+Choose any d3-geo core projection from the dropdown. Spherical projections
+(Orthographic, Stereographic, the Azimuthal family, Gnomonic) render as a
+**rotatable globe** — drag to spin, scroll to zoom. The rest are flat maps with
+d3-zoom pan/zoom. Switching projection calls `map.setProjection(...)`, which
+re-projects the existing layers; spherical projections then `enableRotation()`,
+flat ones `enableZoom()`.
+
+On top of the base map (ocean, graticule, land) it draws GeoJSON feature layers:
+a fine grid of cells clipped to land (many small polygons), a region polygon, a
+route line, and city points.
+
+<ExampleCard files={["map-projections/draw.ts"]}>
+  <MapProjections client:visible slot="demo" />
+</ExampleCard>
+
+Dragging a globe re-projects the land on the CPU each frame. The **Features**
+toggle flags those feature layers `hideOnInteraction`: while you rotate (or
+zoom/pan) only the cheap land re-projects, and the dense features reappear when
+the gesture ends.

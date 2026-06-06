@@ -1,4 +1,4 @@
-import { geoPath } from "d3-geo";
+import { geoPath, geoDistance } from "d3-geo";
 import type { GeoProjection } from "d3-geo";
 import type { GroupBuilder } from "../core/index.js";
 import type { GeoInput } from "./project.js";
@@ -27,16 +27,30 @@ export function geoLayer<F extends GeoInput>(
 ): (g: GroupBuilder) => void {
   const radius = opts.pointRadius ?? 3;
   const drawOpts = opts.lineWidth != null ? { lineWidth: opts.lineWidth } : undefined;
+  // Polygons/lines are clipped to the visible hemisphere by geoPath, but a raw
+  // `projection(point)` returns coordinates even for back-facing points (they fold
+  // onto the front disc). An azimuthal projection reports a positive clipAngle
+  // (e.g. orthographic ≈ 90°); others report 0 (no angular clip). When azimuthal,
+  // cull points whose great-circle distance from the view centre exceeds that angle.
+  const clipAngle = projection.clipAngle();
+  const azimuthal = clipAngle != null && clipAngle > 0;
+  const rot = projection.rotate();
+  const centre: [number, number] = [-rot[0], -rot[1]];
+  const limit = azimuthal ? (clipAngle * Math.PI) / 180 : Infinity;
+  const visible = (c: [number, number]): boolean => !azimuthal || geoDistance(c, centre) <= limit;
   return (g) => {
     features.forEach((feature, i) => {
       const id = opts.id ? opts.id(feature, i) : i;
       const geom = geomOf(feature);
       if (geom && geom.type === "Point") {
-        const p = projection(geom.coordinates as [number, number]);
+        const c = geom.coordinates as [number, number];
+        if (!visible(c)) return;
+        const p = projection(c);
         if (p) g.point(id, p[0], p[1], radius);
       } else if (geom && geom.type === "MultiPoint") {
         const centers: [number, number][] = [];
         for (const c of geom.coordinates) {
+          if (!visible(c as [number, number])) continue;
           const p = projection(c as [number, number]);
           if (p) centers.push([p[0], p[1]]);
         }

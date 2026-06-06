@@ -346,9 +346,19 @@ export class GroupRenderer {
     test:  { depthCompare: "always", depthWriteEnabled: false, stencilCompare: "not-equal", stencilReadMask: 0x01, stencilWriteMask: 0x01, stencilPassOperation: "keep", stencilFailOperation: "keep", stencilDepthFailOperation: "keep" },
   } as const;
 
+  // Standard (non-premultiplied) alpha blending so a fill/stroke color with alpha < 1
+  // (e.g. "#9bd1a466") composites over what's behind it instead of rendering opaque.
+  // Opaque colors (alpha = 1) are unaffected: src·1 + dst·0 = src. Applied to the
+  // fill/stroke/point models — NOT the pick model, whose ids must stay exact.
+  private static BLEND = {
+    blend: true,
+    blendColorOperation: "add", blendColorSrcFactor: "src-alpha", blendColorDstFactor: "one-minus-src-alpha",
+    blendAlphaOperation: "add", blendAlphaSrcFactor: "one", blendAlphaDstFactor: "one-minus-src-alpha",
+  } as const;
+
   /** Switch stencil state for clipping. "write" = clip source (mask), "test" = clipped layer, "off" = normal. */
   setStencil(mode: "off" | "write" | "test"): void {
-    const params = GroupRenderer.STENCIL[mode] as Record<string, unknown>;
+    const params = { ...GroupRenderer.BLEND, ...GroupRenderer.STENCIL[mode] } as Record<string, unknown>;
     if (this.fill) this.fill.fillModel.setParameters(params);
     if (this.stroke) this.stroke.fillModel.setParameters(params);
     if (this.point) this.point.model.setParameters(params);
