@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { geoEquirectangular, geoOrthographic } from "d3-geo";
+import { geoEquirectangular, geoOrthographic, geoMercator } from "d3-geo";
 import { geoMap } from "./geo-map.js";
 
 const sphere = { type: "Sphere" } as const;
@@ -133,5 +133,30 @@ describe("geoMap projections + rotation", () => {
     (map as any).setInteracting(false);
     expect((map as any).interacting).toBe(false);
     map.destroy();
+  });
+
+  it("enableZoom dispatches: rotation for spherical, affine zoom for flat", async () => {
+    // Spherical (orthographic): enableZoom attaches the rotation wheel handler
+    // (wheel changes projection.scale), not d3-zoom.
+    const host = mount();
+    const globe = geoMap(host, { width: 200, height: 200, projection: geoOrthographic().fitSize([200, 200], sphere), backend: "canvas" });
+    await globe.whenReady();
+    globe.layer("land", [land()], { fill: "rgb(0,128,0)" });
+    globe.enableZoom([0.5, 8]);
+    const s0 = (globe as any).projection.scale();
+    host.dispatchEvent(new WheelEvent("wheel", { deltaY: -100, bubbles: true, cancelable: true }));
+    expect((globe as any).projection.scale()).toBeGreaterThan(s0); // rotation path scales the projection
+    globe.destroy();
+
+    // Flat (mercator): enableZoom attaches d3-zoom; projection.scale stays fixed.
+    const host2 = mount();
+    const flat = geoMap(host2, { width: 200, height: 200, projection: geoMercator().fitSize([200, 200], sphere), backend: "canvas" });
+    await flat.whenReady();
+    flat.layer("land", [land()], { fill: "rgb(0,128,0)" });
+    flat.enableZoom([1, 8]);
+    const fs0 = (flat as any).projection.scale();
+    host2.dispatchEvent(new WheelEvent("wheel", { deltaY: -100, bubbles: true, cancelable: true }));
+    expect((flat as any).projection.scale()).toBe(fs0); // affine path leaves projection.scale unchanged
+    flat.destroy();
   });
 });

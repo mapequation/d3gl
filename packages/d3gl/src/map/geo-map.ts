@@ -3,6 +3,7 @@ import { geoLayer } from "../geo/index.js";
 import versor, { type Angles, type Vec3, type Quaternion } from "../geo/versor.js";
 import { BaseEngine, type HoverHit, type LayerSpec } from "./base-engine.js";
 import type { BackendType } from "./backend-factory.js";
+import type { ViewTransform } from "../core/index.js";
 
 export interface GeoMapOptions { width: number; height: number; projection: GeoProjection; backend?: BackendType; }
 export interface LayerOptions<F = any> {
@@ -51,6 +52,21 @@ export class GeoMap extends BaseEngine {
     this.rebuildLayers();
     this.setTransform({ k: 1, x: 0, y: 0 });
     return this;
+  }
+
+  /** One entry point for both projection kinds: a spherical (azimuthal) projection
+   *  gets versor rotation (drag) + wheel-zoom bounded by `extent`; a flat projection
+   *  gets d3-zoom affine pan/zoom. `extent` sets the zoom limits for both. */
+  override enableZoom(extent: [number, number] = [1, 100], onTransform?: (t: ViewTransform) => void): this {
+    if (this.isSpherical()) return this.enableRotation({ scaleExtent: extent });
+    return super.enableZoom(extent, onTransform);
+  }
+
+  /** Azimuthal projections report a positive clipAngle (orthographic 90, stereographic
+   *  142, azimuthal* ~180, gnomonic 60); cylindrical/conic report 0. */
+  private isSpherical(): boolean {
+    const ca = this.projection.clipAngle();
+    return ca != null && ca > 0;
   }
 
   /** Drag to trackball-rotate a spherical projection; wheel to scale it. Re-projects
