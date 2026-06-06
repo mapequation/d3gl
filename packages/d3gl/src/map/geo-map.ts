@@ -64,6 +64,9 @@ export class GeoMap extends BaseEngine {
     let q0: Quaternion | null = null;
     let r0: Angles = [0, 0, 0];
     let active = false;
+    // Wheel zoom has no natural "end"; debounce one so hideOnInteraction layers
+    // hide while zooming the globe and re-project once the wheel goes quiet.
+    let wheelEnd: ReturnType<typeof setTimeout> | null = null;
 
     const at = (e: PointerEvent): [number, number] => {
       const r = host.getBoundingClientRect();
@@ -100,9 +103,16 @@ export class GeoMap extends BaseEngine {
     };
     const wheel = (e: WheelEvent): void => {
       e.preventDefault();
+      this.setInteracting(true); // drops hideOnInteraction layers while zooming
       const s = Math.max(scale0 * minK, Math.min(scale0 * maxK, this.projection.scale() * Math.exp(-e.deltaY * 0.001)));
       this.projection.scale(s);
-      this.rebuildLayers({ skipHidden: this.interacting });
+      this.rebuildLayers({ skipHidden: true });
+      if (wheelEnd) clearTimeout(wheelEnd);
+      wheelEnd = setTimeout(() => {
+        wheelEnd = null;
+        this.interacting = false;
+        this.rebuildLayers(); // re-project all (incl. hidden) once the wheel settles
+      }, 200);
     };
 
     host.addEventListener("pointerdown", down);
@@ -116,6 +126,7 @@ export class GeoMap extends BaseEngine {
       host.removeEventListener("pointerup", up);
       host.removeEventListener("pointercancel", up);
       host.removeEventListener("wheel", wheel);
+      if (wheelEnd) clearTimeout(wheelEnd);
     });
     return this;
   }

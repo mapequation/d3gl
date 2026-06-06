@@ -61,6 +61,44 @@ describe("geoMap projections + rotation", () => {
     expect((map as any).projection.scale()).toBe(scaleAfter); // listener removed on destroy
   });
 
+  it("a points layer with a culled back-face point + fill accessor does not throw", async () => {
+    const host = mount();
+    const map = geoMap(host, { width: 200, height: 200, projection: geoOrthographic().fitSize([200, 200], sphere), backend: "canvas" });
+    await map.whenReady();
+    const pt = (lon: number, lat: number): GeoJSON.Feature => ({
+      type: "Feature", properties: {}, geometry: { type: "Point", coordinates: [lon, lat] },
+    });
+    // [0,0] is on the front hemisphere, [180,0] is the antipode (culled by geoLayer).
+    // applyAccessors must not setFill the culled id (regression: "unknown drawable").
+    expect(() => {
+      map.layer("cities", [pt(0, 0), pt(180, 0)], { fill: (_g, i) => (i === 0 ? "rgb(255,0,0)" : "rgb(0,0,255)"), id: (_g, i) => `c${i}` });
+      map.render();
+    }).not.toThrow();
+    // Only the front point produced a drawable.
+    const ids = (map as any).scene.drawables("cities").map((d: any) => d.id);
+    expect(ids).toContain("c0");
+    expect(ids).not.toContain("c1");
+    map.destroy();
+  });
+
+  it("a globe wheel-zoom hides hideOnInteraction layers while zooming", async () => {
+    const host = mount();
+    const map = geoMap(host, { width: 200, height: 200, projection: geoOrthographic().fitSize([200, 200], sphere), backend: "canvas" });
+    await map.whenReady();
+    map.layer("land", [land()], { fill: "rgb(0,128,0)" });
+    map.layer("dense", [land()], { fill: "rgb(0,0,200)", hideOnInteraction: true });
+    map.enableRotation();
+
+    const names = () => (map as any).renderSpecs().map((s: any) => s.name);
+    expect(names()).toContain("dense");
+
+    host.dispatchEvent(new WheelEvent("wheel", { deltaY: -100, bubbles: true, cancelable: true }));
+    // The wheel marks the map interacting, so the dense layer drops out immediately.
+    expect((map as any).interacting).toBe(true);
+    expect(names()).not.toContain("dense");
+    map.destroy(); // clears the debounce timer
+  });
+
   it("hideOnInteraction drops the layer from the render only while interacting", async () => {
     const host = mount();
     const map = geoMap(host, { width: 200, height: 200, projection: geoOrthographic().fitSize([200, 200], sphere), backend: "canvas" });

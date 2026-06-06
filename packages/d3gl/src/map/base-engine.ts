@@ -223,8 +223,14 @@ export abstract class BaseEngine {
     return typeof a === "function" ? (a as (d: any, i: number) => T)(d, i) : a;
   }
   private applyAccessors(spec: LayerSpec): void {
+    // A spec has one id per datum, but the built group may have fewer drawables —
+    // e.g. geoLayer culls back-hemisphere points on a globe, so those ids have no
+    // drawable. Only color the ids actually present (setFill/Stroke throw on
+    // unknown ids), which keeps the typo guard for genuinely-missing drawables.
+    const present = new Set(this.scene.drawables(spec.name).map((dr) => dr.id));
     spec.data.forEach((d, i) => {
       const id = spec.ids[i]!;
+      if (!present.has(id)) return;
       const fill = this.resolve(spec.fill, d, i);
       if (fill) this.scene.setFill(spec.name, id, fill);
       const stroke = this.resolve(spec.stroke, d, i);

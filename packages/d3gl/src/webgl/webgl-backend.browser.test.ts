@@ -29,6 +29,23 @@ describe("WebGLBackend", () => {
     backend.destroy();
   });
 
+  it("alpha-blends a semi-transparent layer over an opaque one", async () => {
+    const canvas = document.createElement("canvas");
+    canvas.width = 64; canvas.height = 64;
+    document.body.appendChild(canvas);
+    const backend = await WebGLBackend.create(canvas, { width: 64, height: 64 });
+    const bg = rectLayer("bg", 0, 0, 64, 64, "rgb(255,0,0)");   // opaque red
+    const top = rectLayer("top", 0, 0, 64, 64, "#0000ff80");    // ~50% blue (8-digit hex alpha)
+    backend.setLayers([bg, top]);
+    backend.setTransform({ k: 1, x: 0, y: 0 });
+    const px = backend.readPixel(32, 32);
+    // Blended ≈ 50% blue over red → both channels present. Without blending it would
+    // be pure opaque blue (R≈0, B≈255).
+    expect(px[0]).toBeGreaterThan(90);  // red shows through (~127)
+    expect(px[2]).toBeGreaterThan(90);  // blue on top (~128)
+    backend.destroy();
+  });
+
   it("also clips on the ONSCREEN render() path (needs a stencil on the canvas buffer)", async () => {
     const canvas = document.createElement("canvas");
     canvas.width = 64; canvas.height = 64;

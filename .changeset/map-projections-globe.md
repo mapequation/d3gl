@@ -12,3 +12,7 @@ Add map projection switching and a rotatable globe:
 - `LayerOptions.hideOnInteraction` drops dense layers from the render while the
   user is interacting — a rotation drag or a zoom/pan gesture — so only cheap
   layers re-project per frame; they reappear when the gesture ends.
+- The WebGL backend now alpha-blends, so fills/strokes with alpha < 1 (e.g.
+  `"#9bd1a466"`) composite correctly instead of rendering opaque.
+- On azimuthal projections (e.g. orthographic), point geometries on the back
+  hemisphere are culled instead of showing through the globe.
