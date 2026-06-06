@@ -12,9 +12,10 @@ export interface LayerOptions<F = any> {
   id?: (f: F, i: number) => string | number;
   /** "world" (default): radius scales with zoom. "screen": constant pixel size. */
   sizeMode?: "world" | "screen";
-  /** Drop this layer from the render during a rotation drag (re-projects + reappears
-   *  on release). Use for dense layers so only cheap layers re-project per frame. */
-  hideOnRotation?: boolean;
+  /** Drop this layer from the render while interacting — a rotation drag or a
+   *  zoom/pan gesture (re-projects + reappears when the gesture ends). Use for
+   *  dense layers so only the cheap layers re-project per rotation frame. */
+  hideOnInteraction?: boolean;
 }
 
 /** Options for {@link GeoMap.enableRotation}. */
@@ -53,7 +54,7 @@ export class GeoMap extends BaseEngine {
   }
 
   /** Drag to trackball-rotate a spherical projection; wheel to scale it. Re-projects
-   *  on the CPU per frame. Layers flagged hideOnRotation are hidden mid-drag. */
+   *  on the CPU per frame. Layers flagged hideOnInteraction are hidden mid-drag. */
   enableRotation(opts: RotationOptions = {}): this {
     this.disableInteraction();
     const host = this.host;
@@ -75,7 +76,7 @@ export class GeoMap extends BaseEngine {
       r0 = this.projection.rotate();
       q0 = versor(r0);
       active = true;
-      this.rotating = true;
+      this.setInteracting(true);
       host.setPointerCapture?.(e.pointerId);
     };
     const move = (e: PointerEvent): void => {
@@ -91,7 +92,9 @@ export class GeoMap extends BaseEngine {
     const up = (e: PointerEvent): void => {
       if (!active) return;
       active = false;
-      this.rotating = false;
+      // Clear the flag directly (no extra push) so the rebuild below re-projects and
+      // re-pushes every layer — including the hidden ones — at the final rotation.
+      this.interacting = false;
       host.releasePointerCapture?.(e.pointerId);
       this.rebuildLayers(); // re-project all (incl. hidden) at the final rotation
     };
@@ -99,7 +102,7 @@ export class GeoMap extends BaseEngine {
       e.preventDefault();
       const s = Math.max(scale0 * minK, Math.min(scale0 * maxK, this.projection.scale() * Math.exp(-e.deltaY * 0.001)));
       this.projection.scale(s);
-      this.rebuildLayers({ skipHidden: this.rotating });
+      this.rebuildLayers({ skipHidden: this.interacting });
     };
 
     host.addEventListener("pointerdown", down);
@@ -113,16 +116,15 @@ export class GeoMap extends BaseEngine {
       host.removeEventListener("pointerup", up);
       host.removeEventListener("pointercancel", up);
       host.removeEventListener("wheel", wheel);
-      this.rotating = false;
     });
     return this;
   }
 
   /** Re-register layers against the current projection (re-project once). During a
-   *  rotation drag, skipHidden avoids re-projecting hideOnRotation layers. */
+   *  rotation drag, skipHidden avoids re-projecting hideOnInteraction layers. */
   private rebuildLayers(o: { skipHidden?: boolean } = {}): void {
     for (const def of this.defs) {
-      if (o.skipHidden && def.opts.hideOnRotation) continue;
+      if (o.skipHidden && def.opts.hideOnInteraction) continue;
       this.registerLayer(this.buildSpec(def.name, def.list, def.opts));
     }
   }
@@ -131,7 +133,7 @@ export class GeoMap extends BaseEngine {
     const ids = list.map((f, i) => (opts.id ? opts.id(f, i) : i));
     return {
       name, data: list, ids, fill: opts.fill, stroke: opts.stroke, clipTo: opts.clipTo,
-      sizeMode: opts.sizeMode, hideOnRotation: opts.hideOnRotation,
+      sizeMode: opts.sizeMode, hideOnInteraction: opts.hideOnInteraction,
       build: geoLayer(list, this.projection, { id: (_f, i) => ids[i]!, lineWidth: opts.lineWidth, pointRadius: opts.pointRadius, sizeMode: opts.sizeMode }),
     };
   }

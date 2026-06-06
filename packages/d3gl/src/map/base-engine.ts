@@ -14,9 +14,10 @@ export interface LayerSpec {
   stroke?: Accessor<any, string>;
   clipTo?: string;
   sizeMode?: "world" | "screen";
-  /** When true, this layer is dropped from the render during an active rotation
-   *  drag (and not re-projected per frame); it re-projects + reappears on release. */
-  hideOnRotation?: boolean;
+  /** When true, this layer is dropped from the render while the user is interacting
+   *  (a rotation drag, or a zoom/pan gesture) — and not re-projected per rotation
+   *  frame; it re-projects + reappears when the interaction ends. */
+  hideOnInteraction?: boolean;
   /** Screen-space declutter radius (px). When set, on each transform the engine hides
    *  anchored glyphs whose projected anchor falls within this radius of an already-kept one
    *  (grouped by anchor, earlier drawables win) — constant-size markers stop overlapping. */
@@ -34,9 +35,9 @@ export abstract class BaseEngine {
   private hoverCb: ((hit: HoverHit | null, ev: PointerEvent) => void) | null = null;
   private swapToken = 0;
   private destroyed = false;
-  /** True while a rotation drag is in progress (set by enableRotation). Layers
-   *  flagged hideOnRotation are excluded from the render while this is true. */
-  protected rotating = false;
+  /** True while the user is interacting (a rotation drag, or a zoom/pan gesture).
+   *  Layers flagged hideOnInteraction are excluded from the render while this is true. */
+  protected interacting = false;
   /** Detaches the currently-attached interaction (zoom or rotation), if any. */
   private interactionCleanup: (() => void) | null = null;
 
@@ -60,9 +61,9 @@ export abstract class BaseEngine {
     const spec = this.specs.find((s) => s.name === name);
     if (!spec) return this;
     this.applyAccessors(spec);
-    // Don't touch the backend for a layer that's hidden mid-rotation (setLayers
-    // already dropped it); it re-projects + repaints on drag release.
-    if (!(this.rotating && spec.hideOnRotation)) {
+    // Don't touch the backend for a layer that's hidden mid-interaction (setLayers
+    // already dropped it); it re-projects + repaints when the interaction ends.
+    if (!(this.interacting && spec.hideOnInteraction)) {
       this.handle?.backend.updateLayer(name, this.renderLayer(spec));
       this.render();
     }
@@ -80,12 +81,22 @@ export abstract class BaseEngine {
   disableInteraction(): this {
     this.interactionCleanup?.();
     this.interactionCleanup = null;
+    this.interacting = false;
     return this;
   }
   /** Subclasses (GeoMap.enableRotation) register their interaction teardown here.
    *  Call disableInteraction() first if replacing an existing interaction. */
   protected setInteractionCleanup(fn: () => void): void {
     this.interactionCleanup = fn;
+  }
+  /** Toggle the interacting flag. When it changes AND some layer opts into
+   *  hideOnInteraction, re-push so those layers drop out / come back at the
+   *  gesture boundary. A no-op (beyond the flag) when no layer opts in, so
+   *  zoom/pan on ordinary maps keeps zero overhead. */
+  protected setInteracting(v: boolean): void {
+    if (this.interacting === v) return;
+    this.interacting = v;
+    if (this.specs.some((s) => s.hideOnInteraction)) this.pushLayers();
   }
   setTransform(t: ViewTransform): this {
     this.transform = t;
@@ -144,11 +155,14 @@ export abstract class BaseEngine {
   enableZoom(extent: [number, number] = [1, 100], onTransform?: (t: ViewTransform) => void): this {
     this.disableInteraction();
     const sel = select(this.host as Element);
-    const behavior = d3zoom<Element, unknown>().scaleExtent(extent).on("zoom", (e: D3ZoomEvent<Element, unknown>) => {
-      const t: ViewTransform = { k: e.transform.k, x: e.transform.x, y: e.transform.y };
-      this.setTransform(t);
-      onTransform?.(t);
-    });
+    const behavior = d3zoom<Element, unknown>().scaleExtent(extent)
+      .on("start", () => this.setInteracting(true))
+      .on("zoom", (e: D3ZoomEvent<Element, unknown>) => {
+        const t: ViewTransform = { k: e.transform.k, x: e.transform.x, y: e.transform.y };
+        this.setTransform(t);
+        onTransform?.(t);
+      })
+      .on("end", () => this.setInteracting(false));
     (sel as any).call(behavior);
     // Seed d3-zoom's internal transform from the engine's CURRENT view so a non-identity base
     // (e.g. a centering translate set via setTransform before enableZoom) is respected, and
@@ -220,9 +234,9 @@ export abstract class BaseEngine {
   private renderLayer(spec: LayerSpec): RenderLayer {
     return { name: spec.name, buffers: this.scene.buffers(spec.name), drawables: this.scene.drawables(spec.name), clipTo: spec.clipTo, sizeMode: spec.sizeMode };
   }
-  /** Specs to actually render: hidden-on-rotation layers drop out mid-drag. */
+  /** Specs to actually render: hidden-on-interaction layers drop out mid-gesture. */
   private renderSpecs(): LayerSpec[] {
-    return this.specs.filter((s) => !(this.rotating && s.hideOnRotation));
+    return this.specs.filter((s) => !(this.interacting && s.hideOnInteraction));
   }
   private pushLayers(): void {
     this.handle?.backend.setLayers(this.renderSpecs().map((s) => this.renderLayer(s)));

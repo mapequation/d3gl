@@ -61,22 +61,39 @@ describe("geoMap projections + rotation", () => {
     expect((map as any).projection.scale()).toBe(scaleAfter); // listener removed on destroy
   });
 
-  it("hideOnRotation drops the layer from the render only while rotating", async () => {
+  it("hideOnInteraction drops the layer from the render only while interacting", async () => {
     const host = mount();
     const map = geoMap(host, { width: 200, height: 200, projection: geoOrthographic().fitSize([200, 200], sphere), backend: "canvas" });
     await map.whenReady();
     map.layer("land", [land()], { fill: "rgb(0,128,0)" });
-    map.layer("dense", [land()], { fill: "rgb(0,0,200)", hideOnRotation: true });
+    map.layer("dense", [land()], { fill: "rgb(0,0,200)", hideOnInteraction: true });
 
     const names = () => (map as any).renderSpecs().map((s: any) => s.name);
     expect(names()).toContain("dense");
 
-    (map as any).rotating = true;
+    (map as any).interacting = true;
     expect(names()).not.toContain("dense");
     expect(names()).toContain("land");
 
-    (map as any).rotating = false;
+    (map as any).interacting = false;
     expect(names()).toContain("dense");
+    map.destroy();
+  });
+
+  it("setInteracting only re-pushes when a hideOnInteraction layer is present", async () => {
+    const host = mount();
+    const map = geoMap(host, { width: 200, height: 200, projection: geoOrthographic().fitSize([200, 200], sphere), backend: "canvas" });
+    await map.whenReady();
+    map.layer("plain", [land()], { fill: "rgb(0,128,0)" }); // no hideOnInteraction
+
+    // No opted-in layer → setInteracting just flips the flag, no render churn.
+    (map as any).setInteracting(true);
+    expect((map as any).interacting).toBe(true);
+    const names = () => (map as any).renderSpecs().map((s: any) => s.name);
+    expect(names()).toContain("plain"); // still rendered (it never opted in)
+
+    (map as any).setInteracting(false);
+    expect((map as any).interacting).toBe(false);
     map.destroy();
   });
 });

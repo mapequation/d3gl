@@ -46,14 +46,16 @@ For low-poly world land, CPU re-project per frame is a few ms, correct on all
 three backends, and reuses the entire existing pipeline. The GPU globe is
 recorded as a future enhancement (see "Future work").
 
-### Dense data: `hideOnRotation`
+### Dense data: `hideOnInteraction`
 
 To keep the GPU-globe ambition unnecessary for dense datasets (e.g. the
-downstream Infomap Bioregions map), layers can opt out of per-frame
-re-projection while dragging. A layer flagged `hideOnRotation` is dropped from
-the render during an active rotation drag (only cheap layers like land
-re-project per frame); on drag release, *all* layers re-project at the final
-rotation and reappear. Smooth drag, full detail on release.
+downstream Infomap Bioregions map), layers can opt out of rendering while the
+user interacts. A layer flagged `hideOnInteraction` is dropped from the render
+while interacting — a rotation drag, or a zoom/pan gesture (tracked by a shared
+`interacting` flag set on pointerdown/up for rotation and on d3-zoom start/end
+for zoom). During a rotation drag only cheap layers like land re-project per
+frame; when the gesture ends, *all* layers re-project and reappear. Smooth
+interaction, full detail on release.
 
 ## Library additions (`@mapequation/d3gl`)
 
@@ -79,8 +81,8 @@ Versor trackball rotation for spherical projections:
   `projection.invert(pointer)` returning `null` (pointer off the disc).
 - **wheel** → scale the projection (clamped to a multiple of the fitted scale);
   rebuild and render.
-- Tracks an internal `rotating` flag: `true` from pointerdown until pointerup.
-  While `true`, layers with `hideOnRotation` are excluded from the render and
+- Sets the shared `interacting` flag `true` from pointerdown until pointerup.
+  While `true`, layers with `hideOnInteraction` are excluded from the render and
   not re-projected. On pointerup, all layers re-project at the final rotation
   and the engine renders the full detail.
 - `opts` (all optional): `scaleExtent?: [number, number]` (default `[0.5, 8]`,
@@ -99,12 +101,15 @@ mutually exclusive. Add a single interaction-cleanup slot in `BaseEngine`:
 - `enableRotation` cleanup: remove its pointer/wheel listeners.
 - Public `disableInteraction(): this` runs and clears the cleanup.
 
-### 4. `LayerOptions.hideOnRotation?: boolean`
+### 4. `LayerOptions.hideOnInteraction?: boolean`
 
 Per-layer flag (default `false`). Threaded onto `LayerSpec`. The layer push
 (`pushLayers` / `setBackend`) excludes specs where
-`this.rotating && spec.hideOnRotation` from `setLayers`, and the rotation
-rebuild skips re-projecting them while `rotating`.
+`this.interacting && spec.hideOnInteraction` from `setLayers`, and the rotation
+rebuild skips re-projecting them while interacting. The `interacting` flag is set
+by both `enableRotation` (pointerdown/up) and `enableZoom` (d3-zoom start/end), so
+flagged layers also drop out during a flat-map zoom/pan. `setInteracting` only
+re-pushes when some layer opts in, so ordinary maps keep zero zoom overhead.
 
 ### 5. Vendored versor (`src/geo/versor.ts`)
 
@@ -161,8 +166,8 @@ A 14-entry segmented bar is unusable, so add a `select` control:
     projected anchor/path changes and the transform resets to identity.
   - `enableRotation`: simulating a drag changes `projection.rotate()` and the
     rendered geometry; `disableInteraction()` removes listeners.
-  - `hideOnRotation`: while `rotating`, a flagged layer is absent from the pushed
-    layers; after pointerup it is present again.
+  - `hideOnInteraction`: while `interacting`, a flagged layer is absent from the
+    pushed layers; when the gesture ends it is present again.
 - **Website smoke:** existing `pnpm --filter @d3gl/website build` covers the new
   MDX/example compiling. Playwright check the page renders a globe and the
   dropdown switches projections (webgl/canvas/svg).
@@ -180,11 +185,11 @@ A 14-entry segmented bar is unusable, so add a `select` control:
 **GPU globe mode** (its own spec when dense-data globes need it): project once to
 3D cartesian, rotate via a shader uniform, project per-vertex, discard
 back-hemisphere fragments for the limb. WebGL-only; keeps the CPU path for
-canvas/svg. Until then, `hideOnRotation` covers dense data by hiding it during
+canvas/svg. Until then, `hideOnInteraction` covers dense data by hiding it during
 the drag.
 
 ## Release
 
 Changeset: `@mapequation/d3gl` **minor** — adds `GeoMap.setProjection`,
 `GeoMap.enableRotation`, `BaseEngine.disableInteraction`, and
-`LayerOptions.hideOnRotation`.
+`LayerOptions.hideOnInteraction`.
