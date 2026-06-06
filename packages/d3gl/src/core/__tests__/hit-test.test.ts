@@ -34,4 +34,16 @@ describe("HitIndex", () => {
     expect(idx.pick(52, 52)).toBe("dot");   // inside r=5
     expect(idx.pick(60, 60)).toBe(null);    // outside
   });
+
+  it("append() makes new drawables pickable without disturbing existing ones", () => {
+    const scene = new Scene();
+    scene.group("g", (b) => b.point("a", 50, 50, 5));
+    const idx = new HitIndex(scene.drawables("g"));
+    expect(idx.pick(50, 50)).toBe("a");
+
+    scene.appendToGroup("g", (b) => b.point("b", 150, 150, 5));
+    idx.append(scene.drawables("g").slice(1)); // only the appended drawable
+    expect(idx.pick(150, 150)).toBe("b"); // new one hits
+    expect(idx.pick(50, 50)).toBe("a");    // old one still hits
+  });
 });
