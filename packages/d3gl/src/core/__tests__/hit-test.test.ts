@@ -41,9 +41,11 @@ describe("HitIndex", () => {
     const idx = new HitIndex(scene.drawables("g"));
     expect(idx.pick(50, 50)).toBe("a");
 
+    const before = scene.drawableCount("g");
     scene.appendToGroup("g", (b) => b.point("b", 150, 150, 5));
-    idx.append(scene.drawables("g").slice(1)); // only the appended drawable
+    idx.append(scene.drawables("g").slice(before)); // index only the newly appended drawables
     expect(idx.pick(150, 150)).toBe("b"); // new one hits
     expect(idx.pick(50, 50)).toBe("a");    // old one still hits
+    expect(idx.pick(100, 100)).toBe(null); // gap between them misses
   });
 });
