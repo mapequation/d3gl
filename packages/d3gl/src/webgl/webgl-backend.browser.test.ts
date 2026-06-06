@@ -64,6 +64,23 @@ describe("WebGLBackend", () => {
     backend.destroy();
   });
 
+  it("exports PNG of the globe and SVG without throwing in globe mode", async () => {
+    const canvas = document.createElement("canvas");
+    canvas.width = 128; canvas.height = 128;
+    document.body.appendChild(canvas);
+    const backend = await WebGLBackend.create(canvas, { width: 128, height: 128 });
+    const ocean = rectLayer("ocean", 0, 0, 256, 128, "rgb(0,128,0)");
+    backend.setLayers([ocean]);
+    backend.setTransform({ k: 1, x: 0, y: 0 });
+    backend.setGlobeMode(true, 256, 128);
+    const png = backend.toPNG();
+    expect(png.startsWith("data:image/png")).toBe(true);
+    let svg = "";
+    expect(() => { svg = backend.toSVG(); }).not.toThrow();
+    expect(typeof svg).toBe("string");
+    backend.destroy();
+  });
+
   it("globe mode bakes layers and draws a textured sphere; rotation repaints without throwing", async () => {
     const canvas = document.createElement("canvas");
     canvas.width = 128; canvas.height = 128;

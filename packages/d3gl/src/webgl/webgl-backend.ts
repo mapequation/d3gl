@@ -113,11 +113,15 @@ export class WebGLBackend implements Backend {
   }
 
   private renderGlobe(): void {
-    const g = this.globe!;
-    if (this.bakeDirty) { this.bakeLayers(g.bakeTarget()); this.bakeDirty = false; }
     const cc = this.device.getDefaultCanvasContext();
     const out = cc.getCurrentFramebuffer({ depthStencilFormat: "depth24plus-stencil8" });
-    const pass = this.device.beginRenderPass({ framebuffer: out, clearColor: [0, 0, 0, 0], clearDepth: 1 });
+    this.drawGlobeInto(out);
+  }
+
+  private drawGlobeInto(framebuffer: Framebuffer): void {
+    const g = this.globe!;
+    if (this.bakeDirty) { this.bakeLayers(g.bakeTarget()); this.bakeDirty = false; }
+    const pass = this.device.beginRenderPass({ framebuffer, clearColor: [0, 0, 0, 0], clearDepth: 1 });
     const baseRadius = Math.min(this.width, this.height) * 0.45;
     const k = this.viewTransform.k;
     g.draw(pass, baseRadius * k, [this.width / 2 + this.viewTransform.x, this.height / 2 + this.viewTransform.y]);
@@ -163,11 +167,13 @@ export class WebGLBackend implements Backend {
   }
 
   toPNG(): string {
+    if (this.globe) { this.drawGlobeInto(this.offscreen); return toPNG(this.device, this.offscreen, this.width, this.height); }
     this.drawInto(this.offscreen);
     return toPNG(this.device, this.offscreen, this.width, this.height);
   }
 
   toSVG(): string {
+    // In globe mode, SVG cannot render a 3D sphere; fall back to the baked (equirectangular) layer snapshot.
     return svgFromLayers(this.width, this.height, this.order.map((n) => this.layers.get(n)!), this.viewTransform);
   }
 
