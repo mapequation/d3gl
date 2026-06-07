@@ -84,3 +84,10 @@ export function randomHsl(): string {
 export const BATCH_SIZES = ["1", "10", "100", "1000", "100000", "1000000"];
 /** The artificial per-batch delay choices (ms) — mirrors loading from a file. */
 export const RATES_MS = ["0", "16", "100", "500"];
+/** Data-size choices (total features to stream) and their numeric totals. */
+export const DATA_SIZES = ["100k", "1M", "10M"];
+export const DATA_SIZE_TOTALS: Record<string, number> = {
+  "100k": 100_000,
+  "1M": 1_000_000,
+  "10M": 10_000_000,
+};

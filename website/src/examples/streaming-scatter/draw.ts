@@ -1,13 +1,14 @@
 import { plot, type LayerHandle } from "@mapequation/d3gl/map";
-import { makeStreamingPoints, type StreamPoint } from "../shared/geo-data.js";
-import { StreamController, randomHsl } from "../shared/streaming.js";
+import { makeStreamingPoints, DEFAULT_STREAM_COLOR, type StreamPoint } from "../shared/geo-data.js";
+import { StreamController, randomHsl, DATA_SIZE_TOTALS } from "../shared/streaming.js";
 import type { ImperativeSetup } from "../types.js";
 
 /**
  * The same streaming point source as the world-map example, but plotted on a
  * scatter chart: x = longitude, y = −latitude (so north is up). Reusing
  * `makeStreamingPoints` shows `Plot.points().append()` is the same incremental
- * append as the map's `GeoMap.layer().append()`.
+ * append as the map's `GeoMap.layer().append()`. Points start red; "Randomize
+ * colors" recolors future + retained points.
  */
 export const setup: ImperativeSetup = (host, { width, height, backend, options }) => {
   const chart = plot(host, { width, height, backend });
@@ -17,6 +18,7 @@ export const setup: ImperativeSetup = (host, { width, height, backend, options }
   chart.enableZoom([0.5, 40]);
 
   const retained: StreamPoint[] = [];
+  let currentColor = DEFAULT_STREAM_COLOR;
   const pointOpts = {
     x: (f: StreamPoint) => f.geometry.coordinates[0], // longitude
     y: (f: StreamPoint) => -f.geometry.coordinates[1], // −latitude (north up)
@@ -29,9 +31,11 @@ export const setup: ImperativeSetup = (host, { width, height, backend, options }
   chart.render();
 
   let seed = 1;
+  let total = DATA_SIZE_TOTALS[String(options.size)] ?? 1_000_000;
   const ctrl = new StreamController<StreamPoint>({
-    source: (o) => makeStreamingPoints({ total: 10_000_000, ...o }),
+    source: (o) => makeStreamingPoints({ total, ...o }),
     onBatch: (batch) => {
+      for (const f of batch) f.properties.color = currentColor;
       retained.push(...batch);
       points.append(batch);
     },
@@ -54,15 +58,23 @@ export const setup: ImperativeSetup = (host, { width, height, backend, options }
       ctrl.setRunning(o.stream === "run");
       if (o.randomize !== lastRandomize) {
         lastRandomize = Number(o.randomize) || 0;
-        for (const f of retained) f.properties.color = randomHsl();
+        currentColor = randomHsl();
+        for (const f of retained) f.properties.color = currentColor;
         points.recolor();
       }
       const batch = Number(o.batch);
       const rate = Number(o.rate);
-      if (batch !== ctrl.batchSize || rate !== ctrl.delayMs || o.restart !== lastRestart) {
+      const newTotal = DATA_SIZE_TOTALS[String(o.size)] ?? total;
+      if (
+        batch !== ctrl.batchSize ||
+        rate !== ctrl.delayMs ||
+        newTotal !== total ||
+        o.restart !== lastRestart
+      ) {
         lastRestart = Number(o.restart) || 0;
         ctrl.batchSize = batch;
         ctrl.delayMs = rate;
+        total = newTotal;
         ctrl.restart(++seed);
       }
     },

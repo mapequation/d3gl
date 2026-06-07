@@ -1,5 +1,10 @@
 import { describe, it, expect } from "vitest";
-import { makeStreamingPoints, makeStreamingPolygons, type StreamPoint } from "./geo-data.js";
+import {
+  makeStreamingPoints,
+  makeStreamingPolygons,
+  DEFAULT_STREAM_COLOR,
+  type StreamPoint,
+} from "./geo-data.js";
 
 async function collect<T>(gen: AsyncGenerator<T[]>): Promise<T[]> {
   const out: T[] = [];
@@ -20,7 +25,7 @@ describe("makeStreamingPoints", () => {
     expect(all.map((f) => f.properties.id)).toEqual([...Array(25).keys()]); // 0..24, continuing
   });
 
-  it("places points in lon/lat range and carries a color", async () => {
+  it("places points in lon/lat range and starts with the default color", async () => {
     const all = await collect(makeStreamingPoints({ total: 50, batchSize: 50 }));
     for (const f of all) {
       const [lon, lat] = f.geometry.coordinates;
@@ -28,7 +33,7 @@ describe("makeStreamingPoints", () => {
       expect(lon).toBeLessThanOrEqual(180);
       expect(lat).toBeGreaterThanOrEqual(-90);
       expect(lat).toBeLessThanOrEqual(90);
-      expect(f.properties.color).toMatch(/^hsl\(\d+, 70%, 55%\)$/);
+      expect(f.properties.color).toBe(DEFAULT_STREAM_COLOR);
     }
   });
 
@@ -66,7 +71,7 @@ describe("makeStreamingPolygons", () => {
       // box corner stays in-range so lon+size / lat+size don't exceed the sphere
       expect(lon).toBeLessThanOrEqual(180 - 2);
       expect(lat).toBeLessThanOrEqual(90 - 2);
-      expect(f.properties.color).toMatch(/^hsl\(/);
+      expect(f.properties.color).toBe(DEFAULT_STREAM_COLOR);
     }
   });
 });

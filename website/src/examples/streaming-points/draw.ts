@@ -1,17 +1,24 @@
 import { geoEquirectangular } from "d3-geo";
 import { geoMap, type LayerHandle } from "@mapequation/d3gl/map";
-import { loadWorld, makeStreamingPoints, type StreamPoint } from "../shared/geo-data.js";
-import { StreamController, randomHsl } from "../shared/streaming.js";
+import {
+  loadWorld,
+  makeStreamingPoints,
+  DEFAULT_STREAM_COLOR,
+  type StreamPoint,
+} from "../shared/geo-data.js";
+import { StreamController, randomHsl, DATA_SIZE_TOTALS } from "../shared/streaming.js";
 import type { ImperativeSetup } from "../types.js";
 
 const OCEAN = "#dbe7f3";
 const LAND = "#e9e7df";
 
 /**
- * Stream random world points and append them live. Each batch is appended with
- * `layer.append(batch)` — only the NEW points project, the existing ones are
- * untouched. The example also keeps its own `retained` GeoJSON array so the
- * "Randomize colors" button can recolor the data already on screen.
+ * Stream points (clustered around cities + rivers) and append them live with
+ * `layer.append(batch)` — only the NEW points project; existing ones are
+ * untouched and clipped to land. Every feature carries a `color` the example
+ * owns: all start red, and "Randomize colors" picks a new color for FUTURE
+ * points AND rewrites the retained ones' properties + `recolor()`s them — showing
+ * streaming and retained-for-redraw working together.
  */
 export const setup: ImperativeSetup = (host, { width, height, backend, options }) => {
   const world = loadWorld();
@@ -22,18 +29,22 @@ export const setup: ImperativeSetup = (host, { width, height, backend, options }
   map.enableZoom([1, 40]);
 
   const retained: StreamPoint[] = [];
+  let currentColor = DEFAULT_STREAM_COLOR; // the color new points get (until randomized)
   const pointOpts = {
     fill: (f: StreamPoint) => f.properties.color,
-    pointRadius: 1.4,
+    pointRadius: 1.6,
     id: (f: StreamPoint) => f.properties.id,
+    clipTo: "land", // only show points over land
   };
   let points: LayerHandle<StreamPoint> = map.layer("points", [], pointOpts);
   map.render();
 
   let seed = 1;
+  let total = DATA_SIZE_TOTALS[String(options.size)] ?? 1_000_000;
   const ctrl = new StreamController<StreamPoint>({
-    source: (o) => makeStreamingPoints({ total: 10_000_000, ...o }),
+    source: (o) => makeStreamingPoints({ total, ...o }),
     onBatch: (batch) => {
+      for (const f of batch) f.properties.color = currentColor; // new points get the current color
       retained.push(...batch); // retain for redraw / recolor
       points.append(batch); // incremental append — only the new points project
     },
@@ -56,15 +67,23 @@ export const setup: ImperativeSetup = (host, { width, height, backend, options }
       ctrl.setRunning(o.stream === "run");
       if (o.randomize !== lastRandomize) {
         lastRandomize = Number(o.randomize) || 0;
-        for (const f of retained) f.properties.color = randomHsl();
-        points.recolor();
+        currentColor = randomHsl(); // future points...
+        for (const f of retained) f.properties.color = currentColor; // ...and already-stored ones
+        points.recolor(); // re-render from the retained, updated properties
       }
       const batch = Number(o.batch);
       const rate = Number(o.rate);
-      if (batch !== ctrl.batchSize || rate !== ctrl.delayMs || o.restart !== lastRestart) {
+      const newTotal = DATA_SIZE_TOTALS[String(o.size)] ?? total;
+      if (
+        batch !== ctrl.batchSize ||
+        rate !== ctrl.delayMs ||
+        newTotal !== total ||
+        o.restart !== lastRestart
+      ) {
         lastRestart = Number(o.restart) || 0;
         ctrl.batchSize = batch;
         ctrl.delayMs = rate;
+        total = newTotal;
         ctrl.restart(++seed);
       }
     },

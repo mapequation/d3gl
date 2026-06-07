@@ -1,16 +1,22 @@
 import { geoEquirectangular } from "d3-geo";
 import { geoMap, type LayerHandle } from "@mapequation/d3gl/map";
-import { loadWorld, makeStreamingPolygons, type StreamPolygon } from "../shared/geo-data.js";
-import { StreamController, randomHsl } from "../shared/streaming.js";
+import {
+  loadWorld,
+  makeStreamingPolygons,
+  DEFAULT_STREAM_COLOR,
+  type StreamPolygon,
+} from "../shared/geo-data.js";
+import { StreamController, randomHsl, DATA_SIZE_TOTALS } from "../shared/streaming.js";
 import type { ImperativeSetup } from "../types.js";
 
 const OCEAN = "#dbe7f3";
 const LAND = "#e9e7df";
 
 /**
- * Stream small random polygon cells and append them live with `layer.append`.
- * Only the new cells are projected/tessellated per batch; existing ones stay put.
- * A retained GeoJSON array backs the "Randomize colors" recolor.
+ * Stream small polygon cells (clustered around cities + rivers) and append them
+ * live with `layer.append`. Only new cells project/tessellate per batch; existing
+ * ones stay put, clipped to land. All cells start red; "Randomize colors" sets the
+ * color for future cells and rewrites + `recolor()`s the retained ones.
  */
 export const setup: ImperativeSetup = (host, { width, height, backend, options }) => {
   const world = loadWorld();
@@ -21,19 +27,23 @@ export const setup: ImperativeSetup = (host, { width, height, backend, options }
   map.enableZoom([1, 40]);
 
   const retained: StreamPolygon[] = [];
+  let currentColor = DEFAULT_STREAM_COLOR;
   const cellOpts = {
     fill: (f: StreamPolygon) => f.properties.color,
     stroke: "#00000022",
     lineWidth: 0.2,
     id: (f: StreamPolygon) => f.properties.id,
+    clipTo: "land", // only show cells over land
   };
   let cells: LayerHandle<StreamPolygon> = map.layer("cells", [], cellOpts);
   map.render();
 
   let seed = 1;
+  let total = DATA_SIZE_TOTALS[String(options.size)] ?? 1_000_000;
   const ctrl = new StreamController<StreamPolygon>({
-    source: (o) => makeStreamingPolygons({ total: 10_000_000, size: 1.5, ...o }),
+    source: (o) => makeStreamingPolygons({ total, size: 1.5, ...o }),
     onBatch: (batch) => {
+      for (const f of batch) f.properties.color = currentColor;
       retained.push(...batch);
       cells.append(batch);
     },
@@ -56,15 +66,23 @@ export const setup: ImperativeSetup = (host, { width, height, backend, options }
       ctrl.setRunning(o.stream === "run");
       if (o.randomize !== lastRandomize) {
         lastRandomize = Number(o.randomize) || 0;
-        for (const f of retained) f.properties.color = randomHsl();
+        currentColor = randomHsl();
+        for (const f of retained) f.properties.color = currentColor;
         cells.recolor();
       }
       const batch = Number(o.batch);
       const rate = Number(o.rate);
-      if (batch !== ctrl.batchSize || rate !== ctrl.delayMs || o.restart !== lastRestart) {
+      const newTotal = DATA_SIZE_TOTALS[String(o.size)] ?? total;
+      if (
+        batch !== ctrl.batchSize ||
+        rate !== ctrl.delayMs ||
+        newTotal !== total ||
+        o.restart !== lastRestart
+      ) {
         lastRestart = Number(o.restart) || 0;
         ctrl.batchSize = batch;
         ctrl.delayMs = rate;
+        total = newTotal;
         ctrl.restart(++seed);
       }
     },

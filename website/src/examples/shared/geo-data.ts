@@ -145,15 +145,43 @@ export function makeDemoPolygon(): Feature<Polygon> {
   };
 }
 
+/** A handful of major rivers as rough polylines (the bundled world-atlas data has
+ *  no rivers), shown on the GeoJSON-features map and used as streaming cluster
+ *  centers. Coordinates are approximate [lon, lat] traces, mouth → source. */
+export function makeMajorRivers(): Feature<MultiLineString> {
+  const rivers: [number, number][][] = [
+    // Amazon
+    [[-50.0, -0.7], [-55.5, -2.5], [-60.0, -3.1], [-67.9, -3.5], [-73.2, -4.5]],
+    // Nile
+    [[31.3, 31.4], [32.9, 24.1], [32.5, 15.6], [32.5, 9.5], [31.6, 2.3]],
+    // Mississippi
+    [[-89.2, 29.2], [-90.1, 32.3], [-90.2, 38.6], [-91.2, 43.5], [-95.0, 47.2]],
+    // Yangtze
+    [[121.8, 31.4], [114.3, 30.6], [106.5, 29.6], [100.2, 26.9], [94.7, 33.5]],
+    // Congo
+    [[12.4, -6.0], [16.2, -4.3], [20.0, -1.0], [25.2, 0.5], [27.2, 3.0]],
+    // Volga
+    [[48.0, 46.3], [45.0, 48.7], [44.5, 51.6], [47.5, 54.3], [37.0, 57.3]],
+    // Ganges
+    [[90.5, 22.5], [88.0, 24.5], [83.0, 25.4], [78.0, 26.5], [78.9, 30.1]],
+  ];
+  return { type: "Feature", properties: { name: "major-rivers" }, geometry: { type: "MultiLineString", coordinates: rivers } };
+}
+
 // ---------------------------------------------------------------------------
-// Streaming sources — async generators that emit batches of randomly-placed
-// features lazily (only `batchSize` features are materialized per tick, never
-// the whole `total`), so a consumer can `await`-iterate and append them live.
-// Used by the "streaming data" examples to exercise LayerHandle.append.
+// Streaming sources — async generators that emit batches of features lazily
+// (only `batchSize` are materialized per tick, never the whole `total`), so a
+// consumer can `await`-iterate and append them live. Points/cells are CLUSTERED
+// around cities + major-river vertices (not uniform), which the world-map
+// examples then clip to land. Used by the "streaming data" examples.
 // ---------------------------------------------------------------------------
 
-/** Per-feature properties carried by streamed features: a stable id (continues
- *  across batches) plus a color the example mutates for the "randomize" button. */
+/** A solid default color all streamed features start with (the example's
+ *  "randomize" button swaps in a new color for new + retained features). */
+export const DEFAULT_STREAM_COLOR = "#e23b2f";
+
+/** Per-feature properties: a stable id (continues across batches) + a color the
+ *  example owns (constant by default; swapped by the randomize button). */
 export interface StreamProps {
   id: number;
   color: string;
@@ -171,6 +199,8 @@ export interface StreamOptions {
   delayMs?: number;
   /** Seed for the deterministic PRNG (reproducible streams). Default 1. */
   seed?: number;
+  /** Cluster spread in degrees (gaussian stddev around each center). Default 4. */
+  spread?: number;
   /** Cooperative cancellation: iteration stops once `signal.aborted` is true. */
   signal?: { aborted: boolean };
 }
@@ -187,28 +217,42 @@ function mulberry32(seed: number): () => number {
   };
 }
 
-/** A random vivid color as a d3-color-parseable `hsl(h, s%, l%)` string. */
-function randomColor(rng: () => number): string {
-  return `hsl(${Math.floor(rng() * 360)}, 70%, 55%)`;
+/** Standard-normal sample (Box–Muller) from a uniform PRNG. */
+function gaussian(rng: () => number): number {
+  const u = Math.max(1e-9, rng());
+  return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * rng());
+}
+
+const clamp = (x: number, lo: number, hi: number): number => Math.max(lo, Math.min(hi, x));
+
+/** Cluster centers for the streaming sources: every city plus every major-river
+ *  vertex, so points/cells concentrate where features actually are. */
+export function streamClusterCenters(): [number, number][] {
+  const centers: [number, number][] = makeCities().map((c) => c.geometry.coordinates as [number, number]);
+  for (const line of makeMajorRivers().geometry.coordinates) for (const pt of line) centers.push(pt as [number, number]);
+  return centers;
 }
 
 const tick = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
 
-/** Stream random world points as GeoJSON `Feature<Point>` batches (lon/lat uniform). */
+/** Stream world points as GeoJSON `Feature<Point>` batches, clustered (gaussian)
+ *  around city + river centers. All start with DEFAULT_STREAM_COLOR. */
 export async function* makeStreamingPoints(opts: StreamOptions = {}): AsyncGenerator<StreamPoint[]> {
-  const { total = 10_000_000, batchSize = 1000, delayMs = 0, seed = 1, signal } = opts;
+  const { total = 10_000_000, batchSize = 1000, delayMs = 0, seed = 1, spread = 4, signal } = opts;
   const rng = mulberry32(seed);
+  const centers = streamClusterCenters();
   let id = 0;
   while (id < total) {
     if (signal?.aborted) return;
     const n = Math.min(batchSize, total - id);
     const batch: StreamPoint[] = new Array(n);
     for (let k = 0; k < n; k++) {
-      const lon = rng() * 360 - 180;
-      const lat = rng() * 180 - 90;
+      const c = centers[Math.floor(rng() * centers.length)]!;
+      const lon = clamp(c[0] + gaussian(rng) * spread, -180, 180);
+      const lat = clamp(c[1] + gaussian(rng) * spread, -90, 90);
       batch[k] = {
         type: "Feature",
-        properties: { id: id++, color: randomColor(rng) },
+        properties: { id: id++, color: DEFAULT_STREAM_COLOR },
         geometry: { type: "Point", coordinates: [lon, lat] },
       };
     }
@@ -217,24 +261,26 @@ export async function* makeStreamingPoints(opts: StreamOptions = {}): AsyncGener
   }
 }
 
-/** Stream small random cells as GeoJSON `Feature<Polygon>` batches (≈`size`° boxes,
- *  wound like makeCells so d3-geo fills the small box). */
+/** Stream small `size`° polygon cells (wound like makeCells), clustered around
+ *  city + river centers. All start with DEFAULT_STREAM_COLOR. */
 export async function* makeStreamingPolygons(
   opts: StreamOptions & { size?: number } = {},
 ): AsyncGenerator<StreamPolygon[]> {
-  const { total = 10_000_000, batchSize = 1000, delayMs = 0, seed = 1, size = 1.5, signal } = opts;
+  const { total = 10_000_000, batchSize = 1000, delayMs = 0, seed = 1, spread = 4, size = 1.5, signal } = opts;
   const rng = mulberry32(seed);
+  const centers = streamClusterCenters();
   let id = 0;
   while (id < total) {
     if (signal?.aborted) return;
     const n = Math.min(batchSize, total - id);
     const batch: StreamPolygon[] = new Array(n);
     for (let k = 0; k < n; k++) {
-      const lon = rng() * (360 - size) - 180;
-      const lat = rng() * (180 - size) - 90;
+      const c = centers[Math.floor(rng() * centers.length)]!;
+      const lon = clamp(c[0] + gaussian(rng) * spread, -180, 180 - size);
+      const lat = clamp(c[1] + gaussian(rng) * spread, -90, 90 - size);
       batch[k] = {
         type: "Feature",
-        properties: { id: id++, color: randomColor(rng) },
+        properties: { id: id++, color: DEFAULT_STREAM_COLOR },
         geometry: {
           type: "Polygon",
           coordinates: [[[lon, lat], [lon, lat + size], [lon + size, lat + size], [lon + size, lat], [lon, lat]]],
