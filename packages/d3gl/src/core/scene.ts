@@ -96,7 +96,10 @@ class GroupData {
   strokeVerts: number[] = [];
   strokeIdx: number[] = [];
   ranges: DrawableRange[] = [];
-  idToDrawable = new Map<string, number>();
+  // Keyed by the raw id (string OR number) — NOT String(id) — so numeric-id layers
+  // don't allocate a string per drawable (millions, for streamed data). A layer uses
+  // one id type, so 1 vs "1" collisions aren't a real concern.
+  idToDrawable = new Map<string | number, number>();
   fillColors: number[] = []; // flat RGBA, 4 per drawable
   strokeColors: number[] = [];
   flags: number[] = [];
@@ -166,13 +169,12 @@ export class Scene {
     draw: (ctx: PathRecorder) => void,
     opts?: DrawableOpts,
   ): void {
-    const key = String(id);
-    if (data.idToDrawable.has(key)) throw new Error(`duplicate drawable id: ${String(id)}`);
+    if (data.idToDrawable.has(id)) throw new Error(`duplicate drawable id: ${String(id)}`);
     const recorder = new PathRecorder(data.tolerance);
     draw(recorder);
     const subpaths = recorder.subpaths;
     const drawableId = data.ranges.length;
-    data.idToDrawable.set(key, drawableId);
+    data.idToDrawable.set(id, drawableId);
     data.subpaths.push(subpaths.map((s) => ({ closed: s.closed, points: s.points.slice() })));
     data.ids.push(id);
     data.lineWidths.push(opts?.lineWidth ?? 0);
@@ -248,10 +250,9 @@ export class Scene {
     centers: readonly [number, number][],
     r: number,
   ): void {
-    const key = String(id);
-    if (data.idToDrawable.has(key)) throw new Error(`duplicate drawable id: ${String(id)}`);
+    if (data.idToDrawable.has(id)) throw new Error(`duplicate drawable id: ${String(id)}`);
     const drawableId = data.ranges.length;
-    data.idToDrawable.set(key, drawableId);
+    data.idToDrawable.set(id, drawableId);
     data.subpaths.push([]);
     data.circles.push(centers.map(([x, y]) => ({ x, y, r })));
     data.ids.push(id);
@@ -279,7 +280,7 @@ export class Scene {
   /** The contiguous buffer slice a drawable occupies. */
   range(name: string, id: string | number): DrawableRange {
     const data = this.get(name);
-    const drawableId = data.idToDrawable.get(String(id));
+    const drawableId = data.idToDrawable.get(id);
     if (drawableId === undefined) throw new Error(`unknown drawable: ${String(id)}`);
     return data.ranges[drawableId]!;
   }
@@ -287,7 +288,7 @@ export class Scene {
   /** Resolve a group + domain id to its drawableId, or throw. */
   private drawableIdOf(name: string, id: string | number): { data: GroupData; drawableId: number } {
     const data = this.get(name);
-    const drawableId = data.idToDrawable.get(String(id));
+    const drawableId = data.idToDrawable.get(id);
     if (drawableId === undefined) throw new Error(`unknown drawable: ${String(id)}`);
     return { data, drawableId };
   }

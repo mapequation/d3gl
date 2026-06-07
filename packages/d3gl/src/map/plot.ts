@@ -30,6 +30,9 @@ export interface PlotLayerOptions<D = any> {
   /** Screen-space declutter radius (px): on each zoom, hide anchored glyphs that overlap an
    *  already-kept one (earlier data wins). Pairs with `anchor` + "screen" sizeMode. */
   declutter?: number;
+  /** When false, skip the CPU hit index (no hover/pick) — saves an Entry per datum on
+   *  huge non-interactive layers. */
+  pickable?: boolean;
 }
 
 export interface PlotPointOptions<D = any> {
@@ -42,6 +45,9 @@ export interface PlotPointOptions<D = any> {
   clipTo?: string;
   /** "world" (default): radius scales with zoom. "screen": constant pixel size. */
   sizeMode?: "world" | "screen";
+  /** When false, skip the CPU hit index (no hover/pick) — saves an Entry per point on
+   *  huge non-interactive layers (e.g. streamed points). */
+  pickable?: boolean;
 }
 
 export class Plot extends BaseEngine {
@@ -50,14 +56,14 @@ export class Plot extends BaseEngine {
   layer<D>(name: string, data: readonly D[], opts: PlotLayerOptions<D>): LayerHandle<D> {
     const list = data as D[];
     const ids = list.map((d, i) => (opts.id ? opts.id(d, i) : i));
-    this.registerLayer({ name, data: list, ids, fill: opts.fill, stroke: opts.stroke, clipTo: opts.clipTo, sizeMode: opts.sizeMode, declutter: opts.declutter, build: this.buildDrawables(list, ids, 0, opts) });
+    this.registerLayer({ name, data: list, ids, fill: opts.fill, stroke: opts.stroke, clipTo: opts.clipTo, sizeMode: opts.sizeMode, declutter: opts.declutter, pickable: opts.pickable, build: this.buildDrawables(list, ids, 0, opts) });
     return new LayerHandle<D>(this, name, (items) => this.appendDrawables(name, items, opts));
   }
 
   points<D>(name: string, data: readonly D[], opts: PlotPointOptions<D>): LayerHandle<D> {
     const list = data as D[];
     const ids = list.map((d, i) => (opts.id ? opts.id(d, i) : i));
-    this.registerLayer({ name, data: list, ids, fill: opts.fill, stroke: opts.stroke, clipTo: opts.clipTo, sizeMode: opts.sizeMode, build: this.buildPoints(list, ids, 0, opts) });
+    this.registerLayer({ name, data: list, ids, fill: opts.fill, stroke: opts.stroke, clipTo: opts.clipTo, sizeMode: opts.sizeMode, pickable: opts.pickable, build: this.buildPoints(list, ids, 0, opts) });
     return new LayerHandle<D>(this, name, (items) => this.appendPoints(name, items, opts));
   }
 
