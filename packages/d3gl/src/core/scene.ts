@@ -48,6 +48,27 @@ export interface GroupBuffers {
   strokeAnchors: Float32Array;
 }
 
+/**
+ * Buffers for an appended TAIL of a group (see {@link Scene.appendedBuffers}).
+ * Same arrays as {@link GroupBuffers} but each holds only the newly-appended data;
+ * index values are group-absolute. `drawableCount` is the total after the append,
+ * `fromDrawable` the index where the new range begins. Point count = pointCenters/4.
+ */
+export interface GroupBufferDelta {
+  fillVertices: Float32Array;
+  fillIndices: Uint32Array;
+  strokeVertices: Float32Array;
+  strokeIndices: Uint32Array;
+  fillColors: Uint8Array;
+  strokeColors: Uint8Array;
+  flags: Uint8Array;
+  pointCenters: Float32Array;
+  fillAnchors: Float32Array;
+  strokeAnchors: Float32Array;
+  drawableCount: number;
+  fromDrawable: number;
+}
+
 export interface DrawableOpts {
   /** Stroke width in coordinate units. 0/undefined => no stroke geometry. */
   lineWidth?: number;
@@ -327,6 +348,49 @@ export class Scene {
       pointCount: pointFlat.length / 4,
       fillAnchors: new Float32Array(data.fillAnchors),
       strokeAnchors: new Float32Array(data.strokeAnchors),
+    };
+  }
+
+  /**
+   * GPU-ready buffers for ONLY the drawables appended at/after `fromDrawable` —
+   * the tail slices, computed in O(new). A backend whose buffers mirror the group
+   * 1:1 (append-only, same order) can apply this by appending: the index values are
+   * group-ABSOLUTE (no rebasing), because the new vertices sit at the same positions
+   * the group placed them. `fromDrawable >= drawableCount` yields an empty delta.
+   */
+  appendedBuffers(name: string, fromDrawable: number): GroupBufferDelta {
+    const data = this.get(name);
+    const dc = data.ranges.length;
+    const from = Math.max(0, fromDrawable);
+    if (from >= dc) {
+      const empty = (): Float32Array => new Float32Array(0);
+      return {
+        fillVertices: empty(), fillIndices: new Uint32Array(0),
+        strokeVertices: empty(), strokeIndices: new Uint32Array(0),
+        fillColors: new Uint8Array(0), strokeColors: new Uint8Array(0), flags: new Uint8Array(0),
+        pointCenters: empty(), fillAnchors: empty(), strokeAnchors: empty(),
+        drawableCount: dc, fromDrawable: from,
+      };
+    }
+    const r = data.ranges[from]!;
+    const fv = r.fill.vertexOffset, fi = r.fill.indexOffset;
+    const sv = r.stroke.vertexOffset, si = r.stroke.indexOffset;
+    // New circles only; drawableId stays the absolute group index for texture lookup.
+    const pointFlat: number[] = [];
+    for (let i = from; i < dc; i++) for (const c of data.circles[i]!) pointFlat.push(c.x, c.y, c.r, i);
+    return {
+      fillVertices: new Float32Array(data.fillVerts.slice(fv * 3)),
+      fillIndices: new Uint32Array(data.fillIdx.slice(fi)),
+      strokeVertices: new Float32Array(data.strokeVerts.slice(sv * 3)),
+      strokeIndices: new Uint32Array(data.strokeIdx.slice(si)),
+      fillColors: new Uint8Array(data.fillColors.slice(from * 4)),
+      strokeColors: new Uint8Array(data.strokeColors.slice(from * 4)),
+      flags: new Uint8Array(data.flags.slice(from)),
+      pointCenters: new Float32Array(pointFlat),
+      fillAnchors: new Float32Array(data.fillAnchors.slice(fv * 2)),
+      strokeAnchors: new Float32Array(data.strokeAnchors.slice(sv * 2)),
+      drawableCount: dc,
+      fromDrawable: from,
     };
   }
 }
