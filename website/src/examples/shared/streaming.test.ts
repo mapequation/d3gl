@@ -3,11 +3,15 @@ import { StreamController } from "./streaming.js";
 
 const tick = (ms = 0) => new Promise((r) => setTimeout(r, ms));
 
-/** A tiny finite source: yields `count` batches of [seed, i]. */
-async function* source(o: { batchSize: number; seed: number; signal: { aborted: boolean } }, count = 5) {
+/** A tiny finite source: yields `count` batches of [seed, i, size]. `batchSize` is a
+ *  getter (re-read each batch) so adaptive resizing is observable. */
+async function* source(
+  o: { batchSize: () => number; seed: number; signal: { aborted: boolean } },
+  count = 5,
+) {
   for (let i = 0; i < count; i++) {
     if (o.signal.aborted) return;
-    yield [{ seed: o.seed, i, size: o.batchSize }];
+    yield [{ seed: o.seed, i, size: o.batchSize() }];
     await tick(0);
   }
 }
@@ -78,5 +82,40 @@ describe("StreamController", () => {
     const n = seen.length;
     await tick(120);
     expect(seen.length).toBe(n); // no batches after dispose
+  });
+
+  it("adaptive mode grows the batch size when onBatch is well under budget", async () => {
+    const seenSizes: number[] = [];
+    const ctrl = new StreamController<{ size: number }>({
+      source: (o) => source(o, 50),
+      onBatch: (b) => seenSizes.push(b[0]!.size), // trivial/instant work → under budget
+      onReset: () => {},
+    });
+    ctrl.adaptive = true;
+    ctrl.batchSize = 256; // seed
+    ctrl.restart(1);
+    await tick(120); // several batches
+    ctrl.dispose();
+    // Fast onBatch (dt < frameBudget) → batch grows (≤2× per step), bounded at 1e6.
+    expect(ctrl.batchSize).toBeGreaterThan(256);
+    expect(ctrl.batchSize).toBeLessThanOrEqual(1_000_000);
+    // The source observed the growth live (later batches larger than the first).
+    expect(seenSizes[seenSizes.length - 1]!).toBeGreaterThan(seenSizes[0]!);
+  });
+
+  it("non-adaptive mode keeps the batch size fixed", async () => {
+    const seenSizes: number[] = [];
+    const ctrl = new StreamController<{ size: number }>({
+      source: (o) => source(o, 20),
+      onBatch: (b) => seenSizes.push(b[0]!.size),
+      onReset: () => {},
+    });
+    ctrl.adaptive = false;
+    ctrl.batchSize = 100;
+    ctrl.restart(1);
+    await tick(80);
+    ctrl.dispose();
+    expect(ctrl.batchSize).toBe(100);
+    expect(seenSizes.every((s) => s === 100)).toBe(true);
   });
 });

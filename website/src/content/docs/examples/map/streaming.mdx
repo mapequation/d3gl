@@ -20,8 +20,11 @@ the same color; **Randomize colors** picks a new color, applies it to all *futur
 **and** rewrites the retained features' `properties.color` then `recolor()`s them — so
 streaming and the retained-for-redraw data stay in sync. Use **Stream** to pause/resume,
 **Restart** for a fresh stream, **Data size** for the total to stream (100k / 1M / 10M),
-**Batch size** for how many features each tick emits, and **Batch delay (ms)** for an
-artificial per-batch delay that mirrors loading from a file.
+**Batch size** for how many features each tick emits — including **adaptive** (the
+default), which auto-tunes the batch each frame to fit a ~30fps budget so the stream runs
+as fast as the backend allows while staying responsive — and **Batch delay (ms)** for an
+artificial per-batch delay that mirrors loading from a file. The readout's **batch** line
+shows the live (adaptive) batch size.
 
 The source (`makeStreamingPoints` / `makeStreamingPolygons` in `shared/geo-data.ts`) is an
 async generator that yields batches lazily up to the chosen total, so nothing is

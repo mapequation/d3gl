@@ -45,6 +45,16 @@ describe("makeStreamingPoints", () => {
     expect(a.map((f) => f.geometry.coordinates)).not.toEqual(c.map((f) => f.geometry.coordinates));
   });
 
+  it("re-reads a batchSize function each batch (enables adaptive resizing)", async () => {
+    let size = 5;
+    const sizes: number[] = [];
+    for await (const b of makeStreamingPoints({ total: 30, batchSize: () => size })) {
+      sizes.push(b.length);
+      size += 5; // grow between batches — the source must pick this up
+    }
+    expect(sizes).toEqual([5, 10, 15]); // 5 + 10 + 15 = 30, sizes reflect the live getter
+  });
+
   it("stops early when the signal is aborted", async () => {
     const signal = { aborted: false };
     const seen: StreamPoint[] = [];

@@ -1,7 +1,7 @@
 import { geoEquirectangular } from "d3-geo";
 import { geoMap, type LayerHandle } from "@mapequation/d3gl/map";
 import { loadWorld, makeStreamingPolygons, type StreamPolygon } from "../shared/geo-data.js";
-import { StreamController, randomHsl, DATA_SIZE_TOTALS } from "../shared/streaming.js";
+import { StreamController, randomHsl, DATA_SIZE_TOTALS, ADAPTIVE_SEED_BATCH } from "../shared/streaming.js";
 import { createStatsOverlay } from "../shared/stats-overlay.js";
 import type { ImperativeSetup } from "../types.js";
 
@@ -51,21 +51,27 @@ export const setup: ImperativeSetup = (host, { width, height, backend, options }
       cells.append(batch);
       appendMs += performance.now() - t0;
       count += batch.length;
-      stats.update(count, total, count / (appendMs / 1000));
+      stats.update(count, total, count / (appendMs / 1000), ctrl.batchSize);
     },
     onReset: () => {
       retained.length = 0;
       count = 0;
       appendMs = 0;
       cells = map.layer("cells", [], cellOpts);
-      stats.update(0, total, 0, true);
+      stats.update(0, total, 0, ctrl.batchSize, true);
     },
   });
+  // "adaptive" auto-tunes the batch to a frame budget; a number fixes it.
+  const applyBatch = (opt: string): void => {
+    ctrl.adaptive = opt === "adaptive";
+    ctrl.batchSize = ctrl.adaptive ? ADAPTIVE_SEED_BATCH : Number(opt);
+  };
   // Stream runs only when the user wants it AND the canvas is on-screen (the harness
   // calls setVisible). A manual pause persists across scroll-out/in.
   let visible = true;
   let userRunning = options.stream === "run";
-  ctrl.batchSize = Number(options.batch);
+  let lastBatchOpt = String(options.batch);
+  applyBatch(lastBatchOpt);
   ctrl.delayMs = Number(options.rate);
   ctrl.setRunning(userRunning && visible);
   ctrl.restart(seed);
@@ -84,17 +90,18 @@ export const setup: ImperativeSetup = (host, { width, height, backend, options }
         for (const f of retained) f.properties.color = currentColor;
         cells.recolor();
       }
-      const batch = Number(o.batch);
+      const batchOpt = String(o.batch);
       const rate = Number(o.rate);
       const newTotal = DATA_SIZE_TOTALS[String(o.size)] ?? total;
       if (
-        batch !== ctrl.batchSize ||
+        batchOpt !== lastBatchOpt ||
         rate !== ctrl.delayMs ||
         newTotal !== total ||
         o.restart !== lastRestart
       ) {
         lastRestart = Number(o.restart) || 0;
-        ctrl.batchSize = batch;
+        lastBatchOpt = batchOpt;
+        applyBatch(batchOpt);
         ctrl.delayMs = rate;
         total = newTotal;
         ctrl.restart(++seed);
