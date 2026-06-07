@@ -1,6 +1,6 @@
 {
   "name": "@mapequation/d3gl",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "GPU-accelerated rendering for d3 — especially maps with GeoJSON and grid-cell data, with switchable SVG / Canvas2D / WebGL2 backends.",
   "license": "MIT",
   "author": "Daniel Edler",
