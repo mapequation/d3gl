@@ -1,6 +1,7 @@
 import type { GroupBuilder, PathContext } from "../core/index.js";
 import { BaseEngine } from "./base-engine.js";
 import type { BackendType } from "./backend-factory.js";
+import { LayerHandle } from "./layer-handle.js";
 
 export interface PlotOptions { width: number; height: number; backend?: BackendType; }
 export interface PlotLayerOptions<D = any> {
@@ -45,36 +46,62 @@ export interface PlotPointOptions<D = any> {
 
 export class Plot extends BaseEngine {
   constructor(host: HTMLElement, opts: PlotOptions) { super(host, opts.width, opts.height, opts.backend ?? "webgl"); }
-  layer<D>(name: string, data: readonly D[], opts: PlotLayerOptions<D>): this {
+
+  layer<D>(name: string, data: readonly D[], opts: PlotLayerOptions<D>): LayerHandle<D> {
     const list = data as D[];
     const ids = list.map((d, i) => (opts.id ? opts.id(d, i) : i));
+    this.registerLayer({ name, data: list, ids, fill: opts.fill, stroke: opts.stroke, clipTo: opts.clipTo, sizeMode: opts.sizeMode, declutter: opts.declutter, build: this.buildDrawables(list, ids, 0, opts) });
+    return new LayerHandle<D>(this, name, (items) => this.appendDrawables(name, items, opts));
+  }
+
+  points<D>(name: string, data: readonly D[], opts: PlotPointOptions<D>): LayerHandle<D> {
+    const list = data as D[];
+    const ids = list.map((d, i) => (opts.id ? opts.id(d, i) : i));
+    this.registerLayer({ name, data: list, ids, fill: opts.fill, stroke: opts.stroke, clipTo: opts.clipTo, sizeMode: opts.sizeMode, build: this.buildPoints(list, ids, 0, opts) });
+    return new LayerHandle<D>(this, name, (items) => this.appendPoints(name, items, opts));
+  }
+
+  private appendDrawables<D>(name: string, items: readonly D[], opts: PlotLayerOptions<D>): void {
+    if (items.length === 0) return;
+    const spec = this.specs.find((s) => s.name === name);
+    if (!spec) throw new Error(`unknown layer: ${name}`);
+    const base = spec.data.length;
+    const ids = items.map((d, j) => (opts.id ? opts.id(d, base + j) : base + j));
+    this.appendToLayer(name, items, ids, this.buildDrawables(items, ids, base, opts));
+  }
+
+  private appendPoints<D>(name: string, items: readonly D[], opts: PlotPointOptions<D>): void {
+    if (items.length === 0) return;
+    const spec = this.specs.find((s) => s.name === name);
+    if (!spec) throw new Error(`unknown layer: ${name}`);
+    const base = spec.data.length;
+    const ids = items.map((d, j) => (opts.id ? opts.id(d, base + j) : base + j));
+    this.appendToLayer(name, items, ids, this.buildPoints(items, ids, base, opts));
+  }
+
+  /** Build a chunk of context-draw drawables. `base` is the global index of items[0]
+   *  (0 for the initial layer, current length for an append) so user accessors see a
+   *  stable index. */
+  private buildDrawables<D>(items: readonly D[], ids: (string | number)[], base: number, opts: PlotLayerOptions<D>): (g: GroupBuilder) => void {
     const lw = opts.lineWidth;
     const widthOf = typeof lw === "function" ? lw : (_d: D, _i: number) => lw as number;
     const anchorOf = opts.anchor;
-    const build = (g: GroupBuilder): void => {
-      // d3gl's PathContext implements the path-building subset d3 generators use;
-      // present it as CanvasRenderingContext2D (the type their .context()/geoPath
-      // expect) so user draw code needs no cast. Single internal cast here.
-      list.forEach((d, i) =>
+    // d3gl's PathContext implements the path-building subset d3 generators use; present
+    // it as CanvasRenderingContext2D so user draw code needs no cast. Single cast here.
+    return (g) =>
+      items.forEach((d, j) =>
         g.drawable(
-          ids[i]!,
-          (ctx: PathContext) => opts.draw(ctx as unknown as CanvasRenderingContext2D, d, i),
-          lw != null || anchorOf ? { lineWidth: lw != null ? widthOf(d, i) : 0, anchor: anchorOf?.(d, i) } : undefined,
+          ids[j]!,
+          (ctx: PathContext) => opts.draw(ctx as unknown as CanvasRenderingContext2D, d, base + j),
+          lw != null || anchorOf ? { lineWidth: lw != null ? widthOf(d, base + j) : 0, anchor: anchorOf?.(d, base + j) } : undefined,
         ),
       );
-    };
-    this.registerLayer({ name, data: list, ids, fill: opts.fill, stroke: opts.stroke, clipTo: opts.clipTo, sizeMode: opts.sizeMode, declutter: opts.declutter, build });
-    return this;
   }
-  points<D>(name: string, data: readonly D[], opts: PlotPointOptions<D>): this {
-    const list = data as D[];
-    const ids = list.map((d, i) => (opts.id ? opts.id(d, i) : i));
+
+  /** Build a chunk of point drawables (see buildDrawables for `base`). */
+  private buildPoints<D>(items: readonly D[], ids: (string | number)[], base: number, opts: PlotPointOptions<D>): (g: GroupBuilder) => void {
     const resolveRadius = typeof opts.radius === "function" ? opts.radius : (_d: D, _i: number) => (opts.radius as number | undefined) ?? 3;
-    const build = (g: GroupBuilder): void => {
-      list.forEach((d, i) => g.point(ids[i]!, opts.x(d, i), opts.y(d, i), resolveRadius(d, i)));
-    };
-    this.registerLayer({ name, data: list, ids, fill: opts.fill, stroke: opts.stroke, clipTo: opts.clipTo, sizeMode: opts.sizeMode, build });
-    return this;
+    return (g) => items.forEach((d, j) => g.point(ids[j]!, opts.x(d, base + j), opts.y(d, base + j), resolveRadius(d, base + j)));
   }
 }
 export function plot(host: HTMLElement, opts: PlotOptions): Plot { return new Plot(host, opts); }
