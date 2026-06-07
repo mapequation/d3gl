@@ -82,7 +82,6 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
     // enable the interaction the projection calls for.
     render: (options) => {
       const name = (options.projection as string) ?? DEFAULT;
-      const entry = PROJECTIONS[name] ?? PROJECTIONS[DEFAULT]!;
       const hideFeatures = ((options.features as string) ?? "hide") !== "show";
 
       map.setProjection(fit(name));
@@ -101,8 +100,9 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
         hideOnInteraction: hideFeatures,
       });
 
-      if (entry.spherical) map.enableRotation();
-      else map.enableZoom([1, 8]);
+      // One call for every projection: the engine auto-dispatches versor rotation for
+      // spherical projections (GPU-accelerated globe on WebGL) and affine pan/zoom for flat.
+      map.enableZoom([1, 8]);
       map.render();
     },
   };
