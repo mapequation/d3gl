@@ -22,6 +22,9 @@ export interface LayerSpec {
    *  anchored glyphs whose projected anchor falls within this radius of an already-kept one
    *  (grouped by anchor, earlier drawables win) — constant-size markers stop overlapping. */
   declutter?: number;
+  /** When false, no CPU hit index is built for this layer (pick() can't hit it). Skips
+   *  ~one Entry object per drawable — worth it for huge, non-interactive streamed layers. */
+  pickable?: boolean;
   build: (g: GroupBuilder) => void;   // rebuilds the Scene group (geo or draw)
 }
 
@@ -32,7 +35,7 @@ export abstract class BaseEngine {
   /** Per-layer set of drawable ids (as strings), maintained incrementally so an
    *  append's duplicate-id check stays O(new) instead of rebuilding a Set of every
    *  existing id each batch (which made streaming O(total)/batch). */
-  private layerIds = new Map<string, Set<string>>();
+  private layerIds = new Map<string, Set<string | number>>();
   protected transform: ViewTransform = { k: 1, x: 0, y: 0 };
   protected handle: BackendHandle | null = null;
   protected ready: Promise<void>;
@@ -63,10 +66,14 @@ export abstract class BaseEngine {
     const at = this.specs.findIndex((s) => s.name === spec.name);
     if (at >= 0) this.specs[at] = spec;
     else this.specs.push(spec);
-    this.hitIndexes.set(spec.name, new HitIndex(this.scene.drawables(spec.name)));
+    // pickable:false skips the hit index entirely (no Entry-per-drawable) — for big
+    // non-interactive layers. pick() simply can't return that layer (get()?.pick → skip).
+    if (spec.pickable !== false) this.hitIndexes.set(spec.name, new HitIndex(this.scene.drawables(spec.name)));
+    else this.hitIndexes.delete(spec.name);
     // Seed the incremental id set from the full (re)built spec (O(total) here, but a
-    // register/rebuild is already O(total); appends then stay O(new)).
-    this.layerIds.set(spec.name, new Set(spec.ids.map(String)));
+    // register/rebuild is already O(total); appends then stay O(new)). Raw ids (no
+    // String()) so numeric-id layers don't allocate a string per drawable.
+    this.layerIds.set(spec.name, new Set(spec.ids));
     this.pushLayers();
   }
 
@@ -90,12 +97,11 @@ export abstract class BaseEngine {
     // Validate against the PERSISTENT id set (O(new)); a from-scratch
     // `new Set(spec.ids…)` here would be O(total) every batch and make streaming
     // quadratic. Don't mutate the set until validation passes (keeps append atomic).
-    const existing = this.layerIds.get(name) ?? new Set(spec.ids.map(String));
-    const seen = new Set<string>();
+    const existing = this.layerIds.get(name) ?? new Set(spec.ids);
+    const seen = new Set<string | number>();
     for (const id of ids) {
-      const key = String(id);
-      if (existing.has(key) || seen.has(key)) throw new Error(`duplicate drawable id: ${key}`);
-      seen.add(key);
+      if (existing.has(id) || seen.has(id)) throw new Error(`duplicate drawable id: ${String(id)}`);
+      seen.add(id);
     }
     const drawOffset = this.scene.drawableCount(name); // drawables, not data (culling may differ)
     const dataStart = spec.data.length;

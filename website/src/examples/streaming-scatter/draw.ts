@@ -27,6 +27,7 @@ export const setup: ImperativeSetup = (host, { width, height, backend, options }
     fill: (f: StreamPoint) => f.properties.color,
     id: (f: StreamPoint) => f.properties.id,
     sizeMode: "screen" as const, // constant 1px dots regardless of zoom
+    pickable: false, // huge streamed layer — skip the hit index to save memory
   };
   let points: LayerHandle<StreamPoint> = chart.points("points", [], pointOpts);
   chart.render();

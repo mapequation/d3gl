@@ -36,6 +36,7 @@ export const setup: ImperativeSetup = (host, { width, height, backend, options }
     pointRadius: 0.5,
     id: (f: StreamPoint) => f.properties.id,
     clipTo: "land", // only show points over land
+    pickable: false, // millions of streamed points — skip the hit index (no hover) to save memory
   };
   let points: LayerHandle<StreamPoint> = map.layer("points", [], pointOpts);
   map.render();

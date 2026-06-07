@@ -19,6 +19,9 @@ export interface LayerOptions<F = any> {
    *  zoom/pan gesture (re-projects + reappears when the gesture ends). Use for
    *  dense layers so only the cheap layers re-project per rotation frame. */
   hideOnInteraction?: boolean;
+  /** When false, skip the CPU hit index for this layer (no hover/pick on it) — saves an
+   *  Entry object per feature; use for huge, non-interactive layers (e.g. streamed points). */
+  pickable?: boolean;
 }
 
 /** Options for {@link GeoMap.enableRotation}. */
@@ -322,7 +325,7 @@ export class GeoMap extends BaseEngine {
     const ids = list.map((f, i) => (opts.id ? opts.id(f, i) : i));
     return {
       name, data: list, ids, fill: opts.fill, stroke: opts.stroke, clipTo: opts.clipTo,
-      sizeMode: opts.sizeMode, hideOnInteraction: opts.hideOnInteraction,
+      sizeMode: opts.sizeMode, hideOnInteraction: opts.hideOnInteraction, pickable: opts.pickable,
       build: geoLayer(list, this.bakeProjection ?? this.projection, { id: (_f, i) => ids[i]!, lineWidth: opts.lineWidth, pointRadius: opts.pointRadius, sizeMode: opts.sizeMode }),
     };
   }

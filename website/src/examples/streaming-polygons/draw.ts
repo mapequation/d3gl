@@ -30,6 +30,7 @@ export const setup: ImperativeSetup = (host, { width, height, backend, options }
     fill: (f: StreamPolygon) => f.properties.color,
     id: (f: StreamPolygon) => f.properties.id,
     clipTo: "land", // only show ranges over land
+    pickable: false, // huge streamed layer — skip the hit index to save memory
   };
   let cells: LayerHandle<StreamPolygon> = map.layer("cells", [], cellOpts);
   map.render();
