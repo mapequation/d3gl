@@ -286,6 +286,30 @@ function clusteredLonLat(rng: () => number, p: Parent): [number, number] {
   ];
 }
 
+/**
+ * An irregular, star-convex polygon ring (3–10 vertices, varied per-vertex radius)
+ * centered at [clon, clat] with overall extent ≤ ~`size`° — a rough species range.
+ * Angles are evenly spaced with bounded jitter so they stay monotonic ⇒ the ring is
+ * simple (non-self-intersecting) and closed. Longitude offsets are widened by
+ * 1/cos(lat) so ranges don't look squished toward the poles.
+ */
+function randomRangeRing(rng: () => number, clon: number, clat: number, size: number): [number, number][] {
+  const verts = 3 + Math.floor(rng() * 8); // 3..10
+  const base = size * (0.15 + 0.5 * rng()); // varied overall size
+  const latScale = 1 / Math.max(0.25, Math.cos((clat * Math.PI) / 180));
+  const ring: [number, number][] = [];
+  for (let i = 0; i < verts; i++) {
+    const ang = ((i + 0.5 * rng()) / verts) * 2 * Math.PI; // monotonic ⇒ simple polygon
+    const r = base * (0.5 + rng()); // per-vertex radius variation
+    ring.push([
+      clamp(clon + r * Math.cos(ang) * latScale, -180, 180),
+      clamp(clat + r * Math.sin(ang), -90, 90),
+    ]);
+  }
+  ring.push(ring[0]!); // close the ring
+  return ring;
+}
+
 const tick = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
 
 /** Stream world points as GeoJSON `Feature<Point>` batches, clustered around
@@ -313,10 +337,10 @@ export async function* makeStreamingPoints(opts: StreamOptions = {}): AsyncGener
   }
 }
 
-/** Stream polygon "range" cells clustered around hotspots, each a box of random
- *  side ≤ `size`° (large, to mimic species ranges). All start with
- *  DEFAULT_STREAM_COLOR; the example renders them very transparent so overlapping
- *  ranges build up richness. */
+/** Stream irregular polygon "ranges" clustered around hotspots — each a 3–10
+ *  vertex star-convex polygon of varied size ≤ ~`size`°, to mimic species ranges.
+ *  All start with DEFAULT_STREAM_COLOR; the example renders them very transparent
+ *  so overlapping ranges build up richness. */
 export async function* makeStreamingPolygons(
   opts: StreamOptions & { size?: number } = {},
 ): AsyncGenerator<StreamPolygon[]> {
@@ -330,17 +354,11 @@ export async function* makeStreamingPolygons(
     const n = Math.min(batchSize, total - id);
     const batch: StreamPolygon[] = new Array(n);
     for (let k = 0; k < n; k++) {
-      const center = clusteredLonLat(rng, pickParent(rng, parents, cum));
-      const s = size * (0.3 + 0.7 * rng()); // varied range sizes, ≤ size
-      const lon = clamp(center[0], -180, 180 - size);
-      const lat = clamp(center[1], -90, 90 - size);
+      const [clon, clat] = clusteredLonLat(rng, pickParent(rng, parents, cum));
       batch[k] = {
         type: "Feature",
         properties: { id: id++, color: DEFAULT_STREAM_COLOR },
-        geometry: {
-          type: "Polygon",
-          coordinates: [[[lon, lat], [lon, lat + s], [lon + s, lat + s], [lon + s, lat], [lon, lat]]],
-        },
+        geometry: { type: "Polygon", coordinates: [randomRangeRing(rng, clon, clat, size)] },
       };
     }
     yield batch;

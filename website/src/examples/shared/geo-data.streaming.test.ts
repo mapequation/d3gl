@@ -59,19 +59,25 @@ describe("makeStreamingPoints", () => {
 });
 
 describe("makeStreamingPolygons", () => {
-  it("emits closed `size`° boxes with continuing ids and a color", async () => {
-    const all = await collect(makeStreamingPolygons({ total: 12, batchSize: 5, size: 2 }));
-    expect(all).toHaveLength(12);
-    expect(all.map((f) => f.properties.id)).toEqual([...Array(12).keys()]);
+  it("emits irregular closed rings (3–10 vertices) with continuing ids and a color", async () => {
+    const all = await collect(makeStreamingPolygons({ total: 40, batchSize: 5, size: 8 }));
+    expect(all).toHaveLength(40);
+    expect(all.map((f) => f.properties.id)).toEqual([...Array(40).keys()]);
+    const ringLengths = new Set<number>();
     for (const f of all) {
       const ring = f.geometry.coordinates[0]!;
-      expect(ring).toHaveLength(5); // closed quad: 5 coords
-      expect(ring[0]).toEqual(ring[4]); // closed
-      const [lon, lat] = ring[0]!;
-      // box corner stays in-range so lon+size / lat+size don't exceed the sphere
-      expect(lon).toBeLessThanOrEqual(180 - 2);
-      expect(lat).toBeLessThanOrEqual(90 - 2);
+      ringLengths.add(ring.length);
+      expect(ring.length).toBeGreaterThanOrEqual(4); // 3 verts + close
+      expect(ring.length).toBeLessThanOrEqual(11); // 10 verts + close
+      expect(ring[0]).toEqual(ring[ring.length - 1]!); // closed
+      for (const [lon, lat] of ring) {
+        expect(lon).toBeGreaterThanOrEqual(-180);
+        expect(lon).toBeLessThanOrEqual(180);
+        expect(lat).toBeGreaterThanOrEqual(-90);
+        expect(lat).toBeLessThanOrEqual(90);
+      }
       expect(f.properties.color).toBe(DEFAULT_STREAM_COLOR);
     }
+    expect(ringLengths.size).toBeGreaterThan(1); // genuinely varied vertex counts
   });
 });
