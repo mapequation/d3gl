@@ -31,17 +31,23 @@ describe("SvgBackend", () => {
     backend.destroy();
   });
 
-  it("setTransform on an all-world scene only re-points the view group (no re-serialize)", () => {
+  it("all-world pan/zoom doesn't re-serialize, even via the engine's setTransform-then-render flow", () => {
     const el = document.createElement("div");
     document.body.appendChild(el);
     const backend = new SvgBackend(el, 100, 100);
     backend.setLayers([layer("a", "rgb(255,0,0)")]); // world sizeMode
     backend.render();
     const view = el.querySelector("svg")!.querySelector("g")!; // first <g> = the view group
-    const before = view.innerHTML;
+    const pathNode = view.querySelector("path")!; // a specific live node
+
+    // Mimic BaseEngine.setTransform: backend.setTransform(t) THEN render().
     backend.setTransform({ k: 5, x: 7, y: 9 });
+    backend.render();
+
     expect(view.getAttribute("transform")).toBe("translate(7, 9) scale(5)");
-    expect(view.innerHTML).toBe(before); // O(1): content was NOT re-serialized
+    // The SAME node object must still be there — re-serialization would replace it (even
+    // if the string were identical). This is what keeps a 64k-cell SVG zoom from O(total).
+    expect(view.querySelector("path")).toBe(pathNode);
     backend.destroy();
   });
 
@@ -58,7 +64,8 @@ describe("SvgBackend", () => {
     const svg = el.querySelector("svg")!;
     expect(svg.querySelector("circle")!.getAttribute("cx")).toBe("10"); // 1*10+0
     backend.setTransform({ k: 2, x: 0, y: 0 });
-    expect(svg.querySelector("circle")!.getAttribute("cx")).toBe("20"); // re-serialized: 2*10+0
+    backend.render(); // engine flow re-serializes (hasScreen → dirty)
+    expect(svg.querySelector("circle")!.getAttribute("cx")).toBe("20"); // 2*10+0
     backend.destroy();
   });
 
