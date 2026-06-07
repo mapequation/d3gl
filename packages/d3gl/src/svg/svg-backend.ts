@@ -17,6 +17,11 @@ export class SvgBackend implements Backend {
   /** True when some layer is screen sizeMode → `view`/strokes depend on the transform,
    *  so a move must re-serialize (no O(1) transform fast path). */
   private hasScreen = false;
+  /** Content (not just the transform) changed since the last render, so `render()`
+   *  must re-serialize. The engine calls `render()` after every `setTransform`; this
+   *  lets that call be a no-op for an all-world pan/zoom (the retained DOM stands,
+   *  only the view group's transform attribute changed). */
+  private dirty = true;
 
   constructor(private host: HTMLElement, private width: number, private height: number) {
     this.root = document.createElementNS(SVG_NS, "svg");
@@ -35,27 +40,31 @@ export class SvgBackend implements Backend {
     host.appendChild(this.root);
   }
 
-  setLayers(layers: RenderLayer[]): void { this.layers = layers; }
+  setLayers(layers: RenderLayer[]): void { this.layers = layers; this.dirty = true; }
   updateLayer(name: string, layer: RenderLayer): void {
     const i = this.layers.findIndex((l) => l.name === name);
     if (i >= 0) this.layers[i] = layer; else this.layers.push(layer);
+    this.dirty = true;
   }
 
   setTransform(t: ViewTransform): void {
     this.transform = t;
-    // O(1) for the common (all-world) case: just re-point the view group. Screen-mode
-    // content (and screen-mode stroke widths) bake in the transform, so re-serialize then.
+    // O(1) for the common (all-world) case: just re-point the view group, and DON'T mark
+    // dirty — the engine's following render() then no-ops (the retained DOM stands). With
+    // screen-mode content the coords/strokes bake the transform, so a re-serialize is due.
     this.view.setAttribute("transform", viewTransform(t));
-    if (this.hasScreen) this.render();
+    if (this.hasScreen) this.dirty = true;
   }
 
   render(): void {
+    if (!this.dirty) return; // only the transform changed (already applied in setTransform)
     const { defs, world, screen, hasScreen } = svgBody(this.layers, this.transform);
     this.defs.innerHTML = defs;
     this.view.innerHTML = world;
     this.view.setAttribute("transform", viewTransform(this.transform));
     this.screen.innerHTML = screen;
     this.hasScreen = hasScreen;
+    this.dirty = false;
   }
 
   toSVG(): string { return svgFromLayers(this.width, this.height, this.layers, this.transform); }
