@@ -49,8 +49,10 @@ export const setup: ImperativeSetup = (host, { width, height, backend, options }
   const ctrl = new StreamController<StreamPoint>({
     source: (o) => makeStreamingPoints({ total, ...o }),
     onBatch: (batch) => {
-      for (const f of batch) f.properties.color = currentColor; // new points get the current color
-      retained.push(...batch); // retain for redraw / recolor
+      for (const f of batch) {
+        f.properties.color = currentColor; // new points get the current color
+        retained.push(f); // retain for redraw / recolor (loop, not push(...spread): batch can be 1M)
+      }
       const t0 = performance.now();
       points.append(batch); // incremental append — only the new points project
       appendMs += performance.now() - t0;

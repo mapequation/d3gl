@@ -67,40 +67,33 @@ export class WebGLBackend implements Backend {
     this.bakeDirty = true;
   }
 
+  /**
+   * Update a layer. If the drawable count is unchanged this is the cheap recolor /
+   * show-hide path (`updateColors` rewrites only the palette/flags textures). If the
+   * count changed — e.g. a `LayerHandle.append` routed here because this backend
+   * doesn't implement the incremental `appendToLayer` — rebuild the layer's renderer
+   * from the full buffers (correct, but O(total) per call).
+   *
+   * TODO(perf): implement the incremental `Backend.appendToLayer(delta)` here — grow
+   * the VBOs with `Buffer.write` + capacity doubling and the color/flag textures with
+   * `Texture.writeData`, bumping `Model.setVertexCount` — so an append is O(new). The
+   * luma.gl API supports it (`createBuffer({byteLength})`, `write`, `setVertexCount`,
+   * `setAttributes`); deferred because it needs interactive browser verification.
+   */
   updateLayer(name: string, layer: RenderLayer): void {
     const existing = this.renderers.get(name);
-    if (existing) {
-      existing.updateColors(layer.buffers);
+    const prev = this.layers.get(name);
+    if (existing && prev && prev.buffers.drawableCount === layer.buffers.drawableCount) {
+      existing.updateColors(layer.buffers); // same count → recolor/show-hide only
       this.layers.set(name, layer);
     } else {
+      existing?.destroy(); // count changed (append) or new layer → (re)build renderer
       const renderer = new GroupRenderer(this.device, layer.buffers, this.width, this.height);
       renderer.setTransform(this.clipMatrix);
       this.renderers.set(name, renderer);
       this.layers.set(name, layer);
-      this.order.push(name);
+      if (!this.order.includes(name)) this.order.push(name);
     }
-    this.bakeDirty = true;
-  }
-
-  /**
-   * Apply an incremental append for one layer. `updateColors` (the recolor path)
-   * can't be used here because it asserts an unchanged drawable count — an append
-   * grows the layer. For now this rebuilds the layer's renderer from the FULL
-   * buffers (correct, but O(total) per batch).
-   *
-   * TODO(perf): true O(new) upload — grow the VBOs/index buffers with capacity
-   * doubling + `bufferSubData` the tail from `addedFrom`, and `texSubImage2D` only
-   * the new color/flag rows — so a batch costs O(new), not O(total). Deferred
-   * because it needs interactive (browser) verification of the GPU paths.
-   */
-  appendToLayer(name: string, layer: RenderLayer, _addedFrom: number): void {
-    const existing = this.renderers.get(name);
-    if (existing) existing.destroy();
-    const renderer = new GroupRenderer(this.device, layer.buffers, this.width, this.height);
-    renderer.setTransform(this.clipMatrix);
-    this.renderers.set(name, renderer);
-    this.layers.set(name, layer);
-    if (!existing) this.order.push(name);
     this.bakeDirty = true;
   }
 

@@ -88,19 +88,39 @@ export abstract class BaseEngine {
       seen.add(key);
     }
     const drawOffset = this.scene.drawableCount(name); // drawables, not data (culling may differ)
+    const dataStart = spec.data.length;
     this.scene.appendToGroup(name, build);
-    spec.data.push(...items);
-    spec.ids.push(...ids);
-    this.applyAccessors(spec, spec.data.length - items.length);
-    this.hitIndexes.get(name)?.append(this.scene.drawables(name).slice(drawOffset));
+    // NB: never `push(...items)` — spreading a large batch (the batch-size control goes
+    // to 1M) exceeds the argument-count limit and throws RangeError. Loop instead.
+    for (const it of items) spec.data.push(it);
+    for (const id of ids) spec.ids.push(id);
+    // Which appended ids actually produced a drawable (culling may drop some)?
+    // (DrawableVector copies its color into a fresh tuple at read time, so we must
+    //  color the scene FIRST, then read the drawables we hand to the hit index /
+    //  backend — otherwise they'd carry the default transparent fill and not paint.)
+    const present = new Set(this.scene.drawables(name, drawOffset).map((d) => d.id));
+    this.applyAccessors(spec, dataStart, present);
+    const newDrawables = this.scene.drawables(name, drawOffset); // O(new), colored
+    this.hitIndexes.get(name)?.append(newDrawables);
     // Skip the GPU push for a layer hidden mid-interaction (mirrors recolor): the
     // gesture-end rebuild re-projects + re-pushes the full extended list.
     if (this.interacting && spec.hideOnInteraction) return;
-    const rl = this.renderLayer(spec);
     const backend = this.handle?.backend;
-    if (backend?.appendToLayer) backend.appendToLayer(name, rl, drawOffset);
-    else backend?.updateLayer(name, rl);
-    this.render();
+    if (backend?.appendToLayer) {
+      // O(new): the backend uploads/draws ONLY the appended delta (and is responsible
+      // for making it visible — e.g. canvas draws-on-top). No full render() here, or
+      // we'd pay O(total) per batch and defeat the point.
+      backend.appendToLayer({
+        name,
+        buffers: this.scene.appendedBuffers(name, drawOffset),
+        drawables: newDrawables,
+        clipTo: spec.clipTo,
+        sizeMode: spec.sizeMode,
+      });
+    } else {
+      backend?.updateLayer(name, this.renderLayer(spec)); // fallback: full re-upload (e.g. SVG)
+      this.render();
+    }
   }
 
   recolor(name: string): this {
@@ -268,16 +288,18 @@ export abstract class BaseEngine {
   private resolve<T>(a: Accessor<any, T> | undefined, d: any, i: number): T | undefined {
     return typeof a === "function" ? (a as (d: any, i: number) => T)(d, i) : a;
   }
-  private applyAccessors(spec: LayerSpec, start = 0): void {
+  private applyAccessors(spec: LayerSpec, start = 0, present?: Set<string | number>): void {
     // A spec has one id per datum, but the built group may have fewer drawables —
     // e.g. geoLayer culls back-hemisphere points on a globe, so those ids have no
     // drawable. Only color the ids actually present (setFill/Stroke throw on
     // unknown ids), which keeps the typo guard for genuinely-missing drawables.
-    const present = new Set(this.scene.drawables(spec.name).map((dr) => dr.id));
+    // `present` is supplied by the append path (only the new drawables) so coloring
+    // stays O(new); a full (re)build passes nothing and scans all drawables.
+    const ids = present ?? new Set(this.scene.drawables(spec.name).map((dr) => dr.id));
     for (let i = start; i < spec.data.length; i++) {
       const d = spec.data[i]!;
       const id = spec.ids[i]!;
-      if (!present.has(id)) continue;
+      if (!ids.has(id)) continue;
       const fill = this.resolve(spec.fill, d, i);
       if (fill) this.scene.setFill(spec.name, id, fill);
       const stroke = this.resolve(spec.stroke, d, i);
