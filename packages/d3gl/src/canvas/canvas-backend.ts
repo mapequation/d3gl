@@ -1,4 +1,4 @@
-import type { Backend, RenderLayer, ViewTransform, DrawableVector } from "../core/index.js";
+import type { Backend, RenderLayer, RenderDelta, ViewTransform, DrawableVector } from "../core/index.js";
 import { svgFromLayers } from "../svg/index.js";
 
 function trace(ctx: CanvasRenderingContext2D, d: DrawableVector): void {
@@ -29,13 +29,37 @@ export class CanvasBackend implements Backend {
     if (i >= 0) this.layers[i] = layer; else this.layers.push(layer);
   }
   setTransform(t: ViewTransform): void { this.transform = t; }
+
+  /**
+   * Incremental append (O(new)): accumulate the new drawables into the stored layer
+   * (so a later full `render()` still draws everything) and draw ONLY those new
+   * drawables on top of the current canvas — no clear. This is the canvas analog of
+   * a GPU sub-buffer upload; full redraws happen on transform/recolor/resize.
+   */
+  appendToLayer(delta: RenderDelta): void {
+    const layer = this.layers.find((l) => l.name === delta.name);
+    if (!layer) return; // layer is always registered (setLayers) before any append
+    (layer.drawables as DrawableVector[]).push(...delta.drawables);
+    const t = this.transform;
+    this.ctx.setTransform(t.k, 0, 0, t.k, t.x, t.y); // current view, NO clear
+    this.paintDrawables(layer, delta.drawables);
+  }
+
   render(): void {
     const { ctx } = this;
     ctx.setTransform(1, 0, 0, 1, 0, 0);
     ctx.clearRect(0, 0, this.width, this.height);
     const t = this.transform;
     ctx.setTransform(t.k, 0, 0, t.k, t.x, t.y);
-    for (const layer of this.layers) {
+    for (const layer of this.layers) this.paintDrawables(layer, layer.drawables);
+  }
+
+  /** Draw `drawables` for one layer (honoring its clip + sizeMode) at the current
+   *  transform. Shared by full `render()` and incremental `appendToLayer`. */
+  private paintDrawables(layer: RenderLayer, drawables: readonly DrawableVector[]): void {
+    const { ctx } = this;
+    const t = this.transform;
+    {
       const clipSrc = layer.clipTo ? this.layers.find((l) => l.name === layer.clipTo) : undefined;
       if (clipSrc) {
         ctx.save();
@@ -59,7 +83,7 @@ export class CanvasBackend implements Backend {
         if (d.fill[3] > 0) { ctx.fillStyle = css(d.fill); ctx.fill(); }
         if (d.stroke[3] > 0 && strokeW > 0) { ctx.strokeStyle = css(d.stroke); ctx.lineWidth = strokeW; ctx.stroke(); }
       };
-      for (const d of layer.drawables) {
+      for (const d of drawables) {
         if ((d.flags & 1) === 0) continue;
         if (d.circles.length > 0) {
           // Circle drawable: arc per circle, honoring active clip.

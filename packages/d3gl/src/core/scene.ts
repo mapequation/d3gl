@@ -310,19 +310,24 @@ export class Scene {
     data.flags[drawableId] = flags & 0xff;
   }
 
-  /** Return the vector view of all drawables in a group. */
-  drawables(name: string): DrawableVector[] {
+  /** Return the vector view of a group's drawables, optionally only those at/after
+   *  `from` (so an incremental append can read just the new ones in O(new)). */
+  drawables(name: string, from = 0): DrawableVector[] {
     const data = this.get(name);
-    return data.ids.map((id, i) => ({
-      id,
-      subpaths: data.subpaths[i]!,
-      fill: [data.fillColors[i * 4]!, data.fillColors[i * 4 + 1]!, data.fillColors[i * 4 + 2]!, data.fillColors[i * 4 + 3]!],
-      stroke: [data.strokeColors[i * 4]!, data.strokeColors[i * 4 + 1]!, data.strokeColors[i * 4 + 2]!, data.strokeColors[i * 4 + 3]!],
-      lineWidth: data.lineWidths[i]!,
-      flags: data.flags[i]!,
-      circles: data.circles[i]!,
-      anchor: data.anchors[i]!,
-    }));
+    const out: DrawableVector[] = [];
+    for (let i = Math.max(0, from); i < data.ids.length; i++) {
+      out.push({
+        id: data.ids[i]!,
+        subpaths: data.subpaths[i]!,
+        fill: [data.fillColors[i * 4]!, data.fillColors[i * 4 + 1]!, data.fillColors[i * 4 + 2]!, data.fillColors[i * 4 + 3]!],
+        stroke: [data.strokeColors[i * 4]!, data.strokeColors[i * 4 + 1]!, data.strokeColors[i * 4 + 2]!, data.strokeColors[i * 4 + 3]!],
+        lineWidth: data.lineWidths[i]!,
+        flags: data.flags[i]!,
+        circles: data.circles[i]!,
+        anchor: data.anchors[i]!,
+      });
+    }
+    return out;
   }
 
   /** Assemble GPU-ready typed arrays for a group. */

@@ -1,4 +1,4 @@
-import type { GroupBuffers, DrawableVector } from "./scene.js";
+import type { GroupBuffers, GroupBufferDelta, DrawableVector } from "./scene.js";
 
 /** View transform applied on top of project-once geometry: scale k, translate (x, y). */
 export interface ViewTransform {
@@ -22,18 +22,32 @@ export interface RenderLayer {
   sizeMode?: "world" | "screen";
 }
 
+/**
+ * An incremental append for one layer: only the drawables added at/after
+ * `buffers.fromDrawable`. `buffers` are the delta GPU buffers (for WebGL), `drawables`
+ * the matching new vector views (for Canvas/SVG draw-on-top). Index values in
+ * `buffers` are group-absolute, so a backend whose buffers mirror the group appends
+ * verbatim. `clipTo`/`sizeMode` mirror the layer's current settings.
+ */
+export interface RenderDelta {
+  name: string;
+  buffers: GroupBufferDelta;
+  drawables: DrawableVector[];
+  clipTo?: string;
+  sizeMode?: "world" | "screen";
+}
+
 /** A renderer for a Scene, implemented per target (WebGL / Canvas / SVG). */
 export interface Backend {
   setLayers(layers: RenderLayer[]): void;
   updateLayer(name: string, layer: RenderLayer): void;
   /**
-   * Append-only fast path (optional). Same observable result as
-   * `updateLayer(name, layer)`, but a backend MAY upload only the tail of each
-   * buffer — the drawables/vertices added at or after `addedFrom` (the drawable
-   * index where the appended range begins). Backends that don't implement this are
-   * driven via `updateLayer` (full re-upload). No backend implements it yet.
+   * Append-only fast path (optional). Same observable result as a full re-upload,
+   * but the backend uploads/draws only the appended tail (`delta`) — O(new) instead
+   * of O(total). Backends that don't implement it are driven via `updateLayer`
+   * (full re-upload); the engine still calls `updateLayer` for non-append changes.
    */
-  appendToLayer?(name: string, layer: RenderLayer, addedFrom: number): void;
+  appendToLayer?(delta: RenderDelta): void;
   setTransform(t: ViewTransform): void;
   render(): void;
   toPNG(): string;

@@ -70,4 +70,31 @@ describe("GeoMap incremental append", () => {
     expect(() => occ.append(pt(20, 0))).toThrow(/duplicate drawable id/);
     map.destroy();
   });
+
+  it("canvas draw-on-top: many batches accumulate and survive a zoom redraw", async () => {
+    // Exercises CanvasBackend.appendToLayer (draw new on top, no clear) + the stored-
+    // layer accumulation that a later full render() (e.g. after zoom) redraws from.
+    const host = mount();
+    const map = geoMap(host, { width: 200, height: 200, projection: proj(), backend: "canvas" });
+    await map.whenReady();
+    const occ = map.layer("occ", [] as GeoJSON.Feature[], {
+      pointRadius: 3,
+      fill: "rgb(255,0,0)",
+      id: (f) => `o${(f.geometry as any).coordinates[0]}`,
+    });
+    // Append across several batches: lon 0,10,20 → x 100,110,120 (lat 0 → y 100).
+    occ.append(pt(0, 0));
+    occ.append([pt(10, 0), pt(20, 0)]);
+    map.render();
+    expect(map.pick(100, 100)?.id).toBe("o0"); // first batch
+    expect(map.pick(110, 100)?.id).toBe("o10"); // later batch
+    expect(map.pick(120, 100)?.id).toBe("o20");
+
+    // A full redraw (e.g. on zoom) must still show every accumulated batch.
+    map.setTransform({ k: 1, x: 0, y: 0 });
+    map.render();
+    expect(map.pick(100, 100)?.id).toBe("o0");
+    expect(map.pick(120, 100)?.id).toBe("o20");
+    map.destroy();
+  });
 });
