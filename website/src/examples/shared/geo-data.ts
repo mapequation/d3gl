@@ -192,8 +192,9 @@ export type StreamPolygon = Feature<Polygon, StreamProps>;
 export interface StreamOptions {
   /** Total features emitted before the generator completes. Default 10,000,000. */
   total?: number;
-  /** Features per yielded batch. Default 1000. */
-  batchSize?: number;
+  /** Features per yielded batch. A function is re-read every batch, so the caller can
+   *  resize adaptively (e.g. to fit a frame budget). Default 1000. */
+  batchSize?: number | (() => number);
   /** Artificial delay between batches (ms), to mirror loading from a file/network.
    *  Even 0 yields a macrotask so the browser can paint between batches. Default 0. */
   delayMs?: number;
@@ -320,13 +321,14 @@ const tick = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms)
  *  many multi-scale hotspots. All start with DEFAULT_STREAM_COLOR. */
 export async function* makeStreamingPoints(opts: StreamOptions = {}): AsyncGenerator<StreamPoint[]> {
   const { total = 10_000_000, batchSize = 1000, delayMs = 0, seed = 1, signal } = opts;
+  const sizeOf = (): number => Math.max(1, Math.floor(typeof batchSize === "function" ? batchSize() : batchSize));
   const rng = mulberry32(seed);
   const parents = buildParents(rng);
   const cum = cumulativeWeights(parents);
   let id = 0;
   while (id < total) {
     if (signal?.aborted) return;
-    const n = Math.min(batchSize, total - id);
+    const n = Math.min(sizeOf(), total - id);
     const batch: StreamPoint[] = new Array(n);
     for (let k = 0; k < n; k++) {
       const [lon, lat] = clusteredLonLat(rng, pickParent(rng, parents, cum));
@@ -349,13 +351,14 @@ export async function* makeStreamingPolygons(
   opts: StreamOptions & { size?: number } = {},
 ): AsyncGenerator<StreamPolygon[]> {
   const { total = 10_000_000, batchSize = 1000, delayMs = 0, seed = 1, size = 16, signal } = opts;
+  const sizeOf = (): number => Math.max(1, Math.floor(typeof batchSize === "function" ? batchSize() : batchSize));
   const rng = mulberry32(seed);
   const parents = buildParents(rng);
   const cum = cumulativeWeights(parents);
   let id = 0;
   while (id < total) {
     if (signal?.aborted) return;
-    const n = Math.min(batchSize, total - id);
+    const n = Math.min(sizeOf(), total - id);
     const batch: StreamPolygon[] = new Array(n);
     for (let k = 0; k < n; k++) {
       const [clon, clat] = clusteredLonLat(rng, pickParent(rng, parents, cum));
