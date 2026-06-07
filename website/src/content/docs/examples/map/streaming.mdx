@@ -30,9 +30,13 @@ The source (`makeStreamingPoints` / `makeStreamingPolygons` in `shared/geo-data.
 async generator that yields batches lazily up to the chosen total, so nothing is
 materialized up front.
 
-> Append currently re-uploads the whole layer buffer per batch on WebGL (correct, but
-> O(total)/batch), so very high point counts get heavy — the perf readout shows it. A
-> follow-up adds true O(new) GPU sub-buffer uploads.
+> **Backend matters.** These examples default to the **canvas** backend, where append is
+> truly O(new) (new geometry is drawn on top, no full redraw) — so adaptive batching ramps
+> up and the stream stays fast. On **WebGL**, append currently rebuilds the whole layer
+> renderer per batch (O(total)); adaptive then *backs off* the batch to hold the frame
+> budget (you'll see the batch readout fall toward 1) and throughput stays modest. A
+> follow-up adds true O(new) WebGL sub-buffer uploads; until then, use canvas for high
+> streaming throughput.
 
 ## Streaming points on a world map
 
