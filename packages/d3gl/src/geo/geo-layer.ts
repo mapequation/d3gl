@@ -19,7 +19,14 @@ function geomOf(input: GeoInput): GeoJSON.Geometry | null {
   return input as GeoJSON.Geometry;
 }
 
-/** A Scene.group builder projecting any GeoJSON geometry once. Points → analytic circles. */
+/**
+ * A Scene.group builder projecting any GeoJSON geometry once. Points → analytic circles.
+ *
+ * WINDING (Polygon/MultiPolygon): geoPath fills on the sphere, so exterior rings must be
+ * wound CLOCKWISE in [lon, lat] (latitude up; negative signed area). A counter-clockwise
+ * ring is treated as its complement and fills the entire map. If polygons render as one
+ * map-covering fill, rewind them. See AGENTS.md "GeoJSON winding" and geo/project.ts.
+ */
 export function geoLayer<F extends GeoInput>(
   features: readonly F[],
   projection: GeoProjection,

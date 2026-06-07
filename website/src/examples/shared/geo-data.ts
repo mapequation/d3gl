@@ -292,6 +292,10 @@ function clusteredLonLat(rng: () => number, p: Parent): [number, number] {
  * Angles are evenly spaced with bounded jitter so they stay monotonic ⇒ the ring is
  * simple (non-self-intersecting) and closed. Longitude offsets are widened by
  * 1/cos(lat) so ranges don't look squished toward the poles.
+ *
+ * WINDING: built CLOCKWISE in [lon, lat] (note the NEGATIVE angle). d3-geo fills on
+ * the sphere, and a small exterior ring wound counter-clockwise is treated as its
+ * complement → it fills the whole map. See `AGENTS.md` and `geo/project.ts`.
  */
 function randomRangeRing(rng: () => number, clon: number, clat: number, size: number): [number, number][] {
   const verts = 3 + Math.floor(rng() * 8); // 3..10
@@ -299,7 +303,7 @@ function randomRangeRing(rng: () => number, clon: number, clat: number, size: nu
   const latScale = 1 / Math.max(0.25, Math.cos((clat * Math.PI) / 180));
   const ring: [number, number][] = [];
   for (let i = 0; i < verts; i++) {
-    const ang = ((i + 0.5 * rng()) / verts) * 2 * Math.PI; // monotonic ⇒ simple polygon
+    const ang = -((i + 0.5 * rng()) / verts) * 2 * Math.PI; // NEGATIVE ⇒ clockwise ⇒ fills interior
     const r = base * (0.5 + rng()); // per-vertex radius variation
     ring.push([
       clamp(clon + r * Math.cos(ang) * latScale, -180, 180),

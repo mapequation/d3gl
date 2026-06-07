@@ -59,9 +59,13 @@ export const setup: ImperativeSetup = (host, { width, height, backend, options }
       stats.update(0, total, 0, true);
     },
   });
+  // Stream runs only when the user wants it AND the canvas is on-screen (the harness
+  // calls setVisible). A manual pause persists across scroll-out/in.
+  let visible = true;
+  let userRunning = options.stream === "run";
   ctrl.batchSize = Number(options.batch);
   ctrl.delayMs = Number(options.rate);
-  ctrl.setRunning(options.stream === "run");
+  ctrl.setRunning(userRunning && visible);
   ctrl.restart(seed);
 
   let lastRandomize = Number(options.randomize) || 0;
@@ -70,7 +74,8 @@ export const setup: ImperativeSetup = (host, { width, height, backend, options }
   return {
     engine: map,
     render: (o) => {
-      ctrl.setRunning(o.stream === "run");
+      userRunning = o.stream === "run";
+      ctrl.setRunning(userRunning && visible);
       if (o.randomize !== lastRandomize) {
         lastRandomize = Number(o.randomize) || 0;
         currentColor = randomHsl(RANGE_ALPHA); // keep ranges translucent
@@ -92,6 +97,10 @@ export const setup: ImperativeSetup = (host, { width, height, backend, options }
         total = newTotal;
         ctrl.restart(++seed);
       }
+    },
+    setVisible: (v) => {
+      visible = v;
+      ctrl.setRunning(userRunning && visible); // pause offscreen; resume only if user wants run
     },
     dispose: () => {
       ctrl.dispose();
