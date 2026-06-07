@@ -32,6 +32,22 @@ describe("GeoMap incremental append", () => {
     map.destroy();
   });
 
+  it("appends on the webgl backend without throwing (drawable count grows)", async () => {
+    // Regression guard: webgl updateLayer asserts an unchanged drawable count, so
+    // append must route through the backend's appendToLayer (renderer rebuild), not
+    // updateColors. The hit index (CPU) confirms both points are present.
+    const host = mount();
+    const map = geoMap(host, { width: 200, height: 200, projection: proj(), backend: "webgl" });
+    await map.whenReady();
+    const occ = map.layer("occ", [pt(0, 0)], { pointRadius: 4, fill: "rgb(255,0,0)", id: (f) => `o${(f.geometry as any).coordinates[0]}` });
+    map.render();
+    expect(() => occ.append(pt(20, 0))).not.toThrow();
+    map.render();
+    expect(map.pick(110, 100)?.id).toBe("o20");
+    expect(map.pick(100, 100)?.id).toBe("o0");
+    map.destroy();
+  });
+
   it("keeps appended features after setProjection", async () => {
     const host = mount();
     const map = geoMap(host, { width: 200, height: 200, projection: proj(), backend: "canvas" });

@@ -82,6 +82,28 @@ export class WebGLBackend implements Backend {
     this.bakeDirty = true;
   }
 
+  /**
+   * Apply an incremental append for one layer. `updateColors` (the recolor path)
+   * can't be used here because it asserts an unchanged drawable count — an append
+   * grows the layer. For now this rebuilds the layer's renderer from the FULL
+   * buffers (correct, but O(total) per batch).
+   *
+   * TODO(perf): true O(new) upload — grow the VBOs/index buffers with capacity
+   * doubling + `bufferSubData` the tail from `addedFrom`, and `texSubImage2D` only
+   * the new color/flag rows — so a batch costs O(new), not O(total). Deferred
+   * because it needs interactive (browser) verification of the GPU paths.
+   */
+  appendToLayer(name: string, layer: RenderLayer, _addedFrom: number): void {
+    const existing = this.renderers.get(name);
+    if (existing) existing.destroy();
+    const renderer = new GroupRenderer(this.device, layer.buffers, this.width, this.height);
+    renderer.setTransform(this.clipMatrix);
+    this.renderers.set(name, renderer);
+    this.layers.set(name, layer);
+    if (!existing) this.order.push(name);
+    this.bakeDirty = true;
+  }
+
   setTransform(t: ViewTransform): void {
     this.viewTransform = t;
     this.clipMatrix = clipFromView(t, this.width, this.height);
