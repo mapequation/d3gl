@@ -39,6 +39,11 @@ export interface ExampleContext {
  * the engine on option changes — backward compatible for controls-free examples.
  * The `.ts` module exporting this is what the code tab shows, so it stays pure
  * d3gl with zero framework/plumbing.
+ *
+ * Optional `setVisible(visible)` lets an example react to the canvas entering /
+ * leaving the viewport (and tab show/hide) — e.g. pausing a stream while offscreen.
+ * The harness wires up the IntersectionObserver / visibility listener; the example
+ * just decides what to do.
  */
 export type ImperativeSetup = (
   host: HTMLElement,
@@ -49,6 +54,7 @@ export type ImperativeSetup = (
       engine: ExampleEngine;
       render?: (options: Record<string, unknown>) => void;
       dispose?: () => void;
+      setVisible?: (visible: boolean) => void;
     };
 
 /** Declares one example-specific control rendered in the shared control bar. */
@@ -81,4 +87,12 @@ export type ControlSpec =
       options: string[];
       /** Default value (else options[0]). */
       value?: string;
+    }
+  | {
+      /** An action button. Each click bumps opts[key] (a monotonically increasing
+       *  nonce), so the example's `render(options)` fires and can react to the
+       *  change (e.g. randomize colors). The value starts at 0. */
+      type: "button";
+      key: string;
+      label: string;
     };

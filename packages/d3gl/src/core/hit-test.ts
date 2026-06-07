@@ -42,7 +42,12 @@ function distToSegments(px: number, py: number, pts: number[]): number {
 export class HitIndex {
   private entries: Entry[] = [];
 
-  constructor(drawables: readonly DrawableVector[], tolerance = 1) {
+  constructor(drawables: readonly DrawableVector[], private readonly tolerance = 1) {
+    this.append(drawables);
+  }
+
+  /** Add more drawables to the index (used by incremental layer append). */
+  append(drawables: readonly DrawableVector[]): void {
     for (const d of drawables) {
       if ((d.flags & 1) === 0) continue; // hidden never hits
       const closed = d.subpaths.filter((s) => s.closed && s.points.length >= 6);
@@ -62,9 +67,9 @@ export class HitIndex {
         filled: closed.length > 0,
         rings: closed.length > 0 ? groupRings(closed) : [],
         strokes: d.lineWidth > 0 ? d.subpaths : [],
-        halfWidth: d.lineWidth / 2 + tolerance,
+        halfWidth: d.lineWidth / 2 + this.tolerance,
         circles,
-        tolerance,
+        tolerance: this.tolerance,
       });
     }
   }

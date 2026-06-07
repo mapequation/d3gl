@@ -1,0 +1,54 @@
+---
+title: Streaming data
+description: Append points and polygons live with LayerHandle.append — only new features project, existing ones stay put.
+---
+
+import ExampleCard from "../../../../components/ExampleCard.astro";
+import StreamingPoints from "../../../../examples/streaming-points/StreamingPoints.tsx";
+import StreamingPolygons from "../../../../examples/streaming-polygons/StreamingPolygons.tsx";
+import StreamingScatter from "../../../../examples/streaming-scatter/StreamingScatter.tsx";
+
+`layer.append(batch)` streams new features into an existing layer **without re-projecting
+the features already on screen** — the key to live data like species occurrences. Points
+land in patchy, multi-scale clusters (a Thomas-like point process) and are **clipped to
+land**; the polygon "ranges" are large and rendered very transparently, so overlapping
+ranges build up species-richness hotspots. A live readout (top-right) shows the record
+count, percentage of the chosen total, and the average append speed so far.
+
+Each example keeps its own retained GeoJSON array alongside the layer. Every feature starts
+the same color; **Randomize colors** picks a new color, applies it to all *future* features,
+**and** rewrites the retained features' `properties.color` then `recolor()`s them — so
+streaming and the retained-for-redraw data stay in sync. Use **Stream** to pause/resume,
+**Restart** for a fresh stream, **Data size** for the total to stream (100k / 1M / 10M),
+**Batch size** for how many features each tick emits, and **Batch delay (ms)** for an
+artificial per-batch delay that mirrors loading from a file.
+
+The source (`makeStreamingPoints` / `makeStreamingPolygons` in `shared/geo-data.ts`) is an
+async generator that yields batches lazily up to the chosen total, so nothing is
+materialized up front.
+
+> Append currently re-uploads the whole layer buffer per batch on WebGL (correct, but
+> O(total)/batch), so very high point counts get heavy — the perf readout shows it. A
+> follow-up adds true O(new) GPU sub-buffer uploads.
+
+## Streaming points on a world map
+
+<ExampleCard files={["streaming-points/draw.ts", "shared/streaming.ts"]}>
+  <StreamingPoints client:visible slot="demo" />
+</ExampleCard>
+
+## Streaming polygons on a world map
+
+<ExampleCard files={["streaming-polygons/draw.ts"]}>
+  <StreamingPolygons client:visible slot="demo" />
+</ExampleCard>
+
+## Streaming points on a scatter plot
+
+The same point source, plotted with `x = longitude`, `y = −latitude` so the familiar world
+shape emerges — `Plot.points().append()` is the same incremental append as the map's
+`GeoMap.layer().append()`.
+
+<ExampleCard files={["streaming-scatter/draw.ts"]}>
+  <StreamingScatter client:visible slot="demo" />
+</ExampleCard>

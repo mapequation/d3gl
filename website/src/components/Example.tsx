@@ -204,7 +204,13 @@ export default function Example(props: ExampleProps) {
     const o: Record<string, unknown> = {};
     for (const c of controls) {
       o[c.key] =
-        c.type === "range" ? c.value : c.type === "select" ? (c.value ?? c.options[0]) : c.options[0];
+        c.type === "range"
+          ? c.value
+          : c.type === "select"
+            ? (c.value ?? c.options[0])
+            : c.type === "button"
+              ? 0
+              : c.options[0];
     }
     for (const [k, v] of Object.entries(defaults)) if (k !== "backend") o[k] = v;
     return o;
@@ -237,19 +243,7 @@ export default function Example(props: ExampleProps) {
     engineRef.current = engine;
   };
 
-  const selects = controls.filter((c) => c.type === "select") as Extract<
-    ControlSpec,
-    { type: "select" }
-  >[];
-  const segmented = controls.filter((c) => c.type !== "range" && c.type !== "select") as Extract<
-    ControlSpec,
-    { options: string[] }
-  >[];
-  const ranges = controls.filter((c) => c.type === "range") as Extract<
-    ControlSpec,
-    { type: "range" }
-  >[];
-  const hasControlsRow = segmented.length > 0 || ranges.length > 0 || selects.length > 0;
+  const hasControlsRow = controls.length > 0;
 
   const onExport = (): void => {
     const engine = engineRef.current;
@@ -288,38 +282,56 @@ export default function Example(props: ExampleProps) {
           <div className="px-3 pb-1">
             <div className="border-border h-px w-24 border-t" />
           </div>
+          {/* Controls render in declaration order so each example controls its own layout. */}
           <div className="flex flex-wrap items-center gap-x-4 gap-y-2 px-3 pt-1.5 pb-2.5">
-            {segmented.map((c) => (
-              <Segmented
-                key={c.key}
-                label={c.label}
-                value={String(options[c.key]) as string}
-                options={c.options}
-                onChange={(v) => setOptions((o) => ({ ...o, [c.key]: v }))}
-              />
-            ))}
-            {ranges.map((c) => (
-              <RangeSlider
-                key={c.key}
-                spec={c}
-                value={Number(options[c.key])}
-                onCommit={(v) => setOptions((o) => ({ ...o, [c.key]: v }))}
-              />
-            ))}
-            {selects.map((c) => (
-              <label key={c.key} className="flex items-center gap-1.5">
-                <span className="text-muted-foreground text-[11px]">{c.label}</span>
-                <select
-                  className="border-border bg-background text-foreground focus-visible:ring-outline/50 h-6 rounded-md border py-0 pr-1 pl-1.5 text-[11px] leading-none outline-none focus-visible:ring-2"
+            {controls.map((c) => {
+              if (c.type === "range") {
+                return (
+                  <RangeSlider
+                    key={c.key}
+                    spec={c}
+                    value={Number(options[c.key])}
+                    onCommit={(v) => setOptions((o) => ({ ...o, [c.key]: v }))}
+                  />
+                );
+              }
+              if (c.type === "select") {
+                return (
+                  <label key={c.key} className="flex items-center gap-1.5">
+                    <span className="text-muted-foreground text-[11px]">{c.label}</span>
+                    <select
+                      className="border-border bg-background text-foreground focus-visible:ring-outline/50 h-6 rounded-md border py-0 pr-1 pl-1.5 text-[11px] leading-none outline-none focus-visible:ring-2"
+                      value={String(options[c.key])}
+                      onChange={(e) => setOptions((o) => ({ ...o, [c.key]: e.target.value }))}
+                    >
+                      {c.options.map((opt) => (
+                        <option key={opt} value={opt}>{opt}</option>
+                      ))}
+                    </select>
+                  </label>
+                );
+              }
+              if (c.type === "button") {
+                return (
+                  <ActionButton
+                    key={c.key}
+                    onClick={() => setOptions((o) => ({ ...o, [c.key]: (Number(o[c.key]) || 0) + 1 }))}
+                  >
+                    {c.label}
+                  </ActionButton>
+                );
+              }
+              // segmented (the default control type)
+              return (
+                <Segmented
+                  key={c.key}
+                  label={c.label}
                   value={String(options[c.key])}
-                  onChange={(e) => setOptions((o) => ({ ...o, [c.key]: e.target.value }))}
-                >
-                  {c.options.map((opt) => (
-                    <option key={opt} value={opt}>{opt}</option>
-                  ))}
-                </select>
-              </label>
-            ))}
+                  options={c.options}
+                  onChange={(v) => setOptions((o) => ({ ...o, [c.key]: v }))}
+                />
+              );
+            })}
           </div>
         </>
       )}

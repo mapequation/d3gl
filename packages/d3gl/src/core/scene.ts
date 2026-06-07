@@ -112,13 +112,31 @@ export class Scene {
   /** Build (or rebuild) a named group. The callback registers drawables. */
   group(name: string, build: (g: GroupBuilder) => void): void {
     const data = new GroupData(this.tolerance);
-    const builder: GroupBuilder = {
+    build(this.builderFor(data));
+    this.groups.set(name, data);
+  }
+
+  /** Append more drawables to an existing group (vs group(), which replaces it).
+   *  New drawables' integer drawableIds continue after the existing ones; a
+   *  duplicate domain id (the caller's string/number id) throws. NOTE: not atomic
+   *  across a multi-drawable build — if a later drawable in the batch throws, earlier
+   *  ones are already committed. Callers needing all-or-nothing (the engine append
+   *  path) validate ids before calling. */
+  appendToGroup(name: string, build: (g: GroupBuilder) => void): void {
+    build(this.builderFor(this.get(name)));
+  }
+
+  /** Number of drawables currently registered in a group. */
+  drawableCount(name: string): number {
+    return this.get(name).ranges.length;
+  }
+
+  private builderFor(data: GroupData): GroupBuilder {
+    return {
       drawable: (id, draw, opts) => this.addDrawable(data, id, draw, opts),
       point: (id, x, y, radius) => this.addCircleDrawable(data, id, [[x, y]], radius),
       points: (id, centers, radius) => this.addCircleDrawable(data, id, centers, radius),
     };
-    build(builder);
-    this.groups.set(name, data);
   }
 
   private addDrawable(
@@ -127,11 +145,13 @@ export class Scene {
     draw: (ctx: PathRecorder) => void,
     opts?: DrawableOpts,
   ): void {
+    const key = String(id);
+    if (data.idToDrawable.has(key)) throw new Error(`duplicate drawable id: ${String(id)}`);
     const recorder = new PathRecorder(data.tolerance);
     draw(recorder);
     const subpaths = recorder.subpaths;
     const drawableId = data.ranges.length;
-    data.idToDrawable.set(String(id), drawableId);
+    data.idToDrawable.set(key, drawableId);
     data.subpaths.push(subpaths.map((s) => ({ closed: s.closed, points: s.points.slice() })));
     data.ids.push(id);
     data.lineWidths.push(opts?.lineWidth ?? 0);
@@ -207,8 +227,10 @@ export class Scene {
     centers: readonly [number, number][],
     r: number,
   ): void {
+    const key = String(id);
+    if (data.idToDrawable.has(key)) throw new Error(`duplicate drawable id: ${String(id)}`);
     const drawableId = data.ranges.length;
-    data.idToDrawable.set(String(id), drawableId);
+    data.idToDrawable.set(key, drawableId);
     data.subpaths.push([]);
     data.circles.push(centers.map(([x, y]) => ({ x, y, r })));
     data.ids.push(id);

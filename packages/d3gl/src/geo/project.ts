@@ -36,9 +36,12 @@ export interface FeatureAccessors<F> {
  * After this, the GPU renders, recolors, and pans/zooms without re-projecting.
  *
  * Winding matters: geoPath fills on the sphere, so a ring's orientation selects
- * the region it encloses. A ring wound the wrong way is treated as its complement
- * (the whole sphere minus the region) and projects to a giant, map-covering
- * polygon — if every cell renders as one solid fill, rewind your rings.
+ * the region it encloses. Wind exterior rings CLOCKWISE in [lon, lat] (latitude
+ * up; i.e. negative signed area, like `makeCells`/`makeDemoPolygon`). A ring wound
+ * COUNTER-clockwise is treated as its complement (the whole sphere minus the
+ * region) and projects to a giant, map-covering polygon — if every polygon renders
+ * as one solid fill covering the map, your rings are wound the wrong way. (Holes:
+ * opposite winding to their exterior.) See also AGENTS.md "GeoJSON winding".
  */
 export function featureGroup<F extends GeoInput>(
   features: readonly F[],

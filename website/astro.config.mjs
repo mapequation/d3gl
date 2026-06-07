@@ -87,6 +87,7 @@ export default defineConfig({
           { label: "GeoJSON features", slug: "examples/map/geojson-features" },
           { label: "Heatmap", slug: "examples/map/heatmap" },
           { label: "Map projections", slug: "examples/map/map-projections" },
+          { label: "Streaming data", slug: "examples/map/streaming" },
           { label: "React", slug: "examples/react" },
         ],
       },

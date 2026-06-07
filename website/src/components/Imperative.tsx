@@ -28,6 +28,7 @@ export default function Imperative({ ctx, setup }: ImperativeProps) {
   const engineRef = useRef<ExampleEngine | null>(null);
   const renderRef = useRef<RenderFn | undefined>(undefined);
   const disposeRef = useRef<(() => void) | undefined>(undefined);
+  const visibleRef = useRef<((visible: boolean) => void) | undefined>(undefined);
   // The options key the engine was last built/rendered with, so the options effect can skip
   // the redundant run that fires right after the size effect builds the engine.
   const builtOptionsKey = useRef<string | null>(null);
@@ -48,6 +49,7 @@ export default function Imperative({ ctx, setup }: ImperativeProps) {
     engineRef.current = engine;
     renderRef.current = render;
     disposeRef.current = dispose;
+    visibleRef.current = "engine" in result ? result.setVisible : undefined;
     registerEngine(engine);
     // Initial option-dependent content (if this example builds layers in render).
     render?.(options);
@@ -60,6 +62,7 @@ export default function Imperative({ ctx, setup }: ImperativeProps) {
       engineRef.current = null;
       renderRef.current = undefined;
       disposeRef.current = undefined;
+      visibleRef.current = undefined;
     };
     // Only SIZE recreates the engine; backend/options are handled separately.
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -87,10 +90,32 @@ export default function Imperative({ ctx, setup }: ImperativeProps) {
     engineRef.current = engine;
     renderRef.current = "engine" in result ? result.render : undefined;
     disposeRef.current = "engine" in result ? result.dispose : undefined;
+    visibleRef.current = "engine" in result ? result.setVisible : undefined;
     registerEngine(engine);
     renderRef.current?.(options);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [optionsKey]);
+
+  // Tell the example when its canvas enters/leaves the viewport or the tab is
+  // hidden, so it can pause offscreen work (e.g. streaming). The harness owns the
+  // observer; the example just implements setVisible if it cares.
+  useEffect(() => {
+    const host = hostRef.current;
+    if (!host) return;
+    let inView = true;
+    const emit = (): void => visibleRef.current?.(inView && document.visibilityState !== "hidden");
+    const io = new IntersectionObserver((entries) => {
+      inView = entries[0]?.isIntersecting ?? true;
+      emit();
+    });
+    io.observe(host);
+    const onVisibility = (): void => emit();
+    document.addEventListener("visibilitychange", onVisibility);
+    return () => {
+      io.disconnect();
+      document.removeEventListener("visibilitychange", onVisibility);
+    };
+  }, []);
 
   // Swap backend in place, preserving zoom/pan + layers.
   useEffect(() => {
