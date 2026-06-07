@@ -1,0 +1,45 @@
+---
+title: Streaming data
+description: Append points and polygons live with LayerHandle.append — only new features project, existing ones stay put.
+---
+
+import ExampleCard from "../../../../components/ExampleCard.astro";
+import StreamingPoints from "../../../../examples/streaming-points/StreamingPoints.tsx";
+import StreamingPolygons from "../../../../examples/streaming-polygons/StreamingPolygons.tsx";
+import StreamingScatter from "../../../../examples/streaming-scatter/StreamingScatter.tsx";
+
+`layer.append(batch)` streams new features into an existing layer **without re-projecting
+the features already on screen** — the key to live data like species occurrences. Each
+example keeps its own retained GeoJSON array alongside the layer, so **Randomize colors**
+recolors the data already drawn (via `recolor()`). Use **Stream** to pause/resume,
+**Batch size** to control how many features each tick emits, **Rate** for an artificial
+per-batch delay (mirroring loading from a file), and **Restart** for a fresh stream.
+
+The source (`makeStreamingPoints` / `makeStreamingPolygons` in `shared/geo-data.ts`) is an
+async generator that yields batches lazily up to 10M, so nothing is materialized up front.
+
+> Append currently re-uploads the whole layer buffer per batch on WebGL (correct, but
+> O(total)/batch), so very high point counts get heavy — the perf readout shows it. A
+> follow-up adds true O(new) GPU sub-buffer uploads.
+
+## Streaming points on a world map
+
+<ExampleCard files={["streaming-points/draw.ts", "shared/streaming.ts"]}>
+  <StreamingPoints client:visible slot="demo" />
+</ExampleCard>
+
+## Streaming polygons on a world map
+
+<ExampleCard files={["streaming-polygons/draw.ts"]}>
+  <StreamingPolygons client:visible slot="demo" />
+</ExampleCard>
+
+## Streaming points on a scatter plot
+
+The same point source, plotted with `x = longitude`, `y = −latitude` so the familiar world
+shape emerges — `Plot.points().append()` is the same incremental append as the map's
+`GeoMap.layer().append()`.
+
+<ExampleCard files={["streaming-scatter/draw.ts"]}>
+  <StreamingScatter client:visible slot="demo" />
+</ExampleCard>

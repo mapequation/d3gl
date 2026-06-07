@@ -204,7 +204,13 @@ export default function Example(props: ExampleProps) {
     const o: Record<string, unknown> = {};
     for (const c of controls) {
       o[c.key] =
-        c.type === "range" ? c.value : c.type === "select" ? (c.value ?? c.options[0]) : c.options[0];
+        c.type === "range"
+          ? c.value
+          : c.type === "select"
+            ? (c.value ?? c.options[0])
+            : c.type === "button"
+              ? 0
+              : c.options[0];
     }
     for (const [k, v] of Object.entries(defaults)) if (k !== "backend") o[k] = v;
     return o;
@@ -241,15 +247,19 @@ export default function Example(props: ExampleProps) {
     ControlSpec,
     { type: "select" }
   >[];
-  const segmented = controls.filter((c) => c.type !== "range" && c.type !== "select") as Extract<
-    ControlSpec,
-    { options: string[] }
-  >[];
+  const segmented = controls.filter(
+    (c) => c.type !== "range" && c.type !== "select" && c.type !== "button",
+  ) as Extract<ControlSpec, { options: string[] }>[];
   const ranges = controls.filter((c) => c.type === "range") as Extract<
     ControlSpec,
     { type: "range" }
   >[];
-  const hasControlsRow = segmented.length > 0 || ranges.length > 0 || selects.length > 0;
+  const buttons = controls.filter((c) => c.type === "button") as Extract<
+    ControlSpec,
+    { type: "button" }
+  >[];
+  const hasControlsRow =
+    segmented.length > 0 || ranges.length > 0 || selects.length > 0 || buttons.length > 0;
 
   const onExport = (): void => {
     const engine = engineRef.current;
@@ -319,6 +329,14 @@ export default function Example(props: ExampleProps) {
                   ))}
                 </select>
               </label>
+            ))}
+            {buttons.map((c) => (
+              <ActionButton
+                key={c.key}
+                onClick={() => setOptions((o) => ({ ...o, [c.key]: (Number(o[c.key]) || 0) + 1 }))}
+              >
+                {c.label}
+              </ActionButton>
             ))}
           </div>
         </>

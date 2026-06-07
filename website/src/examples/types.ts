@@ -81,4 +81,12 @@ export type ControlSpec =
       options: string[];
       /** Default value (else options[0]). */
       value?: string;
+    }
+  | {
+      /** An action button. Each click bumps opts[key] (a monotonically increasing
+       *  nonce), so the example's `render(options)` fires and can react to the
+       *  change (e.g. randomize colors). The value starts at 0. */
+      type: "button";
+      key: string;
+      label: string;
     };

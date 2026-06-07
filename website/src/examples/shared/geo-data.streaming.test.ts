@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { makeStreamingPoints, makeStreamingPolygons } from "./geo-data.js";
+import { makeStreamingPoints, makeStreamingPolygons, type StreamPoint } from "./geo-data.js";
 
 async function collect<T>(gen: AsyncGenerator<T[]>): Promise<T[]> {
   const out: T[] = [];
@@ -42,7 +42,7 @@ describe("makeStreamingPoints", () => {
 
   it("stops early when the signal is aborted", async () => {
     const signal = { aborted: false };
-    const seen: number[] = [];
+    const seen: StreamPoint[] = [];
     for await (const b of makeStreamingPoints({ total: 1000, batchSize: 10, signal })) {
       seen.push(...b);
       if (seen.length >= 30) signal.aborted = true; // abort after a few batches
