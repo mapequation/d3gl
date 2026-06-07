@@ -45,15 +45,17 @@ const { FakeBuffer, FakeTexture, FakeModel, created } = vi.hoisted(() => {
   class FakeTexture {
     width: number;
     height: number;
-    writeDatas: { x: number; y: number; width: number; height: number }[] = [];
+    format?: string;
+    writeDatas: { x: number; y: number; width: number; height: number; length: number }[] = [];
     destroyed = false;
-    constructor(props: { width: number; height: number }) {
+    constructor(props: { width: number; height: number; format?: string }) {
       this.width = props.width;
       this.height = props.height;
+      this.format = props.format;
       created.textures.push(this);
     }
-    writeData(_data: ArrayBufferView, region: { x: number; y: number; width: number; height: number }): void {
-      this.writeDatas.push(region);
+    writeData(data: ArrayBufferView, region: { x: number; y: number; width: number; height: number }): void {
+      this.writeDatas.push({ ...region, length: data.byteLength });
     }
     destroy(): void {
       this.destroyed = true;
@@ -92,7 +94,7 @@ vi.mock("@luma.gl/engine", () => ({ Model: FakeModel }));
 
 const fakeDevice = {
   createBuffer: (props: ConstructorParameters<typeof FakeBuffer>[0]) => new FakeBuffer(props),
-  createTexture: (props: ConstructorParameters<typeof FakeTexture>[0]) => new FakeTexture(props),
+  createTexture: (props: { width: number; height: number; format?: string }) => new FakeTexture(props),
 } as unknown as import("@luma.gl/core").Device;
 
 // Import AFTER mocks are registered.
@@ -248,6 +250,62 @@ describe("GrowBuffer / GroupRenderer.append — O(new) incremental upload", () =
     r.append(pointDelta(300, 400));
     expect(created.textures.length).toBeGreaterThan(seedTextures); // new textures created
     expect(pointModel.setBindingsCalls).toBe(setBindingsBefore + 1); // rebound to new textures
+  });
+
+  it("grows color/flags textures in O(new): few recreations + partial-row uploads across many 256-boundaries", () => {
+    // Stream 2000 drawables as 20 appends of 100, crossing ~8 row boundaries (rows of 256).
+    // The O(total) regression manifests two ways the fix must avoid:
+    //   (a) recreating the texture on (nearly) every batch — old code recreates whenever
+    //       paletteDimensions(count).height changes, i.e. every time count crosses a 256
+    //       multiple (≈8 times here) AND the dims-unchanged branch still re-uploaded the
+    //       FULL height each batch.
+    //   (b) re-uploading the FULL texture height on every writeData (old dims-unchanged
+    //       branch used { y: 0, height: fullHeight }).
+    // The capacity-doubling GrowTexture: created once, then doubles rows 1→2→4→8→16 (4
+    // extra recreations to reach 16 rows of capacity for 2050 drawables), and each
+    // non-recreate upload touches only the changed rows (small height, y often > 0).
+    const r = new GroupRenderer(fakeDevice, pointBuffers(50), 100, 100);
+    // Points-only renderer: the point pass OWNS its color/flags textures.
+    const colorTexturesInitial = created.textures.filter((t) => t.format === "rgba8unorm");
+    expect(colorTexturesInitial.length).toBe(1); // one color table created at build
+
+    let total = 50;
+    for (let i = 0; i < 20; i++) {
+      r.append(pointDelta(100, total));
+      total += 100;
+    }
+    expect(total).toBe(2050);
+
+    // (a) Color texture created FEW times — initial + log2 capacity doublings, NOT
+    // once per batch (would be ~21) and NOT once per 256-boundary (would be ~9).
+    const colorTextures = created.textures.filter((t) => t.format === "rgba8unorm");
+    expect(colorTextures.length).toBeLessThanOrEqual(5);
+    // And strictly fewer than the number of batches / the number of row boundaries.
+    expect(colorTextures.length).toBeLessThan(9);
+
+    // Gather every partial writeData across all color textures (different texture objects
+    // get used as capacity doubles; the live one accumulates the rest).
+    const allWrites = colorTextures.flatMap((t) => t.writeDatas);
+    expect(allWrites.length).toBeGreaterThan(0);
+
+    // (b) Uploads are PARTIAL rows, not full-height re-uploads:
+    //   - At least one write starts at y > 0 (writing into a tail row, not the whole table).
+    const someTailRow = allWrites.some((w) => w.y > 0);
+    expect(someTailRow).toBe(true);
+    //   - Every write covers only a few rows (height small), never the full live height.
+    //     A 100-drawable delta spans at most 2 rows.
+    const maxRows = Math.max(...allWrites.map((w) => w.height));
+    expect(maxRows).toBeLessThanOrEqual(2);
+    //   - Width stays fixed at 256 (the shader's id % width mapping relies on this).
+    expect(allWrites.every((w) => w.width === 256)).toBe(true);
+    //   - The largest live texture is 8 rows (nextPow2(ceil(2050/256)) = nextPow2(9) = 16),
+    //     proving the table is NOT re-uploaded at its full height each batch.
+    const liveColor = colorTextures[colorTextures.length - 1]!;
+    expect(liveColor.height).toBe(16);
+    // Total bytes uploaded by partial writes is O(new) — bounded well under
+    // (batches × full-table bytes). Full re-upload each batch would be ≥ 20 * 2050 * 4.
+    const totalBytes = allWrites.reduce((a, w) => a + w.length, 0);
+    expect(totalBytes).toBeLessThan(20 * 2050 * 4 * 0.25);
   });
 
   it("returns false when a needed pass is absent (empty renderer), so the backend can rebuild", () => {

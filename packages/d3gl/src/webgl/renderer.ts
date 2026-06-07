@@ -1,10 +1,11 @@
 import { Buffer } from "@luma.gl/core";
-import type { Device, Texture, RenderPass } from "@luma.gl/core";
+import type { Device, Texture, RenderPass, TextureFormat } from "@luma.gl/core";
 import { Model } from "@luma.gl/engine";
 import type { GroupBuffers, GroupBufferDelta } from "../core/index.js";
-import { paletteDimensions, padPalette, padFlags } from "./palette.js";
-import type { PaletteDimensions } from "./palette.js";
 import { FILL_VS, FILL_FS, PICK_FS, POINT_VS, POINT_FS } from "./shaders.js";
+
+/** Fixed texel width of every per-drawable side-table texture (color/flags). */
+const TABLE_WIDTH = 256;
 
 const identity = (): Float32Array => new Float32Array([1, 0, 0, 0, 1, 0, 0, 0, 1]);
 
@@ -99,20 +100,121 @@ class GrowBuffer {
   }
 }
 
+/**
+ * A per-drawable side-table TEXTURE (color rgba8 or flags r8) that grows by
+ * capacity-doubling, backed by a padded CPU mirror.
+ *
+ * Width is FIXED at {@link TABLE_WIDTH} (256); only the height (number of rows)
+ * grows. drawableId indexes into the texture as `(id % width, id / width)` in the
+ * shader (via textureSize), so the constant width keeps that mapping valid and any
+ * extra capacity rows are simply never indexed.
+ *
+ * Appends within the current row-capacity upload ONLY the changed rows — O(new).
+ * On overflow the texture is reallocated to the next power-of-two row count, the
+ * mirror is grown + recreated once, and `append` returns TRUE so the caller rebinds
+ * the owning Model(s) to the new `texture` (the old handle is destroyed).
+ */
+class GrowTexture {
+  texture: Texture;
+  /** Padded CPU mirror, `capacityRows * TABLE_WIDTH * channels` bytes. */
+  private mirror: Uint8Array;
+  /** Entries (drawables) currently uploaded. */
+  count: number;
+  private capacityRows: number;
+  private readonly rowBytes: number;
+
+  /**
+   * @param channels bytes per entry (4 for rgba8unorm color, 1 for r8unorm flags).
+   * @param initialBytes the first `count * channels` bytes of table data.
+   * @param count number of entries the initial data represents.
+   */
+  constructor(
+    private readonly device: Device,
+    private readonly channels: number,
+    private readonly format: TextureFormat,
+    initialBytes: Uint8Array,
+    count: number,
+  ) {
+    this.rowBytes = TABLE_WIDTH * channels;
+    const usedRows = Math.max(1, Math.ceil(count / TABLE_WIDTH));
+    this.capacityRows = nextPow2(usedRows);
+    this.mirror = new Uint8Array(this.capacityRows * this.rowBytes);
+    this.mirror.set(initialBytes.subarray(0, count * channels));
+    this.count = count;
+    this.texture = this.allocate();
+  }
+
+  private allocate(): Texture {
+    return this.device.createTexture({
+      data: this.mirror,
+      width: TABLE_WIDTH,
+      height: this.capacityRows,
+      format: this.format,
+      mipLevels: 1,
+      sampler: { minFilter: "nearest", magFilter: "nearest" },
+    });
+  }
+
+  /**
+   * Append `deltaBytes` ((newCount-count)*channels long) extending the table to
+   * `newCount` entries. Returns TRUE if the texture was RECREATED (caller must
+   * rebind the Model bindings to the new `this.texture`), FALSE if only changed
+   * rows were re-uploaded (a partial writeData — O(new)).
+   */
+  append(deltaBytes: Uint8Array, newCount: number): boolean {
+    const oldCount = this.count;
+    const newRows = Math.max(1, Math.ceil(newCount / TABLE_WIDTH));
+    if (newRows > this.capacityRows) {
+      // Overflow: grow to next power-of-two rows, recreate the texture once.
+      this.capacityRows = nextPow2(newRows);
+      const newMirror = new Uint8Array(this.capacityRows * this.rowBytes);
+      newMirror.set(this.mirror.subarray(0, oldCount * this.channels));
+      newMirror.set(deltaBytes, oldCount * this.channels);
+      this.mirror = newMirror;
+      this.texture.destroy();
+      this.texture = this.allocate();
+      this.count = newCount;
+      return true;
+    }
+    // Fits: write the delta into the mirror, then upload only the changed rows.
+    this.mirror.set(deltaBytes, oldCount * this.channels);
+    const startRow = Math.floor(oldCount / TABLE_WIDTH);
+    const numRows = newRows - startRow;
+    this.texture.writeData(
+      this.mirror.subarray(startRow * this.rowBytes, newRows * this.rowBytes),
+      { x: 0, y: startRow, width: TABLE_WIDTH, height: numRows },
+    );
+    this.count = newCount;
+    return false;
+  }
+
+  /** Overwrite the whole table in place (recolor / show-hide; count unchanged). */
+  write(bytes: Uint8Array): void {
+    this.mirror.set(bytes.subarray(0, this.count * this.channels));
+    const rows = Math.max(1, Math.ceil(this.count / TABLE_WIDTH));
+    this.texture.writeData(this.mirror.subarray(0, rows * this.rowBytes), {
+      x: 0,
+      y: 0,
+      width: TABLE_WIDTH,
+      height: rows,
+    });
+  }
+
+  destroy(): void {
+    this.texture.destroy();
+  }
+}
+
 /** GPU resources for one geometry pass (fill or stroke). */
 interface Pass {
   position: GrowBuffer;
   id: GrowBuffer;
   anchor: GrowBuffer;
   index: GrowBuffer;
-  colorTexture: Texture;
-  flagsTexture: Texture;
-  /** CPU mirror of the RGBA color table (4 bytes/drawable). */
-  colors: Uint8Array;
-  /** CPU mirror of the flags table (1 byte/drawable). */
-  flags: Uint8Array;
-  /** Texel dimensions the textures are currently allocated at. */
-  dims: PaletteDimensions;
+  /** Per-drawable RGBA color table (rgba8unorm), grown with partial row uploads. */
+  colorTex: GrowTexture;
+  /** Per-drawable flags table (r8unorm), grown with partial row uploads. */
+  flagsTex: GrowTexture;
   fillModel: Model;
   pickModel: Model;
   /** Shared uniforms object — mutated in-place by setTransform so the next draw picks it up. */
@@ -130,15 +232,11 @@ interface PointPass {
   index: GrowBuffer;
   /** Number of point vertices uploaded (4 per circle); index base for appends. */
   vertexCount: number;
-  /** Color/flags textures — either shared with fill pass or owned. */
-  colorTexture: Texture;
-  flagsTexture: Texture;
+  /** Color/flags tables — either shared with the fill pass (same refs) or owned. */
+  colorTex: GrowTexture;
+  flagsTex: GrowTexture;
   /** Whether this pass owns the textures (false = borrowed from fill pass). */
   ownsTextures: boolean;
-  /** CPU mirrors + dims, only meaningful when ownsTextures. */
-  colors: Uint8Array;
-  flags: Uint8Array;
-  dims: PaletteDimensions;
   model: Model;
   uniforms: Record<string, unknown>;
   drawableCount: number;
@@ -227,28 +325,11 @@ export class GroupRenderer {
     const index = new GrowBuffer(device, Uint32Array, indices, true);
 
     const count = colors.length / 4;
-    const dims = paletteDimensions(count);
-    const colorsMirror = new Uint8Array(colors);
-    const flagsMirror = new Uint8Array(flags);
-    const colorTexture = device.createTexture({
-      data: padPalette(colorsMirror, dims),
-      width: dims.width,
-      height: dims.height,
-      format: "rgba8unorm",
-      mipLevels: 1,
-      sampler: { minFilter: "nearest", magFilter: "nearest" },
-    });
-    const flagsTexture = device.createTexture({
-      data: padFlags(flagsMirror, dims),
-      width: dims.width,
-      height: dims.height,
-      format: "r8unorm",
-      mipLevels: 1,
-      sampler: { minFilter: "nearest", magFilter: "nearest" },
-    });
+    const colorTex = new GrowTexture(device, 4, "rgba8unorm", colors, count);
+    const flagsTex = new GrowTexture(device, 1, "r8unorm", flags, count);
 
     const attributes = { a_position: position.buffer, a_anchor: anchor.buffer, a_drawableId: id.buffer };
-    const bindings = { u_colorTable: colorTexture, u_flags: flagsTexture };
+    const bindings = { u_colorTable: colorTex.texture, u_flags: flagsTex.texture };
     // Use a shared uniforms object so setTransform mutations are picked up on the next draw.
     const uniforms: Record<string, unknown> = {
       u_transform: this.transform,
@@ -272,8 +353,7 @@ export class GroupRenderer {
     // by renderPick() (GPU color-picking).
     const pickModel = new Model(device, { ...common, vs: FILL_VS, fs: PICK_FS });
     return {
-      position, id, anchor, index, colorTexture, flagsTexture,
-      colors: colorsMirror, flags: flagsMirror, dims,
+      position, id, anchor, index, colorTex, flagsTex,
       fillModel, pickModel, uniforms, drawableCount: count,
     };
   }
@@ -323,41 +403,19 @@ export class GroupRenderer {
     const pointId = new GrowBuffer(device, Float32Array, e.pointId);
     const index = new GrowBuffer(device, Uint32Array, e.index, true);
 
-    // Reuse fill pass textures if available, else build from fillColors/flags.
-    let colorTexture: Texture;
-    let flagsTexture: Texture;
+    // Reuse fill pass textures if available (share the same GrowTexture refs),
+    // else build owned ones from fillColors/flags.
+    let colorTex: GrowTexture;
+    let flagsTex: GrowTexture;
     let ownsTextures: boolean;
-    let colors: Uint8Array;
-    let flags: Uint8Array;
-    let dims: PaletteDimensions;
     if (this.fill) {
-      colorTexture = this.fill.colorTexture;
-      flagsTexture = this.fill.flagsTexture;
+      colorTex = this.fill.colorTex;
+      flagsTex = this.fill.flagsTex;
       ownsTextures = false;
-      colors = this.fill.colors;
-      flags = this.fill.flags;
-      dims = this.fill.dims;
     } else {
       const count = buffers.fillColors.length / 4;
-      dims = paletteDimensions(count);
-      colors = new Uint8Array(buffers.fillColors);
-      flags = new Uint8Array(buffers.flags);
-      colorTexture = device.createTexture({
-        data: padPalette(colors, dims),
-        width: dims.width,
-        height: dims.height,
-        format: "rgba8unorm",
-        mipLevels: 1,
-        sampler: { minFilter: "nearest", magFilter: "nearest" },
-      });
-      flagsTexture = device.createTexture({
-        data: padFlags(flags, dims),
-        width: dims.width,
-        height: dims.height,
-        format: "r8unorm",
-        mipLevels: 1,
-        sampler: { minFilter: "nearest", magFilter: "nearest" },
-      });
+      colorTex = new GrowTexture(device, 4, "rgba8unorm", buffers.fillColors, count);
+      flagsTex = new GrowTexture(device, 1, "r8unorm", buffers.flags, count);
       ownsTextures = true;
     }
 
@@ -367,7 +425,7 @@ export class GroupRenderer {
       a_radius: radius.buffer,
       a_pointId: pointId.buffer,
     };
-    const bindings = { u_colorTable: colorTexture, u_flags: flagsTexture };
+    const bindings = { u_colorTable: colorTex.texture, u_flags: flagsTex.texture };
     const uniforms: Record<string, unknown> = {
       u_transform: this.transform,
       u_pointScreen: 0,
@@ -389,7 +447,7 @@ export class GroupRenderer {
     return {
       center, corner, radius, pointId, index,
       vertexCount: N * 4,
-      colorTexture, flagsTexture, ownsTextures, colors, flags, dims,
+      colorTex, flagsTex, ownsTextures,
       model, uniforms, drawableCount: buffers.drawableCount,
     };
   }
@@ -448,40 +506,25 @@ export class GroupRenderer {
     }
     pass.fillModel.setVertexCount(pass.index.length);
     pass.pickModel.setVertexCount(pass.index.length);
-    // Grow color/flags textures.
+    // Grow color/flags textures (partial row upload, or recreate on capacity overflow).
     this.growPassTextures(pass, deltaColors, deltaFlags, newDrawableCount);
   }
 
-  /** Append color/flags for a fill/stroke pass and re-upload (partial, or recreate on dims change). */
+  /** Append color/flags for a fill/stroke pass: O(new) partial row upload, recreate on overflow. */
   private growPassTextures(pass: Pass, deltaColors: Uint8Array, deltaFlags: Uint8Array, newCount: number): void {
-    const grown = this.growColorFlagMirrors(pass.colors, pass.flags, deltaColors, deltaFlags, newCount);
-    pass.colors = grown.colors;
-    pass.flags = grown.flags;
+    // Track whether a borrowing point pass shares these GrowTextures, so we can rebind
+    // its Model when an overflow recreates the underlying texture.
+    const pointBorrows = !!this.point && !this.point.ownsTextures &&
+      this.point.colorTex === pass.colorTex;
+    // Call both (no short-circuit): both tables must consume their delta.
+    const colorRecreated = pass.colorTex.append(deltaColors, newCount);
+    const flagsRecreated = pass.flagsTex.append(deltaFlags, newCount);
     pass.drawableCount = newCount;
-    const newDims = paletteDimensions(newCount);
-    if (newDims.width === pass.dims.width && newDims.height === pass.dims.height) {
-      pass.colorTexture.writeData(padPalette(pass.colors, newDims), { x: 0, y: 0, width: newDims.width, height: newDims.height });
-      pass.flagsTexture.writeData(padFlags(pass.flags, newDims), { x: 0, y: 0, width: newDims.width, height: newDims.height });
-    } else {
-      // Track whether a borrowing point pass shares these textures, so we can rebind it
-      // to the recreated textures (and avoid double-destroy of the shared handles).
-      const pointBorrows = !!this.point && !this.point.ownsTextures &&
-        this.point.colorTexture === pass.colorTexture;
-      const { colorTexture, flagsTexture } = this.recreateTextures(pass.colors, pass.flags, newDims);
-      pass.colorTexture.destroy();
-      pass.flagsTexture.destroy();
-      pass.colorTexture = colorTexture;
-      pass.flagsTexture = flagsTexture;
-      pass.dims = newDims;
-      const bindings = { u_colorTable: colorTexture, u_flags: flagsTexture };
+    if (colorRecreated || flagsRecreated) {
+      const bindings = { u_colorTable: pass.colorTex.texture, u_flags: pass.flagsTex.texture };
       pass.fillModel.setBindings(bindings);
       pass.pickModel.setBindings(bindings);
-      if (pointBorrows && this.point) {
-        this.point.colorTexture = colorTexture;
-        this.point.flagsTexture = flagsTexture;
-        this.point.dims = newDims;
-        this.point.model.setBindings(bindings);
-      }
+      if (pointBorrows && this.point) this.point.model.setBindings(bindings);
     }
   }
 
@@ -508,63 +551,17 @@ export class GroupRenderer {
     }
     pp.model.setVertexCount(pp.index.length);
     // If this pass owns its textures (no fill pass), grow them; otherwise the fill pass
-    // owns them and its own append (with the same delta colors/flags) already grew them.
+    // owns them and its own append (with the same delta colors/flags) already grew them
+    // — and the shared GrowTexture refs mean pp already sees the new textures; we only
+    // rebind pp.model on a recreate, which growPassTextures handles for the borrow case.
     if (pp.ownsTextures) {
-      const grown = this.growColorFlagMirrors(pp.colors, pp.flags, deltaColors, deltaFlags, newDrawableCount);
-      pp.colors = grown.colors;
-      pp.flags = grown.flags;
-      pp.drawableCount = newDrawableCount;
-      const newDims = paletteDimensions(newDrawableCount);
-      if (newDims.width === pp.dims.width && newDims.height === pp.dims.height) {
-        pp.colorTexture.writeData(padPalette(pp.colors, newDims), { x: 0, y: 0, width: newDims.width, height: newDims.height });
-        pp.flagsTexture.writeData(padFlags(pp.flags, newDims), { x: 0, y: 0, width: newDims.width, height: newDims.height });
-      } else {
-        const { colorTexture, flagsTexture } = this.recreateTextures(pp.colors, pp.flags, newDims);
-        pp.colorTexture.destroy();
-        pp.flagsTexture.destroy();
-        pp.colorTexture = colorTexture;
-        pp.flagsTexture = flagsTexture;
-        pp.dims = newDims;
-        pp.model.setBindings({ u_colorTable: colorTexture, u_flags: flagsTexture });
+      const colorRecreated = pp.colorTex.append(deltaColors, newDrawableCount);
+      const flagsRecreated = pp.flagsTex.append(deltaFlags, newDrawableCount);
+      if (colorRecreated || flagsRecreated) {
+        pp.model.setBindings({ u_colorTable: pp.colorTex.texture, u_flags: pp.flagsTex.texture });
       }
-    } else {
-      pp.drawableCount = newDrawableCount;
     }
-  }
-
-  /** Concatenate the appended color/flags onto the CPU mirrors, growing the arrays. */
-  private growColorFlagMirrors(
-    colors: Uint8Array, flags: Uint8Array,
-    deltaColors: Uint8Array, deltaFlags: Uint8Array, newCount: number,
-  ): { colors: Uint8Array; flags: Uint8Array } {
-    const newColors = new Uint8Array(newCount * 4);
-    newColors.set(colors.subarray(0, newCount * 4));
-    newColors.set(deltaColors, (newCount - deltaFlags.length) * 4);
-    const newFlags = new Uint8Array(newCount);
-    newFlags.set(flags.subarray(0, newCount));
-    newFlags.set(deltaFlags, newCount - deltaFlags.length);
-    return { colors: newColors, flags: newFlags };
-  }
-
-  private recreateTextures(colors: Uint8Array, flags: Uint8Array, dims: PaletteDimensions): { colorTexture: Texture; flagsTexture: Texture } {
-    const device = this.device;
-    const colorTexture = device.createTexture({
-      data: padPalette(colors, dims),
-      width: dims.width,
-      height: dims.height,
-      format: "rgba8unorm",
-      mipLevels: 1,
-      sampler: { minFilter: "nearest", magFilter: "nearest" },
-    });
-    const flagsTexture = device.createTexture({
-      data: padFlags(flags, dims),
-      width: dims.width,
-      height: dims.height,
-      format: "r8unorm",
-      mipLevels: 1,
-      sampler: { minFilter: "nearest", magFilter: "nearest" },
-    });
-    return { colorTexture, flagsTexture };
+    pp.drawableCount = newDrawableCount;
   }
 
   /**
@@ -594,21 +591,8 @@ export class GroupRenderer {
           `appended drawables must go through append()`,
       );
     }
-    const dims = paletteDimensions(count);
-    pass.colors = new Uint8Array(colors);
-    pass.flags = new Uint8Array(flags);
-    pass.colorTexture.writeData(padPalette(colors, dims), {
-      x: 0,
-      y: 0,
-      width: dims.width,
-      height: dims.height,
-    });
-    pass.flagsTexture.writeData(padFlags(flags, dims), {
-      x: 0,
-      y: 0,
-      width: dims.width,
-      height: dims.height,
-    });
+    pass.colorTex.write(colors);
+    pass.flagsTex.write(flags);
   }
 
   private writePointTables(pp: PointPass, colors: Uint8Array, flags: Uint8Array): void {
@@ -619,11 +603,8 @@ export class GroupRenderer {
           `appended drawables must go through append()`,
       );
     }
-    const dims = paletteDimensions(count);
-    pp.colors = new Uint8Array(colors);
-    pp.flags = new Uint8Array(flags);
-    pp.colorTexture.writeData(padPalette(colors, dims), { x: 0, y: 0, width: dims.width, height: dims.height });
-    pp.flagsTexture.writeData(padFlags(flags, dims), { x: 0, y: 0, width: dims.width, height: dims.height });
+    pp.colorTex.write(colors);
+    pp.flagsTex.write(flags);
   }
 
   private static STENCIL = {
@@ -693,8 +674,8 @@ export class GroupRenderer {
       pass.id.destroy();
       pass.anchor.destroy();
       pass.index.destroy();
-      pass.colorTexture.destroy();
-      pass.flagsTexture.destroy();
+      pass.colorTex.destroy();
+      pass.flagsTex.destroy();
       pass.fillModel.destroy();
       pass.pickModel.destroy();
     }
@@ -705,10 +686,11 @@ export class GroupRenderer {
       this.point.pointId.destroy();
       this.point.index.destroy();
       this.point.model.destroy();
-      // Only destroy textures if they are owned (not shared with fill pass).
+      // Only destroy textures if they are owned (not shared with fill pass —
+      // borrowed GrowTextures are the fill pass's and are destroyed above).
       if (this.point.ownsTextures) {
-        this.point.colorTexture.destroy();
-        this.point.flagsTexture.destroy();
+        this.point.colorTex.destroy();
+        this.point.flagsTex.destroy();
       }
     }
   }
