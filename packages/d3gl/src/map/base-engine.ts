@@ -90,8 +90,10 @@ export abstract class BaseEngine {
     const drawOffset = this.scene.drawableCount(name); // drawables, not data (culling may differ)
     const dataStart = spec.data.length;
     this.scene.appendToGroup(name, build);
-    spec.data.push(...items);
-    spec.ids.push(...ids);
+    // NB: never `push(...items)` — spreading a large batch (the batch-size control goes
+    // to 1M) exceeds the argument-count limit and throws RangeError. Loop instead.
+    for (const it of items) spec.data.push(it);
+    for (const id of ids) spec.ids.push(id);
     // The drawables actually added (culling may produce fewer than `items`). Used to
     // color only the new range, grow the hit index, and feed the backend delta.
     const newDrawables = this.scene.drawables(name, drawOffset); // O(new)
@@ -102,7 +104,9 @@ export abstract class BaseEngine {
     if (this.interacting && spec.hideOnInteraction) return;
     const backend = this.handle?.backend;
     if (backend?.appendToLayer) {
-      // O(new): hand the backend only the appended buffers + vector views.
+      // O(new): the backend uploads/draws ONLY the appended delta (and is responsible
+      // for making it visible — e.g. canvas draws-on-top). No full render() here, or
+      // we'd pay O(total) per batch and defeat the point.
       backend.appendToLayer({
         name,
         buffers: this.scene.appendedBuffers(name, drawOffset),
@@ -112,8 +116,8 @@ export abstract class BaseEngine {
       });
     } else {
       backend?.updateLayer(name, this.renderLayer(spec)); // fallback: full re-upload (e.g. SVG)
+      this.render();
     }
-    this.render();
   }
 
   recolor(name: string): this {

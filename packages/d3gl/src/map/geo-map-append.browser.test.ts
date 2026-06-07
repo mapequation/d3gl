@@ -71,6 +71,20 @@ describe("GeoMap incremental append", () => {
     map.destroy();
   });
 
+  it("appends a large batch without a spread/argument-count RangeError", async () => {
+    // Regression: spec.data/ids/drawables were extended with push(...batch); a big
+    // batch (the batch-size control goes to 1M) exceeded the argument limit and threw.
+    const host = mount();
+    const map = geoMap(host, { width: 200, height: 200, projection: proj(), backend: "canvas" });
+    await map.whenReady();
+    const big: GeoJSON.Feature[] = [];
+    for (let i = 0; i < 200_000; i++) big.push(pt((i % 360) - 180, 0));
+    const occ = map.layer("occ", [] as GeoJSON.Feature[], { pointRadius: 1, fill: "rgb(255,0,0)", id: (_f, i) => i });
+    expect(() => occ.append(big)).not.toThrow();
+    expect(map.pick(100, 100)).not.toBeNull(); // lon 0 → x 100; some point is there
+    map.destroy();
+  });
+
   it("canvas draw-on-top: many batches accumulate and survive a zoom redraw", async () => {
     // Exercises CanvasBackend.appendToLayer (draw new on top, no clear) + the stored-
     // layer accumulation that a later full render() (e.g. after zoom) redraws from.

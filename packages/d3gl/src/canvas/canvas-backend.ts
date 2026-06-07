@@ -39,7 +39,9 @@ export class CanvasBackend implements Backend {
   appendToLayer(delta: RenderDelta): void {
     const layer = this.layers.find((l) => l.name === delta.name);
     if (!layer) return; // layer is always registered (setLayers) before any append
-    (layer.drawables as DrawableVector[]).push(...delta.drawables);
+    // Loop, not push(...spread): a big batch would exceed the argument-count limit.
+    const acc = layer.drawables as DrawableVector[];
+    for (const d of delta.drawables) acc.push(d);
     const t = this.transform;
     this.ctx.setTransform(t.k, 0, 0, t.k, t.x, t.y); // current view, NO clear
     this.paintDrawables(layer, delta.drawables);
