@@ -94,10 +94,13 @@ export abstract class BaseEngine {
     // to 1M) exceeds the argument-count limit and throws RangeError. Loop instead.
     for (const it of items) spec.data.push(it);
     for (const id of ids) spec.ids.push(id);
-    // The drawables actually added (culling may produce fewer than `items`). Used to
-    // color only the new range, grow the hit index, and feed the backend delta.
-    const newDrawables = this.scene.drawables(name, drawOffset); // O(new)
-    this.applyAccessors(spec, dataStart, new Set(newDrawables.map((d) => d.id)));
+    // Which appended ids actually produced a drawable (culling may drop some)?
+    // (DrawableVector copies its color into a fresh tuple at read time, so we must
+    //  color the scene FIRST, then read the drawables we hand to the hit index /
+    //  backend — otherwise they'd carry the default transparent fill and not paint.)
+    const present = new Set(this.scene.drawables(name, drawOffset).map((d) => d.id));
+    this.applyAccessors(spec, dataStart, present);
+    const newDrawables = this.scene.drawables(name, drawOffset); // O(new), colored
     this.hitIndexes.get(name)?.append(newDrawables);
     // Skip the GPU push for a layer hidden mid-interaction (mirrors recolor): the
     // gesture-end rebuild re-projects + re-pushes the full extended list.

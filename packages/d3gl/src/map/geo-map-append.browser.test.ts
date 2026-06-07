@@ -71,6 +71,25 @@ describe("GeoMap incremental append", () => {
     map.destroy();
   });
 
+  it("canvas paints an appended point immediately, with its accessor color", async () => {
+    // Regression: the drawables handed to the backend were captured BEFORE accessors
+    // ran, so they carried the default transparent fill → canvas painted nothing on
+    // append (only a later full recolor/redraw showed them). Assert a real red pixel.
+    const host = mount();
+    const map = geoMap(host, { width: 200, height: 200, projection: proj(), backend: "canvas" });
+    await map.whenReady();
+    const occ = map.layer("occ", [] as GeoJSON.Feature[], { pointRadius: 5, fill: "rgb(255,0,0)", id: (_f, i) => i });
+    occ.append(pt(0, 0)); // proj([0,0]) = [100,100]; draw-on-top should paint red there
+    const cv = host.querySelector("canvas") as HTMLCanvasElement;
+    const ctx = cv.getContext("2d")!;
+    const dpr = cv.width / 200 || 1;
+    const px = ctx.getImageData(Math.round(100 * dpr), Math.round(100 * dpr), 1, 1).data;
+    expect(px[3]).toBeGreaterThan(0); // not transparent — something was painted
+    expect(px[0]!).toBeGreaterThan(180); // red channel high (the accessor color)
+    expect(px[1]!).toBeLessThan(80);
+    map.destroy();
+  });
+
   it("appends a large batch without a spread/argument-count RangeError", async () => {
     // Regression: spec.data/ids/drawables were extended with push(...batch); a big
     // batch (the batch-size control goes to 1M) exceeded the argument limit and threw.
