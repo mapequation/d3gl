@@ -144,3 +144,104 @@ export function makeDemoPolygon(): Feature<Polygon> {
     geometry: { type: "Polygon", coordinates: [[[0, 15], [0, 30], [30, 30], [30, 15], [0, 15]]] },
   };
 }
+
+// ---------------------------------------------------------------------------
+// Streaming sources — async generators that emit batches of randomly-placed
+// features lazily (only `batchSize` features are materialized per tick, never
+// the whole `total`), so a consumer can `await`-iterate and append them live.
+// Used by the "streaming data" examples to exercise LayerHandle.append.
+// ---------------------------------------------------------------------------
+
+/** Per-feature properties carried by streamed features: a stable id (continues
+ *  across batches) plus a color the example mutates for the "randomize" button. */
+export interface StreamProps {
+  id: number;
+  color: string;
+}
+export type StreamPoint = Feature<Point, StreamProps>;
+export type StreamPolygon = Feature<Polygon, StreamProps>;
+
+export interface StreamOptions {
+  /** Total features emitted before the generator completes. Default 10,000,000. */
+  total?: number;
+  /** Features per yielded batch. Default 1000. */
+  batchSize?: number;
+  /** Artificial delay between batches (ms), to mirror loading from a file/network.
+   *  Even 0 yields a macrotask so the browser can paint between batches. Default 0. */
+  delayMs?: number;
+  /** Seed for the deterministic PRNG (reproducible streams). Default 1. */
+  seed?: number;
+  /** Cooperative cancellation: iteration stops once `signal.aborted` is true. */
+  signal?: { aborted: boolean };
+}
+
+/** Small, fast, seedable PRNG (mulberry32) — deterministic so streams reproduce. */
+function mulberry32(seed: number): () => number {
+  let a = seed >>> 0;
+  return () => {
+    a |= 0;
+    a = (a + 0x6d2b79f5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+/** A random vivid color as a d3-color-parseable `hsl(h, s%, l%)` string. */
+function randomColor(rng: () => number): string {
+  return `hsl(${Math.floor(rng() * 360)}, 70%, 55%)`;
+}
+
+const tick = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
+
+/** Stream random world points as GeoJSON `Feature<Point>` batches (lon/lat uniform). */
+export async function* makeStreamingPoints(opts: StreamOptions = {}): AsyncGenerator<StreamPoint[]> {
+  const { total = 10_000_000, batchSize = 1000, delayMs = 0, seed = 1, signal } = opts;
+  const rng = mulberry32(seed);
+  let id = 0;
+  while (id < total) {
+    if (signal?.aborted) return;
+    const n = Math.min(batchSize, total - id);
+    const batch: StreamPoint[] = new Array(n);
+    for (let k = 0; k < n; k++) {
+      const lon = rng() * 360 - 180;
+      const lat = rng() * 180 - 90;
+      batch[k] = {
+        type: "Feature",
+        properties: { id: id++, color: randomColor(rng) },
+        geometry: { type: "Point", coordinates: [lon, lat] },
+      };
+    }
+    yield batch;
+    await tick(delayMs);
+  }
+}
+
+/** Stream small random cells as GeoJSON `Feature<Polygon>` batches (≈`size`° boxes,
+ *  wound like makeCells so d3-geo fills the small box). */
+export async function* makeStreamingPolygons(
+  opts: StreamOptions & { size?: number } = {},
+): AsyncGenerator<StreamPolygon[]> {
+  const { total = 10_000_000, batchSize = 1000, delayMs = 0, seed = 1, size = 1.5, signal } = opts;
+  const rng = mulberry32(seed);
+  let id = 0;
+  while (id < total) {
+    if (signal?.aborted) return;
+    const n = Math.min(batchSize, total - id);
+    const batch: StreamPolygon[] = new Array(n);
+    for (let k = 0; k < n; k++) {
+      const lon = rng() * (360 - size) - 180;
+      const lat = rng() * (180 - size) - 90;
+      batch[k] = {
+        type: "Feature",
+        properties: { id: id++, color: randomColor(rng) },
+        geometry: {
+          type: "Polygon",
+          coordinates: [[[lon, lat], [lon, lat + size], [lon + size, lat + size], [lon + size, lat], [lon, lat]]],
+        },
+      };
+    }
+    yield batch;
+    await tick(delayMs);
+  }
+}
