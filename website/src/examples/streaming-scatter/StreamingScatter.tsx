@@ -16,7 +16,7 @@ const controls: ControlSpec[] = [
 /** Streaming points on a scatter plot (x = lon, y = −lat), reusing the map source. */
 export default function StreamingScatter() {
   return (
-    <Example width={720} height={420} controls={controls}>
+    <Example width={720} height={420} controls={controls} defaults={{ backend: "canvas" }}>
       {(ctx) => <Imperative ctx={ctx} setup={setup} />}
     </Example>
   );

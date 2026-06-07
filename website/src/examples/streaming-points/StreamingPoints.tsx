@@ -16,7 +16,7 @@ const controls: ControlSpec[] = [
 /** Streaming random world points, appended live onto an equirectangular map. */
 export default function StreamingPoints() {
   return (
-    <Example width={720} height={420} controls={controls}>
+    <Example width={720} height={420} controls={controls} defaults={{ backend: "canvas" }}>
       {(ctx) => <Imperative ctx={ctx} setup={setup} />}
     </Example>
   );
