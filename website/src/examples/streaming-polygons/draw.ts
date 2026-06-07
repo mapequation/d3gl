@@ -1,16 +1,14 @@
 import { geoEquirectangular } from "d3-geo";
 import { geoMap, type LayerHandle } from "@mapequation/d3gl/map";
-import {
-  loadWorld,
-  makeStreamingPolygons,
-  DEFAULT_STREAM_COLOR,
-  type StreamPolygon,
-} from "../shared/geo-data.js";
+import { loadWorld, makeStreamingPolygons, type StreamPolygon } from "../shared/geo-data.js";
 import { StreamController, randomHsl, DATA_SIZE_TOTALS } from "../shared/streaming.js";
+import { createStatsOverlay } from "../shared/stats-overlay.js";
 import type { ImperativeSetup } from "../types.js";
 
 const OCEAN = "#dbe7f3";
 const LAND = "#e9e7df";
+const RANGE_ALPHA = 0.12; // very transparent so overlapping ranges build up richness
+const DEFAULT_RANGE_COLOR = `hsla(8, 80%, 53%, ${RANGE_ALPHA})`; // translucent red
 
 /**
  * Stream small polygon cells (clustered around cities + rivers) and append them
@@ -27,29 +25,38 @@ export const setup: ImperativeSetup = (host, { width, height, backend, options }
   map.enableZoom([1, 40]);
 
   const retained: StreamPolygon[] = [];
-  let currentColor = DEFAULT_STREAM_COLOR;
+  let currentColor = DEFAULT_RANGE_COLOR; // translucent; new ranges get this color
   const cellOpts = {
     fill: (f: StreamPolygon) => f.properties.color,
-    stroke: "#00000022",
-    lineWidth: 0.2,
     id: (f: StreamPolygon) => f.properties.id,
-    clipTo: "land", // only show cells over land
+    clipTo: "land", // only show ranges over land
   };
   let cells: LayerHandle<StreamPolygon> = map.layer("cells", [], cellOpts);
   map.render();
 
+  const stats = createStatsOverlay(host);
+  let count = 0;
+  let appendMs = 0;
+
   let seed = 1;
   let total = DATA_SIZE_TOTALS[String(options.size)] ?? 1_000_000;
   const ctrl = new StreamController<StreamPolygon>({
-    source: (o) => makeStreamingPolygons({ total, size: 1.5, ...o }),
+    source: (o) => makeStreamingPolygons({ total, ...o }), // large ranges (default size)
     onBatch: (batch) => {
       for (const f of batch) f.properties.color = currentColor;
       retained.push(...batch);
+      const t0 = performance.now();
       cells.append(batch);
+      appendMs += performance.now() - t0;
+      count += batch.length;
+      stats.update(count, total, count / (appendMs / 1000));
     },
     onReset: () => {
       retained.length = 0;
+      count = 0;
+      appendMs = 0;
       cells = map.layer("cells", [], cellOpts);
+      stats.update(0, total, 0, true);
     },
   });
   ctrl.batchSize = Number(options.batch);
@@ -66,7 +73,7 @@ export const setup: ImperativeSetup = (host, { width, height, backend, options }
       ctrl.setRunning(o.stream === "run");
       if (o.randomize !== lastRandomize) {
         lastRandomize = Number(o.randomize) || 0;
-        currentColor = randomHsl();
+        currentColor = randomHsl(RANGE_ALPHA); // keep ranges translucent
         for (const f of retained) f.properties.color = currentColor;
         cells.recolor();
       }
@@ -86,6 +93,9 @@ export const setup: ImperativeSetup = (host, { width, height, backend, options }
         ctrl.restart(++seed);
       }
     },
-    dispose: () => ctrl.dispose(),
+    dispose: () => {
+      ctrl.dispose();
+      stats.destroy();
+    },
   };
 };

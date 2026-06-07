@@ -7,6 +7,7 @@ import {
   type StreamPoint,
 } from "../shared/geo-data.js";
 import { StreamController, randomHsl, DATA_SIZE_TOTALS } from "../shared/streaming.js";
+import { createStatsOverlay } from "../shared/stats-overlay.js";
 import type { ImperativeSetup } from "../types.js";
 
 const OCEAN = "#dbe7f3";
@@ -32,12 +33,16 @@ export const setup: ImperativeSetup = (host, { width, height, backend, options }
   let currentColor = DEFAULT_STREAM_COLOR; // the color new points get (until randomized)
   const pointOpts = {
     fill: (f: StreamPoint) => f.properties.color,
-    pointRadius: 1.6,
+    pointRadius: 0.5,
     id: (f: StreamPoint) => f.properties.id,
     clipTo: "land", // only show points over land
   };
   let points: LayerHandle<StreamPoint> = map.layer("points", [], pointOpts);
   map.render();
+
+  const stats = createStatsOverlay(host);
+  let count = 0; // records appended this session
+  let appendMs = 0; // total time spent in append() — gives the average speed
 
   let seed = 1;
   let total = DATA_SIZE_TOTALS[String(options.size)] ?? 1_000_000;
@@ -46,11 +51,18 @@ export const setup: ImperativeSetup = (host, { width, height, backend, options }
     onBatch: (batch) => {
       for (const f of batch) f.properties.color = currentColor; // new points get the current color
       retained.push(...batch); // retain for redraw / recolor
+      const t0 = performance.now();
       points.append(batch); // incremental append — only the new points project
+      appendMs += performance.now() - t0;
+      count += batch.length;
+      stats.update(count, total, count / (appendMs / 1000));
     },
     onReset: () => {
       retained.length = 0;
+      count = 0;
+      appendMs = 0;
       points = map.layer("points", [], pointOpts); // re-register empty to clear
+      stats.update(0, total, 0, true);
     },
   });
   ctrl.batchSize = Number(options.batch);
@@ -87,6 +99,9 @@ export const setup: ImperativeSetup = (host, { width, height, backend, options }
         ctrl.restart(++seed);
       }
     },
-    dispose: () => ctrl.dispose(),
+    dispose: () => {
+      ctrl.dispose();
+      stats.destroy();
+    },
   };
 };

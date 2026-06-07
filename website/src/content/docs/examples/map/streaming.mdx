@@ -10,7 +10,10 @@ import StreamingScatter from "../../../../examples/streaming-scatter/StreamingSc
 
 `layer.append(batch)` streams new features into an existing layer **without re-projecting
 the features already on screen** — the key to live data like species occurrences. Points
-and cells are clustered around cities + major rivers and, on the maps, **clipped to land**.
+land in patchy, multi-scale clusters (a Thomas-like point process) and are **clipped to
+land**; the polygon "ranges" are large and rendered very transparently, so overlapping
+ranges build up species-richness hotspots. A live readout (top-right) shows the record
+count, percentage of the chosen total, and the average append speed so far.
 
 Each example keeps its own retained GeoJSON array alongside the layer. Every feature starts
 the same color; **Randomize colors** picks a new color, applies it to all *future* features,

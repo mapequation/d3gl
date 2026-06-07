@@ -75,9 +75,11 @@ export class StreamController<T> {
   }
 }
 
-/** A random vivid color (used by the "randomize colors" button). */
-export function randomHsl(): string {
-  return `hsl(${Math.floor(Math.random() * 360)}, 70%, 55%)`;
+/** A random vivid color (used by the "randomize colors" button). Pass `alpha` < 1
+ *  for translucent fills (e.g. overlapping polygon ranges). */
+export function randomHsl(alpha = 1): string {
+  const h = Math.floor(Math.random() * 360);
+  return alpha >= 1 ? `hsl(${h}, 70%, 55%)` : `hsla(${h}, 70%, 55%, ${alpha})`;
 }
 
 /** The batch-size choices offered by the streaming examples' control. */

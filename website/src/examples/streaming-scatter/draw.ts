@@ -1,6 +1,7 @@
 import { plot, type LayerHandle } from "@mapequation/d3gl/map";
 import { makeStreamingPoints, DEFAULT_STREAM_COLOR, type StreamPoint } from "../shared/geo-data.js";
 import { StreamController, randomHsl, DATA_SIZE_TOTALS } from "../shared/streaming.js";
+import { createStatsOverlay } from "../shared/stats-overlay.js";
 import type { ImperativeSetup } from "../types.js";
 
 /**
@@ -22,13 +23,17 @@ export const setup: ImperativeSetup = (host, { width, height, backend, options }
   const pointOpts = {
     x: (f: StreamPoint) => f.geometry.coordinates[0], // longitude
     y: (f: StreamPoint) => -f.geometry.coordinates[1], // −latitude (north up)
-    radius: 2,
+    radius: 1,
     fill: (f: StreamPoint) => f.properties.color,
     id: (f: StreamPoint) => f.properties.id,
-    sizeMode: "screen" as const, // constant 2px dots regardless of zoom
+    sizeMode: "screen" as const, // constant 1px dots regardless of zoom
   };
   let points: LayerHandle<StreamPoint> = chart.points("points", [], pointOpts);
   chart.render();
+
+  const stats = createStatsOverlay(host);
+  let count = 0;
+  let appendMs = 0;
 
   let seed = 1;
   let total = DATA_SIZE_TOTALS[String(options.size)] ?? 1_000_000;
@@ -37,11 +42,18 @@ export const setup: ImperativeSetup = (host, { width, height, backend, options }
     onBatch: (batch) => {
       for (const f of batch) f.properties.color = currentColor;
       retained.push(...batch);
+      const t0 = performance.now();
       points.append(batch);
+      appendMs += performance.now() - t0;
+      count += batch.length;
+      stats.update(count, total, count / (appendMs / 1000));
     },
     onReset: () => {
       retained.length = 0;
+      count = 0;
+      appendMs = 0;
       points = chart.points("points", [], pointOpts);
+      stats.update(0, total, 0, true);
     },
   });
   ctrl.batchSize = Number(options.batch);
@@ -78,6 +90,9 @@ export const setup: ImperativeSetup = (host, { width, height, backend, options }
         ctrl.restart(++seed);
       }
     },
-    dispose: () => ctrl.dispose(),
+    dispose: () => {
+      ctrl.dispose();
+      stats.destroy();
+    },
   };
 };

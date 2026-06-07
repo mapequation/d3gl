@@ -199,8 +199,6 @@ export interface StreamOptions {
   delayMs?: number;
   /** Seed for the deterministic PRNG (reproducible streams). Default 1. */
   seed?: number;
-  /** Cluster spread in degrees (gaussian stddev around each center). Default 4. */
-  spread?: number;
   /** Cooperative cancellation: iteration stops once `signal.aborted` is true. */
   signal?: { aborted: boolean };
 }
@@ -217,39 +215,93 @@ function mulberry32(seed: number): () => number {
   };
 }
 
-/** Standard-normal sample (Box–Muller) from a uniform PRNG. */
-function gaussian(rng: () => number): number {
-  const u = Math.max(1e-9, rng());
-  return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * rng());
-}
-
 const clamp = (x: number, lo: number, hi: number): number => Math.max(lo, Math.min(hi, x));
 
-/** Cluster centers for the streaming sources: every city plus every major-river
- *  vertex, so points/cells concentrate where features actually are. */
-export function streamClusterCenters(): [number, number][] {
-  const centers: [number, number][] = makeCities().map((c) => c.geometry.coordinates as [number, number]);
-  for (const line of makeMajorRivers().geometry.coordinates) for (const pt of line) centers.push(pt as [number, number]);
-  return centers;
+/**
+ * A clustered point process (Thomas-like): many weighted "hotspot" parents at a
+ * range of scales — tight, dense cities; medium clumps along rivers; and a field
+ * of random global hotspots with varied spread/weight. Offspring fall around a
+ * parent with an exponential (heavy-tailed) radius, so the result is patchy and
+ * multi-scale — far closer to real species-occurrence density than a smooth
+ * gaussian. Clip-to-land then carves the continental outline.
+ */
+interface Parent {
+  lon: number;
+  lat: number;
+  /** Mean offspring radius in degrees. */
+  spread: number;
+  /** Relative share of points drawn from this parent. */
+  weight: number;
+}
+
+function buildParents(rng: () => number): Parent[] {
+  const parents: Parent[] = [];
+  for (const c of makeCities())
+    parents.push({ lon: c.geometry.coordinates[0]!, lat: c.geometry.coordinates[1]!, spread: 1.5, weight: 3 });
+  for (const line of makeMajorRivers().geometry.coordinates)
+    for (const p of line) parents.push({ lon: p[0]!, lat: p[1]!, spread: 2.5, weight: 2 });
+  // Random global hotspots: rng()*rng() biases toward small spreads/weights, so
+  // most clumps are tight with a few diffuse ones — a wide range of scales.
+  for (let i = 0; i < 240; i++) {
+    parents.push({
+      lon: rng() * 360 - 180,
+      lat: rng() * 160 - 80,
+      spread: 0.6 + 9 * rng() * rng(),
+      weight: 0.2 + 3 * rng() * rng(),
+    });
+  }
+  return parents;
+}
+
+function cumulativeWeights(parents: readonly Parent[]): number[] {
+  const cum: number[] = [];
+  let s = 0;
+  for (const p of parents) {
+    s += p.weight;
+    cum.push(s);
+  }
+  return cum;
+}
+
+/** Pick a parent by weight (binary search over cumulative weights). */
+function pickParent(rng: () => number, parents: readonly Parent[], cum: readonly number[]): Parent {
+  const r = rng() * cum[cum.length - 1]!;
+  let lo = 0;
+  let hi = cum.length - 1;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (cum[mid]! < r) lo = mid + 1;
+    else hi = mid;
+  }
+  return parents[lo]!;
+}
+
+/** Offspring location around a parent: exponential radius, uniform direction. */
+function clusteredLonLat(rng: () => number, p: Parent): [number, number] {
+  const radius = -p.spread * Math.log(Math.max(1e-9, rng())); // exponential, mean = spread
+  const ang = rng() * 2 * Math.PI;
+  return [
+    clamp(p.lon + radius * Math.cos(ang), -180, 180),
+    clamp(p.lat + radius * Math.sin(ang), -90, 90),
+  ];
 }
 
 const tick = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
 
-/** Stream world points as GeoJSON `Feature<Point>` batches, clustered (gaussian)
- *  around city + river centers. All start with DEFAULT_STREAM_COLOR. */
+/** Stream world points as GeoJSON `Feature<Point>` batches, clustered around
+ *  many multi-scale hotspots. All start with DEFAULT_STREAM_COLOR. */
 export async function* makeStreamingPoints(opts: StreamOptions = {}): AsyncGenerator<StreamPoint[]> {
-  const { total = 10_000_000, batchSize = 1000, delayMs = 0, seed = 1, spread = 4, signal } = opts;
+  const { total = 10_000_000, batchSize = 1000, delayMs = 0, seed = 1, signal } = opts;
   const rng = mulberry32(seed);
-  const centers = streamClusterCenters();
+  const parents = buildParents(rng);
+  const cum = cumulativeWeights(parents);
   let id = 0;
   while (id < total) {
     if (signal?.aborted) return;
     const n = Math.min(batchSize, total - id);
     const batch: StreamPoint[] = new Array(n);
     for (let k = 0; k < n; k++) {
-      const c = centers[Math.floor(rng() * centers.length)]!;
-      const lon = clamp(c[0] + gaussian(rng) * spread, -180, 180);
-      const lat = clamp(c[1] + gaussian(rng) * spread, -90, 90);
+      const [lon, lat] = clusteredLonLat(rng, pickParent(rng, parents, cum));
       batch[k] = {
         type: "Feature",
         properties: { id: id++, color: DEFAULT_STREAM_COLOR },
@@ -261,29 +313,33 @@ export async function* makeStreamingPoints(opts: StreamOptions = {}): AsyncGener
   }
 }
 
-/** Stream small `size`° polygon cells (wound like makeCells), clustered around
- *  city + river centers. All start with DEFAULT_STREAM_COLOR. */
+/** Stream polygon "range" cells clustered around hotspots, each a box of random
+ *  side ≤ `size`° (large, to mimic species ranges). All start with
+ *  DEFAULT_STREAM_COLOR; the example renders them very transparent so overlapping
+ *  ranges build up richness. */
 export async function* makeStreamingPolygons(
   opts: StreamOptions & { size?: number } = {},
 ): AsyncGenerator<StreamPolygon[]> {
-  const { total = 10_000_000, batchSize = 1000, delayMs = 0, seed = 1, spread = 4, size = 1.5, signal } = opts;
+  const { total = 10_000_000, batchSize = 1000, delayMs = 0, seed = 1, size = 16, signal } = opts;
   const rng = mulberry32(seed);
-  const centers = streamClusterCenters();
+  const parents = buildParents(rng);
+  const cum = cumulativeWeights(parents);
   let id = 0;
   while (id < total) {
     if (signal?.aborted) return;
     const n = Math.min(batchSize, total - id);
     const batch: StreamPolygon[] = new Array(n);
     for (let k = 0; k < n; k++) {
-      const c = centers[Math.floor(rng() * centers.length)]!;
-      const lon = clamp(c[0] + gaussian(rng) * spread, -180, 180 - size);
-      const lat = clamp(c[1] + gaussian(rng) * spread, -90, 90 - size);
+      const center = clusteredLonLat(rng, pickParent(rng, parents, cum));
+      const s = size * (0.3 + 0.7 * rng()); // varied range sizes, ≤ size
+      const lon = clamp(center[0], -180, 180 - size);
+      const lat = clamp(center[1], -90, 90 - size);
       batch[k] = {
         type: "Feature",
         properties: { id: id++, color: DEFAULT_STREAM_COLOR },
         geometry: {
           type: "Polygon",
-          coordinates: [[[lon, lat], [lon, lat + size], [lon + size, lat + size], [lon + size, lat], [lon, lat]]],
+          coordinates: [[[lon, lat], [lon, lat + s], [lon + s, lat + s], [lon + s, lat], [lon, lat]]],
         },
       };
     }
