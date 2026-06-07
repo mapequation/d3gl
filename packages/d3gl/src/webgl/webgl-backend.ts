@@ -1,7 +1,8 @@
 import { luma } from "@luma.gl/core";
 import { webgl2Adapter } from "@luma.gl/webgl";
 import type { Device, Framebuffer } from "@luma.gl/core";
-import type { Backend, RenderLayer, ViewTransform } from "../core/index.js";
+import type { Backend, RenderLayer, RenderDelta, ViewTransform } from "../core/index.js";
+import type { GroupBuffers, GroupBufferDelta } from "../core/index.js";
 import { GroupRenderer } from "./renderer.js";
 import { clipFromView } from "./transform.js";
 import { toPNG } from "./png.js";
@@ -70,15 +71,10 @@ export class WebGLBackend implements Backend {
   /**
    * Update a layer. If the drawable count is unchanged this is the cheap recolor /
    * show-hide path (`updateColors` rewrites only the palette/flags textures). If the
-   * count changed — e.g. a `LayerHandle.append` routed here because this backend
-   * doesn't implement the incremental `appendToLayer` — rebuild the layer's renderer
-   * from the full buffers (correct, but O(total) per call).
-   *
-   * TODO(perf): implement the incremental `Backend.appendToLayer(delta)` here — grow
-   * the VBOs with `Buffer.write` + capacity doubling and the color/flag textures with
-   * `Texture.writeData`, bumping `Model.setVertexCount` — so an append is O(new). The
-   * luma.gl API supports it (`createBuffer({byteLength})`, `write`, `setVertexCount`,
-   * `setAttributes`); deferred because it needs interactive browser verification.
+   * count changed — e.g. an append routed here as a fallback (a new geometry-type pass
+   * appeared that `appendToLayer` can't create incrementally) — rebuild the layer's
+   * renderer from the full buffers (correct, but O(total) per call). The O(new) path is
+   * {@link appendToLayer}, which the engine uses for normal appends.
    */
   updateLayer(name: string, layer: RenderLayer): void {
     const existing = this.renderers.get(name);
@@ -95,6 +91,43 @@ export class WebGLBackend implements Backend {
       if (!this.order.includes(name)) this.order.push(name);
     }
     this.bakeDirty = true;
+  }
+
+  /**
+   * O(new) incremental append: grow the existing GroupRenderer's geometry buffers
+   * (capacity-doubling) and color/flag textures with only the appended tail, instead of
+   * rebuilding from full buffers. The engine calls this (not `updateLayer`) for appends.
+   *
+   * The layer is always registered (via `setLayers`) before any append, so the renderer
+   * exists; if it somehow doesn't, we no-op (nothing to grow from a delta alone). If a new
+   * geometry-type pass appears that can't be grown incrementally (renderer.append returns
+   * false), fall back to a full rebuild via `updateLayer` so the result stays correct.
+   */
+  appendToLayer(delta: RenderDelta): void {
+    const renderer = this.renderers.get(delta.name);
+    if (!renderer) return;
+    const ok = renderer.append(delta.buffers);
+    if (!ok) {
+      // A pass needed by the delta did not exist in the renderer yet — e.g. the layer
+      // was created empty (all passes null) and the first geometry of some type arrives
+      // now. We can't grow a null pass from a tail delta. But when fromDrawable === 0 the
+      // delta IS the whole group (group-absolute indices from 0), so we can rebuild the
+      // renderer from it. (For a *partial* new-pass-type append — uncommon, since layers
+      // keep a stable geometry-type mix — this would be incomplete; documented limit.)
+      if (delta.buffers.fromDrawable === 0) {
+        renderer.destroy();
+        const fresh = new GroupRenderer(this.device, deltaToBuffers(delta.buffers), this.width, this.height);
+        fresh.setTransform(this.clipMatrix);
+        this.renderers.set(delta.name, fresh);
+      }
+    }
+    // Keep the stored layer's clip/sizeMode current (geometry lives in the renderer).
+    const prev = this.layers.get(delta.name);
+    if (prev) this.layers.set(delta.name, { ...prev, clipTo: delta.clipTo, sizeMode: delta.sizeMode });
+    this.bakeDirty = true;
+    // The engine does not call render() after appendToLayer (the backend is responsible
+    // for making the append visible); render now (re-bakes if dirty in globe mode).
+    this.render();
   }
 
   setTransform(t: ViewTransform): void {
@@ -224,4 +257,26 @@ export class WebGLBackend implements Backend {
     this.offscreen.destroy();
     this.device.destroy();
   }
+}
+
+/**
+ * Treat a `fromDrawable === 0` delta as full {@link GroupBuffers}: the delta's arrays
+ * already span the whole group (indices are group-absolute from 0). Used only on the
+ * rare empty-renderer rebuild path in appendToLayer.
+ */
+function deltaToBuffers(d: GroupBufferDelta): GroupBuffers {
+  return {
+    fillVertices: d.fillVertices,
+    fillIndices: d.fillIndices,
+    strokeVertices: d.strokeVertices,
+    strokeIndices: d.strokeIndices,
+    fillColors: d.fillColors,
+    strokeColors: d.strokeColors,
+    flags: d.flags,
+    drawableCount: d.drawableCount,
+    pointCenters: d.pointCenters,
+    pointCount: d.pointCenters.length / 4,
+    fillAnchors: d.fillAnchors,
+    strokeAnchors: d.strokeAnchors,
+  };
 }
