@@ -5,6 +5,7 @@ import versor, { type Angles, type Vec3, type Quaternion } from "../geo/versor.j
 import { BaseEngine, type HoverHit, type LayerSpec } from "./base-engine.js";
 import type { BackendType } from "./backend-factory.js";
 import type { ViewTransform } from "../core/index.js";
+import { LayerHandle } from "./layer-handle.js";
 
 export interface GeoMapOptions { width: number; height: number; projection: GeoProjection; backend?: BackendType; }
 export interface LayerOptions<F = any> {
@@ -28,7 +29,7 @@ export interface RotationOptions {
   onRotate?: (rotation: Angles) => void;
 }
 
-interface LayerDef { name: string; list: any[]; opts: LayerOptions; }
+interface LayerDef { name: string; opts: LayerOptions; }
 
 /** WebGL-only globe methods, feature-detected at runtime (other backends lack them). */
 type GlobeBackend = {
@@ -64,11 +65,26 @@ export class GeoMap extends BaseEngine {
     this.gpuGlobe = this.backendType() === "webgl" && isOrthographic(this.projection);
   }
 
-  layer<F>(name: string, features: F | readonly F[], opts: LayerOptions<F> = {}): this {
+  layer<F>(name: string, features: F | readonly F[], opts: LayerOptions<F> = {}): LayerHandle<F> {
     const list = Array.isArray(features) ? (features as F[]) : [features as F];
-    this.defs = this.defs.filter((d) => d.name !== name).concat({ name, list, opts });
+    this.defs = this.defs.filter((d) => d.name !== name).concat({ name, opts });
     this.registerLayer(this.buildSpec(name, list, opts));
-    return this;
+    return new LayerHandle<F>(this, name, (items) => this.appendFeatures(name, items, opts));
+  }
+
+  /** Project only the new features against the current projection and append them.
+   *  spec.data (extended by appendToLayer) is the rebuild source, so appended
+   *  features survive setProjection / rotation. */
+  private appendFeatures<F>(name: string, items: readonly F[], opts: LayerOptions<F>): void {
+    if (items.length === 0) return;
+    const spec = this.specs.find((s) => s.name === name);
+    if (!spec) throw new Error(`unknown layer: ${name}`);
+    const offset = spec.data.length;
+    const ids = items.map((f, j) => (opts.id ? opts.id(f, offset + j) : offset + j));
+    const build = geoLayer(items as any[], this.projection, {
+      id: (_f, j) => ids[j]!, lineWidth: opts.lineWidth, pointRadius: opts.pointRadius, sizeMode: opts.sizeMode,
+    });
+    this.appendToLayer(name, items, ids, build);
   }
 
   /** Swap the projection on the existing map: re-project every layer once and
@@ -296,7 +312,9 @@ export class GeoMap extends BaseEngine {
   private rebuildLayers(o: { skipHidden?: boolean } = {}): void {
     for (const def of this.defs) {
       if (o.skipHidden && def.opts.hideOnInteraction) continue;
-      this.registerLayer(this.buildSpec(def.name, def.list, def.opts));
+      const spec = this.specs.find((s) => s.name === def.name);
+      if (!spec) continue;
+      this.registerLayer(this.buildSpec(def.name, spec.data, def.opts));
     }
   }
 
