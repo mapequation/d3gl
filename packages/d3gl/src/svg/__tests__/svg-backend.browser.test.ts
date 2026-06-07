@@ -31,6 +31,37 @@ describe("SvgBackend", () => {
     backend.destroy();
   });
 
+  it("setTransform on an all-world scene only re-points the view group (no re-serialize)", () => {
+    const el = document.createElement("div");
+    document.body.appendChild(el);
+    const backend = new SvgBackend(el, 100, 100);
+    backend.setLayers([layer("a", "rgb(255,0,0)")]); // world sizeMode
+    backend.render();
+    const view = el.querySelector("svg")!.querySelector("g")!; // first <g> = the view group
+    const before = view.innerHTML;
+    backend.setTransform({ k: 5, x: 7, y: 9 });
+    expect(view.getAttribute("transform")).toBe("translate(7, 9) scale(5)");
+    expect(view.innerHTML).toBe(before); // O(1): content was NOT re-serialized
+    backend.destroy();
+  });
+
+  it("setTransform with screen-mode content re-serializes (coords bake the transform)", () => {
+    const el = document.createElement("div");
+    document.body.appendChild(el);
+    const backend = new SvgBackend(el, 100, 100);
+    const scene = new Scene();
+    scene.group("p", (b) => b.point("p", 10, 10, 3));
+    scene.setFill("p", "p", "rgb(0,0,255)");
+    backend.setLayers([{ name: "p", buffers: scene.buffers("p"), drawables: scene.drawables("p"), sizeMode: "screen" }]);
+    backend.setTransform({ k: 1, x: 0, y: 0 });
+    backend.render();
+    const svg = el.querySelector("svg")!;
+    expect(svg.querySelector("circle")!.getAttribute("cx")).toBe("10"); // 1*10+0
+    backend.setTransform({ k: 2, x: 0, y: 0 });
+    expect(svg.querySelector("circle")!.getAttribute("cx")).toBe("20"); // re-serialized: 2*10+0
+    backend.destroy();
+  });
+
   it("carries a viewBox so content scales (matches canvas/webgl mapping) when CSS resizes the svg", () => {
     const el = document.createElement("div");
     el.style.width = "400px"; el.style.height = "400px"; // larger than the logical 200x200

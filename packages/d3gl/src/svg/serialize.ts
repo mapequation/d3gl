@@ -48,13 +48,58 @@ function drawableElements(d: DrawableVector): string {
   return `<path d="${pathD(d)}" fill="${fill}"${strokeAttrs} />`;
 }
 
-/** A full SVG document for the given layers under a view transform. */
-export function svgFromLayers(width: number, height: number, layers: readonly RenderLayer[], t: ViewTransform): string {
+/**
+ * The serialized pieces of the scene body, split by how they relate to the view
+ * transform so a backend can update the transform cheaply:
+ * - `defs`: clipPath defs (world coords; transform-independent).
+ * - `world`: drawables in world coordinates, meant to sit inside a single
+ *   `<g transform="…">` — so a pan/zoom is just that group's `transform` attribute.
+ * - `screen`: screen-sizeMode content (constant-pixel circles/glyphs) with the
+ *   transform BAKED into coordinates; it must be re-serialized when the view moves.
+ * - `hasScreen`: true if any layer is screen sizeMode — i.e. `world`/stroke widths
+ *   also depend on the transform, so the whole body must be re-serialized on a move
+ *   (no O(1) transform fast path). False ⇒ `world` is transform-independent.
+ */
+export function svgBody(
+  layers: readonly RenderLayer[],
+  t: ViewTransform,
+): { defs: string; world: string; screen: string; hasScreen: boolean } {
   const defs: string[] = [];
   const groups: string[] = [];
-  // Screen-mode point drawables are emitted in a separate untransformed group on top.
   const screenCircleGroups: string[] = [];
+  buildGroups(layers, t, defs, groups, screenCircleGroups);
+  return {
+    defs: defs.join(""),
+    world: groups.join(""),
+    screen: screenCircleGroups.join(""),
+    hasScreen: layers.some((l) => l.sizeMode === "screen"),
+  };
+}
 
+/** The view-group transform string for a `ViewTransform`. */
+export function viewTransform(t: ViewTransform): string {
+  return `translate(${t.x}, ${t.y}) scale(${t.k})`;
+}
+
+/** A full SVG document for the given layers under a view transform. */
+export function svgFromLayers(width: number, height: number, layers: readonly RenderLayer[], t: ViewTransform): string {
+  const { defs, world, screen } = svgBody(layers, t);
+  return (
+    `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}">` +
+    `<defs>${defs}</defs><g transform="${viewTransform(t)}">${world}</g>` +
+    screen +
+    `</svg>`
+  );
+}
+
+/** Shared serialization used by both svgBody and svgFromLayers. */
+function buildGroups(
+  layers: readonly RenderLayer[],
+  t: ViewTransform,
+  defs: string[],
+  groups: string[],
+  screenCircleGroups: string[],
+): void {
   for (const layer of layers) {
     const screenMode = layer.sizeMode === "screen";
 
@@ -110,11 +155,4 @@ export function svgFromLayers(width: number, height: number, layers: readonly Re
       groups.push(`<g${clipAttr}>${elements}</g>`);
     }
   }
-  const transform = `translate(${t.x}, ${t.y}) scale(${t.k})`;
-  return (
-    `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}">` +
-    `<defs>${defs.join("")}</defs><g transform="${transform}">${groups.join("")}</g>` +
-    (screenCircleGroups.length > 0 ? screenCircleGroups.join("") : "") +
-    `</svg>`
-  );
 }
