@@ -29,6 +29,10 @@ export abstract class BaseEngine {
   protected scene = new Scene();
   protected specs: LayerSpec[] = [];
   protected hitIndexes = new Map<string, HitIndex>();
+  /** Per-layer set of drawable ids (as strings), maintained incrementally so an
+   *  append's duplicate-id check stays O(new) instead of rebuilding a Set of every
+   *  existing id each batch (which made streaming O(total)/batch). */
+  private layerIds = new Map<string, Set<string>>();
   protected transform: ViewTransform = { k: 1, x: 0, y: 0 };
   protected handle: BackendHandle | null = null;
   protected ready: Promise<void>;
@@ -60,6 +64,9 @@ export abstract class BaseEngine {
     if (at >= 0) this.specs[at] = spec;
     else this.specs.push(spec);
     this.hitIndexes.set(spec.name, new HitIndex(this.scene.drawables(spec.name)));
+    // Seed the incremental id set from the full (re)built spec (O(total) here, but a
+    // register/rebuild is already O(total); appends then stay O(new)).
+    this.layerIds.set(spec.name, new Set(spec.ids.map(String)));
     this.pushLayers();
   }
 
@@ -80,7 +87,10 @@ export abstract class BaseEngine {
     // ids and items must stay parallel — a mismatch would desync spec.data/spec.ids
     // (which applyAccessors and pick index in lockstep).
     if (ids.length !== items.length) throw new Error(`appendToLayer: ids.length (${ids.length}) !== items.length (${items.length})`);
-    const existing = new Set(spec.ids.map(String));
+    // Validate against the PERSISTENT id set (O(new)); a from-scratch
+    // `new Set(spec.ids…)` here would be O(total) every batch and make streaming
+    // quadratic. Don't mutate the set until validation passes (keeps append atomic).
+    const existing = this.layerIds.get(name) ?? new Set(spec.ids.map(String));
     const seen = new Set<string>();
     for (const id of ids) {
       const key = String(id);
@@ -94,6 +104,8 @@ export abstract class BaseEngine {
     // to 1M) exceeds the argument-count limit and throws RangeError. Loop instead.
     for (const it of items) spec.data.push(it);
     for (const id of ids) spec.ids.push(id);
+    for (const key of seen) existing.add(key); // commit ids to the persistent set
+    this.layerIds.set(name, existing);
     // Which appended ids actually produced a drawable (culling may drop some)?
     // (DrawableVector copies its color into a fresh tuple at read time, so we must
     //  color the scene FIRST, then read the drawables we hand to the hit index /
