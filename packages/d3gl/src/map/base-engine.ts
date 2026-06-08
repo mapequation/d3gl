@@ -124,6 +124,7 @@ export abstract class BaseEngine {
     if (!this.handle) return; // not ready: keep the spec; install replay activates it
     if (!this.handle.backend.supportsPassThrough) {
       this.ptSpecs.delete(spec.name);
+      this.ptRepaintTokens.delete(spec.name); // prune stale token (no active repaint, but keep the map clean)
       throw new Error(
         `passThrough is not supported by the "${this.currentBackend}" backend (use canvas or webgl)`,
       );
@@ -167,6 +168,9 @@ export abstract class BaseEngine {
   protected repaintPassThrough(name: string): void {
     const spec = this.ptSpecs.get(name);
     if (!spec || !this.handle) return;
+    // Closing over `spec` here is safe: if the same layer is re-registered, registerPassThrough
+    // calls repaintPassThrough again (bumping this layer's token), which cancels any in-flight
+    // step() before it can execute another slice with the now-stale spec.
     const data = this.ptData(spec);
     const token = (this.ptRepaintTokens.get(name) ?? 0) + 1;
     this.ptRepaintTokens.set(name, token);
@@ -316,6 +320,12 @@ export abstract class BaseEngine {
         this.handle?.backend.snapshotPassThrough?.();
       } else {
         // Settle: re-pull + crisp redraw of every pass-through layer.
+        // Known benign double-repaint: if a hideOnInteraction retained layer coexists with
+        // a pass-through layer, pushLayers() above already called repaintPassThrough for
+        // each PT layer (to restore PT pixels after render() cleared them). The loop here
+        // repaints them again — correct output; the first-slice from pushLayers is simply
+        // cancelled by this second token bump. Do NOT add a dedup guard: the pushLayers
+        // repaint is necessary in the general case (retained-layer rebuild without settle).
         for (const name of this.ptSpecs.keys()) this.repaintPassThrough(name);
       }
     }
