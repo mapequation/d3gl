@@ -104,12 +104,26 @@ export class GeoMap extends BaseEngine {
   }
 
   override setBackend(type: BackendType): this {
+    // Already live on this backend (e.g. "auto" finished upgrading to WebGL) → do nothing.
+    // Must short-circuit BEFORE disableInteraction, or we'd tear down the GPU globe (drop it
+    // to the flat fitted disc) and re-bake it — the visible flicker we're avoiding.
+    if (this.isCurrentBackend(type)) return this;
     this.disableInteraction();
     super.setBackend(type);
+    // gpuGlobe re-eval + interaction re-dispatch now happen in onBackendSwapped(), once the
+    // new backend is actually live — which also covers the transparent "auto" canvas→WebGL
+    // upgrade (a swap the caller never explicitly requested).
+    return this;
+  }
+
+  /** After any backend SWAP (explicit setBackend, or the "auto" canvas→WebGL upgrade): the
+   *  live backend changed, so re-evaluate GPU-globe eligibility and re-dispatch the stored
+   *  interaction (an orthographic globe switches from CPU rotation to the GPU globe on the
+   *  swap to WebGL). */
+  protected override onBackendSwapped(): void {
     this.evalGpuGlobe();
     const req = this.interactionRequest;
     if (req) this.enableZoom(req.extent, req.onTransform);
-    return this;
   }
 
   /** One entry point for both projection kinds: a spherical (azimuthal) projection

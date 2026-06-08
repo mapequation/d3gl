@@ -174,7 +174,7 @@ function download(href: string, filename: string): void {
   a.click();
 }
 
-const BACKENDS: readonly Backend[] = ["webgl", "canvas", "svg"];
+const BACKENDS: readonly Backend[] = ["auto", "webgl", "canvas", "svg"];
 
 export interface ExampleProps {
   controls?: ControlSpec[];
@@ -195,7 +195,7 @@ export interface ExampleProps {
 export default function Example(props: ExampleProps) {
   const { controls = [], defaults = {}, width = 900, height = 560, children } = props;
 
-  const initialBackend = (defaults.backend as Backend) ?? "webgl";
+  const initialBackend = (defaults.backend as Backend) ?? "auto";
   const [backend, setBackend] = useState<Backend>(initialBackend);
 
   // Example-specific control values, seeded from each control's default then any

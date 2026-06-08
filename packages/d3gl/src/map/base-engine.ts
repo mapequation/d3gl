@@ -1,7 +1,7 @@
 import { select } from "d3-selection";
 import { zoom as d3zoom, zoomIdentity, type D3ZoomEvent } from "d3-zoom";
 import { Scene, HitIndex, type Backend, type GroupBuilder, type RenderLayer, type ViewTransform } from "../core/index.js";
-import { createBackend, type BackendType, type BackendHandle } from "./backend-factory.js";
+import { createBackend, createCanvasBackend, type BackendType, type BackendHandle } from "./backend-factory.js";
 
 export type Accessor<D, T> = T | ((d: D, i: number) => T);
 export interface HoverHit { layer: string; id: string | number; datum: unknown; }
@@ -43,6 +43,12 @@ export abstract class BaseEngine {
   private hoverCb: ((hit: HoverHit | null, ev: PointerEvent) => void) | null = null;
   private swapToken = 0;
   private destroyed = false;
+  /** "auto" mode only: the WebGL upgrade promise (in-flight, then settled). Null until
+   *  enterAutoMode() starts the upgrade; not reset afterwards. */
+  private upgradeDone: Promise<void> | null = null;
+  /** True only while the background "auto" → WebGL upgrade is in flight. Gates the
+   *  same-backend no-op in setBackend so a backend pick during the upgrade still swaps. */
+  private upgrading = false;
   /** True while the user is interacting (a rotation drag, or a zoom/pan gesture).
    *  Layers flagged hideOnInteraction are excluded from the render while this is true. */
   protected interacting = false;
@@ -51,10 +57,16 @@ export abstract class BaseEngine {
 
   constructor(protected host: HTMLElement, protected width: number, protected height: number, backend: BackendType) {
     this.currentBackend = backend;
-    this.ready = this.swapBackend(backend);
+    if (backend === "auto") {
+      // Instant canvas first paint; whenReady() resolves now. WebGL is built in the background.
+      this.ready = Promise.resolve();
+      this.enterAutoMode();
+    } else {
+      this.ready = this.swapBackend(backend);
+    }
   }
   whenReady(): Promise<void> { return this.ready; }
-  /** The currently-active backend type (set by the constructor / swapBackend). */
+  /** The currently-active backend type (set by the constructor / installBackend). */
   protected backendType(): BackendType { return this.currentBackend; }
   /** The live backend instance, or null before the first swap resolves. */
   protected backend(): Backend | null { return this.handle?.backend ?? null; }
@@ -160,7 +172,20 @@ export abstract class BaseEngine {
     this.pushLayers();
     return this;
   }
-  setBackend(type: BackendType): this { this.ready = this.swapBackend(type); return this; }
+  /** True when `type` names the backend already live — so switching to it would be pure
+   *  churn (recreate the same backend, re-push, re-render). Notably, once "auto" has
+   *  upgraded to WebGL the live backend IS "webgl", so an explicit setBackend("webgl") is a
+   *  no-op. Excludes "auto" (always an action) and the in-flight upgrade window (where the
+   *  live "canvas" is about to become "webgl", so a pick must still take effect). */
+  protected isCurrentBackend(type: BackendType): boolean {
+    return type !== "auto" && type === this.currentBackend && !this.upgrading;
+  }
+  setBackend(type: BackendType): this {
+    if (this.isCurrentBackend(type)) return this; // already live on this backend — no churn
+    if (type === "auto") { this.ready = Promise.resolve(); this.enterAutoMode(); }
+    else this.ready = this.swapBackend(type);
+    return this;
+  }
   /** Detach the current pan/zoom or rotation interaction (no-op if none). */
   disableInteraction(): this {
     this.interactionCleanup?.();
@@ -336,19 +361,80 @@ export abstract class BaseEngine {
     this.handle?.backend.setTransform(this.transform);
     this.render();
   }
-  private async swapBackend(type: BackendType): Promise<void> {
-    this.currentBackend = type;
-    const token = ++this.swapToken;
+  /**
+   * Post-swap hook: called after a backend SWAP completes (an existing handle was
+   * replaced) — NOT on the first install. Subclasses override to react to a change of
+   * the live backend (e.g. re-evaluate GPU-globe eligibility and re-dispatch interaction).
+   * Default: no-op.
+   */
+  protected onBackendSwapped(): void {}
+
+  /**
+   * Install `next` as the live backend (shared by swapBackend and the "auto" upgrade).
+   * Honors the swap-supersede / destroyed guards. Destroys + detaches the previous
+   * handle, pushes the current specs + transform, renders, and — only if it REPLACED an
+   * existing handle — fires onBackendSwapped(). The first install (old === null) does NOT
+   * notify, so it is safe to call synchronously during construction (before a subclass has
+   * finished initializing its own fields, e.g. GeoMap's projection).
+   */
+  private installBackend(next: BackendHandle, token: number, type: BackendType): void {
+    // A newer swap superseded this one, or the engine was destroyed mid-flight: tear down
+    // the freshly created backend so it never orphans an element.
+    if (token !== this.swapToken || this.destroyed) {
+      next.backend.destroy();
+      if (next.element !== this.host) next.element.remove();
+      return;
+    }
     const old = this.handle;
-    const next = await createBackend(type, this.host, this.width, this.height);
-    // A newer swap superseded this one, or the engine was destroyed mid-flight:
-    // tear down the freshly created backend so it never orphans an element.
-    if (token !== this.swapToken || this.destroyed) { next.backend.destroy(); if (next.element !== this.host) next.element.remove(); return; }
     old?.backend.destroy();
     if (old && old.element !== this.host) old.element.remove();
     this.handle = next;
+    this.currentBackend = type;
     next.backend.setLayers(this.renderSpecs().map((s) => this.renderLayer(s)));
     next.backend.setTransform(this.transform);
     next.backend.render();
+    if (old) this.onBackendSwapped();
+  }
+
+  private async swapBackend(type: BackendType): Promise<void> {
+    const token = ++this.swapToken;
+    const next = await createBackend(type, this.host, this.width, this.height);
+    this.installBackend(next, token, type);
+  }
+
+  /** Thin override point so tests can stub the WebGL creation without fighting ESM live bindings. */
+  protected createWebGLBackend(): Promise<BackendHandle> {
+    return createBackend("webgl", this.host, this.width, this.height);
+  }
+
+  /** Enter "auto" mode: install a Canvas backend synchronously (instant first paint, no
+   *  await, no onBackendSwapped — it is the first install / a fresh canvas), then start the
+   *  background WebGL upgrade. Bumping swapToken invalidates any in-flight prior swap. */
+  private enterAutoMode(): void {
+    const handle = createCanvasBackend(this.host, this.width, this.height);
+    this.installBackend(handle, ++this.swapToken, "canvas");
+    this.upgradeDone = this.upgradeToWebGL();
+  }
+
+  /** Background upgrade: create the WebGL device, then swap it in via installBackend (which
+   *  destroys the canvas handle and fires onBackendSwapped, since it replaces a live handle).
+   *  On failure, keep the canvas and warn — the map keeps working. While in flight, `upgrading`
+   *  is true so a same-type setBackend isn't treated as a no-op (a "canvas" pick during the
+   *  window must still cancel the upgrade via the normal swap's token bump). */
+  private async upgradeToWebGL(): Promise<void> {
+    this.upgrading = true;
+    try {
+      const token = ++this.swapToken;
+      let next: BackendHandle;
+      try {
+        next = await this.createWebGLBackend();
+      } catch (err) {
+        if (!this.destroyed) console.warn("d3gl: WebGL upgrade failed, staying on canvas", err);
+        return;
+      }
+      this.installBackend(next, token, "webgl");
+    } finally {
+      this.upgrading = false;
+    }
   }
 }
