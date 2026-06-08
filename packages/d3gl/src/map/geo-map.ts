@@ -1,5 +1,6 @@
-import { type GeoProjection, geoEquirectangular } from "d3-geo";
+import { type GeoProjection, geoEquirectangular, geoPath } from "d3-geo";
 import { geoLayer, projectVisiblePoint } from "../geo/index.js";
+import { PathRecorder } from "../core/index.js";
 import { isOrthographic, rotationMatrix } from "../geo/orthographic.js";
 import versor, { type Angles, type Vec3, type Quaternion } from "../geo/versor.js";
 import { BaseEngine, type HoverHit, type LayerSpec } from "./base-engine.js";
@@ -30,9 +31,11 @@ export interface LayerOptions<F = any> {
    *  Entry object per feature; use for huge, non-interactive layers (e.g. streamed points). */
   pickable?: boolean;
   /** Render via the backend's pass-through path: no retained Scene geometry, no hit
-   *  index (not pickable). Phase 1 supports Point geometry only — features are projected
-   *  + drawn directly each repaint, so `features` may be a callback re-invoked per repaint.
-   *  For huge, fast-changing point sets. */
+   *  index (not pickable). Supports all GeoJSON geometry (Point/MultiPoint → analytic
+   *  circles; Polygon/Line/etc. → projected paths) — features are projected/recorded and
+   *  drawn directly each repaint, so `features` may be a callback re-invoked per repaint.
+   *  For huge, fast-changing datasets. NOTE: WebGL renders only points for now; polygon/line
+   *  pass-through paths render on the Canvas backend (WebGL path support is a follow-up). */
   passThrough?: boolean;
 }
 
@@ -87,19 +90,46 @@ export class GeoMap extends BaseEngine {
           ? () => [...(features as () => readonly F[])()]
           : [...(Array.isArray(features) ? (features as readonly F[]) : [features as F])];
       const radius = opts.pointRadius ?? 3;
-      const colorOf = typeof opts.fill === "function"
-        ? (f: F, i: number) => (opts.fill as (f: F, i: number) => string)(f, i)
-        : () => (opts.fill as string | undefined) ?? "#000";
+      const lineWidth = opts.lineWidth ?? 0;
+      // Color accessors: string | (f,i)=>string, resolved per datum. Points/path fills
+      // default to "#000"; a path stroke has no default (null = no stroke).
+      const accessor = (
+        v: string | ((f: F, i: number) => string) | undefined,
+        fallback: string | null,
+      ): ((f: F, i: number) => string | null) =>
+        typeof v === "function"
+          ? (f, i) => (v as (f: F, i: number) => string)(f, i)
+          : () => (v as string | undefined) ?? fallback;
+      const pointFillOf = accessor(opts.fill, "#000"); // points default to opaque black
+      const pathFillOf = accessor(opts.fill, null);     // path fill: null = no fill
+      const strokeOf = accessor(opts.stroke, null);     // path stroke: null = no stroke
       this.registerPassThrough({
         name,
         source,
         buildItem: (f, i) => {
-          const geom = (f as { geometry?: GeoJSON.Geometry }).geometry;
-          if (!geom || geom.type !== "Point") {
-            throw new Error("passThrough supports only Point geometry in Phase 1");
+          const feature = f as { type?: string; geometry?: GeoJSON.Geometry };
+          // Accept a Feature (read .geometry) or a bare Geometry (read the feature itself).
+          const geom = (feature.geometry ?? (feature as GeoJSON.Geometry)) as GeoJSON.Geometry;
+          const type = geom?.type;
+          if (type === "Point") {
+            const xy = projectVisiblePoint(this.projection, (geom as GeoJSON.Point).coordinates as [number, number]);
+            return xy ? { kind: "points", centers: [xy], radius, color: pointFillOf(f as F, i) ?? "#000" } : null;
           }
-          const xy = projectVisiblePoint(this.projection, geom.coordinates as [number, number]);
-          return xy ? { kind: "points", centers: [xy], radius, color: colorOf(f as F, i) } : null;
+          if (type === "MultiPoint") {
+            const centers: [number, number][] = [];
+            for (const c of (geom as GeoJSON.MultiPoint).coordinates) {
+              const xy = projectVisiblePoint(this.projection, c as [number, number]);
+              if (xy) centers.push(xy);
+            }
+            return centers.length > 0 ? { kind: "points", centers, radius, color: pointFillOf(f as F, i) ?? "#000" } : null;
+          }
+          // Polygon / MultiPolygon / LineString / MultiLineString / GeometryCollection / Feature:
+          // record the projected subpaths (same geoPath path as the retained geo layer).
+          const rec = new PathRecorder(0.25);
+          geoPath(this.projection, rec)(f as Parameters<ReturnType<typeof geoPath>>[0]);
+          const subpaths = rec.subpaths.map((s) => ({ closed: s.closed, points: s.points.slice() }));
+          if (subpaths.length === 0) return null;
+          return { kind: "path", subpaths, fill: pathFillOf(f as F, i), stroke: strokeOf(f as F, i), lineWidth };
         },
         sizeMode: opts.sizeMode,
         clipTo: opts.clipTo,

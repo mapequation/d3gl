@@ -16,7 +16,8 @@ import type { WebGLBackend } from "../webgl/webgl-backend.js";
 //   - the public-API surface (handles return synchronously; pass-through layers are NOT pickable),
 //   - the canvas backend actually draws pass-through points on top of the retained base,
 //   - handle.append() draws incrementally on top (first point stays, second appears),
-//   - non-Point geometry under passThrough still throws on projection,
+//   - non-Point geometry under passThrough no longer throws (Phase 3 lifted the Point-only guard),
+//     and the canvas backend fills polygons + strokes lines (a separate geometry suite),
 //   - snapshot-pan: a frozen raster blits under the delta transform during a gesture.
 // (The canvas backend now declares supportsPassThrough, so the old "not supported" assertion is gone.)
 //
@@ -158,12 +159,98 @@ describe("passThrough rendering (canvas backend)", () => {
     chart.destroy();
   });
 
-  it("non-Point geometry under passThrough throws on projection", async () => {
+  it("non-Point geometry under passThrough no longer throws (Phase 3 lifts the guard)", async () => {
     const map = geoMap(host(), { width: 200, height: 200, projection: proj(), backend: "canvas" });
-    // Registration defers (no backend live yet); the backend install replays it, and the repaint
-    // that projects the Polygon throws — surfacing via whenReady().
-    map.layer("bad", [polygon()], { fill: "red", passThrough: true });
-    await expect(map.whenReady()).rejects.toThrow(/passThrough supports only Point geometry in Phase 1/);
+    // Registration defers (no backend live yet); the backend install replays it and the repaint
+    // projects + records the Polygon. The Phase-1 Point-only throw is gone.
+    map.layer("poly", [polygon()], { fill: "red", passThrough: true });
+    await expect(map.whenReady()).resolves.toBeUndefined();
+    map.destroy();
+  });
+});
+
+describe("passThrough geometry rendering (canvas backend)", () => {
+  // geo-map is where GeoJSON geometry lives; the equirectangular proj() maps [lon,lat] to
+  // pixels as x = 100 + lon, y = 100 - lat (scale 50 → 1°≈0.87px; here we keep it simple by
+  // computing through the projection). We assert real getImageData pixels on the canvas backend.
+  const project = (lon: number, lat: number): [number, number] => {
+    const p = proj()([lon, lat])!;
+    return [p[0], p[1]];
+  };
+  // A big CLOCKWISE-wound polygon (clockwise in [lon,lat] fills its interior; CCW fills the
+  // whole map — see AGENTS.md winding note). Spans lon 0..20, lat 0..20.
+  const bigPolygon = (): GeoJSON.Feature => ({
+    type: "Feature",
+    properties: {},
+    geometry: { type: "Polygon", coordinates: [[[0, 20], [20, 20], [20, 0], [0, 0], [0, 20]]] },
+  });
+  const polygon2 = (): GeoJSON.Feature => ({
+    type: "Feature",
+    properties: {},
+    geometry: { type: "Polygon", coordinates: [[[-30, -5], [-10, -5], [-10, -25], [-30, -25], [-30, -5]]] },
+  });
+  // A line along the equator: the geodesic between two equatorial points IS the equator,
+  // so it projects to a straight horizontal line (no great-circle bow to chase in pixels).
+  const line = (): GeoJSON.Feature => ({
+    type: "Feature",
+    properties: {},
+    geometry: { type: "LineString", coordinates: [[-40, 0], [40, 0]] },
+  });
+
+  it("renders a filled Polygon: inside reads the fill color, outside is background", async () => {
+    const h = host();
+    const map = geoMap(h, { width: 200, height: 200, projection: proj(), backend: "canvas" });
+    map.layer("poly", [bigPolygon()], { fill: "rgb(0,200,0)", passThrough: true });
+    await map.whenReady();
+    const ctx = canvasOf(h).getContext("2d")!;
+    // Centroid at lon 10, lat 10.
+    const [cx, cy] = project(10, 10);
+    const inside = at(ctx, Math.round(cx), Math.round(cy));
+    expect(inside[1]!).toBeGreaterThan(150); // green fill inside
+    expect(inside[3]!).toBeGreaterThan(180); // opaque
+    // Well outside the polygon (lon -50, lat -40 → far corner).
+    const [ox, oy] = project(-50, -40);
+    expect(at(ctx, Math.round(ox), Math.round(oy))[3]!).toBe(0);
+    map.destroy();
+  });
+
+  it("renders a LineString stroke: a pixel on the line reads the stroke color", async () => {
+    const h = host();
+    const map = geoMap(h, { width: 200, height: 200, projection: proj(), backend: "canvas" });
+    map.layer("line", [line()], { stroke: "rgb(0,0,255)", lineWidth: 4, passThrough: true });
+    await map.whenReady();
+    const ctx = canvasOf(h).getContext("2d")!;
+    // Midpoint of the line at lon 0, lat 0 (the equator → no projected bow).
+    const [mx, my] = project(0, 0);
+    const px = at(ctx, Math.round(mx), Math.round(my));
+    expect(px[2]!).toBeGreaterThan(150); // blue stroke
+    expect(px[3]!).toBeGreaterThan(120); // present
+    map.destroy();
+  });
+
+  it("handle.append() adds another polygon incrementally (first remains)", async () => {
+    const h = host();
+    const map = geoMap(h, { width: 200, height: 200, projection: proj(), backend: "canvas" });
+    const handle = map.layer("poly", [bigPolygon()], { fill: "rgb(0,200,0)", passThrough: true });
+    await map.whenReady();
+    const ctx = canvasOf(h).getContext("2d")!;
+    const [c1x, c1y] = project(10, 10);
+    expect(at(ctx, Math.round(c1x), Math.round(c1y))[1]!).toBeGreaterThan(150); // first polygon
+
+    handle.append([polygon2()]); // incremental draw-on-top
+    const [c2x, c2y] = project(-20, -15); // centroid of polygon2
+    expect(at(ctx, Math.round(c2x), Math.round(c2y))[1]!).toBeGreaterThan(150); // second appeared
+    expect(at(ctx, Math.round(c1x), Math.round(c1y))[1]!).toBeGreaterThan(150); // first still there
+    map.destroy();
+  });
+
+  it("a geometry pass-through layer is NOT pickable", async () => {
+    const h = host();
+    const map = geoMap(h, { width: 200, height: 200, projection: proj(), backend: "canvas" });
+    map.layer("poly", [bigPolygon()], { fill: "rgb(0,200,0)", passThrough: true });
+    await map.whenReady();
+    const [cx, cy] = project(10, 10);
+    expect(map.pick(Math.round(cx), Math.round(cy))).toBe(null); // drawn, but no hit index
     map.destroy();
   });
 });
