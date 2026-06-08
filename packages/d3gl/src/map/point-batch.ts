@@ -44,7 +44,9 @@ export function projectPoints<D>(data: readonly D[], opts: ProjectPointsOpts<D>)
     positions[count * 2] = p[0];
     positions[count * 2 + 1] = p[1];
     radii[count] = radiusFn(data[i]!, i);
-    const c = rgb(colorFn(data[i]!, i));
+    const cs = colorFn(data[i]!, i);
+    const c = rgb(cs);
+    if (Number.isNaN(c.r)) throw new Error(`invalid color: ${cs}`);
     const off = count * 4;
     colors[off] = toByte(c.r);
     colors[off + 1] = toByte(c.g);

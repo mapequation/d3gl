@@ -31,4 +31,10 @@ describe("projectPoints", () => {
     const b = projectPoints(data, { project, radius: 4, color: () => "#000" });
     expect(Array.from(b.radii)).toEqual([4, 4]);
   });
+
+  it("throws on an invalid color string", () => {
+    expect(() =>
+      projectPoints(data, { project, radius: 4, color: () => "not-a-color" }),
+    ).toThrow(/invalid color/);
+  });
 });
