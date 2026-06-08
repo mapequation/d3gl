@@ -14,7 +14,7 @@ describe("Plot incremental append", () => {
     const host = mount();
     const chart = plot(host, { width: 200, height: 200, backend: "canvas" });
     await chart.whenReady();
-    const pts = chart.points("p", [{ x: 40, y: 40 }], { radius: 5, fill: "rgb(255,0,0)", id: (d) => `p${d.x}` });
+    const pts = chart.points("p", [{ x: 40, y: 40 }], { x: (d) => d.x, y: (d) => d.y, radius: 5, fill: "rgb(255,0,0)", id: (d) => `p${d.x}` });
     chart.render();
     expect(chart.pick(40, 40)?.id).toBe("p40");
 

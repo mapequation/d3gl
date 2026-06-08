@@ -9,12 +9,9 @@ import { geoMap } from "../map/geo-map.js";
 // texture's 256-wide row boundary). The geometry uploaded BEFORE growth must survive
 // the buffer reallocation + Model.setAttributes/setIndexBuffer rebind.
 //
-// NOTE: cannot run in the headless node harness (the vitest-browser/Playwright setup
-// hangs at Vite "Re-optimizing dependencies"). For interactive/CI browser runs only.
-
 const proj = () => geoEquirectangular().scale(50).translate([100, 100]);
-const pt = (lon: number, lat: number): GeoJSON.Feature => ({
-  type: "Feature", properties: {}, geometry: { type: "Point", coordinates: [lon, lat] },
+const pt = (lon: number, lat: number, id?: string): GeoJSON.Feature => ({
+  type: "Feature", properties: { id }, geometry: { type: "Point", coordinates: [lon, lat] },
 });
 
 function mount() {
@@ -30,27 +27,32 @@ describe("WebGL O(new) incremental append across capacity-doubling boundaries", 
     const map = geoMap(host, { width: 200, height: 200, projection: proj(), backend: "webgl" });
     await map.whenReady();
 
-    // Seed a single point at lon 0 (proj([0,0]) = [100,100]).
-    const occ = map.layer("occ", [pt(0, 0)], {
+    // Seed a single point at lon 0 (proj([0,0]) = [100,100]). Ids come from a
+    // stable per-feature property so each drawable is unique regardless of where
+    // it lands — longitudes repeat across thousands of points, but ids must not.
+    const occ = map.layer("occ", [pt(0, 0, "o0")], {
       pointRadius: 3,
       fill: "rgb(255,0,0)",
-      id: (f) => `o${(f.geometry as any).coordinates[0]}`,
+      id: (f) => (f.properties as { id: string }).id,
     });
     map.render();
     expect(map.pick(100, 100)?.id).toBe("o0");
 
-    // Append in several batches up to a few thousand points, spread across longitudes
-    // 1..N so each lands at a distinct x. This forces multiple GrowBuffer reallocations
-    // (1 -> ... -> a few thousand vertices) and palette-texture recreations (crossing
-    // 256 drawables). Each batch is a distinct id so no duplicate throws.
+    // Append in several batches up to a few thousand points. Crossing 256 unique
+    // drawables forces palette-texture recreation; the cumulative counts (10 → 60
+    // → 260 → 1260 → 3260) force multiple GrowBuffer capacity-doubling reallocs.
+    // Longitudes sweep 6..175 — far enough from lon 0 that no appended point falls
+    // within the seed's pick tolerance at x=100 (proj([6,0]) ≈ x105 vs the 3px
+    // radius + 1px tolerance), so the seed stays the sole hit there. Ids are a
+    // running counter so every drawable is unique (longitudes repeat; ids must not).
     let next = 1;
     const batches = [10, 50, 200, 1000, 2000];
     expect(() => {
       for (const n of batches) {
         const feats: GeoJSON.Feature[] = [];
         for (let i = 0; i < n; i++) {
-          const lon = ((next % 359) - 179); // keep within [-180,180]
-          feats.push(pt(lon, 0));
+          const lon = 6 + (next % 170); // [6,175]: clear of x=100, within [-180,180]
+          feats.push(pt(lon, 0, `p${next}`));
           next++;
         }
         occ.append(feats);
@@ -62,9 +64,9 @@ describe("WebGL O(new) incremental append across capacity-doubling boundaries", 
     // pickable — proves the seed geometry survived the buffer reallocs + Model rebind.
     expect(map.pick(100, 100)?.id).toBe("o0");
 
-    // A late point (appended after growth) must also be present. lon 0 maps to x 100;
-    // pick a different known longitude from the last batch. proj([10,0]) = [110,100].
-    // lon 10 was appended (10 falls within the swept range), so it is pickable.
+    // A late point (appended after growth) must also be present. x=110 maps back to
+    // lon ≈ 11.5 (proj([12,0]) ≈ [110.5,100]); the 4..178 sweep lands points there,
+    // so something is pickable at x=110 well away from the seed at x=100.
     expect(map.pick(110, 100)).not.toBeNull();
 
     map.destroy();

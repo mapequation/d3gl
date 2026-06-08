@@ -70,7 +70,7 @@
   ],
   "scripts": {
     "build": "tsup",
-    "test:browser": "vitest run --config vitest.config.ts",
+    "test:browser": "node scripts/run-browser-tests.mjs",
     "prepublishOnly": "tsup"
   },
   "dependencies": {

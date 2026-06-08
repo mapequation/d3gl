@@ -24,10 +24,11 @@ describe("GeoMap incremental append", () => {
     map.render();
     expect(map.pick(100, 100)?.id).toBe("o0"); // proj([0,0]) = [100,100]
 
-    occ.append(pt(20, 0)); // proj([20,0]) = [110,100]
+    occ.append(pt(20, 0));
     map.render();
-    expect(map.pick(110, 100)?.id).toBe("o20"); // appended point hits
-    expect(map.pick(100, 100)?.id).toBe("o0");  // original still hits
+    const [ax, ay] = proj()([20, 0])!; // equirectangular(scale 50): lon 20 → ≈ [117.45, 100]
+    expect(map.pick(Math.round(ax), Math.round(ay))?.id).toBe("o20"); // appended point hits
+    expect(map.pick(100, 100)?.id).toBe("o0");  // original (lon 0 → [100,100]) still hits
 
     map.destroy();
   });
@@ -43,7 +44,8 @@ describe("GeoMap incremental append", () => {
     map.render();
     expect(() => occ.append(pt(20, 0))).not.toThrow();
     map.render();
-    expect(map.pick(110, 100)?.id).toBe("o20");
+    const [ax, ay] = proj()([20, 0])!; // lon 20 → ≈ [117.45, 100]
+    expect(map.pick(Math.round(ax), Math.round(ay))?.id).toBe("o20");
     expect(map.pick(100, 100)?.id).toBe("o0");
     map.destroy();
   });
