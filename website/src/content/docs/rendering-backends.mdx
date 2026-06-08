@@ -18,37 +18,12 @@ const map = geoMap(host, { width, height, projection, backend: "webgl" }); // th
 
 ## The backends
 
-<table>
-  <thead>
-    <tr><th>Backend</th><th>Startup</th><th>Best for</th><th>Export</th></tr>
-  </thead>
-  <tbody>
-    <tr>
-      <td><code>"webgl"</code> (default)</td>
-      <td>One-time GPU device creation (can be 100s of ms cold)</td>
-      <td>Large/dense scenes, smooth pan/zoom, the GPU globe</td>
-      <td><code>toPNG()</code></td>
-    </tr>
-    <tr>
-      <td><code>"canvas"</code></td>
-      <td>Instant (synchronous)</td>
-      <td>Small/medium scenes, fastest first paint, no GPU dependency</td>
-      <td><code>toPNG()</code></td>
-    </tr>
-    <tr>
-      <td><code>"svg"</code></td>
-      <td>Instant (synchronous)</td>
-      <td>Vector export, print, hand-editable output</td>
-      <td><code>toSVG()</code></td>
-    </tr>
-    <tr>
-      <td><code>"auto"</code></td>
-      <td>Instant first paint, then upgrades</td>
-      <td>The best of canvas + webgl — see below</td>
-      <td><code>toPNG()</code></td>
-    </tr>
-  </tbody>
-</table>
+| Backend | Startup | Best for | Export |
+| --- | --- | --- | --- |
+| `"webgl"` *(default)* | One-time GPU device creation (can be 100s of ms cold) | Large/dense scenes, smooth pan/zoom, the GPU globe | `toPNG()` |
+| `"canvas"` | Instant (synchronous) | Small/medium scenes, fastest first paint, no GPU dependency | `toPNG()` |
+| `"svg"` | Instant (synchronous) | Vector export, print, hand-editable output | `toSVG()` |
+| `"auto"` | Instant first paint, then upgrades | The best of canvas + webgl — see below | `toPNG()` |
 
 All four share the same engine API (`layer`, `recolor`, `enableZoom`, `setTransform`, `pick`,
 `setProjection`, …); switching backend never changes how you drive the map.
