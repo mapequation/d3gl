@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from "vitest";
-import { geoEquirectangular } from "d3-geo";
+import { geoEquirectangular, geoOrthographic } from "d3-geo";
 import { geoMap, GeoMap } from "./geo-map.js";
 
 // BaseEngine.prototype — owns the `createWebGLBackend` seam the auto-upgrade resolves through.
@@ -99,6 +99,28 @@ describe("backend: \"auto\"", () => {
     await up;                // let the in-flight upgrade settle
     expect(host.querySelector("canvas")).toBeNull(); // no orphaned element left behind
 
+    host.remove();
+  });
+
+  it("orthographic + enableZoom: CPU rotation on canvas, GPU globe after the WebGL upgrade", async () => {
+    const host = document.createElement("div");
+    host.style.width = "200px"; host.style.height = "200px";
+    document.body.appendChild(host);
+
+    const map = geoMap(host, { width: 200, height: 200, projection: geoOrthographic().scale(90).translate([100, 100]), backend: "auto" });
+    map.layer("land", [sqPoly(0, 0, 30)], { fill: "rgb(0,120,0)", id: () => "L" });
+    map.enableZoom([1, 8]); // orthographic ⇒ rotation; dispatched against canvas first
+    await map.whenReady();
+    expect(liveBackend(map)).toBe("canvas");
+    // gpuGlobe must be OFF while canvas is live (CPU rotation path).
+    expect((map as unknown as { gpuGlobe: boolean }).gpuGlobe).toBe(false);
+
+    await upgradeOf(map);
+    expect(liveBackend(map)).toBe("webgl");
+    // After the swap to WebGL, the GPU globe is active for the orthographic projection.
+    expect((map as unknown as { gpuGlobe: boolean }).gpuGlobe).toBe(true);
+
+    map.destroy();
     host.remove();
   });
 });
