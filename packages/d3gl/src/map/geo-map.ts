@@ -7,7 +7,14 @@ import type { BackendType } from "./backend-factory.js";
 import type { ViewTransform } from "../core/index.js";
 import { LayerHandle } from "./layer-handle.js";
 
-export interface GeoMapOptions { width: number; height: number; projection: GeoProjection; backend?: BackendType; }
+export interface GeoMapOptions {
+  width: number;
+  height: number;
+  projection: GeoProjection;
+  /** Which renderer to draw with — see {@link BackendType}. Defaults to `"webgl"`.
+   *  Use `"auto"` for an instant Canvas first paint that upgrades to WebGL in the background. */
+  backend?: BackendType;
+}
 export interface LayerOptions<F = any> {
   fill?: string | ((f: F, i: number) => string);
   stroke?: string | ((f: F, i: number) => string);
