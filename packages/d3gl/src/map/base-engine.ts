@@ -126,7 +126,7 @@ export abstract class BaseEngine {
       this.ptSpecs.delete(spec.name);
       this.ptRepaintTokens.delete(spec.name); // prune stale token (no active repaint, but keep the map clean)
       throw new Error(
-        `passThrough is not supported by the "${this.currentBackend}" backend (use canvas or webgl)`,
+        `passThrough is not supported by the "${this.currentBackend}" backend (use the canvas backend; WebGL pass-through is not yet supported)`,
       );
     }
     this.handle.backend.setPassThroughLayer?.({ name: spec.name, sizeMode: spec.sizeMode, clipTo: spec.clipTo });
@@ -534,7 +534,7 @@ export abstract class BaseEngine {
     if (this.ptSpecs.size > 0) {
       if (!next.backend.supportsPassThrough) {
         throw new Error(
-          `passThrough is not supported by the "${type}" backend (use canvas or webgl)`,
+          `passThrough is not supported by the "${type}" backend (use the canvas backend; WebGL pass-through is not yet supported)`,
         );
       }
       for (const spec of this.ptSpecs.values()) {
@@ -579,6 +579,19 @@ export abstract class BaseEngine {
         next = await this.createWebGLBackend();
       } catch (err) {
         if (!this.destroyed) console.warn("d3gl: WebGL upgrade failed, staying on canvas", err);
+        return;
+      }
+      // Phase 1: WebGL has no pass-through support. If pass-through layers exist, aborting the
+      // transparent auto-upgrade is the only safe move — installBackend would destroy the canvas
+      // handle (losing the pass-through raster) and then THROW at its unsupported-backend check.
+      // Tear down the just-created WebGL handle (mirroring the createWebGLBackend failure path),
+      // keep the live canvas + currentBackend untouched, and warn. (An EXPLICIT setBackend("webgl")
+      // still throws via installBackend — only this silent upgrade stays on canvas.)
+      if (this.ptSpecs.size > 0 && !next.backend.supportsPassThrough) {
+        next.backend.destroy();
+        if (next.element !== this.host) next.element.remove();
+        if (!this.destroyed)
+          console.warn("d3gl: pass-through layers keep the canvas backend (WebGL pass-through is not yet supported)");
         return;
       }
       this.installBackend(next, token, "webgl");

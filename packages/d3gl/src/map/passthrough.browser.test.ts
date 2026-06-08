@@ -3,9 +3,11 @@ import { geoEquirectangular } from "d3-geo";
 import type { PassThroughLayer, PointBatch } from "../core/index.js";
 import { CanvasBackend } from "../canvas/canvas-backend.js";
 import { BaseEngine } from "./base-engine.js";
-import { plot } from "./plot.js";
+import { plot, Plot } from "./plot.js";
+import type { PlotOptions } from "./plot.js";
 import { geoMap } from "./geo-map.js";
 import { LayerHandle } from "./layer-handle.js";
+import { createCanvasBackend, type BackendHandle } from "./backend-factory.js";
 
 // Task 5 pinned the public-API surface + the (then-true) "backend doesn't support pass-through"
 // error. Task 6 adds REAL canvas pass-through rendering, so this file now asserts:
@@ -290,5 +292,81 @@ describe("passThrough snapshot-pan (canvas backend, direct)", () => {
     backend.render();
     expect(at(ctx, 100, 100)[0]!).toBeGreaterThan(180); // snapshot scaled to the new location
     backend.destroy();
+  });
+});
+
+describe('passThrough "auto" backend upgrade guard (Phase 1: WebGL has no PT)', () => {
+  // The "auto" backend starts on Canvas then upgrades to WebGL in the background. WebGL has no
+  // pass-through support in Phase 1. Without the guard, the upgrade would destroy the canvas
+  // (losing the PT raster) and THROW at installBackend's unsupported-backend check (an unhandled
+  // rejection, plus the points vanish). The fix aborts the upgrade and stays on canvas.
+  //
+  // We drive the upgrade deterministically by stubbing createWebGLBackend (the protected test
+  // seam) to return a backend whose supportsPassThrough is falsy — exactly like the real WebGL
+  // backend — without spinning up a real GPU device (flaky in headless browsers). The subclass
+  // exposes the private upgradeDone promise so the test can await the upgrade window precisely.
+  class StubPlot extends Plot {
+    stubbedWebGL: BackendHandle | null = null;
+    constructor(host: HTMLElement, opts: PlotOptions) { super(host, opts); }
+    protected createWebGLBackend(): Promise<BackendHandle> {
+      // A canvas-backed handle is a fully-working backend, but we force supportsPassThrough falsy
+      // to mimic WebGL (no PT support yet). Real WebGLBackend leaves the flag undefined too.
+      const h = createCanvasBackend(this.host, this.width, this.height);
+      (h.backend as { supportsPassThrough?: boolean }).supportsPassThrough = false;
+      this.stubbedWebGL = h;
+      return Promise.resolve(h);
+    }
+    awaitUpgrade(): Promise<void> {
+      return (this as unknown as { upgradeDone: Promise<void> | null }).upgradeDone ?? Promise.resolve();
+    }
+    liveBackendType(): string {
+      return (this as unknown as { backendType(): string }).backendType();
+    }
+  }
+
+  it("auto-upgrade with a pass-through layer stays on canvas (no throw, points survive)", async () => {
+    const h = host();
+    const chart = new StubPlot(h, { width: 200, height: 200, backend: "auto" });
+    // Register the pass-through layer on the synchronous canvas first paint, BEFORE the
+    // background upgrade settles — this is the reachable scenario the bug is about. (auto's
+    // whenReady() resolves at the canvas paint; the WebGL upgrade is a separate in-flight promise.)
+    chart.points("pts", [{ x: 60, y: 60 }], { x: (d) => d.x, y: (d) => d.y, radius: 6, fill: "rgb(255,0,0)", passThrough: true });
+    await chart.whenReady(); // canvas first paint
+    const ctx = canvasOf(h).getContext("2d")!;
+    expect(at(ctx, 60, 60)[0]!).toBeGreaterThan(180); // visible before the upgrade fires
+
+    // Drive the background WebGL upgrade to completion. The guard must abort it gracefully.
+    await expect(chart.awaitUpgrade()).resolves.toBeUndefined(); // no throw / unhandled rejection
+
+    // (a) stayed on canvas, (b) the WebGL handle was torn down (not installed),
+    expect(chart.liveBackendType()).toBe("canvas");
+    expect(canvasOf(h)).toBe(ctx.canvas); // same live canvas — never swapped out
+    // (c) the pass-through point is still visible after the upgrade window.
+    expect(at(ctx, 60, 60)[0]!).toBeGreaterThan(180);
+    expect(at(ctx, 60, 60)[3]!).toBeGreaterThan(180);
+    chart.destroy();
+  });
+
+  it("auto-upgrade WITHOUT pass-through layers still upgrades to WebGL", async () => {
+    const h = host();
+    const chart = new StubPlot(h, { width: 200, height: 200, backend: "auto" });
+    await chart.whenReady();
+    // A retained (non-pass-through) layer — no PT, so the upgrade must proceed normally.
+    chart.points("base", [{ x: 50, y: 50 }], { x: (d) => d.x, y: (d) => d.y, radius: 6, fill: "rgb(0,0,255)" });
+
+    await expect(chart.awaitUpgrade()).resolves.toBeUndefined();
+    expect(chart.liveBackendType()).toBe("webgl"); // upgrade committed
+    chart.destroy();
+  });
+
+  it('explicit setBackend with an unsupported backend still throws (only the silent auto-upgrade stays on canvas)', async () => {
+    const h = host();
+    const chart = plot(h, { width: 200, height: 200, backend: "canvas" });
+    await chart.whenReady();
+    chart.points("pts", [{ x: 60, y: 60 }], { x: (d) => d.x, y: (d) => d.y, radius: 6, fill: "rgb(255,0,0)", passThrough: true });
+    // SVG declares supportsPassThrough = false; an explicit swap surfaces via whenReady().
+    chart.setBackend("svg");
+    await expect(chart.whenReady()).rejects.toThrow(/passThrough is not supported.*canvas backend; WebGL pass-through is not yet supported/);
+    chart.destroy();
   });
 });
