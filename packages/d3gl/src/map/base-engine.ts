@@ -2,6 +2,7 @@ import { select } from "d3-selection";
 import { zoom as d3zoom, zoomIdentity, type D3ZoomEvent } from "d3-zoom";
 import { Scene, HitIndex, type Backend, type GroupBuilder, type RenderLayer, type ViewTransform } from "../core/index.js";
 import { createBackend, createCanvasBackend, type BackendType, type BackendHandle } from "./backend-factory.js";
+import { projectPoints } from "./point-batch.js";
 
 export type Accessor<D, T> = T | ((d: D, i: number) => T);
 export interface HoverHit { layer: string; id: string | number; datum: unknown; }
@@ -28,10 +29,24 @@ export interface LayerSpec {
   build: (g: GroupBuilder) => void;   // rebuilds the Scene group (geo or draw)
 }
 
+export interface PassThroughSpec {
+  name: string;
+  /** User data source: an array, or a function re-invoked each full repaint. */
+  source: unknown[] | (() => unknown[]);
+  /** Project a datum → projected world coords, or null to cull. Built by the subclass. */
+  project: (d: unknown, i: number) => [number, number] | null;
+  radius: number | ((d: unknown, i: number) => number);
+  color: string | ((d: unknown, i: number) => string);
+  sizeMode?: "world" | "screen";
+  clipTo?: string;
+}
+
 export abstract class BaseEngine {
   protected scene = new Scene();
   protected specs: LayerSpec[] = [];
   protected hitIndexes = new Map<string, HitIndex>();
+  /** Pass-through layers: no Scene entry, no retained geometry. */
+  protected ptSpecs = new Map<string, PassThroughSpec>();
   /** Per-layer set of drawable ids (as strings), maintained incrementally so an
    *  append's duplicate-id check stays O(new) instead of rebuilding a Set of every
    *  existing id each batch (which made streaming O(total)/batch). */
@@ -87,6 +102,32 @@ export abstract class BaseEngine {
     // String()) so numeric-id layers don't allocate a string per drawable.
     this.layerIds.set(spec.name, new Set(spec.ids));
     this.pushLayers();
+  }
+
+  /** Register a pass-through layer (called by subclasses for passThrough:true). */
+  protected registerPassThrough(spec: PassThroughSpec): void {
+    if (!this.handle?.backend.supportsPassThrough) {
+      throw new Error(
+        `passThrough is not supported by the "${this.currentBackend}" backend (use canvas or webgl)`,
+      );
+    }
+    this.ptSpecs.set(spec.name, spec);
+    this.handle.backend.setPassThroughLayer?.({ name: spec.name, sizeMode: spec.sizeMode, clipTo: spec.clipTo });
+    this.repaintPassThrough(spec.name);
+  }
+
+  /** Resolve the current data array for a pass-through layer. */
+  private ptData(spec: PassThroughSpec): unknown[] {
+    return typeof spec.source === "function" ? spec.source() : spec.source;
+  }
+
+  /** Full repaint of a pass-through layer (re-pull + project + draw). Time-slicing added in Task 7. */
+  protected repaintPassThrough(name: string): void {
+    const spec = this.ptSpecs.get(name);
+    if (!spec || !this.handle) return;
+    const data = this.ptData(spec);
+    const batch = projectPoints(data, { project: spec.project, radius: spec.radius, color: spec.color });
+    this.handle.backend.drawPassThrough?.(name, batch, "replace-first");
   }
 
   /**
