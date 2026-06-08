@@ -394,16 +394,18 @@ describe("passThrough snapshot-pan (canvas backend, direct)", () => {
   });
 });
 
-describe('passThrough "auto" backend upgrade guard (Phase 1: WebGL has no PT)', () => {
-  // The "auto" backend starts on Canvas then upgrades to WebGL in the background. WebGL has no
-  // pass-through support in Phase 1. Without the guard, the upgrade would destroy the canvas
+describe('passThrough "auto" backend upgrade guard (unsupported upgrade target)', () => {
+  // The "auto" backend starts on Canvas then upgrades to WebGL in the background. The real WebGL
+  // backend now supports pass-through (Phase 2+), so a real upgrade carries the layers over — see
+  // the "real upgrade to WebGL" test above. This block instead covers the DEFENSIVE guard for an
+  // upgrade target that LACKS pass-through support: without it, the upgrade would destroy the canvas
   // (losing the PT raster) and THROW at installBackend's unsupported-backend check (an unhandled
   // rejection, plus the points vanish). The fix aborts the upgrade and stays on canvas.
   //
-  // We drive the upgrade deterministically by stubbing createWebGLBackend (the protected test
-  // seam) to return a backend whose supportsPassThrough is falsy — exactly like the real WebGL
-  // backend — without spinning up a real GPU device (flaky in headless browsers). The subclass
-  // exposes the private upgradeDone promise so the test can await the upgrade window precisely.
+  // We drive this deterministically by stubbing createWebGLBackend (the protected test seam) to
+  // return a backend whose supportsPassThrough is forced falsy — UNLIKE the real WebGL backend,
+  // purely to exercise the guard without depending on a hypothetical unsupported backend. The
+  // subclass exposes the private upgradeDone promise so the test can await the upgrade window.
   class StubPlot extends Plot {
     stubbedWebGL: BackendHandle | null = null;
     constructor(host: HTMLElement, opts: PlotOptions) { super(host, opts); }

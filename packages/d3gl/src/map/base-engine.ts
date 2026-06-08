@@ -579,12 +579,14 @@ export abstract class BaseEngine {
         if (!this.destroyed) console.warn("d3gl: WebGL upgrade failed, staying on canvas", err);
         return;
       }
-      // Phase 1: WebGL has no pass-through support. If pass-through layers exist, aborting the
-      // transparent auto-upgrade is the only safe move — installBackend would destroy the canvas
+      // Defensive guard for any upgrade target that lacks pass-through support. (The real WebGL
+      // backend DOES support pass-through, so this no longer fires for it — but a future/headless
+      // backend might not.) If pass-through layers exist and the target can't render them, aborting
+      // the transparent auto-upgrade is the only safe move — installBackend would destroy the canvas
       // handle (losing the pass-through raster) and then THROW at its unsupported-backend check.
-      // Tear down the just-created WebGL handle (mirroring the createWebGLBackend failure path),
-      // keep the live canvas + currentBackend untouched, and warn. (An EXPLICIT setBackend("webgl")
-      // still throws via installBackend — only this silent upgrade stays on canvas.)
+      // Tear down the just-created handle (mirroring the createWebGLBackend failure path), keep the
+      // live canvas + currentBackend untouched, and warn. (An EXPLICIT setBackend to an unsupported
+      // backend still throws via installBackend — only this silent upgrade stays on canvas.)
       if (this.ptSpecs.size > 0 && !next.backend.supportsPassThrough) {
         next.backend.destroy();
         if (next.element !== this.host) next.element.remove();
