@@ -2,6 +2,7 @@ import { select } from "d3-selection";
 import { zoom as d3zoom, zoomIdentity, type D3ZoomEvent } from "d3-zoom";
 import { Scene, HitIndex, type Backend, type GroupBuilder, type RenderLayer, type ViewTransform } from "../core/index.js";
 import { createBackend, createCanvasBackend, type BackendType, type BackendHandle } from "./backend-factory.js";
+import { projectPoints } from "./point-batch.js";
 
 export type Accessor<D, T> = T | ((d: D, i: number) => T);
 export interface HoverHit { layer: string; id: string | number; datum: unknown; }
@@ -28,10 +29,24 @@ export interface LayerSpec {
   build: (g: GroupBuilder) => void;   // rebuilds the Scene group (geo or draw)
 }
 
+export interface PassThroughSpec {
+  name: string;
+  /** User data source: an array, or a function re-invoked each full repaint. */
+  source: unknown[] | (() => unknown[]);
+  /** Project a datum → projected world coords, or null to cull. Built by the subclass. */
+  project: (d: unknown, i: number) => [number, number] | null;
+  radius: number | ((d: unknown, i: number) => number);
+  color: string | ((d: unknown, i: number) => string);
+  sizeMode?: "world" | "screen";
+  clipTo?: string;
+}
+
 export abstract class BaseEngine {
   protected scene = new Scene();
   protected specs: LayerSpec[] = [];
   protected hitIndexes = new Map<string, HitIndex>();
+  /** Pass-through layers: no Scene entry, no retained geometry. */
+  protected ptSpecs = new Map<string, PassThroughSpec>();
   /** Per-layer set of drawable ids (as strings), maintained incrementally so an
    *  append's duplicate-id check stays O(new) instead of rebuilding a Set of every
    *  existing id each batch (which made streaming O(total)/batch). */
@@ -54,6 +69,17 @@ export abstract class BaseEngine {
   protected interacting = false;
   /** Detaches the currently-attached interaction (zoom or rotation), if any. */
   private interactionCleanup: (() => void) | null = null;
+  /** Per-pass-through-layer repaint token. A time-sliced repaint captures the current
+   *  token for its layer; each rAF step bails if a newer repaint (or an interaction) has
+   *  bumped that layer's token. Per-LAYER (not a single shared token) so two PT layers
+   *  repainting in the same `for … of ptSpecs.keys()` loop don't cancel each other — a
+   *  shared token would let the second layer's `++token` abort the first layer's in-flight
+   *  loop, so only the last layer would paint. */
+  private ptRepaintTokens = new Map<string, number>();
+  /** Rows projected+drawn per rAF slice. Big enough that a few-hundred-k layer finishes
+   *  in one or two frames, small enough that a multi-million-point fill never blocks the
+   *  main thread. Module-internal (no public API); tests stub it via the static field. */
+  protected static PT_CHUNK = 500_000;
 
   constructor(protected host: HTMLElement, protected width: number, protected height: number, backend: BackendType) {
     this.currentBackend = backend;
@@ -87,6 +113,80 @@ export abstract class BaseEngine {
     // String()) so numeric-id layers don't allocate a string per drawable.
     this.layerIds.set(spec.name, new Set(spec.ids));
     this.pushLayers();
+  }
+
+  /** Register a pass-through layer (called by subclasses for passThrough:true).
+   *  Always stores the spec so a not-ready registration is replayed on backend install.
+   *  When a backend IS live: activate it if supported, else remove the spec + throw
+   *  (an explicit unsupported backend, e.g. SVG). When no backend is live yet: defer. */
+  protected registerPassThrough(spec: PassThroughSpec): void {
+    this.ptSpecs.set(spec.name, spec);
+    if (!this.handle) return; // not ready: keep the spec; install replay activates it
+    if (!this.handle.backend.supportsPassThrough) {
+      this.ptSpecs.delete(spec.name);
+      this.ptRepaintTokens.delete(spec.name); // prune stale token (no active repaint, but keep the map clean)
+      throw new Error(
+        `passThrough is not supported by the "${this.currentBackend}" backend (use the canvas backend; WebGL pass-through is not yet supported)`,
+      );
+    }
+    this.handle.backend.setPassThroughLayer?.({ name: spec.name, sizeMode: spec.sizeMode, clipTo: spec.clipTo });
+    this.repaintPassThrough(spec.name);
+  }
+
+  /** Incremental draw: project just this batch and draw it on top (O(new)). */
+  protected appendPassThrough(name: string, items: unknown[]): void {
+    const spec = this.ptSpecs.get(name);
+    if (!spec || !this.handle) return;
+    const batch = projectPoints(items, { project: spec.project, radius: spec.radius, color: spec.color });
+    this.handle.backend.drawPassThrough?.(name, batch, "append");
+  }
+
+  /** Resolve the current data array for a pass-through layer. */
+  private ptData(spec: PassThroughSpec): unknown[] {
+    return typeof spec.source === "function" ? spec.source() : spec.source;
+  }
+
+  /**
+   * Full repaint of a pass-through layer, TIME-SLICED so a multi-million-point fill never
+   * freezes the main thread: re-pull the data, then project + draw it in PT_CHUNK-row
+   * slices across requestAnimationFrame frames. The FIRST slice runs synchronously (so the
+   * caller sees points immediately and the retained base is redrawn via "replace-first");
+   * later slices are scheduled on rAF and stack on top via "replace-rest" (no clear).
+   *
+   * Cancellable per layer: each call captures a fresh token for `name`; a running slice
+   * loop bails the moment that token changes — i.e. when a NEWER repaint of the same layer
+   * starts, or an interaction begins (setInteracting bumps every layer's token). Using a
+   * per-layer token Map (not one shared counter) keeps layers independent: the settle /
+   * setTransform loops repaint every PT layer in turn, and a shared `++token` would let the
+   * second layer cancel the first's in-flight loop, so only the last layer would paint.
+   *
+   * Phase-1 multi-layer note: "replace-first" clears + redraws the retained base (the canvas
+   * backend calls render()), so two PT layers each starting with "replace-first" would clobber
+   * each other's pixels. The streaming use case is a SINGLE pass-through layer; multi-PT-layer
+   * compositing is out of scope here (would need a per-layer offscreen buffer in the backend).
+   */
+  protected repaintPassThrough(name: string): void {
+    const spec = this.ptSpecs.get(name);
+    if (!spec || !this.handle) return;
+    // Closing over `spec` here is safe: if the same layer is re-registered, registerPassThrough
+    // calls repaintPassThrough again (bumping this layer's token), which cancels any in-flight
+    // step() before it can execute another slice with the now-stale spec.
+    const data = this.ptData(spec);
+    const token = (this.ptRepaintTokens.get(name) ?? 0) + 1;
+    this.ptRepaintTokens.set(name, token);
+    const total = data.length;
+    let cursor = 0;
+    const step = (): void => {
+      // Cancelled by a newer repaint of this layer, an interaction, or a destroyed engine.
+      if (token !== this.ptRepaintTokens.get(name) || !this.handle) return;
+      const end = Math.min(cursor + BaseEngine.PT_CHUNK, total);
+      const slice = data.slice(cursor, end);
+      const batch = projectPoints(slice, { project: spec.project, radius: spec.radius, color: spec.color });
+      this.handle.backend.drawPassThrough?.(name, batch, cursor === 0 ? "replace-first" : "replace-rest");
+      cursor = end;
+      if (cursor < total) requestAnimationFrame(step);
+    };
+    step();
   }
 
   /**
@@ -154,6 +254,9 @@ export abstract class BaseEngine {
   }
 
   recolor(name: string): this {
+    // Pass-through layers aren't in `specs` (no retained Scene geometry); their color comes
+    // from the data callback each repaint, so a repaint IS the recolor.
+    if (this.ptSpecs.has(name)) { this.repaintPassThrough(name); return this; }
     const spec = this.specs.find((s) => s.name === name);
     if (!spec) return this;
     this.applyAccessors(spec);
@@ -206,12 +309,38 @@ export abstract class BaseEngine {
     if (this.interacting === v) return;
     this.interacting = v;
     if (this.specs.some((s) => s.hideOnInteraction)) this.pushLayers();
+    if (this.ptSpecs.size > 0) {
+      if (v) {
+        // Gesture start: cancel any in-flight time-sliced fill (bump each layer's token so
+        // a running step() no-ops on its next frame) BEFORE snapshotting — otherwise a
+        // stale slice could draw onto the canvas we're about to freeze for snapshot-pan.
+        for (const name of this.ptSpecs.keys())
+          this.ptRepaintTokens.set(name, (this.ptRepaintTokens.get(name) ?? 0) + 1);
+        // Capture the current accumulation so the backend can snapshot-pan.
+        this.handle?.backend.snapshotPassThrough?.();
+      } else {
+        // Settle: re-pull + crisp redraw of every pass-through layer.
+        // Known benign double-repaint: if a hideOnInteraction retained layer coexists with
+        // a pass-through layer, pushLayers() above already called repaintPassThrough for
+        // each PT layer (to restore PT pixels after render() cleared them). The loop here
+        // repaints them again — correct output; the first-slice from pushLayers is simply
+        // cancelled by this second token bump. Do NOT add a dedup guard: the pushLayers
+        // repaint is necessary in the general case (retained-layer rebuild without settle).
+        for (const name of this.ptSpecs.keys()) this.repaintPassThrough(name);
+      }
+    }
   }
   setTransform(t: ViewTransform): this {
     this.transform = t;
     this.handle?.backend.setTransform(t);
     for (const spec of this.specs) if (spec.declutter) this.declutterLayer(spec, t);
     this.render();
+    // Pass-through layers. While interacting, the backend composites its accumulation
+    // buffer with the live transform (snapshot-pan) — nothing to repaint here. On a
+    // programmatic/settle transform, re-pull + crisp redraw each layer.
+    if (this.ptSpecs.size > 0 && !this.interacting) {
+      for (const name of this.ptSpecs.keys()) this.repaintPassThrough(name);
+    }
     return this;
   }
 
@@ -360,6 +489,13 @@ export abstract class BaseEngine {
     this.handle?.backend.setLayers(this.renderSpecs().map((s) => this.renderLayer(s)));
     this.handle?.backend.setTransform(this.transform);
     this.render();
+    // render() above clears the canvas and redraws ONLY the retained layers — it has no
+    // pass-through point data, so any pass-through pixels are wiped. Repaint each PT layer
+    // back on top. Gated on ptSpecs.size so retained-only maps keep their zero-overhead path
+    // (and no recursion: repaintPassThrough → backend.drawPassThrough("replace-first") calls
+    // backend.render() directly, never back through pushLayers).
+    if (this.ptSpecs.size > 0)
+      for (const name of this.ptSpecs.keys()) this.repaintPassThrough(name);
   }
   /**
    * Post-swap hook: called after a backend SWAP completes (an existing handle was
@@ -393,6 +529,19 @@ export abstract class BaseEngine {
     next.backend.setLayers(this.renderSpecs().map((s) => this.renderLayer(s)));
     next.backend.setTransform(this.transform);
     next.backend.render();
+    // Replay retained pass-through layers onto the freshly-installed backend (mirrors the
+    // retained setLayers re-push above). A deferred/not-ready registration is activated here.
+    if (this.ptSpecs.size > 0) {
+      if (!next.backend.supportsPassThrough) {
+        throw new Error(
+          `passThrough is not supported by the "${type}" backend (use the canvas backend; WebGL pass-through is not yet supported)`,
+        );
+      }
+      for (const spec of this.ptSpecs.values()) {
+        next.backend.setPassThroughLayer?.({ name: spec.name, sizeMode: spec.sizeMode, clipTo: spec.clipTo });
+        this.repaintPassThrough(spec.name);
+      }
+    }
     if (old) this.onBackendSwapped();
   }
 
@@ -430,6 +579,19 @@ export abstract class BaseEngine {
         next = await this.createWebGLBackend();
       } catch (err) {
         if (!this.destroyed) console.warn("d3gl: WebGL upgrade failed, staying on canvas", err);
+        return;
+      }
+      // Phase 1: WebGL has no pass-through support. If pass-through layers exist, aborting the
+      // transparent auto-upgrade is the only safe move — installBackend would destroy the canvas
+      // handle (losing the pass-through raster) and then THROW at its unsupported-backend check.
+      // Tear down the just-created WebGL handle (mirroring the createWebGLBackend failure path),
+      // keep the live canvas + currentBackend untouched, and warn. (An EXPLICIT setBackend("webgl")
+      // still throws via installBackend — only this silent upgrade stays on canvas.)
+      if (this.ptSpecs.size > 0 && !next.backend.supportsPassThrough) {
+        next.backend.destroy();
+        if (next.element !== this.host) next.element.remove();
+        if (!this.destroyed)
+          console.warn("d3gl: pass-through layers keep the canvas backend (WebGL pass-through is not yet supported)");
         return;
       }
       this.installBackend(next, token, "webgl");

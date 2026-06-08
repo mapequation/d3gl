@@ -1,5 +1,5 @@
 import type { GroupBuilder, PathContext } from "../core/index.js";
-import { BaseEngine } from "./base-engine.js";
+import { BaseEngine, type PassThroughSpec } from "./base-engine.js";
 import type { BackendType } from "./backend-factory.js";
 import { LayerHandle } from "./layer-handle.js";
 
@@ -54,6 +54,10 @@ export interface PlotPointOptions<D = any> {
   /** When false, skip the CPU hit index (no hover/pick) — saves an Entry per point on
    *  huge non-interactive layers (e.g. streamed points). */
   pickable?: boolean;
+  /** Render via the backend's pass-through path: no retained Scene geometry, no hit
+   *  index (not pickable). Points are projected + drawn directly each repaint, so the
+   *  data may be a callback re-invoked per repaint. For huge, fast-changing point sets. */
+  passThrough?: boolean;
 }
 
 export class Plot extends BaseEngine {
@@ -66,7 +70,26 @@ export class Plot extends BaseEngine {
     return new LayerHandle<D>(this, name, (items) => this.appendDrawables(name, items, opts));
   }
 
-  points<D>(name: string, data: readonly D[], opts: PlotPointOptions<D>): LayerHandle<D> {
+  points<D>(name: string, data: readonly D[] | (() => readonly D[]), opts: PlotPointOptions<D>): LayerHandle<D> {
+    if (opts.passThrough) {
+      const radius = opts.radius ?? 3;
+      this.registerPassThrough({
+        name,
+        source: (typeof data === "function" ? () => [...data()] : [...data]) as unknown[] | (() => unknown[]),
+        // plot x/y accessors yield projected world coords directly (view transform applied at draw)
+        project: (d, i) => [opts.x(d as D, i), opts.y(d as D, i)],
+        radius: typeof radius === "function"
+          ? (d, i) => (radius as (d: D, i: number) => number)(d as D, i)
+          : (radius as number),
+        color: ((typeof opts.fill === "function")
+          ? (d, i) => (opts.fill as (d: D, i: number) => string)(d as D, i)
+          : (opts.fill ?? "#000")) as PassThroughSpec["color"],
+        sizeMode: opts.sizeMode,
+        clipTo: opts.clipTo,
+      });
+      return new LayerHandle<D>(this, name, (items) => this.appendPassThrough(name, items as unknown[]));
+    }
+    if (typeof data === "function") throw new Error("callback data requires passThrough: true");
     const list = data as D[];
     const ids = list.map((d, i) => (opts.id ? opts.id(d, i) : i));
     this.registerLayer({ name, data: list, ids, fill: opts.fill, stroke: opts.stroke, clipTo: opts.clipTo, sizeMode: opts.sizeMode, pickable: opts.pickable, build: this.buildPoints(list, ids, 0, opts) });
