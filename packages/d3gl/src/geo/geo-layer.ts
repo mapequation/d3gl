@@ -20,6 +20,31 @@ function geomOf(input: GeoInput): GeoJSON.Geometry | null {
 }
 
 /**
+ * Project a Point's `[lon, lat]` to screen coords, or return `null` when it isn't
+ * visible. A raw `projection(point)` returns coordinates even for back-facing points
+ * (they fold onto the front disc). An azimuthal projection reports a positive
+ * clipAngle (e.g. orthographic ≈ 90°); others report 0 (no angular clip). When
+ * azimuthal, cull points whose great-circle distance from the view centre exceeds
+ * that angle. Shared by {@link geoLayer} and the pass-through path so both cull
+ * identically.
+ */
+export function projectVisiblePoint(
+  projection: GeoProjection,
+  coordinates: [number, number],
+): [number, number] | null {
+  const clipAngle = projection.clipAngle();
+  const azimuthal = clipAngle != null && clipAngle > 0;
+  if (azimuthal) {
+    const rot = projection.rotate();
+    const centre: [number, number] = [-rot[0], -rot[1]];
+    const limit = (clipAngle * Math.PI) / 180;
+    if (geoDistance(coordinates, centre) > limit) return null;
+  }
+  const p = projection(coordinates);
+  return p ? [p[0], p[1]] : null;
+}
+
+/**
  * A Scene.group builder projecting any GeoJSON geometry once. Points → analytic circles.
  *
  * WINDING (Polygon/MultiPolygon): geoPath fills on the sphere, so exterior rings must be
@@ -50,9 +75,7 @@ export function geoLayer<F extends GeoInput>(
       const id = opts.id ? opts.id(feature, i) : i;
       const geom = geomOf(feature);
       if (geom && geom.type === "Point") {
-        const c = geom.coordinates as [number, number];
-        if (!visible(c)) return;
-        const p = projection(c);
+        const p = projectVisiblePoint(projection, geom.coordinates as [number, number]);
         if (p) g.point(id, p[0], p[1], radius);
       } else if (geom && geom.type === "MultiPoint") {
         const centers: [number, number][] = [];

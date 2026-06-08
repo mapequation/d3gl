@@ -1,8 +1,8 @@
 import { type GeoProjection, geoEquirectangular } from "d3-geo";
-import { geoLayer } from "../geo/index.js";
+import { geoLayer, projectVisiblePoint } from "../geo/index.js";
 import { isOrthographic, rotationMatrix } from "../geo/orthographic.js";
 import versor, { type Angles, type Vec3, type Quaternion } from "../geo/versor.js";
-import { BaseEngine, type HoverHit, type LayerSpec } from "./base-engine.js";
+import { BaseEngine, type HoverHit, type LayerSpec, type PassThroughSpec } from "./base-engine.js";
 import type { BackendType } from "./backend-factory.js";
 import type { ViewTransform } from "../core/index.js";
 import { LayerHandle } from "./layer-handle.js";
@@ -29,6 +29,11 @@ export interface LayerOptions<F = any> {
   /** When false, skip the CPU hit index for this layer (no hover/pick on it) — saves an
    *  Entry object per feature; use for huge, non-interactive layers (e.g. streamed points). */
   pickable?: boolean;
+  /** Render via the backend's pass-through path: no retained Scene geometry, no hit
+   *  index (not pickable). Phase 1 supports Point geometry only — features are projected
+   *  + drawn directly each repaint, so `features` may be a callback re-invoked per repaint.
+   *  For huge, fast-changing point sets. */
+  passThrough?: boolean;
 }
 
 /** Options for {@link GeoMap.enableRotation}. */
@@ -75,7 +80,33 @@ export class GeoMap extends BaseEngine {
     this.gpuGlobe = this.backendType() === "webgl" && isOrthographic(this.projection);
   }
 
-  layer<F>(name: string, features: F | readonly F[], opts: LayerOptions<F> = {}): LayerHandle<F> {
+  layer<F>(name: string, features: F | readonly F[] | (() => readonly F[]), opts: LayerOptions<F> = {}): LayerHandle<F> {
+    if (opts.passThrough) {
+      const source: unknown[] | (() => unknown[]) =
+        typeof features === "function"
+          ? () => [...(features as () => readonly F[])()]
+          : [...(Array.isArray(features) ? (features as readonly F[]) : [features as F])];
+      this.registerPassThrough({
+        name,
+        source,
+        project: (f, i) => {
+          void i;
+          const geom = (f as { geometry?: GeoJSON.Geometry }).geometry;
+          if (!geom || geom.type !== "Point") {
+            throw new Error("passThrough supports only Point geometry in Phase 1");
+          }
+          return projectVisiblePoint(this.projection, geom.coordinates as [number, number]);
+        },
+        radius: opts.pointRadius ?? 3,
+        color: ((typeof opts.fill === "function")
+          ? (f, i) => (opts.fill as (f: F, i: number) => string)(f as F, i)
+          : (opts.fill ?? "#000")) as PassThroughSpec["color"],
+        sizeMode: opts.sizeMode,
+        clipTo: opts.clipTo,
+      });
+      return new LayerHandle<F>(this, name, (items) => this.appendPassThrough(name, items as unknown[]));
+    }
+    if (typeof features === "function") throw new Error("callback data requires passThrough: true");
     const list = Array.isArray(features) ? (features as F[]) : [features as F];
     this.defs = this.defs.filter((d) => d.name !== name).concat({ name, opts });
     this.registerLayer(this.buildSpec(name, list, opts));

@@ -208,6 +208,9 @@ export abstract class BaseEngine {
   }
 
   recolor(name: string): this {
+    // Pass-through layers aren't in `specs` (no retained Scene geometry); their color comes
+    // from the data callback each repaint, so a repaint IS the recolor.
+    if (this.ptSpecs.has(name)) { this.repaintPassThrough(name); return this; }
     const spec = this.specs.find((s) => s.name === name);
     if (!spec) return this;
     this.applyAccessors(spec);
