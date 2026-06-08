@@ -85,6 +85,15 @@ modules test in headless Chromium via Vitest browser mode. The
 pnpm --filter @mapequation/d3gl test:browser
 ```
 
+`test:browser` runs Vitest through a wall-clock watchdog
+(`scripts/run-browser-tests.mjs`) so the suite can never hang indefinitely.
+If the run stalls outside a test body — browser launch, the Vite optimizer, or
+post-run teardown of a leaked WebGL context — the watchdog kills the whole
+process tree (including Chromium) and exits `124` instead of blocking. Raise the
+budget on a slow machine with `D3GL_BROWSER_TEST_TIMEOUT=<ms>` (default 180000)
+or `--watchdog-timeout=<ms>`. In-test, hook, and teardown phases are separately
+bounded by Vitest's `testTimeout` / `hookTimeout` / `teardownTimeout`.
+
 ## Making a change
 
 1. **Fork** the repo and create a branch from `main`
