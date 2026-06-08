@@ -3,7 +3,7 @@
 **Date:** 2026-06-08
 **Status:** Phase 1 implemented (engine plumbing + Canvas backend, points). Phases 2–4 (WebGL, generic geometry, docs + example) pending — see the plan at `docs/superpowers/plans/2026-06-08-pass-through-rendering.md`.
 
-> **Phase 1 done (2026-06-08):** `passThrough` option + callback data on `plot.points()` / `geoMap.layer()`; pure `projectPoints`/`PointBatch` builder; engine registration that bypasses `Scene` (zero retention) with defer/re-register-on-install; Canvas accumulate + snapshot-pan; time-sliced cancellable repaint; `pickable:false`; SVG rejects `passThrough`. Verified: typecheck clean, 186 node tests, 93 browser tests green.
+> **Phase 1 done (2026-06-08):** `passThrough` option + callback data on `plot.points()` / `geoMap.layer()`; pure `projectPoints`/`PointBatch` builder; engine registration that bypasses `Scene` (zero retention) with defer/re-register-on-install; Canvas accumulate + snapshot-pan; time-sliced cancellable repaint; `pickable:false`; SVG rejects `passThrough`; `auto` mode stays on Canvas while pass-through layers exist (WebGL pass-through arrives in Phase 2). Verified: typecheck clean, 186 node tests, 96 browser tests green.
 
 > Scope note: the design is framed around points (the OOM case and cheapest
 > path), but the pipeline is **generic over all GeoJSON geometry** — see
