@@ -1,4 +1,4 @@
-import type { Backend, RenderLayer, RenderDelta, ViewTransform, DrawableVector } from "../core/index.js";
+import type { Backend, RenderLayer, RenderDelta, ViewTransform, DrawableVector, PassThroughLayer, PointBatch } from "../core/index.js";
 import { svgFromLayers } from "../svg/index.js";
 
 const css = (c: readonly [number, number, number, number]) => `rgba(${c[0]}, ${c[1]}, ${c[2]}, ${(c[3] / 255).toFixed(4)})`;
@@ -20,6 +20,17 @@ export class CanvasBackend implements Backend {
   private clipCache = new Map<string, Path2D>();
   /** A clip left applied across incremental appends (clip-once, draw-many). */
   private activeClip: ActiveClip | null = null;
+
+  /** Canvas-2D persists drawn pixels between calls, so the canvas IS the pass-through
+   *  accumulation buffer: points draw on top of the retained base map and stay there. */
+  readonly supportsPassThrough = true;
+  /** Pass-through layer metadata only (name / sizeMode / clip) — no retained geometry; the
+   *  engine re-projects the point data each repaint and hands us batches via drawPassThrough. */
+  private ptLayers = new Map<string, PassThroughLayer>();
+  /** A frozen raster of the whole canvas captured at gesture start, plus the transform it was
+   *  drawn at. While non-null we snapshot-pan (blit it under the delta transform) instead of
+   *  re-rendering — the backend holds no point data to redraw, so a normal render would drop them. */
+  private ptSnapshot: { canvas: HTMLCanvasElement; transform: ViewTransform } | null = null;
 
   constructor(private canvas: HTMLCanvasElement, private width: number, private height: number) {
     const ctx = canvas.getContext("2d");
@@ -83,6 +94,10 @@ export class CanvasBackend implements Backend {
   }
 
   render(): void {
+    // Mid-gesture with pass-through layers: blit the frozen snapshot under the delta
+    // transform instead of re-rendering. A normal render would clear the canvas and redraw
+    // only the retained layers — dropping the pass-through points (we hold no point data).
+    if (this.ptSnapshot) { this.compositeSnapshot(); return; }
     const { ctx } = this;
     this.releaseClip(); // any persistent append-clip is replaced by the per-layer clips below
     ctx.setTransform(1, 0, 0, 1, 0, 0);
@@ -98,6 +113,81 @@ export class CanvasBackend implements Backend {
       this.drawShapes(layer.drawables, layer.sizeMode === "screen", t);
       if (path) ctx.restore();
     }
+  }
+
+  setPassThroughLayer(layer: PassThroughLayer): void {
+    this.ptLayers.set(layer.name, layer);
+  }
+
+  removePassThroughLayer(name: string): void {
+    this.ptLayers.delete(name);
+  }
+
+  /**
+   * Draw a batch of pass-through points onto the main canvas at the current transform.
+   * - `"replace-first"` starts a fresh full repaint of the overlay: drop any snapshot, redraw
+   *   the retained base via the normal render(), then draw this batch on top.
+   * - `"replace-rest"` / `"append"` draw this batch on top of what's already there (no clear) —
+   *   continuing a chunked repaint, or an incremental add.
+   * (Single-batch draw; Task 7 time-slices large batches. No color grouping — YAGNI.)
+   */
+  drawPassThrough(name: string, batch: PointBatch, mode: "replace-first" | "replace-rest" | "append"): void {
+    if (mode === "replace-first") {
+      this.ptSnapshot = null;       // a fresh repaint supersedes any in-flight snapshot-pan
+      this.render();                // clears + redraws the retained base map
+    }
+    this.drawPtBatch(name, batch);
+  }
+
+  /** Capture the current canvas + transform so render() can snapshot-pan during a gesture. */
+  snapshotPassThrough(): void {
+    const snap = document.createElement("canvas");
+    snap.width = this.canvas.width;
+    snap.height = this.canvas.height;
+    snap.getContext("2d")!.drawImage(this.canvas, 0, 0);
+    this.ptSnapshot = { canvas: snap, transform: { ...this.transform } };
+  }
+
+  /** Draw one batch of points in device/screen space, applying the current transform manually
+   *  (mirrors the screen-mode circle path in drawShapes). The canvas is sized in device px with
+   *  no DPR scale (see backend-factory.makeCanvas), so world→screen is exactly t.k*w + t.(x,y). */
+  private drawPtBatch(name: string, batch: PointBatch): void {
+    const { ctx } = this;
+    const t = this.transform;
+    const screen = this.ptLayers.get(name)?.sizeMode === "screen";
+    const { positions, radii, colors, count } = batch;
+    ctx.save();
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    for (let i = 0; i < count; i++) {
+      const sx = t.k * positions[i * 2]! + t.x;
+      const sy = t.k * positions[i * 2 + 1]! + t.y;
+      const r = screen ? radii[i]! : radii[i]! * t.k;
+      const o = i * 4;
+      ctx.fillStyle = `rgba(${colors[o]}, ${colors[o + 1]}, ${colors[o + 2]}, ${colors[o + 3]! / 255})`;
+      ctx.beginPath();
+      ctx.arc(sx, sy, r, 0, 2 * Math.PI);
+      ctx.fill();
+    }
+    ctx.restore();
+  }
+
+  /**
+   * Snapshot-pan: clear, then blit the frozen snapshot under the delta from the transform it was
+   * captured at (s) to the current transform (t). A world point w sat at s.k*w + s.offset in the
+   * snapshot; it must now appear at t.k*w + t.offset. So a snapshot pixel p (= world (p-s.off)/s.k)
+   * maps to (t.k/s.k)*p + (t.off - (t.k/s.k)*s.off). The canvas has no DPR scale, so p is already
+   * in device px and no extra scaling is needed.
+   */
+  private compositeSnapshot(): void {
+    const { ctx } = this;
+    const s = this.ptSnapshot!.transform;
+    const t = this.transform;
+    const a = t.k / s.k;
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.clearRect(0, 0, this.width, this.height);
+    ctx.setTransform(a, 0, 0, a, t.x - a * s.x, t.y - a * s.y);
+    ctx.drawImage(this.ptSnapshot!.canvas, 0, 0);
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
   }
 
   /** Pop a persistent append-clip if one is applied (balances its save()). */
@@ -200,5 +290,7 @@ export class CanvasBackend implements Backend {
     this.releaseClip();
     this.layers = [];
     this.clipCache.clear();
+    this.ptLayers.clear();
+    this.ptSnapshot = null;
   }
 }
