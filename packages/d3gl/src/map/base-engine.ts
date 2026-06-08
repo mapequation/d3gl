@@ -1,7 +1,7 @@
 import { select } from "d3-selection";
 import { zoom as d3zoom, zoomIdentity, type D3ZoomEvent } from "d3-zoom";
 import { Scene, HitIndex, type Backend, type GroupBuilder, type RenderLayer, type ViewTransform } from "../core/index.js";
-import { createBackend, type BackendType, type BackendHandle } from "./backend-factory.js";
+import { createBackend, createCanvasBackend, type BackendType, type BackendHandle } from "./backend-factory.js";
 
 export type Accessor<D, T> = T | ((d: D, i: number) => T);
 export interface HoverHit { layer: string; id: string | number; datum: unknown; }
@@ -43,6 +43,8 @@ export abstract class BaseEngine {
   private hoverCb: ((hit: HoverHit | null, ev: PointerEvent) => void) | null = null;
   private swapToken = 0;
   private destroyed = false;
+  /** The in-flight (or settled) WebGL upgrade for "auto" mode; null when not in auto mode. */
+  private upgradeDone: Promise<void> | null = null;
   /** True while the user is interacting (a rotation drag, or a zoom/pan gesture).
    *  Layers flagged hideOnInteraction are excluded from the render while this is true. */
   protected interacting = false;
@@ -51,7 +53,13 @@ export abstract class BaseEngine {
 
   constructor(protected host: HTMLElement, protected width: number, protected height: number, backend: BackendType) {
     this.currentBackend = backend;
-    this.ready = this.swapBackend(backend);
+    if (backend === "auto") {
+      // Instant canvas first paint; whenReady() resolves now. WebGL is built in the background.
+      this.ready = Promise.resolve();
+      this.enterAutoMode();
+    } else {
+      this.ready = this.swapBackend(backend);
+    }
   }
   whenReady(): Promise<void> { return this.ready; }
   /** The currently-active backend type (set by the constructor / installBackend). */
@@ -160,7 +168,11 @@ export abstract class BaseEngine {
     this.pushLayers();
     return this;
   }
-  setBackend(type: BackendType): this { this.ready = this.swapBackend(type); return this; }
+  setBackend(type: BackendType): this {
+    if (type === "auto") { this.ready = Promise.resolve(); this.enterAutoMode(); }
+    else this.ready = this.swapBackend(type);
+    return this;
+  }
   /** Detach the current pan/zoom or rotation interaction (no-op if none). */
   disableInteraction(): this {
     this.interactionCleanup?.();
@@ -375,5 +387,34 @@ export abstract class BaseEngine {
     const token = ++this.swapToken;
     const next = await createBackend(type, this.host, this.width, this.height);
     this.installBackend(next, token, type);
+  }
+
+  /** Thin override point so tests can stub the WebGL creation without fighting ESM live bindings. */
+  protected createWebGLBackend(): Promise<BackendHandle> {
+    return createBackend("webgl", this.host, this.width, this.height);
+  }
+
+  /** Enter "auto" mode: install a Canvas backend synchronously (instant first paint, no
+   *  await, no onBackendSwapped — it is the first install / a fresh canvas), then start the
+   *  background WebGL upgrade. Bumping swapToken invalidates any in-flight prior swap. */
+  private enterAutoMode(): void {
+    const handle = createCanvasBackend(this.host, this.width, this.height);
+    this.installBackend(handle, ++this.swapToken, "canvas");
+    this.upgradeDone = this.upgradeToWebGL();
+  }
+
+  /** Background upgrade: create the WebGL device, then swap it in via installBackend (which
+   *  destroys the canvas handle and fires onBackendSwapped, since it replaces a live handle).
+   *  On failure, keep the canvas and warn — the map keeps working. */
+  private async upgradeToWebGL(): Promise<void> {
+    const token = ++this.swapToken;
+    let next: BackendHandle;
+    try {
+      next = await this.createWebGLBackend();
+    } catch (err) {
+      if (!this.destroyed) console.warn("d3gl: WebGL upgrade failed, staying on canvas", err);
+      return;
+    }
+    this.installBackend(next, token, "webgl");
   }
 }
