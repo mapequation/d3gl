@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { clipFromView } from "../transform.js";
+import { clipFromView, blitMatrix } from "../transform.js";
 
 /** Apply a column-major mat3 to a 2D point. */
 function apply(m: Float32Array, x: number, y: number): [number, number] {
@@ -41,5 +41,20 @@ describe("clipFromView", () => {
     expect(m[2]).toBe(0);
     expect(m[5]).toBe(0);
     expect(m[8]).toBe(1);
+  });
+});
+
+describe("blitMatrix", () => {
+  it("is identity when from === to", () => {
+    const v = { k: 1, x: 0, y: 0 };
+    expect(Array.from(blitMatrix(v, v, 100, 100))).toEqual([1, 0, 0, 0, 1, 0, 0, 0, 1]);
+  });
+  it("maps a pure 2x zoom about the screen origin", () => {
+    const m = Array.from(blitMatrix({ k: 1, x: 0, y: 0 }, { k: 2, x: 0, y: 0 }, 100, 100));
+    expect(m).toEqual([2, 0, 0, 0, 2, 0, 1, -1, 1]);
+  });
+  it("maps a pure pan", () => {
+    const m = Array.from(blitMatrix({ k: 1, x: 0, y: 0 }, { k: 1, x: 10, y: 20 }, 100, 100));
+    m.forEach((v, i) => expect(v).toBeCloseTo([1, 0, 0, 0, 1, 0, 0.2, -0.4, 1][i], 6));
   });
 });
