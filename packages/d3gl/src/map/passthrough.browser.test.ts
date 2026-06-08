@@ -1,7 +1,8 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, afterEach } from "vitest";
 import { geoEquirectangular } from "d3-geo";
 import type { PassThroughLayer, PointBatch } from "../core/index.js";
 import { CanvasBackend } from "../canvas/canvas-backend.js";
+import { BaseEngine } from "./base-engine.js";
 import { plot } from "./plot.js";
 import { geoMap } from "./geo-map.js";
 import { LayerHandle } from "./layer-handle.js";
@@ -36,6 +37,15 @@ function host(): HTMLElement {
 }
 const canvasOf = (h: HTMLElement): HTMLCanvasElement => h.querySelector("canvas")!;
 const at = (ctx: CanvasRenderingContext2D, x: number, y: number): Uint8ClampedArray => ctx.getImageData(x, y, 1, 1).data;
+
+/** Await `n` real animation frames (the browser env has a real rAF) so time-sliced
+ *  repaints can advance their scheduled slices. */
+const frames = (n: number): Promise<void> =>
+  new Promise((resolve) => {
+    let left = n;
+    const tick = (): void => { if (--left <= 0) resolve(); else requestAnimationFrame(tick); };
+    requestAnimationFrame(tick);
+  });
 
 describe("passThrough public API", () => {
   it("plot.points(passThrough) returns a handle synchronously and creates no pickable retained layer", () => {
@@ -133,6 +143,86 @@ describe("passThrough rendering (canvas backend)", () => {
     map.layer("bad", [polygon()], { fill: "red", passThrough: true });
     await expect(map.whenReady()).rejects.toThrow(/passThrough supports only Point geometry in Phase 1/);
     map.destroy();
+  });
+});
+
+describe("passThrough time-sliced repaint", () => {
+  // PT_CHUNK is a protected static (no public API for it). Tests stub it via an `any` cast so
+  // a modest dataset (not the real 500k) exercises multi-chunk slicing fast. We restore it
+  // after each test so other suites see the production value.
+  const realChunk = (BaseEngine as any).PT_CHUNK as number;
+  afterEach(() => { (BaseEngine as any).PT_CHUNK = realChunk; });
+
+  it("renders the first chunk synchronously, later chunks across rAF frames", async () => {
+    (BaseEngine as any).PT_CHUNK = 2; // 2 points/slice → 3 points spans two slices
+    const h = host();
+    const chart = plot(h, { width: 200, height: 200, backend: "canvas" });
+    await chart.whenReady();
+    // Three points at distinct pixels (identity transform). Chunk 0 = pts[0..1], chunk 1 = pts[2].
+    chart.points(
+      "pts",
+      [{ x: 30, y: 30 }, { x: 60, y: 60 }, { x: 120, y: 120 }],
+      { x: (d) => d.x, y: (d) => d.y, radius: 6, fill: "rgb(255,0,0)", passThrough: true },
+    );
+    const ctx = canvasOf(h).getContext("2d")!;
+    // First chunk painted synchronously by the initial step() (no awaited frame yet).
+    expect(at(ctx, 30, 30)[0]!).toBeGreaterThan(180);
+    expect(at(ctx, 60, 60)[0]!).toBeGreaterThan(180);
+    // The third point is in a later chunk scheduled on rAF — not drawn yet.
+    expect(at(ctx, 120, 120)[3]!).toBe(0);
+
+    await frames(3); // let the scheduled slice run
+    expect(at(ctx, 120, 120)[0]!).toBeGreaterThan(180); // later chunk now painted
+    // Earlier chunks survive (later slices use "replace-rest" = draw-on-top, no clear).
+    expect(at(ctx, 30, 30)[0]!).toBeGreaterThan(180);
+    chart.destroy();
+  });
+
+  it("an interaction mid-fill cancels the in-flight repaint (no further chunks paint)", async () => {
+    (BaseEngine as any).PT_CHUNK = 1; // 1 point/slice → each point needs its own frame
+    const h = host();
+    const chart = plot(h, { width: 200, height: 200, backend: "canvas" });
+    await chart.whenReady();
+    chart.enableZoom(); // so setInteracting(true) snapshots + cancels
+    chart.points(
+      "pts",
+      [{ x: 30, y: 30 }, { x: 80, y: 80 }, { x: 140, y: 140 }],
+      { x: (d) => d.x, y: (d) => d.y, radius: 6, fill: "rgb(255,0,0)", passThrough: true },
+    );
+    const ctx = canvasOf(h).getContext("2d")!;
+    // Only the first chunk drew synchronously; chunks 2 and 3 are pending on rAF.
+    expect(at(ctx, 30, 30)[0]!).toBeGreaterThan(180);
+    expect(at(ctx, 80, 80)[3]!).toBe(0);
+
+    // Start a gesture: bumps the layer's token, cancelling the pending slices.
+    // (Plot extends BaseEngine; setInteracting is protected, reached via an `any` cast.)
+    (chart as any).setInteracting(true);
+
+    await frames(5); // the stale step() must no-op; no further chunks paint
+    expect(at(ctx, 80, 80)[3]!).toBe(0);
+    expect(at(ctx, 140, 140)[3]!).toBe(0);
+    chart.destroy();
+  });
+});
+
+describe("passThrough retained-layer coexistence (Part C)", () => {
+  it("re-pushing a retained layer keeps pass-through points visible (they get repainted)", async () => {
+    const h = host();
+    const chart = plot(h, { width: 200, height: 200, backend: "canvas" });
+    await chart.whenReady();
+    // A pass-through point at (60,60).
+    chart.points("pts", [{ x: 60, y: 60 }], { x: (d) => d.x, y: (d) => d.y, radius: 6, fill: "rgb(255,0,0)", passThrough: true });
+    const ctx = canvasOf(h).getContext("2d")!;
+    expect(at(ctx, 60, 60)[0]!).toBeGreaterThan(180);
+
+    // Register a RETAINED layer somewhere else. registerLayer → pushLayers → backend.render()
+    // clears the canvas (and the pass-through pixels). Part C must repaint the PT layer after.
+    chart.points("base", [{ x: 150, y: 150 }], { x: (d) => d.x, y: (d) => d.y, radius: 6, fill: "rgb(0,0,255)" });
+
+    // Retained base drew; the pass-through point survived the clear (repainted on top of render()).
+    expect(at(ctx, 150, 150)[2]!).toBeGreaterThan(180); // blue retained point
+    expect(at(ctx, 60, 60)[0]!).toBeGreaterThan(180);   // red pass-through point still visible
+    chart.destroy();
   });
 });
 
