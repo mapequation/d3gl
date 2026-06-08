@@ -1,6 +1,6 @@
 import { describe, it, expect, afterEach } from "vitest";
 import { geoEquirectangular } from "d3-geo";
-import type { PassThroughLayer, PointBatch } from "../core/index.js";
+import type { PassThroughLayer, DrawBatch } from "../core/index.js";
 import { CanvasBackend } from "../canvas/canvas-backend.js";
 import { BaseEngine } from "./base-engine.js";
 import { plot, Plot } from "./plot.js";
@@ -253,11 +253,14 @@ describe("passThrough snapshot-pan (canvas backend, direct)", () => {
   // (setInteracting → snapshotPassThrough; setTransform during a gesture → render) is the
   // same call sequence exercised here. End-to-end gesture simulation is covered manually / Task 9.
   const layer: PassThroughLayer = { name: "pts" };
-  const batchAt = (x: number, y: number, r: number): PointBatch => ({
-    positions: new Float32Array([x, y]),
-    radii: new Float32Array([r]),
-    colors: new Uint8Array([255, 0, 0, 255]),
-    count: 1,
+  const batchAt = (x: number, y: number, r: number): DrawBatch => ({
+    points: {
+      positions: new Float32Array([x, y]),
+      radii: new Float32Array([r]),
+      colors: new Uint8Array([255, 0, 0, 255]),
+      count: 1,
+    },
+    paths: null,
   });
 
   it("blits the frozen raster under a pan delta, then a settle-repaint draws crisp again", () => {

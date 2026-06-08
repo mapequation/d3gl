@@ -1,7 +1,7 @@
 import { Buffer } from "@luma.gl/core";
 import type { Device, Framebuffer, RenderPass } from "@luma.gl/core";
 import { Model } from "@luma.gl/engine";
-import type { PointBatch, ViewTransform } from "../core/index.js";
+import type { PointBatch, DrawBatch, ViewTransform } from "../core/index.js";
 import { GrowBuffer } from "./renderer.js";
 import { PT_POINT_VS, POINT_FS, BLIT_VS, BLIT_FS } from "./shaders.js";
 import { clipFromView, blitMatrix } from "./transform.js";
@@ -233,8 +233,13 @@ export class PassThroughGL {
    * refilled, vertex base 0), so a draw is O(batch), not O(total) — earlier batches live
    * only in the FBO. This is why the clearColor:false preserve below is load-bearing.
    */
-  draw(batch: PointBatch, transform: ViewTransform, clear: boolean): void {
-    const e = expand(batch, 0);
+  draw(batch: DrawBatch, transform: ViewTransform, clear: boolean): void {
+    // Task 5: rasterize batch.paths. For now, points only.
+    const points: PointBatch =
+      batch.points && batch.points.count
+        ? batch.points
+        : { positions: new Float32Array(0), radii: new Float32Array(0), colors: new Uint8Array(0), count: 0 };
+    const e = expand(points, 0);
     // Reset so the scratch buffers are overwritten from the start with only this batch.
     this.center.reset();
     this.corner.reset();

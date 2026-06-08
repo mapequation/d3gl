@@ -2,7 +2,7 @@ import { select } from "d3-selection";
 import { zoom as d3zoom, zoomIdentity, type D3ZoomEvent } from "d3-zoom";
 import { Scene, HitIndex, type Backend, type GroupBuilder, type RenderLayer, type ViewTransform } from "../core/index.js";
 import { createBackend, createCanvasBackend, type BackendType, type BackendHandle } from "./backend-factory.js";
-import { projectPoints } from "./point-batch.js";
+import { buildBatch, type DrawItem } from "./draw-batch.js";
 
 export type Accessor<D, T> = T | ((d: D, i: number) => T);
 export interface HoverHit { layer: string; id: string | number; datum: unknown; }
@@ -33,10 +33,8 @@ export interface PassThroughSpec {
   name: string;
   /** User data source: an array, or a function re-invoked each full repaint. */
   source: unknown[] | (() => unknown[]);
-  /** Project a datum → projected world coords, or null to cull. Built by the subclass. */
-  project: (d: unknown, i: number) => [number, number] | null;
-  radius: number | ((d: unknown, i: number) => number);
-  color: string | ((d: unknown, i: number) => string);
+  /** Build the draw item for a datum, or null to cull. Built by the subclass. */
+  buildItem: (d: unknown, i: number) => DrawItem | null;
   sizeMode?: "world" | "screen";
   clipTo?: string;
 }
@@ -137,7 +135,7 @@ export abstract class BaseEngine {
   protected appendPassThrough(name: string, items: unknown[]): void {
     const spec = this.ptSpecs.get(name);
     if (!spec || !this.handle) return;
-    const batch = projectPoints(items, { project: spec.project, radius: spec.radius, color: spec.color });
+    const batch = buildBatch(items, spec.buildItem);
     this.handle.backend.drawPassThrough?.(name, batch, "append");
   }
 
@@ -181,7 +179,7 @@ export abstract class BaseEngine {
       if (token !== this.ptRepaintTokens.get(name) || !this.handle) return;
       const end = Math.min(cursor + BaseEngine.PT_CHUNK, total);
       const slice = data.slice(cursor, end);
-      const batch = projectPoints(slice, { project: spec.project, radius: spec.radius, color: spec.color });
+      const batch = buildBatch(slice, spec.buildItem);
       this.handle.backend.drawPassThrough?.(name, batch, cursor === 0 ? "replace-first" : "replace-rest");
       cursor = end;
       if (cursor < total) requestAnimationFrame(step);

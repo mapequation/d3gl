@@ -1,4 +1,4 @@
-import type { Backend, RenderLayer, RenderDelta, ViewTransform, DrawableVector, PassThroughLayer, PointBatch } from "../core/index.js";
+import type { Backend, RenderLayer, RenderDelta, ViewTransform, DrawableVector, PassThroughLayer, PointBatch, DrawBatch } from "../core/index.js";
 import { svgFromLayers } from "../svg/index.js";
 
 const css = (c: readonly [number, number, number, number]) => `rgba(${c[0]}, ${c[1]}, ${c[2]}, ${(c[3] / 255).toFixed(4)})`;
@@ -131,12 +131,13 @@ export class CanvasBackend implements Backend {
    *   continuing a chunked repaint, or an incremental add.
    * (Single-batch draw; Task 7 time-slices large batches. No color grouping — YAGNI.)
    */
-  drawPassThrough(name: string, batch: PointBatch, mode: "replace-first" | "replace-rest" | "append"): void {
+  drawPassThrough(name: string, batch: DrawBatch, mode: "replace-first" | "replace-rest" | "append"): void {
     if (mode === "replace-first") {
       this.ptSnapshot = null;       // a fresh repaint supersedes any in-flight snapshot-pan
       this.render();                // clears + redraws the retained base map
     }
-    this.drawPtBatch(name, batch);
+    if (batch.points) this.drawPtBatch(name, batch.points);
+    // Task 4: render batch.paths
   }
 
   /** Capture the current canvas + transform so render() can snapshot-pan during a gesture. */

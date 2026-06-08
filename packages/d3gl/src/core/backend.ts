@@ -1,4 +1,5 @@
 import type { GroupBuffers, GroupBufferDelta, DrawableVector } from "./scene.js";
+import type { Subpath } from "./path-context.js";
 
 /** Transient, GPU/Canvas-ready point data. Owned by no one — built per repaint and discarded. */
 export interface PointBatch {
@@ -11,6 +12,25 @@ export interface PointBatch {
   /** number of points actually packed (after culling). */
   count: number;
 }
+
+/** One projected path feature, ready to draw. Canvas draws natively; WebGL tessellates per frame. */
+export interface ProjectedPath {
+  subpaths: Subpath[];
+  fill: [number, number, number, number] | null;   // RGBA bytes; null = no fill
+  stroke: [number, number, number, number] | null; // RGBA bytes; null = no stroke
+  lineWidth: number;                                // 0 = no stroke geometry
+}
+
+/** Generalized transient pass-through payload (built per repaint, discarded). */
+export interface DrawBatch {
+  points: PointBatch | null;
+  paths: ProjectedPath[] | null;
+}
+
+/** What a PassThroughSpec yields per datum (generalizes the point-only project()). */
+export type DrawItem =
+  | { kind: "points"; centers: [number, number][]; radius: number; color: string }
+  | { kind: "path"; subpaths: Subpath[]; fill: string | null; stroke: string | null; lineWidth: number };
 
 /** Identifies a pass-through layer to a backend (no retained geometry). */
 export interface PassThroughLayer {
@@ -77,7 +97,7 @@ export interface Backend {
    * `"replace-rest"` continues a chunked full repaint without clearing,
    * `"append"` draws on top (incremental).
    */
-  drawPassThrough?(name: string, batch: PointBatch, mode: "replace-first" | "replace-rest" | "append"): void;
+  drawPassThrough?(name: string, batch: DrawBatch, mode: "replace-first" | "replace-rest" | "append"): void;
   /** Snapshot current accumulation for snapshot-pan (called on interaction start). */
   snapshotPassThrough?(): void;
   /** True if this backend supports pass-through (canvas/webgl yes, svg no). */

@@ -2,7 +2,6 @@ import type { PointBatch } from "../core/index.js";
 import { packColor } from "./color.js";
 
 export type { PointBatch };
-export { packColor };
 
 export interface ProjectPointsOpts<D> {
   /** Project a datum to projected world coords, or null to cull it (off-globe / off-screen). */

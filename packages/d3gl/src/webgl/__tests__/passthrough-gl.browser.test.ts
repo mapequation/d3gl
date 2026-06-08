@@ -1,7 +1,7 @@
 import { describe, it, expect } from "vitest";
 import { luma } from "@luma.gl/core";
 import { webgl2Adapter } from "@luma.gl/webgl";
-import type { PointBatch } from "../../core/index.js";
+import type { DrawBatch } from "../../core/index.js";
 import { PassThroughGL } from "../passthrough-gl.js";
 
 const W = 64;
@@ -39,12 +39,15 @@ function batch(
   positions: number[],
   radii: number[],
   colors: number[],
-): PointBatch {
+): DrawBatch {
   return {
-    positions: new Float32Array(positions),
-    radii: new Float32Array(radii),
-    colors: new Uint8Array(colors),
-    count: radii.length,
+    points: {
+      positions: new Float32Array(positions),
+      radii: new Float32Array(radii),
+      colors: new Uint8Array(colors),
+      count: radii.length,
+    },
+    paths: null,
   };
 }
 

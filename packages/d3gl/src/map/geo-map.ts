@@ -2,7 +2,7 @@ import { type GeoProjection, geoEquirectangular } from "d3-geo";
 import { geoLayer, projectVisiblePoint } from "../geo/index.js";
 import { isOrthographic, rotationMatrix } from "../geo/orthographic.js";
 import versor, { type Angles, type Vec3, type Quaternion } from "../geo/versor.js";
-import { BaseEngine, type HoverHit, type LayerSpec, type PassThroughSpec } from "./base-engine.js";
+import { BaseEngine, type HoverHit, type LayerSpec } from "./base-engine.js";
 import type { BackendType } from "./backend-factory.js";
 import type { ViewTransform } from "../core/index.js";
 import { LayerHandle } from "./layer-handle.js";
@@ -86,21 +86,21 @@ export class GeoMap extends BaseEngine {
         typeof features === "function"
           ? () => [...(features as () => readonly F[])()]
           : [...(Array.isArray(features) ? (features as readonly F[]) : [features as F])];
+      const radius = opts.pointRadius ?? 3;
+      const colorOf = typeof opts.fill === "function"
+        ? (f: F, i: number) => (opts.fill as (f: F, i: number) => string)(f, i)
+        : () => (opts.fill as string | undefined) ?? "#000";
       this.registerPassThrough({
         name,
         source,
-        project: (f, i) => {
-          void i;
+        buildItem: (f, i) => {
           const geom = (f as { geometry?: GeoJSON.Geometry }).geometry;
           if (!geom || geom.type !== "Point") {
             throw new Error("passThrough supports only Point geometry in Phase 1");
           }
-          return projectVisiblePoint(this.projection, geom.coordinates as [number, number]);
+          const xy = projectVisiblePoint(this.projection, geom.coordinates as [number, number]);
+          return xy ? { kind: "points", centers: [xy], radius, color: colorOf(f as F, i) } : null;
         },
-        radius: opts.pointRadius ?? 3,
-        color: ((typeof opts.fill === "function")
-          ? (f, i) => (opts.fill as (f: F, i: number) => string)(f as F, i)
-          : (opts.fill ?? "#000")) as PassThroughSpec["color"],
         sizeMode: opts.sizeMode,
         clipTo: opts.clipTo,
       });

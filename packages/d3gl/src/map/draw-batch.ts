@@ -1,27 +1,7 @@
-import type { Subpath } from "../core/path-context.js";
-import type { PointBatch } from "../core/backend.js";
+import type { Subpath, PointBatch, DrawBatch, ProjectedPath, DrawItem } from "../core/index.js";
 import { packColor } from "./color.js";
 
-export type { Subpath, PointBatch };
-
-/** One projected path feature, ready to draw. Canvas draws natively; WebGL tessellates per frame. */
-export interface ProjectedPath {
-  subpaths: Subpath[];
-  fill: [number, number, number, number] | null;   // RGBA bytes; null = no fill
-  stroke: [number, number, number, number] | null; // RGBA bytes; null = no stroke
-  lineWidth: number;                                // 0 = no stroke geometry
-}
-
-/** Generalized transient pass-through payload (built per repaint, discarded). */
-export interface DrawBatch {
-  points: PointBatch | null;
-  paths: ProjectedPath[] | null;
-}
-
-/** What a PassThroughSpec yields per datum (generalizes the point-only project()). */
-export type DrawItem =
-  | { kind: "points"; centers: [number, number][]; radius: number; color: string }
-  | { kind: "path"; subpaths: Subpath[]; fill: string | null; stroke: string | null; lineWidth: number };
+export type { Subpath, PointBatch, DrawBatch, ProjectedPath, DrawItem };
 
 /**
  * Build a DrawBatch from user data and a per-datum builder function.

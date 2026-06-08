@@ -2,7 +2,7 @@ import { luma } from "@luma.gl/core";
 import { webgl2Adapter } from "@luma.gl/webgl";
 import type { Device, Framebuffer } from "@luma.gl/core";
 import type { Backend, RenderLayer, RenderDelta, ViewTransform } from "../core/index.js";
-import type { GroupBuffers, GroupBufferDelta, PassThroughLayer, PointBatch } from "../core/index.js";
+import type { GroupBuffers, GroupBufferDelta, PassThroughLayer, DrawBatch } from "../core/index.js";
 import { GroupRenderer } from "./renderer.js";
 import { clipFromView } from "./transform.js";
 import { toPNG } from "./png.js";
@@ -152,7 +152,7 @@ export class WebGLBackend implements Backend {
     }
   }
 
-  drawPassThrough(name: string, batch: PointBatch, mode: "replace-first" | "replace-rest" | "append"): void {
+  drawPassThrough(name: string, batch: DrawBatch, mode: "replace-first" | "replace-rest" | "append"): void {
     if (!this.pt) return;
     const clear = mode === "replace-first";
     this.pt.setScreenMode(this.ptScreen);
