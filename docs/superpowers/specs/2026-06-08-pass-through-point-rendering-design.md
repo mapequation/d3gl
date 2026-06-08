@@ -1,9 +1,11 @@
 # Pass-through rendering (points + GeoJSON)
 
 **Date:** 2026-06-08
-**Status:** Phase 1 implemented (engine plumbing + Canvas backend, points). Phases 2–4 (WebGL, generic geometry, docs + example) pending — see the plan at `docs/superpowers/plans/2026-06-08-pass-through-rendering.md`.
+**Status:** Phases 1–2 implemented (engine + Canvas + WebGL, points). Phases 3–4 (generic GeoJSON geometry, docs + example) pending — see the plans at `docs/superpowers/plans/2026-06-08-pass-through-rendering.md` and `docs/superpowers/plans/2026-06-08-pass-through-webgl-phase2.md`.
 
-> **Phase 1 done (2026-06-08):** `passThrough` option + callback data on `plot.points()` / `geoMap.layer()`; pure `projectPoints`/`PointBatch` builder; engine registration that bypasses `Scene` (zero retention) with defer/re-register-on-install; Canvas accumulate + snapshot-pan; time-sliced cancellable repaint; `pickable:false`; SVG rejects `passThrough`; `auto` mode stays on Canvas while pass-through layers exist (WebGL pass-through arrives in Phase 2). Verified: typecheck clean, 186 node tests, 96 browser tests green.
+> **Phase 1 done (2026-06-08):** `passThrough` option + callback data on `plot.points()` / `geoMap.layer()`; pure `projectPoints`/`PointBatch` builder; engine registration that bypasses `Scene` (zero retention) with defer/re-register-on-install; Canvas accumulate + snapshot-pan; time-sliced cancellable repaint; `pickable:false`; SVG rejects `passThrough`.
+>
+> **Phase 2 done (2026-06-08):** WebGL backend pass-through — per-layer offscreen accumulation FBO (O(pixels)), points quad-expanded into a reused O(chunk) scratch buffer with **color as a vertex attribute** (no per-drawable color texture → no WebGL texture cliff), composited over the retained map via a full-screen blit, snapshot-pan via the FBO-vs-view transform delta (base stays crisp). `auto` mode now upgrades Canvas→WebGL with pass-through layers intact. Verified: typecheck clean, 189 node tests, 107 browser tests green.
 
 > Scope note: the design is framed around points (the OOM case and cheapest
 > path), but the pipeline is **generic over all GeoJSON geometry** — see
