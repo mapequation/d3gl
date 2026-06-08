@@ -31,11 +31,15 @@ export interface LayerOptions<F = any> {
    *  Entry object per feature; use for huge, non-interactive layers (e.g. streamed points). */
   pickable?: boolean;
   /** Render via the backend's pass-through path: no retained Scene geometry, no hit
-   *  index (not pickable). Supports all GeoJSON geometry (Point/MultiPoint → analytic
-   *  circles; Polygon/Line/etc. → projected paths) — features are projected/recorded and
-   *  drawn directly each repaint, so `features` may be a callback re-invoked per repaint.
-   *  For huge, fast-changing datasets. NOTE: WebGL renders only points for now; polygon/line
-   *  pass-through paths render on the Canvas backend (WebGL path support is a follow-up). */
+   *  index (not pickable). Supports all GeoJSON geometry on **both** Canvas and WebGL
+   *  (Point/MultiPoint → analytic circles; Polygon/Line/etc. → projected paths) — features
+   *  are projected/recorded and drawn directly each repaint, so `features` may be a callback
+   *  re-invoked per repaint (you own the data). For huge / fast-changing datasets beyond the
+   *  retained ceiling (~4–16M). Trade-off vs the default retained path: retained is always
+   *  crisp, interactive, and pickable but capped; pass-through is uncapped + streaming but
+   *  shows a slightly stale raster during pan/zoom (re-crisp on settle), isn't pickable, and
+   *  re-tessellates non-point geometry per settle. Paths are world-mode (screen-mode paths
+   *  are a follow-up). */
   passThrough?: boolean;
 }
 

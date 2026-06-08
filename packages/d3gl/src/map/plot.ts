@@ -54,9 +54,13 @@ export interface PlotPointOptions<D = any> {
   /** When false, skip the CPU hit index (no hover/pick) — saves an Entry per point on
    *  huge non-interactive layers (e.g. streamed points). */
   pickable?: boolean;
-  /** Render via the backend's pass-through path: no retained Scene geometry, no hit
-   *  index (not pickable). Points are projected + drawn directly each repaint, so the
-   *  data may be a callback re-invoked per repaint. For huge, fast-changing point sets. */
+  /** Render via the backend's pass-through path: no retained Scene geometry, no hit index
+   *  (not pickable). Points are projected + drawn directly each repaint (on both Canvas and
+   *  WebGL), so the data may be a callback re-invoked per repaint (you own the array). For
+   *  huge / fast-changing point sets beyond the retained ceiling (~4–16M). Trade-off vs the
+   *  default retained path: retained is always crisp, interactive, and pickable but capped;
+   *  pass-through is uncapped + streaming but shows a slightly stale raster during pan/zoom
+   *  (re-crisp on settle) and isn't pickable. */
   passThrough?: boolean;
 }
 
