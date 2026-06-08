@@ -4,6 +4,9 @@ import { svgBody, svgFromLayers, viewTransform } from "./serialize.js";
 const SVG_NS = "http://www.w3.org/2000/svg";
 
 export class SvgBackend implements Backend {
+  /** SVG has no raster surface for pass-through; the engine rejects it before calling us. */
+  readonly supportsPassThrough = false;
+
   private layers: RenderLayer[] = [];
   private transform: ViewTransform = { k: 1, x: 0, y: 0 };
   private root: SVGSVGElement;

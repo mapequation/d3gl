@@ -47,6 +47,17 @@ const frames = (n: number): Promise<void> =>
     requestAnimationFrame(tick);
   });
 
+describe("passThrough SVG backend rejection", () => {
+  it("SVG backend throws when passThrough: true is registered after backend is ready", async () => {
+    const chart = plot(host(), { width: 200, height: 200, backend: "svg" });
+    await chart.whenReady();
+    expect(() =>
+      chart.points("pts", [{ x: 1, y: 1 }], { x: (d) => d.x, y: (d) => d.y, passThrough: true }),
+    ).toThrow(/passThrough/);
+    chart.destroy();
+  });
+});
+
 describe("passThrough public API", () => {
   it("plot.points(passThrough) returns a handle synchronously and creates no pickable retained layer", () => {
     const chart = plot(host(), { width: 200, height: 200, backend: "canvas" });
