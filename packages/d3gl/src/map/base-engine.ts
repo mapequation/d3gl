@@ -336,19 +336,43 @@ export abstract class BaseEngine {
     this.handle?.backend.setTransform(this.transform);
     this.render();
   }
-  private async swapBackend(type: BackendType): Promise<void> {
-    this.currentBackend = type;
-    const token = ++this.swapToken;
+  /**
+   * Post-swap hook: called after a backend SWAP completes (an existing handle was
+   * replaced) — NOT on the first install. Subclasses override to react to a change of
+   * the live backend (e.g. re-evaluate GPU-globe eligibility and re-dispatch interaction).
+   * Default: no-op.
+   */
+  protected onBackendSwapped(): void {}
+
+  /**
+   * Install `next` as the live backend (shared by swapBackend and the "auto" upgrade).
+   * Honors the swap-supersede / destroyed guards. Destroys + detaches the previous
+   * handle, pushes the current specs + transform, renders, and — only if it REPLACED an
+   * existing handle — fires onBackendSwapped(). The first install (old === null) does NOT
+   * notify, so it is safe to call synchronously during construction (before a subclass has
+   * finished initializing its own fields, e.g. GeoMap's projection).
+   */
+  private installBackend(next: BackendHandle, token: number, type: BackendType): void {
+    if (token !== this.swapToken || this.destroyed) {
+      next.backend.destroy();
+      if (next.element !== this.host) next.element.remove();
+      return;
+    }
     const old = this.handle;
-    const next = await createBackend(type, this.host, this.width, this.height);
-    // A newer swap superseded this one, or the engine was destroyed mid-flight:
-    // tear down the freshly created backend so it never orphans an element.
-    if (token !== this.swapToken || this.destroyed) { next.backend.destroy(); if (next.element !== this.host) next.element.remove(); return; }
     old?.backend.destroy();
     if (old && old.element !== this.host) old.element.remove();
     this.handle = next;
+    this.currentBackend = type;
     next.backend.setLayers(this.renderSpecs().map((s) => this.renderLayer(s)));
     next.backend.setTransform(this.transform);
     next.backend.render();
+    if (old) this.onBackendSwapped();
+  }
+
+  private async swapBackend(type: BackendType): Promise<void> {
+    this.currentBackend = type;
+    const token = ++this.swapToken;
+    const next = await createBackend(type, this.host, this.width, this.height);
+    this.installBackend(next, token, type);
   }
 }
