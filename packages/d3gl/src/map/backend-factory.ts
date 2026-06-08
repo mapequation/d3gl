@@ -3,7 +3,7 @@ import { CanvasBackend } from "../canvas/index.js";
 import { SvgBackend } from "../svg/index.js";
 import { WebGLBackend } from "../webgl/index.js";
 
-export type BackendType = "webgl" | "canvas" | "svg";
+export type BackendType = "webgl" | "canvas" | "svg" | "auto";
 
 export interface BackendHandle {
   backend: Backend;
@@ -17,6 +17,15 @@ function makeCanvas(host: HTMLElement, w: number, h: number): HTMLCanvasElement 
   canvas.style.display = "block";
   host.appendChild(canvas);
   return canvas;
+}
+
+/**
+ * Synchronously create a Canvas backend + its <canvas> element. Used by the engine's
+ * "auto" mode for an instant (non-async) first paint before the WebGL device is ready.
+ */
+export function createCanvasBackend(host: HTMLElement, width: number, height: number): BackendHandle {
+  const canvas = makeCanvas(host, width, height);
+  return { backend: new CanvasBackend(canvas, width, height), element: canvas };
 }
 
 export async function createBackend(type: BackendType, host: HTMLElement, width: number, height: number): Promise<BackendHandle> {
