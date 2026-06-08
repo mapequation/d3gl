@@ -104,6 +104,10 @@ export class GeoMap extends BaseEngine {
   }
 
   override setBackend(type: BackendType): this {
+    // Already live on this backend (e.g. "auto" finished upgrading to WebGL) → do nothing.
+    // Must short-circuit BEFORE disableInteraction, or we'd tear down the GPU globe (drop it
+    // to the flat fitted disc) and re-bake it — the visible flicker we're avoiding.
+    if (this.isCurrentBackend(type)) return this;
     this.disableInteraction();
     super.setBackend(type);
     // gpuGlobe re-eval + interaction re-dispatch now happen in onBackendSwapped(), once the

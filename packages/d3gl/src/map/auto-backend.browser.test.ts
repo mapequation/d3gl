@@ -123,4 +123,38 @@ describe("backend: \"auto\"", () => {
     map.destroy();
     host.remove();
   });
+
+  it("switching to \"webgl\" after the auto upgrade is inert — no canvas re-render, no globe teardown", async () => {
+    const host = document.createElement("div");
+    host.style.width = "200px"; host.style.height = "200px";
+    document.body.appendChild(host);
+
+    // Mirrors the Map-projections example: orthographic globe under "auto".
+    const map = geoMap(host, { width: 200, height: 200, projection: geoOrthographic().scale(90).translate([100, 100]), backend: "auto" });
+    map.layer("ocean", [{ type: "Sphere" }], { fill: "rgb(212,230,245)" });
+    map.layer("land", [sqPoly(0, 0, 30)], { fill: "rgb(0,120,0)", id: () => "L" });
+    map.enableZoom([1, 8]);
+    await map.whenReady();
+    await upgradeOf(map);
+    expect(liveBackend(map)).toBe("webgl");
+    expect((map as unknown as { gpuGlobe: boolean }).gpuGlobe).toBe(true);
+
+    // The live backend is already WebGL. Selecting "webgl" must do nothing: no new backend
+    // (same <canvas> element, swapToken unchanged) and the GPU globe must NOT be torn down
+    // (the bug: disableInteraction drops the globe to the large flat disc, then re-bakes —
+    // the visible canvas→webgl flicker).
+    const canvasBefore = host.querySelector("canvas");
+    const swapTokenBefore = (map as unknown as { swapToken: number }).swapToken;
+
+    map.setBackend("webgl");
+    await map.whenReady();
+
+    expect(host.querySelector("canvas")).toBe(canvasBefore);     // same element — no swap
+    expect((map as unknown as { swapToken: number }).swapToken).toBe(swapTokenBefore); // no swap kicked off
+    expect(liveBackend(map)).toBe("webgl");
+    expect((map as unknown as { gpuGlobe: boolean }).gpuGlobe).toBe(true); // globe still active
+
+    map.destroy();
+    host.remove();
+  });
 });

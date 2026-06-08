@@ -46,6 +46,9 @@ export abstract class BaseEngine {
   /** "auto" mode only: the WebGL upgrade promise (in-flight, then settled). Null until
    *  enterAutoMode() starts the upgrade; not reset afterwards. */
   private upgradeDone: Promise<void> | null = null;
+  /** True only while the background "auto" → WebGL upgrade is in flight. Gates the
+   *  same-backend no-op in setBackend so a backend pick during the upgrade still swaps. */
+  private upgrading = false;
   /** True while the user is interacting (a rotation drag, or a zoom/pan gesture).
    *  Layers flagged hideOnInteraction are excluded from the render while this is true. */
   protected interacting = false;
@@ -169,7 +172,16 @@ export abstract class BaseEngine {
     this.pushLayers();
     return this;
   }
+  /** True when `type` names the backend already live — so switching to it would be pure
+   *  churn (recreate the same backend, re-push, re-render). Notably, once "auto" has
+   *  upgraded to WebGL the live backend IS "webgl", so an explicit setBackend("webgl") is a
+   *  no-op. Excludes "auto" (always an action) and the in-flight upgrade window (where the
+   *  live "canvas" is about to become "webgl", so a pick must still take effect). */
+  protected isCurrentBackend(type: BackendType): boolean {
+    return type !== "auto" && type === this.currentBackend && !this.upgrading;
+  }
   setBackend(type: BackendType): this {
+    if (this.isCurrentBackend(type)) return this; // already live on this backend — no churn
     if (type === "auto") { this.ready = Promise.resolve(); this.enterAutoMode(); }
     else this.ready = this.swapBackend(type);
     return this;
@@ -406,16 +418,23 @@ export abstract class BaseEngine {
 
   /** Background upgrade: create the WebGL device, then swap it in via installBackend (which
    *  destroys the canvas handle and fires onBackendSwapped, since it replaces a live handle).
-   *  On failure, keep the canvas and warn — the map keeps working. */
+   *  On failure, keep the canvas and warn — the map keeps working. While in flight, `upgrading`
+   *  is true so a same-type setBackend isn't treated as a no-op (a "canvas" pick during the
+   *  window must still cancel the upgrade via the normal swap's token bump). */
   private async upgradeToWebGL(): Promise<void> {
-    const token = ++this.swapToken;
-    let next: BackendHandle;
+    this.upgrading = true;
     try {
-      next = await this.createWebGLBackend();
-    } catch (err) {
-      if (!this.destroyed) console.warn("d3gl: WebGL upgrade failed, staying on canvas", err);
-      return;
+      const token = ++this.swapToken;
+      let next: BackendHandle;
+      try {
+        next = await this.createWebGLBackend();
+      } catch (err) {
+        if (!this.destroyed) console.warn("d3gl: WebGL upgrade failed, staying on canvas", err);
+        return;
+      }
+      this.installBackend(next, token, "webgl");
+    } finally {
+      this.upgrading = false;
     }
-    this.installBackend(next, token, "webgl");
   }
 }
