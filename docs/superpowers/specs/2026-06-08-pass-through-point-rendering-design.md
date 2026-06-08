@@ -1,7 +1,12 @@
-# Pass-through point rendering
+# Pass-through rendering (points + GeoJSON)
 
 **Date:** 2026-06-08
 **Status:** Design approved, ready for implementation plan
+
+> Scope note: the design is framed around points (the OOM case and cheapest
+> path), but the pipeline is **generic over all GeoJSON geometry** — see
+> "Generic geometry pipeline" below. Points are the primary, validated-first
+> case; polygons/lines ride the same path with a documented per-settle cost.
 
 ## Problem
 
@@ -69,7 +74,9 @@ for (const batch of csvBatches) {
 ```
 
 Same accessors (`x`/`y`/`radius`/`fill`), same handle. `passThrough` is the only
-new concept.
+new concept. The same flag and data-callback form apply to the generic GeoJSON
+`chart.layer(name, featuresOrCallback, { passThrough: true })` — any geometry
+type, one API.
 
 ### Two distinct draw operations
 
@@ -108,6 +115,35 @@ d3gl's per-point retained memory is **zero**.
 - **Per-point color is a vertex/instance attribute, not a texture-table lookup.**
   This removes the per-drawable color-texture growth that is the WebGL-specific
   multi-GB cliff.
+
+### Generic geometry pipeline (points + polygons + lines)
+
+Pass-through is **not** a points-only code path. The pipeline is *"pull → build
+geometry → draw → discard"*, and the only thing that differs from standard mode
+is **discard instead of retain**. The geometry builders (`tessellateFill`,
+`expandStroke`, `PathRecorder`) and the render shaders **already exist and are
+geometry-polymorphic**; pass-through feeds them from **transient, chunked,
+discarded** buffers into the accumulation buffer rather than from retained
+`GrowBuffer`s. Designing it points-only would create a special case that later
+has to be unwound — so the pipeline is generic from the start.
+
+What this buys (uniformly across geometry types):
+
+- **Color baked into vertex attributes for every type.** Because we rebuild each
+  repaint anyway, per-feature color is written into the vertex/instance data, so
+  there is **no per-drawable color texture at all** — this kills the WebGL
+  texture cliff for points, polygons, and lines alike.
+- **Reuse of the existing pass split.** WebGL draws points via the **instanced**
+  fast-path and polygons/lines via **indexed-mesh** draws (the same fill/stroke
+  shaders standard mode uses) — just sourced from transient buffers into the FBO.
+  Canvas uses `ctx.arc` for points and `Path2D`/path fill+stroke for
+  polygons/lines.
+
+The honest cost: **non-point geometry re-tessellates/re-expands on each repaint**
+(at pan/zoom *settle*, time-sliced — not every frame). Polygons/lines still get
+the memory win (no retained meshes), but carry a heavier per-settle cost than
+points. Points remain the cheap, primary case; heavy polygon sets are a
+"memory-bound, accept the settle cost" use case.
 
 ### Interaction — snapshot-pan (Google-Maps style)
 
@@ -208,7 +244,7 @@ model does not apply and 1M nodes is infeasible. With the `auto` backend,
 | Ceiling before OOM | ~6–7M | ~4M | user-array bound (250M+) | user-array bound (250M+) |
 | Crisp during pan | n/a (janky) | **yes** | no (soft until settle) | no (soft until settle) |
 | Picking | yes | yes | no | no |
-| Geometry | all | all | points/multipoints (v1) | points/multipoints (v1) |
+| Geometry | all | all | all (points cheap; polys re-tessellate/settle) | all (points cheap; polys re-tessellate/settle) |
 
 ## When to use which
 
@@ -226,8 +262,8 @@ model does not apply and 1M nodes is infeasible. With the `auto` backend,
   on canvas + WebGL.
 - Cons: soft/stale raster during pan (crisp only after settle); every transform
   change triggers an O(n) repaint (time-sliced/progressive, not frozen); no
-  picking; points/multipoints only (v1); the user must own and retain the raw
-  data.
+  picking; non-point geometry re-tessellates per settle (heavier redraw); the
+  user must own and retain the raw data.
 - **Use when** rendering huge point clouds (millions–tens of millions) or
   streaming/live data, where brief pan softness and re-render-on-settle are
   acceptable and picking is not needed.
@@ -237,11 +273,14 @@ streaming but a stale raster during gestures.**
 
 ## Scope decisions
 
-- **Geometry: points + multipoints in v1.** The architecture generalizes to any
-  layer, but polygons/lines need per-frame tessellation/stroke-expansion
-  (expensive every repaint). Ship points first — that is the OOM case — and
-  leave heavier geometry as a documented follow-up rather than pretend it is
-  free.
+- **Geometry: generic over all GeoJSON; points validated first.** The pipeline
+  is geometry-polymorphic (see "Generic geometry pipeline") — points, polygons,
+  and lines all ride the same pull→build→draw→discard path reusing the existing
+  builders and shaders. Points are implemented and benchmarked first (the OOM
+  case and cheapest path); polygons/lines are supported through the same code
+  with a documented **per-settle re-tessellation cost** (memory win, heavier
+  redraw). This generic-from-the-start framing is deliberate, to keep one unified
+  pipeline rather than a points-only special case that must later be unwound.
 - **`pickable: false` for pass-through.** Hit-testing needs an O(N) spatial index
   = retention again. Pass-through layers are not pickable; callers needing
   picking hit-test against their own data (as bioregions did).
