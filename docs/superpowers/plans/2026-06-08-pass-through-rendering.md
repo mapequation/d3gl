@@ -29,10 +29,10 @@ Phases 2–4 are scoped at the end. Write each as its own detailed plan after th
 
 The spec says WebGL points are drawn **instanced**. The codebase has **zero instancing**; points are quad-expanded (4 verts/circle) at upload via proven code. Phase 2 will **reuse quad-expansion fed from transient/chunked/discarded buffers, with per-point color written as a per-vertex attribute** (4 copies/point in a throwaway buffer). This satisfies the two real requirements — no retained per-point storage, and no per-drawable color texture (the WebGL cliff) — without the risk of new instancing code. Instancing is a documented later optimization.
 
-## ⚠️ Testing note (read before running tests)
+## Testing note (read before running tests)
 
-- Node/CPU tests run via the **root** config: `npx vitest run <path>` (include glob `packages/*/src/**/*.test.ts`, `environment: node`).
-- **Browser tests (`*.browser.test.ts`) hang in the Claude Code sandbox** — run them **locally** with `pnpm --filter @mapequation/d3gl test:browser` (or `npx vitest run --config packages/d3gl/vitest.config.ts <path>`). The agent should write them but tell the user to run them locally and report results.
+- **Node/CPU tests** run via the **root** config: `npx vitest run <path>` (include glob `packages/*/src/**/*.test.ts`, `environment: node`).
+- **Browser tests** (`*.browser.test.{ts,tsx}`) run via the package's watchdog runner: `pnpm --filter @mapequation/d3gl test:browser <file-relative-to-package>` (headless Chromium + Playwright; a full run is ~25s). Positional args are forwarded to Vitest, so you can target a single file. These are part of TDD here — write them, run them, watch them fail then pass, exactly like node tests.
 - The memory bench (`point-memory.bench.test.ts`) is skipped unless `BENCH_MEM=1`.
 
 ---
@@ -498,7 +498,7 @@ git commit -m "feat(map): passThrough option + callback data on layer()/points()
 
 In `setTransform(t)`: when `this.ptSnapshot` exists (we're mid-gesture), composite it transformed instead of redrawing points — draw base layers, then `drawImage` the snapshot scaled/translated by the delta from `ptSnapshot.transform` to `t`. On a non-interacting transform / settle the engine calls `drawPassThrough(..., "replace-first")`, which clears `ptSnapshot` (`this.ptSnapshot = null`).
 
-- [ ] **Step 4: Browser test (run locally)**
+- [ ] **Step 4: Write the failing browser test**
 
 ```ts
 // packages/d3gl/src/map/passthrough.browser.test.ts
@@ -525,10 +525,10 @@ describe("canvas pass-through", () => {
 });
 ```
 
-- [ ] **Step 5: Run browser test (LOCAL ONLY — hangs in sandbox)**
+- [ ] **Step 5: Run the browser test (fails first, then passes after Steps 1–3)**
 
-Run (ask the user to run): `pnpm --filter @mapequation/d3gl test:browser packages/d3gl/src/map/passthrough.browser.test.ts`
-Expected: PASS.
+Run: `pnpm --filter @mapequation/d3gl test:browser src/map/passthrough.browser.test.ts`
+Expected: PASS once `drawPassThrough` is implemented (FAIL before).
 
 - [ ] **Step 6: Commit**
 
@@ -574,11 +574,12 @@ Spread a large `replace` repaint across animation frames so the main thread neve
 
 (A new interaction / repaint bumps `ptRepaintToken`, abandoning the in-flight loop. `setInteracting(true)` should also bump it so a gesture cancels a running fill-in.)
 
-- [ ] **Step 2: Browser test — large dataset doesn't block + fills in (run locally)**
+- [ ] **Step 2: Browser test — large dataset doesn't block + fills in**
 
-Add a test that pushes e.g. 1.2M points, calls render, and asserts the call returns within a frame budget and pixels eventually appear after rAF flushes. (Use `vi.useFakeTimers`/rAF flush helpers as the repo does, or poll.)
+Add a test that pushes e.g. 1.2M points, calls render, asserts the synchronous `render()` call returns well under a frame budget (the first chunk only), then drives `requestAnimationFrame` until pixels appear in a later region (the fill-in completed). Run it:
+`pnpm --filter @mapequation/d3gl test:browser src/map/passthrough.browser.test.ts` → PASS.
 
-- [ ] **Step 3: Run locally + commit**
+- [ ] **Step 3: Commit**
 
 ```bash
 git add packages/d3gl/src/map/base-engine.ts packages/d3gl/src/map/passthrough.browser.test.ts
@@ -604,7 +605,9 @@ git commit -m "feat(map): time-sliced pass-through repaint with cancellation"
   });
 ```
 
-- [ ] **Step 2: Run locally + commit**
+- [ ] **Step 2: Run the browser test + commit**
+
+Run: `pnpm --filter @mapequation/d3gl test:browser src/map/passthrough.browser.test.ts` → PASS.
 
 ```bash
 git add packages/d3gl/src/svg/svg-backend.ts packages/d3gl/src/map/passthrough.browser.test.ts
@@ -617,7 +620,7 @@ git commit -m "feat(svg): throw on passThrough; enforce pickable:false"
 
 - [ ] **Step 1: Full node suite** — `npx vitest run` → all pass (browser excluded).
 - [ ] **Step 2: Typecheck** — `pnpm --filter @mapequation/d3gl exec tsc -b` → clean.
-- [ ] **Step 3: Browser suite (LOCAL)** — ask the user to run `pnpm --filter @mapequation/d3gl test:browser` and report.
+- [ ] **Step 3: Full browser suite** — `pnpm --filter @mapequation/d3gl test:browser` → all pass (incl. the new pass-through suite).
 - [ ] **Step 4: Update the spec status** — mark Phase 1 done in the spec doc; commit.
 
 ---
