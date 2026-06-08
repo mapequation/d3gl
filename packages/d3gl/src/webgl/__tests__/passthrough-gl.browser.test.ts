@@ -126,6 +126,33 @@ describe("PassThroughGL", () => {
     device.destroy();
   });
 
+  it("screen mode keeps a constant pixel radius (no zoom scaling); world mode scales", async () => {
+    const { device, target } = await setup();
+    // World mode (default) at 2x zoom: a radius-4 point at (8,8) maps to screen (16,16)
+    // and grows to ~8px, so a pixel ~6px out from the centre is still inside.
+    const world = new PassThroughGL(device, W, H);
+    world.draw(batch([8, 8], [4], [255, 0, 0, 255]), { k: 2, x: 0, y: 0 }, true);
+    composite(device, target, world, { k: 2, x: 0, y: 0 }, { k: 2, x: 0, y: 0 });
+    const worldEdge = pixel(device, target, 16 + 6, 16);
+    expect(worldEdge[0]).toBeGreaterThan(150); // world radius scaled up → still painted
+    world.destroy();
+
+    // Screen mode: same point, same zoom — radius stays 4px, so 6px out is OUTSIDE.
+    const t2 = device.createFramebuffer({ width: W, height: H, colorAttachments: ["rgba8unorm"] });
+    const screen = new PassThroughGL(device, W, H);
+    screen.setScreenMode(true);
+    screen.draw(batch([8, 8], [4], [255, 0, 0, 255]), { k: 2, x: 0, y: 0 }, true);
+    composite(device, t2, screen, { k: 2, x: 0, y: 0 }, { k: 2, x: 0, y: 0 });
+    const screenCenter = pixel(device, t2, 16, 16);
+    expect(screenCenter[0]).toBeGreaterThan(200); // centre still painted (constant radius)
+    const screenEdge = pixel(device, t2, 16 + 6, 16);
+    expect(screenEdge[3]).toBeLessThan(60);        // 6px out is outside the 4px radius
+    screen.destroy();
+    t2.destroy();
+    target.destroy();
+    device.destroy();
+  });
+
   it("offsets the accumulated layer via the blit delta (snapshot-pan)", async () => {
     const { device, target } = await setup();
     const pt = new PassThroughGL(device, W, H);

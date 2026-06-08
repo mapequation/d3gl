@@ -2,12 +2,13 @@ import { luma } from "@luma.gl/core";
 import { webgl2Adapter } from "@luma.gl/webgl";
 import type { Device, Framebuffer } from "@luma.gl/core";
 import type { Backend, RenderLayer, RenderDelta, ViewTransform } from "../core/index.js";
-import type { GroupBuffers, GroupBufferDelta } from "../core/index.js";
+import type { GroupBuffers, GroupBufferDelta, PassThroughLayer, PointBatch } from "../core/index.js";
 import { GroupRenderer } from "./renderer.js";
 import { clipFromView } from "./transform.js";
 import { toPNG } from "./png.js";
 import { svgFromLayers } from "../svg/index.js";
 import { GlobeRenderer } from "./globe.js";
+import { PassThroughGL } from "./passthrough-gl.js";
 
 export interface WebGLBackendOptions {
   width: number;
@@ -15,6 +16,7 @@ export interface WebGLBackendOptions {
 }
 
 export class WebGLBackend implements Backend {
+  readonly supportsPassThrough = true;
   private renderers = new Map<string, GroupRenderer>();
   private layers = new Map<string, RenderLayer>();
   private order: string[] = [];
@@ -24,6 +26,12 @@ export class WebGLBackend implements Backend {
   private bakeDirty = true;
   private bakeW = 2048;
   private bakeH = 1024;
+  /** Pass-through accumulation surface (lazily created when the first PT layer registers). */
+  private pt: PassThroughGL | null = null;
+  /** Registered pass-through layer names; the composite is gated on this being non-empty. */
+  private ptNames = new Set<string>();
+  /** sizeMode of the active PT layer: true ⇒ screen (constant px), false ⇒ world. */
+  private ptScreen = false;
 
   private constructor(
     private readonly device: Device,
@@ -130,6 +138,39 @@ export class WebGLBackend implements Backend {
     this.render();
   }
 
+  setPassThroughLayer(layer: PassThroughLayer): void {
+    this.ptNames.add(layer.name);
+    this.pt ??= new PassThroughGL(this.device, this.width, this.height);
+    this.ptScreen = layer.sizeMode === "screen";
+  }
+
+  removePassThroughLayer(name: string): void {
+    this.ptNames.delete(name);
+    if (this.ptNames.size === 0) {
+      this.pt?.destroy();
+      this.pt = null;
+    }
+  }
+
+  drawPassThrough(name: string, batch: PointBatch, mode: "replace-first" | "replace-rest" | "append"): void {
+    if (!this.pt) return;
+    const clear = mode === "replace-first";
+    this.pt.setScreenMode(this.ptScreen);
+    // PassThroughGL records its fboTransform internally on a clear (replace-first).
+    this.pt.draw(batch, this.viewTransform, clear);
+    // The engine does NOT render() after drawPassThrough (mirrors appendToLayer); render now
+    // so the freshly accumulated points are composited to screen.
+    this.render();
+  }
+
+  /**
+   * No-op for WebGL: the accumulation FBO persists across gestures and
+   * `PassThroughGL.fboTransform` already records the reference transform (set on the last
+   * clear), so the composite blit can offset it during a pan with no extra snapshot. (The
+   * canvas backend, by contrast, must copy the canvas here because it has no retained FBO.)
+   */
+  snapshotPassThrough(): void {}
+
   setTransform(t: ViewTransform): void {
     this.viewTransform = t;
     this.clipMatrix = clipFromView(t, this.width, this.height);
@@ -212,6 +253,20 @@ export class WebGLBackend implements Backend {
     }
     pass.end();
     this.device.submit();
+
+    // Pass-through composite: blit the accumulation FBO onto the SAME target in a second
+    // render pass that PRESERVES the retained pixels just drawn (clearColor:false = no
+    // load-clear, confirmed luma semantics). During interaction this.viewTransform differs
+    // from the FBO's reference transform, so the blit applies the snapshot-pan delta while
+    // the retained base above is re-rendered crisp at the current transform. This shared
+    // drawInto path also runs for toPNG()/readPixel() (offscreen target), so PNG export
+    // gets the pass-through points for free.
+    if (this.pt && this.ptNames.size > 0) {
+      const pass2 = this.device.beginRenderPass({ framebuffer, clearColor: false });
+      this.pt.composite(pass2, this.pt.fboTransform ?? this.viewTransform, this.viewTransform);
+      pass2.end();
+      this.device.submit();
+    }
   }
 
   toPNG(): string {
@@ -254,6 +309,9 @@ export class WebGLBackend implements Backend {
     this.order = [];
     this.globe?.destroy();
     this.globe = null;
+    this.pt?.destroy();
+    this.pt = null;
+    this.ptNames.clear();
     this.offscreen.destroy();
     this.device.destroy();
   }

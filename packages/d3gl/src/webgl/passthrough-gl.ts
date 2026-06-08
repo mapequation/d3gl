@@ -215,6 +215,15 @@ export class PassThroughGL {
   }
 
   /**
+   * Select the point sizing mode for subsequent draws: `true` = screen mode (constant
+   * pixel radius, no zoom scaling), `false` = world mode (radius scales with k). Mutates
+   * the shared point uniforms in place, so the next `draw` picks it up.
+   */
+  setScreenMode(on: boolean): void {
+    this.pointUniforms["u_pointScreen"] = on ? 1 : 0;
+  }
+
+  /**
    * Rasterize `batch` into the accumulation FBO at `transform`. When `clear` is true the
    * FBO is cleared first (start of a full repaint) and the reference transform is recorded;
    * when false the previous FBO contents are PRESERVED and this batch is drawn ON TOP
