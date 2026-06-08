@@ -1,11 +1,11 @@
 import { describe, it, expect, afterEach } from "vitest";
 import { geoEquirectangular } from "d3-geo";
-import type { PassThroughLayer, PointBatch } from "../core/index.js";
+import type { PassThroughLayer, DrawBatch } from "../core/index.js";
 import { CanvasBackend } from "../canvas/canvas-backend.js";
 import { BaseEngine } from "./base-engine.js";
 import { plot, Plot } from "./plot.js";
 import type { PlotOptions } from "./plot.js";
-import { geoMap } from "./geo-map.js";
+import { geoMap, GeoMap } from "./geo-map.js";
 import { LayerHandle } from "./layer-handle.js";
 import { createCanvasBackend, type BackendHandle } from "./backend-factory.js";
 import type { ViewTransform } from "../core/index.js";
@@ -16,7 +16,8 @@ import type { WebGLBackend } from "../webgl/webgl-backend.js";
 //   - the public-API surface (handles return synchronously; pass-through layers are NOT pickable),
 //   - the canvas backend actually draws pass-through points on top of the retained base,
 //   - handle.append() draws incrementally on top (first point stays, second appears),
-//   - non-Point geometry under passThrough still throws on projection,
+//   - non-Point geometry under passThrough no longer throws (Phase 3 lifted the Point-only guard),
+//     and the canvas backend fills polygons + strokes lines (a separate geometry suite),
 //   - snapshot-pan: a frozen raster blits under the delta transform during a gesture.
 // (The canvas backend now declares supportsPassThrough, so the old "not supported" assertion is gone.)
 //
@@ -158,12 +159,98 @@ describe("passThrough rendering (canvas backend)", () => {
     chart.destroy();
   });
 
-  it("non-Point geometry under passThrough throws on projection", async () => {
+  it("non-Point geometry under passThrough no longer throws (Phase 3 lifts the guard)", async () => {
     const map = geoMap(host(), { width: 200, height: 200, projection: proj(), backend: "canvas" });
-    // Registration defers (no backend live yet); the backend install replays it, and the repaint
-    // that projects the Polygon throws — surfacing via whenReady().
-    map.layer("bad", [polygon()], { fill: "red", passThrough: true });
-    await expect(map.whenReady()).rejects.toThrow(/passThrough supports only Point geometry in Phase 1/);
+    // Registration defers (no backend live yet); the backend install replays it and the repaint
+    // projects + records the Polygon. The Phase-1 Point-only throw is gone.
+    map.layer("poly", [polygon()], { fill: "red", passThrough: true });
+    await expect(map.whenReady()).resolves.toBeUndefined();
+    map.destroy();
+  });
+});
+
+describe("passThrough geometry rendering (canvas backend)", () => {
+  // geo-map is where GeoJSON geometry lives; the equirectangular proj() maps [lon,lat] to
+  // pixels as x = 100 + lon, y = 100 - lat (scale 50 → 1°≈0.87px; here we keep it simple by
+  // computing through the projection). We assert real getImageData pixels on the canvas backend.
+  const project = (lon: number, lat: number): [number, number] => {
+    const p = proj()([lon, lat])!;
+    return [p[0], p[1]];
+  };
+  // A big CLOCKWISE-wound polygon (clockwise in [lon,lat] fills its interior; CCW fills the
+  // whole map — see AGENTS.md winding note). Spans lon 0..20, lat 0..20.
+  const bigPolygon = (): GeoJSON.Feature => ({
+    type: "Feature",
+    properties: {},
+    geometry: { type: "Polygon", coordinates: [[[0, 20], [20, 20], [20, 0], [0, 0], [0, 20]]] },
+  });
+  const polygon2 = (): GeoJSON.Feature => ({
+    type: "Feature",
+    properties: {},
+    geometry: { type: "Polygon", coordinates: [[[-30, -5], [-10, -5], [-10, -25], [-30, -25], [-30, -5]]] },
+  });
+  // A line along the equator: the geodesic between two equatorial points IS the equator,
+  // so it projects to a straight horizontal line (no great-circle bow to chase in pixels).
+  const line = (): GeoJSON.Feature => ({
+    type: "Feature",
+    properties: {},
+    geometry: { type: "LineString", coordinates: [[-40, 0], [40, 0]] },
+  });
+
+  it("renders a filled Polygon: inside reads the fill color, outside is background", async () => {
+    const h = host();
+    const map = geoMap(h, { width: 200, height: 200, projection: proj(), backend: "canvas" });
+    map.layer("poly", [bigPolygon()], { fill: "rgb(0,200,0)", passThrough: true });
+    await map.whenReady();
+    const ctx = canvasOf(h).getContext("2d")!;
+    // Centroid at lon 10, lat 10.
+    const [cx, cy] = project(10, 10);
+    const inside = at(ctx, Math.round(cx), Math.round(cy));
+    expect(inside[1]!).toBeGreaterThan(150); // green fill inside
+    expect(inside[3]!).toBeGreaterThan(180); // opaque
+    // Well outside the polygon (lon -50, lat -40 → far corner).
+    const [ox, oy] = project(-50, -40);
+    expect(at(ctx, Math.round(ox), Math.round(oy))[3]!).toBe(0);
+    map.destroy();
+  });
+
+  it("renders a LineString stroke: a pixel on the line reads the stroke color", async () => {
+    const h = host();
+    const map = geoMap(h, { width: 200, height: 200, projection: proj(), backend: "canvas" });
+    map.layer("line", [line()], { stroke: "rgb(0,0,255)", lineWidth: 4, passThrough: true });
+    await map.whenReady();
+    const ctx = canvasOf(h).getContext("2d")!;
+    // Midpoint of the line at lon 0, lat 0 (the equator → no projected bow).
+    const [mx, my] = project(0, 0);
+    const px = at(ctx, Math.round(mx), Math.round(my));
+    expect(px[2]!).toBeGreaterThan(150); // blue stroke
+    expect(px[3]!).toBeGreaterThan(120); // present
+    map.destroy();
+  });
+
+  it("handle.append() adds another polygon incrementally (first remains)", async () => {
+    const h = host();
+    const map = geoMap(h, { width: 200, height: 200, projection: proj(), backend: "canvas" });
+    const handle = map.layer("poly", [bigPolygon()], { fill: "rgb(0,200,0)", passThrough: true });
+    await map.whenReady();
+    const ctx = canvasOf(h).getContext("2d")!;
+    const [c1x, c1y] = project(10, 10);
+    expect(at(ctx, Math.round(c1x), Math.round(c1y))[1]!).toBeGreaterThan(150); // first polygon
+
+    handle.append([polygon2()]); // incremental draw-on-top
+    const [c2x, c2y] = project(-20, -15); // centroid of polygon2
+    expect(at(ctx, Math.round(c2x), Math.round(c2y))[1]!).toBeGreaterThan(150); // second appeared
+    expect(at(ctx, Math.round(c1x), Math.round(c1y))[1]!).toBeGreaterThan(150); // first still there
+    map.destroy();
+  });
+
+  it("a geometry pass-through layer is NOT pickable", async () => {
+    const h = host();
+    const map = geoMap(h, { width: 200, height: 200, projection: proj(), backend: "canvas" });
+    map.layer("poly", [bigPolygon()], { fill: "rgb(0,200,0)", passThrough: true });
+    await map.whenReady();
+    const [cx, cy] = project(10, 10);
+    expect(map.pick(Math.round(cx), Math.round(cy))).toBe(null); // drawn, but no hit index
     map.destroy();
   });
 });
@@ -253,11 +340,14 @@ describe("passThrough snapshot-pan (canvas backend, direct)", () => {
   // (setInteracting → snapshotPassThrough; setTransform during a gesture → render) is the
   // same call sequence exercised here. End-to-end gesture simulation is covered manually / Task 9.
   const layer: PassThroughLayer = { name: "pts" };
-  const batchAt = (x: number, y: number, r: number): PointBatch => ({
-    positions: new Float32Array([x, y]),
-    radii: new Float32Array([r]),
-    colors: new Uint8Array([255, 0, 0, 255]),
-    count: 1,
+  const batchAt = (x: number, y: number, r: number): DrawBatch => ({
+    points: {
+      positions: new Float32Array([x, y]),
+      radii: new Float32Array([r]),
+      colors: new Uint8Array([255, 0, 0, 255]),
+      count: 1,
+    },
+    paths: null,
   });
 
   it("blits the frozen raster under a pan delta, then a settle-repaint draws crisp again", () => {
@@ -304,16 +394,18 @@ describe("passThrough snapshot-pan (canvas backend, direct)", () => {
   });
 });
 
-describe('passThrough "auto" backend upgrade guard (Phase 1: WebGL has no PT)', () => {
-  // The "auto" backend starts on Canvas then upgrades to WebGL in the background. WebGL has no
-  // pass-through support in Phase 1. Without the guard, the upgrade would destroy the canvas
+describe('passThrough "auto" backend upgrade guard (unsupported upgrade target)', () => {
+  // The "auto" backend starts on Canvas then upgrades to WebGL in the background. The real WebGL
+  // backend now supports pass-through (Phase 2+), so a real upgrade carries the layers over — see
+  // the "real upgrade to WebGL" test above. This block instead covers the DEFENSIVE guard for an
+  // upgrade target that LACKS pass-through support: without it, the upgrade would destroy the canvas
   // (losing the PT raster) and THROW at installBackend's unsupported-backend check (an unhandled
   // rejection, plus the points vanish). The fix aborts the upgrade and stays on canvas.
   //
-  // We drive the upgrade deterministically by stubbing createWebGLBackend (the protected test
-  // seam) to return a backend whose supportsPassThrough is falsy — exactly like the real WebGL
-  // backend — without spinning up a real GPU device (flaky in headless browsers). The subclass
-  // exposes the private upgradeDone promise so the test can await the upgrade window precisely.
+  // We drive this deterministically by stubbing createWebGLBackend (the protected test seam) to
+  // return a backend whose supportsPassThrough is forced falsy — UNLIKE the real WebGL backend,
+  // purely to exercise the guard without depending on a hypothetical unsupported backend. The
+  // subclass exposes the private upgradeDone promise so the test can await the upgrade window.
   class StubPlot extends Plot {
     stubbedWebGL: BackendHandle | null = null;
     constructor(host: HTMLElement, opts: PlotOptions) { super(host, opts); }
@@ -444,6 +536,90 @@ describe('passThrough "auto" backend real upgrade to WebGL (Phase 2: WebGL has P
   });
 });
 
+/**
+ * A real-WebGL GeoMap exposing the same screenPixel() seam as GLPlot, so geo polygon/line
+ * pass-through can be asserted against real GPU pixels read off the WebGL canvas.
+ */
+class GLGeoMap extends GeoMap {
+  private gl(): WebGLBackend {
+    return (this as unknown as { backend(): WebGLBackend | null }).backend()!;
+  }
+  liveBackendType(): string {
+    return (this as unknown as { backendType(): string }).backendType();
+  }
+  screenPixel(x: number, y: number): number[] {
+    return this.gl().readScreenPixel(x, y);
+  }
+  // Same seam as GLPlot.awaitUpgrade(): "auto" whenReady() resolves at the canvas paint while
+  // the background canvas → WebGL upgrade is still in flight; this awaits that upgrade precisely.
+  awaitUpgrade(): Promise<void> {
+    return (this as unknown as { upgradeDone: Promise<void> | null }).upgradeDone ?? Promise.resolve();
+  }
+}
+
+describe("passThrough geometry rendering (webgl backend)", () => {
+  // Mirrors the canvas Task-3 geometry suite but on a real WebGL device: polygons fill and
+  // lines stroke into the accumulation FBO (world mode), read back as real GPU pixels.
+  const project = (lon: number, lat: number): [number, number] => {
+    const p = proj()([lon, lat])!;
+    return [p[0], p[1]];
+  };
+  const bigPolygon = (): GeoJSON.Feature => ({
+    type: "Feature",
+    properties: {},
+    geometry: { type: "Polygon", coordinates: [[[0, 20], [20, 20], [20, 0], [0, 0], [0, 20]]] },
+  });
+  const polygon2 = (): GeoJSON.Feature => ({
+    type: "Feature",
+    properties: {},
+    geometry: { type: "Polygon", coordinates: [[[-30, -5], [-10, -5], [-10, -25], [-30, -25], [-30, -5]]] },
+  });
+  const line = (): GeoJSON.Feature => ({
+    type: "Feature",
+    properties: {},
+    geometry: { type: "LineString", coordinates: [[-40, 0], [40, 0]] },
+  });
+
+  it("rasterizes a filled Polygon: inside reads the fill color", async () => {
+    const map = new GLGeoMap(host(), { width: 200, height: 200, projection: proj(), backend: "webgl" });
+    map.layer("poly", [bigPolygon()], { fill: "rgb(0,200,0)", passThrough: true });
+    await map.whenReady();
+    expect(map.liveBackendType()).toBe("webgl");
+    const [cx, cy] = project(10, 10); // centroid
+    const inside = map.screenPixel(Math.round(cx), Math.round(cy));
+    expect(inside[1]!).toBeGreaterThan(150); // green fill inside
+    expect(inside[3]!).toBeGreaterThan(180); // opaque
+    const [ox, oy] = project(-50, -40);
+    expect(map.screenPixel(Math.round(ox), Math.round(oy))[3]!).toBeLessThan(40); // empty outside
+    map.destroy();
+  });
+
+  it("rasterizes a LineString stroke: a pixel on the line reads the stroke color", async () => {
+    const map = new GLGeoMap(host(), { width: 200, height: 200, projection: proj(), backend: "webgl" });
+    map.layer("line", [line()], { stroke: "rgb(0,0,255)", lineWidth: 4, passThrough: true });
+    await map.whenReady();
+    const [mx, my] = project(0, 0); // midpoint on the equator
+    const px = map.screenPixel(Math.round(mx), Math.round(my));
+    expect(px[2]!).toBeGreaterThan(150); // blue stroke
+    expect(px[3]!).toBeGreaterThan(120); // present
+    map.destroy();
+  });
+
+  it("handle.append() adds another polygon incrementally (first remains)", async () => {
+    const map = new GLGeoMap(host(), { width: 200, height: 200, projection: proj(), backend: "webgl" });
+    const handle = map.layer("poly", [bigPolygon()], { fill: "rgb(0,200,0)", passThrough: true });
+    await map.whenReady();
+    const [c1x, c1y] = project(10, 10);
+    expect(map.screenPixel(Math.round(c1x), Math.round(c1y))[1]!).toBeGreaterThan(150); // first
+
+    handle.append([polygon2()]); // incremental draw-on-top (FBO accumulation)
+    const [c2x, c2y] = project(-20, -15); // centroid of polygon2
+    expect(map.screenPixel(Math.round(c2x), Math.round(c2y))[1]!).toBeGreaterThan(150); // second appeared
+    expect(map.screenPixel(Math.round(c1x), Math.round(c1y))[1]!).toBeGreaterThan(150); // first still there
+    map.destroy();
+  });
+});
+
 describe("passThrough rendering (webgl backend)", () => {
   it("draws a pass-through point at its projected screen location", async () => {
     const h = host();
@@ -509,5 +685,213 @@ describe("passThrough rendering (webgl backend)", () => {
     // After settle the old pre-pan pixel must be cleared (re-rasterize replaces; not composited on top).
     expect(chart.screenPixel(50, 50)[0]!).toBeLessThan(60);     // original location cleared
     chart.destroy();
+  });
+});
+
+// ── Phase 3 INTEGRATION ──────────────────────────────────────────────────────
+// End-to-end proof of the UNIFIED pipeline: one pass-through layer carrying MIXED
+// GeoJSON geometry (Point + Polygon + LineString) flows through one buildBatch →
+// DrawBatch{points, paths} → drawPassThrough on BOTH backends, and the "auto"
+// upgrade keeps polygon/line pass-through (the points-only WebGL gap that existed
+// mid-phase is closed). Real pixels, no mocks.
+//
+// Shared mixed FeatureCollection: three distinct-colour geometries at well-separated
+// projected locations so each kind can be probed independently.
+//   - filled Polygon  (green) spanning lon 0..20, lat 0..20 → centroid (10,10)
+//   - LineString      (blue)  along the equator lon -40..40, lat 0 → midpoint (0,0)
+//   - Point           (red)   at lon -30, lat 30 (top-left quadrant, clear of both)
+// The polygon is CLOCKWISE-wound in [lon,lat] (CCW fills the whole map — AGENTS.md).
+const mixedProject = (lon: number, lat: number): [number, number] => {
+  const p = proj()([lon, lat])!;
+  return [p[0], p[1]];
+};
+const mixedPolygon = (): GeoJSON.Feature => ({
+  type: "Feature",
+  properties: {},
+  geometry: { type: "Polygon", coordinates: [[[0, 20], [20, 20], [20, 0], [0, 0], [0, 20]]] },
+});
+const mixedLine = (): GeoJSON.Feature => ({
+  type: "Feature",
+  properties: {},
+  geometry: { type: "LineString", coordinates: [[-40, 0], [40, 0]] },
+});
+const mixedPoint = (): GeoJSON.Feature => ({
+  type: "Feature",
+  properties: {},
+  geometry: { type: "Point", coordinates: [-30, 30] },
+});
+// Per-feature colours resolved by the accessors below (geo layer style accessors
+// receive the feature, so one layer can carry three kinds in three colours).
+const mixedFill = (f: GeoJSON.Feature): string =>
+  f.geometry.type === "Polygon" ? "rgb(0,200,0)" : "rgb(255,0,0)"; // polygon green, point red
+const mixedStroke = (): string => "rgb(0,0,255)"; // line blue
+
+describe("passThrough mixed-geometry integration (both backends)", () => {
+  it("canvas: one pass-through layer renders Point + Polygon + LineString at their projected spots", async () => {
+    const h = host();
+    const map = geoMap(h, { width: 200, height: 200, projection: proj(), backend: "canvas" });
+    map.layer("mixed", [mixedPolygon(), mixedLine(), mixedPoint()], {
+      fill: mixedFill,
+      stroke: mixedStroke,
+      lineWidth: 4,
+      pointRadius: 6,
+      passThrough: true,
+    });
+    await map.whenReady();
+    const ctx = canvasOf(h).getContext("2d")!;
+
+    // Polygon: centroid reads green fill.
+    const [px, py] = mixedProject(10, 10);
+    const poly = at(ctx, Math.round(px), Math.round(py));
+    expect(poly[1]!).toBeGreaterThan(150); // green
+    expect(poly[3]!).toBeGreaterThan(180); // opaque
+
+    // Line: equator midpoint reads blue stroke.
+    const [lx, ly] = mixedProject(0, 0);
+    const ln = at(ctx, Math.round(lx), Math.round(ly));
+    expect(ln[2]!).toBeGreaterThan(150); // blue
+    expect(ln[3]!).toBeGreaterThan(120); // present
+
+    // Point: its projected location reads red.
+    const [ptx, pty] = mixedProject(-30, 30);
+    const pt = at(ctx, Math.round(ptx), Math.round(pty));
+    expect(pt[0]!).toBeGreaterThan(180); // red
+    expect(pt[3]!).toBeGreaterThan(180); // opaque
+
+    // Background well clear of all three is empty.
+    const [ox, oy] = mixedProject(-50, -40);
+    expect(at(ctx, Math.round(ox), Math.round(oy))[3]!).toBe(0);
+    map.destroy();
+  });
+
+  it("webgl: one pass-through layer renders Point + Polygon + LineString at their projected spots", async () => {
+    const map = new GLGeoMap(host(), { width: 200, height: 200, projection: proj(), backend: "webgl" });
+    map.layer("mixed", [mixedPolygon(), mixedLine(), mixedPoint()], {
+      fill: mixedFill,
+      stroke: mixedStroke,
+      lineWidth: 4,
+      pointRadius: 6,
+      passThrough: true,
+    });
+    await map.whenReady();
+    expect(map.liveBackendType()).toBe("webgl");
+
+    // Polygon: centroid reads green fill (tessellated into the accumulation FBO).
+    const [px, py] = mixedProject(10, 10);
+    const poly = map.screenPixel(Math.round(px), Math.round(py));
+    expect(poly[1]!).toBeGreaterThan(150); // green
+    expect(poly[3]!).toBeGreaterThan(180); // opaque
+
+    // Line: equator midpoint reads blue stroke.
+    const [lx, ly] = mixedProject(0, 0);
+    const ln = map.screenPixel(Math.round(lx), Math.round(ly));
+    expect(ln[2]!).toBeGreaterThan(150); // blue
+    expect(ln[3]!).toBeGreaterThan(120); // present
+
+    // Point: its projected location reads red (rasterized into the same FBO).
+    const [ptx, pty] = mixedProject(-30, 30);
+    const pt = map.screenPixel(Math.round(ptx), Math.round(pty));
+    expect(pt[0]!).toBeGreaterThan(180); // red
+    expect(pt[3]!).toBeGreaterThan(180); // opaque
+
+    // Background well clear of all three is empty.
+    const [ox, oy] = mixedProject(-50, -40);
+    expect(map.screenPixel(Math.round(ox), Math.round(oy))[3]!).toBeLessThan(40);
+    map.destroy();
+  });
+});
+
+describe('passThrough "auto" upgrade keeps polygon/line pass-through (regression)', () => {
+  // The mid-phase WebGL gap: auto upgraded canvas→WebGL but the WebGL backend only
+  // handled pass-through POINTS, so polygons/lines vanished on upgrade. Phase 3 routes
+  // all geometry through one buildBatch/DrawBatch pipeline; the upgrade re-registers +
+  // repaints the FULL batch (points AND paths) onto WebGL. This is the regression guard.
+  it("auto: a pass-through Polygon (+ line, + point) survives the real canvas → WebGL upgrade", async () => {
+    const map = new GLGeoMap(host(), { width: 200, height: 200, projection: proj(), backend: "auto" });
+    // Registered on the synchronous canvas first paint, BEFORE the background upgrade settles.
+    map.layer("mixed", [mixedPolygon(), mixedLine(), mixedPoint()], {
+      fill: mixedFill,
+      stroke: mixedStroke,
+      lineWidth: 4,
+      pointRadius: 6,
+      passThrough: true,
+    });
+    await map.whenReady(); // canvas first paint (upgrade still in flight)
+
+    // Drive the REAL background WebGL upgrade to completion.
+    await expect(map.awaitUpgrade()).resolves.toBeUndefined();
+
+    // (a) the live backend committed to WebGL.
+    expect(map.liveBackendType()).toBe("webgl");
+
+    // (b) the Polygon is STILL rendered after the upgrade (the closed gap), read back as
+    //     real GPU pixels off the now-WebGL-backed canvas.
+    const [px, py] = mixedProject(10, 10);
+    const poly = map.screenPixel(Math.round(px), Math.round(py));
+    expect(poly[1]!).toBeGreaterThan(150); // green polygon fill survived
+    expect(poly[3]!).toBeGreaterThan(180); // opaque
+
+    // The line and point survived too (full mixed batch re-rendered, not points-only).
+    const [lx, ly] = mixedProject(0, 0);
+    expect(map.screenPixel(Math.round(lx), Math.round(ly))[2]!).toBeGreaterThan(150); // blue line
+    const [ptx, pty] = mixedProject(-30, 30);
+    expect(map.screenPixel(Math.round(ptx), Math.round(pty))[0]!).toBeGreaterThan(180); // red point
+    map.destroy();
+  });
+});
+
+describe("passThrough append mixed geometry (engine path)", () => {
+  // The incremental appendPassThrough → buildBatch → drawPassThrough(...,"append") path
+  // must handle a geometry kind DIFFERENT from the initial layer: start with a Point layer,
+  // append a Polygon. Both must end up rendered (the original is not cleared by the append).
+  it("canvas: start with a Point, append a Polygon — both render", async () => {
+    const h = host();
+    const map = geoMap(h, { width: 200, height: 200, projection: proj(), backend: "canvas" });
+    const handle = map.layer("mixed", [mixedPoint()], {
+      fill: mixedFill,
+      stroke: mixedStroke,
+      lineWidth: 4,
+      pointRadius: 6,
+      passThrough: true,
+    });
+    await map.whenReady();
+    const ctx = canvasOf(h).getContext("2d")!;
+
+    // Original point drew.
+    const [ptx, pty] = mixedProject(-30, 30);
+    expect(at(ctx, Math.round(ptx), Math.round(pty))[0]!).toBeGreaterThan(180); // red point
+
+    // Append a Polygon through the engine (different geometry kind than the layer started with).
+    handle.append([mixedPolygon()]);
+
+    // Appended polygon appears...
+    const [px, py] = mixedProject(10, 10);
+    expect(at(ctx, Math.round(px), Math.round(py))[1]!).toBeGreaterThan(150); // green polygon
+    // ...and the original point is still there (append draws on top, no clear).
+    expect(at(ctx, Math.round(ptx), Math.round(pty))[0]!).toBeGreaterThan(180);
+    map.destroy();
+  });
+
+  it("webgl: start with a Point, append a Polygon — both render (FBO accumulation)", async () => {
+    const map = new GLGeoMap(host(), { width: 200, height: 200, projection: proj(), backend: "webgl" });
+    const handle = map.layer("mixed", [mixedPoint()], {
+      fill: mixedFill,
+      stroke: mixedStroke,
+      lineWidth: 4,
+      pointRadius: 6,
+      passThrough: true,
+    });
+    await map.whenReady();
+    expect(map.liveBackendType()).toBe("webgl");
+
+    const [ptx, pty] = mixedProject(-30, 30);
+    expect(map.screenPixel(Math.round(ptx), Math.round(pty))[0]!).toBeGreaterThan(180); // red point
+
+    handle.append([mixedPolygon()]); // "append" mode → tessellated polygon composited onto the FBO
+
+    const [px, py] = mixedProject(10, 10);
+    expect(map.screenPixel(Math.round(px), Math.round(py))[1]!).toBeGreaterThan(150); // green polygon
+    expect(map.screenPixel(Math.round(ptx), Math.round(pty))[0]!).toBeGreaterThan(180); // point still there
+    map.destroy();
   });
 });

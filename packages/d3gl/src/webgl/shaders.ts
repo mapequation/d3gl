@@ -153,6 +153,21 @@ void main() {
   gl_Position = vec4(c.xy + off, 0.0, 1.0);
 }`;
 
+// PT_MESH_VS — pass-through fill/stroke meshes. Both fill triangles and expanded-stroke
+// triangles are just colored geometry, so they share this shader: project the world-space
+// vertex through u_transform (world mode — stroke width scales with zoom, matching Canvas)
+// and pass the per-vertex baked color straight through. Pairs with FILL_FS (fragColor=v_color).
+export const PT_MESH_VS = `#version 300 es
+precision highp float;
+uniform mat3 u_transform;
+in vec2 a_position;
+in vec4 a_color;
+out vec4 v_color;
+void main() {
+  v_color = a_color;
+  gl_Position = vec4((u_transform * vec3(a_position, 1.0)).xy, 0.0, 1.0);
+}`;
+
 // BLIT_VS / BLIT_FS — composite a texture (the pass-through accumulation FBO) to the
 // screen as a full-screen textured quad. u_blit is a mat3 transform applied in clip
 // space, used during snapshot-pan to offset the accumulated layer without re-rendering.

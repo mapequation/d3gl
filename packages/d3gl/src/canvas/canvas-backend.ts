@@ -1,4 +1,4 @@
-import type { Backend, RenderLayer, RenderDelta, ViewTransform, DrawableVector, PassThroughLayer, PointBatch } from "../core/index.js";
+import type { Backend, RenderLayer, RenderDelta, ViewTransform, DrawableVector, PassThroughLayer, PointBatch, DrawBatch, ProjectedPath } from "../core/index.js";
 import { svgFromLayers } from "../svg/index.js";
 
 const css = (c: readonly [number, number, number, number]) => `rgba(${c[0]}, ${c[1]}, ${c[2]}, ${(c[3] / 255).toFixed(4)})`;
@@ -131,12 +131,13 @@ export class CanvasBackend implements Backend {
    *   continuing a chunked repaint, or an incremental add.
    * (Single-batch draw; Task 7 time-slices large batches. No color grouping — YAGNI.)
    */
-  drawPassThrough(name: string, batch: PointBatch, mode: "replace-first" | "replace-rest" | "append"): void {
+  drawPassThrough(name: string, batch: DrawBatch, mode: "replace-first" | "replace-rest" | "append"): void {
     if (mode === "replace-first") {
       this.ptSnapshot = null;       // a fresh repaint supersedes any in-flight snapshot-pan
       this.render();                // clears + redraws the retained base map
     }
-    this.drawPtBatch(name, batch);
+    if (batch.points) this.drawPtBatch(name, batch.points);
+    if (batch.paths) this.drawPathBatch(name, batch.paths);
   }
 
   /** Capture the current canvas + transform so render() can snapshot-pan during a gesture. */
@@ -167,6 +168,32 @@ export class CanvasBackend implements Backend {
       ctx.beginPath();
       ctx.arc(sx, sy, r, 0, 2 * Math.PI);
       ctx.fill();
+    }
+    ctx.restore();
+  }
+
+  /** Draw projected path features (Polygon/Line/etc.) for a pass-through layer. World mode
+   *  (the common case) mirrors the retained world path in drawShapes: scale the context by k
+   *  and trace world coords, so a point drawn via drawPtBatch (sx = t.k*x + t.x) lands at the
+   *  same screen location as a path vertex. Stroke width is the reference lineWidth (scaled
+   *  with zoom by the context, matching retained world strokes). Screen-mode PT paths are a
+   *  follow-up; world mode is what geo polygon/line pass-through needs today. */
+  private drawPathBatch(_name: string, paths: readonly ProjectedPath[]): void {
+    const { ctx } = this;
+    const t = this.transform;
+    ctx.save();
+    ctx.setTransform(t.k, 0, 0, t.k, t.x, t.y);
+    for (const p of paths) {
+      const path = new Path2D();
+      for (const s of p.subpaths) {
+        const pts = s.points;
+        if (pts.length < 2) continue;
+        path.moveTo(pts[0]!, pts[1]!);
+        for (let i = 2; i < pts.length; i += 2) path.lineTo(pts[i]!, pts[i + 1]!);
+        if (s.closed) path.closePath();
+      }
+      if (p.fill) { ctx.fillStyle = css(p.fill); ctx.fill(path); }
+      if (p.stroke && p.lineWidth > 0) { ctx.strokeStyle = css(p.stroke); ctx.lineWidth = p.lineWidth; ctx.stroke(path); }
     }
     ctx.restore();
   }

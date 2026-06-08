@@ -1,5 +1,5 @@
 import type { GroupBuilder, PathContext } from "../core/index.js";
-import { BaseEngine, type PassThroughSpec } from "./base-engine.js";
+import { BaseEngine } from "./base-engine.js";
 import type { BackendType } from "./backend-factory.js";
 import { LayerHandle } from "./layer-handle.js";
 
@@ -73,17 +73,22 @@ export class Plot extends BaseEngine {
   points<D>(name: string, data: readonly D[] | (() => readonly D[]), opts: PlotPointOptions<D>): LayerHandle<D> {
     if (opts.passThrough) {
       const radius = opts.radius ?? 3;
+      const radiusOf = typeof radius === "function"
+        ? (d: D, i: number) => (radius as (d: D, i: number) => number)(d, i)
+        : () => radius as number;
+      const colorOf = typeof opts.fill === "function"
+        ? (d: D, i: number) => (opts.fill as (d: D, i: number) => string)(d, i)
+        : () => (opts.fill as string | undefined) ?? "#000";
       this.registerPassThrough({
         name,
         source: (typeof data === "function" ? () => [...data()] : [...data]) as unknown[] | (() => unknown[]),
         // plot x/y accessors yield projected world coords directly (view transform applied at draw)
-        project: (d, i) => [opts.x(d as D, i), opts.y(d as D, i)],
-        radius: typeof radius === "function"
-          ? (d, i) => (radius as (d: D, i: number) => number)(d as D, i)
-          : (radius as number),
-        color: ((typeof opts.fill === "function")
-          ? (d, i) => (opts.fill as (d: D, i: number) => string)(d as D, i)
-          : (opts.fill ?? "#000")) as PassThroughSpec["color"],
+        buildItem: (d, i) => ({
+          kind: "points",
+          centers: [[opts.x(d as D, i), opts.y(d as D, i)]],
+          radius: radiusOf(d as D, i),
+          color: colorOf(d as D, i),
+        }),
         sizeMode: opts.sizeMode,
         clipTo: opts.clipTo,
       });

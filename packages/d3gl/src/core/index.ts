@@ -26,5 +26,5 @@ export { expandStroke } from "./stroke.js";
 export type { StrokeGeometry } from "./stroke.js";
 export { Scene } from "./scene.js";
 export type { GroupBuffers, GroupBufferDelta, GroupBuilder, DrawableRange, DrawableOpts, DrawableVector } from "./scene.js";
-export type { Backend, RenderLayer, RenderDelta, ViewTransform, PointBatch, PassThroughLayer } from "./backend.js";
+export type { Backend, RenderLayer, RenderDelta, ViewTransform, PointBatch, PassThroughLayer, DrawBatch, ProjectedPath, DrawItem } from "./backend.js";
 export { HitIndex } from "./hit-test.js";

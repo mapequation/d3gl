@@ -1,5 +1,5 @@
-import { rgb } from "d3-color";
 import type { PointBatch } from "../core/index.js";
+import { packColor } from "./color.js";
 
 export type { PointBatch };
 
@@ -10,11 +10,6 @@ export interface ProjectPointsOpts<D> {
   radius: number | ((d: D, i: number) => number);
   /** CSS color per point. Constant or per-datum. */
   color: string | ((d: D, i: number) => string);
-}
-
-/** Clamp to a 0–255 byte (CSS clamps out-of-range channels; Uint8Array would wrap). */
-function toByte(v: number): number {
-  return Math.max(0, Math.min(255, Math.round(v)));
 }
 
 /**
@@ -35,14 +30,12 @@ export function projectPoints<D>(data: readonly D[], opts: ProjectPointsOpts<D>)
     positions[count * 2] = p[0];
     positions[count * 2 + 1] = p[1];
     radii[count] = radiusFn(data[i]!, i);
-    const cs = colorFn(data[i]!, i);
-    const c = rgb(cs);
-    if (Number.isNaN(c.r)) throw new Error(`invalid color: ${cs}`);
+    const [r, g, b, a] = packColor(colorFn(data[i]!, i));
     const off = count * 4;
-    colors[off] = toByte(c.r);
-    colors[off + 1] = toByte(c.g);
-    colors[off + 2] = toByte(c.b);
-    colors[off + 3] = toByte((Number.isNaN(c.opacity) ? 1 : c.opacity) * 255);
+    colors[off] = r;
+    colors[off + 1] = g;
+    colors[off + 2] = b;
+    colors[off + 3] = a;
     count++;
   }
   return {

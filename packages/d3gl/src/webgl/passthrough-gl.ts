@@ -1,9 +1,12 @@
 import { Buffer } from "@luma.gl/core";
 import type { Device, Framebuffer, RenderPass } from "@luma.gl/core";
 import { Model } from "@luma.gl/engine";
-import type { PointBatch, ViewTransform } from "../core/index.js";
+import type { PointBatch, DrawBatch, ProjectedPath, ViewTransform } from "../core/index.js";
+import { groupRings } from "../core/rings.js";
+import { tessellateFill } from "../core/tessellate.js";
+import { expandStroke } from "../core/stroke.js";
 import { GrowBuffer } from "./renderer.js";
-import { PT_POINT_VS, POINT_FS, BLIT_VS, BLIT_FS } from "./shaders.js";
+import { PT_POINT_VS, POINT_FS, PT_MESH_VS, FILL_FS, BLIT_VS, BLIT_FS } from "./shaders.js";
 import { clipFromView, blitMatrix } from "./transform.js";
 
 const identity3 = (): Float32Array => new Float32Array([1, 0, 0, 0, 1, 0, 0, 0, 1]);
@@ -28,6 +31,16 @@ const PT_POINT_LAYOUT = [
   { name: "a_center", format: "float32x2" as const },
   { name: "a_corner", format: "float32x2" as const },
   { name: "a_radius", format: "float32" as const },
+  { name: "a_color", format: "unorm8x4" as const },
+];
+
+/**
+ * Vertex layout for pass-through fill/stroke meshes: world-space position + a per-vertex
+ * baked color. Color uses the same Uint32 → unorm8x4 packing as the point quads (GrowBuffer
+ * backs Float32Array | Uint32Array only), so one packed uint32 per vertex is read as vec4.
+ */
+const PT_MESH_LAYOUT = [
+  { name: "a_position", format: "float32x2" as const },
   { name: "a_color", format: "unorm8x4" as const },
 ];
 
@@ -107,6 +120,77 @@ function expand(batch: PointBatch, vertexBase: number): Expanded {
   return { center, corner, radius, color, index };
 }
 
+/** Mesh geometry built from all paths in a batch: positions, packed colors, rebased indices. */
+interface MeshBuild {
+  position: Float32Array;
+  /** Packed RGBA, one uint32 per vertex (read as unorm8x4 vec4). */
+  color: Uint32Array;
+  index: Uint32Array;
+}
+
+/**
+ * Build the fill and stroke triangle meshes for a batch's paths.
+ *
+ * Mirrors the retained path in core/scene.ts addDrawable: closed subpaths → groupRings →
+ * tessellateFill for fills; expandStroke per subpath for strokes. Colors are baked per-vertex
+ * (each path's fill/stroke RGBA, packed to uint32). Indices from each tessellation/stroke are
+ * rebased by the running vertex base so multiple paths concatenate into one mesh per draw call.
+ */
+function buildMeshes(paths: ProjectedPath[]): { fill: MeshBuild; stroke: MeshBuild } {
+  const fillPos: number[] = [];
+  const fillColor: number[] = [];
+  const fillIndex: number[] = [];
+  const strokePos: number[] = [];
+  const strokeColor: number[] = [];
+  const strokeIndex: number[] = [];
+
+  for (const p of paths) {
+    if (p.fill) {
+      const closed = p.subpaths.filter((s) => s.closed && s.points.length >= 6);
+      if (closed.length) {
+        const rings = groupRings(closed);
+        const fg = tessellateFill(
+          rings.map((r) => r.outer),
+          rings.map((r) => r.holes),
+        );
+        const base = fillPos.length / 2;
+        const packed = packRGBA(p.fill[0], p.fill[1], p.fill[2], p.fill[3]);
+        for (let i = 0; i < fg.vertices.length; i += 2) {
+          fillPos.push(fg.vertices[i]!, fg.vertices[i + 1]!);
+          fillColor.push(packed);
+        }
+        for (const idx of fg.indices) fillIndex.push(base + idx);
+      }
+    }
+    if (p.stroke && p.lineWidth > 0) {
+      const packed = packRGBA(p.stroke[0], p.stroke[1], p.stroke[2], p.stroke[3]);
+      for (const sp of p.subpaths) {
+        const sg = expandStroke(sp, p.lineWidth);
+        if (!sg.indices.length) continue;
+        const base = strokePos.length / 2;
+        for (let i = 0; i < sg.vertices.length; i += 2) {
+          strokePos.push(sg.vertices[i]!, sg.vertices[i + 1]!);
+          strokeColor.push(packed);
+        }
+        for (const idx of sg.indices) strokeIndex.push(base + idx);
+      }
+    }
+  }
+
+  return {
+    fill: {
+      position: new Float32Array(fillPos),
+      color: new Uint32Array(fillColor),
+      index: new Uint32Array(fillIndex),
+    },
+    stroke: {
+      position: new Float32Array(strokePos),
+      color: new Uint32Array(strokeColor),
+      index: new Uint32Array(strokeIndex),
+    },
+  };
+}
+
 /**
  * One pass-through accumulation surface: rasterizes point batches into an offscreen
  * RGBA8 FBO (the accumulation buffer) and composites that FBO onto a caller-supplied
@@ -120,6 +204,8 @@ function expand(batch: PointBatch, vertexBase: number): Expanded {
 export class PassThroughGL {
   private fbo: Framebuffer;
   private pointModel: Model;
+  private fillModel: Model;
+  private strokeModel: Model;
   private blitModel: Model;
   /** Scratch grow-buffers refilled per draw (geometry is transient, never retained CPU-side). */
   private center: GrowBuffer;
@@ -127,12 +213,22 @@ export class PassThroughGL {
   private radius: GrowBuffer;
   private color: GrowBuffer;
   private index: GrowBuffer;
+  /** Scratch grow-buffers for the per-batch fill triangle mesh (position + packed color + index). */
+  private fillPos: GrowBuffer;
+  private fillColor: GrowBuffer;
+  private fillIndex: GrowBuffer;
+  /** Scratch grow-buffers for the per-batch stroke triangle mesh. */
+  private strokePos: GrowBuffer;
+  private strokeColor: GrowBuffer;
+  private strokeIndex: GrowBuffer;
   /** Static full-screen quad buffers for the blit. */
   private blitPos: Buffer;
   private blitUv: Buffer;
   private blitIndex: Buffer;
   /** Shared uniforms so a mutate-in-place is picked up on the next draw. */
   private pointUniforms: Record<string, unknown>;
+  private fillUniforms: Record<string, unknown>;
+  private strokeUniforms: Record<string, unknown>;
   private blitUniforms: Record<string, unknown>;
   /** The view transform the FBO contents were rasterized at (set on the last clear). */
   private fboRef: ViewTransform | null = null;
@@ -173,6 +269,40 @@ export class PassThroughGL {
       indexBuffer: this.index.buffer,
       topology: "triangle-list" as const,
       uniforms: this.pointUniforms,
+      parameters: BLEND,
+      vertexCount: 0,
+    });
+
+    // Fill + stroke mesh scratch buffers (position float32x2, color unorm8x4 via uint32, index).
+    this.fillPos = new GrowBuffer(device, Float32Array, new Float32Array(0));
+    this.fillColor = new GrowBuffer(device, Uint32Array, new Uint32Array(0));
+    this.fillIndex = new GrowBuffer(device, Uint32Array, new Uint32Array(0), true);
+    this.strokePos = new GrowBuffer(device, Float32Array, new Float32Array(0));
+    this.strokeColor = new GrowBuffer(device, Uint32Array, new Uint32Array(0));
+    this.strokeIndex = new GrowBuffer(device, Uint32Array, new Uint32Array(0), true);
+
+    this.fillUniforms = { u_transform: clipFromView({ k: 1, x: 0, y: 0 }, width, height) };
+    this.fillModel = new Model(device, {
+      vs: PT_MESH_VS,
+      fs: FILL_FS,
+      bufferLayout: PT_MESH_LAYOUT,
+      attributes: { a_position: this.fillPos.buffer, a_color: this.fillColor.buffer },
+      indexBuffer: this.fillIndex.buffer,
+      topology: "triangle-list" as const,
+      uniforms: this.fillUniforms,
+      parameters: BLEND,
+      vertexCount: 0,
+    });
+
+    this.strokeUniforms = { u_transform: clipFromView({ k: 1, x: 0, y: 0 }, width, height) };
+    this.strokeModel = new Model(device, {
+      vs: PT_MESH_VS,
+      fs: FILL_FS,
+      bufferLayout: PT_MESH_LAYOUT,
+      attributes: { a_position: this.strokePos.buffer, a_color: this.strokeColor.buffer },
+      indexBuffer: this.strokeIndex.buffer,
+      topology: "triangle-list" as const,
+      uniforms: this.strokeUniforms,
       parameters: BLEND,
       vertexCount: 0,
     });
@@ -233,8 +363,12 @@ export class PassThroughGL {
    * refilled, vertex base 0), so a draw is O(batch), not O(total) — earlier batches live
    * only in the FBO. This is why the clearColor:false preserve below is load-bearing.
    */
-  draw(batch: PointBatch, transform: ViewTransform, clear: boolean): void {
-    const e = expand(batch, 0);
+  draw(batch: DrawBatch, transform: ViewTransform, clear: boolean): void {
+    const points: PointBatch =
+      batch.points && batch.points.count
+        ? batch.points
+        : { positions: new Float32Array(0), radii: new Float32Array(0), colors: new Uint8Array(0), count: 0 };
+    const e = expand(points, 0);
     // Reset so the scratch buffers are overwritten from the start with only this batch.
     this.center.reset();
     this.corner.reset();
@@ -259,14 +393,52 @@ export class PassThroughGL {
       this.pointModel.setIndexBuffer(this.index.buffer);
     }
     this.pointModel.setVertexCount(this.index.length);
-    this.pointUniforms["u_transform"] = clipFromView(transform, this.width, this.height);
+    const u_transform = clipFromView(transform, this.width, this.height);
+    this.pointUniforms["u_transform"] = u_transform;
+
+    // Build the fill/stroke meshes for this batch's paths (reset + refill, vertex base 0 —
+    // geometry is per-batch; accumulation is the FBO's job). Re-tessellated each repaint.
+    const meshes = buildMeshes(batch.paths ?? []);
+    this.fillPos.reset();
+    this.fillColor.reset();
+    this.fillIndex.reset();
+    this.strokePos.reset();
+    this.strokeColor.reset();
+    this.strokeIndex.reset();
+    const fillRealloc = [
+      this.fillPos.append(meshes.fill.position),
+      this.fillColor.append(meshes.fill.color),
+      this.fillIndex.append(meshes.fill.index),
+    ].reduce((a, b) => a || b, false);
+    if (fillRealloc) {
+      this.fillModel.setAttributes({ a_position: this.fillPos.buffer, a_color: this.fillColor.buffer });
+      this.fillModel.setIndexBuffer(this.fillIndex.buffer);
+    }
+    this.fillModel.setVertexCount(this.fillIndex.length);
+    this.fillUniforms["u_transform"] = u_transform;
+
+    const strokeRealloc = [
+      this.strokePos.append(meshes.stroke.position),
+      this.strokeColor.append(meshes.stroke.color),
+      this.strokeIndex.append(meshes.stroke.index),
+    ].reduce((a, b) => a || b, false);
+    if (strokeRealloc) {
+      this.strokeModel.setAttributes({ a_position: this.strokePos.buffer, a_color: this.strokeColor.buffer });
+      this.strokeModel.setIndexBuffer(this.strokeIndex.buffer);
+    }
+    this.strokeModel.setVertexCount(this.strokeIndex.length);
+    this.strokeUniforms["u_transform"] = u_transform;
 
     // clear===false preserves the existing FBO contents (clearColor:false → no load-clear),
     // so successive draws accumulate. clear===true wipes to transparent first.
+    // Z-order within the batch: fill under stroke under points (sensible visual layering;
+    // separate FBO accumulation across draws is unaffected).
     const pass = this.device.beginRenderPass({
       framebuffer: this.fbo,
       clearColor: clear ? [0, 0, 0, 0] : false,
     });
+    if (this.fillIndex.length) this.fillModel.draw(pass);
+    if (this.strokeIndex.length) this.strokeModel.draw(pass);
     this.pointModel.draw(pass);
     pass.end();
     this.device.submit();
@@ -292,10 +464,18 @@ export class PassThroughGL {
     this.radius.destroy();
     this.color.destroy();
     this.index.destroy();
+    this.fillPos.destroy();
+    this.fillColor.destroy();
+    this.fillIndex.destroy();
+    this.strokePos.destroy();
+    this.strokeColor.destroy();
+    this.strokeIndex.destroy();
     this.blitPos.destroy();
     this.blitUv.destroy();
     this.blitIndex.destroy();
     this.pointModel.destroy();
+    this.fillModel.destroy();
+    this.strokeModel.destroy();
     this.blitModel.destroy();
     this.fbo.destroy();
   }

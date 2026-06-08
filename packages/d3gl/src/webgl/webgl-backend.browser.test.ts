@@ -115,10 +115,13 @@ describe("WebGLBackend", () => {
     // Register a pass-through layer and draw one red point at the centre.
     backend.setPassThroughLayer!({ name: "pts" });
     backend.drawPassThrough!("pts", {
-      positions: new Float32Array([32, 32]),
-      radii: new Float32Array([8]),
-      colors: new Uint8Array([255, 0, 0, 255]),
-      count: 1,
+      points: {
+        positions: new Float32Array([32, 32]),
+        radii: new Float32Array([8]),
+        colors: new Uint8Array([255, 0, 0, 255]),
+        count: 1,
+      },
+      paths: null,
     }, "replace-first");
     // Centre: red point composited over the base.
     const center = backend.readPixel(32, 32);
