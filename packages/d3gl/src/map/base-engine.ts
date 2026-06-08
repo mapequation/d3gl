@@ -104,16 +104,29 @@ export abstract class BaseEngine {
     this.pushLayers();
   }
 
-  /** Register a pass-through layer (called by subclasses for passThrough:true). */
+  /** Register a pass-through layer (called by subclasses for passThrough:true).
+   *  Always stores the spec so a not-ready registration is replayed on backend install.
+   *  When a backend IS live: activate it if supported, else remove the spec + throw
+   *  (an explicit unsupported backend, e.g. SVG). When no backend is live yet: defer. */
   protected registerPassThrough(spec: PassThroughSpec): void {
-    if (!this.handle?.backend.supportsPassThrough) {
+    this.ptSpecs.set(spec.name, spec);
+    if (!this.handle) return; // not ready: keep the spec; install replay activates it
+    if (!this.handle.backend.supportsPassThrough) {
+      this.ptSpecs.delete(spec.name);
       throw new Error(
         `passThrough is not supported by the "${this.currentBackend}" backend (use canvas or webgl)`,
       );
     }
-    this.ptSpecs.set(spec.name, spec);
     this.handle.backend.setPassThroughLayer?.({ name: spec.name, sizeMode: spec.sizeMode, clipTo: spec.clipTo });
     this.repaintPassThrough(spec.name);
+  }
+
+  /** Incremental draw: project just this batch and draw it on top (O(new)). */
+  protected appendPassThrough(name: string, items: unknown[]): void {
+    const spec = this.ptSpecs.get(name);
+    if (!spec || !this.handle) return;
+    const batch = projectPoints(items, { project: spec.project, radius: spec.radius, color: spec.color });
+    this.handle.backend.drawPassThrough?.(name, batch, "append");
   }
 
   /** Resolve the current data array for a pass-through layer. */
@@ -247,12 +260,27 @@ export abstract class BaseEngine {
     if (this.interacting === v) return;
     this.interacting = v;
     if (this.specs.some((s) => s.hideOnInteraction)) this.pushLayers();
+    if (this.ptSpecs.size > 0) {
+      if (v) {
+        // Gesture start: capture the current accumulation so the backend can snapshot-pan.
+        this.handle?.backend.snapshotPassThrough?.();
+      } else {
+        // Settle: re-pull + crisp redraw of every pass-through layer.
+        for (const name of this.ptSpecs.keys()) this.repaintPassThrough(name);
+      }
+    }
   }
   setTransform(t: ViewTransform): this {
     this.transform = t;
     this.handle?.backend.setTransform(t);
     for (const spec of this.specs) if (spec.declutter) this.declutterLayer(spec, t);
     this.render();
+    // Pass-through layers. While interacting, the backend composites its accumulation
+    // buffer with the live transform (snapshot-pan) — nothing to repaint here. On a
+    // programmatic/settle transform, re-pull + crisp redraw each layer.
+    if (this.ptSpecs.size > 0 && !this.interacting) {
+      for (const name of this.ptSpecs.keys()) this.repaintPassThrough(name);
+    }
     return this;
   }
 
@@ -434,6 +462,19 @@ export abstract class BaseEngine {
     next.backend.setLayers(this.renderSpecs().map((s) => this.renderLayer(s)));
     next.backend.setTransform(this.transform);
     next.backend.render();
+    // Replay retained pass-through layers onto the freshly-installed backend (mirrors the
+    // retained setLayers re-push above). A deferred/not-ready registration is activated here.
+    if (this.ptSpecs.size > 0) {
+      if (!next.backend.supportsPassThrough) {
+        throw new Error(
+          `passThrough is not supported by the "${type}" backend (use canvas or webgl)`,
+        );
+      }
+      for (const spec of this.ptSpecs.values()) {
+        next.backend.setPassThroughLayer?.({ name: spec.name, sizeMode: spec.sizeMode, clipTo: spec.clipTo });
+        this.repaintPassThrough(spec.name);
+      }
+    }
     if (old) this.onBackendSwapped();
   }
 
