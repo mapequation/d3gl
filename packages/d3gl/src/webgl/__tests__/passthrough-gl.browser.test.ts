@@ -1,7 +1,7 @@
 import { describe, it, expect } from "vitest";
 import { luma } from "@luma.gl/core";
 import { webgl2Adapter } from "@luma.gl/webgl";
-import type { DrawBatch } from "../../core/index.js";
+import type { DrawBatch, ProjectedPath } from "../../core/index.js";
 import { PassThroughGL } from "../passthrough-gl.js";
 
 const W = 64;
@@ -49,6 +49,16 @@ function batch(
     },
     paths: null,
   };
+}
+
+/** A DrawBatch carrying only paths (no points). */
+function pathBatch(paths: ProjectedPath[]): DrawBatch {
+  return { points: null, paths };
+}
+
+/** A closed square subpath (CCW in screen coords) spanning [x0,x1]×[y0,y1]. */
+function square(x0: number, y0: number, x1: number, y1: number): ProjectedPath["subpaths"][number] {
+  return { points: [x0, y0, x1, y0, x1, y1, x0, y1], closed: true };
 }
 
 /** Composite the pass-through layer onto a fresh (transparent) target. */
@@ -171,6 +181,137 @@ describe("PassThroughGL", () => {
     expect(moved[0]).toBeGreaterThan(200); // appears at the 2x-zoomed location
     const original = pixel(device, target, 16, 16);
     expect(original[3]).toBeLessThan(40); // no longer at the un-zoomed location
+
+    pt.destroy();
+    target.destroy();
+    device.destroy();
+  });
+
+  it("rasterizes a filled polygon into the FBO (inside pixel reads the fill)", async () => {
+    const { device, target } = await setup();
+    const pt = new PassThroughGL(device, W, H);
+
+    pt.draw(
+      pathBatch([{ subpaths: [square(16, 16, 48, 48)], fill: [255, 0, 0, 255], stroke: null, lineWidth: 0 }]),
+      { k: 1, x: 0, y: 0 },
+      true,
+    );
+    composite(device, target, pt, { k: 1, x: 0, y: 0 }, { k: 1, x: 0, y: 0 });
+
+    const inside = pixel(device, target, 32, 32);
+    expect(inside[0]).toBeGreaterThan(200); // red fill
+    expect(inside[1]).toBeLessThan(40);
+    expect(inside[3]).toBeGreaterThan(200);
+    const outside = pixel(device, target, 4, 4);
+    expect(outside[3]).toBeLessThan(40); // empty outside the polygon
+
+    pt.destroy();
+    target.destroy();
+    device.destroy();
+  });
+
+  it("rasterizes a stroked open line into the FBO (a pixel on the line reads the stroke)", async () => {
+    const { device, target } = await setup();
+    const pt = new PassThroughGL(device, W, H);
+
+    // Horizontal line across the middle, thick enough to cover the sampled pixel.
+    pt.draw(
+      pathBatch([
+        {
+          subpaths: [{ points: [8, 32, 56, 32], closed: false }],
+          fill: null,
+          stroke: [0, 0, 255, 255],
+          lineWidth: 8,
+        },
+      ]),
+      { k: 1, x: 0, y: 0 },
+      true,
+    );
+    composite(device, target, pt, { k: 1, x: 0, y: 0 }, { k: 1, x: 0, y: 0 });
+
+    const onLine = pixel(device, target, 32, 32);
+    expect(onLine[2]).toBeGreaterThan(200); // blue stroke
+    expect(onLine[0]).toBeLessThan(40);
+    const offLine = pixel(device, target, 32, 8);
+    expect(offLine[3]).toBeLessThan(40); // empty above the line
+
+    pt.destroy();
+    target.destroy();
+    device.destroy();
+  });
+
+  it("carries per-path fill color (two polygons, two colors)", async () => {
+    const { device, target } = await setup();
+    const pt = new PassThroughGL(device, W, H);
+
+    pt.draw(
+      pathBatch([
+        { subpaths: [square(4, 4, 28, 28)], fill: [255, 0, 0, 255], stroke: null, lineWidth: 0 },
+        { subpaths: [square(36, 36, 60, 60)], fill: [0, 0, 255, 255], stroke: null, lineWidth: 0 },
+      ]),
+      { k: 1, x: 0, y: 0 },
+      true,
+    );
+    composite(device, target, pt, { k: 1, x: 0, y: 0 }, { k: 1, x: 0, y: 0 });
+
+    const red = pixel(device, target, 16, 16);
+    const blue = pixel(device, target, 48, 48);
+    expect(red[0]).toBeGreaterThan(200); // first polygon is red
+    expect(red[2]).toBeLessThan(40);
+    expect(blue[2]).toBeGreaterThan(200); // second polygon is blue (correct index rebasing)
+    expect(blue[0]).toBeLessThan(40);
+
+    pt.destroy();
+    target.destroy();
+    device.destroy();
+  });
+
+  it("renders points and a polygon in the same batch", async () => {
+    const { device, target } = await setup();
+    const pt = new PassThroughGL(device, W, H);
+
+    const mixed: DrawBatch = {
+      points: {
+        positions: new Float32Array([48, 16]),
+        radii: new Float32Array([6]),
+        colors: new Uint8Array([0, 255, 0, 255]),
+        count: 1,
+      },
+      paths: [{ subpaths: [square(8, 36, 32, 60)], fill: [255, 0, 0, 255], stroke: null, lineWidth: 0 }],
+    };
+    pt.draw(mixed, { k: 1, x: 0, y: 0 }, true);
+    composite(device, target, pt, { k: 1, x: 0, y: 0 }, { k: 1, x: 0, y: 0 });
+
+    const point = pixel(device, target, 48, 16);
+    const poly = pixel(device, target, 20, 48);
+    expect(point[1]).toBeGreaterThan(200); // green point
+    expect(poly[0]).toBeGreaterThan(200); // red polygon fill
+
+    pt.destroy();
+    target.destroy();
+    device.destroy();
+  });
+
+  it("accumulates a polygon (clear:true) then another (clear:false) — both present", async () => {
+    const { device, target } = await setup();
+    const pt = new PassThroughGL(device, W, H);
+
+    pt.draw(
+      pathBatch([{ subpaths: [square(4, 4, 28, 28)], fill: [255, 0, 0, 255], stroke: null, lineWidth: 0 }]),
+      { k: 1, x: 0, y: 0 },
+      true,
+    );
+    pt.draw(
+      pathBatch([{ subpaths: [square(36, 36, 60, 60)], fill: [0, 0, 255, 255], stroke: null, lineWidth: 0 }]),
+      { k: 1, x: 0, y: 0 },
+      false,
+    );
+    composite(device, target, pt, { k: 1, x: 0, y: 0 }, { k: 1, x: 0, y: 0 });
+
+    const first = pixel(device, target, 16, 16);
+    const second = pixel(device, target, 48, 48);
+    expect(first[0]).toBeGreaterThan(200); // first polygon survived the append
+    expect(second[2]).toBeGreaterThan(200); // appended polygon present
 
     pt.destroy();
     target.destroy();

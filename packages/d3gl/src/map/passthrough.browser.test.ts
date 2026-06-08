@@ -5,7 +5,7 @@ import { CanvasBackend } from "../canvas/canvas-backend.js";
 import { BaseEngine } from "./base-engine.js";
 import { plot, Plot } from "./plot.js";
 import type { PlotOptions } from "./plot.js";
-import { geoMap } from "./geo-map.js";
+import { geoMap, GeoMap } from "./geo-map.js";
 import { LayerHandle } from "./layer-handle.js";
 import { createCanvasBackend, type BackendHandle } from "./backend-factory.js";
 import type { ViewTransform } from "../core/index.js";
@@ -531,6 +531,85 @@ describe('passThrough "auto" backend real upgrade to WebGL (Phase 2: WebGL has P
     const away = chart.screenPixel(10, 10);
     expect(away[3]!).toBeLessThan(40);   // nothing elsewhere
     chart.destroy();
+  });
+});
+
+/**
+ * A real-WebGL GeoMap exposing the same screenPixel() seam as GLPlot, so geo polygon/line
+ * pass-through can be asserted against real GPU pixels read off the WebGL canvas.
+ */
+class GLGeoMap extends GeoMap {
+  private gl(): WebGLBackend {
+    return (this as unknown as { backend(): WebGLBackend | null }).backend()!;
+  }
+  liveBackendType(): string {
+    return (this as unknown as { backendType(): string }).backendType();
+  }
+  screenPixel(x: number, y: number): number[] {
+    return this.gl().readScreenPixel(x, y);
+  }
+}
+
+describe("passThrough geometry rendering (webgl backend)", () => {
+  // Mirrors the canvas Task-3 geometry suite but on a real WebGL device: polygons fill and
+  // lines stroke into the accumulation FBO (world mode), read back as real GPU pixels.
+  const project = (lon: number, lat: number): [number, number] => {
+    const p = proj()([lon, lat])!;
+    return [p[0], p[1]];
+  };
+  const bigPolygon = (): GeoJSON.Feature => ({
+    type: "Feature",
+    properties: {},
+    geometry: { type: "Polygon", coordinates: [[[0, 20], [20, 20], [20, 0], [0, 0], [0, 20]]] },
+  });
+  const polygon2 = (): GeoJSON.Feature => ({
+    type: "Feature",
+    properties: {},
+    geometry: { type: "Polygon", coordinates: [[[-30, -5], [-10, -5], [-10, -25], [-30, -25], [-30, -5]]] },
+  });
+  const line = (): GeoJSON.Feature => ({
+    type: "Feature",
+    properties: {},
+    geometry: { type: "LineString", coordinates: [[-40, 0], [40, 0]] },
+  });
+
+  it("rasterizes a filled Polygon: inside reads the fill color", async () => {
+    const map = new GLGeoMap(host(), { width: 200, height: 200, projection: proj(), backend: "webgl" });
+    map.layer("poly", [bigPolygon()], { fill: "rgb(0,200,0)", passThrough: true });
+    await map.whenReady();
+    expect(map.liveBackendType()).toBe("webgl");
+    const [cx, cy] = project(10, 10); // centroid
+    const inside = map.screenPixel(Math.round(cx), Math.round(cy));
+    expect(inside[1]!).toBeGreaterThan(150); // green fill inside
+    expect(inside[3]!).toBeGreaterThan(180); // opaque
+    const [ox, oy] = project(-50, -40);
+    expect(map.screenPixel(Math.round(ox), Math.round(oy))[3]!).toBeLessThan(40); // empty outside
+    map.destroy();
+  });
+
+  it("rasterizes a LineString stroke: a pixel on the line reads the stroke color", async () => {
+    const map = new GLGeoMap(host(), { width: 200, height: 200, projection: proj(), backend: "webgl" });
+    map.layer("line", [line()], { stroke: "rgb(0,0,255)", lineWidth: 4, passThrough: true });
+    await map.whenReady();
+    const [mx, my] = project(0, 0); // midpoint on the equator
+    const px = map.screenPixel(Math.round(mx), Math.round(my));
+    expect(px[2]!).toBeGreaterThan(150); // blue stroke
+    expect(px[3]!).toBeGreaterThan(120); // present
+    map.destroy();
+  });
+
+  it("handle.append() adds another polygon incrementally (first remains)", async () => {
+    const map = new GLGeoMap(host(), { width: 200, height: 200, projection: proj(), backend: "webgl" });
+    const handle = map.layer("poly", [bigPolygon()], { fill: "rgb(0,200,0)", passThrough: true });
+    await map.whenReady();
+    const [c1x, c1y] = project(10, 10);
+    expect(map.screenPixel(Math.round(c1x), Math.round(c1y))[1]!).toBeGreaterThan(150); // first
+
+    handle.append([polygon2()]); // incremental draw-on-top (FBO accumulation)
+    const [c2x, c2y] = project(-20, -15); // centroid of polygon2
+    expect(map.screenPixel(Math.round(c2x), Math.round(c2y))[1]!).toBeGreaterThan(150); // second appeared
+    expect(map.screenPixel(Math.round(c1x), Math.round(c1y))[1]!).toBeGreaterThan(150); // first still there
+    map.destroy();
   });
 });
 
