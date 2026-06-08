@@ -1,16 +1,7 @@
 import { rgb } from "d3-color";
+import type { PointBatch } from "../core/index.js";
 
-/** Transient, GPU/Canvas-ready point data. Owned by no one — built per repaint and discarded. */
-export interface PointBatch {
-  /** [x, y] per point, in projected world coords (pre view-transform). */
-  positions: Float32Array;
-  /** radius (reference px) per point. */
-  radii: Float32Array;
-  /** RGBA bytes per point (4 per point), parallel to positions. */
-  colors: Uint8Array;
-  /** number of points actually packed (after culling). */
-  count: number;
-}
+export type { PointBatch };
 
 export interface ProjectPointsOpts<D> {
   /** Project a datum to projected world coords, or null to cull it (off-globe / off-screen). */

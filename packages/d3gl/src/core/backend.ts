@@ -1,5 +1,24 @@
 import type { GroupBuffers, GroupBufferDelta, DrawableVector } from "./scene.js";
 
+/** Transient, GPU/Canvas-ready point data. Owned by no one — built per repaint and discarded. */
+export interface PointBatch {
+  /** [x, y] per point, in projected world coords (pre view-transform). */
+  positions: Float32Array;
+  /** radius (reference px) per point. */
+  radii: Float32Array;
+  /** RGBA bytes per point (4 per point), parallel to positions. */
+  colors: Uint8Array;
+  /** number of points actually packed (after culling). */
+  count: number;
+}
+
+/** Identifies a pass-through layer to a backend (no retained geometry). */
+export interface PassThroughLayer {
+  name: string;
+  sizeMode?: "world" | "screen";
+  clipTo?: string;
+}
+
 /** View transform applied on top of project-once geometry: scale k, translate (x, y). */
 export interface ViewTransform {
   k: number;
@@ -48,6 +67,21 @@ export interface Backend {
    * (full re-upload); the engine still calls `updateLayer` for non-append changes.
    */
   appendToLayer?(delta: RenderDelta): void;
+  /** Register/replace a pass-through layer (no buffers). Backends opt in. */
+  setPassThroughLayer?(layer: PassThroughLayer): void;
+  /** Remove a pass-through layer. */
+  removePassThroughLayer?(name: string): void;
+  /**
+   * Draw a batch into the layer's accumulation buffer.
+   * `mode: "replace-first"` clears the layer's buffer first (start of a full repaint),
+   * `"replace-rest"` continues a chunked full repaint without clearing,
+   * `"append"` draws on top (incremental).
+   */
+  drawPassThrough?(name: string, batch: PointBatch, mode: "replace-first" | "replace-rest" | "append"): void;
+  /** Snapshot current accumulation for snapshot-pan (called on interaction start). */
+  snapshotPassThrough?(): void;
+  /** True if this backend supports pass-through (canvas/webgl yes, svg no). */
+  readonly supportsPassThrough?: boolean;
   setTransform(t: ViewTransform): void;
   render(): void;
   toPNG(): string;
