@@ -126,7 +126,7 @@ export abstract class BaseEngine {
       this.ptSpecs.delete(spec.name);
       this.ptRepaintTokens.delete(spec.name); // prune stale token (no active repaint, but keep the map clean)
       throw new Error(
-        `passThrough is not supported by the "${this.currentBackend}" backend (use the canvas backend; WebGL pass-through is not yet supported)`,
+        `passThrough is not supported by the "${this.currentBackend}" backend (use the canvas or webgl backend)`,
       );
     }
     this.handle.backend.setPassThroughLayer?.({ name: spec.name, sizeMode: spec.sizeMode, clipTo: spec.clipTo });
@@ -534,7 +534,7 @@ export abstract class BaseEngine {
     if (this.ptSpecs.size > 0) {
       if (!next.backend.supportsPassThrough) {
         throw new Error(
-          `passThrough is not supported by the "${type}" backend (use the canvas backend; WebGL pass-through is not yet supported)`,
+          `passThrough is not supported by the "${type}" backend (use the canvas or webgl backend)`,
         );
       }
       for (const spec of this.ptSpecs.values()) {
@@ -591,7 +591,7 @@ export abstract class BaseEngine {
         next.backend.destroy();
         if (next.element !== this.host) next.element.remove();
         if (!this.destroyed)
-          console.warn("d3gl: pass-through layers keep the canvas backend (WebGL pass-through is not yet supported)");
+          console.warn("d3gl: pass-through layers kept on the canvas backend (the upgrade target does not support pass-through)");
         return;
       }
       this.installBackend(next, token, "webgl");

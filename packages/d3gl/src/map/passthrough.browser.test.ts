@@ -377,7 +377,7 @@ describe('passThrough "auto" backend upgrade guard (Phase 1: WebGL has no PT)', 
     chart.points("pts", [{ x: 60, y: 60 }], { x: (d) => d.x, y: (d) => d.y, radius: 6, fill: "rgb(255,0,0)", passThrough: true });
     // SVG declares supportsPassThrough = false; an explicit swap surfaces via whenReady().
     chart.setBackend("svg");
-    await expect(chart.whenReady()).rejects.toThrow(/passThrough is not supported.*canvas backend; WebGL pass-through is not yet supported/);
+    await expect(chart.whenReady()).rejects.toThrow(/passThrough is not supported.*canvas or webgl backend/);
     chart.destroy();
   });
 });
@@ -506,6 +506,8 @@ describe("passThrough rendering (webgl backend)", () => {
     // Settle (d3-zoom "end" → setInteracting(false)): crisp re-rasterize at the new transform.
     chart.interact(false);
     expect(chart.screenPixel(90, 80)[0]!).toBeGreaterThan(180); // still at the panned location
+    // After settle the old pre-pan pixel must be cleared (re-rasterize replaces; not composited on top).
+    expect(chart.screenPixel(50, 50)[0]!).toBeLessThan(60);     // original location cleared
     chart.destroy();
   });
 });
