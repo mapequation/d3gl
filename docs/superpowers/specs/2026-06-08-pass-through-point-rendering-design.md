@@ -1,13 +1,15 @@
 # Pass-through rendering (points + GeoJSON)
 
 **Date:** 2026-06-08
-**Status:** Phases 1–3 implemented (engine + Canvas + WebGL; points and generic GeoJSON geometry). Phase 4 (docs + example) pending — see the plans at `docs/superpowers/plans/2026-06-08-pass-through-rendering.md` and `docs/superpowers/plans/2026-06-08-pass-through-webgl-phase2.md`.
+**Status:** ✅ Complete — all 4 phases shipped (engine + Canvas + WebGL; points and generic GeoJSON geometry; website docs + example). See the per-phase plans under `docs/superpowers/plans/2026-06-08-pass-through-*.md`. Merged: PR #31 (Phase 1), #32 (Phase 2), #33 (Phase 3); Phase 4 (docs) on `feat/passthrough-docs`.
 
 > **Phase 1 done (2026-06-08):** `passThrough` option + callback data on `plot.points()` / `geoMap.layer()`; pure `projectPoints`/`PointBatch` builder; engine registration that bypasses `Scene` (zero retention) with defer/re-register-on-install; Canvas accumulate + snapshot-pan; time-sliced cancellable repaint; `pickable:false`; SVG rejects `passThrough`.
 >
 > **Phase 2 done (2026-06-08):** WebGL backend pass-through — per-layer offscreen accumulation FBO (O(pixels)), points quad-expanded into a reused O(chunk) scratch buffer with **color as a vertex attribute** (no per-drawable color texture → no WebGL texture cliff), composited over the retained map via a full-screen blit, snapshot-pan via the FBO-vs-view transform delta (base stays crisp). `auto` mode now upgrades Canvas→WebGL with pass-through layers intact. Verified: typecheck clean, 189 node tests, 107 browser tests green.
 >
 > **Phase 3 done (2026-06-08):** generic GeoJSON geometry (polygons/lines, not just points) for pass-through on **both** backends — geo-map `buildItem` handles all geometry kinds and `buildBatch` produces a single `DrawBatch{points, paths}` that every backend consumes through one `drawPassThrough(...)`. Canvas fills/strokes paths natively via `Path2D`; WebGL **re-tessellates fill/stroke per repaint** into the same accumulation FBO, **color as a vertex attribute** (same no-texture-cliff model as points). The mid-phase WebGL gap — `auto` upgrading Canvas→WebGL but dropping polygon/line pass-through — is closed: the upgrade re-registers + repaints the full mixed batch (points *and* paths). Paths are **world-mode** (re-projected/re-tessellated on each settle; **screen-mode paths are a follow-up**); the per-settle re-tessellation is the documented cost for the path kinds. Verified: typecheck clean, **199 node tests**, **124 browser tests** green.
+
+> **Phase 4 done (2026-06-08):** website docs + example. Corrected the now-stale `passThrough` JSDoc (`LayerOptions`/`PlotPointOptions` → auto-generated reference) to reflect all-geometry on both backends + the retained-vs-pass-through trade-off. Added a `streaming-passthrough` example (10M points, `auto` backend, callback data + `append`) and a "Pass-through: uncapped streaming" section to the Streaming guide leading with the trade-off table + when-to-use. Verified: website `astro build` succeeds (109 pages, reference regenerated; stale "points-only" text gone).
 
 > Scope note: the design is framed around points (the OOM case and cheapest
 > path), but the pipeline is **generic over all GeoJSON geometry** — see
