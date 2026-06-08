@@ -29,6 +29,10 @@ export function createCanvasBackend(host: HTMLElement, width: number, height: nu
 }
 
 export async function createBackend(type: BackendType, host: HTMLElement, width: number, height: number): Promise<BackendHandle> {
+  // "auto" is an engine-level orchestration (canvas-first paint, then a background WebGL
+  // upgrade), not a real backend — the engine installs canvas via createCanvasBackend and
+  // upgrades via its own path, so createBackend should never receive it.
+  if (type === "auto") throw new Error('createBackend: "auto" is engine-level — use createCanvasBackend + the engine upgrade path');
   if (type === "canvas") {
     const canvas = makeCanvas(host, width, height);
     return { backend: new CanvasBackend(canvas, width, height), element: canvas };

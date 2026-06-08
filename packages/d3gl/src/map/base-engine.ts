@@ -43,7 +43,8 @@ export abstract class BaseEngine {
   private hoverCb: ((hit: HoverHit | null, ev: PointerEvent) => void) | null = null;
   private swapToken = 0;
   private destroyed = false;
-  /** The in-flight (or settled) WebGL upgrade for "auto" mode; null when not in auto mode. */
+  /** "auto" mode only: the WebGL upgrade promise (in-flight, then settled). Null until
+   *  enterAutoMode() starts the upgrade; not reset afterwards. */
   private upgradeDone: Promise<void> | null = null;
   /** True while the user is interacting (a rotation drag, or a zoom/pan gesture).
    *  Layers flagged hideOnInteraction are excluded from the render while this is true. */
