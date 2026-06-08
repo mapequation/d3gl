@@ -16,10 +16,9 @@
         "../packages/d3gl/src/*/index.ts"
       ],
       "@/*": [
-        "src/*"
+        "./src/*"
       ]
     },
-    "baseUrl": ".",
     "jsx": "react-jsx",
     "jsxImportSource": "react"
   }
