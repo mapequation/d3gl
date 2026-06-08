@@ -1,4 +1,4 @@
-export type Backend = "webgl" | "canvas" | "svg";
+export type Backend = "auto" | "webgl" | "canvas" | "svg";
 
 // ---------------------------------------------------------------------------
 // React <Example> harness contracts. The harness flows everything through

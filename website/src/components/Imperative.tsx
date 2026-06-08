@@ -1,5 +1,5 @@
 import { useEffect, useRef } from "react";
-import type { ExampleContext, ExampleEngine, ImperativeSetup } from "../examples/types.js";
+import type { Backend, ExampleContext, ExampleEngine, ImperativeSetup } from "../examples/types.js";
 
 export interface ImperativeProps {
   ctx: ExampleContext;
@@ -32,6 +32,10 @@ export default function Imperative({ ctx, setup }: ImperativeProps) {
   // The options key the engine was last built/rendered with, so the options effect can skip
   // the redundant run that fires right after the size effect builds the engine.
   const builtOptionsKey = useRef<string | null>(null);
+  // The backend the current engine was created with, so the backend effect can skip the
+  // no-op switch that would otherwise fire on mount (and after a size-driven recreate) —
+  // which would needlessly re-init the backend (and, for "auto", flash a second canvas).
+  const createdBackend = useRef<Backend>(ctx.backend);
 
   const { backend, width, height, options, registerEngine } = ctx;
   const optionsKey = JSON.stringify(options);
@@ -51,6 +55,7 @@ export default function Imperative({ ctx, setup }: ImperativeProps) {
     disposeRef.current = dispose;
     visibleRef.current = "engine" in result ? result.setVisible : undefined;
     registerEngine(engine);
+    createdBackend.current = backend; // engine built with this backend; skip the mount switch
     // Initial option-dependent content (if this example builds layers in render).
     render?.(options);
     builtOptionsKey.current = optionsKey;
@@ -92,6 +97,7 @@ export default function Imperative({ ctx, setup }: ImperativeProps) {
     disposeRef.current = "engine" in result ? result.dispose : undefined;
     visibleRef.current = "engine" in result ? result.setVisible : undefined;
     registerEngine(engine);
+    createdBackend.current = backend; // recreated with the current backend
     renderRef.current?.(options);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [optionsKey]);
@@ -117,8 +123,11 @@ export default function Imperative({ ctx, setup }: ImperativeProps) {
     };
   }, []);
 
-  // Swap backend in place, preserving zoom/pan + layers.
+  // Swap backend in place, preserving zoom/pan + layers. Skip the no-op switch to the
+  // backend the engine was just created with (on mount, or after a size-driven recreate).
   useEffect(() => {
+    if (backend === createdBackend.current) return;
+    createdBackend.current = backend;
     engineRef.current?.setBackend(backend);
   }, [backend]);
 
