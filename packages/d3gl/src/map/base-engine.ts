@@ -54,7 +54,7 @@ export abstract class BaseEngine {
     this.ready = this.swapBackend(backend);
   }
   whenReady(): Promise<void> { return this.ready; }
-  /** The currently-active backend type (set by the constructor / swapBackend). */
+  /** The currently-active backend type (set by the constructor / installBackend). */
   protected backendType(): BackendType { return this.currentBackend; }
   /** The live backend instance, or null before the first swap resolves. */
   protected backend(): Backend | null { return this.handle?.backend ?? null; }
@@ -353,6 +353,8 @@ export abstract class BaseEngine {
    * finished initializing its own fields, e.g. GeoMap's projection).
    */
   private installBackend(next: BackendHandle, token: number, type: BackendType): void {
+    // A newer swap superseded this one, or the engine was destroyed mid-flight: tear down
+    // the freshly created backend so it never orphans an element.
     if (token !== this.swapToken || this.destroyed) {
       next.backend.destroy();
       if (next.element !== this.host) next.element.remove();
@@ -370,7 +372,6 @@ export abstract class BaseEngine {
   }
 
   private async swapBackend(type: BackendType): Promise<void> {
-    this.currentBackend = type;
     const token = ++this.swapToken;
     const next = await createBackend(type, this.host, this.width, this.height);
     this.installBackend(next, token, type);
