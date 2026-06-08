@@ -1,0 +1,97 @@
+---
+title: Rendering backends
+description: Choose between WebGL, Canvas2D, SVG, or the progressive "auto" backend — and switch at runtime.
+---
+
+d3gl renders the same projected-and-tessellated [`Scene`](/d3gl/reference/core/) through
+one of several backends. They are interchangeable: geometry is built once (backend-independent),
+and each backend turns it into pixels (or vector nodes) its own way. Pick one with the `backend`
+option on `geoMap` / `plot` (and the React `<GeoMap>` component):
+
+```ts
+import { geoMap } from "@mapequation/d3gl/map";
+
+const map = geoMap(host, { width, height, projection, backend: "webgl" }); // the default
+```
+
+`backend` defaults to `"webgl"` when omitted.
+
+## The backends
+
+| Backend | Startup | Best for | Export |
+| --- | --- | --- | --- |
+| `"webgl"` *(default)* | One-time GPU device creation (can be 100s of ms cold) | Large/dense scenes, smooth pan/zoom, the GPU globe | `toPNG()` |
+| `"canvas"` | Instant (synchronous) | Small/medium scenes, fastest first paint, no GPU dependency | `toPNG()` |
+| `"svg"` | Instant (synchronous) | Vector export, print, hand-editable output | `toSVG()` |
+| `"auto"` | Instant first paint, then upgrades | The best of canvas + webgl — see below | `toPNG()` |
+
+All four share the same engine API (`layer`, `recolor`, `enableZoom`, `setTransform`, `pick`,
+`setProjection`, …); switching backend never changes how you drive the map.
+
+## `auto` — canvas first, WebGL when ready
+
+WebGL is the best backend for an interactive map, but creating its GPU device has a fixed
+cost that delays the first paint — noticeable on a cold load, especially where the browser
+spins up a GPU process. Canvas2D has effectively zero startup but is slower for large or
+frequently-redrawn scenes.
+
+`backend: "auto"` gives you both:
+
+1. It installs the **Canvas2D** backend **synchronously** and paints immediately.
+2. In the background it creates the **WebGL** device and, once ready, **swaps to it transparently** —
+   preserving your layers, colors, view transform, and interaction.
+3. If WebGL is unavailable (or device creation fails), it **stays on Canvas** and logs a warning.
+   The map keeps working.
+
+```ts
+const map = geoMap(host, { width, height, projection, backend: "auto" });
+map.layer("ocean", [{ type: "Sphere" }], { fill: "#d4e6f5" });
+map.layer("land", [world.land], { fill: "#e3e6ea" });
+map.enableZoom([1, 8]);
+
+// whenReady() resolves at the CANVAS first paint (early) — not when WebGL is ready.
+await map.whenReady();
+// The map is already visible and interactive here; the WebGL upgrade happens
+// transparently a beat later.
+```
+
+:::note[`whenReady()` resolves early]
+In `"auto"` mode `whenReady()` (and the React `onReady`) fire at the **canvas first paint**, so
+consumers see a working map immediately. The WebGL upgrade is transparent and happens afterward —
+you don't need to wait for it or handle it.
+:::
+
+The trade-off is a brief visual change when WebGL takes over (Canvas and WebGL anti-alias
+slightly differently). For most maps this is unnoticeable; if you need pixel-stable rendering
+from the first frame, choose `"webgl"` or `"canvas"` explicitly.
+
+## Switching at runtime
+
+Call `setBackend(...)` to switch a live map — layers, colors, and the current zoom/pan are
+preserved across the swap:
+
+```ts
+map.setBackend("svg"); // e.g. right before exporting vector output
+const svg = map.toSVG();
+map.setBackend("webgl");
+```
+
+Switching to the backend that is **already live** is a no-op (no re-render, no flicker). In
+particular, once `"auto"` has upgraded, the live backend *is* `"webgl"`, so selecting `"webgl"`
+does nothing.
+
+## React
+
+The `<GeoMap>` component takes the same `backend` prop, including `"auto"`:
+
+```tsx
+import { GeoMap } from "@mapequation/d3gl/react";
+
+<GeoMap width={720} height={380} projection={projection} backend="auto" onReady={(map) => { /* … */ }} />
+```
+
+## Exporting
+
+Raster backends (`webgl`, `canvas`, and an upgraded `auto`) export via `toPNG()`; the `svg`
+backend exports via `toSVG()`. To export vector output from a raster map, switch to `"svg"`
+first, call `toSVG()`, then switch back.

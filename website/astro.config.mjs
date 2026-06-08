@@ -7,6 +7,7 @@ import starlightTypeDoc, { typeDocSidebarGroup } from "starlight-typedoc";
 import tailwindcss from "@tailwindcss/vite";
 import { fileURLToPath } from "node:url";
 
+import mdx from "@astrojs/mdx";
 import react from "@astrojs/react";
 
 // Alias each @mapequation/d3gl subpath to its TypeScript source so the docs run
@@ -77,7 +78,10 @@ export default defineConfig({
     components: { SocialIcons: "./src/components/SocialIcons.astro" },
     plugins: [typeDocPlugin],
     sidebar: [
-      { label: "Start Here", items: [{ label: "Getting started", slug: "getting-started" }] },
+      { label: "Start Here", items: [
+        { label: "Getting started", slug: "getting-started" },
+        { label: "Rendering backends", slug: "rendering-backends" },
+      ] },
       {
         label: "Examples",
         items: [
@@ -94,7 +98,15 @@ export default defineConfig({
       typeDocSidebarGroup,
       { label: "Contributing", items: [{ label: "Contributing", slug: "contributing" }] },
     ],
-  }), react()],
+  }),
+  // Provide the MDX integration explicitly so we can enable GitHub-Flavored Markdown
+  // (tables, etc.) in `.mdx`. Astro 6.4 deprecated `markdown.gfm` and stopped defaulting it,
+  // and @astrojs/mdx v5 still derives GFM from that now-undefined field — so `.md` keeps GFM
+  // (via the new `markdown.processor`) but `.mdx` silently loses it. Setting `gfm: true` here
+  // restores it. Starlight detects a user-provided @astrojs/mdx and skips adding its own, so we
+  // mirror its `optimize: true`. Remove `gfm` once @astrojs/mdx reads `markdown.processor`.
+  mdx({ optimize: true, gfm: true }),
+  react()],
   vite: {
     plugins: [tailwindcss()],
     resolve: {

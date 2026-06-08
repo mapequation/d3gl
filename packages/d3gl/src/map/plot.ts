@@ -3,7 +3,13 @@ import { BaseEngine } from "./base-engine.js";
 import type { BackendType } from "./backend-factory.js";
 import { LayerHandle } from "./layer-handle.js";
 
-export interface PlotOptions { width: number; height: number; backend?: BackendType; }
+export interface PlotOptions {
+  width: number;
+  height: number;
+  /** Which renderer to draw with — see {@link BackendType}. Defaults to `"webgl"`.
+   *  Use `"auto"` for an instant Canvas first paint that upgrades to WebGL in the background. */
+  backend?: BackendType;
+}
 export interface PlotLayerOptions<D = any> {
   /**
    * Draw one datum's geometry by emitting path commands. The context is typed as

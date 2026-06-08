@@ -3,6 +3,26 @@ import { CanvasBackend } from "../canvas/index.js";
 import { SvgBackend } from "../svg/index.js";
 import { WebGLBackend } from "../webgl/index.js";
 
+/**
+ * Which renderer an engine ({@link GeoMap} / {@link Plot}, or the React `<GeoMap>`) draws
+ * the {@link core!Scene} with. Geometry is projected & tessellated once (backend-independent);
+ * the backend only turns it into pixels (or SVG nodes). Defaults to `"webgl"`.
+ *
+ * - `"webgl"` *(default)* — luma.gl v9 WebGL2. Best for large/dense scenes, smooth pan/zoom,
+ *   and the GPU globe. One-time GPU device creation delays the first paint (can be 100s of ms
+ *   on a cold load). Exports via `toPNG()`.
+ * - `"canvas"` — Canvas2D. Instant (synchronous) startup, no GPU dependency; ideal for small/
+ *   medium scenes and the fastest first paint. Exports via `toPNG()`.
+ * - `"svg"` — SVG nodes. Instant startup; for vector export / print / hand-editable output.
+ *   Exports via `toSVG()`.
+ * - `"auto"` — progressive: install `"canvas"` synchronously for an instant first paint, then
+ *   create the WebGL device in the background and swap to it transparently when ready. Falls
+ *   back to staying on Canvas (with a `console.warn`) if WebGL is unavailable. In `"auto"` mode
+ *   `whenReady()` resolves at the canvas first paint (early); the upgrade is transparent.
+ *
+ * Switch a live engine with `setBackend(...)` (layers, colors, and the current view are
+ * preserved); switching to the already-live backend is a no-op.
+ */
 export type BackendType = "webgl" | "canvas" | "svg" | "auto";
 
 export interface BackendHandle {

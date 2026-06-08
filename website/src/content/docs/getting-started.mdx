@@ -43,5 +43,12 @@ chart.layer("series", [points], { draw: (ctx, d) => { gen.context(ctx); gen(d); 
 chart.enableZoom();
 ```
 
+## Backends
+
+Every engine renders through a backend — `"webgl"` (default), `"canvas"`, `"svg"`, or `"auto"`
+(instant canvas first paint, then a transparent upgrade to WebGL). Pass it via the `backend`
+option, or switch at runtime with `setBackend(...)`. See [Rendering backends](/d3gl/rendering-backends/)
+for how to choose and how `auto` works.
+
 See the [Examples](/d3gl/examples/tree/phylogenetic-tree/) for full, runnable demos, and the
 [Reference](/d3gl/reference/) for the API of each module.
