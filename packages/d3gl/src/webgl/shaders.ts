@@ -128,3 +128,49 @@ void main() {
   if (v_front <= 0.0) discard;
   fragColor = texture(u_map, v_uv);
 }`;
+
+// PT_POINT_VS — pass-through variant of POINT_VS. Identical quad-corner geometry but
+// reads color directly from the a_color vertex attribute instead of a texture lookup,
+// so no u_colorTable / u_flags are needed. Pairs with the existing POINT_FS.
+export const PT_POINT_VS = `#version 300 es
+precision highp float;
+uniform mat3 u_transform;
+uniform float u_pointScreen;
+uniform vec2 u_viewport;
+in vec2 a_center;
+in vec2 a_corner;
+in float a_radius;
+in vec4 a_color;
+out vec4 v_color;
+out vec2 v_local;
+void main() {
+  v_color = a_color;
+  v_local = a_corner;
+  vec3 c = u_transform * vec3(a_center, 1.0);
+  vec2 off = (u_pointScreen > 0.5)
+    ? a_corner * a_radius * vec2(2.0 / u_viewport.x, -2.0 / u_viewport.y)
+    : (u_transform * vec3(a_center + a_corner * a_radius, 1.0)).xy - c.xy;
+  gl_Position = vec4(c.xy + off, 0.0, 1.0);
+}`;
+
+// BLIT_VS / BLIT_FS — composite a texture (the pass-through accumulation FBO) to the
+// screen as a full-screen textured quad. u_blit is a mat3 transform applied in clip
+// space, used during snapshot-pan to offset the accumulated layer without re-rendering.
+export const BLIT_VS = `#version 300 es
+precision highp float;
+uniform mat3 u_blit;
+in vec2 a_pos;
+in vec2 a_uv;
+out vec2 v_uv;
+void main() {
+  v_uv = a_uv;
+  vec3 p = u_blit * vec3(a_pos, 1.0);
+  gl_Position = vec4(p.xy, 0.0, 1.0);
+}`;
+
+export const BLIT_FS = `#version 300 es
+precision highp float;
+in vec2 v_uv;
+uniform sampler2D u_tex;
+out vec4 fragColor;
+void main() { fragColor = texture(u_tex, v_uv); }`;

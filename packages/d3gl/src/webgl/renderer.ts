@@ -30,7 +30,7 @@ function nextPow2(n: number): number {
  * The CPU mirror doubles memory vs. a GPU-only buffer; that is the deliberate trade
  * for a correct, simple grow (we need the full data to repopulate the bigger GPU buffer).
  */
-class GrowBuffer {
+export class GrowBuffer {
   buffer: Buffer;
   /** CPU mirror (Float32Array or Uint32Array), `capacity` elements long. */
   private mirror: Float32Array | Uint32Array;
@@ -93,6 +93,16 @@ class GrowBuffer {
     this.buffer.write(data, this.length * this.bytesPerElement);
     this.length = need;
     return false;
+  }
+
+  /**
+   * Reset the used length to 0 so the next {@link append} overwrites from the start
+   * (the GPU buffer and its capacity are kept). Used by reusable scratch buffers that
+   * are refilled per draw rather than grown monotonically; stale tail bytes past the
+   * new length are simply never indexed.
+   */
+  reset(): void {
+    this.length = 0;
   }
 
   destroy(): void {

@@ -8,6 +8,8 @@ import type { PlotOptions } from "./plot.js";
 import { geoMap } from "./geo-map.js";
 import { LayerHandle } from "./layer-handle.js";
 import { createCanvasBackend, type BackendHandle } from "./backend-factory.js";
+import type { ViewTransform } from "../core/index.js";
+import type { WebGLBackend } from "../webgl/webgl-backend.js";
 
 // Task 5 pinned the public-API surface + the (then-true) "backend doesn't support pass-through"
 // error. Task 6 adds REAL canvas pass-through rendering, so this file now asserts:
@@ -17,6 +19,13 @@ import { createCanvasBackend, type BackendHandle } from "./backend-factory.js";
 //   - non-Point geometry under passThrough still throws on projection,
 //   - snapshot-pan: a frozen raster blits under the delta transform during a gesture.
 // (The canvas backend now declares supportsPassThrough, so the old "not supported" assertion is gone.)
+//
+// Phase 2: WebGL now implements the pass-through contract too. The suites at the bottom assert,
+// against a REAL WebGL device (this browser has WebGL):
+//   - the "auto" backend upgrades canvas → WebGL with pass-through layers present, and the
+//     pass-through point survives the upgrade (read back from the now-WebGL-backed canvas),
+//   - explicit backend:"webgl" renders a pass-through point, accumulates an append, carries
+//     per-point colors, and snapshot-pans during a gesture then settles crisp.
 
 const proj = () => geoEquirectangular().scale(50).translate([100, 100]);
 const point = (lon: number, lat: number): GeoJSON.Feature => ({
@@ -309,8 +318,10 @@ describe('passThrough "auto" backend upgrade guard (Phase 1: WebGL has no PT)', 
     stubbedWebGL: BackendHandle | null = null;
     constructor(host: HTMLElement, opts: PlotOptions) { super(host, opts); }
     protected createWebGLBackend(): Promise<BackendHandle> {
-      // A canvas-backed handle is a fully-working backend, but we force supportsPassThrough falsy
-      // to mimic WebGL (no PT support yet). Real WebGLBackend leaves the flag undefined too.
+      // A canvas-backed handle is a fully-working backend, but we force supportsPassThrough
+      // FALSY to exercise the defensive abort guard. The REAL WebGLBackend now sets
+      // supportsPassThrough = true (so a real auto-upgrade PROCEEDS — see the real test below);
+      // the stub forces it falsy ONLY to drive the graceful-abort path without a GPU device.
       const h = createCanvasBackend(this.host, this.width, this.height);
       (h.backend as { supportsPassThrough?: boolean }).supportsPassThrough = false;
       this.stubbedWebGL = h;
@@ -366,7 +377,137 @@ describe('passThrough "auto" backend upgrade guard (Phase 1: WebGL has no PT)', 
     chart.points("pts", [{ x: 60, y: 60 }], { x: (d) => d.x, y: (d) => d.y, radius: 6, fill: "rgb(255,0,0)", passThrough: true });
     // SVG declares supportsPassThrough = false; an explicit swap surfaces via whenReady().
     chart.setBackend("svg");
-    await expect(chart.whenReady()).rejects.toThrow(/passThrough is not supported.*canvas backend; WebGL pass-through is not yet supported/);
+    await expect(chart.whenReady()).rejects.toThrow(/passThrough is not supported.*canvas or webgl backend/);
+    chart.destroy();
+  });
+});
+
+/**
+ * A REAL-WebGL Plot subclass (no stub of createWebGLBackend — the test browser has WebGL).
+ * It exposes the same minimal, test-only seams as StubPlot above:
+ *   - awaitUpgrade(): the private upgradeDone promise, so the test can await the background
+ *     "auto" → WebGL upgrade precisely (whenReady() for "auto" resolves at the canvas paint,
+ *     while the upgrade is still in flight);
+ *   - liveBackendType(): the protected backendType();
+ *   - screenPixel(): reads a pixel from the live WebGL backend's onscreen canvas via the
+ *     backend's readScreenPixel() test aid (the WebGL canvas has a webgl2 context, not "2d",
+ *     so getImageData() is unavailable — we read real GPU pixels off the default framebuffer);
+ *   - interact()/applyTransform(): drive the engine's protected setInteracting()/setTransform()
+ *     — the exact calls d3-zoom's start/zoom/end handlers make — so snapshot-pan is exercised
+ *     end-to-end through the engine without synthesizing real pointer events.
+ * No public API is added; these mirror StubPlot's existing seam pattern.
+ */
+class GLPlot extends Plot {
+  awaitUpgrade(): Promise<void> {
+    return (this as unknown as { upgradeDone: Promise<void> | null }).upgradeDone ?? Promise.resolve();
+  }
+  liveBackendType(): string {
+    return (this as unknown as { backendType(): string }).backendType();
+  }
+  private gl(): WebGLBackend {
+    return (this as unknown as { backend(): WebGLBackend | null }).backend()!;
+  }
+  screenPixel(x: number, y: number): number[] {
+    return this.gl().readScreenPixel(x, y);
+  }
+  interact(v: boolean): void {
+    (this as unknown as { setInteracting(v: boolean): void }).setInteracting(v);
+  }
+  applyTransform(t: ViewTransform): void {
+    (this as unknown as { setTransform(t: ViewTransform): this }).setTransform(t);
+  }
+}
+
+describe('passThrough "auto" backend real upgrade to WebGL (Phase 2: WebGL has PT)', () => {
+  it("auto-upgrades canvas → WebGL with a pass-through layer present; the point survives the upgrade", async () => {
+    const h = host();
+    const chart = new GLPlot(h, { width: 200, height: 200, backend: "auto" });
+    // Register a pass-through point on the synchronous canvas first paint, BEFORE the
+    // background upgrade settles. WebGL now supports pass-through, so the upgrade PROCEEDS:
+    // installBackend re-registers + repaints the PT layer onto the WebGL backend.
+    chart.points("pts", [{ x: 60, y: 60 }], { x: (d) => d.x, y: (d) => d.y, radius: 8, fill: "rgb(255,0,0)", passThrough: true });
+    await chart.whenReady(); // canvas first paint (upgrade still in flight)
+
+    // Drive the REAL background WebGL upgrade to completion (no stub).
+    await expect(chart.awaitUpgrade()).resolves.toBeUndefined();
+
+    // (a) the live backend committed to WebGL.
+    expect(chart.liveBackendType()).toBe("webgl");
+    // (b) the pass-through point is still rendered, read back as real GPU pixels from the
+    //     now-WebGL-backed canvas (the canvas element was swapped during the upgrade).
+    const px = chart.screenPixel(60, 60);
+    expect(px[0]!).toBeGreaterThan(180); // red where the point is
+    expect(px[3]!).toBeGreaterThan(180); // opaque
+    const away = chart.screenPixel(10, 10);
+    expect(away[3]!).toBeLessThan(40);   // nothing elsewhere
+    chart.destroy();
+  });
+});
+
+describe("passThrough rendering (webgl backend)", () => {
+  it("draws a pass-through point at its projected screen location", async () => {
+    const h = host();
+    const chart = new GLPlot(h, { width: 200, height: 200, backend: "webgl" });
+    await chart.whenReady();
+    chart.points("pts", [{ x: 60, y: 60 }], { x: (d) => d.x, y: (d) => d.y, radius: 8, fill: "rgb(255,0,0)", passThrough: true });
+    const px = chart.screenPixel(60, 60);
+    expect(px[0]!).toBeGreaterThan(180); // red point present
+    expect(px[3]!).toBeGreaterThan(180); // opaque
+    expect(chart.screenPixel(10, 10)[3]!).toBeLessThan(40); // nothing elsewhere
+    chart.destroy();
+  });
+
+  it("handle.append() accumulates a second point (FBO accumulation) while the first remains", async () => {
+    const h = host();
+    const chart = new GLPlot(h, { width: 200, height: 200, backend: "webgl" });
+    await chart.whenReady();
+    const handle = chart.points("pts", [{ x: 50, y: 50 }], { x: (d) => d.x, y: (d) => d.y, radius: 8, fill: "rgb(255,0,0)", passThrough: true });
+    expect(chart.screenPixel(50, 50)[0]!).toBeGreaterThan(180); // first point drawn
+
+    handle.append([{ x: 140, y: 140 }]); // "append" mode → composited on top of the FBO
+    expect(chart.screenPixel(140, 140)[0]!).toBeGreaterThan(180); // second point appeared
+    expect(chart.screenPixel(50, 50)[0]!).toBeGreaterThan(180);   // first point still accumulated
+    chart.destroy();
+  });
+
+  it("renders per-point fill colors end-to-end (per-point color attribute)", async () => {
+    const h = host();
+    const chart = new GLPlot(h, { width: 200, height: 200, backend: "webgl" });
+    await chart.whenReady();
+    // Two points, distinct fills resolved per-datum. The packed RGBA per-vertex attribute must
+    // carry each point's own color through projectPoints → PassThroughGL → composite.
+    chart.points(
+      "pts",
+      [{ x: 50, y: 50, c: "rgb(255,0,0)" }, { x: 140, y: 140, c: "rgb(0,0,255)" }],
+      { x: (d) => d.x, y: (d) => d.y, radius: 8, fill: (d) => d.c, passThrough: true },
+    );
+    const red = chart.screenPixel(50, 50);
+    const blue = chart.screenPixel(140, 140);
+    expect(red[0]!).toBeGreaterThan(180); expect(red[2]!).toBeLessThan(60);  // first is red
+    expect(blue[2]!).toBeGreaterThan(180); expect(blue[0]!).toBeLessThan(60); // second is blue
+    chart.destroy();
+  });
+
+  it("snapshot-pan: the FBO blits to the panned location during a gesture, then settles crisp", async () => {
+    const h = host();
+    const chart = new GLPlot(h, { width: 200, height: 200, backend: "webgl" });
+    await chart.whenReady();
+    chart.points("pts", [{ x: 50, y: 50 }], { x: (d) => d.x, y: (d) => d.y, radius: 8, fill: "rgb(255,0,0)", passThrough: true });
+    expect(chart.screenPixel(50, 50)[0]!).toBeGreaterThan(180); // crisp at the origin
+
+    // Gesture start (d3-zoom "start" → setInteracting(true)): snapshot reference captured.
+    chart.interact(true);
+    // Pan by +40,+30 (d3-zoom "zoom" → setTransform): while interacting the backend blits the
+    // FBO under the delta instead of re-rasterizing, so the point appears at the panned spot.
+    chart.applyTransform({ k: 1, x: 40, y: 30 });
+    expect(chart.screenPixel(50, 50)[0]!).toBeLessThan(120);    // moved away from the old spot
+    expect(chart.screenPixel(90, 80)[0]!).toBeGreaterThan(180); // re-appears at +40,+30
+
+    // Settle (d3-zoom "end" → setInteracting(false)): crisp re-rasterize at the new transform.
+    chart.interact(false);
+    expect(chart.screenPixel(90, 80)[0]!).toBeGreaterThan(180); // still at the panned location
+    // After settle the old pre-pan pixel must be cleared (re-rasterize replaces; not composited on top).
+    expect(chart.screenPixel(50, 50)[0]!).toBeLessThan(60);     // original location cleared
     chart.destroy();
   });
 });

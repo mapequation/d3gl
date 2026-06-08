@@ -103,6 +103,33 @@ describe("WebGLBackend", () => {
     backend.destroy();
   });
 
+  it("composites a pass-through point on top of the retained base (preserve-composite)", async () => {
+    const canvas = document.createElement("canvas");
+    canvas.width = 64; canvas.height = 64;
+    document.body.appendChild(canvas);
+    const backend = await WebGLBackend.create(canvas, { width: 64, height: 64 });
+    // Retained full-canvas green base.
+    const base = rectLayer("base", 0, 0, 64, 64, "rgb(0,128,0)");
+    backend.setLayers([base]);
+    backend.setTransform({ k: 1, x: 0, y: 0 });
+    // Register a pass-through layer and draw one red point at the centre.
+    backend.setPassThroughLayer!({ name: "pts" });
+    backend.drawPassThrough!("pts", {
+      positions: new Float32Array([32, 32]),
+      radii: new Float32Array([8]),
+      colors: new Uint8Array([255, 0, 0, 255]),
+      count: 1,
+    }, "replace-first");
+    // Centre: red point composited over the base.
+    const center = backend.readPixel(32, 32);
+    expect(center[0]).toBeGreaterThan(200); // red point present
+    // Away from the point: the retained green base survived the preserve-composite.
+    const away = backend.readPixel(4, 4);
+    expect(away[1]).toBeGreaterThan(80);    // green base still there
+    expect(away[0]).toBeLessThan(60);       // not red (no point here)
+    backend.destroy();
+  });
+
   it("globe is not vertically flipped: north content renders at the top of the disc", async () => {
     const canvas = document.createElement("canvas"); canvas.width = 128; canvas.height = 128;
     document.body.appendChild(canvas);
