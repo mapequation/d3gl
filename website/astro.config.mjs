@@ -77,7 +77,10 @@ export default defineConfig({
     components: { SocialIcons: "./src/components/SocialIcons.astro" },
     plugins: [typeDocPlugin],
     sidebar: [
-      { label: "Start Here", items: [{ label: "Getting started", slug: "getting-started" }] },
+      { label: "Start Here", items: [
+        { label: "Getting started", slug: "getting-started" },
+        { label: "Rendering backends", slug: "rendering-backends" },
+      ] },
       {
         label: "Examples",
         items: [
