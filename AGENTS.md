@@ -37,12 +37,12 @@ This has bitten us repeatedly. The rule lives here, in
 ## Tests
 
 - Node unit tests: `pnpm test` (root vitest, node env; excludes `*.browser.test.ts`).
-- **Browser tests (`*.browser.test.ts`) currently hang** in this environment —
-  vitest browser mode (`@vitest/browser-playwright`, headless Chromium) launches the
-  browser but never connects, so the run sits at `Test Files 0 passed (N)` forever.
-  Don't rely on `pnpm --filter @mapequation/d3gl test:browser` to verify; instead use
-  `pnpm test` + per-package typecheck + careful review, and verify rendering visually
-  with `pnpm dev` in a normal browser.
+- **Browser tests** (`*.browser.test.ts`): run with `pnpm --filter @mapequation/d3gl
+  test:browser` (headless Chromium via `@vitest/browser-playwright`; pass a
+  package-relative path to target one file). They run reliably and are part of TDD —
+  a wall-clock watchdog (`packages/d3gl/scripts/run-browser-tests.mjs`) turns any
+  rare connect/teardown stall into a fast failure instead of an infinite hang. CI
+  (`ci.yml`) still runs only `pnpm test` (node), not the browser suite.
 
 ## Incremental layer append (status)
 
@@ -53,3 +53,39 @@ rebuilds the layer's renderer from the full buffers. The **O(new)** fast-path (S
 delta buffers + `bufferSubData`/`texSubImage2D` on WebGL, draw-on-top on Canvas) is
 designed but **deferred** — it needs interactive browser verification (see the browser
 test note above).
+
+## Releases (changesets, CI-published)
+
+Publishing is automated by `.github/workflows/release.yml` (the `changesets/action`
+on push to `main`) via npm **OIDC trusted publishing** — there is **no local publish
+and no token**. Do not run `changeset publish` / `npm publish` yourself. Steps:
+
+1. **Ensure the changes have changesets.** Each published-package change should ship a
+   `.changeset/<name>.md` (added in its feature PR). If one was forgotten, add it on a
+   branch (don't push to `main` directly):
+
+   ```md
+   ---
+   "@mapequation/d3gl": patch   # pre-1.0: `patch` for additions/fixes, `minor` ONLY for breaking changes (see CONTRIBUTING)
+   ---
+   <user-facing changelog summary>
+   ```
+
+   Verify with `pnpm changeset status` (reads every `.changeset/*.md`; note
+   `--since=main` only counts *committed* changesets, so a brand-new uncommitted file
+   shows nothing). Open a PR and merge it.
+2. On push to `main`, the workflow opens/updates the **"Version Packages"** PR (branch
+   `changeset-release/main`): it bumps `packages/d3gl/package.json`, rewrites
+   `CHANGELOG.md`, and deletes the consumed changeset files. Multiple changesets bundle
+   into one release.
+3. **Merge the "Version Packages" PR** → the workflow re-runs and this time executes
+   `pnpm run release` (`build:lib && changeset publish`): publishes to npm, pushes the
+   `@mapequation/d3gl@X.Y.Z` tag, and creates the GitHub release.
+4. **Verify + tidy:** `npm view @mapequation/d3gl version`, `gh release list`. The
+   primary worktree's local `main` may be behind (it can't be force-updated while
+   checked out) — `git checkout main && git pull --ff-only` it, and delete merged
+   feature/changeset branches (local + remote).
+
+Merging the Version Packages PR is the single action that publishes — but only what
+the accumulated changesets describe. No changesets ⇒ a push to `main` is a no-op
+release run.
