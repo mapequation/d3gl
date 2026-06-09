@@ -1,5 +1,13 @@
 # @d3gl/website
 
+## 0.0.4
+
+### Patch Changes
+
+- Updated dependencies [a03c1f8]
+- Updated dependencies [cc33ebb]
+  - @mapequation/d3gl@0.4.0
+
 ## 0.0.3
 
 ### Patch Changes
