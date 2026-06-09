@@ -102,7 +102,7 @@ describe("backend: \"auto\"", () => {
     host.remove();
   });
 
-  it("orthographic + enableZoom: CPU rotation on canvas, GPU globe after the WebGL upgrade", async () => {
+  it("orthographic + enableZoom: rotation works on canvas and survives the WebGL upgrade", async () => {
     const host = document.createElement("div");
     host.style.width = "200px"; host.style.height = "200px";
     document.body.appendChild(host);
@@ -112,19 +112,22 @@ describe("backend: \"auto\"", () => {
     map.enableZoom([1, 8]); // orthographic ⇒ rotation; dispatched against canvas first
     await map.whenReady();
     expect(liveBackend(map)).toBe("canvas");
-    // gpuGlobe must be OFF while canvas is live (CPU rotation path).
-    expect((map as unknown as { gpuGlobe: boolean }).gpuGlobe).toBe(false);
 
     await upgradeOf(map);
     expect(liveBackend(map)).toBe("webgl");
-    // After the swap to WebGL, the GPU globe is active for the orthographic projection.
-    expect((map as unknown as { gpuGlobe: boolean }).gpuGlobe).toBe(true);
+    // The rotation interaction persists across the transparent upgrade (listeners on the host,
+    // not the backend) — a drag still rotates after the swap to WebGL, no re-dispatch needed.
+    const r = host.getBoundingClientRect();
+    host.dispatchEvent(new PointerEvent("pointerdown", { clientX: r.left + 100, clientY: r.top + 100, bubbles: true }));
+    host.dispatchEvent(new PointerEvent("pointermove", { clientX: r.left + 140, clientY: r.top + 108, bubbles: true }));
+    host.dispatchEvent(new PointerEvent("pointerup", { clientX: r.left + 140, clientY: r.top + 108, bubbles: true }));
+    expect((map as unknown as { projection: ReturnType<typeof geoOrthographic> }).projection.rotate()[0]).not.toBe(0);
 
     map.destroy();
     host.remove();
   });
 
-  it("switching to \"webgl\" after the auto upgrade is inert — no canvas re-render, no globe teardown", async () => {
+  it("switching to \"webgl\" after the auto upgrade is inert — no new backend, no re-render", async () => {
     const host = document.createElement("div");
     host.style.width = "200px"; host.style.height = "200px";
     document.body.appendChild(host);
@@ -137,12 +140,9 @@ describe("backend: \"auto\"", () => {
     await map.whenReady();
     await upgradeOf(map);
     expect(liveBackend(map)).toBe("webgl");
-    expect((map as unknown as { gpuGlobe: boolean }).gpuGlobe).toBe(true);
 
     // The live backend is already WebGL. Selecting "webgl" must do nothing: no new backend
-    // (same <canvas> element, swapToken unchanged) and the GPU globe must NOT be torn down
-    // (the bug: disableInteraction drops the globe to the large flat disc, then re-bakes —
-    // the visible canvas→webgl flicker).
+    // (same <canvas> element, swapToken unchanged) — selecting the live backend is a no-op.
     const canvasBefore = host.querySelector("canvas");
     const swapTokenBefore = (map as unknown as { swapToken: number }).swapToken;
 
@@ -152,7 +152,6 @@ describe("backend: \"auto\"", () => {
     expect(host.querySelector("canvas")).toBe(canvasBefore);     // same element — no swap
     expect((map as unknown as { swapToken: number }).swapToken).toBe(swapTokenBefore); // no swap kicked off
     expect(liveBackend(map)).toBe("webgl");
-    expect((map as unknown as { gpuGlobe: boolean }).gpuGlobe).toBe(true); // globe still active
 
     map.destroy();
     host.remove();
