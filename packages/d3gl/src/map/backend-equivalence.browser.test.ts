@@ -35,10 +35,10 @@ describe("backend equivalence: overlapping bordered shapes (#41)", () => {
     const diff = diffPixels(gl, cv);
     // Sanity: the scene must actually have rendered content in both backends.
     expect(diff.considered).toBeGreaterThan(W * H * 0.2);
-    // Equivalence: at most a sliver of edge-antialiasing pixels may differ. The
-    // draw-order bug makes WebGL keep every white border on top while Canvas
-    // occludes them — that's a large mismatch (many percent), so this fails until
-    // WebGL composites in painter's order.
-    expect(diff.fraction).toBeLessThan(0.02);
+    // Equivalence (position-tolerant, so ~1px stroke-rasterizer differences don't count):
+    // the draw-order bug leaves several-px-wide white border bands on WebGL that Canvas
+    // occludes — far wider than the 1px tolerance, so it scores many percent and fails.
+    // Once WebGL composites in painter's order, only a handful of pixels differ (<0.5%).
+    expect(diff.fraction).toBeLessThan(0.01);
   });
 });

@@ -342,5 +342,6 @@ function deltaToBuffers(d: GroupBufferDelta): GroupBuffers {
     pointCount: d.pointCenters.length / 4,
     fillAnchors: d.fillAnchors,
     strokeAnchors: d.strokeAnchors,
+    ranges: d.ranges,
   };
 }

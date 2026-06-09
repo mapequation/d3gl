@@ -46,6 +46,10 @@ export interface GroupBuffers {
   fillAnchors: Float32Array;
   /** Per-stroke-vertex anchor [x, y] (parallel to strokeVertices) for screen sizeMode. */
   strokeAnchors: Float32Array;
+  /** Per-drawable fill/stroke vertex+index slices, in drawable (paint) order. Lets a
+   *  backend interleave fill and stroke per drawable (painter's order) rather than
+   *  drawing all fills then all strokes. Offsets are absolute into the arrays above. */
+  ranges: DrawableRange[];
 }
 
 /**
@@ -67,6 +71,9 @@ export interface GroupBufferDelta {
   strokeAnchors: Float32Array;
   drawableCount: number;
   fromDrawable: number;
+  /** Per-drawable ranges for the appended drawables only (offsets absolute into the
+   *  full group arrays, matching the group-absolute index values). See {@link GroupBuffers.ranges}. */
+  ranges: DrawableRange[];
 }
 
 export interface DrawableOpts {
@@ -354,6 +361,7 @@ export class Scene {
       pointCount: pointFlat.length / 4,
       fillAnchors: new Float32Array(data.fillAnchors),
       strokeAnchors: new Float32Array(data.strokeAnchors),
+      ranges: data.ranges,
     };
   }
 
@@ -375,7 +383,7 @@ export class Scene {
         strokeVertices: empty(), strokeIndices: new Uint32Array(0),
         fillColors: new Uint8Array(0), strokeColors: new Uint8Array(0), flags: new Uint8Array(0),
         pointCenters: empty(), fillAnchors: empty(), strokeAnchors: empty(),
-        drawableCount: dc, fromDrawable: from,
+        drawableCount: dc, fromDrawable: from, ranges: [],
       };
     }
     const r = data.ranges[from]!;
@@ -397,6 +405,9 @@ export class Scene {
       strokeAnchors: new Float32Array(data.strokeAnchors.slice(sv * 2)),
       drawableCount: dc,
       fromDrawable: from,
+      // Absolute offsets (into the full group arrays), matching the group-absolute
+      // index values above — the consumer rebases against ranges[0]'s offsets.
+      ranges: data.ranges.slice(from),
     };
   }
 }

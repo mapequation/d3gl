@@ -73,10 +73,24 @@ export function renderCanvas(scene: Scene, name: string, width: number, height: 
   return { width, height, data: new Uint8Array(img.data.buffer.slice(0)) };
 }
 
+export interface DiffOptions {
+  /** Max per-channel |Δ| for two pixels to count as equal (default 40). */
+  colorTolerance?: number;
+  /**
+   * Neighborhood radius (px) for the position-tolerant match (default 1). A pixel in
+   * `a` is a mismatch only if NO pixel within this radius in `b` matches it. This
+   * absorbs sub-pixel edge/border shifts (e.g. WebGL's tessellated stroke vs Canvas's
+   * native stroker land ~1px apart) while still flagging genuinely divergent regions —
+   * a several-px-wide band of the wrong color (a draw-order bug) has no nearby match.
+   * Set 0 for an exact-position diff.
+   */
+  radius?: number;
+}
+
 export interface DiffResult {
   /** Pixels considered (non-transparent in at least one buffer). */
   considered: number;
-  /** Pixels whose max per-channel |Δ| exceeds `tolerance`. */
+  /** Considered pixels with no color-tolerant match within `radius` in `b`. */
   mismatches: number;
   /** mismatches / considered (0 when nothing considered). */
   fraction: number;
@@ -85,39 +99,56 @@ export interface DiffResult {
 }
 
 /**
- * Per-pixel diff of two equally-sized buffers. A pixel is "considered" if either
- * buffer is non-transparent there; it's a mismatch if any channel differs by more
- * than `tolerance` (default 16, to absorb sub-pixel antialiasing along edges).
+ * Position-tolerant per-pixel diff of two equally-sized buffers. A pixel is
+ * "considered" if either buffer is non-transparent there; it's a mismatch if no pixel
+ * within `radius` of it in `b` matches its color within `colorTolerance`. See
+ * {@link DiffOptions.radius} for why the neighborhood search is the right metric for
+ * comparing two different rasterizers.
  */
-export function diffPixels(a: PixelBuffer, b: PixelBuffer, tolerance = 16): DiffResult {
+export function diffPixels(a: PixelBuffer, b: PixelBuffer, opts: DiffOptions = {}): DiffResult {
   if (a.width !== b.width || a.height !== b.height) {
     throw new Error(`size mismatch: ${a.width}x${a.height} vs ${b.width}x${b.height}`);
   }
+  const colorTolerance = opts.colorTolerance ?? 40;
+  const radius = opts.radius ?? 1;
+  const { width: W, height: H } = a;
+  const at = (data: Uint8Array, x: number, y: number): number => (y * W + x) * 4;
   let considered = 0;
   let mismatches = 0;
   const samples: DiffResult["samples"] = [];
-  const n = a.width * a.height;
-  for (let i = 0; i < n; i++) {
-    const o = i * 4;
-    const aa = a.data[o + 3]!;
-    const ba = b.data[o + 3]!;
-    if (aa === 0 && ba === 0) continue;
-    considered++;
-    const d = Math.max(
-      Math.abs(a.data[o]! - b.data[o]!),
-      Math.abs(a.data[o + 1]! - b.data[o + 1]!),
-      Math.abs(a.data[o + 2]! - b.data[o + 2]!),
-      Math.abs(aa - ba),
-    );
-    if (d > tolerance) {
-      mismatches++;
-      if (samples.length < 8) {
-        samples.push({
-          x: i % a.width,
-          y: Math.floor(i / a.width),
-          a: [a.data[o]!, a.data[o + 1]!, a.data[o + 2]!, aa],
-          b: [b.data[o]!, b.data[o + 1]!, b.data[o + 2]!, ba],
-        });
+  for (let y = 0; y < H; y++) {
+    for (let x = 0; x < W; x++) {
+      const o = at(a.data, x, y);
+      const aa = a.data[o + 3]!;
+      if (aa === 0 && b.data[o + 3]! === 0) continue;
+      considered++;
+      let matched = false;
+      for (let dy = -radius; dy <= radius && !matched; dy++) {
+        const ny = y + dy;
+        if (ny < 0 || ny >= H) continue;
+        for (let dx = -radius; dx <= radius; dx++) {
+          const nx = x + dx;
+          if (nx < 0 || nx >= W) continue;
+          const p = at(b.data, nx, ny);
+          const d = Math.max(
+            Math.abs(a.data[o]! - b.data[p]!),
+            Math.abs(a.data[o + 1]! - b.data[p + 1]!),
+            Math.abs(a.data[o + 2]! - b.data[p + 2]!),
+            Math.abs(aa - b.data[p + 3]!),
+          );
+          if (d <= colorTolerance) { matched = true; break; }
+        }
+      }
+      if (!matched) {
+        mismatches++;
+        if (samples.length < 8) {
+          const bo = at(b.data, x, y);
+          samples.push({
+            x, y,
+            a: [a.data[o]!, a.data[o + 1]!, a.data[o + 2]!, aa],
+            b: [b.data[bo]!, b.data[bo + 1]!, b.data[bo + 2]!, b.data[bo + 3]!],
+          });
+        }
       }
     }
   }
