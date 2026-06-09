@@ -12,9 +12,10 @@ Two probes:
 - **Overlapping bordered shapes** — a flower of opaque, overlapping discs with thick white
   borders. Because the discs overlap and are drawn in order, each disc's border is partly
   covered by later discs' fills — a sensitive probe of fill/stroke draw order.
-- **Stroke joins & caps** — thick polylines with sharp, acute, and closed corners, probing
-  join style and the miter limit (where backends used to differ: bevel vs miter, and miter
-  limit 10 vs 4).
+- **Stroke joins & caps** — thick polylines with sharp, acute, and closed corners. Toggle the
+  join (`miter`/`bevel`), end cap (`butt`/`square`/`round`), and miter limit to see all three
+  backends stay in lockstep (they used to differ: bevel vs miter, miter limit 10 vs 4, and
+  WebGL had no square/round caps).
 
 WebGL, Canvas, and SVG should agree on both. Zoom/pan any panel to inspect; the view mirrors
 across all panels.

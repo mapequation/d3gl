@@ -4,7 +4,7 @@ import { PathRecorder } from "../core/index.js";
 import versor, { type Angles, type Vec3, type Quaternion } from "../geo/versor.js";
 import { BaseEngine, type HoverHit, type LayerSpec } from "./base-engine.js";
 import type { BackendType } from "./backend-factory.js";
-import type { ViewTransform, LineJoin } from "../core/index.js";
+import type { ViewTransform, LineJoin, LineCap } from "../core/index.js";
 import { LayerHandle } from "./layer-handle.js";
 
 export interface GeoMapOptions {
@@ -23,6 +23,8 @@ export interface LayerOptions<F = any> {
   lineJoin?: LineJoin;
   /** Miter length / width above which a miter falls back to a bevel (default 10). */
   miterLimit?: number;
+  /** End-cap style for open strokes ("butt" default | "square" | "round"). */
+  lineCap?: LineCap;
   id?: (f: F, i: number) => string | number;
   /** "world" (default): radius scales with zoom. "screen": constant pixel size. */
   sizeMode?: "world" | "screen";
@@ -145,7 +147,7 @@ export class GeoMap extends BaseEngine {
     const offset = spec.data.length;
     const ids = items.map((f, j) => (opts.id ? opts.id(f, offset + j) : offset + j));
     const build = geoLayer(items as any[], this.projection, {
-      id: (_f, j) => ids[j]!, lineWidth: opts.lineWidth, lineJoin: opts.lineJoin, miterLimit: opts.miterLimit, pointRadius: opts.pointRadius, sizeMode: opts.sizeMode,
+      id: (_f, j) => ids[j]!, lineWidth: opts.lineWidth, lineJoin: opts.lineJoin, miterLimit: opts.miterLimit, lineCap: opts.lineCap, pointRadius: opts.pointRadius, sizeMode: opts.sizeMode,
     });
     this.appendToLayer(name, items, ids, build);
   }
@@ -281,7 +283,7 @@ export class GeoMap extends BaseEngine {
     return {
       name, data: list, ids, fill: opts.fill, stroke: opts.stroke, clipTo: opts.clipTo,
       sizeMode: opts.sizeMode, hideOnInteraction: opts.hideOnInteraction, pickable: opts.pickable,
-      build: geoLayer(list, this.projection, { id: (_f, i) => ids[i]!, lineWidth: opts.lineWidth, lineJoin: opts.lineJoin, miterLimit: opts.miterLimit, pointRadius: opts.pointRadius, sizeMode: opts.sizeMode }),
+      build: geoLayer(list, this.projection, { id: (_f, i) => ids[i]!, lineWidth: opts.lineWidth, lineJoin: opts.lineJoin, miterLimit: opts.miterLimit, lineCap: opts.lineCap, pointRadius: opts.pointRadius, sizeMode: opts.sizeMode }),
     };
   }
 }

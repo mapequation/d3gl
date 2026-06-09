@@ -199,7 +199,15 @@ export function overlappingBorderedShapes(width: number, height: number, petals 
  * and SVG mitered them (and at different default miter limits — 10 vs 4). The acute
  * spike is sharp enough to exceed a small miter limit, so it probes the bevel fallback.
  */
-export function strokeJoinShapes(width: number, height: number, lineWidth = Math.round(Math.min(width, height) * 0.07)): Scene {
+export interface JoinSceneOptions {
+  lineWidth?: number;
+  join?: "miter" | "bevel";
+  miterLimit?: number;
+  cap?: "butt" | "square" | "round";
+}
+
+export function strokeJoinShapes(width: number, height: number, opts: JoinSceneOptions = {}): Scene {
+  const lineWidth = opts.lineWidth ?? Math.round(Math.min(width, height) * 0.07);
   const x = (f: number): number => width * f;
   const y = (f: number): number => height * f;
   const lines: { color: string; closed?: boolean; pts: [number, number][] }[] = [
@@ -217,7 +225,7 @@ export function strokeJoinShapes(width: number, height: number, lineWidth = Math
           for (let k = 1; k < l.pts.length; k++) ctx.lineTo(l.pts[k]![0], l.pts[k]![1]);
           if (l.closed) ctx.closePath();
         },
-        { lineWidth },
+        { lineWidth, lineJoin: opts.join, miterLimit: opts.miterLimit, lineCap: opts.cap },
       );
     });
   });

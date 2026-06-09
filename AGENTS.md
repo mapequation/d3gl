@@ -145,13 +145,14 @@ of every fill and diverges from Canvas/SVG (issue #41). `GroupBuffers.ranges` ca
 the per-drawable fill/stroke slices the interleave needs.
 
 **Stroke joins/caps** must also match. WebGL `expandStroke` (`core/stroke.ts`) tessellates
-**miter** joins (bevel fallback past the miter limit), `lineJoin`/`miterLimit` thread from
-the layer options through `DrawableOpts` → `expandStroke` and onto `DrawableVector` so
-Canvas (`ctx.lineJoin`/`miterLimit`/`lineCap`) and SVG (`stroke-linejoin`/`-miterlimit`/
-`-linecap` in `svg/serialize.ts`) render the same corners. Pin them explicitly on every
-backend — the native defaults differ (Canvas miter limit 10, SVG 4, and WebGL used to bevel
-everything). Caps are butt only for now (round/square deferred — would need cap geometry in
-`expandStroke` before exposing a `lineCap` option).
+**miter** joins (bevel fallback past the miter limit) and **square/round** end caps (open
+subpaths only — a quad or a semicircle fan, built at geometry time, no per-frame cost).
+`lineJoin`/`miterLimit`/`lineCap` thread from the layer options through `DrawableOpts` →
+`expandStroke` and onto `DrawableVector` so Canvas (`ctx.lineJoin`/`miterLimit`/`lineCap`)
+and SVG (`stroke-linejoin`/`-miterlimit`/`-linecap` in `svg/serialize.ts`) render the same
+corners/ends. Pin them explicitly on every backend — the native defaults differ (Canvas
+miter limit 10, SVG 4, and WebGL used to bevel everything). Round *joins* are still deferred
+(would reuse the round-cap fan).
 
 Guard it with the **backend-equivalence harness**
 (`map/__tests__/backend-equivalence-harness.ts` + `map/backend-equivalence.browser.test.ts`):

@@ -1,4 +1,4 @@
-import type { GroupBuilder, PathContext, LineJoin } from "../core/index.js";
+import type { GroupBuilder, PathContext, LineJoin, LineCap } from "../core/index.js";
 import { BaseEngine } from "./base-engine.js";
 import type { BackendType } from "./backend-factory.js";
 import { LayerHandle } from "./layer-handle.js";
@@ -31,6 +31,9 @@ export interface PlotLayerOptions<D = any> {
   /** Miter length / stroke width above which a miter falls back to a bevel (default 10,
    *  matching the Canvas 2D default). Only affects "miter" joins. */
   miterLimit?: number;
+  /** End-cap style for open strokes: "butt" (default) | "square" | "round". Consistent
+   *  across WebGL/Canvas/SVG. */
+  lineCap?: LineCap;
   clipTo?: string;
   id?: (d: D, i: number) => string | number;
   /** "world" (default): geometry scales with zoom. "screen": constant pixel size — anchored
@@ -136,7 +139,7 @@ export class Plot extends BaseEngine {
     const lw = opts.lineWidth;
     const widthOf = typeof lw === "function" ? lw : (_d: D, _i: number) => lw as number;
     const anchorOf = opts.anchor;
-    const { lineJoin, miterLimit } = opts;
+    const { lineJoin, miterLimit, lineCap } = opts;
     // d3gl's PathContext implements the path-building subset d3 generators use; present
     // it as CanvasRenderingContext2D so user draw code needs no cast. Single cast here.
     return (g) =>
@@ -145,7 +148,7 @@ export class Plot extends BaseEngine {
           ids[j]!,
           (ctx: PathContext) => opts.draw(ctx as unknown as CanvasRenderingContext2D, d, base + j),
           lw != null || anchorOf
-            ? { lineWidth: lw != null ? widthOf(d, base + j) : 0, anchor: anchorOf?.(d, base + j), lineJoin, miterLimit }
+            ? { lineWidth: lw != null ? widthOf(d, base + j) : 0, anchor: anchorOf?.(d, base + j), lineJoin, miterLimit, lineCap }
             : undefined,
         ),
       );

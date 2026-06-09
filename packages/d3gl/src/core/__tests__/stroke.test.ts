@@ -62,6 +62,28 @@ describe("expandStroke", () => {
     expect(expandStroke(sp, 2, { miterLimit: 50 }).indices.length).toBe(24);
   });
 
+  it("adds no cap geometry for butt caps (default), a quad for square", () => {
+    const sp: Subpath = { points: [0, 0, 10, 0], closed: false };
+    const butt = expandStroke(sp, 2); // one quad, 6 indices, butt
+    expect(butt.indices.length).toBe(6);
+    const square = expandStroke(sp, 2, { cap: "square" });
+    // + a quad (2 tris) at each of the 2 ends = 12 more indices.
+    expect(square.indices.length).toBe(6 + 12);
+  });
+
+  it("tessellates round caps into a fan at each open end", () => {
+    const sp: Subpath = { points: [0, 0, 10, 0], closed: false };
+    const round = expandStroke(sp, 2, { cap: "round" });
+    expect(round.indices.length).toBeGreaterThan(6); // base quad + two fans
+    const vertexCount = round.vertices.length / 2;
+    for (const i of round.indices) expect(i).toBeLessThan(vertexCount);
+  });
+
+  it("adds no caps to a closed subpath (no ends)", () => {
+    const sp: Subpath = { points: [0, 0, 10, 0, 10, 10, 0, 10], closed: true };
+    expect(expandStroke(sp, 2, { cap: "round" }).indices.length).toBe(expandStroke(sp, 2).indices.length);
+  });
+
   it("returns empty geometry for zero width or a single point", () => {
     expect(expandStroke({ points: [0, 0, 10, 0], closed: false }, 0).indices).toHaveLength(0);
     expect(expandStroke({ points: [0, 0], closed: false }, 2).indices).toHaveLength(0);

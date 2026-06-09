@@ -93,8 +93,16 @@ export function makeLines(width: number, height: number): Line[] {
 
 const JOIN_LW = (width: number, height: number): number => Math.max(8, Math.round(Math.min(width, height) * 0.07));
 
-/** Add the stroke-joins/caps scene to a Plot and render it. */
-export function drawJoinsScene(chart: Plot, width: number, height: number): void {
+/** Stroke style for the joins/caps scene — exposed as interactive controls in the example. */
+export interface JoinStyle {
+  lineJoin: "miter" | "bevel";
+  lineCap: "butt" | "square" | "round";
+  miterLimit: number;
+}
+
+/** Add the stroke-joins/caps scene to a Plot and render it. The (re)build replaces the
+ *  "joins" layer, so changing a style control re-renders without recreating the engine. */
+export function drawJoinsScene(chart: Plot, width: number, height: number, style?: JoinStyle): void {
   const lines = makeLines(width, height);
   chart.layer("joins", lines, {
     draw: (ctx, l) => {
@@ -104,6 +112,9 @@ export function drawJoinsScene(chart: Plot, width: number, height: number): void
     },
     stroke: (l: Line) => l.color,
     lineWidth: JOIN_LW(width, height),
+    lineJoin: style?.lineJoin,
+    lineCap: style?.lineCap,
+    miterLimit: style?.miterLimit,
     id: (_l, i) => i,
   });
   chart.render();

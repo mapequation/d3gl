@@ -14,8 +14,10 @@ export interface StrokeGeometry {
   anchors: number[];
 }
 
-/** Stroke join style. "round" caps/joins are not yet tessellated (deferred). */
+/** Stroke join style. "round" joins are not yet tessellated (deferred). */
 export type LineJoin = "miter" | "bevel";
+/** Open-subpath end-cap style. */
+export type LineCap = "butt" | "square" | "round";
 
 export interface StrokeOptions {
   /** Corner style. "miter" extends to a sharp point (falling back to "bevel" past
@@ -24,6 +26,9 @@ export interface StrokeOptions {
   /** Miter length / stroke width above which a miter falls back to a bevel — the same
    *  definition Canvas (`ctx.miterLimit`) and SVG (`stroke-miterlimit`) use. Default 10. */
   miterLimit?: number;
+  /** End-cap style for OPEN subpaths: "butt" (default, flush), "square" (extends half the
+   *  width past the end), or "round" (a semicircle). Closed subpaths have no ends. */
+  cap?: LineCap;
 }
 
 /** Defaults match the Canvas 2D defaults and are pinned identically on Canvas/SVG so the
@@ -46,6 +51,7 @@ export const DEFAULT_MITER_LIMIT = 10;
 export function expandStroke(subpath: Subpath, width: number, options: StrokeOptions = {}): StrokeGeometry {
   const join = options.join ?? "miter";
   const miterLimit = options.miterLimit ?? DEFAULT_MITER_LIMIT;
+  const cap = options.cap ?? "butt";
   const vertices: number[] = [];
   const indices: number[] = [];
   const anchors: number[] = [];
@@ -143,6 +149,46 @@ export function expandStroke(subpath: Subpath, width: number, options: StrokeOpt
     const out1 = base + (outerLeft ? 1 : 3);
     const out2 = base + (outerLeft ? 2 : 4);
     indices.push(base + 0, out1, ai, base + 0, ai, out2);
+  }
+
+  // End caps (open subpaths only; closed paths have no ends). `ox,oy` is the unit
+  // OUTWARD direction (away from the path) at the endpoint; the cap extends from the
+  // end edge into that side. Built once per end — geometry only, no per-frame cost.
+  if (!subpath.closed && cap !== "butt") {
+    const addCap = (ex: number, ey: number, ox: number, oy: number): void => {
+      const nx = -oy, ny = ox; // unit normal (outward rotated +90°)
+      if (cap === "square") {
+        const b = vertices.length / 2;
+        vertices.push(
+          ex + nx * half, ey + ny * half,                       // 0 left edge
+          ex - nx * half, ey - ny * half,                       // 1 right edge
+          ex - nx * half + ox * half, ey - ny * half + oy * half, // 2 right far
+          ex + nx * half + ox * half, ey + ny * half + oy * half, // 3 left far
+        );
+        anchors.push(ex, ey, ex, ey, ex, ey, ex, ey);
+        indices.push(b + 0, b + 1, b + 2, b + 0, b + 2, b + 3);
+      } else {
+        // round: a semicircle fan from +normal through outward to -normal.
+        const segs = Math.max(4, Math.ceil(Math.PI / Math.acos(Math.max(-1, 1 - 0.25 / half))));
+        const center = vertices.length / 2;
+        vertices.push(ex, ey);
+        anchors.push(ex, ey);
+        const a0 = Math.atan2(ny, nx);
+        for (let s = 0; s <= segs; s++) {
+          const a = a0 - Math.PI * (s / segs);
+          vertices.push(ex + Math.cos(a) * half, ey + Math.sin(a) * half);
+          anchors.push(ex, ey);
+        }
+        for (let s = 0; s < segs; s++) indices.push(center, center + 1 + s, center + 2 + s);
+      }
+    };
+    // Start: outward is opposite segment 0's direction. End: along the last segment's.
+    let sdx = px(1) - px(0), sdy = py(1) - py(0);
+    const sl = Math.hypot(sdx, sdy);
+    if (sl > 0) { sdx /= sl; sdy /= sl; addCap(px(0), py(0), -sdx, -sdy); }
+    let edx = px(n - 1) - px(n - 2), edy = py(n - 1) - py(n - 2);
+    const el = Math.hypot(edx, edy);
+    if (el > 0) { edx /= el; edy /= el; addCap(px(n - 1), py(n - 1), edx, edy); }
   }
 
   return { vertices, indices, anchors };

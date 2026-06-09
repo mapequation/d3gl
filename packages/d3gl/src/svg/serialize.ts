@@ -37,7 +37,7 @@ function pathDScreen(d: DrawableVector, ax: number, ay: number, ox: number, oy: 
 function strokeAttrs(d: DrawableVector, width: number): string {
   if (!(d.stroke[3] > 0 && d.lineWidth > 0)) return "";
   const miter = d.lineJoin === "miter" ? ` stroke-miterlimit="${d.miterLimit}"` : "";
-  return ` stroke="${rgba(d.stroke)}" stroke-width="${width}" stroke-linejoin="${d.lineJoin}" stroke-linecap="butt"${miter}`;
+  return ` stroke="${rgba(d.stroke)}" stroke-width="${width}" stroke-linejoin="${d.lineJoin}" stroke-linecap="${d.lineCap}"${miter}`;
 }
 
 /** Render one drawable's fill/stroke attributes as a string of SVG elements. */

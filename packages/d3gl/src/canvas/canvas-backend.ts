@@ -285,7 +285,7 @@ export class CanvasBackend implements Backend {
         // Canvas defaults (which differ from SVG's default miter limit of 4).
         ctx.lineJoin = d.lineJoin;
         ctx.miterLimit = d.miterLimit;
-        ctx.lineCap = "butt";
+        ctx.lineCap = d.lineCap;
         ctx.stroke();
       }
     };

@@ -1,7 +1,7 @@
 import { PathRecorder } from "./path-recorder.js";
 import { groupRings } from "./rings.js";
 import { tessellateFill } from "./tessellate.js";
-import { expandStroke, DEFAULT_MITER_LIMIT, type LineJoin } from "./stroke.js";
+import { expandStroke, DEFAULT_MITER_LIMIT, type LineJoin, type LineCap } from "./stroke.js";
 import { rgb } from "d3-color";
 import type { Subpath } from "./path-context.js";
 
@@ -83,6 +83,8 @@ export interface DrawableOpts {
   lineJoin?: LineJoin;
   /** Miter length / width above which a miter falls back to a bevel (default 10). */
   miterLimit?: number;
+  /** End-cap style for open subpaths ("butt" default | "square" | "round"). */
+  lineCap?: LineCap;
   /**
    * Optional glyph anchor in world coordinates. When set, in "screen" sizeMode the whole
    * drawable (fill + stroke) is rendered at a constant pixel size around the projected
@@ -124,9 +126,10 @@ class GroupData {
   strokeAnchors: number[] = [];
   /** One array of circle centers per drawable (empty for path drawables). */
   circles: { x: number; y: number; r: number }[][] = [];
-  /** Per-drawable stroke join style + miter limit (parallel to lineWidths). */
+  /** Per-drawable stroke join style + miter limit + end cap (parallel to lineWidths). */
   joins: LineJoin[] = [];
   miterLimits: number[] = [];
+  caps: LineCap[] = [];
   constructor(public readonly tolerance: number) {}
 }
 
@@ -136,9 +139,10 @@ export interface DrawableVector {
   fill: [number, number, number, number];
   stroke: [number, number, number, number];
   lineWidth: number;
-  /** Stroke join style + miter limit (so Canvas/SVG match the WebGL stroke geometry). */
+  /** Stroke join style + miter limit + end cap (so Canvas/SVG match the WebGL stroke geometry). */
   lineJoin: LineJoin;
   miterLimit: number;
+  lineCap: LineCap;
   flags: number;
   circles: { x: number; y: number; r: number }[];
   /** Glyph anchor in world coords (null = none); used by backends for screen sizeMode. */
@@ -197,8 +201,10 @@ export class Scene {
     data.lineWidths.push(opts?.lineWidth ?? 0);
     const join: LineJoin = opts?.lineJoin ?? "miter";
     const miterLimit = opts?.miterLimit ?? DEFAULT_MITER_LIMIT;
+    const cap: LineCap = opts?.lineCap ?? "butt";
     data.joins.push(join);
     data.miterLimits.push(miterLimit);
+    data.caps.push(cap);
     const anchor = opts?.anchor ?? null;
     data.anchors.push(anchor);
 
@@ -229,7 +235,7 @@ export class Scene {
     const lineWidth = opts?.lineWidth ?? 0;
     if (lineWidth > 0) {
       for (const sp of subpaths) {
-        const sg = expandStroke(sp, lineWidth, { join, miterLimit });
+        const sg = expandStroke(sp, lineWidth, { join, miterLimit, cap });
         const baseVertex = data.strokeVerts.length / 3;
         for (let i = 0; i < sg.vertices.length; i += 2) {
           data.strokeVerts.push(sg.vertices[i]!, sg.vertices[i + 1]!, drawableId);
@@ -280,6 +286,7 @@ export class Scene {
     data.lineWidths.push(0);
     data.joins.push("miter");
     data.miterLimits.push(DEFAULT_MITER_LIMIT);
+    data.caps.push("butt");
     data.anchors.push(null);
     // Zero fill+stroke range to keep ranges index-aligned with drawableId.
     const fillVertexOffset = data.fillVerts.length / 3;
@@ -348,6 +355,7 @@ export class Scene {
         lineWidth: data.lineWidths[i]!,
         lineJoin: data.joins[i]!,
         miterLimit: data.miterLimits[i]!,
+        lineCap: data.caps[i]!,
         flags: data.flags[i]!,
         circles: data.circles[i]!,
         anchor: data.anchors[i]!,

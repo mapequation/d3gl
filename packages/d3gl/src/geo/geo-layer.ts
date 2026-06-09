@@ -1,6 +1,6 @@
 import { geoPath, geoDistance } from "d3-geo";
 import type { GeoProjection } from "d3-geo";
-import type { GroupBuilder, LineJoin } from "../core/index.js";
+import type { GroupBuilder, LineJoin, LineCap } from "../core/index.js";
 import type { GeoInput } from "./project.js";
 
 export interface GeoLayerOptions<F> {
@@ -11,6 +11,8 @@ export interface GeoLayerOptions<F> {
   lineJoin?: LineJoin;
   /** Miter length / width above which a miter falls back to a bevel (default 10). */
   miterLimit?: number;
+  /** End-cap style for open strokes ("butt" default | "square" | "round"). */
+  lineCap?: LineCap;
   /** Dot radius in projected px for Point/MultiPoint. */
   pointRadius?: number;
   /** "world" (default): radius scales with zoom. "screen": constant pixel size. */
@@ -63,7 +65,7 @@ export function geoLayer<F extends GeoInput>(
 ): (g: GroupBuilder) => void {
   const radius = opts.pointRadius ?? 3;
   const drawOpts = opts.lineWidth != null
-    ? { lineWidth: opts.lineWidth, lineJoin: opts.lineJoin, miterLimit: opts.miterLimit }
+    ? { lineWidth: opts.lineWidth, lineJoin: opts.lineJoin, miterLimit: opts.miterLimit, lineCap: opts.lineCap }
     : undefined;
   // Polygons/lines are clipped to the visible hemisphere by geoPath, but a raw
   // `projection(point)` returns coordinates even for back-facing points (they fold

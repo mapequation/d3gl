@@ -57,4 +57,19 @@ describe("backend equivalence: overlapping bordered shapes (#41)", () => {
     // same limit and Canvas is pinned to that limit + miter join + butt caps.
     expect(diff.fraction).toBeLessThan(0.01);
   });
+
+  it("WebGL round caps match Canvas", async () => {
+    const device = await makeDevice();
+    const scene = strokeJoinShapes(W, H, { cap: "round" });
+
+    const gl = renderWebGL(device, scene, "lines", W, H);
+    const cv = renderCanvas(scene, "lines", W, H);
+
+    const diff = diffPixels(gl, cv);
+    expect(diff.considered).toBeGreaterThan(W * H * 0.05);
+    // WebGL tessellates the round cap into a fan; Canvas draws a true arc. The
+    // position-tolerant diff absorbs the sub-pixel chord error; a missing cap (butt
+    // vs round) would leave a half-disc-sized mismatch well over the threshold.
+    expect(diff.fraction).toBeLessThan(0.01);
+  });
 });
