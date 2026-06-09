@@ -128,6 +128,30 @@ This has bitten us repeatedly. The rule lives here, in
   rare connect/teardown stall into a fast failure instead of an infinite hang. CI
   (`ci.yml`) still runs only `pnpm test` (node), not the browser suite.
 
+## Backend compositing equivalence (READ before touching the WebGL renderer)
+
+WebGL, Canvas, and SVG must composite a layer **identically**. The reference is the
+**painter's model**: for each drawable in order, fill then stroke (Canvas
+`drawShapes` / SVG document order). So a later drawable's fill correctly occludes an
+earlier drawable's *border* where they overlap.
+
+`GroupRenderer` (`webgl/renderer.ts`) therefore packs fill **and** stroke into ONE
+geometry pass whose index buffer is ordered **per drawable** —
+`fill_d, stroke_d, fill_{d+1}, …` — and draws it in a single indexed call (WebGL
+blends primitives in index order). An `a_isStroke` attribute picks the fill vs stroke
+color table in-shader; both tables stay `drawableId`-indexed. **Do not** split this
+back into separate all-fills-then-all-strokes passes — that puts every border on top
+of every fill and diverges from Canvas/SVG (issue #41). `GroupBuffers.ranges` carries
+the per-drawable fill/stroke slices the interleave needs.
+
+Guard it with the **backend-equivalence harness**
+(`map/__tests__/backend-equivalence-harness.ts` + `map/backend-equivalence.browser.test.ts`):
+it renders a Scene through both backends and pixel-diffs them. Use a **position-tolerant**
+diff (radius ≥ 1) — WebGL's tessellated stroke and Canvas's native stroker land ~1px
+apart along edges, so an exact-position diff reports ~6% noise that isn't a real
+divergence. The live `website` "Backend equivalence" example renders the same scene in
+all three backends side by side with synced zoom for eyeballing.
+
 ## Incremental layer append (status)
 
 `LayerHandle.append()` (`GeoMap.layer().append()` / `Plot.points().append()`) appends
