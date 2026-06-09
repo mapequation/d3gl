@@ -2,8 +2,9 @@
   "extends": "../../tsconfig.base.json",
   "compilerOptions": {
     "jsx": "react-jsx",
-    "noEmit": true
+    "noEmit": true,
+    "resolveJsonModule": true
   },
-  "include": ["src/**/*", "tsup.config.ts"],
+  "include": ["src/**/*", "tsup.config.ts", "package.json"],
   "exclude": ["src/**/*.test.ts", "src/**/*.test.tsx", "src/**/__screenshots__/**"]
 }

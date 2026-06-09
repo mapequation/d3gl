@@ -212,6 +212,9 @@
 /* Version badge shown to the left of the header social icons (see SocialIcons override). */
 @layer components {
   .d3gl-version {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.375rem;
     align-self: center;
     font-size: var(--sl-text-xs);
     font-variant-numeric: tabular-nums;
@@ -219,7 +222,23 @@
     text-decoration: none;
     white-space: nowrap;
   }
+  /* npm brand red, so the badge visibly reads as a link to the npm package. */
+  .d3gl-version__npm {
+    flex: none;
+    color: #cb3837;
+  }
   .d3gl-version:hover {
     color: var(--sl-color-text-accent);
+  }
+  .d3gl-version:hover .d3gl-version__npm {
+    color: var(--sl-color-text-accent);
+  }
+}
+
+/* The Changelog page renders the package CHANGELOG.md, whose leading
+   `# @mapequation/d3gl` h1 duplicates the Starlight page title — hide it. */
+@layer components {
+  .changelog-body > h1:first-child {
+    display: none;
   }
 }

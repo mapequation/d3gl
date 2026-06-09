@@ -96,7 +96,10 @@ export default defineConfig({
         ],
       },
       typeDocSidebarGroup,
-      { label: "Contributing", items: [{ label: "Contributing", slug: "contributing" }] },
+      { label: "Contributing", items: [
+        { label: "Contributing", slug: "contributing" },
+        { label: "Changelog", slug: "changelog" },
+      ] },
     ],
   }),
   // Provide the MDX integration explicitly so we can enable GitHub-Flavored Markdown
