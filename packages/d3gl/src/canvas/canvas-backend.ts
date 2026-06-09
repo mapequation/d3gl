@@ -32,10 +32,30 @@ export class CanvasBackend implements Backend {
    *  re-rendering — the backend holds no point data to redraw, so a normal render would drop them. */
   private ptSnapshot: { canvas: HTMLCanvasElement; transform: ViewTransform } | null = null;
 
+  /** Device pixels per CSS pixel (drawing buffer is CSS size × dpr — see backend-factory).
+   *  Folded into every setTransform so the backend's drawing code stays in CSS-px coords while
+   *  rendering at the physical resolution; 1 on a standard display (all the math below is ×1). */
+  private dpr: number;
+
   constructor(private canvas: HTMLCanvasElement, private width: number, private height: number) {
     const ctx = canvas.getContext("2d");
     if (!ctx) throw new Error("CanvasBackend: 2D context unavailable");
     this.ctx = ctx;
+    this.dpr = width > 0 ? canvas.width / width : 1;
+  }
+
+  /** Set the view transform (world → screen, CSS px) with the device-pixel scale folded in. */
+  private setView(t: ViewTransform): void {
+    this.ctx.setTransform(t.k * this.dpr, 0, 0, t.k * this.dpr, t.x * this.dpr, t.y * this.dpr);
+  }
+  /** Screen-space identity (1 CSS px = dpr device px), for constant-pixel glyphs/points. */
+  private setScreen(): void {
+    this.ctx.setTransform(this.dpr, 0, 0, this.dpr, 0, 0);
+  }
+  /** Clear the whole device-px backing store. */
+  private clearAll(): void {
+    this.ctx.setTransform(1, 0, 0, 1, 0, 0);
+    this.ctx.clearRect(0, 0, this.canvas.width, this.canvas.height);
   }
 
   setLayers(layers: RenderLayer[]): void {
@@ -78,17 +98,17 @@ export class CanvasBackend implements Backend {
         this.activeClip?.layer === layer.name && this.activeClip.k === t.k && this.activeClip.x === t.x && this.activeClip.y === t.y;
       if (!reuse) {
         this.releaseClip(); // pop any stale clip
-        ctx.setTransform(t.k, 0, 0, t.k, t.x, t.y);
+        this.setView(t);
         const path = this.clipPathFor(layer.clipTo);
         ctx.save();
         if (path) ctx.clip(path);
         this.activeClip = { layer: layer.name, k: t.k, x: t.x, y: t.y };
       } else {
-        ctx.setTransform(t.k, 0, 0, t.k, t.x, t.y); // clip already applied; just (re)assert the transform
+        this.setView(t); // clip already applied; just (re)assert the transform
       }
     } else {
       this.releaseClip();
-      ctx.setTransform(t.k, 0, 0, t.k, t.x, t.y);
+      this.setView(t);
     }
     this.drawShapes(delta.drawables, layer.sizeMode === "screen", t);
   }
@@ -100,10 +120,9 @@ export class CanvasBackend implements Backend {
     if (this.ptSnapshot) { this.compositeSnapshot(); return; }
     const { ctx } = this;
     this.releaseClip(); // any persistent append-clip is replaced by the per-layer clips below
-    ctx.setTransform(1, 0, 0, 1, 0, 0);
-    ctx.clearRect(0, 0, this.width, this.height);
+    this.clearAll();
     const t = this.transform;
-    ctx.setTransform(t.k, 0, 0, t.k, t.x, t.y);
+    this.setView(t);
     for (const layer of this.layers) {
       const path = layer.clipTo ? this.clipPathFor(layer.clipTo) : null;
       if (path) {
@@ -158,7 +177,7 @@ export class CanvasBackend implements Backend {
     const screen = this.ptLayers.get(name)?.sizeMode === "screen";
     const { positions, radii, colors, count } = batch;
     ctx.save();
-    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    this.setScreen(); // points are positioned in screen (CSS) px; dpr maps to device px
     for (let i = 0; i < count; i++) {
       const sx = t.k * positions[i * 2]! + t.x;
       const sy = t.k * positions[i * 2 + 1]! + t.y;
@@ -182,7 +201,7 @@ export class CanvasBackend implements Backend {
     const { ctx } = this;
     const t = this.transform;
     ctx.save();
-    ctx.setTransform(t.k, 0, 0, t.k, t.x, t.y);
+    this.setView(t);
     for (const p of paths) {
       const path = new Path2D();
       for (const s of p.subpaths) {
@@ -210,9 +229,9 @@ export class CanvasBackend implements Backend {
     const s = this.ptSnapshot!.transform;
     const t = this.transform;
     const a = t.k / s.k;
-    ctx.setTransform(1, 0, 0, 1, 0, 0);
-    ctx.clearRect(0, 0, this.width, this.height);
-    ctx.setTransform(a, 0, 0, a, t.x - a * s.x, t.y - a * s.y);
+    this.clearAll();
+    // The snapshot is a device-px raster; the pan delta (t-s) is in CSS px, so scale it by dpr.
+    ctx.setTransform(a, 0, 0, a, (t.x - a * s.x) * this.dpr, (t.y - a * s.y) * this.dpr);
     ctx.drawImage(this.ptSnapshot!.canvas, 0, 0);
     ctx.setTransform(1, 0, 0, 1, 0, 0);
   }
@@ -266,9 +285,9 @@ export class CanvasBackend implements Backend {
       if (d.circles.length > 0) {
         for (const c of d.circles) {
           if (screenMode) {
-            // Constant pixel radius: draw in identity transform at projected screen coords.
+            // Constant pixel radius: draw in screen space (CSS px) at projected screen coords.
             ctx.save();
-            ctx.setTransform(1, 0, 0, 1, 0, 0);
+            this.setScreen();
             ctx.beginPath();
             ctx.arc(t.k * c.x + t.x, t.k * c.y + t.y, c.r, 0, 2 * Math.PI);
             ctx.closePath();
@@ -286,7 +305,7 @@ export class CanvasBackend implements Backend {
         const [ax, ay] = d.anchor;
         const ox = t.k * ax + t.x, oy = t.k * ay + t.y;
         ctx.save();
-        ctx.setTransform(1, 0, 0, 1, 0, 0);
+        this.setScreen();
         ctx.beginPath();
         for (const s of d.subpaths) {
           const p = s.points; if (p.length < 2) continue;
