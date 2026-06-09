@@ -41,7 +41,7 @@ materialized up front.
 
 ## Streaming points on a world map
 
-<ExampleCard files={["streaming-points/draw.ts", "shared/streaming.ts"]}>
+<ExampleCard files={["streaming-points/draw.ts"]}>
   <StreamingPoints client:visible slot="demo" />
 </ExampleCard>
 
@@ -99,6 +99,6 @@ or per-feature updates. **Use pass-through** for huge or live-streaming sets whe
 during gestures is fine and picking isn't needed. The demo below streams to **10M** points with a
 flat memory footprint (default **auto** backend → upgrades to WebGL).
 
-<ExampleCard files={["streaming-passthrough/draw.ts", "shared/streaming.ts"]}>
+<ExampleCard files={["streaming-passthrough/draw.ts"]}>
   <StreamingPassthrough client:visible slot="demo" />
 </ExampleCard>
