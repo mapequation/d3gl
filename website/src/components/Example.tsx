@@ -76,6 +76,42 @@ function ActionButton(props: { onClick: () => void; children: ReactNode }) {
   );
 }
 
+/** A square icon button matching the action-button height, for terse controls. */
+function IconButton(props: { onClick: () => void; title: string; children: ReactNode }) {
+  return (
+    <button
+      type="button"
+      onClick={props.onClick}
+      title={props.title}
+      aria-label={props.title}
+      className="inline-flex h-6 w-6 items-center justify-center rounded-md border border-border bg-background text-foreground transition-colors outline-none hover:bg-muted focus-visible:ring-2 focus-visible:ring-outline/50"
+    >
+      {props.children}
+    </button>
+  );
+}
+
+/** Circular-arrow restart glyph (reset zoom/pan/options and re-mount the example). */
+function RestartIcon() {
+  return (
+    <svg
+      width="13"
+      height="13"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2.2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+      style={{ transform: "scaleX(-1)" }}
+    >
+      <path d="M3 13.2a9 9 0 1 0 3-7.2L3 8" />
+      <path d="M3 3v5h5" />
+    </svg>
+  );
+}
+
 /** A range slider with a live value label, committing on release. */
 function RangeSlider(props: {
   spec: Extract<ControlSpec, { type: "range" }>;
@@ -292,6 +328,9 @@ export default function Example(props: ExampleProps) {
           {backend === "svg" ? "Export SVG" : "Export PNG"}
         </ActionButton>
         <PerfMeter />
+        <IconButton onClick={handleReset} title="Restart example">
+          <RestartIcon />
+        </IconButton>
       </div>
 
       {hasControlsRow && (
