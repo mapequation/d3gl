@@ -136,9 +136,32 @@ the use case — what are you trying to draw?
 
 ## Releases
 
-Releases are automated with [Changesets](https://github.com/changesets/changesets).
-Merged changesets accumulate into a "Version Packages" pull request; merging that
-PR publishes `@mapequation/d3gl` to npm. Maintainers handle this — contributors
-only need to add a changeset.
+Releases are automated with [Changesets](https://github.com/changesets/changesets)
+and the **Release** workflow (`.github/workflows/release.yml`), which runs on every
+push to `main`. The flow:
+
+1. Each change to the published package lands with a **changeset** (see above). Its
+   bump type and summary drive the version and the changelog.
+2. Once changesets are on `main`, the workflow opens (or updates) a **"Version
+   Packages"** pull request that bumps the version and rewrites `CHANGELOG.md`,
+   consuming the changeset files.
+3. **To cut a release, a maintainer merges the "Version Packages" PR.** Merging it
+   re-runs the workflow, which builds and publishes `@mapequation/d3gl` to npm, then
+   pushes a git tag and creates a GitHub release.
+
+**So yes — merging the auto-generated "Version Packages" PR is all it takes.** Two
+things to know:
+
+- **The release contains only what has changesets.** If a merged feature forgot its
+  changeset, it's on `main` but won't appear in the Version PR. Fix it by adding a
+  changeset in a small follow-up PR (`pnpm changeset`, commit the `.changeset/*.md`);
+  once it lands on `main`, the workflow updates the Version PR to include it, then
+  merge that. Run `pnpm changeset status` any time to see what the next release will
+  bump.
+- **No tokens to manage.** Publishing uses npm [OIDC trusted publishing](https://docs.npmjs.com/trusted-publishers)
+  from CI — there's no `NPM_TOKEN` step you maintain, and you should not run
+  `changeset publish` / `npm publish` locally.
+
+Contributors only need to add a changeset; everything above is maintainer-side.
 
 Thanks again for contributing! 🎉
