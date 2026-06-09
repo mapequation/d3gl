@@ -81,6 +81,15 @@ export abstract class BaseEngine {
 
   constructor(protected host: HTMLElement, protected width: number, protected height: number, backend: BackendType) {
     this.currentBackend = backend;
+    // Backend canvases are positioned absolutely (see makeCanvas) so transiently-coexisting
+    // canvases during an "auto" upgrade overlap instead of stacking in normal flow. An
+    // absolute canvas anchors to its nearest positioned ancestor, so the host MUST be
+    // positioned — otherwise the canvas would escape to some outer ancestor. The React
+    // wrappers already set position:relative; for a bare-engine host that is still `static`,
+    // promote it to `relative` (a no-op if the consumer already positioned it).
+    if (typeof getComputedStyle === "function" && getComputedStyle(host).position === "static") {
+      host.style.position = "relative";
+    }
     if (backend === "auto") {
       // Instant canvas first paint; whenReady() resolves now. WebGL is built in the background.
       this.ready = Promise.resolve();
