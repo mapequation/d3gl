@@ -66,7 +66,7 @@ and no token**. Do not run `changeset publish` / `npm publish` yourself. Steps:
 
    ```md
    ---
-   "@mapequation/d3gl": minor   # bump type: see CONTRIBUTING (pre-1.0 convention)
+   "@mapequation/d3gl": patch   # pre-1.0: `patch` for additions/fixes, `minor` ONLY for breaking changes (see CONTRIBUTING)
    ---
    <user-facing changelog summary>
    ```
