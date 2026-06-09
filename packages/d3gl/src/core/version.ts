@@ -1,5 +1,5 @@
 // `__D3GL_VERSION__` is replaced at build time with the `package.json` version
-// (see tsup.config.ts `define`). The `typeof` guard keeps source-level / unbundled
+// (see tsdown.config.ts `define`). The `typeof` guard keeps source-level / unbundled
 // imports working without a build step — when the constant is not substituted
 // (e.g. the website's `src` aliases, vitest) it reads as `"undefined"` rather than
 // throwing a ReferenceError, and we fall back to a dev sentinel.

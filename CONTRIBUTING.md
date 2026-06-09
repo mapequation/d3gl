@@ -40,7 +40,7 @@ packages/d3gl/
     labels    HTML label overlay + culling
     map       geoMap / plot engines + d3-zoom wiring
     react     headless controller + React components
-  tsup.config.ts   builds the package + per-subpath .d.ts
+  tsdown.config.ts builds the package + per-subpath .d.ts
   vitest.config.ts browser-mode test config (WebGL / DOM / React)
 examples/
   app         the demo app (deployed to GitHub Pages)

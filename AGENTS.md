@@ -31,7 +31,7 @@ This has bitten us repeatedly. The rule lives here, in
   `pnpm --filter @d3gl/website exec astro check`.
 - **ESM import extensions:** import specifiers use `.js` even though sources are
   `.ts` (NodeNext/ESM convention — TS does not rewrite extensions). Do **not** change
-  them to `.ts`; `tsc`/`tsup` will fail. This applies to package and website source
+  them to `.ts`; `tsc`/`tsdown` will fail. This applies to package and website source
   alike.
 
 ## Tests
