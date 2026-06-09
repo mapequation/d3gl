@@ -36,6 +36,34 @@ long it stays useful:
 3. Move **Backlog → Ready** when triaged (manual — see below), **→ In progress** when
    you start, **→ In review** when the PR is open, **→ Done** on merge/close.
 4. Branch (worktree under `.claude/worktrees/`), open PR with `Fixes #N`.
+5. **Merge with squash** (see below), then **delete the feature branch** (local +
+   remote) once it's in `main`.
+
+### Merge strategy & branch cleanup
+
+**Squash-merge feature PRs** (`gh pr merge <N> --squash --delete-branch`). It's the
+default best practice here: one commit per PR keeps `main`'s history linear and
+readable, makes revert/bisect trivial, and the messy work-in-progress commits stay in
+the PR (where, per the issue-tracking rule above, throwaway reasoning belongs). Earlier
+PRs used merge commits or rebase-merges — those preserve ancestry but clutter `main`
+with intermediate commits and lose the one-PR-one-commit grouping, so don't carry that
+pattern forward. Reserve plain merge commits for genuine long-lived branches (none
+exist here today).
+
+**Delete the branch on merge.** `--delete-branch` removes it remotely; also prune
+locally:
+
+```sh
+git checkout main && git pull --ff-only
+git fetch --prune origin           # drop stale remote-tracking refs
+git branch -d <branch>             # delete local copy (safe; refuses if unmerged)
+```
+
+Caveat: a squash-merged branch is **not** an ancestor of `main`, so
+`git branch --merged` / `git branch -d` won't recognize it — confirm via the PR
+(`gh pr list --state merged`) and use `git branch -D` / `git push origin --delete` for
+those. **Never delete** `changeset-release/main` (the Changesets release bot branch) or
+any branch with an open PR.
 
 ### Issue body template
 
