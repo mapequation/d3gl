@@ -14,8 +14,8 @@ export interface StrokeGeometry {
   anchors: number[];
 }
 
-/** Stroke join style. "round" joins are not yet tessellated (deferred). */
-export type LineJoin = "miter" | "bevel";
+/** Stroke join style. */
+export type LineJoin = "miter" | "bevel" | "round";
 /** Open-subpath end-cap style. */
 export type LineCap = "butt" | "square" | "round";
 
@@ -41,7 +41,8 @@ export const DEFAULT_MITER_LIMIT = 10;
  * Each straight segment becomes a quad (2 triangles). Each join is filled per side: the
  * INNER side is a bevel (harmless overlap with the segment quads for opaque fills); the
  * OUTER side is a **miter** to a sharp apex — reproducing the Canvas/SVG painter look —
- * unless `join` is "bevel" or the miter exceeds `miterLimit` (then bevel). Closed subpaths
+ * unless `join` is "bevel" (flat) or "round" (an arc fan), or the miter exceeds
+ * `miterLimit` (then bevel). Closed subpaths
  * join every corner including the wrap-around; open subpaths use butt caps (no extra cap
  * geometry — round/square caps are deferred).
  *
@@ -123,14 +124,34 @@ export function expandStroke(subpath: Subpath, width: number, options: StrokeOpt
     );
     anchors.push(cx, cy, cx, cy, cx, cy, cx, cy, cx, cy);
     // Always fill both bevel triangles (center→prev→next on each side). This covers the
-    // inner side and, when not mitering, the outer side too.
+    // inner side and, when not extending the outer side, the outer side too.
     indices.push(base + 0, base + 1, base + 2, base + 0, base + 3, base + 4);
 
-    if (join !== "miter" || cross === 0) continue;
-    // Outer-side miter: bisector of the two outer normals, apex at half / cos(halfAngle).
+    if (join === "bevel" || cross === 0) continue;
+    // Outer-side unit normals (the side the corner opens toward).
     const outerLeft = cross < 0; // turning right → outer side is the left
     const o1x = outerLeft ? pnx : -pnx, o1y = outerLeft ? pny : -pny;
     const o2x = outerLeft ? nnx : -nnx, o2y = outerLeft ? nny : -nny;
+
+    if (join === "round") {
+      // Outer-side arc fan from the corner center, sweeping the turn angle (replaces the
+      // outer bevel chord with the rounded arc; overlap with the bevel is harmless).
+      const a1 = Math.atan2(o1y, o1x);
+      let delta = Math.atan2(o2y, o2x) - a1;
+      if (delta > Math.PI) delta -= 2 * Math.PI;
+      if (delta < -Math.PI) delta += 2 * Math.PI;
+      const segs = Math.max(1, Math.ceil(Math.abs(delta) / Math.acos(Math.max(-1, 1 - 0.25 / half))));
+      const c0 = vertices.length / 2;
+      for (let s = 0; s <= segs; s++) {
+        const a = a1 + delta * (s / segs);
+        vertices.push(cx + Math.cos(a) * half, cy + Math.sin(a) * half);
+        anchors.push(cx, cy);
+      }
+      for (let s = 0; s < segs; s++) indices.push(base + 0, c0 + s, c0 + s + 1);
+      continue;
+    }
+
+    // Outer-side miter: bisector of the two outer normals, apex at half / cos(halfAngle).
     let bx2 = o1x + o2x, by2 = o1y + o2y;
     const bl = Math.hypot(bx2, by2);
     if (bl === 0) continue; // ~180° fold: nothing to miter

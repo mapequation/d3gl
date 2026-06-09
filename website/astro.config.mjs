@@ -85,6 +85,7 @@ export default defineConfig({
       {
         label: "Examples",
         items: [
+          { label: "Backend equivalence", slug: "examples/backend-equivalence" },
           { label: "Phylogenetic tree", slug: "examples/tree/phylogenetic-tree" },
           { label: "Ancestral ranges", slug: "examples/tree/ancestral-ranges" },
           { label: "World map", slug: "examples/map/world-map" },
@@ -92,7 +93,6 @@ export default defineConfig({
           { label: "Heatmap", slug: "examples/map/heatmap" },
           { label: "Map projections", slug: "examples/map/map-projections" },
           { label: "Streaming data", slug: "examples/map/streaming" },
-          { label: "Backend equivalence", slug: "examples/backend-equivalence" },
           { label: "React", slug: "examples/react" },
         ],
       },

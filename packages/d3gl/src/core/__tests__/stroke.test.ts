@@ -54,6 +54,15 @@ describe("expandStroke", () => {
     for (const i of indices) expect(i).toBeLessThan(vertexCount);
   });
 
+  it("rounds interior corners with an arc fan when join is 'round'", () => {
+    const sp: Subpath = { points: [0, 0, 10, 0, 10, 10], closed: false };
+    const round = expandStroke(sp, 2, { join: "round" });
+    // 2 quads (12) + 1 join: bevels (6) + an arc fan (≥ 1 extra triangle) → more than bevel's 18.
+    expect(round.indices.length).toBeGreaterThan(18);
+    const vertexCount = round.vertices.length / 2;
+    for (const i of round.indices) expect(i).toBeLessThan(vertexCount);
+  });
+
   it("falls back to bevel when the miter exceeds the miter limit (acute spike)", () => {
     const sp: Subpath = { points: [0, 0, 10, 0, 0, 1], closed: false }; // ~5° spike at (10,0)
     // Default limit 10: the acute miter is too long → bevel only (12 + 6 = 18).

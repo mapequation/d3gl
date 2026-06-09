@@ -72,4 +72,18 @@ describe("backend equivalence: overlapping bordered shapes (#41)", () => {
     // vs round) would leave a half-disc-sized mismatch well over the threshold.
     expect(diff.fraction).toBeLessThan(0.01);
   });
+
+  it("WebGL round joins match Canvas", async () => {
+    const device = await makeDevice();
+    const scene = strokeJoinShapes(W, H, { join: "round" });
+
+    const gl = renderWebGL(device, scene, "lines", W, H);
+    const cv = renderCanvas(scene, "lines", W, H);
+
+    const diff = diffPixels(gl, cv);
+    expect(diff.considered).toBeGreaterThan(W * H * 0.05);
+    // WebGL's arc-fan round join vs Canvas's native round join — sub-pixel chord error
+    // only. A miter/bevel fallback at sharp corners would leave a multi-px divergence.
+    expect(diff.fraction).toBeLessThan(0.01);
+  });
 });

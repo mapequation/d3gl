@@ -108,7 +108,7 @@ export default function BackendEquivalence() {
           <div className="flex flex-wrap items-center gap-x-4 gap-y-2">
             <label className="flex items-center gap-1.5">
               <span className="text-muted-foreground text-[11px]">Join</span>
-              <Segmented value={style.lineJoin} options={["miter", "bevel"] as const} onChange={(lineJoin) => setStyle((s) => ({ ...s, lineJoin }))} />
+              <Segmented value={style.lineJoin} options={["miter", "bevel", "round"] as const} onChange={(lineJoin) => setStyle((s) => ({ ...s, lineJoin }))} />
             </label>
             <label className="flex items-center gap-1.5">
               <span className="text-muted-foreground text-[11px]">Cap</span>

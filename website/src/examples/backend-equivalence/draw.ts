@@ -95,7 +95,7 @@ const JOIN_LW = (width: number, height: number): number => Math.max(8, Math.roun
 
 /** Stroke style for the joins/caps scene — exposed as interactive controls in the example. */
 export interface JoinStyle {
-  lineJoin: "miter" | "bevel";
+  lineJoin: "miter" | "bevel" | "round";
   lineCap: "butt" | "square" | "round";
   miterLimit: number;
 }

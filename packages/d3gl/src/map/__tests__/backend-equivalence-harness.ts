@@ -201,7 +201,7 @@ export function overlappingBorderedShapes(width: number, height: number, petals 
  */
 export interface JoinSceneOptions {
   lineWidth?: number;
-  join?: "miter" | "bevel";
+  join?: "miter" | "bevel" | "round";
   miterLimit?: number;
   cap?: "butt" | "square" | "round";
 }
