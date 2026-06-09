@@ -7,7 +7,7 @@ import type { ControlSpec } from "../types.js";
 const controls: ControlSpec[] = [
   { key: "stream", label: "Stream", options: ["run", "pause"] },
   { type: "button", key: "restart", label: "Restart" },
-  { type: "select", key: "size", label: "Data size", options: DATA_SIZES, value: "100k" },
+  { type: "select", key: "size", label: "Data size", options: DATA_SIZES, value: "1M" },
   { type: "select", key: "batch", label: "Batch size", options: BATCH_SIZES, value: "adaptive" },
   { type: "select", key: "rate", label: "Batch delay (ms)", options: RATES_MS, value: "0" },
   { type: "button", key: "randomize", label: "Randomize colors" },

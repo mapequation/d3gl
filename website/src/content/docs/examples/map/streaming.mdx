@@ -32,7 +32,8 @@ The source (`makeStreamingPoints` / `makeStreamingPolygons` in `shared/geo-data.
 async generator that yields batches lazily up to the chosen total, so nothing is
 materialized up front.
 
-> **Backend matters.** These examples default to the **canvas** backend, where append is
+> **Backend matters.** The point examples default to the **canvas** backend (the polygons
+> example defaults to **auto**), where append is
 > truly O(new) (new geometry is drawn on top, no full redraw) — so adaptive batching ramps
 > up and the stream stays fast. On **WebGL**, append currently rebuilds the whole layer
 > renderer per batch (O(total)); adaptive then *backs off* the batch to hold the frame
