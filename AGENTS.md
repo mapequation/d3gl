@@ -3,6 +3,62 @@
 Notes for anyone (human or agent) working in this repo. Read before touching geo
 rendering, the build, or the test setup.
 
+## Issue-tracking workflow (do this for non-trivial work)
+
+The expensive part of a session is the reasoning — hypotheses tried, tests run to
+*rule things out*, the eventual root cause. None of it survives in a merged PR.
+Capture it in GitHub issues so a future session can resume. Knowledge tiers, by how
+long it stays useful:
+
+- **Repo (`AGENTS.md` / `docs/`)** — recurs across tasks (architectural gotcha,
+  non-obvious constraint, recurring failure mode). The only tier re-read
+  automatically next session → durable learnings go here, not in a closed issue.
+  `docs/specs` + `docs/plans` (superpowers skills) hold a task's spec/plan.
+- **Issue** — *this problem's* understanding. Body = current answer (living doc:
+  repro, confirmed root cause, ruled-out paths); edit as understanding changes.
+  Comment thread = chronological work log; post negative results explicitly ("tried
+  X, ruled out by Y") — most expensive thing to rediscover. End of session: summarize
+  with `gh issue comment` or edit the body.
+- **PR** — only diff-shaped reasoning (why this approach, tradeoffs, review replies).
+  Dies at merge; inline comments detach on rebase. Put **`Fixes #N`** in the PR body
+  to auto-close + link issue ↔ PR ↔ commits.
+- **New / sub-issues** — a *genuinely new* problem → its own issue, linked
+  (`Related to #N`). Same problem getting deeper → stays on the original. Multi-phase
+  work → **sub-issues** under a parent (board tracks `Sub-issues progress`).
+
+### Lifecycle (per task)
+
+1. **Open the issue first**, before branching. Create it in the repo, then add it to
+   the project — don't rely on the project's "default repository" auto-create.
+2. Add to the board: `gh project item-add 4 --owner mapequation --url <issue-url>`
+   (lands in **Backlog**). Needs `project,read:project` scopes
+   (`gh auth refresh -s project,read:project`).
+3. Move **Backlog → Ready** when triaged (manual — see below), **→ In progress** when
+   you start, **→ In review** when the PR is open, **→ Done** on merge/close.
+4. Branch (worktree under `.claude/worktrees/`), open PR with `Fixes #N`.
+
+### Issue body template
+
+```md
+## Context        # what's wrong / the situation, why it matters
+## Goal           # one-sentence outcome
+## Scope          # what's in — bullets, concrete
+## Files / pointers   # repo-relative paths + symbols to start from
+## Acceptance criteria  # how we know it's done (testable)
+## Dependencies   # blocking issues (#N), prerequisites
+## Non-goals      # explicitly out of scope
+## Effort         # Small / Medium / Large
+```
+
+### Project board (`mapequation/d3gl`, org project #4)
+
+Status field: **Backlog → Ready → In progress → In review → Done.** Built-in
+workflows (Project ▸ ⋯ ▸ Workflows) automate entry/exit only — *Item added* →
+Backlog, *PR merged* / *Issue closed* → Done. **Backlog → Ready and In progress / In
+review have no built-in automation**: move them manually (Ready = deliberate
+"groomed & prioritized" triage signal). Automate only via a label-driven GitHub
+Action if wanted — not a built-in workflow.
+
 ## GeoJSON winding (READ THIS before generating polygons)
 
 `geoPath` fills polygons **on the sphere**, so a ring's orientation selects which
