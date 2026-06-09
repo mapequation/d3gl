@@ -58,6 +58,11 @@ function resolveSpec(fromFile: string, spec: string): string | null {
 /** Regex that matches import/export … from "spec" and bare import "spec". */
 const importRe = /(?:^|\s)(?:import|export)\s[^"']*["']([^"']+)["']/gm;
 
+/** Auto-discovered deps to NOT surface as tabs (harness plumbing, not example content).
+ *  `shared/types.ts` is the ImperativeSetup/ExampleContext contract — noise in every example.
+ *  An explicit `files` entry is always honored; this only filters transitively-discovered deps. */
+const AUTO_DEP_EXCLUDE = new Set(["shared/types.ts"]);
+
 /**
  * BFS: starting from `files`, discover all locally-imported sources
  * (transitively). Returns a deduped ordered list: explicit entries first,
@@ -85,7 +90,7 @@ function discoverDeps(entryFiles: string[]): string[] {
     importRe.lastIndex = 0;
     while ((match = importRe.exec(src)) !== null) {
       const resolved = resolveSpec(f, match[1]);
-      if (resolved) enqueue(resolved);
+      if (resolved && !AUTO_DEP_EXCLUDE.has(resolved)) enqueue(resolved);
     }
   }
 
