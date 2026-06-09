@@ -6,6 +6,7 @@ import type {
   ExampleContext,
   ExampleEngine,
 } from "../examples/types.js";
+import { ErrorBoundary } from "./ErrorBoundary.js";
 
 // ---------------------------------------------------------------------------
 // Themed control primitives. These intentionally do NOT import the starwind
@@ -198,9 +199,9 @@ export default function Example(props: ExampleProps) {
   const initialBackend = (defaults.backend as Backend) ?? "auto";
   const [backend, setBackend] = useState<Backend>(initialBackend);
 
-  // Example-specific control values, seeded from each control's default then any
-  // page-supplied `defaults`.
-  const [options, setOptions] = useState<Record<string, unknown>>(() => {
+  // The default control values (each control's default, then page `defaults`).
+  // Captured as a function so reset-to-default can rebuild them.
+  const defaultOptions = (): Record<string, unknown> => {
     const o: Record<string, unknown> = {};
     for (const c of controls) {
       o[c.key] =
@@ -214,7 +215,23 @@ export default function Example(props: ExampleProps) {
     }
     for (const [k, v] of Object.entries(defaults)) if (k !== "backend") o[k] = v;
     return o;
-  });
+  };
+
+  // Example-specific control values, seeded from each control's default then any
+  // page-supplied `defaults`.
+  const [options, setOptions] = useState<Record<string, unknown>>(defaultOptions);
+
+  // Bumped on reset to force a full re-mount of the example (fresh engine) after
+  // an error, so it rebuilds cleanly on the (supported) default backend.
+  const [resetKey, setResetKey] = useState(0);
+
+  // Restore the DEFAULT (supported) backend + options and re-mount the example so
+  // a failed swap (e.g. svg + passThrough) recovers into a working state.
+  const handleReset = (): void => {
+    setBackend(initialBackend);
+    setOptions(defaultOptions());
+    setResetKey((k) => k + 1);
+  };
 
   // Measure the canvas container so the viz renders 1:1 at the container size.
   const canvasRef = useRef<HTMLDivElement>(null);
@@ -341,7 +358,9 @@ export default function Example(props: ExampleProps) {
         className="d3gl-canvas relative w-full bg-white"
         style={{ maxWidth: width, height }}
       >
-        {children(ctx)}
+        <ErrorBoundary key={resetKey} onReset={handleReset}>
+          {children(ctx)}
+        </ErrorBoundary>
       </div>
     </div>
   );

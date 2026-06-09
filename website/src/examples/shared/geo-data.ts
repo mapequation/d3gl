@@ -300,7 +300,13 @@ function clusteredLonLat(rng: () => number, p: Parent): [number, number] {
  */
 function randomRangeRing(rng: () => number, clon: number, clat: number, size: number): [number, number][] {
   const verts = 3 + Math.floor(rng() * 8); // 3..10
-  const base = size * (0.15 + 0.5 * rng()); // varied overall size
+  // Strongly heavy-tailed size: the vast majority of ranges are TINY and only ~3% are
+  // visibly large. At high counts the translucent fill then reads as a density gradient
+  // (clustered richness hotspots) instead of saturating the whole map red.
+  const base =
+    rng() < 0.03
+      ? size * (0.1 + 0.15 * rng()) // ~3% larger ranges: 0.10..0.25 * size
+      : size * (0.02 + 0.07 * rng() * rng()); // most tiny: 0.02..0.09 * size, biased small (rng²)
   const latScale = 1 / Math.max(0.25, Math.cos((clat * Math.PI) / 180));
   const ring: [number, number][] = [];
   for (let i = 0; i < verts; i++) {

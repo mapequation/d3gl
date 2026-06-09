@@ -7,6 +7,8 @@ import ExampleCard from "../../../../components/ExampleCard.astro";
 import StreamingPoints from "../../../../examples/streaming-points/StreamingPoints.tsx";
 import StreamingPolygons from "../../../../examples/streaming-polygons/StreamingPolygons.tsx";
 import StreamingScatter from "../../../../examples/streaming-scatter/StreamingScatter.tsx";
+import StreamingPassthrough from "../../../../examples/streaming-passthrough/StreamingPassthrough.tsx";
+import StreamingPassthroughPolygons from "../../../../examples/streaming-passthrough-polygons/StreamingPassthroughPolygons.tsx";
 
 `layer.append(batch)` streams new features into an existing layer **without re-projecting
 the features already on screen** — the key to live data like species occurrences. Points
@@ -30,7 +32,8 @@ The source (`makeStreamingPoints` / `makeStreamingPolygons` in `shared/geo-data.
 async generator that yields batches lazily up to the chosen total, so nothing is
 materialized up front.
 
-> **Backend matters.** These examples default to the **canvas** backend, where append is
+> **Backend matters.** The point examples default to the **canvas** backend (the polygons
+> example defaults to **auto**), where append is
 > truly O(new) (new geometry is drawn on top, no full redraw) — so adaptive batching ramps
 > up and the stream stays fast. On **WebGL**, append currently rebuilds the whole layer
 > renderer per batch (O(total)); adaptive then *backs off* the batch to hold the frame
@@ -40,7 +43,7 @@ materialized up front.
 
 ## Streaming points on a world map
 
-<ExampleCard files={["streaming-points/draw.ts", "shared/streaming.ts"]}>
+<ExampleCard files={["streaming-points/draw.ts"]}>
   <StreamingPoints client:visible slot="demo" />
 </ExampleCard>
 
@@ -58,4 +61,60 @@ shape emerges — `Plot.points().append()` is the same incremental append as the
 
 <ExampleCard files={["streaming-scatter/draw.ts"]}>
   <StreamingScatter client:visible slot="demo" />
+</ExampleCard>
+
+## Pass-through: uncapped streaming
+
+The examples above **retain** every feature in d3gl so it can re-project, recolor, and
+hit-test — which caps out around 4–16M features (storage, not drawing, is the limit).
+**Pass-through** mode (`passThrough: true`) retains **nothing** in d3gl: you own the data, and
+d3gl pulls from it, draws, and discards on each repaint. The ceiling becomes whatever your own
+array costs — 250M+ for a packed `Float32Array`. Pass `features` (or `points` data) as a
+**callback** that returns your current array; d3gl re-invokes it on each full repaint, and
+`handle.append(batch)` draws new arrivals immediately.
+
+```js
+let nodes = [];                                  // you own the data
+const layer = map.layer("nodes", () => nodes, {  // callback, re-pulled per repaint
+  passThrough: true,
+  fill: (f) => f.properties.color,
+});
+// stream in:
+nodes.push(...batch);
+layer.append(batch);                             // draws the new batch on top, O(new)
+```
+
+It works for **all GeoJSON geometry** on **both Canvas and WebGL** (points → analytic circles;
+polygons/lines → projected paths, re-tessellated per settle on WebGL). The trade-off:
+
+| | Retained (default) | Pass-through |
+|---|---|---|
+| Ceiling | ~4–16M | your array (250M+) |
+| Memory in d3gl | ~130–480 B/feature | ~0 |
+| During pan/zoom | always crisp | slightly stale raster, re-crisp on settle |
+| Picking (`pick`/hover) | yes | no |
+| Per-feature recolor / mutate | yes | re-pull from your data |
+| Clip to another layer (`clipTo`) | yes | **not yet** (ignored) |
+| Backends | all (incl. SVG) | Canvas + WebGL (SVG rejects it) |
+
+**Use retained** for datasets up to a few million where you need crisp interaction, hit-testing,
+or per-feature updates. **Use pass-through** for huge or live-streaming sets where a brief raster
+during gestures is fine and picking isn't needed. The demo below streams to **10M** points with a
+flat memory footprint (default **auto** backend → upgrades to WebGL).
+
+<ExampleCard files={["streaming-passthrough/draw.ts"]}>
+  <StreamingPassthrough client:visible slot="demo" />
+</ExampleCard>
+
+### Pass-through polygons
+
+Pass-through works for **polygons and lines** too, not just points. On **WebGL** the full set
+re-tessellates on every pan/zoom settle (the documented cost of pass-through for path geometry);
+on **Canvas** it re-projects paths, same as retained. The demo below streams **1M** translucent
+polygon ranges via the pass-through path — raise "Data size" to push the ceiling further. Unlike
+the retained polygons example above, these ranges are **not clipped to land** — `clipTo` isn't
+applied to pass-through layers yet (see the trade-off table), so ranges appear over the ocean too.
+
+<ExampleCard files={["streaming-passthrough-polygons/draw.ts"]}>
+  <StreamingPassthroughPolygons client:visible slot="demo" />
 </ExampleCard>

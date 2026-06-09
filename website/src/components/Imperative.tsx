@@ -1,4 +1,4 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import type { Backend, ExampleContext, ExampleEngine, ImperativeSetup } from "../examples/types.js";
 
 export interface ImperativeProps {
@@ -36,6 +36,9 @@ export default function Imperative({ ctx, setup }: ImperativeProps) {
   // no-op switch that would otherwise fire on mount (and after a size-driven recreate) —
   // which would needlessly re-init the backend (and, for "auto", flash a second canvas).
   const createdBackend = useRef<Backend>(ctx.backend);
+  // Updater that re-throws during render so an ASYNC backend-swap rejection (which
+  // happens inside engine.whenReady(), not during render) reaches the ErrorBoundary.
+  const [, setSwapError] = useState<null>(null);
 
   const { backend, width, height, options, registerEngine } = ctx;
   const optionsKey = JSON.stringify(options);
@@ -128,7 +131,23 @@ export default function Imperative({ ctx, setup }: ImperativeProps) {
   useEffect(() => {
     if (backend === createdBackend.current) return;
     createdBackend.current = backend;
-    engineRef.current?.setBackend(backend);
+    const engine = engineRef.current;
+    if (!engine) return;
+    let cancelled = false;
+    engine.setBackend(backend);
+    // setBackend does its work in an async promise (engine.whenReady()), so an
+    // unsupported-backend throw (e.g. svg + passThrough) rejects there, not during
+    // render. Re-throw it through setState so the nearest ErrorBoundary catches it.
+    const ready = (engine as { whenReady?: () => Promise<void> }).whenReady?.();
+    ready?.catch?.((err: unknown) => {
+      if (cancelled) return;
+      setSwapError(() => {
+        throw err instanceof Error ? err : new Error(String(err));
+      });
+    });
+    return () => {
+      cancelled = true;
+    };
   }, [backend]);
 
   return <div ref={hostRef} style={{ width: "100%", height: "100%" }} />;

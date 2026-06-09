@@ -13,8 +13,8 @@ const controls: ControlSpec[] = [
   { type: "button", key: "randomize", label: "Randomize colors" },
 ];
 
-/** Streaming random polygon cells, appended live onto an equirectangular map. */
-export default function StreamingPolygons() {
+/** Streaming random polygon ranges via the pass-through path — flat GPU memory, re-tessellates on settle. */
+export default function StreamingPassthroughPolygons() {
   return (
     <Example width={720} height={420} controls={controls} defaults={{ backend: "auto" }}>
       {(ctx) => <Imperative ctx={ctx} setup={setup} />}

@@ -6,8 +6,103 @@ const { files } = Astro.props;
 
 // All example sources as raw strings, resolved at build time.
 const raw = import.meta.glob("../examples/**/*.{ts,tsx}", { query: "?raw", import: "default", eager: true }) as Record<string, string>;
-const tabs = files.map((f) => ({
+
+/**
+ * Resolve a relative import specifier from an importing file to an
+ * example-relative path (e.g. "streaming-points/draw.ts"), or null if it
+ * doesn't resolve to a known source in the raw glob.
+ *
+ * fromFile: example-relative path like "streaming-points/draw.ts"
+ * spec:     import specifier like "../shared/geo-data.js" or "./util.js"
+ */
+function resolveSpec(fromFile: string, spec: string): string | null {
+  // Only follow relative imports.
+  if (!spec.startsWith("./") && !spec.startsWith("../")) return null;
+
+  // Compute the directory of the importing file (example-relative).
+  const fromParts = fromFile.split("/");
+  const dirParts = fromParts.slice(0, -1); // drop filename
+
+  // Resolve spec segments against the directory.
+  const specParts = spec.split("/");
+  const resolved = [...dirParts];
+  for (const seg of specParts) {
+    if (seg === ".") continue;
+    if (seg === "..") { resolved.pop(); }
+    else { resolved.push(seg); }
+  }
+  const base = resolved.join("/");
+
+  // Try candidate extensions in preference order.
+  // ESM imports use .js but the actual source is .ts / .tsx.
+  const candidates: string[] = [];
+  if (base.endsWith(".js")) {
+    // .js → try .ts then .tsx
+    const stem = base.slice(0, -3);
+    candidates.push(`${stem}.ts`, `${stem}.tsx`);
+  } else if (base.endsWith(".jsx")) {
+    candidates.push(`${base.slice(0, -4)}.tsx`);
+  } else if (base.endsWith(".ts") || base.endsWith(".tsx")) {
+    candidates.push(base);
+  } else {
+    // No extension — try .ts then .tsx
+    candidates.push(`${base}.ts`, `${base}.tsx`);
+  }
+
+  for (const candidate of candidates) {
+    if (`../examples/${candidate}` in raw) return candidate;
+  }
+  return null;
+}
+
+/** Regex that matches import/export … from "spec" and bare import "spec". */
+const importRe = /(?:^|\s)(?:import|export)\s[^"']*["']([^"']+)["']/gm;
+
+/** Auto-discovered deps to NOT surface as tabs (harness plumbing, not example content).
+ *  `types.ts` (examples-root) is the ImperativeSetup/ExampleContext contract, imported by
+ *  every example as `../types.js` — noise in every code panel. An explicit `files` entry is
+ *  always honored; this only filters transitively-discovered deps. */
+const AUTO_DEP_EXCLUDE = new Set(["types.ts"]);
+
+/**
+ * BFS: starting from `files`, discover all locally-imported sources
+ * (transitively). Returns a deduped ordered list: explicit entries first,
+ * then discovered deps in discovery order.
+ */
+function discoverDeps(entryFiles: string[]): string[] {
+  const ordered: string[] = [];
+  const visited = new Set<string>();
+
+  const enqueue = (f: string) => {
+    if (visited.has(f)) return;
+    visited.add(f);
+    ordered.push(f);
+  };
+
+  for (const f of entryFiles) enqueue(f);
+
+  // BFS over `ordered` — length grows as we discover new files.
+  for (let i = 0; i < ordered.length; i++) {
+    const f = ordered[i];
+    const src = raw[`../examples/${f}`];
+    if (!src) continue; // explicit file missing — skip dep scan
+
+    let match: RegExpExecArray | null;
+    importRe.lastIndex = 0;
+    while ((match = importRe.exec(src)) !== null) {
+      const resolved = resolveSpec(f, match[1]);
+      if (resolved && !AUTO_DEP_EXCLUDE.has(resolved)) enqueue(resolved);
+    }
+  }
+
+  return ordered;
+}
+
+const allFiles = discoverDeps(files);
+
+const tabs = allFiles.map((f) => ({
   name: f.split("/").pop()!,
+  // Explicit files get the missing fallback; discovered ones are existence-checked already.
   code: raw[`../examples/${f}`] ?? `// missing: ${f}`,
   lang: f.endsWith(".tsx") ? "tsx" : "ts",
 }));

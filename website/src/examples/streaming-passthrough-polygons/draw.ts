@@ -8,13 +8,20 @@ import type { ImperativeSetup } from "../types.js";
 const OCEAN = "#dbe7f3";
 const LAND = "#e9e7df";
 const RANGE_ALPHA = 0.05; // very transparent so overlapping ranges build up a density gradient
-const DEFAULT_RANGE_COLOR = `hsla(8, 80%, 53%, ${RANGE_ALPHA})`; // translucent red
 
 /**
- * Stream small polygon cells (clustered around cities + rivers) and append them
- * live with `layer.append`. Only new cells project/tessellate per batch; existing
- * ones stay put, clipped to land. All cells start red; "Randomize colors" sets the
- * color for future cells and rewrites + `recolor()`s the retained ones.
+ * Stream polygon "ranges" using the pass-through path (`passThrough: true`).
+ * The engine re-reads `() => retained` on each repaint — so pan/zoom re-projects
+ * (and on WebGL re-tessellates) the full set, with no ceiling inside d3gl.
+ *
+ * Contrast with `streaming-polygons` (retained path): that example supports
+ * picking and per-feature recolor; this one is uncapped and not pickable.
+ * New batches draw immediately via `cells.append(batch)`; the callback
+ * covers full repaints (pan/zoom settle).
+ *
+ * WebGL re-tessellates the full set on every pan/zoom settle — the documented
+ * cost of pass-through for polygon/line geometry. Use a modest data-size default
+ * so the demo stays responsive; raise it if you want to test limits.
  */
 export const setup: ImperativeSetup = (host, { width, height, backend, options }) => {
   const world = loadWorld();
@@ -25,14 +32,16 @@ export const setup: ImperativeSetup = (host, { width, height, backend, options }
   map.enableZoom([1, 40]);
 
   const retained: StreamPolygon[] = [];
-  let currentColor = DEFAULT_RANGE_COLOR; // translucent; new ranges get this color
+  let currentColor = `hsla(8, 80%, 53%, ${RANGE_ALPHA})`; // translucent red; new ranges get this
   const cellOpts = {
     fill: (f: StreamPolygon) => f.properties.color,
-    id: (f: StreamPolygon) => f.properties.id,
-    clipTo: "land", // only show ranges over land
-    pickable: false, // huge streamed layer — skip the hit index to save memory
+    // pass-through layers are not pickable (no hit index); no id/clipTo needed
   };
-  let cells: LayerHandle<StreamPolygon> = map.layer("cells", [], cellOpts);
+  // passThrough: true — engine re-invokes `() => retained` each repaint (pan/zoom)
+  let cells: LayerHandle<StreamPolygon> = map.layer("cells", () => retained, {
+    passThrough: true,
+    ...cellOpts,
+  });
   map.render();
 
   const stats = createStatsOverlay(host);
@@ -40,16 +49,16 @@ export const setup: ImperativeSetup = (host, { width, height, backend, options }
   let appendMs = 0;
 
   let seed = 1;
-  let total = DATA_SIZE_TOTALS[String(options.size)] ?? 1_000_000;
+  let total = DATA_SIZE_TOTALS[String(options.size)] ?? 100_000;
   const ctrl = new StreamController<StreamPolygon>({
-    source: (o) => makeStreamingPolygons({ total, ...o }), // large ranges (default size)
+    source: (o) => makeStreamingPolygons({ total, ...o }),
     onBatch: (batch) => {
       for (const f of batch) {
-        f.properties.color = currentColor;
-        retained.push(f); // loop, not push(...spread): batch can be up to 1M
+        f.properties.color = currentColor; // new polygons get the current color
+        retained.push(f); // retain for repaint via the callback — loop (not spread) for large batches
       }
       const t0 = performance.now();
-      cells.append(batch);
+      cells.append(batch); // incremental draw — only the new batch projects/tessellates immediately
       appendMs += performance.now() - t0;
       count += batch.length;
       stats.update(count, total, count / (appendMs / 1000), ctrl.batchSize);
@@ -58,7 +67,8 @@ export const setup: ImperativeSetup = (host, { width, height, backend, options }
       retained.length = 0;
       count = 0;
       appendMs = 0;
-      cells = map.layer("cells", [], cellOpts);
+      // Re-register the layer (clears the pass-through buffer); callback still points at retained
+      cells = map.layer("cells", () => retained, { passThrough: true, ...cellOpts });
       stats.update(0, total, 0, ctrl.batchSize, true);
     },
   });
@@ -89,7 +99,7 @@ export const setup: ImperativeSetup = (host, { width, height, backend, options }
         lastRandomize = Number(o.randomize) || 0;
         currentColor = randomHsl(RANGE_ALPHA); // keep ranges translucent
         for (const f of retained) f.properties.color = currentColor;
-        cells.recolor();
+        cells.recolor(); // re-render from the retained, updated properties
       }
       const batchOpt = String(o.batch);
       const rate = Number(o.rate);
