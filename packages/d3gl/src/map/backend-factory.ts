@@ -35,6 +35,18 @@ function makeCanvas(host: HTMLElement, w: number, h: number): HTMLCanvasElement 
   const canvas = document.createElement("canvas");
   canvas.width = w; canvas.height = h;
   canvas.style.display = "block";
+  // Take the canvas out of normal flow and pin it to the host's top-left. The host is
+  // always positioned (the React <GeoMap>/<Plot> wrappers set position:relative; a bare
+  // engine host should too). This matters for "auto" mode: during the canvas→WebGL upgrade
+  // (and the React StrictMode double-mount that compounds it) two or more backend canvases
+  // coexist in the host for ~100s of ms. In normal flow each display:block canvas would
+  // stack vertically, inflating host height and pushing the live map below its reserved box
+  // — a visible "jump up" when the stale canvases detach. Absolute positioning overlaps them
+  // at the origin so the swap never affects layout. Hit-testing is unaffected: pointers are
+  // measured from host.getBoundingClientRect(), and the canvas sits at the host's origin.
+  canvas.style.position = "absolute";
+  canvas.style.top = "0";
+  canvas.style.left = "0";
   host.appendChild(canvas);
   return canvas;
 }
