@@ -135,28 +135,22 @@ describe("geoMap projections + rotation", () => {
     map.destroy();
   });
 
-  it("uses the GPU globe path on webgl + orthographic, CPU otherwise", async () => {
-    const host = mount();
-    const gpu = geoMap(host, { width: 200, height: 200, projection: geoOrthographic().fitSize([200, 200], sphere), backend: "webgl" });
-    await gpu.whenReady();
-    gpu.layer("land", [land()], { fill: "rgb(0,128,0)" });
-    gpu.enableZoom([0.5, 8]);
-    expect((gpu as any).gpuGlobe).toBe(true);
-    // A drag updates projection.rotate() but must NOT throw and must not depend on CPU rebuild.
-    const r = host.getBoundingClientRect();
-    host.dispatchEvent(new PointerEvent("pointerdown", { clientX: r.left + 100, clientY: r.top + 100, bubbles: true }));
-    host.dispatchEvent(new PointerEvent("pointermove", { clientX: r.left + 140, clientY: r.top + 110, bubbles: true }));
-    host.dispatchEvent(new PointerEvent("pointerup", { clientX: r.left + 140, clientY: r.top + 110, bubbles: true }));
-    expect((gpu as any).projection.rotate()[0]).not.toBe(0); // rotated
-    gpu.destroy();
-
-    const host2 = mount();
-    const cpu = geoMap(host2, { width: 200, height: 200, projection: geoOrthographic().fitSize([200, 200], sphere), backend: "canvas" });
-    await cpu.whenReady();
-    cpu.layer("land", [land()], { fill: "rgb(0,128,0)" });
-    cpu.enableZoom([0.5, 8]);
-    expect((cpu as any).gpuGlobe).toBe(false); // canvas → CPU path
-    cpu.destroy();
+  it("webgl + orthographic rotates via the same CPU reprojection path as canvas", async () => {
+    // Both backends render the identical geoPath-projected geometry; rotation re-projects on
+    // the CPU and pushes to whichever backend is live (no separate GPU bake path).
+    for (const backend of ["webgl", "canvas"] as const) {
+      const host = mount();
+      const map = geoMap(host, { width: 200, height: 200, projection: geoOrthographic().fitSize([200, 200], sphere), backend });
+      await map.whenReady();
+      map.layer("land", [land()], { fill: "rgb(0,128,0)" });
+      map.enableZoom([0.5, 8]);
+      const r = host.getBoundingClientRect();
+      host.dispatchEvent(new PointerEvent("pointerdown", { clientX: r.left + 100, clientY: r.top + 100, bubbles: true }));
+      host.dispatchEvent(new PointerEvent("pointermove", { clientX: r.left + 140, clientY: r.top + 110, bubbles: true }));
+      host.dispatchEvent(new PointerEvent("pointerup", { clientX: r.left + 140, clientY: r.top + 110, bubbles: true }));
+      expect((map as any).projection.rotate()[0]).not.toBe(0); // rotated, no throw, on both backends
+      map.destroy();
+    }
   });
 
   it("enableZoom dispatches: rotation for spherical, affine zoom for flat", async () => {
@@ -184,47 +178,84 @@ describe("geoMap projections + rotation", () => {
     flat.destroy();
   });
 
-  it("enableZoom on an unready webgl globe does not throw (backend resolves later)", async () => {
+  it("enableZoom on an unready webgl backend does not throw (backend resolves later)", async () => {
     const host = mount();
     const map = geoMap(host, { width: 200, height: 200, projection: geoOrthographic().fitSize([200,200], sphere), backend: "webgl" });
     map.layer("land", [land()], { fill: "rgb(0,128,0)" });
     expect(() => map.enableZoom([0.5, 8])).not.toThrow(); // called before whenReady()
     await map.whenReady();
-    await Promise.resolve(); // let the deferred init microtask run
-    expect((map as any).gpuGlobe).toBe(true);
-    map.destroy();
-  });
-
-  it("switching from the GPU globe to a flat projection tears down globe mode", async () => {
-    const host = mount();
-    const map = geoMap(host, { width: 200, height: 200, projection: geoOrthographic().fitSize([200,200], sphere), backend: "webgl" });
-    await map.whenReady();
-    map.layer("land", [land()], { fill: "rgb(0,128,0)" });
-    map.enableZoom([0.5, 8]);
     await Promise.resolve();
-    expect((map as any).gpuGlobe).toBe(true);
-    map.setProjection(geoMercator().fitSize([200,200], sphere));
-    expect((map as any).gpuGlobe).toBe(false); // flat now → affine path, no throw
-    map.destroy();
-  });
-
-  it("switching backend off webgl keeps the spherical projection rotating on the CPU", async () => {
-    const host = mount();
-    const map = geoMap(host, { width: 200, height: 200, projection: geoOrthographic().fitSize([200,200], sphere), backend: "webgl" });
-    await map.whenReady();
-    map.layer("land", [land()], { fill: "rgb(0,128,0)" });
-    map.enableZoom([0.5, 8]);
-    await Promise.resolve();
-    expect((map as any).gpuGlobe).toBe(true);
-    map.setBackend("canvas");
-    await map.whenReady();
-    expect((map as any).gpuGlobe).toBe(false); // canvas → CPU rotation re-established
-    // A drag now rotates via the CPU path (projection.rotate changes), no throw.
+    // Rotation works once the backend is live (a drag updates the projection, no throw).
     const r = host.getBoundingClientRect();
-    host.dispatchEvent(new PointerEvent("pointerdown", { clientX: r.left+100, clientY: r.top+100, bubbles: true }));
-    host.dispatchEvent(new PointerEvent("pointermove", { clientX: r.left+140, clientY: r.top+108, bubbles: true }));
-    host.dispatchEvent(new PointerEvent("pointerup", { clientX: r.left+140, clientY: r.top+108, bubbles: true }));
+    host.dispatchEvent(new PointerEvent("pointerdown", { clientX: r.left + 100, clientY: r.top + 100, bubbles: true }));
+    host.dispatchEvent(new PointerEvent("pointermove", { clientX: r.left + 140, clientY: r.top + 110, bubbles: true }));
+    host.dispatchEvent(new PointerEvent("pointerup", { clientX: r.left + 140, clientY: r.top + 110, bubbles: true }));
     expect((map as any).projection.rotate()[0]).not.toBe(0);
+    map.destroy();
+  });
+
+  it("rotation wheel-zoom limits stay anchored across a backend swap (can still zoom back out)", async () => {
+    // Regression: the wheel clamps zoom to [baseScale·minK, baseScale·maxK] where baseScale is
+    // the FITTED scale captured when the projection was set. A backend swap must NOT re-anchor it
+    // to the (already zoomed-in) live scale — that would ratchet the floor up and trap the zoom.
+    const host = mount();
+    const map = geoMap(host, { width: 200, height: 200, projection: geoOrthographic().fitSize([200, 200], sphere), backend: "canvas" });
+    await map.whenReady();
+    map.layer("land", [land()], { fill: "rgb(0,128,0)" });
+    map.enableZoom([0.5, 8]);
+    const fitted = (map as any).baseScale as number;
+
+    // Zoom IN a few notches.
+    for (let i = 0; i < 5; i++) host.dispatchEvent(new WheelEvent("wheel", { deltaY: -100, bubbles: true, cancelable: true }));
+    expect((map as any).projection.scale()).toBeGreaterThan(fitted);
+
+    // Swap backend while zoomed in, then zoom OUT hard — must return to the fitted floor.
+    map.setBackend("webgl");
+    await map.whenReady();
+    await Promise.resolve();
+    expect((map as any).baseScale).toBeCloseTo(fitted, 5); // anchor unchanged by the swap
+    for (let i = 0; i < 40; i++) host.dispatchEvent(new WheelEvent("wheel", { deltaY: 100, bubbles: true, cancelable: true }));
+    expect((map as any).projection.scale()).toBeCloseTo(fitted * 0.5, 1); // floor = baseScale·minK
+    map.destroy();
+  });
+
+  it("a backend swap preserves the current rotation AND zoom (shared projection state)", async () => {
+    const host = mount();
+    const map = geoMap(host, { width: 200, height: 200, projection: geoOrthographic().fitSize([200, 200], sphere), backend: "webgl" });
+    await map.whenReady();
+    await Promise.resolve();
+    map.layer("land", [land()], { fill: "rgb(0,128,0)" });
+    map.enableZoom([0.5, 8]);
+    // Rotate + zoom on webgl.
+    const r = host.getBoundingClientRect();
+    host.dispatchEvent(new PointerEvent("pointerdown", { clientX: r.left + 100, clientY: r.top + 100, bubbles: true }));
+    host.dispatchEvent(new PointerEvent("pointermove", { clientX: r.left + 140, clientY: r.top + 108, bubbles: true }));
+    host.dispatchEvent(new PointerEvent("pointerup", { clientX: r.left + 140, clientY: r.top + 108, bubbles: true }));
+    host.dispatchEvent(new WheelEvent("wheel", { deltaY: -100, bubbles: true, cancelable: true }));
+    const rot = (map as any).projection.rotate()[0];
+    const scl = (map as any).projection.scale();
+    expect(rot).not.toBe(0);
+
+    map.setBackend("canvas"); // zoom was lost on this swap before the unification
+    await map.whenReady();
+    expect((map as any).projection.rotate()[0]).toBeCloseTo(rot, 6); // rotation preserved
+    expect((map as any).projection.scale()).toBeCloseTo(scl, 6);     // zoom preserved too
+    map.destroy();
+  });
+
+  it("switching from orthographic to a flat projection re-dispatches affine pan/zoom", async () => {
+    const host = mount();
+    const map = geoMap(host, { width: 200, height: 200, projection: geoOrthographic().fitSize([200,200], sphere), backend: "webgl" });
+    await map.whenReady();
+    map.layer("land", [land()], { fill: "rgb(0,128,0)" });
+    map.enableZoom([0.5, 8]);
+    expect((map as any).isSpherical()).toBe(true);
+    map.setProjection(geoMercator().fitSize([200,200], sphere));
+    expect((map as any).isSpherical()).toBe(false); // flat now → affine path, no throw
+    // Wheel on a flat projection leaves projection.scale fixed (d3-zoom affine path).
+    const s0 = (map as any).projection.scale();
+    host.dispatchEvent(new WheelEvent("wheel", { deltaY: -100, bubbles: true, cancelable: true }));
+    expect((map as any).projection.scale()).toBe(s0);
     map.destroy();
   });
 });

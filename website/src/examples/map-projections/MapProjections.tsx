@@ -5,7 +5,7 @@ import type { ControlSpec } from "../types.js";
 
 const controls: ControlSpec[] = [
   { type: "select", key: "projection", label: "Projection", options: PROJECTION_NAMES, value: "Orthographic" },
-  { key: "features", label: "Features on zoom/rotate", options: ["hide", "show"] },
+  { key: "features", label: "Features on zoom/rotate", options: ["show", "hide"] },
 ];
 
 /** Harness wrapper: projection picker + rotatable globe driven by <Example>. */

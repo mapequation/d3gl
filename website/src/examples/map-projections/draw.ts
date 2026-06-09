@@ -82,7 +82,7 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
     // enable the interaction the projection calls for.
     render: (options) => {
       const name = (options.projection as string) ?? DEFAULT;
-      const hideFeatures = ((options.features as string) ?? "hide") !== "show";
+      const hideFeatures = ((options.features as string) ?? "show") !== "show";
 
       map.setProjection(fit(name));
       map.layer("cells", cells.map((c) => c.geometry), {
