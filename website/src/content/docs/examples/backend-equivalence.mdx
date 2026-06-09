@@ -6,11 +6,18 @@ description: The same overlapping bordered shapes rendered in WebGL, Canvas, and
 import ExampleCard from "../../../components/ExampleCard.astro";
 import BackendEquivalence from "../../../examples/backend-equivalence/BackendEquivalence.tsx";
 
-A flower of opaque, overlapping discs with thick white borders, rendered in all three
-backends at once. Because the discs overlap and are drawn in order, each disc's border is
-partly covered by later discs' fills — a sensitive probe of how a backend composites
-overlapping fills and strokes. WebGL, Canvas, and SVG should all agree. Zoom/pan any panel
-to inspect the overlaps; the view mirrors across all three.
+The same scene rendered in all three backends at once, to check they composite identically.
+Two probes:
+
+- **Overlapping bordered shapes** — a flower of opaque, overlapping discs with thick white
+  borders. Because the discs overlap and are drawn in order, each disc's border is partly
+  covered by later discs' fills — a sensitive probe of fill/stroke draw order.
+- **Stroke joins & caps** — thick polylines with sharp, acute, and closed corners, probing
+  join style and the miter limit (where backends used to differ: bevel vs miter, and miter
+  limit 10 vs 4).
+
+WebGL, Canvas, and SVG should agree on both. Zoom/pan any panel to inspect; the view mirrors
+across all panels.
 
 <ExampleCard files={["backend-equivalence/draw.ts"]}>
   <BackendEquivalence client:visible slot="demo" />

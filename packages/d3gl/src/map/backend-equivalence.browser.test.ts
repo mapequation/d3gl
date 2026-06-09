@@ -4,6 +4,7 @@ import { webgl2Adapter } from "@luma.gl/webgl";
 import type { Device } from "@luma.gl/core";
 import {
   overlappingBorderedShapes,
+  strokeJoinShapes,
   renderWebGL,
   renderCanvas,
   diffPixels,
@@ -39,6 +40,21 @@ describe("backend equivalence: overlapping bordered shapes (#41)", () => {
     // the draw-order bug leaves several-px-wide white border bands on WebGL that Canvas
     // occludes — far wider than the 1px tolerance, so it scores many percent and fails.
     // Once WebGL composites in painter's order, only a handful of pixels differ (<0.5%).
+    expect(diff.fraction).toBeLessThan(0.01);
+  });
+
+  it("WebGL strokes joins/caps identically to Canvas (miter + limit)", async () => {
+    const device = await makeDevice();
+    const scene = strokeJoinShapes(W, H);
+
+    const gl = renderWebGL(device, scene, "lines", W, H);
+    const cv = renderCanvas(scene, "lines", W, H);
+
+    const diff = diffPixels(gl, cv);
+    expect(diff.considered).toBeGreaterThan(W * H * 0.05);
+    // WebGL beveled every corner while Canvas miters them — sharp corners add several-px
+    // pointed regions far wider than the 1px tolerance. Passes once WebGL miters with the
+    // same limit and Canvas is pinned to that limit + miter join + butt caps.
     expect(diff.fraction).toBeLessThan(0.01);
   });
 });

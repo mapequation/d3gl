@@ -278,7 +278,16 @@ export class CanvasBackend implements Backend {
     const { ctx } = this;
     const fillStroke = (d: DrawableVector, strokeW: number): void => {
       if (d.fill[3] > 0) { ctx.fillStyle = css(d.fill); ctx.fill(); }
-      if (d.stroke[3] > 0 && strokeW > 0) { ctx.strokeStyle = css(d.stroke); ctx.lineWidth = strokeW; ctx.stroke(); }
+      if (d.stroke[3] > 0 && strokeW > 0) {
+        ctx.strokeStyle = css(d.stroke);
+        ctx.lineWidth = strokeW;
+        // Match the WebGL stroke geometry (and SVG): explicit join/limit/cap, not the
+        // Canvas defaults (which differ from SVG's default miter limit of 4).
+        ctx.lineJoin = d.lineJoin;
+        ctx.miterLimit = d.miterLimit;
+        ctx.lineCap = "butt";
+        ctx.stroke();
+      }
     };
     for (const d of drawables) {
       if ((d.flags & 1) === 0) continue;

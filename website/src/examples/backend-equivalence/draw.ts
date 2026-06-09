@@ -67,6 +67,48 @@ export function drawEquivalenceScene(chart: Plot, width: number, height: number)
   chart.render();
 }
 
+/** One thick open/closed polyline, to probe stroke join + cap rendering. */
+export interface Line {
+  pts: [number, number][];
+  closed?: boolean;
+  color: string;
+}
+
+/** A set of thick polylines exercising stroke joins (sharp/right/obtuse, and a closed
+ *  triangle) and end caps. Joins are where backends historically diverged: WebGL beveled
+ *  every corner while Canvas/SVG mitered them (and at different miter limits), so sharp
+ *  corners looked flat on WebGL but pointed on Canvas/SVG. */
+export function makeLines(width: number, height: number): Line[] {
+  const x = (f: number): number => width * f;
+  const y = (f: number): number => height * f;
+  return [
+    // Zigzag with sharp alternating corners.
+    { color: "#1f77b4", pts: [[x(0.1), y(0.3)], [x(0.3), y(0.12)], [x(0.5), y(0.3)], [x(0.7), y(0.12)], [x(0.9), y(0.3)]] },
+    // A very acute spike — exceeds a typical miter limit, so the miter must fall back to bevel.
+    { color: "#d62728", pts: [[x(0.12), y(0.62)], [x(0.5), y(0.42)], [x(0.88), y(0.62)]] },
+    // A closed triangle: every corner is a (closed-path) join.
+    { color: "#2ca02c", closed: true, pts: [[x(0.5), y(0.66)], [x(0.78), y(0.92)], [x(0.22), y(0.92)]] },
+  ];
+}
+
+const JOIN_LW = (width: number, height: number): number => Math.max(8, Math.round(Math.min(width, height) * 0.07));
+
+/** Add the stroke-joins/caps scene to a Plot and render it. */
+export function drawJoinsScene(chart: Plot, width: number, height: number): void {
+  const lines = makeLines(width, height);
+  chart.layer("joins", lines, {
+    draw: (ctx, l) => {
+      ctx.moveTo(l.pts[0]![0], l.pts[0]![1]);
+      for (let i = 1; i < l.pts.length; i++) ctx.lineTo(l.pts[i]![0], l.pts[i]![1]);
+      if (l.closed) ctx.closePath();
+    },
+    stroke: (l: Line) => l.color,
+    lineWidth: JOIN_LW(width, height),
+    id: (_l, i) => i,
+  });
+  chart.render();
+}
+
 /**
  * Overlapping bordered shapes (issue #41 repro). Renders a flower of opaque discs
  * with thick white borders. Switch the backend with the harness control to see

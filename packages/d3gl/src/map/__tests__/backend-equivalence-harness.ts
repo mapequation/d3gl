@@ -192,3 +192,35 @@ export function overlappingBorderedShapes(width: number, height: number, petals 
   });
   return scene;
 }
+
+/**
+ * Thick open/closed polylines exercising stroke JOINS (sharp/acute/closed) and end
+ * caps. Backends historically diverged here: WebGL beveled every corner while Canvas
+ * and SVG mitered them (and at different default miter limits — 10 vs 4). The acute
+ * spike is sharp enough to exceed a small miter limit, so it probes the bevel fallback.
+ */
+export function strokeJoinShapes(width: number, height: number, lineWidth = Math.round(Math.min(width, height) * 0.07)): Scene {
+  const x = (f: number): number => width * f;
+  const y = (f: number): number => height * f;
+  const lines: { color: string; closed?: boolean; pts: [number, number][] }[] = [
+    { color: "#1f77b4", pts: [[x(0.1), y(0.3)], [x(0.3), y(0.12)], [x(0.5), y(0.3)], [x(0.7), y(0.12)], [x(0.9), y(0.3)]] },
+    { color: "#d62728", pts: [[x(0.12), y(0.62)], [x(0.5), y(0.42)], [x(0.88), y(0.62)]] },
+    { color: "#2ca02c", closed: true, pts: [[x(0.5), y(0.66)], [x(0.78), y(0.92)], [x(0.22), y(0.92)]] },
+  ];
+  const scene = new Scene();
+  scene.group("lines", (g) => {
+    lines.forEach((l, i) => {
+      g.drawable(
+        i,
+        (ctx) => {
+          ctx.moveTo(l.pts[0]![0], l.pts[0]![1]);
+          for (let k = 1; k < l.pts.length; k++) ctx.lineTo(l.pts[k]![0], l.pts[k]![1]);
+          if (l.closed) ctx.closePath();
+        },
+        { lineWidth },
+      );
+    });
+  });
+  lines.forEach((l, i) => scene.setStroke("lines", i, l.color));
+  return scene;
+}

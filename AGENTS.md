@@ -144,13 +144,23 @@ back into separate all-fills-then-all-strokes passes — that puts every border 
 of every fill and diverges from Canvas/SVG (issue #41). `GroupBuffers.ranges` carries
 the per-drawable fill/stroke slices the interleave needs.
 
+**Stroke joins/caps** must also match. WebGL `expandStroke` (`core/stroke.ts`) tessellates
+**miter** joins (bevel fallback past the miter limit), `lineJoin`/`miterLimit` thread from
+the layer options through `DrawableOpts` → `expandStroke` and onto `DrawableVector` so
+Canvas (`ctx.lineJoin`/`miterLimit`/`lineCap`) and SVG (`stroke-linejoin`/`-miterlimit`/
+`-linecap` in `svg/serialize.ts`) render the same corners. Pin them explicitly on every
+backend — the native defaults differ (Canvas miter limit 10, SVG 4, and WebGL used to bevel
+everything). Caps are butt only for now (round/square deferred — would need cap geometry in
+`expandStroke` before exposing a `lineCap` option).
+
 Guard it with the **backend-equivalence harness**
 (`map/__tests__/backend-equivalence-harness.ts` + `map/backend-equivalence.browser.test.ts`):
-it renders a Scene through both backends and pixel-diffs them. Use a **position-tolerant**
-diff (radius ≥ 1) — WebGL's tessellated stroke and Canvas's native stroker land ~1px
-apart along edges, so an exact-position diff reports ~6% noise that isn't a real
-divergence. The live `website` "Backend equivalence" example renders the same scene in
-all three backends side by side with synced zoom for eyeballing.
+it renders a Scene through both backends and pixel-diffs them (cases: overlapping bordered
+shapes for draw order, thick polylines for joins/caps). Use a **position-tolerant** diff
+(radius ≥ 1) — WebGL's tessellated stroke and Canvas's native stroker land ~1px apart along
+edges, so an exact-position diff reports ~6% noise that isn't a real divergence. The live
+`website` "Backend equivalence" example renders both scenes in all three backends side by
+side with synced zoom for eyeballing.
 
 ## Incremental layer append (status)
 
