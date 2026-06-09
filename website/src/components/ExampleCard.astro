@@ -59,9 +59,10 @@ function resolveSpec(fromFile: string, spec: string): string | null {
 const importRe = /(?:^|\s)(?:import|export)\s[^"']*["']([^"']+)["']/gm;
 
 /** Auto-discovered deps to NOT surface as tabs (harness plumbing, not example content).
- *  `shared/types.ts` is the ImperativeSetup/ExampleContext contract — noise in every example.
- *  An explicit `files` entry is always honored; this only filters transitively-discovered deps. */
-const AUTO_DEP_EXCLUDE = new Set(["shared/types.ts"]);
+ *  `types.ts` (examples-root) is the ImperativeSetup/ExampleContext contract, imported by
+ *  every example as `../types.js` — noise in every code panel. An explicit `files` entry is
+ *  always honored; this only filters transitively-discovered deps. */
+const AUTO_DEP_EXCLUDE = new Set(["types.ts"]);
 
 /**
  * BFS: starting from `files`, discover all locally-imported sources
