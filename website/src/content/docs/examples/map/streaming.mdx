@@ -94,6 +94,7 @@ polygons/lines → projected paths, re-tessellated per settle on WebGL). The tra
 | During pan/zoom | always crisp | slightly stale raster, re-crisp on settle |
 | Picking (`pick`/hover) | yes | no |
 | Per-feature recolor / mutate | yes | re-pull from your data |
+| Clip to another layer (`clipTo`) | yes | **not yet** (ignored) |
 | Backends | all (incl. SVG) | Canvas + WebGL (SVG rejects it) |
 
 **Use retained** for datasets up to a few million where you need crisp interaction, hit-testing,
@@ -109,8 +110,10 @@ flat memory footprint (default **auto** backend → upgrades to WebGL).
 
 Pass-through works for **polygons and lines** too, not just points. On **WebGL** the full set
 re-tessellates on every pan/zoom settle (the documented cost of pass-through for path geometry);
-on **Canvas** it re-projects paths, same as retained. The demo below streams **100k** translucent
-polygon ranges via the pass-through path — raise "Data size" to push the ceiling further.
+on **Canvas** it re-projects paths, same as retained. The demo below streams **1M** translucent
+polygon ranges via the pass-through path — raise "Data size" to push the ceiling further. Unlike
+the retained polygons example above, these ranges are **not clipped to land** — `clipTo` isn't
+applied to pass-through layers yet (see the trade-off table), so ranges appear over the ocean too.
 
 <ExampleCard files={["streaming-passthrough-polygons/draw.ts"]}>
   <StreamingPassthroughPolygons client:visible slot="demo" />

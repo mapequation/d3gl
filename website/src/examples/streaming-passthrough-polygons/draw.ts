@@ -7,7 +7,7 @@ import type { ImperativeSetup } from "../types.js";
 
 const OCEAN = "#dbe7f3";
 const LAND = "#e9e7df";
-const RANGE_ALPHA = 0.12; // very transparent so overlapping ranges build up richness
+const RANGE_ALPHA = 0.05; // very transparent so overlapping ranges build up a density gradient
 
 /**
  * Stream polygon "ranges" using the pass-through path (`passThrough: true`).

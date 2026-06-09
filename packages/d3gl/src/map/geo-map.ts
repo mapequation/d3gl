@@ -39,7 +39,8 @@ export interface LayerOptions<F = any> {
    *  crisp, interactive, and pickable but capped; pass-through is uncapped + streaming but
    *  shows a slightly stale raster during pan/zoom (re-crisp on settle), isn't pickable, and
    *  re-tessellates non-point geometry per settle. Paths are world-mode (screen-mode paths
-   *  are a follow-up). */
+   *  are a follow-up). NOTE: `clipTo` is NOT applied to pass-through layers yet — it is ignored
+   *  (a follow-up); use the retained path if you need clipping. */
   passThrough?: boolean;
 }
 
