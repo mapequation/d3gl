@@ -1,0 +1,17 @@
+---
+title: Backend equivalence
+description: The same overlapping bordered shapes rendered in WebGL, Canvas, and SVG side by side, to check that all three composite identically.
+---
+
+import ExampleCard from "../../../components/ExampleCard.astro";
+import BackendEquivalence from "../../../examples/backend-equivalence/BackendEquivalence.tsx";
+
+A flower of opaque, overlapping discs with thick white borders, rendered in all three
+backends at once. Because the discs overlap and are drawn in order, each disc's border is
+partly covered by later discs' fills — a sensitive probe of how a backend composites
+overlapping fills and strokes. WebGL, Canvas, and SVG should all agree. Zoom/pan any panel
+to inspect the overlaps; the view mirrors across all three.
+
+<ExampleCard files={["backend-equivalence/draw.ts"]}>
+  <BackendEquivalence client:visible slot="demo" />
+</ExampleCard>

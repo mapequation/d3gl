@@ -92,6 +92,7 @@ export default defineConfig({
           { label: "Heatmap", slug: "examples/map/heatmap" },
           { label: "Map projections", slug: "examples/map/map-projections" },
           { label: "Streaming data", slug: "examples/map/streaming" },
+          { label: "Backend equivalence", slug: "examples/backend-equivalence" },
           { label: "React", slug: "examples/react" },
         ],
       },
