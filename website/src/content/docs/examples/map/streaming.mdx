@@ -8,6 +8,7 @@ import StreamingPoints from "../../../../examples/streaming-points/StreamingPoin
 import StreamingPolygons from "../../../../examples/streaming-polygons/StreamingPolygons.tsx";
 import StreamingScatter from "../../../../examples/streaming-scatter/StreamingScatter.tsx";
 import StreamingPassthrough from "../../../../examples/streaming-passthrough/StreamingPassthrough.tsx";
+import StreamingPassthroughPolygons from "../../../../examples/streaming-passthrough-polygons/StreamingPassthroughPolygons.tsx";
 
 `layer.append(batch)` streams new features into an existing layer **without re-projecting
 the features already on screen** — the key to live data like species occurrences. Points
@@ -101,4 +102,15 @@ flat memory footprint (default **auto** backend → upgrades to WebGL).
 
 <ExampleCard files={["streaming-passthrough/draw.ts"]}>
   <StreamingPassthrough client:visible slot="demo" />
+</ExampleCard>
+
+### Pass-through polygons
+
+Pass-through works for **polygons and lines** too, not just points. On **WebGL** the full set
+re-tessellates on every pan/zoom settle (the documented cost of pass-through for path geometry);
+on **Canvas** it re-projects paths, same as retained. The demo below streams **100k** translucent
+polygon ranges via the pass-through path — raise "Data size" to push the ceiling further.
+
+<ExampleCard files={["streaming-passthrough-polygons/draw.ts"]}>
+  <StreamingPassthroughPolygons client:visible slot="demo" />
 </ExampleCard>
