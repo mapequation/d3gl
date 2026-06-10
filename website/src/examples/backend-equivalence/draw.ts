@@ -62,16 +62,16 @@ export function drawBordersScene(chart: Plot, width: number, height: number): vo
 /** One thick open/closed polyline, to probe stroke joins (sharp/acute/closed) and end caps. */
 export interface Line { pts: [number, number][]; closed?: boolean; color: string; }
 
-export function makeLines(width: number, height: number): Line[] {
+export function makeLines(width: number, height: number, opacity: number = 1.0): Line[] {
   const x = (f: number): number => width * f;
   const y = (f: number): number => height * f;
   return [
     // Zigzag with sharp alternating corners (joins) and two open ends (caps).
-    { color: "#1f77b4", pts: [[x(0.1), y(0.3)], [x(0.3), y(0.12)], [x(0.5), y(0.3)], [x(0.7), y(0.12)], [x(0.9), y(0.3)]] },
+    { color: `rgba(31, 119, 180, ${opacity})`, pts: [[x(0.1), y(0.3)], [x(0.3), y(0.12)], [x(0.75), y(0.3)], [x(0.7), y(0.12)], [x(0.9), y(0.3)]] },
     // A very acute spike — exceeds a small miter limit, so the miter falls back to bevel.
-    { color: "#d62728", pts: [[x(0.12), y(0.62)], [x(0.5), y(0.42)], [x(0.88), y(0.62)]] },
+    { color: `rgba(214, 39, 40, ${opacity})`, pts: [[x(0.12), y(0.22)], [x(0.5), y(0.42)], [x(0.88), y(0.42)]] },
     // A closed triangle: every corner is a (closed-path) join.
-    { color: "#2ca02c", closed: true, pts: [[x(0.5), y(0.66)], [x(0.78), y(0.92)], [x(0.22), y(0.92)]] },
+    { color: `rgba(44, 160, 44, ${opacity})`, closed: true, pts: [[x(0.5), y(0.26)], [x(0.78), y(0.50)], [x(0.22), y(0.50)]] },
   ];
 }
 
@@ -106,8 +106,8 @@ export interface Wedge { pts: [number, number][]; fill: string; }
 /** One open segment crossing the pie, to show end caps over another (translucent) stroke. */
 export interface Ray { x0: number; y0: number; x1: number; y1: number; }
 
-const PIE_FRACTIONS = [0.3, 0.14, 0.22, 0.18, 0.16];
-const PIE_COLORS = ["#4e79a7", "#f28e2b", "#e15759", "#76b7b2", "#59a14f"];
+const PIE_FRACTIONS = [0.2, 0.1, 0.14, 0.22, 0.18];
+const PIE_COLORS = ["#4e79a7", "#f28e2b", /*"#e15759"*/ undefined, /*"#76b7b2"*/ undefined, "#59a14f"];
 /** Semi-transparent black: overlapping borders darken where they stack and a line end stays
  *  visible over another stroke — and it reveals WebGL's stroke self-overlap (issue #41). */
 const STROKE_RGBA = "rgba(0, 0, 0, 0.5)";
@@ -149,11 +149,12 @@ export function makeRays(cx: number, cy: number, r: number, n: number): Ray[] {
  */
 export function drawPieScene(chart: Plot, width: number, height: number, style?: JoinStyle): void {
   const cx = width / 2;
-  const cy = height * 0.5;
-  const r = Math.min(width, height) * 0.3;
+  const cy = height * 0.75;
+  const r = Math.min(width, height) * 0.2;
   const lineWidth = Math.max(7, Math.round(Math.min(width, height) * 0.05));
   const wedges = makeWedges(cx, cy, r);
-  const rays = makeRays(cx, cy, r, 3);
+  const lines = makeLines(width, height, 0.5); // for reference, shows the same stroke styles as the joins scene
+  const WEDGE_STROKES = ["rgba(255, 0, 0, 0.5)", "rgba(255, 255, 0, 0.5)", "rgba(0, 255, 255, 0.5)", "rgba(255, 0, 255, 0.5)", "rgba(100, 100, 100, 0.5)"];
 
   chart.layer("pie", wedges, {
     draw: (ctx, w) => {
@@ -162,22 +163,25 @@ export function drawPieScene(chart: Plot, width: number, height: number, style?:
       ctx.closePath();
     },
     fill: (w: Wedge) => w.fill,
-    stroke: STROKE_RGBA,
+    stroke: (w: Wedge, i: number) => WEDGE_STROKES[i % WEDGE_STROKES.length],
     lineWidth,
     lineJoin: style?.lineJoin,
     miterLimit: style?.miterLimit,
     id: (_w, i) => i,
   });
 
-  chart.layer("rays", rays, {
-    draw: (ctx, ray) => {
-      ctx.moveTo(ray.x0, ray.y0);
-      ctx.lineTo(ray.x1, ray.y1);
+  chart.layer("lines", lines, {
+    draw: (ctx, l) => {
+      ctx.moveTo(l.pts[0]![0], l.pts[0]![1]);
+      for (let i = 1; i < l.pts.length; i++) ctx.lineTo(l.pts[i]![0], l.pts[i]![1]);
+      if (l.closed) ctx.closePath();
     },
-    stroke: STROKE_RGBA,
+    stroke: (l: Line) => l.color,
     lineWidth,
+    lineJoin: style?.lineJoin,
     lineCap: style?.lineCap,
-    id: (_ray, i) => i,
+    miterLimit: style?.miterLimit,
+    id: (_l, i) => i,
   });
 
   chart.render();
