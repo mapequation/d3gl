@@ -61,24 +61,32 @@ export function drawBordersScene(chart: Plot, width: number, height: number): vo
 // ---------------------------------------------------------------------------
 
 /** One thick open/closed polyline — probes joins (sharp/acute/closed) and end caps. `rgb` is
- *  the base colour; the alpha is applied per render via the scene's `opacity`. */
+ *  the base colour; the alpha comes from the scene's `opacity`. */
 interface Line { pts: [number, number][]; closed?: boolean; rgb: string; }
-/** One pie wedge (centre → smooth arc → close); the rim corners are joins. */
-interface Wedge { cx: number; cy: number; r: number; a0: number; a1: number; fill: string; }
+/** One pie wedge (centre → smooth arc → close); the rim corners are joins. `fill` undefined
+ *  leaves the wedge unfilled (exposes how its border stroke is built); `strokeRgb` is the base
+ *  border colour, alpha from the scene's `opacity`. */
+interface Wedge { cx: number; cy: number; r: number; a0: number; a1: number; fill?: string; strokeRgb: string; }
 
-/** Polylines in the top half: a sharp zigzag, an acute spike, and a closed triangle. */
+/** A falsy fill — the engine skips `setFill` for it, leaving the wedge unfilled. */
+const NO_FILL = "";
+
+/** Three overlapping polylines in the top half: an asymmetric zigzag, an acute spike, and a
+ *  closed triangle — varied join angles plus open ends (caps). */
 function makeLines(width: number, height: number): Line[] {
   const x = (f: number): number => width * f;
   const y = (f: number): number => height * f;
   return [
-    { rgb: "31, 119, 180", pts: [[x(0.1), y(0.28)], [x(0.3), y(0.08)], [x(0.5), y(0.28)], [x(0.7), y(0.08)], [x(0.9), y(0.28)]] },
-    { rgb: "214, 39, 40", pts: [[x(0.14), y(0.46)], [x(0.5), y(0.30)], [x(0.86), y(0.46)]] },
-    { rgb: "44, 160, 44", closed: true, pts: [[x(0.5), y(0.40)], [x(0.66), y(0.6)], [x(0.34), y(0.6)]] },
+    { rgb: "31, 119, 180", pts: [[x(0.1), y(0.3)], [x(0.3), y(0.12)], [x(0.75), y(0.3)], [x(0.7), y(0.12)], [x(0.9), y(0.3)]] },
+    { rgb: "214, 39, 40", pts: [[x(0.12), y(0.22)], [x(0.5), y(0.42)], [x(0.88), y(0.42)]] },
+    { rgb: "44, 160, 44", closed: true, pts: [[x(0.5), y(0.26)], [x(0.78), y(0.5)], [x(0.22), y(0.5)]] },
   ];
 }
 
-const PIE_FRACTIONS = [0.3, 0.14, 0.22, 0.18, 0.16];
-const PIE_COLORS = ["#4e79a7", "#f28e2b", "#e15759", "#76b7b2", "#59a14f"];
+const PIE_FRACTIONS = [0.2, 0.1, 0.14, 0.22, 0.18];
+// Two wedges are left unfilled (undefined) so the border stroke construction is visible.
+const PIE_FILLS: (string | undefined)[] = ["#4e79a7", "#f28e2b", undefined, undefined, "#59a14f"];
+const PIE_STROKE_RGB = ["255, 0, 0", "255, 255, 0", "0, 255, 255", "255, 0, 255", "100, 100, 100"];
 
 /** A pie of smooth-arc wedges in the bottom half (drawn with `ctx.arc`, not a polygon). */
 function makeWedges(cx: number, cy: number, r: number): Wedge[] {
@@ -87,23 +95,23 @@ function makeWedges(cx: number, cy: number, r: number): Wedge[] {
     const a0 = a;
     const a1 = a + f * 2 * Math.PI;
     a = a1;
-    return { cx, cy, r, a0, a1, fill: PIE_COLORS[i % PIE_COLORS.length]! };
+    return { cx, cy, r, a0, a1, fill: PIE_FILLS[i], strokeRgb: PIE_STROKE_RGB[i % PIE_STROKE_RGB.length]! };
   });
 }
 
 /**
- * The shared stroke scene: thick polylines (joins + caps) above a pie chart with thick black
- * borders. Rendered at `opacity` 1 it's a clean join/cap probe (all three backends match); at
- * `opacity` < 1 the translucent strokes reveal a WebGL-only difference — its triangulated stroke
- * double-blends slightly where the stroke self-overlaps (joins, and the wedge rim), whereas
- * Canvas/SVG composite each stroke as a single coverage. The lines and pie overlap a little, so a
- * translucent line-end also sits visibly over the pie border.
+ * The shared stroke scene: three overlapping polylines (joins + caps) above a pie chart whose
+ * wedges are drawn with `ctx.arc`. Rendered at `opacity` 1 it's a clean join/cap probe (all three
+ * backends match); at `opacity` < 1 the translucent strokes reveal a WebGL-only difference — its
+ * triangulated stroke double-blends slightly where a stroke self-overlaps (joins, and the wedge
+ * rim), whereas Canvas/SVG composite each stroke as a single coverage. Some wedges are unfilled so
+ * the border construction shows, and the lines overlap the pie so a translucent line-end also sits
+ * visibly over a wedge border.
  */
 export function drawStrokeScene(chart: Plot, width: number, height: number, opacity: number, style?: JoinStyle): void {
-  const lineWidth = Math.max(7, Math.round(Math.min(width, height) * 0.06));
+  const lineWidth = Math.max(7, Math.round(Math.min(width, height) * 0.05));
   const lines = makeLines(width, height);
-  const wedges = makeWedges(width / 2, height * 0.66, Math.min(width, height) * 0.26);
-  const border = `rgba(0, 0, 0, ${opacity})`;
+  const wedges = makeWedges(width / 2, height * 0.75, Math.min(width, height) * 0.2);
 
   chart.layer("pie", wedges, {
     draw: (ctx, w) => {
@@ -111,8 +119,8 @@ export function drawStrokeScene(chart: Plot, width: number, height: number, opac
       ctx.arc(w.cx, w.cy, w.r, w.a0, w.a1);
       ctx.closePath();
     },
-    fill: (w: Wedge) => w.fill,
-    stroke: border,
+    fill: (w: Wedge) => w.fill ?? NO_FILL,
+    stroke: (w: Wedge) => `rgba(${w.strokeRgb}, ${opacity})`,
     lineWidth,
     lineJoin: style?.lineJoin,
     miterLimit: style?.miterLimit,
