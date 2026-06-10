@@ -107,6 +107,24 @@ This has bitten us repeatedly. The rule lives here, in
 `packages/d3gl/src/geo/project.ts` (`featureGroup`), and
 `packages/d3gl/src/geo/geo-layer.ts` (`geoLayer`).
 
+## Worktrees & shell cwd (avoid committing to the wrong repo)
+
+Feature work happens in a worktree under `.claude/worktrees/<name>/`, which is a SECOND
+checkout of the same repo. The shell's working directory can silently reset to the
+**primary** repo between commands (e.g. after a `cd /…/d3gl && …`, a `cd /tmp`, or a tool
+that resets cwd). If you then run `git add -A && git commit && git push` assuming you're in
+the worktree, you'll commit to the **primary checkout's branch (usually `main`)** instead —
+and `git add -A` there will even add `.claude/worktrees/<name>` as an embedded-repo gitlink.
+This happened once and pushed junk to `main`.
+
+Defenses (do these):
+- Run every git/build command with an explicit path — `git -C <worktree> …`,
+  `pnpm --filter <pkg> …` — instead of relying on the current directory.
+- Stage scoped paths (`git add website/ packages/`), never a bare `git add -A`, so a
+  wrong-cwd add can't sweep in `.claude/`.
+- A `git push` that prints `main -> main` (or warns about an *embedded git repository*)
+  means you're in the wrong checkout — stop and fix before pushing.
+
 ## Build / typecheck
 
 - **Root `pnpm typecheck` is broken** — there is no root `tsconfig.json`, so the
