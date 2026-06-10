@@ -156,4 +156,31 @@ describe("backend: \"auto\"", () => {
     map.destroy();
     host.remove();
   });
+
+  it("keeps the swapped surface BELOW a later-appended overlay (no occlusion)", async () => {
+    const host = document.createElement("div");
+    host.style.width = "200px"; host.style.height = "200px";
+    document.body.appendChild(host);
+
+    const map = geoMap(host, { width: 200, height: 200, projection: proj(), backend: "canvas" });
+    map.layer("cells", [sqPoly(0, 0, 20)], { fill: "rgb(255,0,0)", id: () => "c0" });
+    await map.whenReady();
+
+    // The caller appends an HTML overlay AFTER the canvas (e.g. the website stats readout).
+    // It must stay the last child so it paints on top.
+    const overlay = document.createElement("div");
+    host.appendChild(overlay);
+    expect(host.lastElementChild).toBe(overlay);
+
+    // Swap the backend. makeCanvas() appends the new canvas to the end of the host, but
+    // installBackend repositions it to the old canvas's slot — so the overlay stays last.
+    map.setBackend("webgl");
+    await map.whenReady();
+    expect(liveBackend(map)).toBe("webgl");
+    expect(host.querySelectorAll("canvas").length).toBe(1); // old surface removed, one canvas
+    expect(host.lastElementChild).toBe(overlay); // overlay still on top, not occluded
+
+    map.destroy();
+    host.remove();
+  });
 });
