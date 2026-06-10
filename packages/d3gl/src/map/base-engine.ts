@@ -529,6 +529,20 @@ export abstract class BaseEngine {
       return;
     }
     const old = this.handle;
+    // Keep the rendering surface at the OLD surface's DOM position instead of at the end of
+    // the host, where makeCanvas() appended the new canvas. This makes the canvas a stable
+    // base layer: anything the caller appended to the host AFTER it (e.g. an HTML stats
+    // overlay) keeps painting on top across a backend swap, with no z-index needed. SVG draws
+    // into the host itself (element === host), so there is no child surface to reposition.
+    if (
+      old &&
+      old.element !== this.host &&
+      next.element !== this.host &&
+      old.element.parentNode === this.host &&
+      next.element.parentNode === this.host
+    ) {
+      this.host.insertBefore(next.element, old.element);
+    }
     old?.backend.destroy();
     if (old && old.element !== this.host) old.element.remove();
     this.handle = next;
