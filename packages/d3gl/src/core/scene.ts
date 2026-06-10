@@ -79,7 +79,7 @@ export interface GroupBufferDelta {
 export interface DrawableOpts {
   /** Stroke width in coordinate units. 0/undefined => no stroke geometry. */
   lineWidth?: number;
-  /** Stroke join style ("miter" default | "bevel") — see {@link LineJoin}. */
+  /** Stroke join style ("bevel" default | "miter" | "round") — see {@link LineJoin}. */
   lineJoin?: LineJoin;
   /** Miter length / width above which a miter falls back to a bevel (default 10). */
   miterLimit?: number;
@@ -199,7 +199,7 @@ export class Scene {
     data.subpaths.push(subpaths.map((s) => ({ closed: s.closed, points: s.points.slice() })));
     data.ids.push(id);
     data.lineWidths.push(opts?.lineWidth ?? 0);
-    const join: LineJoin = opts?.lineJoin ?? "miter";
+    const join: LineJoin = opts?.lineJoin ?? "bevel";
     const miterLimit = opts?.miterLimit ?? DEFAULT_MITER_LIMIT;
     const cap: LineCap = opts?.lineCap ?? "butt";
     data.joins.push(join);
@@ -284,7 +284,7 @@ export class Scene {
     data.circles.push(centers.map(([x, y]) => ({ x, y, r })));
     data.ids.push(id);
     data.lineWidths.push(0);
-    data.joins.push("miter");
+    data.joins.push("bevel");
     data.miterLimits.push(DEFAULT_MITER_LIMIT);
     data.caps.push("butt");
     data.anchors.push(null);

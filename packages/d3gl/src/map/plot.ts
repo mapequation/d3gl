@@ -25,7 +25,7 @@ export interface PlotLayerOptions<D = any> {
   stroke?: string | ((d: D, i: number) => string);
   /** A constant width, or a per-datum width (e.g. branch thickness ∝ subtended terminals). */
   lineWidth?: number | ((d: D, i: number) => number);
-  /** Stroke corner style: "miter" (default, sharp) or "bevel" (flat-cut). Applies to the
+  /** Stroke corner style: "bevel" (default) | "miter" | "round". Applies to the
    *  whole layer; rendered identically across WebGL/Canvas/SVG. */
   lineJoin?: LineJoin;
   /** Miter length / stroke width above which a miter falls back to a bevel (default 10,

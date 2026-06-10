@@ -1,25 +1,36 @@
 ---
 title: Backend equivalence
-description: The same overlapping bordered shapes rendered in WebGL, Canvas, and SVG side by side, to check that all three composite identically.
+description: The same scenes rendered in WebGL, Canvas, and SVG side by side, to check that all three composite identically.
 ---
 
 import ExampleCard from "../../../components/ExampleCard.astro";
-import BackendEquivalence from "../../../examples/backend-equivalence/BackendEquivalence.tsx";
+import BordersEquivalence from "../../../examples/backend-equivalence/BordersEquivalence.tsx";
+import StrokeEquivalence from "../../../examples/backend-equivalence/StrokeEquivalence.tsx";
 
-The same scene rendered in all three backends at once, to check they composite identically.
-Two probes:
+d3gl renders the same scene through three backends. These examples render a scene in all
+three at once so any compositing divergence is obvious. Zoom/pan any panel to inspect (the
+view mirrors across all three); the ↺ button resets the view.
 
-- **Overlapping bordered shapes** — a flower of opaque, overlapping discs with thick white
-  borders. Because the discs overlap and are drawn in order, each disc's border is partly
-  covered by later discs' fills — a sensitive probe of fill/stroke draw order.
-- **Stroke joins & caps** — thick polylines with sharp, acute, and closed corners. Toggle the
-  join (`miter`/`bevel`), end cap (`butt`/`square`/`round`), and miter limit to see all three
-  backends stay in lockstep (they used to differ: bevel vs miter, miter limit 10 vs 4, and
-  WebGL had no square/round caps).
+## Overlapping bordered shapes
 
-WebGL, Canvas, and SVG should agree on both. Zoom/pan any panel to inspect; the view mirrors
-across all panels.
+A flower of opaque, overlapping discs with thick white borders. Because the discs overlap and
+are drawn in order, each disc's border is partly covered by later discs' fills — a sensitive
+probe of fill/stroke **draw order**. WebGL used to draw all fills then all strokes (every border
+on top); it now composites per drawable like Canvas and SVG.
 
 <ExampleCard files={["backend-equivalence/draw.ts"]}>
-  <BackendEquivalence client:visible slot="demo" />
+  <BordersEquivalence client:visible slot="demo" />
+</ExampleCard>
+
+## Stroke joins & caps
+
+A pie chart (closed wedges) with thick semi-transparent black borders, plus a few open rays
+crossing it. The wedge corners exercise stroke **joins** (miter spikes vs bevel cuts vs round
+arcs), and the rays' ends exercise **caps** — the translucent border lets you see where a ray
+ends on top of a wedge border. Toggle the join, cap, and miter limit: all three backends stay
+in lockstep (they used to differ — WebGL beveled everything with butt caps, while Canvas/SVG
+mitered at different limits). The default is `bevel`, matching the original WebGL look.
+
+<ExampleCard files={["backend-equivalence/draw.ts"]}>
+  <StrokeEquivalence client:visible slot="demo" />
 </ExampleCard>

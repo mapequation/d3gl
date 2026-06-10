@@ -29,25 +29,25 @@ describe("expandStroke", () => {
     for (const i of indices) expect(i).toBeLessThan(vertexCount);
   });
 
-  it("miters an interior corner of an open polyline (bevel + miter apex)", () => {
+  it("bevels interior corners by default (no miter apex)", () => {
     const sp: Subpath = { points: [0, 0, 10, 0, 10, 10], closed: false };
-    const { vertices, indices } = expandStroke(sp, 2); // default join "miter"
+    const { indices } = expandStroke(sp, 2); // default join is "bevel"
+    // 2 segment quads (12) + 1 bevel joint (6) = 18
+    expect(indices.length).toBe(18);
+  });
+
+  it("miters an interior corner when join is 'miter' (bevel + miter apex)", () => {
+    const sp: Subpath = { points: [0, 0, 10, 0, 10, 10], closed: false };
+    const { vertices, indices } = expandStroke(sp, 2, { join: "miter" });
     // 2 segment quads (12) + 1 join: inner bevel (6) + outer miter, 2 tris (6) = 24
     expect(indices.length).toBe(24);
     const vertexCount = vertices.length / 2;
     for (const i of indices) expect(i).toBeLessThan(vertexCount);
   });
 
-  it("bevels interior corners when join is 'bevel' (no miter apex)", () => {
-    const sp: Subpath = { points: [0, 0, 10, 0, 10, 10], closed: false };
-    const { indices } = expandStroke(sp, 2, { join: "bevel" });
-    // 2 segment quads (12) + 1 bevel joint (6) = 18
-    expect(indices.length).toBe(18);
-  });
-
   it("miters all corners of a closed ring (no caps)", () => {
     const sp: Subpath = { points: [0, 0, 10, 0, 10, 10, 0, 10], closed: true };
-    const { vertices, indices } = expandStroke(sp, 2);
+    const { vertices, indices } = expandStroke(sp, 2, { join: "miter" });
     // 4 segment quads (24) + 4 joins × (bevel 6 + miter 6) = 72
     expect(indices.length).toBe(72);
     const vertexCount = vertices.length / 2;
@@ -65,10 +65,10 @@ describe("expandStroke", () => {
 
   it("falls back to bevel when the miter exceeds the miter limit (acute spike)", () => {
     const sp: Subpath = { points: [0, 0, 10, 0, 0, 1], closed: false }; // ~5° spike at (10,0)
-    // Default limit 10: the acute miter is too long → bevel only (12 + 6 = 18).
-    expect(expandStroke(sp, 2).indices.length).toBe(18);
+    // join "miter", default limit 10: the acute miter is too long → bevel only (12 + 6 = 18).
+    expect(expandStroke(sp, 2, { join: "miter" }).indices.length).toBe(18);
     // A generous limit admits the miter apex (12 + bevel 6 + miter 6 = 24).
-    expect(expandStroke(sp, 2, { miterLimit: 50 }).indices.length).toBe(24);
+    expect(expandStroke(sp, 2, { join: "miter", miterLimit: 50 }).indices.length).toBe(24);
   });
 
   it("adds no cap geometry for butt caps (default), a quad for square", () => {

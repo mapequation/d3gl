@@ -45,7 +45,7 @@ describe("backend equivalence: overlapping bordered shapes (#41)", () => {
 
   it("WebGL strokes joins/caps identically to Canvas (miter + limit)", async () => {
     const device = await makeDevice();
-    const scene = strokeJoinShapes(W, H);
+    const scene = strokeJoinShapes(W, H, { join: "miter" });
 
     const gl = renderWebGL(device, scene, "lines", W, H);
     const cv = renderCanvas(scene, "lines", W, H);

@@ -7,7 +7,7 @@ export interface GeoLayerOptions<F> {
   id?: (feature: F, index: number) => string | number;
   /** Stroke width in projected px (Line/MultiLine and polygon outlines). */
   lineWidth?: number;
-  /** Stroke corner style: "miter" (default) or "bevel". Identical across backends. */
+  /** Stroke corner style: "bevel" (default) | "miter" | "round". Identical across backends. */
   lineJoin?: LineJoin;
   /** Miter length / width above which a miter falls back to a bevel (default 10). */
   miterLimit?: number;

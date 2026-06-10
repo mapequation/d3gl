@@ -19,7 +19,7 @@ export interface LayerOptions<F = any> {
   fill?: string | ((f: F, i: number) => string);
   stroke?: string | ((f: F, i: number) => string);
   lineWidth?: number; pointRadius?: number; clipTo?: string;
-  /** Stroke corner style: "miter" (default) or "bevel". Identical across backends. */
+  /** Stroke corner style: "bevel" (default) | "miter" | "round". Identical across backends. */
   lineJoin?: LineJoin;
   /** Miter length / width above which a miter falls back to a bevel (default 10). */
   miterLimit?: number;

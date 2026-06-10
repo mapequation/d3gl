@@ -20,8 +20,8 @@ export type LineJoin = "miter" | "bevel" | "round";
 export type LineCap = "butt" | "square" | "round";
 
 export interface StrokeOptions {
-  /** Corner style. "miter" extends to a sharp point (falling back to "bevel" past
-   *  {@link StrokeOptions.miterLimit}); "bevel" always cuts the corner flat. Default "miter". */
+  /** Corner style. "bevel" (default) cuts the corner flat; "miter" extends to a sharp point
+   *  (falling back to "bevel" past {@link StrokeOptions.miterLimit}); "round" arcs the corner. */
   join?: LineJoin;
   /** Miter length / stroke width above which a miter falls back to a bevel — the same
    *  definition Canvas (`ctx.miterLimit`) and SVG (`stroke-miterlimit`) use. Default 10. */
@@ -50,7 +50,7 @@ export const DEFAULT_MITER_LIMIT = 10;
  * stroke does not — color lives in a separate side-table.)
  */
 export function expandStroke(subpath: Subpath, width: number, options: StrokeOptions = {}): StrokeGeometry {
-  const join = options.join ?? "miter";
+  const join = options.join ?? "bevel";
   const miterLimit = options.miterLimit ?? DEFAULT_MITER_LIMIT;
   const cap = options.cap ?? "butt";
   const vertices: number[] = [];
