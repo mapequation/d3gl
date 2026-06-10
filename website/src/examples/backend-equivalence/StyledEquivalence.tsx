@@ -1,6 +1,7 @@
 import { useState } from "react";
+import type { Plot } from "@mapequation/d3gl/map";
 import { EquivalencePanels } from "./EquivalencePanels.js";
-import { drawJoinsScene, type JoinStyle } from "./draw.js";
+import type { JoinStyle } from "./draw.js";
 
 const SEG =
   "inline-flex h-6 items-center justify-center border border-border px-2 text-[11px] font-medium -ml-px first:ml-0 first:rounded-l-md last:rounded-r-md outline-none";
@@ -23,11 +24,11 @@ function Segmented<T extends string>({ value, options, onChange }: { value: T; o
 }
 
 /**
- * A pie chart + overlapping rays rendered in all three backends, with live Join / Cap /
- * Miter-limit controls — the stroke join + end-cap probe. All three stay in lockstep for
- * every combination (the default is `bevel`, matching the old WebGL look).
+ * Three backend panels with live Join / Cap / Miter-limit controls, rendering the given
+ * `draw(chart, w, h, style)` scene. Shared by the joins/caps and translucent-pie examples.
+ * Default join is `bevel` (matching the prior WebGL look).
  */
-export default function StrokeEquivalence() {
+export default function StyledEquivalence({ draw }: { draw: (chart: Plot, w: number, h: number, style: JoinStyle) => void }) {
   const [style, setStyle] = useState<JoinStyle>({ lineJoin: "bevel", lineCap: "butt", miterLimit: 10 });
   const controls = (
     <>
@@ -56,7 +57,7 @@ export default function StrokeEquivalence() {
   );
   return (
     <EquivalencePanels
-      draw={(chart, w, h) => drawJoinsScene(chart, w, h, style)}
+      draw={(chart, w, h) => draw(chart, w, h, style)}
       renderKey={JSON.stringify(style)}
       controls={controls}
     />

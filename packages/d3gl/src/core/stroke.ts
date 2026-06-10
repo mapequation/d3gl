@@ -110,32 +110,24 @@ export function expandStroke(subpath: Subpath, width: number, options: StrokeOpt
     const pnx = -pdy, pny = pdx;
     const nnx = -ndy, nny = ndx;
     // Turn direction: cross(prevDir, nextDir). > 0 turns left (outer side = right),
-    // < 0 turns right (outer side = left). The outer side is where the miter forms.
+    // < 0 turns right (outer side = left). Collinear → quads already abut, no join.
     const cross = pdx * ndy - pdy * ndx;
-    const base = vertices.length / 2;
-    // The corner-fan center plus the four offset corners (left/right of each segment).
-    // pL/nL on the left, pR/nR on the right; all anchored at the corner (cx, cy).
-    vertices.push(
-      cx, cy,
-      cx + pnx * half, cy + pny * half, // 1 prevLeft
-      cx + nnx * half, cy + nny * half, // 2 nextLeft
-      cx - pnx * half, cy - pny * half, // 3 prevRight
-      cx - nnx * half, cy - nny * half, // 4 nextRight
-    );
-    anchors.push(cx, cy, cx, cy, cx, cy, cx, cy, cx, cy);
-    // Always fill both bevel triangles (center→prev→next on each side). This covers the
-    // inner side and, when not extending the outer side, the outer side too.
-    indices.push(base + 0, base + 1, base + 2, base + 0, base + 3, base + 4);
-
-    if (join === "bevel" || cross === 0) continue;
-    // Outer-side unit normals (the side the corner opens toward).
+    if (cross === 0) continue;
+    // ONLY the outer side needs a join: the inner side is already covered by the two
+    // overlapping segment quads, so an inner triangle would just stack a redundant layer
+    // (invisible when opaque, but a darkening double-blend when the stroke is translucent).
     const outerLeft = cross < 0; // turning right → outer side is the left
     const o1x = outerLeft ? pnx : -pnx, o1y = outerLeft ? pny : -pny;
     const o2x = outerLeft ? nnx : -nnx, o2y = outerLeft ? nny : -nny;
+    const base = vertices.length / 2;
+    // Centre + the two outer corners; the triangle (centre, c1, c2) sits in the outer gap
+    // between the segment end-faces (its edges lie ON them), so it does not overlap the quads.
+    vertices.push(cx, cy, cx + o1x * half, cy + o1y * half, cx + o2x * half, cy + o2y * half);
+    anchors.push(cx, cy, cx, cy, cx, cy);
+    const centre = base, c1 = base + 1, c2 = base + 2;
 
     if (join === "round") {
-      // Outer-side arc fan from the corner center, sweeping the turn angle (replaces the
-      // outer bevel chord with the rounded arc; overlap with the bevel is harmless).
+      // Outer-side arc fan sweeping the turn angle from c1 to c2.
       const a1 = Math.atan2(o1y, o1x);
       let delta = Math.atan2(o2y, o2x) - a1;
       if (delta > Math.PI) delta -= 2 * Math.PI;
@@ -147,29 +139,32 @@ export function expandStroke(subpath: Subpath, width: number, options: StrokeOpt
         vertices.push(cx + Math.cos(a) * half, cy + Math.sin(a) * half);
         anchors.push(cx, cy);
       }
-      for (let s = 0; s < segs; s++) indices.push(base + 0, c0 + s, c0 + s + 1);
+      for (let s = 0; s < segs; s++) indices.push(centre, c0 + s, c0 + s + 1);
       continue;
     }
 
-    // Outer-side miter: bisector of the two outer normals, apex at half / cos(halfAngle).
-    let bx2 = o1x + o2x, by2 = o1y + o2y;
-    const bl = Math.hypot(bx2, by2);
-    if (bl === 0) continue; // ~180° fold: nothing to miter
-    bx2 /= bl; by2 /= bl;
-    const cosHalf = bx2 * o1x + by2 * o1y; // = cos(angle between bisector and an outer normal)
-    if (cosHalf <= 1e-4) continue;
-    if (1 / cosHalf > miterLimit) continue; // miter too long → keep the bevel already emitted
-    const apexLen = half / cosHalf;
-    const apx = cx + bx2 * apexLen, apy = cy + by2 * apexLen;
-    const ai = vertices.length / 2;
-    vertices.push(apx, apy);
-    anchors.push(cx, cy);
-    // Two triangles fill the gap between the (already-emitted) outer bevel edge and the apex:
-    // (center, outer1, apex) and (center, apex, outer2). Outer corners are verts 1/2 (left)
-    // or 3/4 (right) of this fan.
-    const out1 = base + (outerLeft ? 1 : 3);
-    const out2 = base + (outerLeft ? 2 : 4);
-    indices.push(base + 0, out1, ai, base + 0, ai, out2);
+    if (join === "miter") {
+      // Bisector of the two outer normals; apex at half / cos(halfAngle). Within the miter
+      // limit the miter REPLACES the bevel (two triangles centre→c1→apex→c2) — not drawn on
+      // top of it — so there is no self-overlap at the join.
+      let bx2 = o1x + o2x, by2 = o1y + o2y;
+      const bl = Math.hypot(bx2, by2);
+      if (bl > 0) {
+        bx2 /= bl; by2 /= bl;
+        const cosHalf = bx2 * o1x + by2 * o1y;
+        if (cosHalf > 1e-4 && 1 / cosHalf <= miterLimit) {
+          const ai = vertices.length / 2;
+          vertices.push(cx + bx2 * (half / cosHalf), cy + by2 * (half / cosHalf));
+          anchors.push(cx, cy);
+          indices.push(centre, c1, ai, centre, ai, c2);
+          continue;
+        }
+      }
+      // else: miter too long / degenerate → fall through to the bevel below.
+    }
+
+    // Bevel (and the miter fallback): a single triangle filling the outer gap.
+    indices.push(centre, c1, c2);
   }
 
   // End caps (open subpaths only; closed paths have no ends). `ox,oy` is the unit

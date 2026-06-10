@@ -152,6 +152,14 @@ options through `DrawableOpts` → `expandStroke` and onto `DrawableVector` so C
 (`ctx.lineJoin`/`miterLimit`/`lineCap`) and SVG (`stroke-linejoin`/`-miterlimit`/`-linecap` in
 `svg/serialize.ts`) render the same corners/ends. Pin them explicitly on every backend — the
 native defaults differ (Canvas miter limit 10, SVG 4, and WebGL used to bevel everything).
+**Default join is `bevel`.** Each join emits ONLY outer-side geometry (the inner side is
+already covered by the two overlapping segment quads); a miter REPLACES the bevel rather than
+stacking on it. This matters for **translucent** strokes — redundant overlapping triangles
+would double-blend (darken) at joins. A residual remains: the segment quads themselves overlap
+on the inner side of sharp turns, which only single-coverage rendering (stencil/RTT —
+incompatible with the batched single-pass painter order) would fully remove. It's ~0.4%
+(position-tolerant) and opaque strokes are unaffected. luma.gl has no high-level arc/stroke
+primitive to lean on — strokes are flattened to polylines (`PathRecorder`) and triangulated here.
 
 Guard it with the **backend-equivalence harness**
 (`map/__tests__/backend-equivalence-harness.ts` + `map/backend-equivalence.browser.test.ts`):

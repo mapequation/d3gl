@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type ReactNode } from "react";
+import { useEffect, useLayoutEffect, useRef, useState, type ReactNode } from "react";
 import { plot, type Plot } from "@mapequation/d3gl/map";
 import type { ViewTransform } from "@mapequation/d3gl";
 import type { Backend } from "../types.js";
@@ -10,7 +10,15 @@ const PANELS: { backend: Exclude<Backend, "auto">; label: string }[] = [
   { backend: "svg", label: "SVG" },
 ];
 
-const PANEL = 196; // px, square panels — three fit in one row within the docs content column
+const GAP = 12; // px, matches gap-3 between panels
+const MIN_PANEL = 120;
+const MAX_PANEL = 420;
+
+/** Largest square panel size that fits three across `containerWidth` (with two gaps). */
+function panelSizeFor(containerWidth: number): number {
+  const s = Math.floor((containerWidth - 2 * GAP) / 3);
+  return Math.max(MIN_PANEL, Math.min(MAX_PANEL, s));
+}
 
 /** Circular-arrow restart glyph (mirrors the live-example harness). */
 function RestartIcon() {
@@ -29,16 +37,22 @@ function Panels({ draw, renderKey, controls, onReload }: {
   controls?: ReactNode;
   onReload: () => void;
 }) {
+  const rowRef = useRef<HTMLDivElement>(null);
   const hosts = useRef<(HTMLDivElement | null)[]>([]);
   const engines = useRef<Plot[]>([]);
   const drawRef = useRef(draw);
   drawRef.current = draw;
-  // The create effect already draws with the initial renderKey, so the renderKey effect
-  // skips its first (mount) run and only re-draws on subsequent control changes.
-  const skipNextRedraw = useRef(true);
+  // Square panel size, measured to fill the card width (three across). Starts at 0 so the
+  // engines are built once, after the layout effect measures the real width.
+  const [size, setSize] = useState(0);
+  useLayoutEffect(() => {
+    if (rowRef.current) setSize(panelSizeFor(rowRef.current.clientWidth));
+  }, []);
 
-  // Build the three engines once per mount; zoom/pan on any panel mirrors to the others.
+  // Build the three engines once the panel size is known; zoom/pan on any panel mirrors to
+  // the others. Rebuilds if the measured size changes.
   useEffect(() => {
+    if (!size) return;
     const es: Plot[] = [];
     let syncing = false;
     const sync = (src: Plot, t: ViewTransform): void => {
@@ -50,9 +64,9 @@ function Panels({ draw, renderKey, controls, onReload }: {
     PANELS.forEach(({ backend }, i) => {
       const host = hosts.current[i];
       if (!host) return;
-      const chart = plot(host, { width: PANEL, height: PANEL, backend });
+      const chart = plot(host, { width: size, height: size, backend });
       chart.enableZoom([0.5, 40], (t) => sync(chart, t));
-      drawRef.current(chart, PANEL, PANEL);
+      drawRef.current(chart, size, size);
       es.push(chart);
     });
     engines.current = es;
@@ -60,13 +74,14 @@ function Panels({ draw, renderKey, controls, onReload }: {
       for (const e of es) e.destroy();
       engines.current = [];
     };
-  }, []);
+  }, [size]);
 
-  // Re-draw on the existing engines when a control (renderKey) changes — no recreate, so
-  // the user's zoom/pan is preserved.
+  // Re-draw on the existing engines when a control (renderKey) changes — no recreate, so the
+  // user's zoom/pan is preserved. (A redundant run right after the build is harmless: drawing
+  // replaces the layer in place. Before the engines exist, engines.current is empty → no-op.)
   useEffect(() => {
-    if (skipNextRedraw.current) { skipNextRedraw.current = false; return; }
-    for (const e of engines.current) drawRef.current(e, PANEL, PANEL);
+    for (const e of engines.current) drawRef.current(e, size, size);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [renderKey]);
 
   return (
@@ -83,14 +98,14 @@ function Panels({ draw, renderKey, controls, onReload }: {
           <RestartIcon />
         </button>
       </div>
-      <div className="flex flex-wrap gap-3">
+      <div ref={rowRef} className="flex flex-wrap gap-3">
         {PANELS.map(({ backend, label }, i) => (
           <div key={backend} className="flex flex-col gap-1">
             <span className="text-muted-foreground text-[10px]">{label}</span>
             <div
               ref={(el) => { hosts.current[i] = el; }}
               className="border-border rounded-md border"
-              style={{ width: PANEL, height: PANEL }}
+              style={{ width: size || MIN_PANEL, height: size || MIN_PANEL }}
             />
           </div>
         ))}

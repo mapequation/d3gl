@@ -5,11 +5,12 @@ description: The same scenes rendered in WebGL, Canvas, and SVG side by side, to
 
 import ExampleCard from "../../../components/ExampleCard.astro";
 import BordersEquivalence from "../../../examples/backend-equivalence/BordersEquivalence.tsx";
-import StrokeEquivalence from "../../../examples/backend-equivalence/StrokeEquivalence.tsx";
+import JoinsEquivalence from "../../../examples/backend-equivalence/JoinsEquivalence.tsx";
+import PieEquivalence from "../../../examples/backend-equivalence/PieEquivalence.tsx";
 
-d3gl renders the same scene through three backends. These examples render a scene in all
-three at once so any compositing divergence is obvious. Zoom/pan any panel to inspect (the
-view mirrors across all three); the ↺ button resets the view.
+d3gl renders the same scene through three backends. Each example below renders a scene in all
+three at once so any compositing divergence is obvious. Zoom/pan any panel to inspect (the view
+mirrors across all three); the ↺ button resets the view.
 
 ## Overlapping bordered shapes
 
@@ -24,13 +25,25 @@ on top); it now composites per drawable like Canvas and SVG.
 
 ## Stroke joins & caps
 
-A pie chart (closed wedges) with thick semi-transparent black borders, plus a few open rays
-crossing it. The wedge corners exercise stroke **joins** (miter spikes vs bevel cuts vs round
-arcs), and the rays' ends exercise **caps** — the translucent border lets you see where a ray
-ends on top of a wedge border. Toggle the join, cap, and miter limit: all three backends stay
-in lockstep (they used to differ — WebGL beveled everything with butt caps, while Canvas/SVG
-mitered at different limits). The default is `bevel`, matching the original WebGL look.
+Thick opaque polylines — a sharp zigzag, an acute spike, and a closed triangle — exercising
+stroke **joins** (miter spikes vs bevel cuts vs round arcs, and the miter-limit fallback) and end
+**caps** (butt / square / round). Toggle the controls: all three backends stay in lockstep. The
+default join is `bevel`, matching the original WebGL look; choose `miter` for sharp corners.
 
 <ExampleCard files={["backend-equivalence/draw.ts"]}>
-  <StrokeEquivalence client:visible slot="demo" />
+  <JoinsEquivalence client:visible slot="demo" />
+</ExampleCard>
+
+## Translucent strokes
+
+A low-poly pie chart with thick **semi-transparent** black borders, plus a few open rays crossing
+it — the same shape as the ancestral-ranges node pies. Transparency makes overlaps visible (a ray
+end sits over a wedge border; adjacent borders darken where they stack). It also surfaces a
+WebGL-only difference: its triangulated stroke double-blends slightly where the stroke geometry
+self-overlaps (joins, and the rim where wedge edges meet), whereas Canvas/SVG composite each
+stroke as a single coverage. Most visible with `miter`. Opaque strokes (the examples above) are
+unaffected.
+
+<ExampleCard files={["backend-equivalence/draw.ts"]}>
+  <PieEquivalence client:visible slot="demo" />
 </ExampleCard>
