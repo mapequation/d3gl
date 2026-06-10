@@ -1,5 +1,39 @@
 # @mapequation/d3gl
 
+## 0.4.1
+
+### Patch Changes
+
+- 672f1fa: Fix layout shift in `"auto"` backend mode. Backend `<canvas>` elements are now
+  positioned absolutely within the (positioned) host instead of sitting in normal
+  flow. During the canvas→WebGL upgrade — and the React StrictMode double-mount that
+  compounds it — two or more backend canvases briefly coexist; as `display:block`
+  elements in normal flow they stacked vertically, inflating the host's height and
+  rendering the live map below its reserved box until the stale canvases detached (a
+  visible "jump up"). Absolute positioning overlaps coexisting canvases at the host's
+  origin so the swap never affects layout. The engine also promotes a `static` host
+  to `position:relative` so the absolute canvas anchors correctly even for bare-engine
+  consumers (the React `<GeoMap>`/`<Plot>` wrappers already set `position:relative`).
+  Hit-testing is unaffected — pointers are measured from `host.getBoundingClientRect()`.
+- 464fc3b: WebGL now composites overlapping fills and strokes in the same painter's order as Canvas and SVG. Previously WebGL drew all fills then all strokes, so a shape's border always landed on top of every fill — overlapping bordered shapes (e.g. node range pies) looked different on WebGL than on Canvas/SVG, where a later shape's fill correctly occludes an earlier shape's border. The three backends now match. (Internally this is one fewer draw call per layer, not a slowdown.)
+
+  Stroke joins and caps now match across backends too: WebGL renders **miter**/**round** joins and **square**/**round** caps (previously only bevel joins + butt caps), and all three backends are pinned to the same join/cap/miter-limit (Canvas/SVG no longer use their differing defaults of 10 and 4). New layer options `lineJoin` (`"bevel"` default | `"miter"` | `"round"`), `miterLimit` (default 10), and `lineCap` (`"butt"` default | `"square"` | `"round"`) on `plot().layer()` and `geoMap().layer()` control this consistently everywhere. The default join is `"bevel"` (matching the prior WebGL look); pass `lineJoin: "miter"` for sharp corners.
+
+  Stroke joins now emit only the outer-side geometry (the inner side is already covered by the segment quads), and a miter replaces the bevel rather than stacking on top of it. This removes redundant overlapping triangles, so translucent strokes no longer double-blend (darken) at joins — keeping WebGL close to Canvas/SVG for semi-transparent borders too.
+
+  Also renders the raster backends at `devicePixelRatio`, so WebGL and Canvas stay crisp on HiDPI/retina displays instead of upscaling a CSS-resolution buffer.
+
+- 776876c: Export `version` from the package root, inlined from `package.json` at build time.
+  Downstream apps can surface the d3gl version (e.g. a "Powered by d3gl v0.4.0" badge)
+  without importing `@mapequation/d3gl/package.json`:
+
+  ```ts
+  import { version } from "@mapequation/d3gl";
+  console.log(`Powered by d3gl v${version}`);
+  ```
+
+- 456b923: Render the orthographic globe via the same per-frame CPU reprojection as Canvas/SVG instead of an equirectangular bake-to-texture. WebGL now matches Canvas/SVG output (crisp coastlines and lines, correct globe size, no "droplet" artifact when changing layers mid-globe), honors `hideOnInteraction` while rotating/zooming the globe, and shares one zoom/rotate state model across backends — fixing the inability to zoom back out after switching backends.
+
 ## 0.4.0
 
 ### Minor Changes
