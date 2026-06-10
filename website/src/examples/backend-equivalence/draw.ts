@@ -56,114 +56,63 @@ export function drawBordersScene(chart: Plot, width: number, height: number): vo
 }
 
 // ---------------------------------------------------------------------------
-// Scene 2 — stroke joins & caps (thick opaque polylines)
+// Scenes 2 & 3 — stroke joins & caps. ONE scene, rendered opaque (joins/caps probe)
+// or translucent (which reveals WebGL's stroke self-overlap, issue #41).
 // ---------------------------------------------------------------------------
 
-/** One thick open/closed polyline, to probe stroke joins (sharp/acute/closed) and end caps. */
-export interface Line { pts: [number, number][]; closed?: boolean; color: string; }
+/** One thick open/closed polyline — probes joins (sharp/acute/closed) and end caps. `rgb` is
+ *  the base colour; the alpha is applied per render via the scene's `opacity`. */
+interface Line { pts: [number, number][]; closed?: boolean; rgb: string; }
+/** One pie wedge (centre → smooth arc → close); the rim corners are joins. */
+interface Wedge { cx: number; cy: number; r: number; a0: number; a1: number; fill: string; }
 
-export function makeLines(width: number, height: number, opacity: number = 1.0): Line[] {
+/** Polylines in the top half: a sharp zigzag, an acute spike, and a closed triangle. */
+function makeLines(width: number, height: number): Line[] {
   const x = (f: number): number => width * f;
   const y = (f: number): number => height * f;
   return [
-    // Zigzag with sharp alternating corners (joins) and two open ends (caps).
-    { color: `rgba(31, 119, 180, ${opacity})`, pts: [[x(0.1), y(0.3)], [x(0.3), y(0.12)], [x(0.75), y(0.3)], [x(0.7), y(0.12)], [x(0.9), y(0.3)]] },
-    // A very acute spike — exceeds a small miter limit, so the miter falls back to bevel.
-    { color: `rgba(214, 39, 40, ${opacity})`, pts: [[x(0.12), y(0.22)], [x(0.5), y(0.42)], [x(0.88), y(0.42)]] },
-    // A closed triangle: every corner is a (closed-path) join.
-    { color: `rgba(44, 160, 44, ${opacity})`, closed: true, pts: [[x(0.5), y(0.26)], [x(0.78), y(0.50)], [x(0.22), y(0.50)]] },
+    { rgb: "31, 119, 180", pts: [[x(0.1), y(0.28)], [x(0.3), y(0.08)], [x(0.5), y(0.28)], [x(0.7), y(0.08)], [x(0.9), y(0.28)]] },
+    { rgb: "214, 39, 40", pts: [[x(0.14), y(0.46)], [x(0.5), y(0.30)], [x(0.86), y(0.46)]] },
+    { rgb: "44, 160, 44", closed: true, pts: [[x(0.5), y(0.40)], [x(0.66), y(0.6)], [x(0.34), y(0.6)]] },
   ];
 }
 
-/** Add the stroke-joins/caps polyline scene to a Plot and render it. */
-export function drawJoinsScene(chart: Plot, width: number, height: number, style?: JoinStyle): void {
-  const lines = makeLines(width, height);
-  const lineWidth = Math.max(8, Math.round(Math.min(width, height) * 0.07));
-  chart.layer("joins", lines, {
-    draw: (ctx, l) => {
-      ctx.moveTo(l.pts[0]![0], l.pts[0]![1]);
-      for (let i = 1; i < l.pts.length; i++) ctx.lineTo(l.pts[i]![0], l.pts[i]![1]);
-      if (l.closed) ctx.closePath();
-    },
-    stroke: (l: Line) => l.color,
-    lineWidth,
-    lineJoin: style?.lineJoin,
-    lineCap: style?.lineCap,
-    miterLimit: style?.miterLimit,
-    id: (_l, i) => i,
-  });
-  chart.render();
-}
+const PIE_FRACTIONS = [0.3, 0.14, 0.22, 0.18, 0.16];
+const PIE_COLORS = ["#4e79a7", "#f28e2b", "#e15759", "#76b7b2", "#59a14f"];
 
-// ---------------------------------------------------------------------------
-// Scene 3 — translucent pie chart (shows WebGL stroke compositing differences)
-// ---------------------------------------------------------------------------
-
-/** A pie wedge as an explicit low-poly path (centre → a few arc points → close) — deliberately
- *  NOT a smooth circle, so the rim corners are sharp enough to show miter spikes (as in the
- *  ancestral-ranges pies). */
-export interface Wedge { pts: [number, number][]; fill: string; }
-/** One open segment crossing the pie, to show end caps over another (translucent) stroke. */
-export interface Ray { x0: number; y0: number; x1: number; y1: number; }
-
-const PIE_FRACTIONS = [0.2, 0.1, 0.14, 0.22, 0.18];
-const PIE_COLORS = ["#4e79a7", "#f28e2b", /*"#e15759"*/ undefined, /*"#76b7b2"*/ undefined, "#59a14f"];
-/** Semi-transparent black: overlapping borders darken where they stack and a line end stays
- *  visible over another stroke — and it reveals WebGL's stroke self-overlap (issue #41). */
-const STROKE_RGBA = "rgba(0, 0, 0, 0.5)";
-const ARC_STEPS = 3; // few steps per wedge arc ⇒ a low-poly, "less circular" pie
-
-export function makeWedges(cx: number, cy: number, r: number): Wedge[] {
+/** A pie of smooth-arc wedges in the bottom half (drawn with `ctx.arc`, not a polygon). */
+function makeWedges(cx: number, cy: number, r: number): Wedge[] {
   let a = -Math.PI / 2;
   return PIE_FRACTIONS.map((f, i) => {
     const a0 = a;
     const a1 = a + f * 2 * Math.PI;
     a = a1;
-    const pts: [number, number][] = [[cx, cy]];
-    for (let s = 0; s <= ARC_STEPS; s++) {
-      const t = a0 + (a1 - a0) * (s / ARC_STEPS);
-      pts.push([cx + Math.cos(t) * r, cy + Math.sin(t) * r]);
-    }
-    return { pts, fill: PIE_COLORS[i % PIE_COLORS.length]! };
+    return { cx, cy, r, a0, a1, fill: PIE_COLORS[i % PIE_COLORS.length]! };
   });
 }
 
-export function makeRays(cx: number, cy: number, r: number, n: number): Ray[] {
-  const rays: Ray[] = [];
-  for (let i = 0; i < n; i++) {
-    const a = -Math.PI / 2 + (i + 0.5) * (2 * Math.PI / n) + 0.3;
-    rays.push({
-      x0: cx + Math.cos(a) * r * 0.5, y0: cy + Math.sin(a) * r * 0.5,
-      x1: cx + Math.cos(a) * r * 1.32, y1: cy + Math.sin(a) * r * 1.32,
-    });
-  }
-  return rays;
-}
-
 /**
- * A low-poly pie chart (closed wedges) with thick semi-transparent black borders, plus a few
- * open rays crossing it. The sharp wedge corners exercise JOINS (miter spikes vs bevel vs round)
- * and the rays' ends exercise CAPS; the translucent border reveals where strokes overlap and
- * lets a ray-end sit visibly over a wedge border. It also surfaces WebGL's translucent
- * stroke-tessellation differences (see issue #41) — most visible with `miter`.
+ * The shared stroke scene: thick polylines (joins + caps) above a pie chart with thick black
+ * borders. Rendered at `opacity` 1 it's a clean join/cap probe (all three backends match); at
+ * `opacity` < 1 the translucent strokes reveal a WebGL-only difference — its triangulated stroke
+ * double-blends slightly where the stroke self-overlaps (joins, and the wedge rim), whereas
+ * Canvas/SVG composite each stroke as a single coverage. The lines and pie overlap a little, so a
+ * translucent line-end also sits visibly over the pie border.
  */
-export function drawPieScene(chart: Plot, width: number, height: number, style?: JoinStyle): void {
-  const cx = width / 2;
-  const cy = height * 0.75;
-  const r = Math.min(width, height) * 0.2;
-  const lineWidth = Math.max(7, Math.round(Math.min(width, height) * 0.05));
-  const wedges = makeWedges(cx, cy, r);
-  const lines = makeLines(width, height, 0.5); // for reference, shows the same stroke styles as the joins scene
-  const WEDGE_STROKES = ["rgba(255, 0, 0, 0.5)", "rgba(255, 255, 0, 0.5)", "rgba(0, 255, 255, 0.5)", "rgba(255, 0, 255, 0.5)", "rgba(100, 100, 100, 0.5)"];
+export function drawStrokeScene(chart: Plot, width: number, height: number, opacity: number, style?: JoinStyle): void {
+  const lineWidth = Math.max(7, Math.round(Math.min(width, height) * 0.06));
+  const lines = makeLines(width, height);
+  const wedges = makeWedges(width / 2, height * 0.66, Math.min(width, height) * 0.26);
+  const border = `rgba(0, 0, 0, ${opacity})`;
 
   chart.layer("pie", wedges, {
     draw: (ctx, w) => {
-      ctx.moveTo(w.pts[0]![0], w.pts[0]![1]);
-      for (let i = 1; i < w.pts.length; i++) ctx.lineTo(w.pts[i]![0], w.pts[i]![1]);
+      ctx.moveTo(w.cx, w.cy);
+      ctx.arc(w.cx, w.cy, w.r, w.a0, w.a1);
       ctx.closePath();
     },
     fill: (w: Wedge) => w.fill,
-    stroke: (w: Wedge, i: number) => WEDGE_STROKES[i % WEDGE_STROKES.length],
+    stroke: border,
     lineWidth,
     lineJoin: style?.lineJoin,
     miterLimit: style?.miterLimit,
@@ -176,7 +125,7 @@ export function drawPieScene(chart: Plot, width: number, height: number, style?:
       for (let i = 1; i < l.pts.length; i++) ctx.lineTo(l.pts[i]![0], l.pts[i]![1]);
       if (l.closed) ctx.closePath();
     },
-    stroke: (l: Line) => l.color,
+    stroke: (l: Line) => `rgba(${l.rgb}, ${opacity})`,
     lineWidth,
     lineJoin: style?.lineJoin,
     lineCap: style?.lineCap,
