@@ -107,6 +107,24 @@ This has bitten us repeatedly. The rule lives here, in
 `packages/d3gl/src/geo/project.ts` (`featureGroup`), and
 `packages/d3gl/src/geo/geo-layer.ts` (`geoLayer`).
 
+## Worktrees & shell cwd (avoid committing to the wrong repo)
+
+Feature work happens in a worktree under `.claude/worktrees/<name>/`, which is a SECOND
+checkout of the same repo. The shell's working directory can silently reset to the
+**primary** repo between commands (e.g. after a `cd /…/d3gl && …`, a `cd /tmp`, or a tool
+that resets cwd). If you then run `git add -A && git commit && git push` assuming you're in
+the worktree, you'll commit to the **primary checkout's branch (usually `main`)** instead —
+and `git add -A` there will even add `.claude/worktrees/<name>` as an embedded-repo gitlink.
+This happened once and pushed junk to `main`.
+
+Defenses (do these):
+- Run every git/build command with an explicit path — `git -C <worktree> …`,
+  `pnpm --filter <pkg> …` — instead of relying on the current directory.
+- Stage scoped paths (`git add website/ packages/`), never a bare `git add -A`, so a
+  wrong-cwd add can't sweep in `.claude/`.
+- A `git push` that prints `main -> main` (or warns about an *embedded git repository*)
+  means you're in the wrong checkout — stop and fix before pushing.
+
 ## Build / typecheck
 
 - **Root `pnpm typecheck` is broken** — there is no root `tsconfig.json`, so the
@@ -127,6 +145,48 @@ This has bitten us repeatedly. The rule lives here, in
   a wall-clock watchdog (`packages/d3gl/scripts/run-browser-tests.mjs`) turns any
   rare connect/teardown stall into a fast failure instead of an infinite hang. CI
   (`ci.yml`) still runs only `pnpm test` (node), not the browser suite.
+
+## Backend compositing equivalence (READ before touching the WebGL renderer)
+
+WebGL, Canvas, and SVG must composite a layer **identically**. The reference is the
+**painter's model**: for each drawable in order, fill then stroke (Canvas
+`drawShapes` / SVG document order). So a later drawable's fill correctly occludes an
+earlier drawable's *border* where they overlap.
+
+`GroupRenderer` (`webgl/renderer.ts`) therefore packs fill **and** stroke into ONE
+geometry pass whose index buffer is ordered **per drawable** —
+`fill_d, stroke_d, fill_{d+1}, …` — and draws it in a single indexed call (WebGL
+blends primitives in index order). An `a_isStroke` attribute picks the fill vs stroke
+color table in-shader; both tables stay `drawableId`-indexed. **Do not** split this
+back into separate all-fills-then-all-strokes passes — that puts every border on top
+of every fill and diverges from Canvas/SVG (issue #41). `GroupBuffers.ranges` carries
+the per-drawable fill/stroke slices the interleave needs.
+
+**Stroke joins/caps** must also match. WebGL `expandStroke` (`core/stroke.ts`) tessellates
+**miter** joins (bevel fallback past the miter limit), **round** joins (an outer-side arc
+fan), and **square/round** end caps (open subpaths only — a quad or a semicircle fan, built
+at geometry time, no per-frame cost). `lineJoin`/`miterLimit`/`lineCap` thread from the layer
+options through `DrawableOpts` → `expandStroke` and onto `DrawableVector` so Canvas
+(`ctx.lineJoin`/`miterLimit`/`lineCap`) and SVG (`stroke-linejoin`/`-miterlimit`/`-linecap` in
+`svg/serialize.ts`) render the same corners/ends. Pin them explicitly on every backend — the
+native defaults differ (Canvas miter limit 10, SVG 4, and WebGL used to bevel everything).
+**Default join is `bevel`.** Each join emits ONLY outer-side geometry (the inner side is
+already covered by the two overlapping segment quads); a miter REPLACES the bevel rather than
+stacking on it. This matters for **translucent** strokes — redundant overlapping triangles
+would double-blend (darken) at joins. A residual remains: the segment quads themselves overlap
+on the inner side of sharp turns, which only single-coverage rendering (stencil/RTT —
+incompatible with the batched single-pass painter order) would fully remove. It's ~0.4%
+(position-tolerant) and opaque strokes are unaffected. luma.gl has no high-level arc/stroke
+primitive to lean on — strokes are flattened to polylines (`PathRecorder`) and triangulated here.
+
+Guard it with the **backend-equivalence harness**
+(`map/__tests__/backend-equivalence-harness.ts` + `map/backend-equivalence.browser.test.ts`):
+it renders a Scene through both backends and pixel-diffs them (cases: overlapping bordered
+shapes for draw order, thick polylines for joins/caps). Use a **position-tolerant** diff
+(radius ≥ 1) — WebGL's tessellated stroke and Canvas's native stroker land ~1px apart along
+edges, so an exact-position diff reports ~6% noise that isn't a real divergence. The live
+`website` "Backend equivalence" example renders both scenes in all three backends side by
+side with synced zoom for eyeballing.
 
 ## Incremental layer append (status)
 

@@ -7,20 +7,28 @@
 export const FILL_VS = `#version 300 es
 precision highp float;
 uniform mat3 u_transform;
-uniform highp sampler2D u_colorTable;
+uniform highp sampler2D u_colorTable;   // per-drawable FILL color, indexed by drawableId
+uniform highp sampler2D u_strokeTable;  // per-drawable STROKE color, indexed by drawableId
 uniform highp sampler2D u_flags;
 uniform float u_screen;     // 1.0 = screen sizeMode (constant px), 0.0 = world
 uniform vec2 u_viewport;    // device px, for screen sizeMode
 in vec2 a_position;
 in vec2 a_anchor;
 in float a_drawableId;
+in float a_isStroke;        // 0 = fill vertex (sample u_colorTable), 1 = stroke vertex (u_strokeTable)
 out vec4 v_color;
 flat out float v_id;
 void main() {
   int id = int(a_drawableId + 0.5);
   v_id = a_drawableId;
+  // Fill and stroke geometry of a drawable share this shader (interleaved per drawable
+  // in one draw, so painter's order is preserved); a_isStroke picks the color table.
+  // Samplers are opaque (no sampler l-values in GLSL ES), so fetch both and select.
   ivec2 cs = textureSize(u_colorTable, 0);
-  v_color = texelFetch(u_colorTable, ivec2(id % cs.x, id / cs.x), 0);
+  vec4 fillColor = texelFetch(u_colorTable, ivec2(id % cs.x, id / cs.x), 0);
+  ivec2 ss = textureSize(u_strokeTable, 0);
+  vec4 strokeColor = texelFetch(u_strokeTable, ivec2(id % ss.x, id / ss.x), 0);
+  v_color = (a_isStroke > 0.5) ? strokeColor : fillColor;
   ivec2 fsz = textureSize(u_flags, 0);
   // r8 byte -> integer; visibility is bit 0 (matches ../core/index.js flag semantics).
   int flags = int(texelFetch(u_flags, ivec2(id % fsz.x, id / fsz.x), 0).r * 255.0 + 0.5);

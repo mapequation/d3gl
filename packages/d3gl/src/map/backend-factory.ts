@@ -31,9 +31,21 @@ export interface BackendHandle {
   element: HTMLElement;
 }
 
+/** Backing-store pixels per CSS pixel. Rendering at the physical display resolution keeps thin
+ *  strokes/points crisp on HiDPI ("retina") screens instead of letting the browser upscale a
+ *  CSS-resolution buffer. 1 on a standard display — then all the per-backend dpr math is a no-op. */
+function dpr(): number {
+  return (typeof window !== "undefined" && window.devicePixelRatio) || 1;
+}
+
 function makeCanvas(host: HTMLElement, w: number, h: number): HTMLCanvasElement {
   const canvas = document.createElement("canvas");
-  canvas.width = w; canvas.height = h;
+  // CSS size stays in layout px; the drawing buffer is device px (CSS × dpr). The WebGL path
+  // lets luma own the buffer (useDevicePixels), reconciling to this same CSS size.
+  canvas.style.width = `${w}px`;
+  canvas.style.height = `${h}px`;
+  canvas.width = Math.round(w * dpr());
+  canvas.height = Math.round(h * dpr());
   canvas.style.display = "block";
   // Take the canvas out of normal flow and pin it to the host's top-left. The host is
   // always positioned (the React <GeoMap>/<Plot> wrappers set position:relative; a bare

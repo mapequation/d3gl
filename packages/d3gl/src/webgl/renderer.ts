@@ -1,7 +1,7 @@
 import { Buffer } from "@luma.gl/core";
 import type { Device, Texture, RenderPass, TextureFormat } from "@luma.gl/core";
 import { Model } from "@luma.gl/engine";
-import type { GroupBuffers, GroupBufferDelta } from "../core/index.js";
+import type { GroupBuffers, GroupBufferDelta, DrawableRange } from "../core/index.js";
 import { FILL_VS, FILL_FS, PICK_FS, POINT_VS, POINT_FS } from "./shaders.js";
 
 /** Fixed texel width of every per-drawable side-table texture (color/flags). */
@@ -215,14 +215,26 @@ class GrowTexture {
   }
 }
 
-/** GPU resources for one geometry pass (fill or stroke). */
+/**
+ * GPU resources for the combined fill+stroke geometry pass.
+ *
+ * Fill and stroke triangles live in ONE vertex/index buffer, with the index buffer
+ * ordered per drawable — `fill_d, stroke_d, fill_{d+1}, stroke_{d+1}, …` — so a single
+ * indexed draw composites them in painter's order (WebGL blends primitives in index
+ * order), matching the Canvas/SVG per-drawable fill-then-stroke model. The `isStroke`
+ * attribute (0/1) selects the fill vs stroke color table per vertex in the shader.
+ */
 interface Pass {
   position: GrowBuffer;
   id: GrowBuffer;
   anchor: GrowBuffer;
+  /** Per-vertex 0 (fill) / 1 (stroke) flag selecting the color table in the shader. */
+  isStroke: GrowBuffer;
   index: GrowBuffer;
-  /** Per-drawable RGBA color table (rgba8unorm), grown with partial row uploads. */
+  /** Per-drawable FILL RGBA table (rgba8unorm), indexed by drawableId. */
   colorTex: GrowTexture;
+  /** Per-drawable STROKE RGBA table (rgba8unorm), indexed by drawableId. */
+  strokeColorTex: GrowTexture;
   /** Per-drawable flags table (r8unorm), grown with partial row uploads. */
   flagsTex: GrowTexture;
   fillModel: Model;
@@ -256,6 +268,7 @@ const FILL_LAYOUT = [
   { name: "a_position", format: "float32x2" as const },
   { name: "a_anchor", format: "float32x2" as const },
   { name: "a_drawableId", format: "float32" as const },
+  { name: "a_isStroke", format: "float32" as const },
 ];
 
 const POINT_LAYOUT = [
@@ -276,8 +289,8 @@ const POINT_CORNERS: [number, number][] = [[-1, -1], [1, -1], [1, 1], [-1, 1]];
  */
 export class GroupRenderer {
   private transform = identity();
-  private fill: Pass | null;
-  private stroke: Pass | null;
+  /** Combined fill+stroke pass (interleaved per drawable). Null when the group is points-only. */
+  private shape: Pass | null;
   private point: PointPass | null;
 
   constructor(
@@ -288,58 +301,120 @@ export class GroupRenderer {
     /** Viewport height in device pixels (for screen-mode point sizing). */
     private viewportHeight = 0,
   ) {
-    this.fill = this.buildPass(
-      buffers.fillVertices,
-      buffers.fillIndices,
-      buffers.fillColors,
-      buffers.flags,
-      buffers.fillAnchors,
-    );
-    this.stroke = this.buildPass(
-      buffers.strokeVertices,
-      buffers.strokeIndices,
-      buffers.strokeColors,
-      buffers.flags,
-      buffers.strokeAnchors,
-    );
+    this.shape = this.buildShapePass(buffers);
     this.point = this.buildPointPass(buffers);
   }
 
-  /** De-interleave stride-3 [x,y,id] verts into position(2/vert) + id(1/vert). */
-  private static deinterleave(verts: Float32Array): { pos: Float32Array; ids: Float32Array } {
-    const n = verts.length / 3;
-    const pos = new Float32Array(n * 2);
-    const ids = new Float32Array(n);
-    for (let i = 0; i < n; i++) {
-      pos[2 * i] = verts[3 * i]!;
-      pos[2 * i + 1] = verts[3 * i + 1]!;
-      ids[i] = verts[3 * i + 2]!;
+  /**
+   * Interleave per-drawable fill + stroke geometry into one merged vertex/index set,
+   * in paint order (`fill_d, stroke_d, fill_{d+1}, …`). Vertex order is irrelevant to
+   * blending — only the INDEX order is — so vertices are laid out drawable-by-drawable
+   * (fill block then stroke block) which makes appends a clean tail-add.
+   *
+   * `ranges` offsets are absolute into the given arrays; for an append the arrays are
+   * tail slices, so they're rebased against `ranges[0]`'s offsets. Index VALUES stay
+   * group/slice-absolute and are remapped to the merged buffer via the drawable's own
+   * vertex offset. `mergedVertexBase` is the vertex count already in the merged buffer
+   * (0 for a fresh build) so appended index values continue correctly.
+   */
+  private static interleave(
+    fillVerts: Float32Array,
+    strokeVerts: Float32Array,
+    fillAnchors: Float32Array,
+    strokeAnchors: Float32Array,
+    fillIdx: Uint32Array,
+    strokeIdx: Uint32Array,
+    ranges: DrawableRange[],
+    mergedVertexBase: number,
+  ): { pos: Float32Array; anchor: Float32Array; id: Float32Array; isStroke: Float32Array; index: Uint32Array } {
+    let vCount = 0;
+    let iCount = 0;
+    for (const r of ranges) {
+      vCount += r.fill.vertexCount + r.stroke.vertexCount;
+      iCount += r.fill.indexCount + r.stroke.indexCount;
     }
-    return { pos, ids };
+    const pos = new Float32Array(vCount * 2);
+    const anchor = new Float32Array(vCount * 2);
+    const id = new Float32Array(vCount);
+    const isStroke = new Float32Array(vCount);
+    const index = new Uint32Array(iCount);
+    // Slice bases: ranges offsets are absolute, but the arrays may be tail slices.
+    const fvBase = ranges.length ? ranges[0]!.fill.vertexOffset : 0;
+    const fiBase = ranges.length ? ranges[0]!.fill.indexOffset : 0;
+    const svBase = ranges.length ? ranges[0]!.stroke.vertexOffset : 0;
+    const siBase = ranges.length ? ranges[0]!.stroke.indexOffset : 0;
+    let v = 0;
+    let ii = 0;
+    const emit = (
+      verts: Float32Array,
+      anchors: Float32Array,
+      idx: Uint32Array,
+      vOff: number,
+      vCnt: number,
+      iOff: number,
+      iCnt: number,
+      vBase: number,
+      iBase: number,
+      strokeFlag: number,
+    ): void => {
+      const mergedBase = mergedVertexBase + v;
+      const localVOff = vOff - vBase;
+      for (let k = 0; k < vCnt; k++) {
+        const src = (localVOff + k) * 3;
+        pos[v * 2] = verts[src]!;
+        pos[v * 2 + 1] = verts[src + 1]!;
+        id[v] = verts[src + 2]!;
+        const a = (localVOff + k) * 2;
+        anchor[v * 2] = anchors[a]!;
+        anchor[v * 2 + 1] = anchors[a + 1]!;
+        isStroke[v] = strokeFlag;
+        v++;
+      }
+      const localIOff = iOff - iBase;
+      for (let k = 0; k < iCnt; k++) {
+        // idx values are absolute into the drawable's vertex run; (value - vOff) is the
+        // local-in-drawable vertex, + mergedBase places it in the merged buffer.
+        index[ii++] = idx[localIOff + k]! - vOff + mergedBase;
+      }
+    };
+    for (const r of ranges) {
+      emit(fillVerts, fillAnchors, fillIdx, r.fill.vertexOffset, r.fill.vertexCount, r.fill.indexOffset, r.fill.indexCount, fvBase, fiBase, 0);
+      emit(strokeVerts, strokeAnchors, strokeIdx, r.stroke.vertexOffset, r.stroke.vertexCount, r.stroke.indexOffset, r.stroke.indexCount, svBase, siBase, 1);
+    }
+    return { pos, anchor, id, isStroke, index };
   }
 
-  private buildPass(
-    verts: Float32Array,
-    indices: Uint32Array,
-    colors: Uint8Array,
-    flags: Uint8Array,
-    anchors: Float32Array,
-  ): Pass | null {
-    if (indices.length === 0) return null;
+  /** Build the combined fill+stroke pass. Null when the group has no fill/stroke geometry. */
+  private buildShapePass(buffers: GroupBuffers): Pass | null {
+    if (buffers.fillIndices.length === 0 && buffers.strokeIndices.length === 0) return null;
     const device = this.device;
 
-    const { pos, ids } = GroupRenderer.deinterleave(verts);
-    const position = new GrowBuffer(device, Float32Array, pos);
-    const id = new GrowBuffer(device, Float32Array, ids);
-    const anchor = new GrowBuffer(device, Float32Array, anchors);
-    const index = new GrowBuffer(device, Uint32Array, indices, true);
+    const m = GroupRenderer.interleave(
+      buffers.fillVertices, buffers.strokeVertices,
+      buffers.fillAnchors, buffers.strokeAnchors,
+      buffers.fillIndices, buffers.strokeIndices,
+      buffers.ranges, 0,
+    );
+    const position = new GrowBuffer(device, Float32Array, m.pos);
+    const id = new GrowBuffer(device, Float32Array, m.id);
+    const anchor = new GrowBuffer(device, Float32Array, m.anchor);
+    const isStroke = new GrowBuffer(device, Float32Array, m.isStroke);
+    const index = new GrowBuffer(device, Uint32Array, m.index, true);
 
-    const count = colors.length / 4;
-    const colorTex = new GrowTexture(device, 4, "rgba8unorm", colors, count);
-    const flagsTex = new GrowTexture(device, 1, "r8unorm", flags, count);
+    // Every drawable contributes one fill + one stroke color + one flag byte (defaults
+    // included for fill-less / stroke-less drawables), so all three tables size to drawableCount.
+    const count = buffers.fillColors.length / 4;
+    const colorTex = new GrowTexture(device, 4, "rgba8unorm", buffers.fillColors, count);
+    const strokeColorTex = new GrowTexture(device, 4, "rgba8unorm", buffers.strokeColors, count);
+    const flagsTex = new GrowTexture(device, 1, "r8unorm", buffers.flags, count);
 
-    const attributes = { a_position: position.buffer, a_anchor: anchor.buffer, a_drawableId: id.buffer };
-    const bindings = { u_colorTable: colorTex.texture, u_flags: flagsTex.texture };
+    const attributes = {
+      a_position: position.buffer,
+      a_anchor: anchor.buffer,
+      a_drawableId: id.buffer,
+      a_isStroke: isStroke.buffer,
+    };
+    const bindings = { u_colorTable: colorTex.texture, u_strokeTable: strokeColorTex.texture, u_flags: flagsTex.texture };
     // Use a shared uniforms object so setTransform mutations are picked up on the next draw.
     const uniforms: Record<string, unknown> = {
       u_transform: this.transform,
@@ -355,15 +430,16 @@ export class GroupRenderer {
       topology: "triangle-list" as const,
       // For indexed draws luma derives the draw count from the index buffer; this
       // is the index count and is accepted but redundant.
-      vertexCount: indices.length,
+      vertexCount: m.index.length,
     };
 
     const fillModel = new Model(device, { ...common, vs: FILL_VS, fs: FILL_FS });
     // pickModel shares geometry/bindings/uniforms with fillModel; it is drawn only
-    // by renderPick() (GPU color-picking).
+    // by renderPick() (GPU color-picking). Both fill and stroke fragments encode the
+    // same drawableId (v_id), so a border pixel picks its drawable too.
     const pickModel = new Model(device, { ...common, vs: FILL_VS, fs: PICK_FS });
     return {
-      position, id, anchor, index, colorTex, flagsTex,
+      position, id, anchor, isStroke, index, colorTex, strokeColorTex, flagsTex,
       fillModel, pickModel, uniforms, drawableCount: count,
     };
   }
@@ -413,14 +489,14 @@ export class GroupRenderer {
     const pointId = new GrowBuffer(device, Float32Array, e.pointId);
     const index = new GrowBuffer(device, Uint32Array, e.index, true);
 
-    // Reuse fill pass textures if available (share the same GrowTexture refs),
+    // Reuse the shape pass's FILL color table (same realId-indexed semantics) if available,
     // else build owned ones from fillColors/flags.
     let colorTex: GrowTexture;
     let flagsTex: GrowTexture;
     let ownsTextures: boolean;
-    if (this.fill) {
-      colorTex = this.fill.colorTex;
-      flagsTex = this.fill.flagsTex;
+    if (this.shape) {
+      colorTex = this.shape.colorTex;
+      flagsTex = this.shape.flagsTex;
       ownsTextures = false;
     } else {
       const count = buffers.fillColors.length / 4;
@@ -462,29 +538,24 @@ export class GroupRenderer {
     };
   }
 
-  private passes(): Pass[] {
-    return [this.fill, this.stroke].filter((p): p is Pass => p !== null);
-  }
-
   /**
-   * Append a tail delta in O(new): grow the geometry buffers (capacity-doubling)
-   * and the color/flags textures (partial upload, or recreate on a dimension change),
-   * bumping the draw (index) count. Same observable result as a full rebuild.
+   * Append a tail delta in O(new): interleave the new drawables' fill+stroke into the
+   * merged geometry buffers (capacity-doubling) and grow the color/flags textures
+   * (partial upload, or recreate on a dimension change). Same observable result as a
+   * full rebuild.
    *
-   * Limitation: a pass that does not yet exist (e.g. the first stroke geometry arriving
-   * on an append to a previously stroke-less layer) cannot be created incrementally here
-   * — we lack the full buffers. The engine guards this by routing such a case to a full
-   * `updateLayer` rebuild instead; in practice layers keep a stable geometry-type mix.
+   * Limitation: a pass that does not yet exist (the group was built with NO fill/stroke
+   * geometry at all and the first such geometry arrives now) cannot be created
+   * incrementally here — we lack the full buffers. The engine guards this by routing such
+   * a case to a full rebuild instead. (Unlike the old split fill/stroke passes, a layer
+   * that already has *either* fill or stroke can grow into the other type without a rebuild,
+   * since both share one pass.)
    */
   append(delta: GroupBufferDelta): boolean {
     let ok = true;
-    if (delta.fillIndices.length > 0) {
-      if (this.fill) this.appendPass(this.fill, delta.fillVertices, delta.fillIndices, delta.fillColors, delta.flags, delta.fillAnchors, delta.drawableCount);
-      else ok = false; // pass absent; caller falls back to a rebuild
-    }
-    if (delta.strokeIndices.length > 0) {
-      if (this.stroke) this.appendPass(this.stroke, delta.strokeVertices, delta.strokeIndices, delta.strokeColors, delta.flags, delta.strokeAnchors, delta.drawableCount);
-      else ok = false;
+    if (delta.fillIndices.length > 0 || delta.strokeIndices.length > 0) {
+      if (this.shape) this.appendShape(delta);
+      else ok = false; // no shape pass yet; caller falls back to a rebuild
     }
     if (delta.pointCenters.length > 0) {
       if (this.point) this.appendPointPass(this.point, delta.pointCenters, delta.fillColors, delta.flags, delta.drawableCount);
@@ -493,22 +564,25 @@ export class GroupRenderer {
     return ok;
   }
 
-  private appendPass(
-    pass: Pass,
-    deltaVerts: Float32Array,
-    deltaIndices: Uint32Array,
-    deltaColors: Uint8Array,
-    deltaFlags: Uint8Array,
-    deltaAnchors: Float32Array,
-    newDrawableCount: number,
-  ): void {
-    const { pos, ids } = GroupRenderer.deinterleave(deltaVerts);
-    // Index values are group-absolute — append verbatim.
+  private appendShape(delta: GroupBufferDelta): void {
+    const pass = this.shape!;
+    const mergedVertexBase = pass.position.length / 2; // 2 floats per vertex
+    const m = GroupRenderer.interleave(
+      delta.fillVertices, delta.strokeVertices,
+      delta.fillAnchors, delta.strokeAnchors,
+      delta.fillIndices, delta.strokeIndices,
+      delta.ranges, mergedVertexBase,
+    );
     const realloc =
-      [pass.position.append(pos), pass.id.append(ids), pass.anchor.append(deltaAnchors), pass.index.append(deltaIndices)]
+      [pass.position.append(m.pos), pass.id.append(m.id), pass.anchor.append(m.anchor), pass.isStroke.append(m.isStroke), pass.index.append(m.index)]
         .reduce((a, b) => a || b, false);
     if (realloc) {
-      const attributes = { a_position: pass.position.buffer, a_anchor: pass.anchor.buffer, a_drawableId: pass.id.buffer };
+      const attributes = {
+        a_position: pass.position.buffer,
+        a_anchor: pass.anchor.buffer,
+        a_drawableId: pass.id.buffer,
+        a_isStroke: pass.isStroke.buffer,
+      };
       pass.fillModel.setAttributes(attributes);
       pass.fillModel.setIndexBuffer(pass.index.buffer);
       pass.pickModel.setAttributes(attributes);
@@ -516,25 +590,25 @@ export class GroupRenderer {
     }
     pass.fillModel.setVertexCount(pass.index.length);
     pass.pickModel.setVertexCount(pass.index.length);
-    // Grow color/flags textures (partial row upload, or recreate on capacity overflow).
-    this.growPassTextures(pass, deltaColors, deltaFlags, newDrawableCount);
+    // Grow the fill/stroke/flags textures (partial row upload, or recreate on overflow).
+    this.growShapeTextures(delta.fillColors, delta.strokeColors, delta.flags, delta.drawableCount);
   }
 
-  /** Append color/flags for a fill/stroke pass: O(new) partial row upload, recreate on overflow. */
-  private growPassTextures(pass: Pass, deltaColors: Uint8Array, deltaFlags: Uint8Array, newCount: number): void {
-    // Track whether a borrowing point pass shares these GrowTextures, so we can rebind
-    // its Model when an overflow recreates the underlying texture.
-    const pointBorrows = !!this.point && !this.point.ownsTextures &&
-      this.point.colorTex === pass.colorTex;
-    // Call both (no short-circuit): both tables must consume their delta.
-    const colorRecreated = pass.colorTex.append(deltaColors, newCount);
+  /** Append fill/stroke colors + flags for the shape pass: O(new) partial row upload, recreate on overflow. */
+  private growShapeTextures(deltaFill: Uint8Array, deltaStroke: Uint8Array, deltaFlags: Uint8Array, newCount: number): void {
+    const pass = this.shape!;
+    // A borrowing point pass shares the FILL color table + flags, so rebind it if a recreate
+    // swaps the underlying texture.
+    const pointBorrows = !!this.point && !this.point.ownsTextures && this.point.colorTex === pass.colorTex;
+    // Call all (no short-circuit): every table must consume its delta.
+    const colorRecreated = pass.colorTex.append(deltaFill, newCount);
+    const strokeRecreated = pass.strokeColorTex.append(deltaStroke, newCount);
     const flagsRecreated = pass.flagsTex.append(deltaFlags, newCount);
     pass.drawableCount = newCount;
-    if (colorRecreated || flagsRecreated) {
-      const bindings = { u_colorTable: pass.colorTex.texture, u_flags: pass.flagsTex.texture };
-      pass.fillModel.setBindings(bindings);
-      pass.pickModel.setBindings(bindings);
-      if (pointBorrows && this.point) this.point.model.setBindings(bindings);
+    if (colorRecreated || strokeRecreated || flagsRecreated) {
+      pass.fillModel.setBindings({ u_colorTable: pass.colorTex.texture, u_strokeTable: pass.strokeColorTex.texture, u_flags: pass.flagsTex.texture });
+      pass.pickModel.setBindings({ u_colorTable: pass.colorTex.texture, u_strokeTable: pass.strokeColorTex.texture, u_flags: pass.flagsTex.texture });
+      if (pointBorrows && this.point) this.point.model.setBindings({ u_colorTable: pass.colorTex.texture, u_flags: pass.flagsTex.texture });
     }
   }
 
@@ -584,25 +658,23 @@ export class GroupRenderer {
    * mismatch throws rather than silently corrupting.
    */
   updateColors(buffers: GroupBuffers): void {
-    if (this.fill) this.writeTables(this.fill, buffers.fillColors, buffers.flags);
-    if (this.stroke) this.writeTables(this.stroke, buffers.strokeColors, buffers.flags);
-    // If the point pass owns its own textures (no fill pass), update them too.
+    if (this.shape) {
+      const count = buffers.fillColors.length / 4;
+      if (count !== this.shape.drawableCount) {
+        throw new Error(
+          `updateColors drawable count ${count} != ${this.shape.drawableCount} at build time; ` +
+            `appended drawables must go through append()`,
+        );
+      }
+      this.shape.colorTex.write(buffers.fillColors);
+      this.shape.strokeColorTex.write(buffers.strokeColors);
+      this.shape.flagsTex.write(buffers.flags);
+    }
+    // If the point pass owns its own textures (no shape pass), update them too.
     if (this.point?.ownsTextures) {
       this.writePointTables(this.point, buffers.fillColors, buffers.flags);
     }
-    // If point borrows from fill, fill's writeTables above already updated those textures.
-  }
-
-  private writeTables(pass: Pass, colors: Uint8Array, flags: Uint8Array): void {
-    const count = colors.length / 4;
-    if (count !== pass.drawableCount) {
-      throw new Error(
-        `updateColors drawable count ${count} != ${pass.drawableCount} at build time; ` +
-          `appended drawables must go through append()`,
-      );
-    }
-    pass.colorTex.write(colors);
-    pass.flagsTex.write(flags);
+    // If point borrows from the shape pass, the writes above already updated those textures.
   }
 
   private writePointTables(pp: PointPass, colors: Uint8Array, flags: Uint8Array): void {
@@ -626,7 +698,7 @@ export class GroupRenderer {
   // Standard (non-premultiplied) alpha blending so a fill/stroke color with alpha < 1
   // (e.g. "#9bd1a466") composites over what's behind it instead of rendering opaque.
   // Opaque colors (alpha = 1) are unaffected: src·1 + dst·0 = src. Applied to the
-  // fill/stroke/point models — NOT the pick model, whose ids must stay exact.
+  // shape/point models — NOT the pick model, whose ids must stay exact.
   private static BLEND = {
     blend: true,
     blendColorOperation: "add", blendColorSrcFactor: "src-alpha", blendColorDstFactor: "one-minus-src-alpha",
@@ -636,8 +708,7 @@ export class GroupRenderer {
   /** Switch stencil state for clipping. "write" = clip source (mask), "test" = clipped layer, "off" = normal. */
   setStencil(mode: "off" | "write" | "test"): void {
     const params = { ...GroupRenderer.BLEND, ...GroupRenderer.STENCIL[mode] } as Record<string, unknown>;
-    if (this.fill) this.fill.fillModel.setParameters(params);
-    if (this.stroke) this.stroke.fillModel.setParameters(params);
+    if (this.shape) this.shape.fillModel.setParameters(params);
     if (this.point) this.point.model.setParameters(params);
   }
 
@@ -645,9 +716,7 @@ export class GroupRenderer {
   setTransform(m: Float32Array): void {
     this.transform = m;
     // Mutate the shared uniforms dict in-place; Model reads this.props.uniforms on every draw.
-    for (const pass of this.passes()) {
-      pass.uniforms["u_transform"] = m;
-    }
+    if (this.shape) this.shape.uniforms["u_transform"] = m;
     if (this.point) this.point.uniforms["u_transform"] = m;
   }
 
@@ -658,36 +727,37 @@ export class GroupRenderer {
    */
   setSizeMode(mode: "world" | "screen"): void {
     const s = mode === "screen" ? 1.0 : 0.0;
-    for (const pass of this.passes()) pass.uniforms["u_screen"] = s;
+    if (this.shape) this.shape.uniforms["u_screen"] = s;
     if (this.point) this.point.uniforms["u_pointScreen"] = s;
   }
 
-  /** Draw the fill, stroke, then point passes into an open render pass. */
+  /** Draw the combined fill+stroke pass (painter's order), then the point pass. */
   render(renderPass: RenderPass): void {
-    if (this.fill) this.fill.fillModel.draw(renderPass);
-    if (this.stroke) this.stroke.fillModel.draw(renderPass);
+    if (this.shape) this.shape.fillModel.draw(renderPass);
     if (this.point) this.point.model.draw(renderPass);
   }
 
   /**
-   * Draw the fill geometry with each drawable's id encoded as an RGB color, for
+   * Draw the fill+stroke geometry with each drawable's id encoded as an RGB color, for
    * GPU color-picking. Render this into a dedicated offscreen pass, then read the
    * pixel under the cursor and decode it with decodePickColor().
    */
   renderPick(renderPass: RenderPass): void {
-    if (this.fill) this.fill.pickModel.draw(renderPass);
+    if (this.shape) this.shape.pickModel.draw(renderPass);
   }
 
   destroy(): void {
-    for (const pass of this.passes()) {
-      pass.position.destroy();
-      pass.id.destroy();
-      pass.anchor.destroy();
-      pass.index.destroy();
-      pass.colorTex.destroy();
-      pass.flagsTex.destroy();
-      pass.fillModel.destroy();
-      pass.pickModel.destroy();
+    if (this.shape) {
+      this.shape.position.destroy();
+      this.shape.id.destroy();
+      this.shape.anchor.destroy();
+      this.shape.isStroke.destroy();
+      this.shape.index.destroy();
+      this.shape.colorTex.destroy();
+      this.shape.strokeColorTex.destroy();
+      this.shape.flagsTex.destroy();
+      this.shape.fillModel.destroy();
+      this.shape.pickModel.destroy();
     }
     if (this.point) {
       this.point.center.destroy();
@@ -696,8 +766,8 @@ export class GroupRenderer {
       this.point.pointId.destroy();
       this.point.index.destroy();
       this.point.model.destroy();
-      // Only destroy textures if they are owned (not shared with fill pass —
-      // borrowed GrowTextures are the fill pass's and are destroyed above).
+      // Only destroy textures if they are owned (not shared with the shape pass —
+      // borrowed GrowTextures are the shape pass's and are destroyed above).
       if (this.point.ownsTextures) {
         this.point.colorTex.destroy();
         this.point.flagsTex.destroy();

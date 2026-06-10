@@ -1,0 +1,49 @@
+---
+title: Backend equivalence
+description: The same scenes rendered in WebGL, Canvas, and SVG side by side, to check that all three composite identically.
+---
+
+import ExampleCard from "../../../components/ExampleCard.astro";
+import BordersEquivalence from "../../../examples/backend-equivalence/BordersEquivalence.tsx";
+import JoinsEquivalence from "../../../examples/backend-equivalence/JoinsEquivalence.tsx";
+import TranslucentEquivalence from "../../../examples/backend-equivalence/TranslucentEquivalence.tsx";
+
+d3gl renders the same scene through three backends. Each example below renders a scene in all
+three at once so any compositing divergence is obvious. Zoom/pan any panel to inspect (the view
+mirrors across all three); the ↺ button resets the view.
+
+## Overlapping bordered shapes
+
+A flower of opaque, overlapping discs with thick white borders. Because the discs overlap and
+are drawn in order, each disc's border is partly covered by later discs' fills — a sensitive
+probe of fill/stroke **draw order**. WebGL used to draw all fills then all strokes (every border
+on top); it now composites per drawable like Canvas and SVG.
+
+<ExampleCard files={["backend-equivalence/draw.ts"]}>
+  <BordersEquivalence client:visible slot="demo" />
+</ExampleCard>
+
+## Stroke joins & caps
+
+Thick **opaque** strokes — a sharp zigzag, an acute spike, a closed triangle, and a pie chart —
+exercising stroke **joins** (miter spikes vs bevel cuts vs round arcs, plus the miter-limit
+fallback) and end **caps** (butt / square / round). Toggle the controls: all three backends stay
+in lockstep. The default join is `bevel`, matching the original WebGL look; choose `miter` for
+sharp corners.
+
+<ExampleCard files={["backend-equivalence/draw.ts"]}>
+  <JoinsEquivalence client:visible slot="demo" />
+</ExampleCard>
+
+## Translucent strokes
+
+The **same scene at 50% opacity**. Transparency makes overlaps visible — a line end sits over the
+pie border, and adjacent borders darken where they stack. It also surfaces a WebGL-only
+difference: its triangulated stroke double-blends slightly where a stroke self-overlaps (joins,
+and the wedge rim), whereas Canvas and SVG composite each stroke as a single coverage. The
+difference is small (~0.4% of pixels) and translucent-only — the opaque strokes above are exact —
+and is tracked as a follow-up. Most visible with `miter`.
+
+<ExampleCard files={["backend-equivalence/draw.ts"]}>
+  <TranslucentEquivalence client:visible slot="demo" />
+</ExampleCard>

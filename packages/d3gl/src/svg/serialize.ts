@@ -31,21 +31,27 @@ function pathDScreen(d: DrawableVector, ax: number, ay: number, ox: number, oy: 
   return ctx.toPath();
 }
 
+/** SVG stroke attributes (color, width, join, miter limit, butt cap) matching the WebGL
+ *  stroke geometry + the Canvas backend. SVG's own defaults differ (miter limit 4), so set
+ *  them explicitly. Empty string when the drawable has no visible stroke. */
+function strokeAttrs(d: DrawableVector, width: number): string {
+  if (!(d.stroke[3] > 0 && d.lineWidth > 0)) return "";
+  const miter = d.lineJoin === "miter" ? ` stroke-miterlimit="${d.miterLimit}"` : "";
+  return ` stroke="${rgba(d.stroke)}" stroke-width="${width}" stroke-linejoin="${d.lineJoin}" stroke-linecap="${d.lineCap}"${miter}`;
+}
+
 /** Render one drawable's fill/stroke attributes as a string of SVG elements. */
 function drawableElements(d: DrawableVector): string {
   const fill = d.fill[3] > 0 ? rgba(d.fill) : "none";
-  const strokeAttrs =
-    d.stroke[3] > 0 && d.lineWidth > 0
-      ? ` stroke="${rgba(d.stroke)}" stroke-width="${d.lineWidth}"`
-      : "";
+  const sa = strokeAttrs(d, d.lineWidth);
   if (d.circles.length > 0) {
     // Circle drawable: emit a <circle> per center.
     return d.circles
-      .map((c) => `<circle cx="${c.x}" cy="${c.y}" r="${c.r}" fill="${fill}"${strokeAttrs} />`)
+      .map((c) => `<circle cx="${c.x}" cy="${c.y}" r="${c.r}" fill="${fill}"${sa} />`)
       .join("");
   }
   // Path drawable.
-  return `<path d="${pathD(d)}" fill="${fill}"${strokeAttrs} />`;
+  return `<path d="${pathD(d)}" fill="${fill}"${sa} />`;
 }
 
 /**
@@ -132,16 +138,15 @@ function buildGroups(
       for (const d of layer.drawables) {
         if ((d.flags & 1) === 0) continue;
         const fill = d.fill[3] > 0 ? rgba(d.fill) : "none";
-        const hasStroke = d.stroke[3] > 0 && d.lineWidth > 0;
         if (d.circles.length > 0) {
-          const sa = hasStroke ? ` stroke="${rgba(d.stroke)}" stroke-width="${d.lineWidth}"` : "";
+          const sa = strokeAttrs(d, d.lineWidth);
           screenEls.push(d.circles.map((c) => `<circle cx="${t.k * c.x + t.x}" cy="${t.k * c.y + t.y}" r="${c.r}" fill="${fill}"${sa} />`).join(""));
         } else if (d.anchor) {
           const [ax, ay] = d.anchor;
-          const sa = hasStroke ? ` stroke="${rgba(d.stroke)}" stroke-width="${d.lineWidth}"` : "";
+          const sa = strokeAttrs(d, d.lineWidth);
           screenEls.push(`<path d="${pathDScreen(d, ax, ay, t.k * ax + t.x, t.k * ay + t.y)}" fill="${fill}"${sa} />`);
         } else {
-          const sa = hasStroke ? ` stroke="${rgba(d.stroke)}" stroke-width="${d.lineWidth / t.k}"` : "";
+          const sa = strokeAttrs(d, d.lineWidth / t.k);
           worldEls.push(`<path d="${pathD(d)}" fill="${fill}"${sa} />`);
         }
       }

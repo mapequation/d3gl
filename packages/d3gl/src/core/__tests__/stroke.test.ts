@@ -29,22 +29,68 @@ describe("expandStroke", () => {
     for (const i of indices) expect(i).toBeLessThan(vertexCount);
   });
 
-  it("adds a bevel join at an interior corner of an open polyline", () => {
+  it("bevels interior corners by default (one outer-gap triangle, no inner overlap)", () => {
     const sp: Subpath = { points: [0, 0, 10, 0, 10, 10], closed: false };
-    const { vertices, indices } = expandStroke(sp, 2);
-    // 2 segment quads (12 indices) + 1 bevel joint (6 indices) = 18
+    const { indices } = expandStroke(sp, 2); // default join is "bevel"
+    // 2 segment quads (12) + 1 outer-gap bevel triangle (3) = 15. (No redundant inner triangle.)
+    expect(indices.length).toBe(15);
+  });
+
+  it("miters an interior corner when join is 'miter' (outer miter, no bevel under it)", () => {
+    const sp: Subpath = { points: [0, 0, 10, 0, 10, 10], closed: false };
+    const { vertices, indices } = expandStroke(sp, 2, { join: "miter" });
+    // 2 segment quads (12) + outer miter, 2 tris (6) = 18 — the miter replaces the bevel.
     expect(indices.length).toBe(18);
     const vertexCount = vertices.length / 2;
     for (const i of indices) expect(i).toBeLessThan(vertexCount);
   });
 
-  it("joins all corners of a closed ring (no caps)", () => {
+  it("miters all corners of a closed ring (no caps)", () => {
     const sp: Subpath = { points: [0, 0, 10, 0, 10, 10, 0, 10], closed: true };
-    const { vertices, indices } = expandStroke(sp, 2);
-    // 4 segment quads (24 indices) + 4 bevel joints (24 indices) = 48
+    const { vertices, indices } = expandStroke(sp, 2, { join: "miter" });
+    // 4 segment quads (24) + 4 outer miters × 6 = 48.
     expect(indices.length).toBe(48);
     const vertexCount = vertices.length / 2;
     for (const i of indices) expect(i).toBeLessThan(vertexCount);
+  });
+
+  it("rounds interior corners with an arc fan when join is 'round'", () => {
+    const sp: Subpath = { points: [0, 0, 10, 0, 10, 10], closed: false };
+    const round = expandStroke(sp, 2, { join: "round" });
+    // 2 quads (12) + an arc fan (≥ 1 triangle) → more than the bevel's 15.
+    expect(round.indices.length).toBeGreaterThan(15);
+    const vertexCount = round.vertices.length / 2;
+    for (const i of round.indices) expect(i).toBeLessThan(vertexCount);
+  });
+
+  it("falls back to bevel when the miter exceeds the miter limit (acute spike)", () => {
+    const sp: Subpath = { points: [0, 0, 10, 0, 0, 1], closed: false }; // ~5° spike at (10,0)
+    // join "miter", default limit 10: the acute miter is too long → bevel triangle (12 + 3 = 15).
+    expect(expandStroke(sp, 2, { join: "miter" }).indices.length).toBe(15);
+    // A generous limit admits the miter (12 + miter 6 = 18).
+    expect(expandStroke(sp, 2, { join: "miter", miterLimit: 50 }).indices.length).toBe(18);
+  });
+
+  it("adds no cap geometry for butt caps (default), a quad for square", () => {
+    const sp: Subpath = { points: [0, 0, 10, 0], closed: false };
+    const butt = expandStroke(sp, 2); // one quad, 6 indices, butt
+    expect(butt.indices.length).toBe(6);
+    const square = expandStroke(sp, 2, { cap: "square" });
+    // + a quad (2 tris) at each of the 2 ends = 12 more indices.
+    expect(square.indices.length).toBe(6 + 12);
+  });
+
+  it("tessellates round caps into a fan at each open end", () => {
+    const sp: Subpath = { points: [0, 0, 10, 0], closed: false };
+    const round = expandStroke(sp, 2, { cap: "round" });
+    expect(round.indices.length).toBeGreaterThan(6); // base quad + two fans
+    const vertexCount = round.vertices.length / 2;
+    for (const i of round.indices) expect(i).toBeLessThan(vertexCount);
+  });
+
+  it("adds no caps to a closed subpath (no ends)", () => {
+    const sp: Subpath = { points: [0, 0, 10, 0, 10, 10, 0, 10], closed: true };
+    expect(expandStroke(sp, 2, { cap: "round" }).indices.length).toBe(expandStroke(sp, 2).indices.length);
   });
 
   it("returns empty geometry for zero width or a single point", () => {

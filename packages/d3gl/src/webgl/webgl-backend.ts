@@ -46,7 +46,11 @@ export class WebGLBackend implements Backend {
     const device = await luma.createDevice({
       adapters: [webgl2Adapter],
       type: "webgl",
-      createCanvasContext: { canvas, useDevicePixels: false },
+      // Render at the physical display resolution (buffer = CSS size × devicePixelRatio) so
+      // thin strokes/points stay crisp on HiDPI screens, matching Canvas/SVG. Clip space is
+      // normalized and screen-px math uses CSS-px viewport uniforms, so no shader changes are
+      // needed — only the drawing-buffer/viewport resolution rises.
+      createCanvasContext: { canvas, useDevicePixels: true },
       // Request a stencil buffer on the canvas drawing buffer so the ONSCREEN
       // render path can clip via the stencil test (WebGL defaults stencil:false).
       webgl: { stencil: true },
@@ -280,13 +284,15 @@ export class WebGLBackend implements Backend {
     return svgFromLayers(this.width, this.height, this.order.map((n) => this.layers.get(n)!), this.viewTransform);
   }
 
-  /** Read a pixel from the ONSCREEN canvas default framebuffer after render(). Test aid. */
+  /** Read a pixel from the ONSCREEN canvas default framebuffer after render(). Test aid.
+   *  Coords are in CSS px; the onscreen buffer is device px, so scale by the buffer ratio. */
   readScreenPixel(x: number, y: number): number[] {
     this.render();
     const gl = (this.device as unknown as { gl: WebGL2RenderingContext }).gl;
+    const sx = gl.drawingBufferWidth / this.width, sy = gl.drawingBufferHeight / this.height;
     gl.bindFramebuffer(gl.READ_FRAMEBUFFER, null);
     const p = new Uint8Array(4);
-    gl.readPixels(Math.floor(x), Math.floor(this.height - 1 - y), 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, p);
+    gl.readPixels(Math.floor(x * sx), Math.floor((this.height - 1 - y) * sy), 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, p);
     return [p[0]!, p[1]!, p[2]!, p[3]!];
   }
 
@@ -336,5 +342,6 @@ function deltaToBuffers(d: GroupBufferDelta): GroupBuffers {
     pointCount: d.pointCenters.length / 4,
     fillAnchors: d.fillAnchors,
     strokeAnchors: d.strokeAnchors,
+    ranges: d.ranges,
   };
 }
