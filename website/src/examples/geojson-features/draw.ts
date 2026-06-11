@@ -33,7 +33,7 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
   map.layer("ocean", [world.sphere], { fill: OCEAN });
   map.layer("land", [world.land], { fill: LAND, stroke: "#9aa3ad", lineWidth: 0.5 });
   map.layer("graticule", [makeGraticule()], { stroke: "#bcc6d0", lineWidth: 0.5 });
-  map.layer("rivers", [makeMajorRivers()], { stroke: "#3b82c4", lineWidth: 0.9 });
+  map.layer("rivers", makeMajorRivers(), { stroke: "#3b82c4", lineWidth: 0.9 });
   map.layer("region", [makeDemoPolygon()], { fill: "#9bd1a466", stroke: "#3b8c4e", lineWidth: 1 });
   map.layer("route", [makeRoute()], { stroke: "#e8932f", lineWidth: 1.5 });
   map.layer("cluster", [makeCluster()], { fill: "#4dd0e1", pointRadius: 3 });

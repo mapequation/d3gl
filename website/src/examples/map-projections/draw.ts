@@ -10,7 +10,7 @@ import { geoMap } from "@mapequation/d3gl/map";
 import { fitProjection } from "@mapequation/d3gl/geo";
 import type { ImperativeSetup } from "../types.js";
 import {
-  loadWorld, makeGraticule, makeCells, makeCities, makeRoute, makeDemoPolygon,
+  loadWorld, makeGraticule, makeCities, makeRoute, makeDemoPolygon, centreCells,
 } from "../shared/geo-data.js";
 
 const OCEAN = "#d4e6f5";
@@ -40,12 +40,6 @@ const PROJECTIONS: Record<string, ProjEntry> = {
 
 export const PROJECTION_NAMES = Object.keys(PROJECTIONS);
 const DEFAULT = "Orthographic";
-
-/** A fine grid over the central third of the globe (lon ±60°, lat ±30°), clipped
- *  to land — the "dense" layer that the hide-on-interaction toggle drops. */
-function centreCells() {
-  return makeCells(4).filter((c) => Math.abs(c.center[0]) <= 60 && Math.abs(c.center[1]) <= 30);
-}
 
 /**
  * Pick any d3-geo projection. Spherical projections (orthographic, azimuthal, …)
