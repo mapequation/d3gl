@@ -10,8 +10,8 @@ clip source is also hit, so interaction matches what is visibly painted.
 ## Events
 
 ```ts
-map.on("hover", (hit, ev) => { /* hit: { layer, id, datum } | null */ });
-map.on("click", (hit, ev) => { /* fires only when the pointer didn't drag (≤ 4 px) */ });
+map.on("hover", (hit, ev) => { ... });  // hit: { layer, id, datum } | null
+map.on("click", (hit, ev) => { ... });  // same hit shape; fires only on a non-drag click (≤ 4 px travel)
 ```
 
 `click` coexists with pan/zoom/rotation: a drag never fires it.
@@ -38,7 +38,7 @@ Custom draw gets a `HighlightBuilder` scoped to the hovered drawable (world coor
 hover: (city, g) => {
   g.replay({ fill: "#fff" });                       // the item itself, restyled —
                                                     // uses its already-projected geometry
-  const [x, y] = g.anchor;                          // a point feature's projected center
+  const [x, y] = g.anchor!;                         // non-null for point features
   g.path((ctx) => ctx.arc(x, y, 8, 0, 2 * Math.PI), // plus anything else
     { stroke: "#e23b2f", lineWidth: 1.5 });
   g.point(x, y - 12, 2, { fill: "#e23b2f" });
