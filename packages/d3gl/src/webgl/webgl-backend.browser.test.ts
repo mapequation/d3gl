@@ -1,6 +1,7 @@
 import { describe, it, expect } from "vitest";
 import { Scene } from "../core/index.js";
 import { WebGLBackend } from "./webgl-backend.js";
+import type { DrawableVector } from "../core/index.js";
 
 function rectLayer(name: string, x: number, y: number, w: number, h: number, color: string, clipTo?: string) {
   const scene = new Scene();
@@ -148,6 +149,58 @@ describe("WebGLBackend", () => {
     const bottom = backend.readScreenPixel(64, 104);  // lower part of the disc
     expect(top[0]).toBeGreaterThan(top[2]);     // top is red-dominant (north)
     expect(bottom[2]).toBeGreaterThan(bottom[0]); // bottom is blue-dominant (south)
+    backend.destroy();
+  });
+
+  it("updateLayer re-uploads geometry even when the drawable count is unchanged", async () => {
+    // Regression: the hover overlay always calls updateLayer with count=1 but different
+    // geometry per hovered cell. The old same-count fast path only recolored, leaving the
+    // first cell's geometry on screen while only the color updated.
+    const canvas = document.createElement("canvas");
+    canvas.width = 100; canvas.height = 100;
+    document.body.appendChild(canvas);
+    const backend = await WebGLBackend.create(canvas, { width: 100, height: 100 });
+    const scene = new Scene();
+    scene.group("g", (g) => g.drawable("a", (ctx) => ctx.rect(10, 10, 20, 20)));
+    scene.setFill("g", "a", "rgb(255,0,0)");
+    backend.setLayers([{ name: "g", buffers: scene.buffers("g"), drawables: scene.drawables("g") }]);
+    backend.setTransform({ k: 1, x: 0, y: 0 });
+    expect([...backend.readPixel(20, 20).slice(0, 3)]).toEqual([255, 0, 0]);
+
+    // Same drawable count (1), DIFFERENT geometry — the hover-overlay pattern.
+    scene.group("g", (g) => g.drawable("a", (ctx) => ctx.rect(60, 60, 20, 20)));
+    scene.setFill("g", "a", "rgb(255,0,0)");
+    backend.updateLayer("g", { name: "g", buffers: scene.buffers("g"), drawables: scene.drawables("g") });
+    expect([...backend.readPixel(70, 70).slice(0, 3)]).toEqual([255, 0, 0]); // new position painted
+    expect(backend.readPixel(20, 20)[3]).toBe(0);                             // old position cleared
+    backend.destroy();
+  });
+
+  it("updateLayerStyles recolors without geometry re-upload", async () => {
+    const canvas = document.createElement("canvas");
+    canvas.width = 100; canvas.height = 100;
+    document.body.appendChild(canvas);
+    const backend = await WebGLBackend.create(canvas, { width: 100, height: 100 });
+    const scene = new Scene();
+    scene.group("g", (g) => g.drawable("a", (ctx) => ctx.rect(10, 10, 40, 40)));
+    scene.setFill("g", "a", "rgb(255,0,0)");
+    backend.setLayers([{ name: "g", buffers: scene.buffers("g"), drawables: scene.drawables("g") }]);
+    backend.setTransform({ k: 1, x: 0, y: 0 });
+    // Initial state: the rect is red at (30, 30).
+    expect(backend.readPixel(30, 30).slice(0, 3)).toEqual([255, 0, 0]);
+
+    // Restyle to 50% blue — only the palette/flags textures change; geometry stays uploaded.
+    scene.setFill("g", "a", "rgba(0, 0, 255, 0.5)");
+    // updateLayerStyles is optional on the interface; cast to access it.
+    (backend as unknown as { updateLayerStyles: (n: string, t: ReturnType<typeof scene.styleTables>, d: DrawableVector[]) => void })
+      .updateLayerStyles("g", scene.styleTables("g"), scene.drawables("g"));
+    const px = backend.readPixel(30, 30);
+    // Blue channel dominant after recolor (alpha-blended over clear, pre-mult ~128 → >100).
+    expect(px[2]).toBeGreaterThan(100); // blue present
+    expect(px[0]).toBe(0);              // red gone
+    // toSVG reads the stored drawables — they must be refreshed so the export reflects
+    // the new color (rgba(0, 0, 255, ...) contains the substring "0, 0, 255").
+    expect(backend.toSVG()).toContain("0, 0, 255");
     backend.destroy();
   });
 });

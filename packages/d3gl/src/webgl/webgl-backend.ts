@@ -2,7 +2,7 @@ import { luma } from "@luma.gl/core";
 import { webgl2Adapter } from "@luma.gl/webgl";
 import type { Device, Framebuffer } from "@luma.gl/core";
 import type { Backend, RenderLayer, RenderDelta, ViewTransform } from "../core/index.js";
-import type { GroupBuffers, GroupBufferDelta, PassThroughLayer, DrawBatch } from "../core/index.js";
+import type { GroupBuffers, GroupBufferDelta, PassThroughLayer, DrawBatch, StyleTables, DrawableVector } from "../core/index.js";
 import { GroupRenderer } from "./renderer.js";
 import { clipFromView } from "./transform.js";
 import { toPNG } from "./png.js";
@@ -81,27 +81,30 @@ export class WebGLBackend implements Backend {
   }
 
   /**
-   * Update a layer. If the drawable count is unchanged this is the cheap recolor /
-   * show-hide path (`updateColors` rewrites only the palette/flags textures). If the
-   * count changed — e.g. an append routed here as a fallback (a new geometry-type pass
-   * appeared that `appendToLayer` can't create incrementally) — rebuild the layer's
-   * renderer from the full buffers (correct, but O(total) per call). The O(new) path is
-   * {@link appendToLayer}, which the engine uses for normal appends.
+   * Replace a layer's geometry + tables: destroy the old renderer and rebuild from the
+   * full buffers. `updateLayer` deliberately has NO same-count recolor shortcut: equal
+   * drawable counts do NOT imply unchanged geometry (the hover overlay re-targets a
+   * different drawable at the same count every pointer move). Styles-only changes go
+   * through {@link updateLayerStyles}; appends through {@link appendToLayer} (O(new)).
    */
   updateLayer(name: string, layer: RenderLayer): void {
-    const existing = this.renderers.get(name);
+    this.renderers.get(name)?.destroy();
+    const renderer = new GroupRenderer(this.device, layer.buffers, this.width, this.height);
+    renderer.setTransform(this.clipMatrix);
+    this.renderers.set(name, renderer);
+    this.layers.set(name, layer);
+    if (!this.order.includes(name)) this.order.push(name);
+    this.bakeDirty = true;
+  }
+
+  /** Styles-only update: rewrite the palette/flags textures, refresh the stored vector
+   *  view (toSVG reads it), leave geometry buffers untouched. */
+  updateLayerStyles(name: string, tables: StyleTables, drawables: DrawableVector[]): void {
+    const renderer = this.renderers.get(name);
+    if (!renderer) return;
+    renderer.updateColors(tables);
     const prev = this.layers.get(name);
-    if (existing && prev && prev.buffers.drawableCount === layer.buffers.drawableCount) {
-      existing.updateColors(layer.buffers); // same count → recolor/show-hide only
-      this.layers.set(name, layer);
-    } else {
-      existing?.destroy(); // count changed (append) or new layer → (re)build renderer
-      const renderer = new GroupRenderer(this.device, layer.buffers, this.width, this.height);
-      renderer.setTransform(this.clipMatrix);
-      this.renderers.set(name, renderer);
-      this.layers.set(name, layer);
-      if (!this.order.includes(name)) this.order.push(name);
-    }
+    if (prev) this.layers.set(name, { ...prev, drawables });
     this.bakeDirty = true;
   }
 

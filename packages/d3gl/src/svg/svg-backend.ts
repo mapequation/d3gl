@@ -1,4 +1,4 @@
-import type { Backend, RenderLayer, ViewTransform } from "../core/index.js";
+import type { Backend, RenderLayer, ViewTransform, StyleTables, DrawableVector } from "../core/index.js";
 import { svgBody, svgFromLayers, viewTransform } from "./serialize.js";
 
 const SVG_NS = "http://www.w3.org/2000/svg";
@@ -47,6 +47,14 @@ export class SvgBackend implements Backend {
   updateLayer(name: string, layer: RenderLayer): void {
     const i = this.layers.findIndex((l) => l.name === name);
     if (i >= 0) this.layers[i] = layer; else this.layers.push(layer);
+    this.dirty = true;
+  }
+
+  /** Styles-only update: swap the stored vector view and re-serialize on next render(). */
+  updateLayerStyles(name: string, _tables: StyleTables, drawables: DrawableVector[]): void {
+    const i = this.layers.findIndex((l) => l.name === name);
+    if (i < 0) return;
+    this.layers[i] = { ...this.layers[i]!, drawables };
     this.dirty = true;
   }
 

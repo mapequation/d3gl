@@ -1,4 +1,4 @@
-import type { Backend, RenderLayer, RenderDelta, ViewTransform, DrawableVector, PassThroughLayer, PointBatch, DrawBatch, ProjectedPath } from "../core/index.js";
+import type { Backend, RenderLayer, RenderDelta, ViewTransform, DrawableVector, PassThroughLayer, PointBatch, DrawBatch, ProjectedPath, StyleTables } from "../core/index.js";
 import { svgFromLayers } from "../svg/index.js";
 
 const css = (c: readonly [number, number, number, number]) => `rgba(${c[0]}, ${c[1]}, ${c[2]}, ${(c[3] / 255).toFixed(4)})`;
@@ -70,6 +70,15 @@ export class CanvasBackend implements Backend {
     const i = this.layers.findIndex((l) => l.name === name);
     if (i >= 0) this.layers[i] = layer;
     else this.layers.push(layer);
+  }
+
+  /** Styles-only update: swap the stored vector view (the next render() repaints from
+   *  it). Visibility flags feed the clip silhouette, so drop this layer's cached clip. */
+  updateLayerStyles(name: string, _tables: StyleTables, drawables: DrawableVector[]): void {
+    const layer = this.layers.find((l) => l.name === name);
+    if (!layer) return;
+    layer.drawables = drawables;
+    this.clipCache.delete(name);
   }
 
   setTransform(t: ViewTransform): void {

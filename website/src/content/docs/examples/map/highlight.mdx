@@ -1,0 +1,20 @@
+---
+title: Highlight
+description: Hover-highlight and click-selection on a value grid — an overlay redraw plus style-table writes, no re-tessellation.
+---
+
+import ExampleCard from "../../../../components/ExampleCard.astro";
+import Highlight from "../../../../examples/highlight/Highlight.tsx";
+
+A synthetic value field on a grid, **clipped to the land outline**. **Hover** any cell to
+highlight it and read its value. **Click** a cell to select it together with every cell within
+±0.1 of its value — all other cells dim to 30% opacity. Click open ocean to clear the selection.
+
+Hover redraws only the hovered cell into a tiny overlay layer, and selection rewrites only the
+per-cell color tables — neither touches the grid's geometry, so both stay instant at 1° (≈ 65k
+cells). Scroll to zoom; the **cell-size** slider rebuilds the grid (which clears the selection).
+See the [Interaction guide](/d3gl/interaction/) for the full API.
+
+<ExampleCard files={["highlight/draw.ts"]}>
+  <Highlight client:visible slot="demo" />
+</ExampleCard>

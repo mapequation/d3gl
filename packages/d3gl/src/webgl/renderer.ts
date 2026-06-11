@@ -1,7 +1,7 @@
 import { Buffer } from "@luma.gl/core";
 import type { Device, Texture, RenderPass, TextureFormat } from "@luma.gl/core";
 import { Model } from "@luma.gl/engine";
-import type { GroupBuffers, GroupBufferDelta, DrawableRange } from "../core/index.js";
+import type { GroupBuffers, GroupBufferDelta, DrawableRange, StyleTables } from "../core/index.js";
 import { FILL_VS, FILL_FS, PICK_FS, POINT_VS, POINT_FS } from "./shaders.js";
 
 /** Fixed texel width of every per-drawable side-table texture (color/flags). */
@@ -649,7 +649,7 @@ export class GroupRenderer {
   }
 
   /**
-   * Re-upload the color and flag tables from fresh buffers. Touches only the
+   * Re-upload the color and flag tables from the style tables. Touches only the
    * palette/flags textures — geometry buffers are untouched, so this is the cheap
    * recolor / show-hide hot path.
    *
@@ -657,22 +657,22 @@ export class GroupRenderer {
    * show-hide, not a geometry change. Adding drawables goes through append(). A count
    * mismatch throws rather than silently corrupting.
    */
-  updateColors(buffers: GroupBuffers): void {
+  updateColors(tables: StyleTables): void {
     if (this.shape) {
-      const count = buffers.fillColors.length / 4;
+      const count = tables.fillColors.length / 4;
       if (count !== this.shape.drawableCount) {
         throw new Error(
           `updateColors drawable count ${count} != ${this.shape.drawableCount} at build time; ` +
             `appended drawables must go through append()`,
         );
       }
-      this.shape.colorTex.write(buffers.fillColors);
-      this.shape.strokeColorTex.write(buffers.strokeColors);
-      this.shape.flagsTex.write(buffers.flags);
+      this.shape.colorTex.write(tables.fillColors);
+      this.shape.strokeColorTex.write(tables.strokeColors);
+      this.shape.flagsTex.write(tables.flags);
     }
     // If the point pass owns its own textures (no shape pass), update them too.
     if (this.point?.ownsTextures) {
-      this.writePointTables(this.point, buffers.fillColors, buffers.flags);
+      this.writePointTables(this.point, tables.fillColors, tables.flags);
     }
     // If point borrows from the shape pass, the writes above already updated those textures.
   }

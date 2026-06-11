@@ -4,6 +4,8 @@ import { PathRecorder } from "../core/index.js";
 import versor, { type Angles, type Vec3, type Quaternion } from "../geo/versor.js";
 import { BaseEngine, type HoverHit, type LayerSpec } from "./base-engine.js";
 import type { BackendType } from "./backend-factory.js";
+import type { SelectionOptions } from "./style-overrides.js";
+import type { HoverOption } from "./highlight.js";
 import type { ViewTransform, LineJoin, LineCap } from "../core/index.js";
 import { LayerHandle } from "./layer-handle.js";
 
@@ -14,6 +16,8 @@ export interface GeoMapOptions {
   /** Which renderer to draw with — see {@link BackendType}. Defaults to `"webgl"`.
    *  Use `"auto"` for an instant Canvas first paint that upgrades to WebGL in the background. */
   backend?: BackendType;
+  /** Class(es) for the hover tooltip box, replacing its default inline look. */
+  tooltipClass?: string;
 }
 export interface LayerOptions<F = any> {
   fill?: string | ((f: F, i: number) => string);
@@ -47,6 +51,17 @@ export interface LayerOptions<F = any> {
    *  are a follow-up). NOTE: `clipTo` is NOT applied to pass-through layers yet — it is ignored
    *  (a follow-up); use the retained path if you need clipping. */
   passThrough?: boolean;
+  /** Styles for {@link GeoMap.select}: the selected set and its complement.
+   *  Defaults: selected keeps the base style; others `{ opacity: 0.3 }`. */
+  selection?: SelectionOptions;
+  /** Hover-highlight: true = default white outline, a HighlightStyle = redraw the
+   *  hovered item with it, or a custom (datum, HighlightBuilder) draw fn. Rendered in
+   *  a tiny overlay layer — O(hovered item) per change, the base layer is untouched. */
+  hover?: HoverOption<F>;
+  /** Hover tooltip content for this layer (null hides). Shown in a shared
+   *  engine-managed div — see GeoMapOptions.tooltipClass for styling.
+   *  Content is re-evaluated only when the hovered target changes; re-declare the layer to force a refresh. */
+  tooltip?: (f: F, id: string | number) => string | HTMLElement | null;
 }
 
 /** Options for {@link GeoMap.enableRotation}. */
@@ -75,10 +90,13 @@ export class GeoMap extends BaseEngine {
     super(host, opts.width, opts.height, opts.backend ?? "webgl");
     this.projection = opts.projection;
     this.baseScale = opts.projection.scale();
+    this.tooltipClass = opts.tooltipClass;
   }
 
   layer<F>(name: string, features: F | readonly F[] | (() => readonly F[]), opts: LayerOptions<F> = {}): LayerHandle<F> {
     if (opts.passThrough) {
+      if (opts.hover || opts.tooltip || opts.selection)
+        throw new Error("hover/tooltip/selection require a retained layer (passThrough layers are not pickable)");
       const source: unknown[] | (() => unknown[]) =
         typeof features === "function"
           ? () => [...(features as () => readonly F[])()]
@@ -133,6 +151,7 @@ export class GeoMap extends BaseEngine {
     if (typeof features === "function") throw new Error("callback data requires passThrough: true");
     const list = Array.isArray(features) ? (features as F[]) : [features as F];
     this.defs = this.defs.filter((d) => d.name !== name).concat({ name, opts });
+    this.dropInteractionState(name); // a re-declared layer starts with base styles
     this.registerLayer(this.buildSpec(name, list, opts));
     return new LayerHandle<F>(this, name, (items) => this.appendFeatures(name, items, opts));
   }
@@ -283,6 +302,7 @@ export class GeoMap extends BaseEngine {
     return {
       name, data: list, ids, fill: opts.fill, stroke: opts.stroke, clipTo: opts.clipTo,
       sizeMode: opts.sizeMode, hideOnInteraction: opts.hideOnInteraction, pickable: opts.pickable,
+      selection: opts.selection, hover: opts.hover, tooltip: opts.tooltip,
       build: geoLayer(list, this.projection, { id: (_f, i) => ids[i]!, lineWidth: opts.lineWidth, lineJoin: opts.lineJoin, miterLimit: opts.miterLimit, lineCap: opts.lineCap, pointRadius: opts.pointRadius, sizeMode: opts.sizeMode }),
     };
   }

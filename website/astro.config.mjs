@@ -81,6 +81,7 @@ export default defineConfig({
       { label: "Start Here", items: [
         { label: "Getting started", slug: "getting-started" },
         { label: "Rendering backends", slug: "rendering-backends" },
+        { label: "Interaction", slug: "interaction" },
       ] },
       {
         label: "Examples",
@@ -90,7 +91,7 @@ export default defineConfig({
           { label: "Ancestral ranges", slug: "examples/tree/ancestral-ranges" },
           { label: "World map", slug: "examples/map/world-map" },
           { label: "GeoJSON features", slug: "examples/map/geojson-features" },
-          { label: "Heatmap", slug: "examples/map/heatmap" },
+          { label: "Highlight", slug: "examples/map/highlight" },
           { label: "Map projections", slug: "examples/map/map-projections" },
           { label: "Streaming data", slug: "examples/map/streaming" },
           { label: "React", slug: "examples/react" },

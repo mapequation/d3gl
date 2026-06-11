@@ -3,6 +3,9 @@ import { zoom as d3zoom, zoomIdentity, type D3ZoomEvent } from "d3-zoom";
 import { Scene, HitIndex, type Backend, type GroupBuilder, type RenderLayer, type ViewTransform } from "../core/index.js";
 import { createBackend, createCanvasBackend, type BackendType, type BackendHandle } from "./backend-factory.js";
 import { buildBatch, type DrawItem } from "./draw-batch.js";
+import { composeColor, type StyleOverride, type SelectionOptions } from "./style-overrides.js";
+import { HighlightBuilder, resolveHighlight, HIGHLIGHT_SUFFIX, type HighlightStyle, type HighlightDraw, type HoverOption, type PendingColor } from "./highlight.js";
+import { Tooltip } from "./tooltip.js";
 
 export type Accessor<D, T> = T | ((d: D, i: number) => T);
 export interface HoverHit { layer: string; id: string | number; datum: unknown; }
@@ -26,6 +29,13 @@ export interface LayerSpec {
   /** When false, no CPU hit index is built for this layer (pick() can't hit it). Skips
    *  ~one Entry object per drawable — worth it for huge, non-interactive streamed layers. */
   pickable?: boolean;
+  /** Styles applied by {@link BaseEngine.select} to the selected set / its complement. */
+  selection?: SelectionOptions;
+  /** Hover-highlight for this layer: true = default style, a HighlightStyle = replay
+   *  with it, a function = custom draw of the hovered item (see HighlightBuilder). */
+  hover?: HoverOption;
+  /** Tooltip content for the hovered drawable (string / element / null = hide). */
+  tooltip?: (d: any, id: string | number) => string | HTMLElement | null;
   build: (g: GroupBuilder) => void;   // rebuilds the Scene group (geo or draw)
 }
 
@@ -45,15 +55,33 @@ export abstract class BaseEngine {
   protected hitIndexes = new Map<string, HitIndex>();
   /** Pass-through layers: no Scene entry, no retained geometry. */
   protected ptSpecs = new Map<string, PassThroughSpec>();
-  /** Per-layer set of drawable ids (as strings), maintained incrementally so an
-   *  append's duplicate-id check stays O(new) instead of rebuilding a Set of every
-   *  existing id each batch (which made streaming O(total)/batch). */
-  private layerIds = new Map<string, Set<string | number>>();
+  /** Per-layer id → datum index, maintained incrementally so an append's duplicate-id
+   *  check stays O(new) (not O(total)/batch) AND so pick()/restyle resolve a datum
+   *  index in O(1) instead of spec.ids.indexOf (O(n) per pointer move). */
+  private layerIds = new Map<string, Map<string | number, number>>();
+  /** Per-layer style overrides (id → override), composed over the base accessor colors.
+   *  Survive rebuilds (reapplied after applyAccessors); dropped when the layer is
+   *  re-declared via layer() (its ids may change). */
+  private styleOverrides = new Map<string, Map<string | number, StyleOverride>>();
+  /** Active highlight per source layer; re-resolved after a rebuild re-projects geometry. */
+  private highlights = new Map<string, { ids: (string | number)[]; styleOrDraw?: HighlightStyle | HighlightDraw }>();
   protected transform: ViewTransform = { k: 1, x: 0, y: 0 };
   protected handle: BackendHandle | null = null;
   protected ready: Promise<void>;
   private currentBackend: BackendType;
   private hoverCb: ((hit: HoverHit | null, ev: PointerEvent) => void) | null = null;
+  private clickCb: ((hit: HoverHit | null, ev: PointerEvent) => void) | null = null;
+  /** Last hover pick, for cheap same-target exits while the pointer stays inside one drawable. */
+  private lastHover: HoverHit | null = null;
+  /** Source layer whose hover-option highlight is currently shown (auto, not manual). */
+  private autoHover: string | null = null;
+  private tooltipEl: Tooltip | null = null;
+  /** Replaces the tooltip's default inline look when set (e.g. utility classes). */
+  protected tooltipClass?: string;
+  /** pointerdown position; a pointerup within CLICK_SLOP px of it is a click. */
+  private downAt: [number, number] | null = null;
+  /** Max pointer travel (px) between down and up for a click — suppresses pan/rotate drags. */
+  private static readonly CLICK_SLOP = 4;
   private swapToken = 0;
   private destroyed = false;
   /** "auto" mode only: the WebGL upgrade promise (in-flight, then settled). Null until
@@ -99,6 +127,11 @@ export abstract class BaseEngine {
     }
   }
   whenReady(): Promise<void> { return this.ready; }
+  /** Idempotent: addEventListener dedupes on the same handler reference. */
+  private attachPointer(): void {
+    this.host.addEventListener("pointermove", this.onPointerMove);
+    this.host.addEventListener("pointerleave", this.onPointerLeave);
+  }
   /** The currently-active backend type (set by the constructor / installBackend). */
   protected backendType(): BackendType { return this.currentBackend; }
   /** The live backend instance, or null before the first swap resolves. */
@@ -106,8 +139,10 @@ export abstract class BaseEngine {
 
   /** Register/replace a layer: build its Scene group, apply accessors, index, push. */
   protected registerLayer(spec: LayerSpec): void {
+    if (spec.name.endsWith(HIGHLIGHT_SUFFIX)) throw new Error(`layer name suffix "${HIGHLIGHT_SUFFIX}" is reserved`);
     this.scene.group(spec.name, spec.build);
     this.applyAccessors(spec);
+    this.reapplyOverrides(spec); // rebuilds (rotation/projection) keep overrides
     const at = this.specs.findIndex((s) => s.name === spec.name);
     if (at >= 0) this.specs[at] = spec;
     else this.specs.push(spec);
@@ -115,10 +150,17 @@ export abstract class BaseEngine {
     // non-interactive layers. pick() simply can't return that layer (get()?.pick → skip).
     if (spec.pickable !== false) this.hitIndexes.set(spec.name, new HitIndex(this.scene.drawables(spec.name)));
     else this.hitIndexes.delete(spec.name);
-    // Seed the incremental id set from the full (re)built spec (O(total) here, but a
+    // Seed the incremental id map from the full (re)built spec (O(total) here, but a
     // register/rebuild is already O(total); appends then stay O(new)). Raw ids (no
     // String()) so numeric-id layers don't allocate a string per drawable.
-    this.layerIds.set(spec.name, new Set(spec.ids));
+    this.layerIds.set(spec.name, new Map(spec.ids.map((id, i) => [id, i])));
+    // A rebuild (rotation/projection) re-projected the source geometry: rebuild the
+    // overlay from the stored ids so the highlight tracks it. (A re-DECLARED layer had
+    // its highlight dropped by dropInteractionState first.)
+    const active = this.highlights.get(spec.name);
+    if (active) this.buildHighlight(spec, active.ids, active.styleOrDraw);
+    // Attach pointer listeners if this layer needs auto-hover or tooltip (idempotent via same ref).
+    if (spec.hover || spec.tooltip) this.attachPointer();
     this.pushLayers();
   }
 
@@ -216,7 +258,7 @@ export abstract class BaseEngine {
     // Validate against the PERSISTENT id set (O(new)); a from-scratch
     // `new Set(spec.ids…)` here would be O(total) every batch and make streaming
     // quadratic. Don't mutate the set until validation passes (keeps append atomic).
-    const existing = this.layerIds.get(name) ?? new Set(spec.ids);
+    const existing = this.layerIds.get(name) ?? new Map(spec.ids.map((id, i) => [id, i]));
     const seen = new Set<string | number>();
     for (const id of ids) {
       if (existing.has(id) || seen.has(id)) throw new Error(`duplicate drawable id: ${String(id)}`);
@@ -229,7 +271,7 @@ export abstract class BaseEngine {
     // to 1M) exceeds the argument-count limit and throws RangeError. Loop instead.
     for (const it of items) spec.data.push(it);
     for (const id of ids) spec.ids.push(id);
-    for (const key of seen) existing.add(key); // commit ids to the persistent set
+    ids.forEach((id, j) => existing.set(id, dataStart + j)); // commit ids to the persistent map
     this.layerIds.set(name, existing);
     // Which appended ids actually produced a drawable (culling may drop some)?
     // (DrawableVector copies its color into a fresh tuple at read time, so we must
@@ -267,13 +309,206 @@ export abstract class BaseEngine {
     const spec = this.specs.find((s) => s.name === name);
     if (!spec) return this;
     this.applyAccessors(spec);
-    // Don't touch the backend for a layer that's hidden mid-interaction (setLayers
-    // already dropped it); it re-projects + repaints when the interaction ends.
-    if (!(this.interacting && spec.hideOnInteraction)) {
-      this.handle?.backend.updateLayer(name, this.renderLayer(spec));
-      this.render();
-    }
+    this.reapplyOverrides(spec);
+    this.pushStyles(spec); // styles-only: geometry can't have changed under a recolor
     return this;
+  }
+
+  /** Override the style of one drawable or a set (replaces any previous override for
+   *  those ids — last write wins). O(ids) compose + one styles-only push. */
+  setStyle(name: string, ids: string | number | readonly (string | number)[], override: StyleOverride): this {
+    const spec = this.specs.find((s) => s.name === name);
+    if (!spec) return this;
+    const list: readonly (string | number)[] = Array.isArray(ids) ? ids : [ids as string | number];
+    let map = this.styleOverrides.get(name);
+    if (!map) { map = new Map(); this.styleOverrides.set(name, map); }
+    for (const id of list) map.set(id, override);
+    this.restyle(spec, list);
+    this.pushStyles(spec);
+    return this;
+  }
+
+  /** Remove overrides (all of the layer's when `ids` is omitted) and restore base styles. */
+  clearStyle(name: string, ids?: string | number | readonly (string | number)[]): this {
+    const spec = this.specs.find((s) => s.name === name);
+    if (!spec) return this;
+    const map = this.styleOverrides.get(name);
+    if (!map || map.size === 0) return this;
+    const list: readonly (string | number)[] =
+      ids === undefined ? [...map.keys()] : Array.isArray(ids) ? ids : [ids as string | number];
+    for (const id of list) map.delete(id);
+    this.restyle(spec, list);
+    this.pushStyles(spec);
+    return this;
+  }
+
+  /**
+   * Select a set of drawables: style members with the layer's `selection.selected`
+   * (default: keep base style) and the complement with `selection.others` (default
+   * `{ opacity: 0.3 }`). One O(n) compose + one styles-only push — click-time cost
+   * only, nothing per frame. `null` clears. NOTE: selection rewrites the layer's
+   * whole override map, so it replaces earlier setStyle overrides (one table, last
+   * write wins) — and select(null) restores plain base styles.
+   */
+  select(name: string, set: readonly (string | number)[] | ((d: any, i: number) => boolean) | null): this {
+    const spec = this.specs.find((s) => s.name === name);
+    if (!spec) return this;
+    this.styleOverrides.delete(name);
+    if (set !== null) {
+      const members = typeof set === "function"
+        ? new Set(spec.ids.filter((_, i) => set(spec.data[i], i)))
+        : new Set(set);
+      const selected = spec.selection?.selected;
+      const others = spec.selection?.others ?? { opacity: 0.3 };
+      const map = new Map<string | number, StyleOverride>();
+      for (const id of spec.ids) {
+        const o = members.has(id) ? selected : others;
+        if (o) map.set(id, o);
+      }
+      this.styleOverrides.set(name, map);
+    }
+    this.restyle(spec, spec.ids);
+    this.pushStyles(spec);
+    return this;
+  }
+
+  /**
+   * Highlight one drawable / a set of drawables of `name` by drawing them into a tiny
+   * internal overlay layer on top (inheriting the source's clipTo/sizeMode) — the base
+   * layer's buffers are untouched, so the per-change cost is tessellating the
+   * highlighted items only. `styleOrDraw` falls back to the layer's `hover` option,
+   * then to the default white outline. `null` clears.
+   */
+  highlight(
+    name: string,
+    idOrIds: string | number | readonly (string | number)[] | null,
+    styleOrDraw?: HighlightStyle | HighlightDraw,
+  ): this {
+    const spec = this.specs.find((s) => s.name === name);
+    if (!spec) return this;
+    if (idOrIds == null) {
+      if (!this.highlights.delete(name)) return this; // nothing shown: keep it a no-op
+      this.buildHighlight(spec, []);
+      this.pushHighlight(spec);
+      return this;
+    }
+    const ids = Array.isArray(idOrIds) ? [...idOrIds] : [idOrIds as string | number];
+    this.highlights.set(name, { ids, styleOrDraw });
+    this.buildHighlight(spec, ids, styleOrDraw);
+    this.pushHighlight(spec);
+    return this;
+  }
+
+  /** (Re)build the overlay group for `spec` from already-projected Scene geometry. */
+  private buildHighlight(spec: LayerSpec, ids: readonly (string | number)[], styleOrDraw?: HighlightStyle | HighlightDraw): void {
+    const hlName = spec.name + HIGHLIGHT_SUFFIX;
+    const colors: PendingColor[] = [];
+    const index = this.layerIds.get(spec.name);
+    this.scene.group(hlName, (g) => {
+      for (const id of ids) {
+        const d = this.scene.drawableOf(spec.name, id);
+        if (!d) continue; // unknown or culled id: nothing to highlight
+        const b = new HighlightBuilder(g, d, colors);
+        const draw = resolveHighlight(styleOrDraw ?? spec.hover);
+        const i = index?.get(id) ?? -1;
+        draw(i >= 0 ? spec.data[i] : null, b);
+      }
+    });
+    // Colors must wait for the group build to commit (Scene.setFill resolves the group).
+    for (const c of colors) {
+      if (c.fill) this.scene.setFill(hlName, c.id, c.fill);
+      if (c.stroke) this.scene.setStroke(hlName, c.id, c.stroke);
+    }
+  }
+
+  /** Push one overlay layer (tiny buffers — O(highlighted items), not O(layer)). */
+  private pushHighlight(spec: LayerSpec): void {
+    // A hidden-mid-gesture source isn't in the backend's layer set; its overlay would
+    // float over nothing. The gesture-end pushLayers re-pushes overlays anyway.
+    if (this.interacting && spec.hideOnInteraction) return;
+    const backend = this.handle?.backend;
+    if (!backend) return; // pre-install: installBackend pushes overlays with setLayers
+    backend.updateLayer(spec.name + HIGHLIGHT_SUFFIX, this.overlayRenderLayer(spec));
+    this.render();
+  }
+
+  private overlayRenderLayer(spec: LayerSpec): RenderLayer {
+    const hlName = spec.name + HIGHLIGHT_SUFFIX;
+    return { name: hlName, buffers: this.scene.buffers(hlName), drawables: this.scene.drawables(hlName), clipTo: spec.clipTo, sizeMode: spec.sizeMode };
+  }
+
+  /** Overlay layers to render after all user layers (skipping hidden-mid-gesture sources). */
+  private overlayRenderLayers(): RenderLayer[] {
+    const out: RenderLayer[] = [];
+    for (const name of this.highlights.keys()) {
+      const spec = this.specs.find((s) => s.name === name);
+      if (!spec || (this.interacting && spec.hideOnInteraction)) continue;
+      out.push(this.overlayRenderLayer(spec));
+    }
+    return out;
+  }
+
+  /** Everything the backend should draw: user layers in declaration order, then
+   *  highlight overlays on top. */
+  private allRenderLayers(): RenderLayer[] {
+    return [...this.renderSpecs().map((s) => this.renderLayer(s)), ...this.overlayRenderLayers()];
+  }
+
+  /** Recompose + write the effective colors for `ids`: base accessor value with the
+   *  current override (if any) applied. Ids without a drawable (culled) are skipped.
+   *  When neither base nor override exists, composeColor returns null; we write
+   *  "transparent" so clearing an override on a layer with no base fill accessor
+   *  correctly restores the transparent default instead of leaving a stale color. */
+  private restyle(spec: LayerSpec, ids: readonly (string | number)[]): void {
+    const map = this.styleOverrides.get(spec.name);
+    const index = this.layerIds.get(spec.name);
+    for (const id of ids) {
+      const i = index?.get(id);
+      if (i === undefined || this.scene.drawableOf(spec.name, id) === null) continue;
+      const o = map?.get(id) ?? {};
+      const d = spec.data[i]!;
+      const fill = composeColor(this.resolve(spec.fill, d, i), o.fill, o.opacity);
+      this.scene.setFill(spec.name, id, fill ?? "transparent");
+      const stroke = composeColor(this.resolve(spec.stroke, d, i), o.stroke, o.opacity);
+      this.scene.setStroke(spec.name, id, stroke ?? "transparent");
+    }
+  }
+
+  /** Re-write all of a layer's overrides (after applyAccessors reset the tables). */
+  private reapplyOverrides(spec: LayerSpec): void {
+    const map = this.styleOverrides.get(spec.name);
+    if (map && map.size > 0) this.restyle(spec, [...map.keys()]);
+  }
+
+  /** Styles-only backend push (tables + refreshed vector views); falls back to a full
+   *  updateLayer for backends without the fast path. Skips hidden-mid-gesture layers
+   *  (the gesture-end rebuild re-pushes them). */
+  private pushStyles(spec: LayerSpec): void {
+    if (this.interacting && spec.hideOnInteraction) return;
+    const backend = this.handle?.backend;
+    if (!backend) return;
+    if (backend.updateLayerStyles) {
+      backend.updateLayerStyles(spec.name, this.scene.styleTables(spec.name), this.scene.drawables(spec.name));
+    } else {
+      backend.updateLayer(spec.name, this.renderLayer(spec));
+    }
+    this.render();
+  }
+
+  /** Forget per-layer interaction state (overrides, highlights). Called when a
+   *  layer is RE-DECLARED (its ids may change) — not on a rebuild of the same data. */
+  protected dropInteractionState(name: string): void {
+    this.styleOverrides.delete(name);
+    this.highlights.delete(name);
+    // The hover tracking may point at this layer's now-dropped overlay; reset it so the
+    // next pointermove re-evaluates instead of taking the same-target cheap exit (the
+    // pointer often hasn't moved when a layer is re-declared on a data update).
+    if (this.lastHover?.layer === name) this.lastHover = null;
+    if (this.autoHover === name) this.autoHover = null;
+    // A re-declared layer may carry new tooltip content; hide any stale tip immediately
+    // rather than leaving it visible until the next pointer event (unbounded dwell time
+    // on a stationary mouse when the layer is re-declared on a background data push).
+    this.tooltipEl?.hide();
   }
   setClip(name: string, clipTo?: string): this {
     const spec = this.specs.find((s) => s.name === name);
@@ -315,6 +550,7 @@ export abstract class BaseEngine {
   protected setInteracting(v: boolean): void {
     if (this.interacting === v) return;
     this.interacting = v;
+    if (v) this.clearHoverState(); // a drag/zoom hides hover artifacts immediately
     if (this.specs.some((s) => s.hideOnInteraction)) this.pushLayers();
     if (this.ptSpecs.size > 0) {
       if (v) {
@@ -390,7 +626,15 @@ export abstract class BaseEngine {
       }
     }
     for (const d of draws) this.scene.setFlag(spec.name, d.id, !d.anchor || visible.has(d.id) ? 1 : 0);
-    this.handle?.backend.updateLayer(spec.name, this.renderLayer(spec));
+    // Flags-only change: push just the style tables (the styles-only path). No render()
+    // here — setTransform() renders right after the declutter loop. updateLayer would
+    // re-upload the full geometry per zoom frame for nothing.
+    const backend = this.handle?.backend;
+    if (backend?.updateLayerStyles) {
+      backend.updateLayerStyles(spec.name, this.scene.styleTables(spec.name), this.scene.drawables(spec.name));
+    } else {
+      backend?.updateLayer(spec.name, this.renderLayer(spec));
+    }
   }
   /**
    * Enable scroll-to-zoom / drag-to-pan via d3-zoom, clamped to `extent`. The optional
@@ -417,11 +661,17 @@ export abstract class BaseEngine {
     this.interactionCleanup = () => { (sel as any).on(".zoom", null); };
     return this;
   }
-  on(event: "hover", cb: (hit: HoverHit | null, ev: PointerEvent) => void): this {
+  on(event: "hover" | "click", cb: (hit: HoverHit | null, ev: PointerEvent) => void): this {
     if (event === "hover") {
       this.hoverCb = cb;
-      this.host.addEventListener("pointermove", this.onPointerMove);
-      this.host.addEventListener("pointerleave", this.onPointerLeave);
+      this.attachPointer();
+    } else if (event === "click") {
+      this.clickCb = cb;
+      // Re-calling on("click") swaps the callback; the addEventListener calls below are
+      // no-ops when the same handler refs are already registered — intentional.
+      this.host.addEventListener("pointerdown", this.onPointerDown);
+      this.host.addEventListener("pointerup", this.onPointerUp);
+      this.host.addEventListener("pointercancel", this.onPointerCancel);
     }
     return this;
   }
@@ -431,10 +681,15 @@ export abstract class BaseEngine {
     for (let i = this.specs.length - 1; i >= 0; i--) {
       const spec = this.specs[i]!;
       const id = this.hitIndexes.get(spec.name)?.pick(px, py);
-      if (id != null) {
-        const di = spec.ids.indexOf(id);
-        return { layer: spec.name, id, datum: di >= 0 ? spec.data[di] : null };
+      if (id == null) continue;
+      // Visually clipped away ⇒ not a hit: with clipTo, the point must also fall on the
+      // clip source's geometry. Skipped when the source has no hit index (pickable:false).
+      if (spec.clipTo) {
+        const clip = this.hitIndexes.get(spec.clipTo);
+        if (clip && clip.pick(px, py) == null) continue;
       }
+      const di = this.layerIds.get(spec.name)?.get(id) ?? -1;
+      return { layer: spec.name, id, datum: di >= 0 ? spec.data[di] : null };
     }
     return null;
   }
@@ -453,17 +708,71 @@ export abstract class BaseEngine {
     this.swapToken++;
     this.host.removeEventListener("pointermove", this.onPointerMove);
     this.host.removeEventListener("pointerleave", this.onPointerLeave);
+    this.host.removeEventListener("pointerdown", this.onPointerDown);
+    this.host.removeEventListener("pointerup", this.onPointerUp);
+    this.host.removeEventListener("pointercancel", this.onPointerCancel);
+    this.tooltipEl?.destroy(); this.tooltipEl = null;
     this.handle?.backend.destroy();
     if (this.handle && this.handle.element !== this.host) this.handle.element.remove();
     this.handle = null;
   }
 
   private onPointerMove = (e: PointerEvent): void => {
-    if (!this.hoverCb) return;
+    if (this.interacting) return; // gesture frames skip picking entirely
+    if (!this.hoverCb && !this.specs.some((s) => s.hover || s.tooltip)) return;
     const r = this.host.getBoundingClientRect();
-    this.hoverCb(this.pick(e.clientX - r.left, e.clientY - r.top), e);
+    const hit = this.pick(e.clientX - r.left, e.clientY - r.top);
+    this.hoverCb?.(hit, e);
+    if (hit?.layer !== this.lastHover?.layer || hit?.id !== this.lastHover?.id) {
+      this.lastHover = hit;
+      this.applyAutoHover(hit);
+      this.updateTooltip(hit);
+    }
+    this.tooltipEl?.move(e.clientX - r.left, e.clientY - r.top);
   };
-  private onPointerLeave = (e: PointerEvent): void => { this.hoverCb?.(null, e); };
+
+  /** Show the hover-option highlight for the picked drawable; clear the previous one.
+   *  NOTE: if a manual highlight() was called on the same layer, the next pointermove
+   *  that changes target will overwrite/clear it — the hover option owns that layer's overlay. */
+  private applyAutoHover(hit: HoverHit | null): void {
+    const spec = hit ? this.specs.find((s) => s.name === hit.layer) : undefined;
+    const target = spec?.hover ? spec.name : null;
+    if (this.autoHover && this.autoHover !== target) this.highlight(this.autoHover, null);
+    if (target && hit) this.highlight(target, hit.id);
+    this.autoHover = target;
+  }
+
+  /** Fill/show or hide the tooltip for the (changed) hover target. */
+  private updateTooltip(hit: HoverHit | null): void {
+    const spec = hit ? this.specs.find((s) => s.name === hit.layer) : undefined;
+    const content = spec?.tooltip ? spec.tooltip(hit!.datum, hit!.id) : null;
+    if (content == null) { this.tooltipEl?.hide(); return; }
+    (this.tooltipEl ??= new Tooltip(this.host, this.tooltipClass)).show(content);
+  }
+
+  private onPointerLeave = (e: PointerEvent): void => {
+    this.hoverCb?.(null, e);
+    this.clearHoverState();
+  };
+
+  /** Drop transient hover artifacts (auto-highlight; tooltip). */
+  private clearHoverState(): void {
+    this.lastHover = null;
+    if (this.autoHover) { this.highlight(this.autoHover, null); this.autoHover = null; }
+    this.tooltipEl?.hide();
+  }
+  private onPointerDown = (e: PointerEvent): void => { this.downAt = [e.clientX, e.clientY]; };
+  /** An interrupted gesture (e.g. setPointerCapture takeover, scroll) must not leave a stale
+   *  down-position that would validate the next unrelated pointerup as a click. */
+  private onPointerCancel = (): void => { this.downAt = null; };
+  private onPointerUp = (e: PointerEvent): void => {
+    const d = this.downAt;
+    this.downAt = null;
+    if (!d || !this.clickCb) return;
+    if (Math.hypot(e.clientX - d[0], e.clientY - d[1]) > BaseEngine.CLICK_SLOP) return;
+    const r = this.host.getBoundingClientRect();
+    this.clickCb(this.pick(e.clientX - r.left, e.clientY - r.top), e);
+  };
   private resolve<T>(a: Accessor<any, T> | undefined, d: any, i: number): T | undefined {
     return typeof a === "function" ? (a as (d: any, i: number) => T)(d, i) : a;
   }
@@ -493,7 +802,7 @@ export abstract class BaseEngine {
     return this.specs.filter((s) => !(this.interacting && s.hideOnInteraction));
   }
   private pushLayers(): void {
-    this.handle?.backend.setLayers(this.renderSpecs().map((s) => this.renderLayer(s)));
+    this.handle?.backend.setLayers(this.allRenderLayers());
     this.handle?.backend.setTransform(this.transform);
     this.render();
     // render() above clears the canvas and redraws ONLY the retained layers — it has no
@@ -547,7 +856,7 @@ export abstract class BaseEngine {
     if (old && old.element !== this.host) old.element.remove();
     this.handle = next;
     this.currentBackend = type;
-    next.backend.setLayers(this.renderSpecs().map((s) => this.renderLayer(s)));
+    next.backend.setLayers(this.allRenderLayers());
     next.backend.setTransform(this.transform);
     next.backend.render();
     // Replay retained pass-through layers onto the freshly-installed backend (mirrors the

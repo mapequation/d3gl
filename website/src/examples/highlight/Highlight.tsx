@@ -2,8 +2,9 @@ import Example from "../../components/Example.js";
 import Imperative from "../../components/Imperative.js";
 import { setup } from "./draw.js";
 
-/** Harness wrapper: a land-clipped value grid with a hover read-out and a cell-size slider. */
-export default function Heatmap() {
+/** Harness wrapper: hover-highlight + click-selection on a land-clipped value grid,
+ *  with a cell-size slider. */
+export default function Highlight() {
   return (
     <Example
       controls={[

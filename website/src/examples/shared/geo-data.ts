@@ -9,7 +9,7 @@ export interface Cell {
   geometry: Polygon;
   /** Cell centroid [lon, lat]. */
   center: [number, number];
-  /** Continuous field in [0, 1] (heatmap). */
+  /** Continuous field in [0, 1] (value field). */
   value: number;
   /** Categorical bioregion id in 0..7. */
   bioregion: number;
@@ -56,6 +56,12 @@ export function makeCells(step: number = BASE_STEP): Cell[] {
     }
   }
   return cells;
+}
+
+/** A fine grid over the central third of the globe (lon ±60°, lat ±30°), 4° cells —
+ *  a "dense" demo layer (used clipped to land). */
+export function centreCells(): Cell[] {
+  return makeCells(4).filter((c) => Math.abs(c.center[0]) <= 60 && Math.abs(c.center[1]) <= 30);
 }
 
 /** Wrap cells as a FeatureCollection for projection fitting. */
@@ -145,27 +151,24 @@ export function makeDemoPolygon(): Feature<Polygon> {
   };
 }
 
-/** A handful of major rivers as rough polylines (the bundled world-atlas data has
- *  no rivers), shown on the GeoJSON-features map and used as streaming cluster
+/** A handful of major rivers as rough named polylines (the bundled world-atlas data
+ *  has no rivers), shown on the GeoJSON-features map and used as streaming cluster
  *  centers. Coordinates are approximate [lon, lat] traces, mouth → source. */
-export function makeMajorRivers(): Feature<MultiLineString> {
-  const rivers: [number, number][][] = [
-    // Amazon
-    [[-50.0, -0.7], [-55.5, -2.5], [-60.0, -3.1], [-67.9, -3.5], [-73.2, -4.5]],
-    // Nile
-    [[31.3, 31.4], [32.9, 24.1], [32.5, 15.6], [32.5, 9.5], [31.6, 2.3]],
-    // Mississippi
-    [[-89.2, 29.2], [-90.1, 32.3], [-90.2, 38.6], [-91.2, 43.5], [-95.0, 47.2]],
-    // Yangtze
-    [[121.8, 31.4], [114.3, 30.6], [106.5, 29.6], [100.2, 26.9], [94.7, 33.5]],
-    // Congo
-    [[12.4, -6.0], [16.2, -4.3], [20.0, -1.0], [25.2, 0.5], [27.2, 3.0]],
-    // Volga
-    [[48.0, 46.3], [45.0, 48.7], [44.5, 51.6], [47.5, 54.3], [37.0, 57.3]],
-    // Ganges
-    [[90.5, 22.5], [88.0, 24.5], [83.0, 25.4], [78.0, 26.5], [78.9, 30.1]],
+export function makeMajorRivers(): Feature<LineString, { name: string }>[] {
+  const rivers: [string, [number, number][]][] = [
+    ["Amazon", [[-50.0, -0.7], [-55.5, -2.5], [-60.0, -3.1], [-67.9, -3.5], [-73.2, -4.5]]],
+    ["Nile", [[31.3, 31.4], [32.9, 24.1], [32.5, 15.6], [32.5, 9.5], [31.6, 2.3]]],
+    ["Mississippi", [[-89.2, 29.2], [-90.1, 32.3], [-90.2, 38.6], [-91.2, 43.5], [-95.0, 47.2]]],
+    ["Yangtze", [[121.8, 31.4], [114.3, 30.6], [106.5, 29.6], [100.2, 26.9], [94.7, 33.5]]],
+    ["Congo", [[12.4, -6.0], [16.2, -4.3], [20.0, -1.0], [25.2, 0.5], [27.2, 3.0]]],
+    ["Volga", [[48.0, 46.3], [45.0, 48.7], [44.5, 51.6], [47.5, 54.3], [37.0, 57.3]]],
+    ["Ganges", [[90.5, 22.5], [88.0, 24.5], [83.0, 25.4], [78.0, 26.5], [78.9, 30.1]]],
   ];
-  return { type: "Feature", properties: { name: "major-rivers" }, geometry: { type: "MultiLineString", coordinates: rivers } };
+  return rivers.map(([name, coordinates]) => ({
+    type: "Feature",
+    properties: { name },
+    geometry: { type: "LineString", coordinates },
+  }));
 }
 
 // ---------------------------------------------------------------------------
@@ -239,8 +242,8 @@ function buildParents(rng: () => number): Parent[] {
   const parents: Parent[] = [];
   for (const c of makeCities())
     parents.push({ lon: c.geometry.coordinates[0]!, lat: c.geometry.coordinates[1]!, spread: 1.5, weight: 3 });
-  for (const line of makeMajorRivers().geometry.coordinates)
-    for (const p of line) parents.push({ lon: p[0]!, lat: p[1]!, spread: 2.5, weight: 2 });
+  for (const river of makeMajorRivers())
+    for (const p of river.geometry.coordinates) parents.push({ lon: p[0]!, lat: p[1]!, spread: 2.5, weight: 2 });
   // Random global hotspots: rng()*rng() biases toward small spreads/weights, so
   // most clumps are tight with a few diffuse ones — a wide range of scales.
   for (let i = 0; i < 240; i++) {
