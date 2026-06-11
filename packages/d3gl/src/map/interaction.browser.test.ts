@@ -296,4 +296,21 @@ describe("hover option", () => {
     map.destroy();
     host.remove();
   });
+
+  it("re-declaring the layer re-arms hover for a stationary pointer", async () => {
+    const { map, host } = await makeMap();
+    const declare = () => {
+      map.layer("cells", [sqPoly(0, 0, 20)], { fill: "rgb(0,0,255)", id: () => "c1", hover: { fill: "rgb(0,255,0)" } });
+      map.render();
+    };
+    declare();
+    pointer(host, "pointermove", 108, 91);
+    expect([...pixelAt(host, 108, 91)].slice(0, 3)).toEqual([0, 255, 0]);
+    declare(); // data update re-declares the layer; overlay drops
+    expect([...pixelAt(host, 108, 91)].slice(0, 3)).toEqual([0, 0, 255]);
+    pointer(host, "pointermove", 108, 91); // pointer "hasn't moved": same pick target
+    expect([...pixelAt(host, 108, 91)].slice(0, 3)).toEqual([0, 255, 0]); // re-armed
+    map.destroy();
+    host.remove();
+  });
 });

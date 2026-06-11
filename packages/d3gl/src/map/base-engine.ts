@@ -494,6 +494,11 @@ export abstract class BaseEngine {
   protected dropInteractionState(name: string): void {
     this.styleOverrides.delete(name);
     this.highlights.delete(name);
+    // The hover tracking may point at this layer's now-dropped overlay; reset it so the
+    // next pointermove re-evaluates instead of taking the same-target cheap exit (the
+    // pointer often hasn't moved when a layer is re-declared on a data update).
+    if (this.lastHover?.layer === name) this.lastHover = null;
+    if (this.autoHover === name) this.autoHover = null;
   }
   setClip(name: string, clipTo?: string): this {
     const spec = this.specs.find((s) => s.name === name);
