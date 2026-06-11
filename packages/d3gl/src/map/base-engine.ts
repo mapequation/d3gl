@@ -626,7 +626,15 @@ export abstract class BaseEngine {
       }
     }
     for (const d of draws) this.scene.setFlag(spec.name, d.id, !d.anchor || visible.has(d.id) ? 1 : 0);
-    this.handle?.backend.updateLayer(spec.name, this.renderLayer(spec));
+    // Flags-only change: push just the style tables (the styles-only path). No render()
+    // here — setTransform() renders right after the declutter loop. updateLayer would
+    // re-upload the full geometry per zoom frame for nothing.
+    const backend = this.handle?.backend;
+    if (backend?.updateLayerStyles) {
+      backend.updateLayerStyles(spec.name, this.scene.styleTables(spec.name), this.scene.drawables(spec.name));
+    } else {
+      backend?.updateLayer(spec.name, this.renderLayer(spec));
+    }
   }
   /**
    * Enable scroll-to-zoom / drag-to-pan via d3-zoom, clamped to `extent`. The optional

@@ -252,6 +252,15 @@ describe("highlight", () => {
     map.highlight("cells", ["c0", "c1"], { fill: "rgb(0,255,0)" });
     map.highlight("cells", null);
     expect(map.toPNG().startsWith("data:image/png")).toBe(true); // renders cleanly after clears
+
+    // Move highlight between two cells: same overlay drawable count (1) but different
+    // geometry. No throw = the retarget path works. Pixel-level geometry re-upload
+    // regression is covered by webgl-backend.browser.test.ts "updateLayer re-uploads
+    // geometry even when the drawable count is unchanged".
+    map.highlight("cells", "c0", { fill: "rgb(0,255,0)" });
+    map.highlight("cells", "c1", { fill: "rgb(0,255,0)" });
+    expect(map.toPNG().startsWith("data:image/png")).toBe(true);
+
     map.destroy();
     host.remove();
   });

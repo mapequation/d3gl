@@ -152,6 +152,30 @@ describe("WebGLBackend", () => {
     backend.destroy();
   });
 
+  it("updateLayer re-uploads geometry even when the drawable count is unchanged", async () => {
+    // Regression: the hover overlay always calls updateLayer with count=1 but different
+    // geometry per hovered cell. The old same-count fast path only recolored, leaving the
+    // first cell's geometry on screen while only the color updated.
+    const canvas = document.createElement("canvas");
+    canvas.width = 100; canvas.height = 100;
+    document.body.appendChild(canvas);
+    const backend = await WebGLBackend.create(canvas, { width: 100, height: 100 });
+    const scene = new Scene();
+    scene.group("g", (g) => g.drawable("a", (ctx) => ctx.rect(10, 10, 20, 20)));
+    scene.setFill("g", "a", "rgb(255,0,0)");
+    backend.setLayers([{ name: "g", buffers: scene.buffers("g"), drawables: scene.drawables("g") }]);
+    backend.setTransform({ k: 1, x: 0, y: 0 });
+    expect([...backend.readPixel(20, 20).slice(0, 3)]).toEqual([255, 0, 0]);
+
+    // Same drawable count (1), DIFFERENT geometry — the hover-overlay pattern.
+    scene.group("g", (g) => g.drawable("a", (ctx) => ctx.rect(60, 60, 20, 20)));
+    scene.setFill("g", "a", "rgb(255,0,0)");
+    backend.updateLayer("g", { name: "g", buffers: scene.buffers("g"), drawables: scene.drawables("g") });
+    expect([...backend.readPixel(70, 70).slice(0, 3)]).toEqual([255, 0, 0]); // new position painted
+    expect(backend.readPixel(20, 20)[3]).toBe(0);                             // old position cleared
+    backend.destroy();
+  });
+
   it("updateLayerStyles recolors without geometry re-upload", async () => {
     const canvas = document.createElement("canvas");
     canvas.width = 100; canvas.height = 100;
