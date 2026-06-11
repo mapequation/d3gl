@@ -239,4 +239,20 @@ describe("highlight", () => {
     map.destroy();
     host.remove();
   });
+
+  it("highlight + clear works on the webgl backend (empty overlay buffers)", async () => {
+    const host = document.createElement("div");
+    host.style.width = "200px"; host.style.height = "200px";
+    document.body.appendChild(host);
+    const map = geoMap(host, { width: 200, height: 200, projection: proj(), backend: "webgl" });
+    await map.whenReady();
+    addCells(map);
+    map.highlight("cells", "c1", { fill: "rgb(0,255,0)" });
+    map.highlight("cells", null); // empty overlay buffers must not throw on webgl
+    map.highlight("cells", ["c0", "c1"], { fill: "rgb(0,255,0)" });
+    map.highlight("cells", null);
+    expect(map.toPNG().startsWith("data:image/png")).toBe(true); // renders cleanly after clears
+    map.destroy();
+    host.remove();
+  });
 });
