@@ -76,6 +76,15 @@ export interface GroupBufferDelta {
   ranges: DrawableRange[];
 }
 
+/** Just the per-drawable style tables (colors + flags) as detached typed arrays —
+ *  O(drawableCount), for styles-only backend updates. Never the O(total-vertices)
+ *  {@link Scene.buffers} rebuild: geometry hasn't changed, only how it's painted. */
+export interface StyleTables {
+  fillColors: Uint8Array;
+  strokeColors: Uint8Array;
+  flags: Uint8Array;
+}
+
 export interface DrawableOpts {
   /** Stroke width in coordinate units. 0/undefined => no stroke geometry. */
   lineWidth?: number;
@@ -341,27 +350,48 @@ export class Scene {
     data.flags[drawableId] = flags & 0xff;
   }
 
+  /** Build the vector view of one drawable at index `i` (shared by drawables()/drawableOf()). */
+  private vectorAt(data: GroupData, i: number): DrawableVector {
+    return {
+      id: data.ids[i]!,
+      subpaths: data.subpaths[i]!,
+      fill: [data.fillColors[i * 4]!, data.fillColors[i * 4 + 1]!, data.fillColors[i * 4 + 2]!, data.fillColors[i * 4 + 3]!],
+      stroke: [data.strokeColors[i * 4]!, data.strokeColors[i * 4 + 1]!, data.strokeColors[i * 4 + 2]!, data.strokeColors[i * 4 + 3]!],
+      lineWidth: data.lineWidths[i]!,
+      lineJoin: data.joins[i]!,
+      miterLimit: data.miterLimits[i]!,
+      lineCap: data.caps[i]!,
+      flags: data.flags[i]!,
+      circles: data.circles[i]!,
+      anchor: data.anchors[i]!,
+    };
+  }
+
   /** Return the vector view of a group's drawables, optionally only those at/after
    *  `from` (so an incremental append can read just the new ones in O(new)). */
   drawables(name: string, from = 0): DrawableVector[] {
     const data = this.get(name);
     const out: DrawableVector[] = [];
-    for (let i = Math.max(0, from); i < data.ids.length; i++) {
-      out.push({
-        id: data.ids[i]!,
-        subpaths: data.subpaths[i]!,
-        fill: [data.fillColors[i * 4]!, data.fillColors[i * 4 + 1]!, data.fillColors[i * 4 + 2]!, data.fillColors[i * 4 + 3]!],
-        stroke: [data.strokeColors[i * 4]!, data.strokeColors[i * 4 + 1]!, data.strokeColors[i * 4 + 2]!, data.strokeColors[i * 4 + 3]!],
-        lineWidth: data.lineWidths[i]!,
-        lineJoin: data.joins[i]!,
-        miterLimit: data.miterLimits[i]!,
-        lineCap: data.caps[i]!,
-        flags: data.flags[i]!,
-        circles: data.circles[i]!,
-        anchor: data.anchors[i]!,
-      });
-    }
+    for (let i = Math.max(0, from); i < data.ids.length; i++) out.push(this.vectorAt(data, i));
     return out;
+  }
+
+  /** The vector view of ONE drawable by domain id, or null when the id has no
+   *  drawable (unknown, or culled at build time). O(1) lookup. */
+  drawableOf(name: string, id: string | number): DrawableVector | null {
+    const data = this.get(name);
+    const i = data.idToDrawable.get(id);
+    return i === undefined ? null : this.vectorAt(data, i);
+  }
+
+  /** Snapshot the per-drawable color/flag tables (see {@link StyleTables}). */
+  styleTables(name: string): StyleTables {
+    const data = this.get(name);
+    return {
+      fillColors: new Uint8Array(data.fillColors),
+      strokeColors: new Uint8Array(data.strokeColors),
+      flags: new Uint8Array(data.flags),
+    };
   }
 
   /** Assemble GPU-ready typed arrays for a group. */

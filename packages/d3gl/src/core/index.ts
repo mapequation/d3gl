@@ -25,7 +25,7 @@ export type { RingGroup } from "./rings.js";
 export { expandStroke, DEFAULT_MITER_LIMIT } from "./stroke.js";
 export type { StrokeGeometry, StrokeOptions, LineJoin, LineCap } from "./stroke.js";
 export { Scene } from "./scene.js";
-export type { GroupBuffers, GroupBufferDelta, GroupBuilder, DrawableRange, DrawableOpts, DrawableVector } from "./scene.js";
+export type { GroupBuffers, GroupBufferDelta, GroupBuilder, DrawableRange, DrawableOpts, DrawableVector, StyleTables } from "./scene.js";
 export type { Backend, RenderLayer, RenderDelta, ViewTransform, PointBatch, PassThroughLayer, DrawBatch, ProjectedPath, DrawItem } from "./backend.js";
 export { HitIndex } from "./hit-test.js";
 export { version } from "./version.js";
