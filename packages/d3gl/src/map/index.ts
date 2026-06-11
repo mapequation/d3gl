@@ -22,3 +22,7 @@ export type { GeoMapOptions, LayerOptions, HoverHit } from "./geo-map.js";
 export { plot, Plot } from "./plot.js";
 export type { PlotOptions, PlotLayerOptions, PlotPointOptions } from "./plot.js";
 export { LayerHandle } from "./layer-handle.js";
+export type { StyleOverride, SelectionOptions } from "./style-overrides.js";
+export { HighlightBuilder } from "./highlight.js";
+export type { HighlightStyle, HighlightDraw, HoverOption } from "./highlight.js";
+export { Tooltip } from "./tooltip.js";

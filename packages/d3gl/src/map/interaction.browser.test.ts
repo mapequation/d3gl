@@ -315,6 +315,15 @@ describe("hover option", () => {
   });
 });
 
+it("rejects hover/tooltip/selection on passThrough layers", async () => {
+  const { map, host } = await makeMap();
+  expect(() =>
+    map.layer("pt", [sqPoly(0, 0, 5)], { passThrough: true, hover: true }),
+  ).toThrow(/passThrough/);
+  map.destroy();
+  host.remove();
+});
+
 describe("tooltip option", () => {
   it("shows accessor content on hover, follows the pointer, hides off-target", async () => {
     const { map, host } = await makeMap();

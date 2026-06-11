@@ -95,6 +95,8 @@ export class GeoMap extends BaseEngine {
 
   layer<F>(name: string, features: F | readonly F[] | (() => readonly F[]), opts: LayerOptions<F> = {}): LayerHandle<F> {
     if (opts.passThrough) {
+      if (opts.hover || opts.tooltip || opts.selection)
+        throw new Error("hover/tooltip/selection require a retained layer (passThrough layers are not pickable)");
       const source: unknown[] | (() => unknown[]) =
         typeof features === "function"
           ? () => [...(features as () => readonly F[])()]
