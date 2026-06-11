@@ -81,6 +81,7 @@ export default defineConfig({
       { label: "Start Here", items: [
         { label: "Getting started", slug: "getting-started" },
         { label: "Rendering backends", slug: "rendering-backends" },
+        { label: "Interaction", slug: "interaction" },
       ] },
       {
         label: "Examples",

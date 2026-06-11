@@ -1,0 +1,90 @@
+---
+title: Interaction
+description: Hover, tooltips, highlight, click selection, and per-drawable style overrides — and what each one costs.
+---
+
+Retained layers are pickable by default (a CPU hit index per layer; disable with
+`pickable: false`). Picking is **clip-aware**: a layer with `clipTo` only hits where its
+clip source is also hit, so interaction matches what is visibly painted.
+
+## Events
+
+```ts
+map.on("hover", (hit, ev) => { /* hit: { layer, id, datum } | null */ });
+map.on("click", (hit, ev) => { /* fires only when the pointer didn't drag (≤ 4 px) */ });
+```
+
+`click` coexists with pan/zoom/rotation: a drag never fires it.
+
+## Hover highlight
+
+```ts
+map.layer("cells", geoms, {
+  hover: true,                                   // default: white outline (ring for points)
+  // hover: { stroke: "#fff", lineWidth: 1.5 },  // or replay the item with this style
+  // hover: (d, g) => { ... },                   // or fully custom draw (see below)
+});
+map.highlight("cells", id, styleOrDraw);         // the imperative primitive (pass null to clear)
+```
+
+The hovered item is **redrawn into a tiny internal overlay layer** (inheriting the source
+layer's `clipTo`/`sizeMode`, rendered on top). The base layer's buffers are never touched, so
+sweeping fast across a dense grid costs O(one feature) per cell crossed — no fps drop. Because
+only one item is re-tessellated, `lineWidth` is allowed here (unlike bulk overrides).
+
+Custom draw gets a `HighlightBuilder` scoped to the hovered drawable (world coordinates):
+
+```ts
+hover: (city, g) => {
+  g.replay({ fill: "#fff" });                       // the item itself, restyled —
+                                                    // uses its already-projected geometry
+  const [x, y] = g.anchor;                          // a point feature's projected center
+  g.path((ctx) => ctx.arc(x, y, 8, 0, 2 * Math.PI), // plus anything else
+    { stroke: "#e23b2f", lineWidth: 1.5 });
+  g.point(x, y - 12, 2, { fill: "#e23b2f" });
+}
+```
+
+## Tooltips
+
+```ts
+const map = geoMap(host, { tooltipClass: "my-tooltip" }); // optional styling hook
+map.layer("cities", pts, { tooltip: (d, id) => d.name }); // string | HTMLElement | null
+```
+
+One shared absolutely-positioned div (`class="d3gl-tooltip"`), engine-managed: filled from the
+accessor of the hovered layer, follows the pointer clamped to the host, hidden off-target.
+Without `tooltipClass` it gets a minimal default look. Content is re-evaluated only when the
+hovered target changes; re-declare the layer to force a refresh.
+
+## Selection and style overrides
+
+```ts
+map.layer("cells", geoms, {
+  selection: { selected: { stroke: "#fff" },   // optional; default keeps base style
+               others: { opacity: 0.3 } },     // default when omitted
+});
+map.select("cells", ids);                      // apply (pass null to clear)
+
+map.setStyle("cells", ids, { fill, stroke, opacity }); // the primitives
+map.clearStyle("cells", ids);
+```
+
+Overrides compose **over** the base accessor colors: `fill`/`stroke` replace the base color,
+`opacity` multiplies the base alpha (dimming keeps each item's hue). They survive projection
+switches and rotation rebuilds; re-declaring the layer (`map.layer(name, …)` again) resets
+them. `select()` rewrites the layer's whole override table (last write wins vs `setStyle`).
+
+Bulk overrides are colors-only: stroke geometry bakes its width at tessellation time, so a bulk
+`lineWidth` would be O(n) re-tessellation — use the hover overlay for width changes.
+
+## Cost model
+
+| Operation | Cost | When |
+| --- | --- | --- |
+| Pointer move within one item | one pick + tooltip reposition | per move |
+| Hover crosses into a new item | tessellate 1 feature + tiny upload | per change |
+| `select()` / `setStyle` bulk | O(n) byte writes + one small table upload | per call (e.g. click) |
+| Pan/zoom/rotate frames | unchanged — the hover pipeline pauses during gestures | — |
+
+Nothing here adds per-frame work, changes shaders, or rebuilds vertex buffers.
