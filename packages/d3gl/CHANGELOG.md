@@ -1,5 +1,25 @@
 # @mapequation/d3gl
 
+## 0.5.0
+
+### Minor Changes
+
+- b459367: Interactive styling for retained layers: `on("click")` (drag-suppressed), hover
+  highlight via per-item overlay (`hover` layer option / `highlight()`, with custom
+  draw through `HighlightBuilder`), core tooltips (`tooltip` option + `tooltipClass`),
+  click selection with complement dimming (`selection` option + `select()`), per-drawable
+  style overrides (`setStyle`/`clearStyle`) on a new styles-only backend path
+  (`updateLayerStyles`), faster `recolor()`, and clip-aware picking (`clipTo` layers no
+  longer hit where they are visibly clipped away).
+
+### Patch Changes
+
+- 9b7a40f: Backend swap now re-inserts the new rendering surface at the previous surface's DOM
+  position instead of appending it to the end of the host. This keeps the canvas a stable
+  base layer, so HTML elements the caller appended to the host after it (e.g. an overlay)
+  keep painting on top across a `setBackend()` switch or the `"auto"` canvas→WebGL upgrade,
+  with no `z-index` needed.
+
 ## 0.4.1
 
 ### Patch Changes
