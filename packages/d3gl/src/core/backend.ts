@@ -1,4 +1,4 @@
-import type { GroupBuffers, GroupBufferDelta, DrawableVector } from "./scene.js";
+import type { GroupBuffers, GroupBufferDelta, DrawableVector, StyleTables } from "./scene.js";
 import type { Subpath } from "./path-context.js";
 
 /** Transient, GPU/Canvas-ready point data. Owned by no one — built per repaint and discarded. */
@@ -80,6 +80,14 @@ export interface RenderDelta {
 export interface Backend {
   setLayers(layers: RenderLayer[]): void;
   updateLayer(name: string, layer: RenderLayer): void;
+  /**
+   * Styles-only fast path (optional): the per-drawable color/flag tables changed but
+   * geometry did not (recolor / dim / show-hide). `drawables` is the refreshed vector
+   * view (same drawables, same order) so vector-reading consumers (Canvas redraw, SVG
+   * serialize, toSVG export) stay in sync with the raster output. Backends without it
+   * are driven through `updateLayer` (full re-upload).
+   */
+  updateLayerStyles?(name: string, tables: StyleTables, drawables: DrawableVector[]): void;
   /**
    * Append-only fast path (optional). Same observable result as a full re-upload,
    * but the backend uploads/draws only the appended tail (`delta`) — O(new) instead

@@ -2,7 +2,7 @@ import { luma } from "@luma.gl/core";
 import { webgl2Adapter } from "@luma.gl/webgl";
 import type { Device, Framebuffer } from "@luma.gl/core";
 import type { Backend, RenderLayer, RenderDelta, ViewTransform } from "../core/index.js";
-import type { GroupBuffers, GroupBufferDelta, PassThroughLayer, DrawBatch } from "../core/index.js";
+import type { GroupBuffers, GroupBufferDelta, PassThroughLayer, DrawBatch, StyleTables, DrawableVector } from "../core/index.js";
 import { GroupRenderer } from "./renderer.js";
 import { clipFromView } from "./transform.js";
 import { toPNG } from "./png.js";
@@ -102,6 +102,17 @@ export class WebGLBackend implements Backend {
       this.layers.set(name, layer);
       if (!this.order.includes(name)) this.order.push(name);
     }
+    this.bakeDirty = true;
+  }
+
+  /** Styles-only update: rewrite the palette/flags textures, refresh the stored vector
+   *  view (toSVG reads it), leave geometry buffers untouched. */
+  updateLayerStyles(name: string, tables: StyleTables, drawables: DrawableVector[]): void {
+    const renderer = this.renderers.get(name);
+    if (!renderer) return;
+    renderer.updateColors(tables);
+    const prev = this.layers.get(name);
+    if (prev) this.layers.set(name, { ...prev, drawables });
     this.bakeDirty = true;
   }
 
