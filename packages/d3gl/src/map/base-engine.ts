@@ -3,6 +3,7 @@ import { zoom as d3zoom, zoomIdentity, type D3ZoomEvent } from "d3-zoom";
 import { Scene, HitIndex, type Backend, type GroupBuilder, type RenderLayer, type ViewTransform } from "../core/index.js";
 import { createBackend, createCanvasBackend, type BackendType, type BackendHandle } from "./backend-factory.js";
 import { buildBatch, type DrawItem } from "./draw-batch.js";
+import { composeColor, type StyleOverride } from "./style-overrides.js";
 
 export type Accessor<D, T> = T | ((d: D, i: number) => T);
 export interface HoverHit { layer: string; id: string | number; datum: unknown; }
@@ -49,6 +50,10 @@ export abstract class BaseEngine {
    *  check stays O(new) (not O(total)/batch) AND so pick()/restyle resolve a datum
    *  index in O(1) instead of spec.ids.indexOf (O(n) per pointer move). */
   private layerIds = new Map<string, Map<string | number, number>>();
+  /** Per-layer style overrides (id → override), composed over the base accessor colors.
+   *  Survive rebuilds (reapplied after applyAccessors); dropped when the layer is
+   *  re-declared via layer() (its ids may change). */
+  private styleOverrides = new Map<string, Map<string | number, StyleOverride>>();
   protected transform: ViewTransform = { k: 1, x: 0, y: 0 };
   protected handle: BackendHandle | null = null;
   protected ready: Promise<void>;
@@ -108,6 +113,7 @@ export abstract class BaseEngine {
   protected registerLayer(spec: LayerSpec): void {
     this.scene.group(spec.name, spec.build);
     this.applyAccessors(spec);
+    this.reapplyOverrides(spec); // rebuilds (rotation/projection) keep overrides
     const at = this.specs.findIndex((s) => s.name === spec.name);
     if (at >= 0) this.specs[at] = spec;
     else this.specs.push(spec);
@@ -267,13 +273,83 @@ export abstract class BaseEngine {
     const spec = this.specs.find((s) => s.name === name);
     if (!spec) return this;
     this.applyAccessors(spec);
-    // Don't touch the backend for a layer that's hidden mid-interaction (setLayers
-    // already dropped it); it re-projects + repaints when the interaction ends.
-    if (!(this.interacting && spec.hideOnInteraction)) {
-      this.handle?.backend.updateLayer(name, this.renderLayer(spec));
-      this.render();
-    }
+    this.reapplyOverrides(spec);
+    this.pushStyles(spec); // styles-only: geometry can't have changed under a recolor
     return this;
+  }
+
+  /** Override the style of one drawable or a set (replaces any previous override for
+   *  those ids — last write wins). O(ids) compose + one styles-only push. */
+  setStyle(name: string, ids: string | number | readonly (string | number)[], override: StyleOverride): this {
+    const spec = this.specs.find((s) => s.name === name);
+    if (!spec) return this;
+    const list: readonly (string | number)[] = Array.isArray(ids) ? ids : [ids as string | number];
+    let map = this.styleOverrides.get(name);
+    if (!map) { map = new Map(); this.styleOverrides.set(name, map); }
+    for (const id of list) map.set(id, override);
+    this.restyle(spec, list);
+    this.pushStyles(spec);
+    return this;
+  }
+
+  /** Remove overrides (all of the layer's when `ids` is omitted) and restore base styles. */
+  clearStyle(name: string, ids?: string | number | readonly (string | number)[]): this {
+    const spec = this.specs.find((s) => s.name === name);
+    if (!spec) return this;
+    const map = this.styleOverrides.get(name);
+    if (!map || map.size === 0) return this;
+    const list: readonly (string | number)[] =
+      ids === undefined ? [...map.keys()] : Array.isArray(ids) ? ids : [ids as string | number];
+    for (const id of list) map.delete(id);
+    this.restyle(spec, list);
+    this.pushStyles(spec);
+    return this;
+  }
+
+  /** Recompose + write the effective colors for `ids`: base accessor value with the
+   *  current override (if any) applied. Ids without a drawable (culled) are skipped.
+   *  When neither base nor override exists, we leave the scene's existing color in place
+   *  (composeColor → null) rather than writing an invalid transparent sentinel. */
+  private restyle(spec: LayerSpec, ids: readonly (string | number)[]): void {
+    const map = this.styleOverrides.get(spec.name);
+    const index = this.layerIds.get(spec.name);
+    for (const id of ids) {
+      const i = index?.get(id);
+      if (i === undefined || this.scene.drawableOf(spec.name, id) === null) continue;
+      const o = map?.get(id) ?? {};
+      const d = spec.data[i]!;
+      const fill = composeColor(this.resolve(spec.fill, d, i), o.fill, o.opacity);
+      if (fill !== null) this.scene.setFill(spec.name, id, fill);
+      const stroke = composeColor(this.resolve(spec.stroke, d, i), o.stroke, o.opacity);
+      if (stroke !== null) this.scene.setStroke(spec.name, id, stroke);
+    }
+  }
+
+  /** Re-write all of a layer's overrides (after applyAccessors reset the tables). */
+  private reapplyOverrides(spec: LayerSpec): void {
+    const map = this.styleOverrides.get(spec.name);
+    if (map && map.size > 0) this.restyle(spec, [...map.keys()]);
+  }
+
+  /** Styles-only backend push (tables + refreshed vector views); falls back to a full
+   *  updateLayer for backends without the fast path. Skips hidden-mid-gesture layers
+   *  (the gesture-end rebuild re-pushes them). */
+  private pushStyles(spec: LayerSpec): void {
+    if (this.interacting && spec.hideOnInteraction) return;
+    const backend = this.handle?.backend;
+    if (!backend) return;
+    if (backend.updateLayerStyles) {
+      backend.updateLayerStyles(spec.name, this.scene.styleTables(spec.name), this.scene.drawables(spec.name));
+    } else {
+      backend.updateLayer(spec.name, this.renderLayer(spec));
+    }
+    this.render();
+  }
+
+  /** Forget per-layer interaction state (overrides; later: highlights). Called when a
+   *  layer is RE-DECLARED (its ids may change) — not on a rebuild of the same data. */
+  protected dropInteractionState(name: string): void {
+    this.styleOverrides.delete(name);
   }
   setClip(name: string, clipTo?: string): this {
     const spec = this.specs.find((s) => s.name === name);

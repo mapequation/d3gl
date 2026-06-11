@@ -79,6 +79,7 @@ export class Plot extends BaseEngine {
   layer<D>(name: string, data: readonly D[], opts: PlotLayerOptions<D>): LayerHandle<D> {
     const list = data as D[];
     const ids = list.map((d, i) => (opts.id ? opts.id(d, i) : i));
+    this.dropInteractionState(name); // a re-declared layer starts with base styles
     this.registerLayer({ name, data: list, ids, fill: opts.fill, stroke: opts.stroke, clipTo: opts.clipTo, sizeMode: opts.sizeMode, declutter: opts.declutter, pickable: opts.pickable, build: this.buildDrawables(list, ids, 0, opts) });
     return new LayerHandle<D>(this, name, (items) => this.appendDrawables(name, items, opts));
   }
@@ -110,6 +111,7 @@ export class Plot extends BaseEngine {
     if (typeof data === "function") throw new Error("callback data requires passThrough: true");
     const list = data as D[];
     const ids = list.map((d, i) => (opts.id ? opts.id(d, i) : i));
+    this.dropInteractionState(name); // a re-declared layer starts with base styles
     this.registerLayer({ name, data: list, ids, fill: opts.fill, stroke: opts.stroke, clipTo: opts.clipTo, sizeMode: opts.sizeMode, pickable: opts.pickable, build: this.buildPoints(list, ids, 0, opts) });
     return new LayerHandle<D>(this, name, (items) => this.appendPoints(name, items, opts));
   }

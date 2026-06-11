@@ -133,6 +133,7 @@ export class GeoMap extends BaseEngine {
     if (typeof features === "function") throw new Error("callback data requires passThrough: true");
     const list = Array.isArray(features) ? (features as F[]) : [features as F];
     this.defs = this.defs.filter((d) => d.name !== name).concat({ name, opts });
+    this.dropInteractionState(name); // a re-declared layer starts with base styles
     this.registerLayer(this.buildSpec(name, list, opts));
     return new LayerHandle<F>(this, name, (items) => this.appendFeatures(name, items, opts));
   }
