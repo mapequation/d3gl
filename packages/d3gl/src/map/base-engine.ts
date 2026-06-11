@@ -68,6 +68,10 @@ export abstract class BaseEngine {
   private currentBackend: BackendType;
   private hoverCb: ((hit: HoverHit | null, ev: PointerEvent) => void) | null = null;
   private clickCb: ((hit: HoverHit | null, ev: PointerEvent) => void) | null = null;
+  /** Last hover pick, for cheap same-target exits while the pointer stays inside one drawable. */
+  private lastHover: HoverHit | null = null;
+  /** Source layer whose hover-option highlight is currently shown (auto, not manual). */
+  private autoHover: string | null = null;
   /** pointerdown position; a pointerup within CLICK_SLOP px of it is a click. */
   private downAt: [number, number] | null = null;
   /** Max pointer travel (px) between down and up for a click — suppresses pan/rotate drags. */
@@ -117,6 +121,11 @@ export abstract class BaseEngine {
     }
   }
   whenReady(): Promise<void> { return this.ready; }
+  /** Idempotent: addEventListener dedupes on the same handler reference. */
+  private attachPointer(): void {
+    this.host.addEventListener("pointermove", this.onPointerMove);
+    this.host.addEventListener("pointerleave", this.onPointerLeave);
+  }
   /** The currently-active backend type (set by the constructor / installBackend). */
   protected backendType(): BackendType { return this.currentBackend; }
   /** The live backend instance, or null before the first swap resolves. */
@@ -144,6 +153,8 @@ export abstract class BaseEngine {
     // its highlight dropped by dropInteractionState first.)
     const active = this.highlights.get(spec.name);
     if (active) this.buildHighlight(spec, active.ids, active.styleOrDraw);
+    // Attach pointer listeners if this layer needs auto-hover (idempotent via same ref).
+    if (spec.hover) this.attachPointer();
     this.pushLayers();
   }
 
@@ -406,6 +417,9 @@ export abstract class BaseEngine {
 
   /** Push one overlay layer (tiny buffers — O(highlighted items), not O(layer)). */
   private pushHighlight(spec: LayerSpec): void {
+    // A hidden-mid-gesture source isn't in the backend's layer set; its overlay would
+    // float over nothing. The gesture-end pushLayers re-pushes overlays anyway.
+    if (this.interacting && spec.hideOnInteraction) return;
     const backend = this.handle?.backend;
     if (!backend) return; // pre-install: installBackend pushes overlays with setLayers
     backend.updateLayer(spec.name + HIGHLIGHT_SUFFIX, this.overlayRenderLayer(spec));
@@ -521,6 +535,7 @@ export abstract class BaseEngine {
   protected setInteracting(v: boolean): void {
     if (this.interacting === v) return;
     this.interacting = v;
+    if (v) this.clearHoverState(); // a drag/zoom hides hover artifacts immediately
     if (this.specs.some((s) => s.hideOnInteraction)) this.pushLayers();
     if (this.ptSpecs.size > 0) {
       if (v) {
@@ -626,8 +641,7 @@ export abstract class BaseEngine {
   on(event: "hover" | "click", cb: (hit: HoverHit | null, ev: PointerEvent) => void): this {
     if (event === "hover") {
       this.hoverCb = cb;
-      this.host.addEventListener("pointermove", this.onPointerMove);
-      this.host.addEventListener("pointerleave", this.onPointerLeave);
+      this.attachPointer();
     } else if (event === "click") {
       this.clickCb = cb;
       // Re-calling on("click") swaps the callback; the addEventListener calls below are
@@ -680,11 +694,38 @@ export abstract class BaseEngine {
   }
 
   private onPointerMove = (e: PointerEvent): void => {
-    if (!this.hoverCb) return;
+    if (this.interacting) return; // gesture frames skip picking entirely
+    if (!this.hoverCb && !this.specs.some((s) => s.hover)) return;
     const r = this.host.getBoundingClientRect();
-    this.hoverCb(this.pick(e.clientX - r.left, e.clientY - r.top), e);
+    const hit = this.pick(e.clientX - r.left, e.clientY - r.top);
+    this.hoverCb?.(hit, e);
+    if (hit?.layer !== this.lastHover?.layer || hit?.id !== this.lastHover?.id) {
+      this.lastHover = hit;
+      this.applyAutoHover(hit);
+    }
   };
-  private onPointerLeave = (e: PointerEvent): void => { this.hoverCb?.(null, e); };
+
+  /** Show the hover-option highlight for the picked drawable; clear the previous one.
+   *  NOTE: if a manual highlight() was called on the same layer, the next pointermove
+   *  that changes target will overwrite/clear it — the hover option owns that layer's overlay. */
+  private applyAutoHover(hit: HoverHit | null): void {
+    const spec = hit ? this.specs.find((s) => s.name === hit.layer) : undefined;
+    const target = spec?.hover ? spec.name : null;
+    if (this.autoHover && this.autoHover !== target) this.highlight(this.autoHover, null);
+    if (target && hit) this.highlight(target, hit.id);
+    this.autoHover = target;
+  }
+
+  private onPointerLeave = (e: PointerEvent): void => {
+    this.hoverCb?.(null, e);
+    this.clearHoverState();
+  };
+
+  /** Drop transient hover artifacts (auto-highlight; tooltip in a later task). */
+  private clearHoverState(): void {
+    this.lastHover = null;
+    if (this.autoHover) { this.highlight(this.autoHover, null); this.autoHover = null; }
+  }
   private onPointerDown = (e: PointerEvent): void => { this.downAt = [e.clientX, e.clientY]; };
   /** An interrupted gesture (e.g. setPointerCapture takeover, scroll) must not leave a stale
    *  down-position that would validate the next unrelated pointerup as a click. */

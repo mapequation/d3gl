@@ -256,3 +256,44 @@ describe("highlight", () => {
     host.remove();
   });
 });
+
+describe("hover option", () => {
+  it("auto-highlights the hovered drawable, no-ops within it, clears on leave", async () => {
+    const { map, host } = await makeMap();
+    map.layer("cells", [sqPoly(-20, -20, 20), sqPoly(0, 0, 20)], {
+      fill: (_f, i) => (i === 0 ? "rgb(255,0,0)" : "rgb(0,0,255)"),
+      id: (_f, i) => `c${i}`,
+      hover: { fill: "rgb(0,255,0)" },
+    });
+    map.render();
+
+    pointer(host, "pointermove", 108, 91);
+    expect([...pixelAt(host, 108, 91)].slice(0, 3)).toEqual([0, 255, 0]);
+
+    pointer(host, "pointermove", 110, 92); // same cell: still highlighted
+    expect([...pixelAt(host, 108, 91)].slice(0, 3)).toEqual([0, 255, 0]);
+
+    pointer(host, "pointermove", 91, 109); // crossed into c0
+    expect([...pixelAt(host, 91, 109)].slice(0, 3)).toEqual([0, 255, 0]);
+    expect([...pixelAt(host, 108, 91)].slice(0, 3)).toEqual([0, 0, 255]); // c1 restored
+
+    pointer(host, "pointermove", 10, 10);  // empty space clears
+    expect([...pixelAt(host, 91, 109)].slice(0, 3)).toEqual([255, 0, 0]);
+
+    pointer(host, "pointermove", 108, 91);
+    host.dispatchEvent(new PointerEvent("pointerleave", { bubbles: true }));
+    expect([...pixelAt(host, 108, 91)].slice(0, 3)).toEqual([0, 0, 255]);
+    map.destroy();
+    host.remove();
+  });
+
+  it("hover works without any on(hover) callback registered", async () => {
+    const { map, host } = await makeMap();
+    map.layer("cells", [sqPoly(0, 0, 20)], { fill: "rgb(0,0,255)", id: () => "c1", hover: { fill: "rgb(0,255,0)" } });
+    map.render();
+    pointer(host, "pointermove", 108, 91);
+    expect([...pixelAt(host, 108, 91)].slice(0, 3)).toEqual([0, 255, 0]);
+    map.destroy();
+    host.remove();
+  });
+});
