@@ -124,4 +124,18 @@ describe("on(click)", () => {
     map.destroy();
     host.remove();
   });
+
+  it("does not fire after a pointercancel interrupts the gesture", async () => {
+    const { map, host } = await makeMap();
+    addCells(map);
+    const clicks: unknown[] = [];
+    map.on("click", (hit) => clicks.push(hit));
+
+    pointer(host, "pointerdown", 108, 91);
+    pointer(host, "pointercancel", 108, 91);
+    pointer(host, "pointerup", 108, 91);
+    expect(clicks.length).toBe(0);
+    map.destroy();
+    host.remove();
+  });
 });

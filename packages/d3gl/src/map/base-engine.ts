@@ -63,7 +63,7 @@ export abstract class BaseEngine {
   /** pointerdown position; a pointerup within CLICK_SLOP px of it is a click. */
   private downAt: [number, number] | null = null;
   /** Max pointer travel (px) between down and up for a click — suppresses pan/rotate drags. */
-  private static CLICK_SLOP = 4;
+  private static readonly CLICK_SLOP = 4;
   private swapToken = 0;
   private destroyed = false;
   /** "auto" mode only: the WebGL upgrade promise (in-flight, then settled). Null until
@@ -506,8 +506,11 @@ export abstract class BaseEngine {
       this.host.addEventListener("pointerleave", this.onPointerLeave);
     } else if (event === "click") {
       this.clickCb = cb;
+      // Re-calling on("click") swaps the callback; the addEventListener calls below are
+      // no-ops when the same handler refs are already registered — intentional.
       this.host.addEventListener("pointerdown", this.onPointerDown);
       this.host.addEventListener("pointerup", this.onPointerUp);
+      this.host.addEventListener("pointercancel", this.onPointerCancel);
     }
     return this;
   }
@@ -541,6 +544,7 @@ export abstract class BaseEngine {
     this.host.removeEventListener("pointerleave", this.onPointerLeave);
     this.host.removeEventListener("pointerdown", this.onPointerDown);
     this.host.removeEventListener("pointerup", this.onPointerUp);
+    this.host.removeEventListener("pointercancel", this.onPointerCancel);
     this.handle?.backend.destroy();
     if (this.handle && this.handle.element !== this.host) this.handle.element.remove();
     this.handle = null;
@@ -553,6 +557,9 @@ export abstract class BaseEngine {
   };
   private onPointerLeave = (e: PointerEvent): void => { this.hoverCb?.(null, e); };
   private onPointerDown = (e: PointerEvent): void => { this.downAt = [e.clientX, e.clientY]; };
+  /** An interrupted gesture (e.g. setPointerCapture takeover, scroll) must not leave a stale
+   *  down-position that would validate the next unrelated pointerup as a click. */
+  private onPointerCancel = (): void => { this.downAt = null; };
   private onPointerUp = (e: PointerEvent): void => {
     const d = this.downAt;
     this.downAt = null;
