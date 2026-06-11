@@ -155,3 +155,33 @@ describe("clip-aware pick", () => {
     host.remove();
   });
 });
+
+describe("select", () => {
+  it("dims the complement, keeps the selected set, clears on null", async () => {
+    const { map, host } = await makeMap();
+    map.layer("cells", [sqPoly(-20, -20, 20), sqPoly(0, 0, 20)], {
+      fill: "rgb(0,0,255)", id: (_f, i) => `c${i}`,
+      selection: { others: { opacity: 0.3 } },
+    });
+    map.render();
+
+    map.select("cells", ["c1"]);
+    expect(pixelAt(host, 108, 91)[3]).toBe(255);          // selected: base style
+    expect(pixelAt(host, 91, 109)[3]).toBeLessThan(110);  // other: dimmed
+
+    map.select("cells", null);
+    expect(pixelAt(host, 91, 109)[3]).toBe(255);
+
+    // Predicate form + selected style.
+    map.layer("cells2", [sqPoly(40, -20, 20)], {
+      fill: "rgb(0,0,255)", id: () => "x0",
+      selection: { selected: { fill: "rgb(255,0,0)" }, others: { opacity: 0.3 } },
+    });
+    map.render();
+    map.select("cells2", () => true);
+    // proj([50,-10]) ≈ [143.6, 108.7]
+    expect([...pixelAt(host, 143, 108)].slice(0, 3)).toEqual([255, 0, 0]);
+    map.destroy();
+    host.remove();
+  });
+});

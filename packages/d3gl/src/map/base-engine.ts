@@ -3,7 +3,7 @@ import { zoom as d3zoom, zoomIdentity, type D3ZoomEvent } from "d3-zoom";
 import { Scene, HitIndex, type Backend, type GroupBuilder, type RenderLayer, type ViewTransform } from "../core/index.js";
 import { createBackend, createCanvasBackend, type BackendType, type BackendHandle } from "./backend-factory.js";
 import { buildBatch, type DrawItem } from "./draw-batch.js";
-import { composeColor, type StyleOverride } from "./style-overrides.js";
+import { composeColor, type StyleOverride, type SelectionOptions } from "./style-overrides.js";
 
 export type Accessor<D, T> = T | ((d: D, i: number) => T);
 export interface HoverHit { layer: string; id: string | number; datum: unknown; }
@@ -27,6 +27,8 @@ export interface LayerSpec {
   /** When false, no CPU hit index is built for this layer (pick() can't hit it). Skips
    *  ~one Entry object per drawable — worth it for huge, non-interactive streamed layers. */
   pickable?: boolean;
+  /** Styles applied by {@link BaseEngine.select} to the selected set / its complement. */
+  selection?: SelectionOptions;
   build: (g: GroupBuilder) => void;   // rebuilds the Scene group (geo or draw)
 }
 
@@ -307,6 +309,36 @@ export abstract class BaseEngine {
       ids === undefined ? [...map.keys()] : Array.isArray(ids) ? ids : [ids as string | number];
     for (const id of list) map.delete(id);
     this.restyle(spec, list);
+    this.pushStyles(spec);
+    return this;
+  }
+
+  /**
+   * Select a set of drawables: style members with the layer's `selection.selected`
+   * (default: keep base style) and the complement with `selection.others` (default
+   * `{ opacity: 0.3 }`). One O(n) compose + one styles-only push — click-time cost
+   * only, nothing per frame. `null` clears. NOTE: selection rewrites the layer's
+   * whole override map, so it replaces earlier setStyle overrides (one table, last
+   * write wins) — and select(null) restores plain base styles.
+   */
+  select(name: string, set: readonly (string | number)[] | ((d: any, i: number) => boolean) | null): this {
+    const spec = this.specs.find((s) => s.name === name);
+    if (!spec) return this;
+    this.styleOverrides.delete(name);
+    if (set !== null) {
+      const members = typeof set === "function"
+        ? new Set(spec.ids.filter((_, i) => set(spec.data[i], i)))
+        : new Set(set);
+      const selected = spec.selection?.selected;
+      const others = spec.selection?.others ?? { opacity: 0.3 };
+      const map = new Map<string | number, StyleOverride>();
+      for (const id of spec.ids) {
+        const o = members.has(id) ? selected : others;
+        if (o) map.set(id, o);
+      }
+      this.styleOverrides.set(name, map);
+    }
+    this.restyle(spec, spec.ids);
     this.pushStyles(spec);
     return this;
   }
