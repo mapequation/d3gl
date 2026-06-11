@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { composeColor } from "./style-overrides.js";
+import { composeColor } from "../style-overrides.js";
 
 describe("composeColor", () => {
   it("passes the base through untouched when there is no override", () => {
@@ -21,6 +21,8 @@ describe("composeColor", () => {
   });
   it("clamps opacity products into [0, 1] and rejects invalid colors", () => {
     expect(composeColor("#ff0000", undefined, 4)).toBe("rgb(255, 0, 0)");
+    expect(composeColor("#ff0000", undefined, 0)).toBe("rgba(255, 0, 0, 0)");
+    expect(composeColor("#ff0000", undefined, -0.5)).toBe("rgba(255, 0, 0, 0)");
     expect(() => composeColor("not-a-color", undefined, 0.5)).toThrow(/invalid color/);
   });
 });

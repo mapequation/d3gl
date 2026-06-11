@@ -32,7 +32,7 @@
 | `packages/d3gl/src/webgl/webgl-backend.ts` | Implement `updateLayerStyles` |
 | `packages/d3gl/src/canvas/canvas-backend.ts` | Implement `updateLayerStyles` |
 | `packages/d3gl/src/svg/svg-backend.ts` | Implement `updateLayerStyles` |
-| `packages/d3gl/src/map/style-overrides.ts` | NEW: `StyleOverride`, `SelectionOption`, `composeColor` |
+| `packages/d3gl/src/map/style-overrides.ts` | NEW: `StyleOverride`, `SelectionOptions`, `composeColor` |
 | `packages/d3gl/src/map/highlight.ts` | NEW: `HighlightStyle`, `HoverOption`, `HighlightDraw`, `HighlightBuilder`, `resolveHighlight`, `HIGHLIGHT_SUFFIX` |
 | `packages/d3gl/src/map/tooltip.ts` | NEW: `Tooltip` class |
 | `packages/d3gl/src/map/base-engine.ts` | id→index map, `setStyle`/`clearStyle`/`select`/`highlight`/`on("click")`, unified pointer pipeline, clip-aware `pick`, overlay push, tooltip wiring |
@@ -293,7 +293,7 @@ export interface StyleOverride {
 /** Styles for {@link BaseEngine.select}: the selected set and its complement.
  *  Defaults: `selected` keeps the base style (items stand out because the others
  *  dim); `others` is `{ opacity: 0.3 }`. */
-export interface SelectionOption {
+export interface SelectionOptions {
   selected?: StyleOverride;
   others?: StyleOverride;
 }
@@ -332,7 +332,7 @@ Expected: PASS (adjust string expectations to d3-color's real formatting if need
 
 ```bash
 git -C /Users/daniel/dev/projects/icelab/code/web/d3gl/.claude/worktrees/highlight-interaction add packages/d3gl/src/map/style-overrides.ts packages/d3gl/src/map/style-overrides.test.ts
-git -C /Users/daniel/dev/projects/icelab/code/web/d3gl/.claude/worktrees/highlight-interaction commit -m "feat(map): StyleOverride/SelectionOption types + composeColor"
+git -C /Users/daniel/dev/projects/icelab/code/web/d3gl/.claude/worktrees/highlight-interaction commit -m "feat(map): StyleOverride/SelectionOptions types + composeColor"
 ```
 
 ---
@@ -620,7 +620,7 @@ Expected: FAIL — `map.setStyle is not a function`.
 Imports at top:
 
 ```ts
-import { composeColor, type StyleOverride, type SelectionOption } from "./style-overrides.js";
+import { composeColor, type StyleOverride, type SelectionOptions } from "./style-overrides.js";
 ```
 
 Field next to `layerIds`:
@@ -962,7 +962,7 @@ describe("select", () => {
 
 ```ts
   /** Styles applied by {@link BaseEngine.select} to the selected set / its complement. */
-  selection?: SelectionOption;
+  selection?: SelectionOptions;
 ```
 
 Add the method after `clearStyle`:
@@ -1004,10 +1004,10 @@ In `geo-map.ts`: add to `LayerOptions` (after `passThrough`):
 ```ts
   /** Styles for {@link GeoMap.select}: the selected set and its complement.
    *  Defaults: selected keeps the base style; others `{ opacity: 0.3 }`. */
-  selection?: SelectionOption;
+  selection?: SelectionOptions;
 ```
 
-with `import type { SelectionOption } from "./style-overrides.js";` — and pass it through in `buildSpec`'s returned object: `selection: opts.selection,`.
+with `import type { SelectionOptions } from "./style-overrides.js";` — and pass it through in `buildSpec`'s returned object: `selection: opts.selection,`.
 
 - [ ] **Step 4: Run tests** — interaction suite. Expected: PASS.
 
@@ -1799,7 +1799,7 @@ it("rejects hover/tooltip/selection on passThrough layers", async () => {
 - [ ] **Step 2: Exports** — `packages/d3gl/src/map/index.ts`:
 
 ```ts
-export type { StyleOverride, SelectionOption } from "./style-overrides.js";
+export type { StyleOverride, SelectionOptions } from "./style-overrides.js";
 export { HighlightBuilder } from "./highlight.js";
 export type { HighlightStyle, HighlightDraw, HoverOption } from "./highlight.js";
 export { Tooltip } from "./tooltip.js";

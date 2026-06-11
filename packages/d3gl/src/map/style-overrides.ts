@@ -9,14 +9,14 @@ export interface StyleOverride {
   fill?: string;
   /** Replaces the base stroke. */
   stroke?: string;
-  /** Multiplies the base alpha (0..1) — dimming keeps each drawable's own hue. */
+  /** Finite number in 0..1; out-of-range values are clamped to [0, 1]. NaN is not valid. */
   opacity?: number;
 }
 
 /** Styles for select(): the selected set and its complement.
  *  Defaults: `selected` keeps the base style (items stand out because the others
  *  dim); `others` is `{ opacity: 0.3 }`. */
-export interface SelectionOption {
+export interface SelectionOptions {
   selected?: StyleOverride;
   others?: StyleOverride;
 }

@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { Scene } from "./scene.js";
+import { Scene } from "../scene.js";
 
 describe("Scene.styleTables / Scene.drawableOf", () => {
   const build = (): Scene => {
