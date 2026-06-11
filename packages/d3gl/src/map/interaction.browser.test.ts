@@ -349,15 +349,33 @@ describe("tooltip option", () => {
     document.body.appendChild(host);
     const map = geoMap(host, { width: 200, height: 200, projection: proj(), backend: "canvas", tooltipClass: "my-tip" });
     await map.whenReady();
+
+    // First: a layer with real content — proves the custom class is applied and the
+    // default inline look (background) is absent (className branch skips it).
+    map.layer("cells", [sqPoly(0, 0, 20)], {
+      fill: "#00f", id: () => "c1",
+      tooltip: () => "x",
+    });
+    map.render();
+    pointer(host, "pointermove", 108, 91);
+    const tip = host.querySelector(".d3gl-tooltip") as HTMLDivElement;
+    expect(tip).toBeTruthy();
+    expect(tip.style.display).not.toBe("none");
+    expect(tip.classList.contains("my-tip")).toBe(true);
+    expect(tip.style.background).toBe(""); // className branch: no inline background
+
+    // Second: re-declare with null accessor — verify the tooltip hides.
+    // Re-declaring the layer calls dropInteractionState which hides any stale tip,
+    // and the next pointermove onto the same target shows null → stays hidden.
     map.layer("cells", [sqPoly(0, 0, 20)], {
       fill: "#00f", id: () => "c1",
       tooltip: () => null,
     });
     map.render();
     pointer(host, "pointermove", 108, 91);
-    const tip = host.querySelector(".d3gl-tooltip") as HTMLDivElement | null;
-    // null content: tooltip never shown (element may not even exist yet).
-    expect(tip?.style.display ?? "none").toBe("none");
+    // null content: engine hides the tip (element exists from the first show).
+    expect(tip.style.display).toBe("none");
+
     map.destroy();
     host.remove();
   });

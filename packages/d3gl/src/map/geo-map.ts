@@ -59,7 +59,8 @@ export interface LayerOptions<F = any> {
    *  a tiny overlay layer — O(hovered item) per change, the base layer is untouched. */
   hover?: HoverOption<F>;
   /** Hover tooltip content for this layer (null hides). Shown in a shared
-   *  engine-managed div — see GeoMapOptions.tooltipClass for styling. */
+   *  engine-managed div — see GeoMapOptions.tooltipClass for styling.
+   *  Content is re-evaluated only when the hovered target changes; re-declare the layer to force a refresh. */
   tooltip?: (f: F, id: string | number) => string | HTMLElement | null;
 }
 

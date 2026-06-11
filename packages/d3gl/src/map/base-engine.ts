@@ -505,6 +505,10 @@ export abstract class BaseEngine {
     // pointer often hasn't moved when a layer is re-declared on a data update).
     if (this.lastHover?.layer === name) this.lastHover = null;
     if (this.autoHover === name) this.autoHover = null;
+    // A re-declared layer may carry new tooltip content; hide any stale tip immediately
+    // rather than leaving it visible until the next pointer event (unbounded dwell time
+    // on a stationary mouse when the layer is re-declared on a background data push).
+    this.tooltipEl?.hide();
   }
   setClip(name: string, clipTo?: string): this {
     const spec = this.specs.find((s) => s.name === name);
@@ -716,7 +720,7 @@ export abstract class BaseEngine {
       this.applyAutoHover(hit);
       this.updateTooltip(hit);
     }
-    this.tooltipEl?.move(e.clientX - r.left, e.clientY - r.top, this.width, this.height);
+    this.tooltipEl?.move(e.clientX - r.left, e.clientY - r.top);
   };
 
   /** Show the hover-option highlight for the picked drawable; clear the previous one.

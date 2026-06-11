@@ -3,6 +3,12 @@
  *  given (then styling is entirely the caller's). Always carries `d3gl-tooltip`. */
 export class Tooltip {
   private el: HTMLDivElement | null = null;
+  /** Cached box dimensions — measured once in show() after content + display:block are
+   *  set (forced reflow there is unavoidable) so move() on every pointermove can use
+   *  them without touching offsetWidth/Height again and triggering a second reflow.
+   *  Reset to 0 when hidden so a stale size never persists across content changes. */
+  private w = 0;
+  private h = 0;
   constructor(private readonly host: HTMLElement, private readonly className?: string) {}
 
   private ensure(): HTMLDivElement {
@@ -31,16 +37,29 @@ export class Tooltip {
     if (typeof content === "string") el.textContent = content;
     else el.replaceChildren(content);
     el.style.display = "block";
+    // Measure now, while the reflow is already dirty from the display write above.
+    // Dimensions only change with content, not with pointer position, so caching here
+    // lets move() skip offsetWidth/Height on every pointermove (per-move reflow avoidance).
+    this.w = el.offsetWidth;
+    this.h = el.offsetHeight;
   }
 
-  /** Position near host-relative (x, y) with a 12px offset, clamped into the host. */
-  move(x: number, y: number, hostW: number, hostH: number): void {
+  /** Position near host-relative (x, y) with a 12px offset, clamped into the host.
+   *  Reads host.clientWidth/clientHeight so the clamp tracks the CSS size correctly
+   *  under responsive layouts where the host may differ from the engine's logical size. */
+  move(x: number, y: number): void {
     if (!this.el || this.el.style.display === "none") return;
-    const w = this.el.offsetWidth, h = this.el.offsetHeight;
-    this.el.style.left = `${Math.max(0, Math.min(x + 12, hostW - w))}px`;
-    this.el.style.top = `${Math.max(0, Math.min(y + 12, hostH - h))}px`;
+    const hostW = this.host.clientWidth;
+    const hostH = this.host.clientHeight;
+    // Fall back to unclamped position when the host is detached (clientWidth/Height = 0).
+    const left = hostW > 0 ? Math.max(0, Math.min(x + 12, hostW - this.w)) : x + 12;
+    const top  = hostH > 0 ? Math.max(0, Math.min(y + 12, hostH - this.h)) : y + 12;
+    this.el.style.left = `${left}px`;
+    this.el.style.top  = `${top}px`;
   }
 
-  hide(): void { if (this.el) this.el.style.display = "none"; }
+  hide(): void {
+    if (this.el) { this.el.style.display = "none"; this.w = 0; this.h = 0; }
+  }
   destroy(): void { this.el?.remove(); this.el = null; }
 }
