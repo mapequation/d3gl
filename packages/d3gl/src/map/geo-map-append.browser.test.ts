@@ -106,6 +106,43 @@ describe("GeoMap incremental append", () => {
     map.destroy();
   });
 
+  it("pick() datum identity: returns the exact feature object (original and appended)", async () => {
+    // Guards the layerIds id→index map built in appendToLayer: a wrong dataStart+j would
+    // silently return the wrong datum object even if the id string looked correct.
+    const host = mount();
+    const map = geoMap(host, { width: 200, height: 200, projection: proj(), backend: "canvas" });
+    await map.whenReady();
+
+    const original: GeoJSON.Feature = {
+      type: "Feature", properties: {}, geometry: { type: "Polygon", coordinates: [[[0,5],[5,5],[5,-5],[0,-5],[0,5]]] },
+    };
+    const appended: GeoJSON.Feature = {
+      type: "Feature", properties: {}, geometry: { type: "Polygon", coordinates: [[[20,5],[25,5],[25,-5],[20,-5],[20,5]]] },
+    };
+
+    const occ = map.layer("occ", [original], {
+      fill: "rgb(255,0,0)",
+      id: (_f, i) => i === 0 ? "orig" : "app",
+    });
+    map.render();
+
+    occ.append(appended);
+    map.render();
+
+    // proj([0,0]) = [100,100] — inside original polygon (lon 0–5, lat -5–5)
+    const hitOrig = map.pick(100, 100);
+    expect(hitOrig?.id).toBe("orig");
+    expect(hitOrig?.datum).toBe(original);
+
+    // proj([22,0]) — inside appended polygon (lon 20–25, lat -5–5)
+    const [ax, ay] = proj()([22, 0])!;
+    const hitApp = map.pick(Math.round(ax), Math.round(ay));
+    expect(hitApp?.id).toBe("app");
+    expect(hitApp?.datum).toBe(appended);
+
+    map.destroy();
+  });
+
   it("canvas draw-on-top: many batches accumulate and survive a zoom redraw", async () => {
     // Exercises CanvasBackend.appendToLayer (draw new on top, no clear) + the stored-
     // layer accumulation that a later full render() (e.g. after zoom) redraws from.
