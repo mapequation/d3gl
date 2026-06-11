@@ -5,6 +5,7 @@ import { createBackend, createCanvasBackend, type BackendType, type BackendHandl
 import { buildBatch, type DrawItem } from "./draw-batch.js";
 import { composeColor, type StyleOverride, type SelectionOptions } from "./style-overrides.js";
 import { HighlightBuilder, resolveHighlight, HIGHLIGHT_SUFFIX, type HighlightStyle, type HighlightDraw, type HoverOption, type PendingColor } from "./highlight.js";
+import { Tooltip } from "./tooltip.js";
 
 export type Accessor<D, T> = T | ((d: D, i: number) => T);
 export interface HoverHit { layer: string; id: string | number; datum: unknown; }
@@ -33,6 +34,8 @@ export interface LayerSpec {
   /** Hover-highlight for this layer: true = default style, a HighlightStyle = replay
    *  with it, a function = custom draw of the hovered item (see HighlightBuilder). */
   hover?: HoverOption;
+  /** Tooltip content for the hovered drawable (string / element / null = hide). */
+  tooltip?: (d: any, id: string | number) => string | HTMLElement | null;
   build: (g: GroupBuilder) => void;   // rebuilds the Scene group (geo or draw)
 }
 
@@ -72,6 +75,9 @@ export abstract class BaseEngine {
   private lastHover: HoverHit | null = null;
   /** Source layer whose hover-option highlight is currently shown (auto, not manual). */
   private autoHover: string | null = null;
+  private tooltipEl: Tooltip | null = null;
+  /** Replaces the tooltip's default inline look when set (e.g. utility classes). */
+  protected tooltipClass?: string;
   /** pointerdown position; a pointerup within CLICK_SLOP px of it is a click. */
   private downAt: [number, number] | null = null;
   /** Max pointer travel (px) between down and up for a click — suppresses pan/rotate drags. */
@@ -153,8 +159,8 @@ export abstract class BaseEngine {
     // its highlight dropped by dropInteractionState first.)
     const active = this.highlights.get(spec.name);
     if (active) this.buildHighlight(spec, active.ids, active.styleOrDraw);
-    // Attach pointer listeners if this layer needs auto-hover (idempotent via same ref).
-    if (spec.hover) this.attachPointer();
+    // Attach pointer listeners if this layer needs auto-hover or tooltip (idempotent via same ref).
+    if (spec.hover || spec.tooltip) this.attachPointer();
     this.pushLayers();
   }
 
@@ -693,6 +699,7 @@ export abstract class BaseEngine {
     this.host.removeEventListener("pointerdown", this.onPointerDown);
     this.host.removeEventListener("pointerup", this.onPointerUp);
     this.host.removeEventListener("pointercancel", this.onPointerCancel);
+    this.tooltipEl?.destroy(); this.tooltipEl = null;
     this.handle?.backend.destroy();
     if (this.handle && this.handle.element !== this.host) this.handle.element.remove();
     this.handle = null;
@@ -700,14 +707,16 @@ export abstract class BaseEngine {
 
   private onPointerMove = (e: PointerEvent): void => {
     if (this.interacting) return; // gesture frames skip picking entirely
-    if (!this.hoverCb && !this.specs.some((s) => s.hover)) return;
+    if (!this.hoverCb && !this.specs.some((s) => s.hover || s.tooltip)) return;
     const r = this.host.getBoundingClientRect();
     const hit = this.pick(e.clientX - r.left, e.clientY - r.top);
     this.hoverCb?.(hit, e);
     if (hit?.layer !== this.lastHover?.layer || hit?.id !== this.lastHover?.id) {
       this.lastHover = hit;
       this.applyAutoHover(hit);
+      this.updateTooltip(hit);
     }
+    this.tooltipEl?.move(e.clientX - r.left, e.clientY - r.top, this.width, this.height);
   };
 
   /** Show the hover-option highlight for the picked drawable; clear the previous one.
@@ -721,15 +730,24 @@ export abstract class BaseEngine {
     this.autoHover = target;
   }
 
+  /** Fill/show or hide the tooltip for the (changed) hover target. */
+  private updateTooltip(hit: HoverHit | null): void {
+    const spec = hit ? this.specs.find((s) => s.name === hit.layer) : undefined;
+    const content = spec?.tooltip ? spec.tooltip(hit!.datum, hit!.id) : null;
+    if (content == null) { this.tooltipEl?.hide(); return; }
+    (this.tooltipEl ??= new Tooltip(this.host, this.tooltipClass)).show(content);
+  }
+
   private onPointerLeave = (e: PointerEvent): void => {
     this.hoverCb?.(null, e);
     this.clearHoverState();
   };
 
-  /** Drop transient hover artifacts (auto-highlight; tooltip in a later task). */
+  /** Drop transient hover artifacts (auto-highlight; tooltip). */
   private clearHoverState(): void {
     this.lastHover = null;
     if (this.autoHover) { this.highlight(this.autoHover, null); this.autoHover = null; }
+    this.tooltipEl?.hide();
   }
   private onPointerDown = (e: PointerEvent): void => { this.downAt = [e.clientX, e.clientY]; };
   /** An interrupted gesture (e.g. setPointerCapture takeover, scroll) must not leave a stale

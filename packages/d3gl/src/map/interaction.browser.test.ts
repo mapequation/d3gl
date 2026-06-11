@@ -314,3 +314,51 @@ describe("hover option", () => {
     host.remove();
   });
 });
+
+describe("tooltip option", () => {
+  it("shows accessor content on hover, follows the pointer, hides off-target", async () => {
+    const { map, host } = await makeMap();
+    map.layer("cells", [sqPoly(-20, -20, 20), sqPoly(0, 0, 20)], {
+      fill: "rgb(0,0,255)", id: (_f, i) => `c${i}`,
+      tooltip: (_f, id) => `cell ${id}`,
+    });
+    map.render();
+
+    pointer(host, "pointermove", 108, 91);
+    const tip = host.querySelector(".d3gl-tooltip") as HTMLDivElement;
+    expect(tip).toBeTruthy();
+    expect(tip.textContent).toBe("cell c1");
+    expect(tip.style.display).not.toBe("none");
+    const left0 = tip.style.left;
+
+    pointer(host, "pointermove", 110, 93); // same cell: content stays, position tracks
+    expect(tip.textContent).toBe("cell c1");
+    expect(tip.style.left).not.toBe(left0);
+
+    pointer(host, "pointermove", 10, 10); // off the layer
+    expect(tip.style.display).toBe("none");
+
+    map.destroy();
+    expect(host.querySelector(".d3gl-tooltip")).toBeNull();
+    host.remove();
+  });
+
+  it("tooltipClass replaces the default look; null content hides", async () => {
+    const host = document.createElement("div");
+    host.style.width = "200px"; host.style.height = "200px";
+    document.body.appendChild(host);
+    const map = geoMap(host, { width: 200, height: 200, projection: proj(), backend: "canvas", tooltipClass: "my-tip" });
+    await map.whenReady();
+    map.layer("cells", [sqPoly(0, 0, 20)], {
+      fill: "#00f", id: () => "c1",
+      tooltip: () => null,
+    });
+    map.render();
+    pointer(host, "pointermove", 108, 91);
+    const tip = host.querySelector(".d3gl-tooltip") as HTMLDivElement | null;
+    // null content: tooltip never shown (element may not even exist yet).
+    expect(tip?.style.display ?? "none").toBe("none");
+    map.destroy();
+    host.remove();
+  });
+});

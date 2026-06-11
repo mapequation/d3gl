@@ -16,6 +16,8 @@ export interface GeoMapOptions {
   /** Which renderer to draw with — see {@link BackendType}. Defaults to `"webgl"`.
    *  Use `"auto"` for an instant Canvas first paint that upgrades to WebGL in the background. */
   backend?: BackendType;
+  /** Class(es) for the hover tooltip box, replacing its default inline look. */
+  tooltipClass?: string;
 }
 export interface LayerOptions<F = any> {
   fill?: string | ((f: F, i: number) => string);
@@ -56,6 +58,9 @@ export interface LayerOptions<F = any> {
    *  hovered item with it, or a custom (datum, HighlightBuilder) draw fn. Rendered in
    *  a tiny overlay layer — O(hovered item) per change, the base layer is untouched. */
   hover?: HoverOption<F>;
+  /** Hover tooltip content for this layer (null hides). Shown in a shared
+   *  engine-managed div — see GeoMapOptions.tooltipClass for styling. */
+  tooltip?: (f: F, id: string | number) => string | HTMLElement | null;
 }
 
 /** Options for {@link GeoMap.enableRotation}. */
@@ -84,6 +89,7 @@ export class GeoMap extends BaseEngine {
     super(host, opts.width, opts.height, opts.backend ?? "webgl");
     this.projection = opts.projection;
     this.baseScale = opts.projection.scale();
+    this.tooltipClass = opts.tooltipClass;
   }
 
   layer<F>(name: string, features: F | readonly F[] | (() => readonly F[]), opts: LayerOptions<F> = {}): LayerHandle<F> {
@@ -293,7 +299,7 @@ export class GeoMap extends BaseEngine {
     return {
       name, data: list, ids, fill: opts.fill, stroke: opts.stroke, clipTo: opts.clipTo,
       sizeMode: opts.sizeMode, hideOnInteraction: opts.hideOnInteraction, pickable: opts.pickable,
-      selection: opts.selection, hover: opts.hover,
+      selection: opts.selection, hover: opts.hover, tooltip: opts.tooltip,
       build: geoLayer(list, this.projection, { id: (_f, i) => ids[i]!, lineWidth: opts.lineWidth, lineJoin: opts.lineJoin, miterLimit: opts.miterLimit, lineCap: opts.lineCap, pointRadius: opts.pointRadius, sizeMode: opts.sizeMode }),
     };
   }
