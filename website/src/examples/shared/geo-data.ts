@@ -9,7 +9,7 @@ export interface Cell {
   geometry: Polygon;
   /** Cell centroid [lon, lat]. */
   center: [number, number];
-  /** Continuous field in [0, 1] (heatmap). */
+  /** Continuous field in [0, 1] (value field). */
   value: number;
   /** Categorical bioregion id in 0..7. */
   bioregion: number;
