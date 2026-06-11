@@ -169,6 +169,11 @@ describe("select", () => {
     expect(pixelAt(host, 108, 91)[3]).toBe(255);          // selected: base style
     expect(pixelAt(host, 91, 109)[3]).toBeLessThan(110);  // other: dimmed
 
+    // select-then-select (no intervening null): dimming flips to the new set
+    map.select("cells", ["c0"]);
+    expect(pixelAt(host, 91, 109)[3]).toBe(255);          // c0 now selected: full alpha
+    expect(pixelAt(host, 108, 91)[3]).toBeLessThan(110);  // c1 now other: dimmed
+
     map.select("cells", null);
     expect(pixelAt(host, 91, 109)[3]).toBe(255);
 
@@ -181,6 +186,56 @@ describe("select", () => {
     map.select("cells2", () => true);
     // proj([50,-10]) ≈ [143.6, 108.7]
     expect([...pixelAt(host, 143, 108)].slice(0, 3)).toEqual([255, 0, 0]);
+    map.destroy();
+    host.remove();
+  });
+});
+
+describe("highlight", () => {
+  it("draws the highlighted item on top without touching the base layer; null clears", async () => {
+    const { map, host } = await makeMap();
+    addCells(map);
+    map.highlight("cells", "c1", { fill: "rgb(0,255,0)" });
+    expect([...pixelAt(host, 108, 91)].slice(0, 3)).toEqual([0, 255, 0]);
+    expect([...pixelAt(host, 91, 109)].slice(0, 3)).toEqual([255, 0, 0]); // base untouched
+
+    map.highlight("cells", null);
+    expect([...pixelAt(host, 108, 91)].slice(0, 3)).toEqual([0, 0, 255]);
+    map.destroy();
+    host.remove();
+  });
+
+  it("array of ids; overlay inherits clipTo; survives a transform re-push", async () => {
+    const { map, host } = await makeMap();
+    map.layer("land", [sqPoly(0, 0, 20)], { fill: "#eee" });
+    map.layer("cells", [sqPoly(-20, -20, 20), sqPoly(0, 0, 20)], {
+      fill: "rgb(0,0,255)", id: (_f, i) => `c${i}`, clipTo: "land",
+    });
+    map.render();
+    map.highlight("cells", ["c0", "c1"], { fill: "rgb(0,255,0)" });
+    expect([...pixelAt(host, 108, 91)].slice(0, 3)).toEqual([0, 255, 0]);
+    // c0's area is outside the land mask: the overlay is clipped there too.
+    expect(pixelAt(host, 91, 109)[3]).toBe(0);
+    // A setClip→pushLayers full re-push must keep the overlay (overlays ride along).
+    map.setClip("cells", "land");
+    expect([...pixelAt(host, 108, 91)].slice(0, 3)).toEqual([0, 255, 0]);
+    map.destroy();
+    host.remove();
+  });
+
+  it("re-resolves against rebuilt geometry on setProjection, drops vanished ids", async () => {
+    const { map, host } = await makeMap();
+    addCells(map);
+    map.highlight("cells", "c1", { fill: "rgb(0,255,0)" });
+    map.setProjection(proj());
+    expect([...pixelAt(host, 108, 91)].slice(0, 3)).toEqual([0, 255, 0]);
+    map.destroy();
+    host.remove();
+  });
+
+  it("rejects user layer names ending in :highlight", async () => {
+    const { map, host } = await makeMap();
+    expect(() => map.layer("bad:highlight", [sqPoly(0, 0, 10)], {})).toThrow(/reserved/);
     map.destroy();
     host.remove();
   });

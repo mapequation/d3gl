@@ -90,7 +90,8 @@ export class HighlightBuilder {
     });
   }
 
-  /** Record an arbitrary path (standard PathContext: moveTo/lineTo/arc/rect/…). */
+  /** Record an arbitrary path (standard PathContext: moveTo/lineTo/arc/rect/…).
+   *  Note: a stroke is only visible when `style.lineWidth > 0` (backends suppress zero-width strokes). */
   path(draw: (ctx: PathContext) => void, style: HighlightStyle = {}): void {
     const id = this.nextId("p");
     this.g.drawable(id, draw, { lineWidth: style.lineWidth ?? 0 });

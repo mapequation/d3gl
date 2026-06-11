@@ -4,6 +4,7 @@ import { Scene, HitIndex, type Backend, type GroupBuilder, type RenderLayer, typ
 import { createBackend, createCanvasBackend, type BackendType, type BackendHandle } from "./backend-factory.js";
 import { buildBatch, type DrawItem } from "./draw-batch.js";
 import { composeColor, type StyleOverride, type SelectionOptions } from "./style-overrides.js";
+import { HighlightBuilder, resolveHighlight, HIGHLIGHT_SUFFIX, type HighlightStyle, type HighlightDraw, type HoverOption, type PendingColor } from "./highlight.js";
 
 export type Accessor<D, T> = T | ((d: D, i: number) => T);
 export interface HoverHit { layer: string; id: string | number; datum: unknown; }
@@ -29,6 +30,9 @@ export interface LayerSpec {
   pickable?: boolean;
   /** Styles applied by {@link BaseEngine.select} to the selected set / its complement. */
   selection?: SelectionOptions;
+  /** Hover-highlight for this layer: true = default style, a HighlightStyle = replay
+   *  with it, a function = custom draw of the hovered item (see HighlightBuilder). */
+  hover?: HoverOption;
   build: (g: GroupBuilder) => void;   // rebuilds the Scene group (geo or draw)
 }
 
@@ -56,6 +60,8 @@ export abstract class BaseEngine {
    *  Survive rebuilds (reapplied after applyAccessors); dropped when the layer is
    *  re-declared via layer() (its ids may change). */
   private styleOverrides = new Map<string, Map<string | number, StyleOverride>>();
+  /** Active highlight per source layer; re-resolved after a rebuild re-projects geometry. */
+  private highlights = new Map<string, { ids: (string | number)[]; styleOrDraw?: HighlightStyle | HighlightDraw }>();
   protected transform: ViewTransform = { k: 1, x: 0, y: 0 };
   protected handle: BackendHandle | null = null;
   protected ready: Promise<void>;
@@ -118,6 +124,7 @@ export abstract class BaseEngine {
 
   /** Register/replace a layer: build its Scene group, apply accessors, index, push. */
   protected registerLayer(spec: LayerSpec): void {
+    if (spec.name.endsWith(HIGHLIGHT_SUFFIX)) throw new Error(`layer name suffix "${HIGHLIGHT_SUFFIX}" is reserved`);
     this.scene.group(spec.name, spec.build);
     this.applyAccessors(spec);
     this.reapplyOverrides(spec); // rebuilds (rotation/projection) keep overrides
@@ -132,6 +139,11 @@ export abstract class BaseEngine {
     // register/rebuild is already O(total); appends then stay O(new)). Raw ids (no
     // String()) so numeric-id layers don't allocate a string per drawable.
     this.layerIds.set(spec.name, new Map(spec.ids.map((id, i) => [id, i])));
+    // A rebuild (rotation/projection) re-projected the source geometry: rebuild the
+    // overlay from the stored ids so the highlight tracks it. (A re-DECLARED layer had
+    // its highlight dropped by dropInteractionState first.)
+    const active = this.highlights.get(spec.name);
+    if (active) this.buildHighlight(spec, active.ids, active.styleOrDraw);
     this.pushLayers();
   }
 
@@ -343,6 +355,85 @@ export abstract class BaseEngine {
     return this;
   }
 
+  /**
+   * Highlight one drawable / a set of drawables of `name` by drawing them into a tiny
+   * internal overlay layer on top (inheriting the source's clipTo/sizeMode) — the base
+   * layer's buffers are untouched, so the per-change cost is tessellating the
+   * highlighted items only. `styleOrDraw` falls back to the layer's `hover` option,
+   * then to the default white outline. `null` clears.
+   */
+  highlight(
+    name: string,
+    idOrIds: string | number | readonly (string | number)[] | null,
+    styleOrDraw?: HighlightStyle | HighlightDraw,
+  ): this {
+    const spec = this.specs.find((s) => s.name === name);
+    if (!spec) return this;
+    if (idOrIds == null) {
+      if (!this.highlights.delete(name)) return this; // nothing shown: keep it a no-op
+      this.buildHighlight(spec, []);
+      this.pushHighlight(spec);
+      return this;
+    }
+    const ids = Array.isArray(idOrIds) ? [...idOrIds] : [idOrIds as string | number];
+    this.highlights.set(name, { ids, styleOrDraw });
+    this.buildHighlight(spec, ids, styleOrDraw);
+    this.pushHighlight(spec);
+    return this;
+  }
+
+  /** (Re)build the overlay group for `spec` from already-projected Scene geometry. */
+  private buildHighlight(spec: LayerSpec, ids: readonly (string | number)[], styleOrDraw?: HighlightStyle | HighlightDraw): void {
+    const hlName = spec.name + HIGHLIGHT_SUFFIX;
+    const colors: PendingColor[] = [];
+    const index = this.layerIds.get(spec.name);
+    this.scene.group(hlName, (g) => {
+      for (const id of ids) {
+        const d = this.scene.drawableOf(spec.name, id);
+        if (!d) continue; // unknown or culled id: nothing to highlight
+        const b = new HighlightBuilder(g, d, colors);
+        const draw = resolveHighlight(styleOrDraw ?? spec.hover);
+        const i = index?.get(id) ?? -1;
+        draw(i >= 0 ? spec.data[i] : null, b);
+      }
+    });
+    // Colors must wait for the group build to commit (Scene.setFill resolves the group).
+    for (const c of colors) {
+      if (c.fill) this.scene.setFill(hlName, c.id, c.fill);
+      if (c.stroke) this.scene.setStroke(hlName, c.id, c.stroke);
+    }
+  }
+
+  /** Push one overlay layer (tiny buffers — O(highlighted items), not O(layer)). */
+  private pushHighlight(spec: LayerSpec): void {
+    const backend = this.handle?.backend;
+    if (!backend) return; // pre-install: installBackend pushes overlays with setLayers
+    backend.updateLayer(spec.name + HIGHLIGHT_SUFFIX, this.overlayRenderLayer(spec));
+    this.render();
+  }
+
+  private overlayRenderLayer(spec: LayerSpec): RenderLayer {
+    const hlName = spec.name + HIGHLIGHT_SUFFIX;
+    return { name: hlName, buffers: this.scene.buffers(hlName), drawables: this.scene.drawables(hlName), clipTo: spec.clipTo, sizeMode: spec.sizeMode };
+  }
+
+  /** Overlay layers to render after all user layers (skipping hidden-mid-gesture sources). */
+  private overlayRenderLayers(): RenderLayer[] {
+    const out: RenderLayer[] = [];
+    for (const name of this.highlights.keys()) {
+      const spec = this.specs.find((s) => s.name === name);
+      if (!spec || (this.interacting && spec.hideOnInteraction)) continue;
+      out.push(this.overlayRenderLayer(spec));
+    }
+    return out;
+  }
+
+  /** Everything the backend should draw: user layers in declaration order, then
+   *  highlight overlays on top. */
+  private allRenderLayers(): RenderLayer[] {
+    return [...this.renderSpecs().map((s) => this.renderLayer(s)), ...this.overlayRenderLayers()];
+  }
+
   /** Recompose + write the effective colors for `ids`: base accessor value with the
    *  current override (if any) applied. Ids without a drawable (culled) are skipped.
    *  When neither base nor override exists, composeColor returns null; we write
@@ -384,10 +475,11 @@ export abstract class BaseEngine {
     this.render();
   }
 
-  /** Forget per-layer interaction state (overrides; later: highlights). Called when a
+  /** Forget per-layer interaction state (overrides, highlights). Called when a
    *  layer is RE-DECLARED (its ids may change) — not on a rebuild of the same data. */
   protected dropInteractionState(name: string): void {
     this.styleOverrides.delete(name);
+    this.highlights.delete(name);
   }
   setClip(name: string, clipTo?: string): this {
     const spec = this.specs.find((s) => s.name === name);
@@ -634,7 +726,7 @@ export abstract class BaseEngine {
     return this.specs.filter((s) => !(this.interacting && s.hideOnInteraction));
   }
   private pushLayers(): void {
-    this.handle?.backend.setLayers(this.renderSpecs().map((s) => this.renderLayer(s)));
+    this.handle?.backend.setLayers(this.allRenderLayers());
     this.handle?.backend.setTransform(this.transform);
     this.render();
     // render() above clears the canvas and redraws ONLY the retained layers — it has no
@@ -688,7 +780,7 @@ export abstract class BaseEngine {
     if (old && old.element !== this.host) old.element.remove();
     this.handle = next;
     this.currentBackend = type;
-    next.backend.setLayers(this.renderSpecs().map((s) => this.renderLayer(s)));
+    next.backend.setLayers(this.allRenderLayers());
     next.backend.setTransform(this.transform);
     next.backend.render();
     // Replay retained pass-through layers onto the freshly-installed backend (mirrors the
