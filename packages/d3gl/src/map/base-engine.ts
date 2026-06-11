@@ -45,10 +45,10 @@ export abstract class BaseEngine {
   protected hitIndexes = new Map<string, HitIndex>();
   /** Pass-through layers: no Scene entry, no retained geometry. */
   protected ptSpecs = new Map<string, PassThroughSpec>();
-  /** Per-layer set of drawable ids (as strings), maintained incrementally so an
-   *  append's duplicate-id check stays O(new) instead of rebuilding a Set of every
-   *  existing id each batch (which made streaming O(total)/batch). */
-  private layerIds = new Map<string, Set<string | number>>();
+  /** Per-layer id → datum index, maintained incrementally so an append's duplicate-id
+   *  check stays O(new) (not O(total)/batch) AND so pick()/restyle resolve a datum
+   *  index in O(1) instead of spec.ids.indexOf (O(n) per pointer move). */
+  private layerIds = new Map<string, Map<string | number, number>>();
   protected transform: ViewTransform = { k: 1, x: 0, y: 0 };
   protected handle: BackendHandle | null = null;
   protected ready: Promise<void>;
@@ -115,10 +115,10 @@ export abstract class BaseEngine {
     // non-interactive layers. pick() simply can't return that layer (get()?.pick → skip).
     if (spec.pickable !== false) this.hitIndexes.set(spec.name, new HitIndex(this.scene.drawables(spec.name)));
     else this.hitIndexes.delete(spec.name);
-    // Seed the incremental id set from the full (re)built spec (O(total) here, but a
+    // Seed the incremental id map from the full (re)built spec (O(total) here, but a
     // register/rebuild is already O(total); appends then stay O(new)). Raw ids (no
     // String()) so numeric-id layers don't allocate a string per drawable.
-    this.layerIds.set(spec.name, new Set(spec.ids));
+    this.layerIds.set(spec.name, new Map(spec.ids.map((id, i) => [id, i])));
     this.pushLayers();
   }
 
@@ -216,7 +216,7 @@ export abstract class BaseEngine {
     // Validate against the PERSISTENT id set (O(new)); a from-scratch
     // `new Set(spec.ids…)` here would be O(total) every batch and make streaming
     // quadratic. Don't mutate the set until validation passes (keeps append atomic).
-    const existing = this.layerIds.get(name) ?? new Set(spec.ids);
+    const existing = this.layerIds.get(name) ?? new Map(spec.ids.map((id, i) => [id, i]));
     const seen = new Set<string | number>();
     for (const id of ids) {
       if (existing.has(id) || seen.has(id)) throw new Error(`duplicate drawable id: ${String(id)}`);
@@ -229,7 +229,7 @@ export abstract class BaseEngine {
     // to 1M) exceeds the argument-count limit and throws RangeError. Loop instead.
     for (const it of items) spec.data.push(it);
     for (const id of ids) spec.ids.push(id);
-    for (const key of seen) existing.add(key); // commit ids to the persistent set
+    ids.forEach((id, j) => existing.set(id, dataStart + j)); // commit ids to the persistent map
     this.layerIds.set(name, existing);
     // Which appended ids actually produced a drawable (culling may drop some)?
     // (DrawableVector copies its color into a fresh tuple at read time, so we must
@@ -432,7 +432,7 @@ export abstract class BaseEngine {
       const spec = this.specs[i]!;
       const id = this.hitIndexes.get(spec.name)?.pick(px, py);
       if (id != null) {
-        const di = spec.ids.indexOf(id);
+        const di = this.layerIds.get(spec.name)?.get(id) ?? -1;
         return { layer: spec.name, id, datum: di >= 0 ? spec.data[di] : null };
       }
     }
