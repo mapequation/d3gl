@@ -139,3 +139,19 @@ describe("on(click)", () => {
     host.remove();
   });
 });
+
+describe("clip-aware pick", () => {
+  it("a clipped layer only hits where its clip source is also hit", async () => {
+    const { map, host } = await makeMap();
+    // "land" mask covers only the c1 square's area; cells cover both squares.
+    map.layer("land", [sqPoly(0, 0, 20)], { fill: "#eee" });
+    map.layer("cells", [sqPoly(-20, -20, 20), sqPoly(0, 0, 20)], {
+      fill: "rgb(0,0,255)", id: (_f, i) => `c${i}`, clipTo: "land",
+    });
+    map.render();
+    expect(map.pick(108, 91)?.id).toBe("c1"); // on the mask: cell hit
+    expect(map.pick(91, 109)).toBeNull();     // c0 is clipped away entirely → no hit at all
+    map.destroy();
+    host.remove();
+  });
+});

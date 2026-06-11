@@ -520,10 +520,15 @@ export abstract class BaseEngine {
     for (let i = this.specs.length - 1; i >= 0; i--) {
       const spec = this.specs[i]!;
       const id = this.hitIndexes.get(spec.name)?.pick(px, py);
-      if (id != null) {
-        const di = this.layerIds.get(spec.name)?.get(id) ?? -1;
-        return { layer: spec.name, id, datum: di >= 0 ? spec.data[di] : null };
+      if (id == null) continue;
+      // Visually clipped away ⇒ not a hit: with clipTo, the point must also fall on the
+      // clip source's geometry. Skipped when the source has no hit index (pickable:false).
+      if (spec.clipTo) {
+        const clip = this.hitIndexes.get(spec.clipTo);
+        if (clip && clip.pick(px, py) == null) continue;
       }
+      const di = this.layerIds.get(spec.name)?.get(id) ?? -1;
+      return { layer: spec.name, id, datum: di >= 0 ? spec.data[di] : null };
     }
     return null;
   }
