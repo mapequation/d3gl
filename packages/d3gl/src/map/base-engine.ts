@@ -308,8 +308,9 @@ export abstract class BaseEngine {
 
   /** Recompose + write the effective colors for `ids`: base accessor value with the
    *  current override (if any) applied. Ids without a drawable (culled) are skipped.
-   *  When neither base nor override exists, we leave the scene's existing color in place
-   *  (composeColor → null) rather than writing an invalid transparent sentinel. */
+   *  When neither base nor override exists, composeColor returns null; we write
+   *  "transparent" so clearing an override on a layer with no base fill accessor
+   *  correctly restores the transparent default instead of leaving a stale color. */
   private restyle(spec: LayerSpec, ids: readonly (string | number)[]): void {
     const map = this.styleOverrides.get(spec.name);
     const index = this.layerIds.get(spec.name);
@@ -319,9 +320,9 @@ export abstract class BaseEngine {
       const o = map?.get(id) ?? {};
       const d = spec.data[i]!;
       const fill = composeColor(this.resolve(spec.fill, d, i), o.fill, o.opacity);
-      if (fill !== null) this.scene.setFill(spec.name, id, fill);
+      this.scene.setFill(spec.name, id, fill ?? "transparent");
       const stroke = composeColor(this.resolve(spec.stroke, d, i), o.stroke, o.opacity);
-      if (stroke !== null) this.scene.setStroke(spec.name, id, stroke);
+      this.scene.setStroke(spec.name, id, stroke ?? "transparent");
     }
   }
 

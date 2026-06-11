@@ -35,3 +35,41 @@ describe("Scene.styleTables / Scene.drawableOf", () => {
     expect(scene.drawableOf("g", "missing")).toBeNull();
   });
 });
+
+describe("Scene.setFill / writeColor — transparent color handling", () => {
+  const buildScene = (): Scene => {
+    const scene = new Scene();
+    scene.group("g", (g) => {
+      g.drawable("a", (ctx) => ctx.rect(0, 0, 10, 10));
+    });
+    return scene;
+  };
+
+  it('writes [0,0,0,0] for "transparent"', () => {
+    const scene = buildScene();
+    scene.setFill("g", "a", "transparent");
+    const d = scene.drawableOf("g", "a");
+    expect(d?.fill).toEqual([0, 0, 0, 0]);
+  });
+
+  it('writes [0,0,0,0] for "rgba(255, 0, 0, 0)" (fully transparent with non-zero RGB)', () => {
+    const scene = buildScene();
+    scene.setFill("g", "a", "rgba(255, 0, 0, 0)");
+    const d = scene.drawableOf("g", "a");
+    expect(d?.fill).toEqual([0, 0, 0, 0]);
+  });
+
+  it("styleTables also reflects the [0,0,0,0] write", () => {
+    const scene = buildScene();
+    // First set a visible color, then overwrite with transparent.
+    scene.setFill("g", "a", "rgb(255,0,0)");
+    scene.setFill("g", "a", "transparent");
+    const t = scene.styleTables("g");
+    expect([...t.fillColors.slice(0, 4)]).toEqual([0, 0, 0, 0]);
+  });
+
+  it('throws "invalid color" for an unparseable string', () => {
+    const scene = buildScene();
+    expect(() => scene.setFill("g", "a", "not-a-color")).toThrow("invalid color");
+  });
+});

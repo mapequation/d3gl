@@ -476,13 +476,21 @@ function toByte(v: number): number {
 /**
  * Parse a CSS color string into RGBA bytes and write it at drawableId.
  *
- * An unparseable color yields NaN channels from d3-color; we fail fast rather
- * than silently render opaque black, which would mask a typo'd color string.
+ * d3-color parses any FULLY-transparent color ("transparent", "rgba(r,g,b,0)")
+ * to NaN channels with opacity 0 — by design, not a parse failure: all colors with
+ * a <= 0 produce Rgb(NaN, NaN, NaN, 0). We treat that as the zero color [0,0,0,0].
+ * Only NaN opacity (a genuinely unparseable string) is a typo worth failing fast on.
  */
 function writeColor(table: number[], drawableId: number, color: string): void {
   const c = rgb(color);
-  if (Number.isNaN(c.r)) throw new Error(`invalid color: ${color}`);
   const off = drawableId * 4;
+  if (Number.isNaN(c.r)) {
+    // d3-color parses any FULLY-transparent color ("transparent", "rgba(…, 0)") to NaN
+    // channels with opacity 0 — by design, not a parse failure. Accept it as the zero
+    // color; only NaN opacity (an unparseable string) is a typo worth failing fast on.
+    if (c.opacity === 0) { table[off] = table[off + 1] = table[off + 2] = table[off + 3] = 0; return; }
+    throw new Error(`invalid color: ${color}`);
+  }
   table[off] = toByte(c.r);
   table[off + 1] = toByte(c.g);
   table[off + 2] = toByte(c.b);

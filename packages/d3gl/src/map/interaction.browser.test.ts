@@ -75,4 +75,21 @@ describe("setStyle / clearStyle", () => {
     expect(pixelAt(host, 91, 109)[3]).toBe(255);
     map.destroy();
   });
+
+  it("opacity 0 hides; clearStyle restores a layer with no base fill accessor", async () => {
+    const { map, host } = await makeMap();
+    addCells(map);
+    map.setStyle("cells", "c1", { opacity: 0 });
+    expect(pixelAt(host, 108, 91)[3]).toBe(0); // fully transparent, no throw
+
+    // A layer with NO fill accessor: override paints it, clear must restore transparency.
+    map.layer("ghost", [sqPoly(40, -20, 20)], { id: () => "g0" });
+    map.render();
+    expect(pixelAt(host, 143, 108)[3]).toBe(0);
+    map.setStyle("ghost", "g0", { fill: "rgb(0,255,0)" });
+    expect([...pixelAt(host, 143, 108)].slice(0, 3)).toEqual([0, 255, 0]);
+    map.clearStyle("ghost");
+    expect(pixelAt(host, 143, 108)[3]).toBe(0);
+    map.destroy();
+  });
 });
