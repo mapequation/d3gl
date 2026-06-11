@@ -14,6 +14,11 @@ function pixelAt(host: HTMLElement, x: number, y: number): Uint8ClampedArray {
   return canvas.getContext("2d")!.getImageData(x, y, 1, 1).data;
 }
 
+function pointer(host: HTMLElement, type: string, x: number, y: number): void {
+  const r = host.getBoundingClientRect();
+  host.dispatchEvent(new PointerEvent(type, { clientX: r.left + x, clientY: r.top + y, bubbles: true }));
+}
+
 async function makeMap(): Promise<{ map: GeoMap; host: HTMLDivElement }> {
   const host = document.createElement("div");
   host.style.width = "200px"; host.style.height = "200px";
@@ -54,6 +59,7 @@ describe("setStyle / clearStyle", () => {
     expect(pixelAt(host, 91, 109)[3]).toBe(255);
     expect([...pixelAt(host, 108, 91)].slice(0, 3)).toEqual([0, 0, 255]);
     map.destroy();
+    host.remove();
   });
 
   it("overrides survive setProjection, and recolor() reapplies them over fresh accessors", async () => {
@@ -65,6 +71,7 @@ describe("setStyle / clearStyle", () => {
     map.recolor("cells");
     expect(pixelAt(host, 91, 109)[3]).toBeLessThan(110);
     map.destroy();
+    host.remove();
   });
 
   it("re-declaring the layer drops its overrides", async () => {
@@ -74,6 +81,7 @@ describe("setStyle / clearStyle", () => {
     addCells(map); // map.layer(...) again
     expect(pixelAt(host, 91, 109)[3]).toBe(255);
     map.destroy();
+    host.remove();
   });
 
   it("opacity 0 hides; clearStyle restores a layer with no base fill accessor", async () => {
@@ -91,5 +99,29 @@ describe("setStyle / clearStyle", () => {
     map.clearStyle("ghost");
     expect(pixelAt(host, 143, 108)[3]).toBe(0);
     map.destroy();
+    host.remove();
+  });
+});
+
+describe("on(click)", () => {
+  it("fires with the picked hit on a stationary click; a drag does not fire", async () => {
+    const { map, host } = await makeMap();
+    addCells(map);
+    const clicks: ({ layer: string; id: string | number } | null)[] = [];
+    map.on("click", (hit) => clicks.push(hit ? { layer: hit.layer, id: hit.id } : null));
+
+    pointer(host, "pointerdown", 108, 91);
+    pointer(host, "pointerup", 108, 91);
+    expect(clicks).toEqual([{ layer: "cells", id: "c1" }]);
+
+    pointer(host, "pointerdown", 108, 91);
+    pointer(host, "pointerup", 130, 110); // > 4px travel: a drag, not a click
+    expect(clicks.length).toBe(1);
+
+    pointer(host, "pointerdown", 10, 10); // empty space
+    pointer(host, "pointerup", 10, 10);
+    expect(clicks[1]).toBeNull();
+    map.destroy();
+    host.remove();
   });
 });

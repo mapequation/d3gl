@@ -59,6 +59,11 @@ export abstract class BaseEngine {
   protected ready: Promise<void>;
   private currentBackend: BackendType;
   private hoverCb: ((hit: HoverHit | null, ev: PointerEvent) => void) | null = null;
+  private clickCb: ((hit: HoverHit | null, ev: PointerEvent) => void) | null = null;
+  /** pointerdown position; a pointerup within CLICK_SLOP px of it is a click. */
+  private downAt: [number, number] | null = null;
+  /** Max pointer travel (px) between down and up for a click — suppresses pan/rotate drags. */
+  private static CLICK_SLOP = 4;
   private swapToken = 0;
   private destroyed = false;
   /** "auto" mode only: the WebGL upgrade promise (in-flight, then settled). Null until
@@ -494,11 +499,15 @@ export abstract class BaseEngine {
     this.interactionCleanup = () => { (sel as any).on(".zoom", null); };
     return this;
   }
-  on(event: "hover", cb: (hit: HoverHit | null, ev: PointerEvent) => void): this {
+  on(event: "hover" | "click", cb: (hit: HoverHit | null, ev: PointerEvent) => void): this {
     if (event === "hover") {
       this.hoverCb = cb;
       this.host.addEventListener("pointermove", this.onPointerMove);
       this.host.addEventListener("pointerleave", this.onPointerLeave);
+    } else if (event === "click") {
+      this.clickCb = cb;
+      this.host.addEventListener("pointerdown", this.onPointerDown);
+      this.host.addEventListener("pointerup", this.onPointerUp);
     }
     return this;
   }
@@ -530,6 +539,8 @@ export abstract class BaseEngine {
     this.swapToken++;
     this.host.removeEventListener("pointermove", this.onPointerMove);
     this.host.removeEventListener("pointerleave", this.onPointerLeave);
+    this.host.removeEventListener("pointerdown", this.onPointerDown);
+    this.host.removeEventListener("pointerup", this.onPointerUp);
     this.handle?.backend.destroy();
     if (this.handle && this.handle.element !== this.host) this.handle.element.remove();
     this.handle = null;
@@ -541,6 +552,15 @@ export abstract class BaseEngine {
     this.hoverCb(this.pick(e.clientX - r.left, e.clientY - r.top), e);
   };
   private onPointerLeave = (e: PointerEvent): void => { this.hoverCb?.(null, e); };
+  private onPointerDown = (e: PointerEvent): void => { this.downAt = [e.clientX, e.clientY]; };
+  private onPointerUp = (e: PointerEvent): void => {
+    const d = this.downAt;
+    this.downAt = null;
+    if (!d || !this.clickCb) return;
+    if (Math.hypot(e.clientX - d[0], e.clientY - d[1]) > BaseEngine.CLICK_SLOP) return;
+    const r = this.host.getBoundingClientRect();
+    this.clickCb(this.pick(e.clientX - r.left, e.clientY - r.top), e);
+  };
   private resolve<T>(a: Accessor<any, T> | undefined, d: any, i: number): T | undefined {
     return typeof a === "function" ? (a as (d: any, i: number) => T)(d, i) : a;
   }
