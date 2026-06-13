@@ -1,5 +1,5 @@
 import type { GroupBuilder, PathContext, LineJoin, LineCap } from "../core/index.js";
-import { BaseEngine } from "./base-engine.js";
+import { BaseEngine, type InteractiveLayerOptions } from "./base-engine.js";
 import type { BackendType } from "./backend-factory.js";
 import { LayerHandle } from "./layer-handle.js";
 
@@ -10,7 +10,7 @@ export interface PlotOptions {
    *  Use `"auto"` for an instant Canvas first paint that upgrades to WebGL in the background. */
   backend?: BackendType;
 }
-export interface PlotLayerOptions<D = any> {
+export interface PlotLayerOptions<D = any> extends InteractiveLayerOptions<D> {
   /**
    * Draw one datum's geometry by emitting path commands. The context is typed as
    * `CanvasRenderingContext2D` so d3 generators that render to a context —
@@ -50,7 +50,7 @@ export interface PlotLayerOptions<D = any> {
   pickable?: boolean;
 }
 
-export interface PlotPointOptions<D = any> {
+export interface PlotPointOptions<D = any> extends InteractiveLayerOptions<D> {
   x: (d: D, i: number) => number;
   y: (d: D, i: number) => number;
   radius?: number | ((d: D, i: number) => number);
@@ -80,12 +80,14 @@ export class Plot extends BaseEngine {
     const list = data as D[];
     const ids = list.map((d, i) => (opts.id ? opts.id(d, i) : i));
     this.dropInteractionState(name); // a re-declared layer starts with base styles
-    this.registerLayer({ name, data: list, ids, fill: opts.fill, stroke: opts.stroke, clipTo: opts.clipTo, sizeMode: opts.sizeMode, declutter: opts.declutter, pickable: opts.pickable, build: this.buildDrawables(list, ids, 0, opts) });
+    this.registerLayer({ name, data: list, ids, fill: opts.fill, stroke: opts.stroke, clipTo: opts.clipTo, sizeMode: opts.sizeMode, declutter: opts.declutter, pickable: opts.pickable, ...this.interactionFields(opts), build: this.buildDrawables(list, ids, 0, opts) });
     return new LayerHandle<D>(this, name, (items) => this.appendDrawables(name, items, opts));
   }
 
   points<D>(name: string, data: readonly D[] | (() => readonly D[]), opts: PlotPointOptions<D>): LayerHandle<D> {
     if (opts.passThrough) {
+      if (opts.hover || opts.tooltip || opts.selection)
+        throw new Error("hover/tooltip/selection require a retained layer (passThrough layers are not pickable)");
       const radius = opts.radius ?? 3;
       const radiusOf = typeof radius === "function"
         ? (d: D, i: number) => (radius as (d: D, i: number) => number)(d, i)
@@ -112,7 +114,7 @@ export class Plot extends BaseEngine {
     const list = data as D[];
     const ids = list.map((d, i) => (opts.id ? opts.id(d, i) : i));
     this.dropInteractionState(name); // a re-declared layer starts with base styles
-    this.registerLayer({ name, data: list, ids, fill: opts.fill, stroke: opts.stroke, clipTo: opts.clipTo, sizeMode: opts.sizeMode, pickable: opts.pickable, build: this.buildPoints(list, ids, 0, opts) });
+    this.registerLayer({ name, data: list, ids, fill: opts.fill, stroke: opts.stroke, clipTo: opts.clipTo, sizeMode: opts.sizeMode, pickable: opts.pickable, ...this.interactionFields(opts), build: this.buildPoints(list, ids, 0, opts) });
     return new LayerHandle<D>(this, name, (items) => this.appendPoints(name, items, opts));
   }
 

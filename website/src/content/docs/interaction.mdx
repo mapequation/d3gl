@@ -3,6 +3,12 @@ title: Interaction
 description: Hover, tooltips, highlight, click selection, and per-drawable style overrides — and what each one costs.
 ---
 
+Everything on this page is implemented once on the shared base of both engines (`BaseEngine`),
+so it works identically on [`geoMap()`](/d3gl/reference/map/classes/geomap/) and
+[`plot()`](/d3gl/reference/map/classes/plot/) — see [Engines](/d3gl/engines/). The examples use
+`map`, but read identically for a `plot` instance: `map.on("hover", …)`, the declarative `hover`
+/ `tooltip` / `selection` layer options, `select()`, and `setStyle()` are all the same call.
+
 Retained layers are pickable by default (a CPU hit index per layer; disable with
 `pickable: false`). Picking is **clip-aware**: a layer with `clipTo` only hits where its
 clip source is also hit, so interaction matches what is visibly painted.

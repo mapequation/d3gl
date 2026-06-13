@@ -3,12 +3,12 @@ title: Streaming data
 description: Append points and polygons live with LayerHandle.append — only new features project, existing ones stay put.
 ---
 
-import ExampleCard from "../../../../components/ExampleCard.astro";
-import StreamingPoints from "../../../../examples/streaming-points/StreamingPoints.tsx";
-import StreamingPolygons from "../../../../examples/streaming-polygons/StreamingPolygons.tsx";
-import StreamingScatter from "../../../../examples/streaming-scatter/StreamingScatter.tsx";
-import StreamingPassthrough from "../../../../examples/streaming-passthrough/StreamingPassthrough.tsx";
-import StreamingPassthroughPolygons from "../../../../examples/streaming-passthrough-polygons/StreamingPassthroughPolygons.tsx";
+import ExampleCard from "../../../components/ExampleCard.astro";
+import StreamingPoints from "../../../examples/streaming-points/StreamingPoints.tsx";
+import StreamingPolygons from "../../../examples/streaming-polygons/StreamingPolygons.tsx";
+import StreamingScatter from "../../../examples/streaming-scatter/StreamingScatter.tsx";
+import StreamingPassthrough from "../../../examples/streaming-passthrough/StreamingPassthrough.tsx";
+import StreamingPassthroughPolygons from "../../../examples/streaming-passthrough-polygons/StreamingPassthroughPolygons.tsx";
 
 `layer.append(batch)` streams new features into an existing layer **without re-projecting
 the features already on screen** — the key to live data like species occurrences. Points

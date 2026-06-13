@@ -2,10 +2,8 @@ import { type GeoProjection, geoPath } from "d3-geo";
 import { geoLayer, projectVisiblePoint } from "../geo/index.js";
 import { PathRecorder } from "../core/index.js";
 import versor, { type Angles, type Vec3, type Quaternion } from "../geo/versor.js";
-import { BaseEngine, type HoverHit, type LayerSpec } from "./base-engine.js";
+import { BaseEngine, type HoverHit, type LayerSpec, type InteractiveLayerOptions } from "./base-engine.js";
 import type { BackendType } from "./backend-factory.js";
-import type { SelectionOptions } from "./style-overrides.js";
-import type { HoverOption } from "./highlight.js";
 import type { ViewTransform, LineJoin, LineCap } from "../core/index.js";
 import { LayerHandle } from "./layer-handle.js";
 
@@ -19,7 +17,7 @@ export interface GeoMapOptions {
   /** Class(es) for the hover tooltip box, replacing its default inline look. */
   tooltipClass?: string;
 }
-export interface LayerOptions<F = any> {
+export interface LayerOptions<F = any> extends InteractiveLayerOptions<F> {
   fill?: string | ((f: F, i: number) => string);
   stroke?: string | ((f: F, i: number) => string);
   lineWidth?: number; pointRadius?: number; clipTo?: string;
@@ -51,17 +49,7 @@ export interface LayerOptions<F = any> {
    *  are a follow-up). NOTE: `clipTo` is NOT applied to pass-through layers yet — it is ignored
    *  (a follow-up); use the retained path if you need clipping. */
   passThrough?: boolean;
-  /** Styles for {@link GeoMap.select}: the selected set and its complement.
-   *  Defaults: selected keeps the base style; others `{ opacity: 0.3 }`. */
-  selection?: SelectionOptions;
-  /** Hover-highlight: true = default white outline, a HighlightStyle = redraw the
-   *  hovered item with it, or a custom (datum, HighlightBuilder) draw fn. Rendered in
-   *  a tiny overlay layer — O(hovered item) per change, the base layer is untouched. */
-  hover?: HoverOption<F>;
-  /** Hover tooltip content for this layer (null hides). Shown in a shared
-   *  engine-managed div — see GeoMapOptions.tooltipClass for styling.
-   *  Content is re-evaluated only when the hovered target changes; re-declare the layer to force a refresh. */
-  tooltip?: (f: F, id: string | number) => string | HTMLElement | null;
+  // selection / hover / tooltip are inherited from InteractiveLayerOptions (shared with Plot).
 }
 
 /** Options for {@link GeoMap.enableRotation}. */
@@ -302,7 +290,7 @@ export class GeoMap extends BaseEngine {
     return {
       name, data: list, ids, fill: opts.fill, stroke: opts.stroke, clipTo: opts.clipTo,
       sizeMode: opts.sizeMode, hideOnInteraction: opts.hideOnInteraction, pickable: opts.pickable,
-      selection: opts.selection, hover: opts.hover, tooltip: opts.tooltip,
+      ...this.interactionFields(opts),
       build: geoLayer(list, this.projection, { id: (_f, i) => ids[i]!, lineWidth: opts.lineWidth, lineJoin: opts.lineJoin, miterLimit: opts.miterLimit, lineCap: opts.lineCap, pointRadius: opts.pointRadius, sizeMode: opts.sizeMode }),
     };
   }
