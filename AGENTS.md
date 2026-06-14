@@ -3,6 +3,30 @@
 Notes for anyone (human or agent) working in this repo. Read before touching geo
 rendering, the build, or the test setup.
 
+## Library-first design (improve d3gl, don't work around it)
+
+The d3gl library is the product; the website examples and any consumer code are its
+clients. When a piece of user-facing code can only be made to work with boilerplate,
+DOM hacks, or per-call ceremony, treat that as a signal that the **library** is missing
+something — fix it upstream so the consumer code stays simple, instead of polishing the
+workaround. If a "simple" change needs ugly userland code, step back and redesign the
+API (e.g. lift a capability into the shared engine rather than re-implementing it per
+consumer). When that implies a larger change, surface it as a decision rather than
+silently absorbing the complexity downstream.
+
+## Website example code (keep the d3gl usage front and center)
+
+Each example's `draw.ts` / `*.tsx` is shown verbatim in the docs code tabs, so it must
+read as a **minimal, idiomatic demonstration of the d3gl API — nothing else**. Push data
+generation, fixtures, math, and similar boilerplate into separate co-located files
+(`<example>/data.ts`) or shared helpers (`website/src/examples/shared/`), and import
+them. `ExampleCard` (`website/src/components/ExampleCard.astro`) transitively discovers
+local relative imports and renders each as its own code tab (it excludes only the
+`types.ts` harness contract), so an imported `data.ts` stays visible to readers without
+cluttering the file that teaches the API. Mirror the existing pattern: the Highlight
+examples import `makeCells`/`loadWorld` from `shared/geo-data.ts` and `makeData` from
+`plot-highlight/data.ts`.
+
 ## Issue-tracking workflow (do this for non-trivial work)
 
 The expensive part of a session is the reasoning — hypotheses tried, tests run to

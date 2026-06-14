@@ -80,6 +80,7 @@ export default defineConfig({
     sidebar: [
       { label: "Start Here", items: [
         { label: "Getting started", slug: "getting-started" },
+        { label: "Engines", slug: "engines" },
         { label: "Rendering backends", slug: "rendering-backends" },
         { label: "Interaction", slug: "interaction" },
       ] },
@@ -87,13 +88,13 @@ export default defineConfig({
         label: "Examples",
         items: [
           { label: "Backend equivalence", slug: "examples/backend-equivalence" },
-          { label: "Phylogenetic tree", slug: "examples/tree/phylogenetic-tree" },
-          { label: "Ancestral ranges", slug: "examples/tree/ancestral-ranges" },
-          { label: "World map", slug: "examples/map/world-map" },
-          { label: "GeoJSON features", slug: "examples/map/geojson-features" },
-          { label: "Highlight", slug: "examples/map/highlight" },
-          { label: "Map projections", slug: "examples/map/map-projections" },
-          { label: "Streaming data", slug: "examples/map/streaming" },
+          { label: "Phylogenetic tree", slug: "examples/phylogenetic-tree" },
+          { label: "Ancestral ranges", slug: "examples/ancestral-ranges" },
+          { label: "World map", slug: "examples/world-map" },
+          { label: "GeoJSON features", slug: "examples/geojson-features" },
+          { label: "Highlight", slug: "examples/highlight" },
+          { label: "Map projections", slug: "examples/map-projections" },
+          { label: "Streaming data", slug: "examples/streaming" },
           { label: "React", slug: "examples/react" },
         ],
       },

@@ -1,0 +1,42 @@
+---
+title: Highlight
+description: Hover-highlight and click-selection — on a geographic value grid and a plot scatter — an overlay redraw plus style-table writes, no re-tessellation.
+---
+
+import ExampleCard from "../../../components/ExampleCard.astro";
+import Highlight from "../../../examples/highlight/Highlight.tsx";
+import PlotHighlight from "../../../examples/plot-highlight/PlotHighlight.tsx";
+
+The hover-highlight, tooltip, and click-selection API lives on the engines' shared base, so it
+works identically on both [`geoMap`](/d3gl/reference/map/classes/geomap/) and
+[`plot`](/d3gl/reference/map/classes/plot/). The same interaction is shown below on each — see
+the [Interaction guide](/d3gl/interaction/) for the full API and [Engines](/d3gl/engines/) for
+the universal-vs-engine-specific split.
+
+## On a `geoMap`: a geographic value grid
+
+A synthetic value field on a grid, **clipped to the land outline**. **Hover** any cell to
+highlight it and read its value. **Click** a cell to select it together with every cell within
+±0.1 of its value — all other cells dim to 30% opacity. Click open ocean to clear the selection.
+
+Hover redraws only the hovered cell into a tiny overlay layer, and selection rewrites only the
+per-cell color tables — neither touches the grid's geometry, so both stay instant at 1° (≈ 65k
+cells). Scroll to zoom; the **cell-size** slider rebuilds the grid (which clears the selection).
+
+<ExampleCard files={["highlight/draw.ts"]}>
+  <Highlight client:visible slot="demo" />
+</ExampleCard>
+
+## On a `plot`: a 2D scatter
+
+The same hover-highlight + click-selection, on a Cartesian scatter instead of a map. **Hover** a
+point or a cluster region to outline it and read a tooltip; **click** either to select its whole
+cluster (everything else dims); click empty space to clear. Scroll to zoom, drag to pan.
+
+This one uses two layer kinds: drawn rectangles (`layer` with a `draw` callback) outline each
+cluster, with the scatter `points` on top — both carry the same declarative options. The only
+difference from the map version is the engine factory and the layer-definition calls.
+
+<ExampleCard files={["plot-highlight/draw.ts"]}>
+  <PlotHighlight client:visible slot="demo" />
+</ExampleCard>

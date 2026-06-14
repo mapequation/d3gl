@@ -1,0 +1,87 @@
+---
+title: Engines
+description: The two engines — geoMap (geographic) and plot (2D Cartesian) — share one base, so interaction, styling, backends, and export work identically on both.
+---
+
+d3gl gives you two engines:
+
+- [`geoMap()`](/d3gl/reference/map/classes/geomap/) — geographic. Layers are GeoJSON features
+  drawn through a d3 [`GeoProjection`](https://d3js.org/d3-geo/projection), with rotation,
+  re-projection, and a GPU globe.
+- [`plot()`](/d3gl/reference/map/classes/plot/) — 2D Cartesian. Layers are drawn with a
+  `draw(ctx, datum)` callback or `x`/`y` point accessors in plot coordinates (trees, charts,
+  link diagrams, scatter plots).
+
+They are **siblings over a shared base** (`BaseEngine`, internal). They differ *only* in how a
+layer's geometry is defined. Everything else — interaction, per-drawable styling, backends, view
+transform, and export — lives in the base, so it behaves identically on both. Pick the engine
+that matches your data; the rest of the API is the same.
+
+```ts
+import { geoMap } from "@mapequation/d3gl/map"; // geographic
+import { plot } from "@mapequation/d3gl/map";   // 2D Cartesian
+```
+
+## Shared API (both engines)
+
+Once you have an engine instance, these work the same regardless of which one you created:
+
+| Concern | API |
+| --- | --- |
+| Events | `on("hover", …)`, `on("click", …)` — `hit: { layer, id, datum } \| null` |
+| Hit-testing | `pick(x, y)` (clip-aware; retained layers are pickable by default) |
+| Highlight | `highlight(layer, idOrIds, styleOrDraw)` |
+| Selection | `select(layer, ids)` |
+| Style overrides | `setStyle(layer, ids, …)`, `clearStyle(layer, ids)` |
+| View | `enableZoom(extent)`, `setTransform(t)`, `render()` |
+| Backend | `setBackend(type)`, `whenReady()` — see [Rendering backends](/d3gl/rendering-backends/) |
+| Export | `toPNG()`, `toSVG()` |
+| Teardown | `destroy()` |
+
+Retained layers on **both** engines also accept the same **declarative interaction options**
+(`InteractiveLayerOptions`), forwarded into the layer the same way:
+
+```ts
+engine.layer("things", data, {
+  hover: true,                          // or a style, or a (datum, HighlightBuilder) draw fn
+  tooltip: (d, id) => `${d.name}`,      // string | HTMLElement | null
+  selection: { others: { opacity: 0.3 } },
+  pickable: true,                       // default; false skips the hit index
+});
+```
+
+See the [Interaction guide](/d3gl/interaction/) for what each one does and what it costs — every
+example there reads identically whether `engine` is a `geoMap` or a `plot`.
+
+## Engine-specific API
+
+What's unique to each engine is the layer definition (its geometry) plus a few domain methods:
+
+| | [`geoMap()`](/d3gl/reference/map/classes/geomap/) | [`plot()`](/d3gl/reference/map/classes/plot/) |
+| --- | --- | --- |
+| Constructor option | `projection` (required) | — |
+| Layer geometry | `layer(name, features, opts)` — GeoJSON + projection | `layer(name, data, { draw })` and `points(name, data, { x, y })` |
+| Domain methods | `setProjection()`, `enableRotation()` | — |
+| Coordinates | geographic `[lon, lat]`, projected each frame | plot coordinates, drawn directly |
+
+```ts
+// geoMap: GeoJSON features through a projection
+const map = geoMap(host, { width, height, projection });
+map.layer("land", [world.land], { fill: "#e3e6ea", hover: true });
+
+// plot: a draw callback in plot coordinates
+const chart = plot(host, { width, height });
+chart.layer("boxes", rects, {
+  draw: (ctx, d) => ctx.rect(d.x, d.y, 40, 40),
+  fill: "#4477aa",
+  hover: { fill: "#ee6677" },
+});
+```
+
+## Choosing an engine
+
+- Mapping anything geographic (GeoJSON, projections, a globe) → **`geoMap()`**.
+- Everything else in a 2D plane (trees, scatter, links, custom marks) → **`plot()`**.
+
+Because the shared base is the same object, you can move between them without relearning
+interaction, styling, or backends — only the layer-definition call changes.

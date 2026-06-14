@@ -10,6 +10,27 @@ import { Tooltip } from "./tooltip.js";
 export type Accessor<D, T> = T | ((d: D, i: number) => T);
 export interface HoverHit { layer: string; id: string | number; datum: unknown; }
 
+/**
+ * Declarative interaction options shared by every engine's retained layers. The machinery
+ * (hover overlay, tooltip, selection styling, hit-testing) lives entirely in {@link BaseEngine} —
+ * these options are just the per-layer surface that both {@link BaseEngine.select}'s and the
+ * hover/tooltip dispatch read. `Plot.layer()`/`Plot.points()` and `GeoMap.layer()` forward them
+ * into the {@link LayerSpec} via {@link BaseEngine.interactionFields}, so the contract has one home.
+ */
+export interface InteractiveLayerOptions<D = any> {
+  /** Styles for {@link BaseEngine.select}: the selected set and its complement.
+   *  Defaults: selected keeps the base style; others `{ opacity: 0.3 }`. */
+  selection?: SelectionOptions;
+  /** Hover-highlight: `true` = default white outline, a {@link HighlightStyle} = redraw the
+   *  hovered item with it, or a custom `(datum, HighlightBuilder)` draw fn. Rendered in a tiny
+   *  overlay layer — O(hovered item) per change, the base layer is untouched. */
+  hover?: HoverOption<D>;
+  /** Hover tooltip content for this layer (`null` hides). Shown in a shared engine-managed div —
+   *  see `tooltipClass` for styling. Re-evaluated only when the hovered target changes;
+   *  re-declare the layer to force a refresh. */
+  tooltip?: (d: D, id: string | number) => string | HTMLElement | null;
+}
+
 export interface LayerSpec {
   name: string;
   data: any[];
@@ -136,6 +157,13 @@ export abstract class BaseEngine {
   protected backendType(): BackendType { return this.currentBackend; }
   /** The live backend instance, or null before the first swap resolves. */
   protected backend(): Backend | null { return this.handle?.backend ?? null; }
+
+  /** Pull the declarative interaction options out of a layer-options object into the
+   *  {@link LayerSpec} fields. Shared by `Plot.layer()`/`Plot.points()` and `GeoMap.layer()`
+   *  so the hover/tooltip/selection contract lives in exactly one place. */
+  protected interactionFields(opts: InteractiveLayerOptions): Pick<LayerSpec, "selection" | "hover" | "tooltip"> {
+    return { selection: opts.selection, hover: opts.hover, tooltip: opts.tooltip };
+  }
 
   /** Register/replace a layer: build its Scene group, apply accessors, index, push. */
   protected registerLayer(spec: LayerSpec): void {
