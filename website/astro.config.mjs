@@ -94,6 +94,7 @@ export default defineConfig({
           { label: "GeoJSON features", slug: "examples/geojson-features" },
           { label: "Highlight", slug: "examples/highlight" },
           { label: "Map projections", slug: "examples/map-projections" },
+          { label: "Sizing", slug: "examples/sizing" },
           { label: "Streaming data", slug: "examples/streaming" },
           { label: "React", slug: "examples/react" },
         ],

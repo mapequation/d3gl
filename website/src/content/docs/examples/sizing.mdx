@@ -1,0 +1,50 @@
+---
+title: Sizing
+description: The three responsive sizing modes — fixed, fill-parent, and aspect-ratio — each resizing the engine in place.
+---
+
+import ExampleCard from "../../../components/ExampleCard.astro";
+import FixedSize from "../../../examples/react-sizing/FixedSize.tsx";
+import FillParent from "../../../examples/react-sizing/FillParent.tsx";
+import AspectRatio from "../../../examples/react-sizing/AspectRatio.tsx";
+
+Both engines are **responsive by default** and resize **in place** — when their container
+changes size they reconcile the rendering surface and re-render without tearing down, so the
+view, layers, hover, and selection all survive. Which mode you get depends on the props you
+pass to `plot()` / `geoMap()` (or the React `<Plot>` / `<GeoMap>`). The three demos below each
+sit in a drag-to-resize box so you can feel the difference — resize them and watch the map react
+live. See the [Sizing reference](/d3gl/engines/#sizing) for the full rundown.
+
+## Fixed size
+
+Pass both `width` and `height` for a static pixel box. The map ignores its container — drag the
+parent below and the map stays exactly `320 × 200`. This is the opt-out from responsive sizing
+(the pre-responsive behavior), useful when you need a guaranteed export size or a pixel-locked
+layout.
+
+<ExampleCard files={["react-sizing/FixedSize.tsx"]}>
+  <FixedSize client:visible slot="demo" />
+</ExampleCard>
+
+## Fill parent
+
+Pass nothing and the map fills its parent box on both axes — the parent must supply a height
+(here the resizable box does). Drag the corner: the engine resizes in place and `geoMap` refits
+the projection to the new box, so the world keeps filling it whatever the shape. This is the
+right mode for a map that should occupy a flex/grid cell or a full-bleed panel.
+
+<ExampleCard files={["react-sizing/FillParent.tsx"]}>
+  <FillParent client:visible slot="demo" />
+</ExampleCard>
+
+## Aspect ratio
+
+Pass `aspectRatio` (width ÷ height) and the map fills the available width while keeping that
+ratio — its height is derived, not set. Drag the right edge: the width changes, the height
+follows, and the projection rescales uniformly, preserving the framing exactly. This is the
+most common choice for an embedded map or chart that should stay proportional as the column
+it lives in grows and shrinks.
+
+<ExampleCard files={["react-sizing/AspectRatio.tsx"]}>
+  <AspectRatio client:visible slot="demo" />
+</ExampleCard>

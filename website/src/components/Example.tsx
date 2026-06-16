@@ -269,7 +269,10 @@ export default function Example(props: ExampleProps) {
     setResetKey((k) => k + 1);
   };
 
-  // Measure the canvas container so the viz renders 1:1 at the container size.
+  // Measure the canvas container so the viz renders 1:1 at the container size. The examples
+  // need numeric width/height for their own layout math (fitProjection, d3 scales), so we keep
+  // measuring here; passing the new size to <Plot>/<GeoMap> now resizes the engine IN PLACE
+  // (setSize), not by recreating it — zoom/hover/selection survive a container resize for free.
   const canvasRef = useRef<HTMLDivElement>(null);
   const [size, setSize] = useState<{ width: number; height: number }>({ width, height });
   useLayoutEffect(() => {

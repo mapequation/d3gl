@@ -35,9 +35,9 @@ export class WebGLBackend implements Backend {
 
   private constructor(
     private readonly device: Device,
-    private readonly offscreen: Framebuffer,
-    private readonly width: number,
-    private readonly height: number,
+    private offscreen: Framebuffer,
+    private width: number,
+    private height: number,
   ) {
     this.clipMatrix = clipFromView({ k: 1, x: 0, y: 0 }, width, height);
   }
@@ -182,6 +182,38 @@ export class WebGLBackend implements Backend {
     this.viewTransform = t;
     this.clipMatrix = clipFromView(t, this.width, this.height);
     for (const r of this.renderers.values()) r.setTransform(this.clipMatrix);
+  }
+
+  /** Resize the onscreen canvas drawing buffer (luma owns it via useDevicePixels), recompute
+   *  the clip matrix at the new size, push the new viewport to every renderer (screen-mode point
+   *  sizing) and recreate the offscreen export framebuffer. The engine re-pushes layers + renders
+   *  after. Globe mode reads this.width/height per draw, so it follows automatically. */
+  resize(width: number, height: number): void {
+    if (width === this.width && height === this.height) return;
+    this.width = width;
+    this.height = height;
+    const cc = this.device.getDefaultCanvasContext();
+    const canvas = cc.canvas as HTMLCanvasElement;
+    canvas.style.width = `${width}px`;
+    canvas.style.height = `${height}px`;
+    // Drive luma's drawing buffer to the new CSS size × dpr deterministically (its own
+    // ResizeObserver would otherwise reconcile asynchronously, one frame late).
+    cc.setDrawingBufferSize(Math.round(width * cc.devicePixelRatio), Math.round(height * cc.devicePixelRatio));
+    this.clipMatrix = clipFromView(this.viewTransform, width, height);
+    for (const r of this.renderers.values()) {
+      r.setTransform(this.clipMatrix);
+      r.setViewport(width, height);
+    }
+    // The offscreen export/readback FBO is fixed-size; recreate it at the new size (mirrors the
+    // globe's destroy+recreate idiom rather than relying on Framebuffer.resize).
+    this.offscreen.destroy();
+    this.offscreen = this.device.createFramebuffer({
+      width,
+      height,
+      colorAttachments: ["rgba8unorm"],
+      depthStencilAttachment: "depth24plus-stencil8",
+    });
+    this.bakeDirty = true;
   }
 
   /** Enter/leave globe mode. texW/texH = equirect bake size. Idempotent re-entry resizes. */

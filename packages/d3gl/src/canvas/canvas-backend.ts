@@ -58,6 +58,21 @@ export class CanvasBackend implements Backend {
     this.ctx.clearRect(0, 0, this.canvas.width, this.canvas.height);
   }
 
+  /** Resize the CSS size + device-px backing store and re-read the dpr. Clears the canvas
+   *  (setting canvas.width/height resets the bitmap and context state); the engine re-renders
+   *  right after, which reapplies the view transform via setView. */
+  resize(width: number, height: number): void {
+    if (width === this.width && height === this.height) return;
+    this.width = width;
+    this.height = height;
+    const ratio = (typeof window !== "undefined" && window.devicePixelRatio) || 1;
+    this.canvas.style.width = `${width}px`;
+    this.canvas.style.height = `${height}px`;
+    this.canvas.width = Math.round(width * ratio);
+    this.canvas.height = Math.round(height * ratio);
+    this.dpr = ratio;
+  }
+
   setLayers(layers: RenderLayer[]): void {
     this.releaseClip();
     this.clipCache.clear();

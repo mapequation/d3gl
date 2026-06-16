@@ -34,6 +34,7 @@ Once you have an engine instance, these work the same regardless of which one yo
 | Selection | `select(layer, ids)` |
 | Style overrides | `setStyle(layer, ids, …)`, `clearStyle(layer, ids)` |
 | View | `enableZoom(extent)`, `setTransform(t)`, `render()` |
+| Sizing | `width` / `height` / `aspectRatio` options, `setSize(w, h)` — see [Sizing](#sizing) |
 | Backend | `setBackend(type)`, `whenReady()` — see [Rendering backends](/d3gl/rendering-backends/) |
 | Export | `toPNG()`, `toSVG()` |
 | Teardown | `destroy()` |
@@ -52,6 +53,36 @@ engine.layer("things", data, {
 
 See the [Interaction guide](/d3gl/interaction/) for what each one does and what it costs — every
 example there reads identically whether `engine` is a `geoMap` or a `plot`.
+
+## Sizing
+
+Both engines are **responsive by default** and resize **in place** — when their container changes
+size they reconcile the rendering surface and re-render without tearing down, so the view
+transform, layers, hover, and selection are all preserved. Three modes, picked by which options
+you pass (to the `plot()` / `geoMap()` constructors or the React `<Plot>` / `<GeoMap>` props):
+
+| You pass | Mode | Behavior |
+| --- | --- | --- |
+| `aspectRatio` | width-driven | Fills the parent's width and keeps `width ÷ height` = `aspectRatio`. |
+| nothing | fill-parent | Tracks the parent box. The parent must give it a height (from your CSS). |
+| both `width` & `height` | fixed | A static pixel size — the opt-out (the pre-responsive behavior). |
+
+```tsx
+<Plot aspectRatio={16 / 9} />        {/* fills width, keeps the ratio   */}
+<GeoMap />                           {/* fills the parent box           */}
+<Plot width={800} height={400} />    {/* fixed size                     */}
+```
+
+```ts
+// Bare engines take the same options; the engine observes its host element.
+const chart = plot(host, { aspectRatio: 2 });
+// Resize imperatively at any time (no recreate):
+chart.setSize(1024, 512);
+```
+
+A resized **`geoMap`** also **refits its projection** to the new box, so the map keeps filling it.
+A uniform resize (always the case in `aspectRatio` mode) preserves your original framing exactly;
+an aspect-ratio change (possible in fill-parent mode) re-letterboxes the map to the new shape.
 
 ## Engine-specific API
 

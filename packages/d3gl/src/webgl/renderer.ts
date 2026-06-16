@@ -712,6 +712,12 @@ export class GroupRenderer {
     if (this.point) this.point.model.setParameters(params);
   }
 
+  /** Update the viewport size (px) used for screen-mode point/glyph sizing on resize. */
+  setViewport(width: number, height: number): void {
+    this.viewportWidth = width;
+    this.viewportHeight = height;
+  }
+
   /** Set the view transform (column-major mat3) for pan/zoom. */
   setTransform(m: Float32Array): void {
     this.transform = m;

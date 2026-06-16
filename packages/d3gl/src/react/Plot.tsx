@@ -7,6 +7,7 @@ import {
   type PlotLayerOptions,
   type PlotPointOptions,
 } from "../map/index.js";
+import { hostSizeStyle, isFixedSize } from "./host-style.js";
 
 /**
  * Props for a {@link Layer} child of {@link Plot}: the imperative
@@ -43,8 +44,13 @@ export function Points<D = unknown>(_props: PointsProps<D>): ReactElement | null
 }
 
 export interface PlotProps {
-  width: number;
-  height: number;
+  /** Fixed width (px). Omit (with `height`) for responsive sizing. */
+  width?: number;
+  /** Fixed height (px). Omit (with `width`) for responsive sizing. */
+  height?: number;
+  /** width ÷ height. When set, the plot fills its parent's width and keeps this ratio (the host
+   *  resizes the engine in place). Omit `width`/`height`/`aspectRatio` to fill the parent box. */
+  aspectRatio?: number;
   backend?: BackendType;
   /** Enable scroll-to-zoom / drag-to-pan, clamped to this `[min, max]` scale extent. */
   zoom?: [number, number];
@@ -103,7 +109,7 @@ function applySpecs(engine: Engine, specs: ChildSpec[]): void {
  * ```
  */
 export function Plot(props: PlotProps): ReactElement {
-  const { width, height, backend, zoom, onTransform, onReady, className, style, children } = props;
+  const { width, height, aspectRatio, backend, zoom, onTransform, onReady, className, style, children } = props;
   const hostRef = useRef<HTMLDivElement>(null);
   const engineRef = useRef<Engine | null>(null);
   // The backend the engine was created with; the [backend] effect skips the no-op
@@ -124,7 +130,7 @@ export function Plot(props: PlotProps): ReactElement {
     const host = hostRef.current;
     if (!host) return;
     createdBackend.current = backend ?? "webgl";
-    const engine = plot(host, { width, height, backend: createdBackend.current });
+    const engine = plot(host, { width, height, aspectRatio, backend: createdBackend.current });
     engineRef.current = engine;
     let cancelled = false;
     engine.whenReady().then(() => {
@@ -139,10 +145,18 @@ export function Plot(props: PlotProps): ReactElement {
       engine.destroy();
       engineRef.current = null;
     };
-    // Recreate only on size change; everything else is read from refs above so an
-    // unrelated re-render doesn't recreate the engine (which would lose zoom/pan).
+    // Create ONCE on mount. Sizing is handled in place afterwards — responsive modes via the
+    // engine's own ResizeObserver, a fixed-size prop change via the setSize effect below — so a
+    // resize never recreates the engine (which would lose zoom/pan, layers, hover/selection).
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [width, height]);
+  }, []);
+
+  // Fixed-size prop change → resize in place (responsive modes self-track, so this is a no-op
+  // for them: the engine ignores a setSize that matches its observed box).
+  useEffect(() => {
+    const engine = engineRef.current;
+    if (engine && isFixedSize(width, height, aspectRatio)) engine.setSize(width!, height!);
+  }, [width, height, aspectRatio]);
 
   // Swap backend in place — preserves zoom/pan + layers (no recreate).
   useEffect(() => {
@@ -161,5 +175,11 @@ export function Plot(props: PlotProps): ReactElement {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [children]);
 
-  return <div ref={hostRef} className={className} style={{ position: "relative", width, height, ...style }} />;
+  return (
+    <div
+      ref={hostRef}
+      className={className}
+      style={{ position: "relative", ...hostSizeStyle(width, height, aspectRatio), ...style }}
+    />
+  );
 }

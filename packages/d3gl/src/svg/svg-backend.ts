@@ -67,6 +67,19 @@ export class SvgBackend implements Backend {
     if (this.hasScreen) this.dirty = true;
   }
 
+  /** Resize the root <svg> + its viewBox. The markup is drawn in a (0,0..W,H) user-coordinate
+   *  system pinned by the viewBox, so existing nodes keep their positions; the engine re-renders
+   *  after to fill the new box. */
+  resize(width: number, height: number): void {
+    if (width === this.width && height === this.height) return;
+    this.width = width;
+    this.height = height;
+    this.root.setAttribute("width", String(width));
+    this.root.setAttribute("height", String(height));
+    this.root.setAttribute("viewBox", `0 0 ${width} ${height}`);
+    this.dirty = true;
+  }
+
   render(): void {
     if (!this.dirty) return; // only the transform changed (already applied in setTransform)
     const { defs, world, screen, hasScreen } = svgBody(this.layers, this.transform);
