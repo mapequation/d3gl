@@ -70,6 +70,28 @@ export interface PassThroughSpec {
   clipTo?: string;
 }
 
+/**
+ * How an engine is sized. Sizing is **responsive by default** — the engine observes its host
+ * and resizes in place (no teardown), preserving layers, view, and interaction state:
+ *
+ * - `aspectRatio` set → width-driven: the host fills the available width and keeps this
+ *   width÷height ratio (a CSS `aspect-ratio` on the host); the engine tracks the resulting box.
+ * - neither `width` nor `height` → fill-parent: the engine tracks the host's box. The host must
+ *   get a height from your layout (CSS), since the rendering surface is absolutely positioned.
+ * - both `width` and `height` → fixed: a static size, the opt-out (the pre-responsive behavior).
+ */
+export interface EngineSizing {
+  width?: number;
+  height?: number;
+  /** width ÷ height. When set, the engine is width-driven and keeps this ratio on resize. */
+  aspectRatio?: number;
+}
+
+/** Fallback CSS size used only when a responsive host can't be measured yet (detached / zero
+ *  box); the ResizeObserver corrects it on the first real layout. Matches the <canvas> defaults. */
+const DEFAULT_WIDTH = 300;
+const DEFAULT_HEIGHT = 150;
+
 export abstract class BaseEngine {
   protected scene = new Scene();
   protected specs: LayerSpec[] = [];
@@ -128,7 +150,18 @@ export abstract class BaseEngine {
    *  main thread. Module-internal (no public API); tests stub it via the static field. */
   protected static PT_CHUNK = 500_000;
 
-  constructor(protected host: HTMLElement, protected width: number, protected height: number, backend: BackendType) {
+  /** Current CSS size (px). Set by the constructor's sizing resolution and by setSize(). */
+  protected width = 0;
+  protected height = 0;
+  /** width ÷ height in width-driven mode; undefined otherwise. */
+  private aspectRatio?: number;
+  /** Whether the engine tracks its host (fill / aspect modes) vs. a fixed size. */
+  private responsive = false;
+  /** Observes the host in responsive modes; coalesced into one rAF per burst. */
+  private sizingObserver?: ResizeObserver;
+  private resizeRaf = 0;
+
+  constructor(protected host: HTMLElement, sizing: EngineSizing, backend: BackendType) {
     this.currentBackend = backend;
     // Backend canvases are positioned absolutely (see makeCanvas) so transiently-coexisting
     // canvases during an "auto" upgrade overlap instead of stacking in normal flow. An
@@ -139,6 +172,9 @@ export abstract class BaseEngine {
     if (typeof getComputedStyle === "function" && getComputedStyle(host).position === "static") {
       host.style.position = "relative";
     }
+    const size = this.resolveSizing(sizing);
+    this.width = size.width;
+    this.height = size.height;
     if (backend === "auto") {
       // Instant canvas first paint; whenReady() resolves now. WebGL is built in the background.
       this.ready = Promise.resolve();
@@ -146,7 +182,91 @@ export abstract class BaseEngine {
     } else {
       this.ready = this.swapBackend(backend);
     }
+    if (this.responsive) this.installResizeObserver();
   }
+
+  /**
+   * Resolve the initial CSS size from the sizing spec and, in responsive modes, prepare the
+   * host so its box reflects the engine size:
+   * - fixed (both width & height, no aspectRatio): host styling untouched (pre-responsive behavior).
+   * - width-driven (aspectRatio set): give the host a CSS `aspect-ratio` and let it fill the
+   *   available width, then measure the resulting box.
+   * - fill-parent (neither width nor height): measure the host box as laid out by your CSS.
+   * getBoundingClientRect() forces a synchronous layout, so the just-applied styles are reflected.
+   */
+  private resolveSizing(s: EngineSizing): { width: number; height: number } {
+    if (s.aspectRatio == null && s.width != null && s.height != null) {
+      this.responsive = false;
+      return { width: Math.round(s.width), height: Math.round(s.height) };
+    }
+    this.responsive = true;
+    this.aspectRatio = s.aspectRatio;
+    if (s.aspectRatio != null) {
+      if (s.width != null) this.host.style.width = `${s.width}px`;
+      else if (!this.host.style.width) this.host.style.width = "100%";
+      this.host.style.aspectRatio = String(s.aspectRatio);
+      this.host.style.height = ""; // height follows the aspect-ratio
+    }
+    const rect = this.host.getBoundingClientRect();
+    const width = rect.width || s.width || DEFAULT_WIDTH;
+    const height = s.aspectRatio != null
+      ? width / s.aspectRatio
+      : (rect.height || s.height || DEFAULT_HEIGHT);
+    return { width: Math.round(width), height: Math.round(height) };
+  }
+
+  private installResizeObserver(): void {
+    if (typeof ResizeObserver === "undefined") return;
+    this.sizingObserver = new ResizeObserver(() => this.scheduleResize());
+    this.sizingObserver.observe(this.host);
+  }
+
+  /** Coalesce a burst of ResizeObserver callbacks into a single setSize() per animation frame.
+   *  The host box drives both axes (its CSS aspect-ratio sizes the height in width-driven mode),
+   *  but height is recomputed from the ratio to avoid sub-pixel rounding drift. */
+  private scheduleResize(): void {
+    if (this.resizeRaf || this.destroyed) return;
+    const raf = typeof requestAnimationFrame === "function"
+      ? requestAnimationFrame
+      : (cb: FrameRequestCallback): number => setTimeout(() => cb(0), 0) as unknown as number;
+    this.resizeRaf = raf(() => {
+      this.resizeRaf = 0;
+      if (this.destroyed) return;
+      const rect = this.host.getBoundingClientRect();
+      const width = rect.width;
+      const height = this.aspectRatio != null ? width / this.aspectRatio : rect.height;
+      if (width > 0 && height > 0) this.setSize(width, height);
+    });
+  }
+
+  /**
+   * Resize the engine in place to a new CSS size (px) — no teardown. Resizes the live backend,
+   * runs the subclass {@link onResize} hook (e.g. GeoMap refits its projection), then re-renders
+   * and repaints pass-through layers. Layers, view transform, and interaction state are preserved.
+   * A no-op when the size is unchanged or either axis is zero (a collapsed/hidden layout). In
+   * responsive modes the ResizeObserver calls this automatically; callers in fixed mode use it
+   * to apply a new explicit size without recreating the engine.
+   */
+  setSize(width: number, height: number): this {
+    const w = Math.max(0, Math.round(width));
+    const h = Math.max(0, Math.round(height));
+    if (w === 0 || h === 0 || (w === this.width && h === this.height)) return this;
+    const prevW = this.width;
+    const prevH = this.height;
+    this.width = w;
+    this.height = h;
+    this.handle?.backend.resize(w, h);
+    this.onResize(prevW, prevH, w, h);
+    this.render();
+    for (const name of this.ptSpecs.keys()) this.repaintPassThrough(name);
+    return this;
+  }
+
+  /** Subclass hook fired by setSize() after the backend resized but before the re-render.
+   *  GeoMap overrides it to refit its projection into the new box. Default: no-op (Plot's
+   *  world coords are size-independent). */
+  protected onResize(_prevW: number, _prevH: number, _width: number, _height: number): void {}
+
   whenReady(): Promise<void> { return this.ready; }
   /** Idempotent: addEventListener dedupes on the same handler reference. */
   private attachPointer(): void {
@@ -726,6 +846,10 @@ export abstract class BaseEngine {
   toPNG(): string { return this.handle?.backend.toPNG() ?? ""; }
   destroy(): void {
     this.destroyed = true;
+    this.sizingObserver?.disconnect();
+    this.sizingObserver = undefined;
+    if (this.resizeRaf && typeof cancelAnimationFrame === "function") cancelAnimationFrame(this.resizeRaf);
+    this.resizeRaf = 0;
     // Detach pan/zoom or rotation listeners so a trailing wheel/pointer event can't
     // fire on a destroyed engine (destroy() otherwise only removes hover listeners).
     this.disableInteraction();

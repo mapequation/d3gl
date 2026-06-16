@@ -111,6 +111,12 @@ export interface Backend {
   /** True if this backend supports pass-through (canvas/webgl yes, svg no). */
   readonly supportsPassThrough?: boolean;
   setTransform(t: ViewTransform): void;
+  /**
+   * Resize the rendering surface to a new CSS size (px). Re-reads the device pixel ratio
+   * and reconciles the backing buffer / framebuffers; the engine re-pushes layers and
+   * re-renders afterwards. A no-op when the size is unchanged.
+   */
+  resize(width: number, height: number): void;
   render(): void;
   toPNG(): string;
   toSVG(): string;

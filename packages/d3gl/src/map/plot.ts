@@ -4,8 +4,12 @@ import type { BackendType } from "./backend-factory.js";
 import { LayerHandle } from "./layer-handle.js";
 
 export interface PlotOptions {
-  width: number;
-  height: number;
+  /** Fixed width (px). Omit for responsive sizing — see {@link EngineSizing}. */
+  width?: number;
+  /** Fixed height (px). Omit for responsive sizing — see {@link EngineSizing}. */
+  height?: number;
+  /** width ÷ height. When set, the plot fills its parent's width and keeps this ratio. */
+  aspectRatio?: number;
   /** Which renderer to draw with — see {@link BackendType}. Defaults to `"webgl"`.
    *  Use `"auto"` for an instant Canvas first paint that upgrades to WebGL in the background. */
   backend?: BackendType;
@@ -74,7 +78,9 @@ export interface PlotPointOptions<D = any> extends InteractiveLayerOptions<D> {
 }
 
 export class Plot extends BaseEngine {
-  constructor(host: HTMLElement, opts: PlotOptions) { super(host, opts.width, opts.height, opts.backend ?? "webgl"); }
+  constructor(host: HTMLElement, opts: PlotOptions = {}) {
+    super(host, { width: opts.width, height: opts.height, aspectRatio: opts.aspectRatio }, opts.backend ?? "webgl");
+  }
 
   layer<D>(name: string, data: readonly D[], opts: PlotLayerOptions<D>): LayerHandle<D> {
     const list = data as D[];
@@ -164,4 +170,4 @@ export class Plot extends BaseEngine {
     return (g) => items.forEach((d, j) => g.point(ids[j]!, opts.x(d, base + j), opts.y(d, base + j), resolveRadius(d, base + j)));
   }
 }
-export function plot(host: HTMLElement, opts: PlotOptions): Plot { return new Plot(host, opts); }
+export function plot(host: HTMLElement, opts: PlotOptions = {}): Plot { return new Plot(host, opts); }

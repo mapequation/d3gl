@@ -8,8 +8,12 @@ import type { ViewTransform, LineJoin, LineCap } from "../core/index.js";
 import { LayerHandle } from "./layer-handle.js";
 
 export interface GeoMapOptions {
-  width: number;
-  height: number;
+  /** Fixed width (px). Omit for responsive sizing — see {@link EngineSizing}. */
+  width?: number;
+  /** Fixed height (px). Omit for responsive sizing — see {@link EngineSizing}. */
+  height?: number;
+  /** width ÷ height. When set, the map fills its parent's width and keeps this ratio. */
+  aspectRatio?: number;
   projection: GeoProjection;
   /** Which renderer to draw with — see {@link BackendType}. Defaults to `"webgl"`.
    *  Use `"auto"` for an instant Canvas first paint that upgrades to WebGL in the background. */
@@ -62,6 +66,9 @@ export interface RotationOptions {
 
 interface LayerDef { name: string; opts: LayerOptions; }
 
+/** The object type d3-geo's `fitSize` accepts (Feature / FeatureCollection / geometry / Sphere). */
+type FitObject = Parameters<GeoProjection["fitSize"]>[1];
+
 export class GeoMap extends BaseEngine {
   private projection: GeoProjection;
   private defs: LayerDef[] = [];
@@ -75,10 +82,60 @@ export class GeoMap extends BaseEngine {
   private interactionRequest: { extent: [number, number]; onTransform?: (t: ViewTransform) => void } | null = null;
 
   constructor(host: HTMLElement, opts: GeoMapOptions) {
-    super(host, opts.width, opts.height, opts.backend ?? "webgl");
+    super(host, { width: opts.width, height: opts.height, aspectRatio: opts.aspectRatio }, opts.backend ?? "webgl");
     this.projection = opts.projection;
     this.baseScale = opts.projection.scale();
     this.tooltipClass = opts.tooltipClass;
+  }
+
+  /**
+   * Refit the projection into the resized box, then re-project every layer. The caller fitted
+   * the projection to the original box (e.g. `projection.fitSize([w,h], …)`); a resize must
+   * preserve that framing.
+   *
+   * - **Uniform resize** (same scale factor on both axes — always true in aspect-ratio mode):
+   *   scale the projection's `scale()` + `translate()` by that factor. Projection output is
+   *   linear in `scale()`, so this is exact and preserves the caller's framing precisely
+   *   (including Sphere fits / padding) with no geometry scan.
+   * - **Aspect-ratio change** (fill-parent only): re-letterbox via `fitSize()` against the
+   *   engine's own retained geometry (or the Sphere for a spherical projection), reproducing
+   *   the caller's fit so the map reflows to fill the new box shape ("meet" framing).
+   */
+  protected override onResize(prevW: number, prevH: number, w: number, h: number): void {
+    if (prevW > 0 && prevH > 0) {
+      const fx = w / prevW;
+      const fy = h / prevH;
+      if (Math.abs(fx - fy) < 1e-6) {
+        const [tx, ty] = this.projection.translate();
+        this.projection.scale(this.projection.scale() * fx).translate([tx * fx, ty * fy]);
+        this.baseScale *= fx;
+        this.rebuildLayers();
+        return;
+      }
+    }
+    const fit = this.fitObject();
+    if (fit) {
+      this.projection.fitSize([w, h], fit);
+      this.baseScale = this.projection.scale();
+    }
+    this.rebuildLayers();
+  }
+
+  /** The GeoJSON the projection is refitted against on an aspect-ratio change: the Sphere for a
+   *  spherical projection (rotation-invariant, the natural globe frame), otherwise the union of
+   *  all retained layer geometry (you fit to what you draw). Null when there are no layers yet. */
+  private fitObject(): FitObject | null {
+    if (this.isSpherical()) return { type: "Sphere" } as FitObject;
+    const features: GeoJSON.Feature[] = [];
+    for (const def of this.defs) {
+      const spec = this.specs.find((s) => s.name === def.name);
+      if (!spec) continue;
+      for (const datum of spec.data as Array<{ type?: string; geometry?: GeoJSON.Geometry }>) {
+        const geometry = (datum.geometry ?? (datum as GeoJSON.Geometry)) as GeoJSON.Geometry;
+        if (geometry?.type) features.push({ type: "Feature", geometry, properties: null });
+      }
+    }
+    return features.length ? ({ type: "FeatureCollection", features } as FitObject) : null;
   }
 
   layer<F>(name: string, features: F | readonly F[] | (() => readonly F[]), opts: LayerOptions<F> = {}): LayerHandle<F> {
