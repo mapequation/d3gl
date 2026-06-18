@@ -2,6 +2,13 @@ import Example from "../../components/Example.js";
 import Imperative from "../../components/Imperative.js";
 import { setup } from "./draw.js";
 
+const MIN_TIPS_EXPONENT = 5;
+const MAX_TIPS_EXPONENT = 16;
+const TIPS_LABELS = Array.from(
+  { length: MAX_TIPS_EXPONENT - MIN_TIPS_EXPONENT + 1 },
+  (_, i) => String(2 ** (i + MIN_TIPS_EXPONENT)),
+);
+
 /** Harness wrapper: a mammal phylogeny with Fitch-parsimony ancestral-range pies. */
 export default function AncestralRanges() {
   return (
@@ -14,11 +21,11 @@ export default function AncestralRanges() {
           type: "range",
           key: "tips",
           label: "Tips",
-          min: 5,
-          max: 14,
+          min: MIN_TIPS_EXPONENT,
+          max: MAX_TIPS_EXPONENT,
           step: 1,
           value: 8,
-          display: ["32", "64", "128", "256", "512", "1024", "2048", "4096", "8192", "16384"],
+          display: TIPS_LABELS,
         },
       ]}
       defaults={{ curve: "bump", coords: "world" }}

@@ -12,7 +12,7 @@
  *
  * @packageDocumentation
  */
-export { cullLabels } from "./cull.js";
-export type { LabelBox, CullOptions } from "./cull.js";
+export { cullLabels, labelGeometry } from "./cull.js";
+export type { LabelBox, CullOptions, TextAnchor, LabelGeometry } from "./cull.js";
 export { LabelLayer } from "./label-layer.js";
 export type { LabelAnchor } from "./label-layer.js";
