@@ -102,14 +102,6 @@ function topRegion(node: PNode): number | undefined {
   return pieSlices(node)[0]?.clusterId;
 }
 
-// Rotation/centering only — the constant-px gap from the node is the LabelAnchor `offset`.
-function labelTransform(mode: LayoutMode, angle: number): string {
-  if (mode !== "radial") return "";
-  const deg = (angle * 180) / Math.PI - 90;
-  return Math.sin(angle) < 0
-    ? `rotate(${deg + 180}deg) translate(-100%, -50%)`
-    : `rotate(${deg}deg) translate(0, -50%)`;
-}
 /** Constant screen-px offset from the node: rightward (rectangular) or outward along the
  *  radius (radial). Vertical centering for rectangular is folded in as -height/2. */
 function labelOffset(mode: LayoutMode, angle: number, gap: number, height: number): [number, number] {
@@ -198,6 +190,7 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
       }).filter((p) => p.slices.length > 0);
 
       const GAP = 8;
+      const radial = layoutMode === "radial";
       anchors = tipNodes.map((n, i) => {
         const [px, py] = xy(n);
         const h = 14;
@@ -205,9 +198,10 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
           id: `t${i}`, refX: px, refY: py, text: n.data.name,
           width: n.data.name.length * 6.2 + 6, height: h,
           priority: n.data.speciesCount ?? 1,
-          transformOrigin: "0 0",
           offset: labelOffset(layoutMode, n.x, GAP, h),
-          transform: labelTransform(layoutMode, n.x),
+          // Radial: declare the reading angle; d3gl derives the CSS transform AND the oriented
+          // collision box from it, so rotated tip labels pack by their true on-screen footprint.
+          ...(radial ? { rotation: n.x - Math.PI / 2, textAnchor: "start" as const, keepUpright: true } : {}),
         };
       });
 

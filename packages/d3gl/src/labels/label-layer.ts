@@ -1,6 +1,6 @@
 import type { ViewTransform } from "../webgl/index.js";
-import { cullLabels } from "./cull.js";
-import type { LabelBox } from "./cull.js";
+import { cullLabels, labelGeometry } from "./cull.js";
+import type { LabelBox, TextAnchor } from "./cull.js";
 
 /** A label anchored in REFERENCE (projected, pre-transform) pixel space. */
 export interface LabelAnchor {
@@ -17,8 +17,19 @@ export interface LabelAnchor {
    * any zoom, and culling reflects where the label actually sits (no overlap as you zoom in).
    */
   offset?: [number, number];
-  /** Optional CSS transform applied at the (offset) anchor point. The consumer owns
-   *  layout-specific placement (radial rotation, etc.); use `offset` for the gap. */
+  /**
+   * Reading-direction angle in radians. Setting it switches the label to the ORIENTED model:
+   * the library derives BOTH the rendered CSS transform and the collision box from this single
+   * angle (with {@link textAnchor}/{@link keepUpright}), so they cannot drift apart. Leave it
+   * undefined for a plain axis-aligned label and supply your own {@link transform}.
+   */
+  rotation?: number;
+  /** Oriented labels only: which way the text runs from the anchor (default "start"). */
+  textAnchor?: TextAnchor;
+  /** Oriented labels only: flip 180° to keep the text upright (radial-tree readability flip). */
+  keepUpright?: boolean;
+  /** Optional CSS transform for a PLAIN label (ignored when `rotation` is set, since the
+   *  library then generates the transform). Use `offset` for the constant-px gap. */
   transform?: string;
   /** transform-origin for the node; defaults to "0 0" (the anchor point). */
   transformOrigin?: string;
@@ -55,6 +66,9 @@ export class LabelLayer {
       height: a.height,
       priority: a.priority,
       text: a.text,
+      rotation: a.rotation,
+      textAnchor: a.textAnchor,
+      keepUpright: a.keepUpright,
       transform: a.transform,
       transformOrigin: a.transformOrigin,
     }));
@@ -82,7 +96,10 @@ export class LabelLayer {
       });
       node.style.left = `${Math.round(box.x)}px`;
       node.style.top = `${Math.round(box.y)}px`;
-      node.style.transform = (box.transform as string) ?? "";
+      // Oriented labels: the library generates the transform from the same geometry used for
+      // collision (so render and culling agree). Plain labels keep the caller's transform.
+      node.style.transform =
+        box.rotation !== undefined ? labelGeometry(box).transform : ((box.transform as string) ?? "");
       node.style.transformOrigin = (box.transformOrigin as string) ?? "0 0";
     }
 
