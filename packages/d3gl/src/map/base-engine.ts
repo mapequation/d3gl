@@ -87,6 +87,20 @@ export interface EngineSizing {
   aspectRatio?: number;
 }
 
+/**
+ * Options every engine shares, owned and consumed once by the {@link BaseEngine} constructor.
+ * Each engine's options type (e.g. `GeoMapOptions`, `PlotOptions`) extends this and adds only
+ * its own fields, so a base-level setting is declared in exactly one place and can't drift or
+ * be silently dropped by an engine that forgot to wire it.
+ */
+export interface BaseEngineOptions extends EngineSizing {
+  /** Which renderer to draw with — see {@link BackendType}. Defaults to `"webgl"`.
+   *  Use `"auto"` for an instant Canvas first paint that upgrades to WebGL in the background. */
+  backend?: BackendType;
+  /** Class(es) for the hover tooltip box, replacing its default inline look. */
+  tooltipClass?: string;
+}
+
 /** Fallback CSS size used only when a responsive host can't be measured yet (detached / zero
  *  box); the ResizeObserver corrects it on the first real layout. Matches the <canvas> defaults. */
 const DEFAULT_WIDTH = 300;
@@ -161,7 +175,8 @@ export abstract class BaseEngine {
   private sizingObserver?: ResizeObserver;
   private resizeRaf = 0;
 
-  constructor(protected host: HTMLElement, sizing: EngineSizing, backend: BackendType) {
+  constructor(protected host: HTMLElement, opts: BaseEngineOptions) {
+    const backend = opts.backend ?? "webgl";
     this.currentBackend = backend;
     // Backend canvases are positioned absolutely (see makeCanvas) so transiently-coexisting
     // canvases during an "auto" upgrade overlap instead of stacking in normal flow. An
@@ -172,9 +187,10 @@ export abstract class BaseEngine {
     if (typeof getComputedStyle === "function" && getComputedStyle(host).position === "static") {
       host.style.position = "relative";
     }
-    const size = this.resolveSizing(sizing);
+    const size = this.resolveSizing(opts);
     this.width = size.width;
     this.height = size.height;
+    this.tooltipClass = opts.tooltipClass;
     if (backend === "auto") {
       // Instant canvas first paint; whenReady() resolves now. WebGL is built in the background.
       this.ready = Promise.resolve();
