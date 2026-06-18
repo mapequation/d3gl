@@ -46,7 +46,12 @@ function pointTooltip(d: Point): HTMLElement {
 export const setup: ImperativeSetup = (host, { width, height, backend }) => {
   const W = width, H = height;
 
-  const chart = plot(host, { width: W, height: H, backend });
+  const chart = plot(host, {
+    width: W, height: H, backend,
+    // Themed (dark-mode aware) tooltip card — now honored on `plot` via BaseEngineOptions.
+    tooltipClass:
+      "rounded border border-border bg-card/95 px-1.5 py-0.5 text-xs text-foreground",
+  });
 
   // Click selection is wired once: it reads the clicked point's category from a lookup that
   // `render` refreshes whenever the point cloud is rebuilt, then selects the whole category.
