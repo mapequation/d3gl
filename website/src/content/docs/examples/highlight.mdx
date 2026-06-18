@@ -6,6 +6,7 @@ description: Hover-highlight and click-selection — on a geographic value grid 
 import ExampleCard from "../../../components/ExampleCard.astro";
 import Highlight from "../../../examples/highlight/Highlight.tsx";
 import PlotHighlight from "../../../examples/plot-highlight/PlotHighlight.tsx";
+import ScatterStress from "../../../examples/scatter-stress/ScatterStress.tsx";
 
 The hover-highlight, tooltip, and click-selection API lives on the engines' shared base, so it
 works identically on both [`geoMap`](/d3gl/reference/map/classes/geomap/) and
@@ -39,4 +40,22 @@ difference from the map version is the engine factory and the layer-definition c
 
 <ExampleCard files={["plot-highlight/draw.ts"]}>
   <PlotHighlight client:visible slot="demo" />
+</ExampleCard>
+
+## Stress test: hover & selection at scale
+
+How well do hover and selection hold up as the point count climbs? The **points** slider grows
+the scatter from 32 to ~1M points, each with a random category 1–10 (color) and a random value
+(radius). **Hover** any point for a tooltip of all its properties; **click** a point to select
+its whole category — every other point dims to 20%. Click empty space to clear. Scroll to zoom,
+drag to pan. On the WebGL backend it stays smooth at the top of the range.
+
+The layer's hit index keeps hover instant even at the top of the range, and selection only
+rewrites the per-point color tables — no re-upload of geometry. The rich tooltip is built with
+d3gl's `h` hyperscript helper. The **coords** toggle picks
+`world` (radii scale with zoom) vs `screen` (constant-pixel radii), exactly as in the
+[ancestral ranges](/d3gl/examples/ancestral-ranges/) example.
+
+<ExampleCard files={["scatter-stress/draw.ts"]}>
+  <ScatterStress client:visible slot="demo" />
 </ExampleCard>
