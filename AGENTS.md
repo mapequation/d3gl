@@ -59,7 +59,12 @@ long it stays useful:
    (`gh auth refresh -s project,read:project`).
 3. Move **Backlog → Ready** when triaged (manual — see below), **→ In progress** when
    you start, **→ In review** when the PR is open, **→ Done** on merge/close.
-4. Branch (worktree under `.claude/worktrees/`), open PR with `Fixes #N`.
+4. Branch (worktree under `.claude/worktrees/`). **Immediately `pnpm install` in the new
+   worktree** — a fresh worktree has its own *empty* `node_modules` (it's a separate working
+   tree; deps are not shared from the primary checkout), so every build/typecheck/test fails
+   (or silently runs against missing/stale deps) until you install. Do this *before* the first
+   `tsc`/`astro check`/`vitest`/build command, not after it errors. Then open the PR with
+   `Fixes #N`.
 5. **Merge with squash** (see below), then **delete the feature branch** (local +
    remote) once it's in `main`.
 
