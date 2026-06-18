@@ -112,6 +112,50 @@ function RestartIcon() {
   );
 }
 
+/** Corner-bracket "maximize" glyph (enter fullscreen) — Lucide `maximize`. */
+function FullscreenIcon() {
+  return (
+    <svg
+      width="13"
+      height="13"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2.2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+    >
+      <path d="M8 3H5a2 2 0 0 0-2 2v3" />
+      <path d="M21 8V5a2 2 0 0 0-2-2h-3" />
+      <path d="M3 16v3a2 2 0 0 0 2 2h3" />
+      <path d="M16 21h3a2 2 0 0 0 2-2v-3" />
+    </svg>
+  );
+}
+
+/** Corner-bracket "minimize" glyph (exit fullscreen) — Lucide `minimize`. */
+function ExitFullscreenIcon() {
+  return (
+    <svg
+      width="13"
+      height="13"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2.2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+    >
+      <path d="M8 3v3a2 2 0 0 1-2 2H3" />
+      <path d="M21 8h-3a2 2 0 0 1-2-2V3" />
+      <path d="M3 16h3a2 2 0 0 1 2 2v3" />
+      <path d="M16 21v-3a2 2 0 0 1 2-2h3" />
+    </svg>
+  );
+}
+
 /** A range slider with a live value label, committing on release. */
 function RangeSlider(props: {
   spec: Extract<ControlSpec, { type: "range" }>;
@@ -261,6 +305,44 @@ export default function Example(props: ExampleProps) {
   // an error, so it rebuilds cleanly on the (supported) default backend.
   const [resetKey, setResetKey] = useState(0);
 
+  // Fullscreen: lift the whole .d3gl-live block into a fixed viewport-filling overlay.
+  // We only toggle classes/styles on the existing nodes (no portal / no reparenting), so the
+  // engine subtree stays mounted — the canvas ResizeObserver below then resizes the engine IN
+  // PLACE to the bigger size, preserving zoom/hover/selection. Escape or the toggle button exits.
+  const [fullscreen, setFullscreen] = useState(false);
+  const rootRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (!fullscreen) return;
+    const onKey = (e: KeyboardEvent): void => {
+      if (e.key === "Escape") setFullscreen(false);
+    };
+    window.addEventListener("keydown", onKey);
+    const prevOverflow = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+
+    // The overlay is `position: fixed`, but a `fixed` child is still trapped inside any ancestor
+    // that forms a stacking context — Starlight's `.main-pane` sets `isolation: isolate`, which
+    // would render the page chrome (sidebar/header, z-index ≤ 20) ON TOP of our overlay. Rather
+    // than reparent the engine (a portal would remount it and lose zoom), temporarily clear
+    // `isolation` on the trapping ancestors while fullscreen and restore it on exit.
+    const restores: Array<() => void> = [];
+    for (let el = rootRef.current?.parentElement; el && el !== document.body; el = el.parentElement) {
+      if (getComputedStyle(el).isolation === "isolate") {
+        const node = el;
+        const prev = node.style.isolation;
+        node.style.isolation = "auto";
+        restores.push(() => {
+          node.style.isolation = prev;
+        });
+      }
+    }
+    return () => {
+      window.removeEventListener("keydown", onKey);
+      document.body.style.overflow = prevOverflow;
+      for (const restore of restores) restore();
+    };
+  }, [fullscreen]);
+
   // Restore the DEFAULT (supported) backend + options and re-mount the example so
   // a failed swap (e.g. svg + passThrough) recovers into a working state.
   const handleReset = (): void => {
@@ -323,7 +405,13 @@ export default function Example(props: ExampleProps) {
   };
 
   return (
-    <div className="d3gl-live bg-card text-foreground">
+    <div
+      ref={rootRef}
+      className={[
+        "d3gl-live bg-card text-foreground",
+        fullscreen ? "fixed inset-0 z-[100] flex flex-col" : "",
+      ].join(" ")}
+    >
       {/* Status row: backend switch (left), export, perf (right). */}
       <div className="flex flex-wrap items-center gap-x-3 gap-y-1.5 px-3 py-2">
         <Segmented value={backend} options={BACKENDS} onChange={setBackend} />
@@ -333,6 +421,12 @@ export default function Example(props: ExampleProps) {
         <PerfMeter />
         <IconButton onClick={handleReset} title="Restart example">
           <RestartIcon />
+        </IconButton>
+        <IconButton
+          onClick={() => setFullscreen((f) => !f)}
+          title={fullscreen ? "Exit fullscreen" : "Enter fullscreen"}
+        >
+          {fullscreen ? <ExitFullscreenIcon /> : <FullscreenIcon />}
         </IconButton>
       </div>
 
@@ -397,8 +491,11 @@ export default function Example(props: ExampleProps) {
 
       <div
         ref={canvasRef}
-        className="d3gl-canvas relative w-full bg-white"
-        style={{ maxWidth: width, height }}
+        className={[
+          "d3gl-canvas relative w-full bg-white",
+          fullscreen ? "min-h-0 flex-1" : "",
+        ].join(" ")}
+        style={fullscreen ? undefined : { maxWidth: width, height }}
       >
         <ErrorBoundary key={resetKey} onReset={handleReset}>
           {children(ctx)}
