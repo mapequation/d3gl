@@ -73,6 +73,28 @@ describe("Plot interaction options (lifted from BaseEngine, same as GeoMap)", ()
     host.remove();
   });
 
+  it("tooltipClass styles the plot tooltip (shared base option, not just GeoMap)", async () => {
+    const host = document.createElement("div");
+    host.style.width = "200px"; host.style.height = "200px";
+    document.body.appendChild(host);
+    const chart = plot(host, { width: 200, height: 200, backend: "canvas", tooltipClass: "my-tip" });
+    await chart.whenReady();
+    chart.layer<{ x: number; y: number }>("boxes", [{ x: 20, y: 20 }], {
+      draw: (ctx: PathContext, d) => ctx.rect(d.x, d.y, 40, 40),
+      fill: "rgb(0,0,255)", id: () => "b0",
+      tooltip: () => "x",
+    });
+    chart.render();
+
+    pointer(host, "pointermove", 40, 40);
+    const tip = host.querySelector(".d3gl-tooltip") as HTMLDivElement;
+    expect(tip).toBeTruthy();
+    expect(tip.classList.contains("my-tip")).toBe(true);
+    expect(tip.style.background).toBe(""); // className branch: no inline default look
+    chart.destroy();
+    host.remove();
+  });
+
   it("select() dims the complement and clears on null", async () => {
     const { chart, host } = await makePlot();
     chart.layer<{ x: number; y: number }>("boxes", [{ x: 20, y: 20 }, { x: 120, y: 120 }], {

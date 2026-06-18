@@ -1,19 +1,10 @@
 import type { GroupBuilder, PathContext, LineJoin, LineCap } from "../core/index.js";
-import { BaseEngine, type InteractiveLayerOptions } from "./base-engine.js";
-import type { BackendType } from "./backend-factory.js";
+import { BaseEngine, type InteractiveLayerOptions, type BaseEngineOptions } from "./base-engine.js";
 import { LayerHandle } from "./layer-handle.js";
 
-export interface PlotOptions {
-  /** Fixed width (px). Omit for responsive sizing — see {@link EngineSizing}. */
-  width?: number;
-  /** Fixed height (px). Omit for responsive sizing — see {@link EngineSizing}. */
-  height?: number;
-  /** width ÷ height. When set, the plot fills its parent's width and keeps this ratio. */
-  aspectRatio?: number;
-  /** Which renderer to draw with — see {@link BackendType}. Defaults to `"webgl"`.
-   *  Use `"auto"` for an instant Canvas first paint that upgrades to WebGL in the background. */
-  backend?: BackendType;
-}
+/** Plot adds no engine-level options of its own — all of {@link BaseEngineOptions}
+ *  (sizing, `backend`, `tooltipClass`) apply. */
+export interface PlotOptions extends BaseEngineOptions {}
 export interface PlotLayerOptions<D = any> extends InteractiveLayerOptions<D> {
   /**
    * Draw one datum's geometry by emitting path commands. The context is typed as
@@ -79,7 +70,7 @@ export interface PlotPointOptions<D = any> extends InteractiveLayerOptions<D> {
 
 export class Plot extends BaseEngine {
   constructor(host: HTMLElement, opts: PlotOptions = {}) {
-    super(host, { width: opts.width, height: opts.height, aspectRatio: opts.aspectRatio }, opts.backend ?? "webgl");
+    super(host, opts);
   }
 
   layer<D>(name: string, data: readonly D[], opts: PlotLayerOptions<D>): LayerHandle<D> {

@@ -2,24 +2,12 @@ import { type GeoProjection, geoPath } from "d3-geo";
 import { geoLayer, projectVisiblePoint } from "../geo/index.js";
 import { PathRecorder } from "../core/index.js";
 import versor, { type Angles, type Vec3, type Quaternion } from "../geo/versor.js";
-import { BaseEngine, type HoverHit, type LayerSpec, type InteractiveLayerOptions } from "./base-engine.js";
-import type { BackendType } from "./backend-factory.js";
+import { BaseEngine, type HoverHit, type LayerSpec, type InteractiveLayerOptions, type BaseEngineOptions } from "./base-engine.js";
 import type { ViewTransform, LineJoin, LineCap } from "../core/index.js";
 import { LayerHandle } from "./layer-handle.js";
 
-export interface GeoMapOptions {
-  /** Fixed width (px). Omit for responsive sizing — see {@link EngineSizing}. */
-  width?: number;
-  /** Fixed height (px). Omit for responsive sizing — see {@link EngineSizing}. */
-  height?: number;
-  /** width ÷ height. When set, the map fills its parent's width and keeps this ratio. */
-  aspectRatio?: number;
+export interface GeoMapOptions extends BaseEngineOptions {
   projection: GeoProjection;
-  /** Which renderer to draw with — see {@link BackendType}. Defaults to `"webgl"`.
-   *  Use `"auto"` for an instant Canvas first paint that upgrades to WebGL in the background. */
-  backend?: BackendType;
-  /** Class(es) for the hover tooltip box, replacing its default inline look. */
-  tooltipClass?: string;
 }
 export interface LayerOptions<F = any> extends InteractiveLayerOptions<F> {
   fill?: string | ((f: F, i: number) => string);
@@ -82,10 +70,9 @@ export class GeoMap extends BaseEngine {
   private interactionRequest: { extent: [number, number]; onTransform?: (t: ViewTransform) => void } | null = null;
 
   constructor(host: HTMLElement, opts: GeoMapOptions) {
-    super(host, { width: opts.width, height: opts.height, aspectRatio: opts.aspectRatio }, opts.backend ?? "webgl");
+    super(host, opts);
     this.projection = opts.projection;
     this.baseScale = opts.projection.scale();
-    this.tooltipClass = opts.tooltipClass;
   }
 
   /**
