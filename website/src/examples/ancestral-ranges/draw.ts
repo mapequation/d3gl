@@ -2,7 +2,7 @@ import { schemeCategory10 } from "d3-scale-chromatic";
 import { scaleOrdinal, scaleSqrt } from "d3-scale";
 import { link as d3link, linkRadial, curveLinear, curveStepBefore, curveBumpX, pointRadial } from "d3-shape";
 import type { HierarchyPointNode, HierarchyPointLink } from "d3-hierarchy";
-import { plot } from "@mapequation/d3gl/map";
+import { plot, h } from "@mapequation/d3gl/map";
 import { LabelLayer, type LabelAnchor } from "@mapequation/d3gl/labels";
 import type { ImperativeSetup } from "../types.js";
 import type { TreeNode } from "../shared/tree.js";
@@ -102,6 +102,32 @@ function topRegion(node: PNode): number | undefined {
   return pieSlices(node)[0]?.clusterId;
 }
 
+/** Hover-tooltip body: a small table of the node's reconstructed regions, each row sized
+ *  exactly as its pie wedge (share = wedge angle / 2π) and labelled with its occurrence
+ *  count. The header names a tip species or, for an internal node, its subtended clade
+ *  size. Built with d3gl's `h` hyperscript so the engine's shared tooltip renders it. */
+function rangeTable(node: PNode): HTMLElement | null {
+  const slices = pieSlices(node);
+  if (slices.length === 0) return null;
+  const header = node.children ? `${node.data.speciesCount ?? 1} species` : node.data.name;
+  return h("div", null, [
+    h("div", { class: "mb-1 font-semibold" }, header),
+    h("table", { class: "border-collapse" }, slices.map((s) => {
+      const share = Math.round(((s.a1 - s.a0) / (2 * Math.PI)) * 100);
+      return h("tr", null, [
+        h("td", { class: "pr-1.5" },
+          h("span", {
+            class: "inline-block h-2.5 w-2.5 rounded-sm align-middle",
+            style: `background:${regionColor(s.clusterId)}`,
+          })),
+        h("td", { class: "pr-2.5" }, REGION_NAMES[s.clusterId] ?? `#${s.clusterId}`),
+        h("td", { class: "pr-1.5 text-right tabular-nums" }, s.count),
+        h("td", { class: "text-right tabular-nums opacity-60" }, `${share}%`),
+      ]);
+    })),
+  ]);
+}
+
 /** Constant screen-px offset from the node: rightward (rectangular) or outward along the
  *  radius (radial). Vertical centering for rectangular is folded in as -height/2. */
 function labelOffset(mode: LayoutMode, angle: number, gap: number, height: number): [number, number] {
@@ -117,6 +143,10 @@ function labelOffset(mode: LayoutMode, angle: number, gap: number, height: numbe
  * (rectangular | radial), `curve` (linear | step | bump), and `coords`
  * (screen | world) from the harness options. Pure d3gl; the harness owns the
  * controls, backend, export, and zoom.
+ *
+ * Hovering a node pie or a branch shows a region tooltip (`rangeTable`) and a
+ * highlight, driven by the engine's pick path (a per-layer hit index + a
+ * `pick()` on each pointermove).
  */
 export const setup: ImperativeSetup = (host, { width, height, backend }) => {
   const W = width, H = height;
@@ -213,6 +243,10 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
         stroke: (l: PLink) => { const t = topRegion(l.target); return t == null ? "#777" : regionColor(t); },
         lineWidth: (l: PLink) => widthBase(l.target),
         sizeMode,
+        id: (_l, i) => i,
+        // Hovering a branch darkens it and reads out its child clade's range distribution.
+        hover: { stroke: "#111" },
+        tooltip: (l: PLink) => rangeTable(l.target),
       });
 
       const wedges: Wedge[] = [];
@@ -235,6 +269,9 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
         // Screen mode: declutter overlapping fixed-size pies on zoom (bigger clades win).
         declutter: sizeMode === "screen" ? SCREEN_PIE_R * 2 + 2 : undefined,
         id: (_w, i) => i,
+        // Hovering a pie outlines the wedge and reads out the whole node's range distribution.
+        hover: { stroke: "#222", lineWidth: 1 },
+        tooltip: (w: Wedge) => rangeTable(w.node),
       });
 
       chart.render();
