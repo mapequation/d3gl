@@ -6,7 +6,8 @@ const MIN_POINTS_EXPONENT = 5;
 const MAX_POINTS_EXPONENT = 20;
 const POINTS_LABELS = Array.from(
   { length: MAX_POINTS_EXPONENT - MIN_POINTS_EXPONENT + 1 },
-  (_, i) => String(2 ** (i + MIN_POINTS_EXPONENT)),
+  // Locale thousands grouping (built-in) so e.g. 1048576 reads as "1,048,576".
+  (_, i) => (2 ** (i + MIN_POINTS_EXPONENT)).toLocaleString(),
 );
 
 /** Harness wrapper: a hover/selection stress test on a `plot` scatter — a points slider

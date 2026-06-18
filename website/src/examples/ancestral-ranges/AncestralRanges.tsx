@@ -6,7 +6,8 @@ const MIN_TIPS_EXPONENT = 5;
 const MAX_TIPS_EXPONENT = 16;
 const TIPS_LABELS = Array.from(
   { length: MAX_TIPS_EXPONENT - MIN_TIPS_EXPONENT + 1 },
-  (_, i) => String(2 ** (i + MIN_TIPS_EXPONENT)),
+  // Locale thousands grouping (built-in) so e.g. 65536 reads as "65,536".
+  (_, i) => (2 ** (i + MIN_TIPS_EXPONENT)).toLocaleString(),
 );
 
 /** Harness wrapper: a mammal phylogeny with Fitch-parsimony ancestral-range pies. */

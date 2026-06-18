@@ -165,12 +165,16 @@ function RangeSlider(props: {
   const { spec } = props;
   const [live, setLive] = useState(props.value);
   useEffect(() => setLive(props.value), [props.value]);
-  const display = spec.display?.[(live - spec.min) / spec.step] ?? String(live);
+  const labelAt = (v: number): string => spec.display?.[(v - spec.min) / spec.step] ?? String(v);
+  const display = labelAt(live);
+  // Reserve a stable readout width from the widest possible label so growing digits never
+  // shift the slider (and the controls after it). tabular-nums keeps each digit fixed-width.
+  const widest = spec.display
+    ? spec.display.reduce((a, b) => (b.length > a.length ? b : a), "")
+    : String(spec.max);
   return (
     <div className="flex h-6 items-center gap-1.5">
-      <span className="text-muted-foreground text-[11px]">
-        {spec.label} {display}
-      </span>
+      <span className="text-muted-foreground text-[11px]">{spec.label}</span>
       <input
         type="range"
         className="accent-primary h-1 w-32"
@@ -183,6 +187,13 @@ function RangeSlider(props: {
         onPointerUp={() => props.onCommit(live)}
         onKeyUp={() => props.onCommit(live)}
       />
+      {/* Live value as a right-aligned readout after the track (label — control — value). */}
+      <span
+        className="text-muted-foreground text-right text-[11px] tabular-nums"
+        style={{ width: `${widest.length}ch` }}
+      >
+        {display}
+      </span>
     </div>
   );
 }
