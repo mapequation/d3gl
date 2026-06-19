@@ -71,7 +71,7 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
     view = t;
     labels.update(anchors, t, { width: W, height: H });
   };
-  chart.enableZoom([0.4, 12], (t) => updateLabels(t)); // scroll to zoom, drag to pan
+  chart.enableZoom([0.3, 40], (t) => updateLabels(t)); // scroll to zoom, drag to pan (deep range)
 
   return {
     engine: chart,

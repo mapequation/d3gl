@@ -115,4 +115,34 @@ describe("screen-space declutter (flat-grid cull)", () => {
     chart.destroy();
     host.remove();
   });
+
+  it("declutters analytic points (chart.points) — anchor defaults to each point's center", async () => {
+    const W = 900, H = 450, N = 1500, RADIUS = 26;
+    const host = document.createElement("div");
+    host.style.width = `${W}px`; host.style.height = `${H}px`;
+    document.body.appendChild(host);
+    const chart = plot(host, { width: W, height: H, backend: "webgl" });
+    await chart.whenReady();
+
+    const rnd = mulberry32(N);
+    const nodes = Array.from({ length: N }, (_, i) => ({ id: i, x: 60 + rnd() * (W - 120), y: 60 + rnd() * (H - 120) }));
+    const anchors = nodes.map((d) => [d.x, d.y] as [number, number]);
+
+    chart.points("pts", nodes, {
+      x: (d) => d.x, y: (d) => d.y, radius: 4, fill: () => "#3b82f6",
+      sizeMode: "screen", declutter: RADIUS, id: (d) => d.id, // no explicit anchor — center is used
+    });
+    chart.render();
+
+    /* eslint-disable @typescript-eslint/no-explicit-any */
+    const flags = (chart as any).scene.buffers("pts").flags as Uint8Array;
+    /* eslint-enable @typescript-eslint/no-explicit-any */
+    const ref = referenceVisible(anchors, RADIUS, { k: 1, x: 0, y: 0 });
+    const engineVisible = Array.from(flags, (f) => (f & 1) === 1);
+    expect(engineVisible.reduce((n, v, i) => n + (v === ref[i] ? 0 : 1), 0)).toBe(0);
+    expect(ref.filter((v) => !v).length).toBeGreaterThan(0);
+
+    chart.destroy();
+    host.remove();
+  });
 });
