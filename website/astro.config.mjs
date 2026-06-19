@@ -93,6 +93,7 @@ export default defineConfig({
           { label: "World map", slug: "examples/world-map" },
           { label: "GeoJSON features", slug: "examples/geojson-features" },
           { label: "Highlight", slug: "examples/highlight" },
+          { label: "Declutter", slug: "examples/declutter" },
           { label: "Map projections", slug: "examples/map-projections" },
           { label: "Sizing", slug: "examples/sizing" },
           { label: "Streaming data", slug: "examples/streaming" },
