@@ -5,13 +5,16 @@ description: Screen-space collision culling — overlapping glyphs and labels dr
 
 import ExampleCard from "../../../components/ExampleCard.astro";
 import Declutter from "../../../examples/declutter/Declutter.tsx";
+import DeclutterPoints from "../../../examples/declutter-points/DeclutterPoints.tsx";
 
 A scatter of labelled nodes that thins itself out when the view gets crowded. Each node is a
 constant-pixel circle with a name label beside it; importance drives the radius, the color, and
 the priority. **Scroll to zoom, drag to pan** — zoom **out** and the anchors crowd together, so
 low-priority circles and overlapping labels drop out; zoom back **in** and they return. The
 **Declutter** slider is the literal collision radius in pixels (0 turns it off); the **Nodes**
-slider grows the cloud up to ~16k to stress the per-zoom collision pass.
+slider grows the cloud up to ~262k to stress the per-zoom collision pass.
+
+## Labelled scatter
 
 <ExampleCard files={["declutter/draw.ts"]}>
   <Declutter client:visible slot="demo" />
@@ -72,3 +75,31 @@ The two systems express priority differently, so keep them consistent:
 The `offset` is a constant pixel gap applied to both the rendered position **and** the collision
 box, so the label stays a fixed distance from its node at any zoom and culling reflects where the
 label actually sits.
+
+## A million points
+
+The scatter above draws each circle as a tessellated `ctx.arc` **path** so it can carry an
+`anchor` for declutter — but a path circle is tens of vertices, so the geometry gets heavy past a
+few hundred thousand. For large clouds, use **analytic points** instead: `chart.points(...)`
+draws each circle on the GPU from a single quad (~4 vertices), and a point's **anchor defaults to
+its own center**, so `declutter` works with no extra wiring. That lifts the **Nodes** slider to
+~1M on the same per-zoom cull.
+
+This example drops the label overlay (an HTML `LabelLayer` can't follow a million nodes) and sets
+`pickable: false` (a per-point hit index would dwarf the geometry), so it's a pure glyph-declutter
+stress test. Scroll to zoom — the deep zoom range lets the crowd fully resolve.
+
+<ExampleCard files={["declutter-points/draw.ts"]}>
+  <DeclutterPoints client:visible slot="demo" />
+</ExampleCard>
+
+```ts
+chart.points("nodes", points, {
+  x: (d) => d.x, y: (d) => d.y,
+  radius: (d) => d.radius,        // per-point radius, like the path version
+  fill: (d) => color(d.importance),
+  sizeMode: "screen",             // constant pixel size — declutter compares on-screen distances
+  declutter: 30,                  // anchor defaults to each point's center; no explicit anchor
+  pickable: false,                // skip the per-point hit index so ~1M stays lean
+});
+```

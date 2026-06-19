@@ -314,7 +314,11 @@ export class Scene {
     data.joins.push("bevel");
     data.miterLimits.push(DEFAULT_MITER_LIMIT);
     data.caps.push("butt");
-    data.anchors.push(null);
+    // A lone point carries its center as the glyph anchor, so screen-space declutter can act on
+    // analytic points (rendering reads `pointCenters`, and screen-mode hit-testing already used
+    // the lone center as its anchor — so this only newly enables declutter, nothing else changes).
+    // A MultiPoint has no single anchor.
+    data.anchors.push(centers.length === 1 ? [centers[0]![0], centers[0]![1]] : null);
     // Zero fill+stroke range to keep ranges index-aligned with drawableId.
     const fillVertexOffset = data.fillVerts.length / 3;
     const strokeVertexOffset = data.strokeVerts.length / 3;

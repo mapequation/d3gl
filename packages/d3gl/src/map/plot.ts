@@ -55,6 +55,11 @@ export interface PlotPointOptions<D = any> extends InteractiveLayerOptions<D> {
   clipTo?: string;
   /** "world" (default): radius scales with zoom. "screen": constant pixel size. */
   sizeMode?: "world" | "screen";
+  /** Screen-space declutter radius (px): on each transform, hide points whose projected center
+   *  falls within this radius of an already-kept one (earlier data wins). Each point's anchor is
+   *  its center, so unlike {@link PlotLayerOptions} no explicit `anchor` is needed. Pairs with
+   *  `sizeMode: "screen"`. Retained path only (not `passThrough`). */
+  declutter?: number;
   /** When false, skip the CPU hit index (no hover/pick) — saves an Entry per point on
    *  huge non-interactive layers (e.g. streamed points). */
   pickable?: boolean;
@@ -85,6 +90,7 @@ export class Plot extends BaseEngine {
     if (opts.passThrough) {
       if (opts.hover || opts.tooltip || opts.selection)
         throw new Error("hover/tooltip/selection require a retained layer (passThrough layers are not pickable)");
+      if (opts.declutter) throw new Error("declutter requires a retained layer (passThrough has no per-drawable visibility flags)");
       const radius = opts.radius ?? 3;
       const radiusOf = typeof radius === "function"
         ? (d: D, i: number) => (radius as (d: D, i: number) => number)(d, i)
@@ -111,7 +117,7 @@ export class Plot extends BaseEngine {
     const list = data as D[];
     const ids = list.map((d, i) => (opts.id ? opts.id(d, i) : i));
     this.dropInteractionState(name); // a re-declared layer starts with base styles
-    this.registerLayer({ name, data: list, ids, fill: opts.fill, stroke: opts.stroke, clipTo: opts.clipTo, sizeMode: opts.sizeMode, pickable: opts.pickable, ...this.interactionFields(opts), build: this.buildPoints(list, ids, 0, opts) });
+    this.registerLayer({ name, data: list, ids, fill: opts.fill, stroke: opts.stroke, clipTo: opts.clipTo, sizeMode: opts.sizeMode, declutter: opts.declutter, pickable: opts.pickable, ...this.interactionFields(opts), build: this.buildPoints(list, ids, 0, opts) });
     return new LayerHandle<D>(this, name, (items) => this.appendPoints(name, items, opts));
   }
 
