@@ -128,6 +128,30 @@ describe("Plot interaction options (lifted from BaseEngine, same as GeoMap)", ()
     host.remove();
   });
 
+  it("hover hit-test on a screen-mode point follows the rendered pixel size at k != 1", async () => {
+    const { chart, host } = await makePlot();
+    // World point at (50,50), constant 12px radius. At k=2 it renders centered on
+    // screen (100,100) with a radius that STAYS 12px (screen mode).
+    chart.points<{ x: number; y: number }>("pts", [{ x: 50, y: 50 }], {
+      x: (d) => d.x, y: (d) => d.y, radius: 12, sizeMode: "screen",
+      fill: "rgb(0,0,255)", id: () => "p0",
+      hover: { fill: "rgb(0,255,0)" },
+    });
+    chart.setTransform({ k: 2, x: 0, y: 0 });
+    chart.render();
+
+    // 8px from the rendered center → inside the visible 12px dot → hit.
+    pointer(host, "pointermove", 108, 100);
+    expect([...pixelAt(host, 100, 100)].slice(0, 3)).toEqual([0, 255, 0]);
+
+    // 18px from the rendered center → OUTSIDE the visible 12px dot → must NOT hit.
+    // (The bug accepts up to 12 world units = 24px here, so it wrongly hits empty space.)
+    pointer(host, "pointermove", 118, 100);
+    expect([...pixelAt(host, 100, 100)].slice(0, 3)).toEqual([0, 0, 255]);
+    chart.destroy();
+    host.remove();
+  });
+
   it("rejects hover/tooltip/selection on passThrough point layers", async () => {
     const { chart, host } = await makePlot();
     expect(() =>

@@ -312,7 +312,7 @@ export abstract class BaseEngine {
     else this.specs.push(spec);
     // pickable:false skips the hit index entirely (no Entry-per-drawable) — for big
     // non-interactive layers. pick() simply can't return that layer (get()?.pick → skip).
-    if (spec.pickable !== false) this.hitIndexes.set(spec.name, new HitIndex(this.scene.drawables(spec.name)));
+    if (spec.pickable !== false) this.hitIndexes.set(spec.name, new HitIndex(this.scene.drawables(spec.name), 1, spec.sizeMode === "screen"));
     else this.hitIndexes.delete(spec.name);
     // Seed the incremental id map from the full (re)built spec (O(total) here, but a
     // register/rebuild is already O(total); appends then stay O(new)). Raw ids (no
@@ -840,17 +840,19 @@ export abstract class BaseEngine {
     return this;
   }
   pick(x: number, y: number): HoverHit | null {
-    const px = (x - this.transform.x) / this.transform.k;
-    const py = (y - this.transform.y) / this.transform.k;
+    // x,y are SCREEN (CSS px); the HitIndex applies the transform itself (per-mode: invert for
+    // world layers, project-the-anchor for screen layers — so screen geometry picks at its
+    // rendered pixel size at any zoom, not a hit area that scales with the view transform).
+    const t = this.transform;
     for (let i = this.specs.length - 1; i >= 0; i--) {
       const spec = this.specs[i]!;
-      const id = this.hitIndexes.get(spec.name)?.pick(px, py);
+      const id = this.hitIndexes.get(spec.name)?.pick(x, y, t);
       if (id == null) continue;
       // Visually clipped away ⇒ not a hit: with clipTo, the point must also fall on the
       // clip source's geometry. Skipped when the source has no hit index (pickable:false).
       if (spec.clipTo) {
         const clip = this.hitIndexes.get(spec.clipTo);
-        if (clip && clip.pick(px, py) == null) continue;
+        if (clip && clip.pick(x, y, t) == null) continue;
       }
       const di = this.layerIds.get(spec.name)?.get(id) ?? -1;
       return { layer: spec.name, id, datum: di >= 0 ? spec.data[di] : null };
