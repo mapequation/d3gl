@@ -66,4 +66,41 @@ describe("PathRecorder", () => {
     r.moveTo(0, 0);
     expect(() => r.arcTo(10, 0, 10, 10, 5)).toThrow(/not implemented/);
   });
+
+  it("bakes translate() into every subsequent path coordinate", () => {
+    const r = new PathRecorder();
+    r.translate(100, 50);
+    r.moveTo(0, 0);
+    r.lineTo(10, 0);
+    r.rect(0, 0, 5, 5);
+    expect(r.subpaths[0]!.points).toEqual([100, 50, 110, 50]);
+    expect(r.subpaths[1]!.points).toEqual([100, 50, 105, 50, 105, 55, 100, 55]);
+  });
+
+  it("accumulates successive translate() calls like canvas", () => {
+    const r = new PathRecorder();
+    r.translate(10, 10);
+    r.translate(5, 0);
+    r.moveTo(0, 0);
+    expect(r.subpaths[0]!.points).toEqual([15, 10]);
+  });
+
+  it("offsets an arc's centre and start point by translate()", () => {
+    const r = new PathRecorder();
+    r.translate(100, 100);
+    r.arc(0, 0, 10, 0, Math.PI / 2);
+    const pts = r.subpaths[0]!.points;
+    // Start at centre + (r, 0) = (110, 100); arc stays a radius-10 circle about (100, 100).
+    expect(pts.slice(0, 2)).toEqual([110, 100]);
+    expect(pts.slice(-2)[0]).toBeCloseTo(100, 6);
+    expect(pts.slice(-2)[1]).toBeCloseTo(110, 6);
+  });
+
+  it("offsets an origin-centred generator path (radial-tree idiom)", () => {
+    // moveTo with no prior point still honours the offset (the lineTo→moveTo fallback path).
+    const r = new PathRecorder();
+    r.translate(7, 3);
+    r.lineTo(1, 1);
+    expect(r.subpaths[0]!.points).toEqual([8, 4]);
+  });
 });

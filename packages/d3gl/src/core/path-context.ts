@@ -9,6 +9,19 @@
  */
 export interface PathContext {
   beginPath(): void;
+  /**
+   * Shift all subsequent path coordinates by (dx, dy), accumulating like
+   * CanvasRenderingContext2D.translate. The canonical d3 idiom for placing an
+   * origin-centred generator (radial trees, chords, …) at an offset: call
+   * `translate(cx, cy)` once, then run the generator into this context unchanged.
+   *
+   * This is the only transform in the seam — no rotate/scale/save/restore. Radial
+   * generators bake angle into their coordinates, so a translation is all they need;
+   * a richer transform stack would complicate every backend for no current consumer.
+   * The offset is part of context state (not reset by beginPath) and, in retained
+   * backends, lives only for the single drawable the callback is recording.
+   */
+  translate(dx: number, dy: number): void;
   moveTo(x: number, y: number): void;
   lineTo(x: number, y: number): void;
   quadraticCurveTo(cpx: number, cpy: number, x: number, y: number): void;

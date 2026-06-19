@@ -12,6 +12,9 @@ export class CanvasContext implements PathContext {
   beginPath(): void {
     this.ctx.beginPath();
   }
+  translate(dx: number, dy: number): void {
+    this.ctx.translate(dx, dy);
+  }
   moveTo(x: number, y: number): void {
     this.ctx.moveTo(x, y);
   }
