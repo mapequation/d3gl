@@ -86,8 +86,21 @@ export interface Backend {
    * view (same drawables, same order) so vector-reading consumers (Canvas redraw, SVG
    * serialize, toSVG export) stay in sync with the raster output. Backends without it
    * are driven through `updateLayer` (full re-upload).
+   *
+   * `drawables` may be omitted (`undefined`): the caller does this on a backend that doesn't
+   * render from the vector view (see {@link stylesNeedDrawables}) to skip an O(n) rebuild on a
+   * hot path (e.g. per-frame declutter). Such a backend must keep its previously-stored vector
+   * view; consumers that read it (e.g. `toSVG`) may then lag the tables until the next update
+   * that does pass `drawables`.
    */
-  updateLayerStyles?(name: string, tables: StyleTables, drawables: DrawableVector[]): void;
+  updateLayerStyles?(name: string, tables: StyleTables, drawables?: DrawableVector[]): void;
+  /**
+   * Whether {@link updateLayerStyles} actually *renders* from its `drawables` argument (Canvas
+   * and SVG repaint from the vector view) vs. only stashing it for export (WebGL draws from the
+   * GPU flag/color tables). When `false`, the engine may omit `drawables` on hot paths. Absent
+   * ⇒ treated as `true` (safe default: always pass the vector view).
+   */
+  readonly stylesNeedDrawables?: boolean;
   /**
    * Append-only fast path (optional). Same observable result as a full re-upload,
    * but the backend uploads/draws only the appended tail (`delta`) — O(new) instead

@@ -50,10 +50,11 @@ export class SvgBackend implements Backend {
     this.dirty = true;
   }
 
-  /** Styles-only update: swap the stored vector view and re-serialize on next render(). */
-  updateLayerStyles(name: string, _tables: StyleTables, drawables: DrawableVector[]): void {
+  /** Styles-only update: swap the stored vector view and re-serialize on next render(). SVG
+   *  renders from `drawables`, so it always needs them ({@link stylesNeedDrawables} default). */
+  updateLayerStyles(name: string, _tables: StyleTables, drawables?: DrawableVector[]): void {
     const i = this.layers.findIndex((l) => l.name === name);
-    if (i < 0) return;
+    if (i < 0 || !drawables) return;
     this.layers[i] = { ...this.layers[i]!, drawables };
     this.dirty = true;
   }

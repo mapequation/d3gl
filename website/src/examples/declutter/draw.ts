@@ -39,7 +39,11 @@ function nodeTooltip(d: Node): HTMLElement {
  *
  * Both are screen-space: zoom OUT crowds the anchors → low-priority nodes and overlapping
  * labels drop out; zoom IN spreads them → everything returns. The **Declutter** slider is the
- * literal `declutter` radius in pixels (0 = off); the **Nodes** slider grows the cloud.
+ * literal `declutter` radius in pixels (0 = off); the **Nodes** slider grows the cloud to 262k.
+ *
+ * Glyph declutter is an O(n) spatial-grid pass that scales well; the HTML LabelLayer reprojects
+ * every anchor per zoom and does not. The **Labels** toggle drops the label layer so the d3gl
+ * declutter + GPU path can be stress-tested on its own at high node counts.
  *
  * Pure d3gl; the harness owns the controls, backend, export, and the screen size.
  */
@@ -76,6 +80,7 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
     render: (options) => {
       const count = 2 ** ((options.nodes as number) ?? 6);
       const declutterPx = (options.declutter as number) ?? 30;
+      const showLabels = (options.labels ?? "on") !== "off";
 
       // Sort by importance DESC: declutter keeps the earliest-listed of any overlapping group,
       // so listing the big nodes first makes them win. (Glyph priority = input order.)
@@ -100,17 +105,22 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
       });
 
       // One label per node, placed just past its right edge. `priority` drives label culling:
-      // higher importance survives a collision (matching the glyph order above).
-      anchors = nodes.map((d) => ({
-        id: d.id,
-        refX: d.x,
-        refY: d.y,
-        text: d.label,
-        width: d.label.length * 6.2 + 4,
-        height: 14,
-        priority: d.importance,
-        offset: [d.radius + GAP, -7], // right of the circle, vertically centred
-      }));
+      // higher importance survives a collision (matching the glyph order above). The LabelLayer
+      // reprojects every anchor on each zoom/pan, so at the high end of the Nodes slider it
+      // dominates; the Labels toggle drops it entirely (empty anchors → all label DOM culled)
+      // to isolate the d3gl glyph-declutter + GPU path.
+      anchors = showLabels
+        ? nodes.map((d) => ({
+            id: d.id,
+            refX: d.x,
+            refY: d.y,
+            text: d.label,
+            width: d.label.length * 6.2 + 4,
+            height: 14,
+            priority: d.importance,
+            offset: [d.radius + GAP, -7], // right of the circle, vertically centred
+          }))
+        : [];
 
       chart.render();
       updateLabels(); // re-place labels at the CURRENT transform (preserved across changes)

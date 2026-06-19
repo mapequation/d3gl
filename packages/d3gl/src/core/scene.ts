@@ -139,7 +139,23 @@ class GroupData {
   joins: LineJoin[] = [];
   miterLimits: number[] = [];
   caps: LineCap[] = [];
+  /** Cached transform-independent declutter index (built lazily; null ⇒ stale/never built).
+   *  Invalidated whenever the group's drawable set changes (rebuild or append). */
+  declutterIndex: DeclutterIndex | null = null;
   constructor(public readonly tolerance: number) {}
+}
+
+/**
+ * Transform-independent view of a group's anchors for screen-space declutter, built once and
+ * reused across zoom frames. `ax`/`ay` are the *unique* anchor positions in first-seen (input)
+ * order — drawables sharing an exact anchor (e.g. a pie's wedges) collapse to one entry so they
+ * cull as a unit. `groupOf[i]` is the index into `ax`/`ay` for drawable `i`, or -1 when it has
+ * no anchor (never deduplicated, always kept).
+ */
+export interface DeclutterIndex {
+  ax: Float64Array;
+  ay: Float64Array;
+  groupOf: Int32Array;
 }
 
 export interface DrawableVector {
@@ -177,7 +193,9 @@ export class Scene {
    *  ones are already committed. Callers needing all-or-nothing (the engine append
    *  path) validate ids before calling. */
   appendToGroup(name: string, build: (g: GroupBuilder) => void): void {
-    build(this.builderFor(this.get(name)));
+    const data = this.get(name);
+    build(this.builderFor(data));
+    data.declutterIndex = null; // the drawable set grew; the cached anchor index is now stale
   }
 
   /** Number of drawables currently registered in a group. */
@@ -348,6 +366,50 @@ export class Scene {
   setFlag(name: string, id: string | number, flags: number): void {
     const { data, drawableId } = this.drawableIdOf(name, id);
     data.flags[drawableId] = flags & 0xff;
+  }
+
+  /**
+   * The {@link DeclutterIndex} for a group — the transform-independent anchor grouping used by
+   * screen-space declutter. Built once and cached on the group; the per-frame caller projects
+   * `ax`/`ay` to screen and bins them, so the (string-keyed) grouping never re-runs on a zoom.
+   * Invalidated automatically when the group is rebuilt ({@link group}) or appended to
+   * ({@link appendToGroup}).
+   */
+  declutterIndex(name: string): DeclutterIndex {
+    const data = this.get(name);
+    if (data.declutterIndex) return data.declutterIndex;
+    const n = data.anchors.length;
+    const groupOf = new Int32Array(n);
+    const keyToGroup = new Map<string, number>();
+    const xs: number[] = [];
+    const ys: number[] = [];
+    for (let i = 0; i < n; i++) {
+      const a = data.anchors[i];
+      if (!a) { groupOf[i] = -1; continue; } // no anchor ⇒ never deduplicated, always kept
+      const key = `${a[0]},${a[1]}`;
+      let g = keyToGroup.get(key);
+      if (g === undefined) { g = xs.length; keyToGroup.set(key, g); xs.push(a[0]); ys.push(a[1]); }
+      groupOf[i] = g;
+    }
+    const idx: DeclutterIndex = { ax: Float64Array.from(xs), ay: Float64Array.from(ys), groupOf };
+    data.declutterIndex = idx;
+    return idx;
+  }
+
+  /**
+   * Apply a per-anchor-group visibility verdict (1 = keep, 0 = hide) to the flag bytes, in
+   * place — one linear pass over the cached {@link DeclutterIndex}, with no per-id Map lookups.
+   * Drawables with no anchor (`groupOf` = -1) always stay visible. `visibleByGroup` is indexed
+   * by the same group index as `ax`/`ay`.
+   */
+  writeDeclutterFlags(name: string, visibleByGroup: Uint8Array): void {
+    const data = this.get(name);
+    const { groupOf } = data.declutterIndex ?? this.declutterIndex(name);
+    const flags = data.flags;
+    for (let i = 0; i < flags.length; i++) {
+      const g = groupOf[i]!;
+      flags[i] = g < 0 || visibleByGroup[g] ? 1 : 0;
+    }
   }
 
   /** Build the vector view of one drawable at index `i` (shared by drawables()/drawableOf()). */

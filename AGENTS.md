@@ -59,12 +59,22 @@ long it stays useful:
    (`gh auth refresh -s project,read:project`).
 3. Move **Backlog → Ready** when triaged (manual — see below), **→ In progress** when
    you start, **→ In review** when the PR is open, **→ Done** on merge/close.
-4. Branch (worktree under `.claude/worktrees/`). **Immediately `pnpm install` in the new
-   worktree** — a fresh worktree has its own *empty* `node_modules` (it's a separate working
-   tree; deps are not shared from the primary checkout), so every build/typecheck/test fails
-   (or silently runs against missing/stale deps) until you install. Do this *before* the first
-   `tsc`/`astro check`/`vitest`/build command, not after it errors. Then open the PR with
-   `Fixes #N`.
+4. Branch **inside a worktree**, created in one step:
+   ```sh
+   git worktree add .claude/worktrees/<name> -b <branch>   # new branch, checked out IN the worktree
+   ```
+   Do **not** `git checkout <branch>` in the primary checkout — the branch lives in the
+   worktree, and the primary stays on `main`. From here on, **everything targets the worktree
+   path**: not just `git -C <worktree>` / `pnpm --filter`, but also the Read/Edit/Write tools —
+   edit `/…/.claude/worktrees/<name>/packages/…`, never the primary `/…/d3gl/packages/…`. After
+   your first edits, confirm `git -C <worktree> status` lists them (if they show up in the
+   *primary* status instead, you edited the wrong tree — see §Worktrees & shell cwd to recover).
+
+   **Immediately `pnpm install` in the new worktree** — a fresh worktree has its own *empty*
+   `node_modules` (it's a separate working tree; deps are not shared from the primary checkout),
+   so every build/typecheck/test fails (or silently runs against missing/stale deps) until you
+   install. Do this *before* the first `tsc`/`astro check`/`vitest`/build command, not after it
+   errors. Then open the PR with `Fixes #N`.
 5. **Merge with squash** (see below), then **delete the feature branch** (local +
    remote) once it's in `main`.
 
@@ -153,6 +163,19 @@ Defenses (do these):
   wrong-cwd add can't sweep in `.claude/`.
 - A `git push` that prints `main -> main` (or warns about an *embedded git repository*)
   means you're in the wrong checkout — stop and fix before pushing.
+
+**The same trap with file edits (Read/Edit/Write take absolute paths).** Editing
+`/…/d3gl/packages/…` (primary) instead of `/…/.claude/worktrees/<name>/packages/…` lands your
+changes in the primary tree. Then `pnpm --filter` build/test/`tsc` run *from the worktree* see
+UNCHANGED source — everything "passes" and the rebuilt `dist` has none of your changes, so it
+looks like your work had no effect. Always edit via the full worktree path; after core edits,
+verify `git -C <worktree> status` shows them. Recover a misplaced edit without redoing it:
+```sh
+git -C <primary> diff -- <files> | git -C <worktree> apply   # move tracked changes
+git -C <primary> checkout -- <files>                         # restore primary to clean
+# untracked new files: mv them into the worktree
+```
+(Also: `rm` may be aliased to `rm -i`; use `command rm -f` for a non-interactive delete.)
 
 ## Build / typecheck
 

@@ -97,14 +97,22 @@ export class WebGLBackend implements Backend {
     this.bakeDirty = true;
   }
 
+  /** WebGL renders from the GPU flag/color textures, not the vector view — the `drawables` arg
+   *  to {@link updateLayerStyles} is only stashed for `toSVG` export. So the engine may omit it
+   *  on hot paths (per-frame declutter) to skip an O(n) rebuild. */
+  readonly stylesNeedDrawables = false;
+
   /** Styles-only update: rewrite the palette/flags textures, refresh the stored vector
-   *  view (toSVG reads it), leave geometry buffers untouched. */
-  updateLayerStyles(name: string, tables: StyleTables, drawables: DrawableVector[]): void {
+   *  view (toSVG reads it), leave geometry buffers untouched. `drawables` omitted ⇒ keep the
+   *  previously-stored vector view (export may lag the textures until the next update with it). */
+  updateLayerStyles(name: string, tables: StyleTables, drawables?: DrawableVector[]): void {
     const renderer = this.renderers.get(name);
     if (!renderer) return;
     renderer.updateColors(tables);
-    const prev = this.layers.get(name);
-    if (prev) this.layers.set(name, { ...prev, drawables });
+    if (drawables) {
+      const prev = this.layers.get(name);
+      if (prev) this.layers.set(name, { ...prev, drawables });
+    }
     this.bakeDirty = true;
   }
 

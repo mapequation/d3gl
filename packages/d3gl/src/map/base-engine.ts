@@ -171,6 +171,14 @@ export abstract class BaseEngine {
   private aspectRatio?: number;
   /** Whether the engine tracks its host (fill / aspect modes) vs. a fixed size. */
   private responsive = false;
+  /** Reusable scratch for the per-zoom screen-space declutter ({@link declutterLayer}): a flat
+   *  uniform grid (cell heads) plus an intrusive linked list of kept points, so the hot path
+   *  allocates nothing per frame. Grown on demand; never freed. */
+  private dcCellHead: Int32Array | null = null;
+  private dcKeptX: Float64Array | null = null;
+  private dcKeptY: Float64Array | null = null;
+  private dcKeptNext: Int32Array | null = null;
+  private dcVisible: Uint8Array | null = null;
   /** Observes the host in responsive modes; coalesced into one rAF per burst. */
   private sizingObserver?: ResizeObserver;
   private resizeRaf = 0;
@@ -753,52 +761,100 @@ export abstract class BaseEngine {
 
   /**
    * Hide anchored glyphs that overlap in screen space, keeping earlier (e.g. larger-clade)
-   * ones. Drawables sharing an exact anchor (a pie's wedges) are one unit. A uniform grid
-   * of cell size = radius makes neighbour checks O(1) average, so this is cheap enough to run
-   * on every zoom; it only toggles visibility flags (no geometry rebuild).
+   * ones. Drawables sharing an exact anchor (a pie's wedges) are one unit. Runs on every
+   * zoom/pan, so the whole pass is allocation-free and toggles visibility flags only (no
+   * geometry rebuild).
+   *
+   * The anchor grouping is transform-independent and cached on the Scene (built once); only
+   * the projection + binning below runs per frame. Binning uses a **flat** uniform grid (cell
+   * size = radius) over the viewport plus a one-cell margin, indexed by a reused `Int32Array`
+   * of cell heads with an intrusive linked list of kept points — no per-frame Map or bucket
+   * allocation (the Map-based version was the dominant per-frame cost at high node counts).
+   * Anchors projecting beyond the margin can't occlude (or be occluded by) anything on-screen,
+   * so they're kept and skipped; a pan re-evaluates them next frame.
    */
   private declutterLayer(spec: LayerSpec, t: ViewTransform): void {
-    const radius = spec.declutter!;
-    if (!(radius > 0)) return;
-    const draws = this.scene.drawables(spec.name);
-    const groups = new Map<string, { ax: number; ay: number; ids: (string | number)[] }>();
-    for (const d of draws) {
-      if (!d.anchor) continue;
-      const key = `${d.anchor[0]},${d.anchor[1]}`;
-      const g = groups.get(key) ?? { ax: d.anchor[0], ay: d.anchor[1], ids: [] };
-      g.ids.push(d.id);
-      groups.set(key, g);
-    }
-    if (groups.size === 0) return;
-    const r2 = radius * radius;
-    const grid = new Map<string, { x: number; y: number }[]>();
-    const visible = new Set<string | number>();
-    for (const g of groups.values()) {
-      const sx = t.k * g.ax + t.x, sy = t.k * g.ay + t.y;
-      const cx = Math.floor(sx / radius), cy = Math.floor(sy / radius);
-      let occluded = false;
-      for (let i = -1; i <= 1 && !occluded; i++)
-        for (let j = -1; j <= 1 && !occluded; j++) {
-          for (const p of grid.get(`${cx + i},${cy + j}`) ?? []) {
-            const dx = p.x - sx, dy = p.y - sy;
-            if (dx * dx + dy * dy < r2) { occluded = true; break; }
-          }
-        }
-      if (!occluded) {
-        (grid.get(`${cx},${cy}`) ?? grid.set(`${cx},${cy}`, []).get(`${cx},${cy}`)!).push({ x: sx, y: sy });
-        for (const id of g.ids) visible.add(id);
-      }
-    }
-    for (const d of draws) this.scene.setFlag(spec.name, d.id, !d.anchor || visible.has(d.id) ? 1 : 0);
-    // Flags-only change: push just the style tables (the styles-only path). No render()
-    // here — setTransform() renders right after the declutter loop. updateLayer would
-    // re-upload the full geometry per zoom frame for nothing.
+    if (!this.cullDeclutter(spec, t)) return; // wrote visibility flags into the Scene
+    // Flags-only change: push just the style tables (the styles-only path). No render() here —
+    // setTransform() renders right after the declutter loop. updateLayer would re-upload the
+    // full geometry per zoom frame for nothing.
     const backend = this.handle?.backend;
     if (backend?.updateLayerStyles) {
-      backend.updateLayerStyles(spec.name, this.scene.styleTables(spec.name), this.scene.drawables(spec.name));
+      // The vector view (`drawables`) is what Canvas/SVG repaint from, but WebGL only stashes it
+      // for `toSVG` export — `updateColors` drives the GPU from the flag table. So on a backend
+      // that doesn't render from it, skip the (O(n)) materialization while interacting and let
+      // the settle frame refresh the export snapshot. Saves a full drawables() build per frame.
+      const needDrawables = backend.stylesNeedDrawables !== false || !this.interacting;
+      backend.updateLayerStyles(
+        spec.name,
+        this.scene.styleTables(spec.name),
+        needDrawables ? this.scene.drawables(spec.name) : undefined,
+      );
     } else {
       backend?.updateLayer(spec.name, this.renderLayer(spec));
     }
+  }
+
+  /**
+   * Run the screen-space declutter cull and write the result into the Scene's visibility flags
+   * (no backend push). Returns false when there's nothing to cull (radius off / no anchored
+   * drawables). Called by {@link declutterLayer} on every zoom AND by {@link pushLayers} before
+   * the initial upload, so the FIRST draw already reflects declutter (not just after the first
+   * interaction).
+   */
+  private cullDeclutter(spec: LayerSpec, t: ViewTransform): boolean {
+    const radius = spec.declutter!;
+    if (!(radius > 0)) return false;
+    const { ax, ay } = this.scene.declutterIndex(spec.name);
+    const G = ax.length;
+    if (G === 0) return false; // no anchored drawables ⇒ nothing to cull (all stay visible)
+    const r2 = radius * radius;
+
+    // Flat grid spanning [-radius, width+radius] × [-radius, height+radius] in screen px, so a
+    // cell index is `cy * cols + cx` with cx = floor((sx + radius) / radius). Grow the scratch
+    // buffers on demand and reuse them across frames (cleared per frame, never reallocated).
+    const cols = Math.floor((this.width + 2 * radius) / radius) + 2;
+    const rows = Math.floor((this.height + 2 * radius) / radius) + 2;
+    const nCells = cols * rows;
+    let cellHead = this.dcCellHead;
+    if (!cellHead || cellHead.length < nCells) cellHead = this.dcCellHead = new Int32Array(nCells);
+    cellHead.fill(-1, 0, nCells);
+    let keptX = this.dcKeptX, keptY = this.dcKeptY, keptNext = this.dcKeptNext, vis = this.dcVisible;
+    if (!keptX || keptX.length < G) {
+      keptX = this.dcKeptX = new Float64Array(G);
+      keptY = this.dcKeptY = new Float64Array(G);
+      keptNext = this.dcKeptNext = new Int32Array(G);
+      vis = this.dcVisible = new Uint8Array(G);
+    }
+    let kept = 0;
+    for (let g = 0; g < G; g++) {
+      const sx = t.k * ax[g]! + t.x, sy = t.k * ay[g]! + t.y;
+      const cx = Math.floor((sx + radius) / radius), cy = Math.floor((sy + radius) / radius);
+      if (cx < 0 || cy < 0 || cx >= cols || cy >= rows) { vis![g] = 1; continue; } // off-screen ⇒ keep
+      let occluded = false;
+      for (let i = -1; i <= 1 && !occluded; i++) {
+        const nx = cx + i;
+        if (nx < 0 || nx >= cols) continue;
+        for (let j = -1; j <= 1 && !occluded; j++) {
+          const ny = cy + j;
+          if (ny < 0 || ny >= rows) continue;
+          for (let p = cellHead[ny * cols + nx]!; p !== -1; p = keptNext![p]!) {
+            const dx = keptX![p]! - sx, dy = keptY![p]! - sy;
+            if (dx * dx + dy * dy < r2) { occluded = true; break; }
+          }
+        }
+      }
+      if (!occluded) {
+        vis![g] = 1;
+        const cell = cy * cols + cx;
+        keptX![kept] = sx; keptY![kept] = sy; keptNext![kept] = cellHead[cell]!;
+        cellHead[cell] = kept++;
+      } else {
+        vis![g] = 0;
+      }
+    }
+    this.scene.writeDeclutterFlags(spec.name, vis!);
+    return true;
   }
   /**
    * Enable scroll-to-zoom / drag-to-pan via d3-zoom, clamped to `extent`. The optional
@@ -972,6 +1028,9 @@ export abstract class BaseEngine {
     return this.specs.filter((s) => !(this.interacting && s.hideOnInteraction));
   }
   private pushLayers(): void {
+    // Apply declutter to the Scene flags BEFORE the upload, so the first draw is already
+    // decluttered (setTransform's per-zoom pass otherwise wouldn't run until the first gesture).
+    for (const spec of this.specs) if (spec.declutter) this.cullDeclutter(spec, this.transform);
     this.handle?.backend.setLayers(this.allRenderLayers());
     this.handle?.backend.setTransform(this.transform);
     this.render();

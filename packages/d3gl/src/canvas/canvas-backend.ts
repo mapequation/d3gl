@@ -87,12 +87,13 @@ export class CanvasBackend implements Backend {
     else this.layers.push(layer);
   }
 
-  /** Styles-only update: swap the stored vector view (the next render() repaints from
-   *  it). Visibility flags feed the clip silhouette, so drop this layer's cached clip. */
-  updateLayerStyles(name: string, _tables: StyleTables, drawables: DrawableVector[]): void {
+  /** Styles-only update: swap the stored vector view (the next render() repaints from it), so
+   *  Canvas always needs `drawables` (it renders from them — see {@link stylesNeedDrawables},
+   *  left at its default). Visibility flags feed the clip silhouette, so drop the cached clip. */
+  updateLayerStyles(name: string, _tables: StyleTables, drawables?: DrawableVector[]): void {
     const layer = this.layers.find((l) => l.name === name);
     if (!layer) return;
-    layer.drawables = drawables;
+    if (drawables) layer.drawables = drawables;
     this.clipCache.delete(name);
   }
 
