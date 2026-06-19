@@ -1,0 +1,74 @@
+---
+title: Declutter
+description: Screen-space collision culling — overlapping glyphs and labels drop out as the view crowds, highest-priority first, recomputed on every zoom.
+---
+
+import ExampleCard from "../../../components/ExampleCard.astro";
+import Declutter from "../../../examples/declutter/Declutter.tsx";
+
+A scatter of labelled nodes that thins itself out when the view gets crowded. Each node is a
+constant-pixel circle with a name label beside it; importance drives the radius, the color, and
+the priority. **Scroll to zoom, drag to pan** — zoom **out** and the anchors crowd together, so
+low-priority circles and overlapping labels drop out; zoom back **in** and they return. The
+**Declutter** slider is the literal collision radius in pixels (0 turns it off); the **Nodes**
+slider grows the cloud up to ~16k to stress the per-zoom collision pass.
+
+<ExampleCard files={["declutter/draw.ts"]}>
+  <Declutter client:visible slot="demo" />
+</ExampleCard>
+
+## How it works
+
+Two independent collision systems run on every zoom/pan, both in **screen space** — they compare
+on-screen pixel distances, so what survives depends on the current zoom, not the data extent:
+
+- **Glyph declutter** is built into [`plot`](/d3gl/reference/map/classes/plot/). A layer with an
+  `anchor` and `sizeMode: "screen"` can set `declutter: <px>`; after each transform the engine
+  hides any anchored glyph whose anchor lands within `<px>` of an already-kept one. It only
+  toggles visibility flags — no geometry is rebuilt — so it is cheap enough to run on every
+  zoom frame.
+- **Label culling** is done by [`LabelLayer`](/d3gl/reference/labels/classes/labellayer/) (an
+  HTML overlay). On each `update` it maps anchors through the transform, drops labels outside the
+  viewport, then greedily places the rest, skipping any whose box overlaps one already placed.
+  Only the surviving labels exist in the DOM.
+
+```ts
+chart.layer("nodes", nodes, {
+  draw: (ctx, d) => { ctx.arc(d.x, d.y, d.radius, 0, 2 * Math.PI); ctx.closePath(); },
+  anchor: (d) => [d.x, d.y],   // pin each node in world coords
+  sizeMode: "screen",          // constant pixel size — declutter needs screen space
+  declutter: 30,               // hide anchored glyphs within 30 px of a kept one
+  // ...fill, stroke, hover, tooltip
+});
+```
+
+## Prioritizing what survives
+
+The two systems express priority differently, so keep them consistent:
+
+- **Glyphs** break ties by **input order** — the engine keeps the earliest-listed glyph of an
+  overlapping group. Sort the data by importance descending and the big nodes win:
+
+  ```ts
+  const nodes = makeNodes(count).sort((a, b) => b.importance - a.importance);
+  ```
+
+- **Labels** take an explicit `priority` field on each anchor (higher wins; ties fall back to
+  input order). Set it from the same channel as the glyph order:
+
+  ```ts
+  labels.update(
+    nodes.map((d) => ({
+      id: d.id, refX: d.x, refY: d.y, text: d.label,
+      width: d.label.length * 6.2 + 4, height: 14,
+      priority: d.importance,        // higher importance survives a collision
+      offset: [d.radius + 4, -7],    // sit just past the circle's right edge
+    })),
+    transform,
+    { width, height },
+  );
+  ```
+
+The `offset` is a constant pixel gap applied to both the rendered position **and** the collision
+box, so the label stays a fixed distance from its node at any zoom and culling reflects where the
+label actually sits.
