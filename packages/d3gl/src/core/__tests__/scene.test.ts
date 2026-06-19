@@ -184,3 +184,45 @@ describe("Scene color & flag tables", () => {
     expect(Array.from(buf.fillColors.slice(0, 4))).toEqual([255, 0, 128, 255]);
   });
 });
+
+describe("Scene declutter index", () => {
+  // Three glyphs at distinct anchors, two wedges sharing one anchor (a "pie"), one anchorless.
+  function mixed() {
+    const scene = new Scene();
+    scene.group("g", (b) => {
+      b.drawable("a", (ctx) => ctx.rect(0, 0, 1, 1), { anchor: [10, 20] });
+      b.drawable("pie0", (ctx) => ctx.rect(0, 0, 1, 1), { anchor: [50, 60] });
+      b.drawable("pie1", (ctx) => ctx.rect(0, 0, 1, 1), { anchor: [50, 60] }); // same anchor as pie0
+      b.drawable("c", (ctx) => ctx.rect(0, 0, 1, 1), { anchor: [10, 20] }); // same anchor as a
+      b.drawable("free", (ctx) => ctx.rect(0, 0, 1, 1)); // no anchor
+    });
+    return scene;
+  }
+
+  it("collapses shared anchors to one group in first-seen order; anchorless ⇒ -1", () => {
+    const { ax, ay, groupOf } = mixed().declutterIndex("g");
+    // unique anchors, first-seen: [10,20] then [50,60]
+    expect(Array.from(ax)).toEqual([10, 50]);
+    expect(Array.from(ay)).toEqual([20, 60]);
+    // a→0, pie0→1, pie1→1, c→0, free→-1
+    expect(Array.from(groupOf)).toEqual([0, 1, 1, 0, -1]);
+  });
+
+  it("returns the cached instance until the group changes", () => {
+    const scene = mixed();
+    const first = scene.declutterIndex("g");
+    expect(scene.declutterIndex("g")).toBe(first); // same object, not rebuilt
+    scene.appendToGroup("g", (b) => b.drawable("d", (ctx) => ctx.rect(0, 0, 1, 1), { anchor: [99, 99] }));
+    const after = scene.declutterIndex("g");
+    expect(after).not.toBe(first); // append invalidated the cache
+    expect(Array.from(after.ax)).toEqual([10, 50, 99]);
+  });
+
+  it("writeDeclutterFlags maps a per-group verdict onto drawables; anchorless stays visible", () => {
+    const scene = mixed();
+    scene.declutterIndex("g");
+    // keep group 0 ([10,20] → a, c), hide group 1 ([50,60] → pie0, pie1)
+    scene.writeDeclutterFlags("g", new Uint8Array([1, 0]));
+    expect(Array.from(scene.buffers("g").flags)).toEqual([1, 0, 0, 1, 1]); // a, pie0, pie1, c, free
+  });
+});
