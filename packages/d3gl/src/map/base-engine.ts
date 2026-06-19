@@ -774,11 +774,40 @@ export abstract class BaseEngine {
    * so they're kept and skipped; a pan re-evaluates them next frame.
    */
   private declutterLayer(spec: LayerSpec, t: ViewTransform): void {
+    if (!this.cullDeclutter(spec, t)) return; // wrote visibility flags into the Scene
+    // Flags-only change: push just the style tables (the styles-only path). No render() here —
+    // setTransform() renders right after the declutter loop. updateLayer would re-upload the
+    // full geometry per zoom frame for nothing.
+    const backend = this.handle?.backend;
+    if (backend?.updateLayerStyles) {
+      // The vector view (`drawables`) is what Canvas/SVG repaint from, but WebGL only stashes it
+      // for `toSVG` export — `updateColors` drives the GPU from the flag table. So on a backend
+      // that doesn't render from it, skip the (O(n)) materialization while interacting and let
+      // the settle frame refresh the export snapshot. Saves a full drawables() build per frame.
+      const needDrawables = backend.stylesNeedDrawables !== false || !this.interacting;
+      backend.updateLayerStyles(
+        spec.name,
+        this.scene.styleTables(spec.name),
+        needDrawables ? this.scene.drawables(spec.name) : undefined,
+      );
+    } else {
+      backend?.updateLayer(spec.name, this.renderLayer(spec));
+    }
+  }
+
+  /**
+   * Run the screen-space declutter cull and write the result into the Scene's visibility flags
+   * (no backend push). Returns false when there's nothing to cull (radius off / no anchored
+   * drawables). Called by {@link declutterLayer} on every zoom AND by {@link pushLayers} before
+   * the initial upload, so the FIRST draw already reflects declutter (not just after the first
+   * interaction).
+   */
+  private cullDeclutter(spec: LayerSpec, t: ViewTransform): boolean {
     const radius = spec.declutter!;
-    if (!(radius > 0)) return;
+    if (!(radius > 0)) return false;
     const { ax, ay } = this.scene.declutterIndex(spec.name);
     const G = ax.length;
-    if (G === 0) return; // no anchored drawables ⇒ nothing to cull (all stay visible)
+    if (G === 0) return false; // no anchored drawables ⇒ nothing to cull (all stay visible)
     const r2 = radius * radius;
 
     // Flat grid spanning [-radius, width+radius] × [-radius, height+radius] in screen px, so a
@@ -825,25 +854,7 @@ export abstract class BaseEngine {
       }
     }
     this.scene.writeDeclutterFlags(spec.name, vis!);
-
-    // Flags-only change: push just the style tables (the styles-only path). No render() here —
-    // setTransform() renders right after the declutter loop. updateLayer would re-upload the
-    // full geometry per zoom frame for nothing.
-    const backend = this.handle?.backend;
-    if (backend?.updateLayerStyles) {
-      // The vector view (`drawables`) is what Canvas/SVG repaint from, but WebGL only stashes it
-      // for `toSVG` export — `updateColors` drives the GPU from the flag table. So on a backend
-      // that doesn't render from it, skip the (O(n)) materialization while interacting and let
-      // the settle frame refresh the export snapshot. Saves a full drawables() build per frame.
-      const needDrawables = backend.stylesNeedDrawables !== false || !this.interacting;
-      backend.updateLayerStyles(
-        spec.name,
-        this.scene.styleTables(spec.name),
-        needDrawables ? this.scene.drawables(spec.name) : undefined,
-      );
-    } else {
-      backend?.updateLayer(spec.name, this.renderLayer(spec));
-    }
+    return true;
   }
   /**
    * Enable scroll-to-zoom / drag-to-pan via d3-zoom, clamped to `extent`. The optional
@@ -1017,6 +1028,9 @@ export abstract class BaseEngine {
     return this.specs.filter((s) => !(this.interacting && s.hideOnInteraction));
   }
   private pushLayers(): void {
+    // Apply declutter to the Scene flags BEFORE the upload, so the first draw is already
+    // decluttered (setTransform's per-zoom pass otherwise wouldn't run until the first gesture).
+    for (const spec of this.specs) if (spec.declutter) this.cullDeclutter(spec, this.transform);
     this.handle?.backend.setLayers(this.allRenderLayers());
     this.handle?.backend.setTransform(this.transform);
     this.render();

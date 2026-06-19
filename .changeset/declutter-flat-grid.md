@@ -16,3 +16,6 @@ the full vector view twice. It now:
 
 At 131k screen-mode nodes a full zoom frame drops from ~33ms to ~8ms; cull output is
 unchanged (verified against a brute-force reference).
+
+Also fixes declutter not being applied on the first draw — it now runs before the initial
+upload, not only after the first zoom/pan.

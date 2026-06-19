@@ -39,11 +39,11 @@ function nodeTooltip(d: Node): HTMLElement {
  *
  * Both are screen-space: zoom OUT crowds the anchors → low-priority nodes and overlapping
  * labels drop out; zoom IN spreads them → everything returns. The **Declutter** slider is the
- * literal `declutter` radius in pixels (0 = off); the **Nodes** slider grows the cloud to ~1M.
+ * literal `declutter` radius in pixels (0 = off); the **Nodes** slider grows the cloud to 262k.
  *
- * Glyph declutter is an O(n) spatial-grid pass that scales to that range; the HTML LabelLayer
- * reprojects every anchor per zoom and does not. The **Labels** toggle drops the label layer so
- * the d3gl declutter + GPU path can be stress-tested on its own at huge node counts.
+ * Glyph declutter is an O(n) spatial-grid pass that scales well; the HTML LabelLayer reprojects
+ * every anchor per zoom and does not. The **Labels** toggle drops the label layer so the d3gl
+ * declutter + GPU path can be stress-tested on its own at high node counts.
  *
  * Pure d3gl; the harness owns the controls, backend, export, and the screen size.
  */
