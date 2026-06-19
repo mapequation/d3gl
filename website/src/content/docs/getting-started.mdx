@@ -43,6 +43,16 @@ chart.layer("series", [points], { draw: (ctx, d) => { gen.context(ctx); gen(d); 
 chart.enableZoom();
 ```
 
+Generators that emit coordinates around the origin (radial trees, chords) place with the
+canonical canvas idiom — call `ctx.translate(cx, cy)` once, then run the generator unchanged:
+
+```ts
+chart.layer("links", links, { draw: (ctx, l) => { ctx.translate(cx, cy); gen.context(ctx); gen(l); } });
+```
+
+`translate` is the one transform in the context (no `rotate`/`scale`/`save`/`restore`); it
+accumulates like Canvas2D and applies only within that drawable's `draw` callback.
+
 ## Backends
 
 Every engine renders through a backend — `"webgl"` (default), `"canvas"`, `"svg"`, or `"auto"`

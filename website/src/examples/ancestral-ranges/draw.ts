@@ -24,26 +24,12 @@ const regionColor = scaleOrdinal<number, string>()
 interface Wedge { cx: number; cy: number; r: number; a0: number; a1: number; clusterId: number; count: number; single: boolean; node: PNode; }
 interface PieSpec { cx: number; cy: number; rBase: number; node: PNode; slices: { clusterId: number; count: number; a0: number; a1: number }[]; }
 
-/** Wrap a canvas-like context so every path call is shifted by (ox, oy). Used for radial
- *  generators (linkRadial) that emit coordinates around the origin. */
-function offsetCtx(ctx: CanvasRenderingContext2D, ox: number, oy: number): CanvasRenderingContext2D {
-  return {
-    beginPath: () => ctx.beginPath(),
-    closePath: () => ctx.closePath(),
-    moveTo: (x: number, y: number) => ctx.moveTo(x + ox, y + oy),
-    lineTo: (x: number, y: number) => ctx.lineTo(x + ox, y + oy),
-    quadraticCurveTo: (cx: number, cy: number, x: number, y: number) => ctx.quadraticCurveTo(cx + ox, cy + oy, x + ox, y + oy),
-    bezierCurveTo: (c1x: number, c1y: number, c2x: number, c2y: number, x: number, y: number) =>
-      ctx.bezierCurveTo(c1x + ox, c1y + oy, c2x + ox, c2y + oy, x + ox, y + oy),
-    arc: (x: number, y: number, r: number, a0: number, a1: number, ccw?: boolean) => ctx.arc(x + ox, y + oy, r, a0, a1, ccw),
-  } as unknown as CanvasRenderingContext2D;
-}
-
 /**
  * A link-drawing closure for the chosen layout/curve. Radial layouts are origin-centred by
- * d3-shape's `pointRadial`/`linkRadial`; `center` ([ox, oy], the canvas centre) is baked into
- * the emitted coordinates so the radial tree is centred at the IDENTITY transform (no centring
- * `setTransform`, so the user's zoom survives layout/curve toggles).
+ * d3-shape's `pointRadial`/`linkRadial`; each radial closure does `ctx.translate(ox, oy)` once
+ * (d3gl's path context supports the canonical canvas translate) to land the fan at the canvas
+ * centre `center` ([ox, oy]). The view transform stays at IDENTITY, so the user's zoom survives
+ * layout/curve toggles. Rectangular needs no offset (center is [0, 0]).
  */
 function makeLinkDraw(mode: LayoutMode, curve: CurveMode, center: [number, number]): (ctx: CanvasRenderingContext2D, l: PLink) => void {
   const [ox, oy] = center;
@@ -53,27 +39,28 @@ function makeLinkDraw(mode: LayoutMode, curve: CurveMode, center: [number, numbe
     return (ctx, l) => { gen.context(ctx); gen(l); };
   }
   if (curve === "bump") {
-    // linkRadial emits curves around (0,0); wrap the context in an offsetting proxy so the
-    // figure lands at the canvas centre (the d3gl path context has no translate()).
+    // linkRadial emits curves around (0,0); translate the context so the figure lands centred.
     const gen = linkRadial<PLink, PNode>().angle((d) => d.x).radius((d) => d.y);
-    return (ctx, l) => { gen.context(offsetCtx(ctx, ox, oy)); gen(l); };
+    return (ctx, l) => { ctx.translate(ox, oy); gen.context(ctx); gen(l); };
   }
   if (curve === "linear") {
     return (ctx, l) => {
+      ctx.translate(ox, oy);
       const [sx, sy] = pointRadial(l.source.x, l.source.y);
       const [tx, ty] = pointRadial(l.target.x, l.target.y);
-      ctx.moveTo(sx + ox, sy + oy); ctx.lineTo(tx + ox, ty + oy);
+      ctx.moveTo(sx, sy); ctx.lineTo(tx, ty);
     };
   }
   // radial "step": arc along the parent radius to the child angle, then a radial line out.
   return (ctx, l) => {
+    ctx.translate(ox, oy);
     const r0 = l.source.y;
     const sa = l.source.x - Math.PI / 2;
     const ta = l.target.x - Math.PI / 2;
-    ctx.moveTo(r0 * Math.cos(sa) + ox, r0 * Math.sin(sa) + oy);
-    ctx.arc(ox, oy, r0, sa, ta, ta < sa);
+    ctx.moveTo(r0 * Math.cos(sa), r0 * Math.sin(sa));
+    ctx.arc(0, 0, r0, sa, ta, ta < sa);
     const [tx, ty] = pointRadial(l.target.x, l.target.y);
-    ctx.lineTo(tx + ox, ty + oy);
+    ctx.lineTo(tx, ty);
   };
 }
 

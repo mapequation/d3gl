@@ -11,6 +11,9 @@ export class PathRecorder implements PathContext {
   private current: Subpath | null = null;
   private cx = 0;
   private cy = 0;
+  // Accumulated translate offset, baked into recorded coordinates (see PathContext.translate).
+  private tx = 0;
+  private ty = 0;
 
   /** Flattening tolerance in coordinate units. */
   constructor(public tolerance = 0.25) {}
@@ -24,7 +27,14 @@ export class PathRecorder implements PathContext {
     this.current = null;
   }
 
+  translate(dx: number, dy: number): void {
+    this.tx += dx;
+    this.ty += dy;
+  }
+
   moveTo(x: number, y: number): void {
+    x += this.tx;
+    y += this.ty;
     this.current = { points: [x, y], closed: false };
     this.paths.push(this.current);
     this.cx = x;
@@ -32,8 +42,11 @@ export class PathRecorder implements PathContext {
   }
 
   lineTo(x: number, y: number): void {
+    x += this.tx;
+    y += this.ty;
     if (!this.current) {
-      this.moveTo(x, y);
+      // moveTo re-applies the offset, so pass the un-offset coordinate.
+      this.moveTo(x - this.tx, y - this.ty);
       return;
     }
     this.current.points.push(x, y);
@@ -42,7 +55,8 @@ export class PathRecorder implements PathContext {
   }
 
   quadraticCurveTo(cpx: number, cpy: number, x: number, y: number): void {
-    if (!this.current) this.moveTo(this.cx, this.cy);
+    cpx += this.tx; cpy += this.ty; x += this.tx; y += this.ty;
+    if (!this.current) this.moveTo(this.cx - this.tx, this.cy - this.ty);
     flattenQuadratic(this.cx, this.cy, cpx, cpy, x, y, this.tolerance, this.current!.points);
     this.cx = x;
     this.cy = y;
@@ -56,7 +70,8 @@ export class PathRecorder implements PathContext {
     x: number,
     y: number,
   ): void {
-    if (!this.current) this.moveTo(this.cx, this.cy);
+    cp1x += this.tx; cp1y += this.ty; cp2x += this.tx; cp2y += this.ty; x += this.tx; y += this.ty;
+    if (!this.current) this.moveTo(this.cx - this.tx, this.cy - this.ty);
     flattenCubic(this.cx, this.cy, cp1x, cp1y, cp2x, cp2y, x, y, this.tolerance, this.current!.points);
     this.cx = x;
     this.cy = y;
@@ -70,10 +85,12 @@ export class PathRecorder implements PathContext {
     endAngle: number,
     counterclockwise = false,
   ): void {
+    x += this.tx;
+    y += this.ty;
     const sx = x + radius * Math.cos(startAngle);
     const sy = y + radius * Math.sin(startAngle);
     if (!this.current) {
-      this.moveTo(sx, sy);
+      this.moveTo(sx - this.tx, sy - this.ty);
     } else {
       this.current.points.push(sx, sy);
     }
@@ -94,6 +111,8 @@ export class PathRecorder implements PathContext {
   }
 
   rect(x: number, y: number, w: number, h: number): void {
+    x += this.tx;
+    y += this.ty;
     this.current = { points: [x, y, x + w, y, x + w, y + h, x, y + h], closed: true };
     this.paths.push(this.current);
     this.cx = x;

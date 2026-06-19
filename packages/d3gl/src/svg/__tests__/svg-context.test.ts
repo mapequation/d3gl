@@ -53,4 +53,25 @@ describe("SvgPathContext", () => {
     expect(d.startsWith("M10,0")).toBe(true); // arc start point
     expect(d).toContain("L"); // flattened to line segments
   });
+
+  it("bakes translate() into emitted commands (incl. arc via moveTo/lineTo)", () => {
+    const ctx = new SvgPathContext();
+    ctx.translate(100, 50);
+    ctx.translate(0, 5); // accumulates → (100, 55)
+    ctx.moveTo(0, 0);
+    ctx.lineTo(10, 0);
+    ctx.quadraticCurveTo(5, 10, 10, 0);
+    ctx.bezierCurveTo(0, 10, 10, 10, 10, 0);
+    ctx.rect(1, 2, 10, 20);
+    expect(ctx.toPath()).toBe(
+      "M100,55L110,55Q105,65,110,55C100,65,110,65,110,55M101,57L111,57L111,77L101,77Z",
+    );
+  });
+
+  it("offsets the arc start point by translate()", () => {
+    const ctx = new SvgPathContext();
+    ctx.translate(100, 100);
+    ctx.arc(0, 0, 10, 0, Math.PI / 2, false);
+    expect(ctx.toPath().startsWith("M110,100")).toBe(true);
+  });
 });
