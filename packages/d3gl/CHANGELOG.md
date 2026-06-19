@@ -1,5 +1,52 @@
 # @mapequation/d3gl
 
+## 0.7.0
+
+### Minor Changes
+
+- 50a8506: Collide rotated labels by their true oriented footprint. `LabelBox` / `LabelAnchor` gain
+  `rotation` (radians), `textAnchor` (`start | middle | end`, like SVG), and `keepUpright`; the
+  library now derives **both** the rendered CSS transform and the collision box from the same
+  angle (an oriented-box / separating-axis test, with the fast axis-aligned path kept for plain
+  labels). Previously rotated labels were culled by their un-rotated dimensions, so near-vertical
+  labels — e.g. toward the top of a radial tree — over-excluded their angular neighbors and left
+  gaps that grew with the rotation.
+
+### Patch Changes
+
+- f170ba6: Share engine-level options through one `BaseEngineOptions` type. `tooltipClass`,
+  `width`/`height`/`aspectRatio`, and `backend` were re-declared per engine and
+  consumed in each subclass — so `plot(host, { tooltipClass })` was silently
+  dropped (only `geoMap` wired it). These shared fields now live on a single
+  `BaseEngineOptions` (exported) that both `GeoMapOptions` and `PlotOptions`
+  extend, and the `BaseEngine` constructor consumes them once. `plot()` tooltips
+  now honor `tooltipClass`, and base-level options can no longer drift between
+  engines.
+- 3c55631: Add `h`, a tiny framework-free hyperscript helper exported from `@mapequation/d3gl/map`, for building rich tooltip / HTML-overlay content declaratively. The layer `tooltip` option accepts the returned `HTMLElement`, so `tooltip: (d) => h("div", null, [...])` replaces hand-rolled `document.createElement` ceremony. Children are always inserted as text nodes (never parsed as markup).
+- 350f1ba: Make screen-space glyph `declutter` scale to very large node counts. The per-zoom cull
+  ran on every transform but rebuilt transform-independent work each frame and materialized
+  the full vector view twice. It now:
+  - caches the anchor grouping on the Scene (built once per layer, reused every frame);
+  - bins with a reused flat typed-array grid + intrusive linked list (no per-frame `Map`
+    or bucket allocation), bounded to the viewport plus a one-cell margin;
+  - writes visibility flags in place; and
+  - skips the export-only `drawables()` rebuild on WebGL while interacting (the new optional
+    `Backend.updateLayerStyles` `drawables` arg + `stylesNeedDrawables` capability — Canvas/SVG
+    render from the vector view and still receive it; the settle frame refreshes it for `toSVG`).
+
+  At 131k screen-mode nodes a full zoom frame drops from ~33ms to ~8ms; cull output is
+  unchanged (verified against a brute-force reference).
+
+  Also fixes declutter not being applied on the first draw — it now runs before the initial
+  upload, not only after the first zoom/pan.
+
+- 7968c2c: Let screen-space `declutter` act on analytic points (`Plot.points`). A lone point's anchor now
+  defaults to its center, and `points()` accepts a `declutter` option, so a decluttered scatter can
+  use lightweight GPU points (~4 verts each) instead of tessellated `ctx.arc` paths (tens of verts).
+  This lifts a decluttered cloud from ~256k (where the path geometry OOMs a tab) to ~1M. Rendering
+  and screen-mode hit-testing are unchanged (the point shader already culls by the visibility flag,
+  and hit-testing already used a lone point's center as its anchor).
+
 ## 0.6.0
 
 ### Minor Changes
