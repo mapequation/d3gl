@@ -1,6 +1,7 @@
 import { BaseEngine, type BaseEngineOptions } from "../map/base-engine.js";
 import { networkLayers, emitNodes, emitLinks, emitArrows, type ResolvedNetworkStyle } from "./glyphs.js";
 import { ForceLayout, seedPositions, type ForceParams } from "./force.js";
+import { multilevelLayout } from "./coarsen.js";
 import type { NetworkGraph } from "./graph.js";
 
 /** Options for the network engine. Inherits sizing, `backend`, and `tooltipClass`. */
@@ -31,10 +32,16 @@ export interface NetworkLayoutOptions {
   backend?: "positions" | "force" | "worker" | "gpu";
   /** Interleaved `[x, y, …]` world coordinates for `backend: "positions"`. */
   positions?: Float32Array;
-  /** Iterations for `backend: "force"` (default 300). */
+  /** Iterations for `backend: "force"` (default 300, per level when multilevel). */
   iterations?: number;
   /** Force parameters for `backend: "force"`. */
   force?: Partial<ForceParams>;
+  /**
+   * For `backend: "force"`, seed the layout via multilevel coarsening (heavy-edge matching) for
+   * faster convergence and fewer tangles on clustered graphs. Default `true`; set `false` for a
+   * plain cold-start force run. Tiny / edgeless graphs skip coarsening automatically.
+   */
+  multilevel?: boolean;
 }
 
 const DEFAULT_NODE_RADIUS = 4;
@@ -86,10 +93,20 @@ export class Network extends BaseEngine {
       if (opts.backend === "positions" && opts.positions) {
         this.graph.positions.set(opts.positions);
       } else if (opts.backend === "force") {
-        // Main-thread force layout: seed a reproducible disc, then run a fixed schedule.
-        // (Off-thread + progressive convergence via a Web Worker is the next slice.)
-        seedPositions(this.graph, this.width, this.height);
-        new ForceLayout(this.graph, opts.force).run(opts.iterations ?? DEFAULT_FORCE_ITERATIONS);
+        // Main-thread force layout. (Off-thread + progressive convergence via a Web Worker is the
+        // next slice.) Multilevel coarsening seeds it by default; opt out for a plain cold start.
+        const iterations = opts.iterations ?? DEFAULT_FORCE_ITERATIONS;
+        if (opts.multilevel === false) {
+          seedPositions(this.graph, this.width, this.height);
+          new ForceLayout(this.graph, opts.force).run(iterations);
+        } else {
+          multilevelLayout(this.graph, {
+            width: this.width,
+            height: this.height,
+            iterations,
+            force: opts.force,
+          });
+        }
       }
     }
     return this.rebuild();

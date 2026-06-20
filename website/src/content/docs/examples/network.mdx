@@ -13,11 +13,14 @@ level-of-detail (coming in later steps).
 
 This example builds a **ring of cliques** — fully-connected clusters of 10 nodes bridged in a
 ring — and lets d3gl's in-library **force layout** (`layout({ backend: "force" })`, Barnes-Hut)
-place the nodes; no coordinates are supplied. The **Nodes** slider scales from 10 to 1,000,000 to
-stress-test the layout and rendering. Force layout currently runs on the main thread, so the
-largest sizes block briefly while solving — moving it to a Web Worker with progressive convergence
-is the next step. Rendering uses WebGL instancing — drag to pan, scroll to zoom, and toggle
-**Links** between directed (with arrowheads) and undirected.
+place the nodes; no coordinates are supplied. The layout is seeded by **multilevel coarsening**
+(heavy-edge matching): the graph is collapsed into a hierarchy of ever-smaller graphs, the tiny
+coarsest one is laid out first, and positions are projected back down and refined — far faster
+convergence and fewer tangles on clustered graphs than a cold start. The **Nodes** slider scales
+from 10 to 1,000,000 to stress-test the layout and rendering. Force layout currently runs on the
+main thread, so the largest sizes block briefly while solving — moving it to a Web Worker with
+progressive convergence is the next step. Rendering uses WebGL instancing — drag to pan, scroll to
+zoom, and toggle **Links** between directed (with arrowheads) and undirected.
 
 <ExampleCard files={["network/draw.ts", "network/data.ts"]}>
   <Network client:visible slot="demo" />

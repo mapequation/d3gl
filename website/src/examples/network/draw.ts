@@ -7,10 +7,11 @@ const SIZES = [10, 100, 1_000, 10_000, 100_000, 1_000_000];
 /**
  * A ring-of-cliques network rendered with the `network()` engine: nodes as GPU-instanced points,
  * links as instanced lines, triangle arrowheads for directed edges. Node positions come from
- * d3gl's in-library **force layout** (`layout({ backend: "force" })`, Barnes-Hut) — no coordinates
- * are supplied. The Nodes slider scales 10 → 1,000,000 to stress the layout + renderer. Force
- * layout currently runs on the main thread, so the largest sizes block briefly while solving (a
- * Web Worker with progressive convergence is the next step). Drag to pan, scroll to zoom.
+ * d3gl's in-library **force layout** (`layout({ backend: "force" })`, Barnes-Hut), seeded by
+ * **multilevel coarsening** — no coordinates are supplied. The Nodes slider scales 10 → 1,000,000
+ * to stress the layout + renderer. Force layout currently runs on the main thread, so the largest
+ * sizes block briefly while solving (a Web Worker with progressive convergence is the next step).
+ * Drag to pan, scroll to zoom.
  */
 export const setup: ImperativeSetup = (host, { width, height, backend }) => {
   const net = network(host, { width, height, backend });

@@ -1,12 +1,25 @@
-import type { NetworkGraph } from "./graph.js";
 import { BarnesHutTree } from "./quadtree.js";
 
 /**
+ * Minimal graph view the force core needs: node count, a directed edge list (used as undirected
+ * springs), and the positions buffer it mutates. {@link NetworkGraph} satisfies this structurally,
+ * and so does a synthetic coarse level (see {@link ./coarsen.js}) — so one force core lays out the
+ * full graph *and* every coarsening level without casts.
+ */
+export interface LayoutGraph {
+  nodeCount: number;
+  edgeCount: number;
+  source: Uint32Array;
+  target: Uint32Array;
+  /** Interleaved `[x, y, …]`, length `2 * nodeCount`; mutated in place by the layout. */
+  positions: Float32Array;
+}
+
+/**
  * Force-directed layout core (sub-issue #102, epic #98). Operates directly on a
- * {@link NetworkGraph}'s positions buffer + CSR — pure typed-array math, no DOM, so it runs
+ * {@link LayoutGraph}'s positions buffer + edge list — pure typed-array math, no DOM, so it runs
  * unchanged on the main thread or inside a Web Worker (the worker + SharedArrayBuffer transport
- * land in later slices). This first version uses O(n²) repulsion; a Barnes-Hut quadtree replaces
- * the pairwise loop next.
+ * land in a later slice). Repulsion is Barnes-Hut O(n log n) via {@link BarnesHutTree}.
  */
 export interface ForceParams {
   /** Repulsion (charge) strength between all node pairs. */
@@ -32,7 +45,7 @@ export class ForceLayout {
   private readonly tree = new BarnesHutTree();
 
   constructor(
-    private readonly graph: NetworkGraph,
+    private readonly graph: LayoutGraph,
     params: Partial<ForceParams> = {},
   ) {
     this.params = { ...DEFAULT_FORCE, ...params };
@@ -105,7 +118,7 @@ export class ForceLayout {
  * viewport — a good, reproducible starting distribution for {@link ForceLayout} when a graph
  * arrives without coordinates (no two nodes coincident, no RNG).
  */
-export function seedPositions(graph: NetworkGraph, width: number, height: number): void {
+export function seedPositions(graph: LayoutGraph, width: number, height: number): void {
   const n = graph.nodeCount;
   const cx = width / 2;
   const cy = height / 2;
