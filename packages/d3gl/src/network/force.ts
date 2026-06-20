@@ -1,4 +1,5 @@
 import type { NetworkGraph } from "./graph.js";
+import { BarnesHutTree } from "./quadtree.js";
 
 /**
  * Force-directed layout core (sub-issue #102, epic #98). Operates directly on a
@@ -16,9 +17,11 @@ export interface ForceParams {
   centering: number;
   /** Integration step size. */
   alpha: number;
+  /** Barnes-Hut opening angle θ — 0 is exact O(n²); ~0.9 trades a little accuracy for speed. */
+  theta: number;
 }
 
-export const DEFAULT_FORCE: ForceParams = { repulsion: 200, attraction: 0.05, centering: 0.01, alpha: 0.2 };
+export const DEFAULT_FORCE: ForceParams = { repulsion: 200, attraction: 0.05, centering: 0.01, alpha: 0.2, theta: 0.9 };
 
 export class ForceLayout {
   private readonly params: ForceParams;
@@ -26,6 +29,7 @@ export class ForceLayout {
   private readonly vy: Float32Array;
   private readonly fx: Float32Array;
   private readonly fy: Float32Array;
+  private readonly tree = new BarnesHutTree();
 
   constructor(
     private readonly graph: NetworkGraph,
@@ -42,34 +46,15 @@ export class ForceLayout {
   /** Advance the simulation one step, mutating `graph.positions`. */
   tick(): void {
     const { positions, source, target, nodeCount, edgeCount } = this.graph;
-    const { repulsion, attraction, centering, alpha } = this.params;
-    const { fx, fy, vx, vy } = this;
+    const { repulsion, attraction, centering, alpha, theta } = this.params;
+    const { fx, fy, vx, vy, tree } = this;
     fx.fill(0);
     fy.fill(0);
 
-    // Repulsion: pairwise inverse-square (Barnes-Hut quadtree replaces this loop next slice).
-    for (let i = 0; i < nodeCount; i++) {
-      const xi = positions[i * 2]!;
-      const yi = positions[i * 2 + 1]!;
-      for (let j = i + 1; j < nodeCount; j++) {
-        let dx = xi - positions[j * 2]!;
-        let dy = yi - positions[j * 2 + 1]!;
-        let d2 = dx * dx + dy * dy;
-        if (d2 < 1e-6) {
-          // Coincident nodes: nudge along a deterministic axis so the force is finite.
-          dx = 1e-3;
-          dy = 0;
-          d2 = 1e-6;
-        }
-        const f = repulsion / d2;
-        const ax = f * dx;
-        const ay = f * dy;
-        fx[i]! += ax;
-        fy[i]! += ay;
-        fx[j]! -= ax;
-        fy[j]! -= ay;
-      }
-    }
+    // Repulsion via Barnes-Hut (O(n log n)): build the tree on the current positions, then
+    // accumulate each node's repulsion through the θ-approximated traversal.
+    tree.build(positions, nodeCount);
+    for (let i = 0; i < nodeCount; i++) tree.applyForce(i, repulsion, theta, fx, fy);
 
     // Attraction: a spring along each directed edge pulling its endpoints together.
     for (let e = 0; e < edgeCount; e++) {
