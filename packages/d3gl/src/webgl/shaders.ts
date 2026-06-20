@@ -161,6 +161,31 @@ void main() {
   gl_Position = vec4(c.xy + off, 0.0, 1.0);
 }`;
 
+// INSTANCED_CIRCLE_VS — true GPU-instanced circles for the network lane (#100). A shared
+// unit-quad template (a_corner, per-vertex) is offset by per-instance centre/radius and
+// coloured from a per-instance attribute (no texture lookup). Pairs with POINT_FS, which
+// discards fragments outside the unit disc. Mirrors PT_POINT_VS's world/screen sizeMode.
+export const INSTANCED_CIRCLE_VS = `#version 300 es
+precision highp float;
+uniform mat3 u_transform;
+uniform float u_screen;     // 1.0 = screen sizeMode (constant px), 0.0 = world
+uniform vec2 u_viewport;    // device px, for screen sizeMode
+in vec2 a_corner;           // per-vertex unit-quad corner in [-1, 1]
+in vec2 a_center;           // per-instance world centre
+in float a_radius;          // per-instance radius
+in vec4 a_color;            // per-instance RGBA (unorm8x4 -> 0..1)
+out vec4 v_color;
+out vec2 v_local;
+void main() {
+  v_color = a_color;
+  v_local = a_corner;
+  vec3 c = u_transform * vec3(a_center, 1.0);
+  vec2 off = (u_screen > 0.5)
+    ? a_corner * a_radius * vec2(2.0 / u_viewport.x, -2.0 / u_viewport.y)
+    : (u_transform * vec3(a_center + a_corner * a_radius, 1.0)).xy - c.xy;
+  gl_Position = vec4(c.xy + off, 0.0, 1.0);
+}`;
+
 // PT_MESH_VS — pass-through fill/stroke meshes. Both fill triangles and expanded-stroke
 // triangles are just colored geometry, so they share this shader: project the world-space
 // vertex through u_transform (world mode — stroke width scales with zoom, matching Canvas)
