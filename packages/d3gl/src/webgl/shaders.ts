@@ -186,6 +186,45 @@ void main() {
   gl_Position = vec4(c.xy + off, 0.0, 1.0);
 }`;
 
+// INSTANCED_LINE_VS — true GPU-instanced "path-strip" lines for the network lane (#100).
+// The per-vertex template a_corner = (t, side): t in {0,1} walks the segment, side in {-1,1}
+// picks the edge. Per-instance source/target/width/color. Straight links are the M=2 case;
+// the same primitive generalises to bezier/half-arrows (more samples) later. Pairs with FILL_FS.
+export const INSTANCED_LINE_VS = `#version 300 es
+precision highp float;
+uniform mat3 u_transform;
+uniform float u_screen;     // 1.0 = constant-px width, 0.0 = world width (scales with zoom)
+uniform vec2 u_viewport;    // device px, for screen mode
+in vec2 a_corner;           // per-vertex (t in {0,1}, side in {-1,1})
+in vec2 a_source;           // per-instance world source
+in vec2 a_target;           // per-instance world target
+in float a_width;           // per-instance line width
+in vec4 a_color;            // per-instance RGBA (unorm8x4 -> 0..1)
+out vec4 v_color;
+void main() {
+  v_color = a_color;
+  float t = a_corner.x;
+  float side = a_corner.y;
+  float hw = a_width * 0.5;
+  vec2 p = mix(a_source, a_target, t);
+  vec2 cp = (u_transform * vec3(p, 1.0)).xy;          // centreline point in clip
+  vec2 off;
+  if (u_screen > 0.5) {
+    // Constant-pixel width: perpendicular derived in screen px, converted back to clip.
+    vec2 cs = (u_transform * vec3(a_source, 1.0)).xy;
+    vec2 ct = (u_transform * vec3(a_target, 1.0)).xy;
+    vec2 dir = normalize((ct - cs) * u_viewport);     // clip delta -> px direction
+    vec2 perp = vec2(-dir.y, dir.x);
+    off = perp * side * hw * (2.0 / u_viewport);      // px -> clip
+  } else {
+    // World width: offset the centreline point in world space, then transform.
+    vec2 dir = normalize(a_target - a_source);
+    vec2 perp = vec2(-dir.y, dir.x);
+    off = (u_transform * vec3(p + perp * side * hw, 1.0)).xy - cp;
+  }
+  gl_Position = vec4(cp + off, 0.0, 1.0);
+}`;
+
 // PT_MESH_VS — pass-through fill/stroke meshes. Both fill triangles and expanded-stroke
 // triangles are just colored geometry, so they share this shader: project the world-space
 // vertex through u_transform (world mode — stroke width scales with zoom, matching Canvas)

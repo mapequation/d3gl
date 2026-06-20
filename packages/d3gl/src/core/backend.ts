@@ -87,13 +87,23 @@ export interface InstancedCirclesData {
   count: number;
 }
 
-/** A named GPU-instanced primitive layer — the network rendering lane (#100). */
-export interface InstancedLayer {
-  name: string;
-  primitive: "circles";
-  circles: InstancedCirclesData;
-  sizeMode?: "world" | "screen";
+/** SoA for a batch of instanced straight lines (e.g. network links). */
+export interface InstancedLinesData {
+  /** [x, y] world source per line, length `2 * count`. */
+  sources: Float32Array;
+  /** [x, y] world target per line, length `2 * count`. */
+  targets: Float32Array;
+  /** width per line, length `count`. */
+  widths: Float32Array;
+  /** RGBA bytes per line, length `4 * count`. */
+  colors: Uint8Array;
+  count: number;
 }
+
+/** A named GPU-instanced primitive layer — the network rendering lane (#100). */
+export type InstancedLayer =
+  | { name: string; sizeMode?: "world" | "screen"; primitive: "circles"; circles: InstancedCirclesData }
+  | { name: string; sizeMode?: "world" | "screen"; primitive: "lines"; lines: InstancedLinesData };
 
 /** A renderer for a Scene, implemented per target (WebGL / Canvas / SVG). */
 export interface Backend {

@@ -1,7 +1,7 @@
 import { describe, it, expect } from "vitest";
 import { luma } from "@luma.gl/core";
 import { webgl2Adapter } from "@luma.gl/webgl";
-import { InstancedCircles } from "../instanced.js";
+import { InstancedCircles, InstancedLines } from "../instanced.js";
 import { clipFromView } from "../index.js";
 import { WebGLBackend } from "../webgl-backend.js";
 
@@ -109,5 +109,37 @@ describe("WebGLBackend instanced layer", () => {
     expect(backend.readPixel(32, 32)[3]).toBe(0); // gone after removal
 
     backend.destroy();
+  });
+});
+
+describe("InstancedLines", () => {
+  it("draws an instanced straight line at its world endpoints in its colour", async () => {
+    const { device, framebuffer } = await setup();
+    const lines = new InstancedLines(
+      device,
+      {
+        sources: new Float32Array([10, 32]),
+        targets: new Float32Array([54, 32]),
+        widths: new Float32Array([6]),
+        colors: new Uint8Array([0, 0, 255, 255]),
+        count: 1,
+      },
+      W,
+      H,
+    );
+    lines.setTransform(clipFromView({ k: 1, x: 0, y: 0 }, W, H));
+
+    const pass = device.beginRenderPass({ framebuffer, clearColor: [0, 0, 0, 0] });
+    lines.render(pass);
+    pass.end();
+    device.submit();
+
+    const onLine = px(device, framebuffer, 32, 32); // midpoint, on the segment
+    const offLine = px(device, framebuffer, 32, 10); // away from the segment
+    expect(onLine[2]).toBeGreaterThan(200); // blue along the line
+    expect(offLine[3]).toBe(0); // transparent away from it
+
+    lines.destroy();
+    device.destroy();
   });
 });

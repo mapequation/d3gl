@@ -1,5 +1,5 @@
 import { BaseEngine, type BaseEngineOptions } from "../map/base-engine.js";
-import { nodeCircles } from "./glyphs.js";
+import { nodeCircles, linkLines } from "./glyphs.js";
 import type { NetworkGraph } from "./graph.js";
 
 /** Options for the network engine. Inherits sizing, `backend`, and `tooltipClass`. */
@@ -13,6 +13,10 @@ export interface NetworkStyle {
   nodeRadius?: number;
   /** Node fill colour (any CSS color). Default a medium blue. */
   nodeFill?: string;
+  /** Link width in world units. Default 1. */
+  linkWidth?: number;
+  /** Link stroke colour (any CSS color). Default a light grey. */
+  linkStroke?: string;
 }
 
 /** How node positions are produced. The worker / GPU backends land in #102 / #106. */
@@ -25,6 +29,8 @@ export interface NetworkLayoutOptions {
 
 const DEFAULT_NODE_RADIUS = 4;
 const DEFAULT_NODE_FILL = "#4878d0";
+const DEFAULT_LINK_WIDTH = 1;
+const DEFAULT_LINK_STROKE = "#999999";
 
 /**
  * The network rendering engine (epic #98). A dedicated engine — nodes, links,
@@ -77,6 +83,18 @@ export class Network extends BaseEngine {
     if (!this.graph) return this;
     const backend = this.backend();
     if (!backend?.setInstancedLayer) return this;
+    // Links first (drawn under nodes).
+    if (this.graph.edgeCount > 0) {
+      backend.setInstancedLayer({
+        name: "links",
+        primitive: "lines",
+        lines: linkLines(this.graph, {
+          width: this.styleOpts.linkWidth ?? DEFAULT_LINK_WIDTH,
+          stroke: this.styleOpts.linkStroke ?? DEFAULT_LINK_STROKE,
+        }),
+        sizeMode: "world",
+      });
+    }
     backend.setInstancedLayer({
       name: "nodes",
       primitive: "circles",

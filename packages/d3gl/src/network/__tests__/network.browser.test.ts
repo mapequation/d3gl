@@ -60,4 +60,26 @@ describe("network() engine scaffold", () => {
 
     net.destroy();
   });
+
+  it("renders links through the instanced lane", async () => {
+    const el = document.createElement("div");
+    el.style.width = "64px";
+    el.style.height = "64px";
+    document.body.appendChild(el);
+    const net = network(el, { width: 64, height: 64 });
+    await net.whenReady();
+
+    const g = buildGraph({ nodeCount: 2, source: [0], target: [1] });
+    net
+      .data(g)
+      .style({ nodeRadius: 1, linkWidth: 8, linkStroke: "#00ff00" })
+      .layout({ backend: "positions", positions: new Float32Array([10, 32, 54, 32]) });
+    net.render();
+
+    const be = (net as unknown as { backend(): { readPixel(x: number, y: number): number[] } | null }).backend();
+    const midpoint = be!.readPixel(32, 32); // on the link, between the two nodes
+    expect(midpoint[1]).toBeGreaterThan(150); // green link rendered
+
+    net.destroy();
+  });
 });

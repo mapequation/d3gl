@@ -1,8 +1,8 @@
 import { Model } from "@luma.gl/engine";
 import type { Buffer, Device, RenderPass } from "@luma.gl/core";
-import { INSTANCED_CIRCLE_VS, POINT_FS } from "./shaders.js";
+import { INSTANCED_CIRCLE_VS, INSTANCED_LINE_VS, POINT_FS, FILL_FS } from "./shaders.js";
 import { clipFromView } from "./transform.js";
-import type { InstancedCirclesData } from "../core/index.js";
+import type { InstancedCirclesData, InstancedLinesData } from "../core/index.js";
 
 /**
  * GPU-instanced primitives for the network module's rendering lane (#100, epic #98).
@@ -89,6 +89,78 @@ export class InstancedCircles {
     this.corner.destroy();
     this.center.destroy();
     this.radius.destroy();
+    this.color.destroy();
+  }
+}
+
+/** Unit path-strip template for straight lines (M=2): (t, side) per vertex, triangle-strip. */
+const LINE_TEMPLATE = new Float32Array([0, -1, 0, 1, 1, -1, 1, 1]);
+
+export class InstancedLines {
+  count: number;
+  private model: Model;
+  private corner: Buffer;
+  private source: Buffer;
+  private target: Buffer;
+  private widthBuf: Buffer;
+  private color: Buffer;
+  private uniforms: Record<string, unknown>;
+
+  constructor(device: Device, data: InstancedLinesData, width = 0, height = 0) {
+    this.count = data.count;
+    this.corner = device.createBuffer({ data: LINE_TEMPLATE });
+    this.source = device.createBuffer({ data: data.sources });
+    this.target = device.createBuffer({ data: data.targets });
+    this.widthBuf = device.createBuffer({ data: data.widths });
+    this.color = device.createBuffer({ data: data.colors });
+    this.uniforms = {
+      u_transform: clipFromView({ k: 1, x: 0, y: 0 }, width || 1, height || 1),
+      u_screen: 0,
+      u_viewport: [width, height],
+    };
+    this.model = new Model(device, {
+      vs: INSTANCED_LINE_VS,
+      fs: FILL_FS,
+      bufferLayout: [
+        { name: "a_corner", format: "float32x2" },
+        { name: "a_source", format: "float32x2", stepMode: "instance" },
+        { name: "a_target", format: "float32x2", stepMode: "instance" },
+        { name: "a_width", format: "float32", stepMode: "instance" },
+        { name: "a_color", format: "unorm8x4", stepMode: "instance" },
+      ],
+      attributes: {
+        a_corner: this.corner,
+        a_source: this.source,
+        a_target: this.target,
+        a_width: this.widthBuf,
+        a_color: this.color,
+      },
+      uniforms: this.uniforms,
+      parameters: BLEND,
+      topology: "triangle-strip",
+      vertexCount: 4,
+      instanceCount: this.count,
+    });
+  }
+
+  setTransform(m: Float32Array): void {
+    this.uniforms["u_transform"] = m;
+  }
+  setViewport(width: number, height: number): void {
+    this.uniforms["u_viewport"] = [width, height];
+  }
+  setSizeMode(mode: "world" | "screen"): void {
+    this.uniforms["u_screen"] = mode === "screen" ? 1 : 0;
+  }
+  render(pass: RenderPass): void {
+    if (this.count > 0) this.model.draw(pass);
+  }
+  destroy(): void {
+    this.model.destroy();
+    this.corner.destroy();
+    this.source.destroy();
+    this.target.destroy();
+    this.widthBuf.destroy();
     this.color.destroy();
   }
 }
