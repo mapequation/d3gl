@@ -57,6 +57,10 @@
       "types": "./dist/map.d.ts",
       "import": "./dist/map.js"
     },
+    "./network": {
+      "types": "./dist/network.d.ts",
+      "import": "./dist/network.js"
+    },
     "./react": {
       "types": "./dist/react.d.ts",
       "import": "./dist/react.js"

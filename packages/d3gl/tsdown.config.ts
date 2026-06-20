@@ -25,6 +25,7 @@ export default defineConfig({
     geo: "src/geo/index.ts",
     labels: "src/labels/index.ts",
     map: "src/map/index.ts",
+    network: "src/network/index.ts",
     react: "src/react/index.ts",
   },
   format: ["esm"],
