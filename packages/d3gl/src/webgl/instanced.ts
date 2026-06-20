@@ -2,6 +2,7 @@ import { Model } from "@luma.gl/engine";
 import type { Buffer, Device, RenderPass } from "@luma.gl/core";
 import { INSTANCED_CIRCLE_VS, POINT_FS } from "./shaders.js";
 import { clipFromView } from "./transform.js";
+import type { InstancedCirclesData } from "../core/index.js";
 
 /**
  * GPU-instanced primitives for the network module's rendering lane (#100, epic #98).
@@ -12,17 +13,6 @@ import { clipFromView } from "./transform.js";
  * It's the shared lane the network engine renders through; `plot.points()` migrates
  * onto it later (#108).
  */
-
-/** SoA for a batch of circles (nodes). Plain typed arrays — worker-transferable. */
-export interface CirclesData {
-  /** [x, y] world coords per circle, length `2 * count`. */
-  centers: Float32Array;
-  /** radius per circle, length `count`. */
-  radii: Float32Array;
-  /** RGBA bytes per circle, length `4 * count`. */
-  colors: Uint8Array;
-  count: number;
-}
 
 /** Unit-quad corners as a triangle-strip (shared across all instances). */
 const QUAD = new Float32Array([-1, -1, 1, -1, -1, 1, 1, 1]);
@@ -47,7 +37,7 @@ export class InstancedCircles {
   private color: Buffer;
   private uniforms: Record<string, unknown>;
 
-  constructor(device: Device, data: CirclesData, width = 0, height = 0) {
+  constructor(device: Device, data: InstancedCirclesData, width = 0, height = 0) {
     this.count = data.count;
     this.corner = device.createBuffer({ data: QUAD });
     this.center = device.createBuffer({ data: data.centers });

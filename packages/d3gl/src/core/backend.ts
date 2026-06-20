@@ -76,6 +76,25 @@ export interface RenderDelta {
   sizeMode?: "world" | "screen";
 }
 
+/** SoA for a batch of instanced circles (e.g. network nodes). Plain typed arrays. */
+export interface InstancedCirclesData {
+  /** [x, y] world coords per circle, length `2 * count`. */
+  centers: Float32Array;
+  /** radius per circle, length `count`. */
+  radii: Float32Array;
+  /** RGBA bytes per circle, length `4 * count`. */
+  colors: Uint8Array;
+  count: number;
+}
+
+/** A named GPU-instanced primitive layer — the network rendering lane (#100). */
+export interface InstancedLayer {
+  name: string;
+  primitive: "circles";
+  circles: InstancedCirclesData;
+  sizeMode?: "world" | "screen";
+}
+
 /** A renderer for a Scene, implemented per target (WebGL / Canvas / SVG). */
 export interface Backend {
   setLayers(layers: RenderLayer[]): void;
@@ -123,6 +142,14 @@ export interface Backend {
   snapshotPassThrough?(): void;
   /** True if this backend supports pass-through (canvas/webgl yes, svg no). */
   readonly supportsPassThrough?: boolean;
+  /**
+   * Register/replace a GPU-instanced primitive layer (the network rendering lane).
+   * Optional — only the WebGL backend implements it; other backends omit it, so network
+   * instanced rendering is WebGL-only (small-N / export go through the PathContext emitter).
+   */
+  setInstancedLayer?(layer: InstancedLayer): void;
+  /** Remove an instanced primitive layer by name. */
+  removeInstancedLayer?(name: string): void;
   setTransform(t: ViewTransform): void;
   /**
    * Resize the rendering surface to a new CSS size (px). Re-reads the device pixel ratio

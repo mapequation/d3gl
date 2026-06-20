@@ -3,6 +3,7 @@ import { luma } from "@luma.gl/core";
 import { webgl2Adapter } from "@luma.gl/webgl";
 import { InstancedCircles } from "../instanced.js";
 import { clipFromView } from "../index.js";
+import { WebGLBackend } from "../webgl-backend.js";
 
 const W = 64;
 const H = 64;
@@ -80,5 +81,33 @@ describe("InstancedCircles", () => {
 
     circles.destroy();
     device.destroy();
+  });
+});
+
+describe("WebGLBackend instanced layer", () => {
+  it("renders an instanced circles layer through the backend (readPixel)", async () => {
+    const canvas = document.createElement("canvas");
+    canvas.width = W;
+    canvas.height = H;
+    document.body.appendChild(canvas);
+    const backend = await WebGLBackend.create(canvas, { width: W, height: H });
+
+    backend.setInstancedLayer({
+      name: "nodes",
+      primitive: "circles",
+      circles: { centers: new Float32Array([32, 32]), radii: new Float32Array([12]), colors: new Uint8Array([0, 200, 0, 255]), count: 1 },
+      sizeMode: "world",
+    });
+    backend.setTransform({ k: 1, x: 0, y: 0 });
+
+    const centre = backend.readPixel(32, 32);
+    const outside = backend.readPixel(2, 2);
+    expect(centre[1]).toBeGreaterThan(150); // green node present at the centre
+    expect(outside[3]).toBe(0); // transparent elsewhere
+
+    backend.removeInstancedLayer("nodes");
+    expect(backend.readPixel(32, 32)[3]).toBe(0); // gone after removal
+
+    backend.destroy();
   });
 });
