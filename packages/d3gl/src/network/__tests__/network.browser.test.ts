@@ -34,11 +34,19 @@ describe("network() engine", () => {
     net.destroy();
   });
 
-  it("renders without throwing and exports an svg string", async () => {
+  it("renders a network to SVG on the svg backend (publication export)", async () => {
     const net = network(host(), { width: 200, height: 200, backend: "svg" });
     await net.whenReady();
-    net.render();
-    expect(typeof net.toSVG()).toBe("string");
+    const g = buildGraph({ nodeCount: 3, source: [0, 1], target: [1, 2], directed: true });
+    net
+      .data(g)
+      .style({ directed: true, nodeRadius: 5, nodeFill: "#ff0000", linkStroke: "#999999", linkWidth: 1 })
+      .layout({ backend: "positions", positions: new Float32Array([20, 20, 100, 100, 180, 40]) });
+
+    const svg = net.toSVG();
+    expect((svg.match(/<circle/g) ?? []).length).toBe(3); // one circle per node
+    expect(svg).toContain("<path"); // links + arrowheads emitted as paths
+
     net.destroy();
   });
 });

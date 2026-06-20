@@ -1,5 +1,5 @@
 import { BaseEngine, type BaseEngineOptions } from "../map/base-engine.js";
-import { networkLayers, type ResolvedNetworkStyle } from "./glyphs.js";
+import { networkLayers, emitNodes, emitLinks, emitArrows, type ResolvedNetworkStyle } from "./glyphs.js";
 import type { NetworkGraph } from "./graph.js";
 
 /** Options for the network engine. Inherits sizing, `backend`, and `tooltipClass`. */
@@ -35,6 +35,7 @@ const DEFAULT_NODE_RADIUS = 4;
 const DEFAULT_NODE_FILL = "#4878d0";
 const DEFAULT_LINK_WIDTH = 1;
 const DEFAULT_LINK_STROKE = "#999999";
+const LAYER_NAMES = ["links", "arrows", "nodes"] as const;
 
 /**
  * The network rendering engine (epic #98). A dedicated engine — nodes, links,
@@ -49,6 +50,8 @@ export class Network extends BaseEngine {
   private graph: NetworkGraph | null = null;
   private styleOpts: NetworkStyle = {};
   private layoutOpts: NetworkLayoutOptions = {};
+  /** Whether retained Scene layers are currently populated (SVG/Canvas path). */
+  private sceneActive = false;
 
   constructor(host: HTMLElement, opts: NetworkOptions = {}) {
     super(host, opts);
@@ -86,12 +89,65 @@ export class Network extends BaseEngine {
   private rebuild(): this {
     if (!this.graph) return this;
     const backend = this.backend();
-    if (!backend?.setInstancedLayer) return this;
-    for (const layer of networkLayers(this.graph, this.resolvedStyle(this.graph))) {
-      backend.setInstancedLayer(layer);
+    if (!backend) return this;
+    const style = this.resolvedStyle(this.graph);
+
+    if (backend.setInstancedLayer) {
+      // WebGL: the instanced lane. Clear any Scene geometry left from a previous
+      // non-WebGL backend so a backend switch doesn't double-draw.
+      if (this.sceneActive) {
+        this.registerNetworkScene(this.graph, style, false);
+        this.sceneActive = false;
+      }
+      const layers = networkLayers(this.graph, style);
+      const present = new Set(layers.map((l) => l.name));
+      for (const name of LAYER_NAMES) if (!present.has(name)) backend.removeInstancedLayer?.(name);
+      for (const layer of layers) backend.setInstancedLayer(layer);
+    } else {
+      // SVG/Canvas: emit the glyphs through the PathContext seam as Scene layers, so the
+      // existing pipeline renders them and toSVG() produces publication output.
+      this.registerNetworkScene(this.graph, style, true);
+      this.sceneActive = true;
     }
     this.render();
     return this;
+  }
+
+  /**
+   * Register the network as retained Scene layers (links under arrows under nodes) via the
+   * PathContext glyph emitters. With `emit: false` the layers are registered empty — used to
+   * clear tessellated geometry when switching to the WebGL instanced lane.
+   */
+  private registerNetworkScene(graph: NetworkGraph, style: ResolvedNetworkStyle, emit: boolean): void {
+    const edgeIds = Array.from({ length: graph.edgeCount }, (_, e) => e);
+    const nodeIds = Array.from({ length: graph.nodeCount }, (_, i) => i);
+    this.registerLayer({
+      name: "links",
+      data: edgeIds,
+      ids: edgeIds,
+      stroke: () => style.linkStroke,
+      build: (g) => {
+        if (emit) emitLinks(g, graph, style.linkWidth);
+      },
+    });
+    this.registerLayer({
+      name: "arrows",
+      data: edgeIds,
+      ids: edgeIds,
+      fill: () => style.arrowFill,
+      build: (g) => {
+        if (emit && style.directed) emitArrows(g, graph, style.arrowSize, style.nodeRadius);
+      },
+    });
+    this.registerLayer({
+      name: "nodes",
+      data: nodeIds,
+      ids: nodeIds,
+      fill: () => style.nodeFill,
+      build: (g) => {
+        if (emit) emitNodes(g, graph, style.nodeRadius);
+      },
+    });
   }
 
   /** Apply style defaults (drawn order is decided by {@link networkLayers}). */

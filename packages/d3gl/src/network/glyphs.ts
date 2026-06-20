@@ -1,5 +1,5 @@
 import { rgb } from "d3-color";
-import type { InstancedCirclesData, InstancedLinesData, InstancedArrowsData, InstancedLayer } from "../core/index.js";
+import type { InstancedCirclesData, InstancedLinesData, InstancedArrowsData, InstancedLayer, GroupBuilder } from "../core/index.js";
 import type { NetworkGraph } from "./graph.js";
 
 /**
@@ -148,4 +148,66 @@ export function networkLayers(graph: NetworkGraph, style: ResolvedNetworkStyle):
     sizeMode: "world",
   });
   return layers;
+}
+
+// ---------------------------------------------------------------------------
+// PathContext emitters — the second emitter of each glyph (#100 N2.3). They draw
+// the same glyphs into a Scene GroupBuilder so SVG/Canvas backends render small
+// networks and toSVG() produces publication output, reusing the existing pipeline.
+// ---------------------------------------------------------------------------
+
+/** Emit each node as a circle (point) drawable, keyed by node index. */
+export function emitNodes(g: GroupBuilder, graph: NetworkGraph, radius: number): void {
+  for (let i = 0; i < graph.nodeCount; i++) {
+    g.point(i, graph.positions[i * 2]!, graph.positions[i * 2 + 1]!, radius);
+  }
+}
+
+/** Emit each link as a stroked line drawable, keyed by edge index. */
+export function emitLinks(g: GroupBuilder, graph: NetworkGraph, width: number): void {
+  for (let e = 0; e < graph.edgeCount; e++) {
+    const s = graph.source[e]!;
+    const t = graph.target[e]!;
+    const sx = graph.positions[s * 2]!;
+    const sy = graph.positions[s * 2 + 1]!;
+    const tx = graph.positions[t * 2]!;
+    const ty = graph.positions[t * 2 + 1]!;
+    g.drawable(
+      e,
+      (ctx) => {
+        ctx.moveTo(sx, sy);
+        ctx.lineTo(tx, ty);
+      },
+      { lineWidth: width },
+    );
+  }
+}
+
+/** Emit each directed link's arrowhead as a filled triangle, tip set back by the node radius. */
+export function emitArrows(g: GroupBuilder, graph: NetworkGraph, size: number, nodeRadius: number): void {
+  for (let e = 0; e < graph.edgeCount; e++) {
+    const s = graph.source[e]!;
+    const t = graph.target[e]!;
+    const sx = graph.positions[s * 2]!;
+    const sy = graph.positions[s * 2 + 1]!;
+    const tx = graph.positions[t * 2]!;
+    const ty = graph.positions[t * 2 + 1]!;
+    const dx = tx - sx;
+    const dy = ty - sy;
+    const len = Math.hypot(dx, dy) || 1;
+    const ux = dx / len;
+    const uy = dy / len;
+    const px = -uy;
+    const py = ux;
+    const tipX = tx - ux * nodeRadius;
+    const tipY = ty - uy * nodeRadius;
+    const baseX = tipX - ux * 2 * size;
+    const baseY = tipY - uy * 2 * size;
+    g.drawable(e, (ctx) => {
+      ctx.moveTo(tipX, tipY);
+      ctx.lineTo(baseX - px * size, baseY - py * size);
+      ctx.lineTo(baseX + px * size, baseY + py * size);
+      ctx.closePath();
+    });
+  }
 }
