@@ -76,6 +76,49 @@ export interface RenderDelta {
   sizeMode?: "world" | "screen";
 }
 
+/** SoA for a batch of instanced circles (e.g. network nodes). Plain typed arrays. */
+export interface InstancedCirclesData {
+  /** [x, y] world coords per circle, length `2 * count`. */
+  centers: Float32Array;
+  /** radius per circle, length `count`. */
+  radii: Float32Array;
+  /** RGBA bytes per circle, length `4 * count`. */
+  colors: Uint8Array;
+  count: number;
+}
+
+/** SoA for a batch of instanced straight lines (e.g. network links). */
+export interface InstancedLinesData {
+  /** [x, y] world source per line, length `2 * count`. */
+  sources: Float32Array;
+  /** [x, y] world target per line, length `2 * count`. */
+  targets: Float32Array;
+  /** width per line, length `count`. */
+  widths: Float32Array;
+  /** RGBA bytes per line, length `4 * count`. */
+  colors: Uint8Array;
+  count: number;
+}
+
+/** SoA for a batch of instanced triangle arrowheads (directed-link tips). */
+export interface InstancedArrowsData {
+  /** [x, y] world source per arrow (for orientation), length `2 * count`. */
+  sources: Float32Array;
+  /** [x, y] world tip per arrow, length `2 * count`. */
+  targets: Float32Array;
+  /** arrow size (world units) per arrow, length `count`. */
+  sizes: Float32Array;
+  /** RGBA bytes per arrow, length `4 * count`. */
+  colors: Uint8Array;
+  count: number;
+}
+
+/** A named GPU-instanced primitive layer — the network rendering lane (#100). */
+export type InstancedLayer =
+  | { name: string; sizeMode?: "world" | "screen"; primitive: "circles"; circles: InstancedCirclesData }
+  | { name: string; sizeMode?: "world" | "screen"; primitive: "lines"; lines: InstancedLinesData }
+  | { name: string; sizeMode?: "world" | "screen"; primitive: "arrows"; arrows: InstancedArrowsData };
+
 /** A renderer for a Scene, implemented per target (WebGL / Canvas / SVG). */
 export interface Backend {
   setLayers(layers: RenderLayer[]): void;
@@ -123,6 +166,14 @@ export interface Backend {
   snapshotPassThrough?(): void;
   /** True if this backend supports pass-through (canvas/webgl yes, svg no). */
   readonly supportsPassThrough?: boolean;
+  /**
+   * Register/replace a GPU-instanced primitive layer (the network rendering lane).
+   * Optional — only the WebGL backend implements it; other backends omit it, so network
+   * instanced rendering is WebGL-only (small-N / export go through the PathContext emitter).
+   */
+  setInstancedLayer?(layer: InstancedLayer): void;
+  /** Remove an instanced primitive layer by name. */
+  removeInstancedLayer?(name: string): void;
   setTransform(t: ViewTransform): void;
   /**
    * Resize the rendering surface to a new CSS size (px). Re-reads the device pixel ratio

@@ -26,5 +26,6 @@ export {
 } from "./palette.js";
 export type { PaletteDimensions } from "./palette.js";
 export { GroupRenderer } from "./renderer.js";
+export { InstancedCircles, InstancedLines, InstancedArrows } from "./instanced.js";
 export { pickAt } from "./pick.js";
 export { toPNG } from "./png.js";

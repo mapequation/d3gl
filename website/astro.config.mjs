@@ -15,7 +15,7 @@ import react from "@astrojs/react";
 const mod = (name) =>
   fileURLToPath(new URL(`../packages/d3gl/src/${name}/index.ts`, import.meta.url));
 
-// The 8 library module entry points documented by the API reference.
+// The 9 library module entry points documented by the API reference.
 const referenceEntryPoints = [
   "../packages/d3gl/src/core/index.ts",
   "../packages/d3gl/src/canvas/index.ts",
@@ -24,6 +24,7 @@ const referenceEntryPoints = [
   "../packages/d3gl/src/geo/index.ts",
   "../packages/d3gl/src/labels/index.ts",
   "../packages/d3gl/src/map/index.ts",
+  "../packages/d3gl/src/network/index.ts",
   "../packages/d3gl/src/react/index.ts",
 ];
 
@@ -94,6 +95,7 @@ export default defineConfig({
           { label: "GeoJSON features", slug: "examples/geojson-features" },
           { label: "Highlight", slug: "examples/highlight" },
           { label: "Declutter", slug: "examples/declutter" },
+          { label: "Network", slug: "examples/network" },
           { label: "Map projections", slug: "examples/map-projections" },
           { label: "Sizing", slug: "examples/sizing" },
           { label: "Streaming data", slug: "examples/streaming" },
@@ -125,6 +127,7 @@ export default defineConfig({
         { find: "@mapequation/d3gl/geo", replacement: mod("geo") },
         { find: "@mapequation/d3gl/labels", replacement: mod("labels") },
         { find: "@mapequation/d3gl/map", replacement: mod("map") },
+        { find: "@mapequation/d3gl/network", replacement: mod("network") },
         { find: "@mapequation/d3gl/react", replacement: mod("react") },
         { find: /^@mapequation\/d3gl$/, replacement: mod("core") },
       ],

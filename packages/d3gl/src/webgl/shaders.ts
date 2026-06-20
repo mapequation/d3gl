@@ -161,6 +161,91 @@ void main() {
   gl_Position = vec4(c.xy + off, 0.0, 1.0);
 }`;
 
+// INSTANCED_CIRCLE_VS — true GPU-instanced circles for the network lane (#100). A shared
+// unit-quad template (a_corner, per-vertex) is offset by per-instance centre/radius and
+// coloured from a per-instance attribute (no texture lookup). Pairs with POINT_FS, which
+// discards fragments outside the unit disc. Mirrors PT_POINT_VS's world/screen sizeMode.
+export const INSTANCED_CIRCLE_VS = `#version 300 es
+precision highp float;
+uniform mat3 u_transform;
+uniform float u_screen;     // 1.0 = screen sizeMode (constant px), 0.0 = world
+uniform vec2 u_viewport;    // device px, for screen sizeMode
+in vec2 a_corner;           // per-vertex unit-quad corner in [-1, 1]
+in vec2 a_center;           // per-instance world centre
+in float a_radius;          // per-instance radius
+in vec4 a_color;            // per-instance RGBA (unorm8x4 -> 0..1)
+out vec4 v_color;
+out vec2 v_local;
+void main() {
+  v_color = a_color;
+  v_local = a_corner;
+  vec3 c = u_transform * vec3(a_center, 1.0);
+  vec2 off = (u_screen > 0.5)
+    ? a_corner * a_radius * vec2(2.0 / u_viewport.x, -2.0 / u_viewport.y)
+    : (u_transform * vec3(a_center + a_corner * a_radius, 1.0)).xy - c.xy;
+  gl_Position = vec4(c.xy + off, 0.0, 1.0);
+}`;
+
+// INSTANCED_LINE_VS — true GPU-instanced "path-strip" lines for the network lane (#100).
+// The per-vertex template a_corner = (t, side): t in {0,1} walks the segment, side in {-1,1}
+// picks the edge. Per-instance source/target/width/color. Straight links are the M=2 case;
+// the same primitive generalises to bezier/half-arrows (more samples) later. Pairs with FILL_FS.
+export const INSTANCED_LINE_VS = `#version 300 es
+precision highp float;
+uniform mat3 u_transform;
+uniform float u_screen;     // 1.0 = constant-px width, 0.0 = world width (scales with zoom)
+uniform vec2 u_viewport;    // device px, for screen mode
+in vec2 a_corner;           // per-vertex (t in {0,1}, side in {-1,1})
+in vec2 a_source;           // per-instance world source
+in vec2 a_target;           // per-instance world target
+in float a_width;           // per-instance line width
+in vec4 a_color;            // per-instance RGBA (unorm8x4 -> 0..1)
+out vec4 v_color;
+void main() {
+  v_color = a_color;
+  float t = a_corner.x;
+  float side = a_corner.y;
+  float hw = a_width * 0.5;
+  vec2 p = mix(a_source, a_target, t);
+  vec2 cp = (u_transform * vec3(p, 1.0)).xy;          // centreline point in clip
+  vec2 off;
+  if (u_screen > 0.5) {
+    // Constant-pixel width: perpendicular derived in screen px, converted back to clip.
+    vec2 cs = (u_transform * vec3(a_source, 1.0)).xy;
+    vec2 ct = (u_transform * vec3(a_target, 1.0)).xy;
+    vec2 dir = normalize((ct - cs) * u_viewport);     // clip delta -> px direction
+    vec2 perp = vec2(-dir.y, dir.x);
+    off = perp * side * hw * (2.0 / u_viewport);      // px -> clip
+  } else {
+    // World width: offset the centreline point in world space, then transform.
+    vec2 dir = normalize(a_target - a_source);
+    vec2 perp = vec2(-dir.y, dir.x);
+    off = (u_transform * vec3(p + perp * side * hw, 1.0)).xy - cp;
+  }
+  gl_Position = vec4(cp + off, 0.0, 1.0);
+}`;
+
+// INSTANCED_ARROW_VS — instanced triangle arrowheads for directed links (#100). One triangle
+// per instance: per-vertex a_tri = (back, across) with tip (0,0) and base (2,-1)/(2,1); the tip
+// sits at a_target, oriented along (a_target - a_source), scaled by a_size (world units). Pairs
+// with FILL_FS. World-sized for now (screen-sizing can follow the line shader's u_screen branch).
+export const INSTANCED_ARROW_VS = `#version 300 es
+precision highp float;
+uniform mat3 u_transform;
+in vec2 a_tri;        // per-vertex (back, across)
+in vec2 a_source;     // per-instance world source (orientation)
+in vec2 a_target;     // per-instance world tip
+in float a_size;      // per-instance arrow size (world units)
+in vec4 a_color;
+out vec4 v_color;
+void main() {
+  v_color = a_color;
+  vec2 dir = normalize(a_target - a_source);
+  vec2 perp = vec2(-dir.y, dir.x);
+  vec2 world = a_target - dir * (a_tri.x * a_size) + perp * (a_tri.y * a_size);
+  gl_Position = vec4((u_transform * vec3(world, 1.0)).xy, 0.0, 1.0);
+}`;
+
 // PT_MESH_VS — pass-through fill/stroke meshes. Both fill triangles and expanded-stroke
 // triangles are just colored geometry, so they share this shader: project the world-space
 // vertex through u_transform (world mode — stroke width scales with zoom, matching Canvas)

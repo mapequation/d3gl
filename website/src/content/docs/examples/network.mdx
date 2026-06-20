@@ -1,0 +1,24 @@
+---
+title: Network
+description: Render a raw directed network — instanced points, lines, and arrowheads — with the network() engine.
+---
+
+import ExampleCard from "../../../components/ExampleCard.astro";
+import Network from "../../../examples/network/Network.tsx";
+
+The `network()` engine renders node–link diagrams through a dedicated GPU-instanced rendering
+lane: nodes are instanced points, links are instanced lines, and directed edges get triangle
+arrowheads. It is built for large graphs — the same lane scales to millions of elements with
+level-of-detail (coming in later steps).
+
+This example builds a **ring of cliques** — fully-connected clusters of 10 nodes bridged in a
+ring — and lets d3gl's in-library **force layout** (`layout({ backend: "force" })`, Barnes-Hut)
+place the nodes; no coordinates are supplied. The **Nodes** slider scales from 10 to 1,000,000 to
+stress-test the layout and rendering. Force layout currently runs on the main thread, so the
+largest sizes block briefly while solving — moving it to a Web Worker with progressive convergence
+is the next step. Rendering uses WebGL instancing — drag to pan, scroll to zoom, and toggle
+**Links** between directed (with arrowheads) and undirected.
+
+<ExampleCard files={["network/draw.ts", "network/data.ts"]}>
+  <Network client:visible slot="demo" />
+</ExampleCard>

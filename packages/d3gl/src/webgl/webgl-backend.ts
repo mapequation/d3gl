@@ -1,9 +1,10 @@
 import { luma } from "@luma.gl/core";
 import { webgl2Adapter } from "@luma.gl/webgl";
 import type { Device, Framebuffer } from "@luma.gl/core";
-import type { Backend, RenderLayer, RenderDelta, ViewTransform } from "../core/index.js";
+import type { Backend, RenderLayer, RenderDelta, ViewTransform, InstancedLayer } from "../core/index.js";
 import type { GroupBuffers, GroupBufferDelta, PassThroughLayer, DrawBatch, StyleTables, DrawableVector } from "../core/index.js";
 import { GroupRenderer } from "./renderer.js";
+import { InstancedCircles, InstancedLines, InstancedArrows } from "./instanced.js";
 import { clipFromView } from "./transform.js";
 import { toPNG } from "./png.js";
 import { svgFromLayers } from "../svg/index.js";
@@ -20,6 +21,8 @@ export class WebGLBackend implements Backend {
   private renderers = new Map<string, GroupRenderer>();
   private layers = new Map<string, RenderLayer>();
   private order: string[] = [];
+  /** GPU-instanced primitive layers (the network lane), drawn after retained layers. */
+  private instanced = new Map<string, InstancedCircles | InstancedLines | InstancedArrows>();
   private clipMatrix: Float32Array;
   private viewTransform: ViewTransform = { k: 1, x: 0, y: 0 };
   private globe: GlobeRenderer | null = null; // non-null ⇒ globe mode active
@@ -186,10 +189,30 @@ export class WebGLBackend implements Backend {
    */
   snapshotPassThrough(): void {}
 
+  setInstancedLayer(layer: InstancedLayer): void {
+    this.instanced.get(layer.name)?.destroy();
+    const r =
+      layer.primitive === "lines"
+        ? new InstancedLines(this.device, layer.lines, this.width, this.height)
+        : layer.primitive === "arrows"
+          ? new InstancedArrows(this.device, layer.arrows, this.width, this.height)
+          : new InstancedCircles(this.device, layer.circles, this.width, this.height);
+    r.setTransform(this.clipMatrix);
+    r.setViewport(this.width, this.height);
+    r.setSizeMode(layer.sizeMode ?? "world");
+    this.instanced.set(layer.name, r);
+  }
+
+  removeInstancedLayer(name: string): void {
+    this.instanced.get(name)?.destroy();
+    this.instanced.delete(name);
+  }
+
   setTransform(t: ViewTransform): void {
     this.viewTransform = t;
     this.clipMatrix = clipFromView(t, this.width, this.height);
     for (const r of this.renderers.values()) r.setTransform(this.clipMatrix);
+    for (const r of this.instanced.values()) r.setTransform(this.clipMatrix);
   }
 
   /** Resize the onscreen canvas drawing buffer (luma owns it via useDevicePixels), recompute
@@ -209,6 +232,10 @@ export class WebGLBackend implements Backend {
     cc.setDrawingBufferSize(Math.round(width * cc.devicePixelRatio), Math.round(height * cc.devicePixelRatio));
     this.clipMatrix = clipFromView(this.viewTransform, width, height);
     for (const r of this.renderers.values()) {
+      r.setTransform(this.clipMatrix);
+      r.setViewport(width, height);
+    }
+    for (const r of this.instanced.values()) {
       r.setTransform(this.clipMatrix);
       r.setViewport(width, height);
     }
@@ -298,6 +325,9 @@ export class WebGLBackend implements Backend {
       r.setSizeMode(layer.sizeMode ?? "world");
       r.render(pass);
     }
+    // Instanced-primitive lane (network nodes/links): no Scene group — fed via
+    // setInstancedLayer, drawn after retained layers, before the pass-through composite.
+    for (const r of this.instanced.values()) r.render(pass);
     pass.end();
     this.device.submit();
 
@@ -354,6 +384,8 @@ export class WebGLBackend implements Backend {
   destroy(): void {
     for (const r of this.renderers.values()) r.destroy();
     this.renderers.clear();
+    for (const r of this.instanced.values()) r.destroy();
+    this.instanced.clear();
     this.layers.clear();
     this.order = [];
     this.globe?.destroy();
