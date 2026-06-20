@@ -38,9 +38,10 @@ export interface NetworkLayoutOptions {
   /** Force parameters for `backend: "force"`. */
   force?: Partial<ForceParams>;
   /**
-   * For `backend: "force"`, seed the layout via multilevel coarsening (heavy-edge matching) for
-   * faster convergence and fewer tangles on clustered graphs. Default `true`; set `false` for a
-   * plain cold-start force run. Tiny / edgeless graphs skip coarsening automatically.
+   * For `backend: "force"` and `backend: "worker"`, seed the layout via multilevel coarsening
+   * (heavy-edge matching) for faster convergence and fewer tangles on clustered graphs. Default
+   * `true`; set `false` for a plain cold-start force run. Tiny / edgeless graphs skip coarsening
+   * automatically.
    */
   multilevel?: boolean;
 }
@@ -111,6 +112,7 @@ export class Network extends BaseEngine {
             height: this.height,
             iterations: opts.iterations ?? DEFAULT_FORCE_ITERATIONS,
             force: opts.force,
+            multilevel: opts.multilevel,
           },
           () => this.scheduleLayoutRepaint(),
         );

@@ -26,7 +26,12 @@ export interface ForceParams {
   repulsion: number;
   /** Spring attraction strength along edges. */
   attraction: number;
-  /** Pull toward the centroid (keeps the layout from drifting / flying apart). */
+  /**
+   * Positional gravity: each node is pulled toward the layout centroid ∝ its distance. Besides
+   * keeping the layout from drifting, this is the main knob against loosely-connected clusters
+   * flying far apart — unbounded pairwise repulsion otherwise pushes whole clusters out of frame
+   * (a single bridge edge can't pull them back). Higher = tighter inter-cluster spacing.
+   */
   centering: number;
   /** Integration step size. */
   alpha: number;
@@ -34,7 +39,7 @@ export interface ForceParams {
   theta: number;
 }
 
-export const DEFAULT_FORCE: ForceParams = { repulsion: 200, attraction: 0.05, centering: 0.01, alpha: 0.2, theta: 0.9 };
+export const DEFAULT_FORCE: ForceParams = { repulsion: 200, attraction: 0.05, centering: 0.2, alpha: 0.2, theta: 0.9 };
 
 export class ForceLayout {
   private readonly params: ForceParams;

@@ -19,6 +19,7 @@ export default function Network() {
           display: ["10", "100", "1k", "10k", "100k", "1M"],
         },
         { type: "segmented", key: "mode", label: "Links", options: ["Directed", "Undirected"] },
+        { type: "segmented", key: "seeding", label: "Seeding", options: ["Multilevel", "Cold"] },
       ]}
       width={760}
       height={480}

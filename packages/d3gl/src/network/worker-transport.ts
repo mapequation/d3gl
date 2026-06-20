@@ -8,7 +8,7 @@
  */
 import type { NetworkGraph } from "./graph.js";
 import { multilevelLayout, type CoarsenOptions } from "./coarsen.js";
-import { seedPositions, type ForceParams } from "./force.js";
+import { ForceLayout, seedPositions, type ForceParams } from "./force.js";
 import type { MainToWorker, WorkerToMain } from "./worker-protocol.js";
 
 export interface WorkerLayoutOptions {
@@ -17,6 +17,8 @@ export interface WorkerLayoutOptions {
   iterations: number;
   force?: Partial<ForceParams>;
   coarsen?: CoarsenOptions;
+  /** Seed via multilevel coarsening (default) or a plain disc cold start. */
+  multilevel?: boolean;
   /** Ticks per progress frame; defaults to ~60 frames across the run. */
   frameEvery?: number;
 }
@@ -41,13 +43,18 @@ export function startWorkerLayout(
   onFrame: () => void,
 ): WorkerLayoutHandle {
   const { width, height, iterations } = opts;
+  const multilevel = opts.multilevel ?? true;
   const frameEvery = opts.frameEvery ?? Math.max(1, Math.ceil(iterations / TARGET_FRAMES));
   const syncOpts = { width, height, iterations, force: opts.force, coarsen: opts.coarsen };
 
   // No Worker available (SSR / unsupported) or construction fails: solve synchronously so the
   // layout still happens, then signal one frame + completion.
   const fallback = (): WorkerLayoutHandle => {
-    multilevelLayout(graph, syncOpts);
+    if (multilevel) multilevelLayout(graph, syncOpts);
+    else {
+      seedPositions(graph, width, height);
+      new ForceLayout(graph, opts.force).run(iterations);
+    }
     onFrame();
     return { settled: Promise.resolve(), stop() {} };
   };
@@ -92,7 +99,11 @@ export function startWorkerLayout(
   worker.onerror = (): void => {
     if (finished) return;
     // Worker failed mid-run — fall back to a synchronous solve so the user still gets a layout.
-    multilevelLayout(graph, syncOpts);
+    if (multilevel) multilevelLayout(graph, syncOpts);
+    else {
+      seedPositions(graph, width, height);
+      new ForceLayout(graph, opts.force).run(iterations);
+    }
     onFrame();
     finish();
   };
@@ -109,6 +120,7 @@ export function startWorkerLayout(
     iterations,
     force: opts.force,
     coarsen: opts.coarsen,
+    multilevel,
     frameEvery,
   };
   worker.postMessage(start);

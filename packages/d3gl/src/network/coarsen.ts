@@ -55,14 +55,21 @@ export interface MultilevelLayoutOptions {
   height: number;
   /** Force parameters passed to every level's {@link ForceLayout}. */
   force?: Partial<ForceParams>;
-  /** Refinement iterations run at each level. Default 100. */
+  /** Refinement iterations run at the finest level. Default 100. */
   iterations?: number;
+  /**
+   * Iterations run at each *coarser* level while seeding. These start near-relaxed after
+   * prolongation, so they need far fewer ticks than the finest level — keeping the seed phase
+   * cheap (it runs before any progressive frame). Default 30.
+   */
+  coarsenIterations?: number;
   coarsen?: CoarsenOptions;
 }
 
 const DEFAULT_MIN_NODES = 8;
 const DEFAULT_MAX_LEVELS = 32;
 const DEFAULT_ITERATIONS = 100;
+const DEFAULT_COARSEN_ITERATIONS = 30;
 const GOLDEN = Math.PI * (3 - Math.sqrt(5));
 
 /** Symmetric (undirected) adjacency with per-incidence weights; self-loops dropped. */
@@ -239,7 +246,7 @@ function graphView(graph: CoarsenableGraph): LayoutGraph {
  */
 export function multilevelSeed(graph: CoarsenableGraph, opts: MultilevelLayoutOptions): void {
   const { width, height } = opts;
-  const iterations = opts.iterations ?? DEFAULT_ITERATIONS;
+  const coarsenIterations = opts.coarsenIterations ?? DEFAULT_COARSEN_ITERATIONS;
   const { levels, projections } = buildHierarchy(graph, opts.coarsen);
   const last = levels.length - 1;
 
@@ -256,11 +263,11 @@ export function multilevelSeed(graph: CoarsenableGraph, opts: MultilevelLayoutOp
   // Seed + solve the coarsest level, then prolongate + refine down to (but not including) level 0.
   const coarsestView = asView(levels[last]!, pos[last]!);
   seedPositions(coarsestView, width, height);
-  new ForceLayout(coarsestView, opts.force).run(iterations);
+  new ForceLayout(coarsestView, opts.force).run(coarsenIterations);
   for (let k = last - 1; k >= 1; k--) {
     const lvl = levels[k]!;
     prolongate(pos[k]!, pos[k + 1]!, projections[k]!, lvl.nodeCount, width, height);
-    new ForceLayout(asView(lvl, pos[k]!), opts.force).run(iterations);
+    new ForceLayout(asView(lvl, pos[k]!), opts.force).run(coarsenIterations);
   }
   // Project the seed onto the finest level; the caller refines from here.
   prolongate(graph.positions, pos[1]!, projections[0]!, levels[0]!.nodeCount, width, height);

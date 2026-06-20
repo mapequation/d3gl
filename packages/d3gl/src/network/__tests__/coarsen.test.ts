@@ -143,4 +143,39 @@ describe("multilevelLayout", () => {
 
     expect(tangleRatio(multi)).toBeLessThan(tangleRatio(cold));
   });
+
+  it("keeps clusters distinct but compact — inter-cluster spacing within a few × the cluster size", () => {
+    // Regression guard: the default positional gravity (centering) must stop loosely-bridged
+    // cliques from flying far apart (was ~9× the cluster size with weak gravity).
+    const C = 30;
+    const S = 10;
+    const g = ringOfCliques(C, S);
+    multilevelLayout(g, { width: 800, height: 600, iterations: 120 });
+
+    // intra: mean within-clique pairwise distance; inter: mean adjacent-clique centroid distance.
+    let intra = 0;
+    let intraN = 0;
+    const cx: number[] = [];
+    const cy: number[] = [];
+    for (let c = 0; c < C; c++) {
+      const base = c * S;
+      let mx = 0;
+      let my = 0;
+      for (let i = 0; i < S; i++) {
+        mx += g.positions[(base + i) * 2]!;
+        my += g.positions[(base + i) * 2 + 1]!;
+        for (let j = i + 1; j < S; j++) (intra += dist(g.positions, base + i, base + j), intraN++);
+      }
+      cx.push(mx / S);
+      cy.push(my / S);
+    }
+    intra /= intraN;
+    let inter = 0;
+    for (let c = 0; c < C; c++) inter += Math.hypot(cx[c]! - cx[(c + 1) % C]!, cy[c]! - cy[(c + 1) % C]!);
+    inter /= C;
+
+    const ratio = inter / intra;
+    expect(ratio).toBeGreaterThan(1.5); // clusters stay separated, not collapsed into one blob
+    expect(ratio).toBeLessThan(6); // …but compact, not flung apart
+  });
 });

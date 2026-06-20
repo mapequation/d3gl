@@ -22,6 +22,9 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
     render: (options) => {
       const count = SIZES[(options.nodes as number) ?? 1] ?? 100;
       const directed = options.mode !== "Undirected";
+      // "Cold" disables multilevel seeding so you can watch the difference: multilevel snaps to a
+      // good global arrangement then settles; cold starts from a disc and untangles slowly.
+      const multilevel = options.seeding !== "Cold";
       // Scale per-tick work down as the graph grows so the off-thread solve stays responsive; the
       // worker keeps the main thread free regardless, streaming frames as it converges.
       const iterations = Math.min(250, Math.max(10, Math.round(2.5e6 / count)));
@@ -37,7 +40,7 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
           linkStroke: "#cfd8e6",
           arrowFill: "#9aa7bd",
         })
-        .layout({ backend: "worker", iterations });
+        .layout({ backend: "worker", iterations, multilevel });
     },
   };
 };

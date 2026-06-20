@@ -28,6 +28,17 @@ describe("worker layout (off-thread, progressive)", () => {
     expect(spread(g.positions)).toBeGreaterThan(2); // nodes moved apart, not stacked
   });
 
+  it("honours multilevel:false (off-thread cold start) and still spreads the nodes", async () => {
+    const g = ring(40);
+    const handle = startWorkerLayout(
+      g,
+      { width: 400, height: 400, iterations: 30, frameEvery: 1, multilevel: false },
+      () => {},
+    );
+    await handle.settled;
+    expect(spread(g.positions)).toBeGreaterThan(2);
+  });
+
   it("stop() cancels mid-run and resolves settled", async () => {
     const g = ring(60);
     const handle = startWorkerLayout(g, { width: 400, height: 400, iterations: 100000, frameEvery: 1 }, () => {});

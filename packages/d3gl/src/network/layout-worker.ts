@@ -11,7 +11,7 @@
  * (no transferables): structured clone copies the snapshot synchronously at post time, which the
  * `DOM` `postMessage(message, options?)` overload accepts — so no worker-lib cast is needed.
  */
-import { ForceLayout } from "./force.js";
+import { ForceLayout, seedPositions } from "./force.js";
 import { multilevelSeed } from "./coarsen.js";
 import type { MainToWorker, StartMessage, WorkerToMain } from "./worker-protocol.js";
 
@@ -30,15 +30,16 @@ function yieldToEventLoop(): Promise<void> {
 async function runLayout(msg: StartMessage): Promise<void> {
   busy = true;
   cancelled = false;
-  const { nodeCount, source, target, weight, sharedPositions, width, height, iterations, force, coarsen, frameEvery } =
+  const { nodeCount, source, target, weight, sharedPositions, width, height, iterations, force, coarsen, multilevel, frameEvery } =
     msg;
   const shared = sharedPositions !== undefined;
   const positions = shared ? new Float32Array(sharedPositions) : new Float32Array(nodeCount * 2);
-  // Satisfies both CoarsenableGraph (multilevelSeed) and LayoutGraph (ForceLayout).
+  // Satisfies both CoarsenableGraph (multilevelSeed) and LayoutGraph (ForceLayout / seedPositions).
   const graph = { nodeCount, edgeCount: source.length, source, target, weight, positions };
 
-  // Seed via multilevel coarsening (coarse levels are tiny, so this is fast), publish the seed.
-  multilevelSeed(graph, { width, height, iterations, force, coarsen });
+  // Seed: multilevel coarsening (fast — coarse levels are tiny) or a plain disc cold start.
+  if (multilevel) multilevelSeed(graph, { width, height, iterations, force, coarsen });
+  else seedPositions(graph, width, height);
   post(shared ? { type: "frame", tick: 0 } : { type: "frame", tick: 0, positions });
 
   // Stream the finest-level refinement in batches.

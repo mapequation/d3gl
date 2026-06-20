@@ -25,6 +25,8 @@ export interface StartMessage {
   iterations: number;
   force?: Partial<ForceParams>;
   coarsen?: CoarsenOptions;
+  /** Seed via multilevel coarsening (`true`) or a plain disc cold start (`false`). */
+  multilevel: boolean;
   /** Run this many refinement ticks between progress frames. */
   frameEvery: number;
 }
