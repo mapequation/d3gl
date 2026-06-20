@@ -1,0 +1,21 @@
+---
+title: Network
+description: Render a raw directed network — instanced points, lines, and arrowheads — with the network() engine.
+---
+
+import ExampleCard from "../../../components/ExampleCard.astro";
+import Network from "../../../examples/network/Network.tsx";
+
+The `network()` engine renders node–link diagrams through a dedicated GPU-instanced rendering
+lane: nodes are instanced points, links are instanced lines, and directed edges get triangle
+arrowheads. It is built for large graphs — the same lane scales to millions of elements with
+level-of-detail (coming in later steps).
+
+This example lays a small circulant graph out on a circle and supplies the node positions
+directly. d3gl's in-library force layout, for graphs that arrive without coordinates, lands in a
+later step. Rendering uses WebGL instancing — drag to pan, scroll to zoom, and toggle **Links**
+between directed (with arrowheads) and undirected.
+
+<ExampleCard files={["network/draw.ts", "network/data.ts"]}>
+  <Network client:visible slot="demo" />
+</ExampleCard>
