@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { parsePajek } from "../pajek.js";
+import { parsePajek, parseNetwork, detectFormat } from "../pajek.js";
 
 describe("parsePajek", () => {
   it("reads *Vertices labels + coordinates and *Arcs as a directed, 0-based edge list", () => {
@@ -55,5 +55,31 @@ describe("parsePajek", () => {
     expect(p.labels).toEqual(["1", "2", "3"]);
     expect(Array.from(p.source)).toEqual([0, 2]);
     expect(Array.from(p.target)).toEqual([2, 1]);
+  });
+});
+
+describe("detectFormat / parseNetwork", () => {
+  it("detects Pajek by .net filename or a *section header, else edge list", () => {
+    expect(detectFormat("a b\nb c", "graph.net")).toBe("pajek"); // extension wins over content
+    expect(detectFormat("*Vertices 2\n1 a\n2 b\n*Edges\n1 2")).toBe("pajek"); // content sniff
+    expect(detectFormat("a b 2\nb c 1")).toBe("edgelist");
+    expect(detectFormat("a b", "graph.txt")).toBe("edgelist");
+  });
+
+  it("parses an edge list (the non-Pajek path) as undirected dense indices", () => {
+    const p = parseNetwork("# comment\nalice bob 2\nbob carol", "friends.txt");
+
+    expect(p.directed).toBe(false);
+    expect(p.labels).toEqual(["alice", "bob", "carol"]);
+    expect(Array.from(p.source)).toEqual([0, 1]);
+    expect(Array.from(p.target)).toEqual([1, 2]);
+    expect(Array.from(p.weight)).toEqual([2, 1]);
+    expect(p.positions).toBeUndefined();
+  });
+
+  it("routes a .net document through the Pajek parser", () => {
+    const p = parseNetwork('*Vertices 2\n1 "x"\n2 "y"\n*Arcs\n1 2', "g.net");
+    expect(p.directed).toBe(true);
+    expect(p.labels).toEqual(["x", "y"]);
   });
 });

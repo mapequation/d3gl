@@ -6,13 +6,26 @@
  * 1-based; they map to dense `0..n-1` indices here so the result drops straight into
  * {@link ./graph.js}'s `buildGraph`. Unknown sections (e.g. `*Matrix`) are skipped.
  */
-import type { ParsedEdges } from "./parse.js";
+import { parseEdgeList, type ParsedEdges } from "./parse.js";
 
 export interface ParsedPajek extends ParsedEdges {
   /** True when the file declared `*Arcs` / `*Arcslist` (directed edges). */
   directed: boolean;
   /** Interleaved `[x, y, …]` layout coordinates from `*Vertices`, present only if any were given. */
   positions?: Float32Array;
+}
+
+/** Network text formats {@link parseNetwork} can read. */
+export type NetworkFormat = "pajek" | "edgelist";
+
+/**
+ * Pick a parser: Pajek for a `.net` filename or text with a `*Vertices`/`*Arcs`/`*Edges` section
+ * header; otherwise the plain edge list. A filename extension wins over content sniffing.
+ */
+export function detectFormat(text: string, filename?: string): NetworkFormat {
+  if (filename && /\.net$/i.test(filename)) return "pajek";
+  if (filename && /\.(edges?|tsv|csv|txt)$/i.test(filename)) return "edgelist";
+  return /^\s*\*(vertices|arcs|edges)\b/im.test(text) ? "pajek" : "edgelist";
 }
 
 type Section = "vertices" | "arcs" | "edges" | "arcslist" | "edgeslist" | "ignore";
@@ -142,4 +155,13 @@ export function parsePajek(text: string): ParsedPajek {
     directed,
     positions,
   };
+}
+
+/**
+ * Parse a network from text, choosing the format via {@link detectFormat}: Pajek `.net` or a plain
+ * edge list (`source target [weight]`, `#` comments). Edge lists are reported as undirected.
+ */
+export function parseNetwork(text: string, filename?: string): ParsedPajek {
+  if (detectFormat(text, filename) === "pajek") return parsePajek(text);
+  return { ...parseEdgeList(text), directed: false };
 }

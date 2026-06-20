@@ -5,11 +5,14 @@ description: Render a raw directed network — instanced points, lines, and arro
 
 import ExampleCard from "../../../components/ExampleCard.astro";
 import Network from "../../../examples/network/Network.tsx";
+import LoadNetwork from "../../../examples/load-network/LoadNetwork.tsx";
 
 The `network()` engine renders node–link diagrams through a dedicated GPU-instanced rendering
 lane: nodes are instanced points, links are instanced lines, and directed edges get triangle
 arrowheads. It is built for large graphs — the same lane scales to millions of elements with
 level-of-detail (coming in later steps).
+
+## Large-scale layout in a Web Worker
 
 This example builds a **ring of cliques** — fully-connected clusters of 10 nodes bridged in a
 ring — and lets d3gl's in-library **force layout** (Barnes-Hut) place the nodes; no coordinates are
@@ -21,9 +24,29 @@ clustered graphs than a cold start. With `layout({ backend: "worker" })` the ent
 on screen** while the main thread stays responsive — pan and zoom while it settles. (On a
 cross-origin-isolated page positions are shared zero-copy via `SharedArrayBuffer`; otherwise they
 are posted as snapshots.) The **Nodes** slider scales from 10 to 1,000,000 to stress-test the
-layout and rendering. Rendering uses WebGL instancing — drag to pan, scroll to zoom, and toggle
-**Links** between directed (with arrowheads) and undirected.
+layout and rendering, and the **Seeding** toggle compares multilevel against a cold start. Rendering
+uses WebGL instancing — drag to pan, scroll to zoom, and toggle **Links** between directed (with
+arrowheads) and undirected.
 
 <ExampleCard files={["network/draw.ts", "network/data.ts"]}>
   <Network client:visible slot="demo" />
 </ExampleCard>
+
+## Loading a network from a file
+
+The same engine renders a network parsed from a file. `parseNetwork(text, filename)` dispatches on
+the name: a **`.net`** file is read as **Pajek** (vertex labels and coordinates, `*Arcs`/`*Edges`),
+and anything else as a plain **edge list** (`source target [weight]`, one edge per line, `#`
+comments). Pick your own file or load a built-in sample of each format. Vertex **labels** are drawn
+beside the nodes with the HTML `LabelLayer` overlay (from `@mapequation/d3gl/labels`), which culls
+overlaps and tracks the GPU geometry as you pan and zoom.
+
+<ExampleCard files={["load-network/draw.ts", "load-network/data.ts"]}>
+  <LoadNetwork client:visible slot="demo" />
+</ExampleCard>
+
+## Dragging nodes
+
+Interactive node dragging — grab a node, pin it to the cursor, and let the simulation reheat for a
+moment while its neighbours readjust — lands together with **picking** in a later step (it shares
+the engine's hit-testing), so it can resolve nodes correctly through level-of-detail at scale.
