@@ -37,4 +37,27 @@ describe("network() engine scaffold", () => {
     expect(typeof net.toSVG()).toBe("string");
     net.destroy();
   });
+
+  it("renders nodes through the instanced lane (pixel readback)", async () => {
+    const el = document.createElement("div");
+    el.style.width = "64px";
+    el.style.height = "64px";
+    document.body.appendChild(el);
+    const net = network(el, { width: 64, height: 64 });
+    await net.whenReady();
+
+    const g = buildGraph({ nodeCount: 1, source: [], target: [] });
+    net
+      .data(g)
+      .style({ nodeRadius: 12, nodeFill: "#ff0000" })
+      .layout({ backend: "positions", positions: new Float32Array([32, 32]) });
+    net.render();
+
+    // backend() is protected; reach the WebGL backend's readPixel test-aid via a cast.
+    const be = (net as unknown as { backend(): { readPixel(x: number, y: number): number[] } | null }).backend();
+    const centre = be!.readPixel(32, 32);
+    expect(centre[0]).toBeGreaterThan(200); // red node rendered at its world centre
+
+    net.destroy();
+  });
 });

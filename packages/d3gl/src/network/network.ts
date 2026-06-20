@@ -1,13 +1,18 @@
 import { BaseEngine, type BaseEngineOptions } from "../map/base-engine.js";
+import { nodeCircles } from "./glyphs.js";
 import type { NetworkGraph } from "./graph.js";
 
 /** Options for the network engine. Inherits sizing, `backend`, and `tooltipClass`. */
 export interface NetworkOptions extends BaseEngineOptions {}
 
-/** Visual style. Node/link appearance accessors are filled in as rendering lands (#100). */
+/** Visual style. Link appearance accessors arrive with the link pass (#100 N2.2). */
 export interface NetworkStyle {
   /** Render links with arrowheads. Defaults to the graph's `directed` flag. */
   directed?: boolean;
+  /** Node radius in world units. Default 4. */
+  nodeRadius?: number;
+  /** Node fill colour (any CSS color). Default a medium blue. */
+  nodeFill?: string;
 }
 
 /** How node positions are produced. The worker / GPU backends land in #102 / #106. */
@@ -18,14 +23,17 @@ export interface NetworkLayoutOptions {
   positions?: Float32Array;
 }
 
+const DEFAULT_NODE_RADIUS = 4;
+const DEFAULT_NODE_FILL = "#4878d0";
+
 /**
  * The network rendering engine (epic #98). A dedicated engine — nodes, links,
- * layout, and LOD are one coupled system, not independent layers — built on the
- * shared {@link BaseEngine} host/transform/zoom/interaction shell.
+ * layout, and LOD are one coupled system — built on the shared {@link BaseEngine}
+ * host/transform/zoom/interaction shell, rendering through the instanced lane (#100)
+ * rather than the retained `Scene` path.
  *
- * This slice (#107) is the scaffold: it mounts a backend and defines the public
- * surface. Instanced rendering (#100), the layout contract (#101), and LOD (#103)
- * fill in the behavior; today the engine holds data but draws nothing yet.
+ * N2.1 draws nodes as instanced circles. Links (#100 N2.2), the layout contract
+ * proper (#101), and LOD (#103) build on this.
  */
 export class Network extends BaseEngine {
   private graph: NetworkGraph | null = null;
@@ -34,18 +42,21 @@ export class Network extends BaseEngine {
 
   constructor(host: HTMLElement, opts: NetworkOptions = {}) {
     super(host, opts);
+    // Push whatever data exists once the initial backend is ready: data() may be called
+    // before whenReady, and a *first* backend install does not fire onBackendSwapped.
+    void this.whenReady().then(() => this.rebuild());
   }
 
   /** Set the graph to render (built via `buildGraph` / `parseEdgeList`). */
   data(graph: NetworkGraph): this {
     this.graph = graph;
-    return this;
+    return this.rebuild();
   }
 
-  /** Set visual style (directed arrows; node/link appearance later). */
+  /** Set visual style (node radius/fill now; link/arrow appearance later). */
   style(style: NetworkStyle): this {
     this.styleOpts = { ...this.styleOpts, ...style };
-    return this;
+    return this.rebuild();
   }
 
   /** Configure layout / supply positions (the pluggable contract proper lands in #101). */
@@ -54,7 +65,34 @@ export class Network extends BaseEngine {
     if (opts.backend === "positions" && opts.positions && this.graph) {
       this.graph.positions.set(opts.positions);
     }
+    return this.rebuild();
+  }
+
+  /**
+   * Re-emit the instanced node layer to the backend and repaint. A no-op until a graph is
+   * set and a backend exposing the instanced lane is live — on non-WebGL backends this
+   * simply does nothing (small-N / export go through the PathContext emitter, #100 N2.3).
+   */
+  private rebuild(): this {
+    if (!this.graph) return this;
+    const backend = this.backend();
+    if (!backend?.setInstancedLayer) return this;
+    backend.setInstancedLayer({
+      name: "nodes",
+      primitive: "circles",
+      circles: nodeCircles(this.graph, {
+        radius: this.styleOpts.nodeRadius ?? DEFAULT_NODE_RADIUS,
+        fill: this.styleOpts.nodeFill ?? DEFAULT_NODE_FILL,
+      }),
+      sizeMode: "world",
+    });
+    this.render();
     return this;
+  }
+
+  /** Re-push instanced layers after a backend swap (the first install doesn't fire this). */
+  protected onBackendSwapped(): void {
+    this.rebuild();
   }
 }
 
