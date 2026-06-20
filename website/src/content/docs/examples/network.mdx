@@ -11,9 +11,9 @@ lane: nodes are instanced points, links are instanced lines, and directed edges 
 arrowheads. It is built for large graphs — the same lane scales to millions of elements with
 level-of-detail (coming in later steps).
 
-This example lays a small circulant graph out on a circle and supplies the node positions
-directly. d3gl's in-library force layout, for graphs that arrive without coordinates, lands in a
-later step. Rendering uses WebGL instancing — drag to pan, scroll to zoom, and toggle **Links**
+This example builds a small circulant graph and lets d3gl's in-library **force layout** place the
+nodes — no coordinates are supplied (`layout({ backend: "force" })`, a Barnes-Hut force-directed
+simulation). Rendering uses WebGL instancing — drag to pan, scroll to zoom, and toggle **Links**
 between directed (with arrowheads) and undirected.
 
 <ExampleCard files={["network/draw.ts", "network/data.ts"]}>

@@ -1,5 +1,6 @@
 import { BaseEngine, type BaseEngineOptions } from "../map/base-engine.js";
 import { networkLayers, emitNodes, emitLinks, emitArrows, type ResolvedNetworkStyle } from "./glyphs.js";
+import { ForceLayout, seedPositions, type ForceParams } from "./force.js";
 import type { NetworkGraph } from "./graph.js";
 
 /** Options for the network engine. Inherits sizing, `backend`, and `tooltipClass`. */
@@ -23,12 +24,17 @@ export interface NetworkStyle {
   arrowFill?: string;
 }
 
-/** How node positions are produced. The worker / GPU backends land in #102 / #106. */
+/** How node positions are produced. The worker / GPU backends land in later slices. */
 export interface NetworkLayoutOptions {
-  /** `"positions"` uses caller-supplied coordinates; `"worker"`/`"gpu"` land later. */
-  backend?: "positions" | "worker" | "gpu";
+  /** `"positions"` uses caller-supplied coordinates; `"force"` runs the in-library force
+   *  layout on the main thread; `"worker"`/`"gpu"` land later. */
+  backend?: "positions" | "force" | "worker" | "gpu";
   /** Interleaved `[x, y, …]` world coordinates for `backend: "positions"`. */
   positions?: Float32Array;
+  /** Iterations for `backend: "force"` (default 300). */
+  iterations?: number;
+  /** Force parameters for `backend: "force"`. */
+  force?: Partial<ForceParams>;
 }
 
 const DEFAULT_NODE_RADIUS = 4;
@@ -36,6 +42,7 @@ const DEFAULT_NODE_FILL = "#4878d0";
 const DEFAULT_LINK_WIDTH = 1;
 const DEFAULT_LINK_STROKE = "#999999";
 const LAYER_NAMES = ["links", "arrows", "nodes"] as const;
+const DEFAULT_FORCE_ITERATIONS = 300;
 
 /**
  * The network rendering engine (epic #98). A dedicated engine — nodes, links,
@@ -75,8 +82,15 @@ export class Network extends BaseEngine {
   /** Configure layout / supply positions (the pluggable contract proper lands in #101). */
   layout(opts: NetworkLayoutOptions): this {
     this.layoutOpts = { ...this.layoutOpts, ...opts };
-    if (opts.backend === "positions" && opts.positions && this.graph) {
-      this.graph.positions.set(opts.positions);
+    if (this.graph) {
+      if (opts.backend === "positions" && opts.positions) {
+        this.graph.positions.set(opts.positions);
+      } else if (opts.backend === "force") {
+        // Main-thread force layout: seed a reproducible disc, then run a fixed schedule.
+        // (Off-thread + progressive convergence via a Web Worker is the next slice.)
+        seedPositions(this.graph, this.width, this.height);
+        new ForceLayout(this.graph, opts.force).run(opts.iterations ?? DEFAULT_FORCE_ITERATIONS);
+      }
     }
     return this.rebuild();
   }

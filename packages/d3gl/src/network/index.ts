@@ -11,5 +11,5 @@ export type { NetworkGraph, CSR, BuildGraphInput } from "./graph.js";
 export { parseEdgeList } from "./parse.js";
 export type { ParsedEdges } from "./parse.js";
 
-export { ForceLayout, DEFAULT_FORCE } from "./force.js";
+export { ForceLayout, DEFAULT_FORCE, seedPositions } from "./force.js";
 export type { ForceParams } from "./force.js";

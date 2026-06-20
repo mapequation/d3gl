@@ -49,4 +49,19 @@ describe("network() engine", () => {
 
     net.destroy();
   });
+
+  it("auto-positions an unpositioned graph with the force backend", async () => {
+    const net = network(host(), { width: 200, height: 200, backend: "svg" });
+    await net.whenReady();
+    const g = buildGraph({ nodeCount: 8, source: [0, 1, 2, 3], target: [1, 2, 3, 0] });
+
+    net.data(g).layout({ backend: "force", iterations: 50 });
+
+    const svg = net.toSVG();
+    const cxs = [...svg.matchAll(/<circle cx="([\d.eE+-]+)"/g)].map((m) => Number(m[1]));
+    expect(cxs.length).toBe(8);
+    expect(new Set(cxs).size).toBeGreaterThan(1); // nodes spread out, not all stacked
+
+    net.destroy();
+  });
 });

@@ -99,3 +99,22 @@ export class ForceLayout {
     for (let i = 0; i < iterations; i++) this.tick();
   }
 }
+
+/**
+ * Seed node positions deterministically as a phyllotaxis ("sunflower") disc centred on the
+ * viewport — a good, reproducible starting distribution for {@link ForceLayout} when a graph
+ * arrives without coordinates (no two nodes coincident, no RNG).
+ */
+export function seedPositions(graph: NetworkGraph, width: number, height: number): void {
+  const n = graph.nodeCount;
+  const cx = width / 2;
+  const cy = height / 2;
+  const scale = Math.min(width, height) / (2 * Math.sqrt(Math.max(n, 1)));
+  const golden = Math.PI * (3 - Math.sqrt(5));
+  for (let i = 0; i < n; i++) {
+    const r = scale * Math.sqrt(i + 0.5);
+    const a = i * golden;
+    graph.positions[i * 2] = cx + r * Math.cos(a);
+    graph.positions[i * 2 + 1] = cy + r * Math.sin(a);
+  }
+}

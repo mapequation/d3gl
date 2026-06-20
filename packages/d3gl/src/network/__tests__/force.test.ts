@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { ForceLayout } from "../force.js";
+import { ForceLayout, seedPositions } from "../force.js";
 import { buildGraph } from "../graph.js";
 
 const dist = (p: Float32Array, a: number, b: number) =>
@@ -31,5 +31,22 @@ describe("ForceLayout", () => {
     new ForceLayout(g).run(30);
 
     expect(Array.from(g.positions).every((v) => Number.isFinite(v))).toBe(true);
+  });
+});
+
+describe("seedPositions", () => {
+  it("spreads nodes deterministically (no coincident, reproducible)", () => {
+    const g = buildGraph({ nodeCount: 20, source: [], target: [] });
+
+    seedPositions(g, 200, 200);
+    const first = Float32Array.from(g.positions);
+
+    // Spread out (not all at the origin) and node 0 != node 1.
+    expect(Array.from(g.positions).some((v) => v !== 0)).toBe(true);
+    expect(g.positions[0] !== g.positions[2] || g.positions[1] !== g.positions[3]).toBe(true);
+
+    // Deterministic: re-seeding gives identical coordinates.
+    seedPositions(g, 200, 200);
+    expect(Array.from(g.positions)).toEqual(Array.from(first));
   });
 });
