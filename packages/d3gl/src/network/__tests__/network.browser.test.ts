@@ -10,7 +10,11 @@ function host(): HTMLElement {
   return el;
 }
 
-describe("network() engine scaffold", () => {
+// Pixel-level rendering of each primitive is covered (typed) at the backend layer in
+// webgl/__tests__/instanced.browser.test.ts; layer assembly is covered (typed) by the
+// networkLayers unit tests. These tests cover the engine's integration: mounting, the
+// chainable API, and that data/style/layout drive a real backend without throwing.
+describe("network() engine", () => {
   it("mounts on the default (webgl) backend and resolves whenReady", async () => {
     const net = network(host(), { width: 200, height: 200 });
     await net.whenReady();
@@ -18,14 +22,14 @@ describe("network() engine scaffold", () => {
     net.destroy();
   });
 
-  it("accepts a graph and the data/style/layout methods are chainable", async () => {
+  it("pushes a directed graph through the lane without throwing, chainably", async () => {
     const net = network(host(), { width: 200, height: 200 });
     await net.whenReady();
     const g = buildGraph({ nodeCount: 3, source: [0, 1], target: [1, 2], directed: true });
 
     expect(net.data(g)).toBe(net);
-    expect(net.style({ directed: true })).toBe(net);
-    expect(net.layout({ backend: "positions", positions: new Float32Array(6) })).toBe(net);
+    expect(net.style({ directed: true, linkWidth: 2 })).toBe(net);
+    expect(net.layout({ backend: "positions", positions: new Float32Array([10, 10, 90, 90, 170, 30]) })).toBe(net);
 
     net.destroy();
   });
@@ -35,74 +39,6 @@ describe("network() engine scaffold", () => {
     await net.whenReady();
     net.render();
     expect(typeof net.toSVG()).toBe("string");
-    net.destroy();
-  });
-
-  it("renders nodes through the instanced lane (pixel readback)", async () => {
-    const el = document.createElement("div");
-    el.style.width = "64px";
-    el.style.height = "64px";
-    document.body.appendChild(el);
-    const net = network(el, { width: 64, height: 64 });
-    await net.whenReady();
-
-    const g = buildGraph({ nodeCount: 1, source: [], target: [] });
-    net
-      .data(g)
-      .style({ nodeRadius: 12, nodeFill: "#ff0000" })
-      .layout({ backend: "positions", positions: new Float32Array([32, 32]) });
-    net.render();
-
-    // backend() is protected; reach the WebGL backend's readPixel test-aid via a cast.
-    const be = (net as unknown as { backend(): { readPixel(x: number, y: number): number[] } | null }).backend();
-    const centre = be!.readPixel(32, 32);
-    expect(centre[0]).toBeGreaterThan(200); // red node rendered at its world centre
-
-    net.destroy();
-  });
-
-  it("renders links through the instanced lane", async () => {
-    const el = document.createElement("div");
-    el.style.width = "64px";
-    el.style.height = "64px";
-    document.body.appendChild(el);
-    const net = network(el, { width: 64, height: 64 });
-    await net.whenReady();
-
-    const g = buildGraph({ nodeCount: 2, source: [0], target: [1] });
-    net
-      .data(g)
-      .style({ nodeRadius: 1, linkWidth: 8, linkStroke: "#00ff00" })
-      .layout({ backend: "positions", positions: new Float32Array([10, 32, 54, 32]) });
-    net.render();
-
-    const be = (net as unknown as { backend(): { readPixel(x: number, y: number): number[] } | null }).backend();
-    const midpoint = be!.readPixel(32, 32); // on the link, between the two nodes
-    expect(midpoint[1]).toBeGreaterThan(150); // green link rendered
-
-    net.destroy();
-  });
-
-  it("draws arrowheads for directed links", async () => {
-    const el = document.createElement("div");
-    el.style.width = "64px";
-    el.style.height = "64px";
-    document.body.appendChild(el);
-    const net = network(el, { width: 64, height: 64 });
-    await net.whenReady();
-
-    const g = buildGraph({ nodeCount: 2, source: [0], target: [1], directed: true });
-    net
-      .data(g)
-      .style({ nodeRadius: 1, linkWidth: 1, linkStroke: "#00ff00", arrowSize: 9, arrowFill: "#ff0000" })
-      .layout({ backend: "positions", positions: new Float32Array([10, 32, 54, 32]) });
-    net.render();
-
-    const be = (net as unknown as { backend(): { readPixel(x: number, y: number): number[] } | null }).backend();
-    // Inside the wide arrowhead near the target, off the thin green line → red arrow.
-    const arrow = be!.readPixel(45, 35);
-    expect(arrow[0]).toBeGreaterThan(150); // red arrowhead present
-
     net.destroy();
   });
 });

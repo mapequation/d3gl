@@ -1,5 +1,5 @@
 import { rgb } from "d3-color";
-import type { InstancedCirclesData, InstancedLinesData, InstancedArrowsData } from "../core/index.js";
+import type { InstancedCirclesData, InstancedLinesData, InstancedArrowsData, InstancedLayer } from "../core/index.js";
 import type { NetworkGraph } from "./graph.js";
 
 /**
@@ -105,4 +105,47 @@ export function linkArrows(graph: NetworkGraph, style: ArrowStyleResolved): Inst
   }
   const sizes = new Float32Array(count).fill(style.size);
   return { sources, targets, sizes, colors: fillColors(count, style.fill), count };
+}
+
+/** Fully-resolved network style (defaults applied) for assembling the render layers. */
+export interface ResolvedNetworkStyle {
+  nodeRadius: number;
+  nodeFill: string;
+  linkWidth: number;
+  linkStroke: string;
+  arrowSize: number;
+  arrowFill: string;
+  directed: boolean;
+}
+
+/**
+ * Assemble the ordered instanced layers for a network: links (under), arrowheads (directed
+ * only), then nodes (on top). Pure — the engine just pushes the result to the backend, which
+ * keeps "what to render" unit-testable without a DOM or GPU.
+ */
+export function networkLayers(graph: NetworkGraph, style: ResolvedNetworkStyle): InstancedLayer[] {
+  const layers: InstancedLayer[] = [];
+  if (graph.edgeCount > 0) {
+    layers.push({
+      name: "links",
+      primitive: "lines",
+      lines: linkLines(graph, { width: style.linkWidth, stroke: style.linkStroke }),
+      sizeMode: "world",
+    });
+    if (style.directed) {
+      layers.push({
+        name: "arrows",
+        primitive: "arrows",
+        arrows: linkArrows(graph, { size: style.arrowSize, nodeRadius: style.nodeRadius, fill: style.arrowFill }),
+        sizeMode: "world",
+      });
+    }
+  }
+  layers.push({
+    name: "nodes",
+    primitive: "circles",
+    circles: nodeCircles(graph, { radius: style.nodeRadius, fill: style.nodeFill }),
+    sizeMode: "world",
+  });
+  return layers;
 }

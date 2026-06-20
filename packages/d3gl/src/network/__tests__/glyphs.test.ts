@@ -1,6 +1,16 @@
 import { describe, it, expect } from "vitest";
-import { nodeCircles, linkLines, linkArrows } from "../glyphs.js";
+import { nodeCircles, linkLines, linkArrows, networkLayers, type ResolvedNetworkStyle } from "../glyphs.js";
 import { buildGraph } from "../graph.js";
+
+const STYLE: ResolvedNetworkStyle = {
+  nodeRadius: 4,
+  nodeFill: "#000000",
+  linkWidth: 1,
+  linkStroke: "#999999",
+  arrowSize: 3,
+  arrowFill: "#999999",
+  directed: false,
+};
 
 describe("nodeCircles", () => {
   it("builds per-node radii and parsed RGBA colours, sharing the graph positions buffer", () => {
@@ -50,5 +60,30 @@ describe("linkArrows", () => {
     expect(Array.from(a.targets)).toEqual([8, 0]); // 10 - dir(1,0) * nodeRadius(2)
     expect(Array.from(a.sizes)).toEqual([4]);
     expect(Array.from(a.colors)).toEqual([255, 0, 0, 255]);
+  });
+});
+
+describe("networkLayers", () => {
+  it("emits links then nodes for an undirected graph (no arrows)", () => {
+    const g = buildGraph({ nodeCount: 2, source: [0], target: [1] });
+    const layers = networkLayers(g, { ...STYLE, directed: false });
+
+    expect(layers.map((l) => l.name)).toEqual(["links", "nodes"]);
+    expect(layers.map((l) => l.primitive)).toEqual(["lines", "circles"]);
+  });
+
+  it("inserts arrows between links and nodes for a directed graph", () => {
+    const g = buildGraph({ nodeCount: 2, source: [0], target: [1], directed: true });
+    const layers = networkLayers(g, { ...STYLE, directed: true });
+
+    expect(layers.map((l) => l.name)).toEqual(["links", "arrows", "nodes"]);
+    expect(layers.map((l) => l.primitive)).toEqual(["lines", "arrows", "circles"]);
+  });
+
+  it("emits only nodes when there are no edges", () => {
+    const g = buildGraph({ nodeCount: 1, source: [], target: [] });
+    const layers = networkLayers(g, { ...STYLE, directed: true });
+
+    expect(layers.map((l) => l.name)).toEqual(["nodes"]);
   });
 });

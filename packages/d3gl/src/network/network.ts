@@ -1,5 +1,5 @@
 import { BaseEngine, type BaseEngineOptions } from "../map/base-engine.js";
-import { nodeCircles, linkLines, linkArrows } from "./glyphs.js";
+import { networkLayers, type ResolvedNetworkStyle } from "./glyphs.js";
 import type { NetworkGraph } from "./graph.js";
 
 /** Options for the network engine. Inherits sizing, `backend`, and `tooltipClass`. */
@@ -87,41 +87,26 @@ export class Network extends BaseEngine {
     if (!this.graph) return this;
     const backend = this.backend();
     if (!backend?.setInstancedLayer) return this;
-
-    const nodeRadius = this.styleOpts.nodeRadius ?? DEFAULT_NODE_RADIUS;
-    const linkWidth = this.styleOpts.linkWidth ?? DEFAULT_LINK_WIDTH;
-    const linkStroke = this.styleOpts.linkStroke ?? DEFAULT_LINK_STROKE;
-    const directed = this.styleOpts.directed ?? this.graph.directed;
-
-    // Draw order (insertion order): links under arrows under nodes.
-    if (this.graph.edgeCount > 0) {
-      backend.setInstancedLayer({
-        name: "links",
-        primitive: "lines",
-        lines: linkLines(this.graph, { width: linkWidth, stroke: linkStroke }),
-        sizeMode: "world",
-      });
-      if (directed) {
-        backend.setInstancedLayer({
-          name: "arrows",
-          primitive: "arrows",
-          arrows: linkArrows(this.graph, {
-            size: this.styleOpts.arrowSize ?? 3 * linkWidth,
-            nodeRadius,
-            fill: this.styleOpts.arrowFill ?? linkStroke,
-          }),
-          sizeMode: "world",
-        });
-      }
+    for (const layer of networkLayers(this.graph, this.resolvedStyle(this.graph))) {
+      backend.setInstancedLayer(layer);
     }
-    backend.setInstancedLayer({
-      name: "nodes",
-      primitive: "circles",
-      circles: nodeCircles(this.graph, { radius: nodeRadius, fill: this.styleOpts.nodeFill ?? DEFAULT_NODE_FILL }),
-      sizeMode: "world",
-    });
     this.render();
     return this;
+  }
+
+  /** Apply style defaults (drawn order is decided by {@link networkLayers}). */
+  private resolvedStyle(graph: NetworkGraph): ResolvedNetworkStyle {
+    const linkWidth = this.styleOpts.linkWidth ?? DEFAULT_LINK_WIDTH;
+    const linkStroke = this.styleOpts.linkStroke ?? DEFAULT_LINK_STROKE;
+    return {
+      nodeRadius: this.styleOpts.nodeRadius ?? DEFAULT_NODE_RADIUS,
+      nodeFill: this.styleOpts.nodeFill ?? DEFAULT_NODE_FILL,
+      linkWidth,
+      linkStroke,
+      arrowSize: this.styleOpts.arrowSize ?? 3 * linkWidth,
+      arrowFill: this.styleOpts.arrowFill ?? linkStroke,
+      directed: this.styleOpts.directed ?? graph.directed,
+    };
   }
 
   /** Re-push instanced layers after a backend swap (the first install doesn't fire this). */

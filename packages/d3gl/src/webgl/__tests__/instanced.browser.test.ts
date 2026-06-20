@@ -1,5 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { luma } from "@luma.gl/core";
+import type { Device, Framebuffer } from "@luma.gl/core";
 import { webgl2Adapter } from "@luma.gl/webgl";
 import { InstancedCircles, InstancedLines, InstancedArrows } from "../instanced.js";
 import { clipFromView } from "../index.js";
@@ -22,8 +23,7 @@ async function setup() {
   return { device, framebuffer };
 }
 
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-function px(device: any, framebuffer: any, x: number, y: number): Uint8Array {
+function px(device: Device, framebuffer: Framebuffer, x: number, y: number) {
   return device.readPixelsToArrayWebGL(framebuffer, { sourceX: x, sourceY: y, sourceWidth: 1, sourceHeight: 1 });
 }
 
