@@ -82,4 +82,27 @@ describe("network() engine scaffold", () => {
 
     net.destroy();
   });
+
+  it("draws arrowheads for directed links", async () => {
+    const el = document.createElement("div");
+    el.style.width = "64px";
+    el.style.height = "64px";
+    document.body.appendChild(el);
+    const net = network(el, { width: 64, height: 64 });
+    await net.whenReady();
+
+    const g = buildGraph({ nodeCount: 2, source: [0], target: [1], directed: true });
+    net
+      .data(g)
+      .style({ nodeRadius: 1, linkWidth: 1, linkStroke: "#00ff00", arrowSize: 9, arrowFill: "#ff0000" })
+      .layout({ backend: "positions", positions: new Float32Array([10, 32, 54, 32]) });
+    net.render();
+
+    const be = (net as unknown as { backend(): { readPixel(x: number, y: number): number[] } | null }).backend();
+    // Inside the wide arrowhead near the target, off the thin green line → red arrow.
+    const arrow = be!.readPixel(45, 35);
+    expect(arrow[0]).toBeGreaterThan(150); // red arrowhead present
+
+    net.destroy();
+  });
 });

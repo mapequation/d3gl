@@ -225,6 +225,27 @@ void main() {
   gl_Position = vec4(cp + off, 0.0, 1.0);
 }`;
 
+// INSTANCED_ARROW_VS — instanced triangle arrowheads for directed links (#100). One triangle
+// per instance: per-vertex a_tri = (back, across) with tip (0,0) and base (2,-1)/(2,1); the tip
+// sits at a_target, oriented along (a_target - a_source), scaled by a_size (world units). Pairs
+// with FILL_FS. World-sized for now (screen-sizing can follow the line shader's u_screen branch).
+export const INSTANCED_ARROW_VS = `#version 300 es
+precision highp float;
+uniform mat3 u_transform;
+in vec2 a_tri;        // per-vertex (back, across)
+in vec2 a_source;     // per-instance world source (orientation)
+in vec2 a_target;     // per-instance world tip
+in float a_size;      // per-instance arrow size (world units)
+in vec4 a_color;
+out vec4 v_color;
+void main() {
+  v_color = a_color;
+  vec2 dir = normalize(a_target - a_source);
+  vec2 perp = vec2(-dir.y, dir.x);
+  vec2 world = a_target - dir * (a_tri.x * a_size) + perp * (a_tri.y * a_size);
+  gl_Position = vec4((u_transform * vec3(world, 1.0)).xy, 0.0, 1.0);
+}`;
+
 // PT_MESH_VS — pass-through fill/stroke meshes. Both fill triangles and expanded-stroke
 // triangles are just colored geometry, so they share this shader: project the world-space
 // vertex through u_transform (world mode — stroke width scales with zoom, matching Canvas)

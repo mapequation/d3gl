@@ -1,5 +1,5 @@
 import { BaseEngine, type BaseEngineOptions } from "../map/base-engine.js";
-import { nodeCircles, linkLines } from "./glyphs.js";
+import { nodeCircles, linkLines, linkArrows } from "./glyphs.js";
 import type { NetworkGraph } from "./graph.js";
 
 /** Options for the network engine. Inherits sizing, `backend`, and `tooltipClass`. */
@@ -17,6 +17,10 @@ export interface NetworkStyle {
   linkWidth?: number;
   /** Link stroke colour (any CSS color). Default a light grey. */
   linkStroke?: string;
+  /** Arrowhead size (world units) for directed links. Default 3 × linkWidth. */
+  arrowSize?: number;
+  /** Arrowhead colour. Default matches linkStroke. */
+  arrowFill?: string;
 }
 
 /** How node positions are produced. The worker / GPU backends land in #102 / #106. */
@@ -83,25 +87,37 @@ export class Network extends BaseEngine {
     if (!this.graph) return this;
     const backend = this.backend();
     if (!backend?.setInstancedLayer) return this;
-    // Links first (drawn under nodes).
+
+    const nodeRadius = this.styleOpts.nodeRadius ?? DEFAULT_NODE_RADIUS;
+    const linkWidth = this.styleOpts.linkWidth ?? DEFAULT_LINK_WIDTH;
+    const linkStroke = this.styleOpts.linkStroke ?? DEFAULT_LINK_STROKE;
+    const directed = this.styleOpts.directed ?? this.graph.directed;
+
+    // Draw order (insertion order): links under arrows under nodes.
     if (this.graph.edgeCount > 0) {
       backend.setInstancedLayer({
         name: "links",
         primitive: "lines",
-        lines: linkLines(this.graph, {
-          width: this.styleOpts.linkWidth ?? DEFAULT_LINK_WIDTH,
-          stroke: this.styleOpts.linkStroke ?? DEFAULT_LINK_STROKE,
-        }),
+        lines: linkLines(this.graph, { width: linkWidth, stroke: linkStroke }),
         sizeMode: "world",
       });
+      if (directed) {
+        backend.setInstancedLayer({
+          name: "arrows",
+          primitive: "arrows",
+          arrows: linkArrows(this.graph, {
+            size: this.styleOpts.arrowSize ?? 3 * linkWidth,
+            nodeRadius,
+            fill: this.styleOpts.arrowFill ?? linkStroke,
+          }),
+          sizeMode: "world",
+        });
+      }
     }
     backend.setInstancedLayer({
       name: "nodes",
       primitive: "circles",
-      circles: nodeCircles(this.graph, {
-        radius: this.styleOpts.nodeRadius ?? DEFAULT_NODE_RADIUS,
-        fill: this.styleOpts.nodeFill ?? DEFAULT_NODE_FILL,
-      }),
+      circles: nodeCircles(this.graph, { radius: nodeRadius, fill: this.styleOpts.nodeFill ?? DEFAULT_NODE_FILL }),
       sizeMode: "world",
     });
     this.render();

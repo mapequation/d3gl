@@ -1,8 +1,8 @@
 import { Model } from "@luma.gl/engine";
 import type { Buffer, Device, RenderPass } from "@luma.gl/core";
-import { INSTANCED_CIRCLE_VS, INSTANCED_LINE_VS, POINT_FS, FILL_FS } from "./shaders.js";
+import { INSTANCED_CIRCLE_VS, INSTANCED_LINE_VS, INSTANCED_ARROW_VS, POINT_FS, FILL_FS } from "./shaders.js";
 import { clipFromView } from "./transform.js";
-import type { InstancedCirclesData, InstancedLinesData } from "../core/index.js";
+import type { InstancedCirclesData, InstancedLinesData, InstancedArrowsData } from "../core/index.js";
 
 /**
  * GPU-instanced primitives for the network module's rendering lane (#100, epic #98).
@@ -161,6 +161,72 @@ export class InstancedLines {
     this.source.destroy();
     this.target.destroy();
     this.widthBuf.destroy();
+    this.color.destroy();
+  }
+}
+
+/** Triangle template for an arrowhead: tip (0,0), base (2,-1)/(2,1), triangle-list. */
+const ARROW_TEMPLATE = new Float32Array([0, 0, 2, -1, 2, 1]);
+
+export class InstancedArrows {
+  count: number;
+  private model: Model;
+  private tri: Buffer;
+  private source: Buffer;
+  private target: Buffer;
+  private size: Buffer;
+  private color: Buffer;
+  private uniforms: Record<string, unknown>;
+
+  constructor(device: Device, data: InstancedArrowsData, width = 0, height = 0) {
+    this.count = data.count;
+    this.tri = device.createBuffer({ data: ARROW_TEMPLATE });
+    this.source = device.createBuffer({ data: data.sources });
+    this.target = device.createBuffer({ data: data.targets });
+    this.size = device.createBuffer({ data: data.sizes });
+    this.color = device.createBuffer({ data: data.colors });
+    this.uniforms = { u_transform: clipFromView({ k: 1, x: 0, y: 0 }, width || 1, height || 1) };
+    this.model = new Model(device, {
+      vs: INSTANCED_ARROW_VS,
+      fs: FILL_FS,
+      bufferLayout: [
+        { name: "a_tri", format: "float32x2" },
+        { name: "a_source", format: "float32x2", stepMode: "instance" },
+        { name: "a_target", format: "float32x2", stepMode: "instance" },
+        { name: "a_size", format: "float32", stepMode: "instance" },
+        { name: "a_color", format: "unorm8x4", stepMode: "instance" },
+      ],
+      attributes: {
+        a_tri: this.tri,
+        a_source: this.source,
+        a_target: this.target,
+        a_size: this.size,
+        a_color: this.color,
+      },
+      uniforms: this.uniforms,
+      parameters: BLEND,
+      topology: "triangle-list",
+      vertexCount: 3,
+      instanceCount: this.count,
+    });
+  }
+
+  setTransform(m: Float32Array): void {
+    this.uniforms["u_transform"] = m;
+  }
+  // Arrows are world-sized for now; viewport/sizeMode are accepted for a uniform renderer
+  // interface but unused (screen-sizing can follow the line shader's u_screen branch later).
+  setViewport(_width: number, _height: number): void {}
+  setSizeMode(_mode: "world" | "screen"): void {}
+  render(pass: RenderPass): void {
+    if (this.count > 0) this.model.draw(pass);
+  }
+  destroy(): void {
+    this.model.destroy();
+    this.tri.destroy();
+    this.source.destroy();
+    this.target.destroy();
+    this.size.destroy();
     this.color.destroy();
   }
 }

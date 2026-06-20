@@ -1,5 +1,5 @@
 import { rgb } from "d3-color";
-import type { InstancedCirclesData, InstancedLinesData } from "../core/index.js";
+import type { InstancedCirclesData, InstancedLinesData, InstancedArrowsData } from "../core/index.js";
 import type { NetworkGraph } from "./graph.js";
 
 /**
@@ -70,4 +70,39 @@ export function linkLines(graph: NetworkGraph, style: LinkStyleResolved): Instan
   }
   const widths = new Float32Array(count).fill(style.width);
   return { sources, targets, widths, colors: fillColors(count, style.stroke), count };
+}
+
+export interface ArrowStyleResolved {
+  size: number;
+  nodeRadius: number;
+  fill: string;
+}
+
+/**
+ * Instanced arrowhead data for a directed graph's links. The tip sits `nodeRadius` back from
+ * the target node's centre (so it meets the node boundary), oriented from the source.
+ */
+export function linkArrows(graph: NetworkGraph, style: ArrowStyleResolved): InstancedArrowsData {
+  const count = graph.edgeCount;
+  const sources = new Float32Array(count * 2);
+  const targets = new Float32Array(count * 2);
+  for (let e = 0; e < count; e++) {
+    const s = graph.source[e]!;
+    const t = graph.target[e]!;
+    const sx = graph.positions[s * 2]!;
+    const sy = graph.positions[s * 2 + 1]!;
+    const tx = graph.positions[t * 2]!;
+    const ty = graph.positions[t * 2 + 1]!;
+    const dx = tx - sx;
+    const dy = ty - sy;
+    const len = Math.hypot(dx, dy) || 1;
+    const ux = dx / len;
+    const uy = dy / len;
+    sources[e * 2] = sx;
+    sources[e * 2 + 1] = sy;
+    targets[e * 2] = tx - ux * style.nodeRadius;
+    targets[e * 2 + 1] = ty - uy * style.nodeRadius;
+  }
+  const sizes = new Float32Array(count).fill(style.size);
+  return { sources, targets, sizes, colors: fillColors(count, style.fill), count };
 }

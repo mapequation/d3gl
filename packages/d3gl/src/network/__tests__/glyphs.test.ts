@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { nodeCircles, linkLines } from "../glyphs.js";
+import { nodeCircles, linkLines, linkArrows } from "../glyphs.js";
 import { buildGraph } from "../graph.js";
 
 describe("nodeCircles", () => {
@@ -35,5 +35,20 @@ describe("linkLines", () => {
     expect(Array.from(l.targets)).toEqual([10, 10, 20, 20]); // edge0 tgt=node1, edge1 tgt=node2
     expect(Array.from(l.widths)).toEqual([2, 2]);
     expect(Array.from(l.colors)).toEqual([0, 0, 0, 255, 0, 0, 0, 255]);
+  });
+});
+
+describe("linkArrows", () => {
+  it("places the tip back from the target by the node radius, oriented from the source", () => {
+    const g = buildGraph({ nodeCount: 2, source: [0], target: [1], directed: true });
+    g.positions.set([0, 0, 10, 0]); // node0 at origin, node1 at (10,0)
+
+    const a = linkArrows(g, { size: 4, nodeRadius: 2, fill: "#ff0000" });
+
+    expect(a.count).toBe(1);
+    expect(Array.from(a.sources)).toEqual([0, 0]);
+    expect(Array.from(a.targets)).toEqual([8, 0]); // 10 - dir(1,0) * nodeRadius(2)
+    expect(Array.from(a.sizes)).toEqual([4]);
+    expect(Array.from(a.colors)).toEqual([255, 0, 0, 255]);
   });
 });

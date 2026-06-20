@@ -4,7 +4,7 @@ import type { Device, Framebuffer } from "@luma.gl/core";
 import type { Backend, RenderLayer, RenderDelta, ViewTransform, InstancedLayer } from "../core/index.js";
 import type { GroupBuffers, GroupBufferDelta, PassThroughLayer, DrawBatch, StyleTables, DrawableVector } from "../core/index.js";
 import { GroupRenderer } from "./renderer.js";
-import { InstancedCircles, InstancedLines } from "./instanced.js";
+import { InstancedCircles, InstancedLines, InstancedArrows } from "./instanced.js";
 import { clipFromView } from "./transform.js";
 import { toPNG } from "./png.js";
 import { svgFromLayers } from "../svg/index.js";
@@ -22,7 +22,7 @@ export class WebGLBackend implements Backend {
   private layers = new Map<string, RenderLayer>();
   private order: string[] = [];
   /** GPU-instanced primitive layers (the network lane), drawn after retained layers. */
-  private instanced = new Map<string, InstancedCircles | InstancedLines>();
+  private instanced = new Map<string, InstancedCircles | InstancedLines | InstancedArrows>();
   private clipMatrix: Float32Array;
   private viewTransform: ViewTransform = { k: 1, x: 0, y: 0 };
   private globe: GlobeRenderer | null = null; // non-null ⇒ globe mode active
@@ -191,9 +191,12 @@ export class WebGLBackend implements Backend {
 
   setInstancedLayer(layer: InstancedLayer): void {
     this.instanced.get(layer.name)?.destroy();
-    const r = layer.primitive === "lines"
-      ? new InstancedLines(this.device, layer.lines, this.width, this.height)
-      : new InstancedCircles(this.device, layer.circles, this.width, this.height);
+    const r =
+      layer.primitive === "lines"
+        ? new InstancedLines(this.device, layer.lines, this.width, this.height)
+        : layer.primitive === "arrows"
+          ? new InstancedArrows(this.device, layer.arrows, this.width, this.height)
+          : new InstancedCircles(this.device, layer.circles, this.width, this.height);
     r.setTransform(this.clipMatrix);
     r.setViewport(this.width, this.height);
     r.setSizeMode(layer.sizeMode ?? "world");

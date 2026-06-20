@@ -100,10 +100,24 @@ export interface InstancedLinesData {
   count: number;
 }
 
+/** SoA for a batch of instanced triangle arrowheads (directed-link tips). */
+export interface InstancedArrowsData {
+  /** [x, y] world source per arrow (for orientation), length `2 * count`. */
+  sources: Float32Array;
+  /** [x, y] world tip per arrow, length `2 * count`. */
+  targets: Float32Array;
+  /** arrow size (world units) per arrow, length `count`. */
+  sizes: Float32Array;
+  /** RGBA bytes per arrow, length `4 * count`. */
+  colors: Uint8Array;
+  count: number;
+}
+
 /** A named GPU-instanced primitive layer — the network rendering lane (#100). */
 export type InstancedLayer =
   | { name: string; sizeMode?: "world" | "screen"; primitive: "circles"; circles: InstancedCirclesData }
-  | { name: string; sizeMode?: "world" | "screen"; primitive: "lines"; lines: InstancedLinesData };
+  | { name: string; sizeMode?: "world" | "screen"; primitive: "lines"; lines: InstancedLinesData }
+  | { name: string; sizeMode?: "world" | "screen"; primitive: "arrows"; arrows: InstancedArrowsData };
 
 /** A renderer for a Scene, implemented per target (WebGL / Canvas / SVG). */
 export interface Backend {

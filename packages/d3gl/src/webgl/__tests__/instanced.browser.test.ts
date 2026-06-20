@@ -1,7 +1,7 @@
 import { describe, it, expect } from "vitest";
 import { luma } from "@luma.gl/core";
 import { webgl2Adapter } from "@luma.gl/webgl";
-import { InstancedCircles, InstancedLines } from "../instanced.js";
+import { InstancedCircles, InstancedLines, InstancedArrows } from "../instanced.js";
 import { clipFromView } from "../index.js";
 import { WebGLBackend } from "../webgl-backend.js";
 
@@ -140,6 +140,38 @@ describe("InstancedLines", () => {
     expect(offLine[3]).toBe(0); // transparent away from it
 
     lines.destroy();
+    device.destroy();
+  });
+});
+
+describe("InstancedArrows", () => {
+  it("draws a triangle arrowhead at the tip, oriented from source to target", async () => {
+    const { device, framebuffer } = await setup();
+    const arrows = new InstancedArrows(
+      device,
+      {
+        sources: new Float32Array([0, 32]),
+        targets: new Float32Array([54, 32]), // tip at x=54, pointing +x
+        sizes: new Float32Array([10]),
+        colors: new Uint8Array([255, 0, 0, 255]),
+        count: 1,
+      },
+      W,
+      H,
+    );
+    arrows.setTransform(clipFromView({ k: 1, x: 0, y: 0 }, W, H));
+
+    const pass = device.beginRenderPass({ framebuffer, clearColor: [0, 0, 0, 0] });
+    arrows.render(pass);
+    pass.end();
+    device.submit();
+
+    const inside = px(device, framebuffer, 48, 32); // on axis, between tip (54) and base (34)
+    const before = px(device, framebuffer, 20, 32); // before the base — outside the triangle
+    expect(inside[0]).toBeGreaterThan(200); // red arrowhead
+    expect(before[3]).toBe(0); // transparent before the base
+
+    arrows.destroy();
     device.destroy();
   });
 });
