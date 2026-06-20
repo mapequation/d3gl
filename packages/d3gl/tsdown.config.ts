@@ -27,6 +27,10 @@ export default defineConfig({
     map: "src/map/index.ts",
     network: "src/network/index.ts",
     react: "src/react/index.ts",
+    // Layout Web Worker entry: emitted as a sibling so `network` can reference it via
+    // `new Worker(new URL("./layout-worker.js", import.meta.url))` (the consumer's bundler
+    // re-processes that URL). Not a public subpath export — loaded by URL, not imported.
+    "layout-worker": "src/network/layout-worker.ts",
   },
   format: ["esm"],
   dts: true,

@@ -1,19 +1,37 @@
-import type { NetworkGraph } from "./graph.js";
 import { BarnesHutTree } from "./quadtree.js";
 
 /**
+ * Minimal graph view the force core needs: node count, a directed edge list (used as undirected
+ * springs), and the positions buffer it mutates. {@link NetworkGraph} satisfies this structurally,
+ * and so does a synthetic coarse level (see {@link ./coarsen.js}) — so one force core lays out the
+ * full graph *and* every coarsening level without casts.
+ */
+export interface LayoutGraph {
+  nodeCount: number;
+  edgeCount: number;
+  source: Uint32Array;
+  target: Uint32Array;
+  /** Interleaved `[x, y, …]`, length `2 * nodeCount`; mutated in place by the layout. */
+  positions: Float32Array;
+}
+
+/**
  * Force-directed layout core (sub-issue #102, epic #98). Operates directly on a
- * {@link NetworkGraph}'s positions buffer + CSR — pure typed-array math, no DOM, so it runs
+ * {@link LayoutGraph}'s positions buffer + edge list — pure typed-array math, no DOM, so it runs
  * unchanged on the main thread or inside a Web Worker (the worker + SharedArrayBuffer transport
- * land in later slices). This first version uses O(n²) repulsion; a Barnes-Hut quadtree replaces
- * the pairwise loop next.
+ * land in a later slice). Repulsion is Barnes-Hut O(n log n) via {@link BarnesHutTree}.
  */
 export interface ForceParams {
   /** Repulsion (charge) strength between all node pairs. */
   repulsion: number;
   /** Spring attraction strength along edges. */
   attraction: number;
-  /** Pull toward the centroid (keeps the layout from drifting / flying apart). */
+  /**
+   * Positional gravity: each node is pulled toward the layout centroid ∝ its distance. Besides
+   * keeping the layout from drifting, this is the main knob against loosely-connected clusters
+   * flying far apart — unbounded pairwise repulsion otherwise pushes whole clusters out of frame
+   * (a single bridge edge can't pull them back). Higher = tighter inter-cluster spacing.
+   */
   centering: number;
   /** Integration step size. */
   alpha: number;
@@ -21,7 +39,7 @@ export interface ForceParams {
   theta: number;
 }
 
-export const DEFAULT_FORCE: ForceParams = { repulsion: 200, attraction: 0.05, centering: 0.01, alpha: 0.2, theta: 0.9 };
+export const DEFAULT_FORCE: ForceParams = { repulsion: 200, attraction: 0.05, centering: 0.2, alpha: 0.2, theta: 0.9 };
 
 export class ForceLayout {
   private readonly params: ForceParams;
@@ -32,7 +50,7 @@ export class ForceLayout {
   private readonly tree = new BarnesHutTree();
 
   constructor(
-    private readonly graph: NetworkGraph,
+    private readonly graph: LayoutGraph,
     params: Partial<ForceParams> = {},
   ) {
     this.params = { ...DEFAULT_FORCE, ...params };
@@ -105,7 +123,7 @@ export class ForceLayout {
  * viewport — a good, reproducible starting distribution for {@link ForceLayout} when a graph
  * arrives without coordinates (no two nodes coincident, no RNG).
  */
-export function seedPositions(graph: NetworkGraph, width: number, height: number): void {
+export function seedPositions(graph: LayoutGraph, width: number, height: number): void {
   const n = graph.nodeCount;
   const cx = width / 2;
   const cy = height / 2;

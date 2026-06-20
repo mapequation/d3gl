@@ -11,5 +11,11 @@ export type { NetworkGraph, CSR, BuildGraphInput } from "./graph.js";
 export { parseEdgeList } from "./parse.js";
 export type { ParsedEdges } from "./parse.js";
 
+export { parsePajek, parseNetwork, detectFormat } from "./pajek.js";
+export type { ParsedPajek, NetworkFormat } from "./pajek.js";
+
 export { ForceLayout, DEFAULT_FORCE, seedPositions } from "./force.js";
-export type { ForceParams } from "./force.js";
+export type { ForceParams, LayoutGraph } from "./force.js";
+
+export { coarsenLevel, buildHierarchy, multilevelLayout } from "./coarsen.js";
+export type { CoarseLevel, Hierarchy, CoarsenOptions, MultilevelLayoutOptions } from "./coarsen.js";
