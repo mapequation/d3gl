@@ -2,6 +2,7 @@ import { BaseEngine, type BaseEngineOptions } from "../map/base-engine.js";
 import { networkLayers, emitNodes, emitLinks, emitArrows, type ResolvedNetworkStyle } from "./glyphs.js";
 import { ForceLayout, seedPositions, type ForceParams } from "./force.js";
 import { multilevelLayout } from "./coarsen.js";
+import { startWorkerLayout, type WorkerLayoutHandle } from "./worker-transport.js";
 import type { NetworkGraph } from "./graph.js";
 
 /** Options for the network engine. Inherits sizing, `backend`, and `tooltipClass`. */
@@ -66,6 +67,10 @@ export class Network extends BaseEngine {
   private layoutOpts: NetworkLayoutOptions = {};
   /** Whether retained Scene layers are currently populated (SVG/Canvas path). */
   private sceneActive = false;
+  /** Live handle to a running worker layout, if any. */
+  private layoutHandle: WorkerLayoutHandle | null = null;
+  /** Pending coalesced repaint rAF id (0 = none) for progressive worker frames. */
+  private layoutRepaintRaf = 0;
 
   constructor(host: HTMLElement, opts: NetworkOptions = {}) {
     super(host, opts);
@@ -76,6 +81,7 @@ export class Network extends BaseEngine {
 
   /** Set the graph to render (built via `buildGraph` / `parseEdgeList`). */
   data(graph: NetworkGraph): this {
+    this.stopLayout(); // any worker layout is tied to the previous graph's buffers
     this.graph = graph;
     return this.rebuild();
   }
@@ -90,8 +96,24 @@ export class Network extends BaseEngine {
   layout(opts: NetworkLayoutOptions): this {
     this.layoutOpts = { ...this.layoutOpts, ...opts };
     if (this.graph) {
+      // Any backend change cancels a running worker layout before re-seeding positions.
+      this.stopLayout();
       if (opts.backend === "positions" && opts.positions) {
         this.graph.positions.set(opts.positions);
+      } else if (opts.backend === "worker") {
+        // Off-thread force layout with progressive convergence. The worker can post a frame per
+        // tick, so coalesce repaints to one per animation frame (always painting the freshest
+        // positions) to bound main-thread work at large N.
+        this.layoutHandle = startWorkerLayout(
+          this.graph,
+          {
+            width: this.width,
+            height: this.height,
+            iterations: opts.iterations ?? DEFAULT_FORCE_ITERATIONS,
+            force: opts.force,
+          },
+          () => this.scheduleLayoutRepaint(),
+        );
       } else if (opts.backend === "force") {
         // Main-thread force layout. (Off-thread + progressive convergence via a Web Worker is the
         // next slice.) Multilevel coarsening seeds it by default; opt out for a plain cold start.
@@ -110,6 +132,37 @@ export class Network extends BaseEngine {
       }
     }
     return this.rebuild();
+  }
+
+  /** Coalesce progressive worker frames into at most one repaint per animation frame. */
+  private scheduleLayoutRepaint(): void {
+    if (this.layoutRepaintRaf) return;
+    const raf: (cb: FrameRequestCallback) => number =
+      typeof requestAnimationFrame === "function" ? requestAnimationFrame : (cb) => setTimeout(() => cb(0), 16);
+    this.layoutRepaintRaf = raf(() => {
+      this.layoutRepaintRaf = 0;
+      this.rebuild();
+    });
+  }
+
+  /** Stop a running worker layout (no-op if none). The last computed positions are kept. */
+  stopLayout(): this {
+    this.layoutHandle?.stop();
+    this.layoutHandle = null;
+    if (this.layoutRepaintRaf && typeof cancelAnimationFrame === "function") cancelAnimationFrame(this.layoutRepaintRaf);
+    this.layoutRepaintRaf = 0;
+    return this;
+  }
+
+  /** Resolves when the current worker layout converges or is stopped (immediately if none runs). */
+  whenSettled(): Promise<void> {
+    return this.layoutHandle?.settled ?? Promise.resolve();
+  }
+
+  /** Tear down the engine, cancelling any worker layout first. */
+  override destroy(): void {
+    this.stopLayout();
+    super.destroy();
   }
 
   /**

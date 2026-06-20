@@ -11,8 +11,20 @@
  * This is the layout coarsener, distinct from any provided Infomap module hierarchy (N6): it is a
  * topological structure built once, feeding both layout seeding here and structural LOD later (N5).
  */
-import type { NetworkGraph } from "./graph.js";
 import { ForceLayout, seedPositions, type ForceParams, type LayoutGraph } from "./force.js";
+
+/**
+ * The graph fields coarsening + multilevel seeding read: node count, a weighted edge list, and the
+ * positions buffer they fill. `NetworkGraph` satisfies this structurally, and so does the plain
+ * object the layout worker reconstructs from transferred buffers — so neither needs a cast.
+ */
+export interface CoarsenableGraph {
+  nodeCount: number;
+  source: Uint32Array;
+  target: Uint32Array;
+  weight: Float32Array;
+  positions: Float32Array;
+}
 
 /** One coarsening level as a weighted, undirected edge list (parallel edges already collapsed). */
 export interface CoarseLevel {
@@ -155,7 +167,7 @@ export function coarsenLevel(level: CoarseLevel): { coarse: CoarseLevel; project
 }
 
 /** Build the full coarsening hierarchy, stopping at `minNodes` or when a pass stops reducing. */
-export function buildHierarchy(graph: NetworkGraph, opts: CoarsenOptions = {}): Hierarchy {
+export function buildHierarchy(graph: CoarsenableGraph, opts: CoarsenOptions = {}): Hierarchy {
   const minNodes = opts.minNodes ?? DEFAULT_MIN_NODES;
   const maxLevels = opts.maxLevels ?? DEFAULT_MAX_LEVELS;
   const levels: CoarseLevel[] = [
@@ -207,31 +219,59 @@ function prolongate(
   }
 }
 
+/** A {@link CoarsenableGraph}'s own edge list + positions, as the {@link ForceLayout} view. */
+function graphView(graph: CoarsenableGraph): LayoutGraph {
+  return {
+    nodeCount: graph.nodeCount,
+    edgeCount: graph.source.length,
+    source: graph.source,
+    target: graph.target,
+    positions: graph.positions,
+  };
+}
+
 /**
- * Multilevel force layout: build the coarsening hierarchy, lay out the coarsest level from a seeded
- * disc, then prolongate + refine down to the original graph. Writes `graph.positions` in place.
- * With no possible coarsening (tiny or edgeless graph) this degrades to a plain seeded force run.
+ * Build the coarsening hierarchy, lay out the coarsest level from a seeded disc, then prolongate +
+ * refine *every level except the finest*, leaving `graph.positions` holding the seed projected onto
+ * the original graph — ready for a final refinement the caller drives (the layout worker streams
+ * that refinement tick-by-tick for progressive rendering). With no possible coarsening (tiny or
+ * edgeless graph) this is just a reproducible disc seed.
  */
-export function multilevelLayout(graph: NetworkGraph, opts: MultilevelLayoutOptions): void {
+export function multilevelSeed(graph: CoarsenableGraph, opts: MultilevelLayoutOptions): void {
   const { width, height } = opts;
   const iterations = opts.iterations ?? DEFAULT_ITERATIONS;
   const { levels, projections } = buildHierarchy(graph, opts.coarsen);
   const last = levels.length - 1;
 
-  // Positions per level; level 0 aliases graph.positions so the final result lands there.
+  if (last === 0) {
+    seedPositions(graphView(graph), width, height);
+    return;
+  }
+
+  // Positions per level; level 0 aliases graph.positions so the seed lands there.
   const pos: Float32Array[] = levels.map((lvl, k) =>
     k === 0 ? graph.positions : new Float32Array(lvl.nodeCount * 2),
   );
 
-  // Seed + solve the coarsest level.
+  // Seed + solve the coarsest level, then prolongate + refine down to (but not including) level 0.
   const coarsestView = asView(levels[last]!, pos[last]!);
   seedPositions(coarsestView, width, height);
   new ForceLayout(coarsestView, opts.force).run(iterations);
-
-  // Prolongate + refine down to the finest level.
-  for (let k = last - 1; k >= 0; k--) {
+  for (let k = last - 1; k >= 1; k--) {
     const lvl = levels[k]!;
     prolongate(pos[k]!, pos[k + 1]!, projections[k]!, lvl.nodeCount, width, height);
     new ForceLayout(asView(lvl, pos[k]!), opts.force).run(iterations);
   }
+  // Project the seed onto the finest level; the caller refines from here.
+  prolongate(graph.positions, pos[1]!, projections[0]!, levels[0]!.nodeCount, width, height);
+}
+
+/**
+ * Multilevel force layout: {@link multilevelSeed} then refine the finest level in place. Writes
+ * `graph.positions`. This is the synchronous main-thread path; the worker reuses `multilevelSeed`
+ * and streams the finest-level refinement instead.
+ */
+export function multilevelLayout(graph: CoarsenableGraph, opts: MultilevelLayoutOptions): void {
+  multilevelSeed(graph, opts);
+  new ForceLayout(graphView(graph), opts.force).run(opts.iterations ?? DEFAULT_ITERATIONS);
 }
