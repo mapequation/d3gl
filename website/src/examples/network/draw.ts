@@ -1,7 +1,7 @@
 import { network, buildGraph, type NodeRadiusSpec, type NetworkGraph } from "@mapequation/d3gl/network";
 import { scaleSqrt } from "d3-scale";
 import type { ImperativeSetup } from "../types.js";
-import { makeNetwork } from "./data.js";
+import { generateLFR } from "./data.js";
 
 const SIZES = [10, 100, 1_000, 10_000, 100_000, 1_000_000];
 
@@ -22,22 +22,21 @@ function degreeRadius(graph: NetworkGraph): NodeRadiusSpec {
 }
 
 /**
- * A ring-of-cliques network rendered with the `network()` engine: nodes as GPU-instanced points,
- * links as instanced lines, triangle arrowheads for directed edges. Node positions come from
- * d3gl's in-library **force layout** (Barnes-Hut), seeded by **multilevel coarsening** — no
- * coordinates are supplied. `layout({ backend: "worker" })` runs the whole solve in a Web Worker
- * and streams positions back, so the layout **converges progressively on screen** while the UI
- * stays responsive (drag/zoom mid-solve). The Nodes slider scales 10 → 1,000,000 to stress the
- * layout + renderer; the Size toggle switches between a uniform radius and **degree-weighted** node
- * size (a d3 `scaleSqrt` over the degree range), which is free even at 1M nodes. **Sizing** switches
- * world units (glyphs scale with zoom) vs **screen** (constant pixels — glyphs stay visible when
- * zoomed out). The **LOD** toggle enables the adaptive hierarchy cut: dense regions collapse to
- * aggregate glyphs and expand into their members as you zoom in, so per-frame work tracks the visible
- * frontier (pair it with screen sizing). Drag to pan, scroll to zoom.
+ * An **LFR benchmark network** (power-law degrees + power-law communities with a mixing parameter —
+ * the standard community-detection benchmark) rendered with the `network()` engine: nodes as
+ * GPU-instanced points, links as instanced lines, triangle arrowheads for directed edges. Node
+ * positions come from d3gl's in-library **force layout** (Barnes-Hut), seeded by **multilevel
+ * coarsening** — no coordinates are supplied. `layout({ backend: "worker" })` runs the whole solve in
+ * a Web Worker and streams positions back, so the layout **converges progressively on screen** while
+ * the UI stays responsive. The Nodes slider scales 10 → 1,000,000; the Size toggle switches a uniform
+ * vs **degree-weighted** radius; **Sizing** switches world vs **screen** (constant-pixel) glyphs. The
+ * **LOD** toggle enables the adaptive hierarchy cut — dense communities collapse to aggregate glyphs
+ * and expand into their members as you zoom in — with **Declutter** (thin overlaps) and **Edges**
+ * (super-edges between aggregates). Pair LOD with screen sizing. Drag to pan, scroll to zoom.
  */
 export const setup: ImperativeSetup = (host, { width, height, backend }) => {
   const net = network(host, { width, height, backend });
-  net.enableZoom([0.05, 20]);
+  net.enableZoom([0.002, 200]); // wide range: zoom right out to the aggregate map, in to single nodes
 
   return {
     engine: net,
@@ -50,7 +49,8 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
       // Scale per-tick work down as the graph grows so the off-thread solve stays responsive; the
       // worker keeps the main thread free regardless, streaming frames as it converges.
       const iterations = Math.min(250, Math.max(10, Math.round(2.5e6 / count)));
-      const { nodeCount, source, target } = makeNetwork(count);
+      // LFR benchmark with clear community structure (low mixing) for the layout + LOD to resolve.
+      const { nodeCount, source, target } = generateLFR(count, { mu: 0.1, seed: 1 });
       const graph = buildGraph({ nodeCount, source, target, directed });
 
       net
