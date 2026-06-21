@@ -149,6 +149,16 @@ describe("multilevelLayout", () => {
     expect(Array.from(g1.positions)).toEqual(Array.from(g2.positions));
   });
 
+  it("skips force solves on levels above maxSeedNodes yet still lays out tightly (#117)", () => {
+    // Force the cap to bite even on a small graph (only the coarsest level is solved; larger levels
+    // are prolongated through). The finest refinement still produces a finite, well-clustered layout.
+    const g = ringOfCliques(16, 6); // 96 nodes
+    multilevelLayout(g, { width: 800, height: 600, iterations: 60, maxSeedNodes: 8 });
+
+    expect(Array.from(g.positions).every(Number.isFinite)).toBe(true);
+    expect(tangleRatio(g)).toBeLessThan(0.5); // still tight, not a tangled mess
+  });
+
   it("converges to a better (less tangled) clustered layout than a cold start at equal iterations", () => {
     const cold = ringOfCliques(16, 6);
     const multi = ringOfCliques(16, 6);
