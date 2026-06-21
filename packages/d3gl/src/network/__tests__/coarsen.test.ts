@@ -37,8 +37,9 @@ describe("coarsenLevel (heavy-edge matching)", () => {
     expect(edgeSet(coarse)).toEqual(["0-1:1"]);
   });
 
-  it("aggregates parallel coarse edges, drops internal (self) edges, makes a singleton when no unmatched neighbour remains", () => {
-    // Triangle 0=1 (w2), 0-2 (w1), 1-2 (w1): 0 matches 1 (heaviest); 2 is left a singleton.
+  it("adopts a node with no unmatched neighbour into its heaviest matched neighbour's group", () => {
+    // Triangle 0=1 (w2), 0-2 (w1), 1-2 (w1): 0 matches 1; node 2 has no unmatched neighbour, so it
+    // adopts into their group rather than becoming a singleton → the dense triangle collapses to one.
     const { coarse, projection } = coarsenLevel(
       level(3, [
         [0, 1, 2],
@@ -47,13 +48,29 @@ describe("coarsenLevel (heavy-edge matching)", () => {
       ]),
     );
 
-    expect(Array.from(projection)).toEqual([0, 0, 1]);
-    expect(coarse.nodeCount).toBe(2);
-    // 0-2 and 1-2 both become coarse 0-1; weights sum; the internal 0-1 edge is dropped.
-    expect(edgeSet(coarse)).toEqual(["0-1:2"]);
+    expect(Array.from(projection)).toEqual([0, 0, 0]);
+    expect(coarse.nodeCount).toBe(1);
+    expect(coarse.source.length).toBe(0); // every edge is now internal
   });
 
-  it("leaves an edgeless graph fully unmatched (no reduction)", () => {
+  it("collapses a star via adoption instead of stalling (the power-law coarsening fix, #117)", () => {
+    // Hub 0 + 12 leaves: heavy-edge matching alone pairs one leaf and strands the other 11 as
+    // singletons (≈ no reduction → the level-cap stall). Adoption pulls every leaf into the hub group.
+    const edges: [number, number, number][] = [];
+    for (let i = 1; i < 13; i++) edges.push([0, i, 1]);
+    const { coarse } = coarsenLevel(level(13, edges));
+    expect(coarse.nodeCount).toBe(1);
+  });
+
+  it("halves a path without over-collapsing (adoption only fires for stragglers)", () => {
+    // Path 0-1-…-9: matching always finds an unmatched neighbour, so it pairs (no adoption) → 5.
+    const edges: [number, number, number][] = [];
+    for (let i = 0; i < 9; i++) edges.push([i, i + 1, 1]);
+    const { coarse } = coarsenLevel(level(10, edges));
+    expect(coarse.nodeCount).toBe(5);
+  });
+
+  it("leaves an edgeless graph fully unmatched (no reduction, no adoption)", () => {
     const { coarse, projection } = coarsenLevel(level(3, []));
     expect(Array.from(projection)).toEqual([0, 1, 2]);
     expect(coarse.nodeCount).toBe(3);

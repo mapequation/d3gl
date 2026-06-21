@@ -48,6 +48,8 @@ export class ForceLayout {
   private readonly fx: Float32Array;
   private readonly fy: Float32Array;
   private readonly tree = new BarnesHutTree();
+  /** Reference layout span captured on the first tick; bounds the per-tick step (see {@link tick}). */
+  private span0 = 0;
 
   constructor(
     private readonly graph: LayoutGraph,
@@ -72,6 +74,8 @@ export class ForceLayout {
     // Repulsion via Barnes-Hut (O(n log n)): build the tree on the current positions, then
     // accumulate each node's repulsion through the θ-approximated traversal.
     tree.build(positions, nodeCount);
+    // Capture the initial layout span once; it scales the per-tick displacement clamp below.
+    if (this.span0 === 0) this.span0 = Math.max(2 * tree.rootHalf(), 1);
     for (let i = 0; i < nodeCount; i++) tree.applyForce(i, repulsion, theta, fx, fy);
 
     // Attraction: a spring along each directed edge pulling its endpoints together.
@@ -102,13 +106,20 @@ export class ForceLayout {
       }
     }
 
-    // Integrate with velocity Verlet-ish damping (cools toward equilibrium).
+    // Integrate with velocity Verlet-ish damping (cools toward equilibrium). The per-tick step is
+    // clamped to a multiple of the initial span so a pathological force (e.g. a dense coarse level)
+    // can't fling a node to ±∞ and poison the layout with NaN; far above any normal displacement.
     const damping = 0.9;
+    const maxStep = this.span0 * 4;
     for (let i = 0; i < nodeCount; i++) {
-      vx[i] = (vx[i]! + fx[i]! * alpha) * damping;
-      vy[i] = (vy[i]! + fy[i]! * alpha) * damping;
-      positions[i * 2] = positions[i * 2]! + vx[i]!;
-      positions[i * 2 + 1] = positions[i * 2 + 1]! + vy[i]!;
+      let sx = (vx[i]! + fx[i]! * alpha) * damping;
+      let sy = (vy[i]! + fy[i]! * alpha) * damping;
+      sx = sx > maxStep ? maxStep : sx < -maxStep ? -maxStep : sx;
+      sy = sy > maxStep ? maxStep : sy < -maxStep ? -maxStep : sy;
+      vx[i] = sx;
+      vy[i] = sy;
+      positions[i * 2] = positions[i * 2]! + sx;
+      positions[i * 2 + 1] = positions[i * 2 + 1]! + sy;
     }
   }
 

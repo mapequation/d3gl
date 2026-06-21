@@ -1,6 +1,7 @@
 import { rgb } from "d3-color";
 import type { InstancedCirclesData, InstancedLinesData, InstancedArrowsData, InstancedLayer, GroupBuilder } from "../core/index.js";
 import type { NetworkGraph } from "./graph.js";
+import type { LODTree } from "./lod.js";
 
 /**
  * Glyph builders for the network module (#100, epic #98) — the instanced "emitters".
@@ -118,6 +119,106 @@ export function nodeCircles(graph: NetworkGraph, style: NodeStyleResolved): Inst
   return { centers: graph.positions, radii: style.radii, colors: fillColors(count, style.fill), count };
 }
 
+export interface FrontierStyleResolved {
+  /** Fill for real leaves (individual nodes). */
+  nodeFill: string;
+  /** Fill for aggregate glyphs (collapsed subtrees). */
+  aggregateFill: string;
+  /**
+   * Cap (in the layer's size units) on the aggregate draw radius. The tree's area-additive radius
+   * (`√Σ child radius²`) grows without bound for large subtrees — harmless in world units but it
+   * would balloon as pixels in screen `sizeMode`, so aggregates clamp here. Leaves are never capped.
+   * Default unbounded.
+   */
+  maxAggregateRadius?: number;
+}
+
+/**
+ * Instanced-circle data for an LOD cut frontier: each frontier node drawn at its tree-resolved
+ * {@link LODTree.radius} and centroid, leaves in `nodeFill` and aggregates in `aggregateFill`
+ * (capped at `maxAggregateRadius`). The frontier is bounded by the viewport + expand threshold, so
+ * this small buffer is cheap to rebuild per pan/zoom frame (the instanced lane reallocates, but only
+ * over the visible set, not all of N).
+ */
+export function frontierCircles(tree: LODTree, frontier: Uint32Array, style: FrontierStyleResolved): InstancedCirclesData {
+  const count = frontier.length;
+  const maxAgg = style.maxAggregateRadius ?? Infinity;
+  const centers = new Float32Array(count * 2);
+  const radii = new Float32Array(count);
+  const colors = new Uint8Array(count * 4);
+  const leaf = toRGBA(style.nodeFill);
+  const agg = toRGBA(style.aggregateFill);
+  for (let i = 0; i < count; i++) {
+    const g = frontier[i]!;
+    centers[i * 2] = tree.cx[g]!;
+    centers[i * 2 + 1] = tree.cy[g]!;
+    const isLeafNode = g < tree.leafCount;
+    radii[i] = isLeafNode ? tree.radius[g]! : Math.min(tree.radius[g]!, maxAgg);
+    const c = isLeafNode ? leaf : agg;
+    colors[i * 4] = c[0];
+    colors[i * 4 + 1] = c[1];
+    colors[i * 4 + 2] = c[2];
+    colors[i * 4 + 3] = c[3];
+  }
+  return { centers, radii, colors, count };
+}
+
+export interface SuperEdgeStyleResolved {
+  width: number;
+  stroke: string;
+}
+
+/**
+ * Instanced line data for **super-edges**: every same-level edge incident to a *visible* frontier
+ * node is drawn — a visible node keeps all its edges, so connections don't vanish when a neighbour
+ * scrolls off-screen or is decluttered away (the edge is drawn toward the neighbour's position).
+ * When both endpoints are visible the edge is deduped (`g < h`); when only one is visible it is drawn
+ * once from the visible side. Leaf neighbours come from the graph CSR (a leaf's global id is its node
+ * id); aggregate neighbours from the tree's coarse adjacency. Cross-level pairs (a node linked to a
+ * region shown at a different LOD level) are approximated to the neighbour's centroid for now.
+ */
+export function superEdgeLines(
+  graph: NetworkGraph,
+  tree: LODTree,
+  frontier: Uint32Array,
+  style: SuperEdgeStyleResolved,
+): InstancedLinesData {
+  const present = new Uint8Array(tree.size);
+  for (let i = 0; i < frontier.length; i++) present[frontier[i]!] = 1;
+
+  const a: number[] = [];
+  const b: number[] = [];
+  const { offsets, neighbors } = graph.csr;
+  for (let i = 0; i < frontier.length; i++) {
+    const g = frontier[i]!;
+    const leaf = g < tree.leafCount;
+    const from = leaf ? offsets[g]! : tree.edgeOffset[g]!;
+    const to = leaf ? offsets[g + 1]! : tree.edgeOffset[g + 1]!;
+    for (let p = from; p < to; p++) {
+      const h = leaf ? neighbors[p]! : tree.edgeNeighbors[p]!;
+      // Both visible → emit once (from the smaller id). Neighbour hidden → emit from the visible g.
+      if (present[h] ? g < h : true) {
+        a.push(g);
+        b.push(h);
+      }
+    }
+  }
+
+  const count = a.length;
+  const sources = new Float32Array(count * 2);
+  const targets = new Float32Array(count * 2);
+  for (let e = 0; e < count; e++) {
+    const g = a[e]!;
+    const h = b[e]!;
+    sources[e * 2] = tree.cx[g]!;
+    sources[e * 2 + 1] = tree.cy[g]!;
+    targets[e * 2] = tree.cx[h]!;
+    targets[e * 2 + 1] = tree.cy[h]!;
+  }
+  const widths = new Float32Array(count).fill(style.width);
+  return { sources, targets, widths, colors: fillColors(count, style.stroke), count };
+}
+
 /**
  * Instanced straight-line data for a graph's links, gathering each edge's endpoints from the
  * node positions by index. Rebuilt when positions change (it copies, unlike {@link nodeCircles}).
@@ -178,7 +279,7 @@ export function linkArrows(graph: NetworkGraph, style: ArrowStyleResolved): Inst
 
 /** Fully-resolved network style (defaults applied) for assembling the render layers. */
 export interface ResolvedNetworkStyle {
-  /** Per-node radii (world units), length `nodeCount`; resolved via {@link resolveNodeRadii}. */
+  /** Per-node radii, length `nodeCount`; resolved via {@link resolveNodeRadii}. Units follow `sizeMode`. */
   nodeRadii: Float32Array;
   nodeFill: string;
   linkWidth: number;
@@ -186,6 +287,12 @@ export interface ResolvedNetworkStyle {
   arrowSize: number;
   arrowFill: string;
   directed: boolean;
+  /**
+   * `"world"` (default) sizes glyphs in world units (they scale with zoom); `"screen"` sizes them in
+   * constant pixels (the navigation register for large layouts — glyphs don't vanish when zoomed
+   * out). Arrowheads are world-only for now (their screen-mode shader is a tracked gap, #103).
+   */
+  sizeMode: "world" | "screen";
 }
 
 /**
@@ -200,13 +307,15 @@ export function networkLayers(graph: NetworkGraph, style: ResolvedNetworkStyle):
       name: "links",
       primitive: "lines",
       lines: linkLines(graph, { width: style.linkWidth, stroke: style.linkStroke }),
-      sizeMode: "world",
+      sizeMode: style.sizeMode,
     });
     if (style.directed) {
       layers.push({
         name: "arrows",
         primitive: "arrows",
         arrows: linkArrows(graph, { size: style.arrowSize, nodeRadii: style.nodeRadii, fill: style.arrowFill }),
+        // Arrowheads remain world-sized until their screen-mode shader lands (#103); harmless in
+        // world mode, slightly inconsistent in screen mode for directed graphs.
         sizeMode: "world",
       });
     }
@@ -215,7 +324,7 @@ export function networkLayers(graph: NetworkGraph, style: ResolvedNetworkStyle):
     name: "nodes",
     primitive: "circles",
     circles: nodeCircles(graph, { radii: style.nodeRadii, fill: style.nodeFill }),
-    sizeMode: "world",
+    sizeMode: style.sizeMode,
   });
   return layers;
 }

@@ -8,6 +8,13 @@
  * their parent, so mass/COM is computed bottom-up by a single reverse pass.
  */
 const MAX_DEPTH = 24;
+/**
+ * Repulsion softening (world units²): `f = repulsion / (d² + SOFTENING)`. Bounds the force as
+ * d → 0 instead of letting `repulsion / d²` blow up for near-coincident nodes (which, with an
+ * unbounded force, lets velocities run away to ±∞ → NaN — seen in multilevel coarse-level solves).
+ * Tiny relative to layout spacing, so it doesn't affect well-separated nodes.
+ */
+const SOFTENING = 1e-2;
 
 export class BarnesHutTree {
   private cellCx: Float64Array = new Float64Array(0);
@@ -200,18 +207,14 @@ export class BarnesHutTree {
       const cell = this.stack[--sp]!;
       if (this.mass[cell] === 0) continue;
       if (this.internal[cell]) {
-        let dx = xi - this.comX[cell]!;
-        let dy = yi - this.comY[cell]!;
-        let d2 = dx * dx + dy * dy;
+        const dx = xi - this.comX[cell]!;
+        const dy = yi - this.comY[cell]!;
+        const d2 = dx * dx + dy * dy;
         const s = 2 * this.cellHalf[cell]!;
         if (s * s < theta2 * d2) {
-          // Cell is far enough: treat it as a single body at its centre of mass.
-          if (d2 < 1e-6) {
-            dx = 1e-3;
-            dy = 0;
-            d2 = 1e-6;
-          }
-          const f = (repulsion * this.mass[cell]!) / d2;
+          // Cell is far enough: treat it as a single body at its centre of mass. Softened so a
+          // near-coincident COM can't produce an unbounded force.
+          const f = (repulsion * this.mass[cell]!) / (d2 + SOFTENING);
           ax += f * dx;
           ay += f * dy;
         } else {
@@ -223,15 +226,10 @@ export class BarnesHutTree {
       } else {
         for (let b = this.head[cell]!; b !== -1; b = this.bodyNext[b]!) {
           if (b === i) continue;
-          let dx = xi - this.px[b * 2]!;
-          let dy = yi - this.px[b * 2 + 1]!;
-          let d2 = dx * dx + dy * dy;
-          if (d2 < 1e-6) {
-            dx = 1e-3;
-            dy = 0;
-            d2 = 1e-6;
-          }
-          const f = repulsion / d2;
+          const dx = xi - this.px[b * 2]!;
+          const dy = yi - this.px[b * 2 + 1]!;
+          const d2 = dx * dx + dy * dy;
+          const f = repulsion / (d2 + SOFTENING); // softened: bounded as d → 0
           ax += f * dx;
           ay += f * dy;
         }
@@ -239,6 +237,11 @@ export class BarnesHutTree {
     }
     fx[i] = fx[i]! + ax;
     fy[i] = fy[i]! + ay;
+  }
+
+  /** Half the side of the root bounding box (≈ layout radius); 1 before the first {@link build}. */
+  rootHalf(): number {
+    return this.cellCount > 0 ? this.cellHalf[0]! : 1;
   }
 
   rootMass(): number {
