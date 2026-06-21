@@ -85,6 +85,8 @@ export interface NodeStyleResolved {
 export interface LinkStyleResolved {
   width: number;
   stroke: string;
+  /** Bend (#104 N6c): quadratic-bezier control offset ⟂ to the chord, as a fraction of chord length (0 = straight). */
+  bend?: number;
 }
 
 /** Parse any CSS colour to RGBA bytes (alpha from opacity). */
@@ -326,9 +328,30 @@ export function superEdgeLines(
   return { sources, targets, widths, colors: fillColors(count, style.stroke), count };
 }
 
+/** Path-strip samples for a smooth bent link (#104 N6c). */
+const BENT_SAMPLES = 24;
+
+/** Quadratic-bezier control point for a bent link: chord midpoint offset ⟂ by `bend`·|chord| — matches the strip shader. */
+export function bezierControl(sx: number, sy: number, tx: number, ty: number, bend: number): [number, number] {
+  const dx = tx - sx;
+  const dy = ty - sy;
+  return [(sx + tx) / 2 - dy * bend, (sy + ty) / 2 + dx * bend];
+}
+
+/** Unit end-tangent of a bent link at the target — matches the arrow shader's bezier `t=1` tangent. */
+export function bentEndTangent(sx: number, sy: number, tx: number, ty: number, bend: number): [number, number] {
+  const dx = tx - sx;
+  const dy = ty - sy;
+  const ex = 0.5 * dx + dy * bend;
+  const ey = 0.5 * dy - dx * bend;
+  const el = Math.hypot(ex, ey) || 1;
+  return [ex / el, ey / el];
+}
+
 /**
- * Instanced straight-line data for a graph's links, gathering each edge's endpoints from the
- * node positions by index. Rebuilt when positions change (it copies, unlike {@link nodeCircles}).
+ * Instanced line data for a graph's links, gathering each edge's endpoints from the node positions
+ * by index. Straight by default; with `style.bend` the links bow into quadratic beziers (#104 N6c),
+ * drawn as multi-sample strips. Rebuilt when positions change (it copies, unlike {@link nodeCircles}).
  */
 export function linkLines(graph: NetworkGraph, style: LinkStyleResolved): InstancedLinesData {
   const count = graph.edgeCount;
@@ -343,7 +366,11 @@ export function linkLines(graph: NetworkGraph, style: LinkStyleResolved): Instan
     targets[e * 2 + 1] = graph.positions[t * 2 + 1]!;
   }
   const widths = new Float32Array(count).fill(style.width);
-  return { sources, targets, widths, colors: fillColors(count, style.stroke), count };
+  const colors = fillColors(count, style.stroke);
+  if (style.bend) {
+    return { sources, targets, widths, colors, bends: new Float32Array(count).fill(style.bend), samples: BENT_SAMPLES, count };
+  }
+  return { sources, targets, widths, colors, count };
 }
 
 export interface ArrowStyleResolved {
@@ -351,15 +378,21 @@ export interface ArrowStyleResolved {
   /** Per-node radii (world units) — the tip is set back by the *target* node's radius. */
   nodeRadii: Float32Array;
   fill: string;
+  /** Bend (#104 N6c), matching the link's — the head sits on the bezier end-tangent. */
+  bend?: number;
+  /** Draw a one-sided **half** arrowhead (#104 N6c). */
+  half?: boolean;
 }
 
 /**
  * Instanced arrowhead data for a directed graph's links. The tip sits the *target* node's radius
  * back from its centre (so it meets the node boundary even when nodes are degree/flow-sized),
- * oriented from the source.
+ * oriented along the link's end-tangent — the chord for straight links, the bezier tangent when
+ * `style.bend` is set (#104 N6c).
  */
 export function linkArrows(graph: NetworkGraph, style: ArrowStyleResolved): InstancedArrowsData {
   const count = graph.edgeCount;
+  const bend = style.bend ?? 0;
   const sources = new Float32Array(count * 2);
   const targets = new Float32Array(count * 2);
   for (let e = 0; e < count; e++) {
@@ -369,11 +402,7 @@ export function linkArrows(graph: NetworkGraph, style: ArrowStyleResolved): Inst
     const sy = graph.positions[s * 2 + 1]!;
     const tx = graph.positions[t * 2]!;
     const ty = graph.positions[t * 2 + 1]!;
-    const dx = tx - sx;
-    const dy = ty - sy;
-    const len = Math.hypot(dx, dy) || 1;
-    const ux = dx / len;
-    const uy = dy / len;
+    const [ux, uy] = bend ? bentEndTangent(sx, sy, tx, ty, bend) : straightUnit(sx, sy, tx, ty);
     const setback = style.nodeRadii[t]!;
     sources[e * 2] = sx;
     sources[e * 2 + 1] = sy;
@@ -381,7 +410,19 @@ export function linkArrows(graph: NetworkGraph, style: ArrowStyleResolved): Inst
     targets[e * 2 + 1] = ty - uy * setback;
   }
   const sizes = new Float32Array(count).fill(style.size);
-  return { sources, targets, sizes, colors: fillColors(count, style.fill), count };
+  const colors = fillColors(count, style.fill);
+  if (bend) {
+    return { sources, targets, sizes, colors, bends: new Float32Array(count).fill(bend), half: style.half, count };
+  }
+  return { sources, targets, sizes, colors, count };
+}
+
+/** Unit chord direction source→target (1,0 if degenerate). */
+function straightUnit(sx: number, sy: number, tx: number, ty: number): [number, number] {
+  const dx = tx - sx;
+  const dy = ty - sy;
+  const len = Math.hypot(dx, dy) || 1;
+  return [dx / len, dy / len];
 }
 
 /** Fully-resolved network style (defaults applied) for assembling the render layers. */
@@ -402,6 +443,12 @@ export interface ResolvedNetworkStyle {
   sizeMode: "world" | "screen";
   /** Flow-border ring (#104 N6), or `null` when disabled (plain filled nodes). */
   flowBorder: ResolvedFlowBorder | null;
+  /**
+   * Link bend (#104 N6c): quadratic-bezier control offset ⟂ to the chord, as a fraction of chord
+   * length. `0` (default) ⇒ straight links; non-zero bows links into curves, and directed links get
+   * a one-sided **half-arrow** so reciprocal A→B / B→A links separate (the map-of-networks style).
+   */
+  linkBend: number;
 }
 
 /**
@@ -411,18 +458,20 @@ export interface ResolvedNetworkStyle {
  */
 export function networkLayers(graph: NetworkGraph, style: ResolvedNetworkStyle): InstancedLayer[] {
   const layers: InstancedLayer[] = [];
+  const bend = style.linkBend;
   if (graph.edgeCount > 0) {
     layers.push({
       name: "links",
       primitive: "lines",
-      lines: linkLines(graph, { width: style.linkWidth, stroke: style.linkStroke }),
+      lines: linkLines(graph, { width: style.linkWidth, stroke: style.linkStroke, bend }),
       sizeMode: style.sizeMode,
     });
     if (style.directed) {
       layers.push({
         name: "arrows",
         primitive: "arrows",
-        arrows: linkArrows(graph, { size: style.arrowSize, nodeRadii: style.nodeRadii, fill: style.arrowFill }),
+        // Bent links get a one-sided half-arrow so reciprocal links don't collide (#104 N6c).
+        arrows: linkArrows(graph, { size: style.arrowSize, nodeRadii: style.nodeRadii, fill: style.arrowFill, bend, half: bend !== 0 }),
         // Arrowheads remain world-sized until their screen-mode shader lands (#103); harmless in
         // world mode, slightly inconsistent in screen mode for directed graphs.
         sizeMode: "world",
@@ -451,8 +500,8 @@ export function emitNodes(g: GroupBuilder, graph: NetworkGraph, radii: Float32Ar
   }
 }
 
-/** Emit each link as a stroked line drawable, keyed by edge index. */
-export function emitLinks(g: GroupBuilder, graph: NetworkGraph, width: number): void {
+/** Emit each link as a stroked drawable, keyed by edge index. With `bend` it bows into a quadratic bezier (#104 N6c). */
+export function emitLinks(g: GroupBuilder, graph: NetworkGraph, width: number, bend = 0): void {
   for (let e = 0; e < graph.edgeCount; e++) {
     const s = graph.source[e]!;
     const t = graph.target[e]!;
@@ -464,15 +513,24 @@ export function emitLinks(g: GroupBuilder, graph: NetworkGraph, width: number): 
       e,
       (ctx) => {
         ctx.moveTo(sx, sy);
-        ctx.lineTo(tx, ty);
+        if (bend) {
+          const [cxp, cyp] = bezierControl(sx, sy, tx, ty, bend);
+          ctx.quadraticCurveTo(cxp, cyp, tx, ty);
+        } else {
+          ctx.lineTo(tx, ty);
+        }
       },
       { lineWidth: width },
     );
   }
 }
 
-/** Emit each directed link's arrowhead as a filled triangle, tip set back by the target node's radius. */
-export function emitArrows(g: GroupBuilder, graph: NetworkGraph, size: number, nodeRadii: Float32Array): void {
+/**
+ * Emit each directed link's arrowhead as a filled triangle, tip set back by the target node's radius
+ * and oriented along the link's end-tangent (the bezier tangent when `bend` is set). With `half` the
+ * triangle is one-sided (#104 N6c), matching the WebGL half-arrow.
+ */
+export function emitArrows(g: GroupBuilder, graph: NetworkGraph, size: number, nodeRadii: Float32Array, bend = 0, half = false): void {
   for (let e = 0; e < graph.edgeCount; e++) {
     const s = graph.source[e]!;
     const t = graph.target[e]!;
@@ -480,11 +538,7 @@ export function emitArrows(g: GroupBuilder, graph: NetworkGraph, size: number, n
     const sy = graph.positions[s * 2 + 1]!;
     const tx = graph.positions[t * 2]!;
     const ty = graph.positions[t * 2 + 1]!;
-    const dx = tx - sx;
-    const dy = ty - sy;
-    const len = Math.hypot(dx, dy) || 1;
-    const ux = dx / len;
-    const uy = dy / len;
+    const [ux, uy] = bend ? bentEndTangent(sx, sy, tx, ty, bend) : straightUnit(sx, sy, tx, ty);
     const px = -uy;
     const py = ux;
     const setback = nodeRadii[t]!;
@@ -494,7 +548,8 @@ export function emitArrows(g: GroupBuilder, graph: NetworkGraph, size: number, n
     const baseY = tipY - uy * 2 * size;
     g.drawable(e, (ctx) => {
       ctx.moveTo(tipX, tipY);
-      ctx.lineTo(baseX - px * size, baseY - py * size);
+      // Half-arrow: base on one side of the centreline only (tip → centre-base → +side).
+      ctx.lineTo(half ? baseX : baseX - px * size, half ? baseY : baseY - py * size);
       ctx.lineTo(baseX + px * size, baseY + py * size);
       ctx.closePath();
     });
