@@ -318,6 +318,18 @@ export class Network extends BaseEngine {
   }
 
   /**
+   * Which tree currently drives LOD rendering (#103): `"worker"` when the active tree is the one the
+   * layout worker built and streams (so the main thread does no coarsening or O(N) geometry pass),
+   * `"main"` when it was built on the main thread (`force`/`positions` backends, the worker fallback,
+   * or LOD enabled after a worker run), or `"none"` when LOD is off or no geometry exists yet.
+   * Introspection for debugging and tests.
+   */
+  get lodSource(): "worker" | "main" | "none" {
+    if (!this.lodOptions || !this.lodTree || !this.lodHasGeometry) return "none";
+    return this.lodWorkerTree && this.lodTree === this.lodWorkerTree ? "worker" : "main";
+  }
+
+  /**
    * Re-emit the instanced layers to the backend and repaint. A no-op until a graph is set and a
    * backend exposing the instanced lane is live — on non-WebGL backends this draws through the
    * PathContext seam instead (small-N / export, #100 N2.3). When LOD is active and settled, the
