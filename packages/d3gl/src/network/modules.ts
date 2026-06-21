@@ -36,22 +36,31 @@ export interface ModuleNode {
   path: ArrayLike<number>;
 }
 
+/** Directed, weighted edge list for deriving module super-edges (#104 N6c) — the graph's own arrays. */
+export interface ModuleEdges {
+  source: ArrayLike<number>;
+  target: ArrayLike<number>;
+  /** Per-edge flow/weight; the super-edge flow is the directed sum. */
+  weight: ArrayLike<number>;
+}
+
 /**
  * Build a {@link LODTree} from a provided module hierarchy (the priority-chain entry that precedes
  * structural coarsening). Geometry is left zeroed — fill it with {@link computeLODGeometry} once
- * positions exist. Super-edge adjacency is empty in N6a (module↔module links land with the bent
- * half-arrow renderer in N6c); leaf-level edges still render via the existing super-edge fallback.
+ * positions exist.
  *
- * `records` must cover every node `0..nodeCount-1` exactly once.
+ * With `edges` (the graph's directed edge list), also derive **directed, flow-weighted super-edges**
+ * (#104 N6c) so a map's inter-module links render as bent half-arrows; omit them (N6a) for a
+ * node-only map. `records` must cover every node `0..nodeCount-1` exactly once.
  */
-export function buildModuleLODTree(nodeCount: number, records: ArrayLike<ModuleNode>): LODTree {
-  return lodTreeFromTopology(buildModuleTopology(nodeCount, records));
+export function buildModuleLODTree(nodeCount: number, records: ArrayLike<ModuleNode>, edges?: ModuleEdges): LODTree {
+  return lodTreeFromTopology(buildModuleTopology(nodeCount, records, edges));
 }
 
 /** The empty-prefix root key. Every node's path prefixes bottom out here, so it is the single root. */
 const ROOT_KEY = "";
 
-function buildModuleTopology(nodeCount: number, records: ArrayLike<ModuleNode>): LODTopology {
+function buildModuleTopology(nodeCount: number, records: ArrayLike<ModuleNode>, edges?: ModuleEdges): LODTopology {
   // --- 1. Register every distinct module prefix (root + all ancestors) in first-seen order, and
   // record each leaf's enclosing-module key. ---
   const moduleIndex = new Map<string, number>(); // prefix key → internal module index
@@ -165,16 +174,71 @@ function buildModuleTopology(nodeCount: number, records: ArrayLike<ModuleNode>):
     }
   }
 
-  return {
+  const topo: LODTopology = {
     size,
     leafCount: nodeCount,
     levelCount,
     levelOffset,
     childOffset,
     children,
-    edgeOffset: new Uint32Array(size + 1), // no super-edges in N6a (deferred to N6c)
+    edgeOffset: new Uint32Array(size + 1), // undirected coarse adjacency unused for module trees
     edgeNeighbors: new Uint32Array(0),
   };
+  if (edges) Object.assign(topo, buildSuperEdges(size, parent, edges));
+  return topo;
+}
+
+/**
+ * Directed, flow-weighted super-edge out-adjacency (#104 N6c). Each graph edge `u→v` contributes at
+ * every tree level from the leaves up to (but not including) `u` and `v`'s lowest common module: walk
+ * both ancestor chains in lockstep (after equalising depth) and add a directed `a→b` at each level
+ * until they meet. So a leaf↔leaf pair *and* the module↔module pairs above it all get an entry — the
+ * cut renders whichever level is visible. Flows for the same ordered (a, b) pair are summed.
+ */
+function buildSuperEdges(
+  size: number,
+  parent: Int32Array,
+  edges: ModuleEdges,
+): Pick<LODTopology, "superEdgeOffset" | "superEdgeTarget" | "superEdgeFlow"> {
+  // Depth from root. Parents have higher ids than children (modules sorted by height; root is last),
+  // so a single descending pass finalises each parent before its children.
+  const depth = new Int32Array(size);
+  for (let g = size - 2; g >= 0; g--) depth[g] = depth[parent[g]!]! + 1;
+
+  // Accumulate directed (a→b) flow into a map keyed by a*size+b, walking each edge's ancestor chains.
+  const flowByPair = new Map<number, number>();
+  const m = edges.source.length;
+  for (let e = 0; e < m; e++) {
+    let a = edges.source[e]!;
+    let b = edges.target[e]!;
+    if (a === b) continue; // self-loop
+    const w = edges.weight[e]!;
+    while (depth[a]! > depth[b]!) a = parent[a]!;
+    while (depth[b]! > depth[a]!) b = parent[b]!;
+    while (a !== b) {
+      const key = a * size + b;
+      flowByPair.set(key, (flowByPair.get(key) ?? 0) + w);
+      a = parent[a]!;
+      b = parent[b]!;
+    }
+  }
+
+  // Flatten to an out-adjacency CSR (count → prefix-sum → scatter), like buildCSR.
+  const superEdgeOffset = new Uint32Array(size + 1);
+  for (const key of flowByPair.keys()) superEdgeOffset[Math.floor(key / size) + 1]!++;
+  for (let g = 0; g < size; g++) superEdgeOffset[g + 1] = superEdgeOffset[g + 1]! + superEdgeOffset[g]!;
+  const total = superEdgeOffset[size]!;
+  const superEdgeTarget = new Uint32Array(total);
+  const superEdgeFlow = new Float32Array(total);
+  const cursor = superEdgeOffset.slice(0, size);
+  for (const [key, flow] of flowByPair) {
+    const a = Math.floor(key / size);
+    const pos = cursor[a]!;
+    superEdgeTarget[pos] = key - a * size;
+    superEdgeFlow[pos] = flow;
+    cursor[a] = pos + 1;
+  }
+  return { superEdgeOffset, superEdgeTarget, superEdgeFlow };
 }
 
 /** Prefix depth = number of components (`""` → 0, `"2"` → 1, `"2:1"` → 2). */

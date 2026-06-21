@@ -221,4 +221,37 @@ describe("network() engine", () => {
 
     net.destroy();
   });
+
+  it("renders a directed map of modules (N6c.2): flow borders + bent half-arrow super-edges", async () => {
+    const net = network(host(), { width: 200, height: 200 });
+    await net.whenReady();
+    // Two modules of two nodes, with directed cross-module edges (so module super-edges exist).
+    const g = buildGraph({
+      nodeCount: 4,
+      source: [0, 1, 0, 2],
+      target: [1, 0, 2, 3],
+      weight: [5, 5, 1, 5],
+      directed: true,
+      nodeFlow: [0.3, 0.3, 0.2, 0.2],
+    });
+    const modules = [
+      { id: 0, path: [1, 1] }, { id: 1, path: [1, 2] }, { id: 2, path: [2, 1] }, { id: 3, path: [2, 2] },
+    ];
+    net
+      .data(g)
+      .style({
+        directed: true,
+        sizeMode: "screen",
+        linkBend: 0.2,
+        flowBorder: { flow: "strength", scale: (v) => v * 0.5, color: "#234" },
+      })
+      .lod({ modules, expandPx: 48 })
+      .layout({ backend: "positions", positions: new Float32Array([20, 20, 40, 20, 170, 180, 190, 180]) });
+
+    expect(net.lodSource).toBe("modules");
+    // Across zoom: collapsed modules show bent half-arrow super-edges; zoomed in, leaf links. No throw.
+    expect(net.setTransform({ k: 0.4, x: 100, y: 100 })).toBe(net);
+    expect(net.setTransform({ k: 30, x: -2900, y: -2900 })).toBe(net);
+    net.destroy();
+  });
 });

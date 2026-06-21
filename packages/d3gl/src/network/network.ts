@@ -1,5 +1,5 @@
 import { BaseEngine, type BaseEngineOptions } from "../map/base-engine.js";
-import { networkLayers, frontierCircles, superEdgeLines, emitNodes, emitLinks, emitArrows, resolveNodeRadii, resolveFlowBorder, flowBorderInnerRadii, type ResolvedNetworkStyle, type NodeRadiusSpec, type FlowBorderSpec } from "./glyphs.js";
+import { networkLayers, frontierCircles, superEdgeLines, bentSuperEdges, emitNodes, emitLinks, emitArrows, resolveNodeRadii, resolveFlowBorder, flowBorderInnerRadii, type ResolvedNetworkStyle, type NodeRadiusSpec, type FlowBorderSpec } from "./glyphs.js";
 import { ForceLayout, seedPositions, type ForceParams } from "./force.js";
 import { multilevelLayout, type CoarsenOptions } from "./coarsen.js";
 import { buildLODTree, buildSpatialLODTree, computeLODGeometry, computeLODStyle, cut, declutterFrontier, type LODTree, type SpatialLODOptions } from "./lod.js";
@@ -176,6 +176,8 @@ export class Network extends BaseEngine {
   private lodSpatial = false;
   /** Whether the current `lodTree` was built from a provided module hierarchy (N6 / #104). */
   private lodModules = false;
+  /** Max directed super-edge flow in the current module tree (#104 N6c), to normalise bent-link widths. */
+  private lodMaxSuperFlow = 0;
   /** True while a worker-LOD run is in flight (launched, not yet settled/stopped) — it will stream the tree. */
   private lodStreaming = false;
   /** Dedup guard for the one-shot deferred main-thread LOD-tree fallback (see {@link scheduleLODFallback}). */
@@ -462,8 +464,26 @@ export class Network extends BaseEngine {
     const layers: InstancedLayer[] = [];
     // Super-edges first (drawn under the nodes), among the visible frontier only.
     if (opts.superEdges !== false && this.graph!.edgeCount > 0) {
-      const lines = superEdgeLines(this.graph!, tree, frontier, { width: style.linkWidth, stroke: style.linkStroke });
-      if (lines.count > 0) layers.push({ name: "links", primitive: "lines", lines, sizeMode: style.sizeMode });
+      if (this.lodModules && style.linkBend !== 0 && tree.superEdgeOffset) {
+        // Map register (#104 N6c): bent half-arrow inter-module links from the directed, flow-weighted
+        // super-edge adjacency; width ∝ √flow (normalised to the max), half-arrows when directed.
+        const maxFlow = this.lodMaxSuperFlow || 1;
+        const { lines, arrows } = bentSuperEdges(tree, frontier, {
+          width: style.linkWidth,
+          stroke: style.linkStroke,
+          bend: style.linkBend,
+          flowScale: (f) => style.linkWidth * Math.sqrt(f / maxFlow),
+          directed: style.directed,
+          arrowSize: style.arrowSize,
+          arrowFill: style.arrowFill,
+          maxAggregateRadius: opts.maxAggregateRadius,
+        });
+        if (lines.count > 0) layers.push({ name: "links", primitive: "lines", lines, sizeMode: style.sizeMode });
+        if (arrows.count > 0) layers.push({ name: "arrows", primitive: "arrows", arrows, sizeMode: "world" });
+      } else {
+        const lines = superEdgeLines(this.graph!, tree, frontier, { width: style.linkWidth, stroke: style.linkStroke });
+        if (lines.count > 0) layers.push({ name: "links", primitive: "lines", lines, sizeMode: style.sizeMode });
+      }
     }
     const circles = frontierCircles(tree, frontier, {
       nodeFill: style.nodeFill,
@@ -512,7 +532,13 @@ export class Network extends BaseEngine {
       // Priority chain (epic #98): provided module hierarchy → structural coarsening → spatial
       // quadtree fallback. A provided tree (N6 / #104) is position-independent, like coarsening.
       if (this.lodOptions.modules) {
-        this.lodTree = buildModuleLODTree(this.graph.nodeCount, this.lodOptions.modules);
+        // Pass the graph's directed edges so the tree also carries flow-weighted super-edges for the
+        // bent half-arrow map links (#104 N6c); cache their max flow to normalise link widths.
+        this.lodTree = buildModuleLODTree(this.graph.nodeCount, this.lodOptions.modules, this.graph);
+        const sf = this.lodTree.superEdgeFlow;
+        let mx = 0;
+        if (sf) for (let i = 0; i < sf.length; i++) if (sf[i]! > mx) mx = sf[i]!;
+        this.lodMaxSuperFlow = mx;
         this.lodModules = true;
         this.lodSpatial = false;
       } else if (this.graph.edgeCount === 0) {

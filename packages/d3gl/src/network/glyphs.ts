@@ -328,6 +328,94 @@ export function superEdgeLines(
   return { sources, targets, widths, colors: fillColors(count, style.stroke), count };
 }
 
+export interface BentSuperEdgeStyleResolved {
+  /** Constant link width, unless `flowScale` is given. */
+  width: number;
+  stroke: string;
+  /** Bend (fraction of chord) for the bezier links. */
+  bend: number;
+  /** Optional map flow → link width (e.g. `scaleSqrt`), so width ∝ √flow; constant `width` when absent. */
+  flowScale?: (flow: number) => number;
+  /** Draw one-sided half-arrowheads (directed maps). */
+  directed: boolean;
+  arrowSize: number;
+  arrowFill: string;
+  /** Aggregate draw-radius cap, so a head sits at the (capped) module boundary, not its centre. */
+  maxAggregateRadius?: number;
+}
+
+/**
+ * Instanced **bent half-arrow super-edges** for the map register (#104 N6c): inter-module links drawn
+ * from the tree's directed, flow-weighted {@link LODTree.superEdgeOffset} adjacency. For each visible
+ * frontier node, its directed super-edges to *also-visible* nodes are emitted as bezier strips (width
+ * ∝ √flow via `flowScale`); on a directed map each gets a one-sided half-arrow set back to the target
+ * module's boundary, so reciprocal links bow apart. Returns both layers (lines under arrows).
+ */
+export function bentSuperEdges(
+  tree: LODTree,
+  frontier: Uint32Array,
+  style: BentSuperEdgeStyleResolved,
+): { lines: InstancedLinesData; arrows: InstancedArrowsData } {
+  const off = tree.superEdgeOffset;
+  const tgt = tree.superEdgeTarget;
+  const flw = tree.superEdgeFlow;
+  const present = new Uint8Array(tree.size);
+  for (let i = 0; i < frontier.length; i++) present[frontier[i]!] = 1;
+
+  const aS: number[] = [];
+  const bS: number[] = [];
+  const wS: number[] = [];
+  if (off && tgt && flw) {
+    for (let i = 0; i < frontier.length; i++) {
+      const g = frontier[i]!;
+      for (let p = off[g]!; p < off[g + 1]!; p++) {
+        const h = tgt[p]!;
+        if (present[h]) {
+          aS.push(g);
+          bS.push(h);
+          wS.push(flw[p]!);
+        }
+      }
+    }
+  }
+
+  const count = aS.length;
+  const maxAgg = style.maxAggregateRadius ?? Infinity;
+  const drawnRadius = (g: number): number => (g < tree.leafCount ? tree.radius[g]! : Math.min(tree.radius[g]!, maxAgg));
+
+  const sources = new Float32Array(count * 2);
+  const targets = new Float32Array(count * 2);
+  const widths = new Float32Array(count);
+  const bends = new Float32Array(count).fill(style.bend);
+  const aTargets = new Float32Array(count * 2);
+  const aSizes = new Float32Array(count).fill(style.arrowSize);
+  const aBends = new Float32Array(count).fill(style.bend);
+  for (let e = 0; e < count; e++) {
+    const g = aS[e]!;
+    const h = bS[e]!;
+    const sx = tree.cx[g]!;
+    const sy = tree.cy[g]!;
+    const tx = tree.cx[h]!;
+    const ty = tree.cy[h]!;
+    sources[e * 2] = sx;
+    sources[e * 2 + 1] = sy;
+    targets[e * 2] = tx;
+    targets[e * 2 + 1] = ty;
+    widths[e] = style.flowScale ? style.flowScale(wS[e]!) : style.width;
+    // Arrow tip set back to the target module's boundary along the bezier end-tangent.
+    const [ux, uy] = bentEndTangent(sx, sy, tx, ty, style.bend);
+    const setback = drawnRadius(h);
+    aTargets[e * 2] = tx - ux * setback;
+    aTargets[e * 2 + 1] = ty - uy * setback;
+  }
+
+  const lines: InstancedLinesData = { sources, targets, widths, colors: fillColors(count, style.stroke), bends, samples: BENT_SAMPLES, count };
+  const arrows: InstancedArrowsData = style.directed
+    ? { sources, targets: aTargets, sizes: aSizes, colors: fillColors(count, style.arrowFill), bends: aBends, half: true, count }
+    : { sources: new Float32Array(0), targets: new Float32Array(0), sizes: new Float32Array(0), colors: new Uint8Array(0), count: 0 };
+  return { lines, arrows };
+}
+
 /** Path-strip samples for a smooth bent link (#104 N6c). */
 const BENT_SAMPLES = 24;
 
