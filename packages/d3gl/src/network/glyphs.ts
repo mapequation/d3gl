@@ -152,7 +152,9 @@ export function frontierCircles(tree: LODTree, frontier: Uint32Array, style: Fro
     const g = frontier[i]!;
     centers[i * 2] = tree.cx[g]!;
     centers[i * 2 + 1] = tree.cy[g]!;
-    const isLeafNode = g < tree.leafCount;
+    // A real leaf, or an aggregate covering a single leaf (the spatial quadtree wraps each isolated
+    // point in a 1-child cell, #103) — draw it as that point: leaf fill, uncapped radius.
+    const isLeafNode = g < tree.leafCount || tree.count[g] === 1;
     radii[i] = isLeafNode ? tree.radius[g]! : Math.min(tree.radius[g]!, maxAgg);
     const c = isLeafNode ? leaf : agg;
     colors[i * 4] = c[0];
