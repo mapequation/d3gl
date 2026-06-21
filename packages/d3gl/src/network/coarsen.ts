@@ -306,12 +306,16 @@ function graphView(graph: CoarsenableGraph): LayoutGraph {
  * the original graph — ready for a final refinement the caller drives (the layout worker streams
  * that refinement tick-by-tick for progressive rendering). With no possible coarsening (tiny or
  * edgeless graph) this is just a reproducible disc seed.
+ *
+ * Pass a pre-built `hierarchy` to reuse a coarsening already computed by the caller — the worker
+ * builds it once and feeds the *same* tree to both this seed and the structural LOD (#103), so the
+ * graph is never coarsened twice.
  */
-export function multilevelSeed(graph: CoarsenableGraph, opts: MultilevelLayoutOptions): void {
+export function multilevelSeed(graph: CoarsenableGraph, opts: MultilevelLayoutOptions, hierarchy?: Hierarchy): void {
   const { width, height } = opts;
   const coarsenIterations = opts.coarsenIterations ?? DEFAULT_COARSEN_ITERATIONS;
   const maxSeedNodes = opts.maxSeedNodes ?? DEFAULT_MAX_SEED_NODES;
-  const { levels, projections } = buildHierarchy(graph, opts.coarsen);
+  const { levels, projections } = hierarchy ?? buildHierarchy(graph, opts.coarsen);
   const last = levels.length - 1;
 
   if (last === 0) {

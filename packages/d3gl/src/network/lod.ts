@@ -16,16 +16,15 @@
  * to be promotable to a shared core `select(transform) → visibleIndices` lane later (#108).
  */
 import type { NetworkGraph } from "./graph.js";
-import { buildHierarchy, type CoarsenOptions } from "./coarsen.js";
+import { buildHierarchy, type CoarsenOptions, type Hierarchy } from "./coarsen.js";
 
 /**
- * A retained coarsening tree, flattened to SoA typed arrays for cache-friendly traversal at scale.
- *
- * Tree nodes are numbered by level: level 0 (the original graph) occupies global ids `[0, leafCount)`
- * and is the **leaves**; each coarser level follows, and the coarsest level is the **roots**. Ids are
- * stable for the life of the graph, so aggregates keep their identity across frames (no popping).
+ * The position-independent **topology** of the LOD tree: the flattened coarsening hierarchy (levels,
+ * children CSR, super-edge adjacency) with no geometry. Built once from a {@link Hierarchy} — on the
+ * worker, which already coarsens for multilevel seeding, then streamed to the main thread (#103
+ * worker-LOD) so the main thread never re-coarsens. {@link LODTree} extends this with geometry.
  */
-export interface LODTree {
+export interface LODTopology {
   /** Total tree nodes across all levels. */
   size: number;
   /** Number of leaves (= `graph.nodeCount` = level-0 node count). */
@@ -45,6 +44,16 @@ export interface LODTree {
    */
   edgeOffset: Uint32Array;
   edgeNeighbors: Uint32Array;
+}
+
+/**
+ * A retained coarsening tree, flattened to SoA typed arrays for cache-friendly traversal at scale.
+ *
+ * Tree nodes are numbered by level: level 0 (the original graph) occupies global ids `[0, leafCount)`
+ * and is the **leaves**; each coarser level follows, and the coarsest level is the **roots**. Ids are
+ * stable for the life of the graph, so aggregates keep their identity across frames (no popping).
+ */
+export interface LODTree extends LODTopology {
   // --- geometry, filled by computeLODGeometry from the settled layout ---
   /** Centroid x of each node's leaf descendants. */
   cx: Float32Array;
@@ -68,17 +77,18 @@ export interface LODTree {
 }
 
 /**
- * Build the retained LOD tree topology from a graph's coarsening hierarchy. Geometry is left zeroed;
- * call {@link computeLODGeometry} once positions have settled. Pure topology — no positions read.
+ * Flatten a coarsening {@link Hierarchy} into the LOD tree's {@link LODTopology} — the level offsets,
+ * children CSR, and aggregate super-edge adjacency — with no geometry. Pure topology, no positions
+ * read. Reused by both the main-thread {@link buildLODTree} and the layout worker, which already has
+ * the hierarchy from multilevel seeding and streams this topology to the main thread (#103).
  */
-export function buildLODTree(graph: NetworkGraph, coarsen?: CoarsenOptions): LODTree {
-  const { levels, projections } = buildHierarchy(graph, coarsen);
+export function flattenHierarchyToTopology(hierarchy: Hierarchy, leafCount: number): LODTopology {
+  const { levels, projections } = hierarchy;
   const levelCount = levels.length;
 
   const levelOffset = new Uint32Array(levelCount + 1);
   for (let k = 0; k < levelCount; k++) levelOffset[k + 1] = levelOffset[k]! + levels[k]!.nodeCount;
   const size = levelOffset[levelCount]!;
-  const leafCount = graph.nodeCount;
 
   // Parent of each node (one level coarser): projections[k] maps level-k local → level-(k+1) local.
   const parent = new Int32Array(size).fill(-1);
@@ -136,15 +146,14 @@ export function buildLODTree(graph: NetworkGraph, coarsen?: CoarsenOptions): LOD
     }
   }
 
+  return { size, leafCount, levelCount, levelOffset, childOffset, children, edgeOffset, edgeNeighbors };
+}
+
+/** Allocate zeroed geometry arrays over a topology, yielding a renderable {@link LODTree}. */
+function attachGeometry(topo: LODTopology): LODTree {
+  const { size } = topo;
   return {
-    size,
-    leafCount,
-    levelCount,
-    levelOffset,
-    childOffset,
-    children,
-    edgeOffset,
-    edgeNeighbors,
+    ...topo,
     cx: new Float32Array(size),
     cy: new Float32Array(size),
     extent: new Float32Array(size),
@@ -155,31 +164,55 @@ export function buildLODTree(graph: NetworkGraph, coarsen?: CoarsenOptions): LOD
 }
 
 /**
- * Fill the tree's geometry from the settled layout, the per-leaf visual radii, and a per-leaf
- * importance weight. Leaves take their own position/radius; each aggregate gets the count-weighted
- * centroid of its children (= the mean of its descendant leaf positions), the summed count/weight,
- * an area-additive visual radius (`√Σ child radius²`), and a bounding `extent` enclosing all
- * descendant leaves. One bottom-up pass over the levels — O(tree size) ≈ O(n).
- *
- * `leafRadii` is the resolved per-node radius (so aggregates respect the node sizing); `leafWeight`
- * is the per-leaf importance, defaulting to `graph.strength` (weighted degree) — pass `graph.flow`
- * or `graph.csr.degree` to prioritise differently.
+ * Build the retained LOD tree topology from a graph's coarsening hierarchy. Geometry is left zeroed;
+ * call {@link computeLODGeometry} once positions have settled. This is the main-thread path (the
+ * `force`/`positions` backends and LOD enabled after a worker has finished); the worker backend
+ * streams an already-built {@link LODTopology} instead (#103), assembled via {@link lodTreeFromTopology}.
  */
-export function computeLODGeometry(
-  tree: LODTree,
-  graph: NetworkGraph,
-  leafRadii: ArrayLike<number>,
-  leafWeight: ArrayLike<number> = graph.strength,
-): void {
-  const { leafCount, levelCount, levelOffset, childOffset, children, cx, cy, extent, radius, count, weight } = tree;
-  const pos = graph.positions;
+export function buildLODTree(graph: NetworkGraph, coarsen?: CoarsenOptions): LODTree {
+  return attachGeometry(flattenHierarchyToTopology(buildHierarchy(graph, coarsen), graph.nodeCount));
+}
+
+/**
+ * Assemble a {@link LODTree} from a worker-streamed {@link LODTopology}, optionally binding the
+ * position-derived geometry (`cx`/`cy`/`extent`) to caller-provided buffers — typically views into a
+ * `SharedArrayBuffer` the worker writes live each frame (#103 worker-LOD), so the main thread reads
+ * the converging geometry with no copy. Style-derived geometry (`radius`/`weight`, plus topological
+ * `count`) is always main-allocated; fill it once with {@link computeLODStyle}.
+ */
+export function lodTreeFromTopology(
+  topo: LODTopology,
+  geometry?: { cx: Float32Array; cy: Float32Array; extent: Float32Array },
+): LODTree {
+  const { size } = topo;
+  return {
+    ...topo,
+    cx: geometry?.cx ?? new Float32Array(size),
+    cy: geometry?.cy ?? new Float32Array(size),
+    extent: geometry?.extent ?? new Float32Array(size),
+    radius: new Float32Array(size),
+    count: new Uint32Array(size),
+    weight: new Float32Array(size),
+  };
+}
+
+/**
+ * Fill the tree's **position-derived** geometry from a layout snapshot: each leaf's centroid is its
+ * own position (extent 0, count 1); each aggregate gets the count-weighted centroid of its children
+ * (= the mean of its descendant leaf positions), the summed leaf `count`, and a bounding `extent`
+ * enclosing all descendant leaves. One bottom-up pass — O(tree size) ≈ O(n).
+ *
+ * This is the *only* geometry that changes as the layout converges, so it is the per-frame pass: the
+ * layout worker runs it each streamed frame and writes `cx`/`cy`/`extent` into the shared buffer the
+ * main thread renders from (#103 worker-LOD). Style-derived geometry is {@link computeLODStyle}.
+ */
+export function computeLODPositions(tree: LODTree, positions: ArrayLike<number>): void {
+  const { leafCount, levelCount, levelOffset, childOffset, children, cx, cy, extent, count } = tree;
 
   for (let i = 0; i < leafCount; i++) {
-    cx[i] = pos[i * 2]!;
-    cy[i] = pos[i * 2 + 1]!;
+    cx[i] = positions[i * 2]!;
+    cy[i] = positions[i * 2 + 1]!;
     count[i] = 1;
-    radius[i] = leafRadii[i]!;
-    weight[i] = leafWeight[i]!;
     extent[i] = 0;
   }
 
@@ -190,24 +223,18 @@ export function computeLODGeometry(
       let sumC = 0;
       let sx = 0;
       let sy = 0;
-      let sw = 0;
-      let sumR2 = 0;
       for (let p = c0; p < c1; p++) {
         const c = children[p]!;
         const cc = count[c]!;
         sumC += cc;
         sx += cc * cx[c]!;
         sy += cc * cy[c]!;
-        sw += weight[c]!;
-        sumR2 += radius[c]! * radius[c]!;
       }
       const gx = sumC > 0 ? sx / sumC : 0;
       const gy = sumC > 0 ? sy / sumC : 0;
       cx[g] = gx;
       cy[g] = gy;
       count[g] = sumC;
-      weight[g] = sw;
-      radius[g] = Math.sqrt(sumR2); // area-additive: aggregate ink ≈ Σ child ink
       // Bounding radius: the farthest child's centre distance plus that child's own extent.
       let ext = 0;
       for (let p = c0; p < c1; p++) {
@@ -220,6 +247,58 @@ export function computeLODGeometry(
       extent[g] = ext;
     }
   }
+}
+
+/**
+ * Fill the tree's **style-derived** geometry: each leaf takes its resolved visual `radius` and
+ * importance `weight`; each aggregate gets an area-additive radius (`√Σ child radius²`, so an
+ * aggregate's ink ≈ its contents' total ink, agnostic to the node sizing) and the summed child
+ * weight. Independent of positions, so this is constant through a solve — computed once on the main
+ * thread (and recomputed only when the style's radii change), never per frame.
+ *
+ * `leafRadii` is the resolved per-node radius; `leafWeight` is the per-leaf importance (typically
+ * `graph.strength`) driving super-edge weight and declutter priority.
+ */
+export function computeLODStyle(tree: LODTree, leafRadii: ArrayLike<number>, leafWeight: ArrayLike<number>): void {
+  const { leafCount, levelCount, levelOffset, childOffset, children, radius, weight } = tree;
+
+  for (let i = 0; i < leafCount; i++) {
+    radius[i] = leafRadii[i]!;
+    weight[i] = leafWeight[i]!;
+  }
+
+  for (let k = 1; k < levelCount; k++) {
+    for (let g = levelOffset[k]!; g < levelOffset[k + 1]!; g++) {
+      let sw = 0;
+      let sumR2 = 0;
+      for (let p = childOffset[g]!; p < childOffset[g + 1]!; p++) {
+        const c = children[p]!;
+        sw += weight[c]!;
+        sumR2 += radius[c]! * radius[c]!;
+      }
+      weight[g] = sw;
+      radius[g] = Math.sqrt(sumR2); // area-additive: aggregate ink ≈ Σ child ink
+    }
+  }
+}
+
+/**
+ * Fill the tree's full geometry from the settled layout, the per-leaf visual radii, and a per-leaf
+ * importance weight — {@link computeLODPositions} then {@link computeLODStyle}. The main-thread path
+ * (synchronous solve / supplied positions); the worker backend splits these passes across threads.
+ *
+ * `leafRadii` is the resolved per-node radius (so aggregates respect the node sizing); `leafWeight`
+ * is the per-leaf importance, defaulting to `graph.strength` (weighted degree) — pass `graph.flow`
+ * or `graph.csr.degree` to prioritise differently.
+ */
+export function computeLODGeometry(
+  tree: LODTree,
+  graph: NetworkGraph,
+  leafRadii: ArrayLike<number>,
+  leafWeight: ArrayLike<number> = graph.strength,
+): void {
+  computeLODPositions(tree, graph.positions);
+  computeLODStyle(tree, leafRadii, leafWeight);
 }
 
 /** Screen-space transform: `screen = world * k + (x, y)` (matches {@link BaseEngine} `ViewTransform`). */
