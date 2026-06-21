@@ -1,5 +1,5 @@
 import { BaseEngine, type BaseEngineOptions } from "../map/base-engine.js";
-import { networkLayers, frontierCircles, superEdgeLines, emitNodes, emitLinks, emitArrows, resolveNodeRadii, type ResolvedNetworkStyle, type NodeRadiusSpec } from "./glyphs.js";
+import { networkLayers, frontierCircles, superEdgeLines, emitNodes, emitLinks, emitArrows, resolveNodeRadii, resolveFlowBorder, flowBorderInnerRadii, type ResolvedNetworkStyle, type NodeRadiusSpec, type FlowBorderSpec } from "./glyphs.js";
 import { ForceLayout, seedPositions, type ForceParams } from "./force.js";
 import { multilevelLayout, type CoarsenOptions } from "./coarsen.js";
 import { buildLODTree, buildSpatialLODTree, computeLODGeometry, computeLODStyle, cut, declutterFrontier, type LODTree, type SpatialLODOptions } from "./lod.js";
@@ -40,6 +40,14 @@ export interface NetworkStyle {
    * `linkWidth` are then read as pixels. (Arrowheads stay world-sized for now, #103.)
    */
   sizeMode?: "world" | "screen";
+  /**
+   * Flow-border ring (N6 / #104): draw each node/module as a disc with an outer ring whose width
+   * encodes a per-node **enter/exit flow** (`flow`: an app `Float32Array` or a built-in metric) via
+   * `scale`. Module aggregates sum their members' flow over the same LOD cut. Fill/size still come
+   * from `nodeFill`/`nodeRadius` (size by total flow with `nodeRadius: { by: "flow", scale }`). Omit
+   * for plain filled nodes. @see {@link FlowBorderSpec}
+   */
+  flowBorder?: FlowBorderSpec;
 }
 
 /** How node positions are produced. The worker / GPU backends land in later slices. */
@@ -454,6 +462,7 @@ export class Network extends BaseEngine {
       nodeFill: style.nodeFill,
       aggregateFill: opts.aggregateFill ?? style.nodeFill,
       maxAggregateRadius: opts.maxAggregateRadius,
+      border: style.flowBorder,
     });
     layers.push({ name: "nodes", primitive: "circles", circles, sizeMode: style.sizeMode });
     return layers;
@@ -478,9 +487,11 @@ export class Network extends BaseEngine {
    */
   private recomputeLODGeometry(forceMain = false): void {
     if (!this.lodOptions || !this.graph) return;
-    const nodeRadii = this.resolvedStyleCached(this.graph).nodeRadii;
+    const resolved = this.resolvedStyleCached(this.graph);
+    const nodeRadii = resolved.nodeRadii;
+    const leafBorder = resolved.flowBorder?.metric; // per-leaf flow metric; sum-aggregated onto the tree
     if (this.lodWorkerTree) {
-      computeLODStyle(this.lodWorkerTree, nodeRadii, this.graph.strength);
+      computeLODStyle(this.lodWorkerTree, nodeRadii, this.graph.strength, leafBorder);
       this.lodTree = this.lodWorkerTree;
       this.lodHasGeometry = true;
       return;
@@ -511,7 +522,7 @@ export class Network extends BaseEngine {
         this.lodModules = false;
       }
     }
-    computeLODGeometry(this.lodTree, this.graph, nodeRadii);
+    computeLODGeometry(this.lodTree, this.graph, nodeRadii, undefined, leafBorder);
     this.lodHasGeometry = true;
   }
 
@@ -576,13 +587,28 @@ export class Network extends BaseEngine {
         if (emit && style.directed) emitArrows(g, graph, style.arrowSize, style.nodeRadii);
       },
     });
+    // Flow border (#104 N6): the instanced lane draws the ring in-shader, but the Scene path has no
+    // per-element ring primitive — so render it as two stacked discs, a border-colour disc under a
+    // smaller fill disc (inner radius = radius − ring width). Always registered (empty when off) so
+    // toggling the border clears the layer instead of leaving it behind.
+    const border = style.flowBorder;
+    const innerRadii = border ? flowBorderInnerRadii(style.nodeRadii, border.metric, border.scale) : style.nodeRadii;
+    this.registerLayer({
+      name: "node-borders",
+      data: nodeIds,
+      ids: nodeIds,
+      fill: () => border?.colorCss ?? style.nodeFill,
+      build: (g) => {
+        if (emit && border) emitNodes(g, graph, style.nodeRadii);
+      },
+    });
     this.registerLayer({
       name: "nodes",
       data: nodeIds,
       ids: nodeIds,
       fill: () => style.nodeFill,
       build: (g) => {
-        if (emit) emitNodes(g, graph, style.nodeRadii);
+        if (emit) emitNodes(g, graph, innerRadii);
       },
     });
   }
@@ -596,15 +622,17 @@ export class Network extends BaseEngine {
   private resolvedStyle(graph: NetworkGraph): ResolvedNetworkStyle {
     const linkWidth = this.styleOpts.linkWidth ?? DEFAULT_LINK_WIDTH;
     const linkStroke = this.styleOpts.linkStroke ?? DEFAULT_LINK_STROKE;
+    const nodeFill = this.styleOpts.nodeFill ?? DEFAULT_NODE_FILL;
     return {
       nodeRadii: resolveNodeRadii(graph, this.styleOpts.nodeRadius ?? DEFAULT_NODE_RADIUS),
-      nodeFill: this.styleOpts.nodeFill ?? DEFAULT_NODE_FILL,
+      nodeFill,
       linkWidth,
       linkStroke,
       arrowSize: this.styleOpts.arrowSize ?? 3 * linkWidth,
       arrowFill: this.styleOpts.arrowFill ?? linkStroke,
       directed: this.styleOpts.directed ?? graph.directed,
       sizeMode: this.styleOpts.sizeMode ?? "world",
+      flowBorder: this.styleOpts.flowBorder ? resolveFlowBorder(graph, this.styleOpts.flowBorder, nodeFill) : null,
     };
   }
 

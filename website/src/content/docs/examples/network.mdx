@@ -137,8 +137,38 @@ net.lodSource; // "modules"
 ```
 
 The provided hierarchy takes priority over structural coarsening; everything else about the cut
-(declutter, `sizeMode`, the on-screen-bounded per-frame work) is unchanged. The map register's
-distinctive **flow-border** nodes and **bent half-arrow** links land in the next steps.
+(declutter, `sizeMode`, the on-screen-bounded per-frame work) is unchanged.
+
+### Flow borders
+
+A node or module reads as a disc whose **fill/size** is its total flow and whose **border ring**
+encodes its **enter/exit flow** — the flow crossing its boundary. `style({ flowBorder })` draws that
+ring: `flow` is a per-node value (your `Float32Array` of enter/exit flow, or a built-in metric like
+`"strength"`), `scale` maps it to ring width (same units as `nodeRadius`), and `color` sets the ring
+colour. d3gl doesn't compute enter/exit flow — you supply it (Infomap gives it), mirroring how the
+module hierarchy and positions are provided.
+
+```ts
+import { scaleSqrt } from "d3-scale";
+
+net.data(graph).style({
+  sizeMode: "screen",
+  nodeFill: "#cdd7ec",
+  nodeRadius: { by: "flow", scale: scaleSqrt().range([3, 22]) }, // size ∝ total flow
+  flowBorder: {
+    flow: enterExitFlow, // Float32Array (length nodeCount), or a metric like "strength"
+    scale: scaleSqrt().range([0, 6]), // → ring width
+    color: "#3b5b9b",
+  },
+});
+```
+
+It composes with everything above: under LOD, a **module's** ring sums its members' flow over the
+same adaptive cut, so a collapsed module shows the boundary flow of its whole subtree, resolving into
+individual nodes as you zoom in. The ring renders in-shader on the WebGL lane and exports to SVG (a
+border disc under a smaller fill disc) for publication at small N.
+
+The map register's **bent half-arrow** links land in the next step.
 
 ## Loading a network from a file
 

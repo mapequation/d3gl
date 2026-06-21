@@ -84,6 +84,13 @@ export interface InstancedCirclesData {
   radii: Float32Array;
   /** RGBA bytes per circle, length `4 * count`. */
   colors: Uint8Array;
+  /**
+   * Optional flow-border ring (#104 N6): per-circle thickness as a fraction of the radius
+   * (`0`/absent ⇒ no ring, a plain filled disc), length `count`.
+   */
+  borders?: Float32Array;
+  /** Optional RGBA ring colour bytes per circle, length `4 * count`. Paired with {@link borders}. */
+  borderColors?: Uint8Array;
   count: number;
 }
 

@@ -74,6 +74,13 @@ export interface LODTree extends LODTopology {
   count: Uint32Array;
   /** Summed leaf importance (default: strength) — drives super-edge weight and declutter priority. */
   weight: Float32Array;
+  /**
+   * Summed leaf flow-border metric (e.g. enter/exit flow) — the raw value a flow border encodes
+   * (#104 N6). Each leaf takes its provided value; each aggregate the sum of its descendants', so a
+   * module's border reflects its members' total. Zero when no border metric is supplied. The draw
+   * scale (value → ring width) is applied at glyph-build time, not stored here.
+   */
+  border: Float32Array;
 }
 
 /**
@@ -160,6 +167,7 @@ function attachGeometry(topo: LODTopology): LODTree {
     radius: new Float32Array(size),
     count: new Uint32Array(size),
     weight: new Float32Array(size),
+    border: new Float32Array(size),
   };
 }
 
@@ -423,6 +431,7 @@ export function lodTreeFromTopology(
     radius: new Float32Array(size),
     count: new Uint32Array(size),
     weight: new Float32Array(size),
+    border: new Float32Array(size),
   };
 }
 
@@ -487,27 +496,38 @@ export function computeLODPositions(tree: LODTree, positions: ArrayLike<number>)
  * thread (and recomputed only when the style's radii change), never per frame.
  *
  * `leafRadii` is the resolved per-node radius; `leafWeight` is the per-leaf importance (typically
- * `graph.strength`) driving super-edge weight and declutter priority.
+ * `graph.strength`) driving super-edge weight and declutter priority. `leafBorder` (optional) is the
+ * per-leaf flow-border metric (e.g. enter/exit flow); each aggregate gets the **sum** of its
+ * descendants' (so a module's border reflects its members' total). Omitted ⇒ `border` stays zero.
  */
-export function computeLODStyle(tree: LODTree, leafRadii: ArrayLike<number>, leafWeight: ArrayLike<number>): void {
-  const { leafCount, levelCount, levelOffset, childOffset, children, radius, weight } = tree;
+export function computeLODStyle(
+  tree: LODTree,
+  leafRadii: ArrayLike<number>,
+  leafWeight: ArrayLike<number>,
+  leafBorder?: ArrayLike<number>,
+): void {
+  const { leafCount, levelCount, levelOffset, childOffset, children, radius, weight, border } = tree;
 
   for (let i = 0; i < leafCount; i++) {
     radius[i] = leafRadii[i]!;
     weight[i] = leafWeight[i]!;
+    border[i] = leafBorder ? leafBorder[i]! : 0;
   }
 
   for (let k = 1; k < levelCount; k++) {
     for (let g = levelOffset[k]!; g < levelOffset[k + 1]!; g++) {
       let sw = 0;
       let sumR2 = 0;
+      let sb = 0;
       for (let p = childOffset[g]!; p < childOffset[g + 1]!; p++) {
         const c = children[p]!;
         sw += weight[c]!;
         sumR2 += radius[c]! * radius[c]!;
+        sb += border[c]!;
       }
       weight[g] = sw;
       radius[g] = Math.sqrt(sumR2); // area-additive: aggregate ink ≈ Σ child ink
+      border[g] = sb; // sum-additive: a module's border metric ≈ Σ member metric
     }
   }
 }
@@ -526,9 +546,10 @@ export function computeLODGeometry(
   graph: NetworkGraph,
   leafRadii: ArrayLike<number>,
   leafWeight: ArrayLike<number> = graph.strength,
+  leafBorder?: ArrayLike<number>,
 ): void {
   computeLODPositions(tree, graph.positions);
-  computeLODStyle(tree, leafRadii, leafWeight);
+  computeLODStyle(tree, leafRadii, leafWeight, leafBorder);
 }
 
 /** Screen-space transform: `screen = world * k + (x, y)` (matches {@link BaseEngine} `ViewTransform`). */

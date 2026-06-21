@@ -78,6 +78,8 @@ export interface NodeStyleResolved {
   /** Per-node radius (world units), length `graph.nodeCount`. Resolved via {@link resolveNodeRadii}. */
   radii: Float32Array;
   fill: string;
+  /** Optional flow-border ring (#104 N6); `null`/absent ⇒ plain filled nodes. */
+  border?: ResolvedFlowBorder | null;
 }
 
 export interface LinkStyleResolved {
@@ -110,13 +112,106 @@ function fillColors(count: number, css: string): Uint8Array {
 }
 
 /**
+ * Flow-border style (#104 N6): a ring around each node/module whose width encodes a per-node flow
+ * (e.g. Infomap enter/exit flow). The app supplies the flow; d3gl renders the ring. For module
+ * aggregates the metric is summed over members (see {@link computeLODStyle}).
+ */
+export interface FlowBorderSpec {
+  /**
+   * Per-node enter/exit flow driving the border width: a caller `Float32Array` (length `nodeCount`)
+   * or a built-in {@link NodeMetric}. Summed over members for module aggregates.
+   */
+  flow: Float32Array | NodeMetric;
+  /** Maps the (summed) flow → ring width in the active `sizeMode`'s units, e.g. `scaleSqrt().range([0, 6])`. */
+  scale: (value: number) => number;
+  /** Ring colour (any CSS colour). Default: a darker shade of the node fill. */
+  color?: string;
+}
+
+/** Resolved {@link FlowBorderSpec}: raw per-node metric + draw scale + ring colour (bytes for WebGL, CSS for export). */
+export interface ResolvedFlowBorder {
+  /** Raw per-node flow metric, length `nodeCount`; sum-aggregated onto the LOD tree for modules. */
+  metric: Float32Array;
+  scale: (value: number) => number;
+  color: [number, number, number, number];
+  colorCss: string;
+}
+
+/**
+ * Resolve a {@link FlowBorderSpec} against a graph. `fallbackColor` (the node fill) defaults the ring
+ * colour to a darker shade. Resolved once per `style()` — never per frame.
+ */
+export function resolveFlowBorder(graph: NetworkGraph, spec: FlowBorderSpec, fallbackColor: string): ResolvedFlowBorder {
+  const n = graph.nodeCount;
+  let metric: Float32Array;
+  if (spec.flow instanceof Float32Array) {
+    if (spec.flow.length !== n) throw new Error(`flowBorder.flow length ${spec.flow.length} !== nodeCount ${n}`);
+    metric = spec.flow;
+  } else {
+    const value = metricAccessor(graph, spec.flow);
+    metric = new Float32Array(n);
+    for (let i = 0; i < n; i++) metric[i] = value(i);
+  }
+  const colorCss = spec.color ?? rgb(fallbackColor).darker(0.8).formatHex();
+  return { metric, scale: spec.scale, color: toRGBA(colorCss), colorCss };
+}
+
+const clamp01 = (x: number): number => (x < 0 ? 0 : x > 1 ? 1 : x);
+
+/**
+ * Per-instance border-ring arrays for a batch of circles: thickness as a fraction of the *drawn*
+ * radius (`scale(value)/radius`, clamped to `[0,1]`) plus a repeated RGBA ring colour.
+ */
+function buildBorders(
+  count: number,
+  radii: ArrayLike<number>,
+  valueOf: (i: number) => number,
+  scale: (v: number) => number,
+  color: [number, number, number, number],
+): { borders: Float32Array; borderColors: Uint8Array } {
+  const borders = new Float32Array(count);
+  const borderColors = new Uint8Array(count * 4);
+  for (let i = 0; i < count; i++) {
+    const r = radii[i]!;
+    borders[i] = r > 0 ? clamp01(scale(valueOf(i)) / r) : 0;
+    borderColors[i * 4] = color[0];
+    borderColors[i * 4 + 1] = color[1];
+    borderColors[i * 4 + 2] = color[2];
+    borderColors[i * 4 + 3] = color[3];
+  }
+  return { borders, borderColors };
+}
+
+/**
+ * Inner-disc radii (`radius − ring width`) for rendering a flow border as two stacked discs (a
+ * border-colour disc under a smaller fill disc) on the SVG/Canvas export path, which has no
+ * per-element ring primitive. `metric` is the raw per-node flow.
+ */
+export function flowBorderInnerRadii(radii: ArrayLike<number>, metric: ArrayLike<number>, scale: (v: number) => number): Float32Array {
+  const n = radii.length;
+  const inner = new Float32Array(n);
+  for (let i = 0; i < n; i++) {
+    const r = radii[i]!;
+    inner[i] = Math.max(0, r - Math.min(r, scale(metric[i]!)));
+  }
+  return inner;
+}
+
+/**
  * Instanced-circle data for a graph's nodes. Shares the graph's positions buffer as the
  * instance centres *and* the resolved per-node `radii` buffer (no copies) — `radii` is already a
- * per-instance GPU attribute, so degree/flow-scaled sizing costs nothing extra at draw time.
+ * per-instance GPU attribute, so degree/flow-scaled sizing costs nothing extra at draw time. With a
+ * resolved {@link ResolvedFlowBorder} it also emits the per-node ring (#104 N6).
  */
 export function nodeCircles(graph: NetworkGraph, style: NodeStyleResolved): InstancedCirclesData {
   const count = graph.nodeCount;
-  return { centers: graph.positions, radii: style.radii, colors: fillColors(count, style.fill), count };
+  const colors = fillColors(count, style.fill);
+  if (style.border) {
+    const { metric, scale, color } = style.border;
+    const { borders, borderColors } = buildBorders(count, style.radii, (i) => metric[i]!, scale, color);
+    return { centers: graph.positions, radii: style.radii, colors, borders, borderColors, count };
+  }
+  return { centers: graph.positions, radii: style.radii, colors, count };
 }
 
 export interface FrontierStyleResolved {
@@ -131,6 +226,11 @@ export interface FrontierStyleResolved {
    * Default unbounded.
    */
   maxAggregateRadius?: number;
+  /**
+   * Optional flow-border ring (#104 N6). Each frontier glyph's ring width comes from the tree's
+   * sum-aggregated `border` metric (a module reflects its members' total); `metric` is ignored here.
+   */
+  border?: ResolvedFlowBorder | null;
 }
 
 /**
@@ -161,6 +261,11 @@ export function frontierCircles(tree: LODTree, frontier: Uint32Array, style: Fro
     colors[i * 4 + 1] = c[1];
     colors[i * 4 + 2] = c[2];
     colors[i * 4 + 3] = c[3];
+  }
+  if (style.border) {
+    const { scale, color } = style.border;
+    const { borders, borderColors } = buildBorders(count, radii, (i) => tree.border[frontier[i]!]!, scale, color);
+    return { centers, radii, colors, borders, borderColors, count };
   }
   return { centers, radii, colors, count };
 }
@@ -295,6 +400,8 @@ export interface ResolvedNetworkStyle {
    * out). Arrowheads are world-only for now (their screen-mode shader is a tracked gap, #103).
    */
   sizeMode: "world" | "screen";
+  /** Flow-border ring (#104 N6), or `null` when disabled (plain filled nodes). */
+  flowBorder: ResolvedFlowBorder | null;
 }
 
 /**
@@ -325,7 +432,7 @@ export function networkLayers(graph: NetworkGraph, style: ResolvedNetworkStyle):
   layers.push({
     name: "nodes",
     primitive: "circles",
-    circles: nodeCircles(graph, { radii: style.nodeRadii, fill: style.nodeFill }),
+    circles: nodeCircles(graph, { radii: style.nodeRadii, fill: style.nodeFill, border: style.flowBorder }),
     sizeMode: style.sizeMode,
   });
   return layers;

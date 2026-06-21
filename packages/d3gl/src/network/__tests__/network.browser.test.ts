@@ -139,4 +139,52 @@ describe("network() engine", () => {
 
     net.destroy();
   });
+
+  it("renders flow-border nodes (N6b) through the WebGL lane + LOD without throwing", async () => {
+    const net = network(host(), { width: 200, height: 200 });
+    await net.whenReady();
+    const g = buildGraph({ nodeCount: 4, source: [0, 2, 1], target: [1, 3, 2], nodeFlow: [0.4, 0.1, 0.3, 0.2] });
+    const modules = [
+      { id: 0, path: [1, 1] }, { id: 1, path: [1, 2] }, { id: 2, path: [2, 1] }, { id: 3, path: [2, 2] },
+    ];
+    net
+      .data(g)
+      .style({
+        sizeMode: "screen",
+        nodeRadius: 10,
+        flowBorder: { flow: "strength", scale: (v) => v, color: "#123456" },
+      })
+      .lod({ modules, expandPx: 48 })
+      .layout({ backend: "positions", positions: new Float32Array([10, 10, 30, 10, 170, 190, 190, 190]) });
+
+    expect(net.lodSource).toBe("modules");
+    // Module aggregates sum their members' border metric (no throw through the frontier glyph).
+    expect(net.setTransform({ k: 0.1, x: 100, y: 100 })).toBe(net);
+    expect(net.setTransform({ k: 30, x: -2900, y: -2900 })).toBe(net);
+    net.destroy();
+  });
+
+  it("exports a flow border to SVG as a border disc under a smaller fill disc (two circles per node)", async () => {
+    const net = network(host(), { width: 200, height: 200, backend: "svg" });
+    await net.whenReady();
+    const g = buildGraph({ nodeCount: 3, source: [0, 1], target: [1, 2] });
+    net
+      .data(g)
+      .style({
+        nodeRadius: 10,
+        nodeFill: "#4878d0",
+        flowBorder: { flow: new Float32Array([4, 4, 4]), scale: (v) => v, color: "#123456" },
+      })
+      .layout({ backend: "positions", positions: new Float32Array([20, 20, 100, 100, 180, 40]) });
+
+    const svg = net.toSVG();
+    // One border disc + one fill disc per node = 6 circles (vs 3 with no flow border).
+    expect((svg.match(/<circle/g) ?? []).length).toBe(6);
+
+    // Disabling the border returns to 3 circles (the node-borders layer clears, not lingers).
+    net.style({ flowBorder: undefined });
+    expect((net.toSVG().match(/<circle/g) ?? []).length).toBe(3);
+
+    net.destroy();
+  });
 });
