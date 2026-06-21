@@ -111,9 +111,13 @@ function symmetricAdjacency(level: CoarseLevel): {
 }
 
 /**
- * One heavy-edge-matching coarsening step: visit nodes in index order, pair each unmatched node
- * with its heaviest unmatched neighbour (lowest index breaks ties → deterministic), and aggregate
- * the surviving inter-group edges (parallel edges summed, internal edges dropped).
+ * One coarsening step. Visit nodes in index order and pair each unmatched node with its heaviest
+ * unmatched neighbour (lowest index breaks ties → deterministic). A node with no unmatched neighbour
+ * is **adopted** into its heaviest already-matched neighbour's group rather than left as a singleton:
+ * without this, hub/star structures (pervasive in power-law graphs) barely shrink — each pass strips
+ * only a couple of nodes, the hierarchy hits its level cap, and the multilevel seed runs dozens of
+ * force solves on near-full graphs (#117). Adoption keeps the per-level reduction roughly geometric.
+ * Then aggregate the surviving inter-group edges (parallel edges summed, internal edges dropped).
  */
 export function coarsenLevel(level: CoarseLevel): { coarse: CoarseLevel; projection: Uint32Array } {
   const { nodeCount, source, target, weight } = level;
@@ -126,20 +130,33 @@ export function coarsenLevel(level: CoarseLevel): { coarse: CoarseLevel; project
     if (assigned[u]) continue;
     let best = -1;
     let bestW = -Infinity;
+    let adopt = -1;
+    let adoptW = -Infinity;
     for (let p = offsets[u]!; p < offsets[u + 1]!; p++) {
       const v = neighbors[p]!;
-      if (assigned[v]) continue;
-      if (w[p]! > bestW) {
-        bestW = w[p]!;
+      const wv = w[p]!;
+      if (assigned[v]) {
+        if (wv > adoptW) {
+          adoptW = wv;
+          adopt = v;
+        }
+      } else if (wv > bestW) {
+        bestW = wv;
         best = v;
       }
     }
-    const cid = coarseCount++;
-    projection[u] = cid;
-    assigned[u] = 1;
     if (best !== -1) {
+      const cid = coarseCount++;
+      projection[u] = cid;
+      assigned[u] = 1;
       projection[best] = cid;
       assigned[best] = 1;
+    } else if (adopt !== -1) {
+      projection[u] = projection[adopt]!; // join an already-matched neighbour's group
+      assigned[u] = 1;
+    } else {
+      projection[u] = coarseCount++; // truly isolated this pass
+      assigned[u] = 1;
     }
   }
 
