@@ -124,16 +124,25 @@ export interface FrontierStyleResolved {
   nodeFill: string;
   /** Fill for aggregate glyphs (collapsed subtrees). */
   aggregateFill: string;
+  /**
+   * Cap (in the layer's size units) on the aggregate draw radius. The tree's area-additive radius
+   * (`√Σ child radius²`) grows without bound for large subtrees — harmless in world units but it
+   * would balloon as pixels in screen `sizeMode`, so aggregates clamp here. Leaves are never capped.
+   * Default unbounded.
+   */
+  maxAggregateRadius?: number;
 }
 
 /**
  * Instanced-circle data for an LOD cut frontier: each frontier node drawn at its tree-resolved
- * {@link LODTree.radius} and centroid, leaves in `nodeFill` and aggregates in `aggregateFill`. The
- * frontier is bounded by the viewport + expand threshold, so this small buffer is cheap to rebuild
- * per pan/zoom frame (the instanced lane reallocates, but only over the visible set, not all of N).
+ * {@link LODTree.radius} and centroid, leaves in `nodeFill` and aggregates in `aggregateFill`
+ * (capped at `maxAggregateRadius`). The frontier is bounded by the viewport + expand threshold, so
+ * this small buffer is cheap to rebuild per pan/zoom frame (the instanced lane reallocates, but only
+ * over the visible set, not all of N).
  */
 export function frontierCircles(tree: LODTree, frontier: Uint32Array, style: FrontierStyleResolved): InstancedCirclesData {
   const count = frontier.length;
+  const maxAgg = style.maxAggregateRadius ?? Infinity;
   const centers = new Float32Array(count * 2);
   const radii = new Float32Array(count);
   const colors = new Uint8Array(count * 4);
@@ -143,8 +152,9 @@ export function frontierCircles(tree: LODTree, frontier: Uint32Array, style: Fro
     const g = frontier[i]!;
     centers[i * 2] = tree.cx[g]!;
     centers[i * 2 + 1] = tree.cy[g]!;
-    radii[i] = tree.radius[g]!;
-    const c = g < tree.leafCount ? leaf : agg;
+    const isLeafNode = g < tree.leafCount;
+    radii[i] = isLeafNode ? tree.radius[g]! : Math.min(tree.radius[g]!, maxAgg);
+    const c = isLeafNode ? leaf : agg;
     colors[i * 4] = c[0];
     colors[i * 4 + 1] = c[1];
     colors[i * 4 + 2] = c[2];
@@ -213,7 +223,7 @@ export function linkArrows(graph: NetworkGraph, style: ArrowStyleResolved): Inst
 
 /** Fully-resolved network style (defaults applied) for assembling the render layers. */
 export interface ResolvedNetworkStyle {
-  /** Per-node radii (world units), length `nodeCount`; resolved via {@link resolveNodeRadii}. */
+  /** Per-node radii, length `nodeCount`; resolved via {@link resolveNodeRadii}. Units follow `sizeMode`. */
   nodeRadii: Float32Array;
   nodeFill: string;
   linkWidth: number;
@@ -221,6 +231,12 @@ export interface ResolvedNetworkStyle {
   arrowSize: number;
   arrowFill: string;
   directed: boolean;
+  /**
+   * `"world"` (default) sizes glyphs in world units (they scale with zoom); `"screen"` sizes them in
+   * constant pixels (the navigation register for large layouts — glyphs don't vanish when zoomed
+   * out). Arrowheads are world-only for now (their screen-mode shader is a tracked gap, #103).
+   */
+  sizeMode: "world" | "screen";
 }
 
 /**
@@ -235,13 +251,15 @@ export function networkLayers(graph: NetworkGraph, style: ResolvedNetworkStyle):
       name: "links",
       primitive: "lines",
       lines: linkLines(graph, { width: style.linkWidth, stroke: style.linkStroke }),
-      sizeMode: "world",
+      sizeMode: style.sizeMode,
     });
     if (style.directed) {
       layers.push({
         name: "arrows",
         primitive: "arrows",
         arrows: linkArrows(graph, { size: style.arrowSize, nodeRadii: style.nodeRadii, fill: style.arrowFill }),
+        // Arrowheads remain world-sized until their screen-mode shader lands (#103); harmless in
+        // world mode, slightly inconsistent in screen mode for directed graphs.
         sizeMode: "world",
       });
     }
@@ -250,7 +268,7 @@ export function networkLayers(graph: NetworkGraph, style: ResolvedNetworkStyle):
     name: "nodes",
     primitive: "circles",
     circles: nodeCircles(graph, { radii: style.nodeRadii, fill: style.nodeFill }),
-    sizeMode: "world",
+    sizeMode: style.sizeMode,
   });
   return layers;
 }

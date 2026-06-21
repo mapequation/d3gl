@@ -21,6 +21,7 @@ export default function Network() {
         },
         { type: "segmented", key: "mode", label: "Links", options: ["Directed", "Undirected"] },
         { type: "segmented", key: "size", label: "Size", options: ["Uniform", "Degree"] },
+        { type: "segmented", key: "coords", label: "Sizing", options: ["World", "Screen"] },
         { type: "segmented", key: "lod", label: "LOD", options: ["Off", "On"] },
         { type: "segmented", key: "seeding", label: "Seeding", options: ["Multilevel", "Cold"] },
       ]}

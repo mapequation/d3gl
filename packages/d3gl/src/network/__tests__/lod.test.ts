@@ -1,5 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { buildLODTree, computeLODGeometry, cut } from "../lod.js";
+import { frontierCircles } from "../glyphs.js";
 import { buildGraph } from "../graph.js";
 
 /**
@@ -83,5 +84,36 @@ describe("cut", () => {
     // World viewport ≈ [5, 20] in x at k=1 → aggregate 4 (centre x=1) is off-screen, only 5 visible.
     const frontier = cut(tree, { k: 1, x: -5, y: 0 }, 15, 200);
     expect(Array.from(frontier)).toEqual([5]);
+  });
+});
+
+describe("frontierCircles", () => {
+  const treeOnLine = () => {
+    const g = buildGraph({ nodeCount: 4, source: [0, 2, 1], target: [1, 3, 2], weight: [2, 2, 1] });
+    g.positions.set([0, 0, 2, 0, 10, 0, 12, 0]);
+    const tree = buildLODTree(g, { minNodes: 2 });
+    computeLODGeometry(tree, g, new Float32Array([4, 4, 4, 4])); // aggregate radius = √32 ≈ 5.657
+    return tree;
+  };
+
+  it("draws leaves and aggregates at their tree radius, with distinct fills", () => {
+    const tree = treeOnLine();
+    const c = frontierCircles(tree, new Uint32Array([0, 4]), { nodeFill: "#ff0000", aggregateFill: "#00ff00" });
+
+    expect(c.count).toBe(2);
+    expect(c.radii[0]).toBeCloseTo(4); // leaf 0
+    expect(c.radii[1]).toBeCloseTo(Math.sqrt(32)); // aggregate 4
+    expect(Array.from(c.colors)).toEqual([255, 0, 0, 255, 0, 255, 0, 255]); // leaf red, aggregate green
+  });
+
+  it("caps aggregate radius (not leaves) at maxAggregateRadius", () => {
+    const tree = treeOnLine();
+    const c = frontierCircles(tree, new Uint32Array([0, 4]), {
+      nodeFill: "#000",
+      aggregateFill: "#000",
+      maxAggregateRadius: 5,
+    });
+    expect(c.radii[0]).toBeCloseTo(4); // leaf uncapped
+    expect(c.radii[1]).toBeCloseTo(5); // aggregate clamped from √32 to 5
   });
 });

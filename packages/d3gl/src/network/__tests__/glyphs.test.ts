@@ -11,6 +11,7 @@ const style = (n: number): ResolvedNetworkStyle => ({
   arrowSize: 3,
   arrowFill: "#999999",
   directed: false,
+  sizeMode: "world",
 });
 
 describe("nodeCircles", () => {
@@ -88,6 +89,14 @@ describe("networkLayers", () => {
     const layers = networkLayers(g, { ...style(1), directed: true });
 
     expect(layers.map((l) => l.name)).toEqual(["nodes"]);
+  });
+
+  it("threads sizeMode to nodes + links; arrows stay world-sized (their screen shader is pending)", () => {
+    const g = buildGraph({ nodeCount: 2, source: [0], target: [1], directed: true });
+    const layers = networkLayers(g, { ...style(2), directed: true, sizeMode: "screen" });
+
+    const bySize = Object.fromEntries(layers.map((l) => [l.name, l.sizeMode]));
+    expect(bySize).toEqual({ links: "screen", arrows: "world", nodes: "screen" });
   });
 });
 

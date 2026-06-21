@@ -32,6 +32,13 @@ export interface NetworkStyle {
   arrowSize?: number;
   /** Arrowhead colour. Default matches linkStroke. */
   arrowFill?: string;
+  /**
+   * `"world"` (default) — glyph sizes are in world units and scale with zoom. `"screen"` — sizes are
+   * constant pixels regardless of zoom: the natural register for navigating a large layout (nodes
+   * stay visible when zoomed out instead of going sub-pixel), and what LOD wants. `nodeRadius` /
+   * `linkWidth` are then read as pixels. (Arrowheads stay world-sized for now, #103.)
+   */
+  sizeMode?: "world" | "screen";
 }
 
 /** How node positions are produced. The worker / GPU backends land in later slices. */
@@ -58,8 +65,10 @@ export interface NetworkLayoutOptions {
  * Level-of-detail (#103): an adaptive hierarchy cut so a large network draws only what's visible.
  * Each pan/zoom re-cuts a retained coarsening tree — dense regions collapse to aggregate glyphs and
  * expand into their members as you zoom in — bounding per-frame work to the visible frontier. Opt-in
- * via {@link Network.lod}; off by default (every node/link drawn). Geometry is (re)built when the
- * layout settles. Requires the WebGL (instanced) backend.
+ * via {@link Network.lod}; off by default (every node/link drawn). The tree's geometry updates as the
+ * layout converges (so LOD helps during the solve, not only after), and the zoom-time path re-cuts
+ * only the visible frontier. Best paired with `style({ sizeMode: "screen" })`. Requires the WebGL
+ * (instanced) backend.
  */
 export interface NetworkLODOptions {
   /**
@@ -70,6 +79,12 @@ export interface NetworkLODOptions {
   expandPx?: number;
   /** Aggregate-glyph fill (any CSS color). Default = `nodeFill`. */
   aggregateFill?: string;
+  /**
+   * Cap on an aggregate glyph's draw radius (in the active `sizeMode`'s units). The tree's
+   * area-additive radius grows with subtree size — fine in world units, but set this (e.g. ~24) in
+   * screen mode so large aggregates stay readable rather than ballooning to hundreds of pixels.
+   */
+  maxAggregateRadius?: number;
   /** Coarsening granularity for the LOD tree (depth / minimum aggregate size). */
   coarsen?: CoarsenOptions;
 }
@@ -104,10 +119,8 @@ export class Network extends BaseEngine {
   private lodOptions: NetworkLODOptions | null = null;
   /** Retained coarsening tree for the current graph (topology built lazily). */
   private lodTree: LODTree | null = null;
-  /** Whether `lodTree`'s geometry reflects settled positions, so the cut may run. */
-  private lodSettled = false;
-  /** Whether the current layout's positions are final (set on settle / static layout). */
-  private positionsReady = false;
+  /** Whether `lodTree` has had its geometry computed at least once, so the cut may run. */
+  private lodHasGeometry = false;
   /** Cached resolved style; invalidated on style()/data() to avoid per-zoom O(n) radii recompute. */
   private resolvedCache: ResolvedNetworkStyle | null = null;
 
@@ -124,17 +137,16 @@ export class Network extends BaseEngine {
     this.graph = graph;
     // New topology + position buffer: drop the retained LOD tree and resolved-style cache.
     this.lodTree = null;
-    this.lodSettled = false;
-    this.positionsReady = false;
+    this.lodHasGeometry = false;
     this.resolvedCache = null;
     return this.rebuild();
   }
 
-  /** Set visual style (node radius/fill now; link/arrow appearance later). */
+  /** Set visual style (node radius/fill/sizeMode; link & arrow appearance). */
   style(style: NetworkStyle): this {
     this.styleOpts = { ...this.styleOpts, ...style };
-    this.resolvedCache = null; // radii/colours changed
-    if (this.lodOptions) this.refreshLODGeometry(); // node radii feed the LOD tree's draw radii
+    this.resolvedCache = null; // radii/colours/sizeMode changed
+    if (this.lodOptions) this.recomputeLODGeometry(); // node radii feed the LOD tree's draw radii
     return this.rebuild();
   }
 
@@ -142,19 +154,17 @@ export class Network extends BaseEngine {
    * Enable (or, with `false`, disable) level-of-detail rendering (#103) — an adaptive hierarchy cut
    * that draws dense regions as aggregate glyphs and expands them into members as you zoom, so
    * per-frame work tracks the visible frontier rather than the whole graph. Requires the WebGL
-   * backend; the tree's geometry is built from the settled layout.
+   * backend. The tree's geometry follows the layout as it converges (re-cut cheaply on zoom).
    */
   lod(options: NetworkLODOptions | false): this {
     if (!options) {
       this.lodOptions = null;
       this.lodTree = null;
-      this.lodSettled = false;
+      this.lodHasGeometry = false;
       return this.rebuild();
     }
     this.lodOptions = options;
-    this.lodSettled = false;
-    this.lodTree = this.graph ? buildLODTree(this.graph, options.coarsen) : null;
-    this.refreshLODGeometry(); // computes now if positions are ready, else defers to settle
+    this.recomputeLODGeometry(); // builds the tree + geometry from whatever positions exist now
     return this.rebuild();
   }
 
@@ -162,14 +172,11 @@ export class Network extends BaseEngine {
   layout(opts: NetworkLayoutOptions): this {
     this.layoutOpts = { ...this.layoutOpts, ...opts };
     if (this.graph) {
-      // Any backend change cancels a running worker layout before re-seeding positions. A fresh
-      // solve invalidates the LOD geometry until it settles again.
+      // Any backend change cancels a running worker layout before re-seeding positions.
       this.stopLayout();
-      this.positionsReady = false;
-      this.lodSettled = false;
       if (opts.backend === "positions" && opts.positions) {
         this.graph.positions.set(opts.positions);
-        this.markPositionsReady(); // caller-supplied coordinates are final immediately
+        this.recomputeLODGeometry(); // caller-supplied coordinates are final immediately
       } else if (opts.backend === "worker") {
         // Off-thread force layout with progressive convergence. The worker can post a frame per
         // tick, so coalesce repaints to one per animation frame (always painting the freshest
@@ -185,11 +192,11 @@ export class Network extends BaseEngine {
           },
           () => this.scheduleLayoutRepaint(),
         );
-        // Build the LOD tree's geometry once positions settle (kept stale-free until then).
+        // Final refresh on settle (the last streamed frame may land before the resolve).
         const handle = this.layoutHandle;
         void handle.settled.then(() => {
           if (this.layoutHandle !== handle) return; // a newer layout superseded this one
-          this.markPositionsReady();
+          this.recomputeLODGeometry();
           this.rebuild();
         });
       } else if (opts.backend === "force") {
@@ -207,19 +214,24 @@ export class Network extends BaseEngine {
             force: opts.force,
           });
         }
-        this.markPositionsReady(); // synchronous solve is done
+        this.recomputeLODGeometry(); // synchronous solve is done
       }
     }
     return this.rebuild();
   }
 
-  /** Coalesce progressive worker frames into at most one repaint per animation frame. */
+  /**
+   * Coalesce progressive worker frames into at most one repaint per animation frame. Each frame the
+   * positions changed, so the LOD geometry is refreshed before the cut — LOD tracks the layout *as
+   * it converges*, not only once settled.
+   */
   private scheduleLayoutRepaint(): void {
     if (this.layoutRepaintRaf) return;
     const raf: (cb: FrameRequestCallback) => number =
       typeof requestAnimationFrame === "function" ? requestAnimationFrame : (cb) => setTimeout(() => cb(0), 16);
     this.layoutRepaintRaf = raf(() => {
       this.layoutRepaintRaf = 0;
+      this.recomputeLODGeometry();
       this.rebuild();
     });
   }
@@ -285,9 +297,9 @@ export class Network extends BaseEngine {
     for (const layer of layers) backend.setInstancedLayer!(layer);
   }
 
-  /** Whether the LOD cut can run (enabled, tree built, geometry reflects settled positions). */
+  /** Whether the LOD cut can run (enabled, tree built, geometry computed at least once). */
   private lodReady(): boolean {
-    return !!(this.lodOptions && this.lodSettled && this.lodTree);
+    return !!(this.lodOptions && this.lodHasGeometry && this.lodTree);
   }
 
   /**
@@ -299,22 +311,22 @@ export class Network extends BaseEngine {
     const circles = frontierCircles(tree, frontier, {
       nodeFill: style.nodeFill,
       aggregateFill: this.lodOptions!.aggregateFill ?? style.nodeFill,
+      maxAggregateRadius: this.lodOptions!.maxAggregateRadius,
     });
-    return [{ name: "nodes", primitive: "circles", circles, sizeMode: "world" }];
+    return [{ name: "nodes", primitive: "circles", circles, sizeMode: style.sizeMode }];
   }
 
-  /** (Re)compute the LOD tree's geometry from the settled layout + current style. No-op if not ready. */
-  private refreshLODGeometry(): void {
-    if (!this.lodOptions || !this.graph || !this.positionsReady) return;
+  /**
+   * (Re)compute the LOD tree's geometry from the *current* positions + style. Called whenever
+   * positions move (every streamed worker frame, a sync solve) or the style's radii change — so LOD
+   * tracks the layout as it converges. No-op when LOD is off. O(tree size); the zoom-time cut does
+   * not call this (it reuses the geometry).
+   */
+  private recomputeLODGeometry(): void {
+    if (!this.lodOptions || !this.graph) return;
     if (!this.lodTree) this.lodTree = buildLODTree(this.graph, this.lodOptions.coarsen);
     computeLODGeometry(this.lodTree, this.graph, this.resolvedStyleCached(this.graph).nodeRadii);
-    this.lodSettled = true;
-  }
-
-  /** Mark the current layout's positions final and refresh any LOD geometry that was waiting on them. */
-  private markPositionsReady(): void {
-    this.positionsReady = true;
-    this.refreshLODGeometry();
+    this.lodHasGeometry = true;
   }
 
   /**
@@ -384,6 +396,7 @@ export class Network extends BaseEngine {
       arrowSize: this.styleOpts.arrowSize ?? 3 * linkWidth,
       arrowFill: this.styleOpts.arrowFill ?? linkStroke,
       directed: this.styleOpts.directed ?? graph.directed,
+      sizeMode: this.styleOpts.sizeMode ?? "world",
     };
   }
 

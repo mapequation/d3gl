@@ -29,10 +29,11 @@ function degreeRadius(graph: NetworkGraph): NodeRadiusSpec {
  * and streams positions back, so the layout **converges progressively on screen** while the UI
  * stays responsive (drag/zoom mid-solve). The Nodes slider scales 10 → 1,000,000 to stress the
  * layout + renderer; the Size toggle switches between a uniform radius and **degree-weighted** node
- * size (a d3 `scaleSqrt` over the degree range), which is free even at 1M nodes. The **LOD** toggle
- * enables the adaptive hierarchy cut: dense regions collapse to aggregate glyphs and expand into
- * their members as you zoom in, so per-frame work tracks the visible frontier. Drag to pan, scroll
- * to zoom.
+ * size (a d3 `scaleSqrt` over the degree range), which is free even at 1M nodes. **Sizing** switches
+ * world units (glyphs scale with zoom) vs **screen** (constant pixels — glyphs stay visible when
+ * zoomed out). The **LOD** toggle enables the adaptive hierarchy cut: dense regions collapse to
+ * aggregate glyphs and expand into their members as you zoom in, so per-frame work tracks the visible
+ * frontier (pair it with screen sizing). Drag to pan, scroll to zoom.
  */
 export const setup: ImperativeSetup = (host, { width, height, backend }) => {
   const net = network(host, { width, height, backend });
@@ -61,11 +62,15 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
           linkWidth: 0.6,
           linkStroke: "#cfd8e6",
           arrowFill: "#9aa7bd",
+          // "Screen" keeps glyphs a constant pixel size while you zoom (they don't vanish when
+          // zoomed out) — the natural register for navigating a large layout, and what LOD wants.
+          sizeMode: options.coords === "Screen" ? "screen" : "world",
         })
         .layout({ backend: "worker", iterations, multilevel })
-        // Enable the adaptive cut (it builds from the settled layout); aggregates draw a touch
-        // lighter than leaves so the two registers read apart.
-        .lod(options.lod === "On" ? { expandPx: 48, aggregateFill: "#7f97c8" } : false);
+        // Enable the adaptive cut: aggregates draw a touch lighter than leaves, capped at 26px so
+        // big collapsed clusters stay readable in screen mode. The cut tracks the layout as it
+        // converges and re-cuts cheaply on zoom.
+        .lod(options.lod === "On" ? { expandPx: 48, aggregateFill: "#7f97c8", maxAggregateRadius: 26 } : false);
     },
   };
 };
