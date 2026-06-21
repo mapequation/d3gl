@@ -113,6 +113,33 @@ net
   .layout({ backend: "worker", iterations }); // …so the worker builds + streams the tree
 ```
 
+### Maps of networks: a provided module hierarchy
+
+When the app already has a **module hierarchy** — e.g. an [Infomap](https://www.mapequation.org/infomap/)
+clustering — pass it as the LOD source instead of letting d3gl coarsen structurally. d3gl does not
+cluster; the tree is computed app-side and handed in, just like externally-provided positions. Modules
+then expand → sub-modules → leaves on zoom through the *same* adaptive cut.
+
+Pass Infomap's JSON `nodes` array straight through: each record's `id` is the node index (aligned with
+`buildGraph`) and `path` is its 1-based module chain (`[2, 1, 3]` = top module 2 → sub-module 1 → the
+node ranked 3).
+
+```ts
+import infomapResult from "./network.json"; // Infomap JSON: { nodes: [{ id, path, flow, … }], … }
+
+net
+  .data(graph)
+  .style({ sizeMode: "screen" })
+  .lod({ modules: infomapResult.nodes, expandPx: 48 })
+  .layout({ backend: "positions", positions });
+
+net.lodSource; // "modules"
+```
+
+The provided hierarchy takes priority over structural coarsening; everything else about the cut
+(declutter, `sizeMode`, the on-screen-bounded per-frame work) is unchanged. The map register's
+distinctive **flow-border** nodes and **bent half-arrow** links land in the next steps.
+
 ## Loading a network from a file
 
 The same engine renders a network parsed from a file. `parseNetwork(text, filename)` dispatches on

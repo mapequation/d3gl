@@ -3,6 +3,7 @@ import { networkLayers, frontierCircles, superEdgeLines, emitNodes, emitLinks, e
 import { ForceLayout, seedPositions, type ForceParams } from "./force.js";
 import { multilevelLayout, type CoarsenOptions } from "./coarsen.js";
 import { buildLODTree, buildSpatialLODTree, computeLODGeometry, computeLODStyle, cut, declutterFrontier, type LODTree, type SpatialLODOptions } from "./lod.js";
+import { buildModuleLODTree, type ModuleNode } from "./modules.js";
 import { startWorkerLayout, type WorkerLayoutHandle } from "./worker-transport.js";
 import type { NetworkGraph } from "./graph.js";
 import type { Backend, InstancedLayer, ViewTransform } from "../core/index.js";
@@ -71,6 +72,17 @@ export interface NetworkLayoutOptions {
  * (instanced) backend.
  */
 export interface NetworkLODOptions {
+  /**
+   * A **provided module hierarchy** (N6 / #104): the LOD tree's source, taking priority over
+   * structural coarsening. Pass Infomap's JSON `nodes` array directly — each record's `id` is the
+   * dense node index (aligned with `buildGraph`) and `path` its 1-based module chain. Modules then
+   * expand → sub-modules → leaves on zoom through the same adaptive cut as coarsening. Records must
+   * cover every node. @see {@link buildModuleLODTree}
+   *
+   * On the `worker` backend the tree is built on the main thread (the worker supplies only positions);
+   * the off-thread module-tree path is a later refinement.
+   */
+  modules?: ArrayLike<ModuleNode>;
   /**
    * Expand threshold (px): an aggregate whose on-screen footprint (`2·extent·k`) reaches this
    * expands into its children; below it it draws as a single glyph. Larger → coarser (fewer, bigger
@@ -147,6 +159,8 @@ export class Network extends BaseEngine {
   private lodWorkerTree: LODTree | null = null;
   /** Whether the current main-thread `lodTree` was built spatially (edge-less quadtree, #103) vs by coarsening. */
   private lodSpatial = false;
+  /** Whether the current `lodTree` was built from a provided module hierarchy (N6 / #104). */
+  private lodModules = false;
   /** True while a worker-LOD run is in flight (launched, not yet settled/stopped) — it will stream the tree. */
   private lodStreaming = false;
   /** Dedup guard for the one-shot deferred main-thread LOD-tree fallback (see {@link scheduleLODFallback}). */
@@ -171,6 +185,7 @@ export class Network extends BaseEngine {
     this.lodTree = null;
     this.lodWorkerTree = null;
     this.lodSpatial = false;
+    this.lodModules = false;
     this.lodHasGeometry = false;
     this.resolvedCache = null;
     return this.rebuild();
@@ -201,6 +216,7 @@ export class Network extends BaseEngine {
       this.lodTree = null;
       this.lodWorkerTree = null;
       this.lodSpatial = false;
+      this.lodModules = false;
       this.lodHasGeometry = false;
       return this.rebuild();
     }
@@ -232,7 +248,11 @@ export class Network extends BaseEngine {
         // Off-thread force layout with progressive convergence. The worker can post a frame per
         // tick, so coalesce repaints to one per animation frame (always painting the freshest
         // positions) to bound main-thread work at large N.
-        const useLod = !!this.lodOptions;
+        //
+        // The worker streams a *coarsening* LOD tree; a provided module hierarchy (N6 / #104) is a
+        // different source the worker doesn't build, so with modules the worker supplies positions
+        // only and the main thread builds the module tree (recomputeLODGeometry, off the worker guard).
+        const useLod = !!this.lodOptions && !this.lodOptions.modules;
         this.lodStreaming = useLod; // the worker will stream the tree; main builds none meanwhile
         const handle: WorkerLayoutHandle = startWorkerLayout(
           this.graph,
@@ -330,16 +350,17 @@ export class Network extends BaseEngine {
   }
 
   /**
-   * Which tree currently drives LOD rendering (#103): `"worker"` when the active tree is the one the
-   * layout worker built and streams (so the main thread does no coarsening or O(N) geometry pass),
-   * `"spatial"` when it's the edge-less quadtree built over the node positions, `"main"` when it's the
-   * coarsening tree built on the main thread (`force`/`positions` backends, the worker fallback, or LOD
-   * enabled after a worker run), or `"none"` when LOD is off or no geometry exists yet. Introspection
-   * for debugging and tests.
+   * Which tree currently drives LOD rendering: `"worker"` when the active tree is the one the layout
+   * worker built and streams (so the main thread does no coarsening or O(N) geometry pass),
+   * `"modules"` when it's a provided module hierarchy (N6 / #104), `"spatial"` when it's the edge-less
+   * quadtree built over the node positions, `"main"` when it's the coarsening tree built on the main
+   * thread (`force`/`positions` backends, the worker fallback, or LOD enabled after a worker run), or
+   * `"none"` when LOD is off or no geometry exists yet. Introspection for debugging and tests.
    */
-  get lodSource(): "worker" | "spatial" | "main" | "none" {
+  get lodSource(): "worker" | "modules" | "spatial" | "main" | "none" {
     if (!this.lodOptions || !this.lodTree || !this.lodHasGeometry) return "none";
     if (this.lodWorkerTree && this.lodTree === this.lodWorkerTree) return "worker";
+    if (this.lodModules) return "modules";
     return this.lodSpatial ? "spatial" : "main";
   }
 
@@ -464,21 +485,30 @@ export class Network extends BaseEngine {
       this.lodHasGeometry = true;
       return;
     }
-    // The worker streams the tree on this backend; don't build one on the main thread (the whole
-    // point of worker-LOD). The settle handler / deferred fallback force a build when no worker
-    // streamed one (a synchronous fallback solve, or LOD toggled on after the run settled).
-    if (this.layoutOpts.backend === "worker" && !forceMain) return;
+    // The worker streams a *coarsening* tree on this backend; don't build one on the main thread (the
+    // whole point of worker-LOD). A provided module hierarchy is the exception — the worker doesn't
+    // build it, so the main thread must (it falls through to the module branch below). The settle
+    // handler / deferred fallback force a build when no worker streamed one.
+    if (this.layoutOpts.backend === "worker" && !this.lodOptions.modules && !forceMain) return;
     if (!this.lodTree) {
-      // Edge-less graphs can't be coarsened (heavy-edge matching needs edges) — build the LOD tree
-      // spatially over the positions instead (#103), so the cut still aggregates + prunes in O(visible)
-      // rather than degenerating to a single flat level. (Its topology depends on the positions, so
-      // it's rebuilt when those change — see the positions backend below + data().)
-      if (this.graph.edgeCount === 0) {
+      // Priority chain (epic #98): provided module hierarchy → structural coarsening → spatial
+      // quadtree fallback. A provided tree (N6 / #104) is position-independent, like coarsening.
+      if (this.lodOptions.modules) {
+        this.lodTree = buildModuleLODTree(this.graph.nodeCount, this.lodOptions.modules);
+        this.lodModules = true;
+        this.lodSpatial = false;
+      } else if (this.graph.edgeCount === 0) {
+        // Edge-less graphs can't be coarsened (heavy-edge matching needs edges) — build the LOD tree
+        // spatially over the positions instead (#103), so the cut still aggregates + prunes in O(visible)
+        // rather than degenerating to a single flat level. (Its topology depends on the positions, so
+        // it's rebuilt when those change — see the positions backend below + data().)
         this.lodTree = buildSpatialLODTree(this.graph.positions, this.graph.nodeCount, this.lodOptions.spatial);
         this.lodSpatial = true;
+        this.lodModules = false;
       } else {
         this.lodTree = buildLODTree(this.graph, this.lodOptions.coarsen);
         this.lodSpatial = false;
+        this.lodModules = false;
       }
     }
     computeLODGeometry(this.lodTree, this.graph, nodeRadii);

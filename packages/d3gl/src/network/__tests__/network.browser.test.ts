@@ -112,4 +112,31 @@ describe("network() engine", () => {
 
     net.destroy();
   });
+
+  it("drives the LOD cut from a provided module hierarchy (N6) across layout order and zoom", async () => {
+    const net = network(host(), { width: 200, height: 200 });
+    await net.whenReady();
+    // Two modules of two nodes each, bridged — Infomap JSON node shape (id + path).
+    const g = buildGraph({ nodeCount: 4, source: [0, 2, 1], target: [1, 3, 2] });
+    const modules = [
+      { id: 0, path: [1, 1], flow: 0.25 },
+      { id: 1, path: [1, 2], flow: 0.25 },
+      { id: 2, path: [2, 1], flow: 0.25 },
+      { id: 3, path: [2, 2], flow: 0.25 },
+    ];
+
+    net
+      .data(g)
+      .style({ sizeMode: "screen" })
+      .lod({ modules, expandPx: 48 })
+      .layout({ backend: "positions", positions: new Float32Array([10, 10, 30, 10, 170, 190, 190, 190]) });
+
+    // The provided hierarchy — not coarsening — drives LOD.
+    expect(net.lodSource).toBe("modules");
+    // Re-cut across zoom: modules collapse when out, expand to leaves when in — no throw.
+    expect(net.setTransform({ k: 0.1, x: 100, y: 100 })).toBe(net);
+    expect(net.setTransform({ k: 30, x: -2900, y: -2900 })).toBe(net);
+
+    net.destroy();
+  });
 });
