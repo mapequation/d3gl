@@ -169,12 +169,13 @@ export interface SuperEdgeStyleResolved {
 }
 
 /**
- * Instanced line data for **super-edges**: a line between two frontier nodes that are same-level
- * neighbours and both present in the frontier (so both survived the cut + declutter). Leaf
- * neighbours come from the graph's CSR (a leaf's global id is its node id); aggregate neighbours from
- * the tree's coarse adjacency. Undirected and deduped (emitted once, for `h > g`). Bounded by the
- * visible frontier — cross-level pairs (a frontier node connected to a region shown at a different
- * LOD level) are omitted for now; same-level covers the common locally-uniform cut.
+ * Instanced line data for **super-edges**: every same-level edge incident to a *visible* frontier
+ * node is drawn — a visible node keeps all its edges, so connections don't vanish when a neighbour
+ * scrolls off-screen or is decluttered away (the edge is drawn toward the neighbour's position).
+ * When both endpoints are visible the edge is deduped (`g < h`); when only one is visible it is drawn
+ * once from the visible side. Leaf neighbours come from the graph CSR (a leaf's global id is its node
+ * id); aggregate neighbours from the tree's coarse adjacency. Cross-level pairs (a node linked to a
+ * region shown at a different LOD level) are approximated to the neighbour's centroid for now.
  */
 export function superEdgeLines(
   graph: NetworkGraph,
@@ -190,21 +191,15 @@ export function superEdgeLines(
   const { offsets, neighbors } = graph.csr;
   for (let i = 0; i < frontier.length; i++) {
     const g = frontier[i]!;
-    if (g < tree.leafCount) {
-      for (let p = offsets[g]!; p < offsets[g + 1]!; p++) {
-        const h = neighbors[p]!;
-        if (h > g && present[h]) {
-          a.push(g);
-          b.push(h);
-        }
-      }
-    } else {
-      for (let p = tree.edgeOffset[g]!; p < tree.edgeOffset[g + 1]!; p++) {
-        const h = tree.edgeNeighbors[p]!;
-        if (h > g && present[h]) {
-          a.push(g);
-          b.push(h);
-        }
+    const leaf = g < tree.leafCount;
+    const from = leaf ? offsets[g]! : tree.edgeOffset[g]!;
+    const to = leaf ? offsets[g + 1]! : tree.edgeOffset[g + 1]!;
+    for (let p = from; p < to; p++) {
+      const h = leaf ? neighbors[p]! : tree.edgeNeighbors[p]!;
+      // Both visible → emit once (from the smaller id). Neighbour hidden → emit from the visible g.
+      if (present[h] ? g < h : true) {
+        a.push(g);
+        b.push(h);
       }
     }
   }

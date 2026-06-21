@@ -322,7 +322,11 @@ export class Network extends BaseEngine {
    */
   private lodLayers(tree: LODTree, style: ResolvedNetworkStyle): InstancedLayer[] {
     const opts = this.lodOptions!;
-    let frontier = cut(tree, this.transform, this.width, this.height, { expandPx: opts.expandPx });
+    let frontier = cut(tree, this.transform, this.width, this.height, {
+      expandPx: opts.expandPx,
+      screenSized: style.sizeMode === "screen",
+      maxAggregateRadius: opts.maxAggregateRadius,
+    });
     if (opts.declutter !== false) {
       frontier = declutterFrontier(tree, frontier, this.transform, this.width, this.height, {
         screenSized: style.sizeMode === "screen",

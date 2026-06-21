@@ -236,6 +236,10 @@ export interface CutOptions {
    * (fewer, bigger glyphs); smaller → finer. Default 48.
    */
   expandPx?: number;
+  /** True when glyphs are screen-pixel sized; converts the per-node draw radius to world for the cull margin. */
+  screenSized?: boolean;
+  /** Aggregate draw-radius cap (matches rendering), so the cull margin reflects the drawn size. */
+  maxAggregateRadius?: number;
 }
 
 const DEFAULT_EXPAND_PX = 48;
@@ -253,8 +257,15 @@ export function cut(
   height: number,
   opts: CutOptions = {},
 ): Uint32Array {
-  const { leafCount, levelCount, levelOffset, childOffset, children, cx, cy, extent } = tree;
+  const { leafCount, levelCount, levelOffset, childOffset, children, cx, cy, extent, radius } = tree;
   const expandPx = opts.expandPx ?? DEFAULT_EXPAND_PX;
+  const maxAgg = opts.maxAggregateRadius ?? Infinity;
+  // Per-node draw radius in world units, so a glyph stays until its *whole body* leaves the viewport
+  // (not just its centre) — no popping at the screen edge when zoomed in.
+  const drawMargin = (g: number): number => {
+    const r = g < leafCount ? radius[g]! : Math.min(radius[g]!, maxAgg);
+    return opts.screenSized ? r / t.k : r;
+  };
 
   // Visible world rectangle (inverse of screen = world·k + translate).
   const ax = (0 - t.x) / t.k;
@@ -276,8 +287,10 @@ export function cut(
     const ext = extent[g]!;
     const gx = cx[g]!;
     const gy = cy[g]!;
-    // Cull: the node's bounding box is entirely outside the viewport.
-    if (gx + ext < minX || gx - ext > maxX || gy + ext < minY || gy - ext > maxY) continue;
+    // Cull only when the node's drawn body (bbox grown by its draw radius) misses the viewport, so a
+    // glyph stays until its whole body is off-screen.
+    const m = ext + drawMargin(g);
+    if (gx + m < minX || gx - m > maxX || gy + m < minY || gy - m > maxY) continue;
     if (g < leafCount) {
       frontier.push(g); // a real leaf — nothing finer to expand into
       continue;

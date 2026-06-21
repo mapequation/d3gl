@@ -82,11 +82,19 @@ describe("cut", () => {
     expect(Array.from(frontier).sort((a, b) => a - b)).toEqual([0, 1, 2, 3]);
   });
 
-  it("culls subtrees whose bounding box misses the viewport", () => {
-    const tree = treeOnLine();
-    // World viewport ≈ [5, 20] in x at k=1 → aggregate 4 (centre x=1) is off-screen, only 5 visible.
-    const frontier = cut(tree, { k: 1, x: -5, y: 0 }, 15, 200);
+  it("culls a subtree only once its whole drawn body misses the viewport", () => {
+    const tree = treeOnLine(); // aggregate 4 at x=1, extent 1, draw radius √32 ≈ 5.66 → body ≈ [-5.66, 7.66]
+    // Viewport world x = [10, 25]: aggregate 4's body (max ≈ 7.66) is fully left of it → culled.
+    const frontier = cut(tree, { k: 1, x: -10, y: 0 }, 15, 200);
     expect(Array.from(frontier)).toEqual([5]);
+  });
+
+  it("keeps a node whose centre is off-screen while its draw radius still pokes in", () => {
+    const tree = treeOnLine();
+    // Viewport world x = [5, 20]: aggregate 4's centre (x=1) is off-screen, but its body (max ≈ 7.66)
+    // overlaps → kept (no popping at the edge).
+    const frontier = cut(tree, { k: 1, x: -5, y: 0 }, 15, 200);
+    expect(Array.from(frontier).sort((a, b) => a - b)).toEqual([4, 5]);
   });
 });
 
@@ -202,14 +210,20 @@ describe("superEdgeLines", () => {
     expect(lines.count).toBe(3); // edges (0,1), (1,2), (2,3)
   });
 
-  it("links aggregate neighbours via the coarse adjacency, and skips edges to absent nodes", () => {
+  it("links aggregate neighbours via the coarse adjacency (deduped when both visible)", () => {
     const { g, tree } = make();
     const both = superEdgeLines(g, tree, new Uint32Array([4, 5]), { width: 1, stroke: "#000" });
-    expect(both.count).toBe(1); // the bridge between the two aggregates
+    expect(both.count).toBe(1); // the bridge between the two aggregates, emitted once
     expect(Array.from(both.sources.slice(0, 2))).toEqual([1, 0]); // centroid of aggregate 4
     expect(Array.from(both.targets.slice(0, 2))).toEqual([11, 0]); // centroid of aggregate 5
+  });
 
+  it("keeps a visible node's edge to an off-screen / absent neighbour (drawn toward its position)", () => {
+    const { g, tree } = make();
+    // Only aggregate 4 is visible; neighbour 5 is absent, but the edge is still drawn from 4 to 5.
     const one = superEdgeLines(g, tree, new Uint32Array([4]), { width: 1, stroke: "#000" });
-    expect(one.count).toBe(0); // neighbour 5 absent from the frontier
+    expect(one.count).toBe(1);
+    expect(Array.from(one.sources.slice(0, 2))).toEqual([1, 0]); // aggregate 4
+    expect(Array.from(one.targets.slice(0, 2))).toEqual([11, 0]); // toward absent aggregate 5's centroid
   });
 });
