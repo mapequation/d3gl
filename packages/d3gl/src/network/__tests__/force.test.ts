@@ -32,6 +32,31 @@ describe("ForceLayout", () => {
 
     expect(Array.from(g.positions).every((v) => Number.isFinite(v))).toBe(true);
   });
+
+  it("stays finite and bounded on a large near-coincident cluster (softening + step clamp)", () => {
+    // A 256-node hub star seeded in a sub-pixel disc: without softening the repulsion ~ 1/d² is
+    // enormous and (with the old same-direction coincidence hack) velocities ran away to ±∞ → NaN,
+    // which cascaded through the multilevel coarse solves (#118).
+    const n = 256;
+    const source: number[] = [];
+    const target: number[] = [];
+    for (let i = 1; i < n; i++) {
+      source.push(0);
+      target.push(i);
+    }
+    const g = buildGraph({ nodeCount: n, source, target });
+    for (let i = 0; i < n; i++) {
+      const a = i * 2.39996323;
+      g.positions[i * 2] = 1e-3 * Math.cos(a);
+      g.positions[i * 2 + 1] = 1e-3 * Math.sin(a);
+    }
+
+    new ForceLayout(g).run(100);
+
+    const xs = Array.from(g.positions);
+    expect(xs.every((v) => Number.isFinite(v))).toBe(true); // no NaN/∞
+    expect(Math.max(...xs.map((v) => Math.abs(v)))).toBeLessThan(1e5); // no runaway drift
+  });
 });
 
 describe("seedPositions", () => {

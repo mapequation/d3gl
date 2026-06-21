@@ -1,7 +1,9 @@
 import { describe, it, expect } from "vitest";
 import { BarnesHutTree } from "../quadtree.js";
 
-/** Direct O(n²) repulsion on node `i` — the ground truth a θ=0 tree must reproduce. */
+const SOFTENING = 1e-2; // mirrors quadtree.ts: f = rep / (d² + SOFTENING)
+
+/** Direct O(n²) softened repulsion on node `i` — the ground truth a θ=0 tree must reproduce. */
 function directForce(pos: Float32Array, n: number, i: number, rep: number): [number, number] {
   let fx = 0;
   let fy = 0;
@@ -9,15 +11,10 @@ function directForce(pos: Float32Array, n: number, i: number, rep: number): [num
   const yi = pos[i * 2 + 1]!;
   for (let j = 0; j < n; j++) {
     if (j === i) continue;
-    let dx = xi - pos[j * 2]!;
-    let dy = yi - pos[j * 2 + 1]!;
-    let d2 = dx * dx + dy * dy;
-    if (d2 < 1e-6) {
-      dx = 1e-3;
-      dy = 0;
-      d2 = 1e-6;
-    }
-    const f = rep / d2;
+    const dx = xi - pos[j * 2]!;
+    const dy = yi - pos[j * 2 + 1]!;
+    const d2 = dx * dx + dy * dy;
+    const f = rep / (d2 + SOFTENING);
     fx += f * dx;
     fy += f * dy;
   }
