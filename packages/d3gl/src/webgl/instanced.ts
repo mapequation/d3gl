@@ -1,6 +1,6 @@
 import { Model } from "@luma.gl/engine";
 import type { Buffer, Device, RenderPass } from "@luma.gl/core";
-import { INSTANCED_CIRCLE_VS, INSTANCED_LINE_VS, INSTANCED_ARROW_VS, POINT_FS, FILL_FS } from "./shaders.js";
+import { INSTANCED_CIRCLE_VS, INSTANCED_CIRCLE_FS, INSTANCED_LINE_VS, INSTANCED_ARROW_VS, POINT_FS, FILL_FS } from "./shaders.js";
 import { clipFromView } from "./transform.js";
 import type { InstancedCirclesData, InstancedLinesData, InstancedArrowsData } from "../core/index.js";
 
@@ -35,6 +35,8 @@ export class InstancedCircles {
   private center: Buffer;
   private radius: Buffer;
   private color: Buffer;
+  private border: Buffer;
+  private borderColor: Buffer;
   private uniforms: Record<string, unknown>;
 
   constructor(device: Device, data: InstancedCirclesData, width = 0, height = 0) {
@@ -43,6 +45,10 @@ export class InstancedCircles {
     this.center = device.createBuffer({ data: data.centers });
     this.radius = device.createBuffer({ data: data.radii });
     this.color = device.createBuffer({ data: data.colors });
+    // Flow-border ring (#104 N6), optional: a per-instance thickness fraction + colour. Absent ⇒
+    // zero-filled, so a_border = 0 and the shader draws a plain filled disc (unchanged appearance).
+    this.border = device.createBuffer({ data: data.borders ?? new Float32Array(data.count) });
+    this.borderColor = device.createBuffer({ data: data.borderColors ?? new Uint8Array(data.count * 4) });
     this.uniforms = {
       u_transform: clipFromView({ k: 1, x: 0, y: 0 }, width || 1, height || 1),
       u_screen: 0,
@@ -50,18 +56,22 @@ export class InstancedCircles {
     };
     this.model = new Model(device, {
       vs: INSTANCED_CIRCLE_VS,
-      fs: POINT_FS,
+      fs: INSTANCED_CIRCLE_FS,
       bufferLayout: [
         { name: "a_corner", format: "float32x2" },
         { name: "a_center", format: "float32x2", stepMode: "instance" },
         { name: "a_radius", format: "float32", stepMode: "instance" },
         { name: "a_color", format: "unorm8x4", stepMode: "instance" },
+        { name: "a_border", format: "float32", stepMode: "instance" },
+        { name: "a_borderColor", format: "unorm8x4", stepMode: "instance" },
       ],
       attributes: {
         a_corner: this.corner,
         a_center: this.center,
         a_radius: this.radius,
         a_color: this.color,
+        a_border: this.border,
+        a_borderColor: this.borderColor,
       },
       uniforms: this.uniforms,
       parameters: BLEND,
@@ -90,6 +100,8 @@ export class InstancedCircles {
     this.center.destroy();
     this.radius.destroy();
     this.color.destroy();
+    this.border.destroy();
+    this.borderColor.destroy();
   }
 }
 

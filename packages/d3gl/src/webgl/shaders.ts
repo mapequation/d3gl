@@ -174,16 +174,40 @@ in vec2 a_corner;           // per-vertex unit-quad corner in [-1, 1]
 in vec2 a_center;           // per-instance world centre
 in float a_radius;          // per-instance radius
 in vec4 a_color;            // per-instance RGBA (unorm8x4 -> 0..1)
+in float a_border;          // per-instance ring thickness as a fraction of radius (0 = no ring)
+in vec4 a_borderColor;      // per-instance ring RGBA (unorm8x4 -> 0..1)
 out vec4 v_color;
 out vec2 v_local;
+out float v_border;
+out vec4 v_borderColor;
 void main() {
   v_color = a_color;
   v_local = a_corner;
+  v_border = a_border;
+  v_borderColor = a_borderColor;
   vec3 c = u_transform * vec3(a_center, 1.0);
   vec2 off = (u_screen > 0.5)
     ? a_corner * a_radius * vec2(2.0 / u_viewport.x, -2.0 / u_viewport.y)
     : (u_transform * vec3(a_center + a_corner * a_radius, 1.0)).xy - c.xy;
   gl_Position = vec4(c.xy + off, 0.0, 1.0);
+}`;
+
+// INSTANCED_CIRCLE_FS — flow-border circle (#104 N6): a filled disc with an optional outer ring.
+// `v_border` is the ring thickness as a fraction of the radius; fragments in the outer annulus
+// (r > 1 - border) take the border colour, the rest the fill. border = 0 ⇒ a plain filled disc
+// (so every existing circle layer renders exactly as before). Kept separate from the shared POINT_FS
+// (which PT_POINT_VS also uses) since it reads the extra ring varyings.
+export const INSTANCED_CIRCLE_FS = `#version 300 es
+precision highp float;
+in vec4 v_color;
+in vec2 v_local;
+in float v_border;
+in vec4 v_borderColor;
+out vec4 fragColor;
+void main() {
+  float r = length(v_local);
+  if (r > 1.0) discard;
+  fragColor = (v_border > 0.0 && r > 1.0 - v_border) ? v_borderColor : v_color;
 }`;
 
 // INSTANCED_LINE_VS — true GPU-instanced "path-strip" lines for the network lane (#100).
