@@ -271,10 +271,11 @@ export interface DeclutterOptions {
 
 /**
  * Thin an LOD frontier in screen space: keep higher-importance glyphs (by tree {@link LODTree.weight}
- * = strength) and drop lower-importance ones whose centre falls within a kept glyph's on-screen
- * radius. Greedy in descending importance over a uniform screen grid (cell = max glyph radius), so a
- * dense cluster keeps its most important members and overdraw is bounded. Runs per cut, so it's
- * zoom-dependent — more glyphs resolve as you zoom in. Returns the kept frontier ids (original order).
+ * = strength) and drop lower-importance ones that would **overlap** a kept glyph (centre distance <
+ * sum of the two radii). Greedy in descending importance over a uniform screen grid, so a dense
+ * cluster keeps its most important members and the kept set is overlap-free (no overdraw). Runs per
+ * cut, so it's zoom-dependent — more glyphs resolve as you zoom in. Returns the kept frontier ids
+ * (original order).
  */
 export function declutterFrontier(
   tree: LODTree,
@@ -308,9 +309,10 @@ export function declutterFrontier(
   const order = Array.from({ length: F }, (_, i) => i);
   order.sort((a, b) => tree.weight[frontier[b]!]! - tree.weight[frontier[a]!]!);
 
-  // Uniform grid with cell = the largest exclusion radius, so any colliding kept glyph is in the
-  // 3×3 neighbourhood. Intrusive linked list of kept glyphs per cell (no per-cell allocation).
-  const cell = Math.max(maxR * spacing, 1);
+  // Uniform grid sized so any overlapping pair (centre distance < spacing·(rᵢ+rⱼ) ≤ 2·spacing·maxR)
+  // lands within the 3×3 neighbourhood. Intrusive linked list of kept glyphs per cell (no per-cell
+  // allocation).
+  const cell = Math.max(2 * maxR * spacing, 1);
   const cols = Math.floor(width / cell) + 3;
   const rows = Math.floor(height / cell) + 3;
   const head = new Int32Array(cols * rows).fill(-1);
@@ -333,7 +335,7 @@ export function declutterFrontier(
         for (let p = head[gy * cols + gx]!; p !== -1; p = next[p]!) {
           const dx = px[p]! - x;
           const dy = py[p]! - y;
-          const thresh = spacing * Math.max(r, pr[p]!);
+          const thresh = spacing * (r + pr[p]!); // circles must not overlap
           if (dx * dx + dy * dy < thresh * thresh) {
             occluded = true;
             break;

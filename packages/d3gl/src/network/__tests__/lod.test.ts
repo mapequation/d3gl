@@ -141,11 +141,45 @@ describe("declutterFrontier", () => {
 
   it("keeps every glyph when nothing overlaps", () => {
     const tree = treeOnLine();
-    // The two aggregates sit at x = 1 and x = 11 (gap 10) with radius √32 ≈ 5.66 → no overlap.
-    const kept = declutterFrontier(tree, new Uint32Array([4, 5]), { k: 1, x: 0, y: 0 }, 200, 200, {
+    // Aggregates at x = 1 and x = 11, radius √32 ≈ 5.66 (sum ≈ 11.3). At k = 2 their screen centres
+    // are 20px apart (> 11.3) so they don't overlap → both kept. (Screen-sized radius stays constant.)
+    const kept = declutterFrontier(tree, new Uint32Array([4, 5]), { k: 2, x: 0, y: 0 }, 200, 200, {
       screenSized: true,
-      k: 1,
+      k: 2,
     });
     expect(Array.from(kept).sort((a, b) => a - b)).toEqual([4, 5]);
+  });
+
+  it("keeps kept glyphs overlap-free (no overdraw) on a dense cluster", () => {
+    // 16 leaves packed in a small box, radius 4 each; declutter must leave a non-overlapping subset.
+    const N = 16;
+    const source: number[] = [];
+    const target: number[] = [];
+    for (let i = 1; i < N; i++) {
+      source.push(0);
+      target.push(i); // star so they coarsen into one tree
+    }
+    const g = buildGraph({ nodeCount: N, source, target });
+    for (let i = 0; i < N; i++) {
+      g.positions[i * 2] = (i % 4) * 3; // 4×4 grid, 3px spacing ⇒ heavy overlap at radius 4
+      g.positions[i * 2 + 1] = Math.floor(i / 4) * 3;
+    }
+    const tree = buildLODTree(g, { minNodes: 2 });
+    computeLODGeometry(tree, g, new Float32Array(N).fill(4));
+    const frontier = Uint32Array.from({ length: N }, (_, i) => i);
+
+    const kept = declutterFrontier(tree, frontier, { k: 1, x: 0, y: 0 }, 200, 200, { screenSized: true, k: 1 });
+
+    expect(kept.length).toBeLessThan(N); // some dropped
+    for (let a = 0; a < kept.length; a++) {
+      for (let b = a + 1; b < kept.length; b++) {
+        const ga = kept[a]!;
+        const gb = kept[b]!;
+        const dx = tree.cx[ga]! - tree.cx[gb]!;
+        const dy = tree.cy[ga]! - tree.cy[gb]!;
+        const dist = Math.hypot(dx, dy);
+        expect(dist).toBeGreaterThanOrEqual(tree.radius[ga]! + tree.radius[gb]! - 1e-6); // no overlap
+      }
+    }
   });
 });
