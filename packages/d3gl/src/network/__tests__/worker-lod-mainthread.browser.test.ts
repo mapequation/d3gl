@@ -65,4 +65,32 @@ describe("worker-LOD source selection (#103)", () => {
     net.destroy();
     host.remove();
   });
+
+  it("uses the spatial quadtree for an edge-less point cloud (#103)", async () => {
+    const { net, host } = makeNet();
+    await net.whenReady();
+
+    // An edge-less graph can't be coarsened, so LOD falls back to a spatial quadtree over positions.
+    const N = 3000;
+    const r = (() => {
+      let s = 11 >>> 0;
+      return () => ((s = (s * 1664525 + 1013904223) >>> 0) / 4294967296);
+    })();
+    const positions = new Float32Array(N * 2);
+    for (let i = 0; i < N; i++) {
+      positions[i * 2] = r() * 500;
+      positions[i * 2 + 1] = r() * 500;
+    }
+    const g = buildGraph({ nodeCount: N, source: [], target: [] });
+
+    net.data(g).style({ sizeMode: "screen" }).lod({ expandPx: 48 }).layout({ backend: "positions", positions });
+    expect(net.lodSource).toBe("spatial");
+
+    // Pan/zoom re-cuts the spatial tree (O(visible)) without rebuilding or throwing.
+    net.setTransform({ k: 4, x: 30, y: -20 });
+    expect(net.lodSource).toBe("spatial");
+
+    net.destroy();
+    host.remove();
+  });
 });

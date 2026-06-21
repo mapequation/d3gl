@@ -1,6 +1,7 @@
 import { describe, it, expect } from "vitest";
 import {
   buildLODTree,
+  buildSpatialLODTree,
   computeLODGeometry,
   computeLODPositions,
   computeLODStyle,
@@ -377,5 +378,98 @@ describe("superEdgeLines", () => {
     expect(one.count).toBe(1);
     expect(Array.from(one.sources.slice(0, 2))).toEqual([1, 0]); // aggregate 4
     expect(Array.from(one.targets.slice(0, 2))).toEqual([11, 0]); // toward absent aggregate 5's centroid
+  });
+});
+
+describe("buildSpatialLODTree (#103 edge-less point clouds)", () => {
+  // Deterministic LCG → reproducible clouds without Math.random.
+  function rng(seed: number) {
+    let s = seed >>> 0;
+    return () => ((s = (s * 1664525 + 1013904223) >>> 0) / 4294967296);
+  }
+  function cloud(n: number, span = 1000, seed = 3) {
+    const r = rng(seed);
+    const pos = new Float32Array(n * 2);
+    for (let i = 0; i < n; i++) {
+      pos[i * 2] = r() * span;
+      pos[i * 2 + 1] = r() * span;
+    }
+    return pos;
+  }
+
+  it("builds a multi-level quadtree whose leaves are the points (4 corners → 4 quadrants under a root)", () => {
+    const pos = Float32Array.from([0, 0, 10, 0, 0, 10, 10, 10]); // one point per quadrant
+    const tree = buildSpatialLODTree(pos, 4);
+
+    expect(tree.leafCount).toBe(4);
+    expect(tree.levelCount).toBe(3); // points (0), four 1-point cells (1), root (2)
+    expect(tree.size).toBe(9); // 4 points + 4 leaf cells + 1 root
+    expect(Array.from(tree.levelOffset)).toEqual([0, 4, 8, 9]);
+    // the single root (coarsest level) has all four points as descendants
+    const root = tree.size - 1;
+    computeLODPositions(tree, pos);
+    computeLODStyle(tree, new Float32Array(4).fill(2), new Float32Array(4));
+    expect(tree.count[root]).toBe(4);
+    expect(tree.cx[root]).toBeCloseTo(5);
+    expect(tree.cy[root]).toBeCloseTo(5);
+  });
+
+  it("aggregates geometry: a cell's centroid/count come from its descendant points", () => {
+    const pos = Float32Array.from([0, 0, 10, 0, 0, 10, 10, 10]);
+    const tree = buildSpatialLODTree(pos, 4);
+    computeLODPositions(tree, pos);
+    computeLODStyle(tree, new Float32Array(4).fill(2), new Float32Array(4));
+    // every point is a leaf at its own position, count 1, extent 0
+    for (let i = 0; i < 4; i++) {
+      expect(tree.count[i]).toBe(1);
+      expect(tree.extent[i]).toBe(0);
+      expect(tree.cx[i]).toBeCloseTo(pos[i * 2]!);
+    }
+    // the root aggregates all four (area-additive radius √(4·2²) = 4)
+    const root = tree.size - 1;
+    expect(tree.radius[root]).toBeCloseTo(Math.sqrt(4 * 4));
+  });
+
+  it("expandPx collapses the frontier toward the root aggregates, and viewport culling bounds it", () => {
+    const N = 8000;
+    const pos = cloud(N);
+    const tree = buildSpatialLODTree(pos, N);
+    computeLODPositions(tree, pos);
+    computeLODStyle(tree, new Float32Array(N).fill(3), new Float32Array(N));
+
+    const W = 1000, H = 1000;
+    const kOut = (0.9 * W) / 1000; // whole cloud framed
+    const viewOut = { k: kOut, x: W / 2 - 500 * kOut, y: H / 2 - 500 * kOut };
+
+    // The detail knob: a coarser threshold draws strictly fewer glyphs (deterministic, density-free).
+    const fine = cut(tree, viewOut, W, H, { expandPx: 4 }).length;
+    const mid = cut(tree, viewOut, W, H, { expandPx: 64 }).length;
+    const coarse = cut(tree, viewOut, W, H, { expandPx: 1e9 }).length; // nothing expands → root only
+    expect(fine).toBeGreaterThan(mid);
+    expect(mid).toBeGreaterThan(coarse);
+    const rootCount = tree.size - tree.levelOffset[tree.levelCount - 1]!;
+    expect(coarse).toBeLessThanOrEqual(rootCount);
+    expect(coarse).toBeLessThan(N / 50); // a handful of glyphs for thousands of points
+
+    // Viewport culling: zoom 6× into the centre → most points scroll off-screen and are culled.
+    const kIn = kOut * 6;
+    const viewIn = { k: kIn, x: W / 2 - 500 * kIn, y: H / 2 - 500 * kIn };
+    const inn = cut(tree, viewIn, W, H, { expandPx: 48 });
+    expect(inn.length).toBeGreaterThan(0);
+    expect(inn.length).toBeLessThan(N / 2);
+  });
+
+  it("handles coincident points (bucketed, not infinite recursion) and tiny inputs", () => {
+    const coincident = new Float32Array(200); // 100 points all at (0,0)
+    const tree = buildSpatialLODTree(coincident, 100);
+    computeLODPositions(tree, coincident);
+    computeLODStyle(tree, new Float32Array(100).fill(1), new Float32Array(100));
+    const root = tree.size - 1;
+    expect(tree.count[root]).toBe(100); // all 100 accounted for
+
+    const single = buildSpatialLODTree(Float32Array.from([5, 5]), 1);
+    expect(single.levelCount).toBe(1);
+    expect(single.size).toBe(1);
+    expect(buildSpatialLODTree(new Float32Array(0), 0).size).toBe(0);
   });
 });

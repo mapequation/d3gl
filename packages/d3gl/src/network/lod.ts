@@ -173,6 +173,236 @@ export function buildLODTree(graph: NetworkGraph, coarsen?: CoarsenOptions): LOD
   return attachGeometry(flattenHierarchyToTopology(buildHierarchy(graph, coarsen), graph.nodeCount));
 }
 
+export interface SpatialLODOptions {
+  /**
+   * Safety cap on quadtree depth. Cells stop subdividing here and bucket their points, so
+   * coincident / near-coincident points can't recurse forever. Default 24.
+   */
+  maxDepth?: number;
+}
+
+const SPATIAL_MAX_DEPTH = 24;
+
+/**
+ * Build a {@link LODTree} from a point cloud's positions alone — a spatial **quadtree** used as the
+ * LOD hierarchy when there are no edges to coarsen (#103). The structural coarsening tree needs edges
+ * (heavy-edge matching), so an edge-less graph would otherwise yield a single-level tree whose
+ * {@link cut} degenerates to O(N) per frame with no aggregation; the quadtree restores hierarchical
+ * culling (O(visible)) and zoom-out aggregation.
+ *
+ * Leaves are the points (global ids `[0, count)`); each quadtree cell is an aggregate whose children
+ * are its points (a bottom cell) or its sub-cells. Cells are bucketed into {@link LODTopology} levels
+ * by **height** (1 + the deepest child's height), so the existing {@link cut} /
+ * {@link computeLODGeometry} / {@link declutterFrontier} all work unchanged. There are no super-edges
+ * (the `edge*` arrays are empty). Geometry is left zeroed — fill it with {@link computeLODGeometry}.
+ *
+ * Generic over any positions buffer (not network-specific), so the same point-cloud LOD can back
+ * other engines later (`plot.points()` / map scatter, #108).
+ */
+export function buildSpatialLODTree(positions: ArrayLike<number>, count: number, opts: SpatialLODOptions = {}): LODTree {
+  const maxDepth = opts.maxDepth ?? SPATIAL_MAX_DEPTH;
+  // ≤ 1 point: nothing to aggregate — a single-level tree of just the points.
+  if (count <= 1) {
+    return attachGeometry({
+      size: count,
+      leafCount: count,
+      levelCount: 1,
+      levelOffset: Uint32Array.from([0, count]),
+      childOffset: new Uint32Array(count + 1),
+      children: new Uint32Array(0),
+      edgeOffset: new Uint32Array(count + 1),
+      edgeNeighbors: new Uint32Array(0),
+    });
+  }
+
+  // Root bounding square over all points.
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+  for (let i = 0; i < count; i++) {
+    const x = positions[i * 2]!;
+    const y = positions[i * 2 + 1]!;
+    if (x < minX) minX = x;
+    if (x > maxX) maxX = x;
+    if (y < minY) minY = y;
+    if (y > maxY) maxY = y;
+  }
+  let rootHalf = Math.max(maxX - minX, maxY - minY) / 2;
+  if (!(rootHalf > 0)) rootHalf = 1; // all coincident
+  rootHalf *= 1.0001; // pad so max-corner points fall strictly inside
+
+  // Flat cell store (one body per leaf, like the Barnes-Hut tree; coincident points bucket via a
+  // per-point linked list). Grown geometrically; `let` so the grow closure can reassign the bindings.
+  let cap = Math.max(64, count);
+  let cx: Float64Array = new Float64Array(cap);
+  let cy: Float64Array = new Float64Array(cap);
+  let half: Float64Array = new Float64Array(cap);
+  let child: Int32Array = new Int32Array(cap * 4);
+  let head: Int32Array = new Int32Array(cap); // leaf body-list head, -1 = empty
+  let internal: Uint8Array = new Uint8Array(cap);
+  const next = new Int32Array(count).fill(-1); // per-point next pointer (coincident buckets)
+  let cellCount = 0;
+
+  const grow = (): void => {
+    cap *= 2;
+    const g64 = (a: Float64Array): Float64Array => {
+      const b = new Float64Array(cap);
+      b.set(a);
+      return b;
+    };
+    cx = g64(cx);
+    cy = g64(cy);
+    half = g64(half);
+    const c4 = new Int32Array(cap * 4);
+    c4.set(child);
+    child = c4;
+    const h = new Int32Array(cap);
+    h.set(head);
+    head = h;
+    const ig = new Uint8Array(cap);
+    ig.set(internal);
+    internal = ig;
+  };
+  const newCell = (ccx: number, ccy: number, chalf: number): number => {
+    if (cellCount >= cap) grow();
+    const c = cellCount++;
+    cx[c] = ccx;
+    cy[c] = ccy;
+    half[c] = chalf;
+    child[c * 4] = child[c * 4 + 1] = child[c * 4 + 2] = child[c * 4 + 3] = -1;
+    head[c] = -1;
+    internal[c] = 0;
+    return c;
+  };
+  const quadrant = (c: number, x: number, y: number): number => (x >= cx[c]! ? 1 : 0) | (y >= cy[c]! ? 2 : 0);
+  const makeChild = (parent: number, q: number): number => {
+    const h2 = half[parent]! / 2;
+    const c = newCell(cx[parent]! + ((q & 1) === 0 ? -h2 : h2), cy[parent]! + ((q & 2) === 0 ? -h2 : h2), h2);
+    child[parent * 4 + q] = c;
+    internal[parent] = 1;
+    return c;
+  };
+
+  newCell((minX + maxX) / 2, (minY + maxY) / 2, rootHalf);
+  for (let i = 0; i < count; i++) {
+    const x = positions[i * 2]!;
+    const y = positions[i * 2 + 1]!;
+    let cell = 0;
+    let depth = 0;
+    for (;;) {
+      if (internal[cell]) {
+        const q = quadrant(cell, x, y);
+        const c = child[cell * 4 + q]!;
+        if (c === -1) {
+          const nc = makeChild(cell, q);
+          head[nc] = i;
+          break;
+        }
+        cell = c;
+        if (++depth >= maxDepth) {
+          next[i] = head[cell]!;
+          head[cell] = i;
+          break;
+        }
+        continue;
+      }
+      if (head[cell] === -1 || depth >= maxDepth) {
+        next[i] = head[cell]!;
+        head[cell] = i;
+        break;
+      }
+      // Occupied leaf: push its body into a child, mark internal, re-loop to place point i.
+      const j = head[cell]!;
+      head[cell] = -1;
+      const cj = makeChild(cell, quadrant(cell, positions[j * 2]!, positions[j * 2 + 1]!));
+      head[cj] = j;
+      next[j] = -1;
+    }
+  }
+
+  // Height of each cell (1 + deepest child; leaf cells are 1, parenting height-0 points). Children
+  // always have a higher cell index than their parent, so a single reverse pass suffices.
+  const cheight = new Uint32Array(cellCount);
+  for (let c = cellCount - 1; c >= 0; c--) {
+    if (internal[c]) {
+      let h = 0;
+      for (let q = 0; q < 4; q++) {
+        const ch = child[c * 4 + q]!;
+        if (ch !== -1 && cheight[ch]! > h) h = cheight[ch]!;
+      }
+      cheight[c] = h + 1;
+    } else {
+      cheight[c] = 1;
+    }
+  }
+  const maxHeight = cheight[0]!; // the root is the ancestor of all cells → the tallest
+
+  // Assign global ids: points keep [0, count); cells follow, ordered by height (counting sort) so
+  // each LOD level is a contiguous id range and every child's id < its parent's.
+  const size = count + cellCount;
+  const perHeight = new Uint32Array(maxHeight + 1); // perHeight[h] = number of cells of height h
+  for (let c = 0; c < cellCount; c++) perHeight[cheight[c]!] = perHeight[cheight[c]!]! + 1;
+  const heightStart = new Uint32Array(maxHeight + 1); // first LOD id for height-h cells
+  let acc = count;
+  for (let h = 1; h <= maxHeight; h++) {
+    heightStart[h] = acc;
+    acc += perHeight[h]!;
+  }
+  const lodId = new Uint32Array(cellCount);
+  const hcursor = heightStart.slice();
+  for (let c = 0; c < cellCount; c++) {
+    const h = cheight[c]!;
+    lodId[c] = hcursor[h]!;
+    hcursor[h] = hcursor[h]! + 1;
+  }
+
+  const levelCount = maxHeight + 1;
+  const levelOffset = new Uint32Array(levelCount + 1);
+  levelOffset[1] = count;
+  for (let h = 1; h <= maxHeight; h++) levelOffset[h + 1] = levelOffset[h]! + perHeight[h]!;
+
+  // Children CSR: count → prefix-sum → scatter (points have none; cells point to sub-cells or bodies).
+  const childOffset = new Uint32Array(size + 1);
+  for (let c = 0; c < cellCount; c++) {
+    let n = 0;
+    if (internal[c]) {
+      for (let q = 0; q < 4; q++) if (child[c * 4 + q]! !== -1) n++;
+    } else {
+      for (let b = head[c]!; b !== -1; b = next[b]!) n++;
+    }
+    childOffset[lodId[c]! + 1] = n;
+  }
+  for (let g = 0; g < size; g++) childOffset[g + 1] = childOffset[g + 1]! + childOffset[g]!;
+  const children = new Uint32Array(childOffset[size]!);
+  const ccur = childOffset.slice(0, size);
+  for (let c = 0; c < cellCount; c++) {
+    const g = lodId[c]!;
+    if (internal[c]) {
+      for (let q = 0; q < 4; q++) {
+        const ch = child[c * 4 + q]!;
+        if (ch !== -1) {
+          children[ccur[g]!] = lodId[ch]!;
+          ccur[g] = ccur[g]! + 1;
+        }
+      }
+    } else {
+      for (let b = head[c]!; b !== -1; b = next[b]!) {
+        children[ccur[g]!] = b; // a point id (already its own LOD id)
+        ccur[g] = ccur[g]! + 1;
+      }
+    }
+  }
+
+  return attachGeometry({
+    size,
+    leafCount: count,
+    levelCount,
+    levelOffset,
+    childOffset,
+    children,
+    edgeOffset: new Uint32Array(size + 1),
+    edgeNeighbors: new Uint32Array(0),
+  });
+}
+
 /**
  * Assemble a {@link LODTree} from a worker-streamed {@link LODTopology}, optionally binding the
  * position-derived geometry (`cx`/`cy`/`extent`) to caller-provided buffers — typically views into a
