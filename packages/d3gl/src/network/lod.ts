@@ -44,6 +44,17 @@ export interface LODTopology {
    */
   edgeOffset: Uint32Array;
   edgeNeighbors: Uint32Array;
+  /**
+   * **Directed, flow-weighted super-edges** (#104 N6c), built from a provided module hierarchy so a
+   * map's inter-module links render as bent half-arrows. Out-adjacency CSR over *all* tree nodes:
+   * node `g`'s out-edges are `[superEdgeOffset[g] .. superEdgeOffset[g+1])`, going to `superEdgeTarget`
+   * with summed directed `superEdgeFlow`. A graph edge contributes at every level from the leaves up to
+   * its endpoints' lowest common module, so leaf↔leaf and module↔module pairs both have an entry —
+   * whichever the cut makes visible. Absent for coarsening / spatial trees. @see {@link buildModuleLODTree}
+   */
+  superEdgeOffset?: Uint32Array;
+  superEdgeTarget?: Uint32Array;
+  superEdgeFlow?: Float32Array;
 }
 
 /**
