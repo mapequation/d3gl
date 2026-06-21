@@ -1,6 +1,6 @@
 ---
 title: Network
-description: Render a raw directed network — instanced points, lines, and arrowheads — with the network() engine.
+description: Render large directed networks with the network() engine — instanced points, lines, and arrowheads, in-library force layout, and an adaptive level-of-detail cut.
 ---
 
 import ExampleCard from "../../../components/ExampleCard.astro";
@@ -9,24 +9,25 @@ import LoadNetwork from "../../../examples/load-network/LoadNetwork.tsx";
 
 The `network()` engine renders node–link diagrams through a dedicated GPU-instanced rendering
 lane: nodes are instanced points, links are instanced lines, and directed edges get triangle
-arrowheads. It is built for large graphs — the same lane scales to millions of elements with
-level-of-detail (coming in later steps).
+arrowheads. It is built for large graphs — the same lane scales toward millions of elements, with an
+adaptive **level-of-detail** cut that keeps per-frame work proportional to what's actually on screen.
 
 ## Large-scale layout in a Web Worker
 
-This example builds a **ring of cliques** — fully-connected clusters of 10 nodes bridged in a
-ring — and lets d3gl's in-library **force layout** (Barnes-Hut) place the nodes; no coordinates are
-supplied. The layout is seeded by **multilevel coarsening** (heavy-edge matching): the graph is
-collapsed into a hierarchy of ever-smaller graphs, the tiny coarsest one is laid out first, and
-positions are projected back down and refined — far faster convergence and fewer tangles on
-clustered graphs than a cold start. With `layout({ backend: "worker" })` the entire solve runs in a
-**Web Worker** and streams positions back to the renderer, so the layout **converges progressively
-on screen** while the main thread stays responsive — pan and zoom while it settles. (On a
-cross-origin-isolated page positions are shared zero-copy via `SharedArrayBuffer`; otherwise they
-are posted as snapshots.) The **Nodes** slider scales from 10 to 1,000,000 to stress-test the
-layout and rendering, and the **Seeding** toggle compares multilevel against a cold start. Rendering
-uses WebGL instancing — drag to pan, scroll to zoom, toggle **Links** between directed (with
-arrowheads) and undirected, and switch **Size** between a uniform radius and degree-weighted nodes.
+This example builds an **LFR benchmark network** — power-law node degrees and power-law community
+sizes with a tunable mixing parameter, the standard benchmark for community detection — and lets
+d3gl's in-library **force layout** (Barnes-Hut) place the nodes; no coordinates are supplied. The
+layout is seeded by **multilevel coarsening**: the graph is collapsed into a hierarchy of
+ever-smaller graphs (each node merged with a neighbour, hubs and their leaves absorbed together so
+power-law graphs still shrink geometrically), the tiny coarsest one is laid out first, and positions
+are projected back down and refined — far faster convergence and fewer tangles than a cold start.
+With `layout({ backend: "worker" })` the entire solve runs in a **Web Worker** and streams positions
+back, so the layout **converges progressively on screen** while the main thread stays responsive —
+pan and zoom while it settles. (On a cross-origin-isolated page positions are shared zero-copy via
+`SharedArrayBuffer`; otherwise they are posted as snapshots.) The **Nodes** slider scales from 10 to
+1,000,000; **Seeding** compares multilevel against a cold start; **Size** switches uniform vs
+degree-weighted radius; **Sizing** switches world vs screen units; and **LOD** / **Declutter** /
+**Edges** control the level-of-detail cut (below). Drag to pan, scroll to zoom.
 
 <ExampleCard files={["network/draw.ts", "network/data.ts"]}>
   <Network client:visible slot="demo" />
@@ -62,6 +63,43 @@ net.style({ nodeRadius: { by: "strength", scale: scaleSqrt().range([2, 20]) } })
 `degree` and `strength` are derived from the edge list automatically. **Flow** is a model quantity
 (e.g. an Infomap visit rate) that d3gl does not invent — supply it as `buildGraph({ …, nodeFlow })`
 to make `{ by: "flow", scale }` available.
+
+## Level of detail (LOD)
+
+Drawing every node and edge stops scaling long before 10M. `net.lod({ … })` turns on an **adaptive
+hierarchy cut**: d3gl keeps the multilevel coarsening tree around after layout and, each frame, walks
+it top-down for the current view — a dense region collapses to a single **aggregate glyph**, and
+expands into its members only once its on-screen footprint grows past a threshold as you zoom in. Per
+frame the engine touches the visible *frontier*, not the whole graph.
+
+```ts
+net
+  .style({ sizeMode: "screen" }) // constant-pixel glyphs — the natural register for navigating
+  .lod({
+    expandPx: 48,            // expand an aggregate once its on-screen footprint reaches ~48px
+    aggregateFill: "#7f97c8",
+    maxAggregateRadius: 26,  // cap the aggregate glyph size (pixels, in screen sizeMode)
+    declutter: true,         // thin overlapping glyphs by importance (strength)
+    superEdges: true,        // summarise connectivity between aggregates
+  });
+net.lod(false); // back to drawing every element
+```
+
+What it composes:
+
+- **Aggregates** carry their subtree's centroid, an area-additive radius (so a big cluster reads as a
+  big glyph), and an importance weight (default **strength**). Aggregate identity is stable, so they
+  don't pop as you pan.
+- **Declutter** drops glyphs that would overlap a kept one, keeping the highest-importance member —
+  zoom-dependent, so more resolve as you zoom in.
+- **Super-edges** draw connectivity between visible nodes (a leaf↔leaf graph edge, or an
+  aggregate↔aggregate coarse edge); a visible node keeps its edges even when a neighbour is
+  off-screen.
+- **`sizeMode`** — `"world"` (glyphs scale with zoom) or `"screen"` (constant pixels, so nodes stay
+  visible when zoomed out). LOD pairs naturally with `"screen"`.
+
+The geometry tracks the layout *as it converges* (LOD helps during the solve, not just after), while
+panning and zooming only re-run the cheap cut. LOD requires the WebGL backend.
 
 ## Loading a network from a file
 
