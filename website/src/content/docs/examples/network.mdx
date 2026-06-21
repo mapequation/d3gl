@@ -168,7 +168,23 @@ same adaptive cut, so a collapsed module shows the boundary flow of its whole su
 individual nodes as you zoom in. The ring renders in-shader on the WebGL lane and exports to SVG (a
 border disc under a smaller fill disc) for publication at small N.
 
-The map register's **bent half-arrow** links land in the next step.
+### Curved links and half-arrows
+
+`style({ linkBend })` bows links into **quadratic-bezier curves** — the control point sits ⟂ to the
+chord, offset by `linkBend` × chord length (try ~0.15). On a **directed** graph each link then draws a
+one-sided **half-arrow**, so a reciprocal A→B / B→A pair bows to opposite sides instead of overlapping
+— the map-of-networks link style.
+
+```ts
+net.data(graph).style({ directed: true, linkBend: 0.15 });
+```
+
+It's one generalised "path-strip" primitive: straight links stay the cheap 2-sample case (no cost at
+scale), while bent links trace a smooth multi-sample strip in the same shader. It renders in-shader on
+the WebGL lane and exports to SVG (a flattened bezier path + one-sided arrowhead).
+
+Wiring these onto **module super-edges** — so a map's inter-module links read as bent half-arrows
+weighted by flow — is the next step, together with an interactive map-of-networks example.
 
 ## Loading a network from a file
 

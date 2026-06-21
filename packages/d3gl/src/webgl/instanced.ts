@@ -105,8 +105,23 @@ export class InstancedCircles {
   }
 }
 
-/** Unit path-strip template for straight lines (M=2): (t, side) per vertex, triangle-strip. */
-const LINE_TEMPLATE = new Float32Array([0, -1, 0, 1, 1, -1, 1, 1]);
+/**
+ * Path-strip template: M samples × 2 sides as a triangle-strip, `(t, side)` per vertex with
+ * `t = i/(M-1)` walking the path and `side ∈ {-1,1}` picking the edge. M=2 is the straight case
+ * (= the original 4-vertex strip); higher M traces a smooth bezier (#104 N6c).
+ */
+function lineTemplate(samples: number): Float32Array {
+  const M = Math.max(2, samples | 0);
+  const t = new Float32Array(M * 4);
+  for (let i = 0; i < M; i++) {
+    const tt = i / (M - 1);
+    t[i * 4] = tt;
+    t[i * 4 + 1] = -1;
+    t[i * 4 + 2] = tt;
+    t[i * 4 + 3] = 1;
+  }
+  return t;
+}
 
 export class InstancedLines {
   count: number;
@@ -116,15 +131,19 @@ export class InstancedLines {
   private target: Buffer;
   private widthBuf: Buffer;
   private color: Buffer;
+  private bend: Buffer;
   private uniforms: Record<string, unknown>;
 
   constructor(device: Device, data: InstancedLinesData, width = 0, height = 0) {
     this.count = data.count;
-    this.corner = device.createBuffer({ data: LINE_TEMPLATE });
+    const samples = Math.max(2, (data.samples ?? 2) | 0);
+    this.corner = device.createBuffer({ data: lineTemplate(samples) });
     this.source = device.createBuffer({ data: data.sources });
     this.target = device.createBuffer({ data: data.targets });
     this.widthBuf = device.createBuffer({ data: data.widths });
     this.color = device.createBuffer({ data: data.colors });
+    // Per-instance bend (#104 N6c), optional: absent ⇒ zero ⇒ straight (control on the chord).
+    this.bend = device.createBuffer({ data: data.bends ?? new Float32Array(data.count) });
     this.uniforms = {
       u_transform: clipFromView({ k: 1, x: 0, y: 0 }, width || 1, height || 1),
       u_screen: 0,
@@ -139,6 +158,7 @@ export class InstancedLines {
         { name: "a_target", format: "float32x2", stepMode: "instance" },
         { name: "a_width", format: "float32", stepMode: "instance" },
         { name: "a_color", format: "unorm8x4", stepMode: "instance" },
+        { name: "a_bend", format: "float32", stepMode: "instance" },
       ],
       attributes: {
         a_corner: this.corner,
@@ -146,11 +166,12 @@ export class InstancedLines {
         a_target: this.target,
         a_width: this.widthBuf,
         a_color: this.color,
+        a_bend: this.bend,
       },
       uniforms: this.uniforms,
       parameters: BLEND,
       topology: "triangle-strip",
-      vertexCount: 4,
+      vertexCount: samples * 2,
       instanceCount: this.count,
     });
   }
@@ -174,11 +195,14 @@ export class InstancedLines {
     this.target.destroy();
     this.widthBuf.destroy();
     this.color.destroy();
+    this.bend.destroy();
   }
 }
 
 /** Triangle template for an arrowhead: tip (0,0), base (2,-1)/(2,1), triangle-list. */
 const ARROW_TEMPLATE = new Float32Array([0, 0, 2, -1, 2, 1]);
+/** One-sided "half" arrowhead (#104 N6c): tip (0,0), base on one side only (2,0)/(2,1). */
+const HALF_ARROW_TEMPLATE = new Float32Array([0, 0, 2, 0, 2, 1]);
 
 export class InstancedArrows {
   count: number;
@@ -188,15 +212,18 @@ export class InstancedArrows {
   private target: Buffer;
   private size: Buffer;
   private color: Buffer;
+  private bend: Buffer;
   private uniforms: Record<string, unknown>;
 
   constructor(device: Device, data: InstancedArrowsData, width = 0, height = 0) {
     this.count = data.count;
-    this.tri = device.createBuffer({ data: ARROW_TEMPLATE });
+    this.tri = device.createBuffer({ data: data.half ? HALF_ARROW_TEMPLATE : ARROW_TEMPLATE });
     this.source = device.createBuffer({ data: data.sources });
     this.target = device.createBuffer({ data: data.targets });
     this.size = device.createBuffer({ data: data.sizes });
     this.color = device.createBuffer({ data: data.colors });
+    // Per-instance bend (#104 N6c), optional: absent ⇒ zero ⇒ oriented along the chord, as before.
+    this.bend = device.createBuffer({ data: data.bends ?? new Float32Array(data.count) });
     this.uniforms = { u_transform: clipFromView({ k: 1, x: 0, y: 0 }, width || 1, height || 1) };
     this.model = new Model(device, {
       vs: INSTANCED_ARROW_VS,
@@ -206,6 +233,7 @@ export class InstancedArrows {
         { name: "a_source", format: "float32x2", stepMode: "instance" },
         { name: "a_target", format: "float32x2", stepMode: "instance" },
         { name: "a_size", format: "float32", stepMode: "instance" },
+        { name: "a_bend", format: "float32", stepMode: "instance" },
         { name: "a_color", format: "unorm8x4", stepMode: "instance" },
       ],
       attributes: {
@@ -213,6 +241,7 @@ export class InstancedArrows {
         a_source: this.source,
         a_target: this.target,
         a_size: this.size,
+        a_bend: this.bend,
         a_color: this.color,
       },
       uniforms: this.uniforms,
@@ -240,5 +269,6 @@ export class InstancedArrows {
     this.target.destroy();
     this.size.destroy();
     this.color.destroy();
+    this.bend.destroy();
   }
 }

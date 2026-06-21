@@ -48,6 +48,13 @@ export interface NetworkStyle {
    * for plain filled nodes. @see {@link FlowBorderSpec}
    */
   flowBorder?: FlowBorderSpec;
+  /**
+   * Bend links into curves (N6c / #104): the quadratic-bezier control offset ⟂ to the chord, as a
+   * fraction of chord length (try ~0.15). `0` (default) keeps links straight. Directed links then
+   * draw a one-sided **half-arrow** so reciprocal A→B / B→A links bow to opposite sides and don't
+   * collide — the map-of-networks link style.
+   */
+  linkBend?: number;
 }
 
 /** How node positions are produced. The worker / GPU backends land in later slices. */
@@ -575,7 +582,7 @@ export class Network extends BaseEngine {
       ids: edgeIds,
       stroke: () => style.linkStroke,
       build: (g) => {
-        if (emit) emitLinks(g, graph, style.linkWidth);
+        if (emit) emitLinks(g, graph, style.linkWidth, style.linkBend);
       },
     });
     this.registerLayer({
@@ -584,7 +591,7 @@ export class Network extends BaseEngine {
       ids: edgeIds,
       fill: () => style.arrowFill,
       build: (g) => {
-        if (emit && style.directed) emitArrows(g, graph, style.arrowSize, style.nodeRadii);
+        if (emit && style.directed) emitArrows(g, graph, style.arrowSize, style.nodeRadii, style.linkBend, style.linkBend !== 0);
       },
     });
     // Flow border (#104 N6): the instanced lane draws the ring in-shader, but the Scene path has no
@@ -633,6 +640,7 @@ export class Network extends BaseEngine {
       directed: this.styleOpts.directed ?? graph.directed,
       sizeMode: this.styleOpts.sizeMode ?? "world",
       flowBorder: this.styleOpts.flowBorder ? resolveFlowBorder(graph, this.styleOpts.flowBorder, nodeFill) : null,
+      linkBend: this.styleOpts.linkBend ?? 0,
     };
   }
 

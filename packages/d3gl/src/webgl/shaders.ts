@@ -210,49 +210,58 @@ void main() {
   fragColor = (v_border > 0.0 && r > 1.0 - v_border) ? v_borderColor : v_color;
 }`;
 
-// INSTANCED_LINE_VS — true GPU-instanced "path-strip" lines for the network lane (#100).
-// The per-vertex template a_corner = (t, side): t in {0,1} walks the segment, side in {-1,1}
-// picks the edge. Per-instance source/target/width/color. Straight links are the M=2 case;
-// the same primitive generalises to bezier/half-arrows (more samples) later. Pairs with FILL_FS.
+// INSTANCED_LINE_VS — GPU-instanced "path-strip" lines for the network lane (#100, bent #104 N6c).
+// The per-vertex template a_corner = (t, side): t in [0,1] walks the path (M samples), side in
+// {-1,1} picks the edge. Per-instance source/target/width/color/bend. The path is a quadratic
+// bezier whose control point is the chord midpoint offset perpendicular by `a_bend` (a fraction of
+// the chord length); `a_bend = 0` ⇒ the control sits on the chord ⇒ a straight line (so straight
+// links draw exactly as before, at M=2). The strip offsets each sample by the *tangent's*
+// perpendicular, so a continuous strip gets its joins for free. Pairs with FILL_FS.
 export const INSTANCED_LINE_VS = `#version 300 es
 precision highp float;
 uniform mat3 u_transform;
 uniform float u_screen;     // 1.0 = constant-px width, 0.0 = world width (scales with zoom)
 uniform vec2 u_viewport;    // device px, for screen mode
-in vec2 a_corner;           // per-vertex (t in {0,1}, side in {-1,1})
+in vec2 a_corner;           // per-vertex (t in [0,1], side in {-1,1})
 in vec2 a_source;           // per-instance world source
 in vec2 a_target;           // per-instance world target
 in float a_width;           // per-instance line width
 in vec4 a_color;            // per-instance RGBA (unorm8x4 -> 0..1)
+in float a_bend;            // per-instance control offset ⟂ to the chord, as a fraction of |chord| (0 = straight)
 out vec4 v_color;
 void main() {
   v_color = a_color;
   float t = a_corner.x;
   float side = a_corner.y;
   float hw = a_width * 0.5;
-  vec2 p = mix(a_source, a_target, t);
+  vec2 d = a_target - a_source;
+  vec2 ctrl = 0.5 * (a_source + a_target) + vec2(-d.y, d.x) * a_bend; // ⟂(chord) · bend
+  float u = 1.0 - t;
+  vec2 p = u * u * a_source + 2.0 * u * t * ctrl + t * t * a_target;  // B(t)
+  vec2 tang = 2.0 * u * (ctrl - a_source) + 2.0 * t * (a_target - ctrl); // B'(t)
   vec2 cp = (u_transform * vec3(p, 1.0)).xy;          // centreline point in clip
   vec2 off;
   if (u_screen > 0.5) {
-    // Constant-pixel width: perpendicular derived in screen px, converted back to clip.
-    vec2 cs = (u_transform * vec3(a_source, 1.0)).xy;
-    vec2 ct = (u_transform * vec3(a_target, 1.0)).xy;
-    vec2 dir = normalize((ct - cs) * u_viewport);     // clip delta -> px direction
+    // Constant-pixel width: tangent's perpendicular derived in screen px, converted back to clip.
+    vec2 ctan = (u_transform * vec3(p + tang, 1.0)).xy;
+    vec2 dir = normalize((ctan - cp) * u_viewport);   // clip delta -> px direction
     vec2 perp = vec2(-dir.y, dir.x);
     off = perp * side * hw * (2.0 / u_viewport);      // px -> clip
   } else {
-    // World width: offset the centreline point in world space, then transform.
-    vec2 dir = normalize(a_target - a_source);
+    // World width: offset the centreline point in world space along the tangent's perpendicular.
+    vec2 dir = normalize(tang);
     vec2 perp = vec2(-dir.y, dir.x);
     off = (u_transform * vec3(p + perp * side * hw, 1.0)).xy - cp;
   }
   gl_Position = vec4(cp + off, 0.0, 1.0);
 }`;
 
-// INSTANCED_ARROW_VS — instanced triangle arrowheads for directed links (#100). One triangle
-// per instance: per-vertex a_tri = (back, across) with tip (0,0) and base (2,-1)/(2,1); the tip
-// sits at a_target, oriented along (a_target - a_source), scaled by a_size (world units). Pairs
-// with FILL_FS. World-sized for now (screen-sizing can follow the line shader's u_screen branch).
+// INSTANCED_ARROW_VS — instanced triangle arrowheads for directed links (#100; bent + half #104 N6c).
+// One triangle per instance: per-vertex a_tri = (back, across), tip (0,0); the symmetric template
+// has base (2,-1)/(2,1), the half template (2,0)/(2,1) (one-sided, for bent map links so reciprocal
+// arrows don't collide). The tip sits at a_target, oriented along the bezier's *end* tangent (so it
+// aligns with a bent link), scaled by a_size (world units). a_bend = 0 ⇒ oriented along the chord,
+// as before. Pairs with FILL_FS. World-sized for now.
 export const INSTANCED_ARROW_VS = `#version 300 es
 precision highp float;
 uniform mat3 u_transform;
@@ -260,11 +269,15 @@ in vec2 a_tri;        // per-vertex (back, across)
 in vec2 a_source;     // per-instance world source (orientation)
 in vec2 a_target;     // per-instance world tip
 in float a_size;      // per-instance arrow size (world units)
+in float a_bend;      // per-instance bend, matching the link's, so the head aligns with its end tangent
 in vec4 a_color;
 out vec4 v_color;
 void main() {
   v_color = a_color;
-  vec2 dir = normalize(a_target - a_source);
+  vec2 d = a_target - a_source;
+  // Quadratic-bezier end tangent (t=1): 2·(P1 − C), C = midpoint + ⟂(chord)·bend.
+  vec2 endTan = 0.5 * d - vec2(-d.y, d.x) * a_bend;
+  vec2 dir = normalize(endTan);
   vec2 perp = vec2(-dir.y, dir.x);
   vec2 world = a_target - dir * (a_tri.x * a_size) + perp * (a_tri.y * a_size);
   gl_Position = vec4((u_transform * vec3(world, 1.0)).xy, 0.0, 1.0);

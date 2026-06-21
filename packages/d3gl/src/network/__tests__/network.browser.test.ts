@@ -187,4 +187,38 @@ describe("network() engine", () => {
 
     net.destroy();
   });
+
+  it("renders bent half-arrow links (N6c) through the WebGL lane without throwing", async () => {
+    const net = network(host(), { width: 200, height: 200 });
+    await net.whenReady();
+    const g = buildGraph({ nodeCount: 3, source: [0, 1, 2], target: [1, 2, 0], directed: true });
+    // A bent directed cycle: the multi-sample bezier strip + one-sided half-arrow shaders must
+    // compile and draw (a shader-link failure would throw here).
+    expect(
+      net
+        .data(g)
+        .style({ directed: true, linkBend: 0.2, linkWidth: 2 })
+        .layout({ backend: "positions", positions: new Float32Array([40, 40, 160, 40, 100, 160]) }),
+    ).toBe(net);
+    net.destroy();
+  });
+
+  it("exports bent links to SVG as flattened curved paths (vs straight)", async () => {
+    const net = network(host(), { width: 200, height: 200, backend: "svg" });
+    await net.whenReady();
+    const g = buildGraph({ nodeCount: 3, source: [0, 1, 2], target: [1, 2, 0], directed: true });
+    net
+      .data(g)
+      .style({ directed: true, linkBend: 0.25, nodeRadius: 6 })
+      .layout({ backend: "positions", positions: new Float32Array([40, 40, 160, 40, 100, 160]) });
+    const bent = net.toSVG();
+    expect((bent.match(/<circle/g) ?? []).length).toBe(3);
+    expect(bent).toContain("<path");
+
+    // A bent link's path is a flattened bezier (many points); straightening shrinks the markup.
+    net.style({ linkBend: 0 });
+    expect(bent.length).toBeGreaterThan(net.toSVG().length);
+
+    net.destroy();
+  });
 });

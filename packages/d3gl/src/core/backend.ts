@@ -94,7 +94,7 @@ export interface InstancedCirclesData {
   count: number;
 }
 
-/** SoA for a batch of instanced straight lines (e.g. network links). */
+/** SoA for a batch of instanced lines (e.g. network links); straight, or bent via {@link bends}. */
 export interface InstancedLinesData {
   /** [x, y] world source per line, length `2 * count`. */
   sources: Float32Array;
@@ -104,6 +104,16 @@ export interface InstancedLinesData {
   widths: Float32Array;
   /** RGBA bytes per line, length `4 * count`. */
   colors: Uint8Array;
+  /**
+   * Optional per-line **bend** (#104 N6c): the quadratic-bezier control offset ⟂ to the chord, as a
+   * fraction of chord length (`0`/absent ⇒ straight). Length `count`.
+   */
+  bends?: Float32Array;
+  /**
+   * Path samples (M) for the strip — `2` (straight, default) up to ~16–32 for a smooth bend. A draw
+   * setting, not per-instance; bent layers raise it, straight layers keep `2` to stay cheap at scale.
+   */
+  samples?: number;
   count: number;
 }
 
@@ -117,6 +127,10 @@ export interface InstancedArrowsData {
   sizes: Float32Array;
   /** RGBA bytes per arrow, length `4 * count`. */
   colors: Uint8Array;
+  /** Optional per-arrow bend (#104 N6c), matching the link's, so the head aligns with the bent end tangent. */
+  bends?: Float32Array;
+  /** Draw a one-sided **half** arrowhead (#104 N6c) — for bent map links, so reciprocal heads don't collide. */
+  half?: boolean;
   count: number;
 }
 
