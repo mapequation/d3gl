@@ -60,7 +60,9 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
           nodeRadius: options.size === "Degree" ? degreeRadius(graph) : 4,
           nodeFill: "#4878d0",
           linkWidth: 0.6,
-          linkStroke: "#cfd8e6",
+          // Translucent links so overlapping edges read as density — a hierarchical depth cue, and
+          // it keeps the super-edge thicket legible under the nodes.
+          linkStroke: "rgba(120,140,180,0.32)",
           arrowFill: "#9aa7bd",
           // "Screen" keeps glyphs a constant pixel size while you zoom (they don't vanish when
           // zoomed out) — the natural register for navigating a large layout, and what LOD wants.

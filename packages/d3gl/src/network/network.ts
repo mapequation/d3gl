@@ -304,10 +304,15 @@ export class Network extends BaseEngine {
     return this;
   }
 
-  /** Push a set of instanced layers, removing any of the known layers no longer present. */
+  /**
+   * Push the instanced layers in canonical draw order. The backend draws them in Map-insertion
+   * order, and updating an existing layer keeps its slot — so to guarantee links/arrows stay *under*
+   * nodes regardless of the order layers first appeared, clear the known layers and re-add in
+   * `layers` order (built bottom-to-top). No extra cost: `setInstancedLayer` recreates each layer's
+   * buffers either way; this just also frees the slots of any now-absent layer.
+   */
   private emitInstancedLayers(backend: Backend, layers: InstancedLayer[]): void {
-    const present = new Set(layers.map((l) => l.name));
-    for (const name of LAYER_NAMES) if (!present.has(name)) backend.removeInstancedLayer?.(name);
+    for (const name of LAYER_NAMES) backend.removeInstancedLayer?.(name);
     for (const layer of layers) backend.setInstancedLayer!(layer);
   }
 
