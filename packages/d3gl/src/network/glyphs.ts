@@ -1,6 +1,7 @@
 import { rgb } from "d3-color";
 import type { InstancedCirclesData, InstancedLinesData, InstancedArrowsData, InstancedLayer, GroupBuilder } from "../core/index.js";
 import type { NetworkGraph } from "./graph.js";
+import type { LODTree } from "./lod.js";
 
 /**
  * Glyph builders for the network module (#100, epic #98) — the instanced "emitters".
@@ -116,6 +117,40 @@ function fillColors(count: number, css: string): Uint8Array {
 export function nodeCircles(graph: NetworkGraph, style: NodeStyleResolved): InstancedCirclesData {
   const count = graph.nodeCount;
   return { centers: graph.positions, radii: style.radii, colors: fillColors(count, style.fill), count };
+}
+
+export interface FrontierStyleResolved {
+  /** Fill for real leaves (individual nodes). */
+  nodeFill: string;
+  /** Fill for aggregate glyphs (collapsed subtrees). */
+  aggregateFill: string;
+}
+
+/**
+ * Instanced-circle data for an LOD cut frontier: each frontier node drawn at its tree-resolved
+ * {@link LODTree.radius} and centroid, leaves in `nodeFill` and aggregates in `aggregateFill`. The
+ * frontier is bounded by the viewport + expand threshold, so this small buffer is cheap to rebuild
+ * per pan/zoom frame (the instanced lane reallocates, but only over the visible set, not all of N).
+ */
+export function frontierCircles(tree: LODTree, frontier: Uint32Array, style: FrontierStyleResolved): InstancedCirclesData {
+  const count = frontier.length;
+  const centers = new Float32Array(count * 2);
+  const radii = new Float32Array(count);
+  const colors = new Uint8Array(count * 4);
+  const leaf = toRGBA(style.nodeFill);
+  const agg = toRGBA(style.aggregateFill);
+  for (let i = 0; i < count; i++) {
+    const g = frontier[i]!;
+    centers[i * 2] = tree.cx[g]!;
+    centers[i * 2 + 1] = tree.cy[g]!;
+    radii[i] = tree.radius[g]!;
+    const c = g < tree.leafCount ? leaf : agg;
+    colors[i * 4] = c[0];
+    colors[i * 4 + 1] = c[1];
+    colors[i * 4 + 2] = c[2];
+    colors[i * 4 + 3] = c[3];
+  }
+  return { centers, radii, colors, count };
 }
 
 /**

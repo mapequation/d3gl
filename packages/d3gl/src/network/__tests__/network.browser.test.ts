@@ -81,4 +81,35 @@ describe("network() engine", () => {
 
     net.destroy();
   });
+
+  it("drives the LOD cut through layout, enable, and zoom on the WebGL lane without throwing", async () => {
+    const net = network(host(), { width: 200, height: 200 });
+    await net.whenReady();
+    // A ring of 40 nodes (coarsens to several levels) with supplied positions ⇒ settled at once.
+    const N = 40;
+    const source: number[] = [];
+    const target: number[] = [];
+    const positions = new Float32Array(N * 2);
+    for (let i = 0; i < N; i++) {
+      source.push(i);
+      target.push((i + 1) % N);
+      const a = (i / N) * Math.PI * 2;
+      positions[i * 2] = 100 + 80 * Math.cos(a);
+      positions[i * 2 + 1] = 100 + 80 * Math.sin(a);
+    }
+    const g = buildGraph({ nodeCount: N, source, target });
+
+    net
+      .data(g)
+      .layout({ backend: "positions", positions })
+      .lod({ expandPx: 48, coarsen: { minNodes: 2 } });
+
+    // Re-cut across a wide zoom range: collapsed aggregates when out, individual leaves when in.
+    expect(net.setTransform({ k: 0.05, x: 100, y: 100 })).toBe(net);
+    expect(net.setTransform({ k: 20, x: -1900, y: -1900 })).toBe(net);
+    // Disabling LOD restores the full-graph draw.
+    expect(net.lod(false)).toBe(net);
+
+    net.destroy();
+  });
 });

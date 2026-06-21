@@ -3,8 +3,11 @@
  * with level-of-detail (epic #98).
  */
 export { network, Network } from "./network.js";
-export type { NetworkOptions, NetworkStyle, NetworkLayoutOptions } from "./network.js";
+export type { NetworkOptions, NetworkStyle, NetworkLayoutOptions, NetworkLODOptions } from "./network.js";
 export type { NodeRadiusSpec, NodeMetric } from "./glyphs.js";
+
+export { buildLODTree, computeLODGeometry, cut } from "./lod.js";
+export type { LODTree, LODTransform, CutOptions } from "./lod.js";
 
 export { buildGraph, buildCSR } from "./graph.js";
 export type { NetworkGraph, CSR, BuildGraphInput } from "./graph.js";

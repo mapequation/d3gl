@@ -1,0 +1,259 @@
+/**
+ * Module-free structural level-of-detail (sub-issue #103 / epic #98).
+ *
+ * The mechanism that bounds per-frame work to *visible* elements so a module-free network reaches
+ * ~10M: a retained **LOD tree** (the N4 coarsening hierarchy, kept instead of discarded) whose
+ * nodes carry geometry derived from the final layout, plus an **adaptive cut** that each frame walks
+ * the tree top-down and keeps only what's on-screen and large enough to matter — expanding an
+ * aggregate into its children when its on-screen footprint grows, collapsing it to one glyph when it
+ * shrinks. The frontier (leaves + aggregates) is what the renderer draws, so cost ∝ visible set.
+ *
+ * This is the structural-primary path (epic decision "Option B"). The spatial-quadtree fallback for
+ * edge-less point clouds is a later slice; an edge-less graph yields a single-level tree here, which
+ * the cut simply draws in full (no aggregation possible).
+ *
+ * Kept network-private for now behind the {@link cut} / frontier boundary; the same shape is meant
+ * to be promotable to a shared core `select(transform) → visibleIndices` lane later (#108).
+ */
+import type { NetworkGraph } from "./graph.js";
+import { buildHierarchy, type CoarsenOptions } from "./coarsen.js";
+
+/**
+ * A retained coarsening tree, flattened to SoA typed arrays for cache-friendly traversal at scale.
+ *
+ * Tree nodes are numbered by level: level 0 (the original graph) occupies global ids `[0, leafCount)`
+ * and is the **leaves**; each coarser level follows, and the coarsest level is the **roots**. Ids are
+ * stable for the life of the graph, so aggregates keep their identity across frames (no popping).
+ */
+export interface LODTree {
+  /** Total tree nodes across all levels. */
+  size: number;
+  /** Number of leaves (= `graph.nodeCount` = level-0 node count). */
+  leafCount: number;
+  /** Number of coarsening levels; 1 means no coarsening was possible (tiny / edge-less graph). */
+  levelCount: number;
+  /** Global-id start of each level; length `levelCount + 1`. Level `k` is `[levelOffset[k], levelOffset[k+1])`. */
+  levelOffset: Uint32Array;
+  /** Children CSR: node `g`'s children are `children[childOffset[g] .. childOffset[g+1]]` (one level finer). */
+  childOffset: Uint32Array;
+  children: Uint32Array;
+  // --- geometry, filled by computeLODGeometry from the settled layout ---
+  /** Centroid x of each node's leaf descendants. */
+  cx: Float32Array;
+  /** Centroid y of each node's leaf descendants. */
+  cy: Float32Array;
+  /**
+   * Spatial bounding radius (world units): an upper bound on the distance from the centroid to any
+   * descendant leaf. Drives viewport culling and the zoom-driven expand trigger.
+   */
+  extent: Float32Array;
+  /**
+   * Visual draw radius (world units): leaves take their resolved per-node radius (degree/strength/…
+   * encoded); each aggregate is `√(Σ child radius²)` — area-additive, so it's agnostic to the node
+   * sizing and an aggregate's ink ≈ its contents' total ink. Drives drawing and declutter occupancy.
+   */
+  radius: Float32Array;
+  /** Number of leaf descendants. */
+  count: Uint32Array;
+  /** Summed leaf importance (default: strength) — drives super-edge weight and declutter priority. */
+  weight: Float32Array;
+}
+
+/**
+ * Build the retained LOD tree topology from a graph's coarsening hierarchy. Geometry is left zeroed;
+ * call {@link computeLODGeometry} once positions have settled. Pure topology — no positions read.
+ */
+export function buildLODTree(graph: NetworkGraph, coarsen?: CoarsenOptions): LODTree {
+  const { levels, projections } = buildHierarchy(graph, coarsen);
+  const levelCount = levels.length;
+
+  const levelOffset = new Uint32Array(levelCount + 1);
+  for (let k = 0; k < levelCount; k++) levelOffset[k + 1] = levelOffset[k]! + levels[k]!.nodeCount;
+  const size = levelOffset[levelCount]!;
+  const leafCount = graph.nodeCount;
+
+  // Parent of each node (one level coarser): projections[k] maps level-k local → level-(k+1) local.
+  const parent = new Int32Array(size).fill(-1);
+  for (let k = 0; k < levelCount - 1; k++) {
+    const proj = projections[k]!;
+    const childBase = levelOffset[k]!;
+    const parentBase = levelOffset[k + 1]!;
+    for (let i = 0; i < proj.length; i++) parent[childBase + i] = parentBase + proj[i]!;
+  }
+
+  // Children CSR from the parent map (count → prefix-sum → scatter), like buildCSR.
+  const childOffset = new Uint32Array(size + 1);
+  for (let g = 0; g < size; g++) {
+    const p = parent[g]!;
+    if (p >= 0) childOffset[p + 1] = childOffset[p + 1]! + 1;
+  }
+  for (let g = 0; g < size; g++) childOffset[g + 1] = childOffset[g + 1]! + childOffset[g]!;
+  const children = new Uint32Array(childOffset[size]!);
+  const cursor = childOffset.slice(0, size);
+  for (let g = 0; g < size; g++) {
+    const p = parent[g]!;
+    if (p >= 0) {
+      const pos = cursor[p]!;
+      children[pos] = g;
+      cursor[p] = pos + 1;
+    }
+  }
+
+  return {
+    size,
+    leafCount,
+    levelCount,
+    levelOffset,
+    childOffset,
+    children,
+    cx: new Float32Array(size),
+    cy: new Float32Array(size),
+    extent: new Float32Array(size),
+    radius: new Float32Array(size),
+    count: new Uint32Array(size),
+    weight: new Float32Array(size),
+  };
+}
+
+/**
+ * Fill the tree's geometry from the settled layout, the per-leaf visual radii, and a per-leaf
+ * importance weight. Leaves take their own position/radius; each aggregate gets the count-weighted
+ * centroid of its children (= the mean of its descendant leaf positions), the summed count/weight,
+ * an area-additive visual radius (`√Σ child radius²`), and a bounding `extent` enclosing all
+ * descendant leaves. One bottom-up pass over the levels — O(tree size) ≈ O(n).
+ *
+ * `leafRadii` is the resolved per-node radius (so aggregates respect the node sizing); `leafWeight`
+ * is the per-leaf importance, defaulting to `graph.strength` (weighted degree) — pass `graph.flow`
+ * or `graph.csr.degree` to prioritise differently.
+ */
+export function computeLODGeometry(
+  tree: LODTree,
+  graph: NetworkGraph,
+  leafRadii: ArrayLike<number>,
+  leafWeight: ArrayLike<number> = graph.strength,
+): void {
+  const { leafCount, levelCount, levelOffset, childOffset, children, cx, cy, extent, radius, count, weight } = tree;
+  const pos = graph.positions;
+
+  for (let i = 0; i < leafCount; i++) {
+    cx[i] = pos[i * 2]!;
+    cy[i] = pos[i * 2 + 1]!;
+    count[i] = 1;
+    radius[i] = leafRadii[i]!;
+    weight[i] = leafWeight[i]!;
+    extent[i] = 0;
+  }
+
+  for (let k = 1; k < levelCount; k++) {
+    for (let g = levelOffset[k]!; g < levelOffset[k + 1]!; g++) {
+      const c0 = childOffset[g]!;
+      const c1 = childOffset[g + 1]!;
+      let sumC = 0;
+      let sx = 0;
+      let sy = 0;
+      let sw = 0;
+      let sumR2 = 0;
+      for (let p = c0; p < c1; p++) {
+        const c = children[p]!;
+        const cc = count[c]!;
+        sumC += cc;
+        sx += cc * cx[c]!;
+        sy += cc * cy[c]!;
+        sw += weight[c]!;
+        sumR2 += radius[c]! * radius[c]!;
+      }
+      const gx = sumC > 0 ? sx / sumC : 0;
+      const gy = sumC > 0 ? sy / sumC : 0;
+      cx[g] = gx;
+      cy[g] = gy;
+      count[g] = sumC;
+      weight[g] = sw;
+      radius[g] = Math.sqrt(sumR2); // area-additive: aggregate ink ≈ Σ child ink
+      // Bounding radius: the farthest child's centre distance plus that child's own extent.
+      let ext = 0;
+      for (let p = c0; p < c1; p++) {
+        const c = children[p]!;
+        const dx = gx - cx[c]!;
+        const dy = gy - cy[c]!;
+        const d = Math.hypot(dx, dy) + extent[c]!;
+        if (d > ext) ext = d;
+      }
+      extent[g] = ext;
+    }
+  }
+}
+
+/** Screen-space transform: `screen = world * k + (x, y)` (matches {@link BaseEngine} `ViewTransform`). */
+export interface LODTransform {
+  k: number;
+  x: number;
+  y: number;
+}
+
+export interface CutOptions {
+  /**
+   * Expand an aggregate into its children once its on-screen footprint (diameter = `2·extent·k`, in
+   * px) reaches this threshold; below it the aggregate draws as a single glyph. Larger → coarser
+   * (fewer, bigger glyphs); smaller → finer. Default 48.
+   */
+  expandPx?: number;
+}
+
+const DEFAULT_EXPAND_PX = 48;
+
+/**
+ * Adaptive hierarchy cut: walk the tree top-down for the given view and return the **frontier** —
+ * the set of node ids to draw. A subtree is culled when its bounding box misses the viewport; an
+ * aggregate expands when its on-screen footprint is large enough, otherwise it is drawn as one
+ * glyph; leaves always draw. Work is proportional to the visible frontier, not to the tree size.
+ */
+export function cut(
+  tree: LODTree,
+  t: LODTransform,
+  width: number,
+  height: number,
+  opts: CutOptions = {},
+): Uint32Array {
+  const { leafCount, levelCount, levelOffset, childOffset, children, cx, cy, extent } = tree;
+  const expandPx = opts.expandPx ?? DEFAULT_EXPAND_PX;
+
+  // Visible world rectangle (inverse of screen = world·k + translate).
+  const ax = (0 - t.x) / t.k;
+  const bx = (width - t.x) / t.k;
+  const ay = (0 - t.y) / t.k;
+  const by = (height - t.y) / t.k;
+  const minX = Math.min(ax, bx);
+  const maxX = Math.max(ax, bx);
+  const minY = Math.min(ay, by);
+  const maxY = Math.max(ay, by);
+
+  const frontier: number[] = [];
+  // Seed the stack with the roots (coarsest level).
+  const stack: number[] = [];
+  for (let g = levelOffset[levelCount - 1]!; g < levelOffset[levelCount]!; g++) stack.push(g);
+
+  while (stack.length > 0) {
+    const g = stack.pop()!;
+    const ext = extent[g]!;
+    const gx = cx[g]!;
+    const gy = cy[g]!;
+    // Cull: the node's bounding box is entirely outside the viewport.
+    if (gx + ext < minX || gx - ext > maxX || gy + ext < minY || gy - ext > maxY) continue;
+    if (g < leafCount) {
+      frontier.push(g); // a real leaf — nothing finer to expand into
+      continue;
+    }
+    if (2 * ext * t.k >= expandPx) {
+      for (let p = childOffset[g]!; p < childOffset[g + 1]!; p++) stack.push(children[p]!);
+    } else {
+      frontier.push(g);
+    }
+  }
+
+  return Uint32Array.from(frontier);
+}
+
+/** Whether a frontier id is a real leaf (vs. an aggregate). */
+export function isLeaf(tree: LODTree, g: number): boolean {
+  return g < tree.leafCount;
+}
