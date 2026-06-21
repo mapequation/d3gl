@@ -9,7 +9,7 @@ import {
   cut,
   declutterFrontier,
 } from "../lod.js";
-import { buildHierarchy } from "../coarsen.js";
+import { buildHierarchy, multilevelSeed } from "../coarsen.js";
 import { lodGeometryViews, lodGeometryByteLength } from "../worker-protocol.js";
 import { frontierCircles, superEdgeLines } from "../glyphs.js";
 import { buildGraph } from "../graph.js";
@@ -173,6 +173,80 @@ describe("cut", () => {
     // overlaps → kept (no popping at the edge).
     const frontier = cut(tree, { k: 1, x: -5, y: 0 }, 15, 200);
     expect(Array.from(frontier).sort((a, b) => a - b)).toEqual([4, 5]);
+  });
+});
+
+describe("cut bounds work to the visible set (#103 worker-LOD perf)", () => {
+  // A clustered graph (ring backbone + deterministic chords) laid out by the real multilevel seed, so
+  // the coarsening groups are spatially compact and the cut's spatial pruning applies — the property
+  // that makes per-frame work ∝ visible rather than ∝ N. (Random positions would scatter each
+  // aggregate's members and defeat pruning; the layout's whole job is to give the hierarchy locality.)
+  function seededClusteredTree(n: number) {
+    let s = 7 >>> 0;
+    const rng = () => ((s = (s * 1664525 + 1013904223) >>> 0) / 4294967296);
+    const source: number[] = [];
+    const target: number[] = [];
+    for (let i = 0; i < n; i++) {
+      source.push(i);
+      target.push((i + 1) % n);
+      source.push(i);
+      target.push((i + 1 + Math.floor(rng() * (n - 2))) % n);
+    }
+    const g = buildGraph({ nodeCount: n, source, target });
+    multilevelSeed(g, { width: 2000, height: 2000 });
+    const tree = buildLODTree(g, {});
+    computeLODGeometry(tree, g, new Float32Array(n).fill(4));
+    return { g, tree };
+  }
+
+  const W = 1200, H = 800;
+  /** Bounds + a transform that frames the whole layout (90% of the viewport). */
+  function wholeView(g: ReturnType<typeof seededClusteredTree>["g"], n: number) {
+    let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+    for (let i = 0; i < n; i++) {
+      const x = g.positions[i * 2]!, y = g.positions[i * 2 + 1]!;
+      if (x < minX) minX = x;
+      if (x > maxX) maxX = x;
+      if (y < minY) minY = y;
+      if (y > maxY) maxY = y;
+    }
+    const k = 0.9 * Math.min(W / (maxX - minX), H / (maxY - minY));
+    const cx = (minX + maxX) / 2, cy = (minY + maxY) / 2;
+    return { k, x: W / 2 - cx * k, y: H / 2 - cy * k };
+  }
+
+  it("expandPx is the detail knob: a coarser threshold draws fewer glyphs, collapsing toward the roots", () => {
+    const N = 5000;
+    const { g, tree } = seededClusteredTree(N);
+    const view = wholeView(g, N);
+
+    const fine = cut(tree, view, W, H, { expandPx: 4 }).length;
+    const mid = cut(tree, view, W, H, { expandPx: 64 }).length;
+    const coarse = cut(tree, view, W, H, { expandPx: 1e9 }).length; // nothing expands → roots only
+
+    expect(fine).toBeGreaterThan(mid); // finer threshold resolves more glyphs…
+    expect(mid).toBeGreaterThan(coarse); // …coarser collapses them (monotone)
+
+    // At the coarsest threshold the frontier is exactly the root aggregates — a handful, not N.
+    const rootCount = tree.size - tree.levelOffset[tree.levelCount - 1]!;
+    expect(coarse).toBeLessThanOrEqual(rootCount);
+    expect(coarse).toBeLessThan(N / 50); // work ∝ visible detail, independent of the node count
+    expect(coarse).toBeGreaterThan(0);
+  });
+
+  it("viewport culling bounds the frontier: zooming into a region draws far fewer than N", () => {
+    const N = 5000;
+    const { g, tree } = seededClusteredTree(N);
+    const out = wholeView(g, N);
+    // Zoom 6× into the layout centre — most of the graph scrolls off-screen and is culled.
+    const k = out.k * 6;
+    const cx = (W / 2 - out.x) / out.k, cy = (H / 2 - out.y) / out.k; // world point at screen centre
+    const view = { k, x: W / 2 - cx * k, y: H / 2 - cy * k };
+
+    const frontier = cut(tree, view, W, H, { expandPx: 48 });
+    expect(frontier.length).toBeGreaterThan(0); // the region isn't empty
+    expect(frontier.length).toBeLessThan(N / 2); // …but the off-screen majority is culled
+    expect(frontier.length).toBeLessThanOrEqual(tree.size); // never more than the whole tree
   });
 });
 
