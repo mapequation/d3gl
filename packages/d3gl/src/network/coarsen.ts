@@ -63,6 +63,13 @@ export interface MultilevelLayoutOptions {
    * cheap (it runs before any progressive frame). Default 30.
    */
   coarsenIterations?: number;
+  /**
+   * Largest level the seed actually force-solves. Levels with more nodes are prolongated through
+   * without a solve — the seed captures the global/meso structure from the small coarse levels, and
+   * the finest refinement (streamed by the worker) does the rest. Bounds seed cost at O(maxSeedNodes)
+   * per level instead of running a Barnes-Hut solve on near-full coarse levels (#117). Default 4096.
+   */
+  maxSeedNodes?: number;
   coarsen?: CoarsenOptions;
 }
 
@@ -70,6 +77,7 @@ const DEFAULT_MIN_NODES = 8;
 const DEFAULT_MAX_LEVELS = 32;
 const DEFAULT_ITERATIONS = 100;
 const DEFAULT_COARSEN_ITERATIONS = 30;
+const DEFAULT_MAX_SEED_NODES = 4096;
 const GOLDEN = Math.PI * (3 - Math.sqrt(5));
 
 /** Symmetric (undirected) adjacency with per-incidence weights; self-loops dropped. */
@@ -302,6 +310,7 @@ function graphView(graph: CoarsenableGraph): LayoutGraph {
 export function multilevelSeed(graph: CoarsenableGraph, opts: MultilevelLayoutOptions): void {
   const { width, height } = opts;
   const coarsenIterations = opts.coarsenIterations ?? DEFAULT_COARSEN_ITERATIONS;
+  const maxSeedNodes = opts.maxSeedNodes ?? DEFAULT_MAX_SEED_NODES;
   const { levels, projections } = buildHierarchy(graph, opts.coarsen);
   const last = levels.length - 1;
 
@@ -315,14 +324,17 @@ export function multilevelSeed(graph: CoarsenableGraph, opts: MultilevelLayoutOp
     k === 0 ? graph.positions : new Float32Array(lvl.nodeCount * 2),
   );
 
-  // Seed + solve the coarsest level, then prolongate + refine down to (but not including) level 0.
+  // Seed + solve the coarsest level (always small), then prolongate down to (but not including)
+  // level 0. Large levels are prolongated *without* a solve — the small coarse levels fix the global
+  // arrangement and the finest refinement (caller / streamed) handles the detail, so the seed never
+  // runs a Barnes-Hut solve on a near-full graph.
   const coarsestView = asView(levels[last]!, pos[last]!);
   seedPositions(coarsestView, width, height);
   new ForceLayout(coarsestView, opts.force).run(coarsenIterations);
   for (let k = last - 1; k >= 1; k--) {
     const lvl = levels[k]!;
     prolongate(pos[k]!, pos[k + 1]!, projections[k]!, lvl.nodeCount, width, height);
-    new ForceLayout(asView(lvl, pos[k]!), opts.force).run(coarsenIterations);
+    if (lvl.nodeCount <= maxSeedNodes) new ForceLayout(asView(lvl, pos[k]!), opts.force).run(coarsenIterations);
   }
   // Project the seed onto the finest level; the caller refines from here.
   prolongate(graph.positions, pos[1]!, projections[0]!, levels[0]!.nodeCount, width, height);
