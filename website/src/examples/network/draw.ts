@@ -77,6 +77,7 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
                 aggregateFill: "#7f97c8",
                 maxAggregateRadius: 26,
                 declutter: options.declutter !== "Off",
+                superEdges: options.edges !== "Off",
               }
             : false,
         );

@@ -24,6 +24,7 @@ export default function Network() {
         { type: "segmented", key: "coords", label: "Sizing", options: ["World", "Screen"] },
         { type: "segmented", key: "lod", label: "LOD", options: ["Off", "On"] },
         { type: "segmented", key: "declutter", label: "Declutter", options: ["On", "Off"] },
+        { type: "segmented", key: "edges", label: "Edges", options: ["On", "Off"] },
         { type: "segmented", key: "seeding", label: "Seeding", options: ["Multilevel", "Cold"] },
       ]}
       width={760}

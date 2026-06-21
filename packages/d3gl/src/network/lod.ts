@@ -37,6 +37,14 @@ export interface LODTree {
   /** Children CSR: node `g`'s children are `children[childOffset[g] .. childOffset[g+1]]` (one level finer). */
   childOffset: Uint32Array;
   children: Uint32Array;
+  /**
+   * Same-level adjacency CSR for **aggregates** (super-edges): aggregate `g`'s same-level neighbours
+   * are `edgeNeighbors[edgeOffset[g] .. edgeOffset[g+1]]`. Built from the coarse levels only; leaf
+   * adjacency is the graph's own CSR (a leaf's global id equals its node id), so leaf entries are
+   * empty here. Symmetric.
+   */
+  edgeOffset: Uint32Array;
+  edgeNeighbors: Uint32Array;
   // --- geometry, filled by computeLODGeometry from the settled layout ---
   /** Centroid x of each node's leaf descendants. */
   cx: Float32Array;
@@ -99,6 +107,35 @@ export function buildLODTree(graph: NetworkGraph, coarsen?: CoarsenOptions): LOD
     }
   }
 
+  // Same-level adjacency for aggregates (super-edges), from the coarse levels only (level 0 reuses
+  // graph.csr). Symmetric: count → prefix-sum → scatter, like buildCSR.
+  const edgeOffset = new Uint32Array(size + 1);
+  for (let k = 1; k < levelCount; k++) {
+    const lvl = levels[k]!;
+    const base = levelOffset[k]!;
+    for (let e = 0; e < lvl.source.length; e++) {
+      const a = base + lvl.source[e]!;
+      const b = base + lvl.target[e]!;
+      edgeOffset[a + 1] = edgeOffset[a + 1]! + 1;
+      edgeOffset[b + 1] = edgeOffset[b + 1]! + 1;
+    }
+  }
+  for (let g = 0; g < size; g++) edgeOffset[g + 1] = edgeOffset[g + 1]! + edgeOffset[g]!;
+  const edgeNeighbors = new Uint32Array(edgeOffset[size]!);
+  const ecur = edgeOffset.slice(0, size);
+  for (let k = 1; k < levelCount; k++) {
+    const lvl = levels[k]!;
+    const base = levelOffset[k]!;
+    for (let e = 0; e < lvl.source.length; e++) {
+      const a = base + lvl.source[e]!;
+      const b = base + lvl.target[e]!;
+      edgeNeighbors[ecur[a]!] = b;
+      ecur[a] = ecur[a]! + 1;
+      edgeNeighbors[ecur[b]!] = a;
+      ecur[b] = ecur[b]! + 1;
+    }
+  }
+
   return {
     size,
     leafCount,
@@ -106,6 +143,8 @@ export function buildLODTree(graph: NetworkGraph, coarsen?: CoarsenOptions): LOD
     levelOffset,
     childOffset,
     children,
+    edgeOffset,
+    edgeNeighbors,
     cx: new Float32Array(size),
     cy: new Float32Array(size),
     extent: new Float32Array(size),

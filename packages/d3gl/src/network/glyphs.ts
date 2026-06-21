@@ -163,6 +163,67 @@ export function frontierCircles(tree: LODTree, frontier: Uint32Array, style: Fro
   return { centers, radii, colors, count };
 }
 
+export interface SuperEdgeStyleResolved {
+  width: number;
+  stroke: string;
+}
+
+/**
+ * Instanced line data for **super-edges**: a line between two frontier nodes that are same-level
+ * neighbours and both present in the frontier (so both survived the cut + declutter). Leaf
+ * neighbours come from the graph's CSR (a leaf's global id is its node id); aggregate neighbours from
+ * the tree's coarse adjacency. Undirected and deduped (emitted once, for `h > g`). Bounded by the
+ * visible frontier — cross-level pairs (a frontier node connected to a region shown at a different
+ * LOD level) are omitted for now; same-level covers the common locally-uniform cut.
+ */
+export function superEdgeLines(
+  graph: NetworkGraph,
+  tree: LODTree,
+  frontier: Uint32Array,
+  style: SuperEdgeStyleResolved,
+): InstancedLinesData {
+  const present = new Uint8Array(tree.size);
+  for (let i = 0; i < frontier.length; i++) present[frontier[i]!] = 1;
+
+  const a: number[] = [];
+  const b: number[] = [];
+  const { offsets, neighbors } = graph.csr;
+  for (let i = 0; i < frontier.length; i++) {
+    const g = frontier[i]!;
+    if (g < tree.leafCount) {
+      for (let p = offsets[g]!; p < offsets[g + 1]!; p++) {
+        const h = neighbors[p]!;
+        if (h > g && present[h]) {
+          a.push(g);
+          b.push(h);
+        }
+      }
+    } else {
+      for (let p = tree.edgeOffset[g]!; p < tree.edgeOffset[g + 1]!; p++) {
+        const h = tree.edgeNeighbors[p]!;
+        if (h > g && present[h]) {
+          a.push(g);
+          b.push(h);
+        }
+      }
+    }
+  }
+
+  const count = a.length;
+  const sources = new Float32Array(count * 2);
+  const targets = new Float32Array(count * 2);
+  for (let e = 0; e < count; e++) {
+    const g = a[e]!;
+    const h = b[e]!;
+    sources[e * 2] = tree.cx[g]!;
+    sources[e * 2 + 1] = tree.cy[g]!;
+    targets[e * 2] = tree.cx[h]!;
+    targets[e * 2 + 1] = tree.cy[h]!;
+  }
+  const widths = new Float32Array(count).fill(style.width);
+  return { sources, targets, widths, colors: fillColors(count, style.stroke), count };
+}
+
 /**
  * Instanced straight-line data for a graph's links, gathering each edge's endpoints from the
  * node positions by index. Rebuilt when positions change (it copies, unlike {@link nodeCircles}).

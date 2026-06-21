@@ -1,5 +1,5 @@
 import { BaseEngine, type BaseEngineOptions } from "../map/base-engine.js";
-import { networkLayers, frontierCircles, emitNodes, emitLinks, emitArrows, resolveNodeRadii, type ResolvedNetworkStyle, type NodeRadiusSpec } from "./glyphs.js";
+import { networkLayers, frontierCircles, superEdgeLines, emitNodes, emitLinks, emitArrows, resolveNodeRadii, type ResolvedNetworkStyle, type NodeRadiusSpec } from "./glyphs.js";
 import { ForceLayout, seedPositions, type ForceParams } from "./force.js";
 import { multilevelLayout, type CoarsenOptions } from "./coarsen.js";
 import { buildLODTree, computeLODGeometry, cut, declutterFrontier, type LODTree } from "./lod.js";
@@ -93,6 +93,12 @@ export interface NetworkLODOptions {
   declutter?: boolean;
   /** Spacing multiplier for {@link declutter} (>1 sparser, <1 denser). Default 1. */
   declutterSpacing?: number;
+  /**
+   * Draw **super-edges**: links between visible frontier nodes (leaf↔leaf via the graph, aggregate↔
+   * aggregate via the coarse adjacency), summarising connectivity at the current LOD. Uses
+   * `linkWidth`/`linkStroke`. Default `true`. (Same-level pairs only for now; see {@link superEdgeLines}.)
+   */
+  superEdges?: boolean;
   /** Coarsening granularity for the LOD tree (depth / minimum aggregate size). */
   coarsen?: CoarsenOptions;
 }
@@ -325,12 +331,19 @@ export class Network extends BaseEngine {
         spacing: opts.declutterSpacing,
       });
     }
+    const layers: InstancedLayer[] = [];
+    // Super-edges first (drawn under the nodes), among the visible frontier only.
+    if (opts.superEdges !== false && this.graph!.edgeCount > 0) {
+      const lines = superEdgeLines(this.graph!, tree, frontier, { width: style.linkWidth, stroke: style.linkStroke });
+      if (lines.count > 0) layers.push({ name: "links", primitive: "lines", lines, sizeMode: style.sizeMode });
+    }
     const circles = frontierCircles(tree, frontier, {
       nodeFill: style.nodeFill,
       aggregateFill: opts.aggregateFill ?? style.nodeFill,
       maxAggregateRadius: opts.maxAggregateRadius,
     });
-    return [{ name: "nodes", primitive: "circles", circles, sizeMode: style.sizeMode }];
+    layers.push({ name: "nodes", primitive: "circles", circles, sizeMode: style.sizeMode });
+    return layers;
   }
 
   /**

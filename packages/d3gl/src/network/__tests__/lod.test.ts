@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { buildLODTree, computeLODGeometry, cut, declutterFrontier } from "../lod.js";
-import { frontierCircles } from "../glyphs.js";
+import { frontierCircles, superEdgeLines } from "../glyphs.js";
 import { buildGraph } from "../graph.js";
 
 /**
@@ -23,6 +23,9 @@ describe("buildLODTree", () => {
     // aggregate 4 = {0,1}, aggregate 5 = {2,3}
     expect(Array.from(tree.children.slice(tree.childOffset[4]!, tree.childOffset[5]!))).toEqual([0, 1]);
     expect(Array.from(tree.children.slice(tree.childOffset[5]!, tree.childOffset[6]!))).toEqual([2, 3]);
+    // coarse same-level adjacency: the two aggregates are neighbours (the bridge between the pairs)
+    expect(Array.from(tree.edgeNeighbors.slice(tree.edgeOffset[4]!, tree.edgeOffset[5]!))).toEqual([5]);
+    expect(Array.from(tree.edgeNeighbors.slice(tree.edgeOffset[5]!, tree.edgeOffset[6]!))).toEqual([4]);
   });
 
   it("leaves a non-coarsenable graph single-level (every node is its own root)", () => {
@@ -181,5 +184,32 @@ describe("declutterFrontier", () => {
         expect(dist).toBeGreaterThanOrEqual(tree.radius[ga]! + tree.radius[gb]! - 1e-6); // no overlap
       }
     }
+  });
+});
+
+describe("superEdgeLines", () => {
+  const make = () => {
+    const g = buildGraph({ nodeCount: 4, source: [0, 2, 1], target: [1, 3, 2], weight: [2, 2, 1] });
+    g.positions.set([0, 0, 2, 0, 10, 0, 12, 0]);
+    const tree = buildLODTree(g, { minNodes: 2 });
+    computeLODGeometry(tree, g, new Float32Array([4, 4, 4, 4]));
+    return { g, tree };
+  };
+
+  it("links leaf neighbours present in the frontier (via the graph CSR)", () => {
+    const { g, tree } = make();
+    const lines = superEdgeLines(g, tree, new Uint32Array([0, 1, 2, 3]), { width: 1, stroke: "#000" });
+    expect(lines.count).toBe(3); // edges (0,1), (1,2), (2,3)
+  });
+
+  it("links aggregate neighbours via the coarse adjacency, and skips edges to absent nodes", () => {
+    const { g, tree } = make();
+    const both = superEdgeLines(g, tree, new Uint32Array([4, 5]), { width: 1, stroke: "#000" });
+    expect(both.count).toBe(1); // the bridge between the two aggregates
+    expect(Array.from(both.sources.slice(0, 2))).toEqual([1, 0]); // centroid of aggregate 4
+    expect(Array.from(both.targets.slice(0, 2))).toEqual([11, 0]); // centroid of aggregate 5
+
+    const one = superEdgeLines(g, tree, new Uint32Array([4]), { width: 1, stroke: "#000" });
+    expect(one.count).toBe(0); // neighbour 5 absent from the frontier
   });
 });
