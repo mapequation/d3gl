@@ -2,7 +2,7 @@ import { BaseEngine, type BaseEngineOptions } from "../map/base-engine.js";
 import { networkLayers, frontierCircles, emitNodes, emitLinks, emitArrows, resolveNodeRadii, type ResolvedNetworkStyle, type NodeRadiusSpec } from "./glyphs.js";
 import { ForceLayout, seedPositions, type ForceParams } from "./force.js";
 import { multilevelLayout, type CoarsenOptions } from "./coarsen.js";
-import { buildLODTree, computeLODGeometry, cut, type LODTree } from "./lod.js";
+import { buildLODTree, computeLODGeometry, cut, declutterFrontier, type LODTree } from "./lod.js";
 import { startWorkerLayout, type WorkerLayoutHandle } from "./worker-transport.js";
 import type { NetworkGraph } from "./graph.js";
 import type { Backend, InstancedLayer, ViewTransform } from "../core/index.js";
@@ -85,6 +85,14 @@ export interface NetworkLODOptions {
    * screen mode so large aggregates stay readable rather than ballooning to hundreds of pixels.
    */
   maxAggregateRadius?: number;
+  /**
+   * Thin overlapping frontier glyphs in screen space, keeping the most important (by strength) and
+   * dropping those covered by a kept glyph — so dense regions stay readable instead of a solid mass.
+   * Zoom-dependent (more resolve as you zoom in). Default `true`.
+   */
+  declutter?: boolean;
+  /** Spacing multiplier for {@link declutter} (>1 sparser, <1 denser). Default 1. */
+  declutterSpacing?: number;
   /** Coarsening granularity for the LOD tree (depth / minimum aggregate size). */
   coarsen?: CoarsenOptions;
 }
@@ -307,11 +315,20 @@ export class Network extends BaseEngine {
    * visible frontier, not the graph size. (Nodes now; super-edges + frontier declutter follow.)
    */
   private lodLayers(tree: LODTree, style: ResolvedNetworkStyle): InstancedLayer[] {
-    const frontier = cut(tree, this.transform, this.width, this.height, { expandPx: this.lodOptions!.expandPx });
+    const opts = this.lodOptions!;
+    let frontier = cut(tree, this.transform, this.width, this.height, { expandPx: opts.expandPx });
+    if (opts.declutter !== false) {
+      frontier = declutterFrontier(tree, frontier, this.transform, this.width, this.height, {
+        screenSized: style.sizeMode === "screen",
+        k: this.transform.k,
+        maxAggregateRadius: opts.maxAggregateRadius,
+        spacing: opts.declutterSpacing,
+      });
+    }
     const circles = frontierCircles(tree, frontier, {
       nodeFill: style.nodeFill,
-      aggregateFill: this.lodOptions!.aggregateFill ?? style.nodeFill,
-      maxAggregateRadius: this.lodOptions!.maxAggregateRadius,
+      aggregateFill: opts.aggregateFill ?? style.nodeFill,
+      maxAggregateRadius: opts.maxAggregateRadius,
     });
     return [{ name: "nodes", primitive: "circles", circles, sizeMode: style.sizeMode }];
   }

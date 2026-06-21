@@ -257,3 +257,102 @@ export function cut(
 export function isLeaf(tree: LODTree, g: number): boolean {
   return g < tree.leafCount;
 }
+
+export interface DeclutterOptions {
+  /** True when glyphs are sized in screen pixels (`sizeMode: "screen"`); else world radii × k. */
+  screenSized: boolean;
+  /** The transform scale `k`, used to project world radii to pixels when not screen-sized. */
+  k: number;
+  /** Aggregate draw-radius cap (matches {@link frontierCircles}), for the on-screen size. */
+  maxAggregateRadius?: number;
+  /** Spacing multiplier on the exclusion radius (>1 = sparser, <1 = denser). Default 1. */
+  spacing?: number;
+}
+
+/**
+ * Thin an LOD frontier in screen space: keep higher-importance glyphs (by tree {@link LODTree.weight}
+ * = strength) and drop lower-importance ones whose centre falls within a kept glyph's on-screen
+ * radius. Greedy in descending importance over a uniform screen grid (cell = max glyph radius), so a
+ * dense cluster keeps its most important members and overdraw is bounded. Runs per cut, so it's
+ * zoom-dependent — more glyphs resolve as you zoom in. Returns the kept frontier ids (original order).
+ */
+export function declutterFrontier(
+  tree: LODTree,
+  frontier: Uint32Array,
+  t: LODTransform,
+  width: number,
+  height: number,
+  opts: DeclutterOptions,
+): Uint32Array {
+  const F = frontier.length;
+  if (F <= 1) return frontier;
+  const maxAgg = opts.maxAggregateRadius ?? Infinity;
+  const spacing = opts.spacing ?? 1;
+
+  // Project each glyph to screen and resolve its on-screen draw radius (matching frontierCircles).
+  const px = new Float64Array(F);
+  const py = new Float64Array(F);
+  const pr = new Float64Array(F);
+  let maxR = 1;
+  for (let i = 0; i < F; i++) {
+    const g = frontier[i]!;
+    const drawn = g < tree.leafCount ? tree.radius[g]! : Math.min(tree.radius[g]!, maxAgg);
+    const r = opts.screenSized ? drawn : drawn * opts.k;
+    pr[i] = r;
+    px[i] = tree.cx[g]! * t.k + t.x;
+    py[i] = tree.cy[g]! * t.k + t.y;
+    if (r > maxR) maxR = r;
+  }
+
+  // Visit in descending importance so the most important glyph in a cluster survives.
+  const order = Array.from({ length: F }, (_, i) => i);
+  order.sort((a, b) => tree.weight[frontier[b]!]! - tree.weight[frontier[a]!]!);
+
+  // Uniform grid with cell = the largest exclusion radius, so any colliding kept glyph is in the
+  // 3×3 neighbourhood. Intrusive linked list of kept glyphs per cell (no per-cell allocation).
+  const cell = Math.max(maxR * spacing, 1);
+  const cols = Math.floor(width / cell) + 3;
+  const rows = Math.floor(height / cell) + 3;
+  const head = new Int32Array(cols * rows).fill(-1);
+  const next = new Int32Array(F);
+  const kept = new Uint8Array(F);
+
+  for (const i of order) {
+    const x = px[i]!;
+    const y = py[i]!;
+    const r = pr[i]!;
+    let cx = Math.floor(x / cell) + 1;
+    let cy = Math.floor(y / cell) + 1;
+    cx = cx < 0 ? 0 : cx >= cols ? cols - 1 : cx;
+    cy = cy < 0 ? 0 : cy >= rows ? rows - 1 : cy;
+    let occluded = false;
+    for (let gx = cx - 1; gx <= cx + 1 && !occluded; gx++) {
+      if (gx < 0 || gx >= cols) continue;
+      for (let gy = cy - 1; gy <= cy + 1 && !occluded; gy++) {
+        if (gy < 0 || gy >= rows) continue;
+        for (let p = head[gy * cols + gx]!; p !== -1; p = next[p]!) {
+          const dx = px[p]! - x;
+          const dy = py[p]! - y;
+          const thresh = spacing * Math.max(r, pr[p]!);
+          if (dx * dx + dy * dy < thresh * thresh) {
+            occluded = true;
+            break;
+          }
+        }
+      }
+    }
+    if (!occluded) {
+      kept[i] = 1;
+      const c = cy * cols + cx;
+      next[i] = head[c]!;
+      head[c] = i;
+    }
+  }
+
+  let n = 0;
+  for (let i = 0; i < F; i++) if (kept[i]) n++;
+  const out = new Uint32Array(n);
+  let w = 0;
+  for (let i = 0; i < F; i++) if (kept[i]) out[w++] = frontier[i]!;
+  return out;
+}

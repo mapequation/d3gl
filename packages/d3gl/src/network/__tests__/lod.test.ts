@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { buildLODTree, computeLODGeometry, cut } from "../lod.js";
+import { buildLODTree, computeLODGeometry, cut, declutterFrontier } from "../lod.js";
 import { frontierCircles } from "../glyphs.js";
 import { buildGraph } from "../graph.js";
 
@@ -115,5 +115,37 @@ describe("frontierCircles", () => {
     });
     expect(c.radii[0]).toBeCloseTo(4); // leaf uncapped
     expect(c.radii[1]).toBeCloseTo(5); // aggregate clamped from √32 to 5
+  });
+});
+
+describe("declutterFrontier", () => {
+  // Four leaves on a line at x = 0,2,10,12 (radius 4); strength weights [2,3,3,2].
+  const treeOnLine = () => {
+    const g = buildGraph({ nodeCount: 4, source: [0, 2, 1], target: [1, 3, 2], weight: [2, 2, 1] });
+    g.positions.set([0, 0, 2, 0, 10, 0, 12, 0]);
+    const tree = buildLODTree(g, { minNodes: 2 });
+    computeLODGeometry(tree, g, new Float32Array([4, 4, 4, 4]));
+    return tree;
+  };
+
+  it("drops lower-importance glyphs covered by a kept one, keeping the higher-strength member", () => {
+    const tree = treeOnLine();
+    // screen-sized radius 4; pairs (0,1) at x=0,2 and (2,3) at x=10,12 overlap (gap 2 < radius 4).
+    // Within each pair the higher-strength node (1 and 2, strength 3) survives; 0 and 3 (strength 2) drop.
+    const kept = declutterFrontier(tree, new Uint32Array([0, 1, 2, 3]), { k: 1, x: 0, y: 0 }, 200, 200, {
+      screenSized: true,
+      k: 1,
+    });
+    expect(Array.from(kept)).toEqual([1, 2]);
+  });
+
+  it("keeps every glyph when nothing overlaps", () => {
+    const tree = treeOnLine();
+    // The two aggregates sit at x = 1 and x = 11 (gap 10) with radius √32 ≈ 5.66 → no overlap.
+    const kept = declutterFrontier(tree, new Uint32Array([4, 5]), { k: 1, x: 0, y: 0 }, 200, 200, {
+      screenSized: true,
+      k: 1,
+    });
+    expect(Array.from(kept).sort((a, b) => a - b)).toEqual([4, 5]);
   });
 });

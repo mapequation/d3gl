@@ -68,9 +68,18 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
         })
         .layout({ backend: "worker", iterations, multilevel })
         // Enable the adaptive cut: aggregates draw a touch lighter than leaves, capped at 26px so
-        // big collapsed clusters stay readable in screen mode. The cut tracks the layout as it
-        // converges and re-cuts cheaply on zoom.
-        .lod(options.lod === "On" ? { expandPx: 48, aggregateFill: "#7f97c8", maxAggregateRadius: 26 } : false);
+        // big collapsed clusters stay readable in screen mode. Frontier declutter thins overlapping
+        // glyphs by importance. The cut tracks the layout as it converges and re-cuts on zoom.
+        .lod(
+          options.lod === "On"
+            ? {
+                expandPx: 48,
+                aggregateFill: "#7f97c8",
+                maxAggregateRadius: 26,
+                declutter: options.declutter !== "Off",
+              }
+            : false,
+        );
     },
   };
 };

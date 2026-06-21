@@ -6,8 +6,8 @@ export { network, Network } from "./network.js";
 export type { NetworkOptions, NetworkStyle, NetworkLayoutOptions, NetworkLODOptions } from "./network.js";
 export type { NodeRadiusSpec, NodeMetric } from "./glyphs.js";
 
-export { buildLODTree, computeLODGeometry, cut } from "./lod.js";
-export type { LODTree, LODTransform, CutOptions } from "./lod.js";
+export { buildLODTree, computeLODGeometry, cut, declutterFrontier } from "./lod.js";
+export type { LODTree, LODTransform, CutOptions, DeclutterOptions } from "./lod.js";
 
 export { buildGraph, buildCSR } from "./graph.js";
 export type { NetworkGraph, CSR, BuildGraphInput } from "./graph.js";
