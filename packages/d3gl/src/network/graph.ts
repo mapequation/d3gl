@@ -69,6 +69,18 @@ export interface NetworkGraph {
   positions: Float32Array;
   /** Undirected adjacency for layout/traversal. */
   csr: CSR;
+  /**
+   * Per-node strength: the sum of incident edge weights (weighted degree), length `nodeCount`.
+   * A purely structural metric derived from the edge list — a sizing input alongside
+   * {@link CSR.degree}. (Not flow in the map-equation sense; that is {@link NetworkGraph.flow}.)
+   */
+  strength: Float32Array;
+  /**
+   * Per-node flow (e.g. an Infomap visit rate), length `nodeCount`, or `null` when the caller
+   * supplied none. A model quantity the app provides via {@link BuildGraphInput.nodeFlow} — d3gl
+   * does not derive it. Available to `nodeRadius` sizing as the `"flow"` metric.
+   */
+  flow: Float32Array | null;
   /** Whether links render with arrowheads. */
   directed: boolean;
 }
@@ -79,6 +91,11 @@ export interface BuildGraphInput {
   target: ArrayLike<number>;
   /** Optional per-edge weight; defaults to 1. */
   weight?: ArrayLike<number>;
+  /**
+   * Optional per-node flow (length must equal `nodeCount`) — a model quantity (e.g. Infomap visit
+   * rates) the app computes. Exposed as {@link NetworkGraph.flow} and usable for `nodeRadius` sizing.
+   */
+  nodeFlow?: ArrayLike<number>;
   /** Defaults to false (undirected). */
   directed?: boolean;
 }
@@ -95,6 +112,24 @@ export function buildGraph(input: BuildGraphInput): NetworkGraph {
   const positions = new Float32Array(nodeCount * 2);
   const csr = buildCSR(nodeCount, source, target);
 
+  // Weighted degree: each edge adds its weight to both endpoints (undirected, mirroring CSR.degree).
+  const strength = new Float32Array(nodeCount);
+  for (let e = 0; e < edgeCount; e++) {
+    const w = weight[e]!;
+    const s = source[e]!;
+    const t = target[e]!;
+    strength[s] = strength[s]! + w;
+    strength[t] = strength[t]! + w;
+  }
+
+  let flow: Float32Array | null = null;
+  if (input.nodeFlow) {
+    if (input.nodeFlow.length !== nodeCount) {
+      throw new Error(`buildGraph: nodeFlow length ${input.nodeFlow.length} !== nodeCount ${nodeCount}`);
+    }
+    flow = Float32Array.from(input.nodeFlow);
+  }
+
   return {
     nodeCount,
     edgeCount,
@@ -103,6 +138,8 @@ export function buildGraph(input: BuildGraphInput): NetworkGraph {
     weight,
     positions,
     csr,
+    strength,
+    flow,
     directed: input.directed ?? false,
   };
 }

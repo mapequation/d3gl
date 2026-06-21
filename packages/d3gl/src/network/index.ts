@@ -4,6 +4,7 @@
  */
 export { network, Network } from "./network.js";
 export type { NetworkOptions, NetworkStyle, NetworkLayoutOptions } from "./network.js";
+export type { NodeRadiusSpec, NodeMetric } from "./glyphs.js";
 
 export { buildGraph, buildCSR } from "./graph.js";
 export type { NetworkGraph, CSR, BuildGraphInput } from "./graph.js";

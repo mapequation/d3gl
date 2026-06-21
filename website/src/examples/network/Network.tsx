@@ -2,8 +2,9 @@ import Example from "../../components/Example.js";
 import Imperative from "../../components/Imperative.js";
 import { setup } from "./draw.js";
 
-/** Harness for the raw-network example: a node-count slider and a Directed/Undirected toggle.
- *  Rendering is WebGL-instanced (points + lines + arrowheads); scroll to zoom, drag to pan. */
+/** Harness for the raw-network example: a node-count slider, Directed/Undirected and uniform/
+ *  degree-weighted node-size toggles, and a seeding toggle. Rendering is WebGL-instanced (points +
+ *  lines + arrowheads); scroll to zoom, drag to pan. */
 export default function Network() {
   return (
     <Example
@@ -19,6 +20,7 @@ export default function Network() {
           display: ["10", "100", "1k", "10k", "100k", "1M"],
         },
         { type: "segmented", key: "mode", label: "Links", options: ["Directed", "Undirected"] },
+        { type: "segmented", key: "size", label: "Size", options: ["Uniform", "Degree"] },
         { type: "segmented", key: "seeding", label: "Seeding", options: ["Multilevel", "Cold"] },
       ]}
       width={760}
