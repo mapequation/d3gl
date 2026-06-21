@@ -160,9 +160,26 @@ export function coarsenLevel(level: CoarseLevel): { coarse: CoarseLevel; project
     }
   }
 
-  // Aggregate inter-group edges: key each undirected coarse pair (ca<cb), summing weights.
-  const edgeMap = new Map<number, number>();
-  for (let e = 0; e < source.length; e++) {
+  // Aggregate inter-group edges (undirected coarse pair ca<cb, summing weights) with a flat
+  // typed-array pass instead of a Map<number,number>: bucket the edges by `ca` (counting sort), then
+  // sum within each bucket via a per-`ca` mark. O(edges + coarseCount), no hashing/boxing/GC, and no
+  // `ca * coarseCount + cb` key (which overflowed 2⁵³ at large coarseCount).
+  const m = source.length;
+  const deg = new Uint32Array(coarseCount);
+  let cnt = 0;
+  for (let e = 0; e < m; e++) {
+    const ca = projection[source[e]!]!;
+    const cb = projection[target[e]!]!;
+    if (ca === cb) continue;
+    deg[ca < cb ? ca : cb] = deg[ca < cb ? ca : cb]! + 1;
+    cnt++;
+  }
+  const bucketOffsets = new Uint32Array(coarseCount + 1);
+  for (let c = 0; c < coarseCount; c++) bucketOffsets[c + 1] = bucketOffsets[c]! + deg[c]!;
+  const bucketCb = new Uint32Array(cnt);
+  const bucketW = new Float32Array(cnt);
+  const cursor = bucketOffsets.slice(0, coarseCount);
+  for (let e = 0; e < m; e++) {
     let ca = projection[source[e]!]!;
     let cb = projection[target[e]!]!;
     if (ca === cb) continue;
@@ -171,23 +188,44 @@ export function coarsenLevel(level: CoarseLevel): { coarse: CoarseLevel; project
       ca = cb;
       cb = tmp;
     }
-    const key = ca * coarseCount + cb;
-    edgeMap.set(key, (edgeMap.get(key) ?? 0) + weight[e]!);
+    const p = cursor[ca]!;
+    cursor[ca] = p + 1;
+    bucketCb[p] = cb;
+    bucketW[p] = weight[e]!;
   }
 
-  const ce = edgeMap.size;
-  const cs = new Uint32Array(ce);
-  const ct = new Uint32Array(ce);
-  const cw = new Float32Array(ce);
-  let i = 0;
-  for (const [key, ww] of edgeMap) {
-    cs[i] = Math.floor(key / coarseCount);
-    ct[i] = key % coarseCount;
-    cw[i] = ww;
-    i++;
+  // Sum parallel edges within each ca-bucket; `mark[cb] === ca` means "already emitted this bucket".
+  const cs = new Uint32Array(cnt);
+  const ct = new Uint32Array(cnt);
+  const cw = new Float32Array(cnt);
+  const mark = new Int32Array(coarseCount).fill(-1);
+  const slot = new Uint32Array(coarseCount);
+  let ce = 0;
+  for (let ca = 0; ca < coarseCount; ca++) {
+    for (let p = bucketOffsets[ca]!; p < bucketOffsets[ca + 1]!; p++) {
+      const cb = bucketCb[p]!;
+      if (mark[cb] !== ca) {
+        mark[cb] = ca;
+        slot[cb] = ce;
+        cs[ce] = ca;
+        ct[ce] = cb;
+        cw[ce] = bucketW[p]!;
+        ce++;
+      } else {
+        cw[slot[cb]!] = cw[slot[cb]!]! + bucketW[p]!;
+      }
+    }
   }
 
-  return { coarse: { nodeCount: coarseCount, source: cs, target: ct, weight: cw }, projection };
+  return {
+    coarse: {
+      nodeCount: coarseCount,
+      source: cs.subarray(0, ce),
+      target: ct.subarray(0, ce),
+      weight: cw.subarray(0, ce),
+    },
+    projection,
+  };
 }
 
 /** Build the full coarsening hierarchy, stopping at `minNodes` or when a pass stops reducing. */
