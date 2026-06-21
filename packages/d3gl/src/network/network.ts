@@ -1,5 +1,5 @@
 import { BaseEngine, type BaseEngineOptions } from "../map/base-engine.js";
-import { networkLayers, emitNodes, emitLinks, emitArrows, type ResolvedNetworkStyle } from "./glyphs.js";
+import { networkLayers, emitNodes, emitLinks, emitArrows, resolveNodeRadii, type ResolvedNetworkStyle, type NodeRadiusSpec } from "./glyphs.js";
 import { ForceLayout, seedPositions, type ForceParams } from "./force.js";
 import { multilevelLayout } from "./coarsen.js";
 import { startWorkerLayout, type WorkerLayoutHandle } from "./worker-transport.js";
@@ -12,8 +12,14 @@ export interface NetworkOptions extends BaseEngineOptions {}
 export interface NetworkStyle {
   /** Render links with arrowheads. Defaults to the graph's `directed` flag. */
   directed?: boolean;
-  /** Node radius in world units. Default 4. */
-  nodeRadius?: number;
+  /**
+   * Node radius (world units). A constant `number` (default 4), a per-node `Float32Array`, a
+   * `(degree, index, graph) => radius` accessor (a bare d3 scale fits — it receives the node's
+   * degree), or `{ by, scale }` to size by a chosen metric (`"degree"` | `"strength"` | `"flow"` |
+   * custom accessor) through any scale. Resolved once per call — no per-frame or rendering cost.
+   * @see {@link NodeRadiusSpec}
+   */
+  nodeRadius?: NodeRadiusSpec;
   /** Node fill colour (any CSS color). Default a medium blue. */
   nodeFill?: string;
   /** Link width in world units. Default 1. */
@@ -222,7 +228,7 @@ export class Network extends BaseEngine {
       ids: edgeIds,
       fill: () => style.arrowFill,
       build: (g) => {
-        if (emit && style.directed) emitArrows(g, graph, style.arrowSize, style.nodeRadius);
+        if (emit && style.directed) emitArrows(g, graph, style.arrowSize, style.nodeRadii);
       },
     });
     this.registerLayer({
@@ -231,7 +237,7 @@ export class Network extends BaseEngine {
       ids: nodeIds,
       fill: () => style.nodeFill,
       build: (g) => {
-        if (emit) emitNodes(g, graph, style.nodeRadius);
+        if (emit) emitNodes(g, graph, style.nodeRadii);
       },
     });
   }
@@ -241,7 +247,7 @@ export class Network extends BaseEngine {
     const linkWidth = this.styleOpts.linkWidth ?? DEFAULT_LINK_WIDTH;
     const linkStroke = this.styleOpts.linkStroke ?? DEFAULT_LINK_STROKE;
     return {
-      nodeRadius: this.styleOpts.nodeRadius ?? DEFAULT_NODE_RADIUS,
+      nodeRadii: resolveNodeRadii(graph, this.styleOpts.nodeRadius ?? DEFAULT_NODE_RADIUS),
       nodeFill: this.styleOpts.nodeFill ?? DEFAULT_NODE_FILL,
       linkWidth,
       linkStroke,

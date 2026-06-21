@@ -56,4 +56,27 @@ describe("buildGraph", () => {
     expect(Array.from(g.weight)).toEqual([2.5]);
     expect(g.directed).toBe(false);
   });
+
+  it("computes per-node strength (weighted degree) from incident edges, defaulting weights to 1", () => {
+    // star centred on node 1; weights 1/2/3 → hub strength 6, leaves 1/2/3.
+    const weighted = buildGraph({ nodeCount: 4, source: [0, 1, 1], target: [1, 2, 3], weight: [1, 2, 3] });
+    expect(weighted.strength).toBeInstanceOf(Float32Array);
+    expect(Array.from(weighted.strength)).toEqual([1, 6, 2, 3]);
+
+    // unweighted strength equals degree (every edge contributes 1 to both ends).
+    const plain = buildGraph({ nodeCount: 4, source: [0, 1, 1], target: [1, 2, 3] });
+    expect(Array.from(plain.strength)).toEqual(Array.from(plain.csr.degree));
+  });
+
+  it("keeps flow null unless supplied, copies provided flow, and validates its length", () => {
+    expect(buildGraph({ nodeCount: 2, source: [0], target: [1] }).flow).toBeNull();
+
+    const g = buildGraph({ nodeCount: 3, source: [0, 1], target: [1, 2], nodeFlow: [0.5, 0.3, 0.2] });
+    expect(g.flow).toBeInstanceOf(Float32Array);
+    expect(Array.from(g.flow!)).toEqual([0.5, expect.closeTo(0.3), expect.closeTo(0.2)]); // float32 rounding
+
+    expect(() => buildGraph({ nodeCount: 3, source: [], target: [], nodeFlow: [0.5, 0.5] })).toThrow(
+      /nodeFlow length 2 !== nodeCount 3/,
+    );
+  });
 });

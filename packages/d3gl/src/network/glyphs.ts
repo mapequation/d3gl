@@ -8,8 +8,74 @@ import type { NetworkGraph } from "./graph.js";
  * or, later, to the PathContext seam for SVG/Canvas export (#100 N2.3).
  */
 
+/**
+ * A built-in per-node metric d3gl can read directly, or a custom `(index, graph) => value` accessor.
+ * `"degree"` is the neighbour count ({@link CSR.degree}); `"strength"` the weighted degree
+ * ({@link NetworkGraph.strength}); `"flow"` the app-provided {@link NetworkGraph.flow} (errors if absent).
+ */
+export type NodeMetric = "degree" | "strength" | "flow" | ((index: number, graph: NetworkGraph) => number);
+
+/**
+ * How node radius is determined. Resolves once (per `style()` call) to a per-node `Float32Array`,
+ * which is already a per-instance GPU attribute — so any of these forms is free at draw time.
+ *
+ * - `number` — one constant radius for every node.
+ * - `Float32Array` — caller-supplied per-node radii (length must equal `nodeCount`); used as-is.
+ * - function — `(value, index, graph) => radius`, where `value` is the node's **degree**. A bare d3
+ *   scale fits here directly: `scaleSqrt().domain([1, maxDegree]).range([2, 20])`.
+ * - `{ by, scale }` — feed a chosen metric through any scale: `{ by: "strength", scale }`. Use this
+ *   to size by `strength`/`flow` (or a custom accessor) with a reusable scale instead of degree.
+ */
+export type NodeRadiusSpec =
+  | number
+  | Float32Array
+  | ((value: number, index: number, graph: NetworkGraph) => number)
+  | { by: NodeMetric; scale: (value: number) => number };
+
+/** Resolve a {@link NodeMetric} to an `(index) => value` reader over the graph's metric arrays. */
+function metricAccessor(graph: NetworkGraph, by: NodeMetric): (index: number) => number {
+  if (typeof by === "function") return (i) => by(i, graph);
+  switch (by) {
+    case "degree":
+      return (i) => graph.csr.degree[i]!;
+    case "strength":
+      return (i) => graph.strength[i]!;
+    case "flow": {
+      const flow = graph.flow;
+      if (!flow) throw new Error(`nodeRadius by:"flow" requires nodeFlow passed to buildGraph()`);
+      return (i) => flow[i]!;
+    }
+    default:
+      throw new Error(`nodeRadius: unknown metric ${JSON.stringify(by)}`);
+  }
+}
+
+/**
+ * Resolve a {@link NodeRadiusSpec} to a per-node `Float32Array` of radii (length `nodeCount`).
+ * Called once per `style()` change — never per frame.
+ */
+export function resolveNodeRadii(graph: NetworkGraph, spec: NodeRadiusSpec): Float32Array {
+  const n = graph.nodeCount;
+  if (typeof spec === "number") return new Float32Array(n).fill(spec);
+  if (spec instanceof Float32Array) {
+    if (spec.length !== n) throw new Error(`nodeRadius Float32Array length ${spec.length} !== nodeCount ${n}`);
+    return spec; // used directly as the instance buffer — no copy
+  }
+  const radii = new Float32Array(n);
+  if (typeof spec === "function") {
+    const degree = graph.csr.degree;
+    for (let i = 0; i < n; i++) radii[i] = spec(degree[i]!, i, graph);
+    return radii;
+  }
+  const value = metricAccessor(graph, spec.by);
+  const { scale } = spec;
+  for (let i = 0; i < n; i++) radii[i] = scale(value(i));
+  return radii;
+}
+
 export interface NodeStyleResolved {
-  radius: number;
+  /** Per-node radius (world units), length `graph.nodeCount`. Resolved via {@link resolveNodeRadii}. */
+  radii: Float32Array;
   fill: string;
 }
 
@@ -44,12 +110,12 @@ function fillColors(count: number, css: string): Uint8Array {
 
 /**
  * Instanced-circle data for a graph's nodes. Shares the graph's positions buffer as the
- * instance centres (no copy); radii/colours are constant for now (degree/flow scaling later).
+ * instance centres *and* the resolved per-node `radii` buffer (no copies) — `radii` is already a
+ * per-instance GPU attribute, so degree/flow-scaled sizing costs nothing extra at draw time.
  */
 export function nodeCircles(graph: NetworkGraph, style: NodeStyleResolved): InstancedCirclesData {
   const count = graph.nodeCount;
-  const radii = new Float32Array(count).fill(style.radius);
-  return { centers: graph.positions, radii, colors: fillColors(count, style.fill), count };
+  return { centers: graph.positions, radii: style.radii, colors: fillColors(count, style.fill), count };
 }
 
 /**
@@ -74,13 +140,15 @@ export function linkLines(graph: NetworkGraph, style: LinkStyleResolved): Instan
 
 export interface ArrowStyleResolved {
   size: number;
-  nodeRadius: number;
+  /** Per-node radii (world units) — the tip is set back by the *target* node's radius. */
+  nodeRadii: Float32Array;
   fill: string;
 }
 
 /**
- * Instanced arrowhead data for a directed graph's links. The tip sits `nodeRadius` back from
- * the target node's centre (so it meets the node boundary), oriented from the source.
+ * Instanced arrowhead data for a directed graph's links. The tip sits the *target* node's radius
+ * back from its centre (so it meets the node boundary even when nodes are degree/flow-sized),
+ * oriented from the source.
  */
 export function linkArrows(graph: NetworkGraph, style: ArrowStyleResolved): InstancedArrowsData {
   const count = graph.edgeCount;
@@ -98,10 +166,11 @@ export function linkArrows(graph: NetworkGraph, style: ArrowStyleResolved): Inst
     const len = Math.hypot(dx, dy) || 1;
     const ux = dx / len;
     const uy = dy / len;
+    const setback = style.nodeRadii[t]!;
     sources[e * 2] = sx;
     sources[e * 2 + 1] = sy;
-    targets[e * 2] = tx - ux * style.nodeRadius;
-    targets[e * 2 + 1] = ty - uy * style.nodeRadius;
+    targets[e * 2] = tx - ux * setback;
+    targets[e * 2 + 1] = ty - uy * setback;
   }
   const sizes = new Float32Array(count).fill(style.size);
   return { sources, targets, sizes, colors: fillColors(count, style.fill), count };
@@ -109,7 +178,8 @@ export function linkArrows(graph: NetworkGraph, style: ArrowStyleResolved): Inst
 
 /** Fully-resolved network style (defaults applied) for assembling the render layers. */
 export interface ResolvedNetworkStyle {
-  nodeRadius: number;
+  /** Per-node radii (world units), length `nodeCount`; resolved via {@link resolveNodeRadii}. */
+  nodeRadii: Float32Array;
   nodeFill: string;
   linkWidth: number;
   linkStroke: string;
@@ -136,7 +206,7 @@ export function networkLayers(graph: NetworkGraph, style: ResolvedNetworkStyle):
       layers.push({
         name: "arrows",
         primitive: "arrows",
-        arrows: linkArrows(graph, { size: style.arrowSize, nodeRadius: style.nodeRadius, fill: style.arrowFill }),
+        arrows: linkArrows(graph, { size: style.arrowSize, nodeRadii: style.nodeRadii, fill: style.arrowFill }),
         sizeMode: "world",
       });
     }
@@ -144,7 +214,7 @@ export function networkLayers(graph: NetworkGraph, style: ResolvedNetworkStyle):
   layers.push({
     name: "nodes",
     primitive: "circles",
-    circles: nodeCircles(graph, { radius: style.nodeRadius, fill: style.nodeFill }),
+    circles: nodeCircles(graph, { radii: style.nodeRadii, fill: style.nodeFill }),
     sizeMode: "world",
   });
   return layers;
@@ -156,10 +226,10 @@ export function networkLayers(graph: NetworkGraph, style: ResolvedNetworkStyle):
 // networks and toSVG() produces publication output, reusing the existing pipeline.
 // ---------------------------------------------------------------------------
 
-/** Emit each node as a circle (point) drawable, keyed by node index. */
-export function emitNodes(g: GroupBuilder, graph: NetworkGraph, radius: number): void {
+/** Emit each node as a circle (point) drawable, keyed by node index, sized by its resolved radius. */
+export function emitNodes(g: GroupBuilder, graph: NetworkGraph, radii: Float32Array): void {
   for (let i = 0; i < graph.nodeCount; i++) {
-    g.point(i, graph.positions[i * 2]!, graph.positions[i * 2 + 1]!, radius);
+    g.point(i, graph.positions[i * 2]!, graph.positions[i * 2 + 1]!, radii[i]!);
   }
 }
 
@@ -183,8 +253,8 @@ export function emitLinks(g: GroupBuilder, graph: NetworkGraph, width: number): 
   }
 }
 
-/** Emit each directed link's arrowhead as a filled triangle, tip set back by the node radius. */
-export function emitArrows(g: GroupBuilder, graph: NetworkGraph, size: number, nodeRadius: number): void {
+/** Emit each directed link's arrowhead as a filled triangle, tip set back by the target node's radius. */
+export function emitArrows(g: GroupBuilder, graph: NetworkGraph, size: number, nodeRadii: Float32Array): void {
   for (let e = 0; e < graph.edgeCount; e++) {
     const s = graph.source[e]!;
     const t = graph.target[e]!;
@@ -199,8 +269,9 @@ export function emitArrows(g: GroupBuilder, graph: NetworkGraph, size: number, n
     const uy = dy / len;
     const px = -uy;
     const py = ux;
-    const tipX = tx - ux * nodeRadius;
-    const tipY = ty - uy * nodeRadius;
+    const setback = nodeRadii[t]!;
+    const tipX = tx - ux * setback;
+    const tipY = ty - uy * setback;
     const baseX = tipX - ux * 2 * size;
     const baseY = tipY - uy * 2 * size;
     g.drawable(e, (ctx) => {

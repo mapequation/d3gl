@@ -50,6 +50,23 @@ describe("network() engine", () => {
     net.destroy();
   });
 
+  it("sizes nodes by degree through the full style→export path", async () => {
+    const net = network(host(), { width: 200, height: 200, backend: "svg" });
+    await net.whenReady();
+    // star: node 0 is the hub (degree 3); nodes 1/2/3 are leaves (degree 1).
+    const g = buildGraph({ nodeCount: 4, source: [0, 0, 0], target: [1, 2, 3], directed: true });
+    net
+      .data(g)
+      .style({ nodeRadius: { by: "degree", scale: (d) => d } }) // radius == degree
+      .layout({ backend: "positions", positions: new Float32Array([100, 100, 20, 20, 180, 20, 100, 180]) });
+
+    const radii = [...net.toSVG().matchAll(/<circle[^>]*\br="([\d.eE+-]+)"/g)].map((m) => Number(m[1]));
+    expect(radii.length).toBe(4);
+    expect(new Set(radii)).toEqual(new Set([3, 1])); // hub radius 3, leaves radius 1
+
+    net.destroy();
+  });
+
   it("auto-positions an unpositioned graph with the force backend", async () => {
     const net = network(host(), { width: 200, height: 200, backend: "svg" });
     await net.whenReady();

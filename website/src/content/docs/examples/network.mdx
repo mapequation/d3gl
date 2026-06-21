@@ -25,21 +25,53 @@ on screen** while the main thread stays responsive — pan and zoom while it set
 cross-origin-isolated page positions are shared zero-copy via `SharedArrayBuffer`; otherwise they
 are posted as snapshots.) The **Nodes** slider scales from 10 to 1,000,000 to stress-test the
 layout and rendering, and the **Seeding** toggle compares multilevel against a cold start. Rendering
-uses WebGL instancing — drag to pan, scroll to zoom, and toggle **Links** between directed (with
-arrowheads) and undirected.
+uses WebGL instancing — drag to pan, scroll to zoom, toggle **Links** between directed (with
+arrowheads) and undirected, and switch **Size** between a uniform radius and degree-weighted nodes.
 
 <ExampleCard files={["network/draw.ts", "network/data.ts"]}>
   <Network client:visible slot="demo" />
 </ExampleCard>
+
+## Sizing nodes by degree (or any metric)
+
+`nodeRadius` accepts more than a constant — it takes a **d3 scale** so node size can encode a metric.
+The radius is a per-instance GPU attribute, so varying it per node is **free at draw time** (it is
+resolved once per `style()` call, never per frame), all the way to millions of nodes.
+
+```ts
+import { scaleSqrt } from "d3-scale";
+
+// A function receives the node's degree — a bare d3 scale fits directly.
+// scaleSqrt makes the *area* proportional to degree, the honest mapping for circles.
+net.style({ nodeRadius: scaleSqrt().domain([1, maxDegree]).range([2, 20]) });
+
+// Or size by a chosen metric through any scale with { by, scale }:
+net.style({ nodeRadius: { by: "strength", scale: scaleSqrt().range([2, 20]) } });
+```
+
+`nodeRadius` can be:
+
+- a **`number`** — one constant radius for every node (the default is 4);
+- a **function** `(degree, index, graph) => radius` — the node's degree is the first argument, so a
+  bare d3 scale works; `index`/`graph` are there for anything custom;
+- **`{ by, scale }`** — feed a metric through any scale, where `by` is `"degree"` (neighbour count),
+  `"strength"` (weighted degree — summed incident edge weights), `"flow"` (an app-provided per-node
+  value, see below), or your own `(index, graph) => value` accessor;
+- a **`Float32Array`** of per-node radii you computed yourself.
+
+`degree` and `strength` are derived from the edge list automatically. **Flow** is a model quantity
+(e.g. an Infomap visit rate) that d3gl does not invent — supply it as `buildGraph({ …, nodeFlow })`
+to make `{ by: "flow", scale }` available.
 
 ## Loading a network from a file
 
 The same engine renders a network parsed from a file. `parseNetwork(text, filename)` dispatches on
 the name: a **`.net`** file is read as **Pajek** (vertex labels and coordinates, `*Arcs`/`*Edges`),
 and anything else as a plain **edge list** (`source target [weight]`, one edge per line, `#`
-comments). Pick your own file or load a built-in sample of each format. Vertex **labels** are drawn
-beside the nodes with the HTML `LabelLayer` overlay (from `@mapequation/d3gl/labels`), which culls
-overlaps and tracks the GPU geometry as you pan and zoom.
+comments). Pick your own file or load a built-in sample of each format. Nodes are **sized by degree**
+(`scaleSqrt`) so hubs stand out, and vertex **labels** are drawn beside them with the HTML
+`LabelLayer` overlay (from `@mapequation/d3gl/labels`), which culls overlaps and tracks the GPU
+geometry as you pan and zoom.
 
 <ExampleCard files={["load-network/draw.ts", "load-network/data.ts"]}>
   <LoadNetwork client:visible slot="demo" />

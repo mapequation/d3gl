@@ -1,5 +1,6 @@
 import { network, buildGraph, parseNetwork } from "@mapequation/d3gl/network";
 import { LabelLayer, type LabelAnchor } from "@mapequation/d3gl/labels";
+import { scaleSqrt } from "d3-scale";
 import type { ImperativeSetup } from "../types.js";
 import { makeControls } from "./controls.js";
 import { SAMPLE_PAJEK } from "./data.js";
@@ -11,8 +12,9 @@ let loaded = { text: SAMPLE_PAJEK, name: "sample.net" };
  * Load a network from a file and render it with the `network()` engine. `parseNetwork` dispatches
  * on the filename — `.net` → Pajek (vertex labels, `*Arcs`/`*Edges`), anything else → the plain
  * edge-list parser (`source target [weight]`, `#` comments). The off-thread worker lays it out;
- * once it settles, vertex labels are placed beside the nodes with the HTML `LabelLayer` overlay and
- * kept aligned with the GPU geometry as you pan/zoom. Pick a file, or load a built-in sample.
+ * nodes are **sized by degree** (a d3 `scaleSqrt`) so hubs stand out. Once it settles, vertex labels
+ * are placed beside the nodes with the HTML `LabelLayer` overlay and kept aligned with the GPU
+ * geometry as you pan/zoom. Pick a file, or load a built-in sample.
  */
 export const setup: ImperativeSetup = (host, { width, height, backend }) => {
   const net = network(host, { width, height, backend });
@@ -39,9 +41,21 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
     const { nodeCount, source, target, weight, labels: names, directed } = parseNetwork(text, filename);
     anchors = [];
     const graph = buildGraph({ nodeCount, source, target, weight, directed });
+    // Size nodes by degree so hubs stand out: a d3 `scaleSqrt` (area-proportional) over the degree
+    // range, handed straight to `nodeRadius` via { by: "degree", scale }. Resolved once, no draw cost.
+    let maxDegree = 1;
+    for (const d of graph.csr.degree) if (d > maxDegree) maxDegree = d;
+    const radius = scaleSqrt().domain([1, maxDegree]).range([4, 16]);
     net
       .data(graph)
-      .style({ directed, nodeRadius: 5, nodeFill: "#4878d0", linkWidth: 1, linkStroke: "#cbd5e6", arrowFill: "#9aa7bd" })
+      .style({
+        directed,
+        nodeRadius: { by: "degree", scale: radius },
+        nodeFill: "#4878d0",
+        linkWidth: 1,
+        linkStroke: "#cbd5e6",
+        arrowFill: "#9aa7bd",
+      })
       .layout({ backend: "worker", iterations: 300 });
 
     await net.whenSettled();
