@@ -2,7 +2,7 @@ import { BaseEngine, type BaseEngineOptions } from "../map/base-engine.js";
 import { networkLayers, frontierCircles, superEdgeLines, emitNodes, emitLinks, emitArrows, resolveNodeRadii, type ResolvedNetworkStyle, type NodeRadiusSpec } from "./glyphs.js";
 import { ForceLayout, seedPositions, type ForceParams } from "./force.js";
 import { multilevelLayout, type CoarsenOptions } from "./coarsen.js";
-import { buildLODTree, computeLODGeometry, cut, declutterFrontier, type LODTree } from "./lod.js";
+import { buildLODTree, computeLODGeometry, computeLODStyle, cut, declutterFrontier, type LODTree } from "./lod.js";
 import { startWorkerLayout, type WorkerLayoutHandle } from "./worker-transport.js";
 import type { NetworkGraph } from "./graph.js";
 import type { Backend, InstancedLayer, ViewTransform } from "../core/index.js";
@@ -133,6 +133,17 @@ export class Network extends BaseEngine {
   private lodOptions: NetworkLODOptions | null = null;
   /** Retained coarsening tree for the current graph (topology built lazily). */
   private lodTree: LODTree | null = null;
+  /**
+   * The LOD tree streamed by the layout worker (#103), when running the worker backend with LOD on.
+   * Its `cx`/`cy`/`extent` are written by the worker each frame (live), so the main thread skips the
+   * O(N) build + geometry pass and only fills the style geometry once + runs the O(visible) cut.
+   * Null on the `force`/`positions` backends, the worker fallback, or LOD enabled after a worker run.
+   */
+  private lodWorkerTree: LODTree | null = null;
+  /** True while a worker-LOD run is in flight (launched, not yet settled/stopped) — it will stream the tree. */
+  private lodStreaming = false;
+  /** Dedup guard for the one-shot deferred main-thread LOD-tree fallback (see {@link scheduleLODFallback}). */
+  private lodFallbackScheduled = false;
   /** Whether `lodTree` has had its geometry computed at least once, so the cut may run. */
   private lodHasGeometry = false;
   /** Cached resolved style; invalidated on style()/data() to avoid per-zoom O(n) radii recompute. */
@@ -151,6 +162,7 @@ export class Network extends BaseEngine {
     this.graph = graph;
     // New topology + position buffer: drop the retained LOD tree and resolved-style cache.
     this.lodTree = null;
+    this.lodWorkerTree = null;
     this.lodHasGeometry = false;
     this.resolvedCache = null;
     return this.rebuild();
@@ -169,16 +181,26 @@ export class Network extends BaseEngine {
    * that draws dense regions as aggregate glyphs and expands them into members as you zoom, so
    * per-frame work tracks the visible frontier rather than the whole graph. Requires the WebGL
    * backend. The tree's geometry follows the layout as it converges (re-cut cheaply on zoom).
+   *
+   * **Call this before `layout({ backend: "worker" })`** to get the full win: the worker then builds
+   * and streams the LOD tree itself (#103), so the main thread never coarsens or runs the O(N)
+   * geometry pass. Enabling it *after* a worker run (or on the `force`/`positions` backends) falls
+   * back to building the tree on the main thread from the current positions.
    */
   lod(options: NetworkLODOptions | false): this {
     if (!options) {
       this.lodOptions = null;
       this.lodTree = null;
+      this.lodWorkerTree = null;
       this.lodHasGeometry = false;
       return this.rebuild();
     }
     this.lodOptions = options;
-    this.recomputeLODGeometry(); // builds the tree + geometry from whatever positions exist now
+    // Keep any worker-streamed tree from a still-current run: reconfiguring LOD options reuses it
+    // (cut-time options apply immediately; the style geometry refreshes). data()/layout() drop it on
+    // a graph or layout change. recomputeLODGeometry builds a main-thread tree only off the worker
+    // backend — on the worker backend the tree comes from the worker (or the settle fallback).
+    this.recomputeLODGeometry();
     return this.rebuild();
   }
 
@@ -186,8 +208,11 @@ export class Network extends BaseEngine {
   layout(opts: NetworkLayoutOptions): this {
     this.layoutOpts = { ...this.layoutOpts, ...opts };
     if (this.graph) {
-      // Any backend change cancels a running worker layout before re-seeding positions.
+      // Any backend change cancels a running worker layout before re-seeding positions. A prior
+      // worker-streamed LOD tree belongs to that superseded run, so drop it: the new layout either
+      // re-streams one (worker backend) or builds one on the main thread (force/positions).
       this.stopLayout();
+      this.lodWorkerTree = null;
       if (opts.backend === "positions" && opts.positions) {
         this.graph.positions.set(opts.positions);
         this.recomputeLODGeometry(); // caller-supplied coordinates are final immediately
@@ -195,7 +220,9 @@ export class Network extends BaseEngine {
         // Off-thread force layout with progressive convergence. The worker can post a frame per
         // tick, so coalesce repaints to one per animation frame (always painting the freshest
         // positions) to bound main-thread work at large N.
-        this.layoutHandle = startWorkerLayout(
+        const useLod = !!this.lodOptions;
+        this.lodStreaming = useLod; // the worker will stream the tree; main builds none meanwhile
+        const handle: WorkerLayoutHandle = startWorkerLayout(
           this.graph,
           {
             width: this.width,
@@ -203,14 +230,32 @@ export class Network extends BaseEngine {
             iterations: opts.iterations ?? DEFAULT_FORCE_ITERATIONS,
             force: opts.force,
             multilevel: opts.multilevel,
+            // When LOD is on, the worker builds + streams the tree; its coarsening is shared with the
+            // multilevel seed so the graph is coarsened once and the main thread never coarsens.
+            lod: useLod,
+            coarsen: this.lodOptions?.coarsen,
           },
           () => this.scheduleLayoutRepaint(),
+          useLod
+            ? (tree) => {
+                if (this.layoutHandle !== handle) return; // a newer layout superseded this one
+                // Adopt the worker's tree: its geometry streams live, so the main thread only fills
+                // the style geometry once. The first frame (which follows this message) renders it.
+                this.lodTree = tree;
+                this.lodWorkerTree = tree;
+                this.recomputeLODGeometry();
+              }
+            : undefined,
         );
-        // Final refresh on settle (the last streamed frame may land before the resolve).
-        const handle = this.layoutHandle;
+        this.layoutHandle = handle;
+        // Final refresh on settle (the last streamed frame may land before the resolve). `forceMain`
+        // covers the worker-unavailable fallback: it solved synchronously and never streamed a tree,
+        // so build one on the main thread here (a no-op when the worker did stream — that takes the
+        // worker-tree branch and only refreshes the style geometry).
         void handle.settled.then(() => {
           if (this.layoutHandle !== handle) return; // a newer layout superseded this one
-          this.recomputeLODGeometry();
+          this.lodStreaming = false;
+          this.recomputeLODGeometry(true);
           this.rebuild();
         });
       } else if (opts.backend === "force") {
@@ -235,9 +280,10 @@ export class Network extends BaseEngine {
   }
 
   /**
-   * Coalesce progressive worker frames into at most one repaint per animation frame. Each frame the
-   * positions changed, so the LOD geometry is refreshed before the cut — LOD tracks the layout *as
-   * it converges*, not only once settled.
+   * Coalesce progressive worker frames into at most one repaint per animation frame. With a
+   * worker-streamed LOD tree the geometry is already fresh (the worker wrote it before posting the
+   * frame), so the main thread only re-cuts; otherwise the positions changed and the LOD geometry is
+   * recomputed here before the cut — LOD tracks the layout *as it converges*, not only once settled.
    */
   private scheduleLayoutRepaint(): void {
     if (this.layoutRepaintRaf) return;
@@ -245,7 +291,7 @@ export class Network extends BaseEngine {
       typeof requestAnimationFrame === "function" ? requestAnimationFrame : (cb) => setTimeout(() => cb(0), 16);
     this.layoutRepaintRaf = raf(() => {
       this.layoutRepaintRaf = 0;
-      this.recomputeLODGeometry();
+      if (!this.lodWorkerTree) this.recomputeLODGeometry(); // worker streams geometry; main only re-cuts
       this.rebuild();
     });
   }
@@ -254,6 +300,7 @@ export class Network extends BaseEngine {
   stopLayout(): this {
     this.layoutHandle?.stop();
     this.layoutHandle = null;
+    this.lodStreaming = false; // no worker run is in flight to stream the LOD tree any more
     if (this.layoutRepaintRaf && typeof cancelAnimationFrame === "function") cancelAnimationFrame(this.layoutRepaintRaf);
     this.layoutRepaintRaf = 0;
     return this;
@@ -289,10 +336,20 @@ export class Network extends BaseEngine {
         this.registerNetworkScene(this.graph, style, false);
         this.sceneActive = false;
       }
-      this.emitInstancedLayers(
-        backend,
-        this.lodReady() ? this.lodLayers(this.lodTree!, style) : networkLayers(this.graph, style),
-      );
+      let layers: InstancedLayer[];
+      if (this.lodReady()) {
+        layers = this.lodLayers(this.lodTree!, style); // cut frontier (cost ∝ visible)
+      } else if (this.lodOptions && this.layoutOpts.backend === "worker") {
+        // LOD is on, worker backend, no tree yet — draw nothing rather than the full graph (the very
+        // O(N) draw LOD exists to avoid at scale). A streaming run will populate the tree shortly; if
+        // none is in flight (LOD toggled on after a run settled), build one on the main thread,
+        // deferred a microtask so an imminent layout() in the same chain takes the streaming path.
+        layers = [];
+        this.scheduleLODFallback();
+      } else {
+        layers = networkLayers(this.graph, style); // no LOD: the full graph
+      }
+      this.emitInstancedLayers(backend, layers);
     } else {
       // SVG/Canvas: emit the glyphs through the PathContext seam as Scene layers, so the
       // existing pipeline renders them and toSVG() produces publication output. (LOD is a
@@ -356,16 +413,60 @@ export class Network extends BaseEngine {
   }
 
   /**
-   * (Re)compute the LOD tree's geometry from the *current* positions + style. Called whenever
-   * positions move (every streamed worker frame, a sync solve) or the style's radii change — so LOD
-   * tracks the layout as it converges. No-op when LOD is off. O(tree size); the zoom-time cut does
-   * not call this (it reuses the geometry).
+   * (Re)compute the LOD tree's geometry from the *current* positions + style. No-op when LOD is off.
+   *
+   * Three modes:
+   * - **Worker-streamed tree** (`lodWorkerTree`): the worker owns the position-derived geometry
+   *   (`cx`/`cy`/`extent`, written live each frame), so the main thread only (re)derives the
+   *   style-derived geometry (`radius`/`weight`) — once on adoption, and again when the radii change.
+   *   Never per frame (see {@link scheduleLayoutRepaint}).
+   * - **Awaiting a worker tree** (`backend: "worker"`, no tree yet): the worker is about to stream the
+   *   tree, so the main thread builds *nothing* — it would only duplicate the worker's O(N)/O(E) work
+   *   and be discarded. Pass `forceMain` (from the settle handler) to build anyway when the worker
+   *   fell back to a synchronous main-thread solve and never streamed a tree.
+   * - **Main-thread tree** (`force`/`positions` backends, or the worker fallback): build the tree
+   *   lazily, then the full geometry from the current positions + style; tracks convergence.
+   *
+   * O(tree size); the zoom-time cut does not call this (it reuses the geometry).
    */
-  private recomputeLODGeometry(): void {
+  private recomputeLODGeometry(forceMain = false): void {
     if (!this.lodOptions || !this.graph) return;
+    const nodeRadii = this.resolvedStyleCached(this.graph).nodeRadii;
+    if (this.lodWorkerTree) {
+      computeLODStyle(this.lodWorkerTree, nodeRadii, this.graph.strength);
+      this.lodTree = this.lodWorkerTree;
+      this.lodHasGeometry = true;
+      return;
+    }
+    // The worker streams the tree on this backend; don't build one on the main thread (the whole
+    // point of worker-LOD). The settle handler / deferred fallback force a build when no worker
+    // streamed one (a synchronous fallback solve, or LOD toggled on after the run settled).
+    if (this.layoutOpts.backend === "worker" && !forceMain) return;
     if (!this.lodTree) this.lodTree = buildLODTree(this.graph, this.lodOptions.coarsen);
-    computeLODGeometry(this.lodTree, this.graph, this.resolvedStyleCached(this.graph).nodeRadii);
+    computeLODGeometry(this.lodTree, this.graph, nodeRadii);
     this.lodHasGeometry = true;
+  }
+
+  /**
+   * Defer one main-thread LOD-tree build by a microtask. Scheduled when LOD is on, the backend is
+   * `worker`, and no tree exists yet — but only fires if, after the current synchronous call chain,
+   * no worker run has taken over the streaming path (i.e. LOD was toggled on after a run settled).
+   * The microtask delay lets an imminent `layout({ backend: "worker" })` in the same chain win first,
+   * so the common path never builds a tree the worker would replace.
+   */
+  private scheduleLODFallback(): void {
+    if (this.lodFallbackScheduled) return;
+    this.lodFallbackScheduled = true;
+    const defer: (cb: () => void) => void =
+      typeof queueMicrotask === "function" ? queueMicrotask : (cb) => void Promise.resolve().then(cb);
+    defer(() => {
+      this.lodFallbackScheduled = false;
+      // A worker is now streaming, LOD was turned off, the graph/backend changed, or a tree already
+      // landed — nothing to do; the normal path renders it.
+      if (!this.lodOptions || this.lodStreaming || this.lodReady() || this.layoutOpts.backend !== "worker") return;
+      this.recomputeLODGeometry(true); // no live worker: build the tree on the main thread
+      this.rebuild();
+    });
   }
 
   /**

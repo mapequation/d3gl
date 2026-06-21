@@ -1,5 +1,16 @@
 import { describe, it, expect } from "vitest";
-import { buildLODTree, computeLODGeometry, cut, declutterFrontier } from "../lod.js";
+import {
+  buildLODTree,
+  computeLODGeometry,
+  computeLODPositions,
+  computeLODStyle,
+  flattenHierarchyToTopology,
+  lodTreeFromTopology,
+  cut,
+  declutterFrontier,
+} from "../lod.js";
+import { buildHierarchy } from "../coarsen.js";
+import { lodGeometryViews, lodGeometryByteLength } from "../worker-protocol.js";
 import { frontierCircles, superEdgeLines } from "../glyphs.js";
 import { buildGraph } from "../graph.js";
 
@@ -55,6 +66,73 @@ describe("computeLODGeometry", () => {
     expect(tree.cx[5]).toBeCloseTo(11);
     expect(tree.count[5]).toBe(2);
     expect(tree.weight[5]).toBeCloseTo(5); // strength2 + strength3 = 3 + 2
+  });
+});
+
+describe("worker-LOD split (#103)", () => {
+  const placed = () => {
+    const g = pairedGraph();
+    g.positions.set([0, 0, 2, 0, 10, 0, 12, 0]);
+    return g;
+  };
+
+  it("flattenHierarchyToTopology reproduces buildLODTree's topology (worker builds the same tree)", () => {
+    const g = placed();
+    const main = buildLODTree(g, { minNodes: 2 });
+    const topo = flattenHierarchyToTopology(buildHierarchy(g, { minNodes: 2 }), g.nodeCount);
+
+    expect(topo.size).toBe(main.size);
+    expect(topo.leafCount).toBe(main.leafCount);
+    expect(topo.levelCount).toBe(main.levelCount);
+    expect(Array.from(topo.levelOffset)).toEqual(Array.from(main.levelOffset));
+    expect(Array.from(topo.childOffset)).toEqual(Array.from(main.childOffset));
+    expect(Array.from(topo.children)).toEqual(Array.from(main.children));
+    expect(Array.from(topo.edgeOffset)).toEqual(Array.from(main.edgeOffset));
+    expect(Array.from(topo.edgeNeighbors)).toEqual(Array.from(main.edgeNeighbors));
+  });
+
+  it("computeLODPositions + computeLODStyle equals the fused computeLODGeometry", () => {
+    const g = placed();
+    const radii = new Float32Array([4, 4, 4, 4]);
+
+    const fused = buildLODTree(g, { minNodes: 2 });
+    computeLODGeometry(fused, g, radii);
+
+    const split = buildLODTree(g, { minNodes: 2 });
+    computeLODPositions(split, g.positions); // the worker's per-frame pass
+    computeLODStyle(split, radii, g.strength); // the main thread's once-per-style pass
+
+    for (const k of ["cx", "cy", "extent", "radius", "count", "weight"] as const) {
+      expect(Array.from(split[k])).toEqual(Array.from(fused[k]));
+    }
+  });
+
+  it("lodTreeFromTopology binds cx/cy/extent to the provided (shared) geometry buffer", () => {
+    const g = placed();
+    const topo = flattenHierarchyToTopology(buildHierarchy(g, { minNodes: 2 }), g.nodeCount);
+    const buffer = new ArrayBuffer(lodGeometryByteLength(topo.size));
+    const views = lodGeometryViews(buffer, topo.size);
+    const tree = lodTreeFromTopology(topo, views);
+
+    expect(tree.cx).toBe(views.cx); // the tree reads the worker-written buffer with no copy
+    expect(tree.cy).toBe(views.cy);
+    expect(tree.extent).toBe(views.extent);
+
+    // Writing geometry through the tree lands in the underlying buffer the worker shares.
+    computeLODPositions(tree, g.positions);
+    const cx = new Float32Array(buffer, 0, topo.size);
+    expect(cx[0]).toBeCloseTo(0); // leaf 0 position
+    expect(cx[4]).toBeCloseTo(1); // aggregate {0,1} centroid
+  });
+
+  it("lodGeometryViews packs [cx, cy, extent] contiguously", () => {
+    const size = 6;
+    const buffer = new ArrayBuffer(lodGeometryByteLength(size));
+    expect(lodGeometryByteLength(size)).toBe(3 * size * 4);
+    const { cx, cy, extent } = lodGeometryViews(buffer, size);
+    expect(cx.length).toBe(size);
+    expect(cy.byteOffset).toBe(size * 4);
+    expect(extent.byteOffset).toBe(2 * size * 4);
   });
 });
 

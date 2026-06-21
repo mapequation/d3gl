@@ -101,6 +101,18 @@ What it composes:
 The geometry tracks the layout *as it converges* (LOD helps during the solve, not just after), while
 panning and zooming only re-run the cheap cut. LOD requires the WebGL backend.
 
+With the **worker backend**, enable LOD *before* `layout({ backend: "worker" })` and the worker builds
+the hierarchy itself — it reuses the coarsening it already computes for the multilevel seed, then
+streams the tree once plus its aggregate geometry each frame. The main thread then never coarsens or
+runs the per-frame O(N) geometry pass; it only fills the style geometry once and runs the
+on-screen-bounded cut. That keeps the main thread free as the network scales toward millions of nodes.
+
+```js
+net
+  .lod({ expandPx: 48, maxAggregateRadius: 26 }) // configure LOD first…
+  .layout({ backend: "worker", iterations }); // …so the worker builds + streams the tree
+```
+
 ## Loading a network from a file
 
 The same engine renders a network parsed from a file. `parseNetwork(text, filename)` dispatches on

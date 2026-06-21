@@ -5,11 +5,16 @@
  * cross-origin-isolated page, transferable-free postMessage copies otherwise — and repaints via the
  * supplied callback on each progress frame. Degrades to a synchronous main-thread solve when Web
  * Workers are unavailable (SSR) or the bundler/runtime can't construct one.
+ *
+ * With `lod` on (#103) the worker also builds the structural LOD tree and streams it: the topology
+ * once (→ `onLODTree`), then position-derived geometry each frame (shared via a SAB, or copied per
+ * frame here). The main thread then never coarsens or runs the O(N) geometry pass.
  */
 import type { NetworkGraph } from "./graph.js";
 import { multilevelLayout, type CoarsenOptions } from "./coarsen.js";
 import { ForceLayout, seedPositions, type ForceParams } from "./force.js";
-import type { MainToWorker, WorkerToMain } from "./worker-protocol.js";
+import { lodTreeFromTopology, type LODTree } from "./lod.js";
+import { lodGeometryViews, lodGeometryByteLength, type MainToWorker, type WorkerToMain } from "./worker-protocol.js";
 
 export interface WorkerLayoutOptions {
   width: number;
@@ -21,6 +26,13 @@ export interface WorkerLayoutOptions {
   multilevel?: boolean;
   /** Ticks per progress frame; defaults to ~60 frames across the run. */
   frameEvery?: number;
+  /**
+   * Build the structural LOD tree on the worker and stream it (#103). When set, the worker coarsens
+   * once (reused for seeding), posts the tree topology via `onLODTree`, and refreshes its geometry
+   * each frame — so the main thread never coarsens or runs the O(N) geometry pass. No effect on the
+   * synchronous fallback (the caller builds the tree on the main thread there).
+   */
+  lod?: boolean;
 }
 
 export interface WorkerLayoutHandle {
@@ -41,6 +53,12 @@ export function startWorkerLayout(
   graph: NetworkGraph,
   opts: WorkerLayoutOptions,
   onFrame: () => void,
+  /**
+   * Called once when the worker streams the LOD tree (only when `opts.lod` is on and a real worker
+   * runs). The tree's `cx`/`cy`/`extent` track the worker's layout live; the caller fills
+   * `radius`/`weight` once via `computeLODStyle`.
+   */
+  onLODTree?: (tree: LODTree) => void,
 ): WorkerLayoutHandle {
   const { width, height, iterations } = opts;
   const multilevel = opts.multilevel ?? true;
@@ -48,7 +66,8 @@ export function startWorkerLayout(
   const syncOpts = { width, height, iterations, force: opts.force, coarsen: opts.coarsen };
 
   // No Worker available (SSR / unsupported) or construction fails: solve synchronously so the
-  // layout still happens, then signal one frame + completion.
+  // layout still happens, then signal one frame + completion. LOD (if requested) is left to the
+  // caller's main-thread path — `onLODTree` is never called in the fallback.
   const fallback = (): WorkerLayoutHandle => {
     if (multilevel) multilevelLayout(graph, syncOpts);
     else {
@@ -90,9 +109,22 @@ export function startWorkerLayout(
     resolveSettled();
   };
 
+  // Copy-mode only: the full `[cx, cy, extent]` buffer backing the LOD tree, refilled each frame from
+  // the message. In shared mode the tree is bound straight to the worker's geometry SAB (no copy).
+  let lodGeomFlat: Float32Array | null = null;
+
   worker.onmessage = (e: MessageEvent<WorkerToMain>): void => {
     const msg = e.data;
+    if (msg.type === "lod-topology") {
+      const { topology, sharedGeometry } = msg;
+      const buffer: ArrayBufferLike = sharedGeometry ?? new ArrayBuffer(lodGeometryByteLength(topology.size));
+      if (!sharedGeometry) lodGeomFlat = new Float32Array(buffer);
+      onLODTree?.(lodTreeFromTopology(topology, lodGeometryViews(buffer, topology.size)));
+      return;
+    }
+    // frame | done
     if (msg.positions && !shared) graph.positions.set(msg.positions);
+    if (msg.geometry && lodGeomFlat) lodGeomFlat.set(msg.geometry); // copy-mode geometry snapshot
     onFrame();
     if (msg.type === "done") finish();
   };
@@ -122,6 +154,7 @@ export function startWorkerLayout(
     coarsen: opts.coarsen,
     multilevel,
     frameEvery,
+    lod: opts.lod,
   };
   worker.postMessage(start);
 

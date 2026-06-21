@@ -12,8 +12,16 @@
  * `DOM` `postMessage(message, options?)` overload accepts — so no worker-lib cast is needed.
  */
 import { ForceLayout, seedPositions } from "./force.js";
-import { multilevelSeed } from "./coarsen.js";
-import type { MainToWorker, StartMessage, WorkerToMain } from "./worker-protocol.js";
+import { multilevelSeed, buildHierarchy } from "./coarsen.js";
+import { flattenHierarchyToTopology, lodTreeFromTopology, computeLODPositions, type LODTree } from "./lod.js";
+import {
+  lodGeometryViews,
+  lodGeometryByteLength,
+  type MainToWorker,
+  type ProgressMessage,
+  type StartMessage,
+  type WorkerToMain,
+} from "./worker-protocol.js";
 
 let cancelled = false;
 let busy = false;
@@ -30,17 +38,49 @@ function yieldToEventLoop(): Promise<void> {
 async function runLayout(msg: StartMessage): Promise<void> {
   busy = true;
   cancelled = false;
-  const { nodeCount, source, target, weight, sharedPositions, width, height, iterations, force, coarsen, multilevel, frameEvery } =
+  const { nodeCount, source, target, weight, sharedPositions, width, height, iterations, force, coarsen, multilevel, frameEvery, lod } =
     msg;
   const shared = sharedPositions !== undefined;
   const positions = shared ? new Float32Array(sharedPositions) : new Float32Array(nodeCount * 2);
   // Satisfies both CoarsenableGraph (multilevelSeed) and LayoutGraph (ForceLayout / seedPositions).
   const graph = { nodeCount, edgeCount: source.length, source, target, weight, positions };
 
+  // LOD (#103): coarsen once and reuse that hierarchy for both the multilevel seed and the streamed
+  // tree, so the graph is never coarsened twice and the main thread never coarsens at all. The worker
+  // owns the position-derived geometry (`cx`/`cy`/`extent`) — recomputed each frame, written to a SAB
+  // (shared mode) or posted with the frame (copy mode); the main thread fills the style-derived
+  // geometry once and runs only the O(visible) cut.
+  const hierarchy = lod ? buildHierarchy(graph, coarsen) : undefined;
+  let lodTree: LODTree | null = null;
+  let geomBuffer: ArrayBufferLike | null = null; // copy-mode buffer re-posted each frame
+  if (lod && hierarchy) {
+    const topology = flattenHierarchyToTopology(hierarchy, nodeCount);
+    const byteLength = lodGeometryByteLength(topology.size);
+    let sharedGeometry: SharedArrayBuffer | undefined;
+    let buffer: ArrayBufferLike;
+    if (shared) {
+      sharedGeometry = new SharedArrayBuffer(byteLength);
+      buffer = sharedGeometry;
+    } else {
+      buffer = new ArrayBuffer(byteLength);
+      geomBuffer = buffer;
+    }
+    lodTree = lodTreeFromTopology(topology, lodGeometryViews(buffer, topology.size));
+    post({ type: "lod-topology", topology, sharedGeometry });
+  }
+
+  const postFrame = (type: "frame" | "done", tick: number): void => {
+    if (lodTree) computeLODPositions(lodTree, positions); // writes cx/cy/extent into the geometry buffer
+    const message: ProgressMessage = { type, tick };
+    if (!shared) message.positions = positions;
+    if (lodTree && geomBuffer) message.geometry = new Float32Array(geomBuffer); // copy-mode snapshot
+    post(message);
+  };
+
   // Seed: multilevel coarsening (fast — coarse levels are tiny) or a plain disc cold start.
-  if (multilevel) multilevelSeed(graph, { width, height, iterations, force, coarsen });
+  if (multilevel) multilevelSeed(graph, { width, height, iterations, force, coarsen }, hierarchy);
   else seedPositions(graph, width, height);
-  post(shared ? { type: "frame", tick: 0 } : { type: "frame", tick: 0, positions });
+  postFrame("frame", 0);
 
   // Stream the finest-level refinement in batches.
   const layout = new ForceLayout(graph, force);
@@ -49,11 +89,11 @@ async function runLayout(msg: StartMessage): Promise<void> {
     const batch = Math.min(frameEvery, iterations - done);
     layout.run(batch);
     done += batch;
-    post(shared ? { type: "frame", tick: done } : { type: "frame", tick: done, positions });
+    postFrame("frame", done);
     await yieldToEventLoop();
   }
 
-  post(shared ? { type: "done", tick: done } : { type: "done", tick: done, positions });
+  postFrame("done", done);
   busy = false;
 }
 
