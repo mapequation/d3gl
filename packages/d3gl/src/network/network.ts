@@ -650,7 +650,10 @@ export class Network extends BaseEngine {
       name: "links",
       data: edgeIds,
       ids: edgeIds,
-      sizeMode: halfArrow ? "world" : style.sizeMode, // half-arrow geometry is world-sized
+      // SVG/Canvas half-arrows are always world-sized: a screen-mode shape that spans two
+      // independently-projected node anchors can't be expressed by the retained Scene's per-drawable
+      // anchor — only the WebGL lane recomputes it per frame. World geometry is correct for static export.
+      sizeMode: halfArrow ? "world" : style.sizeMode,
       ...(halfArrow ? { fill: (e) => linkColorAt(e as number) } : { stroke: (e) => linkColorAt(e as number) }),
       build: (g) => {
         if (!emit) return;

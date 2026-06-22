@@ -748,12 +748,13 @@ export function networkLayers(graph: NetworkGraph, style: ResolvedNetworkStyle):
   if (graph.edgeCount > 0) {
     if (halfArrow) {
       // One fused filled glyph per directed link (the map-of-networks look): the arrowhead is part of
-      // the shape, so there's no separate arrows layer. World-sized (matches the reference layout).
+      // the shape, so there's no separate arrows layer. The WebGL lane honours sizeMode — in "screen"
+      // it projects both node centres to px and builds the shape in px (constant-px decorations).
       layers.push({
         name: "links",
         primitive: "half-arrows",
         halfArrows: halfArrowLinks(graph, { nodeRadii: style.nodeRadii, widthOf: style.linkWidthOf, colorOf: style.linkColorOf, bend }),
-        sizeMode: "world",
+        sizeMode: style.sizeMode,
       });
     } else {
       layers.push({

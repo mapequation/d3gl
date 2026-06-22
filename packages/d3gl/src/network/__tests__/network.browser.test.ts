@@ -225,6 +225,29 @@ describe("network() engine", () => {
     net.destroy();
   });
 
+  it("renders screen-sizeMode half-arrows across a zoom range without throwing (constant-px decorations)", async () => {
+    const net = network(host(), { width: 200, height: 200 });
+    await net.whenReady();
+    const g = buildGraph({ nodeCount: 2, source: [0, 1], target: [1, 0], weight: [0.5, 0.3], directed: true, nodeFlow: [0.6, 0.4] });
+    net
+      .data(g)
+      .style({
+        directed: true,
+        linkStyle: "half-arrow",
+        sizeMode: "screen", // half-arrow VS projects both centres to px and builds the shape in px
+        nodeRadius: new Float32Array([30, 20]),
+        linkBend: 30,
+        linkWidth: (w) => (w > 0.4 ? 13 : 7),
+        linkStroke: (w) => (w > 0.4 ? "#418EC7" : "#71B2D7"),
+      })
+      .layout({ backend: "positions", positions: new Float32Array([60, 60, 140, 100]) });
+    // The screen branch (worldToPx + px→clip) must hold across non-trivial zooms (k≠1, where screen
+    // and world diverge) — a shader-link or NaN failure would throw here.
+    expect(net.setTransform({ k: 0.4, x: 80, y: 80 })).toBe(net);
+    expect(net.setTransform({ k: 3, x: -200, y: -150 })).toBe(net);
+    net.destroy();
+  });
+
   it("exports half-arrow links to SVG as one filled path per link (head fused, no separate arrow)", async () => {
     const net = network(host(), { width: 200, height: 200, backend: "svg" });
     await net.whenReady();

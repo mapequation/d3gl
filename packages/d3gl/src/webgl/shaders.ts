@@ -291,29 +291,44 @@ void main() {
 // of truth, golden-tested vs the reference), mirrored here so the WebGL lane stays fully instanced.
 // Per-vertex a_kind = (code, t): code selects a named anchor (0 x0, 1 x02, 2 x03, 3 x04, 4 x11,
 // 5 x12, 6 x13, 7 x14) or evaluates the inner (8) / outer (9) edge bezier at parameter t; the template
-// (see instanced.ts) lists the foot, body strip and head as a triangle list. World-sized. Pairs with
-// FILL_FS. `a_bend` is the absolute perpendicular offset in world units (sign = bow direction).
+// (see instanced.ts) lists the foot, body strip and head as a triangle list. Pairs with FILL_FS.
+// `a_bend` is the absolute perpendicular offset (sign = bow direction).
+//
+// sizeMode: in **world** mode the shape is built in world units, then projected — so widths/tips/bend
+// scale with zoom. In **screen** mode the two node centres are first projected to screen pixels and the
+// *same* math runs in pixel space — so the link decorations (width, tip, bend, node radii) stay a
+// constant pixel size while the endpoints still move with zoom. The geometry math is scale-free, so
+// only the input/output space differs: screen mode adds two world→px projections up front and a px→clip
+// convert at the end (a uniform branch — the world path is untouched).
 export const INSTANCED_HALF_ARROW_VS = `#version 300 es
 precision highp float;
 uniform mat3 u_transform;
+uniform float u_screen;   // 1.0 = screen sizeMode (constant px), 0.0 = world
+uniform vec2 u_viewport;  // device px, for screen sizeMode
 in vec2 a_kind;       // per-vertex (code, t)
 in vec2 a_p0;         // per-instance source centre
 in vec2 a_p1;         // per-instance target centre
 in vec2 a_radii;      // per-instance (r0, r1)
 in vec2 a_widths;     // per-instance (width, oppositeWidth)
-in float a_bend;      // per-instance bend (world units; sign picks the bow side)
+in float a_bend;      // per-instance bend (world or px per sizeMode; sign picks the bow side)
 in vec4 a_color;      // per-instance RGBA (unorm8x4 -> 0..1)
 out vec4 v_color;
 vec2 bez(vec2 p0, vec2 c, vec2 p2, float t) {
   float u = 1.0 - t;
   return u * u * p0 + 2.0 * u * t * c + t * t * p2;
 }
+vec2 worldToPx(vec2 w) {
+  vec2 clip = (u_transform * vec3(w, 1.0)).xy;
+  return vec2((clip.x + 1.0) * 0.5 * u_viewport.x, (1.0 - clip.y) * 0.5 * u_viewport.y);
+}
 void main() {
   v_color = a_color;
   float code = a_kind.x;
   float t = a_kind.y;
-  vec2 p0 = a_p0;
-  vec2 p1 = a_p1;
+  bool screen = u_screen > 0.5;
+  // Screen mode: project both node centres to px and build the shape in px (radii/widths/bend are px).
+  vec2 p0 = screen ? worldToPx(a_p0) : a_p0;
+  vec2 p1 = screen ? worldToPx(a_p1) : a_p1;
   float r0 = a_radii.x;
   float r1 = a_radii.y;
   float width = a_widths.x;
@@ -369,7 +384,9 @@ void main() {
   else if (code < 8.5) pos = bez(x02, cp1, x12, t);
   else pos = bez(x03, cp2, x13, t);
 
-  gl_Position = vec4((u_transform * vec3(pos, 1.0)).xy, 0.0, 1.0);
+  // World: project the world-space point. Screen: pos is already px, so convert px to clip.
+  vec2 clip = screen ? vec2(pos.x / u_viewport.x * 2.0 - 1.0, 1.0 - pos.y / u_viewport.y * 2.0) : (u_transform * vec3(pos, 1.0)).xy;
+  gl_Position = vec4(clip, 0.0, 1.0);
 }`;
 
 // PT_MESH_VS — pass-through fill/stroke meshes. Both fill triangles and expanded-stroke

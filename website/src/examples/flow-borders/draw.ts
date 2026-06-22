@@ -39,10 +39,14 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
     engine: net,
     render: (options) => {
       const bend = BENDS[(options.bend as number) ?? 2] ?? 30;
-      // World sizing: the reference is a fixed publication layout; radii/widths are world units.
+      // World (default): radii/widths/bend are world units and scale with zoom (the reference is a fixed
+      // publication layout). Screen: they're constant pixels as you zoom, while the nodes still move
+      // apart/together — the navigation register LOD wants. (Screen-mode half-arrows are WebGL-only.)
+      const sizeMode = options.sizing === "Screen" ? "screen" : "world";
       net.style({
         directed: true,
         linkStyle: "half-arrow",
+        sizeMode,
         nodeRadius: { by: "flow", scale: radius }, // radius ∝ total flow
         nodeFill: (i) => fillColor(graph.flow![i]!), // fill ∝ total flow
         flowBorder: { flow: g.outFlow, scale: borderWidth, color: (v) => borderColor(v) }, // ring ∝ enter/exit flow
