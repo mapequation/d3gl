@@ -54,21 +54,6 @@ in vec4 v_color;
 out vec4 fragColor;
 void main() { fragColor = v_color; }`;
 
-// LINE_FS — antialiased strip edges for INSTANCED_LINE_VS: fade the last ~1px at the strip's two
-// long edges (|v_side| → 1), via the screen-space derivative of v_side, so widths match the smooth
-// Canvas/SVG strokes instead of a hard aliased edge that reads ~1px thicker.
-export const LINE_FS = `#version 300 es
-precision highp float;
-in vec4 v_color;
-in float v_side;
-out vec4 fragColor;
-void main() {
-  float aa = fwidth(v_side);
-  float cover = 1.0 - smoothstep(1.0 - aa, 1.0, abs(v_side));
-  if (cover <= 0.0) discard;
-  fragColor = vec4(v_color.rgb, v_color.a * cover);
-}`;
-
 export const POINT_VS = `#version 300 es
 precision highp float;
 uniform mat3 u_transform;
@@ -221,13 +206,8 @@ in vec4 v_borderColor;
 out vec4 fragColor;
 void main() {
   float r = length(v_local);
-  // Antialias the rim over ~1px (screen-space derivative of r) so the disc matches the smooth edges
-  // of the Canvas/SVG backends instead of a hard aliased cutoff that reads ~1px larger.
-  float aa = fwidth(r);
-  float cover = 1.0 - smoothstep(1.0 - aa, 1.0, r);
-  if (cover <= 0.0) discard;
-  vec4 col = (v_border > 0.0 && r > 1.0 - v_border) ? v_borderColor : v_color;
-  fragColor = vec4(col.rgb, col.a * cover);
+  if (r > 1.0) discard;
+  fragColor = (v_border > 0.0 && r > 1.0 - v_border) ? v_borderColor : v_color;
 }`;
 
 // INSTANCED_LINE_VS — GPU-instanced "path-strip" lines for the network lane (#100, bent #104 N6c).
@@ -249,12 +229,10 @@ in float a_width;           // per-instance line width
 in vec4 a_color;            // per-instance RGBA (unorm8x4 -> 0..1)
 in float a_bend;            // per-instance control offset ⟂ to the chord, as a fraction of |chord| (0 = straight)
 out vec4 v_color;
-out float v_side;           // cross-strip coord in [-1,1] for edge antialiasing
 void main() {
   v_color = a_color;
   float t = a_corner.x;
   float side = a_corner.y;
-  v_side = side;
   float hw = a_width * 0.5;
   vec2 d = a_target - a_source;
   vec2 ctrl = 0.5 * (a_source + a_target) + vec2(-d.y, d.x) * a_bend; // ⟂(chord) · bend

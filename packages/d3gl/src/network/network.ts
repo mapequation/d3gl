@@ -633,6 +633,7 @@ export class Network extends BaseEngine {
       name: "links",
       data: edgeIds,
       ids: edgeIds,
+      sizeMode: style.sizeMode,
       stroke: () => style.linkStroke,
       build: (g) => {
         if (emit) emitLinks(g, graph, style.linkWidthOf, style.linkBend);
@@ -642,6 +643,7 @@ export class Network extends BaseEngine {
       name: "arrows",
       data: edgeIds,
       ids: edgeIds,
+      sizeMode: style.sizeMode,
       fill: () => style.arrowFill,
       build: (g) => {
         if (emit && style.directed) emitArrows(g, graph, style.arrowSize, style.nodeRadii, style.linkBend, style.linkBend !== 0);
@@ -672,6 +674,7 @@ export class Network extends BaseEngine {
       name: "node-borders",
       data: nodeIds,
       ids: nodeIds,
+      sizeMode: style.sizeMode,
       fill: () => borderColorCss,
       build: (g) => {
         if (emit && hasBorder) emitNodes(g, graph, style.nodeRadii);
@@ -681,6 +684,7 @@ export class Network extends BaseEngine {
       name: "nodes",
       data: nodeIds,
       ids: nodeIds,
+      sizeMode: style.sizeMode,
       fill: (i) => fillOf(i as number),
       build: (g) => {
         if (emit) emitNodes(g, graph, innerRadii);

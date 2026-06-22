@@ -1,6 +1,6 @@
 import { Model } from "@luma.gl/engine";
 import type { Buffer, Device, RenderPass } from "@luma.gl/core";
-import { INSTANCED_CIRCLE_VS, INSTANCED_CIRCLE_FS, INSTANCED_LINE_VS, LINE_FS, INSTANCED_ARROW_VS, POINT_FS, FILL_FS } from "./shaders.js";
+import { INSTANCED_CIRCLE_VS, INSTANCED_CIRCLE_FS, INSTANCED_LINE_VS, INSTANCED_ARROW_VS, POINT_FS, FILL_FS } from "./shaders.js";
 import { clipFromView } from "./transform.js";
 import type { InstancedCirclesData, InstancedLinesData, InstancedArrowsData } from "../core/index.js";
 
@@ -151,7 +151,7 @@ export class InstancedLines {
     };
     this.model = new Model(device, {
       vs: INSTANCED_LINE_VS,
-      fs: LINE_FS,
+      fs: FILL_FS,
       bufferLayout: [
         { name: "a_corner", format: "float32x2" },
         { name: "a_source", format: "float32x2", stepMode: "instance" },
