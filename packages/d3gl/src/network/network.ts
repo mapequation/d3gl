@@ -1,5 +1,5 @@
 import { BaseEngine, type BaseEngineOptions } from "../map/base-engine.js";
-import { networkLayers, frontierCircles, superEdgeLines, bentSuperEdges, emitNodes, emitLinks, emitArrows, emitHalfLinks, resolveNodeRadii, resolveFlowBorder, resolveNodeColors, resolveLinkWidthOf, resolveLinkColorOf, flowBorderInnerRadii, type ResolvedNetworkStyle, type NodeRadiusSpec, type FlowBorderSpec, type ConstBorder, type LinkWidthSpec, type LinkColorSpec, type LinkStyle } from "./glyphs.js";
+import { networkLayers, frontierCircles, superEdgeLines, bentSuperEdges, halfArrowSuperEdges, emitNodes, emitLinks, emitArrows, emitHalfLinks, resolveNodeRadii, resolveFlowBorder, resolveNodeColors, resolveLinkWidthOf, resolveLinkColorOf, flowBorderInnerRadii, type ResolvedNetworkStyle, type NodeRadiusSpec, type FlowBorderSpec, type ConstBorder, type LinkWidthSpec, type LinkColorSpec, type LinkStyle } from "./glyphs.js";
 import { rgb } from "d3-color";
 import { ForceLayout, seedPositions, type ForceParams } from "./force.js";
 import { multilevelLayout, type CoarsenOptions } from "./coarsen.js";
@@ -505,10 +505,21 @@ export class Network extends BaseEngine {
     const layers: InstancedLayer[] = [];
     // Super-edges first (drawn under the nodes), among the visible frontier only.
     if (opts.superEdges !== false && this.graph!.edgeCount > 0) {
-      if (this.lodModules && style.linkBend !== 0 && tree.superEdgeOffset) {
-        // Map register (#104 N6c): bent half-arrow inter-module links from the directed, flow-weighted
-        // super-edge adjacency. Width comes from the same weight scale as raw links, applied to each
-        // super-edge's accumulated subsumed weight; half-arrows when directed.
+      if (this.lodModules && style.linkStyle === "half-arrow" && style.directed && tree.superEdgeOffset) {
+        // Directed map register (#104 N6): inter-module links as fused half-arrow glyphs from the
+        // flow-weighted super-edge adjacency — width/colour from each super-edge's accumulated subsumed
+        // flow, reciprocal pairs nesting. The instanced lane honours sizeMode (screen-projected in-shader).
+        const halfArrows = halfArrowSuperEdges(tree, frontier, {
+          widthOf: style.linkWidthOf,
+          colorOf: style.linkColorOf,
+          bend: style.linkBend,
+          maxAggregateRadius: opts.maxAggregateRadius,
+        });
+        if (halfArrows.count > 0) layers.push({ name: "links", primitive: "half-arrows", halfArrows, sizeMode: style.sizeMode });
+      } else if (this.lodModules && style.linkBend !== 0 && tree.superEdgeOffset) {
+        // Bent (undirected/line-style) inter-module links from the directed, flow-weighted super-edge
+        // adjacency. Width comes from the same weight scale as raw links, applied to each super-edge's
+        // accumulated subsumed weight; one-sided half-arrowheads when directed.
         const { lines, arrows } = bentSuperEdges(tree, frontier, {
           widthOf: style.linkWidthOf,
           stroke: style.linkStroke,

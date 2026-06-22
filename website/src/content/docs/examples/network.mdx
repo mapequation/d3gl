@@ -8,6 +8,7 @@ import Network from "../../../examples/network/Network.tsx";
 import LoadNetwork from "../../../examples/load-network/LoadNetwork.tsx";
 import ModularLod from "../../../examples/modular-lod/ModularLod.tsx";
 import FlowBorders from "../../../examples/flow-borders/FlowBorders.tsx";
+import ModularMap from "../../../examples/modular-map/ModularMap.tsx";
 
 The `network()` engine renders node–link diagrams through a dedicated GPU-instanced rendering
 lane: nodes are instanced points, links are instanced lines, and directed edges get triangle
@@ -217,6 +218,32 @@ every node.
 
 <ExampleCard files={["modular-lod/draw.ts", "modular-lod/data.ts"]}>
   <ModularLod client:visible slot="demo" />
+</ExampleCard>
+
+## A directed map of modules
+
+This brings it together: an **LFR planted-partition** network rendered as a **directed map of modules**.
+Each undirected benchmark edge is split into a reciprocal pair, and the random-walk **flow** is computed
+offline by d3gl's `randomWalkFlow` and baked into a fixture (`generate.ts`). That function reproduces
+[Infomap](https://www.mapequation.org/infomap/)'s directed flow — a test cross-checks it against
+`@mapequation/infomap` (the C++/WASM reference) to ~1e-7. Flow then drives every channel: node **radius**
+∝ visit rate, the **ring** ∝ enter/exit (boundary) flow, and the **half-arrow** width + colour ∝ link
+flow — so a reciprocal pair's two arrows carry genuinely different weight.
+
+Nodes are coloured **categorically by module** (the planted communities), fed to `lod({ modules })`. The
+**LOD** control switches the cut:
+
+- **Off** — every node and half-arrow.
+- **Standard** — plain structural coarsening; it *ignores* the partition, joining aggregates with simple
+  super-edge lines.
+- **Modules** — the partition drives the cut, so a module collapses to one glyph and its connectivity
+  shows as **half-arrow super-edges that thicken with the accumulated flow** between modules.
+
+In `sizeMode: "screen"` the glyphs stay a constant pixel size, so the map reads at every zoom — scroll
+out to the map of modules, in to sub-modules and individual nodes.
+
+<ExampleCard files={["modular-map/draw.ts", "modular-map/data.ts", "modular-map/generate.ts"]}>
+  <ModularMap client:visible slot="demo" />
 </ExampleCard>
 
 ## Loading a network from a file

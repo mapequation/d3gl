@@ -9,6 +9,9 @@ export type { NodeRadiusSpec, NodeMetric, FlowBorderSpec, LinkWidthSpec, LinkCol
 export { halfLinkGeometry, traceHalfLink, halfLinkPathString, scaleHalfLink } from "./half-link.js";
 export type { HalfLinkParams, HalfLinkGeometry, PathSink } from "./half-link.js";
 
+export { randomWalkFlow } from "./flow.js";
+export type { FlowGraph, FlowOptions, FlowResult } from "./flow.js";
+
 export { buildLODTree, computeLODGeometry, cut, declutterFrontier } from "./lod.js";
 export type { LODTree, LODTransform, CutOptions, DeclutterOptions } from "./lod.js";
 
