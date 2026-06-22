@@ -6,7 +6,7 @@ description: Render large directed networks with the network() engine — instan
 import ExampleCard from "../../../components/ExampleCard.astro";
 import Network from "../../../examples/network/Network.tsx";
 import LoadNetwork from "../../../examples/load-network/LoadNetwork.tsx";
-import Sierpinski from "../../../examples/sierpinski/Sierpinski.tsx";
+import ModularLod from "../../../examples/modular-lod/ModularLod.tsx";
 
 The `network()` engine renders node–link diagrams through a dedicated GPU-instanced rendering
 lane: nodes are instanced points, links are instanced lines, and directed edges get triangle
@@ -184,26 +184,23 @@ It's one generalised "path-strip" primitive: straight links stay the cheap 2-sam
 scale), while bent links trace a smooth multi-sample strip in the same shader. It renders in-shader on
 the WebGL lane and exports to SVG (a flattened bezier path + one-sided arrowhead).
 
-## Maps of networks
+## Modular level of detail
 
-Put it together and you get the second register: a **map of networks**. This example builds a directed
-**Sierpinski gasket** whose recursive subdivision *is* an Infomap-style module hierarchy — each smallest
-triangle a community, joined to its siblings by sparse directed bridges. It's rendered as a map:
+When the LOD hierarchy comes from a **provided module tree** (rather than structural coarsening), the
+adaptive cut becomes **modular-aware**: nodes aggregate into their *parent module* as you zoom out, and
+expand back to sub-modules and leaves as you zoom in. This example builds an undirected **Sierpinski
+gasket** whose recursive subdivision *is* the module hierarchy (an Infomap-style `path` per node), fed
+to `net.lod({ modules })`.
 
-- **Modules and nodes** are discs sized by **total flow**, with a **flow-border** ring ∝ enter/exit
-  (boundary) flow — `style({ flowBorder })`.
-- **Inter-module links** are **bent half-arrow super-edges**, width ∝ √flow — `style({ linkBend })` over
-  the directed, flow-weighted adjacency derived from the provided hierarchy.
-- **LOD** drives it all from that hierarchy: collapsed modules are single glyphs zoomed out and expand
-  → sub-modules → leaf triangles as you zoom in, the bent super-edges summarising connectivity at each
-  level. Toggle LOD off to see the full directed network instead. The **Depth** slider grows the gasket
-  from 27 to 2,187 nodes.
+Each node is coloured by its **top-level module** through a categorical palette, and `nodeFill` accepts
+a per-node accessor — so a module's aggregate glyph and all of its leaves share one colour, and you can
+read the planted hierarchy at every zoom level. Links are simple **bent lines** (`linkBend`), nodes get
+a 1px white outline (`nodeBorder`). Scroll to zoom and watch the three top modules expand → sub-modules
+→ leaf triangles; the **Depth** slider grows the gasket from 27 to 2,187 nodes, and **LOD** off draws
+every node.
 
-Everything in the engine is the same adaptive cut as the module-free case — only the hierarchy *source*
-(provided modules) and the glyphs (flow borders, bent half-arrows) differ.
-
-<ExampleCard files={["sierpinski/draw.ts", "sierpinski/data.ts"]}>
-  <Sierpinski client:visible slot="demo" />
+<ExampleCard files={["modular-lod/draw.ts", "modular-lod/data.ts"]}>
+  <ModularLod client:visible slot="demo" />
 </ExampleCard>
 
 ## Loading a network from a file

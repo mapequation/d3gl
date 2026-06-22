@@ -74,12 +74,22 @@ export function resolveNodeRadii(graph: NetworkGraph, spec: NodeRadiusSpec): Flo
   return radii;
 }
 
+/** A constant ring of a fixed pixel width (#104 rework) — e.g. a 1px white outline on every node. */
+export interface ConstBorder {
+  width: number;
+  color: [number, number, number, number];
+}
+
 export interface NodeStyleResolved {
   /** Per-node radius (world units), length `graph.nodeCount`. Resolved via {@link resolveNodeRadii}. */
   radii: Float32Array;
   fill: string;
+  /** Optional per-node RGBA fill (length `4·count`) — overrides `fill` (categorical module colours, #104 rework). */
+  colors?: Uint8Array;
   /** Optional flow-border ring (#104 N6); `null`/absent ⇒ plain filled nodes. */
   border?: ResolvedFlowBorder | null;
+  /** Optional constant border ring (#104 rework): a fixed px width + colour, independent of flow. */
+  constBorder?: ConstBorder | null;
 }
 
 export interface LinkStyleResolved {
@@ -184,6 +194,30 @@ function buildBorders(
   return { borders, borderColors };
 }
 
+/** Per-instance ring arrays for a constant px-width border (fraction = width/radius), one colour. */
+function constBorderArrays(
+  count: number,
+  radii: ArrayLike<number>,
+  width: number,
+  color: [number, number, number, number],
+): { borders: Float32Array; borderColors: Uint8Array } {
+  return buildBorders(count, radii, () => width, (w) => w, color);
+}
+
+/** Resolve a per-node fill-colour accessor to a packed RGBA buffer (length `4·nodeCount`), #104 rework. */
+export function resolveNodeColors(graph: NetworkGraph, color: (index: number, graph: NetworkGraph) => string): Uint8Array {
+  const n = graph.nodeCount;
+  const out = new Uint8Array(n * 4);
+  for (let i = 0; i < n; i++) {
+    const [r, g, b, a] = toRGBA(color(i, graph));
+    out[i * 4] = r;
+    out[i * 4 + 1] = g;
+    out[i * 4 + 2] = b;
+    out[i * 4 + 3] = a;
+  }
+  return out;
+}
+
 /**
  * Inner-disc radii (`radius − ring width`) for rendering a flow border as two stacked discs (a
  * border-colour disc under a smaller fill disc) on the SVG/Canvas export path, which has no
@@ -207,13 +241,16 @@ export function flowBorderInnerRadii(radii: ArrayLike<number>, metric: ArrayLike
  */
 export function nodeCircles(graph: NetworkGraph, style: NodeStyleResolved): InstancedCirclesData {
   const count = graph.nodeCount;
-  const colors = fillColors(count, style.fill);
+  const colors = style.colors ?? fillColors(count, style.fill);
+  const base = { centers: graph.positions, radii: style.radii, colors, count };
   if (style.border) {
     const { metric, scale, color } = style.border;
-    const { borders, borderColors } = buildBorders(count, style.radii, (i) => metric[i]!, scale, color);
-    return { centers: graph.positions, radii: style.radii, colors, borders, borderColors, count };
+    return { ...base, ...buildBorders(count, style.radii, (i) => metric[i]!, scale, color) };
   }
-  return { centers: graph.positions, radii: style.radii, colors, count };
+  if (style.constBorder) {
+    return { ...base, ...constBorderArrays(count, style.radii, style.constBorder.width, style.constBorder.color) };
+  }
+  return base;
 }
 
 export interface FrontierStyleResolved {
@@ -233,6 +270,10 @@ export interface FrontierStyleResolved {
    * sum-aggregated `border` metric (a module reflects its members' total); `metric` is ignored here.
    */
   border?: ResolvedFlowBorder | null;
+  /** Optional constant border ring (#104 rework): fixed px width + colour on every frontier glyph. */
+  constBorder?: ConstBorder | null;
+  /** Colour each frontier glyph by the tree's per-node `color` (categorical module colours) instead of `nodeFill`/`aggregateFill`. */
+  useTreeColor?: boolean;
 }
 
 /**
@@ -250,6 +291,7 @@ export function frontierCircles(tree: LODTree, frontier: Uint32Array, style: Fro
   const colors = new Uint8Array(count * 4);
   const leaf = toRGBA(style.nodeFill);
   const agg = toRGBA(style.aggregateFill);
+  const useTreeColor = style.useTreeColor === true;
   for (let i = 0; i < count; i++) {
     const g = frontier[i]!;
     centers[i * 2] = tree.cx[g]!;
@@ -258,18 +300,29 @@ export function frontierCircles(tree: LODTree, frontier: Uint32Array, style: Fro
     // point in a 1-child cell, #103) — draw it as that point: leaf fill, uncapped radius.
     const isLeafNode = g < tree.leafCount || tree.count[g] === 1;
     radii[i] = isLeafNode ? tree.radius[g]! : Math.min(tree.radius[g]!, maxAgg);
-    const c = isLeafNode ? leaf : agg;
-    colors[i * 4] = c[0];
-    colors[i * 4 + 1] = c[1];
-    colors[i * 4 + 2] = c[2];
-    colors[i * 4 + 3] = c[3];
+    if (useTreeColor) {
+      // Categorical module colour, propagated to aggregates by computeLODStyle.
+      colors[i * 4] = tree.color[g * 4]!;
+      colors[i * 4 + 1] = tree.color[g * 4 + 1]!;
+      colors[i * 4 + 2] = tree.color[g * 4 + 2]!;
+      colors[i * 4 + 3] = tree.color[g * 4 + 3]!;
+    } else {
+      const c = isLeafNode ? leaf : agg;
+      colors[i * 4] = c[0];
+      colors[i * 4 + 1] = c[1];
+      colors[i * 4 + 2] = c[2];
+      colors[i * 4 + 3] = c[3];
+    }
   }
+  const base = { centers, radii, colors, count };
   if (style.border) {
     const { scale, color } = style.border;
-    const { borders, borderColors } = buildBorders(count, radii, (i) => tree.border[frontier[i]!]!, scale, color);
-    return { centers, radii, colors, borders, borderColors, count };
+    return { ...base, ...buildBorders(count, radii, (i) => tree.border[frontier[i]!]!, scale, color) };
   }
-  return { centers, radii, colors, count };
+  if (style.constBorder) {
+    return { ...base, ...constBorderArrays(count, radii, style.constBorder.width, style.constBorder.color) };
+  }
+  return base;
 }
 
 export interface SuperEdgeStyleResolved {
@@ -529,8 +582,12 @@ export interface ResolvedNetworkStyle {
    * out). Arrowheads are world-only for now (their screen-mode shader is a tracked gap, #103).
    */
   sizeMode: "world" | "screen";
+  /** Optional per-node RGBA fill (categorical module colours, #104 rework); overrides `nodeFill` when set. */
+  nodeColors?: Uint8Array;
   /** Flow-border ring (#104 N6), or `null` when disabled (plain filled nodes). */
   flowBorder: ResolvedFlowBorder | null;
+  /** Constant border ring (#104 rework), or `null`; used when no flow border is set. */
+  constBorder: ConstBorder | null;
   /**
    * Link bend (#104 N6c): quadratic-bezier control offset ⟂ to the chord, as a fraction of chord
    * length. `0` (default) ⇒ straight links; non-zero bows links into curves, and directed links get
@@ -569,7 +626,13 @@ export function networkLayers(graph: NetworkGraph, style: ResolvedNetworkStyle):
   layers.push({
     name: "nodes",
     primitive: "circles",
-    circles: nodeCircles(graph, { radii: style.nodeRadii, fill: style.nodeFill, border: style.flowBorder }),
+    circles: nodeCircles(graph, {
+      radii: style.nodeRadii,
+      fill: style.nodeFill,
+      colors: style.nodeColors,
+      border: style.flowBorder,
+      constBorder: style.constBorder,
+    }),
     sizeMode: style.sizeMode,
   });
   return layers;

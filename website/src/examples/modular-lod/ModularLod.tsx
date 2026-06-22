@@ -2,10 +2,10 @@ import Example from "../../components/Example.js";
 import Imperative from "../../components/Imperative.js";
 import { setup } from "./draw.js";
 
-/** Harness for the directed map-of-networks example: a Depth slider (gasket size) and an LOD toggle.
- *  Rendering is WebGL-instanced — flow-border modules + bent half-arrow super-edges; scroll to zoom,
- *  drag to pan, and watch modules expand → sub-modules → leaf triangles. */
-export default function Sierpinski() {
+/** Harness for the modular-LOD example: a Depth slider (gasket size) and an LOD toggle. Nodes are
+ *  coloured by top-level module; with LOD on they aggregate into their parent module as you zoom out.
+ *  Scroll to zoom, drag to pan. */
+export default function ModularLod() {
   return (
     <Example
       controls={[
