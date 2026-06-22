@@ -111,6 +111,13 @@ SVG/Canvas export, so publication output matches the screen. The plain `linkStyl
 default, see the large-scale example) keeps stroked lines + separate arrowheads for graphs with many
 edges.
 
+The **Sizing** toggle switches `sizeMode`. In **screen** mode the link decorations (width, arrow tip,
+bend, node radii) stay a constant pixel size as you zoom while the nodes still move — the navigation
+register LOD wants. Screen-mode half-arrows are recomputed per frame on the WebGL lane; for SVG/Canvas
+the shape is *baked* into world coords at the current zoom (a retained backend can't recompute a shape
+spanning two moving anchors per frame), refreshed automatically on backend switch and at the end of a
+pan/zoom — call `net.syncScreenGeometry()` to refit on demand (e.g. before a programmatic export).
+
 <ExampleCard files={["flow-borders/draw.ts", "flow-borders/data.ts"]}>
   <FlowBorders client:visible slot="demo" />
 </ExampleCard>

@@ -633,6 +633,28 @@ export class Network extends BaseEngine {
   }
 
   /**
+   * Re-bake the SVG/Canvas **screen-sizeMode half-arrow** geometry to the *current* zoom, so a vector
+   * backend reproduces the WebGL screen look at any zoom (the retained Scene can't recompute a
+   * screen-space shape per frame, so it's baked into world coords at the active transform; see
+   * {@link registerNetworkScene}). **No-op on WebGL** (the shader does it live) and when not drawing
+   * screen-mode half-arrows. Called automatically on backend switch and at interaction-end; call it
+   * explicitly for a "refit" button or before a programmatic export at a chosen transform.
+   */
+  syncScreenGeometry(): this {
+    const backend = this.backend();
+    // Only the retained (vector) backends need re-baking; the WebGL instanced lane is live.
+    if (backend && !backend.setInstancedLayer && this.sceneActive) this.rebuild();
+    return this;
+  }
+
+  /** Re-bake the vector-backend screen-mode geometry when a pan/zoom gesture ends (cheap, O(edges)). */
+  protected override setInteracting(v: boolean): void {
+    const ending = this.interacting && !v;
+    super.setInteracting(v);
+    if (ending) this.syncScreenGeometry();
+  }
+
+  /**
    * Register the network as retained Scene layers (links under arrows under nodes) via the
    * PathContext glyph emitters. With `emit: false` the layers are registered empty — used to
    * clear tessellated geometry when switching to the WebGL instanced lane.
@@ -646,18 +668,26 @@ export class Network extends BaseEngine {
     // so the "links" layer fills and the "arrows" layer stays empty. Plain `line` style strokes + a
     // separate filled arrowhead, as before.
     const halfArrow = style.linkStyle === "half-arrow" && style.directed;
+    // SVG/Canvas half-arrows are always world-sized: a screen-mode shape that spans two
+    // independently-projected node anchors can't be expressed by the retained Scene's per-drawable
+    // anchor (only the WebGL lane recomputes it per frame). To still match the WebGL *screen* look for
+    // export, we BAKE the shape at the current zoom: dividing the decoration sizes by k means the
+    // Scene's ×k view transform reproduces the constant-px appearance. The bake is refreshed on backend
+    // switch (here) and at interaction-end (see setInteracting) / on demand (syncScreenGeometry).
+    const screenHalf = halfArrow && style.sizeMode === "screen";
+    const k = this.transform.k || 1;
+    const haRadii = screenHalf ? Float32Array.from(style.nodeRadii, (r) => r / k) : style.nodeRadii;
+    const haWidthOf = screenHalf ? (w: number) => style.linkWidthOf(w) / k : style.linkWidthOf;
+    const haBend = screenHalf ? style.linkBend / k : style.linkBend;
     this.registerLayer({
       name: "links",
       data: edgeIds,
       ids: edgeIds,
-      // SVG/Canvas half-arrows are always world-sized: a screen-mode shape that spans two
-      // independently-projected node anchors can't be expressed by the retained Scene's per-drawable
-      // anchor — only the WebGL lane recomputes it per frame. World geometry is correct for static export.
       sizeMode: halfArrow ? "world" : style.sizeMode,
       ...(halfArrow ? { fill: (e) => linkColorAt(e as number) } : { stroke: (e) => linkColorAt(e as number) }),
       build: (g) => {
         if (!emit) return;
-        if (halfArrow) emitHalfLinks(g, graph, style.nodeRadii, style.linkWidthOf, style.linkBend);
+        if (halfArrow) emitHalfLinks(g, graph, haRadii, haWidthOf, haBend);
         else emitLinks(g, graph, style.linkWidthOf, style.linkBend);
       },
     });

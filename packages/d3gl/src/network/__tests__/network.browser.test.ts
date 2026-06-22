@@ -248,6 +248,37 @@ describe("network() engine", () => {
     net.destroy();
   });
 
+  it("syncScreenGeometry re-bakes screen-mode half-arrows to the current zoom (vector export parity)", async () => {
+    const net = network(host(), { width: 200, height: 200, backend: "svg" });
+    await net.whenReady();
+    const g = buildGraph({ nodeCount: 2, source: [0, 1], target: [1, 0], weight: [0.5, 0.3], directed: true, nodeFlow: [0.6, 0.4] });
+    const apply = () =>
+      net.style({
+        directed: true,
+        linkStyle: "half-arrow",
+        sizeMode: "screen",
+        nodeRadius: new Float32Array([30, 20]),
+        linkBend: 30,
+        linkWidth: (w) => (w > 0.4 ? 13 : 7),
+        linkStroke: (w) => (w > 0.4 ? "#418EC7" : "#71B2D7"),
+      });
+    // The first half-link's path `d` is the *world-baked* geometry (independent of the <g> wrapper
+    // transform), so comparing it isolates the bake from the view scale.
+    const pathD = () => net.toSVG().match(/<path d="([^"]*)"/)?.[1] ?? "";
+
+    net.setTransform({ k: 1, x: 0, y: 0 });
+    net.data(g).layout({ backend: "positions", positions: new Float32Array([60, 60, 140, 100]) });
+    apply();
+    const d1 = pathD();
+    net.setTransform({ k: 2, x: 0, y: 0 }); // a programmatic zoom does not re-bake on its own…
+    expect(pathD()).toBe(d1);
+    net.syncScreenGeometry(); // …syncing re-bakes the screen shape to k=2 (decorations ÷ k)
+    expect(pathD()).not.toBe(d1);
+    expect(net.syncScreenGeometry()).toBe(net); // chainable + idempotent at a fixed transform
+
+    net.destroy();
+  });
+
   it("exports half-arrow links to SVG as one filled path per link (head fused, no separate arrow)", async () => {
     const net = network(host(), { width: 200, height: 200, backend: "svg" });
     await net.whenReady();
