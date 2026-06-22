@@ -12,6 +12,9 @@ export type { LODTree, LODTransform, CutOptions, DeclutterOptions } from "./lod.
 export { buildModuleLODTree } from "./modules.js";
 export type { ModuleNode } from "./modules.js";
 
+export { moduleColors } from "./module-colors.js";
+export type { ModulePathNode, ModuleColorOptions } from "./module-colors.js";
+
 export { buildGraph, buildCSR } from "./graph.js";
 export type { NetworkGraph, CSR, BuildGraphInput } from "./graph.js";
 

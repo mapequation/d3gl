@@ -13,7 +13,7 @@ describe("resolveNodeColors", () => {
 });
 
 describe("LOD colour aggregation (computeLODStyle)", () => {
-  it("propagates a uniform module colour to its aggregate, and averages a mixed parent", () => {
+  it("preserves a uniform module's colour on its aggregate (circular-hue mean), and blends a mixed parent vividly", () => {
     // Module 4 = {0,1} red; module 5 = {2,3} blue; root 6 = {4,5}.
     const tree = buildModuleLODTree(4, [
       { id: 0, path: [1, 1] }, { id: 1, path: [1, 2] }, { id: 2, path: [2, 1] }, { id: 3, path: [2, 2] },
@@ -22,11 +22,16 @@ describe("LOD colour aggregation (computeLODStyle)", () => {
     const blue = [0, 0, 200, 255];
     const leafColors = new Uint8Array([...red, ...red, ...blue, ...blue]);
     computeLODStyle(tree, new Float32Array([4, 4, 4, 4]), new Float32Array([1, 1, 1, 1]), undefined, leafColors);
-    // Uniform children keep the colour exactly…
-    expect(Array.from(tree.color.slice(4 * 4, 4 * 4 + 4))).toEqual(red); // module 4
-    expect(Array.from(tree.color.slice(5 * 4, 5 * 4 + 4))).toEqual(blue); // module 5
-    // …the root averages its two children (red+blue)/2.
-    expect(Array.from(tree.color.slice(6 * 4, 6 * 4 + 4))).toEqual([100, 0, 100, 255]);
+    const at = (g: number) => Array.from(tree.color.slice(g * 4, g * 4 + 4));
+    const near = (got: number[], want: number[], tol = 4) => got.every((v, i) => Math.abs(v - want[i]!) <= tol);
+    // Uniform children → the aggregate keeps that colour (within HCL round-trip tolerance).
+    expect(near(at(4), red)).toBe(true);
+    expect(near(at(5), blue)).toBe(true);
+    // Mixed parent → a vivid blend (a magenta between red and blue), NOT a muddy dark RGB average.
+    const root = at(6);
+    expect(root[0]!).toBeGreaterThan(120); // strong red component
+    expect(root[2]!).toBeGreaterThan(90); // strong blue component
+    expect(root[1]!).toBeLessThan(40); // little green → not muddy/grey
   });
 });
 

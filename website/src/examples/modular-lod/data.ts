@@ -78,9 +78,11 @@ export function generateSierpinski(depth: number): SierpinskiGraph {
     const c1 = [...prefix, 1];
     const c2 = [...prefix, 2];
     const c3 = [...prefix, 3];
-    edge(cornerId(c1, 2), cornerId(c2, 1), BRIDGE);
-    edge(cornerId(c2, 3), cornerId(c3, 2), BRIDGE);
-    edge(cornerId(c1, 3), cornerId(c3, 1), BRIDGE);
+    // Heavier bridges between larger sub-gaskets, so a super-edge grows as its modules aggregate.
+    const w = BRIDGE * Math.pow(3, depth - 1 - prefix.length);
+    edge(cornerId(c1, 2), cornerId(c2, 1), w);
+    edge(cornerId(c2, 3), cornerId(c3, 2), w);
+    edge(cornerId(c1, 3), cornerId(c3, 1), w);
     addBridges(c1), addBridges(c2), addBridges(c3);
   };
   addBridges([]);
@@ -97,12 +99,3 @@ export function generateSierpinski(depth: number): SierpinskiGraph {
 
 /** The gasket's fixed world bounds (depth-independent) — for fitting the initial view. */
 export const SIERPINSKI_BOUNDS = { minX: 0, maxX: SCALE, minY: 0, maxY: HEIGHT };
-
-/**
- * Muted categorical palette (the scheme mapequation uses for module colours) — index a module by its
- * top-level id so a module glyph and all its leaves share one colour.
- */
-export const MODULE_PALETTE = [
-  "#EBC384", "#82A3C9", "#C2554A", "#ADB580", "#A37CB6", "#E68C6C", "#7DB7AE", "#DFDDA2",
-  "#C9748A", "#5D7FA0", "#D4925E", "#6A8C5C", "#B4CCDF", "#ECA770", "#8C7363", "#B49AD0",
-];

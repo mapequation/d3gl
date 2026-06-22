@@ -235,7 +235,10 @@ export class Network extends BaseEngine {
   style(style: NetworkStyle): this {
     this.styleOpts = { ...this.styleOpts, ...style };
     this.resolvedCache = null; // radii/colours/sizeMode changed
-    if (this.lodOptions) this.recomputeLODGeometry(); // node radii feed the LOD tree's draw radii
+    // Refresh the LOD tree's style geometry (radii/colours) only if a tree already exists. Don't
+    // *build* one here: after a data() change the tree is null and the provided modules may not yet
+    // match the new graph (lod() supplies fresh ones next) — building now would mismatch and throw.
+    if (this.lodOptions && (this.lodTree || this.lodWorkerTree)) this.recomputeLODGeometry();
     return this.rebuild();
   }
 
@@ -646,26 +649,41 @@ export class Network extends BaseEngine {
         if (emit && style.directed) emitArrows(g, graph, style.arrowSize, style.nodeRadii, style.linkBend, style.linkBend !== 0);
       },
     });
-    // Flow border (#104 N6): the instanced lane draws the ring in-shader, but the Scene path has no
+    // Per-node fill: a single colour, or the per-node accessor (categorical module colours, #104 rework).
+    const fillSpec = this.styleOpts.nodeFill;
+    const fillOf = typeof fillSpec === "function" ? (i: number) => fillSpec(i, graph) : () => style.nodeFill;
+
+    // Border (#104 N6/rework): the instanced lane draws the ring in-shader, but the Scene path has no
     // per-element ring primitive — so render it as two stacked discs, a border-colour disc under a
-    // smaller fill disc (inner radius = radius − ring width). Always registered (empty when off) so
-    // toggling the border clears the layer instead of leaving it behind.
-    const border = style.flowBorder;
-    const innerRadii = border ? flowBorderInnerRadii(style.nodeRadii, border.metric, border.scale) : style.nodeRadii;
+    // smaller fill disc (inner radius = radius − ring width). Handles both the flow border (per-node
+    // width) and the constant border (fixed px). Always registered (empty when off) so toggling clears it.
+    const flow = style.flowBorder;
+    const cb = style.constBorder;
+    const borderColorCss = flow
+      ? flow.colorCss
+      : cb
+        ? `rgba(${cb.color[0]},${cb.color[1]},${cb.color[2]},${cb.color[3] / 255})`
+        : style.nodeFill;
+    const innerRadii = flow
+      ? flowBorderInnerRadii(style.nodeRadii, flow.metric, flow.scale)
+      : cb
+        ? Float32Array.from(style.nodeRadii, (r) => Math.max(0, r - Math.min(r, cb.width)))
+        : style.nodeRadii;
+    const hasBorder = !!(flow || cb);
     this.registerLayer({
       name: "node-borders",
       data: nodeIds,
       ids: nodeIds,
-      fill: () => border?.colorCss ?? style.nodeFill,
+      fill: () => borderColorCss,
       build: (g) => {
-        if (emit && border) emitNodes(g, graph, style.nodeRadii);
+        if (emit && hasBorder) emitNodes(g, graph, style.nodeRadii);
       },
     });
     this.registerLayer({
       name: "nodes",
       data: nodeIds,
       ids: nodeIds,
-      fill: () => style.nodeFill,
+      fill: (i) => fillOf(i as number),
       build: (g) => {
         if (emit) emitNodes(g, graph, innerRadii);
       },

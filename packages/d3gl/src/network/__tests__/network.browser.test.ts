@@ -254,4 +254,27 @@ describe("network() engine", () => {
     expect(net.setTransform({ k: 30, x: -2900, y: -2900 })).toBe(net);
     net.destroy();
   });
+
+  it("re-renders with a different-size graph + module hierarchy without throwing (depth change)", async () => {
+    const net = network(host(), { width: 200, height: 200 });
+    await net.whenReady();
+    // The example's chain: data → style (per-node colour accessor) → lod(modules) → layout. style()
+    // must not build a stale module tree against the new graph before lod() supplies fresh modules.
+    const render = (n: number, modules: { id: number; path: number[] }[]) => {
+      const source: number[] = [];
+      const target: number[] = [];
+      for (let i = 0; i + 1 < n; i++) (source.push(i), target.push(i + 1));
+      net
+        .data(buildGraph({ nodeCount: n, source, target }))
+        .style({ sizeMode: "screen", nodeRadius: 4, nodeFill: (i) => (i % 2 ? "#f00" : "#00f") })
+        .lod({ modules, expandPx: 40 })
+        .layout({ backend: "positions", positions: new Float32Array(n * 2) });
+    };
+    const four = [{ id: 0, path: [1, 1] }, { id: 1, path: [1, 2] }, { id: 2, path: [2, 1] }, { id: 3, path: [2, 2] }];
+    const six = [0, 1, 2, 3, 4, 5].map((id) => ({ id, path: [id < 3 ? 1 : 2, (id % 3) + 1] }));
+    expect(() => render(4, four)).not.toThrow();
+    expect(() => render(6, six)).not.toThrow(); // increase
+    expect(() => render(4, four)).not.toThrow(); // decrease
+    net.destroy();
+  });
 });

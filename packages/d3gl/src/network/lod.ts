@@ -15,6 +15,7 @@
  * Kept network-private for now behind the {@link cut} / frontier boundary; the same shape is meant
  * to be promotable to a shared core `select(transform) → visibleIndices` lane later (#108).
  */
+import { hcl, rgb } from "d3-color";
 import type { NetworkGraph } from "./graph.js";
 import { buildHierarchy, type CoarsenOptions, type Hierarchy } from "./coarsen.js";
 
@@ -546,27 +547,37 @@ export function computeLODStyle(
       let sw = 0;
       let sumR2 = 0;
       let sb = 0;
-      let cr = 0, cg = 0, cb = 0, ca = 0, nc = 0;
+      // Colour: a chroma-weighted circular-hue mean in HCL, so a module's aggregate takes its hue
+      // family's representative hue (crisp) rather than a muddy RGB average across the family.
+      let hx = 0, hy = 0, sumC = 0, sumL = 0, sumA = 0, nc = 0;
       for (let p = childOffset[g]!; p < childOffset[g + 1]!; p++) {
         const c = children[p]!;
         sw += weight[c]!;
         sumR2 += radius[c]! * radius[c]!;
         sb += border[c]!;
-        cr += color[c * 4]!;
-        cg += color[c * 4 + 1]!;
-        cb += color[c * 4 + 2]!;
-        ca += color[c * 4 + 3]!;
-        nc++;
+        if (leafColors) {
+          const col = hcl(rgb(color[c * 4]!, color[c * 4 + 1]!, color[c * 4 + 2]!));
+          const ch = Number.isNaN(col.c) ? 0 : col.c;
+          if (!Number.isNaN(col.h)) {
+            hx += Math.cos((col.h * Math.PI) / 180) * ch;
+            hy += Math.sin((col.h * Math.PI) / 180) * ch;
+          }
+          sumC += ch;
+          sumL += Number.isNaN(col.l) ? 0 : col.l;
+          sumA += color[c * 4 + 3]!;
+          nc++;
+        }
       }
       weight[g] = sw;
       radius[g] = Math.sqrt(sumR2); // area-additive: aggregate ink ≈ Σ child ink
       border[g] = sb; // sum-additive: a module's border metric ≈ Σ member metric
       if (leafColors && nc > 0) {
-        // Averaged child colour — uniform children (one palette colour per module) stay that colour.
-        color[g * 4] = Math.round(cr / nc);
-        color[g * 4 + 1] = Math.round(cg / nc);
-        color[g * 4 + 2] = Math.round(cb / nc);
-        color[g * 4 + 3] = Math.round(ca / nc);
+        const hue = (Math.atan2(hy, hx) * 180) / Math.PI;
+        const c = rgb(hcl(hue, sumC / nc, sumL / nc));
+        color[g * 4] = Math.max(0, Math.min(255, Math.round(c.r)));
+        color[g * 4 + 1] = Math.max(0, Math.min(255, Math.round(c.g)));
+        color[g * 4 + 2] = Math.max(0, Math.min(255, Math.round(c.b)));
+        color[g * 4 + 3] = Math.round(sumA / nc);
       }
     }
   }
