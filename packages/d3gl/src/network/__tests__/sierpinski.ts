@@ -121,10 +121,9 @@ export function generateSierpinski(depth: number): SierpinskiNetwork {
     const c1 = [...prefix, 1];
     const c2 = [...prefix, 2];
     const c3 = [...prefix, 3];
-    const w = BRIDGE_WEIGHT * Math.pow(3, depth - 1 - prefix.length); // heavier between larger sub-gaskets
-    edge(cornerId(c1, 2), cornerId(c2, 1), w); // child1↔child2 at mid(p0,p1)
-    edge(cornerId(c2, 3), cornerId(c3, 2), w); // child2↔child3 at mid(p1,p2)
-    edge(cornerId(c1, 3), cornerId(c3, 1), w); // child1↔child3 at mid(p0,p2)
+    edge(cornerId(c1, 2), cornerId(c2, 1), BRIDGE_WEIGHT); // child1↔child2 at mid(p0,p1)
+    edge(cornerId(c2, 3), cornerId(c3, 2), BRIDGE_WEIGHT); // child2↔child3 at mid(p1,p2)
+    edge(cornerId(c1, 3), cornerId(c3, 1), BRIDGE_WEIGHT); // child1↔child3 at mid(p0,p2)
     addBridges(c1);
     addBridges(c2);
     addBridges(c3);

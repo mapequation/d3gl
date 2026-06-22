@@ -92,8 +92,12 @@ export interface NodeStyleResolved {
   constBorder?: ConstBorder | null;
 }
 
+/** Link width: a constant, or a d3-style scale of the edge's weight/flow (like {@link NodeRadiusSpec}). */
+export type LinkWidthSpec = number | ((weight: number) => number);
+
 export interface LinkStyleResolved {
-  width: number;
+  /** Per-edge width from its weight; for super-edges, applied to the accumulated subsumed weight. */
+  widthOf: (weight: number) => number;
   stroke: string;
   /** Bend (#104 N6c): quadratic-bezier control offset ⟂ to the chord, as a fraction of chord length (0 = straight). */
   bend?: number;
@@ -382,13 +386,11 @@ export function superEdgeLines(
 }
 
 export interface BentSuperEdgeStyleResolved {
-  /** Constant link width, unless `flowScale` is given. */
-  width: number;
+  /** Width from a super-edge's **accumulated** subsumed weight (the same scale as raw links). */
+  widthOf: (weight: number) => number;
   stroke: string;
   /** Bend (fraction of chord) for the bezier links. */
   bend: number;
-  /** Optional map flow → link width (e.g. `scaleSqrt`), so width ∝ √flow; constant `width` when absent. */
-  flowScale?: (flow: number) => number;
   /** Draw one-sided half-arrowheads (directed maps). */
   directed: boolean;
   arrowSize: number;
@@ -454,7 +456,7 @@ export function bentSuperEdges(
     sources[e * 2 + 1] = sy;
     targets[e * 2] = tx;
     targets[e * 2 + 1] = ty;
-    widths[e] = style.flowScale ? style.flowScale(wS[e]!) : style.width;
+    widths[e] = style.widthOf(wS[e]!); // accumulated subsumed weight → width
     // Arrow tip set back to the target module's boundary along the bezier end-tangent.
     const [ux, uy] = bentEndTangent(sx, sy, tx, ty, style.bend);
     const setback = drawnRadius(h);
@@ -506,7 +508,8 @@ export function linkLines(graph: NetworkGraph, style: LinkStyleResolved): Instan
     targets[e * 2] = graph.positions[t * 2]!;
     targets[e * 2 + 1] = graph.positions[t * 2 + 1]!;
   }
-  const widths = new Float32Array(count).fill(style.width);
+  const widths = new Float32Array(count);
+  for (let e = 0; e < count; e++) widths[e] = style.widthOf(graph.weight[e]!);
   const colors = fillColors(count, style.stroke);
   if (style.bend) {
     return { sources, targets, widths, colors, bends: new Float32Array(count).fill(style.bend), samples: BENT_SAMPLES, count };
@@ -571,7 +574,10 @@ export interface ResolvedNetworkStyle {
   /** Per-node radii, length `nodeCount`; resolved via {@link resolveNodeRadii}. Units follow `sizeMode`. */
   nodeRadii: Float32Array;
   nodeFill: string;
+  /** Representative scalar width (for unweighted super-edges + the arrow-size default). */
   linkWidth: number;
+  /** Per-edge width from weight (a d3 scale or constant); for super-edges, applied to accumulated weight. */
+  linkWidthOf: (weight: number) => number;
   linkStroke: string;
   arrowSize: number;
   arrowFill: string;
@@ -608,7 +614,7 @@ export function networkLayers(graph: NetworkGraph, style: ResolvedNetworkStyle):
     layers.push({
       name: "links",
       primitive: "lines",
-      lines: linkLines(graph, { width: style.linkWidth, stroke: style.linkStroke, bend }),
+      lines: linkLines(graph, { widthOf: style.linkWidthOf, stroke: style.linkStroke, bend }),
       sizeMode: style.sizeMode,
     });
     if (style.directed) {
@@ -651,8 +657,8 @@ export function emitNodes(g: GroupBuilder, graph: NetworkGraph, radii: Float32Ar
   }
 }
 
-/** Emit each link as a stroked drawable, keyed by edge index. With `bend` it bows into a quadratic bezier (#104 N6c). */
-export function emitLinks(g: GroupBuilder, graph: NetworkGraph, width: number, bend = 0): void {
+/** Emit each link as a stroked drawable, keyed by edge index; width from its weight via `widthOf`. With `bend` it bows into a quadratic bezier (#104 N6c). */
+export function emitLinks(g: GroupBuilder, graph: NetworkGraph, widthOf: (weight: number) => number, bend = 0): void {
   for (let e = 0; e < graph.edgeCount; e++) {
     const s = graph.source[e]!;
     const t = graph.target[e]!;
@@ -660,6 +666,7 @@ export function emitLinks(g: GroupBuilder, graph: NetworkGraph, width: number, b
     const sy = graph.positions[s * 2 + 1]!;
     const tx = graph.positions[t * 2]!;
     const ty = graph.positions[t * 2 + 1]!;
+    const width = widthOf(graph.weight[e]!);
     g.drawable(
       e,
       (ctx) => {

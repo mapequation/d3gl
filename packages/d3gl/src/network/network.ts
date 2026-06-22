@@ -1,5 +1,5 @@
 import { BaseEngine, type BaseEngineOptions } from "../map/base-engine.js";
-import { networkLayers, frontierCircles, superEdgeLines, bentSuperEdges, emitNodes, emitLinks, emitArrows, resolveNodeRadii, resolveFlowBorder, resolveNodeColors, flowBorderInnerRadii, type ResolvedNetworkStyle, type NodeRadiusSpec, type FlowBorderSpec, type ConstBorder } from "./glyphs.js";
+import { networkLayers, frontierCircles, superEdgeLines, bentSuperEdges, emitNodes, emitLinks, emitArrows, resolveNodeRadii, resolveFlowBorder, resolveNodeColors, flowBorderInnerRadii, type ResolvedNetworkStyle, type NodeRadiusSpec, type FlowBorderSpec, type ConstBorder, type LinkWidthSpec } from "./glyphs.js";
 import { rgb } from "d3-color";
 import { ForceLayout, seedPositions, type ForceParams } from "./force.js";
 import { multilevelLayout, type CoarsenOptions } from "./coarsen.js";
@@ -37,8 +37,13 @@ export interface NetworkStyle {
    * `flowBorder` wins if both are set.
    */
   nodeBorder?: { width: number; color?: string };
-  /** Link width in world units. Default 1. */
-  linkWidth?: number;
+  /**
+   * Link width. A constant (default 1), or a **d3 scale of the edge weight** — `(weight) => width`,
+   * e.g. `scaleSqrt().domain([0, maxWeight]).range([0.5, 6])` — analogous to {@link nodeRadius}. A
+   * **super-edge** applies the same scale to the **accumulated** weight of the edges it subsumes, so
+   * link thickness reads as flow at every LOD level.
+   */
+  linkWidth?: LinkWidthSpec;
   /** Link stroke colour (any CSS color). Default a light grey. */
   linkStroke?: string;
   /** Arrowhead size (world units) for directed links. Default 3 × linkWidth. */
@@ -199,8 +204,6 @@ export class Network extends BaseEngine {
   private lodSpatial = false;
   /** Whether the current `lodTree` was built from a provided module hierarchy (N6 / #104). */
   private lodModules = false;
-  /** Max directed super-edge flow in the current module tree (#104 N6c), to normalise bent-link widths. */
-  private lodMaxSuperFlow = 0;
   /** True while a worker-LOD run is in flight (launched, not yet settled/stopped) — it will stream the tree. */
   private lodStreaming = false;
   /** Dedup guard for the one-shot deferred main-thread LOD-tree fallback (see {@link scheduleLODFallback}). */
@@ -492,13 +495,12 @@ export class Network extends BaseEngine {
     if (opts.superEdges !== false && this.graph!.edgeCount > 0) {
       if (this.lodModules && style.linkBend !== 0 && tree.superEdgeOffset) {
         // Map register (#104 N6c): bent half-arrow inter-module links from the directed, flow-weighted
-        // super-edge adjacency; width ∝ √flow (normalised to the max), half-arrows when directed.
-        const maxFlow = this.lodMaxSuperFlow || 1;
+        // super-edge adjacency. Width comes from the same weight scale as raw links, applied to each
+        // super-edge's accumulated subsumed weight; half-arrows when directed.
         const { lines, arrows } = bentSuperEdges(tree, frontier, {
-          width: style.linkWidth,
+          widthOf: style.linkWidthOf,
           stroke: style.linkStroke,
           bend: style.linkBend,
-          flowScale: (f) => style.linkWidth * Math.sqrt(f / maxFlow),
           directed: style.directed,
           arrowSize: style.arrowSize,
           arrowFill: style.arrowFill,
@@ -561,13 +563,9 @@ export class Network extends BaseEngine {
       // Priority chain (epic #98): provided module hierarchy → structural coarsening → spatial
       // quadtree fallback. A provided tree (N6 / #104) is position-independent, like coarsening.
       if (this.lodOptions.modules) {
-        // Pass the graph's directed edges so the tree also carries flow-weighted super-edges for the
-        // bent half-arrow map links (#104 N6c); cache their max flow to normalise link widths.
+        // Pass the graph's directed edges so the tree also carries flow-weighted super-edges (the sum
+        // of subsumed edge weights per module pair) for the bent half-arrow map links (#104 N6c).
         this.lodTree = buildModuleLODTree(this.graph.nodeCount, this.lodOptions.modules, this.graph);
-        const sf = this.lodTree.superEdgeFlow;
-        let mx = 0;
-        if (sf) for (let i = 0; i < sf.length; i++) if (sf[i]! > mx) mx = sf[i]!;
-        this.lodMaxSuperFlow = mx;
         this.lodModules = true;
         this.lodSpatial = false;
       } else if (this.graph.edgeCount === 0) {
@@ -637,7 +635,7 @@ export class Network extends BaseEngine {
       ids: edgeIds,
       stroke: () => style.linkStroke,
       build: (g) => {
-        if (emit) emitLinks(g, graph, style.linkWidth, style.linkBend);
+        if (emit) emitLinks(g, graph, style.linkWidthOf, style.linkBend);
       },
     });
     this.registerLayer({
@@ -697,7 +695,12 @@ export class Network extends BaseEngine {
 
   /** Apply style defaults (drawn order is decided by {@link networkLayers}). */
   private resolvedStyle(graph: NetworkGraph): ResolvedNetworkStyle {
-    const linkWidth = this.styleOpts.linkWidth ?? DEFAULT_LINK_WIDTH;
+    // linkWidth: a constant, or a scale of edge weight. `linkWidthOf` is the per-edge function;
+    // `linkWidth` is a representative scalar (constant, or the scale at weight 1) for the unweighted
+    // super-edge path and the arrow-size default.
+    const lwSpec = this.styleOpts.linkWidth ?? DEFAULT_LINK_WIDTH;
+    const linkWidthOf = typeof lwSpec === "function" ? lwSpec : () => lwSpec;
+    const linkWidth = typeof lwSpec === "number" ? lwSpec : linkWidthOf(1) || DEFAULT_LINK_WIDTH;
     const linkStroke = this.styleOpts.linkStroke ?? DEFAULT_LINK_STROKE;
     // nodeFill: a single colour, or a per-node accessor → packed RGBA (categorical module colours).
     const fillSpec = this.styleOpts.nodeFill;
@@ -712,6 +715,7 @@ export class Network extends BaseEngine {
       nodeFill,
       nodeColors,
       linkWidth,
+      linkWidthOf,
       linkStroke,
       arrowSize: this.styleOpts.arrowSize ?? 3 * linkWidth,
       arrowFill: this.styleOpts.arrowFill ?? linkStroke,

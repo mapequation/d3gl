@@ -42,7 +42,9 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
           nodeBorder: { width: 1, color: "#ffffff" },
           linkBend: 0.18, // bent lines (undirected — no arrowheads)
           linkStroke: "rgba(90,100,120,0.55)",
-          linkWidth: 5, // super-edge width ∝ √flow up to this; aggregated module links read as highways
+          // Uniform: every edge has weight 1 and bridges don't aggregate here, so links stay constant.
+          // (linkWidth also accepts a (weight) => width scale; super-edges then size by accumulated weight.)
+          linkWidth: 2.5,
         })
         .lod(lod ? { modules, expandPx: 120, maxAggregateRadius: 26 } : false)
         .layout({ backend: "positions", positions });

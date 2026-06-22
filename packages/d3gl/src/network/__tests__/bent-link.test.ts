@@ -23,7 +23,7 @@ describe("linkLines bend", () => {
   it("adds a per-line bend and raises the strip sample count when bent", () => {
     const g = buildGraph({ nodeCount: 2, source: [0], target: [1] });
     g.positions.set([0, 0, 10, 0]);
-    const d = linkLines(g, { width: 1, stroke: "#999999", bend: 0.2 });
+    const d = linkLines(g, { widthOf: () => 1, stroke: "#999999", bend: 0.2 });
     expect(d.bends).toHaveLength(1);
     expect(d.bends![0]).toBeCloseTo(0.2, 6); // Float32 storage
     expect(d.samples).toBeGreaterThan(2);
@@ -31,7 +31,7 @@ describe("linkLines bend", () => {
 
   it("omits bends/samples for straight links (unchanged at scale)", () => {
     const g = buildGraph({ nodeCount: 2, source: [0], target: [1] });
-    const d = linkLines(g, { width: 1, stroke: "#999999" });
+    const d = linkLines(g, { widthOf: () => 1, stroke: "#999999" });
     expect(d.bends).toBeUndefined();
     expect(d.samples).toBeUndefined();
   });

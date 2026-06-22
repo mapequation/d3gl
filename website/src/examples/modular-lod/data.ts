@@ -26,8 +26,11 @@ const mid = (a: Pt, b: Pt): Pt => [(a[0] + b[0]) / 2, (a[1] + b[1]) / 2];
 const SCALE = 1000;
 const HEIGHT = (SCALE * Math.sqrt(3)) / 2;
 const SHRINK = 0.22; // pull leaf nodes off the shared corners so bridges have length
-const INTRA = 6; // within a leaf triangle (dense community)
-const BRIDGE = 1; // between sibling sub-gaskets (sparse)
+// All edges carry weight 1 (an unweighted network). Inter-module bridges don't aggregate in this
+// gasket — each module pair is joined by exactly one bridge — so super-edges stay weight 1 and links
+// are uniform; zooming in just reveals more (still unit-weight) bridges.
+const INTRA = 1;
+const BRIDGE = 1;
 
 /** Generate the undirected Sierpinski gasket at the given `depth` (≥ 1). Deterministic. */
 export function generateSierpinski(depth: number): SierpinskiGraph {
@@ -78,11 +81,9 @@ export function generateSierpinski(depth: number): SierpinskiGraph {
     const c1 = [...prefix, 1];
     const c2 = [...prefix, 2];
     const c3 = [...prefix, 3];
-    // Heavier bridges between larger sub-gaskets, so a super-edge grows as its modules aggregate.
-    const w = BRIDGE * Math.pow(3, depth - 1 - prefix.length);
-    edge(cornerId(c1, 2), cornerId(c2, 1), w);
-    edge(cornerId(c2, 3), cornerId(c3, 2), w);
-    edge(cornerId(c1, 3), cornerId(c3, 1), w);
+    edge(cornerId(c1, 2), cornerId(c2, 1), BRIDGE);
+    edge(cornerId(c2, 3), cornerId(c3, 2), BRIDGE);
+    edge(cornerId(c1, 3), cornerId(c3, 1), BRIDGE);
     addBridges(c1), addBridges(c2), addBridges(c3);
   };
   addBridges([]);

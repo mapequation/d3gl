@@ -7,11 +7,15 @@ const style = (n: number): ResolvedNetworkStyle => ({
   nodeRadii: new Float32Array(n).fill(4),
   nodeFill: "#000000",
   linkWidth: 1,
+  linkWidthOf: () => 1,
   linkStroke: "#999999",
   arrowSize: 3,
   arrowFill: "#999999",
   directed: false,
   sizeMode: "world",
+  flowBorder: null,
+  constBorder: null,
+  linkBend: 0,
 });
 
 describe("nodeCircles", () => {
@@ -41,7 +45,7 @@ describe("linkLines", () => {
     const g = buildGraph({ nodeCount: 3, source: [0, 1], target: [1, 2] });
     g.positions.set([0, 0, 10, 10, 20, 20]); // nodes 0,1,2
 
-    const l = linkLines(g, { width: 2, stroke: "#000000" });
+    const l = linkLines(g, { widthOf: () => 2, stroke: "#000000" });
 
     expect(l.count).toBe(2);
     expect(Array.from(l.sources)).toEqual([0, 0, 10, 10]); // edge0 src=node0, edge1 src=node1
