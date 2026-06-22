@@ -2,7 +2,7 @@ import { rgb } from "d3-color";
 import type { InstancedCirclesData, InstancedLinesData, InstancedArrowsData, InstancedHalfArrowsData, InstancedLayer, GroupBuilder } from "../core/index.js";
 import type { NetworkGraph } from "./graph.js";
 import type { LODTree } from "./lod.js";
-import { halfLinkGeometry, traceHalfLink } from "./half-link.js";
+import { halfLinkGeometry, traceHalfLink, scaleHalfLink } from "./half-link.js";
 
 /**
  * Glyph builders for the network module (#100, epic #98) — the instanced "emitters".
@@ -748,12 +748,13 @@ export function networkLayers(graph: NetworkGraph, style: ResolvedNetworkStyle):
   if (graph.edgeCount > 0) {
     if (halfArrow) {
       // One fused filled glyph per directed link (the map-of-networks look): the arrowhead is part of
-      // the shape, so there's no separate arrows layer. World-sized (matches the reference layout).
+      // the shape, so there's no separate arrows layer. The WebGL lane honours sizeMode — in "screen"
+      // it projects both node centres to px and builds the shape in px (constant-px decorations).
       layers.push({
         name: "links",
         primitive: "half-arrows",
         halfArrows: halfArrowLinks(graph, { nodeRadii: style.nodeRadii, widthOf: style.linkWidthOf, colorOf: style.linkColorOf, bend }),
-        sizeMode: "world",
+        sizeMode: style.sizeMode,
       });
     } else {
       layers.push({
@@ -865,8 +866,21 @@ export function emitArrows(g: GroupBuilder, graph: NetworkGraph, size: number, n
  * WebGL half-arrow lane, tracing the exact reference path via {@link traceHalfLink}. Keyed by edge
  * index; the fill colour is set per-edge by the layer. `widthOf`/`bend` and the reciprocal-width
  * lookup mirror {@link halfArrowLinks}, so vector export matches the GPU render.
+ *
+ * `bake` (default 1) supports the **screen-sizeMode** bake: the shape is solved in pixel space (node
+ * centres × `bake`, with `nodeRadii`/`widthOf`/`bend` already in px) and the result scaled by `1/bake`,
+ * so the Scene's ×k transform reproduces the WebGL constant-px render *exactly* — including the
+ * non-linear tip/bend terms, which a naive per-size division would distort (and worse the deeper you
+ * zoom). `bake = 1` (world mode) leaves world sizes untouched.
  */
-export function emitHalfLinks(g: GroupBuilder, graph: NetworkGraph, nodeRadii: Float32Array, widthOf: (weight: number) => number, bend: number): void {
+export function emitHalfLinks(
+  g: GroupBuilder,
+  graph: NetworkGraph,
+  nodeRadii: Float32Array,
+  widthOf: (weight: number) => number,
+  bend: number,
+  bake = 1,
+): void {
   const n = graph.nodeCount;
   const weightByPair = new Map<number, number>();
   for (let e = 0; e < graph.edgeCount; e++) weightByPair.set(graph.source[e]! * n + graph.target[e]!, graph.weight[e]!);
@@ -874,18 +888,21 @@ export function emitHalfLinks(g: GroupBuilder, graph: NetworkGraph, nodeRadii: F
     const s = graph.source[e]!;
     const t = graph.target[e]!;
     const oppRaw = weightByPair.get(t * n + s);
+    // Solve in pixel space (positions × bake, px sizes); scale the result back by 1/bake to emit world
+    // geometry the Scene's view transform restores to pixels. bake = 1 ⇒ plain world geometry.
     const geom = halfLinkGeometry({
-      x0: graph.positions[s * 2]!,
-      y0: graph.positions[s * 2 + 1]!,
+      x0: graph.positions[s * 2]! * bake,
+      y0: graph.positions[s * 2 + 1]! * bake,
       r0: nodeRadii[s]!,
-      x1: graph.positions[t * 2]!,
-      y1: graph.positions[t * 2 + 1]!,
+      x1: graph.positions[t * 2]! * bake,
+      y1: graph.positions[t * 2 + 1]! * bake,
       r1: nodeRadii[t]!,
       width: widthOf(graph.weight[e]!),
       oppositeWidth: oppRaw === undefined ? widthOf(graph.weight[e]!) : widthOf(oppRaw),
       bend,
     });
     if (!geom) continue;
-    g.drawable(e, (ctx) => traceHalfLink(geom, ctx));
+    const out = bake === 1 ? geom : scaleHalfLink(geom, 1 / bake);
+    g.drawable(e, (ctx) => traceHalfLink(out, ctx));
   }
 }

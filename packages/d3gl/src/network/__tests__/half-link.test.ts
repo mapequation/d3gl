@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { halfLinkGeometry, halfLinkPathString, traceHalfLink, type PathSink } from "../half-link.js";
+import { halfLinkGeometry, halfLinkPathString, traceHalfLink, scaleHalfLink, type PathSink } from "../half-link.js";
 
 /**
  * Golden test: the half-arrow geometry is a clean-room port of mapequation's `network-rendering`
@@ -62,5 +62,34 @@ describe("traceHalfLink", () => {
     };
     traceHalfLink(g, sink);
     expect(cmds.join("")).toBe("MLLLQLLLQZ");
+  });
+});
+
+describe("screen-mode bake (scaleHalfLink) — exact at any zoom", () => {
+  // The arrow tip length min(lBetween/3, 10·width^⅓) is non-linear in size, so the SVG/Canvas screen
+  // bake must solve in PIXEL space (positions × k, px sizes) then scale by 1/k — not pre-divide sizes.
+  const params = (k: number, sizeScale = 1) => ({
+    x0: 100 * k, y0: 100 * k, r0: 30 * sizeScale,
+    x1: 300 * k, y1: 180 * k, r1: 20 * sizeScale,
+    width: 13 * sizeScale, oppositeWidth: 7 * sizeScale, bend: 30 * sizeScale,
+  });
+  const tipLen = (g: NonNullable<ReturnType<typeof halfLinkGeometry>>) => Math.hypot(g.x12 - g.x11, g.y12 - g.y11);
+
+  it("baking in px then scaling by 1/k restores the exact pixel geometry (×k round-trips)", () => {
+    const k = 6;
+    const px = halfLinkGeometry(params(k))!; // what the WebGL screen lane draws (px space)
+    const baked = scaleHalfLink(px, 1 / k); // world geometry emitted to the Scene
+    const restored = scaleHalfLink(baked, k); // the Scene's ×k view transform
+    for (const key of Object.keys(px) as (keyof typeof px)[]) expect(restored[key]).toBeCloseTo(px[key], 6);
+  });
+
+  it("the naive per-size ÷k bake distorts the arrowhead, and worse the deeper the zoom", () => {
+    const trueTipPx = tipLen(halfLinkGeometry(params(6))!); // px-space cap: 10·13^⅓ ≈ 23.5
+    // Naive: world positions, every size ÷k, then the Scene ×k. The cube-root makes the tip ~k^⅔ too long.
+    const naive = (k: number) => tipLen(halfLinkGeometry({ x0: 100, y0: 100, r0: 30 / k, x1: 300, y1: 180, r1: 20 / k, width: 13 / k, oppositeWidth: 7 / k, bend: 30 / k })!) * k;
+    expect(naive(6)).toBeGreaterThan(trueTipPx * 2); // 6^⅔ ≈ 3.3× too long at k=6
+    expect(naive(12) - trueTipPx).toBeGreaterThan(naive(6) - trueTipPx); // error grows with zoom
+    // The correct bake matches the px tip exactly at every k.
+    expect(tipLen(scaleHalfLink(scaleHalfLink(halfLinkGeometry(params(6))!, 1 / 6), 6))).toBeCloseTo(trueTipPx, 6);
   });
 });

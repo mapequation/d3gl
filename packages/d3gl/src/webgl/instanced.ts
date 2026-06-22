@@ -324,7 +324,11 @@ export class InstancedHalfArrows {
     this.widths = device.createBuffer({ data: data.widths });
     this.bend = device.createBuffer({ data: data.bends });
     this.color = device.createBuffer({ data: data.colors });
-    this.uniforms = { u_transform: clipFromView({ k: 1, x: 0, y: 0 }, width || 1, height || 1) };
+    this.uniforms = {
+      u_transform: clipFromView({ k: 1, x: 0, y: 0 }, width || 1, height || 1),
+      u_screen: 0,
+      u_viewport: [width, height],
+    };
     this.model = new Model(device, {
       vs: INSTANCED_HALF_ARROW_VS,
       fs: FILL_FS,
@@ -357,9 +361,12 @@ export class InstancedHalfArrows {
   setTransform(m: Float32Array): void {
     this.uniforms["u_transform"] = m;
   }
-  // World-sized for now (matches the reference publication layout); screen-mode is a tracked gap.
-  setViewport(_width: number, _height: number): void {}
-  setSizeMode(_mode: "world" | "screen"): void {}
+  setViewport(width: number, height: number): void {
+    this.uniforms["u_viewport"] = [width, height];
+  }
+  setSizeMode(mode: "world" | "screen"): void {
+    this.uniforms["u_screen"] = mode === "screen" ? 1 : 0;
+  }
   render(pass: RenderPass): void {
     if (this.count > 0) this.model.draw(pass);
   }
