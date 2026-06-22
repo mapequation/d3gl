@@ -54,7 +54,6 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
         nodeFill: "#4878d0",
         linkWidth: 1,
         linkStroke: "#cbd5e6",
-        arrowFill: "#9aa7bd",
       })
       .layout({ backend: "worker", iterations: 300 });
 

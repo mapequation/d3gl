@@ -1,5 +1,5 @@
 import { BaseEngine, type BaseEngineOptions } from "../map/base-engine.js";
-import { networkLayers, frontierCircles, superEdgeLines, bentSuperEdges, emitNodes, emitLinks, emitArrows, resolveNodeRadii, resolveFlowBorder, resolveNodeColors, flowBorderInnerRadii, type ResolvedNetworkStyle, type NodeRadiusSpec, type FlowBorderSpec, type ConstBorder, type LinkWidthSpec } from "./glyphs.js";
+import { networkLayers, frontierCircles, superEdgeLines, bentSuperEdges, emitNodes, emitLinks, emitArrows, emitHalfLinks, resolveNodeRadii, resolveFlowBorder, resolveNodeColors, resolveLinkWidthOf, resolveLinkColorOf, flowBorderInnerRadii, type ResolvedNetworkStyle, type NodeRadiusSpec, type FlowBorderSpec, type ConstBorder, type LinkWidthSpec, type LinkColorSpec, type LinkStyle } from "./glyphs.js";
 import { rgb } from "d3-color";
 import { ForceLayout, seedPositions, type ForceParams } from "./force.js";
 import { multilevelLayout, type CoarsenOptions } from "./coarsen.js";
@@ -38,18 +38,29 @@ export interface NetworkStyle {
    */
   nodeBorder?: { width: number; color?: string };
   /**
-   * Link width. A constant (default 1), or a **d3 scale of the edge weight** — `(weight) => width`,
-   * e.g. `scaleSqrt().domain([0, maxWeight]).range([0.5, 6])` — analogous to {@link nodeRadius}. A
-   * **super-edge** applies the same scale to the **accumulated** weight of the edges it subsumes, so
-   * link thickness reads as flow at every LOD level.
+   * How directed links are drawn (#104 N6). `"line"` (default) — a stroked line (straight, or bowed
+   * by {@link linkBend}) plus a separate triangle arrowhead, as in the large-scale layout example.
+   * `"half-arrow"` — the **map-of-networks** glyph: one filled shape per link that pinches to the
+   * source centre and ends in a barbed arrowhead on the *target* node's boundary, with reciprocal
+   * A→B / B→A links nesting around a shared centre curve. (Half-arrow links are world-sized.)
+   */
+  linkStyle?: LinkStyle;
+  /**
+   * Link width. A constant (default 1), a **d3 scale of the edge weight** — `(weight) => width`, e.g.
+   * `scaleSqrt().domain([0, maxWeight]).range([1, 6])` — or `{ by, scale }` for parity with
+   * {@link nodeRadius} (`by` is `"weight"`/`"flow"`, the same per-edge quantity). A **super-edge**
+   * applies the same scale to the **accumulated** weight of the edges it subsumes, so link thickness
+   * reads as flow at every LOD level. Keep the scale's range minimum ≥ 1 so links never vanish.
    */
   linkWidth?: LinkWidthSpec;
-  /** Link stroke colour (any CSS color). Default a light grey. */
-  linkStroke?: string;
-  /** Arrowhead size (world units) for directed links. Default 3 × linkWidth. */
+  /**
+   * Link colour. A single CSS colour (default a light grey), or a `(weight) => cssColour` scale so
+   * colour encodes the edge weight/flow (a bare d3 colour scale fits). The arrowhead always takes the
+   * link's colour — there is no separate arrow fill.
+   */
+  linkStroke?: LinkColorSpec;
+  /** Arrowhead size (world units) for directed `linkStyle:"line"` links. Default 3 × linkWidth. */
   arrowSize?: number;
-  /** Arrowhead colour. Default matches linkStroke. */
-  arrowFill?: string;
   /**
    * `"world"` (default) — glyph sizes are in world units and scale with zoom. `"screen"` — sizes are
    * constant pixels regardless of zoom: the natural register for navigating a large layout (nodes
@@ -66,10 +77,11 @@ export interface NetworkStyle {
    */
   flowBorder?: FlowBorderSpec;
   /**
-   * Bend links into curves (N6c / #104): the quadratic-bezier control offset ⟂ to the chord, as a
-   * fraction of chord length (try ~0.15). `0` (default) keeps links straight. Directed links then
-   * draw a one-sided **half-arrow** so reciprocal A→B / B→A links bow to opposite sides and don't
-   * collide — the map-of-networks link style.
+   * Bend links into curves (N6c / #104). For `linkStyle:"line"` this is the quadratic-bezier control
+   * offset ⟂ to the chord as a **fraction of chord length** (try ~0.15; `0` (default) keeps links
+   * straight). For `linkStyle:"half-arrow"` it is an **absolute world-unit** offset (the reference's
+   * `bend`, ~30); the bow side is derived from the link direction so a reciprocal A→B / B→A pair nests
+   * around a shared centre curve instead of colliding.
    */
   linkBend?: number;
 }
@@ -503,7 +515,6 @@ export class Network extends BaseEngine {
           bend: style.linkBend,
           directed: style.directed,
           arrowSize: style.arrowSize,
-          arrowFill: style.arrowFill,
           maxAggregateRadius: opts.maxAggregateRadius,
         });
         if (lines.count > 0) layers.push({ name: "links", primitive: "lines", lines, sizeMode: style.sizeMode });
@@ -629,14 +640,22 @@ export class Network extends BaseEngine {
   private registerNetworkScene(graph: NetworkGraph, style: ResolvedNetworkStyle, emit: boolean): void {
     const edgeIds = Array.from({ length: graph.edgeCount }, (_, e) => e);
     const nodeIds = Array.from({ length: graph.nodeCount }, (_, i) => i);
+    // Per-edge link colour (encodes weight/flow); the arrowhead shares it.
+    const linkColorAt = (e: number): string => style.linkStrokeOf(graph.weight[e]!);
+    // The map glyph (`half-arrow`, directed) is one *filled* shape per link — the head is part of it,
+    // so the "links" layer fills and the "arrows" layer stays empty. Plain `line` style strokes + a
+    // separate filled arrowhead, as before.
+    const halfArrow = style.linkStyle === "half-arrow" && style.directed;
     this.registerLayer({
       name: "links",
       data: edgeIds,
       ids: edgeIds,
-      sizeMode: style.sizeMode,
-      stroke: () => style.linkStroke,
+      sizeMode: halfArrow ? "world" : style.sizeMode, // half-arrow geometry is world-sized
+      ...(halfArrow ? { fill: (e) => linkColorAt(e as number) } : { stroke: (e) => linkColorAt(e as number) }),
       build: (g) => {
-        if (emit) emitLinks(g, graph, style.linkWidthOf, style.linkBend);
+        if (!emit) return;
+        if (halfArrow) emitHalfLinks(g, graph, style.nodeRadii, style.linkWidthOf, style.linkBend);
+        else emitLinks(g, graph, style.linkWidthOf, style.linkBend);
       },
     });
     this.registerLayer({
@@ -644,9 +663,9 @@ export class Network extends BaseEngine {
       data: edgeIds,
       ids: edgeIds,
       sizeMode: style.sizeMode,
-      fill: () => style.arrowFill,
+      fill: (e) => linkColorAt(e as number),
       build: (g) => {
-        if (emit && style.directed) emitArrows(g, graph, style.arrowSize, style.nodeRadii, style.linkBend, style.linkBend !== 0);
+        if (emit && style.directed && !halfArrow) emitArrows(g, graph, style.arrowSize, style.nodeRadii, style.linkBend, style.linkBend !== 0);
       },
     });
     // Per-node fill: a single colour, or the per-node accessor (categorical module colours, #104 rework).
@@ -664,6 +683,11 @@ export class Network extends BaseEngine {
       : cb
         ? `rgba(${cb.color[0]},${cb.color[1]},${cb.color[2]},${cb.color[3] / 255})`
         : style.nodeFill;
+    // Per-node ring colour when flowBorder.color is an accessor (e.g. ring colour ∝ enter/exit flow).
+    const flowColors = flow?.colors;
+    const borderColorAt = flowColors
+      ? (i: number) => `rgba(${flowColors[i * 4]},${flowColors[i * 4 + 1]},${flowColors[i * 4 + 2]},${flowColors[i * 4 + 3]! / 255})`
+      : () => borderColorCss;
     const innerRadii = flow
       ? flowBorderInnerRadii(style.nodeRadii, flow.metric, flow.scale)
       : cb
@@ -675,7 +699,7 @@ export class Network extends BaseEngine {
       data: nodeIds,
       ids: nodeIds,
       sizeMode: style.sizeMode,
-      fill: () => borderColorCss,
+      fill: (i) => borderColorAt(i as number),
       build: (g) => {
         if (emit && hasBorder) emitNodes(g, graph, style.nodeRadii);
       },
@@ -699,13 +723,18 @@ export class Network extends BaseEngine {
 
   /** Apply style defaults (drawn order is decided by {@link networkLayers}). */
   private resolvedStyle(graph: NetworkGraph): ResolvedNetworkStyle {
-    // linkWidth: a constant, or a scale of edge weight. `linkWidthOf` is the per-edge function;
-    // `linkWidth` is a representative scalar (constant, or the scale at weight 1) for the unweighted
-    // super-edge path and the arrow-size default.
+    // linkWidth: a constant, a (weight)=>width scale, or {by,scale}. `linkWidthOf` is the per-edge
+    // function; `linkWidth` is a representative scalar (constant, or the scale at weight 1) for the
+    // unweighted super-edge path and the arrow-size default.
     const lwSpec = this.styleOpts.linkWidth ?? DEFAULT_LINK_WIDTH;
-    const linkWidthOf = typeof lwSpec === "function" ? lwSpec : () => lwSpec;
+    const linkWidthOf = resolveLinkWidthOf(lwSpec);
     const linkWidth = typeof lwSpec === "number" ? lwSpec : linkWidthOf(1) || DEFAULT_LINK_WIDTH;
-    const linkStroke = this.styleOpts.linkStroke ?? DEFAULT_LINK_STROKE;
+    // linkStroke: a single colour, or a (weight)=>colour scale. `linkColorOf` packs RGBA bytes for
+    // the WebGL lane; `linkStrokeOf` gives the CSS for the Scene path; `linkStroke` is representative.
+    const lsSpec: LinkColorSpec = this.styleOpts.linkStroke ?? DEFAULT_LINK_STROKE;
+    const linkColorOf = resolveLinkColorOf(lsSpec);
+    const linkStrokeOf = typeof lsSpec === "function" ? lsSpec : () => lsSpec;
+    const linkStroke = typeof lsSpec === "function" ? linkStrokeOf(1) : lsSpec;
     // nodeFill: a single colour, or a per-node accessor → packed RGBA (categorical module colours).
     const fillSpec = this.styleOpts.nodeFill;
     const nodeFill = typeof fillSpec === "function" ? DEFAULT_NODE_FILL : (fillSpec ?? DEFAULT_NODE_FILL);
@@ -721,8 +750,10 @@ export class Network extends BaseEngine {
       linkWidth,
       linkWidthOf,
       linkStroke,
+      linkColorOf,
+      linkStrokeOf,
+      linkStyle: this.styleOpts.linkStyle ?? "line",
       arrowSize: this.styleOpts.arrowSize ?? 3 * linkWidth,
-      arrowFill: this.styleOpts.arrowFill ?? linkStroke,
       directed: this.styleOpts.directed ?? graph.directed,
       sizeMode: this.styleOpts.sizeMode ?? "world",
       flowBorder: this.styleOpts.flowBorder ? resolveFlowBorder(graph, this.styleOpts.flowBorder, nodeFill) : null,

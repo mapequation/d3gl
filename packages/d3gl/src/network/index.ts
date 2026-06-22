@@ -4,7 +4,10 @@
  */
 export { network, Network } from "./network.js";
 export type { NetworkOptions, NetworkStyle, NetworkLayoutOptions, NetworkLODOptions } from "./network.js";
-export type { NodeRadiusSpec, NodeMetric, FlowBorderSpec } from "./glyphs.js";
+export type { NodeRadiusSpec, NodeMetric, FlowBorderSpec, LinkWidthSpec, LinkColorSpec, LinkStyle } from "./glyphs.js";
+
+export { halfLinkGeometry, traceHalfLink, halfLinkPathString } from "./half-link.js";
+export type { HalfLinkParams, HalfLinkGeometry, PathSink } from "./half-link.js";
 
 export { buildLODTree, computeLODGeometry, cut, declutterFrontier } from "./lod.js";
 export type { LODTree, LODTransform, CutOptions, DeclutterOptions } from "./lod.js";
