@@ -23,7 +23,7 @@ describe("linkLines bend", () => {
   it("adds a per-line bend and raises the strip sample count when bent", () => {
     const g = buildGraph({ nodeCount: 2, source: [0], target: [1] });
     g.positions.set([0, 0, 10, 0]);
-    const d = linkLines(g, { widthOf: () => 1, stroke: "#999999", bend: 0.2 });
+    const d = linkLines(g, { widthOf: () => 1, colorOf: () => [153, 153, 153, 255], bend: 0.2 });
     expect(d.bends).toHaveLength(1);
     expect(d.bends![0]).toBeCloseTo(0.2, 6); // Float32 storage
     expect(d.samples).toBeGreaterThan(2);
@@ -31,7 +31,7 @@ describe("linkLines bend", () => {
 
   it("omits bends/samples for straight links (unchanged at scale)", () => {
     const g = buildGraph({ nodeCount: 2, source: [0], target: [1] });
-    const d = linkLines(g, { widthOf: () => 1, stroke: "#999999" });
+    const d = linkLines(g, { widthOf: () => 1, colorOf: () => [153, 153, 153, 255] });
     expect(d.bends).toBeUndefined();
     expect(d.samples).toBeUndefined();
   });
@@ -41,7 +41,7 @@ describe("linkArrows bend", () => {
   it("sets the tip back along the bent end-tangent and flags a per-arrow bend + half head", () => {
     const g = buildGraph({ nodeCount: 2, source: [0], target: [1], directed: true });
     g.positions.set([0, 0, 10, 0]);
-    const d = linkArrows(g, { size: 3, nodeRadii: new Float32Array([2, 2]), fill: "#999999", bend: 0.2, half: true });
+    const d = linkArrows(g, { size: 3, nodeRadii: new Float32Array([2, 2]), colorOf: () => [153, 153, 153, 255], bend: 0.2, half: true });
     expect(d.half).toBe(true);
     expect(d.bends![0]).toBeCloseTo(0.2, 6); // Float32 storage
     const [ux, uy] = bentEndTangent(0, 0, 10, 0, 0.2);
@@ -52,7 +52,7 @@ describe("linkArrows bend", () => {
   it("matches the straight arrow when bend=0 (tip set back along the chord)", () => {
     const g = buildGraph({ nodeCount: 2, source: [0], target: [1], directed: true });
     g.positions.set([0, 0, 10, 0]);
-    const d = linkArrows(g, { size: 3, nodeRadii: new Float32Array([2, 2]), fill: "#999999" });
+    const d = linkArrows(g, { size: 3, nodeRadii: new Float32Array([2, 2]), colorOf: () => [153, 153, 153, 255] });
     expect(d.bends).toBeUndefined();
     expect(d.half).toBeUndefined();
     expect(d.targets[0]).toBeCloseTo(8); // 10 − radius 2

@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { nodeCircles, linkLines, linkArrows, networkLayers, resolveNodeRadii, type ResolvedNetworkStyle } from "../glyphs.js";
+import { nodeCircles, linkLines, linkArrows, halfArrowLinks, networkLayers, resolveNodeRadii, type ResolvedNetworkStyle } from "../glyphs.js";
 import { buildGraph } from "../graph.js";
 
 /** A resolved style with a uniform radius for `n` nodes (defaults applied elsewhere). */
@@ -9,8 +9,10 @@ const style = (n: number): ResolvedNetworkStyle => ({
   linkWidth: 1,
   linkWidthOf: () => 1,
   linkStroke: "#999999",
+  linkColorOf: () => [153, 153, 153, 255],
+  linkStrokeOf: () => "#999999",
+  linkStyle: "line",
   arrowSize: 3,
-  arrowFill: "#999999",
   directed: false,
   sizeMode: "world",
   flowBorder: null,
@@ -45,7 +47,7 @@ describe("linkLines", () => {
     const g = buildGraph({ nodeCount: 3, source: [0, 1], target: [1, 2] });
     g.positions.set([0, 0, 10, 10, 20, 20]); // nodes 0,1,2
 
-    const l = linkLines(g, { widthOf: () => 2, stroke: "#000000" });
+    const l = linkLines(g, { widthOf: () => 2, colorOf: () => [0, 0, 0, 255] });
 
     expect(l.count).toBe(2);
     expect(Array.from(l.sources)).toEqual([0, 0, 10, 10]); // edge0 src=node0, edge1 src=node1
@@ -61,7 +63,7 @@ describe("linkArrows", () => {
     g.positions.set([0, 0, 10, 0]); // node0 at origin, node1 at (10,0)
 
     // node0 radius 5, node1 (the target) radius 2 → setback uses the target's 2, not the source's 5.
-    const a = linkArrows(g, { size: 4, nodeRadii: new Float32Array([5, 2]), fill: "#ff0000" });
+    const a = linkArrows(g, { size: 4, nodeRadii: new Float32Array([5, 2]), colorOf: () => [255, 0, 0, 255] });
 
     expect(a.count).toBe(1);
     expect(Array.from(a.sources)).toEqual([0, 0]);
@@ -101,6 +103,43 @@ describe("networkLayers", () => {
 
     const bySize = Object.fromEntries(layers.map((l) => [l.name, l.sizeMode]));
     expect(bySize).toEqual({ links: "screen", arrows: "world", nodes: "screen" });
+  });
+
+  it("emits one fused half-arrow links layer (no separate arrows) for linkStyle:'half-arrow'", () => {
+    const g = buildGraph({ nodeCount: 2, source: [0, 1], target: [1, 0], directed: true });
+    const layers = networkLayers(g, { ...style(2), directed: true, linkStyle: "half-arrow", linkBend: 30 });
+
+    // The arrowhead is part of the filled shape, so there is no "arrows" layer; world-sized.
+    expect(layers.map((l) => l.name)).toEqual(["links", "nodes"]);
+    expect(layers.map((l) => l.primitive)).toEqual(["half-arrows", "circles"]);
+    expect(layers.find((l) => l.name === "links")?.sizeMode).toBe("world");
+  });
+});
+
+describe("halfArrowLinks", () => {
+  it("packs per-edge endpoints, [r0,r1] radii, and pairs reciprocal widths via oppositeWidth", () => {
+    const g = buildGraph({ nodeCount: 2, source: [0, 1], target: [1, 0], weight: [5, 2], directed: true });
+    g.positions.set([0, 0, 10, 0]);
+    const d = halfArrowLinks(g, {
+      nodeRadii: new Float32Array([3, 1]),
+      widthOf: (w) => w, // width == weight, so we can read pairing directly
+      colorOf: () => [1, 2, 3, 255],
+      bend: 30,
+    });
+
+    expect(d.count).toBe(2);
+    // edge 0 (0→1): r0=node0=3, r1=node1=1; edge 1 (1→0): r0=node1=1, r1=node0=3.
+    expect(Array.from(d.radii)).toEqual([3, 1, 1, 3]);
+    // widths = [width, oppositeWidth]: edge0 carries 5 with opposite 2; edge1 carries 2 with opposite 5.
+    expect(Array.from(d.widths)).toEqual([5, 2, 2, 5]);
+    expect(Array.from(d.bends)).toEqual([30, 30]);
+    expect(Array.from(d.colors)).toEqual([1, 2, 3, 255, 1, 2, 3, 255]);
+  });
+
+  it("falls back oppositeWidth to the edge's own width when there is no reciprocal link", () => {
+    const g = buildGraph({ nodeCount: 2, source: [0], target: [1], weight: [4], directed: true });
+    const d = halfArrowLinks(g, { nodeRadii: new Float32Array([2, 2]), widthOf: (w) => w, colorOf: () => [0, 0, 0, 255], bend: 10 });
+    expect(Array.from(d.widths)).toEqual([4, 4]); // no 1→0 edge ⇒ oppositeWidth = own width
   });
 });
 

@@ -283,6 +283,95 @@ void main() {
   gl_Position = vec4((u_transform * vec3(world, 1.0)).xy, 0.0, 1.0);
 }`;
 
+// INSTANCED_HALF_ARROW_VS — the "map of networks" directed-link glyph (#104 N6): one filled shape
+// per link that pinches to the source centre, bows around a shared centre curve, and ends in a barbed
+// arrowhead whose tip lands on the *target node's boundary*. A reciprocal A→B / B→A pair shares the
+// centre curve (the direction-based `positiveCurvature` rule fixes the side) and fills opposite halves
+// of it, so the two arrows nest. This is the same math as network/half-link.ts (the SVG/Canvas source
+// of truth, golden-tested vs the reference), mirrored here so the WebGL lane stays fully instanced.
+// Per-vertex a_kind = (code, t): code selects a named anchor (0 x0, 1 x02, 2 x03, 3 x04, 4 x11,
+// 5 x12, 6 x13, 7 x14) or evaluates the inner (8) / outer (9) edge bezier at parameter t; the template
+// (see instanced.ts) lists the foot, body strip and head as a triangle list. World-sized. Pairs with
+// FILL_FS. `a_bend` is the absolute perpendicular offset in world units (sign = bow direction).
+export const INSTANCED_HALF_ARROW_VS = `#version 300 es
+precision highp float;
+uniform mat3 u_transform;
+in vec2 a_kind;       // per-vertex (code, t)
+in vec2 a_p0;         // per-instance source centre
+in vec2 a_p1;         // per-instance target centre
+in vec2 a_radii;      // per-instance (r0, r1)
+in vec2 a_widths;     // per-instance (width, oppositeWidth)
+in float a_bend;      // per-instance bend (world units; sign picks the bow side)
+in vec4 a_color;      // per-instance RGBA (unorm8x4 -> 0..1)
+out vec4 v_color;
+vec2 bez(vec2 p0, vec2 c, vec2 p2, float t) {
+  float u = 1.0 - t;
+  return u * u * p0 + 2.0 * u * t * c + t * t * p2;
+}
+void main() {
+  v_color = a_color;
+  float code = a_kind.x;
+  float t = a_kind.y;
+  vec2 p0 = a_p0;
+  vec2 p1 = a_p1;
+  float r0 = a_radii.x;
+  float r1 = a_radii.y;
+  float width = a_widths.x;
+  float oppositeWidth = a_widths.y;
+
+  vec2 d = p1 - p0;
+  float l = length(d);
+  float lBetween = l - r0 - r1;
+  vec2 dir = d / l;
+  vec2 right = vec2(-dir.y, dir.x);
+
+  float tipLength = min(lBetween / 3.0, 10.0 * pow(width, 1.0 / 3.0));
+  float tipWidth = 2.0 * sqrt(width);
+  float oppositeTipLength = min(lBetween / 3.0, 10.0 * pow(oppositeWidth, 1.0 / 3.0));
+
+  float bendMagnitude = abs(a_bend);
+  float outerBendAddition = pow(bendMagnitude / 10.0, 0.4);
+  bool positiveCurvature = dir.x > 0.0 || (dir.x == 0.0 && dir.y < 0.0);
+  float curvatureSign = positiveCurvature ? 1.0 : -1.0;
+  float bendSign = a_bend > 0.0 ? 1.0 : -1.0;
+  float signedBend = curvatureSign * bendSign * bendMagnitude;
+
+  vec2 c02tmp = p0 + (r0 + oppositeTipLength) * dir;
+  vec2 c12tmp = p1 - (r1 + tipLength) * dir;
+  vec2 mid = 0.5 * (c02tmp + c12tmp);
+  vec2 cp1 = mid + signedBend * right;
+  vec2 cp2 = mid + (signedBend + width + outerBendAddition) * right;
+
+  vec2 d1 = cp1 - p0;
+  vec2 dir0 = d1 / length(d1);
+  vec2 right0 = vec2(-dir0.y, dir0.x);
+  vec2 x02 = p0 + (r0 + oppositeTipLength) * dir0;
+  vec2 x03 = x02 + width * right0;
+  vec2 x04 = p0 + width * right0;
+
+  vec2 d2 = cp1 - p1;
+  vec2 dir1 = d2 / length(d2);
+  vec2 x11 = p1 + r1 * dir1;
+  vec2 x12 = x11 + tipLength * dir1;
+  vec2 left1 = vec2(dir1.y, -dir1.x);
+  vec2 x13 = x12 + width * left1;
+  vec2 x14 = x13 + tipWidth * left1;
+
+  vec2 pos;
+  if (code < 0.5) pos = p0;
+  else if (code < 1.5) pos = x02;
+  else if (code < 2.5) pos = x03;
+  else if (code < 3.5) pos = x04;
+  else if (code < 4.5) pos = x11;
+  else if (code < 5.5) pos = x12;
+  else if (code < 6.5) pos = x13;
+  else if (code < 7.5) pos = x14;
+  else if (code < 8.5) pos = bez(x02, cp1, x12, t);
+  else pos = bez(x03, cp2, x13, t);
+
+  gl_Position = vec4((u_transform * vec3(pos, 1.0)).xy, 0.0, 1.0);
+}`;
+
 // PT_MESH_VS — pass-through fill/stroke meshes. Both fill triangles and expanded-stroke
 // triangles are just colored geometry, so they share this shader: project the world-space
 // vertex through u_transform (world mode — stroke width scales with zoom, matching Canvas)

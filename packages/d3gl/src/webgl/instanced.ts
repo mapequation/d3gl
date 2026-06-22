@@ -1,8 +1,8 @@
 import { Model } from "@luma.gl/engine";
 import type { Buffer, Device, RenderPass } from "@luma.gl/core";
-import { INSTANCED_CIRCLE_VS, INSTANCED_CIRCLE_FS, INSTANCED_LINE_VS, INSTANCED_ARROW_VS, POINT_FS, FILL_FS } from "./shaders.js";
+import { INSTANCED_CIRCLE_VS, INSTANCED_CIRCLE_FS, INSTANCED_LINE_VS, INSTANCED_ARROW_VS, INSTANCED_HALF_ARROW_VS, POINT_FS, FILL_FS } from "./shaders.js";
 import { clipFromView } from "./transform.js";
-import type { InstancedCirclesData, InstancedLinesData, InstancedArrowsData } from "../core/index.js";
+import type { InstancedCirclesData, InstancedLinesData, InstancedArrowsData, InstancedHalfArrowsData } from "../core/index.js";
 
 /**
  * GPU-instanced primitives for the network module's rendering lane (#100, epic #98).
@@ -270,5 +270,107 @@ export class InstancedArrows {
     this.size.destroy();
     this.color.destroy();
     this.bend.destroy();
+  }
+}
+
+/**
+ * Triangle-list template for one half-arrow link (#104 N6): the source foot (2 triangles), a body
+ * strip of `M` samples per bezier edge (`2·(M−1)` triangles between the inner and outer curves), and
+ * the barbed head (2 triangles). Each vertex is `(code, t)`: `code` selects a named anchor or the
+ * inner(8)/outer(9) edge bezier evaluated at `t` (see INSTANCED_HALF_ARROW_VS).
+ */
+function halfArrowTemplate(samples: number): Float32Array {
+  const M = Math.max(2, samples | 0);
+  const v: number[] = [];
+  // Source foot: x02(1) x0(0) x04(3), then x02(1) x04(3) x03(2).
+  v.push(1, 0, 0, 0, 3, 0, 1, 0, 3, 0, 2, 0);
+  // Body strip between inner (code 8) and outer (code 9) edges.
+  for (let i = 0; i < M - 1; i++) {
+    const ti = i / (M - 1);
+    const tj = (i + 1) / (M - 1);
+    v.push(8, ti, 9, ti, 8, tj); // inner_i, outer_i, inner_{i+1}
+    v.push(9, ti, 8, tj, 9, tj); // outer_i, inner_{i+1}, outer_{i+1}
+  }
+  // Head: x13(6) x14(7) x11(4), then x13(6) x11(4) x12(5).
+  v.push(6, 0, 7, 0, 4, 0, 6, 0, 4, 0, 5, 0);
+  return new Float32Array(v);
+}
+
+/** Path samples per bezier edge for the half-arrow strip. */
+const HALF_ARROW_SAMPLES = 24;
+
+export class InstancedHalfArrows {
+  count: number;
+  private vertexCount: number;
+  private model: Model;
+  private kind: Buffer;
+  private source: Buffer;
+  private target: Buffer;
+  private radii: Buffer;
+  private widths: Buffer;
+  private bend: Buffer;
+  private color: Buffer;
+  private uniforms: Record<string, unknown>;
+
+  constructor(device: Device, data: InstancedHalfArrowsData, width = 0, height = 0) {
+    this.count = data.count;
+    const samples = Math.max(2, (data.samples ?? HALF_ARROW_SAMPLES) | 0);
+    const template = halfArrowTemplate(samples);
+    this.vertexCount = template.length / 2;
+    this.kind = device.createBuffer({ data: template });
+    this.source = device.createBuffer({ data: data.sources });
+    this.target = device.createBuffer({ data: data.targets });
+    this.radii = device.createBuffer({ data: data.radii });
+    this.widths = device.createBuffer({ data: data.widths });
+    this.bend = device.createBuffer({ data: data.bends });
+    this.color = device.createBuffer({ data: data.colors });
+    this.uniforms = { u_transform: clipFromView({ k: 1, x: 0, y: 0 }, width || 1, height || 1) };
+    this.model = new Model(device, {
+      vs: INSTANCED_HALF_ARROW_VS,
+      fs: FILL_FS,
+      bufferLayout: [
+        { name: "a_kind", format: "float32x2" },
+        { name: "a_p0", format: "float32x2", stepMode: "instance" },
+        { name: "a_p1", format: "float32x2", stepMode: "instance" },
+        { name: "a_radii", format: "float32x2", stepMode: "instance" },
+        { name: "a_widths", format: "float32x2", stepMode: "instance" },
+        { name: "a_bend", format: "float32", stepMode: "instance" },
+        { name: "a_color", format: "unorm8x4", stepMode: "instance" },
+      ],
+      attributes: {
+        a_kind: this.kind,
+        a_p0: this.source,
+        a_p1: this.target,
+        a_radii: this.radii,
+        a_widths: this.widths,
+        a_bend: this.bend,
+        a_color: this.color,
+      },
+      uniforms: this.uniforms,
+      parameters: BLEND,
+      topology: "triangle-list",
+      vertexCount: this.vertexCount,
+      instanceCount: this.count,
+    });
+  }
+
+  setTransform(m: Float32Array): void {
+    this.uniforms["u_transform"] = m;
+  }
+  // World-sized for now (matches the reference publication layout); screen-mode is a tracked gap.
+  setViewport(_width: number, _height: number): void {}
+  setSizeMode(_mode: "world" | "screen"): void {}
+  render(pass: RenderPass): void {
+    if (this.count > 0) this.model.draw(pass);
+  }
+  destroy(): void {
+    this.model.destroy();
+    this.kind.destroy();
+    this.source.destroy();
+    this.target.destroy();
+    this.radii.destroy();
+    this.widths.destroy();
+    this.bend.destroy();
+    this.color.destroy();
   }
 }

@@ -1,7 +1,8 @@
 import { rgb } from "d3-color";
-import type { InstancedCirclesData, InstancedLinesData, InstancedArrowsData, InstancedLayer, GroupBuilder } from "../core/index.js";
+import type { InstancedCirclesData, InstancedLinesData, InstancedArrowsData, InstancedHalfArrowsData, InstancedLayer, GroupBuilder } from "../core/index.js";
 import type { NetworkGraph } from "./graph.js";
 import type { LODTree } from "./lod.js";
+import { halfLinkGeometry, traceHalfLink } from "./half-link.js";
 
 /**
  * Glyph builders for the network module (#100, epic #98) — the instanced "emitters".
@@ -92,15 +93,59 @@ export interface NodeStyleResolved {
   constBorder?: ConstBorder | null;
 }
 
-/** Link width: a constant, or a d3-style scale of the edge's weight/flow (like {@link NodeRadiusSpec}). */
-export type LinkWidthSpec = number | ((weight: number) => number);
+/**
+ * Link width. A constant, a `(weight) => width` scale of the edge weight (a bare d3 scale fits — its
+ * input is the edge's weight, which **is** the per-edge flow), or `{ by, scale }` for parity with
+ * {@link NodeRadiusSpec} (`by` is `"weight"`/`"flow"` — the same per-edge quantity — so the scale maps
+ * the weight). Whichever form, it resolves to a function of a *weight value*, so a **super-edge**
+ * applies the same scale to the **accumulated** weight of the edges it subsumes.
+ */
+export type LinkWidthSpec = number | ((weight: number) => number) | { by: "weight" | "flow"; scale: (value: number) => number };
+
+/**
+ * Link colour. A single CSS colour, or a `(weight) => cssColour` scale so colour encodes the edge's
+ * weight/flow (a bare d3 sequential/linear colour scale fits). Resolves to a function of a *weight
+ * value*, so a super-edge colours by its accumulated subsumed weight — matching {@link LinkWidthSpec}.
+ */
+export type LinkColorSpec = string | ((weight: number) => string);
+
+/** How directed links are drawn: plain `"line"` + a separate arrowhead, or a fused `"half-arrow"` (the map glyph). */
+export type LinkStyle = "line" | "half-arrow";
 
 export interface LinkStyleResolved {
   /** Per-edge width from its weight; for super-edges, applied to the accumulated subsumed weight. */
   widthOf: (weight: number) => number;
-  stroke: string;
+  /** Per-edge RGBA from its weight; for super-edges, applied to the accumulated subsumed weight. */
+  colorOf: (weight: number) => [number, number, number, number];
   /** Bend (#104 N6c): quadratic-bezier control offset ⟂ to the chord, as a fraction of chord length (0 = straight). */
   bend?: number;
+}
+
+/** Resolve a {@link LinkWidthSpec} to a `(weight) => width` function (composes with super-edge accumulation). */
+export function resolveLinkWidthOf(spec: LinkWidthSpec): (weight: number) => number {
+  if (typeof spec === "number") return () => spec;
+  if (typeof spec === "function") return spec;
+  return spec.scale; // { by, scale }: `by` is the per-edge weight (== flow); `scale` maps it
+}
+
+/** Resolve a {@link LinkColorSpec} to a `(weight) => RGBA` function (composes with super-edge accumulation). */
+export function resolveLinkColorOf(spec: LinkColorSpec): (weight: number) => [number, number, number, number] {
+  if (typeof spec === "function") return (w) => toRGBA(spec(w));
+  const c = toRGBA(spec);
+  return () => c;
+}
+
+/** Per-instance RGBA buffer for a batch of links, colouring each by its weight via `colorOf`. */
+function linkColorBytes(weights: ArrayLike<number>, count: number, colorOf: (weight: number) => [number, number, number, number]): Uint8Array {
+  const colors = new Uint8Array(count * 4);
+  for (let e = 0; e < count; e++) {
+    const [r, g, b, a] = colorOf(weights[e]!);
+    colors[e * 4] = r;
+    colors[e * 4 + 1] = g;
+    colors[e * 4 + 2] = b;
+    colors[e * 4 + 3] = a;
+  }
+  return colors;
 }
 
 /** Parse any CSS colour to RGBA bytes (alpha from opacity). */
@@ -140,8 +185,12 @@ export interface FlowBorderSpec {
   flow: Float32Array | NodeMetric;
   /** Maps the (summed) flow → ring width in the active `sizeMode`'s units, e.g. `scaleSqrt().range([0, 6])`. */
   scale: (value: number) => number;
-  /** Ring colour (any CSS colour). Default: a darker shade of the node fill. */
-  color?: string;
+  /**
+   * Ring colour: a single CSS colour, or a per-node `(value, index, graph) => cssColour` accessor so
+   * the ring colour can also encode the per-node metric (a bare d3 colour scale fits — `value` is the
+   * node's flow metric). Default: a darker shade of the node fill.
+   */
+  color?: string | ((value: number, index: number, graph: NetworkGraph) => string);
 }
 
 /** Resolved {@link FlowBorderSpec}: raw per-node metric + draw scale + ring colour (bytes for WebGL, CSS for export). */
@@ -149,13 +198,17 @@ export interface ResolvedFlowBorder {
   /** Raw per-node flow metric, length `nodeCount`; sum-aggregated onto the LOD tree for modules. */
   metric: Float32Array;
   scale: (value: number) => number;
+  /** Representative ring colour (the single colour, or a fallback for LOD aggregates). */
   color: [number, number, number, number];
   colorCss: string;
+  /** Per-node ring RGBA (length `4·nodeCount`) when {@link FlowBorderSpec.color} is an accessor; else absent. */
+  colors?: Uint8Array;
 }
 
 /**
  * Resolve a {@link FlowBorderSpec} against a graph. `fallbackColor` (the node fill) defaults the ring
- * colour to a darker shade. Resolved once per `style()` — never per frame.
+ * colour to a darker shade; a per-node colour accessor resolves to a `colors` byte buffer. Resolved
+ * once per `style()` — never per frame.
  */
 export function resolveFlowBorder(graph: NetworkGraph, spec: FlowBorderSpec, fallbackColor: string): ResolvedFlowBorder {
   const n = graph.nodeCount;
@@ -167,6 +220,22 @@ export function resolveFlowBorder(graph: NetworkGraph, spec: FlowBorderSpec, fal
     const value = metricAccessor(graph, spec.flow);
     metric = new Float32Array(n);
     for (let i = 0; i < n; i++) metric[i] = value(i);
+  }
+  if (typeof spec.color === "function") {
+    const colorOf = spec.color;
+    const colors = new Uint8Array(n * 4);
+    for (let i = 0; i < n; i++) {
+      const [r, g, b, a] = toRGBA(colorOf(metric[i]!, i, graph));
+      colors[i * 4] = r;
+      colors[i * 4 + 1] = g;
+      colors[i * 4 + 2] = b;
+      colors[i * 4 + 3] = a;
+    }
+    // Representative (the highest-flow node's colour) for LOD aggregates / single-colour fallbacks.
+    let rep = 0;
+    for (let i = 1; i < n; i++) if (metric[i]! > metric[rep]!) rep = i;
+    const colorCss = colorOf(metric[rep] ?? 0, rep, graph);
+    return { metric, scale: spec.scale, color: toRGBA(colorCss), colorCss, colors };
   }
   const colorCss = spec.color ?? rgb(fallbackColor).darker(0.8).formatHex();
   return { metric, scale: spec.scale, color: toRGBA(colorCss), colorCss };
@@ -184,16 +253,24 @@ function buildBorders(
   valueOf: (i: number) => number,
   scale: (v: number) => number,
   color: [number, number, number, number],
+  perNodeColors?: Uint8Array,
 ): { borders: Float32Array; borderColors: Uint8Array } {
   const borders = new Float32Array(count);
   const borderColors = new Uint8Array(count * 4);
   for (let i = 0; i < count; i++) {
     const r = radii[i]!;
     borders[i] = r > 0 ? clamp01(scale(valueOf(i)) / r) : 0;
-    borderColors[i * 4] = color[0];
-    borderColors[i * 4 + 1] = color[1];
-    borderColors[i * 4 + 2] = color[2];
-    borderColors[i * 4 + 3] = color[3];
+    if (perNodeColors) {
+      borderColors[i * 4] = perNodeColors[i * 4]!;
+      borderColors[i * 4 + 1] = perNodeColors[i * 4 + 1]!;
+      borderColors[i * 4 + 2] = perNodeColors[i * 4 + 2]!;
+      borderColors[i * 4 + 3] = perNodeColors[i * 4 + 3]!;
+    } else {
+      borderColors[i * 4] = color[0];
+      borderColors[i * 4 + 1] = color[1];
+      borderColors[i * 4 + 2] = color[2];
+      borderColors[i * 4 + 3] = color[3];
+    }
   }
   return { borders, borderColors };
 }
@@ -248,8 +325,8 @@ export function nodeCircles(graph: NetworkGraph, style: NodeStyleResolved): Inst
   const colors = style.colors ?? fillColors(count, style.fill);
   const base = { centers: graph.positions, radii: style.radii, colors, count };
   if (style.border) {
-    const { metric, scale, color } = style.border;
-    return { ...base, ...buildBorders(count, style.radii, (i) => metric[i]!, scale, color) };
+    const { metric, scale, color, colors: borderNodeColors } = style.border;
+    return { ...base, ...buildBorders(count, style.radii, (i) => metric[i]!, scale, color, borderNodeColors) };
   }
   if (style.constBorder) {
     return { ...base, ...constBorderArrays(count, style.radii, style.constBorder.width, style.constBorder.color) };
@@ -394,7 +471,6 @@ export interface BentSuperEdgeStyleResolved {
   /** Draw one-sided half-arrowheads (directed maps). */
   directed: boolean;
   arrowSize: number;
-  arrowFill: string;
   /** Aggregate draw-radius cap, so a head sits at the (capped) module boundary, not its centre. */
   maxAggregateRadius?: number;
 }
@@ -465,8 +541,9 @@ export function bentSuperEdges(
   }
 
   const lines: InstancedLinesData = { sources, targets, widths, colors: fillColors(count, style.stroke), bends, samples: BENT_SAMPLES, count };
+  // The arrowhead belongs to its link, so it always takes the link colour (no separate arrow fill).
   const arrows: InstancedArrowsData = style.directed
-    ? { sources, targets: aTargets, sizes: aSizes, colors: fillColors(count, style.arrowFill), bends: aBends, half: true, count }
+    ? { sources, targets: aTargets, sizes: aSizes, colors: fillColors(count, style.stroke), bends: aBends, half: true, count }
     : { sources: new Float32Array(0), targets: new Float32Array(0), sizes: new Float32Array(0), colors: new Uint8Array(0), count: 0 };
   return { lines, arrows };
 }
@@ -510,18 +587,67 @@ export function linkLines(graph: NetworkGraph, style: LinkStyleResolved): Instan
   }
   const widths = new Float32Array(count);
   for (let e = 0; e < count; e++) widths[e] = style.widthOf(graph.weight[e]!);
-  const colors = fillColors(count, style.stroke);
+  const colors = linkColorBytes(graph.weight, count, style.colorOf);
   if (style.bend) {
     return { sources, targets, widths, colors, bends: new Float32Array(count).fill(style.bend), samples: BENT_SAMPLES, count };
   }
   return { sources, targets, widths, colors, count };
 }
 
+/**
+ * Instanced **half-arrow** link data (#104 N6) — the "map of networks" directed-link glyph. Each
+ * directed edge becomes one filled shape (see {@link halfLinkGeometry}): pinched to the source
+ * centre, bowed around a shared centre curve, ending in a barbed arrowhead on the *target* node's
+ * boundary. A reciprocal A→B / B→A pair is detected so each leaves room for the other's arrow at its
+ * source end (`oppositeWidth`) and the two nest. `bend` is an absolute world-unit ⟂ offset (the
+ * reference's `bend`). Width and colour encode the edge weight (which is the per-edge flow).
+ */
+export function halfArrowLinks(graph: NetworkGraph, style: HalfArrowStyleResolved): InstancedHalfArrowsData {
+  const count = graph.edgeCount;
+  const { nodeRadii, widthOf, colorOf, bend } = style;
+  // Reciprocal lookup: key s*N+t → edge weight, so t→s can find s→t's width for `oppositeWidth`.
+  const n = graph.nodeCount;
+  const weightByPair = new Map<number, number>();
+  for (let e = 0; e < count; e++) weightByPair.set(graph.source[e]! * n + graph.target[e]!, graph.weight[e]!);
+
+  const sources = new Float32Array(count * 2);
+  const targets = new Float32Array(count * 2);
+  const radii = new Float32Array(count * 2);
+  const widths = new Float32Array(count * 2);
+  const bends = new Float32Array(count).fill(bend);
+  for (let e = 0; e < count; e++) {
+    const s = graph.source[e]!;
+    const t = graph.target[e]!;
+    sources[e * 2] = graph.positions[s * 2]!;
+    sources[e * 2 + 1] = graph.positions[s * 2 + 1]!;
+    targets[e * 2] = graph.positions[t * 2]!;
+    targets[e * 2 + 1] = graph.positions[t * 2 + 1]!;
+    radii[e * 2] = nodeRadii[s]!;
+    radii[e * 2 + 1] = nodeRadii[t]!;
+    const w = widthOf(graph.weight[e]!);
+    const oppRaw = weightByPair.get(t * n + s);
+    widths[e * 2] = w;
+    widths[e * 2 + 1] = oppRaw === undefined ? w : widthOf(oppRaw);
+  }
+  const colors = linkColorBytes(graph.weight, count, colorOf);
+  return { sources, targets, radii, widths, bends, colors, count };
+}
+
+export interface HalfArrowStyleResolved {
+  /** Per-node radii (world units) — source foot at r0, arrow tip on the target's r1 boundary. */
+  nodeRadii: Float32Array;
+  widthOf: (weight: number) => number;
+  colorOf: (weight: number) => [number, number, number, number];
+  /** Bend in **world units** (the reference's absolute ⟂ offset; sign picks the bow side). */
+  bend: number;
+}
+
 export interface ArrowStyleResolved {
   size: number;
   /** Per-node radii (world units) — the tip is set back by the *target* node's radius. */
   nodeRadii: Float32Array;
-  fill: string;
+  /** Per-edge RGBA from weight — the arrowhead always matches its link's colour. */
+  colorOf: (weight: number) => [number, number, number, number];
   /** Bend (#104 N6c), matching the link's — the head sits on the bezier end-tangent. */
   bend?: number;
   /** Draw a one-sided **half** arrowhead (#104 N6c). */
@@ -554,7 +680,8 @@ export function linkArrows(graph: NetworkGraph, style: ArrowStyleResolved): Inst
     targets[e * 2 + 1] = ty - uy * setback;
   }
   const sizes = new Float32Array(count).fill(style.size);
-  const colors = fillColors(count, style.fill);
+  // The arrowhead always takes its link's colour (no separate arrow fill).
+  const colors = linkColorBytes(graph.weight, count, style.colorOf);
   if (bend) {
     return { sources, targets, sizes, colors, bends: new Float32Array(count).fill(bend), half: style.half, count };
   }
@@ -578,9 +705,15 @@ export interface ResolvedNetworkStyle {
   linkWidth: number;
   /** Per-edge width from weight (a d3 scale or constant); for super-edges, applied to accumulated weight. */
   linkWidthOf: (weight: number) => number;
+  /** Representative link colour (single colour, or a fallback for super-edges / Scene strokes). */
   linkStroke: string;
+  /** Per-edge RGBA from weight; for super-edges, applied to accumulated weight. The arrow shares it. */
+  linkColorOf: (weight: number) => [number, number, number, number];
+  /** Per-edge CSS colour from weight (the Scene/SVG twin of {@link linkColorOf}). */
+  linkStrokeOf: (weight: number) => string;
+  /** How directed links draw: `"line"` + arrowhead, or a fused `"half-arrow"` (the map glyph). */
+  linkStyle: LinkStyle;
   arrowSize: number;
-  arrowFill: string;
   directed: boolean;
   /**
    * `"world"` (default) sizes glyphs in world units (they scale with zoom); `"screen"` sizes them in
@@ -595,9 +728,10 @@ export interface ResolvedNetworkStyle {
   /** Constant border ring (#104 rework), or `null`; used when no flow border is set. */
   constBorder: ConstBorder | null;
   /**
-   * Link bend (#104 N6c): quadratic-bezier control offset ⟂ to the chord, as a fraction of chord
-   * length. `0` (default) ⇒ straight links; non-zero bows links into curves, and directed links get
-   * a one-sided **half-arrow** so reciprocal A→B / B→A links separate (the map-of-networks style).
+   * Link bend (#104 N6c): the quadratic-bezier control offset ⟂ to the chord. For `linkStyle:"line"`
+   * it is a **fraction of chord length** (`0` ⇒ straight); for `linkStyle:"half-arrow"` it is an
+   * **absolute world-unit** offset (the reference's `bend`, ~30), and the bow side is derived from the
+   * link direction so a reciprocal pair nests.
    */
   linkBend: number;
 }
@@ -610,23 +744,35 @@ export interface ResolvedNetworkStyle {
 export function networkLayers(graph: NetworkGraph, style: ResolvedNetworkStyle): InstancedLayer[] {
   const layers: InstancedLayer[] = [];
   const bend = style.linkBend;
+  const halfArrow = style.linkStyle === "half-arrow" && style.directed;
   if (graph.edgeCount > 0) {
-    layers.push({
-      name: "links",
-      primitive: "lines",
-      lines: linkLines(graph, { widthOf: style.linkWidthOf, stroke: style.linkStroke, bend }),
-      sizeMode: style.sizeMode,
-    });
-    if (style.directed) {
+    if (halfArrow) {
+      // One fused filled glyph per directed link (the map-of-networks look): the arrowhead is part of
+      // the shape, so there's no separate arrows layer. World-sized (matches the reference layout).
       layers.push({
-        name: "arrows",
-        primitive: "arrows",
-        // Bent links get a one-sided half-arrow so reciprocal links don't collide (#104 N6c).
-        arrows: linkArrows(graph, { size: style.arrowSize, nodeRadii: style.nodeRadii, fill: style.arrowFill, bend, half: bend !== 0 }),
-        // Arrowheads remain world-sized until their screen-mode shader lands (#103); harmless in
-        // world mode, slightly inconsistent in screen mode for directed graphs.
+        name: "links",
+        primitive: "half-arrows",
+        halfArrows: halfArrowLinks(graph, { nodeRadii: style.nodeRadii, widthOf: style.linkWidthOf, colorOf: style.linkColorOf, bend }),
         sizeMode: "world",
       });
+    } else {
+      layers.push({
+        name: "links",
+        primitive: "lines",
+        lines: linkLines(graph, { widthOf: style.linkWidthOf, colorOf: style.linkColorOf, bend }),
+        sizeMode: style.sizeMode,
+      });
+      if (style.directed) {
+        layers.push({
+          name: "arrows",
+          primitive: "arrows",
+          // Bent links get a one-sided half-arrow so reciprocal links don't collide (#104 N6c).
+          arrows: linkArrows(graph, { size: style.arrowSize, nodeRadii: style.nodeRadii, colorOf: style.linkColorOf, bend, half: bend !== 0 }),
+          // Arrowheads remain world-sized until their screen-mode shader lands (#103); harmless in
+          // world mode, slightly inconsistent in screen mode for directed graphs.
+          sizeMode: "world",
+        });
+      }
     }
   }
   layers.push({
@@ -711,5 +857,35 @@ export function emitArrows(g: GroupBuilder, graph: NetworkGraph, size: number, n
       ctx.lineTo(baseX + px * size, baseY + py * size);
       ctx.closePath();
     });
+  }
+}
+
+/**
+ * Emit each directed link as a filled **half-arrow** drawable (#104 N6) — the SVG/Canvas twin of the
+ * WebGL half-arrow lane, tracing the exact reference path via {@link traceHalfLink}. Keyed by edge
+ * index; the fill colour is set per-edge by the layer. `widthOf`/`bend` and the reciprocal-width
+ * lookup mirror {@link halfArrowLinks}, so vector export matches the GPU render.
+ */
+export function emitHalfLinks(g: GroupBuilder, graph: NetworkGraph, nodeRadii: Float32Array, widthOf: (weight: number) => number, bend: number): void {
+  const n = graph.nodeCount;
+  const weightByPair = new Map<number, number>();
+  for (let e = 0; e < graph.edgeCount; e++) weightByPair.set(graph.source[e]! * n + graph.target[e]!, graph.weight[e]!);
+  for (let e = 0; e < graph.edgeCount; e++) {
+    const s = graph.source[e]!;
+    const t = graph.target[e]!;
+    const oppRaw = weightByPair.get(t * n + s);
+    const geom = halfLinkGeometry({
+      x0: graph.positions[s * 2]!,
+      y0: graph.positions[s * 2 + 1]!,
+      r0: nodeRadii[s]!,
+      x1: graph.positions[t * 2]!,
+      y1: graph.positions[t * 2 + 1]!,
+      r1: nodeRadii[t]!,
+      width: widthOf(graph.weight[e]!),
+      oppositeWidth: oppRaw === undefined ? widthOf(graph.weight[e]!) : widthOf(oppRaw),
+      bend,
+    });
+    if (!geom) continue;
+    g.drawable(e, (ctx) => traceHalfLink(geom, ctx));
   }
 }

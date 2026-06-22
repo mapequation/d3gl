@@ -16,7 +16,7 @@ export default function FlowBorders() {
           max: 4,
           step: 1,
           value: 2,
-          display: ["0", "0.10", "0.18", "0.28", "0.40"],
+          display: ["0", "15", "30", "45", "60"],
         },
       ]}
       width={720}

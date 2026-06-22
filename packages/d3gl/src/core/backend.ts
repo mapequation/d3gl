@@ -134,11 +134,35 @@ export interface InstancedArrowsData {
   count: number;
 }
 
+/**
+ * SoA for a batch of instanced **half-arrow** links (#104 N6) — the "map of networks" directed-link
+ * glyph: one filled shape per link, pinched to the source centre and ending in a barbed arrowhead on
+ * the target boundary, bowed around a shared centre curve (see network/half-link.ts). All world units.
+ */
+export interface InstancedHalfArrowsData {
+  /** [x, y] world source centre per link, length `2 * count`. */
+  sources: Float32Array;
+  /** [x, y] world target centre per link, length `2 * count`. */
+  targets: Float32Array;
+  /** [r0, r1] source/target node radii per link, length `2 * count` (the tip lands on r1). */
+  radii: Float32Array;
+  /** [width, oppositeWidth] per link, length `2 * count` (opposite width spaces the source foot). */
+  widths: Float32Array;
+  /** Bend per link (absolute world-unit ⟂ offset; sign picks the bow side), length `count`. */
+  bends: Float32Array;
+  /** RGBA bytes per link, length `4 * count`. */
+  colors: Uint8Array;
+  /** Path samples (M) per bezier edge of the strip; a draw setting, not per-instance. Default 24. */
+  samples?: number;
+  count: number;
+}
+
 /** A named GPU-instanced primitive layer — the network rendering lane (#100). */
 export type InstancedLayer =
   | { name: string; sizeMode?: "world" | "screen"; primitive: "circles"; circles: InstancedCirclesData }
   | { name: string; sizeMode?: "world" | "screen"; primitive: "lines"; lines: InstancedLinesData }
-  | { name: string; sizeMode?: "world" | "screen"; primitive: "arrows"; arrows: InstancedArrowsData };
+  | { name: string; sizeMode?: "world" | "screen"; primitive: "arrows"; arrows: InstancedArrowsData }
+  | { name: string; sizeMode?: "world" | "screen"; primitive: "half-arrows"; halfArrows: InstancedHalfArrowsData };
 
 /** A renderer for a Scene, implemented per target (WebGL / Canvas / SVG). */
 export interface Backend {

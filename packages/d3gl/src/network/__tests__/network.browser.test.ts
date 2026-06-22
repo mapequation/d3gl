@@ -203,6 +203,59 @@ describe("network() engine", () => {
     net.destroy();
   });
 
+  it("renders half-arrow links (N6) through the WebGL lane without throwing", async () => {
+    const net = network(host(), { width: 200, height: 200 });
+    await net.whenReady();
+    // Reciprocal directed pair — the half-arrow shader must compile and draw both nested arrows.
+    const g = buildGraph({ nodeCount: 2, source: [0, 1], target: [1, 0], weight: [0.5, 0.3], directed: true, nodeFlow: [0.6, 0.4] });
+    expect(
+      net
+        .data(g)
+        .style({
+          directed: true,
+          linkStyle: "half-arrow",
+          nodeRadius: { by: "flow", scale: (f) => 20 + f * 20 },
+          linkBend: 30,
+          linkWidth: (w) => 7 + w * 12,
+          linkStroke: (w) => (w > 0.4 ? "#418EC7" : "#71B2D7"),
+          flowBorder: { flow: new Float32Array([6, 3]), scale: (v) => v, color: (_v, i) => (i === 0 ? "#f9a327" : "#FFAE38") },
+        })
+        .layout({ backend: "positions", positions: new Float32Array([50, 50, 150, 90]) }),
+    ).toBe(net);
+    net.destroy();
+  });
+
+  it("exports half-arrow links to SVG as one filled path per link (head fused, no separate arrow)", async () => {
+    const net = network(host(), { width: 200, height: 200, backend: "svg" });
+    await net.whenReady();
+    const g = buildGraph({ nodeCount: 2, source: [0, 1], target: [1, 0], weight: [0.5, 0.3], directed: true, nodeFlow: [0.6, 0.4] });
+    net
+      .data(g)
+      .style({
+        directed: true,
+        linkStyle: "half-arrow",
+        nodeRadius: new Float32Array([30, 20]),
+        nodeFill: (i) => (i === 0 ? "#D75908" : "#EF7518"),
+        linkBend: 30,
+        linkWidth: (w) => (w > 0.4 ? 13 : 7),
+        linkStroke: (w) => (w > 0.4 ? "#418EC7" : "#71B2D7"),
+      })
+      .layout({ backend: "positions", positions: new Float32Array([100, 100, 300, 180]) });
+
+    const svg = net.toSVG();
+    // Exactly one filled half-arrow path per directed link — the head is fused in, so there are no
+    // separate arrowhead triangles (two links ⇒ two paths). The strip pinches to the source centre
+    // (the backend flattens the bezier to a polyline and writes compact "L100,100").
+    expect((svg.match(/<path/g) ?? []).length).toBe(2);
+    expect(svg).toContain("L100,100"); // 0→1 link pinches to node 0's centre (100,100)
+    expect((svg.match(/<circle/g) ?? []).length).toBe(2); // two plain nodes (no flow border here)
+    // Each path is coloured by its own link flow (the two reference blues) — per-edge linkStroke.
+    expect(svg).toContain("rgba(65, 142, 199"); // heavy 0→1
+    expect(svg).toContain("rgba(113, 178, 215"); // light 1→0
+
+    net.destroy();
+  });
+
   it("exports bent links to SVG as flattened curved paths (vs straight)", async () => {
     const net = network(host(), { width: 200, height: 200, backend: "svg" });
     await net.whenReady();
