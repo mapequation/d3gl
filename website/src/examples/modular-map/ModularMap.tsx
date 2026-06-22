@@ -8,7 +8,13 @@ import { setup } from "./draw.js";
 export default function ModularMap() {
   return (
     <Example
-      controls={[{ type: "segmented", key: "lod", label: "LOD", options: ["Off", "Standard", "Modules"], value: "Modules" }]}
+      controls={[
+        { type: "segmented", key: "lod", label: "LOD", options: ["Off", "Standard", "Modules"], value: "Modules" },
+        { type: "segmented", key: "sizing", label: "Sizing", options: ["Screen", "World"] },
+        { type: "segmented", key: "declutter", label: "Declutter", options: ["On", "Off"] },
+        { type: "range", key: "expand", label: "Expand", min: 24, max: 120, step: 4, value: 48 },
+        { type: "range", key: "maxAgg", label: "Max module", min: 12, max: 48, step: 2, value: 28 },
+      ]}
       width={820}
       height={560}
     >

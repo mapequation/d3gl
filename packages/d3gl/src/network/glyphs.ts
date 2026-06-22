@@ -188,7 +188,8 @@ export interface FlowBorderSpec {
   /**
    * Ring colour: a single CSS colour, or a per-node `(value, index, graph) => cssColour` accessor so
    * the ring colour can also encode the per-node metric (a bare d3 colour scale fits — `value` is the
-   * node's flow metric). Default: a darker shade of the node fill.
+   * node's flow metric). **Omitted (default): a darker shade of each glyph's own fill** — so a module
+   * aggregate's ring is a darker shade of *its* module colour, not one shared colour.
    */
   color?: string | ((value: number, index: number, graph: NetworkGraph) => string);
 }
@@ -203,6 +204,8 @@ export interface ResolvedFlowBorder {
   colorCss: string;
   /** Per-node ring RGBA (length `4·nodeCount`) when {@link FlowBorderSpec.color} is an accessor; else absent. */
   colors?: Uint8Array;
+  /** When set (no explicit colour given), derive each glyph's ring by multiplying its own fill RGB by this factor (0–1). */
+  darken?: number;
 }
 
 /**
@@ -237,8 +240,25 @@ export function resolveFlowBorder(graph: NetworkGraph, spec: FlowBorderSpec, fal
     const colorCss = colorOf(metric[rep] ?? 0, rep, graph);
     return { metric, scale: spec.scale, color: toRGBA(colorCss), colorCss, colors };
   }
-  const colorCss = spec.color ?? rgb(fallbackColor).darker(0.8).formatHex();
+  if (spec.color === undefined) {
+    // No explicit colour → each glyph's ring is a darker shade of its OWN fill (per-module under LOD).
+    // The renderers derive it from the glyph colours via `darken`; colorCss is a representative fallback.
+    return { metric, scale: spec.scale, color: toRGBA(rgb(fallbackColor).darker(0.9).formatHex()), colorCss: rgb(fallbackColor).darker(0.9).formatHex(), darken: 0.62 };
+  }
+  const colorCss = spec.color;
   return { metric, scale: spec.scale, color: toRGBA(colorCss), colorCss };
+}
+
+/** Per-instance ring colours = the glyph fill colours darkened (RGB × factor); alpha preserved. */
+function darkenColors(fill: ArrayLike<number>, count: number, factor: number): Uint8Array {
+  const out = new Uint8Array(count * 4);
+  for (let i = 0; i < count; i++) {
+    out[i * 4] = Math.round(fill[i * 4]! * factor);
+    out[i * 4 + 1] = Math.round(fill[i * 4 + 1]! * factor);
+    out[i * 4 + 2] = Math.round(fill[i * 4 + 2]! * factor);
+    out[i * 4 + 3] = fill[i * 4 + 3]!;
+  }
+  return out;
 }
 
 const clamp01 = (x: number): number => (x < 0 ? 0 : x > 1 ? 1 : x);
@@ -325,7 +345,9 @@ export function nodeCircles(graph: NetworkGraph, style: NodeStyleResolved): Inst
   const colors = style.colors ?? fillColors(count, style.fill);
   const base = { centers: graph.positions, radii: style.radii, colors, count };
   if (style.border) {
-    const { metric, scale, color, colors: borderNodeColors } = style.border;
+    const { metric, scale, color, colors: explicit, darken } = style.border;
+    // `darken` (no explicit ring colour) ⇒ each node's ring = its own fill darkened.
+    const borderNodeColors = darken !== undefined ? darkenColors(colors, count, darken) : explicit;
     return { ...base, ...buildBorders(count, style.radii, (i) => metric[i]!, scale, color, borderNodeColors) };
   }
   if (style.constBorder) {
@@ -397,8 +419,11 @@ export function frontierCircles(tree: LODTree, frontier: Uint32Array, style: Fro
   }
   const base = { centers, radii, colors, count };
   if (style.border) {
-    const { scale, color } = style.border;
-    return { ...base, ...buildBorders(count, radii, (i) => tree.border[frontier[i]!]!, scale, color) };
+    const { scale, color, colors: explicit, darken } = style.border;
+    // `darken` (no explicit ring colour) ⇒ each glyph's ring = its own (module) colour darkened — so a
+    // collapsed module's ring is a darker shade of that module's hue, not one shared colour.
+    const borderColors = darken !== undefined ? darkenColors(colors, count, darken) : explicit;
+    return { ...base, ...buildBorders(count, radii, (i) => tree.border[frontier[i]!]!, scale, color, borderColors) };
   }
   if (style.constBorder) {
     return { ...base, ...constBorderArrays(count, radii, style.constBorder.width, style.constBorder.color) };

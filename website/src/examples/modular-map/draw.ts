@@ -1,6 +1,5 @@
 import { network, buildGraph, moduleColors } from "@mapequation/d3gl/network";
 import { scaleSqrt, scaleLinear } from "d3-scale";
-import { rgb } from "d3-color";
 import type { ImperativeSetup } from "../types.js";
 import { loadModularMap } from "./data.js";
 
@@ -38,7 +37,11 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
   const nodeR = scaleSqrt().domain([0, maxNodeFlow]).range([3, 26]);
   const ringW = scaleSqrt().domain([0, maxEnter]).range([0, 6]);
   const linkW = scaleSqrt().domain([0, maxLink]).range([1, 10]);
-  const linkC = scaleLinear<string>().domain([0, maxLink]).range(["#aebfdd", "#21386e"]);
+  // Link colour: the half-arrow example's blue, semi-transparent so overlaps read as density (not
+  // black); alpha grows with flow alongside the width. Returning rgba keeps the alpha (a colour scale
+  // would drop it).
+  const linkAlpha = scaleLinear().domain([0, maxLink]).range([0.35, 0.85]).clamp(true);
+  const linkStroke = (w: number) => `rgba(65, 142, 199, ${linkAlpha(w).toFixed(3)})`;
 
   net.data(graph).layout({ backend: "force", iterations: 320 });
 
@@ -64,27 +67,31 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
   return {
     engine: net,
     render: (options) => {
+      const sizeMode = options.sizing === "World" ? "world" : "screen";
+      const expandPx = (options.expand as number) ?? 48;
+      const maxAggregateRadius = (options.maxAgg as number) ?? 28;
+      const declutter = options.declutter !== "Off";
       net.style({
         directed: true,
         linkStyle: "half-arrow",
-        sizeMode: "screen", // constant-pixel glyphs — the navigation register LOD wants
+        sizeMode, // "screen" = constant-pixel glyphs (the navigation register LOD wants); "world" scales with zoom
         nodeRadius: { by: "flow", scale: nodeR }, // radius ∝ visit rate
         nodeFill: (i) => colors[i]!, // categorical module colour
-        // Ring ∝ enter/exit flow, in a darker shade of the node's module colour.
-        flowBorder: { flow: d.enterExit, scale: ringW, color: (_v, i) => rgb(colors[i]!).darker(1).formatHex() },
+        // Ring ∝ enter/exit flow; colour omitted ⇒ a darker shade of each glyph's own module colour.
+        flowBorder: { flow: d.enterExit, scale: ringW },
         linkBend: 14, // px (screen mode)
         linkWidth: linkW, // half-arrow width ∝ link flow; super-edges use accumulated flow
-        linkStroke: linkC, // half-arrow colour ∝ link flow
+        linkStroke, // semi-transparent blue, alpha ∝ flow
       });
       const mode = (options.lod as string) ?? "Modules";
       if (mode === "Off") {
         net.lod(false);
       } else if (mode === "Standard") {
         // Structural coarsening — no module info; aggregates joined by plain super-edge lines.
-        net.lod({ expandPx: 44, maxAggregateRadius: 28, declutter: true });
+        net.lod({ expandPx, maxAggregateRadius, declutter });
       } else {
         // The planted partition drives the cut → directed half-arrow super-edges ∝ accumulated flow.
-        net.lod({ modules: d.modulePaths, expandPx: 44, maxAggregateRadius: 28, declutter: true, superEdges: true });
+        net.lod({ modules: d.modulePaths, expandPx, maxAggregateRadius, declutter, superEdges: true });
       }
     },
   };

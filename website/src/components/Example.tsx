@@ -302,7 +302,7 @@ export default function Example(props: ExampleProps) {
             ? (c.value ?? c.options[0])
             : c.type === "button"
               ? 0
-              : c.options[0];
+              : (c.value ?? c.options[0]); // segmented: honour an explicit default
     }
     for (const [k, v] of Object.entries(defaults)) if (k !== "backend") o[k] = v;
     return o;

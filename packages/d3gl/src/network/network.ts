@@ -278,6 +278,13 @@ export class Network extends BaseEngine {
       this.lodHasGeometry = false;
       return this.rebuild();
     }
+    // Switching the tree SOURCE (provided modules ↔ structural coarsening) must rebuild the tree — the
+    // retained one is from the old source. Drop the main-thread tree so recomputeLODGeometry rebuilds
+    // (keep a worker-streamed tree; the worker owns it).
+    if (!!options.modules !== this.lodModules && this.lodTree && this.lodTree !== this.lodWorkerTree) {
+      this.lodTree = null;
+      this.lodHasGeometry = false;
+    }
     this.lodOptions = options;
     // Keep any worker-streamed tree from a still-current run: reconfiguring LOD options reuses it
     // (cut-time options apply immediately; the style geometry refreshes). data()/layout() drop it on
@@ -725,11 +732,19 @@ export class Network extends BaseEngine {
       : cb
         ? `rgba(${cb.color[0]},${cb.color[1]},${cb.color[2]},${cb.color[3] / 255})`
         : style.nodeFill;
-    // Per-node ring colour when flowBorder.color is an accessor (e.g. ring colour ∝ enter/exit flow).
+    // Per-node ring colour: a darker shade of each node's own fill (no explicit colour given), an
+    // accessor's per-node colours (ring ∝ a metric), else the single representative colour.
     const flowColors = flow?.colors;
-    const borderColorAt = flowColors
-      ? (i: number) => `rgba(${flowColors[i * 4]},${flowColors[i * 4 + 1]},${flowColors[i * 4 + 2]},${flowColors[i * 4 + 3]! / 255})`
-      : () => borderColorCss;
+    const darken = flow?.darken;
+    const borderColorAt =
+      darken !== undefined
+        ? (i: number) => {
+            const c = rgb(fillOf(i));
+            return `rgb(${Math.round(c.r * darken)},${Math.round(c.g * darken)},${Math.round(c.b * darken)})`;
+          }
+        : flowColors
+          ? (i: number) => `rgba(${flowColors[i * 4]},${flowColors[i * 4 + 1]},${flowColors[i * 4 + 2]},${flowColors[i * 4 + 3]! / 255})`
+          : () => borderColorCss;
     const innerRadii = flow
       ? flowBorderInnerRadii(style.nodeRadii, flow.metric, flow.scale)
       : cb

@@ -8,13 +8,14 @@ import { computeLODPositions, computeLODStyle } from "../lod.js";
 const id = (v: number) => v;
 
 describe("resolveFlowBorder", () => {
-  it("passes an app Float32Array straight through (no copy) and defaults the colour to a darker fill", () => {
+  it("passes an app Float32Array straight through (no copy) and, with no colour, derives the ring from each fill", () => {
     const g = buildGraph({ nodeCount: 2, source: [0], target: [1] });
     const flow = new Float32Array([0.3, 0.7]);
     const b = resolveFlowBorder(g, { flow, scale: id }, "#4878d0");
     expect(b.metric).toBe(flow); // same reference
-    expect(b.colorCss).toBe(rgb("#4878d0").darker(0.8).formatHex());
-    expect(b.color).toEqual([...rgbBytes("#4878d0", 0.8)]);
+    // No explicit colour ⇒ a per-glyph darken factor (each ring = its own fill darkened); colorCss is a fallback.
+    expect(b.darken).toBe(0.62);
+    expect(b.colorCss).toBe(rgb("#4878d0").darker(0.9).formatHex());
   });
 
   it("resolves a built-in metric to per-node values, and honours an explicit colour", () => {
@@ -97,9 +98,3 @@ describe("flowBorderInnerRadii (SVG two-disc export)", () => {
     expect(Array.from(flowBorderInnerRadii(new Float32Array([10, 10]), new Float32Array([3, 20]), id))).toEqual([7, 0]);
   });
 });
-
-/** RGBA bytes of a CSS colour darkened by `k` (mirrors resolveFlowBorder's default). */
-function rgbBytes(css: string, k: number): [number, number, number, number] {
-  const c = rgb(rgb(css).darker(k).formatHex());
-  return [Math.round(c.r), Math.round(c.g), Math.round(c.b), 255];
-}
