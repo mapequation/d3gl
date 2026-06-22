@@ -7,6 +7,7 @@ import ExampleCard from "../../../components/ExampleCard.astro";
 import Network from "../../../examples/network/Network.tsx";
 import LoadNetwork from "../../../examples/load-network/LoadNetwork.tsx";
 import ModularLod from "../../../examples/modular-lod/ModularLod.tsx";
+import FlowBorders from "../../../examples/flow-borders/FlowBorders.tsx";
 
 The `network()` engine renders node–link diagrams through a dedicated GPU-instanced rendering
 lane: nodes are instanced points, links are instanced lines, and directed edges get triangle
@@ -64,6 +65,45 @@ net.style({ nodeRadius: { by: "strength", scale: scaleSqrt().range([2, 20]) } })
 `degree` and `strength` are derived from the edge list automatically. **Flow** is a model quantity
 (e.g. an Infomap visit rate) that d3gl does not invent — supply it as `buildGraph({ …, nodeFlow })`
 to make `{ by: "flow", scale }` available.
+
+## Flow borders and bent half-arrows
+
+The "map of networks" glyph style — independent of LOD, these are plain rendering features. A node or
+module reads as a disc whose **fill/size** is its total flow and whose **border ring** encodes its
+**enter/exit flow** (the flow crossing its boundary); directed links are **bent half-arrows** whose
+width encodes link flow and which bow to opposite sides so a reciprocal A→B / B→A pair doesn't overlap.
+This minimal two-node example reproduces `mapequation`'s `network-rendering` look — switch the backend
+(WebGL / Canvas / SVG): the render is **equivalent** across all three.
+
+- **`flowBorder`** — `flow` is a per-node value (your `Float32Array` of enter/exit flow, or a built-in
+  metric like `"strength"`), `scale` maps it to ring width, `color` sets the ring colour. d3gl doesn't
+  compute enter/exit flow — you supply it (Infomap gives it), as with positions and the module tree.
+- **`linkBend`** — bows links into quadratic-bezier curves (control point ⟂ to the chord, offset by
+  `linkBend` × chord length). One generalised "path-strip" primitive: straight links stay the cheap
+  2-sample case; bent links trace a smooth strip in the same shader. Directed → a one-sided half-arrow.
+- **`linkWidth`** — a constant, or a `(weight) => width` scale (like `nodeRadius`); the **fill/size also
+  takes a scale** via `nodeRadius: { by: "flow", scale }`.
+
+```ts
+import { scaleSqrt } from "d3-scale";
+
+net.data(graph).style({
+  directed: true,
+  nodeRadius: { by: "flow", scale: scaleSqrt().range([0, 30]) }, // fill/size ∝ total flow
+  nodeFill: (i) => moduleColour(i), // a constant, or a per-node accessor
+  flowBorder: { flow: enterExitFlow, scale: scaleSqrt().range([0, 6]), color: "#3b5b9b" },
+  linkBend: 0.18,
+  linkWidth: scaleSqrt().range([0, 13]), // link width ∝ flow; super-edges use accumulated weight
+});
+```
+
+Both glyphs render in-shader on the WebGL lane and export to SVG/Canvas (the ring as a border disc
+under a smaller fill disc; the link as a flattened bezier + one-sided head), so publication output
+matches the screen.
+
+<ExampleCard files={["flow-borders/draw.ts", "flow-borders/data.ts"]}>
+  <FlowBorders client:visible slot="demo" />
+</ExampleCard>
 
 ## Level of detail (LOD)
 
@@ -138,51 +178,10 @@ net.lodSource; // "modules"
 ```
 
 The provided hierarchy takes priority over structural coarsening; everything else about the cut
-(declutter, `sizeMode`, the on-screen-bounded per-frame work) is unchanged.
-
-### Flow borders
-
-A node or module reads as a disc whose **fill/size** is its total flow and whose **border ring**
-encodes its **enter/exit flow** — the flow crossing its boundary. `style({ flowBorder })` draws that
-ring: `flow` is a per-node value (your `Float32Array` of enter/exit flow, or a built-in metric like
-`"strength"`), `scale` maps it to ring width (same units as `nodeRadius`), and `color` sets the ring
-colour. d3gl doesn't compute enter/exit flow — you supply it (Infomap gives it), mirroring how the
-module hierarchy and positions are provided.
-
-```ts
-import { scaleSqrt } from "d3-scale";
-
-net.data(graph).style({
-  sizeMode: "screen",
-  nodeFill: "#cdd7ec",
-  nodeRadius: { by: "flow", scale: scaleSqrt().range([3, 22]) }, // size ∝ total flow
-  flowBorder: {
-    flow: enterExitFlow, // Float32Array (length nodeCount), or a metric like "strength"
-    scale: scaleSqrt().range([0, 6]), // → ring width
-    color: "#3b5b9b",
-  },
-});
-```
-
-It composes with everything above: under LOD, a **module's** ring sums its members' flow over the
-same adaptive cut, so a collapsed module shows the boundary flow of its whole subtree, resolving into
-individual nodes as you zoom in. The ring renders in-shader on the WebGL lane and exports to SVG (a
-border disc under a smaller fill disc) for publication at small N.
-
-### Curved links and half-arrows
-
-`style({ linkBend })` bows links into **quadratic-bezier curves** — the control point sits ⟂ to the
-chord, offset by `linkBend` × chord length (try ~0.15). On a **directed** graph each link then draws a
-one-sided **half-arrow**, so a reciprocal A→B / B→A pair bows to opposite sides instead of overlapping
-— the map-of-networks link style.
-
-```ts
-net.data(graph).style({ directed: true, linkBend: 0.15 });
-```
-
-It's one generalised "path-strip" primitive: straight links stay the cheap 2-sample case (no cost at
-scale), while bent links trace a smooth multi-sample strip in the same shader. It renders in-shader on
-the WebGL lane and exports to SVG (a flattened bezier path + one-sided arrowhead).
+(declutter, `sizeMode`, the on-screen-bounded per-frame work) is unchanged. Under LOD a **module's**
+flow border sums its members' enter/exit flow, and its bent-half-arrow **super-edges** size by the
+accumulated weight of the edges they subsume — the same flow-border and bent-link glyphs as above,
+driven by the cut.
 
 ## Modular level of detail
 
