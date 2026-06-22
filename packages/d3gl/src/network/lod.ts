@@ -15,6 +15,7 @@
  * Kept network-private for now behind the {@link cut} / frontier boundary; the same shape is meant
  * to be promotable to a shared core `select(transform) → visibleIndices` lane later (#108).
  */
+import { hcl, rgb } from "d3-color";
 import type { NetworkGraph } from "./graph.js";
 import { buildHierarchy, type CoarsenOptions, type Hierarchy } from "./coarsen.js";
 
@@ -92,6 +93,13 @@ export interface LODTree extends LODTopology {
    * scale (value → ring width) is applied at glyph-build time, not stored here.
    */
   border: Float32Array;
+  /**
+   * Per-node fill colour as RGBA bytes, length `4 · size` (#104 N6 rework). Each leaf takes its
+   * provided colour; each aggregate the (count-)averaged colour of its descendants — so a module
+   * drawn from a categorical palette keeps its colour when collapsed, and its leaves share it. Zero
+   * when no colours are supplied (the engine falls back to a single fill).
+   */
+  color: Uint8Array;
 }
 
 /**
@@ -179,6 +187,7 @@ function attachGeometry(topo: LODTopology): LODTree {
     count: new Uint32Array(size),
     weight: new Float32Array(size),
     border: new Float32Array(size),
+    color: new Uint8Array(size * 4),
   };
 }
 
@@ -443,6 +452,7 @@ export function lodTreeFromTopology(
     count: new Uint32Array(size),
     weight: new Float32Array(size),
     border: new Float32Array(size),
+    color: new Uint8Array(size * 4),
   };
 }
 
@@ -516,13 +526,20 @@ export function computeLODStyle(
   leafRadii: ArrayLike<number>,
   leafWeight: ArrayLike<number>,
   leafBorder?: ArrayLike<number>,
+  leafColors?: ArrayLike<number>,
 ): void {
-  const { leafCount, levelCount, levelOffset, childOffset, children, radius, weight, border } = tree;
+  const { leafCount, levelCount, levelOffset, childOffset, children, radius, weight, border, color } = tree;
 
   for (let i = 0; i < leafCount; i++) {
     radius[i] = leafRadii[i]!;
     weight[i] = leafWeight[i]!;
     border[i] = leafBorder ? leafBorder[i]! : 0;
+    if (leafColors) {
+      color[i * 4] = leafColors[i * 4]!;
+      color[i * 4 + 1] = leafColors[i * 4 + 1]!;
+      color[i * 4 + 2] = leafColors[i * 4 + 2]!;
+      color[i * 4 + 3] = leafColors[i * 4 + 3]!;
+    }
   }
 
   for (let k = 1; k < levelCount; k++) {
@@ -530,15 +547,38 @@ export function computeLODStyle(
       let sw = 0;
       let sumR2 = 0;
       let sb = 0;
+      // Colour: a chroma-weighted circular-hue mean in HCL, so a module's aggregate takes its hue
+      // family's representative hue (crisp) rather than a muddy RGB average across the family.
+      let hx = 0, hy = 0, sumC = 0, sumL = 0, sumA = 0, nc = 0;
       for (let p = childOffset[g]!; p < childOffset[g + 1]!; p++) {
         const c = children[p]!;
         sw += weight[c]!;
         sumR2 += radius[c]! * radius[c]!;
         sb += border[c]!;
+        if (leafColors) {
+          const col = hcl(rgb(color[c * 4]!, color[c * 4 + 1]!, color[c * 4 + 2]!));
+          const ch = Number.isNaN(col.c) ? 0 : col.c;
+          if (!Number.isNaN(col.h)) {
+            hx += Math.cos((col.h * Math.PI) / 180) * ch;
+            hy += Math.sin((col.h * Math.PI) / 180) * ch;
+          }
+          sumC += ch;
+          sumL += Number.isNaN(col.l) ? 0 : col.l;
+          sumA += color[c * 4 + 3]!;
+          nc++;
+        }
       }
       weight[g] = sw;
       radius[g] = Math.sqrt(sumR2); // area-additive: aggregate ink ≈ Σ child ink
       border[g] = sb; // sum-additive: a module's border metric ≈ Σ member metric
+      if (leafColors && nc > 0) {
+        const hue = (Math.atan2(hy, hx) * 180) / Math.PI;
+        const c = rgb(hcl(hue, sumC / nc, sumL / nc));
+        color[g * 4] = Math.max(0, Math.min(255, Math.round(c.r)));
+        color[g * 4 + 1] = Math.max(0, Math.min(255, Math.round(c.g)));
+        color[g * 4 + 2] = Math.max(0, Math.min(255, Math.round(c.b)));
+        color[g * 4 + 3] = Math.round(sumA / nc);
+      }
     }
   }
 }
@@ -558,9 +598,10 @@ export function computeLODGeometry(
   leafRadii: ArrayLike<number>,
   leafWeight: ArrayLike<number> = graph.strength,
   leafBorder?: ArrayLike<number>,
+  leafColors?: ArrayLike<number>,
 ): void {
   computeLODPositions(tree, graph.positions);
-  computeLODStyle(tree, leafRadii, leafWeight, leafBorder);
+  computeLODStyle(tree, leafRadii, leafWeight, leafBorder, leafColors);
 }
 
 /** Screen-space transform: `screen = world * k + (x, y)` (matches {@link BaseEngine} `ViewTransform`). */

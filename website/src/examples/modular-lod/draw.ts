@@ -1,0 +1,53 @@
+import { network, buildGraph, moduleColors } from "@mapequation/d3gl/network";
+import type { ImperativeSetup } from "../types.js";
+import { generateSierpinski, SIERPINSKI_BOUNDS } from "./data.js";
+
+const DEPTHS = [2, 3, 4, 5, 6]; // 27 → 2187 nodes
+
+/**
+ * **Modular-aware level of detail.** An undirected Sierpinski gasket whose recursive subdivision *is*
+ * a planted module hierarchy (Infomap-style `path` per node), fed to `net.lod({ modules })`. Each node
+ * is coloured by its **top-level module** (a categorical palette), so a module glyph and all its leaves
+ * share one colour. Zoom out and nodes **aggregate into their parent module**; zoom in and modules
+ * expand → sub-modules → leaf triangles — the colour stays, so you can read the hierarchy at any scale.
+ * Links are simple bent lines (undirected, no arrows). Scroll to zoom, drag to pan; the Depth slider
+ * grows the gasket from 27 to 2,187 nodes.
+ */
+export const setup: ImperativeSetup = (host, { width, height, backend }) => {
+  const net = network(host, { width, height, backend });
+  // Frame the gasket's fixed world bounds once, BEFORE enableZoom — so d3-zoom seeds its internal
+  // transform from this view and the first gesture doesn't snap back to identity. render() never
+  // touches the transform.
+  const { minX, maxX, minY, maxY } = SIERPINSKI_BOUNDS;
+  const k = Math.min(width / (maxX - minX), height / (maxY - minY)) * 0.9;
+  net.setTransform({ k, x: width / 2 - ((minX + maxX) / 2) * k, y: height / 2 - ((minY + maxY) / 2) * k });
+  net.enableZoom([k * 0.3, k * 40]); // bracket the fit scale
+
+  return {
+    engine: net,
+    render: (options) => {
+      const depth = DEPTHS[(options.depth as number) ?? 2] ?? 4;
+      const lod = options.lod !== "Off";
+      const { nodeCount, source, target, weight, positions, modules } = generateSierpinski(depth);
+      const graph = buildGraph({ nodeCount, source, target, weight });
+      // Hierarchical module colours: top modules split the hue circle, sub-modules vary within.
+      const colors = moduleColors(modules);
+
+      net
+        .data(graph)
+        .style({
+          sizeMode: "screen",
+          nodeRadius: 6,
+          nodeFill: (i) => colors[i]!, // hierarchical module colour; LOD aggregates take their family hue
+          nodeBorder: { width: 1, color: "#ffffff" },
+          linkBend: 0.18, // bent lines (undirected — no arrowheads)
+          linkStroke: "rgba(90,100,120,0.55)",
+          // Uniform: every edge has weight 1 and bridges don't aggregate here, so links stay constant.
+          // (linkWidth also accepts a (weight) => width scale; super-edges then size by accumulated weight.)
+          linkWidth: 2.5,
+        })
+        .lod(lod ? { modules, expandPx: 120, maxAggregateRadius: 26 } : false)
+        .layout({ backend: "positions", positions });
+    },
+  };
+};

@@ -74,16 +74,30 @@ export function resolveNodeRadii(graph: NetworkGraph, spec: NodeRadiusSpec): Flo
   return radii;
 }
 
+/** A constant ring of a fixed pixel width (#104 rework) — e.g. a 1px white outline on every node. */
+export interface ConstBorder {
+  width: number;
+  color: [number, number, number, number];
+}
+
 export interface NodeStyleResolved {
   /** Per-node radius (world units), length `graph.nodeCount`. Resolved via {@link resolveNodeRadii}. */
   radii: Float32Array;
   fill: string;
+  /** Optional per-node RGBA fill (length `4·count`) — overrides `fill` (categorical module colours, #104 rework). */
+  colors?: Uint8Array;
   /** Optional flow-border ring (#104 N6); `null`/absent ⇒ plain filled nodes. */
   border?: ResolvedFlowBorder | null;
+  /** Optional constant border ring (#104 rework): a fixed px width + colour, independent of flow. */
+  constBorder?: ConstBorder | null;
 }
 
+/** Link width: a constant, or a d3-style scale of the edge's weight/flow (like {@link NodeRadiusSpec}). */
+export type LinkWidthSpec = number | ((weight: number) => number);
+
 export interface LinkStyleResolved {
-  width: number;
+  /** Per-edge width from its weight; for super-edges, applied to the accumulated subsumed weight. */
+  widthOf: (weight: number) => number;
   stroke: string;
   /** Bend (#104 N6c): quadratic-bezier control offset ⟂ to the chord, as a fraction of chord length (0 = straight). */
   bend?: number;
@@ -184,6 +198,30 @@ function buildBorders(
   return { borders, borderColors };
 }
 
+/** Per-instance ring arrays for a constant px-width border (fraction = width/radius), one colour. */
+function constBorderArrays(
+  count: number,
+  radii: ArrayLike<number>,
+  width: number,
+  color: [number, number, number, number],
+): { borders: Float32Array; borderColors: Uint8Array } {
+  return buildBorders(count, radii, () => width, (w) => w, color);
+}
+
+/** Resolve a per-node fill-colour accessor to a packed RGBA buffer (length `4·nodeCount`), #104 rework. */
+export function resolveNodeColors(graph: NetworkGraph, color: (index: number, graph: NetworkGraph) => string): Uint8Array {
+  const n = graph.nodeCount;
+  const out = new Uint8Array(n * 4);
+  for (let i = 0; i < n; i++) {
+    const [r, g, b, a] = toRGBA(color(i, graph));
+    out[i * 4] = r;
+    out[i * 4 + 1] = g;
+    out[i * 4 + 2] = b;
+    out[i * 4 + 3] = a;
+  }
+  return out;
+}
+
 /**
  * Inner-disc radii (`radius − ring width`) for rendering a flow border as two stacked discs (a
  * border-colour disc under a smaller fill disc) on the SVG/Canvas export path, which has no
@@ -207,13 +245,16 @@ export function flowBorderInnerRadii(radii: ArrayLike<number>, metric: ArrayLike
  */
 export function nodeCircles(graph: NetworkGraph, style: NodeStyleResolved): InstancedCirclesData {
   const count = graph.nodeCount;
-  const colors = fillColors(count, style.fill);
+  const colors = style.colors ?? fillColors(count, style.fill);
+  const base = { centers: graph.positions, radii: style.radii, colors, count };
   if (style.border) {
     const { metric, scale, color } = style.border;
-    const { borders, borderColors } = buildBorders(count, style.radii, (i) => metric[i]!, scale, color);
-    return { centers: graph.positions, radii: style.radii, colors, borders, borderColors, count };
+    return { ...base, ...buildBorders(count, style.radii, (i) => metric[i]!, scale, color) };
   }
-  return { centers: graph.positions, radii: style.radii, colors, count };
+  if (style.constBorder) {
+    return { ...base, ...constBorderArrays(count, style.radii, style.constBorder.width, style.constBorder.color) };
+  }
+  return base;
 }
 
 export interface FrontierStyleResolved {
@@ -233,6 +274,10 @@ export interface FrontierStyleResolved {
    * sum-aggregated `border` metric (a module reflects its members' total); `metric` is ignored here.
    */
   border?: ResolvedFlowBorder | null;
+  /** Optional constant border ring (#104 rework): fixed px width + colour on every frontier glyph. */
+  constBorder?: ConstBorder | null;
+  /** Colour each frontier glyph by the tree's per-node `color` (categorical module colours) instead of `nodeFill`/`aggregateFill`. */
+  useTreeColor?: boolean;
 }
 
 /**
@@ -250,6 +295,7 @@ export function frontierCircles(tree: LODTree, frontier: Uint32Array, style: Fro
   const colors = new Uint8Array(count * 4);
   const leaf = toRGBA(style.nodeFill);
   const agg = toRGBA(style.aggregateFill);
+  const useTreeColor = style.useTreeColor === true;
   for (let i = 0; i < count; i++) {
     const g = frontier[i]!;
     centers[i * 2] = tree.cx[g]!;
@@ -258,18 +304,29 @@ export function frontierCircles(tree: LODTree, frontier: Uint32Array, style: Fro
     // point in a 1-child cell, #103) — draw it as that point: leaf fill, uncapped radius.
     const isLeafNode = g < tree.leafCount || tree.count[g] === 1;
     radii[i] = isLeafNode ? tree.radius[g]! : Math.min(tree.radius[g]!, maxAgg);
-    const c = isLeafNode ? leaf : agg;
-    colors[i * 4] = c[0];
-    colors[i * 4 + 1] = c[1];
-    colors[i * 4 + 2] = c[2];
-    colors[i * 4 + 3] = c[3];
+    if (useTreeColor) {
+      // Categorical module colour, propagated to aggregates by computeLODStyle.
+      colors[i * 4] = tree.color[g * 4]!;
+      colors[i * 4 + 1] = tree.color[g * 4 + 1]!;
+      colors[i * 4 + 2] = tree.color[g * 4 + 2]!;
+      colors[i * 4 + 3] = tree.color[g * 4 + 3]!;
+    } else {
+      const c = isLeafNode ? leaf : agg;
+      colors[i * 4] = c[0];
+      colors[i * 4 + 1] = c[1];
+      colors[i * 4 + 2] = c[2];
+      colors[i * 4 + 3] = c[3];
+    }
   }
+  const base = { centers, radii, colors, count };
   if (style.border) {
     const { scale, color } = style.border;
-    const { borders, borderColors } = buildBorders(count, radii, (i) => tree.border[frontier[i]!]!, scale, color);
-    return { centers, radii, colors, borders, borderColors, count };
+    return { ...base, ...buildBorders(count, radii, (i) => tree.border[frontier[i]!]!, scale, color) };
   }
-  return { centers, radii, colors, count };
+  if (style.constBorder) {
+    return { ...base, ...constBorderArrays(count, radii, style.constBorder.width, style.constBorder.color) };
+  }
+  return base;
 }
 
 export interface SuperEdgeStyleResolved {
@@ -329,13 +386,11 @@ export function superEdgeLines(
 }
 
 export interface BentSuperEdgeStyleResolved {
-  /** Constant link width, unless `flowScale` is given. */
-  width: number;
+  /** Width from a super-edge's **accumulated** subsumed weight (the same scale as raw links). */
+  widthOf: (weight: number) => number;
   stroke: string;
   /** Bend (fraction of chord) for the bezier links. */
   bend: number;
-  /** Optional map flow → link width (e.g. `scaleSqrt`), so width ∝ √flow; constant `width` when absent. */
-  flowScale?: (flow: number) => number;
   /** Draw one-sided half-arrowheads (directed maps). */
   directed: boolean;
   arrowSize: number;
@@ -401,7 +456,7 @@ export function bentSuperEdges(
     sources[e * 2 + 1] = sy;
     targets[e * 2] = tx;
     targets[e * 2 + 1] = ty;
-    widths[e] = style.flowScale ? style.flowScale(wS[e]!) : style.width;
+    widths[e] = style.widthOf(wS[e]!); // accumulated subsumed weight → width
     // Arrow tip set back to the target module's boundary along the bezier end-tangent.
     const [ux, uy] = bentEndTangent(sx, sy, tx, ty, style.bend);
     const setback = drawnRadius(h);
@@ -453,7 +508,8 @@ export function linkLines(graph: NetworkGraph, style: LinkStyleResolved): Instan
     targets[e * 2] = graph.positions[t * 2]!;
     targets[e * 2 + 1] = graph.positions[t * 2 + 1]!;
   }
-  const widths = new Float32Array(count).fill(style.width);
+  const widths = new Float32Array(count);
+  for (let e = 0; e < count; e++) widths[e] = style.widthOf(graph.weight[e]!);
   const colors = fillColors(count, style.stroke);
   if (style.bend) {
     return { sources, targets, widths, colors, bends: new Float32Array(count).fill(style.bend), samples: BENT_SAMPLES, count };
@@ -518,7 +574,10 @@ export interface ResolvedNetworkStyle {
   /** Per-node radii, length `nodeCount`; resolved via {@link resolveNodeRadii}. Units follow `sizeMode`. */
   nodeRadii: Float32Array;
   nodeFill: string;
+  /** Representative scalar width (for unweighted super-edges + the arrow-size default). */
   linkWidth: number;
+  /** Per-edge width from weight (a d3 scale or constant); for super-edges, applied to accumulated weight. */
+  linkWidthOf: (weight: number) => number;
   linkStroke: string;
   arrowSize: number;
   arrowFill: string;
@@ -529,8 +588,12 @@ export interface ResolvedNetworkStyle {
    * out). Arrowheads are world-only for now (their screen-mode shader is a tracked gap, #103).
    */
   sizeMode: "world" | "screen";
+  /** Optional per-node RGBA fill (categorical module colours, #104 rework); overrides `nodeFill` when set. */
+  nodeColors?: Uint8Array;
   /** Flow-border ring (#104 N6), or `null` when disabled (plain filled nodes). */
   flowBorder: ResolvedFlowBorder | null;
+  /** Constant border ring (#104 rework), or `null`; used when no flow border is set. */
+  constBorder: ConstBorder | null;
   /**
    * Link bend (#104 N6c): quadratic-bezier control offset ⟂ to the chord, as a fraction of chord
    * length. `0` (default) ⇒ straight links; non-zero bows links into curves, and directed links get
@@ -551,7 +614,7 @@ export function networkLayers(graph: NetworkGraph, style: ResolvedNetworkStyle):
     layers.push({
       name: "links",
       primitive: "lines",
-      lines: linkLines(graph, { width: style.linkWidth, stroke: style.linkStroke, bend }),
+      lines: linkLines(graph, { widthOf: style.linkWidthOf, stroke: style.linkStroke, bend }),
       sizeMode: style.sizeMode,
     });
     if (style.directed) {
@@ -569,7 +632,13 @@ export function networkLayers(graph: NetworkGraph, style: ResolvedNetworkStyle):
   layers.push({
     name: "nodes",
     primitive: "circles",
-    circles: nodeCircles(graph, { radii: style.nodeRadii, fill: style.nodeFill, border: style.flowBorder }),
+    circles: nodeCircles(graph, {
+      radii: style.nodeRadii,
+      fill: style.nodeFill,
+      colors: style.nodeColors,
+      border: style.flowBorder,
+      constBorder: style.constBorder,
+    }),
     sizeMode: style.sizeMode,
   });
   return layers;
@@ -588,8 +657,8 @@ export function emitNodes(g: GroupBuilder, graph: NetworkGraph, radii: Float32Ar
   }
 }
 
-/** Emit each link as a stroked drawable, keyed by edge index. With `bend` it bows into a quadratic bezier (#104 N6c). */
-export function emitLinks(g: GroupBuilder, graph: NetworkGraph, width: number, bend = 0): void {
+/** Emit each link as a stroked drawable, keyed by edge index; width from its weight via `widthOf`. With `bend` it bows into a quadratic bezier (#104 N6c). */
+export function emitLinks(g: GroupBuilder, graph: NetworkGraph, widthOf: (weight: number) => number, bend = 0): void {
   for (let e = 0; e < graph.edgeCount; e++) {
     const s = graph.source[e]!;
     const t = graph.target[e]!;
@@ -597,6 +666,7 @@ export function emitLinks(g: GroupBuilder, graph: NetworkGraph, width: number, b
     const sy = graph.positions[s * 2 + 1]!;
     const tx = graph.positions[t * 2]!;
     const ty = graph.positions[t * 2 + 1]!;
+    const width = widthOf(graph.weight[e]!);
     g.drawable(
       e,
       (ctx) => {

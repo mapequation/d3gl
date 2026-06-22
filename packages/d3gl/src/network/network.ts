@@ -1,5 +1,6 @@
 import { BaseEngine, type BaseEngineOptions } from "../map/base-engine.js";
-import { networkLayers, frontierCircles, superEdgeLines, bentSuperEdges, emitNodes, emitLinks, emitArrows, resolveNodeRadii, resolveFlowBorder, flowBorderInnerRadii, type ResolvedNetworkStyle, type NodeRadiusSpec, type FlowBorderSpec } from "./glyphs.js";
+import { networkLayers, frontierCircles, superEdgeLines, bentSuperEdges, emitNodes, emitLinks, emitArrows, resolveNodeRadii, resolveFlowBorder, resolveNodeColors, flowBorderInnerRadii, type ResolvedNetworkStyle, type NodeRadiusSpec, type FlowBorderSpec, type ConstBorder, type LinkWidthSpec } from "./glyphs.js";
+import { rgb } from "d3-color";
 import { ForceLayout, seedPositions, type ForceParams } from "./force.js";
 import { multilevelLayout, type CoarsenOptions } from "./coarsen.js";
 import { buildLODTree, buildSpatialLODTree, computeLODGeometry, computeLODStyle, cut, declutterFrontier, type LODTree, type SpatialLODOptions } from "./lod.js";
@@ -23,10 +24,26 @@ export interface NetworkStyle {
    * @see {@link NodeRadiusSpec}
    */
   nodeRadius?: NodeRadiusSpec;
-  /** Node fill colour (any CSS color). Default a medium blue. */
-  nodeFill?: string;
-  /** Link width in world units. Default 1. */
-  linkWidth?: number;
+  /**
+   * Node fill colour. A single CSS colour (default a medium blue), or a per-node
+   * `(index, graph) => cssColour` accessor — e.g. a categorical palette keyed by module, so a
+   * planted hierarchy reads as colour (#104 rework). Per-node colours propagate to LOD aggregates
+   * (a collapsed module keeps its colour).
+   */
+  nodeFill?: string | ((index: number, graph: NetworkGraph) => string);
+  /**
+   * Constant border ring (#104 rework): a fixed **pixel** outline on every node/module (e.g.
+   * `{ width: 1, color: "#fff" }`). Independent of {@link flowBorder} (which encodes flow);
+   * `flowBorder` wins if both are set.
+   */
+  nodeBorder?: { width: number; color?: string };
+  /**
+   * Link width. A constant (default 1), or a **d3 scale of the edge weight** — `(weight) => width`,
+   * e.g. `scaleSqrt().domain([0, maxWeight]).range([0.5, 6])` — analogous to {@link nodeRadius}. A
+   * **super-edge** applies the same scale to the **accumulated** weight of the edges it subsumes, so
+   * link thickness reads as flow at every LOD level.
+   */
+  linkWidth?: LinkWidthSpec;
   /** Link stroke colour (any CSS color). Default a light grey. */
   linkStroke?: string;
   /** Arrowhead size (world units) for directed links. Default 3 × linkWidth. */
@@ -142,6 +159,17 @@ const DEFAULT_LINK_STROKE = "#999999";
 const LAYER_NAMES = ["links", "arrows", "nodes"] as const;
 const DEFAULT_FORCE_ITERATIONS = 300;
 
+/** Any CSS colour → RGBA bytes (for the constant-border colour). */
+function rgbaBytes(css: string): [number, number, number, number] {
+  const c = rgb(css);
+  return [
+    Math.round(c.r) & 255,
+    Math.round(c.g) & 255,
+    Math.round(c.b) & 255,
+    Math.round((Number.isNaN(c.opacity) ? 1 : c.opacity) * 255) & 255,
+  ];
+}
+
 /**
  * The network rendering engine (epic #98). A dedicated engine — nodes, links,
  * layout, and LOD are one coupled system — built on the shared {@link BaseEngine}
@@ -176,8 +204,6 @@ export class Network extends BaseEngine {
   private lodSpatial = false;
   /** Whether the current `lodTree` was built from a provided module hierarchy (N6 / #104). */
   private lodModules = false;
-  /** Max directed super-edge flow in the current module tree (#104 N6c), to normalise bent-link widths. */
-  private lodMaxSuperFlow = 0;
   /** True while a worker-LOD run is in flight (launched, not yet settled/stopped) — it will stream the tree. */
   private lodStreaming = false;
   /** Dedup guard for the one-shot deferred main-thread LOD-tree fallback (see {@link scheduleLODFallback}). */
@@ -212,7 +238,10 @@ export class Network extends BaseEngine {
   style(style: NetworkStyle): this {
     this.styleOpts = { ...this.styleOpts, ...style };
     this.resolvedCache = null; // radii/colours/sizeMode changed
-    if (this.lodOptions) this.recomputeLODGeometry(); // node radii feed the LOD tree's draw radii
+    // Refresh the LOD tree's style geometry (radii/colours) only if a tree already exists. Don't
+    // *build* one here: after a data() change the tree is null and the provided modules may not yet
+    // match the new graph (lod() supplies fresh ones next) — building now would mismatch and throw.
+    if (this.lodOptions && (this.lodTree || this.lodWorkerTree)) this.recomputeLODGeometry();
     return this.rebuild();
   }
 
@@ -466,13 +495,12 @@ export class Network extends BaseEngine {
     if (opts.superEdges !== false && this.graph!.edgeCount > 0) {
       if (this.lodModules && style.linkBend !== 0 && tree.superEdgeOffset) {
         // Map register (#104 N6c): bent half-arrow inter-module links from the directed, flow-weighted
-        // super-edge adjacency; width ∝ √flow (normalised to the max), half-arrows when directed.
-        const maxFlow = this.lodMaxSuperFlow || 1;
+        // super-edge adjacency. Width comes from the same weight scale as raw links, applied to each
+        // super-edge's accumulated subsumed weight; half-arrows when directed.
         const { lines, arrows } = bentSuperEdges(tree, frontier, {
-          width: style.linkWidth,
+          widthOf: style.linkWidthOf,
           stroke: style.linkStroke,
           bend: style.linkBend,
-          flowScale: (f) => style.linkWidth * Math.sqrt(f / maxFlow),
           directed: style.directed,
           arrowSize: style.arrowSize,
           arrowFill: style.arrowFill,
@@ -490,6 +518,8 @@ export class Network extends BaseEngine {
       aggregateFill: opts.aggregateFill ?? style.nodeFill,
       maxAggregateRadius: opts.maxAggregateRadius,
       border: style.flowBorder,
+      constBorder: style.constBorder,
+      useTreeColor: !!style.nodeColors, // categorical module colours, propagated to aggregates
     });
     layers.push({ name: "nodes", primitive: "circles", circles, sizeMode: style.sizeMode });
     return layers;
@@ -517,8 +547,9 @@ export class Network extends BaseEngine {
     const resolved = this.resolvedStyleCached(this.graph);
     const nodeRadii = resolved.nodeRadii;
     const leafBorder = resolved.flowBorder?.metric; // per-leaf flow metric; sum-aggregated onto the tree
+    const leafColors = resolved.nodeColors; // per-leaf RGBA; averaged onto aggregates
     if (this.lodWorkerTree) {
-      computeLODStyle(this.lodWorkerTree, nodeRadii, this.graph.strength, leafBorder);
+      computeLODStyle(this.lodWorkerTree, nodeRadii, this.graph.strength, leafBorder, leafColors);
       this.lodTree = this.lodWorkerTree;
       this.lodHasGeometry = true;
       return;
@@ -532,13 +563,9 @@ export class Network extends BaseEngine {
       // Priority chain (epic #98): provided module hierarchy → structural coarsening → spatial
       // quadtree fallback. A provided tree (N6 / #104) is position-independent, like coarsening.
       if (this.lodOptions.modules) {
-        // Pass the graph's directed edges so the tree also carries flow-weighted super-edges for the
-        // bent half-arrow map links (#104 N6c); cache their max flow to normalise link widths.
+        // Pass the graph's directed edges so the tree also carries flow-weighted super-edges (the sum
+        // of subsumed edge weights per module pair) for the bent half-arrow map links (#104 N6c).
         this.lodTree = buildModuleLODTree(this.graph.nodeCount, this.lodOptions.modules, this.graph);
-        const sf = this.lodTree.superEdgeFlow;
-        let mx = 0;
-        if (sf) for (let i = 0; i < sf.length; i++) if (sf[i]! > mx) mx = sf[i]!;
-        this.lodMaxSuperFlow = mx;
         this.lodModules = true;
         this.lodSpatial = false;
       } else if (this.graph.edgeCount === 0) {
@@ -555,7 +582,7 @@ export class Network extends BaseEngine {
         this.lodModules = false;
       }
     }
-    computeLODGeometry(this.lodTree, this.graph, nodeRadii, undefined, leafBorder);
+    computeLODGeometry(this.lodTree, this.graph, nodeRadii, undefined, leafBorder, leafColors);
     this.lodHasGeometry = true;
   }
 
@@ -606,40 +633,59 @@ export class Network extends BaseEngine {
       name: "links",
       data: edgeIds,
       ids: edgeIds,
+      sizeMode: style.sizeMode,
       stroke: () => style.linkStroke,
       build: (g) => {
-        if (emit) emitLinks(g, graph, style.linkWidth, style.linkBend);
+        if (emit) emitLinks(g, graph, style.linkWidthOf, style.linkBend);
       },
     });
     this.registerLayer({
       name: "arrows",
       data: edgeIds,
       ids: edgeIds,
+      sizeMode: style.sizeMode,
       fill: () => style.arrowFill,
       build: (g) => {
         if (emit && style.directed) emitArrows(g, graph, style.arrowSize, style.nodeRadii, style.linkBend, style.linkBend !== 0);
       },
     });
-    // Flow border (#104 N6): the instanced lane draws the ring in-shader, but the Scene path has no
+    // Per-node fill: a single colour, or the per-node accessor (categorical module colours, #104 rework).
+    const fillSpec = this.styleOpts.nodeFill;
+    const fillOf = typeof fillSpec === "function" ? (i: number) => fillSpec(i, graph) : () => style.nodeFill;
+
+    // Border (#104 N6/rework): the instanced lane draws the ring in-shader, but the Scene path has no
     // per-element ring primitive — so render it as two stacked discs, a border-colour disc under a
-    // smaller fill disc (inner radius = radius − ring width). Always registered (empty when off) so
-    // toggling the border clears the layer instead of leaving it behind.
-    const border = style.flowBorder;
-    const innerRadii = border ? flowBorderInnerRadii(style.nodeRadii, border.metric, border.scale) : style.nodeRadii;
+    // smaller fill disc (inner radius = radius − ring width). Handles both the flow border (per-node
+    // width) and the constant border (fixed px). Always registered (empty when off) so toggling clears it.
+    const flow = style.flowBorder;
+    const cb = style.constBorder;
+    const borderColorCss = flow
+      ? flow.colorCss
+      : cb
+        ? `rgba(${cb.color[0]},${cb.color[1]},${cb.color[2]},${cb.color[3] / 255})`
+        : style.nodeFill;
+    const innerRadii = flow
+      ? flowBorderInnerRadii(style.nodeRadii, flow.metric, flow.scale)
+      : cb
+        ? Float32Array.from(style.nodeRadii, (r) => Math.max(0, r - Math.min(r, cb.width)))
+        : style.nodeRadii;
+    const hasBorder = !!(flow || cb);
     this.registerLayer({
       name: "node-borders",
       data: nodeIds,
       ids: nodeIds,
-      fill: () => border?.colorCss ?? style.nodeFill,
+      sizeMode: style.sizeMode,
+      fill: () => borderColorCss,
       build: (g) => {
-        if (emit && border) emitNodes(g, graph, style.nodeRadii);
+        if (emit && hasBorder) emitNodes(g, graph, style.nodeRadii);
       },
     });
     this.registerLayer({
       name: "nodes",
       data: nodeIds,
       ids: nodeIds,
-      fill: () => style.nodeFill,
+      sizeMode: style.sizeMode,
+      fill: (i) => fillOf(i as number),
       build: (g) => {
         if (emit) emitNodes(g, graph, innerRadii);
       },
@@ -653,19 +699,34 @@ export class Network extends BaseEngine {
 
   /** Apply style defaults (drawn order is decided by {@link networkLayers}). */
   private resolvedStyle(graph: NetworkGraph): ResolvedNetworkStyle {
-    const linkWidth = this.styleOpts.linkWidth ?? DEFAULT_LINK_WIDTH;
+    // linkWidth: a constant, or a scale of edge weight. `linkWidthOf` is the per-edge function;
+    // `linkWidth` is a representative scalar (constant, or the scale at weight 1) for the unweighted
+    // super-edge path and the arrow-size default.
+    const lwSpec = this.styleOpts.linkWidth ?? DEFAULT_LINK_WIDTH;
+    const linkWidthOf = typeof lwSpec === "function" ? lwSpec : () => lwSpec;
+    const linkWidth = typeof lwSpec === "number" ? lwSpec : linkWidthOf(1) || DEFAULT_LINK_WIDTH;
     const linkStroke = this.styleOpts.linkStroke ?? DEFAULT_LINK_STROKE;
-    const nodeFill = this.styleOpts.nodeFill ?? DEFAULT_NODE_FILL;
+    // nodeFill: a single colour, or a per-node accessor → packed RGBA (categorical module colours).
+    const fillSpec = this.styleOpts.nodeFill;
+    const nodeFill = typeof fillSpec === "function" ? DEFAULT_NODE_FILL : (fillSpec ?? DEFAULT_NODE_FILL);
+    const nodeColors = typeof fillSpec === "function" ? resolveNodeColors(graph, fillSpec) : undefined;
+    // Constant border (px). flowBorder wins if both are set.
+    const nb = this.styleOpts.nodeBorder;
+    const constBorder: ConstBorder | null =
+      nb && !this.styleOpts.flowBorder ? { width: nb.width, color: rgbaBytes(nb.color ?? "#ffffff") } : null;
     return {
       nodeRadii: resolveNodeRadii(graph, this.styleOpts.nodeRadius ?? DEFAULT_NODE_RADIUS),
       nodeFill,
+      nodeColors,
       linkWidth,
+      linkWidthOf,
       linkStroke,
       arrowSize: this.styleOpts.arrowSize ?? 3 * linkWidth,
       arrowFill: this.styleOpts.arrowFill ?? linkStroke,
       directed: this.styleOpts.directed ?? graph.directed,
       sizeMode: this.styleOpts.sizeMode ?? "world",
       flowBorder: this.styleOpts.flowBorder ? resolveFlowBorder(graph, this.styleOpts.flowBorder, nodeFill) : null,
+      constBorder,
       linkBend: this.styleOpts.linkBend ?? 0,
     };
   }
