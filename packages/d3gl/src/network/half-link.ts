@@ -171,6 +171,28 @@ export function halfLinkGeometry(p: HalfLinkParams): HalfLinkGeometry | null {
 }
 
 /**
+ * Uniformly scale a resolved half-arrow geometry's coordinates by `s` (about the origin). Used to
+ * "bake" a screen-space shape for the retained SVG/Canvas path: the shape is solved in **pixel** space
+ * (node centres × k, sizes in px) — because the tip length (`width^⅓`), tip width (`width^½`) and outer
+ * bend (`^0.4`) are **not** linear in size, so they can't be reproduced by pre-dividing the sizes — and
+ * the result is scaled by `1/k`, so the Scene's ×k view transform reproduces the exact pixel shape.
+ */
+export function scaleHalfLink(g: HalfLinkGeometry, s: number): HalfLinkGeometry {
+  return {
+    x0: g.x0 * s, y0: g.y0 * s,
+    x02: g.x02 * s, y02: g.y02 * s,
+    x04: g.x04 * s, y04: g.y04 * s,
+    x03: g.x03 * s, y03: g.y03 * s,
+    cp1x: g.cp1x * s, cp1y: g.cp1y * s,
+    cp2x: g.cp2x * s, cp2y: g.cp2y * s,
+    x13: g.x13 * s, y13: g.y13 * s,
+    x14: g.x14 * s, y14: g.y14 * s,
+    x11: g.x11 * s, y11: g.y11 * s,
+    x12: g.x12 * s, y12: g.y12 * s,
+  };
+}
+
+/**
  * Trace a resolved half-arrow link onto a {@link PathSink} (Canvas/SVG export), as the reference does:
  * inner-start → source centre → foot → outer edge (quadratic via `cp2`) → barb → tip → inner base →
  * inner edge (quadratic via `cp1`) → close.

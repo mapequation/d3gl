@@ -671,14 +671,12 @@ export class Network extends BaseEngine {
     // SVG/Canvas half-arrows are always world-sized: a screen-mode shape that spans two
     // independently-projected node anchors can't be expressed by the retained Scene's per-drawable
     // anchor (only the WebGL lane recomputes it per frame). To still match the WebGL *screen* look for
-    // export, we BAKE the shape at the current zoom: dividing the decoration sizes by k means the
-    // Scene's ×k view transform reproduces the constant-px appearance. The bake is refreshed on backend
-    // switch (here) and at interaction-end (see setInteracting) / on demand (syncScreenGeometry).
-    const screenHalf = halfArrow && style.sizeMode === "screen";
-    const k = this.transform.k || 1;
-    const haRadii = screenHalf ? Float32Array.from(style.nodeRadii, (r) => r / k) : style.nodeRadii;
-    const haWidthOf = screenHalf ? (w: number) => style.linkWidthOf(w) / k : style.linkWidthOf;
-    const haBend = screenHalf ? style.linkBend / k : style.linkBend;
+    // export, we BAKE the shape at the current zoom: emitHalfLinks solves it in pixel space (positions ×
+    // k, px sizes) and scales the result by 1/k, so the Scene's ×k view transform reproduces the exact
+    // constant-px render — including the non-linear tip/bend terms a naive per-size ÷k would distort
+    // (the gap would grow with zoom). Refreshed on backend switch (here), at interaction-end
+    // (setInteracting) and on demand (syncScreenGeometry).
+    const bake = halfArrow && style.sizeMode === "screen" ? this.transform.k || 1 : 1;
     this.registerLayer({
       name: "links",
       data: edgeIds,
@@ -687,7 +685,7 @@ export class Network extends BaseEngine {
       ...(halfArrow ? { fill: (e) => linkColorAt(e as number) } : { stroke: (e) => linkColorAt(e as number) }),
       build: (g) => {
         if (!emit) return;
-        if (halfArrow) emitHalfLinks(g, graph, haRadii, haWidthOf, haBend);
+        if (halfArrow) emitHalfLinks(g, graph, style.nodeRadii, style.linkWidthOf, style.linkBend, bake);
         else emitLinks(g, graph, style.linkWidthOf, style.linkBend);
       },
     });
