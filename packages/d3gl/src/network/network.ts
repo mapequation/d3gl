@@ -799,11 +799,18 @@ export class Network extends BaseEngine {
   /** Apply style defaults (drawn order is decided by {@link networkLayers}). */
   private resolvedStyle(graph: NetworkGraph): ResolvedNetworkStyle {
     // linkWidth: a constant, a (weight)=>width scale, or {by,scale}. `linkWidthOf` is the per-edge
-    // function; `linkWidth` is a representative scalar (constant, or the scale at weight 1) for the
-    // unweighted super-edge path and the arrow-size default.
+    // function; `linkWidth` is a representative scalar (for the uniform super-edge path + the arrow-size
+    // default). Evaluate the scale at the **mean edge weight** — an in-domain value — so a flow-domain
+    // scale (tiny weights) isn't extrapolated to a huge width (which blew up the structural super-edges).
     const lwSpec = this.styleOpts.linkWidth ?? DEFAULT_LINK_WIDTH;
     const linkWidthOf = resolveLinkWidthOf(lwSpec);
-    const linkWidth = typeof lwSpec === "number" ? lwSpec : linkWidthOf(1) || DEFAULT_LINK_WIDTH;
+    let meanWeight = 1;
+    if (graph.edgeCount > 0) {
+      let sum = 0;
+      for (let e = 0; e < graph.edgeCount; e++) sum += graph.weight[e]!;
+      meanWeight = sum / graph.edgeCount;
+    }
+    const linkWidth = typeof lwSpec === "number" ? lwSpec : linkWidthOf(meanWeight) || DEFAULT_LINK_WIDTH;
     // linkStroke: a single colour, or a (weight)=>colour scale. `linkColorOf` packs RGBA bytes for
     // the WebGL lane; `linkStrokeOf` gives the CSS for the Scene path; `linkStroke` is representative.
     const lsSpec: LinkColorSpec = this.styleOpts.linkStroke ?? DEFAULT_LINK_STROKE;

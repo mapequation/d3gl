@@ -50,10 +50,10 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
 
   net.data(graph).layout({ backend: "force", iterations: 320 });
 
-  // Frame the laid-out map: centre on the centroid, size from the 97th-percentile radius (so a
-  // force-layout fling-out doesn't shrink everything). Zoom out → modules collapse into the map of
-  // modules; zoom in → they expand to sub-members and leaves. (setTransform before enableZoom so the
-  // first gesture doesn't jump.)
+  // Rather than a custom fit transform, **scale the layout** to fill the view at the default zoom — so
+  // the map opens framed and World/Screen sizing don't change the apparent scale (the transform stays
+  // k=1). Centre on the centroid and size from the 97th-percentile radius (robust to force-layout
+  // fling-outs). Modules collapse into the map of modules here; zoom in to expand them.
   const p = graph.positions;
   let cx = 0;
   let cy = 0;
@@ -65,9 +65,13 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
   cy /= graph.nodeCount;
   const dists = Array.from({ length: graph.nodeCount }, (_, i) => Math.hypot(p[i * 2]! - cx, p[i * 2 + 1]! - cy)).sort((a, b) => a - b);
   const R = dists[Math.floor(graph.nodeCount * 0.97)] || 1;
-  const k = (Math.min(width, height) / (2 * R)) * 0.85;
-  net.setTransform({ k, x: width / 2 - k * cx, y: height / 2 - k * cy });
-  net.enableZoom([k * 0.2, k * 30]); // out to the module map, in to single nodes
+  const s = (Math.min(width, height) / 2) * 0.85 / R; // scale the 97th-pct extent to ~0.85 of half the view
+  for (let i = 0; i < graph.nodeCount; i++) {
+    p[i * 2] = width / 2 + (p[i * 2]! - cx) * s;
+    p[i * 2 + 1] = height / 2 + (p[i * 2 + 1]! - cy) * s;
+  }
+  net.layout({ backend: "positions", positions: p }); // commit the scaled layout at the default k=1 view
+  net.enableZoom([0.1, 40]); // default view; zoom out to the module map, in to single nodes
 
   return {
     engine: net,
