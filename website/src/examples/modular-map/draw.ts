@@ -1,5 +1,5 @@
 import { network, buildGraph, moduleColors } from "@mapequation/d3gl/network";
-import { scaleSqrt, scaleLinear } from "d3-scale";
+import { scaleSqrt } from "d3-scale";
 import type { ImperativeSetup } from "../types.js";
 import { loadModularMap } from "./data.js";
 
@@ -36,12 +36,17 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
   // Range minimums ≥ 1 so nodes/links never vanish (the ring may be 0 for interior nodes).
   const nodeR = scaleSqrt().domain([0, maxNodeFlow]).range([3, 26]);
   const ringW = scaleSqrt().domain([0, maxEnter]).range([0, 6]);
-  const linkW = scaleSqrt().domain([0, maxLink]).range([1, 10]);
-  // Link colour: the half-arrow example's blue, semi-transparent so overlaps read as density (not
-  // black); alpha grows with flow alongside the width. Returning rgba keeps the alpha (a colour scale
-  // would drop it).
-  const linkAlpha = scaleLinear().domain([0, maxLink]).range([0.35, 0.85]).clamp(true);
-  const linkStroke = (w: number) => `rgba(65, 142, 199, ${linkAlpha(w).toFixed(3)})`;
+  const linkW = scaleSqrt().domain([0, maxLink]).range([0.75, 6]); // thinner half-arrows
+  // Link colour encodes flow like the half-arrow example — light → dark blue with flow — and is
+  // semi-transparent (alpha also ∝ flow) so overlaps read as density, not black. So a reciprocal pair
+  // shows its asymmetry in both width AND colour. (Manual lerp keeps the alpha a colour scale drops.)
+  const linkStroke = (w: number) => {
+    const t = Math.sqrt(Math.min(1, w / maxLink));
+    const r = Math.round(150 - 110 * t);
+    const g = Math.round(186 - 96 * t);
+    const b = Math.round(221 - 60 * t);
+    return `rgba(${r}, ${g}, ${b}, ${(0.4 + 0.5 * t).toFixed(3)})`;
+  };
 
   net.data(graph).layout({ backend: "force", iterations: 320 });
 
@@ -68,7 +73,7 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
     engine: net,
     render: (options) => {
       const sizeMode = options.sizing === "World" ? "world" : "screen";
-      const expandPx = (options.expand as number) ?? 48;
+      const expandPx = (options.expand as number) ?? 120;
       const maxAggregateRadius = (options.maxAgg as number) ?? 28;
       const declutter = options.declutter !== "Off";
       net.style({
@@ -84,14 +89,16 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
         linkStroke, // semi-transparent blue, alpha ∝ flow
       });
       const mode = (options.lod as string) ?? "Modules";
+      // A thin outline ring, set a few px outside the glyph, marks collapsed aggregates as expandable.
+      const aggregateOutline = { width: 1.5, gap: 3 };
       if (mode === "Off") {
         net.lod(false);
       } else if (mode === "Standard") {
         // Structural coarsening — no module info; aggregates joined by plain super-edge lines.
-        net.lod({ expandPx, maxAggregateRadius, declutter });
+        net.lod({ expandPx, maxAggregateRadius, declutter, aggregateOutline });
       } else {
         // The planted partition drives the cut → directed half-arrow super-edges ∝ accumulated flow.
-        net.lod({ modules: d.modulePaths, expandPx, maxAggregateRadius, declutter, superEdges: true });
+        net.lod({ modules: d.modulePaths, expandPx, maxAggregateRadius, declutter, superEdges: true, aggregateOutline });
       }
     },
   };

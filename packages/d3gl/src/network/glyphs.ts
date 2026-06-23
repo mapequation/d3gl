@@ -431,6 +431,52 @@ export function frontierCircles(tree: LODTree, frontier: Uint32Array, style: Fro
   return base;
 }
 
+/** Resolved aggregate-outline style: a `width`-px ring `gap` px outside aggregate glyphs, in `color`. */
+export interface AggregateOutlineResolved {
+  width: number;
+  gap: number;
+  color: string;
+  maxAggregateRadius?: number;
+}
+
+/**
+ * Concentric **outline rings** around the LOD frontier's **aggregate** glyphs only (collapsed modules
+ * / subtrees, not leaves), set a `gap` px *outside* each glyph so a thin ring floats around it — a
+ * "this is a collapsed module, zoom to expand" cue that leaf nodes don't get. Built as a ring (a circle
+ * with transparent fill + a `width`-px border) so the gap shows through; drawn as its own
+ * instanced-circles layer *under* the nodes. WebGL/LOD-only (the vector full-graph draw has no aggregates).
+ */
+export function frontierHalos(tree: LODTree, frontier: Uint32Array, style: AggregateOutlineResolved): InstancedCirclesData {
+  const maxAgg = style.maxAggregateRadius ?? Infinity;
+  const idx: number[] = [];
+  for (let i = 0; i < frontier.length; i++) {
+    const g = frontier[i]!;
+    if (!(g < tree.leafCount || tree.count[g] === 1)) idx.push(i); // aggregates only (not leaves / 1-child cells)
+  }
+  const count = idx.length;
+  const centers = new Float32Array(count * 2);
+  const radii = new Float32Array(count);
+  const borders = new Float32Array(count);
+  const ring = toRGBA(style.color);
+  const borderColors = new Uint8Array(count * 4);
+  for (let k = 0; k < count; k++) {
+    const g = frontier[idx[k]!]!;
+    centers[k * 2] = tree.cx[g]!;
+    centers[k * 2 + 1] = tree.cy[g]!;
+    // Outer radius = glyph radius + gap + ring width; the ring occupies the outer `width` px, the gap
+    // and the glyph's own area are transparent (a circle with no fill, only a border).
+    const outer = Math.min(tree.radius[g]!, maxAgg) + style.gap + style.width;
+    radii[k] = outer;
+    borders[k] = outer > 0 ? style.width / outer : 0;
+    borderColors[k * 4] = ring[0];
+    borderColors[k * 4 + 1] = ring[1];
+    borderColors[k * 4 + 2] = ring[2];
+    borderColors[k * 4 + 3] = ring[3];
+  }
+  // Transparent fill (alpha 0) so only the border ring shows, leaving a gap to the glyph inside it.
+  return { centers, radii, colors: new Uint8Array(count * 4), borders, borderColors, count };
+}
+
 export interface SuperEdgeStyleResolved {
   width: number;
   stroke: string;

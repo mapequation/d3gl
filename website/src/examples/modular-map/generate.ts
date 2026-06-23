@@ -17,20 +17,37 @@ import { randomWalkFlow } from "../../../../packages/d3gl/src/network/flow.ts";
 const N = 500;
 const lfr = generateLFR(N, { mu: 0.1, avgDegree: 10, minCommunity: 18, seed: 42 });
 
-// Directed: each undirected edge → a reciprocal pair (weight 1 each).
+// Deterministic PRNG (mulberry32) for reproducible asymmetric edge weights.
+function mulberry32(seed: number): () => number {
+  let s = seed >>> 0;
+  return () => {
+    s = (s + 0x6d2b79f5) | 0;
+    let t = Math.imul(s ^ (s >>> 15), 1 | s);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+const rng = mulberry32(7);
+
+// Directed: each undirected edge → a reciprocal pair with **asymmetric** weights, so the two
+// half-arrows of a pair carry genuinely different flow (a→b ≠ b→a) and the map reads as directed.
 const src: number[] = [];
 const tgt: number[] = [];
+const w: number[] = [];
+const draw = () => 0.3 + 4 * rng() * rng(); // skewed [0.3, ~4.3): most light, some heavy
 for (let e = 0; e < lfr.source.length; e++) {
   const a = lfr.source[e]!;
   const b = lfr.target[e]!;
   src.push(a, b);
   tgt.push(b, a);
+  w.push(draw(), draw());
 }
 const source = Uint32Array.from(src);
 const target = Uint32Array.from(tgt);
+const weight = Float32Array.from(w);
 
 // Authoritative random-walk flow (Infomap convention), then per-link + per-node boundary flow.
-const { nodeFlow, linkFlow } = randomWalkFlow({ nodeCount: N, source, target }, { tau: 0.15 });
+const { nodeFlow, linkFlow } = randomWalkFlow({ nodeCount: N, source, target, weight }, { tau: 0.15 });
 const enterExit = new Float64Array(N);
 for (let e = 0; e < source.length; e++) {
   const a = source[e]!;

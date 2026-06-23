@@ -1,5 +1,5 @@
 import { BaseEngine, type BaseEngineOptions } from "../map/base-engine.js";
-import { networkLayers, frontierCircles, superEdgeLines, bentSuperEdges, halfArrowSuperEdges, emitNodes, emitLinks, emitArrows, emitHalfLinks, resolveNodeRadii, resolveFlowBorder, resolveNodeColors, resolveLinkWidthOf, resolveLinkColorOf, flowBorderInnerRadii, type ResolvedNetworkStyle, type NodeRadiusSpec, type FlowBorderSpec, type ConstBorder, type LinkWidthSpec, type LinkColorSpec, type LinkStyle } from "./glyphs.js";
+import { networkLayers, frontierCircles, frontierHalos, superEdgeLines, bentSuperEdges, halfArrowSuperEdges, emitNodes, emitLinks, emitArrows, emitHalfLinks, resolveNodeRadii, resolveFlowBorder, resolveNodeColors, resolveLinkWidthOf, resolveLinkColorOf, flowBorderInnerRadii, type ResolvedNetworkStyle, type NodeRadiusSpec, type FlowBorderSpec, type ConstBorder, type LinkWidthSpec, type LinkColorSpec, type LinkStyle } from "./glyphs.js";
 import { rgb } from "d3-color";
 import { ForceLayout, seedPositions, type ForceParams } from "./force.js";
 import { multilevelLayout, type CoarsenOptions } from "./coarsen.js";
@@ -150,6 +150,13 @@ export interface NetworkLODOptions {
   /** Spacing multiplier for {@link declutter} (>1 sparser, <1 denser). Default 1. */
   declutterSpacing?: number;
   /**
+   * Mark **aggregate** glyphs (collapsed modules/subtrees, not leaves) with a thin outline **ring** set
+   * a `gap` px outside the glyph, so it reads as expandable — distinguishing a collapsed module from an
+   * individual node at intermediate zoom. `width`/`gap` in px (default 1.5 / 2.5), `color` any CSS
+   * colour (default a dark neutral). Omit to disable.
+   */
+  aggregateOutline?: { width?: number; gap?: number; color?: string };
+  /**
    * Draw **super-edges**: links between visible frontier nodes (leaf↔leaf via the graph, aggregate↔
    * aggregate via the coarse adjacency), summarising connectivity at the current LOD. Uses
    * `linkWidth`/`linkStroke`. Default `true`. (Same-level pairs only for now; see {@link superEdgeLines}.)
@@ -168,7 +175,7 @@ const DEFAULT_NODE_RADIUS = 4;
 const DEFAULT_NODE_FILL = "#4878d0";
 const DEFAULT_LINK_WIDTH = 1;
 const DEFAULT_LINK_STROKE = "#999999";
-const LAYER_NAMES = ["links", "arrows", "nodes"] as const;
+const LAYER_NAMES = ["links", "arrows", "node-halos", "nodes"] as const;
 const DEFAULT_FORCE_ITERATIONS = 300;
 
 /** Any CSS colour → RGBA bytes (for the constant-border colour). */
@@ -541,6 +548,17 @@ export class Network extends BaseEngine {
         const lines = superEdgeLines(this.graph!, tree, frontier, { width: style.linkWidth, stroke: style.linkStroke });
         if (lines.count > 0) layers.push({ name: "links", primitive: "lines", lines, sizeMode: style.sizeMode });
       }
+    }
+    // Aggregate-outline affordance: a halo ring behind collapsed-module glyphs (not leaves), under the
+    // nodes, so a module reads as expandable. WebGL/LOD-only (the vector full-graph draw has no aggregates).
+    if (opts.aggregateOutline) {
+      const halos = frontierHalos(tree, frontier, {
+        width: opts.aggregateOutline.width ?? 1.5,
+        gap: opts.aggregateOutline.gap ?? 2.5,
+        color: opts.aggregateOutline.color ?? "#3a3f52",
+        maxAggregateRadius: opts.maxAggregateRadius,
+      });
+      if (halos.count > 0) layers.push({ name: "node-halos", primitive: "circles", circles: halos, sizeMode: style.sizeMode });
     }
     const circles = frontierCircles(tree, frontier, {
       nodeFill: style.nodeFill,
