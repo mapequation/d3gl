@@ -477,205 +477,70 @@ export function frontierHalos(tree: LODTree, frontier: Uint32Array, style: Aggre
   return { centers, radii, colors: new Uint8Array(count * 4), borders, borderColors, count };
 }
 
+/** Resolved style for LOD super-edges — the same channels as raw links, applied to accumulated flow. */
 export interface SuperEdgeStyleResolved {
-  width: number;
-  stroke: string;
-}
-
-/**
- * Instanced line data for **super-edges**: every same-level edge incident to a *visible* frontier
- * node is drawn — a visible node keeps all its edges, so connections don't vanish when a neighbour
- * scrolls off-screen or is decluttered away (the edge is drawn toward the neighbour's position).
- * When both endpoints are visible the edge is deduped (`g < h`); when only one is visible it is drawn
- * once from the visible side. Leaf neighbours come from the graph CSR (a leaf's global id is its node
- * id); aggregate neighbours from the tree's coarse adjacency. Cross-level pairs (a node linked to a
- * region shown at a different LOD level) are approximated to the neighbour's centroid for now.
- */
-export function superEdgeLines(
-  graph: NetworkGraph,
-  tree: LODTree,
-  frontier: Uint32Array,
-  style: SuperEdgeStyleResolved,
-): InstancedLinesData {
-  const present = new Uint8Array(tree.size);
-  for (let i = 0; i < frontier.length; i++) present[frontier[i]!] = 1;
-
-  const a: number[] = [];
-  const b: number[] = [];
-  const { offsets, neighbors } = graph.csr;
-  for (let i = 0; i < frontier.length; i++) {
-    const g = frontier[i]!;
-    const leaf = g < tree.leafCount;
-    const from = leaf ? offsets[g]! : tree.edgeOffset[g]!;
-    const to = leaf ? offsets[g + 1]! : tree.edgeOffset[g + 1]!;
-    for (let p = from; p < to; p++) {
-      const h = leaf ? neighbors[p]! : tree.edgeNeighbors[p]!;
-      // Both visible → emit once (from the smaller id). Neighbour hidden → emit from the visible g.
-      if (present[h] ? g < h : true) {
-        a.push(g);
-        b.push(h);
-      }
-    }
-  }
-
-  const count = a.length;
-  const sources = new Float32Array(count * 2);
-  const targets = new Float32Array(count * 2);
-  for (let e = 0; e < count; e++) {
-    const g = a[e]!;
-    const h = b[e]!;
-    sources[e * 2] = tree.cx[g]!;
-    sources[e * 2 + 1] = tree.cy[g]!;
-    targets[e * 2] = tree.cx[h]!;
-    targets[e * 2 + 1] = tree.cy[h]!;
-  }
-  const widths = new Float32Array(count).fill(style.width);
-  return { sources, targets, widths, colors: fillColors(count, style.stroke), count };
-}
-
-export interface BentSuperEdgeStyleResolved {
-  /** Width from a super-edge's **accumulated** subsumed weight (the same scale as raw links). */
-  widthOf: (weight: number) => number;
-  stroke: string;
-  /** Bend (fraction of chord) for the bezier links. */
-  bend: number;
-  /** Draw one-sided half-arrowheads (directed maps). */
+  /** `"line"` (bent/straight + optional arrowhead) or `"half-arrow"` (fused, directed). */
+  linkStyle: LinkStyle;
   directed: boolean;
-  arrowSize: number;
-  /** Aggregate draw-radius cap, so a head sits at the (capped) module boundary, not its centre. */
-  maxAggregateRadius?: number;
-}
-
-/**
- * Instanced **bent half-arrow super-edges** for the map register (#104 N6c): inter-module links drawn
- * from the tree's directed, flow-weighted {@link LODTree.superEdgeOffset} adjacency. For each visible
- * frontier node, its directed super-edges to *also-visible* nodes are emitted as bezier strips (width
- * ∝ √flow via `flowScale`); on a directed map each gets a one-sided half-arrow set back to the target
- * module's boundary, so reciprocal links bow apart. Returns both layers (lines under arrows).
- */
-export function bentSuperEdges(
-  tree: LODTree,
-  frontier: Uint32Array,
-  style: BentSuperEdgeStyleResolved,
-): { lines: InstancedLinesData; arrows: InstancedArrowsData } {
-  const off = tree.superEdgeOffset;
-  const tgt = tree.superEdgeTarget;
-  const flw = tree.superEdgeFlow;
-  const present = new Uint8Array(tree.size);
-  for (let i = 0; i < frontier.length; i++) present[frontier[i]!] = 1;
-
-  const aS: number[] = [];
-  const bS: number[] = [];
-  const wS: number[] = [];
-  if (off && tgt && flw) {
-    for (let i = 0; i < frontier.length; i++) {
-      const g = frontier[i]!;
-      for (let p = off[g]!; p < off[g + 1]!; p++) {
-        const h = tgt[p]!;
-        if (present[h]) {
-          aS.push(g);
-          bS.push(h);
-          wS.push(flw[p]!);
-        }
-      }
-    }
-  }
-
-  const count = aS.length;
-  const maxAgg = style.maxAggregateRadius ?? Infinity;
-  const drawnRadius = (g: number): number => (g < tree.leafCount ? tree.radius[g]! : Math.min(tree.radius[g]!, maxAgg));
-
-  const sources = new Float32Array(count * 2);
-  const targets = new Float32Array(count * 2);
-  const widths = new Float32Array(count);
-  const bends = new Float32Array(count).fill(style.bend);
-  const aTargets = new Float32Array(count * 2);
-  const aSizes = new Float32Array(count).fill(style.arrowSize);
-  const aBends = new Float32Array(count).fill(style.bend);
-  for (let e = 0; e < count; e++) {
-    const g = aS[e]!;
-    const h = bS[e]!;
-    const sx = tree.cx[g]!;
-    const sy = tree.cy[g]!;
-    const tx = tree.cx[h]!;
-    const ty = tree.cy[h]!;
-    sources[e * 2] = sx;
-    sources[e * 2 + 1] = sy;
-    targets[e * 2] = tx;
-    targets[e * 2 + 1] = ty;
-    widths[e] = style.widthOf(wS[e]!); // accumulated subsumed weight → width
-    // Arrow tip set back to the target module's boundary along the bezier end-tangent.
-    const [ux, uy] = bentEndTangent(sx, sy, tx, ty, style.bend);
-    const setback = drawnRadius(h);
-    aTargets[e * 2] = tx - ux * setback;
-    aTargets[e * 2 + 1] = ty - uy * setback;
-  }
-
-  const lines: InstancedLinesData = { sources, targets, widths, colors: fillColors(count, style.stroke), bends, samples: BENT_SAMPLES, count };
-  // The arrowhead belongs to its link, so it always takes the link colour (no separate arrow fill).
-  const arrows: InstancedArrowsData = style.directed
-    ? { sources, targets: aTargets, sizes: aSizes, colors: fillColors(count, style.stroke), bends: aBends, half: true, count }
-    : { sources: new Float32Array(0), targets: new Float32Array(0), sizes: new Float32Array(0), colors: new Uint8Array(0), count: 0 };
-  return { lines, arrows };
-}
-
-export interface HalfArrowSuperEdgeStyleResolved {
-  /** Width from a super-edge's **accumulated** subsumed flow (the same scale as raw links). */
+  /** Width from a super-edge's accumulated subsumed flow (the same scale as raw links). */
   widthOf: (weight: number) => number;
   /** Colour from the accumulated flow (the same scale as raw links). */
   colorOf: (weight: number) => [number, number, number, number];
-  /** Bend (world or px per sizeMode; sign handled in-shader). */
+  /** Bend: a fraction of chord for `"line"`, an absolute (world/px) offset for `"half-arrow"` — as for raw links. */
   bend: number;
-  /** Aggregate draw-radius cap, so a head sits at the (capped) module boundary, not its centre. */
+  /** Arrowhead size for the directed `"line"` style. */
+  arrowSize: number;
+  /** Aggregate draw-radius cap, so a tip/setback sits at the (capped) module boundary, not its centre. */
   maxAggregateRadius?: number;
 }
 
 /**
- * Instanced **half-arrow super-edges** for the directed map register (#104 N6): inter-module links
- * drawn from the tree's directed, flow-weighted {@link LODTree.superEdgeOffset} adjacency as fused
- * half-arrow glyphs (the same primitive as raw links). For each visible frontier node, its directed
- * super-edges to *also-visible* nodes are emitted: source/target are the module centroids, `r0`/`r1`
- * their (capped) draw radii (so the tip lands on the target module's boundary), width/colour come from
- * the **accumulated subsumed flow**, and reciprocal super-edges find each other for `oppositeWidth`, so
- * a module pair's two arrows nest. The instanced lane honours `sizeMode` (screen-projected in-shader).
+ * Instanced LOD **super-edges**, unified across tree types and link styles (#104 N6). Links are
+ * gathered from the tree's directed, flow-weighted super-edge CSR — built identically for a coarsening
+ * tree and a module tree (so the edge-LOD logic is one path, not two) — between **both-visible**
+ * frontier nodes only, so an edge never dangles to an off-frontier node. Width + colour come from the
+ * **accumulated subsumed flow** at whatever level is visible. Rendered as fused **half-arrows**
+ * (`linkStyle: "half-arrow"`, directed — reciprocals nest, tip on the target boundary) or as bent/
+ * straight **lines** + (directed) one-sided arrowheads — the same glyph choice the non-LOD path makes.
+ * Returns whichever layers apply; `{}` when the tree has no super-edge CSR (e.g. the spatial tree).
  */
-export function halfArrowSuperEdges(tree: LODTree, frontier: Uint32Array, style: HalfArrowSuperEdgeStyleResolved): InstancedHalfArrowsData {
+export function superEdges(
+  tree: LODTree,
+  frontier: Uint32Array,
+  style: SuperEdgeStyleResolved,
+): { halfArrows?: InstancedHalfArrowsData; lines?: InstancedLinesData; arrows?: InstancedArrowsData } {
   const off = tree.superEdgeOffset;
   const tgt = tree.superEdgeTarget;
   const flw = tree.superEdgeFlow;
+  if (!off || !tgt || !flw) return {};
+
   const present = new Uint8Array(tree.size);
   for (let i = 0; i < frontier.length; i++) present[frontier[i]!] = 1;
 
-  // Collect visible directed super-edges + a reciprocal-flow lookup (both endpoints are frontier
-  // nodes, so each direction is captured) for oppositeWidth.
+  // Gather visible directed super-edges (both endpoints on the frontier) + a reciprocal-flow lookup.
   const aS: number[] = [];
   const bS: number[] = [];
   const wS: number[] = [];
   const flowByPair = new Map<number, number>();
-  if (off && tgt && flw) {
-    for (let i = 0; i < frontier.length; i++) {
-      const g = frontier[i]!;
-      for (let p = off[g]!; p < off[g + 1]!; p++) {
-        const h = tgt[p]!;
-        if (present[h]) {
-          aS.push(g);
-          bS.push(h);
-          wS.push(flw[p]!);
-          flowByPair.set(g * tree.size + h, flw[p]!);
-        }
+  for (let i = 0; i < frontier.length; i++) {
+    const g = frontier[i]!;
+    for (let p = off[g]!; p < off[g + 1]!; p++) {
+      const h = tgt[p]!;
+      if (present[h]) {
+        aS.push(g);
+        bS.push(h);
+        wS.push(flw[p]!);
+        flowByPair.set(g * tree.size + h, flw[p]!);
       }
     }
   }
-
   const count = aS.length;
   const maxAgg = style.maxAggregateRadius ?? Infinity;
   const drawnRadius = (g: number): number => (g < tree.leafCount ? tree.radius[g]! : Math.min(tree.radius[g]!, maxAgg));
 
+  // Endpoints (centroids) + per-edge colour are common to both styles.
   const sources = new Float32Array(count * 2);
   const targets = new Float32Array(count * 2);
-  const radii = new Float32Array(count * 2);
-  const widths = new Float32Array(count * 2);
-  const bends = new Float32Array(count).fill(style.bend);
   const colors = new Uint8Array(count * 4);
   for (let e = 0; e < count; e++) {
     const g = aS[e]!;
@@ -684,19 +549,51 @@ export function halfArrowSuperEdges(tree: LODTree, frontier: Uint32Array, style:
     sources[e * 2 + 1] = tree.cy[g]!;
     targets[e * 2] = tree.cx[h]!;
     targets[e * 2 + 1] = tree.cy[h]!;
-    radii[e * 2] = drawnRadius(g);
-    radii[e * 2 + 1] = drawnRadius(h);
-    const w = style.widthOf(wS[e]!);
-    const opp = flowByPair.get(h * tree.size + g);
-    widths[e * 2] = w;
-    widths[e * 2 + 1] = opp === undefined ? w : style.widthOf(opp);
     const [cr, cg, cb, ca] = style.colorOf(wS[e]!);
     colors[e * 4] = cr;
     colors[e * 4 + 1] = cg;
     colors[e * 4 + 2] = cb;
     colors[e * 4 + 3] = ca;
   }
-  return { sources, targets, radii, widths, bends, colors, count };
+
+  if (style.linkStyle === "half-arrow" && style.directed) {
+    const radii = new Float32Array(count * 2);
+    const widths = new Float32Array(count * 2);
+    const bends = new Float32Array(count).fill(style.bend);
+    for (let e = 0; e < count; e++) {
+      radii[e * 2] = drawnRadius(aS[e]!);
+      radii[e * 2 + 1] = drawnRadius(bS[e]!);
+      const w = style.widthOf(wS[e]!);
+      const opp = flowByPair.get(bS[e]! * tree.size + aS[e]!);
+      widths[e * 2] = w;
+      widths[e * 2 + 1] = opp === undefined ? w : style.widthOf(opp);
+    }
+    return { halfArrows: { sources, targets, radii, widths, bends, colors, count } };
+  }
+
+  // Line style: bent/straight lines ∝ flow; directed → one-sided arrowheads set back to the target's
+  // (capped) boundary along the bent end-tangent. Same colour as the line.
+  const widths = new Float32Array(count);
+  for (let e = 0; e < count; e++) widths[e] = style.widthOf(wS[e]!);
+  const bends = new Float32Array(count).fill(style.bend);
+  const lines: InstancedLinesData = style.bend
+    ? { sources, targets, widths, colors, bends, samples: BENT_SAMPLES, count }
+    : { sources, targets, widths, colors, count };
+  if (!style.directed) return { lines };
+
+  const aTargets = new Float32Array(count * 2);
+  for (let e = 0; e < count; e++) {
+    const sx = sources[e * 2]!;
+    const sy = sources[e * 2 + 1]!;
+    const tx = targets[e * 2]!;
+    const ty = targets[e * 2 + 1]!;
+    const [ux, uy] = style.bend ? bentEndTangent(sx, sy, tx, ty, style.bend) : straightUnit(sx, sy, tx, ty);
+    const setback = drawnRadius(bS[e]!);
+    aTargets[e * 2] = tx - ux * setback;
+    aTargets[e * 2 + 1] = ty - uy * setback;
+  }
+  const arrows: InstancedArrowsData = { sources, targets: aTargets, sizes: new Float32Array(count).fill(style.arrowSize), colors, bends, half: true, count };
+  return { lines, arrows };
 }
 
 /** Path-strip samples for a smooth bent link (#104 N6c). */

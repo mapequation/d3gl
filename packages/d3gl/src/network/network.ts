@@ -1,5 +1,5 @@
 import { BaseEngine, type BaseEngineOptions } from "../map/base-engine.js";
-import { networkLayers, frontierCircles, frontierHalos, superEdgeLines, bentSuperEdges, halfArrowSuperEdges, emitNodes, emitLinks, emitArrows, emitHalfLinks, resolveNodeRadii, resolveFlowBorder, resolveNodeColors, resolveLinkWidthOf, resolveLinkColorOf, flowBorderInnerRadii, type ResolvedNetworkStyle, type NodeRadiusSpec, type FlowBorderSpec, type ConstBorder, type LinkWidthSpec, type LinkColorSpec, type LinkStyle } from "./glyphs.js";
+import { networkLayers, frontierCircles, frontierHalos, superEdges, emitNodes, emitLinks, emitArrows, emitHalfLinks, resolveNodeRadii, resolveFlowBorder, resolveNodeColors, resolveLinkWidthOf, resolveLinkColorOf, flowBorderInnerRadii, type ResolvedNetworkStyle, type NodeRadiusSpec, type FlowBorderSpec, type ConstBorder, type LinkWidthSpec, type LinkColorSpec, type LinkStyle } from "./glyphs.js";
 import { rgb } from "d3-color";
 import { ForceLayout, seedPositions, type ForceParams } from "./force.js";
 import { multilevelLayout, type CoarsenOptions } from "./coarsen.js";
@@ -156,10 +156,10 @@ export interface NetworkLODOptions {
    * colour (default a dark neutral). Omit to disable.
    */
   aggregateOutline?: { width?: number; gap?: number; color?: string };
-  /**
-   * Draw **super-edges**: links between visible frontier nodes (leaf↔leaf via the graph, aggregate↔
-   * aggregate via the coarse adjacency), summarising connectivity at the current LOD. Uses
-   * `linkWidth`/`linkStroke`. Default `true`. (Same-level pairs only for now; see {@link superEdgeLines}.)
+   /**
+   * Draw **super-edges**: links between *both-visible* frontier nodes (leaf↔leaf, module↔module, or
+   * aggregate↔aggregate — whatever the cut exposes), sized + coloured by their accumulated flow and
+   * rendered in the active `linkStyle`. Default `true`. @see {@link superEdges}
    */
   superEdges?: boolean;
   /** Coarsening granularity for the LOD tree (depth / minimum aggregate size). */
@@ -519,35 +519,22 @@ export class Network extends BaseEngine {
     const layers: InstancedLayer[] = [];
     // Super-edges first (drawn under the nodes), among the visible frontier only.
     if (opts.superEdges !== false && this.graph!.edgeCount > 0) {
-      if (this.lodModules && style.linkStyle === "half-arrow" && style.directed && tree.superEdgeOffset) {
-        // Directed map register (#104 N6): inter-module links as fused half-arrow glyphs from the
-        // flow-weighted super-edge adjacency — width/colour from each super-edge's accumulated subsumed
-        // flow, reciprocal pairs nesting. The instanced lane honours sizeMode (screen-projected in-shader).
-        const halfArrows = halfArrowSuperEdges(tree, frontier, {
-          widthOf: style.linkWidthOf,
-          colorOf: style.linkColorOf,
-          bend: style.linkBend,
-          maxAggregateRadius: opts.maxAggregateRadius,
-        });
-        if (halfArrows.count > 0) layers.push({ name: "links", primitive: "half-arrows", halfArrows, sizeMode: style.sizeMode });
-      } else if (this.lodModules && style.linkBend !== 0 && tree.superEdgeOffset) {
-        // Bent (undirected/line-style) inter-module links from the directed, flow-weighted super-edge
-        // adjacency. Width comes from the same weight scale as raw links, applied to each super-edge's
-        // accumulated subsumed weight; one-sided half-arrowheads when directed.
-        const { lines, arrows } = bentSuperEdges(tree, frontier, {
-          widthOf: style.linkWidthOf,
-          stroke: style.linkStroke,
-          bend: style.linkBend,
-          directed: style.directed,
-          arrowSize: style.arrowSize,
-          maxAggregateRadius: opts.maxAggregateRadius,
-        });
-        if (lines.count > 0) layers.push({ name: "links", primitive: "lines", lines, sizeMode: style.sizeMode });
-        if (arrows.count > 0) layers.push({ name: "arrows", primitive: "arrows", arrows, sizeMode: "world" });
-      } else {
-        const lines = superEdgeLines(this.graph!, tree, frontier, { width: style.linkWidth, stroke: style.linkStroke });
-        if (lines.count > 0) layers.push({ name: "links", primitive: "lines", lines, sizeMode: style.sizeMode });
-      }
+      // One super-edge path for both structural and module trees: gathered from the flow-weighted
+      // super-edge CSR (both-visible, so no edge dangles off-frontier) and rendered per linkStyle —
+      // fused half-arrows, or bent/straight lines + (directed) arrowheads, the same glyph the non-LOD
+      // path uses. (The half-arrow lane honours sizeMode in-shader; line arrowheads stay world-sized.)
+      const { halfArrows, lines, arrows } = superEdges(tree, frontier, {
+        linkStyle: style.linkStyle,
+        directed: style.directed,
+        widthOf: style.linkWidthOf,
+        colorOf: style.linkColorOf,
+        bend: style.linkBend,
+        arrowSize: style.arrowSize,
+        maxAggregateRadius: opts.maxAggregateRadius,
+      });
+      if (halfArrows && halfArrows.count > 0) layers.push({ name: "links", primitive: "half-arrows", halfArrows, sizeMode: style.sizeMode });
+      if (lines && lines.count > 0) layers.push({ name: "links", primitive: "lines", lines, sizeMode: style.sizeMode });
+      if (arrows && arrows.count > 0) layers.push({ name: "arrows", primitive: "arrows", arrows, sizeMode: "world" });
     }
     // Aggregate-outline affordance: a halo ring behind collapsed-module glyphs (not leaves), under the
     // nodes, so a module reads as expandable. WebGL/LOD-only (the vector full-graph draw has no aggregates).
@@ -799,18 +786,11 @@ export class Network extends BaseEngine {
   /** Apply style defaults (drawn order is decided by {@link networkLayers}). */
   private resolvedStyle(graph: NetworkGraph): ResolvedNetworkStyle {
     // linkWidth: a constant, a (weight)=>width scale, or {by,scale}. `linkWidthOf` is the per-edge
-    // function; `linkWidth` is a representative scalar (for the uniform super-edge path + the arrow-size
-    // default). Evaluate the scale at the **mean edge weight** — an in-domain value — so a flow-domain
-    // scale (tiny weights) isn't extrapolated to a huge width (which blew up the structural super-edges).
+    // function; `linkWidth` is a representative scalar, used only for the arrow-size default now (the
+    // super-edges size per-edge by accumulated flow, so there's no uniform-width path to mis-scale).
     const lwSpec = this.styleOpts.linkWidth ?? DEFAULT_LINK_WIDTH;
     const linkWidthOf = resolveLinkWidthOf(lwSpec);
-    let meanWeight = 1;
-    if (graph.edgeCount > 0) {
-      let sum = 0;
-      for (let e = 0; e < graph.edgeCount; e++) sum += graph.weight[e]!;
-      meanWeight = sum / graph.edgeCount;
-    }
-    const linkWidth = typeof lwSpec === "number" ? lwSpec : linkWidthOf(meanWeight) || DEFAULT_LINK_WIDTH;
+    const linkWidth = typeof lwSpec === "number" ? lwSpec : linkWidthOf(1) || DEFAULT_LINK_WIDTH;
     // linkStroke: a single colour, or a (weight)=>colour scale. `linkColorOf` packs RGBA bytes for
     // the WebGL lane; `linkStrokeOf` gives the CSS for the Scene path; `linkStroke` is representative.
     const lsSpec: LinkColorSpec = this.styleOpts.linkStroke ?? DEFAULT_LINK_STROKE;

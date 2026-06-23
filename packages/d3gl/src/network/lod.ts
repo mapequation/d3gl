@@ -108,7 +108,7 @@ export interface LODTree extends LODTopology {
  * read. Reused by both the main-thread {@link buildLODTree} and the layout worker, which already has
  * the hierarchy from multilevel seeding and streams this topology to the main thread (#103).
  */
-export function flattenHierarchyToTopology(hierarchy: Hierarchy, leafCount: number): LODTopology {
+export function flattenHierarchyToTopology(hierarchy: Hierarchy, leafCount: number, edges?: SuperEdgeInput): LODTopology {
   const { levels, projections } = hierarchy;
   const levelCount = levels.length;
 
@@ -172,7 +172,71 @@ export function flattenHierarchyToTopology(hierarchy: Hierarchy, leafCount: numb
     }
   }
 
-  return { size, leafCount, levelCount, levelOffset, childOffset, children, edgeOffset, edgeNeighbors };
+  const topo: LODTopology = { size, leafCount, levelCount, levelOffset, childOffset, children, edgeOffset, edgeNeighbors };
+  // Directed, flow-weighted super-edges (#104 N6) — built the same way for the coarsening tree as for a
+  // module tree, so the LOD edge logic is identical for both. Only when the graph's edges are supplied
+  // (the main-thread build); the worker streams a tree without them.
+  if (edges) Object.assign(topo, buildSuperEdges(size, parent, edges));
+  return topo;
+}
+
+/** Directed edges (source/target/weight) used to build the flow-weighted super-edge CSR. */
+export interface SuperEdgeInput {
+  source: ArrayLike<number>;
+  target: ArrayLike<number>;
+  weight: ArrayLike<number>;
+}
+
+/**
+ * Directed, flow-weighted super-edge out-adjacency over a tree (#104 N6). Each graph edge `u→v`
+ * contributes at every level from the leaves up to (not including) `u`/`v`'s lowest common ancestor:
+ * walk both ancestor chains in lockstep (after equalising depth), adding a directed `a→b` at each level
+ * until they meet, summing flow per ordered pair. Tree-generic — works for a coarsening tree or a
+ * module tree (it only needs `parent`, with parent ids greater than child ids). The cut renders
+ * whichever level is visible.
+ */
+export function buildSuperEdges(
+  size: number,
+  parent: Int32Array,
+  edges: SuperEdgeInput,
+): Pick<LODTopology, "superEdgeOffset" | "superEdgeTarget" | "superEdgeFlow"> {
+  // Depth from root. Parents have higher ids than children, so a single descending pass finalises each
+  // parent before its children.
+  const depth = new Int32Array(size);
+  for (let g = size - 2; g >= 0; g--) depth[g] = depth[parent[g]!]! + 1;
+
+  const flowByPair = new Map<number, number>();
+  const m = edges.source.length;
+  for (let e = 0; e < m; e++) {
+    let a = edges.source[e]!;
+    let b = edges.target[e]!;
+    if (a === b) continue; // self-loop
+    const w = edges.weight[e]!;
+    while (depth[a]! > depth[b]!) a = parent[a]!;
+    while (depth[b]! > depth[a]!) b = parent[b]!;
+    while (a !== b) {
+      const key = a * size + b;
+      flowByPair.set(key, (flowByPair.get(key) ?? 0) + w);
+      a = parent[a]!;
+      b = parent[b]!;
+    }
+  }
+
+  const superEdgeOffset = new Uint32Array(size + 1);
+  for (const key of flowByPair.keys()) superEdgeOffset[Math.floor(key / size) + 1]!++;
+  for (let g = 0; g < size; g++) superEdgeOffset[g + 1] = superEdgeOffset[g + 1]! + superEdgeOffset[g]!;
+  const total = superEdgeOffset[size]!;
+  const superEdgeTarget = new Uint32Array(total);
+  const superEdgeFlow = new Float32Array(total);
+  const cursor = superEdgeOffset.slice(0, size);
+  for (const [key, flow] of flowByPair) {
+    const a = Math.floor(key / size);
+    const pos = cursor[a]!;
+    superEdgeTarget[pos] = key - a * size;
+    superEdgeFlow[pos] = flow;
+    cursor[a] = pos + 1;
+  }
+  return { superEdgeOffset, superEdgeTarget, superEdgeFlow };
 }
 
 /** Allocate zeroed geometry arrays over a topology, yielding a renderable {@link LODTree}. */
@@ -198,7 +262,11 @@ function attachGeometry(topo: LODTopology): LODTree {
  * streams an already-built {@link LODTopology} instead (#103), assembled via {@link lodTreeFromTopology}.
  */
 export function buildLODTree(graph: NetworkGraph, coarsen?: CoarsenOptions): LODTree {
-  return attachGeometry(flattenHierarchyToTopology(buildHierarchy(graph, coarsen), graph.nodeCount));
+  // Pass the graph's directed edges so the coarsening tree carries flow-weighted super-edges too —
+  // the same edge-LOD path then serves both structural and module trees.
+  return attachGeometry(
+    flattenHierarchyToTopology(buildHierarchy(graph, coarsen), graph.nodeCount, { source: graph.source, target: graph.target, weight: graph.weight }),
+  );
 }
 
 export interface SpatialLODOptions {
