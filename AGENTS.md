@@ -10,7 +10,8 @@ rendering, the build, or the test setup.
 - **d3 compatibility** — Design the library for d3 compatibility and familiarity, supporting both d3's low-level flexibility and a powerful API that keeps example code simple. It should accept `d3-shape` generators, `d3-geo` projections, `d3-hierarchy` layouts, `d3-scale` scales, and the like.
 - **Clean code** — Casting or reaching for `any` / `unknown` is a sign of bad design; fix the underlying seam (a typed pure function, a test at the right layer) instead. Avoid the non-null assertion operator (`!`) for the same reason, unless it's justified in a performance-critical spot and approved by me.
 - **Regression-safe** — Write tests for both behavior and visual output. Never claim a visual issue is solved without visual testing (browser tests / the backend-equivalence harness). When you change the library, make sure no example breaks.
-- **Up-to-date documentation** — Every major feature should be highlighted on the website landing page and have a minimal example that demonstrates it. As soon as the library changes, keep the documentation — prose and examples — up to date.
+- **Up-to-date documentation** — Every major feature should be highlighted on the website landing page and have a minimal example that demonstrates it. As soon as the library changes, keep the documentation — prose and examples — up to date. If it includes a new feature, it should be possible to verify its function in at least one example.
+- **Human verification** — Never merge a PR without human approval.
 
 ## Library-first design (improve d3gl, don't work around it)
 
@@ -84,7 +85,10 @@ long it stays useful:
    so every build/typecheck/test fails (or silently runs against missing/stale deps) until you
    install. Do this *before* the first `tsc`/`astro check`/`vitest`/build command, not after it
    errors. Then open the PR with `Fixes #N`.
-5. **Merge with squash** (see below), then **delete the feature branch** (local +
+5. **Human verification** — Summarize what you have done including changes that may
+   have affected per-frame computational complexity or memory footprint and ask for approval before merging a PR.
+6. Create changesets.
+7. **Merge with squash** (see below), then **delete the feature branch** (local +
    remote) once it's in `main`.
 
 ### Merge strategy & branch cleanup
