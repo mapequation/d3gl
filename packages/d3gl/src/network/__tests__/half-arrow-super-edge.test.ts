@@ -49,4 +49,21 @@ describe("superEdges (half-arrow style) over a module tree", () => {
     const d = superEdges(tree, Uint32Array.from([4]), { ...HALF, widthOf: (w) => w, bend: 12 }, ALL).halfArrows;
     expect(d ? d.count : 0).toBe(0);
   });
+
+  it("keeps a present node's INCOMING edge from an off-screen source (transpose walk)", () => {
+    // Reciprocal cross-module flow: 0→2 ⇒ 4→5, 2→0 ⇒ 5→4 — module 4 has both an out- and an in-edge.
+    const graph = buildGraph({ nodeCount: 4, source: [0, 2], target: [2, 0], weight: [3, 1], directed: true });
+    graph.positions.set([0, 0, 10, 0, 100, 0, 110, 0]); // module 4 left (x≈5), module 5 right (x≈105)
+    const tree = buildModuleLODTree(4, RECORDS, graph);
+    computeLODGeometry(tree, graph, new Float32Array(4).fill(4));
+
+    // Only module 4 is on the frontier; module 5's centroid (x≈105) is off-screen.
+    const view = { minX: -50, maxX: 50, minY: -50, maxY: 50 };
+    const d = superEdges(tree, Uint32Array.from([4]), { ...HALF, widthOf: (w) => w, bend: 12 }, view).halfArrows!;
+
+    // Both directions survive: 4→5 (out-walk, off-screen target) AND 5→4 (in-walk, off-screen source).
+    expect(d.count).toBe(2);
+    const pairs = Array.from({ length: 2 }, (_, e) => `${d.sources[e * 2]! < d.targets[e * 2]! ? "4→5" : "5→4"}`);
+    expect(new Set(pairs)).toEqual(new Set(["4→5", "5→4"]));
+  });
 });

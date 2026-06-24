@@ -559,6 +559,25 @@ export function superEdges(
       }
     }
   }
+  // Incoming edges to a present node from an **off-screen source** (the transpose) — so a node keeps its
+  // in-edges too, not just out-edges, as a neighbour scrolls off (symmetric with the out-walk above).
+  // present sources were already emitted from their out-walk, so only off-screen (non-present) ones here.
+  const inOff = tree.superEdgeInOffset;
+  const inSrc = tree.superEdgeInSource;
+  const inFlw = tree.superEdgeInFlow;
+  if (inOff && inSrc && inFlw) {
+    for (let i = 0; i < frontier.length; i++) {
+      const g = frontier[i]!;
+      for (let p = inOff[g]!; p < inOff[g + 1]!; p++) {
+        const s = inSrc[p]!;
+        if (!present[s] && offScreen(s)) {
+          aS.push(s);
+          bS.push(g);
+          wS.push(inFlw[p]!);
+        }
+      }
+    }
+  }
   const count = aS.length;
   const maxAgg = style.maxAggregateRadius ?? Infinity;
   const drawnRadius = (g: number): number => (g < tree.leafCount ? tree.radius[g]! : Math.min(tree.radius[g]!, maxAgg));

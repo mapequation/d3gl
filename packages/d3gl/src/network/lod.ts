@@ -56,6 +56,16 @@ export interface LODTopology {
   superEdgeOffset?: Uint32Array;
   superEdgeTarget?: Uint32Array;
   superEdgeFlow?: Float32Array;
+  /**
+   * The **transpose** of the super-edge CSR (in-adjacency, by target): node `g`'s incoming edges are
+   * `[superEdgeInOffset[g] .. superEdgeInOffset[g+1])`, coming from `superEdgeInSource` with the same
+   * summed `superEdgeInFlow`. Lets the gather keep a visible node's edges to off-screen neighbours in
+   * *both* directions (incoming as well as outgoing) without scanning off-screen sources. Built and
+   * present together with the out-adjacency above. @see {@link buildSuperEdges}
+   */
+  superEdgeInOffset?: Uint32Array;
+  superEdgeInSource?: Uint32Array;
+  superEdgeInFlow?: Float32Array;
 }
 
 /**
@@ -190,18 +200,21 @@ export interface SuperEdgeInput {
 }
 
 /**
- * Directed, flow-weighted super-edge out-adjacency over a tree (#104 N6). Each graph edge `u→v`
- * contributes at every level from the leaves up to (not including) `u`/`v`'s lowest common ancestor:
- * walk both ancestor chains in lockstep (after equalising depth), adding a directed `a→b` at each level
- * until they meet, summing flow per ordered pair. Tree-generic — works for a coarsening tree or a
- * module tree (it only needs `parent`, with parent ids greater than child ids). The cut renders
- * whichever level is visible.
+ * Directed, flow-weighted super-edge adjacency over a tree (#104 N6). Each graph edge `u→v` contributes
+ * at every level from the leaves up to (not including) `u`/`v`'s lowest common ancestor: walk both
+ * ancestor chains in lockstep (after equalising depth), adding a directed `a→b` at each level until they
+ * meet, summing flow per ordered pair. Tree-generic — works for a coarsening tree or a module tree (it
+ * only needs `parent`, with parent ids greater than child ids). The cut renders whichever level is
+ * visible. Both the **out**-adjacency (by source) and the **in**-adjacency (the transpose, by target)
+ * are returned, so the gather can keep a visible node's edges to off-screen neighbours symmetrically —
+ * outgoing (walk the node's out-edges) *and* incoming (walk its in-edges) — without re-scanning
+ * off-screen sources (#104: WebGL incoming-link culling fix).
  */
 export function buildSuperEdges(
   size: number,
   parent: Int32Array,
   edges: SuperEdgeInput,
-): Pick<LODTopology, "superEdgeOffset" | "superEdgeTarget" | "superEdgeFlow"> {
+): Pick<LODTopology, "superEdgeOffset" | "superEdgeTarget" | "superEdgeFlow" | "superEdgeInOffset" | "superEdgeInSource" | "superEdgeInFlow"> {
   // Depth from root. Parents have higher ids than children, so a single descending pass finalises each
   // parent before its children.
   const depth = new Int32Array(size);
@@ -238,7 +251,24 @@ export function buildSuperEdges(
     superEdgeFlow[pos] = flow;
     cursor[a] = pos + 1;
   }
-  return { superEdgeOffset, superEdgeTarget, superEdgeFlow };
+
+  // Transpose: the same pairs grouped by *target*, so a visible node can find its incoming edges
+  // (whose source may be off-screen) without scanning off-screen sources' out-lists.
+  const superEdgeInOffset = new Uint32Array(size + 1);
+  for (const key of flowByPair.keys()) superEdgeInOffset[(key % size) + 1]!++; // b = key % size
+  for (let g = 0; g < size; g++) superEdgeInOffset[g + 1] = superEdgeInOffset[g + 1]! + superEdgeInOffset[g]!;
+  const superEdgeInSource = new Uint32Array(total);
+  const superEdgeInFlow = new Float32Array(total);
+  const inCursor = superEdgeInOffset.slice(0, size);
+  for (const [key, flow] of flowByPair) {
+    const a = Math.floor(key / size);
+    const b = key - a * size;
+    const pos = inCursor[b]!;
+    superEdgeInSource[pos] = a;
+    superEdgeInFlow[pos] = flow;
+    inCursor[b] = pos + 1;
+  }
+  return { superEdgeOffset, superEdgeTarget, superEdgeFlow, superEdgeInOffset, superEdgeInSource, superEdgeInFlow };
 }
 
 /** Allocate zeroed geometry arrays over a topology, yielding a renderable {@link LODTree}. */
