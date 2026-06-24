@@ -900,15 +900,23 @@ export function emitLinks(g: GroupBuilder, graph: NetworkGraph, widthOf: (weight
  * Emit each directed link's arrowhead as a filled triangle, tip set back by the target node's radius
  * and oriented along the link's end-tangent (the bezier tangent when `bend` is set). With `half` the
  * triangle is one-sided (#104 N6c), matching the WebGL half-arrow.
+ *
+ * `bake` (default 1) is the **screen-sizeMode** bake (the same trick as {@link emitHalfLinks}): the
+ * shape is solved in pixel space (positions × `bake`, with `size`/`nodeRadii` already in px) and scaled
+ * back by `1/bake`, so the Scene's ×k view transform reproduces the WebGL constant-px arrowhead — tip
+ * size *and* the node-boundary setback. Without it, the world-unit setback grows with zoom and the head
+ * drifts off the node. The end-tangent direction is invariant under the uniform ×bake, so only the
+ * setback/size scale. `bake = 1` (world mode) leaves world geometry untouched.
  */
-export function emitArrows(g: GroupBuilder, graph: NetworkGraph, size: number, nodeRadii: Float32Array, bend = 0, half = false): void {
+export function emitArrows(g: GroupBuilder, graph: NetworkGraph, size: number, nodeRadii: Float32Array, bend = 0, half = false, bake = 1): void {
+  const inv = 1 / bake;
   for (let e = 0; e < graph.edgeCount; e++) {
     const s = graph.source[e]!;
     const t = graph.target[e]!;
-    const sx = graph.positions[s * 2]!;
-    const sy = graph.positions[s * 2 + 1]!;
-    const tx = graph.positions[t * 2]!;
-    const ty = graph.positions[t * 2 + 1]!;
+    const sx = graph.positions[s * 2]! * bake;
+    const sy = graph.positions[s * 2 + 1]! * bake;
+    const tx = graph.positions[t * 2]! * bake;
+    const ty = graph.positions[t * 2 + 1]! * bake;
     const [ux, uy] = bend ? bentEndTangent(sx, sy, tx, ty, bend) : straightUnit(sx, sy, tx, ty);
     const px = -uy;
     const py = ux;
@@ -918,10 +926,11 @@ export function emitArrows(g: GroupBuilder, graph: NetworkGraph, size: number, n
     const baseX = tipX - ux * 2 * size;
     const baseY = tipY - uy * 2 * size;
     g.drawable(e, (ctx) => {
-      ctx.moveTo(tipX, tipY);
+      // Solve in px×bake space, emit ÷bake so the ×k view restores the constant-px shape.
+      ctx.moveTo(tipX * inv, tipY * inv);
       // Half-arrow: base on one side of the centreline only (tip → centre-base → +side).
-      ctx.lineTo(half ? baseX : baseX - px * size, half ? baseY : baseY - py * size);
-      ctx.lineTo(baseX + px * size, baseY + py * size);
+      ctx.lineTo((half ? baseX : baseX - px * size) * inv, (half ? baseY : baseY - py * size) * inv);
+      ctx.lineTo((baseX + px * size) * inv, (baseY + py * size) * inv);
       ctx.closePath();
     });
   }

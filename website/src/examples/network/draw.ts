@@ -17,8 +17,8 @@ function degreeRadius(graph: NetworkGraph): NodeRadiusSpec {
     if (d < lo) lo = d;
     if (d > hi) hi = d;
   }
-  if (hi <= lo) return 5; // uniform degree (e.g. a single clique) — nothing to scale
-  return { by: "degree", scale: scaleSqrt().domain([lo, hi]).range([2.5, 11]) };
+  if (hi <= lo) return 6; // uniform degree (e.g. a single clique) — nothing to scale
+  return { by: "degree", scale: scaleSqrt().domain([lo, hi]).range([3, 13]) };
 }
 
 /**
@@ -57,9 +57,10 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
         .data(graph)
         .style({
           directed,
-          nodeRadius: options.size === "Degree" ? degreeRadius(graph) : 4,
+          nodeRadius: options.size === "Uniform" ? 5 : degreeRadius(graph),
           nodeFill: "#4878d0",
           linkWidth: 0.6,
+          arrowSize: 6, // visible arrowheads (the 3·linkWidth default is tiny at linkWidth 0.6)
           // Translucent links so overlapping edges read as density — a hierarchical depth cue, and
           // it keeps the super-edge thicket legible under the nodes. The arrowhead shares this colour.
           linkStroke: "rgba(120,140,180,0.32)",

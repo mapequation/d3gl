@@ -33,8 +33,8 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
   const maxNodeFlow = d.nodeFlow.reduce((a, b) => Math.max(a, b), 0);
   const maxEnter = d.enterExit.reduce((a, b) => Math.max(a, b), 0);
   const maxLink = d.linkFlow.reduce((a, b) => Math.max(a, b), 0);
-  // Range minimums ≥ 1 so nodes/links never vanish (the ring may be 0 for interior nodes).
-  const nodeR = scaleSqrt().domain([0, maxNodeFlow]).range([3, 26]);
+  // Range minimums ≥ 1 so nodes/links never vanish (the ring may be 0 for interior nodes). The node
+  // radius range top is slider-driven (see render) — smaller ⇒ less declutter ⇒ more nodes + edges show.
   const ringW = scaleSqrt().domain([0, maxEnter]).range([0, 6]);
   const linkW = scaleSqrt().domain([0, maxLink]).range([0.75, 6]); // thinner half-arrows
   // Link colour encodes flow like the half-arrow example — light → dark blue with flow — and is
@@ -79,6 +79,10 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
       const sizeMode = options.sizing === "World" ? "world" : "screen";
       const expandPx = (options.expand as number) ?? 120;
       const declutter = options.declutter !== "Off";
+      // Node-radius range top (leaf max; modules extrapolate above it via the same scale). Smaller →
+      // smaller glyphs → declutter keeps more → more nodes + inter-module edges visible.
+      const maxRadius = (options.maxRadius as number) ?? 21;
+      const nodeR = scaleSqrt().domain([0, maxNodeFlow]).range([3, maxRadius]);
       net.style({
         directed: true,
         linkStyle: "half-arrow",

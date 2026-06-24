@@ -709,6 +709,9 @@ export class Network extends BaseEngine {
     // (the gap would grow with zoom). Refreshed on backend switch (here), at interaction-end
     // (setInteracting) and on demand (syncScreenGeometry).
     const bake = halfArrow && style.sizeMode === "screen" ? this.transform.k || 1 : 1;
+    // The plain line-style arrowhead bakes the same way (its tip + node-boundary setback are px in
+    // screen mode); baked geometry is world-coord, so the layer renders "world" and re-bakes on zoom-end.
+    const arrowBake = !halfArrow && style.directed && style.sizeMode === "screen" ? this.transform.k || 1 : 1;
     this.registerLayer({
       name: "links",
       data: edgeIds,
@@ -725,10 +728,11 @@ export class Network extends BaseEngine {
       name: "arrows",
       data: edgeIds,
       ids: edgeIds,
-      sizeMode: style.sizeMode,
+      // Baked screen-mode arrows live in world coords (like the half-arrow); world mode passes through.
+      sizeMode: arrowBake !== 1 ? "world" : style.sizeMode,
       fill: (e) => linkColorAt(e as number),
       build: (g) => {
-        if (emit && style.directed && !halfArrow) emitArrows(g, graph, style.arrowSize, style.nodeRadii, style.linkBend, style.linkBend !== 0);
+        if (emit && style.directed && !halfArrow) emitArrows(g, graph, style.arrowSize, style.nodeRadii, style.linkBend, style.linkBend !== 0, arrowBake);
       },
     });
     // Per-node fill: a single colour, or the per-node accessor (categorical module colours, #104 rework).
