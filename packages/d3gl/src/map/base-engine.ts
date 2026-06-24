@@ -1,6 +1,6 @@
 import { select } from "d3-selection";
 import { zoom as d3zoom, zoomIdentity, type D3ZoomEvent } from "d3-zoom";
-import { Scene, HitIndex, type Backend, type GroupBuilder, type RenderLayer, type ViewTransform } from "../core/index.js";
+import { Scene, HitIndex, declutterScreen, declutterScratch, type Backend, type GroupBuilder, type RenderLayer, type ViewTransform, type DeclutterScratch } from "../core/index.js";
 import { createBackend, createCanvasBackend, type BackendType, type BackendHandle } from "./backend-factory.js";
 import { buildBatch, type DrawItem } from "./draw-batch.js";
 import { composeColor, type StyleOverride, type SelectionOptions } from "./style-overrides.js";
@@ -171,14 +171,14 @@ export abstract class BaseEngine {
   private aspectRatio?: number;
   /** Whether the engine tracks its host (fill / aspect modes) vs. a fixed size. */
   private responsive = false;
-  /** Reusable scratch for the per-zoom screen-space declutter ({@link declutterLayer}): a flat
-   *  uniform grid (cell heads) plus an intrusive linked list of kept points, so the hot path
-   *  allocates nothing per frame. Grown on demand; never freed. */
-  private dcCellHead: Int32Array | null = null;
-  private dcKeptX: Float64Array | null = null;
-  private dcKeptY: Float64Array | null = null;
-  private dcKeptNext: Int32Array | null = null;
+  /** Reusable scratch for the per-zoom screen-space declutter ({@link declutterLayer}): projected
+   *  anchor coordinates, the shared declutter grid ({@link DeclutterScratch}), and the per-group
+   *  visibility flags — so the hot path (declutter runs on every zoom) allocates nothing per frame.
+   *  Grown on demand; never freed. */
+  private dcSx: Float64Array | null = null;
+  private dcSy: Float64Array | null = null;
   private dcVisible: Uint8Array | null = null;
+  private dcScratch: DeclutterScratch = declutterScratch();
   /** Observes the host in responsive modes; coalesced into one rAF per burst. */
   private sizingObserver?: ResizeObserver;
   private resizeRaf = 0;
@@ -803,56 +803,28 @@ export abstract class BaseEngine {
    * interaction).
    */
   private cullDeclutter(spec: LayerSpec, t: ViewTransform): boolean {
-    const radius = spec.declutter!;
-    if (!(radius > 0)) return false;
+    const exclusion = spec.declutter!;
+    if (!(exclusion > 0)) return false;
     const { ax, ay } = this.scene.declutterIndex(spec.name);
     const G = ax.length;
     if (G === 0) return false; // no anchored drawables ⇒ nothing to cull (all stay visible)
-    const r2 = radius * radius;
 
-    // Flat grid spanning [-radius, width+radius] × [-radius, height+radius] in screen px, so a
-    // cell index is `cy * cols + cx` with cx = floor((sx + radius) / radius). Grow the scratch
-    // buffers on demand and reuse them across frames (cleared per frame, never reallocated).
-    const cols = Math.floor((this.width + 2 * radius) / radius) + 2;
-    const rows = Math.floor((this.height + 2 * radius) / radius) + 2;
-    const nCells = cols * rows;
-    let cellHead = this.dcCellHead;
-    if (!cellHead || cellHead.length < nCells) cellHead = this.dcCellHead = new Int32Array(nCells);
-    cellHead.fill(-1, 0, nCells);
-    let keptX = this.dcKeptX, keptY = this.dcKeptY, keptNext = this.dcKeptNext, vis = this.dcVisible;
-    if (!keptX || keptX.length < G) {
-      keptX = this.dcKeptX = new Float64Array(G);
-      keptY = this.dcKeptY = new Float64Array(G);
-      keptNext = this.dcKeptNext = new Int32Array(G);
+    // Reuse scratch across frames (declutter runs on every zoom). Project anchors to screen px, then
+    // run the shared greedy declutter — the same engine the network LOD frontier uses (core/declutter).
+    let sx = this.dcSx, sy = this.dcSy, vis = this.dcVisible;
+    if (!sx || sx.length < G) {
+      sx = this.dcSx = new Float64Array(G);
+      sy = this.dcSy = new Float64Array(G);
       vis = this.dcVisible = new Uint8Array(G);
     }
-    let kept = 0;
-    for (let g = 0; g < G; g++) {
-      const sx = t.k * ax[g]! + t.x, sy = t.k * ay[g]! + t.y;
-      const cx = Math.floor((sx + radius) / radius), cy = Math.floor((sy + radius) / radius);
-      if (cx < 0 || cy < 0 || cx >= cols || cy >= rows) { vis![g] = 1; continue; } // off-screen ⇒ keep
-      let occluded = false;
-      for (let i = -1; i <= 1 && !occluded; i++) {
-        const nx = cx + i;
-        if (nx < 0 || nx >= cols) continue;
-        for (let j = -1; j <= 1 && !occluded; j++) {
-          const ny = cy + j;
-          if (ny < 0 || ny >= rows) continue;
-          for (let p = cellHead[ny * cols + nx]!; p !== -1; p = keptNext![p]!) {
-            const dx = keptX![p]! - sx, dy = keptY![p]! - sy;
-            if (dx * dx + dy * dy < r2) { occluded = true; break; }
-          }
-        }
-      }
-      if (!occluded) {
-        vis![g] = 1;
-        const cell = cy * cols + cx;
-        keptX![kept] = sx; keptY![kept] = sy; keptNext![kept] = cellHead[cell]!;
-        cellHead[cell] = kept++;
-      } else {
-        vis![g] = 0;
-      }
+    for (let i = 0; i < G; i++) {
+      sx![i] = t.k * ax[i]! + t.x;
+      sy![i] = t.k * ay[i]! + t.y;
     }
+    // `declutter` is the centre-to-centre exclusion distance, so the per-glyph radius is half of it
+    // (two glyphs collide when dist < rᵢ + rⱼ = exclusion). Visited in index (data) order — the survivor
+    // of a cluster is the earliest registered. Off-screen anchors are kept and don't occlude.
+    declutterScreen(G, sx!, sy!, exclusion / 2, undefined, this.width, this.height, 1, vis!, this.dcScratch);
     this.scene.writeDeclutterFlags(spec.name, vis!);
     return true;
   }

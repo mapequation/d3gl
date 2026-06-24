@@ -18,6 +18,7 @@
 import { hcl, rgb } from "d3-color";
 import type { NetworkGraph } from "./graph.js";
 import { buildHierarchy, type CoarsenOptions, type Hierarchy } from "./coarsen.js";
+import { declutterScreen } from "../core/declutter.js";
 
 /**
  * The position-independent **topology** of the LOD tree: the flattened coarsening hierarchy (levels,
@@ -859,62 +860,19 @@ export function declutterFrontier(
   const px = new Float64Array(F);
   const py = new Float64Array(F);
   const pr = new Float64Array(F);
-  let maxR = 1;
   for (let i = 0; i < F; i++) {
     const g = frontier[i]!;
     const drawn = g < tree.leafCount ? tree.radius[g]! : Math.min(tree.radius[g]!, maxAgg);
-    const r = opts.screenSized ? drawn : drawn * opts.k;
-    pr[i] = r;
+    pr[i] = opts.screenSized ? drawn : drawn * opts.k;
     px[i] = tree.cx[g]! * t.k + t.x;
     py[i] = tree.cy[g]! * t.k + t.y;
-    if (r > maxR) maxR = r;
   }
 
-  // Visit in descending importance so the most important glyph in a cluster survives.
+  // Visit in descending importance so the most important glyph in a cluster survives, then run the
+  // shared greedy declutter (one engine across backends + the geo layers — see core/declutter).
   const order = Array.from({ length: F }, (_, i) => i);
   order.sort((a, b) => tree.weight[frontier[b]!]! - tree.weight[frontier[a]!]!);
-
-  // Uniform grid sized so any overlapping pair (centre distance < spacing·(rᵢ+rⱼ) ≤ 2·spacing·maxR)
-  // lands within the 3×3 neighbourhood. Intrusive linked list of kept glyphs per cell (no per-cell
-  // allocation).
-  const cell = Math.max(2 * maxR * spacing, 1);
-  const cols = Math.floor(width / cell) + 3;
-  const rows = Math.floor(height / cell) + 3;
-  const head = new Int32Array(cols * rows).fill(-1);
-  const next = new Int32Array(F);
-  const kept = new Uint8Array(F);
-
-  for (const i of order) {
-    const x = px[i]!;
-    const y = py[i]!;
-    const r = pr[i]!;
-    let cx = Math.floor(x / cell) + 1;
-    let cy = Math.floor(y / cell) + 1;
-    cx = cx < 0 ? 0 : cx >= cols ? cols - 1 : cx;
-    cy = cy < 0 ? 0 : cy >= rows ? rows - 1 : cy;
-    let occluded = false;
-    for (let gx = cx - 1; gx <= cx + 1 && !occluded; gx++) {
-      if (gx < 0 || gx >= cols) continue;
-      for (let gy = cy - 1; gy <= cy + 1 && !occluded; gy++) {
-        if (gy < 0 || gy >= rows) continue;
-        for (let p = head[gy * cols + gx]!; p !== -1; p = next[p]!) {
-          const dx = px[p]! - x;
-          const dy = py[p]! - y;
-          const thresh = spacing * (r + pr[p]!); // circles must not overlap
-          if (dx * dx + dy * dy < thresh * thresh) {
-            occluded = true;
-            break;
-          }
-        }
-      }
-    }
-    if (!occluded) {
-      kept[i] = 1;
-      const c = cy * cols + cx;
-      next[i] = head[c]!;
-      head[c] = i;
-    }
-  }
+  const kept = declutterScreen(F, px, py, pr, order, width, height, spacing, new Uint8Array(F));
 
   let n = 0;
   for (let i = 0; i < F; i++) if (kept[i]) n++;
