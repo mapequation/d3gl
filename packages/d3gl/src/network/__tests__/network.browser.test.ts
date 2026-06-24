@@ -140,6 +140,80 @@ describe("network() engine", () => {
     net.destroy();
   });
 
+  it("renders the LOD frontier (not the full graph) to SVG and re-cuts on zoom (#138)", async () => {
+    const net = network(host(), { width: 200, height: 200, backend: "svg" });
+    await net.whenReady();
+    // Two tight modules of two nodes each, bridged — so the cut collapses each module to one
+    // aggregate when zoomed out, and expands to its leaves when zoomed in.
+    const g = buildGraph({ nodeCount: 4, source: [0, 2, 1], target: [1, 3, 2], directed: true });
+    const modules = [
+      { id: 0, path: [1, 1] }, { id: 1, path: [1, 2] }, { id: 2, path: [2, 1] }, { id: 3, path: [2, 2] },
+    ];
+    net
+      .data(g)
+      .style({ directed: true })
+      // module1 = {0,1} near (70,90); module2 = {2,3} near (120,110); whole graph fits the viewport.
+      .lod({ modules, expandPx: 20 })
+      .layout({ backend: "positions", positions: new Float32Array([70, 90, 85, 90, 115, 110, 130, 110]) });
+    expect(net.lodSource).toBe("modules");
+
+    const circles = () => (net.toSVG().match(/<circle/g) ?? []).length;
+
+    // Zoomed out (k=1): each module collapses to one aggregate glyph → 2 circles, NOT the 4 leaves.
+    net.setTransform({ k: 1, x: 0, y: 0 });
+    net.syncScreenGeometry();
+    expect(circles()).toBe(2);
+    // The bridge edge collapses to a single super-edge between the two aggregates.
+    expect(net.toSVG()).toContain("<path");
+
+    // Zoomed in (k=2, centred): both modules expand to leaves → 4 circles. Proves the Scene path
+    // re-cuts the frontier at the new transform (the agreed redraw-on-zoom-end model).
+    net.setTransform({ k: 2, x: -100, y: -100 });
+    net.syncScreenGeometry();
+    expect(circles()).toBe(4);
+
+    // Disabling LOD restores the full-graph draw (no stale frontier left behind).
+    net.lod(false);
+    expect(circles()).toBe(4);
+
+    net.destroy();
+  });
+
+  it("exports a collapsed module map to SVG with border discs, halo rings and half-arrow super-edges (#138)", async () => {
+    const net = network(host(), { width: 200, height: 200, backend: "svg" });
+    await net.whenReady();
+    const g = buildGraph({ nodeCount: 4, source: [0, 2, 1], target: [1, 3, 2], directed: true, nodeFlow: [0.3, 0.2, 0.3, 0.2] });
+    const modules = [
+      { id: 0, path: [1, 1] }, { id: 1, path: [1, 2] }, { id: 2, path: [2, 1] }, { id: 3, path: [2, 2] },
+    ];
+    net
+      .data(g)
+      .style({
+        directed: true,
+        sizeMode: "screen", // exercises the screen-mode bake of the half-arrow super-edge
+        nodeRadius: 8,
+        linkStyle: "half-arrow",
+        linkBend: 20,
+        linkWidth: 4,
+        flowBorder: { flow: "strength", scale: (v) => v, color: "#123456" }, // → stacked border discs
+      })
+      // aggregateOutline is a LOD option (the ring marks collapsed modules) → halo rings around aggregates.
+      .lod({ modules, expandPx: 20, maxAggregateRadius: 24, aggregateOutline: { width: 1.5, gap: 2.5, color: "#3a3f52" } })
+      .layout({ backend: "positions", positions: new Float32Array([70, 90, 85, 90, 115, 110, 130, 110]) });
+
+    net.setTransform({ k: 1, x: 0, y: 0 });
+    net.syncScreenGeometry();
+    const svg = net.toSVG();
+    // Two collapsed aggregates, each a border disc under a fill disc → 4 circles.
+    expect((svg.match(/<circle/g) ?? []).length).toBe(4);
+    // The aggregate-outline ring is a stroked arc per aggregate (2) + the fused half-arrow super-edge
+    // between the two modules (1) → at least 3 path elements; the half-arrow path is filled.
+    expect((svg.match(/<path/g) ?? []).length).toBeGreaterThanOrEqual(3);
+    expect(svg).toContain("rgba(58, 63, 82"); // the halo ring colour (#3a3f52) reached the export
+
+    net.destroy();
+  });
+
   it("renders flow-border nodes (N6b) through the WebGL lane + LOD without throwing", async () => {
     const net = network(host(), { width: 200, height: 200 });
     await net.whenReady();

@@ -502,7 +502,7 @@ export interface AggregateOutlineResolved {
  * with transparent fill + a `width`-px border) so the gap shows through; drawn as its own
  * instanced-circles layer *under* the nodes. WebGL/LOD-only (the vector full-graph draw has no aggregates).
  */
-export function frontierHalos(tree: LODTree, frontier: Uint32Array, style: AggregateOutlineResolved): InstancedCirclesData {
+export function frontierHalos(tree: LODTree, frontier: Uint32Array, style: AggregateOutlineResolved): FrontierHalosData {
   const maxAgg = style.maxAggregateRadius ?? Infinity;
   const idx: number[] = [];
   for (let i = 0; i < frontier.length; i++) {
@@ -515,8 +515,12 @@ export function frontierHalos(tree: LODTree, frontier: Uint32Array, style: Aggre
   const borders = new Float32Array(count);
   const ring = toRGBA(style.color);
   const borderColors = new Uint8Array(count * 4);
+  // Stable tree-node id per halo, so the Scene path (#138) keys its ring drawables identically to the
+  // frontier glyph they sit behind (and the retained-scene diff stays stable across re-cuts).
+  const ids = new Uint32Array(count);
   for (let k = 0; k < count; k++) {
     const g = frontier[idx[k]!]!;
+    ids[k] = g;
     centers[k * 2] = tree.cx[g]!;
     centers[k * 2 + 1] = tree.cy[g]!;
     // Outer radius = glyph radius + gap + ring width; the ring occupies the outer `width` px, the gap
@@ -530,7 +534,14 @@ export function frontierHalos(tree: LODTree, frontier: Uint32Array, style: Aggre
     borderColors[k * 4 + 3] = ring[3];
   }
   // Transparent fill (alpha 0) so only the border ring shows, leaving a gap to the glyph inside it.
-  return { centers, radii, colors: new Uint8Array(count * 4), borders, borderColors, count };
+  return { centers, radii, colors: new Uint8Array(count * 4), borders, borderColors, count, ids };
+}
+
+/** {@link frontierHalos} output: an {@link InstancedCirclesData} ring batch plus the per-halo tree-node `ids` (the Scene path keys rings by them; the WebGL lane ignores them). The ring `borders`/`borderColors` are always present (a halo *is* a ring). */
+export interface FrontierHalosData extends InstancedCirclesData {
+  ids: Uint32Array;
+  borders: Float32Array;
+  borderColors: Uint8Array;
 }
 
 /** Resolved style for LOD super-edges — the same channels as raw links, applied to accumulated flow. */
@@ -566,11 +577,11 @@ export function superEdges(
   frontier: Uint32Array,
   style: SuperEdgeStyleResolved,
   view: { minX: number; maxX: number; minY: number; maxY: number },
-): { halfArrows?: InstancedHalfArrowsData; lines?: InstancedLinesData; arrows?: InstancedArrowsData } {
+): SuperEdgesData {
   const off = tree.superEdgeOffset;
   const tgt = tree.superEdgeTarget;
   const flw = tree.superEdgeFlow;
-  if (!off || !tgt || !flw) return {};
+  if (!off || !tgt || !flw) return { ids: [] };
 
   const present = new Uint8Array(tree.size);
   for (let i = 0; i < frontier.length; i++) present[frontier[i]!] = 1;
@@ -616,6 +627,11 @@ export function superEdges(
     }
   }
   const count = aS.length;
+  // Stable per-super-edge id (the directed tree-node pair), parallel to `count`. The Scene path (#138)
+  // keys its link drawables by it so the retained-scene diff is stable across re-cuts; the WebGL lane
+  // ignores it. Half-arrows and lines/arrows share the one edge order, so one id array serves both.
+  const ids: number[] = new Array(count);
+  for (let e = 0; e < count; e++) ids[e] = aS[e]! * tree.size + bS[e]!;
   const maxAgg = style.maxAggregateRadius ?? Infinity;
   const drawnRadius = (g: number): number => (g < tree.leafCount ? tree.radius[g]! : Math.min(tree.radius[g]!, maxAgg));
 
@@ -649,7 +665,7 @@ export function superEdges(
       widths[e * 2] = w;
       widths[e * 2 + 1] = opp === undefined ? w : style.widthOf(opp);
     }
-    return { halfArrows: { sources, targets, radii, widths, bends, colors, count } };
+    return { halfArrows: { sources, targets, radii, widths, bends, colors, count }, ids };
   }
 
   // Line style: bent/straight lines ∝ flow; directed → arrowheads set back to the target's (capped)
@@ -660,7 +676,7 @@ export function superEdges(
   const lines: InstancedLinesData = style.bend
     ? { sources, targets, widths, colors, bends, samples: BENT_SAMPLES, count }
     : { sources, targets, widths, colors, count };
-  if (!style.directed) return { lines };
+  if (!style.directed) return { lines, ids };
 
   // Arrowheads orient + set back in-shader (so screen sizeMode is honoured): pass the target centre
   // (already in `targets`) plus its draw radius; the shader puts the tip on the node boundary. A
@@ -669,7 +685,15 @@ export function superEdges(
   const aRadii = new Float32Array(count);
   for (let e = 0; e < count; e++) aRadii[e] = drawnRadius(bS[e]!);
   const arrows: InstancedArrowsData = { sources, targets, radii: aRadii, sizes: new Float32Array(count).fill(style.arrowSize), colors, bends, half: style.bend !== 0, count };
-  return { lines, arrows };
+  return { lines, arrows, ids };
+}
+
+/** {@link superEdges} output: the per-style instanced batches plus the stable per-super-edge `ids` (the Scene path keys link drawables by them; the WebGL lane ignores them). */
+export interface SuperEdgesData {
+  halfArrows?: InstancedHalfArrowsData;
+  lines?: InstancedLinesData;
+  arrows?: InstancedArrowsData;
+  ids: number[];
 }
 
 /** Path-strip samples for a smooth bent link (#104 N6c). */
@@ -1039,5 +1063,155 @@ export function emitHalfLinks(
     if (!geom) continue;
     const out = bake === 1 ? geom : scaleHalfLink(geom, 1 / bake);
     g.drawable(e, (ctx) => traceHalfLink(out, ctx));
+  }
+}
+
+// ---------------------------------------------------------------------------
+// LOD frontier → Scene tracers (#138). The retained-Scene twin of the WebGL
+// instanced LOD lane: trace the *same* SoA {@link frontierCircles}/{@link frontierHalos}/
+// {@link superEdges} produce, so Canvas/SVG draw the byte-identical aggregate map and
+// toSVG() exports a level-of-detail network. Each drawable is keyed by a **stable
+// tree-node id** (frontier node, or directed super-edge pair) so the retained-scene
+// diff stays stable across re-cuts — a module that survives a re-cut keeps its slot
+// (and any selection/highlight on it). Colours come from the layer's fill/stroke
+// accessor reading the SoA byte buffers via {@link rgbaCss}, parallel to these traces.
+// ---------------------------------------------------------------------------
+
+/** RGBA byte quad at instance `i` of a packed colour buffer → a CSS `rgba()` string for a Scene accessor. */
+export function rgbaCss(colors: Uint8Array, i: number): string {
+  return `rgba(${colors[i * 4]},${colors[i * 4 + 1]},${colors[i * 4 + 2]},${colors[i * 4 + 3]! / 255})`;
+}
+
+/**
+ * Trace the LOD frontier's **fill discs** (the inner disc under any border ring) into a Scene group,
+ * keyed by tree-node id. Mirrors {@link frontierCircles}' radius/border semantics: with a border, the
+ * fill radius is `radius·(1 − borderFraction)` — the smaller disc the {@link emitNodes} stacked-disc
+ * border path also draws (the border disc itself is {@link traceFrontierBorders}).
+ */
+export function traceFrontierFills(g: GroupBuilder, circles: InstancedCirclesData, frontier: Uint32Array): void {
+  const { centers, radii, borders } = circles;
+  for (let i = 0; i < circles.count; i++) {
+    const inner = borders ? radii[i]! * (1 - borders[i]!) : radii[i]!;
+    g.point(frontier[i]!, centers[i * 2]!, centers[i * 2 + 1]!, inner);
+  }
+}
+
+/** Trace the LOD frontier's **border discs** (the outer ring-colour disc under each fill), keyed by tree-node id. Empty when the frontier has no border. */
+export function traceFrontierBorders(g: GroupBuilder, circles: InstancedCirclesData, frontier: Uint32Array): void {
+  if (!circles.borders) return;
+  const { centers, radii } = circles;
+  for (let i = 0; i < circles.count; i++) {
+    g.point(frontier[i]!, centers[i * 2]!, centers[i * 2 + 1]!, radii[i]!);
+  }
+}
+
+/**
+ * Trace the aggregate-outline **halo rings** (a `width`-thick stroked circle a `gap` outside each
+ * collapsed-module glyph) into a Scene group, keyed by the halo's tree-node id. In `screen` sizeMode the
+ * ring is pinned at a constant pixel size around the projected centre via the drawable `anchor` (the
+ * same mechanism a `point` uses); in world mode it's plain world geometry. The stroke colour comes from
+ * the layer accessor reading `halos.borderColors`.
+ */
+export function traceFrontierHalos(g: GroupBuilder, halos: FrontierHalosData, screen: boolean): void {
+  const { centers, radii, borders, ids } = halos;
+  for (let k = 0; k < halos.count; k++) {
+    const cx = centers[k * 2]!;
+    const cy = centers[k * 2 + 1]!;
+    const outer = radii[k]!;
+    const w = outer * borders[k]!; // ring thickness (= style.width, in the active sizeMode's units)
+    const mid = outer - w / 2; // stroke centreline radius, so the ring's outer edge sits at `outer`
+    g.drawable(
+      ids[k]!,
+      (ctx) => {
+        ctx.moveTo(cx + mid, cy);
+        ctx.arc(cx, cy, mid, 0, Math.PI * 2);
+      },
+      screen ? { lineWidth: w, anchor: [cx, cy] } : { lineWidth: w },
+    );
+  }
+}
+
+/**
+ * Trace LOD super-edges as filled **half-arrows** (the directed map glyph), keyed by super-edge pair id.
+ * The Scene twin of the WebGL half-arrow lane: builds each shape from the {@link superEdges} SoA via the
+ * same {@link halfLinkGeometry}/{@link traceHalfLink} reference path as {@link emitHalfLinks}, with the
+ * identical `bake` trick — in `screen` sizeMode pass `bake = k` so centres are solved in pixel space and
+ * the result scaled by `1/bake`, reproducing the constant-px GPU render under the Scene's ×k transform.
+ */
+export function traceSuperHalfArrows(g: GroupBuilder, ha: InstancedHalfArrowsData, ids: ArrayLike<number>, bake = 1): void {
+  const inv = 1 / bake;
+  for (let e = 0; e < ha.count; e++) {
+    const geom = halfLinkGeometry({
+      x0: ha.sources[e * 2]! * bake,
+      y0: ha.sources[e * 2 + 1]! * bake,
+      r0: ha.radii[e * 2]!,
+      x1: ha.targets[e * 2]! * bake,
+      y1: ha.targets[e * 2 + 1]! * bake,
+      r1: ha.radii[e * 2 + 1]!,
+      width: ha.widths[e * 2]!,
+      oppositeWidth: ha.widths[e * 2 + 1]!,
+      bend: ha.bends[e]!,
+    });
+    if (!geom) continue;
+    const out = bake === 1 ? geom : scaleHalfLink(geom, inv);
+    g.drawable(ids[e]!, (ctx) => traceHalfLink(out, ctx));
+  }
+}
+
+/** Trace LOD super-edges as **stroked lines** (straight or bent, ∝ flow), keyed by super-edge pair id. World-positioned with a per-line width; the layer's sizeMode applies the px stroke width in screen mode (no bake — endpoints are world, the chord-fraction bend scales with them). */
+export function traceSuperLines(g: GroupBuilder, lines: InstancedLinesData, ids: ArrayLike<number>): void {
+  const { sources, targets, widths, bends } = lines;
+  for (let e = 0; e < lines.count; e++) {
+    const sx = sources[e * 2]!;
+    const sy = sources[e * 2 + 1]!;
+    const tx = targets[e * 2]!;
+    const ty = targets[e * 2 + 1]!;
+    const bend = bends ? bends[e]! : 0;
+    g.drawable(
+      ids[e]!,
+      (ctx) => {
+        ctx.moveTo(sx, sy);
+        if (bend) {
+          const [cxp, cyp] = bezierControl(sx, sy, tx, ty, bend);
+          ctx.quadraticCurveTo(cxp, cyp, tx, ty);
+        } else {
+          ctx.lineTo(tx, ty);
+        }
+      },
+      { lineWidth: widths[e]! },
+    );
+  }
+}
+
+/**
+ * Trace LOD super-edges' directed **arrowheads** as filled triangles, keyed by super-edge pair id —
+ * the Scene twin of {@link emitArrows}, reading the {@link superEdges} SoA (target centre + draw radius
+ * for the boundary setback, size, bend, and `half` for one-sided heads on bent links). Same `bake` trick
+ * for `screen` sizeMode: solve in pixel space (×bake) and emit ÷bake.
+ */
+export function traceSuperArrows(g: GroupBuilder, arrows: InstancedArrowsData, ids: ArrayLike<number>, bake = 1): void {
+  const inv = 1 / bake;
+  const half = arrows.half === true;
+  for (let e = 0; e < arrows.count; e++) {
+    const sx = arrows.sources[e * 2]! * bake;
+    const sy = arrows.sources[e * 2 + 1]! * bake;
+    const tx = arrows.targets[e * 2]! * bake;
+    const ty = arrows.targets[e * 2 + 1]! * bake;
+    const bend = arrows.bends ? arrows.bends[e]! : 0;
+    const [ux, uy] = bend ? bentEndTangent(sx, sy, tx, ty, bend) : straightUnit(sx, sy, tx, ty);
+    const px = -uy;
+    const py = ux;
+    const setback = arrows.radii[e]!;
+    const size = arrows.sizes[e]!;
+    const tipX = tx - ux * setback;
+    const tipY = ty - uy * setback;
+    const baseX = tipX - ux * 2 * size;
+    const baseY = tipY - uy * 2 * size;
+    g.drawable(ids[e]!, (ctx) => {
+      ctx.moveTo(tipX * inv, tipY * inv);
+      ctx.lineTo((half ? baseX : baseX - px * size) * inv, (half ? baseY : baseY - py * size) * inv);
+      ctx.lineTo((baseX + px * size) * inv, (baseY + py * size) * inv);
+      ctx.closePath();
+    });
   }
 }

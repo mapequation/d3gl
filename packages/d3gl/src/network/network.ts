@@ -1,5 +1,5 @@
 import { BaseEngine, type BaseEngineOptions } from "../map/base-engine.js";
-import { networkLayers, frontierCircles, frontierHalos, superEdges, emitNodes, emitLinks, emitArrows, emitHalfLinks, resolveNodeRadii, resolveNodeRadiusAggregate, resolveImportance, resolveFlowBorder, resolveNodeColors, resolveLinkWidthOf, resolveLinkColorOf, resolveLinkStrokeOf, flowBorderInnerRadii, type ResolvedNetworkStyle, type NodeRadiusSpec, type ImportanceSpec, type FlowBorderSpec, type ConstBorder, type LinkWidthSpec, type LinkColorSpec, type LinkStyle } from "./glyphs.js";
+import { networkLayers, frontierCircles, frontierHalos, superEdges, emitNodes, emitLinks, emitArrows, emitHalfLinks, traceFrontierFills, traceFrontierBorders, traceFrontierHalos, traceSuperHalfArrows, traceSuperLines, traceSuperArrows, rgbaCss, resolveNodeRadii, resolveNodeRadiusAggregate, resolveImportance, resolveFlowBorder, resolveNodeColors, resolveLinkWidthOf, resolveLinkColorOf, resolveLinkStrokeOf, flowBorderInnerRadii, type ResolvedNetworkStyle, type NodeRadiusSpec, type ImportanceSpec, type FlowBorderSpec, type ConstBorder, type LinkWidthSpec, type LinkColorSpec, type LinkStyle } from "./glyphs.js";
 import { rgb } from "d3-color";
 import { ForceLayout, seedPositions, type ForceParams } from "./force.js";
 import { multilevelLayout, type CoarsenOptions } from "./coarsen.js";
@@ -119,8 +119,12 @@ export interface NetworkLayoutOptions {
  * expand into their members as you zoom in — bounding per-frame work to the visible frontier. Opt-in
  * via {@link Network.lod}; off by default (every node/link drawn). The tree's geometry updates as the
  * layout converges (so LOD helps during the solve, not only after), and the zoom-time path re-cuts
- * only the visible frontier. Best paired with `style({ sizeMode: "screen" })`. Requires the WebGL
- * (instanced) backend.
+ * only the visible frontier. Best paired with `style({ sizeMode: "screen" })`.
+ *
+ * On the **WebGL** lane the cut re-runs live every pan/zoom frame. On the **Canvas/SVG** (retained)
+ * backends the same frontier draws as Scene layers — so `toSVG()` exports a level-of-detail map (#138) —
+ * but the retained Scene can't re-tessellate per frame, so there the frontier is static during a gesture
+ * and re-cuts on release (the redraw-on-zoom-end model; force one with {@link Network.syncScreenGeometry}).
  */
 export interface NetworkLODOptions {
   /**
@@ -505,10 +509,12 @@ export class Network extends BaseEngine {
   }
 
   /**
-   * Build the instanced layers for the current LOD cut frontier at the live transform. Cost ∝ the
-   * visible frontier, not the graph size. (Nodes now; super-edges + frontier declutter follow.)
+   * Cut the LOD frontier at the live transform, then declutter it. The single per-frame visible-set
+   * computation shared by the WebGL instanced lane ({@link lodLayers}) and the vector retained-Scene
+   * path ({@link registerLODScene}, #138) — so the two backends draw the byte-identical aggregate map
+   * and can't drift. Cost ∝ the visible frontier, not the graph size.
    */
-  private lodLayers(tree: LODTree, style: ResolvedNetworkStyle): InstancedLayer[] {
+  private computeFrontier(tree: LODTree, style: ResolvedNetworkStyle): Uint32Array {
     const opts = this.lodOptions!;
     let frontier = cut(tree, this.transform, this.width, this.height, {
       expandPx: opts.expandPx,
@@ -523,6 +529,16 @@ export class Network extends BaseEngine {
         spacing: opts.declutterSpacing,
       });
     }
+    return frontier;
+  }
+
+  /**
+   * Build the instanced layers for the current LOD cut frontier at the live transform. Cost ∝ the
+   * visible frontier, not the graph size. (Nodes now; super-edges + frontier declutter follow.)
+   */
+  private lodLayers(tree: LODTree, style: ResolvedNetworkStyle): InstancedLayer[] {
+    const opts = this.lodOptions!;
+    const frontier = this.computeFrontier(tree, style);
     const layers: InstancedLayer[] = [];
     // Super-edges first (drawn under the nodes), among the visible frontier only.
     if (opts.superEdges !== false && this.graph!.edgeCount > 0) {
@@ -701,6 +717,13 @@ export class Network extends BaseEngine {
    * clear tessellated geometry when switching to the WebGL instanced lane.
    */
   private registerNetworkScene(graph: NetworkGraph, style: ResolvedNetworkStyle, emit: boolean): void {
+    // LOD on a vector backend (#138): draw the cut frontier as retained Scene layers instead of the full
+    // graph, so Canvas/SVG show the same aggregate map as the WebGL lane and toSVG() exports an LOD
+    // network. Same branch for emit:false (clears the frontier on a backend switch / LOD toggle).
+    if (this.lodReady()) {
+      this.registerLODScene(this.lodTree!, style, emit);
+      return;
+    }
     const edgeIds = Array.from({ length: graph.edgeCount }, (_, e) => e);
     const nodeIds = Array.from({ length: graph.nodeCount }, (_, i) => i);
     // Per-edge link colour (encodes weight/flow); the arrowhead shares it.
@@ -744,6 +767,11 @@ export class Network extends BaseEngine {
         if (emit && style.directed && !halfArrow) emitArrows(g, graph, style.arrowSize, style.nodeRadii, style.linkBend, style.linkBend !== 0, arrowBake);
       },
     });
+    // Aggregate-outline halo ring: only the LOD Scene path ({@link registerLODScene}) draws into it,
+    // but it's registered empty here too so the layer slot exists in canonical order (links < arrows <
+    // node-halos < node-borders < nodes) — so a backend switch / LOD toggle re-registers into the same
+    // slot and the ring never lingers above the nodes nor draws on a full-graph view.
+    this.registerLayer({ name: "node-halos", data: [], ids: [], sizeMode: style.sizeMode, build: () => {} });
     // Per-node fill: a single colour, or the per-node accessor (categorical module colours, #104 rework).
     const fillSpec = this.styleOpts.nodeFill;
     const fillOf = typeof fillSpec === "function" ? (i: number) => fillSpec(i, graph) : () => style.nodeFill;
@@ -796,6 +824,129 @@ export class Network extends BaseEngine {
       fill: (i) => fillOf(i as number),
       build: (g) => {
         if (emit) emitNodes(g, graph, innerRadii);
+      },
+    });
+  }
+
+  /**
+   * Register the LOD cut frontier as retained Scene layers (#138) — the vector-backend twin of
+   * {@link lodLayers}. Computes the same {@link computeFrontier} and traces the *same* SoA
+   * ({@link superEdges}/{@link frontierHalos}/{@link frontierCircles}) into Scene drawables, keyed by
+   * **stable tree-node id** (frontier node, or directed super-edge pair) so the retained-scene diff is
+   * stable across re-cuts. Layers are registered in canonical draw order (links < arrows < node-halos <
+   * node-borders < nodes), each into the same slot the full-graph path uses, so toggling LOD or swapping
+   * backends never reorders or leaves stale geometry. With `emit: false` every layer registers empty (the
+   * frontier clear). Re-run at each interaction-end via {@link syncScreenGeometry} — the retained Scene
+   * can't re-tessellate per frame, so the frontier is static during a gesture and snaps on release (the
+   * agreed redraw-on-zoom-end model).
+   */
+  private registerLODScene(tree: LODTree, style: ResolvedNetworkStyle, emit: boolean): void {
+    const opts = this.lodOptions!;
+    const screen = style.sizeMode === "screen";
+    const frontier = emit ? this.computeFrontier(tree, style) : new Uint32Array(0);
+
+    // --- Super-edges (drawn under the nodes), among the visible frontier only. ---
+    const se =
+      emit && opts.superEdges !== false && this.graph!.edgeCount > 0
+        ? superEdges(
+            tree,
+            frontier,
+            {
+              linkStyle: style.linkStyle,
+              directed: style.directed,
+              widthOf: style.linkWidthOf,
+              colorOf: style.linkColorOf,
+              bend: style.linkBend,
+              arrowSize: style.arrowSize,
+              maxAggregateRadius: opts.maxAggregateRadius,
+            },
+            visibleWorldRect(this.transform, this.width, this.height),
+          )
+        : { ids: [] as number[] };
+    // Screen-mode super-edge shapes BAKE at the current zoom (constant-px tip/setback/bend terms), the
+    // same trick the full-graph path uses; lines need no bake (world endpoints + per-line px width).
+    const seBake = screen ? this.transform.k || 1 : 1;
+    const isHalf = !!se.halfArrows;
+    this.registerLayer({
+      name: "links",
+      data: se.ids,
+      ids: se.ids,
+      // A half-arrow is one filled shape (baked to world in screen mode); a line keeps the sizeMode.
+      sizeMode: isHalf ? "world" : style.sizeMode,
+      ...(isHalf
+        ? { fill: (_d, i) => (se.halfArrows ? rgbaCss(se.halfArrows.colors, i) : "") }
+        : { stroke: (_d, i) => (se.lines ? rgbaCss(se.lines.colors, i) : "") }),
+      build: (g) => {
+        if (se.halfArrows) traceSuperHalfArrows(g, se.halfArrows, se.ids, seBake);
+        else if (se.lines) traceSuperLines(g, se.lines, se.ids);
+      },
+    });
+    // Line-style directed arrowheads (the half-arrow's head is fused into its own filled shape, so this
+    // layer is empty for half-arrows). Baked screen-mode heads live in world coords, like the line.
+    const arrowBake = !isHalf && style.directed && screen ? this.transform.k || 1 : 1;
+    this.registerLayer({
+      name: "arrows",
+      data: se.ids,
+      ids: se.ids,
+      sizeMode: arrowBake !== 1 ? "world" : style.sizeMode,
+      fill: (_d, i) => (se.arrows ? rgbaCss(se.arrows.colors, i) : ""),
+      build: (g) => {
+        if (se.arrows) traceSuperArrows(g, se.arrows, se.ids, arrowBake);
+      },
+    });
+
+    // --- Aggregate-outline halo rings, behind collapsed-module glyphs only (under the nodes). ---
+    const halos =
+      emit && opts.aggregateOutline
+        ? frontierHalos(tree, frontier, {
+            width: opts.aggregateOutline.width ?? 1.5,
+            gap: opts.aggregateOutline.gap ?? 2.5,
+            color: opts.aggregateOutline.color ?? "#3a3f52",
+            maxAggregateRadius: opts.maxAggregateRadius,
+          })
+        : null;
+    const haloIds = halos ? Array.from(halos.ids) : [];
+    this.registerLayer({
+      name: "node-halos",
+      data: haloIds,
+      ids: haloIds,
+      sizeMode: style.sizeMode,
+      stroke: (_d, i) => (halos?.borderColors ? rgbaCss(halos.borderColors, i) : ""),
+      build: (g) => {
+        if (halos) traceFrontierHalos(g, halos, screen);
+      },
+    });
+
+    // --- Frontier glyphs: a border-colour disc (when bordered) under the smaller fill disc. ---
+    const circles = emit
+      ? frontierCircles(tree, frontier, {
+          nodeFill: style.nodeFill,
+          aggregateFill: opts.aggregateFill ?? style.nodeFill,
+          maxAggregateRadius: opts.maxAggregateRadius,
+          border: style.flowBorder,
+          constBorder: style.constBorder,
+          useTreeColor: !!style.nodeColors, // categorical module colours, propagated to aggregates
+        })
+      : null;
+    const circleIds = circles ? Array.from(frontier) : [];
+    this.registerLayer({
+      name: "node-borders",
+      data: circleIds,
+      ids: circleIds,
+      sizeMode: style.sizeMode,
+      fill: (_d, i) => (circles?.borderColors ? rgbaCss(circles.borderColors, i) : ""),
+      build: (g) => {
+        if (circles) traceFrontierBorders(g, circles, frontier);
+      },
+    });
+    this.registerLayer({
+      name: "nodes",
+      data: circleIds,
+      ids: circleIds,
+      sizeMode: style.sizeMode,
+      fill: (_d, i) => (circles ? rgbaCss(circles.colors, i) : ""),
+      build: (g) => {
+        if (circles) traceFrontierFills(g, circles, frontier);
       },
     });
   }
