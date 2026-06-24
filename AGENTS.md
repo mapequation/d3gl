@@ -3,6 +3,15 @@
 Notes for anyone (human or agent) working in this repo. Read before touching geo
 rendering, the build, or the test setup.
 
+## Core values
+
+- **Efficient rendering** — Never increase the computational complexity or memory footprint of the rendering path without first weighing the options and asking me for guidance. Explain the trade-offs concretely: how run time and space grow with the input (node / edge / vertex count) under each option, and how noticeable it will be for a user.
+- **Unified rendering** — Before changing the rendering path, work out how to do it in a unified way across all three backends (WebGL, Canvas, SVG) with shared code — as long as that stays as efficient as a backend-specialized alternative. When you do touch backend-specialized code, check whether the other backends need a corresponding change.
+- **d3 compatibility** — Design the library for d3 compatibility and familiarity, supporting both d3's low-level flexibility and a powerful API that keeps example code simple. It should accept `d3-shape` generators, `d3-geo` projections, `d3-hierarchy` layouts, `d3-scale` scales, and the like.
+- **Clean code** — Casting or reaching for `any` / `unknown` is a sign of bad design; fix the underlying seam (a typed pure function, a test at the right layer) instead. Avoid the non-null assertion operator (`!`) for the same reason, unless it's justified in a performance-critical spot and approved by me.
+- **Regression-safe** — Write tests for both behavior and visual output. Never claim a visual issue is solved without visual testing (browser tests / the backend-equivalence harness). When you change the library, make sure no example breaks.
+- **Up-to-date documentation** — Every major feature should be highlighted on the website landing page and have a minimal example that demonstrates it. As soon as the library changes, keep the documentation — prose and examples — up to date.
+
 ## Library-first design (improve d3gl, don't work around it)
 
 The d3gl library is the product; the website examples and any consumer code are its
