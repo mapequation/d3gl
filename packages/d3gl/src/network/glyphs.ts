@@ -94,6 +94,36 @@ export function resolveNodeRadiusAggregate(
   return { leafValue, radiusOf: spec.scale };
 }
 
+/**
+ * How a node's **declutter importance** is determined: a {@link NodeMetric} (`"degree"`/`"strength"`/
+ * `"flow"`/accessor), a per-node `Float32Array`, or `"order"` (a flat priority — so the survivor of a
+ * cluster falls back to input order, and an aggregate ranks by its subtree size). Resolved per-leaf and
+ * summed up the LOD tree (so a module's importance is its members' total — e.g. total flow), then used
+ * to break overlaps in the declutter: the highest-importance glyph in a cluster is kept.
+ */
+export type ImportanceSpec = NodeMetric | Float32Array | "order";
+
+/**
+ * Resolve an {@link ImportanceSpec} to per-leaf importance values (length `nodeCount`). When unset it
+ * **defaults to the node-size metric** — the `{ by }` of a `nodeRadius: { by, scale }` spec — so the
+ * biggest glyph wins an overlap (consistent with sizing); for a constant / array / degree-function size
+ * it falls back to flat input `"order"`. Called once per `style()` change, never per frame.
+ */
+export function resolveImportance(graph: NetworkGraph, spec: ImportanceSpec | undefined, nodeRadius: NodeRadiusSpec): Float32Array {
+  const n = graph.nodeCount;
+  const effective: ImportanceSpec =
+    spec ?? (typeof nodeRadius === "object" && !(nodeRadius instanceof Float32Array) ? nodeRadius.by : "order");
+  if (effective instanceof Float32Array) {
+    if (effective.length !== n) throw new Error(`importance Float32Array length ${effective.length} !== nodeCount ${n}`);
+    return effective;
+  }
+  if (effective === "order") return new Float32Array(n).fill(1); // flat ⇒ aggregates rank by subtree size, leaves by id order
+  const value = metricAccessor(graph, effective);
+  const out = new Float32Array(n);
+  for (let i = 0; i < n; i++) out[i] = value(i);
+  return out;
+}
+
 /** A constant ring of a fixed pixel width (#104 rework) — e.g. a 1px white outline on every node. */
 export interface ConstBorder {
   width: number;
@@ -785,6 +815,8 @@ export interface ResolvedNetworkStyle {
   nodeRadii: Float32Array;
   /** When sizing by an additive metric, the per-leaf value + scale so LOD aggregates size by summed flow (else null). */
   nodeRadiusAggregate: { leafValue: Float32Array; radiusOf: (value: number) => number } | null;
+  /** Per-leaf declutter importance (length `nodeCount`); summed up the tree → declutter priority. @see {@link resolveImportance} */
+  importance: Float32Array;
   nodeFill: string;
   /** Representative scalar width (for unweighted super-edges + the arrow-size default). */
   linkWidth: number;

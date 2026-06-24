@@ -1,11 +1,12 @@
 import { describe, it, expect } from "vitest";
-import { nodeCircles, linkLines, linkArrows, halfArrowLinks, networkLayers, resolveNodeRadii, type ResolvedNetworkStyle } from "../glyphs.js";
+import { nodeCircles, linkLines, linkArrows, halfArrowLinks, networkLayers, resolveNodeRadii, resolveImportance, type ResolvedNetworkStyle } from "../glyphs.js";
 import { buildGraph } from "../graph.js";
 
 /** A resolved style with a uniform radius for `n` nodes (defaults applied elsewhere). */
 const style = (n: number): ResolvedNetworkStyle => ({
   nodeRadii: new Float32Array(n).fill(4),
   nodeRadiusAggregate: null,
+  importance: new Float32Array(n).fill(1),
   nodeFill: "#000000",
   linkWidth: 1,
   linkWidthOf: () => 1,
@@ -19,6 +20,26 @@ const style = (n: number): ResolvedNetworkStyle => ({
   flowBorder: null,
   constBorder: null,
   linkBend: 0,
+});
+
+describe("resolveImportance", () => {
+  it("defaults to the nodeRadius size metric (so the biggest glyph wins overlaps)", () => {
+    const g = buildGraph({ nodeCount: 3, source: [0, 1], target: [1, 2], nodeFlow: new Float32Array([0.5, 0.25, 0.125]) });
+    const imp = resolveImportance(g, undefined, { by: "flow", scale: (v) => v });
+    expect(Array.from(imp)).toEqual([0.5, 0.25, 0.125]); // per-node flow (exact in Float32)
+  });
+
+  it("falls back to flat input order for a constant size", () => {
+    const g = buildGraph({ nodeCount: 3, source: [0, 1], target: [1, 2] });
+    expect(Array.from(resolveImportance(g, undefined, 5))).toEqual([1, 1, 1]);
+  });
+
+  it("honours an explicit metric or per-node array", () => {
+    const g = buildGraph({ nodeCount: 3, source: [0, 1], target: [1, 2] }); // node 1 has degree 2
+    expect(Array.from(resolveImportance(g, "degree", 5))).toEqual([1, 2, 1]);
+    const custom = new Float32Array([9, 8, 7]);
+    expect(resolveImportance(g, custom, 5)).toBe(custom); // used as-is, no copy
+  });
 });
 
 describe("nodeCircles", () => {

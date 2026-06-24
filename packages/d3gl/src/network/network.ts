@@ -1,5 +1,5 @@
 import { BaseEngine, type BaseEngineOptions } from "../map/base-engine.js";
-import { networkLayers, frontierCircles, frontierHalos, superEdges, emitNodes, emitLinks, emitArrows, emitHalfLinks, resolveNodeRadii, resolveNodeRadiusAggregate, resolveFlowBorder, resolveNodeColors, resolveLinkWidthOf, resolveLinkColorOf, flowBorderInnerRadii, type ResolvedNetworkStyle, type NodeRadiusSpec, type FlowBorderSpec, type ConstBorder, type LinkWidthSpec, type LinkColorSpec, type LinkStyle } from "./glyphs.js";
+import { networkLayers, frontierCircles, frontierHalos, superEdges, emitNodes, emitLinks, emitArrows, emitHalfLinks, resolveNodeRadii, resolveNodeRadiusAggregate, resolveImportance, resolveFlowBorder, resolveNodeColors, resolveLinkWidthOf, resolveLinkColorOf, flowBorderInnerRadii, type ResolvedNetworkStyle, type NodeRadiusSpec, type ImportanceSpec, type FlowBorderSpec, type ConstBorder, type LinkWidthSpec, type LinkColorSpec, type LinkStyle } from "./glyphs.js";
 import { rgb } from "d3-color";
 import { ForceLayout, seedPositions, type ForceParams } from "./force.js";
 import { multilevelLayout, type CoarsenOptions } from "./coarsen.js";
@@ -24,6 +24,13 @@ export interface NetworkStyle {
    * @see {@link NodeRadiusSpec}
    */
   nodeRadius?: NodeRadiusSpec;
+  /**
+   * Per-node **declutter importance** — which glyph wins when two overlap (the kept one). A
+   * {@link NodeMetric}/accessor/`Float32Array`, or `"order"` (input order). Summed up the LOD tree, so a
+   * module's importance is its members' total. Defaults to the {@link nodeRadius} size metric (biggest
+   * wins), falling back to input order for a constant size. @see {@link ImportanceSpec}
+   */
+  importance?: ImportanceSpec;
   /**
    * Node fill colour. A single CSS colour (default a medium blue), or a per-node
    * `(index, graph) => cssColour` accessor — e.g. a categorical palette keyed by module, so a
@@ -591,8 +598,10 @@ export class Network extends BaseEngine {
     // When sizing by an additive metric, aggregates size by the leaf scale on their summed value
     // (flow-sized modules); else null ⇒ the area-additive √Σr² fallback.
     const radiusAggregate = resolved.nodeRadiusAggregate ?? undefined;
+    // Declutter importance (per-leaf, summed up the tree): defaults to the size metric — see resolveImportance.
+    const leafWeight = resolved.importance;
     if (this.lodWorkerTree) {
-      computeLODStyle(this.lodWorkerTree, nodeRadii, this.graph.strength, leafBorder, leafColors, radiusAggregate);
+      computeLODStyle(this.lodWorkerTree, nodeRadii, leafWeight, leafBorder, leafColors, radiusAggregate);
       this.lodTree = this.lodWorkerTree;
       this.lodHasGeometry = true;
       return;
@@ -625,7 +634,7 @@ export class Network extends BaseEngine {
         this.lodModules = false;
       }
     }
-    computeLODGeometry(this.lodTree, this.graph, nodeRadii, undefined, leafBorder, leafColors, radiusAggregate);
+    computeLODGeometry(this.lodTree, this.graph, nodeRadii, leafWeight, leafBorder, leafColors, radiusAggregate);
     this.lodHasGeometry = true;
   }
 
@@ -822,6 +831,7 @@ export class Network extends BaseEngine {
     return {
       nodeRadii: resolveNodeRadii(graph, nodeRadiusSpec),
       nodeRadiusAggregate: resolveNodeRadiusAggregate(graph, nodeRadiusSpec),
+      importance: resolveImportance(graph, this.styleOpts.importance, nodeRadiusSpec),
       nodeFill,
       nodeColors,
       linkWidth,
