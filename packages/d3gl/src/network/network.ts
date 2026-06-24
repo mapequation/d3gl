@@ -808,8 +808,8 @@ export class Network extends BaseEngine {
   /** Apply style defaults (drawn order is decided by {@link networkLayers}). */
   private resolvedStyle(graph: NetworkGraph): ResolvedNetworkStyle {
     // linkWidth: a constant, a (weight)=>width scale, or {by,scale}. `linkWidthOf` is the per-edge
-    // function; `linkWidth` is a representative scalar, used only for the arrow-size default now (the
-    // super-edges size per-edge by accumulated flow, so there's no uniform-width path to mis-scale).
+    // function; `linkWidth` is a representative scalar (the weight-1 width), used only for the
+    // arrow-size default below.
     const lwSpec = this.styleOpts.linkWidth ?? DEFAULT_LINK_WIDTH;
     const linkWidthOf = resolveLinkWidthOf(lwSpec);
     const linkWidth = typeof lwSpec === "number" ? lwSpec : linkWidthOf(1) || DEFAULT_LINK_WIDTH;
@@ -840,7 +840,10 @@ export class Network extends BaseEngine {
       linkColorOf,
       linkStrokeOf,
       linkStyle: this.styleOpts.linkStyle ?? "line",
-      arrowSize: this.styleOpts.arrowSize ?? 3 * linkWidth,
+      // Default arrow size derived from link width like the half-arrow tip (10·width^⅓): the triangle
+      // is 2·size long, so size = 5·width^⅓ gives a head comparable to the half-arrow's and stays
+      // visible for thin links (sublinear) without ballooning for thick ones.
+      arrowSize: this.styleOpts.arrowSize ?? 5 * Math.cbrt(linkWidth),
       directed: this.styleOpts.directed ?? graph.directed,
       sizeMode: this.styleOpts.sizeMode ?? "world",
       flowBorder: this.styleOpts.flowBorder ? resolveFlowBorder(graph, this.styleOpts.flowBorder, nodeFill) : null,
