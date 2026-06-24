@@ -645,8 +645,8 @@ export function superEdges(
     return { halfArrows: { sources, targets, radii, widths, bends, colors, count } };
   }
 
-  // Line style: bent/straight lines ∝ flow; directed → one-sided arrowheads set back to the target's
-  // (capped) boundary along the bent end-tangent. Same colour as the line.
+  // Line style: bent/straight lines ∝ flow; directed → arrowheads set back to the target's (capped)
+  // boundary along the bent end-tangent. Same colour as the line.
   const widths = new Float32Array(count);
   for (let e = 0; e < count; e++) widths[e] = style.widthOf(wS[e]!);
   const bends = new Float32Array(count).fill(style.bend);
@@ -656,10 +656,12 @@ export function superEdges(
   if (!style.directed) return { lines };
 
   // Arrowheads orient + set back in-shader (so screen sizeMode is honoured): pass the target centre
-  // (already in `targets`) plus its draw radius; the shader puts the tip on the node boundary.
+  // (already in `targets`) plus its draw radius; the shader puts the tip on the node boundary. A
+  // one-sided **half** head only for bent links (so reciprocal heads don't collide); straight links
+  // get the symmetric triangle — matching the non-LOD path (`half: bend !== 0`).
   const aRadii = new Float32Array(count);
   for (let e = 0; e < count; e++) aRadii[e] = drawnRadius(bS[e]!);
-  const arrows: InstancedArrowsData = { sources, targets, radii: aRadii, sizes: new Float32Array(count).fill(style.arrowSize), colors, bends, half: true, count };
+  const arrows: InstancedArrowsData = { sources, targets, radii: aRadii, sizes: new Float32Array(count).fill(style.arrowSize), colors, bends, half: style.bend !== 0, count };
   return { lines, arrows };
 }
 
