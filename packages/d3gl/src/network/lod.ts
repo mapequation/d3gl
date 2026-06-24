@@ -280,10 +280,22 @@ export function buildSuperEdges(
 }
 
 /** Allocate zeroed geometry arrays over a topology, yielding a renderable {@link LODTree}. */
+/** Derive the parent map from the children CSR (parent = inverse of children), root = -1. O(size), once per build. */
+function deriveParent(topo: LODTopology): Int32Array {
+  const parent = new Int32Array(topo.size).fill(-1);
+  for (let g = 0; g < topo.size; g++) {
+    for (let p = topo.childOffset[g]!; p < topo.childOffset[g + 1]!; p++) parent[topo.children[p]!] = g;
+  }
+  return parent;
+}
+
 function attachGeometry(topo: LODTopology): LODTree {
   const { size } = topo;
   return {
     ...topo,
+    // Ensure a parent map (the spatial-quadtree builder doesn't set one) so the cross-fade declutter
+    // can test ancestry (#133). Coarsening/module topologies already carry it, so this is a no-op there.
+    parent: topo.parent ?? deriveParent(topo),
     cx: new Float32Array(size),
     cy: new Float32Array(size),
     extent: new Float32Array(size),
@@ -887,6 +899,13 @@ export function isLeaf(tree: LODTree, g: number): boolean {
   return g < tree.leafCount;
 }
 
+/** True when `a` and `b` lie on the same root-to-leaf path — i.e. one is an ancestor of the other. O(depth). */
+function onSamePath(a: number, b: number, parent: Int32Array): boolean {
+  for (let x = parent[a]!; x >= 0; x = parent[x]!) if (x === b) return true;
+  for (let x = parent[b]!; x >= 0; x = parent[x]!) if (x === a) return true;
+  return false;
+}
+
 export interface DeclutterOptions {
   /** True when glyphs are sized in screen pixels (`sizeMode: "screen"`); else world radii × k. */
   screenSized: boolean;
@@ -896,6 +915,13 @@ export interface DeclutterOptions {
   maxAggregateRadius?: number;
   /** Spacing multiplier on the exclusion radius (>1 = sparser, <1 = denser). Default 1. */
   spacing?: number;
+  /**
+   * Cross-fade alpha (#133), indexed by tree-node id. A glyph mid-transition (`fadeAlpha[g] < 1`) is
+   * **exempt** from declutter — it can't be culled by its (also-transitioning) parent nor cull its
+   * children, so the split/merge cross-fades smoothly instead of the children popping in after the
+   * parent has faded out. Absent ⇒ normal declutter (zero added cost).
+   */
+  fadeAlpha?: Float32Array;
 }
 
 /**
@@ -935,7 +961,13 @@ export function declutterFrontier(
   // shared greedy declutter (one engine across backends + the geo layers — see core/declutter).
   const order = Array.from({ length: F }, (_, i) => i);
   order.sort((a, b) => tree.weight[frontier[b]!]! - tree.weight[frontier[a]!]!);
-  const kept = declutterScreen(F, px, py, pr, order, width, height, spacing, new Uint8Array(F));
+  // Cross-fade (#133): a transitioning glyph ignores its ANCESTOR as an occluder, so a fading parent
+  // doesn't cull its fading-in children — but children still declutter against siblings (and the parent
+  // still occludes unrelated glyphs). Only the fade adds a parent+child pair to the frontier (it's
+  // otherwise an antichain), so ancestry alone identifies the pairs; gate on the fade pass for zero cost.
+  const par = opts.fadeAlpha ? tree.parent : undefined;
+  const ignore = par ? (i: number, j: number) => onSamePath(frontier[i]!, frontier[j]!, par) : undefined;
+  const kept = declutterScreen(F, px, py, pr, order, width, height, spacing, new Uint8Array(F), undefined, ignore);
 
   let n = 0;
   for (let i = 0; i < F; i++) if (kept[i]) n++;

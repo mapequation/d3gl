@@ -567,6 +567,8 @@ export class Network extends BaseEngine {
         k: this.transform.k,
         maxAggregateRadius: opts.maxAggregateRadius,
         spacing: opts.declutterSpacing,
+        // Cross-fade (#133): transitioning glyphs are exempt, so a fading parent never culls its fading-in children.
+        fadeAlpha: this.fadeAlpha ?? undefined,
       });
     }
     return frontier;
