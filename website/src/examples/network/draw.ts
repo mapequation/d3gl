@@ -63,7 +63,7 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
       const edgeWidth =
         options.edge === "Uniform"
           ? 0.8
-          : { by: "weight" as const, scale: scaleSqrt().domain([1, 25]).range([0.5, 2]).clamp(true) };
+          : { by: "weight" as const, scale: scaleSqrt().domain([1, 25]).range([0.5, 5]).clamp(true) };
       // Colour by weight via a d3 colour scale: light/translucent at weight 1 → darker/opaque with
       // accumulated super-edge weight (scaleSqrt interpolates the RGBA range, alpha included).
       const linkStroke = {
@@ -77,7 +77,7 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
           directed,
           nodeRadius: options.size === "Uniform" ? 5 : degreeRadius(graph),
           nodeFill: "#4878d0",
-          linkWidth: edgeWidth, // Edge size: Uniform (0.8) or ∝ √weight in [0.5, 2]
+          linkWidth: edgeWidth, // Edge size: Uniform (0.8) or ∝ √weight in [0.5, 5]
           linkStroke, // darker + more opaque with accumulated weight (arrowhead shares it)
           // arrowSize left unset → defaults to a function of link width (≈ the half-arrow tip).
           // "Screen" keeps glyphs a constant pixel size while you zoom (they don't vanish when

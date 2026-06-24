@@ -84,10 +84,13 @@ Every visual channel maps a flow quantity through a d3 scale, so the map reads q
 - **`flowBorder`** — `flow` is a per-node value (your `Float32Array` of enter/exit flow, or a built-in
   metric like `"strength"`); `scale` maps it to ring width and `color` may be a per-node accessor so
   the ring colour encodes it too. d3gl doesn't compute enter/exit flow — you supply it (Infomap gives it).
-- **`linkWidth` + `linkStroke`** — link flow (the per-edge weight) → half-arrow width **and** colour
-  (both accept a `(weight) => …` scale; a **super-edge** applies the same scale to its accumulated
-  subsumed weight). The arrowhead is part of the shape, so it always takes the link's colour — there
-  is no separate arrow fill. Keep range minimums ≥ 1 so nothing vanishes at low flow.
+- **`linkWidth` + `linkStroke`** — link flow (the per-edge weight) → half-arrow width **and** colour.
+  Each takes a constant, a `(weight) => …` scale (a bare d3 colour scale fits `linkStroke` —
+  `scaleSqrt().range([light, dark])` interpolates RGBA, alpha included), or **`{ by, scale }`** like
+  `nodeRadius` (`by` is `"weight"`/`"flow"`). A **super-edge** applies the same scale to its accumulated
+  subsumed weight, so a heavier super-edge reads as thicker and darker. The arrowhead is part of the
+  shape, so it always takes the link's colour — there is no separate arrow fill. Keep range minimums
+  ≥ 1 so nothing vanishes at low flow.
 - **`linkBend`** — for half-arrows, an absolute world-unit ⟂ offset (the reference's `bend`); the bow
   side is derived from the link direction so reciprocal links nest automatically.
 
@@ -138,7 +141,7 @@ net
     expandPx: 48,            // expand an aggregate once its on-screen footprint reaches ~48px
     aggregateFill: "#7f97c8",
     maxAggregateRadius: 26,  // cap the aggregate glyph size (pixels, in screen sizeMode)
-    declutter: true,         // thin overlapping glyphs by importance (strength)
+    declutter: true,         // thin overlapping glyphs by importance (default: the node-size metric)
     superEdges: true,        // summarise connectivity between aggregates
   });
 net.lod(false); // back to drawing every element
@@ -146,11 +149,14 @@ net.lod(false); // back to drawing every element
 
 What it composes:
 
-- **Aggregates** carry their subtree's centroid, an area-additive radius (so a big cluster reads as a
-  big glyph), and an importance weight (default **strength**). Aggregate identity is stable, so they
-  don't pop as you pan.
-- **Declutter** drops glyphs that would overlap a kept one, keeping the highest-importance member —
-  zoom-dependent, so more resolve as you zoom in.
+- **Aggregates** carry their subtree's centroid and a radius (area-additive `√Σr²`, or — when sizing
+  by an additive metric like `flow` — the same node scale applied to the summed child value, so a
+  module reads as its total flow). Aggregate identity is stable, so they don't pop as you pan.
+- **Declutter** drops glyphs that would overlap a kept one, keeping the highest-**importance** member —
+  zoom-dependent, so more resolve as you zoom in. Importance is summed up the tree (a module's is its
+  members' total) and set by `style({ importance })` — a metric (`"degree"`/`"strength"`/`"flow"`), an
+  accessor, a `Float32Array`, or `"order"`. It **defaults to the node-size metric**, so the biggest
+  glyph wins an overlap.
 - **Super-edges** draw connectivity between visible nodes (a leaf↔leaf graph edge, or an
   aggregate↔aggregate coarse edge); a visible node keeps its edges even when a neighbour is
   off-screen.
