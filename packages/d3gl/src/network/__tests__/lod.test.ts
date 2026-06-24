@@ -80,7 +80,8 @@ describe("worker-LOD split (#103)", () => {
   it("flattenHierarchyToTopology reproduces buildLODTree's topology (worker builds the same tree)", () => {
     const g = placed();
     const main = buildLODTree(g, { minNodes: 2 });
-    const topo = flattenHierarchyToTopology(buildHierarchy(g, { minNodes: 2 }), g.nodeCount);
+    // The worker builds the same tree — including the flow-weighted super-edge CSR (it passes edges too).
+    const topo = flattenHierarchyToTopology(buildHierarchy(g, { minNodes: 2 }), g.nodeCount, { source: g.source, target: g.target, weight: g.weight });
 
     expect(topo.size).toBe(main.size);
     expect(topo.leafCount).toBe(main.leafCount);
@@ -90,6 +91,8 @@ describe("worker-LOD split (#103)", () => {
     expect(Array.from(topo.children)).toEqual(Array.from(main.children));
     expect(Array.from(topo.edgeOffset)).toEqual(Array.from(main.edgeOffset));
     expect(Array.from(topo.edgeNeighbors)).toEqual(Array.from(main.edgeNeighbors));
+    expect(Array.from(topo.superEdgeOffset!)).toEqual(Array.from(main.superEdgeOffset!));
+    expect(Array.from(topo.superEdgeFlow!)).toEqual(Array.from(main.superEdgeFlow!));
   });
 
   it("computeLODPositions + computeLODStyle equals the fused computeLODGeometry", () => {
