@@ -183,6 +183,7 @@ function buildModuleTopology(nodeCount: number, records: ArrayLike<ModuleNode>, 
     children,
     edgeOffset: new Uint32Array(size + 1), // undirected coarse adjacency unused for module trees
     edgeNeighbors: new Uint32Array(0),
+    parent, // lets the cross-level super-edge gather walk a node up to its present ancestor (#139)
   };
   if (edges) Object.assign(topo, buildSuperEdges(size, parent, edges));
   return topo;

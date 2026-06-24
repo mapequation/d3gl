@@ -433,6 +433,12 @@ export interface FrontierStyleResolved {
   constBorder?: ConstBorder | null;
   /** Colour each frontier glyph by the tree's per-node `color` (categorical module colours) instead of `nodeFill`/`aggregateFill`. */
   useTreeColor?: boolean;
+  /**
+   * Cross-fade alpha (#133), indexed by tree-node id (from {@link cut} with a fade band). When set, each
+   * glyph's colour alpha is scaled by `fadeAlpha[g]`, so an aggregate eases out as its children ease in
+   * across the expand threshold. Absent ⇒ glyphs draw at full opacity.
+   */
+  fadeAlpha?: Float32Array;
 }
 
 /**
@@ -473,18 +479,29 @@ export function frontierCircles(tree: LODTree, frontier: Uint32Array, style: Fro
       colors[i * 4 + 3] = c[3];
     }
   }
-  const base = { centers, radii, colors, count };
+  let result: InstancedCirclesData = { centers, radii, colors, count };
   if (style.border) {
     const { scale, color, colors: explicit, darken } = style.border;
     // `darken` (no explicit ring colour) ⇒ each glyph's ring = its own (module) colour darkened — so a
     // collapsed module's ring is a darker shade of that module's hue, not one shared colour.
     const borderColors = darken !== undefined ? darkenColors(colors, count, darken) : explicit;
-    return { ...base, ...buildBorders(count, radii, (i) => tree.border[frontier[i]!]!, scale, color, borderColors) };
+    result = { ...result, ...buildBorders(count, radii, (i) => tree.border[frontier[i]!]!, scale, color, borderColors) };
+  } else if (style.constBorder) {
+    result = { ...result, ...constBorderArrays(count, radii, style.constBorder.width, style.constBorder.color) };
   }
-  if (style.constBorder) {
-    return { ...base, ...constBorderArrays(count, radii, style.constBorder.width, style.constBorder.color) };
+  // Cross-fade (#133): scale fill (and ring) alpha by the per-node fade alpha, so a transitioning
+  // aggregate/child eases across the expand threshold.
+  if (style.fadeAlpha) {
+    scaleAlpha(result.colors, count, frontier, style.fadeAlpha);
+    scaleAlpha(result.borderColors, count, frontier, style.fadeAlpha);
   }
-  return base;
+  return result;
+}
+
+/** Scale each RGBA quad's alpha byte by the per-node cross-fade alpha `fadeAlpha[ids[i]]` (#133). No-op when `colors` is absent. */
+function scaleAlpha(colors: Uint8Array | undefined, count: number, ids: ArrayLike<number>, fadeAlpha: Float32Array): void {
+  if (!colors) return;
+  for (let i = 0; i < count; i++) colors[i * 4 + 3] = Math.round(colors[i * 4 + 3]! * (fadeAlpha[ids[i]!] ?? 1));
 }
 
 /** Resolved aggregate-outline style: a `width`-px ring `gap` px outside aggregate glyphs, in `color`. */
@@ -493,6 +510,8 @@ export interface AggregateOutlineResolved {
   gap: number;
   color: string;
   maxAggregateRadius?: number;
+  /** Cross-fade alpha (#133), indexed by tree-node id — scales each ring's alpha so a halo fades with its aggregate. */
+  fadeAlpha?: Float32Array;
 }
 
 /**
@@ -533,6 +552,8 @@ export function frontierHalos(tree: LODTree, frontier: Uint32Array, style: Aggre
     borderColors[k * 4 + 2] = ring[2];
     borderColors[k * 4 + 3] = ring[3];
   }
+  // Cross-fade (#133): a halo fades with its aggregate (ring alpha scaled by the per-node fade alpha).
+  if (style.fadeAlpha) scaleAlpha(borderColors, count, ids, style.fadeAlpha);
   // Transparent fill (alpha 0) so only the border ring shows, leaving a gap to the glyph inside it.
   return { centers, radii, colors: new Uint8Array(count * 4), borders, borderColors, count, ids };
 }
@@ -559,6 +580,18 @@ export interface SuperEdgeStyleResolved {
   arrowSize: number;
   /** Aggregate draw-radius cap, so a tip/setback sits at the (capped) module boundary, not its centre. */
   maxAggregateRadius?: number;
+  /**
+   * Also draw **mixed-level** super-edges (#139): an off-frontier on-screen neighbour is projected to its
+   * nearest present ancestor (`coverOf`) and the edge drawn there, deduped. Off by default and **zero
+   * added cost when off** — the projection pass runs only when this is `true`. Needs `tree.parent`.
+   */
+  crossLevelEdges?: boolean;
+  /**
+   * Cross-fade alpha (#133), indexed by tree-node id. When set, each super-edge's alpha is scaled by the
+   * least-visible of its two *present* endpoints (off-screen endpoints count as opaque), so an edge fades
+   * with the aggregate/child it connects. Absent ⇒ edges draw at full opacity.
+   */
+  fadeAlpha?: Float32Array;
 }
 
 /**
@@ -626,6 +659,63 @@ export function superEdges(
       }
     }
   }
+  // Mixed-level super-edges (#139): the same-level walk skips an off-frontier *on-screen* neighbour (the
+  // collapsed↔expanded mismatch). Project it to its nearest present ancestor (`coverOf`) and draw the
+  // edge there, deduping per directed pair to sum flow. Iterating from each present node covers both
+  // directions: the finer present side projects the coarser neighbour *up* to a present ancestor; the
+  // coarse side's walk into a finer-expanded region can't project up (its present nodes are below it) and
+  // is simply redundant — so there's no double counting. Gated on `crossLevelEdges` (+ the parent map),
+  // so it's ZERO added cost when off (the same-level gather above is untouched).
+  const par = tree.parent;
+  if (style.crossLevelEdges && par) {
+    // Nearest present ancestor of `h` (climb parents), or -1 if none — memoised with path-compression so
+    // the whole pass stays O(visible-degree · depth), not O(visible-degree · depth²).
+    const cover = new Int32Array(tree.size).fill(-2); // -2 unknown, -1 none, ≥0 present ancestor
+    const coverOf = (h: number): number => {
+      let x = h;
+      while (x >= 0 && cover[x] === -2 && !present[x]) x = par[x]!;
+      const c = x < 0 ? -1 : present[x] ? x : cover[x]!;
+      for (let y = h; y >= 0 && y !== x; y = par[y]!) cover[y] = c; // backfill the climbed chain
+      return c;
+    };
+    const proj = new Map<number, number>(); // directed pair key (a·size + b) → summed flow
+    // Out: a present node's out-edge to an off-frontier on-screen target → project the target up (g → c).
+    for (let i = 0; i < frontier.length; i++) {
+      const g = frontier[i]!;
+      for (let p = off[g]!; p < off[g + 1]!; p++) {
+        const h = tgt[p]!;
+        if (present[h] || offScreen(h)) continue; // already emitted by the same-level walk
+        const c = coverOf(h);
+        if (c >= 0 && c !== g) {
+          const key = g * tree.size + c;
+          proj.set(key, (proj.get(key) ?? 0) + flw[p]!);
+        }
+      }
+    }
+    // In: a present node's in-edge from an off-frontier on-screen source → project the source up (c → g).
+    if (inOff && inSrc && inFlw) {
+      for (let i = 0; i < frontier.length; i++) {
+        const g = frontier[i]!;
+        for (let p = inOff[g]!; p < inOff[g + 1]!; p++) {
+          const s = inSrc[p]!;
+          if (present[s] || offScreen(s)) continue; // present: from its out-walk; off-screen: handled above
+          const c = coverOf(s);
+          if (c >= 0 && c !== g) {
+            const key = c * tree.size + g;
+            proj.set(key, (proj.get(key) ?? 0) + inFlw[p]!);
+          }
+        }
+      }
+    }
+    for (const [key, w] of proj) {
+      const a = Math.floor(key / tree.size);
+      const b = key - a * tree.size;
+      aS.push(a);
+      bS.push(b);
+      wS.push(w);
+      flowByPair.set(key, w); // both endpoints present → feed reciprocal half-arrow widths too
+    }
+  }
   const count = aS.length;
   // Stable per-super-edge id (the directed tree-node pair), parallel to `count`. The Scene path (#138)
   // keys its link drawables by it so the retained-scene diff is stable across re-cuts; the WebGL lane
@@ -639,6 +729,9 @@ export function superEdges(
   const sources = new Float32Array(count * 2);
   const targets = new Float32Array(count * 2);
   const colors = new Uint8Array(count * 4);
+  // Cross-fade (#133): scale an edge's alpha by its least-visible present endpoint (off-screen endpoints
+  // are opaque), so it fades with the aggregate/child it connects. `fa` undefined ⇒ full opacity.
+  const fa = style.fadeAlpha;
   for (let e = 0; e < count; e++) {
     const g = aS[e]!;
     const h = bS[e]!;
@@ -650,7 +743,13 @@ export function superEdges(
     colors[e * 4] = cr;
     colors[e * 4 + 1] = cg;
     colors[e * 4 + 2] = cb;
-    colors[e * 4 + 3] = ca;
+    if (fa) {
+      const af = present[g] ? fa[g]! : 1;
+      const bf = present[h] ? fa[h]! : 1;
+      colors[e * 4 + 3] = Math.round(ca * Math.min(af, bf));
+    } else {
+      colors[e * 4 + 3] = ca;
+    }
   }
 
   if (style.linkStyle === "half-arrow" && style.directed) {

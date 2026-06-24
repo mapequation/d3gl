@@ -173,6 +173,30 @@ export interface NetworkLODOptions {
    * rendered in the active `linkStyle`. Default `true`. @see {@link superEdges}
    */
   superEdges?: boolean;
+  /**
+   * Also draw super-edges between **mixed-level** visible nodes — a visible leaf (or finer aggregate)
+   * and a visible *coarser* aggregate at a different cut level (the collapsed↔expanded mismatch). By
+   * default such an edge is dropped: when you zoom into one region, its leaves lose their links to the
+   * still-collapsed regions until both sides are at the same level again. With this on, the off-frontier
+   * on-screen endpoint is projected to its **nearest present ancestor** and the edge is drawn there
+   * (flows deduped), so aggregates keep their context across a mixed frontier (#139).
+   *
+   * **Off by default and zero added cost when off** — the projection (an `O(depth)` ancestor walk per
+   * off-frontier on-screen edge + a dedup map) runs only when enabled; the same-level gather is unchanged.
+   * Needs the directed super-edge CSR (a provided {@link modules} hierarchy); ignored otherwise.
+   */
+  crossLevelEdges?: boolean;
+  /**
+   * **Cross-fade** level transitions (#133): the half-width, as a fraction of {@link expandPx}, of the
+   * zoom band around the expand threshold over which an aggregate and its children are drawn *together*
+   * — the aggregate easing out (opacity 1→0) as its children ease in (0→1, smoothstep) — so a split/merge
+   * reads smoothly instead of popping. e.g. `0.3` fades over `[expandPx·0.7, expandPx·1.3]`. Applies to
+   * the frontier glyphs, their borders/halos, and the super-edges (which fade with their endpoints).
+   *
+   * **Off by default and zero added cost when off** (`0`/omitted ⇒ the hard threshold): only the
+   * transitioning band of the frontier is doubled, and the per-node alpha pass runs only when set.
+   */
+  crossFade?: number;
   /** Coarsening granularity for the LOD tree (depth / minimum aggregate size). */
   coarsen?: CoarsenOptions;
   /**
@@ -240,6 +264,10 @@ export class Network extends BaseEngine {
   private lodFallbackScheduled = false;
   /** Whether `lodTree` has had its geometry computed at least once, so the cut may run. */
   private lodHasGeometry = false;
+  /** Reusable cross-fade scratch (#133), indexed by tree-node id; grown as the tree grows, reused per cut to avoid GC. */
+  private fadeScratch: Float32Array | null = null;
+  /** The fade alpha the last {@link computeFrontier} produced (the live `fadeScratch`), or null when cross-fade is off. */
+  private fadeAlpha: Float32Array | null = null;
   /** Cached resolved style; invalidated on style()/data() to avoid per-zoom O(n) radii recompute. */
   private resolvedCache: ResolvedNetworkStyle | null = null;
 
@@ -516,10 +544,22 @@ export class Network extends BaseEngine {
    */
   private computeFrontier(tree: LODTree, style: ResolvedNetworkStyle): Uint32Array {
     const opts = this.lodOptions!;
+    // Cross-fade (#133): when a band is set, give the cut a reusable scratch (indexed by tree-node id) to
+    // write per-node alpha into. The cut only writes frontier nodes; downstream readers only read those,
+    // so no per-frame reset is needed. Off ⇒ null, and the cut takes its zero-cost hard-threshold path.
+    const fadeBand = opts.crossFade && opts.crossFade > 0 ? opts.crossFade : 0;
+    if (fadeBand > 0) {
+      if (!this.fadeScratch || this.fadeScratch.length < tree.size) this.fadeScratch = new Float32Array(tree.size);
+      this.fadeAlpha = this.fadeScratch;
+    } else {
+      this.fadeAlpha = null;
+    }
     let frontier = cut(tree, this.transform, this.width, this.height, {
       expandPx: opts.expandPx,
       screenSized: style.sizeMode === "screen",
       maxAggregateRadius: opts.maxAggregateRadius,
+      fadeBand,
+      fadeAlpha: this.fadeAlpha ?? undefined,
     });
     if (opts.declutter !== false) {
       frontier = declutterFrontier(tree, frontier, this.transform, this.width, this.height, {
@@ -558,6 +598,8 @@ export class Network extends BaseEngine {
           bend: style.linkBend,
           arrowSize: style.arrowSize,
           maxAggregateRadius: opts.maxAggregateRadius,
+          crossLevelEdges: opts.crossLevelEdges,
+          fadeAlpha: this.fadeAlpha ?? undefined,
         },
         visibleWorldRect(this.transform, this.width, this.height),
       );
@@ -573,6 +615,7 @@ export class Network extends BaseEngine {
         gap: opts.aggregateOutline.gap ?? 2.5,
         color: opts.aggregateOutline.color ?? "#3a3f52",
         maxAggregateRadius: opts.maxAggregateRadius,
+        fadeAlpha: this.fadeAlpha ?? undefined,
       });
       if (halos.count > 0) layers.push({ name: "node-halos", primitive: "circles", circles: halos, sizeMode: style.sizeMode });
     }
@@ -583,6 +626,7 @@ export class Network extends BaseEngine {
       border: style.flowBorder,
       constBorder: style.constBorder,
       useTreeColor: !!style.nodeColors, // categorical module colours, propagated to aggregates
+      fadeAlpha: this.fadeAlpha ?? undefined,
     });
     layers.push({ name: "nodes", primitive: "circles", circles, sizeMode: style.sizeMode });
     return layers;
@@ -859,6 +903,8 @@ export class Network extends BaseEngine {
               bend: style.linkBend,
               arrowSize: style.arrowSize,
               maxAggregateRadius: opts.maxAggregateRadius,
+              crossLevelEdges: opts.crossLevelEdges,
+              fadeAlpha: this.fadeAlpha ?? undefined,
             },
             visibleWorldRect(this.transform, this.width, this.height),
           )
@@ -903,6 +949,7 @@ export class Network extends BaseEngine {
             gap: opts.aggregateOutline.gap ?? 2.5,
             color: opts.aggregateOutline.color ?? "#3a3f52",
             maxAggregateRadius: opts.maxAggregateRadius,
+            fadeAlpha: this.fadeAlpha ?? undefined,
           })
         : null;
     const haloIds = halos ? Array.from(halos.ids) : [];
@@ -926,6 +973,7 @@ export class Network extends BaseEngine {
           border: style.flowBorder,
           constBorder: style.constBorder,
           useTreeColor: !!style.nodeColors, // categorical module colours, propagated to aggregates
+          fadeAlpha: this.fadeAlpha ?? undefined,
         })
       : null;
     const circleIds = circles ? Array.from(frontier) : [];
