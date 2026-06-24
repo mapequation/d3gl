@@ -97,6 +97,10 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
                 maxAggregateRadius: 26,
                 declutter: options.declutter !== "Off",
                 superEdges: options.edges !== "Off",
+                // Opt-in #139: also link a visible leaf to a still-collapsed module across a mixed frontier.
+                crossLevelEdges: options.crossLevel === "On",
+                // Opt-in #133: ease aggregates ↔ children across the expand threshold (slider × 0.1 = band).
+                crossFade: ((options.crossFade as number) ?? 0) * 0.1,
               }
             : false,
         )

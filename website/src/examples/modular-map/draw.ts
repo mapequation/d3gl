@@ -98,16 +98,20 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
       const mode = (options.lod as string) ?? "Modules";
       // A thin outline ring, set a few px outside the glyph, marks collapsed aggregates as expandable.
       const aggregateOutline = { width: 1.5, gap: 3 };
+      // Opt-in #139: keep a visible leaf's links to a still-collapsed module across a mixed frontier.
+      // Opt-in #133: ease modules ↔ sub-members across the expand threshold (slider × 0.1 = fade band).
+      const crossLevelEdges = options.crossLevel === "On";
+      const crossFade = ((options.crossFade as number) ?? 0) * 0.1;
       if (mode === "Off") {
         net.lod(false);
       } else if (mode === "Standard") {
         // Structural coarsening — no module info; aggregates joined by plain super-edge lines.
-        net.lod({ expandPx, declutter, aggregateOutline });
+        net.lod({ expandPx, declutter, aggregateOutline, crossLevelEdges, crossFade });
       } else {
         // The planted partition drives the cut → directed half-arrow super-edges ∝ accumulated flow.
         // No aggregate-radius cap: a module is sized by `nodeRadius` applied to its members' summed
         // flow (the scale extrapolates above the leaf domain), so a module reads as its total flow.
-        net.lod({ modules: d.modulePaths, expandPx, declutter, superEdges: true, aggregateOutline });
+        net.lod({ modules: d.modulePaths, expandPx, declutter, superEdges: true, aggregateOutline, crossLevelEdges, crossFade });
       }
     },
   };
