@@ -17,8 +17,8 @@ function degreeRadius(graph: NetworkGraph): NodeRadiusSpec {
     if (d < lo) lo = d;
     if (d > hi) hi = d;
   }
-  if (hi <= lo) return 5; // uniform degree (e.g. a single clique) — nothing to scale
-  return { by: "degree", scale: scaleSqrt().domain([lo, hi]).range([2.5, 11]) };
+  if (hi <= lo) return 6; // uniform degree (e.g. a single clique) — nothing to scale
+  return { by: "degree", scale: scaleSqrt().domain([lo, hi]).range([3, 13]) };
 }
 
 /**
@@ -28,8 +28,10 @@ function degreeRadius(graph: NetworkGraph): NodeRadiusSpec {
  * positions come from d3gl's in-library **force layout** (Barnes-Hut), seeded by **multilevel
  * coarsening** — no coordinates are supplied. `layout({ backend: "worker" })` runs the whole solve in
  * a Web Worker and streams positions back, so the layout **converges progressively on screen** while
- * the UI stays responsive. The Nodes slider scales 10 → 1,000,000; the Size toggle switches a uniform
- * vs **degree-weighted** radius; **Sizing** switches world vs **screen** (constant-pixel) glyphs. The
+ * the UI stays responsive. The Nodes slider scales 10 → 1,000,000; **Node size** switches a uniform
+ * vs **degree-weighted** radius; **Edge size** switches uniform vs **weight-scaled** links (LOD
+ * super-edges thicken + darken with their accumulated weight); **Sizing** switches world vs **screen**
+ * (constant-pixel) glyphs. The
  * **LOD** toggle enables the adaptive hierarchy cut — dense communities collapse to aggregate glyphs
  * and expand into their members as you zoom in — with **Declutter** (thin overlaps) and **Edges**
  * (super-edges between aggregates). Pair LOD with screen sizing. Drag to pan, scroll to zoom.
@@ -50,19 +52,34 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
       // worker keeps the main thread free regardless, streaming frames as it converges.
       const iterations = Math.min(250, Math.max(10, Math.round(2.5e6 / count)));
       // LFR benchmark with clear community structure (low mixing) for the layout + LOD to resolve.
-      const { nodeCount, source, target } = generateLFR(count, { mu: 0.1, seed: 1 });
-      const graph = buildGraph({ nodeCount, source, target, directed });
+      // Weighted so links vary and LOD super-edges thicken/darken with their accumulated weight.
+      const { nodeCount, source, target, weight } = generateLFR(count, { mu: 0.1, seed: 1, weighted: true });
+      const graph = buildGraph({ nodeCount, source, target, weight, directed });
+
+      // The raw graph is unweighted (every edge weight 1); the per-edge "weight" that varies is the
+      // **accumulated flow of an LOD super-edge**. Encode it in both width and colour so a heavier
+      // super-edge reads as thicker AND darker (the same scale applies to each edge's weight, so a
+      // super-edge uses its summed weight). Width follows the Edge-size toggle; colour always encodes it.
+      const edgeWidth =
+        options.edge === "Uniform"
+          ? 0.8
+          : { by: "weight" as const, scale: scaleSqrt().domain([1, 25]).range([0.5, 5]).clamp(true) };
+      // Colour by weight via a d3 colour scale: light/translucent at weight 1 → darker/opaque with
+      // accumulated super-edge weight (scaleSqrt interpolates the RGBA range, alpha included).
+      const linkStroke = {
+        by: "weight" as const,
+        scale: scaleSqrt<string>().domain([1, 25]).range(["rgba(150,165,205,0.3)", "rgba(65,95,150,0.85)"]).clamp(true),
+      };
 
       net
         .data(graph)
         .style({
           directed,
-          nodeRadius: options.size === "Degree" ? degreeRadius(graph) : 4,
+          nodeRadius: options.size === "Uniform" ? 5 : degreeRadius(graph),
           nodeFill: "#4878d0",
-          linkWidth: 0.6,
-          // Translucent links so overlapping edges read as density — a hierarchical depth cue, and
-          // it keeps the super-edge thicket legible under the nodes. The arrowhead shares this colour.
-          linkStroke: "rgba(120,140,180,0.32)",
+          linkWidth: edgeWidth, // Edge size: Uniform (0.8) or ∝ √weight in [0.5, 5]
+          linkStroke, // darker + more opaque with accumulated weight (arrowhead shares it)
+          // arrowSize left unset → defaults to a function of link width (≈ the half-arrow tip).
           // "Screen" keeps glyphs a constant pixel size while you zoom (they don't vanish when
           // zoomed out) — the natural register for navigating a large layout, and what LOD wants.
           sizeMode: options.coords === "Screen" ? "screen" : "world",

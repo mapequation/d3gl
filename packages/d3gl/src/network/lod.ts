@@ -18,6 +18,7 @@
 import { hcl, rgb } from "d3-color";
 import type { NetworkGraph } from "./graph.js";
 import { buildHierarchy, type CoarsenOptions, type Hierarchy } from "./coarsen.js";
+import { declutterScreen } from "../core/declutter.js";
 
 /**
  * The position-independent **topology** of the LOD tree: the flattened coarsening hierarchy (levels,
@@ -56,6 +57,16 @@ export interface LODTopology {
   superEdgeOffset?: Uint32Array;
   superEdgeTarget?: Uint32Array;
   superEdgeFlow?: Float32Array;
+  /**
+   * The **transpose** of the super-edge CSR (in-adjacency, by target): node `g`'s incoming edges are
+   * `[superEdgeInOffset[g] .. superEdgeInOffset[g+1])`, coming from `superEdgeInSource` with the same
+   * summed `superEdgeInFlow`. Lets the gather keep a visible node's edges to off-screen neighbours in
+   * *both* directions (incoming as well as outgoing) without scanning off-screen sources. Built and
+   * present together with the out-adjacency above. @see {@link buildSuperEdges}
+   */
+  superEdgeInOffset?: Uint32Array;
+  superEdgeInSource?: Uint32Array;
+  superEdgeInFlow?: Float32Array;
 }
 
 /**
@@ -79,7 +90,9 @@ export interface LODTree extends LODTopology {
   /**
    * Visual draw radius (world units): leaves take their resolved per-node radius (degree/strength/…
    * encoded); each aggregate is `√(Σ child radius²)` — area-additive, so it's agnostic to the node
-   * sizing and an aggregate's ink ≈ its contents' total ink. Drives drawing and declutter occupancy.
+   * sizing and an aggregate's ink ≈ its contents' total ink — *unless* a {@link RadiusAggregate} is
+   * supplied, when an aggregate is sized by the leaf scale on its summed metric (flow-sized modules).
+   * Drives drawing and declutter occupancy.
    */
   radius: Float32Array;
   /** Number of leaf descendants. */
@@ -108,7 +121,7 @@ export interface LODTree extends LODTopology {
  * read. Reused by both the main-thread {@link buildLODTree} and the layout worker, which already has
  * the hierarchy from multilevel seeding and streams this topology to the main thread (#103).
  */
-export function flattenHierarchyToTopology(hierarchy: Hierarchy, leafCount: number): LODTopology {
+export function flattenHierarchyToTopology(hierarchy: Hierarchy, leafCount: number, edges?: SuperEdgeInput): LODTopology {
   const { levels, projections } = hierarchy;
   const levelCount = levels.length;
 
@@ -172,7 +185,91 @@ export function flattenHierarchyToTopology(hierarchy: Hierarchy, leafCount: numb
     }
   }
 
-  return { size, leafCount, levelCount, levelOffset, childOffset, children, edgeOffset, edgeNeighbors };
+  const topo: LODTopology = { size, leafCount, levelCount, levelOffset, childOffset, children, edgeOffset, edgeNeighbors };
+  // Directed, flow-weighted super-edges (#104 N6) — built the same way for the coarsening tree as for a
+  // module tree, so the LOD edge logic is identical for both. Only when the graph's edges are supplied
+  // (the main-thread build); the worker streams a tree without them.
+  if (edges) Object.assign(topo, buildSuperEdges(size, parent, edges));
+  return topo;
+}
+
+/** Directed edges (source/target/weight) used to build the flow-weighted super-edge CSR. */
+export interface SuperEdgeInput {
+  source: ArrayLike<number>;
+  target: ArrayLike<number>;
+  weight: ArrayLike<number>;
+}
+
+/**
+ * Directed, flow-weighted super-edge adjacency over a tree (#104 N6). Each graph edge `u→v` contributes
+ * at every level from the leaves up to (not including) `u`/`v`'s lowest common ancestor: walk both
+ * ancestor chains in lockstep (after equalising depth), adding a directed `a→b` at each level until they
+ * meet, summing flow per ordered pair. Tree-generic — works for a coarsening tree or a module tree (it
+ * only needs `parent`, with parent ids greater than child ids). The cut renders whichever level is
+ * visible. Both the **out**-adjacency (by source) and the **in**-adjacency (the transpose, by target)
+ * are returned, so the gather can keep a visible node's edges to off-screen neighbours symmetrically —
+ * outgoing (walk the node's out-edges) *and* incoming (walk its in-edges) — without re-scanning
+ * off-screen sources (#104: WebGL incoming-link culling fix).
+ */
+export function buildSuperEdges(
+  size: number,
+  parent: Int32Array,
+  edges: SuperEdgeInput,
+): Pick<LODTopology, "superEdgeOffset" | "superEdgeTarget" | "superEdgeFlow" | "superEdgeInOffset" | "superEdgeInSource" | "superEdgeInFlow"> {
+  // Depth from root. Parents have higher ids than children, so a single descending pass finalises each
+  // parent before its children.
+  const depth = new Int32Array(size);
+  for (let g = size - 2; g >= 0; g--) depth[g] = depth[parent[g]!]! + 1;
+
+  const flowByPair = new Map<number, number>();
+  const m = edges.source.length;
+  for (let e = 0; e < m; e++) {
+    let a = edges.source[e]!;
+    let b = edges.target[e]!;
+    if (a === b) continue; // self-loop
+    const w = edges.weight[e]!;
+    while (depth[a]! > depth[b]!) a = parent[a]!;
+    while (depth[b]! > depth[a]!) b = parent[b]!;
+    while (a !== b) {
+      const key = a * size + b;
+      flowByPair.set(key, (flowByPair.get(key) ?? 0) + w);
+      a = parent[a]!;
+      b = parent[b]!;
+    }
+  }
+
+  const superEdgeOffset = new Uint32Array(size + 1);
+  for (const key of flowByPair.keys()) superEdgeOffset[Math.floor(key / size) + 1]!++;
+  for (let g = 0; g < size; g++) superEdgeOffset[g + 1] = superEdgeOffset[g + 1]! + superEdgeOffset[g]!;
+  const total = superEdgeOffset[size]!;
+  const superEdgeTarget = new Uint32Array(total);
+  const superEdgeFlow = new Float32Array(total);
+  const cursor = superEdgeOffset.slice(0, size);
+  for (const [key, flow] of flowByPair) {
+    const a = Math.floor(key / size);
+    const pos = cursor[a]!;
+    superEdgeTarget[pos] = key - a * size;
+    superEdgeFlow[pos] = flow;
+    cursor[a] = pos + 1;
+  }
+
+  // Transpose: the same pairs grouped by *target*, so a visible node can find its incoming edges
+  // (whose source may be off-screen) without scanning off-screen sources' out-lists.
+  const superEdgeInOffset = new Uint32Array(size + 1);
+  for (const key of flowByPair.keys()) superEdgeInOffset[(key % size) + 1]!++; // b = key % size
+  for (let g = 0; g < size; g++) superEdgeInOffset[g + 1] = superEdgeInOffset[g + 1]! + superEdgeInOffset[g]!;
+  const superEdgeInSource = new Uint32Array(total);
+  const superEdgeInFlow = new Float32Array(total);
+  const inCursor = superEdgeInOffset.slice(0, size);
+  for (const [key, flow] of flowByPair) {
+    const a = Math.floor(key / size);
+    const b = key - a * size;
+    const pos = inCursor[b]!;
+    superEdgeInSource[pos] = a;
+    superEdgeInFlow[pos] = flow;
+    inCursor[b] = pos + 1;
+  }
+  return { superEdgeOffset, superEdgeTarget, superEdgeFlow, superEdgeInOffset, superEdgeInSource, superEdgeInFlow };
 }
 
 /** Allocate zeroed geometry arrays over a topology, yielding a renderable {@link LODTree}. */
@@ -198,7 +295,11 @@ function attachGeometry(topo: LODTopology): LODTree {
  * streams an already-built {@link LODTopology} instead (#103), assembled via {@link lodTreeFromTopology}.
  */
 export function buildLODTree(graph: NetworkGraph, coarsen?: CoarsenOptions): LODTree {
-  return attachGeometry(flattenHierarchyToTopology(buildHierarchy(graph, coarsen), graph.nodeCount));
+  // Pass the graph's directed edges so the coarsening tree carries flow-weighted super-edges too —
+  // the same edge-LOD path then serves both structural and module trees.
+  return attachGeometry(
+    flattenHierarchyToTopology(buildHierarchy(graph, coarsen), graph.nodeCount, { source: graph.source, target: graph.target, weight: graph.weight }),
+  );
 }
 
 export interface SpatialLODOptions {
@@ -510,11 +611,28 @@ export function computeLODPositions(tree: LODTree, positions: ArrayLike<number>)
 }
 
 /**
+ * Optional radius aggregation for {@link computeLODStyle}. When node radius is sized by an **additive
+ * metric** (degree / strength / flow), an aggregate is sized like a single *leaf carrying the combined
+ * value* — the SAME scale applied to the summed child value (e.g. a module's radius from its members'
+ * total flow). That is what the node sizing means hierarchically, and a `scaleSqrt` extrapolates above
+ * the leaf domain as an honest area-proportional continuation. Omitted ⇒ the area-additive `√(Σ child
+ * radius²)` fallback (agnostic to the sizing — used for structural / spatial trees with no metric).
+ */
+export interface RadiusAggregate {
+  /** Per-leaf additive metric value (length `leafCount`); summed up the tree onto each aggregate. */
+  leafValue: ArrayLike<number>;
+  /** Maps a (summed) value → radius — the SAME scale used for the leaves. */
+  radiusOf: (value: number) => number;
+}
+
+/**
  * Fill the tree's **style-derived** geometry: each leaf takes its resolved visual `radius` and
- * importance `weight`; each aggregate gets an area-additive radius (`√Σ child radius²`, so an
- * aggregate's ink ≈ its contents' total ink, agnostic to the node sizing) and the summed child
- * weight. Independent of positions, so this is constant through a solve — computed once on the main
- * thread (and recomputed only when the style's radii change), never per frame.
+ * importance `weight`; each aggregate gets the summed child weight and, by default, an area-additive
+ * radius (`√Σ child radius²`, so its ink ≈ its contents' total ink, agnostic to the node sizing).
+ * Pass `radiusAggregate` to instead size an aggregate by the leaf scale applied to its summed child
+ * value (flow-sized modules — see {@link RadiusAggregate}). Independent of positions, so this is
+ * constant through a solve — computed once on the main thread (recomputed only when the style's radii
+ * change), never per frame.
  *
  * `leafRadii` is the resolved per-node radius; `leafWeight` is the per-leaf importance (typically
  * `graph.strength`) driving super-edge weight and declutter priority. `leafBorder` (optional) is the
@@ -527,13 +645,18 @@ export function computeLODStyle(
   leafWeight: ArrayLike<number>,
   leafBorder?: ArrayLike<number>,
   leafColors?: ArrayLike<number>,
+  radiusAggregate?: RadiusAggregate,
 ): void {
   const { leafCount, levelCount, levelOffset, childOffset, children, radius, weight, border, color } = tree;
+  // Summed additive metric per node, only when sizing aggregates by the leaf scale (else null → the
+  // area-additive √Σr² fallback). One temp array per style recompute, never per frame.
+  const value = radiusAggregate ? new Float64Array(tree.size) : null;
 
   for (let i = 0; i < leafCount; i++) {
     radius[i] = leafRadii[i]!;
     weight[i] = leafWeight[i]!;
     border[i] = leafBorder ? leafBorder[i]! : 0;
+    if (value) value[i] = radiusAggregate!.leafValue[i]!;
     if (leafColors) {
       color[i * 4] = leafColors[i * 4]!;
       color[i * 4 + 1] = leafColors[i * 4 + 1]!;
@@ -546,6 +669,7 @@ export function computeLODStyle(
     for (let g = levelOffset[k]!; g < levelOffset[k + 1]!; g++) {
       let sw = 0;
       let sumR2 = 0;
+      let sv = 0;
       let sb = 0;
       // Colour: a chroma-weighted circular-hue mean in HCL, so a module's aggregate takes its hue
       // family's representative hue (crisp) rather than a muddy RGB average across the family.
@@ -553,7 +677,8 @@ export function computeLODStyle(
       for (let p = childOffset[g]!; p < childOffset[g + 1]!; p++) {
         const c = children[p]!;
         sw += weight[c]!;
-        sumR2 += radius[c]! * radius[c]!;
+        if (value) sv += value[c]!;
+        else sumR2 += radius[c]! * radius[c]!;
         sb += border[c]!;
         if (leafColors) {
           const col = hcl(rgb(color[c * 4]!, color[c * 4 + 1]!, color[c * 4 + 2]!));
@@ -569,7 +694,12 @@ export function computeLODStyle(
         }
       }
       weight[g] = sw;
-      radius[g] = Math.sqrt(sumR2); // area-additive: aggregate ink ≈ Σ child ink
+      if (value) {
+        value[g] = sv;
+        radius[g] = radiusAggregate!.radiusOf(sv); // leaf scale on the summed value (flow-sized modules)
+      } else {
+        radius[g] = Math.sqrt(sumR2); // area-additive: aggregate ink ≈ Σ child ink
+      }
       border[g] = sb; // sum-additive: a module's border metric ≈ Σ member metric
       if (leafColors && nc > 0) {
         const hue = (Math.atan2(hy, hx) * 180) / Math.PI;
@@ -599,9 +729,10 @@ export function computeLODGeometry(
   leafWeight: ArrayLike<number> = graph.strength,
   leafBorder?: ArrayLike<number>,
   leafColors?: ArrayLike<number>,
+  radiusAggregate?: RadiusAggregate,
 ): void {
   computeLODPositions(tree, graph.positions);
-  computeLODStyle(tree, leafRadii, leafWeight, leafBorder, leafColors);
+  computeLODStyle(tree, leafRadii, leafWeight, leafBorder, leafColors, radiusAggregate);
 }
 
 /** Screen-space transform: `screen = world * k + (x, y)` (matches {@link BaseEngine} `ViewTransform`). */
@@ -632,6 +763,15 @@ const DEFAULT_EXPAND_PX = 48;
  * aggregate expands when its on-screen footprint is large enough, otherwise it is drawn as one
  * glyph; leaves always draw. Work is proportional to the visible frontier, not to the tree size.
  */
+/** The visible world rectangle for a transform + viewport (inverse of `screen = world·k + translate`). */
+export function visibleWorldRect(t: LODTransform, width: number, height: number): { minX: number; maxX: number; minY: number; maxY: number } {
+  const ax = (0 - t.x) / t.k;
+  const bx = (width - t.x) / t.k;
+  const ay = (0 - t.y) / t.k;
+  const by = (height - t.y) / t.k;
+  return { minX: Math.min(ax, bx), maxX: Math.max(ax, bx), minY: Math.min(ay, by), maxY: Math.max(ay, by) };
+}
+
 export function cut(
   tree: LODTree,
   t: LODTransform,
@@ -649,15 +789,7 @@ export function cut(
     return opts.screenSized ? r / t.k : r;
   };
 
-  // Visible world rectangle (inverse of screen = world·k + translate).
-  const ax = (0 - t.x) / t.k;
-  const bx = (width - t.x) / t.k;
-  const ay = (0 - t.y) / t.k;
-  const by = (height - t.y) / t.k;
-  const minX = Math.min(ax, bx);
-  const maxX = Math.max(ax, bx);
-  const minY = Math.min(ay, by);
-  const maxY = Math.max(ay, by);
+  const { minX, maxX, minY, maxY } = visibleWorldRect(t, width, height);
 
   const frontier: number[] = [];
   // Seed the stack with the roots (coarsest level).
@@ -728,62 +860,19 @@ export function declutterFrontier(
   const px = new Float64Array(F);
   const py = new Float64Array(F);
   const pr = new Float64Array(F);
-  let maxR = 1;
   for (let i = 0; i < F; i++) {
     const g = frontier[i]!;
     const drawn = g < tree.leafCount ? tree.radius[g]! : Math.min(tree.radius[g]!, maxAgg);
-    const r = opts.screenSized ? drawn : drawn * opts.k;
-    pr[i] = r;
+    pr[i] = opts.screenSized ? drawn : drawn * opts.k;
     px[i] = tree.cx[g]! * t.k + t.x;
     py[i] = tree.cy[g]! * t.k + t.y;
-    if (r > maxR) maxR = r;
   }
 
-  // Visit in descending importance so the most important glyph in a cluster survives.
+  // Visit in descending importance so the most important glyph in a cluster survives, then run the
+  // shared greedy declutter (one engine across backends + the geo layers — see core/declutter).
   const order = Array.from({ length: F }, (_, i) => i);
   order.sort((a, b) => tree.weight[frontier[b]!]! - tree.weight[frontier[a]!]!);
-
-  // Uniform grid sized so any overlapping pair (centre distance < spacing·(rᵢ+rⱼ) ≤ 2·spacing·maxR)
-  // lands within the 3×3 neighbourhood. Intrusive linked list of kept glyphs per cell (no per-cell
-  // allocation).
-  const cell = Math.max(2 * maxR * spacing, 1);
-  const cols = Math.floor(width / cell) + 3;
-  const rows = Math.floor(height / cell) + 3;
-  const head = new Int32Array(cols * rows).fill(-1);
-  const next = new Int32Array(F);
-  const kept = new Uint8Array(F);
-
-  for (const i of order) {
-    const x = px[i]!;
-    const y = py[i]!;
-    const r = pr[i]!;
-    let cx = Math.floor(x / cell) + 1;
-    let cy = Math.floor(y / cell) + 1;
-    cx = cx < 0 ? 0 : cx >= cols ? cols - 1 : cx;
-    cy = cy < 0 ? 0 : cy >= rows ? rows - 1 : cy;
-    let occluded = false;
-    for (let gx = cx - 1; gx <= cx + 1 && !occluded; gx++) {
-      if (gx < 0 || gx >= cols) continue;
-      for (let gy = cy - 1; gy <= cy + 1 && !occluded; gy++) {
-        if (gy < 0 || gy >= rows) continue;
-        for (let p = head[gy * cols + gx]!; p !== -1; p = next[p]!) {
-          const dx = px[p]! - x;
-          const dy = py[p]! - y;
-          const thresh = spacing * (r + pr[p]!); // circles must not overlap
-          if (dx * dx + dy * dy < thresh * thresh) {
-            occluded = true;
-            break;
-          }
-        }
-      }
-    }
-    if (!occluded) {
-      kept[i] = 1;
-      const c = cy * cols + cx;
-      next[i] = head[c]!;
-      head[c] = i;
-    }
-  }
+  const kept = declutterScreen(F, px, py, pr, order, width, height, spacing, new Uint8Array(F));
 
   let n = 0;
   for (let i = 0; i < F; i++) if (kept[i]) n++;

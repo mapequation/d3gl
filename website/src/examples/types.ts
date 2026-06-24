@@ -64,8 +64,10 @@ export type ControlSpec =
       /** Option key this control sets (e.g. "layout"). */
       key: string;
       label: string;
-      /** Segmented options; first is the default. */
+      /** Segmented options. */
       options: string[];
+      /** Default option (else the first). */
+      value?: string;
     }
   | {
       type: "range";

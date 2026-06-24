@@ -54,7 +54,9 @@ async function runLayout(msg: StartMessage): Promise<void> {
   let lodTree: LODTree | null = null;
   let geomBuffer: ArrayBufferLike | null = null; // copy-mode buffer re-posted each frame
   if (lod && hierarchy) {
-    const topology = flattenHierarchyToTopology(hierarchy, nodeCount);
+    // Pass the edges so the streamed tree carries the flow-weighted super-edge CSR too — the unified
+    // super-edge path needs it on the worker (coarsening) tree just like the main-thread one.
+    const topology = flattenHierarchyToTopology(hierarchy, nodeCount, { source, target, weight });
     const byteLength = lodGeometryByteLength(topology.size);
     let sharedGeometry: SharedArrayBuffer | undefined;
     let buffer: ArrayBufferLike;

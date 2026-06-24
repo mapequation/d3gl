@@ -1,10 +1,12 @@
 import { describe, it, expect } from "vitest";
-import { nodeCircles, linkLines, linkArrows, halfArrowLinks, networkLayers, resolveNodeRadii, type ResolvedNetworkStyle } from "../glyphs.js";
+import { nodeCircles, linkLines, linkArrows, halfArrowLinks, networkLayers, resolveNodeRadii, resolveImportance, resolveLinkColorOf, resolveLinkStrokeOf, type ResolvedNetworkStyle } from "../glyphs.js";
 import { buildGraph } from "../graph.js";
 
 /** A resolved style with a uniform radius for `n` nodes (defaults applied elsewhere). */
 const style = (n: number): ResolvedNetworkStyle => ({
   nodeRadii: new Float32Array(n).fill(4),
+  nodeRadiusAggregate: null,
+  importance: new Float32Array(n).fill(1),
   nodeFill: "#000000",
   linkWidth: 1,
   linkWidthOf: () => 1,
@@ -18,6 +20,40 @@ const style = (n: number): ResolvedNetworkStyle => ({
   flowBorder: null,
   constBorder: null,
   linkBend: 0,
+});
+
+describe("resolveImportance", () => {
+  it("defaults to the nodeRadius size metric (so the biggest glyph wins overlaps)", () => {
+    const g = buildGraph({ nodeCount: 3, source: [0, 1], target: [1, 2], nodeFlow: new Float32Array([0.5, 0.25, 0.125]) });
+    const imp = resolveImportance(g, undefined, { by: "flow", scale: (v) => v });
+    expect(Array.from(imp)).toEqual([0.5, 0.25, 0.125]); // per-node flow (exact in Float32)
+  });
+
+  it("falls back to flat input order for a constant size", () => {
+    const g = buildGraph({ nodeCount: 3, source: [0, 1], target: [1, 2] });
+    expect(Array.from(resolveImportance(g, undefined, 5))).toEqual([1, 1, 1]);
+  });
+
+  it("honours an explicit metric or per-node array", () => {
+    const g = buildGraph({ nodeCount: 3, source: [0, 1], target: [1, 2] }); // node 1 has degree 2
+    expect(Array.from(resolveImportance(g, "degree", 5))).toEqual([1, 2, 1]);
+    const custom = new Float32Array([9, 8, 7]);
+    expect(resolveImportance(g, custom, 5)).toBe(custom); // used as-is, no copy
+  });
+});
+
+describe("link colour {by,scale} parity", () => {
+  it("resolves the {by,scale} form to per-weight CSS (Scene) and RGBA (WebGL)", () => {
+    const scale = (w: number) => (w > 5 ? "#000000" : "#ffffff"); // a stand-in colour scale of the weight
+    expect(resolveLinkStrokeOf({ by: "weight", scale })(10)).toBe("#000000");
+    expect(Array.from(resolveLinkColorOf({ by: "weight", scale })(10))).toEqual([0, 0, 0, 255]);
+    expect(Array.from(resolveLinkColorOf({ by: "weight", scale })(1))).toEqual([255, 255, 255, 255]);
+  });
+
+  it("still accepts a bare colour and a (weight)=>css function", () => {
+    expect(resolveLinkStrokeOf("#abcdef")(99)).toBe("#abcdef");
+    expect(resolveLinkStrokeOf((w) => (w > 1 ? "#111111" : "#eeeeee"))(2)).toBe("#111111");
+  });
 });
 
 describe("nodeCircles", () => {
@@ -58,7 +94,7 @@ describe("linkLines", () => {
 });
 
 describe("linkArrows", () => {
-  it("sets the tip back from the target by the *target* node's radius, oriented from the source", () => {
+  it("carries the target *centre* + the *target* node's radius (the tip sets back in-shader)", () => {
     const g = buildGraph({ nodeCount: 2, source: [0], target: [1], directed: true });
     g.positions.set([0, 0, 10, 0]); // node0 at origin, node1 at (10,0)
 
@@ -67,7 +103,8 @@ describe("linkArrows", () => {
 
     expect(a.count).toBe(1);
     expect(Array.from(a.sources)).toEqual([0, 0]);
-    expect(Array.from(a.targets)).toEqual([8, 0]); // 10 - dir(1,0) * targetRadius(2)
+    expect(Array.from(a.targets)).toEqual([10, 0]); // the target centre (setback is in-shader)
+    expect(Array.from(a.radii)).toEqual([2]); // target radius → the shader sets the tip back to the boundary
     expect(Array.from(a.sizes)).toEqual([4]);
     expect(Array.from(a.colors)).toEqual([255, 0, 0, 255]);
   });
@@ -97,12 +134,12 @@ describe("networkLayers", () => {
     expect(layers.map((l) => l.name)).toEqual(["nodes"]);
   });
 
-  it("threads sizeMode to nodes + links; arrows stay world-sized (their screen shader is pending)", () => {
+  it("threads sizeMode to nodes, links, and arrowheads (the arrow shader honours it in-shader)", () => {
     const g = buildGraph({ nodeCount: 2, source: [0], target: [1], directed: true });
     const layers = networkLayers(g, { ...style(2), directed: true, sizeMode: "screen" });
 
     const bySize = Object.fromEntries(layers.map((l) => [l.name, l.sizeMode]));
-    expect(bySize).toEqual({ links: "screen", arrows: "world", nodes: "screen" });
+    expect(bySize).toEqual({ links: "screen", arrows: "screen", nodes: "screen" });
   });
 
   it("emits one fused half-arrow links layer (no separate arrows) for linkStyle:'half-arrow'", () => {

@@ -259,28 +259,46 @@ void main() {
 // INSTANCED_ARROW_VS — instanced triangle arrowheads for directed links (#100; bent + half #104 N6c).
 // One triangle per instance: per-vertex a_tri = (back, across), tip (0,0); the symmetric template
 // has base (2,-1)/(2,1), the half template (2,0)/(2,1) (one-sided, for bent map links so reciprocal
-// arrows don't collide). The tip sits at a_target, oriented along the bezier's *end* tangent (so it
-// aligns with a bent link), scaled by a_size (world units). a_bend = 0 ⇒ oriented along the chord,
-// as before. Pairs with FILL_FS. World-sized for now.
+// arrows don't collide). a_target is the target node's *centre*; the tip is set back along the bezier's
+// *end* tangent by a_radius (the target's draw radius) so it lands on the node boundary even when nodes
+// are flow/degree-sized, then scaled by a_size. a_bend = 0 ⇒ oriented along the chord. Pairs with FILL_FS.
+//
+// sizeMode (mirrors the line + half-arrow shaders): in **world** mode the shape is built in world units,
+// then projected — so size/setback scale with zoom. In **screen** mode both endpoints are first projected
+// to px and the same scale-free math runs in px (a_size/a_radius are px), so the arrowhead stays a
+// constant pixel size and meets the node boundary. The end-tangent direction is identical in either space
+// (the view transform is an isotropic scale), so only the working space differs.
 export const INSTANCED_ARROW_VS = `#version 300 es
 precision highp float;
 uniform mat3 u_transform;
+uniform float u_screen;   // 1.0 = screen sizeMode (constant px), 0.0 = world
+uniform vec2 u_viewport;  // device px, for screen sizeMode
 in vec2 a_tri;        // per-vertex (back, across)
-in vec2 a_source;     // per-instance world source (orientation)
-in vec2 a_target;     // per-instance world tip
-in float a_size;      // per-instance arrow size (world units)
+in vec2 a_source;     // per-instance source centre (orientation)
+in vec2 a_target;     // per-instance target centre (tip set back by a_radius)
+in float a_size;      // per-instance arrow size (world or px per sizeMode)
+in float a_radius;    // per-instance target node radius (setback to the boundary)
 in float a_bend;      // per-instance bend, matching the link's, so the head aligns with its end tangent
 in vec4 a_color;
 out vec4 v_color;
+vec2 worldToPx(vec2 w) {
+  vec2 clip = (u_transform * vec3(w, 1.0)).xy;
+  return vec2((clip.x + 1.0) * 0.5 * u_viewport.x, (1.0 - clip.y) * 0.5 * u_viewport.y);
+}
 void main() {
   v_color = a_color;
-  vec2 d = a_target - a_source;
+  bool screen = u_screen > 0.5;
+  vec2 src = screen ? worldToPx(a_source) : a_source;
+  vec2 tgt = screen ? worldToPx(a_target) : a_target;
+  vec2 d = tgt - src;
   // Quadratic-bezier end tangent (t=1): 2·(P1 − C), C = midpoint + ⟂(chord)·bend.
   vec2 endTan = 0.5 * d - vec2(-d.y, d.x) * a_bend;
   vec2 dir = normalize(endTan);
   vec2 perp = vec2(-dir.y, dir.x);
-  vec2 world = a_target - dir * (a_tri.x * a_size) + perp * (a_tri.y * a_size);
-  gl_Position = vec4((u_transform * vec3(world, 1.0)).xy, 0.0, 1.0);
+  vec2 tip = tgt - dir * a_radius; // set back to the target node's boundary
+  vec2 pos = tip - dir * (a_tri.x * a_size) + perp * (a_tri.y * a_size);
+  vec2 clip = screen ? vec2(pos.x / u_viewport.x * 2.0 - 1.0, 1.0 - pos.y / u_viewport.y * 2.0) : (u_transform * vec3(pos, 1.0)).xy;
+  gl_Position = vec4(clip, 0.0, 1.0);
 }`;
 
 // INSTANCED_HALF_ARROW_VS — the "map of networks" directed-link glyph (#104 N6): one filled shape

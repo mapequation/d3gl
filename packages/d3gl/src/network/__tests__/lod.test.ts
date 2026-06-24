@@ -12,7 +12,7 @@ import {
 } from "../lod.js";
 import { buildHierarchy, multilevelSeed } from "../coarsen.js";
 import { lodGeometryViews, lodGeometryByteLength } from "../worker-protocol.js";
-import { frontierCircles, superEdgeLines } from "../glyphs.js";
+import { frontierCircles, superEdges } from "../glyphs.js";
 import { buildGraph } from "../graph.js";
 
 /**
@@ -68,6 +68,28 @@ describe("computeLODGeometry", () => {
     expect(tree.count[5]).toBe(2);
     expect(tree.weight[5]).toBeCloseTo(5); // strength2 + strength3 = 3 + 2
   });
+
+  it("sizes aggregates by the leaf scale on summed child value when a RadiusAggregate is given (flow-sized modules)", () => {
+    const g = pairedGraph();
+    g.positions.set([0, 0, 2, 0, 10, 0, 12, 0]);
+    const tree = buildLODTree(g, { minNodes: 2 });
+    // Leaf value (e.g. flow) per node; radiusOf is the leaf scale. Use identity so the numbers are
+    // legible and clearly differ from the area-additive √Σr² fallback.
+    const leafValue = new Float32Array([3, 4, 5, 12]);
+    const radiusOf = (v: number): number => v;
+    const leafRadii = new Float32Array([3, 4, 5, 12]); // = radiusOf(value) at the leaves
+    computeLODGeometry(tree, g, leafRadii, undefined, undefined, undefined, { leafValue, radiusOf });
+
+    // aggregate 4 = {0,1}: radiusOf(3 + 4) = 7 (NOT the area-additive √(3²+4²) = 5)
+    expect(tree.radius[4]).toBeCloseTo(7);
+    // aggregate 5 = {2,3}: radiusOf(5 + 12) = 17 (NOT √(5² + 12²) = 13)
+    expect(tree.radius[5]).toBeCloseTo(17);
+
+    // Without the RadiusAggregate, the same tree falls back to area-additive √Σr².
+    computeLODGeometry(tree, g, leafRadii);
+    expect(tree.radius[4]).toBeCloseTo(5);
+    expect(tree.radius[5]).toBeCloseTo(13);
+  });
 });
 
 describe("worker-LOD split (#103)", () => {
@@ -80,7 +102,8 @@ describe("worker-LOD split (#103)", () => {
   it("flattenHierarchyToTopology reproduces buildLODTree's topology (worker builds the same tree)", () => {
     const g = placed();
     const main = buildLODTree(g, { minNodes: 2 });
-    const topo = flattenHierarchyToTopology(buildHierarchy(g, { minNodes: 2 }), g.nodeCount);
+    // The worker builds the same tree — including the flow-weighted super-edge CSR (it passes edges too).
+    const topo = flattenHierarchyToTopology(buildHierarchy(g, { minNodes: 2 }), g.nodeCount, { source: g.source, target: g.target, weight: g.weight });
 
     expect(topo.size).toBe(main.size);
     expect(topo.leafCount).toBe(main.leafCount);
@@ -90,6 +113,8 @@ describe("worker-LOD split (#103)", () => {
     expect(Array.from(topo.children)).toEqual(Array.from(main.children));
     expect(Array.from(topo.edgeOffset)).toEqual(Array.from(main.edgeOffset));
     expect(Array.from(topo.edgeNeighbors)).toEqual(Array.from(main.edgeNeighbors));
+    expect(Array.from(topo.superEdgeOffset!)).toEqual(Array.from(main.superEdgeOffset!));
+    expect(Array.from(topo.superEdgeFlow!)).toEqual(Array.from(main.superEdgeFlow!));
   });
 
   it("computeLODPositions + computeLODStyle equals the fused computeLODGeometry", () => {
@@ -348,36 +373,47 @@ describe("declutterFrontier", () => {
   });
 });
 
-describe("superEdgeLines", () => {
+describe("superEdges (line style) over a coarsening tree", () => {
+  const lineStyle = { linkStyle: "line" as const, directed: false, widthOf: () => 1, colorOf: (): [number, number, number, number] => [0, 0, 0, 255], bend: 0, arrowSize: 3 };
+  const ALL = { minX: -1e6, maxX: 1e6, minY: -1e6, maxY: 1e6 }; // everything on-screen
   const make = () => {
-    const g = buildGraph({ nodeCount: 4, source: [0, 2, 1], target: [1, 3, 2], weight: [2, 2, 1] });
+    // Directed edges 0→1, 2→3 (intra-aggregate) and 1→2 (cross) — buildLODTree now also derives the
+    // flow-weighted super-edge CSR (so structural and module trees share the edge path).
+    const g = buildGraph({ nodeCount: 4, source: [0, 2, 1], target: [1, 3, 2], weight: [2, 2, 1], directed: true });
     g.positions.set([0, 0, 2, 0, 10, 0, 12, 0]);
     const tree = buildLODTree(g, { minNodes: 2 });
     computeLODGeometry(tree, g, new Float32Array([4, 4, 4, 4]));
-    return { g, tree };
+    return { tree };
   };
 
-  it("links leaf neighbours present in the frontier (via the graph CSR)", () => {
-    const { g, tree } = make();
-    const lines = superEdgeLines(g, tree, new Uint32Array([0, 1, 2, 3]), { width: 1, stroke: "#000" });
-    expect(lines.count).toBe(3); // edges (0,1), (1,2), (2,3)
+  it("links leaf neighbours present in the frontier (from the super-edge CSR)", () => {
+    const { tree } = make();
+    const { lines } = superEdges(tree, new Uint32Array([0, 1, 2, 3]), lineStyle, ALL);
+    expect(lines!.count).toBe(3); // 0→1, 1→2, 2→3
   });
 
-  it("links aggregate neighbours via the coarse adjacency (deduped when both visible)", () => {
-    const { g, tree } = make();
-    const both = superEdgeLines(g, tree, new Uint32Array([4, 5]), { width: 1, stroke: "#000" });
-    expect(both.count).toBe(1); // the bridge between the two aggregates, emitted once
-    expect(Array.from(both.sources.slice(0, 2))).toEqual([1, 0]); // centroid of aggregate 4
-    expect(Array.from(both.targets.slice(0, 2))).toEqual([11, 0]); // centroid of aggregate 5
+  it("links aggregate neighbours by accumulated flow when both are visible", () => {
+    const { tree } = make();
+    const { lines } = superEdges(tree, new Uint32Array([4, 5]), lineStyle, ALL);
+    expect(lines!.count).toBe(1); // the 4→5 bridge
+    expect(Array.from(lines!.sources.slice(0, 2))).toEqual([1, 0]); // centroid of aggregate 4
+    expect(Array.from(lines!.targets.slice(0, 2))).toEqual([11, 0]); // centroid of aggregate 5
   });
 
-  it("keeps a visible node's edge to an off-screen / absent neighbour (drawn toward its position)", () => {
-    const { g, tree } = make();
-    // Only aggregate 4 is visible; neighbour 5 is absent, but the edge is still drawn from 4 to 5.
-    const one = superEdgeLines(g, tree, new Uint32Array([4]), { width: 1, stroke: "#000" });
-    expect(one.count).toBe(1);
-    expect(Array.from(one.sources.slice(0, 2))).toEqual([1, 0]); // aggregate 4
-    expect(Array.from(one.targets.slice(0, 2))).toEqual([11, 0]); // toward absent aggregate 5's centroid
+  it("skips an off-frontier neighbour that is on-screen (collapsed↔expanded → deferred), no dangling", () => {
+    const { tree } = make();
+    // Only aggregate 4 visible; 5 is on-screen (ALL rect) but not on the frontier → skipped.
+    const { lines } = superEdges(tree, new Uint32Array([4]), lineStyle, ALL);
+    expect(lines ? lines.count : 0).toBe(0);
+  });
+
+  it("keeps the edge to an off-SCREEN neighbour (drawn toward it, exiting the view)", () => {
+    const { tree } = make();
+    // Aggregate 4 visible; 5's centroid (x≈11) is right of the viewport → off-screen → edge kept.
+    const view = { minX: -5, maxX: 5, minY: -5, maxY: 5 };
+    const { lines } = superEdges(tree, new Uint32Array([4]), lineStyle, view);
+    expect(lines!.count).toBe(1);
+    expect(Array.from(lines!.targets.slice(0, 2))).toEqual([11, 0]); // toward off-screen aggregate 5
   });
 });
 

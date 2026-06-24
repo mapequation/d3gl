@@ -28,4 +28,6 @@ export { Scene } from "./scene.js";
 export type { GroupBuffers, GroupBufferDelta, GroupBuilder, DrawableRange, DrawableOpts, DrawableVector, StyleTables } from "./scene.js";
 export type { Backend, RenderLayer, RenderDelta, ViewTransform, PointBatch, PassThroughLayer, DrawBatch, ProjectedPath, DrawItem, InstancedLayer, InstancedCirclesData, InstancedLinesData, InstancedArrowsData, InstancedHalfArrowsData } from "./backend.js";
 export { HitIndex } from "./hit-test.js";
+export { declutterScreen, declutterScratch } from "./declutter.js";
+export type { DeclutterScratch } from "./declutter.js";
 export { version } from "./version.js";

@@ -75,6 +75,55 @@ export function resolveNodeRadii(graph: NetworkGraph, spec: NodeRadiusSpec): Flo
   return radii;
 }
 
+/**
+ * When {@link NodeRadiusSpec} sizes by an **additive metric** (`{ by, scale }` — degree/strength/flow,
+ * or a custom accessor), expose the per-leaf metric value + the scale so LOD aggregates size by the
+ * SAME scale applied to their summed child value (a module's radius from its members' total flow),
+ * rather than the area-additive `√Σr²` fallback. Returns `null` for constant / `Float32Array` /
+ * degree-function specs — there is no additive value to sum, so aggregates keep the fallback.
+ */
+export function resolveNodeRadiusAggregate(
+  graph: NetworkGraph,
+  spec: NodeRadiusSpec,
+): { leafValue: Float32Array; radiusOf: (value: number) => number } | null {
+  if (typeof spec === "number" || typeof spec === "function" || spec instanceof Float32Array) return null;
+  const accessor = metricAccessor(graph, spec.by);
+  const n = graph.nodeCount;
+  const leafValue = new Float32Array(n);
+  for (let i = 0; i < n; i++) leafValue[i] = accessor(i);
+  return { leafValue, radiusOf: spec.scale };
+}
+
+/**
+ * How a node's **declutter importance** is determined: a {@link NodeMetric} (`"degree"`/`"strength"`/
+ * `"flow"`/accessor), a per-node `Float32Array`, or `"order"` (a flat priority — so the survivor of a
+ * cluster falls back to input order, and an aggregate ranks by its subtree size). Resolved per-leaf and
+ * summed up the LOD tree (so a module's importance is its members' total — e.g. total flow), then used
+ * to break overlaps in the declutter: the highest-importance glyph in a cluster is kept.
+ */
+export type ImportanceSpec = NodeMetric | Float32Array | "order";
+
+/**
+ * Resolve an {@link ImportanceSpec} to per-leaf importance values (length `nodeCount`). When unset it
+ * **defaults to the node-size metric** — the `{ by }` of a `nodeRadius: { by, scale }` spec — so the
+ * biggest glyph wins an overlap (consistent with sizing); for a constant / array / degree-function size
+ * it falls back to flat input `"order"`. Called once per `style()` change, never per frame.
+ */
+export function resolveImportance(graph: NetworkGraph, spec: ImportanceSpec | undefined, nodeRadius: NodeRadiusSpec): Float32Array {
+  const n = graph.nodeCount;
+  const effective: ImportanceSpec =
+    spec ?? (typeof nodeRadius === "object" && !(nodeRadius instanceof Float32Array) ? nodeRadius.by : "order");
+  if (effective instanceof Float32Array) {
+    if (effective.length !== n) throw new Error(`importance Float32Array length ${effective.length} !== nodeCount ${n}`);
+    return effective;
+  }
+  if (effective === "order") return new Float32Array(n).fill(1); // flat ⇒ aggregates rank by subtree size, leaves by id order
+  const value = metricAccessor(graph, effective);
+  const out = new Float32Array(n);
+  for (let i = 0; i < n; i++) out[i] = value(i);
+  return out;
+}
+
 /** A constant ring of a fixed pixel width (#104 rework) — e.g. a 1px white outline on every node. */
 export interface ConstBorder {
   width: number;
@@ -103,11 +152,12 @@ export interface NodeStyleResolved {
 export type LinkWidthSpec = number | ((weight: number) => number) | { by: "weight" | "flow"; scale: (value: number) => number };
 
 /**
- * Link colour. A single CSS colour, or a `(weight) => cssColour` scale so colour encodes the edge's
- * weight/flow (a bare d3 sequential/linear colour scale fits). Resolves to a function of a *weight
- * value*, so a super-edge colours by its accumulated subsumed weight — matching {@link LinkWidthSpec}.
+ * Link colour. A single CSS colour; a `(weight) => cssColour` scale (a bare d3 sequential/linear colour
+ * scale fits — `scaleSqrt().range([light, dark])` interpolates RGBA, alpha included); or `{ by, scale }`
+ * for parity with {@link LinkWidthSpec}. Whichever form, it resolves to a function of a *weight value*,
+ * so a super-edge colours by its accumulated subsumed weight (darker/heavier reads as more important).
  */
-export type LinkColorSpec = string | ((weight: number) => string);
+export type LinkColorSpec = string | ((weight: number) => string) | { by: "weight" | "flow"; scale: (value: number) => string };
 
 /** How directed links are drawn: plain `"line"` + a separate arrowhead, or a fused `"half-arrow"` (the map glyph). */
 export type LinkStyle = "line" | "half-arrow";
@@ -128,11 +178,17 @@ export function resolveLinkWidthOf(spec: LinkWidthSpec): (weight: number) => num
   return spec.scale; // { by, scale }: `by` is the per-edge weight (== flow); `scale` maps it
 }
 
-/** Resolve a {@link LinkColorSpec} to a `(weight) => RGBA` function (composes with super-edge accumulation). */
+/** Resolve a {@link LinkColorSpec} to a `(weight) => cssColour` function (composes with super-edge accumulation). */
+export function resolveLinkStrokeOf(spec: LinkColorSpec): (weight: number) => string {
+  if (typeof spec === "string") return () => spec;
+  if (typeof spec === "function") return spec;
+  return spec.scale; // { by, scale }: `by` is the per-edge weight (== flow); `scale` maps it to a colour
+}
+
+/** Resolve a {@link LinkColorSpec} to a `(weight) => RGBA` function (the WebGL twin of {@link resolveLinkStrokeOf}). */
 export function resolveLinkColorOf(spec: LinkColorSpec): (weight: number) => [number, number, number, number] {
-  if (typeof spec === "function") return (w) => toRGBA(spec(w));
-  const c = toRGBA(spec);
-  return () => c;
+  const cssOf = resolveLinkStrokeOf(spec);
+  return (w) => toRGBA(cssOf(w));
 }
 
 /** Per-instance RGBA buffer for a batch of links, colouring each by its weight via `colorOf`. */
@@ -188,7 +244,8 @@ export interface FlowBorderSpec {
   /**
    * Ring colour: a single CSS colour, or a per-node `(value, index, graph) => cssColour` accessor so
    * the ring colour can also encode the per-node metric (a bare d3 colour scale fits — `value` is the
-   * node's flow metric). Default: a darker shade of the node fill.
+   * node's flow metric). **Omitted (default): a darker shade of each glyph's own fill** — so a module
+   * aggregate's ring is a darker shade of *its* module colour, not one shared colour.
    */
   color?: string | ((value: number, index: number, graph: NetworkGraph) => string);
 }
@@ -203,6 +260,8 @@ export interface ResolvedFlowBorder {
   colorCss: string;
   /** Per-node ring RGBA (length `4·nodeCount`) when {@link FlowBorderSpec.color} is an accessor; else absent. */
   colors?: Uint8Array;
+  /** When set (no explicit colour given), derive each glyph's ring by multiplying its own fill RGB by this factor (0–1). */
+  darken?: number;
 }
 
 /**
@@ -237,8 +296,25 @@ export function resolveFlowBorder(graph: NetworkGraph, spec: FlowBorderSpec, fal
     const colorCss = colorOf(metric[rep] ?? 0, rep, graph);
     return { metric, scale: spec.scale, color: toRGBA(colorCss), colorCss, colors };
   }
-  const colorCss = spec.color ?? rgb(fallbackColor).darker(0.8).formatHex();
+  if (spec.color === undefined) {
+    // No explicit colour → each glyph's ring is a darker shade of its OWN fill (per-module under LOD).
+    // The renderers derive it from the glyph colours via `darken`; colorCss is a representative fallback.
+    return { metric, scale: spec.scale, color: toRGBA(rgb(fallbackColor).darker(0.9).formatHex()), colorCss: rgb(fallbackColor).darker(0.9).formatHex(), darken: 0.62 };
+  }
+  const colorCss = spec.color;
   return { metric, scale: spec.scale, color: toRGBA(colorCss), colorCss };
+}
+
+/** Per-instance ring colours = the glyph fill colours darkened (RGB × factor); alpha preserved. */
+function darkenColors(fill: ArrayLike<number>, count: number, factor: number): Uint8Array {
+  const out = new Uint8Array(count * 4);
+  for (let i = 0; i < count; i++) {
+    out[i * 4] = Math.round(fill[i * 4]! * factor);
+    out[i * 4 + 1] = Math.round(fill[i * 4 + 1]! * factor);
+    out[i * 4 + 2] = Math.round(fill[i * 4 + 2]! * factor);
+    out[i * 4 + 3] = fill[i * 4 + 3]!;
+  }
+  return out;
 }
 
 const clamp01 = (x: number): number => (x < 0 ? 0 : x > 1 ? 1 : x);
@@ -325,7 +401,9 @@ export function nodeCircles(graph: NetworkGraph, style: NodeStyleResolved): Inst
   const colors = style.colors ?? fillColors(count, style.fill);
   const base = { centers: graph.positions, radii: style.radii, colors, count };
   if (style.border) {
-    const { metric, scale, color, colors: borderNodeColors } = style.border;
+    const { metric, scale, color, colors: explicit, darken } = style.border;
+    // `darken` (no explicit ring colour) ⇒ each node's ring = its own fill darkened.
+    const borderNodeColors = darken !== undefined ? darkenColors(colors, count, darken) : explicit;
     return { ...base, ...buildBorders(count, style.radii, (i) => metric[i]!, scale, color, borderNodeColors) };
   }
   if (style.constBorder) {
@@ -397,8 +475,11 @@ export function frontierCircles(tree: LODTree, frontier: Uint32Array, style: Fro
   }
   const base = { centers, radii, colors, count };
   if (style.border) {
-    const { scale, color } = style.border;
-    return { ...base, ...buildBorders(count, radii, (i) => tree.border[frontier[i]!]!, scale, color) };
+    const { scale, color, colors: explicit, darken } = style.border;
+    // `darken` (no explicit ring colour) ⇒ each glyph's ring = its own (module) colour darkened — so a
+    // collapsed module's ring is a darker shade of that module's hue, not one shared colour.
+    const borderColors = darken !== undefined ? darkenColors(colors, count, darken) : explicit;
+    return { ...base, ...buildBorders(count, radii, (i) => tree.border[frontier[i]!]!, scale, color, borderColors) };
   }
   if (style.constBorder) {
     return { ...base, ...constBorderArrays(count, radii, style.constBorder.width, style.constBorder.color) };
@@ -406,145 +487,188 @@ export function frontierCircles(tree: LODTree, frontier: Uint32Array, style: Fro
   return base;
 }
 
-export interface SuperEdgeStyleResolved {
+/** Resolved aggregate-outline style: a `width`-px ring `gap` px outside aggregate glyphs, in `color`. */
+export interface AggregateOutlineResolved {
   width: number;
-  stroke: string;
-}
-
-/**
- * Instanced line data for **super-edges**: every same-level edge incident to a *visible* frontier
- * node is drawn — a visible node keeps all its edges, so connections don't vanish when a neighbour
- * scrolls off-screen or is decluttered away (the edge is drawn toward the neighbour's position).
- * When both endpoints are visible the edge is deduped (`g < h`); when only one is visible it is drawn
- * once from the visible side. Leaf neighbours come from the graph CSR (a leaf's global id is its node
- * id); aggregate neighbours from the tree's coarse adjacency. Cross-level pairs (a node linked to a
- * region shown at a different LOD level) are approximated to the neighbour's centroid for now.
- */
-export function superEdgeLines(
-  graph: NetworkGraph,
-  tree: LODTree,
-  frontier: Uint32Array,
-  style: SuperEdgeStyleResolved,
-): InstancedLinesData {
-  const present = new Uint8Array(tree.size);
-  for (let i = 0; i < frontier.length; i++) present[frontier[i]!] = 1;
-
-  const a: number[] = [];
-  const b: number[] = [];
-  const { offsets, neighbors } = graph.csr;
-  for (let i = 0; i < frontier.length; i++) {
-    const g = frontier[i]!;
-    const leaf = g < tree.leafCount;
-    const from = leaf ? offsets[g]! : tree.edgeOffset[g]!;
-    const to = leaf ? offsets[g + 1]! : tree.edgeOffset[g + 1]!;
-    for (let p = from; p < to; p++) {
-      const h = leaf ? neighbors[p]! : tree.edgeNeighbors[p]!;
-      // Both visible → emit once (from the smaller id). Neighbour hidden → emit from the visible g.
-      if (present[h] ? g < h : true) {
-        a.push(g);
-        b.push(h);
-      }
-    }
-  }
-
-  const count = a.length;
-  const sources = new Float32Array(count * 2);
-  const targets = new Float32Array(count * 2);
-  for (let e = 0; e < count; e++) {
-    const g = a[e]!;
-    const h = b[e]!;
-    sources[e * 2] = tree.cx[g]!;
-    sources[e * 2 + 1] = tree.cy[g]!;
-    targets[e * 2] = tree.cx[h]!;
-    targets[e * 2 + 1] = tree.cy[h]!;
-  }
-  const widths = new Float32Array(count).fill(style.width);
-  return { sources, targets, widths, colors: fillColors(count, style.stroke), count };
-}
-
-export interface BentSuperEdgeStyleResolved {
-  /** Width from a super-edge's **accumulated** subsumed weight (the same scale as raw links). */
-  widthOf: (weight: number) => number;
-  stroke: string;
-  /** Bend (fraction of chord) for the bezier links. */
-  bend: number;
-  /** Draw one-sided half-arrowheads (directed maps). */
-  directed: boolean;
-  arrowSize: number;
-  /** Aggregate draw-radius cap, so a head sits at the (capped) module boundary, not its centre. */
+  gap: number;
+  color: string;
   maxAggregateRadius?: number;
 }
 
 /**
- * Instanced **bent half-arrow super-edges** for the map register (#104 N6c): inter-module links drawn
- * from the tree's directed, flow-weighted {@link LODTree.superEdgeOffset} adjacency. For each visible
- * frontier node, its directed super-edges to *also-visible* nodes are emitted as bezier strips (width
- * ∝ √flow via `flowScale`); on a directed map each gets a one-sided half-arrow set back to the target
- * module's boundary, so reciprocal links bow apart. Returns both layers (lines under arrows).
+ * Concentric **outline rings** around the LOD frontier's **aggregate** glyphs only (collapsed modules
+ * / subtrees, not leaves), set a `gap` px *outside* each glyph so a thin ring floats around it — a
+ * "this is a collapsed module, zoom to expand" cue that leaf nodes don't get. Built as a ring (a circle
+ * with transparent fill + a `width`-px border) so the gap shows through; drawn as its own
+ * instanced-circles layer *under* the nodes. WebGL/LOD-only (the vector full-graph draw has no aggregates).
  */
-export function bentSuperEdges(
+export function frontierHalos(tree: LODTree, frontier: Uint32Array, style: AggregateOutlineResolved): InstancedCirclesData {
+  const maxAgg = style.maxAggregateRadius ?? Infinity;
+  const idx: number[] = [];
+  for (let i = 0; i < frontier.length; i++) {
+    const g = frontier[i]!;
+    if (!(g < tree.leafCount || tree.count[g] === 1)) idx.push(i); // aggregates only (not leaves / 1-child cells)
+  }
+  const count = idx.length;
+  const centers = new Float32Array(count * 2);
+  const radii = new Float32Array(count);
+  const borders = new Float32Array(count);
+  const ring = toRGBA(style.color);
+  const borderColors = new Uint8Array(count * 4);
+  for (let k = 0; k < count; k++) {
+    const g = frontier[idx[k]!]!;
+    centers[k * 2] = tree.cx[g]!;
+    centers[k * 2 + 1] = tree.cy[g]!;
+    // Outer radius = glyph radius + gap + ring width; the ring occupies the outer `width` px, the gap
+    // and the glyph's own area are transparent (a circle with no fill, only a border).
+    const outer = Math.min(tree.radius[g]!, maxAgg) + style.gap + style.width;
+    radii[k] = outer;
+    borders[k] = outer > 0 ? style.width / outer : 0;
+    borderColors[k * 4] = ring[0];
+    borderColors[k * 4 + 1] = ring[1];
+    borderColors[k * 4 + 2] = ring[2];
+    borderColors[k * 4 + 3] = ring[3];
+  }
+  // Transparent fill (alpha 0) so only the border ring shows, leaving a gap to the glyph inside it.
+  return { centers, radii, colors: new Uint8Array(count * 4), borders, borderColors, count };
+}
+
+/** Resolved style for LOD super-edges — the same channels as raw links, applied to accumulated flow. */
+export interface SuperEdgeStyleResolved {
+  /** `"line"` (bent/straight + optional arrowhead) or `"half-arrow"` (fused, directed). */
+  linkStyle: LinkStyle;
+  directed: boolean;
+  /** Width from a super-edge's accumulated subsumed flow (the same scale as raw links). */
+  widthOf: (weight: number) => number;
+  /** Colour from the accumulated flow (the same scale as raw links). */
+  colorOf: (weight: number) => [number, number, number, number];
+  /** Bend: a fraction of chord for `"line"`, an absolute (world/px) offset for `"half-arrow"` — as for raw links. */
+  bend: number;
+  /** Arrowhead size for the directed `"line"` style. */
+  arrowSize: number;
+  /** Aggregate draw-radius cap, so a tip/setback sits at the (capped) module boundary, not its centre. */
+  maxAggregateRadius?: number;
+}
+
+/**
+ * Instanced LOD **super-edges**, unified across tree types and link styles (#104 N6). Links are
+ * gathered from the tree's directed, flow-weighted super-edge CSR — built identically for a coarsening
+ * tree and a module tree (so the edge-LOD logic is one path, not two). A visible node keeps an edge to
+ * a neighbour that is **also on the frontier** *or* whose centroid is **off-screen** (drawn toward it,
+ * exiting the view) — so a node's edges don't pop out as a neighbour scrolls off, without dangling into
+ * an on-screen region that has no glyph (an off-frontier-but-on-screen neighbour — a collapsed↔expanded
+ * mismatch — is skipped, deferred to the LOD cross-fade #133). Width + colour come from the accumulated
+ * subsumed flow. Rendered as fused **half-arrows** or bent/straight **lines** + (directed) arrowheads —
+ * the same glyph choice the non-LOD path makes. `{}` when the tree has no super-edge CSR (spatial tree).
+ */
+export function superEdges(
   tree: LODTree,
   frontier: Uint32Array,
-  style: BentSuperEdgeStyleResolved,
-): { lines: InstancedLinesData; arrows: InstancedArrowsData } {
+  style: SuperEdgeStyleResolved,
+  view: { minX: number; maxX: number; minY: number; maxY: number },
+): { halfArrows?: InstancedHalfArrowsData; lines?: InstancedLinesData; arrows?: InstancedArrowsData } {
   const off = tree.superEdgeOffset;
   const tgt = tree.superEdgeTarget;
   const flw = tree.superEdgeFlow;
+  if (!off || !tgt || !flw) return {};
+
   const present = new Uint8Array(tree.size);
   for (let i = 0; i < frontier.length; i++) present[frontier[i]!] = 1;
+  // A neighbour is drawable if it's on the frontier, or its centroid is off-screen (the edge just exits
+  // the view toward a real node) — an O(1) test, no cull margin needed. Off-frontier *on-screen*
+  // neighbours (collapsed↔expanded) are skipped.
+  const offScreen = (h: number): boolean => tree.cx[h]! < view.minX || tree.cx[h]! > view.maxX || tree.cy[h]! < view.minY || tree.cy[h]! > view.maxY;
 
+  // Gather drawable directed super-edges + a reciprocal-flow lookup (for both-on-frontier pairs).
   const aS: number[] = [];
   const bS: number[] = [];
   const wS: number[] = [];
-  if (off && tgt && flw) {
+  const flowByPair = new Map<number, number>();
+  for (let i = 0; i < frontier.length; i++) {
+    const g = frontier[i]!;
+    for (let p = off[g]!; p < off[g + 1]!; p++) {
+      const h = tgt[p]!;
+      if (present[h] || offScreen(h)) {
+        aS.push(g);
+        bS.push(h);
+        wS.push(flw[p]!);
+        if (present[h]) flowByPair.set(g * tree.size + h, flw[p]!);
+      }
+    }
+  }
+  // Incoming edges to a present node from an **off-screen source** (the transpose) — so a node keeps its
+  // in-edges too, not just out-edges, as a neighbour scrolls off (symmetric with the out-walk above).
+  // present sources were already emitted from their out-walk, so only off-screen (non-present) ones here.
+  const inOff = tree.superEdgeInOffset;
+  const inSrc = tree.superEdgeInSource;
+  const inFlw = tree.superEdgeInFlow;
+  if (inOff && inSrc && inFlw) {
     for (let i = 0; i < frontier.length; i++) {
       const g = frontier[i]!;
-      for (let p = off[g]!; p < off[g + 1]!; p++) {
-        const h = tgt[p]!;
-        if (present[h]) {
-          aS.push(g);
-          bS.push(h);
-          wS.push(flw[p]!);
+      for (let p = inOff[g]!; p < inOff[g + 1]!; p++) {
+        const s = inSrc[p]!;
+        if (!present[s] && offScreen(s)) {
+          aS.push(s);
+          bS.push(g);
+          wS.push(inFlw[p]!);
         }
       }
     }
   }
-
   const count = aS.length;
   const maxAgg = style.maxAggregateRadius ?? Infinity;
   const drawnRadius = (g: number): number => (g < tree.leafCount ? tree.radius[g]! : Math.min(tree.radius[g]!, maxAgg));
 
+  // Endpoints (centroids) + per-edge colour are common to both styles.
   const sources = new Float32Array(count * 2);
   const targets = new Float32Array(count * 2);
-  const widths = new Float32Array(count);
-  const bends = new Float32Array(count).fill(style.bend);
-  const aTargets = new Float32Array(count * 2);
-  const aSizes = new Float32Array(count).fill(style.arrowSize);
-  const aBends = new Float32Array(count).fill(style.bend);
+  const colors = new Uint8Array(count * 4);
   for (let e = 0; e < count; e++) {
     const g = aS[e]!;
     const h = bS[e]!;
-    const sx = tree.cx[g]!;
-    const sy = tree.cy[g]!;
-    const tx = tree.cx[h]!;
-    const ty = tree.cy[h]!;
-    sources[e * 2] = sx;
-    sources[e * 2 + 1] = sy;
-    targets[e * 2] = tx;
-    targets[e * 2 + 1] = ty;
-    widths[e] = style.widthOf(wS[e]!); // accumulated subsumed weight → width
-    // Arrow tip set back to the target module's boundary along the bezier end-tangent.
-    const [ux, uy] = bentEndTangent(sx, sy, tx, ty, style.bend);
-    const setback = drawnRadius(h);
-    aTargets[e * 2] = tx - ux * setback;
-    aTargets[e * 2 + 1] = ty - uy * setback;
+    sources[e * 2] = tree.cx[g]!;
+    sources[e * 2 + 1] = tree.cy[g]!;
+    targets[e * 2] = tree.cx[h]!;
+    targets[e * 2 + 1] = tree.cy[h]!;
+    const [cr, cg, cb, ca] = style.colorOf(wS[e]!);
+    colors[e * 4] = cr;
+    colors[e * 4 + 1] = cg;
+    colors[e * 4 + 2] = cb;
+    colors[e * 4 + 3] = ca;
   }
 
-  const lines: InstancedLinesData = { sources, targets, widths, colors: fillColors(count, style.stroke), bends, samples: BENT_SAMPLES, count };
-  // The arrowhead belongs to its link, so it always takes the link colour (no separate arrow fill).
-  const arrows: InstancedArrowsData = style.directed
-    ? { sources, targets: aTargets, sizes: aSizes, colors: fillColors(count, style.stroke), bends: aBends, half: true, count }
-    : { sources: new Float32Array(0), targets: new Float32Array(0), sizes: new Float32Array(0), colors: new Uint8Array(0), count: 0 };
+  if (style.linkStyle === "half-arrow" && style.directed) {
+    const radii = new Float32Array(count * 2);
+    const widths = new Float32Array(count * 2);
+    const bends = new Float32Array(count).fill(style.bend);
+    for (let e = 0; e < count; e++) {
+      radii[e * 2] = drawnRadius(aS[e]!);
+      radii[e * 2 + 1] = drawnRadius(bS[e]!);
+      const w = style.widthOf(wS[e]!);
+      const opp = flowByPair.get(bS[e]! * tree.size + aS[e]!);
+      widths[e * 2] = w;
+      widths[e * 2 + 1] = opp === undefined ? w : style.widthOf(opp);
+    }
+    return { halfArrows: { sources, targets, radii, widths, bends, colors, count } };
+  }
+
+  // Line style: bent/straight lines ∝ flow; directed → arrowheads set back to the target's (capped)
+  // boundary along the bent end-tangent. Same colour as the line.
+  const widths = new Float32Array(count);
+  for (let e = 0; e < count; e++) widths[e] = style.widthOf(wS[e]!);
+  const bends = new Float32Array(count).fill(style.bend);
+  const lines: InstancedLinesData = style.bend
+    ? { sources, targets, widths, colors, bends, samples: BENT_SAMPLES, count }
+    : { sources, targets, widths, colors, count };
+  if (!style.directed) return { lines };
+
+  // Arrowheads orient + set back in-shader (so screen sizeMode is honoured): pass the target centre
+  // (already in `targets`) plus its draw radius; the shader puts the tip on the node boundary. A
+  // one-sided **half** head only for bent links (so reciprocal heads don't collide); straight links
+  // get the symmetric triangle — matching the non-LOD path (`half: bend !== 0`).
+  const aRadii = new Float32Array(count);
+  for (let e = 0; e < count; e++) aRadii[e] = drawnRadius(bS[e]!);
+  const arrows: InstancedArrowsData = { sources, targets, radii: aRadii, sizes: new Float32Array(count).fill(style.arrowSize), colors, bends, half: style.bend !== 0, count };
   return { lines, arrows };
 }
 
@@ -665,30 +789,28 @@ export function linkArrows(graph: NetworkGraph, style: ArrowStyleResolved): Inst
   const bend = style.bend ?? 0;
   const sources = new Float32Array(count * 2);
   const targets = new Float32Array(count * 2);
+  const radii = new Float32Array(count);
   for (let e = 0; e < count; e++) {
     const s = graph.source[e]!;
     const t = graph.target[e]!;
-    const sx = graph.positions[s * 2]!;
-    const sy = graph.positions[s * 2 + 1]!;
-    const tx = graph.positions[t * 2]!;
-    const ty = graph.positions[t * 2 + 1]!;
-    const [ux, uy] = bend ? bentEndTangent(sx, sy, tx, ty, bend) : straightUnit(sx, sy, tx, ty);
-    const setback = style.nodeRadii[t]!;
-    sources[e * 2] = sx;
-    sources[e * 2 + 1] = sy;
-    targets[e * 2] = tx - ux * setback;
-    targets[e * 2 + 1] = ty - uy * setback;
+    sources[e * 2] = graph.positions[s * 2]!;
+    sources[e * 2 + 1] = graph.positions[s * 2 + 1]!;
+    targets[e * 2] = graph.positions[t * 2]!;
+    targets[e * 2 + 1] = graph.positions[t * 2 + 1]!;
+    // The tip is set back to the target node's boundary in-shader (oriented along the end tangent),
+    // so it follows flow/degree-sized nodes and honours screen sizeMode.
+    radii[e] = style.nodeRadii[t]!;
   }
   const sizes = new Float32Array(count).fill(style.size);
   // The arrowhead always takes its link's colour (no separate arrow fill).
   const colors = linkColorBytes(graph.weight, count, style.colorOf);
   if (bend) {
-    return { sources, targets, sizes, colors, bends: new Float32Array(count).fill(bend), half: style.half, count };
+    return { sources, targets, radii, sizes, colors, bends: new Float32Array(count).fill(bend), half: style.half, count };
   }
-  return { sources, targets, sizes, colors, count };
+  return { sources, targets, radii, sizes, colors, count };
 }
 
-/** Unit chord direction source→target (1,0 if degenerate). */
+/** Unit chord direction source→target (1,0 if degenerate). Used by the Scene/SVG arrow emitter. */
 function straightUnit(sx: number, sy: number, tx: number, ty: number): [number, number] {
   const dx = tx - sx;
   const dy = ty - sy;
@@ -700,6 +822,10 @@ function straightUnit(sx: number, sy: number, tx: number, ty: number): [number, 
 export interface ResolvedNetworkStyle {
   /** Per-node radii, length `nodeCount`; resolved via {@link resolveNodeRadii}. Units follow `sizeMode`. */
   nodeRadii: Float32Array;
+  /** When sizing by an additive metric, the per-leaf value + scale so LOD aggregates size by summed flow (else null). */
+  nodeRadiusAggregate: { leafValue: Float32Array; radiusOf: (value: number) => number } | null;
+  /** Per-leaf declutter importance (length `nodeCount`); summed up the tree → declutter priority. @see {@link resolveImportance} */
+  importance: Float32Array;
   nodeFill: string;
   /** Representative scalar width (for unweighted super-edges + the arrow-size default). */
   linkWidth: number;
@@ -718,7 +844,7 @@ export interface ResolvedNetworkStyle {
   /**
    * `"world"` (default) sizes glyphs in world units (they scale with zoom); `"screen"` sizes them in
    * constant pixels (the navigation register for large layouts — glyphs don't vanish when zoomed
-   * out). Arrowheads are world-only for now (their screen-mode shader is a tracked gap, #103).
+   * out). Nodes, links and arrowheads all honour it in-shader.
    */
   sizeMode: "world" | "screen";
   /** Optional per-node RGBA fill (categorical module colours, #104 rework); overrides `nodeFill` when set. */
@@ -769,9 +895,9 @@ export function networkLayers(graph: NetworkGraph, style: ResolvedNetworkStyle):
           primitive: "arrows",
           // Bent links get a one-sided half-arrow so reciprocal links don't collide (#104 N6c).
           arrows: linkArrows(graph, { size: style.arrowSize, nodeRadii: style.nodeRadii, colorOf: style.linkColorOf, bend, half: bend !== 0 }),
-          // Arrowheads remain world-sized until their screen-mode shader lands (#103); harmless in
-          // world mode, slightly inconsistent in screen mode for directed graphs.
-          sizeMode: "world",
+          // The arrowhead shader honours sizeMode in-shader (tip projected + set back in the working
+          // space), so screen mode keeps a constant pixel head on the node boundary.
+          sizeMode: style.sizeMode,
         });
       }
     }
@@ -834,15 +960,23 @@ export function emitLinks(g: GroupBuilder, graph: NetworkGraph, widthOf: (weight
  * Emit each directed link's arrowhead as a filled triangle, tip set back by the target node's radius
  * and oriented along the link's end-tangent (the bezier tangent when `bend` is set). With `half` the
  * triangle is one-sided (#104 N6c), matching the WebGL half-arrow.
+ *
+ * `bake` (default 1) is the **screen-sizeMode** bake (the same trick as {@link emitHalfLinks}): the
+ * shape is solved in pixel space (positions × `bake`, with `size`/`nodeRadii` already in px) and scaled
+ * back by `1/bake`, so the Scene's ×k view transform reproduces the WebGL constant-px arrowhead — tip
+ * size *and* the node-boundary setback. Without it, the world-unit setback grows with zoom and the head
+ * drifts off the node. The end-tangent direction is invariant under the uniform ×bake, so only the
+ * setback/size scale. `bake = 1` (world mode) leaves world geometry untouched.
  */
-export function emitArrows(g: GroupBuilder, graph: NetworkGraph, size: number, nodeRadii: Float32Array, bend = 0, half = false): void {
+export function emitArrows(g: GroupBuilder, graph: NetworkGraph, size: number, nodeRadii: Float32Array, bend = 0, half = false, bake = 1): void {
+  const inv = 1 / bake;
   for (let e = 0; e < graph.edgeCount; e++) {
     const s = graph.source[e]!;
     const t = graph.target[e]!;
-    const sx = graph.positions[s * 2]!;
-    const sy = graph.positions[s * 2 + 1]!;
-    const tx = graph.positions[t * 2]!;
-    const ty = graph.positions[t * 2 + 1]!;
+    const sx = graph.positions[s * 2]! * bake;
+    const sy = graph.positions[s * 2 + 1]! * bake;
+    const tx = graph.positions[t * 2]! * bake;
+    const ty = graph.positions[t * 2 + 1]! * bake;
     const [ux, uy] = bend ? bentEndTangent(sx, sy, tx, ty, bend) : straightUnit(sx, sy, tx, ty);
     const px = -uy;
     const py = ux;
@@ -852,10 +986,11 @@ export function emitArrows(g: GroupBuilder, graph: NetworkGraph, size: number, n
     const baseX = tipX - ux * 2 * size;
     const baseY = tipY - uy * 2 * size;
     g.drawable(e, (ctx) => {
-      ctx.moveTo(tipX, tipY);
+      // Solve in px×bake space, emit ÷bake so the ×k view restores the constant-px shape.
+      ctx.moveTo(tipX * inv, tipY * inv);
       // Half-arrow: base on one side of the centreline only (tip → centre-base → +side).
-      ctx.lineTo(half ? baseX : baseX - px * size, half ? baseY : baseY - py * size);
-      ctx.lineTo(baseX + px * size, baseY + py * size);
+      ctx.lineTo((half ? baseX : baseX - px * size) * inv, (half ? baseY : baseY - py * size) * inv);
+      ctx.lineTo((baseX + px * size) * inv, (baseY + py * size) * inv);
       ctx.closePath();
     });
   }

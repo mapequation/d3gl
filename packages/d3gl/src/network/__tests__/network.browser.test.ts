@@ -362,6 +362,42 @@ describe("network() engine", () => {
     net.destroy();
   });
 
+  it("renders the modular map (N6): half-arrow super-edges over module LOD in screen mode across zoom", async () => {
+    const net = network(host(), { width: 200, height: 200 });
+    await net.whenReady();
+    // Two modules of two nodes, reciprocal cross-module flow → directed module super-edges.
+    const g = buildGraph({
+      nodeCount: 4,
+      source: [0, 1, 0, 2, 2, 0],
+      target: [1, 0, 2, 3, 0, 2],
+      weight: [5, 5, 3, 5, 1, 3],
+      directed: true,
+      nodeFlow: [0.3, 0.3, 0.2, 0.2],
+    });
+    const modules = [
+      { id: 0, path: [1, 1] }, { id: 1, path: [1, 2] }, { id: 2, path: [2, 1] }, { id: 3, path: [2, 2] },
+    ];
+    net
+      .data(g)
+      .style({
+        directed: true,
+        linkStyle: "half-arrow", // super-edges become fused half-arrows ∝ accumulated flow
+        sizeMode: "screen",
+        nodeRadius: { by: "flow", scale: (f) => 6 + f * 20 },
+        linkBend: 12,
+        linkWidth: (w) => 1 + w,
+        linkStroke: (w) => (w > 4 ? "#21386e" : "#9ab"),
+      })
+      .lod({ modules, expandPx: 60, maxAggregateRadius: 24, declutter: true, superEdges: true })
+      .layout({ backend: "positions", positions: new Float32Array([20, 20, 40, 20, 170, 180, 190, 180]) });
+
+    expect(net.lodSource).toBe("modules");
+    // Zoomed out the modules collapse (half-arrow super-edges); zoomed in they expand to leaves. No throw.
+    expect(net.setTransform({ k: 0.3, x: 100, y: 100 })).toBe(net);
+    expect(net.setTransform({ k: 8, x: -700, y: -700 })).toBe(net);
+    net.destroy();
+  });
+
   it("re-renders with a different-size graph + module hierarchy without throwing (depth change)", async () => {
     const net = network(host(), { width: 200, height: 200 });
     await net.whenReady();
