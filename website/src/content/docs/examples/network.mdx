@@ -143,6 +143,8 @@ net
     maxAggregateRadius: 26,  // cap the aggregate glyph size (pixels, in screen sizeMode)
     declutter: true,         // thin overlapping glyphs by importance (default: the node-size metric)
     superEdges: true,        // summarise connectivity between aggregates
+    crossLevelEdges: true,   // also link a visible leaf to a still-collapsed module (opt-in, #139)
+    crossFade: 0.3,          // ease aggregate↔children across the expand threshold (opt-in, #133)
   });
 net.lod(false); // back to drawing every element
 ```
@@ -159,7 +161,12 @@ What it composes:
   glyph wins an overlap.
 - **Super-edges** draw connectivity between visible nodes (a leaf↔leaf graph edge, or an
   aggregate↔aggregate coarse edge); a visible node keeps its edges even when a neighbour is
-  off-screen.
+  off-screen. By default they connect *same-level* pairs only, so when you expand one region its leaves
+  lose their links to the still-collapsed regions; **`crossLevelEdges: true`** restores them by projecting
+  the off-frontier endpoint to its nearest visible ancestor (opt-in — zero added cost when off).
+- **`crossFade`** smooths level transitions: over a band around the expand threshold (a fraction of
+  `expandPx`, e.g. `0.3`), the aggregate and its children draw *together*, the parent easing out as the
+  children ease in — so a split/merge reads smoothly instead of popping. Opt-in; off (and free) by default.
 - **`sizeMode`** — `"world"` (glyphs scale with zoom) or `"screen"` (constant pixels, so nodes stay
   visible when zoomed out). LOD pairs naturally with `"screen"`.
 

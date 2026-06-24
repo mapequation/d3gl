@@ -214,6 +214,76 @@ describe("network() engine", () => {
     net.destroy();
   });
 
+  it("draws cross-level super-edges between mixed-level visible nodes only when opted in (#139)", async () => {
+    const net = network(host(), { width: 200, height: 200, backend: "svg" });
+    await net.whenReady();
+    // One directed edge from a node in module A to a node in module B; no intra-module edges.
+    const g = buildGraph({ nodeCount: 4, source: [0], target: [2], directed: true });
+    const modules = [
+      { id: 0, path: [1, 1] }, { id: 1, path: [1, 2] }, // module A = {0,1}
+      { id: 2, path: [2, 1] }, { id: 3, path: [2, 2] }, // module B = {2,3}
+    ];
+    // A is spread WIDE (expands to its leaves at k=1); B is TIGHT (stays one collapsed aggregate) →
+    // a mixed-level frontier {leaf0, leaf1, moduleB}. Declutter off so all three survive.
+    const setup = (crossLevelEdges: boolean) =>
+      net
+        .data(g)
+        .style({ directed: true })
+        .lod({ modules, expandPx: 60, declutter: false, crossLevelEdges })
+        .layout({ backend: "positions", positions: new Float32Array([20, 100, 180, 100, 100, 40, 110, 40]) });
+    const paths = () => (net.toSVG().match(/<path/g) ?? []).length;
+
+    // Default (off): leaf 0 ↔ collapsed module B is a mixed-level pair → dropped, no super-edge path.
+    setup(false);
+    net.setTransform({ k: 1, x: 0, y: 0 });
+    net.syncScreenGeometry();
+    expect(paths()).toBe(0);
+
+    // Opted in: the off-frontier leaf 2 projects to module B (its nearest present ancestor) → the
+    // leaf0 → moduleB super-edge is drawn.
+    setup(true);
+    net.setTransform({ k: 1, x: 0, y: 0 });
+    net.syncScreenGeometry();
+    expect(paths()).toBeGreaterThanOrEqual(1);
+
+    net.destroy();
+  });
+
+  it("cross-fades level transitions only when opted in (#133)", async () => {
+    const net = network(host(), { width: 200, height: 200, backend: "svg" });
+    await net.whenReady();
+    const g = buildGraph({ nodeCount: 4, source: [0, 2, 1], target: [1, 3, 2], directed: true });
+    const modules = [
+      { id: 0, path: [1, 1] }, { id: 1, path: [1, 2] }, { id: 2, path: [2, 1] }, { id: 3, path: [2, 2] },
+    ];
+    // All rgba(...) opacities present in the export.
+    const alphas = () => [...net.toSVG().matchAll(/rgba\(\s*\d+\s*,\s*\d+\s*,\s*\d+\s*,\s*([0-9.]+)\s*\)/g)].map((m) => Number(m[1]));
+    const circles = () => (net.toSVG().match(/<circle/g) ?? []).length;
+    const setup = (crossFade: number) =>
+      net
+        .data(g)
+        .style({ directed: true })
+        .lod({ modules, expandPx: 48, declutter: false, crossFade })
+        .layout({ backend: "positions", positions: new Float32Array([70, 90, 85, 90, 115, 110, 130, 110]) });
+
+    // Off (default): the cut is the hard threshold — every glyph fully opaque.
+    setup(0);
+    net.setTransform({ k: 1, x: 0, y: 0 });
+    net.syncScreenGeometry();
+    const baseCircles = circles();
+    expect(alphas().every((a) => a >= 0.999)).toBe(true);
+
+    // On: a wide band draws transitioning aggregates *and* their children together (more glyphs), with
+    // intermediate opacities easing the split/merge.
+    setup(0.9);
+    net.setTransform({ k: 1, x: 0, y: 0 });
+    net.syncScreenGeometry();
+    expect(circles()).toBeGreaterThan(baseCircles);
+    expect(alphas().some((a) => a > 0.001 && a < 0.999)).toBe(true);
+
+    net.destroy();
+  });
+
   it("renders flow-border nodes (N6b) through the WebGL lane + LOD without throwing", async () => {
     const net = network(host(), { width: 200, height: 200 });
     await net.whenReady();

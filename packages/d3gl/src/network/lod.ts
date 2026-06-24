@@ -39,6 +39,13 @@ export interface LODTopology {
   childOffset: Uint32Array;
   children: Uint32Array;
   /**
+   * Per-node parent global id (one level coarser), length `size`; the root's parent is `-1`. Lets the
+   * super-edge gather walk a node up to its nearest present ancestor for cross-level edges (#139).
+   * Present on provided-module trees (built with the parent map); absent on coarsening/spatial trees,
+   * which also carry no super-edge CSR — so the cross-level path never needs it there.
+   */
+  parent?: Int32Array;
+  /**
    * Same-level adjacency CSR for **aggregates** (super-edges): aggregate `g`'s same-level neighbours
    * are `edgeNeighbors[edgeOffset[g] .. edgeOffset[g+1]]`. Built from the coarse levels only; leaf
    * adjacency is the graph's own CSR (a leaf's global id equals its node id), so leaf entries are
@@ -185,7 +192,7 @@ export function flattenHierarchyToTopology(hierarchy: Hierarchy, leafCount: numb
     }
   }
 
-  const topo: LODTopology = { size, leafCount, levelCount, levelOffset, childOffset, children, edgeOffset, edgeNeighbors };
+  const topo: LODTopology = { size, leafCount, levelCount, levelOffset, childOffset, children, edgeOffset, edgeNeighbors, parent };
   // Directed, flow-weighted super-edges (#104 N6) — built the same way for the coarsening tree as for a
   // module tree, so the LOD edge logic is identical for both. Only when the graph's edges are supplied
   // (the main-thread build); the worker streams a tree without them.
@@ -753,9 +760,25 @@ export interface CutOptions {
   screenSized?: boolean;
   /** Aggregate draw-radius cap (matches rendering), so the cull margin reflects the drawn size. */
   maxAggregateRadius?: number;
+  /**
+   * **Cross-fade band** (#133): half-width, as a fraction of `expandPx`, of the zoom band around the
+   * expand threshold over which an aggregate and its children are drawn *together* — the aggregate
+   * easing out (alpha 1→0) as its children ease in (0→1), so a split/merge reads smoothly instead of
+   * popping. `0`/absent ⇒ off (the hard threshold, **zero added cost**). When > 0, fill {@link fadeAlpha}.
+   */
+  fadeBand?: number;
+  /**
+   * Scratch buffer, indexed by tree-node id (length ≥ `tree.size`), the cut fills with each emitted
+   * node's draw alpha when {@link fadeBand} > 0 (only frontier nodes are written; stale entries are
+   * never read). Reusable across frames to avoid per-frame GC. Required when `fadeBand > 0`.
+   */
+  fadeAlpha?: Float32Array;
 }
 
 const DEFAULT_EXPAND_PX = 48;
+
+/** Smoothstep (Hermite) ease on [0,1] — the cross-fade ramp (#133), softer than linear at both ends. */
+const smoothstep = (x: number): number => (x <= 0 ? 0 : x >= 1 ? 1 : x * x * (3 - 2 * x));
 
 /**
  * Adaptive hierarchy cut: walk the tree top-down for the given view and return the **frontier** —
@@ -791,13 +814,33 @@ export function cut(
 
   const { minX, maxX, minY, maxY } = visibleWorldRect(t, width, height);
 
+  // Cross-fade band (#133): when on, an aggregate whose footprint falls in [lo, hi] is drawn together
+  // with its children, alpha-interpolated in opposite directions. The alpha multiplies down the chain
+  // (a child in its own band fades within its parent's fade), and is written per emitted node into the
+  // scratch `alphaOut`. Off (band 0) ⇒ the alphaStack/ease/writes are all skipped: byte-identical to before.
+  const fadeBand = opts.fadeBand ?? 0;
+  const fade = fadeBand > 0;
+  const lo = expandPx * (1 - fadeBand);
+  const hi = expandPx * (1 + fadeBand);
+  const alphaOut = opts.fadeAlpha;
+
   const frontier: number[] = [];
-  // Seed the stack with the roots (coarsest level).
+  // Seed the stack with the roots (coarsest level). A parallel alpha stack carries the inherited fade
+  // multiplier (only touched when fading).
   const stack: number[] = [];
-  for (let g = levelOffset[levelCount - 1]!; g < levelOffset[levelCount]!; g++) stack.push(g);
+  const alphaStack: number[] = [];
+  for (let g = levelOffset[levelCount - 1]!; g < levelOffset[levelCount]!; g++) {
+    stack.push(g);
+    if (fade) alphaStack.push(1);
+  }
+  const emit = (g: number, a: number): void => {
+    frontier.push(g);
+    if (fade && alphaOut) alphaOut[g] = a;
+  };
 
   while (stack.length > 0) {
     const g = stack.pop()!;
+    const a = fade ? alphaStack.pop()! : 1;
     const ext = extent[g]!;
     const gx = cx[g]!;
     const gy = cy[g]!;
@@ -806,13 +849,33 @@ export function cut(
     const m = ext + drawMargin(g);
     if (gx + m < minX || gx - m > maxX || gy + m < minY || gy - m > maxY) continue;
     if (g < leafCount) {
-      frontier.push(g); // a real leaf — nothing finer to expand into
+      emit(g, a); // a real leaf — nothing finer to expand into
       continue;
     }
-    if (2 * ext * t.k >= expandPx) {
-      for (let p = childOffset[g]!; p < childOffset[g + 1]!; p++) stack.push(children[p]!);
+    const footprint = 2 * ext * t.k;
+    // Decide this node's draw alpha (`drawA`) and/or the alpha to expand its children at (`childA`);
+    // -1 = "don't". Inlined (no per-node closure) so the off path stays a plain expand/draw split.
+    let drawA = -1;
+    let childA = -1;
+    if (!fade) {
+      if (footprint >= expandPx) childA = 1; // expand
+      else drawA = 1; // draw as one glyph
+    } else if (footprint >= hi) {
+      childA = a; // above the band: fully expanded, children inherit `a`
+    } else if (footprint >= lo) {
+      // In the band: draw the aggregate easing out and its children easing in.
+      const aggA = smoothstep((hi - footprint) / (hi - lo)); // 1 at lo → 0 at hi
+      drawA = a * aggA;
+      childA = a * (1 - aggA);
     } else {
-      frontier.push(g);
+      drawA = a; // below the band: a single aggregate glyph
+    }
+    if (drawA > 0) emit(g, drawA);
+    if (childA > 0) {
+      for (let p = childOffset[g]!; p < childOffset[g + 1]!; p++) {
+        stack.push(children[p]!);
+        if (fade) alphaStack.push(childA);
+      }
     }
   }
 
