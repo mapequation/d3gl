@@ -1,5 +1,5 @@
 import { BaseEngine, type BaseEngineOptions } from "../map/base-engine.js";
-import { networkLayers, frontierCircles, frontierHalos, superEdges, emitNodes, emitLinks, emitArrows, emitHalfLinks, resolveNodeRadii, resolveNodeRadiusAggregate, resolveImportance, resolveFlowBorder, resolveNodeColors, resolveLinkWidthOf, resolveLinkColorOf, flowBorderInnerRadii, type ResolvedNetworkStyle, type NodeRadiusSpec, type ImportanceSpec, type FlowBorderSpec, type ConstBorder, type LinkWidthSpec, type LinkColorSpec, type LinkStyle } from "./glyphs.js";
+import { networkLayers, frontierCircles, frontierHalos, superEdges, emitNodes, emitLinks, emitArrows, emitHalfLinks, resolveNodeRadii, resolveNodeRadiusAggregate, resolveImportance, resolveFlowBorder, resolveNodeColors, resolveLinkWidthOf, resolveLinkColorOf, resolveLinkStrokeOf, flowBorderInnerRadii, type ResolvedNetworkStyle, type NodeRadiusSpec, type ImportanceSpec, type FlowBorderSpec, type ConstBorder, type LinkWidthSpec, type LinkColorSpec, type LinkStyle } from "./glyphs.js";
 import { rgb } from "d3-color";
 import { ForceLayout, seedPositions, type ForceParams } from "./force.js";
 import { multilevelLayout, type CoarsenOptions } from "./coarsen.js";
@@ -817,8 +817,8 @@ export class Network extends BaseEngine {
     // the WebGL lane; `linkStrokeOf` gives the CSS for the Scene path; `linkStroke` is representative.
     const lsSpec: LinkColorSpec = this.styleOpts.linkStroke ?? DEFAULT_LINK_STROKE;
     const linkColorOf = resolveLinkColorOf(lsSpec);
-    const linkStrokeOf = typeof lsSpec === "function" ? lsSpec : () => lsSpec;
-    const linkStroke = typeof lsSpec === "function" ? linkStrokeOf(1) : lsSpec;
+    const linkStrokeOf = resolveLinkStrokeOf(lsSpec);
+    const linkStroke = typeof lsSpec === "string" ? lsSpec : linkStrokeOf(1);
     // nodeFill: a single colour, or a per-node accessor → packed RGBA (categorical module colours).
     const fillSpec = this.styleOpts.nodeFill;
     const nodeFill = typeof fillSpec === "function" ? DEFAULT_NODE_FILL : (fillSpec ?? DEFAULT_NODE_FILL);

@@ -152,11 +152,12 @@ export interface NodeStyleResolved {
 export type LinkWidthSpec = number | ((weight: number) => number) | { by: "weight" | "flow"; scale: (value: number) => number };
 
 /**
- * Link colour. A single CSS colour, or a `(weight) => cssColour` scale so colour encodes the edge's
- * weight/flow (a bare d3 sequential/linear colour scale fits). Resolves to a function of a *weight
- * value*, so a super-edge colours by its accumulated subsumed weight — matching {@link LinkWidthSpec}.
+ * Link colour. A single CSS colour; a `(weight) => cssColour` scale (a bare d3 sequential/linear colour
+ * scale fits — `scaleSqrt().range([light, dark])` interpolates RGBA, alpha included); or `{ by, scale }`
+ * for parity with {@link LinkWidthSpec}. Whichever form, it resolves to a function of a *weight value*,
+ * so a super-edge colours by its accumulated subsumed weight (darker/heavier reads as more important).
  */
-export type LinkColorSpec = string | ((weight: number) => string);
+export type LinkColorSpec = string | ((weight: number) => string) | { by: "weight" | "flow"; scale: (value: number) => string };
 
 /** How directed links are drawn: plain `"line"` + a separate arrowhead, or a fused `"half-arrow"` (the map glyph). */
 export type LinkStyle = "line" | "half-arrow";
@@ -177,11 +178,17 @@ export function resolveLinkWidthOf(spec: LinkWidthSpec): (weight: number) => num
   return spec.scale; // { by, scale }: `by` is the per-edge weight (== flow); `scale` maps it
 }
 
-/** Resolve a {@link LinkColorSpec} to a `(weight) => RGBA` function (composes with super-edge accumulation). */
+/** Resolve a {@link LinkColorSpec} to a `(weight) => cssColour` function (composes with super-edge accumulation). */
+export function resolveLinkStrokeOf(spec: LinkColorSpec): (weight: number) => string {
+  if (typeof spec === "string") return () => spec;
+  if (typeof spec === "function") return spec;
+  return spec.scale; // { by, scale }: `by` is the per-edge weight (== flow); `scale` maps it to a colour
+}
+
+/** Resolve a {@link LinkColorSpec} to a `(weight) => RGBA` function (the WebGL twin of {@link resolveLinkStrokeOf}). */
 export function resolveLinkColorOf(spec: LinkColorSpec): (weight: number) => [number, number, number, number] {
-  if (typeof spec === "function") return (w) => toRGBA(spec(w));
-  const c = toRGBA(spec);
-  return () => c;
+  const cssOf = resolveLinkStrokeOf(spec);
+  return (w) => toRGBA(cssOf(w));
 }
 
 /** Per-instance RGBA buffer for a batch of links, colouring each by its weight via `colorOf`. */

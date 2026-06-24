@@ -64,11 +64,11 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
         options.edge === "Uniform"
           ? 0.8
           : { by: "weight" as const, scale: scaleSqrt().domain([1, 25]).range([0.5, 2]).clamp(true) };
-      // Light translucent at weight 1 (so the full-graph thicket reads as density via overdraw),
-      // darkening + opacifying with accumulated super-edge weight.
-      const linkStroke = (w: number): string => {
-        const t = Math.min(1, Math.sqrt((w - 1) / 24));
-        return `rgba(${Math.round(150 - 85 * t)}, ${Math.round(165 - 70 * t)}, ${Math.round(205 - 55 * t)}, ${(0.3 + 0.55 * t).toFixed(3)})`;
+      // Colour by weight via a d3 colour scale: light/translucent at weight 1 → darker/opaque with
+      // accumulated super-edge weight (scaleSqrt interpolates the RGBA range, alpha included).
+      const linkStroke = {
+        by: "weight" as const,
+        scale: scaleSqrt<string>().domain([1, 25]).range(["rgba(150,165,205,0.3)", "rgba(65,95,150,0.85)"]).clamp(true),
       };
 
       net

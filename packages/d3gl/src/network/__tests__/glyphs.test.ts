@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { nodeCircles, linkLines, linkArrows, halfArrowLinks, networkLayers, resolveNodeRadii, resolveImportance, type ResolvedNetworkStyle } from "../glyphs.js";
+import { nodeCircles, linkLines, linkArrows, halfArrowLinks, networkLayers, resolveNodeRadii, resolveImportance, resolveLinkColorOf, resolveLinkStrokeOf, type ResolvedNetworkStyle } from "../glyphs.js";
 import { buildGraph } from "../graph.js";
 
 /** A resolved style with a uniform radius for `n` nodes (defaults applied elsewhere). */
@@ -39,6 +39,20 @@ describe("resolveImportance", () => {
     expect(Array.from(resolveImportance(g, "degree", 5))).toEqual([1, 2, 1]);
     const custom = new Float32Array([9, 8, 7]);
     expect(resolveImportance(g, custom, 5)).toBe(custom); // used as-is, no copy
+  });
+});
+
+describe("link colour {by,scale} parity", () => {
+  it("resolves the {by,scale} form to per-weight CSS (Scene) and RGBA (WebGL)", () => {
+    const scale = (w: number) => (w > 5 ? "#000000" : "#ffffff"); // a stand-in colour scale of the weight
+    expect(resolveLinkStrokeOf({ by: "weight", scale })(10)).toBe("#000000");
+    expect(Array.from(resolveLinkColorOf({ by: "weight", scale })(10))).toEqual([0, 0, 0, 255]);
+    expect(Array.from(resolveLinkColorOf({ by: "weight", scale })(1))).toEqual([255, 255, 255, 255]);
+  });
+
+  it("still accepts a bare colour and a (weight)=>css function", () => {
+    expect(resolveLinkStrokeOf("#abcdef")(99)).toBe("#abcdef");
+    expect(resolveLinkStrokeOf((w) => (w > 1 ? "#111111" : "#eeeeee"))(2)).toBe("#111111");
   });
 });
 
