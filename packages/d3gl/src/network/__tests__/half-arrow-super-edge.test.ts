@@ -5,6 +5,7 @@ import { computeLODGeometry } from "../lod.js";
 import { superEdges } from "../glyphs.js";
 
 const HALF = { linkStyle: "half-arrow" as const, directed: true, colorOf: (): [number, number, number, number] => [10, 20, 30, 255], arrowSize: 3 };
+const ALL = { minX: -1e6, maxX: 1e6, minY: -1e6, maxY: 1e6 }; // everything on-screen
 
 /** Leaves 0,1 in module 4; leaves 2,3 in module 5; root 6. */
 const RECORDS = [
@@ -23,7 +24,7 @@ describe("superEdges (half-arrow style) over a module tree", () => {
     computeLODGeometry(tree, graph, new Float32Array(4).fill(4));
 
     const frontier = Uint32Array.from([4, 5]); // both modules visible
-    const d = superEdges(tree, frontier, { ...HALF, widthOf: (w) => w, bend: 12 }).halfArrows!;
+    const d = superEdges(tree, frontier, { ...HALF, widthOf: (w) => w, bend: 12 }, ALL).halfArrows!;
 
     expect(d.count).toBe(2); // 4→5 and 5→4
     // widths = [width, oppositeWidth] per edge: 4→5 carries 3 (opp 1); 5→4 carries 1 (opp 3).
@@ -45,7 +46,7 @@ describe("superEdges (half-arrow style) over a module tree", () => {
     computeLODGeometry(tree, graph, new Float32Array(4).fill(4));
 
     // Only module 4 visible → its super-edge to 5 is skipped (5 not present).
-    const d = superEdges(tree, Uint32Array.from([4]), { ...HALF, widthOf: (w) => w, bend: 12 }).halfArrows;
+    const d = superEdges(tree, Uint32Array.from([4]), { ...HALF, widthOf: (w) => w, bend: 12 }, ALL).halfArrows;
     expect(d ? d.count : 0).toBe(0);
   });
 });

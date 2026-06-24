@@ -497,17 +497,19 @@ export interface SuperEdgeStyleResolved {
 /**
  * Instanced LOD **super-edges**, unified across tree types and link styles (#104 N6). Links are
  * gathered from the tree's directed, flow-weighted super-edge CSR — built identically for a coarsening
- * tree and a module tree (so the edge-LOD logic is one path, not two) — between **both-visible**
- * frontier nodes only, so an edge never dangles to an off-frontier node. Width + colour come from the
- * **accumulated subsumed flow** at whatever level is visible. Rendered as fused **half-arrows**
- * (`linkStyle: "half-arrow"`, directed — reciprocals nest, tip on the target boundary) or as bent/
- * straight **lines** + (directed) one-sided arrowheads — the same glyph choice the non-LOD path makes.
- * Returns whichever layers apply; `{}` when the tree has no super-edge CSR (e.g. the spatial tree).
+ * tree and a module tree (so the edge-LOD logic is one path, not two). A visible node keeps an edge to
+ * a neighbour that is **also on the frontier** *or* whose centroid is **off-screen** (drawn toward it,
+ * exiting the view) — so a node's edges don't pop out as a neighbour scrolls off, without dangling into
+ * an on-screen region that has no glyph (an off-frontier-but-on-screen neighbour — a collapsed↔expanded
+ * mismatch — is skipped, deferred to the LOD cross-fade #133). Width + colour come from the accumulated
+ * subsumed flow. Rendered as fused **half-arrows** or bent/straight **lines** + (directed) arrowheads —
+ * the same glyph choice the non-LOD path makes. `{}` when the tree has no super-edge CSR (spatial tree).
  */
 export function superEdges(
   tree: LODTree,
   frontier: Uint32Array,
   style: SuperEdgeStyleResolved,
+  view: { minX: number; maxX: number; minY: number; maxY: number },
 ): { halfArrows?: InstancedHalfArrowsData; lines?: InstancedLinesData; arrows?: InstancedArrowsData } {
   const off = tree.superEdgeOffset;
   const tgt = tree.superEdgeTarget;
@@ -516,8 +518,12 @@ export function superEdges(
 
   const present = new Uint8Array(tree.size);
   for (let i = 0; i < frontier.length; i++) present[frontier[i]!] = 1;
+  // A neighbour is drawable if it's on the frontier, or its centroid is off-screen (the edge just exits
+  // the view toward a real node) — an O(1) test, no cull margin needed. Off-frontier *on-screen*
+  // neighbours (collapsed↔expanded) are skipped.
+  const offScreen = (h: number): boolean => tree.cx[h]! < view.minX || tree.cx[h]! > view.maxX || tree.cy[h]! < view.minY || tree.cy[h]! > view.maxY;
 
-  // Gather visible directed super-edges (both endpoints on the frontier) + a reciprocal-flow lookup.
+  // Gather drawable directed super-edges + a reciprocal-flow lookup (for both-on-frontier pairs).
   const aS: number[] = [];
   const bS: number[] = [];
   const wS: number[] = [];
@@ -526,11 +532,11 @@ export function superEdges(
     const g = frontier[i]!;
     for (let p = off[g]!; p < off[g + 1]!; p++) {
       const h = tgt[p]!;
-      if (present[h]) {
+      if (present[h] || offScreen(h)) {
         aS.push(g);
         bS.push(h);
         wS.push(flw[p]!);
-        flowByPair.set(g * tree.size + h, flw[p]!);
+        if (present[h]) flowByPair.set(g * tree.size + h, flw[p]!);
       }
     }
   }

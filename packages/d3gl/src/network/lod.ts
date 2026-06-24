@@ -700,6 +700,15 @@ const DEFAULT_EXPAND_PX = 48;
  * aggregate expands when its on-screen footprint is large enough, otherwise it is drawn as one
  * glyph; leaves always draw. Work is proportional to the visible frontier, not to the tree size.
  */
+/** The visible world rectangle for a transform + viewport (inverse of `screen = world·k + translate`). */
+export function visibleWorldRect(t: LODTransform, width: number, height: number): { minX: number; maxX: number; minY: number; maxY: number } {
+  const ax = (0 - t.x) / t.k;
+  const bx = (width - t.x) / t.k;
+  const ay = (0 - t.y) / t.k;
+  const by = (height - t.y) / t.k;
+  return { minX: Math.min(ax, bx), maxX: Math.max(ax, bx), minY: Math.min(ay, by), maxY: Math.max(ay, by) };
+}
+
 export function cut(
   tree: LODTree,
   t: LODTransform,
@@ -717,15 +726,7 @@ export function cut(
     return opts.screenSized ? r / t.k : r;
   };
 
-  // Visible world rectangle (inverse of screen = world·k + translate).
-  const ax = (0 - t.x) / t.k;
-  const bx = (width - t.x) / t.k;
-  const ay = (0 - t.y) / t.k;
-  const by = (height - t.y) / t.k;
-  const minX = Math.min(ax, bx);
-  const maxX = Math.max(ax, bx);
-  const minY = Math.min(ay, by);
-  const maxY = Math.max(ay, by);
+  const { minX, maxX, minY, maxY } = visibleWorldRect(t, width, height);
 
   const frontier: number[] = [];
   // Seed the stack with the roots (coarsest level).

@@ -353,6 +353,7 @@ describe("declutterFrontier", () => {
 
 describe("superEdges (line style) over a coarsening tree", () => {
   const lineStyle = { linkStyle: "line" as const, directed: false, widthOf: () => 1, colorOf: (): [number, number, number, number] => [0, 0, 0, 255], bend: 0, arrowSize: 3 };
+  const ALL = { minX: -1e6, maxX: 1e6, minY: -1e6, maxY: 1e6 }; // everything on-screen
   const make = () => {
     // Directed edges 0→1, 2→3 (intra-aggregate) and 1→2 (cross) — buildLODTree now also derives the
     // flow-weighted super-edge CSR (so structural and module trees share the edge path).
@@ -365,23 +366,32 @@ describe("superEdges (line style) over a coarsening tree", () => {
 
   it("links leaf neighbours present in the frontier (from the super-edge CSR)", () => {
     const { tree } = make();
-    const { lines } = superEdges(tree, new Uint32Array([0, 1, 2, 3]), lineStyle);
+    const { lines } = superEdges(tree, new Uint32Array([0, 1, 2, 3]), lineStyle, ALL);
     expect(lines!.count).toBe(3); // 0→1, 1→2, 2→3
   });
 
   it("links aggregate neighbours by accumulated flow when both are visible", () => {
     const { tree } = make();
-    const { lines } = superEdges(tree, new Uint32Array([4, 5]), lineStyle);
+    const { lines } = superEdges(tree, new Uint32Array([4, 5]), lineStyle, ALL);
     expect(lines!.count).toBe(1); // the 4→5 bridge
     expect(Array.from(lines!.sources.slice(0, 2))).toEqual([1, 0]); // centroid of aggregate 4
     expect(Array.from(lines!.targets.slice(0, 2))).toEqual([11, 0]); // centroid of aggregate 5
   });
 
-  it("draws NO edge to an off-frontier neighbour (both endpoints must be visible)", () => {
+  it("skips an off-frontier neighbour that is on-screen (collapsed↔expanded → deferred), no dangling", () => {
     const { tree } = make();
-    // Only aggregate 4 visible; its 4→5 super-edge is skipped (no dangling edge to a hidden node).
-    const { lines } = superEdges(tree, new Uint32Array([4]), lineStyle);
+    // Only aggregate 4 visible; 5 is on-screen (ALL rect) but not on the frontier → skipped.
+    const { lines } = superEdges(tree, new Uint32Array([4]), lineStyle, ALL);
     expect(lines ? lines.count : 0).toBe(0);
+  });
+
+  it("keeps the edge to an off-SCREEN neighbour (drawn toward it, exiting the view)", () => {
+    const { tree } = make();
+    // Aggregate 4 visible; 5's centroid (x≈11) is right of the viewport → off-screen → edge kept.
+    const view = { minX: -5, maxX: 5, minY: -5, maxY: 5 };
+    const { lines } = superEdges(tree, new Uint32Array([4]), lineStyle, view);
+    expect(lines!.count).toBe(1);
+    expect(Array.from(lines!.targets.slice(0, 2))).toEqual([11, 0]); // toward off-screen aggregate 5
   });
 });
 

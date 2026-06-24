@@ -3,7 +3,7 @@ import { networkLayers, frontierCircles, frontierHalos, superEdges, emitNodes, e
 import { rgb } from "d3-color";
 import { ForceLayout, seedPositions, type ForceParams } from "./force.js";
 import { multilevelLayout, type CoarsenOptions } from "./coarsen.js";
-import { buildLODTree, buildSpatialLODTree, computeLODGeometry, computeLODStyle, cut, declutterFrontier, type LODTree, type SpatialLODOptions } from "./lod.js";
+import { buildLODTree, buildSpatialLODTree, computeLODGeometry, computeLODStyle, cut, declutterFrontier, visibleWorldRect, type LODTree, type SpatialLODOptions } from "./lod.js";
 import { buildModuleLODTree, type ModuleNode } from "./modules.js";
 import { startWorkerLayout, type WorkerLayoutHandle } from "./worker-transport.js";
 import type { NetworkGraph } from "./graph.js";
@@ -520,18 +520,24 @@ export class Network extends BaseEngine {
     // Super-edges first (drawn under the nodes), among the visible frontier only.
     if (opts.superEdges !== false && this.graph!.edgeCount > 0) {
       // One super-edge path for both structural and module trees: gathered from the flow-weighted
-      // super-edge CSR (both-visible, so no edge dangles off-frontier) and rendered per linkStyle —
-      // fused half-arrows, or bent/straight lines + (directed) arrowheads, the same glyph the non-LOD
-      // path uses. (The half-arrow lane honours sizeMode in-shader; line arrowheads stay world-sized.)
-      const { halfArrows, lines, arrows } = superEdges(tree, frontier, {
-        linkStyle: style.linkStyle,
-        directed: style.directed,
-        widthOf: style.linkWidthOf,
-        colorOf: style.linkColorOf,
-        bend: style.linkBend,
-        arrowSize: style.arrowSize,
-        maxAggregateRadius: opts.maxAggregateRadius,
-      });
+      // super-edge CSR and rendered per linkStyle — fused half-arrows, or bent/straight lines +
+      // (directed) arrowheads, the same glyph the non-LOD path uses. A node keeps edges to on-frontier
+      // or off-screen neighbours (the same visible rect the cut uses); the half-arrow lane honours
+      // sizeMode in-shader, line arrowheads stay world-sized.
+      const { halfArrows, lines, arrows } = superEdges(
+        tree,
+        frontier,
+        {
+          linkStyle: style.linkStyle,
+          directed: style.directed,
+          widthOf: style.linkWidthOf,
+          colorOf: style.linkColorOf,
+          bend: style.linkBend,
+          arrowSize: style.arrowSize,
+          maxAggregateRadius: opts.maxAggregateRadius,
+        },
+        visibleWorldRect(this.transform, this.width, this.height),
+      );
       if (halfArrows && halfArrows.count > 0) layers.push({ name: "links", primitive: "half-arrows", halfArrows, sizeMode: style.sizeMode });
       if (lines && lines.count > 0) layers.push({ name: "links", primitive: "lines", lines, sizeMode: style.sizeMode });
       if (arrows && arrows.count > 0) layers.push({ name: "arrows", primitive: "arrows", arrows, sizeMode: "world" });
