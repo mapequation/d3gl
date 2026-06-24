@@ -68,6 +68,28 @@ describe("computeLODGeometry", () => {
     expect(tree.count[5]).toBe(2);
     expect(tree.weight[5]).toBeCloseTo(5); // strength2 + strength3 = 3 + 2
   });
+
+  it("sizes aggregates by the leaf scale on summed child value when a RadiusAggregate is given (flow-sized modules)", () => {
+    const g = pairedGraph();
+    g.positions.set([0, 0, 2, 0, 10, 0, 12, 0]);
+    const tree = buildLODTree(g, { minNodes: 2 });
+    // Leaf value (e.g. flow) per node; radiusOf is the leaf scale. Use identity so the numbers are
+    // legible and clearly differ from the area-additive √Σr² fallback.
+    const leafValue = new Float32Array([3, 4, 5, 12]);
+    const radiusOf = (v: number): number => v;
+    const leafRadii = new Float32Array([3, 4, 5, 12]); // = radiusOf(value) at the leaves
+    computeLODGeometry(tree, g, leafRadii, undefined, undefined, undefined, { leafValue, radiusOf });
+
+    // aggregate 4 = {0,1}: radiusOf(3 + 4) = 7 (NOT the area-additive √(3²+4²) = 5)
+    expect(tree.radius[4]).toBeCloseTo(7);
+    // aggregate 5 = {2,3}: radiusOf(5 + 12) = 17 (NOT √(5² + 12²) = 13)
+    expect(tree.radius[5]).toBeCloseTo(17);
+
+    // Without the RadiusAggregate, the same tree falls back to area-additive √Σr².
+    computeLODGeometry(tree, g, leafRadii);
+    expect(tree.radius[4]).toBeCloseTo(5);
+    expect(tree.radius[5]).toBeCloseTo(13);
+  });
 });
 
 describe("worker-LOD split (#103)", () => {

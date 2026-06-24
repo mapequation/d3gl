@@ -5,6 +5,7 @@ import { buildGraph } from "../graph.js";
 /** A resolved style with a uniform radius for `n` nodes (defaults applied elsewhere). */
 const style = (n: number): ResolvedNetworkStyle => ({
   nodeRadii: new Float32Array(n).fill(4),
+  nodeRadiusAggregate: null,
   nodeFill: "#000000",
   linkWidth: 1,
   linkWidthOf: () => 1,
@@ -58,7 +59,7 @@ describe("linkLines", () => {
 });
 
 describe("linkArrows", () => {
-  it("sets the tip back from the target by the *target* node's radius, oriented from the source", () => {
+  it("carries the target *centre* + the *target* node's radius (the tip sets back in-shader)", () => {
     const g = buildGraph({ nodeCount: 2, source: [0], target: [1], directed: true });
     g.positions.set([0, 0, 10, 0]); // node0 at origin, node1 at (10,0)
 
@@ -67,7 +68,8 @@ describe("linkArrows", () => {
 
     expect(a.count).toBe(1);
     expect(Array.from(a.sources)).toEqual([0, 0]);
-    expect(Array.from(a.targets)).toEqual([8, 0]); // 10 - dir(1,0) * targetRadius(2)
+    expect(Array.from(a.targets)).toEqual([10, 0]); // the target centre (setback is in-shader)
+    expect(Array.from(a.radii)).toEqual([2]); // target radius → the shader sets the tip back to the boundary
     expect(Array.from(a.sizes)).toEqual([4]);
     expect(Array.from(a.colors)).toEqual([255, 0, 0, 255]);
   });
@@ -97,12 +99,12 @@ describe("networkLayers", () => {
     expect(layers.map((l) => l.name)).toEqual(["nodes"]);
   });
 
-  it("threads sizeMode to nodes + links; arrows stay world-sized (their screen shader is pending)", () => {
+  it("threads sizeMode to nodes, links, and arrowheads (the arrow shader honours it in-shader)", () => {
     const g = buildGraph({ nodeCount: 2, source: [0], target: [1], directed: true });
     const layers = networkLayers(g, { ...style(2), directed: true, sizeMode: "screen" });
 
     const bySize = Object.fromEntries(layers.map((l) => [l.name, l.sizeMode]));
-    expect(bySize).toEqual({ links: "screen", arrows: "world", nodes: "screen" });
+    expect(bySize).toEqual({ links: "screen", arrows: "screen", nodes: "screen" });
   });
 
   it("emits one fused half-arrow links layer (no separate arrows) for linkStyle:'half-arrow'", () => {

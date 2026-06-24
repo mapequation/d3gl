@@ -119,11 +119,13 @@ export interface InstancedLinesData {
 
 /** SoA for a batch of instanced triangle arrowheads (directed-link tips). */
 export interface InstancedArrowsData {
-  /** [x, y] world source per arrow (for orientation), length `2 * count`. */
+  /** [x, y] source centre per arrow (for orientation), length `2 * count`. */
   sources: Float32Array;
-  /** [x, y] world tip per arrow, length `2 * count`. */
+  /** [x, y] target *centre* per arrow, length `2 * count`; the tip is set back by `radii` in-shader. */
   targets: Float32Array;
-  /** arrow size (world units) per arrow, length `count`. */
+  /** Target node radius per arrow (active sizeMode units), length `count` — the boundary setback. */
+  radii: Float32Array;
+  /** arrow size (active sizeMode units) per arrow, length `count`. */
   sizes: Float32Array;
   /** RGBA bytes per arrow, length `4 * count`. */
   colors: Uint8Array;

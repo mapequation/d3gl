@@ -13,7 +13,6 @@ export default function ModularMap() {
         { type: "segmented", key: "sizing", label: "Sizing", options: ["Screen", "World"] },
         { type: "segmented", key: "declutter", label: "Declutter", options: ["On", "Off"] },
         { type: "range", key: "expand", label: "Expand", min: 24, max: 400, step: 8, value: 240 },
-        { type: "range", key: "maxAgg", label: "Max module", min: 12, max: 48, step: 2, value: 28 },
       ]}
       width={820}
       height={560}

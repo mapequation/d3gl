@@ -1,5 +1,5 @@
 import { BaseEngine, type BaseEngineOptions } from "../map/base-engine.js";
-import { networkLayers, frontierCircles, frontierHalos, superEdges, emitNodes, emitLinks, emitArrows, emitHalfLinks, resolveNodeRadii, resolveFlowBorder, resolveNodeColors, resolveLinkWidthOf, resolveLinkColorOf, flowBorderInnerRadii, type ResolvedNetworkStyle, type NodeRadiusSpec, type FlowBorderSpec, type ConstBorder, type LinkWidthSpec, type LinkColorSpec, type LinkStyle } from "./glyphs.js";
+import { networkLayers, frontierCircles, frontierHalos, superEdges, emitNodes, emitLinks, emitArrows, emitHalfLinks, resolveNodeRadii, resolveNodeRadiusAggregate, resolveFlowBorder, resolveNodeColors, resolveLinkWidthOf, resolveLinkColorOf, flowBorderInnerRadii, type ResolvedNetworkStyle, type NodeRadiusSpec, type FlowBorderSpec, type ConstBorder, type LinkWidthSpec, type LinkColorSpec, type LinkStyle } from "./glyphs.js";
 import { rgb } from "d3-color";
 import { ForceLayout, seedPositions, type ForceParams } from "./force.js";
 import { multilevelLayout, type CoarsenOptions } from "./coarsen.js";
@@ -522,8 +522,8 @@ export class Network extends BaseEngine {
       // One super-edge path for both structural and module trees: gathered from the flow-weighted
       // super-edge CSR and rendered per linkStyle — fused half-arrows, or bent/straight lines +
       // (directed) arrowheads, the same glyph the non-LOD path uses. A node keeps edges to on-frontier
-      // or off-screen neighbours (the same visible rect the cut uses); the half-arrow lane honours
-      // sizeMode in-shader, line arrowheads stay world-sized.
+      // or off-screen neighbours (the same visible rect the cut uses); both half-arrow and line
+      // arrowheads honour sizeMode in-shader (the tip sets back to the node boundary in either space).
       const { halfArrows, lines, arrows } = superEdges(
         tree,
         frontier,
@@ -540,7 +540,7 @@ export class Network extends BaseEngine {
       );
       if (halfArrows && halfArrows.count > 0) layers.push({ name: "links", primitive: "half-arrows", halfArrows, sizeMode: style.sizeMode });
       if (lines && lines.count > 0) layers.push({ name: "links", primitive: "lines", lines, sizeMode: style.sizeMode });
-      if (arrows && arrows.count > 0) layers.push({ name: "arrows", primitive: "arrows", arrows, sizeMode: "world" });
+      if (arrows && arrows.count > 0) layers.push({ name: "arrows", primitive: "arrows", arrows, sizeMode: style.sizeMode });
     }
     // Aggregate-outline affordance: a halo ring behind collapsed-module glyphs (not leaves), under the
     // nodes, so a module reads as expandable. WebGL/LOD-only (the vector full-graph draw has no aggregates).
@@ -588,8 +588,11 @@ export class Network extends BaseEngine {
     const nodeRadii = resolved.nodeRadii;
     const leafBorder = resolved.flowBorder?.metric; // per-leaf flow metric; sum-aggregated onto the tree
     const leafColors = resolved.nodeColors; // per-leaf RGBA; averaged onto aggregates
+    // When sizing by an additive metric, aggregates size by the leaf scale on their summed value
+    // (flow-sized modules); else null ⇒ the area-additive √Σr² fallback.
+    const radiusAggregate = resolved.nodeRadiusAggregate ?? undefined;
     if (this.lodWorkerTree) {
-      computeLODStyle(this.lodWorkerTree, nodeRadii, this.graph.strength, leafBorder, leafColors);
+      computeLODStyle(this.lodWorkerTree, nodeRadii, this.graph.strength, leafBorder, leafColors, radiusAggregate);
       this.lodTree = this.lodWorkerTree;
       this.lodHasGeometry = true;
       return;
@@ -622,7 +625,7 @@ export class Network extends BaseEngine {
         this.lodModules = false;
       }
     }
-    computeLODGeometry(this.lodTree, this.graph, nodeRadii, undefined, leafBorder, leafColors);
+    computeLODGeometry(this.lodTree, this.graph, nodeRadii, undefined, leafBorder, leafColors, radiusAggregate);
     this.lodHasGeometry = true;
   }
 
@@ -811,8 +814,10 @@ export class Network extends BaseEngine {
     const nb = this.styleOpts.nodeBorder;
     const constBorder: ConstBorder | null =
       nb && !this.styleOpts.flowBorder ? { width: nb.width, color: rgbaBytes(nb.color ?? "#ffffff") } : null;
+    const nodeRadiusSpec = this.styleOpts.nodeRadius ?? DEFAULT_NODE_RADIUS;
     return {
-      nodeRadii: resolveNodeRadii(graph, this.styleOpts.nodeRadius ?? DEFAULT_NODE_RADIUS),
+      nodeRadii: resolveNodeRadii(graph, nodeRadiusSpec),
+      nodeRadiusAggregate: resolveNodeRadiusAggregate(graph, nodeRadiusSpec),
       nodeFill,
       nodeColors,
       linkWidth,

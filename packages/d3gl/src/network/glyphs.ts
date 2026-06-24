@@ -75,6 +75,25 @@ export function resolveNodeRadii(graph: NetworkGraph, spec: NodeRadiusSpec): Flo
   return radii;
 }
 
+/**
+ * When {@link NodeRadiusSpec} sizes by an **additive metric** (`{ by, scale }` — degree/strength/flow,
+ * or a custom accessor), expose the per-leaf metric value + the scale so LOD aggregates size by the
+ * SAME scale applied to their summed child value (a module's radius from its members' total flow),
+ * rather than the area-additive `√Σr²` fallback. Returns `null` for constant / `Float32Array` /
+ * degree-function specs — there is no additive value to sum, so aggregates keep the fallback.
+ */
+export function resolveNodeRadiusAggregate(
+  graph: NetworkGraph,
+  spec: NodeRadiusSpec,
+): { leafValue: Float32Array; radiusOf: (value: number) => number } | null {
+  if (typeof spec === "number" || typeof spec === "function" || spec instanceof Float32Array) return null;
+  const accessor = metricAccessor(graph, spec.by);
+  const n = graph.nodeCount;
+  const leafValue = new Float32Array(n);
+  for (let i = 0; i < n; i++) leafValue[i] = accessor(i);
+  return { leafValue, radiusOf: spec.scale };
+}
+
 /** A constant ring of a fixed pixel width (#104 rework) — e.g. a 1px white outline on every node. */
 export interface ConstBorder {
   width: number;
@@ -587,18 +606,11 @@ export function superEdges(
     : { sources, targets, widths, colors, count };
   if (!style.directed) return { lines };
 
-  const aTargets = new Float32Array(count * 2);
-  for (let e = 0; e < count; e++) {
-    const sx = sources[e * 2]!;
-    const sy = sources[e * 2 + 1]!;
-    const tx = targets[e * 2]!;
-    const ty = targets[e * 2 + 1]!;
-    const [ux, uy] = style.bend ? bentEndTangent(sx, sy, tx, ty, style.bend) : straightUnit(sx, sy, tx, ty);
-    const setback = drawnRadius(bS[e]!);
-    aTargets[e * 2] = tx - ux * setback;
-    aTargets[e * 2 + 1] = ty - uy * setback;
-  }
-  const arrows: InstancedArrowsData = { sources, targets: aTargets, sizes: new Float32Array(count).fill(style.arrowSize), colors, bends, half: true, count };
+  // Arrowheads orient + set back in-shader (so screen sizeMode is honoured): pass the target centre
+  // (already in `targets`) plus its draw radius; the shader puts the tip on the node boundary.
+  const aRadii = new Float32Array(count);
+  for (let e = 0; e < count; e++) aRadii[e] = drawnRadius(bS[e]!);
+  const arrows: InstancedArrowsData = { sources, targets, radii: aRadii, sizes: new Float32Array(count).fill(style.arrowSize), colors, bends, half: true, count };
   return { lines, arrows };
 }
 
@@ -719,30 +731,28 @@ export function linkArrows(graph: NetworkGraph, style: ArrowStyleResolved): Inst
   const bend = style.bend ?? 0;
   const sources = new Float32Array(count * 2);
   const targets = new Float32Array(count * 2);
+  const radii = new Float32Array(count);
   for (let e = 0; e < count; e++) {
     const s = graph.source[e]!;
     const t = graph.target[e]!;
-    const sx = graph.positions[s * 2]!;
-    const sy = graph.positions[s * 2 + 1]!;
-    const tx = graph.positions[t * 2]!;
-    const ty = graph.positions[t * 2 + 1]!;
-    const [ux, uy] = bend ? bentEndTangent(sx, sy, tx, ty, bend) : straightUnit(sx, sy, tx, ty);
-    const setback = style.nodeRadii[t]!;
-    sources[e * 2] = sx;
-    sources[e * 2 + 1] = sy;
-    targets[e * 2] = tx - ux * setback;
-    targets[e * 2 + 1] = ty - uy * setback;
+    sources[e * 2] = graph.positions[s * 2]!;
+    sources[e * 2 + 1] = graph.positions[s * 2 + 1]!;
+    targets[e * 2] = graph.positions[t * 2]!;
+    targets[e * 2 + 1] = graph.positions[t * 2 + 1]!;
+    // The tip is set back to the target node's boundary in-shader (oriented along the end tangent),
+    // so it follows flow/degree-sized nodes and honours screen sizeMode.
+    radii[e] = style.nodeRadii[t]!;
   }
   const sizes = new Float32Array(count).fill(style.size);
   // The arrowhead always takes its link's colour (no separate arrow fill).
   const colors = linkColorBytes(graph.weight, count, style.colorOf);
   if (bend) {
-    return { sources, targets, sizes, colors, bends: new Float32Array(count).fill(bend), half: style.half, count };
+    return { sources, targets, radii, sizes, colors, bends: new Float32Array(count).fill(bend), half: style.half, count };
   }
-  return { sources, targets, sizes, colors, count };
+  return { sources, targets, radii, sizes, colors, count };
 }
 
-/** Unit chord direction source→target (1,0 if degenerate). */
+/** Unit chord direction source→target (1,0 if degenerate). Used by the Scene/SVG arrow emitter. */
 function straightUnit(sx: number, sy: number, tx: number, ty: number): [number, number] {
   const dx = tx - sx;
   const dy = ty - sy;
@@ -754,6 +764,8 @@ function straightUnit(sx: number, sy: number, tx: number, ty: number): [number, 
 export interface ResolvedNetworkStyle {
   /** Per-node radii, length `nodeCount`; resolved via {@link resolveNodeRadii}. Units follow `sizeMode`. */
   nodeRadii: Float32Array;
+  /** When sizing by an additive metric, the per-leaf value + scale so LOD aggregates size by summed flow (else null). */
+  nodeRadiusAggregate: { leafValue: Float32Array; radiusOf: (value: number) => number } | null;
   nodeFill: string;
   /** Representative scalar width (for unweighted super-edges + the arrow-size default). */
   linkWidth: number;
@@ -772,7 +784,7 @@ export interface ResolvedNetworkStyle {
   /**
    * `"world"` (default) sizes glyphs in world units (they scale with zoom); `"screen"` sizes them in
    * constant pixels (the navigation register for large layouts — glyphs don't vanish when zoomed
-   * out). Arrowheads are world-only for now (their screen-mode shader is a tracked gap, #103).
+   * out). Nodes, links and arrowheads all honour it in-shader.
    */
   sizeMode: "world" | "screen";
   /** Optional per-node RGBA fill (categorical module colours, #104 rework); overrides `nodeFill` when set. */
@@ -823,9 +835,9 @@ export function networkLayers(graph: NetworkGraph, style: ResolvedNetworkStyle):
           primitive: "arrows",
           // Bent links get a one-sided half-arrow so reciprocal links don't collide (#104 N6c).
           arrows: linkArrows(graph, { size: style.arrowSize, nodeRadii: style.nodeRadii, colorOf: style.linkColorOf, bend, half: bend !== 0 }),
-          // Arrowheads remain world-sized until their screen-mode shader lands (#103); harmless in
-          // world mode, slightly inconsistent in screen mode for directed graphs.
-          sizeMode: "world",
+          // The arrowhead shader honours sizeMode in-shader (tip projected + set back in the working
+          // space), so screen mode keeps a constant pixel head on the node boundary.
+          sizeMode: style.sizeMode,
         });
       }
     }

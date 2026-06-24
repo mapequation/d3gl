@@ -79,7 +79,9 @@ export interface LODTree extends LODTopology {
   /**
    * Visual draw radius (world units): leaves take their resolved per-node radius (degree/strength/…
    * encoded); each aggregate is `√(Σ child radius²)` — area-additive, so it's agnostic to the node
-   * sizing and an aggregate's ink ≈ its contents' total ink. Drives drawing and declutter occupancy.
+   * sizing and an aggregate's ink ≈ its contents' total ink — *unless* a {@link RadiusAggregate} is
+   * supplied, when an aggregate is sized by the leaf scale on its summed metric (flow-sized modules).
+   * Drives drawing and declutter occupancy.
    */
   radius: Float32Array;
   /** Number of leaf descendants. */
@@ -578,11 +580,28 @@ export function computeLODPositions(tree: LODTree, positions: ArrayLike<number>)
 }
 
 /**
+ * Optional radius aggregation for {@link computeLODStyle}. When node radius is sized by an **additive
+ * metric** (degree / strength / flow), an aggregate is sized like a single *leaf carrying the combined
+ * value* — the SAME scale applied to the summed child value (e.g. a module's radius from its members'
+ * total flow). That is what the node sizing means hierarchically, and a `scaleSqrt` extrapolates above
+ * the leaf domain as an honest area-proportional continuation. Omitted ⇒ the area-additive `√(Σ child
+ * radius²)` fallback (agnostic to the sizing — used for structural / spatial trees with no metric).
+ */
+export interface RadiusAggregate {
+  /** Per-leaf additive metric value (length `leafCount`); summed up the tree onto each aggregate. */
+  leafValue: ArrayLike<number>;
+  /** Maps a (summed) value → radius — the SAME scale used for the leaves. */
+  radiusOf: (value: number) => number;
+}
+
+/**
  * Fill the tree's **style-derived** geometry: each leaf takes its resolved visual `radius` and
- * importance `weight`; each aggregate gets an area-additive radius (`√Σ child radius²`, so an
- * aggregate's ink ≈ its contents' total ink, agnostic to the node sizing) and the summed child
- * weight. Independent of positions, so this is constant through a solve — computed once on the main
- * thread (and recomputed only when the style's radii change), never per frame.
+ * importance `weight`; each aggregate gets the summed child weight and, by default, an area-additive
+ * radius (`√Σ child radius²`, so its ink ≈ its contents' total ink, agnostic to the node sizing).
+ * Pass `radiusAggregate` to instead size an aggregate by the leaf scale applied to its summed child
+ * value (flow-sized modules — see {@link RadiusAggregate}). Independent of positions, so this is
+ * constant through a solve — computed once on the main thread (recomputed only when the style's radii
+ * change), never per frame.
  *
  * `leafRadii` is the resolved per-node radius; `leafWeight` is the per-leaf importance (typically
  * `graph.strength`) driving super-edge weight and declutter priority. `leafBorder` (optional) is the
@@ -595,13 +614,18 @@ export function computeLODStyle(
   leafWeight: ArrayLike<number>,
   leafBorder?: ArrayLike<number>,
   leafColors?: ArrayLike<number>,
+  radiusAggregate?: RadiusAggregate,
 ): void {
   const { leafCount, levelCount, levelOffset, childOffset, children, radius, weight, border, color } = tree;
+  // Summed additive metric per node, only when sizing aggregates by the leaf scale (else null → the
+  // area-additive √Σr² fallback). One temp array per style recompute, never per frame.
+  const value = radiusAggregate ? new Float64Array(tree.size) : null;
 
   for (let i = 0; i < leafCount; i++) {
     radius[i] = leafRadii[i]!;
     weight[i] = leafWeight[i]!;
     border[i] = leafBorder ? leafBorder[i]! : 0;
+    if (value) value[i] = radiusAggregate!.leafValue[i]!;
     if (leafColors) {
       color[i * 4] = leafColors[i * 4]!;
       color[i * 4 + 1] = leafColors[i * 4 + 1]!;
@@ -614,6 +638,7 @@ export function computeLODStyle(
     for (let g = levelOffset[k]!; g < levelOffset[k + 1]!; g++) {
       let sw = 0;
       let sumR2 = 0;
+      let sv = 0;
       let sb = 0;
       // Colour: a chroma-weighted circular-hue mean in HCL, so a module's aggregate takes its hue
       // family's representative hue (crisp) rather than a muddy RGB average across the family.
@@ -621,7 +646,8 @@ export function computeLODStyle(
       for (let p = childOffset[g]!; p < childOffset[g + 1]!; p++) {
         const c = children[p]!;
         sw += weight[c]!;
-        sumR2 += radius[c]! * radius[c]!;
+        if (value) sv += value[c]!;
+        else sumR2 += radius[c]! * radius[c]!;
         sb += border[c]!;
         if (leafColors) {
           const col = hcl(rgb(color[c * 4]!, color[c * 4 + 1]!, color[c * 4 + 2]!));
@@ -637,7 +663,12 @@ export function computeLODStyle(
         }
       }
       weight[g] = sw;
-      radius[g] = Math.sqrt(sumR2); // area-additive: aggregate ink ≈ Σ child ink
+      if (value) {
+        value[g] = sv;
+        radius[g] = radiusAggregate!.radiusOf(sv); // leaf scale on the summed value (flow-sized modules)
+      } else {
+        radius[g] = Math.sqrt(sumR2); // area-additive: aggregate ink ≈ Σ child ink
+      }
       border[g] = sb; // sum-additive: a module's border metric ≈ Σ member metric
       if (leafColors && nc > 0) {
         const hue = (Math.atan2(hy, hx) * 180) / Math.PI;
@@ -667,9 +698,10 @@ export function computeLODGeometry(
   leafWeight: ArrayLike<number> = graph.strength,
   leafBorder?: ArrayLike<number>,
   leafColors?: ArrayLike<number>,
+  radiusAggregate?: RadiusAggregate,
 ): void {
   computeLODPositions(tree, graph.positions);
-  computeLODStyle(tree, leafRadii, leafWeight, leafBorder, leafColors);
+  computeLODStyle(tree, leafRadii, leafWeight, leafBorder, leafColors, radiusAggregate);
 }
 
 /** Screen-space transform: `screen = world * k + (x, y)` (matches {@link BaseEngine} `ViewTransform`). */

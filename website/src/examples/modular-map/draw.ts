@@ -78,7 +78,6 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
     render: (options) => {
       const sizeMode = options.sizing === "World" ? "world" : "screen";
       const expandPx = (options.expand as number) ?? 120;
-      const maxAggregateRadius = (options.maxAgg as number) ?? 28;
       const declutter = options.declutter !== "Off";
       net.style({
         directed: true,
@@ -99,10 +98,12 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
         net.lod(false);
       } else if (mode === "Standard") {
         // Structural coarsening — no module info; aggregates joined by plain super-edge lines.
-        net.lod({ expandPx, maxAggregateRadius, declutter, aggregateOutline });
+        net.lod({ expandPx, declutter, aggregateOutline });
       } else {
         // The planted partition drives the cut → directed half-arrow super-edges ∝ accumulated flow.
-        net.lod({ modules: d.modulePaths, expandPx, maxAggregateRadius, declutter, superEdges: true, aggregateOutline });
+        // No aggregate-radius cap: a module is sized by `nodeRadius` applied to its members' summed
+        // flow (the scale extrapolates above the leaf domain), so a module reads as its total flow.
+        net.lod({ modules: d.modulePaths, expandPx, declutter, superEdges: true, aggregateOutline });
       }
     },
   };

@@ -38,24 +38,24 @@ describe("linkLines bend", () => {
 });
 
 describe("linkArrows bend", () => {
-  it("sets the tip back along the bent end-tangent and flags a per-arrow bend + half head", () => {
+  it("carries the target centre + radius and flags a per-arrow bend + half head (setback is in-shader)", () => {
     const g = buildGraph({ nodeCount: 2, source: [0], target: [1], directed: true });
     g.positions.set([0, 0, 10, 0]);
     const d = linkArrows(g, { size: 3, nodeRadii: new Float32Array([2, 2]), colorOf: () => [153, 153, 153, 255], bend: 0.2, half: true });
     expect(d.half).toBe(true);
-    expect(d.bends![0]).toBeCloseTo(0.2, 6); // Float32 storage
-    const [ux, uy] = bentEndTangent(0, 0, 10, 0, 0.2);
-    expect(d.targets[0]).toBeCloseTo(10 - ux * 2); // tip set back by target radius along the tangent
-    expect(d.targets[1]).toBeCloseTo(0 - uy * 2);
+    expect(d.bends![0]).toBeCloseTo(0.2, 6); // Float32 storage; the shader orients the head along the end tangent
+    expect(d.targets[0]).toBeCloseTo(10); // target centre — the shader sets the tip back to the boundary
+    expect(d.targets[1]).toBeCloseTo(0);
+    expect(d.radii[0]).toBeCloseTo(2); // target radius drives the in-shader setback
   });
 
-  it("matches the straight arrow when bend=0 (tip set back along the chord)", () => {
+  it("has no bend flag for a straight arrow but still carries the target radius", () => {
     const g = buildGraph({ nodeCount: 2, source: [0], target: [1], directed: true });
     g.positions.set([0, 0, 10, 0]);
     const d = linkArrows(g, { size: 3, nodeRadii: new Float32Array([2, 2]), colorOf: () => [153, 153, 153, 255] });
     expect(d.bends).toBeUndefined();
     expect(d.half).toBeUndefined();
-    expect(d.targets[0]).toBeCloseTo(8); // 10 − radius 2
-    expect(d.targets[1]).toBeCloseTo(0);
+    expect(d.targets[0]).toBeCloseTo(10); // centre
+    expect(d.radii[0]).toBeCloseTo(2);
   });
 });

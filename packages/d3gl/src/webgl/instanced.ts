@@ -211,6 +211,7 @@ export class InstancedArrows {
   private source: Buffer;
   private target: Buffer;
   private size: Buffer;
+  private radius: Buffer;
   private color: Buffer;
   private bend: Buffer;
   private uniforms: Record<string, unknown>;
@@ -221,10 +222,15 @@ export class InstancedArrows {
     this.source = device.createBuffer({ data: data.sources });
     this.target = device.createBuffer({ data: data.targets });
     this.size = device.createBuffer({ data: data.sizes });
+    this.radius = device.createBuffer({ data: data.radii });
     this.color = device.createBuffer({ data: data.colors });
     // Per-instance bend (#104 N6c), optional: absent ⇒ zero ⇒ oriented along the chord, as before.
     this.bend = device.createBuffer({ data: data.bends ?? new Float32Array(data.count) });
-    this.uniforms = { u_transform: clipFromView({ k: 1, x: 0, y: 0 }, width || 1, height || 1) };
+    this.uniforms = {
+      u_transform: clipFromView({ k: 1, x: 0, y: 0 }, width || 1, height || 1),
+      u_screen: 0,
+      u_viewport: [width || 1, height || 1],
+    };
     this.model = new Model(device, {
       vs: INSTANCED_ARROW_VS,
       fs: FILL_FS,
@@ -233,6 +239,7 @@ export class InstancedArrows {
         { name: "a_source", format: "float32x2", stepMode: "instance" },
         { name: "a_target", format: "float32x2", stepMode: "instance" },
         { name: "a_size", format: "float32", stepMode: "instance" },
+        { name: "a_radius", format: "float32", stepMode: "instance" },
         { name: "a_bend", format: "float32", stepMode: "instance" },
         { name: "a_color", format: "unorm8x4", stepMode: "instance" },
       ],
@@ -241,6 +248,7 @@ export class InstancedArrows {
         a_source: this.source,
         a_target: this.target,
         a_size: this.size,
+        a_radius: this.radius,
         a_bend: this.bend,
         a_color: this.color,
       },
@@ -255,10 +263,12 @@ export class InstancedArrows {
   setTransform(m: Float32Array): void {
     this.uniforms["u_transform"] = m;
   }
-  // Arrows are world-sized for now; viewport/sizeMode are accepted for a uniform renderer
-  // interface but unused (screen-sizing can follow the line shader's u_screen branch later).
-  setViewport(_width: number, _height: number): void {}
-  setSizeMode(_mode: "world" | "screen"): void {}
+  setViewport(width: number, height: number): void {
+    this.uniforms["u_viewport"] = [width, height];
+  }
+  setSizeMode(mode: "world" | "screen"): void {
+    this.uniforms["u_screen"] = mode === "screen" ? 1 : 0;
+  }
   render(pass: RenderPass): void {
     if (this.count > 0) this.model.draw(pass);
   }
@@ -268,6 +278,7 @@ export class InstancedArrows {
     this.source.destroy();
     this.target.destroy();
     this.size.destroy();
+    this.radius.destroy();
     this.color.destroy();
     this.bend.destroy();
   }
