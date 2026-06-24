@@ -52,8 +52,9 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
       // worker keeps the main thread free regardless, streaming frames as it converges.
       const iterations = Math.min(250, Math.max(10, Math.round(2.5e6 / count)));
       // LFR benchmark with clear community structure (low mixing) for the layout + LOD to resolve.
-      const { nodeCount, source, target } = generateLFR(count, { mu: 0.1, seed: 1 });
-      const graph = buildGraph({ nodeCount, source, target, directed });
+      // Weighted so links vary and LOD super-edges thicken/darken with their accumulated weight.
+      const { nodeCount, source, target, weight } = generateLFR(count, { mu: 0.1, seed: 1, weighted: true });
+      const graph = buildGraph({ nodeCount, source, target, weight, directed });
 
       // The raw graph is unweighted (every edge weight 1); the per-edge "weight" that varies is the
       // **accumulated flow of an LOD super-edge**. Encode it in both width and colour so a heavier

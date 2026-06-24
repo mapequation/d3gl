@@ -2,6 +2,8 @@ export interface GeneratedNetwork {
   nodeCount: number;
   source: Uint32Array;
   target: Uint32Array;
+  /** Per-edge weight. All 1 unless `weighted` is set, then a power-law draw (most light, a few heavy). */
+  weight: Float32Array;
   /** Node → community id (planted ground truth; handy for colouring or validation). */
   community: Int32Array;
 }
@@ -21,6 +23,12 @@ export interface LFROptions {
   minCommunity?: number;
   /** Largest community. Default ≈ n/8. */
   maxCommunity?: number;
+  /** Assign power-law edge weights (so links — and accumulated LOD super-edges — vary). Default false. */
+  weighted?: boolean;
+  /** Edge-weight power-law exponent (when `weighted`). Default 2.2 (most weights near 1, a few large). */
+  weightExponent?: number;
+  /** Max edge weight (when `weighted`). Default 12. */
+  maxWeight?: number;
   /** PRNG seed (deterministic output across re-renders). Default 1. */
   seed?: number;
 }
@@ -66,7 +74,8 @@ function shuffle(arr: Uint32Array, from: number, to: number, rand: () => number)
  *
  * This is an approximation tuned for visualization (it allows the occasional multi-edge and skips
  * the reference algorithm's exact degree-sequence rewiring), not a bit-faithful reproduction of the
- * published LFR generator.
+ * published LFR generator. Pass `weighted` for power-law edge weights, so links vary in width/colour
+ * and an LOD super-edge reads as the (summed) weight of the edges it subsumes.
  */
 export function generateLFR(n: number, opts: LFROptions = {}): GeneratedNetwork {
   const mu = opts.mu ?? 0.1;
@@ -160,5 +169,12 @@ export function generateLFR(n: number, opts: LFROptions = {}): GeneratedNetwork 
     }
   }
 
-  return { nodeCount: n, source: source.subarray(0, ne), target: target.subarray(0, ne), community };
+  // 5) Edge weights: a power-law draw per edge (most ≈ 1, a few heavy) so links vary — and an LOD
+  //    super-edge, summing the weights it subsumes, reads as genuinely thicker/heavier. Unweighted ⇒ 1.
+  const weightExp = opts.weightExponent ?? 2.2;
+  const maxWeight = opts.maxWeight ?? 12;
+  const weight = new Float32Array(ne);
+  for (let e = 0; e < ne; e++) weight[e] = opts.weighted ? powerLaw(rand, 1, maxWeight, weightExp) : 1;
+
+  return { nodeCount: n, source: source.subarray(0, ne), target: target.subarray(0, ne), weight, community };
 }
