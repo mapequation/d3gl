@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { nodeCircles, linkLines, linkArrows, halfArrowLinks, networkLayers, resolveNodeRadii, resolveImportance, resolveLinkColorOf, resolveLinkStrokeOf, type ResolvedNetworkStyle } from "../glyphs.js";
+import { nodeCircles, linkLines, linkArrows, halfArrowLinks, networkLayers, pickNodes, resolveNodeRadii, resolveImportance, resolveLinkColorOf, resolveLinkStrokeOf, type ResolvedNetworkStyle } from "../glyphs.js";
 import { buildGraph } from "../graph.js";
 
 /** A resolved style with a uniform radius for `n` nodes (defaults applied elsewhere). */
@@ -216,5 +216,32 @@ describe("resolveNodeRadii", () => {
     const radii = resolveNodeRadii(withFlow, { by: "flow", scale: (v) => v * 10 });
     expect(Array.from(radii)).toEqual([1, 4, 2, 3]);
     expect(() => resolveNodeRadii(star(), { by: "flow", scale: (v) => v })).toThrow(/requires nodeFlow/);
+  });
+});
+
+describe("pickNodes (#105 N7a — no-LOD full-graph hit-test)", () => {
+  const positions = Float32Array.from([0, 0, 100, 0, 200, 0]);
+  const radii = Float32Array.from([4, 4, 4]);
+  const id = { k: 1, x: 0, y: 0 };
+
+  it("resolves the node under the point, −1 on a miss", () => {
+    expect(pickNodes(positions, radii, 3, 0, 0, id, false)).toBe(0);
+    expect(pickNodes(positions, radii, 3, 100, 0, id, false)).toBe(1);
+    expect(pickNodes(positions, radii, 3, 50, 0, id, false)).toBe(-1);
+    expect(pickNodes(positions, radii, 3, 5, 0, id, false)).toBe(-1); // dist 5 > radius 4
+  });
+
+  it("applies the transform (world radius ×k) and the screenSized (constant px) modes", () => {
+    const t = { k: 2, x: 0, y: 0 };
+    expect(pickNodes(positions, radii, 3, 200, 0, t, false)).toBe(1); // node1 → screen 200, radius 8
+    expect(pickNodes(positions, radii, 3, 207, 0, t, false)).toBe(1); // dist 7 < 8
+    expect(pickNodes(positions, radii, 3, 209, 0, t, false)).toBe(-1); // dist 9 > 8
+    expect(pickNodes(positions, radii, 3, 3, 0, t, true)).toBe(0); // screenSized: radius stays 4px
+    expect(pickNodes(positions, radii, 3, 5, 0, t, true)).toBe(-1);
+  });
+
+  it("returns the topmost (last) node when circles overlap", () => {
+    const p = Float32Array.from([0, 0, 2, 0]); // both radius 4 → overlap; (1,0) inside both
+    expect(pickNodes(p, Float32Array.from([4, 4]), 2, 1, 0, id, false)).toBe(1);
   });
 });

@@ -9,6 +9,7 @@ import {
   lodTreeFromTopology,
   cut,
   declutterFrontier,
+  pickFrontier,
 } from "../lod.js";
 import { buildHierarchy, multilevelSeed } from "../coarsen.js";
 import { lodGeometryViews, lodGeometryByteLength } from "../worker-protocol.js";
@@ -507,5 +508,77 @@ describe("buildSpatialLODTree (#103 edge-less point clouds)", () => {
     expect(single.levelCount).toBe(1);
     expect(single.size).toBe(1);
     expect(buildSpatialLODTree(new Float32Array(0), 0).size).toBe(0);
+  });
+});
+
+describe("pickFrontier (#105 N7a — CPU hit-test on the cut frontier)", () => {
+  // Nodes spread far apart so leaf glyphs (radius 4) don't overlap at k=1; aggregates 4={0,1} at
+  // cx=50 and 5={2,3} at cx=250, each radius √(4²+4²) ≈ 5.657 (area-additive).
+  const spreadTree = () => {
+    const g = pairedGraph();
+    g.positions.set([0, 0, 100, 0, 200, 0, 300, 0]);
+    const tree = buildLODTree(g, { minNodes: 2 });
+    computeLODGeometry(tree, g, new Float32Array([4, 4, 4, 4]));
+    return tree;
+  };
+  const noScale = { screenSized: false };
+  const id = { k: 1, x: 0, y: 0 };
+
+  it("resolves the leaf whose drawn circle contains the point, −1 on a miss", () => {
+    const tree = spreadTree();
+    const f = Uint32Array.from([0, 1, 2, 3]);
+    expect(pickFrontier(tree, f, 0, 0, id, noScale)).toBe(0);
+    expect(pickFrontier(tree, f, 100, 0, id, noScale)).toBe(1);
+    expect(pickFrontier(tree, f, 300, 0, id, noScale)).toBe(3);
+    expect(pickFrontier(tree, f, 2, 2, id, noScale)).toBe(0); // dist √8 ≈ 2.83 ≤ 4
+    expect(pickFrontier(tree, f, 5, 0, id, noScale)).toBe(-1); // dist 5 > radius 4
+    expect(pickFrontier(tree, f, 50, 0, id, noScale)).toBe(-1); // between two leaves
+  });
+
+  it("resolves aggregates at their area-additive radius", () => {
+    const tree = spreadTree();
+    const f = Uint32Array.from([4, 5]);
+    expect(pickFrontier(tree, f, 50, 0, id, noScale)).toBe(4);
+    expect(pickFrontier(tree, f, 250, 0, id, noScale)).toBe(5);
+    expect(pickFrontier(tree, f, 50, 5, id, noScale)).toBe(4); // 5 < 5.657
+    expect(pickFrontier(tree, f, 50, 6, id, noScale)).toBe(-1); // 6 > 5.657
+  });
+
+  it("applies the view transform (world radius scales by k, centre by k+translate)", () => {
+    const tree = spreadTree();
+    const f = Uint32Array.from([0]);
+    const t = { k: 2, x: 10, y: 0 }; // node 0 → screen (10,0), on-screen radius 4·2 = 8
+    expect(pickFrontier(tree, f, 10, 0, t, noScale)).toBe(0);
+    expect(pickFrontier(tree, f, 17, 0, t, noScale)).toBe(0); // dist 7 < 8
+    expect(pickFrontier(tree, f, 19, 0, t, noScale)).toBe(-1); // dist 9 > 8
+  });
+
+  it("treats radii as constant pixels when screenSized (no ×k)", () => {
+    const tree = spreadTree();
+    const f = Uint32Array.from([0]);
+    const t = { k: 2, x: 0, y: 0 }; // screen radius stays 4px, not 8
+    expect(pickFrontier(tree, f, 3, 0, t, { screenSized: true })).toBe(0);
+    expect(pickFrontier(tree, f, 5, 0, t, { screenSized: true })).toBe(-1);
+  });
+
+  it("clamps aggregate hit radius to maxAggregateRadius, but never leaves", () => {
+    const tree = spreadTree();
+    expect(pickFrontier(tree, Uint32Array.from([4]), 50, 4, id, { screenSized: false, maxAggregateRadius: 3 })).toBe(-1); // 4 > clamp 3
+    expect(pickFrontier(tree, Uint32Array.from([4]), 50, 2, id, { screenSized: false, maxAggregateRadius: 3 })).toBe(4);
+    expect(pickFrontier(tree, Uint32Array.from([0]), 0, 4, id, { screenSized: false, maxAggregateRadius: 3 })).toBe(0); // leaf radius 4 uncapped
+  });
+
+  it("returns the topmost (last-drawn) glyph when circles overlap", () => {
+    // Line tree: nodes 0,1 at x=0,2 (radius 4) overlap; the point (1,0) is inside both.
+    const g = pairedGraph();
+    g.positions.set([0, 0, 2, 0, 10, 0, 12, 0]);
+    const tree = buildLODTree(g, { minNodes: 2 });
+    computeLODGeometry(tree, g, new Float32Array([4, 4, 4, 4]));
+    expect(pickFrontier(tree, Uint32Array.from([0, 1]), 1, 0, id, noScale)).toBe(1); // 1 drawn after 0
+    expect(pickFrontier(tree, Uint32Array.from([1, 0]), 1, 0, id, noScale)).toBe(0); // 0 drawn after 1
+  });
+
+  it("misses on an empty frontier", () => {
+    expect(pickFrontier(spreadTree(), new Uint32Array(0), 0, 0, id, noScale)).toBe(-1);
   });
 });

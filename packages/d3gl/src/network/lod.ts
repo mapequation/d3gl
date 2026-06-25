@@ -976,3 +976,44 @@ export function declutterFrontier(
   for (let i = 0; i < F; i++) if (kept[i]) out[w++] = frontier[i]!;
   return out;
 }
+
+export interface PickOptions {
+  /** True when glyphs are screen-pixel sized (`sizeMode: "screen"`); else world radii × k. */
+  screenSized: boolean;
+  /** Aggregate draw-radius cap (matches {@link frontierCircles}/{@link declutterFrontier}). */
+  maxAggregateRadius?: number;
+}
+
+/**
+ * Hit-test a screen point (CSS px) against the LOD cut **frontier** — the only glyphs on screen — and
+ * return the frontier node id under it, or `-1` for a miss. Projects each glyph exactly as
+ * {@link frontierCircles}/{@link declutterFrontier} do (`screen = world·k + t`; on-screen radius =
+ * `screenSized ? radius : radius·k`, aggregates clamped to `maxAggregateRadius`), so the hit area
+ * matches the drawn circle at any zoom. Nodes/aggregates are circles, so point-in-circle is exact.
+ *
+ * On overlap (declutter off) the **last** containing glyph wins — the frontier is drawn in order and
+ * the GPU paints later instances on top, so the last match is the topmost glyph the user sees.
+ *
+ * O(frontier): the frontier is bounded by the viewport + expand threshold, never the graph size — so
+ * this is cheap per pointer event even at 10M nodes. No GPU readback needed (see #105 / #141).
+ */
+export function pickFrontier(
+  tree: LODTree,
+  frontier: Uint32Array,
+  x: number,
+  y: number,
+  t: LODTransform,
+  opts: PickOptions,
+): number {
+  const maxAgg = opts.maxAggregateRadius ?? Infinity;
+  let found = -1;
+  for (let i = 0; i < frontier.length; i++) {
+    const g = frontier[i]!;
+    const drawn = g < tree.leafCount ? tree.radius[g]! : Math.min(tree.radius[g]!, maxAgg);
+    const pr = opts.screenSized ? drawn : drawn * t.k;
+    const dx = x - (tree.cx[g]! * t.k + t.x);
+    const dy = y - (tree.cy[g]! * t.k + t.y);
+    if (dx * dx + dy * dy <= pr * pr) found = g; // last match = topmost in paint order
+  }
+  return found;
+}

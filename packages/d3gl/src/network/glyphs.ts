@@ -1,7 +1,7 @@
 import { rgb } from "d3-color";
 import type { InstancedCirclesData, InstancedLinesData, InstancedArrowsData, InstancedHalfArrowsData, InstancedLayer, GroupBuilder } from "../core/index.js";
 import type { NetworkGraph } from "./graph.js";
-import type { LODTree } from "./lod.js";
+import type { LODTree, LODTransform } from "./lod.js";
 import { halfLinkGeometry, traceHalfLink, scaleHalfLink } from "./half-link.js";
 
 /**
@@ -410,6 +410,33 @@ export function nodeCircles(graph: NetworkGraph, style: NodeStyleResolved): Inst
     return { ...base, ...constBorderArrays(count, style.radii, style.constBorder.width, style.constBorder.color) };
   }
   return base;
+}
+
+/**
+ * Hit-test a screen point (CSS px) against the full node set (the no-LOD draw) and return the node
+ * index under it, or `-1` for a miss. Counterpart to {@link pickFrontier} for graphs drawn without
+ * LOD: same projection as the renderer (`screen = world·k + t`; on-screen radius =
+ * `screenSized ? radius : radius·k`), last match wins (topmost in paint order). O(node count) — the
+ * no-LOD path is the small-graph case, so a linear scan is fine; large graphs use the LOD frontier.
+ */
+export function pickNodes(
+  positions: Float32Array,
+  radii: Float32Array | readonly number[],
+  count: number,
+  x: number,
+  y: number,
+  t: LODTransform,
+  screenSized: boolean,
+): number {
+  let found = -1;
+  for (let i = 0; i < count; i++) {
+    const r = radii[i]!;
+    const pr = screenSized ? r : r * t.k;
+    const dx = x - (positions[2 * i]! * t.k + t.x);
+    const dy = y - (positions[2 * i + 1]! * t.k + t.y);
+    if (dx * dx + dy * dy <= pr * pr) found = i;
+  }
+  return found;
 }
 
 export interface FrontierStyleResolved {
