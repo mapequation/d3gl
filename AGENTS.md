@@ -85,10 +85,23 @@ long it stays useful:
    so every build/typecheck/test fails (or silently runs against missing/stale deps) until you
    install. Do this *before* the first `tsc`/`astro check`/`vitest`/build command, not after it
    errors. Then open the PR with `Fixes #N`.
-5. **Human verification** — Summarize what you have done including changes that may
-   have affected per-frame computational complexity or memory footprint and ask for approval before merging a PR.
-6. Create changesets.
-7. **Merge with squash** (see below), then **delete the feature branch** (local +
+5. **Performance section in the PR** — before asking for human verification, add a
+   `## Performance` section to the PR body with two subsections, **Per-frame cost** and
+   **Memory footprint**. Under each, list *every* change that could move fps / run-time
+   (resp. memory) by more than a negligible amount — **include it even when you are
+   uncertain**, and an added loop on a per-frame path *always* requires an entry. For each:
+   - give the computational complexity **before → after**, and
+   - **quantify every `N` / `size`**: say exactly which set it ranges over (all drawables,
+     only the visible frontier, only the aggregated nodes, tree depth, …) and its rough
+     scale — never an unqualified `O(size)` or `~log N`.
+
+   Then state, from the **user's** point of view, under what conditions (if any) the change
+   is noticeable and by how much (run-time and memory), including any scale at which it
+   could hit a memory limit.
+6. **Human verification** — Summarize what you have done (point to the Performance section
+   for any per-frame / memory impact) and ask for approval before merging a PR.
+7. Create changesets.
+8. **Merge with squash** (see below), then **delete the feature branch** (local +
    remote) once it's in `main`.
 
 ### Merge strategy & branch cleanup
