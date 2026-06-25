@@ -16,7 +16,7 @@ export default function Network() {
           min: 0,
           max: 5,
           step: 1,
-          value: 1, // 100 — loads instantly; crank up to stress-test
+          value: 2, // 1k — a good default for showing LOD; crank up to stress-test
           display: ["10", "100", "1k", "10k", "100k", "1M"],
         },
         { type: "segmented", key: "mode", label: "Links", options: ["Directed", "Undirected"] },
@@ -26,7 +26,7 @@ export default function Network() {
         { type: "segmented", key: "lod", label: "LOD", options: ["Off", "On"], value: "On" },
         { type: "segmented", key: "declutter", label: "Declutter", options: ["On", "Off"] },
         { type: "segmented", key: "edges", label: "Edges", options: ["On", "Off"] },
-        { type: "segmented", key: "crossLevel", label: "Cross-level edges", options: ["Off", "On"] },
+        { type: "segmented", key: "crossLevel", label: "Cross-level edges", options: ["Off", "On"], value: "On" },
         {
           type: "range",
           key: "crossFade",

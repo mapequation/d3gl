@@ -27,7 +27,7 @@ export default function ModularLod() {
           min: 0,
           max: 6,
           step: 1,
-          value: 0, // off; raise to fade a module ↔ its sub-modules across the expand threshold (#133).
+          value: 2, // 0.2 — fade a module ↔ its sub-modules across the expand threshold (#133).
           // The gasket is self-similar (the whole frontier transitions at one level), so there's no
           // mixed-level case — `crossLevelEdges` (#139) has nothing to project across and is omitted here.
           display: ["Off", "0.1", "0.2", "0.3", "0.4", "0.5", "0.6"],
