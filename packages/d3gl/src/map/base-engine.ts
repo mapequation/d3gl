@@ -1,6 +1,7 @@
 import { select } from "d3-selection";
 import { zoom as d3zoom, zoomIdentity, type D3ZoomEvent } from "d3-zoom";
 import { Scene, HitIndex, declutterScreen, declutterScratch, type Backend, type GroupBuilder, type RenderLayer, type ViewTransform, type DeclutterScratch } from "../core/index.js";
+import { InstancedLane } from "../core/instanced-lane.js";
 import { createBackend, createCanvasBackend, type BackendType, type BackendHandle } from "./backend-factory.js";
 import { buildBatch, type DrawItem } from "./draw-batch.js";
 import { composeColor, type StyleOverride, type SelectionOptions } from "./style-overrides.js";
@@ -9,6 +10,17 @@ import { Tooltip } from "./tooltip.js";
 
 export type Accessor<D, T> = T | ((d: D, i: number) => T);
 export interface HoverHit { layer: string; id: string | number; datum: unknown; }
+
+/** A registered instanced selection lane (#108-B). BaseEngine drives its re-emit + resolves its picks. */
+export interface InstancedLaneEntry {
+  lane: InstancedLane;
+  /** The instanced layer names this lane emits — cleared then re-added in this order each emit (draw order). */
+  layerNames: readonly string[];
+  /** Re-select + re-emit on every setTransform (zoom-dependent: LOD cut / declutter). Static lanes emit once at register. */
+  dynamic: boolean;
+  /** Map a picked source index (from `lane.pick`) to a HoverHit for hover/click dispatch; null = treat as a miss. */
+  resolve(index: number): HoverHit | null;
+}
 
 /**
  * Declarative interaction options shared by every engine's retained layers. The machinery
@@ -112,6 +124,8 @@ export abstract class BaseEngine {
   protected hitIndexes = new Map<string, HitIndex>();
   /** Pass-through layers: no Scene entry, no retained geometry. */
   protected ptSpecs = new Map<string, PassThroughSpec>();
+  /** Instanced selection lanes (#108-B): drives re-emit on setTransform; resolves picks. */
+  protected instancedLanes = new Map<string, InstancedLaneEntry>();
   /** Per-layer id → datum index, maintained incrementally so an append's duplicate-id
    *  check stays O(new) (not O(total)/batch) AND so pick()/restyle resolve a datum
    *  index in O(1) instead of spec.ids.indexOf (O(n) per pointer move). */
@@ -307,6 +321,29 @@ export abstract class BaseEngine {
    *  so the hover/tooltip/selection contract lives in exactly one place. */
   protected interactionFields(opts: InteractiveLayerOptions): Pick<LayerSpec, "selection" | "hover" | "tooltip"> {
     return { selection: opts.selection, hover: opts.hover, tooltip: opts.tooltip };
+  }
+
+  /** Register (or replace) an instanced selection lane and emit it once if a backend is ready. */
+  protected registerInstancedLane(name: string, entry: InstancedLaneEntry): void {
+    this.instancedLanes.set(name, entry);
+    if (this.handle?.backend.setInstancedLayer) this.emitInstancedLane(name);
+  }
+
+  /** Drop a lane and remove its instanced layers from the backend. */
+  protected unregisterInstancedLane(name: string): void {
+    const entry = this.instancedLanes.get(name);
+    const backend = this.handle?.backend;
+    if (entry && backend?.removeInstancedLayer) for (const n of entry.layerNames) backend.removeInstancedLayer(n);
+    this.instancedLanes.delete(name);
+  }
+
+  /** Re-select the lane at the live transform and push its layers (clear its names, then re-add in order). */
+  protected emitInstancedLane(name: string): void {
+    const entry = this.instancedLanes.get(name);
+    const backend = this.handle?.backend;
+    if (!entry || !backend?.setInstancedLayer) return;
+    for (const n of entry.layerNames) backend.removeInstancedLayer?.(n);
+    for (const layer of entry.lane.update(this.transform, this.width, this.height)) backend.setInstancedLayer(layer);
   }
 
   /** Register/replace a layer: build its Scene group, apply accessors, index, push. */
@@ -748,6 +785,7 @@ export abstract class BaseEngine {
   setTransform(t: ViewTransform): this {
     this.transform = t;
     this.handle?.backend.setTransform(t);
+    for (const [name, entry] of this.instancedLanes) if (entry.dynamic) this.emitInstancedLane(name);
     for (const spec of this.specs) if (spec.declutter) this.declutterLayer(spec, t);
     this.render();
     // Pass-through layers. While interacting, the backend composites its accumulation
@@ -872,6 +910,15 @@ export abstract class BaseEngine {
     // world layers, project-the-anchor for screen layers — so screen geometry picks at its
     // rendered pixel size at any zoom, not a hit area that scales with the view transform).
     const t = this.transform;
+    // Instanced lanes (topmost = last registered) — resolved before Scene specs. Guarded on
+    // size so the common empty-registry case (geoMap/plot, pick() per pointermove) allocates nothing.
+    if (this.instancedLanes.size > 0) {
+      const lanes = [...this.instancedLanes.values()];
+      for (let i = lanes.length - 1; i >= 0; i--) {
+        const idx = lanes[i]!.lane.pick(x, y, t);
+        if (idx >= 0) { const hit = lanes[i]!.resolve(idx); if (hit) return hit; }
+      }
+    }
     for (let i = this.specs.length - 1; i >= 0; i--) {
       const spec = this.specs[i]!;
       const id = this.hitIndexes.get(spec.name)?.pick(x, y, t);
