@@ -11,7 +11,6 @@ rendering, the build, or the test setup.
 - **Clean code** — Casting or reaching for `any` / `unknown` is a sign of bad design; fix the underlying seam (a typed pure function, a test at the right layer) instead. Avoid the non-null assertion operator (`!`) for the same reason, unless it's justified in a performance-critical spot and approved by me.
 - **Regression-safe** — Write tests for both behavior and visual output. Never claim a visual issue is solved without visual testing (browser tests / the backend-equivalence harness). When you change the library, make sure no example breaks.
 - **Up-to-date documentation** — Every major feature should be highlighted on the website landing page and have a minimal example that demonstrates it. As soon as the library changes, keep the documentation — prose and examples — up to date. If it includes a new feature, it should be possible to verify its function in at least one example.
-- **Human verification** — Never merge a PR without human approval.
 
 ## Library-first design (improve d3gl, don't work around it)
 
@@ -73,18 +72,15 @@ long it stays useful:
    ```sh
    git worktree add .claude/worktrees/<name> -b <branch>   # new branch, checked out IN the worktree
    ```
-   Do **not** `git checkout <branch>` in the primary checkout — the branch lives in the
-   worktree, and the primary stays on `main`. From here on, **everything targets the worktree
-   path**: not just `git -C <worktree>` / `pnpm --filter`, but also the Read/Edit/Write tools —
-   edit `/…/.claude/worktrees/<name>/packages/…`, never the primary `/…/d3gl/packages/…`. After
-   your first edits, confirm `git -C <worktree> status` lists them (if they show up in the
-   *primary* status instead, you edited the wrong tree — see §Worktrees & shell cwd to recover).
+   Don't `git checkout <branch>` in the primary checkout — the branch lives in the worktree and
+   the primary stays on `main`. Drive everything by the worktree path (`git -C <worktree>`,
+   `pnpm --filter`, and Read/Edit/Write under `/…/.claude/worktrees/<name>/…`), never the primary
+   tree — see **§Worktrees & shell cwd** for why and how to recover a mis-targeted edit.
 
-   **Immediately `pnpm install` in the new worktree** — a fresh worktree has its own *empty*
-   `node_modules` (it's a separate working tree; deps are not shared from the primary checkout),
-   so every build/typecheck/test fails (or silently runs against missing/stale deps) until you
-   install. Do this *before* the first `tsc`/`astro check`/`vitest`/build command, not after it
-   errors. Then open the PR with `Fixes #N`.
+   **Immediately `pnpm install` in the new worktree** — it has its own *empty* `node_modules`
+   (deps aren't shared from the primary checkout), so builds/typecheck/tests fail or run against
+   stale deps until you do. Run it *before* the first `tsc`/`astro check`/`vitest`/build, not after
+   it errors. Then open the PR with `Fixes #N`.
 5. **Performance section in the PR** — before asking for human verification, add a
    `## Performance` section to the PR body with two subsections, **Per-frame cost** and
    **Memory footprint**. Under each, list *every* change that could move fps / run-time
@@ -103,32 +99,34 @@ long it stays useful:
 7. Create changesets.
 8. **Merge with squash** (see below), then **delete the feature branch** (local +
    remote) once it's in `main`.
+9. **Tear down the worktree.** Stop any dev server you started in it and **wait for its
+   `astro`/`vite`/`esbuild` children to fully exit** before removing — a process still rewriting
+   its cache (e.g. `website/.astro`) makes `git worktree remove --force` fail with *"Directory not
+   empty"* (a worktree that only ran one-shot builds removes cleanly). Then `git worktree remove
+   <path>` + `git worktree prune`; don't be `cd`'d inside it (drive via `git -C`). If git already
+   de-registered the worktree but a stale dir lingers, `rm -rf` the leftover path.
 
 ### Merge strategy & branch cleanup
 
-**Squash-merge feature PRs** (`gh pr merge <N> --squash --delete-branch`). It's the
-default best practice here: one commit per PR keeps `main`'s history linear and
-readable, makes revert/bisect trivial, and the messy work-in-progress commits stay in
-the PR (where, per the issue-tracking rule above, throwaway reasoning belongs). Earlier
-PRs used merge commits or rebase-merges — those preserve ancestry but clutter `main`
-with intermediate commits and lose the one-PR-one-commit grouping, so don't carry that
-pattern forward. Reserve plain merge commits for genuine long-lived branches (none
-exist here today).
+**Squash-merge feature PRs** (`gh pr merge <N> --squash`). One commit per PR keeps
+`main`'s history linear and readable, makes revert/bisect trivial, and the messy
+work-in-progress commits stay in the PR (where, per the issue-tracking rule above,
+throwaway reasoning belongs). Reserve plain merge commits for genuine long-lived branches.
 
-**Delete the branch on merge.** `--delete-branch` removes it remotely; also prune
-locally:
+**Delete the branch manually after merge** — *not* with `--delete-branch`: from inside a
+linked worktree it fails (gh tries to check out the base branch, which the primary checkout
+holds), and a squash-merged branch isn't an ancestor of `main` so `git branch -d` refuses it
+anyway. So:
 
 ```sh
 git checkout main && git pull --ff-only
 git fetch --prune origin           # drop stale remote-tracking refs
-git branch -d <branch>             # delete local copy (safe; refuses if unmerged)
+git push origin --delete <branch>  # remote
+git branch -D <branch>             # local (confirm it merged via `gh pr list --state merged`)
 ```
 
-Caveat: a squash-merged branch is **not** an ancestor of `main`, so
-`git branch --merged` / `git branch -d` won't recognize it — confirm via the PR
-(`gh pr list --state merged`) and use `git branch -D` / `git push origin --delete` for
-those. **Never delete** `changeset-release/main` (the Changesets release bot branch) or
-any branch with an open PR.
+**Never delete** `changeset-release/main` (the Changesets release bot branch) or any branch
+with an open PR.
 
 ### Issue body template
 
@@ -180,7 +178,6 @@ checkout of the same repo. The shell's working directory can silently reset to t
 that resets cwd). If you then run `git add -A && git commit && git push` assuming you're in
 the worktree, you'll commit to the **primary checkout's branch (usually `main`)** instead —
 and `git add -A` there will even add `.claude/worktrees/<name>` as an embedded-repo gitlink.
-This happened once and pushed junk to `main`.
 
 Defenses (do these):
 - Run every git/build command with an explicit path — `git -C <worktree> …`,
@@ -265,16 +262,6 @@ shapes for draw order, thick polylines for joins/caps). Use a **position-toleran
 edges, so an exact-position diff reports ~6% noise that isn't a real divergence. The live
 `website` "Backend equivalence" example renders both scenes in all three backends side by
 side with synced zoom for eyeballing.
-
-## Incremental layer append (status)
-
-`LayerHandle.append()` (`GeoMap.layer().append()` / `Plot.points().append()`) appends
-without re-projecting existing features, but the per-batch cost is currently
-**O(total)**: `scene.buffers()` re-serializes the whole layer and the WebGL backend
-rebuilds the layer's renderer from the full buffers. The **O(new)** fast-path (Scene
-delta buffers + `bufferSubData`/`texSubImage2D` on WebGL, draw-on-top on Canvas) is
-designed but **deferred** — it needs interactive browser verification (see the browser
-test note above).
 
 ## Releases (changesets, CI-published)
 
