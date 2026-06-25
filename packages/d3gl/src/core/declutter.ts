@@ -26,6 +26,13 @@ export function declutterScratch(): DeclutterScratch {
  * the uniform case (a point layer's fixed spacing is passed as **half** the centre-to-centre distance,
  * since two glyphs collide when `dist < rᵢ + rⱼ`). `out` (length ≥ `count`, written in index order) and
  * `scratch` are reused across frames by the caller. Returns `out`.
+ *
+ * `ignore(i, j)` (optional) drops a specific overlap from the test: when candidate `i` would be occluded
+ * by an already-kept glyph `j`, returning true means "not a real overlap" so `i` is not culled by `j`
+ * (but is still tested against every other glyph, and still occludes others). Used by the LOD cross-fade
+ * (#133): a glyph transitioning across the expand threshold ignores its **ancestor** as an occluder — so
+ * a fading parent doesn't cull its fading-in children — while children still declutter against siblings.
+ * Omitted ⇒ no ignored pairs (zero added cost).
  */
 export function declutterScreen(
   count: number,
@@ -38,6 +45,7 @@ export function declutterScreen(
   spacing: number,
   out: Uint8Array,
   scratch: DeclutterScratch = declutterScratch(),
+  ignore?: (i: number, j: number) => boolean,
 ): Uint8Array {
   const radAt = typeof radius === "number" ? (_i: number) => radius : (i: number) => radius[i]!;
   let maxR = 1;
@@ -81,6 +89,7 @@ export function declutterScreen(
           const dy = sy[p]! - y;
           const thresh = spacing * (r + radAt(p)); // circles must not overlap
           if (dx * dx + dy * dy < thresh * thresh) {
+            if (ignore && ignore(i, p)) continue; // e.g. a cross-fading glyph ignores its ancestor
             occluded = true;
             break;
           }

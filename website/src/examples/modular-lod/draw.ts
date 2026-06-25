@@ -46,7 +46,10 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
           // (linkWidth also accepts a (weight) => width scale; super-edges then size by accumulated weight.)
           linkWidth: 2.5,
         })
-        .lod(lod ? { modules, expandPx: 120, maxAggregateRadius: 26 } : false)
+        // crossFade (#133): opt-in opacity cross-fade of a module ↔ its sub-modules across the expand
+        // threshold (slider × 0.1 = band half-width). The self-similar gasket has no mixed-level frontier,
+        // so crossLevelEdges (#139) doesn't apply here.
+        .lod(lod ? { modules, expandPx: 120, maxAggregateRadius: 26, crossFade: ((options.crossFade as number) ?? 0) * 0.1 } : false)
         .layout({ backend: "positions", positions });
     },
   };

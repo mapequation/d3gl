@@ -669,13 +669,15 @@ export function superEdges(
   const par = tree.parent;
   if (style.crossLevelEdges && par) {
     // Nearest present ancestor of `h` (climb parents), or -1 if none — memoised with path-compression so
-    // the whole pass stays O(visible-degree · depth), not O(visible-degree · depth²).
-    const cover = new Int32Array(tree.size).fill(-2); // -2 unknown, -1 none, ≥0 present ancestor
+    // the whole pass stays O(off-frontier-on-screen incidences · depth). Keyed in a Map over only the
+    // **touched** nodes: a per-frame `Int32Array(tree.size).fill(-2)` would be an O(all tree nodes)
+    // allocation + write every frame, defeating LOD's O(visible) intent (#144 perf section).
+    const cover = new Map<number, number>(); // node id → nearest present ancestor (-1 = none)
     const coverOf = (h: number): number => {
       let x = h;
-      while (x >= 0 && cover[x] === -2 && !present[x]) x = par[x]!;
-      const c = x < 0 ? -1 : present[x] ? x : cover[x]!;
-      for (let y = h; y >= 0 && y !== x; y = par[y]!) cover[y] = c; // backfill the climbed chain
+      while (x >= 0 && !cover.has(x) && !present[x]) x = par[x]!;
+      const c = x < 0 ? -1 : present[x] ? x : cover.get(x)!;
+      for (let y = h; y >= 0 && y !== x; y = par[y]!) cover.set(y, c); // backfill the climbed chain
       return c;
     };
     const proj = new Map<number, number>(); // directed pair key (a·size + b) → summed flow

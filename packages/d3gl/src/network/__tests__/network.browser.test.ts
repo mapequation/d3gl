@@ -284,6 +284,41 @@ describe("network() engine", () => {
     net.destroy();
   });
 
+  it("during cross-fade a child ignores its parent as occluder but still declutters against siblings (#133)", async () => {
+    const net = network(host(), { width: 200, height: 200, backend: "svg" });
+    await net.whenReady();
+    const g = buildGraph({ nodeCount: 4, source: [0, 2, 1], target: [1, 3, 2], directed: true });
+    const modules = [
+      { id: 0, path: [1, 1] }, { id: 1, path: [1, 2] }, { id: 2, path: [2, 1] }, { id: 3, path: [2, 2] },
+    ];
+    // Each module's two leaves overlap each other AND sit under the module glyph; the two modules are
+    // far apart. So a leaf overlaps both its (ancestor) module and its sibling leaf.
+    const positions = new Float32Array([60, 100, 66, 100, 140, 100, 146, 100]);
+    const circles = (declutter: boolean, crossFade: number) => {
+      net
+        .data(g)
+        .style({ directed: true, nodeRadius: 7 })
+        .lod({ modules, expandPx: 48, declutter, crossFade })
+        .layout({ backend: "positions", positions });
+      net.setTransform({ k: 1, x: 0, y: 0 });
+      net.syncScreenGeometry();
+      return (net.toSVG().match(/<circle/g) ?? []).length;
+    };
+
+    const fadeNoDeclutter = circles(false, 0.9); // every transitioning glyph drawn (parent + both leaves)
+    const fadeWithDeclutter = circles(true, 0.9); // parent ignored as occluder, siblings still declutter
+    const collapsed = circles(true, 0); // no fade: just the collapsed module aggregates
+
+    // Children survive their (transitioning) parent — far more glyphs than the collapsed frontier
+    // (a fading parent no longer culls the leaves behind it).
+    expect(fadeWithDeclutter).toBeGreaterThan(collapsed);
+    // …but overlapping *siblings* are still decluttered, so strictly fewer than the un-decluttered fade
+    // (this is the part the earlier over-broad exemption got wrong — it kept the siblings too).
+    expect(fadeWithDeclutter).toBeLessThan(fadeNoDeclutter);
+
+    net.destroy();
+  });
+
   it("renders flow-border nodes (N6b) through the WebGL lane + LOD without throwing", async () => {
     const net = network(host(), { width: 200, height: 200 });
     await net.whenReady();
