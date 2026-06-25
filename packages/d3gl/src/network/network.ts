@@ -8,6 +8,7 @@ import { buildModuleLODTree, type ModuleNode } from "./modules.js";
 import { startWorkerLayout, type WorkerLayoutHandle } from "./worker-transport.js";
 import type { NetworkGraph } from "./graph.js";
 import type { Backend, InstancedLayer, ViewTransform } from "../core/index.js";
+import { InstancedLane, type SelectionStrategy } from "../core/instanced-lane.js";
 
 /** Options for the network engine. Inherits sizing, `backend`, and `tooltipClass`. */
 export interface NetworkOptions extends BaseEngineOptions {}
@@ -283,12 +284,13 @@ export class Network extends BaseEngine {
   /** Cached resolved style; invalidated on style()/data() to avoid per-zoom O(n) radii recompute. */
   private resolvedCache: ResolvedNetworkStyle | null = null;
   /**
-   * The frontier from the last LOD cut (the on-screen glyph ids), retained so {@link pick} can
-   * hit-test exactly what's drawn without recutting. Null on the no-LOD path (then `pick` scans the
-   * full node set) and on the vector backends (then `pick` defers to the Scene hit index). Updated
-   * by {@link lodLayers} on every rebuild and pan/zoom frame, so it always reflects the live view.
+   * The shared {@link InstancedLane} for the LOD frontier — wraps {@link computeFrontier} (select)
+   * and {@link frontierLayers} (emit) so the cut + glyph build ride through the common seam. Its
+   * retained `visible` set is the on-screen glyph ids, which {@link pick} hit-tests directly. Rebuilt
+   * lazily by {@link rebuildLane} after every invalidation; null until the first LOD draw (and on the
+   * no-LOD / vector paths, where `pick` scans the full node set or defers to the Scene hit index).
    */
-  private frontier: Uint32Array | null = null;
+  private lane: InstancedLane | null = null;
 
   constructor(host: HTMLElement, opts: NetworkOptions = {}) {
     super(host, opts);
@@ -308,6 +310,7 @@ export class Network extends BaseEngine {
     this.lodModules = false;
     this.lodHasGeometry = false;
     this.resolvedCache = null;
+    this.lane = null;
     return this.rebuild();
   }
 
@@ -315,6 +318,7 @@ export class Network extends BaseEngine {
   style(style: NetworkStyle): this {
     this.styleOpts = { ...this.styleOpts, ...style };
     this.resolvedCache = null; // radii/colours/sizeMode changed
+    this.lane = null; // style changes affect the emit output; force lane rebuild
     // Refresh the LOD tree's style geometry (radii/colours) only if a tree already exists. Don't
     // *build* one here: after a data() change the tree is null and the provided modules may not yet
     // match the new graph (lod() supplies fresh ones next) — building now would mismatch and throw.
@@ -341,6 +345,7 @@ export class Network extends BaseEngine {
       this.lodSpatial = false;
       this.lodModules = false;
       this.lodHasGeometry = false;
+      this.lane = null;
       return this.rebuild();
     }
     // Switching the tree SOURCE (provided modules ↔ structural coarsening) must rebuild the tree — the
@@ -351,6 +356,7 @@ export class Network extends BaseEngine {
       this.lodHasGeometry = false;
     }
     this.lodOptions = options;
+    this.lane = null; // LOD options changed; force lane rebuild with new strategy
     // Keep any worker-streamed tree from a still-current run: reconfiguring LOD options reuses it
     // (cut-time options apply immediately; the style geometry refreshes). data()/layout() drop it on
     // a graph or layout change. recomputeLODGeometry builds a main-thread tree only off the worker
@@ -372,7 +378,7 @@ export class Network extends BaseEngine {
         this.graph.positions.set(opts.positions);
         // The edge-less spatial tree's topology depends on the positions, so drop it to rebuild from
         // the new coordinates (the coarsening tree is position-independent and is kept).
-        if (this.lodSpatial) this.lodTree = null;
+        if (this.lodSpatial) { this.lodTree = null; this.lane = null; }
         this.recomputeLODGeometry(); // caller-supplied coordinates are final immediately
       } else if (opts.backend === "worker") {
         // Off-thread force layout with progressive convergence. The worker can post a frame per
@@ -405,6 +411,7 @@ export class Network extends BaseEngine {
                 // the style geometry once. The first frame (which follows this message) renders it.
                 this.lodTree = tree;
                 this.lodWorkerTree = tree;
+                this.lane = null; // new tree — force lane rebuild on next draw
                 this.recomputeLODGeometry();
               }
             : undefined,
@@ -515,18 +522,19 @@ export class Network extends BaseEngine {
       }
       let layers: InstancedLayer[];
       if (this.lodReady()) {
-        layers = this.lodLayers(this.lodTree!, style); // cut frontier (cost ∝ visible)
+        if (!this.lane) this.rebuildLane();
+        layers = this.lane!.update(this.transform, this.width, this.height); // cut frontier (cost ∝ visible)
       } else if (this.lodOptions && this.layoutOpts.backend === "worker") {
         // LOD is on, worker backend, no tree yet — draw nothing rather than the full graph (the very
         // O(N) draw LOD exists to avoid at scale). A streaming run will populate the tree shortly; if
         // none is in flight (LOD toggled on after a run settled), build one on the main thread,
         // deferred a microtask so an imminent layout() in the same chain takes the streaming path.
         layers = [];
-        this.frontier = null; // no frontier yet → pick() returns null until the tree streams in
+        this.lane = null; // no tree yet → pick() returns null until the tree streams in
         this.scheduleLODFallback();
       } else {
         layers = networkLayers(this.graph, style); // no LOD: the full graph
-        this.frontier = null; // no LOD → pick() scans the full node set
+        this.lane = null; // no LOD → pick() scans the full node set (drop any lane from a prior LOD view)
       }
       this.emitInstancedLayers(backend, layers);
     } else {
@@ -559,9 +567,10 @@ export class Network extends BaseEngine {
 
   /**
    * Cut the LOD frontier at the live transform, then declutter it. The single per-frame visible-set
-   * computation shared by the WebGL instanced lane ({@link lodLayers}) and the vector retained-Scene
-   * path ({@link registerLODScene}, #138) — so the two backends draw the byte-identical aggregate map
-   * and can't drift. Cost ∝ the visible frontier, not the graph size.
+   * computation shared by the WebGL instanced lane (the {@link InstancedLane}'s select; see
+   * {@link rebuildLane}) and the vector retained-Scene path ({@link registerLODScene}, #138) — so the
+   * two backends draw the byte-identical aggregate map and can't drift. Cost ∝ the visible frontier,
+   * not the graph size.
    */
   private computeFrontier(tree: LODTree, style: ResolvedNetworkStyle): Uint32Array {
     const opts = this.lodOptions!;
@@ -592,17 +601,17 @@ export class Network extends BaseEngine {
         fadeAlpha: this.fadeAlpha ?? undefined,
       });
     }
-    this.frontier = frontier; // retain the on-screen glyph set for pick() (see {@link pick})
     return frontier;
   }
 
   /**
-   * Build the instanced layers for the current LOD cut frontier at the live transform. Cost ∝ the
-   * visible frontier, not the graph size. (Nodes now; super-edges + frontier declutter follow.)
+   * Build the instanced layers for a given LOD frontier (the index-compacted visible set). The emit
+   * body the {@link InstancedLane} (see {@link rebuildLane}) feeds the cut's visible set into, shared
+   * with the vector retained-Scene path ({@link registerLODScene}). Cost ∝ the visible frontier, not
+   * the graph size.
    */
-  private lodLayers(tree: LODTree, style: ResolvedNetworkStyle): InstancedLayer[] {
+  private frontierLayers(tree: LODTree, style: ResolvedNetworkStyle, frontier: Uint32Array): InstancedLayer[] {
     const opts = this.lodOptions!;
-    const frontier = this.computeFrontier(tree, style);
     const layers: InstancedLayer[] = [];
     // Super-edges first (drawn under the nodes), among the visible frontier only.
     if (opts.superEdges !== false && this.graph!.edgeCount > 0) {
@@ -654,6 +663,26 @@ export class Network extends BaseEngine {
     });
     layers.push({ name: "nodes", primitive: "circles", circles, sizeMode: style.sizeMode });
     return layers;
+  }
+
+  /**
+   * (Re)build the LOD-frontier lane: a select=cut+declutter / pick=pickFrontier strategy feeding the
+   * existing glyph emit. Cheap — captures references; runs no work until update()/pick().
+   */
+  private rebuildLane(): void {
+    if (!this.lodTree) { this.lane = null; return; }
+    const tree = this.lodTree;
+    const strategy: SelectionStrategy = {
+      select: () => this.computeFrontier(tree, this.resolvedStyleCached(this.graph!)),
+      pick: (x, y, t, visible) =>
+        pickFrontier(tree, visible, x, y, t, {
+          screenSized: this.resolvedStyleCached(this.graph!).sizeMode === "screen",
+          maxAggregateRadius: this.lodOptions!.maxAggregateRadius,
+        }),
+    };
+    this.lane = new InstancedLane(strategy, (visible) =>
+      this.frontierLayers(tree, this.resolvedStyleCached(this.graph!), visible),
+    );
   }
 
   /**
@@ -752,7 +781,8 @@ export class Network extends BaseEngine {
     const backend = this.backend();
     if (backend?.setInstancedLayer && this.lodReady() && this.graph) {
       this.transform = t; // the cut reads the live transform to compute the visible world rect
-      this.emitInstancedLayers(backend, this.lodLayers(this.lodTree!, this.resolvedStyleCached(this.graph)));
+      if (!this.lane) this.rebuildLane();
+      this.emitInstancedLayers(backend, this.lane!.update(this.transform, this.width, this.height));
     }
     return super.setTransform(t);
   }
@@ -774,11 +804,8 @@ export class Network extends BaseEngine {
     if (!backend?.setInstancedLayer || !this.graph) return super.pick(x, y);
     const style = this.resolvedStyleCached(this.graph);
     const screenSized = style.sizeMode === "screen";
-    if (this.lodReady() && this.lodTree && this.frontier) {
-      const g = pickFrontier(this.lodTree, this.frontier, x, y, this.transform, {
-        screenSized,
-        maxAggregateRadius: this.lodOptions!.maxAggregateRadius,
-      });
+    if (this.lodReady() && this.lodTree && this.lane) {
+      const g = this.lane.pick(x, y, this.transform);
       if (g < 0) return null;
       const aggregate = g >= this.lodTree.leafCount;
       return { layer: "nodes", id: g, datum: { aggregate, count: this.lodTree.count[g]! } satisfies NetworkHit };
@@ -932,8 +959,8 @@ export class Network extends BaseEngine {
   }
 
   /**
-   * Register the LOD cut frontier as retained Scene layers (#138) — the vector-backend twin of
-   * {@link lodLayers}. Computes the same {@link computeFrontier} and traces the *same* SoA
+   * Register the LOD cut frontier as retained Scene layers (#138) — the vector-backend twin of the
+   * WebGL {@link frontierLayers} emit. Computes the same {@link computeFrontier} and traces the *same* SoA
    * ({@link superEdges}/{@link frontierHalos}/{@link frontierCircles}) into Scene drawables, keyed by
    * **stable tree-node id** (frontier node, or directed super-edge pair) so the retained-scene diff is
    * stable across re-cuts. Layers are registered in canonical draw order (links < arrows < node-halos <
