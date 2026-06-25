@@ -1,4 +1,4 @@
-import { network, buildGraph, type NodeRadiusSpec, type NetworkGraph } from "@mapequation/d3gl/network";
+import { network, buildGraph, type NodeRadiusSpec, type NetworkGraph, type NetworkHit } from "@mapequation/d3gl/network";
 import { scaleSqrt } from "d3-scale";
 import type { ImperativeSetup } from "../types.js";
 import { generateLFR } from "./data.js";
@@ -35,10 +35,27 @@ function degreeRadius(graph: NetworkGraph): NodeRadiusSpec {
  * **LOD** toggle enables the adaptive hierarchy cut — dense communities collapse to aggregate glyphs
  * and expand into their members as you zoom in — with **Declutter** (thin overlaps) and **Edges**
  * (super-edges between aggregates). Pair LOD with screen sizing. Drag to pan, scroll to zoom.
+ * **Hover or click** a glyph to resolve the node — or the module it collapsed into — shown top-left.
  */
 export const setup: ImperativeSetup = (host, { width, height, backend }) => {
   const net = network(host, { width, height, backend });
   net.enableZoom([0.002, 200]); // wide range: zoom right out to the aggregate map, in to single nodes
+
+  // Picking (#105 N7a): hover/click resolve the node or aggregate under the cursor via the engine's
+  // CPU hit-test over the LOD cut frontier — bounded by the visible set, so it stays cheap at 1M. The
+  // same on("hover"/"click") API the GeoMap/Plot examples use; network just teaches pick() to see the
+  // instanced glyphs. Shown in a small overlay so the resolution is visible (no GPU readback needed).
+  const readout = document.createElement("div");
+  readout.className = "absolute top-2 left-2 pointer-events-none rounded bg-white/85 px-2 py-1 font-mono text-[12px] leading-tight text-[#333]";
+  const describe = (hit: { id: string | number; datum: unknown } | null): string => {
+    if (!hit) return "hover a node or module";
+    const d = hit.datum as NetworkHit;
+    return d.aggregate ? `module · ${d.count.toLocaleString()} nodes` : `node ${hit.id}`;
+  };
+  readout.textContent = describe(null);
+  host.appendChild(readout);
+  net.on("hover", (hit) => { readout.textContent = describe(hit); });
+  net.on("click", (hit) => { if (hit) readout.textContent = `clicked ${describe(hit)}`; });
 
   return {
     engine: net,

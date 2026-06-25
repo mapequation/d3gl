@@ -600,3 +600,79 @@ describe("network() engine", () => {
     net.destroy();
   });
 });
+
+// #105 N7a — picking on the WebGL instanced lane. The Scene hit index can't see instanced glyphs, so
+// network() overrides pick() to hit-test the retained LOD cut frontier (or the full node set with LOD
+// off). These cover the engine integration: that pick() resolves the right leaf/aggregate at the live
+// transform, tracks pan/zoom (the frontier is re-cut), and falls back to the Scene index on a vector
+// backend. The projection math itself is unit-tested in lod.test.ts (pickFrontier) / glyphs.test.ts.
+describe("network() picking (#105 N7a)", () => {
+  it("resolves the node under a point on the no-LOD WebGL lane, null on a miss", async () => {
+    const net = network(host(), { width: 200, height: 200 });
+    await net.whenReady();
+    // Identity transform (k=1) → world coords map 1:1 to screen px; nodes radius 5.
+    net
+      .data(buildGraph({ nodeCount: 3, source: [0, 1], target: [1, 2] }))
+      .style({ nodeRadius: 5 })
+      .layout({ backend: "positions", positions: new Float32Array([10, 10, 90, 90, 170, 30]) });
+
+    expect(net.pick(10, 10)).toMatchObject({ layer: "nodes", id: 0, datum: { aggregate: false, count: 1 } });
+    expect(net.pick(90, 90)).toMatchObject({ id: 1 });
+    expect(net.pick(170, 30)).toMatchObject({ id: 2 });
+    expect(net.pick(50, 50)).toBeNull(); // gap between nodes
+    net.destroy();
+  });
+
+  it("resolves aggregates zoomed out and leaves zoomed in, tracking the transform", async () => {
+    const net = network(host(), { width: 320, height: 200 });
+    await net.whenReady();
+    // Two strongly-bound pairs ({0,1},{2,3}) → aggregates 4 and 5 at minNodes:2. Centroids at world
+    // x = 50 and 250; spread far enough that they expand to leaves at k=1 but collapse zoomed out.
+    net
+      .data(buildGraph({ nodeCount: 4, source: [0, 2, 1], target: [1, 3, 2], weight: [2, 2, 1] }))
+      .lod({ coarsen: { minNodes: 2 }, expandPx: 48, declutter: false })
+      .layout({ backend: "positions", positions: new Float32Array([0, 0, 100, 0, 200, 0, 300, 0]) });
+
+    // k=1: aggregates expand (footprint 100px ≥ 48) → leaves. World maps 1:1 to screen.
+    expect(net.pick(0, 0)).toMatchObject({ id: 0, datum: { aggregate: false, count: 1 } });
+    expect(net.pick(100, 0)).toMatchObject({ id: 1, datum: { aggregate: false } });
+    expect(net.pick(50, 0)).toBeNull(); // between leaves
+
+    // Zoom out (k=0.4): footprint 40px < 48 → collapse to the two aggregates. agg 4 → screen x=20.
+    net.setTransform({ k: 0.4, x: 0, y: 0 });
+    expect(net.pick(20, 0)).toMatchObject({ id: 4, datum: { aggregate: true, count: 2 } });
+    expect(net.pick(100, 0)).toMatchObject({ id: 5, datum: { aggregate: true, count: 2 } });
+    net.destroy();
+  });
+
+  it("falls back to the Scene hit index on a vector backend", async () => {
+    const net = network(host(), { width: 200, height: 200, backend: "svg" });
+    await net.whenReady();
+    net
+      .data(buildGraph({ nodeCount: 3, source: [0, 1], target: [1, 2] }))
+      .style({ nodeRadius: 6 })
+      .layout({ backend: "positions", positions: new Float32Array([30, 30, 100, 100, 160, 50]) });
+
+    expect(net.pick(30, 30)).toMatchObject({ layer: "nodes", id: 0 });
+    expect(net.pick(160, 50)).toMatchObject({ id: 2 });
+    net.destroy();
+  });
+
+  it("routes a real pointer click through on(\"click\") to the resolved node (same API as GeoMap/Plot)", async () => {
+    const h = host();
+    const net = network(h, { width: 200, height: 200 });
+    await net.whenReady();
+    net
+      .data(buildGraph({ nodeCount: 3, source: [0, 1], target: [1, 2] }))
+      .style({ nodeRadius: 6 })
+      .layout({ backend: "positions", positions: new Float32Array([40, 40, 120, 120, 160, 60]) });
+
+    let clicked: { layer: string; id: string | number; datum: unknown } | null | undefined;
+    net.on("click", (hit) => { clicked = hit; });
+    const r = h.getBoundingClientRect();
+    h.dispatchEvent(new PointerEvent("pointerdown", { clientX: r.left + 40, clientY: r.top + 40, bubbles: true }));
+    h.dispatchEvent(new PointerEvent("pointerup", { clientX: r.left + 40, clientY: r.top + 40, bubbles: true }));
+    expect(clicked).toMatchObject({ layer: "nodes", id: 0, datum: { aggregate: false, count: 1 } });
+    net.destroy();
+  });
+});

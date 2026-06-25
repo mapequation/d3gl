@@ -1,9 +1,9 @@
-import { BaseEngine, type BaseEngineOptions } from "../map/base-engine.js";
-import { networkLayers, frontierCircles, frontierHalos, superEdges, emitNodes, emitLinks, emitArrows, emitHalfLinks, traceFrontierFills, traceFrontierBorders, traceFrontierHalos, traceSuperHalfArrows, traceSuperLines, traceSuperArrows, rgbaCss, resolveNodeRadii, resolveNodeRadiusAggregate, resolveImportance, resolveFlowBorder, resolveNodeColors, resolveLinkWidthOf, resolveLinkColorOf, resolveLinkStrokeOf, flowBorderInnerRadii, type ResolvedNetworkStyle, type NodeRadiusSpec, type ImportanceSpec, type FlowBorderSpec, type ConstBorder, type LinkWidthSpec, type LinkColorSpec, type LinkStyle } from "./glyphs.js";
+import { BaseEngine, type BaseEngineOptions, type HoverHit } from "../map/base-engine.js";
+import { networkLayers, frontierCircles, frontierHalos, superEdges, emitNodes, emitLinks, emitArrows, emitHalfLinks, traceFrontierFills, traceFrontierBorders, traceFrontierHalos, traceSuperHalfArrows, traceSuperLines, traceSuperArrows, rgbaCss, pickNodes, resolveNodeRadii, resolveNodeRadiusAggregate, resolveImportance, resolveFlowBorder, resolveNodeColors, resolveLinkWidthOf, resolveLinkColorOf, resolveLinkStrokeOf, flowBorderInnerRadii, type ResolvedNetworkStyle, type NodeRadiusSpec, type ImportanceSpec, type FlowBorderSpec, type ConstBorder, type LinkWidthSpec, type LinkColorSpec, type LinkStyle } from "./glyphs.js";
 import { rgb } from "d3-color";
 import { ForceLayout, seedPositions, type ForceParams } from "./force.js";
 import { multilevelLayout, type CoarsenOptions } from "./coarsen.js";
-import { buildLODTree, buildSpatialLODTree, computeLODGeometry, computeLODStyle, cut, declutterFrontier, visibleWorldRect, type LODTree, type SpatialLODOptions } from "./lod.js";
+import { buildLODTree, buildSpatialLODTree, computeLODGeometry, computeLODStyle, cut, declutterFrontier, pickFrontier, visibleWorldRect, type LODTree, type SpatialLODOptions } from "./lod.js";
 import { buildModuleLODTree, type ModuleNode } from "./modules.js";
 import { startWorkerLayout, type WorkerLayoutHandle } from "./worker-transport.js";
 import type { NetworkGraph } from "./graph.js";
@@ -11,6 +11,18 @@ import type { Backend, InstancedLayer, ViewTransform } from "../core/index.js";
 
 /** Options for the network engine. Inherits sizing, `backend`, and `tooltipClass`. */
 export interface NetworkOptions extends BaseEngineOptions {}
+
+/**
+ * What a network {@link Network.pick} resolved — carried as the `datum` of the {@link HoverHit}
+ * passed to `on("hover" | "click")` handlers. The hit's `id` is the tree node id: for a leaf that's
+ * the original node index; an aggregate id is `≥ leafCount`.
+ */
+export interface NetworkHit {
+  /** True if the target is an aggregate glyph (a collapsed module/subtree), false for a single node. */
+  aggregate: boolean;
+  /** Leaf nodes the target covers — 1 for a leaf, the subtree size for an aggregate. */
+  count: number;
+}
 
 /** Visual style. Link appearance accessors arrive with the link pass (#100 N2.2). */
 export interface NetworkStyle {
@@ -270,6 +282,13 @@ export class Network extends BaseEngine {
   private fadeAlpha: Float32Array | null = null;
   /** Cached resolved style; invalidated on style()/data() to avoid per-zoom O(n) radii recompute. */
   private resolvedCache: ResolvedNetworkStyle | null = null;
+  /**
+   * The frontier from the last LOD cut (the on-screen glyph ids), retained so {@link pick} can
+   * hit-test exactly what's drawn without recutting. Null on the no-LOD path (then `pick` scans the
+   * full node set) and on the vector backends (then `pick` defers to the Scene hit index). Updated
+   * by {@link lodLayers} on every rebuild and pan/zoom frame, so it always reflects the live view.
+   */
+  private frontier: Uint32Array | null = null;
 
   constructor(host: HTMLElement, opts: NetworkOptions = {}) {
     super(host, opts);
@@ -503,9 +522,11 @@ export class Network extends BaseEngine {
         // none is in flight (LOD toggled on after a run settled), build one on the main thread,
         // deferred a microtask so an imminent layout() in the same chain takes the streaming path.
         layers = [];
+        this.frontier = null; // no frontier yet → pick() returns null until the tree streams in
         this.scheduleLODFallback();
       } else {
         layers = networkLayers(this.graph, style); // no LOD: the full graph
+        this.frontier = null; // no LOD → pick() scans the full node set
       }
       this.emitInstancedLayers(backend, layers);
     } else {
@@ -571,6 +592,7 @@ export class Network extends BaseEngine {
         fadeAlpha: this.fadeAlpha ?? undefined,
       });
     }
+    this.frontier = frontier; // retain the on-screen glyph set for pick() (see {@link pick})
     return frontier;
   }
 
@@ -733,6 +755,41 @@ export class Network extends BaseEngine {
       this.emitInstancedLayers(backend, this.lodLayers(this.lodTree!, this.resolvedStyleCached(this.graph)));
     }
     return super.setTransform(t);
+  }
+
+  /**
+   * Resolve the node or aggregate under a screen point (CSS px). Overrides {@link BaseEngine.pick} for
+   * the WebGL instanced lane, which the Scene hit index can't see: it hit-tests the retained LOD cut
+   * frontier — the only glyphs on screen — as exact circles (see {@link pickFrontier}), or the full
+   * node set when LOD is off ({@link pickNodes}). Cost is ∝ the visible frontier, never the graph
+   * size, so hover/click stay cheap at 10M nodes with no GPU readback (#105; GPU-readback → #141).
+   *
+   * On a vector backend (SVG/Canvas) the nodes are Scene drawables, so it defers to the base hit
+   * index. The {@link HoverHit}'s `datum` is a {@link NetworkHit} (leaf vs aggregate + leaf count);
+   * `on("hover" | "click")` routes pointer events through here automatically.
+   */
+  override pick(x: number, y: number): HoverHit | null {
+    const backend = this.backend();
+    // Vector lane (no instanced backend) or no graph: the Scene hit index already covers it.
+    if (!backend?.setInstancedLayer || !this.graph) return super.pick(x, y);
+    const style = this.resolvedStyleCached(this.graph);
+    const screenSized = style.sizeMode === "screen";
+    if (this.lodReady() && this.lodTree && this.frontier) {
+      const g = pickFrontier(this.lodTree, this.frontier, x, y, this.transform, {
+        screenSized,
+        maxAggregateRadius: this.lodOptions!.maxAggregateRadius,
+      });
+      if (g < 0) return null;
+      const aggregate = g >= this.lodTree.leafCount;
+      return { layer: "nodes", id: g, datum: { aggregate, count: this.lodTree.count[g]! } satisfies NetworkHit };
+    }
+    // No LOD: the full graph is drawn, so scan every node. (LOD-on-but-no-tree-yet draws nothing →
+    // fall through to null rather than scanning unlaid-out positions.)
+    if (!this.lodOptions) {
+      const i = pickNodes(this.graph.positions, style.nodeRadii, this.graph.nodeCount, x, y, this.transform, screenSized);
+      if (i >= 0) return { layer: "nodes", id: i, datum: { aggregate: false, count: 1 } satisfies NetworkHit };
+    }
+    return null;
   }
 
   /**
