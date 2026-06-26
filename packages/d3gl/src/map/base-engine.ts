@@ -146,6 +146,9 @@ export abstract class BaseEngine {
   private currentBackend: BackendType;
   private hoverCb: ((hit: HoverHit | null, ev: PointerEvent) => void) | null = null;
   private clickCb: ((hit: HoverHit | null, ev: PointerEvent) => void) | null = null;
+  private selectCb: ((selected: HoverHit[], ev: PointerEvent) => void) | null = null;
+  /** Selected ids per layer (gesture-driven multi-select, #79). */
+  private selected = new Map<string, Set<string | number>>();
   /** Last hover pick, for cheap same-target exits while the pointer stays inside one drawable. */
   private lastHover: HoverHit | null = null;
   /** Source layer whose hover-option highlight is currently shown (auto, not manual). */
@@ -742,6 +745,7 @@ export abstract class BaseEngine {
   protected dropInteractionState(name: string): void {
     this.styleOverrides.delete(name);
     this.highlights.delete(name);
+    this.selected.delete(name);
     // The hover tracking may point at this layer's now-dropped overlay; reset it so the
     // next pointermove re-evaluates instead of taking the same-target cheap exit (the
     // pointer often hasn't moved when a layer is re-declared on a data update).
@@ -924,14 +928,22 @@ export abstract class BaseEngine {
     this.interactionCleanup = () => { (sel as any).on(".zoom", null); };
     return this;
   }
-  on(event: "hover" | "click", cb: (hit: HoverHit | null, ev: PointerEvent) => void): this {
+  on(event: "hover" | "click", cb: (hit: HoverHit | null, ev: PointerEvent) => void): this;
+  on(event: "select", cb: (selected: HoverHit[], ev: PointerEvent) => void): this;
+  on(event: "hover" | "click" | "select", cb: ((hit: HoverHit | null, ev: PointerEvent) => void) | ((selected: HoverHit[], ev: PointerEvent) => void)): this {
     if (event === "hover") {
-      this.hoverCb = cb;
+      this.hoverCb = cb as (hit: HoverHit | null, ev: PointerEvent) => void;
       this.attachPointer();
     } else if (event === "click") {
-      this.clickCb = cb;
+      this.clickCb = cb as (hit: HoverHit | null, ev: PointerEvent) => void;
       // Re-calling on("click") swaps the callback; the addEventListener calls below are
       // no-ops when the same handler refs are already registered — intentional.
+      this.host.addEventListener("pointerdown", this.onPointerDown);
+      this.host.addEventListener("pointerup", this.onPointerUp);
+      this.host.addEventListener("pointercancel", this.onPointerCancel);
+    } else if (event === "select") {
+      this.selectCb = cb as (selected: HoverHit[], ev: PointerEvent) => void;
+      // Same pointer listeners as "click" — idempotent if already attached.
       this.host.addEventListener("pointerdown", this.onPointerDown);
       this.host.addEventListener("pointerup", this.onPointerUp);
       this.host.addEventListener("pointercancel", this.onPointerCancel);
@@ -1046,11 +1058,61 @@ export abstract class BaseEngine {
   private onPointerUp = (e: PointerEvent): void => {
     const d = this.downAt;
     this.downAt = null;
-    if (!d || !this.clickCb) return;
+    if (!d || (!this.clickCb && !this.selectCb)) return;
     if (Math.hypot(e.clientX - d[0], e.clientY - d[1]) > BaseEngine.CLICK_SLOP) return;
     const r = this.host.getBoundingClientRect();
-    this.clickCb(this.pick(e.clientX - r.left, e.clientY - r.top), e);
+    const hit = this.pick(e.clientX - r.left, e.clientY - r.top);
+    this.clickCb?.(hit, e);
+    if (this.selectCb) this.updateSelection(hit, e);
   };
+  /** Update the multi-select set and apply styling + fire selectCb. Plain click replaces;
+   *  shift/cmd/ctrl-click toggles. Called only when selectCb is registered. */
+  private updateSelection(hit: HoverHit | null, ev: PointerEvent): void {
+    const additive = ev.shiftKey || ev.metaKey || ev.ctrlKey;
+    const touched = new Set<string>(); // layers whose styling must refresh
+    if (!hit) {
+      if (!additive) {
+        for (const n of this.selected.keys()) touched.add(n);
+        this.selected.clear();
+      }
+      // additive + null hit = no-op
+    } else if (!additive) {
+      // Plain click: replace whole selection with just this hit
+      for (const n of this.selected.keys()) touched.add(n);
+      this.selected.clear();
+      this.getOrCreateLayerSet(hit.layer).add(hit.id);
+      touched.add(hit.layer);
+    } else {
+      // Additive: toggle this hit in its layer's set
+      const set = this.getOrCreateLayerSet(hit.layer);
+      if (set.has(hit.id)) set.delete(hit.id); else set.add(hit.id);
+      touched.add(hit.layer);
+    }
+    for (const n of touched) {
+      const ids = this.selected.get(n);
+      this.select(n, ids && ids.size ? [...ids] : null);
+    }
+    this.selectCb!(this.selection(), ev);
+  }
+  /** Get (or create) the per-layer id set. */
+  private getOrCreateLayerSet(layer: string): Set<string | number> {
+    let set = this.selected.get(layer);
+    if (!set) { set = new Set(); this.selected.set(layer, set); }
+    return set;
+  }
+  /** Flatten the retained selection into HoverHit[], resolving datums via layerIds/spec.data. */
+  selection(): HoverHit[] {
+    const out: HoverHit[] = [];
+    for (const [layer, ids] of this.selected) {
+      const spec = this.specs.find((s) => s.name === layer);
+      const index = this.layerIds.get(layer);
+      for (const id of ids) {
+        const di = index?.get(id) ?? -1;
+        out.push({ layer, id, datum: di >= 0 && spec ? spec.data[di] : null });
+      }
+    }
+    return out;
+  }
   private resolve<T>(a: Accessor<any, T> | undefined, d: any, i: number): T | undefined {
     return typeof a === "function" ? (a as (d: any, i: number) => T)(d, i) : a;
   }
