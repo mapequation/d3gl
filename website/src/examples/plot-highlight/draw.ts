@@ -1,7 +1,8 @@
 import { schemeCategory10 } from "d3-scale-chromatic";
 import { plot } from "@mapequation/d3gl/map";
+import type { HoverHit } from "@mapequation/d3gl/map";
 import type { ImperativeSetup } from "../types.js";
-import { makeData, type Dot, type Region } from "./data.js";
+import { makeData } from "./data.js";
 
 const color = (group: number): string => schemeCategory10[group % 10] ?? "#888";
 /** A translucent tint of a #rrggbb hex, for the region fills. */
@@ -9,18 +10,17 @@ const tint = (hex: string, alpha: number): string =>
   `rgba(${parseInt(hex.slice(1, 3), 16)},${parseInt(hex.slice(3, 5), 16)},${parseInt(hex.slice(5, 7), 16)},${alpha})`;
 
 /**
- * The same interaction as the geographic Highlight example, but on a `plot` engine —
- * proof that `hover` / `tooltip` / `selection` are universal (they live on the shared
- * base, not on `geoMap`). Two layer kinds drive it: drawn rectangles (`layer` with a
- * `draw` callback) outline each cluster, and `points` are the scatter on top. Both carry
- * the same declarative options: **hover** a point or a region to outline it in a tiny
- * overlay and read a tooltip; **click** either to select the whole cluster — every other
- * point and region dims via `select()` + the `selection` option. Click empty space to
- * clear. Scroll to zoom, drag to pan.
+ * Hover-highlight + multi-select on a `plot` engine — proof that these interactions are
+ * universal (they live on the shared base, not on `geoMap`). Two layer kinds drive it:
+ * drawn rectangles (`layer` with a `draw` callback) outline each cluster, and `points`
+ * are the scatter on top. Both carry the same declarative options: **hover** a point or
+ * a region to outline it and read a tooltip; **click** to select individual items — every
+ * other point and region dims via the `selection` option. **Shift / Cmd-click** adds or
+ * removes items from the selection; click empty space to clear. A small overlay shows the
+ * running count. Scroll to zoom, drag to pan.
  */
 export const setup: ImperativeSetup = (host, { width, height, backend }) => {
   const { dots, regions } = makeData(width, height);
-  const groupOf = new Map(dots.map((d) => [d.id, d.group]));
 
   const chart = plot(host, {
     width, height, backend,
@@ -38,6 +38,7 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
     id: (r) => `r${r.group}`,
     hover: { stroke: "#fff", lineWidth: 2 },
     tooltip: (r) => `cluster ${r.group}`,
+    selectable: { multi: true },
     selection: { others: { opacity: 0.15 } },
   });
 
@@ -49,19 +50,28 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
     id: (d) => d.id,
     hover: { stroke: "#fff", lineWidth: 2, radiusScale: 1.4 },
     tooltip: (d) => `cluster ${d.group} · ${d.value.toFixed(2)}`,
+    selectable: { multi: true },
     selection: { others: { opacity: 0.25 } },
   });
 
-  chart.on("click", (hit) => {
-    if (hit?.layer !== "dots" && hit?.layer !== "regions") {
-      chart.select("dots", null); // clicked empty space: clear both layers
-      chart.select("regions", null);
-      return;
-    }
-    const g = hit.layer === "dots" ? groupOf.get(hit.id as string) : Number((hit.id as string).slice(1));
-    chart.select("dots", (d: Dot) => d.group === g);
-    chart.select("regions", (r: Region) => r.group === g);
-  });
+  // Selection count readout — absolutely-positioned overlay, pointer-events-none so it
+  // doesn't interfere with mouse interaction on the canvas below.
+  const readout = document.createElement("div");
+  readout.className =
+    "absolute bottom-2 left-2 pointer-events-none text-xs text-foreground/70 select-none";
+  host.appendChild(readout);
+
+  const updateReadout = (sel: HoverHit[]): void => {
+    const n = sel.length;
+    readout.textContent =
+      n === 0 ? "Click to select · shift/cmd-click to add" : `${n} selected · shift/cmd-click to add`;
+  };
+  updateReadout([]);
+
+  // on("select") is a pure observer: fires on every selection change (gesture or programmatic).
+  // The gesture itself is enabled by `selectable: { multi: true }` on each layer above.
+  chart.on("select", updateReadout);
+
   chart.enableZoom([0.5, 20]); // scroll to zoom, drag to pan (clicks still fire — drags don't)
   chart.render();
 
