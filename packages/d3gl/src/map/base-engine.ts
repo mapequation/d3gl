@@ -337,13 +337,35 @@ export abstract class BaseEngine {
     this.instancedLanes.delete(name);
   }
 
-  /** Re-select the lane at the live transform and push its layers (clear its names, then re-add in order). */
+  /**
+   * Re-select the lane at the live transform and push its layers.
+   *
+   * For each emitted layer: use `backend.updateInstancedLayer` (update-in-place, no GPU
+   * teardown) when available; otherwise fall back to `setInstancedLayer` (destroy+recreate).
+   * Layers that were in `entry.layerNames` but are NOT in this frame's emit (a layer that
+   * disappears mid-session) are removed with `removeInstancedLayer`.
+   */
   protected emitInstancedLane(name: string): void {
     const entry = this.instancedLanes.get(name);
     const backend = this.handle?.backend;
     if (!entry || !backend?.setInstancedLayer) return;
-    for (const n of entry.layerNames) backend.removeInstancedLayer?.(n);
-    for (const layer of entry.lane.update(this.transform, this.width, this.height)) backend.setInstancedLayer(layer);
+
+    // Emit new layers (update-in-place when supported, else destroy+recreate).
+    const emitted = entry.lane.update(this.transform, this.width, this.height);
+    const emittedNames = new Set<string>();
+    for (const layer of emitted) {
+      emittedNames.add(layer.name);
+      if (backend.updateInstancedLayer) {
+        backend.updateInstancedLayer(layer);
+      } else {
+        backend.setInstancedLayer(layer);
+      }
+    }
+
+    // Remove any layers from the previous emit that are no longer present this frame.
+    for (const n of entry.layerNames) {
+      if (!emittedNames.has(n)) backend.removeInstancedLayer?.(n);
+    }
   }
 
   /** Register/replace a layer: build its Scene group, apply accessors, index, push. */

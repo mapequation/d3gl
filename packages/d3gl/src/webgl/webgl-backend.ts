@@ -205,6 +205,22 @@ export class WebGLBackend implements Backend {
     this.instanced.set(layer.name, r);
   }
 
+  /**
+   * Update-in-place for a circles layer: if the layer already exists AND is an
+   * `InstancedCircles`, call `update()` (GPU sub-upload, no teardown); otherwise fall
+   * back to the full destroy+recreate path (`setInstancedLayer`). Non-circles primitives
+   * (lines/arrows/half-arrows) always recreate — they have no `update` method.
+   */
+  updateInstancedLayer(layer: InstancedLayer): void {
+    const existing = this.instanced.get(layer.name);
+    if (existing instanceof InstancedCircles && layer.primitive === "circles") {
+      existing.update(this.device, layer.circles);
+      existing.setSizeMode(layer.sizeMode ?? "world");
+    } else {
+      this.setInstancedLayer(layer);
+    }
+  }
+
   removeInstancedLayer(name: string): void {
     this.instanced.get(name)?.destroy();
     this.instanced.delete(name);

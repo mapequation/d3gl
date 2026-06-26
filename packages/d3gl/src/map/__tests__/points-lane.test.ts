@@ -1,6 +1,6 @@
 // packages/d3gl/src/map/__tests__/points-lane.test.ts
 import { describe, it, expect } from "vitest";
-import { plotPointsCircles, declutterPointsStrategy } from "../points-lane.js";
+import { resolvePlotPointsSoA, plotPointsCircles, declutterPointsStrategy } from "../points-lane.js";
 
 const X = [0, 10, 20, 100];
 const Y = [0, 0, 0, 0];
@@ -8,22 +8,31 @@ const xOf = (_d: number, i: number) => X[i]!;
 const yOf = (_d: number, i: number) => Y[i]!;
 // pointRadiusOf: world-space radius used for pick (screen radius = r * k)
 const pointROf = (_d: number, _i: number) => 4;
-// declutterPxOf: centre-to-centre exclusion distance; strategy passes this/2 to declutterScreen
+// declutterPx: centre-to-centre exclusion distance; strategy passes this/2 to declutterScreen
 // so two glyphs collide when dist < declutterPx (i.e. rᵢ + rⱼ = declutterPx/2 + declutterPx/2).
 // Points at x=0,10,20 are 10–20px apart at k=1; declutterPx=22 → threshold=22 → both within → dropped.
-const declutterPxOf = (_d: number, _i: number) => 22;
+const declutterPx = 22;
 const data = [0, 1, 2, 3];
+const n = data.length;
+
+// Pre-resolved SoA (built once, reused across tests — mirrors what syncPointsLayer does).
+const { allCenters, allRadii, allColors: _allColorsDefault } = resolvePlotPointsSoA(data, xOf, yOf, pointROf, (_d, _i) => "#000000");
+// allColors for the actual #ff0000 test case
+const { allColors: allColorsRed } = resolvePlotPointsSoA(data, xOf, yOf, pointROf, () => "#ff0000");
 
 describe("plotPointsCircles (#108-C)", () => {
   it("gathers x/y/r/color into InstancedCirclesData for the given visible indices", () => {
+    const scratchCenters = new Float32Array(n * 2);
+    const scratchRadii = new Float32Array(n);
+    const scratchColors = new Uint8Array(n * 4);
     const c = plotPointsCircles(
-      data,
       Uint32Array.from([0, 3]),
-      xOf,
-      yOf,
-      pointROf,
-      () => "#ff0000",
-      2,
+      allCenters,
+      allRadii,
+      allColorsRed,
+      scratchCenters,
+      scratchRadii,
+      scratchColors,
     );
     expect(c.count).toBe(2);
     expect(Array.from(c.centers)).toEqual([0, 0, 100, 0]);
@@ -37,11 +46,10 @@ describe("declutterPointsStrategy (#108-C)", () => {
   // world-sized strategy: pick hit radius scales with k (r × k). select is sizeMode-independent,
   // so the select cases below use this one regardless of the screenSized flag.
   const strat = declutterPointsStrategy(
-    data,
-    xOf,
-    yOf,
-    pointROf,
-    declutterPxOf,
+    n,
+    allCenters,
+    allRadii,
+    declutterPx,
     undefined,
     900,
     450,
@@ -49,11 +57,10 @@ describe("declutterPointsStrategy (#108-C)", () => {
   );
   // screen-sized strategy: pick hit radius is constant px (r as-is, NOT × k).
   const stratScreen = declutterPointsStrategy(
-    data,
-    xOf,
-    yOf,
-    pointROf,
-    declutterPxOf,
+    n,
+    allCenters,
+    allRadii,
+    declutterPx,
     undefined,
     900,
     450,

@@ -30,6 +30,10 @@ const BLEND = {
 
 export class InstancedCircles {
   count: number;
+  /** Current buffer capacity (in instances). Used by update() to decide grow vs. sub-update. */
+  private _capacity: number;
+  /** Whether the current buffers were allocated with borders (optional-field shape). */
+  private _hasBorders: boolean;
   private model: Model;
   private corner: Buffer;
   private center: Buffer;
@@ -41,6 +45,8 @@ export class InstancedCircles {
 
   constructor(device: Device, data: InstancedCirclesData, width = 0, height = 0) {
     this.count = data.count;
+    this._capacity = data.count;
+    this._hasBorders = data.borders != null;
     this.corner = device.createBuffer({ data: QUAD });
     this.center = device.createBuffer({ data: data.centers });
     this.radius = device.createBuffer({ data: data.radii });
@@ -91,6 +97,55 @@ export class InstancedCircles {
   setSizeMode(mode: "world" | "screen"): void {
     this.uniforms["u_screen"] = mode === "screen" ? 1 : 0;
   }
+
+  /**
+   * Update the instance data in place (no object recreation). Uses `gl.bufferSubData` when
+   * `data.count ≤ current buffer capacity`; reallocates the internal GL buffers (but keeps the
+   * SAME `InstancedCircles` object) when the new count exceeds capacity. If the optional-field
+   * shape changes (borders present↔absent), falls back to a full buffer reinit.
+   *
+   * This is the per-frame hot path for the declutter instanced lane: calling this instead of
+   * destroy()+new InstancedCircles() avoids per-frame GPU buffer teardown+recreate.
+   */
+  update(device: Device, data: InstancedCirclesData): void {
+    const hasBorders = data.borders != null;
+    // If optional-field shape changed or count exceeds capacity, reinit buffers.
+    if (data.count > this._capacity || hasBorders !== this._hasBorders) {
+      // Grow: destroy old instance buffers and create new ones at the new capacity.
+      this.center.destroy();
+      this.radius.destroy();
+      this.color.destroy();
+      this.border.destroy();
+      this.borderColor.destroy();
+      this._capacity = data.count;
+      this._hasBorders = hasBorders;
+      this.center = device.createBuffer({ data: data.centers });
+      this.radius = device.createBuffer({ data: data.radii });
+      this.color = device.createBuffer({ data: data.colors });
+      this.border = device.createBuffer({ data: data.borders ?? new Float32Array(data.count) });
+      this.borderColor = device.createBuffer({ data: data.borderColors ?? new Uint8Array(data.count * 4) });
+      // Re-bind all attributes on the model (the buffer objects changed).
+      this.model.setAttributes({
+        a_center: this.center,
+        a_radius: this.radius,
+        a_color: this.color,
+        a_border: this.border,
+        a_borderColor: this.borderColor,
+      });
+    } else {
+      // Sub-update: upload only the filled portion of the scratch buffers.
+      this.center.write(data.centers);
+      this.radius.write(data.radii);
+      this.color.write(data.colors);
+      if (hasBorders) {
+        this.border.write(data.borders!);
+        this.borderColor.write(data.borderColors!);
+      }
+    }
+    this.count = data.count;
+    this.model.setInstanceCount(data.count);
+  }
+
   render(pass: RenderPass): void {
     if (this.count > 0) this.model.draw(pass);
   }

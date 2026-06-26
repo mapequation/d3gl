@@ -2,7 +2,7 @@ import type { GroupBuilder, PathContext, LineJoin, LineCap } from "../core/index
 import { InstancedLane } from "../core/instanced-lane.js";
 import { BaseEngine, type InteractiveLayerOptions, type BaseEngineOptions } from "./base-engine.js";
 import { LayerHandle } from "./layer-handle.js";
-import { plotPointsCircles, declutterPointsStrategy } from "./points-lane.js";
+import { resolvePlotPointsSoA, plotPointsCircles, declutterPointsStrategy } from "./points-lane.js";
 
 /** Plot adds no engine-level options of its own — all of {@link BaseEngineOptions}
  *  (sizing, `backend`, `tooltipClass`) apply. */
@@ -131,15 +131,25 @@ export class Plot extends BaseEngine {
       const fillOf = typeof opts.fill === "function"
         ? (d: any, i: number) => (opts.fill as (d: any, i: number) => string)(d, i)
         : (_d: any, _i: number) => (opts.fill as string | undefined) ?? "#000";
-      const declutterPxOf = (_d: any, _i: number) => opts.declutter as number;
       const screenSized = (opts.sizeMode ?? "world") === "screen";
 
-      const strategy = declutterPointsStrategy(list, xOf, yOf, pointRadiusOf, declutterPxOf, undefined, this.width, this.height, screenSized);
+      // Resolve the full per-point SoA ONCE (data/style change only, not per-frame).
+      // Each accessor is called exactly N times here, never again during setTransform.
+      const { allCenters, allRadii, allColors } = resolvePlotPointsSoA(list, xOf, yOf, pointRadiusOf, fillOf);
+
+      // Allocate scratch buffers at capacity N (reused every frame — no per-frame allocation).
+      const n = list.length;
+      const scratchCenters = new Float32Array(n * 2);
+      const scratchRadii = new Float32Array(n);
+      const scratchColors = new Uint8Array(n * 4);
+
+      const strategy = declutterPointsStrategy(n, allCenters, allRadii, opts.declutter as number, undefined, this.width, this.height, screenSized);
       this.registerInstancedLane(laneName, {
         lane: new InstancedLane(strategy, (vis) => [{
           name: laneName,
           primitive: "circles",
-          circles: plotPointsCircles(list, vis, xOf, yOf, pointRadiusOf, fillOf, vis.length),
+          // Gather kept indices into scratch buffers (no accessor calls, no rgb() parse, no allocation).
+          circles: plotPointsCircles(vis, allCenters, allRadii, allColors, scratchCenters, scratchRadii, scratchColors),
           sizeMode: opts.sizeMode ?? "world",
         }]),
         layerNames: [laneName],
