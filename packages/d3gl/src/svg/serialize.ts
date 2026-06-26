@@ -1,8 +1,26 @@
-import type { RenderLayer, ViewTransform, DrawableVector } from "../core/index.js";
+import type { RenderLayer, ViewTransform, DrawableVector, TextData } from "../core/index.js";
 import { SvgPathContext } from "./svg-context.js";
 
 function rgba([r, g, b, a]: readonly [number, number, number, number]): string {
   return `rgba(${r}, ${g}, ${b}, ${(a / 255).toFixed(4)})`;
+}
+
+function escapeXml(s: string): string {
+  return s.replace(/[&<>]/g, (c) => (c === "&" ? "&amp;" : c === "<" ? "&lt;" : "&gt;"));
+}
+
+/** Serialize screen-space text labels (#105 N7b-2) to `<text>` elements (coords already in screen px,
+ *  so no view-transform wrapper). A halo is a stroke drawn behind the fill via `paint-order:stroke`. */
+export function serializeTexts(texts: readonly TextData[]): string {
+  if (texts.length === 0) return "";
+  const els = texts.map((td) => {
+    const anchor = td.align === "middle" ? "middle" : td.align === "end" ? "end" : "start";
+    const fill = td.color ?? "#000";
+    const op = td.opacity != null && td.opacity < 1 ? ` opacity="${td.opacity.toFixed(3)}"` : "";
+    const halo = td.halo ? ` stroke="${td.halo.color}" stroke-width="${td.halo.width * 2}" stroke-linejoin="round" paint-order="stroke"` : "";
+    return `<text x="${td.x}" y="${td.y}" text-anchor="${anchor}" dominant-baseline="central" style="font:${td.font ?? "12px sans-serif"}" fill="${fill}"${halo}${op}>${escapeXml(td.text)}</text>`;
+  });
+  return `<g>${els.join("")}</g>`;
 }
 
 function pathD(d: DrawableVector): string {
@@ -87,13 +105,15 @@ export function viewTransform(t: ViewTransform): string {
   return `translate(${t.x}, ${t.y}) scale(${t.k})`;
 }
 
-/** A full SVG document for the given layers under a view transform. */
-export function svgFromLayers(width: number, height: number, layers: readonly RenderLayer[], t: ViewTransform): string {
+/** A full SVG document for the given layers under a view transform, with optional screen-space text
+ *  labels (#105 N7b-2) drawn on top so `toSVG()` exports include them. */
+export function svgFromLayers(width: number, height: number, layers: readonly RenderLayer[], t: ViewTransform, texts: readonly TextData[] = []): string {
   const { defs, world, screen } = svgBody(layers, t);
   return (
     `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}">` +
     `<defs>${defs}</defs><g transform="${viewTransform(t)}">${world}</g>` +
     screen +
+    serializeTexts(texts) +
     `</svg>`
   );
 }

@@ -166,6 +166,32 @@ export type InstancedLayer =
   | { name: string; sizeMode?: "world" | "screen"; primitive: "arrows"; arrows: InstancedArrowsData }
   | { name: string; sizeMode?: "world" | "screen"; primitive: "half-arrows"; halfArrows: InstancedHalfArrowsData };
 
+/**
+ * One backend-rendered text label (#105 N7b-2). Positioned in **screen pixels** (the caller projects
+ * the world anchor and applies the view transform) and drawn at a **constant pixel** font, so labels
+ * stay readable at any zoom — re-pushed each `setTransform`, like the HTML overlay it mirrors. Drawn by
+ * the SVG (`<text>`) and Canvas (`fillText`) backends so labels survive `toSVG()`/`toPNG()`; the WebGL
+ * backend omits {@link Backend.setTextLayer} and keeps the HTML overlay (GPU/MSDF text is #69).
+ */
+export interface TextData {
+  /** Screen-space anchor (CSS px). Horizontal placement relative to it follows {@link align}; the text
+   *  is vertically centred on it (baseline middle). */
+  x: number;
+  y: number;
+  text: string;
+  /** CSS font shorthand, e.g. `"600 11px sans-serif"`. Defaults to `"12px sans-serif"`. */
+  font?: string;
+  /** CSS fill colour. Defaults to black. */
+  color?: string;
+  /** 0–1 opacity (e.g. an LOD cross-fade alpha). Defaults to 1. */
+  opacity?: number;
+  /** Which side of `x` the text runs from (`"start"`/`"middle"`/`"end"`). Defaults to `"start"`. */
+  align?: "start" | "middle" | "end";
+  /** A halo stroked behind the fill for legibility on busy backgrounds (the export analogue of the
+   *  overlay's text-shadow). `width` is the half-stroke in px. */
+  halo?: { color: string; width: number };
+}
+
 /** A renderer for a Scene, implemented per target (WebGL / Canvas / SVG). */
 export interface Backend {
   setLayers(layers: RenderLayer[]): void;
@@ -228,6 +254,13 @@ export interface Backend {
   updateInstancedLayer?(layer: InstancedLayer): void;
   /** Remove an instanced primitive layer by name. */
   removeInstancedLayer?(name: string): void;
+  /**
+   * Set the screen-space text labels to draw on top of the scene (#105 N7b-2). Optional — the SVG
+   * (`<text>`) and Canvas (`fillText`) backends implement it so labels appear in `toSVG()`/`toPNG()`;
+   * the WebGL backend omits it (the engine keeps the HTML overlay there). Replaces the whole set; pass
+   * `[]` to clear. Re-pushed by the engine each `setTransform` (the coords are screen px).
+   */
+  setTextLayer?(texts: readonly TextData[]): void;
   setTransform(t: ViewTransform): void;
   /**
    * Resize the rendering surface to a new CSS size (px). Re-reads the device pixel ratio

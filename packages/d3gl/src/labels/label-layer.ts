@@ -39,6 +39,35 @@ export interface LabelAnchor {
 }
 
 /**
+ * Project label anchors to screen px (`screen = k·ref + (x,y)` + the constant offset) and resolve
+ * collisions, returning the survivors as {@link LabelBox}es (carrying `text`/`opacity`). Shared by the
+ * HTML overlay ({@link LabelLayer.update}) and the backend-native text path (#105 N7b-2) so both place
+ * and cull labels identically — they differ only in how they render the survivors.
+ */
+export function placeLabels(
+  anchors: readonly LabelAnchor[],
+  transform: ViewTransform,
+  viewport: { width: number; height: number },
+): LabelBox[] {
+  const boxes: LabelBox[] = anchors.map((a) => ({
+    id: a.id,
+    x: transform.k * a.refX + transform.x + (a.offset?.[0] ?? 0),
+    y: transform.k * a.refY + transform.y + (a.offset?.[1] ?? 0),
+    width: a.width,
+    height: a.height,
+    priority: a.priority,
+    text: a.text,
+    opacity: a.opacity,
+    rotation: a.rotation,
+    textAnchor: a.textAnchor,
+    keepUpright: a.keepUpright,
+    transform: a.transform,
+    transformOrigin: a.transformOrigin,
+  }));
+  return cullLabels(boxes, { viewport });
+}
+
+/**
  * An HTML overlay of absolutely-positioned label elements. On each update it maps
  * reference anchors through the view transform to screen pixels, culls to the
  * viewport with collision resolution, and reconciles the DOM (reusing nodes by
@@ -62,25 +91,9 @@ export class LabelLayer {
     transform: ViewTransform,
     viewport: { width: number; height: number },
   ): void {
-    // reference -> screen: screen = k*ref + (x,y), plus the constant-px offset.
-    const boxes: LabelBox[] = anchors.map((a) => ({
-      id: a.id,
-      x: transform.k * a.refX + transform.x + (a.offset?.[0] ?? 0),
-      y: transform.k * a.refY + transform.y + (a.offset?.[1] ?? 0),
-      width: a.width,
-      height: a.height,
-      priority: a.priority,
-      text: a.text,
-      rotation: a.rotation,
-      textAnchor: a.textAnchor,
-      keepUpright: a.keepUpright,
-      transform: a.transform,
-      transformOrigin: a.transformOrigin,
-    }));
-    const visible = cullLabels(boxes, { viewport });
+    // Project + cull (shared with the backend-native text path), then render the survivors to DOM.
+    const visible = placeLabels(anchors, transform, viewport);
     const seen = new Set<string>();
-    // Per-label opacity (cross-fade) keyed by id — applied at render, not part of collision geometry.
-    const opacityById = new Map<string, number | undefined>(anchors.map((a) => [String(a.id), a.opacity]));
 
     for (const box of visible) {
       const key = String(box.id);
@@ -109,7 +122,7 @@ export class LabelLayer {
       node.style.transform =
         box.rotation !== undefined ? labelGeometry(box).transform : ((box.transform as string) ?? "");
       node.style.transformOrigin = (box.transformOrigin as string) ?? "0 0";
-      const op = opacityById.get(key);
+      const op = box.opacity as number | undefined;
       node.style.opacity = op == null ? "" : String(op);
     }
 

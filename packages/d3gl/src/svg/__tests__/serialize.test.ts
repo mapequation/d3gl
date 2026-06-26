@@ -1,6 +1,30 @@
 import { describe, it, expect } from "vitest";
 import { Scene } from "../../core/index.js";
-import { svgFromLayers } from "../serialize.js";
+import { svgFromLayers, serializeTexts } from "../serialize.js";
+
+describe("serializeTexts (#105 N7b-2)", () => {
+  it("emits a screen-space <text> per label with anchor, font, fill and escaped content", () => {
+    const svg = serializeTexts([{ x: 10, y: 20, text: "A & B <x>", font: "600 11px sans-serif", color: "#222", align: "middle" }]);
+    expect(svg).toContain('<text x="10" y="20"');
+    expect(svg).toContain('text-anchor="middle"');
+    expect(svg).toContain('dominant-baseline="central"');
+    expect(svg).toContain("font:600 11px sans-serif");
+    expect(svg).toContain('fill="#222"');
+    expect(svg).toContain("A &amp; B &lt;x&gt;"); // XML-escaped
+  });
+
+  it("renders a halo as paint-order:stroke behind the fill, and opacity when < 1", () => {
+    const svg = serializeTexts([{ x: 0, y: 0, text: "n", halo: { color: "#fff", width: 2 }, opacity: 0.5 }]);
+    expect(svg).toContain('paint-order="stroke"');
+    expect(svg).toContain('stroke="#fff"');
+    expect(svg).toContain('stroke-width="4"'); // width * 2
+    expect(svg).toContain('opacity="0.500"');
+  });
+
+  it("is empty for no labels", () => {
+    expect(serializeTexts([])).toBe("");
+  });
+});
 
 function layer(name: string, clipTo?: string) {
   const scene = new Scene();

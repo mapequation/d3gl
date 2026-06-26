@@ -1044,6 +1044,10 @@ export abstract class BaseEngine {
     this.handle?.backend.setTransform(t);
     for (const [name, entry] of this.instancedLanes) if (entry.dynamic) this.emitInstancedLane(name);
     for (const spec of this.specs) if (spec.declutter) this.declutterLayer(spec, t);
+    // Refresh view-tracking overlays/labels BEFORE the render, so a backend that draws labels into the
+    // frame (Canvas `fillText`) paints the current labels in the SAME render — not one frame stale.
+    // Runs after lanes re-emit, so a subclass can read a lane's freshly-cut `visible` set.
+    this.afterTransform();
     this.render();
     // Pass-through layers. While interacting, the backend composites its accumulation
     // buffer with the live transform (snapshot-pan) — nothing to repaint here. On a
@@ -1051,13 +1055,12 @@ export abstract class BaseEngine {
     if (this.ptSpecs.size > 0 && !this.interacting) {
       for (const name of this.ptSpecs.keys()) this.repaintPassThrough(name);
     }
-    this.afterTransform(); // subclass hook: re-place HTML overlays (e.g. the network label layer)
     return this;
   }
 
-  /** Called at the end of every {@link setTransform} (zoom frame or programmatic). Subclasses override
-   *  to re-place HTML overlays that track the view — e.g. the network's frontier label layer (#105 N7b).
-   *  Runs after lanes re-emit, so a subclass can read a lane's freshly-cut `visible` set. */
+  /** Called by {@link setTransform} just before the render (zoom frame or programmatic), after lanes
+   *  re-emit. Subclasses override to re-place view-tracking overlays/labels — e.g. the network's
+   *  frontier label layer (#105 N7b) — so a backend that bakes labels into the frame draws them now. */
   protected afterTransform(): void {}
 
   /**
