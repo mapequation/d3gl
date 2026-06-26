@@ -126,6 +126,10 @@ export abstract class BaseEngine {
   protected ptSpecs = new Map<string, PassThroughSpec>();
   /** Instanced selection lanes (#108-B): drives re-emit on setTransform; resolves picks. */
   protected instancedLanes = new Map<string, InstancedLaneEntry>();
+  /** Per-lane name-set from its last emit — lets {@link emitInstancedLane} keep the update-in-place
+   *  fast path only while the present-layer set is unchanged, and re-add in emit order on a change
+   *  (so a reappearing layer can't be appended out of draw order — the backend draws in insertion order). */
+  private laneEmittedNames = new Map<string, Set<string>>();
   /** Per-layer id → datum index, maintained incrementally so an append's duplicate-id
    *  check stays O(new) (not O(total)/batch) AND so pick()/restyle resolve a datum
    *  index in O(1) instead of spec.ids.indexOf (O(n) per pointer move). */
@@ -350,22 +354,29 @@ export abstract class BaseEngine {
     const backend = this.handle?.backend;
     if (!entry || !backend?.setInstancedLayer) return;
 
-    // Emit new layers (update-in-place when supported, else destroy+recreate).
     const emitted = entry.lane.update(this.transform, this.width, this.height);
     const emittedNames = new Set<string>();
-    for (const layer of emitted) {
-      emittedNames.add(layer.name);
-      if (backend.updateInstancedLayer) {
-        backend.updateInstancedLayer(layer);
-      } else {
-        backend.setInstancedLayer(layer);
-      }
-    }
+    for (const layer of emitted) emittedNames.add(layer.name);
 
-    // Remove any layers from the previous emit that are no longer present this frame.
-    for (const n of entry.layerNames) {
-      if (!emittedNames.has(n)) backend.removeInstancedLayer?.(n);
+    // The WebGL backend draws instanced layers in insertion order, so draw order == emit order.
+    // Updating in place preserves each layer's slot — correct ONLY while the present-layer set is
+    // unchanged (the per-frame zoom/pan case). When a layer appears or disappears (e.g. network
+    // arrows toggling across an LOD cut), a reappearing layer would be appended last and drawn on
+    // top of layers that should sit above it — so on ANY set change, clear this lane's layers and
+    // re-add in emit order to re-establish the canonical z-order. (Set-stable ⇒ in-place, the
+    // perf-critical path: zero teardown, no order drift.)
+    const prev = this.laneEmittedNames.get(name);
+    const sameSet = prev != null && prev.size === emittedNames.size && [...emittedNames].every((n) => prev.has(n));
+    if (sameSet) {
+      for (const layer of emitted) {
+        if (backend.updateInstancedLayer) backend.updateInstancedLayer(layer);
+        else backend.setInstancedLayer(layer);
+      }
+    } else {
+      for (const n of entry.layerNames) backend.removeInstancedLayer?.(n);
+      for (const layer of emitted) backend.setInstancedLayer(layer);
     }
+    this.laneEmittedNames.set(name, emittedNames);
   }
 
   /** Register/replace a layer: build its Scene group, apply accessors, index, push. */
