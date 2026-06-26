@@ -1,6 +1,8 @@
 import type { GroupBuilder, PathContext, LineJoin, LineCap } from "../core/index.js";
+import { InstancedLane } from "../core/instanced-lane.js";
 import { BaseEngine, type InteractiveLayerOptions, type BaseEngineOptions } from "./base-engine.js";
 import { LayerHandle } from "./layer-handle.js";
+import { plotPointsCircles, declutterPointsStrategy } from "./points-lane.js";
 
 /** Plot adds no engine-level options of its own — all of {@link BaseEngineOptions}
  *  (sizing, `backend`, `tooltipClass`) apply. */
@@ -117,6 +119,59 @@ export class Plot extends BaseEngine {
     const list = data as D[];
     const ids = list.map((d, i) => (opts.id ? opts.id(d, i) : i));
     this.dropInteractionState(name); // a re-declared layer starts with base styles
+
+    // Eligibility: route to the shared instanced lane when declutter is set, the backend is WebGL
+    // (setInstancedLayer available), and no clipTo / passThrough / hover / selection (those need the
+    // Scene path: GPU stencil, SVG export, auto-highlight, selection restyle).
+    // tooltip IS allowed: a no-op LayerSpec forwards tooltip dispatch through the lane's resolve datum.
+    const useLane = !opts.passThrough && !opts.clipTo && !opts.hover && !opts.selection
+      && opts.declutter != null && !!this.backend()?.setInstancedLayer;
+
+    if (useLane) {
+      // Resolve the same accessors the Scene path would use.
+      const xOf = (d: D, i: number) => opts.x(d, i);
+      const yOf = (d: D, i: number) => opts.y(d, i);
+      const pointRadiusOf = typeof opts.radius === "function"
+        ? (d: D, i: number) => (opts.radius as (d: D, i: number) => number)(d, i)
+        : (_d: D, _i: number) => (opts.radius as number | undefined) ?? 3;
+      const fillOf = typeof opts.fill === "function"
+        ? (d: D, i: number) => (opts.fill as (d: D, i: number) => string)(d, i)
+        : (_d: D, _i: number) => (opts.fill as string | undefined) ?? "#000";
+      const declutterPxOf = (_d: D, _i: number) => opts.declutter as number;
+      const screenSized = (opts.sizeMode ?? "world") === "screen";
+      const laneName = "points:" + name;
+
+      const strategy = declutterPointsStrategy(list, xOf, yOf, pointRadiusOf, declutterPxOf, undefined, this.width, this.height, screenSized);
+      this.registerInstancedLane(laneName, {
+        lane: new InstancedLane(strategy, (vis) => [{
+          name: laneName,
+          primitive: "circles",
+          circles: plotPointsCircles(list, vis, xOf, yOf, pointRadiusOf, fillOf, vis.length),
+          sizeMode: opts.sizeMode ?? "world",
+        }]),
+        layerNames: [laneName],
+        dynamic: true,
+        resolve: opts.pickable === false ? () => null : (i) => ({ layer: name, id: ids[i]!, datum: list[i] }),
+      });
+
+      // If tooltip is set, register a no-op LayerSpec so BaseEngine's tooltip dispatch resolves
+      // hit.layer === name → spec.tooltip. pickable:false means no Scene HitIndex (the lane owns pick).
+      if (opts.tooltip) {
+        this.registerLayer({
+          name,
+          data: list,
+          ids,
+          pickable: false,
+          tooltip: opts.tooltip,
+          build: () => { /* no Scene geometry — lane owns draw + pick */ },
+        });
+        // Attach pointer listeners for the tooltip (registerLayer only attaches when spec.hover or tooltip is set,
+        // but we need the pointermove guard to include this spec's tooltip).
+      }
+
+      return new LayerHandle<D>(this, name, () => { /* append not supported on lane layers */ });
+    }
+
     this.registerLayer({ name, data: list, ids, fill: opts.fill, stroke: opts.stroke, clipTo: opts.clipTo, sizeMode: opts.sizeMode, declutter: opts.declutter, pickable: opts.pickable, ...this.interactionFields(opts), build: this.buildPoints(list, ids, 0, opts) });
     return new LayerHandle<D>(this, name, (items) => this.appendPoints(name, items, opts));
   }
