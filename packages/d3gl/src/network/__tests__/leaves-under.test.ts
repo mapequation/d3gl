@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { leavesUnder } from "../lod.js";
+import { leavesUnder, lodTreeFromTopology } from "../lod.js";
 import type { LODTopology } from "../lod.js";
 
 /**
@@ -40,5 +40,14 @@ describe("leavesUnder", () => {
     const t = tinyTree();
     t.children = new Uint32Array([1, 0, 3, 2, 5, 4]);
     expect(leavesUnder(t, 6)).toEqual([0, 1, 2, 3]);
+  });
+});
+
+describe("lodTreeFromTopology — count (#105)", () => {
+  it("fills leaf-descendant count from topology (the worker path streams cx/cy/extent, not count)", () => {
+    // Reproduces the 'aggregate shows 0 nodes' bug: a worker-streamed tree never re-runs the per-frame
+    // computeLODPositions on the main thread, so count must be filled at construction.
+    const tree = lodTreeFromTopology(tinyTree());
+    expect(Array.from(tree.count)).toEqual([1, 1, 1, 1, 2, 2, 4]); // leaves=1, modules=2, root=4
   });
 });

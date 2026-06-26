@@ -310,6 +310,30 @@ function deriveParent(topo: LODTopology): Int32Array {
   return parent;
 }
 
+/**
+ * Leaf-descendant count per node — pure topology: `count[leaf] = 1`, `count[aggregate] = Σ children`,
+ * one bottom-up pass by level. Only the **worker path** needs this filled at construction (see
+ * {@link lodTreeFromTopology}): the worker streams `cx`/`cy`/`extent` per frame but NOT `count`, and
+ * never re-runs the per-frame {@link computeLODPositions} on the main thread, so without it the
+ * main-thread worker tree's `count` stayed 0 (#105: hovering an aggregate showed "0 nodes"). The
+ * main-thread builders ({@link attachGeometry} callers) get `count` from `computeLODPositions`, which
+ * always runs right after they build — so they must NOT call this (it would be redundant work, and the
+ * spatial tree rebuilds per frame as positions converge). O(tree size), run once per worker topology.
+ */
+function leafDescendantCounts(topo: LODTopology): Uint32Array {
+  const { size, leafCount, levelCount, levelOffset, childOffset, children } = topo;
+  const count = new Uint32Array(size);
+  for (let i = 0; i < leafCount; i++) count[i] = 1;
+  for (let k = 1; k < levelCount; k++) {
+    for (let g = levelOffset[k]!; g < levelOffset[k + 1]!; g++) {
+      let sum = 0;
+      for (let p = childOffset[g]!; p < childOffset[g + 1]!; p++) sum += count[children[p]!]!;
+      count[g] = sum;
+    }
+  }
+  return count;
+}
+
 function attachGeometry(topo: LODTopology): LODTree {
   const { size } = topo;
   return {
@@ -321,6 +345,8 @@ function attachGeometry(topo: LODTopology): LODTree {
     cy: new Float32Array(size),
     extent: new Float32Array(size),
     radius: new Float32Array(size),
+    // count is filled by computeLODPositions, which always runs right after this builder (and again per
+    // frame as the layout converges — for the spatial tree, on every rebuild). Don't fill it here.
     count: new Uint32Array(size),
     weight: new Float32Array(size),
     border: new Float32Array(size),
@@ -576,8 +602,9 @@ export function buildSpatialLODTree(positions: ArrayLike<number>, count: number,
  * Assemble a {@link LODTree} from a worker-streamed {@link LODTopology}, optionally binding the
  * position-derived geometry (`cx`/`cy`/`extent`) to caller-provided buffers — typically views into a
  * `SharedArrayBuffer` the worker writes live each frame (#103 worker-LOD), so the main thread reads
- * the converging geometry with no copy. Style-derived geometry (`radius`/`weight`, plus topological
- * `count`) is always main-allocated; fill it once with {@link computeLODStyle}.
+ * the converging geometry with no copy. Style-derived geometry (`radius`/`weight`) is main-allocated
+ * and filled once with {@link computeLODStyle}; the topological `count` is filled here (it's
+ * position-independent — the worker streams cx/cy/extent but not count, #105).
  */
 export function lodTreeFromTopology(
   topo: LODTopology,
@@ -590,7 +617,7 @@ export function lodTreeFromTopology(
     cy: geometry?.cy ?? new Float32Array(size),
     extent: geometry?.extent ?? new Float32Array(size),
     radius: new Float32Array(size),
-    count: new Uint32Array(size),
+    count: leafDescendantCounts(topo),
     weight: new Float32Array(size),
     border: new Float32Array(size),
     color: new Uint8Array(size * 4),
