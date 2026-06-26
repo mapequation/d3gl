@@ -366,14 +366,25 @@ export class Network extends BaseEngine {
   }
 
   /**
-   * Opt nodes/aggregates into hover + click-selection (#105 N7c-2). `selectable` enables click-select
-   * (`true`/`{}` = single, `{ multi: true }` = shift/cmd-click toggles); `hover` shows a hover ring;
-   * `tooltip` is shown for the hovered node/aggregate; `selection.selected.stroke` overrides the
-   * selection ring colour (instanced glyphs are highlighted with a ring, not the Scene `others`-dim).
+   * Opt nodes/aggregates into the **visual** hover ring + click-selection (#105 N7c-2). This is
+   * separate from `on("hover" | "click")`: those callbacks fire on every pick regardless of this call
+   * (use them for your own readout/side-effects); `interactive()` is what draws the hover/selection
+   * **ring overlay** on the glyphs and manages the selection set (`selection()`, `on("select")`).
+   *
+   * Options (each **off by default** — `interactive()` is itself opt-in; omit it entirely and nodes are
+   * pick-only, with no ring and no managed selection):
+   * - `selectable` — click to select: `true`/`{}` = single (click replaces), `{ multi: true }` =
+   *   shift/cmd/ctrl-click toggles add/remove.
+   * - `hover` — draw a ring on the hovered node/aggregate.
+   * - `tooltip: (datum, id) => content` — shown for the hovered node/aggregate.
+   * - `selection: { selected, others }` — `selected.stroke` overrides the **select** ring colour
+   *   (default `#ff6a00`); the hover ring defaults to `#fff` (override via a `hover` HighlightStyle's
+   *   `stroke`). `others` (Scene dimming) is ignored on instanced glyphs — selected glyphs get a ring.
    *
    * The hit's `datum` is a {@link NetworkHit} (`{ aggregate, count }`); its `members()` lists the leaf
    * node ids the target covers (1 for a leaf, the whole subtree for an aggregate). Observe selection
    * via `on("select", (hits) => …)` or read it back with `selection()`; both carry `members()`.
+   * Pass `false` to disable (clears any current selection).
    */
   interactive(opts: InteractiveLayerOptions<NetworkHit> | false): this {
     this.interactiveOpts = opts || null;
