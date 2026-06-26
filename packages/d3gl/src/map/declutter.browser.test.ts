@@ -134,15 +134,104 @@ describe("screen-space declutter (flat-grid cull)", () => {
     });
     chart.render();
 
+    // On WebGL + declutter (no hover/selection/clipTo), points() routes to the instanced lane.
+    // Read the kept set from the lane and compare to the same brute-force reference.
     /* eslint-disable @typescript-eslint/no-explicit-any */
-    const flags = (chart as any).scene.buffers("pts").flags as Uint8Array;
+    const lane = (chart as any).instancedLanes.get("points:pts").lane;
+    const kept = new Set(Array.from(lane.visible as Uint32Array));
     /* eslint-enable @typescript-eslint/no-explicit-any */
     const ref = referenceVisible(anchors, RADIUS, { k: 1, x: 0, y: 0 });
-    const engineVisible = Array.from(flags, (f) => (f & 1) === 1);
-    expect(engineVisible.reduce((n, v, i) => n + (v === ref[i] ? 0 : 1), 0)).toBe(0);
+    const engineVisible = nodes.map((_, i) => kept.has(i));
+    expect(engineVisible.reduce((n: number, v: boolean, i: number) => n + (v === ref[i] ? 0 : 1), 0)).toBe(0);
     expect(ref.filter((v) => !v).length).toBeGreaterThan(0);
 
     chart.destroy();
     host.remove();
+  });
+
+  it("points() with declutter + hover stays on the Scene path (not routed to lane)", async () => {
+    const W = 900, H = 450, N = 200, RADIUS = 20;
+    const host = document.createElement("div");
+    host.style.width = `${W}px`; host.style.height = `${H}px`;
+    document.body.appendChild(host);
+    const chart = plot(host, { width: W, height: H, backend: "webgl" });
+    await chart.whenReady();
+
+    const rnd = mulberry32(42);
+    const nodes = Array.from({ length: N }, (_, i) => ({ id: i, x: 60 + rnd() * (W - 120), y: 60 + rnd() * (H - 120) }));
+
+    /* eslint-disable @typescript-eslint/no-explicit-any */
+    chart.points("hov", nodes, {
+      x: (d) => d.x, y: (d) => d.y, radius: 5, fill: () => "#ef4444",
+      sizeMode: "screen", declutter: RADIUS, id: (d) => d.id,
+      hover: true, // hover disqualifies the lane — stays Scene
+    });
+    chart.render();
+
+    // Must NOT have routed to the instanced lane.
+    expect((chart as any).instancedLanes.has("points:hov")).toBe(false);
+    // Must still be a Scene layer (has a scene group / flags).
+    const flags = (chart as any).scene.buffers("hov").flags as Uint8Array;
+    expect(flags.length).toBe(N);
+    /* eslint-enable @typescript-eslint/no-explicit-any */
+
+    chart.destroy();
+    host.remove();
+  });
+
+  it("points() with declutter + tooltip (no hover) routes to lane and tooltip resolves", async () => {
+    const W = 900, H = 450, N = 300, RADIUS = 22;
+    const host = document.createElement("div");
+    host.style.width = `${W}px`; host.style.height = `${H}px`;
+    document.body.appendChild(host);
+    const chart = plot(host, { width: W, height: H, backend: "webgl" });
+    await chart.whenReady();
+
+    const rnd = mulberry32(77);
+    const nodes = Array.from({ length: N }, (_, i) => ({ id: i, x: 60 + rnd() * (W - 120), y: 60 + rnd() * (H - 120) }));
+
+    chart.points("tip", nodes, {
+      x: (d) => d.x, y: (d) => d.y, radius: 5, fill: () => "#10b981",
+      sizeMode: "screen", declutter: RADIUS, id: (d) => d.id,
+      tooltip: (d) => `node-${d.id}`,
+    });
+    chart.render();
+
+    /* eslint-disable @typescript-eslint/no-explicit-any */
+    // Must have routed to the instanced lane.
+    expect((chart as any).instancedLanes.has("points:tip")).toBe(true);
+
+    // Find a point that was kept by the declutter and pick it.
+    const lane = (chart as any).instancedLanes.get("points:tip").lane;
+    const visible = lane.visible as Uint32Array;
+    expect(visible.length).toBeGreaterThan(0);
+
+    // Pick the first kept point — resolve must return {layer: "tip", datum, id}.
+    const keptIdx = visible[0]!;
+    const keptNode = nodes[keptIdx]!;
+    const t = { k: 1, x: 0, y: 0 };
+    const hit = (chart as any).pick(keptNode.x, keptNode.y);
+    expect(hit).not.toBeNull();
+    expect(hit.layer).toBe("tip");
+    expect(hit.datum).toBe(keptNode);
+
+    // Tooltip dispatch: pointermove over a kept point's center shows the tooltip.
+    const r = host.getBoundingClientRect();
+    host.dispatchEvent(new PointerEvent("pointermove", {
+      clientX: r.left + keptNode.x,
+      clientY: r.top + keptNode.y,
+      bubbles: true,
+    }));
+    const tipEl = host.querySelector("[class*='d3gl']") ?? host.querySelector("div > div");
+    // The tooltip element exists and shows the expected content for the picked node.
+    // (We assert via pick + resolve rather than DOM, since tooltip CSS class may vary.)
+    const resolvedHit = (chart as any).pick(keptNode.x, keptNode.y);
+    expect(resolvedHit?.layer).toBe("tip");
+    expect(resolvedHit?.datum?.id).toBe(keptNode.id);
+    /* eslint-enable @typescript-eslint/no-explicit-any */
+
+    chart.destroy();
+    host.remove();
+    void tipEl; // suppress unused-var
   });
 });

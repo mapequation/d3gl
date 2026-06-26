@@ -94,6 +94,32 @@ long it stays useful:
    Then state, from the **user's** point of view, under what conditions (if any) the change
    is noticeable and by how much (run-time and memory), including any scale at which it
    could hit a memory limit.
+
+   **The prose section is necessary but NOT sufficient — it documents, it does not prevent.**
+   If the change adds, moves, or grows work on a **per-frame path** (anything reachable from
+   `setTransform` / `render` / a selection `emit` / a draw loop), you MUST also land an
+   automated **per-frame regression test** before requesting verification. It must:
+   - drive a **realistic large input** (≈1M points/nodes) through a sequence of `setTransform`s
+     (a zoom-in sweep) and assert a **frame budget** — a wall-clock-per-`setTransform` ceiling
+     generous enough to be non-flaky but tight enough to catch an order-of-magnitude drop; **and**
+   - assert the regression's **deterministic signature** directly where one exists: per-frame
+     work the baseline did **once** must stay once — e.g. spy that style/colour resolution (or any
+     accessor) runs **O(data) at registration, not O(visible) per frame**, and that GPU buffers
+     are **updated in place, not destroyed + recreated** each frame.
+
+   **Baseline comparison is mandatory when you replace a render path.** Moving a layer from one
+   path to another (retained-Scene → instanced lane, etc.) means the new path's per-frame cost is
+   measured **against the path it replaces**. A path that re-derives / re-allocates / re-parses /
+   re-uploads per frame what the old path **retained** is a **regression** — even if it wins on a
+   different axis (draw count, scale). Both axes must hold; "better at X" never excuses "worse at
+   per-frame Y".
+
+   **Never self-defer a per-frame cost.** A per-frame allocation / upload / re-derivation you are
+   "uncertain" about, or that you label a "follow-up" or "not a regression", is treated as a
+   **blocking regression** until a test proves it bounded. Resolve it — or land the test that
+   bounds it — *before* merge. Do not ship it on a promise to optimise later. (This rule exists
+   because exactly this slipped through once: a per-frame buffer rebuild was documented as a
+   deferred follow-up and shipped a 30× zoom regression.)
 6. **Human verification** — Summarize what you have done (point to the Performance section
    for any per-frame / memory impact) and ask for approval before merging a PR.
 7. Create changesets.

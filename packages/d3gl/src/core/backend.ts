@@ -219,6 +219,13 @@ export interface Backend {
    * instanced rendering is WebGL-only (small-N / export go through the PathContext emitter).
    */
   setInstancedLayer?(layer: InstancedLayer): void;
+  /**
+   * Update an instanced layer in place when the primitive supports it (circles), or fall
+   * back to destroy+recreate otherwise. Optional — only the WebGL backend implements it;
+   * when absent, `emitInstancedLane` falls back to `setInstancedLayer`. Non-circles
+   * primitives (lines/arrows/half-arrows) always recreate via `setInstancedLayer`.
+   */
+  updateInstancedLayer?(layer: InstancedLayer): void;
   /** Remove an instanced primitive layer by name. */
   removeInstancedLayer?(name: string): void;
   setTransform(t: ViewTransform): void;

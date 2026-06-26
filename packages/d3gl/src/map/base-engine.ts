@@ -126,6 +126,10 @@ export abstract class BaseEngine {
   protected ptSpecs = new Map<string, PassThroughSpec>();
   /** Instanced selection lanes (#108-B): drives re-emit on setTransform; resolves picks. */
   protected instancedLanes = new Map<string, InstancedLaneEntry>();
+  /** Per-lane name-set from its last emit — lets {@link emitInstancedLane} keep the update-in-place
+   *  fast path only while the present-layer set is unchanged, and re-add in emit order on a change
+   *  (so a reappearing layer can't be appended out of draw order — the backend draws in insertion order). */
+  private laneEmittedNames = new Map<string, Set<string>>();
   /** Per-layer id → datum index, maintained incrementally so an append's duplicate-id
    *  check stays O(new) (not O(total)/batch) AND so pick()/restyle resolve a datum
    *  index in O(1) instead of spec.ids.indexOf (O(n) per pointer move). */
@@ -337,13 +341,42 @@ export abstract class BaseEngine {
     this.instancedLanes.delete(name);
   }
 
-  /** Re-select the lane at the live transform and push its layers (clear its names, then re-add in order). */
+  /**
+   * Re-select the lane at the live transform and push its layers.
+   *
+   * For each emitted layer: use `backend.updateInstancedLayer` (update-in-place, no GPU
+   * teardown) when available; otherwise fall back to `setInstancedLayer` (destroy+recreate).
+   * Layers that were in `entry.layerNames` but are NOT in this frame's emit (a layer that
+   * disappears mid-session) are removed with `removeInstancedLayer`.
+   */
   protected emitInstancedLane(name: string): void {
     const entry = this.instancedLanes.get(name);
     const backend = this.handle?.backend;
     if (!entry || !backend?.setInstancedLayer) return;
-    for (const n of entry.layerNames) backend.removeInstancedLayer?.(n);
-    for (const layer of entry.lane.update(this.transform, this.width, this.height)) backend.setInstancedLayer(layer);
+
+    const emitted = entry.lane.update(this.transform, this.width, this.height);
+    const emittedNames = new Set<string>();
+    for (const layer of emitted) emittedNames.add(layer.name);
+
+    // The WebGL backend draws instanced layers in insertion order, so draw order == emit order.
+    // Updating in place preserves each layer's slot — correct ONLY while the present-layer set is
+    // unchanged (the per-frame zoom/pan case). When a layer appears or disappears (e.g. network
+    // arrows toggling across an LOD cut), a reappearing layer would be appended last and drawn on
+    // top of layers that should sit above it — so on ANY set change, clear this lane's layers and
+    // re-add in emit order to re-establish the canonical z-order. (Set-stable ⇒ in-place, the
+    // perf-critical path: zero teardown, no order drift.)
+    const prev = this.laneEmittedNames.get(name);
+    const sameSet = prev != null && prev.size === emittedNames.size && [...emittedNames].every((n) => prev.has(n));
+    if (sameSet) {
+      for (const layer of emitted) {
+        if (backend.updateInstancedLayer) backend.updateInstancedLayer(layer);
+        else backend.setInstancedLayer(layer);
+      }
+    } else {
+      for (const n of entry.layerNames) backend.removeInstancedLayer?.(n);
+      for (const layer of emitted) backend.setInstancedLayer(layer);
+    }
+    this.laneEmittedNames.set(name, emittedNames);
   }
 
   /** Register/replace a layer: build its Scene group, apply accessors, index, push. */
@@ -1070,6 +1103,15 @@ export abstract class BaseEngine {
   protected onBackendSwapped(): void {}
 
   /**
+   * Backend-changed hook: called after EVERY backend install (first install AND swaps),
+   * after setLayers/setTransform/passThrough-repaint, but before the blanket instanced-lane
+   * re-emit. Subclasses override to re-evaluate which layers should be lane vs. Scene paths
+   * (e.g. Plot re-syncs points() layers so canvas→WebGL upgrades promote eligible layers to
+   * the instanced lane). Default: no-op.
+   */
+  protected onBackendChanged(): void {}
+
+  /**
    * Install `next` as the live backend (shared by swapBackend and the "auto" upgrade).
    * Honors the swap-supersede / destroyed guards. Destroys + detaches the previous
    * handle, pushes the current specs + transform, renders, and — only if it REPLACED an
@@ -1121,6 +1163,13 @@ export abstract class BaseEngine {
       }
     }
     if (old) this.onBackendSwapped();
+    // Notify subclasses that the backend changed (both first-install and swaps), then
+    // re-emit all registered instanced lanes for the new backend. onBackendChanged() runs
+    // first so a subclass can register/unregister lanes before the blanket re-emit here.
+    this.onBackendChanged();
+    if (this.handle?.backend.setInstancedLayer) {
+      for (const name of [...this.instancedLanes.keys()]) this.emitInstancedLane(name);
+    }
   }
 
   private async swapBackend(type: BackendType): Promise<void> {

@@ -1,6 +1,8 @@
 import type { GroupBuilder, PathContext, LineJoin, LineCap } from "../core/index.js";
+import { InstancedLane } from "../core/instanced-lane.js";
 import { BaseEngine, type InteractiveLayerOptions, type BaseEngineOptions } from "./base-engine.js";
 import { LayerHandle } from "./layer-handle.js";
+import { resolvePlotPointsSoA, plotPointsCircles, declutterPointsStrategy } from "./points-lane.js";
 
 /** Plot adds no engine-level options of its own — all of {@link BaseEngineOptions}
  *  (sizing, `backend`, `tooltipClass`) apply. */
@@ -73,9 +75,114 @@ export interface PlotPointOptions<D = any> extends InteractiveLayerOptions<D> {
   passThrough?: boolean;
 }
 
+/** Stored per-points() layer so syncPointsLayer can re-evaluate lane eligibility on backend changes. */
+interface PointsLayerInfo<D = any> {
+  data: D[];
+  ids: (string | number)[];
+  opts: PlotPointOptions<D>;
+}
+
 export class Plot extends BaseEngine {
+  /** Retained info for every non-passThrough points() layer. Used by onBackendChanged() to
+   *  re-evaluate lane vs. Scene eligibility when the backend upgrades or downgrades.
+   *  Initialized lazily (not as a class field) so it is ready before the BaseEngine
+   *  constructor fires onBackendChanged() during `super()`. */
+  private _pointsLayers: Map<string, PointsLayerInfo> | undefined;
+  private get pointsLayers(): Map<string, PointsLayerInfo> {
+    if (!this._pointsLayers) this._pointsLayers = new Map();
+    return this._pointsLayers;
+  }
+
   constructor(host: HTMLElement, opts: PlotOptions = {}) {
     super(host, opts);
+  }
+
+  /** Called by BaseEngine after every backend install (first + swaps). Re-syncs all points()
+   *  layers so a canvas→WebGL upgrade promotes eligible layers to the instanced lane, and a
+   *  downgrade reverts them to the Scene path. */
+  protected override onBackendChanged(): void {
+    for (const name of this.pointsLayers.keys()) this.syncPointsLayer(name);
+  }
+
+  /**
+   * Register (or re-register) one non-passThrough points layer on the correct path for
+   * the CURRENT backend:
+   * - useLane: register an instanced lane + optional no-op Scene spec for tooltip dispatch.
+   *   If a real Scene spec for this name was previously registered (from a canvas phase),
+   *   replace it with an empty build so there is no double-draw.
+   * - !useLane: unregister any instanced lane; register the real Scene LayerSpec.
+   */
+  private syncPointsLayer(name: string): void {
+    const info = this.pointsLayers.get(name);
+    if (!info) return;
+    const { data: list, ids, opts } = info;
+
+    const useLane = !opts.passThrough && !opts.clipTo && !opts.hover && !opts.selection
+      && opts.declutter != null && opts.declutter > 0 && !!this.backend()?.setInstancedLayer;
+
+    const laneName = "points:" + name;
+
+    if (useLane) {
+      const xOf = (d: any, i: number) => opts.x(d, i);
+      const yOf = (d: any, i: number) => opts.y(d, i);
+      const pointRadiusOf = typeof opts.radius === "function"
+        ? (d: any, i: number) => (opts.radius as (d: any, i: number) => number)(d, i)
+        : (_d: any, _i: number) => (opts.radius as number | undefined) ?? 3;
+      const fillOf = typeof opts.fill === "function"
+        ? (d: any, i: number) => (opts.fill as (d: any, i: number) => string)(d, i)
+        : (_d: any, _i: number) => (opts.fill as string | undefined) ?? "#000";
+      const screenSized = (opts.sizeMode ?? "world") === "screen";
+
+      // Resolve the full per-point SoA ONCE (data/style change only, not per-frame).
+      // Each accessor is called exactly N times here, never again during setTransform.
+      const { allCenters, allRadii, allColors } = resolvePlotPointsSoA(list, xOf, yOf, pointRadiusOf, fillOf);
+
+      // Allocate scratch buffers at capacity N (reused every frame — no per-frame allocation).
+      const n = list.length;
+      const scratchCenters = new Float32Array(n * 2);
+      const scratchRadii = new Float32Array(n);
+      const scratchColors = new Uint8Array(n * 4);
+
+      const strategy = declutterPointsStrategy(n, allCenters, allRadii, opts.declutter as number, undefined, this.width, this.height, screenSized);
+      this.registerInstancedLane(laneName, {
+        lane: new InstancedLane(strategy, (vis) => [{
+          name: laneName,
+          primitive: "circles",
+          // Gather kept indices into scratch buffers (no accessor calls, no rgb() parse, no allocation).
+          circles: plotPointsCircles(vis, allCenters, allRadii, allColors, scratchCenters, scratchRadii, scratchColors),
+          sizeMode: opts.sizeMode ?? "world",
+        }]),
+        layerNames: [laneName],
+        dynamic: true,
+        resolve: opts.pickable === false ? () => null : (i) => ({ layer: name, id: ids[i]!, datum: list[i] }),
+      });
+
+      // Replace any previously-registered real Scene spec for this name with a no-op build
+      // (clears tessellated geometry so there's no double-draw with the lane), OR register a
+      // tooltip-forwarding no-op spec when tooltip is set (BaseEngine needs it for dispatch).
+      if (opts.tooltip || this.specs.find((s) => s.name === name)) {
+        this.registerLayer({
+          name,
+          data: list,
+          ids,
+          pickable: false,
+          tooltip: opts.tooltip,
+          build: () => { /* no Scene geometry — lane owns draw + pick */ },
+        });
+      }
+    } else {
+      // Revert to Scene path: drop the lane if one was registered.
+      this.unregisterInstancedLane(laneName);
+      this.registerLayer({
+        name, data: list, ids,
+        fill: opts.fill, stroke: opts.stroke,
+        clipTo: opts.clipTo, sizeMode: opts.sizeMode,
+        declutter: opts.declutter,
+        pickable: opts.pickable,
+        ...this.interactionFields(opts),
+        build: this.buildPoints(list, ids, 0, opts),
+      });
+    }
   }
 
   layer<D>(name: string, data: readonly D[], opts: PlotLayerOptions<D>): LayerHandle<D> {
@@ -117,8 +224,24 @@ export class Plot extends BaseEngine {
     const list = data as D[];
     const ids = list.map((d, i) => (opts.id ? opts.id(d, i) : i));
     this.dropInteractionState(name); // a re-declared layer starts with base styles
-    this.registerLayer({ name, data: list, ids, fill: opts.fill, stroke: opts.stroke, clipTo: opts.clipTo, sizeMode: opts.sizeMode, declutter: opts.declutter, pickable: opts.pickable, ...this.interactionFields(opts), build: this.buildPoints(list, ids, 0, opts) });
-    return new LayerHandle<D>(this, name, (items) => this.appendPoints(name, items, opts));
+
+    // Store the layer info so onBackendChanged() can re-sync when the backend upgrades/downgrades.
+    this.pointsLayers.set(name, { data: list, ids, opts });
+    // Delegate registration to syncPointsLayer which handles both lane and Scene paths.
+    this.syncPointsLayer(name);
+
+    // A declutter layer may render via the instanced lane now OR after a backend upgrade
+    // (canvas→WebGL via backend:"auto"), so its handle must ALWAYS throw on append — the
+    // lane holds a data snapshot, and appending to the (possibly no-op) Scene spec would
+    // silently desync spec.data/spec.ids. The decision must NOT depend on the live backend,
+    // or a layer registered on canvas would bind the real append handler and corrupt itself
+    // once it upgrades to the lane.
+    const laneEligible = !opts.passThrough && !opts.clipTo && !opts.hover && !opts.selection
+      && opts.declutter != null && opts.declutter > 0;
+
+    return new LayerHandle<D>(this, name, laneEligible
+      ? () => { throw new Error("append() is not supported on a declutter points layer (it renders via the instanced lane); rebuild the layer with the full data via points()."); }
+      : (items) => this.appendPoints(name, items, opts));
   }
 
   private appendDrawables<D>(name: string, items: readonly D[], opts: PlotLayerOptions<D>): void {
