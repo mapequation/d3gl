@@ -16,10 +16,10 @@ const DEPTHS = [2, 3, 4, 5, 6]; // 27 → 2187 nodes
  * **hover** shows a ring, **click** selects (shift/⌘-click adds), and `on("select")` reports each hit's
  * `members()` — the **leaf node ids inside a clicked module aggregate** — shown in the caption.
  *
- * `net.labels({ max, labelOf })` adds a handful of **importance-ranked frontier labels** (#105 N7b): a
- * size badge on each visible module aggregate (the leaf node id on a leaf), the top-`max` by importance
- * within the viewport, re-placed on pan/zoom. Scroll to zoom, drag to pan; the Depth slider grows the
- * gasket from 27 to 2,187 nodes.
+ * `net.labels({ labelOf })` adds **frontier labels** (#105 N7b): a size badge on every visible module
+ * aggregate (here `labelOf` returns null for leaves, and no `max` is set — on a symmetric gasket showing
+ * all modules reads clearer than an arbitrary top-k), re-placed on pan/zoom. Scroll to zoom, drag to
+ * pan; the Depth slider grows the gasket from 27 to 2,187 nodes.
  */
 export const setup: ImperativeSetup = (host, { width, height, backend }) => {
   const net = network(host, { width, height, backend });
@@ -50,12 +50,13 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
       caption.textContent = `Selected ${hits.length} glyph${hits.length > 1 ? "s" : ""} covering ${leaves.length} leaf node${leaves.length > 1 ? "s" : ""}: ${sample}${leaves.length > 12 ? ", …" : ""}`;
     });
 
-  // Frontier labels (#105 N7b): a handful of importance-ranked labels on the cut — a size badge on each
-  // visible module aggregate, the node id on a leaf — re-placed (and re-picked) as you pan/zoom.
+  // Frontier labels (#105 N7b): a size badge on EVERY visible module aggregate (no `max` — the gasket is
+  // symmetric, so showing all reads clearer than an arbitrary top-k; `labelOf` returns null for leaves,
+  // so only modules are badged). Re-placed (and re-picked) as you pan/zoom.
   const labelStyle = document.createElement("style");
   labelStyle.textContent = ".lod-label{font:600 11px/1 system-ui,sans-serif;color:#1f2937;text-shadow:0 0 3px #fff,0 0 3px #fff,0 0 3px #fff}";
   host.appendChild(labelStyle);
-  net.labels({ max: 12, className: "lod-label", labelOf: (id, info) => (info.aggregate ? `${info.count}` : `n${id}`) });
+  net.labels({ className: "lod-label", labelOf: (id, info) => (info.aggregate ? `${info.count}` : null) });
 
   return {
     engine: net,

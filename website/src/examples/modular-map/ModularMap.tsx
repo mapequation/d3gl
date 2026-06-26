@@ -14,6 +14,16 @@ export default function ModularMap() {
         { type: "segmented", key: "declutter", label: "Declutter", options: ["On", "Off"] },
         { type: "range", key: "expand", label: "Expand", min: 24, max: 500, step: 8, value: 240 },
         { type: "range", key: "maxRadius", label: "Max radius", min: 12, max: 40, step: 1, value: 18 },
+        {
+          type: "range",
+          key: "maxLabels",
+          label: "Labels",
+          min: 0,
+          max: 6,
+          step: 1,
+          value: 1, // index into LABEL_CAPS in draw.ts → 12; last position = "All" (no limit)
+          display: ["6", "12", "20", "30", "50", "100", "All"],
+        },
         { type: "segmented", key: "crossLevel", label: "Cross-level edges", options: ["Off", "On"], value: "On" },
         {
           type: "range",

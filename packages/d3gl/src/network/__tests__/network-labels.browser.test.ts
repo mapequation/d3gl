@@ -60,6 +60,31 @@ describe("network.labels() — frontier labels (#105 N7b)", () => {
     h.remove();
   });
 
+  it("default has no cap: labels every visible aggregate; labelOf null skips leaves", async () => {
+    const h = host();
+    const net = network(h, { width: 200, height: 200 });
+    await net.whenReady();
+    const g = buildGraph({ nodeCount: 4, source: [0, 2, 1], target: [1, 3, 2], directed: true });
+    const modules = [
+      { id: 0, path: [1, 1] }, { id: 1, path: [1, 2] }, { id: 2, path: [2, 1] }, { id: 3, path: [2, 2] },
+    ];
+    net.data(g).style({ directed: true }).lod({ modules, expandPx: 20 }).layout({ backend: "positions", positions: new Float32Array([70, 90, 85, 90, 115, 110, 130, 110]) });
+    // No `max` → show all; label only aggregates (null for leaves).
+    net.labels({ labelOf: (_id, info) => (info.aggregate ? `${info.count}` : null) });
+    net.setTransform({ k: 1, x: 0, y: 0 });
+
+    /* eslint-disable @typescript-eslint/no-explicit-any */
+    const tree = (net as any).lodTree;
+    const frontier = [...((net as any).instancedLanes.get("network").lane.visible as Uint32Array)];
+    const aggregatesInView = frontier.filter((gid) => gid >= tree.leafCount);
+    const els = labelEls(h);
+    expect(els.length).toBe(aggregatesInView.length); // every aggregate labelled — no cap
+    expect(els.every((e) => /^\d+$/.test(e.textContent ?? ""))).toBe(true); // counts only, leaves skipped
+    /* eslint-enable @typescript-eslint/no-explicit-any */
+    net.destroy();
+    h.remove();
+  });
+
   it("no-LOD: ranks visible nodes by strength, capped at max", async () => {
     const h = host();
     const net = network(h, { width: 200, height: 200 });

@@ -33,6 +33,9 @@ export interface LabelAnchor {
   transform?: string;
   /** transform-origin for the node; defaults to "0 0" (the anchor point). */
   transformOrigin?: string;
+  /** Per-label opacity [0,1] (default 1). Lets a caller cross-fade labels in/out in lockstep with the
+   *  glyphs they sit on — e.g. the network LOD cross-fade (#133) fading a module ↔ its sub-modules. */
+  opacity?: number;
 }
 
 /**
@@ -76,6 +79,8 @@ export class LabelLayer {
     }));
     const visible = cullLabels(boxes, { viewport });
     const seen = new Set<string>();
+    // Per-label opacity (cross-fade) keyed by id — applied at render, not part of collision geometry.
+    const opacityById = new Map<string, number | undefined>(anchors.map((a) => [String(a.id), a.opacity]));
 
     for (const box of visible) {
       const key = String(box.id);
@@ -104,6 +109,8 @@ export class LabelLayer {
       node.style.transform =
         box.rotation !== undefined ? labelGeometry(box).transform : ((box.transform as string) ?? "");
       node.style.transformOrigin = (box.transformOrigin as string) ?? "0 0";
+      const op = opacityById.get(key);
+      node.style.opacity = op == null ? "" : String(op);
     }
 
     for (const [key, node] of this.nodes) {

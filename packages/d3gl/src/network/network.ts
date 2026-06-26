@@ -34,13 +34,15 @@ export interface NetworkHit {
  */
 export interface NetworkLabelOptions {
   /** Text for a node/aggregate id. `info` describes the glyph (`{ aggregate, count }`) — for an
-   *  aggregate return e.g. a module name or `${info.count}`, for a leaf the node's name. Default: a
-   *  leaf → its id, an aggregate → `"N nodes"`. */
-  labelOf?: (id: number, info: NetworkHit) => string;
-  /** Max labels shown at once — the top-k by importance within the viewport (default 12). */
+   *  aggregate return e.g. a module name or `${info.count}`, for a leaf the node's name. Return `null`
+   *  / `""` to give that glyph no label. Default: a leaf → its id, an aggregate → `"N nodes"`. */
+  labelOf?: (id: number, info: NetworkHit) => string | null | undefined;
+  /** Hard cap on labels shown — the top-`max` by importance within the viewport. **Default: no cap** —
+   *  every visible labelled glyph is shown, thinned only by collision culling. Set this to surface just
+   *  the most important few on a dense map (ranking, hence a sort, runs only when this caps). */
   max?: number;
-  /** Importance for ranking (higher = shown first). Default: the LOD tree `weight` (summed flow/
-   *  strength) with LOD on, node strength with LOD off. */
+  /** Importance for ranking (higher = shown first) when {@link max} caps. Default: the LOD tree `weight`
+   *  (summed flow/strength) with LOD on, node strength with LOD off. */
   importanceOf?: (id: number, info: NetworkHit) => number;
   /** Class set on each label element, for styling the overlay (font/colour/halo). */
   className?: string;
@@ -254,8 +256,9 @@ const EMPTY_VISIBLE = new Uint32Array(0);
 /** Shared {@link NetworkHit} for no-LOD label ranking (every node is a single leaf). */
 const NO_LOD_INFO: NetworkHit = { aggregate: false, count: 1 };
 
-/** Resolve a frontier label's text: the user's `labelOf`, else a default (leaf → id, aggregate → "N nodes"). */
-function labelText(opts: NetworkLabelOptions, id: number, info: NetworkHit): string {
+/** Resolve a frontier label's text: the user's `labelOf` (may return null/"" to skip a glyph), else a
+ *  default (leaf → id, aggregate → "N nodes"). */
+function labelText(opts: NetworkLabelOptions, id: number, info: NetworkHit): string | null | undefined {
   if (opts.labelOf) return opts.labelOf(id, info);
   return info.aggregate ? `${info.count} nodes` : String(id);
 }
@@ -458,33 +461,41 @@ export class Network extends BaseEngine {
   private refreshLabels(): void {
     const layer = this.labelLayer, opts = this.labelOpts;
     if (!layer || !opts || !this.graph) return;
-    const max = opts.max ?? 12;
+    // Default: NO cap — show every visible glyph that has a label (collision culling thins them where
+    // they'd overlap). A finite `max` keeps only the top-k by importance; ranking (the sort below) is
+    // therefore done ONLY when capping AND there are more candidates than the cap.
+    const max = opts.max ?? Infinity;
     const rect = visibleWorldRect(this.transform, this.width, this.height);
     const inView = (x: number, y: number) => x >= rect.minX && x <= rect.maxX && y >= rect.minY && y <= rect.maxY;
     const anchors: LabelAnchor[] = [];
 
     if (this.lodReady() && this.lodTree) {
       const tree = this.lodTree;
+      const fade = this.fadeAlpha; // per-node cross-fade alpha (#133) when crossFade is on, else null
       const frontier = this.instancedLanes.get(this.NET_LANE)?.lane.visible ?? EMPTY_VISIBLE;
       const cand: number[] = [];
       for (let i = 0; i < frontier.length; i++) { const g = frontier[i]!; if (inView(tree.cx[g]!, tree.cy[g]!)) cand.push(g); }
       const impOf = opts.importanceOf;
-      cand.sort((a, b) => (impOf ? impOf(b, this.lodDatum(tree, b)) - impOf(a, this.lodDatum(tree, a)) : tree.weight[b]! - tree.weight[a]!));
-      for (let i = 0; i < Math.min(max, cand.length); i++) {
-        const g = cand[i]!, info = this.lodDatum(tree, g);
-        anchors.push({ id: g, refX: tree.cx[g]!, refY: tree.cy[g]!, text: labelText(opts, g, info), offset: opts.offset, transform: "translate(-50%, -50%)" });
+      if (cand.length > max) cand.sort((a, b) => (impOf ? impOf(b, this.lodDatum(tree, b)) - impOf(a, this.lodDatum(tree, a)) : tree.weight[b]! - tree.weight[a]!));
+      for (const g of cand) {
+        const info = this.lodDatum(tree, g);
+        const text = labelText(opts, g, info);
+        if (!text) continue; // labelOf returned null/"" — this glyph has no label
+        anchors.push({ id: g, refX: tree.cx[g]!, refY: tree.cy[g]!, text, offset: opts.offset, transform: "translate(-50%, -50%)", opacity: fade ? fade[g] : undefined });
+        if (anchors.length >= max) break;
       }
     } else {
-      // No-LOD: rank the nodes in view by strength (weighted degree). O(N) per refresh — for the
-      // small-graph case (LOD is the scale path), the offset:[0,0] full-graph draw.
+      // No-LOD: rank the nodes in view by strength (weighted degree). The full graph is drawn.
       const graph = this.graph, pos = graph.positions, strength = graph.strength;
       const cand: number[] = [];
       for (let i = 0; i < graph.nodeCount; i++) if (inView(pos[2 * i]!, pos[2 * i + 1]!)) cand.push(i);
       const impOf = opts.importanceOf;
-      cand.sort((a, b) => (impOf ? impOf(b, NO_LOD_INFO) - impOf(a, NO_LOD_INFO) : strength[b]! - strength[a]!));
-      for (let i = 0; i < Math.min(max, cand.length); i++) {
-        const id = cand[i]!;
-        anchors.push({ id, refX: pos[2 * id]!, refY: pos[2 * id + 1]!, text: labelText(opts, id, NO_LOD_INFO), offset: opts.offset, transform: "translate(-50%, -50%)" });
+      if (cand.length > max) cand.sort((a, b) => (impOf ? impOf(b, NO_LOD_INFO) - impOf(a, NO_LOD_INFO) : strength[b]! - strength[a]!));
+      for (const id of cand) {
+        const text = labelText(opts, id, NO_LOD_INFO);
+        if (!text) continue;
+        anchors.push({ id, refX: pos[2 * id]!, refY: pos[2 * id + 1]!, text, offset: opts.offset, transform: "translate(-50%, -50%)" });
+        if (anchors.length >= max) break;
       }
     }
     layer.update(anchors, this.transform, { width: this.width, height: this.height });
