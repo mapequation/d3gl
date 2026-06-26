@@ -197,6 +197,46 @@ describe("network interactive lane (#105 N7c-2)", () => {
     h.remove();
   });
 
+  it("works after a canvas→WebGL upgrade, where empty placeholder Scene specs would shadow the lane", async () => {
+    // The website harness defaults to backend:"auto" (canvas first, then WebGL). On the upgrade the
+    // network keeps empty "nodes"/"links"/… Scene specs (geometry cleared) — these must NOT shadow the
+    // interactive lane in selection/hover dispatch. Reproduce via an explicit canvas→webgl swap.
+    const net = network(host(), { width: 200, height: 200, backend: "canvas" });
+    await net.whenReady();
+    const g = buildGraph({ nodeCount: 4, source: [0, 2, 1], target: [1, 3, 2], directed: true });
+    const modules = [
+      { id: 0, path: [1, 1] }, { id: 1, path: [1, 2] }, { id: 2, path: [2, 1] }, { id: 3, path: [2, 2] },
+    ];
+    net.interactive({ selectable: { multi: true }, hover: true });
+    net.data(g).style({ sizeMode: "screen", nodeRadius: 6 }).lod({ modules, expandPx: 120, maxAggregateRadius: 26 }).layout({ backend: "positions", positions: new Float32Array([70, 90, 85, 90, 115, 110, 130, 110]) });
+    net.setBackend("webgl");
+    await net.whenReady();
+    net.setTransform({ k: 1, x: 0, y: 0 });
+
+    /* eslint-disable @typescript-eslint/no-explicit-any */
+    // A placeholder Scene "nodes" spec is present from the canvas phase…
+    expect((net as any).specs.some((s: { name: string }) => s.name === "nodes")).toBe(true);
+    const tree = (net as any).lodTree;
+    const agg = [...((net as any).instancedLanes.get("network").lane.visible as Uint32Array)].find((id) => id >= tree.leafCount)!;
+    expect(agg).toBeDefined();
+
+    // …yet selection resolves through the LANE (aggregate members = subtree leaves, not [id]) and the
+    // ring lights up — i.e. the placeholder spec does not shadow the lane.
+    net.select("nodes", [agg]);
+    const sel = net.selection();
+    expect(sel.map((s) => s.id)).toEqual([agg]);
+    // members = the aggregate's subtree leaves (count > 1) — would be 1 ([agg]) if the placeholder
+    // Scene spec shadowed the lane (sceneMembers has no winners for "nodes" → returns [id]).
+    expect(sel[0]!.members?.().length).toBe(tree.count[agg]);
+    expect(tree.count[agg]).toBeGreaterThan(1);
+    expect([...(net as any).instancedLanes.get("network-highlight").lane.visible]).toContain(agg);
+    // And the gesture path is selectable through the lane (not the non-selectable placeholder spec).
+    const hit = (net as any).pick(tree.cx[agg], tree.cy[agg]);
+    expect((hit?.datum as { aggregate: boolean }).aggregate).toBe(true);
+    /* eslint-enable @typescript-eslint/no-explicit-any */
+    net.destroy();
+  });
+
   it("toggling interactive(false) returns to pick-only (no managed selection)", async () => {
     const net = network(host(), { width: 200, height: 200 });
     await net.whenReady();

@@ -37,7 +37,8 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
   // Selection + hover for nodes/aggregates. on("select") reads each hit's members() — the leaf node ids
   // the glyph covers (a single node for a leaf, the whole subtree for a collapsed module).
   net
-    .interactive({ selectable: { multi: true }, hover: true })
+    // hover ring blue, selection ring orange (the white default hover ring is for dark backgrounds).
+    .interactive({ selectable: { multi: true }, hover: { stroke: "#2563eb" }, selection: { selected: { stroke: "#ff6a00" } } })
     .on("select", (hits) => {
       if (hits.length === 0) { caption.textContent = "Hover to ring a node/module · click to select (⇧/⌘ adds)"; return; }
       const leaves = hits.flatMap((h) => h.members?.() ?? []);

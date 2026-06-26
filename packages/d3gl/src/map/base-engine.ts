@@ -502,10 +502,12 @@ export abstract class BaseEngine {
     return false;
   }
 
-  /** Resolve a layer's selectability from either its Scene spec or its interactive lane. */
+  /** Resolve a layer's selectability. An interactive lane takes precedence over a same-named Scene
+   *  spec — on WebGL the network keeps empty placeholder specs ("nodes" etc.) that must not shadow
+   *  the lane that actually draws + picks those glyphs. */
   private selectableOf(layer: string): { on: boolean; multi: boolean } {
-    const spec = this.specs.find((s) => s.name === layer);
-    const sel = spec ? spec.selectable : this.laneInteractiveFor(layer)?.ix.options.selectable;
+    const ix = this.laneInteractiveFor(layer)?.ix;
+    const sel = ix ? ix.options.selectable : this.specs.find((s) => s.name === layer)?.selectable;
     if (!sel) return { on: false, multi: false };
     return { on: true, multi: sel !== true && (sel as { multi?: boolean }).multi === true };
   }
@@ -784,11 +786,9 @@ export abstract class BaseEngine {
    * same way they observe gesture selection.
    */
   select(name: string, set: readonly (string | number)[] | ((d: any, i: number) => boolean) | null): this {
-    const spec = this.specs.find((s) => s.name === name);
-    if (!spec) {
+    // Lane-first: an interactive lane takes precedence over a same-named (empty placeholder) Scene spec.
+    if (this.laneInteractiveFor(name)) {
       // Instanced lane: update the managed set + refresh the ring overlay (no Scene drawables to style).
-      const found = this.laneInteractiveFor(name);
-      if (!found) return this;
       if (typeof set === "function") throw new Error(`select(${name}, fn): function selectors are Scene-layer only; pass an id array for instanced lanes`);
       if (set === null) this.selected.delete(name);
       else this.selected.set(name, new Set(set));
@@ -796,6 +796,8 @@ export abstract class BaseEngine {
       this.selectCb?.(this.selection(), undefined);
       return this;
     }
+    const spec = this.specs.find((s) => s.name === name);
+    if (!spec) return this;
     // Resolve function selectors to an id set once (stored + used for styling).
     const resolved: Set<string | number> | null = set === null ? null
       : typeof set === "function"
@@ -1253,23 +1255,24 @@ export abstract class BaseEngine {
    *  that changes target will overwrite/clear it — the hover option owns that layer's overlay. */
   private applyAutoHover(hit: HoverHit | null): void {
     const layer = hit?.layer ?? null;
-    const spec = layer ? this.specs.find((s) => s.name === layer) : undefined;
+    // An interactive lane takes precedence over a same-named Scene spec (empty WebGL placeholders).
+    const ix = layer ? this.laneInteractiveFor(layer)?.ix : undefined;
+    const spec = layer && !ix ? this.specs.find((s) => s.name === layer) : undefined;
     // Scene-layer hover: redraw the hovered drawable into the tiny overlay layer.
     const sceneTarget = spec?.hover ? spec.name : null;
     if (this.autoHover && this.autoHover !== sceneTarget) this.highlight(this.autoHover, null);
     if (sceneTarget && hit) this.highlight(sceneTarget, hit.id);
     this.autoHover = sceneTarget;
-    // Instanced-lane hover (no Scene spec for this layer): drive the companion highlight ring.
-    const found = layer && !spec ? this.laneInteractiveFor(layer) : null;
-    const laneTarget = found?.ix.options.hover ? layer : null;
+    // Instanced-lane hover: drive the companion highlight ring.
+    const laneTarget = ix?.options.hover ? layer : null;
     this.setLaneHover(laneTarget, laneTarget && hit ? hit.id : null);
   }
 
-  /** Fill/show or hide the tooltip for the (changed) hover target. Resolves the tooltip fn from the
-   *  layer's Scene spec or, for an instanced-lane glyph, its interactive options. */
+  /** Fill/show or hide the tooltip for the (changed) hover target. An interactive lane's tooltip
+   *  takes precedence over a same-named Scene spec's. */
   private updateTooltip(hit: HoverHit | null): void {
-    const spec = hit ? this.specs.find((s) => s.name === hit.layer) : undefined;
-    const tip = spec ? spec.tooltip : hit ? this.laneInteractiveFor(hit.layer)?.ix.options.tooltip : undefined;
+    const ix = hit ? this.laneInteractiveFor(hit.layer)?.ix : undefined;
+    const tip = ix ? ix.options.tooltip : hit ? this.specs.find((s) => s.name === hit.layer)?.tooltip : undefined;
     const content = tip && hit ? tip(hit.datum, hit.id) : null;
     if (content == null) { this.tooltipEl?.hide(); return; }
     (this.tooltipEl ??= new Tooltip(this.host, this.tooltipClass)).show(content);
@@ -1308,11 +1311,12 @@ export abstract class BaseEngine {
    *  refresh their companion ring overlay instead (no Scene drawables to recolor). */
   private applySelectionStyles(touched: Set<string>): void {
     for (const n of touched) {
-      if (this.specs.some((s) => s.name === n)) {
+      // Lane-first: an interactive lane refreshes its ring overlay; otherwise a Scene layer restyles.
+      if (this.laneInteractiveFor(n)) {
+        this.emitHighlightFor(n);
+      } else {
         const ids = this.selected.get(n);
         this._applySelect(n, ids && ids.size ? ids : null);
-      } else {
-        this.emitHighlightFor(n);
       }
     }
   }
@@ -1361,17 +1365,16 @@ export abstract class BaseEngine {
   selection(): HoverHit[] {
     const out: HoverHit[] = [];
     for (const [layer, ids] of this.selected) {
-      const spec = this.specs.find((s) => s.name === layer);
-      if (spec) {
+      // Lane-first: an interactive lane resolves datum + members; otherwise the Scene spec does.
+      const ix = this.laneInteractiveFor(layer)?.ix;
+      if (ix) {
+        for (const id of ids) out.push({ layer, id, datum: ix.datumOf(id), members: () => ix.members(id) });
+      } else {
+        const spec = this.specs.find((s) => s.name === layer);
         const index = this.layerIds.get(layer);
         for (const id of ids) {
           const di = index?.get(id) ?? -1;
-          out.push({ layer, id, datum: di >= 0 ? spec.data[di] : null, members: () => this.sceneMembers(layer, id) });
-        }
-      } else {
-        const ix = this.laneInteractiveFor(layer)?.ix;
-        for (const id of ids) {
-          out.push(ix ? { layer, id, datum: ix.datumOf(id), members: () => ix.members(id) } : { layer, id, datum: null });
+          out.push({ layer, id, datum: di >= 0 && spec ? spec.data[di] : null, members: () => this.sceneMembers(layer, id) });
         }
       }
     }
