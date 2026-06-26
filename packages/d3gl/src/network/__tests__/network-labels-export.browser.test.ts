@@ -98,6 +98,31 @@ describe("network.labels() backend-native text (#105 N7b-2)", () => {
     net.destroy();
   });
 
+  it("Canvas backend: a backend swap bakes labels into that same render (not one frame stale)", async () => {
+    // Canvas draws text in render() (vs SVG/WebGL which update the DOM in setTextLayer/overlay), so the
+    // label refresh must run BEFORE the swap's render — otherwise labels are blank until the next zoom/pan.
+    const { CanvasBackend } = await import("../../canvas/canvas-backend.js");
+    const renders: number[] = [];
+    const orig = CanvasBackend.prototype.render;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    CanvasBackend.prototype.render = function (this: any) { renders.push(this.textData.length); return orig.call(this); };
+    try {
+      const net = network(host(), { width: 200, height: 200 }); // start on webgl (no canvas renders)
+      await net.whenReady();
+      net.data(graph()).style({ nodeRadius: 6 }).layout({ backend: "positions", positions: POS });
+      net.labels({ labelOf: (id) => `n${id}` });
+      net.setTransform({ k: 1, x: 0, y: 0 });
+      renders.length = 0; // only watch what happens during/after the swap
+      net.setBackend("canvas");
+      await net.whenReady();
+      // At least one render during the swap already had the labels set — no zoom/pan needed to show them.
+      expect(renders.some((n) => n > 0)).toBe(true);
+      net.destroy();
+    } finally {
+      CanvasBackend.prototype.render = orig;
+    }
+  });
+
   it("labels(false) clears backend-native text", async () => {
     const net = network(host(), { width: 200, height: 200, backend: "svg" });
     await net.whenReady();

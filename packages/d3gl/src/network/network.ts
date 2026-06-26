@@ -457,6 +457,7 @@ export class Network extends BaseEngine {
       this.labelLayer = null;
       this.labelOpts = null;
       this.backend()?.setTextLayer?.([]); // clear any backend-native labels too
+      this.render(); // repaint so a backend that bakes labels in (Canvas) drops them now
       return this;
     }
     this.labelOpts = opts;
@@ -466,6 +467,7 @@ export class Network extends BaseEngine {
       this.labelLayer = new LabelLayer(this.host, (a) => a.text, opts.className);
     }
     this.refreshLabels();
+    this.render(); // bake just-set labels into the frame (Canvas); no-op-ish for the live-DOM backends
     return this;
   }
 
@@ -707,8 +709,10 @@ export class Network extends BaseEngine {
       this.registerNetworkScene(this.graph, style, true);
       this.sceneActive = true;
     }
-    this.render();
+    // Set labels BEFORE the render so a backend that bakes them into the frame (Canvas) draws the
+    // current labels in this render rather than one rebuild behind.
     this.refreshLabels(); // the frontier just changed (data/layout/lod/backend) — re-place labels
+    this.render();
     return this;
   }
 
