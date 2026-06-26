@@ -1,8 +1,12 @@
-import type { GroupBuilder, PathContext, LineJoin, LineCap } from "../core/index.js";
+import { declutterMembers, type GroupBuilder, type PathContext, type LineJoin, type LineCap } from "../core/index.js";
 import { InstancedLane } from "../core/instanced-lane.js";
-import { BaseEngine, type InteractiveLayerOptions, type BaseEngineOptions } from "./base-engine.js";
+import { BaseEngine, type InteractiveLayerOptions, type BaseEngineOptions, type LaneInteractive } from "./base-engine.js";
 import { LayerHandle } from "./layer-handle.js";
 import { resolvePlotPointsSoA, plotPointsCircles, declutterPointsStrategy } from "./points-lane.js";
+import { resolveRingColors, ringCircles } from "./highlight-ring.js";
+
+/** Shared empty kept-set returned by a points highlight lane when nothing is selected/hovered. */
+const EMPTY_KEPT = new Uint32Array(0);
 
 /** Plot adds no engine-level options of its own — all of {@link BaseEngineOptions}
  *  (sizing, `backend`, `tooltipClass`) apply. */
@@ -117,10 +121,15 @@ export class Plot extends BaseEngine {
     if (!info) return;
     const { data: list, ids, opts } = info;
 
-    const useLane = !opts.passThrough && !opts.clipTo && !opts.hover && !opts.selection && !opts.selectable
+    // A decluttered points layer renders via the instanced lane even when interactive (#105 N7c-2):
+    // selection/hover are drawn by a companion ring overlay, tooltip/pick resolve through the lane. Only
+    // passThrough/clipTo (which the lane can't express) fall back to the Scene path. Non-decluttered
+    // points still go Scene (the lane IS the declutter path).
+    const useLane = !opts.passThrough && !opts.clipTo
       && opts.declutter != null && opts.declutter > 0 && !!this.backend()?.setInstancedLayer;
 
     const laneName = "points:" + name;
+    const hlLaneName = laneName + ":hl";
 
     if (useLane) {
       const xOf = (d: any, i: number) => opts.x(d, i);
@@ -143,35 +152,72 @@ export class Plot extends BaseEngine {
       const scratchRadii = new Float32Array(n);
       const scratchColors = new Uint8Array(n * 4);
 
-      const strategy = declutterPointsStrategy(n, allCenters, allRadii, opts.declutter as number, undefined, this.width, this.height, screenSized);
+      // members() needs each point's kept survivor — track it only when the layer is interactive.
+      const ixOpts = this.interactionFields(opts);
+      const interactive = !!(ixOpts.selectable || ixOpts.hover || ixOpts.tooltip || ixOpts.selection);
+      const winners = interactive ? new Int32Array(n) : undefined;
+      const strategy = declutterPointsStrategy(n, allCenters, allRadii, opts.declutter as number, undefined, this.width, this.height, screenSized, winners);
+      const srcLane = new InstancedLane(strategy, (vis) => [{
+        name: laneName,
+        primitive: "circles",
+        // Gather kept indices into scratch buffers (no accessor calls, no rgb() parse, no allocation).
+        circles: plotPointsCircles(vis, allCenters, allRadii, allColors, scratchCenters, scratchRadii, scratchColors),
+        sizeMode: opts.sizeMode ?? "world",
+      }]);
+      const idToIndex = interactive ? new Map(ids.map((id, i) => [id, i])) : undefined;
+      const laneInteractive: LaneInteractive | undefined = interactive ? {
+        layer: name,
+        options: ixOpts,
+        highlightLane: hlLaneName,
+        datumOf: (id) => { const i = idToIndex!.get(id); return i == null ? null : list[i]; },
+        members: (id) => { const i = idToIndex!.get(id); return i == null || !winners ? [id] : declutterMembers(winners, i, n).map((k) => ids[k]!); },
+      } : undefined;
       this.registerInstancedLane(laneName, {
-        lane: new InstancedLane(strategy, (vis) => [{
-          name: laneName,
-          primitive: "circles",
-          // Gather kept indices into scratch buffers (no accessor calls, no rgb() parse, no allocation).
-          circles: plotPointsCircles(vis, allCenters, allRadii, allColors, scratchCenters, scratchRadii, scratchColors),
-          sizeMode: opts.sizeMode ?? "world",
-        }]),
+        lane: srcLane,
         layerNames: [laneName],
         dynamic: true,
         resolve: opts.pickable === false ? () => null : (i) => ({ layer: name, id: ids[i]!, datum: list[i] }),
+        interactive: laneInteractive,
       });
 
-      // Replace any previously-registered real Scene spec for this name with a no-op build
-      // (clears tessellated geometry so there's no double-draw with the lane), OR register a
-      // tooltip-forwarding no-op spec when tooltip is set (BaseEngine needs it for dispatch).
-      if (opts.tooltip || this.specs.find((s) => s.name === name)) {
-        this.registerLayer({
-          name,
-          data: list,
-          ids,
-          pickable: false,
-          tooltip: opts.tooltip,
-          build: () => { /* no Scene geometry — lane owns draw + pick */ },
+      // Companion ring overlay drawn on top (registered after the source lane). Registered for any
+      // interactive layer so a programmatic select() rings too; its select intersects the highlighted
+      // ids with the kept (decluttered) set — O(kept) per refresh, empty until something is shown.
+      if (interactive) {
+        const colors = resolveRingColors(ixOpts);
+        const ringName = hlLaneName + ":ring";
+        const ringSizeMode = opts.sizeMode ?? "world";
+        this.registerInstancedLane(hlLaneName, {
+          lane: new InstancedLane(
+            {
+              select: () => {
+                if (!this.hasHighlight(name)) return EMPTY_KEPT;
+                const sel = this.selectedIds(name), hov = this.hoveredIds(name);
+                const vis = srcLane.visible;
+                const out: number[] = [];
+                for (let k = 0; k < vis.length; k++) { const i = vis[k]!; const id = ids[i]!; if (sel?.has(id) || hov?.has(id)) out.push(i); }
+                return out.length ? Uint32Array.from(out) : EMPTY_KEPT;
+              },
+              pick: () => -1,
+            },
+            (vis) => {
+              if (vis.length === 0) return [];
+              const selected = this.selectedIds(name);
+              return [{ name: ringName, primitive: "circles", sizeMode: ringSizeMode, circles: ringCircles(vis, (i) => [allCenters[i * 2]!, allCenters[i * 2 + 1]!], (i) => allRadii[i]!, (i) => !!selected?.has(ids[i]!), colors) }];
+            },
+          ),
+          layerNames: [ringName], dynamic: true, resolve: () => null,
         });
+      } else {
+        this.unregisterInstancedLane(hlLaneName);
       }
+
+      // Clear any real Scene spec left from a canvas phase — the lane owns draw + interaction now, and a
+      // Scene spec of the same name would double-draw and shadow the lane in pick/selection dispatch.
+      if (this.specs.find((s) => s.name === name)) this.removeLayer(name);
     } else {
-      // Revert to Scene path: drop the lane if one was registered.
+      // Revert to Scene path: drop the lane (and its ring overlay) if one was registered.
+      this.unregisterInstancedLane(hlLaneName);
       this.unregisterInstancedLane(laneName);
       this.registerLayer({
         name, data: list, ids,
@@ -236,7 +282,7 @@ export class Plot extends BaseEngine {
     // silently desync spec.data/spec.ids. The decision must NOT depend on the live backend,
     // or a layer registered on canvas would bind the real append handler and corrupt itself
     // once it upgrades to the lane.
-    const laneEligible = !opts.passThrough && !opts.clipTo && !opts.hover && !opts.selection && !opts.selectable
+    const laneEligible = !opts.passThrough && !opts.clipTo
       && opts.declutter != null && opts.declutter > 0;
 
     return new LayerHandle<D>(this, name, laneEligible

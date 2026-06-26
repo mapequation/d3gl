@@ -311,7 +311,7 @@ describe("plot.points() lane lifecycle across backend swaps", () => {
     host.remove();
   });
 
-  it("non-declutter points() or hover points() are unaffected by backend swap", async () => {
+  it("non-declutter points() stay Scene; a declutter+hover layer promotes to the lane on the WebGL swap (#105 N7c-2)", async () => {
     const W = 400, H = 300, N = 80;
     const host = document.createElement("div");
     host.style.width = `${W}px`; host.style.height = `${H}px`;
@@ -325,27 +325,32 @@ describe("plot.points() lane lifecycle across backend swaps", () => {
       id: i, x: rnd() * W, y: rnd() * H,
     }));
 
-    // No declutter: always Scene.
+    // No declutter: always Scene (the lane IS the declutter path).
     chart.points("nodecl", nodes, {
       x: (d) => d.x, y: (d) => d.y, radius: 3, fill: () => "#888",
       id: (d) => d.id,
     });
-    // Hover: always Scene (disqualified from lane even on WebGL).
+    // declutter + hover: Scene on canvas (no instanced support); promotes to the lane on WebGL (N7c-2).
     chart.points("hovpt", nodes, {
       x: (d) => d.x, y: (d) => d.y, radius: 3, fill: () => "#f00",
       sizeMode: "screen", declutter: 10, id: (d) => d.id, hover: true,
     });
 
+    /* eslint-disable @typescript-eslint/no-explicit-any */
+    // On canvas: both Scene (no instanced lane available).
+    expect((chart as any).instancedLanes.has("points:hovpt")).toBe(false);
+    expect((chart as any).scene.buffers("hovpt").flags.length).toBe(N);
+
     chart.setBackend("webgl");
     await chart.whenReady();
 
-    /* eslint-disable @typescript-eslint/no-explicit-any */
-    // Neither should have a lane registered.
+    // No-declutter layer is unaffected: still Scene, no lane.
     expect((chart as any).instancedLanes.has("points:nodecl")).toBe(false);
-    expect((chart as any).instancedLanes.has("points:hovpt")).toBe(false);
-    // Both must be Scene specs with drawable data.
     expect((chart as any).scene.buffers("nodecl").flags.length).toBe(N);
-    expect((chart as any).scene.buffers("hovpt").flags.length).toBe(N);
+    // declutter+hover layer promoted to the lane (+ companion ring); its Scene spec was cleared.
+    expect((chart as any).instancedLanes.has("points:hovpt")).toBe(true);
+    expect((chart as any).instancedLanes.has("points:hovpt:hl")).toBe(true);
+    expect((chart as any).specs.find((s: { name: string }) => s.name === "hovpt")).toBeUndefined();
     /* eslint-enable @typescript-eslint/no-explicit-any */
 
     chart.destroy();

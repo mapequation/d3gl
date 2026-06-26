@@ -9,7 +9,19 @@ import { HighlightBuilder, resolveHighlight, HIGHLIGHT_SUFFIX, type HighlightSty
 import { Tooltip } from "./tooltip.js";
 
 export type Accessor<D, T> = T | ((d: D, i: number) => T);
-export interface HoverHit { layer: string; id: string | number; datum: unknown; }
+export interface HoverHit {
+  layer: string;
+  id: string | number;
+  datum: unknown;
+  /**
+   * Underlying source ids this hit represents — for inspecting what an aggregate/decluttered glyph
+   * stands for (#105 N7c-2). A network LOD aggregate → its leaf node ids; a decluttered glyph →
+   * itself + the glyphs absorbed under it; a plain glyph → `[id]`. Lazy: enumeration runs only when
+   * called (network = subtree DFS, declutter = a `winners` inverse-scan), never on the pick hot path.
+   * Present on `on("hover" | "click")` hits and every `selection()` entry; absent for non-pickable hits.
+   */
+  members?: () => (string | number)[];
+}
 
 /** A registered instanced selection lane (#108-B). BaseEngine drives its re-emit + resolves its picks. */
 export interface InstancedLaneEntry {
@@ -20,6 +32,34 @@ export interface InstancedLaneEntry {
   dynamic: boolean;
   /** Map a picked source index (from `lane.pick`) to a HoverHit for hover/click dispatch; null = treat as a miss. */
   resolve(index: number): HoverHit | null;
+  /**
+   * Opt this lane into hover/selection (#105 N7c-2). When present, the lane's glyphs participate in
+   * the same `on("select")` / `selection()` / hover-highlight machinery as Scene layers — styling is
+   * a ring overlay drawn by a companion highlight lane (instanced glyphs have no Scene drawables to
+   * recolor). Absent ⇒ pick-only (the pre-N7c-2 behavior: `on("hover"|"click")` fire, but no
+   * managed selection or visual highlight).
+   */
+  interactive?: LaneInteractive;
+}
+
+/**
+ * Interaction surface for an instanced lane (#105 N7c-2) — the lane analogue of the per-layer
+ * {@link InteractiveLayerOptions} that Scene layers carry on their {@link LayerSpec}. Selection/hover
+ * styling is rendered as a **ring overlay** by a separate companion lane (`highlightLane`), since
+ * instanced glyphs have no Scene drawables to recolor; `selection.others` dimming is therefore not
+ * applied on lanes (selected glyphs get a ring instead).
+ */
+export interface LaneInteractive {
+  /** The `hit.layer` value this lane owns — the key under which selection/hover ids are tracked. */
+  layer: string;
+  /** Per-layer interaction options (selectable / hover / tooltip / selection). */
+  options: InteractiveLayerOptions;
+  /** Companion highlight lane re-emitted when this layer's selection/hover set changes (the ring overlay). */
+  highlightLane: string;
+  /** Datum for a selected/hovered id — used to rebuild hits in {@link BaseEngine.selection}. */
+  datumOf(id: string | number): unknown;
+  /** Underlying source ids `id` represents, for {@link HoverHit.members} (subtree leaves / absorbed set). */
+  members(id: string | number): (string | number)[];
 }
 
 /**
@@ -157,6 +197,13 @@ export abstract class BaseEngine {
   private selectCb: ((selected: HoverHit[], ev?: PointerEvent) => void) | null = null;
   /** Selected ids per layer (gesture-driven multi-select, #79). */
   private selected = new Map<string, Set<string | number>>();
+  /** Transient hover ids per instanced-lane layer (#105 N7c-2) — the hover-ring set, distinct from
+   *  the persistent `selected` set. Read by a lane's companion highlight strategy. At most one entry. */
+  private laneHilite = new Map<string, Set<string | number>>();
+  /** Instanced-lane layer whose hover ring is currently shown (auto-hover), so a target change clears it. */
+  private laneHoverLayer: string | null = null;
+  /** Per-Scene-layer declutter `winners` array (id→kept survivor), for `members()` on decluttered glyphs. */
+  private declutterWinners = new Map<string, Int32Array>();
   /** Last hover pick, for cheap same-target exits while the pointer stays inside one drawable. */
   private lastHover: HoverHit | null = null;
   /** Source layer whose hover-option highlight is currently shown (auto, not manual). */
@@ -347,6 +394,11 @@ export abstract class BaseEngine {
   /** Register (or replace) an instanced selection lane and emit it once if a backend is ready. */
   protected registerInstancedLane(name: string, entry: InstancedLaneEntry): void {
     this.instancedLanes.set(name, entry);
+    // An interactive lane needs the same pointer listeners as a Scene layer with these options
+    // (idempotent — same handler ref). The pick path resolves the lane; dispatch reads its options.
+    const opts = entry.interactive?.options;
+    if (opts?.hover || opts?.tooltip) this.attachPointer();
+    if (opts?.selectable) this.attachSelectPointer();
     if (this.handle?.backend.setInstancedLayer) this.emitInstancedLane(name);
   }
 
@@ -396,6 +448,109 @@ export abstract class BaseEngine {
     this.laneEmittedNames.set(name, emittedNames);
   }
 
+  /** Selected ids for an instanced-lane layer (#105 N7c-2) — read by a lane's companion highlight
+   *  strategy to draw the persistent selection ring. Empty/undefined ⇒ draw none. */
+  protected selectedIds(layer: string): ReadonlySet<string | number> | undefined {
+    return this.selected.get(layer);
+  }
+  /** Transient hover/manual-highlight ids for an instanced-lane layer (#105 N7c-2) — the hover ring. */
+  protected hoveredIds(layer: string): ReadonlySet<string | number> | undefined {
+    return this.laneHilite.get(layer);
+  }
+  /** Whether anything is currently highlighted on `layer` (selection or hover) — lets a lane's
+   *  highlight strategy short-circuit to an empty visible set (O(1)) when nothing is shown. */
+  protected hasHighlight(layer: string): boolean {
+    return (this.selected.get(layer)?.size ?? 0) > 0 || (this.laneHilite.get(layer)?.size ?? 0) > 0;
+  }
+
+  /** Drop any managed selection + hover highlight for `layer` — e.g. when an engine disables that
+   *  layer's interaction (so a stale selection can't survive as un-highlightable ghost state). */
+  protected clearLayerSelection(layer: string): void {
+    this.selected.delete(layer);
+    this.laneHilite.delete(layer);
+    if (this.laneHoverLayer === layer) this.laneHoverLayer = null;
+  }
+
+  /** Find the interactive lane that owns the dispatch layer `layer` (its `interactive.layer`), or null. */
+  private laneInteractiveFor(layer: string): { name: string; entry: InstancedLaneEntry; ix: LaneInteractive } | null {
+    for (const [name, entry] of this.instancedLanes) {
+      if (entry.interactive?.layer === layer) return { name, entry, ix: entry.interactive };
+    }
+    return null;
+  }
+
+  /** Re-emit the companion highlight lane for an interactive layer after its selection/hover set
+   *  changed — refreshes only the ring overlay (reuses the source lane's retained visible set; no
+   *  base-buffer re-upload) and repaints. No-op when the layer isn't a (highlight-capable) lane.
+   *  The repaint is essential: this runs at a STATIC transform (a click/hover, not a zoom), so unlike
+   *  `setTransform` — which emits then renders — nothing else would draw the freshly-pushed ring. */
+  private emitHighlightFor(layer: string): void {
+    const found = this.laneInteractiveFor(layer);
+    if (!found || !this.instancedLanes.has(found.ix.highlightLane)) return;
+    this.emitInstancedLane(found.ix.highlightLane);
+    this.render();
+  }
+
+  /** Does any registered lane opt into hover/tooltip (`"hover"`) or click-select (`"selectable"`)?
+   *  Lets the pointer-move/up handlers fire for lane-only engines (no Scene specs carry the option). */
+  private anyLaneInteractive(kind: "hover" | "selectable"): boolean {
+    for (const e of this.instancedLanes.values()) {
+      const o = e.interactive?.options;
+      if (!o) continue;
+      if (kind === "selectable" ? !!o.selectable : (!!o.hover || !!o.tooltip)) return true;
+    }
+    return false;
+  }
+
+  /** Resolve a layer's selectability. An interactive lane takes precedence over a same-named Scene
+   *  spec — on WebGL the network keeps empty placeholder specs ("nodes" etc.) that must not shadow
+   *  the lane that actually draws + picks those glyphs. */
+  private selectableOf(layer: string): { on: boolean; multi: boolean } {
+    const ix = this.laneInteractiveFor(layer)?.ix;
+    const sel = ix ? ix.options.selectable : this.specs.find((s) => s.name === layer)?.selectable;
+    if (!sel) return { on: false, multi: false };
+    return { on: true, multi: sel !== true && (sel as { multi?: boolean }).multi === true };
+  }
+
+  /** Show the hover ring for one instanced-lane glyph (`id`), clearing the previous lane hover.
+   *  `layer = null` clears any lane hover. Hover shows exactly one glyph at a time. */
+  private setLaneHover(layer: string | null, id: string | number | null): void {
+    if (this.laneHoverLayer && this.laneHoverLayer !== layer) {
+      const prev = this.laneHoverLayer;
+      this.laneHilite.delete(prev);
+      this.emitHighlightFor(prev);
+    }
+    this.laneHoverLayer = layer;
+    if (!layer) return;
+    const set = this.laneHilite.get(layer);
+    if (id == null) {
+      if (set?.size) { this.laneHilite.delete(layer); this.emitHighlightFor(layer); }
+    } else if (!set || set.size !== 1 || !set.has(id)) {
+      this.laneHilite.set(layer, new Set([id]));
+      this.emitHighlightFor(layer);
+    }
+  }
+
+  /** The source ids a Scene-layer glyph represents (#105 N7c-2): for a decluttered layer, itself plus
+   *  the glyphs absorbed under it (from the declutter `winners`); otherwise `[id]`. Lazy — only on a
+   *  `members()` call. Maps id → declutter group → absorbed groups → the drawable ids in those groups. */
+  private sceneMembers(layer: string, id: string | number): (string | number)[] {
+    const winners = this.declutterWinners.get(layer);
+    const di = this.layerIds.get(layer)?.get(id);
+    if (!winners || di == null) return [id];
+    const { groupOf } = this.scene.declutterIndex(layer);
+    const myGroup = groupOf[di];
+    if (myGroup == null || myGroup < 0) return [id];
+    const memberGroups = new Set<number>([myGroup]);
+    for (let g = 0; g < winners.length; g++) if (winners[g] === myGroup) memberGroups.add(g);
+    const drawables = this.scene.drawables(layer);
+    const out: (string | number)[] = [];
+    for (let d = 0; d < groupOf.length && d < drawables.length; d++) {
+      if (memberGroups.has(groupOf[d]!)) out.push(drawables[d]!.id);
+    }
+    return out.length ? out : [id];
+  }
+
   /** Register/replace a layer: build its Scene group, apply accessors, index, push. */
   protected registerLayer(spec: LayerSpec): void {
     if (spec.name.endsWith(HIGHLIGHT_SUFFIX)) throw new Error(`layer name suffix "${HIGHLIGHT_SUFFIX}" is reserved`);
@@ -422,6 +577,21 @@ export abstract class BaseEngine {
     if (spec.hover || spec.tooltip) this.attachPointer();
     // Attach pointer down/up when the layer is selectable (idempotent via same ref).
     if (spec.selectable) this.attachSelectPointer();
+    this.pushLayers();
+  }
+
+  /** Remove a Scene layer entirely: drop its spec, indexes, interaction state, and Scene group, then
+   *  re-push (setLayers rebuilds from `specs`, so the layer is gone). Used when a points layer is
+   *  promoted to the instanced lane (the lane owns draw + interaction; a stale Scene spec of the same
+   *  name would otherwise double-draw and shadow the lane in pick/selection dispatch). No-op if absent. */
+  protected removeLayer(name: string): void {
+    const at = this.specs.findIndex((s) => s.name === name);
+    if (at < 0) return;
+    this.specs.splice(at, 1);
+    this.hitIndexes.delete(name);
+    this.layerIds.delete(name);
+    this.dropInteractionState(name);
+    this.scene.remove(name);
     this.pushLayers();
   }
 
@@ -616,6 +786,16 @@ export abstract class BaseEngine {
    * same way they observe gesture selection.
    */
   select(name: string, set: readonly (string | number)[] | ((d: any, i: number) => boolean) | null): this {
+    // Lane-first: an interactive lane takes precedence over a same-named (empty placeholder) Scene spec.
+    if (this.laneInteractiveFor(name)) {
+      // Instanced lane: update the managed set + refresh the ring overlay (no Scene drawables to style).
+      if (typeof set === "function") throw new Error(`select(${name}, fn): function selectors are Scene-layer only; pass an id array for instanced lanes`);
+      if (set === null) this.selected.delete(name);
+      else this.selected.set(name, new Set(set));
+      this.emitHighlightFor(name);
+      this.selectCb?.(this.selection(), undefined);
+      return this;
+    }
     const spec = this.specs.find((s) => s.name === name);
     if (!spec) return this;
     // Resolve function selectors to an id set once (stored + used for styling).
@@ -785,6 +965,7 @@ export abstract class BaseEngine {
     this.styleOverrides.delete(name);
     this.highlights.delete(name);
     this.selected.delete(name);
+    this.declutterWinners.delete(name); // stale on a re-declare; cullDeclutter rebuilds next zoom
     // The hover tracking may point at this layer's now-dropped overlay; reset it so the
     // next pointermove re-evaluates instead of taking the same-target cheap exit (the
     // pointer often hasn't moved when a layer is re-declared on a data update).
@@ -935,10 +1116,14 @@ export abstract class BaseEngine {
       sx![i] = t.k * ax[i]! + t.x;
       sy![i] = t.k * ay[i]! + t.y;
     }
+    // Per-layer `winners` (group → kept survivor) so a hit can enumerate the glyphs absorbed under
+    // it (`members()`, #105 N7c-2). Reused per layer across zooms (allocated once per anchor count).
+    let win = this.declutterWinners.get(spec.name);
+    if (!win || win.length < G) { win = new Int32Array(G); this.declutterWinners.set(spec.name, win); }
     // `declutter` is the centre-to-centre exclusion distance, so the per-glyph radius is half of it
     // (two glyphs collide when dist < rᵢ + rⱼ = exclusion). Visited in index (data) order — the survivor
     // of a cluster is the earliest registered. Off-screen anchors are kept and don't occlude.
-    declutterScreen(G, sx!, sy!, exclusion / 2, undefined, this.width, this.height, 1, vis!, this.dcScratch);
+    declutterScreen(G, sx!, sy!, exclusion / 2, undefined, this.width, this.height, 1, vis!, this.dcScratch, undefined, win);
     this.scene.writeDeclutterFlags(spec.name, vis!);
     return true;
   }
@@ -998,7 +1183,14 @@ export abstract class BaseEngine {
       const lanes = [...this.instancedLanes.values()];
       for (let i = lanes.length - 1; i >= 0; i--) {
         const idx = lanes[i]!.lane.pick(x, y, t);
-        if (idx >= 0) { const hit = lanes[i]!.resolve(idx); if (hit) return hit; }
+        if (idx >= 0) {
+          const hit = lanes[i]!.resolve(idx);
+          if (hit) {
+            const ix = lanes[i]!.interactive;
+            if (ix) hit.members = () => ix.members(hit.id); // lazy: subtree leaves / absorbed set
+            return hit;
+          }
+        }
       }
     }
     for (let i = this.specs.length - 1; i >= 0; i--) {
@@ -1012,7 +1204,7 @@ export abstract class BaseEngine {
         if (clip && clip.pick(x, y, t) == null) continue;
       }
       const di = this.layerIds.get(spec.name)?.get(id) ?? -1;
-      return { layer: spec.name, id, datum: di >= 0 ? spec.data[di] : null };
+      return { layer: spec.name, id, datum: di >= 0 ? spec.data[di] : null, members: () => this.sceneMembers(spec.name, id) };
     }
     return null;
   }
@@ -1046,7 +1238,7 @@ export abstract class BaseEngine {
 
   private onPointerMove = (e: PointerEvent): void => {
     if (this.interacting) return; // gesture frames skip picking entirely
-    if (!this.hoverCb && !this.specs.some((s) => s.hover || s.tooltip)) return;
+    if (!this.hoverCb && !this.specs.some((s) => s.hover || s.tooltip) && !this.anyLaneInteractive("hover")) return;
     const r = this.host.getBoundingClientRect();
     const hit = this.pick(e.clientX - r.left, e.clientY - r.top);
     this.hoverCb?.(hit, e);
@@ -1062,17 +1254,26 @@ export abstract class BaseEngine {
    *  NOTE: if a manual highlight() was called on the same layer, the next pointermove
    *  that changes target will overwrite/clear it — the hover option owns that layer's overlay. */
   private applyAutoHover(hit: HoverHit | null): void {
-    const spec = hit ? this.specs.find((s) => s.name === hit.layer) : undefined;
-    const target = spec?.hover ? spec.name : null;
-    if (this.autoHover && this.autoHover !== target) this.highlight(this.autoHover, null);
-    if (target && hit) this.highlight(target, hit.id);
-    this.autoHover = target;
+    const layer = hit?.layer ?? null;
+    // An interactive lane takes precedence over a same-named Scene spec (empty WebGL placeholders).
+    const ix = layer ? this.laneInteractiveFor(layer)?.ix : undefined;
+    const spec = layer && !ix ? this.specs.find((s) => s.name === layer) : undefined;
+    // Scene-layer hover: redraw the hovered drawable into the tiny overlay layer.
+    const sceneTarget = spec?.hover ? spec.name : null;
+    if (this.autoHover && this.autoHover !== sceneTarget) this.highlight(this.autoHover, null);
+    if (sceneTarget && hit) this.highlight(sceneTarget, hit.id);
+    this.autoHover = sceneTarget;
+    // Instanced-lane hover: drive the companion highlight ring.
+    const laneTarget = ix?.options.hover ? layer : null;
+    this.setLaneHover(laneTarget, laneTarget && hit ? hit.id : null);
   }
 
-  /** Fill/show or hide the tooltip for the (changed) hover target. */
+  /** Fill/show or hide the tooltip for the (changed) hover target. An interactive lane's tooltip
+   *  takes precedence over a same-named Scene spec's. */
   private updateTooltip(hit: HoverHit | null): void {
-    const spec = hit ? this.specs.find((s) => s.name === hit.layer) : undefined;
-    const content = spec?.tooltip ? spec.tooltip(hit!.datum, hit!.id) : null;
+    const ix = hit ? this.laneInteractiveFor(hit.layer)?.ix : undefined;
+    const tip = ix ? ix.options.tooltip : hit ? this.specs.find((s) => s.name === hit.layer)?.tooltip : undefined;
+    const content = tip && hit ? tip(hit.datum, hit.id) : null;
     if (content == null) { this.tooltipEl?.hide(); return; }
     (this.tooltipEl ??= new Tooltip(this.host, this.tooltipClass)).show(content);
   }
@@ -1082,10 +1283,11 @@ export abstract class BaseEngine {
     this.clearHoverState();
   };
 
-  /** Drop transient hover artifacts (auto-highlight; tooltip). */
+  /** Drop transient hover artifacts (auto-highlight; lane hover ring; tooltip). */
   private clearHoverState(): void {
     this.lastHover = null;
     if (this.autoHover) { this.highlight(this.autoHover, null); this.autoHover = null; }
+    if (this.laneHoverLayer) this.setLaneHover(null, null);
     this.tooltipEl?.hide();
   }
   private onPointerDown = (e: PointerEvent): void => { this.downAt = [e.clientX, e.clientY]; };
@@ -1095,7 +1297,7 @@ export abstract class BaseEngine {
   private onPointerUp = (e: PointerEvent): void => {
     const d = this.downAt;
     this.downAt = null;
-    const hasSelectableLayer = this.specs.some((s) => s.selectable);
+    const hasSelectableLayer = this.specs.some((s) => s.selectable) || this.anyLaneInteractive("selectable");
     if (!d || (!this.clickCb && !hasSelectableLayer)) return;
     if (Math.hypot(e.clientX - d[0], e.clientY - d[1]) > BaseEngine.CLICK_SLOP) return;
     const r = this.host.getBoundingClientRect();
@@ -1104,12 +1306,18 @@ export abstract class BaseEngine {
     this.clickCb?.(hit, e);
     if (hasSelectableLayer) this.applySelectionGesture(hit, e);
   };
-  /** Apply selection styling (selected / others) for layers listed in `touched`,
-   *  reading the current id set from `this.selected`. */
+  /** Apply selection styling for layers listed in `touched`, reading the current id set from
+   *  `this.selected`. Scene layers restyle their drawables (`selected`/`others`); instanced lanes
+   *  refresh their companion ring overlay instead (no Scene drawables to recolor). */
   private applySelectionStyles(touched: Set<string>): void {
     for (const n of touched) {
-      const ids = this.selected.get(n);
-      this._applySelect(n, ids && ids.size ? ids : null);
+      // Lane-first: an interactive lane refreshes its ring overlay; otherwise a Scene layer restyles.
+      if (this.laneInteractiveFor(n)) {
+        this.emitHighlightFor(n);
+      } else {
+        const ids = this.selected.get(n);
+        this._applySelect(n, ids && ids.size ? ids : null);
+      }
     }
   }
   /** Apply click-driven selection gesture. Only processes hit layers that have `selectable` set;
@@ -1127,10 +1335,9 @@ export abstract class BaseEngine {
       }
       // additive + null hit = no-op
     } else {
-      // Check if the hit layer is selectable.
-      const hitSpec = this.specs.find((s) => s.name === hit.layer);
-      if (!hitSpec?.selectable) return; // hit a non-selectable layer — no selection change
-      const isMulti = hitSpec.selectable !== true && (hitSpec.selectable as { multi?: boolean }).multi === true;
+      // Check if the hit layer is selectable (Scene spec or instanced lane).
+      const { on, multi: isMulti } = this.selectableOf(hit.layer);
+      if (!on) return; // hit a non-selectable layer — no selection change
       if (!additive || !isMulti) {
         // Plain click (or additive on a single-select layer): replace whole selection with this hit
         for (const n of this.selected.keys()) touched.add(n);
@@ -1153,15 +1360,22 @@ export abstract class BaseEngine {
     if (!set) { set = new Set(); this.selected.set(layer, set); }
     return set;
   }
-  /** Flatten the retained selection into HoverHit[], resolving datums via layerIds/spec.data. */
+  /** Flatten the retained selection into HoverHit[], resolving datums + `members()` via the layer's
+   *  Scene spec or its interactive lane (so a selected aggregate's leaf ids are reachable, #105 N7c-2). */
   selection(): HoverHit[] {
     const out: HoverHit[] = [];
     for (const [layer, ids] of this.selected) {
-      const spec = this.specs.find((s) => s.name === layer);
-      const index = this.layerIds.get(layer);
-      for (const id of ids) {
-        const di = index?.get(id) ?? -1;
-        out.push({ layer, id, datum: di >= 0 && spec ? spec.data[di] : null });
+      // Lane-first: an interactive lane resolves datum + members; otherwise the Scene spec does.
+      const ix = this.laneInteractiveFor(layer)?.ix;
+      if (ix) {
+        for (const id of ids) out.push({ layer, id, datum: ix.datumOf(id), members: () => ix.members(id) });
+      } else {
+        const spec = this.specs.find((s) => s.name === layer);
+        const index = this.layerIds.get(layer);
+        for (const id of ids) {
+          const di = index?.get(id) ?? -1;
+          out.push({ layer, id, datum: di >= 0 && spec ? spec.data[di] : null, members: () => this.sceneMembers(layer, id) });
+        }
       }
     }
     return out;

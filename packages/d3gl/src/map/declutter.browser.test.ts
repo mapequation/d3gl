@@ -149,7 +149,7 @@ describe("screen-space declutter (flat-grid cull)", () => {
     host.remove();
   });
 
-  it("points() with declutter + hover stays on the Scene path (not routed to lane)", async () => {
+  it("points() with declutter + hover routes to the lane with a companion ring overlay (#105 N7c-2)", async () => {
     const W = 900, H = 450, N = 200, RADIUS = 20;
     const host = document.createElement("div");
     host.style.width = `${W}px`; host.style.height = `${H}px`;
@@ -164,15 +164,24 @@ describe("screen-space declutter (flat-grid cull)", () => {
     chart.points("hov", nodes, {
       x: (d) => d.x, y: (d) => d.y, radius: 5, fill: () => "#ef4444",
       sizeMode: "screen", declutter: RADIUS, id: (d) => d.id,
-      hover: true, // hover disqualifies the lane — stays Scene
+      hover: true, // N7c-2: a decluttered interactive layer now renders + interacts via the lane
     });
     chart.render();
 
-    // Must NOT have routed to the instanced lane.
-    expect((chart as any).instancedLanes.has("points:hov")).toBe(false);
-    // Must still be a Scene layer (has a scene group / flags).
-    const flags = (chart as any).scene.buffers("hov").flags as Uint8Array;
-    expect(flags.length).toBe(N);
+    // Routes to the lane, plus a companion highlight (ring) lane for the hover overlay.
+    expect((chart as any).instancedLanes.has("points:hov")).toBe(true);
+    expect((chart as any).instancedLanes.has("points:hov:hl")).toBe(true);
+    // No Scene spec of the same name (it would double-draw + shadow the lane in dispatch).
+    expect((chart as any).specs.find((s: { name: string }) => s.name === "hov")).toBeUndefined();
+
+    // Pick a kept point → resolves through the lane to {layer: "hov", datum, members()}.
+    const visible = (chart as any).instancedLanes.get("points:hov").lane.visible as Uint32Array;
+    expect(visible.length).toBeGreaterThan(0);
+    const keptNode = nodes[visible[0]!]!;
+    const hit = (chart as any).pick(keptNode.x, keptNode.y);
+    expect(hit?.layer).toBe("hov");
+    expect(hit?.datum).toBe(keptNode);
+    expect(typeof hit?.members).toBe("function");
     /* eslint-enable @typescript-eslint/no-explicit-any */
 
     chart.destroy();

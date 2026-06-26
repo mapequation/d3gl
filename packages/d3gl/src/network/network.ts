@@ -1,14 +1,15 @@
-import { BaseEngine, type BaseEngineOptions, type HoverHit } from "../map/base-engine.js";
+import { BaseEngine, type BaseEngineOptions, type HoverHit, type InteractiveLayerOptions, type LaneInteractive } from "../map/base-engine.js";
 import { networkLayers, frontierCircles, frontierHalos, superEdges, emitNodes, emitLinks, emitArrows, emitHalfLinks, traceFrontierFills, traceFrontierBorders, traceFrontierHalos, traceSuperHalfArrows, traceSuperLines, traceSuperArrows, rgbaCss, pickNodes, resolveNodeRadii, resolveNodeRadiusAggregate, resolveImportance, resolveFlowBorder, resolveNodeColors, resolveLinkWidthOf, resolveLinkColorOf, resolveLinkStrokeOf, flowBorderInnerRadii, type ResolvedNetworkStyle, type NodeRadiusSpec, type ImportanceSpec, type FlowBorderSpec, type ConstBorder, type LinkWidthSpec, type LinkColorSpec, type LinkStyle } from "./glyphs.js";
 import { rgb } from "d3-color";
 import { ForceLayout, seedPositions, type ForceParams } from "./force.js";
 import { multilevelLayout, type CoarsenOptions } from "./coarsen.js";
-import { buildLODTree, buildSpatialLODTree, computeLODGeometry, computeLODStyle, cut, declutterFrontier, pickFrontier, visibleWorldRect, type LODTree, type SpatialLODOptions } from "./lod.js";
+import { buildLODTree, buildSpatialLODTree, computeLODGeometry, computeLODStyle, cut, declutterFrontier, pickFrontier, visibleWorldRect, leavesUnder, type LODTree, type SpatialLODOptions } from "./lod.js";
 import { buildModuleLODTree, type ModuleNode } from "./modules.js";
 import { startWorkerLayout, type WorkerLayoutHandle } from "./worker-transport.js";
 import type { NetworkGraph } from "./graph.js";
 import type { InstancedLayer } from "../core/index.js";
 import { InstancedLane, type SelectionStrategy } from "../core/instanced-lane.js";
+import { resolveRingColors, ringCircles } from "../map/highlight-ring.js";
 
 /** Options for the network engine. Inherits sizing, `backend`, and `tooltipClass`. */
 export interface NetworkOptions extends BaseEngineOptions {}
@@ -288,6 +289,12 @@ export class Network extends BaseEngine {
   private resolvedCache: ResolvedNetworkStyle | null = null;
   /** Registry key for the single network instanced lane (#108-B). */
   private readonly NET_LANE = "network";
+  /** Registry key for the companion selection/hover ring overlay lane (#105 N7c-2), drawn on top. */
+  private readonly NET_HL_LANE = "network-highlight";
+  /** The dispatch layer name node picks resolve to (selection/hover are keyed under it). */
+  private readonly NODE_LAYER = "nodes";
+  /** Node interaction opts set via {@link interactive} (selection/hover/tooltip). Null = pick-only. */
+  private interactiveOpts: InteractiveLayerOptions | null = null;
 
   constructor(host: HTMLElement, opts: NetworkOptions = {}) {
     super(host, opts);
@@ -356,6 +363,35 @@ export class Network extends BaseEngine {
     // backend — on the worker backend the tree comes from the worker (or the settle fallback).
     this.recomputeLODGeometry();
     return this.rebuild();
+  }
+
+  /**
+   * Opt nodes/aggregates into the **visual** hover ring + click-selection (#105 N7c-2). This is
+   * separate from `on("hover" | "click")`: those callbacks fire on every pick regardless of this call
+   * (use them for your own readout/side-effects); `interactive()` is what draws the hover/selection
+   * **ring overlay** on the glyphs and manages the selection set (`selection()`, `on("select")`).
+   *
+   * Options (each **off by default** — `interactive()` is itself opt-in; omit it entirely and nodes are
+   * pick-only, with no ring and no managed selection):
+   * - `selectable` — click to select: `true`/`{}` = single (click replaces), `{ multi: true }` =
+   *   shift/cmd/ctrl-click toggles add/remove.
+   * - `hover` — draw a ring on the hovered node/aggregate.
+   * - `tooltip: (datum, id) => content` — shown for the hovered node/aggregate.
+   * - `selection: { selected, others }` — `selected.stroke` overrides the **select** ring colour
+   *   (default `#ff6a00`); the hover ring defaults to `#fff` (override via a `hover` HighlightStyle's
+   *   `stroke`). `others` (Scene dimming) is ignored on instanced glyphs — selected glyphs get a ring.
+   *
+   * The hit's `datum` is a {@link NetworkHit} (`{ aggregate, count }`); its `members()` lists the leaf
+   * node ids the target covers (1 for a leaf, the whole subtree for an aggregate). Observe selection
+   * via `on("select", (hits) => …)` or read it back with `selection()`; both carry `members()`.
+   * Pass `false` to disable (clears any current selection).
+   */
+  interactive(opts: InteractiveLayerOptions<NetworkHit> | false): this {
+    this.interactiveOpts = opts || null;
+    if (!this.interactiveOpts) this.clearLayerSelection(this.NODE_LAYER); // disabling clears managed selection
+    this.syncLane(); // re-register the lane with the interactive block + companion highlight lane
+    this.render();
+    return this;
   }
 
   /** Configure layout / supply positions (the pluggable contract proper lands in #101). */
@@ -521,7 +557,7 @@ export class Network extends BaseEngine {
       // SVG/Canvas: emit the glyphs through the PathContext seam as Scene layers, so the
       // existing pipeline renders them and toSVG() produces publication output. (LOD is a
       // WebGL-scale feature; vector backends always draw the full graph.)
-      this.unregisterInstancedLane(this.NET_LANE);
+      this.unregisterLanes();
       this.registerNetworkScene(this.graph, style, true);
       this.sceneActive = true;
     }
@@ -536,18 +572,23 @@ export class Network extends BaseEngine {
    */
   private syncLane(): void {
     const backend = this.backend();
-    if (!backend?.setInstancedLayer || !this.graph) { this.unregisterInstancedLane(this.NET_LANE); return; }
+    if (!backend?.setInstancedLayer || !this.graph) { this.unregisterLanes(); return; }
     if (this.lodReady() && this.lodTree) {
       const tree = this.lodTree;
+      const maxAgg = this.lodOptions!.maxAggregateRadius ?? Infinity;
       const strategy: SelectionStrategy = {
         select: () => this.computeFrontier(tree, this.resolvedStyleCached(this.graph!)),
         pick: (x, y, t, visible) => pickFrontier(tree, visible, x, y, t, { screenSized: this.resolvedStyleCached(this.graph!).sizeMode === "screen", maxAggregateRadius: this.lodOptions!.maxAggregateRadius }),
       };
+      const lane = new InstancedLane(strategy, (visible) => this.frontierLayers(tree, this.resolvedStyleCached(this.graph!), visible));
       this.registerInstancedLane(this.NET_LANE, {
-        lane: new InstancedLane(strategy, (visible) => this.frontierLayers(tree, this.resolvedStyleCached(this.graph!), visible)),
-        layerNames: LAYER_NAMES, dynamic: true,
-        resolve: (g) => ({ layer: "nodes", id: g, datum: { aggregate: g >= tree.leafCount, count: tree.count[g]! } satisfies NetworkHit }),
+        lane, layerNames: LAYER_NAMES, dynamic: true,
+        resolve: (g) => ({ layer: this.NODE_LAYER, id: g, datum: this.lodDatum(tree, g) }),
+        interactive: this.laneInteractive((g) => this.lodDatum(tree, g), (g) => leavesUnder(tree, g)),
       });
+      // Ring overlay reads the same radius the glyph draws at (frontierCircles): leaves/1-child uncapped,
+      // aggregates capped at maxAggregateRadius — so the ring hugs the glyph exactly at any zoom.
+      this.syncHighlightLane(lane, (g) => [tree.cx[g]!, tree.cy[g]!], (g) => (g < tree.leafCount || tree.count[g] === 1 ? tree.radius[g]! : Math.min(tree.radius[g]!, maxAgg)), true);
     } else if (!this.lodOptions) {
       const graph = this.graph;
       const strategy: SelectionStrategy = {
@@ -557,15 +598,86 @@ export class Network extends BaseEngine {
         select: () => EMPTY_VISIBLE,
         pick: (x, y, t) => pickNodes(graph.positions, this.resolvedStyleCached(graph).nodeRadii, graph.nodeCount, x, y, t, this.resolvedStyleCached(graph).sizeMode === "screen"),
       };
+      const lane = new InstancedLane(strategy, () => networkLayers(graph, this.resolvedStyleCached(graph)));
       this.registerInstancedLane(this.NET_LANE, {
-        lane: new InstancedLane(strategy, () => networkLayers(graph, this.resolvedStyleCached(graph))),
-        layerNames: LAYER_NAMES, dynamic: false,
-        resolve: (i) => ({ layer: "nodes", id: i, datum: { aggregate: false, count: 1 } satisfies NetworkHit }),
+        lane, layerNames: LAYER_NAMES, dynamic: false,
+        resolve: (i) => ({ layer: this.NODE_LAYER, id: i, datum: { aggregate: false, count: 1 } satisfies NetworkHit }),
+        interactive: this.laneInteractive(() => ({ aggregate: false, count: 1 }), (i) => [i]),
       });
+      // No-LOD: the whole graph is drawn, so every selected/hovered node index is "visible" (source=null).
+      this.syncHighlightLane(null, (i) => [graph.positions[2 * i]!, graph.positions[2 * i + 1]!], (i) => this.resolvedStyleCached(graph).nodeRadii[i]!, false);
     } else {
       // LOD on but no tree yet (worker streaming) — draw nothing, not pickable.
-      this.unregisterInstancedLane(this.NET_LANE);
+      this.unregisterLanes();
     }
+  }
+
+  /** Unregister both the node lane and its companion ring overlay (backend switch / no graph). */
+  private unregisterLanes(): void {
+    this.unregisterInstancedLane(this.NET_HL_LANE);
+    this.unregisterInstancedLane(this.NET_LANE);
+  }
+
+  private lodDatum(tree: LODTree, g: number): NetworkHit {
+    return { aggregate: g >= tree.leafCount, count: tree.count[g]! };
+  }
+
+  /** Build the lane interaction block for the node layer (#105 N7c-2), or undefined when no
+   *  `interactive()` opts are set (pick-only). `datumOf`/`members` are keyed by the node/aggregate id. */
+  private laneInteractive(datumOf: (id: number) => NetworkHit, members: (id: number) => number[]): LaneInteractive | undefined {
+    const opts = this.interactiveOpts;
+    if (!opts) return undefined;
+    return {
+      layer: this.NODE_LAYER,
+      options: opts,
+      highlightLane: this.NET_HL_LANE,
+      datumOf: (id) => datumOf(id as number),
+      members: (id) => members(id as number),
+    };
+  }
+
+  /**
+   * Register (or drop) the companion ring overlay lane. Its `select` returns the highlighted node ids
+   * currently visible — intersected with the source lane's frontier (LOD) or taken directly (no-LOD,
+   * full graph drawn) — and short-circuits to empty when nothing is highlighted (O(1) per frame). Its
+   * `emit` builds one transparent-fill ring circle per highlighted glyph; never itself pickable.
+   */
+  private syncHighlightLane(source: InstancedLane | null, centerOf: (g: number) => [number, number], radiusOf: (g: number) => number, lod: boolean): void {
+    if (!this.interactiveOpts) { this.unregisterInstancedLane(this.NET_HL_LANE); return; }
+    const colors = resolveRingColors(this.interactiveOpts);
+    const ringName = `${this.NET_HL_LANE}:ring`;
+    const sizeMode = this.resolvedStyleCached(this.graph!).sizeMode;
+    const strategy: SelectionStrategy = { select: () => this.highlightVisible(source, lod), pick: () => -1 };
+    this.registerInstancedLane(this.NET_HL_LANE, {
+      lane: new InstancedLane(strategy, (visible) => {
+        if (visible.length === 0) return [];
+        const selected = this.selectedIds(this.NODE_LAYER);
+        return [{ name: ringName, primitive: "circles", sizeMode, circles: ringCircles(visible, centerOf, radiusOf, (g) => !!selected?.has(g), colors) }];
+      }),
+      layerNames: [ringName], dynamic: true,
+      resolve: () => null,
+    });
+  }
+
+  /** Highlighted node ids currently on screen: (selection ∪ hover) ∩ frontier (LOD) or taken directly
+   *  (no-LOD). Returns the shared empty sentinel when nothing is highlighted, so the per-frame ring
+   *  re-emit costs O(1) until the user selects/hovers something. */
+  private highlightVisible(source: InstancedLane | null, lod: boolean): Uint32Array {
+    if (!this.hasHighlight(this.NODE_LAYER)) return EMPTY_VISIBLE;
+    const ids = new Set<number>();
+    const sel = this.selectedIds(this.NODE_LAYER); if (sel) for (const id of sel) ids.add(id as number);
+    const hov = this.hoveredIds(this.NODE_LAYER); if (hov) for (const id of hov) ids.add(id as number);
+    if (ids.size === 0) return EMPTY_VISIBLE;
+    if (lod && source) {
+      const vis = source.visible;
+      const out: number[] = [];
+      for (let i = 0; i < vis.length; i++) if (ids.has(vis[i]!)) out.push(vis[i]!);
+      return Uint32Array.from(out);
+    }
+    const n = this.graph!.nodeCount;
+    const out: number[] = [];
+    for (const id of ids) if (id >= 0 && id < n) out.push(id);
+    return Uint32Array.from(out);
   }
 
   /** Whether the LOD cut can run (enabled, tree built, geometry computed at least once). */

@@ -96,6 +96,7 @@ export function declutterPointsStrategy(
   width: number,
   height: number,
   screenSized: boolean,
+  winners?: Int32Array,
 ): SelectionStrategy {
   // Reusable per-frame scratch — allocated once, grown lazily inside declutterScreen.
   const scratch = declutterScratch();
@@ -114,7 +115,9 @@ export function declutterPointsStrategy(
         sy[i] = allCenters[i * 2 + 1]! * t.k + t.y;
       }
       flags.fill(0);
-      declutterScreen(n, sx, sy, halfExcl, order, w, h, 1, flags, scratch);
+      // `winners` (when provided) records each point's kept survivor so a hit can list the points
+      // absorbed under it (`members()`, #105 N7c-2). Recomputed each select (the kept set changes per zoom).
+      declutterScreen(n, sx, sy, halfExcl, order, w, h, 1, flags, scratch, undefined, winners);
       let count = 0;
       for (let i = 0; i < n; i++) if (flags[i]) count++;
       const out = new Uint32Array(count);
