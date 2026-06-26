@@ -312,10 +312,13 @@ function deriveParent(topo: LODTopology): Int32Array {
 
 /**
  * Leaf-descendant count per node — pure topology: `count[leaf] = 1`, `count[aggregate] = Σ children`,
- * one bottom-up pass by level. Filled at tree construction because it's position-independent: the
- * worker path streams `cx`/`cy`/`extent` per frame but NOT `count`, and never re-runs the per-frame
- * `computeLODPositions` on the main thread — so without this the main-thread worker tree's `count`
- * stayed 0 (#105: hovering an aggregate showed "0 nodes").
+ * one bottom-up pass by level. Only the **worker path** needs this filled at construction (see
+ * {@link lodTreeFromTopology}): the worker streams `cx`/`cy`/`extent` per frame but NOT `count`, and
+ * never re-runs the per-frame {@link computeLODPositions} on the main thread, so without it the
+ * main-thread worker tree's `count` stayed 0 (#105: hovering an aggregate showed "0 nodes"). The
+ * main-thread builders ({@link attachGeometry} callers) get `count` from `computeLODPositions`, which
+ * always runs right after they build — so they must NOT call this (it would be redundant work, and the
+ * spatial tree rebuilds per frame as positions converge). O(tree size), run once per worker topology.
  */
 function leafDescendantCounts(topo: LODTopology): Uint32Array {
   const { size, leafCount, levelCount, levelOffset, childOffset, children } = topo;
@@ -342,7 +345,9 @@ function attachGeometry(topo: LODTopology): LODTree {
     cy: new Float32Array(size),
     extent: new Float32Array(size),
     radius: new Float32Array(size),
-    count: leafDescendantCounts(topo),
+    // count is filled by computeLODPositions, which always runs right after this builder (and again per
+    // frame as the layout converges — for the spatial tree, on every rebuild). Don't fill it here.
+    count: new Uint32Array(size),
     weight: new Float32Array(size),
     border: new Float32Array(size),
     color: new Uint8Array(size * 4),
