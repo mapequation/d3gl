@@ -50,6 +50,8 @@ export class LabelLayer {
   constructor(
     private readonly container: HTMLElement,
     private readonly text: (anchor: LabelAnchor) => string,
+    /** Optional class set on each label element, for styling the overlay (font, colour, halo). */
+    private readonly className?: string,
   ) {}
 
   update(
@@ -85,6 +87,7 @@ export class LabelLayer {
         node.style.position = "absolute";
         node.style.pointerEvents = "none";
         node.style.whiteSpace = "nowrap";
+        if (this.className) node.className = this.className;
         this.container.appendChild(node);
         this.nodes.set(key, node);
       }

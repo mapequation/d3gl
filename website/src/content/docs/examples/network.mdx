@@ -270,6 +270,29 @@ nodes stay pick-only. Defaults when on: the **select** ring is `#ff6a00`, the **
 (override via `selection.selected.stroke` and a `hover` HighlightStyle's `stroke`).
 :::
 
+### Frontier labels
+
+`net.labels({ … })` puts a **handful of importance-ranked text labels on the LOD frontier** — the top
+`max` glyphs by importance (the tree's `weight` = summed flow/strength) *within the viewport*, placed at
+each leaf/aggregate centroid and re-placed as you pan and zoom. The example above labels each visible
+module aggregate with its **node count** and each leaf with its id:
+
+```ts
+net.labels({
+  max: 12,                                  // show at most 12 — the most important in view
+  labelOf: (id, info) => info.aggregate
+    ? `${info.count}`                       // a collapsed module → its size
+    : names[id],                            // a leaf → your node name
+  className: "lod-label",                   // style the overlay text (font, colour, halo)
+});
+```
+
+The engine owns the wiring — it cuts the frontier, ranks by importance, keeps the top-`max` in view, and
+reconciles an **HTML overlay** of `<div>` labels over the canvas (crisp + accessible), re-placing them on
+every pan/zoom. You supply only `labelOf` (node text is yours — the graph carries no names) and optional
+styling. Labels are an overlay, so they don't yet appear in `toSVG()`/`toPNG()` export — that lands as a
+follow-up (the active backend will draw `<text>`/`fillText`); GPU/MSDF text for very high counts is #69.
+
 ## A directed map of modules
 
 This brings it together: an **LFR planted-partition** network rendered as a **directed map of modules**.

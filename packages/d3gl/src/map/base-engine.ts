@@ -1051,8 +1051,14 @@ export abstract class BaseEngine {
     if (this.ptSpecs.size > 0 && !this.interacting) {
       for (const name of this.ptSpecs.keys()) this.repaintPassThrough(name);
     }
+    this.afterTransform(); // subclass hook: re-place HTML overlays (e.g. the network label layer)
     return this;
   }
+
+  /** Called at the end of every {@link setTransform} (zoom frame or programmatic). Subclasses override
+   *  to re-place HTML overlays that track the view — e.g. the network's frontier label layer (#105 N7b).
+   *  Runs after lanes re-emit, so a subclass can read a lane's freshly-cut `visible` set. */
+  protected afterTransform(): void {}
 
   /**
    * Hide anchored glyphs that overlap in screen space, keeping earlier (e.g. larger-clade)
