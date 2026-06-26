@@ -224,6 +224,9 @@ const DEFAULT_NODE_FILL = "#4878d0";
 const DEFAULT_LINK_WIDTH = 1;
 const DEFAULT_LINK_STROKE = "#999999";
 const LAYER_NAMES = ["links", "arrows", "node-halos", "nodes"] as const;
+/** Shared empty visible-set for selection strategies whose emit draws the whole source directly (no
+ *  per-instance gather) — e.g. the no-LOD full-graph lane — so they never allocate an all-indices array. */
+const EMPTY_VISIBLE = new Uint32Array(0);
 const DEFAULT_FORCE_ITERATIONS = 300;
 
 /** Any CSS colour → RGBA bytes (for the constant-border colour). */
@@ -548,7 +551,10 @@ export class Network extends BaseEngine {
     } else if (!this.lodOptions) {
       const graph = this.graph;
       const strategy: SelectionStrategy = {
-        select: () => Uint32Array.from({ length: graph.nodeCount }, (_, i) => i),
+        // No-LOD: the full graph is drawn directly by networkLayers and picked by pickNodes — both scan
+        // the graph and ignore `visible` — so select returns the shared empty sentinel rather than
+        // building (and retaining in lane.visible) an N-length all-indices array per register.
+        select: () => EMPTY_VISIBLE,
         pick: (x, y, t) => pickNodes(graph.positions, this.resolvedStyleCached(graph).nodeRadii, graph.nodeCount, x, y, t, this.resolvedStyleCached(graph).sizeMode === "screen"),
       };
       this.registerInstancedLane(this.NET_LANE, {
