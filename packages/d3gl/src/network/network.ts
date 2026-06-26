@@ -4,6 +4,7 @@ import { rgb } from "d3-color";
 import { ForceLayout, seedPositions, type ForceParams } from "./force.js";
 import { multilevelLayout, type CoarsenOptions } from "./coarsen.js";
 import { buildLODTree, buildSpatialLODTree, computeLODGeometry, computeLODStyle, cut, declutterFrontier, pickFrontier, visibleWorldRect, leavesUnder, type LODTree, type SpatialLODOptions } from "./lod.js";
+import { LabelLayer, type LabelAnchor } from "../labels/label-layer.js";
 import { buildModuleLODTree, type ModuleNode } from "./modules.js";
 import { startWorkerLayout, type WorkerLayoutHandle } from "./worker-transport.js";
 import type { NetworkGraph } from "./graph.js";
@@ -24,6 +25,29 @@ export interface NetworkHit {
   aggregate: boolean;
   /** Leaf nodes the target covers — 1 for a leaf, the subtree size for an aggregate. */
   count: number;
+}
+
+/**
+ * Options for {@link Network.labels} (#105 N7b) — a handful of importance-ranked text labels on the
+ * LOD frontier (leaf or aggregate centroid), in an HTML overlay that re-places on pan/zoom. Only the
+ * top {@link max} by importance within the viewport are shown, so density stays readable at any zoom.
+ */
+export interface NetworkLabelOptions {
+  /** Text for a node/aggregate id. `info` describes the glyph (`{ aggregate, count }`) — for an
+   *  aggregate return e.g. a module name or `${info.count}`, for a leaf the node's name. Return `null`
+   *  / `""` to give that glyph no label. Default: a leaf → its id, an aggregate → `"N nodes"`. */
+  labelOf?: (id: number, info: NetworkHit) => string | null | undefined;
+  /** Hard cap on labels shown — the top-`max` by importance within the viewport. **Default: no cap** —
+   *  every visible labelled glyph is shown, thinned only by collision culling. Set this to surface just
+   *  the most important few on a dense map (ranking, hence a sort, runs only when this caps). */
+  max?: number;
+  /** Importance for ranking (higher = shown first) when {@link max} caps. Default: the LOD tree `weight`
+   *  (summed flow/strength) with LOD on, node strength with LOD off. */
+  importanceOf?: (id: number, info: NetworkHit) => number;
+  /** Class set on each label element, for styling the overlay (font/colour/halo). */
+  className?: string;
+  /** Constant screen-px offset `[dx, dy]` from the glyph centroid (labels are centred on it by default). */
+  offset?: [number, number];
 }
 
 /** Visual style. Link appearance accessors arrive with the link pass (#100 N2.2). */
@@ -228,6 +252,16 @@ const LAYER_NAMES = ["links", "arrows", "node-halos", "nodes"] as const;
 /** Shared empty visible-set for selection strategies whose emit draws the whole source directly (no
  *  per-instance gather) — e.g. the no-LOD full-graph lane — so they never allocate an all-indices array. */
 const EMPTY_VISIBLE = new Uint32Array(0);
+
+/** Shared {@link NetworkHit} for no-LOD label ranking (every node is a single leaf). */
+const NO_LOD_INFO: NetworkHit = { aggregate: false, count: 1 };
+
+/** Resolve a frontier label's text: the user's `labelOf` (may return null/"" to skip a glyph), else a
+ *  default (leaf → id, aggregate → "N nodes"). */
+function labelText(opts: NetworkLabelOptions, id: number, info: NetworkHit): string | null | undefined {
+  if (opts.labelOf) return opts.labelOf(id, info);
+  return info.aggregate ? `${info.count} nodes` : String(id);
+}
 const DEFAULT_FORCE_ITERATIONS = 300;
 
 /** Any CSS colour → RGBA bytes (for the constant-border colour). */
@@ -295,6 +329,9 @@ export class Network extends BaseEngine {
   private readonly NODE_LAYER = "nodes";
   /** Node interaction opts set via {@link interactive} (selection/hover/tooltip). Null = pick-only. */
   private interactiveOpts: InteractiveLayerOptions | null = null;
+  /** Frontier label overlay (#105 N7b) + its options; null until {@link labels} is enabled. */
+  private labelLayer: LabelLayer | null = null;
+  private labelOpts: NetworkLabelOptions | null = null;
 
   constructor(host: HTMLElement, opts: NetworkOptions = {}) {
     super(host, opts);
@@ -392,6 +429,80 @@ export class Network extends BaseEngine {
     this.syncLane(); // re-register the lane with the interactive block + companion highlight lane
     this.render();
     return this;
+  }
+
+  /**
+   * Show a handful of importance-ranked text labels on the LOD frontier (#105 N7b) — leaf or
+   * aggregate centroids, the top {@link NetworkLabelOptions.max} by importance within the viewport,
+   * re-placed on pan/zoom. Rendered as an HTML overlay over the canvas (crisp + accessible); the
+   * engine owns the frontier→top-k→placement wiring, so you only supply `labelOf` (and styling via
+   * `className`). Pass `false` to remove. Export into `toSVG()`/`toPNG()` is a separate step (N7b-2).
+   */
+  labels(opts: NetworkLabelOptions | false): this {
+    if (!opts) {
+      this.labelLayer?.destroy();
+      this.labelLayer = null;
+      this.labelOpts = null;
+      return this;
+    }
+    this.labelOpts = opts;
+    if (!this.labelLayer) {
+      // The overlay is absolutely positioned over the canvas — anchor it to a positioned host.
+      if (getComputedStyle(this.host).position === "static") this.host.style.position = "relative";
+      this.labelLayer = new LabelLayer(this.host, (a) => a.text, opts.className);
+    }
+    this.refreshLabels();
+    return this;
+  }
+
+  /** Re-place the frontier labels at the current transform: pick the top-`max` visible glyphs by
+   *  importance and feed their centroids + text to the overlay. Cheap no-op when labels are off.
+   *  Called on every {@link afterTransform} (zoom/pan) and after a rebuild (frontier changed). */
+  private refreshLabels(): void {
+    const layer = this.labelLayer, opts = this.labelOpts;
+    if (!layer || !opts || !this.graph) return;
+    // Default: NO cap — show every visible glyph that has a label (collision culling thins them where
+    // they'd overlap). A finite `max` keeps only the top-k by importance; ranking (the sort below) is
+    // therefore done ONLY when capping AND there are more candidates than the cap.
+    const max = opts.max ?? Infinity;
+    const rect = visibleWorldRect(this.transform, this.width, this.height);
+    const inView = (x: number, y: number) => x >= rect.minX && x <= rect.maxX && y >= rect.minY && y <= rect.maxY;
+    const anchors: LabelAnchor[] = [];
+
+    if (this.lodReady() && this.lodTree) {
+      const tree = this.lodTree;
+      const fade = this.fadeAlpha; // per-node cross-fade alpha (#133) when crossFade is on, else null
+      const frontier = this.instancedLanes.get(this.NET_LANE)?.lane.visible ?? EMPTY_VISIBLE;
+      const cand: number[] = [];
+      for (let i = 0; i < frontier.length; i++) { const g = frontier[i]!; if (inView(tree.cx[g]!, tree.cy[g]!)) cand.push(g); }
+      const impOf = opts.importanceOf;
+      if (cand.length > max) cand.sort((a, b) => (impOf ? impOf(b, this.lodDatum(tree, b)) - impOf(a, this.lodDatum(tree, a)) : tree.weight[b]! - tree.weight[a]!));
+      for (const g of cand) {
+        const info = this.lodDatum(tree, g);
+        const text = labelText(opts, g, info);
+        if (!text) continue; // labelOf returned null/"" — this glyph has no label
+        anchors.push({ id: g, refX: tree.cx[g]!, refY: tree.cy[g]!, text, offset: opts.offset, transform: "translate(-50%, -50%)", opacity: fade ? fade[g] : undefined });
+        if (anchors.length >= max) break;
+      }
+    } else {
+      // No-LOD: rank the nodes in view by strength (weighted degree). The full graph is drawn.
+      const graph = this.graph, pos = graph.positions, strength = graph.strength;
+      const cand: number[] = [];
+      for (let i = 0; i < graph.nodeCount; i++) if (inView(pos[2 * i]!, pos[2 * i + 1]!)) cand.push(i);
+      const impOf = opts.importanceOf;
+      if (cand.length > max) cand.sort((a, b) => (impOf ? impOf(b, NO_LOD_INFO) - impOf(a, NO_LOD_INFO) : strength[b]! - strength[a]!));
+      for (const id of cand) {
+        const text = labelText(opts, id, NO_LOD_INFO);
+        if (!text) continue;
+        anchors.push({ id, refX: pos[2 * id]!, refY: pos[2 * id + 1]!, text, offset: opts.offset, transform: "translate(-50%, -50%)" });
+        if (anchors.length >= max) break;
+      }
+    }
+    layer.update(anchors, this.transform, { width: this.width, height: this.height });
+  }
+
+  protected override afterTransform(): void {
+    this.refreshLabels();
   }
 
   /** Configure layout / supply positions (the pluggable contract proper lands in #101). */
@@ -511,6 +622,8 @@ export class Network extends BaseEngine {
   /** Tear down the engine, cancelling any worker layout first. */
   override destroy(): void {
     this.stopLayout();
+    this.labelLayer?.destroy();
+    this.labelLayer = null;
     super.destroy();
   }
 
@@ -562,6 +675,7 @@ export class Network extends BaseEngine {
       this.sceneActive = true;
     }
     this.render();
+    this.refreshLabels(); // the frontier just changed (data/layout/lod/backend) — re-place labels
     return this;
   }
 

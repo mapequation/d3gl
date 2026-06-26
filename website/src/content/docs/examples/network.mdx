@@ -270,6 +270,35 @@ nodes stay pick-only. Defaults when on: the **select** ring is `#ff6a00`, the **
 (override via `selection.selected.stroke` and a `hover` HighlightStyle's `stroke`).
 :::
 
+### Frontier labels
+
+`net.labels({ … })` puts **text labels on the LOD frontier** — at each visible leaf/aggregate centroid,
+re-placed as you pan and zoom. By **default there's no cap**: every visible glyph that has a label is
+shown, thinned only by collision culling. Return `null` from `labelOf` to leave a glyph unlabelled — the
+gasket above labels only **module aggregates** (with their node count), not leaves:
+
+```ts
+net.labels({
+  labelOf: (id, info) => info.aggregate ? `${info.count}` : null, // badge modules; skip leaves
+  className: "lod-label",                                          // style the overlay (font, halo)
+});
+```
+
+Set `max` to surface only the most important few on a **dense** map — the [directed map of modules](#a-directed-map-of-modules)
+below uses `max: 12`, where flow varies so the top-12 by importance (the tree's `weight` = summed flow)
+are the dominant modules/hubs. Ranking (a sort) runs **only when `max` actually caps**, so the default
+"show all" path pays nothing for it.
+
+The engine owns the wiring — it cuts the frontier, (optionally) ranks by importance, and reconciles an
+**HTML overlay** of `<div>` labels over the canvas (crisp + accessible), re-placing them every pan/zoom.
+You supply only `labelOf` (node text is yours — the graph carries no names). With the LOD **cross-fade**
+on (`lod({ crossFade })`), labels fade in lockstep with the glyphs they sit on (per-label `opacity` from
+the same cut alpha).
+
+Labels are an HTML overlay, so they don't yet appear in `toSVG()`/`toPNG()` export — that's the N7b-2
+follow-up (the active backend draws `<text>`/`fillText`; WebGL keeps the overlay). GPU/MSDF text for very
+high counts is #69.
+
 ## A directed map of modules
 
 This brings it together: an **LFR planted-partition** network rendered as a **directed map of modules**.

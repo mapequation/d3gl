@@ -14,6 +14,10 @@ import { loadModularMap } from "./data.js";
  * lines); **Modules** uses the partition, so modules collapse to a single glyph and their connectivity
  * shows as **half-arrow super-edges that thicken with the accumulated flow** between modules. Scroll to
  * zoom: modules expand → sub-members → leaves.
+ *
+ * `net.labels({ max: 12, labelOf })` badges the **12 highest-flow glyphs in view** (#105 N7b) with their
+ * size — re-ranked + re-placed as you pan/zoom. Unlike the symmetric gasket, flow varies here, so a
+ * `max` cap meaningfully surfaces the dominant modules/hubs.
  */
 export const setup: ImperativeSetup = (host, { width, height, backend }) => {
   const net = network(host, { width, height, backend });
@@ -73,9 +77,20 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
   net.layout({ backend: "positions", positions: p }); // commit the scaled layout at the default k=1 view
   net.enableZoom([0.1, 40]); // default view; zoom out to the module map, in to single nodes
 
+  // Frontier labels (#105 N7b): here flow VARIES across modules, so capping with `max` surfaces the
+  // highest-flow glyphs in view (badged with their size). The Labels slider sets the cap (top end =
+  // "All", no limit); re-ranked + re-placed as you pan/zoom.
+  const labelStyle = document.createElement("style");
+  labelStyle.textContent = ".map-label{font:600 11px/1 system-ui,sans-serif;color:#111827;text-shadow:0 0 3px #fff,0 0 3px #fff,0 0 3px #fff}";
+  host.appendChild(labelStyle);
+  // Labels slider → max cap; the last position is "All" (no limit).
+  const LABEL_CAPS = [6, 12, 20, 30, 50, 100, Infinity];
+
   return {
     engine: net,
+    dispose: () => labelStyle.remove(),
     render: (options) => {
+      net.labels({ max: LABEL_CAPS[(options.maxLabels as number) ?? 1] ?? 12, className: "map-label", labelOf: (id, info) => (info.aggregate ? `${info.count}` : `n${id}`) });
       const sizeMode = options.sizing === "World" ? "world" : "screen";
       const expandPx = (options.expand as number) ?? 120;
       const declutter = options.declutter !== "Off";
