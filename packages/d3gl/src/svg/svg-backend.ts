@@ -1,5 +1,5 @@
-import type { Backend, RenderLayer, ViewTransform, StyleTables, DrawableVector } from "../core/index.js";
-import { svgBody, svgFromLayers, viewTransform } from "./serialize.js";
+import type { Backend, RenderLayer, ViewTransform, StyleTables, DrawableVector, TextData } from "../core/index.js";
+import { svgBody, svgFromLayers, serializeTexts, viewTransform } from "./serialize.js";
 
 const SVG_NS = "http://www.w3.org/2000/svg";
 
@@ -17,6 +17,9 @@ export class SvgBackend implements Backend {
   private defs: SVGDefsElement;
   private view: SVGGElement;
   private screen: SVGGElement;
+  /** Screen-space `<text>` labels (#105 N7b-2), drawn on top in their own group (coords are screen px). */
+  private text: SVGGElement;
+  private textData: readonly TextData[] = [];
   /** True when some layer is screen sizeMode → `view`/strokes depend on the transform,
    *  so a move must re-serialize (no O(1) transform fast path). */
   private hasScreen = false;
@@ -39,7 +42,8 @@ export class SvgBackend implements Backend {
     this.defs = document.createElementNS(SVG_NS, "defs");
     this.view = document.createElementNS(SVG_NS, "g");
     this.screen = document.createElementNS(SVG_NS, "g");
-    this.root.append(this.defs, this.view, this.screen);
+    this.text = document.createElementNS(SVG_NS, "g");
+    this.root.append(this.defs, this.view, this.screen, this.text);
     host.appendChild(this.root);
   }
 
@@ -57,6 +61,13 @@ export class SvgBackend implements Backend {
     if (i < 0 || !drawables) return;
     this.layers[i] = { ...this.layers[i]!, drawables };
     this.dirty = true;
+  }
+
+  /** Screen-space text labels (#105 N7b-2). Coords are already in screen px (no view transform), so a
+   *  pan/zoom re-pushes the set; rendered into the dedicated `text` group + included in toSVG(). */
+  setTextLayer(texts: readonly TextData[]): void {
+    this.textData = texts;
+    this.text.innerHTML = serializeTexts(texts);
   }
 
   setTransform(t: ViewTransform): void {
@@ -92,7 +103,7 @@ export class SvgBackend implements Backend {
     this.dirty = false;
   }
 
-  toSVG(): string { return svgFromLayers(this.width, this.height, this.layers, this.transform); }
+  toSVG(): string { return svgFromLayers(this.width, this.height, this.layers, this.transform, this.textData); }
   toPNG(): string {
     throw new Error("SvgBackend.toPNG: rasterize via a raster backend (canvas/webgl); SVG export is toSVG()");
   }

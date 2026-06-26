@@ -295,9 +295,11 @@ You supply only `labelOf` (node text is yours — the graph carries no names). W
 on (`lod({ crossFade })`), labels fade in lockstep with the glyphs they sit on (per-label `opacity` from
 the same cut alpha).
 
-Labels are an HTML overlay, so they don't yet appear in `toSVG()`/`toPNG()` export — that's the N7b-2
-follow-up (the active backend draws `<text>`/`fillText`; WebGL keeps the overlay). GPU/MSDF text for very
-high counts is #69.
+Labels are rendered by the **active backend**: on **WebGL** they're an HTML overlay (crisp + accessible,
+styled via `className`); on **SVG/Canvas** the backend draws them natively — SVG `<text>`, Canvas
+`fillText` — so they appear in `toSVG()`/`toPNG()` **export** (style with `font`/`color`/`halo`). Switch
+this example to the SVG backend and Export SVG for publication-ready labelled vector output. GPU/MSDF text
+(to put WebGL labels on the GPU for very high counts, or to bake them into a WebGL PNG export) is #69.
 
 ## A directed map of modules
 

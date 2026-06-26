@@ -4,7 +4,7 @@ import { rgb } from "d3-color";
 import { ForceLayout, seedPositions, type ForceParams } from "./force.js";
 import { multilevelLayout, type CoarsenOptions } from "./coarsen.js";
 import { buildLODTree, buildSpatialLODTree, computeLODGeometry, computeLODStyle, cut, declutterFrontier, pickFrontier, visibleWorldRect, leavesUnder, type LODTree, type SpatialLODOptions } from "./lod.js";
-import { LabelLayer, type LabelAnchor } from "../labels/label-layer.js";
+import { LabelLayer, placeLabels, type LabelAnchor } from "../labels/label-layer.js";
 import { buildModuleLODTree, type ModuleNode } from "./modules.js";
 import { startWorkerLayout, type WorkerLayoutHandle } from "./worker-transport.js";
 import type { NetworkGraph } from "./graph.js";
@@ -44,10 +44,20 @@ export interface NetworkLabelOptions {
   /** Importance for ranking (higher = shown first) when {@link max} caps. Default: the LOD tree `weight`
    *  (summed flow/strength) with LOD on, node strength with LOD off. */
   importanceOf?: (id: number, info: NetworkHit) => number;
-  /** Class set on each label element, for styling the overlay (font/colour/halo). */
+  /** Class set on each label element — styles the **HTML overlay** (WebGL backend) via CSS (font,
+   *  colour, text-shadow halo). Backend-native text (SVG/Canvas) can't use CSS; style it with the
+   *  {@link font}/{@link color}/{@link halo} options below (set both to match across backends). */
   className?: string;
   /** Constant screen-px offset `[dx, dy]` from the glyph centroid (labels are centred on it by default). */
   offset?: [number, number];
+  /** Font for **backend-native** text (SVG `<text>` / Canvas `fillText`, incl. `toSVG()`/`toPNG()`
+   *  export, #105 N7b-2) — a CSS font shorthand, e.g. `"600 11px sans-serif"`. Default `"12px sans-serif"`. */
+  font?: string;
+  /** Fill colour for backend-native text. Default black. */
+  color?: string;
+  /** A legibility halo stroked behind backend-native text — the export analogue of a CSS text-shadow.
+   *  `width` is the half-stroke in px. */
+  halo?: { color: string; width: number };
 }
 
 /** Visual style. Link appearance accessors arrive with the link pass (#100 N2.2). */
@@ -432,17 +442,21 @@ export class Network extends BaseEngine {
   }
 
   /**
-   * Show a handful of importance-ranked text labels on the LOD frontier (#105 N7b) — leaf or
-   * aggregate centroids, the top {@link NetworkLabelOptions.max} by importance within the viewport,
-   * re-placed on pan/zoom. Rendered as an HTML overlay over the canvas (crisp + accessible); the
-   * engine owns the frontier→top-k→placement wiring, so you only supply `labelOf` (and styling via
-   * `className`). Pass `false` to remove. Export into `toSVG()`/`toPNG()` is a separate step (N7b-2).
+   * Show text labels on the LOD frontier (#105 N7b) — leaf/aggregate centroids, re-placed on pan/zoom.
+   * **No cap by default** (every visible labelled glyph, thinned by collision); set
+   * {@link NetworkLabelOptions.max} to keep only the top-k by importance. The engine owns the
+   * frontier→rank→placement wiring; you supply `labelOf` (return `null` to skip a glyph) + styling.
+   *
+   * Rendered by the **active backend**: WebGL → an HTML overlay (crisp + accessible; style via
+   * `className`); SVG/Canvas → native `<text>`/`fillText` so labels appear in `toSVG()`/`toPNG()`
+   * (style via `font`/`color`/`halo`). Pass `false` to remove.
    */
   labels(opts: NetworkLabelOptions | false): this {
     if (!opts) {
       this.labelLayer?.destroy();
       this.labelLayer = null;
       this.labelOpts = null;
+      this.backend()?.setTextLayer?.([]); // clear any backend-native labels too
       return this;
     }
     this.labelOpts = opts;
@@ -471,8 +485,12 @@ export class Network extends BaseEngine {
 
     if (this.lodReady() && this.lodTree) {
       const tree = this.lodTree;
-      const fade = this.fadeAlpha; // per-node cross-fade alpha (#133) when crossFade is on, else null
-      const frontier = this.instancedLanes.get(this.NET_LANE)?.lane.visible ?? EMPTY_VISIBLE;
+      // Frontier source: the WebGL lane's retained cut when present, else compute it directly — on a
+      // vector backend (SVG/Canvas) the lane isn't registered (#138 draws the cut via the Scene path),
+      // so reading a missing lane's `visible` would leave labels empty.
+      const lane = this.instancedLanes.get(this.NET_LANE);
+      const frontier = lane ? lane.lane.visible : this.computeFrontier(tree, this.resolvedStyleCached(this.graph));
+      const fade = this.fadeAlpha; // set by the cut above (lane emit, or the computeFrontier just run)
       const cand: number[] = [];
       for (let i = 0; i < frontier.length; i++) { const g = frontier[i]!; if (inView(tree.cx[g]!, tree.cy[g]!)) cand.push(g); }
       const impOf = opts.importanceOf;
@@ -498,7 +516,22 @@ export class Network extends BaseEngine {
         if (anchors.length >= max) break;
       }
     }
-    layer.update(anchors, this.transform, { width: this.width, height: this.height });
+
+    // Route by backend (#105 N7b-2): a backend that draws text natively (SVG `<text>` / Canvas
+    // `fillText`) renders the labels so they survive toSVG()/toPNG(); otherwise (WebGL) the HTML
+    // overlay does. Project + cull is shared (placeLabels), so both paths place labels identically.
+    const viewport = { width: this.width, height: this.height };
+    const backend = this.backend();
+    if (backend?.setTextLayer) {
+      const survivors = placeLabels(anchors, this.transform, viewport);
+      backend.setTextLayer(survivors.map((b) => ({
+        x: b.x, y: b.y, text: String(b.text), align: "middle" as const,
+        font: opts.font, color: opts.color, halo: opts.halo, opacity: b.opacity as number | undefined,
+      })));
+      layer.update([], this.transform, viewport); // keep the overlay empty on a native-text backend
+    } else {
+      layer.update(anchors, this.transform, viewport);
+    }
   }
 
   protected override afterTransform(): void {
