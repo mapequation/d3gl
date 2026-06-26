@@ -113,6 +113,90 @@ describe("network interactive lane (#105 N7c-2)", () => {
     net.destroy();
   });
 
+  it("REPRO: example call order — interactive() before data(), screen sizeMode, enableZoom", async () => {
+    const net = network(host(), { width: 200, height: 200 });
+    await net.whenReady();
+    const g = buildGraph({ nodeCount: 4, source: [0, 2, 1], target: [1, 3, 2], directed: true });
+    const modules = [
+      { id: 0, path: [1, 1] }, { id: 1, path: [1, 2] }, { id: 2, path: [2, 1] }, { id: 3, path: [2, 2] },
+    ];
+    // Mirror the modular-lod example exactly: interactive() + on() are set in `setup`, BEFORE the
+    // render chain (data/style/lod/layout). enableZoom is also wired in setup.
+    net.enableZoom([0.1, 40]);
+    net.interactive({ selectable: { multi: true }, hover: true });
+    net.data(g).style({ sizeMode: "screen", nodeRadius: 6 }).lod({ modules, expandPx: 120, maxAggregateRadius: 26 }).layout({ backend: "positions", positions: new Float32Array([70, 90, 85, 90, 115, 110, 130, 110]) });
+
+    /* eslint-disable @typescript-eslint/no-explicit-any */
+    // 1. Is the source lane actually interactive after the chain?
+    const entry = (net as any).instancedLanes.get("network");
+    expect(entry).toBeTruthy();
+    expect(entry.interactive).toBeTruthy();
+    expect(entry.interactive.options.selectable).toBeTruthy();
+    // 2. Is the companion highlight lane registered?
+    expect((net as any).instancedLanes.has("network-highlight")).toBe(true);
+
+    net.setTransform({ k: 1, x: 0, y: 0 });
+    const tree = (net as any).lodTree;
+    const visible = entry.lane.visible as Uint32Array;
+    const agg = [...visible].find((id) => id >= tree.leafCount);
+    expect(agg).toBeDefined();
+    // 3. Does pick hit the aggregate?
+    const hit = (net as any).pick(tree.cx[agg!], tree.cy[agg!]);
+    expect(hit?.layer).toBe("nodes");
+    // 4. Does selecting it light up the ring lane?
+    net.select("nodes", [agg!]);
+    expect([...(net as any).instancedLanes.get("network-highlight").lane.visible]).toContain(agg);
+    /* eslint-enable @typescript-eslint/no-explicit-any */
+    net.destroy();
+  });
+
+  it("REPRO via real pointer events: hover rings, click selects (the path the example drives)", async () => {
+    const h = host();
+    const net = network(h, { width: 200, height: 200 });
+    await net.whenReady();
+    const g = buildGraph({ nodeCount: 4, source: [0, 2, 1], target: [1, 3, 2], directed: true });
+    const modules = [
+      { id: 0, path: [1, 1] }, { id: 1, path: [1, 2] }, { id: 2, path: [2, 1] }, { id: 3, path: [2, 2] },
+    ];
+    const selFired: number[] = [];
+    net.enableZoom([0.1, 40]);
+    net.interactive({ selectable: { multi: true }, hover: true }).on("select", (hits) => selFired.push(hits.length));
+    net.data(g).style({ sizeMode: "screen", nodeRadius: 6 }).lod({ modules, expandPx: 120, maxAggregateRadius: 26 }).layout({ backend: "positions", positions: new Float32Array([70, 90, 85, 90, 115, 110, 130, 110]) });
+    net.setTransform({ k: 1, x: 0, y: 0 });
+
+    /* eslint-disable @typescript-eslint/no-explicit-any */
+    const tree = (net as any).lodTree;
+    const agg = [...((net as any).instancedLanes.get("network").lane.visible as Uint32Array)].find((id) => id >= tree.leafCount)!;
+    const rect = h.getBoundingClientRect();
+    const cx = rect.left + tree.cx[agg], cy = rect.top + tree.cy[agg];
+
+    // Count actual backend repaints — a hover/click at a static transform must REPAINT, not just push
+    // the ring buffer (the bug: emitHighlightFor pushed the ring but never render()ed, so it stayed
+    // invisible until the next zoom). Asserting lane.visible alone misses this — we assert render() ran.
+    const backend = (net as any).handle.backend;
+    const origRender = backend.render.bind(backend);
+    let renders = 0;
+    backend.render = () => { renders++; return origRender(); };
+    const ringVisible = () => [...((net as any).instancedLanes.get("network-highlight").lane.visible as Uint32Array)];
+
+    // Hover: a pointermove over the aggregate must light the hover ring AND repaint.
+    let before = renders;
+    h.dispatchEvent(new PointerEvent("pointermove", { clientX: cx, clientY: cy, bubbles: true }));
+    expect(ringVisible()).toContain(agg);
+    expect(renders).toBeGreaterThan(before); // canvas was actually repainted with the ring
+
+    // Click (down+up, no move) over the aggregate must select it, fire on("select"), AND repaint.
+    before = renders;
+    h.dispatchEvent(new PointerEvent("pointerdown", { clientX: cx, clientY: cy, bubbles: true }));
+    h.dispatchEvent(new PointerEvent("pointerup", { clientX: cx, clientY: cy, bubbles: true }));
+    expect(net.selection().map((s) => s.id)).toContain(agg);
+    expect(selFired.at(-1)).toBeGreaterThan(0);
+    expect(renders).toBeGreaterThan(before);
+    /* eslint-enable @typescript-eslint/no-explicit-any */
+    net.destroy();
+    h.remove();
+  });
+
   it("toggling interactive(false) returns to pick-only (no managed selection)", async () => {
     const net = network(host(), { width: 200, height: 200 });
     await net.whenReady();

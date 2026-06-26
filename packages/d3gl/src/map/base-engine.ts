@@ -481,10 +481,14 @@ export abstract class BaseEngine {
 
   /** Re-emit the companion highlight lane for an interactive layer after its selection/hover set
    *  changed — refreshes only the ring overlay (reuses the source lane's retained visible set; no
-   *  base-buffer re-upload). No-op when the layer isn't a (highlight-capable) lane. */
+   *  base-buffer re-upload) and repaints. No-op when the layer isn't a (highlight-capable) lane.
+   *  The repaint is essential: this runs at a STATIC transform (a click/hover, not a zoom), so unlike
+   *  `setTransform` — which emits then renders — nothing else would draw the freshly-pushed ring. */
   private emitHighlightFor(layer: string): void {
     const found = this.laneInteractiveFor(layer);
-    if (found && this.instancedLanes.has(found.ix.highlightLane)) this.emitInstancedLane(found.ix.highlightLane);
+    if (!found || !this.instancedLanes.has(found.ix.highlightLane)) return;
+    this.emitInstancedLane(found.ix.highlightLane);
+    this.render();
   }
 
   /** Does any registered lane opt into hover/tooltip (`"hover"`) or click-select (`"selectable"`)?
