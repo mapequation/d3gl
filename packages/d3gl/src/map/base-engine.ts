@@ -1070,6 +1070,15 @@ export abstract class BaseEngine {
   protected onBackendSwapped(): void {}
 
   /**
+   * Backend-changed hook: called after EVERY backend install (first install AND swaps),
+   * after setLayers/setTransform/passThrough-repaint, but before the blanket instanced-lane
+   * re-emit. Subclasses override to re-evaluate which layers should be lane vs. Scene paths
+   * (e.g. Plot re-syncs points() layers so canvas→WebGL upgrades promote eligible layers to
+   * the instanced lane). Default: no-op.
+   */
+  protected onBackendChanged(): void {}
+
+  /**
    * Install `next` as the live backend (shared by swapBackend and the "auto" upgrade).
    * Honors the swap-supersede / destroyed guards. Destroys + detaches the previous
    * handle, pushes the current specs + transform, renders, and — only if it REPLACED an
@@ -1121,6 +1130,13 @@ export abstract class BaseEngine {
       }
     }
     if (old) this.onBackendSwapped();
+    // Notify subclasses that the backend changed (both first-install and swaps), then
+    // re-emit all registered instanced lanes for the new backend. onBackendChanged() runs
+    // first so a subclass can register/unregister lanes before the blanket re-emit here.
+    this.onBackendChanged();
+    if (this.handle?.backend.setInstancedLayer) {
+      for (const name of [...this.instancedLanes.keys()]) this.emitInstancedLane(name);
+    }
   }
 
   private async swapBackend(type: BackendType): Promise<void> {
