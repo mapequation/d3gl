@@ -27,8 +27,9 @@ export default function ScatterStress() {
           display: POINTS_LABELS,
         },
         { key: "coords", label: "Coords", options: ["screen", "world"] },
+        { key: "declutter", label: "Declutter", options: ["off", "on"] },
       ]}
-      defaults={{ coords: "world" }}
+      defaults={{ coords: "world", declutter: "off" }}
       width={900}
       height={450}
     >

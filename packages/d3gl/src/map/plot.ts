@@ -117,7 +117,7 @@ export class Plot extends BaseEngine {
     if (!info) return;
     const { data: list, ids, opts } = info;
 
-    const useLane = !opts.passThrough && !opts.clipTo && !opts.hover && !opts.selection
+    const useLane = !opts.passThrough && !opts.clipTo && !opts.hover && !opts.selection && !opts.selectable
       && opts.declutter != null && opts.declutter > 0 && !!this.backend()?.setInstancedLayer;
 
     const laneName = "points:" + name;
@@ -195,8 +195,8 @@ export class Plot extends BaseEngine {
 
   points<D>(name: string, data: readonly D[] | (() => readonly D[]), opts: PlotPointOptions<D>): LayerHandle<D> {
     if (opts.passThrough) {
-      if (opts.hover || opts.tooltip || opts.selection)
-        throw new Error("hover/tooltip/selection require a retained layer (passThrough layers are not pickable)");
+      if (opts.hover || opts.tooltip || opts.selection || opts.selectable)
+        throw new Error("hover/tooltip/selection/selectable require a retained layer (passThrough layers are not pickable)");
       if (opts.declutter) throw new Error("declutter requires a retained layer (passThrough has no per-drawable visibility flags)");
       const radius = opts.radius ?? 3;
       const radiusOf = typeof radius === "function"
@@ -236,7 +236,7 @@ export class Plot extends BaseEngine {
     // silently desync spec.data/spec.ids. The decision must NOT depend on the live backend,
     // or a layer registered on canvas would bind the real append handler and corrupt itself
     // once it upgrades to the lane.
-    const laneEligible = !opts.passThrough && !opts.clipTo && !opts.hover && !opts.selection
+    const laneEligible = !opts.passThrough && !opts.clipTo && !opts.hover && !opts.selection && !opts.selectable
       && opts.declutter != null && opts.declutter > 0;
 
     return new LayerHandle<D>(this, name, laneEligible

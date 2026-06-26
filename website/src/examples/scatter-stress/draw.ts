@@ -1,5 +1,6 @@
 import { schemeCategory10 } from "d3-scale-chromatic";
 import { plot, h } from "@mapequation/d3gl/map";
+import type { HoverHit } from "@mapequation/d3gl/map";
 import type { ImperativeSetup } from "../types.js";
 import { makePoints, type Point } from "./data.js";
 
@@ -38,10 +39,11 @@ function pointTooltip(d: Point): HTMLElement {
  * A hover/selection stress test on a `plot` scatter: the **points** slider grows the cloud
  * from 32 to ~1M points, each with a random category 1–10 (color) and a random value
  * (radius). **Hover** any point for a tooltip of all its properties; **click** a point to
- * select its whole category — every other point dims.
- * Click empty space to clear. Scroll to zoom, drag to pan. The **coords** toggle picks
- * `world` (radii scale with zoom) vs `screen` (constant-pixel radii). The hit index keeps
- * hover instant even at the top of the range. Pure d3gl; the harness owns the controls.
+ * select its whole category — every other point dims via `selectable: { multi: true }` +
+ * `on("select")`. Shift/cmd-click adds/removes from the selection. Click empty space to
+ * clear. The **coords** toggle picks `world` (radii scale with zoom) vs `screen`
+ * (constant-pixel radii). The **declutter** toggle enables screen-space overlap culling
+ * (pairs with `screen` coords). Scroll to zoom, drag to pan.
  */
 export const setup: ImperativeSetup = (host, { width, height, backend }) => {
   const W = width, H = height;
@@ -53,29 +55,36 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
       "rounded border border-border bg-card/95 px-1.5 py-0.5 text-xs text-foreground",
   });
 
-  // Click selection is wired once: it reads the clicked point's category from a lookup that
-  // `render` refreshes whenever the point cloud is rebuilt, then selects the whole category.
-  let categoryOf = new Map<string, number>();
-  chart.on("click", (hit) => {
-    if (hit?.layer !== "dots") {
-      chart.select("dots", null); // clicked empty space: clear the selection
-      return;
-    }
-    const cat = categoryOf.get(hit.id as string);
-    chart.select("dots", (d: Point) => d.category === cat);
-  });
+  // Selection count readout — absolutely-positioned overlay, pointer-events-none so it
+  // doesn't interfere with mouse interaction on the canvas below.
+  const readout = document.createElement("div");
+  readout.className =
+    "absolute bottom-2 left-2 pointer-events-none text-xs text-foreground/70 select-none";
+  host.appendChild(readout);
+
+  const updateReadout = (sel: HoverHit[]): void => {
+    const n = sel.length;
+    readout.textContent =
+      n === 0 ? "Click to select · shift/cmd-click to add" : `${n} selected · shift/cmd-click to add`;
+  };
+  updateReadout([]);
+
+  // on("select") observes all selection changes (gesture or programmatic).
+  // The gesture is enabled by `selectable: { multi: true }` on the points layer below.
+  chart.on("select", updateReadout);
+
   chart.enableZoom([0.5, 20]); // scroll to zoom, drag to pan (clicks still fire — drags don't)
 
   return {
     engine: chart,
-    // Rebuild the point cloud when `points` or `coords` change; never touches the transform,
-    // so the current zoom/pan survives an option change.
+    // Rebuild the point cloud when `points`, `coords`, or `declutter` change; never touches the
+    // transform, so the current zoom/pan survives an option change.
     render: (options) => {
       const count = 2 ** ((options.points as number) ?? 10); // 2^exp points (exp 5..16)
       const sizeMode = (options.coords as SizeMode) ?? "world";
+      const declutter = (options.declutter as string) === "on" ? 20 : undefined;
 
       const points = makePoints(count, W, H);
-      categoryOf = new Map(points.map((p) => [p.id, p.category]));
 
       chart.points("dots", points, {
         x: (d) => d.x,
@@ -84,8 +93,10 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
         fill: (d) => color(d.category),
         id: (d) => d.id,
         sizeMode,
+        declutter,
         hover: { stroke: "#fff", lineWidth: 2, radiusScale: 1.4 },
         tooltip: (d) => pointTooltip(d),
+        selectable: { multi: true },
         selection: { others: { opacity: 0.2 } },
       });
 

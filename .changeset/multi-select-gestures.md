@@ -2,4 +2,14 @@
 "@mapequation/d3gl": minor
 ---
 
-Add multi-select gestures (#79): `on("select", (selected, ev) => …)` fires whenever the selection set changes, and `selection()` returns the current set as `HoverHit[]`. Plain click selects one (replace); shift/cmd/ctrl-click toggles add/remove; clicking empty space clears. Selected features are styled via the layer's existing `selection: { selected, others }` option (others dimmed by default). It's **opt-in** — the gesture only runs once `on("select")` is registered, so existing single-click/hover behaviour is unchanged — and it's a `BaseEngine` capability, so geoMap and plot get it together. (Selected glyphs on the WebGL *instanced* lane — large decluttered scatters, network frontier — are tracked in the set now; their visual selection highlight follows in the instanced-highlight work.)
+Selection API: `selectable` layer option; `select()` + gesture both fire `on("select")` (#79).
+
+**`selectable?: boolean | { multi?: boolean }`** — new per-layer option that opts a layer into click-driven selection. `true` = single-select (plain click replaces). `{ multi: true }` = shift/cmd/ctrl-click toggles add/remove; plain click replaces. Omitting `selectable` leaves the layer un-selectable (no gesture, no click-styling) — **opt-in is preserved**.
+
+**One managed selection path** — the click gesture (on a `selectable` layer) and the programmatic `select(name, set|null)` both update the managed set, apply styling (`selection.selected`/`others`), and **fire `on("select")`**.
+
+**`on("select", (selected, ev?) => void)`** — pure observer of selection changes. `ev` is present for a gesture, `undefined` for a programmatic `select()` call. Registering it no longer enables anything (the layer's `selectable` does).
+
+**`on("click")`** — unchanged: fires first (before selection updates) on every pointer-up that passes the click-slop test, regardless of `selectable`.
+
+Migration: add `selectable: { multi: true }` (or `selectable: true`) to any layer that was previously activated by `on("select")`. The `on("select", cb)` call stays as the observer.

@@ -41,6 +41,12 @@ export interface InteractiveLayerOptions<D = any> {
    *  see `tooltipClass` for styling. Re-evaluated only when the hovered target changes;
    *  re-declare the layer to force a refresh. */
   tooltip?: (d: D, id: string | number) => string | HTMLElement | null;
+  /** Opt this layer into click-driven selection. `true` or `{}` = single-select (plain click
+   *  replaces the selection). `{ multi: true }` = shift/cmd/ctrl-click toggles add/remove;
+   *  plain click replaces. Omitting this option leaves the layer un-selectable (no gesture,
+   *  no styling on click). The pointer listeners are attached when the layer is registered —
+   *  independently of `on("select")`, which is a pure observer. */
+  selectable?: boolean | { multi?: boolean };
 }
 
 export interface LayerSpec {
@@ -69,6 +75,8 @@ export interface LayerSpec {
   hover?: HoverOption;
   /** Tooltip content for the hovered drawable (string / element / null = hide). */
   tooltip?: (d: any, id: string | number) => string | HTMLElement | null;
+  /** Opt this layer into click-driven selection (see {@link InteractiveLayerOptions.selectable}). */
+  selectable?: boolean | { multi?: boolean };
   build: (g: GroupBuilder) => void;   // rebuilds the Scene group (geo or draw)
 }
 
@@ -146,7 +154,7 @@ export abstract class BaseEngine {
   private currentBackend: BackendType;
   private hoverCb: ((hit: HoverHit | null, ev: PointerEvent) => void) | null = null;
   private clickCb: ((hit: HoverHit | null, ev: PointerEvent) => void) | null = null;
-  private selectCb: ((selected: HoverHit[], ev: PointerEvent) => void) | null = null;
+  private selectCb: ((selected: HoverHit[], ev?: PointerEvent) => void) | null = null;
   /** Selected ids per layer (gesture-driven multi-select, #79). */
   private selected = new Map<string, Set<string | number>>();
   /** Last hover pick, for cheap same-target exits while the pointer stays inside one drawable. */
@@ -318,6 +326,12 @@ export abstract class BaseEngine {
     this.host.addEventListener("pointermove", this.onPointerMove);
     this.host.addEventListener("pointerleave", this.onPointerLeave);
   }
+  /** Attach pointer down/up/cancel for selection gestures (idempotent via same handler ref). */
+  private attachSelectPointer(): void {
+    this.host.addEventListener("pointerdown", this.onPointerDown);
+    this.host.addEventListener("pointerup", this.onPointerUp);
+    this.host.addEventListener("pointercancel", this.onPointerCancel);
+  }
   /** The currently-active backend type (set by the constructor / installBackend). */
   protected backendType(): BackendType { return this.currentBackend; }
   /** The live backend instance, or null before the first swap resolves. */
@@ -326,8 +340,8 @@ export abstract class BaseEngine {
   /** Pull the declarative interaction options out of a layer-options object into the
    *  {@link LayerSpec} fields. Shared by `Plot.layer()`/`Plot.points()` and `GeoMap.layer()`
    *  so the hover/tooltip/selection contract lives in exactly one place. */
-  protected interactionFields(opts: InteractiveLayerOptions): Pick<LayerSpec, "selection" | "hover" | "tooltip"> {
-    return { selection: opts.selection, hover: opts.hover, tooltip: opts.tooltip };
+  protected interactionFields(opts: InteractiveLayerOptions): Pick<LayerSpec, "selection" | "hover" | "tooltip" | "selectable"> {
+    return { selection: opts.selection, hover: opts.hover, tooltip: opts.tooltip, selectable: opts.selectable };
   }
 
   /** Register (or replace) an instanced selection lane and emit it once if a backend is ready. */
@@ -406,6 +420,8 @@ export abstract class BaseEngine {
     if (active) this.buildHighlight(spec, active.ids, active.styleOrDraw);
     // Attach pointer listeners if this layer needs auto-hover or tooltip (idempotent via same ref).
     if (spec.hover || spec.tooltip) this.attachPointer();
+    // Attach pointer down/up when the layer is selectable (idempotent via same ref).
+    if (spec.selectable) this.attachSelectPointer();
     this.pushLayers();
   }
 
@@ -594,27 +610,50 @@ export abstract class BaseEngine {
    * only, nothing per frame. `null` clears. NOTE: selection rewrites the layer's
    * whole override map, so it replaces earlier setStyle overrides (one table, last
    * write wins) — and select(null) restores plain base styles.
+   *
+   * Also updates the managed selection set and fires `on("select")` with `ev = undefined`
+   * (programmatic — no PointerEvent), so callers can observe programmatic selection the
+   * same way they observe gesture selection.
    */
   select(name: string, set: readonly (string | number)[] | ((d: any, i: number) => boolean) | null): this {
     const spec = this.specs.find((s) => s.name === name);
     if (!spec) return this;
-    this.styleOverrides.delete(name);
-    if (set !== null) {
-      const members = typeof set === "function"
-        ? new Set(spec.ids.filter((_, i) => set(spec.data[i], i)))
+    // Resolve function selectors to an id set once (stored + used for styling).
+    const resolved: Set<string | number> | null = set === null ? null
+      : typeof set === "function"
+        ? new Set(spec.ids.filter((_, i) => (set as (d: any, i: number) => boolean)(spec.data[i], i)))
         : new Set(set);
-      const selected = spec.selection?.selected;
+    // Update managed selection set (mirrors what the gesture does).
+    if (resolved === null) this.selected.delete(name);
+    else this.selected.set(name, resolved);
+    // Apply styling.
+    this._applySelect(name, resolved);
+    // Fire the observer (ev undefined = programmatic).
+    this.selectCb?.(this.selection(), undefined);
+    return this;
+  }
+
+  /** Internal: apply selection styling for `name` given a resolved id set (or null to clear).
+   *  Does NOT touch `this.selected` or fire `selectCb`. Used by both the public `select()`
+   *  (which manages the set + fires the event) and `applySelectionStyles` (which reads
+   *  `this.selected` and refreshes styling after a gesture). */
+  private _applySelect(name: string, resolved: Set<string | number> | readonly (string | number)[] | null): void {
+    const spec = this.specs.find((s) => s.name === name);
+    if (!spec) return;
+    this.styleOverrides.delete(name);
+    if (resolved !== null) {
+      const members = resolved instanceof Set ? resolved : new Set(resolved);
+      const selectedStyle = spec.selection?.selected;
       const others = spec.selection?.others ?? { opacity: 0.3 };
       const map = new Map<string | number, StyleOverride>();
       for (const id of spec.ids) {
-        const o = members.has(id) ? selected : others;
+        const o = members.has(id) ? selectedStyle : others;
         if (o) map.set(id, o);
       }
       this.styleOverrides.set(name, map);
     }
     this.restyle(spec, spec.ids);
     this.pushStyles(spec);
-    return this;
   }
 
   /**
@@ -929,8 +968,8 @@ export abstract class BaseEngine {
     return this;
   }
   on(event: "hover" | "click", cb: (hit: HoverHit | null, ev: PointerEvent) => void): this;
-  on(event: "select", cb: (selected: HoverHit[], ev: PointerEvent) => void): this;
-  on(event: "hover" | "click" | "select", cb: ((hit: HoverHit | null, ev: PointerEvent) => void) | ((selected: HoverHit[], ev: PointerEvent) => void)): this {
+  on(event: "select", cb: (selected: HoverHit[], ev?: PointerEvent) => void): this;
+  on(event: "hover" | "click" | "select", cb: ((hit: HoverHit | null, ev: PointerEvent) => void) | ((selected: HoverHit[], ev?: PointerEvent) => void)): this {
     if (event === "hover") {
       this.hoverCb = cb as (hit: HoverHit | null, ev: PointerEvent) => void;
       this.attachPointer();
@@ -942,11 +981,9 @@ export abstract class BaseEngine {
       this.host.addEventListener("pointerup", this.onPointerUp);
       this.host.addEventListener("pointercancel", this.onPointerCancel);
     } else if (event === "select") {
-      this.selectCb = cb as (selected: HoverHit[], ev: PointerEvent) => void;
-      // Same pointer listeners as "click" — idempotent if already attached.
-      this.host.addEventListener("pointerdown", this.onPointerDown);
-      this.host.addEventListener("pointerup", this.onPointerUp);
-      this.host.addEventListener("pointercancel", this.onPointerCancel);
+      // Pure observer — registering on("select") does NOT attach gesture listeners.
+      // Gesture attachment happens in registerLayer when a layer has `selectable` set.
+      this.selectCb = cb as (selected: HoverHit[], ev?: PointerEvent) => void;
     }
     return this;
   }
@@ -1058,41 +1095,57 @@ export abstract class BaseEngine {
   private onPointerUp = (e: PointerEvent): void => {
     const d = this.downAt;
     this.downAt = null;
-    if (!d || (!this.clickCb && !this.selectCb)) return;
+    const hasSelectableLayer = this.specs.some((s) => s.selectable);
+    if (!d || (!this.clickCb && !hasSelectableLayer)) return;
     if (Math.hypot(e.clientX - d[0], e.clientY - d[1]) > BaseEngine.CLICK_SLOP) return;
     const r = this.host.getBoundingClientRect();
     const hit = this.pick(e.clientX - r.left, e.clientY - r.top);
+    // on("click") fires first (raw escape hatch), then selection update for selectable layers.
     this.clickCb?.(hit, e);
-    if (this.selectCb) this.updateSelection(hit, e);
+    if (hasSelectableLayer) this.applySelectionGesture(hit, e);
   };
-  /** Update the multi-select set and apply styling + fire selectCb. Plain click replaces;
-   *  shift/cmd/ctrl-click toggles. Called only when selectCb is registered. */
-  private updateSelection(hit: HoverHit | null, ev: PointerEvent): void {
+  /** Apply selection styling (selected / others) for layers listed in `touched`,
+   *  reading the current id set from `this.selected`. */
+  private applySelectionStyles(touched: Set<string>): void {
+    for (const n of touched) {
+      const ids = this.selected.get(n);
+      this._applySelect(n, ids && ids.size ? ids : null);
+    }
+  }
+  /** Apply click-driven selection gesture. Only processes hit layers that have `selectable` set;
+   *  a plain click on a non-selectable layer (e.g. a hover-only layer) is ignored for selection.
+   *  Plain click replaces; shift/cmd/ctrl on a multi-selectable layer toggles. */
+  private applySelectionGesture(hit: HoverHit | null, ev: PointerEvent): void {
     const additive = ev.shiftKey || ev.metaKey || ev.ctrlKey;
     const touched = new Set<string>(); // layers whose styling must refresh
+
     if (!hit) {
+      // Click on empty space: clear all selectable layers' selections.
       if (!additive) {
         for (const n of this.selected.keys()) touched.add(n);
         this.selected.clear();
       }
       // additive + null hit = no-op
-    } else if (!additive) {
-      // Plain click: replace whole selection with just this hit
-      for (const n of this.selected.keys()) touched.add(n);
-      this.selected.clear();
-      this.getOrCreateLayerSet(hit.layer).add(hit.id);
-      touched.add(hit.layer);
     } else {
-      // Additive: toggle this hit in its layer's set
-      const set = this.getOrCreateLayerSet(hit.layer);
-      if (set.has(hit.id)) set.delete(hit.id); else set.add(hit.id);
-      touched.add(hit.layer);
+      // Check if the hit layer is selectable.
+      const hitSpec = this.specs.find((s) => s.name === hit.layer);
+      if (!hitSpec?.selectable) return; // hit a non-selectable layer — no selection change
+      const isMulti = hitSpec.selectable !== true && (hitSpec.selectable as { multi?: boolean }).multi === true;
+      if (!additive || !isMulti) {
+        // Plain click (or additive on a single-select layer): replace whole selection with this hit
+        for (const n of this.selected.keys()) touched.add(n);
+        this.selected.clear();
+        this.getOrCreateLayerSet(hit.layer).add(hit.id);
+        touched.add(hit.layer);
+      } else {
+        // Additive on a multi-select layer: toggle this hit
+        const set = this.getOrCreateLayerSet(hit.layer);
+        if (set.has(hit.id)) set.delete(hit.id); else set.add(hit.id);
+        touched.add(hit.layer);
+      }
     }
-    for (const n of touched) {
-      const ids = this.selected.get(n);
-      this.select(n, ids && ids.size ? [...ids] : null);
-    }
-    this.selectCb!(this.selection(), ev);
+    this.applySelectionStyles(touched);
+    this.selectCb?.(this.selection(), ev);
   }
   /** Get (or create) the per-layer id set. */
   private getOrCreateLayerSet(layer: string): Set<string | number> {

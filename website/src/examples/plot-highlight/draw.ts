@@ -38,6 +38,7 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
     id: (r) => `r${r.group}`,
     hover: { stroke: "#fff", lineWidth: 2 },
     tooltip: (r) => `cluster ${r.group}`,
+    selectable: { multi: true },
     selection: { others: { opacity: 0.15 } },
   });
 
@@ -49,6 +50,7 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
     id: (d) => d.id,
     hover: { stroke: "#fff", lineWidth: 2, radiusScale: 1.4 },
     tooltip: (d) => `cluster ${d.group} · ${d.value.toFixed(2)}`,
+    selectable: { multi: true },
     selection: { others: { opacity: 0.25 } },
   });
 
@@ -66,8 +68,8 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
   };
   updateReadout([]);
 
-  // on("select") is the multi-select gesture: plain click = replace, shift/cmd/ctrl-click = toggle,
-  // click empty = clear. Styling is applied automatically via the `selection` layer option.
+  // on("select") is a pure observer: fires on every selection change (gesture or programmatic).
+  // The gesture itself is enabled by `selectable: { multi: true }` on each layer above.
   chart.on("select", updateReadout);
 
   chart.enableZoom([0.5, 20]); // scroll to zoom, drag to pan (clicks still fire — drags don't)
