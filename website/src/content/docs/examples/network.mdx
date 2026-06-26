@@ -237,6 +237,29 @@ every node.
   <ModularLod client:visible slot="demo" />
 </ExampleCard>
 
+The example above is also **interactive**: hover a node or module to ring it, and click to select (the
+caption reports what the selection covers). That comes from one opt-in call:
+
+```ts
+net.interactive({ selectable: { multi: true }, hover: true })
+   .on("select", (hits) => {
+     // hits[].members() lists the leaf node ids each glyph covers — one node for a leaf,
+     // the whole subtree for a collapsed module aggregate.
+     const leaves = hits.flatMap((h) => h.members?.() ?? []);
+     console.log(`selected ${hits.length} glyphs covering ${leaves.length} leaf nodes`);
+   });
+```
+
+`interactive()` opts the nodes/aggregates (which render on the GPU instanced lane, not as DOM/Scene
+drawables) into the same selection machinery as ordinary layers. Selection and hover are drawn as a
+**ring overlay** (a companion instanced lane drawn on top — translucent, no per-frame rebuild), and the
+hit handed to `on("hover" | "click" | "select")` (and every entry of `selection()`) carries a lazy
+`members()`: for an **aggregate** it walks the LOD subtree to its leaf node ids, for a leaf it returns
+just itself. Use it to read out the members of a clicked module — names, stats, a filter. `members()` is
+the **same call on every engine** (network aggregates, decluttered plot points, geo markers); only the
+glyphs that aggregate something return more than `[id]`. The whole selection set is observable with
+`net.selection()` and persists across pan/zoom; nothing is highlighted ⇒ zero added per-frame cost.
+
 ## A directed map of modules
 
 This brings it together: an **LFR planted-partition** network rendered as a **directed map of modules**.

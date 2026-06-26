@@ -33,6 +33,12 @@ export function declutterScratch(): DeclutterScratch {
  * (#133): a glyph transitioning across the expand threshold ignores its **ancestor** as an occluder — so
  * a fading parent doesn't cull its fading-in children — while children still declutter against siblings.
  * Omitted ⇒ no ignored pairs (zero added cost).
+ *
+ * `winners` (optional, length ≥ `count`) records, for each glyph, the **kept** glyph it is represented by:
+ * a kept glyph maps to itself (`winners[i] = i`), a hidden glyph to the already-kept glyph that occluded
+ * it (`winners[i] = p`). One extra store per glyph in the loop we already run. Lets a hit on the kept
+ * survivor enumerate the glyphs absorbed under it (`members()`): scan for all `i` with `winners[i] === K`
+ * (#105 N7c-2). Omitted ⇒ not tracked (zero added cost).
  */
 export function declutterScreen(
   count: number,
@@ -46,6 +52,7 @@ export function declutterScreen(
   out: Uint8Array,
   scratch: DeclutterScratch = declutterScratch(),
   ignore?: (i: number, j: number) => boolean,
+  winners?: Int32Array,
 ): Uint8Array {
   const radAt = typeof radius === "number" ? (_i: number) => radius : (i: number) => radius[i]!;
   let maxR = 1;
@@ -73,6 +80,7 @@ export function declutterScreen(
     const r = radAt(i);
     if (x < 0 || y < 0 || x > width || y > height) {
       out[i] = 1; // off-screen centre ⇒ keep, and don't insert (so it can't occlude on-screen glyphs)
+      if (winners) winners[i] = i; // a kept glyph represents itself
       continue;
     }
     let cx = Math.floor(x / cell) + 1;
@@ -91,6 +99,7 @@ export function declutterScreen(
           if (dx * dx + dy * dy < thresh * thresh) {
             if (ignore && ignore(i, p)) continue; // e.g. a cross-fading glyph ignores its ancestor
             occluded = true;
+            if (winners) winners[i] = p; // absorbed under the kept glyph that occluded it
             break;
           }
         }
@@ -98,6 +107,7 @@ export function declutterScreen(
     }
     if (!occluded) {
       out[i] = 1;
+      if (winners) winners[i] = i; // a kept glyph represents itself
       const c = cy * cols + cx;
       next[i] = head[c]!;
       head[c] = i;
@@ -105,5 +115,16 @@ export function declutterScreen(
       out[i] = 0;
     }
   }
+  return out;
+}
+
+/**
+ * Enumerate the glyphs a kept survivor represents from a {@link declutterScreen} `winners` array:
+ * every glyph mapped to `kept` (including `kept` itself, which maps to itself). O(count) inverse scan —
+ * run lazily on a hit (`members()`), never per frame. Returns indices in source order.
+ */
+export function declutterMembers(winners: Int32Array, kept: number, count: number): number[] {
+  const out: number[] = [];
+  for (let i = 0; i < count; i++) if (winners[i] === kept) out.push(i);
   return out;
 }

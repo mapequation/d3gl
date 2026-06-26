@@ -186,6 +186,11 @@ export class Scene {
     this.groups.set(name, data);
   }
 
+  /** Drop a group entirely (vs an empty re-{@link group}, which keeps a zero-drawable entry). */
+  remove(name: string): void {
+    this.groups.delete(name);
+  }
+
   /** Append more drawables to an existing group (vs group(), which replaces it).
    *  New drawables' integer drawableIds continue after the existing ones; a
    *  duplicate domain id (the caller's string/number id) throws. NOTE: not atomic

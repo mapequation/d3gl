@@ -200,6 +200,27 @@ export function flattenHierarchyToTopology(hierarchy: Hierarchy, leafCount: numb
   return topo;
 }
 
+/**
+ * Enumerate the leaf descendants of tree node `g` (its global ids `< leafCount`, which equal the
+ * original graph node ids). A leaf returns `[itself]`; an aggregate is a DFS over the children CSR.
+ * O(subtree leaves), run lazily on a hit (`members()`) — never per frame. Sorted ascending so the
+ * member list is deterministic regardless of traversal order. Works for coarsening and module trees
+ * (both carry the children CSR). #105 N7c-2: answers "which leaf nodes are inside this aggregate?".
+ */
+export function leavesUnder(tree: LODTopology, g: number): number[] {
+  const { leafCount, childOffset, children } = tree;
+  if (g < leafCount) return [g];
+  const out: number[] = [];
+  const stack = [g];
+  while (stack.length > 0) {
+    const n = stack.pop()!;
+    if (n < leafCount) { out.push(n); continue; }
+    for (let c = childOffset[n]!; c < childOffset[n + 1]!; c++) stack.push(children[c]!);
+  }
+  out.sort((a, b) => a - b);
+  return out;
+}
+
 /** Directed edges (source/target/weight) used to build the flow-weighted super-edge CSR. */
 export interface SuperEdgeInput {
   source: ArrayLike<number>;
