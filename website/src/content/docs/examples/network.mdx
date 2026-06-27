@@ -260,6 +260,13 @@ the **same call on every engine** (network aggregates, decluttered plot points, 
 glyphs that aggregate something return more than `[id]`. The whole selection set is observable with
 `net.selection()` and persists across pan/zoom; nothing is highlighted ⇒ zero added per-frame cost.
 
+When the lane is **multi**-selectable (`selectable: { multi: true }`), **shift+drag** draws a **marquee**
+that adds every node/aggregate whose centre falls in the box to the selection — additive, like shift+click,
+and observable through the same `on("select")` / `selection()`. No extra call: it's built into the gesture
+layer and gated on multi-select (plain drag still pans; shift is reserved for the box). It's a CPU range
+query over the screen-bounded frontier — exact and cheap even at millions of nodes, no GPU readback (the
+[link picker](#picking-links) needs the GPU because links are thin; node *centres* in a rect don't).
+
 :::note[`on("hover")` vs `interactive({ hover })` — two different things]
 `on("hover", cb)` and `on("click", cb)` are **raw pick callbacks**: they fire on every pick whether or
 not you call `interactive()`, and they draw nothing — you do whatever you want with the hit (the example

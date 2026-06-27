@@ -2,6 +2,7 @@ import { rgb } from "d3-color";
 import type { InstancedCirclesData, InstancedLinesData, InstancedArrowsData, InstancedHalfArrowsData, InstancedLayer, GroupBuilder } from "../core/index.js";
 import type { NetworkGraph } from "./graph.js";
 import type { LODTree, LODTransform } from "./lod.js";
+import type { ScreenRect } from "../core/instanced-lane.js";
 import { halfLinkGeometry, traceHalfLink, scaleHalfLink } from "./half-link.js";
 
 /**
@@ -437,6 +438,21 @@ export function pickNodes(
     if (dx * dx + dy * dy <= pr * pr) found = i;
   }
   return found;
+}
+
+/**
+ * Marquee region query for the no-LOD full graph (#159): the node indices whose **centre** projects
+ * inside `rect` (CSS px). Centre-in-rect is sizeMode-independent (only the radius differs by sizeMode,
+ * not the centre), so unlike {@link pickNodes} this needs no radius. O(node count), like pickNodes.
+ */
+export function regionNodes(positions: Float32Array, count: number, rect: ScreenRect, t: LODTransform): number[] {
+  const out: number[] = [];
+  for (let i = 0; i < count; i++) {
+    const sx = positions[2 * i]! * t.k + t.x;
+    const sy = positions[2 * i + 1]! * t.k + t.y;
+    if (sx >= rect.x0 && sx <= rect.x1 && sy >= rect.y0 && sy <= rect.y1) out.push(i);
+  }
+  return out;
 }
 
 export interface FrontierStyleResolved {

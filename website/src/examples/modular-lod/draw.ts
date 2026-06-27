@@ -14,7 +14,9 @@ const DEPTHS = [2, 3, 4, 5, 6]; // 27 → 2187 nodes
  *
  * `net.interactive({ selectable, hover })` opts the nodes/aggregates into selection (#105 N7c-2):
  * **hover** shows a ring, **click** selects (shift/⌘-click adds), and `on("select")` reports each hit's
- * `members()` — the **leaf node ids inside a clicked module aggregate** — shown in the caption.
+ * `members()` — the **leaf node ids inside a clicked module aggregate** — shown in the caption. With a
+ * **multi**-selectable lane, **shift+drag** draws a **marquee** (#159) that adds every node/aggregate
+ * whose centre falls in the box (a CPU range query over the frontier — no extra setup; plain drag pans).
  *
  * `net.pickLinks()` adds **pixel-exact link picking** (#141, WebGL): the links are thin bent strips, so
  * resolving "the link you see" uses a GPU-readback pass behind the same pick seam. Hover a link (or a
@@ -40,7 +42,7 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
   // tab stays pure d3gl + a tiny DOM readout. pointer-events:none so it never intercepts pan/zoom.
   const caption = document.createElement("div");
   caption.style.cssText = "position:absolute;left:8px;bottom:8px;max-width:calc(100% - 16px);padding:4px 8px;font:12px/1.4 ui-monospace,monospace;color:#e5e7eb;background:rgba(17,24,39,0.72);border-radius:4px;pointer-events:none;white-space:pre-wrap";
-  const HINT = "Hover a node/module to ring it · hover a link to inspect it · click to select (⇧/⌘ adds)";
+  const HINT = "Hover to ring · hover a link to inspect · click to select (⇧/⌘ adds) · ⇧+drag to box-select";
   caption.textContent = HINT;
   host.appendChild(caption);
 

@@ -51,16 +51,18 @@ describe("GPU-readback link picking", () => {
     backend.setInstancedLayer(twoLinks(true));
     backend.setTransform({ k: 1, x: 0, y: 0 });
     // The async path returns the *previous* call's result (one PBO frame of lag) and never blocks, so a
-    // settled cursor converges once the readback fence signals. Poll (the per-pointermove cadence) and
-    // assert it lands on the right id — the meaningful hover guarantee. The budget is generous because the
-    // headless software-GL fence can lag many frames under full-suite GPU contention (on a real GPU this
-    // is one ~16ms frame); break as soon as it converges so a healthy run is fast.
+    // settled cursor converges once the readback fence signals. Poll and assert it lands on the right id —
+    // the meaningful hover guarantee; break as soon as it converges so a healthy run is fast. The interval
+    // must exceed the readback latency: the return-previous ping-pong harvests slot N's readback on call
+    // N+1, so if a call comes back before that readback finished it abandons it and `last` never advances.
+    // On a real GPU readback is sub-ms (the real ~16ms rAF cadence is ample); headless software-GL under
+    // full-suite contention can take tens of ms, so poll slowly here.
     async function hoverSettle(x: number, y: number, expected: number): Promise<number> {
       let id = -1;
-      for (let i = 0; i < 120; i++) {
+      for (let i = 0; i < 60; i++) {
         id = backend.pickInstanced!(x, y, false);
         if (id === expected) return id;
-        await new Promise((r) => setTimeout(r, 4));
+        await new Promise((r) => setTimeout(r, 50));
       }
       return id;
     }
