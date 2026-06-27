@@ -229,8 +229,10 @@ in float a_width;           // per-instance line width
 in vec4 a_color;            // per-instance RGBA (unorm8x4 -> 0..1)
 in float a_bend;            // per-instance control offset ⟂ to the chord, as a fraction of |chord| (0 = straight)
 out vec4 v_color;
+flat out float v_id;        // instance index for GPU-readback picking (#141); ignored by FILL_FS, read by PICK_FS
 void main() {
   v_color = a_color;
+  v_id = float(gl_InstanceID);
   float t = a_corner.x;
   float side = a_corner.y;
   float hw = a_width * 0.5;
@@ -281,12 +283,14 @@ in float a_radius;    // per-instance target node radius (setback to the boundar
 in float a_bend;      // per-instance bend, matching the link's, so the head aligns with its end tangent
 in vec4 a_color;
 out vec4 v_color;
+flat out float v_id;  // instance index for GPU-readback picking (#141); ignored by FILL_FS, read by PICK_FS
 vec2 worldToPx(vec2 w) {
   vec2 clip = (u_transform * vec3(w, 1.0)).xy;
   return vec2((clip.x + 1.0) * 0.5 * u_viewport.x, (1.0 - clip.y) * 0.5 * u_viewport.y);
 }
 void main() {
   v_color = a_color;
+  v_id = float(gl_InstanceID);
   bool screen = u_screen > 0.5;
   vec2 src = screen ? worldToPx(a_source) : a_source;
   vec2 tgt = screen ? worldToPx(a_target) : a_target;
@@ -331,6 +335,7 @@ in vec2 a_widths;     // per-instance (width, oppositeWidth)
 in float a_bend;      // per-instance bend (world or px per sizeMode; sign picks the bow side)
 in vec4 a_color;      // per-instance RGBA (unorm8x4 -> 0..1)
 out vec4 v_color;
+flat out float v_id;  // instance index for GPU-readback picking (#141); ignored by FILL_FS, read by PICK_FS
 vec2 bez(vec2 p0, vec2 c, vec2 p2, float t) {
   float u = 1.0 - t;
   return u * u * p0 + 2.0 * u * t * c + t * t * p2;
@@ -341,6 +346,7 @@ vec2 worldToPx(vec2 w) {
 }
 void main() {
   v_color = a_color;
+  v_id = float(gl_InstanceID);
   float code = a_kind.x;
   float t = a_kind.y;
   bool screen = u_screen > 0.5;

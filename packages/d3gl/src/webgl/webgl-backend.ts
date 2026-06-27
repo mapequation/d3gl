@@ -1,10 +1,11 @@
 import { luma } from "@luma.gl/core";
-import { webgl2Adapter } from "@luma.gl/webgl";
+import { webgl2Adapter, WebGLDevice, WEBGLFramebuffer } from "@luma.gl/webgl";
 import type { Device, Framebuffer } from "@luma.gl/core";
 import type { Backend, RenderLayer, RenderDelta, ViewTransform, InstancedLayer } from "../core/index.js";
 import type { GroupBuffers, GroupBufferDelta, PassThroughLayer, DrawBatch, StyleTables, DrawableVector } from "../core/index.js";
 import { GroupRenderer } from "./renderer.js";
 import { InstancedCircles, InstancedLines, InstancedArrows, InstancedHalfArrows } from "./instanced.js";
+import { PickReadback } from "./pick-readback.js";
 import { clipFromView } from "./transform.js";
 import { toPNG } from "./png.js";
 import { svgFromLayers } from "../svg/index.js";
@@ -23,6 +24,14 @@ export class WebGLBackend implements Backend {
   private order: string[] = [];
   /** GPU-instanced primitive layers (the network lane), drawn after retained layers. */
   private instanced = new Map<string, InstancedCircles | InstancedLines | InstancedArrows | InstancedHalfArrows>();
+  /** Names of instanced layers that opted into the GPU-readback pick pass (#141; link layers only). */
+  private pickable = new Set<string>();
+  /** Offscreen id-encoded pick target (device px). Lazily created when first picked; resized on demand. */
+  private pickFbo: Framebuffer | null = null;
+  /** Stall-free single-pixel readback (double-buffered PBO). Lazily created with the pick FBO. */
+  private picker: PickReadback | null = null;
+  /** Pick FBO is stale (link geometry or transform changed) ⇒ re-render the pick pass before reading. */
+  private pickDirty = true;
   private clipMatrix: Float32Array;
   private viewTransform: ViewTransform = { k: 1, x: 0, y: 0 };
   private globe: GlobeRenderer | null = null; // non-null ⇒ globe mode active
@@ -191,18 +200,24 @@ export class WebGLBackend implements Backend {
 
   setInstancedLayer(layer: InstancedLayer): void {
     this.instanced.get(layer.name)?.destroy();
+    // Link layers (lines/arrows/half-arrows) may opt into the GPU-readback pick pass (#141); the
+    // primitive builds an extra id-encoded pick model when `pick` is set. Nodes (circles) never do.
+    const pick = layer.primitive !== "circles" && !!layer.pickable;
     const r =
       layer.primitive === "lines"
-        ? new InstancedLines(this.device, layer.lines, this.width, this.height)
+        ? new InstancedLines(this.device, layer.lines, this.width, this.height, pick)
         : layer.primitive === "arrows"
-          ? new InstancedArrows(this.device, layer.arrows, this.width, this.height)
+          ? new InstancedArrows(this.device, layer.arrows, this.width, this.height, pick)
           : layer.primitive === "half-arrows"
-            ? new InstancedHalfArrows(this.device, layer.halfArrows, this.width, this.height)
+            ? new InstancedHalfArrows(this.device, layer.halfArrows, this.width, this.height, pick)
             : new InstancedCircles(this.device, layer.circles, this.width, this.height);
     r.setTransform(this.clipMatrix);
     r.setViewport(this.width, this.height);
     r.setSizeMode(layer.sizeMode ?? "world");
     this.instanced.set(layer.name, r);
+    if (pick) this.pickable.add(layer.name);
+    else this.pickable.delete(layer.name);
+    this.pickDirty = true;
   }
 
   /**
@@ -224,6 +239,8 @@ export class WebGLBackend implements Backend {
   removeInstancedLayer(name: string): void {
     this.instanced.get(name)?.destroy();
     this.instanced.delete(name);
+    this.pickable.delete(name);
+    this.pickDirty = true;
   }
 
   setTransform(t: ViewTransform): void {
@@ -231,6 +248,7 @@ export class WebGLBackend implements Backend {
     this.clipMatrix = clipFromView(t, this.width, this.height);
     for (const r of this.renderers.values()) r.setTransform(this.clipMatrix);
     for (const r of this.instanced.values()) r.setTransform(this.clipMatrix);
+    this.pickDirty = true; // links moved with the view ⇒ the pick FBO must be re-rendered before the next read
   }
 
   /** Resize the onscreen canvas drawing buffer (luma owns it via useDevicePixels), recompute
@@ -267,6 +285,8 @@ export class WebGLBackend implements Backend {
       depthStencilAttachment: "depth24plus-stencil8",
     });
     this.bakeDirty = true;
+    // The pick FBO is device-px and size-checked in ensurePickFbo (recreated on mismatch); just mark stale.
+    this.pickDirty = true;
   }
 
   /** Enter/leave globe mode. texW/texH = equirect bake size. Idempotent re-entry resizes. */
@@ -375,6 +395,54 @@ export class WebGLBackend implements Backend {
     return svgFromLayers(this.width, this.height, this.order.map((n) => this.layers.get(n)!), this.viewTransform);
   }
 
+  /**
+   * GPU-readback pick (#141): resolve a screen point (CSS px) to the topmost `pickable` instanced link
+   * instance. Returns the decoded `gl_InstanceID`, `-1` for background, or `undefined` when there are no
+   * pickable layers (the engine then falls through to other pick paths). `exact: true` (click) reads
+   * synchronously; `exact: false` (hover) uses the double-buffered PBO and may return the previous
+   * pointer position's result with no stall. See {@link PickReadback}.
+   */
+  pickInstanced(x: number, y: number, exact: boolean): number | undefined {
+    if (this.pickable.size === 0 || this.globe) return undefined;
+    const fbo = this.ensurePickFbo();
+    if (this.pickDirty) this.renderPickPass(fbo);
+    const dpr = this.device.getDefaultCanvasContext().devicePixelRatio;
+    // CSS px (top-left) → device px (bottom-left origin for WebGL readback), using the FBO's own height.
+    const px = Math.floor(x * dpr);
+    const py = fbo.height - 1 - Math.floor(y * dpr);
+    const handle = (fbo as WEBGLFramebuffer).handle;
+    const picker = (this.picker ??= new PickReadback((this.device as WebGLDevice).gl));
+    return exact ? picker.readSync(handle, px, py) : picker.read(handle, px, py);
+  }
+
+  /** Lazily create / resize the device-px pick FBO (colour-only; no depth/stencil needed for id reads). */
+  private ensurePickFbo(): Framebuffer {
+    const dpr = this.device.getDefaultCanvasContext().devicePixelRatio;
+    const w = Math.max(1, Math.round(this.width * dpr));
+    const h = Math.max(1, Math.round(this.height * dpr));
+    if (this.pickFbo && this.pickFbo.width === w && this.pickFbo.height === h) return this.pickFbo;
+    this.pickFbo?.destroy();
+    this.pickFbo = this.device.createFramebuffer({ width: w, height: h, colorAttachments: ["rgba8unorm"] });
+    this.pickDirty = true;
+    return this.pickFbo;
+  }
+
+  /** Render the id-encoded pick models of the pickable link layers into the pick FBO. Background clears
+   *  to (0,0,0,1) so empty pixels decode to -1. Only re-runs when {@link pickDirty} (geometry/transform
+   *  changed), so a hover over a static view re-reads the same FBO with no redraw. */
+  private renderPickPass(fbo: Framebuffer): void {
+    const pass = this.device.beginRenderPass({ framebuffer: fbo, clearColor: [0, 0, 0, 1] });
+    for (const name of this.pickable) {
+      const r = this.instanced.get(name);
+      // pickable only ever holds link layers; the instanceof guard narrows the union to the
+      // primitives that expose renderPick (circles, the node lane, are CPU-picked and excluded).
+      if (r && !(r instanceof InstancedCircles)) r.renderPick(pass);
+    }
+    pass.end();
+    this.device.submit();
+    this.pickDirty = false;
+  }
+
   /** Read a pixel from the ONSCREEN canvas default framebuffer after render(). Test aid.
    *  Coords are in CSS px; the onscreen buffer is device px, so scale by the buffer ratio. */
   readScreenPixel(x: number, y: number): number[] {
@@ -404,6 +472,7 @@ export class WebGLBackend implements Backend {
     this.renderers.clear();
     for (const r of this.instanced.values()) r.destroy();
     this.instanced.clear();
+    this.pickable.clear();
     this.layers.clear();
     this.order = [];
     this.globe?.destroy();
@@ -411,6 +480,10 @@ export class WebGLBackend implements Backend {
     this.pt?.destroy();
     this.pt = null;
     this.ptNames.clear();
+    this.picker?.destroy();
+    this.picker = null;
+    this.pickFbo?.destroy();
+    this.pickFbo = null;
     this.offscreen.destroy();
     this.device.destroy();
   }

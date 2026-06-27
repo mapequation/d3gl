@@ -40,6 +40,14 @@ export interface InstancedLaneEntry {
    * managed selection or visual highlight).
    */
   interactive?: LaneInteractive;
+  /**
+   * GPU-readback link picking (#141). When set, {@link BaseEngine.pick} consults the backend's pick
+   * FBO ({@link Backend.pickInstanced}) *after* the CPU `lane.pick` misses (so a node drawn over a
+   * link still wins), and maps the decoded instance index back to a HoverHit. This is the second pick
+   * backend the issue describes — pixel-exact over the actual drawn link geometry (thin strips /
+   * half-arrows) where the CPU frontier picker (circles only) can't be exact. Returns null on a miss.
+   */
+  gpuPick?(index: number): HoverHit | null;
 }
 
 /**
@@ -1181,10 +1189,12 @@ export abstract class BaseEngine {
     }
     return this;
   }
-  pick(x: number, y: number): HoverHit | null {
+  pick(x: number, y: number, exact = true): HoverHit | null {
     // x,y are SCREEN (CSS px); the HitIndex applies the transform itself (per-mode: invert for
     // world layers, project-the-anchor for screen layers — so screen geometry picks at its
     // rendered pixel size at any zoom, not a hit area that scales with the view transform).
+    // `exact` (#141): hover passes false → GPU link readback may use its stall-free async path
+    // (previous-frame result); click/programmatic pick defaults true → synchronous, current pixel.
     const t = this.transform;
     // Instanced lanes (topmost = last registered) — resolved before Scene specs. Guarded on
     // size so the common empty-registry case (geoMap/plot, pick() per pointermove) allocates nothing.
@@ -1199,6 +1209,23 @@ export abstract class BaseEngine {
             if (ix) hit.members = () => ix.members(hit.id); // lazy: subtree leaves / absorbed set
             return hit;
           }
+        }
+      }
+      // GPU-readback link picking (#141): the CPU lane.pick above resolves nodes (circles) — exact on
+      // the screen-bounded frontier. Links are thin strips / half-arrows the CPU picker can't be exact
+      // on, so a lane that opted in resolves them pixel-exactly over the drawn geometry via the backend
+      // pick FBO. Runs only after every CPU node pick missed (nodes are drawn on top, so they win).
+      const backend = this.handle?.backend;
+      if (backend?.pickInstanced) {
+        for (let i = lanes.length - 1; i >= 0; i--) {
+          const gp = lanes[i]!.gpuPick;
+          if (!gp) continue;
+          const id = backend.pickInstanced(x, y, exact);
+          if (id != null && id >= 0) {
+            const hit = gp(id);
+            if (hit) return hit;
+          }
+          break; // one pickable instanced lane backs the shared pick FBO (topmost wins); see #141 follow-up.
         }
       }
     }
@@ -1249,7 +1276,9 @@ export abstract class BaseEngine {
     if (this.interacting) return; // gesture frames skip picking entirely
     if (!this.hoverCb && !this.specs.some((s) => s.hover || s.tooltip) && !this.anyLaneInteractive("hover")) return;
     const r = this.host.getBoundingClientRect();
-    const hit = this.pick(e.clientX - r.left, e.clientY - r.top);
+    // Hover: exact=false lets GPU link picking (#141) use its stall-free async readback (the result may
+    // lag the cursor by one pointer event — imperceptible — instead of flushing the GPU per move).
+    const hit = this.pick(e.clientX - r.left, e.clientY - r.top, false);
     this.hoverCb?.(hit, e);
     if (hit?.layer !== this.lastHover?.layer || hit?.id !== this.lastHover?.id) {
       this.lastHover = hit;

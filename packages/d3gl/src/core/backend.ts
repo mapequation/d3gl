@@ -159,12 +159,20 @@ export interface InstancedHalfArrowsData {
   count: number;
 }
 
-/** A named GPU-instanced primitive layer — the network rendering lane (#100). */
+/**
+ * A named GPU-instanced primitive layer — the network rendering lane (#100).
+ *
+ * `pickable` (#141) opts a link layer into the GPU-readback pick pass: the backend also builds an
+ * id-encoded pick model (one extra Model, no extra instance buffers — the id is `gl_InstanceID`) and
+ * renders it into an offscreen pick FBO, so {@link Backend.pickInstanced} resolves a screen pixel to
+ * the topmost link instance. Only the link primitives (lines/arrows/half-arrows) carry it; nodes
+ * (circles) are CPU-picked exactly on the screen-bounded frontier and never enter the GPU pick pass.
+ */
 export type InstancedLayer =
   | { name: string; sizeMode?: "world" | "screen"; primitive: "circles"; circles: InstancedCirclesData }
-  | { name: string; sizeMode?: "world" | "screen"; primitive: "lines"; lines: InstancedLinesData }
-  | { name: string; sizeMode?: "world" | "screen"; primitive: "arrows"; arrows: InstancedArrowsData }
-  | { name: string; sizeMode?: "world" | "screen"; primitive: "half-arrows"; halfArrows: InstancedHalfArrowsData };
+  | { name: string; sizeMode?: "world" | "screen"; primitive: "lines"; pickable?: boolean; lines: InstancedLinesData }
+  | { name: string; sizeMode?: "world" | "screen"; primitive: "arrows"; pickable?: boolean; arrows: InstancedArrowsData }
+  | { name: string; sizeMode?: "world" | "screen"; primitive: "half-arrows"; pickable?: boolean; halfArrows: InstancedHalfArrowsData };
 
 /**
  * One backend-rendered text label (#105 N7b-2). Positioned in **screen pixels** (the caller projects
@@ -254,6 +262,16 @@ export interface Backend {
   updateInstancedLayer?(layer: InstancedLayer): void;
   /** Remove an instanced primitive layer by name. */
   removeInstancedLayer?(name: string): void;
+  /**
+   * GPU-readback pick (#141): resolve a screen point (CSS px) to the topmost `pickable` instanced
+   * link instance by reading its id-encoded colour from an offscreen pick FBO. Returns the decoded
+   * instance index (`gl_InstanceID` within the pickable link layers, which the network emits in edge
+   * order), `-1` for background (no link), or `undefined` when unsupported or no pickable layer is
+   * registered. `exact: false` (hover) uses double-buffered async PBO readback — returns the *previous*
+   * pointer position's result with no GPU pipeline stall; `exact: true` (click) reads synchronously at
+   * (x, y). WebGL-only; other backends omit it (network instanced rendering is WebGL-only).
+   */
+  pickInstanced?(x: number, y: number, exact: boolean): number | undefined;
   /**
    * Set the screen-space text labels to draw on top of the scene (#105 N7b-2). Optional — the SVG
    * (`<text>`) and Canvas (`fillText`) backends implement it so labels appear in `toSVG()`/`toPNG()`;
