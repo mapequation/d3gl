@@ -28,6 +28,23 @@ export interface NetworkHit {
 }
 
 /**
+ * What GPU-readback link picking (#141) resolved — carried as the `datum` of the {@link HoverHit} from
+ * `on("hover" | "click")` (or {@link Network.pick}) when the cursor is over a **link**, with `layer:
+ * "links"`. Enabled by {@link Network.pickLinks}. The hit's `id` is the link's stable identity: the edge
+ * index with LOD off, or the directed tree-node pair (`source * tree.size + target`) under LOD.
+ */
+export interface NetworkLinkHit {
+  /** Source node id. With LOD off a leaf node index; under LOD a tree-node id (aggregate if `≥ leafCount`). */
+  source: number;
+  /** Target node id (same id space as {@link source}). */
+  target: number;
+  /** True under LOD when either endpoint is an aggregate (a super-edge between collapsed modules). */
+  aggregate: boolean;
+  /** Edge flow/weight — the leaf edge's weight with LOD off, the summed super-edge flow under LOD. */
+  weight: number;
+}
+
+/**
  * Options for {@link Network.labels} (#105 N7b) — a handful of importance-ranked text labels on the
  * LOD frontier (leaf or aggregate centroid), in an HTML overlay that re-places on pan/zoom. Only the
  * top {@link max} by importance within the viewport are shown, so density stays readable at any zoom.
@@ -337,8 +354,16 @@ export class Network extends BaseEngine {
   private readonly NET_HL_LANE = "network-highlight";
   /** The dispatch layer name node picks resolve to (selection/hover are keyed under it). */
   private readonly NODE_LAYER = "nodes";
+  /** The `hit.layer` value link picks resolve to (#141), distinguishing a link hit from a node hit. */
+  private readonly LINK_LAYER = "links";
   /** Node interaction opts set via {@link interactive} (selection/hover/tooltip). Null = pick-only. */
   private interactiveOpts: InteractiveLayerOptions | null = null;
+  /** GPU-readback link picking opt-in (#141). Off ⇒ links carry no pick model and the lane has no
+   *  `gpuPick`, so hover/click never resolves a link (zero added GPU cost). Toggled by {@link pickLinks}. */
+  private pickLinksEnabled = false;
+  /** Maps a picked link instance index (gl_InstanceID) → a {@link NetworkLinkHit} HoverHit, captured per
+   *  emit so it matches the link set currently in the pick FBO. Null when no links are drawn. */
+  private linkResolve: ((index: number) => HoverHit | null) | null = null;
   /** Frontier label overlay (#105 N7b) + its options; null until {@link labels} is enabled. */
   private labelLayer: LabelLayer | null = null;
   private labelOpts: NetworkLabelOptions | null = null;
@@ -437,6 +462,25 @@ export class Network extends BaseEngine {
     this.interactiveOpts = opts || null;
     if (!this.interactiveOpts) this.clearLayerSelection(this.NODE_LAYER); // disabling clears managed selection
     this.syncLane(); // re-register the lane with the interactive block + companion highlight lane
+    this.render();
+    return this;
+  }
+
+  /**
+   * Enable (or, with `false`, disable) **pixel-exact link picking** (#141) — WebGL only. Nodes are always
+   * pickable (CPU, exact on circles); links are thin strips / half-arrows, so resolving "the link you see"
+   * needs a GPU pass: the link instances are drawn id-encoded into an offscreen FBO and the pixel under the
+   * cursor is read back. Off by default because it adds a per-link-layer pick model + an offscreen readback
+   * — opt in only when you handle link hits.
+   *
+   * Once enabled, `on("hover" | "click")` and {@link Network.pick} resolve a link as a {@link HoverHit}
+   * with `layer: "links"` and a {@link NetworkLinkHit} `datum` (when the cursor is over a link and not over
+   * a node — nodes are drawn on top and win). Hover uses a stall-free async readback (the result can lag the
+   * cursor by one pointer event); clicks read synchronously. There is no per-frame readback stall.
+   */
+  pickLinks(enabled = true): this {
+    this.pickLinksEnabled = enabled;
+    this.syncLane(); // re-register so link layers gain/lose their pick model and the lane its gpuPick
     this.render();
     return this;
   }
@@ -736,6 +780,8 @@ export class Network extends BaseEngine {
         lane, layerNames: LAYER_NAMES, dynamic: true,
         resolve: (g) => ({ layer: this.NODE_LAYER, id: g, datum: this.lodDatum(tree, g) }),
         interactive: this.laneInteractive((g) => this.lodDatum(tree, g), (g) => leavesUnder(tree, g)),
+        // Link picking (#141): frontierLayers sets `linkResolve` per emit (it has the super-edge ids/flows).
+        gpuPick: this.pickLinksEnabled ? (id) => this.linkResolve?.(id) ?? null : undefined,
       });
       // Ring overlay reads the same radius the glyph draws at (frontierCircles): leaves/1-child uncapped,
       // aggregates capped at maxAggregateRadius — so the ring hugs the glyph exactly at any zoom.
@@ -749,11 +795,14 @@ export class Network extends BaseEngine {
         select: () => EMPTY_VISIBLE,
         pick: (x, y, t) => pickNodes(graph.positions, this.resolvedStyleCached(graph).nodeRadii, graph.nodeCount, x, y, t, this.resolvedStyleCached(graph).sizeMode === "screen"),
       };
-      const lane = new InstancedLane(strategy, () => networkLayers(graph, this.resolvedStyleCached(graph)));
+      // No-LOD: instance i of every link layer is edge i (parallel emit), so the resolve is static.
+      this.linkResolve = (i) => this.noLodLinkHit(graph, i);
+      const lane = new InstancedLane(strategy, () => this.flagPickableLinks(networkLayers(graph, this.resolvedStyleCached(graph))));
       this.registerInstancedLane(this.NET_LANE, {
         lane, layerNames: LAYER_NAMES, dynamic: false,
         resolve: (i) => ({ layer: this.NODE_LAYER, id: i, datum: { aggregate: false, count: 1 } satisfies NetworkHit }),
         interactive: this.laneInteractive(() => ({ aggregate: false, count: 1 }), (i) => [i]),
+        gpuPick: this.pickLinksEnabled ? (id) => this.linkResolve?.(id) ?? null : undefined,
       });
       // No-LOD: the whole graph is drawn, so every selected/hovered node index is "visible" (source=null).
       this.syncHighlightLane(null, (i) => [graph.positions[2 * i]!, graph.positions[2 * i + 1]!], (i) => this.resolvedStyleCached(graph).nodeRadii[i]!, false);
@@ -771,6 +820,41 @@ export class Network extends BaseEngine {
 
   private lodDatum(tree: LODTree, g: number): NetworkHit {
     return { aggregate: g >= tree.leafCount, count: tree.count[g]! };
+  }
+
+  /** Flag every link layer (lines/arrows/half-arrows; not node circles) into the GPU pick pass (#141)
+   *  when link picking is on. Mutates the freshly-built layers in place (they're per-emit, never shared). */
+  private flagPickableLinks(layers: InstancedLayer[]): InstancedLayer[] {
+    if (this.pickLinksEnabled) for (const l of layers) if (l.primitive !== "circles") l.pickable = true;
+    return layers;
+  }
+
+  /** Resolve a picked link instance (#141) under LOD: instance i → super-edge `ids[i]` (the directed
+   *  tree-node pair) + summed `flows[i]`. Returns a HoverHit with `layer: "links"`, or null if out of range. */
+  private lodLinkHit(tree: LODTree, ids: number[], flows: number[] | undefined, index: number): HoverHit | null {
+    if (index < 0 || index >= ids.length) return null;
+    const pair = ids[index]!;
+    const source = Math.floor(pair / tree.size);
+    const target = pair - source * tree.size;
+    const datum: NetworkLinkHit = {
+      source,
+      target,
+      aggregate: source >= tree.leafCount || target >= tree.leafCount,
+      weight: flows?.[index] ?? 0,
+    };
+    return { layer: this.LINK_LAYER, id: pair, datum };
+  }
+
+  /** Resolve a picked link instance (#141) with LOD off: instance i is graph edge i directly. */
+  private noLodLinkHit(graph: NetworkGraph, index: number): HoverHit | null {
+    if (index < 0 || index >= graph.edgeCount) return null;
+    const datum: NetworkLinkHit = {
+      source: graph.source[index]!,
+      target: graph.target[index]!,
+      aggregate: false,
+      weight: graph.weight[index]!,
+    };
+    return { layer: this.LINK_LAYER, id: index, datum };
   }
 
   /** Build the lane interaction block for the node layer (#105 N7c-2), or undefined when no
@@ -884,6 +968,7 @@ export class Network extends BaseEngine {
   private frontierLayers(tree: LODTree, style: ResolvedNetworkStyle, frontier: Uint32Array): InstancedLayer[] {
     const opts = this.lodOptions!;
     const layers: InstancedLayer[] = [];
+    this.linkResolve = null; // no super-edges drawn this emit ⇒ nothing to link-pick (until set below)
     // Super-edges first (drawn under the nodes), among the visible frontier only.
     if (opts.superEdges !== false && this.graph!.edgeCount > 0) {
       // One super-edge path for both structural and module trees: gathered from the flow-weighted
@@ -891,7 +976,7 @@ export class Network extends BaseEngine {
       // (directed) arrowheads, the same glyph the non-LOD path uses. A node keeps edges to on-frontier
       // or off-screen neighbours (the same visible rect the cut uses); both half-arrow and line
       // arrowheads honour sizeMode in-shader (the tip sets back to the node boundary in either space).
-      const { halfArrows, lines, arrows } = superEdges(
+      const { halfArrows, lines, arrows, ids, flows } = superEdges(
         tree,
         frontier,
         {
@@ -907,9 +992,13 @@ export class Network extends BaseEngine {
         },
         visibleWorldRect(this.transform, this.width, this.height),
       );
-      if (halfArrows && halfArrows.count > 0) layers.push({ name: "links", primitive: "half-arrows", halfArrows, sizeMode: style.sizeMode });
-      if (lines && lines.count > 0) layers.push({ name: "links", primitive: "lines", lines, sizeMode: style.sizeMode });
-      if (arrows && arrows.count > 0) layers.push({ name: "arrows", primitive: "arrows", arrows, sizeMode: style.sizeMode });
+      const pick = this.pickLinksEnabled || undefined; // flag link layers into the GPU pick pass (#141)
+      if (halfArrows && halfArrows.count > 0) layers.push({ name: "links", primitive: "half-arrows", pickable: pick, halfArrows, sizeMode: style.sizeMode });
+      if (lines && lines.count > 0) layers.push({ name: "links", primitive: "lines", pickable: pick, lines, sizeMode: style.sizeMode });
+      if (arrows && arrows.count > 0) layers.push({ name: "arrows", primitive: "arrows", pickable: pick, arrows, sizeMode: style.sizeMode });
+      // Link picking (#141): instance i (gl_InstanceID) of every emitted link layer is super-edge i, so
+      // one resolve maps the decoded id → its directed tree-node pair (ids[i]) + summed flow (flows[i]).
+      if (this.pickLinksEnabled) this.linkResolve = (i) => this.lodLinkHit(tree, ids, flows, i);
     }
     // Aggregate-outline affordance: a halo ring behind collapsed-module glyphs (not leaves), under the
     // nodes, so a module reads as expandable. WebGL/LOD-only (the vector full-graph draw has no aggregates).

@@ -270,6 +270,36 @@ nodes stay pick-only. Defaults when on: the **select** ring is `#ff6a00`, the **
 (override via `selection.selected.stroke` and a `hover` HighlightStyle's `stroke`).
 :::
 
+### Picking links
+
+Nodes are circles, so hit-testing them is exact and cheap on the CPU (point-in-circle over the visible
+frontier) — that's the picking above, and it's always on. **Links** are a different shape: thin strips,
+bent curves, half-arrows. To resolve *the link you actually see* over that geometry, opt in to GPU-readback
+link picking (**WebGL only**):
+
+```ts
+net.pickLinks();                  // enable (pickLinks(false) to disable)
+net.on("hover", (hit) => {
+  if (hit?.layer === "links") {   // a link hit (vs "nodes")
+    const { source, target, weight, aggregate } = hit.datum; // NetworkLinkHit
+    // aggregate === true under LOD ⇒ a super-edge between two collapsed modules
+  }
+});
+```
+
+Once enabled, `on("hover" | "click")` and `net.pick(x, y)` resolve a link as a hit with `layer:
+"links"` and a [`NetworkLinkHit`](/d3gl/reference/network/interfaces/networklinkhit/) datum
+(`{ source, target, weight, aggregate }`). With LOD off the hit is a graph edge; under LOD it's a
+**super-edge** — its `source`/`target` are the (possibly aggregate) tree nodes and `weight` is the
+summed flow. **Nodes win:** a node drawn over a link resolves to the node, matching what's on top.
+
+How it works: the link instances are drawn into an offscreen buffer with each instance's id encoded as
+colour, and the pixel under the cursor is read back to an id (the same idea as
+[`pickAt`](/d3gl/reference/webgl/functions/pickat/), over the instanced lane). Hover uses an
+asynchronous double-buffered readback — the result can lag the cursor by one pointer event, never
+stalling the render — so there is **no per-frame readback cost**; clicks read synchronously for an exact
+hit. It's opt-in because it adds a per-link pick pass, so a non-interactive network pays nothing.
+
 ### Frontier labels
 
 `net.labels({ … })` puts **text labels on the LOD frontier** — at each visible leaf/aggregate centroid,

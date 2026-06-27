@@ -1,6 +1,6 @@
 import { Model } from "@luma.gl/engine";
 import type { Buffer, Device, RenderPass } from "@luma.gl/core";
-import { INSTANCED_CIRCLE_VS, INSTANCED_CIRCLE_FS, INSTANCED_LINE_VS, INSTANCED_ARROW_VS, INSTANCED_HALF_ARROW_VS, POINT_FS, FILL_FS } from "./shaders.js";
+import { INSTANCED_CIRCLE_VS, INSTANCED_CIRCLE_FS, INSTANCED_LINE_VS, INSTANCED_ARROW_VS, INSTANCED_HALF_ARROW_VS, POINT_FS, FILL_FS, PICK_FS } from "./shaders.js";
 import { clipFromView } from "./transform.js";
 import type { InstancedCirclesData, InstancedLinesData, InstancedArrowsData, InstancedHalfArrowsData } from "../core/index.js";
 
@@ -27,6 +27,13 @@ const BLEND = {
   blendAlphaSrcFactor: "one",
   blendAlphaDstFactor: "one-minus-src-alpha",
 } as const;
+
+/**
+ * Pick-pass parameters (#141): blending OFF so each fragment writes its instance's encoded id
+ * exactly (a blended id is a meaningless colour). No depth ⇒ the last-drawn instance wins a shared
+ * pixel, mirroring the fill pass's painter order, so the GPU readback resolves the topmost link.
+ */
+const NO_BLEND = { blend: false } as const;
 
 export class InstancedCircles {
   count: number;
@@ -181,6 +188,8 @@ function lineTemplate(samples: number): Float32Array {
 export class InstancedLines {
   count: number;
   private model: Model;
+  /** Pick-pass twin (#141): same VS/geometry, PICK_FS, no blend. Built only when `pick` is set. */
+  private pickModel?: Model;
   private corner: Buffer;
   private source: Buffer;
   private target: Buffer;
@@ -189,7 +198,7 @@ export class InstancedLines {
   private bend: Buffer;
   private uniforms: Record<string, unknown>;
 
-  constructor(device: Device, data: InstancedLinesData, width = 0, height = 0) {
+  constructor(device: Device, data: InstancedLinesData, width = 0, height = 0, pick = false) {
     this.count = data.count;
     const samples = Math.max(2, (data.samples ?? 2) | 0);
     this.corner = device.createBuffer({ data: lineTemplate(samples) });
@@ -204,31 +213,47 @@ export class InstancedLines {
       u_screen: 0,
       u_viewport: [width, height],
     };
+    const bufferLayout = [
+      { name: "a_corner", format: "float32x2" as const },
+      { name: "a_source", format: "float32x2" as const, stepMode: "instance" as const },
+      { name: "a_target", format: "float32x2" as const, stepMode: "instance" as const },
+      { name: "a_width", format: "float32" as const, stepMode: "instance" as const },
+      { name: "a_color", format: "unorm8x4" as const, stepMode: "instance" as const },
+      { name: "a_bend", format: "float32" as const, stepMode: "instance" as const },
+    ];
+    const attributes = {
+      a_corner: this.corner,
+      a_source: this.source,
+      a_target: this.target,
+      a_width: this.widthBuf,
+      a_color: this.color,
+      a_bend: this.bend,
+    };
     this.model = new Model(device, {
       vs: INSTANCED_LINE_VS,
       fs: FILL_FS,
-      bufferLayout: [
-        { name: "a_corner", format: "float32x2" },
-        { name: "a_source", format: "float32x2", stepMode: "instance" },
-        { name: "a_target", format: "float32x2", stepMode: "instance" },
-        { name: "a_width", format: "float32", stepMode: "instance" },
-        { name: "a_color", format: "unorm8x4", stepMode: "instance" },
-        { name: "a_bend", format: "float32", stepMode: "instance" },
-      ],
-      attributes: {
-        a_corner: this.corner,
-        a_source: this.source,
-        a_target: this.target,
-        a_width: this.widthBuf,
-        a_color: this.color,
-        a_bend: this.bend,
-      },
+      bufferLayout,
+      attributes,
       uniforms: this.uniforms,
       parameters: BLEND,
       topology: "triangle-strip",
       vertexCount: samples * 2,
       instanceCount: this.count,
     });
+    // Pick twin: identical geometry + shared instance buffers/uniforms, PICK_FS writes gl_InstanceID.
+    if (pick) {
+      this.pickModel = new Model(device, {
+        vs: INSTANCED_LINE_VS,
+        fs: PICK_FS,
+        bufferLayout,
+        attributes,
+        uniforms: this.uniforms,
+        parameters: NO_BLEND,
+        topology: "triangle-strip",
+        vertexCount: samples * 2,
+        instanceCount: this.count,
+      });
+    }
   }
 
   setTransform(m: Float32Array): void {
@@ -243,8 +268,13 @@ export class InstancedLines {
   render(pass: RenderPass): void {
     if (this.count > 0) this.model.draw(pass);
   }
+  /** Draw the id-encoded pick pass (#141). No-op unless built with `pick`. */
+  renderPick(pass: RenderPass): void {
+    if (this.pickModel && this.count > 0) this.pickModel.draw(pass);
+  }
   destroy(): void {
     this.model.destroy();
+    this.pickModel?.destroy();
     this.corner.destroy();
     this.source.destroy();
     this.target.destroy();
@@ -262,6 +292,8 @@ const HALF_ARROW_TEMPLATE = new Float32Array([0, 0, 2, 0, 2, 1]);
 export class InstancedArrows {
   count: number;
   private model: Model;
+  /** Pick-pass twin (#141): same VS/geometry, PICK_FS, no blend. Built only when `pick` is set. */
+  private pickModel?: Model;
   private tri: Buffer;
   private source: Buffer;
   private target: Buffer;
@@ -271,7 +303,7 @@ export class InstancedArrows {
   private bend: Buffer;
   private uniforms: Record<string, unknown>;
 
-  constructor(device: Device, data: InstancedArrowsData, width = 0, height = 0) {
+  constructor(device: Device, data: InstancedArrowsData, width = 0, height = 0, pick = false) {
     this.count = data.count;
     this.tri = device.createBuffer({ data: data.half ? HALF_ARROW_TEMPLATE : ARROW_TEMPLATE });
     this.source = device.createBuffer({ data: data.sources });
@@ -286,33 +318,48 @@ export class InstancedArrows {
       u_screen: 0,
       u_viewport: [width || 1, height || 1],
     };
+    const bufferLayout = [
+      { name: "a_tri", format: "float32x2" as const },
+      { name: "a_source", format: "float32x2" as const, stepMode: "instance" as const },
+      { name: "a_target", format: "float32x2" as const, stepMode: "instance" as const },
+      { name: "a_size", format: "float32" as const, stepMode: "instance" as const },
+      { name: "a_radius", format: "float32" as const, stepMode: "instance" as const },
+      { name: "a_bend", format: "float32" as const, stepMode: "instance" as const },
+      { name: "a_color", format: "unorm8x4" as const, stepMode: "instance" as const },
+    ];
+    const attributes = {
+      a_tri: this.tri,
+      a_source: this.source,
+      a_target: this.target,
+      a_size: this.size,
+      a_radius: this.radius,
+      a_bend: this.bend,
+      a_color: this.color,
+    };
     this.model = new Model(device, {
       vs: INSTANCED_ARROW_VS,
       fs: FILL_FS,
-      bufferLayout: [
-        { name: "a_tri", format: "float32x2" },
-        { name: "a_source", format: "float32x2", stepMode: "instance" },
-        { name: "a_target", format: "float32x2", stepMode: "instance" },
-        { name: "a_size", format: "float32", stepMode: "instance" },
-        { name: "a_radius", format: "float32", stepMode: "instance" },
-        { name: "a_bend", format: "float32", stepMode: "instance" },
-        { name: "a_color", format: "unorm8x4", stepMode: "instance" },
-      ],
-      attributes: {
-        a_tri: this.tri,
-        a_source: this.source,
-        a_target: this.target,
-        a_size: this.size,
-        a_radius: this.radius,
-        a_bend: this.bend,
-        a_color: this.color,
-      },
+      bufferLayout,
+      attributes,
       uniforms: this.uniforms,
       parameters: BLEND,
       topology: "triangle-list",
       vertexCount: 3,
       instanceCount: this.count,
     });
+    if (pick) {
+      this.pickModel = new Model(device, {
+        vs: INSTANCED_ARROW_VS,
+        fs: PICK_FS,
+        bufferLayout,
+        attributes,
+        uniforms: this.uniforms,
+        parameters: NO_BLEND,
+        topology: "triangle-list",
+        vertexCount: 3,
+        instanceCount: this.count,
+      });
+    }
   }
 
   setTransform(m: Float32Array): void {
@@ -327,8 +374,13 @@ export class InstancedArrows {
   render(pass: RenderPass): void {
     if (this.count > 0) this.model.draw(pass);
   }
+  /** Draw the id-encoded pick pass (#141). No-op unless built with `pick`. */
+  renderPick(pass: RenderPass): void {
+    if (this.pickModel && this.count > 0) this.pickModel.draw(pass);
+  }
   destroy(): void {
     this.model.destroy();
+    this.pickModel?.destroy();
     this.tri.destroy();
     this.source.destroy();
     this.target.destroy();
@@ -369,6 +421,8 @@ export class InstancedHalfArrows {
   count: number;
   private vertexCount: number;
   private model: Model;
+  /** Pick-pass twin (#141): same VS/geometry, PICK_FS, no blend. Built only when `pick` is set. */
+  private pickModel?: Model;
   private kind: Buffer;
   private source: Buffer;
   private target: Buffer;
@@ -378,7 +432,7 @@ export class InstancedHalfArrows {
   private color: Buffer;
   private uniforms: Record<string, unknown>;
 
-  constructor(device: Device, data: InstancedHalfArrowsData, width = 0, height = 0) {
+  constructor(device: Device, data: InstancedHalfArrowsData, width = 0, height = 0, pick = false) {
     this.count = data.count;
     const samples = Math.max(2, (data.samples ?? HALF_ARROW_SAMPLES) | 0);
     const template = halfArrowTemplate(samples);
@@ -395,33 +449,48 @@ export class InstancedHalfArrows {
       u_screen: 0,
       u_viewport: [width, height],
     };
+    const bufferLayout = [
+      { name: "a_kind", format: "float32x2" as const },
+      { name: "a_p0", format: "float32x2" as const, stepMode: "instance" as const },
+      { name: "a_p1", format: "float32x2" as const, stepMode: "instance" as const },
+      { name: "a_radii", format: "float32x2" as const, stepMode: "instance" as const },
+      { name: "a_widths", format: "float32x2" as const, stepMode: "instance" as const },
+      { name: "a_bend", format: "float32" as const, stepMode: "instance" as const },
+      { name: "a_color", format: "unorm8x4" as const, stepMode: "instance" as const },
+    ];
+    const attributes = {
+      a_kind: this.kind,
+      a_p0: this.source,
+      a_p1: this.target,
+      a_radii: this.radii,
+      a_widths: this.widths,
+      a_bend: this.bend,
+      a_color: this.color,
+    };
     this.model = new Model(device, {
       vs: INSTANCED_HALF_ARROW_VS,
       fs: FILL_FS,
-      bufferLayout: [
-        { name: "a_kind", format: "float32x2" },
-        { name: "a_p0", format: "float32x2", stepMode: "instance" },
-        { name: "a_p1", format: "float32x2", stepMode: "instance" },
-        { name: "a_radii", format: "float32x2", stepMode: "instance" },
-        { name: "a_widths", format: "float32x2", stepMode: "instance" },
-        { name: "a_bend", format: "float32", stepMode: "instance" },
-        { name: "a_color", format: "unorm8x4", stepMode: "instance" },
-      ],
-      attributes: {
-        a_kind: this.kind,
-        a_p0: this.source,
-        a_p1: this.target,
-        a_radii: this.radii,
-        a_widths: this.widths,
-        a_bend: this.bend,
-        a_color: this.color,
-      },
+      bufferLayout,
+      attributes,
       uniforms: this.uniforms,
       parameters: BLEND,
       topology: "triangle-list",
       vertexCount: this.vertexCount,
       instanceCount: this.count,
     });
+    if (pick) {
+      this.pickModel = new Model(device, {
+        vs: INSTANCED_HALF_ARROW_VS,
+        fs: PICK_FS,
+        bufferLayout,
+        attributes,
+        uniforms: this.uniforms,
+        parameters: NO_BLEND,
+        topology: "triangle-list",
+        vertexCount: this.vertexCount,
+        instanceCount: this.count,
+      });
+    }
   }
 
   setTransform(m: Float32Array): void {
@@ -436,8 +505,13 @@ export class InstancedHalfArrows {
   render(pass: RenderPass): void {
     if (this.count > 0) this.model.draw(pass);
   }
+  /** Draw the id-encoded pick pass (#141). No-op unless built with `pick`. */
+  renderPick(pass: RenderPass): void {
+    if (this.pickModel && this.count > 0) this.pickModel.draw(pass);
+  }
   destroy(): void {
     this.model.destroy();
+    this.pickModel?.destroy();
     this.kind.destroy();
     this.source.destroy();
     this.target.destroy();

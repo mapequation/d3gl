@@ -3,7 +3,7 @@
  * with level-of-detail (epic #98).
  */
 export { network, Network } from "./network.js";
-export type { NetworkOptions, NetworkStyle, NetworkLayoutOptions, NetworkLODOptions, NetworkHit } from "./network.js";
+export type { NetworkOptions, NetworkStyle, NetworkLayoutOptions, NetworkLODOptions, NetworkHit, NetworkLinkHit } from "./network.js";
 export type { NodeRadiusSpec, NodeMetric, ImportanceSpec, FlowBorderSpec, LinkWidthSpec, LinkColorSpec, LinkStyle } from "./glyphs.js";
 
 export { halfLinkGeometry, traceHalfLink, halfLinkPathString, scaleHalfLink } from "./half-link.js";

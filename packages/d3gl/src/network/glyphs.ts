@@ -793,7 +793,7 @@ export function superEdges(
       widths[e * 2] = w;
       widths[e * 2 + 1] = opp === undefined ? w : style.widthOf(opp);
     }
-    return { halfArrows: { sources, targets, radii, widths, bends, colors, count }, ids };
+    return { halfArrows: { sources, targets, radii, widths, bends, colors, count }, ids, flows: wS };
   }
 
   // Line style: bent/straight lines ∝ flow; directed → arrowheads set back to the target's (capped)
@@ -804,7 +804,7 @@ export function superEdges(
   const lines: InstancedLinesData = style.bend
     ? { sources, targets, widths, colors, bends, samples: BENT_SAMPLES, count }
     : { sources, targets, widths, colors, count };
-  if (!style.directed) return { lines, ids };
+  if (!style.directed) return { lines, ids, flows: wS };
 
   // Arrowheads orient + set back in-shader (so screen sizeMode is honoured): pass the target centre
   // (already in `targets`) plus its draw radius; the shader puts the tip on the node boundary. A
@@ -813,15 +813,22 @@ export function superEdges(
   const aRadii = new Float32Array(count);
   for (let e = 0; e < count; e++) aRadii[e] = drawnRadius(bS[e]!);
   const arrows: InstancedArrowsData = { sources, targets, radii: aRadii, sizes: new Float32Array(count).fill(style.arrowSize), colors, bends, half: style.bend !== 0, count };
-  return { lines, arrows, ids };
+  return { lines, arrows, ids, flows: wS };
 }
 
-/** {@link superEdges} output: the per-style instanced batches plus the stable per-super-edge `ids` (the Scene path keys link drawables by them; the WebGL lane ignores them). */
+/**
+ * {@link superEdges} output: the per-style instanced batches plus parallel per-super-edge metadata.
+ * `ids[e] = sourceTreeNode * tree.size + targetTreeNode` (the stable directed pair) and `flows[e]` is
+ * its summed flow — both indexed by the instance/`gl_InstanceID` order shared across half-arrows and
+ * lines/arrows. The Scene path (#138) keys link drawables by `ids`; GPU-readback link picking (#141)
+ * maps a decoded instance index → `ids`/`flows` → a link HoverHit. (The WebGL fill draw ignores both.)
+ */
 export interface SuperEdgesData {
   halfArrows?: InstancedHalfArrowsData;
   lines?: InstancedLinesData;
   arrows?: InstancedArrowsData;
   ids: number[];
+  flows?: number[];
 }
 
 /** Path-strip samples for a smooth bent link (#104 N6c). */
