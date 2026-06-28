@@ -1,7 +1,7 @@
 import { select } from "d3-selection";
 import { zoom as d3zoom, zoomIdentity, type D3ZoomEvent } from "d3-zoom";
 import { Scene, HitIndex, declutterScreen, declutterScratch, type Backend, type GroupBuilder, type RenderLayer, type ViewTransform, type DeclutterScratch } from "../core/index.js";
-import { InstancedLane } from "../core/instanced-lane.js";
+import { InstancedLane, type ScreenRect } from "../core/instanced-lane.js";
 import { createBackend, createCanvasBackend, type BackendType, type BackendHandle } from "./backend-factory.js";
 import { buildBatch, type DrawItem } from "./draw-batch.js";
 import { composeColor, type StyleOverride, type SelectionOptions } from "./style-overrides.js";
@@ -223,6 +223,10 @@ export abstract class BaseEngine {
   private downAt: [number, number] | null = null;
   /** Max pointer travel (px) between down and up for a click — suppresses pan/rotate drags. */
   private static readonly CLICK_SLOP = 4;
+  /** Active shift+drag marquee (#159): viewport-space start + lazily-created overlay rect. Null when idle. */
+  private marquee: { startClientX: number; startClientY: number; el: HTMLElement | null } | null = null;
+  /** Lane layers currently showing the live marquee preview (the will-be-selected hover ring), to clear on end. */
+  private marqueePreview = new Set<string>();
   private swapToken = 0;
   private destroyed = false;
   /** "auto" mode only: the WebGL upgrade promise (in-flight, then settled). Null until
@@ -1153,6 +1157,13 @@ export abstract class BaseEngine {
     this.disableInteraction();
     const sel = select(this.host as Element);
     const behavior = d3zoom<Element, unknown>().scaleExtent(extent)
+      // Reserve shift+drag for the marquee (#159) only when something is marquee-selectable — otherwise
+      // keep d3-zoom's default (which pans on shift+drag). Shift+wheel still zooms (wheel is exempt).
+      .filter((e: Event) => {
+        const me = e as MouseEvent;
+        if (me.shiftKey && e.type !== "wheel" && this.marqueeCapable()) return false;
+        return (!me.ctrlKey || e.type === "wheel") && !me.button;
+      })
       .on("start", () => this.setInteracting(true))
       .on("zoom", (e: D3ZoomEvent<Element, unknown>) => {
         const t: ViewTransform = { k: e.transform.k, x: e.transform.x, y: e.transform.y };
@@ -1266,6 +1277,7 @@ export abstract class BaseEngine {
     this.host.removeEventListener("pointerdown", this.onPointerDown);
     this.host.removeEventListener("pointerup", this.onPointerUp);
     this.host.removeEventListener("pointercancel", this.onPointerCancel);
+    this.endMarquee(); // drop any in-flight marquee overlay + its window listeners
     this.tooltipEl?.destroy(); this.tooltipEl = null;
     this.handle?.backend.destroy();
     if (this.handle && this.handle.element !== this.host) this.handle.element.remove();
@@ -1273,7 +1285,7 @@ export abstract class BaseEngine {
   }
 
   private onPointerMove = (e: PointerEvent): void => {
-    if (this.interacting) return; // gesture frames skip picking entirely
+    if (this.interacting || this.marquee) return; // gesture / marquee frames skip hover picking entirely
     if (!this.hoverCb && !this.specs.some((s) => s.hover || s.tooltip) && !this.anyLaneInteractive("hover")) return;
     const r = this.host.getBoundingClientRect();
     // Hover: exact=false lets GPU link picking (#141) use its stall-free async readback (the result may
@@ -1328,10 +1340,14 @@ export abstract class BaseEngine {
     if (this.laneHoverLayer) this.setLaneHover(null, null);
     this.tooltipEl?.hide();
   }
-  private onPointerDown = (e: PointerEvent): void => { this.downAt = [e.clientX, e.clientY]; };
+  private onPointerDown = (e: PointerEvent): void => {
+    this.downAt = [e.clientX, e.clientY];
+    // shift+drag over a marquee-selectable lane starts a region selection instead of a pan (#159).
+    if (e.shiftKey && this.marqueeCapable()) this.startMarquee(e);
+  };
   /** An interrupted gesture (e.g. setPointerCapture takeover, scroll) must not leave a stale
    *  down-position that would validate the next unrelated pointerup as a click. */
-  private onPointerCancel = (): void => { this.downAt = null; };
+  private onPointerCancel = (): void => { this.downAt = null; this.endMarquee(); };
   private onPointerUp = (e: PointerEvent): void => {
     const d = this.downAt;
     this.downAt = null;
@@ -1344,6 +1360,121 @@ export abstract class BaseEngine {
     this.clickCb?.(hit, e);
     if (hasSelectableLayer) this.applySelectionGesture(hit, e);
   };
+
+  // ── Marquee (shift+drag region) selection (#159) ──────────────────────────────────────────────
+  /** Any registered lane that is **multi**-selectable — the prerequisite for a marquee (a box selecting
+   *  many glyphs only makes sense on a multi-select lane). Gates both the d3-zoom shift filter and start. */
+  private marqueeCapable(): boolean {
+    for (const e of this.instancedLanes.values()) {
+      const ix = e.interactive;
+      if (ix && this.selectableOf(ix.layer).multi) return true;
+    }
+    return false;
+  }
+  /** Begin a marquee: track the viewport-space start and listen on `window` so the drag survives the
+   *  pointer leaving the host. The overlay rect is created lazily on the first real move (so a shift+click
+   *  never flashes a 0-size box). d3-zoom already declined this gesture (its filter rejects shift+drag). */
+  private startMarquee(e: PointerEvent): void {
+    this.marquee = { startClientX: e.clientX, startClientY: e.clientY, el: null };
+    window.addEventListener("pointermove", this.onMarqueeMove);
+    window.addEventListener("pointerup", this.onMarqueeUp);
+  }
+  private onMarqueeMove = (e: PointerEvent): void => {
+    const m = this.marquee;
+    if (!m) return;
+    if (!m.el) {
+      if (Math.hypot(e.clientX - m.startClientX, e.clientY - m.startClientY) <= BaseEngine.CLICK_SLOP) return;
+      const el = document.createElement("div");
+      el.className = "d3gl-marquee";
+      el.style.cssText = "position:fixed;pointer-events:none;z-index:2147483647;border:1px dashed rgba(255,255,255,0.9);background:rgba(120,170,255,0.18)";
+      document.body.appendChild(el);
+      m.el = el;
+    }
+    m.el.style.left = `${Math.min(m.startClientX, e.clientX)}px`;
+    m.el.style.top = `${Math.min(m.startClientY, e.clientY)}px`;
+    m.el.style.width = `${Math.abs(e.clientX - m.startClientX)}px`;
+    m.el.style.height = `${Math.abs(e.clientY - m.startClientY)}px`;
+    // Live preview: ring the glyphs the box currently covers (the hover ring), updated as it grows.
+    this.previewMarquee(this.marqueeRect(m.startClientX, m.startClientY, e.clientX, e.clientY));
+  };
+  private onMarqueeUp = (e: PointerEvent): void => {
+    const m = this.marquee;
+    if (!m) return;
+    const box = m.el != null && Math.hypot(e.clientX - m.startClientX, e.clientY - m.startClientY) > BaseEngine.CLICK_SLOP;
+    const rect = this.marqueeRect(m.startClientX, m.startClientY, e.clientX, e.clientY);
+    this.endMarquee(); // also clears the live preview rings
+    // A real drag → region select; a no-drag shift+click is left to onPointerUp's click path.
+    if (box) this.finalizeMarquee(rect, e);
+  };
+  /** Remove the overlay + window listeners, drop the live preview rings, and clear marquee state. Idempotent. */
+  private endMarquee(): void {
+    const m = this.marquee;
+    if (!m) return;
+    window.removeEventListener("pointermove", this.onMarqueeMove);
+    window.removeEventListener("pointerup", this.onMarqueeUp);
+    m.el?.remove();
+    this.marquee = null;
+    this.clearMarqueePreview();
+  }
+  /** Host-relative (CSS px) rect for a marquee from two viewport-space points, clamped to the canvas —
+   *  the same screen space `pickRegion` projects into. */
+  private marqueeRect(aClientX: number, aClientY: number, bClientX: number, bClientY: number): ScreenRect {
+    const r = this.host.getBoundingClientRect();
+    const cx = (v: number) => Math.max(0, Math.min(this.width, v - r.left));
+    const cy = (v: number) => Math.max(0, Math.min(this.height, v - r.top));
+    const ax = cx(aClientX), ay = cy(aClientY), bx = cx(bClientX), by = cy(bClientY);
+    return { x0: Math.min(ax, bx), y0: Math.min(ay, by), x1: Math.max(ax, bx), y1: Math.max(ay, by) };
+  }
+  /** For each multi-selectable lane, the ids whose centre is inside `rect` (resolved through the lane). */
+  private marqueeIdsByLayer(rect: ScreenRect): Map<string, Set<string | number>> {
+    const t = this.transform;
+    const byLayer = new Map<string, Set<string | number>>();
+    for (const entry of this.instancedLanes.values()) {
+      const ix = entry.interactive;
+      if (!ix || !this.selectableOf(ix.layer).multi) continue; // marquee = multi-select lanes only
+      for (const idx of entry.lane.pickRegion(rect, t)) {
+        const hit = entry.resolve(idx);
+        if (!hit) continue;
+        let set = byLayer.get(hit.layer);
+        if (!set) byLayer.set(hit.layer, (set = new Set()));
+        set.add(hit.id);
+      }
+    }
+    return byLayer;
+  }
+  /** Live marquee preview: show the will-be-selected glyphs with the hover ring (blue), updated as the
+   *  box grows. Reuses the lane's transient hover set (`laneHilite`) — selected glyphs keep their own
+   *  ring colour. Re-emits a lane's ring overlay only when its set changed (a drag fires many moves). */
+  private previewMarquee(rect: ScreenRect): void {
+    const byLayer = this.marqueeIdsByLayer(rect);
+    // Update layers in the box, and clear any previewed layer no longer in it.
+    for (const layer of this.marqueePreview) if (!byLayer.has(layer)) byLayer.set(layer, new Set());
+    for (const [layer, ids] of byLayer) {
+      if (setsEqual(this.laneHilite.get(layer), ids)) continue;
+      if (ids.size) { this.laneHilite.set(layer, ids); this.marqueePreview.add(layer); }
+      else { this.laneHilite.delete(layer); this.marqueePreview.delete(layer); }
+      this.emitHighlightFor(layer);
+    }
+  }
+  /** Drop the live preview rings (on marquee end / cancel). */
+  private clearMarqueePreview(): void {
+    if (this.marqueePreview.size === 0) return;
+    for (const layer of this.marqueePreview) { this.laneHilite.delete(layer); this.emitHighlightFor(layer); }
+    this.marqueePreview.clear();
+  }
+  /** Add every multi-selectable lane's glyphs in the box to the selection (additive, like shift+click),
+   *  then refresh styling and fire `on("select")`. */
+  private finalizeMarquee(rect: ScreenRect, e: PointerEvent): void {
+    const touched = new Set<string>();
+    for (const [layer, ids] of this.marqueeIdsByLayer(rect)) {
+      const set = this.getOrCreateLayerSet(layer);
+      for (const id of ids) set.add(id);
+      touched.add(layer);
+    }
+    if (touched.size === 0) return;
+    this.applySelectionStyles(touched);
+    this.selectCb?.(this.selection(), e);
+  }
   /** Apply selection styling for layers listed in `touched`, reading the current id set from
    *  `this.selected`. Scene layers restyle their drawables (`selected`/`others`); instanced lanes
    *  refresh their companion ring overlay instead (no Scene drawables to recolor). */
@@ -1595,4 +1726,11 @@ export abstract class BaseEngine {
       this.upgrading = false;
     }
   }
+}
+
+/** Same-membership test for the marquee-preview change guard (avoids re-emitting an unchanged ring set). */
+function setsEqual(a: ReadonlySet<string | number> | undefined, b: ReadonlySet<string | number>): boolean {
+  if (!a || a.size !== b.size) return false;
+  for (const v of b) if (!a.has(v)) return false;
+  return true;
 }

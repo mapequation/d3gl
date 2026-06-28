@@ -19,6 +19,7 @@ import { hcl, rgb } from "d3-color";
 import type { NetworkGraph } from "./graph.js";
 import { buildHierarchy, type CoarsenOptions, type Hierarchy } from "./coarsen.js";
 import { declutterScreen } from "../core/declutter.js";
+import type { ScreenRect } from "../core/instanced-lane.js";
 
 /**
  * The position-independent **topology** of the LOD tree: the flattened coarsening hierarchy (levels,
@@ -1064,4 +1065,20 @@ export function pickFrontier(
     if (dx * dx + dy * dy <= pr * pr) found = g; // last match = topmost in paint order
   }
   return found;
+}
+
+/**
+ * Marquee region query over the LOD frontier (#159): the tree-node ids whose **centre** projects inside
+ * `rect` (CSS px). Centre-in-rect is sizeMode-independent (only the radius differs), so no `PickOptions`.
+ * O(frontier) — bounded by the viewport, like {@link pickFrontier}, so cheap per gesture even at scale.
+ */
+export function regionFrontier(tree: LODTree, frontier: Uint32Array, rect: ScreenRect, t: LODTransform): number[] {
+  const out: number[] = [];
+  for (let i = 0; i < frontier.length; i++) {
+    const g = frontier[i]!;
+    const sx = tree.cx[g]! * t.k + t.x;
+    const sy = tree.cy[g]! * t.k + t.y;
+    if (sx >= rect.x0 && sx <= rect.x1 && sy >= rect.y0 && sy <= rect.y1) out.push(g);
+  }
+  return out;
 }
