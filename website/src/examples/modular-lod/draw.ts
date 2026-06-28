@@ -16,7 +16,8 @@ const DEPTHS = [2, 3, 4, 5, 6]; // 27 → 2187 nodes
  * **hover** shows a ring, **click** selects (shift/⌘-click adds), and `on("select")` reports each hit's
  * `members()` — the **leaf node ids inside a clicked module aggregate** — shown in the caption. With a
  * **multi**-selectable lane, **shift+drag** draws a **marquee** (#159) that adds every node/aggregate
- * whose centre falls in the box (a CPU range query over the frontier — no extra setup; plain drag pans).
+ * whose centre falls in the box (a CPU range query over the frontier — no extra setup; plain drag pans);
+ * the covered glyphs preview with the hover ring as you drag.
  *
  * `net.pickLinks()` adds **pixel-exact link picking** (#141, WebGL): the links are thin bent strips, so
  * resolving "the link you see" uses a GPU-readback pass behind the same pick seam. Hover a link (or a

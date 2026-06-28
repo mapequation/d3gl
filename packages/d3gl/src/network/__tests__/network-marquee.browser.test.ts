@@ -80,6 +80,31 @@ describe("network shift+drag marquee (#159)", () => {
     net.destroy();
   });
 
+  it("previews the will-be-selected glyphs with the hover ring while dragging, then commits on release", async () => {
+    const h = host();
+    const net = network(h, { width: 200, height: 200 });
+    await net.whenReady();
+    const g = buildGraph({ nodeCount: 4, source: [0, 1], target: [1, 2], directed: false });
+    net.data(g).style({ nodeRadius: 6 }).layout({ backend: "positions", positions: new Float32Array([10, 10, 100, 100, 190, 190, 50, 150]) });
+    net.setTransform({ k: 1, x: 0, y: 0 });
+    net.interactive({ selectable: { multi: true }, hover: { stroke: "#2563eb" } });
+
+    const r = h.getBoundingClientRect();
+    const ev = (type: string, sx: number, sy: number) =>
+      h.dispatchEvent(new PointerEvent(type, { clientX: r.left + sx, clientY: r.top + sy, shiftKey: true, bubbles: true, button: 0, pointerId: 1 }));
+    ev("pointerdown", 40, 40);
+    ev("pointermove", 160, 160); // mid-drag: box (40,40)-(160,160) covers nodes 1 and 3
+    /* eslint-disable @typescript-eslint/no-explicit-any */
+    const hilite = (net as any).laneHilite.get("nodes") as Set<number> | undefined;
+    expect(hilite && [...hilite].sort((a, b) => a - b)).toEqual([1, 3]); // previewed (hover ring)…
+    expect(net.selection()).toEqual([]); // …but nothing committed until release
+    ev("pointerup", 160, 160);
+    expect(((net as any).laneHilite.get("nodes") as Set<number> | undefined)?.size ?? 0).toBe(0); // preview cleared
+    /* eslint-enable @typescript-eslint/no-explicit-any */
+    expect(idsOf(net)).toEqual([1, 3]); // committed to the selection
+    net.destroy();
+  });
+
   it("a shift+click (no drag) is not a marquee — single additive toggle still works", async () => {
     const h = host();
     const net = network(h, { width: 200, height: 200 });
