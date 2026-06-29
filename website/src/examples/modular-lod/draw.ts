@@ -62,9 +62,9 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
 
   // Selection + hover ring for nodes/aggregates (#105 N7c-2) + pixel-exact link picking (#141).
   net
-    // hover ring blue, selection ring orange (the white default hover ring is for dark backgrounds).
+    // Default ring palette: green hover/will-add, blue selection, red will-remove (consistent with the +/− marquee badges).
     // draggable (#140): grab a node / selection / collapsed module and drag the grabbed set under the cursor.
-    .interactive({ selectable: { multi: true }, draggable: true, hover: { stroke: "#2563eb" }, selection: { selected: { stroke: "#ff6a00" } } })
+    .interactive({ selectable: { multi: true }, draggable: true, hover: true })
     .pickLinks() // GPU-readback: hover/click now also resolves links (layer: "links"), not just nodes
     .on("select", () => { caption.textContent = selectionText(); })
     .on("hover", (hit) => {

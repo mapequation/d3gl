@@ -11,9 +11,11 @@ import type { InteractiveLayerOptions } from "./base-engine.js";
 export type RGBA = [number, number, number, number];
 const RING_OUTER = 1.34; // ring outer radius ÷ glyph radius
 const RING_BORDER_FRAC = 0.16; // border thickness ÷ ring outer radius
-const DEFAULT_SELECT_RING: RGBA = [255, 106, 0, 255]; // orange — the persistent selection ring
-const DEFAULT_HOVER_RING: RGBA = [255, 255, 255, 255]; // white — the transient hover ring
-const DEFAULT_REMOVE_RING: RGBA = [220, 38, 38, 255]; // red (#dc2626) — "will be removed" (subtract-marquee preview, #140)
+// A coherent default palette across the selection gestures (#140): blue = selected, green =
+// hover / "will add" (matches the green "+" marquee badge), red = "will remove" (matches the red "−").
+const DEFAULT_SELECT_RING: RGBA = [37, 99, 235, 255]; // blue (#2563eb) — the persistent selection ring
+const DEFAULT_HOVER_RING: RGBA = [22, 163, 74, 255]; // green (#16a34a) — the transient hover / will-add ring
+const DEFAULT_REMOVE_RING: RGBA = [220, 38, 38, 255]; // red (#dc2626) — "will be removed" (subtract-marquee preview)
 
 function cssToRgba(css: string, fallback: RGBA): RGBA {
   const c = rgb(css);
@@ -22,7 +24,7 @@ function cssToRgba(css: string, fallback: RGBA): RGBA {
 }
 
 /** Resolve the select/hover ring colours from the interaction opts (`selection.selected.stroke` / a
- *  hover {@link HighlightStyle}'s `stroke`), falling back to the orange/white defaults. */
+ *  hover {@link HighlightStyle}'s `stroke`), falling back to the blue (select) / green (hover) defaults. */
 export function resolveRingColors(opts: InteractiveLayerOptions): { select: RGBA; hover: RGBA; remove: RGBA } {
   const selStroke = opts.selection?.selected?.stroke;
   const hov = opts.hover;

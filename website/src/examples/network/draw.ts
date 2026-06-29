@@ -46,8 +46,8 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
   // while the off-thread worker layout **reheats** around it and re-cools on release. Grab a selected
   // node to drag the whole selection; grab a module aggregate to drag its whole subtree. Plain drag on
   // empty space still pans. Hover/click also light a ring (selection) via the same interactive() opt-in.
-  // hover ring blue (the default white ring is invisible on this light background); select ring orange.
-  net.interactive({ selectable: { multi: true }, hover: { stroke: "#2563eb" }, draggable: true });
+  // Default ring palette: green hover/will-add, blue selection, red will-remove (matches the +/− marquee badges).
+  net.interactive({ selectable: { multi: true }, hover: true, draggable: true });
 
   // Picking (#105 N7a): hover/click resolve the node or aggregate under the cursor via the engine's
   // CPU hit-test over the LOD cut frontier — bounded by the visible set, so it stays cheap at 1M. The

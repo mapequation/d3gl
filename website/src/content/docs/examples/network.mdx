@@ -278,8 +278,10 @@ not you call `interactive()`, and they draw nothing — you do whatever you want
 at the top of this page uses `on("hover")` only to update a text readout). `interactive({ hover: true })`
 is the opt-in that draws the **visual ring** on the hovered/selected glyph and manages the selection set.
 Every interaction option is **off until you set it**, and `interactive()` itself is opt-in — omit it and
-nodes stay pick-only. Defaults when on: the **select** ring is `#ff6a00`, the **hover** ring is `#fff`
-(override via `selection.selected.stroke` and a `hover` HighlightStyle's `stroke`).
+nodes stay pick-only. The default ring palette is consistent across the selection gestures: **blue**
+(`#2563eb`) = selected, **green** (`#16a34a`) = hover / will-add (matches the marquee's green **+** badge),
+**red** (`#dc2626`) = will-remove (matches the **−** badge). Override the first two via
+`selection.selected.stroke` and a `hover` HighlightStyle's `stroke`.
 :::
 
 ### Picking links

@@ -461,8 +461,9 @@ export class Network extends BaseEngine {
    *   the `force` and `worker` layout backends (reheat) and `positions` (translate-only). Pair with
    *   `enableZoom()` and the drag takes precedence over panning when it starts on a glyph.
    * - `selection: { selected, others }` — `selected.stroke` overrides the **select** ring colour
-   *   (default `#ff6a00`); the hover ring defaults to `#fff` (override via a `hover` HighlightStyle's
-   *   `stroke`). `others` (Scene dimming) is ignored on instanced glyphs — selected glyphs get a ring.
+   *   (default `#2563eb` blue); the hover ring defaults to `#16a34a` green (override via a `hover`
+   *   HighlightStyle's `stroke`). A subtract-marquee preview rings the to-be-removed glyphs `#dc2626`
+   *   red. `others` (Scene dimming) is ignored on instanced glyphs — selected glyphs get a ring.
    *
    * The hit's `datum` is a {@link NetworkHit} (`{ aggregate, count }`); its `members()` lists the leaf
    * node ids the target covers (1 for a leaf, the whole subtree for an aggregate). Observe selection
