@@ -242,7 +242,7 @@ export abstract class BaseEngine {
   /** Max pointer travel (px) between down and up for a click — suppresses pan/rotate drags. */
   private static readonly CLICK_SLOP = 4;
   /** Active shift+drag marquee (#159): viewport-space start + lazily-created overlay rect. Null when idle. */
-  private marquee: { startClientX: number; startClientY: number; el: HTMLElement | null } | null = null;
+  private marquee: { startClientX: number; startClientY: number; el: HTMLElement | null; badge: HTMLElement | null } | null = null;
   /** Lane layers currently showing the live marquee preview (the will-be-selected hover ring), to clear on end. */
   private marqueePreview = new Set<string>();
   /** Active node-drag (#140): the grabbed hit + viewport-space start, plus the session once the pointer
@@ -1185,9 +1185,10 @@ export abstract class BaseEngine {
         const me = e as MouseEvent;
         if (me.shiftKey && e.type !== "wheel" && this.marqueeCapable()) return false;
         // A plain primary drag starting ON a draggable glyph is a node-drag (#140), not a pan — let
-        // d3-zoom decline it so `onPointerDown` grabs the node. Only a pointerdown does this hit-test;
+        // d3-zoom decline it so `onPointerDown` grabs the node. d3-zoom starts a pan on `mousedown`
+        // (its registered event is `mousedown.zoom`, not pointerdown), so the hit-test must run there;
         // wheel/dblclick keep zooming. (onPointerDown re-resolves the hit to actually start the drag.)
-        if (e.type === "pointerdown" && !me.shiftKey && !me.ctrlKey && !me.button && this.draggableAtEvent(me)) return false;
+        if ((e.type === "mousedown" || e.type === "pointerdown") && !me.shiftKey && !me.ctrlKey && !me.button && this.draggableAtEvent(me)) return false;
         return (!me.ctrlKey || e.type === "wheel") && !me.button;
       })
       .on("start", () => this.setInteracting(true))
@@ -1465,7 +1466,7 @@ export abstract class BaseEngine {
    *  pointer leaving the host. The overlay rect is created lazily on the first real move (so a shift+click
    *  never flashes a 0-size box). d3-zoom already declined this gesture (its filter rejects shift+drag). */
   private startMarquee(e: PointerEvent): void {
-    this.marquee = { startClientX: e.clientX, startClientY: e.clientY, el: null };
+    this.marquee = { startClientX: e.clientX, startClientY: e.clientY, el: null, badge: null };
     window.addEventListener("pointermove", this.onMarqueeMove);
     window.addEventListener("pointerup", this.onMarqueeUp);
   }
@@ -1479,11 +1480,26 @@ export abstract class BaseEngine {
       el.style.cssText = "position:fixed;pointer-events:none;z-index:2147483647;border:1px dashed rgba(255,255,255,0.9);background:rgba(120,170,255,0.18)";
       document.body.appendChild(el);
       m.el = el;
+      // Mode badge that follows the cursor: "+" (additive, default) or "−" (alt held → subtract), like
+      // Illustrator. Built once with the box; positioned + toggled below as the drag moves / alt toggles.
+      const badge = document.createElement("div");
+      badge.className = "d3gl-marquee-badge";
+      badge.style.cssText = "position:fixed;pointer-events:none;z-index:2147483647;width:14px;height:14px;line-height:13px;text-align:center;font:700 12px/13px ui-monospace,monospace;color:#fff;border-radius:3px;box-shadow:0 0 0 1px rgba(0,0,0,0.35)";
+      document.body.appendChild(badge);
+      m.badge = badge;
     }
     m.el.style.left = `${Math.min(m.startClientX, e.clientX)}px`;
     m.el.style.top = `${Math.min(m.startClientY, e.clientY)}px`;
     m.el.style.width = `${Math.abs(e.clientX - m.startClientX)}px`;
     m.el.style.height = `${Math.abs(e.clientY - m.startClientY)}px`;
+    // Mode badge: subtract while alt/option is held (red "−"), else add (green "+"). Follows the cursor.
+    if (m.badge) {
+      const sub = e.altKey;
+      m.badge.textContent = sub ? "−" : "+";
+      m.badge.style.background = sub ? "#dc2626" : "#16a34a";
+      m.badge.style.left = `${e.clientX + 10}px`;
+      m.badge.style.top = `${e.clientY + 10}px`;
+    }
     // Live preview: ring the glyphs the box currently covers (the hover ring), updated as it grows.
     this.previewMarquee(this.marqueeRect(m.startClientX, m.startClientY, e.clientX, e.clientY));
   };
@@ -1503,6 +1519,7 @@ export abstract class BaseEngine {
     window.removeEventListener("pointermove", this.onMarqueeMove);
     window.removeEventListener("pointerup", this.onMarqueeUp);
     m.el?.remove();
+    m.badge?.remove();
     this.marquee = null;
     this.clearMarqueePreview();
   }
@@ -1552,13 +1569,16 @@ export abstract class BaseEngine {
     for (const layer of this.marqueePreview) { this.laneHilite.delete(layer); this.emitHighlightFor(layer); }
     this.marqueePreview.clear();
   }
-  /** Add every multi-selectable lane's glyphs in the box to the selection (additive, like shift+click),
-   *  then refresh styling and fire `on("select")`. */
+  /** Apply a finished marquee box to the selection of every multi-selectable lane, then refresh styling
+   *  and fire `on("select")`. Additive by default (like shift+click); with **alt/option** held it
+   *  **subtracts** — removes the box's glyphs from the selection (the Illustrator gesture, #140 feedback). */
   private finalizeMarquee(rect: ScreenRect, e: PointerEvent): void {
+    const subtract = e.altKey;
     const touched = new Set<string>();
     for (const [layer, ids] of this.marqueeIdsByLayer(rect)) {
       const set = this.getOrCreateLayerSet(layer);
-      for (const id of ids) set.add(id);
+      if (subtract) for (const id of ids) set.delete(id);
+      else for (const id of ids) set.add(id);
       touched.add(layer);
     }
     if (touched.size === 0) return;

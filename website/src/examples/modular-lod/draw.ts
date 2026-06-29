@@ -17,7 +17,7 @@ const DEPTHS = [2, 3, 4, 5, 6]; // 27 → 2187 nodes
  * hit's `members()` — the **leaf node ids inside a clicked module aggregate** — shown in the caption.
  * With a **multi**-selectable lane, **shift+drag** draws a **marquee** (#159) that adds every
  * node/aggregate whose centre falls in the box (a CPU range query over the frontier — no extra setup);
- * the covered glyphs preview with the hover ring as you drag. With **draggable** (#140), a **plain drag
+ * hold **option/alt** to **subtract** the box instead (a +/− cursor badge shows which). With **draggable** (#140), a **plain drag
  * starting on a glyph moves it** instead of panning: grab a node, a whole **selection**, or a collapsed
  * **module** to drag its entire subtree (these coordinates are fixed, so the drag *translates* the
  * grabbed set — on a `force`/`worker` layout it also reheats the simulation). Plain drag on empty space pans.
@@ -46,7 +46,7 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
   // tab stays pure d3gl + a tiny DOM readout. pointer-events:none so it never intercepts pan/zoom.
   const caption = document.createElement("div");
   caption.style.cssText = "position:absolute;left:8px;bottom:8px;max-width:calc(100% - 16px);padding:4px 8px;font:12px/1.4 ui-monospace,monospace;color:#e5e7eb;background:rgba(17,24,39,0.72);border-radius:4px;pointer-events:none;white-space:pre-wrap";
-  const HINT = "Hover to ring · click to select (⇧/⌘ adds) · ⇧+drag to box-select · drag a glyph to move it";
+  const HINT = "Hover to ring · click to select (⇧/⌘ adds) · ⇧+drag to box-select (⌥ subtracts) · drag a glyph to move it";
   caption.textContent = HINT;
   host.appendChild(caption);
 

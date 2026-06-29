@@ -167,6 +167,39 @@ describe("network node-drag (#140)", () => {
     net.destroy();
   });
 
+  it("with enableZoom, a mouse-drag starting on a node does not pan (d3-zoom mousedown is filtered)", async () => {
+    // d3-zoom starts a pan on `mousedown.zoom` (NOT pointerdown), so the node-drag filter must reject
+    // mousedown — otherwise pan and node-drag fire together and fight. Driven via real MouseEvents so the
+    // d3-zoom filter actually runs (node-drag itself is pointer-driven and isn't exercised here).
+    const h = host();
+    const net = network(h, { width: 200, height: 200 });
+    await net.whenReady();
+    const g = buildGraph({ nodeCount: 3, source: [0, 1], target: [1, 2], directed: false });
+    net.data(g).style({ nodeRadius: 8 }).layout({ backend: "positions", positions: new Float32Array([40, 40, 100, 100, 160, 160]) });
+    net.setTransform({ k: 1, x: 0, y: 0 });
+    net.enableZoom([0.2, 8]);
+    net.interactive({ draggable: true, selectable: true });
+
+    const r = h.getBoundingClientRect();
+    const mouse = (target: EventTarget, type: string, sx: number, sy: number) =>
+      target.dispatchEvent(new MouseEvent(type, { clientX: r.left + sx, clientY: r.top + sy, bubbles: true, button: 0, view: window }));
+    /* eslint-disable @typescript-eslint/no-explicit-any */
+    const tx = () => (net as any).transform as { k: number; x: number; y: number };
+
+    // Control: a mouse-drag on EMPTY space pans (proves d3-zoom responds to these synthetic events).
+    (net as any).setTransform({ k: 1, x: 0, y: 0 });
+    mouse(h, "mousedown", 190, 10); mouse(window, "mousemove", 150, 10); mouse(window, "mouseup", 150, 10);
+    expect(tx().x).not.toBe(0); // panned
+
+    // Starting the same drag ON node 0 must NOT pan — the filter declines so node-drag owns the gesture.
+    (net as any).setTransform({ k: 1, x: 0, y: 0 });
+    mouse(h, "mousedown", 40, 40); mouse(window, "mousemove", 0, 40); mouse(window, "mouseup", 0, 40);
+    expect(tx().x).toBe(0);
+    expect(tx().y).toBe(0);
+    /* eslint-enable @typescript-eslint/no-explicit-any */
+    net.destroy();
+  });
+
   it("on the worker backend, holds the node (zero-lag) and pins/unpins the worker", async () => {
     const h = host();
     const net = network(h, { width: 200, height: 200 });
