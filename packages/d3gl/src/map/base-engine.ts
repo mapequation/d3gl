@@ -95,6 +95,24 @@ export interface InteractiveLayerOptions<D = any> {
    *  no styling on click). The pointer listeners are attached when the layer is registered —
    *  independently of `on("select")`, which is a pure observer. */
   selectable?: boolean | { multi?: boolean };
+  /** Opt this layer's glyphs into **node-drag** (#140): a plain drag starting on a glyph moves it
+   *  (instead of panning), reheating the layout. Honored only by engines that implement node-drag
+   *  ({@link BaseEngine.beginNodeDrag} — currently `network()`); ignored by geoMap/plot. The pointer
+   *  listeners are attached when the layer is registered, like `selectable`. */
+  draggable?: boolean;
+}
+
+/**
+ * An in-progress node-drag (#140). Returned by {@link BaseEngine.beginNodeDrag} once the pointer
+ * travels past the click threshold; {@link BaseEngine} feeds it pointer moves (host CSS px) and ends
+ * it on pointer-up. The engine owns the physics (which nodes move, how the sim reheats / re-cools);
+ * BaseEngine owns only the gesture plumbing (hit-test, window listeners, screen coordinates).
+ */
+export interface NodeDragSession {
+  /** Pointer moved to host-relative CSS px (sx, sy) — translate the held set there. */
+  move(sx: number, sy: number): void;
+  /** Pointer released — release the pins and let the layout re-cool. */
+  end(): void;
 }
 
 export interface LayerSpec {
@@ -227,6 +245,9 @@ export abstract class BaseEngine {
   private marquee: { startClientX: number; startClientY: number; el: HTMLElement | null } | null = null;
   /** Lane layers currently showing the live marquee preview (the will-be-selected hover ring), to clear on end. */
   private marqueePreview = new Set<string>();
+  /** Active node-drag (#140): the grabbed hit + viewport-space start, plus the session once the pointer
+   *  travels past CLICK_SLOP (lazy, so a plain click on a node doesn't reheat the layout). Null when idle. */
+  private nodeDrag: { hit: HoverHit; startClientX: number; startClientY: number; session: NodeDragSession | null } | null = null;
   private swapToken = 0;
   private destroyed = false;
   /** "auto" mode only: the WebGL upgrade promise (in-flight, then settled). Null until
@@ -410,7 +431,8 @@ export abstract class BaseEngine {
     // (idempotent — same handler ref). The pick path resolves the lane; dispatch reads its options.
     const opts = entry.interactive?.options;
     if (opts?.hover || opts?.tooltip) this.attachPointer();
-    if (opts?.selectable) this.attachSelectPointer();
+    // selectable → click/marquee gestures; draggable → node-drag (#140). Both ride the down/up listeners.
+    if (opts?.selectable || opts?.draggable) this.attachSelectPointer();
     if (this.handle?.backend.setInstancedLayer) this.emitInstancedLane(name);
   }
 
@@ -1162,6 +1184,10 @@ export abstract class BaseEngine {
       .filter((e: Event) => {
         const me = e as MouseEvent;
         if (me.shiftKey && e.type !== "wheel" && this.marqueeCapable()) return false;
+        // A plain primary drag starting ON a draggable glyph is a node-drag (#140), not a pan — let
+        // d3-zoom decline it so `onPointerDown` grabs the node. Only a pointerdown does this hit-test;
+        // wheel/dblclick keep zooming. (onPointerDown re-resolves the hit to actually start the drag.)
+        if (e.type === "pointerdown" && !me.shiftKey && !me.ctrlKey && !me.button && this.draggableAtEvent(me)) return false;
         return (!me.ctrlKey || e.type === "wheel") && !me.button;
       })
       .on("start", () => this.setInteracting(true))
@@ -1278,6 +1304,7 @@ export abstract class BaseEngine {
     this.host.removeEventListener("pointerup", this.onPointerUp);
     this.host.removeEventListener("pointercancel", this.onPointerCancel);
     this.endMarquee(); // drop any in-flight marquee overlay + its window listeners
+    this.nodeDrag?.session?.end(); this.endNodeDrag(); // release a held drag + its window listeners (#140)
     this.tooltipEl?.destroy(); this.tooltipEl = null;
     this.handle?.backend.destroy();
     if (this.handle && this.handle.element !== this.host) this.handle.element.remove();
@@ -1285,7 +1312,7 @@ export abstract class BaseEngine {
   }
 
   private onPointerMove = (e: PointerEvent): void => {
-    if (this.interacting || this.marquee) return; // gesture / marquee frames skip hover picking entirely
+    if (this.interacting || this.marquee || this.nodeDrag) return; // gesture / marquee / node-drag frames skip hover picking entirely
     if (!this.hoverCb && !this.specs.some((s) => s.hover || s.tooltip) && !this.anyLaneInteractive("hover")) return;
     const r = this.host.getBoundingClientRect();
     // Hover: exact=false lets GPU link picking (#141) use its stall-free async readback (the result may
@@ -1343,14 +1370,25 @@ export abstract class BaseEngine {
   private onPointerDown = (e: PointerEvent): void => {
     this.downAt = [e.clientX, e.clientY];
     // shift+drag over a marquee-selectable lane starts a region selection instead of a pan (#159).
-    if (e.shiftKey && this.marqueeCapable()) this.startMarquee(e);
+    if (e.shiftKey && this.marqueeCapable()) { this.startMarquee(e); return; }
+    // A plain primary drag starting ON a draggable glyph grabs it (#140). The d3-zoom filter declined
+    // the pan for the same condition; the actual pin/reheat is deferred to the first real move.
+    if (!e.shiftKey && !e.ctrlKey && !e.metaKey && e.button === 0) {
+      const hit = this.draggableAtEvent(e);
+      if (hit) this.startNodeDrag(hit, e);
+    }
   };
   /** An interrupted gesture (e.g. setPointerCapture takeover, scroll) must not leave a stale
    *  down-position that would validate the next unrelated pointerup as a click. */
-  private onPointerCancel = (): void => { this.downAt = null; this.endMarquee(); };
+  private onPointerCancel = (): void => { this.downAt = null; this.endMarquee(); this.nodeDrag?.session?.end(); this.endNodeDrag(); };
   private onPointerUp = (e: PointerEvent): void => {
     const d = this.downAt;
     this.downAt = null;
+    // A real node-drag (#140) ended here — not a click. The CLICK_SLOP test below alone misses a drag
+    // that loops back to within slop of its start (the node still moved + reheated), so it would
+    // double-fire a click-select; bail on the active session. (This host pointerup fires before the
+    // window onNodeDragUp that clears the session.) A no-drag click leaves `session` null and proceeds.
+    if (this.nodeDrag?.session) return;
     const hasSelectableLayer = this.specs.some((s) => s.selectable) || this.anyLaneInteractive("selectable");
     if (!d || (!this.clickCb && !hasSelectableLayer)) return;
     if (Math.hypot(e.clientX - d[0], e.clientY - d[1]) > BaseEngine.CLICK_SLOP) return;
@@ -1360,6 +1398,58 @@ export abstract class BaseEngine {
     this.clickCb?.(hit, e);
     if (hasSelectableLayer) this.applySelectionGesture(hit, e);
   };
+
+  // ── Node-drag (#140) ──────────────────────────────────────────────────────────────────────────
+  /**
+   * The draggable glyph under a pointer event (host CSS px), or null. Gates the d3-zoom pan filter
+   * and the pointerdown grab. Default: never (no node-drag). `network()` overrides it to resolve the
+   * node/aggregate under the cursor when `interactive({ draggable: true })` is set.
+   */
+  protected pickDraggable(_x: number, _y: number): HoverHit | null { return null; }
+  /**
+   * Begin dragging `hit`, grabbed at host CSS px (sx, sy). Return a {@link NodeDragSession} to drive,
+   * or null to decline (→ no drag this gesture). Called once, when the pointer first travels past
+   * {@link CLICK_SLOP} — so a plain click never reheats the layout. Default: declines (no node-drag).
+   */
+  protected beginNodeDrag(_hit: HoverHit, _sx: number, _sy: number): NodeDragSession | null { return null; }
+
+  /** Resolve {@link pickDraggable} for a pointer event (converts viewport → host CSS px). */
+  private draggableAtEvent(e: MouseEvent): HoverHit | null {
+    const r = this.host.getBoundingClientRect();
+    return this.pickDraggable(e.clientX - r.left, e.clientY - r.top);
+  }
+  /** Arm a node-drag: remember the grabbed hit + start point and listen on `window` so the drag
+   *  survives the pointer leaving the host (like the marquee). The session — and the pin/reheat —
+   *  is created lazily on the first real move (so a no-drag click never reheats). */
+  private startNodeDrag(hit: HoverHit, e: PointerEvent): void {
+    this.nodeDrag = { hit, startClientX: e.clientX, startClientY: e.clientY, session: null };
+    window.addEventListener("pointermove", this.onNodeDragMove);
+    window.addEventListener("pointerup", this.onNodeDragUp);
+  }
+  private onNodeDragMove = (e: PointerEvent): void => {
+    const d = this.nodeDrag;
+    if (!d) return;
+    const r = this.host.getBoundingClientRect();
+    if (!d.session) {
+      // First real move: cross CLICK_SLOP before grabbing, so a click-with-jitter stays a click.
+      if (Math.hypot(e.clientX - d.startClientX, e.clientY - d.startClientY) <= BaseEngine.CLICK_SLOP) return;
+      d.session = this.beginNodeDrag(d.hit, d.startClientX - r.left, d.startClientY - r.top);
+      if (!d.session) { this.endNodeDrag(); return; } // engine declined — leave the gesture be
+    }
+    d.session.move(e.clientX - r.left, e.clientY - r.top);
+  };
+  private onNodeDragUp = (): void => {
+    this.nodeDrag?.session?.end();
+    this.endNodeDrag();
+  };
+  /** Drop the window listeners + clear node-drag state. Idempotent. Does NOT call `session.end()`
+   *  (the caller decides whether the drag completed or was cancelled). */
+  private endNodeDrag(): void {
+    if (!this.nodeDrag) return;
+    window.removeEventListener("pointermove", this.onNodeDragMove);
+    window.removeEventListener("pointerup", this.onNodeDragUp);
+    this.nodeDrag = null;
+  }
 
   // ── Marquee (shift+drag region) selection (#159) ──────────────────────────────────────────────
   /** Any registered lane that is **multi**-selectable — the prerequisite for a marquee (a box selecting

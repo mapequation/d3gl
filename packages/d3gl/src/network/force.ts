@@ -50,6 +50,13 @@ export class ForceLayout {
   private readonly tree = new BarnesHutTree();
   /** Reference layout span captured on the first tick; bounds the per-tick step (see {@link tick}). */
   private span0 = 0;
+  /**
+   * Per-node pinned flag (1 = held). A pinned node is **skipped by integration** — its position is
+   * owned externally (the drag session sets it to the cursor each frame, #140) — but it still acts as
+   * a fixed obstacle (it's in the Barnes-Hut tree, so it repels) and its springs still pull neighbours
+   * toward it. `null` until {@link setPinned} is first called, so the common no-drag run allocates nothing.
+   */
+  private pinned: Uint8Array | null = null;
 
   constructor(
     private readonly graph: LayoutGraph,
@@ -61,6 +68,19 @@ export class ForceLayout {
     this.vy = new Float32Array(n);
     this.fx = new Float32Array(n);
     this.fy = new Float32Array(n);
+  }
+
+  /**
+   * Set the held (pinned) node set for an interactive drag (#140), replacing any previous one. Pinned
+   * nodes are left where the caller put them — {@link tick} won't move them — so the drag session can
+   * hold them exactly under the cursor while the rest of the layout reheats around them. Pass `null`
+   * (or an empty iterable) to release every pin. Allocates the flag array lazily on first use.
+   */
+  setPinned(ids: Iterable<number> | null): void {
+    if (!ids) { this.pinned?.fill(0); return; }
+    const flags = (this.pinned ??= new Uint8Array(this.graph.nodeCount));
+    flags.fill(0);
+    for (const id of ids) if (id >= 0 && id < flags.length) flags[id] = 1;
   }
 
   /** Advance the simulation one step, mutating `graph.positions`. */
@@ -111,7 +131,11 @@ export class ForceLayout {
     // can't fling a node to ±∞ and poison the layout with NaN; far above any normal displacement.
     const damping = 0.9;
     const maxStep = this.span0 * 4;
+    const pinned = this.pinned;
     for (let i = 0; i < nodeCount; i++) {
+      // Held nodes (#140) are positioned externally each frame — don't integrate them (and drop any
+      // velocity so they don't lurch when released). They still repel + anchor springs via the passes above.
+      if (pinned && pinned[i]) { vx[i] = 0; vy[i] = 0; continue; }
       let sx = (vx[i]! + fx[i]! * alpha) * damping;
       let sy = (vy[i]! + fy[i]! * alpha) * damping;
       sx = sx > maxStep ? maxStep : sx < -maxStep ? -maxStep : sx;

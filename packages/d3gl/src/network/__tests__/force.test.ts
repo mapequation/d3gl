@@ -33,6 +33,27 @@ describe("ForceLayout", () => {
     expect(Array.from(g.positions).every((v) => Number.isFinite(v))).toBe(true);
   });
 
+  it("setPinned holds a node in place while the rest of the layout moves (#140 drag)", () => {
+    // A connected pair far apart: normally attraction contracts BOTH toward each other. Pin node 0 →
+    // it must not move at all, while node 1 still gets pulled in (the pinned node anchors the spring).
+    const g = buildGraph({ nodeCount: 2, source: [0], target: [1] });
+    g.positions.set([0, 0, 100, 0]);
+    const sim = new ForceLayout(g);
+    sim.setPinned([0]);
+
+    sim.run(60);
+
+    expect(g.positions[0]).toBe(0); // node 0 pinned — x exactly where it started
+    expect(g.positions[1]).toBe(0); // node 0 pinned — y exactly where it started
+    expect(g.positions[2]!).toBeLessThan(100); // node 1 (x at index 2) was pulled toward the held node 0
+    expect(g.positions[2]!).toBeGreaterThan(0); // ...but not past it
+
+    // Releasing the pin lets node 0 move again on the next ticks.
+    sim.setPinned(null);
+    sim.run(10);
+    expect(g.positions[0]).not.toBe(0);
+  });
+
   it("stays finite and bounded on a large near-coincident cluster (softening + step clamp)", () => {
     // A 256-node hub star seeded in a sub-pixel disc: without softening the repulsion ~ 1/d² is
     // enormous and (with the old same-direction coincidence hack) velocities ran away to ±∞ → NaN,

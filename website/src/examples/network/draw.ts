@@ -34,12 +34,19 @@ function degreeRadius(graph: NetworkGraph): NodeRadiusSpec {
  * (constant-pixel) glyphs. The
  * **LOD** toggle enables the adaptive hierarchy cut — dense communities collapse to aggregate glyphs
  * and expand into their members as you zoom in — with **Declutter** (thin overlaps) and **Edges**
- * (super-edges between aggregates). Pair LOD with screen sizing. Drag to pan, scroll to zoom.
+ * (super-edges between aggregates). Pair LOD with screen sizing. Drag empty space to pan, scroll to zoom.
  * **Hover or click** a glyph to resolve the node — or the module it collapsed into — shown top-left.
+ * **Drag a node or a collapsed module** to move it: it tracks the cursor with no lag while the off-thread
+ * worker layout reheats around it and re-cools on release (grab a module to drag its whole subtree).
  */
 export const setup: ImperativeSetup = (host, { width, height, backend }) => {
   const net = network(host, { width, height, backend });
   net.enableZoom([0.002, 200]); // wide range: zoom right out to the aggregate map, in to single nodes
+  // Node-drag (#140): grab a node or a collapsed module and drag it — it tracks the cursor with no lag
+  // while the off-thread worker layout **reheats** around it and re-cools on release. Grab a selected
+  // node to drag the whole selection; grab a module aggregate to drag its whole subtree. Plain drag on
+  // empty space still pans. Hover/click also light a ring (selection) via the same interactive() opt-in.
+  net.interactive({ selectable: { multi: true }, hover: true, draggable: true });
 
   // Picking (#105 N7a): hover/click resolve the node or aggregate under the cursor via the engine's
   // CPU hit-test over the LOD cut frontier — bounded by the visible set, so it stays cheap at 1M. The

@@ -1,4 +1,4 @@
-import { BaseEngine, type BaseEngineOptions, type HoverHit, type InteractiveLayerOptions, type LaneInteractive } from "../map/base-engine.js";
+import { BaseEngine, type BaseEngineOptions, type HoverHit, type InteractiveLayerOptions, type LaneInteractive, type NodeDragSession } from "../map/base-engine.js";
 import { networkLayers, frontierCircles, frontierHalos, superEdges, emitNodes, emitLinks, emitArrows, emitHalfLinks, traceFrontierFills, traceFrontierBorders, traceFrontierHalos, traceSuperHalfArrows, traceSuperLines, traceSuperArrows, rgbaCss, pickNodes, regionNodes, resolveNodeRadii, resolveNodeRadiusAggregate, resolveImportance, resolveFlowBorder, resolveNodeColors, resolveLinkWidthOf, resolveLinkColorOf, resolveLinkStrokeOf, flowBorderInnerRadii, type ResolvedNetworkStyle, type NodeRadiusSpec, type ImportanceSpec, type FlowBorderSpec, type ConstBorder, type LinkWidthSpec, type LinkColorSpec, type LinkStyle } from "./glyphs.js";
 import { rgb } from "d3-color";
 import { ForceLayout, seedPositions, type ForceParams } from "./force.js";
@@ -356,6 +356,8 @@ export class Network extends BaseEngine {
   private readonly NODE_LAYER = "nodes";
   /** The `hit.layer` value link picks resolve to (#141), distinguishing a link hit from a node hit. */
   private readonly LINK_LAYER = "links";
+  /** Re-cool tail (ticks) the main-thread `force` drag runs after release before the sim stops (#140). */
+  private static readonly DRAG_COOL_FRAMES = 90;
   /** Node interaction opts set via {@link interactive} (selection/hover/tooltip). Null = pick-only. */
   private interactiveOpts: InteractiveLayerOptions | null = null;
   /** GPU-readback link picking opt-in (#141). Off ⇒ links carry no pick model and the lane has no
@@ -367,6 +369,10 @@ export class Network extends BaseEngine {
   /** Frontier label overlay (#105 N7b) + its options; null until {@link labels} is enabled. */
   private labelLayer: LabelLayer | null = null;
   private labelOpts: NetworkLabelOptions | null = null;
+  /** While a node-drag is active (#140), re-pins the held positions over each worker frame before it
+   *  paints — in copy mode the worker's streamed snapshot would otherwise clobber the held nodes the
+   *  main thread is holding under the cursor. Null when no drag is in flight. */
+  private dragReapply: (() => void) | null = null;
 
   constructor(host: HTMLElement, opts: NetworkOptions = {}) {
     super(host, opts);
@@ -449,6 +455,11 @@ export class Network extends BaseEngine {
    *   shift/cmd/ctrl-click toggles add/remove.
    * - `hover` — draw a ring on the hovered node/aggregate.
    * - `tooltip: (datum, id) => content` — shown for the hovered node/aggregate.
+   * - `draggable` — grab a node/aggregate and drag it (#140): the held set tracks the cursor with no
+   *   lag while the layout reheats around it and re-cools on release. Grab a **selected** node to drag
+   *   the **whole selection** together; grab a collapsed module to drag its **whole subtree**. Works on
+   *   the `force` and `worker` layout backends (reheat) and `positions` (translate-only). Pair with
+   *   `enableZoom()` and the drag takes precedence over panning when it starts on a glyph.
    * - `selection: { selected, others }` — `selected.stroke` overrides the **select** ring colour
    *   (default `#ff6a00`); the hover ring defaults to `#fff` (override via a `hover` HighlightStyle's
    *   `stroke`). `others` (Scene dimming) is ignored on instanced glyphs — selected glyphs get a ring.
@@ -678,6 +689,7 @@ export class Network extends BaseEngine {
       typeof requestAnimationFrame === "function" ? requestAnimationFrame : (cb) => setTimeout(() => cb(0), 16);
     this.layoutRepaintRaf = raf(() => {
       this.layoutRepaintRaf = 0;
+      this.dragReapply?.(); // hold the dragged nodes under the cursor over the worker's snapshot (#140, copy mode)
       if (!this.lodWorkerTree) this.recomputeLODGeometry(); // worker streams geometry; main only re-cuts
       this.rebuild();
     });
@@ -915,6 +927,127 @@ export class Network extends BaseEngine {
     const out: number[] = [];
     for (const id of ids) if (id >= 0 && id < n) out.push(id);
     return Uint32Array.from(out);
+  }
+
+  // ── Node-drag (#140) ──────────────────────────────────────────────────────────────────────────
+  /** The node/aggregate under host CSS px (x,y) when `interactive({ draggable })` is set — gates the
+   *  d3-zoom pan filter and the pointerdown grab (#140). Only node hits are draggable; a link hit
+   *  (#141) returns null so a drag starting on a link still pans. */
+  protected override pickDraggable(x: number, y: number): HoverHit | null {
+    if (!this.interactiveOpts?.draggable || !this.graph) return null;
+    const hit = this.pick(x, y);
+    return hit && hit.layer === this.NODE_LAYER ? hit : null;
+  }
+
+  /**
+   * Begin dragging the grabbed node/aggregate (#140). Resolves the **held leaf set** — the whole
+   * current selection if the grabbed glyph is part of it, else the grabbed glyph alone (an aggregate
+   * expands to its subtree leaves; an unselected grab also *becomes* the single selection) — snapshots
+   * their start positions, then holds them under the cursor while the layout reheats around them:
+   *
+   * - **force**: a main-thread {@link ForceLayout} pinned to the held set ticks in an rAF loop,
+   *   reflowing neighbours; on release it re-cools for a short tail of ticks, then stops.
+   * - **worker**: the worker pins + reflows the rest off-thread ({@link WorkerLayoutHandle.pin}); the
+   *   main thread writes the held positions every move (zero-lag) and re-pins them over each streamed
+   *   frame ({@link dragReapply}, copy mode). Released via {@link WorkerLayoutHandle.unpin}.
+   * - **positions** (or a worker fallback with no live handle): no sim — the held set just translates.
+   */
+  protected override beginNodeDrag(hit: HoverHit, sx: number, sy: number): NodeDragSession | null {
+    const graph = this.graph;
+    if (!graph || !this.interactiveOpts?.draggable) return null;
+    const held = this.heldLeavesFor(hit);
+    if (held.length === 0) return null;
+
+    const pos = graph.positions;
+    const start = new Float32Array(held.length * 2); // world positions at grab time
+    for (let k = 0; k < held.length; k++) { const id = held[k]!; start[k * 2] = pos[id * 2]!; start[k * 2 + 1] = pos[id * 2 + 1]!; }
+    const t0 = this.transform;
+    const worldStartX = (sx - t0.x) / t0.k, worldStartY = (sy - t0.y) / t0.k;
+    let dx = 0, dy = 0; // world-space cursor delta since grab
+
+    const heldIds = Uint32Array.from(held);
+    const heldPos = new Float32Array(held.length * 2); // interleaved held positions, for the worker pin message
+    // Hold every grabbed leaf at (start + cursor delta), mirrored into `heldPos` for the worker pin.
+    const applyHeld = (): void => {
+      for (let k = 0; k < held.length; k++) {
+        const id = held[k]!;
+        const px = start[k * 2]! + dx, py = start[k * 2 + 1]! + dy;
+        pos[id * 2] = px; pos[id * 2 + 1] = py;
+        heldPos[k * 2] = px; heldPos[k * 2 + 1] = py;
+      }
+    };
+    const setDelta = (mx: number, my: number): void => {
+      const t = this.transform; // read live so a pinch/scroll mid-drag still maps screen → world
+      dx = (mx - t.x) / t.k - worldStartX;
+      dy = (my - t.y) / t.k - worldStartY;
+    };
+
+    const backend = this.layoutOpts.backend;
+    const handle = this.layoutHandle;
+
+    // force: own rAF loop ticks the pinned sim + repaints, so neighbours follow; re-cools on release.
+    if (backend === "force") {
+      const sim = new ForceLayout(graph, this.layoutOpts.force);
+      sim.setPinned(held);
+      const rafFn: (cb: FrameRequestCallback) => number =
+        typeof requestAnimationFrame === "function" ? requestAnimationFrame : (cb) => setTimeout(() => cb(0), 16);
+      let raf = 0;
+      let cool = -1; // -1 while held; ≥0 counts down the re-cool tail after release
+      const frame = (): void => {
+        raf = 0;
+        if (!this.graph || !this.backend()) return; // engine destroyed / backend gone — stop the loop
+        if (cool < 0) applyHeld(); // hold under the cursor; once released, let the held set settle freely
+        sim.tick();
+        this.repaintDuringDrag();
+        if (cool >= 0 && --cool < 0) return; // tail finished — stop the loop
+        raf = rafFn(frame);
+      };
+      raf = rafFn(frame);
+      return {
+        move: setDelta,
+        end: () => { sim.setPinned(null); cool = Network.DRAG_COOL_FRAMES; if (!raf) raf = rafFn(frame); },
+      };
+    }
+
+    // worker: the worker reflows the rest off-thread while the main thread holds the grabbed set crisply.
+    if (backend === "worker" && handle) {
+      applyHeld();
+      handle.pin(heldIds, heldPos);
+      this.dragReapply = applyHeld;
+      this.repaintDuringDrag();
+      return {
+        move: (mx, my) => { setDelta(mx, my); applyHeld(); handle.pin(heldIds, heldPos); this.repaintDuringDrag(); },
+        end: () => { handle.unpin(); this.dragReapply = null; },
+      };
+    }
+
+    // positions / no live worker: translate the held set under the cursor, no reheat.
+    return {
+      move: (mx, my) => { setDelta(mx, my); applyHeld(); this.repaintDuringDrag(); },
+      end: () => {},
+    };
+  }
+
+  /** The leaf node ids a grabbed hit drags (#140): the whole selection if the grab is part of it,
+   *  else the grabbed glyph's own leaves (an aggregate → its subtree; an unselected grab also becomes
+   *  the single selection, so a subsequent drag of it moves it alone). */
+  private heldLeavesFor(hit: HoverHit): number[] {
+    const id = hit.id as number;
+    const selected = this.selectedIds(this.NODE_LAYER);
+    if (selected?.has(id)) {
+      const leaves = new Set<number>(); // union of every selected entry's leaves
+      for (const h of this.selection()) if (h.layer === this.NODE_LAYER) for (const m of h.members?.() ?? [h.id]) leaves.add(m as number);
+      return [...leaves];
+    }
+    if (this.interactiveOpts?.selectable) this.select(this.NODE_LAYER, [id]); // unselected grab → single selection
+    return (hit.members?.() ?? [id]) as number[];
+  }
+
+  /** Recompute the LOD geometry from the moved positions (skipped on a worker-streamed tree — the
+   *  worker owns it) and re-emit + repaint. The per-frame paint shared by every drag backend (#140). */
+  private repaintDuringDrag(): void {
+    if (!this.lodWorkerTree) this.recomputeLODGeometry();
+    this.rebuild();
   }
 
   /** Whether the LOD cut can run (enabled, tree built, geometry computed at least once). */

@@ -382,6 +382,42 @@ geometry as you pan and zoom.
 
 ## Dragging nodes
 
-Interactive node dragging — grab a node, pin it to the cursor, and let the simulation reheat for a
-moment while its neighbours readjust — lands together with **picking** in a later step (it shares
-the engine's hit-testing), so it can resolve nodes correctly through level-of-detail at scale.
+Add `draggable` to `interactive()` and a **plain drag that starts on a glyph moves it** — grab a node,
+it tracks the cursor while the layout **reheats** around it, and the simulation re-cools when you let go.
+A plain drag on **empty space** still pans, and `shift+drag` still draws the [marquee](#modular-level-of-detail);
+the drag only takes over when the pointer goes down on a node, so it composes with `enableZoom()` with no
+extra wiring.
+
+```ts
+net.interactive({ draggable: true, selectable: { multi: true }, hover: true });
+net.enableZoom([0.002, 200]); // pan/zoom; a drag starting on a node moves it instead of panning
+```
+
+What moves depends on what you grab:
+
+- **A node** → that node alone.
+- **A node that's part of the current selection** → the **whole selection** moves together (every selected
+  node is held + translated by the cursor delta). Grabbing an **unselected** node first makes it the
+  selection, then drags it alone.
+- **A collapsed module aggregate** (under [LOD](#level-of-detail-lod)) → its **whole subtree** — every leaf
+  descendant translates, and the aggregate glyph follows because its centroid re-derives from the moved
+  leaves. (`members()` enumerates exactly those leaves, the same set selection uses.)
+
+The held node tracks the cursor with **no lag** on every backend, because the held positions are written on
+the **main thread** each pointer move — the layout backend only reflows *the rest*:
+
+| `layout({ backend })` | While dragging | On release |
+| --- | --- | --- |
+| `force` (main thread) | a pinned [`ForceLayout`](#large-scale-layout-in-a-web-worker) reheats neighbours each frame | re-cools over a short tail, then stops |
+| `worker` (off thread) | the worker **pins** the held set and reflows the rest off-thread; the main thread holds them under the cursor | the worker is **unpinned** and re-cools |
+| `positions` (fixed coords) | the held set simply **translates** (no simulation to reheat) | — |
+
+On the `worker` backend the worker is kept **alive** (idle) after the initial layout converges, so a drag
+can reheat it instantly without re-seeding — the held nodes are pinned (skipped by the worker's integration)
+while their positions are owned by the main thread, so they never rubber-band behind the cursor.
+
+:::note[Drag is opt-in and gated]
+`draggable` is off until you set it (like every `interactive()` option). It only grabs **node** glyphs — a
+drag starting on a *link* still pans — and it reheats only on the `force`/`worker` layout backends; on
+`positions` (caller-supplied coordinates) a drag translates the grabbed set without running a simulation.
+:::
