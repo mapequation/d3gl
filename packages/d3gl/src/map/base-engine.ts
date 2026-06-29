@@ -504,6 +504,21 @@ export abstract class BaseEngine {
     return (this.selected.get(layer)?.size ?? 0) > 0 || (this.laneHilite.get(layer)?.size ?? 0) > 0;
   }
 
+  /**
+   * Resolved `selection.others` dim opacity for an instanced-lane layer (#162) — the lane analogue of
+   * a Scene layer's `others` dimming, which lanes apply as a per-instance alpha multiply in their emit
+   * (see `map/selection-dim.ts`). Returns the layer's `selection.others.opacity` (default `0.3`,
+   * matching Scene `_applySelect`) when a selection is active on `layer`, else `null` (no dim — the
+   * emit short-circuits). Lanes honor only the opacity component of `others`; a colour override there
+   * is ignored on lanes. Hover does NOT dim (matching Scene, where only `select()` dims) — so this
+   * keys off the persistent selection set alone. */
+  protected othersDim(layer: string): number | null {
+    if ((this.selected.get(layer)?.size ?? 0) === 0) return null;
+    const others = this.laneInteractiveFor(layer)?.ix.options.selection?.others;
+    const op = others === undefined ? 0.3 : others.opacity ?? 1;
+    return op < 1 ? op : null;
+  }
+
   /** Drop any managed selection + hover highlight for `layer` — e.g. when an engine disables that
    *  layer's interaction (so a stale selection can't survive as un-highlightable ghost state). */
   protected clearLayerSelection(layer: string): void {
@@ -529,6 +544,19 @@ export abstract class BaseEngine {
     const found = this.laneInteractiveFor(layer);
     if (!found || !this.instancedLanes.has(found.ix.highlightLane)) return;
     this.emitInstancedLane(found.ix.highlightLane);
+    this.render();
+  }
+
+  /** Re-emit BOTH an interactive lane's base layers and its highlight overlay — used when the
+   *  **selection** set changes, so the base lane re-applies (or clears) `selection.others` dimming
+   *  (#162) on its glyphs/links, not just the ring overlay. A hover-only change instead uses
+   *  {@link emitHighlightFor} (ring overlay alone), which leaves the dimmed base untouched — keeping
+   *  pointermove cheap. No-op when `layer` isn't an interactive lane. */
+  private emitSelectionFor(layer: string): void {
+    const found = this.laneInteractiveFor(layer);
+    if (!found) return;
+    this.emitInstancedLane(found.name); // base lane: re-applies/clears the per-instance others-dim
+    if (this.instancedLanes.has(found.ix.highlightLane)) this.emitInstancedLane(found.ix.highlightLane);
     this.render();
   }
 
@@ -833,7 +861,7 @@ export abstract class BaseEngine {
       if (typeof set === "function") throw new Error(`select(${name}, fn): function selectors are Scene-layer only; pass an id array for instanced lanes`);
       if (set === null) this.selected.delete(name);
       else this.selected.set(name, new Set(set));
-      this.emitHighlightFor(name);
+      this.emitSelectionFor(name);
       this.selectCb?.(this.selection(), undefined);
       return this;
     }
@@ -1613,9 +1641,10 @@ export abstract class BaseEngine {
    *  refresh their companion ring overlay instead (no Scene drawables to recolor). */
   private applySelectionStyles(touched: Set<string>): void {
     for (const n of touched) {
-      // Lane-first: an interactive lane refreshes its ring overlay; otherwise a Scene layer restyles.
+      // Lane-first: an interactive lane re-emits its base layers (others-dim) + ring overlay;
+      // otherwise a Scene layer restyles.
       if (this.laneInteractiveFor(n)) {
-        this.emitHighlightFor(n);
+        this.emitSelectionFor(n);
       } else {
         const ids = this.selected.get(n);
         this._applySelect(n, ids && ids.size ? ids : null);

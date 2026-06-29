@@ -49,4 +49,29 @@ describe("plot declutter points — interactive lane (#105 N7c-2)", () => {
     expect([...(hit?.members?.() ?? [])].sort((a, b) => (a as number) - (b as number))).toEqual([0, 1]);
     chart.destroy();
   });
+
+  it("#162 dims non-selected kept points to selection.others.opacity (default 0.3)", async () => {
+    const chart = plot(host(), { width: 200, height: 200 });
+    await chart.whenReady();
+    // Points 0 (x=10) + 1 (x=12) collide under declutter:20 → 0 keeps, 1 absorbed; point 2 (x=150) stands alone.
+    const data = [{ x: 10, y: 10 }, { x: 12, y: 10 }, { x: 150, y: 150 }];
+    chart.points("pts", data, { x: (d) => d.x, y: (d) => d.y, radius: 5, fill: "#000", declutter: 20, selectable: true, id: (_d, i) => i });
+    const T = { k: 1, x: 0, y: 0 };
+    chart.setTransform(T);
+
+    /* eslint-disable @typescript-eslint/no-explicit-any */
+    const lane = (chart as any).instancedLanes.get("points:pts").lane;
+    chart.select("pts", [2]); // select the standalone point
+    const colors = lane.update(T, 200, 200)[0].circles.colors as Uint8Array;
+    const kept = [...(lane.visible as Uint32Array)]; // kept survivor indices, parallel to the colour instances
+    const alphaOf = (pt: number): number => colors[kept.indexOf(pt) * 4 + 3]!;
+    expect(alphaOf(2)).toBe(255); // selected point 2 stays full
+    expect(alphaOf(0)).toBe(Math.round(255 * 0.3)); // non-selected kept survivor 0 is dimmed
+
+    chart.select("pts", null);
+    const cleared = lane.update(T, 200, 200)[0].circles.colors as Uint8Array;
+    expect(cleared[kept.indexOf(0) * 4 + 3]).toBe(255); // dim removed on clear
+    /* eslint-enable @typescript-eslint/no-explicit-any */
+    chart.destroy();
+  });
 });

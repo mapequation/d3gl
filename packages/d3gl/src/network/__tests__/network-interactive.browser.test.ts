@@ -290,3 +290,93 @@ describe("network interactive lane (#105 N7c-2)", () => {
     net.destroy();
   });
 });
+
+// #162: selection.others dimming + outgoing-link emphasis on the instanced node lane.
+describe("network selection.others dim + outgoing links (#162)", () => {
+  /* eslint-disable @typescript-eslint/no-explicit-any */
+  const baseLane = (net: any) => net.instancedLanes.get("network").lane;
+  const hlLane = (net: any) => net.instancedLanes.get("network-highlight").lane;
+  const T = { k: 1, x: 0, y: 0 };
+  const emit = (lane: any): any[] => lane.update(T, 200, 200);
+  const layer = (layers: any[], name: string) => layers.find((l) => l.name === name);
+  const linkColors = (l: any): Uint8Array => (l.primitive === "lines" ? l.lines.colors : l.halfArrows.colors);
+
+  it("#1 selecting a node dims the others to the default 0.3 and keeps the selected node full", async () => {
+    const net = network(host(), { width: 200, height: 200 });
+    await net.whenReady();
+    const g = buildGraph({ nodeCount: 3, source: [0, 1], target: [1, 2], directed: false });
+    net.data(g).style({ nodeRadius: 6 }).layout({ backend: "positions", positions: new Float32Array([10, 10, 90, 90, 170, 30]) });
+    net.interactive({ selectable: true }); // default selection.others = { opacity: 0.3 }
+
+    const before = layer(emit(baseLane(net)), "nodes").circles.colors as Uint8Array;
+    const base = [before[3], before[7], before[11]]; // alpha of nodes 0,1,2 (opaque ⇒ 255)
+    expect(base).toEqual([255, 255, 255]);
+
+    net.select("nodes", [1]);
+    const after = layer(emit(baseLane(net)), "nodes").circles.colors as Uint8Array;
+    expect(after[7]).toBe(255); // selected node 1 stays full
+    expect(after[3]).toBe(Math.round(255 * 0.3)); // node 0 dimmed
+    expect(after[11]).toBe(Math.round(255 * 0.3)); // node 2 dimmed
+
+    net.select("nodes", null); // clearing the selection removes the dim
+    const cleared = layer(emit(baseLane(net)), "nodes").circles.colors as Uint8Array;
+    expect([cleared[3], cleared[7], cleared[11]]).toEqual([255, 255, 255]);
+    net.destroy();
+  });
+
+  it("#1 honors a custom selection.others.opacity", async () => {
+    const net = network(host(), { width: 200, height: 200 });
+    await net.whenReady();
+    const g = buildGraph({ nodeCount: 3, source: [0, 1], target: [1, 2], directed: false });
+    net.data(g).style({ nodeRadius: 6 }).layout({ backend: "positions", positions: new Float32Array([10, 10, 90, 90, 170, 30]) });
+    net.interactive({ selectable: true, selection: { others: { opacity: 0.5 } } });
+
+    net.select("nodes", [0]);
+    const a = layer(emit(baseLane(net)), "nodes").circles.colors as Uint8Array;
+    expect(a[3]).toBe(255); // selected node 0 full
+    expect(a[7]).toBe(Math.round(255 * 0.5)); // node 1 at the custom opacity
+    net.destroy();
+  });
+
+  it("#2 a selected node keeps its outgoing links full while other links dim (directed)", async () => {
+    const net = network(host(), { width: 200, height: 200 });
+    await net.whenReady();
+    // Directed chain 0→1→2: node 0's only outgoing edge is edge 0 (0→1).
+    const g = buildGraph({ nodeCount: 3, source: [0, 1], target: [1, 2], directed: true });
+    net.data(g).style({ nodeRadius: 6, directed: true }).layout({ backend: "positions", positions: new Float32Array([10, 10, 90, 90, 170, 30]) });
+    net.interactive({ selectable: true });
+
+    net.select("nodes", [0]);
+    const links = linkColors(layer(emit(baseLane(net)), "links"));
+    expect(links[3]).toBe(255); // edge 0 (0→1) outgoing from the selected node 0 → full
+    expect(links[7]).toBe(Math.round(255 * 0.3)); // edge 1 (1→2) → dimmed
+    net.destroy();
+  });
+
+  it("#3 hovering a node overlays its outgoing links in the hover lane (transient)", async () => {
+    const h = host();
+    const net = network(h, { width: 200, height: 200 });
+    await net.whenReady();
+    const g = buildGraph({ nodeCount: 3, source: [0, 1], target: [1, 2], directed: true });
+    net.data(g).style({ nodeRadius: 8, directed: true }).layout({ backend: "positions", positions: new Float32Array([10, 10, 90, 90, 170, 30]) });
+    net.interactive({ selectable: true, hover: true });
+    (net as any).setTransform(T);
+
+    // No hover yet → no hover-link layer in the highlight lane.
+    expect(layer(emit(hlLane(net)), "network-highlight:hover-links")).toBeUndefined();
+
+    // Hover node 0 (world == screen at k=1) → its single outgoing link (0→1) overlays in the hover lane.
+    const rect = h.getBoundingClientRect();
+    h.dispatchEvent(new PointerEvent("pointermove", { clientX: rect.left + 10, clientY: rect.top + 10, bubbles: true }));
+    const hover = layer(emit(hlLane(net)), "network-highlight:hover-links");
+    expect(hover).toBeDefined();
+    expect(hover.lines.count).toBe(1); // node 0 has exactly one outgoing edge
+
+    // Moving off clears the transient overlay.
+    h.dispatchEvent(new PointerEvent("pointermove", { clientX: rect.left + 199, clientY: rect.top + 199, bubbles: true }));
+    expect(layer(emit(hlLane(net)), "network-highlight:hover-links")).toBeUndefined();
+    net.destroy();
+    h.remove();
+  });
+  /* eslint-enable @typescript-eslint/no-explicit-any */
+});

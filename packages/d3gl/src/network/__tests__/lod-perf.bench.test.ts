@@ -4,6 +4,7 @@ import { buildLODTree, computeLODGeometry, cut, declutterFrontier, visibleWorldR
 import { multilevelSeed } from "../coarsen.js";
 import { superEdges, frontierCircles } from "../glyphs.js";
 import { buildGraph } from "../graph.js";
+import { dimOthers } from "../../map/selection-dim.js";
 
 // General per-frame LOD performance harness (the WebGL hot path: cut → declutter → super-edges →
 // frontier circles, all pure CPU). Use it to get EMPIRICAL before/after per-frame timings at scale when
@@ -60,14 +61,21 @@ const SE_STYLE = {
 const FC_STYLE = { nodeFill: "#4878d0", aggregateFill: "#7f97c8", maxAggregateRadius: 26 };
 
 /** Run one frame of the per-frame LOD compute at transform `t`, returning the visible frontier size. */
-function frame(tree: LODTree, t: LODTransform, opts: { crossFade?: number; crossLevelEdges?: boolean; scratch: Float32Array }): number {
+function frame(tree: LODTree, t: LODTransform, opts: { crossFade?: number; crossLevelEdges?: boolean; dimSel?: Set<number>; scratch: Float32Array }): number {
   const fadeBand = opts.crossFade ?? 0;
   const fadeAlpha = fadeBand > 0 ? opts.scratch : undefined;
   const raw = cut(tree, t, W, H, { expandPx: 48, maxAggregateRadius: 26, fadeBand, fadeAlpha });
   const frontier = declutterFrontier(tree, raw, t, W, H, { screenSized: false, k: t.k, maxAggregateRadius: 26, fadeAlpha });
   const view = visibleWorldRect(t, W, H);
-  superEdges(tree, frontier, { ...SE_STYLE, crossLevelEdges: opts.crossLevelEdges, fadeAlpha }, view);
-  frontierCircles(tree, frontier, { ...FC_STYLE, fadeAlpha });
+  const { lines, ids } = superEdges(tree, frontier, { ...SE_STYLE, crossLevelEdges: opts.crossLevelEdges, fadeAlpha }, view);
+  const circles = frontierCircles(tree, frontier, { ...FC_STYLE, fadeAlpha });
+  // #162 others-dim: the per-instance alpha multiply over the frontier (nodes) + emitted super-edges (links).
+  const sel = opts.dimSel;
+  if (sel) {
+    dimOthers(circles.colors, frontier.length, 0.3, (k) => sel.has(frontier[k]!));
+    dimOthers(circles.borderColors, frontier.length, 0.3, (k) => sel.has(frontier[k]!));
+    dimOthers(lines?.colors, ids.length, 0.3, (k) => { const p = ids[k]!; const s = Math.floor(p / tree.size); return sel.has(s) || sel.has(p - s * tree.size); });
+  }
   return frontier.length;
 }
 
@@ -98,11 +106,13 @@ describe("LOD per-frame performance", () => {
       const k = baseK * 6;
       const t: LODTransform = { k, x: W / 2 - centroid[0] * k, y: H / 2 - centroid[1] * k };
 
+      const dimSel = new Set<number>([0, 1, 2, 3, 4]); // a small selection — exercises the #162 others-dim
       const rows = [
         measure("baseline (no cross-fade, no cross-level)", () => frame(tree, t, { scratch })),
         measure("crossLevelEdges on", () => frame(tree, t, { crossLevelEdges: true, scratch })),
         measure("crossFade 0.3", () => frame(tree, t, { crossFade: 0.3, scratch })),
         measure("crossFade 0.3 + crossLevelEdges on", () => frame(tree, t, { crossFade: 0.3, crossLevelEdges: true, scratch })),
+        measure("others-dim (selection active)", () => frame(tree, t, { dimSel, scratch })),
       ];
 
       const lines = [

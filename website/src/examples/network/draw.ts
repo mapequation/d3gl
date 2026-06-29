@@ -36,6 +36,9 @@ function degreeRadius(graph: NetworkGraph): NodeRadiusSpec {
  * and expand into their members as you zoom in — with **Declutter** (thin overlaps) and **Edges**
  * (super-edges between aggregates). Pair LOD with screen sizing. Drag empty space to pan, scroll to zoom.
  * **Hover or click** a glyph to resolve the node — or the module it collapsed into — shown top-left.
+ * **Selecting** a node dims the rest of the graph (the `selection.others` focus, consistent with GeoMap
+ * + Plot) while keeping the selected node *and its outgoing links* at full strength; **hovering** a node
+ * lights up its outgoing links too (the link analogue of the hover ring).
  * **Drag a node or a collapsed module** to move it: it tracks the cursor with no lag while the off-thread
  * worker layout reheats around it and re-cools on release (grab a module to drag its whole subtree).
  */
@@ -47,6 +50,8 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
   // node to drag the whole selection; grab a module aggregate to drag its whole subtree. Plain drag on
   // empty space still pans. Hover/click also light a ring (selection) via the same interactive() opt-in.
   // Default ring palette: green hover/will-add, blue selection, red will-remove (matches the +/− marquee badges).
+  // selection.others defaults to { opacity: 0.3 } (#162): selecting a node dims the rest of the graph while
+  // keeping the selected node + its outgoing links full; hovering a node also lights its outgoing links.
   net.interactive({ selectable: { multi: true }, hover: true, draggable: true });
 
   // Picking (#105 N7a): hover/click resolve the node or aggregate under the cursor via the engine's

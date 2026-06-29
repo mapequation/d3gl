@@ -4,6 +4,7 @@ import { BaseEngine, type InteractiveLayerOptions, type BaseEngineOptions, type 
 import { LayerHandle } from "./layer-handle.js";
 import { resolvePlotPointsSoA, plotPointsCircles, declutterPointsStrategy } from "./points-lane.js";
 import { resolveRingColors, ringCircles } from "./highlight-ring.js";
+import { dimOthers } from "./selection-dim.js";
 
 /** Shared empty kept-set returned by a points highlight lane when nothing is selected/hovered. */
 const EMPTY_KEPT = new Uint32Array(0);
@@ -157,13 +158,22 @@ export class Plot extends BaseEngine {
       const interactive = !!(ixOpts.selectable || ixOpts.hover || ixOpts.tooltip || ixOpts.selection);
       const winners = interactive ? new Int32Array(n) : undefined;
       const strategy = declutterPointsStrategy(n, allCenters, allRadii, opts.declutter as number, undefined, this.width, this.height, screenSized, winners);
-      const srcLane = new InstancedLane(strategy, (vis) => [{
-        name: laneName,
-        primitive: "circles",
+      const srcLane = new InstancedLane(strategy, (vis) => {
         // Gather kept indices into scratch buffers (no accessor calls, no rgb() parse, no allocation).
-        circles: plotPointsCircles(vis, allCenters, allRadii, allColors, scratchCenters, scratchRadii, scratchColors),
-        sizeMode: opts.sizeMode ?? "world",
-      }]);
+        const circles = plotPointsCircles(vis, allCenters, allRadii, allColors, scratchCenters, scratchRadii, scratchColors);
+        // selection.others dimming (#162): fade non-selected kept points to the layer's others-opacity,
+        // matching Scene layers + network. O(1) when nothing is selected (othersDim short-circuits).
+        const dimOp = this.othersDim(name);
+        if (dimOp != null) {
+          const selSet = this.selectedIds(name);
+          if (selSet && selSet.size) {
+            const kept = (k: number): boolean => selSet.has(ids[vis[k]!]!);
+            dimOthers(circles.colors, vis.length, dimOp, kept);
+            dimOthers(circles.borderColors, vis.length, dimOp, kept);
+          }
+        }
+        return [{ name: laneName, primitive: "circles", circles, sizeMode: opts.sizeMode ?? "world" }];
+      });
       const idToIndex = interactive ? new Map(ids.map((id, i) => [id, i])) : undefined;
       const laneInteractive: LaneInteractive | undefined = interactive ? {
         layer: name,

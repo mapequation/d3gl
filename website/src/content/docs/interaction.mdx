@@ -84,6 +84,23 @@ them. `select()` rewrites the layer's whole override table (last write wins vs `
 Bulk overrides are colors-only: stroke geometry bakes its width at tessellation time, so a bulk
 `lineWidth` would be O(n) re-tessellation — use the hover overlay for width changes.
 
+### On instanced lanes (network nodes, decluttered points)
+
+`selection.others` works the same on GPU-instanced lanes — network `nodes` and a `plot` layer's
+decluttered `points` — as on retained layers: with a selection active, non-selected glyphs fade to
+`others.opacity` (default `0.3`) as a per-instance alpha multiply, applied on selection change (and
+folded into the per-frame emit under LOD, so it stays O(visible) — see the cost model). The
+persistent selection **ring** remains the *selected* affordance; the dim is the complementary focus.
+Lanes honor the **opacity** component of `others` (a colour override there is ignored — instanced
+glyphs have no Scene drawable to recolour).
+
+For a **network**, a selected node additionally keeps its **outgoing links** at full strength while
+the rest dim — so a selection reads as "this node and what it points to" (incident links for an
+undirected graph; under LOD, the selected aggregate's outgoing super-edges). **Hovering** a node
+lights its outgoing links in the hover colour too — the transient link analogue of the hover ring.
+These links are a *visual* companion derived from the node selection; `selection()` / `on("select")`
+stay node-only.
+
 ## Cost model
 
 | Operation | Cost | When |
