@@ -88,13 +88,22 @@ describe("network shift+drag marquee (#159)", () => {
       h.dispatchEvent(new PointerEvent(type, { clientX: r.left + sx, clientY: r.top + sy, shiftKey: true, altKey: alt, bubbles: true, button: 0, pointerId: 1 }));
     const badge = () => document.querySelector(".d3gl-marquee-badge") as HTMLElement | null;
 
+    net.select("nodes", [1]); // node 1 (100,100) selected → a subtract box over it previews red removal
+    /* eslint-disable @typescript-eslint/no-explicit-any */
+    const removeIds = () => (net as any).removeIds("nodes") as Set<number> | undefined;
+
     ev("pointerdown", 20, 20, false);
-    ev("pointermove", 120, 120, false); // additive (no alt) → "+"
+    ev("pointermove", 120, 120, false); // additive (no alt) → "+"; no red removal preview
     expect(badge()?.textContent).toBe("+");
-    ev("pointermove", 130, 130, true);  // alt held mid-drag → "−"
+    expect(removeIds()?.size ?? 0).toBe(0);
+    ev("pointermove", 130, 130, true);  // alt held mid-drag → "−"; box covers selected node 1 → red ring
     expect(badge()?.textContent).toBe("−");
+    expect([...(removeIds() ?? [])]).toEqual([1]);
     ev("pointerup", 130, 130, true);
-    expect(badge()).toBeNull(); // removed on release
+    expect(badge()).toBeNull();              // removed on release
+    expect(removeIds()?.size ?? 0).toBe(0);  // preview set cleared
+    /* eslint-enable @typescript-eslint/no-explicit-any */
+    expect(net.selection().map((s) => s.id)).toEqual([]); // node 1 subtracted out
     net.destroy();
   });
 

@@ -901,7 +901,8 @@ export class Network extends BaseEngine {
       lane: new InstancedLane(strategy, (visible) => {
         if (visible.length === 0) return [];
         const selected = this.selectedIds(this.NODE_LAYER);
-        return [{ name: ringName, primitive: "circles", sizeMode, circles: ringCircles(visible, centerOf, radiusOf, (g) => !!selected?.has(g), colors) }];
+        const remove = this.removeIds(this.NODE_LAYER); // subtract-marquee preview (#140) — ring these red
+        return [{ name: ringName, primitive: "circles", sizeMode, circles: ringCircles(visible, centerOf, radiusOf, (g) => !!selected?.has(g), colors, remove ? (g) => remove.has(g) : undefined) }];
       }),
       layerNames: [ringName], dynamic: true,
       resolve: () => null,

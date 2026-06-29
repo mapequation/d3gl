@@ -226,6 +226,9 @@ export abstract class BaseEngine {
   /** Transient hover ids per instanced-lane layer (#105 N7c-2) — the hover-ring set, distinct from
    *  the persistent `selected` set. Read by a lane's companion highlight strategy. At most one entry. */
   private laneHilite = new Map<string, Set<string | number>>();
+  /** Transient "will-be-removed" ids per instanced-lane layer (#140): the selected glyphs a live
+   *  **subtract** marquee currently covers. Read by a lane's highlight strategy to ring them red. */
+  private laneRemove = new Map<string, Set<string | number>>();
   /** Instanced-lane layer whose hover ring is currently shown (auto-hover), so a target change clears it. */
   private laneHoverLayer: string | null = null;
   /** Per-Scene-layer declutter `winners` array (id→kept survivor), for `members()` on decluttered glyphs. */
@@ -490,6 +493,10 @@ export abstract class BaseEngine {
   /** Transient hover/manual-highlight ids for an instanced-lane layer (#105 N7c-2) — the hover ring. */
   protected hoveredIds(layer: string): ReadonlySet<string | number> | undefined {
     return this.laneHilite.get(layer);
+  }
+  /** Selected ids a live subtract-marquee currently covers (#140) — ringed red ("will be removed"). */
+  protected removeIds(layer: string): ReadonlySet<string | number> | undefined {
+    return this.laneRemove.get(layer);
   }
   /** Whether anything is currently highlighted on `layer` (selection or hover) — lets a lane's
    *  highlight strategy short-circuit to an empty visible set (O(1)) when nothing is shown. */
@@ -1500,8 +1507,8 @@ export abstract class BaseEngine {
       m.badge.style.left = `${e.clientX + 10}px`;
       m.badge.style.top = `${e.clientY + 10}px`;
     }
-    // Live preview: ring the glyphs the box currently covers (the hover ring), updated as it grows.
-    this.previewMarquee(this.marqueeRect(m.startClientX, m.startClientY, e.clientX, e.clientY));
+    // Live preview: ring the glyphs the box currently covers — blue "will-add", or (alt) red "will-remove".
+    this.previewMarquee(this.marqueeRect(m.startClientX, m.startClientY, e.clientX, e.clientY), e.altKey);
   };
   private onMarqueeUp = (e: PointerEvent): void => {
     const m = this.marquee;
@@ -1549,24 +1556,40 @@ export abstract class BaseEngine {
     }
     return byLayer;
   }
-  /** Live marquee preview: show the will-be-selected glyphs with the hover ring (blue), updated as the
-   *  box grows. Reuses the lane's transient hover set (`laneHilite`) — selected glyphs keep their own
-   *  ring colour. Re-emits a lane's ring overlay only when its set changed (a drag fires many moves). */
-  private previewMarquee(rect: ScreenRect): void {
+  /** Live marquee preview, updated as the box grows. **Additive** (default): ring the box's glyphs with
+   *  the hover ring (blue, "will add") via `laneHilite` — already-selected glyphs keep their own ring.
+   *  **Subtract** (alt held): ring the box's *selected* glyphs red ("will remove") via `laneRemove` and
+   *  show no blue (subtract adds nothing). Re-emits a lane's ring overlay only when its sets changed (a
+   *  drag fires many moves). */
+  private previewMarquee(rect: ScreenRect, subtract: boolean): void {
     const byLayer = this.marqueeIdsByLayer(rect);
     // Update layers in the box, and clear any previewed layer no longer in it.
     for (const layer of this.marqueePreview) if (!byLayer.has(layer)) byLayer.set(layer, new Set());
-    for (const [layer, ids] of byLayer) {
-      if (setsEqual(this.laneHilite.get(layer), ids)) continue;
-      if (ids.size) { this.laneHilite.set(layer, ids); this.marqueePreview.add(layer); }
-      else { this.laneHilite.delete(layer); this.marqueePreview.delete(layer); }
+    // Treat undefined and empty as equal so an empty→empty pass doesn't re-emit.
+    const same = (cur: ReadonlySet<string | number> | undefined, want: Set<string | number>) =>
+      (cur?.size ?? 0) === 0 ? want.size === 0 : setsEqual(cur, want);
+    for (const [layer, boxIds] of byLayer) {
+      let hilite: Set<string | number>; // blue "will-add"
+      let remove: Set<string | number>; // red "will-remove"
+      if (subtract) {
+        const sel = this.selected.get(layer);
+        hilite = new Set();
+        remove = sel ? new Set([...boxIds].filter((id) => sel.has(id))) : new Set();
+      } else {
+        hilite = boxIds;
+        remove = new Set();
+      }
+      if (same(this.laneHilite.get(layer), hilite) && same(this.laneRemove.get(layer), remove)) continue;
+      if (hilite.size) this.laneHilite.set(layer, hilite); else this.laneHilite.delete(layer);
+      if (remove.size) this.laneRemove.set(layer, remove); else this.laneRemove.delete(layer);
+      if (hilite.size || remove.size) this.marqueePreview.add(layer); else this.marqueePreview.delete(layer);
       this.emitHighlightFor(layer);
     }
   }
   /** Drop the live preview rings (on marquee end / cancel). */
   private clearMarqueePreview(): void {
     if (this.marqueePreview.size === 0) return;
-    for (const layer of this.marqueePreview) { this.laneHilite.delete(layer); this.emitHighlightFor(layer); }
+    for (const layer of this.marqueePreview) { this.laneHilite.delete(layer); this.laneRemove.delete(layer); this.emitHighlightFor(layer); }
     this.marqueePreview.clear();
   }
   /** Apply a finished marquee box to the selection of every multi-selectable lane, then refresh styling

@@ -13,6 +13,7 @@ const RING_OUTER = 1.34; // ring outer radius ÷ glyph radius
 const RING_BORDER_FRAC = 0.16; // border thickness ÷ ring outer radius
 const DEFAULT_SELECT_RING: RGBA = [255, 106, 0, 255]; // orange — the persistent selection ring
 const DEFAULT_HOVER_RING: RGBA = [255, 255, 255, 255]; // white — the transient hover ring
+const DEFAULT_REMOVE_RING: RGBA = [220, 38, 38, 255]; // red (#dc2626) — "will be removed" (subtract-marquee preview, #140)
 
 function cssToRgba(css: string, fallback: RGBA): RGBA {
   const c = rgb(css);
@@ -22,27 +23,31 @@ function cssToRgba(css: string, fallback: RGBA): RGBA {
 
 /** Resolve the select/hover ring colours from the interaction opts (`selection.selected.stroke` / a
  *  hover {@link HighlightStyle}'s `stroke`), falling back to the orange/white defaults. */
-export function resolveRingColors(opts: InteractiveLayerOptions): { select: RGBA; hover: RGBA } {
+export function resolveRingColors(opts: InteractiveLayerOptions): { select: RGBA; hover: RGBA; remove: RGBA } {
   const selStroke = opts.selection?.selected?.stroke;
   const hov = opts.hover;
   const hovStroke = hov && typeof hov === "object" && "stroke" in hov ? (hov as { stroke?: string }).stroke : undefined;
   return {
     select: selStroke ? cssToRgba(selStroke, DEFAULT_SELECT_RING) : DEFAULT_SELECT_RING,
     hover: hovStroke ? cssToRgba(hovStroke, DEFAULT_HOVER_RING) : DEFAULT_HOVER_RING,
+    remove: DEFAULT_REMOVE_RING,
   };
 }
 
 /**
  * Build one ring circle per highlighted glyph (transparent fill + coloured border). `centerOf`/
  * `radiusOf` read the glyph's world/screen centre + radius for a source id; `isSelected` picks the
- * persistent select colour over the transient hover colour for ids in the selection set.
+ * persistent select colour over the transient hover colour for ids in the selection set. `isRemove`
+ * (optional) overrides both with the `remove` colour for glyphs a subtract-marquee will deselect
+ * (#140) — red "will be removed", the inverse of the blue "will be added" hover preview.
  */
 export function ringCircles(
   ids: Uint32Array,
   centerOf: (g: number) => [number, number],
   radiusOf: (g: number) => number,
   isSelected: (g: number) => boolean,
-  colors: { select: RGBA; hover: RGBA },
+  colors: { select: RGBA; hover: RGBA; remove?: RGBA },
+  isRemove?: (g: number) => boolean,
 ): InstancedCirclesData {
   const count = ids.length;
   const centers = new Float32Array(count * 2);
@@ -56,7 +61,7 @@ export function ringCircles(
     centers[k * 2 + 1] = cy;
     radii[k] = radiusOf(g) * RING_OUTER;
     borders[k] = RING_BORDER_FRAC;
-    const col = isSelected(g) ? colors.select : colors.hover;
+    const col = isRemove?.(g) && colors.remove ? colors.remove : isSelected(g) ? colors.select : colors.hover;
     borderColors[k * 4] = col[0];
     borderColors[k * 4 + 1] = col[1];
     borderColors[k * 4 + 2] = col[2];
