@@ -27,7 +27,8 @@ are projected back down and refined — far faster convergence and fewer tangles
 With `layout({ backend: "worker" })` the entire solve runs in a **Web Worker** and streams positions
 back, so the layout **converges progressively on screen** while the main thread stays responsive —
 pan and zoom while it settles. (On a cross-origin-isolated page positions are shared zero-copy via
-`SharedArrayBuffer`; otherwise they are posted as snapshots.) The **Nodes** slider scales from 10 to
+`SharedArrayBuffer`; otherwise they are posted as snapshots — the top-right readout shows whether the
+environment supports it and whether this layout is actually using it.) The **Nodes** slider scales from 10 to
 1,000,000; **Seeding** compares multilevel against a cold start; **Size** switches uniform vs
 degree-weighted radius; **Sizing** switches world vs screen units; and **LOD** / **Declutter** /
 **Edges** control the level-of-detail cut (below). Drag to pan, scroll to zoom.

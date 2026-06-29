@@ -735,6 +735,19 @@ export class Network extends BaseEngine {
   }
 
   /**
+   * Which position transport the active worker layout uses: `"shared"` when positions stream zero-copy
+   * via a `SharedArrayBuffer` (the page is cross-origin isolated), `"copy"` when they are posted as
+   * per-frame snapshots (no COOP/COEP isolation, or the worker fell back to a synchronous solve), or
+   * `"none"` when no worker-backed layout is active (the `force`/`positions` backends, or before
+   * `layout({ backend: "worker" })`). This is the run's *actual* transport; the environment's
+   * *capability* — independent of any run — is {@link sharedMemoryAvailable}.
+   */
+  get layoutTransport(): "shared" | "copy" | "none" {
+    if (!this.layoutHandle) return "none";
+    return this.layoutHandle.shared ? "shared" : "copy";
+  }
+
+  /**
    * Re-emit the instanced layers to the backend and repaint. A no-op until a graph is set and a
    * backend exposing the instanced lane is live — on non-WebGL backends this draws through the
    * PathContext seam instead (small-N / export, #100 N2.3). When LOD is active and settled, the

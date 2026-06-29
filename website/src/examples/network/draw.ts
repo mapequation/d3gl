@@ -1,4 +1,4 @@
-import { network, buildGraph, type NodeRadiusSpec, type NetworkGraph, type NetworkHit } from "@mapequation/d3gl/network";
+import { network, buildGraph, sharedMemoryAvailable, type NodeRadiusSpec, type NetworkGraph, type NetworkHit } from "@mapequation/d3gl/network";
 import { scaleSqrt } from "d3-scale";
 import type { ImperativeSetup } from "../types.js";
 import { generateLFR } from "./data.js";
@@ -65,6 +65,26 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
   net.on("hover", (hit) => { readout.textContent = describe(hit); });
   net.on("click", (hit) => { if (hit) readout.textContent = `clicked ${describe(hit)}`; });
 
+  // SharedArrayBuffer transport readout (#163). Two distinct signals: the environment's *capability*
+  // (`sharedMemoryAvailable()` — needs a cross-origin-isolated page via COOP/COEP, set on the dev/preview
+  // server but not on GitHub Pages), and whether the running worker layout *actually* uses it
+  // (`net.layoutTransport`, which is `"copy"` if the worker fell back to a synchronous solve even where SAB
+  // is available). Hover either line for the explanation.
+  const sab = document.createElement("div");
+  sab.className =
+    "absolute top-2 right-2 pointer-events-none rounded bg-white/85 px-2 py-1 font-mono text-[11px] leading-tight [font-variant-numeric:tabular-nums]";
+  host.appendChild(sab);
+  const yesNo = (b: boolean): string => (b ? "yes" : "no");
+  const updateSab = (): void => {
+    const supported = sharedMemoryAvailable();
+    const inUse = net.layoutTransport === "shared";
+    sab.style.color = inUse ? "#1a7f37" : supported ? "#9a6700" : "#8a8a8a";
+    sab.innerHTML =
+      `<span title="Environment capability: SharedArrayBuffer needs a cross-origin-isolated page (COOP: same-origin + COEP: require-corp). Set on the dev/preview server; GitHub Pages can't send these headers — see issue #163.">SAB supported: <b>${yesNo(supported)}</b></span><br>` +
+      `<span title="Actual transport of the running worker layout: yes = positions stream zero-copy through a SharedArrayBuffer; no = posted as per-frame snapshots (also when the worker fell back to a synchronous solve).">SAB in use: <b>${yesNo(inUse)}</b></span>`;
+  };
+  updateSab();
+
   return {
     engine: net,
     render: (options) => {
@@ -130,6 +150,7 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
             : false,
         )
         .layout({ backend: "worker", iterations, multilevel });
+      updateSab(); // the new worker run has now chosen its transport
     },
   };
 };
