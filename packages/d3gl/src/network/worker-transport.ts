@@ -36,11 +36,23 @@ export interface WorkerLayoutOptions {
 }
 
 export interface WorkerLayoutHandle {
-  /** Resolves when the layout converges or is stopped. */
+  /** Resolves when the layout first converges or is stopped. The worker stays **alive** after
+   *  convergence (idle, not terminated) so a node-drag can reheat it (#140); only {@link stop} tears it down. */
   settled: Promise<void>;
   /** Cancel the run and tear the worker down (resolves `settled`). */
   stop(): void;
+  /**
+   * Hold `ids` and reheat the layout so the rest reflows around them (#140). In copy mode pass the
+   * held nodes' `positions` (interleaved `[x, y, …]` in `ids` order); in shared mode write them into
+   * the position SAB instead and omit `positions`. No-op on the synchronous fallback (no live worker).
+   */
+  pin(ids: Uint32Array, positions?: Float32Array): void;
+  /** Release every pin and let the layout re-cool, then idle (#140). No-op on the fallback. */
+  unpin(): void;
 }
+
+/** Handle for the synchronous fallback (no live worker) — reheat is a no-op there. */
+const NOOP_DRAG = { pin() {}, unpin() {} };
 
 const TARGET_FRAMES = 60;
 
@@ -75,7 +87,7 @@ export function startWorkerLayout(
       new ForceLayout(graph, opts.force).run(iterations);
     }
     onFrame();
-    return { settled: Promise.resolve(), stop() {} };
+    return { settled: Promise.resolve(), stop() {}, ...NOOP_DRAG };
   };
   if (typeof Worker === "undefined") return fallback();
 
@@ -101,12 +113,16 @@ export function startWorkerLayout(
 
   let resolveSettled!: () => void;
   const settled = new Promise<void>((r) => (resolveSettled = r));
-  let finished = false;
-  const finish = (): void => {
-    if (finished) return;
-    finished = true;
+  // `settled` resolves once (initial convergence); the worker then stays ALIVE, idle, so a node-drag
+  // can reheat it (#140). `terminate` is the real teardown (stop / worker error); it also settles.
+  let terminated = false;
+  let settledOnce = false;
+  const settle = (): void => { if (settledOnce) return; settledOnce = true; resolveSettled(); };
+  const terminate = (): void => {
+    if (terminated) return;
+    terminated = true;
     worker.terminate();
-    resolveSettled();
+    settle();
   };
 
   // Copy-mode only: the full `[cx, cy, extent]` buffer backing the LOD tree, refilled each frame from
@@ -126,10 +142,12 @@ export function startWorkerLayout(
     if (msg.positions && !shared) graph.positions.set(msg.positions);
     if (msg.geometry && lodGeomFlat) lodGeomFlat.set(msg.geometry); // copy-mode geometry snapshot
     onFrame();
-    if (msg.type === "done") finish();
+    // `done` = the layout (initial run, or a drag re-cool) reached rest. Resolve `settled` the first
+    // time; keep the worker alive either way so a later drag can reheat it.
+    if (msg.type === "done") settle();
   };
   worker.onerror = (): void => {
-    if (finished) return;
+    if (terminated) return;
     // Worker failed mid-run — fall back to a synchronous solve so the user still gets a layout.
     if (multilevel) multilevelLayout(graph, syncOpts);
     else {
@@ -137,7 +155,7 @@ export function startWorkerLayout(
       new ForceLayout(graph, opts.force).run(iterations);
     }
     onFrame();
-    finish();
+    terminate();
   };
 
   const start: MainToWorker = {
@@ -161,10 +179,22 @@ export function startWorkerLayout(
   return {
     settled,
     stop() {
-      if (finished) return;
+      if (terminated) return;
       const stop: MainToWorker = { type: "stop" };
       worker.postMessage(stop);
-      finish();
+      terminate();
+    },
+    pin(ids: Uint32Array, positions?: Float32Array) {
+      if (terminated) return;
+      // Shared mode: the main thread already wrote the held positions into the SAB the worker reads,
+      // so send only the ids. Copy mode: the worker has its own buffer — send the positions too.
+      const pin: MainToWorker = shared ? { type: "pin", ids } : { type: "pin", ids, positions };
+      worker.postMessage(pin);
+    },
+    unpin() {
+      if (terminated) return;
+      const unpin: MainToWorker = { type: "unpin" };
+      worker.postMessage(unpin);
     },
   };
 }

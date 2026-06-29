@@ -15,11 +15,12 @@ function host(): HTMLElement {
   return el;
 }
 
-/** Dispatch a shift+drag from host-relative (x0,y0) to (x1,y1): the move grows the box past CLICK_SLOP. */
-function shiftDrag(h: HTMLElement, x0: number, y0: number, x1: number, y1: number): void {
+/** Dispatch a shift+drag from host-relative (x0,y0) to (x1,y1): the move grows the box past CLICK_SLOP.
+ *  With `alt`, holds option/alt for the whole gesture → a **subtract** marquee (#140 feedback). */
+function shiftDrag(h: HTMLElement, x0: number, y0: number, x1: number, y1: number, alt = false): void {
   const r = h.getBoundingClientRect();
   const ev = (type: string, sx: number, sy: number) =>
-    h.dispatchEvent(new PointerEvent(type, { clientX: r.left + sx, clientY: r.top + sy, shiftKey: true, bubbles: true, button: 0, pointerId: 1 }));
+    h.dispatchEvent(new PointerEvent(type, { clientX: r.left + sx, clientY: r.top + sy, shiftKey: true, altKey: alt, bubbles: true, button: 0, pointerId: 1 }));
   ev("pointerdown", x0, y0); // starts the marquee (onPointerDown → startMarquee)
   ev("pointermove", x1, y1); // bubbles to the window move listener → creates the overlay
   ev("pointerup", x1, y1);   // bubbles to the window up listener → finalizes the region select
@@ -55,6 +56,54 @@ describe("network shift+drag marquee (#159)", () => {
     net.select("nodes", [0]); // pre-existing selection
     shiftDrag(h, 40, 40, 160, 160);
     expect(idsOf(net)).toEqual([0, 1, 3]); // node 0 kept, box added 1 and 3
+    net.destroy();
+  });
+
+  it("alt+drag subtracts the box's glyphs from the selection (Illustrator-style)", async () => {
+    const h = host();
+    const net = network(h, { width: 200, height: 200 });
+    await net.whenReady();
+    const g = buildGraph({ nodeCount: 4, source: [0, 1], target: [1, 2], directed: false });
+    net.data(g).style({ nodeRadius: 6 }).layout({ backend: "positions", positions: new Float32Array([10, 10, 100, 100, 190, 190, 50, 150]) });
+    net.setTransform({ k: 1, x: 0, y: 0 });
+    net.interactive({ selectable: { multi: true } });
+
+    net.select("nodes", [0, 1, 3]); // start with three selected
+    shiftDrag(h, 40, 40, 160, 160, true); // alt held → subtract; box covers nodes 1 (100,100) and 3 (50,150)
+    expect(idsOf(net)).toEqual([0]); // 1 and 3 removed; 0 (outside the box) kept
+    net.destroy();
+  });
+
+  it("shows a + / − mode badge at the cursor while dragging (toggles with alt)", async () => {
+    const h = host();
+    const net = network(h, { width: 200, height: 200 });
+    await net.whenReady();
+    const g = buildGraph({ nodeCount: 2, source: [0], target: [1], directed: false });
+    net.data(g).style({ nodeRadius: 6 }).layout({ backend: "positions", positions: new Float32Array([10, 10, 100, 100]) });
+    net.setTransform({ k: 1, x: 0, y: 0 });
+    net.interactive({ selectable: { multi: true } });
+
+    const r = h.getBoundingClientRect();
+    const ev = (type: string, sx: number, sy: number, alt: boolean) =>
+      h.dispatchEvent(new PointerEvent(type, { clientX: r.left + sx, clientY: r.top + sy, shiftKey: true, altKey: alt, bubbles: true, button: 0, pointerId: 1 }));
+    const badge = () => document.querySelector(".d3gl-marquee-badge") as HTMLElement | null;
+
+    net.select("nodes", [1]); // node 1 (100,100) selected → a subtract box over it previews red removal
+    /* eslint-disable @typescript-eslint/no-explicit-any */
+    const removeIds = () => (net as any).removeIds("nodes") as Set<number> | undefined;
+
+    ev("pointerdown", 20, 20, false);
+    ev("pointermove", 120, 120, false); // additive (no alt) → "+"; no red removal preview
+    expect(badge()?.textContent).toBe("+");
+    expect(removeIds()?.size ?? 0).toBe(0);
+    ev("pointermove", 130, 130, true);  // alt held mid-drag → "−"; box covers selected node 1 → red ring
+    expect(badge()?.textContent).toBe("−");
+    expect([...(removeIds() ?? [])]).toEqual([1]);
+    ev("pointerup", 130, 130, true);
+    expect(badge()).toBeNull();              // removed on release
+    expect(removeIds()?.size ?? 0).toBe(0);  // preview set cleared
+    /* eslint-enable @typescript-eslint/no-explicit-any */
+    expect(net.selection().map((s) => s.id)).toEqual([]); // node 1 subtracted out
     net.destroy();
   });
 

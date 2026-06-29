@@ -237,6 +237,44 @@ describe("network interactive lane (#105 N7c-2)", () => {
     net.destroy();
   });
 
+  it("selection ring coexists with flowBorder + aggregateOutline on a collapsed module (modular-map combo)", async () => {
+    // The directed-map-of-modules example combines per-node flow borders + an aggregate outline with
+    // interactive selection/hover/drag (#140). Assert that combo renders an aggregate's selection ring
+    // (separate companion lane) without throwing — the rings are independent of the glyph borders.
+    const net = network(host(), { width: 200, height: 200 });
+    await net.whenReady();
+    const g = buildGraph({
+      nodeCount: 4, source: [0, 2, 1], target: [1, 3, 2], directed: true,
+      nodeFlow: new Float32Array([0.4, 0.3, 0.2, 0.1]),
+    });
+    const modules = [
+      { id: 0, path: [1, 1] }, { id: 1, path: [1, 2] }, { id: 2, path: [2, 1] }, { id: 3, path: [2, 2] },
+    ];
+    const ringW = (f: number) => f * 8; // enter/exit-flow ring scale
+    net
+      .data(g)
+      .style({
+        directed: true, sizeMode: "screen", linkStyle: "half-arrow",
+        nodeRadius: { by: "flow", scale: (f: number) => 4 + f * 10 },
+        flowBorder: { flow: new Float32Array([0.5, 0.2, 0.3, 0.1]), scale: ringW },
+      })
+      .lod({ modules, expandPx: 20, superEdges: true, aggregateOutline: { width: 1.5, gap: 3 } })
+      .layout({ backend: "positions", positions: new Float32Array([70, 90, 85, 90, 115, 110, 130, 110]) });
+    net.interactive({ selectable: { multi: true }, draggable: true, hover: true });
+    net.setTransform({ k: 1, x: 0, y: 0 }); // collapse to two module aggregates
+
+    /* eslint-disable @typescript-eslint/no-explicit-any */
+    const tree = (net as any).lodTree;
+    const agg = [...((net as any).instancedLanes.get("network").lane.visible as Uint32Array)].find((id) => id >= tree.leafCount)!;
+    expect(agg).toBeDefined();
+    net.select("nodes", [agg]); // ring the collapsed, flow-bordered, outlined module
+    // The companion ring lane renders the selected aggregate (coexisting with flowBorder + aggregateOutline).
+    expect([...(net as any).instancedLanes.get("network-highlight").lane.visible]).toContain(agg);
+    expect(net.selection()[0]!.members?.().length).toBe(tree.count[agg]); // its subtree leaves
+    /* eslint-enable @typescript-eslint/no-explicit-any */
+    net.destroy();
+  });
+
   it("toggling interactive(false) returns to pick-only (no managed selection)", async () => {
     const net = network(host(), { width: 200, height: 200 });
     await net.whenReady();

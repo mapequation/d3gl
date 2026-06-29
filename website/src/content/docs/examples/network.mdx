@@ -262,12 +262,15 @@ glyphs that aggregate something return more than `[id]`. The whole selection set
 
 When the lane is **multi**-selectable (`selectable: { multi: true }`), **shift+drag** draws a **marquee**
 that adds every node/aggregate whose centre falls in the box to the selection — additive, like shift+click,
-and observable through the same `on("select")` / `selection()`. While you drag, the glyphs the box currently
-covers light up with the **hover ring** (a live preview of what releasing will select). No extra call: it's
-built into the gesture layer and gated on multi-select (plain drag still pans; shift is reserved for the
-box). It's a CPU range query over the screen-bounded frontier — exact and cheap even at millions of nodes,
-no GPU readback (the [link picker](#picking-links) needs the GPU because links are thin; node *centres* in
-a rect don't).
+and observable through the same `on("select")` / `selection()`. Hold **option/alt** while dragging to
+**subtract** instead (the Illustrator gesture) — the box then *removes* its glyphs from the selection, and a
+small badge follows the cursor showing **+** (add) or **−** (subtract). The live preview matches: adding rings
+the box's glyphs **blue** ("will add"), subtracting rings the box's *selected* glyphs **red** ("will remove"),
+so you can see exactly what releasing will do. No extra call: it's
+built into the gesture layer and gated on multi-select (plain drag pans or [drags a node](#dragging-nodes);
+shift is reserved for the box). It's a CPU range query over the screen-bounded frontier — exact and cheap even
+at millions of nodes, no GPU readback (the [link picker](#picking-links) needs the GPU because links are thin;
+node *centres* in a rect don't).
 
 :::note[`on("hover")` vs `interactive({ hover })` — two different things]
 `on("hover", cb)` and `on("click", cb)` are **raw pick callbacks**: they fire on every pick whether or
@@ -275,8 +278,10 @@ not you call `interactive()`, and they draw nothing — you do whatever you want
 at the top of this page uses `on("hover")` only to update a text readout). `interactive({ hover: true })`
 is the opt-in that draws the **visual ring** on the hovered/selected glyph and manages the selection set.
 Every interaction option is **off until you set it**, and `interactive()` itself is opt-in — omit it and
-nodes stay pick-only. Defaults when on: the **select** ring is `#ff6a00`, the **hover** ring is `#fff`
-(override via `selection.selected.stroke` and a `hover` HighlightStyle's `stroke`).
+nodes stay pick-only. The default ring palette is consistent across the selection gestures: **blue**
+(`#2563eb`) = selected, **green** (`#16a34a`) = hover / will-add (matches the marquee's green **+** badge),
+**red** (`#dc2626`) = will-remove (matches the **−** badge). Override the first two via
+`selection.selected.stroke` and a `hover` HighlightStyle's `stroke`.
 :::
 
 ### Picking links
@@ -382,6 +387,42 @@ geometry as you pan and zoom.
 
 ## Dragging nodes
 
-Interactive node dragging — grab a node, pin it to the cursor, and let the simulation reheat for a
-moment while its neighbours readjust — lands together with **picking** in a later step (it shares
-the engine's hit-testing), so it can resolve nodes correctly through level-of-detail at scale.
+Add `draggable` to `interactive()` and a **plain drag that starts on a glyph moves it** — grab a node,
+it tracks the cursor while the layout **reheats** around it, and the simulation re-cools when you let go.
+A plain drag on **empty space** still pans, and `shift+drag` still draws the [marquee](#modular-level-of-detail);
+the drag only takes over when the pointer goes down on a node, so it composes with `enableZoom()` with no
+extra wiring.
+
+```ts
+net.interactive({ draggable: true, selectable: { multi: true }, hover: true });
+net.enableZoom([0.002, 200]); // pan/zoom; a drag starting on a node moves it instead of panning
+```
+
+What moves depends on what you grab:
+
+- **A node** → that node alone.
+- **A node that's part of the current selection** → the **whole selection** moves together (every selected
+  node is held + translated by the cursor delta). Grabbing an **unselected** node first makes it the
+  selection, then drags it alone.
+- **A collapsed module aggregate** (under [LOD](#level-of-detail-lod)) → its **whole subtree** — every leaf
+  descendant translates, and the aggregate glyph follows because its centroid re-derives from the moved
+  leaves. (`members()` enumerates exactly those leaves, the same set selection uses.)
+
+The held node tracks the cursor with **no lag** on every backend, because the held positions are written on
+the **main thread** each pointer move — the layout backend only reflows *the rest*:
+
+| `layout({ backend })` | While dragging | On release |
+| --- | --- | --- |
+| `force` (main thread) | a pinned [`ForceLayout`](#large-scale-layout-in-a-web-worker) reheats neighbours each frame | re-cools over a short tail, then stops |
+| `worker` (off thread) | the worker **pins** the held set and reflows the rest off-thread; the main thread holds them under the cursor | the worker is **unpinned** and re-cools |
+| `positions` (fixed coords) | the held set simply **translates** (no simulation to reheat) | — |
+
+On the `worker` backend the worker is kept **alive** (idle) after the initial layout converges, so a drag
+can reheat it instantly without re-seeding — the held nodes are pinned (skipped by the worker's integration)
+while their positions are owned by the main thread, so they never rubber-band behind the cursor.
+
+:::note[Drag is opt-in and gated]
+`draggable` is off until you set it (like every `interactive()` option). It only grabs **node** glyphs — a
+drag starting on a *link* still pans — and it reheats only on the `force`/`worker` layout backends; on
+`positions` (caller-supplied coordinates) a drag translates the grabbed set without running a simulation.
+:::

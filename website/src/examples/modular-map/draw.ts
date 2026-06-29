@@ -18,6 +18,11 @@ import { loadModularMap } from "./data.js";
  * `net.labels({ max: 12, labelOf })` badges the **12 highest-flow glyphs in view** (#105 N7b) with their
  * size — re-ranked + re-placed as you pan/zoom. Unlike the symmetric gasket, flow varies here, so a
  * `max` cap meaningfully surfaces the dominant modules/hubs.
+ *
+ * `net.interactive({ selectable, hover, draggable })` adds the selection/hover rings + node-drag (#140):
+ * hover/click rings a node or module, ⇧+drag box-selects (⌥ subtracts), and dragging a glyph — or a whole
+ * selection, or a collapsed module — moves it (translate-only here, on the `positions` backend). It shows
+ * the selection/hover ring living alongside the per-node **flowBorder** ring and a module's **aggregateOutline**.
  */
 export const setup: ImperativeSetup = (host, { width, height, backend }) => {
   const net = network(host, { width, height, backend });
@@ -76,6 +81,12 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
   }
   net.layout({ backend: "positions", positions: p }); // commit the scaled layout at the default k=1 view
   net.enableZoom([0.1, 40]); // default view; zoom out to the module map, in to single nodes
+  // Selection + hover rings and node-drag (#140): hover/click rings a node or module (green hover, blue
+  // selection), ⇧+drag box-selects (⌥ subtracts, red preview), and dragging a glyph — or a whole selected
+  // set, or a collapsed module — moves it. The final layout is the `positions` backend, so a drag here
+  // *translates* the grabbed set (no sim to reheat). Note how the selection/hover ring sits alongside the
+  // per-node flowBorder ring and a collapsed module's aggregateOutline.
+  net.interactive({ selectable: { multi: true }, draggable: true, hover: true });
 
   // Frontier labels (#105 N7b): here flow VARIES across modules, so capping with `max` surfaces the
   // highest-flow glyphs in view (badged with their size). The Labels slider sets the cap (top end =

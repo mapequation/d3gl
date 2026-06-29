@@ -43,7 +43,29 @@ export interface StopMessage {
   type: "stop";
 }
 
-export type MainToWorker = StartMessage | StopMessage;
+/**
+ * Pin (hold) a set of nodes for an interactive drag (#140), and resume integration so the rest of the
+ * layout reheats around them. Sent on drag start and again whenever the held positions change. The
+ * worker {@link ForceLayout.setPinned}s `ids` (skipped by integration) and — in **copy mode** — writes
+ * `positions` into its own buffer first, so its streamed snapshot + LOD geometry reflect the held
+ * nodes. In **shared mode** the main thread writes the held positions straight into the position SAB,
+ * so `positions` is omitted. After the initial layout converged the worker idles (alive, not
+ * terminated); this message wakes it.
+ */
+export interface PinMessage {
+  type: "pin";
+  /** Held node ids (skipped by integration; still repel + anchor springs). */
+  ids: Uint32Array;
+  /** Copy mode only: interleaved `[x, y, …]` for `ids` in order — the worker writes these before integrating. */
+  positions?: Float32Array;
+}
+
+/** Release every pin (drag ended) and let the layout re-cool over a short tail of ticks, then idle (#140). */
+export interface UnpinMessage {
+  type: "unpin";
+}
+
+export type MainToWorker = StartMessage | StopMessage | PinMessage | UnpinMessage;
 
 /**
  * The LOD tree, posted once after the worker coarsens (only when `lod` was requested). `topology`'s
