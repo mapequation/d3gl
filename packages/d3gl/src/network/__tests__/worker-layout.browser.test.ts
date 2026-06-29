@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { startWorkerLayout } from "../worker-transport.js";
+import { startWorkerLayout, sharedMemoryAvailable } from "../worker-transport.js";
 import { network } from "../network.js";
 import { buildGraph } from "../graph.js";
 import type { LODTree } from "../lod.js";
@@ -59,6 +59,30 @@ describe("worker layout (off-thread, progressive)", () => {
     await net.whenSettled();
 
     net.destroy();
+  });
+
+  it("reports the selected position transport (handle.shared / layoutTransport mirror sharedMemoryAvailable)", async () => {
+    // The test page is not cross-origin isolated, so this is false here; assert the *relationship*
+    // rather than the literal so the test still holds if the harness ever runs isolated.
+    const available = sharedMemoryAvailable();
+    expect(typeof available).toBe("boolean");
+
+    const handle = startWorkerLayout(ring(24), { width: 200, height: 200, iterations: 20, frameEvery: 1 }, () => {});
+    expect(handle.shared).toBe(available); // decided synchronously when the worker run starts
+    await handle.settled;
+
+    const host = document.createElement("div");
+    host.style.width = "200px";
+    host.style.height = "200px";
+    document.body.appendChild(host);
+    const net = network(host, { width: 200, height: 200 });
+    await net.whenReady();
+    expect(net.layoutTransport).toBe("none"); // no worker-backed layout started yet
+    net.data(ring(24)).layout({ backend: "worker", iterations: 20 });
+    expect(net.layoutTransport).toBe(available ? "shared" : "copy");
+    await net.whenSettled();
+    net.destroy();
+    host.remove();
   });
 });
 

@@ -15,6 +15,20 @@ import react from "@astrojs/react";
 const mod = (name) =>
   fileURLToPath(new URL(`../packages/d3gl/src/${name}/index.ts`, import.meta.url));
 
+// Cross-origin isolation. These two headers make the page `crossOriginIsolated`,
+// which is what re-enables `SharedArrayBuffer`. The network layout worker then
+// streams positions to the renderer zero-copy via a shared buffer instead of
+// copying them through postMessage each frame (it self-selects at runtime via
+// `canShareMemory()` in network/worker-transport.ts; without isolation it falls
+// back to the postMessage copy). The site loads no cross-origin subresources, so
+// `require-corp` is safe here — the only exception is the opt-in `?debug-spectorjs`
+// helper, which won't load on an isolated page. GitHub Pages can't set response
+// headers (see #163), so this only takes effect on the dev/preview servers.
+const crossOriginIsolationHeaders = {
+  "Cross-Origin-Opener-Policy": "same-origin",
+  "Cross-Origin-Embedder-Policy": "require-corp",
+};
+
 // The 9 library module entry points documented by the API reference.
 const referenceEntryPoints = [
   "../packages/d3gl/src/core/index.ts",
@@ -72,6 +86,10 @@ const typeDocPlugin = starlightTypeDoc({
 export default defineConfig({
   site: "https://mapequation.github.io",
   base: "/d3gl/",
+  // Astro's top-level `server.headers` applies to both `astro dev` and
+  // `astro preview` (unlike `vite.server.headers`, which the Astro dev server
+  // does not forward).
+  server: { headers: crossOriginIsolationHeaders },
   integrations: [starlight({
     title: "d3gl",
     customCss: ["./src/styles/global.css"],

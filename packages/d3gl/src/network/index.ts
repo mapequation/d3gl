@@ -35,3 +35,5 @@ export type { ForceParams, LayoutGraph } from "./force.js";
 
 export { coarsenLevel, buildHierarchy, multilevelLayout } from "./coarsen.js";
 export type { CoarseLevel, Hierarchy, CoarsenOptions, MultilevelLayoutOptions } from "./coarsen.js";
+
+export { sharedMemoryAvailable } from "./worker-transport.js";

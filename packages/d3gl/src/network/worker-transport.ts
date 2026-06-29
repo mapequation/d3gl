@@ -36,6 +36,12 @@ export interface WorkerLayoutOptions {
 }
 
 export interface WorkerLayoutHandle {
+  /**
+   * Whether this run streams positions **zero-copy** via a `SharedArrayBuffer` (cross-origin-isolated
+   * page) rather than per-frame postMessage copies. `false` in copy mode and on the synchronous
+   * fallback (no live worker). Mirrors {@link sharedMemoryAvailable} for an active worker run.
+   */
+  shared: boolean;
   /** Resolves when the layout first converges or is stopped. The worker stays **alive** after
    *  convergence (idle, not terminated) so a node-drag can reheat it (#140); only {@link stop} tears it down. */
   settled: Promise<void>;
@@ -56,8 +62,15 @@ const NOOP_DRAG = { pin() {}, unpin() {} };
 
 const TARGET_FRAMES = 60;
 
-/** Whether SharedArrayBuffer zero-copy transport is usable (cross-origin-isolated page). */
-function canShareMemory(): boolean {
+/**
+ * Whether this environment can use the `SharedArrayBuffer` zero-copy position transport: `SharedArrayBuffer`
+ * exists and the page is cross-origin isolated (served with `Cross-Origin-Opener-Policy: same-origin` +
+ * `Cross-Origin-Embedder-Policy: require-corp`). When false, the worker posts per-frame position snapshots
+ * instead. This reports the environment's *capability*; whether a given run actually used it is
+ * {@link WorkerLayoutHandle.shared} (they differ when the worker is unavailable and the layout falls back
+ * to a synchronous main-thread solve).
+ */
+export function sharedMemoryAvailable(): boolean {
   return typeof SharedArrayBuffer !== "undefined" && globalThis.crossOriginIsolated === true;
 }
 
@@ -87,7 +100,7 @@ export function startWorkerLayout(
       new ForceLayout(graph, opts.force).run(iterations);
     }
     onFrame();
-    return { settled: Promise.resolve(), stop() {}, ...NOOP_DRAG };
+    return { shared: false, settled: Promise.resolve(), stop() {}, ...NOOP_DRAG };
   };
   if (typeof Worker === "undefined") return fallback();
 
@@ -102,7 +115,7 @@ export function startWorkerLayout(
   // frame is in flight. NetworkGraph satisfies the force core's LayoutGraph view.
   seedPositions(graph, width, height);
 
-  const shared = canShareMemory();
+  const shared = sharedMemoryAvailable();
   let sharedPositions: SharedArrayBuffer | undefined;
   if (shared) {
     sharedPositions = new SharedArrayBuffer(graph.nodeCount * 2 * Float32Array.BYTES_PER_ELEMENT);
@@ -177,6 +190,7 @@ export function startWorkerLayout(
   worker.postMessage(start);
 
   return {
+    shared,
     settled,
     stop() {
       if (terminated) return;
