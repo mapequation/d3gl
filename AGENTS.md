@@ -3,6 +3,9 @@
 Notes for anyone (human or agent) working in this repo. Read before touching geo
 rendering, the build, or the test setup.
 
+> The root `CLAUDE.md` imports this file (`@AGENTS.md`) so Claude Code auto-loads these
+> conventions every session. **This file is canonical — edit it, not `CLAUDE.md`.**
+
 ## Core values
 
 - **Efficient rendering** — Never increase the computational complexity or memory footprint of the rendering path without first weighing the options and asking me for guidance. Explain the trade-offs concretely: how run time and space grow with the input (node / edge / vertex count) under each option, and how noticeable it will be for a user.
@@ -122,7 +125,9 @@ long it stays useful:
    deferred follow-up and shipped a 30× zoom regression.)
 6. **Human verification** — Summarize what you have done (point to the Performance section
    for any per-frame / memory impact) and ask for approval before merging a PR.
-7. Create changesets.
+7. **Create changesets** (see §Releases). **Enforced** (§Enforcement): a PR that changes
+   `packages/d3gl/**` without a changeset, or that closes an issue without a `## Performance`
+   section, is blocked by the `policy` CI check and a local pre-merge hook.
 8. **Merge with squash** (see below), then **delete the feature branch** (local +
    remote) once it's in `main`.
 9. **Tear down the worktree.** Stop any dev server you started in it and **wait for its
@@ -153,6 +158,28 @@ git branch -D <branch>             # local (confirm it merged via `gh pr list --
 
 **Never delete** `changeset-release/main` (the Changesets release bot branch) or any branch
 with an open PR.
+
+### Enforcement (changeset + Performance policy)
+
+Lifecycle steps 7 (changeset) and 5 (`## Performance`) are mechanically gated by **one
+shared check** — `scripts/check-pr-policy.mjs` — run two ways so the omission that
+prompted this (network PRs shipped with no changeset) can't repeat:
+
+- **CI required check** — `.github/workflows/changeset-policy.yml`, status name **`policy`**.
+  The authoritative gate: `gh pr merge --squash` is server-side, so branch protection that
+  requires `policy` blocks any non-conforming merge no matter who triggers it. Enable it once:
+  Settings ▸ Branches ▸ protect `main` ▸ *Require status checks to pass* ▸ add `policy`.
+- **Local pre-merge hook** — `scripts/premerge-gate.sh`, wired in `.claude/settings.json` as a
+  Claude Code `PreToolUse(Bash)` hook. It runs the same check before any `gh pr merge` and
+  blocks the call on failure (a shift-left backstop). It degrades to *allow* if it can't
+  evaluate — node missing, gh error — since CI is the real gate. (`.claude/` is git-ignored
+  except this one committed `settings.json`, via a `.gitignore` negation.)
+
+Rules (the **Balanced** policy):
+1. A change to `packages/d3gl/**` (except the generated `CHANGELOG.md`) needs a changeset. An
+   explicit empty changeset (`pnpm changeset add --empty`) satisfies it when no release is intended.
+2. A PR whose body closes an issue (`close`/`fix`/`resolve` + `#N`) needs a `## Performance` section.
+3. The `changeset-release/main` (Version Packages) branch is exempt.
 
 ### Issue body template
 
@@ -309,6 +336,12 @@ and no token**. Do not run `changeset publish` / `npm publish` yourself. Steps:
    Verify with `pnpm changeset status` (reads every `.changeset/*.md`; note
    `--since=main` only counts *committed* changesets, so a brand-new uncommitted file
    shows nothing). Open a PR and merge it.
+
+   The changelog generator is **`@changesets/changelog-github`** (`.changeset/config.json`),
+   so an entry authored in its **own** feature PR auto-links `(#PR)`, commit, and author in
+   `CHANGELOG.md`. Only a **backfill** — a changeset committed in a *different* PR than the
+   change it documents — needs the original `#PR (commit)` hand-cited in its body, since the
+   generator would otherwise link the backfill PR's commit.
 2. On push to `main`, the workflow opens/updates the **"Version Packages"** PR (branch
    `changeset-release/main`): it bumps `packages/d3gl/package.json`, rewrites
    `CHANGELOG.md`, and deletes the consumed changeset files. Multiple changesets bundle

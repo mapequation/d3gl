@@ -1,0 +1,37 @@
+name: Changeset policy
+
+# Gates every PR on the AGENTS.md lifecycle (steps 5 + 7): a change to the
+# published package needs a changeset, and a PR that closes an issue needs a
+# `## Performance` section. Same rules as the local pre-merge hook
+# (scripts/premerge-gate.sh) — both call scripts/check-pr-policy.mjs.
+#
+# `gh pr merge --squash` is server-side, so this required check is the real gate.
+# Make it required: Settings ▸ Branches ▸ branch protection for `main` ▸
+# "Require status checks to pass" ▸ add "policy". (Or:
+#   gh api -X PUT repos/mapequation/d3gl/branches/main/protection/required_status_checks/contexts \
+#     -f 'contexts[]=policy')
+
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  policy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
+
+      - name: Check changeset / Performance policy
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: node scripts/check-pr-policy.mjs "${{ github.event.pull_request.number }}"
