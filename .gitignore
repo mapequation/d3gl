@@ -4,4 +4,7 @@ dist
 .DS_Store
 .vitest-attachments
 __screenshots__
-.claude/
+.claude/*
+# Keep the committed project hooks/settings tracked (everything else under .claude/ —
+# worktrees, settings.local.json — stays ignored).
+!.claude/settings.json

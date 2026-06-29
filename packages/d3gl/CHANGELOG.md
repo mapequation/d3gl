@@ -4,7 +4,7 @@
 
 ### Minor Changes
 
-- 50a8506: Collide rotated labels by their true oriented footprint. `LabelBox` / `LabelAnchor` gain
+- [#59](https://github.com/mapequation/d3gl/pull/59) [`50a8506`](https://github.com/mapequation/d3gl/commit/50a8506) Thanks [@danieledler](https://github.com/danieledler)! - Collide rotated labels by their true oriented footprint. `LabelBox` / `LabelAnchor` gain
   `rotation` (radians), `textAnchor` (`start | middle | end`, like SVG), and `keepUpright`; the
   library now derives **both** the rendered CSS transform and the collision box from the same
   angle (an oriented-box / separating-axis test, with the fast axis-aligned path kept for plain
@@ -14,7 +14,7 @@
 
 ### Patch Changes
 
-- f170ba6: Share engine-level options through one `BaseEngineOptions` type. `tooltipClass`,
+- [#65](https://github.com/mapequation/d3gl/pull/65) [`f170ba6`](https://github.com/mapequation/d3gl/commit/f170ba6) Thanks [@danieledler](https://github.com/danieledler)! - Share engine-level options through one `BaseEngineOptions` type. `tooltipClass`,
   `width`/`height`/`aspectRatio`, and `backend` were re-declared per engine and
   consumed in each subclass — so `plot(host, { tooltipClass })` was silently
   dropped (only `geoMap` wired it). These shared fields now live on a single
@@ -22,8 +22,8 @@
   extend, and the `BaseEngine` constructor consumes them once. `plot()` tooltips
   now honor `tooltipClass`, and base-level options can no longer drift between
   engines.
-- 3c55631: Add `h`, a tiny framework-free hyperscript helper exported from `@mapequation/d3gl/map`, for building rich tooltip / HTML-overlay content declaratively. The layer `tooltip` option accepts the returned `HTMLElement`, so `tooltip: (d) => h("div", null, [...])` replaces hand-rolled `document.createElement` ceremony. Children are always inserted as text nodes (never parsed as markup).
-- 350f1ba: Make screen-space glyph `declutter` scale to very large node counts. The per-zoom cull
+- [#64](https://github.com/mapequation/d3gl/pull/64) [`3c55631`](https://github.com/mapequation/d3gl/commit/3c55631) Thanks [@danieledler](https://github.com/danieledler)! - Add `h`, a tiny framework-free hyperscript helper exported from `@mapequation/d3gl/map`, for building rich tooltip / HTML-overlay content declaratively. The layer `tooltip` option accepts the returned `HTMLElement`, so `tooltip: (d) => h("div", null, [...])` replaces hand-rolled `document.createElement` ceremony. Children are always inserted as text nodes (never parsed as markup).
+- [#94](https://github.com/mapequation/d3gl/pull/94) [`350f1ba`](https://github.com/mapequation/d3gl/commit/350f1ba) Thanks [@danieledler](https://github.com/danieledler)! - Make screen-space glyph `declutter` scale to very large node counts. The per-zoom cull
   ran on every transform but rebuilt transform-independent work each frame and materialized
   the full vector view twice. It now:
   - caches the anchor grouping on the Scene (built once per layer, reused every frame);
@@ -40,7 +40,7 @@
   Also fixes declutter not being applied on the first draw — it now runs before the initial
   upload, not only after the first zoom/pan.
 
-- 7968c2c: Let screen-space `declutter` act on analytic points (`Plot.points`). A lone point's anchor now
+- [#96](https://github.com/mapequation/d3gl/pull/96) [`7968c2c`](https://github.com/mapequation/d3gl/commit/7968c2c) Thanks [@danieledler](https://github.com/danieledler)! - Let screen-space `declutter` act on analytic points (`Plot.points`). A lone point's anchor now
   defaults to its center, and `points()` accepts a `declutter` option, so a decluttered scatter can
   use lightweight GPU points (~4 verts each) instead of tessellated `ctx.arc` paths (tens of verts).
   This lifts a decluttered cloud from ~256k (where the path geometry OOMs a tab) to ~1M. Rendering
@@ -51,7 +51,7 @@
 
 ### Minor Changes
 
-- df49dd6: Make the engines responsive to their parent and resize in place. `width`/`height` are now
+- [#55](https://github.com/mapequation/d3gl/pull/55) [`df49dd6`](https://github.com/mapequation/d3gl/commit/df49dd6) Thanks [@danieledler](https://github.com/danieledler)! - Make the engines responsive to their parent and resize in place. `width`/`height` are now
   optional on `plot()` / `geoMap()` (and the React `<Plot>` / `<GeoMap>`), with a new `aspectRatio`
   option. Sizing is **responsive by default**:
   - `aspectRatio` set → width-driven: fills the parent's width and keeps the ratio.
@@ -69,7 +69,7 @@
 
 ### Patch Changes
 
-- a0294c8: Make the declarative interaction options (`hover`, `tooltip`, `selection`) universal across
+- [#52](https://github.com/mapequation/d3gl/pull/52) [`a0294c8`](https://github.com/mapequation/d3gl/commit/a0294c8) Thanks [@danieledler](https://github.com/danieledler)! - Make the declarative interaction options (`hover`, `tooltip`, `selection`) universal across
   both engines. They were only exposed on `geoMap` layers, even though the underlying machinery
   (hover overlay, tooltip, selection styling, hit-testing) already lived in the shared base —
   so `plot` layers could not declare hover/tooltip/selection. The options are now lifted into a
@@ -82,7 +82,7 @@
 
 ### Minor Changes
 
-- b459367: Interactive styling for retained layers: `on("click")` (drag-suppressed), hover
+- [#51](https://github.com/mapequation/d3gl/pull/51) [`b459367`](https://github.com/mapequation/d3gl/commit/b459367) Thanks [@danieledler](https://github.com/danieledler)! - Interactive styling for retained layers: `on("click")` (drag-suppressed), hover
   highlight via per-item overlay (`hover` layer option / `highlight()`, with custom
   draw through `HighlightBuilder`), core tooltips (`tooltip` option + `tooltipClass`),
   click selection with complement dimming (`selection` option + `select()`), per-drawable
@@ -92,7 +92,7 @@
 
 ### Patch Changes
 
-- 9b7a40f: Backend swap now re-inserts the new rendering surface at the previous surface's DOM
+- [#49](https://github.com/mapequation/d3gl/pull/49) [`9b7a40f`](https://github.com/mapequation/d3gl/commit/9b7a40f) Thanks [@danieledler](https://github.com/danieledler)! - Backend swap now re-inserts the new rendering surface at the previous surface's DOM
   position instead of appending it to the end of the host. This keeps the canvas a stable
   base layer, so HTML elements the caller appended to the host after it (e.g. an overlay)
   keep painting on top across a `setBackend()` switch or the `"auto"` canvas→WebGL upgrade,
@@ -102,7 +102,7 @@
 
 ### Patch Changes
 
-- 672f1fa: Fix layout shift in `"auto"` backend mode. Backend `<canvas>` elements are now
+- [#39](https://github.com/mapequation/d3gl/pull/39) [`672f1fa`](https://github.com/mapequation/d3gl/commit/672f1fa) Thanks [@danieledler](https://github.com/danieledler)! - Fix layout shift in `"auto"` backend mode. Backend `<canvas>` elements are now
   positioned absolutely within the (positioned) host instead of sitting in normal
   flow. During the canvas→WebGL upgrade — and the React StrictMode double-mount that
   compounds it — two or more backend canvases briefly coexist; as `display:block`
@@ -113,7 +113,7 @@
   to `position:relative` so the absolute canvas anchors correctly even for bare-engine
   consumers (the React `<GeoMap>`/`<Plot>` wrappers already set `position:relative`).
   Hit-testing is unaffected — pointers are measured from `host.getBoundingClientRect()`.
-- 464fc3b: WebGL now composites overlapping fills and strokes in the same painter's order as Canvas and SVG. Previously WebGL drew all fills then all strokes, so a shape's border always landed on top of every fill — overlapping bordered shapes (e.g. node range pies) looked different on WebGL than on Canvas/SVG, where a later shape's fill correctly occludes an earlier shape's border. The three backends now match. (Internally this is one fewer draw call per layer, not a slowdown.)
+- [#43](https://github.com/mapequation/d3gl/pull/43) [`464fc3b`](https://github.com/mapequation/d3gl/commit/464fc3b) Thanks [@danieledler](https://github.com/danieledler)! - WebGL now composites overlapping fills and strokes in the same painter's order as Canvas and SVG. Previously WebGL drew all fills then all strokes, so a shape's border always landed on top of every fill — overlapping bordered shapes (e.g. node range pies) looked different on WebGL than on Canvas/SVG, where a later shape's fill correctly occludes an earlier shape's border. The three backends now match. (Internally this is one fewer draw call per layer, not a slowdown.)
 
   Stroke joins and caps now match across backends too: WebGL renders **miter**/**round** joins and **square**/**round** caps (previously only bevel joins + butt caps), and all three backends are pinned to the same join/cap/miter-limit (Canvas/SVG no longer use their differing defaults of 10 and 4). New layer options `lineJoin` (`"bevel"` default | `"miter"` | `"round"`), `miterLimit` (default 10), and `lineCap` (`"butt"` default | `"square"` | `"round"`) on `plot().layer()` and `geoMap().layer()` control this consistently everywhere. The default join is `"bevel"` (matching the prior WebGL look); pass `lineJoin: "miter"` for sharp corners.
 
@@ -121,7 +121,7 @@
 
   Also renders the raster backends at `devicePixelRatio`, so WebGL and Canvas stay crisp on HiDPI/retina displays instead of upscaling a CSS-resolution buffer.
 
-- 776876c: Export `version` from the package root, inlined from `package.json` at build time.
+- [#37](https://github.com/mapequation/d3gl/pull/37) [`776876c`](https://github.com/mapequation/d3gl/commit/776876c) Thanks [@danieledler](https://github.com/danieledler)! - Export `version` from the package root, inlined from `package.json` at build time.
   Downstream apps can surface the d3gl version (e.g. a "Powered by d3gl v0.4.0" badge)
   without importing `@mapequation/d3gl/package.json`:
 
@@ -130,20 +130,20 @@
   console.log(`Powered by d3gl v${version}`);
   ```
 
-- 456b923: Render the orthographic globe via the same per-frame CPU reprojection as Canvas/SVG instead of an equirectangular bake-to-texture. WebGL now matches Canvas/SVG output (crisp coastlines and lines, correct globe size, no "droplet" artifact when changing layers mid-globe), honors `hideOnInteraction` while rotating/zooming the globe, and shares one zoom/rotate state model across backends — fixing the inability to zoom back out after switching backends.
+- [#42](https://github.com/mapequation/d3gl/pull/42) [`456b923`](https://github.com/mapequation/d3gl/commit/456b923) Thanks [@danieledler](https://github.com/danieledler)! - Render the orthographic globe via the same per-frame CPU reprojection as Canvas/SVG instead of an equirectangular bake-to-texture. WebGL now matches Canvas/SVG output (crisp coastlines and lines, correct globe size, no "droplet" artifact when changing layers mid-globe), honors `hideOnInteraction` while rotating/zooming the globe, and shares one zoom/rotate state model across backends — fixing the inability to zoom back out after switching backends.
 
 ## 0.4.0
 
 ### Minor Changes
 
-- a03c1f8: Add an opt-in `backend: "auto"` mode that paints with the Canvas backend
+- [#27](https://github.com/mapequation/d3gl/pull/27) [`a03c1f8`](https://github.com/mapequation/d3gl/commit/a03c1f8) Thanks [@danieledler](https://github.com/danieledler)! - Add an opt-in `backend: "auto"` mode that paints with the Canvas backend
   synchronously for an instant first paint, then creates the WebGL device in the
   background and swaps to it transparently when ready. `whenReady()` (and the React
   `onReady`) resolve at the canvas first paint, so consumers see a working map
   immediately without paying the WebGL device-creation startup cost up front. If
   WebGL is unavailable the map stays on Canvas (with a `console.warn`). Existing
   `"webgl"` / `"canvas"` / `"svg"` behavior is unchanged.
-- cc33ebb: Add a `passThrough: true` layer mode for huge / streaming datasets. A pass-through
+- [#35](https://github.com/mapequation/d3gl/pull/35) [`cc33ebb`](https://github.com/mapequation/d3gl/commit/cc33ebb) Thanks [@danieledler](https://github.com/danieledler)! - Add a `passThrough: true` layer mode for huge / streaming datasets. A pass-through
   layer retains **no** per-feature geometry in d3gl (no Scene entry, no hit index):
   you own the data and d3gl projects, draws, and discards it on each repaint. This
   lifts the retained ceiling (~4–7M features, where Canvas runs out of memory and
@@ -170,13 +170,13 @@
 
 ### Minor Changes
 
-- 925b635: GPU-accelerate orthographic-globe rotation on the WebGL backend: the map is baked
+- [#14](https://github.com/mapequation/d3gl/pull/14) [`925b635`](https://github.com/mapequation/d3gl/commit/925b635) Thanks [@danieledler](https://github.com/danieledler)! - GPU-accelerate orthographic-globe rotation on the WebGL backend: the map is baked
   into an equirectangular texture and drawn on a spinning 3D sphere, so rotation and
   zoom are uniform updates instead of per-frame re-projection. Activation is
   automatic (WebGL + orthographic); canvas/SVG and other projections are unchanged.
   `GeoMap.enableZoom(extent)` now auto-dispatches: versor rotation for spherical
   projections (azimuthal, `clipAngle > 0`), affine pan/zoom for flat ones.
-- 4397a4b: Add incremental layer append for live-streaming data:
+- [#15](https://github.com/mapequation/d3gl/pull/15) [`4397a4b`](https://github.com/mapequation/d3gl/commit/4397a4b) Thanks [@danieledler](https://github.com/danieledler)! - Add incremental layer append for live-streaming data:
   - `GeoMap.layer()`, `Plot.layer()`, and `Plot.points()` now return a `LayerHandle`
     (previously the engine instance). The handle exposes `append(items)`, plus
     `recolor()` / `setClip(clipTo?)`.
@@ -188,7 +188,7 @@
   - A duplicate drawable id within a layer now throws (previously it silently corrupted
     the layer's id index).
 
-- 524132f: Add map projection switching and a rotatable globe:
+- [#12](https://github.com/mapequation/d3gl/pull/12) [`524132f`](https://github.com/mapequation/d3gl/commit/524132f) Thanks [@danieledler](https://github.com/danieledler)! - Add map projection switching and a rotatable globe:
   - `GeoMap.setProjection(projection)` re-projects existing layers against a new
     projection and resets the view.
   - `GeoMap.enableRotation(opts?)` drag-rotates a spherical projection (versor
@@ -202,7 +202,7 @@
   - On azimuthal projections (e.g. orthographic), point geometries on the back
     hemisphere are culled instead of showing through the globe.
 
-- c98087c: Make incremental layer append O(new) on the Canvas backend (and lay the groundwork
+- [#16](https://github.com/mapequation/d3gl/pull/16) [`c98087c`](https://github.com/mapequation/d3gl/commit/c98087c) Thanks [@danieledler](https://github.com/danieledler)! - Make incremental layer append O(new) on the Canvas backend (and lay the groundwork
   for WebGL):
   - `Scene.appendedBuffers(name, fromDrawable)` returns GPU-ready buffers for only the
     appended tail (group-absolute indices), and `Scene.drawables(name, from)` reads only
@@ -218,7 +218,7 @@
   WebGL still rebuilds the layer's renderer on a count change (correct, O(total) per
   batch); a true O(new) WebGL `bufferSubData` path is a follow-up.
 
-- 310db91: Reduce memory for very large layers (live streaming):
+- [#23](https://github.com/mapequation/d3gl/pull/23) [`310db91`](https://github.com/mapequation/d3gl/commit/310db91) Thanks [@danieledler](https://github.com/danieledler)! - Reduce memory for very large layers (live streaming):
   - New `pickable: false` option on `GeoMap.layer` / `Plot.layer` / `Plot.points` skips
     building the CPU hit index for that layer (no hover/pick on it) — saves one `Entry`
     object per drawable, which dominates memory for huge non-interactive layers.
@@ -226,14 +226,14 @@
     `String(id)` in the scene's id map and the engine's per-layer id set, so numeric-id
     layers no longer allocate a string per drawable.
 
-- be9c7bf: SVG pan/zoom is now O(1). The SVG backend keeps persistent `<defs>` / view-`<g>` /
+- [#24](https://github.com/mapequation/d3gl/pull/24) [`be9c7bf`](https://github.com/mapequation/d3gl/commit/be9c7bf) Thanks [@danieledler](https://github.com/danieledler)! - SVG pan/zoom is now O(1). The SVG backend keeps persistent `<defs>` / view-`<g>` /
   screen-`<g>` elements; `setTransform` updates only the view group's `transform`
   attribute instead of re-serializing the whole document every frame. This applies
   whenever no layer uses `sizeMode: "screen"` (the common case — maps, polygons,
   world points). Screen-mode content (constant-pixel circles/glyphs) still bakes the
   transform into coordinates and is re-serialized on a move, as before. `svgFromLayers`
   output is unchanged.
-- e111f6c: WebGL incremental append is now O(new) per batch. `Backend.appendToLayer` is
+- [#21](https://github.com/mapequation/d3gl/pull/21) [`e111f6c`](https://github.com/mapequation/d3gl/commit/e111f6c) Thanks [@danieledler](https://github.com/danieledler)! - WebGL incremental append is now O(new) per batch. `Backend.appendToLayer` is
   implemented on the WebGL backend with capacity-doubling growable buffers
   (`bufferSubData` for the appended tail, reallocate + rebind the model only when a
   buffer overflows) and incremental color/flag texture growth, bumping the indexed
@@ -245,7 +245,7 @@
 
 ### Minor Changes
 
-- f2bf4c5: Declarative React API and rendering fixes.
+- [#8](https://github.com/mapequation/d3gl/pull/8) [`f2bf4c5`](https://github.com/mapequation/d3gl/commit/f2bf4c5) Thanks [@danieledler](https://github.com/danieledler)! - Declarative React API and rendering fixes.
   - **react:** new `<Plot>` / `<Layer>` / `<Points>` components for declarative,
     non-geo rendering — the imperative-engine sibling of `<GeoMap>`.
   - **geo:** `GeoInput` now accepts a GeoJSON `Sphere` (`{ type: "Sphere" }`)
