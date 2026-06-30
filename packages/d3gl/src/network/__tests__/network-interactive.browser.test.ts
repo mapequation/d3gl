@@ -1,6 +1,7 @@
 import { describe, it, expect } from "vitest";
 import { network } from "../network.js";
 import { buildGraph } from "../graph.js";
+import { leavesUnder } from "../lod.js";
 
 function host(): HTMLElement {
   const el = document.createElement("div");
@@ -353,28 +354,97 @@ describe("network selection.others dim + outgoing links (#162)", () => {
     net.destroy();
   });
 
-  it("#3 hovering a node overlays its outgoing links in the hover lane (transient)", async () => {
+  it("#3 hovering a node recolours its EXISTING outgoing links toward the hover hue (no new geometry)", async () => {
     const h = host();
     const net = network(h, { width: 200, height: 200 });
     await net.whenReady();
+    // Directed chain 0→1→2: node 0's only outgoing edge is edge 0 (0→1); edge 1 (1→2) is unrelated.
     const g = buildGraph({ nodeCount: 3, source: [0, 1], target: [1, 2], directed: true });
-    net.data(g).style({ nodeRadius: 8, directed: true }).layout({ backend: "positions", positions: new Float32Array([10, 10, 90, 90, 170, 30]) });
+    net.data(g).style({ nodeRadius: 8, directed: true, linkStroke: "#999999" }).layout({ backend: "positions", positions: new Float32Array([10, 10, 90, 90, 170, 30]) });
     net.interactive({ selectable: true, hover: true });
-    (net as any).setTransform(T);
+    net.setTransform(T);
 
-    // No hover yet → no hover-link layer in the highlight lane.
-    expect(layer(emit(hlLane(net)), "network-highlight:hover-links")).toBeUndefined();
+    const base = baseLane(net);
+    // No hover: the base `links` layer is the resolved gray, and there is NO separate hover-link layer.
+    const before = linkColors(layer(emit(base), "links"));
+    expect(before[0]).toBe(before[1]); // gray: r == g
+    expect(layer(emit(hlLane(net)), "network-highlight:hover-links")).toBeUndefined(); // no parallel geometry
 
-    // Hover node 0 (world == screen at k=1) → its single outgoing link (0→1) overlays in the hover lane.
+    // Hover node 0 (world == screen at k=1) → its outgoing edge 0 (0→1) recolours toward green IN PLACE
+    // (same `links` layer, same count — no new lines); edge 1 (1→2) is untouched.
     const rect = h.getBoundingClientRect();
     h.dispatchEvent(new PointerEvent("pointermove", { clientX: rect.left + 10, clientY: rect.top + 10, bubbles: true }));
-    const hover = layer(emit(hlLane(net)), "network-highlight:hover-links");
-    expect(hover).toBeDefined();
-    expect(hover.lines.count).toBe(1); // node 0 has exactly one outgoing edge
+    const after = layer(emit(base), "links");
+    expect(after.lines.count).toBe(2); // still the two real edges — geometry unchanged
+    const ac = after.lines.colors as Uint8Array;
+    expect(ac[1]).toBeGreaterThan(ac[0]); // edge 0 now green-dominant (G > R)
+    expect(ac[1]).toBeGreaterThan(ac[2]); // G > B
+    expect([ac[4], ac[5], ac[6]]).toEqual([before[4], before[5], before[6]]); // edge 1 unchanged (gray)
+    expect(layer(emit(hlLane(net)), "network-highlight:hover-links")).toBeUndefined(); // still no new geometry
 
-    // Moving off clears the transient overlay.
+    // Move off → the recolour clears (links back to gray).
     h.dispatchEvent(new PointerEvent("pointermove", { clientX: rect.left + 199, clientY: rect.top + 199, bubbles: true }));
-    expect(layer(emit(hlLane(net)), "network-highlight:hover-links")).toBeUndefined();
+    const cleared = linkColors(layer(emit(base), "links"));
+    expect(cleared[1]).toBe(cleared[0]); // gray again
+    net.destroy();
+    h.remove();
+  });
+
+  it("#162 ancestor-aware: zooming into a selected aggregate highlights its expanded children", async () => {
+    const net = network(host(), { width: 200, height: 200 });
+    await net.whenReady();
+    // Two modules of two nodes; at k=1 each collapses to one aggregate glyph.
+    const g = buildGraph({ nodeCount: 4, source: [0, 2, 1], target: [1, 3, 2], directed: true });
+    const modules = [{ id: 0, path: [1, 1] }, { id: 1, path: [1, 2] }, { id: 2, path: [2, 1] }, { id: 3, path: [2, 2] }];
+    net.data(g).style({ directed: true }).lod({ modules, expandPx: 20 }).layout({ backend: "positions", positions: new Float32Array([70, 90, 85, 90, 115, 110, 130, 110]) });
+    net.interactive({ selectable: { multi: true } });
+    net.setTransform({ k: 1, x: 0, y: 0 });
+
+    const tree = (net as any).lodTree;
+    const agg = [...(baseLane(net).visible as Uint32Array)].find((id) => id >= tree.leafCount)!;
+    net.select("nodes", [agg]);
+    expect([...(hlLane(net).visible as Uint32Array)]).toContain(agg); // zoomed out: the aggregate itself rings
+
+    // Zoom into the module so it expands into its leaves; ancestor-aware highlight rings those children.
+    const k = 12;
+    net.setTransform({ k, x: 100 - tree.cx[agg] * k, y: 100 - tree.cy[agg] * k });
+    const frontier = [...(baseLane(net).visible as Uint32Array)];
+    const expandedLeaves = leavesUnder(tree, agg).filter((l) => frontier.includes(l));
+    expect(expandedLeaves.length).toBeGreaterThan(0); // the aggregate actually expanded
+    const ringed = [...(hlLane(net).visible as Uint32Array)];
+    for (const l of expandedLeaves) expect(ringed).toContain(l); // children of the selected module are highlighted
+    net.destroy();
+  });
+
+  it("#3 modular-map: hovering an aggregate recolours its outgoing super-edge half-arrows IN PLACE", async () => {
+    const h = host();
+    const net = network(h, { width: 200, height: 200 });
+    await net.whenReady();
+    // Two modules; the inter-module edge 1→2 becomes a super-edge between the two aggregates at k=1.
+    const g = buildGraph({ nodeCount: 4, source: [0, 2, 1], target: [1, 3, 2], directed: true });
+    const modules = [{ id: 0, path: [1, 1] }, { id: 1, path: [1, 2] }, { id: 2, path: [2, 1] }, { id: 3, path: [2, 2] }];
+    net.data(g).style({ directed: true, linkStyle: "half-arrow", linkStroke: "#999999" }).lod({ modules, expandPx: 20, superEdges: true }).layout({ backend: "positions", positions: new Float32Array([70, 90, 85, 90, 115, 110, 130, 110]) });
+    net.interactive({ selectable: { multi: true }, hover: true });
+    net.setTransform({ k: 1, x: 0, y: 0 });
+
+    const base = baseLane(net);
+    const tree = (net as any).lodTree;
+    const links0 = layer(emit(base), "links");
+    expect(links0.primitive).toBe("half-arrows"); // the rich map glyph, not plain lines
+    const count0 = links0.halfArrows.count;
+
+    // Hover the aggregate that SOURCES the super-edge (the module containing node 1, the edge 1→2 source).
+    const aggs = [...(base.visible as Uint32Array)].filter((id) => id >= tree.leafCount);
+    const srcAgg = aggs.find((a) => leavesUnder(tree, a).includes(1))!;
+    const r = h.getBoundingClientRect();
+    h.dispatchEvent(new PointerEvent("pointermove", { clientX: r.left + tree.cx[srcAgg], clientY: r.top + tree.cy[srcAgg], bubbles: true }));
+
+    const links = layer(emit(base), "links");
+    expect(links.halfArrows.count).toBe(count0); // SAME half-arrow geometry — recoloured, not re-built
+    const c = links.halfArrows.colors as Uint8Array;
+    let greenInstances = 0;
+    for (let k = 0; k < links.halfArrows.count; k++) if (c[k * 4 + 1]! > c[k * 4]! && c[k * 4 + 1]! > c[k * 4 + 2]!) greenInstances++;
+    expect(greenInstances).toBeGreaterThan(0); // the hovered aggregate's outgoing super-edge turned green
     net.destroy();
     h.remove();
   });

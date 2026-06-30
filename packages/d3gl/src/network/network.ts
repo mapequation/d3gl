@@ -1,6 +1,6 @@
 import { BaseEngine, type BaseEngineOptions, type HoverHit, type InteractiveLayerOptions, type LaneInteractive, type NodeDragSession } from "../map/base-engine.js";
 import { networkLayers, frontierCircles, frontierHalos, superEdges, emitNodes, emitLinks, emitArrows, emitHalfLinks, traceFrontierFills, traceFrontierBorders, traceFrontierHalos, traceSuperHalfArrows, traceSuperLines, traceSuperArrows, rgbaCss, pickNodes, regionNodes, resolveNodeRadii, resolveNodeRadiusAggregate, resolveImportance, resolveFlowBorder, resolveNodeColors, resolveLinkWidthOf, resolveLinkColorOf, resolveLinkStrokeOf, flowBorderInnerRadii, type ResolvedNetworkStyle, type NodeRadiusSpec, type ImportanceSpec, type FlowBorderSpec, type ConstBorder, type LinkWidthSpec, type LinkColorSpec, type LinkStyle } from "./glyphs.js";
-import { rgb } from "d3-color";
+import { rgb, hcl } from "d3-color";
 import { ForceLayout, seedPositions, type ForceParams } from "./force.js";
 import { multilevelLayout, type CoarsenOptions } from "./coarsen.js";
 import { buildLODTree, buildSpatialLODTree, computeLODGeometry, computeLODStyle, cut, declutterFrontier, pickFrontier, regionFrontier, visibleWorldRect, leavesUnder, type LODTree, type SpatialLODOptions } from "./lod.js";
@@ -8,10 +8,10 @@ import { LabelLayer, placeLabels, type LabelAnchor } from "../labels/label-layer
 import { buildModuleLODTree, type ModuleNode } from "./modules.js";
 import { startWorkerLayout, type WorkerLayoutHandle } from "./worker-transport.js";
 import type { NetworkGraph } from "./graph.js";
-import type { InstancedLayer, InstancedLinesData } from "../core/index.js";
+import type { InstancedLayer } from "../core/index.js";
 import { InstancedLane, type SelectionStrategy } from "../core/instanced-lane.js";
-import { resolveRingColors, ringCircles, type RGBA } from "../map/highlight-ring.js";
-import { dimOthers } from "../map/selection-dim.js";
+import { resolveRingColors, ringCircles } from "../map/highlight-ring.js";
+import { dimOthers, hueShiftToward } from "../map/selection-dim.js";
 
 /** Options for the network engine. Inherits sizing, `backend`, and `tooltipClass`. */
 export interface NetworkOptions extends BaseEngineOptions {}
@@ -367,9 +367,10 @@ export class Network extends BaseEngine {
   /** Maps a picked link instance index (gl_InstanceID) → a {@link NetworkLinkHit} HoverHit, captured per
    *  emit so it matches the link set currently in the pick FBO. Null when no links are drawn. */
   private linkResolve: ((index: number) => HoverHit | null) | null = null;
-  /** Lazy node→incident-edge index CSR for the no-LOD hover-link overlay (#162); see {@link incidenceFor}.
-   *  Null until first hover; reset to null whenever the graph topology changes (in {@link data}). */
-  private hoverIncidence: { offsets: Uint32Array; edges: Uint32Array } | null = null;
+  /** Derived parent-pointer cache for the ancestor-aware selection highlight (#162), used only when the
+   *  LOD tree carries no `parent` (coarsening/spatial). Keyed by tree identity; see {@link treeParent}. */
+  private derivedParentFor: LODTree | null = null;
+  private derivedParent: Int32Array | null = null;
   /** Frontier label overlay (#105 N7b) + its options; null until {@link labels} is enabled. */
   private labelLayer: LabelLayer | null = null;
   private labelOpts: NetworkLabelOptions | null = null;
@@ -396,7 +397,7 @@ export class Network extends BaseEngine {
     this.lodModules = false;
     this.lodHasGeometry = false;
     this.resolvedCache = null;
-    this.hoverIncidence = null; // new topology → rebuild the hover-link incidence CSR lazily (#162)
+    this.derivedParentFor = null; this.derivedParent = null; // drop the ancestor-aware parent cache (#162)
     return this.rebuild();
   }
 
@@ -810,6 +811,8 @@ export class Network extends BaseEngine {
       const lane = new InstancedLane(strategy, (visible) => this.frontierLayers(tree, this.resolvedStyleCached(this.graph!), visible));
       this.registerInstancedLane(this.NET_LANE, {
         lane, layerNames: LAYER_NAMES, dynamic: true,
+        // Re-emit on hover too (#162): frontierLayers recolours the hovered node's links in the base lane.
+        hoverDirtiesBase: true,
         resolve: (g) => ({ layer: this.NODE_LAYER, id: g, datum: this.lodDatum(tree, g) }),
         interactive: this.laneInteractive((g) => this.lodDatum(tree, g), (g) => leavesUnder(tree, g)),
         // Link picking (#141): frontierLayers sets `linkResolve` per emit (it has the super-edge ids/flows).
@@ -832,10 +835,13 @@ export class Network extends BaseEngine {
       this.linkResolve = (i) => this.noLodLinkHit(graph, i);
       const lane = new InstancedLane(strategy, () => {
         const resolved = this.resolvedStyleCached(graph);
-        return this.dimNoLodLayers(this.flagPickableLinks(networkLayers(graph, resolved)), graph, resolved.directed);
+        return this.styleNoLodLayers(this.flagPickableLinks(networkLayers(graph, resolved)), graph, resolved.directed);
       });
       this.registerInstancedLane(this.NET_LANE, {
         lane, layerNames: LAYER_NAMES, dynamic: false,
+        // Re-emit on hover too (#162): styleNoLodLayers recolours the hovered node's links. The static
+        // (dynamic:false) base lane otherwise only re-emits on a selection change.
+        hoverDirtiesBase: true,
         resolve: (i) => ({ layer: this.NODE_LAYER, id: i, datum: { aggregate: false, count: 1 } satisfies NetworkHit }),
         interactive: this.laneInteractive(() => ({ aggregate: false, count: 1 }), (i) => [i]),
         gpuPick: this.pickLinksEnabled ? (id) => this.linkResolve?.(id) ?? null : undefined,
@@ -865,27 +871,36 @@ export class Network extends BaseEngine {
     return layers;
   }
 
-  /** Apply `selection.others` dimming (#162) to the **no-LOD** full-graph layers, in place. Instance
-   *  order is the parallel emit: the `nodes` circles layer's instance `i` is node `i`; every link layer
-   *  (`lines`/`half-arrows`/`arrows`) instance `e` is graph edge `e`. A node stays full strength iff
-   *  selected; a link iff its **source** (directed) / **either endpoint** (undirected) is selected — so
-   *  a selected node keeps its outgoing links. No-op (O(1)) when nothing is selected. */
-  private dimNoLodLayers(layers: InstancedLayer[], graph: NetworkGraph, directed: boolean): InstancedLayer[] {
+  /** Apply `selection.others` dimming + the hover-link recolour (#162) to the **no-LOD** full-graph
+   *  layers, in place. Instance order is the parallel emit: the `nodes` circles layer's instance `i` is
+   *  node `i`; every link layer (`lines`/`half-arrows`/`arrows`) instance `e` is graph edge `e`. A node
+   *  stays full strength iff selected (or hovered); a link iff its **source** (directed) / **either
+   *  endpoint** (undirected) is selected or hovered — so a selected node keeps its outgoing links. The
+   *  hovered node's links additionally shift toward the hover hue (existing geometry reused, weight kept
+   *  via HCL lightness). No aggregates exist here, so selection is plain membership (not ancestor-aware).
+   *  No-op (O(1)) when nothing is selected or hovered. */
+  private styleNoLodLayers(layers: InstancedLayer[], graph: NetworkGraph, directed: boolean): InstancedLayer[] {
     const dimOp = this.othersDim(this.NODE_LAYER);
-    const sel = dimOp != null ? this.selectedIds(this.NODE_LAYER) : undefined;
-    if (dimOp == null || !sel || sel.size === 0) return layers;
-    const keepLink = (e: number): boolean => sel.has(graph.source[e]!) || (!directed && sel.has(graph.target[e]!));
+    const sel = this.selectedIds(this.NODE_LAYER);
+    const selSet = sel && sel.size ? sel : undefined;
+    const dimming = dimOp != null && selSet != null;
+    const hovered = this.singleHoveredId();
+    if (!dimming && hovered == null) return layers;
+    const hoverLink = (e: number): boolean => hovered != null && (graph.source[e]! === hovered || (!directed && graph.target[e]! === hovered));
+    const keepLink = (e: number): boolean => hoverLink(e) || selSet?.has(graph.source[e]!) === true || (!directed && selSet?.has(graph.target[e]!) === true);
+    const keepNode = (i: number): boolean => i === hovered || selSet?.has(i) === true;
+    const hue = hovered != null ? this.hoverHueChroma() : null;
     for (const l of layers) {
       if (l.primitive === "circles") {
         // The only circles layer in the no-LOD path is `nodes` (no aggregate halos). Instance i = node i.
-        dimOthers(l.circles.colors, graph.nodeCount, dimOp, (i) => sel.has(i));
-        dimOthers(l.circles.borderColors, graph.nodeCount, dimOp, (i) => sel.has(i));
-      } else if (l.primitive === "lines") {
-        dimOthers(l.lines.colors, graph.edgeCount, dimOp, keepLink);
-      } else if (l.primitive === "half-arrows") {
-        dimOthers(l.halfArrows.colors, graph.edgeCount, dimOp, keepLink);
+        if (dimming && dimOp != null) {
+          dimOthers(l.circles.colors, graph.nodeCount, dimOp, keepNode);
+          dimOthers(l.circles.borderColors, graph.nodeCount, dimOp, keepNode);
+        }
       } else {
-        dimOthers(l.arrows.colors, graph.edgeCount, dimOp, keepLink);
+        const colors = l.primitive === "lines" ? l.lines.colors : l.primitive === "half-arrows" ? l.halfArrows.colors : l.arrows.colors;
+        if (dimming && dimOp != null) dimOthers(colors, graph.edgeCount, dimOp, keepLink);
+        if (hue) hueShiftToward(colors, graph.edgeCount, hoverLink, hue.hue, hue.chroma);
       }
     }
     return layers;
@@ -943,138 +958,111 @@ export class Network extends BaseEngine {
     if (!this.interactiveOpts) { this.unregisterInstancedLane(this.NET_HL_LANE); return; }
     const colors = resolveRingColors(this.interactiveOpts);
     const ringName = `${this.NET_HL_LANE}:ring`;
-    const hoverLinkName = `${this.NET_HL_LANE}:hover-links`;
     const sizeMode = this.resolvedStyleCached(this.graph!).sizeMode;
     const strategy: SelectionStrategy = { select: () => this.highlightVisible(source, lod), pick: () => -1 };
     this.registerInstancedLane(this.NET_HL_LANE, {
       lane: new InstancedLane(strategy, (visible) => {
-        const layers: InstancedLayer[] = [];
-        // Hover-link overlay (#162 part 3) FIRST so it draws UNDER the rings. Re-derived per emit at
-        // O(hovered node out-degree); null (skipped) unless a single node is hovered on a hover layer.
-        const links = this.hoverLinkLines(source, lod, colors.hover, this.resolvedStyleCached(this.graph!));
-        if (links) layers.push({ name: hoverLinkName, primitive: "lines", sizeMode, lines: links });
-        if (visible.length > 0) {
-          const selected = this.selectedIds(this.NODE_LAYER);
-          const remove = this.removeIds(this.NODE_LAYER); // subtract-marquee preview (#140) — ring these red
-          layers.push({ name: ringName, primitive: "circles", sizeMode, circles: ringCircles(visible, centerOf, radiusOf, (g) => !!selected?.has(g), colors, remove ? (g) => remove.has(g) : undefined) });
-        }
-        return layers;
+        if (visible.length === 0) return [];
+        const selected = this.selectedIds(this.NODE_LAYER);
+        const remove = this.removeIds(this.NODE_LAYER); // subtract-marquee preview (#140) — ring these red
+        // Blue (selected) vs green (hover-only) ring: ancestor-aware under LOD, so an expanded selected
+        // aggregate's children ring blue too (#162) — matching the kept-link/dim highlight.
+        const isSel = lod && this.lodTree && selected?.size ? this.makeSelectedPredicate(this.lodTree, selected) : null;
+        const selColored = (g: number): boolean => (isSel ? isSel(g) : !!selected?.has(g));
+        return [{ name: ringName, primitive: "circles", sizeMode, circles: ringCircles(visible, centerOf, radiusOf, selColored, colors, remove ? (g) => remove.has(g) : undefined) }];
       }),
-      layerNames: [hoverLinkName, ringName], dynamic: true,
+      layerNames: [ringName], dynamic: true,
       resolve: () => null,
     });
   }
 
-  /** Highlighted node ids currently on screen: (selection ∪ hover) ∩ frontier (LOD) or taken directly
-   *  (no-LOD). Returns the shared empty sentinel when nothing is highlighted, so the per-frame ring
-   *  re-emit costs O(1) until the user selects/hovers something. */
+  /** Highlighted node ids currently on screen: (selection ∪ hover) ∩ frontier (LOD, **ancestor-aware** —
+   *  an expanded selected aggregate's children count, #162) or taken directly (no-LOD). Returns the
+   *  shared empty sentinel when nothing is highlighted, so the per-frame ring re-emit costs O(1) until
+   *  the user selects/hovers something. */
   private highlightVisible(source: InstancedLane | null, lod: boolean): Uint32Array {
     if (!this.hasHighlight(this.NODE_LAYER)) return EMPTY_VISIBLE;
-    const ids = new Set<number>();
-    const sel = this.selectedIds(this.NODE_LAYER); if (sel) for (const id of sel) ids.add(id as number);
-    const hov = this.hoveredIds(this.NODE_LAYER); if (hov) for (const id of hov) ids.add(id as number);
-    if (ids.size === 0) return EMPTY_VISIBLE;
-    if (lod && source) {
+    const sel = this.selectedIds(this.NODE_LAYER);
+    const hov = this.hoveredIds(this.NODE_LAYER);
+    if (lod && source && this.lodTree) {
+      const isSel = sel && sel.size ? this.makeSelectedPredicate(this.lodTree, sel) : null;
       const vis = source.visible;
       const out: number[] = [];
-      for (let i = 0; i < vis.length; i++) if (ids.has(vis[i]!)) out.push(vis[i]!);
-      return Uint32Array.from(out);
+      for (let i = 0; i < vis.length; i++) { const g = vis[i]!; if ((isSel && isSel(g)) || hov?.has(g)) out.push(g); }
+      return out.length ? Uint32Array.from(out) : EMPTY_VISIBLE;
     }
+    const ids = new Set<number>();
+    if (sel) for (const id of sel) ids.add(id as number);
+    if (hov) for (const id of hov) ids.add(id as number);
+    if (ids.size === 0) return EMPTY_VISIBLE;
     const n = this.graph!.nodeCount;
     const out: number[] = [];
     for (const id of ids) if (id >= 0 && id < n) out.push(id);
     return Uint32Array.from(out);
   }
 
-  /**
-   * Hover-link overlay (#162 part 3): the hovered node's outgoing edges drawn in the hover colour as a
-   * transient companion to the hover ring — "this node and what it points to" on the link layer. Built
-   * in the highlight lane (the lightweight overlay), so it re-emits on hover change / per frame at
-   * O(out-degree of the hovered node), never re-emitting the base lane on pointermove.
-   *
-   * Enumeration: LOD uses the tree's directed super-edge CSR (`superEdgeOffset`), restricted to present
-   * (on-frontier) or off-screen neighbours — matching what {@link superEdges} draws, so no overlay line
-   * dangles into a collapsed/expanded region; the in-adjacency adds the other direction for undirected.
-   * No-LOD uses a lazily-built node→incident-edge index CSR ({@link incidenceFor}). Returns null when
-   * nothing is hovered, the hover layer isn't hover-enabled, more than one glyph is highlighted (a
-   * marquee preview, not a hover), or the tree carries no super-edges (spatial). Widths/bend match the
-   * base links so the green overlay sits exactly over them.
-   */
-  private hoverLinkLines(source: InstancedLane | null, lod: boolean, hover: RGBA, style: ResolvedNetworkStyle): InstancedLinesData | null {
+  /** The single hovered node id, or null — used to recolour that node's links (#162). Null during a
+   *  multi-node marquee preview (which also writes `laneHilite`) and when the layer isn't hover-enabled. */
+  private singleHoveredId(): number | null {
     if (!this.interactiveOpts?.hover) return null;
     const hov = this.hoveredIds(this.NODE_LAYER);
-    if (!hov || hov.size !== 1) return null; // a genuine single-node hover, not a multi-node marquee preview
-    const h = hov.values().next().value as number;
-    const srcXY: number[] = [];
-    const tgtXY: number[] = [];
-    const widths: number[] = [];
-    const push = (sx: number, sy: number, tx: number, ty: number, w: number): void => { srcXY.push(sx, sy); tgtXY.push(tx, ty); widths.push(w); };
-    if (lod && source && this.lodTree) {
-      const tree = this.lodTree;
-      const off = tree.superEdgeOffset, tgt = tree.superEdgeTarget, flw = tree.superEdgeFlow;
-      if (!off || !tgt || !flw || h < 0 || h + 1 >= off.length) return null;
-      const vis = source.visible;
-      const present = new Set<number>();
-      for (let i = 0; i < vis.length; i++) present.add(vis[i]!);
-      if (!present.has(h)) return null; // hovered node isn't on the frontier — nothing to anchor to
-      const view = visibleWorldRect(this.transform, this.width, this.height);
-      const offScreen = (g: number): boolean => tree.cx[g]! < view.minX || tree.cx[g]! > view.maxX || tree.cy[g]! < view.minY || tree.cy[g]! > view.maxY;
-      const hx = tree.cx[h]!, hy = tree.cy[h]!;
-      for (let p = off[h]!; p < off[h + 1]!; p++) {
-        const t = tgt[p]!;
-        if (present.has(t) || offScreen(t)) push(hx, hy, tree.cx[t]!, tree.cy[t]!, style.linkWidthOf(flw[p]!));
-      }
-      // Undirected: also the in-adjacency (edges where h is the target) so a hover shows all incident links.
-      const inOff = tree.superEdgeInOffset, inSrc = tree.superEdgeInSource, inFlw = tree.superEdgeInFlow;
-      if (!style.directed && inOff && inSrc && inFlw) {
-        for (let p = inOff[h]!; p < inOff[h + 1]!; p++) {
-          const s = inSrc[p]!;
-          if (present.has(s) || offScreen(s)) push(hx, hy, tree.cx[s]!, tree.cy[s]!, style.linkWidthOf(inFlw[p]!));
-        }
-      }
-    } else {
-      const graph = this.graph!;
-      if (h < 0 || h >= graph.nodeCount) return null;
-      const inc = this.incidenceFor(graph, style.directed);
-      const pos = graph.positions;
-      const hx = pos[2 * h]!, hy = pos[2 * h + 1]!;
-      for (let p = inc.offsets[h]!; p < inc.offsets[h + 1]!; p++) {
-        const e = inc.edges[p]!;
-        const other = graph.source[e]! === h ? graph.target[e]! : graph.source[e]!;
-        push(hx, hy, pos[2 * other]!, pos[2 * other + 1]!, style.linkWidthOf(graph.weight[e]!));
-      }
-    }
-    const count = widths.length;
-    if (count === 0) return null;
-    const colors = new Uint8Array(count * 4);
-    for (let k = 0; k < count; k++) { colors[k * 4] = hover[0]; colors[k * 4 + 1] = hover[1]; colors[k * 4 + 2] = hover[2]; colors[k * 4 + 3] = hover[3]; }
-    const lines: InstancedLinesData = { sources: Float32Array.from(srcXY), targets: Float32Array.from(tgtXY), widths: Float32Array.from(widths), colors, count };
-    if (style.linkBend) { lines.bends = new Float32Array(count).fill(style.linkBend); lines.samples = 24; }
-    return lines;
+    if (!hov || hov.size !== 1) return null;
+    return hov.values().next().value as number;
+  }
+
+  /** HCL hue + chroma of the resolved hover-ring colour — the target the hovered node's links shift
+   *  toward ({@link hueShiftToward}), so the link highlight matches the ring's colour. */
+  private hoverHueChroma(): { hue: number; chroma: number } {
+    const opts = this.interactiveOpts;
+    const [r, g, b] = opts ? resolveRingColors(opts).hover : [22, 163, 74];
+    const c = hcl(rgb(r, g, b));
+    return { hue: Number.isNaN(c.h) ? 130 : c.h, chroma: Number.isNaN(c.c) ? 40 : c.c };
   }
 
   /**
-   * Lazily-built node → incident-edge-index CSR for the no-LOD {@link hoverLinkLines} overlay (#162):
-   * directed graphs index each node's **out**-edges (source == node); undirected graphs index **all**
-   * incident edges (either endpoint). Built once on first hover so the overlay is O(out-degree), never a
-   * per-frame O(edgeCount) scan. ~4·(nodeCount + edgeCount) bytes (directed) / 4·(nodeCount + 2·edgeCount)
-   * (undirected); allocated only when a no-LOD network is hovered. Invalidated when the graph changes.
+   * Ancestor-aware "is this frontier node selected" predicate (#162): a tree node counts as selected if
+   * it OR any ancestor is in `sel` — so selecting a module and zooming in keeps its expanding children
+   * highlighted, while the selection set stays literal (just the module id; `selection()` is unchanged).
+   * Walks `tree.parent` (derived from the children CSR when absent) with a memo + path-compression, so
+   * the whole per-emit pass over the frontier is O(visible) amortized (depth-bounded climbs collapse).
    */
-  private incidenceFor(graph: NetworkGraph, directed: boolean): { offsets: Uint32Array; edges: Uint32Array } {
-    if (this.hoverIncidence) return this.hoverIncidence;
-    const n = graph.nodeCount, m = graph.edgeCount;
-    const counts = new Uint32Array(n);
-    for (let i = 0; i < m; i++) { counts[graph.source[i]!]!++; if (!directed) counts[graph.target[i]!]!++; }
-    const offsets = new Uint32Array(n + 1);
-    for (let i = 0; i < n; i++) offsets[i + 1] = offsets[i]! + counts[i]!;
-    const edges = new Uint32Array(offsets[n]!);
-    const cursor = offsets.slice(0, n);
-    for (let i = 0; i < m; i++) {
-      const s = graph.source[i]!;
-      edges[cursor[s]!++] = i;
-      if (!directed) { const t = graph.target[i]!; edges[cursor[t]!++] = i; }
+  private makeSelectedPredicate(tree: LODTree, sel: ReadonlySet<string | number>): (g: number) => boolean {
+    const parent = this.treeParent(tree);
+    const memo = new Map<number, boolean>();
+    return (g: number): boolean => {
+      const seen = memo.get(g);
+      if (seen !== undefined) return seen;
+      const path: number[] = [];
+      let cur = g;
+      let result = false;
+      for (;;) {
+        if (sel.has(cur)) { result = true; break; }
+        const cached = memo.get(cur);
+        if (cached !== undefined) { result = cached; break; }
+        const par = parent[cur];
+        if (par === undefined || par < 0) break; // reached a root with no selected ancestor
+        path.push(cur);
+        cur = par;
+      }
+      memo.set(g, result);
+      for (const p of path) memo.set(p, result);
+      return result;
+    };
+  }
+
+  /** Parent-pointer array for the LOD tree: the tree's own `parent` (provided-module trees) or one
+   *  derived once from the children CSR (coarsening/spatial trees), cached by tree identity. O(tree size)
+   *  on first need under a selection; not per frame. */
+  private treeParent(tree: LODTree): Int32Array {
+    if (tree.parent) return tree.parent;
+    if (this.derivedParentFor === tree && this.derivedParent) return this.derivedParent;
+    const parent = new Int32Array(tree.size).fill(-1);
+    for (let g = 0; g < tree.size; g++) {
+      for (let p = tree.childOffset[g]!; p < tree.childOffset[g + 1]!; p++) parent[tree.children[p]!] = g;
     }
-    return (this.hoverIncidence = { offsets, edges });
+    this.derivedParentFor = tree;
+    this.derivedParent = parent;
+    return parent;
   }
 
   // ── Node-drag (#140) ──────────────────────────────────────────────────────────────────────────
@@ -1255,9 +1243,12 @@ export class Network extends BaseEngine {
     // Selection.others dimming (#162): when a selection is active, non-selected frontier glyphs and
     // links (other than a selected node's outgoing super-edges) fade to `dimOp` — the lane analogue of
     // a Scene layer's `selection.others`. `dimOp == null` ⇒ nothing selected, so every dim below is
-    // skipped (O(1)). Keep tests use direct tree-node-id membership, matching the ring (highlightVisible).
+    // skipped (O(1)). Membership is **ancestor-aware** (an expanded selected aggregate's children count),
+    // matching the ring (highlightVisible). The single hovered node's links are kept full + recoloured.
     const dimOp = this.othersDim(this.NODE_LAYER);
     const sel = dimOp != null ? this.selectedIds(this.NODE_LAYER) : undefined;
+    const isSel = sel && sel.size ? this.makeSelectedPredicate(tree, sel) : null;
+    const hovered = this.singleHoveredId();
     // Super-edges first (drawn under the nodes), among the visible frontier only.
     if (opts.superEdges !== false && this.graph!.edgeCount > 0) {
       // One super-edge path for both structural and module trees: gathered from the flow-weighted
@@ -1281,16 +1272,26 @@ export class Network extends BaseEngine {
         },
         visibleWorldRect(this.transform, this.width, this.height),
       );
-      // #162: dim links not outgoing from a selected node. Half-arrows OR lines is present (linkStyle
-      // picks one); `arrows` (when present) SHARES the `lines` colour buffer, so dimming that one buffer
-      // once covers both — keyed by instance order (== `ids` order, shared across all link layers).
-      if (dimOp != null && sel && sel.size) {
-        const linkColors = halfArrows?.colors ?? lines?.colors;
+      // #162: keep a link full-strength iff outgoing from a selected (sub)tree OR from the hovered node;
+      // dim the rest, then recolour the hovered node's links toward the hover hue (existing geometry —
+      // correct bend/half-arrow/width — reused, weight preserved by HCL lightness). Half-arrows OR lines
+      // is present (linkStyle picks one); `arrows` (when present) SHARES the `lines` colour buffer, so
+      // styling that one buffer covers all link layers (instance order == `ids` order, shared across them).
+      const linkColors = halfArrows?.colors ?? lines?.colors;
+      const isHoverLink = (k: number): boolean => {
+        if (hovered == null) return false;
+        const pair = ids[k]!; const s = Math.floor(pair / tree.size);
+        return s === hovered || (!style.directed && pair - s * tree.size === hovered);
+      };
+      if (dimOp != null && isSel) {
         dimOthers(linkColors, ids.length, dimOp, (k) => {
-          const pair = ids[k]!;
-          const src = Math.floor(pair / tree.size);
-          return sel.has(src) || (!style.directed && sel.has(pair - src * tree.size));
+          const pair = ids[k]!; const s = Math.floor(pair / tree.size);
+          return isSel(s) || (!style.directed && isSel(pair - s * tree.size)) || isHoverLink(k);
         });
+      }
+      if (hovered != null) {
+        const { hue, chroma } = this.hoverHueChroma();
+        hueShiftToward(linkColors, ids.length, isHoverLink, hue, chroma);
       }
       const pick = this.pickLinksEnabled || undefined; // flag link layers into the GPU pick pass (#141)
       if (halfArrows && halfArrows.count > 0) layers.push({ name: "links", primitive: "half-arrows", pickable: pick, halfArrows, sizeMode: style.sizeMode });
@@ -1322,8 +1323,9 @@ export class Network extends BaseEngine {
       fadeAlpha: this.fadeAlpha ?? undefined,
     });
     // #162: dim non-selected frontier nodes (fill + border) — O(frontier), composes over the fade alpha.
-    if (dimOp != null && sel && sel.size) {
-      const kept = (k: number): boolean => sel.has(frontier[k]!);
+    // Kept = ancestor-aware selected OR the hovered node (which also gets the green ring + link recolour).
+    if (dimOp != null && isSel) {
+      const kept = (k: number): boolean => { const g = frontier[k]!; return isSel(g) || g === hovered; };
       dimOthers(circles.colors, frontier.length, dimOp, kept);
       dimOthers(circles.borderColors, frontier.length, dimOp, kept);
     }

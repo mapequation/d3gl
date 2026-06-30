@@ -97,9 +97,15 @@ glyphs have no Scene drawable to recolour).
 For a **network**, a selected node additionally keeps its **outgoing links** at full strength while
 the rest dim — so a selection reads as "this node and what it points to" (incident links for an
 undirected graph; under LOD, the selected aggregate's outgoing super-edges). **Hovering** a node
-lights its outgoing links in the hover colour too — the transient link analogue of the hover ring.
-These links are a *visual* companion derived from the node selection; `selection()` / `on("select")`
-stay node-only.
+recolours those same links toward the hover colour — the transient link analogue of the hover ring.
+Both reuse the **already-rendered** link geometry (correct bend / half-arrow / width / direction): the
+hover recolour is a lightness-preserving hue shift, so a weight-encoded link keeps its weight cue. The
+links are a *visual* companion derived from the node selection; `selection()` / `on("select")` stay
+node-only.
+
+Selection highlight is **ancestor-aware** under LOD: selecting a module and zooming in keeps its
+expanding children (and their outgoing links) highlighted, even though only the module id is in the
+selection set — so `selection()` stays compact while the on-screen focus follows the subtree.
 
 ## Cost model
 

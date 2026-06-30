@@ -100,7 +100,7 @@ describe("network shift+drag marquee (#159)", () => {
     expect(badge()?.textContent).toBe("−");
     expect([...(removeIds() ?? [])]).toEqual([1]);
     ev("pointerup", 130, 130, true);
-    expect(badge()).toBeNull();              // removed on release
+    expect(badge()?.style.display).toBe("none"); // hidden on release (the overlay pair is reused, #162)
     expect(removeIds()?.size ?? 0).toBe(0);  // preview set cleared
     /* eslint-enable @typescript-eslint/no-explicit-any */
     expect(net.selection().map((s) => s.id)).toEqual([]); // node 1 subtracted out
@@ -168,6 +168,59 @@ describe("network shift+drag marquee (#159)", () => {
     const at = (type: string) => h.dispatchEvent(new PointerEvent(type, { clientX: r.left + 100, clientY: r.top + 100, shiftKey: true, bubbles: true, button: 0, pointerId: 1 }));
     at("pointerdown"); at("pointerup");
     expect(idsOf(net)).toEqual([1]);
+    net.destroy();
+  });
+
+  // #162 robustness: an interrupted gesture (ctrl-click context menu) used to orphan the overlay box +
+  // mode badge so they accumulated on screen. The overlay is now ONE reused pair, torn down on any abort.
+  it("a context menu mid-drag tears the marquee down without orphaning overlay elements (#162)", async () => {
+    const h = host();
+    const net = network(h, { width: 200, height: 200 });
+    await net.whenReady();
+    const g = buildGraph({ nodeCount: 4, source: [0, 1], target: [1, 2], directed: false });
+    net.data(g).style({ nodeRadius: 6 }).layout({ backend: "positions", positions: new Float32Array([10, 10, 100, 100, 190, 190, 50, 150]) });
+    net.setTransform({ k: 1, x: 0, y: 0 });
+    net.interactive({ selectable: { multi: true } });
+
+    const r = h.getBoundingClientRect();
+    const boxes = () => document.querySelectorAll(".d3gl-marquee").length;
+    const badges = () => document.querySelectorAll(".d3gl-marquee-badge").length;
+    const box0 = boxes(), badge0 = badges();
+    // Three shift-drags, each interrupted mid-gesture by a context menu (the ctrl-click bug path).
+    for (let i = 0; i < 3; i++) {
+      h.dispatchEvent(new PointerEvent("pointerdown", { clientX: r.left + 40, clientY: r.top + 40, shiftKey: true, bubbles: true, button: 0, pointerId: 1 }));
+      h.dispatchEvent(new PointerEvent("pointermove", { clientX: r.left + 160, clientY: r.top + 160, shiftKey: true, bubbles: true, pointerId: 1 })); // box appears
+      window.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true })); // interrupt
+    }
+    // At most ONE reused box + badge for this engine — not one per interrupted gesture.
+    expect(boxes() - box0).toBeLessThanOrEqual(1);
+    expect(badges() - badge0).toBeLessThanOrEqual(1);
+    expect(idsOf(net)).toEqual([]); // none of the interruptions committed a selection
+    // A fresh marquee still works after the interruptions.
+    shiftDrag(h, 40, 40, 160, 160);
+    expect(idsOf(net)).toEqual([1, 3]); // (100,100) and (50,150)
+    net.destroy();
+    expect(boxes()).toBe(box0); // destroy removes the reused overlay from the DOM
+    expect(badges()).toBe(badge0);
+  });
+
+  it("Esc cancels an in-flight marquee — no selection committed (#162)", async () => {
+    const h = host();
+    const net = network(h, { width: 200, height: 200 });
+    await net.whenReady();
+    const g = buildGraph({ nodeCount: 4, source: [0, 1], target: [1, 2], directed: false });
+    net.data(g).style({ nodeRadius: 6 }).layout({ backend: "positions", positions: new Float32Array([10, 10, 100, 100, 190, 190, 50, 150]) });
+    net.setTransform({ k: 1, x: 0, y: 0 });
+    net.interactive({ selectable: { multi: true } });
+    net.select("nodes", [0]); // pre-existing selection to confirm Esc leaves it untouched
+
+    const r = h.getBoundingClientRect();
+    h.dispatchEvent(new PointerEvent("pointerdown", { clientX: r.left + 40, clientY: r.top + 40, shiftKey: true, bubbles: true, button: 0, pointerId: 1 }));
+    h.dispatchEvent(new PointerEvent("pointermove", { clientX: r.left + 160, clientY: r.top + 160, shiftKey: true, bubbles: true, pointerId: 1 })); // box covers nodes 1, 3
+    window.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true })); // cancel
+    expect((document.querySelector(".d3gl-marquee") as HTMLElement | null)?.style.display).toBe("none"); // overlay hidden
+    h.dispatchEvent(new PointerEvent("pointerup", { clientX: r.left + 160, clientY: r.top + 160, shiftKey: true, bubbles: true, button: 0, pointerId: 1 }));
+    expect(idsOf(net)).toEqual([0]); // unchanged — Esc cancelled before the box could commit 1 and 3
     net.destroy();
   });
 });
