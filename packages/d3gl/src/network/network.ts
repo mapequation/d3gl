@@ -3,7 +3,7 @@ import { networkLayers, frontierCircles, frontierHalos, superEdges, emitNodes, e
 import { rgb, hcl } from "d3-color";
 import { ForceLayout, seedPositions, type ForceParams } from "./force.js";
 import { multilevelLayout, type CoarsenOptions } from "./coarsen.js";
-import { buildLODTree, buildSpatialLODTree, computeLODGeometry, computeLODStyle, cut, declutterFrontier, pickFrontier, regionFrontier, visibleWorldRect, leavesUnder, type LODTree, type SpatialLODOptions } from "./lod.js";
+import { buildLODTree, buildSpatialLODTree, computeLODGeometry, computeLODStyle, cut, declutterFrontier, pickFrontier, regionFrontier, visibleWorldRect, leavesUnder, ancestorAwareSelected, type LODTree, type SpatialLODOptions } from "./lod.js";
 import { LabelLayer, placeLabels, type LabelAnchor } from "../labels/label-layer.js";
 import { buildModuleLODTree, type ModuleNode } from "./modules.js";
 import { startWorkerLayout, type WorkerLayoutHandle } from "./worker-transport.js";
@@ -1019,35 +1019,12 @@ export class Network extends BaseEngine {
     return { hue: Number.isNaN(c.h) ? 130 : c.h, chroma: Number.isNaN(c.c) ? 40 : c.c };
   }
 
-  /**
-   * Ancestor-aware "is this frontier node selected" predicate (#162): a tree node counts as selected if
-   * it OR any ancestor is in `sel` — so selecting a module and zooming in keeps its expanding children
-   * highlighted, while the selection set stays literal (just the module id; `selection()` is unchanged).
-   * Walks `tree.parent` (derived from the children CSR when absent) with a memo + path-compression, so
-   * the whole per-emit pass over the frontier is O(visible) amortized (depth-bounded climbs collapse).
-   */
+  /** Ancestor-aware "is this frontier node selected" predicate over the LOD tree (#162) — a node counts
+   *  if it OR any ancestor is in `sel`, so a selected module's expanding children stay highlighted while
+   *  the selection set stays literal. Delegates to the pure {@link ancestorAwareSelected} (tested for the
+   *  O(frontier·depth) bound), with parent pointers from {@link treeParent}. */
   private makeSelectedPredicate(tree: LODTree, sel: ReadonlySet<string | number>): (g: number) => boolean {
-    const parent = this.treeParent(tree);
-    const memo = new Map<number, boolean>();
-    return (g: number): boolean => {
-      const seen = memo.get(g);
-      if (seen !== undefined) return seen;
-      const path: number[] = [];
-      let cur = g;
-      let result = false;
-      for (;;) {
-        if (sel.has(cur)) { result = true; break; }
-        const cached = memo.get(cur);
-        if (cached !== undefined) { result = cached; break; }
-        const par = parent[cur];
-        if (par === undefined || par < 0) break; // reached a root with no selected ancestor
-        path.push(cur);
-        cur = par;
-      }
-      memo.set(g, result);
-      for (const p of path) memo.set(p, result);
-      return result;
-    };
+    return ancestorAwareSelected(this.treeParent(tree), (g) => sel.has(g));
   }
 
   /** Parent-pointer array for the LOD tree: the tree's own `parent` (provided-module trees) or one

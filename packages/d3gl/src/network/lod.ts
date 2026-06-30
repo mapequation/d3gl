@@ -202,6 +202,37 @@ export function flattenHierarchyToTopology(hierarchy: Hierarchy, leafCount: numb
 }
 
 /**
+ * An **ancestor-aware "is selected"** predicate over a tree's parent pointers (#162): node `g` counts
+ * as selected if it OR any ancestor satisfies `isSelected`. Lets a selected aggregate keep its expanding
+ * children highlighted as you zoom in, while the selection set itself stays literal (just the aggregate
+ * id). Memoised with path-compression — each node's whole ancestor chain is cached on first walk — so
+ * applying it across a frontier is O(frontier · depth) worst case but amortises toward O(frontier) as
+ * chains overlap, and is independent of the leaf count. `parent[g] < 0` marks a root.
+ */
+export function ancestorAwareSelected(parent: Int32Array, isSelected: (g: number) => boolean): (g: number) => boolean {
+  const memo = new Map<number, boolean>();
+  return (g: number): boolean => {
+    const seen = memo.get(g);
+    if (seen !== undefined) return seen;
+    const path: number[] = [];
+    let cur = g;
+    let result = false;
+    for (;;) {
+      if (isSelected(cur)) { result = true; break; }
+      const cached = memo.get(cur);
+      if (cached !== undefined) { result = cached; break; }
+      const par = parent[cur];
+      if (par === undefined || par < 0) break; // reached a root with no selected ancestor
+      path.push(cur);
+      cur = par;
+    }
+    memo.set(g, result);
+    for (const p of path) memo.set(p, result);
+    return result;
+  };
+}
+
+/**
  * Enumerate the leaf descendants of tree node `g` (its global ids `< leafCount`, which equal the
  * original graph node ids). A leaf returns `[itself]`; an aggregate is a DFS over the children CSR.
  * O(subtree leaves), run lazily on a hit (`members()`) — never per frame. Sorted ascending so the
