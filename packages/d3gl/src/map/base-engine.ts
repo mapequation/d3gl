@@ -89,6 +89,11 @@ export interface InteractiveLayerOptions<D = any> {
    *  hovered item with it, or a custom `(datum, HighlightBuilder)` draw fn. Rendered in a tiny
    *  overlay layer — O(hovered item) per change, the base layer is untouched. */
   hover?: HoverOption<D>;
+  /** Fade the non-hovered glyphs while hovering (#162) — the hover analogue of `selection.others`,
+   *  opt-in (default off). `true` ⇒ `{ opacity: 0.3 }`, a number ⇒ that opacity, or `{ opacity }`.
+   *  Honored by instanced-lane engines that apply it via the shader (network); it's a uniform change,
+   *  so it stays free even on a full (LOD-off) draw. Ignored by Scene layers. */
+  hoverDimOthers?: boolean | number | { opacity?: number };
   /** Hover tooltip content for this layer (`null` hides). Shown in a shared engine-managed div —
    *  see `tooltipClass` for styling. Re-evaluated only when the hovered target changes;
    *  re-declare the layer to force a refresh. */
@@ -493,6 +498,7 @@ export abstract class BaseEngine {
       for (const layer of emitted) backend.setInstancedLayer(layer);
     }
     this.laneEmittedNames.set(name, emittedNames);
+    this.onInstancedLaneEmitted(name); // re-apply shader-highlight uniforms a fresh setInstancedLayer reset (#162)
   }
 
   /** Selected ids for an instanced-lane layer (#105 N7c-2) — read by a lane's companion highlight
@@ -581,6 +587,16 @@ export abstract class BaseEngine {
     this.render();
   }
 
+  /** Hook: an interactive lane's HOVER set changed (#162). Default re-emits the ring overlay (+ the base
+   *  lane if `hoverDirtiesBase`). An engine with shader-driven highlight (network) overrides this to set
+   *  a uniform instead — so a hover on a full (LOD-off) draw costs no geometry rebuild. */
+  protected onLaneHoverChanged(layer: string): void { this.emitHoverFor(layer); }
+  /** Hook: an interactive lane's SELECTION set changed. Default re-emits base + ring. */
+  protected onLaneSelectionChanged(layer: string): void { this.emitSelectionFor(layer); }
+  /** Hook: called after an instanced lane's layers were (re)emitted (#162). Lets an engine re-apply
+   *  shader-highlight uniforms that a fresh `setInstancedLayer` reset to defaults. Default no-op. */
+  protected onInstancedLaneEmitted(_name: string): void {}
+
   /** Does any registered lane opt into hover/tooltip (`"hover"`) or click-select (`"selectable"`)?
    *  Lets the pointer-move/up handlers fire for lane-only engines (no Scene specs carry the option). */
   private anyLaneInteractive(kind: "hover" | "selectable"): boolean {
@@ -608,16 +624,16 @@ export abstract class BaseEngine {
     if (this.laneHoverLayer && this.laneHoverLayer !== layer) {
       const prev = this.laneHoverLayer;
       this.laneHilite.delete(prev);
-      this.emitHoverFor(prev); // also un-recolours the previous layer's hovered links (#162)
+      this.onLaneHoverChanged(prev); // clear the previous layer's hover styling
     }
     this.laneHoverLayer = layer;
     if (!layer) return;
     const set = this.laneHilite.get(layer);
     if (id == null) {
-      if (set?.size) { this.laneHilite.delete(layer); this.emitHoverFor(layer); }
+      if (set?.size) { this.laneHilite.delete(layer); this.onLaneHoverChanged(layer); }
     } else if (!set || set.size !== 1 || !set.has(id)) {
       this.laneHilite.set(layer, new Set([id]));
-      this.emitHoverFor(layer);
+      this.onLaneHoverChanged(layer);
     }
   }
 
@@ -882,7 +898,7 @@ export abstract class BaseEngine {
       if (typeof set === "function") throw new Error(`select(${name}, fn): function selectors are Scene-layer only; pass an id array for instanced lanes`);
       if (set === null) this.selected.delete(name);
       else this.selected.set(name, new Set(set));
-      this.emitSelectionFor(name);
+      this.onLaneSelectionChanged(name);
       this.selectCb?.(this.selection(), undefined);
       return this;
     }
@@ -1558,10 +1574,10 @@ export abstract class BaseEngine {
     el.style.top = `${Math.min(m.startClientY, e.clientY)}px`;
     el.style.width = `${Math.abs(e.clientX - m.startClientX)}px`;
     el.style.height = `${Math.abs(e.clientY - m.startClientY)}px`;
-    // Mode badge: subtract while alt/option is held (red "−"), else add (green "+"). Follows the cursor.
+    // Mode badge: "−" while alt/option is held (subtract), else "+" (add). Neutral gray in both modes (#162).
     const sub = e.altKey;
     badge.textContent = sub ? "−" : "+";
-    badge.style.background = sub ? "#dc2626" : "#16a34a";
+    badge.style.background = "#4b5563"; // neutral gray (#4b5563)
     badge.style.left = `${e.clientX + 10}px`;
     badge.style.top = `${e.clientY + 10}px`;
     // Live preview: ring the glyphs the box currently covers — blue "will-add", or (alt) red "will-remove".
@@ -1679,10 +1695,10 @@ export abstract class BaseEngine {
    *  refresh their companion ring overlay instead (no Scene drawables to recolor). */
   private applySelectionStyles(touched: Set<string>): void {
     for (const n of touched) {
-      // Lane-first: an interactive lane re-emits its base layers (others-dim) + ring overlay;
+      // Lane-first: an interactive lane restyles via its selection hook (shader uniforms / re-emit);
       // otherwise a Scene layer restyles.
       if (this.laneInteractiveFor(n)) {
-        this.emitSelectionFor(n);
+        this.onLaneSelectionChanged(n);
       } else {
         const ids = this.selected.get(n);
         this._applySelect(n, ids && ids.size ? ids : null);

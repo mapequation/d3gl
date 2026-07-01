@@ -292,105 +292,134 @@ describe("network interactive lane (#105 N7c-2)", () => {
   });
 });
 
-// #162: selection.others dimming + outgoing-link emphasis on the instanced node lane.
-describe("network selection.others dim + outgoing links (#162)", () => {
+// #162: shader-driven selection.others dim + outgoing-link emphasis on the instanced node lane. The
+// highlight is applied in the vertex shader from per-instance `groups`/`selected` columns (baked into the
+// emit) + lane uniforms, so a hover/selection restyle never rebuilds geometry (the large-scale lag fix).
+describe("network shader highlight: selection.others dim + outgoing links (#162)", () => {
   /* eslint-disable @typescript-eslint/no-explicit-any */
   const baseLane = (net: any) => net.instancedLanes.get("network").lane;
   const hlLane = (net: any) => net.instancedLanes.get("network-highlight").lane;
   const T = { k: 1, x: 0, y: 0 };
-  const emit = (lane: any): any[] => lane.update(T, 200, 200);
+  const emit = (lane: any): any[] => lane.update(T, 200, 200); // pure re-emit (returns layer data; no backend calls)
   const layer = (layers: any[], name: string) => layers.find((l) => l.name === name);
-  const linkColors = (l: any): Uint8Array => (l.primitive === "lines" ? l.lines.colors : l.halfArrows.colors);
+  const linkData = (l: any) => (l.primitive === "lines" ? l.lines : l.primitive === "half-arrows" ? l.halfArrows : l.arrows);
+  const BASE = new Set(["nodes", "links", "arrows"]);
+  /** Record backend layer calls so a test can prove a hover is a uniform update, not a geometry re-emit. */
+  const spyBackend = (net: any) => {
+    const b = net.handle.backend;
+    const rec = { set: [] as string[], update: [] as string[], style: [] as { name: string; h: any }[], reset() { this.set.length = 0; this.update.length = 0; this.style.length = 0; } };
+    const os = b.setInstancedLayer.bind(b);
+    b.setInstancedLayer = (l: any) => { rec.set.push(l.name); return os(l); };
+    if (b.updateInstancedLayer) { const ou = b.updateInstancedLayer.bind(b); b.updateInstancedLayer = (l: any) => { rec.update.push(l.name); return ou(l); }; }
+    const ot = b.styleInstancedLayer.bind(b);
+    b.styleInstancedLayer = (n: string, hh: any) => { rec.style.push({ name: n, h: hh }); return ot(n, hh); };
+    return rec;
+  };
 
-  it("#1 selecting a node dims the others to the default 0.3 and keeps the selected node full", async () => {
+  it("#1 selecting a node bakes its `selected` flag + `groups`, and pushes the dim uniform (default 0.3)", async () => {
     const net = network(host(), { width: 200, height: 200 });
     await net.whenReady();
     const g = buildGraph({ nodeCount: 3, source: [0, 1], target: [1, 2], directed: false });
     net.data(g).style({ nodeRadius: 6 }).layout({ backend: "positions", positions: new Float32Array([10, 10, 90, 90, 170, 30]) });
     net.interactive({ selectable: true }); // default selection.others = { opacity: 0.3 }
+    net.setTransform(T);
 
-    const before = layer(emit(baseLane(net)), "nodes").circles.colors as Uint8Array;
-    const base = [before[3], before[7], before[11]]; // alpha of nodes 0,1,2 (opaque ⇒ 255)
-    expect(base).toEqual([255, 255, 255]);
-
+    const spy = spyBackend(net);
+    spy.reset();
     net.select("nodes", [1]);
-    const after = layer(emit(baseLane(net)), "nodes").circles.colors as Uint8Array;
-    expect(after[7]).toBe(255); // selected node 1 stays full
-    expect(after[3]).toBe(Math.round(255 * 0.3)); // node 0 dimmed
-    expect(after[11]).toBe(Math.round(255 * 0.3)); // node 2 dimmed
+    const nodes = layer(emit(baseLane(net)), "nodes").circles;
+    expect([...(nodes.groups as Float32Array)]).toEqual([0, 1, 2]); // a_group = node id
+    expect([...(nodes.selected as Uint8Array)]).toEqual([0, 1, 0]); // only node 1 flagged selected
+    expect(nodes.colors[7]).toBe(255); // a_color stays BASE (dim is in the shader, not the buffer)
+    // The dim is pushed to the base layers as uniforms — no geometry re-emit of nodes/links.
+    const nodeStyle = spy.style.filter((s) => s.name === "nodes");
+    expect(nodeStyle.some((s) => s.h.dimActive === true && s.h.dimOpacity === 0.3)).toBe(true);
+    expect(spy.set.filter((n) => BASE.has(n))).toEqual([]); // no setInstancedLayer on the base geometry
+    expect(spy.update.filter((n) => BASE.has(n))).toEqual([]);
 
-    net.select("nodes", null); // clearing the selection removes the dim
-    const cleared = layer(emit(baseLane(net)), "nodes").circles.colors as Uint8Array;
-    expect([cleared[3], cleared[7], cleared[11]]).toEqual([255, 255, 255]);
+    net.select("nodes", null); // clearing pushes dimActive=false
+    expect(spy.style.filter((s) => s.name === "nodes").at(-1)!.h.dimActive).toBe(false);
     net.destroy();
   });
 
-  it("#1 honors a custom selection.others.opacity", async () => {
+  it("#1 honors a custom selection.others.opacity (uniform value)", async () => {
     const net = network(host(), { width: 200, height: 200 });
     await net.whenReady();
     const g = buildGraph({ nodeCount: 3, source: [0, 1], target: [1, 2], directed: false });
     net.data(g).style({ nodeRadius: 6 }).layout({ backend: "positions", positions: new Float32Array([10, 10, 90, 90, 170, 30]) });
     net.interactive({ selectable: true, selection: { others: { opacity: 0.5 } } });
-
+    net.setTransform(T);
+    const spy = spyBackend(net);
+    spy.reset();
     net.select("nodes", [0]);
-    const a = layer(emit(baseLane(net)), "nodes").circles.colors as Uint8Array;
-    expect(a[3]).toBe(255); // selected node 0 full
-    expect(a[7]).toBe(Math.round(255 * 0.5)); // node 1 at the custom opacity
+    expect(spy.style.filter((s) => s.name === "nodes").some((s) => s.h.dimActive === true && s.h.dimOpacity === 0.5)).toBe(true);
     net.destroy();
   });
 
-  it("#2 a selected node keeps its outgoing links full while other links dim (directed)", async () => {
+  it("#2 a selected node's outgoing links are flagged `selected` (directed source-only)", async () => {
     const net = network(host(), { width: 200, height: 200 });
     await net.whenReady();
     // Directed chain 0→1→2: node 0's only outgoing edge is edge 0 (0→1).
     const g = buildGraph({ nodeCount: 3, source: [0, 1], target: [1, 2], directed: true });
     net.data(g).style({ nodeRadius: 6, directed: true }).layout({ backend: "positions", positions: new Float32Array([10, 10, 90, 90, 170, 30]) });
     net.interactive({ selectable: true });
+    net.setTransform(T);
 
     net.select("nodes", [0]);
-    const links = linkColors(layer(emit(baseLane(net)), "links"));
-    expect(links[3]).toBe(255); // edge 0 (0→1) outgoing from the selected node 0 → full
-    expect(links[7]).toBe(Math.round(255 * 0.3)); // edge 1 (1→2) → dimmed
+    const links = linkData(layer(emit(baseLane(net)), "links"));
+    expect([...(links.groups as Float32Array)]).toEqual([0, 1]); // a_group = link source
+    expect([...(links.selected as Uint8Array)]).toEqual([1, 0]); // edge 0 (from 0) flagged; edge 1 (from 1) not
     net.destroy();
   });
 
-  it("#3 hovering a node recolours its EXISTING outgoing links toward the hover hue (no new geometry)", async () => {
+  it("#3 hovering drives a shader UNIFORM, not a geometry re-emit (the large-scale lag fix)", async () => {
     const h = host();
     const net = network(h, { width: 200, height: 200 });
     await net.whenReady();
-    // Directed chain 0→1→2: node 0's only outgoing edge is edge 0 (0→1); edge 1 (1→2) is unrelated.
     const g = buildGraph({ nodeCount: 3, source: [0, 1], target: [1, 2], directed: true });
-    net.data(g).style({ nodeRadius: 8, directed: true, linkStroke: "#999999" }).layout({ backend: "positions", positions: new Float32Array([10, 10, 90, 90, 170, 30]) });
+    net.data(g).style({ nodeRadius: 8, directed: true }).layout({ backend: "positions", positions: new Float32Array([10, 10, 90, 90, 170, 30]) });
     net.interactive({ selectable: true, hover: true });
     net.setTransform(T);
 
-    const base = baseLane(net);
-    // No hover: the base `links` layer is the resolved gray, and there is NO separate hover-link layer.
-    const before = linkColors(layer(emit(base), "links"));
-    expect(before[0]).toBe(before[1]); // gray: r == g
-    expect(layer(emit(hlLane(net)), "network-highlight:hover-links")).toBeUndefined(); // no parallel geometry
-
-    // Hover node 0 (world == screen at k=1) → its outgoing edge 0 (0→1) recolours toward green IN PLACE
-    // (same `links` layer, same count — no new lines); edge 1 (1→2) is untouched.
+    const spy = spyBackend(net);
+    spy.reset();
     const rect = h.getBoundingClientRect();
-    h.dispatchEvent(new PointerEvent("pointermove", { clientX: rect.left + 10, clientY: rect.top + 10, bubbles: true }));
-    const after = layer(emit(base), "links");
-    expect(after.lines.count).toBe(2); // still the two real edges — geometry unchanged
-    const ac = after.lines.colors as Uint8Array;
-    expect(ac[1]).toBeGreaterThan(ac[0]); // edge 0 now green-dominant (G > R)
-    expect(ac[1]).toBeGreaterThan(ac[2]); // G > B
-    expect([ac[4], ac[5], ac[6]]).toEqual([before[4], before[5], before[6]]); // edge 1 unchanged (gray)
-    expect(layer(emit(hlLane(net)), "network-highlight:hover-links")).toBeUndefined(); // still no new geometry
+    h.dispatchEvent(new PointerEvent("pointermove", { clientX: rect.left + 10, clientY: rect.top + 10, bubbles: true })); // hover node 0
 
-    // Move off → the recolour clears (links back to gray).
+    // The core regression guard: NO base geometry (re)emit on hover — only a uniform update.
+    expect(spy.set.filter((n) => BASE.has(n))).toEqual([]);
+    expect(spy.update.filter((n) => BASE.has(n))).toEqual([]);
+    const styled = spy.style.filter((s) => BASE.has(s.name));
+    expect(styled.length).toBeGreaterThan(0);
+    expect(styled.some((s) => s.h.hoverGroup === 0)).toBe(true); // the hovered node id is pushed as u_hoverGroup
+
+    // Move off → hoverGroup clears to -1.
     h.dispatchEvent(new PointerEvent("pointermove", { clientX: rect.left + 199, clientY: rect.top + 199, bubbles: true }));
-    const cleared = linkColors(layer(emit(base), "links"));
-    expect(cleared[1]).toBe(cleared[0]); // gray again
+    expect(spy.style.filter((s) => s.name === "nodes").at(-1)!.h.hoverGroup).toBe(-1);
     net.destroy();
     h.remove();
   });
 
-  it("#162 ancestor-aware: zooming into a selected aggregate highlights its expanded children", async () => {
+  it("#162 fade-others-on-hover is opt-in (hoverDimOthers) and is a uniform, not a re-emit", async () => {
+    const h = host();
+    const net = network(h, { width: 200, height: 200 });
+    await net.whenReady();
+    const g = buildGraph({ nodeCount: 3, source: [0, 1], target: [1, 2], directed: false });
+    net.data(g).style({ nodeRadius: 8 }).layout({ backend: "positions", positions: new Float32Array([10, 10, 90, 90, 170, 30]) });
+    net.interactive({ hover: true, hoverDimOthers: { opacity: 0.4 } });
+    net.setTransform(T);
+    const spy = spyBackend(net);
+    spy.reset();
+    const rect = h.getBoundingClientRect();
+    h.dispatchEvent(new PointerEvent("pointermove", { clientX: rect.left + 10, clientY: rect.top + 10, bubbles: true })); // hover node 0
+    const nodeStyle = spy.style.filter((s) => s.name === "nodes");
+    expect(nodeStyle.some((s) => s.h.dimActive === true && s.h.dimOpacity === 0.4 && s.h.hoverGroup === 0)).toBe(true);
+    expect(spy.set.filter((n) => BASE.has(n))).toEqual([]); // still no geometry re-emit
+    net.destroy();
+    h.remove();
+  });
+
+  it("#162 ancestor-aware: zooming into a selected aggregate flags its expanded children `selected`", async () => {
     const net = network(host(), { width: 200, height: 200 });
     await net.whenReady();
     // Two modules of two nodes; at k=1 each collapses to one aggregate glyph.
@@ -405,18 +434,23 @@ describe("network selection.others dim + outgoing links (#162)", () => {
     net.select("nodes", [agg]);
     expect([...(hlLane(net).visible as Uint32Array)]).toContain(agg); // zoomed out: the aggregate itself rings
 
-    // Zoom into the module so it expands into its leaves; ancestor-aware highlight rings those children.
+    // Zoom into the module so it expands into its leaves; ancestor-aware ⇒ the children are flagged selected.
     const k = 12;
     net.setTransform({ k, x: 100 - tree.cx[agg] * k, y: 100 - tree.cy[agg] * k });
+    const nodesLayer = layer(baseLane(net).update({ k, x: 100 - tree.cx[agg] * k, y: 100 - tree.cy[agg] * k }, 200, 200), "nodes");
     const frontier = [...(baseLane(net).visible as Uint32Array)];
-    const expandedLeaves = leavesUnder(tree, agg).filter((l) => frontier.includes(l));
-    expect(expandedLeaves.length).toBeGreaterThan(0); // the aggregate actually expanded
-    const ringed = [...(hlLane(net).visible as Uint32Array)];
-    for (const l of expandedLeaves) expect(ringed).toContain(l); // children of the selected module are highlighted
+    const groups = nodesLayer.circles.groups as Float32Array;
+    const selected = nodesLayer.circles.selected as Uint8Array;
+    const childrenOnFrontier = leavesUnder(tree, agg).filter((l) => frontier.includes(l));
+    expect(childrenOnFrontier.length).toBeGreaterThan(0); // the aggregate actually expanded
+    for (const child of childrenOnFrontier) {
+      const i = [...groups].indexOf(child);
+      expect(selected[i]).toBe(1); // a descendant of the selected module is flagged selected (ancestor-aware)
+    }
     net.destroy();
   });
 
-  it("#3 modular-map: hovering an aggregate recolours its outgoing super-edge half-arrows IN PLACE", async () => {
+  it("#3 modular-map: hovering an aggregate pushes its group id as the hover uniform (no re-emit)", async () => {
     const h = host();
     const net = network(h, { width: 200, height: 200 });
     await net.whenReady();
@@ -429,22 +463,19 @@ describe("network selection.others dim + outgoing links (#162)", () => {
 
     const base = baseLane(net);
     const tree = (net as any).lodTree;
-    const links0 = layer(emit(base), "links");
-    expect(links0.primitive).toBe("half-arrows"); // the rich map glyph, not plain lines
-    const count0 = links0.halfArrows.count;
+    expect(layer(emit(base), "links").primitive).toBe("half-arrows"); // the rich map glyph, not plain lines
+    // The links carry a_group = super-edge source tree-node, so the shader recolours the hovered aggregate's out-edges.
+    const links = linkData(layer(emit(base), "links"));
+    expect(links.groups.length).toBe(links.count);
 
-    // Hover the aggregate that SOURCES the super-edge (the module containing node 1, the edge 1→2 source).
     const aggs = [...(base.visible as Uint32Array)].filter((id) => id >= tree.leafCount);
     const srcAgg = aggs.find((a) => leavesUnder(tree, a).includes(1))!;
+    const spy = spyBackend(net);
+    spy.reset();
     const r = h.getBoundingClientRect();
     h.dispatchEvent(new PointerEvent("pointermove", { clientX: r.left + tree.cx[srcAgg], clientY: r.top + tree.cy[srcAgg], bubbles: true }));
-
-    const links = layer(emit(base), "links");
-    expect(links.halfArrows.count).toBe(count0); // SAME half-arrow geometry — recoloured, not re-built
-    const c = links.halfArrows.colors as Uint8Array;
-    let greenInstances = 0;
-    for (let k = 0; k < links.halfArrows.count; k++) if (c[k * 4 + 1]! > c[k * 4]! && c[k * 4 + 1]! > c[k * 4 + 2]!) greenInstances++;
-    expect(greenInstances).toBeGreaterThan(0); // the hovered aggregate's outgoing super-edge turned green
+    expect(spy.style.filter((s) => s.name === "links").some((s) => s.h.hoverGroup === srcAgg)).toBe(true);
+    expect(spy.set.filter((n) => BASE.has(n))).toEqual([]); // half-arrow geometry not rebuilt on hover
     net.destroy();
     h.remove();
   });

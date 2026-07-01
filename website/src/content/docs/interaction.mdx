@@ -88,20 +88,20 @@ Bulk overrides are colors-only: stroke geometry bakes its width at tessellation 
 
 `selection.others` works the same on GPU-instanced lanes — network `nodes` and a `plot` layer's
 decluttered `points` — as on retained layers: with a selection active, non-selected glyphs fade to
-`others.opacity` (default `0.3`) as a per-instance alpha multiply, applied on selection change (and
-folded into the per-frame emit under LOD, so it stays O(visible) — see the cost model). The
-persistent selection **ring** remains the *selected* affordance; the dim is the complementary focus.
-Lanes honor the **opacity** component of `others` (a colour override there is ignored — instanced
-glyphs have no Scene drawable to recolour).
+`others.opacity` (default `0.3`). The persistent selection **ring** stays the *selected* affordance; the
+dim is the complementary focus. Lanes honor the **opacity** component of `others` (a colour override
+there is ignored — instanced glyphs have no Scene drawable to recolour).
 
-For a **network**, a selected node additionally keeps its **outgoing links** at full strength while
-the rest dim — so a selection reads as "this node and what it points to" (incident links for an
-undirected graph; under LOD, the selected aggregate's outgoing super-edges). **Hovering** a node
-recolours those same links toward the hover colour — the transient link analogue of the hover ring.
-Both reuse the **already-rendered** link geometry (correct bend / half-arrow / width / direction): the
-hover recolour is a lightness-preserving hue shift, so a weight-encoded link keeps its weight cue. The
-links are a *visual* companion derived from the node selection; `selection()` / `on("select")` stay
-node-only.
+For a **network** the highlight is applied **in the GPU vertex shader** from per-instance
+`group`/`selected` columns plus lane uniforms, so it scales to a full **LOD-off** draw: a hover is a
+single uniform change — no per-frame geometry rebuild or buffer re-upload, even at a million nodes. A
+selected node keeps its **outgoing links** at full strength while the rest dim ("this node and what it
+points to" — incident links for an undirected graph; under LOD, the selected aggregate's outgoing
+super-edges). **Hovering** a node recolours those same links toward the highlight colour (red by
+default, matching the ring) preserving each link's luminance, so a weight-encoded link keeps its weight
+cue. Set `hoverDimOthers` (`true`, a number, or `{ opacity }`) to *also* fade the rest on hover — the
+opt-in hover analogue of `selection.others`. These links are a *visual* companion derived from the node
+selection; `selection()` / `on("select")` stay node-only.
 
 Selection highlight is **ancestor-aware** under LOD: selecting a module and zooming in keeps its
 expanding children (and their outgoing links) highlighted, even though only the module id is in the

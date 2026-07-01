@@ -6,19 +6,19 @@ import { buildGraph } from "../graph.js";
 import { dimOthers } from "../../map/selection-dim.js";
 
 /**
- * Per-frame regression guard for the #162 `selection.others` dim on the LOD node lane (AGENTS.md step 5).
+ * Per-frame regression guard for the #162 highlight on the LOD node lane (AGENTS.md step 5).
  *
- * The dim is applied in `network.frontierLayers` AFTER the existing per-frame emit (`superEdges` +
- * `frontierCircles`), as a per-instance alpha multiply over the **visible frontier** (nodes) and the
- * **emitted super-edges** (links) — gated to run only when a selection is active. This test reconstructs
- * that exact per-frame pipeline (the same shape as `lod-perf.bench.test.ts`) with a selection active and
- * asserts:
- *   1. **Signature — O(visible), not O(N):** the dim's keep predicate runs exactly `frontier.length`
- *      (nodes) + `ids.length` (links) times per frame, and the frontier is a small fraction of N. So a
- *      future change that made the dim O(N) (e.g. allocating an N-sized dim-alpha array per frame) would
- *      blow this count.
- *   2. **Frame budget:** each frame's cut → super-edges → circles → dim stays under a generous wall-clock
- *      ceiling at scale, catching an order-of-magnitude regression without flakiness.
+ * The dim/recolour itself is now applied in the GPU shader from per-instance columns + uniforms (a hover
+ * is a uniform change — the browser test `network-interactive` proves hover issues no geometry re-emit).
+ * What the LOD emit still does per frame is compute the per-instance `selected` flag over the **visible
+ * frontier** — the *same* ancestor-aware walk this test exercises (`ancestorAwareSelected`), plus a
+ * frontier-sized alpha pass here standing in for the per-instance flag build. This test reconstructs that
+ * per-frame shape (like `lod-perf.bench.test.ts`) with a selection active and asserts:
+ *   1. **Signature — O(visible), not O(N):** the keep predicate runs exactly `frontier.length` (nodes) +
+ *      `ids.length` (links) times per frame; the frontier stays a small fraction of N; and the
+ *      ancestor-aware walk steps stay O(frontier·depth), not O(N).
+ *   2. **Frame budget:** each frame's cut → super-edges → circles → flag pass stays under a generous
+ *      wall-clock ceiling at scale, catching an order-of-magnitude regression without flakiness.
  *
  * N is held at 100k (a few seconds to build) — the 1M empirical timing is the env-gated `lod-perf.bench`.
  */

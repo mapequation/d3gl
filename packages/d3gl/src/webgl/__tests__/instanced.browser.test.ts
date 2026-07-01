@@ -175,3 +175,56 @@ describe("InstancedArrows", () => {
     device.destroy();
   });
 });
+
+// #162 — verify the SHADER HIGHLIGHT actually renders (not just that uniforms are set): a hover/selection
+// is a uniform change on the existing geometry, dimming non-highlighted instances and tinting links red.
+describe("instanced shader highlight (#162)", () => {
+  const draw = (device: Device, framebuffer: Framebuffer, r: { render(p: any): void }): void => {
+    const pass = device.beginRenderPass({ framebuffer, clearColor: [0, 0, 0, 0] });
+    r.render(pass);
+    pass.end();
+    device.submit();
+  };
+
+  it("dims a non-highlighted circle's alpha via a uniform (no geometry change)", async () => {
+    const { device, framebuffer } = await setup();
+    // Two opaque green circles; group 0 at (20,32), group 1 at (44,32).
+    const circles = new InstancedCircles(
+      device,
+      { centers: new Float32Array([20, 32, 44, 32]), radii: new Float32Array([10, 10]), colors: new Uint8Array([0, 200, 0, 255, 0, 200, 0, 255]), groups: new Float32Array([0, 1]), count: 2 },
+      W,
+      H,
+    );
+    circles.setTransform(clipFromView({ k: 1, x: 0, y: 0 }, W, H));
+    circles.setHighlight({ hoverGroup: 0, dimActive: true, dimOpacity: 0.25 }); // hover group 0 → dim the other
+    draw(device, framebuffer, circles);
+
+    const hovered = px(device, framebuffer, 20, 32); // group 0 → kept full
+    const dimmed = px(device, framebuffer, 44, 32); // group 1 → dimmed
+    expect(hovered[3]!).toBeGreaterThan(200); // hovered stays opaque
+    expect(dimmed[3]!).toBeGreaterThan(0);
+    expect(dimmed[3]!).toBeLessThan(hovered[3]!); // the non-hovered circle faded
+    circles.destroy();
+    device.destroy();
+  });
+
+  it("tints a hovered link toward red in place, keeping the geometry (weight-preserving recolour)", async () => {
+    const { device, framebuffer } = await setup();
+    // A thick gray horizontal line across the middle; its group (source id) = 7.
+    const data = { sources: new Float32Array([8, 32]), targets: new Float32Array([56, 32]), widths: new Float32Array([10]), colors: new Uint8Array([150, 150, 150, 255]), groups: new Float32Array([7]), count: 1 };
+    const lines = new InstancedLines(device, data, W, H);
+    lines.setTransform(clipFromView({ k: 1, x: 0, y: 0 }, W, H));
+
+    draw(device, framebuffer, lines);
+    const gray = px(device, framebuffer, 32, 32);
+    expect(Math.abs(gray[0]! - gray[1]!)).toBeLessThan(24); // base: gray (r ≈ g)
+
+    lines.setHighlight({ hoverGroup: 7 }); // hover the link's source → recolour toward red
+    draw(device, framebuffer, lines);
+    const red = px(device, framebuffer, 32, 32);
+    expect(red[0]!).toBeGreaterThan(red[1]! + 30); // R clearly dominant
+    expect(red[0]!).toBeGreaterThan(red[2]! + 30);
+    lines.destroy();
+    device.destroy();
+  });
+});

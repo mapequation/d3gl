@@ -26,7 +26,7 @@ export { expandStroke, DEFAULT_MITER_LIMIT } from "./stroke.js";
 export type { StrokeGeometry, StrokeOptions, LineJoin, LineCap } from "./stroke.js";
 export { Scene } from "./scene.js";
 export type { GroupBuffers, GroupBufferDelta, GroupBuilder, DrawableRange, DrawableOpts, DrawableVector, StyleTables } from "./scene.js";
-export type { Backend, RenderLayer, RenderDelta, ViewTransform, PointBatch, PassThroughLayer, DrawBatch, ProjectedPath, DrawItem, InstancedLayer, InstancedCirclesData, InstancedLinesData, InstancedArrowsData, InstancedHalfArrowsData, TextData } from "./backend.js";
+export type { Backend, RenderLayer, RenderDelta, ViewTransform, PointBatch, PassThroughLayer, DrawBatch, ProjectedPath, DrawItem, InstancedLayer, InstancedCirclesData, InstancedLinesData, InstancedArrowsData, InstancedHalfArrowsData, InstancedHighlight, TextData } from "./backend.js";
 export { HitIndex } from "./hit-test.js";
 export { declutterScreen, declutterScratch, declutterMembers } from "./declutter.js";
 export type { DeclutterScratch } from "./declutter.js";
