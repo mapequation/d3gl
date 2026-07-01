@@ -241,6 +241,17 @@ export class Plot extends BaseEngine {
     }
   }
 
+  /**
+   * Declare (or re-declare) a named layer of arbitrary `data`, each datum drawn by the
+   * `opts.draw` callback emitting path commands — so `d3-shape`/`d3-geo` generators that render
+   * to a context (`d3.line()`, `d3.arc()`, `geoPath(projection, ctx)`, …) work directly. Geometry
+   * is tessellated once and retained, so all three backends render it identically and it stays
+   * crisp under zoom. Re-declaring an existing `name` resets its base styles. Returns a
+   * {@link LayerHandle} for appending data and per-layer styling. For large point sets prefer
+   * {@link Plot.points}, which batches them through the shared instanced lane.
+   *
+   * @typeParam D - the datum type passed to `draw` and the accessors.
+   */
   layer<D>(name: string, data: readonly D[], opts: PlotLayerOptions<D>): LayerHandle<D> {
     const list = data as D[];
     const ids = list.map((d, i) => (opts.id ? opts.id(d, i) : i));
@@ -249,6 +260,16 @@ export class Plot extends BaseEngine {
     return new LayerHandle<D>(this, name, (items) => this.appendDrawables(name, items, opts));
   }
 
+  /**
+   * Declare (or re-declare) a named layer of points positioned by `opts.x`/`opts.y`, rendered
+   * through the shared instanced point lane (one draw call for the whole layer). Prefer this over
+   * {@link Plot.layer} for large point sets: it scales to millions and supports screen-space
+   * `declutter`. `data` may be an array or a callback; with `passThrough: true` points stream
+   * uncapped but aren't pickable. Re-declaring an existing `name` resets its interaction/style
+   * state. Returns a {@link LayerHandle} for appending data and per-layer styling.
+   *
+   * @typeParam D - the datum type passed to the accessors.
+   */
   points<D>(name: string, data: readonly D[] | (() => readonly D[]), opts: PlotPointOptions<D>): LayerHandle<D> {
     if (opts.passThrough) {
       if (opts.hover || opts.tooltip || opts.selection || opts.selectable)
