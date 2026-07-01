@@ -38,7 +38,7 @@ function degreeRadius(graph: NetworkGraph): NodeRadiusSpec {
  * **Hover or click** a glyph to resolve the node — or the module it collapsed into — shown top-left.
  * **Selecting** a node dims the rest of the graph (the `selection.others` focus, consistent with GeoMap
  * + Plot) while keeping the selected node *and its outgoing links* at full strength; **hovering** a node
- * recolours its outgoing links red (and, via `hoverDimOthers`, fades the rest). The highlight is applied
+ * recolours its outgoing links red (and, via `hover: { others }`, fades the rest). The highlight is applied
  * in the GPU shader, so it stays instant even with LOD off on a million-node layout.
  * **Drag a node or a collapsed module** to move it: it tracks the cursor with no lag while the off-thread
  * worker layout reheats around it and re-cools on release (grab a module to drag its whole subtree).
@@ -53,14 +53,13 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
   // #162: the selection/hover highlight is applied in the GPU shader from per-instance flags + uniforms,
   // so hovering across a million-node LOD-off layout is a uniform change — no per-hover geometry rebuild.
   // `selection.others` (set explicitly here, though 0.3 is the default) dims the rest of the graph on
-  // selection while the selected node + its outgoing links stay full; `hoverDimOthers` opts into the same
-  // fade on hover. Highlight colour is red (rings + link recolour); the recolour preserves link weight.
+  // selection while the selected node + its outgoing links stay full; `hover: { others }` opts into the
+  // same fade on hover. Highlight colour is red (rings + link recolour); the recolour preserves link weight.
   net.interactive({
     selectable: { multi: true },
-    hover: true,
     draggable: true,
     selection: { others: { opacity: 0.3 } },
-    hoverDimOthers: { opacity: 0.5 },
+    hover: { others: { opacity: 0.5 } }, // enable hover + fade the rest on hover (mirrors selection.others)
   });
 
   // Picking (#105 N7a): hover/click resolve the node or aggregate under the cursor via the engine's

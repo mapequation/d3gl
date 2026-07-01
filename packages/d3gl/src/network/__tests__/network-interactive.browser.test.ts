@@ -400,13 +400,13 @@ describe("network shader highlight: selection.others dim + outgoing links (#162)
     h.remove();
   });
 
-  it("#162 fade-others-on-hover is opt-in (hoverDimOthers) and is a uniform, not a re-emit", async () => {
+  it("#162 fade-others-on-hover is opt-in (hover.others) and is a uniform, not a re-emit", async () => {
     const h = host();
     const net = network(h, { width: 200, height: 200 });
     await net.whenReady();
     const g = buildGraph({ nodeCount: 3, source: [0, 1], target: [1, 2], directed: false });
     net.data(g).style({ nodeRadius: 8 }).layout({ backend: "positions", positions: new Float32Array([10, 10, 90, 90, 170, 30]) });
-    net.interactive({ hover: true, hoverDimOthers: { opacity: 0.4 } });
+    net.interactive({ hover: { others: { opacity: 0.4 } } });
     net.setTransform(T);
     const spy = spyBackend(net);
     spy.reset();

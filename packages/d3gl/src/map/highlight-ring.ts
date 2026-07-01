@@ -1,6 +1,7 @@
 import { rgb } from "d3-color";
 import type { InstancedCirclesData } from "../core/index.js";
 import type { InteractiveLayerOptions } from "./base-engine.js";
+import { hoverParts } from "./highlight.js";
 
 /**
  * Selection/hover ring overlay for instanced-lane glyphs (#105 N7c-2) — shared by network nodes and
@@ -27,8 +28,10 @@ function cssToRgba(css: string, fallback: RGBA): RGBA {
  *  hover {@link HighlightStyle}'s `stroke`), falling back to the blue (select) / green (hover) defaults. */
 export function resolveRingColors(opts: InteractiveLayerOptions): { select: RGBA; hover: RGBA; remove: RGBA } {
   const selStroke = opts.selection?.selected?.stroke;
-  const hov = opts.hover;
-  const hovStroke = hov && typeof hov === "object" && "stroke" in hov ? (hov as { stroke?: string }).stroke : undefined;
+  // The hover ring's stroke comes from the hovered-item style (`hover.hovered.stroke`, or a bare
+  // HighlightStyle's `stroke` in the back-compat flat form) — see hoverParts (#162).
+  const hovered = hoverParts(opts.hover).hovered;
+  const hovStroke = hovered && typeof hovered === "object" && "stroke" in hovered ? hovered.stroke : undefined;
   return {
     select: selStroke ? cssToRgba(selStroke, DEFAULT_SELECT_RING) : DEFAULT_SELECT_RING,
     hover: hovStroke ? cssToRgba(hovStroke, DEFAULT_HOVER_RING) : DEFAULT_HOVER_RING,

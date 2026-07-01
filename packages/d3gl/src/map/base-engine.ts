@@ -5,7 +5,7 @@ import { InstancedLane, type ScreenRect } from "../core/instanced-lane.js";
 import { createBackend, createCanvasBackend, type BackendType, type BackendHandle } from "./backend-factory.js";
 import { buildBatch, type DrawItem } from "./draw-batch.js";
 import { composeColor, type StyleOverride, type SelectionOptions } from "./style-overrides.js";
-import { HighlightBuilder, resolveHighlight, HIGHLIGHT_SUFFIX, type HighlightStyle, type HighlightDraw, type HoverOption, type PendingColor } from "./highlight.js";
+import { HighlightBuilder, resolveHighlight, hoverParts, HIGHLIGHT_SUFFIX, type HighlightStyle, type HighlightDraw, type HoverOption, type HoverOptions, type PendingColor } from "./highlight.js";
 import { Tooltip } from "./tooltip.js";
 
 export type Accessor<D, T> = T | ((d: D, i: number) => T);
@@ -85,15 +85,15 @@ export interface InteractiveLayerOptions<D = any> {
   /** Styles for {@link BaseEngine.select}: the selected set and its complement.
    *  Defaults: selected keeps the base style; others `{ opacity: 0.3 }`. */
   selection?: SelectionOptions;
-  /** Hover-highlight: `true` = default white outline, a {@link HighlightStyle} = redraw the
-   *  hovered item with it, or a custom `(datum, HighlightBuilder)` draw fn. Rendered in a tiny
-   *  overlay layer — O(hovered item) per change, the base layer is untouched. */
-  hover?: HoverOption<D>;
-  /** Fade the non-hovered glyphs while hovering (#162) — the hover analogue of `selection.others`,
-   *  opt-in (default off). `true` ⇒ `{ opacity: 0.3 }`, a number ⇒ that opacity, or `{ opacity }`.
-   *  Honored by instanced-lane engines that apply it via the shader (network); it's a uniform change,
-   *  so it stays free even on a full (LOD-off) draw. Ignored by Scene layers. */
-  hoverDimOthers?: boolean | number | { opacity?: number };
+  /** Hover-highlight, symmetric with {@link selection} (#162). `true` enables the default outline/ring.
+   *  A {@link HoverOptions} object — `{ hovered?, others? }` — styles it: `hovered` is how the hovered
+   *  item looks (a {@link HighlightStyle} redraw / custom `(datum, HighlightBuilder)` draw fn on Scene
+   *  layers; the ring's `stroke` on instanced lanes), and `others` fades the non-hovered glyphs (the
+   *  hover analogue of `selection.others`, opt-in — honored on instanced lanes via the shader, so it's
+   *  a uniform change that stays free even on a full LOD-off draw). A bare `HighlightStyle`/draw-fn is
+   *  still accepted as shorthand for `{ hovered: … }`. The hovered item is redrawn in a tiny overlay
+   *  layer — O(hovered item) per change; the base layer is untouched. */
+  hover?: HoverOption<D> | HoverOptions<D>;
   /** Hover tooltip content for this layer (`null` hides). Shown in a shared engine-managed div —
    *  see `tooltipClass` for styling. Re-evaluated only when the hovered target changes;
    *  re-declare the layer to force a refresh. */
@@ -145,9 +145,8 @@ export interface LayerSpec {
   pickable?: boolean;
   /** Styles applied by {@link BaseEngine.select} to the selected set / its complement. */
   selection?: SelectionOptions;
-  /** Hover-highlight for this layer: true = default style, a HighlightStyle = replay
-   *  with it, a function = custom draw of the hovered item (see HighlightBuilder). */
-  hover?: HoverOption;
+  /** Hover-highlight for this layer: `true`/style/fn, or a `{ hovered?, others? }` object (#162). */
+  hover?: HoverOption | HoverOptions;
   /** Tooltip content for the hovered drawable (string / element / null = hide). */
   tooltip?: (d: any, id: string | number) => string | HTMLElement | null;
   /** Opt this layer into click-driven selection (see {@link InteractiveLayerOptions.selectable}). */
@@ -979,7 +978,7 @@ export abstract class BaseEngine {
         const d = this.scene.drawableOf(spec.name, id);
         if (!d) continue; // unknown or culled id: nothing to highlight
         const b = new HighlightBuilder(g, d, colors);
-        const draw = resolveHighlight(styleOrDraw ?? spec.hover);
+        const draw = resolveHighlight(styleOrDraw ?? hoverParts(spec.hover).hovered);
         const i = index?.get(id) ?? -1;
         draw(i >= 0 ? spec.data[i] : null, b);
       }

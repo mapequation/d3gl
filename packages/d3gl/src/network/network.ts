@@ -11,6 +11,7 @@ import type { NetworkGraph } from "./graph.js";
 import type { InstancedLayer } from "../core/index.js";
 import { InstancedLane, type SelectionStrategy } from "../core/instanced-lane.js";
 import { resolveRingColors, ringCircles } from "../map/highlight-ring.js";
+import { hoverParts } from "../map/highlight.js";
 
 /** Options for the network engine. Inherits sizing, `backend`, and `tooltipClass`. */
 export interface NetworkOptions extends BaseEngineOptions {}
@@ -1002,13 +1003,13 @@ export class Network extends BaseEngine {
     return hov.values().next().value as number;
   }
 
-  /** Opacity to fade non-highlighted glyphs to while hovering (#162), from `interactive({ hoverDimOthers })`
-   *  — the hover analogue of `selection.others`, opt-in. Null when off or nothing is hovered. */
+  /** Opacity to fade non-highlighted glyphs to while hovering (#162), from `hover.others` — the hover
+   *  analogue of `selection.others`, opt-in. Null when off or nothing is hovered. */
   private hoverDimOpacity(): number | null {
-    const opt = this.interactiveOpts?.hoverDimOthers;
-    if (opt == null || opt === false || this.singleHoveredId() == null) return null;
-    const op = opt === true ? 0.3 : typeof opt === "number" ? opt : opt.opacity ?? 0.3;
-    return op < 1 ? op : null;
+    if (this.singleHoveredId() == null) return null;
+    const others = hoverParts(this.interactiveOpts?.hover).others;
+    const op = others?.opacity;
+    return op != null && op < 1 ? op : null;
   }
 
   /** The base lane's live shader-highlight uniforms (#162): the hovered group id, and the dim state from

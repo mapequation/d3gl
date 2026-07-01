@@ -25,7 +25,7 @@ export type { PlotOptions, PlotLayerOptions, PlotPointOptions } from "./plot.js"
 export { LayerHandle } from "./layer-handle.js";
 export type { StyleOverride, SelectionOptions } from "./style-overrides.js";
 export { HighlightBuilder } from "./highlight.js";
-export type { HighlightStyle, HighlightDraw, HoverOption } from "./highlight.js";
+export type { HighlightStyle, HighlightDraw, HoverOption, HoverOptions } from "./highlight.js";
 export { Tooltip } from "./tooltip.js";
 export { h } from "./h.js";
 export type { HChild } from "./h.js";
