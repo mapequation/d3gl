@@ -2,7 +2,97 @@ import { Model } from "@luma.gl/engine";
 import type { Buffer, Device, RenderPass } from "@luma.gl/core";
 import { INSTANCED_CIRCLE_VS, INSTANCED_CIRCLE_FS, INSTANCED_LINE_VS, INSTANCED_ARROW_VS, INSTANCED_HALF_ARROW_VS, POINT_FS, FILL_FS, PICK_FS } from "./shaders.js";
 import { clipFromView } from "./transform.js";
-import type { InstancedCirclesData, InstancedLinesData, InstancedArrowsData, InstancedHalfArrowsData } from "../core/index.js";
+import type { InstancedCirclesData, InstancedLinesData, InstancedArrowsData, InstancedHalfArrowsData, InstancedHighlight } from "../core/index.js";
+
+/** Per-instance data carrying the shader-highlight columns (#162) — every instanced data type has these.
+ *  `groups2` is the link's OTHER endpoint (target), so an undirected hover matches incident links on either
+ *  side; `-1`/absent ⇒ unused (nodes, directed links match on `groups`/source alone). */
+interface WithHighlight { groups?: Float32Array; groups2?: Float32Array; selected?: Uint8Array; count: number }
+
+/** `-1`-filled `count`-length array — the default `a_group2` (an id never matched by a real group id). */
+function minusOnes(count: number): Float32Array {
+  return new Float32Array(count).fill(-1);
+}
+
+/** `a_selected` as float32 (the attribute format), from the engine's 0/1 `Uint8Array` (or all-zeros). */
+function selectedFloats(data: WithHighlight): Float32Array {
+  const out = new Float32Array(data.count);
+  const sel = data.selected;
+  if (sel) for (let i = 0; i < data.count && i < sel.length; i++) out[i] = sel[i]! > 0 ? 1 : 0;
+  return out;
+}
+
+/** Highlight tint (0..1) ≈ #dc2626 — the red the selection/hover rings use (#162), so a recoloured link
+ *  matches its ring. The shader scales this by the instance's luminance, so weight-encoded links keep their cue. */
+const HL_RED: [number, number, number] = [0.863, 0.149, 0.149];
+
+/** Default highlight uniforms: no hover, no dim; `recolor` = 1 tints highlighted instances (links), 0 keeps (nodes). */
+function highlightUniforms(recolor: 0 | 1): Record<string, unknown> {
+  return { u_hoverGroup: -1, u_dimActive: 0, u_dimOpacity: 1, u_recolor: recolor, u_recolorRGB: HL_RED };
+}
+
+/**
+ * The two per-instance shader-highlight buffers (#162) — `a_group` (node/source id) + `a_selected`
+ * (0/1 as float) — shared by all four instanced primitives. Built once with the geometry; a hover is a
+ * uniform change (see {@link applyHighlight}), a selection change rewrites only `selected` ({@link writeSelected}),
+ * so neither rebuilds geometry. Merge {@link layout}/{@link attributes} into the Model.
+ */
+class HighlightBuffers {
+  group: Buffer;
+  group2: Buffer;
+  selected: Buffer;
+  constructor(private device: Device, data: WithHighlight) {
+    // Default group = -1 (an id no real node has), so a layer WITHOUT groups (plot points, aggregate
+    // halos) never matches a hovered group id and never spuriously highlights.
+    this.group = device.createBuffer({ data: data.groups ?? minusOnes(data.count) });
+    this.group2 = device.createBuffer({ data: data.groups2 ?? minusOnes(data.count) });
+    this.selected = device.createBuffer({ data: selectedFloats(data) });
+  }
+  layout = [
+    { name: "a_group", format: "float32" as const, stepMode: "instance" as const },
+    { name: "a_group2", format: "float32" as const, stepMode: "instance" as const },
+    { name: "a_selected", format: "float32" as const, stepMode: "instance" as const },
+  ];
+  attributes(): Record<string, Buffer> {
+    return { a_group: this.group, a_group2: this.group2, a_selected: this.selected };
+  }
+  /** Rewrite the buffers on a geometry grow (circles' update path). Returns the fresh attributes to re-bind. */
+  recreate(data: WithHighlight): Record<string, Buffer> {
+    this.group.destroy();
+    this.group2.destroy();
+    this.selected.destroy();
+    this.group = this.device.createBuffer({ data: data.groups ?? minusOnes(data.count) });
+    this.group2 = this.device.createBuffer({ data: data.groups2 ?? minusOnes(data.count) });
+    this.selected = this.device.createBuffer({ data: selectedFloats(data) });
+    return this.attributes();
+  }
+  /** Rewrite the buffers from fresh emit data (circles' in-place sub-update path). */
+  write(data: WithHighlight): void {
+    if (data.groups) this.group.write(data.groups);
+    if (data.groups2) this.group2.write(data.groups2);
+    this.selected.write(selectedFloats(data));
+  }
+  /** Rewrite ONLY the selected flags (a selection change) — no geometry touch. */
+  writeSelected(selected: Uint8Array, count: number): void {
+    this.selected.write(selectedFloats({ selected, count }));
+  }
+  destroy(): void {
+    this.group.destroy();
+    this.group2.destroy();
+    this.selected.destroy();
+  }
+}
+
+/** Apply an {@link InstancedHighlight} to a uniforms record (only the provided fields). */
+function applyHighlight(uniforms: Record<string, unknown>, h: InstancedHighlight): void {
+  if (h.hoverGroup !== undefined) uniforms["u_hoverGroup"] = h.hoverGroup;
+  if (h.dimActive !== undefined) uniforms["u_dimActive"] = h.dimActive ? 1 : 0;
+  if (h.dimOpacity !== undefined) uniforms["u_dimOpacity"] = h.dimOpacity;
+  if (h.recolor !== undefined) {
+    uniforms["u_recolor"] = h.recolor ? 1 : 0;
+    if (h.recolor) uniforms["u_recolorRGB"] = h.recolor;
+  }
+}
 
 /**
  * GPU-instanced primitives for the network module's rendering lane (#100, epic #98).
@@ -48,6 +138,7 @@ export class InstancedCircles {
   private color: Buffer;
   private border: Buffer;
   private borderColor: Buffer;
+  private hl: HighlightBuffers;
   private uniforms: Record<string, unknown>;
 
   constructor(device: Device, data: InstancedCirclesData, width = 0, height = 0) {
@@ -62,10 +153,12 @@ export class InstancedCircles {
     // zero-filled, so a_border = 0 and the shader draws a plain filled disc (unchanged appearance).
     this.border = device.createBuffer({ data: data.borders ?? new Float32Array(data.count) });
     this.borderColor = device.createBuffer({ data: data.borderColors ?? new Uint8Array(data.count * 4) });
+    this.hl = new HighlightBuffers(device, data); // #162 shader highlight (a_group / a_selected)
     this.uniforms = {
       u_transform: clipFromView({ k: 1, x: 0, y: 0 }, width || 1, height || 1),
       u_screen: 0,
       u_viewport: [width, height],
+      ...highlightUniforms(0), // nodes are dimmed/kept but not recoloured (recolor = 0)
     };
     this.model = new Model(device, {
       vs: INSTANCED_CIRCLE_VS,
@@ -77,6 +170,7 @@ export class InstancedCircles {
         { name: "a_color", format: "unorm8x4", stepMode: "instance" },
         { name: "a_border", format: "float32", stepMode: "instance" },
         { name: "a_borderColor", format: "unorm8x4", stepMode: "instance" },
+        ...this.hl.layout,
       ],
       attributes: {
         a_corner: this.corner,
@@ -85,6 +179,7 @@ export class InstancedCircles {
         a_color: this.color,
         a_border: this.border,
         a_borderColor: this.borderColor,
+        ...this.hl.attributes(),
       },
       uniforms: this.uniforms,
       parameters: BLEND,
@@ -92,6 +187,12 @@ export class InstancedCircles {
       vertexCount: 4,
       instanceCount: this.count,
     });
+  }
+
+  /** Set shader-highlight uniforms (#162) — a hover/selection restyle with no geometry touch. */
+  setHighlight(h: InstancedHighlight): void {
+    applyHighlight(this.uniforms, h);
+    if (h.selected) this.hl.writeSelected(h.selected, this.count);
   }
 
   /** Set the column-major mat3 clip transform (from {@link clipFromView}). */
@@ -138,6 +239,7 @@ export class InstancedCircles {
         a_color: this.color,
         a_border: this.border,
         a_borderColor: this.borderColor,
+        ...this.hl.recreate(data), // #162 group/selected grow with the geometry
       });
     } else {
       // Sub-update: upload only the filled portion of the scratch buffers.
@@ -148,6 +250,7 @@ export class InstancedCircles {
         this.border.write(data.borders!);
         this.borderColor.write(data.borderColors!);
       }
+      this.hl.write(data); // #162 refresh group/selected for the new frame's instances
     }
     this.count = data.count;
     this.model.setInstanceCount(data.count);
@@ -164,6 +267,7 @@ export class InstancedCircles {
     this.color.destroy();
     this.border.destroy();
     this.borderColor.destroy();
+    this.hl.destroy();
   }
 }
 
@@ -196,6 +300,7 @@ export class InstancedLines {
   private widthBuf: Buffer;
   private color: Buffer;
   private bend: Buffer;
+  private hl: HighlightBuffers;
   private uniforms: Record<string, unknown>;
 
   constructor(device: Device, data: InstancedLinesData, width = 0, height = 0, pick = false) {
@@ -208,10 +313,12 @@ export class InstancedLines {
     this.color = device.createBuffer({ data: data.colors });
     // Per-instance bend (#104 N6c), optional: absent ⇒ zero ⇒ straight (control on the chord).
     this.bend = device.createBuffer({ data: data.bends ?? new Float32Array(data.count) });
+    this.hl = new HighlightBuffers(device, data); // #162 shader highlight (a_group / a_selected)
     this.uniforms = {
       u_transform: clipFromView({ k: 1, x: 0, y: 0 }, width || 1, height || 1),
       u_screen: 0,
       u_viewport: [width, height],
+      ...highlightUniforms(1), // links recolour toward the highlight hue (recolor = 1)
     };
     const bufferLayout = [
       { name: "a_corner", format: "float32x2" as const },
@@ -220,6 +327,7 @@ export class InstancedLines {
       { name: "a_width", format: "float32" as const, stepMode: "instance" as const },
       { name: "a_color", format: "unorm8x4" as const, stepMode: "instance" as const },
       { name: "a_bend", format: "float32" as const, stepMode: "instance" as const },
+      ...this.hl.layout,
     ];
     const attributes = {
       a_corner: this.corner,
@@ -228,6 +336,7 @@ export class InstancedLines {
       a_width: this.widthBuf,
       a_color: this.color,
       a_bend: this.bend,
+      ...this.hl.attributes(),
     };
     this.model = new Model(device, {
       vs: INSTANCED_LINE_VS,
@@ -265,6 +374,11 @@ export class InstancedLines {
   setSizeMode(mode: "world" | "screen"): void {
     this.uniforms["u_screen"] = mode === "screen" ? 1 : 0;
   }
+  /** Set shader-highlight uniforms (#162) — recolour/dim with no geometry touch (shared with the pick twin). */
+  setHighlight(h: InstancedHighlight): void {
+    applyHighlight(this.uniforms, h);
+    if (h.selected) this.hl.writeSelected(h.selected, this.count);
+  }
   render(pass: RenderPass): void {
     if (this.count > 0) this.model.draw(pass);
   }
@@ -281,6 +395,7 @@ export class InstancedLines {
     this.widthBuf.destroy();
     this.color.destroy();
     this.bend.destroy();
+    this.hl.destroy();
   }
 }
 
@@ -301,6 +416,7 @@ export class InstancedArrows {
   private radius: Buffer;
   private color: Buffer;
   private bend: Buffer;
+  private hl: HighlightBuffers;
   private uniforms: Record<string, unknown>;
 
   constructor(device: Device, data: InstancedArrowsData, width = 0, height = 0, pick = false) {
@@ -313,10 +429,12 @@ export class InstancedArrows {
     this.color = device.createBuffer({ data: data.colors });
     // Per-instance bend (#104 N6c), optional: absent ⇒ zero ⇒ oriented along the chord, as before.
     this.bend = device.createBuffer({ data: data.bends ?? new Float32Array(data.count) });
+    this.hl = new HighlightBuffers(device, data); // #162 shader highlight (a_group / a_selected)
     this.uniforms = {
       u_transform: clipFromView({ k: 1, x: 0, y: 0 }, width || 1, height || 1),
       u_screen: 0,
       u_viewport: [width || 1, height || 1],
+      ...highlightUniforms(1), // arrows recolour with their link
     };
     const bufferLayout = [
       { name: "a_tri", format: "float32x2" as const },
@@ -326,6 +444,7 @@ export class InstancedArrows {
       { name: "a_radius", format: "float32" as const, stepMode: "instance" as const },
       { name: "a_bend", format: "float32" as const, stepMode: "instance" as const },
       { name: "a_color", format: "unorm8x4" as const, stepMode: "instance" as const },
+      ...this.hl.layout,
     ];
     const attributes = {
       a_tri: this.tri,
@@ -335,6 +454,7 @@ export class InstancedArrows {
       a_radius: this.radius,
       a_bend: this.bend,
       a_color: this.color,
+      ...this.hl.attributes(),
     };
     this.model = new Model(device, {
       vs: INSTANCED_ARROW_VS,
@@ -371,6 +491,11 @@ export class InstancedArrows {
   setSizeMode(mode: "world" | "screen"): void {
     this.uniforms["u_screen"] = mode === "screen" ? 1 : 0;
   }
+  /** Set shader-highlight uniforms (#162) — recolour/dim with no geometry touch (shared with the pick twin). */
+  setHighlight(h: InstancedHighlight): void {
+    applyHighlight(this.uniforms, h);
+    if (h.selected) this.hl.writeSelected(h.selected, this.count);
+  }
   render(pass: RenderPass): void {
     if (this.count > 0) this.model.draw(pass);
   }
@@ -388,6 +513,7 @@ export class InstancedArrows {
     this.radius.destroy();
     this.color.destroy();
     this.bend.destroy();
+    this.hl.destroy();
   }
 }
 
@@ -430,6 +556,7 @@ export class InstancedHalfArrows {
   private widths: Buffer;
   private bend: Buffer;
   private color: Buffer;
+  private hl: HighlightBuffers;
   private uniforms: Record<string, unknown>;
 
   constructor(device: Device, data: InstancedHalfArrowsData, width = 0, height = 0, pick = false) {
@@ -444,10 +571,12 @@ export class InstancedHalfArrows {
     this.widths = device.createBuffer({ data: data.widths });
     this.bend = device.createBuffer({ data: data.bends });
     this.color = device.createBuffer({ data: data.colors });
+    this.hl = new HighlightBuffers(device, data); // #162 shader highlight (a_group / a_selected)
     this.uniforms = {
       u_transform: clipFromView({ k: 1, x: 0, y: 0 }, width || 1, height || 1),
       u_screen: 0,
       u_viewport: [width, height],
+      ...highlightUniforms(1), // half-arrows recolour toward the highlight hue
     };
     const bufferLayout = [
       { name: "a_kind", format: "float32x2" as const },
@@ -457,6 +586,7 @@ export class InstancedHalfArrows {
       { name: "a_widths", format: "float32x2" as const, stepMode: "instance" as const },
       { name: "a_bend", format: "float32" as const, stepMode: "instance" as const },
       { name: "a_color", format: "unorm8x4" as const, stepMode: "instance" as const },
+      ...this.hl.layout,
     ];
     const attributes = {
       a_kind: this.kind,
@@ -466,6 +596,7 @@ export class InstancedHalfArrows {
       a_widths: this.widths,
       a_bend: this.bend,
       a_color: this.color,
+      ...this.hl.attributes(),
     };
     this.model = new Model(device, {
       vs: INSTANCED_HALF_ARROW_VS,
@@ -502,6 +633,11 @@ export class InstancedHalfArrows {
   setSizeMode(mode: "world" | "screen"): void {
     this.uniforms["u_screen"] = mode === "screen" ? 1 : 0;
   }
+  /** Set shader-highlight uniforms (#162) — recolour/dim with no geometry touch (shared with the pick twin). */
+  setHighlight(h: InstancedHighlight): void {
+    applyHighlight(this.uniforms, h);
+    if (h.selected) this.hl.writeSelected(h.selected, this.count);
+  }
   render(pass: RenderPass): void {
     if (this.count > 0) this.model.draw(pass);
   }
@@ -519,5 +655,6 @@ export class InstancedHalfArrows {
     this.widths.destroy();
     this.bend.destroy();
     this.color.destroy();
+    this.hl.destroy();
   }
 }

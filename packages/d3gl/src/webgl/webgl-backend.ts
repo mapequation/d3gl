@@ -1,7 +1,7 @@
 import { luma } from "@luma.gl/core";
 import { webgl2Adapter, WebGLDevice, WEBGLFramebuffer } from "@luma.gl/webgl";
 import type { Device, Framebuffer } from "@luma.gl/core";
-import type { Backend, RenderLayer, RenderDelta, ViewTransform, InstancedLayer } from "../core/index.js";
+import type { Backend, RenderLayer, RenderDelta, ViewTransform, InstancedLayer, InstancedHighlight } from "../core/index.js";
 import type { GroupBuffers, GroupBufferDelta, PassThroughLayer, DrawBatch, StyleTables, DrawableVector } from "../core/index.js";
 import { GroupRenderer } from "./renderer.js";
 import { InstancedCircles, InstancedLines, InstancedArrows, InstancedHalfArrows } from "./instanced.js";
@@ -241,6 +241,12 @@ export class WebGLBackend implements Backend {
     this.instanced.delete(name);
     this.pickable.delete(name);
     this.pickDirty = true;
+  }
+
+  /** Shader-driven highlight (#162): set the layer's highlight uniforms (+ optionally rewrite its
+   *  per-instance `selected` flags) with no geometry rebuild — a hover is a uniform change. */
+  styleInstancedLayer(name: string, highlight: InstancedHighlight): void {
+    this.instanced.get(name)?.setHighlight(highlight);
   }
 
   setTransform(t: ViewTransform): void {

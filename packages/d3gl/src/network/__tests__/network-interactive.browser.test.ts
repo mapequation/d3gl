@@ -1,6 +1,7 @@
 import { describe, it, expect } from "vitest";
 import { network } from "../network.js";
 import { buildGraph } from "../graph.js";
+import { leavesUnder } from "../lod.js";
 
 function host(): HTMLElement {
   const el = document.createElement("div");
@@ -289,4 +290,194 @@ describe("network interactive lane (#105 N7c-2)", () => {
     expect(net.selection()).toEqual([]); // pick-only again
     net.destroy();
   });
+});
+
+// #162: shader-driven selection.others dim + outgoing-link emphasis on the instanced node lane. The
+// highlight is applied in the vertex shader from per-instance `groups`/`selected` columns (baked into the
+// emit) + lane uniforms, so a hover/selection restyle never rebuilds geometry (the large-scale lag fix).
+describe("network shader highlight: selection.others dim + outgoing links (#162)", () => {
+  /* eslint-disable @typescript-eslint/no-explicit-any */
+  const baseLane = (net: any) => net.instancedLanes.get("network").lane;
+  const hlLane = (net: any) => net.instancedLanes.get("network-highlight").lane;
+  const T = { k: 1, x: 0, y: 0 };
+  const emit = (lane: any): any[] => lane.update(T, 200, 200); // pure re-emit (returns layer data; no backend calls)
+  const layer = (layers: any[], name: string) => layers.find((l) => l.name === name);
+  const linkData = (l: any) => (l.primitive === "lines" ? l.lines : l.primitive === "half-arrows" ? l.halfArrows : l.arrows);
+  const BASE = new Set(["nodes", "links", "arrows"]);
+  /** Record backend layer calls so a test can prove a hover is a uniform update, not a geometry re-emit. */
+  const spyBackend = (net: any) => {
+    const b = net.handle.backend;
+    const rec = { set: [] as string[], update: [] as string[], style: [] as { name: string; h: any }[], reset() { this.set.length = 0; this.update.length = 0; this.style.length = 0; } };
+    const os = b.setInstancedLayer.bind(b);
+    b.setInstancedLayer = (l: any) => { rec.set.push(l.name); return os(l); };
+    if (b.updateInstancedLayer) { const ou = b.updateInstancedLayer.bind(b); b.updateInstancedLayer = (l: any) => { rec.update.push(l.name); return ou(l); }; }
+    const ot = b.styleInstancedLayer.bind(b);
+    b.styleInstancedLayer = (n: string, hh: any) => { rec.style.push({ name: n, h: hh }); return ot(n, hh); };
+    return rec;
+  };
+
+  it("#1 selecting a node bakes its `selected` flag + `groups`, and pushes the dim uniform (default 0.3)", async () => {
+    const net = network(host(), { width: 200, height: 200 });
+    await net.whenReady();
+    const g = buildGraph({ nodeCount: 3, source: [0, 1], target: [1, 2], directed: false });
+    net.data(g).style({ nodeRadius: 6 }).layout({ backend: "positions", positions: new Float32Array([10, 10, 90, 90, 170, 30]) });
+    net.interactive({ selectable: true }); // default selection.others = { opacity: 0.3 }
+    net.setTransform(T);
+
+    const spy = spyBackend(net);
+    spy.reset();
+    net.select("nodes", [1]);
+    const nodes = layer(emit(baseLane(net)), "nodes").circles;
+    expect([...(nodes.groups as Float32Array)]).toEqual([0, 1, 2]); // a_group = node id
+    expect([...(nodes.selected as Uint8Array)]).toEqual([0, 1, 0]); // only node 1 flagged selected
+    expect(nodes.colors[7]).toBe(255); // a_color stays BASE (dim is in the shader, not the buffer)
+    // The dim is pushed to the base layers as uniforms — no geometry re-emit of nodes/links.
+    const nodeStyle = spy.style.filter((s) => s.name === "nodes");
+    expect(nodeStyle.some((s) => s.h.dimActive === true && s.h.dimOpacity === 0.3)).toBe(true);
+    expect(spy.set.filter((n) => BASE.has(n))).toEqual([]); // no setInstancedLayer on the base geometry
+    expect(spy.update.filter((n) => BASE.has(n))).toEqual([]);
+
+    net.select("nodes", null); // clearing pushes dimActive=false
+    expect(spy.style.filter((s) => s.name === "nodes").at(-1)!.h.dimActive).toBe(false);
+    net.destroy();
+  });
+
+  it("#1 honors a custom selection.others.opacity (uniform value)", async () => {
+    const net = network(host(), { width: 200, height: 200 });
+    await net.whenReady();
+    const g = buildGraph({ nodeCount: 3, source: [0, 1], target: [1, 2], directed: false });
+    net.data(g).style({ nodeRadius: 6 }).layout({ backend: "positions", positions: new Float32Array([10, 10, 90, 90, 170, 30]) });
+    net.interactive({ selectable: true, selection: { others: { opacity: 0.5 } } });
+    net.setTransform(T);
+    const spy = spyBackend(net);
+    spy.reset();
+    net.select("nodes", [0]);
+    expect(spy.style.filter((s) => s.name === "nodes").some((s) => s.h.dimActive === true && s.h.dimOpacity === 0.5)).toBe(true);
+    net.destroy();
+  });
+
+  it("#2 a selected node's outgoing links are flagged `selected` (directed source-only)", async () => {
+    const net = network(host(), { width: 200, height: 200 });
+    await net.whenReady();
+    // Directed chain 0→1→2: node 0's only outgoing edge is edge 0 (0→1).
+    const g = buildGraph({ nodeCount: 3, source: [0, 1], target: [1, 2], directed: true });
+    net.data(g).style({ nodeRadius: 6, directed: true }).layout({ backend: "positions", positions: new Float32Array([10, 10, 90, 90, 170, 30]) });
+    net.interactive({ selectable: true });
+    net.setTransform(T);
+
+    net.select("nodes", [0]);
+    const links = linkData(layer(emit(baseLane(net)), "links"));
+    expect([...(links.groups as Float32Array)]).toEqual([0, 1]); // a_group = link source
+    expect([...(links.selected as Uint8Array)]).toEqual([1, 0]); // edge 0 (from 0) flagged; edge 1 (from 1) not
+    net.destroy();
+  });
+
+  it("#3 hovering drives a shader UNIFORM, not a geometry re-emit (the large-scale lag fix)", async () => {
+    const h = host();
+    const net = network(h, { width: 200, height: 200 });
+    await net.whenReady();
+    const g = buildGraph({ nodeCount: 3, source: [0, 1], target: [1, 2], directed: true });
+    net.data(g).style({ nodeRadius: 8, directed: true }).layout({ backend: "positions", positions: new Float32Array([10, 10, 90, 90, 170, 30]) });
+    net.interactive({ selectable: true, hover: true });
+    net.setTransform(T);
+
+    const spy = spyBackend(net);
+    spy.reset();
+    const rect = h.getBoundingClientRect();
+    h.dispatchEvent(new PointerEvent("pointermove", { clientX: rect.left + 10, clientY: rect.top + 10, bubbles: true })); // hover node 0
+
+    // The core regression guard: NO base geometry (re)emit on hover — only a uniform update.
+    expect(spy.set.filter((n) => BASE.has(n))).toEqual([]);
+    expect(spy.update.filter((n) => BASE.has(n))).toEqual([]);
+    const styled = spy.style.filter((s) => BASE.has(s.name));
+    expect(styled.length).toBeGreaterThan(0);
+    expect(styled.some((s) => s.h.hoverGroup === 0)).toBe(true); // the hovered node id is pushed as u_hoverGroup
+
+    // Move off → hoverGroup clears to -1.
+    h.dispatchEvent(new PointerEvent("pointermove", { clientX: rect.left + 199, clientY: rect.top + 199, bubbles: true }));
+    expect(spy.style.filter((s) => s.name === "nodes").at(-1)!.h.hoverGroup).toBe(-1);
+    net.destroy();
+    h.remove();
+  });
+
+  it("#162 fade-others-on-hover is opt-in (hover.others) and is a uniform, not a re-emit", async () => {
+    const h = host();
+    const net = network(h, { width: 200, height: 200 });
+    await net.whenReady();
+    const g = buildGraph({ nodeCount: 3, source: [0, 1], target: [1, 2], directed: false });
+    net.data(g).style({ nodeRadius: 8 }).layout({ backend: "positions", positions: new Float32Array([10, 10, 90, 90, 170, 30]) });
+    net.interactive({ hover: { others: { opacity: 0.4 } } });
+    net.setTransform(T);
+    const spy = spyBackend(net);
+    spy.reset();
+    const rect = h.getBoundingClientRect();
+    h.dispatchEvent(new PointerEvent("pointermove", { clientX: rect.left + 10, clientY: rect.top + 10, bubbles: true })); // hover node 0
+    const nodeStyle = spy.style.filter((s) => s.name === "nodes");
+    expect(nodeStyle.some((s) => s.h.dimActive === true && s.h.dimOpacity === 0.4 && s.h.hoverGroup === 0)).toBe(true);
+    expect(spy.set.filter((n) => BASE.has(n))).toEqual([]); // still no geometry re-emit
+    net.destroy();
+    h.remove();
+  });
+
+  it("#162 ancestor-aware: zooming into a selected aggregate flags its expanded children `selected`", async () => {
+    const net = network(host(), { width: 200, height: 200 });
+    await net.whenReady();
+    // Two modules of two nodes; at k=1 each collapses to one aggregate glyph.
+    const g = buildGraph({ nodeCount: 4, source: [0, 2, 1], target: [1, 3, 2], directed: true });
+    const modules = [{ id: 0, path: [1, 1] }, { id: 1, path: [1, 2] }, { id: 2, path: [2, 1] }, { id: 3, path: [2, 2] }];
+    net.data(g).style({ directed: true }).lod({ modules, expandPx: 20 }).layout({ backend: "positions", positions: new Float32Array([70, 90, 85, 90, 115, 110, 130, 110]) });
+    net.interactive({ selectable: { multi: true } });
+    net.setTransform({ k: 1, x: 0, y: 0 });
+
+    const tree = (net as any).lodTree;
+    const agg = [...(baseLane(net).visible as Uint32Array)].find((id) => id >= tree.leafCount)!;
+    net.select("nodes", [agg]);
+    expect([...(hlLane(net).visible as Uint32Array)]).toContain(agg); // zoomed out: the aggregate itself rings
+
+    // Zoom into the module so it expands into its leaves; ancestor-aware ⇒ the children are flagged selected.
+    const k = 12;
+    net.setTransform({ k, x: 100 - tree.cx[agg] * k, y: 100 - tree.cy[agg] * k });
+    const nodesLayer = layer(baseLane(net).update({ k, x: 100 - tree.cx[agg] * k, y: 100 - tree.cy[agg] * k }, 200, 200), "nodes");
+    const frontier = [...(baseLane(net).visible as Uint32Array)];
+    const groups = nodesLayer.circles.groups as Float32Array;
+    const selected = nodesLayer.circles.selected as Uint8Array;
+    const childrenOnFrontier = leavesUnder(tree, agg).filter((l) => frontier.includes(l));
+    expect(childrenOnFrontier.length).toBeGreaterThan(0); // the aggregate actually expanded
+    for (const child of childrenOnFrontier) {
+      const i = [...groups].indexOf(child);
+      expect(selected[i]).toBe(1); // a descendant of the selected module is flagged selected (ancestor-aware)
+    }
+    net.destroy();
+  });
+
+  it("#3 modular-map: hovering an aggregate pushes its group id as the hover uniform (no re-emit)", async () => {
+    const h = host();
+    const net = network(h, { width: 200, height: 200 });
+    await net.whenReady();
+    // Two modules; the inter-module edge 1→2 becomes a super-edge between the two aggregates at k=1.
+    const g = buildGraph({ nodeCount: 4, source: [0, 2, 1], target: [1, 3, 2], directed: true });
+    const modules = [{ id: 0, path: [1, 1] }, { id: 1, path: [1, 2] }, { id: 2, path: [2, 1] }, { id: 3, path: [2, 2] }];
+    net.data(g).style({ directed: true, linkStyle: "half-arrow", linkStroke: "#999999" }).lod({ modules, expandPx: 20, superEdges: true }).layout({ backend: "positions", positions: new Float32Array([70, 90, 85, 90, 115, 110, 130, 110]) });
+    net.interactive({ selectable: { multi: true }, hover: true });
+    net.setTransform({ k: 1, x: 0, y: 0 });
+
+    const base = baseLane(net);
+    const tree = (net as any).lodTree;
+    expect(layer(emit(base), "links").primitive).toBe("half-arrows"); // the rich map glyph, not plain lines
+    // The links carry a_group = super-edge source tree-node, so the shader recolours the hovered aggregate's out-edges.
+    const links = linkData(layer(emit(base), "links"));
+    expect(links.groups.length).toBe(links.count);
+
+    const aggs = [...(base.visible as Uint32Array)].filter((id) => id >= tree.leafCount);
+    const srcAgg = aggs.find((a) => leavesUnder(tree, a).includes(1))!;
+    const spy = spyBackend(net);
+    spy.reset();
+    const r = h.getBoundingClientRect();
+    h.dispatchEvent(new PointerEvent("pointermove", { clientX: r.left + tree.cx[srcAgg], clientY: r.top + tree.cy[srcAgg], bubbles: true }));
+    expect(spy.style.filter((s) => s.name === "links").some((s) => s.h.hoverGroup === srcAgg)).toBe(true);
+    expect(spy.set.filter((n) => BASE.has(n))).toEqual([]); // half-arrow geometry not rebuilt on hover
+    net.destroy();
+    h.remove();
+  });
+  /* eslint-enable @typescript-eslint/no-explicit-any */
 });

@@ -5,7 +5,7 @@ import { InstancedLane, type ScreenRect } from "../core/instanced-lane.js";
 import { createBackend, createCanvasBackend, type BackendType, type BackendHandle } from "./backend-factory.js";
 import { buildBatch, type DrawItem } from "./draw-batch.js";
 import { composeColor, type StyleOverride, type SelectionOptions } from "./style-overrides.js";
-import { HighlightBuilder, resolveHighlight, HIGHLIGHT_SUFFIX, type HighlightStyle, type HighlightDraw, type HoverOption, type PendingColor } from "./highlight.js";
+import { HighlightBuilder, resolveHighlight, hoverParts, HIGHLIGHT_SUFFIX, type HighlightStyle, type HighlightDraw, type HoverOption, type HoverOptions, type PendingColor } from "./highlight.js";
 import { Tooltip } from "./tooltip.js";
 
 export type Accessor<D, T> = T | ((d: D, i: number) => T);
@@ -30,6 +30,10 @@ export interface InstancedLaneEntry {
   layerNames: readonly string[];
   /** Re-select + re-emit on every setTransform (zoom-dependent: LOD cut / declutter). Static lanes emit once at register. */
   dynamic: boolean;
+  /** Re-emit this base lane when the HOVER set changes, not just on selection change (#162). Set by lanes
+   *  whose emit styles by hover — e.g. network recolours the hovered node's existing links. Plot leaves it
+   *  unset (its hover is only the ring overlay), so a hover doesn't needlessly re-upload the points buffer. */
+  hoverDirtiesBase?: boolean;
   /** Map a picked source index (from `lane.pick`) to a HoverHit for hover/click dispatch; null = treat as a miss. */
   resolve(index: number): HoverHit | null;
   /**
@@ -81,10 +85,15 @@ export interface InteractiveLayerOptions<D = any> {
   /** Styles for {@link BaseEngine.select}: the selected set and its complement.
    *  Defaults: selected keeps the base style; others `{ opacity: 0.3 }`. */
   selection?: SelectionOptions;
-  /** Hover-highlight: `true` = default white outline, a {@link HighlightStyle} = redraw the
-   *  hovered item with it, or a custom `(datum, HighlightBuilder)` draw fn. Rendered in a tiny
-   *  overlay layer — O(hovered item) per change, the base layer is untouched. */
-  hover?: HoverOption<D>;
+  /** Hover-highlight, symmetric with {@link selection} (#162). `true` enables the default outline/ring.
+   *  A {@link HoverOptions} object — `{ hovered?, others? }` — styles it: `hovered` is how the hovered
+   *  item looks (a {@link HighlightStyle} redraw / custom `(datum, HighlightBuilder)` draw fn on Scene
+   *  layers; the ring's `stroke` on instanced lanes), and `others` fades the non-hovered glyphs (the
+   *  hover analogue of `selection.others`, opt-in — honored on instanced lanes via the shader, so it's
+   *  a uniform change that stays free even on a full LOD-off draw). A bare `HighlightStyle`/draw-fn is
+   *  still accepted as shorthand for `{ hovered: … }`. The hovered item is redrawn in a tiny overlay
+   *  layer — O(hovered item) per change; the base layer is untouched. */
+  hover?: HoverOption<D> | HoverOptions<D>;
   /** Hover tooltip content for this layer (`null` hides). Shown in a shared engine-managed div —
    *  see `tooltipClass` for styling. Re-evaluated only when the hovered target changes;
    *  re-declare the layer to force a refresh. */
@@ -136,9 +145,8 @@ export interface LayerSpec {
   pickable?: boolean;
   /** Styles applied by {@link BaseEngine.select} to the selected set / its complement. */
   selection?: SelectionOptions;
-  /** Hover-highlight for this layer: true = default style, a HighlightStyle = replay
-   *  with it, a function = custom draw of the hovered item (see HighlightBuilder). */
-  hover?: HoverOption;
+  /** Hover-highlight for this layer: `true`/style/fn, or a `{ hovered?, others? }` object (#162). */
+  hover?: HoverOption | HoverOptions;
   /** Tooltip content for the hovered drawable (string / element / null = hide). */
   tooltip?: (d: any, id: string | number) => string | HTMLElement | null;
   /** Opt this layer into click-driven selection (see {@link InteractiveLayerOptions.selectable}). */
@@ -244,8 +252,14 @@ export abstract class BaseEngine {
   private downAt: [number, number] | null = null;
   /** Max pointer travel (px) between down and up for a click — suppresses pan/rotate drags. */
   private static readonly CLICK_SLOP = 4;
-  /** Active shift+drag marquee (#159): viewport-space start + lazily-created overlay rect. Null when idle. */
-  private marquee: { startClientX: number; startClientY: number; el: HTMLElement | null; badge: HTMLElement | null } | null = null;
+  /** Active shift+drag marquee (#159): viewport-space start point; `shown` flips true once the drag
+   *  passes the click slop (the overlay box appears). Null when idle. */
+  private marquee: { startClientX: number; startClientY: number; shown: boolean } | null = null;
+  /** The marquee overlay box + mode badge are created ONCE and reused across gestures (#162): shown on
+   *  drag, hidden (not removed) on end. A single reused pair can't be orphaned in the DOM when a gesture
+   *  is interrupted (e.g. a ctrl-click context menu), which is how duplicate badges used to accumulate. */
+  private marqueeEl: HTMLElement | null = null;
+  private marqueeBadge: HTMLElement | null = null;
   /** Lane layers currently showing the live marquee preview (the will-be-selected hover ring), to clear on end. */
   private marqueePreview = new Set<string>();
   /** Active node-drag (#140): the grabbed hit + viewport-space start, plus the session once the pointer
@@ -483,6 +497,7 @@ export abstract class BaseEngine {
       for (const layer of emitted) backend.setInstancedLayer(layer);
     }
     this.laneEmittedNames.set(name, emittedNames);
+    this.onInstancedLaneEmitted(name); // re-apply shader-highlight uniforms a fresh setInstancedLayer reset (#162)
   }
 
   /** Selected ids for an instanced-lane layer (#105 N7c-2) — read by a lane's companion highlight
@@ -502,6 +517,21 @@ export abstract class BaseEngine {
    *  highlight strategy short-circuit to an empty visible set (O(1)) when nothing is shown. */
   protected hasHighlight(layer: string): boolean {
     return (this.selected.get(layer)?.size ?? 0) > 0 || (this.laneHilite.get(layer)?.size ?? 0) > 0;
+  }
+
+  /**
+   * Resolved `selection.others` dim opacity for an instanced-lane layer (#162) — the lane analogue of
+   * a Scene layer's `others` dimming, which lanes apply as a per-instance alpha multiply in their emit
+   * (see `map/selection-dim.ts`). Returns the layer's `selection.others.opacity` (default `0.3`,
+   * matching Scene `_applySelect`) when a selection is active on `layer`, else `null` (no dim — the
+   * emit short-circuits). Lanes honor only the opacity component of `others`; a colour override there
+   * is ignored on lanes. Hover does NOT dim (matching Scene, where only `select()` dims) — so this
+   * keys off the persistent selection set alone. */
+  protected othersDim(layer: string): number | null {
+    if ((this.selected.get(layer)?.size ?? 0) === 0) return null;
+    const others = this.laneInteractiveFor(layer)?.ix.options.selection?.others;
+    const op = others === undefined ? 0.3 : others.opacity ?? 1;
+    return op < 1 ? op : null;
   }
 
   /** Drop any managed selection + hover highlight for `layer` — e.g. when an engine disables that
@@ -532,6 +562,40 @@ export abstract class BaseEngine {
     this.render();
   }
 
+  /** Re-emit BOTH an interactive lane's base layers and its highlight overlay — used when the
+   *  **selection** set changes, so the base lane re-applies (or clears) `selection.others` dimming
+   *  (#162) on its glyphs/links, not just the ring overlay. A hover-only change instead uses
+   *  {@link emitHighlightFor} (ring overlay alone), which leaves the dimmed base untouched — keeping
+   *  pointermove cheap. No-op when `layer` isn't an interactive lane. */
+  private emitSelectionFor(layer: string): void {
+    const found = this.laneInteractiveFor(layer);
+    if (!found) return;
+    this.emitInstancedLane(found.name); // base lane: re-applies/clears the per-instance others-dim
+    if (this.instancedLanes.has(found.ix.highlightLane)) this.emitInstancedLane(found.ix.highlightLane);
+    this.render();
+  }
+
+  /** Re-emit after the HOVER set changed: the ring overlay always; the base lane too when the lane sets
+   *  {@link InstancedLaneEntry.hoverDirtiesBase} (#162) — network recolours the hovered node's existing
+   *  links there. Cheaper than {@link emitSelectionFor} for lanes that don't style by hover (plot). */
+  private emitHoverFor(layer: string): void {
+    const found = this.laneInteractiveFor(layer);
+    if (!found) return;
+    if (found.entry.hoverDirtiesBase) this.emitInstancedLane(found.name);
+    if (this.instancedLanes.has(found.ix.highlightLane)) this.emitInstancedLane(found.ix.highlightLane);
+    this.render();
+  }
+
+  /** Hook: an interactive lane's HOVER set changed (#162). Default re-emits the ring overlay (+ the base
+   *  lane if `hoverDirtiesBase`). An engine with shader-driven highlight (network) overrides this to set
+   *  a uniform instead — so a hover on a full (LOD-off) draw costs no geometry rebuild. */
+  protected onLaneHoverChanged(layer: string): void { this.emitHoverFor(layer); }
+  /** Hook: an interactive lane's SELECTION set changed. Default re-emits base + ring. */
+  protected onLaneSelectionChanged(layer: string): void { this.emitSelectionFor(layer); }
+  /** Hook: called after an instanced lane's layers were (re)emitted (#162). Lets an engine re-apply
+   *  shader-highlight uniforms that a fresh `setInstancedLayer` reset to defaults. Default no-op. */
+  protected onInstancedLaneEmitted(_name: string): void {}
+
   /** Does any registered lane opt into hover/tooltip (`"hover"`) or click-select (`"selectable"`)?
    *  Lets the pointer-move/up handlers fire for lane-only engines (no Scene specs carry the option). */
   private anyLaneInteractive(kind: "hover" | "selectable"): boolean {
@@ -559,16 +623,16 @@ export abstract class BaseEngine {
     if (this.laneHoverLayer && this.laneHoverLayer !== layer) {
       const prev = this.laneHoverLayer;
       this.laneHilite.delete(prev);
-      this.emitHighlightFor(prev);
+      this.onLaneHoverChanged(prev); // clear the previous layer's hover styling
     }
     this.laneHoverLayer = layer;
     if (!layer) return;
     const set = this.laneHilite.get(layer);
     if (id == null) {
-      if (set?.size) { this.laneHilite.delete(layer); this.emitHighlightFor(layer); }
+      if (set?.size) { this.laneHilite.delete(layer); this.onLaneHoverChanged(layer); }
     } else if (!set || set.size !== 1 || !set.has(id)) {
       this.laneHilite.set(layer, new Set([id]));
-      this.emitHighlightFor(layer);
+      this.onLaneHoverChanged(layer);
     }
   }
 
@@ -833,7 +897,7 @@ export abstract class BaseEngine {
       if (typeof set === "function") throw new Error(`select(${name}, fn): function selectors are Scene-layer only; pass an id array for instanced lanes`);
       if (set === null) this.selected.delete(name);
       else this.selected.set(name, new Set(set));
-      this.emitHighlightFor(name);
+      this.onLaneSelectionChanged(name);
       this.selectCb?.(this.selection(), undefined);
       return this;
     }
@@ -914,7 +978,7 @@ export abstract class BaseEngine {
         const d = this.scene.drawableOf(spec.name, id);
         if (!d) continue; // unknown or culled id: nothing to highlight
         const b = new HighlightBuilder(g, d, colors);
-        const draw = resolveHighlight(styleOrDraw ?? spec.hover);
+        const draw = resolveHighlight(styleOrDraw ?? hoverParts(spec.hover).hovered);
         const i = index?.get(id) ?? -1;
         draw(i >= 0 ? spec.data[i] : null, b);
       }
@@ -1312,6 +1376,8 @@ export abstract class BaseEngine {
     this.host.removeEventListener("pointerup", this.onPointerUp);
     this.host.removeEventListener("pointercancel", this.onPointerCancel);
     this.endMarquee(); // drop any in-flight marquee overlay + its window listeners
+    this.marqueeEl?.remove(); this.marqueeEl = null; // remove the reused overlay box + badge from the DOM
+    this.marqueeBadge?.remove(); this.marqueeBadge = null;
     this.nodeDrag?.session?.end(); this.endNodeDrag(); // release a held drag + its window listeners (#140)
     this.tooltipEl?.destroy(); this.tooltipEl = null;
     this.handle?.backend.destroy();
@@ -1473,60 +1539,75 @@ export abstract class BaseEngine {
    *  pointer leaving the host. The overlay rect is created lazily on the first real move (so a shift+click
    *  never flashes a 0-size box). d3-zoom already declined this gesture (its filter rejects shift+drag). */
   private startMarquee(e: PointerEvent): void {
-    this.marquee = { startClientX: e.clientX, startClientY: e.clientY, el: null, badge: null };
+    this.endMarquee(); // defensive: never stack a new marquee over a stale (un-cleaned) one
+    this.marquee = { startClientX: e.clientX, startClientY: e.clientY, shown: false };
     window.addEventListener("pointermove", this.onMarqueeMove);
     window.addEventListener("pointerup", this.onMarqueeUp);
+    // Robust teardown on ANY interruption (#162): a ctrl-click context menu, a cancelled pointer, the
+    // window losing focus, or Esc must each tear the marquee down — else its overlay box + mode badge
+    // (and the live preview rings) leak, and a duplicate accumulates on the next gesture.
+    window.addEventListener("pointercancel", this.onMarqueeAbort);
+    window.addEventListener("contextmenu", this.onMarqueeAbort);
+    window.addEventListener("blur", this.onMarqueeAbort);
+    window.addEventListener("keydown", this.onMarqueeKey);
+  }
+  /** The reused marquee box + badge, created on first use and made visible. Returns both refs (no
+   *  re-creation — one pair for the engine's lifetime), so the move handler stays non-null-safe. */
+  private marqueeOverlay(): { el: HTMLElement; badge: HTMLElement } {
+    const el = this.marqueeEl ?? (this.marqueeEl = makeOverlayDiv("d3gl-marquee", "border:1px dashed rgba(255,255,255,0.9);background:rgba(120,170,255,0.18)"));
+    // Mode badge that follows the cursor: "+" (additive, default) or "−" (alt held → subtract), like Illustrator.
+    const badge = this.marqueeBadge ?? (this.marqueeBadge = makeOverlayDiv("d3gl-marquee-badge", "width:14px;height:14px;line-height:13px;text-align:center;font:700 12px/13px ui-monospace,monospace;color:#fff;border-radius:3px;box-shadow:0 0 0 1px rgba(0,0,0,0.35)"));
+    el.style.display = "block";
+    badge.style.display = "block";
+    return { el, badge };
   }
   private onMarqueeMove = (e: PointerEvent): void => {
     const m = this.marquee;
     if (!m) return;
-    if (!m.el) {
+    if (!m.shown) {
       if (Math.hypot(e.clientX - m.startClientX, e.clientY - m.startClientY) <= BaseEngine.CLICK_SLOP) return;
-      const el = document.createElement("div");
-      el.className = "d3gl-marquee";
-      el.style.cssText = "position:fixed;pointer-events:none;z-index:2147483647;border:1px dashed rgba(255,255,255,0.9);background:rgba(120,170,255,0.18)";
-      document.body.appendChild(el);
-      m.el = el;
-      // Mode badge that follows the cursor: "+" (additive, default) or "−" (alt held → subtract), like
-      // Illustrator. Built once with the box; positioned + toggled below as the drag moves / alt toggles.
-      const badge = document.createElement("div");
-      badge.className = "d3gl-marquee-badge";
-      badge.style.cssText = "position:fixed;pointer-events:none;z-index:2147483647;width:14px;height:14px;line-height:13px;text-align:center;font:700 12px/13px ui-monospace,monospace;color:#fff;border-radius:3px;box-shadow:0 0 0 1px rgba(0,0,0,0.35)";
-      document.body.appendChild(badge);
-      m.badge = badge;
+      m.shown = true;
     }
-    m.el.style.left = `${Math.min(m.startClientX, e.clientX)}px`;
-    m.el.style.top = `${Math.min(m.startClientY, e.clientY)}px`;
-    m.el.style.width = `${Math.abs(e.clientX - m.startClientX)}px`;
-    m.el.style.height = `${Math.abs(e.clientY - m.startClientY)}px`;
-    // Mode badge: subtract while alt/option is held (red "−"), else add (green "+"). Follows the cursor.
-    if (m.badge) {
-      const sub = e.altKey;
-      m.badge.textContent = sub ? "−" : "+";
-      m.badge.style.background = sub ? "#dc2626" : "#16a34a";
-      m.badge.style.left = `${e.clientX + 10}px`;
-      m.badge.style.top = `${e.clientY + 10}px`;
-    }
+    const { el, badge } = this.marqueeOverlay();
+    el.style.left = `${Math.min(m.startClientX, e.clientX)}px`;
+    el.style.top = `${Math.min(m.startClientY, e.clientY)}px`;
+    el.style.width = `${Math.abs(e.clientX - m.startClientX)}px`;
+    el.style.height = `${Math.abs(e.clientY - m.startClientY)}px`;
+    // Mode badge: "−" while alt/option is held (subtract), else "+" (add). Neutral gray in both modes (#162).
+    const sub = e.altKey;
+    badge.textContent = sub ? "−" : "+";
+    badge.style.background = "#4b5563"; // neutral gray (#4b5563)
+    badge.style.left = `${e.clientX + 10}px`;
+    badge.style.top = `${e.clientY + 10}px`;
     // Live preview: ring the glyphs the box currently covers — blue "will-add", or (alt) red "will-remove".
     this.previewMarquee(this.marqueeRect(m.startClientX, m.startClientY, e.clientX, e.clientY), e.altKey);
   };
   private onMarqueeUp = (e: PointerEvent): void => {
     const m = this.marquee;
     if (!m) return;
-    const box = m.el != null && Math.hypot(e.clientX - m.startClientX, e.clientY - m.startClientY) > BaseEngine.CLICK_SLOP;
+    const box = m.shown && Math.hypot(e.clientX - m.startClientX, e.clientY - m.startClientY) > BaseEngine.CLICK_SLOP;
     const rect = this.marqueeRect(m.startClientX, m.startClientY, e.clientX, e.clientY);
     this.endMarquee(); // also clears the live preview rings
     // A real drag → region select; a no-drag shift+click is left to onPointerUp's click path.
     if (box) this.finalizeMarquee(rect, e);
   };
-  /** Remove the overlay + window listeners, drop the live preview rings, and clear marquee state. Idempotent. */
+  /** Tear down on a non-commit interruption (#162): context menu / pointer cancel / window blur. */
+  private onMarqueeAbort = (): void => { this.endMarquee(); };
+  /** Esc cancels an in-flight marquee (no selection committed), like dismissing any drag gesture. */
+  private onMarqueeKey = (e: KeyboardEvent): void => { if (e.key === "Escape") this.endMarquee(); };
+  /** Remove all window listeners, HIDE (not remove) the reused overlay, drop the live preview rings, and
+   *  clear marquee state. Idempotent — safe to call from any interruption and again on pointerup. */
   private endMarquee(): void {
     const m = this.marquee;
     if (!m) return;
     window.removeEventListener("pointermove", this.onMarqueeMove);
     window.removeEventListener("pointerup", this.onMarqueeUp);
-    m.el?.remove();
-    m.badge?.remove();
+    window.removeEventListener("pointercancel", this.onMarqueeAbort);
+    window.removeEventListener("contextmenu", this.onMarqueeAbort);
+    window.removeEventListener("blur", this.onMarqueeAbort);
+    window.removeEventListener("keydown", this.onMarqueeKey);
+    if (this.marqueeEl) this.marqueeEl.style.display = "none";
+    if (this.marqueeBadge) this.marqueeBadge.style.display = "none";
     this.marquee = null;
     this.clearMarqueePreview();
   }
@@ -1613,9 +1694,10 @@ export abstract class BaseEngine {
    *  refresh their companion ring overlay instead (no Scene drawables to recolor). */
   private applySelectionStyles(touched: Set<string>): void {
     for (const n of touched) {
-      // Lane-first: an interactive lane refreshes its ring overlay; otherwise a Scene layer restyles.
+      // Lane-first: an interactive lane restyles via its selection hook (shader uniforms / re-emit);
+      // otherwise a Scene layer restyles.
       if (this.laneInteractiveFor(n)) {
-        this.emitHighlightFor(n);
+        this.onLaneSelectionChanged(n);
       } else {
         const ids = this.selected.get(n);
         this._applySelect(n, ids && ids.size ? ids : null);
@@ -1866,4 +1948,13 @@ function setsEqual(a: ReadonlySet<string | number> | undefined, b: ReadonlySet<s
   if (!a || a.size !== b.size) return false;
   for (const v of b) if (!a.has(v)) return false;
   return true;
+}
+
+/** A fixed, click-through overlay `div` appended to `document.body` — the marquee box / mode badge (#159). */
+function makeOverlayDiv(className: string, extraCss: string): HTMLElement {
+  const el = document.createElement("div");
+  el.className = className;
+  el.style.cssText = `position:fixed;pointer-events:none;z-index:2147483647;${extraCss}`;
+  document.body.appendChild(el);
+  return el;
 }

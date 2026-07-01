@@ -76,6 +76,24 @@ export interface RenderDelta {
   sizeMode?: "world" | "screen";
 }
 
+/**
+ * Shader-driven highlight state for an instanced layer (#162). Passed to {@link Backend.styleInstancedLayer},
+ * it maps to vertex-shader uniforms so hover/selection restyle costs **no** geometry rebuild:
+ * - `hoverGroup` — the hovered node's group id (matched against each instance's `groups`); `-1` = none.
+ * - `dimActive` / `dimOpacity` — fade every non-highlighted instance's alpha by `dimOpacity` when active.
+ * - `recolor` — RGB (0..1) a highlighted instance is tinted toward, preserving luminance (so a weight-
+ *   encoded link keeps its weight); `null`/absent ⇒ highlighted instances keep their colour (e.g. nodes).
+ * - `selected` — optional per-instance flag buffer (0/1) to upload in place (a selection change), instead
+ *   of re-emitting the layer. Length must equal the layer's instance count.
+ */
+export interface InstancedHighlight {
+  hoverGroup?: number;
+  dimActive?: boolean;
+  dimOpacity?: number;
+  recolor?: [number, number, number] | null;
+  selected?: Uint8Array;
+}
+
 /** SoA for a batch of instanced circles (e.g. network nodes). Plain typed arrays. */
 export interface InstancedCirclesData {
   /** [x, y] world coords per circle, length `2 * count`. */
@@ -91,6 +109,11 @@ export interface InstancedCirclesData {
   borders?: Float32Array;
   /** Optional RGBA ring colour bytes per circle, length `4 * count`. Paired with {@link borders}. */
   borderColors?: Uint8Array;
+  /** Optional per-instance **group id** for shader-driven highlight (#162): the node id a circle is,
+   *  so the vertex shader can match `u_hoverGroup` / index the selected set. Length `count`. */
+  groups?: Float32Array;
+  /** Optional per-instance **selected flag** (0/1) for shader-driven dim/recolour (#162). Length `count`. */
+  selected?: Uint8Array;
   count: number;
 }
 
@@ -114,6 +137,14 @@ export interface InstancedLinesData {
    * setting, not per-instance; bent layers raise it, straight layers keep `2` to stay cheap at scale.
    */
   samples?: number;
+  /** Per-instance highlight group (#162): the link's **source** node id, matched against `u_hoverGroup`
+   *  / used to index the selected set so the vertex shader recolours a highlighted node's links. Length `count`. */
+  groups?: Float32Array;
+  /** The link's **target** node id (#162) — the OTHER endpoint, so an undirected hover matches incident
+   *  links on either side; `-1`/absent for directed links (matched on `groups`/source alone). Length `count`. */
+  groups2?: Float32Array;
+  /** Per-instance selected flag (0/1) for shader-driven dim/recolour (#162). Length `count`. */
+  selected?: Uint8Array;
   count: number;
 }
 
@@ -133,6 +164,12 @@ export interface InstancedArrowsData {
   bends?: Float32Array;
   /** Draw a one-sided **half** arrowhead (#104 N6c) — for bent map links, so reciprocal heads don't collide. */
   half?: boolean;
+  /** Per-instance highlight group (#162): the arrow's **source** node id. Length `count`. */
+  groups?: Float32Array;
+  /** The other endpoint (target) id for undirected hover (#162); `-1`/absent when unused. Length `count`. */
+  groups2?: Float32Array;
+  /** Per-instance selected flag (0/1) for shader-driven dim/recolour (#162). Length `count`. */
+  selected?: Uint8Array;
   count: number;
 }
 
@@ -156,6 +193,12 @@ export interface InstancedHalfArrowsData {
   colors: Uint8Array;
   /** Path samples (M) per bezier edge of the strip; a draw setting, not per-instance. Default 24. */
   samples?: number;
+  /** Per-instance highlight group (#162): the link's **source** node id. Length `count`. */
+  groups?: Float32Array;
+  /** The other endpoint (target) id for undirected hover (#162); `-1`/absent when unused. Length `count`. */
+  groups2?: Float32Array;
+  /** Per-instance selected flag (0/1) for shader-driven dim/recolour (#162). Length `count`. */
+  selected?: Uint8Array;
   count: number;
 }
 
@@ -262,6 +305,13 @@ export interface Backend {
   updateInstancedLayer?(layer: InstancedLayer): void;
   /** Remove an instanced primitive layer by name. */
   removeInstancedLayer?(name: string): void;
+  /**
+   * Shader-driven selection/hover styling for an instanced layer (#162) — applies the highlight WITHOUT
+   * rebuilding geometry, so a hover is just a uniform change (no CPU rebuild, no GPU re-upload) even on a
+   * full-graph (LOD-off) draw. Sets the given uniforms; when `selected` is present, updates only that
+   * per-instance flag buffer. No-op when the layer/backend doesn't support it. WebGL-only.
+   */
+  styleInstancedLayer?(name: string, highlight: InstancedHighlight): void;
   /**
    * GPU-readback pick (#141): resolve a screen point (CSS px) to the topmost `pickable` instanced
    * link instance by reading its id-encoded colour from an offscreen pick FBO. Returns the decoded

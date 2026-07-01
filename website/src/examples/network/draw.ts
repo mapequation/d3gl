@@ -36,6 +36,10 @@ function degreeRadius(graph: NetworkGraph): NodeRadiusSpec {
  * and expand into their members as you zoom in — with **Declutter** (thin overlaps) and **Edges**
  * (super-edges between aggregates). Pair LOD with screen sizing. Drag empty space to pan, scroll to zoom.
  * **Hover or click** a glyph to resolve the node — or the module it collapsed into — shown top-left.
+ * **Selecting** a node dims the rest of the graph (the `selection.others` focus, consistent with GeoMap
+ * + Plot) while keeping the selected node *and its outgoing links* at full strength; **hovering** a node
+ * recolours its outgoing links red (and, via `hover: { others }`, fades the rest). The highlight is applied
+ * in the GPU shader, so it stays instant even with LOD off on a million-node layout.
  * **Drag a node or a collapsed module** to move it: it tracks the cursor with no lag while the off-thread
  * worker layout reheats around it and re-cools on release (grab a module to drag its whole subtree).
  */
@@ -45,9 +49,18 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
   // Node-drag (#140): grab a node or a collapsed module and drag it — it tracks the cursor with no lag
   // while the off-thread worker layout **reheats** around it and re-cools on release. Grab a selected
   // node to drag the whole selection; grab a module aggregate to drag its whole subtree. Plain drag on
-  // empty space still pans. Hover/click also light a ring (selection) via the same interactive() opt-in.
-  // Default ring palette: green hover/will-add, blue selection, red will-remove (matches the +/− marquee badges).
-  net.interactive({ selectable: { multi: true }, hover: true, draggable: true });
+  // empty space still pans. Hover/click also light a ring via the same interactive() opt-in.
+  // #162: the selection/hover highlight is applied in the GPU shader from per-instance flags + uniforms,
+  // so hovering across a million-node LOD-off layout is a uniform change — no per-hover geometry rebuild.
+  // `selection.others` (set explicitly here, though 0.3 is the default) dims the rest of the graph on
+  // selection while the selected node + its outgoing links stay full; `hover: { others }` opts into the
+  // same fade on hover. Highlight colour is red (rings + link recolour); the recolour preserves link weight.
+  net.interactive({
+    selectable: { multi: true },
+    draggable: true,
+    selection: { others: { opacity: 0.3 } },
+    hover: { others: { opacity: 0.5 } }, // enable hover + fade the rest on hover (mirrors selection.others)
+  });
 
   // Picking (#105 N7a): hover/click resolve the node or aggregate under the cursor via the engine's
   // CPU hit-test over the LOD cut frontier — bounded by the visible set, so it stays cheap at 1M. The

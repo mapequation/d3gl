@@ -4,6 +4,34 @@
  * texelFetch + textureSize (recolor = texture update, no geometry change). A
  * parallel R8 flags texture culls hidden drawables (visible flag in bit 0).
  */
+
+// Shader-driven selection/hover highlight for the instanced lanes (#162). Injected into each instanced
+// vertex shader: per-instance `a_group` (node id / link source id) + `a_selected` (0/1), and uniforms
+// that turn a hover/selection restyle into a uniform change — no geometry rebuild, no buffer re-upload,
+// so it scales to a full (LOD-off) draw. A highlighted instance (selected, or its group == the hovered
+// group) is tinted toward `u_recolorRGB` preserving luminance (weight cue kept) when `u_recolor` is on
+// (link layers); a non-highlighted instance fades its alpha by `u_dimOpacity` when `u_dimActive`.
+const HL_UNIFORMS = `
+uniform float u_hoverGroup;   // hovered group id (-1 = none)
+uniform float u_dimActive;    // 1 = fade non-highlighted instances
+uniform float u_dimOpacity;   // alpha multiplier for the faded instances
+uniform float u_recolor;      // 1 = tint highlighted instances toward u_recolorRGB (link layers), 0 = keep (nodes)
+uniform vec3 u_recolorRGB;    // highlight tint (0..1)
+in float a_group;             // per-instance highlight group id (node id / link source id)
+in float a_group2;            // link's OTHER endpoint (target) for undirected hover; -1 = unused
+in float a_selected;          // per-instance selected flag (0/1)`;
+
+const HL_APPLY = `
+  bool hl = a_selected > 0.5 || (u_hoverGroup >= 0.0 && (abs(a_group - u_hoverGroup) < 0.5 || abs(a_group2 - u_hoverGroup) < 0.5));
+  if (hl) {
+    if (u_recolor > 0.5) {
+      float lum = dot(v_color.rgb, vec3(0.299, 0.587, 0.114));
+      v_color.rgb = u_recolorRGB * clamp(lum * 1.5 + 0.2, 0.0, 1.0);
+    }
+  } else if (u_dimActive > 0.5) {
+    v_color.a *= u_dimOpacity;
+  }`;
+
 export const FILL_VS = `#version 300 es
 precision highp float;
 uniform mat3 u_transform;
@@ -175,16 +203,17 @@ in vec2 a_center;           // per-instance world centre
 in float a_radius;          // per-instance radius
 in vec4 a_color;            // per-instance RGBA (unorm8x4 -> 0..1)
 in float a_border;          // per-instance ring thickness as a fraction of radius (0 = no ring)
-in vec4 a_borderColor;      // per-instance ring RGBA (unorm8x4 -> 0..1)
+in vec4 a_borderColor;      // per-instance ring RGBA (unorm8x4 -> 0..1)${HL_UNIFORMS}
 out vec4 v_color;
 out vec2 v_local;
 out float v_border;
 out vec4 v_borderColor;
 void main() {
-  v_color = a_color;
+  v_color = a_color;${HL_APPLY}
   v_local = a_corner;
   v_border = a_border;
   v_borderColor = a_borderColor;
+  if (!hl && u_dimActive > 0.5) v_borderColor.a *= u_dimOpacity; // dim the flow-border ring with its node (#162)
   vec3 c = u_transform * vec3(a_center, 1.0);
   vec2 off = (u_screen > 0.5)
     ? a_corner * a_radius * vec2(2.0 / u_viewport.x, -2.0 / u_viewport.y)
@@ -227,11 +256,11 @@ in vec2 a_source;           // per-instance world source
 in vec2 a_target;           // per-instance world target
 in float a_width;           // per-instance line width
 in vec4 a_color;            // per-instance RGBA (unorm8x4 -> 0..1)
-in float a_bend;            // per-instance control offset ⟂ to the chord, as a fraction of |chord| (0 = straight)
+in float a_bend;            // per-instance control offset ⟂ to the chord, as a fraction of |chord| (0 = straight)${HL_UNIFORMS}
 out vec4 v_color;
 flat out float v_id;        // instance index for GPU-readback picking (#141); ignored by FILL_FS, read by PICK_FS
 void main() {
-  v_color = a_color;
+  v_color = a_color;${HL_APPLY}
   v_id = float(gl_InstanceID);
   float t = a_corner.x;
   float side = a_corner.y;
@@ -281,7 +310,7 @@ in vec2 a_target;     // per-instance target centre (tip set back by a_radius)
 in float a_size;      // per-instance arrow size (world or px per sizeMode)
 in float a_radius;    // per-instance target node radius (setback to the boundary)
 in float a_bend;      // per-instance bend, matching the link's, so the head aligns with its end tangent
-in vec4 a_color;
+in vec4 a_color;${HL_UNIFORMS}
 out vec4 v_color;
 flat out float v_id;  // instance index for GPU-readback picking (#141); ignored by FILL_FS, read by PICK_FS
 vec2 worldToPx(vec2 w) {
@@ -289,7 +318,7 @@ vec2 worldToPx(vec2 w) {
   return vec2((clip.x + 1.0) * 0.5 * u_viewport.x, (1.0 - clip.y) * 0.5 * u_viewport.y);
 }
 void main() {
-  v_color = a_color;
+  v_color = a_color;${HL_APPLY}
   v_id = float(gl_InstanceID);
   bool screen = u_screen > 0.5;
   vec2 src = screen ? worldToPx(a_source) : a_source;
@@ -333,7 +362,7 @@ in vec2 a_p1;         // per-instance target centre
 in vec2 a_radii;      // per-instance (r0, r1)
 in vec2 a_widths;     // per-instance (width, oppositeWidth)
 in float a_bend;      // per-instance bend (world or px per sizeMode; sign picks the bow side)
-in vec4 a_color;      // per-instance RGBA (unorm8x4 -> 0..1)
+in vec4 a_color;      // per-instance RGBA (unorm8x4 -> 0..1)${HL_UNIFORMS}
 out vec4 v_color;
 flat out float v_id;  // instance index for GPU-readback picking (#141); ignored by FILL_FS, read by PICK_FS
 vec2 bez(vec2 p0, vec2 c, vec2 p2, float t) {
@@ -345,7 +374,7 @@ vec2 worldToPx(vec2 w) {
   return vec2((clip.x + 1.0) * 0.5 * u_viewport.x, (1.0 - clip.y) * 0.5 * u_viewport.y);
 }
 void main() {
-  v_color = a_color;
+  v_color = a_color;${HL_APPLY}
   v_id = float(gl_InstanceID);
   float code = a_kind.x;
   float t = a_kind.y;

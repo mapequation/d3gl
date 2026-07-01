@@ -1,6 +1,7 @@
 import { rgb } from "d3-color";
 import type { InstancedCirclesData } from "../core/index.js";
 import type { InteractiveLayerOptions } from "./base-engine.js";
+import { hoverParts } from "./highlight.js";
 
 /**
  * Selection/hover ring overlay for instanced-lane glyphs (#105 N7c-2) — shared by network nodes and
@@ -11,11 +12,11 @@ import type { InteractiveLayerOptions } from "./base-engine.js";
 export type RGBA = [number, number, number, number];
 const RING_OUTER = 1.34; // ring outer radius ÷ glyph radius
 const RING_BORDER_FRAC = 0.16; // border thickness ÷ ring outer radius
-// A coherent default palette across the selection gestures (#140): blue = selected, green =
-// hover / "will add" (matches the green "+" marquee badge), red = "will remove" (matches the red "−").
-const DEFAULT_SELECT_RING: RGBA = [37, 99, 235, 255]; // blue (#2563eb) — the persistent selection ring
-const DEFAULT_HOVER_RING: RGBA = [22, 163, 74, 255]; // green (#16a34a) — the transient hover / will-add ring
-const DEFAULT_REMOVE_RING: RGBA = [220, 38, 38, 255]; // red (#dc2626) — "will be removed" (subtract-marquee preview)
+// Default highlight palette (#162): red = selected AND hover (one focus colour, matched by the shader
+// link recolour), yellow = "will remove" (subtract-marquee preview). The marquee +/- badges are neutral gray.
+const DEFAULT_SELECT_RING: RGBA = [220, 38, 38, 255]; // red (#dc2626) — the persistent selection ring
+const DEFAULT_HOVER_RING: RGBA = [220, 38, 38, 255]; // red (#dc2626) — the transient hover ring (same red as selected)
+const DEFAULT_REMOVE_RING: RGBA = [234, 179, 8, 255]; // yellow (#eab308) — "will be removed" (subtract-marquee preview)
 
 function cssToRgba(css: string, fallback: RGBA): RGBA {
   const c = rgb(css);
@@ -27,8 +28,10 @@ function cssToRgba(css: string, fallback: RGBA): RGBA {
  *  hover {@link HighlightStyle}'s `stroke`), falling back to the blue (select) / green (hover) defaults. */
 export function resolveRingColors(opts: InteractiveLayerOptions): { select: RGBA; hover: RGBA; remove: RGBA } {
   const selStroke = opts.selection?.selected?.stroke;
-  const hov = opts.hover;
-  const hovStroke = hov && typeof hov === "object" && "stroke" in hov ? (hov as { stroke?: string }).stroke : undefined;
+  // The hover ring's stroke comes from the hovered-item style (`hover.hovered.stroke`, or a bare
+  // HighlightStyle's `stroke` in the back-compat flat form) — see hoverParts (#162).
+  const hovered = hoverParts(opts.hover).hovered;
+  const hovStroke = hovered && typeof hovered === "object" && "stroke" in hovered ? hovered.stroke : undefined;
   return {
     select: selStroke ? cssToRgba(selStroke, DEFAULT_SELECT_RING) : DEFAULT_SELECT_RING,
     hover: hovStroke ? cssToRgba(hovStroke, DEFAULT_HOVER_RING) : DEFAULT_HOVER_RING,

@@ -3,7 +3,7 @@ import { networkLayers, frontierCircles, frontierHalos, superEdges, emitNodes, e
 import { rgb } from "d3-color";
 import { ForceLayout, seedPositions, type ForceParams } from "./force.js";
 import { multilevelLayout, type CoarsenOptions } from "./coarsen.js";
-import { buildLODTree, buildSpatialLODTree, computeLODGeometry, computeLODStyle, cut, declutterFrontier, pickFrontier, regionFrontier, visibleWorldRect, leavesUnder, type LODTree, type SpatialLODOptions } from "./lod.js";
+import { buildLODTree, buildSpatialLODTree, computeLODGeometry, computeLODStyle, cut, declutterFrontier, pickFrontier, regionFrontier, visibleWorldRect, leavesUnder, ancestorAwareSelected, type LODTree, type SpatialLODOptions } from "./lod.js";
 import { LabelLayer, placeLabels, type LabelAnchor } from "../labels/label-layer.js";
 import { buildModuleLODTree, type ModuleNode } from "./modules.js";
 import { startWorkerLayout, type WorkerLayoutHandle } from "./worker-transport.js";
@@ -11,6 +11,7 @@ import type { NetworkGraph } from "./graph.js";
 import type { InstancedLayer } from "../core/index.js";
 import { InstancedLane, type SelectionStrategy } from "../core/instanced-lane.js";
 import { resolveRingColors, ringCircles } from "../map/highlight-ring.js";
+import { hoverParts } from "../map/highlight.js";
 
 /** Options for the network engine. Inherits sizing, `backend`, and `tooltipClass`. */
 export interface NetworkOptions extends BaseEngineOptions {}
@@ -276,6 +277,15 @@ const DEFAULT_NODE_FILL = "#4878d0";
 const DEFAULT_LINK_WIDTH = 1;
 const DEFAULT_LINK_STROKE = "#999999";
 const LAYER_NAMES = ["links", "arrows", "node-halos", "nodes"] as const;
+/** Base-lane layers the shader highlight (#162) drives — nodes + links (not the aggregate halos, which
+ *  carry no group/selected and so render un-dimmed). */
+const HL_LAYERS = ["nodes", "links", "arrows"] as const;
+/** `[0, 1, …, n-1]` as float32 — the no-LOD node layer's `a_group` (instance i is node i). */
+function identityFloats(n: number): Float32Array {
+  const out = new Float32Array(n);
+  for (let i = 0; i < n; i++) out[i] = i;
+  return out;
+}
 /** Shared empty visible-set for selection strategies whose emit draws the whole source directly (no
  *  per-instance gather) — e.g. the no-LOD full-graph lane — so they never allocate an all-indices array. */
 const EMPTY_VISIBLE = new Uint32Array(0);
@@ -366,6 +376,10 @@ export class Network extends BaseEngine {
   /** Maps a picked link instance index (gl_InstanceID) → a {@link NetworkLinkHit} HoverHit, captured per
    *  emit so it matches the link set currently in the pick FBO. Null when no links are drawn. */
   private linkResolve: ((index: number) => HoverHit | null) | null = null;
+  /** Derived parent-pointer cache for the ancestor-aware selection highlight (#162), used only when the
+   *  LOD tree carries no `parent` (coarsening/spatial). Keyed by tree identity; see {@link treeParent}. */
+  private derivedParentFor: LODTree | null = null;
+  private derivedParent: Int32Array | null = null;
   /** Frontier label overlay (#105 N7b) + its options; null until {@link labels} is enabled. */
   private labelLayer: LabelLayer | null = null;
   private labelOpts: NetworkLabelOptions | null = null;
@@ -392,6 +406,7 @@ export class Network extends BaseEngine {
     this.lodModules = false;
     this.lodHasGeometry = false;
     this.resolvedCache = null;
+    this.derivedParentFor = null; this.derivedParent = null; // drop the ancestor-aware parent cache (#162)
     return this.rebuild();
   }
 
@@ -825,7 +840,10 @@ export class Network extends BaseEngine {
       };
       // No-LOD: instance i of every link layer is edge i (parallel emit), so the resolve is static.
       this.linkResolve = (i) => this.noLodLinkHit(graph, i);
-      const lane = new InstancedLane(strategy, () => this.flagPickableLinks(networkLayers(graph, this.resolvedStyleCached(graph))));
+      const lane = new InstancedLane(strategy, () => {
+        const resolved = this.resolvedStyleCached(graph);
+        return this.attachNoLodHighlight(this.flagPickableLinks(networkLayers(graph, resolved)), graph, resolved.directed);
+      });
       this.registerInstancedLane(this.NET_LANE, {
         lane, layerNames: LAYER_NAMES, dynamic: false,
         resolve: (i) => ({ layer: this.NODE_LAYER, id: i, datum: { aggregate: false, count: 1 } satisfies NetworkHit }),
@@ -854,6 +872,30 @@ export class Network extends BaseEngine {
    *  when link picking is on. Mutates the freshly-built layers in place (they're per-emit, never shared). */
   private flagPickableLinks(layers: InstancedLayer[]): InstancedLayer[] {
     if (this.pickLinksEnabled) for (const l of layers) if (l.primitive !== "circles") l.pickable = true;
+    return layers;
+  }
+
+  /** Attach the shader-highlight columns (#162) to the **no-LOD** full-graph layers, in place — so a
+   *  hover/selection restyle is a uniform / flag-buffer update, never a geometry rebuild. Instance order
+   *  is the parallel emit: the `nodes` circles layer's instance `i` is node `i`; every link layer
+   *  (`lines`/`half-arrows`/`arrows`) instance `e` is graph edge `e`. `group` = node id / link source id;
+   *  `group2` = the link target (undirected incident hover); `selected` = the initial flag from the
+   *  current selection ({@link noLodSelectedFor} refreshes it in place on later selection changes). */
+  private attachNoLodHighlight(layers: InstancedLayer[], graph: NetworkGraph, directed: boolean): InstancedLayer[] {
+    const source = Float32Array.from(graph.source);
+    const target = directed ? undefined : Float32Array.from(graph.target);
+    for (const l of layers) {
+      if (l.primitive === "circles") {
+        // The only circles layer in the no-LOD path is `nodes` (no aggregate halos). Instance i = node i.
+        l.circles.groups = identityFloats(graph.nodeCount);
+        l.circles.selected = this.noLodSelectedFor(this.NODE_LAYER);
+      } else {
+        const link = l.primitive === "lines" ? l.lines : l.primitive === "half-arrows" ? l.halfArrows : l.arrows;
+        link.groups = source;
+        if (target) link.groups2 = target;
+        link.selected = this.noLodSelectedFor("links"); // links/arrows share the per-edge flag
+      }
+    }
     return layers;
   }
 
@@ -916,32 +958,159 @@ export class Network extends BaseEngine {
         if (visible.length === 0) return [];
         const selected = this.selectedIds(this.NODE_LAYER);
         const remove = this.removeIds(this.NODE_LAYER); // subtract-marquee preview (#140) — ring these red
-        return [{ name: ringName, primitive: "circles", sizeMode, circles: ringCircles(visible, centerOf, radiusOf, (g) => !!selected?.has(g), colors, remove ? (g) => remove.has(g) : undefined) }];
+        // Blue (selected) vs green (hover-only) ring: ancestor-aware under LOD, so an expanded selected
+        // aggregate's children ring blue too (#162) — matching the kept-link/dim highlight.
+        const isSel = lod && this.lodTree && selected?.size ? this.makeSelectedPredicate(this.lodTree, selected) : null;
+        const selColored = (g: number): boolean => (isSel ? isSel(g) : !!selected?.has(g));
+        return [{ name: ringName, primitive: "circles", sizeMode, circles: ringCircles(visible, centerOf, radiusOf, selColored, colors, remove ? (g) => remove.has(g) : undefined) }];
       }),
       layerNames: [ringName], dynamic: true,
       resolve: () => null,
     });
   }
 
-  /** Highlighted node ids currently on screen: (selection ∪ hover) ∩ frontier (LOD) or taken directly
-   *  (no-LOD). Returns the shared empty sentinel when nothing is highlighted, so the per-frame ring
-   *  re-emit costs O(1) until the user selects/hovers something. */
+  /** Highlighted node ids currently on screen: (selection ∪ hover) ∩ frontier (LOD, **ancestor-aware** —
+   *  an expanded selected aggregate's children count, #162) or taken directly (no-LOD). Returns the
+   *  shared empty sentinel when nothing is highlighted, so the per-frame ring re-emit costs O(1) until
+   *  the user selects/hovers something. */
   private highlightVisible(source: InstancedLane | null, lod: boolean): Uint32Array {
     if (!this.hasHighlight(this.NODE_LAYER)) return EMPTY_VISIBLE;
-    const ids = new Set<number>();
-    const sel = this.selectedIds(this.NODE_LAYER); if (sel) for (const id of sel) ids.add(id as number);
-    const hov = this.hoveredIds(this.NODE_LAYER); if (hov) for (const id of hov) ids.add(id as number);
-    if (ids.size === 0) return EMPTY_VISIBLE;
-    if (lod && source) {
+    const sel = this.selectedIds(this.NODE_LAYER);
+    const hov = this.hoveredIds(this.NODE_LAYER);
+    if (lod && source && this.lodTree) {
+      const isSel = sel && sel.size ? this.makeSelectedPredicate(this.lodTree, sel) : null;
       const vis = source.visible;
       const out: number[] = [];
-      for (let i = 0; i < vis.length; i++) if (ids.has(vis[i]!)) out.push(vis[i]!);
-      return Uint32Array.from(out);
+      for (let i = 0; i < vis.length; i++) { const g = vis[i]!; if ((isSel && isSel(g)) || hov?.has(g)) out.push(g); }
+      return out.length ? Uint32Array.from(out) : EMPTY_VISIBLE;
     }
+    const ids = new Set<number>();
+    if (sel) for (const id of sel) ids.add(id as number);
+    if (hov) for (const id of hov) ids.add(id as number);
+    if (ids.size === 0) return EMPTY_VISIBLE;
     const n = this.graph!.nodeCount;
     const out: number[] = [];
     for (const id of ids) if (id >= 0 && id < n) out.push(id);
     return Uint32Array.from(out);
+  }
+
+  /** The single hovered node id, or null — used to recolour that node's links (#162). Null during a
+   *  multi-node marquee preview (which also writes `laneHilite`) and when the layer isn't hover-enabled. */
+  private singleHoveredId(): number | null {
+    if (!this.interactiveOpts?.hover) return null;
+    const hov = this.hoveredIds(this.NODE_LAYER);
+    if (!hov || hov.size !== 1) return null;
+    return hov.values().next().value as number;
+  }
+
+  /** Opacity to fade non-highlighted glyphs to while hovering (#162), from `hover.others` — the hover
+   *  analogue of `selection.others`, opt-in. Null when off or nothing is hovered. */
+  private hoverDimOpacity(): number | null {
+    if (this.singleHoveredId() == null) return null;
+    const others = hoverParts(this.interactiveOpts?.hover).others;
+    const op = others?.opacity;
+    return op != null && op < 1 ? op : null;
+  }
+
+  /** The base lane's live shader-highlight uniforms (#162): the hovered group id, and the dim state from
+   *  `selection.others` (a selection is active) OR `hoverDimOthers` (fade-on-hover). No geometry — these
+   *  drive the vertex shader, so a hover is just a uniform change even on a full (LOD-off) draw. */
+  private laneHighlightUniforms(): { hoverGroup: number; dimActive: boolean; dimOpacity: number } {
+    const op = this.othersDim(this.NODE_LAYER) ?? this.hoverDimOpacity();
+    return { hoverGroup: this.singleHoveredId() ?? -1, dimActive: op != null, dimOpacity: op ?? 1 };
+  }
+
+  /** Push the current highlight uniforms (and, when `selectedFor` is given, the refreshed per-instance
+   *  `selected` flags) to the base lane's shader layers — no geometry rebuild. Does NOT render (callers do). */
+  private pushLaneHighlight(selectedFor?: (layer: string) => Uint8Array | undefined): void {
+    const backend = this.backend();
+    if (!backend?.styleInstancedLayer) return;
+    const u = this.laneHighlightUniforms();
+    for (const layer of HL_LAYERS) {
+      backend.styleInstancedLayer(layer, { hoverGroup: u.hoverGroup, dimActive: u.dimActive, dimOpacity: u.dimOpacity, selected: selectedFor?.(layer) });
+    }
+  }
+
+  /** Per-instance `selected` flags for a no-LOD base layer from the current selection (#162) — refreshed
+   *  in place on a selection change instead of rebuilding geometry. `nodes`: node i selected; link layers:
+   *  edge e's source (directed) / either endpoint (undirected) selected. */
+  private noLodSelectedFor(layer: string): Uint8Array | undefined {
+    const graph = this.graph;
+    if (!graph) return undefined;
+    const sel = this.selectedIds(this.NODE_LAYER);
+    if (layer === this.NODE_LAYER) {
+      const out = new Uint8Array(graph.nodeCount);
+      if (sel) for (let i = 0; i < graph.nodeCount; i++) out[i] = sel.has(i) ? 1 : 0;
+      return out;
+    }
+    const directed = this.resolvedStyleCached(graph).directed;
+    const out = new Uint8Array(graph.edgeCount);
+    if (sel) for (let e = 0; e < graph.edgeCount; e++) out[e] = sel.has(graph.source[e]!) || (!directed && sel.has(graph.target[e]!)) ? 1 : 0;
+    return out;
+  }
+
+  /** Shader-highlight columns for the emitted LOD super-edges (#162): `groups` = source tree-node,
+   *  `groups2` = target (undirected incident hover only), `selected` = outgoing-from-a-selected-(sub)tree
+   *  (ancestor-aware). Parallel to `ids` (shared by all link layers). */
+  private linkHighlightColumns(ids: number[], size: number, isSel: ((g: number) => boolean) | null, directed: boolean): { groups: Float32Array; groups2?: Float32Array; selected: Uint8Array } {
+    const n = ids.length;
+    const groups = new Float32Array(n);
+    const groups2 = directed ? undefined : new Float32Array(n);
+    const selected = new Uint8Array(n);
+    for (let k = 0; k < n; k++) {
+      const pair = ids[k]!;
+      const s = Math.floor(pair / size);
+      const t = pair - s * size;
+      groups[k] = s;
+      if (groups2) groups2[k] = t;
+      if (isSel) selected[k] = isSel(s) || (!directed && isSel(t)) ? 1 : 0;
+    }
+    return groups2 ? { groups, groups2, selected } : { groups, selected };
+  }
+
+  // ── Shader-highlight lane hooks (#162) — hover/selection restyle without a geometry rebuild ─────────
+  /** Hover changed: the ring overlay (cheap) + the base-lane hover uniform. No base re-emit. */
+  protected override onLaneHoverChanged(_layer: string): void {
+    this.emitInstancedLane(this.NET_HL_LANE);
+    this.pushLaneHighlight();
+    this.render();
+  }
+  /** Selection changed: LOD re-emits the base (rebuilds the ancestor-aware `selected` flags for the
+   *  current frontier, O(visible); {@link onInstancedLaneEmitted} re-applies uniforms); no-LOD refreshes
+   *  the `selected` flag buffers in place — neither rebuilds the full geometry on a click. */
+  protected override onLaneSelectionChanged(_layer: string): void {
+    if (this.lodReady() && this.lodTree) this.emitInstancedLane(this.NET_LANE);
+    else this.pushLaneHighlight((layer) => this.noLodSelectedFor(layer));
+    this.emitInstancedLane(this.NET_HL_LANE);
+    this.render();
+  }
+  /** A fresh `setInstancedLayer` resets the highlight uniforms to their defaults — re-apply the live ones
+   *  after any base-lane emit (per-frame LOD cut, selection re-emit, layout frame). Uniform-only, no render. */
+  protected override onInstancedLaneEmitted(name: string): void {
+    if (name === this.NET_LANE) this.pushLaneHighlight();
+  }
+
+  /** Ancestor-aware "is this frontier node selected" predicate over the LOD tree (#162) — a node counts
+   *  if it OR any ancestor is in `sel`, so a selected module's expanding children stay highlighted while
+   *  the selection set stays literal. Delegates to the pure {@link ancestorAwareSelected} (tested for the
+   *  O(frontier·depth) bound), with parent pointers from {@link treeParent}. */
+  private makeSelectedPredicate(tree: LODTree, sel: ReadonlySet<string | number>): (g: number) => boolean {
+    return ancestorAwareSelected(this.treeParent(tree), (g) => sel.has(g));
+  }
+
+  /** Parent-pointer array for the LOD tree: the tree's own `parent` (provided-module trees) or one
+   *  derived once from the children CSR (coarsening/spatial trees), cached by tree identity. O(tree size)
+   *  on first need under a selection; not per frame. */
+  private treeParent(tree: LODTree): Int32Array {
+    if (tree.parent) return tree.parent;
+    if (this.derivedParentFor === tree && this.derivedParent) return this.derivedParent;
+    const parent = new Int32Array(tree.size).fill(-1);
+    for (let g = 0; g < tree.size; g++) {
+      for (let p = tree.childOffset[g]!; p < tree.childOffset[g + 1]!; p++) parent[tree.children[p]!] = g;
+    }
+    this.derivedParentFor = tree;
+    this.derivedParent = parent;
+    return parent;
   }
 
   // ── Node-drag (#140) ──────────────────────────────────────────────────────────────────────────
@@ -1119,6 +1288,12 @@ export class Network extends BaseEngine {
     const opts = this.lodOptions!;
     const layers: InstancedLayer[] = [];
     this.linkResolve = null; // no super-edges drawn this emit ⇒ nothing to link-pick (until set below)
+    // Selection/hover highlight (#162) is applied in the SHADER from per-instance columns (below) + lane
+    // uniforms (see onInstancedLaneEmitted) — NO per-instance CPU colour pass here, so a hover/selection
+    // restyle never rebuilds this geometry. Bake only the `selected` flag (ancestor-aware, so an expanded
+    // selected aggregate's children count) + the group ids the shader matches against the hovered id.
+    const sel = this.selectedIds(this.NODE_LAYER);
+    const isSel = sel && sel.size ? this.makeSelectedPredicate(tree, sel) : null;
     // Super-edges first (drawn under the nodes), among the visible frontier only.
     if (opts.superEdges !== false && this.graph!.edgeCount > 0) {
       // One super-edge path for both structural and module trees: gathered from the flow-weighted
@@ -1142,6 +1317,17 @@ export class Network extends BaseEngine {
         },
         visibleWorldRect(this.transform, this.width, this.height),
       );
+      // #162: attach the shader-highlight columns — group = link source id (matched against the hovered
+      // id → recolour that node's outgoing links), group2 = target for undirected incident hover, selected
+      // = outgoing-from-a-selected-(sub)tree flag. The shader recolours/dims from these; no CPU colour
+      // pass. Half-arrows OR lines is present (linkStyle picks one); arrows shares the edge order.
+      const lh = this.linkHighlightColumns(ids, tree.size, isSel, style.directed);
+      for (const d of [halfArrows, lines, arrows]) {
+        if (!d) continue;
+        d.groups = lh.groups;
+        d.selected = lh.selected;
+        if (lh.groups2) d.groups2 = lh.groups2;
+      }
       const pick = this.pickLinksEnabled || undefined; // flag link layers into the GPU pick pass (#141)
       if (halfArrows && halfArrows.count > 0) layers.push({ name: "links", primitive: "half-arrows", pickable: pick, halfArrows, sizeMode: style.sizeMode });
       if (lines && lines.count > 0) layers.push({ name: "links", primitive: "lines", pickable: pick, lines, sizeMode: style.sizeMode });
@@ -1171,6 +1357,15 @@ export class Network extends BaseEngine {
       useTreeColor: !!style.nodeColors, // categorical module colours, propagated to aggregates
       fadeAlpha: this.fadeAlpha ?? undefined,
     });
+    // #162: attach the shader-highlight columns for the frontier nodes — group = tree-node id (the hovered
+    // id matches its own node); selected = ancestor-aware. The shader dims non-highlighted + keeps
+    // selected/hovered from these + the lane uniforms, so a hover/selection never rebuilds these buffers.
+    circles.groups = Float32Array.from(frontier);
+    if (isSel) {
+      const s = new Uint8Array(frontier.length);
+      for (let i = 0; i < frontier.length; i++) s[i] = isSel(frontier[i]!) ? 1 : 0;
+      circles.selected = s;
+    }
     layers.push({ name: "nodes", primitive: "circles", circles, sizeMode: style.sizeMode });
     return layers;
   }
