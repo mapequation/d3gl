@@ -324,10 +324,12 @@ export interface Backend {
    */
   setInstancedLayer?(layer: InstancedLayer): void;
   /**
-   * Update an instanced layer in place when the primitive supports it (circles), or fall
-   * back to destroy+recreate otherwise. Optional — only the WebGL backend implements it;
-   * when absent, `emitInstancedLane` falls back to `setInstancedLayer`. Non-circles
-   * primitives (lines/arrows/half-arrows) always recreate via `setInstancedLayer`.
+   * Update an instanced layer in place when the primitive supports it, or fall back to
+   * destroy+recreate otherwise. Optional — only the WebGL backend implements it; when absent,
+   * `emitInstancedLane` falls back to `setInstancedLayer`. All four primitive types
+   * (circles/lines/arrows/half-arrows) now support in-place `update()` — falling back to
+   * recreate only when a structural property changes (e.g. `samples` or `half` flag on
+   * arrows/lines) or the primitive type itself changes.
    */
   updateInstancedLayer?(layer: InstancedLayer): void;
   /** Remove an instanced primitive layer by name. */
