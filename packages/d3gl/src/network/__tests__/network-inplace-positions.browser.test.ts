@@ -102,6 +102,66 @@ describe("network instanced lane — in-place position update (#179 regression g
     net.destroy();
   });
 
+  it("uploads ONLY the endpoint buffers per position frame — colour/width buffers are NOT re-uploaded", async () => {
+    const N_NODES = 300;
+    const g = ringGraph(N_NODES);
+    const pos = ringPositions(N_NODES);
+
+    const net = network(host(), { width: 300, height: 300, backend: "webgl" });
+    await net.whenReady();
+    net.data(g).style({ nodeRadius: 4, linkStroke: (w: number) => (w % 2 ? "#3b82f6" : "#ef4444"), linkWidth: (w: number) => 1 + w * 0.2 }).layout({ backend: "positions", positions: pos });
+
+    // Reach the links renderer's private GPU buffers and spy their `write` (bufferSubData) methods
+    // AFTER the initial emit, so we count only per-position-frame uploads.
+    const lines = (net as unknown as { handle: { backend: { instanced: Map<string, {
+      source: { write(a: ArrayBufferView): void };
+      target: { write(a: ArrayBufferView): void };
+      widthBuf: { write(a: ArrayBufferView): void };
+      color: { write(a: ArrayBufferView): void };
+    }> } } }).handle.backend.instanced.get("links")!;
+    const srcSpy = vi.spyOn(lines.source, "write");
+    const tgtSpy = vi.spyOn(lines.target, "write");
+    const widthSpy = vi.spyOn(lines.widthBuf, "write");
+    const colorSpy = vi.spyOn(lines.color, "write");
+
+    const N_FRAMES = 12;
+    for (let frame = 0; frame < N_FRAMES; frame++) tickPositions(net, N_NODES, frame);
+
+    // Endpoints upload every frame (freshly allocated each rebuild → new reference).
+    expect(srcSpy.mock.calls.length).toBe(N_FRAMES);
+    expect(tgtSpy.mock.calls.length).toBe(N_FRAMES);
+    // Style-derived buffers are reference-stable across position frames → skipped (0 re-uploads).
+    expect(widthSpy.mock.calls.length).toBe(0);
+    expect(colorSpy.mock.calls.length).toBe(0);
+
+    net.destroy();
+  });
+
+  it("a style() change DOES re-upload the colour buffer (reference-skip invariant holds both ways)", async () => {
+    const N_NODES = 200;
+    const g = ringGraph(N_NODES);
+    const pos = ringPositions(N_NODES);
+
+    const net = network(host(), { width: 300, height: 300, backend: "webgl" });
+    await net.whenReady();
+    net.data(g).style({ nodeRadius: 4, linkStroke: (w: number) => (w % 2 ? "#3b82f6" : "#ef4444"), linkWidth: 1 }).layout({ backend: "positions", positions: pos });
+
+    const lines = (net as unknown as { handle: { backend: { instanced: Map<string, {
+      color: { write(a: ArrayBufferView): void };
+    }> } } }).handle.backend.instanced.get("links")!;
+    const colorSpy = vi.spyOn(lines.color, "write");
+
+    // Position frames — no colour re-upload.
+    for (let frame = 0; frame < 6; frame++) tickPositions(net, N_NODES, frame);
+    expect(colorSpy.mock.calls.length).toBe(0);
+
+    // A style() change produces a FRESH colour array (new reference) → the buffer re-uploads.
+    net.style({ linkStroke: (w: number) => (w % 2 ? "#22c55e" : "#a855f7") });
+    expect(colorSpy.mock.calls.length).toBeGreaterThan(0); // colour buffer re-uploaded with the new colours
+
+    net.destroy();
+  });
+
   it("lines/arrows renderers are NOT destroyed+recreated per position frame (no-LOD, undirected)", async () => {
     const N_NODES = 500;
     const g = ringGraph(N_NODES);

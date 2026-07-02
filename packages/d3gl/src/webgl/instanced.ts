@@ -125,6 +125,22 @@ const BLEND = {
  */
 const NO_BLEND = { blend: false } as const;
 
+/**
+ * Reference-identity upload skip (#179): `bufferSubData` `arr` into `buffer` ONLY when it is a
+ * *different array object* from `last`. Returns the reference to store as the new `last`.
+ *
+ * The network's style cache reuses the SAME colour/width/radius array objects across position-only
+ * layout frames (reference-stable ⟺ content-stable — the cached arrays are never mutated in place),
+ * while the endpoint/position arrays are freshly allocated each frame (new reference). So a
+ * same-reference style array skips its redundant per-frame upload, and a fresh position array always
+ * uploads. On a style change the cache produces a *new* array (new reference), which uploads. This is
+ * safe ONLY under that invariant — the caller must never mutate a retained array in place.
+ */
+function writeIfChanged<T extends ArrayBufferView>(buffer: Buffer, arr: T, last: T | undefined): T {
+  if (arr !== last) buffer.write(arr);
+  return arr;
+}
+
 export class InstancedCircles {
   count: number;
   /** Current buffer capacity (in instances). Used by update() to decide grow vs. sub-update. */
@@ -295,6 +311,10 @@ export class InstancedLines {
   private _capacity: number;
   /** Vertex samples (M) baked into the corner template buffer — if data.samples changes, caller must recreate. */
   private _samples: number;
+  /** Last-uploaded style-derived array refs (#179) — a sub-update skips a buffer whose ref is unchanged. */
+  private _lastWidths?: Float32Array;
+  private _lastColors?: Uint8Array;
+  private _lastBends?: Float32Array;
   private model: Model;
   /** Pick-pass twin (#141): same VS/geometry, PICK_FS, no blend. Built only when `pick` is set. */
   private pickModel?: Model;
@@ -319,6 +339,9 @@ export class InstancedLines {
     this.color = device.createBuffer({ data: data.colors });
     // Per-instance bend (#104 N6c), optional: absent ⇒ zero ⇒ straight (control on the chord).
     this.bend = device.createBuffer({ data: data.bends ?? new Float32Array(data.count) });
+    this._lastWidths = data.widths;
+    this._lastColors = data.colors;
+    this._lastBends = data.bends;
     this.hl = new HighlightBuffers(device, data); // #162 shader highlight (a_group / a_selected)
     this.uniforms = {
       u_transform: clipFromView({ k: 1, x: 0, y: 0 }, width || 1, height || 1),
@@ -412,6 +435,10 @@ export class InstancedLines {
       this.widthBuf = device.createBuffer({ data: data.widths });
       this.color = device.createBuffer({ data: data.colors });
       this.bend = device.createBuffer({ data: data.bends ?? new Float32Array(data.count) });
+      // Fresh buffers were created from these arrays — record the refs so a later sub-update skips them.
+      this._lastWidths = data.widths;
+      this._lastColors = data.colors;
+      this._lastBends = data.bends;
       this.model.setAttributes({
         a_source: this.source,
         a_target: this.target,
@@ -431,12 +458,13 @@ export class InstancedLines {
         });
       }
     } else {
-      // Sub-update: bufferSubData the per-instance data in place.
+      // Sub-update: endpoints are freshly allocated each frame ⇒ always upload; style-derived buffers
+      // (widths/colours/bends) skip when their array reference is unchanged (the position-only fast path, #179).
       this.source.write(data.sources);
       this.target.write(data.targets);
-      this.widthBuf.write(data.widths);
-      this.color.write(data.colors);
-      if (data.bends) this.bend.write(data.bends);
+      this._lastWidths = writeIfChanged(this.widthBuf, data.widths, this._lastWidths);
+      this._lastColors = writeIfChanged(this.color, data.colors, this._lastColors);
+      if (data.bends) this._lastBends = writeIfChanged(this.bend, data.bends, this._lastBends);
       this.hl.write(data);
     }
     this.count = data.count;
@@ -476,6 +504,11 @@ export class InstancedArrows {
   private _capacity: number;
   /** Whether the vertex template was built for the "half" arrowhead shape. If this changes, caller must recreate. */
   private _half: boolean;
+  /** Last-uploaded style-derived array refs (#179) — a sub-update skips a buffer whose ref is unchanged. */
+  private _lastSizes?: Float32Array;
+  private _lastRadii?: Float32Array;
+  private _lastColors?: Uint8Array;
+  private _lastBends?: Float32Array;
   private model: Model;
   /** Pick-pass twin (#141): same VS/geometry, PICK_FS, no blend. Built only when `pick` is set. */
   private pickModel?: Model;
@@ -501,6 +534,10 @@ export class InstancedArrows {
     this.color = device.createBuffer({ data: data.colors });
     // Per-instance bend (#104 N6c), optional: absent ⇒ zero ⇒ oriented along the chord, as before.
     this.bend = device.createBuffer({ data: data.bends ?? new Float32Array(data.count) });
+    this._lastSizes = data.sizes;
+    this._lastRadii = data.radii;
+    this._lastColors = data.colors;
+    this._lastBends = data.bends;
     this.hl = new HighlightBuffers(device, data); // #162 shader highlight (a_group / a_selected)
     this.uniforms = {
       u_transform: clipFromView({ k: 1, x: 0, y: 0 }, width || 1, height || 1),
@@ -591,6 +628,11 @@ export class InstancedArrows {
       this.radius = device.createBuffer({ data: data.radii });
       this.color = device.createBuffer({ data: data.colors });
       this.bend = device.createBuffer({ data: data.bends ?? new Float32Array(data.count) });
+      // Fresh buffers were created from these arrays — record the refs so a later sub-update skips them.
+      this._lastSizes = data.sizes;
+      this._lastRadii = data.radii;
+      this._lastColors = data.colors;
+      this._lastBends = data.bends;
       this.model.setAttributes({
         a_source: this.source,
         a_target: this.target,
@@ -612,13 +654,14 @@ export class InstancedArrows {
         });
       }
     } else {
-      // Sub-update: bufferSubData the per-instance data in place.
+      // Sub-update: endpoints upload every frame (freshly allocated); style-derived buffers (sizes/radii/
+      // colours/bends) skip when their array reference is unchanged (the position-only fast path, #179).
       this.source.write(data.sources);
       this.target.write(data.targets);
-      this.size.write(data.sizes);
-      this.radius.write(data.radii);
-      this.color.write(data.colors);
-      if (data.bends) this.bend.write(data.bends);
+      this._lastSizes = writeIfChanged(this.size, data.sizes, this._lastSizes);
+      this._lastRadii = writeIfChanged(this.radius, data.radii, this._lastRadii);
+      this._lastColors = writeIfChanged(this.color, data.colors, this._lastColors);
+      if (data.bends) this._lastBends = writeIfChanged(this.bend, data.bends, this._lastBends);
       this.hl.write(data);
     }
     this.count = data.count;
@@ -680,6 +723,11 @@ export class InstancedHalfArrows {
   private _capacity: number;
   /** Vertex samples (M) baked into the kind template buffer — if data.samples changes, caller must recreate. */
   private _samples: number;
+  /** Last-uploaded style-derived array refs (#179) — a sub-update skips a buffer whose ref is unchanged. */
+  private _lastRadii?: Float32Array;
+  private _lastWidths?: Float32Array;
+  private _lastBends?: Float32Array;
+  private _lastColors?: Uint8Array;
   private vertexCount: number;
   private model: Model;
   /** Pick-pass twin (#141): same VS/geometry, PICK_FS, no blend. Built only when `pick` is set. */
@@ -708,6 +756,10 @@ export class InstancedHalfArrows {
     this.widths = device.createBuffer({ data: data.widths });
     this.bend = device.createBuffer({ data: data.bends });
     this.color = device.createBuffer({ data: data.colors });
+    this._lastRadii = data.radii;
+    this._lastWidths = data.widths;
+    this._lastBends = data.bends;
+    this._lastColors = data.colors;
     this.hl = new HighlightBuffers(device, data); // #162 shader highlight (a_group / a_selected)
     this.uniforms = {
       u_transform: clipFromView({ k: 1, x: 0, y: 0 }, width || 1, height || 1),
@@ -799,6 +851,11 @@ export class InstancedHalfArrows {
       this.widths = device.createBuffer({ data: data.widths });
       this.bend = device.createBuffer({ data: data.bends });
       this.color = device.createBuffer({ data: data.colors });
+      // Fresh buffers were created from these arrays — record the refs so a later sub-update skips them.
+      this._lastRadii = data.radii;
+      this._lastWidths = data.widths;
+      this._lastBends = data.bends;
+      this._lastColors = data.colors;
       this.model.setAttributes({
         a_p0: this.source,
         a_p1: this.target,
@@ -820,13 +877,14 @@ export class InstancedHalfArrows {
         });
       }
     } else {
-      // Sub-update: bufferSubData the per-instance data in place.
+      // Sub-update: endpoints upload every frame (freshly allocated); style-derived buffers (radii/widths/
+      // bends/colours) skip when their array reference is unchanged (the position-only fast path, #179).
       this.source.write(data.sources);
       this.target.write(data.targets);
-      this.radii.write(data.radii);
-      this.widths.write(data.widths);
-      this.bend.write(data.bends);
-      this.color.write(data.colors);
+      this._lastRadii = writeIfChanged(this.radii, data.radii, this._lastRadii);
+      this._lastWidths = writeIfChanged(this.widths, data.widths, this._lastWidths);
+      this._lastBends = writeIfChanged(this.bend, data.bends, this._lastBends);
+      this._lastColors = writeIfChanged(this.color, data.colors, this._lastColors);
       this.hl.write(data);
     }
     this.count = data.count;
