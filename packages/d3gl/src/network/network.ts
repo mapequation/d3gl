@@ -1588,9 +1588,10 @@ export class Network extends BaseEngine {
    *
    * - **force**: a main-thread {@link ForceLayout} pinned to the held set ticks in an rAF loop,
    *   reflowing neighbours; on release it re-cools for a short tail of ticks, then stops.
-   * - **worker**: the worker pins + reflows the rest off-thread ({@link WorkerLayoutHandle.pin}); the
-   *   main thread writes the held positions every move (zero-lag) and re-pins them over each streamed
-   *   frame ({@link dragReapply}, copy mode). Released via {@link WorkerLayoutHandle.unpin}.
+   * - **worker / gpu**: the backend pins + reflows the rest (worker off-thread, gpu on the GPU) via
+   *   {@link WorkerLayoutHandle.pin}; the main thread writes the held positions every move (zero-lag)
+   *   and re-pins them over each streamed frame ({@link dragReapply}, copy mode). Released via
+   *   {@link WorkerLayoutHandle.unpin}. On the gpu backend the physical-view state layout reheats too.
    * - **positions** (or a worker fallback with no live handle): no sim — the held set just translates.
    */
   protected override beginNodeDrag(hit: HoverHit, sx: number, sy: number): NodeDragSession | null {
@@ -1623,10 +1624,13 @@ export class Network extends BaseEngine {
       dy = (my - t.y) / t.k - worldStartY;
     };
 
-    // State-network mode (#171) has no live sim — its positions are a derived one-shot layout (physical
-    // force + rosette), so a drag TRANSLATES the grabbed node (like the `positions` backend / the
-    // map-of-modules example) rather than reheating a fresh sim that would fight the derived placement.
-    const backend = this.stateData ? "positions" : this.layoutOpts.backend;
+    // State-network state/both views (#171) render a DERIVED rosette, not a live sim over this.graph,
+    // so a drag there TRANSLATES the grabbed node rather than reheating a fresh sim that would fight
+    // the derived placement. The PHYSICAL view, however, IS the live physical layout (this.graph ===
+    // sg.physical, laid out by layoutHandle) — so it reheats like a normal network (#183): the pinned
+    // physical node holds while the rest reflows, and scheduleLayoutRepaint re-derives the rosette
+    // (state/both) around it. State-view reheat over the deterministic rosette is out of scope (#189).
+    const backend = this.stateData && this.activeView !== "physical" ? "positions" : this.layoutOpts.backend;
     const handle = this.layoutHandle;
 
     // force: own rAF loop ticks the pinned sim + repaints, so neighbours follow; re-cools on release.
@@ -1653,8 +1657,9 @@ export class Network extends BaseEngine {
       };
     }
 
-    // worker: the worker reflows the rest off-thread while the main thread holds the grabbed set crisply.
-    if (backend === "worker" && handle) {
+    // worker / gpu: the layout backend reflows the rest (worker off-thread, gpu on the GPU) while the
+    // main thread holds the grabbed set crisply. Both expose the same pin/unpin handle (#140, #183).
+    if ((backend === "worker" || backend === "gpu") && handle) {
       applyHeld();
       handle.pin(heldIds, heldPos);
       this.dragReapply = applyHeld;

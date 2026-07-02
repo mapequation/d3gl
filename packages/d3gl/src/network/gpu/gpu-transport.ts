@@ -3,8 +3,10 @@
  * `network.ts` treats both symmetrically. Falls back to the worker path when the GPU path is
  * unavailable (no device, non-WebGL backend, SSR).
  *
- * Milestone A (N8.1): plain disc seed + streaming rAF loop. Multilevel GPU seeding (N8.2) and
- * drag/reheat parity (N8.5) are later milestones; pin/unpin are no-ops here.
+ * Milestone A (N8.1): plain disc seed + streaming rAF loop. N8.5 (#183) adds drag/reheat parity:
+ * on convergence the loop goes **idle** (keeps the {@link GpuForceLayout} alive, doesn't destroy it),
+ * and `pin`/`unpin` hold nodes + resume the loop so the rest reflows — mirroring the CPU worker
+ * (layout-worker.ts). Multilevel GPU seeding (N8.2) is still a later milestone.
  */
 import type { Device } from "@luma.gl/core";
 import { gpuLayoutSupported } from "./device-caps.js";
@@ -14,6 +16,13 @@ import { seedPositions, DEFAULT_FORCE } from "../force.js";
 import type { NetworkGraph } from "../graph.js";
 
 const TARGET_FRAMES = 60;
+
+/** Ticks per streamed frame while reheating (drag / cool) — small batches keep the stream responsive
+ *  (mirrors the worker's REHEAT_BATCH in layout-worker.ts). */
+const REHEAT_BATCH = 3;
+/** Tail of refinement ticks after a drag releases, so the layout re-cools instead of freezing
+ *  mid-reflow (mirrors the worker's COOL_TICKS). */
+const COOL_TICKS = 120;
 
 /**
  * Start a GPU-accelerated layout run. Returns a {@link WorkerLayoutHandle}-shaped object so the
@@ -139,11 +148,21 @@ function startGpuLayoutSync(
 
   let resolveSettled!: () => void;
   const settled = new Promise<void>((r) => (resolveSettled = r));
+  // `settled` resolves once, at first convergence; the layout then stays ALIVE (idle) so a node-drag
+  // can reheat it (#183). `stop()` is the real teardown; it also settles if we never converged.
+  let settledOnce = false;
+  const settle = (): void => { if (settledOnce) return; settledOnce = true; resolveSettled(); };
 
   let stopped = false;
   let rafHandle = 0;
-  let done = false;
   let ticksDone = 0;
+  // Loop activity, mirroring the worker (layout-worker.ts): `run` (initial fixed-iteration
+  // convergence), `drag` (held nodes pinned, reflow indefinitely), `cool` (post-release settling
+  // tail), `idle` (at rest — loop paused, layout kept alive for a later reheat).
+  let mode: "idle" | "run" | "drag" | "cool" = iterations > 0 ? "run" : "idle";
+  let looping = false;
+  let coolLeft = 0;
+  let dragging = false;
 
   const stop = (): void => {
     if (stopped) return;
@@ -153,41 +172,68 @@ function startGpuLayoutSync(
       rafHandle = 0;
     }
     layout.destroy();
-    resolveSettled();
+    settle();
   };
 
   const step = (): void => {
-    if (stopped || done) return;
+    rafHandle = 0;
+    if (stopped) { looping = false; return; }
 
-    const remaining = iterations - ticksDone;
-    const batch = Math.min(frameEvery, remaining);
+    // The initial run clamps its last batch to the iterations remaining; reheat (drag/cool)
+    // streams small fixed batches for responsiveness.
+    const batch = mode === "run" ? Math.min(frameEvery, iterations - ticksDone) : REHEAT_BATCH;
     layout.runFrame(batch);
     ticksDone += batch;
     layout.readPositions(graph.positions);
     onFrame();
 
-    if (ticksDone >= iterations) {
-      done = true;
-      // Layout converged: resolve settled, then idle (drag parity is N8.5).
-      resolveSettled();
-      layout.destroy();
-      return;
+    if (mode === "run") {
+      if (ticksDone >= iterations) { settle(); mode = dragging ? "drag" : "idle"; } // converged → keep reflowing if a drag is live
+    } else if (mode === "cool") {
+      coolLeft -= batch;
+      if (coolLeft <= 0) mode = "idle";
     }
 
-    // Schedule next batch. gpuLayoutSupported already ensured we're in a browser
-    // context where requestAnimationFrame is available.
+    if (mode === "idle") { looping = false; settle(); return; } // reached rest — pause; layout stays alive
+    // Schedule next batch. gpuLayoutSupported already ensured requestAnimationFrame exists.
     rafHandle = requestAnimationFrame(step);
   };
 
-  // Kick off on the next frame so the caller can set up state before the first onFrame fires.
-  rafHandle = requestAnimationFrame(step);
+  // Resume the rAF loop if it isn't already running and there's work to do. Re-entrant-safe via
+  // `looping` so pin/unpin can't spin up a second loop.
+  const resume = (): void => {
+    if (looping || stopped || mode === "idle") return;
+    looping = true;
+    rafHandle = requestAnimationFrame(step);
+  };
+
+  // Kick off the initial run (or, with no iterations, paint the seed + settle immediately).
+  if (mode === "run") resume();
+  else { onFrame(); settle(); }
 
   return {
     shared: false,
     transport: "gpu",
     settled,
     stop,
-    pin() {}, // drag parity is N8.5
-    unpin() {},
+    /** Hold `ids` (writing their `positions` into the position texture) and reheat — the rest reflows
+     *  around them. Resumes the loop in "drag" mode (or lets a still-running initial run transition to
+     *  it on convergence). Mirrors the worker's `pin`. */
+    pin(ids: Uint32Array, positions?: Float32Array) {
+      if (stopped) return;
+      layout.setPinned(ids);
+      if (positions) layout.setHeldPositions(ids, positions);
+      dragging = true;
+      if (mode === "idle" || mode === "cool") mode = "drag";
+      resume();
+    },
+    /** Release every pin and re-cool over a short tail, then idle. Mirrors the worker's `unpin`. */
+    unpin() {
+      if (stopped) return;
+      layout.setPinned(null);
+      dragging = false;
+      if (mode === "drag") { mode = "cool"; coolLeft = COOL_TICKS; }
+      resume();
+    },
   };
 }

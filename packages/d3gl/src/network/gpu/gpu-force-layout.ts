@@ -124,6 +124,21 @@ export class GpuForceLayout {
    */
   private readonly readFbos: readonly [Framebuffer, Framebuffer];
 
+  /**
+   * Per-node pinned-flag texture (r8unorm, one byte per node; 255 = held, 0 = free) — the GPU
+   * mirror of {@link ForceLayout}'s `pinned` array (#183 drag reheat). Sampled by the integrate
+   * pass: a held node is skipped by integration (held in place, velocity zeroed) but still acts
+   * on its neighbours through the force passes. Pre-created zeroed in the constructor and updated
+   * by {@link setPinned} via sub-uploads (no per-tick / per-move allocation).
+   */
+  private readonly pinnedTex: Texture;
+  /** The currently-pinned ids (so {@link setPinned} can clear them before applying the next set). */
+  private pinnedIds: Uint32Array | null = null;
+  /** Scratch for a single-texel flag sub-upload (r8unorm: 255 = held, 0 = free). */
+  private readonly flagScratch = new Uint8Array(1);
+  /** Scratch for a single-texel (x, y) position sub-upload into the read-side position texture. */
+  private readonly heldScratch = new Float32Array(2);
+
   /** CSR offset texture (r32uint): offsets[0..nodeCount] packed into an atlas. */
   private readonly offsetsTex: Texture;
   /** CSR neighbors texture (r32uint): the flat neighbor list packed into an atlas. */
@@ -203,6 +218,17 @@ export class GpuForceLayout {
       width,
       height,
       colorAttachments: [this.forceTex],
+    });
+
+    // Per-node pinned-flag texture (#183), seeded all-zero (nothing held). Updated by setPinned
+    // via 1×1 writeData sub-uploads — never reallocated, so the no-per-tick-alloc spies stay green.
+    this.pinnedTex = device.createTexture({
+      width,
+      height,
+      format: "r8unorm",
+      data: new Uint8Array(width * height),
+      mipLevels: 1,
+      sampler: { minFilter: "nearest", magFilter: "nearest" },
     });
 
     // Pre-create BOTH MRT framebuffer configurations once. fbos[0] wraps the
@@ -369,7 +395,7 @@ export class GpuForceLayout {
       clearColor: false,
     });
 
-    this.integratePass.run(renderPass, this.pos.readTex, this.vel.readTex, this.forceTex, {
+    this.integratePass.run(renderPass, this.pos.readTex, this.vel.readTex, this.forceTex, this.pinnedTex, {
       count: this.count,
       width: this.width,
       alpha: this.params.alpha,
@@ -391,6 +417,44 @@ export class GpuForceLayout {
   }
 
   /**
+   * Set the held (pinned) node set for an interactive drag (#183), replacing any previous one — the
+   * GPU mirror of {@link ForceLayout.setPinned}. Held nodes are skipped by integration (see the
+   * integrate FS) so the drag session can keep them under the cursor while the rest reflows. Pass
+   * `null` (or an empty array) to release every pin. Sub-uploads only the changed flag texels
+   * (O(prev) clear + O(new) set — the held set is the dragged nodes), never reallocating the texture.
+   */
+  setPinned(ids: Uint32Array | null): void {
+    const prev = this.pinnedIds;
+    if (prev) for (let k = 0; k < prev.length; k++) this.writeFlag(prev[k]!, false);
+    this.pinnedIds = ids && ids.length > 0 ? ids : null;
+    const next = this.pinnedIds;
+    if (next) for (let k = 0; k < next.length; k++) this.writeFlag(next[k]!, true);
+  }
+
+  /**
+   * Write the held nodes' positions into the current read-side position texture (#183) so they sit
+   * exactly where the drag put them; the integrate pass then copies each held texel forward each tick
+   * (o_pos = p) so it stays put while neighbours reflow. `ids`/`positions` are parallel: node `ids[k]`
+   * gets `(positions[2k], positions[2k+1])`. Sub-uploads one texel per held node (O(held)).
+   */
+  setHeldPositions(ids: Uint32Array, positions: Float32Array): void {
+    for (let k = 0; k < ids.length; k++) {
+      const id = ids[k]!;
+      if (id < 0 || id >= this.count) continue;
+      this.heldScratch[0] = positions[k * 2]!;
+      this.heldScratch[1] = positions[k * 2 + 1]!;
+      this.pos.readTex.writeData(this.heldScratch, { x: id % this.width, y: (id / this.width) | 0, width: 1, height: 1 });
+    }
+  }
+
+  /** Set one node's pinned-flag texel (255 = held, 0 = free) via a 1×1 sub-upload. */
+  private writeFlag(id: number, on: boolean): void {
+    if (id < 0 || id >= this.count) return;
+    this.flagScratch[0] = on ? 255 : 0;
+    this.pinnedTex.writeData(this.flagScratch, { x: id % this.width, y: (id / this.width) | 0, width: 1, height: 1 });
+  }
+
+  /**
    * Read the current node positions back to the CPU.
    * Writes `count * 2` floats into `out` starting at index 0.
    */
@@ -405,6 +469,7 @@ export class GpuForceLayout {
     this.vel.destroy();
     this.forceTex.destroy();
     this.forceFbo.destroy();
+    this.pinnedTex.destroy();
     this.sumTex.destroy();
     this.sumFbo.destroy();
     this.fbos[0].destroy();

@@ -21,6 +21,12 @@ void main() { gl_Position = vec4(a_clip, 0.0, 1.0); }
  *
  * With all force strengths set to 0 the force texture is all-zeros, so v and p
  * are unchanged — the zero-force invariant the test relies on.
+ *
+ * Pinned nodes (#183 GPU drag reheat) mirror force.ts `setPinned`: a per-node flag
+ * texture (`u_pinned`, 0/1) marks the held set. A pinned node is **skipped by
+ * integration** — its position is owned externally (the drag session writes the cursor
+ * position into `u_pos` each move) and its velocity is zeroed — but it still contributed
+ * to the repulsion/attraction/centering passes above as a fixed obstacle / spring anchor.
  */
 const FS = /* glsl */ `\
 #version 300 es
@@ -28,6 +34,7 @@ precision highp float;
 uniform sampler2D u_pos;
 uniform sampler2D u_vel;
 uniform sampler2D u_force;
+uniform sampler2D u_pinned;
 uniform int u_count;
 uniform int u_width;
 uniform float u_alpha;
@@ -41,6 +48,9 @@ void main() {
   if (id >= u_count) { o_pos = vec2(0.0); o_vel = vec2(0.0); return; }
   vec2 p = texelFetch(u_pos,   c, 0).xy;
   vec2 v = texelFetch(u_vel,   c, 0).xy;
+  // Held node (#183): keep it exactly where the drag put it, drop its velocity so it
+  // doesn't lurch on release. It still repelled + anchored springs via the force passes.
+  if (texelFetch(u_pinned, c, 0).r > 0.5) { o_pos = p; o_vel = vec2(0.0); return; }
   vec2 f = texelFetch(u_force, c, 0).xy;
   vec2 s = clamp((v + f * u_alpha) * u_damping, vec2(-u_maxStep), vec2(u_maxStep));
   o_vel = s;
@@ -101,6 +111,7 @@ export class IntegratePass {
     posTex: Texture,
     velTex: Texture,
     forceTex: Texture,
+    pinnedTex: Texture,
     u: IntegrateUniforms,
   ): void {
     // Mutate the shared uniforms object in-place — Model reads this.props.uniforms
@@ -111,8 +122,9 @@ export class IntegratePass {
     this.uniforms["u_damping"] = u.damping;
     this.uniforms["u_maxStep"] = u.maxStep;
 
-    // Update sampler bindings for this tick's read textures.
-    this.model.setBindings({ u_pos: posTex, u_vel: velTex, u_force: forceTex });
+    // Update sampler bindings for this tick's read textures. `u_pinned` is the per-node
+    // held-flag texture (all-zero when nothing is pinned → normal integration everywhere).
+    this.model.setBindings({ u_pos: posTex, u_vel: velTex, u_force: forceTex, u_pinned: pinnedTex });
 
     this.model.draw(pass);
   }
