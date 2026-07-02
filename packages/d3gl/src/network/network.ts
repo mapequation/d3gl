@@ -1,11 +1,15 @@
 import { BaseEngine, type BaseEngineOptions, type HoverHit, type InteractiveLayerOptions, type LaneInteractive, type NodeDragSession } from "../map/base-engine.js";
-import { networkLayers, frontierCircles, frontierHalos, superEdges, emitNodes, emitLinks, emitArrows, emitHalfLinks, traceFrontierFills, traceFrontierBorders, traceFrontierHalos, traceSuperHalfArrows, traceSuperLines, traceSuperArrows, rgbaCss, pickNodes, regionNodes, resolveNodeRadii, resolveNodeRadiusAggregate, resolveImportance, resolveFlowBorder, resolveNodeColors, resolveLinkWidthOf, resolveLinkColorOf, resolveLinkStrokeOf, flowBorderInnerRadii, type ResolvedNetworkStyle, type NodeRadiusSpec, type ImportanceSpec, type FlowBorderSpec, type ConstBorder, type LinkWidthSpec, type LinkColorSpec, type LinkStyle } from "./glyphs.js";
+import { networkLayers, frontierCircles, frontierHalos, superEdges, emitNodes, emitLinks, emitArrows, emitHalfLinks, traceFrontierFills, traceFrontierBorders, traceFrontierHalos, traceSuperHalfArrows, traceSuperLines, traceSuperArrows, physicalPieInstances, tracePieWedges, rgbaCss, pickNodes, regionNodes, resolveNodeRadii, resolveNodeRadiusAggregate, resolveImportance, resolveFlowBorder, resolveNodeColors, resolveLinkWidthOf, resolveLinkColorOf, resolveLinkStrokeOf, flowBorderInnerRadii, type ResolvedNetworkStyle, type NodeRadiusSpec, type ImportanceSpec, type FlowBorderSpec, type ConstBorder, type LinkWidthSpec, type LinkColorSpec, type LinkStyle } from "./glyphs.js";
 import { rgb } from "d3-color";
 import { ForceLayout, seedPositions, type ForceParams } from "./force.js";
 import { multilevelLayout, type CoarsenOptions } from "./coarsen.js";
 import { buildLODTree, buildSpatialLODTree, computeLODGeometry, computeLODStyle, cut, declutterFrontier, pickFrontier, regionFrontier, visibleWorldRect, leavesUnder, ancestorAwareSelected, type LODTree, type SpatialLODOptions } from "./lod.js";
 import { LabelLayer, placeLabels, type LabelAnchor } from "../labels/label-layer.js";
 import { buildModuleLODTree, type ModuleNode } from "./modules.js";
+import { moduleColors, type ModulePathNode, type ModuleColorOptions } from "./module-colors.js";
+import { physicalPieWedges, type PhysicalPieWedges, type PieWedgeOptions } from "./pie.js";
+import { rosettePositions } from "./rosette.js";
+import type { StateNetworkGraph } from "./state-graph.js";
 import { startWorkerLayout, type WorkerLayoutHandle } from "./worker-transport.js";
 import type { NetworkGraph } from "./graph.js";
 import type { InstancedLayer } from "../core/index.js";
@@ -272,6 +276,26 @@ export interface NetworkLODOptions {
   spatial?: SpatialLODOptions;
 }
 
+/**
+ * Options for {@link Network.stateNetwork} (#171). The engine ingests a state network + a per-**state-node**
+ * module assignment, derives the physical network's overlapping-module pie wedges + module colours, and lets
+ * you toggle the state ↔ physical view with {@link Network.view}.
+ */
+export interface StateNetworkOptions {
+  /** Per-**state-node** module records (Infomap's `nodes` shape; `id` = state-node index). Drives module
+   *  colours (both views) and the physical view's overlapping-module pie wedges. */
+  modules: ArrayLike<ModulePathNode>;
+  /** Pie-wedge derivation options (grouping level, flow vs count sizing). @see {@link physicalPieWedges} */
+  pie?: PieWedgeOptions;
+  /** Module colour scheme (shared by node colours and pie wedges). @see {@link moduleColors} */
+  color?: ModuleColorOptions;
+  /** Which view to show first. Default `"physical"` (so the overlapping-module pie glyphs are visible). */
+  view?: "state" | "physical";
+  /** Rosette radius (world units) for state-node placement around each physical node. Default: auto —
+   *  ~0.35× the physical layout's characteristic node spacing. @see {@link rosettePositions} */
+  rosetteRadius?: number;
+}
+
 const DEFAULT_NODE_RADIUS = 4;
 const DEFAULT_NODE_FILL = "#4878d0";
 const DEFAULT_LINK_WIDTH = 1;
@@ -280,6 +304,22 @@ const LAYER_NAMES = ["links", "arrows", "node-halos", "nodes"] as const;
 /** Base-lane layers the shader highlight (#162) drives — nodes + links (not the aggregate halos, which
  *  carry no group/selected and so render un-dimmed). */
 const HL_LAYERS = ["nodes", "links", "arrows"] as const;
+/** Characteristic node spacing of a laid-out graph: the bounding-box diagonal ÷ √count. A rough scale
+ *  for auto-sizing the state-network rosette radius (#171) relative to the physical layout. */
+function physicalSpacing(positions: Float32Array, count: number): number {
+  if (count <= 1) return 1;
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+  for (let p = 0; p < count; p++) {
+    const x = positions[2 * p]!, y = positions[2 * p + 1]!;
+    if (x < minX) minX = x;
+    if (x > maxX) maxX = x;
+    if (y < minY) minY = y;
+    if (y > maxY) maxY = y;
+  }
+  const span = Math.hypot(maxX - minX, maxY - minY);
+  return Math.max(span / Math.sqrt(count), 1);
+}
+
 /** `[0, 1, …, n-1]` as float32 — the no-LOD node layer's `a_group` (instance i is node i). */
 function identityFloats(n: number): Float32Array {
   const out = new Float32Array(n);
@@ -387,6 +427,23 @@ export class Network extends BaseEngine {
    *  paints — in copy mode the worker's streamed snapshot would otherwise clobber the held nodes the
    *  main thread is holding under the cursor. Null when no drag is in flight. */
   private dragReapply: (() => void) | null = null;
+  /** State-network mode (#171): the ingested state network, or null for a plain graph. When set, the
+   *  engine renders one of its two views ({@link activeView}) and {@link layout} lays out the physical
+   *  graph + derives rosette state positions. */
+  private stateData: StateNetworkGraph | null = null;
+  /** The active view of the state network (#171). Physical shows aggregated links + overlapping-module
+   *  pie glyphs; state shows state nodes on rosette rings. Ignored unless {@link stateData} is set. */
+  private activeView: "state" | "physical" = "physical";
+  /** Per-physical-node overlapping-module pie wedges (#171); the physical view draws these as pies. */
+  private pieWedges: PhysicalPieWedges | null = null;
+  /** Per-state-node CSS colours (module hue), for the state view's node fill. */
+  private stateColors: string[] | null = null;
+  /** Per-physical-node CSS colours (its dominant module's hue), for the physical view's disc fill. */
+  private physicalColors: string[] | null = null;
+  /** Rosette radius for state-node placement; null = auto from the physical layout scale. */
+  private rosetteRadius: number | null = null;
+  /** Registry key + layer name for the physical-view pie glyphs (drawn on top of the node discs). */
+  private readonly PIE_LAYER = "pie";
 
   constructor(host: HTMLElement, opts: NetworkOptions = {}) {
     super(host, opts);
@@ -395,8 +452,20 @@ export class Network extends BaseEngine {
     void this.whenReady().then(() => this.rebuild());
   }
 
-  /** Set the graph to render (built via `buildGraph` / `parseEdgeList`). */
+  /** Set the graph to render (built via `buildGraph` / `parseEdgeList`). Leaves any state-network mode
+   *  ({@link stateNetwork}) — a plain graph replaces it. */
   data(graph: NetworkGraph): this {
+    this.stateData = null;
+    this.pieWedges = null;
+    this.stateColors = null;
+    this.physicalColors = null;
+    return this.setActiveGraph(graph);
+  }
+
+  /** Point the engine at `graph` and drop the per-graph caches (LOD tree, resolved style, parent cache).
+   *  Shared by {@link data} (plain graph) and {@link applyView} (state-network view switch); unlike
+   *  `data` it does NOT clear the state-network mode. */
+  private setActiveGraph(graph: NetworkGraph): this {
     this.stopLayout(); // any worker layout is tied to the previous graph's buffers
     this.graph = graph;
     // New topology + position buffer: drop the retained LOD tree and resolved-style cache.
@@ -408,6 +477,64 @@ export class Network extends BaseEngine {
     this.resolvedCache = null;
     this.derivedParentFor = null; this.derivedParent = null; // drop the ancestor-aware parent cache (#162)
     return this.rebuild();
+  }
+
+  /**
+   * Render a **state (higher-order / memory) network** (#171). The engine ingests the state network
+   * (state graph + its engine-derived physical graph, from {@link buildStateGraph}) and a per-**state-node**
+   * module assignment, then lets you toggle between:
+   *  - the **state view** — every state node on a golden-angle rosette around its physical node, coloured
+   *    by module, and
+   *  - the **physical view** — the aggregated physical network, where a physical node whose state nodes span
+   *    ≥2 modules renders as a **pie chart** (wedges ∝ per-module flow/count, module-coloured) and a
+   *    single-module node as a solid disc.
+   *
+   * Call {@link layout} next: in state-network mode it lays out the physical graph (worker/force backend)
+   * and derives the rosette state positions, so both views have coordinates (the module-aware GPU layout
+   * of #106 will supply these directly once it lands). Switch views with {@link view}. Colours + pie wedges
+   * are derived once here; the toggle is not a per-frame path.
+   */
+  stateNetwork(graph: StateNetworkGraph, opts: StateNetworkOptions): this {
+    this.stateData = graph;
+    this.activeView = opts.view ?? "physical";
+    this.rosetteRadius = opts.rosetteRadius ?? null;
+    this.pieWedges = physicalPieWedges(graph, opts.modules, opts.pie);
+    // Per-state-node module colours (state view); per-physical disc = its dominant (first) wedge's colour.
+    this.stateColors = moduleColors(opts.modules, opts.color);
+    const wedges = this.pieWedges;
+    const pc = new Array<string>(graph.physicalCount);
+    for (let p = 0; p < graph.physicalCount; p++) {
+      pc[p] = wedges.wedgeCount[p]! > 0 ? wedges.color[wedges.offset[p]!]! : DEFAULT_NODE_FILL;
+    }
+    this.physicalColors = pc;
+    this.applyView();
+    return this;
+  }
+
+  /** Toggle the active view of the ingested state network (#171): `"state"` (rosette of state nodes) or
+   *  `"physical"` (aggregated network with overlapping-module pie glyphs). No-op without {@link stateNetwork}. */
+  view(view: "state" | "physical"): this {
+    if (!this.stateData || view === this.activeView) return this;
+    this.activeView = view;
+    this.applyView();
+    return this;
+  }
+
+  /** Whether a state network is loaded, and which of its two views is active (#171). */
+  get stateView(): "state" | "physical" | null {
+    return this.stateData ? this.activeView : null;
+  }
+
+  /** Point the engine at the active view's graph + per-view node colours, preserving state-network mode.
+   *  Positions live in each view's graph buffer (filled by {@link layout}). */
+  private applyView(): void {
+    const sg = this.stateData;
+    if (!sg) return;
+    const physical = this.activeView === "physical";
+    const colors = (physical ? this.physicalColors : this.stateColors)!;
+    // Set the per-view node fill BEFORE setActiveGraph's rebuild so the first paint is correctly coloured.
+    this.styleOpts = { ...this.styleOpts, nodeFill: (i: number) => colors[i] ?? DEFAULT_NODE_FILL };
+    this.setActiveGraph(physical ? sg.physical : sg.state);
   }
 
   /** Set visual style (node radius/fill/sizeMode; link & arrow appearance). */
@@ -613,6 +740,7 @@ export class Network extends BaseEngine {
 
   /** Configure layout / supply positions (the pluggable contract proper lands in #101). */
   layout(opts: NetworkLayoutOptions): this {
+    if (this.stateData) return this.layoutStateNetwork(opts);
     this.layoutOpts = { ...this.layoutOpts, ...opts };
     if (this.graph) {
       // Any backend change cancels a running worker layout before re-seeding positions. A prior
@@ -691,6 +819,47 @@ export class Network extends BaseEngine {
       }
     }
     return this.rebuild();
+  }
+
+  /**
+   * Layout for state-network mode (#171): lay out the **physical** graph (the coarser structure) with the
+   * requested backend, then derive the **rosette** state positions from it. Both view graphs share their
+   * own position buffer, so after this the active view renders immediately. `backend: "positions"` supplies
+   * the **physical** positions directly; `force`/`worker` run the in-library layout on the physical graph
+   * (the CPU stopgap until #106's module-aware GPU `stateLayout` supplies both position sets).
+   */
+  private layoutStateNetwork(opts: NetworkLayoutOptions): this {
+    const sg = this.stateData!;
+    this.layoutOpts = { ...this.layoutOpts, ...opts };
+    const phys = sg.physical;
+    if (opts.backend === "positions" && opts.positions) {
+      phys.positions.set(opts.positions);
+    } else {
+      // Main-thread force on the physical graph. (Worker/GPU backends for state networks are a follow-up;
+      // the physical graph is the coarser of the two, so this stopgap handles demo-scale networks.)
+      const iterations = opts.iterations ?? DEFAULT_FORCE_ITERATIONS;
+      if (opts.multilevel === false) {
+        seedPositions(phys, this.width, this.height);
+        new ForceLayout(phys, opts.force).run(iterations);
+      } else {
+        multilevelLayout(phys, { width: this.width, height: this.height, iterations, force: opts.force });
+      }
+    }
+    // Rosette state positions from the (now laid-out) physical positions. Auto radius ≈ 0.35× the
+    // characteristic node spacing (layout span / √physicalCount) so rosettes stay local without overlapping.
+    const radius = this.rosetteRadius ?? 0.35 * physicalSpacing(phys.positions, sg.physicalCount);
+    sg.state.positions.set(rosettePositions(sg, { radius }));
+    this.recomputeLODGeometry();
+    return this.rebuild();
+  }
+
+  /** The physical-view pie layer (#171): overlapping (≥2-module) physical nodes as instanced pie wedges,
+   *  drawn on top of the node discs. Null off the physical view, without pie wedges, or when none overlap. */
+  private pieInstancedLayer(graph: NetworkGraph, resolved: ResolvedNetworkStyle): InstancedLayer | null {
+    if (this.activeView !== "physical" || !this.pieWedges) return null;
+    const pie = physicalPieInstances(this.pieWedges, graph.positions, resolved.nodeRadii);
+    if (pie.count === 0) return null;
+    return { name: this.PIE_LAYER, primitive: "pie", pie, sizeMode: resolved.sizeMode };
   }
 
   /**
@@ -842,10 +1011,16 @@ export class Network extends BaseEngine {
       this.linkResolve = (i) => this.noLodLinkHit(graph, i);
       const lane = new InstancedLane(strategy, () => {
         const resolved = this.resolvedStyleCached(graph);
-        return this.attachNoLodHighlight(this.flagPickableLinks(networkLayers(graph, resolved)), graph, resolved.directed);
+        const layers = this.attachNoLodHighlight(this.flagPickableLinks(networkLayers(graph, resolved)), graph, resolved.directed);
+        // Physical view of a state network (#171): overlapping-module physical nodes draw as pies, on top
+        // of the node discs (build-once per emit; drawn last so a pie covers its single underlying disc).
+        const pie = this.pieInstancedLayer(graph, resolved);
+        if (pie) layers.push(pie);
+        return layers;
       });
       this.registerInstancedLane(this.NET_LANE, {
-        lane, layerNames: LAYER_NAMES, dynamic: false,
+        // The pie layer name must be in layerNames so a view switch removes it (emit-set-change re-adds).
+        lane, layerNames: this.pieWedges && this.activeView === "physical" ? [...LAYER_NAMES, this.PIE_LAYER] : LAYER_NAMES, dynamic: false,
         resolve: (i) => ({ layer: this.NODE_LAYER, id: i, datum: { aggregate: false, count: 1 } satisfies NetworkHit }),
         interactive: this.laneInteractive(() => ({ aggregate: false, count: 1 }), (i) => [i]),
         gpuPick: this.pickLinksEnabled ? (id) => this.linkResolve?.(id) ?? null : undefined,
@@ -1597,6 +1772,26 @@ export class Network extends BaseEngine {
       fill: (i) => fillOf(i as number),
       build: (g) => {
         if (emit) emitNodes(g, graph, innerRadii);
+      },
+    });
+    // Physical view of a state network (#171): overlapping-module physical nodes as filled arc-wedge pies,
+    // drawn (and exported by toSVG) on top of the node discs. Keyed by flat wedge index → wedges.color.
+    // Always registered (empty in the state view / when no pie wedges) so a view switch clears it.
+    const wedges = this.activeView === "physical" ? this.pieWedges : null;
+    const pieIds: number[] = [];
+    if (wedges) {
+      for (let p = 0; p < wedges.wedgeCount.length; p++) {
+        if (wedges.wedgeCount[p]! >= 2) for (let k = wedges.offset[p]!; k < wedges.offset[p + 1]!; k++) pieIds.push(k);
+      }
+    }
+    this.registerLayer({
+      name: this.PIE_LAYER,
+      data: pieIds,
+      ids: pieIds,
+      sizeMode: style.sizeMode,
+      fill: (k) => (wedges ? wedges.color[k as number]! : DEFAULT_NODE_FILL),
+      build: (g) => {
+        if (emit && wedges) tracePieWedges(g, wedges, graph.positions, style.nodeRadii, style.sizeMode === "screen");
       },
     });
   }
