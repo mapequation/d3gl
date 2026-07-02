@@ -4,7 +4,7 @@ import type { Device, Framebuffer } from "@luma.gl/core";
 import type { Backend, RenderLayer, RenderDelta, ViewTransform, InstancedLayer, InstancedHighlight } from "../core/index.js";
 import type { GroupBuffers, GroupBufferDelta, PassThroughLayer, DrawBatch, StyleTables, DrawableVector } from "../core/index.js";
 import { GroupRenderer } from "./renderer.js";
-import { InstancedCircles, InstancedLines, InstancedArrows, InstancedHalfArrows } from "./instanced.js";
+import { InstancedCircles, InstancedPie, InstancedLines, InstancedArrows, InstancedHalfArrows } from "./instanced.js";
 import { PickReadback } from "./pick-readback.js";
 import { clipFromView } from "./transform.js";
 import { toPNG } from "./png.js";
@@ -23,7 +23,7 @@ export class WebGLBackend implements Backend {
   private layers = new Map<string, RenderLayer>();
   private order: string[] = [];
   /** GPU-instanced primitive layers (the network lane), drawn after retained layers. */
-  private instanced = new Map<string, InstancedCircles | InstancedLines | InstancedArrows | InstancedHalfArrows>();
+  private instanced = new Map<string, InstancedCircles | InstancedPie | InstancedLines | InstancedArrows | InstancedHalfArrows>();
   /** Names of instanced layers that opted into the GPU-readback pick pass (#141; link layers only). */
   private pickable = new Set<string>();
   /** Offscreen id-encoded pick target (device px). Lazily created when first picked; resized on demand. */
@@ -201,8 +201,9 @@ export class WebGLBackend implements Backend {
   setInstancedLayer(layer: InstancedLayer): void {
     this.instanced.get(layer.name)?.destroy();
     // Link layers (lines/arrows/half-arrows) may opt into the GPU-readback pick pass (#141); the
-    // primitive builds an extra id-encoded pick model when `pick` is set. Nodes (circles) never do.
-    const pick = layer.primitive !== "circles" && !!layer.pickable;
+    // primitive builds an extra id-encoded pick model when `pick` is set. Node glyphs (circles, pie) never do.
+    const pick =
+      (layer.primitive === "lines" || layer.primitive === "arrows" || layer.primitive === "half-arrows") && !!layer.pickable;
     const r =
       layer.primitive === "lines"
         ? new InstancedLines(this.device, layer.lines, this.width, this.height, pick)
@@ -210,7 +211,9 @@ export class WebGLBackend implements Backend {
           ? new InstancedArrows(this.device, layer.arrows, this.width, this.height, pick)
           : layer.primitive === "half-arrows"
             ? new InstancedHalfArrows(this.device, layer.halfArrows, this.width, this.height, pick)
-            : new InstancedCircles(this.device, layer.circles, this.width, this.height);
+            : layer.primitive === "pie"
+              ? new InstancedPie(this.device, layer.pie, this.width, this.height)
+              : new InstancedCircles(this.device, layer.circles, this.width, this.height);
     r.setTransform(this.clipMatrix);
     r.setViewport(this.width, this.height);
     r.setSizeMode(layer.sizeMode ?? "world");
@@ -233,10 +236,14 @@ export class WebGLBackend implements Backend {
     const existing = this.instanced.get(layer.name);
     // A pick-model presence mismatch (pickLinks toggled) must recreate: the in-place update path
     // never builds/drops the pick model, so an in-place update would leave the wrong pick state.
-    const wantPick = layer.primitive !== "circles" && !!layer.pickable;
+    const wantPick =
+      (layer.primitive === "lines" || layer.primitive === "arrows" || layer.primitive === "half-arrows") && !!layer.pickable;
     const pickMismatch = existing !== undefined && !(existing instanceof InstancedCircles) && wantPick !== this.pickable.has(layer.name);
     if (existing instanceof InstancedCircles && layer.primitive === "circles") {
       existing.update(this.device, layer.circles);
+      existing.setSizeMode(layer.sizeMode ?? "world");
+    } else if (existing instanceof InstancedPie && layer.primitive === "pie") {
+      existing.update(this.device, layer.pie);
       existing.setSizeMode(layer.sizeMode ?? "world");
     } else if (existing instanceof InstancedLines && layer.primitive === "lines" && !pickMismatch) {
       if (existing.update(this.device, layer.lines)) {
@@ -469,8 +476,8 @@ export class WebGLBackend implements Backend {
     for (const name of this.pickable) {
       const r = this.instanced.get(name);
       // pickable only ever holds link layers; the instanceof guard narrows the union to the
-      // primitives that expose renderPick (circles, the node lane, are CPU-picked and excluded).
-      if (r && !(r instanceof InstancedCircles)) r.renderPick(pass);
+      // primitives that expose renderPick (circles + pie, the node glyphs, are CPU-picked and excluded).
+      if (r && !(r instanceof InstancedCircles) && !(r instanceof InstancedPie)) r.renderPick(pass);
     }
     pass.end();
     this.device.submit();

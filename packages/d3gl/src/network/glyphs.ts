@@ -1,6 +1,7 @@
 import { rgb } from "d3-color";
-import type { InstancedCirclesData, InstancedLinesData, InstancedArrowsData, InstancedHalfArrowsData, InstancedLayer, GroupBuilder } from "../core/index.js";
+import type { InstancedCirclesData, InstancedPieData, InstancedLinesData, InstancedArrowsData, InstancedHalfArrowsData, InstancedLayer, GroupBuilder } from "../core/index.js";
 import type { NetworkGraph } from "./graph.js";
+import type { PhysicalPieWedges } from "./pie.js";
 import type { LODTree, LODTransform } from "./lod.js";
 import type { ScreenRect } from "../core/instanced-lane.js";
 import { halfLinkGeometry, traceHalfLink, scaleHalfLink } from "./half-link.js";
@@ -1551,5 +1552,99 @@ export function traceSuperArrows(g: GroupBuilder, arrows: InstancedArrowsData, i
       ctx.lineTo((baseX + px * size) * inv, (baseY + py * size) * inv);
       ctx.closePath();
     });
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Pie wedges (#171) — the physical-view glyph for overlapping module membership. WebGL: one instanced
+// wedge per module a physical node spans (physicalPieInstances). Canvas/SVG + toSVG: filled arc sectors
+// (tracePieWedges). Single-module physical nodes are NOT drawn here — they render as solid discs on the
+// nodeCircles lane, so only ≥2-module ("overlapping") physical nodes get a pie.
+// ---------------------------------------------------------------------------
+
+/** Radius input for pie glyphs (active `sizeMode` units): a constant, or one radius per physical node. */
+export type PieRadius = number | ArrayLike<number>;
+
+/** The angle (radians) a wedge fraction `f ∈ [0,1]` maps to — the SAME convention as INSTANCED_PIE_FS
+ *  (`atan2(y,x)`, CCW from +x in world coords), so WebGL and the Canvas/SVG arcs partition a pie identically. */
+const TAU = Math.PI * 2;
+
+/**
+ * Build instanced pie wedges from {@link PhysicalPieWedges} for the physical nodes that span ≥2 modules
+ * — one instance per wedge (its `[startFrac, endFrac]` angular sector). `radius` is per-physical (or a
+ * constant) in the active `sizeMode`'s units. Group id = the physical node id, so a hover/select lights
+ * the whole pie (#162). Build-once: called on a data/module change, not per frame.
+ */
+export function physicalPieInstances(wedges: PhysicalPieWedges, positions: ArrayLike<number>, radius: PieRadius): InstancedPieData {
+  const { offset, end, color, wedgeCount } = wedges;
+  const physicalCount = wedgeCount.length;
+  const radiusAt = typeof radius === "number" ? () => radius : (p: number) => radius[p]!;
+  let total = 0;
+  for (let p = 0; p < physicalCount; p++) if (wedgeCount[p]! >= 2) total += wedgeCount[p]!;
+
+  const centers = new Float32Array(total * 2);
+  const radii = new Float32Array(total);
+  const angles = new Float32Array(total * 2);
+  const colors = new Uint8Array(total * 4);
+  const groups = new Float32Array(total);
+  let w = 0;
+  for (let p = 0; p < physicalCount; p++) {
+    if (wedgeCount[p]! < 2) continue;
+    const cx = positions[2 * p]!;
+    const cy = positions[2 * p + 1]!;
+    const r = radiusAt(p);
+    let a0 = 0;
+    for (let k = offset[p]!; k < offset[p + 1]!; k++) {
+      const a1 = end[k]!;
+      centers[2 * w] = cx;
+      centers[2 * w + 1] = cy;
+      radii[w] = r;
+      angles[2 * w] = a0;
+      angles[2 * w + 1] = a1;
+      const [rr, gg, bb, aa] = toRGBA(color[k]!);
+      colors[4 * w] = rr;
+      colors[4 * w + 1] = gg;
+      colors[4 * w + 2] = bb;
+      colors[4 * w + 3] = aa;
+      groups[w] = p;
+      a0 = a1;
+      w++;
+    }
+  }
+  return { centers, radii, angles, colors, groups, count: total };
+}
+
+/**
+ * Trace pie wedges into a Scene group for the retained (Canvas/SVG) backends + `toSVG()` export — the
+ * vector twin of {@link physicalPieInstances}. Each overlapping physical node's wedges are drawn as
+ * filled arc sectors keyed by their **flat wedge index** into {@link PhysicalPieWedges} (so the engine's
+ * layer `fillOf` reads `wedges.color[index]`). In screen sizeMode the wedge is pinned at a constant
+ * pixel size around the physical centre via the drawable `anchor` (all a pie's wedges share it).
+ */
+export function tracePieWedges(g: GroupBuilder, wedges: PhysicalPieWedges, positions: ArrayLike<number>, radius: PieRadius, screen: boolean): void {
+  const { offset, end, wedgeCount } = wedges;
+  const physicalCount = wedgeCount.length;
+  const radiusAt = typeof radius === "number" ? () => radius : (p: number) => radius[p]!;
+  for (let p = 0; p < physicalCount; p++) {
+    if (wedgeCount[p]! < 2) continue;
+    const cx = positions[2 * p]!;
+    const cy = positions[2 * p + 1]!;
+    const r = radiusAt(p);
+    const anchor: [number, number] | undefined = screen ? [cx, cy] : undefined;
+    let a0 = 0;
+    for (let k = offset[p]!; k < offset[p + 1]!; k++) {
+      const s = a0;
+      const e = end[k]!;
+      g.drawable(
+        k,
+        (ctx) => {
+          ctx.moveTo(cx, cy);
+          ctx.arc(cx, cy, r, s * TAU, e * TAU, false);
+          ctx.closePath();
+        },
+        anchor ? { anchor } : undefined,
+      );
+      a0 = e;
+    }
   }
 }

@@ -3,7 +3,7 @@
  * with level-of-detail (epic #98).
  */
 export { network, Network } from "./network.js";
-export type { NetworkOptions, NetworkStyle, NetworkLayoutOptions, NetworkLODOptions, NetworkHit, NetworkLinkHit } from "./network.js";
+export type { NetworkOptions, NetworkStyle, NetworkLayoutOptions, NetworkLODOptions, NetworkHit, NetworkLinkHit, StateNetworkOptions } from "./network.js";
 export type { NodeRadiusSpec, NodeMetric, ImportanceSpec, FlowBorderSpec, LinkWidthSpec, LinkColorSpec, LinkStyle } from "./glyphs.js";
 
 export { halfLinkGeometry, traceHalfLink, halfLinkPathString, scaleHalfLink } from "./half-link.js";
@@ -23,6 +23,15 @@ export type { ModulePathNode, ModuleColorOptions } from "./module-colors.js";
 
 export { buildGraph, buildCSR } from "./graph.js";
 export type { NetworkGraph, CSR, BuildGraphInput } from "./graph.js";
+
+export { buildStateGraph } from "./state-graph.js";
+export type { BuildStateGraphInput, StateNetworkGraph, PhysicalToState } from "./state-graph.js";
+
+export { rosettePositions } from "./rosette.js";
+export type { RosetteOptions } from "./rosette.js";
+
+export { physicalPieWedges } from "./pie.js";
+export type { PieWedgeOptions, PhysicalPieWedges } from "./pie.js";
 
 export { parseEdgeList } from "./parse.js";
 export type { ParsedEdges } from "./parse.js";

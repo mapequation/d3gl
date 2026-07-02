@@ -9,11 +9,15 @@ import LoadNetwork from "../../../examples/load-network/LoadNetwork.tsx";
 import ModularLod from "../../../examples/modular-lod/ModularLod.tsx";
 import FlowBorders from "../../../examples/flow-borders/FlowBorders.tsx";
 import ModularMap from "../../../examples/modular-map/ModularMap.tsx";
+import StateNetwork from "../../../examples/state-network/StateNetwork.tsx";
 
 The `network()` engine renders node–link diagrams through a dedicated GPU-instanced rendering
 lane: nodes are instanced points, links are instanced lines, and directed edges get triangle
 arrowheads. It is built for large graphs — the same lane scales toward millions of elements, with an
 adaptive **level-of-detail** cut that keeps per-frame work proportional to what's actually on screen.
+It also renders **maps of networks** (a provided module hierarchy drives the cut), and **[state
+(memory) networks](#state-networks-physical--state-views)** — toggling a state view against the derived
+physical view, where overlapping-module physical nodes draw as **pie-chart glyphs**.
 
 ## Large-scale layout in a Web Worker
 
@@ -370,6 +374,66 @@ out to the map of modules, in to sub-modules and individual nodes.
 
 <ExampleCard files={["modular-map/draw.ts", "modular-map/data.ts", "modular-map/generate.ts"]}>
   <ModularMap client:visible slot="demo" />
+</ExampleCard>
+
+## State networks: physical ↔ state views
+
+A **state (higher-order / memory) network** adds a layer to a standard network: each **state node**
+belongs to a **physical node** — the same location seen in different memory / context — and links run
+between state nodes. Because a community detection ([Infomap](https://www.mapequation.org/infomap/))
+partitions the *state* nodes, one physical node's state nodes can land in **different modules**, so on
+the physical view a physical node has an **overlapping** module membership.
+
+`net.stateNetwork(graph, { modules })` ingests the state network (built by `buildStateGraph`, which also
+derives the physical network) plus a per-**state-node** module assignment, and `net.view("physical" |
+"state" | "both")` toggles three renderings of the *same* data:
+
+- **Physical** — the derived physical network (flow-sized nodes + directed, flow-summed aggregated
+  half-arrow links). A physical node whose state nodes span ≥2 modules renders as a **pie chart** — one
+  wedge per module, sized by that module's summed flow and coloured by module; a single-module node is a
+  solid disc.
+- **State** — every state node on a golden-angle **rosette** around its physical node, coloured by
+  module, so you can see *why* a node splits (its memory nodes belong to different communities). The
+  **LOD** control (`net.lod({ modules })`) aggregates the state nodes into their modules on zoom-out —
+  the state nodes carry the module tree, so the [modular LOD cut](#modular-level-of-detail) applies
+  directly. (LOD is a state-view feature; the physical/both views draw full detail.)
+- **Both** — a hybrid: each physical node is a faint **container** disc holding its state nodes on a
+  rosette confined inside it, drawn with **state-level** links — the memory structure in its physical
+  context. Everything is world-sized so the state nodes stay inside their physical node at every zoom.
+
+The **Nodes** slider scales the physical network from 10 to 10,000 (100k+ awaits the module-aware GPU
+layout — the physical force solve + the node2vec trigram enumeration are the current ceiling); the map
+controls (Sizing, Declutter, Expand, Max radius, Labels, Cross-level, Cross-fade) mirror the
+[directed map of modules](#a-directed-map-of-modules) and drive the state-view LOD cut.
+
+```ts
+import { buildStateGraph, network } from "@mapequation/d3gl/network";
+
+// A state network: state-level edges + a per-state-node physical id. The engine derives the physical
+// network (physical nodes = distinct physical ids; links = state edges aggregated across the boundary).
+const graph = buildStateGraph({ stateCount, stateToPhysical, source, target, weight });
+
+net
+  .style({ sizeMode: "screen", nodeRadius: 9 })
+  .stateNetwork(graph, { modules }) // modules = Infomap's per-state-node { id, path } records
+  .layout({ backend: "force" });    // lays out the physical graph + derives rosette state positions
+
+net.view("physical"); // pie glyphs for overlapping nodes · net.view("state") for the rosette
+```
+
+The pie is a first-class **instanced glyph**: one GPU instance per wedge (a `[start, end]` angular sector
+of a disc — no wedge texture, no per-fragment loop), so a physical view with many overlapping nodes draws
+as efficiently as the circle lane and updates in place on pan/zoom. On Canvas/SVG the same wedges trace as
+filled arc sectors, so the physical view **exports to `toSVG()`** and renders identically across all three
+backends. The synthetic data (an **LFR** physical network + **node2vec** triangle-closing trigrams, with
+each state node's module set to its *previous* node's community) is in the `state-network-data.ts` tab.
+
+Positions here are the **CPU stopgap**: d3gl's in-library force layout places the physical nodes and the
+deterministic **rosette** fans each physical node's state nodes onto a ring around it. The module-aware GPU
+`stateLayout` (which will place state nodes with intra-physical structure) is tracked separately.
+
+<ExampleCard files={["state-network/draw.ts"]}>
+  <StateNetwork client:visible slot="demo" />
 </ExampleCard>
 
 ## Loading a network from a file
