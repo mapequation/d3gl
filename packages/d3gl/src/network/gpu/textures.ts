@@ -107,6 +107,35 @@ export function packUintTexture(
 }
 
 /**
+ * Read back an entire `rgba32float` texture (all `width × height` texels, 4
+ * channels each) via a throwaway FBO. Returns a `Float32Array` of length
+ * `width * height * 4` in row-major (x, y) order. Test-only — the layout hot
+ * path never reads back to the CPU.
+ */
+export function readbackRgbaFbo(
+  device: Device,
+  texture: Texture,
+): Float32Array {
+  const width = texture.width;
+  const height = texture.height;
+  const fbo: Framebuffer = device.createFramebuffer({
+    width,
+    height,
+    colorAttachments: [texture],
+  });
+  const pixels = device.readPixelsToArrayWebGL(fbo, {
+    sourceX: 0,
+    sourceY: 0,
+    sourceWidth: width,
+    sourceHeight: height,
+  }) as Float32Array;
+  fbo.destroy();
+  // Copy out so the caller owns a plain Float32Array (readPixels may return a
+  // view into a pooled buffer).
+  return Float32Array.from(pixels);
+}
+
+/**
  * Read back `count` (x, y) pairs from an `rg32float` texture via an FBO.
  * Returns a `Float32Array` of length `count * 2`.
  */
