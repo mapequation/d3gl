@@ -225,28 +225,34 @@ export class WebGLBackend implements Backend {
    * primitive type, call `update()` (GPU sub-upload, no teardown). Lines/arrows/half-arrows
    * return `false` from `update()` when a structural property changed (samples, half-flag) —
    * fall back to `setInstancedLayer` (destroy+recreate) in that case. Also recreates when the
-   * primitive type changes (e.g. lines → arrows).
+   * primitive type changes (e.g. lines → arrows) OR when the layer's `pickable` state no longer
+   * matches the existing renderer's pick-model presence (toggling `pickLinks` builds/drops the
+   * id-encoded pick model, which `update()` can't do in place — see #141/#179).
    */
   updateInstancedLayer(layer: InstancedLayer): void {
     const existing = this.instanced.get(layer.name);
+    // A pick-model presence mismatch (pickLinks toggled) must recreate: the in-place update path
+    // never builds/drops the pick model, so an in-place update would leave the wrong pick state.
+    const wantPick = layer.primitive !== "circles" && !!layer.pickable;
+    const pickMismatch = existing !== undefined && !(existing instanceof InstancedCircles) && wantPick !== this.pickable.has(layer.name);
     if (existing instanceof InstancedCircles && layer.primitive === "circles") {
       existing.update(this.device, layer.circles);
       existing.setSizeMode(layer.sizeMode ?? "world");
-    } else if (existing instanceof InstancedLines && layer.primitive === "lines") {
+    } else if (existing instanceof InstancedLines && layer.primitive === "lines" && !pickMismatch) {
       if (existing.update(this.device, layer.lines)) {
         existing.setSizeMode(layer.sizeMode ?? "world");
         this.pickDirty = true;
       } else {
         this.setInstancedLayer(layer);
       }
-    } else if (existing instanceof InstancedArrows && layer.primitive === "arrows") {
+    } else if (existing instanceof InstancedArrows && layer.primitive === "arrows" && !pickMismatch) {
       if (existing.update(this.device, layer.arrows)) {
         existing.setSizeMode(layer.sizeMode ?? "world");
         this.pickDirty = true;
       } else {
         this.setInstancedLayer(layer);
       }
-    } else if (existing instanceof InstancedHalfArrows && layer.primitive === "half-arrows") {
+    } else if (existing instanceof InstancedHalfArrows && layer.primitive === "half-arrows" && !pickMismatch) {
       if (existing.update(this.device, layer.halfArrows)) {
         existing.setSizeMode(layer.sizeMode ?? "world");
         this.pickDirty = true;

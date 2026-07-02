@@ -893,6 +893,44 @@ export function linkLines(graph: NetworkGraph, style: LinkStyleResolved): Instan
   return { sources, targets, widths, colors, count };
 }
 
+/** Style-derived line attributes (colours/widths/bends) that don't change on a position-only frame (#179). */
+export interface LinkLinesStyleAttrs {
+  widths: Float32Array;
+  colors: Uint8Array;
+  bends?: Float32Array;
+  samples?: number;
+}
+
+/** The style-derived (accessor-run) attributes of {@link linkLines}, extracted so a position-only frame can
+ *  reuse them (via {@link linkLinesFromCache}) instead of re-running `widthOf`/`colorOf` per edge (#179). */
+export function linkLinesStyleAttrs(graph: NetworkGraph, style: LinkStyleResolved): LinkLinesStyleAttrs {
+  const count = graph.edgeCount;
+  const widths = new Float32Array(count);
+  for (let e = 0; e < count; e++) widths[e] = style.widthOf(graph.weight[e]!);
+  const colors = linkColorBytes(graph.weight, count, style.colorOf);
+  if (style.bend) return { widths, colors, bends: new Float32Array(count).fill(style.bend), samples: BENT_SAMPLES };
+  return { widths, colors };
+}
+
+/** Rebuild only the position-derived endpoints (from the current node positions), reusing cached
+ *  style attributes (#179) — the per-layout-frame fast path for the no-LOD lines layer. */
+export function linkLinesFromCache(graph: NetworkGraph, attrs: LinkLinesStyleAttrs): InstancedLinesData {
+  const count = graph.edgeCount;
+  const sources = new Float32Array(count * 2);
+  const targets = new Float32Array(count * 2);
+  for (let e = 0; e < count; e++) {
+    const s = graph.source[e]!;
+    const t = graph.target[e]!;
+    sources[e * 2] = graph.positions[s * 2]!;
+    sources[e * 2 + 1] = graph.positions[s * 2 + 1]!;
+    targets[e * 2] = graph.positions[t * 2]!;
+    targets[e * 2 + 1] = graph.positions[t * 2 + 1]!;
+  }
+  const { widths, colors, bends, samples } = attrs;
+  if (bends) return { sources, targets, widths, colors, bends, samples, count };
+  return { sources, targets, widths, colors, count };
+}
+
 /**
  * Instanced **half-arrow** link data (#104 N6) — the "map of networks" directed-link glyph. Each
  * directed edge becomes one filled shape (see {@link halfLinkGeometry}): pinched to the source
@@ -903,17 +941,9 @@ export function linkLines(graph: NetworkGraph, style: LinkStyleResolved): Instan
  */
 export function halfArrowLinks(graph: NetworkGraph, style: HalfArrowStyleResolved): InstancedHalfArrowsData {
   const count = graph.edgeCount;
-  const { nodeRadii, widthOf, colorOf, bend } = style;
-  // Reciprocal lookup: key s*N+t → edge weight, so t→s can find s→t's width for `oppositeWidth`.
-  const n = graph.nodeCount;
-  const weightByPair = new Map<number, number>();
-  for (let e = 0; e < count; e++) weightByPair.set(graph.source[e]! * n + graph.target[e]!, graph.weight[e]!);
-
+  const attrs = halfArrowLinksStyleAttrs(graph, style);
   const sources = new Float32Array(count * 2);
   const targets = new Float32Array(count * 2);
-  const radii = new Float32Array(count * 2);
-  const widths = new Float32Array(count * 2);
-  const bends = new Float32Array(count).fill(bend);
   for (let e = 0; e < count; e++) {
     const s = graph.source[e]!;
     const t = graph.target[e]!;
@@ -921,6 +951,33 @@ export function halfArrowLinks(graph: NetworkGraph, style: HalfArrowStyleResolve
     sources[e * 2 + 1] = graph.positions[s * 2 + 1]!;
     targets[e * 2] = graph.positions[t * 2]!;
     targets[e * 2 + 1] = graph.positions[t * 2 + 1]!;
+  }
+  return { sources, targets, ...attrs, count };
+}
+
+/** Style-derived half-arrow attributes (per-edge radii/widths/bends/colours) that don't change on a position frame (#179). */
+export interface HalfArrowStyleAttrs {
+  radii: Float32Array;
+  widths: Float32Array;
+  bends: Float32Array;
+  colors: Uint8Array;
+}
+
+/** The style-derived attributes of {@link halfArrowLinks}, extracted so a position frame can reuse them (#179).
+ *  Includes the reciprocal-pair `oppositeWidth` lookup — a function of weights/topology, not positions. */
+export function halfArrowLinksStyleAttrs(graph: NetworkGraph, style: HalfArrowStyleResolved): HalfArrowStyleAttrs {
+  const count = graph.edgeCount;
+  const { nodeRadii, widthOf, colorOf, bend } = style;
+  // Reciprocal lookup: key s*N+t → edge weight, so t→s can find s→t's width for `oppositeWidth`.
+  const n = graph.nodeCount;
+  const weightByPair = new Map<number, number>();
+  for (let e = 0; e < count; e++) weightByPair.set(graph.source[e]! * n + graph.target[e]!, graph.weight[e]!);
+  const radii = new Float32Array(count * 2);
+  const widths = new Float32Array(count * 2);
+  const bends = new Float32Array(count).fill(bend);
+  for (let e = 0; e < count; e++) {
+    const s = graph.source[e]!;
+    const t = graph.target[e]!;
     radii[e * 2] = nodeRadii[s]!;
     radii[e * 2 + 1] = nodeRadii[t]!;
     const w = widthOf(graph.weight[e]!);
@@ -929,6 +986,23 @@ export function halfArrowLinks(graph: NetworkGraph, style: HalfArrowStyleResolve
     widths[e * 2 + 1] = oppRaw === undefined ? w : widthOf(oppRaw);
   }
   const colors = linkColorBytes(graph.weight, count, colorOf);
+  return { radii, widths, bends, colors };
+}
+
+/** Rebuild only the half-arrow endpoints from the current node positions, reusing cached style attributes (#179). */
+export function halfArrowLinksFromCache(graph: NetworkGraph, attrs: HalfArrowStyleAttrs): InstancedHalfArrowsData {
+  const count = graph.edgeCount;
+  const sources = new Float32Array(count * 2);
+  const targets = new Float32Array(count * 2);
+  for (let e = 0; e < count; e++) {
+    const s = graph.source[e]!;
+    const t = graph.target[e]!;
+    sources[e * 2] = graph.positions[s * 2]!;
+    sources[e * 2 + 1] = graph.positions[s * 2 + 1]!;
+    targets[e * 2] = graph.positions[t * 2]!;
+    targets[e * 2 + 1] = graph.positions[t * 2 + 1]!;
+  }
+  const { radii, widths, bends, colors } = attrs;
   return { sources, targets, radii, widths, bends, colors, count };
 }
 
@@ -982,6 +1056,46 @@ export function linkArrows(graph: NetworkGraph, style: ArrowStyleResolved): Inst
   if (bend) {
     return { sources, targets, radii, sizes, colors, bends: new Float32Array(count).fill(bend), half: style.half, count };
   }
+  return { sources, targets, radii, sizes, colors, count };
+}
+
+/** Style-derived arrow attributes (per-edge radii/sizes/colours/bends) that don't change on a position frame (#179). */
+export interface LinkArrowsStyleAttrs {
+  radii: Float32Array;
+  sizes: Float32Array;
+  colors: Uint8Array;
+  bends?: Float32Array;
+  half?: boolean;
+}
+
+/** The style-derived attributes of {@link linkArrows}, extracted so a position frame can reuse them (#179). The
+ *  target-node radius setback is style-derived (node radii come from the cached style, not per-frame positions). */
+export function linkArrowsStyleAttrs(graph: NetworkGraph, style: ArrowStyleResolved): LinkArrowsStyleAttrs {
+  const count = graph.edgeCount;
+  const bend = style.bend ?? 0;
+  const radii = new Float32Array(count);
+  for (let e = 0; e < count; e++) radii[e] = style.nodeRadii[graph.target[e]!]!;
+  const sizes = new Float32Array(count).fill(style.size);
+  const colors = linkColorBytes(graph.weight, count, style.colorOf);
+  if (bend) return { radii, sizes, colors, bends: new Float32Array(count).fill(bend), half: style.half };
+  return { radii, sizes, colors };
+}
+
+/** Rebuild only the arrow endpoints from the current node positions, reusing cached style attributes (#179). */
+export function linkArrowsFromCache(graph: NetworkGraph, attrs: LinkArrowsStyleAttrs): InstancedArrowsData {
+  const count = graph.edgeCount;
+  const sources = new Float32Array(count * 2);
+  const targets = new Float32Array(count * 2);
+  for (let e = 0; e < count; e++) {
+    const s = graph.source[e]!;
+    const t = graph.target[e]!;
+    sources[e * 2] = graph.positions[s * 2]!;
+    sources[e * 2 + 1] = graph.positions[s * 2 + 1]!;
+    targets[e * 2] = graph.positions[t * 2]!;
+    targets[e * 2 + 1] = graph.positions[t * 2 + 1]!;
+  }
+  const { radii, sizes, colors, bends, half } = attrs;
+  if (bends) return { sources, targets, radii, sizes, colors, bends, half, count };
   return { sources, targets, radii, sizes, colors, count };
 }
 
@@ -1088,6 +1202,79 @@ export function networkLayers(graph: NetworkGraph, style: ResolvedNetworkStyle):
       constBorder: style.constBorder,
     }),
     sizeMode: style.sizeMode,
+  });
+  return layers;
+}
+
+/**
+ * Style-derived attributes of the full-graph (no-LOD) layers that DON'T change on a position-only
+ * layout frame (#179): link/arrow colours, widths, per-edge radii/sizes/bends. Cached once per
+ * resolved-style version so a layout frame reuses them (via {@link networkLayersFromCache}) instead
+ * of re-running the colour/width scale accessors ~O(edgeCount) times per frame. The node circles'
+ * style attributes (radii/fill colours/flow-border) are cached whole (positions alias `graph.positions`,
+ * so only a border layer needs a fresh position-derived pass — handled by re-running {@link nodeCircles}).
+ */
+export interface NoLodStyleCache {
+  /** Which layer shape the cache is for (must match the current style to be reusable). */
+  kind: "half-arrows" | "lines" | "lines+arrows" | "lines-only";
+  sizeMode: "world" | "screen";
+  halfArrows?: HalfArrowStyleAttrs;
+  lines?: LinkLinesStyleAttrs;
+  arrows?: LinkArrowsStyleAttrs;
+}
+
+/** Compute the {@link NoLodStyleCache} for the current resolved style (runs the scale accessors ONCE). */
+export function noLodStyleCache(graph: NetworkGraph, style: ResolvedNetworkStyle): NoLodStyleCache {
+  const bend = style.linkBend;
+  const halfArrow = style.linkStyle === "half-arrow" && style.directed;
+  const sizeMode = style.sizeMode;
+  if (graph.edgeCount === 0) return { kind: "lines-only", sizeMode };
+  if (halfArrow) {
+    return {
+      kind: "half-arrows",
+      sizeMode,
+      halfArrows: halfArrowLinksStyleAttrs(graph, { nodeRadii: style.nodeRadii, widthOf: style.linkWidthOf, colorOf: style.linkColorOf, bend }),
+    };
+  }
+  const lines = linkLinesStyleAttrs(graph, { widthOf: style.linkWidthOf, colorOf: style.linkColorOf, bend });
+  if (style.directed) {
+    const arrows = linkArrowsStyleAttrs(graph, { size: style.arrowSize, nodeRadii: style.nodeRadii, colorOf: style.linkColorOf, bend, half: bend !== 0 });
+    return { kind: "lines+arrows", sizeMode, lines, arrows };
+  }
+  return { kind: "lines", sizeMode, lines };
+}
+
+/**
+ * Assemble the no-LOD layers on a **position-only** frame (#179): rebuild ONLY the position-derived
+ * endpoints/node-centres from `graph.positions`, reusing the cached style attributes in `cache`. Does
+ * NOT run the colour/width scale accessors. The `nodes` layer re-runs {@link nodeCircles} (cheap:
+ * centers alias `graph.positions`, colours/radii come from the cached `style`; only a border layer does
+ * an O(node) position pass). Must be called with the SAME `style` version the cache was built from.
+ */
+export function networkLayersFromCache(graph: NetworkGraph, style: ResolvedNetworkStyle, cache: NoLodStyleCache): InstancedLayer[] {
+  const layers: InstancedLayer[] = [];
+  const sizeMode = style.sizeMode;
+  if (graph.edgeCount > 0) {
+    if (cache.kind === "half-arrows" && cache.halfArrows) {
+      layers.push({ name: "links", primitive: "half-arrows", halfArrows: halfArrowLinksFromCache(graph, cache.halfArrows), sizeMode });
+    } else if (cache.lines) {
+      layers.push({ name: "links", primitive: "lines", lines: linkLinesFromCache(graph, cache.lines), sizeMode });
+      if (cache.arrows) {
+        layers.push({ name: "arrows", primitive: "arrows", arrows: linkArrowsFromCache(graph, cache.arrows), sizeMode });
+      }
+    }
+  }
+  layers.push({
+    name: "nodes",
+    primitive: "circles",
+    circles: nodeCircles(graph, {
+      radii: style.nodeRadii,
+      fill: style.nodeFill,
+      colors: style.nodeColors,
+      border: style.flowBorder,
+      constBorder: style.constBorder,
+    }),
+    sizeMode,
   });
   return layers;
 }
