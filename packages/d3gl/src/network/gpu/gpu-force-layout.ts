@@ -5,6 +5,7 @@ import { atlasWidth, pingPong, readbackFloatFbo, packUintTexture } from "./textu
 import { IntegratePass } from "./passes/integrate.js";
 import { AttractionPass } from "./passes/attraction.js";
 import { RepulsionAllPairsPass } from "./passes/repulsion-allpairs.js";
+import { CentroidReducePass, CenteringPass, makeSumTarget } from "./passes/centering.js";
 
 /** Damping applied to velocity each integration step (mirrors CPU force.ts). */
 const DAMPING = 0.9;
@@ -28,6 +29,15 @@ export class GpuForceLayout {
   private readonly integratePass: IntegratePass;
   private readonly attractionPass: AttractionPass;
   private readonly repulsionPass: RepulsionAllPairsPass;
+  private readonly centroidReducePass: CentroidReducePass;
+  private readonly centeringPass: CenteringPass;
+
+  /**
+   * Span-based maximum displacement per tick.  Mirrors force.ts's `span0 * 4`
+   * clamp to prevent layout explosion on pathological force configurations.
+   * Set once at construction from the initial position bounding box.
+   */
+  private readonly maxStep: number;
 
   /**
    * Position ping-pong pair. `readTex` = current positions; `writeTex` = render
@@ -49,6 +59,18 @@ export class GpuForceLayout {
    * alloc rule.
    */
   private readonly forceFbo: Framebuffer;
+
+  /**
+   * 1×1 rg32float texture that accumulates Σpos over all nodes during the
+   * centroid reduction.  Pre-created in the constructor — no per-tick alloc.
+   */
+  private readonly sumTex: Texture;
+  /**
+   * Pre-created FBO wrapping `sumTex`.  Cleared to zero before each centroid
+   * reduction, then CentroidReducePass scatters all node positions into it via
+   * additive blend.
+   */
+  private readonly sumFbo: Framebuffer;
 
   /**
    * The two MRT framebuffer configurations, pre-created once. `swap()` only ever
@@ -80,6 +102,22 @@ export class GpuForceLayout {
     const height = Math.ceil(this.count / width);
     this.width = width;
     this.height = height;
+
+    // Compute initial layout span from positions to set a span-based maxStep.
+    // Mirrors force.ts: span0 = max(2 * rootHalf(), 1) where rootHalf ≈ half-extent.
+    // We approximate by taking the max of x/y extents.  The clamp prevents layout
+    // explosion on the first few ticks (same rationale as the CPU integrator).
+    // TODO(N8.5): if the GPU layout with BH pyramid (Task 5) uses a different span
+    // definition, revisit.
+    let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+    for (let i = 0; i < graph.nodeCount; i++) {
+      const x = graph.positions[i * 2]!;
+      const y = graph.positions[i * 2 + 1]!;
+      if (x < minX) minX = x; if (x > maxX) maxX = x;
+      if (y < minY) minY = y; if (y > maxY) maxY = y;
+    }
+    const span0 = Math.max((maxX - minX), (maxY - minY), 1);
+    this.maxStep = span0 * 4;
 
     // Build padded position data (same layout as packPositionsTexture) and seed
     // the position read (A) side with it. Velocity starts zeroed (no seed).
@@ -143,9 +181,17 @@ export class GpuForceLayout {
     this.neighborsTex = nbrResult.texture;
     this.nbrWidth = nbrResult.width;
 
+    // Pre-create the 1×1 sum texture and its FBO for the centroid reduction.
+    // No per-tick allocation — keep the createFramebuffer spy test green.
+    const sumTarget = makeSumTarget(device);
+    this.sumTex = sumTarget.sumTex;
+    this.sumFbo = sumTarget.sumFbo;
+
     this.integratePass = new IntegratePass(device);
     this.attractionPass = new AttractionPass(device);
     this.repulsionPass = new RepulsionAllPairsPass(device);
+    this.centroidReducePass = new CentroidReducePass(device);
+    this.centeringPass = new CenteringPass(device);
   }
 
   /** Execute `ticks` integrate steps on the GPU. */
@@ -156,7 +202,24 @@ export class GpuForceLayout {
   }
 
   private _tick(): void {
-    // ── 1. Clear force texture to zero ────────────────────────────────────────
+    // ── 1. Centroid reduction ─────────────────────────────────────────────────
+    // Clear the 1×1 sum texture to zero, then scatter all node positions into it
+    // via additive blend (CentroidReducePass).  The resulting single texel holds
+    // Σpos; dividing by nodeCount in CenteringPass gives the centroid.  This is a
+    // separate render pass (different FBO size) that must complete before the
+    // force pass below reads sumTex.
+    const sumPass = this.device.beginRenderPass({
+      framebuffer: this.sumFbo,
+      clearColor: [0, 0, 0, 0],
+    });
+    this.centroidReducePass.run(sumPass, this.pos.readTex, {
+      count: this.count,
+      width: this.width,
+    });
+    sumPass.end();
+    this.device.submit();
+
+    // ── 2. Clear force texture to zero ────────────────────────────────────────
     // Open a render pass on the force FBO with clearColor:[0,0,0,0] — this zeros
     // all texels so each force pass starts from a known blank slate.
     const forcePass = this.device.beginRenderPass({
@@ -164,7 +227,7 @@ export class GpuForceLayout {
       clearColor: [0, 0, 0, 0],
     });
 
-    // ── 2. Force passes (additive blend, write into forceTex) ─────────────────
+    // ── 3. Force passes (additive blend, write into forceTex) ─────────────────
     // Order among force passes doesn't matter — additive blend accumulates them.
 
     // Attraction (spring gather over CSR neighbors).
@@ -189,6 +252,15 @@ export class GpuForceLayout {
       repulsion: this.params.repulsion,
     });
 
+    // Centering: pull every node toward the centroid (Σpos / count computed above).
+    // maxStep = 1e9 for now; span-based clamp from force.ts can be revisited with
+    // the BH pyramid in Task 5.
+    this.centeringPass.run(forcePass, this.pos.readTex, this.sumTex, {
+      count: this.count,
+      width: this.width,
+      centering: this.params.centering,
+    });
+
     forcePass.end();
     this.device.submit();
 
@@ -209,7 +281,9 @@ export class GpuForceLayout {
       width: this.width,
       alpha: this.params.alpha,
       damping: DAMPING,
-      maxStep: 1e9,
+      // Span-based clamp mirrors force.ts's `span0 * 4` to prevent layout
+      // explosion on pathological forces. See constructor for span0 derivation.
+      maxStep: this.maxStep,
     });
 
     renderPass.end();
@@ -237,6 +311,8 @@ export class GpuForceLayout {
     this.vel.destroy();
     this.forceTex.destroy();
     this.forceFbo.destroy();
+    this.sumTex.destroy();
+    this.sumFbo.destroy();
     this.fbos[0].destroy();
     this.fbos[1].destroy();
     this.offsetsTex.destroy();
@@ -244,5 +320,7 @@ export class GpuForceLayout {
     this.integratePass.destroy();
     this.attractionPass.destroy();
     this.repulsionPass.destroy();
+    this.centroidReducePass.destroy();
+    this.centeringPass.destroy();
   }
 }
