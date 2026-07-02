@@ -480,14 +480,15 @@ the **main thread** each pointer move — the layout backend only reflows *the r
 | --- | --- | --- |
 | `force` (main thread) | a pinned [`ForceLayout`](#large-scale-layout-in-a-web-worker) reheats neighbours each frame | re-cools over a short tail, then stops |
 | `worker` (off thread) | the worker **pins** the held set and reflows the rest off-thread; the main thread holds them under the cursor | the worker is **unpinned** and re-cools |
+| `gpu` (on the GPU) | the GPU layout **pins** the held set (skipped by the integrate pass) and reflows the rest on-GPU; the main thread holds them under the cursor | the layout is **unpinned** and re-cools |
 | `positions` (fixed coords) | the held set simply **translates** (no simulation to reheat) | — |
 
-On the `worker` backend the worker is kept **alive** (idle) after the initial layout converges, so a drag
-can reheat it instantly without re-seeding — the held nodes are pinned (skipped by the worker's integration)
-while their positions are owned by the main thread, so they never rubber-band behind the cursor.
+On the `worker` and `gpu` backends the layout is kept **alive** (idle) after the initial layout converges, so
+a drag can reheat it instantly without re-seeding — the held nodes are pinned (skipped by the backend's
+integration) while their positions are owned by the main thread, so they never rubber-band behind the cursor.
 
 :::note[Drag is opt-in and gated]
 `draggable` is off until you set it (like every `interactive()` option). It only grabs **node** glyphs — a
-drag starting on a *link* still pans — and it reheats only on the `force`/`worker` layout backends; on
+drag starting on a *link* still pans — and it reheats on the `force`/`worker`/`gpu` layout backends; on
 `positions` (caller-supplied coordinates) a drag translates the grabbed set without running a simulation.
 :::
