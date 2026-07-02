@@ -81,6 +81,32 @@ export function pingPong(
 }
 
 /**
+ * Pack a flat `Uint32Array` into an `r32uint` texture atlas.
+ * Each texel stores one uint32 value.
+ * Returns the texture and the atlas width used.
+ */
+export function packUintTexture(
+  device: Device,
+  data: Uint32Array,
+): { texture: Texture; width: number; height: number } {
+  const count = data.length;
+  const width = Math.max(1, Math.ceil(Math.sqrt(count)));
+  const height = Math.ceil(count / width);
+  // Allocate padded buffer so the full width×height rectangle is initialised.
+  const padded = new Uint32Array(width * height);
+  padded.set(data);
+  const texture = device.createTexture({
+    width,
+    height,
+    format: "r32uint",
+    data: padded,
+    mipLevels: 1,
+    sampler: { minFilter: "nearest", magFilter: "nearest" },
+  });
+  return { texture, width, height };
+}
+
+/**
  * Read back `count` (x, y) pairs from an `rg32float` texture via an FBO.
  * Returns a `Float32Array` of length `count * 2`.
  */
