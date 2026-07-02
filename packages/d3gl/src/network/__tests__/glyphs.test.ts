@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { nodeCircles, linkLines, linkArrows, halfArrowLinks, networkLayers, pickNodes, resolveNodeRadii, resolveImportance, resolveLinkColorOf, resolveLinkStrokeOf, type ResolvedNetworkStyle } from "../glyphs.js";
+import { nodeCircles, linkLines, linkArrows, halfArrowLinks, networkLayers, networkLayersFromCache, noLodStyleCache, pickNodes, resolveNodeRadii, resolveImportance, resolveLinkColorOf, resolveLinkStrokeOf, type ResolvedNetworkStyle } from "../glyphs.js";
 import { buildGraph } from "../graph.js";
 
 /** A resolved style with a uniform radius for `n` nodes (defaults applied elsewhere). */
@@ -177,6 +177,56 @@ describe("halfArrowLinks", () => {
     const g = buildGraph({ nodeCount: 2, source: [0], target: [1], weight: [4], directed: true });
     const d = halfArrowLinks(g, { nodeRadii: new Float32Array([2, 2]), widthOf: (w) => w, colorOf: () => [0, 0, 0, 255], bend: 10 });
     expect(Array.from(d.widths)).toEqual([4, 4]); // no 1→0 edge ⇒ oppositeWidth = own width
+  });
+});
+
+describe("networkLayersFromCache (#179 position-only frame)", () => {
+  // The cache split must be output-identical to the full path: reusing the cached style attributes
+  // and rebuilding only endpoints/centres from moved positions yields exactly what networkLayers would.
+  function linkOf(layers: ReturnType<typeof networkLayers>) {
+    const l = layers.find((x) => x.name === "links")!;
+    return l.primitive === "lines" ? l.lines : l.primitive === "half-arrows" ? l.halfArrows : null;
+  }
+
+  it("undirected lines: cached path reuses style bytes, rebuilds endpoints from new positions", () => {
+    const g = buildGraph({ nodeCount: 3, source: [0, 1], target: [1, 2], weight: [3, 7] });
+    g.positions.set([0, 0, 10, 10, 20, 20]);
+    const s = { ...style(3), directed: false, linkWidthOf: (w: number) => w, linkColorOf: (w: number) => [w, 0, 0, 255] as [number, number, number, number] };
+
+    const full = networkLayers(g, s);
+    const cache = noLodStyleCache(g, s);
+    // Move node positions (a layout tick), then rebuild from the cache.
+    g.positions.set([5, 5, 15, 15, 25, 25]);
+    const cached = networkLayersFromCache(g, s, cache);
+    const fullMoved = networkLayers(g, s); // ground truth at the new positions
+
+    const cl = linkOf(cached)!;
+    const fl = linkOf(fullMoved)!;
+    expect(Array.from(cl.sources)).toEqual(Array.from(fl.sources)); // endpoints tracked the move
+    expect(Array.from(cl.targets)).toEqual(Array.from(fl.targets));
+    expect(Array.from(cl.widths)).toEqual(Array.from(fl.widths));    // style bytes identical
+    expect(Array.from(cl.colors)).toEqual(Array.from(fl.colors));
+    // And the cached style bytes match the ORIGINAL emit's (weight-derived, position-independent).
+    expect(Array.from(cl.colors)).toEqual(Array.from(linkOf(full)!.colors));
+  });
+
+  it("directed half-arrows: cached path is output-identical to the full path at moved positions", () => {
+    const g = buildGraph({ nodeCount: 2, source: [0, 1], target: [1, 0], weight: [5, 2], directed: true });
+    g.positions.set([0, 0, 10, 0]);
+    const s: ResolvedNetworkStyle = { ...style(2), directed: true, linkStyle: "half-arrow", linkBend: 30, linkWidthOf: (w) => w, linkColorOf: (w) => [w, 1, 2, 255] };
+
+    const cache = noLodStyleCache(g, s);
+    g.positions.set([2, 3, 12, 3]);
+    const cached = networkLayersFromCache(g, s, cache);
+    const full = networkLayers(g, s);
+
+    const ch = linkOf(cached)!;
+    const fh = linkOf(full)!;
+    expect(Array.from(ch.sources)).toEqual(Array.from(fh.sources));
+    expect(Array.from(ch.targets)).toEqual(Array.from(fh.targets));
+    expect(Array.from((ch as { widths: Float32Array }).widths)).toEqual(Array.from((fh as { widths: Float32Array }).widths));
+    expect(Array.from((ch as { radii: Float32Array }).radii)).toEqual(Array.from((fh as { radii: Float32Array }).radii));
+    expect(Array.from(ch.colors)).toEqual(Array.from(fh.colors));
   });
 });
 
