@@ -4,6 +4,7 @@ import { buildCSR } from "../graph.js";
 import { atlasWidth, pingPong, readbackFloatFbo, packUintTexture } from "./textures.js";
 import { IntegratePass } from "./passes/integrate.js";
 import { AttractionPass } from "./passes/attraction.js";
+import { RepulsionAllPairsPass } from "./passes/repulsion-allpairs.js";
 
 /** Damping applied to velocity each integration step (mirrors CPU force.ts). */
 const DAMPING = 0.9;
@@ -26,6 +27,7 @@ export class GpuForceLayout {
   private readonly params: ForceParams;
   private readonly integratePass: IntegratePass;
   private readonly attractionPass: AttractionPass;
+  private readonly repulsionPass: RepulsionAllPairsPass;
 
   /**
    * Position ping-pong pair. `readTex` = current positions; `writeTex` = render
@@ -143,6 +145,7 @@ export class GpuForceLayout {
 
     this.integratePass = new IntegratePass(device);
     this.attractionPass = new AttractionPass(device);
+    this.repulsionPass = new RepulsionAllPairsPass(device);
   }
 
   /** Execute `ticks` integrate steps on the GPU. */
@@ -161,7 +164,10 @@ export class GpuForceLayout {
       clearColor: [0, 0, 0, 0],
     });
 
-    // ── 2. Attraction pass (additive blend, writes into forceTex) ─────────────
+    // ── 2. Force passes (additive blend, write into forceTex) ─────────────────
+    // Order among force passes doesn't matter — additive blend accumulates them.
+
+    // Attraction (spring gather over CSR neighbors).
     this.attractionPass.run(
       forcePass,
       this.pos.readTex,
@@ -175,6 +181,13 @@ export class GpuForceLayout {
         attraction: this.params.attraction,
       },
     );
+
+    // Repulsion (all-pairs O(n²) correctness baseline; Task 5 replaces with BH).
+    this.repulsionPass.run(forcePass, this.pos.readTex, {
+      count: this.count,
+      width: this.width,
+      repulsion: this.params.repulsion,
+    });
 
     forcePass.end();
     this.device.submit();
@@ -230,5 +243,6 @@ export class GpuForceLayout {
     this.neighborsTex.destroy();
     this.integratePass.destroy();
     this.attractionPass.destroy();
+    this.repulsionPass.destroy();
   }
 }

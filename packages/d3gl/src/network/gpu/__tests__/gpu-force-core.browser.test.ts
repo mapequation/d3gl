@@ -44,6 +44,22 @@ describe("GpuForceLayout integrate", () => {
     expect(Array.from(out)).toEqual([0, 0, 10, 0, 0, 10]);
   });
 
+  it("repulsion pushes two unconnected nodes apart", () => {
+    const g = buildGraph({ nodeCount: 2, source: [], target: [] });
+    g.positions.set([0, 0, 1, 0]);
+    const layout = new GpuForceLayout(device, g, {
+      repulsion: 200,
+      attraction: 0,
+      centering: 0,
+      alpha: 0.2,
+      theta: 0.9,
+    });
+    layout.runFrame(60);
+    const out = new Float32Array(4);
+    layout.readPositions(out);
+    expect(Math.hypot(out[2]! - out[0]!, out[3]! - out[1]!)).toBeGreaterThan(5);
+  });
+
   it("ticking creates no framebuffers (all MRT targets pre-created in the constructor)", () => {
     const g = buildGraph({ nodeCount: 3, source: [], target: [] });
     g.positions.set([0, 0, 10, 0, 0, 10]);
