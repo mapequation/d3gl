@@ -68,7 +68,7 @@ export interface IntegrateUniforms {
 export class IntegratePass {
   private readonly model: Model;
   /** Mutable uniforms dict — mutated before each draw so Model picks them up. */
-  private readonly uniforms: Record<string, unknown>;
+  private readonly uniforms: Record<string, number>;
 
   constructor(device: Device) {
     // Full-screen triangle: three vertices cover the [-1,1] clip square.

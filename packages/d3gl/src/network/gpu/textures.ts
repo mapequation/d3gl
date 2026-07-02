@@ -47,22 +47,29 @@ export interface PingPong {
   destroy(): void;
 }
 
-/** Create a ping-pong pair of `rg32float` textures of size `width × height`. */
+/**
+ * Create a ping-pong pair of `rg32float` textures of size `width × height`.
+ * If `seedData` is given, it seeds the read (A) side (must be `width*height*2`
+ * floats, matching {@link packPositionsTexture}'s padded layout); the write (B)
+ * side always starts zeroed. Without a seed both sides start zeroed.
+ */
 export function pingPong(
   device: Device,
   width: number,
   height: number,
+  seedData?: Float32Array,
 ): PingPong {
-  const make = (): Texture =>
+  const make = (data?: Float32Array): Texture =>
     device.createTexture({
       width,
       height,
       format: "rg32float",
+      ...(data ? { data } : {}),
       mipLevels: 1,
       sampler: { minFilter: "nearest", magFilter: "nearest" },
     });
 
-  let texA = make();
+  let texA = make(seedData);
   let texB = make();
 
   return {
