@@ -72,6 +72,13 @@ export interface NetworkLabelOptions {
   className?: string;
   /** Constant screen-px offset `[dx, dy]` from the glyph centroid (labels are centred on it by default). */
   offset?: [number, number];
+  /**
+   * State-network `"both"` view only (#171): also label the physical **containers**, placed just OUTSIDE
+   * each container disc (upper-right, ≈1:30 on a clock) so the label clears the enclosed state rosette.
+   * `labelOf` maps a physical id → text (`null`/`""` to skip); `gap` is the extra px beyond the disc edge
+   * (default 4). Ignored outside the `both` view. The primary {@link labelOf} still labels the state nodes.
+   */
+  physical?: { labelOf: (physicalId: number) => string | null | undefined; gap?: number };
   /** Font for **backend-native** text (SVG `<text>` / Canvas `fillText`, incl. `toSVG()`/`toPNG()`
    *  export, #105 N7b-2) — a CSS font shorthand, e.g. `"600 11px sans-serif"`. Default `"12px sans-serif"`. */
   font?: string;
@@ -297,10 +304,6 @@ export interface StateNetworkOptions {
   rosetteRadius?: number;
 }
 
-/** Normalised characteristic physical-node spacing (world units) the state-network layout rescales to,
- *  so the fit, rosette radii, and `"both"`-view container radii are stable across network sizes (#171). */
-const STATE_LAYOUT_SPACING = 64;
-
 const DEFAULT_NODE_RADIUS = 4;
 const DEFAULT_NODE_FILL = "#4878d0";
 const DEFAULT_LINK_WIDTH = 1;
@@ -309,32 +312,41 @@ const LAYER_NAMES = ["links", "arrows", "node-halos", "nodes"] as const;
 /** Base-lane layers the shader highlight (#162) drives — nodes + links (not the aggregate halos, which
  *  carry no group/selected and so render un-dimmed). */
 const HL_LAYERS = ["nodes", "links", "arrows"] as const;
-/** Rescale a laid-out graph's positions (in place, about their centroid) so the characteristic node
- *  spacing (bounding-box diagonal ÷ √count) equals `target`. Keeps the state-network rosette + container
- *  radii — both keyed off a fixed spacing — stable across network sizes (#171). */
-function normalizeSpacing(positions: Float32Array, count: number, target: number): void {
+/** Scale a laid-out graph's positions (in place) to fill the view at the default `k = 1` zoom — the
+ *  same "scale the layout, don't fit-transform" approach the directed-map-of-modules example uses, so
+ *  the network opens framed without a custom transform (which would fight d3-zoom's own transform, #171).
+ *  Centres on the centroid and scales the 97th-percentile radius (robust to force-layout fling-outs) to
+ *  ~0.85× half the view. */
+function scaleToViewport(positions: Float32Array, count: number, width: number, height: number): void {
   if (count <= 1) return;
-  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
   let cx = 0, cy = 0;
+  for (let p = 0; p < count; p++) { cx += positions[2 * p]!; cy += positions[2 * p + 1]!; }
+  cx /= count;
+  cy /= count;
+  const dists = new Float64Array(count);
+  for (let p = 0; p < count; p++) dists[p] = Math.hypot(positions[2 * p]! - cx, positions[2 * p + 1]! - cy);
+  dists.sort();
+  const r = dists[Math.floor(count * 0.97)] || dists[count - 1] || 1;
+  const s = ((Math.min(width, height) / 2) * 0.85) / r;
+  for (let p = 0; p < count; p++) {
+    positions[2 * p] = width / 2 + (positions[2 * p]! - cx) * s;
+    positions[2 * p + 1] = height / 2 + (positions[2 * p + 1]! - cy) * s;
+  }
+}
+
+/** Characteristic node spacing of a laid-out graph (bounding-box diagonal ÷ √count) — the scale the
+ *  state-network container / rosette radii are sized against (#171). */
+function physicalSpacing(positions: Float32Array, count: number): number {
+  if (count <= 1) return 1;
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
   for (let p = 0; p < count; p++) {
     const x = positions[2 * p]!, y = positions[2 * p + 1]!;
     if (x < minX) minX = x;
     if (x > maxX) maxX = x;
     if (y < minY) minY = y;
     if (y > maxY) maxY = y;
-    cx += x;
-    cy += y;
   }
-  cx /= count;
-  cy /= count;
-  const span = Math.hypot(maxX - minX, maxY - minY);
-  const spacing = Math.max(span / Math.sqrt(count), 1e-6);
-  const s = target / spacing;
-  if (!(s > 0) || Math.abs(s - 1) < 1e-3) return;
-  for (let p = 0; p < count; p++) {
-    positions[2 * p] = cx + (positions[2 * p]! - cx) * s;
-    positions[2 * p + 1] = cy + (positions[2 * p + 1]! - cy) * s;
-  }
+  return Math.max(Math.hypot(maxX - minX, maxY - minY) / Math.sqrt(count), 1);
 }
 
 /** `[0, 1, …, n-1]` as float32 — the no-LOD node layer's `a_group` (instance i is node i). */
@@ -467,8 +479,13 @@ export class Network extends BaseEngine {
    *  `both` view's faint container fill. */
   private physicalColors: string[] | null = null;
   /** `both`-view physical **container** radii (world units), sized so a physical node's confined state
-   *  rosette fits inside it; also the state view's spread bound. Null until {@link stateNetwork}. */
+   *  rosette fits inside it. Computed post-layout, relative to {@link stateSpacing}; null until then. */
   private containerRadii: Float32Array | null = null;
+  /** Characteristic physical-node spacing of the (viewport-scaled) layout — the scale container/rosette
+   *  radii are sized against, so they track the layout instead of a fixed constant (#171). 0 until laid out. */
+  private stateSpacing = 0;
+  /** `both`-view state-node dot radius (world units), sized to fit inside the containers. 0 until laid out. */
+  private bothDotRadius = 0;
   /** State-view rosette radius override (world units); null = auto from the physical layout scale. */
   private rosetteRadius: number | null = null;
   /** Registry key + layer name for the physical-view pie glyphs (drawn on top of the node discs). */
@@ -535,17 +552,15 @@ export class Network extends BaseEngine {
     this.stateColors = moduleColors(opts.modules, opts.color);
     const wedges = this.pieWedges;
     const pc = new Array<string>(graph.physicalCount);
-    const container = new Float32Array(graph.physicalCount);
-    const off = graph.physicalToState.offsets;
     for (let p = 0; p < graph.physicalCount; p++) {
       pc[p] = wedges.wedgeCount[p]! > 0 ? wedges.color[wedges.offset[p]!]! : DEFAULT_NODE_FILL;
-      // Container radius sized to hold `count` state-node dots on a disc, capped so it fits within the
-      // normalised layout spacing (so neighbouring containers don't overlap in the `both` view).
-      const count = off[p + 1]! - off[p]!;
-      container[p] = Math.min(0.44 * STATE_LAYOUT_SPACING, 3.2 * Math.sqrt(Math.max(count, 1)) + 4);
     }
     this.physicalColors = pc;
-    this.containerRadii = container;
+    // Container / rosette radii are sized against the layout scale, so they're (re)computed post-layout
+    // ({@link computeStateSizing}); zeroed here until then.
+    this.containerRadii = null;
+    this.stateSpacing = 0;
+    this.bothDotRadius = 0;
     this.applyView();
     return this;
   }
@@ -574,11 +589,35 @@ export class Network extends BaseEngine {
     const physical = this.activeView === "physical";
     const colors = (physical ? this.physicalColors : this.stateColors)!;
     // Set the per-view node fill BEFORE setActiveGraph's rebuild so the first paint is correctly coloured.
-    this.styleOpts = { ...this.styleOpts, nodeFill: (i: number) => colors[i] ?? DEFAULT_NODE_FILL };
+    // In the `both` view the engine also owns the state-node dot radius (sized to fit the containers), so
+    // the example never has to know the layout scale.
+    const fill = (i: number) => colors[i] ?? DEFAULT_NODE_FILL;
+    this.styleOpts =
+      this.activeView === "both" && this.bothDotRadius > 0
+        ? { ...this.styleOpts, nodeFill: fill, nodeRadius: this.bothDotRadius }
+        : { ...this.styleOpts, nodeFill: fill };
     // LOD is only defined for the state view (its nodes carry the module tree); physical/both draw full.
     if (this.activeView !== "state" && this.lodOptions) this.lodOptions = null;
     this.deriveStatePositions(); // view-dependent rosette (spread vs. container-confined)
     this.setActiveGraph(physical ? sg.physical : sg.state);
+  }
+
+  /** Size the container / rosette radii against the (just-laid-out, viewport-scaled) physical layout, so
+   *  they track the layout scale instead of a fixed constant. Called post-layout. */
+  private computeStateSizing(): void {
+    const sg = this.stateData;
+    if (!sg) return;
+    const spacing = physicalSpacing(sg.physical.positions, sg.physicalCount);
+    this.stateSpacing = spacing;
+    this.bothDotRadius = spacing * 0.03;
+    const off = sg.physicalToState.offsets;
+    const container = new Float32Array(sg.physicalCount);
+    for (let p = 0; p < sg.physicalCount; p++) {
+      const count = off[p + 1]! - off[p]!;
+      // Grows with the state-node count but capped so neighbouring containers (≈`spacing` apart) don't overlap.
+      container[p] = Math.min(0.46 * spacing, spacing * (0.12 + 0.045 * Math.sqrt(count)));
+    }
+    this.containerRadii = container;
   }
 
   /** Write the state-node positions for the active view into `state.positions`: a **spread** rosette for
@@ -589,10 +628,9 @@ export class Network extends BaseEngine {
     const sg = this.stateData;
     if (!sg || this.activeView === "physical") return;
     const container = this.containerRadii;
+    const spread = this.rosetteRadius ?? (this.stateSpacing > 0 ? this.stateSpacing * 0.33 : 12);
     const radius =
-      this.activeView === "both" && container
-        ? (p: number) => 0.72 * container[p]!
-        : this.rosetteRadius ?? ((_p: number, count: number) => Math.min(0.4 * STATE_LAYOUT_SPACING, 4 * Math.sqrt(count)));
+      this.activeView === "both" && container ? (p: number) => 0.72 * container[p]! : () => spread;
     sg.state.positions.set(rosettePositions(sg, { radius }));
   }
 
@@ -776,6 +814,24 @@ export class Network extends BaseEngine {
       }
     }
 
+    // State-network `both` view (#171): also label the physical containers, placed just outside each disc
+    // (upper-right ≈1:30) so the label clears the enclosed state rosette. Per-container screen offset =
+    // (container world-radius × k + gap) along the 1:30 direction, recomputed here so it tracks zoom.
+    if (this.stateData && this.activeView === "both" && opts.physical && this.containerRadii) {
+      const { labelOf: nameOf, gap = 4 } = opts.physical;
+      const k = this.transform.k;
+      const pos = this.stateData.physical.positions;
+      const DX = 0.70710678, DY = -0.70710678; // 1:30 in screen px (x → right, −y → up)
+      for (let p = 0; p < this.stateData.physicalCount; p++) {
+        const x = pos[2 * p]!, y = pos[2 * p + 1]!;
+        if (!inView(x, y)) continue;
+        const text = nameOf(p);
+        if (!text) continue;
+        const dist = this.containerRadii[p]! * k + gap;
+        anchors.push({ id: `phys:${p}`, refX: x, refY: y, text, offset: [DX * dist, DY * dist], transform: "translate(-50%, -50%)" });
+      }
+    }
+
     // Route by backend (#105 N7b-2): a backend that draws text natively (SVG `<text>` / Canvas
     // `fillText`) renders the labels so they survive toSVG()/toPNG(); otherwise (WebGL) the HTML
     // overlay does. Project + cull is shared (placeLabels), so both paths place labels identically.
@@ -903,10 +959,15 @@ export class Network extends BaseEngine {
       } else {
         multilevelLayout(phys, { width: this.width, height: this.height, iterations, force: opts.force });
       }
-      // Rescale the physical layout to the normalised spacing so the rosette radii + `both`-view container
-      // radii (both keyed off STATE_LAYOUT_SPACING) are stable across network sizes. Caller-supplied
-      // positions are taken as-is.
-      normalizeSpacing(phys.positions, sg.physicalCount, STATE_LAYOUT_SPACING);
+      // Scale the layout to fill the view at k=1 (the map-of-modules approach) so it opens framed without
+      // a fit-transform. Caller-supplied positions are taken as-is (already placed).
+      scaleToViewport(phys.positions, sg.physicalCount, this.width, this.height);
+    }
+    // Size container / rosette radii + the both-view dot radius against the resulting layout scale.
+    this.computeStateSizing();
+    if (this.activeView === "both" && this.bothDotRadius > 0) {
+      this.styleOpts = { ...this.styleOpts, nodeRadius: this.bothDotRadius };
+      this.resolvedCache = null;
     }
     this.deriveStatePositions(); // view-appropriate rosette from the laid-out physical positions
     this.recomputeLODGeometry();

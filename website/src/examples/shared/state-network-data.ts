@@ -133,6 +133,11 @@ export interface SyntheticStateNetwork {
   graph: StateNetworkGraph;
   /** Per-**state-node** module records ({id, path:[community+1, rank]}) for colours / pie wedges. */
   stateModules: ModulePathNode[];
+  /** Physical node labels: 1-based ids as strings (`"1"`, `"2"`, …), indexed by physical id. */
+  physicalNames: string[];
+  /** State node labels: `"(i,j)"` with `i`,`j` the 1-based physical ids of the state node's
+   *  (previous, current) endpoints, indexed by state-node id. */
+  stateNames: string[];
   /** The underlying physical network (communities, edges) for reference / physical-view colouring. */
   physical: PhysicalNetwork;
 }
@@ -220,5 +225,10 @@ export function generateStateNetwork(opts: StateNetworkOptions = {}): SyntheticS
     stateModules[s] = { id: s, path: [c + 1, rank] };
   }
 
-  return { graph, stateModules, physical };
+  // Human labels: physical nodes are 1-based ids; a state node (prev→curr) is "(i,j)" over those ids.
+  const physicalNames = Array.from({ length: physicalCount }, (_, p) => String(p + 1));
+  const stateNames = new Array<string>(stateCount);
+  for (let s = 0; s < stateCount; s++) stateNames[s] = `(${prev[s]! + 1},${curr[s]! + 1})`;
+
+  return { graph, stateModules, physicalNames, stateNames, physical };
 }

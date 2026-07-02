@@ -58,6 +58,11 @@ export type ImperativeSetup = (
     };
 
 /** Declares one example-specific control rendered in the shared control bar. */
+/** Predicate deciding whether a control is (visibly) disabled for the current option values — it stays
+ *  laid out (no reflow) but greyed and non-interactive. e.g. LOD sub-controls disabled unless in a view
+ *  that supports LOD. */
+export type ControlDisabled = (options: Record<string, unknown>) => boolean;
+
 export type ControlSpec =
   | {
       type?: "segmented";
@@ -68,6 +73,7 @@ export type ControlSpec =
       options: string[];
       /** Default option (else the first). */
       value?: string;
+      disabled?: ControlDisabled;
     }
   | {
       type: "range";
@@ -80,6 +86,7 @@ export type ControlSpec =
       value: number;
       /** Optional per-step display labels, indexed by (value - min) / step (e.g. ["1°","2°"]). */
       display?: string[];
+      disabled?: ControlDisabled;
     }
   | {
       type: "select";
@@ -89,6 +96,7 @@ export type ControlSpec =
       options: string[];
       /** Default value (else options[0]). */
       value?: string;
+      disabled?: ControlDisabled;
     }
   | {
       /** An action button. Each click bumps opts[key] (a monotonically increasing
@@ -97,4 +105,5 @@ export type ControlSpec =
       type: "button";
       key: string;
       label: string;
+      disabled?: ControlDisabled;
     };

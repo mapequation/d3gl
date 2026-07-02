@@ -85,15 +85,13 @@ describe("state-network engine (#171)", () => {
     await net.whenReady();
     net.stateNetwork(graph, { modules, view: "both" }).layout({ backend: "force" });
 
-    // Every state node lies within its physical node's container radius (confined rosette).
-    // physical 0 holds 2 state nodes; 1 and 2 hold one each (a lone state node sits at the centre).
-    for (let p = 0; p < graph.physicalCount; p++) {
-      const px = graph.physical.positions[2 * p]!;
-      const py = graph.physical.positions[2 * p + 1]!;
-      for (let i = graph.physicalToState.offsets[p]!; i < graph.physicalToState.offsets[p + 1]!; i++) {
-        const s = graph.physicalToState.states[i]!;
-        const d = Math.hypot(graph.state.positions[2 * s]! - px, graph.state.positions[2 * s + 1]! - py);
-        expect(d).toBeLessThan(0.44 * 64); // ≤ the max container radius
+    // Each state node is confined to its own physical node's container: it must be nearer to its own
+    // physical node than to any other (the rosette radius is a fraction of the inter-node spacing).
+    const distTo = (s: number, p: number) => Math.hypot(graph.state.positions[2 * s]! - graph.physical.positions[2 * p]!, graph.state.positions[2 * s + 1]! - graph.physical.positions[2 * p + 1]!);
+    for (let s = 0; s < graph.state.nodeCount; s++) {
+      const own = graph.stateToPhysical[s]!;
+      for (let q = 0; q < graph.physicalCount; q++) {
+        if (q !== own) expect(distTo(s, own)).toBeLessThan(distTo(s, q));
       }
     }
     net.destroy();

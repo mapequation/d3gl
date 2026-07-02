@@ -10,50 +10,33 @@ const VIEW = { Physical: "physical", State: "state", Both: "both" } as const;
 /**
  * **State (higher-order / memory) networks — physical / state / both views with overlapping-module pies.**
  *
- * A state network's links run between **state nodes**, each belonging to a **physical node** (the same
- * location in different memory / context). `net.stateNetwork(graph, { modules })` ingests it (built by
- * `buildStateGraph`, which also derives the physical network) + a per-state-node module assignment, and
- * `net.view(…)` toggles three renderings of the *same* data:
+ * `net.stateNetwork(graph, { modules })` ingests a state network (built by `buildStateGraph`, which also
+ * derives the physical network) + a per-state-node module assignment; `net.view(…)` toggles three
+ * renderings of the *same* data:
  *
- * - **Physical** — the derived physical network (flow-sized nodes, half-arrow links). A physical node
- *   whose state nodes span several modules is a **pie chart** (wedge per module, sized by flow); a
+ * - **Physical** — the derived physical network (flow-sized nodes, bent links). A physical node whose
+ *   state nodes span several modules is a **pie chart** (a wedge per module, sized by flow); a
  *   single-module node is a solid disc.
  * - **State** — every state node on a golden-angle **rosette** around its physical node, coloured by
  *   module. `net.lod({ modules })` (the **LOD** control) aggregates the state nodes into their modules.
  * - **Both** — state nodes confined **inside** each physical node's container disc, with state-level
- *   links — the memory structure in its physical context.
+ *   links: the memory structure in its physical context.
  *
- * Data is synthetic (`state-network-data.ts`): an LFR physical network + node2vec trigrams, each state
- * node's module set to its *previous* node's community — so bridge physical nodes overlap modules → pies.
- * Positions are the CPU stopgap (in-library force layout of the physical graph + rosette) until the
- * module-aware GPU layout lands. Scroll to zoom, drag to pan.
+ * The data is synthetic (`state-network-data.ts`): an LFR physical network + node2vec trigrams, node
+ * labels `1,2,…` (physical) and `(i,j)` (state). The engine lays out the physical graph and derives the
+ * rosette (the CPU stopgap until the module-aware GPU layout); it also **scales the layout to fill the
+ * view** so it opens framed — no fit-transform. Scroll to zoom, drag to pan.
  */
 export const setup: ImperativeSetup = (host, { width, height, backend }) => {
   const net = network(host, { width, height, backend });
-  net.enableZoom([0.02, 80]);
+  net.enableZoom([0.05, 60]);
 
-  // Module-aggregate labels for the state view under LOD (their state-node count).
   const labelStyle = document.createElement("style");
-  labelStyle.textContent = ".sn-label{font:600 11px/1 system-ui,sans-serif;color:#1f2937;text-shadow:0 0 3px #fff,0 0 3px #fff}";
+  labelStyle.textContent = ".sn-label{font:600 11px/1 system-ui,sans-serif;color:#111827;text-shadow:0 0 3px #fff,0 0 3px #fff}";
   host.appendChild(labelStyle);
 
   let data: SyntheticStateNetwork | null = null;
   let builtN = -1;
-
-  const fit = (): void => {
-    const pos = net.stateView === "physical" ? data!.graph.physical.positions : data!.graph.state.positions;
-    const n = net.stateView === "physical" ? data!.graph.physicalCount : data!.graph.state.nodeCount;
-    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
-    for (let i = 0; i < n; i++) {
-      const x = pos[2 * i]!, y = pos[2 * i + 1]!;
-      if (x < minX) minX = x;
-      if (x > maxX) maxX = x;
-      if (y < minY) minY = y;
-      if (y > maxY) maxY = y;
-    }
-    const k = Math.min(width / (maxX - minX || 1), height / (maxY - minY || 1)) * 0.8;
-    net.setTransform({ k, x: width / 2 - ((minX + maxX) / 2) * k, y: height / 2 - ((minY + maxY) / 2) * k });
-  };
 
   return {
     engine: net,
@@ -62,7 +45,7 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
       const n = NODES[(options.nodes as number) ?? 1] ?? 100;
       const view = VIEW[(options.view as keyof typeof VIEW) ?? "Physical"] ?? "physical";
       const physical = view === "physical";
-      const world = view === "both" || options.sizing === "World"; // "both" needs world units for containment
+      const halfArrow = options.links !== "Line"; // default: half-arrows (the map-of-modules glyph)
       const dataChanged = !data || builtN !== n;
       if (dataChanged) {
         data = generateStateNetwork({ nodeCount: n, communityCount: 6, mu: 0.18, avgDegree: 8, seed: 3 });
@@ -70,30 +53,26 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
       }
       const g = data!;
 
-      // Flow-sized nodes + flow-scaled links for the physical "map" view; small uniform glyphs elsewhere.
-      const flow = g.graph.physical.flow!;
-      let hi = 0;
-      for (const f of flow) if (f > hi) hi = f;
+      let hiFlow = 0;
+      for (const f of g.graph.physical.flow!) if (f > hiFlow) hiFlow = f;
+      // The engine owns nodeFill (module colours) and, in the "both" view, nodeRadius (dots sized to the
+      // containers) — so this only sets the shared appearance + the physical/state node size.
       net.style({
         directed: true,
-        sizeMode: world ? "world" : "screen",
-        linkStyle: physical ? "half-arrow" : "line",
-        linkBend: physical ? 0.2 : 0.12,
-        nodeRadius: physical ? { by: "flow", scale: scaleSqrt().domain([0, hi]).range([4, 22]) } : view === "both" ? 2.5 : 5,
-        nodeBorder: view === "both" ? undefined : { width: 1, color: "#ffffff" },
-        linkStroke: physical ? "rgba(90,110,150,0.5)" : "rgba(120,132,156,0.3)",
+        sizeMode: view === "both" || options.sizing === "World" ? "world" : "screen",
+        linkStyle: halfArrow ? "half-arrow" : "line",
+        linkBend: halfArrow ? 14 : 0.15, // half-arrow: world-unit bow; line: fraction of chord — both bent
+        linkStroke: physical ? "rgba(90,110,150,0.5)" : "rgba(120,132,156,0.32)",
         linkWidth: physical ? { by: "weight", scale: scaleSqrt().domain([0, 8]).range([1, 6]).clamp(true) } : 1,
+        nodeBorder: view === "both" ? undefined : { width: 1, color: "#000000" },
+        ...(view === "both" ? {} : { nodeRadius: physical ? { by: "flow" as const, scale: scaleSqrt().domain([0, hiFlow]).range([4, 22]) } : 5 }),
       });
 
-      if (dataChanged) {
-        net.stateNetwork(g.graph, { modules: g.stateModules, view }).layout({ backend: "force" });
-        fit();
-      } else {
-        net.view(view);
-      }
+      if (dataChanged) net.stateNetwork(g.graph, { modules: g.stateModules, view }).layout({ backend: "force" });
+      else net.view(view);
 
-      // LOD is meaningful only in the state view (its nodes carry the module tree); default Off.
-      // "Modules" cuts on the provided partition; "Standard" coarsens the state graph structurally.
+      // LOD applies only to the state view (its nodes carry the module tree); default Off. "Modules" cuts
+      // on the provided partition; "Standard" coarsens the state graph structurally.
       const lodOn = view === "state" && options.lod !== "Off";
       net.lod(
         lodOn
@@ -108,11 +87,21 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
           : false,
       );
 
-      // Module-count labels on the state-view LOD frontier (aggregates only), capped by the Labels control.
+      // Labels: physical (1,2,…) in the physical + both views, state ((i,j)) in the state + both views.
+      // In the both view physical labels sit just outside each container (≈1:30); state labels on the dots.
+      const physOn = options.physLabels === "On";
+      const stateOn = options.stateLabels === "On";
       const cap = LABEL_CAPS[(options.maxLabels as number) ?? 1] ?? 12;
+      const showState = (view === "state" || view === "both") && stateOn;
+      const showPhysical = (physical && physOn) || (view === "both" && physOn);
       net.labels(
-        lodOn
-          ? { className: "sn-label", max: Number.isFinite(cap) ? cap : undefined, labelOf: (_id, info) => (info.aggregate ? `${info.count}` : null) }
+        showState || showPhysical
+          ? {
+              className: "sn-label",
+              max: Number.isFinite(cap) ? cap : undefined,
+              labelOf: (id) => (physical ? (physOn ? g.physicalNames[id] ?? null : null) : stateOn ? g.stateNames[id] ?? null : null),
+              physical: view === "both" && physOn ? { labelOf: (p) => g.physicalNames[p] ?? null } : undefined,
+            }
           : false,
       );
     },

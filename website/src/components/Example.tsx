@@ -24,10 +24,11 @@ function Segmented<T extends string>(props: {
   value: T;
   options: readonly T[];
   onChange: (v: T) => void;
+  disabled?: boolean;
 }) {
-  const { label, value, options, onChange } = props;
+  const { label, value, options, onChange, disabled } = props;
   return (
-    <div className="flex items-center gap-1.5">
+    <div className={`flex items-center gap-1.5${disabled ? " pointer-events-none opacity-40" : ""}`} aria-disabled={disabled || undefined}>
       {label && <span className="text-muted-foreground text-[11px]">{label}</span>}
       <div role="group" aria-label={label} className="inline-flex isolate">
         {options.map((opt, i) => {
@@ -161,8 +162,9 @@ function RangeSlider(props: {
   spec: Extract<ControlSpec, { type: "range" }>;
   value: number;
   onCommit: (v: number) => void;
+  disabled?: boolean;
 }) {
-  const { spec } = props;
+  const { spec, disabled } = props;
   const [live, setLive] = useState(props.value);
   useEffect(() => setLive(props.value), [props.value]);
   const labelAt = (v: number): string => spec.display?.[(v - spec.min) / spec.step] ?? String(v);
@@ -173,12 +175,13 @@ function RangeSlider(props: {
     ? spec.display.reduce((a, b) => (b.length > a.length ? b : a), "")
     : String(spec.max);
   return (
-    <div className="flex h-6 items-center gap-1.5">
+    <div className={`flex h-6 items-center gap-1.5${disabled ? " opacity-40" : ""}`} aria-disabled={disabled || undefined}>
       <span className="text-muted-foreground text-[11px]">{spec.label}</span>
       <input
         type="range"
         className="accent-primary h-1 w-32"
         aria-label={spec.label}
+        disabled={disabled}
         min={spec.min}
         max={spec.max}
         step={spec.step}
@@ -449,6 +452,9 @@ export default function Example(props: ExampleProps) {
           {/* Controls render in declaration order so each example controls its own layout. */}
           <div className="flex flex-wrap items-center gap-x-4 gap-y-2 px-3 pt-1.5 pb-2.5">
             {controls.map((c) => {
+              // A control may declare itself disabled for the current option values — it stays laid out
+              // (no reflow) but greyed + non-interactive.
+              const disabled = c.disabled?.(options) ?? false;
               if (c.type === "range") {
                 return (
                   <RangeSlider
@@ -456,16 +462,18 @@ export default function Example(props: ExampleProps) {
                     spec={c}
                     value={Number(options[c.key])}
                     onCommit={(v) => setOptions((o) => ({ ...o, [c.key]: v }))}
+                    disabled={disabled}
                   />
                 );
               }
               if (c.type === "select") {
                 return (
-                  <label key={c.key} className="flex items-center gap-1.5">
+                  <label key={c.key} className={`flex items-center gap-1.5${disabled ? " opacity-40" : ""}`} aria-disabled={disabled || undefined}>
                     <span className="text-muted-foreground text-[11px]">{c.label}</span>
                     <select
                       className="border-border bg-background text-foreground focus-visible:ring-outline/50 h-6 rounded-md border py-0 pr-1 pl-1.5 text-[11px] leading-none outline-none focus-visible:ring-2"
                       value={String(options[c.key])}
+                      disabled={disabled}
                       onChange={(e) => setOptions((o) => ({ ...o, [c.key]: e.target.value }))}
                     >
                       {c.options.map((opt) => (
@@ -477,12 +485,11 @@ export default function Example(props: ExampleProps) {
               }
               if (c.type === "button") {
                 return (
-                  <ActionButton
-                    key={c.key}
-                    onClick={() => setOptions((o) => ({ ...o, [c.key]: (Number(o[c.key]) || 0) + 1 }))}
-                  >
-                    {c.label}
-                  </ActionButton>
+                  <span key={c.key} className={disabled ? "pointer-events-none opacity-40" : undefined}>
+                    <ActionButton onClick={() => setOptions((o) => ({ ...o, [c.key]: (Number(o[c.key]) || 0) + 1 }))}>
+                      {c.label}
+                    </ActionButton>
+                  </span>
                 );
               }
               // segmented (the default control type)
@@ -493,6 +500,7 @@ export default function Example(props: ExampleProps) {
                   value={String(options[c.key])}
                   options={c.options}
                   onChange={(v) => setOptions((o) => ({ ...o, [c.key]: v }))}
+                  disabled={disabled}
                 />
               );
             })}
