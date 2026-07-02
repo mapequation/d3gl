@@ -5,15 +5,17 @@ import { setup } from "./draw.js";
 /** True unless the State view is active — the LOD cut (and its sub-controls) only apply there. */
 const notState = (o: Record<string, unknown>) => o.view !== "State";
 
-/** Harness for the state-network example: **Nodes** (physical count, up to 10k), a **View** toggle
- *  (Physical pies / State rosette / Both), a **Links** toggle (half-arrow / line, both bent), **Physical**
- *  / **State** label toggles, and the "directed map of modules" option set. The LOD cut only applies to
- *  the State view, so LOD + its sub-controls are **disabled** (greyed, no reflow) in the other views. */
+/** Harness for the state-network example: **Nodes** (physical count, up to 10k), a **Backend** toggle
+ *  (Force / Worker / GPU — #182) for the physical layout, a **View** toggle (Physical pies / State
+ *  rosette / Both), a **Links** toggle (half-arrow / line, both bent), **Physical** / **State** label
+ *  toggles, and the "directed map of modules" option set. The LOD cut only applies to the State view, so
+ *  LOD + its sub-controls are **disabled** (greyed, no reflow) in the other views. */
 export default function StateNetwork() {
   return (
     <Example
       controls={[
         { type: "range", key: "nodes", label: "Nodes", min: 0, max: 3, step: 1, value: 1, display: ["10", "100", "1,000", "10,000"] },
+        { type: "segmented", key: "backend", label: "Backend", options: ["Force", "Worker", "GPU"] },
         { type: "segmented", key: "view", label: "View", options: ["Physical", "State", "Both"] },
         { type: "segmented", key: "links", label: "Links", options: ["Half-arrow", "Line"] },
         { type: "segmented", key: "physLabels", label: "Physical labels", options: ["Off", "On"] },

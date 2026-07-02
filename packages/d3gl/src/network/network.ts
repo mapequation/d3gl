@@ -172,10 +172,13 @@ export interface NetworkStyle {
   linkBend?: number;
 }
 
-/** How node positions are produced. The worker / GPU backends land in later slices. */
+/** How node positions are produced. Applies to plain graphs ({@link Network.layout}) and, since #182,
+ *  state networks ({@link Network.stateNetwork}) — there every backend lays out the **physical** graph
+ *  and the state/both views' rosette is derived from it. */
 export interface NetworkLayoutOptions {
-  /** `"positions"` uses caller-supplied coordinates; `"force"` runs the in-library force
-   *  layout on the main thread; `"worker"`/`"gpu"` land later. */
+  /** `"positions"` uses caller-supplied coordinates; `"force"` runs the in-library force layout on the
+   *  main thread; `"worker"` runs it off-thread with progressive streaming; `"gpu"` runs a WebGL2
+   *  Barnes-Hut solve (falling back to `"worker"` when unavailable). */
   backend?: "positions" | "force" | "worker" | "gpu";
   /** Interleaved `[x, y, …]` world coordinates for `backend: "positions"`. */
   positions?: Float32Array;
@@ -965,40 +968,90 @@ export class Network extends BaseEngine {
     return this.rebuild();
   }
 
-  /**
-   * Layout for state-network mode (#171): lay out the **physical** graph (the coarser structure) with the
-   * requested backend, then derive the **rosette** state positions from it. Both view graphs share their
-   * own position buffer, so after this the active view renders immediately. `backend: "positions"` supplies
-   * the **physical** positions directly; `force`/`worker` run the in-library layout on the physical graph
-   * (the CPU stopgap until #106's module-aware GPU `stateLayout` supplies both position sets).
-   */
-  private layoutStateNetwork(opts: NetworkLayoutOptions): this {
-    const sg = this.stateData!;
-    this.layoutOpts = { ...this.layoutOpts, ...opts };
-    const phys = sg.physical;
-    if (opts.backend === "positions" && opts.positions) {
-      phys.positions.set(opts.positions);
-    } else {
-      // Main-thread force on the physical graph. (Worker/GPU backends for state networks are a follow-up;
-      // the physical graph is the coarser of the two, so this stopgap handles demo-scale networks.)
-      const iterations = opts.iterations ?? DEFAULT_FORCE_ITERATIONS;
-      if (opts.multilevel === false) {
-        seedPositions(phys, this.width, this.height);
-        new ForceLayout(phys, opts.force).run(iterations);
-      } else {
-        multilevelLayout(phys, { width: this.width, height: this.height, iterations, force: opts.force });
-      }
-      // Scale the layout to fill the view at k=1 (the map-of-modules approach) so it opens framed without
-      // a fit-transform. Caller-supplied positions are taken as-is (already placed).
-      scaleToViewport(phys.positions, sg.physicalCount, this.width, this.height);
-    }
-    // Size container / rosette radii + the both-view dot radius against the resulting layout scale.
+  /** Post-layout bookkeeping for state-network mode (#171/#182), shared by every backend and every
+   *  streamed frame: size the container/rosette radii against the (current) physical layout scale, apply
+   *  the `both`-view dot radius, and re-derive the active view's rosette positions from the physical
+   *  positions. O(physicalCount) sizing + O(stateCount) rosette placement — cheap enough to call once per
+   *  streamed physical frame (worker/gpu backends) as well as once after a synchronous solve. */
+  private applyStateDerivedPositions(): void {
     this.computeStateSizing();
     if (this.activeView === "both" && this.bothDotRadius > 0) {
       this.styleOpts = { ...this.styleOpts, nodeRadius: this.bothDotRadius };
       this.resolvedCache = null;
     }
-    this.deriveStatePositions(); // view-appropriate rosette from the laid-out physical positions
+    this.deriveStatePositions();
+  }
+
+  /**
+   * Layout for state-network mode (#171/#182): lay out the **physical** graph (the coarser structure) with
+   * the requested backend, then derive the **rosette** state positions from it. Both view graphs share
+   * their own position buffer, so after this the active view renders immediately.
+   *
+   * - `backend: "positions"` supplies the **physical** positions directly.
+   * - `backend: "force"` runs the in-library multilevel/force layout on the physical graph, synchronously.
+   * - `backend: "worker"` / `"gpu"` mirror {@link layout}'s async branches, but drive the **physical**
+   *   graph: positions stream progressively into `sg.physical.positions`, and each coalesced frame
+   *   ({@link scheduleLayoutRepaint}) re-derives the rosette from them, so the state/both views converge
+   *   live alongside the physical layout. No worker-built LOD tree is requested here (`lod` stays unset) —
+   *   the state-network LOD tree is over the state/module hierarchy, a different structure from the
+   *   worker's physical-graph coarsening; module-aware GPU layout (#106 N8.2-4) is a later milestone.
+   */
+  private layoutStateNetwork(opts: NetworkLayoutOptions): this {
+    const sg = this.stateData!;
+    this.layoutOpts = { ...this.layoutOpts, ...opts };
+    const phys = sg.physical;
+    this.stopLayout(); // cancel a running physical-layout worker/GPU stream before re-seeding
+
+    if (opts.backend === "positions" && opts.positions) {
+      phys.positions.set(opts.positions);
+      this.applyStateDerivedPositions();
+      this.recomputeLODGeometry();
+      return this.rebuild();
+    }
+
+    if (opts.backend === "worker" || opts.backend === "gpu") {
+      const onPhysFrame = () => this.scheduleLayoutRepaint();
+      const workerOpts = {
+        width: this.width,
+        height: this.height,
+        iterations: opts.iterations ?? DEFAULT_FORCE_ITERATIONS,
+        force: opts.force,
+      };
+      const handle: WorkerLayoutHandle =
+        opts.backend === "worker"
+          ? startWorkerLayout(phys, { ...workerOpts, multilevel: opts.multilevel }, onPhysFrame)
+          : startGpuLayout(this.whenBackendSettled().then(() => this.gpuDevice()), phys, workerOpts, onPhysFrame);
+      this.layoutHandle = handle;
+      void handle.settled.then(() => {
+        if (this.layoutHandle !== handle) return; // a newer layout superseded this one
+        // Frame the physical layout to fill the view at k=1 now that it's at rest — scaleToViewport
+        // mutates the shared position buffer in place, so it's only safe once the worker/GPU stream has
+        // stopped writing it (during the run the force's own centering keeps it roughly framed).
+        scaleToViewport(phys.positions, sg.physicalCount, this.width, this.height);
+        this.applyStateDerivedPositions();
+        this.recomputeLODGeometry(true);
+        this.rebuild();
+      });
+      // `worker` seeds `phys.positions` synchronously before returning; the async `gpu` device promise
+      // seeds once it resolves. Either way, deriving now (rather than leaving a stale prior rosette on
+      // screen) is cheap and self-corrects on the first streamed frame regardless.
+      this.applyStateDerivedPositions();
+      this.recomputeLODGeometry();
+      return this.rebuild();
+    }
+
+    // Main-thread force (backend: "force", the synchronous default).
+    const iterations = opts.iterations ?? DEFAULT_FORCE_ITERATIONS;
+    if (opts.multilevel === false) {
+      seedPositions(phys, this.width, this.height);
+      new ForceLayout(phys, opts.force).run(iterations);
+    } else {
+      multilevelLayout(phys, { width: this.width, height: this.height, iterations, force: opts.force });
+    }
+    // Scale the layout to fill the view at k=1 (the map-of-modules approach) so it opens framed without
+    // a fit-transform. Caller-supplied positions are taken as-is (already placed).
+    scaleToViewport(phys.positions, sg.physicalCount, this.width, this.height);
+    this.applyStateDerivedPositions();
     this.recomputeLODGeometry();
     return this.rebuild();
   }
@@ -1049,6 +1102,11 @@ export class Network extends BaseEngine {
    * worker-streamed LOD tree the geometry is already fresh (the worker wrote it before posting the
    * frame), so the main thread only re-cuts; otherwise the positions changed and the LOD geometry is
    * recomputed here before the cut — LOD tracks the layout *as it converges*, not only once settled.
+   *
+   * State-network mode (#182) is also driven through here when the physical layout streams: the
+   * callback re-derives the rosette from the just-streamed physical positions (O(physicalCount) sizing +
+   * O(stateCount) placement) before the LOD/render step, so the state/both views track the physical
+   * layout live instead of only once it settles.
    */
   private scheduleLayoutRepaint(): void {
     if (this.layoutRepaintRaf) return;
@@ -1057,6 +1115,7 @@ export class Network extends BaseEngine {
     this.layoutRepaintRaf = raf(() => {
       this.layoutRepaintRaf = 0;
       this.dragReapply?.(); // hold the dragged nodes under the cursor over the worker's snapshot (#140, copy mode)
+      if (this.stateData) this.applyStateDerivedPositions(); // physical positions just streamed a frame
       if (!this.lodWorkerTree) this.recomputeLODGeometry(); // worker streams geometry; main only re-cuts
       this.rebuild();
     });
@@ -1782,7 +1841,10 @@ export class Network extends BaseEngine {
    * - **Awaiting a worker tree** (`backend: "worker"`, no tree yet): the worker is about to stream the
    *   tree, so the main thread builds *nothing* — it would only duplicate the worker's O(N)/O(E) work
    *   and be discarded. Pass `forceMain` (from the settle handler) to build anyway when the worker
-   *   fell back to a synchronous main-thread solve and never streamed a tree.
+   *   fell back to a synchronous main-thread solve and never streamed a tree. **Exempt in state-network
+   *   mode** (#182): there `layoutOpts.backend` names the *physical* graph's layout transport, but
+   *   `this.graph` (whose tree this method builds) is the state/both view's own graph — no worker ever
+   *   streams a tree for it, so the skip would otherwise starve state-view LOD of a tree forever.
    * - **Main-thread tree** (`force`/`positions` backends, or the worker fallback): build the tree
    *   lazily, then the full geometry from the current positions + style; tracks convergence.
    *
@@ -1809,7 +1871,7 @@ export class Network extends BaseEngine {
     // whole point of worker-LOD). A provided module hierarchy is the exception — the worker doesn't
     // build it, so the main thread must (it falls through to the module branch below). The settle
     // handler / deferred fallback force a build when no worker streamed one.
-    if (this.layoutOpts.backend === "worker" && !this.lodOptions.modules && !forceMain) return;
+    if (!this.stateData && this.layoutOpts.backend === "worker" && !this.lodOptions.modules && !forceMain) return;
     if (!this.lodTree) {
       // Priority chain (epic #98): provided module hierarchy → structural coarsening → spatial
       // quadtree fallback. A provided tree (N6 / #104) is position-independent, like coarsening.

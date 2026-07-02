@@ -23,9 +23,11 @@ const VIEW = { Physical: "physical", State: "state", Both: "both" } as const;
  *   links: the memory structure in its physical context.
  *
  * The data is synthetic (`state-network-data.ts`): an LFR physical network + node2vec trigrams, node
- * labels `1,2,…` (physical) and `(i,j)` (state). The engine lays out the physical graph and derives the
- * rosette (the CPU stopgap until the module-aware GPU layout); it also **scales the layout to fill the
- * view** so it opens framed — no fit-transform. Scroll to zoom, drag to pan.
+ * labels `1,2,…` (physical) and `(i,j)` (state). `layout({ backend })` lays out the physical graph — **Force**
+ * (main-thread, synchronous), **Worker** (off-thread, progressive), or **GPU** (WebGL2 Barnes-Hut,
+ * falling back to Worker when unavailable) — and derives the rosette from it each streamed frame (#182);
+ * it also **scales the layout to fill the view** once settled, so it opens framed — no fit-transform.
+ * Scroll to zoom, drag to pan.
  */
 export const setup: ImperativeSetup = (host, { width, height, backend }) => {
   const net = network(host, { width, height, backend });
@@ -38,6 +40,7 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
   let data: SyntheticStateNetwork | null = null;
   let wedges: PhysicalPieWedges | null = null; // per-physical module wedges, for the physical-view tooltip
   let builtN = -1;
+  let builtBackend = ""; // re-run layout() when the Backend control changes, even without new data
 
   // Same interactive options as the directed map of modules: multi-select, node-drag, hover rings — plus
   // a tooltip. In the physical view it shows a node's flow + its module share(s); elsewhere the node label.
@@ -72,7 +75,9 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
       const view = VIEW[(options.view as keyof typeof VIEW) ?? "Physical"] ?? "physical";
       const physical = view === "physical";
       const halfArrow = options.links !== "Line"; // default: half-arrows (the map-of-modules glyph)
+      const backend = options.backend === "GPU" ? "gpu" : options.backend === "Worker" ? "worker" : "force";
       const dataChanged = !data || builtN !== n;
+      const layoutChanged = dataChanged || builtBackend !== backend; // Backend control also re-lays out
       if (dataChanged) {
         data = generateStateNetwork({ nodeCount: n, communityCount: 6, mu: 0.18, avgDegree: 8, seed: 3 });
         wedges = physicalPieWedges(data.graph, data.stateModules); // for the physical-view tooltip
@@ -95,8 +100,10 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
         ...(view === "both" ? {} : { nodeRadius: physical ? { by: "flow" as const, scale: scaleSqrt().domain([0, hiFlow]).range([4, 22]) } : 5 }),
       });
 
-      if (dataChanged) net.stateNetwork(g.graph, { modules: g.stateModules, view }).layout({ backend: "force" });
-      else net.view(view);
+      if (layoutChanged) {
+        net.stateNetwork(g.graph, { modules: g.stateModules, view }).layout({ backend });
+        builtBackend = backend;
+      } else net.view(view);
 
       // LOD applies only to the state view (its nodes carry the module tree); default Off. "Modules" cuts
       // on the provided partition; "Standard" coarsens the state graph structurally.

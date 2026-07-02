@@ -138,3 +138,92 @@ describe("state-network engine (#171)", () => {
     net.destroy();
   });
 });
+
+/** Shared containment assertion for the async-backend tests below (#182): once settled, every state
+ *  node's rosette position must cluster near its own physical node, not scatter across the layout — the
+ *  same shape of check as the existing "no throw" force-layout test above and `rosette.test.ts`'s
+ *  containment case, driven through the engine's async layout path instead of calling `rosettePositions`
+ *  directly. A generous bound (well under the 200×200 viewport) rather than the exact rosette radius,
+ *  since the radius itself is derived from the converged layout scale (`stateSpacing`) and isn't known
+ *  ahead of the assertion. */
+function assertRosetteContainment(graph: ReturnType<typeof tinyStateNetwork>["graph"]): void {
+  const spacing = 200;
+  for (let s = 0; s < graph.state.nodeCount; s++) {
+    const p = graph.stateToPhysical[s]!;
+    const dx = graph.state.positions[2 * s]! - graph.physical.positions[2 * p]!;
+    const dy = graph.state.positions[2 * s + 1]! - graph.physical.positions[2 * p + 1]!;
+    expect(Math.hypot(dx, dy)).toBeLessThan(spacing);
+  }
+}
+
+describe("state-network async layout backends (#182)", () => {
+  it("backend: 'gpu' lays out the physical graph, derives the rosette, and reports layoutTransport 'gpu'", async () => {
+    const { graph, modules } = tinyStateNetwork();
+    const net = network(host(), { width: 200, height: 200, backend: "webgl" });
+    await net.whenReady();
+
+    net.stateNetwork(graph, { modules, view: "state" }).layout({ backend: "gpu", iterations: 20 });
+    await net.whenSettled();
+
+    expect(net.layoutTransport).toBe("gpu");
+    // The physical graph is laid out (not degenerate: at least two distinct positions among 3 nodes).
+    const physPositions = new Set(Array.from(graph.physical.positions).map((v) => v.toFixed(3)));
+    expect(physPositions.size).toBeGreaterThan(2);
+    assertRosetteContainment(graph);
+
+    net.destroy();
+  });
+
+  it("backend: 'worker' lays out the physical graph, derives the rosette, and reports a worker transport", async () => {
+    const { graph, modules } = tinyStateNetwork();
+    const net = network(host(), { width: 200, height: 200 });
+    await net.whenReady();
+
+    net.stateNetwork(graph, { modules, view: "state" }).layout({ backend: "worker", iterations: 20 });
+    await net.whenSettled();
+
+    expect(["shared", "copy"]).toContain(net.layoutTransport);
+    const physPositions = new Set(Array.from(graph.physical.positions).map((v) => v.toFixed(3)));
+    expect(physPositions.size).toBeGreaterThan(2);
+    assertRosetteContainment(graph);
+
+    net.destroy();
+  });
+
+  it("backend: 'force' still lays out synchronously (unchanged) alongside the new async backends", async () => {
+    const { graph, modules } = tinyStateNetwork();
+    const net = network(host(), { width: 200, height: 200 });
+    await net.whenReady();
+
+    net.stateNetwork(graph, { modules, view: "state" }).layout({ backend: "force" });
+
+    expect(net.layoutTransport).toBe("none"); // synchronous — no layout handle in flight
+    const physPositions = new Set(Array.from(graph.physical.positions).map((v) => v.toFixed(3)));
+    expect(physPositions.size).toBeGreaterThan(2);
+    assertRosetteContainment(graph);
+
+    net.destroy();
+  });
+
+  it("the 'both' view also converges under backend: 'gpu' (container-confined rosette)", async () => {
+    const { graph, modules } = tinyStateNetwork();
+    const net = network(host(), { width: 200, height: 200, backend: "webgl" });
+    await net.whenReady();
+
+    net.stateNetwork(graph, { modules, view: "both" }).layout({ backend: "gpu", iterations: 20 });
+    await net.whenSettled();
+
+    expect(net.layoutTransport).toBe("gpu");
+    // Each state node must be nearer its own physical node than any other (container confinement).
+    const distTo = (s: number, p: number) =>
+      Math.hypot(graph.state.positions[2 * s]! - graph.physical.positions[2 * p]!, graph.state.positions[2 * s + 1]! - graph.physical.positions[2 * p + 1]!);
+    for (let s = 0; s < graph.state.nodeCount; s++) {
+      const own = graph.stateToPhysical[s]!;
+      for (let q = 0; q < graph.physicalCount; q++) {
+        if (q !== own) expect(distTo(s, own)).toBeLessThan(distTo(s, q));
+      }
+    }
+
+    net.destroy();
+  });
+});
