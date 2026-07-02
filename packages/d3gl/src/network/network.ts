@@ -547,6 +547,10 @@ export class Network extends BaseEngine {
     this.stateData = graph;
     this.activeView = opts.view ?? "physical";
     this.rosetteRadius = opts.rosetteRadius ?? null;
+    // A new state network invalidates any prior LOD config: its `modules` were keyed to the OLD state
+    // graph, so a stale `lod({ modules })` would fail `buildModuleLODTree`'s "record for every node" check
+    // when `layout()` rebuilds the tree below. Callers re-apply `lod()` after `layout()` with fresh modules.
+    this.lodOptions = null;
     this.pieWedges = physicalPieWedges(graph, opts.modules, opts.pie);
     // Per-state-node module colours (state/both views); per-physical disc = its dominant (first) wedge's colour.
     this.stateColors = moduleColors(opts.modules, opts.color);
@@ -978,7 +982,11 @@ export class Network extends BaseEngine {
    *  drawn on top of the node discs. Null off the physical view, without pie wedges, or when none overlap. */
   private pieInstancedLayer(graph: NetworkGraph, resolved: ResolvedNetworkStyle): InstancedLayer | null {
     if (this.activeView !== "physical" || !this.pieWedges) return null;
-    const pie = physicalPieInstances(this.pieWedges, graph.positions, resolved.nodeRadii);
+    // Draw the pie at the node's INNER radius (inside any constant border), so the "nodes" circle's
+    // border ring shows around the pie exactly as it does around a single-module disc (#171 review).
+    const cb = resolved.constBorder;
+    const radii = cb ? Float32Array.from(resolved.nodeRadii, (r) => Math.max(0, r - Math.min(r, cb.width))) : resolved.nodeRadii;
+    const pie = physicalPieInstances(this.pieWedges, graph.positions, radii);
     if (pie.count === 0) return null;
     return { name: this.PIE_LAYER, primitive: "pie", pie, sizeMode: resolved.sizeMode };
   }
@@ -991,18 +999,23 @@ export class Network extends BaseEngine {
     const sg = this.stateData;
     const n = sg.physicalCount;
     const colors = new Uint8Array(n * 4);
+    // A thin black border ring makes the faint container disc clearly visible (#171 review).
+    const borders = new Float32Array(n);
+    const borderColors = new Uint8Array(n * 4);
     for (let p = 0; p < n; p++) {
       const [r, g, b] = rgbaBytes(this.physicalColors[p]!);
       colors[4 * p] = r;
       colors[4 * p + 1] = g;
       colors[4 * p + 2] = b;
       colors[4 * p + 3] = 42; // faint — a context backdrop, not a solid glyph
+      borders[p] = Math.min(0.25, 1.5 / this.containerRadii[p]!); // ≈1.5 world-unit ring
+      borderColors[4 * p + 3] = 255; // opaque black (rgb = 0)
     }
     return {
       name: this.CONTAINER_LAYER,
       primitive: "circles",
       sizeMode: "world", // world-sized so state nodes stay inside their container at every zoom
-      circles: { centers: sg.physical.positions, radii: this.containerRadii, colors, count: n },
+      circles: { centers: sg.physical.positions, radii: this.containerRadii, colors, borders, borderColors, count: n },
     };
   }
 
@@ -1489,7 +1502,10 @@ export class Network extends BaseEngine {
       dy = (my - t.y) / t.k - worldStartY;
     };
 
-    const backend = this.layoutOpts.backend;
+    // State-network mode (#171) has no live sim — its positions are a derived one-shot layout (physical
+    // force + rosette), so a drag TRANSLATES the grabbed node (like the `positions` backend / the
+    // map-of-modules example) rather than reheating a fresh sim that would fight the derived placement.
+    const backend = this.stateData ? "positions" : this.layoutOpts.backend;
     const handle = this.layoutHandle;
 
     // force: own rAF loop ticks the pinned sim + repaints, so neighbours follow; re-cools on release.
@@ -1829,8 +1845,13 @@ export class Network extends BaseEngine {
       ids: containerIds,
       sizeMode: "world",
       fill: (p) => withAlpha(this.physicalColors?.[p as number] ?? DEFAULT_NODE_FILL, 42),
+      stroke: () => "#000000", // thin black ring so the faint container disc reads (#171 review)
       build: (g) => {
-        if (emit && containers) for (let p = 0; p < containers.physicalCount; p++) g.point(p, containers.physical.positions[2 * p]!, containers.physical.positions[2 * p + 1]!, this.containerRadii![p]!);
+        if (emit && containers)
+          for (let p = 0; p < containers.physicalCount; p++) {
+            const cx = containers.physical.positions[2 * p]!, cy = containers.physical.positions[2 * p + 1]!, r = this.containerRadii![p]!;
+            g.drawable(p, (ctx) => { ctx.moveTo(cx + r, cy); ctx.arc(cx, cy, r, 0, Math.PI * 2); ctx.closePath(); }, { lineWidth: 1.5 });
+          }
       },
     });
     // Per-edge link colour (encodes weight/flow); the arrowhead shares it.
@@ -1950,7 +1971,9 @@ export class Network extends BaseEngine {
       sizeMode: style.sizeMode,
       fill: (k) => (wedges ? wedges.color[k as number]! : DEFAULT_NODE_FILL),
       build: (g) => {
-        if (emit && wedges) tracePieWedges(g, wedges, graph.positions, style.nodeRadii, style.sizeMode === "screen");
+        // Trace at the INNER radius (inside the border), so each node's black border ring shows around
+        // the pie exactly as around a single-module disc (matches the WebGL pie lane).
+        if (emit && wedges) tracePieWedges(g, wedges, graph.positions, innerRadii, style.sizeMode === "screen");
       },
     });
   }

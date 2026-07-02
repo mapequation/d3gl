@@ -62,13 +62,13 @@ describe("state-network engine (#171)", () => {
     expect(circles(svg)).toBe(4); // four state node discs
     expect(filledPaths(svg)).toBe(0); // no pie wedges in the state view
 
-    // Hybrid "both" view: physical container discs (3) + state node discs (4) = 7 circles, state-level
-    // links, no pies. State nodes sit inside their physical container.
+    // Hybrid "both" view: 4 state node discs (circles) + 3 physical **container** discs (filled + black
+    // stroked arc paths, drawn under) + state-level links. No pies.
     net.view("both");
     expect(net.stateView).toBe("both");
     svg = net.toSVG();
-    expect(circles(svg)).toBe(3 + 4);
-    expect(filledPaths(svg)).toBe(0);
+    expect(circles(svg)).toBe(4); // the 4 state nodes (containers are stroked arc paths, not <circle>)
+    expect(filledPaths(svg)).toBe(3); // the 3 faint container discs
 
     // Back to physical: pies return, containers gone.
     net.view("physical");
@@ -76,6 +76,23 @@ describe("state-network engine (#171)", () => {
     expect(circles(svg)).toBe(3);
     expect(filledPaths(svg)).toBe(2);
 
+    net.destroy();
+  });
+
+  it("swapping to a different-sized state network with module LOD on does not throw (stale modules, #171)", async () => {
+    const net = network(host(), { width: 200, height: 200 });
+    await net.whenReady();
+    const a = tinyStateNetwork(); // 4 state nodes
+    net.stateNetwork(a.graph, { modules: a.modules, view: "state" }).layout({ backend: "force" });
+    net.lod({ modules: a.modules }); // module LOD over A's 4 state nodes
+
+    // A DIFFERENT-sized state network (6 state nodes). Before the fix, layout() rebuilt the LOD tree with
+    // A's stale 4-record modules over B's 6-node graph → "no record for node id …". stateNetwork() must
+    // clear the prior LOD config so this can't happen.
+    const b = buildStateGraph({ stateCount: 6, stateToPhysical: [0, 0, 1, 1, 2, 2], source: [0, 2, 4], target: [2, 4, 0] });
+    const bModules = Array.from({ length: 6 }, (_, id) => ({ id, path: [(id % 2) + 1, id + 1] }));
+    expect(() => net.stateNetwork(b, { modules: bModules, view: "state" }).layout({ backend: "force" })).not.toThrow();
+    expect(net.stateView).toBe("state");
     net.destroy();
   });
 

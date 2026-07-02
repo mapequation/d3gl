@@ -1,4 +1,4 @@
-import { network } from "@mapequation/d3gl/network";
+import { network, physicalPieWedges, type PhysicalPieWedges } from "@mapequation/d3gl/network";
 import { scaleSqrt } from "d3-scale";
 import type { ImperativeSetup } from "../types.js";
 import { generateStateNetwork, type SyntheticStateNetwork } from "../shared/state-network-data.js";
@@ -36,7 +36,33 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
   host.appendChild(labelStyle);
 
   let data: SyntheticStateNetwork | null = null;
+  let wedges: PhysicalPieWedges | null = null; // per-physical module wedges, for the physical-view tooltip
   let builtN = -1;
+
+  // Same interactive options as the directed map of modules: multi-select, node-drag, hover rings — plus
+  // a tooltip. In the physical view it shows a node's flow + its module share(s); elsewhere the node label.
+  net.interactive({
+    selectable: { multi: true },
+    draggable: true,
+    hover: true,
+    tooltip: (_datum, id) => {
+      if (!data) return null;
+      const p = id as number;
+      if (net.stateView === "physical" && wedges) {
+        const flow = data.graph.physical.flow?.[p] ?? 0;
+        const rows: string[] = [];
+        let prev = 0;
+        for (let k = wedges.offset[p]!; k < wedges.offset[p + 1]!; k++) {
+          rows.push(`<span style="color:${wedges.color[k]}">■</span> module ${wedges.moduleKey[k]} — ${((wedges.end[k]! - prev) * 100).toFixed(0)}%`);
+          prev = wedges.end[k]!;
+        }
+        const el = document.createElement("div");
+        el.innerHTML = `<b>Node ${data.physicalNames[p]}</b> · flow ${flow.toFixed(3)}<br>${rows.join("<br>")}`;
+        return el;
+      }
+      return net.stateView === "physical" ? data.physicalNames[p] ?? null : data.stateNames[p] ?? null;
+    },
+  });
 
   return {
     engine: net,
@@ -49,6 +75,7 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
       const dataChanged = !data || builtN !== n;
       if (dataChanged) {
         data = generateStateNetwork({ nodeCount: n, communityCount: 6, mu: 0.18, avgDegree: 8, seed: 3 });
+        wedges = physicalPieWedges(data.graph, data.stateModules); // for the physical-view tooltip
         builtN = n;
       }
       const g = data!;
