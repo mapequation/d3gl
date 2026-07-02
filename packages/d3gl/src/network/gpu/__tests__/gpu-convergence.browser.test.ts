@@ -1,15 +1,18 @@
 /**
- * GPU convergence parity test.
+ * GPU convergence parity tests.
  *
- * Runs both the CPU ForceLayout and the GpuForceLayout on an identical small
- * graph (200 nodes, 3 communities with bridge edges) from the SAME seeded
- * start positions and compares layout quality via an orientation/scale-invariant
- * metric: spreadRatio = meanConnectedEdgeLength / meanSampledPairDistance.
+ * Runs both the CPU ForceLayout and the GpuForceLayout on identical seeded
+ * graphs from the SAME start positions and compares layout quality via an
+ * orientation/scale-invariant metric:
+ *   spreadRatio = meanConnectedEdgeLength / meanSampledPairDistance.
+ * A good layout has spreadRatio << 1 (connected nodes closer than random pairs).
  *
- * A good layout has spreadRatio << 1 (connected nodes are closer than random
- * node pairs). The test asserts:
- *   1. gpuRatio < 1.0  — GPU produced a genuinely good layout.
- *   2. |gpuRatio − cpuRatio| / cpuRatio < 0.35  — GPU quality is comparable to CPU.
+ * Two cases, so BOTH GPU repulsion paths are validated for *emergent layout
+ * quality*, not just single-tick force agreement:
+ *   1. 200 nodes → exact all-pairs path (below the 4096 threshold), CPU θ=0.
+ *   2. 5000 nodes → Barnes-Hut grid-pyramid path (above 4096), θ=0.9 (the real
+ *      approximation users run), CPU reference is its own BH quadtree at θ=0.9.
+ * Each asserts gpuRatio < 1.0 (genuinely good) AND relDiff < 0.35 vs CPU.
  */
 
 import { describe, it, expect, beforeAll } from "vitest";
@@ -202,6 +205,80 @@ describe("GpuForceLayout convergence parity vs CPU", () => {
     expect(gpuRatio).toBeLessThan(1.0);
 
     // 2. GPU quality is comparable to CPU (within 35% relative difference).
+    const relDiff = Math.abs(gpuRatio - cpuRatio) / cpuRatio;
+    expect(relDiff).toBeLessThan(0.35);
+  });
+
+  it("Barnes-Hut pyramid path produces a good layout at θ=0.9 (>4096 nodes)", () => {
+    // The test above uses ~200 nodes (< GPU_REPULSION_ALLPAIRS_MAX=4096) so it
+    // exercises the exact all-pairs path. This one validates the EMERGENT layout
+    // quality of the GPU Barnes-Hut GRID-PYRAMID path — i.e. the approximation
+    // users actually get at large N with default θ=0.9, not just single-tick
+    // force-field agreement. Graph is scaled above the 4096 threshold so the GPU
+    // layout auto-selects the pyramid (repulsionMode:"pyramid" pins it regardless).
+    //
+    // 100 communities × 50 nodes = 5000 nodes, 1 bridge per pair. Community size
+    // (50) and intra-density (Erdős–Rényi p=0.5 ⇒ avg intra-degree ~25) MATCH the
+    // working 200-node all-pairs test above — the ONLY change is more communities
+    // to clear the 4096 threshold. 1000-node communities were a near-clique (avg
+    // degree ~500) where connected-pair distance ≈ random-pair distance by
+    // construction, so spreadRatio ≈ 1 regardless of layout quality (both CPU and
+    // GPU); that made the metric meaningless, not the pyramid bad. Sparse
+    // communities keep spreadRatio a real quality signal.
+    const graph = makeClusteredGraph(100, 50, 1, 0x5eed1234);
+
+    const W = 2000;
+    const H = 1500;
+    seedPositions(graph, W, H);
+
+    const cpuPositions = graph.positions.slice();
+    const gpuPositions = graph.positions.slice();
+
+    // Realistic default params — θ=0.9 (the actual approximation users run). The
+    // CPU reference ALSO uses θ=0.9 (its own Barnes-Hut quadtree), so we compare
+    // two BH approximations of the same physics — the fair reference for the GPU
+    // pyramid, not the exact O(n²) solve.
+    const params = { ...DEFAULT_FORCE };
+    expect(params.theta).toBe(0.9);
+
+    // ── CPU run (BarnesHutTree, θ=0.9) ─────────────────────────────────────────
+    const cpuGraph: LayoutGraph = {
+      nodeCount: graph.nodeCount,
+      edgeCount: graph.edgeCount,
+      source: graph.source,
+      target: graph.target,
+      positions: cpuPositions,
+    };
+    const cpu = new ForceLayout(cpuGraph, params);
+    cpu.run(150);
+
+    // ── GPU run (grid-pyramid BH, θ=0.9), pinned to the pyramid path ──────────
+    const gpuGraph: LayoutGraph = {
+      nodeCount: graph.nodeCount,
+      edgeCount: graph.edgeCount,
+      source: graph.source,
+      target: graph.target,
+      positions: gpuPositions,
+    };
+    const gpu = new GpuForceLayout(device, gpuGraph, params, { repulsionMode: "pyramid" });
+    gpu.runFrame(150);
+    const gpuPos = new Float32Array(graph.nodeCount * 2);
+    gpu.readPositions(gpuPos);
+    gpu.destroy();
+
+    const cpuRatio = spreadRatio(cpuPositions, graph.source, graph.target);
+    const gpuRatio = spreadRatio(gpuPos, graph.source, graph.target);
+    console.log(`  [pyramid θ=0.9, N=${graph.nodeCount}] cpuRatio=${cpuRatio.toFixed(4)} gpuRatio=${gpuRatio.toFixed(4)} relDiff=${(Math.abs(gpuRatio - cpuRatio) / cpuRatio).toFixed(4)}`);
+
+    // 1. The pyramid produced a genuinely good layout (connected nodes closer
+    //    than random pairs) — this is the core claim we can't leave untested.
+    //    Observed: gpuRatio ≈ 0.15 (connected pairs ~7× closer than random).
+    expect(gpuRatio).toBeLessThan(1.0);
+
+    // 2. Comparable to the CPU BH layout. Observed relDiff ≈ 0.065 — the GPU
+    //    grid-pyramid BH tracks CPU's adaptive-quadtree BH closely at θ=0.9, so
+    //    the same 0.35 tolerance as the all-pairs test holds (no widening needed;
+    //    the extra margin considered up front turned out unnecessary).
     const relDiff = Math.abs(gpuRatio - cpuRatio) / cpuRatio;
     expect(relDiff).toBeLessThan(0.35);
   });

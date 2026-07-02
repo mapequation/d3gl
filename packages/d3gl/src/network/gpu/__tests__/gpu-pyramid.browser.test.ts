@@ -247,12 +247,21 @@ describe("GPU Barnes-Hut pyramid repulsion — traversal correctness + perf (Ste
     // Absolute frame budgets ("1M under N ms") are NOT meaningful here and 1M is
     // too slow to run; real-GPU 1M frame-budget validation is done MANUALLY on
     // real hardware in Task 7 (the website example). This test asserts the
-    // RELATIVE O(n²)→O(n log n) crossover at a feasible N with a generous margin
-    // so it stays non-flaky.
-    const count = 12000; // feasible for SwiftShader; O(n²) all-pairs = 144M terms/tick
+    // RELATIVE O(n²)→O(n log n) crossover at a feasible N with a generous margin.
+    //
+    // Robustness: SwiftShader wall-clock is noisy and this suite shares one page,
+    // so a SINGLE timing sample can catch all-pairs in an unusually fast window
+    // (observed once: a lone sample gave 0.98× while isolated runs gave ~6×). We
+    // therefore take the MINIMUM over several repeats per mode — the min reflects
+    // the true compute cost with the least transient interference, the right
+    // statistic for a lower-bound speedup claim — and interleave the two modes so
+    // both see similar accumulated device state.
+    const count = 16000; // feasible for SwiftShader; O(n²) all-pairs = 256M terms/tick
     const ticks = 3;
+    const repeats = 3;
     const g = makeRandomGraph(count, 4000, 0xfeedface);
     const params = { repulsion: 200, attraction: 0.05, centering: 0.2, alpha: 0.05, theta: 0.7 };
+    const out = new Float32Array(count * 2);
 
     const time = (mode: "allpairs" | "pyramid"): number => {
       const gg: LayoutGraph = {
@@ -265,7 +274,6 @@ describe("GPU Barnes-Hut pyramid repulsion — traversal correctness + perf (Ste
       const layout = new GpuForceLayout(device, gg, params, { repulsionMode: mode });
       // Warm-up tick (shader compile / first-use costs) excluded from timing.
       layout.runFrame(1);
-      const out = new Float32Array(count * 2);
       const t0 = performance.now();
       layout.runFrame(ticks);
       // Force GPU completion before stopping the clock (readback is a sync fence).
@@ -275,10 +283,13 @@ describe("GPU Barnes-Hut pyramid repulsion — traversal correctness + perf (Ste
       return dt;
     };
 
-    const tAll = time("allpairs");
-    const tBH = time("pyramid");
+    let tAll = Infinity, tBH = Infinity;
+    for (let r = 0; r < repeats; r++) {
+      tAll = Math.min(tAll, time("allpairs"));
+      tBH = Math.min(tBH, time("pyramid"));
+    }
     const speedup = tAll / tBH;
-    console.log(`  N=${count} ${ticks} ticks: allpairs=${tAll.toFixed(1)}ms pyramid=${tBH.toFixed(1)}ms speedup=${speedup.toFixed(2)}×`);
+    console.log(`  N=${count} ${ticks} ticks (best of ${repeats}): allpairs=${tAll.toFixed(1)}ms pyramid=${tBH.toFixed(1)}ms speedup=${speedup.toFixed(2)}×`);
 
     expect(speedup).toBeGreaterThanOrEqual(3);
   });
