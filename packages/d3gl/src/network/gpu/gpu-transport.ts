@@ -34,6 +34,13 @@ export function startGpuLayout(
     return startWorkerLayout(graph, opts, onFrame);
   }
 
+  // 0-node graph: GpuForceLayout would create a zero-height texture (crash).
+  // Return a no-op handle immediately — there is nothing to lay out.
+  if (graph.nodeCount === 0) {
+    onFrame();
+    return { shared: false, settled: Promise.resolve(), stop() {}, pin() {}, unpin() {} };
+  }
+
   const { width, height, force, iterations: rawIterations } = opts;
   const iterations = rawIterations ?? 300;
   const frameEvery = opts.frameEvery ?? Math.max(1, Math.ceil(iterations / TARGET_FRAMES));
@@ -55,8 +62,7 @@ export function startGpuLayout(
     if (stopped) return;
     stopped = true;
     if (rafHandle) {
-      if (typeof cancelAnimationFrame === "function") cancelAnimationFrame(rafHandle);
-      else clearTimeout(rafHandle);
+      cancelAnimationFrame(rafHandle);
       rafHandle = 0;
     }
     layout.destroy();
@@ -81,22 +87,13 @@ export function startGpuLayout(
       return;
     }
 
-    // Schedule next batch.
-    if (typeof requestAnimationFrame === "function") {
-      rafHandle = requestAnimationFrame(step);
-    } else {
-      // SSR / non-browser: shouldn't reach here since gpuLayoutSupported guards against it,
-      // but guard defensively anyway.
-      rafHandle = setTimeout(step, 16) as unknown as number;
-    }
+    // Schedule next batch. gpuLayoutSupported already ensured we're in a browser
+    // context where requestAnimationFrame is available.
+    rafHandle = requestAnimationFrame(step);
   };
 
   // Kick off on the next frame so the caller can set up state before the first onFrame fires.
-  if (typeof requestAnimationFrame === "function") {
-    rafHandle = requestAnimationFrame(step);
-  } else {
-    rafHandle = setTimeout(step, 16) as unknown as number;
-  }
+  rafHandle = requestAnimationFrame(step);
 
   return {
     shared: false,

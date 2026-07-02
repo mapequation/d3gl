@@ -348,8 +348,6 @@ export class GpuForceLayout {
     }
 
     // Centering: pull every node toward the centroid (Σpos / count computed above).
-    // maxStep = 1e9 for now; span-based clamp from force.ts can be revisited with
-    // the BH pyramid in Task 5.
     this.centeringPass.run(forcePass, this.pos.readTex, this.sumTex, {
       count: this.count,
       width: this.width,

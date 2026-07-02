@@ -1,3 +1,6 @@
+// TODO(n8 follow-up): extract shared full-screen-triangle pass helper into gpu/passes/_shared.ts
+// (full-screen-triangle VS + clip buffer + mutable-uniforms Record + ADDITIVE_BLEND params — 6 passes duplicate this).
+
 import type { Device, Texture, RenderPass } from "@luma.gl/core";
 import { Model } from "@luma.gl/engine";
 

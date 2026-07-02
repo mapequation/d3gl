@@ -81,7 +81,7 @@ export class IntegratePass {
       u_width: 1,
       u_alpha: 0,
       u_damping: 0.9,
-      u_maxStep: 1e9,
+      u_maxStep: 1e9, // placeholder default — always overwritten in run() with the span-based clamp
     };
 
     this.model = new Model(device, {
