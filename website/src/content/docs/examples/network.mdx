@@ -385,14 +385,26 @@ partitions the *state* nodes, one physical node's state nodes can land in **diff
 the physical view a physical node has an **overlapping** module membership.
 
 `net.stateNetwork(graph, { modules })` ingests the state network (built by `buildStateGraph`, which also
-derives the physical network) plus a per-**state-node** module assignment, and `net.view("state" |
-"physical")` toggles two renderings of the *same* data:
+derives the physical network) plus a per-**state-node** module assignment, and `net.view("physical" |
+"state" | "both")` toggles three renderings of the *same* data:
 
-- **Physical** — the derived physical network (physical nodes + directed, flow-summed aggregated links).
-  A physical node whose state nodes span ≥2 modules renders as a **pie chart** — one wedge per module,
-  sized by that module's summed flow and coloured by module; a single-module node is a solid disc.
+- **Physical** — the derived physical network (flow-sized nodes + directed, flow-summed aggregated
+  half-arrow links). A physical node whose state nodes span ≥2 modules renders as a **pie chart** — one
+  wedge per module, sized by that module's summed flow and coloured by module; a single-module node is a
+  solid disc.
 - **State** — every state node on a golden-angle **rosette** around its physical node, coloured by
-  module, so you can see *why* a node splits (its memory nodes belong to different communities).
+  module, so you can see *why* a node splits (its memory nodes belong to different communities). The
+  **LOD** control (`net.lod({ modules })`) aggregates the state nodes into their modules on zoom-out —
+  the state nodes carry the module tree, so the [modular LOD cut](#modular-level-of-detail) applies
+  directly. (LOD is a state-view feature; the physical/both views draw full detail.)
+- **Both** — a hybrid: each physical node is a faint **container** disc holding its state nodes on a
+  rosette confined inside it, drawn with **state-level** links — the memory structure in its physical
+  context. Everything is world-sized so the state nodes stay inside their physical node at every zoom.
+
+The **Nodes** slider scales the physical network from 10 to 10,000 (100k+ awaits the module-aware GPU
+layout — the physical force solve + the node2vec trigram enumeration are the current ceiling); the map
+controls (Sizing, Declutter, Expand, Max radius, Labels, Cross-level, Cross-fade) mirror the
+[directed map of modules](#a-directed-map-of-modules) and drive the state-view LOD cut.
 
 ```ts
 import { buildStateGraph, network } from "@mapequation/d3gl/network";

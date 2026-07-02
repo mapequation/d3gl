@@ -62,7 +62,15 @@ describe("state-network engine (#171)", () => {
     expect(circles(svg)).toBe(4); // four state node discs
     expect(filledPaths(svg)).toBe(0); // no pie wedges in the state view
 
-    // Back to physical: pies return.
+    // Hybrid "both" view: physical container discs (3) + state node discs (4) = 7 circles, state-level
+    // links, no pies. State nodes sit inside their physical container.
+    net.view("both");
+    expect(net.stateView).toBe("both");
+    svg = net.toSVG();
+    expect(circles(svg)).toBe(3 + 4);
+    expect(filledPaths(svg)).toBe(0);
+
+    // Back to physical: pies return, containers gone.
     net.view("physical");
     svg = net.toSVG();
     expect(circles(svg)).toBe(3);
@@ -71,12 +79,32 @@ describe("state-network engine (#171)", () => {
     net.destroy();
   });
 
+  it("confines each physical node's state rosette inside its container disc in the both view", async () => {
+    const { graph, modules } = tinyStateNetwork();
+    const net = network(host(), { width: 200, height: 200 }); // webgl
+    await net.whenReady();
+    net.stateNetwork(graph, { modules, view: "both" }).layout({ backend: "force" });
+
+    // Every state node lies within its physical node's container radius (confined rosette).
+    // physical 0 holds 2 state nodes; 1 and 2 hold one each (a lone state node sits at the centre).
+    for (let p = 0; p < graph.physicalCount; p++) {
+      const px = graph.physical.positions[2 * p]!;
+      const py = graph.physical.positions[2 * p + 1]!;
+      for (let i = graph.physicalToState.offsets[p]!; i < graph.physicalToState.offsets[p + 1]!; i++) {
+        const s = graph.physicalToState.states[i]!;
+        const d = Math.hypot(graph.state.positions[2 * s]! - px, graph.state.positions[2 * s + 1]! - py);
+        expect(d).toBeLessThan(0.44 * 64); // ≤ the max container radius
+      }
+    }
+    net.destroy();
+  });
+
   it("derives rosette state positions from a force layout of the physical graph (WebGL, no throw)", async () => {
     const { graph, modules } = tinyStateNetwork();
     const net = network(host(), { width: 200, height: 200 }); // default webgl
     await net.whenReady();
 
-    net.stateNetwork(graph, { modules }).layout({ backend: "force" });
+    net.stateNetwork(graph, { modules, view: "state" }).layout({ backend: "force" });
 
     // Physical positions are laid out (not all zero) and rosette state positions are derived from them.
     const physNonZero = Array.from(graph.physical.positions).some((v) => v !== 0);
