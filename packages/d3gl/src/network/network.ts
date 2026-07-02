@@ -726,28 +726,10 @@ export class Network extends BaseEngine {
     this.layoutRepaintRaf = raf(() => {
       this.layoutRepaintRaf = 0;
       this.dragReapply?.(); // hold the dragged nodes under the cursor over the worker's snapshot (#140, copy mode)
-      // TEMP(n8-perf): remove before merge — render-path timing to localize 100k bottleneck
-      const perfLogging = Network._perfRenderCount < Network._PERF_LOG_FRAMES;
-      const perfT0 = perfLogging ? performance.now() : 0;
       if (!this.lodWorkerTree) this.recomputeLODGeometry(); // worker streams geometry; main only re-cuts
-      const perfT1 = perfLogging ? performance.now() : 0;
       this.rebuild();
-      if (perfLogging) {
-        const tRebuild = perfT1 - perfT0;
-        const tRender = performance.now() - perfT1;
-        Network._perfRenderCount++;
-        console.info(
-          `[n8-perf] render ${Network._perfRenderCount}: rebuild ${tRebuild.toFixed(2)}ms, render ${tRender.toFixed(2)}ms`,
-        );
-      }
-      // END TEMP(n8-perf)
     });
   }
-
-  // TEMP(n8-perf): remove before merge — counters for the render-path timing cap
-  private static _PERF_LOG_FRAMES = 20;
-  private static _perfRenderCount = 0;
-  // END TEMP(n8-perf)
 
   /**
    * The luma.gl Device from the live WebGL backend, or null on Canvas/SVG/SSR backends.
