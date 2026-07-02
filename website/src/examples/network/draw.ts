@@ -42,6 +42,8 @@ function degreeRadius(graph: NetworkGraph): NodeRadiusSpec {
  * in the GPU shader, so it stays instant even with LOD off on a million-node layout.
  * **Drag a node or a collapsed module** to move it: it tracks the cursor with no lag while the off-thread
  * worker layout reheats around it and re-cools on release (grab a module to drag its whole subtree).
+ * **Backend** switches the force solve between `"worker"` (CPU Barnes-Hut in a Web Worker) and `"gpu"`
+ * (WebGL2 Barnes-Hut grid-pyramid, with automatic fallback to `"worker"` when float render targets are unavailable).
  */
 export const setup: ImperativeSetup = (host, { width, height, backend }) => {
   const net = network(host, { width, height, backend });
@@ -78,23 +80,25 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
   net.on("hover", (hit) => { readout.textContent = describe(hit); });
   net.on("click", (hit) => { if (hit) readout.textContent = `clicked ${describe(hit)}`; });
 
-  // SharedArrayBuffer transport readout (#163). Two distinct signals: the environment's *capability*
-  // (`sharedMemoryAvailable()` — needs a cross-origin-isolated page via COOP/COEP, set on the dev/preview
-  // server but not on GitHub Pages), and whether the running worker layout *actually* uses it
-  // (`net.layoutTransport`, which is `"copy"` if the worker fell back to a synchronous solve even where SAB
-  // is available). Hover either line for the explanation.
+  // Transport readout (#163 + N8): three signals — layout transport (gpu / shared / copy / none),
+  // the environment's SAB *capability* (`sharedMemoryAvailable()`), and whether SAB is *in use*.
+  // For a `backend:"gpu"` layout the transport resolves asynchronously (it is "copy" until the
+  // device promise settles), so we also refresh it after the layout settles.
   const sab = document.createElement("div");
   sab.className =
     "absolute top-2 right-2 pointer-events-none rounded bg-white/85 px-2 py-1 font-mono text-[11px] leading-tight [font-variant-numeric:tabular-nums]";
   host.appendChild(sab);
   const yesNo = (b: boolean): string => (b ? "yes" : "no");
   const updateSab = (): void => {
+    const transport = net.layoutTransport;
     const supported = sharedMemoryAvailable();
-    const inUse = net.layoutTransport === "shared";
-    sab.style.color = inUse ? "#1a7f37" : supported ? "#9a6700" : "#8a8a8a";
+    const inUse = transport === "shared";
+    const isGpu = transport === "gpu";
+    sab.style.color = isGpu ? "#7c3aed" : inUse ? "#1a7f37" : supported ? "#9a6700" : "#8a8a8a";
     sab.innerHTML =
+      `<span title="Active layout transport: gpu = WebGL GPU path; shared = CPU worker, zero-copy SharedArrayBuffer; copy = CPU worker, per-frame postMessage snapshots; none = no layout running.">layout: <b>${transport}</b></span><br>` +
       `<span title="Environment capability: SharedArrayBuffer needs a cross-origin-isolated page (COOP: same-origin + COEP: require-corp). Set on the dev/preview server; GitHub Pages can't send these headers — see issue #163.">SAB supported: <b>${yesNo(supported)}</b></span><br>` +
-      `<span title="Actual transport of the running worker layout: yes = positions stream zero-copy through a SharedArrayBuffer; no = posted as per-frame snapshots (also when the worker fell back to a synchronous solve).">SAB in use: <b>${yesNo(inUse)}</b></span>`;
+      `<span title="Actual SAB transport of the running worker layout: yes = positions stream zero-copy through a SharedArrayBuffer; no = posted as per-frame snapshots (also when the worker fell back to a synchronous solve).">SAB in use: <b>${yesNo(inUse)}</b></span>`;
   };
   updateSab();
 
@@ -162,8 +166,11 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
               }
             : false,
         )
-        .layout({ backend: "worker", iterations, multilevel });
-      updateSab(); // the new worker run has now chosen its transport
+        .layout({ backend: options.backend === "GPU" ? "gpu" : "worker", iterations, multilevel });
+      updateSab(); // immediate snapshot (gpu transport resolves async; whenSettled() refreshes it)
+      // For backend:"gpu" the transport is initially "copy" until the device promise resolves;
+      // refresh the readout once the layout settles so the user sees the resolved "gpu" value.
+      void net.whenSettled().then(updateSab);
     },
   };
 };

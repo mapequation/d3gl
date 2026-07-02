@@ -11,6 +11,8 @@ import { physicalPieWedges, type PhysicalPieWedges, type PieWedgeOptions } from 
 import { rosettePositions } from "./rosette.js";
 import type { StateNetworkGraph } from "./state-graph.js";
 import { startWorkerLayout, type WorkerLayoutHandle } from "./worker-transport.js";
+import { startGpuLayout } from "./gpu/gpu-transport.js";
+import { WebGLBackend } from "../webgl/webgl-backend.js";
 import type { NetworkGraph } from "./graph.js";
 import type { InstancedLayer } from "../core/index.js";
 import { InstancedLane, type SelectionStrategy } from "../core/instanced-lane.js";
@@ -924,6 +926,24 @@ export class Network extends BaseEngine {
           this.recomputeLODGeometry(true);
           this.rebuild();
         });
+      } else if (opts.backend === "gpu") {
+        // GPU force layout — uses the WebGL backend's luma.gl Device. Pass a device *promise* that
+        // waits for the backend to fully settle (including the "auto" → WebGL background upgrade)
+        // before resolving, so `startGpuLayout` sees the real WebGL device and doesn't silently fall
+        // back to the worker because it was called before the upgrade finished.
+        const devicePromise = this.whenBackendSettled().then(() => this.gpuDevice());
+        const handle = startGpuLayout(devicePromise, this.graph, {
+          width: this.width,
+          height: this.height,
+          iterations: opts.iterations ?? DEFAULT_FORCE_ITERATIONS,
+          force: opts.force,
+        }, () => this.scheduleLayoutRepaint());
+        this.layoutHandle = handle;
+        void handle.settled.then(() => {
+          if (this.layoutHandle !== handle) return; // a newer layout superseded this one
+          this.recomputeLODGeometry(true);
+          this.rebuild();
+        });
       } else if (opts.backend === "force") {
         // Main-thread force layout. (Off-thread + progressive convergence via a Web Worker is the
         // next slice.) Multilevel coarsening seeds it by default; opt out for a plain cold start.
@@ -1042,6 +1062,15 @@ export class Network extends BaseEngine {
     });
   }
 
+  /**
+   * The luma.gl Device from the live WebGL backend, or null on Canvas/SVG/SSR backends.
+   * Used by `startGpuLayout` to decide whether the GPU path is available.
+   */
+  private gpuDevice(): import("@luma.gl/core").Device | null {
+    const b = this.handle?.backend;
+    return b instanceof WebGLBackend ? b.gpuDevice : null;
+  }
+
   /** Stop a running worker layout (no-op if none). The last computed positions are kept. */
   stopLayout(): this {
     this.layoutHandle?.stop();
@@ -1081,15 +1110,22 @@ export class Network extends BaseEngine {
   }
 
   /**
-   * Which position transport the active worker layout uses: `"shared"` when positions stream zero-copy
-   * via a `SharedArrayBuffer` (the page is cross-origin isolated), `"copy"` when they are posted as
-   * per-frame snapshots (no COOP/COEP isolation, or the worker fell back to a synchronous solve), or
-   * `"none"` when no worker-backed layout is active (the `force`/`positions` backends, or before
-   * `layout({ backend: "worker" })`). This is the run's *actual* transport; the environment's
-   * *capability* — independent of any run — is {@link sharedMemoryAvailable}.
+   * Which position transport the active layout uses:
+   * - `"gpu"` — running on the WebGL GPU path (the handle's `transport` field is `"gpu"`).
+   * - `"shared"` — CPU worker, positions stream zero-copy via a `SharedArrayBuffer` (cross-origin isolated page).
+   * - `"copy"` — CPU worker, positions are posted as per-frame snapshots (no COOP/COEP isolation, or
+   *   the worker fell back to a synchronous solve).
+   * - `"none"` — no layout active (`force`/`positions` backends, or before `layout()`).
+   *
+   * For a `backend: "gpu"` layout this resolves **asynchronously**: it is `"copy"` (the async
+   * wrapper's initial state) until the device promise settles and the GPU path is confirmed, then
+   * flips to `"gpu"`. Read it after `await net.whenSettled()` or on a subsequent animation frame
+   * for the final resolved value. The environment's *capability* (independent of any run) is
+   * {@link sharedMemoryAvailable}.
    */
-  get layoutTransport(): "shared" | "copy" | "none" {
+  get layoutTransport(): "gpu" | "shared" | "copy" | "none" {
     if (!this.layoutHandle) return "none";
+    if (this.layoutHandle.transport === "gpu") return "gpu";
     return this.layoutHandle.shared ? "shared" : "copy";
   }
 
