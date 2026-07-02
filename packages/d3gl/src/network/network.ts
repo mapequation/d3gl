@@ -675,10 +675,12 @@ export class Network extends BaseEngine {
           this.rebuild();
         });
       } else if (opts.backend === "gpu") {
-        // GPU force layout — uses the WebGL backend's luma.gl Device. Falls back to the worker
-        // path (and thence to a sync solve) when the GPU path is unavailable (Canvas/SVG/SSR).
-        const device = this.gpuDevice();
-        const handle = startGpuLayout(device, this.graph, {
+        // GPU force layout — uses the WebGL backend's luma.gl Device. Pass a device *promise* that
+        // waits for the backend to fully settle (including the "auto" → WebGL background upgrade)
+        // before resolving, so `startGpuLayout` sees the real WebGL device and doesn't silently fall
+        // back to the worker because it was called before the upgrade finished.
+        const devicePromise = this.whenBackendSettled().then(() => this.gpuDevice());
+        const handle = startGpuLayout(devicePromise, this.graph, {
           width: this.width,
           height: this.height,
           iterations: opts.iterations ?? DEFAULT_FORCE_ITERATIONS,
@@ -777,15 +779,22 @@ export class Network extends BaseEngine {
   }
 
   /**
-   * Which position transport the active worker layout uses: `"shared"` when positions stream zero-copy
-   * via a `SharedArrayBuffer` (the page is cross-origin isolated), `"copy"` when they are posted as
-   * per-frame snapshots (no COOP/COEP isolation, or the worker fell back to a synchronous solve), or
-   * `"none"` when no worker-backed layout is active (the `force`/`positions` backends, or before
-   * `layout({ backend: "worker" })`). This is the run's *actual* transport; the environment's
-   * *capability* — independent of any run — is {@link sharedMemoryAvailable}.
+   * Which position transport the active layout uses:
+   * - `"gpu"` — running on the WebGL GPU path (the handle's `transport` field is `"gpu"`).
+   * - `"shared"` — CPU worker, positions stream zero-copy via a `SharedArrayBuffer` (cross-origin isolated page).
+   * - `"copy"` — CPU worker, positions are posted as per-frame snapshots (no COOP/COEP isolation, or
+   *   the worker fell back to a synchronous solve).
+   * - `"none"` — no layout active (`force`/`positions` backends, or before `layout()`).
+   *
+   * For a `backend: "gpu"` layout this resolves **asynchronously**: it is `"copy"` (the async
+   * wrapper's initial state) until the device promise settles and the GPU path is confirmed, then
+   * flips to `"gpu"`. Read it after `await net.whenSettled()` or on a subsequent animation frame
+   * for the final resolved value. The environment's *capability* (independent of any run) is
+   * {@link sharedMemoryAvailable}.
    */
-  get layoutTransport(): "shared" | "copy" | "none" {
+  get layoutTransport(): "gpu" | "shared" | "copy" | "none" {
     if (!this.layoutHandle) return "none";
+    if (this.layoutHandle.transport === "gpu") return "gpu";
     return this.layoutHandle.shared ? "shared" : "copy";
   }
 

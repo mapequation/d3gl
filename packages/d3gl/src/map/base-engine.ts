@@ -418,6 +418,17 @@ export abstract class BaseEngine {
   protected onResize(_prevW: number, _prevH: number, _width: number, _height: number): void {}
 
   whenReady(): Promise<void> { return this.ready; }
+
+  /**
+   * Resolves when the active backend is fully settled, INCLUDING the `"auto"` → WebGL background
+   * upgrade. `whenReady()` alone resolves at first paint (Canvas in `"auto"` mode); this method
+   * additionally awaits the WebGL device so a WebGL-only feature (GPU layout) can safely use it.
+   * On any non-`"auto"` backend this is equivalent to `whenReady()`.
+   */
+  protected async whenBackendSettled(): Promise<void> {
+    await this.ready;
+    if (this.upgradeDone) await this.upgradeDone;
+  }
   /** Idempotent: addEventListener dedupes on the same handler reference. */
   private attachPointer(): void {
     this.host.addEventListener("pointermove", this.onPointerMove);

@@ -42,6 +42,12 @@ export interface WorkerLayoutHandle {
    * fallback (no live worker). Mirrors {@link sharedMemoryAvailable} for an active worker run.
    */
   shared: boolean;
+  /**
+   * `"gpu"` when the handle was created by `startGpuLayout` and the GPU path was successfully taken
+   * (a real WebGL device was available). `undefined` for worker and synchronous-fallback handles.
+   * Used by {@link Network.layoutTransport} to distinguish a real GPU run from a silent worker fallback.
+   */
+  transport?: "gpu";
   /** Resolves when the layout first converges or is stopped. The worker stays **alive** after
    *  convergence (idle, not terminated) so a node-drag can reheat it (#140); only {@link stop} tears it down. */
   settled: Promise<void>;
