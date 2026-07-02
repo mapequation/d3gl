@@ -89,9 +89,12 @@ void main() { o_box = v_box; }
 // to the fragment so we accumulate Σ(node position) (not Σ(cell center)). The FS
 // writes (x, y, mass=1, 0); additive blend gives (Σx, Σy, mass, 0) per cell.
 //
-// The bbox texel is (maxX, maxY, -minX, -minY). We recover min/max, pad the box
-// by u_pad (×1.01) about its center so max-corner nodes fall strictly inside,
-// then cell = clamp(floor((p - min) / size * G), 0, G-1).
+// The bbox texel is (maxX, maxY, -minX, -minY). We recover min/max, then build a
+// SQUARE padded box centered on the AABB center — half = pad·max(halfX, halfY) —
+// exactly like quadtree.ts (which makes the root square: half = max extent / 2).
+// A square box keeps cells square, so cellSize = boxSide / cellsPerSide is a
+// single unambiguous value the BH traversal reuses. Then
+//   cell = clamp(floor((p - lo) / boxSide * G), 0, G-1).
 const SCATTER_VS = /* glsl */ `\
 #version 300 es
 precision highp float;
@@ -112,11 +115,12 @@ void main() {
   vec2 mn = -b.zw;
   vec2 ctr = 0.5 * (mn + mx);
   vec2 hlf = 0.5 * (mx - mn);
-  hlf = max(hlf * u_pad, vec2(1e-6));
-  vec2 lo = ctr - hlf;
-  vec2 span = 2.0 * hlf;
+  // NOTE: 'half' is a reserved word in GLSL ES 3.00 — use hlfMax.
+  float hlfMax = max(max(hlf.x, hlf.y) * u_pad, 1e-6); // square, padded
+  vec2 lo = ctr - vec2(hlfMax);
+  float boxSide = 2.0 * hlfMax;
 
-  vec2 t = (p - lo) / span;
+  vec2 t = (p - lo) / boxSide;
   float G = float(u_grid);
   vec2 cell = clamp(floor(t * G), vec2(0.0), vec2(G - 1.0));
 
@@ -210,8 +214,12 @@ export class GridPyramid {
   private readonly scatterModel: Model;
   private readonly reduceModel: Model;
 
-  /** Box padding factor so max-corner nodes fall strictly inside the grid. */
-  private static readonly PAD = 1.01;
+  /**
+   * Box padding factor so max-corner nodes fall strictly inside the grid. The
+   * BH repulsion pass must apply the SAME padding when it recomputes cell
+   * geometry from the bbox texture, so it's exposed as a public readonly.
+   */
+  readonly pad = 1.01;
 
   private readonly bboxUniforms: Record<string, number>;
   private readonly scatterUniforms: Record<string, number>;
@@ -277,7 +285,7 @@ export class GridPyramid {
       },
     });
 
-    this.scatterUniforms = { u_width: 1, u_grid: G, u_pad: GridPyramid.PAD };
+    this.scatterUniforms = { u_width: 1, u_grid: G, u_pad: this.pad };
     this.scatterModel = new Model(device, {
       vs: SCATTER_VS,
       fs: SCATTER_FS,
