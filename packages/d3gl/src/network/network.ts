@@ -7,6 +7,8 @@ import { buildLODTree, buildSpatialLODTree, computeLODGeometry, computeLODStyle,
 import { LabelLayer, placeLabels, type LabelAnchor } from "../labels/label-layer.js";
 import { buildModuleLODTree, type ModuleNode } from "./modules.js";
 import { startWorkerLayout, type WorkerLayoutHandle } from "./worker-transport.js";
+import { startGpuLayout } from "./gpu/gpu-transport.js";
+import { WebGLBackend } from "../webgl/webgl-backend.js";
 import type { NetworkGraph } from "./graph.js";
 import type { InstancedLayer } from "../core/index.js";
 import { InstancedLane, type SelectionStrategy } from "../core/instanced-lane.js";
@@ -672,6 +674,22 @@ export class Network extends BaseEngine {
           this.recomputeLODGeometry(true);
           this.rebuild();
         });
+      } else if (opts.backend === "gpu") {
+        // GPU force layout — uses the WebGL backend's luma.gl Device. Falls back to the worker
+        // path (and thence to a sync solve) when the GPU path is unavailable (Canvas/SVG/SSR).
+        const device = this.gpuDevice();
+        const handle = startGpuLayout(device, this.graph, {
+          width: this.width,
+          height: this.height,
+          iterations: opts.iterations ?? DEFAULT_FORCE_ITERATIONS,
+          force: opts.force,
+        }, () => this.scheduleLayoutRepaint());
+        this.layoutHandle = handle;
+        void handle.settled.then(() => {
+          if (this.layoutHandle !== handle) return; // a newer layout superseded this one
+          this.recomputeLODGeometry(true);
+          this.rebuild();
+        });
       } else if (opts.backend === "force") {
         // Main-thread force layout. (Off-thread + progressive convergence via a Web Worker is the
         // next slice.) Multilevel coarsening seeds it by default; opt out for a plain cold start.
@@ -709,6 +727,15 @@ export class Network extends BaseEngine {
       if (!this.lodWorkerTree) this.recomputeLODGeometry(); // worker streams geometry; main only re-cuts
       this.rebuild();
     });
+  }
+
+  /**
+   * The luma.gl Device from the live WebGL backend, or null on Canvas/SVG/SSR backends.
+   * Used by `startGpuLayout` to decide whether the GPU path is available.
+   */
+  private gpuDevice(): import("@luma.gl/core").Device | null {
+    const b = this.handle?.backend;
+    return b instanceof WebGLBackend ? b.gpuDevice : null;
   }
 
   /** Stop a running worker layout (no-op if none). The last computed positions are kept. */

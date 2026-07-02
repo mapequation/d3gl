@@ -54,6 +54,9 @@ export class WebGLBackend implements Backend {
     this.clipMatrix = clipFromView({ k: 1, x: 0, y: 0 }, width, height);
   }
 
+  /** The luma.gl Device powering this backend — exposed for GPU-side consumers (e.g. GPU layout). */
+  get gpuDevice(): Device { return this.device; }
+
   static async create(canvas: HTMLCanvasElement, opts: WebGLBackendOptions): Promise<WebGLBackend> {
     const device = await luma.createDevice({
       adapters: [webgl2Adapter],

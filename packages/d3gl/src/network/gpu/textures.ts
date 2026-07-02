@@ -136,7 +136,7 @@ export function readbackRgbaFbo(
 }
 
 /**
- * Read back `count` (x, y) pairs from an `rg32float` texture via an FBO.
+ * Read back `count` (x, y) pairs from an `rg32float` texture via a throwaway FBO.
  * Returns a `Float32Array` of length `count * 2`.
  */
 export function readbackFloatFbo(
@@ -161,6 +161,37 @@ export function readbackFloatFbo(
     sourceHeight: height,
   }) as Float32Array;
   fbo.destroy();
+  const out = new Float32Array(count * 2);
+  for (let i = 0; i < count; i++) {
+    out[i * 2] = pixels[i * 2]!;
+    out[i * 2 + 1] = pixels[i * 2 + 1]!;
+  }
+  return out;
+}
+
+/**
+ * Read back `count` (x, y) pairs from an `rg32float` texture via a pre-created FBO.
+ * Unlike {@link readbackFloatFbo}, this does NOT create or destroy the FBO — the caller
+ * owns it and must have pre-created it wrapping the same texture. Used by
+ * {@link GpuForceLayout.readPositions} to avoid per-call FBO allocation on the hot
+ * streaming path.
+ */
+export function readbackFloatFboReuse(
+  device: Device,
+  fbo: Framebuffer,
+  width: number,
+  count: number,
+): Float32Array {
+  const height = fbo.height;
+  // readPixelsToArrayWebGL auto-deduces sourceFormat/sourceType from the
+  // texture's glFormat/glType (RG, FLOAT for rg32float). EXT_color_buffer_float
+  // is enabled automatically by luma.gl's WebGLDeviceFeatures constructor.
+  const pixels = device.readPixelsToArrayWebGL(fbo, {
+    sourceX: 0,
+    sourceY: 0,
+    sourceWidth: width,
+    sourceHeight: height,
+  }) as Float32Array;
   const out = new Float32Array(count * 2);
   for (let i = 0; i < count; i++) {
     out[i * 2] = pixels[i * 2]!;

@@ -1,7 +1,7 @@
 import type { Device, Texture, Framebuffer } from "@luma.gl/core";
 import type { ForceParams, LayoutGraph } from "../force.js";
 import { buildCSR } from "../graph.js";
-import { atlasWidth, pingPong, readbackFloatFbo, packUintTexture } from "./textures.js";
+import { atlasWidth, pingPong, readbackFloatFboReuse, packUintTexture } from "./textures.js";
 import { IntegratePass } from "./passes/integrate.js";
 import { AttractionPass } from "./passes/attraction.js";
 import { RepulsionAllPairsPass } from "./passes/repulsion-allpairs.js";
@@ -116,6 +116,14 @@ export class GpuForceLayout {
   /** Selects which pre-created FBO this tick writes into; flipped each tick alongside swap(). */
   private parity = 0;
 
+  /**
+   * Pre-created readback FBOs for `readPositions`. Two FBOs (one per ping-pong parity) so we can
+   * read from whichever texture is currently the read side without creating a new FBO per call.
+   * `readFbos[0]` wraps the A texture (initial read side); `readFbos[1]` wraps the B texture.
+   * After each swap, `parity` selects which one holds the current read texture.
+   */
+  private readonly readFbos: readonly [Framebuffer, Framebuffer];
+
   /** CSR offset texture (r32uint): offsets[0..nodeCount] packed into an atlas. */
   private readonly offsetsTex: Texture;
   /** CSR neighbors texture (r32uint): the flat neighbor list packed into an atlas. */
@@ -170,6 +178,16 @@ export class GpuForceLayout {
     posData.set(graph.positions);
     this.pos = pingPong(device, width, height, posData);
     this.vel = pingPong(device, width, height);
+
+    // Pre-create readback FBOs: one per parity so readPositions never allocates per call.
+    // readFbos[0] wraps the A texture (readTex before any swap); readFbos[1] wraps B.
+    const makeReadFbo = (): Framebuffer =>
+      device.createFramebuffer({ width, height, colorAttachments: [this.pos.readTex] });
+    const readFbo0 = makeReadFbo();
+    this.pos.swap();
+    const readFbo1 = makeReadFbo();
+    this.pos.swap(); // restore to initial state
+    this.readFbos = [readFbo0, readFbo1];
 
     // Force accumulation texture — cleared each tick, written by force passes.
     this.forceTex = device.createTexture({
@@ -379,7 +397,8 @@ export class GpuForceLayout {
    * Writes `count * 2` floats into `out` starting at index 0.
    */
   readPositions(out: Float32Array): void {
-    const pixels = readbackFloatFbo(this.device, this.pos.readTex, this.width, this.count);
+    // Reuse the pre-created readback FBO for the current read-side texture (no per-call alloc).
+    const pixels = readbackFloatFboReuse(this.device, this.readFbos[this.parity]!, this.width, this.count);
     out.set(pixels);
   }
 
@@ -392,6 +411,8 @@ export class GpuForceLayout {
     this.sumFbo.destroy();
     this.fbos[0].destroy();
     this.fbos[1].destroy();
+    this.readFbos[0].destroy();
+    this.readFbos[1].destroy();
     this.offsetsTex.destroy();
     this.neighborsTex.destroy();
     this.integratePass.destroy();
