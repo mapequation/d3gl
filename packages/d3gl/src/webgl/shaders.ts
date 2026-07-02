@@ -239,6 +239,51 @@ void main() {
   fragColor = (v_border > 0.0 && r > 1.0 - v_border) ? v_borderColor : v_color;
 }`;
 
+// INSTANCED_PIE_VS — GPU-instanced pie wedges for the physical view of a state network (#171). Reuses
+// the circle's quad positioning (per-instance centre/radius, world/screen sizeMode) and carries the
+// wedge's angular range [startFrac, endFrac] in [0,1] to the fragment shader. One instance per wedge.
+export const INSTANCED_PIE_VS = `#version 300 es
+precision highp float;
+uniform mat3 u_transform;
+uniform float u_screen;     // 1.0 = screen sizeMode (constant px), 0.0 = world
+uniform vec2 u_viewport;    // device px, for screen sizeMode
+in vec2 a_corner;           // per-vertex unit-quad corner in [-1, 1]
+in vec2 a_center;           // per-instance world centre (shared by a pie's wedges)
+in float a_radius;          // per-instance radius
+in vec2 a_angles;           // per-instance [startFrac, endFrac] in [0,1]
+in vec4 a_color;            // per-instance RGBA (unorm8x4 -> 0..1)${HL_UNIFORMS}
+out vec4 v_color;
+out vec2 v_local;
+out vec2 v_angles;
+void main() {
+  v_color = a_color;${HL_APPLY}
+  v_local = a_corner;
+  v_angles = a_angles;
+  vec3 c = u_transform * vec3(a_center, 1.0);
+  vec2 off = (u_screen > 0.5)
+    ? a_corner * a_radius * vec2(2.0 / u_viewport.x, -2.0 / u_viewport.y)
+    : (u_transform * vec3(a_center + a_corner * a_radius, 1.0)).xy - c.xy;
+  gl_Position = vec4(c.xy + off, 0.0, 1.0);
+}`;
+
+// INSTANCED_PIE_FS — a filled disc clipped to one angular wedge. Discards outside the unit disc (like
+// the circle) and outside the wedge's [startFrac, endFrac] angular slice. The angle fraction is
+// atan2(y,x) normalised to [0,1) — the SAME convention the Canvas/SVG wedge-arc emitter uses (in world
+// coords, before the shared world→screen transform), so the three backends partition the pie identically.
+export const INSTANCED_PIE_FS = `#version 300 es
+precision highp float;
+in vec4 v_color;
+in vec2 v_local;
+in vec2 v_angles;
+out vec4 fragColor;
+void main() {
+  if (length(v_local) > 1.0) discard;
+  float frac = atan(v_local.y, v_local.x) * 0.15915494309; // /(2π) -> [-0.5, 0.5]
+  if (frac < 0.0) frac += 1.0;                              // -> [0, 1)
+  if (frac < v_angles.x || frac >= v_angles.y) discard;     // outside this wedge
+  fragColor = v_color;
+}`;
+
 // INSTANCED_LINE_VS — GPU-instanced "path-strip" lines for the network lane (#100, bent #104 N6c).
 // The per-vertex template a_corner = (t, side): t in [0,1] walks the path (M samples), side in
 // {-1,1} picks the edge. Per-instance source/target/width/color/bend. The path is a quadratic

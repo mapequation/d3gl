@@ -871,7 +871,9 @@ export class Network extends BaseEngine {
   /** Flag every link layer (lines/arrows/half-arrows; not node circles) into the GPU pick pass (#141)
    *  when link picking is on. Mutates the freshly-built layers in place (they're per-emit, never shared). */
   private flagPickableLinks(layers: InstancedLayer[]): InstancedLayer[] {
-    if (this.pickLinksEnabled) for (const l of layers) if (l.primitive !== "circles") l.pickable = true;
+    if (this.pickLinksEnabled)
+      for (const l of layers)
+        if (l.primitive === "lines" || l.primitive === "arrows" || l.primitive === "half-arrows") l.pickable = true;
     return layers;
   }
 
@@ -889,12 +891,14 @@ export class Network extends BaseEngine {
         // The only circles layer in the no-LOD path is `nodes` (no aggregate halos). Instance i = node i.
         l.circles.groups = identityFloats(graph.nodeCount);
         l.circles.selected = this.noLodSelectedFor(this.NODE_LAYER);
-      } else {
+      } else if (l.primitive === "lines" || l.primitive === "half-arrows" || l.primitive === "arrows") {
         const link = l.primitive === "lines" ? l.lines : l.primitive === "half-arrows" ? l.halfArrows : l.arrows;
         link.groups = source;
         if (target) link.groups2 = target;
         link.selected = this.noLodSelectedFor("links"); // links/arrows share the per-edge flag
       }
+      // A "pie" layer (#171 physical view) is not part of the standard node/link set; it carries its own
+      // per-wedge groups (physical node id) from physicalPieInstances, so no attachment is needed here.
     }
     return layers;
   }

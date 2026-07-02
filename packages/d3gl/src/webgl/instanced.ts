@@ -1,8 +1,8 @@
 import { Model } from "@luma.gl/engine";
 import type { Buffer, Device, RenderPass } from "@luma.gl/core";
-import { INSTANCED_CIRCLE_VS, INSTANCED_CIRCLE_FS, INSTANCED_LINE_VS, INSTANCED_ARROW_VS, INSTANCED_HALF_ARROW_VS, POINT_FS, FILL_FS, PICK_FS } from "./shaders.js";
+import { INSTANCED_CIRCLE_VS, INSTANCED_CIRCLE_FS, INSTANCED_PIE_VS, INSTANCED_PIE_FS, INSTANCED_LINE_VS, INSTANCED_ARROW_VS, INSTANCED_HALF_ARROW_VS, POINT_FS, FILL_FS, PICK_FS } from "./shaders.js";
 import { clipFromView } from "./transform.js";
-import type { InstancedCirclesData, InstancedLinesData, InstancedArrowsData, InstancedHalfArrowsData, InstancedHighlight } from "../core/index.js";
+import type { InstancedCirclesData, InstancedPieData, InstancedLinesData, InstancedArrowsData, InstancedHalfArrowsData, InstancedHighlight } from "../core/index.js";
 
 /** Per-instance data carrying the shader-highlight columns (#162) — every instanced data type has these.
  *  `groups2` is the link's OTHER endpoint (target), so an undirected hover matches incident links on either
@@ -267,6 +267,126 @@ export class InstancedCircles {
     this.color.destroy();
     this.border.destroy();
     this.borderColor.destroy();
+    this.hl.destroy();
+  }
+}
+
+/**
+ * GPU-instanced **pie wedges** (#171) — one instance per wedge, reusing the circle's quad positioning
+ * (per-instance centre/radius + world/screen sizeMode). The fragment discards outside the disc and
+ * outside the wedge's `[startFrac, endFrac]` angular slice, so a full pie is one instanced draw and
+ * updates in place like {@link InstancedCircles}. Group id = the physical node id, so a hover/select
+ * lights the whole pie (#162).
+ */
+export class InstancedPie {
+  count: number;
+  private _capacity: number;
+  private model: Model;
+  private corner: Buffer;
+  private center: Buffer;
+  private radius: Buffer;
+  private angles: Buffer;
+  private color: Buffer;
+  private hl: HighlightBuffers;
+  private uniforms: Record<string, unknown>;
+
+  constructor(device: Device, data: InstancedPieData, width = 0, height = 0) {
+    this.count = data.count;
+    this._capacity = data.count;
+    this.corner = device.createBuffer({ data: QUAD });
+    this.center = device.createBuffer({ data: data.centers });
+    this.radius = device.createBuffer({ data: data.radii });
+    this.angles = device.createBuffer({ data: data.angles });
+    this.color = device.createBuffer({ data: data.colors });
+    this.hl = new HighlightBuffers(device, data); // #162 shader highlight (a_group / a_selected)
+    this.uniforms = {
+      u_transform: clipFromView({ k: 1, x: 0, y: 0 }, width || 1, height || 1),
+      u_screen: 0,
+      u_viewport: [width, height],
+      ...highlightUniforms(0), // pie is a node glyph — dimmed/kept, not recoloured (recolor = 0)
+    };
+    this.model = new Model(device, {
+      vs: INSTANCED_PIE_VS,
+      fs: INSTANCED_PIE_FS,
+      bufferLayout: [
+        { name: "a_corner", format: "float32x2" },
+        { name: "a_center", format: "float32x2", stepMode: "instance" },
+        { name: "a_radius", format: "float32", stepMode: "instance" },
+        { name: "a_angles", format: "float32x2", stepMode: "instance" },
+        { name: "a_color", format: "unorm8x4", stepMode: "instance" },
+        ...this.hl.layout,
+      ],
+      attributes: {
+        a_corner: this.corner,
+        a_center: this.center,
+        a_radius: this.radius,
+        a_angles: this.angles,
+        a_color: this.color,
+        ...this.hl.attributes(),
+      },
+      uniforms: this.uniforms,
+      parameters: BLEND,
+      topology: "triangle-strip",
+      vertexCount: 4,
+      instanceCount: this.count,
+    });
+  }
+
+  setHighlight(h: InstancedHighlight): void {
+    applyHighlight(this.uniforms, h);
+    if (h.selected) this.hl.writeSelected(h.selected, this.count);
+  }
+  setTransform(m: Float32Array): void {
+    this.uniforms["u_transform"] = m;
+  }
+  setViewport(width: number, height: number): void {
+    this.uniforms["u_viewport"] = [width, height];
+  }
+  setSizeMode(mode: "world" | "screen"): void {
+    this.uniforms["u_screen"] = mode === "screen" ? 1 : 0;
+  }
+
+  /** In-place instance update (mirrors {@link InstancedCircles.update}): sub-upload while the wedge
+   *  count fits capacity, else reallocate the instance buffers (keeping the same object). */
+  update(device: Device, data: InstancedPieData): void {
+    if (data.count > this._capacity) {
+      this.center.destroy();
+      this.radius.destroy();
+      this.angles.destroy();
+      this.color.destroy();
+      this._capacity = data.count;
+      this.center = device.createBuffer({ data: data.centers });
+      this.radius = device.createBuffer({ data: data.radii });
+      this.angles = device.createBuffer({ data: data.angles });
+      this.color = device.createBuffer({ data: data.colors });
+      this.model.setAttributes({
+        a_center: this.center,
+        a_radius: this.radius,
+        a_angles: this.angles,
+        a_color: this.color,
+        ...this.hl.recreate(data),
+      });
+    } else {
+      this.center.write(data.centers);
+      this.radius.write(data.radii);
+      this.angles.write(data.angles);
+      this.color.write(data.colors);
+      this.hl.write(data);
+    }
+    this.count = data.count;
+    this.model.setInstanceCount(data.count);
+  }
+
+  render(pass: RenderPass): void {
+    if (this.count > 0) this.model.draw(pass);
+  }
+  destroy(): void {
+    this.model.destroy();
+    this.corner.destroy();
+    this.center.destroy();
+    this.radius.destroy();
+    this.angles.destroy();
+    this.color.destroy();
     this.hl.destroy();
   }
 }

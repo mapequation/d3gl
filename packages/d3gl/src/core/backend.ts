@@ -203,16 +203,43 @@ export interface InstancedHalfArrowsData {
 }
 
 /**
+ * SoA for a batch of instanced **pie wedges** (#171) — the physical-view glyph for a state network's
+ * overlapping module membership. **One instance per wedge** (not per pie): a wedge is an angular
+ * `[startFrac, endFrac]` sector of a disc, so a physical node spanning `w` modules contributes `w`
+ * wedge instances sharing a centre/radius. Reuses the circle's quad+SDF-disc positioning; the fragment
+ * discards outside the disc **and** outside the wedge's angular range, so there is no per-fragment loop
+ * and no wedge texture — it draws in one instanced call and updates in place like {@link InstancedCirclesData}.
+ * (Single-module physical nodes stay on the {@link InstancedCirclesData} lane as solid discs.)
+ */
+export interface InstancedPieData {
+  /** [x, y] world centre per wedge (a pie's wedges share a centre), length `2 * count`. */
+  centers: Float32Array;
+  /** radius per wedge, length `count`. */
+  radii: Float32Array;
+  /** [startFrac, endFrac] angular range in `[0, 1]` per wedge (cumulative fractions), length `2 * count`. */
+  angles: Float32Array;
+  /** RGBA bytes per wedge, length `4 * count`. */
+  colors: Uint8Array;
+  /** Per-instance highlight group (#162) = the wedge's **physical node id**, so a hover/select lights the
+   *  whole pie (all its wedges share the id). Length `count`. */
+  groups?: Float32Array;
+  /** Per-instance selected flag (0/1) for shader-driven dim/recolour (#162). Length `count`. */
+  selected?: Uint8Array;
+  count: number;
+}
+
+/**
  * A named GPU-instanced primitive layer — the network rendering lane (#100).
  *
  * `pickable` (#141) opts a link layer into the GPU-readback pick pass: the backend also builds an
  * id-encoded pick model (one extra Model, no extra instance buffers — the id is `gl_InstanceID`) and
  * renders it into an offscreen pick FBO, so {@link Backend.pickInstanced} resolves a screen pixel to
  * the topmost link instance. Only the link primitives (lines/arrows/half-arrows) carry it; nodes
- * (circles) are CPU-picked exactly on the screen-bounded frontier and never enter the GPU pick pass.
+ * (circles, pie) are CPU-picked exactly on the screen-bounded frontier and never enter the GPU pick pass.
  */
 export type InstancedLayer =
   | { name: string; sizeMode?: "world" | "screen"; primitive: "circles"; circles: InstancedCirclesData }
+  | { name: string; sizeMode?: "world" | "screen"; primitive: "pie"; pie: InstancedPieData }
   | { name: string; sizeMode?: "world" | "screen"; primitive: "lines"; pickable?: boolean; lines: InstancedLinesData }
   | { name: string; sizeMode?: "world" | "screen"; primitive: "arrows"; pickable?: boolean; arrows: InstancedArrowsData }
   | { name: string; sizeMode?: "world" | "screen"; primitive: "half-arrows"; pickable?: boolean; halfArrows: InstancedHalfArrowsData };
