@@ -106,10 +106,14 @@ does) would solve the wrong units.
 (no children), *not* as "level 0". This decouples the layout from the height-based
 level assignment entirely: prolongation is per-parent→children, so ragged depth is
 handled by recursion (a shallow-branch leaf is placed as soon as its parent is,
-and never subdivided). The per-node geometry (`cx/cy/extent`) stays bottom-up for
-rendering and, under soft containment (§4), converges to the same place the
-top-down layout put each module — so LOD's height-based cut and the layout agree
-on positions without sharing a level numbering.
+and never subdivided). There is **no second "module position" to reconcile**: an
+aggregate's rendered position is simply the **centroid of its members**
+(`computeLODPositions`, bottom-up), and the soft-containment force (§4) pulls each
+node toward that *same* centroid — a cohesion pull that stops a module's members
+drifting apart, so the centroid stays a tight, meaningful point under the aggregate
+glyph. The top-down placement is only the **seed**; the final aggregate position is
+the member centroid, used identically by containment and by rendering. So LOD's
+height-based cut and the layout agree on positions without sharing a level numbering.
 
 ### 2. GPU data model (renderer's WebGL2 device)
 
