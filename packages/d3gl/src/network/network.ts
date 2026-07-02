@@ -2257,9 +2257,10 @@ export class Network extends BaseEngine {
     const constBorder: ConstBorder | null =
       nb && !this.styleOpts.flowBorder ? { width: nb.width, color: rgbaBytes(nb.color ?? "#ffffff") } : null;
     const nodeRadiusSpec = this.styleOpts.nodeRadius ?? DEFAULT_NODE_RADIUS;
+    const nodeRadii = resolveNodeRadii(graph, nodeRadiusSpec);
     return {
-      nodeRadii: resolveNodeRadii(graph, nodeRadiusSpec),
-      nodeRadiusAggregate: resolveNodeRadiusAggregate(graph, nodeRadiusSpec),
+      nodeRadii,
+      nodeRadiusAggregate: resolveNodeRadiusAggregate(graph, nodeRadiusSpec, nodeRadii),
       importance: resolveImportance(graph, this.styleOpts.importance, nodeRadiusSpec),
       nodeFill,
       nodeColors,

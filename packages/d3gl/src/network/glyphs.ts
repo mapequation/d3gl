@@ -78,22 +78,61 @@ export function resolveNodeRadii(graph: NetworkGraph, spec: NodeRadiusSpec): Flo
 }
 
 /**
+ * Resolve the {@link RadiusAggregate} LOD aggregates size by (#192).
+ *
  * When {@link NodeRadiusSpec} sizes by an **additive metric** (`{ by, scale }` — degree/strength/flow,
- * or a custom accessor), expose the per-leaf metric value + the scale so LOD aggregates size by the
- * SAME scale applied to their summed child value (a module's radius from its members' total flow),
- * rather than the area-additive `√Σr²` fallback. Returns `null` for constant / `Float32Array` /
- * degree-function specs — there is no additive value to sum, so aggregates keep the fallback.
+ * or a custom accessor), aggregates use the SAME scale applied to their summed child value (a module's
+ * radius from its members' total flow) — unchanged.
+ *
+ * Otherwise (a constant radius, a caller-supplied `Float32Array`, or a degree-only function — none of
+ * which carry a metric to sum) this now **defaults** aggregate sizing to the graph's summed flow
+ * (falling back to `strength`, the weighted degree, when there is no `flow` — `strength` is always
+ * present, so this is essentially always available) instead of the count-based, metric-agnostic
+ * `√(Σ child radius²)` fallback — so a higher-flow module reads visibly larger than a same-count
+ * low-flow one. The scale is area-proportional, anchored at the mean leaf so it matches the resolved
+ * leaf radii:
+ *
+ *     radiusOf(v) = meanLeafRadius · √(v / meanLeafValue)
+ *
+ * i.e. area ∝ value: a leaf whose own metric equals the mean maps back to ≈ the mean leaf radius, and
+ * doubling the summed value doubles the aggregate's *area* (not its radius) — the same area-additive
+ * spirit as the `√Σr²` fallback, but weighted by the metric instead of raw count.
+ *
+ * Returns `null` (the `√Σr²` fallback stays) only when even that metric carries no size signal — e.g.
+ * an empty or edgeless graph with no flow (mean value 0).
+ *
+ * `leafRadii`, if supplied, is the already-resolved per-node radii (avoids recomputing them — callers
+ * that already resolved `spec` via {@link resolveNodeRadii} should pass that array through); otherwise
+ * it is resolved from `spec` here. Called once per `style()` change — never per frame.
  */
 export function resolveNodeRadiusAggregate(
   graph: NetworkGraph,
   spec: NodeRadiusSpec,
+  leafRadii?: Float32Array,
 ): { leafValue: Float32Array; radiusOf: (value: number) => number } | null {
-  if (typeof spec === "number" || typeof spec === "function" || spec instanceof Float32Array) return null;
-  const accessor = metricAccessor(graph, spec.by);
+  if (typeof spec === "object" && !(spec instanceof Float32Array)) {
+    const accessor = metricAccessor(graph, spec.by);
+    const n = graph.nodeCount;
+    const leafValue = new Float32Array(n);
+    for (let i = 0; i < n; i++) leafValue[i] = accessor(i);
+    return { leafValue, radiusOf: spec.scale };
+  }
+
   const n = graph.nodeCount;
-  const leafValue = new Float32Array(n);
-  for (let i = 0; i < n; i++) leafValue[i] = accessor(i);
-  return { leafValue, radiusOf: spec.scale };
+  const metric = graph.flow ?? graph.strength;
+  if (!metric || n === 0) return null;
+  let valueSum = 0;
+  for (let i = 0; i < n; i++) valueSum += metric[i]!;
+  const meanValue = valueSum / n;
+  if (!(meanValue > 0)) return null; // no size signal (e.g. an edgeless graph with no flow) — keep √Σr²
+
+  const radii = leafRadii ?? resolveNodeRadii(graph, spec);
+  let radiusSum = 0;
+  for (let i = 0; i < n; i++) radiusSum += radii[i]!;
+  const meanRadius = radiusSum / n;
+
+  const radiusOf = (value: number): number => meanRadius * Math.sqrt(value / meanValue);
+  return { leafValue: metric, radiusOf };
 }
 
 /**

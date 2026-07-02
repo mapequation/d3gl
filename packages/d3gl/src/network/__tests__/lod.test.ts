@@ -13,7 +13,7 @@ import {
 } from "../lod.js";
 import { buildHierarchy, multilevelSeed } from "../coarsen.js";
 import { lodGeometryViews, lodGeometryByteLength } from "../worker-protocol.js";
-import { frontierCircles, superEdges } from "../glyphs.js";
+import { frontierCircles, superEdges, resolveNodeRadiusAggregate } from "../glyphs.js";
 import { buildGraph } from "../graph.js";
 
 /**
@@ -90,6 +90,30 @@ describe("computeLODGeometry", () => {
     computeLODGeometry(tree, g, leafRadii);
     expect(tree.radius[4]).toBeCloseTo(5);
     expect(tree.radius[5]).toBeCloseTo(13);
+  });
+
+  it("#192: with a constant node radius, resolveNodeRadiusAggregate defaults sizing to summed strength — an equal-count, higher-strength aggregate reads larger (the √Σr² fallback would size them equal)", () => {
+    // Same pairing topology as pairedGraph(), but the two pairs' own edge weights (hence strength) now
+    // differ sharply while the bridge stays light enough not to change the heavy-edge matching.
+    const g = buildGraph({ nodeCount: 4, source: [0, 2, 1], target: [1, 3, 2], weight: [10, 2, 0.5] });
+    g.positions.set([0, 0, 2, 0, 10, 0, 12, 0]);
+    const tree = buildLODTree(g, { minNodes: 2 });
+    const leafRadii = new Float32Array(4).fill(4);
+    const radiusAggregate = resolveNodeRadiusAggregate(g, 4, leafRadii)!;
+    expect(radiusAggregate).not.toBeNull();
+
+    computeLODGeometry(tree, g, leafRadii, undefined, undefined, undefined, radiusAggregate);
+
+    // aggregate 4 = {0,1} (strength 10, 10.5 → sum 20.5); aggregate 5 = {2,3} (strength 2.5, 2 → sum 4.5).
+    // Equal child count (2 each) but very different summed strength ⇒ different radii.
+    expect(tree.count[4]).toBe(2);
+    expect(tree.count[5]).toBe(2);
+    expect(tree.radius[4]).toBeGreaterThan(tree.radius[5]);
+
+    // The count-based √Σr² fallback is agnostic to strength and would size the equal-count pairs equal.
+    const fallbackTree = buildLODTree(g, { minNodes: 2 });
+    computeLODGeometry(fallbackTree, g, leafRadii);
+    expect(fallbackTree.radius[4]).toBeCloseTo(fallbackTree.radius[5]);
   });
 });
 

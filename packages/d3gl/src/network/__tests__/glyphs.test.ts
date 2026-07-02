@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { nodeCircles, linkLines, linkArrows, halfArrowLinks, networkLayers, networkLayersFromCache, noLodStyleCache, pickNodes, resolveNodeRadii, resolveImportance, resolveLinkColorOf, resolveLinkStrokeOf, type ResolvedNetworkStyle } from "../glyphs.js";
+import { nodeCircles, linkLines, linkArrows, halfArrowLinks, networkLayers, networkLayersFromCache, noLodStyleCache, pickNodes, resolveNodeRadii, resolveNodeRadiusAggregate, resolveImportance, resolveLinkColorOf, resolveLinkStrokeOf, type ResolvedNetworkStyle } from "../glyphs.js";
 import { buildGraph } from "../graph.js";
 
 /** A resolved style with a uniform radius for `n` nodes (defaults applied elsewhere). */
@@ -266,6 +266,58 @@ describe("resolveNodeRadii", () => {
     const radii = resolveNodeRadii(withFlow, { by: "flow", scale: (v) => v * 10 });
     expect(Array.from(radii)).toEqual([1, 4, 2, 3]);
     expect(() => resolveNodeRadii(star(), { by: "flow", scale: (v) => v })).toThrow(/requires nodeFlow/);
+  });
+});
+
+describe("resolveNodeRadiusAggregate (#192 — default LOD aggregate sizing)", () => {
+  it("keeps the leaf-scale-on-summed-value behaviour unchanged when nodeRadius already specifies a metric", () => {
+    const g = buildGraph({ nodeCount: 4, source: [0, 1, 1], target: [1, 2, 3], weight: [1, 2, 3] });
+    const scale = (v: number) => v * 2;
+    const agg = resolveNodeRadiusAggregate(g, { by: "strength", scale })!;
+    // strength = [1, 6, 2, 3] (see the star() comment above); leafValue is the raw metric, radiusOf is
+    // literally the caller's scale (SAME scale used at the leaves) — unchanged from before #192.
+    expect(Array.from(agg.leafValue)).toEqual([1, 6, 2, 3]);
+    expect(agg.radiusOf).toBe(scale);
+  });
+
+  it("defaults to summed flow when the radius spec has no metric (constant radius) and flow is available", () => {
+    // Flow deliberately disagrees with strength so the test can tell which metric drove the sizing.
+    const g = buildGraph({
+      nodeCount: 3,
+      source: [0, 1],
+      target: [1, 2],
+      weight: [100, 100], // strength would be [100, 200, 100] — flow below is unrelated
+      nodeFlow: [1, 1, 1], // uniform flow ⇒ mean = 1
+    });
+    const leafRadii = new Float32Array(3).fill(5);
+    const agg = resolveNodeRadiusAggregate(g, 5, leafRadii)!;
+    expect(agg).not.toBeNull();
+    expect(Array.from(agg.leafValue)).toEqual([1, 1, 1]); // flow, not strength
+    // Uniform metric ⇒ every leaf's own value equals the mean, so its radius maps back exactly.
+    expect(agg.radiusOf(1)).toBeCloseTo(5);
+    expect(agg.radiusOf(2)).toBeCloseTo(5 * Math.sqrt(2)); // area doubles, radius scales by √2
+  });
+
+  it("falls back to summed strength (weighted degree) when the graph has no flow", () => {
+    const g = buildGraph({ nodeCount: 3, source: [0, 1], target: [1, 2], weight: [4, 4] });
+    // strength: node0=4, node1=8, node2=4 → mean = 16/3
+    const leafRadii = new Float32Array(3).fill(6);
+    const agg = resolveNodeRadiusAggregate(g, 6, leafRadii)!;
+    expect(agg.leafValue).toBe(g.strength);
+    const meanValue = 16 / 3;
+    expect(agg.radiusOf(meanValue)).toBeCloseTo(6); // the metric mean maps back to the mean (constant) leaf radius
+  });
+
+  it("returns null (the √Σr² fallback stays) for an edgeless graph with no flow — no size signal at all", () => {
+    const g = buildGraph({ nodeCount: 3, source: [], target: [] }); // strength all 0, no flow
+    const agg = resolveNodeRadiusAggregate(g, 4, new Float32Array(3).fill(4));
+    expect(agg).toBeNull();
+  });
+
+  it("resolves its own leaf radii when none are supplied", () => {
+    const g = buildGraph({ nodeCount: 2, source: [0], target: [1], weight: [3], nodeFlow: [2, 2] });
+    const agg = resolveNodeRadiusAggregate(g, 7)!; // no leafRadii passed ⇒ resolves constant 7 itself
+    expect(agg.radiusOf(2)).toBeCloseTo(7); // uniform flow ⇒ mean 2 maps back to the constant leaf radius
   });
 });
 
