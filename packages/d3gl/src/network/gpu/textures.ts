@@ -25,10 +25,52 @@ export function packPositionsTexture(
     height,
     format: "rg32float",
     data,
-    mipmaps: false,
+    mipLevels: 1,
     sampler: { minFilter: "nearest", magFilter: "nearest" },
   });
   return { texture, width, height, count };
+}
+
+/**
+ * A single-target ping-pong pair. The consumer reads from `readTex` and renders
+ * into `writeTex`. Calling `swap()` makes the write target the new read source
+ * for the next pass.
+ */
+export interface PingPong {
+  /** The current source texture (read side). */
+  readonly readTex: Texture;
+  /** The current write target texture. */
+  readonly writeTex: Texture;
+  /** Flip read ↔ write for the next pass. */
+  swap(): void;
+  /** Release both GPU textures. */
+  destroy(): void;
+}
+
+/** Create a ping-pong pair of `rg32float` textures of size `width × height`. */
+export function pingPong(
+  device: Device,
+  width: number,
+  height: number,
+): PingPong {
+  const make = (): Texture =>
+    device.createTexture({
+      width,
+      height,
+      format: "rg32float",
+      mipLevels: 1,
+      sampler: { minFilter: "nearest", magFilter: "nearest" },
+    });
+
+  let texA = make();
+  let texB = make();
+
+  return {
+    get readTex() { return texA; },
+    get writeTex() { return texB; },
+    swap() { const tmp = texA; texA = texB; texB = tmp; },
+    destroy() { texA.destroy(); texB.destroy(); },
+  };
 }
 
 /**
