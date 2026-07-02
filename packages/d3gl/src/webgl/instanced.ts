@@ -291,6 +291,10 @@ function lineTemplate(samples: number): Float32Array {
 
 export class InstancedLines {
   count: number;
+  /** Current buffer capacity (in instances). Used by update() to decide grow vs. sub-update. */
+  private _capacity: number;
+  /** Vertex samples (M) baked into the corner template buffer — if data.samples changes, caller must recreate. */
+  private _samples: number;
   private model: Model;
   /** Pick-pass twin (#141): same VS/geometry, PICK_FS, no blend. Built only when `pick` is set. */
   private pickModel?: Model;
@@ -305,7 +309,9 @@ export class InstancedLines {
 
   constructor(device: Device, data: InstancedLinesData, width = 0, height = 0, pick = false) {
     this.count = data.count;
+    this._capacity = data.count;
     const samples = Math.max(2, (data.samples ?? 2) | 0);
+    this._samples = samples;
     this.corner = device.createBuffer({ data: lineTemplate(samples) });
     this.source = device.createBuffer({ data: data.sources });
     this.target = device.createBuffer({ data: data.targets });
@@ -379,6 +385,66 @@ export class InstancedLines {
     applyHighlight(this.uniforms, h);
     if (h.selected) this.hl.writeSelected(h.selected, this.count);
   }
+
+  /**
+   * Update the instance data in place (no object recreation). Uses `gl.bufferSubData` when
+   * `data.count ≤ current buffer capacity`; reallocates the per-instance buffers (but keeps the
+   * SAME `InstancedLines` object) when the new count exceeds capacity. If `data.samples` changed
+   * (the vertex template must be rebuilt), the caller must destroy+recreate instead — this method
+   * returns `false` in that case so `updateInstancedLayer` falls back to `setInstancedLayer`.
+   *
+   * The pick model tracks the same instance buffers (shared references), so endpoint moves are
+   * automatically reflected in the pick pass — ids/count are unchanged, only positions moved.
+   */
+  update(device: Device, data: InstancedLinesData): boolean {
+    const newSamples = Math.max(2, (data.samples ?? 2) | 0);
+    if (newSamples !== this._samples) return false; // vertex template changed — caller must recreate
+    if (data.count > this._capacity) {
+      // Grow: destroy old per-instance buffers and allocate at the new capacity.
+      this.source.destroy();
+      this.target.destroy();
+      this.widthBuf.destroy();
+      this.color.destroy();
+      this.bend.destroy();
+      this._capacity = data.count;
+      this.source = device.createBuffer({ data: data.sources });
+      this.target = device.createBuffer({ data: data.targets });
+      this.widthBuf = device.createBuffer({ data: data.widths });
+      this.color = device.createBuffer({ data: data.colors });
+      this.bend = device.createBuffer({ data: data.bends ?? new Float32Array(data.count) });
+      this.model.setAttributes({
+        a_source: this.source,
+        a_target: this.target,
+        a_width: this.widthBuf,
+        a_color: this.color,
+        a_bend: this.bend,
+        ...this.hl.recreate(data),
+      });
+      if (this.pickModel) {
+        this.pickModel.setAttributes({
+          a_source: this.source,
+          a_target: this.target,
+          a_width: this.widthBuf,
+          a_color: this.color,
+          a_bend: this.bend,
+          ...this.hl.attributes(),
+        });
+      }
+    } else {
+      // Sub-update: bufferSubData the per-instance data in place.
+      this.source.write(data.sources);
+      this.target.write(data.targets);
+      this.widthBuf.write(data.widths);
+      this.color.write(data.colors);
+      if (data.bends) this.bend.write(data.bends);
+      this.hl.write(data);
+    }
+    this.count = data.count;
+    this.model.setInstanceCount(data.count);
+    this.pickModel?.setInstanceCount(data.count);
+    return true;
+  }
+
   render(pass: RenderPass): void {
     if (this.count > 0) this.model.draw(pass);
   }
@@ -406,6 +472,10 @@ const HALF_ARROW_TEMPLATE = new Float32Array([0, 0, 2, 0, 2, 1]);
 
 export class InstancedArrows {
   count: number;
+  /** Current buffer capacity (in instances). Used by update() to decide grow vs. sub-update. */
+  private _capacity: number;
+  /** Whether the vertex template was built for the "half" arrowhead shape. If this changes, caller must recreate. */
+  private _half: boolean;
   private model: Model;
   /** Pick-pass twin (#141): same VS/geometry, PICK_FS, no blend. Built only when `pick` is set. */
   private pickModel?: Model;
@@ -421,6 +491,8 @@ export class InstancedArrows {
 
   constructor(device: Device, data: InstancedArrowsData, width = 0, height = 0, pick = false) {
     this.count = data.count;
+    this._capacity = data.count;
+    this._half = !!data.half;
     this.tri = device.createBuffer({ data: data.half ? HALF_ARROW_TEMPLATE : ARROW_TEMPLATE });
     this.source = device.createBuffer({ data: data.sources });
     this.target = device.createBuffer({ data: data.targets });
@@ -496,6 +568,65 @@ export class InstancedArrows {
     applyHighlight(this.uniforms, h);
     if (h.selected) this.hl.writeSelected(h.selected, this.count);
   }
+
+  /**
+   * Update the instance data in place (no object recreation). Mirrors {@link InstancedLines.update}.
+   * Returns `false` when the `half` flag changed (vertex template must be rebuilt — caller recreates).
+   * The pick model shares the same instance buffers, so pick geometry tracks the new endpoints automatically.
+   */
+  update(device: Device, data: InstancedArrowsData): boolean {
+    if (!!data.half !== this._half) return false; // vertex template changed — caller must recreate
+    if (data.count > this._capacity) {
+      // Grow: destroy old per-instance buffers and allocate at the new capacity.
+      this.source.destroy();
+      this.target.destroy();
+      this.size.destroy();
+      this.radius.destroy();
+      this.color.destroy();
+      this.bend.destroy();
+      this._capacity = data.count;
+      this.source = device.createBuffer({ data: data.sources });
+      this.target = device.createBuffer({ data: data.targets });
+      this.size = device.createBuffer({ data: data.sizes });
+      this.radius = device.createBuffer({ data: data.radii });
+      this.color = device.createBuffer({ data: data.colors });
+      this.bend = device.createBuffer({ data: data.bends ?? new Float32Array(data.count) });
+      this.model.setAttributes({
+        a_source: this.source,
+        a_target: this.target,
+        a_size: this.size,
+        a_radius: this.radius,
+        a_color: this.color,
+        a_bend: this.bend,
+        ...this.hl.recreate(data),
+      });
+      if (this.pickModel) {
+        this.pickModel.setAttributes({
+          a_source: this.source,
+          a_target: this.target,
+          a_size: this.size,
+          a_radius: this.radius,
+          a_color: this.color,
+          a_bend: this.bend,
+          ...this.hl.attributes(),
+        });
+      }
+    } else {
+      // Sub-update: bufferSubData the per-instance data in place.
+      this.source.write(data.sources);
+      this.target.write(data.targets);
+      this.size.write(data.sizes);
+      this.radius.write(data.radii);
+      this.color.write(data.colors);
+      if (data.bends) this.bend.write(data.bends);
+      this.hl.write(data);
+    }
+    this.count = data.count;
+    this.model.setInstanceCount(data.count);
+    this.pickModel?.setInstanceCount(data.count);
+    return true;
+  }
+
   render(pass: RenderPass): void {
     if (this.count > 0) this.model.draw(pass);
   }
@@ -545,6 +676,10 @@ const HALF_ARROW_SAMPLES = 24;
 
 export class InstancedHalfArrows {
   count: number;
+  /** Current buffer capacity (in instances). Used by update() to decide grow vs. sub-update. */
+  private _capacity: number;
+  /** Vertex samples (M) baked into the kind template buffer — if data.samples changes, caller must recreate. */
+  private _samples: number;
   private vertexCount: number;
   private model: Model;
   /** Pick-pass twin (#141): same VS/geometry, PICK_FS, no blend. Built only when `pick` is set. */
@@ -561,7 +696,9 @@ export class InstancedHalfArrows {
 
   constructor(device: Device, data: InstancedHalfArrowsData, width = 0, height = 0, pick = false) {
     this.count = data.count;
+    this._capacity = data.count;
     const samples = Math.max(2, (data.samples ?? HALF_ARROW_SAMPLES) | 0);
+    this._samples = samples;
     const template = halfArrowTemplate(samples);
     this.vertexCount = template.length / 2;
     this.kind = device.createBuffer({ data: template });
@@ -638,6 +775,66 @@ export class InstancedHalfArrows {
     applyHighlight(this.uniforms, h);
     if (h.selected) this.hl.writeSelected(h.selected, this.count);
   }
+
+  /**
+   * Update the instance data in place (no object recreation). Mirrors {@link InstancedLines.update}.
+   * Returns `false` when `data.samples` changed (vertex template must be rebuilt — caller recreates).
+   * The pick model shares the same instance buffers, so pick geometry tracks the new endpoints automatically.
+   */
+  update(device: Device, data: InstancedHalfArrowsData): boolean {
+    const newSamples = Math.max(2, (data.samples ?? HALF_ARROW_SAMPLES) | 0);
+    if (newSamples !== this._samples) return false; // vertex template changed — caller must recreate
+    if (data.count > this._capacity) {
+      // Grow: destroy old per-instance buffers and allocate at the new capacity.
+      this.source.destroy();
+      this.target.destroy();
+      this.radii.destroy();
+      this.widths.destroy();
+      this.bend.destroy();
+      this.color.destroy();
+      this._capacity = data.count;
+      this.source = device.createBuffer({ data: data.sources });
+      this.target = device.createBuffer({ data: data.targets });
+      this.radii = device.createBuffer({ data: data.radii });
+      this.widths = device.createBuffer({ data: data.widths });
+      this.bend = device.createBuffer({ data: data.bends });
+      this.color = device.createBuffer({ data: data.colors });
+      this.model.setAttributes({
+        a_p0: this.source,
+        a_p1: this.target,
+        a_radii: this.radii,
+        a_widths: this.widths,
+        a_bend: this.bend,
+        a_color: this.color,
+        ...this.hl.recreate(data),
+      });
+      if (this.pickModel) {
+        this.pickModel.setAttributes({
+          a_p0: this.source,
+          a_p1: this.target,
+          a_radii: this.radii,
+          a_widths: this.widths,
+          a_bend: this.bend,
+          a_color: this.color,
+          ...this.hl.attributes(),
+        });
+      }
+    } else {
+      // Sub-update: bufferSubData the per-instance data in place.
+      this.source.write(data.sources);
+      this.target.write(data.targets);
+      this.radii.write(data.radii);
+      this.widths.write(data.widths);
+      this.bend.write(data.bends);
+      this.color.write(data.colors);
+      this.hl.write(data);
+    }
+    this.count = data.count;
+    this.model.setInstanceCount(data.count);
+    this.pickModel?.setInstanceCount(data.count);
+    return true;
+  }
+
   render(pass: RenderPass): void {
     if (this.count > 0) this.model.draw(pass);
   }
