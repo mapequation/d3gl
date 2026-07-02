@@ -145,6 +145,13 @@ function startGpuLayoutSync(
   let done = false;
   let ticksDone = 0;
 
+  // TEMP(n8-perf): remove before merge — per-frame timing to localize 100k bottleneck
+  const PERF_LOG_FRAMES = 20;
+  let perfFrameCount = 0;
+  let perfFirstFrameAt = 0;
+  let perfTotalSubmit = 0;
+  let perfTotalReadback = 0;
+
   const stop = (): void => {
     if (stopped) return;
     stopped = true;
@@ -161,9 +168,40 @@ function startGpuLayoutSync(
 
     const remaining = iterations - ticksDone;
     const batch = Math.min(frameEvery, remaining);
+
+    // TEMP(n8-perf): remove before merge
+    const perfLogging = perfFrameCount < PERF_LOG_FRAMES;
+    if (perfLogging && perfFrameCount === 0) perfFirstFrameAt = performance.now();
+
+    const t0 = perfLogging ? performance.now() : 0;
     layout.runFrame(batch);
+    const t1 = perfLogging ? performance.now() : 0;
     ticksDone += batch;
     layout.readPositions(graph.positions);
+    const t2 = perfLogging ? performance.now() : 0;
+
+    if (perfLogging) {
+      const tSubmit = t1 - t0;
+      const tReadback = t2 - t1;
+      perfTotalSubmit += tSubmit;
+      perfTotalReadback += tReadback;
+      perfFrameCount++;
+      console.info(
+        `[n8-perf] gpu frame ${perfFrameCount}: submit ${tSubmit.toFixed(2)}ms, readback ${tReadback.toFixed(2)}ms` +
+        ` (frameEvery=${batch}, count=${ticksDone})`,
+      );
+      if (perfFrameCount === PERF_LOG_FRAMES) {
+        const totalWall = performance.now() - perfFirstFrameAt;
+        const n = PERF_LOG_FRAMES;
+        console.info(
+          `[n8-perf] gpu summary (${n} frames): wall=${totalWall.toFixed(1)}ms,` +
+          ` avg submit=${(perfTotalSubmit / n).toFixed(2)}ms,` +
+          ` avg readback=${(perfTotalReadback / n).toFixed(2)}ms`,
+        );
+      }
+    }
+    // END TEMP(n8-perf)
+
     onFrame();
 
     if (ticksDone >= iterations) {
