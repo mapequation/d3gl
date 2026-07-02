@@ -42,6 +42,8 @@ function degreeRadius(graph: NetworkGraph): NodeRadiusSpec {
  * in the GPU shader, so it stays instant even with LOD off on a million-node layout.
  * **Drag a node or a collapsed module** to move it: it tracks the cursor with no lag while the off-thread
  * worker layout reheats around it and re-cools on release (grab a module to drag its whole subtree).
+ * **Backend** switches the force solve between `"worker"` (CPU Barnes-Hut in a Web Worker) and `"gpu"`
+ * (WebGL2 Barnes-Hut grid-pyramid, with automatic fallback to `"worker"` when float render targets are unavailable).
  */
 export const setup: ImperativeSetup = (host, { width, height, backend }) => {
   const net = network(host, { width, height, backend });
@@ -162,7 +164,7 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
               }
             : false,
         )
-        .layout({ backend: "worker", iterations, multilevel });
+        .layout({ backend: options.backend === "GPU" ? "gpu" : "worker", iterations, multilevel });
       updateSab(); // the new worker run has now chosen its transport
     },
   };
