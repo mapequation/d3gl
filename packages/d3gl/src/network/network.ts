@@ -1,5 +1,5 @@
 import { BaseEngine, type BaseEngineOptions, type HoverHit, type InteractiveLayerOptions, type LaneInteractive, type NodeDragSession } from "../map/base-engine.js";
-import { networkLayers, frontierCircles, frontierHalos, superEdges, emitNodes, emitLinks, emitArrows, emitHalfLinks, traceFrontierFills, traceFrontierBorders, traceFrontierHalos, traceSuperHalfArrows, traceSuperLines, traceSuperArrows, rgbaCss, pickNodes, regionNodes, resolveNodeRadii, resolveNodeRadiusAggregate, resolveImportance, resolveFlowBorder, resolveNodeColors, resolveLinkWidthOf, resolveLinkColorOf, resolveLinkStrokeOf, flowBorderInnerRadii, type ResolvedNetworkStyle, type NodeRadiusSpec, type ImportanceSpec, type FlowBorderSpec, type ConstBorder, type LinkWidthSpec, type LinkColorSpec, type LinkStyle } from "./glyphs.js";
+import { networkLayers, networkLayersFromCache, noLodStyleCache, frontierCircles, frontierHalos, superEdges, emitNodes, emitLinks, emitArrows, emitHalfLinks, traceFrontierFills, traceFrontierBorders, traceFrontierHalos, traceSuperHalfArrows, traceSuperLines, traceSuperArrows, rgbaCss, pickNodes, regionNodes, resolveNodeRadii, resolveNodeRadiusAggregate, resolveImportance, resolveFlowBorder, resolveNodeColors, resolveLinkWidthOf, resolveLinkColorOf, resolveLinkStrokeOf, flowBorderInnerRadii, type ResolvedNetworkStyle, type NoLodStyleCache, type NodeRadiusSpec, type ImportanceSpec, type FlowBorderSpec, type ConstBorder, type LinkWidthSpec, type LinkColorSpec, type LinkStyle } from "./glyphs.js";
 import { rgb } from "d3-color";
 import { ForceLayout, seedPositions, type ForceParams } from "./force.js";
 import { multilevelLayout, type CoarsenOptions } from "./coarsen.js";
@@ -360,6 +360,11 @@ export class Network extends BaseEngine {
   private fadeAlpha: Float32Array | null = null;
   /** Cached resolved style; invalidated on style()/data() to avoid per-zoom O(n) radii recompute. */
   private resolvedCache: ResolvedNetworkStyle | null = null;
+  /** No-LOD style-derived link/arrow attributes cache (#179), keyed by `resolvedCache` identity + graph:
+   *  reused on a position-only layout frame so the colour/width scale accessors run O(edges) ONCE per
+   *  style version, not per frame. Invalidated implicitly when `resolvedStyleCached` returns a fresh object. */
+  private noLodStyleCacheFor: { style: ResolvedNetworkStyle; graph: NetworkGraph } | null = null;
+  private noLodStyleCacheVal: NoLodStyleCache | null = null;
   /** Registry key for the single network instanced lane (#108-B). */
   private readonly NET_LANE = "network";
   /** Registry key for the companion selection/hover ring overlay lane (#105 N7c-2), drawn on top. */
@@ -878,7 +883,7 @@ export class Network extends BaseEngine {
       this.linkResolve = (i) => this.noLodLinkHit(graph, i);
       const lane = new InstancedLane(strategy, () => {
         const resolved = this.resolvedStyleCached(graph);
-        return this.attachNoLodHighlight(this.flagPickableLinks(networkLayers(graph, resolved)), graph, resolved.directed);
+        return this.attachNoLodHighlight(this.flagPickableLinks(this.noLodLayers(graph, resolved)), graph, resolved.directed);
       });
       this.registerInstancedLane(this.NET_LANE, {
         lane, layerNames: LAYER_NAMES, dynamic: false,
@@ -902,6 +907,27 @@ export class Network extends BaseEngine {
 
   private lodDatum(tree: LODTree, g: number): NetworkHit {
     return { aggregate: g >= tree.leafCount, count: tree.count[g]! };
+  }
+
+  /**
+   * Assemble the no-LOD full-graph layers (#179). On a **position-only** layout frame — the resolved
+   * style object is identity-unchanged from the last full emit — rebuild ONLY the position-derived
+   * endpoints/node-centres and reuse the cached style-derived attributes (colours/widths/radii/sizes),
+   * so the colour/width scale accessors run O(edges) ONCE per style version, not per frame. On a full
+   * change (`data`/`style`/`lod`) `resolvedStyleCached` hands back a fresh object, invalidating the
+   * cache, and we run the full derivation (populating the cache for the next position frame).
+   */
+  private noLodLayers(graph: NetworkGraph, resolved: ResolvedNetworkStyle): InstancedLayer[] {
+    const cached = this.noLodStyleCacheVal;
+    const valid = cached != null && this.noLodStyleCacheFor?.style === resolved && this.noLodStyleCacheFor?.graph === graph;
+    // First emit for this style version runs the scale accessors ONCE and caches the style-derived attrs;
+    // subsequent (position-only) frames reuse the cache, rebuilding only the position-derived endpoints/centres.
+    const cache = valid && cached ? cached : noLodStyleCache(graph, resolved);
+    if (!valid) {
+      this.noLodStyleCacheVal = cache;
+      this.noLodStyleCacheFor = { style: resolved, graph };
+    }
+    return networkLayersFromCache(graph, resolved, cache);
   }
 
   /** Flag every link layer (lines/arrows/half-arrows; not node circles) into the GPU pick pass (#141)

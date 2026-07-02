@@ -125,6 +125,17 @@ export class GeoMap extends BaseEngine {
     return features.length ? ({ type: "FeatureCollection", features } as FitObject) : null;
   }
 
+  /**
+   * Declare (or re-declare) a named layer of GeoJSON `features`, projected once through the
+   * map's projection and retained so every backend re-renders the same crisp vector geometry.
+   * `features` may be a single Feature/geometry, an array of them, or — only with
+   * `passThrough: true` — a callback re-invoked each repaint (the uncapped, non-pickable
+   * streaming path). Re-declaring an existing `name` replaces the layer and resets its
+   * interaction/style state. Returns a {@link LayerHandle} for appending data and per-layer
+   * styling. (Wind exterior polygon rings clockwise in `[lon, lat]` — see the project docs.)
+   *
+   * @typeParam F - the feature/datum type carried through to accessors and hit results.
+   */
   layer<F>(name: string, features: F | readonly F[] | (() => readonly F[]), opts: LayerOptions<F> = {}): LayerHandle<F> {
     if (opts.passThrough) {
       if (opts.hover || opts.tooltip || opts.selection)
