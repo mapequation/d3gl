@@ -9,11 +9,18 @@ import { loadModularMap } from "./data.js";
  * by their **enter/exit flow**; directed links are **half-arrows** whose width + colour encode link
  * flow. In **screen** sizeMode the glyphs stay a constant pixel size as you zoom.
  *
+ * The layout is the **module-aware GPU seed** (#180 N8.2): the provided module hierarchy is supplied
+ * *before* `layout({ backend: "gpu" })`, so the WebGL2 Barnes-Hut solve is seeded **top-down over the
+ * module tree** — modules (including the ragged, deeper-nested **super-modules** in `data.ts`) lay out
+ * as coherent regions rather than an untangling disc. It streams frames, so the map converges live, then
+ * frames itself to fill the view once settled. (Falls back to the CPU worker where float render targets
+ * are unavailable.)
+ *
  * The **LOD** control switches the cut: **Off** draws every node + half-arrow; **Standard** is plain
  * structural coarsening (it ignores the planted partition — aggregates joined by simple super-edge
  * lines); **Modules** uses the partition, so modules collapse to a single glyph and their connectivity
  * shows as **half-arrow super-edges that thicken with the accumulated flow** between modules. Scroll to
- * zoom: modules expand → sub-members → leaves.
+ * zoom: modules expand → sub-modules → leaves (the ragged branches nest to different depths).
  *
  * `net.labels({ max: 12, labelOf })` badges the **12 highest-flow glyphs in view** (#105 N7b) with their
  * size — re-ranked + re-placed as you pan/zoom. Unlike the symmetric gasket, flow varies here, so a
@@ -57,29 +64,37 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
     return `rgba(${r}, ${g}, ${b}, ${(0.4 + 0.5 * t).toFixed(3)})`;
   };
 
-  net.data(graph).layout({ backend: "force", iterations: 320 });
+  // Supply the (ragged) module hierarchy BEFORE laying out, so the GPU force layout seeds MODULE-AWARE
+  // (#180 N8.2): it lays the map out top-down over the module tree, so modules — including the deeper
+  // super-modules — form coherent regions. `backend: "gpu"` streams frames, so the map converges live.
+  net.data(graph);
+  net.lod({ modules: d.modulePaths });
+  net.layout({ backend: "gpu", iterations: 300 });
 
-  // Rather than a custom fit transform, **scale the layout** to fill the view at the default zoom — so
-  // the map opens framed and World/Screen sizing don't change the apparent scale (the transform stays
-  // k=1). Centre on the centroid and size from the 97th-percentile radius (robust to force-layout
-  // fling-outs). Modules collapse into the map of modules here; zoom in to expand them.
-  const p = graph.positions;
-  let cx = 0;
-  let cy = 0;
-  for (let i = 0; i < graph.nodeCount; i++) {
-    cx += p[i * 2]!;
-    cy += p[i * 2 + 1]!;
-  }
-  cx /= graph.nodeCount;
-  cy /= graph.nodeCount;
-  const dists = Array.from({ length: graph.nodeCount }, (_, i) => Math.hypot(p[i * 2]! - cx, p[i * 2 + 1]! - cy)).sort((a, b) => a - b);
-  const R = dists[Math.floor(graph.nodeCount * 0.97)] || 1;
-  const s = (Math.min(width, height) / 2) * 0.85 / R; // scale the 97th-pct extent to ~0.85 of half the view
-  for (let i = 0; i < graph.nodeCount; i++) {
-    p[i * 2] = width / 2 + (p[i * 2]! - cx) * s;
-    p[i * 2 + 1] = height / 2 + (p[i * 2 + 1]! - cy) * s;
-  }
-  net.layout({ backend: "positions", positions: p }); // commit the scaled layout at the default k=1 view
+  // Once the module-aware layout settles, **scale it to fill the view** at the default zoom — so the map
+  // opens framed and World/Screen sizing don't change the apparent scale (transform stays k=1). Centre on
+  // the centroid and size from the 97th-percentile radius (robust to fling-outs). The GPU stream writes
+  // graph.positions; scaling + committing them via the positions backend after settle is safe (the stream
+  // has stopped) and leaves the map on the positions backend (drag translates, no sim to reheat).
+  void net.whenSettled().then(() => {
+    const p = graph.positions;
+    let cx = 0;
+    let cy = 0;
+    for (let i = 0; i < graph.nodeCount; i++) {
+      cx += p[i * 2]!;
+      cy += p[i * 2 + 1]!;
+    }
+    cx /= graph.nodeCount;
+    cy /= graph.nodeCount;
+    const dists = Array.from({ length: graph.nodeCount }, (_, i) => Math.hypot(p[i * 2]! - cx, p[i * 2 + 1]! - cy)).sort((a, b) => a - b);
+    const R = dists[Math.floor(graph.nodeCount * 0.97)] || 1;
+    const s = (Math.min(width, height) / 2) * 0.85 / R; // scale the 97th-pct extent to ~0.85 of half the view
+    for (let i = 0; i < graph.nodeCount; i++) {
+      p[i * 2] = width / 2 + (p[i * 2]! - cx) * s;
+      p[i * 2 + 1] = height / 2 + (p[i * 2 + 1]! - cy) * s;
+    }
+    net.layout({ backend: "positions", positions: p }); // commit the scaled layout at the default k=1 view
+  });
   net.enableZoom([0.1, 40]); // default view; zoom out to the module map, in to single nodes
   // Selection + hover rings and node-drag (#140): hover/click rings a node or module (green hover, blue
   // selection), ⇧+drag box-selects (⌥ subtracts, red preview), and dragging a glyph — or a whole selected
