@@ -934,12 +934,28 @@ export class Network extends BaseEngine {
         // waits for the backend to fully settle (including the "auto" → WebGL background upgrade)
         // before resolving, so `startGpuLayout` sees the real WebGL device and doesn't silently fall
         // back to the worker because it was called before the upgrade finished.
+        //
+        // N8.2 module-aware seed: when a module hierarchy is provided (`lod({ modules })` set before
+        // `layout`), build the module tree up front and hand it to the GPU seed so the layout is laid
+        // out top-down over the modules. Build it once here and adopt it as the LOD tree — the settle
+        // handler's recomputeLODGeometry then only fills its geometry (it skips the rebuild).
+        let moduleTopology: LODTree | undefined;
+        if (this.lodOptions?.modules) {
+          if (!this.lodTree || !this.lodModules) {
+            this.lodTree = buildModuleLODTree(this.graph.nodeCount, this.lodOptions.modules, this.graph);
+            this.lodModules = true;
+            this.lodSpatial = false;
+            this.lodHasGeometry = false;
+          }
+          moduleTopology = this.lodTree;
+        }
         const devicePromise = this.whenBackendSettled().then(() => this.gpuDevice());
         const handle = startGpuLayout(devicePromise, this.graph, {
           width: this.width,
           height: this.height,
           iterations: opts.iterations ?? DEFAULT_FORCE_ITERATIONS,
           force: opts.force,
+          moduleTopology,
         }, () => this.scheduleLayoutRepaint());
         this.layoutHandle = handle;
         void handle.settled.then(() => {

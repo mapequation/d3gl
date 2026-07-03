@@ -38,7 +38,7 @@ export default function Network() {
           display: ["Off", "0.1", "0.2", "0.3", "0.4", "0.5", "0.6"],
         },
         { type: "segmented", key: "seeding", label: "Seeding", options: ["Multilevel", "Cold"] },
-        { type: "segmented", key: "backend", label: "Backend", options: ["Worker", "GPU"] },
+        { type: "segmented", key: "backend", label: "Backend", options: ["Worker", "GPU"], value: "GPU" },
       ]}
       width={760}
       height={480}
