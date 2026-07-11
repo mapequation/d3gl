@@ -15,7 +15,7 @@ export default function StateNetwork() {
     <Example
       controls={[
         { type: "range", key: "nodes", label: "Nodes", min: 0, max: 3, step: 1, value: 1, display: ["10", "100", "1,000", "10,000"] },
-        { type: "segmented", key: "backend", label: "Backend", options: ["Force", "Worker", "GPU"] },
+        { type: "segmented", key: "backend", label: "Backend", options: ["Force", "Worker", "GPU"], value: "GPU" },
         { type: "segmented", key: "view", label: "View", options: ["Physical", "State", "Both"] },
         { type: "segmented", key: "links", label: "Links", options: ["Half-arrow", "Line"] },
         { type: "segmented", key: "physLabels", label: "Physical labels", options: ["Off", "On"] },

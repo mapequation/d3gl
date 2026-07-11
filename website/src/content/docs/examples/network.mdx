@@ -354,11 +354,18 @@ this example to the SVG backend and Export SVG for publication-ready labelled ve
 
 This brings it together: an **LFR planted-partition** network rendered as a **directed map of modules**.
 Each undirected benchmark edge is split into a reciprocal pair, and the random-walk **flow** is computed
-offline by d3gl's `randomWalkFlow` and baked into a fixture (`generate.ts`). That function reproduces
-[Infomap](https://www.mapequation.org/infomap/)'s directed flow — a test cross-checks it against
-`@mapequation/infomap` (the C++/WASM reference) to ~1e-7. Flow then drives every channel: node **radius**
-∝ visit rate, the **ring** ∝ enter/exit (boundary) flow, and the **half-arrow** width + colour ∝ link
-flow — so a reciprocal pair's two arrows carry genuinely different weight.
+at runtime by d3gl's `randomWalkFlow`, which reproduces [Infomap](https://www.mapequation.org/infomap/)'s
+directed flow — a test cross-checks it against `@mapequation/infomap` (the C++/WASM reference) to ~1e-7.
+Flow then drives every channel: node **radius** ∝ visit rate, the **ring** ∝ enter/exit (boundary) flow,
+and the **half-arrow** width + colour ∝ link flow — so a reciprocal pair's two arrows carry genuinely
+different weight. The **Nodes** slider resizes the generated network (500 → 20,000).
+
+The layout is the **module-aware GPU seed**: the module hierarchy is supplied via `lod({ modules })`
+*before* `layout({ backend: "gpu" })`, so the WebGL2 Barnes-Hut solve is seeded **top-down over the module
+tree** — modules (including the ragged, deeper-nested super-modules) lay out as coherent regions. Because
+the GPU solve streams frames, `fit: true` keeps the camera framed on the layout as it converges (centroid
+→ view centre, extent → the view), so the map opens framed and settles in place rather than piling at the
+origin. It releases to normal zoom/pan once it settles.
 
 Nodes are coloured **categorically by module** (the planted communities), fed to `lod({ modules })`. The
 **LOD** control switches the cut:
@@ -372,7 +379,7 @@ Nodes are coloured **categorically by module** (the planted communities), fed to
 In `sizeMode: "screen"` the glyphs stay a constant pixel size, so the map reads at every zoom — scroll
 out to the map of modules, in to sub-modules and individual nodes.
 
-<ExampleCard files={["modular-map/draw.ts", "modular-map/data.ts", "modular-map/generate.ts"]}>
+<ExampleCard files={["modular-map/draw.ts", "modular-map/data.ts"]}>
   <ModularMap client:visible slot="demo" />
 </ExampleCard>
 
