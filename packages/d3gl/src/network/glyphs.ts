@@ -1214,6 +1214,13 @@ export function networkLayers(graph: NetworkGraph, style: ResolvedNetworkStyle):
  * of re-running the colour/width scale accessors ~O(edgeCount) times per frame. The node circles'
  * style attributes (radii/fill colours/flow-border) are cached whole (positions alias `graph.positions`,
  * so only a border layer needs a fresh position-derived pass — handled by re-running {@link nodeCircles}).
+ *
+ * Also carries the #162 shader-highlight **group columns** (#214) — position-independent float copies
+ * of the immutable edge list + the node-identity column. They never change between position frames, so
+ * caching them here (same key, same invalidation as the style attrs) keeps them reference-stable and
+ * lets the renderer's reference-identity check skip their per-frame GPU upload. They are NEVER mutated
+ * in place (the `writeIfChanged` invariant); the per-instance `selected` flags are NOT cached — they
+ * follow the selection, not the (graph, style) version.
  */
 export interface NoLodStyleCache {
   /** Which layer shape the cache is for (must match the current style to be reusable). */
@@ -1222,6 +1229,12 @@ export interface NoLodStyleCache {
   halfArrows?: HalfArrowStyleAttrs;
   lines?: LinkLinesStyleAttrs;
   arrows?: LinkArrowsStyleAttrs;
+  /** Per-edge source node id (#162 `groups` of every link layer), length `edgeCount`. */
+  groupSource: Float32Array;
+  /** Per-edge target node id (#162 `groups2` — undirected incident hover); absent when directed. */
+  groupTarget?: Float32Array;
+  /** `[0, 1, …, nodeCount-1]` — the `nodes` circles layer's `groups` (instance i is node i). */
+  nodeGroups: Float32Array;
 }
 
 /** Compute the {@link NoLodStyleCache} for the current resolved style (runs the scale accessors ONCE). */
@@ -1229,20 +1242,28 @@ export function noLodStyleCache(graph: NetworkGraph, style: ResolvedNetworkStyle
   const bend = style.linkBend;
   const halfArrow = style.linkStyle === "half-arrow" && style.directed;
   const sizeMode = style.sizeMode;
-  if (graph.edgeCount === 0) return { kind: "lines-only", sizeMode };
+  // #162/#214 highlight group columns — one O(edges + nodes) copy per (graph, style) version, not per frame.
+  const groupSource = Float32Array.from(graph.source);
+  const groupTarget = style.directed ? undefined : Float32Array.from(graph.target);
+  const nodeGroups = new Float32Array(graph.nodeCount);
+  for (let i = 0; i < graph.nodeCount; i++) nodeGroups[i] = i;
+  if (graph.edgeCount === 0) return { kind: "lines-only", sizeMode, groupSource, groupTarget, nodeGroups };
   if (halfArrow) {
     return {
       kind: "half-arrows",
       sizeMode,
       halfArrows: halfArrowLinksStyleAttrs(graph, { nodeRadii: style.nodeRadii, widthOf: style.linkWidthOf, colorOf: style.linkColorOf, bend }),
+      groupSource,
+      groupTarget,
+      nodeGroups,
     };
   }
   const lines = linkLinesStyleAttrs(graph, { widthOf: style.linkWidthOf, colorOf: style.linkColorOf, bend });
   if (style.directed) {
     const arrows = linkArrowsStyleAttrs(graph, { size: style.arrowSize, nodeRadii: style.nodeRadii, colorOf: style.linkColorOf, bend, half: bend !== 0 });
-    return { kind: "lines+arrows", sizeMode, lines, arrows };
+    return { kind: "lines+arrows", sizeMode, lines, arrows, groupSource, groupTarget, nodeGroups };
   }
-  return { kind: "lines", sizeMode, lines };
+  return { kind: "lines", sizeMode, lines, groupSource, groupTarget, nodeGroups };
 }
 
 /**

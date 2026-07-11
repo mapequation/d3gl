@@ -366,12 +366,6 @@ function physicalSpacing(positions: Float32Array, count: number): number {
   return Math.max(Math.hypot(maxX - minX, maxY - minY) / Math.sqrt(count), 1);
 }
 
-/** `[0, 1, …, n-1]` as float32 — the no-LOD node layer's `a_group` (instance i is node i). */
-function identityFloats(n: number): Float32Array {
-  const out = new Float32Array(n);
-  for (let i = 0; i < n; i++) out[i] = i;
-  return out;
-}
 /** Shared empty visible-set for selection strategies whose emit draws the whole source directly (no
  *  per-instance gather) — e.g. the no-LOD full-graph lane — so they never allocate an all-indices array. */
 const EMPTY_VISIBLE = new Uint32Array(0);
@@ -1414,7 +1408,7 @@ export class Network extends BaseEngine {
       this.linkResolve = (i) => this.noLodLinkHit(graph, i);
       const lane = new InstancedLane(strategy, () => {
         const resolved = this.resolvedStyleCached(graph);
-        const base = this.attachNoLodHighlight(this.flagPickableLinks(this.noLodLayers(graph, resolved)), graph, resolved.directed);
+        const base = this.attachNoLodHighlight(this.flagPickableLinks(this.noLodLayers(graph, resolved)), this.noLodCache(graph, resolved));
         // State-network overlays (#171), build-once per emit: the `both`-view physical **container** discs
         // draw UNDER the nodes/links (backdrop), the physical-view **pie** wedges draw ON TOP (cover the disc).
         const container = this.containerLayer();
@@ -1455,16 +1449,20 @@ export class Network extends BaseEngine {
    * cache, and we run the full derivation (populating the cache for the next position frame).
    */
   private noLodLayers(graph: NetworkGraph, resolved: ResolvedNetworkStyle): InstancedLayer[] {
+    return networkLayersFromCache(graph, resolved, this.noLodCache(graph, resolved));
+  }
+
+  /** Get-or-create the no-LOD cache (#179 style attrs + #214 highlight group columns) for the current
+   *  (graph, resolved-style) version. First emit for a version computes it ONCE; position-only frames
+   *  hit the valid branch (O(1)). A `data`/`style` change hands back a fresh `resolved` object,
+   *  invalidating the cache — so the cached arrays are reference-stable exactly while they are valid. */
+  private noLodCache(graph: NetworkGraph, resolved: ResolvedNetworkStyle): NoLodStyleCache {
     const cached = this.noLodStyleCacheVal;
-    const valid = cached != null && this.noLodStyleCacheFor?.style === resolved && this.noLodStyleCacheFor?.graph === graph;
-    // First emit for this style version runs the scale accessors ONCE and caches the style-derived attrs;
-    // subsequent (position-only) frames reuse the cache, rebuilding only the position-derived endpoints/centres.
-    const cache = valid && cached ? cached : noLodStyleCache(graph, resolved);
-    if (!valid) {
-      this.noLodStyleCacheVal = cache;
-      this.noLodStyleCacheFor = { style: resolved, graph };
-    }
-    return networkLayersFromCache(graph, resolved, cache);
+    if (cached != null && this.noLodStyleCacheFor?.style === resolved && this.noLodStyleCacheFor?.graph === graph) return cached;
+    const cache = noLodStyleCache(graph, resolved);
+    this.noLodStyleCacheVal = cache;
+    this.noLodStyleCacheFor = { style: resolved, graph };
+    return cache;
   }
 
   /** Flag every link layer (lines/arrows/half-arrows; not node circles) into the GPU pick pass (#141)
@@ -1479,22 +1477,24 @@ export class Network extends BaseEngine {
   /** Attach the shader-highlight columns (#162) to the **no-LOD** full-graph layers, in place — so a
    *  hover/selection restyle is a uniform / flag-buffer update, never a geometry rebuild. Instance order
    *  is the parallel emit: the `nodes` circles layer's instance `i` is node `i`; every link layer
-   *  (`lines`/`half-arrows`/`arrows`) instance `e` is graph edge `e`. `group` = node id / link source id;
-   *  `group2` = the link target (undirected incident hover); `selected` = the initial flag from the
-   *  current selection ({@link noLodSelectedFor} refreshes it in place on later selection changes). */
-  private attachNoLodHighlight(layers: InstancedLayer[], graph: NetworkGraph, directed: boolean): InstancedLayer[] {
-    const source = Float32Array.from(graph.source);
-    const target = directed ? undefined : Float32Array.from(graph.target);
+   *  (`lines`/`half-arrows`/`arrows`) instance `e` is graph edge `e`. The group columns (`groups` =
+   *  node id / link source id; `groups2` = the link target, undirected incident hover) are
+   *  position-independent, so they come from the {@link noLodCache} (#214) — the SAME array instances
+   *  across position-only frames, letting the renderer skip their per-frame upload. `selected` is the
+   *  initial flag from the current selection — NOT cached, it follows the selection
+   *  ({@link noLodSelectedFor} refreshes it in place on later selection changes). */
+  private attachNoLodHighlight(layers: InstancedLayer[], cache: NoLodStyleCache): InstancedLayer[] {
+    let linkSelected: Uint8Array | undefined; // one build shared by all link layers (lines + arrows)
     for (const l of layers) {
       if (l.primitive === "circles") {
         // The only circles layer in the no-LOD path is `nodes` (no aggregate halos). Instance i = node i.
-        l.circles.groups = identityFloats(graph.nodeCount);
+        l.circles.groups = cache.nodeGroups;
         l.circles.selected = this.noLodSelectedFor(this.NODE_LAYER);
       } else if (l.primitive === "lines" || l.primitive === "half-arrows" || l.primitive === "arrows") {
         const link = l.primitive === "lines" ? l.lines : l.primitive === "half-arrows" ? l.halfArrows : l.arrows;
-        link.groups = source;
-        if (target) link.groups2 = target;
-        link.selected = this.noLodSelectedFor("links"); // links/arrows share the per-edge flag
+        link.groups = cache.groupSource;
+        if (cache.groupTarget) link.groups2 = cache.groupTarget;
+        link.selected = linkSelected ??= this.noLodSelectedFor("links"); // links/arrows share the per-edge flag
       }
       // A "pie" layer (#171 physical view) is not part of the standard node/link set; it carries its own
       // per-wedge groups (physical node id) from physicalPieInstances, so no attachment is needed here.
