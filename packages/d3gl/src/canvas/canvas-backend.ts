@@ -1,5 +1,6 @@
 import type { Backend, RenderLayer, RenderDelta, ViewTransform, DrawableVector, PassThroughLayer, PointBatch, DrawBatch, ProjectedPath, StyleTables, TextData } from "../core/index.js";
 import { svgFromLayers } from "../svg/index.js";
+import { paintTexts } from "./draw-texts.js";
 
 const css = (c: readonly [number, number, number, number]) => `rgba(${c[0]}, ${c[1]}, ${c[2]}, ${(c[3] / 255).toFixed(4)})`;
 
@@ -168,28 +169,15 @@ export class CanvasBackend implements Backend {
     this.textData = texts;
   }
 
-  /** Draw the text labels in screen space (constant pixel font), with an optional halo stroked behind
-   *  the fill for legibility. Coords are CSS px; setScreen folds in the device-pixel ratio. */
+  /** Draw the text labels in screen space (constant pixel font) via the shared painter
+   *  ({@link paintTexts} — also used by the WebGL toPNG export composite, #219). Coords are
+   *  CSS px; setScreen folds in the device-pixel ratio. */
   private drawTexts(): void {
     if (this.textData.length === 0) return;
     const { ctx } = this;
     ctx.save();
     this.setScreen();
-    ctx.textBaseline = "middle";
-    for (const td of this.textData) {
-      ctx.font = td.font ?? "12px sans-serif";
-      ctx.textAlign = td.align === "middle" ? "center" : td.align === "end" ? "right" : "left";
-      ctx.globalAlpha = td.opacity ?? 1;
-      if (td.halo) {
-        ctx.strokeStyle = td.halo.color;
-        ctx.lineWidth = td.halo.width * 2;
-        ctx.lineJoin = "round";
-        ctx.strokeText(td.text, td.x, td.y);
-      }
-      ctx.fillStyle = td.color ?? "#000";
-      ctx.fillText(td.text, td.x, td.y);
-    }
-    ctx.globalAlpha = 1;
+    paintTexts(ctx, this.textData);
     ctx.restore();
   }
 

@@ -5,6 +5,7 @@ import { ForceLayout, seedPositions, type ForceParams } from "./force.js";
 import { multilevelLayout, type CoarsenOptions } from "./coarsen.js";
 import { buildLODTree, buildSpatialLODTree, computeLODGeometry, computeLODStyle, cut, declutterFrontier, pickFrontier, regionFrontier, visibleWorldRect, leavesUnder, ancestorAwareSelected, type LODTree, type SpatialLODOptions } from "./lod.js";
 import { LabelLayer, placeLabels, type LabelAnchor } from "../labels/label-layer.js";
+import type { LabelBox } from "../labels/cull.js";
 import { buildModuleLODTree, type ModuleNode } from "./modules.js";
 import { moduleColors, type ModulePathNode, type ModuleColorOptions } from "./module-colors.js";
 import { physicalPieWedges, type PhysicalPieWedges, type PieWedgeOptions } from "./pie.js";
@@ -15,7 +16,7 @@ import { startGpuLayout } from "./gpu/gpu-transport.js";
 import { WebGLBackend } from "../webgl/webgl-backend.js";
 import type { NetworkGraph } from "./graph.js";
 import { fitNodes, fitBox, fitTransform, type FitBox } from "./fit.js";
-import type { InstancedLayer, ViewTransform } from "../core/index.js";
+import type { InstancedLayer, TextData, ViewTransform } from "../core/index.js";
 import { InstancedLane, type SelectionStrategy } from "../core/instanced-lane.js";
 import { resolveRingColors, ringCircles } from "../map/highlight-ring.js";
 import { hoverParts } from "../map/highlight.js";
@@ -82,8 +83,9 @@ export interface NetworkLabelOptions {
    * (default 4). Ignored outside the `both` view. The primary {@link labelOf} still labels the state nodes.
    */
   physical?: { labelOf: (physicalId: number) => string | null | undefined; gap?: number };
-  /** Font for **backend-native** text (SVG `<text>` / Canvas `fillText`, incl. `toSVG()`/`toPNG()`
-   *  export, #105 N7b-2) — a CSS font shorthand, e.g. `"600 11px sans-serif"`. Default `"12px sans-serif"`. */
+  /** Font for **backend-native** text (SVG `<text>` / Canvas `fillText`, and `toSVG()`/`toPNG()`
+   *  export on every backend incl. WebGL — #105 N7b-2, #219) — a CSS font shorthand, e.g.
+   *  `"600 11px sans-serif"`. Default `"12px sans-serif"`. */
   font?: string;
   /** Fill colour for backend-native text. Default black. */
   color?: string;
@@ -491,6 +493,10 @@ export class Network extends BaseEngine {
   /** Frontier label overlay (#105 N7b) + its options; null until {@link labels} is enabled. */
   private labelLayer: LabelLayer | null = null;
   private labelOpts: NetworkLabelOptions | null = null;
+  /** The last refresh's label anchors, retained (reference only) for the export-only text backend
+   *  push (#219): a WebGL toPNG()/toSVG() places these once at export time. Always current — the
+   *  overlay branch of {@link refreshLabels} runs on every transform/rebuild. */
+  private exportAnchors: readonly LabelAnchor[] = [];
   /** While a node-drag is active (#140), re-pins the held positions over each worker frame before it
    *  paints — in copy mode the worker's streamed snapshot would otherwise clobber the held nodes the
    *  main thread is holding under the cursor. Null when no drag is in flight. */
@@ -794,15 +800,17 @@ export class Network extends BaseEngine {
    * frontier→rank→placement wiring; you supply `labelOf` (return `null` to skip a glyph) + styling.
    *
    * Rendered by the **active backend**: WebGL → an HTML overlay (crisp + accessible; style via
-   * `className`); SVG/Canvas → native `<text>`/`fillText` so labels appear in `toSVG()`/`toPNG()`
-   * (style via `font`/`color`/`halo`). Pass `false` to remove.
+   * `className`); SVG/Canvas → native `<text>`/`fillText` (style via `font`/`color`/`halo`).
+   * Labels appear in `toSVG()`/`toPNG()` on **every** backend — WebGL composites the placed set
+   * into the export at export time (#219). Pass `false` to remove.
    */
   labels(opts: NetworkLabelOptions | false): this {
     if (!opts) {
       this.labelLayer?.destroy();
       this.labelLayer = null;
       this.labelOpts = null;
-      this.backend()?.setTextLayer?.([]); // clear any backend-native labels too
+      this.exportAnchors = [];
+      this.backend()?.setTextLayer?.([]); // clear any backend-native labels too (incl. the WebGL export stash)
       this.render(); // repaint so a backend that bakes labels in (Canvas) drops them now
       return this;
     }
@@ -883,22 +891,47 @@ export class Network extends BaseEngine {
       }
     }
 
-    // Route by backend (#105 N7b-2): a backend that draws text natively (SVG `<text>` / Canvas
-    // `fillText`) renders the labels so they survive toSVG()/toPNG(); otherwise (WebGL) the HTML
-    // overlay does. Project + cull is shared (placeLabels), so both paths place labels identically.
+    // Route by backend (#105 N7b-2): a backend that draws text natively AND live (SVG `<text>` /
+    // Canvas `fillText`) renders the labels so they survive toSVG()/toPNG(); otherwise (WebGL,
+    // whose setTextLayer is an export-only stash — #219) the HTML overlay does. Project + cull is
+    // shared (placeLabels), so both paths place labels identically.
     const viewport = { width: this.width, height: this.height };
     const backend = this.backend();
-    if (backend?.setTextLayer) {
+    if (backend?.setTextLayer && backend.textLayerMode !== "export-only") {
       const survivors = placeLabels(anchors, this.transform, viewport);
-      backend.setTextLayer(survivors.map((b) => ({
-        x: b.x, y: b.y, text: String(b.text), align: "middle" as const,
-        font: opts.font, color: opts.color, halo: opts.halo, opacity: b.opacity as number | undefined,
-      })));
+      backend.setTextLayer(this.toTextData(survivors, opts));
       layer.update([], this.transform, viewport); // keep the overlay empty on a native-text backend
     } else {
       layer.update(anchors, this.transform, viewport);
+      // Retain the anchor set (reference only — the array was built above regardless) so an
+      // export-only text backend can be fed the placed labels at toPNG()/toSVG() time (#219).
+      // Nothing is placed or allocated here — zero added per-frame work.
+      this.exportAnchors = anchors;
     }
   }
+
+  /** Map placed label boxes to backend {@link TextData} — the one shape both the live native-text
+   *  path (SVG/Canvas) and the export-only push (WebGL, #219) emit, so exports match across backends. */
+  private toTextData(survivors: readonly LabelBox[], opts: NetworkLabelOptions): TextData[] {
+    return survivors.map((b) => ({
+      x: b.x, y: b.y, text: String(b.text), align: "middle" as const,
+      font: opts.font, color: opts.color, halo: opts.halo, opacity: b.opacity as number | undefined,
+    }));
+  }
+
+  /** Feed the placed labels to an export-only text backend (#219) right before an export, so a WebGL
+   *  toPNG()/toSVG() includes what the HTML overlay shows. Runs ONLY at export time (O(anchors in
+   *  view) once per call), never per frame; no-op on live-text backends (their set is already pushed). */
+  private pushExportLabels(): void {
+    const backend = this.backend();
+    if (!backend?.setTextLayer || backend.textLayerMode !== "export-only") return;
+    const opts = this.labelOpts;
+    const survivors = opts ? placeLabels(this.exportAnchors, this.transform, { width: this.width, height: this.height }) : [];
+    backend.setTextLayer(opts ? this.toTextData(survivors, opts) : []);
+  }
+
+  override toSVG(): string { this.pushExportLabels(); return super.toSVG(); }
+  override toPNG(): string { this.pushExportLabels(); return super.toPNG(); }
 
   protected override afterTransform(): void {
     this.refreshLabels();
