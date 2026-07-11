@@ -1,6 +1,14 @@
 import { describe, it, expect } from "vitest";
-import { buildModuleLODTree } from "../modules.js";
-import { computeLODPositions, computeLODStyle, cut } from "../lod.js";
+import { buildModuleLODTree, type ModuleNode, type ModuleEdges } from "../modules.js";
+import {
+  computeLODPositions,
+  computeLODStyle,
+  cut,
+  lodTreeFromTopology,
+  buildSuperEdges,
+  type LODTree,
+  type LODTopology,
+} from "../lod.js";
 
 /** Children of tree node `g`, as a sorted array (scatter order is an implementation detail). */
 function childrenOf(tree: { childOffset: Uint32Array; children: Uint32Array }, g: number): number[] {
@@ -114,3 +122,217 @@ describe("buildModuleLODTree", () => {
     });
   });
 });
+
+// --- #215 guard: the integer-keyed prefix-tree build must produce trees identical to the original
+// string-keyed registry it replaced. `referenceModuleLODTree` below is a verbatim copy of that
+// original implementation (":"-joined prefix strings interned in a Map); every array of the built
+// tree is deep-compared against it, on the hand-written fixtures above and on randomized ragged
+// multi-level fixtures with shuffled record order (first-seen registration order is non-trivial). ---
+describe("buildModuleLODTree matches the string-keyed reference build (#215)", () => {
+  const fixtures: { name: string; nodeCount: number; records: ModuleNode[] }[] = [
+    {
+      name: "balanced two-module tree",
+      nodeCount: 4,
+      records: [
+        { id: 0, path: [1, 1] },
+        { id: 1, path: [1, 2] },
+        { id: 2, path: [2, 1] },
+        { id: 3, path: [2, 2] },
+      ],
+    },
+    {
+      name: "ragged tree",
+      nodeCount: 3,
+      records: [
+        { id: 0, path: [1, 1] },
+        { id: 1, path: [2, 1, 1] },
+        { id: 2, path: [2, 1, 2] },
+      ],
+    },
+    {
+      name: "top-level leaf beside a module",
+      nodeCount: 3,
+      records: [
+        { id: 0, path: [1] },
+        { id: 1, path: [2, 1] },
+        { id: 2, path: [2, 2] },
+      ],
+    },
+  ];
+  for (const f of fixtures) {
+    it(`is identical on the ${f.name} fixture`, () => {
+      expect(buildModuleLODTree(f.nodeCount, f.records)).toStrictEqual(referenceModuleLODTree(f.nodeCount, f.records));
+    });
+  }
+
+  it("is identical (including super-edges) on randomized ragged multi-level fixtures", () => {
+    for (let seed = 1; seed <= 5; seed++) {
+      const nodeCount = 100 + seed * 137; // odd sizes, up to ~785 nodes
+      const { records, edges } = randomFixture(seed, nodeCount);
+      expect(buildModuleLODTree(nodeCount, records, edges)).toStrictEqual(
+        referenceModuleLODTree(nodeCount, records, edges),
+      );
+    }
+  });
+});
+
+/** Deterministic LCG in [0, 1) — keeps the randomized fixtures reproducible. */
+function makeRng(seed: number): () => number {
+  let s = seed >>> 0;
+  return () => {
+    s = (Math.imul(s, 1664525) + 1013904223) >>> 0;
+    return s / 0x100000000;
+  };
+}
+
+/**
+ * Random ragged module fixture: every node gets a random-depth (1–5) path with branch ids 1–4, and
+ * the records arrive in a shuffled id order so first-seen module registration interleaves across
+ * subtrees. Edges are a random directed list for the super-edge derivation.
+ */
+function randomFixture(seed: number, nodeCount: number): { records: ModuleNode[]; edges: ModuleEdges } {
+  const rng = makeRng(seed);
+  const ids = Array.from({ length: nodeCount }, (_, i) => i);
+  for (let i = nodeCount - 1; i > 0; i--) {
+    const j = Math.floor(rng() * (i + 1));
+    const t = ids[i]!;
+    ids[i] = ids[j]!;
+    ids[j] = t;
+  }
+  const records = ids.map((id) => {
+    const depth = 1 + Math.floor(rng() * 5);
+    return { id, path: Array.from({ length: depth }, () => 1 + Math.floor(rng() * 4)) };
+  });
+  const edgeCount = nodeCount * 2;
+  const source = new Uint32Array(edgeCount);
+  const target = new Uint32Array(edgeCount);
+  const weight = new Float32Array(edgeCount);
+  for (let e = 0; e < edgeCount; e++) {
+    source[e] = Math.floor(rng() * nodeCount);
+    target[e] = Math.floor(rng() * nodeCount);
+    weight[e] = rng();
+  }
+  return { records, edges: { source, target, weight } };
+}
+
+/**
+ * The pre-#215 string-keyed implementation, kept verbatim as the reference: registers every module
+ * prefix as a ":"-joined path string in a `Map<string, number>` and derives parents/heights from the
+ * retained key strings. Slow and allocation-heavy — which is why it was replaced — but its output
+ * defines the expected tree.
+ */
+function referenceModuleLODTree(nodeCount: number, records: ArrayLike<ModuleNode>, edges?: ModuleEdges): LODTree {
+  const ROOT_KEY = "";
+  const prefixDepth = (key: string): number => {
+    if (key === ROOT_KEY) return 0;
+    let n = 1;
+    for (let i = 0; i < key.length; i++) if (key.charCodeAt(i) === 58 /* ":" */) n++;
+    return n;
+  };
+
+  const moduleIndex = new Map<string, number>(); // prefix key → internal module index
+  const moduleKeys: string[] = []; // internal index → key (registration order)
+  const registerModule = (key: string): number => {
+    let idx = moduleIndex.get(key);
+    if (idx === undefined) {
+      idx = moduleKeys.length;
+      moduleIndex.set(key, idx);
+      moduleKeys.push(key);
+    }
+    return idx;
+  };
+  registerModule(ROOT_KEY);
+
+  const leafModule = new Int32Array(nodeCount).fill(-1);
+  for (let r = 0; r < records.length; r++) {
+    const { id, path } = records[r]!;
+    const depth = path.length;
+    let key = ROOT_KEY;
+    for (let d = 0; d < depth - 1; d++) {
+      key = d === 0 ? String(path[d]) : `${key}:${path[d]}`;
+      registerModule(key);
+    }
+    leafModule[id] = registerModule(key);
+  }
+
+  const moduleCount = moduleKeys.length;
+
+  const moduleParent = new Int32Array(moduleCount).fill(-1);
+  for (let m = 0; m < moduleCount; m++) {
+    const key = moduleKeys[m]!;
+    if (key === ROOT_KEY) continue;
+    const cutAt = key.lastIndexOf(":");
+    const parentKey = cutAt === -1 ? ROOT_KEY : key.slice(0, cutAt);
+    moduleParent[m] = moduleIndex.get(parentKey)!;
+  }
+
+  const moduleHeight = new Int32Array(moduleCount).fill(1);
+  const byDepthDesc = Array.from({ length: moduleCount }, (_, m) => m).sort(
+    (a, b) => prefixDepth(moduleKeys[b]!) - prefixDepth(moduleKeys[a]!),
+  );
+  for (const m of byDepthDesc) {
+    const p = moduleParent[m]!;
+    if (p >= 0 && moduleHeight[m]! + 1 > moduleHeight[p]!) moduleHeight[p] = moduleHeight[m]! + 1;
+  }
+
+  let maxHeight = 1;
+  for (let m = 0; m < moduleCount; m++) if (moduleHeight[m]! > maxHeight) maxHeight = moduleHeight[m]!;
+  const perHeight = new Uint32Array(maxHeight + 1);
+  for (let m = 0; m < moduleCount; m++) perHeight[moduleHeight[m]!] = perHeight[moduleHeight[m]!]! + 1;
+  const heightStart = new Uint32Array(maxHeight + 1);
+  let acc = nodeCount;
+  for (let h = 1; h <= maxHeight; h++) {
+    heightStart[h] = acc;
+    acc += perHeight[h]!;
+  }
+  const moduleId = new Uint32Array(moduleCount);
+  const hcursor = heightStart.slice();
+  for (let m = 0; m < moduleCount; m++) {
+    const h = moduleHeight[m]!;
+    moduleId[m] = hcursor[h]!;
+    hcursor[h] = hcursor[h]! + 1;
+  }
+
+  const size = nodeCount + moduleCount;
+  const levelCount = maxHeight + 1;
+  const levelOffset = new Uint32Array(levelCount + 1);
+  levelOffset[1] = nodeCount;
+  for (let h = 1; h <= maxHeight; h++) levelOffset[h + 1] = levelOffset[h]! + perHeight[h]!;
+
+  const parent = new Int32Array(size).fill(-1);
+  for (let i = 0; i < nodeCount; i++) parent[i] = moduleId[leafModule[i]!]!;
+  for (let m = 0; m < moduleCount; m++) {
+    const p = moduleParent[m]!;
+    if (p >= 0) parent[moduleId[m]!] = moduleId[p]!;
+  }
+
+  const childOffset = new Uint32Array(size + 1);
+  for (let g = 0; g < size; g++) {
+    const p = parent[g]!;
+    if (p >= 0) childOffset[p + 1] = childOffset[p + 1]! + 1;
+  }
+  for (let g = 0; g < size; g++) childOffset[g + 1] = childOffset[g + 1]! + childOffset[g]!;
+  const children = new Uint32Array(childOffset[size]!);
+  const cursor = childOffset.slice(0, size);
+  for (let g = 0; g < size; g++) {
+    const p = parent[g]!;
+    if (p >= 0) {
+      children[cursor[p]!] = g;
+      cursor[p] = cursor[p]! + 1;
+    }
+  }
+
+  const topo: LODTopology = {
+    size,
+    leafCount: nodeCount,
+    levelCount,
+    levelOffset,
+    childOffset,
+    children,
+    edgeOffset: new Uint32Array(size + 1),
+    edgeNeighbors: new Uint32Array(0),
+    parent,
+  };
+  if (edges) Object.assign(topo, buildSuperEdges(size, parent, edges));
+  return lodTreeFromTopology(topo);
+}
