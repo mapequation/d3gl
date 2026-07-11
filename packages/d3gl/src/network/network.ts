@@ -3,7 +3,7 @@ import { networkLayers, networkLayersFromCache, noLodStyleCache, frontierCircles
 import { rgb } from "d3-color";
 import { ForceLayout, seedPositions, type ForceParams } from "./force.js";
 import { multilevelLayout, type CoarsenOptions } from "./coarsen.js";
-import { buildLODTree, buildSpatialLODTree, computeLODGeometry, computeLODStyle, cut, declutterFrontier, pickFrontier, regionFrontier, visibleWorldRect, leavesUnder, ancestorAwareSelected, type LODTree, type SpatialLODOptions } from "./lod.js";
+import { buildLODTree, buildSpatialLODTree, computeLODGeometry, computeLODStyle, cut, makeCutScratch, declutterFrontier, makeDeclutterFrontierScratch, pickFrontier, regionFrontier, visibleWorldRect, leavesUnder, ancestorAwareSelected, type LODTree, type SpatialLODOptions } from "./lod.js";
 import { LabelLayer, placeLabels, type LabelAnchor } from "../labels/label-layer.js";
 import { buildModuleLODTree, type ModuleNode } from "./modules.js";
 import { moduleColors, type ModulePathNode, type ModuleColorOptions } from "./module-colors.js";
@@ -457,6 +457,13 @@ export class Network extends BaseEngine {
   private lodHasGeometry = false;
   /** Reusable cross-fade scratch (#133), indexed by tree-node id; grown as the tree grows, reused per cut to avoid GC. */
   private fadeScratch: Float32Array | null = null;
+  /** Engine-owned {@link cut} scratch (#213): reused by every {@link computeFrontier} so the per-frame
+   *  visible-set walk allocates nothing steady-state. The returned frontier is a view of it, valid until
+   *  the next cut — safe because every consumer (lane select, Scene registration, label refresh) re-selects
+   *  before reading and none retains the previous frontier past its own re-select. */
+  private readonly cutScratch = makeCutScratch();
+  /** Engine-owned {@link declutterFrontier} scratch (#213), same reuse contract as {@link cutScratch}. */
+  private readonly declutterFrontierScratch = makeDeclutterFrontierScratch();
   /** The fade alpha the last {@link computeFrontier} produced (the live `fadeScratch`), or null when cross-fade is off. */
   private fadeAlpha: Float32Array | null = null;
   /** Cached resolved style; invalidated on style()/data() to avoid per-zoom O(n) radii recompute. */
@@ -1875,7 +1882,7 @@ export class Network extends BaseEngine {
       maxAggregateRadius: opts.maxAggregateRadius,
       fadeBand,
       fadeAlpha: this.fadeAlpha ?? undefined,
-    });
+    }, this.cutScratch); // #213: reused per frame — the walk allocates nothing steady-state
     if (opts.declutter !== false) {
       frontier = declutterFrontier(tree, frontier, this.transform, this.width, this.height, {
         screenSized: style.sizeMode === "screen",
@@ -1884,7 +1891,7 @@ export class Network extends BaseEngine {
         spacing: opts.declutterSpacing,
         // Cross-fade (#133): transitioning glyphs are exempt, so a fading parent never culls its fading-in children.
         fadeAlpha: this.fadeAlpha ?? undefined,
-      });
+      }, this.declutterFrontierScratch); // #213: reused per frame, distinct from the cut's buffers
     }
     return frontier;
   }

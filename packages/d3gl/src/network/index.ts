@@ -12,8 +12,8 @@ export type { HalfLinkParams, HalfLinkGeometry, PathSink } from "./half-link.js"
 export { randomWalkFlow } from "./flow.js";
 export type { FlowGraph, FlowOptions, FlowResult } from "./flow.js";
 
-export { buildLODTree, computeLODGeometry, cut, declutterFrontier } from "./lod.js";
-export type { LODTree, LODTransform, CutOptions, DeclutterOptions } from "./lod.js";
+export { buildLODTree, computeLODGeometry, cut, makeCutScratch, declutterFrontier, makeDeclutterFrontierScratch } from "./lod.js";
+export type { LODTree, LODTransform, CutOptions, CutScratch, DeclutterOptions, DeclutterFrontierScratch } from "./lod.js";
 
 export { buildModuleLODTree } from "./modules.js";
 export type { ModuleNode } from "./modules.js";
