@@ -1,5 +1,4 @@
 import { network, buildGraph, parseNetwork } from "@mapequation/d3gl/network";
-import { LabelLayer, type LabelAnchor } from "@mapequation/d3gl/labels";
 import { scaleSqrt } from "d3-scale";
 import type { ImperativeSetup } from "../types.js";
 import { makeControls } from "./controls.js";
@@ -11,35 +10,27 @@ let loaded = { text: SAMPLE_PAJEK, name: "sample.net" };
 /**
  * Load a network from a file and render it with the `network()` engine. `parseNetwork` dispatches
  * on the filename — `.net` → Pajek (vertex labels, `*Arcs`/`*Edges`), anything else → the plain
- * edge-list parser (`source target [weight]`, `#` comments). The off-thread worker lays it out;
- * nodes are **sized by degree** (a d3 `scaleSqrt`) so hubs stand out. Once it settles, vertex labels
- * are placed beside the nodes with the HTML `LabelLayer` overlay and kept aligned with the GPU
- * geometry as you pan/zoom. Pick a file, or load a built-in sample.
+ * edge-list parser (`source target [weight]`, `#` comments). The off-thread worker lays it out with
+ * `layout({ fit: true })`, so it opens **framed** and converges live; nodes are **sized by degree** (a
+ * d3 `scaleSqrt`) so hubs stand out. Vertex names are drawn with engine-managed **frontier labels**
+ * (`net.labels({ labelOf })`) — they track pan/zoom (and the fit reframe) with no overlay bookkeeping.
+ * Pick a file, or load a built-in sample.
  */
 export const setup: ImperativeSetup = (host, { width, height, backend }) => {
   const net = network(host, { width, height, backend });
+  net.enableZoom([0.1, 8]); // scroll to zoom, drag to pan; engine labels follow the transform
 
-  // HTML label overlay above the canvas (the harness positions `host` relative).
-  const labelEl = document.createElement("div");
-  labelEl.className = "absolute inset-0 overflow-hidden pointer-events-none text-[11px] font-medium text-[#334]";
-  host.appendChild(labelEl);
-  const labels = new LabelLayer(labelEl, (a) => a.text);
+  // Style the labels: a CSS class for the WebGL HTML overlay, plus font/color/halo for the Canvas/SVG
+  // native-text backends (so `toSVG()` / `toPNG()` export them too).
+  const labelStyle = document.createElement("style");
+  labelStyle.textContent = ".net-label{font:500 11px/1 system-ui,sans-serif;color:#334455;text-shadow:0 0 3px #fff,0 0 3px #fff}";
+  host.appendChild(labelStyle);
 
-  let anchors: LabelAnchor[] = [];
-  let view = { k: 1, x: 0, y: 0 };
-  const drawLabels = (t = view): void => {
-    view = t;
-    labels.update(anchors, t, { width, height });
-  };
-  net.enableZoom([0.1, 8], drawLabels); // scroll to zoom, drag to pan; labels follow the transform
-
-  let token = 0;
   let disposed = false;
-  const load = async (text: string, filename: string): Promise<void> => {
+  const load = (text: string, filename: string): void => {
+    if (disposed) return;
     loaded = { text, name: filename };
-    const mine = ++token;
     const { nodeCount, source, target, weight, labels: names, directed } = parseNetwork(text, filename);
-    anchors = [];
     const graph = buildGraph({ nodeCount, source, target, weight, directed });
     // Size nodes by degree so hubs stand out: a d3 `scaleSqrt` (area-proportional) over the degree
     // range, handed straight to `nodeRadius` via { by: "degree", scale }. Resolved once, no draw cost.
@@ -48,35 +39,22 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
     const radius = scaleSqrt().domain([1, maxDegree]).range([4, 16]);
     net
       .data(graph)
-      .style({
-        directed,
-        nodeRadius: { by: "degree", scale: radius },
-        nodeFill: "#4878d0",
-        linkWidth: 1,
-        linkStroke: "#cbd5e6",
-      })
-      .layout({ backend: "worker", iterations: 300 });
-
-    await net.whenSettled();
-    if (disposed || mine !== token) return; // a newer load (or teardown) superseded this one
-    anchors = names.map((label, i): LabelAnchor => ({
-      id: i,
-      refX: graph.positions[i * 2]!,
-      refY: graph.positions[i * 2 + 1]!,
-      text: label,
-      offset: [7, -4],
-    }));
-    drawLabels();
+      .style({ directed, nodeRadius: { by: "degree", scale: radius }, nodeFill: "#4878d0", linkWidth: 1, linkStroke: "#cbd5e6" })
+      // Vertex names as engine-managed frontier labels: `labelOf` maps a node id → its parsed label, and
+      // the engine re-places them on every pan/zoom + layout frame — no manual overlay/transform tracking.
+      .labels({ labelOf: (id) => names?.[id] ?? null, className: "net-label", offset: [7, -4], font: "500 11px system-ui, sans-serif", color: "#334455", halo: { color: "#ffffff", width: 3 } })
+      // fit: true (#238) frames the streaming layout as it converges — it opens framed, no manual fit.
+      .layout({ backend: "worker", iterations: 300, fit: true });
   };
 
   host.appendChild(makeControls(load));
-  void load(loaded.text, loaded.name);
+  load(loaded.text, loaded.name);
 
   return {
     engine: net,
     dispose: () => {
       disposed = true;
-      labels.destroy();
+      labelStyle.remove();
     },
   };
 };

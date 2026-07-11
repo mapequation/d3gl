@@ -75,4 +75,34 @@ describe("fit + cosmetic restyle", () => {
 
     net.destroy();
   });
+
+  // load-network path (#238): worker backend + fit:true + engine-managed net.labels. Asserts fit frames
+  // the WORKER (not just gpu) streaming layout, and that labelOf labels render as tracked overlay elements.
+  it("worker + fit + net.labels: framed, with vertex labels rendered", async () => {
+    const host = makeHost();
+    const net = network(host, { width: W, height: H, backend: "webgl" });
+    const { graph } = moduleGraph(0x2468);
+
+    net
+      .data(graph)
+      .style({ nodeRadius: 5 })
+      .labels({ labelOf: (id) => `n${id}`, className: "net-label" })
+      .layout({ backend: "worker", fit: true, iterations: 150 });
+    await net.whenSettled();
+    expect(net.layoutTransport).not.toBe("gpu"); // worker transport ("shared" | "copy")
+    expect(net.layoutTransport).not.toBe("none");
+
+    const t = tf(net);
+    const pos = graph.positions;
+    let onScreen = 0;
+    for (let i = 0; i < graph.nodeCount; i++) {
+      const x = t.k * pos[2 * i]! + t.x;
+      const y = t.k * pos[2 * i + 1]! + t.y;
+      if (x >= 0 && x <= W && y >= 0 && y <= H) onScreen++;
+    }
+    expect(onScreen / graph.nodeCount).toBeGreaterThan(0.9); // framed on the worker backend
+    expect(host.querySelectorAll(".net-label").length).toBeGreaterThan(0); // labels rendered + tracked
+
+    net.destroy();
+  });
 });
