@@ -9,6 +9,7 @@ import { buildModuleLODTree, type ModuleNode } from "./modules.js";
 import { moduleColors, type ModulePathNode, type ModuleColorOptions } from "./module-colors.js";
 import { physicalPieWedges, type PhysicalPieWedges, type PieWedgeOptions } from "./pie.js";
 import { rosettePositions } from "./rosette.js";
+import { gatherCandidates, descendingByKey, CandidateList, type CandidateSource } from "./label-candidates.js";
 import type { StateNetworkGraph } from "./state-graph.js";
 import { startWorkerLayout, type WorkerLayoutHandle } from "./worker-transport.js";
 import { startGpuLayout } from "./gpu/gpu-transport.js";
@@ -484,6 +485,15 @@ export class Network extends BaseEngine {
   /** Maps a picked link instance index (gl_InstanceID) → a {@link NetworkLinkHit} HoverHit, captured per
    *  emit so it matches the link set currently in the pick FBO. Null when no links are drawn. */
   private linkResolve: ((index: number) => HoverHit | null) | null = null;
+  /** No-LOD label candidate source (#212): the lazily-built position grid + its staleness flag.
+   *  `stale` is raised by {@link rebuild} and {@link scheduleLayoutRepaint} — the funnels every
+   *  position-mutating repaint goes through (layout streaming, drag, settle, data/layout change) —
+   *  so a pan/zoom {@link refreshLabels} on settled positions queries the grid in O(visible) while
+   *  a refresh over moving positions falls back to the plain scan (see label-candidates.ts). */
+  private readonly labelSource: CandidateSource = { grid: null, stale: true };
+  /** Reusable candidate-id scratch for {@link refreshLabels} (retained typed buffers — the gather
+   *  allocates nothing per frame in the steady state). */
+  private readonly labelCand = new CandidateList();
   /** Derived parent-pointer cache for the ancestor-aware selection highlight (#162), used only when the
    *  LOD tree carries no `parent` (coarsening/spatial). Keyed by tree identity; see {@link treeParent}. */
   private derivedParentFor: LODTree | null = null;
@@ -852,16 +862,40 @@ export class Network extends BaseEngine {
       }
     } else {
       // No-LOD: rank the nodes in view by strength (weighted degree). The full graph is drawn.
+      // Candidate gathering (#212) is O(visible) per pan/zoom frame in the steady state: on settled
+      // positions a coarse uniform grid — built at most once per position change, never per frame —
+      // answers the in-view query in O(covered cells + their nodes). While positions are moving
+      // (layout streaming, drag — `labelSource.stale`), it falls back to the plain O(N) scan those
+      // frames already pay elsewhere. Output is identical to the scan (see label-candidates.ts).
       const graph = this.graph, pos = graph.positions, strength = graph.strength;
-      const cand: number[] = [];
-      for (let i = 0; i < graph.nodeCount; i++) if (inView(pos[2 * i]!, pos[2 * i + 1]!)) cand.push(i);
+      const cand = this.labelCand;
+      const ascending = gatherCandidates(this.labelSource, pos, graph.nodeCount, rect, cand);
       const impOf = opts.importanceOf;
-      if (cand.length > max) cand.sort((a, b) => (impOf ? impOf(b, NO_LOD_INFO) - impOf(a, NO_LOD_INFO) : strength[b]! - strength[a]!));
-      for (const id of cand) {
-        const text = labelText(opts, id, NO_LOD_INFO);
-        if (!text) continue;
-        anchors.push({ id, refX: pos[2 * id]!, refY: pos[2 * id + 1]!, text, offset: opts.offset, transform: "translate(-50%, -50%)" });
-        if (anchors.length >= max) break;
+      if (cand.length > max) {
+        // Exact top-`max` without a full O(V log V) comparator sort: keys are computed once per
+        // candidate (the old comparator re-invoked `importanceOf` on every comparison) and a lazy
+        // heap pops key-descending, ties id-ascending — the order the old stable sort produced.
+        const ids = cand.ids;
+        const keys = cand.keysFor(cand.length);
+        if (impOf) for (let i = 0; i < cand.length; i++) keys[i] = impOf(ids[i]!, NO_LOD_INFO);
+        else for (let i = 0; i < cand.length; i++) keys[i] = strength[ids[i]!]!;
+        const next = descendingByKey(ids, keys, cand.length);
+        for (let id = next(); id >= 0; id = next()) {
+          const text = labelText(opts, id, NO_LOD_INFO);
+          if (!text) continue;
+          anchors.push({ id, refX: pos[2 * id]!, refY: pos[2 * id + 1]!, text, offset: opts.offset, transform: "translate(-50%, -50%)" });
+          if (anchors.length >= max) break;
+        }
+      } else {
+        // Under the cap (or uncapped): anchors go out ascending by id, as the scan always yielded.
+        if (!ascending) cand.sortAscending();
+        const ids = cand.ids;
+        for (let i = 0; i < cand.length; i++) {
+          const id = ids[i]!;
+          const text = labelText(opts, id, NO_LOD_INFO);
+          if (!text) continue;
+          anchors.push({ id, refX: pos[2 * id]!, refY: pos[2 * id + 1]!, text, offset: opts.offset, transform: "translate(-50%, -50%)" });
+        }
       }
     }
 
@@ -1182,6 +1216,9 @@ export class Network extends BaseEngine {
    * layout live instead of only once it settles.
    */
   private scheduleLayoutRepaint(): void {
+    // Raised at message time (not in the rAF): a pan between a streamed frame and its coalesced
+    // repaint must not label from a grid indexing the pre-stream positions (#212).
+    this.labelSource.stale = true;
     if (this.layoutRepaintRaf) return;
     const raf: (cb: FrameRequestCallback) => number =
       typeof requestAnimationFrame === "function" ? requestAnimationFrame : (cb) => setTimeout(() => cb(0), 16);
@@ -1342,6 +1379,12 @@ export class Network extends BaseEngine {
    */
   private rebuild(): this {
     if (!this.graph) return this;
+    // Every position-mutating repaint funnels through here (drag, settle, data/layout/view change;
+    // streamed frames additionally mark at message time in scheduleLayoutRepaint) — so the no-LOD
+    // label grid must not be trusted until rebuilt from the new coordinates (#212). Conservative
+    // for style-only rebuilds (those are click-frequency, not per-frame): the next settled label
+    // refresh rebuilds the grid once, O(nodeCount), never per frame.
+    this.labelSource.stale = true;
     const backend = this.backend();
     if (!backend) return this;
     const style = this.resolvedStyleCached(this.graph);
