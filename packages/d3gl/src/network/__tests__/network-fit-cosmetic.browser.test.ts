@@ -76,9 +76,10 @@ describe("fit + cosmetic restyle", () => {
     net.destroy();
   });
 
-  // load-network path (#238): worker backend + fit:true + engine-managed net.labels. Asserts fit frames
-  // the WORKER (not just gpu) streaming layout, and that labelOf labels render as tracked overlay elements.
-  it("worker + fit + net.labels: framed, with vertex labels rendered", async () => {
+  // load-network path (#238): worker backend + engine-managed net.labels, no fit (the worker seeds a
+  // viewport-centred disc, so it opens framed at k=1). Asserts the layout is centred (not piled at the
+  // origin) and that labelOf labels render as tracked overlay elements.
+  it("worker + net.labels: seed-framed (centred), with vertex labels rendered", async () => {
     const host = makeHost();
     const net = network(host, { width: W, height: H, backend: "webgl" });
     const { graph } = moduleGraph(0x2468);
@@ -87,20 +88,20 @@ describe("fit + cosmetic restyle", () => {
       .data(graph)
       .style({ nodeRadius: 5 })
       .labels({ labelOf: (id) => `n${id}`, className: "net-label" })
-      .layout({ backend: "worker", fit: true, iterations: 150 });
+      .layout({ backend: "worker", iterations: 150 });
     await net.whenSettled();
     expect(net.layoutTransport).not.toBe("gpu"); // worker transport ("shared" | "copy")
     expect(net.layoutTransport).not.toBe("none");
 
+    // The worker seeds around the viewport centre, so at the default k=1 view the layout centroid sits
+    // near the middle — framed, not piled at the top-left origin.
     const t = tf(net);
     const pos = graph.positions;
-    let onScreen = 0;
-    for (let i = 0; i < graph.nodeCount; i++) {
-      const x = t.k * pos[2 * i]! + t.x;
-      const y = t.k * pos[2 * i + 1]! + t.y;
-      if (x >= 0 && x <= W && y >= 0 && y <= H) onScreen++;
-    }
-    expect(onScreen / graph.nodeCount).toBeGreaterThan(0.9); // framed on the worker backend
+    let cx = 0, cy = 0;
+    for (let i = 0; i < graph.nodeCount; i++) { cx += pos[2 * i]!; cy += pos[2 * i + 1]!; }
+    cx /= graph.nodeCount; cy /= graph.nodeCount;
+    expect(Math.abs((t.k * cx + t.x) - W / 2)).toBeLessThan(W * 0.35);
+    expect(Math.abs((t.k * cy + t.y) - H / 2)).toBeLessThan(H * 0.35);
     expect(host.querySelectorAll(".net-label").length).toBeGreaterThan(0); // labels rendered + tracked
 
     net.destroy();

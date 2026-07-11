@@ -43,8 +43,9 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
       // Vertex names as engine-managed frontier labels: `labelOf` maps a node id → its parsed label, and
       // the engine re-places them on every pan/zoom + layout frame — no manual overlay/transform tracking.
       .labels({ labelOf: (id) => names?.[id] ?? null, className: "net-label", offset: [7, -4], font: "500 11px system-ui, sans-serif", color: "#334455", halo: { color: "#ffffff", width: 3 } })
-      // fit: true (#238) frames the streaming layout as it converges — it opens framed, no manual fit.
-      .layout({ backend: "worker", iterations: 300, fit: true });
+      // The worker seeds a viewport-centred disc, so this opens framed at k=1 as it converges — no fit
+      // needed here (fit is for the solvers that centre elsewhere, e.g. the GPU origin — see network/state).
+      .layout({ backend: "worker", iterations: 300 });
   };
 
   host.appendChild(makeControls(load));
