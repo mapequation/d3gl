@@ -296,6 +296,17 @@ export interface Backend {
    */
   readonly stylesNeedDrawables?: boolean;
   /**
+   * Flags-only fast path (optional): ONLY the per-drawable visibility flags changed —
+   * colours and geometry did not (the per-frame declutter show/hide, #208). `flags` is a
+   * LIVE view of the Scene's persistent flags table (one byte per drawable, drawableId-
+   * indexed, bit 0 = visible), passed by REFERENCE: the caller allocates and copies
+   * nothing per frame, and the view's contents stay current until the layer's drawable
+   * set changes — which always reaches the backend as a `setLayers`/`updateLayer`/
+   * `appendToLayer` call first. Backends must not mutate it. Backends without this
+   * method are driven through the `updateLayerStyles` path (full tables).
+   */
+  updateLayerFlags?(name: string, flags: Uint8Array): void;
+  /**
    * Append-only fast path (optional). Same observable result as a full re-upload,
    * but the backend uploads/draws only the appended tail (`delta`) — O(new) instead
    * of O(total). Backends that don't implement it are driven via `updateLayer`

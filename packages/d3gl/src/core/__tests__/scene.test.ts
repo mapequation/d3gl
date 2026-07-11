@@ -226,3 +226,57 @@ describe("Scene declutter index", () => {
     expect(Array.from(scene.buffers("g").flags)).toEqual([1, 0, 0, 1, 1]); // a, pie0, pie1, c, free
   });
 });
+
+describe("flagsView (persistent typed flags mirror, #208)", () => {
+  function twoRects() {
+    const scene = new Scene();
+    scene.group("g", (b) => {
+      b.drawable("a", (ctx) => ctx.rect(0, 0, 1, 1), { anchor: [10, 20] });
+      b.drawable("b", (ctx) => ctx.rect(2, 0, 1, 1), { anchor: [30, 40] });
+    });
+    return scene;
+  }
+
+  it("returns the SAME instance across calls (zero per-frame allocation)", () => {
+    const scene = twoRects();
+    const view = scene.flagsView("g");
+    expect(Array.from(view)).toEqual([1, 1]); // defaults visible
+    expect(scene.flagsView("g")).toBe(view);
+  });
+
+  it("stays in lockstep with setFlag and writeDeclutterFlags, in place", () => {
+    const scene = twoRects();
+    const view = scene.flagsView("g");
+    scene.setFlag("g", "a", 0);
+    expect(Array.from(view)).toEqual([0, 1]); // same instance, contents updated
+    scene.declutterIndex("g");
+    scene.writeDeclutterFlags("g", new Uint8Array([1, 0])); // keep a's group, hide b's
+    expect(scene.flagsView("g")).toBe(view);
+    expect(Array.from(view)).toEqual([1, 0]);
+    // The boxed table (what styleTables/drawables/buffers read) agrees.
+    expect(Array.from(scene.styleTables("g").flags)).toEqual([1, 0]);
+  });
+
+  it("is rebuilt (new instance, values carried over) when the drawable set grows", () => {
+    const scene = twoRects();
+    const view = scene.flagsView("g");
+    scene.setFlag("g", "a", 0);
+    scene.appendToGroup("g", (b) => b.drawable("c", (ctx) => ctx.rect(4, 0, 1, 1)));
+    // setFlag between append and re-access lands in the boxed table; the stale mirror
+    // is discarded and rebuilt from it.
+    scene.setFlag("g", "b", 0);
+    const after = scene.flagsView("g");
+    expect(after).not.toBe(view);
+    expect(Array.from(after)).toEqual([0, 0, 1]);
+  });
+
+  it("resets with a group() rebuild", () => {
+    const scene = twoRects();
+    scene.setFlag("g", "a", 0);
+    const view = scene.flagsView("g");
+    scene.group("g", (b) => b.drawable("a", (ctx) => ctx.rect(0, 0, 1, 1)));
+    const after = scene.flagsView("g");
+    expect(after).not.toBe(view);
+    expect(Array.from(after)).toEqual([1]); // fresh default, not the stale 0
+  });
+});

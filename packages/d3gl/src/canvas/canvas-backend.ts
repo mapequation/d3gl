@@ -100,6 +100,19 @@ export class CanvasBackend implements Backend {
     this.clipCache.delete(name);
   }
 
+  /** Flags-only update (#208): patch the retained vector view's flag bytes IN PLACE — no new
+   *  objects or arrays (vs updateLayerStyles, which swaps in a freshly materialized view) —
+   *  and the next render() repaints with the new visibility, exactly as before. Flags feed
+   *  the clip silhouette, so drop the cached clip. The length guard is defensive: any
+   *  drawable-set change reaches this backend as updateLayer/appendToLayer/setLayers first. */
+  updateLayerFlags(name: string, flags: Uint8Array): void {
+    const layer = this.layers.find((l) => l.name === name);
+    if (!layer || layer.drawables.length !== flags.length) return;
+    const ds = layer.drawables;
+    for (let i = 0; i < ds.length; i++) ds[i]!.flags = flags[i]!;
+    this.clipCache.delete(name);
+  }
+
   setTransform(t: ViewTransform): void {
     this.releaseClip(); // a moved view invalidates the persistent clip region
     this.transform = t;

@@ -677,6 +677,36 @@ export class GroupRenderer {
     // If point borrows from the shape pass, the writes above already updated those textures.
   }
 
+  /**
+   * Flags-only fast path (#208): rewrite ONLY the flags texture(s) — the colour tables
+   * are untouched (declutter mutates visibility bits, not colours), so a zoom frame
+   * uploads N bytes instead of updateColors' 9·N. Mirrors {@link updateColors}'
+   * structure: the shape pass's table, plus the point pass's own when it owns its
+   * textures (a borrowing point pass shares the shape pass's flags texture, already
+   * written). Same precondition: the drawable set is unchanged (appends go through
+   * append()); a count mismatch throws rather than silently corrupting.
+   */
+  updateFlags(flags: Uint8Array): void {
+    if (this.shape) {
+      if (flags.length !== this.shape.drawableCount) {
+        throw new Error(
+          `updateFlags drawable count ${flags.length} != ${this.shape.drawableCount} at build time; ` +
+            `appended drawables must go through append()`,
+        );
+      }
+      this.shape.flagsTex.write(flags);
+    }
+    if (this.point?.ownsTextures) {
+      if (flags.length !== this.point.drawableCount) {
+        throw new Error(
+          `updateFlags drawable count ${flags.length} != ${this.point.drawableCount} at build time; ` +
+            `appended drawables must go through append()`,
+        );
+      }
+      this.point.flagsTex.write(flags);
+    }
+  }
+
   private writePointTables(pp: PointPass, colors: Uint8Array, flags: Uint8Array): void {
     const count = colors.length / 4;
     if (count !== pp.drawableCount) {
