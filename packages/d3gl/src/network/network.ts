@@ -14,7 +14,7 @@ import { startWorkerLayout, type WorkerLayoutHandle } from "./worker-transport.j
 import { startGpuLayout } from "./gpu/gpu-transport.js";
 import { WebGLBackend } from "../webgl/webgl-backend.js";
 import type { NetworkGraph } from "./graph.js";
-import { topLevelBounds, fitTransform, type FitBox } from "./fit.js";
+import { fitNodes, fitBox, fitTransform, type FitBox } from "./fit.js";
 import type { InstancedLayer, ViewTransform } from "../core/index.js";
 import { InstancedLane, type SelectionStrategy } from "../core/instanced-lane.js";
 import { resolveRingColors, ringCircles } from "../map/highlight-ring.js";
@@ -427,6 +427,11 @@ export class Network extends BaseEngine {
   /** One-shot layout bbox `[minX, minY, maxX, maxY]` for the LOD-off fit fallback: computed once from
    *  positions (no per-frame O(nodes) scan) and held for the run. Null while a LOD tree supplies bounds. */
   private fitFallbackBox: FitBox | null = null;
+  /** Cached top-module ids (the fit nodes, {@link fitNodes}) for the per-frame fit, plus the median scratch
+   *  ({@link fitBox}). Recomputed only when the tree identity changes; the scratch is reused across frames. */
+  private fitNodesArr: Uint32Array | null = null;
+  private fitNodesFor: LODTree | null = null;
+  private fitScratch: Float32Array | null = null;
   /** Pending coalesced repaint rAF id (0 = none) for progressive worker frames. */
   private layoutRepaintRaf = 0;
   /** LOD config when enabled (#103), else null (draw every element). */
@@ -544,6 +549,19 @@ export class Network extends BaseEngine {
   private setActiveGraph(graph: NetworkGraph): this {
     this.stopLayout(); // any worker layout is tied to the previous graph's buffers
     this.graph = graph;
+    // Drop per-node style arrays sized to the PREVIOUS graph — the idiomatic re-render on a graph swap is
+    // `net.data(g).style(s)`, but data() rebuilds first, and resolving a stale-length `flowBorder.flow` /
+    // `nodeRadius` array against the new graph would throw (e.g. "flowBorder.flow length 1000 !== nodeCount
+    // 2000" when a node-count slider changes). They must be re-supplied for the new graph anyway; the next
+    // style() call does that. Accessors / `{ by }` specs are graph-relative and kept.
+    const n = graph.nodeCount;
+    const fb = this.styleOpts.flowBorder;
+    if (fb && fb.flow instanceof Float32Array && fb.flow.length !== n) {
+      this.styleOpts = { ...this.styleOpts, flowBorder: undefined };
+    }
+    if (this.styleOpts.nodeRadius instanceof Float32Array && this.styleOpts.nodeRadius.length !== n) {
+      this.styleOpts = { ...this.styleOpts, nodeRadius: undefined };
+    }
     // New topology + position buffer: drop the retained LOD tree and resolved-style cache.
     this.lodTree = null;
     this.lodWorkerTree = null;
@@ -552,6 +570,7 @@ export class Network extends BaseEngine {
     this.lodHasGeometry = false;
     this.resolvedCache = null;
     this.derivedParentFor = null; this.derivedParent = null; // drop the ancestor-aware parent cache (#162)
+    this.fitFallbackBox = null; this.fitNodesArr = null; this.fitNodesFor = null; // fit caches are tied to the old graph/tree
     return this.rebuild();
   }
 
@@ -1011,7 +1030,13 @@ export class Network extends BaseEngine {
       }
       // Frame the first paint against the seeded (box-centred) layout so a streaming fit opens framed
       // rather than piled at the origin; each subsequent streamed frame reframes in scheduleLayoutRepaint.
-      if (this.fitOnLayout) this.fitViewToLayout();
+      // Recompute the LOD geometry from the just-seeded positions first: a preceding `lod({ modules })`
+      // may have computed the tree geometry from the graph's initial (zero) positions, and the streaming
+      // branches don't refresh it before this first fit — using it stale collapses the frame to the origin.
+      if (this.fitOnLayout) {
+        this.recomputeLODGeometry();
+        this.fitViewToLayout();
+      }
     }
     return this.rebuild();
   }
@@ -1199,9 +1224,18 @@ export class Network extends BaseEngine {
    * (the layout stays roughly framed as it refines; use LOD for continuous reframing). Null if unavailable.
    */
   private layoutFitBox(graph: NetworkGraph): FitBox | null {
-    // Preferred: the LOD tree top level — O(top-level modules), refreshed each frame (see {@link topLevelBounds}).
+    // Preferred: a fling-out-robust box over the top modules ({@link fitBox}) — O(top modules), refreshed
+    // each frame from the live geometry. The fit nodes are cached per tree identity (the scratch too), so
+    // the per-frame work is O(top modules), not O(tree size).
     if (this.lodTree && this.lodHasGeometry) {
-      const box = topLevelBounds(this.lodTree);
+      let nodes = this.fitNodesArr;
+      if (this.fitNodesFor !== this.lodTree || !nodes) {
+        nodes = fitNodes(this.lodTree);
+        this.fitNodesArr = nodes;
+        this.fitNodesFor = this.lodTree;
+      }
+      if (!this.fitScratch || this.fitScratch.length < nodes.length) this.fitScratch = new Float32Array(nodes.length);
+      const box = fitBox(this.lodTree, nodes, this.fitScratch);
       if (box) return box;
     }
     // LOD off (no tree): one-time full-position bbox, held so the fallback never costs O(nodes) per frame.

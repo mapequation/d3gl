@@ -144,14 +144,20 @@ describe("network layout backend:'gpu' integration", () => {
 
   // #206 fit-on-layout: layout({ backend: "gpu", fit: true }) must open + settle FRAMED. The GPU solve
   // centres the layout centroid at the origin, so without fit it renders at the top-left corner until it
-  // settles; fit reframes the camera each streamed frame. Drives the real trigger and asserts the settled
-  // view transform maps the layout centroid to ~canvas centre and the content fills (not overflows) the view.
-  it("fit:true frames the streaming layout — centroid → view centre, content fits the view", async () => {
+  // settles. Drives the real trigger on a RAGGED module tree (like the map-of-modules example) and asserts
+  // the settled view maps the BULK of the nodes INSIDE the viewport at a healthy fill — i.e. not the top-left
+  // pile, and not the over-zoomed "all white" collapse the earlier extent-based frame produced (#206).
+  it("fit:true frames a ragged module layout — bulk of nodes inside the viewport at a healthy fill", async () => {
     const host = makeHost();
     const net = network(host, { width: W, height: H, backend: "webgl" });
     const { buildGraph } = await import("../../graph.js");
 
-    const K = 5, m = 30, nodeCount = K * m;
+    // Ragged paths like the example: some communities top-level (depth 1), some nested (2), some deeper (3).
+    const raggedPrefix = (c: number): number[] => {
+      const sup = Math.floor(c / 4);
+      return c % 4 === 0 ? [10000 + c] : c % 4 === 3 ? [1 + sup, 500 + sup, 200 + c] : [1 + sup, 100 + c];
+    };
+    const K = 12, m = 30, nodeCount = K * m;
     let s = 0x51ed >>> 0;
     const rand = () => ((s = Math.imul(1664525, s) + 1013904223), (s >>> 0) / 0x100000000);
     const members: number[][] = Array.from({ length: K }, () => []);
@@ -161,41 +167,37 @@ describe("network layout backend:'gpu' integration", () => {
     for (let a = 0; a < K; a++) for (let b = a + 1; b < K; b++) { src.push(members[a]![0]!); tgt.push(members[b]![0]!); }
     const g = buildGraph({ nodeCount, source: src, target: tgt });
     const rank = new Map<number, number>();
-    const modules = Array.from({ length: nodeCount }, (_, id) => { const c = id % K; const r = (rank.get(c) ?? 0) + 1; rank.set(c, r); return { id, path: [c + 1, r] }; });
+    const modules = Array.from({ length: nodeCount }, (_, id) => { const c = id % K; const r = (rank.get(c) ?? 0) + 1; rank.set(c, r); return { id, path: [...raggedPrefix(c), r] }; });
 
     net.data(g);
     net.lod({ modules });
+    net.style({ sizeMode: "screen", nodeRadius: 4 });
     net.layout({ backend: "gpu", fit: true, iterations: 200 });
     await net.whenSettled();
     expect(net.layoutTransport).toBe("gpu");
-
-    // Layout centroid + bounds from the settled positions.
-    const pos = g.positions;
-    let cx = 0, cy = 0, minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
-    for (let i = 0; i < nodeCount; i++) {
-      const x = pos[2 * i]!, y = pos[2 * i + 1]!;
-      cx += x; cy += y;
-      minX = Math.min(minX, x); minY = Math.min(minY, y);
-      maxX = Math.max(maxX, x); maxY = Math.max(maxY, y);
-    }
-    cx /= nodeCount; cy /= nodeCount;
 
     const t = (net as unknown as { transform: { k: number; x: number; y: number } }).transform;
     expect(Number.isFinite(t.k)).toBe(true);
     expect(t.k).toBeGreaterThan(0);
 
-    // Centroid maps near the canvas centre (generous tolerance — the fit centres the LOD-tree box, whose
-    // centre is close to but not exactly the raw position centroid). Definitively NOT at the top-left origin.
-    const screenCx = t.k * cx + t.x;
-    const screenCy = t.k * cy + t.y;
-    expect(Math.abs(screenCx - W / 2)).toBeLessThan(W * 0.25);
-    expect(Math.abs(screenCy - H / 2)).toBeLessThan(H * 0.25);
+    // Map every node through the settled transform; drop the farthest few as fling-out outliers (the fit is
+    // deliberately robust to them) and assert the BULK is on-screen and fills a healthy fraction of the view.
+    const pos = g.positions;
+    let cx = 0, cy = 0;
+    for (let i = 0; i < nodeCount; i++) { cx += pos[2 * i]!; cy += pos[2 * i + 1]!; }
+    cx /= nodeCount; cy /= nodeCount;
+    const screen = Array.from({ length: nodeCount }, (_, i) => [t.k * pos[2 * i]! + t.x, t.k * pos[2 * i + 1]! + t.y] as [number, number]);
+    const onScreen = screen.filter(([x, y]) => x >= 0 && x <= W && y >= 0 && y <= H).length;
+    expect(onScreen / nodeCount).toBeGreaterThan(0.9); // ≥90% of nodes visible — not the "all white" collapse
 
-    // Content fills the view without overflowing it: the widest mapped side is a healthy fraction of the
-    // viewport but ≤ it (fit targets 0.85 of the shorter side; the tree box pads slightly beyond leaves).
-    const mappedSpan = t.k * Math.max(maxX - minX, maxY - minY);
-    expect(mappedSpan).toBeGreaterThan(0.2 * Math.min(W, H));
-    expect(mappedSpan).toBeLessThanOrEqual(Math.min(W, H));
+    // Bulk bbox (2nd–98th percentile per axis) fills a healthy fraction of the view and is centred there.
+    const xs = screen.map((p) => p[0]).sort((a, b) => a - b);
+    const ys = screen.map((p) => p[1]).sort((a, b) => a - b);
+    const lo = Math.floor(nodeCount * 0.02), hi = Math.floor(nodeCount * 0.98);
+    const spanX = xs[hi]! - xs[lo]!, spanY = ys[hi]! - ys[lo]!;
+    expect(Math.max(spanX, spanY)).toBeGreaterThan(0.35 * Math.min(W, H)); // fills the view, not a speck
+    expect(Math.abs((t.k * cx + t.x) - W / 2)).toBeLessThan(W * 0.25); // centred, not piled at the origin
+    expect(Math.abs((t.k * cy + t.y) - H / 2)).toBeLessThan(H * 0.25);
 
     net.destroy();
   });
