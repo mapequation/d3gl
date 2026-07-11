@@ -1083,6 +1083,18 @@ export class Network extends BaseEngine {
     }
 
     if (opts.backend === "worker" || opts.backend === "gpu") {
+      // fit: true (#238) frames the streaming physical layout via the CAMERA (like the main layout path)
+      // instead of the `scaleToViewport` position-remap — so state networks open framed and converge in
+      // place (no top-left flash + settle snap on the GPU backend). The state sizing is scale-relative
+      // (computeStateSizing sizes against physicalSpacing), so leaving positions in force scale is fine.
+      // Pre-seed so the first paint is framed (the GPU device resolves async → phys is zero until then);
+      // each streamed frame reframes in scheduleLayoutRepaint, released on settle/interaction.
+      const fit = opts.fit === true;
+      this.fitOnLayout = fit;
+      this.fitFallbackBox = null;
+      this.fitNodesArr = null;
+      this.fitNodesFor = null;
+      if (fit) seedPositions(phys, this.width, this.height);
       const onPhysFrame = () => this.scheduleLayoutRepaint();
       const workerOpts = {
         width: this.width,
@@ -1097,12 +1109,14 @@ export class Network extends BaseEngine {
       this.layoutHandle = handle;
       void handle.settled.then(() => {
         if (this.layoutHandle !== handle) return; // a newer layout superseded this one
-        // Frame the physical layout to fill the view at k=1 now that it's at rest — scaleToViewport
-        // mutates the shared position buffer in place, so it's only safe once the worker/GPU stream has
-        // stopped writing it (during the run the force's own centering keeps it roughly framed).
-        scaleToViewport(phys.positions, sg.physicalCount, this.width, this.height);
+        // Without fit, scaleToViewport remaps the physical positions to fill the view at k=1 now that the
+        // stream has stopped writing them. With fit, the camera already tracks the layout — derive + refresh
+        // geometry from the final positions first, then do the final reframe + release (release needs fresh
+        // geometry to frame the settled layout, not the last streamed frame's).
+        if (!fit) scaleToViewport(phys.positions, sg.physicalCount, this.width, this.height);
         this.applyStateDerivedPositions();
         this.recomputeLODGeometry(true);
+        if (fit) this.releaseFit();
         this.rebuild();
       });
       // `worker` seeds `phys.positions` synchronously before returning; the async `gpu` device promise
@@ -1110,6 +1124,7 @@ export class Network extends BaseEngine {
       // screen) is cheap and self-corrects on the first streamed frame regardless.
       this.applyStateDerivedPositions();
       this.recomputeLODGeometry();
+      if (fit) this.fitViewToLayout(); // frame the first paint against the seeded layout
       return this.rebuild();
     }
 
