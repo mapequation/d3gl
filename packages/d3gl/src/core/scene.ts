@@ -26,6 +26,15 @@ export interface DrawableRange {
  * exactly only up to 2^24 (~16.7M), which caps the number of drawables per group;
  * far above realistic use, but the shader's integer cast of this component would
  * silently break past that ceiling.
+ *
+ * SHARING (#207): every array except `pointCenters` is a LIVE subarray view of the
+ * Scene's typed storage — NOT a detached copy. Consumers must not mutate them, and
+ * must not assume snapshot semantics: a later restyle (`setFill`/`setFlag`) is
+ * visible through the views, and an append to the group makes them stale (the
+ * drawable set change always reaches a backend as a fresh `setLayers`/`updateLayer`/
+ * `appendToLayer` call, so a consumer that re-reads on those events never observes
+ * staleness). `pointCenters` interleaves per-circle data with the drawableId, so it
+ * is assembled fresh per call.
  */
 export interface GroupBuffers {
   fillVertices: Float32Array;
@@ -57,6 +66,10 @@ export interface GroupBuffers {
  * Same arrays as {@link GroupBuffers} but each holds only the newly-appended data;
  * index values are group-absolute. `drawableCount` is the total after the append,
  * `fromDrawable` the index where the new range begins. Point count = pointCenters/4.
+ *
+ * Like {@link GroupBuffers}, the arrays (except `pointCenters`) are live tail VIEWS of
+ * the Scene's typed storage — computed in O(1), consumed synchronously by the backend's
+ * append path, and not to be mutated or retained.
  */
 export interface GroupBufferDelta {
   fillVertices: Float32Array;
@@ -76,9 +89,10 @@ export interface GroupBufferDelta {
   ranges: DrawableRange[];
 }
 
-/** Just the per-drawable style tables (colors + flags) as detached typed arrays —
- *  O(drawableCount), for styles-only backend updates. Never the O(total-vertices)
- *  {@link Scene.buffers} rebuild: geometry hasn't changed, only how it's painted. */
+/** Just the per-drawable style tables (colors + flags), for styles-only backend
+ *  updates — never the O(total-vertices) {@link Scene.buffers} rebuild: geometry
+ *  hasn't changed, only how it's painted. LIVE views of the Scene's typed storage
+ *  (#207) — zero copies/allocation per call; see {@link Scene.styleTables}. */
 export interface StyleTables {
   fillColors: Uint8Array;
   strokeColors: Uint8Array;
@@ -111,45 +125,197 @@ export interface GroupBuilder {
   points(id: string | number, centers: readonly [number, number][], radius: number): void;
 }
 
-/** Mutable accumulation for one group while building / before buffer assembly. */
+// ---------------------------------------------------------------------------
+// Typed grow-on-append storage (#207)
+//
+// Per-drawable tables and vertex data used to live in boxed number[]s (~8 B per
+// element plus per-array overhead) that buffers()/styleTables() copied into fresh
+// typed arrays on demand — at 1M drawables the boxed colour/flag tables alone cost
+// ~70 MB for data that is ~9 MB typed, and the geometry was retained twice. These
+// stores keep the data typed from the start: amortized-doubling capacity, a logical
+// length, and cached subarray views handed out by reference.
+// ---------------------------------------------------------------------------
+
+/**
+ * Amortized-doubling typed store. Hot append loops call {@link reserve} once for the
+ * batch and then write `a[n++]` directly (no per-element method call); `view()` hands
+ * out the used range as a cached subarray — the SAME instance until the length changes,
+ * so per-frame readers get zero allocation.
+ *
+ * Invariant: cells at/past `n` are always zero (allocation zero-fills; reallocation
+ * copies; writers stay below `n`) — {@link extend} relies on it for zero-valued columns.
+ */
+abstract class Grow<A extends Float32Array | Uint8Array | Uint32Array> {
+  /** Backing store, `capacity >= n` elements. Index directly only below {@link n}
+   *  (or into cells claimed via {@link reserve} + `n++`). */
+  a: A;
+  /** Logical length (elements in use). */
+  n = 0;
+  private cached: A | null = null;
+  constructor(capacity = 16) {
+    this.a = this.alloc(capacity);
+  }
+  protected abstract alloc(len: number): A;
+  protected abstract sub(start: number, end: number): A;
+  /** Ensure capacity for `extra` more elements (doubling; contents kept). */
+  reserve(extra: number): void {
+    const need = this.n + extra;
+    if (need <= this.a.length) return;
+    let cap = Math.max(16, this.a.length * 2);
+    while (cap < need) cap *= 2;
+    const next = this.alloc(cap);
+    next.set(this.a);
+    this.a = next;
+    this.cached = null; // a cached view aliases the OLD buffer; drop it
+  }
+  push(v: number): void {
+    this.reserve(1);
+    this.a[this.n++] = v;
+  }
+  /** Claim `count` zero-valued cells (see the class invariant). */
+  extend(count: number): void {
+    this.reserve(count);
+    this.n += count;
+  }
+  /** A live subarray view of the used range `[0, n)` — the SAME instance across calls
+   *  until the length changes (append), so per-frame callers allocate nothing. NOT a
+   *  snapshot: in-place writers (setFill/setFlag/…) are visible through it. */
+  view(): A {
+    let v = this.cached;
+    if (!v || v.length !== this.n) {
+      v = this.sub(0, this.n);
+      this.cached = v;
+    }
+    return v;
+  }
+  /** A live subarray view of `[start, n)` — the appended-tail slice, O(1). */
+  tail(start: number): A {
+    return this.sub(Math.min(start, this.n), this.n);
+  }
+}
+
+class GrowF32 extends Grow<Float32Array> {
+  protected alloc(len: number): Float32Array {
+    return new Float32Array(len);
+  }
+  protected sub(start: number, end: number): Float32Array {
+    return this.a.subarray(start, end);
+  }
+}
+
+class GrowU8 extends Grow<Uint8Array> {
+  protected alloc(len: number): Uint8Array {
+    return new Uint8Array(len);
+  }
+  protected sub(start: number, end: number): Uint8Array {
+    return this.a.subarray(start, end);
+  }
+}
+
+class GrowU32 extends Grow<Uint32Array> {
+  protected alloc(len: number): Uint32Array {
+    return new Uint32Array(len);
+  }
+  protected sub(start: number, end: number): Uint32Array {
+    return this.a.subarray(start, end);
+  }
+}
+
+/** Join/cap styles by column code (index 0 = the default, stored implicitly while the
+ *  column is omitted). */
+const JOIN_NAMES: readonly LineJoin[] = ["bevel", "miter", "round"];
+const CAP_NAMES: readonly LineCap[] = ["butt", "square", "round"];
+
+/**
+ * Push a join/cap code onto a lazily-allocated column: the column stays null (omitted —
+ * zero bytes) while every drawable uses the default (code 0), and is allocated + zero-
+ * backfilled for the `count` drawables already registered when the first non-default
+ * value arrives. Returns the (possibly newly created) column.
+ */
+function pushCode(column: GrowU8 | null, code: number, count: number): GrowU8 | null {
+  if (!column) {
+    if (code === 0) return null;
+    column = new GrowU8();
+    column.extend(count); // zero-filled = the default code
+  }
+  column.push(code);
+  return column;
+}
+
+/** Same lazy-column scheme for miter limits (default {@link DEFAULT_MITER_LIMIT}). */
+function pushLimit(column: GrowF32 | null, v: number, count: number): GrowF32 | null {
+  if (!column) {
+    if (v === DEFAULT_MITER_LIMIT) return null;
+    column = new GrowF32();
+    column.reserve(count + 1);
+    column.a.fill(DEFAULT_MITER_LIMIT, 0, count);
+    column.n = count;
+  }
+  column.push(v);
+  return column;
+}
+
+/** Shared per-drawable defaults for the vector view: path drawables have no circles and
+ *  point drawables no subpaths, so every such drawable aliases ONE empty array instead
+ *  of allocating its own (1M path drawables used to allocate 1M empty arrays, #207).
+ *  Vector-view consumers treat drawables as read-only (audited: Canvas/SVG/hit-test/
+ *  highlight only iterate) — never push into these. */
+const EMPTY_CIRCLES: { x: number; y: number; r: number }[] = [];
+const EMPTY_SUBPATHS: Subpath[] = [];
+
+/**
+ * Mutable accumulation for one group while building / before buffer assembly.
+ *
+ * Storage is typed (#207): per-drawable tables and vertex data live in grow-on-append
+ * typed stores, and {@link Scene.buffers}/{@link Scene.styleTables}/{@link Scene.flagsView}
+ * hand out live views of them (no copies). Rarely-customized columns (`joins`/`caps`/
+ * `miterLimits`) are omitted (null) while every drawable uses the default. `circles` is
+ * null-sparse: path drawables store null instead of an own empty array. `anchors`,
+ * `circles` and `subpaths` stay boxed ON PURPOSE: the vector view shares those objects
+ * by reference, so a typed column would ADD memory (typed column + per-view objects)
+ * whenever a vector view is materialized — which the engine always does — not save it.
+ */
 class GroupData {
-  fillVerts: number[] = [];
-  fillIdx: number[] = [];
-  strokeVerts: number[] = [];
-  strokeIdx: number[] = [];
+  /** [x, y, drawableId] per vertex. Float32 from the start: buffers() always uploaded
+   *  Float32, so nothing downstream ever saw more precision. */
+  fillVerts = new GrowF32();
+  fillIdx = new GrowU32();
+  strokeVerts = new GrowF32();
+  strokeIdx = new GrowU32();
   ranges: DrawableRange[] = [];
   // Keyed by the raw id (string OR number) — NOT String(id) — so numeric-id layers
   // don't allocate a string per drawable (millions, for streamed data). A layer uses
   // one id type, so 1 vs "1" collisions aren't a real concern.
   idToDrawable = new Map<string | number, number>();
-  fillColors: number[] = []; // flat RGBA, 4 per drawable
-  strokeColors: number[] = [];
-  flags: number[] = [];
+  fillColors = new GrowU8(); // flat RGBA, 4 per drawable
+  strokeColors = new GrowU8();
+  /** One byte per drawable (bit 0 = visible) — THE storage: {@link Scene.flagsView},
+   *  {@link Scene.styleTables} and {@link Scene.buffers} alias it directly (#208's
+   *  interim mirror became the primary storage here, as planned). */
+  flags = new GrowU8();
   subpaths: Subpath[][] = [];
   ids: (string | number)[] = [];
-  lineWidths: number[] = [];
-  /** Per-drawable glyph anchor (null = none), for screen sizeMode. */
+  lineWidths = new GrowF32();
+  /** Per-drawable glyph anchor (null = none), for screen sizeMode. Boxed — shared by
+   *  reference with the vector view (see the class doc). */
   anchors: ([number, number] | null)[] = [];
   /** Per-fill-vertex / per-stroke-vertex anchors (flat x,y), parallel to the vertex arrays. */
-  fillAnchors: number[] = [];
-  strokeAnchors: number[] = [];
-  /** One array of circle centers per drawable (empty for path drawables). */
-  circles: { x: number; y: number; r: number }[][] = [];
-  /** Per-drawable stroke join style + miter limit + end cap (parallel to lineWidths). */
-  joins: LineJoin[] = [];
-  miterLimits: number[] = [];
-  caps: LineCap[] = [];
+  fillAnchors = new GrowF32();
+  strokeAnchors = new GrowF32();
+  /** Circle centers per drawable — null for path drawables (no empty array each, #207).
+   *  Boxed — shared by reference with the vector view (see the class doc). */
+  circles: ({ x: number; y: number; r: number }[] | null)[] = [];
+  /** Total circles across all drawables (sizes pointCenters assembly in one pass). */
+  circleCount = 0;
+  /** Per-drawable stroke join/cap codes (index into JOIN_NAMES/CAP_NAMES) and miter
+   *  limits — null while every drawable uses the default (the common case: whole
+   *  layers share one join/cap style, so the columns usually cost zero bytes). */
+  joins: GrowU8 | null = null;
+  caps: GrowU8 | null = null;
+  miterLimits: GrowF32 | null = null;
   /** Cached transform-independent declutter index (built lazily; null ⇒ stale/never built).
    *  Invalidated whenever the group's drawable set changes (rebuild or append). */
   declutterIndex: DeclutterIndex | null = null;
-  /** Persistent typed mirror of {@link flags}, kept in lockstep by the flag writers and
-   *  handed out BY REFERENCE via {@link Scene.flagsView} (the flags-only per-frame path,
-   *  #208 — zero copies/allocation per frame). Lazily (re)built from the boxed array when
-   *  missing or when the drawable set grew (length mismatch); a group() rebuild replaces
-   *  GroupData, so it resets naturally. Interim seam for #207: once the tables themselves
-   *  are typed this mirror becomes the primary storage and the double-write disappears —
-   *  the `flagsView` contract is unchanged. */
-  flagsView: Uint8Array | null = null;
   constructor(public readonly tolerance: number) {}
 }
 
@@ -242,52 +408,66 @@ export class Scene {
     const join: LineJoin = opts?.lineJoin ?? "bevel";
     const miterLimit = opts?.miterLimit ?? DEFAULT_MITER_LIMIT;
     const cap: LineCap = opts?.lineCap ?? "butt";
-    data.joins.push(join);
-    data.miterLimits.push(miterLimit);
-    data.caps.push(cap);
+    data.joins = pushCode(data.joins, JOIN_NAMES.indexOf(join), drawableId);
+    data.caps = pushCode(data.caps, CAP_NAMES.indexOf(cap), drawableId);
+    data.miterLimits = pushLimit(data.miterLimits, miterLimit, drawableId);
     const anchor = opts?.anchor ?? null;
     data.anchors.push(anchor);
 
     // ---- Fill ----
-    const fillVertexOffset = data.fillVerts.length / 3;
-    const fillIndexOffset = data.fillIdx.length;
+    const fv = data.fillVerts, fa = data.fillAnchors, fi = data.fillIdx;
+    const fillVertexOffset = fv.n / 3;
+    const fillIndexOffset = fi.n;
     const closed = subpaths.filter((s) => s.closed && s.points.length >= 6);
     if (closed.length > 0) {
       const rings = groupRings(closed);
       const polygons = rings.map((r) => r.outer);
       const holes = rings.map((r) => r.holes);
       const fg = tessellateFill(polygons, holes);
-      const baseVertex = data.fillVerts.length / 3;
+      const baseVertex = fv.n / 3;
+      fv.reserve((fg.vertices.length / 2) * 3);
+      fa.reserve(fg.vertices.length);
       for (let i = 0; i < fg.vertices.length; i += 2) {
         const x = fg.vertices[i]!, y = fg.vertices[i + 1]!;
-        data.fillVerts.push(x, y, drawableId);
+        fv.a[fv.n++] = x;
+        fv.a[fv.n++] = y;
+        fv.a[fv.n++] = drawableId;
         // Anchor at the glyph center if given, else at the vertex itself (offset 0 ⇒ stays world).
-        data.fillAnchors.push(anchor ? anchor[0] : x, anchor ? anchor[1] : y);
+        fa.a[fa.n++] = anchor ? anchor[0] : x;
+        fa.a[fa.n++] = anchor ? anchor[1] : y;
       }
-      for (const ix of fg.indices) data.fillIdx.push(baseVertex + ix);
+      fi.reserve(fg.indices.length);
+      for (const ix of fg.indices) fi.a[fi.n++] = baseVertex + ix;
     }
-    const fillVertexCount = data.fillVerts.length / 3 - fillVertexOffset;
-    const fillIndexCount = data.fillIdx.length - fillIndexOffset;
+    const fillVertexCount = fv.n / 3 - fillVertexOffset;
+    const fillIndexCount = fi.n - fillIndexOffset;
 
     // ---- Stroke ----
-    const strokeVertexOffset = data.strokeVerts.length / 3;
-    const strokeIndexOffset = data.strokeIdx.length;
+    const sv = data.strokeVerts, sa = data.strokeAnchors, si = data.strokeIdx;
+    const strokeVertexOffset = sv.n / 3;
+    const strokeIndexOffset = si.n;
     const lineWidth = opts?.lineWidth ?? 0;
     if (lineWidth > 0) {
       for (const sp of subpaths) {
         const sg = expandStroke(sp, lineWidth, { join, miterLimit, cap });
-        const baseVertex = data.strokeVerts.length / 3;
+        const baseVertex = sv.n / 3;
+        sv.reserve((sg.vertices.length / 2) * 3);
+        sa.reserve(sg.vertices.length);
         for (let i = 0; i < sg.vertices.length; i += 2) {
-          data.strokeVerts.push(sg.vertices[i]!, sg.vertices[i + 1]!, drawableId);
+          sv.a[sv.n++] = sg.vertices[i]!;
+          sv.a[sv.n++] = sg.vertices[i + 1]!;
+          sv.a[sv.n++] = drawableId;
           // Glyph: anchor at the center (whole outline scales). Else: per-vertex centerline
           // anchor (constant-width stroke about its own line).
-          data.strokeAnchors.push(anchor ? anchor[0] : sg.anchors[i]!, anchor ? anchor[1] : sg.anchors[i + 1]!);
+          sa.a[sa.n++] = anchor ? anchor[0] : sg.anchors[i]!;
+          sa.a[sa.n++] = anchor ? anchor[1] : sg.anchors[i + 1]!;
         }
-        for (const ix of sg.indices) data.strokeIdx.push(baseVertex + ix);
+        si.reserve(sg.indices.length);
+        for (const ix of sg.indices) si.a[si.n++] = baseVertex + ix;
       }
     }
-    const strokeVertexCount = data.strokeVerts.length / 3 - strokeVertexOffset;
-    const strokeIndexCount = data.strokeIdx.length - strokeIndexOffset;
+    const strokeVertexCount = sv.n / 3 - strokeVertexOffset;
+    const strokeIndexCount = si.n - strokeIndexOffset;
 
     data.ranges.push({
       fill: {
@@ -303,12 +483,13 @@ export class Scene {
         indexCount: strokeIndexCount,
       },
     });
-    // Defaults: transparent colors, visible flag (bit 0).
-    data.fillColors.push(0, 0, 0, 0);
-    data.strokeColors.push(0, 0, 0, 0);
+    // Defaults: transparent colors (zero bytes — see the Grow invariant), visible flag (bit 0).
+    data.fillColors.extend(4);
+    data.strokeColors.extend(4);
     data.flags.push(1);
-    // Path drawables have no circle geometry.
-    data.circles.push([]);
+    // Path drawables have no circle geometry (null-sparse; the vector view substitutes
+    // the shared EMPTY_CIRCLES).
+    data.circles.push(null);
   }
 
   private addCircleDrawable(
@@ -320,28 +501,29 @@ export class Scene {
     if (data.idToDrawable.has(id)) throw new Error(`duplicate drawable id: ${String(id)}`);
     const drawableId = data.ranges.length;
     data.idToDrawable.set(id, drawableId);
-    data.subpaths.push([]);
+    data.subpaths.push(EMPTY_SUBPATHS);
     data.circles.push(centers.map(([x, y]) => ({ x, y, r })));
+    data.circleCount += centers.length;
     data.ids.push(id);
     data.lineWidths.push(0);
-    data.joins.push("bevel");
-    data.miterLimits.push(DEFAULT_MITER_LIMIT);
-    data.caps.push("butt");
+    data.joins = pushCode(data.joins, 0, drawableId);
+    data.caps = pushCode(data.caps, 0, drawableId);
+    data.miterLimits = pushLimit(data.miterLimits, DEFAULT_MITER_LIMIT, drawableId);
     // A lone point carries its center as the glyph anchor, so screen-space declutter can act on
     // analytic points (rendering reads `pointCenters`, and screen-mode hit-testing already used
     // the lone center as its anchor — so this only newly enables declutter, nothing else changes).
     // A MultiPoint has no single anchor.
     data.anchors.push(centers.length === 1 ? [centers[0]![0], centers[0]![1]] : null);
     // Zero fill+stroke range to keep ranges index-aligned with drawableId.
-    const fillVertexOffset = data.fillVerts.length / 3;
-    const strokeVertexOffset = data.strokeVerts.length / 3;
+    const fillVertexOffset = data.fillVerts.n / 3;
+    const strokeVertexOffset = data.strokeVerts.n / 3;
     data.ranges.push({
-      fill: { vertexOffset: fillVertexOffset, vertexCount: 0, indexOffset: data.fillIdx.length, indexCount: 0 },
-      stroke: { vertexOffset: strokeVertexOffset, vertexCount: 0, indexOffset: data.strokeIdx.length, indexCount: 0 },
+      fill: { vertexOffset: fillVertexOffset, vertexCount: 0, indexOffset: data.fillIdx.n, indexCount: 0 },
+      stroke: { vertexOffset: strokeVertexOffset, vertexCount: 0, indexOffset: data.strokeIdx.n, indexCount: 0 },
     });
-    // Defaults: transparent colors, visible flag (bit 0).
-    data.fillColors.push(0, 0, 0, 0);
-    data.strokeColors.push(0, 0, 0, 0);
+    // Defaults: transparent colors (zero bytes), visible flag (bit 0).
+    data.fillColors.extend(4);
+    data.strokeColors.extend(4);
     data.flags.push(1);
   }
 
@@ -370,24 +552,20 @@ export class Scene {
   /** Set a drawable's fill color (any CSS color string). Hot-swappable. */
   setFill(name: string, id: string | number, color: string): void {
     const { data, drawableId } = this.drawableIdOf(name, id);
-    writeColor(data.fillColors, drawableId, color);
+    writeColor(data.fillColors.a, drawableId, color);
   }
 
   /** Set a drawable's stroke color (any CSS color string). Hot-swappable. */
   setStroke(name: string, id: string | number, color: string): void {
     const { data, drawableId } = this.drawableIdOf(name, id);
-    writeColor(data.strokeColors, drawableId, color);
+    writeColor(data.strokeColors.a, drawableId, color);
   }
 
-  /** Set a drawable's flag byte (e.g. bit 0 = visible). Hot-swappable. */
+  /** Set a drawable's flag byte (e.g. bit 0 = visible). Hot-swappable. Writes the typed
+   *  storage directly, so any {@link flagsView}/{@link styleTables} view sees it. */
   setFlag(name: string, id: string | number, flags: number): void {
     const { data, drawableId } = this.drawableIdOf(name, id);
-    const v = flags & 0xff;
-    data.flags[drawableId] = v;
-    // Keep the typed mirror in lockstep when current; a stale mirror (drawable set grew)
-    // is rebuilt from the boxed array on the next flagsView() access instead.
-    const view = data.flagsView;
-    if (view && view.length === data.flags.length) view[drawableId] = v;
+    data.flags.a[drawableId] = flags & 0xff;
   }
 
   /**
@@ -422,59 +600,49 @@ export class Scene {
    * Apply a per-anchor-group visibility verdict (1 = keep, 0 = hide) to the flag bytes, in
    * place — one linear pass over the cached {@link DeclutterIndex}, with no per-id Map lookups.
    * Drawables with no anchor (`groupOf` = -1) always stay visible. `visibleByGroup` is indexed
-   * by the same group index as `ax`/`ay`.
+   * by the same group index as `ax`/`ay`. Writes the typed flags storage directly — the
+   * {@link flagsView} the per-frame path hands to backends aliases it (#208).
    */
   writeDeclutterFlags(name: string, visibleByGroup: Uint8Array): void {
     const data = this.get(name);
     const { groupOf } = data.declutterIndex ?? this.declutterIndex(name);
-    const flags = data.flags;
-    const view = this.ensureFlagsView(data); // typed mirror, kept in lockstep (#208)
-    for (let i = 0; i < flags.length; i++) {
+    const flags = data.flags.a;
+    const n = data.flags.n;
+    for (let i = 0; i < n; i++) {
       const g = groupOf[i]!;
-      const v = g < 0 || visibleByGroup[g] ? 1 : 0;
-      flags[i] = v;
-      view[i] = v;
+      flags[i] = g < 0 || visibleByGroup[g] ? 1 : 0;
     }
   }
 
   /**
    * A LIVE typed view of a group's per-drawable flag bytes (bit 0 = visible): the SAME
-   * `Uint8Array` instance across calls — zero per-call allocation — kept in sync in place
-   * by the flag writers ({@link setFlag}, {@link writeDeclutterFlags}) and rebuilt only
-   * when the drawable set changes (append grows it; a group rebuild replaces it). This is
-   * what the flags-only per-frame path (#208) passes by reference to
-   * `Backend.updateLayerFlags`, instead of the O(9·drawableCount)-bytes
-   * {@link styleTables} snapshot. Callers must treat it as read-only and must not retain
-   * it across drawable-set changes.
+   * `Uint8Array` instance across calls — zero per-call allocation — aliasing the Scene's
+   * typed flags storage directly (#207 made #208's mirror the primary storage), so the
+   * flag writers ({@link setFlag}, {@link writeDeclutterFlags}) are visible through it
+   * with no double-write. Replaced only when the drawable set changes (append grows it;
+   * a group rebuild replaces it). This is what the flags-only per-frame path (#208)
+   * passes by reference to `Backend.updateLayerFlags`, instead of the
+   * O(9·drawableCount)-bytes {@link styleTables} snapshot. Callers must treat it as
+   * read-only and must not retain it across drawable-set changes.
    */
   flagsView(name: string): Uint8Array {
-    return this.ensureFlagsView(this.get(name));
-  }
-
-  /** The group's persistent typed flags mirror, (re)built from the boxed array when
-   *  missing or stale (drawable set grew). O(1) when current. */
-  private ensureFlagsView(data: GroupData): Uint8Array {
-    let view = data.flagsView;
-    if (!view || view.length !== data.flags.length) {
-      view = Uint8Array.from(data.flags);
-      data.flagsView = view;
-    }
-    return view;
+    return this.get(name).flags.view();
   }
 
   /** Build the vector view of one drawable at index `i` (shared by drawables()/drawableOf()). */
   private vectorAt(data: GroupData, i: number): DrawableVector {
+    const fc = data.fillColors.a, sc = data.strokeColors.a, o = i * 4;
     return {
       id: data.ids[i]!,
       subpaths: data.subpaths[i]!,
-      fill: [data.fillColors[i * 4]!, data.fillColors[i * 4 + 1]!, data.fillColors[i * 4 + 2]!, data.fillColors[i * 4 + 3]!],
-      stroke: [data.strokeColors[i * 4]!, data.strokeColors[i * 4 + 1]!, data.strokeColors[i * 4 + 2]!, data.strokeColors[i * 4 + 3]!],
-      lineWidth: data.lineWidths[i]!,
-      lineJoin: data.joins[i]!,
-      miterLimit: data.miterLimits[i]!,
-      lineCap: data.caps[i]!,
-      flags: data.flags[i]!,
-      circles: data.circles[i]!,
+      fill: [fc[o]!, fc[o + 1]!, fc[o + 2]!, fc[o + 3]!],
+      stroke: [sc[o]!, sc[o + 1]!, sc[o + 2]!, sc[o + 3]!],
+      lineWidth: data.lineWidths.a[i]!,
+      lineJoin: data.joins ? JOIN_NAMES[data.joins.a[i]!]! : "bevel",
+      miterLimit: data.miterLimits ? data.miterLimits.a[i]! : DEFAULT_MITER_LIMIT,
+      lineCap: data.caps ? CAP_NAMES[data.caps.a[i]!]! : "butt",
+      flags: data.flags.a[i]!,
+      circles: data.circles[i] ?? EMPTY_CIRCLES,
       anchor: data.anchors[i]!,
     };
   }
@@ -496,49 +664,52 @@ export class Scene {
     return i === undefined ? null : this.vectorAt(data, i);
   }
 
-  /** Snapshot the per-drawable color/flag tables (see {@link StyleTables}). */
+  /**
+   * The per-drawable color/flag tables (see {@link StyleTables}) as LIVE views of the
+   * group's typed storage — O(1), zero copies (#207; previously an O(drawableCount)
+   * snapshot per call). Later `setFill`/`setStroke`/`setFlag` writes are visible through
+   * the views; an append makes them stale (backends always receive the drawable-set
+   * change as a setLayers/updateLayer/appendToLayer first). Consumers must not mutate
+   * or retain them across drawable-set changes.
+   */
   styleTables(name: string): StyleTables {
     const data = this.get(name);
     return {
-      fillColors: new Uint8Array(data.fillColors),
-      strokeColors: new Uint8Array(data.strokeColors),
-      flags: new Uint8Array(data.flags),
+      fillColors: data.fillColors.view(),
+      strokeColors: data.strokeColors.view(),
+      flags: data.flags.view(),
     };
   }
 
-  /** Assemble GPU-ready typed arrays for a group. */
+  /** Assemble GPU-ready typed arrays for a group. O(1) views of the typed storage for
+   *  everything except `pointCenters` (assembled fresh, O(pointCount) — it interleaves
+   *  the drawableId per circle). See {@link GroupBuffers} for the sharing contract. */
   buffers(name: string): GroupBuffers {
     const data = this.get(name);
-    // Build the pointCenters buffer: stride 4 = [x, y, radius, drawableId].
-    const pointFlat: number[] = [];
-    for (let i = 0; i < data.circles.length; i++) {
-      for (const c of data.circles[i]!) {
-        pointFlat.push(c.x, c.y, c.r, i);
-      }
-    }
     return {
-      fillVertices: new Float32Array(data.fillVerts),
-      fillIndices: new Uint32Array(data.fillIdx),
-      strokeVertices: new Float32Array(data.strokeVerts),
-      strokeIndices: new Uint32Array(data.strokeIdx),
-      fillColors: new Uint8Array(data.fillColors),
-      strokeColors: new Uint8Array(data.strokeColors),
-      flags: new Uint8Array(data.flags),
+      fillVertices: data.fillVerts.view(),
+      fillIndices: data.fillIdx.view(),
+      strokeVertices: data.strokeVerts.view(),
+      strokeIndices: data.strokeIdx.view(),
+      fillColors: data.fillColors.view(),
+      strokeColors: data.strokeColors.view(),
+      flags: data.flags.view(),
       drawableCount: data.ranges.length,
-      pointCenters: new Float32Array(pointFlat),
-      pointCount: pointFlat.length / 4,
-      fillAnchors: new Float32Array(data.fillAnchors),
-      strokeAnchors: new Float32Array(data.strokeAnchors),
+      pointCenters: assemblePointCenters(data, 0),
+      pointCount: data.circleCount,
+      fillAnchors: data.fillAnchors.view(),
+      strokeAnchors: data.strokeAnchors.view(),
       ranges: data.ranges,
     };
   }
 
   /**
    * GPU-ready buffers for ONLY the drawables appended at/after `fromDrawable` —
-   * the tail slices, computed in O(new). A backend whose buffers mirror the group
-   * 1:1 (append-only, same order) can apply this by appending: the index values are
-   * group-ABSOLUTE (no rebasing), because the new vertices sit at the same positions
-   * the group placed them. `fromDrawable >= drawableCount` yields an empty delta.
+   * the tail slices as O(1) views (pointCenters assembled in O(new circles)). A
+   * backend whose buffers mirror the group 1:1 (append-only, same order) can apply
+   * this by appending: the index values are group-ABSOLUTE (no rebasing), because
+   * the new vertices sit at the same positions the group placed them.
+   * `fromDrawable >= drawableCount` yields an empty delta.
    */
   appendedBuffers(name: string, fromDrawable: number): GroupBufferDelta {
     const data = this.get(name);
@@ -557,20 +728,18 @@ export class Scene {
     const r = data.ranges[from]!;
     const fv = r.fill.vertexOffset, fi = r.fill.indexOffset;
     const sv = r.stroke.vertexOffset, si = r.stroke.indexOffset;
-    // New circles only; drawableId stays the absolute group index for texture lookup.
-    const pointFlat: number[] = [];
-    for (let i = from; i < dc; i++) for (const c of data.circles[i]!) pointFlat.push(c.x, c.y, c.r, i);
     return {
-      fillVertices: new Float32Array(data.fillVerts.slice(fv * 3)),
-      fillIndices: new Uint32Array(data.fillIdx.slice(fi)),
-      strokeVertices: new Float32Array(data.strokeVerts.slice(sv * 3)),
-      strokeIndices: new Uint32Array(data.strokeIdx.slice(si)),
-      fillColors: new Uint8Array(data.fillColors.slice(from * 4)),
-      strokeColors: new Uint8Array(data.strokeColors.slice(from * 4)),
-      flags: new Uint8Array(data.flags.slice(from)),
-      pointCenters: new Float32Array(pointFlat),
-      fillAnchors: new Float32Array(data.fillAnchors.slice(fv * 2)),
-      strokeAnchors: new Float32Array(data.strokeAnchors.slice(sv * 2)),
+      fillVertices: data.fillVerts.tail(fv * 3),
+      fillIndices: data.fillIdx.tail(fi),
+      strokeVertices: data.strokeVerts.tail(sv * 3),
+      strokeIndices: data.strokeIdx.tail(si),
+      fillColors: data.fillColors.tail(from * 4),
+      strokeColors: data.strokeColors.tail(from * 4),
+      flags: data.flags.tail(from),
+      // New circles only; drawableId stays the absolute group index for texture lookup.
+      pointCenters: assemblePointCenters(data, from),
+      fillAnchors: data.fillAnchors.tail(fv * 2),
+      strokeAnchors: data.strokeAnchors.tail(sv * 2),
       drawableCount: dc,
       fromDrawable: from,
       // Absolute offsets (into the full group arrays), matching the group-absolute
@@ -578,6 +747,30 @@ export class Scene {
       ranges: data.ranges.slice(from),
     };
   }
+}
+
+/** Build the stride-4 [x, y, r, drawableId] point-centers array for drawables at/after
+ *  `from` — one sized allocation (no boxed intermediate), O(circles in range). */
+function assemblePointCenters(data: GroupData, from: number): Float32Array {
+  const dc = data.ranges.length;
+  let count = data.circleCount;
+  if (from > 0) {
+    count = 0;
+    for (let i = from; i < dc; i++) count += data.circles[i]?.length ?? 0;
+  }
+  const out = new Float32Array(count * 4);
+  let o = 0;
+  for (let i = from; i < dc; i++) {
+    const cs = data.circles[i];
+    if (!cs) continue;
+    for (const c of cs) {
+      out[o++] = c.x;
+      out[o++] = c.y;
+      out[o++] = c.r;
+      out[o++] = i;
+    }
+  }
+  return out;
 }
 
 /** Clamp to a 0–255 byte (CSS clamps out-of-range channels; Uint8Array would wrap). */
@@ -593,7 +786,7 @@ function toByte(v: number): number {
  * a <= 0 produce Rgb(NaN, NaN, NaN, 0). We treat that as the zero color [0,0,0,0].
  * Only NaN opacity (a genuinely unparseable string) is a typo worth failing fast on.
  */
-function writeColor(table: number[], drawableId: number, color: string): void {
+function writeColor(table: Uint8Array, drawableId: number, color: string): void {
   const c = rgb(color);
   const off = drawableId * 4;
   if (Number.isNaN(c.r)) {
