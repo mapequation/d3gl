@@ -87,43 +87,60 @@ describe("#211 incremental LOD geometry during node-drag", () => {
   const colors = leafColors(N);
   const resetGeometry = (): void => computeLODGeometry(tree, graph, radii, graph.strength, undefined, colors);
 
+  /** Index of the first differing element, or -1 (plain scan — per-element `expect` is too slow on CI). */
+  const firstDiff = (a: ArrayLike<number>, b: ArrayLike<number>): number => {
+    for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return i;
+    return -1;
+  };
+
   for (const heldCount of [1, 100]) {
-    it(`matches a from-scratch recompute after a ${MOVES}-move drag of ${heldCount} held leaf(s) — exact sums, conservative extent, exact on release`, () => {
-      resetGeometry();
-      const held = Array.from({ length: heldCount }, (_, k) => (k * 37) % N);
-      const styleBefore = { radius: tree.radius.slice(), weight: tree.weight.slice(), border: tree.border.slice(), color: tree.color.slice() };
+    it(
+      `matches a from-scratch recompute after a ${MOVES}-move drag of ${heldCount} held leaf(s) — exact sums, conservative extent, exact on release`,
+      () => {
+        resetGeometry();
+        const held = Array.from({ length: heldCount }, (_, k) => (k * 37) % N);
+        const styleBefore = { radius: tree.radius.slice(), weight: tree.weight.slice(), border: tree.border.slice(), color: tree.color.slice() };
 
-      for (let m = 0; m < MOVES; m++) {
-        for (const i of held) {
-          graph.positions[i * 2] = graph.positions[i * 2]! + 2;
-          graph.positions[i * 2 + 1] = graph.positions[i * 2 + 1]! + 1;
+        for (let m = 0; m < MOVES; m++) {
+          for (const i of held) {
+            graph.positions[i * 2] = graph.positions[i * 2]! + 2;
+            graph.positions[i * 2 + 1] = graph.positions[i * 2 + 1]! + 1;
+          }
+          updateLODPositionsForLeaves(tree, graph.positions, held, parent);
         }
-        updateLODPositionsForLeaves(tree, graph.positions, held, parent);
-      }
 
-      // From-scratch reference over the same (moved) positions.
-      const ref: LODTree = { ...tree, cx: new Float32Array(tree.size), cy: new Float32Array(tree.size), extent: new Float32Array(tree.size), count: new Uint32Array(tree.size) };
-      computeLODPositions(ref, graph.positions);
+        // From-scratch reference over the same (moved) positions.
+        const ref: LODTree = { ...tree, cx: new Float32Array(tree.size), cy: new Float32Array(tree.size), extent: new Float32Array(tree.size), count: new Uint32Array(tree.size) };
+        computeLODPositions(ref, graph.positions);
 
-      for (let g = 0; g < tree.size; g++) {
-        // Sum aggregates (centroids): exact up to Float32 accumulation across the drag.
-        expect(Math.abs(tree.cx[g]! - ref.cx[g]!)).toBeLessThan(0.1);
-        expect(Math.abs(tree.cy[g]! - ref.cy[g]!)).toBeLessThan(0.1);
-        // Max aggregate (extent): conservative superset during the drag — never below the true extent.
-        expect(tree.extent[g]!).toBeGreaterThanOrEqual(ref.extent[g]! - 1e-3);
-      }
-      // Style-derived geometry is untouched by drag moves.
-      expect(tree.radius).toEqual(styleBefore.radius);
-      expect(tree.weight).toEqual(styleBefore.weight);
-      expect(tree.border).toEqual(styleBefore.border);
-      expect(tree.color).toEqual(styleBefore.color);
+        let maxCentroidErr = 0;
+        let extentViolations = 0;
+        for (let g = 0; g < tree.size; g++) {
+          // Sum aggregates (centroids): exact up to Float32 accumulation across the drag.
+          const ex = Math.abs(tree.cx[g]! - ref.cx[g]!);
+          const ey = Math.abs(tree.cy[g]! - ref.cy[g]!);
+          if (ex > maxCentroidErr) maxCentroidErr = ex;
+          if (ey > maxCentroidErr) maxCentroidErr = ey;
+          // Max aggregate (extent): conservative superset during the drag — never below the true extent.
+          if (tree.extent[g]! < ref.extent[g]! - 1e-3) extentViolations++;
+        }
+        expect(maxCentroidErr).toBeLessThan(0.1);
+        expect(extentViolations).toBe(0);
 
-      // Release (settleAfterDrag): one exact pass — bit-identical to the from-scratch reference.
-      computeLODPositions(tree, graph.positions);
-      expect(tree.cx).toEqual(ref.cx);
-      expect(tree.cy).toEqual(ref.cy);
-      expect(tree.extent).toEqual(ref.extent);
-    });
+        // Style-derived geometry is untouched by drag moves.
+        expect(firstDiff(tree.radius, styleBefore.radius)).toBe(-1);
+        expect(firstDiff(tree.weight, styleBefore.weight)).toBe(-1);
+        expect(firstDiff(tree.border, styleBefore.border)).toBe(-1);
+        expect(firstDiff(tree.color, styleBefore.color)).toBe(-1);
+
+        // Release (settleAfterDrag): one exact pass — bit-identical to the from-scratch reference.
+        computeLODPositions(tree, graph.positions);
+        expect(firstDiff(tree.cx, ref.cx)).toBe(-1);
+        expect(firstDiff(tree.cy, ref.cy)).toBe(-1);
+        expect(firstDiff(tree.extent, ref.extent)).toBe(-1);
+      },
+      30_000,
+    );
   }
 
   it("deterministic signature: one move writes only the held leaves' ancestor chains, never the tree", () => {
