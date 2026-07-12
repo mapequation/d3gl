@@ -101,4 +101,28 @@ describe("network.labels() — frontier labels (#105 N7b)", () => {
     net.destroy();
     h.remove();
   });
+
+  it("labels come pre-styled by default; `style` overrides inline and restyles on re-call (#224)", async () => {
+    const h = host();
+    const net = network(h, { width: 200, height: 200 });
+    await net.whenReady();
+    const g = buildGraph({ nodeCount: 2, source: [0], target: [1], directed: false });
+    net.data(g).style({ nodeRadius: 5 }).layout({ backend: "positions", positions: new Float32Array([60, 60, 140, 140]) });
+
+    // Default: no className, no style → the built-in look lands on the overlay elements.
+    net.labels({ labelOf: (id) => `n${id}` });
+    net.setTransform({ k: 1, x: 0, y: 0 });
+    let els = labelEls(h);
+    expect(els.length).toBeGreaterThan(0);
+    expect(els.every((e) => e.style.font.includes("11px"))).toBe(true); // DEFAULT_LABEL_STYLE
+    expect(els.every((e) => e.style.textShadow.includes("3px"))).toBe(true); // the white halo
+
+    // Re-call with a partial `style`: merged over the default, and the overlay is restyled.
+    net.labels({ labelOf: (id) => `n${id}`, style: { color: "rgb(31, 41, 55)" } });
+    els = labelEls(h);
+    expect(els.every((e) => e.style.color === "rgb(31, 41, 55)")).toBe(true); // the override applied
+    expect(els.every((e) => e.style.font.includes("11px"))).toBe(true); // the rest of the default kept
+    net.destroy();
+    h.remove();
+  });
 });

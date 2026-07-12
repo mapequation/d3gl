@@ -14,5 +14,5 @@
  */
 export { cullLabels, labelGeometry } from "./cull.js";
 export type { LabelBox, CullOptions, TextAnchor, LabelGeometry } from "./cull.js";
-export { LabelLayer } from "./label-layer.js";
-export type { LabelAnchor } from "./label-layer.js";
+export { LabelLayer, resolveLabelStyle, DEFAULT_LABEL_STYLE, DEFAULT_LABEL_TEXT } from "./label-layer.js";
+export type { LabelAnchor, LabelStyle } from "./label-layer.js";
