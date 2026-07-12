@@ -3,7 +3,7 @@ import { networkLayers, networkLayersFromCache, noLodStyleCache, frontierCircles
 import { rgb } from "d3-color";
 import { ForceLayout, seedPositions, type ForceParams } from "./force.js";
 import { multilevelLayout, type CoarsenOptions } from "./coarsen.js";
-import { buildLODTree, buildSpatialLODTree, computeLODGeometry, computeLODStyle, cut, declutterFrontier, pickFrontier, regionFrontier, visibleWorldRect, leavesUnder, ancestorAwareSelected, type LODTree, type SpatialLODOptions } from "./lod.js";
+import { buildLODTree, buildSpatialLODTree, computeLODGeometry, computeLODPositions, computeLODStyle, updateLODPositionsForLeaves, cut, declutterFrontier, pickFrontier, regionFrontier, visibleWorldRect, leavesUnder, ancestorAwareSelected, type LODTree, type SpatialLODOptions } from "./lod.js";
 import { LabelLayer, placeLabels, type LabelAnchor } from "../labels/label-layer.js";
 import { buildModuleLODTree, type ModuleNode } from "./modules.js";
 import { moduleColors, type ModulePathNode, type ModuleColorOptions } from "./module-colors.js";
@@ -1824,17 +1824,17 @@ export class Network extends BaseEngine {
       applyHeld();
       handle.pin(heldIds, heldPos);
       this.dragReapply = applyHeld;
-      this.repaintDuringDrag();
+      this.repaintDuringDrag(heldIds); // only the held set moved; streamed frames repaint in full (#211)
       return {
-        move: (mx, my) => { setDelta(mx, my); applyHeld(); handle.pin(heldIds, heldPos); this.repaintDuringDrag(); },
-        end: () => { handle.unpin(); this.dragReapply = null; },
+        move: (mx, my) => { setDelta(mx, my); applyHeld(); handle.pin(heldIds, heldPos); this.repaintDuringDrag(heldIds); },
+        end: () => { handle.unpin(); this.dragReapply = null; this.settleAfterDrag(); },
       };
     }
 
     // positions / no live worker: translate the held set under the cursor, no reheat.
     return {
-      move: (mx, my) => { setDelta(mx, my); applyHeld(); this.repaintDuringDrag(); },
-      end: () => {},
+      move: (mx, my) => { setDelta(mx, my); applyHeld(); this.repaintDuringDrag(heldIds); },
+      end: () => this.settleAfterDrag(),
     };
   }
 
@@ -1853,10 +1853,42 @@ export class Network extends BaseEngine {
     return (hit.members?.() ?? [id]) as number[];
   }
 
-  /** Recompute the LOD geometry from the moved positions (skipped on a worker-streamed tree — the
-   *  worker owns it) and re-emit + repaint. The per-frame paint shared by every drag backend (#140). */
-  private repaintDuringDrag(): void {
-    if (!this.lodWorkerTree) this.recomputeLODGeometry();
+  /**
+   * Update the LOD geometry from the moved positions and re-emit + repaint. The per-frame paint
+   * shared by every drag backend (#140); a drag move is a continuous pointer interaction, so this
+   * must never run O(tree size) work (#211):
+   *
+   * - **Worker-streamed tree**: skipped entirely — the worker owns the geometry.
+   * - **`held` given** (positions / worker / gpu drag moves — only the held leaves moved since the
+   *   last pass): incremental {@link updateLODPositionsForLeaves} along the held leaves' ancestor
+   *   chains, O(held · depth). Extents widen conservatively; {@link settleAfterDrag} makes them
+   *   exact on release.
+   * - **No `held`** (the `force` drag's rAF tick moved *every* free node): one full
+   *   {@link computeLODPositions} pass — O(tree size), matching the tick's own O(nodes + edges).
+   *
+   * Style-derived geometry (`radius`/`weight`/`border`/`color`) is position-independent, so no
+   * drag frame recomputes it (the old full `recomputeLODGeometry` re-ran it — with its O(tree)
+   * HCL colour aggregation — on every move). The tree-build fallback stays for a drag that starts
+   * before any geometry pass ran.
+   */
+  private repaintDuringDrag(held?: Uint32Array): void {
+    const graph = this.graph;
+    if (!this.lodWorkerTree && graph) {
+      const tree = this.lodReady() ? this.lodTree : null;
+      if (!tree) this.recomputeLODGeometry(); // no tree/geometry yet — build once (no-op when LOD is off)
+      else if (held) updateLODPositionsForLeaves(tree, graph.positions, held, this.treeParent(tree));
+      else computeLODPositions(tree, graph.positions);
+    }
+    this.rebuild();
+  }
+
+  /** One exact position-geometry pass when a drag releases (#211), replacing the drag's grow-only
+   *  conservative extents with exact ones (a full {@link computeLODPositions} — O(tree size), once
+   *  per release, click-frequency). Skipped on a worker-streamed tree (the worker owns it — its
+   *  next frame is exact) and when LOD has no main-thread geometry. */
+  private settleAfterDrag(): void {
+    if (this.lodWorkerTree || !this.lodReady() || !this.lodTree || !this.graph) return;
+    computeLODPositions(this.lodTree, this.graph.positions);
     this.rebuild();
   }
 
