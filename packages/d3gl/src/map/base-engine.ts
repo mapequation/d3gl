@@ -23,8 +23,10 @@ export interface HoverHit {
   members?: () => (string | number)[];
 }
 
-/** A registered instanced selection lane (#108-B). BaseEngine drives its re-emit + resolves its picks. */
-export interface InstancedLaneEntry {
+/** A registered instanced selection lane (#108-B). BaseEngine drives its re-emit + resolves its picks.
+ *  Generic over the datum type `D` its interaction block resolves (see {@link LaneInteractive});
+ *  stored datum-erased in the engine's registry via the {@link BaseEngine.registerInstancedLane} overload. */
+export interface InstancedLaneEntry<D = unknown> {
   lane: InstancedLane;
   /** The instanced layer names this lane emits — cleared then re-added in this order each emit (draw order). */
   layerNames: readonly string[];
@@ -43,7 +45,7 @@ export interface InstancedLaneEntry {
    * recolor). Absent ⇒ pick-only (the pre-N7c-2 behavior: `on("hover"|"click")` fire, but no
    * managed selection or visual highlight).
    */
-  interactive?: LaneInteractive;
+  interactive?: LaneInteractive<D>;
   /**
    * GPU-readback link picking (#141). When set, {@link BaseEngine.pick} consults the backend's pick
    * FBO ({@link Backend.pickInstanced}) *after* the CPU `lane.pick` misses (so a node drawn over a
@@ -61,15 +63,15 @@ export interface InstancedLaneEntry {
  * instanced glyphs have no Scene drawables to recolor; `selection.others` dimming is therefore not
  * applied on lanes (selected glyphs get a ring instead).
  */
-export interface LaneInteractive {
+export interface LaneInteractive<D = unknown> {
   /** The `hit.layer` value this lane owns — the key under which selection/hover ids are tracked. */
   layer: string;
   /** Per-layer interaction options (selectable / hover / tooltip / selection). */
-  options: InteractiveLayerOptions;
+  options: InteractiveLayerOptions<D>;
   /** Companion highlight lane re-emitted when this layer's selection/hover set changes (the ring overlay). */
   highlightLane: string;
   /** Datum for a selected/hovered id — used to rebuild hits in {@link BaseEngine.selection}. */
-  datumOf(id: string | number): unknown;
+  datumOf(id: string | number): D | null;
   /** Underlying source ids `id` represents, for {@link HoverHit.members} (subtree leaves / absorbed set). */
   members(id: string | number): (string | number)[];
 }
@@ -81,7 +83,7 @@ export interface LaneInteractive {
  * hover/tooltip dispatch read. `Plot.layer()`/`Plot.points()` and `GeoMap.layer()` forward them
  * into the {@link LayerSpec} via {@link BaseEngine.interactionFields}, so the contract has one home.
  */
-export interface InteractiveLayerOptions<D = any> {
+export interface InteractiveLayerOptions<D = unknown> {
   /** Styles for {@link BaseEngine.select}: the selected set and its complement.
    *  Defaults: selected keeps the base style; others `{ opacity: 0.3 }`. */
   selection?: SelectionOptions;
@@ -124,12 +126,20 @@ export interface NodeDragSession {
   end(): void;
 }
 
-export interface LayerSpec {
+/**
+ * A registered retained layer, generic over its datum type `D`. Engines construct a
+ * `LayerSpec<D>` with the concrete datum from `layer()`/`points()` registration, so `data`
+ * and its accessors (`fill`/`stroke`/`tooltip`/`hover`) stay bound to the same `D` and can't
+ * detype. {@link BaseEngine} stores specs datum-erased (`LayerSpec<unknown>` — the engine
+ * never inspects a datum, it only pairs `data[i]` back with the layer's own accessors);
+ * the typed→erased hand-off happens at the {@link BaseEngine.registerLayer} overload.
+ */
+export interface LayerSpec<D = unknown> {
   name: string;
-  data: any[];
+  data: D[];
   ids: (string | number)[];
-  fill?: Accessor<any, string>;
-  stroke?: Accessor<any, string>;
+  fill?: Accessor<D, string>;
+  stroke?: Accessor<D, string>;
   clipTo?: string;
   sizeMode?: "world" | "screen";
   /** When true, this layer is dropped from the render while the user is interacting
@@ -146,20 +156,23 @@ export interface LayerSpec {
   /** Styles applied by {@link BaseEngine.select} to the selected set / its complement. */
   selection?: SelectionOptions;
   /** Hover-highlight for this layer: `true`/style/fn, or a `{ hovered?, others? }` object (#162). */
-  hover?: HoverOption | HoverOptions;
+  hover?: HoverOption<D> | HoverOptions<D>;
   /** Tooltip content for the hovered drawable (string / element / null = hide). */
-  tooltip?: (d: any, id: string | number) => string | HTMLElement | null;
+  tooltip?: (d: D, id: string | number) => string | HTMLElement | null;
   /** Opt this layer into click-driven selection (see {@link InteractiveLayerOptions.selectable}). */
   selectable?: boolean | { multi?: boolean };
   build: (g: GroupBuilder) => void;   // rebuilds the Scene group (geo or draw)
 }
 
-export interface PassThroughSpec {
+/** A pass-through (non-retained) layer, generic over its datum type `D` — `source` and
+ *  `buildItem` stay bound to the same `D`. Stored datum-erased like {@link LayerSpec}, with
+ *  the typed→erased hand-off at the {@link BaseEngine.registerPassThrough} overload. */
+export interface PassThroughSpec<D = unknown> {
   name: string;
   /** User data source: an array, or a function re-invoked each full repaint. */
-  source: unknown[] | (() => unknown[]);
+  source: readonly D[] | (() => readonly D[]);
   /** Build the draw item for a datum, or null to cull. Built by the subclass. */
-  buildItem: (d: unknown, i: number) => DrawItem | null;
+  buildItem: (d: D, i: number) => DrawItem | null;
   sizeMode?: "world" | "screen";
   clipTo?: string;
 }
@@ -456,11 +469,15 @@ export abstract class BaseEngine {
   /** Pull the declarative interaction options out of a layer-options object into the
    *  {@link LayerSpec} fields. Shared by `Plot.layer()`/`Plot.points()` and `GeoMap.layer()`
    *  so the hover/tooltip/selection contract lives in exactly one place. */
-  protected interactionFields(opts: InteractiveLayerOptions): Pick<LayerSpec, "selection" | "hover" | "tooltip" | "selectable"> {
+  protected interactionFields<D>(opts: InteractiveLayerOptions<D>): Pick<LayerSpec<D>, "selection" | "hover" | "tooltip" | "selectable"> {
     return { selection: opts.selection, hover: opts.hover, tooltip: opts.tooltip, selectable: opts.selectable };
   }
 
-  /** Register (or replace) an instanced selection lane and emit it once if a backend is ready. */
+  /** Register (or replace) an instanced selection lane and emit it once if a backend is ready.
+   *  The generic overload is the typed→erased seam: engines register with their concrete datum
+   *  (`InstancedLaneEntry<D>`); the registry stores it datum-erased (the engine only threads a
+   *  lane's datum back through its own `datumOf`/`options`, never inspecting it). */
+  protected registerInstancedLane<D>(name: string, entry: InstancedLaneEntry<D>): void;
   protected registerInstancedLane(name: string, entry: InstancedLaneEntry): void {
     this.instancedLanes.set(name, entry);
     // An interactive lane needs the same pointer listeners as a Scene layer with these options
@@ -633,7 +650,7 @@ export abstract class BaseEngine {
     const ix = this.laneInteractiveFor(layer)?.ix;
     const sel = ix ? ix.options.selectable : this.specs.find((s) => s.name === layer)?.selectable;
     if (!sel) return { on: false, multi: false };
-    return { on: true, multi: sel !== true && (sel as { multi?: boolean }).multi === true };
+    return { on: true, multi: sel !== true && sel.multi === true };
   }
 
   /** Show the hover ring for one instanced-lane glyph (`id`), clearing the previous lane hover.
@@ -675,7 +692,11 @@ export abstract class BaseEngine {
     return out.length ? out : [id];
   }
 
-  /** Register/replace a layer: build its Scene group, apply accessors, index, push. */
+  /** Register/replace a layer: build its Scene group, apply accessors, index, push.
+   *  The generic overload is the typed→erased seam: engines construct a `LayerSpec<D>` with
+   *  their concrete datum; storage is datum-erased (`LayerSpec<unknown>`) because the engine
+   *  only ever pairs `spec.data[i]` with the same spec's accessors — it never inspects a datum. */
+  protected registerLayer<D>(spec: LayerSpec<D>): void;
   protected registerLayer(spec: LayerSpec): void {
     if (spec.name.endsWith(HIGHLIGHT_SUFFIX)) throw new Error(`layer name suffix "${HIGHLIGHT_SUFFIX}" is reserved`);
     this.scene.group(spec.name, spec.build);
@@ -722,7 +743,9 @@ export abstract class BaseEngine {
   /** Register a pass-through layer (called by subclasses for passThrough:true).
    *  Always stores the spec so a not-ready registration is replayed on backend install.
    *  When a backend IS live: activate it if supported, else remove the spec + throw
-   *  (an explicit unsupported backend, e.g. SVG). When no backend is live yet: defer. */
+   *  (an explicit unsupported backend, e.g. SVG). When no backend is live yet: defer.
+   *  The generic overload is the typed→erased seam (see {@link registerLayer}). */
+  protected registerPassThrough<D>(spec: PassThroughSpec<D>): void;
   protected registerPassThrough(spec: PassThroughSpec): void {
     this.ptSpecs.set(spec.name, spec);
     if (!this.handle) return; // not ready: keep the spec; install replay activates it
@@ -738,7 +761,7 @@ export abstract class BaseEngine {
   }
 
   /** Incremental draw: project just this batch and draw it on top (O(new)). */
-  protected appendPassThrough(name: string, items: unknown[]): void {
+  protected appendPassThrough(name: string, items: readonly unknown[]): void {
     const spec = this.ptSpecs.get(name);
     if (!spec || !this.handle) return;
     const batch = buildBatch(items, spec.buildItem);
@@ -746,7 +769,7 @@ export abstract class BaseEngine {
   }
 
   /** Resolve the current data array for a pass-through layer. */
-  private ptData(spec: PassThroughSpec): unknown[] {
+  private ptData(spec: PassThroughSpec): readonly unknown[] {
     return typeof spec.source === "function" ? spec.source() : spec.source;
   }
 
@@ -803,7 +826,7 @@ export abstract class BaseEngine {
    * other) so a duplicate throws before any mutation — the append is atomic. The
    * Scene-level dup guard remains as a backstop.
    */
-  protected appendToLayer(name: string, items: readonly any[], ids: readonly (string | number)[], build: (g: GroupBuilder) => void): void {
+  protected appendToLayer(name: string, items: readonly unknown[], ids: readonly (string | number)[], build: (g: GroupBuilder) => void): void {
     const spec = this.specs.find((s) => s.name === name);
     if (!spec) throw new Error(`unknown layer: ${name}`);
     if (items.length === 0) return;
@@ -908,8 +931,15 @@ export abstract class BaseEngine {
    * Also updates the managed selection set and fires `on("select")` with `ev = undefined`
    * (programmatic — no PointerEvent), so callers can observe programmatic selection the
    * same way they observe gesture selection.
+   *
+   * The predicate overload is generic over the layer's datum type `D` — annotate the
+   * parameter (`(d: MyDatum) => …`) or pass `select<MyDatum>(…)` to get a typed datum,
+   * mirroring d3-selection's caller-asserted datum generics. Prefer the layer handle's
+   * {@link LayerHandle.select}, which already knows `D` from registration.
    */
-  select(name: string, set: readonly (string | number)[] | ((d: any, i: number) => boolean) | null): this {
+  select(name: string, set: readonly (string | number)[] | null): this;
+  select<D = unknown>(name: string, predicate: (d: D, i: number) => boolean): this;
+  select(name: string, set: readonly (string | number)[] | ((d: unknown, i: number) => boolean) | null): this {
     // Lane-first: an interactive lane takes precedence over a same-named (empty placeholder) Scene spec.
     if (this.laneInteractiveFor(name)) {
       // Instanced lane: update the managed set + refresh the ring overlay (no Scene drawables to style).
@@ -925,7 +955,7 @@ export abstract class BaseEngine {
     // Resolve function selectors to an id set once (stored + used for styling).
     const resolved: Set<string | number> | null = set === null ? null
       : typeof set === "function"
-        ? new Set(spec.ids.filter((_, i) => (set as (d: any, i: number) => boolean)(spec.data[i], i)))
+        ? new Set(spec.ids.filter((_, i) => set(spec.data[i], i)))
         : new Set(set);
     // Update managed selection set (mirrors what the gesture does).
     if (resolved === null) this.selected.delete(name);
@@ -966,7 +996,12 @@ export abstract class BaseEngine {
    * layer's buffers are untouched, so the per-change cost is tessellating the
    * highlighted items only. `styleOrDraw` falls back to the layer's `hover` option,
    * then to the default white outline. `null` clears.
+   *
+   * The draw-fn overload is generic over the layer's datum type `D` (caller-asserted,
+   * like {@link select}'s predicate) so a custom highlight draw sees a typed datum.
    */
+  highlight(name: string, idOrIds: string | number | readonly (string | number)[] | null, style?: HighlightStyle): this;
+  highlight<D = unknown>(name: string, idOrIds: string | number | readonly (string | number)[] | null, draw: HighlightDraw<D>): this;
   highlight(
     name: string,
     idOrIds: string | number | readonly (string | number)[] | null,
@@ -1267,7 +1302,7 @@ export abstract class BaseEngine {
    */
   enableZoom(extent: [number, number] = [1, 100], onTransform?: (t: ViewTransform) => void): this {
     this.disableInteraction();
-    const sel = select(this.host as Element);
+    const sel = select<Element, unknown>(this.host);
     const behavior = d3zoom<Element, unknown>().scaleExtent(extent)
       // Reserve shift+drag for the marquee (#159) only when something is marquee-selectable — otherwise
       // keep d3-zoom's default (which pans on shift+drag). Shift+wheel still zooms (wheel is exempt).
@@ -1289,15 +1324,15 @@ export abstract class BaseEngine {
         onTransform?.(t);
       })
       .on("end", () => this.setInteracting(false));
-    (sel as any).call(behavior);
+    sel.call(behavior);
     this.zoomSel = sel;
     this.zoomBehavior = behavior;
     // Seed d3-zoom's internal transform from the engine's CURRENT view so a non-identity base
     // (e.g. a centering translate set via setTransform before enableZoom) is respected, and
     // zoom-to-cursor deltas measure from it rather than from identity.
     const t = this.transform;
-    (sel as any).call(behavior.transform, zoomIdentity.translate(t.x, t.y).scale(t.k));
-    this.interactionCleanup = () => { (sel as any).on(".zoom", null); this.zoomSel = null; this.zoomBehavior = null; };
+    sel.call(behavior.transform, zoomIdentity.translate(t.x, t.y).scale(t.k));
+    this.interactionCleanup = () => { sel.on(".zoom", null); this.zoomSel = null; this.zoomBehavior = null; };
     return this;
   }
 
@@ -1314,7 +1349,7 @@ export abstract class BaseEngine {
     if (!sel || !behavior) return;
     const t = this.transform;
     this.suppressZoomEmit = true;
-    (sel as any).call(behavior.transform, zoomIdentity.translate(t.x, t.y).scale(t.k));
+    sel.call(behavior.transform, zoomIdentity.translate(t.x, t.y).scale(t.k));
     this.suppressZoomEmit = false;
   }
   on(event: "hover" | "click", cb: (hit: HoverHit | null, ev: PointerEvent) => void): this;
@@ -1803,8 +1838,10 @@ export abstract class BaseEngine {
     }
     return out;
   }
-  private resolve<T>(a: Accessor<any, T> | undefined, d: any, i: number): T | undefined {
-    return typeof a === "function" ? (a as (d: any, i: number) => T)(d, i) : a;
+  /** Resolve a color accessor for one datum. Color-valued only (`string`), so the
+   *  constant/function union discriminates by `typeof` with no cast. */
+  private resolve(a: Accessor<unknown, string> | undefined, d: unknown, i: number): string | undefined {
+    return typeof a === "function" ? a(d, i) : a;
   }
   private applyAccessors(spec: LayerSpec, start = 0, present?: Set<string | number>): void {
     // A spec has one id per datum, but the built group may have fewer drawables —

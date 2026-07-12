@@ -476,8 +476,9 @@ export class Network extends BaseEngine {
   private readonly LINK_LAYER = "links";
   /** Re-cool tail (ticks) the main-thread `force` drag runs after release before the sim stops (#140). */
   private static readonly DRAG_COOL_FRAMES = 90;
-  /** Node interaction opts set via {@link interactive} (selection/hover/tooltip). Null = pick-only. */
-  private interactiveOpts: InteractiveLayerOptions | null = null;
+  /** Node interaction opts set via {@link interactive} (selection/hover/tooltip). Null = pick-only.
+   *  Datum-typed as {@link NetworkHit} — the node/aggregate a pick resolves to. */
+  private interactiveOpts: InteractiveLayerOptions<NetworkHit> | null = null;
   /** GPU-readback link picking opt-in (#141). Off ⇒ links carry no pick model and the lane has no
    *  `gpuPick`, so hover/click never resolves a link (zero added GPU cost). Toggled by {@link pickLinks}. */
   private pickLinksEnabled = false;
@@ -1547,7 +1548,7 @@ export class Network extends BaseEngine {
 
   /** Build the lane interaction block for the node layer (#105 N7c-2), or undefined when no
    *  `interactive()` opts are set (pick-only). `datumOf`/`members` are keyed by the node/aggregate id. */
-  private laneInteractive(datumOf: (id: number) => NetworkHit, members: (id: number) => number[]): LaneInteractive | undefined {
+  private laneInteractive(datumOf: (id: number) => NetworkHit, members: (id: number) => number[]): LaneInteractive<NetworkHit> | undefined {
     const opts = this.interactiveOpts;
     if (!opts) return undefined;
     return {
