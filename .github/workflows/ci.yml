@@ -34,3 +34,32 @@ jobs:
 
       - name: Build website (smoke)
         run: pnpm --filter @d3gl/website build
+
+  # At-scale perf-guard tier (#220): every env-gated node bench, executed with its
+  # assertions ON at a reduced-but-real N. Discovery is pattern-driven (any node test
+  # reading process.env.BENCH_* — see scripts/run-perf-tier.mjs), so benches added by
+  # future PRs are enrolled automatically on merge — no workflow edit needed.
+  # Advisory for now (not in branch protection); once it has a flake-free record,
+  # promote it by adding "perf" to the required status checks alongside "policy".
+  perf:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v6
+
+      - name: Set up Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: At-scale perf guards (env-gated benches, asserted)
+        run: node scripts/run-perf-tier.mjs
+        env:
+          PERF_N: "500000"

@@ -1,8 +1,18 @@
-import { describe, it } from "vitest";
+import { describe, it, expect } from "vitest";
 import { appendFileSync } from "node:fs";
 import { Scene } from "./scene.js";
 
 const OUT = "/tmp/point-memory.txt";
+
+// CI assertion mode (#220, set by scripts/run-perf-tier.mjs): besides reporting, assert each
+// case's bytes/point under a generous ceiling (~2.5× the measured value, absorbing V8-version
+// drift) so a memory-footprint regression in Scene storage goes red instead of just being
+// logged. Local report-only runs (no PERF_ASSERT) are unchanged. Assertion mode requires a
+// real gc() (--expose-gc) — without it heap deltas are noise, so we fail loudly rather than
+// assert garbage. The raw Float32Array case is NOT asserted: its backing store is external
+// memory that heapUsed can't see (its delta is ~0 ± gc noise).
+const ASSERT = !!process.env.PERF_ASSERT;
+const SLACK = Number(process.env.PERF_MEM_SLACK) || 1; // emergency loosener for odd runners
 
 // Spike: quantify the heap cost of retaining points, to ground the pass-through
 // design. Not an assertion test — it measures bytes/point and the extrapolated
@@ -29,7 +39,7 @@ function heap(): number {
   return process.memoryUsage().heapUsed;
 }
 
-function report(label: string, n: number, bytes: number) {
+function report(label: string, n: number, bytes: number, maxBytesPerPoint?: number) {
   const perPoint = bytes / n;
   const ceil = (budgetGB: number) =>
     ((budgetGB * 1024 ** 3) / perPoint / 1e6).toFixed(1) + "M";
@@ -39,6 +49,12 @@ function report(label: string, n: number, bytes: number) {
       `${perPoint.toFixed(0).padStart(5)} B/pt   ` +
       `ceiling@2GB=${ceil(2).padStart(7)}  @4GB=${ceil(4).padStart(7)}\n`,
   );
+  if (ASSERT && maxBytesPerPoint != null) {
+    if (!(globalThis as unknown as { gc?: () => void }).gc) {
+      throw new Error("PERF_ASSERT needs real heap deltas — run with NODE_OPTIONS=--expose-gc");
+    }
+    expect(perPoint, `${label}: ${perPoint.toFixed(0)} B/pt exceeds the ${maxBytesPerPoint * SLACK} B/pt ceiling`).toBeLessThan(maxBytesPerPoint * SLACK);
+  }
 }
 
 describe.skipIf(!RUN)("point memory baseline", () => {
@@ -62,7 +78,7 @@ describe.skipIf(!RUN)("point memory baseline", () => {
     for (let i = 0; i < N; i++) arr.push({ x: (i % 360) - 180, y: (i % 180) - 90 });
     const after = heap();
     if (arr.length !== N) throw new Error("unreachable");
-    report("raw [{x,y}] objects", N, after - before);
+    report("raw [{x,y}] objects", N, after - before, 128); // measured ~50 B/pt (V8 baseline, not d3gl)
   });
 
   it("d3gl Scene: points() — many centers, ONE drawable (batched)", () => {
@@ -73,7 +89,7 @@ describe.skipIf(!RUN)("point memory baseline", () => {
     scene.group("pts", (g) => g.points("all", centers, 2));
     const after = heap();
     if (scene.drawableCount("pts") !== 1) throw new Error("unreachable");
-    report("Scene points() — 1 drawable (batched)", N, after - before);
+    report("Scene points() — 1 drawable (batched)", N, after - before, 320); // measured ~130 B/pt
   });
 
   it("d3gl Scene: points() + buffers() assembled (GPU-ready)", () => {
@@ -85,7 +101,7 @@ describe.skipIf(!RUN)("point memory baseline", () => {
     const buf = scene.buffers("pts");
     const after = heap();
     if (buf.pointCount !== N) throw new Error("unreachable");
-    report("Scene points() + buffers() (both forms)", N, after - before);
+    report("Scene points() + buffers() (both forms)", N, after - before, 320); // measured ~130 B/pt
   });
 
   it("d3gl Scene: point() — ONE drawable per point (streaming CSV case)", () => {
@@ -97,6 +113,6 @@ describe.skipIf(!RUN)("point memory baseline", () => {
     });
     const after = heap();
     if (scene.drawableCount("pts") !== M) throw new Error("unreachable");
-    report("Scene point() — 1 drawable/point (CSV)", M, after - before);
+    report("Scene point() — 1 drawable/point (CSV)", M, after - before, 1500); // measured ~580 B/pt
   });
 });
