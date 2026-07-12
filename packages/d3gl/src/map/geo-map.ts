@@ -2,7 +2,7 @@ import { type GeoProjection, geoPath } from "d3-geo";
 import { geoLayer, projectVisiblePoint, type GeoInput } from "../geo/index.js";
 import { PathRecorder } from "../core/index.js";
 import versor, { type Angles, type Vec3, type Quaternion } from "../geo/versor.js";
-import { BaseEngine, type HoverHit, type LayerSpec, type InteractiveLayerOptions, type BaseEngineOptions } from "./base-engine.js";
+import { BaseEngine, type HoverHit, type LayerSpec, type InteractiveLayerOptions, type BaseEngineOptions, type DataLabelOptions } from "./base-engine.js";
 import type { ViewTransform, LineJoin, LineCap } from "../core/index.js";
 import { LayerHandle } from "./layer-handle.js";
 
@@ -87,6 +87,22 @@ export class GeoMap extends BaseEngine {
     super(host, opts);
     this.projection = opts.projection;
     this.baseScale = opts.projection.scale();
+  }
+
+  /**
+   * Show engine-owned text labels (#223): supply the data and d3-style accessors, and the engine
+   * measures each label's text once, then places + culls collisions and re-places them on every
+   * pan/zoom (no manual overlay, transform callback, or text-metric estimates). `anchorOf` returns a
+   * PROJECTED point — e.g. `projection(feature.geometry.coordinates)` (return `null` to skip a
+   * feature off the globe). Rendered by the active backend — an HTML overlay on WebGL, native
+   * `<text>`/`fillText` on SVG/Canvas so labels survive `toSVG()`/`toPNG()` export. Pass `false` to
+   * remove; re-call to rebuild after the projection changes.
+   */
+  labels(data: false): this;
+  labels<D>(data: readonly D[], opts: DataLabelOptions<D>): this;
+  labels<D>(data: readonly D[] | false, opts?: DataLabelOptions<D>): this {
+    this.setDataLabels(data, opts);
+    return this;
   }
 
   /**

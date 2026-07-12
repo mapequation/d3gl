@@ -30,10 +30,12 @@ on-screen pixel distances, so what survives depends on the current zoom, not the
   hides any anchored glyph whose anchor lands within `<px>` of an already-kept one. It only
   toggles visibility flags — no geometry is rebuilt — so it is cheap enough to run on every
   zoom frame.
-- **Label culling** is done by [`LabelLayer`](/d3gl/reference/labels/classes/labellayer/) (an
-  HTML overlay). On each `update` it maps anchors through the transform, drops labels outside the
-  viewport, then greedily places the rest, skipping any whose box overlaps one already placed.
-  Only the surviving labels exist in the DOM.
+- **Label culling** is engine-owned via [`chart.labels`](/d3gl/reference/map/interfaces/datalabeloptions/).
+  You give it the data plus `labelOf`/`anchorOf`/`importanceOf` accessors; the engine measures each
+  label's text once, maps anchors through the transform, drops labels outside the viewport, then
+  greedily places the rest, skipping any whose box overlaps one already placed. Only the surviving
+  labels reach the DOM (an HTML overlay on WebGL; native `<text>`/`fillText` on SVG/Canvas, so they
+  survive `toSVG()`/`toPNG()` export).
 
 ```ts
 chart.layer("nodes", nodes, {
@@ -56,25 +58,22 @@ The two systems express priority differently, so keep them consistent:
   const nodes = makeNodes(count).sort((a, b) => b.importance - a.importance);
   ```
 
-- **Labels** take an explicit `priority` field on each anchor (higher wins; ties fall back to
-  input order). Set it from the same channel as the glyph order:
+- **Labels** take an `importanceOf` accessor (higher wins; ties fall back to input order). Set it
+  from the same channel as the glyph order:
 
   ```ts
-  labels.update(
-    nodes.map((d) => ({
-      id: d.id, refX: d.x, refY: d.y, text: d.label,
-      width: d.label.length * 6.2 + 4, height: 14,
-      priority: d.importance,        // higher importance survives a collision
-      offset: [d.radius + 4, -7],    // sit just past the circle's right edge
-    })),
-    transform,
-    { width, height },
-  );
+  chart.labels(nodes, {
+    labelOf: (d) => d.label,
+    anchorOf: (d) => [d.x, d.y],
+    importanceOf: (d) => d.importance, // higher importance survives a collision
+    offset: (d) => [d.radius + 4, 0],  // sit just past the circle's right edge
+  });
   ```
 
 The `offset` is a constant pixel gap applied to both the rendered position **and** the collision
 box, so the label stays a fixed distance from its node at any zoom and culling reflects where the
-label actually sits.
+label actually sits. The engine measures each label's text (no metric estimates) and centres it
+vertically on the anchor, so the offset only needs the horizontal gap.
 
 ## A million points
 
@@ -85,9 +84,9 @@ draws each circle on the GPU from a single quad (~4 vertices), and a point's **a
 its own center**, so `declutter` works with no extra wiring. That lifts the **Nodes** slider to
 ~1M on the same per-zoom cull.
 
-This example drops the label overlay (an HTML `LabelLayer` can't follow a million nodes) and sets
-`pickable: false` (a per-point hit index would dwarf the geometry), so it's a pure glyph-declutter
-stress test. Scroll to zoom — the deep zoom range lets the crowd fully resolve.
+This example drops the labels (label placement reprojects every anchor per zoom and can't follow a
+million nodes) and sets `pickable: false` (a per-point hit index would dwarf the geometry), so it's
+a pure glyph-declutter stress test. Scroll to zoom — the deep zoom range lets the crowd fully resolve.
 
 <ExampleCard files={["declutter-points/draw.ts"]}>
   <DeclutterPoints client:visible slot="demo" />

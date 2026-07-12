@@ -4,8 +4,7 @@ import { rgb } from "d3-color";
 import { ForceLayout, seedPositions, type ForceParams } from "./force.js";
 import { multilevelLayout, type CoarsenOptions } from "./coarsen.js";
 import { buildLODTree, buildSpatialLODTree, computeLODGeometry, computeLODPositions, computeLODStyle, updateLODPositionsForLeaves, cut, makeCutScratch, declutterFrontier, makeDeclutterFrontierScratch, pickFrontier, regionFrontier, visibleWorldRect, leavesUnder, ancestorAwareSelected, type LODTree, type SpatialLODOptions } from "./lod.js";
-import { LabelLayer, placeLabels, resolveLabelStyle, DEFAULT_LABEL_TEXT, type LabelAnchor, type LabelStyle } from "../labels/label-layer.js";
-import type { LabelBox } from "../labels/cull.js";
+import { DEFAULT_LABEL_TEXT, type LabelAnchor, type LabelStyle } from "../labels/label-layer.js";
 import { buildModuleLODTree, type ModuleNode } from "./modules.js";
 import { moduleColors, type ModulePathNode, type ModuleColorOptions } from "./module-colors.js";
 import { physicalPieWedges, type PhysicalPieWedges, type PieWedgeOptions } from "./pie.js";
@@ -17,7 +16,7 @@ import { startGpuLayout } from "./gpu/gpu-transport.js";
 import { WebGLBackend } from "../webgl/webgl-backend.js";
 import type { NetworkGraph } from "./graph.js";
 import { fitNodes, fitBox, fitTransform, type FitBox } from "./fit.js";
-import type { InstancedLayer, TextData, ViewTransform } from "../core/index.js";
+import type { InstancedLayer, ViewTransform } from "../core/index.js";
 import { InstancedLane, type SelectionStrategy } from "../core/instanced-lane.js";
 import { resolveRingColors, ringCircles } from "../map/highlight-ring.js";
 import { hoverParts } from "../map/highlight.js";
@@ -514,13 +513,10 @@ export class Network extends BaseEngine {
    *  LOD tree carries no `parent` (coarsening/spatial). Keyed by tree identity; see {@link treeParent}. */
   private derivedParentFor: LODTree | null = null;
   private derivedParent: Int32Array | null = null;
-  /** Frontier label overlay (#105 N7b) + its options; null until {@link labels} is enabled. */
-  private labelLayer: LabelLayer | null = null;
+  /** Frontier label options (#105 N7b); null until {@link labels} is enabled. The overlay itself
+   *  ({@link BaseEngine.labelLayer}), its placement/routing, and the export-anchor retention for the
+   *  WebGL export-only text stash (#219) all live in the base (shared with plot/geo labels, #223). */
   private labelOpts: NetworkLabelOptions | null = null;
-  /** The last refresh's label anchors, retained (reference only) for the export-only text backend
-   *  push (#219): a WebGL toPNG()/toSVG() places these once at export time. Always current — the
-   *  overlay branch of {@link refreshLabels} runs on every transform/rebuild. */
-  private exportAnchors: readonly LabelAnchor[] = [];
   /** While a node-drag is active (#140), re-pins the held positions over each worker frame before it
    *  paints — in copy mode the worker's streamed snapshot would otherwise clobber the held nodes the
    *  main thread is holding under the cursor. Null when no drag is in flight. */
@@ -832,11 +828,8 @@ export class Network extends BaseEngine {
    */
   labels(opts: NetworkLabelOptions | false): this {
     if (!opts) {
-      this.labelLayer?.destroy();
-      this.labelLayer = null;
       this.labelOpts = null;
-      this.exportAnchors = [];
-      this.backend()?.setTextLayer?.([]); // clear any backend-native labels too (incl. the WebGL export stash)
+      this.clearLabelOverlay(); // destroy overlay + clear backend-native labels (incl. the WebGL export stash)
       this.render(); // repaint so a backend that bakes labels in (Canvas) drops them now
       return this;
     }
@@ -844,14 +837,11 @@ export class Network extends BaseEngine {
     // defaults to the overlay default's equivalent; explicit font/color/halo win. Normalized once
     // here, so refreshLabels() reads plain opts with no per-frame defaulting.
     this.labelOpts = { ...DEFAULT_LABEL_TEXT, ...opts };
-    // The overlay is absolutely positioned over the canvas — anchor it to a positioned host.
-    if (getComputedStyle(this.host).position === "static") this.host.style.position = "relative";
-    // (Re)create the overlay on every call: className/style land once per element at creation
+    // (Re)create the shared overlay on every call: className/style land once per element at creation
     // (never on the per-transform path), so a styling change must rebuild the elements. Cheap and
     // flash-free — labels() is a call-path, and the synchronous refreshLabels() below repopulates
     // in the same task at O(visible labels), the same order one overlay update already costs.
-    this.labelLayer?.destroy();
-    this.labelLayer = new LabelLayer(this.host, (a) => a.text, opts.className, resolveLabelStyle(opts.className, opts.style));
+    this.createLabelOverlay(opts.className, opts.style, { font: this.labelOpts.font, color: this.labelOpts.color, halo: this.labelOpts.halo });
     this.refreshLabels();
     this.render(); // bake just-set labels into the frame (Canvas); no-op-ish for the live-DOM backends
     return this;
@@ -861,8 +851,8 @@ export class Network extends BaseEngine {
    *  importance and feed their centroids + text to the overlay. Cheap no-op when labels are off.
    *  Called on every {@link afterTransform} (zoom/pan) and after a rebuild (frontier changed). */
   private refreshLabels(): void {
-    const layer = this.labelLayer, opts = this.labelOpts;
-    if (!layer || !opts || !this.graph) return;
+    const opts = this.labelOpts;
+    if (!this.labelLayer || !opts || !this.graph) return;
     // Default: NO cap — show every visible glyph that has a label (collision culling thins them where
     // they'd overlap). A finite `max` keeps only the top-k by importance; ranking (the sort below) is
     // therefore done ONLY when capping AND there are more candidates than the cap.
@@ -947,47 +937,12 @@ export class Network extends BaseEngine {
       }
     }
 
-    // Route by backend (#105 N7b-2): a backend that draws text natively AND live (SVG `<text>` /
-    // Canvas `fillText`) renders the labels so they survive toSVG()/toPNG(); otherwise (WebGL,
-    // whose setTextLayer is an export-only stash — #219) the HTML overlay does. Project + cull is
-    // shared (placeLabels), so both paths place labels identically.
-    const viewport = { width: this.width, height: this.height };
-    const backend = this.backend();
-    if (backend?.setTextLayer && backend.textLayerMode !== "export-only") {
-      const survivors = placeLabels(anchors, this.transform, viewport);
-      backend.setTextLayer(this.toTextData(survivors, opts));
-      layer.update([], this.transform, viewport); // keep the overlay empty on a native-text backend
-    } else {
-      layer.update(anchors, this.transform, viewport);
-      // Retain the anchor set (reference only — the array was built above regardless) so an
-      // export-only text backend can be fed the placed labels at toPNG()/toSVG() time (#219).
-      // Nothing is placed or allocated here — zero added per-frame work.
-      this.exportAnchors = anchors;
-    }
+    // Route to the active backend (#105 N7b-2, #219): shared placement, live-vs-export-only text
+    // routing, and the export-anchor retention for WebGL toPNG()/toSVG() all live in the base
+    // (also used by plot/geo data labels, #223). Network labels are centred on the glyph
+    // (align "middle" + each anchor's translate(-50%, -50%) transform).
+    this.routeLabels(anchors, "middle");
   }
-
-  /** Map placed label boxes to backend {@link TextData} — the one shape both the live native-text
-   *  path (SVG/Canvas) and the export-only push (WebGL, #219) emit, so exports match across backends. */
-  private toTextData(survivors: readonly LabelBox[], opts: NetworkLabelOptions): TextData[] {
-    return survivors.map((b) => ({
-      x: b.x, y: b.y, text: String(b.text), align: "middle" as const,
-      font: opts.font, color: opts.color, halo: opts.halo, opacity: b.opacity as number | undefined,
-    }));
-  }
-
-  /** Feed the placed labels to an export-only text backend (#219) right before an export, so a WebGL
-   *  toPNG()/toSVG() includes what the HTML overlay shows. Runs ONLY at export time (O(anchors in
-   *  view) once per call), never per frame; no-op on live-text backends (their set is already pushed). */
-  private pushExportLabels(): void {
-    const backend = this.backend();
-    if (!backend?.setTextLayer || backend.textLayerMode !== "export-only") return;
-    const opts = this.labelOpts;
-    const survivors = opts ? placeLabels(this.exportAnchors, this.transform, { width: this.width, height: this.height }) : [];
-    backend.setTextLayer(opts ? this.toTextData(survivors, opts) : []);
-  }
-
-  override toSVG(): string { this.pushExportLabels(); return super.toSVG(); }
-  override toPNG(): string { this.pushExportLabels(); return super.toPNG(); }
 
   protected override afterTransform(): void {
     this.refreshLabels();
@@ -1401,9 +1356,7 @@ export class Network extends BaseEngine {
   /** Tear down the engine, cancelling any worker layout first. */
   override destroy(): void {
     this.stopLayout();
-    this.labelLayer?.destroy();
-    this.labelLayer = null;
-    super.destroy();
+    super.destroy(); // base tears down the shared label overlay (#105 N7b, #223)
   }
 
   /**
