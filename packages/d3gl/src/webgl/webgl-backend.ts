@@ -116,6 +116,7 @@ export class WebGLBackend implements Backend {
     const existing = this.renderers.get(name);
     if (existing?.replace(layer.buffers)) {
       this.layers.set(name, layer); // an existing renderer implies `name` is already in `order`
+      this.layerFlags.delete(name); // drawable set changed; a retained flags view is stale (#208)
       this.bakeDirty = true;
       return;
     }
