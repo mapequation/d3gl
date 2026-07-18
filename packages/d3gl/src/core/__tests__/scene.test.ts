@@ -227,7 +227,7 @@ describe("Scene declutter index", () => {
   });
 });
 
-describe("flagsView (persistent typed flags mirror, #208)", () => {
+describe("flagsView (live view of the typed flags storage, #208/#207)", () => {
   function twoRects() {
     const scene = new Scene();
     scene.group("g", (b) => {
@@ -253,7 +253,7 @@ describe("flagsView (persistent typed flags mirror, #208)", () => {
     scene.writeDeclutterFlags("g", new Uint8Array([1, 0])); // keep a's group, hide b's
     expect(scene.flagsView("g")).toBe(view);
     expect(Array.from(view)).toEqual([1, 0]);
-    // The boxed table (what styleTables/drawables/buffers read) agrees.
+    // styleTables/drawables/buffers read the SAME typed storage (#207) and agree.
     expect(Array.from(scene.styleTables("g").flags)).toEqual([1, 0]);
   });
 
@@ -262,8 +262,8 @@ describe("flagsView (persistent typed flags mirror, #208)", () => {
     const view = scene.flagsView("g");
     scene.setFlag("g", "a", 0);
     scene.appendToGroup("g", (b) => b.drawable("c", (ctx) => ctx.rect(4, 0, 1, 1)));
-    // setFlag between append and re-access lands in the boxed table; the stale mirror
-    // is discarded and rebuilt from it.
+    // setFlag between append and re-access writes the typed storage directly (#207 —
+    // the view IS the storage); the next flagsView() re-slices to the grown length.
     scene.setFlag("g", "b", 0);
     const after = scene.flagsView("g");
     expect(after).not.toBe(view);
@@ -278,5 +278,76 @@ describe("flagsView (persistent typed flags mirror, #208)", () => {
     const after = scene.flagsView("g");
     expect(after).not.toBe(view);
     expect(Array.from(after)).toEqual([1]); // fresh default, not the stale 0
+  });
+});
+
+describe("typed GroupData storage (#207)", () => {
+  it("buffers()/styleTables() return live zero-copy views: same instances across calls, aliasing flagsView", () => {
+    const scene = new Scene();
+    scene.group("g", (b) => {
+      b.drawable("a", (ctx) => ctx.rect(0, 0, 1, 1), { lineWidth: 1 });
+      b.drawable("b", (ctx) => ctx.rect(2, 0, 1, 1));
+    });
+    const b1 = scene.buffers("g");
+    const b2 = scene.buffers("g");
+    expect(b2.fillVertices).toBe(b1.fillVertices);
+    expect(b2.fillIndices).toBe(b1.fillIndices);
+    expect(b2.strokeVertices).toBe(b1.strokeVertices);
+    expect(b2.fillColors).toBe(b1.fillColors);
+    expect(b2.flags).toBe(b1.flags);
+    // One storage: buffers/styleTables/flagsView all alias the same flags table.
+    expect(scene.styleTables("g").flags).toBe(b1.flags);
+    expect(scene.flagsView("g")).toBe(b1.flags);
+    // Live: a restyle is visible through an already-obtained view.
+    scene.setFill("g", "a", "rgb(1,2,3)");
+    expect([...b1.fillColors.slice(0, 4)]).toEqual([1, 2, 3, 255]);
+  });
+
+  it("path drawables allocate NO per-drawable circles array (shared empty), point drawables keep their own", () => {
+    const scene = new Scene();
+    scene.group("g", (b) => {
+      b.drawable("p1", (ctx) => ctx.rect(0, 0, 1, 1));
+      b.drawable("p2", (ctx) => ctx.rect(2, 0, 1, 1));
+      b.point("c", 5, 5, 2);
+    });
+    const [p1, p2, c] = scene.drawables("g");
+    expect(p1!.circles.length).toBe(0);
+    expect(p1!.circles).toBe(p2!.circles); // ONE shared empty array, not one per path drawable
+    expect(c!.circles).toEqual([{ x: 5, y: 5, r: 2 }]);
+    // Point drawables share one empty subpaths array the same way.
+    expect(c!.subpaths.length).toBe(0);
+    scene.group("h", (b) => b.point("d", 1, 1, 1));
+    expect(scene.drawableOf("h", "d")!.subpaths).toBe(c!.subpaths);
+  });
+
+  it("omitted join/cap/miterLimit columns resolve to defaults, and backfill on the first custom value", () => {
+    const scene = new Scene();
+    scene.group("g", (b) => b.drawable("a", (ctx) => ctx.rect(0, 0, 1, 1), { lineWidth: 1 }));
+    // Whole group default so far (columns omitted).
+    let a = scene.drawableOf("g", "a")!;
+    expect(a.lineJoin).toBe("bevel");
+    expect(a.lineCap).toBe("butt");
+    expect(a.miterLimit).toBe(10);
+    // First custom value arrives via append: earlier drawables must backfill to defaults.
+    scene.appendToGroup("g", (b) =>
+      b.drawable("b", (ctx) => ctx.rect(2, 0, 1, 1), { lineWidth: 1, lineJoin: "miter", lineCap: "round", miterLimit: 2 }),
+    );
+    a = scene.drawableOf("g", "a")!;
+    const bb = scene.drawableOf("g", "b")!;
+    expect([a.lineJoin, a.lineCap, a.miterLimit]).toEqual(["bevel", "butt", 10]);
+    expect([bb.lineJoin, bb.lineCap, bb.miterLimit]).toEqual(["miter", "round", 2]);
+  });
+
+  it("appendedBuffers() hands out O(1) tail views over the same storage as buffers()", () => {
+    const scene = new Scene();
+    scene.group("g", (b) => b.drawable("a", (ctx) => ctx.rect(0, 0, 1, 1), { lineWidth: 1 }));
+    scene.appendToGroup("g", (b) => b.drawable("b", (ctx) => ctx.rect(2, 0, 1, 1), { lineWidth: 1 }));
+    const full = scene.buffers("g");
+    const delta = scene.appendedBuffers("g", 1);
+    // Tail views alias the SAME backing store (zero copy), at the right offset.
+    expect(delta.fillVertices.buffer).toBe(full.fillVertices.buffer);
+    expect(delta.flags.buffer).toBe(full.flags.buffer);
+    expect(delta.flags.byteOffset).toBe(full.flags.byteOffset + 1);
+    expect(Array.from(delta.fillVertices)).toEqual(Array.from(full.fillVertices.slice(delta.ranges[0]!.fill.vertexOffset * 3)));
   });
 });
