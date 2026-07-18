@@ -20,6 +20,14 @@ function nextPow2(n: number): number {
 }
 
 /**
+ * Total {@link GroupRenderer} constructions since module load — a live ESM binding read by
+ * perf-regression guards to assert renderer REUSE (a construction builds ~10 GPU objects:
+ * buffers, textures, models/pipelines). E.g. the hover overlay must not construct one per
+ * hover change (#218). Test instrumentation only; never read on a render path.
+ */
+export let groupRendererConstructions = 0;
+
+/**
  * A GPU buffer that grows by capacity-doubling, backed by a CPU mirror.
  *
  * Appends within capacity are a single tail `Buffer.write` (bufferSubData) — O(new).
@@ -103,6 +111,18 @@ export class GrowBuffer {
    */
   reset(): void {
     this.length = 0;
+  }
+
+  /**
+   * Overwrite the buffer's contents from element 0 (the in-place layer-replace path,
+   * #218): one sub-data write when `data` fits the retained capacity, or a grow
+   * (reallocate + write) when it doesn't — returns TRUE in that case so the caller
+   * rebinds the owning Model to the new `buffer`. Capacity is kept across shrinks
+   * (high-water); stale tail bytes past the new length are never indexed.
+   */
+  replace(data: Float32Array | Uint32Array): boolean {
+    this.reset();
+    return this.append(data);
   }
 
   destroy(): void {
@@ -195,6 +215,37 @@ class GrowTexture {
       { x: 0, y: startRow, width: TABLE_WIDTH, height: numRows },
     );
     this.count = newCount;
+    return false;
+  }
+
+  /**
+   * Overwrite the table from entry 0 with `newCount` entries (the in-place
+   * layer-replace path, #218) — unlike {@link write}, the count MAY change. Within
+   * the retained row capacity this is one partial upload of the used rows (no GPU
+   * object churn); on row overflow the texture grows to the next power-of-two rows
+   * and is recreated once — returns TRUE so the caller rebinds the Model bindings.
+   * Shrinks keep the capacity (high-water); entries past `newCount` go stale but are
+   * never indexed (drawableId < count).
+   */
+  replace(bytes: Uint8Array, newCount: number): boolean {
+    const newRows = Math.max(1, Math.ceil(newCount / TABLE_WIDTH));
+    if (newRows > this.capacityRows) {
+      this.capacityRows = nextPow2(newRows);
+      this.mirror = new Uint8Array(this.capacityRows * this.rowBytes);
+      this.mirror.set(bytes.subarray(0, newCount * this.channels));
+      this.texture.destroy();
+      this.texture = this.allocate();
+      this.count = newCount;
+      return true;
+    }
+    this.mirror.set(bytes.subarray(0, newCount * this.channels));
+    this.count = newCount;
+    this.texture.writeData(this.mirror.subarray(0, newRows * this.rowBytes), {
+      x: 0,
+      y: 0,
+      width: TABLE_WIDTH,
+      height: newRows,
+    });
     return false;
   }
 
@@ -301,6 +352,7 @@ export class GroupRenderer {
     /** Viewport height in device pixels (for screen-mode point sizing). */
     private viewportHeight = 0,
   ) {
+    groupRendererConstructions++;
     this.shape = this.buildShapePass(buffers);
     this.point = this.buildPointPass(buffers);
   }
@@ -649,6 +701,100 @@ export class GroupRenderer {
   }
 
   /**
+   * Replace the group's ENTIRE geometry + tables in place, reusing the retained GPU
+   * objects — Models/pipelines always, GrowBuffers/GrowTextures within their
+   * capacities (grow + rebind on overflow, exactly like {@link append}). This is the
+   * fast path behind `WebGLBackend.updateLayer` (#218): the hover overlay re-targets
+   * a DIFFERENT drawable per pointer move at the same count, so unlike
+   * {@link updateColors} this rewrites geometry too (equal counts never imply equal
+   * geometry), and unlike {@link append} it starts over from drawable 0.
+   *
+   * Returns FALSE — the caller must fall back to a full rebuild — when the new
+   * buffers need a pass this renderer was built without (fill/stroke or points;
+   * Models cannot be created here). The REVERSE (a pass exists but the new buffers
+   * are empty for it) keeps the pass alive at zero counts, so a hover-out/hover-in
+   * alternation (empty <-> non-empty overlay) never rebuilds; {@link render} skips
+   * zero-index passes.
+   */
+  replace(buffers: GroupBuffers): boolean {
+    const needShape = buffers.fillIndices.length > 0 || buffers.strokeIndices.length > 0;
+    if (needShape && !this.shape) return false;
+    if (buffers.pointCount > 0 && !this.point) return false;
+    if (this.shape) this.replaceShape(this.shape, buffers);
+    if (this.point) this.replacePoint(this.point, buffers);
+    return true;
+  }
+
+  private replaceShape(pass: Pass, buffers: GroupBuffers): void {
+    const m = GroupRenderer.interleave(
+      buffers.fillVertices, buffers.strokeVertices,
+      buffers.fillAnchors, buffers.strokeAnchors,
+      buffers.fillIndices, buffers.strokeIndices,
+      buffers.ranges, 0,
+    );
+    const realloc =
+      [pass.position.replace(m.pos), pass.id.replace(m.id), pass.anchor.replace(m.anchor), pass.isStroke.replace(m.isStroke), pass.index.replace(m.index)]
+        .reduce((a, b) => a || b, false);
+    if (realloc) {
+      const attributes = {
+        a_position: pass.position.buffer,
+        a_anchor: pass.anchor.buffer,
+        a_drawableId: pass.id.buffer,
+        a_isStroke: pass.isStroke.buffer,
+      };
+      pass.fillModel.setAttributes(attributes);
+      pass.fillModel.setIndexBuffer(pass.index.buffer);
+      pass.pickModel.setAttributes(attributes);
+      pass.pickModel.setIndexBuffer(pass.index.buffer);
+    }
+    pass.fillModel.setVertexCount(pass.index.length);
+    pass.pickModel.setVertexCount(pass.index.length);
+    // Tables: overwrite from entry 0 at the new count (grow + rebind on row overflow).
+    // Mirrors growShapeTextures — a borrowing point pass shares these textures, so its
+    // model is rebound too when a recreate swaps them.
+    const count = buffers.fillColors.length / 4;
+    const pointBorrows = !!this.point && !this.point.ownsTextures && this.point.colorTex === pass.colorTex;
+    const colorRecreated = pass.colorTex.replace(buffers.fillColors, count);
+    const strokeRecreated = pass.strokeColorTex.replace(buffers.strokeColors, count);
+    const flagsRecreated = pass.flagsTex.replace(buffers.flags, count);
+    pass.drawableCount = count;
+    if (colorRecreated || strokeRecreated || flagsRecreated) {
+      pass.fillModel.setBindings({ u_colorTable: pass.colorTex.texture, u_strokeTable: pass.strokeColorTex.texture, u_flags: pass.flagsTex.texture });
+      pass.pickModel.setBindings({ u_colorTable: pass.colorTex.texture, u_strokeTable: pass.strokeColorTex.texture, u_flags: pass.flagsTex.texture });
+      if (pointBorrows && this.point) this.point.model.setBindings({ u_colorTable: pass.colorTex.texture, u_flags: pass.flagsTex.texture });
+    }
+  }
+
+  private replacePoint(pp: PointPass, buffers: GroupBuffers): void {
+    const e = GroupRenderer.expandPoints(buffers.pointCenters, 0);
+    const realloc =
+      [pp.center.replace(e.center), pp.corner.replace(e.corner), pp.radius.replace(e.radius), pp.pointId.replace(e.pointId), pp.index.replace(e.index)]
+        .reduce((a, b) => a || b, false);
+    pp.vertexCount = buffers.pointCount * 4;
+    if (realloc) {
+      pp.model.setAttributes({
+        a_center: pp.center.buffer,
+        a_corner: pp.corner.buffer,
+        a_radius: pp.radius.buffer,
+        a_pointId: pp.pointId.buffer,
+      });
+      pp.model.setIndexBuffer(pp.index.buffer);
+    }
+    pp.model.setVertexCount(pp.index.length);
+    // Owned tables only: a borrowing pass's tables are the shape pass's, already
+    // replaced (and rebound on recreate) by replaceShape.
+    if (pp.ownsTextures) {
+      const count = buffers.fillColors.length / 4;
+      const colorRecreated = pp.colorTex.replace(buffers.fillColors, count);
+      const flagsRecreated = pp.flagsTex.replace(buffers.flags, count);
+      if (colorRecreated || flagsRecreated) {
+        pp.model.setBindings({ u_colorTable: pp.colorTex.texture, u_flags: pp.flagsTex.texture });
+      }
+    }
+    pp.drawableCount = buffers.drawableCount;
+  }
+
+  /**
    * Re-upload the color and flag tables from the style tables. Touches only the
    * palette/flags textures — geometry buffers are untouched, so this is the cheap
    * recolor / show-hide hot path.
@@ -767,10 +913,12 @@ export class GroupRenderer {
     if (this.point) this.point.uniforms["u_pointScreen"] = s;
   }
 
-  /** Draw the combined fill+stroke pass (painter's order), then the point pass. */
+  /** Draw the combined fill+stroke pass (painter's order), then the point pass.
+   *  A pass emptied by {@link replace} (zero indices — e.g. a cleared hover overlay
+   *  kept alive for reuse) is skipped rather than issuing a zero-count draw. */
   render(renderPass: RenderPass): void {
-    if (this.shape) this.shape.fillModel.draw(renderPass);
-    if (this.point) this.point.model.draw(renderPass);
+    if (this.shape && this.shape.index.length > 0) this.shape.fillModel.draw(renderPass);
+    if (this.point && this.point.index.length > 0) this.point.model.draw(renderPass);
   }
 
   /**
@@ -779,7 +927,7 @@ export class GroupRenderer {
    * pixel under the cursor and decode it with decodePickColor().
    */
   renderPick(renderPass: RenderPass): void {
-    if (this.shape) this.shape.pickModel.draw(renderPass);
+    if (this.shape && this.shape.index.length > 0) this.shape.pickModel.draw(renderPass);
   }
 
   destroy(): void {

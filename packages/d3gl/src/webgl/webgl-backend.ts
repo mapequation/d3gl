@@ -100,14 +100,27 @@ export class WebGLBackend implements Backend {
   }
 
   /**
-   * Replace a layer's geometry + tables: destroy the old renderer and rebuild from the
-   * full buffers. `updateLayer` deliberately has NO same-count recolor shortcut: equal
-   * drawable counts do NOT imply unchanged geometry (the hover overlay re-targets a
-   * different drawable at the same count every pointer move). Styles-only changes go
-   * through {@link updateLayerStyles}; appends through {@link appendToLayer} (O(new)).
+   * Replace a layer's geometry + tables. When the layer's renderer already exists and
+   * needs no pass it was built without, it is updated IN PLACE ({@link GroupRenderer.replace}):
+   * geometry buffers and tables are rewritten through the retained Grow* objects (which
+   * grow + rebind on overflow) and the Models/pipelines are REUSED. The hover overlay
+   * re-targets a different drawable on every pointer move, so this path must not churn
+   * GPU objects per event (#218). It is still a full GEOMETRY replace, never a same-count
+   * recolor shortcut: equal drawable counts do NOT imply unchanged geometry, so the
+   * buffers are always rewritten. Styles-only changes go through {@link updateLayerStyles};
+   * appends through {@link appendToLayer} (O(new)). Destroy + rebuild remains only for a
+   * structural change (a geometry-type pass appearing that the renderer lacks — e.g. an
+   * overlay created points-only later highlighting a path).
    */
   updateLayer(name: string, layer: RenderLayer): void {
-    this.renderers.get(name)?.destroy();
+    const existing = this.renderers.get(name);
+    if (existing?.replace(layer.buffers)) {
+      this.layers.set(name, layer); // an existing renderer implies `name` is already in `order`
+      this.layerFlags.delete(name); // drawable set changed; a retained flags view is stale (#208)
+      this.bakeDirty = true;
+      return;
+    }
+    existing?.destroy();
     const renderer = new GroupRenderer(this.device, layer.buffers, this.width, this.height);
     renderer.setTransform(this.clipMatrix);
     this.renderers.set(name, renderer);

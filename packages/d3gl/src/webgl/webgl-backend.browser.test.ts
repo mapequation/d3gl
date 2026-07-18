@@ -1,6 +1,7 @@
 import { describe, it, expect } from "vitest";
 import { Scene } from "../core/index.js";
 import { WebGLBackend } from "./webgl-backend.js";
+import { groupRendererConstructions } from "./renderer.js";
 import type { DrawableVector } from "../core/index.js";
 
 function rectLayer(name: string, x: number, y: number, w: number, h: number, color: string, clipTo?: string) {
@@ -201,6 +202,129 @@ describe("WebGLBackend", () => {
     // toSVG reads the stored drawables — they must be refreshed so the export reflects
     // the new color (rgba(0, 0, 255, ...) contains the substring "0, 0, 255").
     expect(backend.toSVG()).toContain("0, 0, 255");
+    backend.destroy();
+  });
+});
+
+/** In-place updateLayer (#218): the renderer (Models/pipelines) is REUSED across geometry
+ *  replaces; Grow* objects rewrite within capacity and grow+rebind past it. A construction
+ *  is asserted only for structural changes (a pass type the renderer was built without). */
+describe("WebGLBackend updateLayer in-place replace (#218)", () => {
+  async function makeBackend(size = 100) {
+    const canvas = document.createElement("canvas");
+    canvas.width = size; canvas.height = size;
+    document.body.appendChild(canvas);
+    const backend = await WebGLBackend.create(canvas, { width: size, height: size });
+    backend.setTransform({ k: 1, x: 0, y: 0 });
+    return backend;
+  }
+  const layerOf = (scene: Scene, name: string) =>
+    ({ name, buffers: scene.buffers(name), drawables: scene.drawables(name) });
+
+  it("reuses one renderer across geometry change, grow past capacity, shrink, empty, and regrow", async () => {
+    const backend = await makeBackend();
+    const scene = new Scene();
+    scene.group("g", (g) => g.drawable("a", (ctx) => ctx.rect(10, 10, 20, 20)));
+    scene.setFill("g", "a", "rgb(255,0,0)");
+    backend.setLayers([layerOf(scene, "g")]);
+    const base = groupRendererConstructions;
+
+    // Same count, different geometry (the hover-overlay pattern) — rewritten in place.
+    scene.group("g", (g) => g.drawable("a", (ctx) => ctx.rect(60, 60, 20, 20)));
+    scene.setFill("g", "a", "rgb(255,0,0)");
+    backend.updateLayer("g", layerOf(scene, "g"));
+    expect([...backend.readPixel(70, 70).slice(0, 3)]).toEqual([255, 0, 0]);
+    expect(backend.readPixel(20, 20)[3]).toBe(0);
+
+    // GROW to 300 drawables: vertex/index buffers outgrow their initial capacity and the
+    // 256-wide colour/flags tables need a second row — reallocate + REBIND, still no new
+    // renderer. Drawable 299 (row 2 of the tables) must resolve its own colour.
+    scene.group("g", (g) => {
+      for (let i = 0; i < 300; i++) g.drawable(`r${i}`, (ctx) => ctx.rect((i % 20) * 5, Math.floor(i / 20) * 5, 4, 4));
+    });
+    for (let i = 0; i < 300; i++) scene.setFill("g", `r${i}`, i === 299 ? "rgb(255,0,0)" : "rgb(0,0,255)");
+    backend.updateLayer("g", layerOf(scene, "g"));
+    expect([...backend.readPixel(2, 2).slice(0, 3)]).toEqual([0, 0, 255]);   // r0
+    expect([...backend.readPixel(97, 72).slice(0, 3)]).toEqual([255, 0, 0]); // r299, table row 2
+
+    // SHRINK back to one drawable: high-water capacity is kept, stale tail never indexed.
+    scene.group("g", (g) => g.drawable("a", (ctx) => ctx.rect(40, 40, 10, 10)));
+    scene.setFill("g", "a", "rgb(0,255,0)");
+    backend.updateLayer("g", layerOf(scene, "g"));
+    expect([...backend.readPixel(45, 45).slice(0, 3)]).toEqual([0, 255, 0]);
+    expect(backend.readPixel(2, 2)[3]).toBe(0); // the 300-rect frame is gone
+
+    // EMPTY (a cleared hover overlay): passes stay alive at zero counts, nothing drawn.
+    scene.group("g", () => {});
+    backend.updateLayer("g", layerOf(scene, "g"));
+    expect(backend.readPixel(45, 45)[3]).toBe(0);
+
+    // REGROW after empty: still the same renderer.
+    scene.group("g", (g) => g.drawable("a", (ctx) => ctx.rect(20, 70, 10, 10)));
+    scene.setFill("g", "a", "rgb(255,0,255)");
+    backend.updateLayer("g", layerOf(scene, "g"));
+    expect([...backend.readPixel(25, 75).slice(0, 3)]).toEqual([255, 0, 255]);
+
+    expect(groupRendererConstructions - base).toBe(0);
+    backend.destroy();
+  });
+
+  it("replaces a points-only layer in place, and mixed shape+point groups rebind borrowed tables on growth", async () => {
+    const backend = await makeBackend();
+    const scene = new Scene();
+    scene.group("pts", (g) => g.point("p", 25, 25, 5));
+    scene.setFill("pts", "p", "rgb(255,0,0)");
+    backend.setLayers([layerOf(scene, "pts")]);
+    expect(backend.readPixel(25, 25)[0]).toBeGreaterThan(200);
+    const base = groupRendererConstructions;
+
+    // Move the point — point-pass buffers rewritten in place (owned tables).
+    scene.group("pts", (g) => g.point("p", 75, 75, 5));
+    scene.setFill("pts", "p", "rgb(255,0,0)");
+    backend.updateLayer("pts", layerOf(scene, "pts"));
+    expect(backend.readPixel(75, 75)[0]).toBeGreaterThan(200);
+    expect(backend.readPixel(25, 25)[3]).toBe(0);
+    expect(groupRendererConstructions - base).toBe(0);
+
+    // Mixed group: 299 rects + 1 point → the point pass BORROWS the shape pass's tables.
+    // Replacing at 300 drawables recreates the tables (row overflow) and must rebind the
+    // borrowing point model, or the point would sample a destroyed texture.
+    const scene2 = new Scene();
+    scene2.group("mix", (g) => {
+      g.drawable("seed", (ctx) => ctx.rect(0, 0, 2, 2)); // shape pass
+      g.point("pseed", 50, 50, 3); // point pass (borrows the shape pass's tables)
+    });
+    scene2.setFill("mix", "seed", "rgb(0,0,255)");
+    scene2.setFill("mix", "pseed", "rgb(0,0,255)");
+    backend.setLayers([layerOf(scene2, "mix")]);
+    const base2 = groupRendererConstructions;
+    scene2.group("mix", (g) => {
+      for (let i = 0; i < 299; i++) g.drawable(`r${i}`, (ctx) => ctx.rect((i % 20) * 5, Math.floor(i / 20) * 5, 3, 3));
+      g.point("p", 90, 90, 5); // drawableId 299 → colour table row 2
+    });
+    for (let i = 0; i < 299; i++) scene2.setFill("mix", `r${i}`, "rgb(0,0,255)");
+    scene2.setFill("mix", "p", "rgb(255,0,0)");
+    backend.updateLayer("mix", layerOf(scene2, "mix"));
+    expect(backend.readPixel(90, 90)[0]).toBeGreaterThan(200); // point drawn from the recreated table
+    expect(groupRendererConstructions - base2).toBe(0);
+    backend.destroy();
+  });
+
+  it("falls back to a full rebuild only when a structurally new pass appears", async () => {
+    const backend = await makeBackend();
+    const scene = new Scene();
+    scene.group("g", (g) => g.point("p", 25, 25, 5)); // points-only: no shape pass
+    scene.setFill("g", "p", "rgb(255,0,0)");
+    backend.setLayers([layerOf(scene, "g")]);
+    const base = groupRendererConstructions;
+
+    // Fill/stroke geometry appears — the shape pass can't be created in place.
+    scene.group("g", (g) => g.drawable("a", (ctx) => ctx.rect(60, 60, 20, 20)));
+    scene.setFill("g", "a", "rgb(0,255,0)");
+    backend.updateLayer("g", layerOf(scene, "g"));
+    expect([...backend.readPixel(70, 70).slice(0, 3)]).toEqual([0, 255, 0]);
+    expect(backend.readPixel(25, 25)[3]).toBe(0);
+    expect(groupRendererConstructions - base).toBe(1); // exactly one rebuild
     backend.destroy();
   });
 });
