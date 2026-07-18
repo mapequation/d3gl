@@ -1,4 +1,4 @@
-import { describe, it } from "vitest";
+import { describe, it, expect } from "vitest";
 import { appendFileSync } from "node:fs";
 import { buildLODTree, computeLODGeometry, cut, declutterFrontier, visibleWorldRect, type LODTree, type LODTransform } from "../lod.js";
 import { multilevelSeed } from "../coarsen.js";
@@ -18,6 +18,13 @@ import { dimOthers } from "../../map/selection-dim.js";
 const RUN = !!process.env.BENCH_LOD;
 const N = Number(process.env.BENCH_LOD_NODES) || 1_000_000;
 const LABEL = process.env.BENCH_LOD_LABEL ?? "run";
+// CI assertion mode (#220, set by scripts/run-perf-tier.mjs): besides reporting, assert every
+// regime's MEDIAN frame under a generous wall-clock ceiling. Local report-only runs (no
+// PERF_ASSERT) are unchanged. Calibration at N=500k: medians 62–95ms on an M-series laptop,
+// expect ~2–3× on a shared 2-core CI runner — the 1000ms default is ~3–5× CI headroom, tight
+// enough to catch an order-of-magnitude per-frame drop, loose enough not to flake.
+const ASSERT = !!process.env.PERF_ASSERT;
+const FRAME_MS = Number(process.env.PERF_LOD_FRAME_MS) || 1000;
 const OUT = "/tmp/lod-perf.txt";
 const W = 1280;
 const H = 800;
@@ -124,6 +131,12 @@ describe("LOD per-frame performance", () => {
       const block = lines.join("\n") + "\n";
       console.log(block);
       appendFileSync(OUT, block);
+
+      if (ASSERT) {
+        for (const r of rows) {
+          expect(r.median, `${r.label}: median frame ${r.median.toFixed(1)}ms exceeds ${FRAME_MS}ms ceiling at N=${N}`).toBeLessThan(FRAME_MS);
+        }
+      }
     },
     600_000,
   );

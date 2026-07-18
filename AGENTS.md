@@ -272,7 +272,17 @@ git -C <primary> checkout -- <files>                         # restore primary t
   package-relative path to target one file). They run reliably and are part of TDD —
   a wall-clock watchdog (`packages/d3gl/scripts/run-browser-tests.mjs`) turns any
   rare connect/teardown stall into a fast failure instead of an infinite hang. CI
-  (`ci.yml`) still runs only `pnpm test` (node), not the browser suite.
+  does not run the browser suite (node only).
+- **At-scale perf tier** (`ci.yml` job `perf`, #220): `node scripts/run-perf-tier.mjs`
+  runs every **env-gated node bench** with its gates ON at a reduced-but-real N
+  (`PERF_N`, CI default 500k) and assertions enabled (`PERF_ASSERT=1`), single-threaded
+  under `--expose-gc`, with a hard per-file wall-clock budget (`PERF_FILE_BUDGET_MS`).
+  Discovery is **pattern-driven**: any node test reading `process.env.BENCH_*` is
+  enrolled automatically — so a new bench joins CI just by following the convention
+  `BENCH_<NAME>` (gate) / `BENCH_<NAME>_N[ODES]` (scale, set to `PERF_N`) /
+  `BENCH_<NAME>_LABEL` (report label). Report-only benches are still guarded by the
+  per-file budget; add `PERF_ASSERT`-gated ceilings for real assertions (see
+  `lod-perf.bench.test.ts`). Local report-only runs (no `PERF_ASSERT`) are unchanged.
 
 ## Backend compositing equivalence (READ before touching the WebGL renderer)
 
