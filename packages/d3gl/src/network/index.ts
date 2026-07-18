@@ -1,6 +1,19 @@
 /**
- * `@mapequation/d3gl/network` — large-scale network & map-of-networks rendering
- * with level-of-detail (epic #98).
+ * Large-scale network and map-of-networks rendering. The {@link network} engine draws
+ * node–link graphs as GPU-instanced glyphs — toward millions of nodes and links — with an
+ * in-library force layout ({@link ForceLayout}; main-thread, worker, or GPU backend), an
+ * adaptive level-of-detail cut over a coarsening or provided module hierarchy
+ * ({@link Network.lod}), and state (memory) networks ({@link buildStateGraph}).
+ * {@link buildGraph} assembles the graph from an edge list.
+ *
+ * ```ts
+ * import { network, buildGraph } from "@mapequation/d3gl/network";
+ *
+ * const graph = buildGraph({ nodeCount, source, target });
+ * network(el, { width, height }).data(graph).layout({ backend: "worker" });
+ * ```
+ *
+ * @packageDocumentation
  */
 export { network, Network } from "./network.js";
 export type { NetworkOptions, NetworkStyle, NetworkLayoutOptions, NetworkLODOptions, NetworkHit, NetworkLinkHit, StateNetworkOptions } from "./network.js";
@@ -12,8 +25,8 @@ export type { HalfLinkParams, HalfLinkGeometry, PathSink } from "./half-link.js"
 export { randomWalkFlow } from "./flow.js";
 export type { FlowGraph, FlowOptions, FlowResult } from "./flow.js";
 
-export { buildLODTree, computeLODGeometry, cut, declutterFrontier } from "./lod.js";
-export type { LODTree, LODTransform, CutOptions, DeclutterOptions } from "./lod.js";
+export { buildLODTree, computeLODGeometry, cut, makeCutScratch, declutterFrontier, makeDeclutterFrontierScratch } from "./lod.js";
+export type { LODTree, LODTransform, CutOptions, CutScratch, DeclutterOptions, DeclutterFrontierScratch } from "./lod.js";
 
 export { buildModuleLODTree } from "./modules.js";
 export type { ModuleNode } from "./modules.js";

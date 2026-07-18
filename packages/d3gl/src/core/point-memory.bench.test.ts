@@ -36,7 +36,11 @@ function gc() {
 
 function heap(): number {
   gc();
-  return process.memoryUsage().heapUsed;
+  // heapUsed alone misses typed-array backing stores (ArrayBuffers live OUTSIDE the V8
+  // heap); include them or any boxed→typed move (#207) looks free and typed copies look
+  // like zero bytes.
+  const mu = process.memoryUsage();
+  return mu.heapUsed + mu.arrayBuffers;
 }
 
 function report(label: string, n: number, bytes: number, maxBytesPerPoint?: number) {
@@ -114,5 +118,37 @@ describe.skipIf(!RUN)("point memory baseline", () => {
     const after = heap();
     if (scene.drawableCount("pts") !== M) throw new Error("unreachable");
     report("Scene point() — 1 drawable/point (CSV)", M, after - before, 1500); // measured ~580 B/pt
+  });
+
+  // #207: the retained-Scene footprint of PATH drawables — per-drawable tables
+  // (colors/flags/widths/joins/caps/anchors), the per-path `circles` entry, and the
+  // vertex data itself. This is the full-detail GeoMap/Plot layer case.
+  it("d3gl Scene: drawable() — 1M path drawables (rects)", () => {
+    const before = heap();
+    const scene = new Scene();
+    scene.group("rects", (g) => {
+      for (let i = 0; i < N; i++) {
+        const x = (i % 1000) * 2, y = ((i / 1000) | 0) * 2;
+        g.drawable(i, (ctx) => ctx.rect(x, y, 1, 1));
+      }
+    });
+    const after = heap();
+    if (scene.drawableCount("rects") !== N) throw new Error("unreachable");
+    report("Scene drawable() — 1M rects (retained)", N, after - before);
+  });
+
+  it("d3gl Scene: drawable() 1M rects + buffers() assembled (GPU-ready)", () => {
+    const before = heap();
+    const scene = new Scene();
+    scene.group("rects", (g) => {
+      for (let i = 0; i < N; i++) {
+        const x = (i % 1000) * 2, y = ((i / 1000) | 0) * 2;
+        g.drawable(i, (ctx) => ctx.rect(x, y, 1, 1));
+      }
+    });
+    const buf = scene.buffers("rects");
+    const after = heap();
+    if (buf.drawableCount !== N) throw new Error("unreachable");
+    report("Scene 1M rects + buffers() (both forms)", N, after - before);
   });
 });

@@ -14,10 +14,10 @@ export interface HighlightStyle {
   radiusScale?: number;
 }
 
-export type HighlightDraw<F = any> = (datum: F, g: HighlightBuilder) => void;
+export type HighlightDraw<F = unknown> = (datum: F, g: HighlightBuilder) => void;
 /** The hovered-item style payload: `true` = default style, a style = replay with it,
  *  a function = full custom draw of the hovered item. */
-export type HoverOption<F = any> = true | HighlightStyle | HighlightDraw<F>;
+export type HoverOption<F = unknown> = true | HighlightStyle | HighlightDraw<F>;
 
 /**
  * Hover styling (#162), symmetric with {@link SelectionOptions}: `hovered` = how the hovered item looks
@@ -26,7 +26,7 @@ export type HoverOption<F = any> = true | HighlightStyle | HighlightDraw<F>;
  * The layer `hover` option accepts either this object OR a bare {@link HoverOption} (the flat forms:
  * `true` / a style / a draw fn) for the common "just style the hovered item" case.
  */
-export interface HoverOptions<F = any> {
+export interface HoverOptions<F = unknown> {
   hovered?: HighlightStyle | HighlightDraw<F>;
   others?: StyleOverride;
 }
@@ -34,7 +34,7 @@ export interface HoverOptions<F = any> {
 /** Split a layer's `hover` option into its hovered-style payload (for the overlay / ring) and its
  *  `others` dim. A flat {@link HoverOption} (`true` / style / fn) is the hovered style with no dim;
  *  a {@link HoverOptions} object (has `hovered`/`others` keys) is read directly. */
-export function hoverParts<F = any>(
+export function hoverParts<F = unknown>(
   hover: HoverOption<F> | HoverOptions<F> | undefined,
 ): { hovered: HoverOption<F> | undefined; others: StyleOverride | undefined } {
   if (hover === true) return { hovered: true, others: undefined };

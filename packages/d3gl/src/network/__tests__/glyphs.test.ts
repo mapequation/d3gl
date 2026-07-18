@@ -180,6 +180,68 @@ describe("halfArrowLinks", () => {
   });
 });
 
+describe("noLodStyleCache highlight group columns (#214)", () => {
+  // The #162 shader-highlight group columns are position-independent copies of the immutable edge
+  // list, so they live on the #179 cache: built ONCE per (graph, style) version and reference-stable
+  // across position-only frames — the invariant the renderer's reference-identity check needs to skip
+  // their per-frame GPU upload. A fresh cache (data/style change) must hand back FRESH instances so
+  // the changed columns DO upload.
+
+  it("carries source ids, target ids (undirected incident hover), and the node-identity column", () => {
+    const g = buildGraph({ nodeCount: 3, source: [0, 1], target: [1, 2] });
+    const c = noLodStyleCache(g, { ...style(3), directed: false });
+    expect(Array.from(c.groupSource)).toEqual([0, 1]);
+    expect(Array.from(c.groupTarget ?? [])).toEqual([1, 2]);
+    expect(Array.from(c.nodeGroups)).toEqual([0, 1, 2]);
+  });
+
+  it("omits groupTarget when directed (links match on source alone) — including half-arrows", () => {
+    const g = buildGraph({ nodeCount: 3, source: [0, 1], target: [1, 2], directed: true });
+    const c = noLodStyleCache(g, { ...style(3), directed: true });
+    expect(c.kind).toBe("lines+arrows");
+    expect(Array.from(c.groupSource)).toEqual([0, 1]);
+    expect(c.groupTarget).toBeUndefined();
+    const h = noLodStyleCache(g, { ...style(3), directed: true, linkStyle: "half-arrow" });
+    expect(h.kind).toBe("half-arrows");
+    expect(Array.from(h.groupSource)).toEqual([0, 1]);
+    expect(h.groupTarget).toBeUndefined();
+    expect(Array.from(h.nodeGroups)).toEqual([0, 1, 2]);
+  });
+
+  it("still carries the node column for an edgeless graph (lines-only kind)", () => {
+    const g = buildGraph({ nodeCount: 2, source: [], target: [] });
+    const c = noLodStyleCache(g, style(2));
+    expect(c.kind).toBe("lines-only");
+    expect(c.groupSource.length).toBe(0);
+    expect(Array.from(c.nodeGroups)).toEqual([0, 1]);
+  });
+
+  it("columns are identity-stable across position-only frames, fresh per cache version", () => {
+    const g = buildGraph({ nodeCount: 3, source: [0, 1], target: [1, 2] });
+    const s = { ...style(3), directed: false };
+    const c = noLodStyleCache(g, s);
+    const { groupSource, groupTarget, nodeGroups } = c;
+
+    // Position-only frames rebuild layers from the SAME cache — the columns must be untouched, the
+    // same array instances (reference-stable ⟺ upload skipped by the renderer's identity check).
+    g.positions.set([5, 5, 15, 15, 25, 25]);
+    networkLayersFromCache(g, s, c);
+    g.positions.set([6, 6, 16, 16, 26, 26]);
+    networkLayersFromCache(g, s, c);
+    expect(c.groupSource).toBe(groupSource);
+    expect(c.groupTarget).toBe(groupTarget);
+    expect(c.nodeGroups).toBe(nodeGroups);
+
+    // Invalidation: a fresh cache version (data/style change) allocates FRESH instances, so the new
+    // columns are a new reference and DO upload.
+    const c2 = noLodStyleCache(g, s);
+    expect(c2.groupSource).not.toBe(groupSource);
+    expect(c2.groupTarget).not.toBe(groupTarget);
+    expect(c2.nodeGroups).not.toBe(nodeGroups);
+    expect(Array.from(c2.groupSource)).toEqual(Array.from(groupSource)); // same content, new identity
+  });
+});
+
 describe("networkLayersFromCache (#179 position-only frame)", () => {
   // The cache split must be output-identical to the full path: reusing the cached style attributes
   // and rebuilding only endpoints/centres from moved positions yields exactly what networkLayers would.

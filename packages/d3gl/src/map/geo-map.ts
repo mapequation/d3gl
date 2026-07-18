@@ -1,15 +1,15 @@
 import { type GeoProjection, geoPath } from "d3-geo";
-import { geoLayer, projectVisiblePoint } from "../geo/index.js";
+import { geoLayer, projectVisiblePoint, type GeoInput } from "../geo/index.js";
 import { PathRecorder } from "../core/index.js";
 import versor, { type Angles, type Vec3, type Quaternion } from "../geo/versor.js";
-import { BaseEngine, type HoverHit, type LayerSpec, type InteractiveLayerOptions, type BaseEngineOptions } from "./base-engine.js";
+import { BaseEngine, type HoverHit, type LayerSpec, type InteractiveLayerOptions, type BaseEngineOptions, type DataLabelOptions } from "./base-engine.js";
 import type { ViewTransform, LineJoin, LineCap } from "../core/index.js";
 import { LayerHandle } from "./layer-handle.js";
 
 export interface GeoMapOptions extends BaseEngineOptions {
   projection: GeoProjection;
 }
-export interface LayerOptions<F = any> extends InteractiveLayerOptions<F> {
+export interface LayerOptions<F extends GeoInput = GeoInput> extends InteractiveLayerOptions<F> {
   fill?: string | ((f: F, i: number) => string);
   stroke?: string | ((f: F, i: number) => string);
   lineWidth?: number; pointRadius?: number; clipTo?: string;
@@ -52,7 +52,21 @@ export interface RotationOptions {
   onRotate?: (rotation: Angles) => void;
 }
 
-interface LayerDef { name: string; opts: LayerOptions; }
+/**
+ * Retained per-retained-layer record for re-projection (setProjection / rotation / resize).
+ * `rebuild` is a closure that re-registers the layer against the CURRENT projection — it
+ * captures the layer's datum type `F` (and its data array reference, which `appendToLayer`
+ * mutates in place), so the datum-erased engine store never has to recover `F`: the same
+ * existential seam as Plot's per-layer sync closures (#221). `fitData` is that same live
+ * array, read GeoInput-typed by {@link GeoMap.fitObject}; `hideOnInteraction` gates the
+ * skip-hidden rotation pass without re-reading the (erased) options.
+ */
+interface LayerDef {
+  name: string;
+  hideOnInteraction: boolean;
+  rebuild: () => void;
+  fitData: readonly GeoInput[];
+}
 
 /** The object type d3-geo's `fitSize` accepts (Feature / FeatureCollection / geometry / Sphere). */
 type FitObject = Parameters<GeoProjection["fitSize"]>[1];
@@ -73,6 +87,22 @@ export class GeoMap extends BaseEngine {
     super(host, opts);
     this.projection = opts.projection;
     this.baseScale = opts.projection.scale();
+  }
+
+  /**
+   * Show engine-owned text labels (#223): supply the data and d3-style accessors, and the engine
+   * measures each label's text once, then places + culls collisions and re-places them on every
+   * pan/zoom (no manual overlay, transform callback, or text-metric estimates). `anchorOf` returns a
+   * PROJECTED point — e.g. `projection(feature.geometry.coordinates)` (return `null` to skip a
+   * feature off the globe). Rendered by the active backend — an HTML overlay on WebGL, native
+   * `<text>`/`fillText` on SVG/Canvas so labels survive `toSVG()`/`toPNG()` export. Pass `false` to
+   * remove; re-call to rebuild after the projection changes.
+   */
+  labels(data: false): this;
+  labels<D>(data: readonly D[], opts: DataLabelOptions<D>): this;
+  labels<D>(data: readonly D[] | false, opts?: DataLabelOptions<D>): this {
+    this.setDataLabels(data, opts);
+    return this;
   }
 
   /**
@@ -115,10 +145,9 @@ export class GeoMap extends BaseEngine {
     if (this.isSpherical()) return { type: "Sphere" } as FitObject;
     const features: GeoJSON.Feature[] = [];
     for (const def of this.defs) {
-      const spec = this.specs.find((s) => s.name === def.name);
-      if (!spec) continue;
-      for (const datum of spec.data as Array<{ type?: string; geometry?: GeoJSON.Geometry }>) {
-        const geometry = (datum.geometry ?? (datum as GeoJSON.Geometry)) as GeoJSON.Geometry;
+      for (const datum of def.fitData) {
+        // A Feature carries its geometry under `.geometry`; a bare Geometry IS the geometry.
+        const geometry = "geometry" in datum ? datum.geometry : (datum as GeoJSON.Geometry);
         if (geometry?.type) features.push({ type: "Feature", geometry, properties: null });
       }
     }
@@ -136,14 +165,14 @@ export class GeoMap extends BaseEngine {
    *
    * @typeParam F - the feature/datum type carried through to accessors and hit results.
    */
-  layer<F>(name: string, features: F | readonly F[] | (() => readonly F[]), opts: LayerOptions<F> = {}): LayerHandle<F> {
+  layer<F extends GeoInput>(name: string, features: F | readonly F[] | (() => readonly F[]), opts: LayerOptions<F> = {}): LayerHandle<F> {
     if (opts.passThrough) {
       if (opts.hover || opts.tooltip || opts.selection)
         throw new Error("hover/tooltip/selection require a retained layer (passThrough layers are not pickable)");
-      const source: unknown[] | (() => unknown[]) =
+      const source: readonly F[] | (() => readonly F[]) =
         typeof features === "function"
-          ? () => [...(features as () => readonly F[])()]
-          : [...(Array.isArray(features) ? (features as readonly F[]) : [features as F])];
+          ? () => [...features()]
+          : [...(Array.isArray(features) ? features : [features])];
       const radius = opts.pointRadius ?? 3;
       const lineWidth = opts.lineWidth ?? 0;
       // Color accessors: string | (f,i)=>string, resolved per datum. Points/path fills
@@ -152,23 +181,22 @@ export class GeoMap extends BaseEngine {
         v: string | ((f: F, i: number) => string) | undefined,
         fallback: string | null,
       ): ((f: F, i: number) => string | null) =>
-        typeof v === "function"
-          ? (f, i) => (v as (f: F, i: number) => string)(f, i)
-          : () => (v as string | undefined) ?? fallback;
+        typeof v === "function" ? v : () => v ?? fallback;
       const pointFillOf = accessor(opts.fill, "#000"); // points default to opaque black
       const pathFillOf = accessor(opts.fill, null);     // path fill: null = no fill
       const strokeOf = accessor(opts.stroke, null);     // path stroke: null = no stroke
-      this.registerPassThrough({
+      this.registerPassThrough<F>({
         name,
         source,
         buildItem: (f, i) => {
-          const feature = f as { type?: string; geometry?: GeoJSON.Geometry };
-          // Accept a Feature (read .geometry) or a bare Geometry (read the feature itself).
-          const geom = (feature.geometry ?? (feature as GeoJSON.Geometry)) as GeoJSON.Geometry;
+          // Accept a Feature (read .geometry) or a bare Geometry (the feature itself). The
+          // downstream geometry-kind casts are GeoJSON-typing boundaries (a discriminated
+          // walk d3-geo's own typings don't narrow structurally), not datum erasure.
+          const geom: GeoJSON.Geometry = "geometry" in f ? f.geometry : (f as GeoJSON.Geometry);
           const type = geom?.type;
           if (type === "Point") {
             const xy = projectVisiblePoint(this.projection, (geom as GeoJSON.Point).coordinates as [number, number]);
-            return xy ? { kind: "points", centers: [xy], radius, color: pointFillOf(f as F, i) ?? "#000" } : null;
+            return xy ? { kind: "points", centers: [xy], radius, color: pointFillOf(f, i) ?? "#000" } : null;
           }
           if (type === "MultiPoint") {
             const centers: [number, number][] = [];
@@ -176,7 +204,7 @@ export class GeoMap extends BaseEngine {
               const xy = projectVisiblePoint(this.projection, c as [number, number]);
               if (xy) centers.push(xy);
             }
-            return centers.length > 0 ? { kind: "points", centers, radius, color: pointFillOf(f as F, i) ?? "#000" } : null;
+            return centers.length > 0 ? { kind: "points", centers, radius, color: pointFillOf(f, i) ?? "#000" } : null;
           }
           // Polygon / MultiPolygon / LineString / MultiLineString / GeometryCollection / Feature:
           // record the projected subpaths (same geoPath path as the retained geo layer).
@@ -184,7 +212,7 @@ export class GeoMap extends BaseEngine {
           geoPath(this.projection, rec)(f as Parameters<ReturnType<typeof geoPath>>[0]);
           const subpaths = rec.subpaths.map((s) => ({ closed: s.closed, points: s.points.slice() }));
           if (subpaths.length === 0) return null;
-          return { kind: "path", subpaths, fill: pathFillOf(f as F, i), stroke: strokeOf(f as F, i), lineWidth };
+          return { kind: "path", subpaths, fill: pathFillOf(f, i), stroke: strokeOf(f, i), lineWidth };
         },
         sizeMode: opts.sizeMode,
         clipTo: opts.clipTo,
@@ -192,9 +220,17 @@ export class GeoMap extends BaseEngine {
       return new LayerHandle<F>(this, name, (items) => this.appendPassThrough(name, items as unknown[]));
     }
     if (typeof features === "function") throw new Error("callback data requires passThrough: true");
-    const list = Array.isArray(features) ? (features as F[]) : [features as F];
-    this.defs = this.defs.filter((d) => d.name !== name).concat({ name, opts });
+    const list: F[] = Array.isArray(features) ? [...features] : [features];
     this.dropInteractionState(name); // a re-declared layer starts with base styles
+    // Capture a datum-typed rebuild closure (re-projects against the CURRENT projection) and the
+    // live data array — so setProjection/rotation/resize re-register without recovering F from the
+    // engine's datum-erased store (#221). `list` is the same reference appendToLayer extends.
+    this.defs = this.defs.filter((d) => d.name !== name).concat({
+      name,
+      hideOnInteraction: !!opts.hideOnInteraction,
+      rebuild: () => this.registerLayer(this.buildSpec(name, list, opts)),
+      fitData: list,
+    });
     this.registerLayer(this.buildSpec(name, list, opts));
     return new LayerHandle<F>(this, name, (items) => this.appendFeatures(name, items, opts));
   }
@@ -202,13 +238,13 @@ export class GeoMap extends BaseEngine {
   /** Project only the new features against the current projection and append them.
    *  spec.data (extended by appendToLayer) is the rebuild source, so appended
    *  features survive setProjection / rotation. */
-  private appendFeatures<F>(name: string, items: readonly F[], opts: LayerOptions<F>): void {
+  private appendFeatures<F extends GeoInput>(name: string, items: readonly F[], opts: LayerOptions<F>): void {
     if (items.length === 0) return;
     const spec = this.specs.find((s) => s.name === name);
     if (!spec) throw new Error(`unknown layer: ${name}`);
     const offset = spec.data.length;
     const ids = items.map((f, j) => (opts.id ? opts.id(f, offset + j) : offset + j));
-    const build = geoLayer(items as any[], this.projection, {
+    const build = geoLayer(items, this.projection, {
       id: (_f, j) => ids[j]!, lineWidth: opts.lineWidth, lineJoin: opts.lineJoin, miterLimit: opts.miterLimit, lineCap: opts.lineCap, pointRadius: opts.pointRadius, sizeMode: opts.sizeMode,
     });
     this.appendToLayer(name, items, ids, build);
@@ -333,14 +369,13 @@ export class GeoMap extends BaseEngine {
    *  rotation drag, skipHidden avoids re-projecting hideOnInteraction layers. */
   private rebuildLayers(o: { skipHidden?: boolean } = {}): void {
     for (const def of this.defs) {
-      if (o.skipHidden && def.opts.hideOnInteraction) continue;
-      const spec = this.specs.find((s) => s.name === def.name);
-      if (!spec) continue;
-      this.registerLayer(this.buildSpec(def.name, spec.data, def.opts));
+      if (o.skipHidden && def.hideOnInteraction) continue;
+      // The rebuild closure re-registers this layer's typed data against the current projection.
+      def.rebuild();
     }
   }
 
-  private buildSpec(name: string, list: any[], opts: LayerOptions): LayerSpec {
+  private buildSpec<F extends GeoInput>(name: string, list: F[], opts: LayerOptions<F>): LayerSpec<F> {
     const ids = list.map((f, i) => (opts.id ? opts.id(f, i) : i));
     return {
       name, data: list, ids, fill: opts.fill, stroke: opts.stroke, clipTo: opts.clipTo,

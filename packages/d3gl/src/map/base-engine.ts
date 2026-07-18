@@ -1,6 +1,8 @@
 import { select, type Selection } from "d3-selection";
 import { zoom as d3zoom, zoomIdentity, type D3ZoomEvent, type ZoomBehavior } from "d3-zoom";
-import { Scene, HitIndex, declutterScreen, declutterScratch, type Backend, type GroupBuilder, type RenderLayer, type ViewTransform, type DeclutterScratch } from "../core/index.js";
+import { Scene, HitIndex, declutterScreen, declutterScratch, type Backend, type GroupBuilder, type RenderLayer, type ViewTransform, type DeclutterScratch, type TextData } from "../core/index.js";
+import { LabelLayer, placeLabels, resolveLabelStyle, measureText, canvasFont, DEFAULT_LABEL_TEXT, type LabelAnchor, type LabelStyle } from "../labels/index.js";
+import type { TextAnchor, LabelBox } from "../labels/cull.js";
 import { InstancedLane, type ScreenRect } from "../core/instanced-lane.js";
 import { createBackend, createCanvasBackend, type BackendType, type BackendHandle } from "./backend-factory.js";
 import { buildBatch, type DrawItem } from "./draw-batch.js";
@@ -23,8 +25,10 @@ export interface HoverHit {
   members?: () => (string | number)[];
 }
 
-/** A registered instanced selection lane (#108-B). BaseEngine drives its re-emit + resolves its picks. */
-export interface InstancedLaneEntry {
+/** A registered instanced selection lane (#108-B). BaseEngine drives its re-emit + resolves its picks.
+ *  Generic over the datum type `D` its interaction block resolves (see {@link LaneInteractive});
+ *  stored datum-erased in the engine's registry via the {@link BaseEngine.registerInstancedLane} overload. */
+export interface InstancedLaneEntry<D = unknown> {
   lane: InstancedLane;
   /** The instanced layer names this lane emits — cleared then re-added in this order each emit (draw order). */
   layerNames: readonly string[];
@@ -43,7 +47,7 @@ export interface InstancedLaneEntry {
    * recolor). Absent ⇒ pick-only (the pre-N7c-2 behavior: `on("hover"|"click")` fire, but no
    * managed selection or visual highlight).
    */
-  interactive?: LaneInteractive;
+  interactive?: LaneInteractive<D>;
   /**
    * GPU-readback link picking (#141). When set, {@link BaseEngine.pick} consults the backend's pick
    * FBO ({@link Backend.pickInstanced}) *after* the CPU `lane.pick` misses (so a node drawn over a
@@ -61,15 +65,15 @@ export interface InstancedLaneEntry {
  * instanced glyphs have no Scene drawables to recolor; `selection.others` dimming is therefore not
  * applied on lanes (selected glyphs get a ring instead).
  */
-export interface LaneInteractive {
+export interface LaneInteractive<D = unknown> {
   /** The `hit.layer` value this lane owns — the key under which selection/hover ids are tracked. */
   layer: string;
   /** Per-layer interaction options (selectable / hover / tooltip / selection). */
-  options: InteractiveLayerOptions;
+  options: InteractiveLayerOptions<D>;
   /** Companion highlight lane re-emitted when this layer's selection/hover set changes (the ring overlay). */
   highlightLane: string;
   /** Datum for a selected/hovered id — used to rebuild hits in {@link BaseEngine.selection}. */
-  datumOf(id: string | number): unknown;
+  datumOf(id: string | number): D | null;
   /** Underlying source ids `id` represents, for {@link HoverHit.members} (subtree leaves / absorbed set). */
   members(id: string | number): (string | number)[];
 }
@@ -81,7 +85,7 @@ export interface LaneInteractive {
  * hover/tooltip dispatch read. `Plot.layer()`/`Plot.points()` and `GeoMap.layer()` forward them
  * into the {@link LayerSpec} via {@link BaseEngine.interactionFields}, so the contract has one home.
  */
-export interface InteractiveLayerOptions<D = any> {
+export interface InteractiveLayerOptions<D = unknown> {
   /** Styles for {@link BaseEngine.select}: the selected set and its complement.
    *  Defaults: selected keeps the base style; others `{ opacity: 0.3 }`. */
   selection?: SelectionOptions;
@@ -124,12 +128,66 @@ export interface NodeDragSession {
   end(): void;
 }
 
-export interface LayerSpec {
+/**
+ * Engine-owned text labels for `plot()` / `geoMap()` (#223) — the data-driven analogue of
+ * `network.labels()`. You supply the data and d3-style accessors; the engine measures each label's
+ * text once (no magic-number metrics), places + culls collisions on every pan/zoom (the shared
+ * {@link LabelLayer} machinery), and routes to the active backend — an HTML overlay on WebGL, native
+ * `<text>`/`fillText` on SVG/Canvas so labels survive `toSVG()`/`toPNG()` export. Styling mirrors
+ * `network.labels()`: a built-in default look, an inline {@link style} override, or a full-CSS
+ * {@link className}. Plain labels are vertically centred on the anchor (offset sits them beside the
+ * glyph); set {@link rotationOf} for the oriented (rotated) model.
+ */
+export interface DataLabelOptions<D = unknown> {
+  /** The label text for a datum, or `null`/`""` to skip it (no label for that datum). */
+  labelOf: (d: D, i: number) => string | null | undefined;
+  /** The label's REFERENCE (world / pre-transform) anchor `[x, y]`; `null`/`undefined` skips it.
+   *  For `geoMap` this is a projected point (e.g. `projection(feature.geometry.coordinates)`). */
+  anchorOf: (d: D, i: number) => [number, number] | null | undefined;
+  /** Importance for collision priority and, when {@link max} caps, ranking (higher wins). Default 0. */
+  importanceOf?: (d: D, i: number) => number;
+  /** Constant screen-px offset `[dx, dy]` from the anchor, or a per-datum accessor. Default `[0, 0]`. */
+  offset?: [number, number] | ((d: D, i: number) => [number, number]);
+  /** Oriented labels: reading-direction angle (radians) per datum — switches to the rotated
+   *  collision/render model (text runs along the axis, vertically centred on the anchor). */
+  rotationOf?: (d: D, i: number) => number;
+  /** Oriented labels only: which way text runs from the anchor (default `"start"`). */
+  textAnchor?: TextAnchor;
+  /** Oriented labels only: flip 180° to keep text upright (radial-tree readability flip). */
+  keepUpright?: boolean;
+  /** Cap the number of shown labels to the top-k by importance (default: no cap — collision thins). */
+  max?: number;
+  /** Inline overlay CSS (camelCased property → value), merged over the built-in default label look
+   *  (a dark 11px sans-serif with a white halo) — a partial override like `{ color: "#333" }` keeps
+   *  the rest. Applied once per element at creation, never per frame. */
+  style?: LabelStyle;
+  /** Advanced overlay styling: a CSS class that SKIPS the built-in default so the class's CSS has
+   *  full control (combine with {@link style} for inline overrides). */
+  className?: string;
+  /** Font for backend-native text (SVG/Canvas, incl. export). Defaults to {@link style}'s font, then
+   *  the built-in default. Also the font used to MEASURE label boxes. */
+  font?: string;
+  /** Fill colour for backend-native text. Defaults to {@link style}'s colour, then the default. */
+  color?: string;
+  /** Legibility halo stroked behind backend-native text. Defaults to the built-in white halo unless
+   *  {@link style} sets `textShadow: "none"`. */
+  halo?: { color: string; width: number };
+}
+
+/**
+ * A registered retained layer, generic over its datum type `D`. Engines construct a
+ * `LayerSpec<D>` with the concrete datum from `layer()`/`points()` registration, so `data`
+ * and its accessors (`fill`/`stroke`/`tooltip`/`hover`) stay bound to the same `D` and can't
+ * detype. {@link BaseEngine} stores specs datum-erased (`LayerSpec<unknown>` — the engine
+ * never inspects a datum, it only pairs `data[i]` back with the layer's own accessors);
+ * the typed→erased hand-off happens at the {@link BaseEngine.registerLayer} overload.
+ */
+export interface LayerSpec<D = unknown> {
   name: string;
-  data: any[];
+  data: D[];
   ids: (string | number)[];
-  fill?: Accessor<any, string>;
-  stroke?: Accessor<any, string>;
+  fill?: Accessor<D, string>;
+  stroke?: Accessor<D, string>;
   clipTo?: string;
   sizeMode?: "world" | "screen";
   /** When true, this layer is dropped from the render while the user is interacting
@@ -146,20 +204,23 @@ export interface LayerSpec {
   /** Styles applied by {@link BaseEngine.select} to the selected set / its complement. */
   selection?: SelectionOptions;
   /** Hover-highlight for this layer: `true`/style/fn, or a `{ hovered?, others? }` object (#162). */
-  hover?: HoverOption | HoverOptions;
+  hover?: HoverOption<D> | HoverOptions<D>;
   /** Tooltip content for the hovered drawable (string / element / null = hide). */
-  tooltip?: (d: any, id: string | number) => string | HTMLElement | null;
+  tooltip?: (d: D, id: string | number) => string | HTMLElement | null;
   /** Opt this layer into click-driven selection (see {@link InteractiveLayerOptions.selectable}). */
   selectable?: boolean | { multi?: boolean };
   build: (g: GroupBuilder) => void;   // rebuilds the Scene group (geo or draw)
 }
 
-export interface PassThroughSpec {
+/** A pass-through (non-retained) layer, generic over its datum type `D` — `source` and
+ *  `buildItem` stay bound to the same `D`. Stored datum-erased like {@link LayerSpec}, with
+ *  the typed→erased hand-off at the {@link BaseEngine.registerPassThrough} overload. */
+export interface PassThroughSpec<D = unknown> {
   name: string;
   /** User data source: an array, or a function re-invoked each full repaint. */
-  source: unknown[] | (() => unknown[]);
+  source: readonly D[] | (() => readonly D[]);
   /** Build the draw item for a datum, or null to cull. Built by the subclass. */
-  buildItem: (d: unknown, i: number) => DrawItem | null;
+  buildItem: (d: D, i: number) => DrawItem | null;
   sizeMode?: "world" | "screen";
   clipTo?: string;
 }
@@ -223,6 +284,24 @@ export abstract class BaseEngine {
   /** Active highlight per source layer; re-resolved after a rebuild re-projects geometry. */
   private highlights = new Map<string, { ids: (string | number)[]; styleOrDraw?: HighlightStyle | HighlightDraw }>();
   protected transform: ViewTransform = { k: 1, x: 0, y: 0 };
+  /** Shared frontier/data label overlay (#105 N7b, #223): the HTML overlay used on the WebGL backend
+   *  (crisp + accessible). Owned by the base so every engine's label API — `network.labels()` and the
+   *  plot/geo `labels(data, opts)` — reuses one overlay + one placement/routing path. Null when off. */
+  protected labelLayer: LabelLayer | null = null;
+  /** Backend-native text style (SVG/Canvas `<text>`/`fillText`, incl. export) for the current label
+   *  set — set once by {@link createLabelOverlay}, read by {@link routeLabels}. Null when off. */
+  private labelText: { font?: string; color?: string; halo?: { color: string; width: number } } | null = null;
+  /** The last {@link routeLabels} anchor set, retained (reference only) for the export-only text
+   *  backend push (#219): a WebGL toPNG()/toSVG() places these once at export time. Always current —
+   *  the overlay branch of routeLabels runs on every transform/rebuild. Covers BOTH network frontier
+   *  labels and plot/geo data labels (#223), since both route through routeLabels. */
+  private exportAnchors: readonly LabelAnchor[] = [];
+  /** The text alignment the retained {@link exportAnchors} were routed with ("middle" for network
+   *  glyph-centred labels, "start" for plot/geo beside-the-glyph labels). */
+  private exportAlign: TextAnchor = "middle";
+  /** Retained plot/geo data-label anchors (#223): measured + built ONCE at `labels(data, opts)` call,
+   *  re-placed (not rebuilt/re-measured) on every transform. `max` caps the shown set (default ∞). */
+  private dataLabels: { anchors: LabelAnchor[]; max: number } | null = null;
   protected handle: BackendHandle | null = null;
   protected ready: Promise<void>;
   private currentBackend: BackendType;
@@ -456,11 +535,15 @@ export abstract class BaseEngine {
   /** Pull the declarative interaction options out of a layer-options object into the
    *  {@link LayerSpec} fields. Shared by `Plot.layer()`/`Plot.points()` and `GeoMap.layer()`
    *  so the hover/tooltip/selection contract lives in exactly one place. */
-  protected interactionFields(opts: InteractiveLayerOptions): Pick<LayerSpec, "selection" | "hover" | "tooltip" | "selectable"> {
+  protected interactionFields<D>(opts: InteractiveLayerOptions<D>): Pick<LayerSpec<D>, "selection" | "hover" | "tooltip" | "selectable"> {
     return { selection: opts.selection, hover: opts.hover, tooltip: opts.tooltip, selectable: opts.selectable };
   }
 
-  /** Register (or replace) an instanced selection lane and emit it once if a backend is ready. */
+  /** Register (or replace) an instanced selection lane and emit it once if a backend is ready.
+   *  The generic overload is the typed→erased seam: engines register with their concrete datum
+   *  (`InstancedLaneEntry<D>`); the registry stores it datum-erased (the engine only threads a
+   *  lane's datum back through its own `datumOf`/`options`, never inspecting it). */
+  protected registerInstancedLane<D>(name: string, entry: InstancedLaneEntry<D>): void;
   protected registerInstancedLane(name: string, entry: InstancedLaneEntry): void {
     this.instancedLanes.set(name, entry);
     // An interactive lane needs the same pointer listeners as a Scene layer with these options
@@ -633,7 +716,7 @@ export abstract class BaseEngine {
     const ix = this.laneInteractiveFor(layer)?.ix;
     const sel = ix ? ix.options.selectable : this.specs.find((s) => s.name === layer)?.selectable;
     if (!sel) return { on: false, multi: false };
-    return { on: true, multi: sel !== true && (sel as { multi?: boolean }).multi === true };
+    return { on: true, multi: sel !== true && sel.multi === true };
   }
 
   /** Show the hover ring for one instanced-lane glyph (`id`), clearing the previous lane hover.
@@ -675,7 +758,11 @@ export abstract class BaseEngine {
     return out.length ? out : [id];
   }
 
-  /** Register/replace a layer: build its Scene group, apply accessors, index, push. */
+  /** Register/replace a layer: build its Scene group, apply accessors, index, push.
+   *  The generic overload is the typed→erased seam: engines construct a `LayerSpec<D>` with
+   *  their concrete datum; storage is datum-erased (`LayerSpec<unknown>`) because the engine
+   *  only ever pairs `spec.data[i]` with the same spec's accessors — it never inspects a datum. */
+  protected registerLayer<D>(spec: LayerSpec<D>): void;
   protected registerLayer(spec: LayerSpec): void {
     if (spec.name.endsWith(HIGHLIGHT_SUFFIX)) throw new Error(`layer name suffix "${HIGHLIGHT_SUFFIX}" is reserved`);
     this.scene.group(spec.name, spec.build);
@@ -722,7 +809,9 @@ export abstract class BaseEngine {
   /** Register a pass-through layer (called by subclasses for passThrough:true).
    *  Always stores the spec so a not-ready registration is replayed on backend install.
    *  When a backend IS live: activate it if supported, else remove the spec + throw
-   *  (an explicit unsupported backend, e.g. SVG). When no backend is live yet: defer. */
+   *  (an explicit unsupported backend, e.g. SVG). When no backend is live yet: defer.
+   *  The generic overload is the typed→erased seam (see {@link registerLayer}). */
+  protected registerPassThrough<D>(spec: PassThroughSpec<D>): void;
   protected registerPassThrough(spec: PassThroughSpec): void {
     this.ptSpecs.set(spec.name, spec);
     if (!this.handle) return; // not ready: keep the spec; install replay activates it
@@ -738,7 +827,7 @@ export abstract class BaseEngine {
   }
 
   /** Incremental draw: project just this batch and draw it on top (O(new)). */
-  protected appendPassThrough(name: string, items: unknown[]): void {
+  protected appendPassThrough(name: string, items: readonly unknown[]): void {
     const spec = this.ptSpecs.get(name);
     if (!spec || !this.handle) return;
     const batch = buildBatch(items, spec.buildItem);
@@ -746,7 +835,7 @@ export abstract class BaseEngine {
   }
 
   /** Resolve the current data array for a pass-through layer. */
-  private ptData(spec: PassThroughSpec): unknown[] {
+  private ptData(spec: PassThroughSpec): readonly unknown[] {
     return typeof spec.source === "function" ? spec.source() : spec.source;
   }
 
@@ -803,7 +892,7 @@ export abstract class BaseEngine {
    * other) so a duplicate throws before any mutation — the append is atomic. The
    * Scene-level dup guard remains as a backstop.
    */
-  protected appendToLayer(name: string, items: readonly any[], ids: readonly (string | number)[], build: (g: GroupBuilder) => void): void {
+  protected appendToLayer(name: string, items: readonly unknown[], ids: readonly (string | number)[], build: (g: GroupBuilder) => void): void {
     const spec = this.specs.find((s) => s.name === name);
     if (!spec) throw new Error(`unknown layer: ${name}`);
     if (items.length === 0) return;
@@ -908,8 +997,15 @@ export abstract class BaseEngine {
    * Also updates the managed selection set and fires `on("select")` with `ev = undefined`
    * (programmatic — no PointerEvent), so callers can observe programmatic selection the
    * same way they observe gesture selection.
+   *
+   * The predicate overload is generic over the layer's datum type `D` — annotate the
+   * parameter (`(d: MyDatum) => …`) or pass `select<MyDatum>(…)` to get a typed datum,
+   * mirroring d3-selection's caller-asserted datum generics. Prefer the layer handle's
+   * {@link LayerHandle.select}, which already knows `D` from registration.
    */
-  select(name: string, set: readonly (string | number)[] | ((d: any, i: number) => boolean) | null): this {
+  select(name: string, set: readonly (string | number)[] | null): this;
+  select<D = unknown>(name: string, predicate: (d: D, i: number) => boolean): this;
+  select(name: string, set: readonly (string | number)[] | ((d: unknown, i: number) => boolean) | null): this {
     // Lane-first: an interactive lane takes precedence over a same-named (empty placeholder) Scene spec.
     if (this.laneInteractiveFor(name)) {
       // Instanced lane: update the managed set + refresh the ring overlay (no Scene drawables to style).
@@ -925,7 +1021,7 @@ export abstract class BaseEngine {
     // Resolve function selectors to an id set once (stored + used for styling).
     const resolved: Set<string | number> | null = set === null ? null
       : typeof set === "function"
-        ? new Set(spec.ids.filter((_, i) => (set as (d: any, i: number) => boolean)(spec.data[i], i)))
+        ? new Set(spec.ids.filter((_, i) => set(spec.data[i], i)))
         : new Set(set);
     // Update managed selection set (mirrors what the gesture does).
     if (resolved === null) this.selected.delete(name);
@@ -966,7 +1062,12 @@ export abstract class BaseEngine {
    * layer's buffers are untouched, so the per-change cost is tessellating the
    * highlighted items only. `styleOrDraw` falls back to the layer's `hover` option,
    * then to the default white outline. `null` clears.
+   *
+   * The draw-fn overload is generic over the layer's datum type `D` (caller-asserted,
+   * like {@link select}'s predicate) so a custom highlight draw sees a typed datum.
    */
+  highlight(name: string, idOrIds: string | number | readonly (string | number)[] | null, style?: HighlightStyle): this;
+  highlight<D = unknown>(name: string, idOrIds: string | number | readonly (string | number)[] | null, draw: HighlightDraw<D>): this;
   highlight(
     name: string,
     idOrIds: string | number | readonly (string | number)[] | null,
@@ -1183,9 +1284,179 @@ export abstract class BaseEngine {
   }
 
   /** Called by {@link setTransform} just before the render (zoom frame or programmatic), after lanes
-   *  re-emit. Subclasses override to re-place view-tracking overlays/labels — e.g. the network's
-   *  frontier label layer (#105 N7b) — so a backend that bakes labels into the frame draws them now. */
-  protected afterTransform(): void {}
+   *  re-emit. Re-places the plot/geo data labels (#223); subclasses may override to re-place their own
+   *  view-tracking overlays/labels — e.g. the network's frontier label layer (#105 N7b) — so a backend
+   *  that bakes labels into the frame draws them now. */
+  protected afterTransform(): void { this.refreshDataLabels(); }
+
+  // ── Engine-owned labels (#105 N7b, #223) ─────────────────────────────────────────────────────
+  // The overlay + placement/routing is shared by every engine; `network.labels()` builds its own
+  // (LOD-frontier) anchors, while plot/geo build data-driven anchors here from d3-style accessors.
+
+  /** Ensure the host is positioned and (re)create the label overlay with the resolved inline style,
+   *  storing the backend-native text style used to route labels on SVG/Canvas (so they survive
+   *  export). Styling lands once per element at creation — {@link routeLabels} adds no per-frame
+   *  restyle. Shared by `network.labels()` and the plot/geo data-label API. */
+  protected createLabelOverlay(
+    className: string | undefined,
+    style: LabelStyle | undefined,
+    text: { font?: string; color?: string; halo?: { color: string; width: number } },
+  ): void {
+    if (typeof getComputedStyle === "function" && getComputedStyle(this.host).position === "static") {
+      this.host.style.position = "relative";
+    }
+    this.labelLayer?.destroy();
+    this.labelLayer = new LabelLayer(this.host, (a) => a.text, className, resolveLabelStyle(className, style));
+    this.labelText = text;
+  }
+
+  /** Tear down the label overlay and clear any backend-native label set (including the WebGL
+   *  export-only stash — the next export must not carry stale labels). */
+  protected clearLabelOverlay(): void {
+    this.labelLayer?.destroy();
+    this.labelLayer = null;
+    this.labelText = null;
+    this.exportAnchors = [];
+    this.backend()?.setTextLayer?.([]);
+  }
+
+  /**
+   * Place + route a fully-built label anchor set to the active backend (#105 N7b-2). A backend that
+   * draws text natively AND live (SVG `<text>` / Canvas `fillText`) renders the culled survivors —
+   * so labels appear in `toSVG()`/`toPNG()`; otherwise — WebGL, whose `setTextLayer` is an
+   * export-only stash ({@link Backend.textLayerMode}, #219) — the HTML overlay owns the screen and
+   * the anchor set is retained (reference only, zero added per-frame work) so {@link toSVG}/
+   * {@link toPNG} can feed the stash at export time. Project + cull is shared ({@link placeLabels})
+   * so both paths place identically. Native text is vertically centred on the box (`y + height/2`,
+   * baseline "middle") and horizontally aligned per `align` — `"start"` for plot/geo labels beside
+   * a glyph, `"middle"` for network labels centred on it.
+   */
+  protected routeLabels(anchors: readonly LabelAnchor[], align: TextAnchor = "middle"): void {
+    const layer = this.labelLayer;
+    if (!layer) return;
+    const viewport = { width: this.width, height: this.height };
+    const backend = this.backend();
+    if (backend?.setTextLayer && backend.textLayerMode !== "export-only") {
+      const survivors = placeLabels(anchors, this.transform, viewport);
+      backend.setTextLayer(this.toTextData(survivors, align));
+      layer.update([], this.transform, viewport); // keep the overlay empty on a native-text backend
+    } else {
+      layer.update(anchors, this.transform, viewport);
+      // Retain the anchor set (reference only — the array was built above regardless) so an
+      // export-only text backend can be fed the placed labels at toPNG()/toSVG() time (#219).
+      // Nothing is placed or allocated here — zero added per-frame work.
+      this.exportAnchors = anchors;
+      this.exportAlign = align;
+    }
+  }
+
+  /** Map placed label boxes to backend {@link TextData} — the one shape both the live native-text
+   *  path (SVG/Canvas) and the export-only push (WebGL, #219) emit, so exports match across backends. */
+  private toTextData(survivors: readonly LabelBox[], align: TextAnchor): TextData[] {
+    const text = this.labelText;
+    return survivors.map((b) => ({
+      x: b.x,
+      y: b.y + (b.height ?? 0) / 2, // top-left box → vertical centre for the "middle" baseline
+      text: String(b.text),
+      align,
+      font: text?.font,
+      color: text?.color,
+      halo: text?.halo,
+      opacity: b.opacity as number | undefined,
+    }));
+  }
+
+  /** Feed the placed labels to an export-only text backend (#219) right before an export, so a WebGL
+   *  toPNG()/toSVG() includes what the HTML overlay shows — for network frontier labels AND plot/geo
+   *  data labels (#223) alike. Runs ONLY at export time (O(anchors in view) once per call), never per
+   *  frame; no-op on live-text backends (their set is already pushed). */
+  private pushExportLabels(): void {
+    const backend = this.backend();
+    if (!backend?.setTextLayer || backend.textLayerMode !== "export-only") return;
+    const active = this.labelLayer !== null;
+    const survivors = active ? placeLabels(this.exportAnchors, this.transform, { width: this.width, height: this.height }) : [];
+    backend.setTextLayer(this.toTextData(survivors, this.exportAlign));
+  }
+
+  /**
+   * Set (or, with `false`, clear) engine-owned data labels for plot/geoMap (#223). Measures each
+   * label's text ONCE here (never per frame), building a retained anchor set that {@link afterTransform}
+   * re-places on every pan/zoom. Plain labels are vertically centred on the anchor+offset (the measured
+   * height folds into the box); {@link DataLabelOptions.rotationOf} switches to the oriented model.
+   * Re-call to rebuild after the underlying data/positions change. O(data) to build + measure (a
+   * data-change/control cost, not per frame); measurement dedupes repeated label texts within the call.
+   */
+  protected setDataLabels<D>(data: readonly D[] | false, opts?: DataLabelOptions<D>): void {
+    if (data === false || !opts) {
+      this.dataLabels = null;
+      this.clearLabelOverlay();
+      this.render();
+      return;
+    }
+    // Native-text (SVG/Canvas export) style — derived to match the overlay when explicit opts are
+    // absent, so one `style` object styles both. Also the font used to MEASURE the label boxes.
+    const font = canvasFont(opts.font ?? opts.style?.font ?? DEFAULT_LABEL_TEXT.font);
+    const color = opts.color ?? opts.style?.color ?? DEFAULT_LABEL_TEXT.color;
+    const halo = opts.halo ?? (opts.style?.textShadow === "none" ? undefined : DEFAULT_LABEL_TEXT.halo);
+    this.createLabelOverlay(opts.className, opts.style, { font, color, halo });
+
+    const offsetOf = typeof opts.offset === "function" ? opts.offset : (): [number, number] => (opts.offset as [number, number]) ?? [0, 0];
+    const measured = new Map<string, { width: number; height: number }>(); // dedupe repeated texts (once each)
+    const anchors: LabelAnchor[] = [];
+    for (let i = 0; i < data.length; i++) {
+      const d = data[i]!;
+      const text = opts.labelOf(d, i);
+      if (!text) continue; // no label for this datum
+      const anchor = opts.anchorOf(d, i);
+      if (!anchor) continue; // e.g. a geoMap point off the projected globe
+      let box = measured.get(text);
+      if (!box) { box = measureText(text, font); measured.set(text, box); }
+      const rotation = opts.rotationOf?.(d, i);
+      const [ox, oy] = offsetOf(d, i);
+      // Plain labels: the box is top-left, so shift up by height/2 to sit centred on the anchor+offset.
+      // Oriented labels: labelGeometry already centres vertically, so the offset is used as given.
+      const offset: [number, number] = rotation === undefined ? [ox, oy - box.height / 2] : [ox, oy];
+      anchors.push({
+        id: i,
+        refX: anchor[0],
+        refY: anchor[1],
+        text,
+        width: box.width,
+        height: box.height,
+        priority: opts.importanceOf?.(d, i) ?? 0,
+        offset,
+        rotation,
+        textAnchor: opts.textAnchor,
+        keepUpright: opts.keepUpright,
+      });
+    }
+    this.dataLabels = { anchors, max: opts.max ?? Infinity };
+    this.refreshDataLabels();
+    this.render(); // bake just-set labels into the frame (Canvas); no-op-ish for the live-DOM backends
+  }
+
+  /** Re-place the retained data labels at the current transform (#223). No-op when off. Default path
+   *  (no `max`) passes the whole set straight to {@link routeLabels}, whose {@link placeLabels} already
+   *  viewport-filters + culls collisions — so the only per-frame work is that O(anchors) project+cull,
+   *  the same the raw `LabelLayer` did before (no regression; #204/#236's grid is the scale path). A
+   *  finite `max` adds an O(anchors) in-view rank+cap first. */
+  private refreshDataLabels(): void {
+    const state = this.dataLabels;
+    if (!state || !this.labelLayer) return;
+    const all = state.anchors;
+    if (all.length <= state.max) { this.routeLabels(all, "start"); return; }
+    // Cap to the top-k by importance among the in-view candidates (screen-space filter).
+    const { k, x, y } = this.transform;
+    const W = this.width, H = this.height;
+    const inView: LabelAnchor[] = [];
+    for (const a of all) {
+      const sx = k * a.refX + x + (a.offset?.[0] ?? 0);
+      const sy = k * a.refY + y + (a.offset?.[1] ?? 0);
+      if (sx >= 0 && sx <= W && sy >= 0 && sy <= H) inView.push(a);
+    }
+    inView.sort((p, q) => (q.priority ?? 0) - (p.priority ?? 0));
+    this.routeLabels(inView.slice(0, state.max), "start");
+  }
 
   /**
    * Hide anchored glyphs that overlap in screen space, keeping earlier (e.g. larger-clade)
@@ -1203,11 +1474,18 @@ export abstract class BaseEngine {
    */
   private declutterLayer(spec: LayerSpec, t: ViewTransform): void {
     if (!this.cullDeclutter(spec, t)) return; // wrote visibility flags into the Scene
-    // Flags-only change: push just the style tables (the styles-only path). No render() here —
-    // setTransform() renders right after the declutter loop. updateLayer would re-upload the
-    // full geometry per zoom frame for nothing.
+    // Only visibility bits moved — colours and geometry did not. Preferred path (#208): hand
+    // the backend the Scene's persistent typed flags view BY REFERENCE (zero copies, zero
+    // per-frame allocation). WebGL rewrites only the flags texture (drawableCount bytes, not
+    // the 9× of a full styleTables push); Canvas/SVG patch their retained vector views in
+    // place instead of re-materializing a fresh drawables array. No render() here —
+    // setTransform() renders right after the declutter loop.
     const backend = this.handle?.backend;
-    if (backend?.updateLayerStyles) {
+    if (!backend) return;
+    if (backend.updateLayerFlags) {
+      backend.updateLayerFlags(spec.name, this.scene.flagsView(spec.name));
+    } else if (backend.updateLayerStyles) {
+      // Fallback for backends without the flags-only entry point: full styles push.
       // The vector view (`drawables`) is what Canvas/SVG repaint from, but WebGL only stashes it
       // for `toSVG` export — `updateColors` drives the GPU from the flag table. So on a backend
       // that doesn't render from it, skip the (O(n)) materialization while interacting and let
@@ -1219,7 +1497,7 @@ export abstract class BaseEngine {
         needDrawables ? this.scene.drawables(spec.name) : undefined,
       );
     } else {
-      backend?.updateLayer(spec.name, this.renderLayer(spec));
+      backend.updateLayer(spec.name, this.renderLayer(spec));
     }
   }
 
@@ -1267,7 +1545,7 @@ export abstract class BaseEngine {
    */
   enableZoom(extent: [number, number] = [1, 100], onTransform?: (t: ViewTransform) => void): this {
     this.disableInteraction();
-    const sel = select(this.host as Element);
+    const sel = select<Element, unknown>(this.host);
     const behavior = d3zoom<Element, unknown>().scaleExtent(extent)
       // Reserve shift+drag for the marquee (#159) only when something is marquee-selectable — otherwise
       // keep d3-zoom's default (which pans on shift+drag). Shift+wheel still zooms (wheel is exempt).
@@ -1289,15 +1567,15 @@ export abstract class BaseEngine {
         onTransform?.(t);
       })
       .on("end", () => this.setInteracting(false));
-    (sel as any).call(behavior);
+    sel.call(behavior);
     this.zoomSel = sel;
     this.zoomBehavior = behavior;
     // Seed d3-zoom's internal transform from the engine's CURRENT view so a non-identity base
     // (e.g. a centering translate set via setTransform before enableZoom) is respected, and
     // zoom-to-cursor deltas measure from it rather than from identity.
     const t = this.transform;
-    (sel as any).call(behavior.transform, zoomIdentity.translate(t.x, t.y).scale(t.k));
-    this.interactionCleanup = () => { (sel as any).on(".zoom", null); this.zoomSel = null; this.zoomBehavior = null; };
+    sel.call(behavior.transform, zoomIdentity.translate(t.x, t.y).scale(t.k));
+    this.interactionCleanup = () => { sel.on(".zoom", null); this.zoomSel = null; this.zoomBehavior = null; };
     return this;
   }
 
@@ -1314,7 +1592,7 @@ export abstract class BaseEngine {
     if (!sel || !behavior) return;
     const t = this.transform;
     this.suppressZoomEmit = true;
-    (sel as any).call(behavior.transform, zoomIdentity.translate(t.x, t.y).scale(t.k));
+    sel.call(behavior.transform, zoomIdentity.translate(t.x, t.y).scale(t.k));
     this.suppressZoomEmit = false;
   }
   on(event: "hover" | "click", cb: (hit: HoverHit | null, ev: PointerEvent) => void): this;
@@ -1393,8 +1671,10 @@ export abstract class BaseEngine {
     return null;
   }
   render(): this { this.handle?.backend.render(); return this; }
-  toSVG(): string { return this.handle?.backend.toSVG() ?? ""; }
-  toPNG(): string { return this.handle?.backend.toPNG() ?? ""; }
+  // Exports feed the export-only text stash first (#219): a WebGL backend never draws labels live
+  // (the HTML overlay does), so the placed set is pushed once at export time — never per frame.
+  toSVG(): string { this.pushExportLabels(); return this.handle?.backend.toSVG() ?? ""; }
+  toPNG(): string { this.pushExportLabels(); return this.handle?.backend.toPNG() ?? ""; }
   destroy(): void {
     this.destroyed = true;
     this.sizingObserver?.disconnect();
@@ -1419,6 +1699,7 @@ export abstract class BaseEngine {
     this.marqueeBadge?.remove(); this.marqueeBadge = null;
     this.nodeDrag?.session?.end(); this.endNodeDrag(); // release a held drag + its window listeners (#140)
     this.tooltipEl?.destroy(); this.tooltipEl = null;
+    this.labelLayer?.destroy(); this.labelLayer = null; // engine-owned label overlay (#105 N7b, #223)
     this.handle?.backend.destroy();
     if (this.handle && this.handle.element !== this.host) this.handle.element.remove();
     this.handle = null;
@@ -1803,8 +2084,10 @@ export abstract class BaseEngine {
     }
     return out;
   }
-  private resolve<T>(a: Accessor<any, T> | undefined, d: any, i: number): T | undefined {
-    return typeof a === "function" ? (a as (d: any, i: number) => T)(d, i) : a;
+  /** Resolve a color accessor for one datum. Color-valued only (`string`), so the
+   *  constant/function union discriminates by `typeof` with no cast. */
+  private resolve(a: Accessor<unknown, string> | undefined, d: unknown, i: number): string | undefined {
+    return typeof a === "function" ? a(d, i) : a;
   }
   private applyAccessors(spec: LayerSpec, start = 0, present?: Set<string | number>): void {
     // A spec has one id per datum, but the built group may have fewer drawables —

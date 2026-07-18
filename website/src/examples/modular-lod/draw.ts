@@ -80,15 +80,13 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
 
   // Frontier labels (#105 N7b): a size badge on EVERY visible module aggregate (no `max` — the gasket is
   // symmetric, so showing all reads clearer than an arbitrary top-k; `labelOf` returns null for leaves,
-  // so only modules are badged). Re-placed (and re-picked) as you pan/zoom.
-  const labelStyle = document.createElement("style");
-  labelStyle.textContent = ".lod-label{font:600 11px/1 system-ui,sans-serif;color:#1f2937;text-shadow:0 0 3px #fff,0 0 3px #fff,0 0 3px #fff}";
-  host.appendChild(labelStyle);
-  net.labels({ className: "lod-label", labelOf: (id, info) => (info.aggregate ? `${info.count}` : null) });
+  // so only modules are badged). Re-placed (and re-picked) as you pan/zoom. Labels come pre-styled
+  // (dark 11px sans-serif + white halo); `style` tweaks individual properties inline.
+  net.labels({ labelOf: (id, info) => (info.aggregate ? `${info.count}` : null), style: { color: "#1f2937" } });
 
   return {
     engine: net,
-    dispose: () => { caption.remove(); labelStyle.remove(); },
+    dispose: () => caption.remove(),
     render: (options) => {
       net.select("nodes", null); // a new graph/cut invalidates prior node ids — clear the selection
       const depth = DEPTHS[(options.depth as number) ?? 2] ?? 4;

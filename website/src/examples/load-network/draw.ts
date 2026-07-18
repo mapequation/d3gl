@@ -20,12 +20,6 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
   const net = network(host, { width, height, backend });
   net.enableZoom([0.1, 8]); // scroll to zoom, drag to pan; engine labels follow the transform
 
-  // Style the labels: a CSS class for the WebGL HTML overlay, plus font/color/halo for the Canvas/SVG
-  // native-text backends (so `toSVG()` / `toPNG()` export them too).
-  const labelStyle = document.createElement("style");
-  labelStyle.textContent = ".net-label{font:500 11px/1 system-ui,sans-serif;color:#334455;text-shadow:0 0 3px #fff,0 0 3px #fff}";
-  host.appendChild(labelStyle);
-
   let disposed = false;
   const load = (text: string, filename: string): void => {
     if (disposed) return;
@@ -42,7 +36,8 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
       .style({ directed, nodeRadius: { by: "degree", scale: radius }, nodeFill: "#4878d0", linkWidth: 1, linkStroke: "#cbd5e6" })
       // Vertex names as engine-managed frontier labels: `labelOf` maps a node id → its parsed label, and
       // the engine re-places them on every pan/zoom + layout frame — no manual overlay/transform tracking.
-      .labels({ labelOf: (id) => names?.[id] ?? null, className: "net-label", offset: [7, -4], font: "500 11px system-ui, sans-serif", color: "#334455", halo: { color: "#ffffff", width: 3 } })
+      // The built-in label style (dark 11px sans-serif + white halo) covers every backend, export included.
+      .labels({ labelOf: (id) => names?.[id] ?? null, offset: [7, -4] })
       // The worker seeds a viewport-centred disc, so this opens framed at k=1 as it converges — no fit
       // needed here (fit is for the solvers that centre elsewhere, e.g. the GPU origin — see network/state).
       .layout({ backend: "worker", iterations: 300 });
@@ -55,7 +50,6 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
     engine: net,
     dispose: () => {
       disposed = true;
-      labelStyle.remove();
     },
   };
 };

@@ -1,6 +1,6 @@
 import { declutterMembers, type GroupBuilder, type PathContext, type LineJoin, type LineCap } from "../core/index.js";
 import { InstancedLane } from "../core/instanced-lane.js";
-import { BaseEngine, type InteractiveLayerOptions, type BaseEngineOptions, type LaneInteractive } from "./base-engine.js";
+import { BaseEngine, type InteractiveLayerOptions, type BaseEngineOptions, type LaneInteractive, type DataLabelOptions } from "./base-engine.js";
 import { LayerHandle } from "./layer-handle.js";
 import { resolvePlotPointsSoA, plotPointsCircles, declutterPointsStrategy } from "./points-lane.js";
 import { resolveRingColors, ringCircles } from "./highlight-ring.js";
@@ -12,15 +12,17 @@ const EMPTY_KEPT = new Uint32Array(0);
 /** Plot adds no engine-level options of its own — all of {@link BaseEngineOptions}
  *  (sizing, `backend`, `tooltipClass`) apply. */
 export interface PlotOptions extends BaseEngineOptions {}
-export interface PlotLayerOptions<D = any> extends InteractiveLayerOptions<D> {
+export interface PlotLayerOptions<D = unknown> extends InteractiveLayerOptions<D> {
   /**
-   * Draw one datum's geometry by emitting path commands. The context is typed as
-   * `CanvasRenderingContext2D` so d3 generators that render to a context —
+   * Draw one datum's geometry by emitting path commands. The context is **deliberately typed
+   * as `CanvasRenderingContext2D`** so d3 generators that render to a context —
    * `d3.linkHorizontal()`, `d3.linkRadial()`, `d3.line()`, `d3.arc()`,
-   * `geoPath(projection, ctx)`, `d3.ribbon()`, … — accept it directly with no cast.
-   * Only the path-building subset (moveTo/lineTo/bezierCurveTo/quadraticCurveTo/
-   * arc/arcTo/rect/closePath) is implemented; fills/strokes come from the layer
-   * options below, not from context state.
+   * `geoPath(projection, ctx)`, `d3.ribbon()`, … — accept it directly with no cast (d3's
+   * typings demand the full context). At runtime the engine passes a {@link PathContext} —
+   * only the path-building subset (moveTo/lineTo/bezierCurveTo/quadraticCurveTo/arc/arcTo/
+   * rect/closePath) is implemented; fills/strokes come from the layer options below, not
+   * from context state, and non-path members don't exist at runtime. Hand-written draw code
+   * that wants the honest contract can type its own helper against the exported `PathContext`.
    */
   draw: (ctx: CanvasRenderingContext2D, datum: D, index: number) => void;
   fill?: string | ((d: D, i: number) => string);
@@ -52,7 +54,7 @@ export interface PlotLayerOptions<D = any> extends InteractiveLayerOptions<D> {
   pickable?: boolean;
 }
 
-export interface PlotPointOptions<D = any> extends InteractiveLayerOptions<D> {
+export interface PlotPointOptions<D = unknown> extends InteractiveLayerOptions<D> {
   x: (d: D, i: number) => number;
   y: (d: D, i: number) => number;
   radius?: number | ((d: D, i: number) => number);
@@ -81,19 +83,21 @@ export interface PlotPointOptions<D = any> extends InteractiveLayerOptions<D> {
 }
 
 /** Stored per-points() layer so syncPointsLayer can re-evaluate lane eligibility on backend changes. */
-interface PointsLayerInfo<D = any> {
+interface PointsLayerInfo<D> {
   data: D[];
   ids: (string | number)[];
   opts: PlotPointOptions<D>;
 }
 
 export class Plot extends BaseEngine {
-  /** Retained info for every non-passThrough points() layer. Used by onBackendChanged() to
-   *  re-evaluate lane vs. Scene eligibility when the backend upgrades or downgrades.
-   *  Initialized lazily (not as a class field) so it is ready before the BaseEngine
-   *  constructor fires onBackendChanged() during `super()`. */
-  private _pointsLayers: Map<string, PointsLayerInfo> | undefined;
-  private get pointsLayers(): Map<string, PointsLayerInfo> {
+  /** Re-sync closure per non-passThrough points() layer, run by onBackendChanged() to
+   *  re-evaluate lane vs. Scene eligibility when the backend upgrades or downgrades. Each
+   *  closure captures its layer's {@link PointsLayerInfo} with the datum type `D` intact —
+   *  the datum-erased registry never re-derives it (the #221 seam). Initialized lazily
+   *  (not as a class field) so it is ready before the BaseEngine constructor fires
+   *  onBackendChanged() during `super()`. */
+  private _pointsLayers: Map<string, () => void> | undefined;
+  private get pointsLayers(): Map<string, () => void> {
     if (!this._pointsLayers) this._pointsLayers = new Map();
     return this._pointsLayers;
   }
@@ -106,7 +110,22 @@ export class Plot extends BaseEngine {
    *  layers so a canvas→WebGL upgrade promotes eligible layers to the instanced lane, and a
    *  downgrade reverts them to the Scene path. */
   protected override onBackendChanged(): void {
-    for (const name of this.pointsLayers.keys()) this.syncPointsLayer(name);
+    for (const sync of this.pointsLayers.values()) sync();
+  }
+
+  /**
+   * Show engine-owned text labels (#223): supply the data and d3-style accessors, and the engine
+   * measures each label's text once, then places + culls collisions and re-places them on every
+   * pan/zoom (no manual overlay, transform callback, or text-metric estimates). Rendered by the
+   * active backend — an HTML overlay on WebGL, native `<text>`/`fillText` on SVG/Canvas so labels
+   * survive `toSVG()`/`toPNG()` export. Pass `false` to remove; re-call to rebuild after the bound
+   * data or positions change.
+   */
+  labels(data: false): this;
+  labels<D>(data: readonly D[], opts: DataLabelOptions<D>): this;
+  labels<D>(data: readonly D[] | false, opts?: DataLabelOptions<D>): this {
+    this.setDataLabels(data, opts);
+    return this;
   }
 
   /**
@@ -117,35 +136,29 @@ export class Plot extends BaseEngine {
    *   replace it with an empty build so there is no double-draw.
    * - !useLane: unregister any instanced lane; register the real Scene LayerSpec.
    */
-  private syncPointsLayer(name: string): void {
-    const info = this.pointsLayers.get(name);
-    if (!info) return;
+  private syncPointsLayer<D>(name: string, info: PointsLayerInfo<D>): void {
     const { data: list, ids, opts } = info;
 
     // A decluttered points layer renders via the instanced lane even when interactive (#105 N7c-2):
     // selection/hover are drawn by a companion ring overlay, tooltip/pick resolve through the lane. Only
     // passThrough/clipTo (which the lane can't express) fall back to the Scene path. Non-decluttered
     // points still go Scene (the lane IS the declutter path).
+    const declutter = opts.declutter;
     const useLane = !opts.passThrough && !opts.clipTo
-      && opts.declutter != null && opts.declutter > 0 && !!this.backend()?.setInstancedLayer;
+      && declutter != null && declutter > 0 && !!this.backend()?.setInstancedLayer;
 
     const laneName = "points:" + name;
     const hlLaneName = laneName + ":hl";
 
     if (useLane) {
-      const xOf = (d: any, i: number) => opts.x(d, i);
-      const yOf = (d: any, i: number) => opts.y(d, i);
-      const pointRadiusOf = typeof opts.radius === "function"
-        ? (d: any, i: number) => (opts.radius as (d: any, i: number) => number)(d, i)
-        : (_d: any, _i: number) => (opts.radius as number | undefined) ?? 3;
-      const fillOf = typeof opts.fill === "function"
-        ? (d: any, i: number) => (opts.fill as (d: any, i: number) => string)(d, i)
-        : (_d: any, _i: number) => (opts.fill as string | undefined) ?? "#000";
+      const { radius, fill } = opts;
+      const pointRadiusOf = typeof radius === "function" ? radius : (): number => radius ?? 3;
+      const fillOf = typeof fill === "function" ? fill : (): string => fill ?? "#000";
       const screenSized = (opts.sizeMode ?? "world") === "screen";
 
       // Resolve the full per-point SoA ONCE (data/style change only, not per-frame).
       // Each accessor is called exactly N times here, never again during setTransform.
-      const { allCenters, allRadii, allColors } = resolvePlotPointsSoA(list, xOf, yOf, pointRadiusOf, fillOf);
+      const { allCenters, allRadii, allColors } = resolvePlotPointsSoA(list, opts.x, opts.y, pointRadiusOf, fillOf);
 
       // Allocate scratch buffers at capacity N (reused every frame — no per-frame allocation).
       const n = list.length;
@@ -157,7 +170,7 @@ export class Plot extends BaseEngine {
       const ixOpts = this.interactionFields(opts);
       const interactive = !!(ixOpts.selectable || ixOpts.hover || ixOpts.tooltip || ixOpts.selection);
       const winners = interactive ? new Int32Array(n) : undefined;
-      const strategy = declutterPointsStrategy(n, allCenters, allRadii, opts.declutter as number, undefined, this.width, this.height, screenSized, winners);
+      const strategy = declutterPointsStrategy(n, allCenters, allRadii, declutter, undefined, this.width, this.height, screenSized, winners);
       const srcLane = new InstancedLane(strategy, (vis) => {
         // Gather kept indices into scratch buffers (no accessor calls, no rgb() parse, no allocation).
         const circles = plotPointsCircles(vis, allCenters, allRadii, allColors, scratchCenters, scratchRadii, scratchColors);
@@ -175,11 +188,11 @@ export class Plot extends BaseEngine {
         return [{ name: laneName, primitive: "circles", circles, sizeMode: opts.sizeMode ?? "world" }];
       });
       const idToIndex = interactive ? new Map(ids.map((id, i) => [id, i])) : undefined;
-      const laneInteractive: LaneInteractive | undefined = interactive ? {
+      const laneInteractive: LaneInteractive<D> | undefined = interactive ? {
         layer: name,
         options: ixOpts,
         highlightLane: hlLaneName,
-        datumOf: (id) => { const i = idToIndex!.get(id); return i == null ? null : list[i]; },
+        datumOf: (id) => { const i = idToIndex!.get(id); return i == null ? null : list[i] ?? null; },
         members: (id) => { const i = idToIndex!.get(id); return i == null || !winners ? [id] : declutterMembers(winners, i, n).map((k) => ids[k]!); },
       } : undefined;
       this.registerInstancedLane(laneName, {
@@ -276,36 +289,36 @@ export class Plot extends BaseEngine {
         throw new Error("hover/tooltip/selection/selectable require a retained layer (passThrough layers are not pickable)");
       if (opts.declutter) throw new Error("declutter requires a retained layer (passThrough has no per-drawable visibility flags)");
       const radius = opts.radius ?? 3;
-      const radiusOf = typeof radius === "function"
-        ? (d: D, i: number) => (radius as (d: D, i: number) => number)(d, i)
-        : () => radius as number;
-      const colorOf = typeof opts.fill === "function"
-        ? (d: D, i: number) => (opts.fill as (d: D, i: number) => string)(d, i)
-        : () => (opts.fill as string | undefined) ?? "#000";
-      this.registerPassThrough({
+      const radiusOf = typeof radius === "function" ? radius : (): number => radius;
+      const fill = opts.fill;
+      const colorOf = typeof fill === "function" ? fill : (): string => fill ?? "#000";
+      this.registerPassThrough<D>({
         name,
-        source: (typeof data === "function" ? () => [...data()] : [...data]) as unknown[] | (() => unknown[]),
+        source: typeof data === "function" ? () => [...data()] : [...data],
         // plot x/y accessors yield projected world coords directly (view transform applied at draw)
         buildItem: (d, i) => ({
           kind: "points",
-          centers: [[opts.x(d as D, i), opts.y(d as D, i)]],
-          radius: radiusOf(d as D, i),
-          color: colorOf(d as D, i),
+          centers: [[opts.x(d, i), opts.y(d, i)]],
+          radius: radiusOf(d, i),
+          color: colorOf(d, i),
         }),
         sizeMode: opts.sizeMode,
         clipTo: opts.clipTo,
       });
-      return new LayerHandle<D>(this, name, (items) => this.appendPassThrough(name, items as unknown[]));
+      return new LayerHandle<D>(this, name, (items) => this.appendPassThrough(name, items));
     }
     if (typeof data === "function") throw new Error("callback data requires passThrough: true");
     const list = data as D[];
     const ids = list.map((d, i) => (opts.id ? opts.id(d, i) : i));
     this.dropInteractionState(name); // a re-declared layer starts with base styles
 
-    // Store the layer info so onBackendChanged() can re-sync when the backend upgrades/downgrades.
-    this.pointsLayers.set(name, { data: list, ids, opts });
+    // Store a re-sync closure so onBackendChanged() can re-register when the backend
+    // upgrades/downgrades. The closure keeps the datum type D bound to (data, ids, opts)
+    // — the engine-side registry stays datum-erased without re-deriving D (#221).
+    const info: PointsLayerInfo<D> = { data: list, ids, opts };
+    this.pointsLayers.set(name, () => this.syncPointsLayer(name, info));
     // Delegate registration to syncPointsLayer which handles both lane and Scene paths.
-    this.syncPointsLayer(name);
+    this.syncPointsLayer(name, info);
 
     // A declutter layer may render via the instanced lane now OR after a backend upgrade
     // (canvas→WebGL via backend:"auto"), so its handle must ALWAYS throw on append — the
@@ -347,8 +360,11 @@ export class Plot extends BaseEngine {
     const widthOf = typeof lw === "function" ? lw : (_d: D, _i: number) => lw as number;
     const anchorOf = opts.anchor;
     const { lineJoin, miterLimit, lineCap } = opts;
-    // d3gl's PathContext implements the path-building subset d3 generators use; present
-    // it as CanvasRenderingContext2D so user draw code needs no cast. Single cast here.
+    // DELIBERATE third-party-boundary cast (#221): d3gl's PathContext implements exactly the
+    // path-building subset d3-shape/d3-geo generators emit, but d3's typings demand the full
+    // CanvasRenderingContext2D — so the widening happens ONCE here and every user `draw`
+    // accepts `d3.line()`/`geoPath(proj, ctx)`/… uncast (the d3-compatibility core value).
+    // The exported PathContext type documents the honest contract for hand-written draw code.
     return (g) =>
       items.forEach((d, j) =>
         g.drawable(
