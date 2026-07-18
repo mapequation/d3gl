@@ -68,6 +68,49 @@ export function placeLabels(
 }
 
 /**
+ * Inline CSS for overlay label elements: camelCased CSS property → value (the string-valued
+ * subset of `CSSStyleDeclaration`), e.g. `{ color: "#1f2937", textShadow: "0 0 2px #fff" }`.
+ * A plain, engine-agnostic shape, so it can lift as-is into other engines' label overlays (#223).
+ */
+export type LabelStyle = {
+  [P in Extract<keyof CSSStyleDeclaration, string> as CSSStyleDeclaration[P] extends string ? P : never]?: string;
+};
+
+/**
+ * Default overlay label look (#224) — a compact dark sans-serif label with a white text-shadow
+ * halo, readable over busy geometry with zero user CSS. Applied by the engine label APIs (e.g.
+ * `network.labels()`) via {@link resolveLabelStyle}; a raw {@link LabelLayer} stays unstyled by
+ * default (the low-level primitive keeps today's inherit-from-container behaviour).
+ */
+export const DEFAULT_LABEL_STYLE: LabelStyle = {
+  font: "600 11px/1 system-ui, sans-serif",
+  color: "#111827",
+  textShadow: "0 0 3px #fff, 0 0 3px #fff, 0 0 3px #fff",
+};
+
+/**
+ * The engine-label styling policy (#224): merge a caller's inline {@link LabelStyle} over
+ * {@link DEFAULT_LABEL_STYLE} — a partial override keeps the rest — but when a `className` is
+ * given, return only the explicit `style` (possibly undefined): the class's CSS keeps full
+ * control, since an inline default would beat it. Shared so other engines lift the exact same
+ * policy (#223); pass the result as {@link LabelLayer}'s `style`.
+ */
+export function resolveLabelStyle(className: string | undefined, style: LabelStyle | undefined): LabelStyle | undefined {
+  return className ? style : { ...DEFAULT_LABEL_STYLE, ...style };
+}
+
+/**
+ * The same default look for BACKEND-NATIVE text (SVG `<text>` / Canvas `fillText`, incl. export),
+ * which CSS can't reach: the `font`/`color`/`halo` equivalent of {@link DEFAULT_LABEL_STYLE}
+ * (canvas font shorthand takes no line-height; the 3px halo stroke ≈ the 3px shadow blur).
+ */
+export const DEFAULT_LABEL_TEXT: { font: string; color: string; halo: { color: string; width: number } } = {
+  font: "600 11px system-ui, sans-serif",
+  color: "#111827",
+  halo: { color: "#ffffff", width: 3 },
+};
+
+/**
  * An HTML overlay of absolutely-positioned label elements. On each update it maps
  * reference anchors through the view transform to screen pixels, culls to the
  * viewport with collision resolution, and reconciles the DOM (reusing nodes by
@@ -84,6 +127,10 @@ export class LabelLayer {
     private readonly text: (anchor: LabelAnchor) => string,
     /** Optional class set on each label element, for styling the overlay (font, colour, halo). */
     private readonly className?: string,
+    /** Optional inline CSS set on each label element, applied ONCE at creation — never on the
+     *  per-transform update path. Applied as given: engine callers pass the default-merged result
+     *  of {@link resolveLabelStyle}; omitted, elements inherit from the container as before. */
+    private readonly style?: LabelStyle,
   ) {}
 
   update(
@@ -106,6 +153,9 @@ export class LabelLayer {
         node.style.pointerEvents = "none";
         node.style.whiteSpace = "nowrap";
         if (this.className) node.className = this.className;
+        // Styling lands ONCE here, in the creation branch — reused elements are never restyled on
+        // the per-transform update path (only left/top/transform/opacity below are per-update).
+        if (this.style) Object.assign(node.style, this.style);
         this.container.appendChild(node);
         this.nodes.set(key, node);
       }

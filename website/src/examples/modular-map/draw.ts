@@ -45,9 +45,6 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
   // flowBorder ring and a collapsed module's aggregateOutline.
   net.interactive({ selectable: { multi: true }, draggable: true, hover: true });
 
-  const labelStyle = document.createElement("style");
-  labelStyle.textContent = ".map-label{font:600 11px/1 system-ui,sans-serif;color:#111827;text-shadow:0 0 3px #fff,0 0 3px #fff,0 0 3px #fff}";
-  host.appendChild(labelStyle);
   // Labels slider → max cap; the last position is "All" (no limit).
   const LABEL_CAPS = [6, 12, 20, 30, 50, 100, Infinity];
 
@@ -63,7 +60,6 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
 
   return {
     engine: net,
-    dispose: () => labelStyle.remove(),
     render: (options) => {
       const n = SIZES[(options.nodes as number) ?? 1] ?? 1_000;
       if (n !== count) {
@@ -100,7 +96,8 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
         net.layout({ backend: "gpu", fit: true, iterations: 300 });
       }
 
-      net.labels({ max: LABEL_CAPS[(options.maxLabels as number) ?? 1] ?? 12, className: "map-label", labelOf: (id, info) => (info.aggregate ? `${info.count}` : `n${id}`) });
+      // Frontier labels come pre-styled (dark 11px sans-serif + white halo) — no CSS needed.
+      net.labels({ max: LABEL_CAPS[(options.maxLabels as number) ?? 1] ?? 12, labelOf: (id, info) => (info.aggregate ? `${info.count}` : `n${id}`) });
       const sizeMode = options.sizing === "World" ? "world" : "screen";
       const expandPx = (options.expand as number) ?? 120;
       const declutter = options.declutter !== "Off";

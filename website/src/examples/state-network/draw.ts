@@ -33,10 +33,6 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
   const net = network(host, { width, height, backend });
   net.enableZoom([0.05, 60]);
 
-  const labelStyle = document.createElement("style");
-  labelStyle.textContent = ".sn-label{font:600 11px/1 system-ui,sans-serif;color:#111827;text-shadow:0 0 3px #fff,0 0 3px #fff}";
-  host.appendChild(labelStyle);
-
   let data: SyntheticStateNetwork | null = null;
   let wedges: PhysicalPieWedges | null = null; // per-physical module wedges, for the physical-view tooltip
   let builtN = -1;
@@ -69,7 +65,6 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
 
   return {
     engine: net,
-    dispose: () => labelStyle.remove(),
     render: (options) => {
       const n = NODES[(options.nodes as number) ?? 1] ?? 100;
       const view = VIEW[(options.view as keyof typeof VIEW) ?? "Physical"] ?? "physical";
@@ -125,6 +120,7 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
 
       // Labels: physical (1,2,…) in the physical + both views, state ((i,j)) in the state + both views.
       // In the both view physical labels sit just outside each container (≈1:30); state labels on the dots.
+      // The built-in label style covers font/colour; `style` thins the default halo a touch.
       const physOn = options.physLabels === "On";
       const stateOn = options.stateLabels === "On";
       const cap = LABEL_CAPS[(options.maxLabels as number) ?? 1] ?? 12;
@@ -133,7 +129,7 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
       net.labels(
         showState || showPhysical
           ? {
-              className: "sn-label",
+              style: { textShadow: "0 0 3px #fff, 0 0 3px #fff" },
               max: Number.isFinite(cap) ? cap : undefined,
               labelOf: (id) => (physical ? (physOn ? g.physicalNames[id] ?? null : null) : stateOn ? g.stateNames[id] ?? null : null),
               physical: view === "both" && physOn ? { labelOf: (p) => g.physicalNames[p] ?? null } : undefined,

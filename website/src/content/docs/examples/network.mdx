@@ -329,9 +329,13 @@ gasket above labels only **module aggregates** (with their node count), not leav
 ```ts
 net.labels({
   labelOf: (id, info) => info.aggregate ? `${info.count}` : null, // badge modules; skip leaves
-  className: "lod-label",                                          // style the overlay (font, halo)
 });
 ```
+
+Labels come **pre-styled** — a compact dark sans-serif with a white halo, readable over busy geometry
+with zero CSS. Pass `style` (an inline CSS-properties object, merged over the default) to tweak it —
+`style: { color: "#1f2937" }` recolours and keeps the rest — or take full control with `className`,
+which skips the built-in default so your class's CSS decides everything.
 
 Set `max` to surface only the most important few on a **dense** map — the [directed map of modules](#a-directed-map-of-modules)
 below uses `max: 12`, where flow varies so the top-12 by importance (the tree's `weight` = summed flow)
@@ -345,11 +349,13 @@ on (`lod({ crossFade })`), labels fade in lockstep with the glyphs they sit on (
 the same cut alpha).
 
 Labels are rendered by the **active backend**: on **WebGL** they're an HTML overlay (crisp + accessible,
-styled via `className`); on **SVG/Canvas** the backend draws them natively — SVG `<text>`, Canvas
-`fillText` (style with `font`/`color`/`halo`). On **every** backend the placed labels appear in
-`toSVG()`/`toPNG()` **export** — WebGL composites them into the PNG and serializes them as `<text>` at
-export time, so a labelled export matches what you see regardless of the backend you happened to run.
-GPU/MSDF text (to put WebGL labels on the GPU for very high counts) is #69.
+styled by the default + `style`/`className` above); on **SVG/Canvas** the backend draws them natively —
+SVG `<text>`, Canvas `fillText` (`font`/`color`/`halo` override the matching native defaults, since CSS
+can't reach backend-drawn text). On **every** backend the placed labels appear in `toSVG()`/`toPNG()`
+**export** — WebGL composites them into the PNG and serializes them as `<text>` at export time, so a
+labelled export matches what you see regardless of the backend you happened to run. Switch this example
+to the SVG backend and Export SVG for publication-ready labelled vector output. GPU/MSDF text (to put
+WebGL labels on the GPU for very high counts) is #69.
 
 ## A directed map of modules
 
@@ -450,9 +456,10 @@ The same engine renders a network parsed from a file. `parseNetwork(text, filena
 the name: a **`.net`** file is read as **Pajek** (vertex labels and coordinates, `*Arcs`/`*Edges`),
 and anything else as a plain **edge list** (`source target [weight]`, one edge per line, `#`
 comments). Pick your own file or load a built-in sample of each format. Nodes are **sized by degree**
-(`scaleSqrt`) so hubs stand out, and vertex **labels** are drawn beside them with the HTML
-`LabelLayer` overlay (from `@mapequation/d3gl/labels`), which culls overlaps and tracks the GPU
-geometry as you pan and zoom.
+(`scaleSqrt`) so hubs stand out, and vertex **labels** are engine-managed
+[frontier labels](#frontier-labels) — one `net.labels({ labelOf, offset })` call, and they're culled
+against each other and re-placed on every pan/zoom **and every layout frame**, with the default label
+style (no CSS, no overlay bookkeeping, and no reaching into position arrays).
 
 <ExampleCard files={["load-network/draw.ts", "load-network/data.ts"]}>
   <LoadNetwork client:visible slot="demo" />
