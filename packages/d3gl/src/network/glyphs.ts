@@ -639,6 +639,35 @@ export interface SuperEdgeStyleResolved {
 }
 
 /**
+ * Reusable scratch for {@link superEdges} (#210) — engine-owned so a zoom-frame emit does **zero
+ * O(tree.size) work**: `seen` is a generation-stamped presence array (`seen[g] === gen` ⇔ on this
+ * call's frontier — the stamp bump replaces a per-frame clear), grown once per tree; the gather
+ * arrays grow-double and are reused; the maps are cleared (O(entries touched last call)) and reused.
+ * Outputs never alias the scratch, so one scratch per engine can serve every emit path.
+ */
+export interface SuperEdgesScratch {
+  /** Generation-stamped frontier membership, length ≥ tree.size — grown on demand, never per frame. */
+  seen: Int32Array;
+  /** Current generation stamp; bumped once per {@link superEdges} call. */
+  gen: number;
+  /** Gathered edge sources/targets/flows (parallel grow-arrays; only a call-local prefix is valid). */
+  aS: Int32Array;
+  bS: Int32Array;
+  wS: Float64Array;
+  /** Directed-pair flow lookup for reciprocal half-arrow widths — cleared per call. */
+  flowByPair: Map<number, number>;
+  /** Cross-level (#139) nearest-present-ancestor memo + projected-pair sums — cleared per call. */
+  cover: Map<number, number>;
+  proj: Map<number, number>;
+}
+
+/** Fresh {@link SuperEdgesScratch}. The network engine keeps ONE per instance; {@link superEdges}
+ *  falls back to a throwaway one when none is passed (backward-compatible, but then per-call O(tree.size)). */
+export function makeSuperEdgesScratch(): SuperEdgesScratch {
+  return { seen: new Int32Array(0), gen: 0, aS: new Int32Array(256), bS: new Int32Array(256), wS: new Float64Array(256), flowByPair: new Map(), cover: new Map(), proj: new Map() };
+}
+
+/**
  * Instanced LOD **super-edges**, unified across tree types and link styles (#104 N6). Links are
  * gathered from the tree's directed, flow-weighted super-edge CSR — built identically for a coarsening
  * tree and a module tree (so the edge-LOD logic is one path, not two). A visible node keeps an edge to
@@ -648,39 +677,59 @@ export interface SuperEdgeStyleResolved {
  * mismatch — is skipped, deferred to the LOD cross-fade #133). Width + colour come from the accumulated
  * subsumed flow. Rendered as fused **half-arrows** or bent/straight **lines** + (directed) arrowheads —
  * the same glyph choice the non-LOD path makes. `{}` when the tree has no super-edge CSR (spatial tree).
+ *
+ * Pass an engine-owned `scratch` ({@link makeSuperEdgesScratch}) to make the per-call cost
+ * O(frontier + drawn super-edges) — without it, presence tracking re-allocates O(tree.size) (#210).
  */
 export function superEdges(
   tree: LODTree,
   frontier: Uint32Array,
   style: SuperEdgeStyleResolved,
   view: { minX: number; maxX: number; minY: number; maxY: number },
+  scratch?: SuperEdgesScratch,
 ): SuperEdgesData {
   const off = tree.superEdgeOffset;
   const tgt = tree.superEdgeTarget;
   const flw = tree.superEdgeFlow;
   if (!off || !tgt || !flw) return { ids: [] };
 
-  const present = new Uint8Array(tree.size);
-  for (let i = 0; i < frontier.length; i++) present[frontier[i]!] = 1;
+  // #210: all working storage comes from the (reused) scratch. The only O(tree.size) cost is `seen`'s
+  // one-time growth to this tree's size; per call, bumping the generation stamp replaces a clear.
+  const sc = scratch ?? makeSuperEdgesScratch();
+  if (sc.seen.length < tree.size) sc.seen = new Int32Array(tree.size); // grown once per tree (zero-filled ⇒ never equals a stamp ≥ 1)
+  if (sc.gen === 0x7fffffff) { sc.seen.fill(0); sc.gen = 0; } // stamp wrap — once per 2^31 calls
+  const seen = sc.seen;
+  const gen = ++sc.gen; // seen[g] === gen ⇔ g is on this call's frontier
+  for (let i = 0; i < frontier.length; i++) seen[frontier[i]!] = gen;
   // A neighbour is drawable if it's on the frontier, or its centroid is off-screen (the edge just exits
   // the view toward a real node) — an O(1) test, no cull margin needed. Off-frontier *on-screen*
   // neighbours (collapsed↔expanded) are skipped.
   const offScreen = (h: number): boolean => tree.cx[h]! < view.minX || tree.cx[h]! > view.maxX || tree.cy[h]! < view.minY || tree.cy[h]! > view.maxY;
 
-  // Gather drawable directed super-edges + a reciprocal-flow lookup (for both-on-frontier pairs).
-  const aS: number[] = [];
-  const bS: number[] = [];
-  const wS: number[] = [];
-  const flowByPair = new Map<number, number>();
+  // Gather drawable directed super-edges + a reciprocal-flow lookup (for both-on-frontier pairs) into
+  // the scratch's reused grow-arrays/map (outputs are copied out below — they never alias the scratch).
+  const flowByPair = sc.flowByPair;
+  flowByPair.clear();
+  let len = 0;
+  const pushEdge = (a: number, b: number, w: number): void => {
+    if (len === sc.aS.length) {
+      const cap = len * 2;
+      const na = new Int32Array(cap); na.set(sc.aS); sc.aS = na;
+      const nb = new Int32Array(cap); nb.set(sc.bS); sc.bS = nb;
+      const nw = new Float64Array(cap); nw.set(sc.wS); sc.wS = nw;
+    }
+    sc.aS[len] = a;
+    sc.bS[len] = b;
+    sc.wS[len] = w;
+    len++;
+  };
   for (let i = 0; i < frontier.length; i++) {
     const g = frontier[i]!;
     for (let p = off[g]!; p < off[g + 1]!; p++) {
       const h = tgt[p]!;
-      if (present[h] || offScreen(h)) {
-        aS.push(g);
-        bS.push(h);
-        wS.push(flw[p]!);
-        if (present[h]) flowByPair.set(g * tree.size + h, flw[p]!);
+      if (seen[h] === gen || offScreen(h)) {
+        pushEdge(g, h, flw[p]!);
+        if (seen[h] === gen) flowByPair.set(g * tree.size + h, flw[p]!);
       }
     }
   }
@@ -695,10 +744,8 @@ export function superEdges(
       const g = frontier[i]!;
       for (let p = inOff[g]!; p < inOff[g + 1]!; p++) {
         const s = inSrc[p]!;
-        if (!present[s] && offScreen(s)) {
-          aS.push(s);
-          bS.push(g);
-          wS.push(inFlw[p]!);
+        if (seen[s] !== gen && offScreen(s)) {
+          pushEdge(s, g, inFlw[p]!);
         }
       }
     }
@@ -716,21 +763,23 @@ export function superEdges(
     // the whole pass stays O(off-frontier-on-screen incidences · depth). Keyed in a Map over only the
     // **touched** nodes: a per-frame `Int32Array(tree.size).fill(-2)` would be an O(all tree nodes)
     // allocation + write every frame, defeating LOD's O(visible) intent (#144 perf section).
-    const cover = new Map<number, number>(); // node id → nearest present ancestor (-1 = none)
+    const cover = sc.cover; // node id → nearest present ancestor (-1 = none) — reused, cleared per call
+    cover.clear();
     const coverOf = (h: number): number => {
       let x = h;
-      while (x >= 0 && !cover.has(x) && !present[x]) x = par[x]!;
-      const c = x < 0 ? -1 : present[x] ? x : cover.get(x)!;
+      while (x >= 0 && !cover.has(x) && seen[x] !== gen) x = par[x]!;
+      const c = x < 0 ? -1 : seen[x] === gen ? x : cover.get(x)!;
       for (let y = h; y >= 0 && y !== x; y = par[y]!) cover.set(y, c); // backfill the climbed chain
       return c;
     };
-    const proj = new Map<number, number>(); // directed pair key (a·size + b) → summed flow
+    const proj = sc.proj; // directed pair key (a·size + b) → summed flow — reused, cleared per call
+    proj.clear();
     // Out: a present node's out-edge to an off-frontier on-screen target → project the target up (g → c).
     for (let i = 0; i < frontier.length; i++) {
       const g = frontier[i]!;
       for (let p = off[g]!; p < off[g + 1]!; p++) {
         const h = tgt[p]!;
-        if (present[h] || offScreen(h)) continue; // already emitted by the same-level walk
+        if (seen[h] === gen || offScreen(h)) continue; // already emitted by the same-level walk
         const c = coverOf(h);
         if (c >= 0 && c !== g) {
           const key = g * tree.size + c;
@@ -744,7 +793,7 @@ export function superEdges(
         const g = frontier[i]!;
         for (let p = inOff[g]!; p < inOff[g + 1]!; p++) {
           const s = inSrc[p]!;
-          if (present[s] || offScreen(s)) continue; // present: from its out-walk; off-screen: handled above
+          if (seen[s] === gen || offScreen(s)) continue; // present: from its out-walk; off-screen: handled above
           const c = coverOf(s);
           if (c >= 0 && c !== g) {
             const key = c * tree.size + g;
@@ -756,13 +805,18 @@ export function superEdges(
     for (const [key, w] of proj) {
       const a = Math.floor(key / tree.size);
       const b = key - a * tree.size;
-      aS.push(a);
-      bS.push(b);
-      wS.push(w);
+      pushEdge(a, b, w);
       flowByPair.set(key, w); // both endpoints present → feed reciprocal half-arrow widths too
     }
   }
-  const count = aS.length;
+  const count = len;
+  const aS = sc.aS;
+  const bS = sc.bS;
+  const wS = sc.wS;
+  // Summed flow per edge, COPIED out of the scratch — callers keep `flows` past this call (e.g. the
+  // link-pick resolve closure), so the output must not alias the reused gather array.
+  const flows: number[] = new Array<number>(count);
+  for (let e = 0; e < count; e++) flows[e] = wS[e]!;
   // Stable per-super-edge id (the directed tree-node pair), parallel to `count`. The Scene path (#138)
   // keys its link drawables by it so the retained-scene diff is stable across re-cuts; the WebGL lane
   // ignores it. Half-arrows and lines/arrows share the one edge order, so one id array serves both.
@@ -790,8 +844,8 @@ export function superEdges(
     colors[e * 4 + 1] = cg;
     colors[e * 4 + 2] = cb;
     if (fa) {
-      const af = present[g] ? fa[g]! : 1;
-      const bf = present[h] ? fa[h]! : 1;
+      const af = seen[g] === gen ? fa[g]! : 1;
+      const bf = seen[h] === gen ? fa[h]! : 1;
       colors[e * 4 + 3] = Math.round(ca * Math.min(af, bf));
     } else {
       colors[e * 4 + 3] = ca;
@@ -810,7 +864,7 @@ export function superEdges(
       widths[e * 2] = w;
       widths[e * 2 + 1] = opp === undefined ? w : style.widthOf(opp);
     }
-    return { halfArrows: { sources, targets, radii, widths, bends, colors, count }, ids, flows: wS };
+    return { halfArrows: { sources, targets, radii, widths, bends, colors, count }, ids, flows };
   }
 
   // Line style: bent/straight lines ∝ flow; directed → arrowheads set back to the target's (capped)
@@ -821,7 +875,7 @@ export function superEdges(
   const lines: InstancedLinesData = style.bend
     ? { sources, targets, widths, colors, bends, samples: BENT_SAMPLES, count }
     : { sources, targets, widths, colors, count };
-  if (!style.directed) return { lines, ids, flows: wS };
+  if (!style.directed) return { lines, ids, flows };
 
   // Arrowheads orient + set back in-shader (so screen sizeMode is honoured): pass the target centre
   // (already in `targets`) plus its draw radius; the shader puts the tip on the node boundary. A
@@ -830,7 +884,7 @@ export function superEdges(
   const aRadii = new Float32Array(count);
   for (let e = 0; e < count; e++) aRadii[e] = drawnRadius(bS[e]!);
   const arrows: InstancedArrowsData = { sources, targets, radii: aRadii, sizes: new Float32Array(count).fill(style.arrowSize), colors, bends, half: style.bend !== 0, count };
-  return { lines, arrows, ids, flows: wS };
+  return { lines, arrows, ids, flows };
 }
 
 /**
@@ -1214,6 +1268,13 @@ export function networkLayers(graph: NetworkGraph, style: ResolvedNetworkStyle):
  * of re-running the colour/width scale accessors ~O(edgeCount) times per frame. The node circles'
  * style attributes (radii/fill colours/flow-border) are cached whole (positions alias `graph.positions`,
  * so only a border layer needs a fresh position-derived pass — handled by re-running {@link nodeCircles}).
+ *
+ * Also carries the #162 shader-highlight **group columns** (#214) — position-independent float copies
+ * of the immutable edge list + the node-identity column. They never change between position frames, so
+ * caching them here (same key, same invalidation as the style attrs) keeps them reference-stable and
+ * lets the renderer's reference-identity check skip their per-frame GPU upload. They are NEVER mutated
+ * in place (the `writeIfChanged` invariant); the per-instance `selected` flags are NOT cached — they
+ * follow the selection, not the (graph, style) version.
  */
 export interface NoLodStyleCache {
   /** Which layer shape the cache is for (must match the current style to be reusable). */
@@ -1222,6 +1283,12 @@ export interface NoLodStyleCache {
   halfArrows?: HalfArrowStyleAttrs;
   lines?: LinkLinesStyleAttrs;
   arrows?: LinkArrowsStyleAttrs;
+  /** Per-edge source node id (#162 `groups` of every link layer), length `edgeCount`. */
+  groupSource: Float32Array;
+  /** Per-edge target node id (#162 `groups2` — undirected incident hover); absent when directed. */
+  groupTarget?: Float32Array;
+  /** `[0, 1, …, nodeCount-1]` — the `nodes` circles layer's `groups` (instance i is node i). */
+  nodeGroups: Float32Array;
 }
 
 /** Compute the {@link NoLodStyleCache} for the current resolved style (runs the scale accessors ONCE). */
@@ -1229,20 +1296,28 @@ export function noLodStyleCache(graph: NetworkGraph, style: ResolvedNetworkStyle
   const bend = style.linkBend;
   const halfArrow = style.linkStyle === "half-arrow" && style.directed;
   const sizeMode = style.sizeMode;
-  if (graph.edgeCount === 0) return { kind: "lines-only", sizeMode };
+  // #162/#214 highlight group columns — one O(edges + nodes) copy per (graph, style) version, not per frame.
+  const groupSource = Float32Array.from(graph.source);
+  const groupTarget = style.directed ? undefined : Float32Array.from(graph.target);
+  const nodeGroups = new Float32Array(graph.nodeCount);
+  for (let i = 0; i < graph.nodeCount; i++) nodeGroups[i] = i;
+  if (graph.edgeCount === 0) return { kind: "lines-only", sizeMode, groupSource, groupTarget, nodeGroups };
   if (halfArrow) {
     return {
       kind: "half-arrows",
       sizeMode,
       halfArrows: halfArrowLinksStyleAttrs(graph, { nodeRadii: style.nodeRadii, widthOf: style.linkWidthOf, colorOf: style.linkColorOf, bend }),
+      groupSource,
+      groupTarget,
+      nodeGroups,
     };
   }
   const lines = linkLinesStyleAttrs(graph, { widthOf: style.linkWidthOf, colorOf: style.linkColorOf, bend });
   if (style.directed) {
     const arrows = linkArrowsStyleAttrs(graph, { size: style.arrowSize, nodeRadii: style.nodeRadii, colorOf: style.linkColorOf, bend, half: bend !== 0 });
-    return { kind: "lines+arrows", sizeMode, lines, arrows };
+    return { kind: "lines+arrows", sizeMode, lines, arrows, groupSource, groupTarget, nodeGroups };
   }
-  return { kind: "lines", sizeMode, lines };
+  return { kind: "lines", sizeMode, lines, groupSource, groupTarget, nodeGroups };
 }
 
 /**
