@@ -1,7 +1,8 @@
 # @mapequation/d3gl
 
 GPU-accelerated rendering for d3 — especially maps with GeoJSON and grid-cell
-data, with switchable **SVG / Canvas2D / WebGL2** backends.
+data, and large node–link networks — with switchable **SVG / Canvas2D / WebGL2**
+backends.
 
 d3's generators (`d3-geo`'s `geoPath`, `d3-shape`, `d3-hierarchy` links) don't
 draw; they emit path commands to a **context**. d3gl implements that same context
@@ -21,6 +22,7 @@ npm i @mapequation/d3gl
 ```ts
 import { Scene } from "@mapequation/d3gl";            // core (root entry)
 import { geoMap, plot } from "@mapequation/d3gl/map"; // interactive engines
+import { network } from "@mapequation/d3gl/network";   // large-network engine
 import { fitProjection } from "@mapequation/d3gl/geo"; // project-once primitives
 import { D3GL } from "@mapequation/d3gl/react";        // React component
 // also: /webgl  /canvas  /svg  /labels
@@ -35,6 +37,7 @@ import { D3GL } from "@mapequation/d3gl/react";        // React component
 | `/geo` | projection + GeoJSON project-once helpers, inverse projection |
 | `/labels` | HTML label overlay with culling |
 | `/map` | `geoMap` + `plot` engines with d3-zoom wiring |
+| `/network` | `network` engine for large node–link graphs: force layout (worker/GPU), level-of-detail, maps of networks |
 | `/react` | headless `MapController` + `<D3GL>` component |
 
 See the [repository](https://github.com/mapequation/d3gl) for full docs,

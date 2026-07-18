@@ -41,12 +41,20 @@ class HighlightBuffers {
   group: Buffer;
   group2: Buffer;
   selected: Buffer;
+  /** Last-uploaded group column references (#214) — the reference-identity upload skip (see
+   *  {@link writeIfChanged}): the network's no-LOD cache reuses the SAME group array objects across
+   *  position-only frames (never mutated in place), so their redundant per-frame re-upload is skipped;
+   *  per-emit columns (LOD frontier) are fresh references and always upload. */
+  private lastGroups: Float32Array | undefined;
+  private lastGroups2: Float32Array | undefined;
   constructor(private device: Device, data: WithHighlight) {
     // Default group = -1 (an id no real node has), so a layer WITHOUT groups (plot points, aggregate
     // halos) never matches a hovered group id and never spuriously highlights.
     this.group = device.createBuffer({ data: data.groups ?? minusOnes(data.count) });
     this.group2 = device.createBuffer({ data: data.groups2 ?? minusOnes(data.count) });
     this.selected = device.createBuffer({ data: selectedFloats(data) });
+    this.lastGroups = data.groups;
+    this.lastGroups2 = data.groups2;
   }
   layout = [
     { name: "a_group", format: "float32" as const, stepMode: "instance" as const },
@@ -64,12 +72,16 @@ class HighlightBuffers {
     this.group = this.device.createBuffer({ data: data.groups ?? minusOnes(data.count) });
     this.group2 = this.device.createBuffer({ data: data.groups2 ?? minusOnes(data.count) });
     this.selected = this.device.createBuffer({ data: selectedFloats(data) });
+    this.lastGroups = data.groups;
+    this.lastGroups2 = data.groups2;
     return this.attributes();
   }
-  /** Rewrite the buffers from fresh emit data (circles' in-place sub-update path). */
+  /** Rewrite the buffers from fresh emit data (the in-place sub-update path). Group columns skip when
+   *  their array reference is unchanged (#214 — the no-LOD position-only fast path, like #179's style
+   *  attrs); `selected` follows the selection and always rewrites. */
   write(data: WithHighlight): void {
-    if (data.groups) this.group.write(data.groups);
-    if (data.groups2) this.group2.write(data.groups2);
+    if (data.groups) this.lastGroups = writeIfChanged(this.group, data.groups, this.lastGroups);
+    if (data.groups2) this.lastGroups2 = writeIfChanged(this.group2, data.groups2, this.lastGroups2);
     this.selected.write(selectedFloats(data));
   }
   /** Rewrite ONLY the selected flags (a selection change) — no geometry touch. */

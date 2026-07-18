@@ -18,7 +18,7 @@
 import { hcl, rgb } from "d3-color";
 import type { NetworkGraph } from "./graph.js";
 import { buildHierarchy, type CoarsenOptions, type Hierarchy } from "./coarsen.js";
-import { declutterScreen } from "../core/declutter.js";
+import { declutterScreen, declutterScratch, type DeclutterScratch } from "../core/declutter.js";
 import type { ScreenRect } from "../core/instanced-lane.js";
 
 /**
@@ -834,6 +834,58 @@ export function computeLODGeometry(
   computeLODStyle(tree, leafRadii, leafWeight, leafBorder, leafColors, radiusAggregate);
 }
 
+/**
+ * Fold a small set of **moved leaves** into the tree's position-derived geometry incrementally
+ * (#211) — the node-drag repaint path, where only the held leaves changed since the last pass.
+ * O(moved · depth) instead of the full O(tree size) {@link computeLODPositions}:
+ *
+ * - **Centroids (exact):** an aggregate's centroid is the mean of its descendant leaf positions
+ *   (the count-weighted child centroid telescopes to that), so one leaf moving by `δ` shifts every
+ *   ancestor's centroid by exactly `δ / count[ancestor]` — updated along the parent chain.
+ * - **Extent (grow-only, conservative):** the bounding radius is a *max* over children, which can
+ *   shrink when a leaf moves inward — detecting that would need a per-ancestor child scan. Instead
+ *   the extent only widens: grown by the ancestor's own centroid shift (covering its distance change
+ *   to every unmoved child) and by the moved child's exact reach (`|centroid − child| + child
+ *   extent`). An over-wide extent is safe — the cut culls less and expands earlier (never hides
+ *   geometry) — and the caller runs one exact {@link computeLODPositions} when the drag settles.
+ *
+ * Style-derived geometry (`radius`/`weight`/`border`/`color`) is position-independent and untouched.
+ * `parent` is the tree's parent-pointer array (derive it from the children CSR for coarsening /
+ * spatial trees, as `Network.treeParent` does — once per tree, not per move). Allocation-free.
+ */
+export function updateLODPositionsForLeaves(
+  tree: LODTree,
+  positions: ArrayLike<number>,
+  leaves: ArrayLike<number>,
+  parent: Int32Array,
+): void {
+  const { cx, cy, extent, count } = tree;
+  for (let k = 0; k < leaves.length; k++) {
+    const i = leaves[k]!;
+    const nx = positions[i * 2]!;
+    const ny = positions[i * 2 + 1]!;
+    const dx = nx - cx[i]!;
+    const dy = ny - cy[i]!;
+    if (dx === 0 && dy === 0) continue;
+    cx[i] = nx;
+    cy[i] = ny;
+    let child = i;
+    for (let a = parent[i]!; a !== -1; a = parent[a]!) {
+      const inv = 1 / count[a]!; // count ≥ 1 for every tree node
+      const ax = cx[a]! + dx * inv;
+      const ay = cy[a]! + dy * inv;
+      // Grow-only: the centroid moved by |δ|/count (distance to every unmoved child changes by at
+      // most that), and the moved child's reach from the new centroid is recomputed exactly.
+      const reach = Math.hypot(ax - cx[child]!, ay - cy[child]!) + extent[child]!;
+      const grown = extent[a]! + Math.hypot(dx * inv, dy * inv);
+      extent[a] = reach > grown ? reach : grown;
+      cx[a] = ax;
+      cy[a] = ay;
+      child = a;
+    }
+  }
+}
+
 /** Screen-space transform: `screen = world * k + (x, y)` (matches {@link BaseEngine} `ViewTransform`). */
 export interface LODTransform {
   k: number;
@@ -873,10 +925,36 @@ const DEFAULT_EXPAND_PX = 48;
 const smoothstep = (x: number): number => (x <= 0 ? 0 : x >= 1 ? 1 : x * x * (3 - 2 * x));
 
 /**
+ * Reusable scratch for {@link cut} (#213) — engine-owned so a zoom/pan frame allocates nothing
+ * steady-state: the frontier output, the DFS stack, and its parallel cross-fade alpha stack are
+ * grow-on-demand typed arrays reused across frames. The returned frontier is a `subarray` **view**
+ * of `frontier`, valid until the next {@link cut} with the same scratch — every per-frame consumer
+ * re-selects before reading, so one scratch per engine serves all paths.
+ */
+export interface CutScratch {
+  /** Emitted frontier ids; only the returned `subarray(0, n)` prefix is valid per call. */
+  frontier: Uint32Array;
+  /** DFS stack of pending tree-node ids (only a call-local prefix is live). */
+  stack: Uint32Array;
+  /** Inherited cross-fade multiplier (#133), parallel to `stack` — only touched when fading. */
+  alpha: Float64Array;
+}
+
+/** Fresh {@link CutScratch}. The network engine keeps ONE per instance; {@link cut} falls back to a
+ *  throwaway one when none is passed (backward-compatible, but then every call allocates). */
+export function makeCutScratch(): CutScratch {
+  return { frontier: new Uint32Array(256), stack: new Uint32Array(256), alpha: new Float64Array(256) };
+}
+
+/**
  * Adaptive hierarchy cut: walk the tree top-down for the given view and return the **frontier** —
  * the set of node ids to draw. A subtree is culled when its bounding box misses the viewport; an
  * aggregate expands when its on-screen footprint is large enough, otherwise it is drawn as one
  * glyph; leaves always draw. Work is proportional to the visible frontier, not to the tree size.
+ *
+ * Pass an engine-owned `scratch` ({@link makeCutScratch}) to make the walk allocation-free
+ * steady-state (#213); the returned frontier is then a view of `scratch.frontier`, valid until the
+ * next cut with that scratch. Without it, every call allocates a private scratch.
  */
 /** The visible world rectangle for a transform + viewport (inverse of `screen = world·k + translate`). */
 export function visibleWorldRect(t: LODTransform, width: number, height: number): { minX: number; maxX: number; minY: number; maxY: number } {
@@ -893,6 +971,7 @@ export function cut(
   width: number,
   height: number,
   opts: CutOptions = {},
+  scratch?: CutScratch,
 ): Uint32Array {
   const { leafCount, levelCount, levelOffset, childOffset, children, cx, cy, extent, radius } = tree;
   const expandPx = opts.expandPx ?? DEFAULT_EXPAND_PX;
@@ -916,23 +995,34 @@ export function cut(
   const hi = expandPx * (1 + fadeBand);
   const alphaOut = opts.fadeAlpha;
 
-  const frontier: number[] = [];
-  // Seed the stack with the roots (coarsest level). A parallel alpha stack carries the inherited fade
-  // multiplier (only touched when fading).
-  const stack: number[] = [];
-  const alphaStack: number[] = [];
-  for (let g = levelOffset[levelCount - 1]!; g < levelOffset[levelCount]!; g++) {
-    stack.push(g);
-    if (fade) alphaStack.push(1);
-  }
+  // #213: all working storage comes from the (reused) scratch — no boxed number[]s, no output copy.
+  // `n`/`sp` are the live frontier / stack lengths; the grow-doubles run only until the scratch is warm.
+  const sc = scratch ?? makeCutScratch();
+  let n = 0;
+  let sp = 0;
+  // Seed the stack with the roots (coarsest level). The parallel alpha slot carries the inherited fade
+  // multiplier (only touched when fading; Float64 keeps the exact doubles the boxed stack held).
+  const push = (g: number, a: number): void => {
+    if (sp === sc.stack.length) {
+      const cap = sp * 2;
+      const ns = new Uint32Array(cap); ns.set(sc.stack); sc.stack = ns;
+      const na = new Float64Array(cap); na.set(sc.alpha); sc.alpha = na;
+    }
+    sc.stack[sp] = g;
+    if (fade) sc.alpha[sp] = a;
+    sp++;
+  };
+  for (let g = levelOffset[levelCount - 1]!; g < levelOffset[levelCount]!; g++) push(g, 1);
   const emit = (g: number, a: number): void => {
-    frontier.push(g);
+    if (n === sc.frontier.length) { const nf = new Uint32Array(n * 2); nf.set(sc.frontier); sc.frontier = nf; }
+    sc.frontier[n++] = g;
     if (fade && alphaOut) alphaOut[g] = a;
   };
 
-  while (stack.length > 0) {
-    const g = stack.pop()!;
-    const a = fade ? alphaStack.pop()! : 1;
+  while (sp > 0) {
+    sp--;
+    const g = sc.stack[sp]!;
+    const a = fade ? sc.alpha[sp]! : 1;
     const ext = extent[g]!;
     const gx = cx[g]!;
     const gy = cy[g]!;
@@ -964,14 +1054,11 @@ export function cut(
     }
     if (drawA > 0) emit(g, drawA);
     if (childA > 0) {
-      for (let p = childOffset[g]!; p < childOffset[g + 1]!; p++) {
-        stack.push(children[p]!);
-        if (fade) alphaStack.push(childA);
-      }
+      for (let p = childOffset[g]!; p < childOffset[g + 1]!; p++) push(children[p]!, childA);
     }
   }
 
-  return Uint32Array.from(frontier);
+  return sc.frontier.subarray(0, n);
 }
 
 /** Whether a frontier id is a real leaf (vs. an aggregate). */
@@ -1005,12 +1092,104 @@ export interface DeclutterOptions {
 }
 
 /**
+ * Reusable scratch for {@link declutterFrontier} (#213) — engine-owned so the per-frame thinning
+ * allocates nothing steady-state: the projected centres/radii, the typed sort keys + visit order,
+ * the kept flags, the shared declutter grid, and the output buffer are all grown on demand (to the
+ * largest frontier seen) and reused. The returned kept set is a `subarray` **view** of `out`, valid
+ * until the next call with the same scratch.
+ */
+export interface DeclutterFrontierScratch {
+  /** Projected screen centres + on-screen draw radii, parallel to the frontier. */
+  px: Float64Array;
+  py: Float64Array;
+  pr: Float64Array;
+  /** Per-frontier-index importance key (`tree.weight[frontier[i]]`), gathered once per call so the
+   *  sort reads one flat array — not two boxed `tree.weight[frontier[i]]` lookups per compare. */
+  key: Float32Array;
+  /** Bit view over `key`'s SAME buffer; transformed in place to the descending-order radix key. */
+  keyBits: Uint32Array;
+  /** Radix scatter partner for `keyBits`. */
+  keyBits2: Uint32Array;
+  /** Frontier-index visit order; the `[0, F)` prefix is sorted descending by `key` each call. */
+  order: Uint32Array;
+  /** Radix scatter partner for `order`. */
+  order2: Uint32Array;
+  /** Per-pass byte histogram / running offsets for the radix sort. */
+  counts: Uint32Array;
+  /** Kept flags from {@link declutterScreen} (fully rewritten each call — no clearing needed). */
+  kept: Uint8Array;
+  /** Uniform-grid scratch for the shared {@link declutterScreen} engine. */
+  grid: DeclutterScratch;
+  /** Kept frontier ids; only the returned `subarray(0, n)` prefix is valid per call. */
+  out: Uint32Array;
+}
+
+/** Fresh {@link DeclutterFrontierScratch}. The network engine keeps ONE per instance;
+ *  {@link declutterFrontier} falls back to a throwaway one when none is passed (backward-compatible,
+ *  but then every call allocates). */
+export function makeDeclutterFrontierScratch(): DeclutterFrontierScratch {
+  const key = new Float32Array(0);
+  return { px: new Float64Array(0), py: new Float64Array(0), pr: new Float64Array(0), key, keyBits: new Uint32Array(key.buffer), keyBits2: new Uint32Array(0), order: new Uint32Array(0), order2: new Uint32Array(0), counts: new Uint32Array(256), kept: new Uint8Array(0), grid: declutterScratch(), out: new Uint32Array(0) };
+}
+
+/**
+ * Sort `sc.order[0..F)` by weight **descending**, ties in original index order — the exact
+ * permutation a stable comparator sort by `-key` produces — via a **stable LSD byte-radix** on the
+ * float32 bit pattern (#213): O(F) with zero allocation, instead of an O(F log F) comparator-callback
+ * sort (which V8 also makes allocate internally). `sc.keyBits` (a bit view over the gathered `key`
+ * floats) is transformed in place to a monotonic unsigned key; passes whose byte is constant are
+ * skipped (an identity permutation, so stability is preserved). Returns the array holding the final
+ * permutation (`sc.order` or `sc.order2`, depending on pass parity). (A NaN weight — always a caller
+ * bug — gets a deterministic slot above +∞ here, where a comparator sort's order was unspecified.)
+ */
+function sortOrderByWeightDesc(sc: DeclutterFrontierScratch, F: number): Uint32Array {
+  // Monotonic descending transform: asc = sign ? ~b : b|0x80000000 orders bit patterns like the
+  // floats ascending; complementing gives descending. −0 is normalized to +0 first so the two zero
+  // encodings tie (as they do under a numeric comparator).
+  const bits = sc.keyBits;
+  for (let i = 0; i < F; i++) {
+    const b = bits[i] === 0x80000000 ? 0 : bits[i]!;
+    bits[i] = (b & 0x80000000) !== 0 ? b : ~b & 0x7fffffff;
+  }
+  let srcO = sc.order;
+  let srcK = sc.keyBits;
+  let dstO = sc.order2;
+  let dstK = sc.keyBits2;
+  const counts = sc.counts;
+  for (let shift = 0; shift < 32; shift += 8) {
+    counts.fill(0);
+    for (let i = 0; i < F; i++) counts[(srcK[i]! >>> shift) & 0xff]!++;
+    if (counts[(srcK[0]! >>> shift) & 0xff] === F) continue; // constant byte — skip the pass
+    let sum = 0;
+    for (let b = 0; b < 256; b++) {
+      const c = counts[b]!;
+      counts[b] = sum;
+      sum += c;
+    }
+    for (let i = 0; i < F; i++) {
+      const b = (srcK[i]! >>> shift) & 0xff;
+      const j = counts[b]!;
+      counts[b] = j + 1;
+      dstO[j] = srcO[i]!;
+      dstK[j] = srcK[i]!;
+    }
+    const tO = srcO; srcO = dstO; dstO = tO;
+    const tK = srcK; srcK = dstK; dstK = tK;
+  }
+  return srcO;
+}
+
+/**
  * Thin an LOD frontier in screen space: keep higher-importance glyphs (by tree {@link LODTree.weight}
  * = strength) and drop lower-importance ones that would **overlap** a kept glyph (centre distance <
  * sum of the two radii). Greedy in descending importance over a uniform screen grid, so a dense
  * cluster keeps its most important members and the kept set is overlap-free (no overdraw). Runs per
  * cut, so it's zoom-dependent — more glyphs resolve as you zoom in. Returns the kept frontier ids
  * (original order).
+ *
+ * Pass an engine-owned `scratch` ({@link makeDeclutterFrontierScratch}) to make the thinning
+ * allocation-free steady-state (#213); the returned set is then a view of `scratch.out`, valid until
+ * the next call with that scratch. Without it, every call allocates a private scratch.
  */
 export function declutterFrontier(
   tree: LODTree,
@@ -1019,42 +1198,63 @@ export function declutterFrontier(
   width: number,
   height: number,
   opts: DeclutterOptions,
+  scratch?: DeclutterFrontierScratch,
 ): Uint32Array {
   const F = frontier.length;
   if (F <= 1) return frontier;
   const maxAgg = opts.maxAggregateRadius ?? Infinity;
   const spacing = opts.spacing ?? 1;
 
-  // Project each glyph to screen and resolve its on-screen draw radius (matching frontierCircles).
-  const px = new Float64Array(F);
-  const py = new Float64Array(F);
-  const pr = new Float64Array(F);
+  // #213: all working storage comes from the (reused) scratch, grown together to the largest frontier
+  // seen. Every array's `[0, F)` prefix is fully rewritten below, so reuse needs no clearing.
+  const sc = scratch ?? makeDeclutterFrontierScratch();
+  if (sc.px.length < F) {
+    const cap = Math.max(F, sc.px.length * 2);
+    sc.px = new Float64Array(cap);
+    sc.py = new Float64Array(cap);
+    sc.pr = new Float64Array(cap);
+    sc.key = new Float32Array(cap);
+    sc.keyBits = new Uint32Array(sc.key.buffer);
+    sc.keyBits2 = new Uint32Array(cap);
+    sc.order = new Uint32Array(cap);
+    sc.order2 = new Uint32Array(cap);
+    sc.kept = new Uint8Array(cap);
+    sc.out = new Uint32Array(cap);
+  }
+  const px = sc.px;
+  const py = sc.py;
+  const pr = sc.pr;
+  const key = sc.key;
+
+  // Project each glyph to screen and resolve its on-screen draw radius (matching frontierCircles),
+  // gathering the sort key (importance) in the same pass.
   for (let i = 0; i < F; i++) {
     const g = frontier[i]!;
     const drawn = g < tree.leafCount ? tree.radius[g]! : Math.min(tree.radius[g]!, maxAgg);
     pr[i] = opts.screenSized ? drawn : drawn * opts.k;
     px[i] = tree.cx[g]! * t.k + t.x;
     py[i] = tree.cy[g]! * t.k + t.y;
+    key[i] = tree.weight[g]!;
   }
 
   // Visit in descending importance so the most important glyph in a cluster survives, then run the
   // shared greedy declutter (one engine across backends + the geo layers — see core/declutter).
-  const order = Array.from({ length: F }, (_, i) => i);
-  order.sort((a, b) => tree.weight[frontier[b]!]! - tree.weight[frontier[a]!]!);
+  // Stable radix index sort on the flat key array's bit pattern — the same permutation the stable
+  // boxed comparator over tree.weight produced, at O(F) with zero allocation (see the sorter's doc).
+  for (let i = 0; i < F; i++) sc.order[i] = i;
+  const order = sortOrderByWeightDesc(sc, F);
   // Cross-fade (#133): a transitioning glyph ignores its ANCESTOR as an occluder, so a fading parent
   // doesn't cull its fading-in children — but children still declutter against siblings (and the parent
   // still occludes unrelated glyphs). Only the fade adds a parent+child pair to the frontier (it's
   // otherwise an antichain), so ancestry alone identifies the pairs; gate on the fade pass for zero cost.
   const par = opts.fadeAlpha ? tree.parent : undefined;
   const ignore = par ? (i: number, j: number) => onSamePath(frontier[i]!, frontier[j]!, par) : undefined;
-  const kept = declutterScreen(F, px, py, pr, order, width, height, spacing, new Uint8Array(F), undefined, ignore);
+  const kept = declutterScreen(F, px, py, pr, order, width, height, spacing, sc.kept, sc.grid, ignore);
 
+  const out = sc.out;
   let n = 0;
-  for (let i = 0; i < F; i++) if (kept[i]) n++;
-  const out = new Uint32Array(n);
-  let w = 0;
-  for (let i = 0; i < F; i++) if (kept[i]) out[w++] = frontier[i]!;
-  return out;
+  for (let i = 0; i < F; i++) if (kept[i]) out[n++] = frontier[i]!;
+  return out.subarray(0, n);
 }
 
 export interface PickOptions {

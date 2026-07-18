@@ -14,7 +14,8 @@ const POS = new Float32Array([40, 40, 100, 100, 160, 60]);
 const graph = () => buildGraph({ nodeCount: 3, source: [0, 1], target: [1, 2], directed: false });
 
 // N7b-2: the active backend draws labels so they survive export — SVG <text>, Canvas fillText.
-// WebGL keeps the HTML overlay.
+// WebGL keeps the HTML overlay on screen; since #219 its setTextLayer is an export-only stash,
+// pushed by the engine at toPNG()/toSVG() time so WebGL exports include the labels too.
 describe("network.labels() backend-native text (#105 N7b-2)", () => {
   it("SVG backend renders labels as <text> (with halo) in toSVG()", async () => {
     const net = network(host(), { width: 200, height: 200, backend: "svg" });
@@ -43,7 +44,7 @@ describe("network.labels() backend-native text (#105 N7b-2)", () => {
     net.destroy();
   });
 
-  it("WebGL backend uses the HTML overlay, not backend text", async () => {
+  it("WebGL backend keeps the HTML overlay live; its text seam is export-only (#219)", async () => {
     const h = host();
     const net = network(h, { width: 200, height: 200 }); // webgl default
     await net.whenReady();
@@ -52,9 +53,60 @@ describe("network.labels() backend-native text (#105 N7b-2)", () => {
     net.setTransform({ k: 1, x: 0, y: 0 });
 
     /* eslint-disable @typescript-eslint/no-explicit-any */
-    expect(h.querySelectorAll("[data-label-id]").length).toBe(3); // overlay divs
-    expect((net as any).backend().setTextLayer).toBeUndefined(); // WebGL has no native text seam
+    expect(h.querySelectorAll("[data-label-id]").length).toBe(3); // overlay divs still own the screen
+    expect((net as any).backend().textLayerMode).toBe("export-only"); // stash-for-export, not live text
     /* eslint-enable @typescript-eslint/no-explicit-any */
+    net.destroy();
+    h.remove();
+  });
+
+  it("WebGL exports include the placed labels, pushed at export time only — never per transform (#219)", async () => {
+    const h = host();
+    const net = network(h, { width: 200, height: 200 }); // webgl default
+    await net.whenReady();
+    net.data(graph()).style({ nodeRadius: 6, nodeFill: "#1f77b4" }).layout({ backend: "positions", positions: POS });
+    net.labels({ labelOf: (id) => `n${id}`, color: "#ff0000", halo: { color: "#ffffff", width: 2 } });
+    net.setTransform({ k: 1, x: 0, y: 0 });
+
+    // Zero per-frame cost: a pan/zoom sweep never pushes TextData into the backend stash.
+    /* eslint-disable @typescript-eslint/no-explicit-any */
+    const backend = (net as any).backend();
+    /* eslint-enable @typescript-eslint/no-explicit-any */
+    let pushes = 0;
+    const orig = backend.setTextLayer.bind(backend);
+    backend.setTextLayer = (texts: unknown[]) => { pushes++; orig(texts); };
+    for (let i = 0; i < 20; i++) net.setTransform({ k: 1 + i * 0.02, x: i, y: -i });
+    net.setTransform({ k: 1, x: 0, y: 0 }); // settle back so all three nodes are in view for export
+    expect(pushes).toBe(0);
+    expect(h.querySelectorAll("[data-label-id]").length).toBe(3); // overlay stayed live throughout
+
+    // toSVG: one push, and the labels serialize as <text>. (The network's shape layers are a
+    // separate WebGL-toSVG gap — #200 — so only the text output is asserted here.)
+    const svg = net.toSVG();
+    expect(pushes).toBe(1);
+    expect((svg.match(/<text/g) ?? []).length).toBe(3);
+    expect(svg).toContain("n0");
+    expect(svg).toContain('paint-order="stroke"'); // halo
+
+    // toPNG: one more push, and the label ink (pure red on blue nodes) is in the raster.
+    const png = net.toPNG();
+    expect(pushes).toBe(2);
+    expect(png.startsWith("data:image/png")).toBe(true);
+    const img = new Image();
+    await new Promise<void>((resolve, reject) => { img.onload = () => resolve(); img.onerror = () => reject(new Error("decode")); img.src = png; });
+    const c = document.createElement("canvas");
+    c.width = img.width; c.height = img.height;
+    const ctx = c.getContext("2d");
+    if (!ctx) throw new Error("2d context unavailable");
+    ctx.drawImage(img, 0, 0);
+    const d = ctx.getImageData(0, 0, c.width, c.height).data;
+    let red = 0;
+    for (let i = 0; i < d.length; i += 4) if (d[i]! > 180 && d[i + 1]! < 90 && d[i + 2]! < 90 && d[i + 3]! > 0) red++;
+    expect(red).toBeGreaterThan(10); // label glyph pixels present in the WebGL PNG export
+
+    // labels(false) clears the export stash too: the next export has no text.
+    net.labels(false);
+    expect(net.toSVG()).not.toContain("<text");
     net.destroy();
     h.remove();
   });

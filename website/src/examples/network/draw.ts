@@ -102,6 +102,12 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
   };
   updateSab();
 
+  // Regenerate + re-lay-out only when a graph/layout input changes (nodes / links / seeding / backend);
+  // the cosmetic controls below just re-style, so toggling e.g. Declutter keeps your pan/zoom. `fit: true`
+  // frames each fresh layout as it converges — otherwise the GPU backend opens at the origin (top-left).
+  let layoutKey = "";
+  let graph: NetworkGraph | null = null;
+
   return {
     engine: net,
     render: (options) => {
@@ -110,13 +116,24 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
       // "Cold" disables multilevel seeding so you can watch the difference: multilevel snaps to a
       // good global arrangement then settles; cold starts from a disc and untangles slowly.
       const multilevel = options.seeding !== "Cold";
-      // Scale per-tick work down as the graph grows so the off-thread solve stays responsive; the
-      // worker keeps the main thread free regardless, streaming frames as it converges.
-      const iterations = Math.min(250, Math.max(10, Math.round(2.5e6 / count)));
-      // LFR benchmark with clear community structure (low mixing) for the layout + LOD to resolve.
-      // Weighted so links vary and LOD super-edges thicken/darken with their accumulated weight.
-      const { nodeCount, source, target, weight } = generateLFR(count, { mu: 0.1, seed: 1, weighted: true });
-      const graph = buildGraph({ nodeCount, source, target, weight, directed });
+      const layoutBackend = options.backend === "GPU" ? "gpu" : "worker";
+      const key = `${count}|${directed}|${multilevel}|${layoutBackend}`;
+      if (key !== layoutKey) {
+        layoutKey = key;
+        // Scale per-tick work down as the graph grows so the off-thread solve stays responsive; the
+        // worker keeps the main thread free regardless, streaming frames as it converges.
+        const iterations = Math.min(250, Math.max(10, Math.round(2.5e6 / count)));
+        // LFR benchmark with clear community structure (low mixing) for the layout + LOD to resolve.
+        // Weighted so links vary and LOD super-edges thicken/darken with their accumulated weight.
+        const { nodeCount, source, target, weight } = generateLFR(count, { mu: 0.1, seed: 1, weighted: true });
+        graph = buildGraph({ nodeCount, source, target, weight, directed });
+        // fit: true (#238) keeps the camera framed on the streaming layout as it converges, released on
+        // settle/interaction — so it opens framed rather than piling at the origin on the GPU backend.
+        net.data(graph).layout({ backend: layoutBackend, iterations, multilevel, fit: true });
+        updateSab(); // immediate snapshot (gpu transport resolves async; whenSettled() refreshes it)
+        void net.whenSettled().then(updateSab); // refresh once the resolved transport is known
+      }
+      if (!graph) return;
 
       // The raw graph is unweighted (every edge weight 1); the per-edge "weight" that varies is the
       // **accumulated flow of an LOD super-edge**. Encode it in both width and colour so a heavier
@@ -134,7 +151,6 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
       };
 
       net
-        .data(graph)
         .style({
           directed,
           nodeRadius: options.size === "Uniform" ? 5 : degreeRadius(graph),
@@ -165,12 +181,7 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
                 crossFade: ((options.crossFade as number) ?? 0) * 0.1,
               }
             : false,
-        )
-        .layout({ backend: options.backend === "GPU" ? "gpu" : "worker", iterations, multilevel });
-      updateSab(); // immediate snapshot (gpu transport resolves async; whenSettled() refreshes it)
-      // For backend:"gpu" the transport is initially "copy" until the device promise resolves;
-      // refresh the readout once the layout settles so the user sees the resolved "gpu" value.
-      void net.whenSettled().then(updateSab);
+        );
     },
   };
 };

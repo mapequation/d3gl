@@ -140,6 +140,62 @@ describe("network node-drag (#140)", () => {
     net.destroy();
   });
 
+  it("drag moves update the LOD geometry incrementally — no full-tree pass per move, exact on release (#211)", async () => {
+    // Deterministic engine-path signature (AGENTS.md step 5): a drag move is a continuous pointer
+    // interaction, so it must fold in ONLY the held leaves' ancestor chains — never rerun the full
+    // O(tree) `computeLODPositions`/`computeLODStyle`. Sentinels poisoned into tree nodes OUTSIDE the
+    // dragged chains detect any full pass: a full positions pass would overwrite the position sentinel
+    // (it recomputes every node from `graph.positions`), and a style pass the style sentinel.
+    const h = host();
+    const net = network(h, { width: 200, height: 200 });
+    await net.whenReady();
+    const g = buildGraph({ nodeCount: 4, source: [0, 2, 1], target: [1, 3, 2], directed: true });
+    const modules = [
+      { id: 0, path: [1, 1] }, { id: 1, path: [1, 2] }, { id: 2, path: [2, 1] }, { id: 3, path: [2, 2] },
+    ];
+    net
+      .data(g)
+      .lod({ modules, expandPx: 20 })
+      .layout({ backend: "positions", positions: new Float32Array([70, 90, 85, 90, 115, 110, 130, 110]) });
+    net.setTransform({ k: 1, x: 0, y: 0 }); // two collapsed aggregates on the frontier
+    net.interactive({ draggable: true, selectable: { multi: true } });
+
+    /* eslint-disable @typescript-eslint/no-explicit-any */
+    const tree = (net as any).lodTree;
+    const visible = (net as any).instancedLanes.get("network").lane.visible as Uint32Array;
+    /* eslint-enable @typescript-eslint/no-explicit-any */
+    const aggs = [...visible].filter((id) => id >= tree.leafCount);
+    const aggLeft = aggs.find((id) => tree.cx[id] < 100)!; // module of leaves 0,1 — the dragged one
+    const aggRight = aggs.find((id) => tree.cx[id] > 100)!; // module of leaves 2,3 — untouched
+    const cx0 = tree.cx[aggLeft], cy0 = tree.cy[aggLeft];
+
+    // Sentinels OUTSIDE the dragged chains: leaf 2's centroid (position-derived) and the right
+    // aggregate's radius (style-derived). Only a full-tree pass would rewrite them.
+    tree.cx[2] = 999;
+    tree.radius[aggRight] = 123;
+
+    const r = h.getBoundingClientRect();
+    const ev = (type: string, sx: number, sy: number) =>
+      h.dispatchEvent(new PointerEvent(type, { clientX: r.left + sx, clientY: r.top + sy, bubbles: true, button: 0, pointerId: 1 }));
+    ev("pointerdown", cx0, cy0);
+    ev("pointermove", cx0 + 40, cy0); // begins + first move
+    ev("pointermove", cx0 + 50, cy0 + 10); // second move — still incremental
+
+    // Per-move: the dragged module's aggregate follows live (its chain IS updated)…
+    expect(tree.cx[aggLeft]).toBeCloseTo(cx0 + 50, 2);
+    expect(tree.cy[aggLeft]).toBeCloseTo(cy0 + 10, 2);
+    // …while both sentinels survive: no full positions pass, no style pass, on any move.
+    expect(tree.cx[2]).toBe(999);
+    expect(tree.radius[aggRight]).toBe(123);
+
+    ev("pointerup", cx0 + 50, cy0 + 10);
+    // Release runs ONE exact position pass (settleAfterDrag): the position sentinel is recomputed
+    // from the true positions; style stays untouched (it is position-independent).
+    expect(tree.cx[2]).toBe(115);
+    expect(tree.radius[aggRight]).toBe(123);
+    net.destroy();
+  });
+
   it("a drag that loops back within click-slop of its start does not also click-select", async () => {
     // Regression: pointerup measures travel from the down point, so a drag that returns near its origin
     // is ≤ CLICK_SLOP — without a guard it would fire a spurious click-select on top of the drag,
