@@ -3,7 +3,6 @@ import { scaleOrdinal, scaleSqrt } from "d3-scale";
 import { link as d3link, linkRadial, curveLinear, curveStepBefore, curveBumpX, pointRadial } from "d3-shape";
 import type { HierarchyPointNode, HierarchyPointLink } from "d3-hierarchy";
 import { plot, h } from "@mapequation/d3gl/map";
-import { LabelLayer, type LabelAnchor } from "@mapequation/d3gl/labels";
 import type { ImperativeSetup } from "../types.js";
 import type { TreeNode } from "../shared/tree.js";
 import { layoutRectangular, layoutRadial, nodeXY, type LayoutMode } from "../shared/layout.js";
@@ -11,6 +10,7 @@ import { makeMammalTree, assignBioregions, REGION_NAMES } from "../shared/mammal
 import { calcMaximumParsimony, aggregateClusters, aggregateSpeciesCount } from "../shared/parsimony.js";
 
 const LINE_MIN = 1, LINE_MAX = 22; // branch-width range when scaling by subtended terminals
+const LABEL_STYLE = { font: "11px system-ui, sans-serif", color: "#333", textShadow: "none" };
 
 type SizeMode = "world" | "screen";
 type CurveMode = "linear" | "step" | "bump";
@@ -115,10 +115,10 @@ function rangeTable(node: PNode): HTMLElement | null {
   ]);
 }
 
-/** Constant screen-px offset from the node: rightward (rectangular) or outward along the
- *  radius (radial). Vertical centering for rectangular is folded in as -height/2. */
-function labelOffset(mode: LayoutMode, angle: number, gap: number, height: number): [number, number] {
-  if (mode !== "radial") return [gap, -height / 2];
+/** Constant screen-px offset from the node: rightward (rectangular — the engine centres the label
+ *  vertically) or outward along the radius (radial). */
+function labelOffset(mode: LayoutMode, angle: number, gap: number): [number, number] {
+  if (mode !== "radial") return [gap, 0];
   const a = angle - Math.PI / 2; // pointRadial's outward direction
   return [Math.cos(a) * gap, Math.sin(a) * gap];
 }
@@ -138,25 +138,9 @@ function labelOffset(mode: LayoutMode, angle: number, gap: number, height: numbe
 export const setup: ImperativeSetup = (host, { width, height, backend }) => {
   const W = width, H = height;
 
-  // HTML label overlay over the canvas (host is positioned `relative` by the harness).
-  const labelEl = document.createElement("div");
-  labelEl.className = "absolute inset-0 pointer-events-none overflow-hidden text-[11px] leading-[14px] text-[#333]";
-
   const chart = plot(host, { width: W, height: H, backend });
-  host.appendChild(labelEl);
-  const labels = new LabelLayer(labelEl, (a) => a.text);
-
-  // Label anchors are rebuilt by `render`; the zoom handler keeps them aligned with the GPU
-  // geometry. The transform stays at identity in both layouts (radial centering is baked into
-  // the world coordinates below), so the user's zoom/pan is never reset by an option change.
-  let anchors: LabelAnchor[] = [];
-  let view: { k: number; x: number; y: number } = { k: 1, x: 0, y: 0 };
-  const updateLabels = (t = view): void => {
-    view = t;
-    labels.update(anchors, t, { width: W, height: H });
-  };
-  // Scroll to zoom, drag to pan; keep the HTML tip labels aligned with the GPU geometry.
-  chart.enableZoom([0.5, 40], (t) => updateLabels(t));
+  // Scroll to zoom, drag to pan; the engine re-places the tip labels on every transform.
+  chart.enableZoom([0.5, 40]);
 
   return {
     engine: chart,
@@ -206,22 +190,6 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
         return { cx, cy, rBase: pieR(n), node: n, slices: pieSlices(n) };
       }).filter((p) => p.slices.length > 0);
 
-      const GAP = 8;
-      const radial = layoutMode === "radial";
-      anchors = tipNodes.map((n, i) => {
-        const [px, py] = xy(n);
-        const h = 14;
-        return {
-          id: `t${i}`, refX: px, refY: py, text: n.data.name,
-          width: n.data.name.length * 6.2 + 6, height: h,
-          priority: n.data.speciesCount ?? 1,
-          offset: labelOffset(layoutMode, n.x, GAP, h),
-          // Radial: declare the reading angle; d3gl derives the CSS transform AND the oriented
-          // collision box from it, so rotated tip labels pack by their true on-screen footprint.
-          ...(radial ? { rotation: n.x - Math.PI / 2, textAnchor: "start" as const, keepUpright: true } : {}),
-        };
-      });
-
       const drawLink = makeLinkDraw(layoutMode, curve, center);
 
       chart.layer("links", links, {
@@ -262,8 +230,23 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
       });
 
       chart.render();
-      updateLabels(); // re-place labels at the CURRENT transform (preserved across option changes)
+
+      // Tip labels via the engine: `labelOf`/`anchorOf` map each leaf to its name + world point,
+      // and the engine measures, culls, and re-places them on every zoom (radial centring is baked
+      // into the world coords, so the identity transform survives an option change). Radial declares
+      // the reading angle via `rotationOf`; d3gl derives the CSS transform AND the oriented collision
+      // box from it, so rotated tip labels pack by their true on-screen footprint.
+      const GAP = 8;
+      chart.labels(tipNodes, {
+        labelOf: (n) => n.data.name,
+        anchorOf: (n) => xy(n),
+        importanceOf: (n) => n.data.speciesCount ?? 1,
+        offset: (n) => labelOffset(layoutMode, n.x, GAP),
+        style: LABEL_STYLE,
+        ...(layoutMode === "radial"
+          ? { rotationOf: (n: PNode) => n.x - Math.PI / 2, textAnchor: "start" as const, keepUpright: true }
+          : {}),
+      });
     },
-    dispose: () => labels.destroy(),
   };
 };

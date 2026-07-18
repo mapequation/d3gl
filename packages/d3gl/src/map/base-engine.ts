@@ -1,6 +1,8 @@
 import { select, type Selection } from "d3-selection";
 import { zoom as d3zoom, zoomIdentity, type D3ZoomEvent, type ZoomBehavior } from "d3-zoom";
-import { Scene, HitIndex, declutterScreen, declutterScratch, type Backend, type GroupBuilder, type RenderLayer, type ViewTransform, type DeclutterScratch } from "../core/index.js";
+import { Scene, HitIndex, declutterScreen, declutterScratch, type Backend, type GroupBuilder, type RenderLayer, type ViewTransform, type DeclutterScratch, type TextData } from "../core/index.js";
+import { LabelLayer, placeLabels, resolveLabelStyle, measureText, canvasFont, DEFAULT_LABEL_TEXT, type LabelAnchor, type LabelStyle } from "../labels/index.js";
+import type { TextAnchor, LabelBox } from "../labels/cull.js";
 import { InstancedLane, type ScreenRect } from "../core/instanced-lane.js";
 import { createBackend, createCanvasBackend, type BackendType, type BackendHandle } from "./backend-factory.js";
 import { buildBatch, type DrawItem } from "./draw-batch.js";
@@ -127,6 +129,52 @@ export interface NodeDragSession {
 }
 
 /**
+ * Engine-owned text labels for `plot()` / `geoMap()` (#223) — the data-driven analogue of
+ * `network.labels()`. You supply the data and d3-style accessors; the engine measures each label's
+ * text once (no magic-number metrics), places + culls collisions on every pan/zoom (the shared
+ * {@link LabelLayer} machinery), and routes to the active backend — an HTML overlay on WebGL, native
+ * `<text>`/`fillText` on SVG/Canvas so labels survive `toSVG()`/`toPNG()` export. Styling mirrors
+ * `network.labels()`: a built-in default look, an inline {@link style} override, or a full-CSS
+ * {@link className}. Plain labels are vertically centred on the anchor (offset sits them beside the
+ * glyph); set {@link rotationOf} for the oriented (rotated) model.
+ */
+export interface DataLabelOptions<D = unknown> {
+  /** The label text for a datum, or `null`/`""` to skip it (no label for that datum). */
+  labelOf: (d: D, i: number) => string | null | undefined;
+  /** The label's REFERENCE (world / pre-transform) anchor `[x, y]`; `null`/`undefined` skips it.
+   *  For `geoMap` this is a projected point (e.g. `projection(feature.geometry.coordinates)`). */
+  anchorOf: (d: D, i: number) => [number, number] | null | undefined;
+  /** Importance for collision priority and, when {@link max} caps, ranking (higher wins). Default 0. */
+  importanceOf?: (d: D, i: number) => number;
+  /** Constant screen-px offset `[dx, dy]` from the anchor, or a per-datum accessor. Default `[0, 0]`. */
+  offset?: [number, number] | ((d: D, i: number) => [number, number]);
+  /** Oriented labels: reading-direction angle (radians) per datum — switches to the rotated
+   *  collision/render model (text runs along the axis, vertically centred on the anchor). */
+  rotationOf?: (d: D, i: number) => number;
+  /** Oriented labels only: which way text runs from the anchor (default `"start"`). */
+  textAnchor?: TextAnchor;
+  /** Oriented labels only: flip 180° to keep text upright (radial-tree readability flip). */
+  keepUpright?: boolean;
+  /** Cap the number of shown labels to the top-k by importance (default: no cap — collision thins). */
+  max?: number;
+  /** Inline overlay CSS (camelCased property → value), merged over the built-in default label look
+   *  (a dark 11px sans-serif with a white halo) — a partial override like `{ color: "#333" }` keeps
+   *  the rest. Applied once per element at creation, never per frame. */
+  style?: LabelStyle;
+  /** Advanced overlay styling: a CSS class that SKIPS the built-in default so the class's CSS has
+   *  full control (combine with {@link style} for inline overrides). */
+  className?: string;
+  /** Font for backend-native text (SVG/Canvas, incl. export). Defaults to {@link style}'s font, then
+   *  the built-in default. Also the font used to MEASURE label boxes. */
+  font?: string;
+  /** Fill colour for backend-native text. Defaults to {@link style}'s colour, then the default. */
+  color?: string;
+  /** Legibility halo stroked behind backend-native text. Defaults to the built-in white halo unless
+   *  {@link style} sets `textShadow: "none"`. */
+  halo?: { color: string; width: number };
+}
+
+/**
  * A registered retained layer, generic over its datum type `D`. Engines construct a
  * `LayerSpec<D>` with the concrete datum from `layer()`/`points()` registration, so `data`
  * and its accessors (`fill`/`stroke`/`tooltip`/`hover`) stay bound to the same `D` and can't
@@ -236,6 +284,24 @@ export abstract class BaseEngine {
   /** Active highlight per source layer; re-resolved after a rebuild re-projects geometry. */
   private highlights = new Map<string, { ids: (string | number)[]; styleOrDraw?: HighlightStyle | HighlightDraw }>();
   protected transform: ViewTransform = { k: 1, x: 0, y: 0 };
+  /** Shared frontier/data label overlay (#105 N7b, #223): the HTML overlay used on the WebGL backend
+   *  (crisp + accessible). Owned by the base so every engine's label API — `network.labels()` and the
+   *  plot/geo `labels(data, opts)` — reuses one overlay + one placement/routing path. Null when off. */
+  protected labelLayer: LabelLayer | null = null;
+  /** Backend-native text style (SVG/Canvas `<text>`/`fillText`, incl. export) for the current label
+   *  set — set once by {@link createLabelOverlay}, read by {@link routeLabels}. Null when off. */
+  private labelText: { font?: string; color?: string; halo?: { color: string; width: number } } | null = null;
+  /** The last {@link routeLabels} anchor set, retained (reference only) for the export-only text
+   *  backend push (#219): a WebGL toPNG()/toSVG() places these once at export time. Always current —
+   *  the overlay branch of routeLabels runs on every transform/rebuild. Covers BOTH network frontier
+   *  labels and plot/geo data labels (#223), since both route through routeLabels. */
+  private exportAnchors: readonly LabelAnchor[] = [];
+  /** The text alignment the retained {@link exportAnchors} were routed with ("middle" for network
+   *  glyph-centred labels, "start" for plot/geo beside-the-glyph labels). */
+  private exportAlign: TextAnchor = "middle";
+  /** Retained plot/geo data-label anchors (#223): measured + built ONCE at `labels(data, opts)` call,
+   *  re-placed (not rebuilt/re-measured) on every transform. `max` caps the shown set (default ∞). */
+  private dataLabels: { anchors: LabelAnchor[]; max: number } | null = null;
   protected handle: BackendHandle | null = null;
   protected ready: Promise<void>;
   private currentBackend: BackendType;
@@ -1218,9 +1284,179 @@ export abstract class BaseEngine {
   }
 
   /** Called by {@link setTransform} just before the render (zoom frame or programmatic), after lanes
-   *  re-emit. Subclasses override to re-place view-tracking overlays/labels — e.g. the network's
-   *  frontier label layer (#105 N7b) — so a backend that bakes labels into the frame draws them now. */
-  protected afterTransform(): void {}
+   *  re-emit. Re-places the plot/geo data labels (#223); subclasses may override to re-place their own
+   *  view-tracking overlays/labels — e.g. the network's frontier label layer (#105 N7b) — so a backend
+   *  that bakes labels into the frame draws them now. */
+  protected afterTransform(): void { this.refreshDataLabels(); }
+
+  // ── Engine-owned labels (#105 N7b, #223) ─────────────────────────────────────────────────────
+  // The overlay + placement/routing is shared by every engine; `network.labels()` builds its own
+  // (LOD-frontier) anchors, while plot/geo build data-driven anchors here from d3-style accessors.
+
+  /** Ensure the host is positioned and (re)create the label overlay with the resolved inline style,
+   *  storing the backend-native text style used to route labels on SVG/Canvas (so they survive
+   *  export). Styling lands once per element at creation — {@link routeLabels} adds no per-frame
+   *  restyle. Shared by `network.labels()` and the plot/geo data-label API. */
+  protected createLabelOverlay(
+    className: string | undefined,
+    style: LabelStyle | undefined,
+    text: { font?: string; color?: string; halo?: { color: string; width: number } },
+  ): void {
+    if (typeof getComputedStyle === "function" && getComputedStyle(this.host).position === "static") {
+      this.host.style.position = "relative";
+    }
+    this.labelLayer?.destroy();
+    this.labelLayer = new LabelLayer(this.host, (a) => a.text, className, resolveLabelStyle(className, style));
+    this.labelText = text;
+  }
+
+  /** Tear down the label overlay and clear any backend-native label set (including the WebGL
+   *  export-only stash — the next export must not carry stale labels). */
+  protected clearLabelOverlay(): void {
+    this.labelLayer?.destroy();
+    this.labelLayer = null;
+    this.labelText = null;
+    this.exportAnchors = [];
+    this.backend()?.setTextLayer?.([]);
+  }
+
+  /**
+   * Place + route a fully-built label anchor set to the active backend (#105 N7b-2). A backend that
+   * draws text natively AND live (SVG `<text>` / Canvas `fillText`) renders the culled survivors —
+   * so labels appear in `toSVG()`/`toPNG()`; otherwise — WebGL, whose `setTextLayer` is an
+   * export-only stash ({@link Backend.textLayerMode}, #219) — the HTML overlay owns the screen and
+   * the anchor set is retained (reference only, zero added per-frame work) so {@link toSVG}/
+   * {@link toPNG} can feed the stash at export time. Project + cull is shared ({@link placeLabels})
+   * so both paths place identically. Native text is vertically centred on the box (`y + height/2`,
+   * baseline "middle") and horizontally aligned per `align` — `"start"` for plot/geo labels beside
+   * a glyph, `"middle"` for network labels centred on it.
+   */
+  protected routeLabels(anchors: readonly LabelAnchor[], align: TextAnchor = "middle"): void {
+    const layer = this.labelLayer;
+    if (!layer) return;
+    const viewport = { width: this.width, height: this.height };
+    const backend = this.backend();
+    if (backend?.setTextLayer && backend.textLayerMode !== "export-only") {
+      const survivors = placeLabels(anchors, this.transform, viewport);
+      backend.setTextLayer(this.toTextData(survivors, align));
+      layer.update([], this.transform, viewport); // keep the overlay empty on a native-text backend
+    } else {
+      layer.update(anchors, this.transform, viewport);
+      // Retain the anchor set (reference only — the array was built above regardless) so an
+      // export-only text backend can be fed the placed labels at toPNG()/toSVG() time (#219).
+      // Nothing is placed or allocated here — zero added per-frame work.
+      this.exportAnchors = anchors;
+      this.exportAlign = align;
+    }
+  }
+
+  /** Map placed label boxes to backend {@link TextData} — the one shape both the live native-text
+   *  path (SVG/Canvas) and the export-only push (WebGL, #219) emit, so exports match across backends. */
+  private toTextData(survivors: readonly LabelBox[], align: TextAnchor): TextData[] {
+    const text = this.labelText;
+    return survivors.map((b) => ({
+      x: b.x,
+      y: b.y + (b.height ?? 0) / 2, // top-left box → vertical centre for the "middle" baseline
+      text: String(b.text),
+      align,
+      font: text?.font,
+      color: text?.color,
+      halo: text?.halo,
+      opacity: b.opacity as number | undefined,
+    }));
+  }
+
+  /** Feed the placed labels to an export-only text backend (#219) right before an export, so a WebGL
+   *  toPNG()/toSVG() includes what the HTML overlay shows — for network frontier labels AND plot/geo
+   *  data labels (#223) alike. Runs ONLY at export time (O(anchors in view) once per call), never per
+   *  frame; no-op on live-text backends (their set is already pushed). */
+  private pushExportLabels(): void {
+    const backend = this.backend();
+    if (!backend?.setTextLayer || backend.textLayerMode !== "export-only") return;
+    const active = this.labelLayer !== null;
+    const survivors = active ? placeLabels(this.exportAnchors, this.transform, { width: this.width, height: this.height }) : [];
+    backend.setTextLayer(this.toTextData(survivors, this.exportAlign));
+  }
+
+  /**
+   * Set (or, with `false`, clear) engine-owned data labels for plot/geoMap (#223). Measures each
+   * label's text ONCE here (never per frame), building a retained anchor set that {@link afterTransform}
+   * re-places on every pan/zoom. Plain labels are vertically centred on the anchor+offset (the measured
+   * height folds into the box); {@link DataLabelOptions.rotationOf} switches to the oriented model.
+   * Re-call to rebuild after the underlying data/positions change. O(data) to build + measure (a
+   * data-change/control cost, not per frame); measurement dedupes repeated label texts within the call.
+   */
+  protected setDataLabels<D>(data: readonly D[] | false, opts?: DataLabelOptions<D>): void {
+    if (data === false || !opts) {
+      this.dataLabels = null;
+      this.clearLabelOverlay();
+      this.render();
+      return;
+    }
+    // Native-text (SVG/Canvas export) style — derived to match the overlay when explicit opts are
+    // absent, so one `style` object styles both. Also the font used to MEASURE the label boxes.
+    const font = canvasFont(opts.font ?? opts.style?.font ?? DEFAULT_LABEL_TEXT.font);
+    const color = opts.color ?? opts.style?.color ?? DEFAULT_LABEL_TEXT.color;
+    const halo = opts.halo ?? (opts.style?.textShadow === "none" ? undefined : DEFAULT_LABEL_TEXT.halo);
+    this.createLabelOverlay(opts.className, opts.style, { font, color, halo });
+
+    const offsetOf = typeof opts.offset === "function" ? opts.offset : (): [number, number] => (opts.offset as [number, number]) ?? [0, 0];
+    const measured = new Map<string, { width: number; height: number }>(); // dedupe repeated texts (once each)
+    const anchors: LabelAnchor[] = [];
+    for (let i = 0; i < data.length; i++) {
+      const d = data[i]!;
+      const text = opts.labelOf(d, i);
+      if (!text) continue; // no label for this datum
+      const anchor = opts.anchorOf(d, i);
+      if (!anchor) continue; // e.g. a geoMap point off the projected globe
+      let box = measured.get(text);
+      if (!box) { box = measureText(text, font); measured.set(text, box); }
+      const rotation = opts.rotationOf?.(d, i);
+      const [ox, oy] = offsetOf(d, i);
+      // Plain labels: the box is top-left, so shift up by height/2 to sit centred on the anchor+offset.
+      // Oriented labels: labelGeometry already centres vertically, so the offset is used as given.
+      const offset: [number, number] = rotation === undefined ? [ox, oy - box.height / 2] : [ox, oy];
+      anchors.push({
+        id: i,
+        refX: anchor[0],
+        refY: anchor[1],
+        text,
+        width: box.width,
+        height: box.height,
+        priority: opts.importanceOf?.(d, i) ?? 0,
+        offset,
+        rotation,
+        textAnchor: opts.textAnchor,
+        keepUpright: opts.keepUpright,
+      });
+    }
+    this.dataLabels = { anchors, max: opts.max ?? Infinity };
+    this.refreshDataLabels();
+    this.render(); // bake just-set labels into the frame (Canvas); no-op-ish for the live-DOM backends
+  }
+
+  /** Re-place the retained data labels at the current transform (#223). No-op when off. Default path
+   *  (no `max`) passes the whole set straight to {@link routeLabels}, whose {@link placeLabels} already
+   *  viewport-filters + culls collisions — so the only per-frame work is that O(anchors) project+cull,
+   *  the same the raw `LabelLayer` did before (no regression; #204/#236's grid is the scale path). A
+   *  finite `max` adds an O(anchors) in-view rank+cap first. */
+  private refreshDataLabels(): void {
+    const state = this.dataLabels;
+    if (!state || !this.labelLayer) return;
+    const all = state.anchors;
+    if (all.length <= state.max) { this.routeLabels(all, "start"); return; }
+    // Cap to the top-k by importance among the in-view candidates (screen-space filter).
+    const { k, x, y } = this.transform;
+    const W = this.width, H = this.height;
+    const inView: LabelAnchor[] = [];
+    for (const a of all) {
+      const sx = k * a.refX + x + (a.offset?.[0] ?? 0);
+      const sy = k * a.refY + y + (a.offset?.[1] ?? 0);
+      if (sx >= 0 && sx <= W && sy >= 0 && sy <= H) inView.push(a);
+    }
+    inView.sort((p, q) => (q.priority ?? 0) - (p.priority ?? 0));
+    this.routeLabels(inView.slice(0, state.max), "start");
+  }
 
   /**
    * Hide anchored glyphs that overlap in screen space, keeping earlier (e.g. larger-clade)
@@ -1435,8 +1671,10 @@ export abstract class BaseEngine {
     return null;
   }
   render(): this { this.handle?.backend.render(); return this; }
-  toSVG(): string { return this.handle?.backend.toSVG() ?? ""; }
-  toPNG(): string { return this.handle?.backend.toPNG() ?? ""; }
+  // Exports feed the export-only text stash first (#219): a WebGL backend never draws labels live
+  // (the HTML overlay does), so the placed set is pushed once at export time — never per frame.
+  toSVG(): string { this.pushExportLabels(); return this.handle?.backend.toSVG() ?? ""; }
+  toPNG(): string { this.pushExportLabels(); return this.handle?.backend.toPNG() ?? ""; }
   destroy(): void {
     this.destroyed = true;
     this.sizingObserver?.disconnect();
@@ -1461,6 +1699,7 @@ export abstract class BaseEngine {
     this.marqueeBadge?.remove(); this.marqueeBadge = null;
     this.nodeDrag?.session?.end(); this.endNodeDrag(); // release a held drag + its window listeners (#140)
     this.tooltipEl?.destroy(); this.tooltipEl = null;
+    this.labelLayer?.destroy(); this.labelLayer = null; // engine-owned label overlay (#105 N7b, #223)
     this.handle?.backend.destroy();
     if (this.handle && this.handle.element !== this.host) this.handle.element.remove();
     this.handle = null;

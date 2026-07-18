@@ -1,6 +1,6 @@
 import { declutterMembers, type GroupBuilder, type PathContext, type LineJoin, type LineCap } from "../core/index.js";
 import { InstancedLane } from "../core/instanced-lane.js";
-import { BaseEngine, type InteractiveLayerOptions, type BaseEngineOptions, type LaneInteractive } from "./base-engine.js";
+import { BaseEngine, type InteractiveLayerOptions, type BaseEngineOptions, type LaneInteractive, type DataLabelOptions } from "./base-engine.js";
 import { LayerHandle } from "./layer-handle.js";
 import { resolvePlotPointsSoA, plotPointsCircles, declutterPointsStrategy } from "./points-lane.js";
 import { resolveRingColors, ringCircles } from "./highlight-ring.js";
@@ -111,6 +111,21 @@ export class Plot extends BaseEngine {
    *  downgrade reverts them to the Scene path. */
   protected override onBackendChanged(): void {
     for (const sync of this.pointsLayers.values()) sync();
+  }
+
+  /**
+   * Show engine-owned text labels (#223): supply the data and d3-style accessors, and the engine
+   * measures each label's text once, then places + culls collisions and re-places them on every
+   * pan/zoom (no manual overlay, transform callback, or text-metric estimates). Rendered by the
+   * active backend — an HTML overlay on WebGL, native `<text>`/`fillText` on SVG/Canvas so labels
+   * survive `toSVG()`/`toPNG()` export. Pass `false` to remove; re-call to rebuild after the bound
+   * data or positions change.
+   */
+  labels(data: false): this;
+  labels<D>(data: readonly D[], opts: DataLabelOptions<D>): this;
+  labels<D>(data: readonly D[] | false, opts?: DataLabelOptions<D>): this {
+    this.setDataLabels(data, opts);
+    return this;
   }
 
   /**

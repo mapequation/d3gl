@@ -17,7 +17,7 @@
  */
 export { createBackend, createCanvasBackend } from "./backend-factory.js";
 export type { BackendType, BackendHandle } from "./backend-factory.js";
-export type { InteractiveLayerOptions, BaseEngineOptions, EngineSizing } from "./base-engine.js";
+export type { InteractiveLayerOptions, BaseEngineOptions, EngineSizing, DataLabelOptions } from "./base-engine.js";
 export { geoMap, GeoMap } from "./geo-map.js";
 export type { GeoMapOptions, LayerOptions, HoverHit } from "./geo-map.js";
 export { plot, Plot } from "./plot.js";
