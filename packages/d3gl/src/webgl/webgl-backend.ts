@@ -2,7 +2,7 @@ import { luma } from "@luma.gl/core";
 import { webgl2Adapter, WebGLDevice, WEBGLFramebuffer } from "@luma.gl/webgl";
 import type { Device, Framebuffer } from "@luma.gl/core";
 import type { Backend, RenderLayer, RenderDelta, ViewTransform, InstancedLayer, InstancedHighlight } from "../core/index.js";
-import type { GroupBuffers, GroupBufferDelta, PassThroughLayer, DrawBatch, StyleTables, DrawableVector } from "../core/index.js";
+import type { GroupBuffers, GroupBufferDelta, PassThroughLayer, DrawBatch, StyleTables, DrawableVector, TextData } from "../core/index.js";
 import { GroupRenderer } from "./renderer.js";
 import { InstancedCircles, InstancedPie, InstancedLines, InstancedArrows, InstancedHalfArrows } from "./instanced.js";
 import { PickReadback } from "./pick-readback.js";
@@ -44,6 +44,9 @@ export class WebGLBackend implements Backend {
   private ptNames = new Set<string>();
   /** sizeMode of the active PT layer: true ⇒ screen (constant px), false ⇒ world. */
   private ptScreen = false;
+  /** Export-only text stash (#219): labels retained for toPNG()/toSVG(), never drawn to screen
+   *  (the engine's HTML overlay owns live labels — GPU/MSDF text is #69). See {@link textLayerMode}. */
+  private textData: readonly TextData[] = [];
 
   private constructor(
     private readonly device: Device,
@@ -84,6 +87,7 @@ export class WebGLBackend implements Backend {
     for (const r of this.renderers.values()) r.destroy();
     this.renderers.clear();
     this.layers.clear();
+    this.layerFlags.clear(); // fresh drawables carry fresh flags
     this.order = [];
     for (const layer of newLayers) {
       const renderer = new GroupRenderer(this.device, layer.buffers, this.width, this.height);
@@ -96,18 +100,32 @@ export class WebGLBackend implements Backend {
   }
 
   /**
-   * Replace a layer's geometry + tables: destroy the old renderer and rebuild from the
-   * full buffers. `updateLayer` deliberately has NO same-count recolor shortcut: equal
-   * drawable counts do NOT imply unchanged geometry (the hover overlay re-targets a
-   * different drawable at the same count every pointer move). Styles-only changes go
-   * through {@link updateLayerStyles}; appends through {@link appendToLayer} (O(new)).
+   * Replace a layer's geometry + tables. When the layer's renderer already exists and
+   * needs no pass it was built without, it is updated IN PLACE ({@link GroupRenderer.replace}):
+   * geometry buffers and tables are rewritten through the retained Grow* objects (which
+   * grow + rebind on overflow) and the Models/pipelines are REUSED. The hover overlay
+   * re-targets a different drawable on every pointer move, so this path must not churn
+   * GPU objects per event (#218). It is still a full GEOMETRY replace, never a same-count
+   * recolor shortcut: equal drawable counts do NOT imply unchanged geometry, so the
+   * buffers are always rewritten. Styles-only changes go through {@link updateLayerStyles};
+   * appends through {@link appendToLayer} (O(new)). Destroy + rebuild remains only for a
+   * structural change (a geometry-type pass appearing that the renderer lacks — e.g. an
+   * overlay created points-only later highlighting a path).
    */
   updateLayer(name: string, layer: RenderLayer): void {
-    this.renderers.get(name)?.destroy();
+    const existing = this.renderers.get(name);
+    if (existing?.replace(layer.buffers)) {
+      this.layers.set(name, layer); // an existing renderer implies `name` is already in `order`
+      this.layerFlags.delete(name); // drawable set changed; a retained flags view is stale (#208)
+      this.bakeDirty = true;
+      return;
+    }
+    existing?.destroy();
     const renderer = new GroupRenderer(this.device, layer.buffers, this.width, this.height);
     renderer.setTransform(this.clipMatrix);
     this.renderers.set(name, renderer);
     this.layers.set(name, layer);
+    this.layerFlags.delete(name); // drawable set may have changed; a retained view is stale
     if (!this.order.includes(name)) this.order.push(name);
     this.bakeDirty = true;
   }
@@ -128,6 +146,25 @@ export class WebGLBackend implements Backend {
       const prev = this.layers.get(name);
       if (prev) this.layers.set(name, { ...prev, drawables });
     }
+    this.bakeDirty = true;
+  }
+
+  /** Live per-layer flags views from {@link updateLayerFlags} (#208), folded into the stashed
+   *  vector views lazily at {@link toSVG} — never per frame (export-only consumer). Entries are
+   *  dropped whenever the drawable set changes (setLayers/updateLayer/appendToLayer), so a
+   *  retained view is always the CURRENT live one. */
+  private layerFlags = new Map<string, Uint8Array>();
+
+  /** Flags-only update (#208): rewrite ONLY the flags texture — colour tables, geometry and
+   *  the stashed vector view untouched, zero CPU-side copies. A zoom frame with declutter
+   *  uploads drawableCount bytes instead of updateColors' 9×. The vector view (toSVG reads
+   *  it) is NOT patched here — that would be an O(drawables) per-frame loop for an
+   *  export-only consumer; the live view is retained and folded in at toSVG(). */
+  updateLayerFlags(name: string, flags: Uint8Array): void {
+    const renderer = this.renderers.get(name);
+    if (!renderer) return;
+    renderer.updateFlags(flags);
+    this.layerFlags.set(name, flags);
     this.bakeDirty = true;
   }
 
@@ -162,6 +199,7 @@ export class WebGLBackend implements Backend {
     // Keep the stored layer's clip/sizeMode current (geometry lives in the renderer).
     const prev = this.layers.get(delta.name);
     if (prev) this.layers.set(delta.name, { ...prev, clipTo: delta.clipTo, sizeMode: delta.sizeMode });
+    this.layerFlags.delete(delta.name); // drawable set grew; a retained flags view is stale
     this.bakeDirty = true;
     // The engine does not call render() after appendToLayer (the backend is responsible
     // for making the append visible); render now (re-bakes if dirty in globe mode).
@@ -285,6 +323,16 @@ export class WebGLBackend implements Backend {
    *  per-instance `selected` flags) with no geometry rebuild — a hover is a uniform change. */
   styleInstancedLayer(name: string, highlight: InstancedHighlight): void {
     this.instanced.get(name)?.setHighlight(highlight);
+  }
+
+  /** Labels are an **export-only** stash here (#219): the engine keeps the HTML overlay live on
+   *  WebGL and pushes the placed set only when exporting — never per transform (zero per-frame cost). */
+  readonly textLayerMode = "export-only";
+
+  /** Retain the screen-space labels for toPNG()/toSVG() (#219). No render — the set is not drawn
+   *  to screen (the HTML overlay is); an O(1) reference swap, safe to call at any frequency. */
+  setTextLayer(texts: readonly TextData[]): void {
+    this.textData = texts;
   }
 
   setTransform(t: ViewTransform): void {
@@ -429,14 +477,24 @@ export class WebGLBackend implements Backend {
   }
 
   toPNG(): string {
-    if (this.globe) { this.drawGlobeInto(this.offscreen); return toPNG(this.device, this.offscreen, this.width, this.height); }
+    // The stashed labels (#219) are composited onto the readback by png.ts's 2D pass, so the
+    // export shows what the screen shows (canvas + HTML overlay). Export-time cost only.
+    if (this.globe) { this.drawGlobeInto(this.offscreen); return toPNG(this.device, this.offscreen, this.width, this.height, this.textData); }
     this.drawInto(this.offscreen);
-    return toPNG(this.device, this.offscreen, this.width, this.height);
+    return toPNG(this.device, this.offscreen, this.width, this.height, this.textData);
   }
 
   toSVG(): string {
+    // Fold any flags-only updates (#208) into the stashed vector views ONCE, at export time
+    // — the per-frame path deliberately skips this (WebGL renders from the flags texture).
+    for (const [name, flags] of this.layerFlags) {
+      const drawables = this.layers.get(name)?.drawables;
+      if (!drawables || drawables.length !== flags.length) continue;
+      for (let i = 0; i < flags.length; i++) drawables[i]!.flags = flags[i]!;
+    }
     // In globe mode, SVG cannot render a 3D sphere; fall back to the baked (equirectangular) layer snapshot.
-    return svgFromLayers(this.width, this.height, this.order.map((n) => this.layers.get(n)!), this.viewTransform);
+    // The stashed labels (#219) serialize as <text> on top, exactly as the Canvas/SVG backends emit them.
+    return svgFromLayers(this.width, this.height, this.order.map((n) => this.layers.get(n)!), this.viewTransform, this.textData);
   }
 
   /**

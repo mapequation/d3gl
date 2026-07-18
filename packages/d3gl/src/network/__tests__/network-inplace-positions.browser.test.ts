@@ -259,6 +259,55 @@ describe("network instanced lane — in-place position update (#179 regression g
     net.destroy();
   });
 
+  it("highlight group columns are NOT re-uploaded per position frame — selection leaves them alone, a style change re-uploads (#214)", async () => {
+    const N_NODES = 300;
+    const g = ringGraph(N_NODES);
+    const pos = ringPositions(N_NODES);
+
+    const net = network(host(), { width: 300, height: 300, backend: "webgl" });
+    await net.whenReady();
+    net.data(g).style({ nodeRadius: 4, linkStroke: "#3b82f6", linkWidth: 1 }).layout({ backend: "positions", positions: pos });
+    net.interactive({ selectable: true });
+
+    // Reach the renderers' #162 highlight buffers and spy their `write` (bufferSubData) methods
+    // AFTER the initial emit, so we count only per-position-frame uploads.
+    type Writable = { write(a: ArrayBufferView): void };
+    type WithHl = { hl: { group: Writable; group2: Writable; selected: Writable }; source: Writable };
+    const instanced = (net as unknown as { handle: { backend: { instanced: Map<string, WithHl> } } }).handle.backend.instanced;
+    const lines = instanced.get("links")!;
+    const nodes = instanced.get("nodes")!;
+    const srcSpy = vi.spyOn(lines.source, "write");
+    const groupSpy = vi.spyOn(lines.hl.group, "write");
+    const group2Spy = vi.spyOn(lines.hl.group2, "write");
+    const nodeGroupSpy = vi.spyOn(nodes.hl.group, "write");
+    const selSpy = vi.spyOn(lines.hl.selected, "write");
+
+    // N position-only frames: endpoints upload every frame, but the #162 group columns come from the
+    // #179/#214 cache — the SAME array instances — so their upload is reference-skipped (0 re-uploads).
+    const N_FRAMES = 12;
+    for (let frame = 0; frame < N_FRAMES; frame++) tickPositions(net, N_NODES, frame);
+    expect(srcSpy.mock.calls.length).toBe(N_FRAMES); // sanity: the frames really emitted
+    expect(groupSpy.mock.calls.length).toBe(0); // per-edge source ids: cached, never re-uploaded
+    expect(group2Spy.mock.calls.length).toBe(0); // per-edge target ids (undirected): cached too
+    expect(nodeGroupSpy.mock.calls.length).toBe(0); // node identity column: cached too
+
+    // A selection change refreshes ONLY the selected flags (in place, via the #162 restyle path) —
+    // the group columns stay untouched, and later position frames still skip their upload.
+    const selBefore = selSpy.mock.calls.length;
+    net.select("nodes", [1]);
+    expect(selSpy.mock.calls.length).toBeGreaterThan(selBefore); // flag buffer rewritten in place
+    for (let frame = 0; frame < 4; frame++) tickPositions(net, N_NODES, frame);
+    expect(groupSpy.mock.calls.length).toBe(0);
+    expect(group2Spy.mock.calls.length).toBe(0);
+
+    // A style() change busts the cache → fresh column instances → the group buffers DO re-upload
+    // (the reference-skip invariant holds in both directions).
+    net.style({ linkStroke: "#22c55e" });
+    expect(groupSpy.mock.calls.length).toBeGreaterThan(0);
+
+    net.destroy();
+  });
+
   it("a genuine data() change fully rebuilds (new topology reaches the GPU)", async () => {
     const net = network(host(), { width: 300, height: 300, backend: "webgl" });
     await net.whenReady();

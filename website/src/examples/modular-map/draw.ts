@@ -81,13 +81,8 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
         linkW = scaleSqrt().domain([0, maxLink]).range([0.75, 6]); // thin half-arrows
         // Link colour encodes flow (light → dark blue) and is semi-transparent (alpha ∝ flow) so overlaps
         // read as density, not black — a reciprocal pair shows its asymmetry in both width AND colour.
-        linkStroke = (w: number) => {
-          const t = Math.sqrt(Math.min(1, w / maxLink));
-          const r = Math.round(150 - 110 * t);
-          const g = Math.round(186 - 96 * t);
-          const b = Math.round(221 - 60 * t);
-          return `rgba(${r}, ${g}, ${b}, ${(0.4 + 0.5 * t).toFixed(3)})`;
-        };
+        // (The scale interpolates the RGBA range, alpha included.)
+        linkStroke = scaleSqrt<string>().domain([0, maxLink]).range(["rgba(150, 186, 221, 0.4)", "rgba(40, 90, 161, 0.9)"]).clamp(true);
         const graph = buildGraph({
           nodeCount: d.nodeCount,
           source: d.source,
