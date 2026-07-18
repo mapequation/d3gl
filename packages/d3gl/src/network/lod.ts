@@ -834,6 +834,58 @@ export function computeLODGeometry(
   computeLODStyle(tree, leafRadii, leafWeight, leafBorder, leafColors, radiusAggregate);
 }
 
+/**
+ * Fold a small set of **moved leaves** into the tree's position-derived geometry incrementally
+ * (#211) — the node-drag repaint path, where only the held leaves changed since the last pass.
+ * O(moved · depth) instead of the full O(tree size) {@link computeLODPositions}:
+ *
+ * - **Centroids (exact):** an aggregate's centroid is the mean of its descendant leaf positions
+ *   (the count-weighted child centroid telescopes to that), so one leaf moving by `δ` shifts every
+ *   ancestor's centroid by exactly `δ / count[ancestor]` — updated along the parent chain.
+ * - **Extent (grow-only, conservative):** the bounding radius is a *max* over children, which can
+ *   shrink when a leaf moves inward — detecting that would need a per-ancestor child scan. Instead
+ *   the extent only widens: grown by the ancestor's own centroid shift (covering its distance change
+ *   to every unmoved child) and by the moved child's exact reach (`|centroid − child| + child
+ *   extent`). An over-wide extent is safe — the cut culls less and expands earlier (never hides
+ *   geometry) — and the caller runs one exact {@link computeLODPositions} when the drag settles.
+ *
+ * Style-derived geometry (`radius`/`weight`/`border`/`color`) is position-independent and untouched.
+ * `parent` is the tree's parent-pointer array (derive it from the children CSR for coarsening /
+ * spatial trees, as `Network.treeParent` does — once per tree, not per move). Allocation-free.
+ */
+export function updateLODPositionsForLeaves(
+  tree: LODTree,
+  positions: ArrayLike<number>,
+  leaves: ArrayLike<number>,
+  parent: Int32Array,
+): void {
+  const { cx, cy, extent, count } = tree;
+  for (let k = 0; k < leaves.length; k++) {
+    const i = leaves[k]!;
+    const nx = positions[i * 2]!;
+    const ny = positions[i * 2 + 1]!;
+    const dx = nx - cx[i]!;
+    const dy = ny - cy[i]!;
+    if (dx === 0 && dy === 0) continue;
+    cx[i] = nx;
+    cy[i] = ny;
+    let child = i;
+    for (let a = parent[i]!; a !== -1; a = parent[a]!) {
+      const inv = 1 / count[a]!; // count ≥ 1 for every tree node
+      const ax = cx[a]! + dx * inv;
+      const ay = cy[a]! + dy * inv;
+      // Grow-only: the centroid moved by |δ|/count (distance to every unmoved child changes by at
+      // most that), and the moved child's reach from the new centroid is recomputed exactly.
+      const reach = Math.hypot(ax - cx[child]!, ay - cy[child]!) + extent[child]!;
+      const grown = extent[a]! + Math.hypot(dx * inv, dy * inv);
+      extent[a] = reach > grown ? reach : grown;
+      cx[a] = ax;
+      cy[a] = ay;
+      child = a;
+    }
+  }
+}
+
 /** Screen-space transform: `screen = world * k + (x, y)` (matches {@link BaseEngine} `ViewTransform`). */
 export interface LODTransform {
   k: number;
