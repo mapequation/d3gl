@@ -11,9 +11,21 @@
 import type { Device } from "@luma.gl/core";
 import { gpuLayoutSupported } from "./device-caps.js";
 import { GpuForceLayout } from "./gpu-force-layout.js";
+import { canModuleSeed, gpuMultilevelSeed } from "./gpu-multilevel-seed.js";
 import { startWorkerLayout, type WorkerLayoutHandle, type WorkerLayoutOptions } from "../worker-transport.js";
 import { seedPositions, DEFAULT_FORCE } from "../force.js";
+import type { LODTopology } from "../lod.js";
 import type { NetworkGraph } from "../graph.js";
+
+/**
+ * GPU layout options — the worker options plus an optional provided module hierarchy (N8.2). When
+ * present (and it carries super-edges), the GPU backend seeds **module-aware**, laying the layout out
+ * top-down over the module tree so modules read as coherent regions; otherwise it uses the disc seed.
+ */
+export interface GpuLayoutOptions extends WorkerLayoutOptions {
+  /** The provided module tree topology (from `lod({ modules })`), for the module-aware multilevel seed. */
+  moduleTopology?: LODTopology;
+}
 
 const TARGET_FRAMES = 60;
 
@@ -40,7 +52,7 @@ const COOL_TICKS = 120;
 export function startGpuLayout(
   deviceOrPromise: Device | null | undefined | Promise<Device | null | undefined>,
   graph: NetworkGraph,
-  opts: WorkerLayoutOptions,
+  opts: GpuLayoutOptions,
   onFrame: () => void,
 ): WorkerLayoutHandle {
   // Fast path: plain value (not a Promise). Preserves backward compatibility.
@@ -116,7 +128,7 @@ export function startGpuLayout(
 function startGpuLayoutSync(
   device: Device | null | undefined,
   graph: NetworkGraph,
-  opts: WorkerLayoutOptions,
+  opts: GpuLayoutOptions,
   onFrame: () => void,
 ): WorkerLayoutHandle {
   if (!gpuLayoutSupported(device)) {
@@ -141,8 +153,15 @@ function startGpuLayoutSync(
   const iterations = rawIterations ?? 300;
   const frameEvery = opts.frameEvery ?? Math.max(1, Math.ceil(iterations / TARGET_FRAMES));
 
-  // Seed positions with a plain disc (multilevel GPU seeding is N8.2).
-  seedPositions(graph, width, height);
+  // Seed positions. Module-aware multilevel seed (N8.2) when a provided module tree with super-edges
+  // is available — lays out top-down over the module hierarchy so modules read as coherent regions —
+  // else the plain phyllotaxis disc. The finest-level refine below (real edges) polishes either seed.
+  const topo = opts.moduleTopology;
+  if (topo && canModuleSeed(topo, graph.nodeCount)) {
+    gpuMultilevelSeed(device, topo, graph, { width, height, force });
+  } else {
+    seedPositions(graph, width, height);
+  }
 
   const layout = new GpuForceLayout(device, graph, { ...DEFAULT_FORCE, ...force });
 
