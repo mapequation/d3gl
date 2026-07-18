@@ -63,6 +63,19 @@ export class SvgBackend implements Backend {
     this.dirty = true;
   }
 
+  /** Flags-only update (#208): patch the retained vector view's flag bytes IN PLACE — no new
+   *  objects or arrays (vs updateLayerStyles, which swaps in a freshly materialized view) —
+   *  and mark dirty: visibility changed, so the next render() re-serializes, exactly as
+   *  before. The length guard is defensive: any drawable-set change reaches this backend as
+   *  updateLayer/appendToLayer/setLayers first. */
+  updateLayerFlags(name: string, flags: Uint8Array): void {
+    const layer = this.layers.find((l) => l.name === name);
+    if (!layer || layer.drawables.length !== flags.length) return;
+    const ds = layer.drawables;
+    for (let i = 0; i < ds.length; i++) ds[i]!.flags = flags[i]!;
+    this.dirty = true;
+  }
+
   /** Screen-space text labels (#105 N7b-2). Coords are already in screen px (no view transform), so a
    *  pan/zoom re-pushes the set; rendered into the dedicated `text` group + included in toSVG(). */
   setTextLayer(texts: readonly TextData[]): void {

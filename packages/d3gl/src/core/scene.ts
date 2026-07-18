@@ -142,6 +142,14 @@ class GroupData {
   /** Cached transform-independent declutter index (built lazily; null ⇒ stale/never built).
    *  Invalidated whenever the group's drawable set changes (rebuild or append). */
   declutterIndex: DeclutterIndex | null = null;
+  /** Persistent typed mirror of {@link flags}, kept in lockstep by the flag writers and
+   *  handed out BY REFERENCE via {@link Scene.flagsView} (the flags-only per-frame path,
+   *  #208 — zero copies/allocation per frame). Lazily (re)built from the boxed array when
+   *  missing or when the drawable set grew (length mismatch); a group() rebuild replaces
+   *  GroupData, so it resets naturally. Interim seam for #207: once the tables themselves
+   *  are typed this mirror becomes the primary storage and the double-write disappears —
+   *  the `flagsView` contract is unchanged. */
+  flagsView: Uint8Array | null = null;
   constructor(public readonly tolerance: number) {}
 }
 
@@ -374,7 +382,12 @@ export class Scene {
   /** Set a drawable's flag byte (e.g. bit 0 = visible). Hot-swappable. */
   setFlag(name: string, id: string | number, flags: number): void {
     const { data, drawableId } = this.drawableIdOf(name, id);
-    data.flags[drawableId] = flags & 0xff;
+    const v = flags & 0xff;
+    data.flags[drawableId] = v;
+    // Keep the typed mirror in lockstep when current; a stale mirror (drawable set grew)
+    // is rebuilt from the boxed array on the next flagsView() access instead.
+    const view = data.flagsView;
+    if (view && view.length === data.flags.length) view[drawableId] = v;
   }
 
   /**
@@ -415,10 +428,38 @@ export class Scene {
     const data = this.get(name);
     const { groupOf } = data.declutterIndex ?? this.declutterIndex(name);
     const flags = data.flags;
+    const view = this.ensureFlagsView(data); // typed mirror, kept in lockstep (#208)
     for (let i = 0; i < flags.length; i++) {
       const g = groupOf[i]!;
-      flags[i] = g < 0 || visibleByGroup[g] ? 1 : 0;
+      const v = g < 0 || visibleByGroup[g] ? 1 : 0;
+      flags[i] = v;
+      view[i] = v;
     }
+  }
+
+  /**
+   * A LIVE typed view of a group's per-drawable flag bytes (bit 0 = visible): the SAME
+   * `Uint8Array` instance across calls — zero per-call allocation — kept in sync in place
+   * by the flag writers ({@link setFlag}, {@link writeDeclutterFlags}) and rebuilt only
+   * when the drawable set changes (append grows it; a group rebuild replaces it). This is
+   * what the flags-only per-frame path (#208) passes by reference to
+   * `Backend.updateLayerFlags`, instead of the O(9·drawableCount)-bytes
+   * {@link styleTables} snapshot. Callers must treat it as read-only and must not retain
+   * it across drawable-set changes.
+   */
+  flagsView(name: string): Uint8Array {
+    return this.ensureFlagsView(this.get(name));
+  }
+
+  /** The group's persistent typed flags mirror, (re)built from the boxed array when
+   *  missing or stale (drawable set grew). O(1) when current. */
+  private ensureFlagsView(data: GroupData): Uint8Array {
+    let view = data.flagsView;
+    if (!view || view.length !== data.flags.length) {
+      view = Uint8Array.from(data.flags);
+      data.flagsView = view;
+    }
+    return view;
   }
 
   /** Build the vector view of one drawable at index `i` (shared by drawables()/drawableOf()). */
