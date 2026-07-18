@@ -1,4 +1,4 @@
-import type { Device, Texture, Framebuffer } from "@luma.gl/core";
+import type { Device, Texture, Framebuffer, RenderPass } from "@luma.gl/core";
 import type { ForceParams, LayoutGraph } from "../force.js";
 import { buildCSR } from "../graph.js";
 import { atlasWidth, pingPong, readbackFloatFboReuse, packUintTexture } from "./textures.js";
@@ -29,6 +29,14 @@ export interface GpuForceLayoutOptions {
    * Omitted → auto-select by {@link GPU_REPULSION_ALLPAIRS_MAX}.
    */
   repulsionMode?: "allpairs" | "pyramid";
+  /**
+   * Override the per-tick displacement clamp (world units). By default it is derived from the seed
+   * positions' bounding box (`span0 * 4`). The multilevel seed (N8.2) seeds each level's position
+   * texture on the **GPU** (prolongation) *after* construction, so the CPU `graph.positions` bbox is
+   * meaningless there — it passes an explicit `maxStep` (a viewport-scaled span) instead. @see
+   * {@link seedFromProlongation}
+   */
+  maxStep?: number;
 }
 
 /**
@@ -185,7 +193,9 @@ export class GpuForceLayout {
       if (y < minY) minY = y; if (y > maxY) maxY = y;
     }
     const span0 = Math.max((maxX - minX), (maxY - minY), 1);
-    this.maxStep = span0 * 4;
+    // Explicit override (multilevel seed: positions are GPU-seeded after construction, so the CPU
+    // bbox above is meaningless — the caller passes a viewport-scaled span instead).
+    this.maxStep = options.maxStep ?? span0 * 4;
 
     // Build padded position data (same layout as packPositionsTexture) and seed
     // the position read (A) side with it. Velocity starts zeroed (no seed).
@@ -452,6 +462,35 @@ export class GpuForceLayout {
     if (id < 0 || id >= this.count) return;
     this.flagScratch[0] = on ? 255 : 0;
     this.pinnedTex.writeData(this.flagScratch, { x: id % this.width, y: (id / this.width) | 0, width: 1, height: 1 });
+  }
+
+  /**
+   * The current read-side position texture (N8.2 multilevel seed). The next finer level's
+   * prolongation gather samples this by parent slot. Read-only handle — do not write it directly.
+   */
+  get positionTexture(): Texture {
+    return this.pos.readTex;
+  }
+
+  /** This layout's position-atlas width (N8.2), so a prolongation from it maps a parent slot → texel. */
+  get positionWidth(): number {
+    return this.width;
+  }
+
+  /**
+   * Seed this layout's positions from a coarser level via a single GPU {@link ProlongatePass} gather
+   * (N8.2), overwriting the constructor's CPU seed. Renders into the read-side position texture (the
+   * one the first tick reads), so a subsequent {@link runFrame} refines from the prolongated seed.
+   * O(this level's size), no CPU per-node loop. `run` is a closure the caller supplies so this class
+   * needn't import the pass type; it draws into the freshly-opened render pass.
+   */
+  seedFromProlongation(run: (pass: RenderPass) => void): void {
+    // readFbos[0] wraps the current read-side position texture (A, parity 0 at construction), so
+    // writing it here seeds exactly what the next tick reads.
+    const pass = this.device.beginRenderPass({ framebuffer: this.readFbos[0]!, clearColor: false });
+    run(pass);
+    pass.end();
+    this.device.submit();
   }
 
   /**

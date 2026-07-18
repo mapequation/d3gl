@@ -101,7 +101,9 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
       });
 
       if (layoutChanged) {
-        net.stateNetwork(g.graph, { modules: g.stateModules, view }).layout({ backend });
+        // fit: true (#238) frames the streaming physical layout as it converges (worker/gpu); the
+        // synchronous `force` backend ignores it and frames itself. Opens framed, no top-left flash.
+        net.stateNetwork(g.graph, { modules: g.stateModules, view }).layout({ backend, fit: true });
         builtBackend = backend;
       } else net.view(view);
 

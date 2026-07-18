@@ -1,19 +1,31 @@
 import { network, buildGraph, moduleColors } from "@mapequation/d3gl/network";
-import { scaleSqrt } from "d3-scale";
+import { scaleSqrt, type ScaleContinuousNumeric } from "d3-scale";
 import type { ImperativeSetup } from "../types.js";
-import { loadModularMap } from "./data.js";
+import { makeModularMap } from "./data.js";
+
+/** Nodes slider → generated network size. Capped where the runtime random-walk flow stays snappy. */
+const SIZES = [500, 1_000, 2_000, 5_000, 10_000, 20_000];
 
 /**
- * A **directed map of modules** from a baked LFR planted partition (#104 N6). Nodes are coloured by
+ * A **directed map of modules** from a runtime LFR planted partition (#104 N6). Nodes are coloured by
  * their **module** (a categorical hue per community), sized by their random-walk **flow**, and ringed
  * by their **enter/exit flow**; directed links are **half-arrows** whose width + colour encode link
  * flow. In **screen** sizeMode the glyphs stay a constant pixel size as you zoom.
  *
- * The **LOD** control switches the cut: **Off** draws every node + half-arrow; **Standard** is plain
- * structural coarsening (it ignores the planted partition — aggregates joined by simple super-edge
- * lines); **Modules** uses the partition, so modules collapse to a single glyph and their connectivity
- * shows as **half-arrow super-edges that thicken with the accumulated flow** between modules. Scroll to
- * zoom: modules expand → sub-members → leaves.
+ * The layout is the **module-aware GPU seed** (#180 N8.2): the provided module hierarchy is supplied
+ * *before* `layout({ backend: "gpu" })`, so the WebGL2 Barnes-Hut solve is seeded **top-down over the
+ * module tree** — modules (including the ragged, deeper-nested **super-modules** in `data.ts`) lay out
+ * as coherent regions rather than an untangling disc. `fit: true` (#206) keeps the camera framed on the
+ * layout as it converges — it opens centred and view-filling and settles in place, with no jump. (Falls
+ * back to the CPU worker where float render targets are unavailable.)
+ *
+ * The **Nodes** slider resizes the generated network (500 → 20,000): the map is regenerated — flow and
+ * all — and re-laid-out on the GPU, framing itself each time. The **LOD** control switches the cut:
+ * **Off** draws every node + half-arrow; **Standard** is plain structural coarsening (it ignores the
+ * planted partition — aggregates joined by simple super-edge lines); **Modules** uses the partition, so
+ * modules collapse to a single glyph and their connectivity shows as **half-arrow super-edges that
+ * thicken with the accumulated flow** between modules. Scroll to zoom: modules expand → sub-modules →
+ * leaves (the ragged branches nest to different depths).
  *
  * `net.labels({ max: 12, labelOf })` badges the **12 highest-flow glyphs in view** (#105 N7b) with their
  * size — re-ranked + re-placed as you pan/zoom. Unlike the symmetric gasket, flow varies here, so a
@@ -26,81 +38,68 @@ import { loadModularMap } from "./data.js";
  */
 export const setup: ImperativeSetup = (host, { width, height, backend }) => {
   const net = network(host, { width, height, backend });
-
-  const d = loadModularMap();
-  const graph = buildGraph({
-    nodeCount: d.nodeCount,
-    source: d.source,
-    target: d.target,
-    weight: d.linkFlow, // edge weight = flow, so LOD super-edges accumulate flow
-    directed: true,
-    nodeFlow: d.nodeFlow,
-  });
-  // Categorical colour per planted module; aggregates inherit their module's colour under LOD.
-  const colors = moduleColors(d.modulePaths, { lightness: 62, chroma: 58 });
-
-  const maxNodeFlow = d.nodeFlow.reduce((a, b) => Math.max(a, b), 0);
-  const maxEnter = d.enterExit.reduce((a, b) => Math.max(a, b), 0);
-  const maxLink = d.linkFlow.reduce((a, b) => Math.max(a, b), 0);
-  // Range minimums ≥ 1 so nodes/links never vanish (the ring may be 0 for interior nodes). The node
-  // radius range top is slider-driven (see render) — smaller ⇒ less declutter ⇒ more nodes + edges show.
-  const ringW = scaleSqrt().domain([0, maxEnter]).range([0, 6]);
-  const linkW = scaleSqrt().domain([0, maxLink]).range([0.75, 6]); // thinner half-arrows
-  // Link colour encodes flow like the half-arrow example — light → dark blue with flow — and is
-  // semi-transparent (alpha also ∝ flow) so overlaps read as density, not black. So a reciprocal pair
-  // shows its asymmetry in both width AND colour. (Manual lerp keeps the alpha a colour scale drops.)
-  const linkStroke = (w: number) => {
-    const t = Math.sqrt(Math.min(1, w / maxLink));
-    const r = Math.round(150 - 110 * t);
-    const g = Math.round(186 - 96 * t);
-    const b = Math.round(221 - 60 * t);
-    return `rgba(${r}, ${g}, ${b}, ${(0.4 + 0.5 * t).toFixed(3)})`;
-  };
-
-  net.data(graph).layout({ backend: "force", iterations: 320 });
-
-  // Rather than a custom fit transform, **scale the layout** to fill the view at the default zoom — so
-  // the map opens framed and World/Screen sizing don't change the apparent scale (the transform stays
-  // k=1). Centre on the centroid and size from the 97th-percentile radius (robust to force-layout
-  // fling-outs). Modules collapse into the map of modules here; zoom in to expand them.
-  const p = graph.positions;
-  let cx = 0;
-  let cy = 0;
-  for (let i = 0; i < graph.nodeCount; i++) {
-    cx += p[i * 2]!;
-    cy += p[i * 2 + 1]!;
-  }
-  cx /= graph.nodeCount;
-  cy /= graph.nodeCount;
-  const dists = Array.from({ length: graph.nodeCount }, (_, i) => Math.hypot(p[i * 2]! - cx, p[i * 2 + 1]! - cy)).sort((a, b) => a - b);
-  const R = dists[Math.floor(graph.nodeCount * 0.97)] || 1;
-  const s = (Math.min(width, height) / 2) * 0.85 / R; // scale the 97th-pct extent to ~0.85 of half the view
-  for (let i = 0; i < graph.nodeCount; i++) {
-    p[i * 2] = width / 2 + (p[i * 2]! - cx) * s;
-    p[i * 2 + 1] = height / 2 + (p[i * 2 + 1]! - cy) * s;
-  }
-  net.layout({ backend: "positions", positions: p }); // commit the scaled layout at the default k=1 view
   net.enableZoom([0.1, 40]); // default view; zoom out to the module map, in to single nodes
   // Selection + hover rings and node-drag (#140): hover/click rings a node or module (green hover, blue
   // selection), ⇧+drag box-selects (⌥ subtracts, red preview), and dragging a glyph — or a whole selected
-  // set, or a collapsed module — moves it. The final layout is the `positions` backend, so a drag here
-  // *translates* the grabbed set (no sim to reheat). Note how the selection/hover ring sits alongside the
-  // per-node flowBorder ring and a collapsed module's aggregateOutline.
+  // set, or a collapsed module — moves it. Note how the selection/hover ring sits alongside the per-node
+  // flowBorder ring and a collapsed module's aggregateOutline.
   net.interactive({ selectable: { multi: true }, draggable: true, hover: true });
 
-  // Frontier labels (#105 N7b): here flow VARIES across modules, so capping with `max` surfaces the
-  // highest-flow glyphs in view (badged with their size). The Labels slider sets the cap (top end =
-  // "All", no limit); re-ranked + re-placed as you pan/zoom.
   const labelStyle = document.createElement("style");
   labelStyle.textContent = ".map-label{font:600 11px/1 system-ui,sans-serif;color:#111827;text-shadow:0 0 3px #fff,0 0 3px #fff,0 0 3px #fff}";
   host.appendChild(labelStyle);
   // Labels slider → max cap; the last position is "All" (no limit).
   const LABEL_CAPS = [6, 12, 20, 30, 50, 100, Infinity];
 
+  // Regenerated + re-laid-out whenever the Nodes slider changes; flow-derived scales are rebuilt with it.
+  let count = -1;
+  let colors: string[] = [];
+  let enterExit: Float32Array<ArrayBufferLike> = new Float32Array();
+  let maxNodeFlow = 1;
+  let modulePaths: { id: number; path: number[] }[] = [];
+  let ringW: ScaleContinuousNumeric<number, number>;
+  let linkW: ScaleContinuousNumeric<number, number>;
+  let linkStroke: (w: number) => string;
+
   return {
     engine: net,
     dispose: () => labelStyle.remove(),
     render: (options) => {
+      const n = SIZES[(options.nodes as number) ?? 1] ?? 1_000;
+      if (n !== count) {
+        count = n;
+        const d = makeModularMap(n);
+        modulePaths = d.modulePaths;
+        enterExit = d.enterExit;
+        // Categorical colour per planted module; aggregates inherit their module's colour under LOD.
+        colors = moduleColors(d.modulePaths, { lightness: 62, chroma: 58 });
+        maxNodeFlow = d.nodeFlow.reduce((a, b) => Math.max(a, b), 0);
+        const maxEnter = d.enterExit.reduce((a, b) => Math.max(a, b), 0);
+        const maxLink = d.linkFlow.reduce((a, b) => Math.max(a, b), 0);
+        // Range minimums keep glyphs/links from vanishing (the ring may be 0 for interior nodes).
+        ringW = scaleSqrt().domain([0, maxEnter]).range([0, 6]);
+        linkW = scaleSqrt().domain([0, maxLink]).range([0.75, 6]); // thin half-arrows
+        // Link colour encodes flow (light → dark blue) and is semi-transparent (alpha ∝ flow) so overlaps
+        // read as density, not black — a reciprocal pair shows its asymmetry in both width AND colour.
+        // (The scale interpolates the RGBA range, alpha included.)
+        linkStroke = scaleSqrt<string>().domain([0, maxLink]).range(["rgba(150, 186, 221, 0.4)", "rgba(40, 90, 161, 0.9)"]).clamp(true);
+        const graph = buildGraph({
+          nodeCount: d.nodeCount,
+          source: d.source,
+          target: d.target,
+          weight: d.linkFlow, // edge weight = flow, so LOD super-edges accumulate flow
+          directed: true,
+          nodeFlow: d.nodeFlow,
+        });
+        // Supply the (ragged) module hierarchy BEFORE laying out, so the GPU force layout seeds
+        // MODULE-AWARE (#180 N8.2): it lays the map out top-down over the module tree, so modules —
+        // including the deeper super-modules — form coherent regions. `fit: true` keeps the camera framed
+        // on the layout as it converges (#206), so the map opens framed and settles in place, no jump.
+        net.data(graph);
+        net.lod({ modules: modulePaths });
+        net.layout({ backend: "gpu", fit: true, iterations: 300 });
+      }
+
       net.labels({ max: LABEL_CAPS[(options.maxLabels as number) ?? 1] ?? 12, className: "map-label", labelOf: (id, info) => (info.aggregate ? `${info.count}` : `n${id}`) });
       const sizeMode = options.sizing === "World" ? "world" : "screen";
       const expandPx = (options.expand as number) ?? 120;
@@ -116,7 +115,7 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
         nodeRadius: { by: "flow", scale: nodeR }, // radius ∝ visit rate
         nodeFill: (i) => colors[i]!, // categorical module colour
         // Ring ∝ enter/exit flow; colour omitted ⇒ a darker shade of each glyph's own module colour.
-        flowBorder: { flow: d.enterExit, scale: ringW },
+        flowBorder: { flow: enterExit, scale: ringW },
         linkBend: 14, // px (screen mode)
         linkWidth: linkW, // half-arrow width ∝ link flow; super-edges use accumulated flow
         linkStroke, // semi-transparent blue, alpha ∝ flow
@@ -137,7 +136,7 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
         // The planted partition drives the cut → directed half-arrow super-edges ∝ accumulated flow.
         // No aggregate-radius cap: a module is sized by `nodeRadius` applied to its members' summed
         // flow (the scale extrapolates above the leaf domain), so a module reads as its total flow.
-        net.lod({ modules: d.modulePaths, expandPx, declutter, superEdges: true, aggregateOutline, crossLevelEdges, crossFade });
+        net.lod({ modules: modulePaths, expandPx, declutter, superEdges: true, aggregateOutline, crossLevelEdges, crossFade });
       }
     },
   };
