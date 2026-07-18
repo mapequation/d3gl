@@ -1,9 +1,9 @@
 ---
 title: Engines
-description: The two engines — geoMap (geographic) and plot (2D Cartesian) — share one base, so interaction, styling, backends, and export work identically on both.
+description: The three engines — geoMap (geographic), plot (2D Cartesian), and network (node–link graphs) — share one base, so interaction, backends, view transform, and export work identically on all of them.
 ---
 
-d3gl gives you two engines:
+d3gl gives you three engines:
 
 - [`geoMap()`](/d3gl/reference/map/classes/geomap/) — geographic. Layers are GeoJSON features
   drawn through a d3 [`GeoProjection`](https://d3js.org/d3-geo/projection), with rotation,
@@ -11,18 +11,23 @@ d3gl gives you two engines:
 - [`plot()`](/d3gl/reference/map/classes/plot/) — 2D Cartesian. Layers are drawn with a
   `draw(ctx, datum)` callback or `x`/`y` point accessors in plot coordinates (trees, charts,
   link diagrams, scatter plots).
+- [`network()`](/d3gl/reference/network/classes/network/) — node–link graphs. Nodes and links
+  are GPU-instanced glyphs — built for millions of elements — placed by the in-library force
+  layout (main-thread, worker, or GPU) or your own positions, with an adaptive
+  level-of-detail cut for [maps of networks](/d3gl/examples/network/).
 
-They are **siblings over a shared base** (`BaseEngine`, internal). They differ *only* in how a
-layer's geometry is defined. Everything else — interaction, per-drawable styling, backends, view
-transform, and export — lives in the base, so it behaves identically on both. Pick the engine
-that matches your data; the rest of the API is the same.
+They are **siblings over a shared base** (`BaseEngine`, internal). They differ *only* in how
+their geometry is defined. Everything else — interaction, backends, view transform, sizing, and
+export — lives in the base, so it behaves identically on all of them. Pick the engine that
+matches your data; the rest of the API is the same.
 
 ```ts
-import { geoMap } from "@mapequation/d3gl/map"; // geographic
-import { plot } from "@mapequation/d3gl/map";   // 2D Cartesian
+import { geoMap } from "@mapequation/d3gl/map";      // geographic
+import { plot } from "@mapequation/d3gl/map";        // 2D Cartesian
+import { network } from "@mapequation/d3gl/network"; // node–link graphs
 ```
 
-## Shared API (both engines)
+## Shared API (all engines)
 
 Once you have an engine instance, these work the same regardless of which one you created:
 
@@ -39,8 +44,8 @@ Once you have an engine instance, these work the same regardless of which one yo
 | Export | `toPNG()`, `toSVG()` |
 | Teardown | `destroy()` |
 
-Retained layers on **both** engines also accept the same **declarative interaction options**
-(`InteractiveLayerOptions`), forwarded into the layer the same way:
+Retained layers on the **`geoMap` and `plot`** engines also accept the same **declarative
+interaction options** (`InteractiveLayerOptions`), forwarded into the layer the same way:
 
 ```ts
 engine.layer("things", data, {
@@ -52,14 +57,18 @@ engine.layer("things", data, {
 ```
 
 See the [Interaction guide](/d3gl/interaction/) for what each one does and what it costs — every
-example there reads identically whether `engine` is a `geoMap` or a `plot`.
+example there reads identically whether `engine` is a `geoMap` or a `plot`. The `network`
+engine's glyphs live on a GPU-instanced lane rather than retained layers, so they opt into the
+same hover/selection machinery with one call — `net.interactive({ hover: true, selectable: true })`
+— and resolve through the same `on("hover" | "click" | "select")` events.
 
 ## Sizing
 
-Both engines are **responsive by default** and resize **in place** — when their container changes
-size they reconcile the rendering surface and re-render without tearing down, so the view
+All three engines are **responsive by default** and resize **in place** — when their container
+changes size they reconcile the rendering surface and re-render without tearing down, so the view
 transform, layers, hover, and selection are all preserved. Three modes, picked by which options
-you pass (to the `plot()` / `geoMap()` constructors or the React `<Plot>` / `<GeoMap>` props):
+you pass (to the `plot()` / `geoMap()` / `network()` constructors or the React `<Plot>` /
+`<GeoMap>` props):
 
 | You pass | Mode | Behavior |
 | --- | --- | --- |
@@ -86,14 +95,14 @@ an aspect-ratio change (possible in fill-parent mode) re-letterboxes the map to 
 
 ## Engine-specific API
 
-What's unique to each engine is the layer definition (its geometry) plus a few domain methods:
+What's unique to each engine is the geometry definition plus a few domain methods:
 
-| | [`geoMap()`](/d3gl/reference/map/classes/geomap/) | [`plot()`](/d3gl/reference/map/classes/plot/) |
-| --- | --- | --- |
-| Constructor option | `projection` (required) | — |
-| Layer geometry | `layer(name, features, opts)` — GeoJSON + projection | `layer(name, data, { draw })` and `points(name, data, { x, y })` |
-| Domain methods | `setProjection()`, `enableRotation()` | — |
-| Coordinates | geographic `[lon, lat]`, projected each frame | plot coordinates, drawn directly |
+| | [`geoMap()`](/d3gl/reference/map/classes/geomap/) | [`plot()`](/d3gl/reference/map/classes/plot/) | [`network()`](/d3gl/reference/network/classes/network/) |
+| --- | --- | --- | --- |
+| Constructor option | `projection` (required) | — | — |
+| Geometry | `layer(name, features, opts)` — GeoJSON + projection | `layer(name, data, { draw })` and `points(name, data, { x, y })` | `data(graph)` — nodes + links from `buildGraph(edges)` |
+| Domain methods | `setProjection()`, `enableRotation()` | — | `style()`, `layout()`, `lod()`, `labels()`, `interactive()` |
+| Coordinates | geographic `[lon, lat]`, projected each frame | plot coordinates, drawn directly | layout coordinates (force layout or supplied positions) |
 
 ```ts
 // geoMap: GeoJSON features through a projection
@@ -107,12 +116,17 @@ chart.layer("boxes", rects, {
   fill: "#4477aa",
   hover: { fill: "#ee6677" },
 });
+
+// network: a graph from an edge list — the layout runs in-library
+const net = network(host, { width, height });
+net.data(buildGraph({ nodeCount, source, target })).layout({ backend: "worker" });
 ```
 
 ## Choosing an engine
 
 - Mapping anything geographic (GeoJSON, projections, a globe) → **`geoMap()`**.
+- A node–link graph (networks, maps of networks, state networks) → **`network()`**.
 - Everything else in a 2D plane (trees, scatter, links, custom marks) → **`plot()`**.
 
 Because the shared base is the same object, you can move between them without relearning
-interaction, styling, or backends — only the layer-definition call changes.
+interaction, styling, or backends — only the geometry-definition call changes.

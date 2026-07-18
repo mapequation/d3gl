@@ -2,7 +2,7 @@ import { luma } from "@luma.gl/core";
 import { webgl2Adapter, WebGLDevice, WEBGLFramebuffer } from "@luma.gl/webgl";
 import type { Device, Framebuffer } from "@luma.gl/core";
 import type { Backend, RenderLayer, RenderDelta, ViewTransform, InstancedLayer, InstancedHighlight } from "../core/index.js";
-import type { GroupBuffers, GroupBufferDelta, PassThroughLayer, DrawBatch, StyleTables, DrawableVector } from "../core/index.js";
+import type { GroupBuffers, GroupBufferDelta, PassThroughLayer, DrawBatch, StyleTables, DrawableVector, TextData } from "../core/index.js";
 import { GroupRenderer } from "./renderer.js";
 import { InstancedCircles, InstancedPie, InstancedLines, InstancedArrows, InstancedHalfArrows } from "./instanced.js";
 import { PickReadback } from "./pick-readback.js";
@@ -44,6 +44,9 @@ export class WebGLBackend implements Backend {
   private ptNames = new Set<string>();
   /** sizeMode of the active PT layer: true ⇒ screen (constant px), false ⇒ world. */
   private ptScreen = false;
+  /** Export-only text stash (#219): labels retained for toPNG()/toSVG(), never drawn to screen
+   *  (the engine's HTML overlay owns live labels — GPU/MSDF text is #69). See {@link textLayerMode}. */
+  private textData: readonly TextData[] = [];
 
   private constructor(
     private readonly device: Device,
@@ -287,6 +290,16 @@ export class WebGLBackend implements Backend {
     this.instanced.get(name)?.setHighlight(highlight);
   }
 
+  /** Labels are an **export-only** stash here (#219): the engine keeps the HTML overlay live on
+   *  WebGL and pushes the placed set only when exporting — never per transform (zero per-frame cost). */
+  readonly textLayerMode = "export-only";
+
+  /** Retain the screen-space labels for toPNG()/toSVG() (#219). No render — the set is not drawn
+   *  to screen (the HTML overlay is); an O(1) reference swap, safe to call at any frequency. */
+  setTextLayer(texts: readonly TextData[]): void {
+    this.textData = texts;
+  }
+
   setTransform(t: ViewTransform): void {
     this.viewTransform = t;
     this.clipMatrix = clipFromView(t, this.width, this.height);
@@ -429,14 +442,17 @@ export class WebGLBackend implements Backend {
   }
 
   toPNG(): string {
-    if (this.globe) { this.drawGlobeInto(this.offscreen); return toPNG(this.device, this.offscreen, this.width, this.height); }
+    // The stashed labels (#219) are composited onto the readback by png.ts's 2D pass, so the
+    // export shows what the screen shows (canvas + HTML overlay). Export-time cost only.
+    if (this.globe) { this.drawGlobeInto(this.offscreen); return toPNG(this.device, this.offscreen, this.width, this.height, this.textData); }
     this.drawInto(this.offscreen);
-    return toPNG(this.device, this.offscreen, this.width, this.height);
+    return toPNG(this.device, this.offscreen, this.width, this.height, this.textData);
   }
 
   toSVG(): string {
     // In globe mode, SVG cannot render a 3D sphere; fall back to the baked (equirectangular) layer snapshot.
-    return svgFromLayers(this.width, this.height, this.order.map((n) => this.layers.get(n)!), this.viewTransform);
+    // The stashed labels (#219) serialize as <text> on top, exactly as the Canvas/SVG backends emit them.
+    return svgFromLayers(this.width, this.height, this.order.map((n) => this.layers.get(n)!), this.viewTransform, this.textData);
   }
 
   /**

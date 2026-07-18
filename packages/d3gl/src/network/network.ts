@@ -1,21 +1,23 @@
 import { BaseEngine, type BaseEngineOptions, type HoverHit, type InteractiveLayerOptions, type LaneInteractive, type NodeDragSession } from "../map/base-engine.js";
-import { networkLayers, networkLayersFromCache, noLodStyleCache, frontierCircles, frontierHalos, superEdges, emitNodes, emitLinks, emitArrows, emitHalfLinks, traceFrontierFills, traceFrontierBorders, traceFrontierHalos, traceSuperHalfArrows, traceSuperLines, traceSuperArrows, physicalPieInstances, tracePieWedges, rgbaCss, pickNodes, regionNodes, resolveNodeRadii, resolveNodeRadiusAggregate, resolveImportance, resolveFlowBorder, resolveNodeColors, resolveLinkWidthOf, resolveLinkColorOf, resolveLinkStrokeOf, flowBorderInnerRadii, type ResolvedNetworkStyle, type NoLodStyleCache, type NodeRadiusSpec, type ImportanceSpec, type FlowBorderSpec, type ConstBorder, type LinkWidthSpec, type LinkColorSpec, type LinkStyle } from "./glyphs.js";
+import { networkLayers, networkLayersFromCache, noLodStyleCache, frontierCircles, frontierHalos, superEdges, makeSuperEdgesScratch, emitNodes, emitLinks, emitArrows, emitHalfLinks, traceFrontierFills, traceFrontierBorders, traceFrontierHalos, traceSuperHalfArrows, traceSuperLines, traceSuperArrows, physicalPieInstances, tracePieWedges, rgbaCss, pickNodes, regionNodes, resolveNodeRadii, resolveNodeRadiusAggregate, resolveImportance, resolveFlowBorder, resolveNodeColors, resolveLinkWidthOf, resolveLinkColorOf, resolveLinkStrokeOf, flowBorderInnerRadii, type ResolvedNetworkStyle, type NoLodStyleCache, type NodeRadiusSpec, type ImportanceSpec, type FlowBorderSpec, type ConstBorder, type LinkWidthSpec, type LinkColorSpec, type LinkStyle } from "./glyphs.js";
 import { rgb } from "d3-color";
 import { ForceLayout, seedPositions, type ForceParams } from "./force.js";
 import { multilevelLayout, type CoarsenOptions } from "./coarsen.js";
-import { buildLODTree, buildSpatialLODTree, computeLODGeometry, computeLODPositions, computeLODStyle, updateLODPositionsForLeaves, cut, declutterFrontier, pickFrontier, regionFrontier, visibleWorldRect, leavesUnder, ancestorAwareSelected, type LODTree, type SpatialLODOptions } from "./lod.js";
+import { buildLODTree, buildSpatialLODTree, computeLODGeometry, computeLODPositions, computeLODStyle, updateLODPositionsForLeaves, cut, makeCutScratch, declutterFrontier, makeDeclutterFrontierScratch, pickFrontier, regionFrontier, visibleWorldRect, leavesUnder, ancestorAwareSelected, type LODTree, type SpatialLODOptions } from "./lod.js";
 import { LabelLayer, placeLabels, type LabelAnchor } from "../labels/label-layer.js";
+import type { LabelBox } from "../labels/cull.js";
 import { buildModuleLODTree, type ModuleNode } from "./modules.js";
 import { moduleColors, type ModulePathNode, type ModuleColorOptions } from "./module-colors.js";
 import { physicalPieWedges, type PhysicalPieWedges, type PieWedgeOptions } from "./pie.js";
 import { rosettePositions } from "./rosette.js";
+import { gatherCandidates, descendingByKey, CandidateList, type CandidateSource } from "./label-candidates.js";
 import type { StateNetworkGraph } from "./state-graph.js";
 import { startWorkerLayout, type WorkerLayoutHandle } from "./worker-transport.js";
 import { startGpuLayout } from "./gpu/gpu-transport.js";
 import { WebGLBackend } from "../webgl/webgl-backend.js";
 import type { NetworkGraph } from "./graph.js";
 import { fitNodes, fitBox, fitTransform, type FitBox } from "./fit.js";
-import type { InstancedLayer, ViewTransform } from "../core/index.js";
+import type { InstancedLayer, TextData, ViewTransform } from "../core/index.js";
 import { InstancedLane, type SelectionStrategy } from "../core/instanced-lane.js";
 import { resolveRingColors, ringCircles } from "../map/highlight-ring.js";
 import { hoverParts } from "../map/highlight.js";
@@ -82,8 +84,9 @@ export interface NetworkLabelOptions {
    * (default 4). Ignored outside the `both` view. The primary {@link labelOf} still labels the state nodes.
    */
   physical?: { labelOf: (physicalId: number) => string | null | undefined; gap?: number };
-  /** Font for **backend-native** text (SVG `<text>` / Canvas `fillText`, incl. `toSVG()`/`toPNG()`
-   *  export, #105 N7b-2) — a CSS font shorthand, e.g. `"600 11px sans-serif"`. Default `"12px sans-serif"`. */
+  /** Font for **backend-native** text (SVG `<text>` / Canvas `fillText`, and `toSVG()`/`toPNG()`
+   *  export on every backend incl. WebGL — #105 N7b-2, #219) — a CSS font shorthand, e.g.
+   *  `"600 11px sans-serif"`. Default `"12px sans-serif"`. */
   font?: string;
   /** Fill colour for backend-native text. Default black. */
   color?: string;
@@ -366,12 +369,6 @@ function physicalSpacing(positions: Float32Array, count: number): number {
   return Math.max(Math.hypot(maxX - minX, maxY - minY) / Math.sqrt(count), 1);
 }
 
-/** `[0, 1, …, n-1]` as float32 — the no-LOD node layer's `a_group` (instance i is node i). */
-function identityFloats(n: number): Float32Array {
-  const out = new Float32Array(n);
-  for (let i = 0; i < n; i++) out[i] = i;
-  return out;
-}
 /** Shared empty visible-set for selection strategies whose emit draws the whole source directly (no
  *  per-instance gather) — e.g. the no-LOD full-graph lane — so they never allocate an all-indices array. */
 const EMPTY_VISIBLE = new Uint32Array(0);
@@ -457,6 +454,13 @@ export class Network extends BaseEngine {
   private lodHasGeometry = false;
   /** Reusable cross-fade scratch (#133), indexed by tree-node id; grown as the tree grows, reused per cut to avoid GC. */
   private fadeScratch: Float32Array | null = null;
+  /** Engine-owned {@link cut} scratch (#213): reused by every {@link computeFrontier} so the per-frame
+   *  visible-set walk allocates nothing steady-state. The returned frontier is a view of it, valid until
+   *  the next cut — safe because every consumer (lane select, Scene registration, label refresh) re-selects
+   *  before reading and none retains the previous frontier past its own re-select. */
+  private readonly cutScratch = makeCutScratch();
+  /** Engine-owned {@link declutterFrontier} scratch (#213), same reuse contract as {@link cutScratch}. */
+  private readonly declutterFrontierScratch = makeDeclutterFrontierScratch();
   /** The fade alpha the last {@link computeFrontier} produced (the live `fadeScratch`), or null when cross-fade is off. */
   private fadeAlpha: Float32Array | null = null;
   /** Cached resolved style; invalidated on style()/data() to avoid per-zoom O(n) radii recompute. */
@@ -484,6 +488,19 @@ export class Network extends BaseEngine {
   /** Maps a picked link instance index (gl_InstanceID) → a {@link NetworkLinkHit} HoverHit, captured per
    *  emit so it matches the link set currently in the pick FBO. Null when no links are drawn. */
   private linkResolve: ((index: number) => HoverHit | null) | null = null;
+  /** No-LOD label candidate source (#212): the lazily-built position grid + its staleness flag.
+   *  `stale` is raised by {@link rebuild} and {@link scheduleLayoutRepaint} — the funnels every
+   *  position-mutating repaint goes through (layout streaming, drag, settle, data/layout change) —
+   *  so a pan/zoom {@link refreshLabels} on settled positions queries the grid in O(visible) while
+   *  a refresh over moving positions falls back to the plain scan (see label-candidates.ts). */
+  private readonly labelSource: CandidateSource = { grid: null, stale: true };
+  /** Reusable candidate-id scratch for {@link refreshLabels} (retained typed buffers — the gather
+   *  allocates nothing per frame in the steady state). */
+  private readonly labelCand = new CandidateList();
+  /** Engine-owned {@link superEdges} scratch (#210): reused every LOD emit so the per-frame gather is
+   *  O(frontier + drawn super-edges) — no O(tree.size) allocation per zoom frame. Shared by the WebGL
+   *  lane emit and the retained-Scene registration (they never run concurrently; outputs never alias it). */
+  private readonly superEdgesScratch = makeSuperEdgesScratch();
   /** Derived parent-pointer cache for the ancestor-aware selection highlight (#162), used only when the
    *  LOD tree carries no `parent` (coarsening/spatial). Keyed by tree identity; see {@link treeParent}. */
   private derivedParentFor: LODTree | null = null;
@@ -491,6 +508,10 @@ export class Network extends BaseEngine {
   /** Frontier label overlay (#105 N7b) + its options; null until {@link labels} is enabled. */
   private labelLayer: LabelLayer | null = null;
   private labelOpts: NetworkLabelOptions | null = null;
+  /** The last refresh's label anchors, retained (reference only) for the export-only text backend
+   *  push (#219): a WebGL toPNG()/toSVG() places these once at export time. Always current — the
+   *  overlay branch of {@link refreshLabels} runs on every transform/rebuild. */
+  private exportAnchors: readonly LabelAnchor[] = [];
   /** While a node-drag is active (#140), re-pins the held positions over each worker frame before it
    *  paints — in copy mode the worker's streamed snapshot would otherwise clobber the held nodes the
    *  main thread is holding under the cursor. Null when no drag is in flight. */
@@ -794,15 +815,17 @@ export class Network extends BaseEngine {
    * frontier→rank→placement wiring; you supply `labelOf` (return `null` to skip a glyph) + styling.
    *
    * Rendered by the **active backend**: WebGL → an HTML overlay (crisp + accessible; style via
-   * `className`); SVG/Canvas → native `<text>`/`fillText` so labels appear in `toSVG()`/`toPNG()`
-   * (style via `font`/`color`/`halo`). Pass `false` to remove.
+   * `className`); SVG/Canvas → native `<text>`/`fillText` (style via `font`/`color`/`halo`).
+   * Labels appear in `toSVG()`/`toPNG()` on **every** backend — WebGL composites the placed set
+   * into the export at export time (#219). Pass `false` to remove.
    */
   labels(opts: NetworkLabelOptions | false): this {
     if (!opts) {
       this.labelLayer?.destroy();
       this.labelLayer = null;
       this.labelOpts = null;
-      this.backend()?.setTextLayer?.([]); // clear any backend-native labels too
+      this.exportAnchors = [];
+      this.backend()?.setTextLayer?.([]); // clear any backend-native labels too (incl. the WebGL export stash)
       this.render(); // repaint so a backend that bakes labels in (Canvas) drops them now
       return this;
     }
@@ -852,16 +875,40 @@ export class Network extends BaseEngine {
       }
     } else {
       // No-LOD: rank the nodes in view by strength (weighted degree). The full graph is drawn.
+      // Candidate gathering (#212) is O(visible) per pan/zoom frame in the steady state: on settled
+      // positions a coarse uniform grid — built at most once per position change, never per frame —
+      // answers the in-view query in O(covered cells + their nodes). While positions are moving
+      // (layout streaming, drag — `labelSource.stale`), it falls back to the plain O(N) scan those
+      // frames already pay elsewhere. Output is identical to the scan (see label-candidates.ts).
       const graph = this.graph, pos = graph.positions, strength = graph.strength;
-      const cand: number[] = [];
-      for (let i = 0; i < graph.nodeCount; i++) if (inView(pos[2 * i]!, pos[2 * i + 1]!)) cand.push(i);
+      const cand = this.labelCand;
+      const ascending = gatherCandidates(this.labelSource, pos, graph.nodeCount, rect, cand);
       const impOf = opts.importanceOf;
-      if (cand.length > max) cand.sort((a, b) => (impOf ? impOf(b, NO_LOD_INFO) - impOf(a, NO_LOD_INFO) : strength[b]! - strength[a]!));
-      for (const id of cand) {
-        const text = labelText(opts, id, NO_LOD_INFO);
-        if (!text) continue;
-        anchors.push({ id, refX: pos[2 * id]!, refY: pos[2 * id + 1]!, text, offset: opts.offset, transform: "translate(-50%, -50%)" });
-        if (anchors.length >= max) break;
+      if (cand.length > max) {
+        // Exact top-`max` without a full O(V log V) comparator sort: keys are computed once per
+        // candidate (the old comparator re-invoked `importanceOf` on every comparison) and a lazy
+        // heap pops key-descending, ties id-ascending — the order the old stable sort produced.
+        const ids = cand.ids;
+        const keys = cand.keysFor(cand.length);
+        if (impOf) for (let i = 0; i < cand.length; i++) keys[i] = impOf(ids[i]!, NO_LOD_INFO);
+        else for (let i = 0; i < cand.length; i++) keys[i] = strength[ids[i]!]!;
+        const next = descendingByKey(ids, keys, cand.length);
+        for (let id = next(); id >= 0; id = next()) {
+          const text = labelText(opts, id, NO_LOD_INFO);
+          if (!text) continue;
+          anchors.push({ id, refX: pos[2 * id]!, refY: pos[2 * id + 1]!, text, offset: opts.offset, transform: "translate(-50%, -50%)" });
+          if (anchors.length >= max) break;
+        }
+      } else {
+        // Under the cap (or uncapped): anchors go out ascending by id, as the scan always yielded.
+        if (!ascending) cand.sortAscending();
+        const ids = cand.ids;
+        for (let i = 0; i < cand.length; i++) {
+          const id = ids[i]!;
+          const text = labelText(opts, id, NO_LOD_INFO);
+          if (!text) continue;
+          anchors.push({ id, refX: pos[2 * id]!, refY: pos[2 * id + 1]!, text, offset: opts.offset, transform: "translate(-50%, -50%)" });
+        }
       }
     }
 
@@ -883,22 +930,47 @@ export class Network extends BaseEngine {
       }
     }
 
-    // Route by backend (#105 N7b-2): a backend that draws text natively (SVG `<text>` / Canvas
-    // `fillText`) renders the labels so they survive toSVG()/toPNG(); otherwise (WebGL) the HTML
-    // overlay does. Project + cull is shared (placeLabels), so both paths place labels identically.
+    // Route by backend (#105 N7b-2): a backend that draws text natively AND live (SVG `<text>` /
+    // Canvas `fillText`) renders the labels so they survive toSVG()/toPNG(); otherwise (WebGL,
+    // whose setTextLayer is an export-only stash — #219) the HTML overlay does. Project + cull is
+    // shared (placeLabels), so both paths place labels identically.
     const viewport = { width: this.width, height: this.height };
     const backend = this.backend();
-    if (backend?.setTextLayer) {
+    if (backend?.setTextLayer && backend.textLayerMode !== "export-only") {
       const survivors = placeLabels(anchors, this.transform, viewport);
-      backend.setTextLayer(survivors.map((b) => ({
-        x: b.x, y: b.y, text: String(b.text), align: "middle" as const,
-        font: opts.font, color: opts.color, halo: opts.halo, opacity: b.opacity as number | undefined,
-      })));
+      backend.setTextLayer(this.toTextData(survivors, opts));
       layer.update([], this.transform, viewport); // keep the overlay empty on a native-text backend
     } else {
       layer.update(anchors, this.transform, viewport);
+      // Retain the anchor set (reference only — the array was built above regardless) so an
+      // export-only text backend can be fed the placed labels at toPNG()/toSVG() time (#219).
+      // Nothing is placed or allocated here — zero added per-frame work.
+      this.exportAnchors = anchors;
     }
   }
+
+  /** Map placed label boxes to backend {@link TextData} — the one shape both the live native-text
+   *  path (SVG/Canvas) and the export-only push (WebGL, #219) emit, so exports match across backends. */
+  private toTextData(survivors: readonly LabelBox[], opts: NetworkLabelOptions): TextData[] {
+    return survivors.map((b) => ({
+      x: b.x, y: b.y, text: String(b.text), align: "middle" as const,
+      font: opts.font, color: opts.color, halo: opts.halo, opacity: b.opacity as number | undefined,
+    }));
+  }
+
+  /** Feed the placed labels to an export-only text backend (#219) right before an export, so a WebGL
+   *  toPNG()/toSVG() includes what the HTML overlay shows. Runs ONLY at export time (O(anchors in
+   *  view) once per call), never per frame; no-op on live-text backends (their set is already pushed). */
+  private pushExportLabels(): void {
+    const backend = this.backend();
+    if (!backend?.setTextLayer || backend.textLayerMode !== "export-only") return;
+    const opts = this.labelOpts;
+    const survivors = opts ? placeLabels(this.exportAnchors, this.transform, { width: this.width, height: this.height }) : [];
+    backend.setTextLayer(opts ? this.toTextData(survivors, opts) : []);
+  }
+
+  override toSVG(): string { this.pushExportLabels(); return super.toSVG(); }
+  override toPNG(): string { this.pushExportLabels(); return super.toPNG(); }
 
   protected override afterTransform(): void {
     this.refreshLabels();
@@ -1197,6 +1269,9 @@ export class Network extends BaseEngine {
    * layout live instead of only once it settles.
    */
   private scheduleLayoutRepaint(): void {
+    // Raised at message time (not in the rAF): a pan between a streamed frame and its coalesced
+    // repaint must not label from a grid indexing the pre-stream positions (#212).
+    this.labelSource.stale = true;
     if (this.layoutRepaintRaf) return;
     const raf: (cb: FrameRequestCallback) => number =
       typeof requestAnimationFrame === "function" ? requestAnimationFrame : (cb) => setTimeout(() => cb(0), 16);
@@ -1357,6 +1432,12 @@ export class Network extends BaseEngine {
    */
   private rebuild(): this {
     if (!this.graph) return this;
+    // Every position-mutating repaint funnels through here (drag, settle, data/layout/view change;
+    // streamed frames additionally mark at message time in scheduleLayoutRepaint) — so the no-LOD
+    // label grid must not be trusted until rebuilt from the new coordinates (#212). Conservative
+    // for style-only rebuilds (those are click-frequency, not per-frame): the next settled label
+    // refresh rebuilds the grid once, O(nodeCount), never per frame.
+    this.labelSource.stale = true;
     const backend = this.backend();
     if (!backend) return this;
     const style = this.resolvedStyleCached(this.graph);
@@ -1429,7 +1510,7 @@ export class Network extends BaseEngine {
       this.linkResolve = (i) => this.noLodLinkHit(graph, i);
       const lane = new InstancedLane(strategy, () => {
         const resolved = this.resolvedStyleCached(graph);
-        const base = this.attachNoLodHighlight(this.flagPickableLinks(this.noLodLayers(graph, resolved)), graph, resolved.directed);
+        const base = this.attachNoLodHighlight(this.flagPickableLinks(this.noLodLayers(graph, resolved)), this.noLodCache(graph, resolved));
         // State-network overlays (#171), build-once per emit: the `both`-view physical **container** discs
         // draw UNDER the nodes/links (backdrop), the physical-view **pie** wedges draw ON TOP (cover the disc).
         const container = this.containerLayer();
@@ -1470,16 +1551,20 @@ export class Network extends BaseEngine {
    * cache, and we run the full derivation (populating the cache for the next position frame).
    */
   private noLodLayers(graph: NetworkGraph, resolved: ResolvedNetworkStyle): InstancedLayer[] {
+    return networkLayersFromCache(graph, resolved, this.noLodCache(graph, resolved));
+  }
+
+  /** Get-or-create the no-LOD cache (#179 style attrs + #214 highlight group columns) for the current
+   *  (graph, resolved-style) version. First emit for a version computes it ONCE; position-only frames
+   *  hit the valid branch (O(1)). A `data`/`style` change hands back a fresh `resolved` object,
+   *  invalidating the cache — so the cached arrays are reference-stable exactly while they are valid. */
+  private noLodCache(graph: NetworkGraph, resolved: ResolvedNetworkStyle): NoLodStyleCache {
     const cached = this.noLodStyleCacheVal;
-    const valid = cached != null && this.noLodStyleCacheFor?.style === resolved && this.noLodStyleCacheFor?.graph === graph;
-    // First emit for this style version runs the scale accessors ONCE and caches the style-derived attrs;
-    // subsequent (position-only) frames reuse the cache, rebuilding only the position-derived endpoints/centres.
-    const cache = valid && cached ? cached : noLodStyleCache(graph, resolved);
-    if (!valid) {
-      this.noLodStyleCacheVal = cache;
-      this.noLodStyleCacheFor = { style: resolved, graph };
-    }
-    return networkLayersFromCache(graph, resolved, cache);
+    if (cached != null && this.noLodStyleCacheFor?.style === resolved && this.noLodStyleCacheFor?.graph === graph) return cached;
+    const cache = noLodStyleCache(graph, resolved);
+    this.noLodStyleCacheVal = cache;
+    this.noLodStyleCacheFor = { style: resolved, graph };
+    return cache;
   }
 
   /** Flag every link layer (lines/arrows/half-arrows; not node circles) into the GPU pick pass (#141)
@@ -1494,22 +1579,24 @@ export class Network extends BaseEngine {
   /** Attach the shader-highlight columns (#162) to the **no-LOD** full-graph layers, in place — so a
    *  hover/selection restyle is a uniform / flag-buffer update, never a geometry rebuild. Instance order
    *  is the parallel emit: the `nodes` circles layer's instance `i` is node `i`; every link layer
-   *  (`lines`/`half-arrows`/`arrows`) instance `e` is graph edge `e`. `group` = node id / link source id;
-   *  `group2` = the link target (undirected incident hover); `selected` = the initial flag from the
-   *  current selection ({@link noLodSelectedFor} refreshes it in place on later selection changes). */
-  private attachNoLodHighlight(layers: InstancedLayer[], graph: NetworkGraph, directed: boolean): InstancedLayer[] {
-    const source = Float32Array.from(graph.source);
-    const target = directed ? undefined : Float32Array.from(graph.target);
+   *  (`lines`/`half-arrows`/`arrows`) instance `e` is graph edge `e`. The group columns (`groups` =
+   *  node id / link source id; `groups2` = the link target, undirected incident hover) are
+   *  position-independent, so they come from the {@link noLodCache} (#214) — the SAME array instances
+   *  across position-only frames, letting the renderer skip their per-frame upload. `selected` is the
+   *  initial flag from the current selection — NOT cached, it follows the selection
+   *  ({@link noLodSelectedFor} refreshes it in place on later selection changes). */
+  private attachNoLodHighlight(layers: InstancedLayer[], cache: NoLodStyleCache): InstancedLayer[] {
+    let linkSelected: Uint8Array | undefined; // one build shared by all link layers (lines + arrows)
     for (const l of layers) {
       if (l.primitive === "circles") {
         // The only circles layer in the no-LOD path is `nodes` (no aggregate halos). Instance i = node i.
-        l.circles.groups = identityFloats(graph.nodeCount);
+        l.circles.groups = cache.nodeGroups;
         l.circles.selected = this.noLodSelectedFor(this.NODE_LAYER);
       } else if (l.primitive === "lines" || l.primitive === "half-arrows" || l.primitive === "arrows") {
         const link = l.primitive === "lines" ? l.lines : l.primitive === "half-arrows" ? l.halfArrows : l.arrows;
-        link.groups = source;
-        if (target) link.groups2 = target;
-        link.selected = this.noLodSelectedFor("links"); // links/arrows share the per-edge flag
+        link.groups = cache.groupSource;
+        if (cache.groupTarget) link.groups2 = cache.groupTarget;
+        link.selected = linkSelected ??= this.noLodSelectedFor("links"); // links/arrows share the per-edge flag
       }
       // A "pie" layer (#171 physical view) is not part of the standard node/link set; it carries its own
       // per-wedge groups (physical node id) from physicalPieInstances, so no attachment is needed here.
@@ -1922,7 +2009,7 @@ export class Network extends BaseEngine {
       maxAggregateRadius: opts.maxAggregateRadius,
       fadeBand,
       fadeAlpha: this.fadeAlpha ?? undefined,
-    });
+    }, this.cutScratch); // #213: reused per frame — the walk allocates nothing steady-state
     if (opts.declutter !== false) {
       frontier = declutterFrontier(tree, frontier, this.transform, this.width, this.height, {
         screenSized: style.sizeMode === "screen",
@@ -1931,7 +2018,7 @@ export class Network extends BaseEngine {
         spacing: opts.declutterSpacing,
         // Cross-fade (#133): transitioning glyphs are exempt, so a fading parent never culls its fading-in children.
         fadeAlpha: this.fadeAlpha ?? undefined,
-      });
+      }, this.declutterFrontierScratch); // #213: reused per frame, distinct from the cut's buffers
     }
     return frontier;
   }
@@ -1974,6 +2061,7 @@ export class Network extends BaseEngine {
           fadeAlpha: this.fadeAlpha ?? undefined,
         },
         visibleWorldRect(this.transform, this.width, this.height),
+        this.superEdgesScratch, // #210: reused per emit — zero O(tree.size) work per zoom frame
       );
       // #162: attach the shader-highlight columns — group = link source id (matched against the hovered
       // id → recolour that node's outgoing links), group2 = target for undirected incident hover, selected
@@ -2338,6 +2426,7 @@ export class Network extends BaseEngine {
               fadeAlpha: this.fadeAlpha ?? undefined,
             },
             visibleWorldRect(this.transform, this.width, this.height),
+            this.superEdgesScratch, // #210: shared with the lane emit — they never run concurrently
           )
         : { ids: [] as number[] };
     // Screen-mode super-edge shapes BAKE at the current zoom (constant-px tip/setback/bend terms), the
