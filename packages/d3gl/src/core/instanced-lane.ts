@@ -22,7 +22,11 @@ export interface ScreenRect {
  * composable: viewport cull, screen-space declutter, or an LOD hierarchy cut.
  */
 export interface SelectionStrategy {
-  /** Indices (into the lane's source) to draw for this view. */
+  /**
+   * Indices (into the lane's source) to draw for this view. The returned array is valid only until
+   * the **next** `select` call — a strategy may return a view over a reused scratch buffer (#217),
+   * so consumers must not retain it across frames (copy it if you need a snapshot).
+   */
   select(t: LaneTransform, width: number, height: number): Uint32Array;
   /** Hit-test a screen point (CSS px) against `visible`; return a source index or -1 (topmost wins). */
   pick(x: number, y: number, t: LaneTransform, visible: Uint32Array): number;
@@ -45,7 +49,11 @@ export type LaneEmit = (visible: Uint32Array) => InstancedLayer[];
  * #108-B hoists ownership of a registry of these into `BaseEngine` so plot + network share the seam.
  */
 export class InstancedLane {
-  /** The visible index set from the last {@link update} — retained for {@link pick}. */
+  /**
+   * The visible index set from the last {@link update} — retained for {@link pick}. May be a view
+   * over strategy-owned scratch that the next {@link update} overwrites (#217): always read it
+   * fresh through this property and iterate/copy immediately; never hold the array across frames.
+   */
   visible: Uint32Array = new Uint32Array(0);
 
   constructor(private strategy: SelectionStrategy, private emit: LaneEmit) {}

@@ -1,9 +1,9 @@
 import { BaseEngine, type BaseEngineOptions, type HoverHit, type InteractiveLayerOptions, type LaneInteractive, type NodeDragSession } from "../map/base-engine.js";
-import { networkLayers, networkLayersFromCache, noLodStyleCache, frontierCircles, frontierHalos, superEdges, emitNodes, emitLinks, emitArrows, emitHalfLinks, traceFrontierFills, traceFrontierBorders, traceFrontierHalos, traceSuperHalfArrows, traceSuperLines, traceSuperArrows, physicalPieInstances, tracePieWedges, rgbaCss, pickNodes, regionNodes, resolveNodeRadii, resolveNodeRadiusAggregate, resolveImportance, resolveFlowBorder, resolveNodeColors, resolveLinkWidthOf, resolveLinkColorOf, resolveLinkStrokeOf, flowBorderInnerRadii, type ResolvedNetworkStyle, type NoLodStyleCache, type NodeRadiusSpec, type ImportanceSpec, type FlowBorderSpec, type ConstBorder, type LinkWidthSpec, type LinkColorSpec, type LinkStyle } from "./glyphs.js";
+import { networkLayers, networkLayersFromCache, noLodStyleCache, frontierCircles, frontierHalos, superEdges, makeSuperEdgesScratch, emitNodes, emitLinks, emitArrows, emitHalfLinks, traceFrontierFills, traceFrontierBorders, traceFrontierHalos, traceSuperHalfArrows, traceSuperLines, traceSuperArrows, physicalPieInstances, tracePieWedges, rgbaCss, pickNodes, regionNodes, resolveNodeRadii, resolveNodeRadiusAggregate, resolveImportance, resolveFlowBorder, resolveNodeColors, resolveLinkWidthOf, resolveLinkColorOf, resolveLinkStrokeOf, flowBorderInnerRadii, type ResolvedNetworkStyle, type NoLodStyleCache, type NodeRadiusSpec, type ImportanceSpec, type FlowBorderSpec, type ConstBorder, type LinkWidthSpec, type LinkColorSpec, type LinkStyle } from "./glyphs.js";
 import { rgb } from "d3-color";
 import { ForceLayout, seedPositions, type ForceParams } from "./force.js";
 import { multilevelLayout, type CoarsenOptions } from "./coarsen.js";
-import { buildLODTree, buildSpatialLODTree, computeLODGeometry, computeLODStyle, cut, declutterFrontier, pickFrontier, regionFrontier, visibleWorldRect, leavesUnder, ancestorAwareSelected, type LODTree, type SpatialLODOptions } from "./lod.js";
+import { buildLODTree, buildSpatialLODTree, computeLODGeometry, computeLODStyle, cut, makeCutScratch, declutterFrontier, makeDeclutterFrontierScratch, pickFrontier, regionFrontier, visibleWorldRect, leavesUnder, ancestorAwareSelected, type LODTree, type SpatialLODOptions } from "./lod.js";
 import { LabelLayer, placeLabels, type LabelAnchor } from "../labels/label-layer.js";
 import { buildModuleLODTree, type ModuleNode } from "./modules.js";
 import { moduleColors, type ModulePathNode, type ModuleColorOptions } from "./module-colors.js";
@@ -458,6 +458,13 @@ export class Network extends BaseEngine {
   private lodHasGeometry = false;
   /** Reusable cross-fade scratch (#133), indexed by tree-node id; grown as the tree grows, reused per cut to avoid GC. */
   private fadeScratch: Float32Array | null = null;
+  /** Engine-owned {@link cut} scratch (#213): reused by every {@link computeFrontier} so the per-frame
+   *  visible-set walk allocates nothing steady-state. The returned frontier is a view of it, valid until
+   *  the next cut — safe because every consumer (lane select, Scene registration, label refresh) re-selects
+   *  before reading and none retains the previous frontier past its own re-select. */
+  private readonly cutScratch = makeCutScratch();
+  /** Engine-owned {@link declutterFrontier} scratch (#213), same reuse contract as {@link cutScratch}. */
+  private readonly declutterFrontierScratch = makeDeclutterFrontierScratch();
   /** The fade alpha the last {@link computeFrontier} produced (the live `fadeScratch`), or null when cross-fade is off. */
   private fadeAlpha: Float32Array | null = null;
   /** Cached resolved style; invalidated on style()/data() to avoid per-zoom O(n) radii recompute. */
@@ -494,6 +501,10 @@ export class Network extends BaseEngine {
   /** Reusable candidate-id scratch for {@link refreshLabels} (retained typed buffers — the gather
    *  allocates nothing per frame in the steady state). */
   private readonly labelCand = new CandidateList();
+  /** Engine-owned {@link superEdges} scratch (#210): reused every LOD emit so the per-frame gather is
+   *  O(frontier + drawn super-edges) — no O(tree.size) allocation per zoom frame. Shared by the WebGL
+   *  lane emit and the retained-Scene registration (they never run concurrently; outputs never alias it). */
+  private readonly superEdgesScratch = makeSuperEdgesScratch();
   /** Derived parent-pointer cache for the ancestor-aware selection highlight (#162), used only when the
    *  LOD tree carries no `parent` (coarsening/spatial). Keyed by tree identity; see {@link treeParent}. */
   private derivedParentFor: LODTree | null = null;
@@ -1117,6 +1128,18 @@ export class Network extends BaseEngine {
     }
 
     if (opts.backend === "worker" || opts.backend === "gpu") {
+      // fit: true (#238) frames the streaming physical layout via the CAMERA (like the main layout path)
+      // instead of the `scaleToViewport` position-remap — so state networks open framed and converge in
+      // place (no top-left flash + settle snap on the GPU backend). The state sizing is scale-relative
+      // (computeStateSizing sizes against physicalSpacing), so leaving positions in force scale is fine.
+      // Pre-seed so the first paint is framed (the GPU device resolves async → phys is zero until then);
+      // each streamed frame reframes in scheduleLayoutRepaint, released on settle/interaction.
+      const fit = opts.fit === true;
+      this.fitOnLayout = fit;
+      this.fitFallbackBox = null;
+      this.fitNodesArr = null;
+      this.fitNodesFor = null;
+      if (fit) seedPositions(phys, this.width, this.height);
       const onPhysFrame = () => this.scheduleLayoutRepaint();
       const workerOpts = {
         width: this.width,
@@ -1131,12 +1154,14 @@ export class Network extends BaseEngine {
       this.layoutHandle = handle;
       void handle.settled.then(() => {
         if (this.layoutHandle !== handle) return; // a newer layout superseded this one
-        // Frame the physical layout to fill the view at k=1 now that it's at rest — scaleToViewport
-        // mutates the shared position buffer in place, so it's only safe once the worker/GPU stream has
-        // stopped writing it (during the run the force's own centering keeps it roughly framed).
-        scaleToViewport(phys.positions, sg.physicalCount, this.width, this.height);
+        // Without fit, scaleToViewport remaps the physical positions to fill the view at k=1 now that the
+        // stream has stopped writing them. With fit, the camera already tracks the layout — derive + refresh
+        // geometry from the final positions first, then do the final reframe + release (release needs fresh
+        // geometry to frame the settled layout, not the last streamed frame's).
+        if (!fit) scaleToViewport(phys.positions, sg.physicalCount, this.width, this.height);
         this.applyStateDerivedPositions();
         this.recomputeLODGeometry(true);
+        if (fit) this.releaseFit();
         this.rebuild();
       });
       // `worker` seeds `phys.positions` synchronously before returning; the async `gpu` device promise
@@ -1144,6 +1169,7 @@ export class Network extends BaseEngine {
       // screen) is cheap and self-corrects on the first streamed frame regardless.
       this.applyStateDerivedPositions();
       this.recomputeLODGeometry();
+      if (fit) this.fitViewToLayout(); // frame the first paint against the seeded layout
       return this.rebuild();
     }
 
@@ -1918,7 +1944,7 @@ export class Network extends BaseEngine {
       maxAggregateRadius: opts.maxAggregateRadius,
       fadeBand,
       fadeAlpha: this.fadeAlpha ?? undefined,
-    });
+    }, this.cutScratch); // #213: reused per frame — the walk allocates nothing steady-state
     if (opts.declutter !== false) {
       frontier = declutterFrontier(tree, frontier, this.transform, this.width, this.height, {
         screenSized: style.sizeMode === "screen",
@@ -1927,7 +1953,7 @@ export class Network extends BaseEngine {
         spacing: opts.declutterSpacing,
         // Cross-fade (#133): transitioning glyphs are exempt, so a fading parent never culls its fading-in children.
         fadeAlpha: this.fadeAlpha ?? undefined,
-      });
+      }, this.declutterFrontierScratch); // #213: reused per frame, distinct from the cut's buffers
     }
     return frontier;
   }
@@ -1970,6 +1996,7 @@ export class Network extends BaseEngine {
           fadeAlpha: this.fadeAlpha ?? undefined,
         },
         visibleWorldRect(this.transform, this.width, this.height),
+        this.superEdgesScratch, // #210: reused per emit — zero O(tree.size) work per zoom frame
       );
       // #162: attach the shader-highlight columns — group = link source id (matched against the hovered
       // id → recolour that node's outgoing links), group2 = target for undirected incident hover, selected
@@ -2334,6 +2361,7 @@ export class Network extends BaseEngine {
               fadeAlpha: this.fadeAlpha ?? undefined,
             },
             visibleWorldRect(this.transform, this.width, this.height),
+            this.superEdgesScratch, // #210: shared with the lane emit — they never run concurrently
           )
         : { ids: [] as number[] };
     // Screen-mode super-edge shapes BAKE at the current zoom (constant-px tip/setback/bend terms), the
