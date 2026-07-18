@@ -9,6 +9,16 @@ export default function ModularMap() {
   return (
     <Example
       controls={[
+        {
+          type: "range",
+          key: "nodes",
+          label: "Nodes",
+          min: 0,
+          max: 5,
+          step: 1,
+          value: 1, // 1k — a good default; crank up to stress the module-aware GPU layout
+          display: ["500", "1k", "2k", "5k", "10k", "20k"],
+        },
         { type: "segmented", key: "lod", label: "LOD", options: ["Off", "Standard", "Modules"], value: "Modules" },
         { type: "segmented", key: "sizing", label: "Sizing", options: ["Screen", "World"] },
         { type: "segmented", key: "declutter", label: "Declutter", options: ["On", "Off"] },

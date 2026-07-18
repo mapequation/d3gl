@@ -1,5 +1,5 @@
-import { select } from "d3-selection";
-import { zoom as d3zoom, zoomIdentity, type D3ZoomEvent } from "d3-zoom";
+import { select, type Selection } from "d3-selection";
+import { zoom as d3zoom, zoomIdentity, type D3ZoomEvent, type ZoomBehavior } from "d3-zoom";
 import { Scene, HitIndex, declutterScreen, declutterScratch, type Backend, type GroupBuilder, type RenderLayer, type ViewTransform, type DeclutterScratch } from "../core/index.js";
 import { InstancedLane, type ScreenRect } from "../core/instanced-lane.js";
 import { createBackend, createCanvasBackend, type BackendType, type BackendHandle } from "./backend-factory.js";
@@ -278,6 +278,14 @@ export abstract class BaseEngine {
   protected interacting = false;
   /** Detaches the currently-attached interaction (zoom or rotation), if any. */
   private interactionCleanup: (() => void) | null = null;
+  /** Live d3-zoom selection + behaviour set by {@link enableZoom}, kept so a programmatic view
+   *  change (e.g. fit-on-layout streaming) can re-seed the gesture's internal transform via
+   *  {@link syncZoomToView} without a subsequent user gesture jumping from a stale base. */
+  private zoomSel: Selection<Element, unknown, null, undefined> | null = null;
+  private zoomBehavior: ZoomBehavior<Element, unknown> | null = null;
+  /** While true, the zoom handler ignores its event — set only while {@link syncZoomToView}
+   *  programmatically re-seeds the gesture transform, so re-seeding does not recurse into setTransform. */
+  private suppressZoomEmit = false;
   /** Per-pass-through-layer repaint token. A time-sliced repaint captures the current
    *  token for its layer; each rAF step bails if a newer repaint (or an interaction) has
    *  bumped that layer's token. Per-LAYER (not a single shared token) so two PT layers
@@ -1275,19 +1283,39 @@ export abstract class BaseEngine {
       })
       .on("start", () => this.setInteracting(true))
       .on("zoom", (e: D3ZoomEvent<Element, unknown>) => {
+        if (this.suppressZoomEmit) return; // a programmatic syncZoomToView() re-seed — don't recurse
         const t: ViewTransform = { k: e.transform.k, x: e.transform.x, y: e.transform.y };
         this.setTransform(t);
         onTransform?.(t);
       })
       .on("end", () => this.setInteracting(false));
     (sel as any).call(behavior);
+    this.zoomSel = sel;
+    this.zoomBehavior = behavior;
     // Seed d3-zoom's internal transform from the engine's CURRENT view so a non-identity base
     // (e.g. a centering translate set via setTransform before enableZoom) is respected, and
     // zoom-to-cursor deltas measure from it rather than from identity.
     const t = this.transform;
     (sel as any).call(behavior.transform, zoomIdentity.translate(t.x, t.y).scale(t.k));
-    this.interactionCleanup = () => { (sel as any).on(".zoom", null); };
+    this.interactionCleanup = () => { (sel as any).on(".zoom", null); this.zoomSel = null; this.zoomBehavior = null; };
     return this;
+  }
+
+  /**
+   * Re-seed the zoom gesture's internal transform to the engine's CURRENT view, without firing the
+   * zoom handler. A programmatic view change made after {@link enableZoom} (e.g. fit-on-layout, which
+   * reframes the camera each streamed layout frame) otherwise leaves d3-zoom's internal transform at
+   * its seed value, so the next user gesture measures its delta from a stale base and jumps. Calling
+   * this after such a change keeps the gesture continuous. No-op when zoom isn't enabled.
+   */
+  protected syncZoomToView(): void {
+    const sel = this.zoomSel;
+    const behavior = this.zoomBehavior;
+    if (!sel || !behavior) return;
+    const t = this.transform;
+    this.suppressZoomEmit = true;
+    (sel as any).call(behavior.transform, zoomIdentity.translate(t.x, t.y).scale(t.k));
+    this.suppressZoomEmit = false;
   }
   on(event: "hover" | "click", cb: (hit: HoverHit | null, ev: PointerEvent) => void): this;
   on(event: "select", cb: (selected: HoverHit[], ev?: PointerEvent) => void): this;
