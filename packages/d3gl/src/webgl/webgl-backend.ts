@@ -87,6 +87,7 @@ export class WebGLBackend implements Backend {
     for (const r of this.renderers.values()) r.destroy();
     this.renderers.clear();
     this.layers.clear();
+    this.layerFlags.clear(); // fresh drawables carry fresh flags
     this.order = [];
     for (const layer of newLayers) {
       const renderer = new GroupRenderer(this.device, layer.buffers, this.width, this.height);
@@ -111,6 +112,7 @@ export class WebGLBackend implements Backend {
     renderer.setTransform(this.clipMatrix);
     this.renderers.set(name, renderer);
     this.layers.set(name, layer);
+    this.layerFlags.delete(name); // drawable set may have changed; a retained view is stale
     if (!this.order.includes(name)) this.order.push(name);
     this.bakeDirty = true;
   }
@@ -131,6 +133,25 @@ export class WebGLBackend implements Backend {
       const prev = this.layers.get(name);
       if (prev) this.layers.set(name, { ...prev, drawables });
     }
+    this.bakeDirty = true;
+  }
+
+  /** Live per-layer flags views from {@link updateLayerFlags} (#208), folded into the stashed
+   *  vector views lazily at {@link toSVG} — never per frame (export-only consumer). Entries are
+   *  dropped whenever the drawable set changes (setLayers/updateLayer/appendToLayer), so a
+   *  retained view is always the CURRENT live one. */
+  private layerFlags = new Map<string, Uint8Array>();
+
+  /** Flags-only update (#208): rewrite ONLY the flags texture — colour tables, geometry and
+   *  the stashed vector view untouched, zero CPU-side copies. A zoom frame with declutter
+   *  uploads drawableCount bytes instead of updateColors' 9×. The vector view (toSVG reads
+   *  it) is NOT patched here — that would be an O(drawables) per-frame loop for an
+   *  export-only consumer; the live view is retained and folded in at toSVG(). */
+  updateLayerFlags(name: string, flags: Uint8Array): void {
+    const renderer = this.renderers.get(name);
+    if (!renderer) return;
+    renderer.updateFlags(flags);
+    this.layerFlags.set(name, flags);
     this.bakeDirty = true;
   }
 
@@ -165,6 +186,7 @@ export class WebGLBackend implements Backend {
     // Keep the stored layer's clip/sizeMode current (geometry lives in the renderer).
     const prev = this.layers.get(delta.name);
     if (prev) this.layers.set(delta.name, { ...prev, clipTo: delta.clipTo, sizeMode: delta.sizeMode });
+    this.layerFlags.delete(delta.name); // drawable set grew; a retained flags view is stale
     this.bakeDirty = true;
     // The engine does not call render() after appendToLayer (the backend is responsible
     // for making the append visible); render now (re-bakes if dirty in globe mode).
@@ -450,6 +472,13 @@ export class WebGLBackend implements Backend {
   }
 
   toSVG(): string {
+    // Fold any flags-only updates (#208) into the stashed vector views ONCE, at export time
+    // — the per-frame path deliberately skips this (WebGL renders from the flags texture).
+    for (const [name, flags] of this.layerFlags) {
+      const drawables = this.layers.get(name)?.drawables;
+      if (!drawables || drawables.length !== flags.length) continue;
+      for (let i = 0; i < flags.length; i++) drawables[i]!.flags = flags[i]!;
+    }
     // In globe mode, SVG cannot render a 3D sphere; fall back to the baked (equirectangular) layer snapshot.
     // The stashed labels (#219) serialize as <text> on top, exactly as the Canvas/SVG backends emit them.
     return svgFromLayers(this.width, this.height, this.order.map((n) => this.layers.get(n)!), this.viewTransform, this.textData);

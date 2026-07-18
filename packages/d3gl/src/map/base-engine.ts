@@ -1203,11 +1203,18 @@ export abstract class BaseEngine {
    */
   private declutterLayer(spec: LayerSpec, t: ViewTransform): void {
     if (!this.cullDeclutter(spec, t)) return; // wrote visibility flags into the Scene
-    // Flags-only change: push just the style tables (the styles-only path). No render() here —
-    // setTransform() renders right after the declutter loop. updateLayer would re-upload the
-    // full geometry per zoom frame for nothing.
+    // Only visibility bits moved — colours and geometry did not. Preferred path (#208): hand
+    // the backend the Scene's persistent typed flags view BY REFERENCE (zero copies, zero
+    // per-frame allocation). WebGL rewrites only the flags texture (drawableCount bytes, not
+    // the 9× of a full styleTables push); Canvas/SVG patch their retained vector views in
+    // place instead of re-materializing a fresh drawables array. No render() here —
+    // setTransform() renders right after the declutter loop.
     const backend = this.handle?.backend;
-    if (backend?.updateLayerStyles) {
+    if (!backend) return;
+    if (backend.updateLayerFlags) {
+      backend.updateLayerFlags(spec.name, this.scene.flagsView(spec.name));
+    } else if (backend.updateLayerStyles) {
+      // Fallback for backends without the flags-only entry point: full styles push.
       // The vector view (`drawables`) is what Canvas/SVG repaint from, but WebGL only stashes it
       // for `toSVG` export — `updateColors` drives the GPU from the flag table. So on a backend
       // that doesn't render from it, skip the (O(n)) materialization while interacting and let
@@ -1219,7 +1226,7 @@ export abstract class BaseEngine {
         needDrawables ? this.scene.drawables(spec.name) : undefined,
       );
     } else {
-      backend?.updateLayer(spec.name, this.renderLayer(spec));
+      backend.updateLayer(spec.name, this.renderLayer(spec));
     }
   }
 
