@@ -12,16 +12,21 @@ describe("Scene.styleTables / Scene.drawableOf", () => {
     return scene;
   };
 
-  it("returns just the per-drawable tables, detached from the scene", () => {
+  it("returns just the per-drawable tables, as LIVE zero-copy views (#207)", () => {
     const scene = build();
     const t = scene.styleTables("g");
     expect(t.fillColors).toBeInstanceOf(Uint8Array);
     expect(t.fillColors.length).toBe(2 * 4);
     expect([...t.fillColors.slice(0, 4)]).toEqual([255, 0, 0, 255]);
     expect(t.flags.length).toBe(2);
-    // Detached snapshot: later scene writes don't mutate it.
+    // Live views of the typed storage: later scene writes ARE visible through them
+    // (and repeat calls return the same instances — zero per-call allocation).
     scene.setFill("g", "a", "rgb(0,255,0)");
-    expect(t.fillColors[1]).toBe(0);
+    expect([...t.fillColors.slice(0, 4)]).toEqual([0, 255, 0, 255]);
+    const again = scene.styleTables("g");
+    expect(again.fillColors).toBe(t.fillColors);
+    expect(again.strokeColors).toBe(t.strokeColors);
+    expect(again.flags).toBe(t.flags);
   });
 
   it("looks up one drawable by id in O(1), null when absent", () => {

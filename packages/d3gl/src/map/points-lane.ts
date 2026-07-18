@@ -103,6 +103,10 @@ export function declutterPointsStrategy(
   const flags = new Uint8Array(n);
   const sx = new Float64Array(n);
   const sy = new Float64Array(n);
+  // Kept-index scratch (#217): grown lazily to the largest kept count seen (≤ n), so steady-state
+  // select() allocates nothing. select returns a subarray view over it — valid only until the next
+  // select overwrites it (the single-frame contract on SelectionStrategy.select).
+  let keptScratch = new Uint32Array(0);
   // Constant exclusion radius = declutterPx/2 for all points (match cullDeclutter convention:
   // two glyphs collide when dist < spacing*(rᵢ+rⱼ) = 1*(px/2+px/2) = px).
   const halfExcl = declutterPx / 2;
@@ -120,10 +124,10 @@ export function declutterPointsStrategy(
       declutterScreen(n, sx, sy, halfExcl, order, w, h, 1, flags, scratch, undefined, winners);
       let count = 0;
       for (let i = 0; i < n; i++) if (flags[i]) count++;
-      const out = new Uint32Array(count);
+      if (keptScratch.length < count) keptScratch = new Uint32Array(count);
       let w2 = 0;
-      for (let i = 0; i < n; i++) if (flags[i]) out[w2++] = i;
-      return out;
+      for (let i = 0; i < n; i++) if (flags[i]) keptScratch[w2++] = i;
+      return keptScratch.subarray(0, count);
     },
     pick(px: number, py: number, t: LaneTransform, visible: Uint32Array): number {
       let found = -1;

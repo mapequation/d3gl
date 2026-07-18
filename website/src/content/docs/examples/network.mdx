@@ -350,10 +350,12 @@ the same cut alpha).
 
 Labels are rendered by the **active backend**: on **WebGL** they're an HTML overlay (crisp + accessible,
 styled by the default + `style`/`className` above); on **SVG/Canvas** the backend draws them natively —
-SVG `<text>`, Canvas `fillText` — so they appear in `toSVG()`/`toPNG()` **export** (`font`/`color`/`halo`
-override the matching native defaults, since CSS can't reach backend-drawn text). Switch
-this example to the SVG backend and Export SVG for publication-ready labelled vector output. GPU/MSDF text
-(to put WebGL labels on the GPU for very high counts, or to bake them into a WebGL PNG export) is #69.
+SVG `<text>`, Canvas `fillText` (`font`/`color`/`halo` override the matching native defaults, since CSS
+can't reach backend-drawn text). On **every** backend the placed labels appear in `toSVG()`/`toPNG()`
+**export** — WebGL composites them into the PNG and serializes them as `<text>` at export time, so a
+labelled export matches what you see regardless of the backend you happened to run. Switch this example
+to the SVG backend and Export SVG for publication-ready labelled vector output. GPU/MSDF text (to put
+WebGL labels on the GPU for very high counts) is #69.
 
 ## A directed map of modules
 

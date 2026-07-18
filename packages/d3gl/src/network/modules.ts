@@ -57,24 +57,21 @@ export function buildModuleLODTree(nodeCount: number, records: ArrayLike<ModuleN
   return lodTreeFromTopology(buildModuleTopology(nodeCount, records, edges));
 }
 
-/** The empty-prefix root key. Every node's path prefixes bottom out here, so it is the single root. */
-const ROOT_KEY = "";
-
 function buildModuleTopology(nodeCount: number, records: ArrayLike<ModuleNode>, edges?: ModuleEdges): LODTopology {
-  // --- 1. Register every distinct module prefix (root + all ancestors) in first-seen order, and
-  // record each leaf's enclosing-module key. ---
-  const moduleIndex = new Map<string, number>(); // prefix key → internal module index
-  const moduleKeys: string[] = []; // internal index → key (registration order)
-  const registerModule = (key: string): number => {
-    let idx = moduleIndex.get(key);
-    if (idx === undefined) {
-      idx = moduleKeys.length;
-      moduleIndex.set(key, idx);
-      moduleKeys.push(key);
-    }
-    return idx;
+  // --- 1. Register every distinct module prefix (root + all ancestors) in first-seen order by
+  // walking an integer-keyed prefix tree: each module lazily holds a child map keyed by the next
+  // path component (branch id). A prefix corresponds one-to-one with a (parent, branch) chain, so
+  // this registers the exact modules — in the exact order — that interning ":"-joined path strings
+  // did, without the O(nodeCount·depth) transient strings (#215). Each module's parent is recorded
+  // at creation; the root (index 0) has none. ---
+  const moduleParent: number[] = []; // internal index → parent internal index (-1 for the root)
+  const moduleChild: (Map<number, number> | null)[] = []; // internal index → (branch id → child internal index)
+  const registerModule = (parent: number): number => {
+    moduleParent.push(parent);
+    moduleChild.push(null);
+    return moduleParent.length - 1;
   };
-  registerModule(ROOT_KEY); // always present, even for a flat (module-less) network
+  registerModule(-1); // the root — always present, even for a flat (module-less) network
 
   const leafModule = new Int32Array(nodeCount).fill(-1); // node id → enclosing module's internal index
   const seen = new Uint8Array(nodeCount);
@@ -87,44 +84,38 @@ function buildModuleTopology(nodeCount: number, records: ArrayLike<ModuleNode>, 
     seen[id] = 1;
     const depth = path.length;
     if (depth < 1) throw new Error(`buildModuleLODTree: node id ${id} has an empty path`);
-    // Register the chain root="" , path[0], path[0:1], … ; the enclosing module is the prefix of
-    // length depth-1 (the last path entry is the node's rank within that module, not a module).
-    let key = ROOT_KEY;
+    // Walk root → path[0] → path[0:1] → …, creating unseen modules; the enclosing module is the
+    // prefix of length depth-1 (the last path entry is the node's rank within that module, not a
+    // module).
+    let m = 0; // the root
     for (let d = 0; d < depth - 1; d++) {
-      key = d === 0 ? String(path[d]) : `${key}:${path[d]}`;
-      registerModule(key);
+      const branch = path[d]!;
+      const kids = (moduleChild[m] ??= new Map());
+      let child = kids.get(branch);
+      if (child === undefined) {
+        child = registerModule(m);
+        kids.set(branch, child);
+      }
+      m = child;
     }
-    leafModule[id] = registerModule(key);
+    leafModule[id] = m;
   }
   for (let i = 0; i < nodeCount; i++) {
     if (!seen[i]) throw new Error(`buildModuleLODTree: no record for node id ${i} (records must cover every node)`);
   }
 
-  const moduleCount = moduleKeys.length;
+  const moduleCount = moduleParent.length;
 
-  // --- 2. Parent of each module: the prefix with its last component dropped; the root has none. ---
-  const moduleParent = new Int32Array(moduleCount).fill(-1); // internal index → parent internal index
-  for (let m = 0; m < moduleCount; m++) {
-    const key = moduleKeys[m]!;
-    if (key === ROOT_KEY) continue;
-    const cut = key.lastIndexOf(":");
-    const parentKey = cut === -1 ? ROOT_KEY : key.slice(0, cut);
-    moduleParent[m] = moduleIndex.get(parentKey)!;
-  }
-
-  // --- 3. Module heights (leaves are height 0; a module is 1 + its deepest child's height). A child
-  // module always has a longer prefix than its parent, so processing by descending prefix length
-  // finalises every child before its parent. ---
+  // --- 2. Module heights (leaves are height 0; a module is 1 + its deepest child's height). A child
+  // module is always registered after its parent, so descending internal-index order finalises every
+  // child before its parent. ---
   const moduleHeight = new Int32Array(moduleCount).fill(1); // ≥1: every module has ≥1 (leaf) child
-  const byDepthDesc = Array.from({ length: moduleCount }, (_, m) => m).sort(
-    (a, b) => prefixDepth(moduleKeys[b]!) - prefixDepth(moduleKeys[a]!),
-  );
-  for (const m of byDepthDesc) {
+  for (let m = moduleCount - 1; m >= 1; m--) {
     const p = moduleParent[m]!;
-    if (p >= 0 && moduleHeight[m]! + 1 > moduleHeight[p]!) moduleHeight[p] = moduleHeight[m]! + 1;
+    if (moduleHeight[m]! + 1 > moduleHeight[p]!) moduleHeight[p] = moduleHeight[m]! + 1;
   }
 
-  // --- 4. Global ids: leaves keep [0, nodeCount); modules are counting-sorted by height so each LOD
+  // --- 3. Global ids: leaves keep [0, nodeCount); modules are counting-sorted by height so each LOD
   // level is a contiguous id range and every child's id < its parent's (cut/geometry rely on both). ---
   let maxHeight = 1;
   for (let m = 0; m < moduleCount; m++) if (moduleHeight[m]! > maxHeight) maxHeight = moduleHeight[m]!;
@@ -150,7 +141,7 @@ function buildModuleTopology(nodeCount: number, records: ArrayLike<ModuleNode>, 
   levelOffset[1] = nodeCount;
   for (let h = 1; h <= maxHeight; h++) levelOffset[h + 1] = levelOffset[h]! + perHeight[h]!;
 
-  // --- 5. Parent of every tree node (global id), then children CSR (count → prefix-sum → scatter). ---
+  // --- 4. Parent of every tree node (global id), then children CSR (count → prefix-sum → scatter). ---
   const parent = new Int32Array(size).fill(-1);
   for (let i = 0; i < nodeCount; i++) parent[i] = moduleId[leafModule[i]!]!; // leaf → its module
   for (let m = 0; m < moduleCount; m++) {
@@ -187,12 +178,4 @@ function buildModuleTopology(nodeCount: number, records: ArrayLike<ModuleNode>, 
   };
   if (edges) Object.assign(topo, buildSuperEdges(size, parent, edges));
   return topo;
-}
-
-/** Prefix depth = number of components (`""` → 0, `"2"` → 1, `"2:1"` → 2). */
-function prefixDepth(key: string): number {
-  if (key === ROOT_KEY) return 0;
-  let n = 1;
-  for (let i = 0; i < key.length; i++) if (key.charCodeAt(i) === 58 /* ":" */) n++;
-  return n;
 }

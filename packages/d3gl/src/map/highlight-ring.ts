@@ -26,7 +26,7 @@ function cssToRgba(css: string, fallback: RGBA): RGBA {
 
 /** Resolve the select/hover ring colours from the interaction opts (`selection.selected.stroke` / a
  *  hover {@link HighlightStyle}'s `stroke`), falling back to the blue (select) / green (hover) defaults. */
-export function resolveRingColors(opts: InteractiveLayerOptions): { select: RGBA; hover: RGBA; remove: RGBA } {
+export function resolveRingColors<D>(opts: InteractiveLayerOptions<D>): { select: RGBA; hover: RGBA; remove: RGBA } {
   const selStroke = opts.selection?.selected?.stroke;
   // The hover ring's stroke comes from the hovered-item style (`hover.hovered.stroke`, or a bare
   // HighlightStyle's `stroke` in the back-compat flat form) — see hoverParts (#162).
