@@ -1,5 +1,6 @@
 import type { Device, Texture, Framebuffer, RenderPass } from "@luma.gl/core";
 import type { ForceParams, LayoutGraph } from "../force.js";
+import { DAMPING, springStabilizers } from "../force.js";
 import { buildCSR } from "../graph.js";
 import { atlasWidth, pingPong, readbackFloatFboReuse, packUintTexture } from "./textures.js";
 import { IntegratePass } from "./passes/integrate.js";
@@ -9,8 +10,7 @@ import { RepulsionPyramidPass } from "./passes/repulsion-pyramid.js";
 import { GridPyramid } from "./passes/grid-pyramid.js";
 import { CentroidReducePass, CenteringPass, makeSumTarget } from "./passes/centering.js";
 
-/** Damping applied to velocity each integration step (mirrors CPU force.ts). */
-const DAMPING = 0.9;
+// DAMPING is imported from force.ts so both integrators share one constant.
 
 /**
  * Node-count threshold for the repulsion algorithm. At or below this many nodes
@@ -140,6 +140,12 @@ export class GpuForceLayout {
    * by {@link setPinned} via sub-uploads (no per-tick / per-move allocation).
    */
   private readonly pinnedTex: Texture;
+  /**
+   * Per-node `1/(1+K̃)` spring-stiffness stabilizer texture (r32float, #203) — the GPU mirror
+   * of {@link springStabilizers}. Static (degrees don't change), created once in the constructor
+   * and sampled by the integrate pass; padding texels are 1 (identity).
+   */
+  private readonly stabTex: Texture;
   /** The currently-pinned ids (so {@link setPinned} can clear them before applying the next set). */
   private pinnedIds: Uint32Array | null = null;
   /** Scratch for a single-texel flag sub-upload (r8unorm: 255 = held, 0 = free). */
@@ -237,6 +243,22 @@ export class GpuForceLayout {
       height,
       format: "r8unorm",
       data: new Uint8Array(width * height),
+      mipLevels: 1,
+      sampler: { minFilter: "nearest", magFilter: "nearest" },
+    });
+
+    // Per-node spring-stiffness stabilizer (#203): 1/(1+K̃) with K̃ = damping·α·attraction·degree,
+    // computed ONCE from the edge list (degrees are static) and sampled by the integrate pass so a
+    // high-degree hub's aggregate spring can never turn the integration oscillatory-unstable.
+    // Identical math to the CPU ForceLayout (springStabilizers) — keeps backend parity.
+    const stab = springStabilizers(graph.nodeCount, graph.source, graph.target, graph.edgeCount, params);
+    const stabPadded = new Float32Array(width * height).fill(1);
+    stabPadded.set(stab);
+    this.stabTex = device.createTexture({
+      width,
+      height,
+      format: "r32float",
+      data: stabPadded,
       mipLevels: 1,
       sampler: { minFilter: "nearest", magFilter: "nearest" },
     });
@@ -405,7 +427,7 @@ export class GpuForceLayout {
       clearColor: false,
     });
 
-    this.integratePass.run(renderPass, this.pos.readTex, this.vel.readTex, this.forceTex, this.pinnedTex, {
+    this.integratePass.run(renderPass, this.pos.readTex, this.vel.readTex, this.forceTex, this.pinnedTex, this.stabTex, {
       count: this.count,
       width: this.width,
       alpha: this.params.alpha,
@@ -509,6 +531,7 @@ export class GpuForceLayout {
     this.forceTex.destroy();
     this.forceFbo.destroy();
     this.pinnedTex.destroy();
+    this.stabTex.destroy();
     this.sumTex.destroy();
     this.sumFbo.destroy();
     this.fbos[0].destroy();
