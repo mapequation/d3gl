@@ -247,9 +247,10 @@ export type InstancedLayer =
 /**
  * One backend-rendered text label (#105 N7b-2). Positioned in **screen pixels** (the caller projects
  * the world anchor and applies the view transform) and drawn at a **constant pixel** font, so labels
- * stay readable at any zoom — re-pushed each `setTransform`, like the HTML overlay it mirrors. Drawn by
- * the SVG (`<text>`) and Canvas (`fillText`) backends so labels survive `toSVG()`/`toPNG()`; the WebGL
- * backend omits {@link Backend.setTextLayer} and keeps the HTML overlay (GPU/MSDF text is #69).
+ * stay readable at any zoom — re-pushed each `setTransform`, like the HTML overlay it mirrors. Drawn
+ * live by the SVG (`<text>`) and Canvas (`fillText`) backends; the WebGL backend keeps the HTML overlay
+ * on screen (GPU/MSDF text is #69) but retains the set for export (#219), so labels survive
+ * `toSVG()`/`toPNG()` on all three backends.
  */
 export interface TextData {
   /** Screen-space anchor (CSS px). Horizontal placement relative to it follows {@link align}; the text
@@ -364,11 +365,21 @@ export interface Backend {
   pickInstanced?(x: number, y: number, exact: boolean): number | undefined;
   /**
    * Set the screen-space text labels to draw on top of the scene (#105 N7b-2). Optional — the SVG
-   * (`<text>`) and Canvas (`fillText`) backends implement it so labels appear in `toSVG()`/`toPNG()`;
-   * the WebGL backend omits it (the engine keeps the HTML overlay there). Replaces the whole set; pass
-   * `[]` to clear. Re-pushed by the engine each `setTransform` (the coords are screen px).
+   * (`<text>`) and Canvas (`fillText`) backends implement it and render the set live, so the engine
+   * routes labels here (instead of the HTML overlay) and they appear in `toSVG()`/`toPNG()`. The WebGL
+   * backend implements it as an **export-only stash** (see {@link textLayerMode}): the set is retained
+   * for `toPNG()`/`toSVG()` but never drawn to screen — the engine keeps the HTML overlay live and
+   * pushes the placed set only at export time (#219). Replaces the whole set; pass `[]` to clear.
    */
   setTextLayer?(texts: readonly TextData[]): void;
+  /**
+   * How {@link setTextLayer} text is rendered (#219). `"live"` (default when absent): the backend
+   * draws the set on screen (SVG `<text>` / Canvas `fillText`), so the engine routes labels away from
+   * the HTML overlay and re-pushes them each `setTransform`. `"export-only"` (WebGL): the backend only
+   * retains the set for `toPNG()`/`toSVG()` — the engine must keep its own live label rendering (the
+   * HTML overlay) and needs to push the set only when exporting, NOT per transform (zero per-frame cost).
+   */
+  readonly textLayerMode?: "live" | "export-only";
   setTransform(t: ViewTransform): void;
   /**
    * Resize the rendering surface to a new CSS size (px). Re-reads the device pixel ratio
