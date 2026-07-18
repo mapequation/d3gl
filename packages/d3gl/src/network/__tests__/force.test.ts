@@ -54,6 +54,58 @@ describe("ForceLayout", () => {
     expect(g.positions[0]).not.toBe(0);
   });
 
+  it("per-tick step clamp is isotropic — preserves direction instead of snapping to ±45° (#203)", () => {
+    // Two unconnected nodes 0.559 apart along 26.57° (dx=0.5, dy=0.25). span0 floors at 1 so
+    // maxStep = 4, while the raw repulsion step is ~60 — far above the clamp. A component-wise
+    // clamp would emit (±4, ±4), i.e. snap the motion onto the diagonal (dy/dx = 1) — exactly the
+    // #203 four-corners artifact. The isotropic clamp must keep |Δp| = maxStep and dy/dx = 0.5.
+    const g = buildGraph({ nodeCount: 2, source: [], target: [] });
+    g.positions.set([0, 0, 0.5, 0.25]);
+
+    new ForceLayout(g).tick();
+
+    const dx = g.positions[2]! - 0.5;
+    const dy = g.positions[3]! - 0.25;
+    expect(Math.hypot(dx, dy)).toBeGreaterThan(3.9); // clamp engaged…
+    expect(Math.hypot(dx, dy)).toBeLessThan(4.01); // …at the vector magnitude, not per axis
+    expect(dy / dx).toBeCloseTo(0.5, 3); // direction preserved (component clamp gives 1.0)
+  });
+
+  it("a high-degree hub cannot turn the spring integration unstable (#203 runaway)", () => {
+    // Star hub with 1200 leaves, each edge doubled (reciprocal pair) → 2400 spring incidences on
+    // the hub: per-tick spring gain K̃ = damping·α·attraction·deg ≈ 21.6, way past the explicit
+    // integrator's oscillatory stability bound (K̃ ≈ 3.8). Pre-#203 the hub oscillates with
+    // exponentially growing amplitude (contained only by the step clamp — permanent maxStep-sized
+    // jitter); the per-node semi-implicit stabilizer keeps it unconditionally stable, so after a
+    // few hundred ticks the layout must be SETTLED (tiny last-tick steps), not just finite.
+    const n = 1201;
+    const source: number[] = [];
+    const target: number[] = [];
+    for (let i = 1; i < n; i++) {
+      source.push(0, i);
+      target.push(i, 0);
+    }
+    const g = buildGraph({ nodeCount: n, source, target });
+    seedPositions(g, 1000, 1000);
+
+    const sim = new ForceLayout(g);
+    sim.run(299);
+    const before = g.positions.slice();
+    sim.tick();
+
+    let span = 0;
+    let maxStepSeen = 0;
+    for (let i = 0; i < n; i++) {
+      const sx = g.positions[i * 2]! - before[i * 2]!;
+      const sy = g.positions[i * 2 + 1]! - before[i * 2 + 1]!;
+      maxStepSeen = Math.max(maxStepSeen, Math.hypot(sx, sy));
+      span = Math.max(span, Math.abs(g.positions[i * 2]!), Math.abs(g.positions[i * 2 + 1]!));
+    }
+    expect(Array.from(g.positions).every((v) => Number.isFinite(v))).toBe(true);
+    expect(span).toBeLessThan(50_000); // no runaway drift
+    expect(maxStepSeen).toBeLessThan(20); // settled — pre-#203 the hub still jumps ~maxStep (≈4000)
+  });
+
   it("stays finite and bounded on a large near-coincident cluster (softening + step clamp)", () => {
     // A 256-node hub star seeded in a sub-pixel disc: without softening the repulsion ~ 1/d² is
     // enormous and (with the old same-direction coincidence hack) velocities ran away to ±∞ → NaN,

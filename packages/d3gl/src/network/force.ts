@@ -41,12 +41,42 @@ export interface ForceParams {
 
 export const DEFAULT_FORCE: ForceParams = { repulsion: 200, attraction: 0.05, centering: 0.2, alpha: 0.2, theta: 0.9 };
 
+/** Velocity damping applied each integration step (shared with the GPU integrate pass). */
+export const DAMPING = 0.9;
+
+/**
+ * Per-node spring-stiffness stabilizer (#203). A node with per-tick spring gain
+ * `K̃ = damping·alpha·attraction·degree` integrates its spring force explicitly; for
+ * `K̃ ≳ 2` the damped integrator's spring mode turns oscillatory-unstable (amplitude grows
+ * every tick), so a high-degree hub — e.g. LFR max degree 3√n, doubled by reciprocal
+ * directed edge pairs — ejects itself and its cluster ballistically ("square layout"
+ * runaway, #203). Dividing the velocity update by `1 + K̃` treats the node's aggregate
+ * spring semi-implicitly: the linearised mode is stable for EVERY `K̃ ≥ 0` (trace/det
+ * check: |T| = 1.9/(1+K̃) ≤ 1 + 0.9/(1+K̃) ⇔ K̃ ≥ 0), equilibria are unchanged (the
+ * factor scales velocity, not the force balance), and low-degree nodes are barely
+ * touched (deg 10 at defaults → factor 1/1.009). Effectively hubs get "heavier"
+ * (ForceAtlas2-style degree mass) exactly in proportion to their spring stiffness.
+ */
+export function springStabilizers(nodeCount: number, source: Uint32Array, target: Uint32Array, edgeCount: number, params: ForceParams): Float32Array {
+  const deg = new Float32Array(nodeCount);
+  for (let e = 0; e < edgeCount; e++) {
+    deg[source[e]!]! += 1;
+    deg[target[e]!]! += 1;
+  }
+  const k = DAMPING * params.alpha * params.attraction;
+  const stab = deg; // reuse in place: deg → 1 / (1 + K̃)
+  for (let i = 0; i < nodeCount; i++) stab[i] = 1 / (1 + k * deg[i]!);
+  return stab;
+}
+
 export class ForceLayout {
   private readonly params: ForceParams;
   private readonly vx: Float32Array;
   private readonly vy: Float32Array;
   private readonly fx: Float32Array;
   private readonly fy: Float32Array;
+  /** Per-node `1/(1+K̃)` spring-stiffness stabilizer (see {@link springStabilizers}). */
+  private readonly stab: Float32Array;
   private readonly tree = new BarnesHutTree();
   /** Reference layout span captured on the first tick; bounds the per-tick step (see {@link tick}). */
   private span0 = 0;
@@ -68,6 +98,7 @@ export class ForceLayout {
     this.vy = new Float32Array(n);
     this.fx = new Float32Array(n);
     this.fy = new Float32Array(n);
+    this.stab = springStabilizers(n, graph.source, graph.target, graph.edgeCount, this.params);
   }
 
   /**
@@ -129,17 +160,28 @@ export class ForceLayout {
     // Integrate with velocity Verlet-ish damping (cools toward equilibrium). The per-tick step is
     // clamped to a multiple of the initial span so a pathological force (e.g. a dense coarse level)
     // can't fling a node to ±∞ and poison the layout with NaN; far above any normal displacement.
-    const damping = 0.9;
     const maxStep = this.span0 * 4;
+    const maxStep2 = maxStep * maxStep;
     const pinned = this.pinned;
+    const stab = this.stab;
     for (let i = 0; i < nodeCount; i++) {
       // Held nodes (#140) are positioned externally each frame — don't integrate them (and drop any
       // velocity so they don't lurch when released). They still repel + anchor springs via the passes above.
       if (pinned && pinned[i]) { vx[i] = 0; vy[i] = 0; continue; }
-      let sx = (vx[i]! + fx[i]! * alpha) * damping;
-      let sy = (vy[i]! + fy[i]! * alpha) * damping;
-      sx = sx > maxStep ? maxStep : sx < -maxStep ? -maxStep : sx;
-      sy = sy > maxStep ? maxStep : sy < -maxStep ? -maxStep : sy;
+      // Per-node semi-implicit spring stabilizer (#203): divide by 1 + K̃ so a hub's aggregate
+      // spring stiffness can never turn the integration oscillatory-unstable. See springStabilizers.
+      const s = stab[i]!;
+      let sx = (vx[i]! + fx[i]! * alpha) * DAMPING * s;
+      let sy = (vy[i]! + fy[i]! * alpha) * DAMPING * s;
+      // Isotropic per-tick step clamp (#203): scale the step VECTOR, never each axis — a
+      // component-wise clamp maps every large step onto the boundary of a square, so runaway
+      // nodes travel at exactly ±45° and pile up in the four corners of an axis-aligned box.
+      const len2 = sx * sx + sy * sy;
+      if (len2 > maxStep2) {
+        const k = maxStep / Math.sqrt(len2);
+        sx *= k;
+        sy *= k;
+      }
       vx[i] = sx;
       vy[i] = sy;
       positions[i * 2] = positions[i * 2]! + sx;

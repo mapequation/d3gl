@@ -16,8 +16,12 @@ void main() { gl_Position = vec4(a_clip, 0.0, 1.0); }
  *
  * Each fragment maps to one node (id = c.y * u_width + c.x). Reads the current
  * position, velocity, and accumulated force, applies integration
- * (v' = clamp((v + f·α)·damping, ±maxStep); p' = p + v'), and writes the new
- * position and velocity via MRT to locations 0 and 1 respectively.
+ * (v' = (v + f·α)·damping·stab, |v'| clamped to maxStep; p' = p + v'), and writes
+ * the new position and velocity via MRT to locations 0 and 1 respectively.
+ * `stab` is the per-node 1/(1+K̃) spring-stiffness stabilizer (#203) and the step
+ * clamp is ISOTROPIC (vector magnitude, mirroring CPU force.ts) — a component-wise
+ * clamp would send every runaway step along ±45°, piling nodes into the corners of
+ * an axis-aligned square.
  *
  * With all force strengths set to 0 the force texture is all-zeros, so v and p
  * are unchanged — the zero-force invariant the test relies on.
@@ -35,6 +39,7 @@ uniform sampler2D u_pos;
 uniform sampler2D u_vel;
 uniform sampler2D u_force;
 uniform sampler2D u_pinned;
+uniform sampler2D u_stab; // per-node 1/(1+K̃) spring-stiffness stabilizer (#203)
 uniform int u_count;
 uniform int u_width;
 uniform float u_alpha;
@@ -52,7 +57,13 @@ void main() {
   // doesn't lurch on release. It still repelled + anchored springs via the force passes.
   if (texelFetch(u_pinned, c, 0).r > 0.5) { o_pos = p; o_vel = vec2(0.0); return; }
   vec2 f = texelFetch(u_force, c, 0).xy;
-  vec2 s = clamp((v + f * u_alpha) * u_damping, vec2(-u_maxStep), vec2(u_maxStep));
+  // Per-node semi-implicit spring stabilizer (#203): scaling the velocity update by 1/(1+K̃)
+  // keeps a hub's aggregate spring stiffness unconditionally stable (mirrors CPU force.ts).
+  float st = texelFetch(u_stab, c, 0).r;
+  vec2 s = (v + f * u_alpha) * u_damping * st;
+  // Isotropic step clamp (#203): scale the vector, never per-axis (see file header).
+  float len = length(s);
+  if (len > u_maxStep) s *= u_maxStep / len;
   o_vel = s;
   o_pos = p + s;
 }
@@ -112,6 +123,7 @@ export class IntegratePass {
     velTex: Texture,
     forceTex: Texture,
     pinnedTex: Texture,
+    stabTex: Texture,
     u: IntegrateUniforms,
   ): void {
     // Mutate the shared uniforms object in-place — Model reads this.props.uniforms
@@ -124,7 +136,7 @@ export class IntegratePass {
 
     // Update sampler bindings for this tick's read textures. `u_pinned` is the per-node
     // held-flag texture (all-zero when nothing is pinned → normal integration everywhere).
-    this.model.setBindings({ u_pos: posTex, u_vel: velTex, u_force: forceTex, u_pinned: pinnedTex });
+    this.model.setBindings({ u_pos: posTex, u_vel: velTex, u_force: forceTex, u_pinned: pinnedTex, u_stab: stabTex });
 
     this.model.draw(pass);
   }
