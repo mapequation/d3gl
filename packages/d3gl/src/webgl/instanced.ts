@@ -47,6 +47,11 @@ class HighlightBuffers {
    *  per-emit columns (LOD frontier) are fresh references and always upload. */
   private lastGroups: Float32Array | undefined;
   private lastGroups2: Float32Array | undefined;
+  /** Last-uploaded selected-flag reference (#240) — the same skip for `a_selected`: the network's
+   *  no-LOD flags are cached per selection version (a selection change hands back a FRESH array), so a
+   *  position-only frame skips their O(count) float conversion + upload. Kept coherent by every path
+   *  that uploads flags (constructor / {@link recreate} / {@link write} / {@link writeSelected}). */
+  private lastSelected: Uint8Array | undefined;
   constructor(private device: Device, data: WithHighlight) {
     // Default group = -1 (an id no real node has), so a layer WITHOUT groups (plot points, aggregate
     // halos) never matches a hovered group id and never spuriously highlights.
@@ -55,6 +60,7 @@ class HighlightBuffers {
     this.selected = device.createBuffer({ data: selectedFloats(data) });
     this.lastGroups = data.groups;
     this.lastGroups2 = data.groups2;
+    this.lastSelected = data.selected; // a fresh registration uploads via createBuffer above
   }
   layout = [
     { name: "a_group", format: "float32" as const, stepMode: "instance" as const },
@@ -74,19 +80,27 @@ class HighlightBuffers {
     this.selected = this.device.createBuffer({ data: selectedFloats(data) });
     this.lastGroups = data.groups;
     this.lastGroups2 = data.groups2;
+    this.lastSelected = data.selected;
     return this.attributes();
   }
-  /** Rewrite the buffers from fresh emit data (the in-place sub-update path). Group columns skip when
-   *  their array reference is unchanged (#214 — the no-LOD position-only fast path, like #179's style
-   *  attrs); `selected` follows the selection and always rewrites. */
+  /** Rewrite the buffers from fresh emit data (the in-place sub-update path). Every column skips when
+   *  its array reference is unchanged: group columns per #214, `selected` per #240 (the no-LOD
+   *  position-only fast path, like #179's style attrs — a selection change hands a fresh array, so an
+   *  unchanged reference ⟺ unchanged flags). A defined→undefined `selected` transition still rewrites
+   *  (zero-fills), so dropping the flags clears stale selection state. */
   write(data: WithHighlight): void {
     if (data.groups) this.lastGroups = writeIfChanged(this.group, data.groups, this.lastGroups);
     if (data.groups2) this.lastGroups2 = writeIfChanged(this.group2, data.groups2, this.lastGroups2);
-    this.selected.write(selectedFloats(data));
+    if (data.selected !== this.lastSelected) {
+      this.selected.write(selectedFloats(data));
+      this.lastSelected = data.selected;
+    }
   }
-  /** Rewrite ONLY the selected flags (a selection change) — no geometry touch. */
+  /** Rewrite ONLY the selected flags (a selection change) — no geometry touch. Records the array as
+   *  last-uploaded (#240) so the next emit's {@link write} skips re-uploading the same flags. */
   writeSelected(selected: Uint8Array, count: number): void {
     this.selected.write(selectedFloats({ selected, count }));
+    this.lastSelected = selected;
   }
   destroy(): void {
     this.group.destroy();

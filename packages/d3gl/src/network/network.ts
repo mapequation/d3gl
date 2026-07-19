@@ -477,6 +477,14 @@ export class Network extends BaseEngine {
    *  style version, not per frame. Invalidated implicitly when `resolvedStyleCached` returns a fresh object. */
   private noLodStyleCacheFor: { style: ResolvedNetworkStyle; graph: NetworkGraph } | null = null;
   private noLodStyleCacheVal: NoLodStyleCache | null = null;
+  /** No-LOD per-instance `selected` flag columns cache (#240), keyed like the style cache PLUS the
+   *  selection version: reference-stable across position-only frames (so the renderer's identity check
+   *  skips their O(nodes)+O(edges)-per-layer conversion + re-upload), rebuilt FRESH on any selection
+   *  change ({@link onLaneSelectionChanged} / {@link interactive} disable call
+   *  {@link invalidateNoLodSelected}) so the changed flags DO upload. Never mutated in place. */
+  private noLodSelectedCacheFor: { style: ResolvedNetworkStyle; graph: NetworkGraph } | null = null;
+  private noLodSelectedNodes: Uint8Array | null = null;
+  private noLodSelectedLinks: Uint8Array | null = null;
   /** Registry key for the single network instanced lane (#108-B). */
   private readonly NET_LANE = "network";
   /** Registry key for the companion selection/hover ring overlay lane (#105 N7c-2), drawn on top. */
@@ -788,7 +796,10 @@ export class Network extends BaseEngine {
    */
   interactive(opts: InteractiveLayerOptions<NetworkHit> | false): this {
     this.interactiveOpts = opts || null;
-    if (!this.interactiveOpts) this.clearLayerSelection(this.NODE_LAYER); // disabling clears managed selection
+    if (!this.interactiveOpts) {
+      this.clearLayerSelection(this.NODE_LAYER); // disabling clears managed selection
+      this.invalidateNoLodSelected(); // #240: bypasses onLaneSelectionChanged, so drop the flag cache here
+    }
     this.syncLane(); // re-register the lane with the interactive block + companion highlight lane
     this.render();
     return this;
@@ -1552,9 +1563,10 @@ export class Network extends BaseEngine {
    *  (`lines`/`half-arrows`/`arrows`) instance `e` is graph edge `e`. The group columns (`groups` =
    *  node id / link source id; `groups2` = the link target, undirected incident hover) are
    *  position-independent, so they come from the {@link noLodCache} (#214) — the SAME array instances
-   *  across position-only frames, letting the renderer skip their per-frame upload. `selected` is the
-   *  initial flag from the current selection — NOT cached, it follows the selection
-   *  ({@link noLodSelectedFor} refreshes it in place on later selection changes). */
+   *  across position-only frames, letting the renderer skip their per-frame upload. `selected` follows
+   *  the *selection* version instead: {@link noLodSelectedFor} caches it until the selection changes
+   *  (#240), so position-only frames also skip its upload, while a selection change refreshes the GPU
+   *  flags in place (via writeSelected) AND hands later emits the fresh arrays. */
   private attachNoLodHighlight(layers: InstancedLayer[], cache: NoLodStyleCache): InstancedLayer[] {
     let linkSelected: Uint8Array | undefined; // one build shared by all link layers (lines + arrows)
     for (const l of layers) {
@@ -1708,20 +1720,39 @@ export class Network extends BaseEngine {
 
   /** Per-instance `selected` flags for a no-LOD base layer from the current selection (#162) — refreshed
    *  in place on a selection change instead of rebuilding geometry. `nodes`: node i selected; link layers:
-   *  edge e's source (directed) / either endpoint (undirected) selected. */
+   *  edge e's source (directed) / either endpoint (undirected) selected. Cached per (graph, style,
+   *  selection) version (#240): position-only frames get the SAME array instances back (the renderer
+   *  skips their re-upload by reference identity); a selection change invalidates
+   *  ({@link invalidateNoLodSelected}), so the next call builds FRESH arrays that do upload. */
   private noLodSelectedFor(layer: string): Uint8Array | undefined {
     const graph = this.graph;
     if (!graph) return undefined;
+    const style = this.resolvedStyleCached(graph);
+    const key = this.noLodSelectedCacheFor;
+    if (!key || key.graph !== graph || key.style !== style) {
+      this.invalidateNoLodSelected(); // data/style version changed — flag lengths/semantics may differ
+      this.noLodSelectedCacheFor = { style, graph };
+    }
     const sel = this.selectedIds(this.NODE_LAYER);
     if (layer === this.NODE_LAYER) {
+      if (this.noLodSelectedNodes) return this.noLodSelectedNodes;
       const out = new Uint8Array(graph.nodeCount);
       if (sel) for (let i = 0; i < graph.nodeCount; i++) out[i] = sel.has(i) ? 1 : 0;
+      this.noLodSelectedNodes = out;
       return out;
     }
-    const directed = this.resolvedStyleCached(graph).directed;
+    if (this.noLodSelectedLinks) return this.noLodSelectedLinks;
     const out = new Uint8Array(graph.edgeCount);
-    if (sel) for (let e = 0; e < graph.edgeCount; e++) out[e] = sel.has(graph.source[e]!) || (!directed && sel.has(graph.target[e]!)) ? 1 : 0;
+    if (sel) for (let e = 0; e < graph.edgeCount; e++) out[e] = sel.has(graph.source[e]!) || (!style.directed && sel.has(graph.target[e]!)) ? 1 : 0;
+    this.noLodSelectedLinks = out;
     return out;
+  }
+
+  /** Drop the cached no-LOD `selected` flag columns (#240) — the selection they encode changed, so the
+   *  next {@link noLodSelectedFor} builds fresh arrays (new references ⇒ the renderer uploads them). */
+  private invalidateNoLodSelected(): void {
+    this.noLodSelectedNodes = null;
+    this.noLodSelectedLinks = null;
   }
 
   /** Shader-highlight columns for the emitted LOD super-edges (#162): `groups` = source tree-node,
@@ -1754,6 +1785,7 @@ export class Network extends BaseEngine {
    *  current frontier, O(visible); {@link onInstancedLaneEmitted} re-applies uniforms); no-LOD refreshes
    *  the `selected` flag buffers in place — neither rebuilds the full geometry on a click. */
   protected override onLaneSelectionChanged(_layer: string): void {
+    this.invalidateNoLodSelected(); // #240: the cached flag columns encode the OLD selection
     if (this.lodReady() && this.lodTree) this.emitInstancedLane(this.NET_LANE);
     else this.pushLaneHighlight((layer) => this.noLodSelectedFor(layer));
     this.emitInstancedLane(this.NET_HL_LANE);

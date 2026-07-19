@@ -1273,8 +1273,9 @@ export function networkLayers(graph: NetworkGraph, style: ResolvedNetworkStyle):
  * of the immutable edge list + the node-identity column. They never change between position frames, so
  * caching them here (same key, same invalidation as the style attrs) keeps them reference-stable and
  * lets the renderer's reference-identity check skip their per-frame GPU upload. They are NEVER mutated
- * in place (the `writeIfChanged` invariant); the per-instance `selected` flags are NOT cached — they
- * follow the selection, not the (graph, style) version.
+ * in place (the `writeIfChanged` invariant); the per-instance `selected` flags are NOT cached here —
+ * they follow the selection, not the (graph, style) version, so the network caches them separately,
+ * keyed by the selection version (#240, `Network.noLodSelectedFor`).
  */
 export interface NoLodStyleCache {
   /** Which layer shape the cache is for (must match the current style to be reusable). */

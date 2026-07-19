@@ -308,6 +308,63 @@ describe("network instanced lane — in-place position update (#179 regression g
     net.destroy();
   });
 
+  it("selected flags are NOT re-uploaded per position frame — a selection change refreshes in place, a fresh registration re-seeds (#240)", async () => {
+    const N_NODES = 300;
+    const g = ringGraph(N_NODES);
+    const pos = ringPositions(N_NODES);
+
+    const net = network(host(), { width: 300, height: 300, backend: "webgl" });
+    await net.whenReady();
+    net.data(g).style({ nodeRadius: 4, linkStroke: "#3b82f6", linkWidth: 1 }).layout({ backend: "positions", positions: pos });
+    net.interactive({ selectable: true });
+    net.select("nodes", [1]); // an ACTIVE selection during the frames — the flags are non-trivial
+
+    // Spy the #162 `a_selected` buffer writes (bufferSubData) AFTER the initial emit + selection, so we
+    // count only per-position-frame uploads. (The #214 test above covers the group columns.)
+    type Writable = { write(a: ArrayBufferView): void };
+    type WithHl = { hl: { selected: Writable }; source: Writable };
+    const instanced = (net as unknown as { handle: { backend: { instanced: Map<string, WithHl> } } }).handle.backend.instanced;
+    const lines = instanced.get("links")!;
+    const nodes = instanced.get("nodes")!;
+    const srcSpy = vi.spyOn(lines.source, "write");
+    const lineSelSpy = vi.spyOn(lines.hl.selected, "write");
+    const nodeSelSpy = vi.spyOn(nodes.hl.selected, "write");
+
+    // N position-only frames with an UNCHANGED selection: the flag columns come from the #240
+    // selection-versioned cache — the SAME array instances — so their O(nodes)+O(edges) float
+    // conversion + upload is reference-skipped (0 re-uploads; pre-fix: one per layer per frame).
+    const N_FRAMES = 12;
+    for (let frame = 0; frame < N_FRAMES; frame++) tickPositions(net, N_NODES, frame);
+    expect(srcSpy.mock.calls.length).toBe(N_FRAMES); // sanity: the frames really emitted
+    expect(lineSelSpy.mock.calls.length).toBe(0); // per-edge selected flags: cached, never re-uploaded
+    expect(nodeSelSpy.mock.calls.length).toBe(0); // per-node selected flags: cached too
+
+    // A selection change refreshes the flags in place (writeSelected) — exactly then, not per frame:
+    // the fresh arrays it uploads are the ones later emits hand back, so the skip resumes immediately.
+    net.select("nodes", [2]);
+    const lineAfterSel = lineSelSpy.mock.calls.length;
+    const nodeAfterSel = nodeSelSpy.mock.calls.length;
+    expect(lineAfterSel).toBeGreaterThan(0); // flag buffer rewritten in place on the change
+    expect(nodeAfterSel).toBeGreaterThan(0);
+    for (let frame = 0; frame < 4; frame++) tickPositions(net, N_NODES, frame);
+    expect(lineSelSpy.mock.calls.length).toBe(lineAfterSel); // position frames skip again
+    expect(nodeSelSpy.mock.calls.length).toBe(nodeAfterSel);
+
+    // Fresh layer registration (backend recreates the link primitives — a backend/pick-model switch):
+    // the new buffer is seeded with the CURRENT flags at creation, position frames skip on it too, and
+    // the next selection change's first write still uploads (no stale skip on a fresh buffer).
+    net.pickLinks(true); // pick-model mismatch forces setInstancedLayer → fresh HighlightBuffers
+    const lines2 = instanced.get("links")!;
+    expect(lines2).not.toBe(lines); // really a fresh renderer object
+    const lineSelSpy2 = vi.spyOn(lines2.hl.selected, "write");
+    for (let frame = 0; frame < 4; frame++) tickPositions(net, N_NODES, frame);
+    expect(lineSelSpy2.mock.calls.length).toBe(0); // constructor seeded the flags — emits skip
+    net.select("nodes", [1]);
+    expect(lineSelSpy2.mock.calls.length).toBeGreaterThan(0); // first write after registration uploads
+
+    net.destroy();
+  });
+
   it("a genuine data() change fully rebuilds (new topology reaches the GPU)", async () => {
     const net = network(host(), { width: 300, height: 300, backend: "webgl" });
     await net.whenReady();
