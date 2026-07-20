@@ -309,7 +309,6 @@ export class InstancedCircles {
 export class InstancedPie {
   count: number;
   private _capacity: number;
-  private device: Device; // TEMP #247 acceptance-test injection — remove with the revert
   private model: Model;
   private corner: Buffer;
   private center: Buffer;
@@ -322,7 +321,6 @@ export class InstancedPie {
   constructor(device: Device, data: InstancedPieData, width = 0, height = 0) {
     this.count = data.count;
     this._capacity = data.count;
-    this.device = device; // TEMP #247 acceptance-test injection
     this.corner = device.createBuffer({ data: QUAD });
     this.center = device.createBuffer({ data: data.centers });
     this.radius = device.createBuffer({ data: data.radii });
@@ -368,10 +366,6 @@ export class InstancedPie {
   }
   setTransform(m: Float32Array): void {
     this.uniforms["u_transform"] = m;
-    // TEMP #247 acceptance-test injection: a deliberate per-frame GPU buffer rebuild.
-    // The browser perf tier's instanced-pie guard must catch this (deterministic
-    // allocation signature) and go red on CI. This commit gets reverted.
-    this.device.createBuffer({ data: new Float32Array(this.count) }).destroy();
   }
   setViewport(width: number, height: number): void {
     this.uniforms["u_viewport"] = [width, height];
