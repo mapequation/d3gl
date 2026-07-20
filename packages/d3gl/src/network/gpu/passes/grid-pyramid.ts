@@ -13,8 +13,10 @@ import { Model } from "@luma.gl/engine";
 //   level ℓ    = (G >> ℓ) × (G >> ℓ) cells, each summing its 2×2 children
 //   level L    = the 1×1 root, where L = log2(G)
 //
-// Each cell of level 0 holds (Σx, Σy, mass, 0) in rgba32float; unit mass means
-// mass = the node count in the cell and COM = (Σx/mass, Σy/mass). Coarser levels
+// Each cell of level 0 holds (Σx, Σy, mass, Σ|p−cellCenter|²) in rgba32float;
+// unit mass means mass = the node count in the cell and COM = (Σx/mass, Σy/mass).
+// The w channel is the occupants' second moment about the cell center, consumed
+// only at level 0 by the BH pass's near-field softening (#251). Coarser levels
 // sum the (Σx, Σy, mass) of their four children, so the root holds the totals
 // over all nodes — exactly the CPU BarnesHutTree's root mass/COM.
 //
@@ -87,7 +89,14 @@ void main() { o_box = v_box; }
 // Each node reads its position, maps it into the [0,G) cell grid from the AABB,
 // emits a point at that cell's clip-space center, and carries the NODE position
 // to the fragment so we accumulate Σ(node position) (not Σ(cell center)). The FS
-// writes (x, y, mass=1, 0); additive blend gives (Σx, Σy, mass, 0) per cell.
+// writes (x, y, mass=1, |p−cellCenter|²); additive blend gives
+// (Σx, Σy, mass, Σ|p−cellCenter|²) per cell. The w channel is the raw second
+// moment about the CELL CENTER — the BH traversal turns it into the cell's
+// second CENTRAL moment (σ² = w/m − |com − cellCenter|²) for the level-0
+// near-field softening (#251). Accumulating about the cell center (offsets
+// ≤ cellSize/√2) instead of the origin keeps the float32 blend-sum
+// well-conditioned; coarser levels sum w like the other channels, which is
+// meaningless across differing cell centers — only level 0 reads it.
 //
 // The bbox texel is (maxX, maxY, -minX, -minY). We recover min/max, then build a
 // SQUARE padded box centered on the AABB center — half = pad·max(halfX, halfY) —
@@ -105,6 +114,7 @@ uniform int   u_width;
 uniform int   u_grid;            // G (finest grid side)
 uniform float u_pad;             // box padding factor (e.g. 1.01)
 flat out vec2 v_pos;
+flat out float v_r2;
 void main() {
   int id = gl_VertexID;
   ivec2 c = ivec2(id % u_width, id / u_width);
@@ -128,6 +138,13 @@ void main() {
   gl_Position = vec4(clip, 0.0, 1.0);
   gl_PointSize = 1.0;
   v_pos = p;
+  // Second-moment channel (#251): squared offset from the cell center. The
+  // center uses the SAME expression the BH traversal uses to rebuild it, so a
+  // single-occupant cell's variance (w/m − |com − cellCenter|²) cancels
+  // exactly to 0.
+  vec2 cellCenter = lo + (cell + 0.5) / G * boxSide;
+  vec2 rel = p - cellCenter;
+  v_r2 = dot(rel, rel);
 }
 `;
 
@@ -135,10 +152,11 @@ const SCATTER_FS = /* glsl */ `\
 #version 300 es
 precision highp float;
 flat in vec2 v_pos;
+flat in float v_r2;
 out vec4 o_cell;
 void main() {
-  // (Σx, Σy, mass=1, 0). Additive blend accumulates per cell.
-  o_cell = vec4(v_pos, 1.0, 0.0);
+  // (Σx, Σy, mass=1, Σ|p−cellCenter|²). Additive blend accumulates per cell.
+  o_cell = vec4(v_pos, 1.0, v_r2);
 }
 `;
 

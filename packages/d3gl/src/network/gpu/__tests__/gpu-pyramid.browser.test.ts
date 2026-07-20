@@ -21,6 +21,7 @@ import { GridPyramid, chooseGrid } from "../passes/grid-pyramid.js";
 import { packPositionsTexture, readbackRgbaFbo } from "../textures.js";
 import { GpuForceLayout } from "../gpu-force-layout.js";
 import { buildGraph } from "../../graph.js";
+import { BarnesHutTree } from "../../quadtree.js";
 import type { LayoutGraph } from "../../force.js";
 
 /** DAMPING mirrored from gpu-force-layout.ts (private constant). */
@@ -316,5 +317,173 @@ describe("GPU Barnes-Hut pyramid repulsion — traversal correctness + perf (Ste
     fboSpy.mockRestore();
     texSpy.mockRestore();
     layout.destroy();
+  });
+});
+
+/** Build a LayoutGraph from explicit positions with a trivial ring edge list
+ *  (edges are irrelevant here — attraction is 0 in the repulsion probes). */
+function graphFromPositions(positions: Float32Array): LayoutGraph {
+  const count = positions.length / 2;
+  const src: number[] = [];
+  const tgt: number[] = [];
+  for (let i = 0; i < count; i++) {
+    src.push(i);
+    tgt.push((i + 1) % count);
+  }
+  const g = buildGraph({ nodeCount: count, source: src, target: tgt });
+  g.positions.set(positions);
+  return g;
+}
+
+describe("GPU pyramid level-0 near field — sub-cell clump probe (#251)", () => {
+  let device: Device;
+  beforeAll(async () => { device = await makeTestDevice(); });
+
+  // Shared probe geometry: 4 corner anchors pin the bbox to [-S, S]² so the
+  // padded square box — and therefore the finest-cell geometry — is known in
+  // closed form (same math as the scatter/traversal shaders: half = S·pad,
+  // boxSide = 2·S·pad, cellSize = boxSide / G).
+  const S = 2000;
+  const PAD = 1.01; // GridPyramid.pad
+  const G = 32;
+  const LO = -S * PAD;
+  const CELL = (2 * S * PAD) / G;
+
+  /**
+   * The #251 probe: a 100-node radius-2 clump placed at the centre of ONE
+   * finest cell of a G=32 pyramid, plus background nodes (rejection-sampled
+   * away from the clump's cell) so chooseGrid(count) = 32. The whole clump
+   * fits inside a single level-0 cell (radius 2 ≪ cellSize/2 ≈ 63), which the
+   * traversal force-accepts as one lumped COM at any distance.
+   */
+  function makeClumpProbe() {
+    const clumpCount = 100;
+    const clumpR = 2;
+    const backgroundCount = 496; // 4 anchors + 496 + 100 = 600 → chooseGrid = 32
+    const rng = makePrng(0x251251);
+
+    // Clump centre = centre of finest cell (20, 16).
+    const ccx = LO + (20 + 0.5) * CELL;
+    const ccy = LO + (16 + 0.5) * CELL;
+
+    const count = 4 + backgroundCount + clumpCount;
+    const positions = new Float32Array(count * 2);
+    let k = 0;
+    const put = (x: number, y: number): void => {
+      positions[k * 2] = x;
+      positions[k * 2 + 1] = y;
+      k++;
+    };
+    put(-S, -S); put(S, -S); put(-S, S); put(S, S);
+    while (k < 4 + backgroundCount) {
+      const x = (rng() * 2 - 1) * (S - 10);
+      const y = (rng() * 2 - 1) * (S - 10);
+      // Keep the clump's cell (and its immediate ring) free of bystanders so
+      // the probed cell holds exactly the clump.
+      if (Math.hypot(x - ccx, y - ccy) < 2 * CELL) continue;
+      put(x, y);
+    }
+    const clumpStart = k;
+    while (k < count) {
+      const r = clumpR * Math.sqrt(rng());
+      const a = 2 * Math.PI * rng();
+      put(ccx + r * Math.cos(a), ccy + r * Math.sin(a));
+    }
+    return { positions, clumpStart, clumpCount, count };
+  }
+
+  it("clump force stays within a small factor of CPU BH both ways (θ=0.9)", () => {
+    const { positions, clumpStart, clumpCount, count } = makeClumpProbe();
+    expect(chooseGrid(count)).toBe(G);
+    const g = graphFromPositions(positions);
+    const repulsion = 200;
+    const theta = 0.9;
+    const alpha = 1e-4; // stays far below the maxStep clamp; linear regime
+
+    // CPU BH reference: its adaptive quadtree resolves the clump members
+    // individually at the leaves (exact pairwise inside the clump).
+    const tree = new BarnesHutTree();
+    tree.build(g.positions, count);
+    const fx = new Float32Array(count);
+    const fy = new Float32Array(count);
+    for (let i = 0; i < count; i++) tree.applyForce(i, repulsion, theta, fx, fy);
+
+    const fGpu = repulsionForces(device, g, repulsion, theta, "pyramid", alpha);
+
+    let maxCpu = 0, maxGpu = 0, sumCpu = 0, sumGpu = 0;
+    for (let i = clumpStart; i < clumpStart + clumpCount; i++) {
+      const mc = Math.hypot(fx[i]!, fy[i]!);
+      const mg = Math.hypot(fGpu[i * 2]!, fGpu[i * 2 + 1]!);
+      if (mc > maxCpu) maxCpu = mc;
+      if (mg > maxGpu) maxGpu = mg;
+      sumCpu += mc;
+      sumGpu += mg;
+    }
+    const ratioMax = maxGpu / maxCpu;
+    const ratioMean = sumGpu / sumCpu;
+    console.log(
+      `  #251 clump probe: CPU max=${maxCpu.toFixed(0)} GPU max=${maxGpu.toFixed(0)} ` +
+      `ratioMax=${ratioMax.toFixed(2)} ratioMean=${ratioMean.toFixed(2)}`,
+    );
+
+    // The un-softened lumped-COM 1/d kernel overestimated the clump ~3× vs CPU
+    // BH (#251); the reverted cell-size resolution floor (#203) underestimated
+    // it ~50×. The second-moment (mass/extent-aware) softening must stay
+    // within a small factor BOTH ways.
+    expect(ratioMax).toBeLessThanOrEqual(1.5);
+    expect(ratioMax).toBeGreaterThanOrEqual(0.3);
+  });
+
+  it("well-separated regime (≤1 node/cell) is untouched: θ=0 forced level-0 accepts match all-pairs", () => {
+    // One node per finest cell. θ=0 rejects every θ-acceptance, so the
+    // traversal descends to level 0 and force-accepts EVERY occupied cell —
+    // exactly the branch #251 modifies. With single occupants the cell's
+    // second moment is exactly 0 (ε(1) = 0), so the level-0 term must remain
+    // the plain point kernel and the field must equal the exact all-pairs
+    // field up to float summation order.
+    const rng = makePrng(0x977abc);
+    const count = 600; // chooseGrid(600) = 32
+    expect(chooseGrid(count)).toBe(G);
+
+    const positions = new Float32Array(count * 2);
+    positions.set([-S, -S, S, -S, -S, S, S, S]); // corner anchors pin the bbox
+    const cells: Array<[number, number]> = [];
+    for (let cy = 0; cy < G; cy++) for (let cx = 0; cx < G; cx++) cells.push([cx, cy]);
+    for (let i = cells.length - 1; i > 0; i--) {
+      const j = Math.floor(rng() * (i + 1));
+      const t = cells[i]!;
+      cells[i] = cells[j]!;
+      cells[j] = t;
+    }
+    const isCornerCell = (cx: number, cy: number): boolean =>
+      (cx === 0 || cx === G - 1) && (cy === 0 || cy === G - 1);
+    let k = 4;
+    for (const [cx, cy] of cells) {
+      if (k >= count) break;
+      if (isCornerCell(cx, cy)) continue; // the anchors already occupy these
+      // Jitter ≪ cellSize/2 so nothing straddles a cell boundary.
+      positions[k * 2] = LO + (cx + 0.5) * CELL + (rng() - 0.5) * CELL * 0.4;
+      positions[k * 2 + 1] = LO + (cy + 0.5) * CELL + (rng() - 0.5) * CELL * 0.4;
+      k++;
+    }
+    const g = graphFromPositions(positions);
+    const alpha = 1e-4;
+
+    const fExact = repulsionForces(device, g, 200, 0, "allpairs", alpha);
+    const fBH = repulsionForces(device, g, 200, 0, "pyramid", alpha);
+
+    let num = 0, den = 0;
+    for (let i = 0; i < count * 2; i++) {
+      const e = fBH[i]! - fExact[i]!;
+      num += e * e;
+      den += fExact[i]! * fExact[i]!;
+    }
+    const relL2 = Math.sqrt(num / den);
+    console.log(`  #251 well-separated θ=0: relL2 vs all-pairs = ${relL2.toExponential(2)}`);
+
+    // Pure float noise (summation order) is ≪ 1e-4; any softening leak into
+    // single-occupant cells (ε(1) ≠ 0) would register orders of magnitude
+    // above this (a cell-size floor shifts near-cell terms by ~50%).
+    expect(relL2).toBeLessThan(1e-4);
   });
 });
