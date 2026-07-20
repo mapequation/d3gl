@@ -104,6 +104,8 @@ jobs:
         run: node scripts/run-browser-perf-tier.mjs
         env:
           # Wall-clock multiplier vs local headless Chromium, calibrated from observed
-          # runner timings (SwiftShader + shared-runner CPU). Raise if the tier flakes
-          # on timing; the deterministic signatures are unaffected either way.
-          PERF_BUDGET_SCALE: "8"
+          # runner timings (2026-07, PR #256: SwiftShader-on-ubuntu measured 1.3-2.5x
+          # local across the guards; 4 = worst observed factor + noisy-neighbor
+          # margin). Raise if the tier flakes on timing; the deterministic signatures
+          # are unaffected either way.
+          PERF_BUDGET_SCALE: "4"
