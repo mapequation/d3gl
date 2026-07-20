@@ -5,6 +5,7 @@ import { webgl2Adapter } from "@luma.gl/webgl";
 import { InstancedPie } from "../instanced.js";
 import { clipFromView } from "../index.js";
 import type { InstancedPieData } from "../../core/index.js";
+import { perfBudget } from "../../__tests__/perf-budget.js";
 
 /**
  * Per-frame regression guard for the pie glyph (#171). The pie rides the instanced lane like circles:
@@ -85,7 +86,7 @@ describe("InstancedPie per-frame cost (#171)", () => {
     // (1) Deterministic signature: NOT ONE buffer created during the sweep (no per-frame rebuild).
     expect(created).toBe(builtAllocations);
     // (2) Frame budget: generous ceiling (a per-frame 100k-instance buffer rebuild would blow past this).
-    expect(elapsed / FRAMES).toBeLessThan(50);
+    expect(elapsed / FRAMES).toBeLessThan(perfBudget(50));
 
     // In-place update() at the SAME count must sub-upload, not reallocate.
     const before = created;

@@ -1,6 +1,7 @@
 import { describe, it, expect } from "vitest";
 import { Scene } from "../core/index.js";
 import { MapController } from "./controller.js";
+import { perfBudget } from "../__tests__/perf-budget.js";
 
 const W = 256;
 const H = 256;
@@ -56,9 +57,9 @@ describe("performance budget", () => {
     // under a fraction of buildMs — this enforces the recolor-<<-build invariant
     // even on fast hardware (where buildMs itself is small). The small absolute
     // floor (5ms) only absorbs timer noise; it never lets recolor approach build.
-    expect(recolorMs).toBeLessThan(Math.max(buildMs * 0.25, 5));
+    expect(recolorMs).toBeLessThan(Math.max(buildMs * 0.25, perfBudget(5)));
     // Gross-regression ceiling regardless of build cost.
-    expect(recolorMs).toBeLessThan(250);
+    expect(recolorMs).toBeLessThan(perfBudget(250));
 
     // Correctness: the final recolor actually took effect.
     const px = controller.readPixel(4, 4);

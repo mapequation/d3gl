@@ -63,3 +63,47 @@ jobs:
         run: node scripts/run-perf-tier.mjs
         env:
           PERF_N: "500000"
+
+  # Browser perf-guard tier (#247): every *-perf.browser.test.ts per-frame guard, run
+  # headless in Playwright Chromium (SwiftShader software GL on these runners) — the
+  # GPU-path regressions the node tier can't see. Discovery is pattern-driven (see
+  # scripts/run-browser-perf-tier.mjs), so guards added by future PRs are enrolled
+  # automatically on merge — no workflow edit needed. Expected runtime ~5-10 min.
+  #
+  # ADVISORY: continue-on-error keeps a red tier from failing the CI workflow run, and
+  # the job must NOT be added to branch protection while its SwiftShader budgets are
+  # young. PERF_BUDGET_SCALE multiplies the guards' locally-calibrated wall-clock
+  # ceilings and test timeouts for the slower software-GL runners (deterministic
+  # allocation/call-count assertions never scale — those stay exact everywhere).
+  # Promote it later — once it has a flake-free record — by deleting the
+  # continue-on-error line, then (optionally) adding "perf-browser" to the required
+  # status checks alongside "policy".
+  perf-browser:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v6
+
+      - name: Set up Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Install Playwright Chromium
+        run: pnpm --filter @mapequation/d3gl exec playwright install --with-deps chromium
+
+      - name: Browser perf guards (headless Chromium, software GL)
+        run: node scripts/run-browser-perf-tier.mjs
+        env:
+          # Wall-clock multiplier vs local headless Chromium, calibrated from observed
+          # runner timings (SwiftShader + shared-runner CPU). Raise if the tier flakes
+          # on timing; the deterministic signatures are unaffected either way.
+          PERF_BUDGET_SCALE: "8"
