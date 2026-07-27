@@ -281,53 +281,103 @@ export function buildSuperEdges(
   const depth = new Int32Array(size);
   for (let g = size - 2; g >= 0; g--) depth[g] = depth[parent[g]!]! + 1;
 
-  const flowByPair = new Map<number, number>();
+  // Aggregate the directed pairs with a flat typed-array counting sort instead of a
+  // `Map<number, number>` keyed by `a * size + b` (#177). V8 caps a Map at 2²⁴ entries, and a ~1M-leaf
+  // hierarchy produces more distinct (ancestor-a, ancestor-b) pairs than that summed over its levels —
+  // `.set()` threw `RangeError: Map maximum size exceeded` and LOD init died before the first frame.
+  // `coarsen.ts` `coarsenLevel` already solved exactly this the same way. Bucket every contribution by
+  // its source `a` (pass 1 counts, pass 2 scatters), then sum duplicates within each bucket via a
+  // per-`a` mark. No hashing, no boxing, no composite key, and no entry ceiling.
   const m = edges.source.length;
+
+  // Pass 1 — contributions per source ancestor. Walking the chains twice (count, then scatter) is
+  // still cheaper than one walk through a Map: every step here is a typed-array increment.
+  const outDeg = new Uint32Array(size);
+  let contributions = 0;
   for (let e = 0; e < m; e++) {
     let a = edges.source[e]!;
     let b = edges.target[e]!;
     if (a === b) continue; // self-loop
-    const w = edges.weight[e]!;
     while (depth[a]! > depth[b]!) a = parent[a]!;
     while (depth[b]! > depth[a]!) b = parent[b]!;
     while (a !== b) {
-      const key = a * size + b;
-      flowByPair.set(key, (flowByPair.get(key) ?? 0) + w);
+      outDeg[a] = outDeg[a]! + 1;
+      contributions++;
       a = parent[a]!;
       b = parent[b]!;
     }
   }
 
-  const superEdgeOffset = new Uint32Array(size + 1);
-  for (const key of flowByPair.keys()) superEdgeOffset[Math.floor(key / size) + 1]!++;
-  for (let g = 0; g < size; g++) superEdgeOffset[g + 1] = superEdgeOffset[g + 1]! + superEdgeOffset[g]!;
-  const total = superEdgeOffset[size]!;
-  const superEdgeTarget = new Uint32Array(total);
-  const superEdgeFlow = new Float32Array(total);
-  const cursor = superEdgeOffset.slice(0, size);
-  for (const [key, flow] of flowByPair) {
-    const a = Math.floor(key / size);
-    const pos = cursor[a]!;
-    superEdgeTarget[pos] = key - a * size;
-    superEdgeFlow[pos] = flow;
-    cursor[a] = pos + 1;
+  const bucketOffset = new Uint32Array(size + 1);
+  for (let g = 0; g < size; g++) bucketOffset[g + 1] = bucketOffset[g]! + outDeg[g]!;
+  // Duplicates included; compacted in place by pass 3, so these double as the output arrays.
+  const bucketTarget = new Uint32Array(contributions);
+  const bucketFlow = new Float32Array(contributions);
+  const cursor = bucketOffset.slice(0, size);
+
+  // Pass 2 — scatter each contribution into its source's bucket.
+  for (let e = 0; e < m; e++) {
+    let a = edges.source[e]!;
+    let b = edges.target[e]!;
+    if (a === b) continue;
+    const w = edges.weight[e]!;
+    while (depth[a]! > depth[b]!) a = parent[a]!;
+    while (depth[b]! > depth[a]!) b = parent[b]!;
+    while (a !== b) {
+      const p = cursor[a]!;
+      cursor[a] = p + 1;
+      bucketTarget[p] = b;
+      bucketFlow[p] = w;
+      a = parent[a]!;
+      b = parent[b]!;
+    }
   }
+
+  // Pass 3 — sum duplicates within each bucket. `mark[b] === a` means "b already emitted in a's row".
+  // Compacts in place: the write cursor `w` never overtakes the read cursor `p` (w <= p always), and
+  // both entries are read before the write, so the deduped rows overwrite the bucket arrays safely.
+  const superEdgeOffset = new Uint32Array(size + 1);
+  const mark = new Int32Array(size).fill(-1);
+  const slot = new Uint32Array(size);
+  let w = 0;
+  for (let a = 0; a < size; a++) {
+    for (let p = bucketOffset[a]!; p < bucketOffset[a + 1]!; p++) {
+      const b = bucketTarget[p]!;
+      const flow = bucketFlow[p]!;
+      if (mark[b] !== a) {
+        mark[b] = a;
+        slot[b] = w;
+        bucketTarget[w] = b;
+        bucketFlow[w] = flow;
+        w++;
+      } else {
+        const at = slot[b]!;
+        bucketFlow[at] = bucketFlow[at]! + flow;
+      }
+    }
+    superEdgeOffset[a + 1] = w;
+  }
+  const total = w;
+  // Exact-size copies so the oversized (duplicate-inclusive) buffers can be collected.
+  const superEdgeTarget = bucketTarget.slice(0, total);
+  const superEdgeFlow = bucketFlow.slice(0, total);
 
   // Transpose: the same pairs grouped by *target*, so a visible node can find its incoming edges
   // (whose source may be off-screen) without scanning off-screen sources' out-lists.
   const superEdgeInOffset = new Uint32Array(size + 1);
-  for (const key of flowByPair.keys()) superEdgeInOffset[(key % size) + 1]!++; // b = key % size
+  for (let i = 0; i < total; i++) superEdgeInOffset[superEdgeTarget[i]! + 1]!++;
   for (let g = 0; g < size; g++) superEdgeInOffset[g + 1] = superEdgeInOffset[g + 1]! + superEdgeInOffset[g]!;
   const superEdgeInSource = new Uint32Array(total);
   const superEdgeInFlow = new Float32Array(total);
   const inCursor = superEdgeInOffset.slice(0, size);
-  for (const [key, flow] of flowByPair) {
-    const a = Math.floor(key / size);
-    const b = key - a * size;
-    const pos = inCursor[b]!;
-    superEdgeInSource[pos] = a;
-    superEdgeInFlow[pos] = flow;
-    inCursor[b] = pos + 1;
+  for (let a = 0; a < size; a++) {
+    for (let p = superEdgeOffset[a]!; p < superEdgeOffset[a + 1]!; p++) {
+      const b = superEdgeTarget[p]!;
+      const pos = inCursor[b]!;
+      superEdgeInSource[pos] = a;
+      superEdgeInFlow[pos] = superEdgeFlow[p]!;
+      inCursor[b] = pos + 1;
+    }
   }
   return { superEdgeOffset, superEdgeTarget, superEdgeFlow, superEdgeInOffset, superEdgeInSource, superEdgeInFlow };
 }
