@@ -30,6 +30,13 @@ import { buildGraph, type NetworkGraph } from "../graph.js";
 const BENCH = !!process.env.BENCH_DRAG;
 const BENCH_N = Number(process.env.BENCH_DRAG_NODES) || 1_000_000;
 const OUT = "/tmp/lod-drag-perf.txt";
+// The at-scale leg gates rather than only reporting (#258). Calibration at N=500k on an M-series
+// laptop: BEFORE (full pass per move) ~307ms, AFTER (incremental) 0.001ms held=1 / 0.056ms held=100
+// — a >5000× gap, so a 100× floor is far clear of noise while still catching a collapse back to
+// the full pass. Node-drag is a continuous pointer interaction: AGENTS §5 treats it as per-frame.
+const ASSERT = !!process.env.PERF_ASSERT;
+const MOVE_MS = Number(process.env.PERF_DRAG_MOVE_MS) || 5;
+const MIN_SPEEDUP = Number(process.env.PERF_DRAG_MIN_SPEEDUP) || 100;
 
 /** A clustered graph (ring backbone + deterministic short-range chords) laid out by the real
  *  multilevel seed, coarsened into the real LOD tree — the fixture shape of `lod-perf.bench.test.ts`,
@@ -208,7 +215,7 @@ describe("#211 drag-move LOD geometry bench (env-gated)", () => {
       const gc = (globalThis as { gc?: () => void }).gc;
       const lines: string[] = [`\n=== #211 drag bench  N=${BENCH_N.toLocaleString()}  tree=${tree.size.toLocaleString()} nodes  depth=${tree.levelCount} ===`];
 
-      const measure = (label: string, heldCount: number, move: (held: number[]) => void): void => {
+      const measure = (label: string, heldCount: number, move: (held: number[]) => void): number => {
         const held = Array.from({ length: heldCount }, (_, k) => k * 37);
         const ts: number[] = [];
         gc?.();
@@ -224,22 +231,40 @@ describe("#211 drag-move LOD geometry bench (env-gated)", () => {
         }
         const h1 = process.memoryUsage().heapUsed;
         const s = [...ts].sort((a, b) => a - b);
+        const median = s[Math.floor(s.length / 2)] ?? 0;
+        const p95 = s[Math.floor(s.length * 0.95)] ?? 0;
         lines.push(
-          `${label.padEnd(18)} held=${String(heldCount).padStart(3)}  median=${s[Math.floor(s.length / 2)]!.toFixed(3).padStart(10)}ms  p95=${s[Math.floor(s.length * 0.95)]!.toFixed(3).padStart(10)}ms  heapΔ=${((h1 - h0) / 1e6).toFixed(1)}MB/50moves`,
+          `${label.padEnd(18)} held=${String(heldCount).padStart(3)}  median=${median.toFixed(3).padStart(10)}ms  p95=${p95.toFixed(3).padStart(10)}ms  heapΔ=${((h1 - h0) / 1e6).toFixed(1)}MB/50moves`,
         );
+        return median;
       };
 
+      /** (held-node count, full-pass median, incremental median) per regime — the ratio is the guard. */
+      const regimes: { heldCount: number; before: number; after: number }[] = [];
       for (const heldCount of [1, 100]) {
-        measure("BEFORE full/move", heldCount, () => {
+        const before = measure("BEFORE full/move", heldCount, () => {
           computeLODPositions(tree, graph.positions);
           computeLODStyle(tree, radii, graph.strength, undefined, colors);
         });
-        measure("AFTER incr/move", heldCount, (held) => updateLODPositionsForLeaves(tree, graph.positions, held, parent));
+        const after = measure("AFTER incr/move", heldCount, (held) => updateLODPositionsForLeaves(tree, graph.positions, held, parent));
+        regimes.push({ heldCount, before, after });
       }
 
       const block = lines.join("\n") + "\n";
       console.log(block);
       appendFileSync(OUT, block);
+
+      for (const { heldCount, before, after } of regimes) {
+        // --- signature (always): the incremental path must stay orders below a full pass. -----
+        expect(
+          before / after,
+          `held=${heldCount}: incremental ${after.toFixed(3)}ms vs full pass ${before.toFixed(1)}ms — only ${(before / after).toFixed(0)}× faster`,
+        ).toBeGreaterThan(MIN_SPEEDUP);
+        // --- wall-clock (uncontended runs only) ----------------------------------------------
+        if (ASSERT) {
+          expect(after, `held=${heldCount}: ${after.toFixed(3)}ms per pointer-move exceeds ${MOVE_MS}ms at N=${BENCH_N}`).toBeLessThan(MOVE_MS);
+        }
+      }
     },
     600_000,
   );

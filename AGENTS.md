@@ -307,6 +307,46 @@ git -C <primary> checkout -- <files>                         # restore primary t
   `packages/d3gl/src/__tests__/perf-budget.ts` — never loosen a local budget for
   CI's sake, and never scale a deterministic (count/pixel) assertion.
 
+### Perf-guard coverage map (#258 — check here before claiming a cell is covered)
+
+Which guard covers which §5 cell. **A cell that runs but asserts nothing is not covered** — that
+was the #258 finding: 6 of the node benches printed numbers at `PERF_N` and gated on nothing but the
+per-file timeout. Every at-scale leg below now asserts. When you add a guard, add its row.
+
+| path | backend | guard | always-on | at-scale (CI `perf`, `PERF_N`) |
+|---|---|---|---|---|
+| plot points, full detail | Canvas | `canvas/__tests__/canvas-zoom-sweep-perf.test.ts` | 100k | `BENCH_CANVAS_SWEEP` |
+| plot points, retained DOM | SVG | `svg/__tests__/svg-zoom-sweep-perf.test.ts` | 100k | `BENCH_SVG_SWEEP` |
+| geo polygons + clip | Canvas | `geo/__tests__/geo-zoom-sweep-perf.test.ts` | ~15k cells | `BENCH_GEO_SWEEP` |
+| geoMap append | — | `map/__tests__/append-scaling-perf.test.ts` | O(new) delta | — |
+| plot declutter `select()` | — | `map/__tests__/points-lane-scratch-perf.test.ts` | 1M | — |
+| plot points lane sweep | — | `map/__tests__/points-lane-perf.bench.test.ts` | — | `BENCH_POINTS` |
+| hover pick (interaction) | — | `core/__tests__/hit-test-grid-perf.test.ts` | 1M, world+screen | `BENCH_HIT` (`core/hit-test.bench.test.ts`) |
+| network LOD cut + declutter | — | `network/__tests__/frontier-perf.test.ts` | 100k, **all-leaves frontier** | `BENCH_FRONTIER` |
+| network LOD super-edges | — | `network/__tests__/super-edges-perf.test.ts` | 100k + all-leaves | `BENCH_SUPER_EDGES` (+ all-leaves) |
+| network LOD end-to-end | — | `network/__tests__/lod-perf.bench.test.ts` | — | `BENCH_LOD` |
+| network no-LOD labels | — | `network/__tests__/label-candidates-perf.test.ts` | 100k | `BENCH_LABEL_CANDIDATES` |
+| network selection dim | — | `network/__tests__/selection-dim-perf.test.ts` | 100k | — |
+| node-drag (interaction) | — | `network/__tests__/lod-drag-incremental-perf.test.ts` | small | `BENCH_DRAG` |
+| LOD super-edge **build** | — | `network/__tests__/super-edges-build.test.ts` | equivalence | `BENCH_SUPER_EDGES_BUILD` |
+| retained memory | — | `core/point-memory.bench.test.ts` | — | `BENCH_MEM` |
+| declutter allocation | — | `core/declutter-alloc.bench.test.ts` | — | — |
+| plot lane, per-frame | **WebGL** | `map/plot-points-perf.browser.test.ts` | 5k | ✗ **no scale knob** |
+| declutter flags upload | **WebGL** | `map/declutter-flags-perf.browser.test.ts` | 2k engine / 1M fn | ✗ |
+| hover overlay reuse | **WebGL** | `map/hover-overlay-perf.browser.test.ts` | 100 glyphs | ✗ |
+| instanced pie | **WebGL** | `webgl/__tests__/instanced-pie-perf.browser.test.ts` | 100k | ✗ |
+| GPU layout tick | **WebGL** | `network/gpu/__tests__/gpu-frame-budget-perf.browser.test.ts` | 30k | ✗ |
+
+**Known holes, tracked:** WebGL guards take no scale variable and their tier is advisory, so the
+default backend is the least-gated path; the at-scale legs drive **backends**, not engines, so the
+layer above the backend seam (accessors, lane emit, LOD integration) is only covered at N ≤ 5000;
+geo's at-scale leg is Canvas-only. Don't read a green tier as "WebGL is fast at 1M".
+
+**Writing an at-scale leg:** gate it `BENCH_<NAME>`, read its size from `BENCH_<NAME>_N` (the tier
+sets it to `$PERF_N` — do **not** hard-code, two benches used to and silently ignored the tier),
+assert the deterministic signature *unconditionally*, and put the wall-clock ceiling behind
+`PERF_ASSERT` with an env override. See `frontier-perf.test.ts` for the shape.
+
 ## Backend compositing equivalence (READ before touching the WebGL renderer)
 
 WebGL, Canvas, and SVG must composite a layer **identically**. The reference is the

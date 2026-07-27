@@ -1,4 +1,4 @@
-import { describe, it } from "vitest";
+import { describe, it, expect } from "vitest";
 import { appendFileSync } from "node:fs";
 import { declutterPointsStrategy } from "../points-lane.js";
 
@@ -23,6 +23,11 @@ const RUN = !!process.env.BENCH_POINTS;
 const N = Number(process.env.BENCH_POINTS_N) || 1_000_000;
 const LABEL = process.env.BENCH_POINTS_LABEL ?? "run";
 const OUT = "/tmp/points-lane-perf.txt";
+// The at-scale leg gates rather than only reporting (#258). Calibration at N=500k on an M-series
+// laptop: median 10.4ms (p95 26.4ms), arrayBuffers Δ 0.00MB over the whole sweep.
+const ASSERT = !!process.env.PERF_ASSERT;
+const FRAME_MS = Number(process.env.PERF_POINTS_FRAME_MS) || 150;
+const ALLOC_KB_PER_FRAME = Number(process.env.PERF_POINTS_ALLOC_KB) || 64;
 const W = 1280;
 const H = 800;
 const FRAMES = 24;
@@ -85,6 +90,17 @@ describe("points-lane select() per-frame performance (#217)", () => {
         `≈${(allocPerFrame / 1024).toFixed(1)}KB/frame\n`;
       console.log(block);
       appendFileSync(OUT, block);
+
+      // --- signatures (always, whenever the bench runs) --------------------------------------
+      // The sweep must actually reach a near-N visible set at its widest — otherwise it is
+      // measuring a cheap zoomed-in frame and the at-scale claim is hollow (AGENTS §5).
+      expect(maxKept, `widest frame kept only ${maxKept.toLocaleString()} of ${N.toLocaleString()} points`).toBeGreaterThan(N * 0.9);
+      // Allocation-free steady state — the #217 scratch-reuse guarantee, at scale.
+      expect(allocPerFrame / 1024, `${(allocPerFrame / 1024).toFixed(1)}KB/frame of typed-array growth in select()`).toBeLessThan(ALLOC_KB_PER_FRAME);
+      // --- wall-clock (uncontended runs only) ------------------------------------------------
+      if (ASSERT) {
+        expect(median, `median ${median.toFixed(1)}ms/frame exceeds ${FRAME_MS}ms at N=${N}`).toBeLessThan(FRAME_MS);
+      }
     },
     600_000,
   );

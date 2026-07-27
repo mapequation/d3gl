@@ -28,6 +28,16 @@ import { buildGraph } from "../graph.js";
  */
 const BENCH = !!process.env.BENCH_SUPER_EDGES;
 const BENCH_N = Number(process.env.BENCH_SUPER_EDGES_NODES) || 1_000_000;
+// The at-scale leg gates rather than only reporting (#258). Signatures assert whenever the bench
+// runs; wall-clock only under PERF_ASSERT (the single-threaded CI tier), per lod-perf.bench.test.ts.
+// Calibration at N=500k on an M-series laptop: sweep median 0.19-0.34ms (p95 0.67-1.48ms);
+// abDelta ~32 KB/frame. The everything-visible frontier is measured separately — the zoom sweep
+// alone only reaches a ~1.4k frontier even at 500k leaves, so on its own it would leave the
+// reductions-ON at-scale case (AGENTS §5) unmeasured here.
+const ASSERT = !!process.env.PERF_ASSERT;
+const SWEEP_FRAME_MS = Number(process.env.PERF_SUPER_EDGES_MS) || 20;
+const ALL_FRONTIER_MS = Number(process.env.PERF_SUPER_EDGES_ALL_MS) || 3000;
+const ALLOC_KB_PER_FRAME = Number(process.env.PERF_SUPER_EDGES_ALLOC_KB) || 256;
 const W = 1280;
 const H = 800;
 
@@ -205,6 +215,37 @@ describe("#210 superEdges per-frame cost", () => {
           `abDelta=${perFrameKB(m0.arrayBuffers, m1.arrayBuffers)}KB/frame${gc ? "" : " (no --expose-gc; rough)"}\n`;
         console.log(line);
         appendFileSync("/tmp/super-edges-perf.txt", `[${process.env.BENCH_SUPER_EDGES_LABEL ?? "run"}] ${line}`);
+
+        if (gc) {
+          const abKB = (m1.arrayBuffers - m0.arrayBuffers) / frames.length / 1024;
+          expect(abKB, `crossLevel=${crossLevelEdges}: ${abKB.toFixed(1)}KB/frame of typed-array growth`).toBeLessThan(ALLOC_KB_PER_FRAME);
+        }
+        if (ASSERT) {
+          expect(median, `crossLevel=${crossLevelEdges}: median ${median.toFixed(2)}ms exceeds ${SWEEP_FRAME_MS}ms at N=${BENCH_N}`).toBeLessThan(SWEEP_FRAME_MS);
+        }
+      }
+
+      // Everything-visible frontier at scale: ALL leaves at once. The zoom sweep above tops out at a
+      // ~1.4k frontier even at 500k leaves, so without this the at-scale leg never exercises the
+      // reductions-ON large-visible-set case that AGENTS §5 makes the primary goal. The always-on leg
+      // does this at 100k; this is the same shape at BENCH_N.
+      const allLeaves = new Uint32Array(tree.leafCount);
+      for (let i = 0; i < tree.leafCount; i++) allLeaves[i] = i;
+      const wide = { minX: -1e9, maxX: 1e9, minY: -1e9, maxY: 1e9 };
+      const allScratch = makeSuperEdgesScratch();
+      superEdges(tree, allLeaves, { ...SE_STYLE, crossLevelEdges: true }, wide, allScratch); // warm
+      const a0 = performance.now();
+      const outAll = superEdges(tree, allLeaves, { ...SE_STYLE, crossLevelEdges: true }, wide, allScratch);
+      const allMs = performance.now() - a0;
+      const allLine = `all-leaves frontier  leaves=${tree.leafCount.toLocaleString()}  edges=${outAll.ids.length.toLocaleString()}  ${allMs.toFixed(1)}ms\n`;
+      console.log(allLine);
+      appendFileSync("/tmp/super-edges-perf.txt", `[${process.env.BENCH_SUPER_EDGES_LABEL ?? "run"}] ${allLine}`);
+
+      // Signature: the frontier really was every leaf, and it really drew super-edges over it.
+      expect(allLeaves.length).toBe(tree.leafCount);
+      expect(outAll.ids.length, "all-leaves frontier drew no super-edges").toBeGreaterThan(tree.leafCount);
+      if (ASSERT) {
+        expect(allMs, `all-leaves frontier ${allMs.toFixed(0)}ms exceeds ${ALL_FRONTIER_MS}ms at N=${BENCH_N}`).toBeLessThan(ALL_FRONTIER_MS);
       }
       expect(frames.length).toBe(24);
     },
