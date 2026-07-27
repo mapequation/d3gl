@@ -267,6 +267,18 @@ git -C <primary> checkout -- <files>                         # restore primary t
 ## Tests
 
 - Node unit tests: `pnpm test` (root vitest, node env; excludes `*.browser.test.ts`).
+- **The node run is two sequential groups** (`vitest.config.ts` `projects`, #257): **`unit`**
+  (everything else, parallel) then **`perf`** — the wall-clock guards, running **alone and one file
+  at a time** (`sequence.groupOrder: 1` + `fileParallelism: false`). The guards' ceilings are
+  calibrated for an *uncontended* run; sharing the pool inflated this repo's test time 4.2× (14.1s
+  serial vs 58.7s parallel) and tripped budgets at random — four sessions chased that ghost before
+  it was pinned as contention. **Never merge the two groups back**, and never loosen a ceiling to
+  make a parallel run pass. Enrolment is **pattern-driven**: a node test named `*-perf.test.ts` or
+  `*.bench.test.ts` under `packages/*/src` joins the serial group automatically — **name every new
+  wall-clock guard that way** (a guard left outside the pattern silently runs contended). The perf
+  group also gets `testTimeout: 120_000`: these build 100k-1M-element fixtures and vitest's 5s
+  default is a harness limit, not a budget. Wall-clock ceilings themselves stay exactly as
+  calibrated — a **timeout** may be raised for a slow machine, a **budget** may not.
 - **Browser tests** (`*.browser.test.ts`): run with `pnpm --filter @mapequation/d3gl
   test:browser` (headless Chromium via `@vitest/browser-playwright`; pass a
   package-relative path to target one file). They run reliably and are part of TDD —
