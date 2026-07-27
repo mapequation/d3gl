@@ -54,11 +54,25 @@ export function declutterScreen(
   ignore?: (i: number, j: number) => boolean,
   winners?: Int32Array,
 ): Uint8Array {
-  const radAt = typeof radius === "number" ? (_i: number) => radius : (i: number) => radius[i]!;
+  // Branch once on the radius form and run a fully specialized loop per form (#233). Two V8
+  // pitfalls make anything less allocate O(count + collision tests) transient HeapNumbers
+  // (~40 MB/call at count = 300k, churned by every per-frame caller):
+  //   1. reading through a `radAt` closure — each call returns a fresh non-Smi double across a
+  //      non-inlined call boundary, which must be boxed;
+  //   2. a mixed-representation ternary (`radii ? radii[i] : uniformR`) inside a shared loop —
+  //      the phi forces the float64 array load to a tagged value, boxing one double per read
+  //      even when the call is monomorphic (measured with the sampling heap profiler).
+  // Direct monomorphic indexed reads inside per-form loops keep the doubles unboxed in registers.
+  const radii = typeof radius === "number" ? undefined : radius;
+  const uniformR = typeof radius === "number" ? radius : 0;
   let maxR = 1;
-  for (let i = 0; i < count; i++) {
-    const r = radAt(i);
-    if (r > maxR) maxR = r;
+  if (radii) {
+    for (let i = 0; i < count; i++) {
+      const r = radii[i]!;
+      if (r > maxR) maxR = r;
+    }
+  } else if (count > 0 && uniformR > maxR) {
+    maxR = uniformR;
   }
 
   // Cell = the largest possible exclusion threshold (2·spacing·maxR), so any colliding pair lands in
@@ -73,46 +87,96 @@ export function declutterScreen(
   const next = scratch.next;
   head.fill(-1, 0, nCells);
 
-  for (let oi = 0; oi < count; oi++) {
-    const i = order ? order[oi]! : oi;
-    const x = sx[i]!;
-    const y = sy[i]!;
-    const r = radAt(i);
-    if (x < 0 || y < 0 || x > width || y > height) {
-      out[i] = 1; // off-screen centre ⇒ keep, and don't insert (so it can't occlude on-screen glyphs)
-      if (winners) winners[i] = i; // a kept glyph represents itself
-      continue;
-    }
-    let cx = Math.floor(x / cell) + 1;
-    let cy = Math.floor(y / cell) + 1;
-    cx = cx < 0 ? 0 : cx >= cols ? cols - 1 : cx;
-    cy = cy < 0 ? 0 : cy >= rows ? rows - 1 : cy;
-    let occluded = false;
-    for (let gx = cx - 1; gx <= cx + 1 && !occluded; gx++) {
-      if (gx < 0 || gx >= cols) continue;
-      for (let gy = cy - 1; gy <= cy + 1 && !occluded; gy++) {
-        if (gy < 0 || gy >= rows) continue;
-        for (let p = head[gy * cols + gx]!; p !== -1; p = next[p]!) {
-          const dx = sx[p]! - x;
-          const dy = sy[p]! - y;
-          const thresh = spacing * (r + radAt(p)); // circles must not overlap
-          if (dx * dx + dy * dy < thresh * thresh) {
-            if (ignore && ignore(i, p)) continue; // e.g. a cross-fading glyph ignores its ancestor
-            occluded = true;
-            if (winners) winners[i] = p; // absorbed under the kept glyph that occluded it
-            break;
+  // The two loops below are identical except for how the exclusion radius is read — keep them in
+  // sync (the byte-identity test in declutter-alloc.bench.test.ts compares both against a reference).
+  if (radii) {
+    // Per-glyph radius (the network LOD frontier shape).
+    for (let oi = 0; oi < count; oi++) {
+      const i = order ? order[oi]! : oi;
+      const x = sx[i]!;
+      const y = sy[i]!;
+      const r = radii[i]!;
+      if (x < 0 || y < 0 || x > width || y > height) {
+        out[i] = 1; // off-screen centre ⇒ keep, and don't insert (so it can't occlude on-screen glyphs)
+        if (winners) winners[i] = i; // a kept glyph represents itself
+        continue;
+      }
+      let cx = Math.floor(x / cell) + 1;
+      let cy = Math.floor(y / cell) + 1;
+      cx = cx < 0 ? 0 : cx >= cols ? cols - 1 : cx;
+      cy = cy < 0 ? 0 : cy >= rows ? rows - 1 : cy;
+      let occluded = false;
+      for (let gx = cx - 1; gx <= cx + 1 && !occluded; gx++) {
+        if (gx < 0 || gx >= cols) continue;
+        for (let gy = cy - 1; gy <= cy + 1 && !occluded; gy++) {
+          if (gy < 0 || gy >= rows) continue;
+          for (let p = head[gy * cols + gx]!; p !== -1; p = next[p]!) {
+            const dx = sx[p]! - x;
+            const dy = sy[p]! - y;
+            const thresh = spacing * (r + radii[p]!); // circles must not overlap
+            if (dx * dx + dy * dy < thresh * thresh) {
+              if (ignore && ignore(i, p)) continue; // e.g. a cross-fading glyph ignores its ancestor
+              occluded = true;
+              if (winners) winners[i] = p; // absorbed under the kept glyph that occluded it
+              break;
+            }
           }
         }
       }
+      if (!occluded) {
+        out[i] = 1;
+        if (winners) winners[i] = i; // a kept glyph represents itself
+        const c = cy * cols + cx;
+        next[i] = head[c]!;
+        head[c] = i;
+      } else {
+        out[i] = 0;
+      }
     }
-    if (!occluded) {
-      out[i] = 1;
-      if (winners) winners[i] = i; // a kept glyph represents itself
-      const c = cy * cols + cx;
-      next[i] = head[c]!;
-      head[c] = i;
-    } else {
-      out[i] = 0;
+  } else {
+    // Uniform radius (the geo/map and plot points-lane shape): the collision threshold is the
+    // same for every pair, so hoist it (bit-identical to computing it per test).
+    const thresh = spacing * (uniformR + uniformR);
+    const thresh2 = thresh * thresh;
+    for (let oi = 0; oi < count; oi++) {
+      const i = order ? order[oi]! : oi;
+      const x = sx[i]!;
+      const y = sy[i]!;
+      if (x < 0 || y < 0 || x > width || y > height) {
+        out[i] = 1; // off-screen centre ⇒ keep, and don't insert (so it can't occlude on-screen glyphs)
+        if (winners) winners[i] = i; // a kept glyph represents itself
+        continue;
+      }
+      let cx = Math.floor(x / cell) + 1;
+      let cy = Math.floor(y / cell) + 1;
+      cx = cx < 0 ? 0 : cx >= cols ? cols - 1 : cx;
+      cy = cy < 0 ? 0 : cy >= rows ? rows - 1 : cy;
+      let occluded = false;
+      for (let gx = cx - 1; gx <= cx + 1 && !occluded; gx++) {
+        if (gx < 0 || gx >= cols) continue;
+        for (let gy = cy - 1; gy <= cy + 1 && !occluded; gy++) {
+          if (gy < 0 || gy >= rows) continue;
+          for (let p = head[gy * cols + gx]!; p !== -1; p = next[p]!) {
+            const dx = sx[p]! - x;
+            const dy = sy[p]! - y;
+            if (dx * dx + dy * dy < thresh2) {
+              if (ignore && ignore(i, p)) continue; // e.g. a cross-fading glyph ignores its ancestor
+              occluded = true;
+              if (winners) winners[i] = p; // absorbed under the kept glyph that occluded it
+              break;
+            }
+          }
+        }
+      }
+      if (!occluded) {
+        out[i] = 1;
+        if (winners) winners[i] = i; // a kept glyph represents itself
+        const c = cy * cols + cx;
+        next[i] = head[c]!;
+        head[c] = i;
+      } else {
+        out[i] = 0;
+      }
     }
   }
   return out;
