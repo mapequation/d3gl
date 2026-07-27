@@ -11,19 +11,34 @@ import type { GridPyramid } from "./grid-pyramid.js";
 // additive-blends the accumulated repulsion force into the shared force texture.
 //
 // The pyramid is a COMPLETE regular quadtree:
-//   level 0    = finest G×G grid; each cell holds (Σx, Σy, mass, 0)
+//   level 0    = finest G×G grid; each cell holds (Σx, Σy, mass, Σ|p−cellCenter|²)
 //   level ℓ    = (G>>ℓ)×(G>>ℓ); each cell sums its 2×2 children
 //   level L    = 1×1 root (L = levelCount-1)
 // A cell (ℓ, cx, cy) has children at (ℓ-1, 2cx+{0,1}, 2cy+{0,1}).
 //
 // Traversal (matches quadtree.ts's force law exactly):
 //   start with the root cell (L, 0, 0);
-//   pop (ℓ, cx, cy); read (Σx,Σy,mass); if mass==0 skip;
+//   pop (ℓ, cx, cy); read (Σx,Σy,mass,w); if mass==0 skip;
 //   com = (Σx,Σy)/mass;  d = p_i − com;  d2 = dot(d,d);
 //   cellSize = boxSide / (G>>ℓ)   (world side of a level-ℓ cell; = 2*half in
 //                                   quadtree.ts terms);
-//   if (cellSize² < θ²·d2) OR ℓ==0:  accept as one body →
+//   if cellSize² < θ²·d2 (θ-accept, any level):  accept as one body →
 //     acc += u_repulsion * mass / (d2 + SOFTENING) * d;
+//   else if ℓ==0:  forced near-field accept (#251) — same lumped body, but
+//     softened by the cell's second CENTRAL moment σ² = w/mass − |com − cc|²
+//     (cc = the cell's center):
+//     acc += u_repulsion * mass / (d2 + 2σ² + SOFTENING) * d.
+//     2σ² is the squared radius of the uniform disc with that second moment, so
+//     the lump follows the disc's force law instead of a point's: exact at the
+//     disc center and in the far field, at worst 0.5× at the disc edge — where
+//     the un-softened 1/d point kernel overestimated a sub-cell clump ~3–5× vs
+//     the CPU BH reference (whose adaptive leaves resolve clump members
+//     individually). A single-occupant cell has σ² = 0 EXACTLY (the scatter and
+//     this shader compute cc with the same expression, so the moments cancel)
+//     and takes the plain point kernel — bit-identical to the θ-accept branch.
+//     (The reverted #203 alternative — a fixed (cellSize/2)² floor — assumed
+//     the occupants fill the whole cell and under-estimated tight sub-cell
+//     clumps ~50×; σ² measures their actual extent.)
 //   else: push the 4 children (ℓ-1, 2cx+{0,1}, 2cy+{0,1}).
 //
 // SOFTENING (1e-2) matches quadtree.ts and the all-pairs pass. The node's own
@@ -110,9 +125,11 @@ void main() {
   vec4 b = texelFetch(u_box, ivec2(0, 0), 0);
   vec2 mx = b.xy;
   vec2 mn = -b.zw;
+  vec2 ctr = 0.5 * (mn + mx);
   vec2 hlf = 0.5 * (mx - mn);
   // NOTE: 'half' is a reserved word in GLSL ES 3.00 — use hlfMax.
   float hlfMax = max(max(hlf.x, hlf.y) * u_pad, 1e-6);
+  vec2 lo = ctr - vec2(hlfMax);
   float boxSide = 2.0 * hlfMax;
   float G = float(u_grid);
 
@@ -148,9 +165,27 @@ void main() {
     int cellsPerSide = u_grid >> level;
     float cellSize = boxSide / float(cellsPerSide);
 
-    if (level == 0 || (cellSize * cellSize < u_theta2 * d2)) {
-      // Accept: treat the whole cell as one body at its COM (softened).
+    if (cellSize * cellSize < u_theta2 * d2) {
+      // θ-accept (far field, any level): treat the whole cell as one body at
+      // its COM (softened). Unchanged by #251 — bit-identical far field.
       float f = u_repulsion * mass / (d2 + 1e-2);
+      acc += f * d;
+    } else if (level == 0) {
+      // Forced near-field accept at the finest level (#251): soften the lump
+      // by its occupants' second central moment (see header). mass is an
+      // integer count, so mass > 1.5 ⇔ multi-occupant; single occupants keep
+      // the exact point kernel of the θ-accept branch.
+      float f;
+      if (mass > 1.5) {
+        // Same expression as the scatter's cellCenter (level 0 ⇒ the cell
+        // coords are finest-grid coords), so the m=1 variance cancels exactly.
+        vec2 cc = lo + (vec2(float(cx), float(cy)) + 0.5) / G * boxSide;
+        vec2 comRel = com - cc;
+        float sigma2 = max(cell.w / mass - dot(comRel, comRel), 0.0);
+        f = u_repulsion * mass / (d2 + 2.0 * sigma2 + 1e-2);
+      } else {
+        f = u_repulsion * mass / (d2 + 1e-2);
+      }
       acc += f * d;
     } else {
       // Descend: push the 4 children at level-1, (2cx+{0,1}, 2cy+{0,1}).
