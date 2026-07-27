@@ -2,6 +2,7 @@ import { describe, it, expect } from "vitest";
 import type { PathContext } from "../core/index.js";
 import { plot, type Plot } from "./plot.js";
 import { groupRendererConstructions } from "../webgl/renderer.js";
+import { perfBudget } from "../__tests__/perf-budget.js";
 
 /**
  * Per-interaction cost guard for the auto-hover overlay (#218).
@@ -99,11 +100,11 @@ describe("hover overlay renderer reuse (#218)", () => {
     expect(built).toBe(0);
     // Generous headless ceiling that still catches an order-of-magnitude drop. Each change
     // includes the O(highlighted)=1 re-tessellation + a full recomposite (pre-existing).
-    expect(median).toBeLessThan(12);
+    expect(median).toBeLessThan(perfBudget(12));
 
     chart.destroy();
     el.remove();
-  }, 60_000);
+  }, perfBudget(60_000));
 
   it("webgl: in-place overlay pixels are identical to a fresh-construction reference; a gap clear restores the base", async () => {
     const { chart, el } = await makeChart();
@@ -132,5 +133,5 @@ describe("hover overlay renderer reuse (#218)", () => {
 
     chart.destroy();
     el.remove();
-  }, 60_000);
+  }, perfBudget(60_000));
 });

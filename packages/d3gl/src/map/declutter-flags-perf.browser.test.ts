@@ -3,6 +3,7 @@ import type { PathContext } from "../core/index.js";
 import { Scene } from "../core/index.js";
 import { plot } from "./plot.js";
 import { WebGLBackend } from "../webgl/index.js";
+import { perfBudget } from "../__tests__/perf-budget.js";
 
 /**
  * Per-frame cost guard for the retained-Scene declutter style push (#208).
@@ -238,9 +239,9 @@ describe("flags-only declutter frame at 1M drawables (#208 scale guard)", () => 
     expect(flags.bytes).toBe(FRAMES * N); // N bytes per frame, not 9N
     // Generous ceiling (headless CI variance) that still catches an order-of-magnitude
     // regression: the old path (9 MB snapshot + 9 MB upload) measured >50 ms/frame CPU alone.
-    expect(perFrame).toBeLessThan(40);
+    expect(perFrame).toBeLessThan(perfBudget(40));
 
     backend.destroy();
     canvas.remove();
-  }, 120_000);
+  }, perfBudget(120_000));
 });

@@ -25,6 +25,7 @@ import { makeTestDevice } from "./_device.js";
 import { GpuForceLayout } from "../gpu-force-layout.js";
 import { buildGraph } from "../../graph.js";
 import type { LayoutGraph } from "../../force.js";
+import { perfBudget } from "../../../__tests__/perf-budget.js";
 
 /** Minimal seeded LCG PRNG — self-contained, no deps. */
 function makePrng(seed: number): () => number {
@@ -80,7 +81,7 @@ describe("GPU frame budget — pyramid path (per-tick regression tripwire)", () 
     // so a genuine regression (e.g. O(n²) re-introduction adding another ~30× cost)
     // trips the assertion while normal run-to-run variance never does.
     const N = 30_000;
-    const CEILING_MS = 10_000;
+    const CEILING_MS = perfBudget(10_000);
     const REPEATS = 3;
 
     const g = makeClusteredGraph(N, 80, 0xdeadbeef);

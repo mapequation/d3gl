@@ -272,7 +272,7 @@ git -C <primary> checkout -- <files>                         # restore primary t
   package-relative path to target one file). They run reliably and are part of TDD —
   a wall-clock watchdog (`packages/d3gl/scripts/run-browser-tests.mjs`) turns any
   rare connect/teardown stall into a fast failure instead of an infinite hang. CI
-  does not run the browser suite (node only).
+  does not run the full browser suite (node only) — only the browser perf tier below.
 - **At-scale perf tier** (`ci.yml` job `perf`, #220): `node scripts/run-perf-tier.mjs`
   runs every **env-gated node bench** with its gates ON at a reduced-but-real N
   (`PERF_N`, CI default 500k) and assertions enabled (`PERF_ASSERT=1`), single-threaded
@@ -283,6 +283,17 @@ git -C <primary> checkout -- <files>                         # restore primary t
   `BENCH_<NAME>_LABEL` (report label). Report-only benches are still guarded by the
   per-file budget; add `PERF_ASSERT`-gated ceilings for real assertions (see
   `lod-perf.bench.test.ts`). Local report-only runs (no `PERF_ASSERT`) are unchanged.
+- **Browser perf tier** (`ci.yml` job `perf-browser`, #247, **advisory** —
+  `continue-on-error`, keep it out of branch protection until it has a flake-free
+  record): `node scripts/run-browser-perf-tier.mjs` runs every browser per-frame
+  guard headless (SwiftShader software GL on CI runners), one watchdogged process
+  per file. Discovery is **pattern-driven**: a file named `*-perf.browser.test.ts`
+  (or bare `perf.browser.test.ts`) under `packages/*/src` is enrolled automatically —
+  name new browser perf guards accordingly. Wall-clock ceilings/timeouts are
+  locally-calibrated numbers multiplied by `PERF_BUDGET_SCALE` (CI sets it for
+  SwiftShader; unset = 1 = local budgets) via
+  `packages/d3gl/src/__tests__/perf-budget.ts` — never loosen a local budget for
+  CI's sake, and never scale a deterministic (count/pixel) assertion.
 
 ## Backend compositing equivalence (READ before touching the WebGL renderer)
 
