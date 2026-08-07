@@ -365,6 +365,10 @@ export abstract class BaseEngine {
   /** While true, the zoom handler ignores its event — set only while {@link syncZoomToView}
    *  programmatically re-seeds the gesture transform, so re-seeding does not recurse into setTransform. */
   private suppressZoomEmit = false;
+  /** True only for the duration of the `setTransform` the zoom handler itself makes. That call is
+   *  already in step with d3-zoom, so it must NOT re-seed — re-seeding on every gesture frame would
+   *  put a `behavior.transform` apply on the interaction path for no benefit (#202). */
+  private inZoomGesture = false;
   /** Per-pass-through-layer repaint token. A time-sliced repaint captures the current
    *  token for its layer; each rAF step bails if a newer repaint (or an interaction) has
    *  bumped that layer's token. Per-LAYER (not a single shared token) so two PT layers
@@ -1266,6 +1270,13 @@ export abstract class BaseEngine {
   }
   setTransform(t: ViewTransform): this {
     this.transform = t;
+    // A PROGRAMMATIC view change (fit, zoomToModule, a centering translate) must carry d3-zoom's
+    // internal transform with it. `enableZoom` seeds that transform once, at call time; without this
+    // the next wheel/drag computes its delta from the stale seed and the view visibly snaps back
+    // before zooming (#202). Skipped during a gesture — that setTransform came FROM d3-zoom and is
+    // already in step, and re-seeding there would add a `behavior.transform` apply per zoom frame.
+    // No-ops when zoom isn't enabled.
+    if (!this.inZoomGesture) this.syncZoomToView();
     this.handle?.backend.setTransform(t);
     for (const [name, entry] of this.instancedLanes) if (entry.dynamic) this.emitInstancedLane(name);
     for (const spec of this.specs) if (spec.declutter) this.declutterLayer(spec, t);
@@ -1563,7 +1574,12 @@ export abstract class BaseEngine {
       .on("zoom", (e: D3ZoomEvent<Element, unknown>) => {
         if (this.suppressZoomEmit) return; // a programmatic syncZoomToView() re-seed — don't recurse
         const t: ViewTransform = { k: e.transform.k, x: e.transform.x, y: e.transform.y };
-        this.setTransform(t);
+        this.inZoomGesture = true;
+        try {
+          this.setTransform(t);
+        } finally {
+          this.inZoomGesture = false;
+        }
         onTransform?.(t);
       })
       .on("end", () => this.setInteracting(false));
