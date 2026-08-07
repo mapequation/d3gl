@@ -337,6 +337,7 @@ per-file timeout. Every at-scale leg below now asserts. When you add a guard, ad
 | plot points, retained DOM | SVG | `svg/__tests__/svg-zoom-sweep-perf.test.ts` | 100k | `BENCH_SVG_SWEEP` |
 | geo polygons + clip | Canvas | `geo/__tests__/geo-zoom-sweep-perf.test.ts` | ~15k cells | `BENCH_GEO_SWEEP` |
 | geoMap append | — | `map/__tests__/append-scaling-perf.test.ts` | O(new) delta | — |
+| layer push, Scene seam | — | `core/__tests__/vector-view-perf.test.ts` | 1M, ×20 pushes | — |
 | plot declutter `select()` | — | `map/__tests__/points-lane-scratch-perf.test.ts` | 1M | — |
 | plot points lane sweep | — | `map/__tests__/points-lane-perf.bench.test.ts` | — | `BENCH_POINTS` |
 | hover pick (interaction) | — | `core/__tests__/hit-test-grid-perf.test.ts` | 1M, world+screen | `BENCH_HIT` (`core/hit-test.bench.test.ts`) |
@@ -357,6 +358,7 @@ per-file timeout. Every at-scale leg below now asserts. When you add a guard, ad
 | React recolor vs build | **WebGL** | `react/perf.browser.test.ts` | 4096 | capped at 8192 — see below |
 | `"auto"` placeholder emit | Canvas→**WebGL** | `map/auto-placeholder-perf.browser.test.ts` | 200k edges / 200k points | `PERF_BROWSER_N` (max 611k) |
 | `"auto"` placeholder **paint** | Canvas→**WebGL** | same file, `#273` describe block | 30k geo polygons | `PERF_BROWSER_N` (max 120k) |
+| `pushLayers()` vector view | Canvas + **WebGL** | `map/push-layers-perf.browser.test.ts` | 20k geo polygons | `PERF_BROWSER_N` (max 120k) |
 
 **Known holes, tracked:** the at-scale legs drive **backends**, not engines, so the layer above the
 backend seam (accessors, lane emit, LOD integration) is only covered at N ≤ 5000 (#263); geo's
@@ -412,6 +414,32 @@ Consequences worth remembering before "fixing" a layout complaint:
 - **A bare host in fixed (`width`+`height`) mode gets NO CSS from the engine**, so an unstyled
   `<div>` collapses to zero height and the map overlaps whatever follows it. Stable, not a shift —
   but it is why examples and docs always size the host.
+
+## What the Scene hands out is SHARED, not a snapshot (#207, #208, #280)
+
+Every array `Scene` returns is owned by the Scene and reused across calls — `styleTables()` and
+`buffers()` give live subarray views of the typed storage (#207), `flagsView()` one persistent
+`Uint8Array` (#208), and since #280 `drawables()` gives a **retained `DrawableVector[]`** and
+`buffers().pointCenters` a retained `Float32Array`. The engine calls all of these once per layer on
+every `pushLayers()`, so anything rebuilt per call is an O(total drawables) cost paid before a
+backend sees it. Consequences to keep in mind:
+
+- **Never grow or reorder an array the Scene handed you.** `CanvasBackend.appendToLayer` pushes the
+  append TAIL into the array it already holds — which is the Scene's. That only works because
+  `Scene.appendToGroup` **drops** its reference rather than growing it, handing ownership over; the
+  next full `drawables()` builds a fresh one. Growing it on both sides double-counts the tail.
+- **`DrawableVector` stores style as plain data**, so retaining it means re-applying later
+  `setFill`/`setStroke`/`setFlag`/`writeDeclutterFlags` writes. Those bump a per-group `styleEpoch`
+  (O(1) — `writeDeclutterFlags` bumps **once** for the whole pass, deliberately: patching the
+  vectors inside that loop would put an O(drawables) object-write on every zoom frame, exactly what
+  the #208 flags-only path exists to avoid), and `drawables()` resyncs in place, reusing the objects
+  AND their colour tuples, when the epoch has moved.
+- The one sanctioned mutation from outside is a backend's flags-only fast path writing `flags` from
+  the Scene's own live flags table (`Canvas`/`Svg` `updateLayerFlags`, `WebGLBackend.toSVG`) — it
+  writes the value the Scene already holds, so it can only bring the view into sync.
+- Adding a per-call rebuild back into any of these is a push-path regression, guarded by
+  `core/__tests__/vector-view-perf.test.ts` (1M, ×20 pushes) and
+  `map/push-layers-perf.browser.test.ts` (the real `pushLayers`, on Canvas and WebGL).
 
 ## Backend compositing equivalence (READ before touching the WebGL renderer)
 

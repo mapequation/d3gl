@@ -34,7 +34,8 @@ export interface DrawableRange {
  * drawable set change always reaches a backend as a fresh `setLayers`/`updateLayer`/
  * `appendToLayer` call, so a consumer that re-reads on those events never observes
  * staleness). `pointCenters` interleaves per-circle data with the drawableId, so it
- * is assembled fresh per call.
+ * cannot be a subarray view — it is assembled once per drawable set and then RETAINED
+ * and shared (#280), under the same read-only contract.
  */
 export interface GroupBuffers {
   fillVertices: Float32Array;
@@ -324,6 +325,25 @@ class GroupData {
   /** Cached transform-independent declutter index (built lazily; null ⇒ stale/never built).
    *  Invalidated whenever the group's drawable set changes (rebuild or append). */
   declutterIndex: DeclutterIndex | null = null;
+  /**
+   * Retained vector view (#280) — the array {@link Scene.drawables} hands out, built once per
+   * drawable set and then reused. `null` ⇒ never built, or the drawable set changed.
+   *
+   * Costs no extra retained memory: every backend already holds the array it was pushed
+   * (`CanvasBackend.layers`, `SvgBackend.layers`, `WebGLBackend.layers`) for the layer's
+   * lifetime, so this is the SAME array shared rather than a fresh copy per push.
+   */
+  vectors: DrawableVector[] | null = null;
+  /** Bumped by every per-drawable style write (setFill/setStroke/setFlag/writeDeclutterFlags).
+   *  O(1) per write — {@link writeDeclutterFlags} bumps once for the whole pass, so the
+   *  per-frame declutter path gains a single increment, not a per-drawable one. */
+  styleEpoch = 0;
+  /** The {@link styleEpoch} {@link vectors} were last synced at (-1 ⇒ never). */
+  vectorsEpoch = -1;
+  /** Cached stride-4 [x, y, r, drawableId] point centers (#280). Geometry-only — no style
+   *  lives in it — so only a drawable-set change can stale it. Like {@link vectors} it is
+   *  already retained downstream (every backend keeps the `GroupBuffers` it was handed). */
+  pointCenters: Float32Array | null = null;
   constructor(public readonly tolerance: number) {}
 }
 
@@ -382,7 +402,15 @@ export class Scene {
   appendToGroup(name: string, build: (g: GroupBuilder) => void): void {
     const data = this.get(name);
     build(this.builderFor(data));
-    data.declutterIndex = null; // the drawable set grew; the cached anchor index is now stale
+    // The drawable set grew: every cache keyed on it is now stale.
+    data.declutterIndex = null;
+    // DROP the retained vector view rather than extending it (#280). The append path hands the
+    // backend only the TAIL (`drawables(name, from)`) and Canvas grows its own stored array with
+    // it — extending this one too would double-count those drawables in the array Canvas holds.
+    // Dropping it hands ownership of the old array to the backend; the next full drawables()
+    // builds a fresh one. Appends never go through pushLayers(), so nothing re-materializes here.
+    data.vectors = null;
+    data.pointCenters = null;
   }
 
   /** Number of drawables currently registered in a group. */
@@ -567,12 +595,14 @@ export class Scene {
   setFill(name: string, id: string | number, color: string): void {
     const { data, drawableId } = this.drawableIdOf(name, id);
     writeColor(data.fillColors.a, drawableId, color);
+    data.styleEpoch++; // the retained vector view now lags the tables (#280)
   }
 
   /** Set a drawable's stroke color (any CSS color string). Hot-swappable. */
   setStroke(name: string, id: string | number, color: string): void {
     const { data, drawableId } = this.drawableIdOf(name, id);
     writeColor(data.strokeColors.a, drawableId, color);
+    data.styleEpoch++;
   }
 
   /** Set a drawable's flag byte (e.g. bit 0 = visible). Hot-swappable. Writes the typed
@@ -580,6 +610,7 @@ export class Scene {
   setFlag(name: string, id: string | number, flags: number): void {
     const { data, drawableId } = this.drawableIdOf(name, id);
     data.flags.a[drawableId] = flags & 0xff;
+    data.styleEpoch++;
   }
 
   /**
@@ -626,6 +657,12 @@ export class Scene {
       const g = groupOf[i]!;
       flags[i] = g < 0 || visibleByGroup[g] ? 1 : 0;
     }
+    // ONE increment for the whole pass (#280) — this is the per-frame declutter path, so the
+    // retained vector view is marked out-of-date here and re-synced lazily, only if and when a
+    // (non-per-frame) caller actually asks for it. Patching the vectors here instead would put
+    // an O(drawables) object-write loop on every zoom frame, which is exactly what the WebGL
+    // flags-only path (#208) exists to avoid.
+    data.styleEpoch++;
   }
 
   /**
@@ -661,13 +698,52 @@ export class Scene {
     };
   }
 
-  /** Return the vector view of a group's drawables, optionally only those at/after
-   *  `from` (so an incremental append can read just the new ones in O(new)). */
+  /**
+   * The vector view of a group's drawables — a **retained** array, built once per drawable set
+   * and handed out by reference thereafter (#280).
+   *
+   * This used to materialize one fresh `DrawableVector` (plus two colour tuples) per drawable on
+   * every call — ~0.16 µs and ~320 B each, measured at 200k — and `BaseEngine.pushLayers()` calls
+   * it for every layer on every push (each `registerLayer`, `removeLayer`, `setClip`, backend
+   * install, and both boundaries of a gesture on a `hideOnInteraction` map). At 1M drawables that
+   * was ~160 ms and ~320 MB of short-lived garbage *per push*, before any backend saw the result.
+   *
+   * Retaining it costs no extra memory: the array is already held for the layer's lifetime by
+   * whichever backend it was pushed to. What goes away is the per-push *copy*.
+   *
+   * Freshness: `DrawableVector` stores style as plain data (a snapshot), so a `setFill`/`setStroke`/
+   * `setFlag`/`writeDeclutterFlags` since the last call is re-applied **in place** here — reusing
+   * the same objects and the same colour tuples, so the resync allocates nothing (see
+   * {@link syncVectorStyle}). Geometry fields never change without a drawable-set change, which
+   * drops the array entirely.
+   *
+   * Contract for callers: treat the array and its elements as read-only, and do not retain them
+   * across a drawable-set change. The one sanctioned mutation is a backend's flags-only fast path
+   * writing `flags` from this Scene's own live flags table (`CanvasBackend`/`SvgBackend`
+   * `updateLayerFlags`, `WebGLBackend.toSVG`) — that writes the value this Scene already holds, so
+   * it can only bring the view into sync, never diverge from it.
+   *
+   * `from > 0` asks for just the appended TAIL (O(new)) and always builds fresh objects: the
+   * append path hands that slice straight to the backend, which owns and grows it from there.
+   */
   drawables(name: string, from = 0): DrawableVector[] {
     const data = this.get(name);
-    const out: DrawableVector[] = [];
-    for (let i = Math.max(0, from); i < data.ids.length; i++) out.push(this.vectorAt(data, i));
-    return out;
+    if (from > 0) {
+      const out: DrawableVector[] = [];
+      for (let i = from; i < data.ids.length; i++) out.push(this.vectorAt(data, i));
+      return out;
+    }
+    let v = data.vectors;
+    if (!v) {
+      const n = data.ids.length;
+      v = new Array<DrawableVector>(n);
+      for (let i = 0; i < n; i++) v[i] = this.vectorAt(data, i);
+      data.vectors = v;
+    } else if (data.vectorsEpoch !== data.styleEpoch) {
+      for (let i = 0; i < v.length; i++) syncVectorStyle(data, v[i]!, i);
+    }
+    data.vectorsEpoch = data.styleEpoch;
+    return v;
   }
 
   /** The vector view of ONE drawable by domain id, or null when the id has no
@@ -695,9 +771,13 @@ export class Scene {
     };
   }
 
-  /** Assemble GPU-ready typed arrays for a group. O(1) views of the typed storage for
-   *  everything except `pointCenters` (assembled fresh, O(pointCount) — it interleaves
-   *  the drawableId per circle). See {@link GroupBuffers} for the sharing contract. */
+  /** Assemble GPU-ready typed arrays for a group — O(1): every array is a live view of the typed
+   *  storage, and `pointCenters` (the one array that has to be interleaved rather than viewed) is
+   *  built once per drawable set and retained (#280), not re-assembled per call. It used to cost
+   *  O(pointCount) time plus a fresh 16 B/circle allocation on every `pushLayers()`; like the
+   *  vector view it was already retained downstream by every backend, so keeping it here shares
+   *  one array instead of minting a copy per push. See {@link GroupBuffers} for the sharing
+   *  contract. */
   buffers(name: string): GroupBuffers {
     const data = this.get(name);
     return {
@@ -709,7 +789,7 @@ export class Scene {
       strokeColors: data.strokeColors.view(),
       flags: data.flags.view(),
       drawableCount: data.ranges.length,
-      pointCenters: assemblePointCenters(data, 0),
+      pointCenters: (data.pointCenters ??= assemblePointCenters(data, 0)),
       pointCount: data.circleCount,
       fillAnchors: data.fillAnchors.view(),
       strokeAnchors: data.strokeAnchors.view(),
@@ -761,6 +841,23 @@ export class Scene {
       ranges: data.ranges.slice(from),
     };
   }
+}
+
+/**
+ * Re-apply the per-drawable STYLE columns onto an already-built vector view, in place (#280).
+ *
+ * Writes into the drawable's existing colour tuples rather than allocating new ones, so a resync
+ * costs eight byte reads + nine property stores per drawable and **zero** allocations — versus
+ * three allocations per drawable (the object plus both tuples) for a full rebuild. Geometry fields
+ * (`id`/`subpaths`/`circles`/`anchor`/`lineWidth`/join/cap) are deliberately untouched: they cannot
+ * change without a drawable-set change, and that drops the whole retained array.
+ */
+function syncVectorStyle(data: GroupData, v: DrawableVector, i: number): void {
+  const fc = data.fillColors.a, sc = data.strokeColors.a, o = i * 4;
+  const f = v.fill, s = v.stroke;
+  f[0] = fc[o]!; f[1] = fc[o + 1]!; f[2] = fc[o + 2]!; f[3] = fc[o + 3]!;
+  s[0] = sc[o]!; s[1] = sc[o + 1]!; s[2] = sc[o + 2]!; s[3] = sc[o + 3]!;
+  v.flags = data.flags.a[i]!;
 }
 
 /** Build the stride-4 [x, y, r, drawableId] point-centers array for drawables at/after
