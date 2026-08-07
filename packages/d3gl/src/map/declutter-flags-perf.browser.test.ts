@@ -3,7 +3,7 @@ import type { PathContext } from "../core/index.js";
 import { Scene } from "../core/index.js";
 import { plot } from "./plot.js";
 import { WebGLBackend } from "../webgl/index.js";
-import { perfBudget } from "../__tests__/perf-budget.js";
+import { perfBudget, perfN } from "../__tests__/perf-budget.js";
 
 /**
  * Per-frame cost guard for the retained-Scene declutter style push (#208).
@@ -68,7 +68,10 @@ function makeNodes(n: number, W: number, H: number) {
 
 describe("scene declutter flags-only style path (#208)", () => {
   it("webgl: a zoom sweep writes ONLY the flags texture (zero colour copies/uploads), reuses one flags view, and stays pixel-identical to the full push", async () => {
-    const W = 480, H = 320, N = 2000, FRAMES = SWEEP.length;
+    // The engine-level WebGL trigger — the cell #258 flagged as covered at only N=2000. The tier
+    // raises it via PERF_BROWSER_N (#262). Capped at 2M: the style tables are a 256-wide GrowTexture,
+    // so beyond ~2.1M rows `createTexture` fails at setLayers — an error, not a budget.
+    const W = 480, H = 320, N = perfN(2000, { max: 2_000_000 }), FRAMES = SWEEP.length;
     const chart = plot(host(W, H), { width: W, height: H, backend: "webgl" });
     await chart.whenReady();
     const nodes = makeNodes(N, W, H);
@@ -134,7 +137,8 @@ describe("scene declutter flags-only style path (#208)", () => {
   });
 
   it("webgl: toSVG export reflects flags-only visibility (lazy fold at export time)", async () => {
-    const W = 480, H = 320, N = 1500;
+    // Capped low on purpose: this leg materialises one DOM node per drawable in the export.
+    const W = 480, H = 320, N = perfN(1500, { max: 20_000 });
     const chart = plot(host(W, H), { width: W, height: H, backend: "webgl" });
     await chart.whenReady();
     const nodes = makeNodes(N, W, H);
@@ -154,7 +158,7 @@ describe("scene declutter flags-only style path (#208)", () => {
   });
 
   it("canvas: patches the retained vector view in place — same drawables array, flags in sync with the scene", async () => {
-    const W = 480, H = 320, N = 1500;
+    const W = 480, H = 320, N = perfN(1500, { max: 100_000 });
     const chart = plot(host(W, H), { width: W, height: H, backend: "canvas" });
     await chart.whenReady();
     const nodes = makeNodes(N, W, H);
@@ -181,7 +185,8 @@ describe("scene declutter flags-only style path (#208)", () => {
   });
 
   it("svg: re-serializes exactly the visible drawables after flags-only frames", async () => {
-    const W = 480, H = 320, N = 1500;
+    // One SVG DOM node per visible drawable — the tightest cap in the file.
+    const W = 480, H = 320, N = perfN(1500, { max: 20_000 });
     const el = host(W, H);
     const chart = plot(el, { width: W, height: H, backend: "svg" });
     await chart.whenReady();
