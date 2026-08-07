@@ -8,7 +8,7 @@ rendering, the build, or the test setup.
 
 ## Core values
 
-- **Efficient rendering** — Never increase the computational complexity or memory footprint of the rendering path without first weighing the options and asking me for guidance. Explain the trade-offs concretely: how run time and space grow with the input (node / edge / vertex count) under each option, and how noticeable it will be for a user.
+- **Efficient rendering** — Never increase the computational complexity or memory footprint of the rendering path or make a performance-motivated trade-off without first weighing the options and asking me for guidance. Explain the trade-offs concretely: how run time and space grow with the data and which data (all drawables, only visible set, all descendats etc) under each option, and how noticeable it will be for a user. **Never assume that LOD, declutter, culling, or any other reduction technique is on, or that it keeps the scale small.** They are *optional helpers* the user can turn off — and even with LOD on, the **visible set can itself be large-scale**: ≈1M LOD-aggregated glyphs must render as efficiently as ≈1M non-reduced glyphs. LOD and friends are a core part of the answer to scale, but they are helpers, not guarantees — so the rendering path itself must stay efficient at large scale both with reductions **off** (the full-detail draw — for *any* engine: GeoMap layers, Plot layers, or the whole network graph) and with them **on over a large visible set**. See the per-frame test rule (lifecycle §5).
 - **Unified rendering** — Before changing the rendering path, work out how to do it in a unified way across all three backends (WebGL, Canvas, SVG) with shared code — as long as that stays as efficient as a backend-specialized alternative. When you do touch backend-specialized code, check whether the other backends need a corresponding change.
 - **d3 compatibility** — Design the library for d3 compatibility and familiarity, supporting both d3's low-level flexibility and a powerful API that keeps example code simple. It should accept `d3-shape` generators, `d3-geo` projections, `d3-hierarchy` layouts, `d3-scale` scales, and the like.
 - **Clean code** — Casting or reaching for `any` / `unknown` is a sign of bad design; fix the underlying seam (a typed pure function, a test at the right layer) instead. Avoid the non-null assertion operator (`!`) for the same reason, unless it's justified in a performance-critical spot and approved by me.
@@ -99,16 +99,31 @@ long it stays useful:
    could hit a memory limit.
 
    **The prose section is necessary but NOT sufficient — it documents, it does not prevent.**
-   If the change adds, moves, or grows work on a **per-frame path** (anything reachable from
-   `setTransform` / `render` / a selection `emit` / a draw loop), you MUST also land an
-   automated **per-frame regression test** before requesting verification. It must:
-   - drive a **realistic large input** (≈1M points/nodes) through a sequence of `setTransform`s
-     (a zoom-in sweep) and assert a **frame budget** — a wall-clock-per-`setTransform` ceiling
-     generous enough to be non-flaky but tight enough to catch an order-of-magnitude drop; **and**
+   If the change adds, moves, or grows work on a **per-frame path**, you MUST also land an automated
+   **per-frame regression test** before requesting verification. A **per-frame path** is anything
+   reachable from `setTransform` / `render` / a selection `emit` / a draw loop — **and any continuous
+   pointer interaction: hover-move, node-drag, marquee-drag.** These fire on *every* pointer event while
+   the pointer moves, so a hover-drag across glyphs is effectively per-frame — it is **not** "just a
+   click" and gets no exemption. (Exactly this was the loophole once: a hover restyle was classed as
+   click-frequency and re-emitted the whole graph per hovered node — a severe drag lag.) The test must:
+   - drive a **realistic large input** — ≈1M drawables (points / nodes / edges / shapes, including
+     half-edges) — through the **actual trigger** (a `setTransform` zoom sweep for the draw path; a
+     **hover sweep across glyphs / a drag** for an interaction path) and assert a **frame budget** (a
+     wall-clock ceiling generous enough to be non-flaky but tight enough to catch an order-of-magnitude
+     drop). "Large" is about the set the path actually processes — not just a total count of ≈1M, but a
+     **visible set of ≈1M *even with reductions on*** (don't let LOD off the hook by assuming it shrinks
+     the frontier). Test **both** reduction states — a green test on one does not prove the other, and a
+     proxy pipeline instead of the real trigger does not count:
+       - **reductions ON (LOD / declutter)** — the common case users run, so keeping it fast is the
+         *primary* goal: per-frame work must be O(visible), not O(total); **and** a ≈1M-glyph aggregated
+         *visible* frontier must be as efficient as ≈1M non-reduced glyphs;
+       - **reductions OFF (full detail drawn)** — must ALSO hold: it's where an O(N)-per-frame or
+         per-interaction cost hides. **and**
    - assert the regression's **deterministic signature** directly where one exists: per-frame
      work the baseline did **once** must stay once — e.g. spy that style/colour resolution (or any
-     accessor) runs **O(data) at registration, not O(visible) per frame**, and that GPU buffers
-     are **updated in place, not destroyed + recreated** each frame.
+     accessor) runs **O(data) at registration, not O(visible) per frame**; that GPU buffers are
+     **updated in place, not destroyed + recreated** each frame; and that an interaction restyle
+     (hover/select) issues **no geometry re-emit/upload** (only a uniform / small in-place buffer write).
 
    **Baseline comparison is mandatory when you replace a render path.** Moving a layer from one
    path to another (retained-Scene → instanced lane, etc.) means the new path's per-frame cost is
