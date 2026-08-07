@@ -1504,8 +1504,7 @@ export function rgbaCss(colors: Uint8Array, i: number): string {
  * Trace the LOD frontier's node glyphs into a Scene group as ONE ring-encoded circle each, keyed by
  * tree-node id — the retained-Scene twin of the instanced circle lane, on the same encoding
  * `circlesToDrawables` (core/instanced-vector.ts) exports and {@link traceFrontierHalos} already
- * uses (#269). Mirrors
- * {@link frontierCircles}' radius/border semantics: a `borders[i]` fraction `b` means the ring
+ * uses (#269). Mirrors {@link frontierCircles}' radius/border semantics: a `borders[i]` fraction `b` means the ring
  * occupies `[r·(1 − b), r]`, so the circle sits at `r·(1 − b/2)` and is stroked `r·b` wide. The
  * layer's `fill` accessor colours the disc and its `stroke` accessor the ring, both read from the
  * SoA byte buffers via {@link rgbaCss}. No border ⇒ a plain filled disc.
