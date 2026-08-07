@@ -27,9 +27,10 @@ exposed all the way up to the user.
 
 ### Non-goals
 
-- True GPU sub-buffer upload (`bufferSubData`) — deferred. The API and internal seams are
-  designed so a GPU fast-path can drop in later **without any public API change** (see
-  §"GPU seam").
+- ~~True GPU sub-buffer upload (`bufferSubData`) — deferred.~~ **Implemented since this spec was
+  written**: offset-based tail writes are live in `packages/d3gl/src/webgl/renderer.ts`
+  (`this.buffer.write(data, offset)`). The seam described below is what it dropped into, and it
+  did land **without any public API change**, as designed.
 - A `removeLayer` / `handle.remove()` — YAGNI; no removal API exists today.
 
 ## Decisions (from brainstorming)
@@ -167,6 +168,6 @@ optional method when present, landing the fast-path requires no change to `Layer
 
 ## Out of scope
 
-- GPU sub-buffer upload (seam only).
+- ~~GPU sub-buffer upload (seam only).~~ **Now implemented** — see the Non-goals note above.
 - Layer removal.
 - Reordering / re-indexing existing drawables.
