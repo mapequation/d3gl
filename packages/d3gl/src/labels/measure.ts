@@ -52,8 +52,14 @@ export function canvasFont(font: string): string {
   return font.replace(/(\d+(?:\.\d+)?px)\/\S+/, "$1");
 }
 
-/** Default cap on distinct cached label texts — see {@link TextMeasurer}. */
-const MEASURE_CACHE_LIMIT = 20_000;
+/**
+ * Hard cap on distinct cached label texts — see {@link TextMeasurer}. Deliberately far above any set
+ * that can be *visible* at once (a viewport holds ~2000 label boxes): the cap exists only so a pan
+ * across a graph with millions of distinct names cannot retain unboundedly, never to evict the
+ * working set. Sizing it near the visible set would be the worst of both worlds — the cache would
+ * thrash and every frame would re-measure.
+ */
+const MEASURE_CACHE_LIMIT = 1_000_000;
 
 /**
  * Text measurement for label sets whose *text* is derived per frame rather than registered once
@@ -62,10 +68,11 @@ const MEASURE_CACHE_LIMIT = 20_000;
  * would put a `measureText` on the per-frame path; this memoizes by text so each distinct string is
  * measured exactly ONCE and every later frame is a Map lookup.
  *
- * The height is a per-font constant (the row box), so only widths are cached. The cache is capped
- * and cleared wholesale on overflow: the working set is the labels currently in view, so a pan
- * across a huge graph can never grow it without bound (worst case it re-measures a text it has seen
- * before). One measurer per font — rebuild it when the font changes.
+ * The height is a per-font constant (the row box), so only widths are cached, and the key is the text
+ * itself — so a changed `labelOf` or a rebuilt LOD tree invalidates itself, with no id-remap hook to
+ * forget. Memory is O(distinct texts shown): a Map slot + a number (~60 B) each, while the string is
+ * normally already retained by the caller's data. {@link MEASURE_CACHE_LIMIT} caps that, clearing
+ * wholesale on overflow. One measurer per font — rebuild it when the font changes.
  */
 export class TextMeasurer {
   /** The row-box height for this font, in px (constant — text width is what varies). */

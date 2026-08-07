@@ -44,11 +44,12 @@ const H = 800;
  *  quadratic scan this replaces runs `placed` tests per candidate — 875 at 200k, i.e. 175M tests. */
 const MAX_TESTS_PER_CANDIDATE = 20;
 /** Wall-clock ceilings (ms per placement pass), split into a constant and an N-linear term per
- *  AGENTS §Perf-guard. Measured best-of-3: dense 64ms / spread 77ms at 200k, 490ms / 564ms at 1M —
- *  so ~0.5µs per candidate plus a fixed radix/grid cost. Ceilings are ~4× the 200k measurement and
- *  ~2.5× the 1M one. */
-const DENSE_MS = Number(process.env.PERF_LABEL_CULL_DENSE_MS) || 40 + 240 * (N / 200_000);
-const SPREAD_MS = Number(process.env.PERF_LABEL_CULL_SPREAD_MS) || 40 + 280 * (N / 200_000);
+ *  AGENTS §Perf-guard. Measured best-of-3 on an M-series laptop: dense 64ms / spread 77ms at 200k,
+ *  458ms / 492ms at 1M — ~0.5µs per candidate plus a fixed radix/grid cost. Ceilings are ~10× the
+ *  200k measurement (an order of magnitude, so a shared CI runner cannot flake them while the
+ *  regression they guard — a ~100× quadratic scan at this N — still trips them). */
+const DENSE_MS = Number(process.env.PERF_LABEL_CULL_DENSE_MS) || 100 + 500 * (N / 200_000);
+const SPREAD_MS = Number(process.env.PERF_LABEL_CULL_SPREAD_MS) || 120 + 600 * (N / 200_000);
 
 /** Deterministic PRNG so both regimes are reproducible across runs and machines. */
 function rng(seed: number): () => number {

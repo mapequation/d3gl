@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeAll, vi } from "vitest";
+import { describe, it, expect, afterAll, beforeAll, vi } from "vitest";
 import { network } from "../network.js";
 import { buildGraph } from "../graph.js";
 import { perfBudget, perfN } from "../../__tests__/perf-budget.js";
@@ -34,11 +34,12 @@ import { perfHost, sweepFrames, zoomSteps } from "../../__tests__/engine-sweep.j
  *   3. **A per-frame wall-clock ceiling** in both reduction states.
  */
 
-// Local default keeps the fixture build ~1s; the browser tier raises it via PERF_BROWSER_N. `max`:
-// this leg holds the graph, the LOD tree, and one HTML overlay element per surviving label, and the
-// registration frame measures one text per in-view node — the same 100k ceiling the other network
-// browser guards settled on.
-const N = perfN(20_000, { max: 100_000 });
+// Local default keeps the fixture build ~1s; the browser tier raises it via PERF_BROWSER_N. `max` is
+// 50k, below the other network guards' 100k, because this file runs THREE sweep legs (LOD off,
+// aggregate frontier, all-leaves frontier) on one engine plus a registration frame that measures one
+// text per node: 42s wall clock at 50k vs 73s at 100k locally, against the tier's 300s per-file
+// budget on software GL. The assertions are exact at whatever N comes back.
+const N = perfN(20_000, { max: 50_000 });
 const W = 640;
 const H = 400;
 const COLS = Math.max(1, Math.round(Math.sqrt(N)));
@@ -114,6 +115,13 @@ describe(`network.labels() per-frame cost (n=${N})`, () => {
     atRegistration = spy.mock.calls.length;
     steps = zoomSteps(W, H, [1, 1.5, 2, 3, 5, 8]); // zoom IN: no unseen label text can appear
   }, 120_000);
+
+  // Release the WebGL context + the overlay when the file is done. A live engine holding a large
+  // graph makes the NEXT file's `whenReady()` stall for 9-12s in the same browser session (#287).
+  afterAll(() => {
+    net.destroy();
+    host.remove();
+  });
 
   /** Run the sweep once so every text the cut can expose is cached, then reset to the wide view. */
   const warm = (): void => {
