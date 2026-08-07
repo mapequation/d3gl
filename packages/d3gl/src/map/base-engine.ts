@@ -350,8 +350,13 @@ export abstract class BaseEngine {
    *  enterAutoMode() starts the upgrade; not reset afterwards. */
   private upgradeDone: Promise<void> | null = null;
   /** True only while the background "auto" → WebGL upgrade is in flight. Gates the
-   *  same-backend no-op in setBackend so a backend pick during the upgrade still swaps. */
+   *  same-backend no-op in setBackend so a backend pick during the upgrade still swaps,
+   *  and marks the live Canvas backend as the *placeholder* ({@link skipPlaceholderEmit}). */
   private upgrading = false;
+  /** True once {@link skipPlaceholderEmit} has withheld an emit from the placeholder canvas —
+   *  so an upgrade that never installs WebGL knows it must re-install canvas and let the
+   *  engines emit for real ({@link upgradeToWebGL}). Cleared by any explicit backend pick. */
+  private withheldFromPlaceholder = false;
   /** True while the user is interacting (a rotation drag, or a zoom/pan gesture).
    *  Layers flagged hideOnInteraction are excluded from the render while this is true. */
   protected interacting = false;
@@ -1222,6 +1227,12 @@ export abstract class BaseEngine {
   }
   setBackend(type: BackendType): this {
     if (this.isCurrentBackend(type)) return this; // already live on this backend — no churn
+    // An explicit pick supersedes any in-flight "auto" upgrade (the token bump below makes
+    // installBackend tear the WebGL handle down), so nothing is provisional any more: clear the
+    // placeholder state BEFORE the swap so the install's onBackendChanged re-emits at full detail
+    // — otherwise an explicit setBackend("canvas") mid-upgrade would keep withholding geometry.
+    this.upgrading = false;
+    this.withheldFromPlaceholder = false;
     if (type === "auto") { this.ready = Promise.resolve(); this.enterAutoMode(); }
     else this.ready = this.swapBackend(type);
     return this;
@@ -2258,6 +2269,43 @@ export abstract class BaseEngine {
     return createBackend("webgl", this.host, this.width, this.height);
   }
 
+  /**
+   * How many elements the **placeholder** Canvas backend of `"auto"` mode may draw while the
+   * WebGL upgrade is in flight (see {@link skipPlaceholderEmit}). An "element" is one thing the
+   * engine would have to tessellate into the retained Scene *only* for that placeholder — a
+   * network node/link, a decluttered plot point — NOT geometry the WebGL backend also renders.
+   *
+   * Calibrated in #201 against the cost the placeholder is covering for: creating the WebGL
+   * device and emitting a 611k-edge network through the instanced lane takes ~135 ms end to end
+   * (headless Chromium), while the Canvas2D full-detail path costs ~13 µs per network edge per
+   * rebuild (measured 5k→100k edges: 150→4173 ms over three rebuilds). So ~10k elements is the
+   * break-even: below it the placeholder paints in ≲100 ms and genuinely beats waiting for
+   * WebGL; above it, it costs strictly more than the upgrade it is bridging.
+   *
+   * Module-internal (no public API); tests stub it via the static field, as with {@link PT_CHUNK}.
+   */
+  protected static AUTO_PLACEHOLDER_MAX_ELEMENTS = 10_000;
+
+  /**
+   * Should an engine withhold `elements` worth of retained-Scene geometry from the live backend?
+   *
+   * True only while `"auto"` mode's **placeholder** Canvas backend is live and a WebGL upgrade is
+   * in flight, for a count above {@link AUTO_PLACEHOLDER_MAX_ELEMENTS}. Callers are the two places
+   * that materialize Scene geometry *purely because the live backend has no instanced lane* — the
+   * network's full-graph/frontier Scene and Plot's decluttered points fallback. That geometry is
+   * discarded by the very next backend install, so at scale emitting it is pure waste: a 611k-edge
+   * graph blocks the main thread for ~9.5 s (#201) painting a canvas that is replaced ~1 s later.
+   *
+   * NOT a general "skip drawing" switch: geometry the WebGL backend renders too (every `geoMap`
+   * layer, `plot.layer()`, non-decluttered points) must still be built — withholding it would only
+   * move the same work later. Small inputs keep `"auto"`'s instant canvas first paint untouched.
+   */
+  protected skipPlaceholderEmit(elements: number): boolean {
+    if (!this.upgrading || elements <= BaseEngine.AUTO_PLACEHOLDER_MAX_ELEMENTS) return false;
+    this.withheldFromPlaceholder = true;
+    return true;
+  }
+
   /** Enter "auto" mode: install a Canvas backend synchronously (instant first paint, no
    *  await, no onBackendSwapped — it is the first install / a fresh canvas), then start the
    *  background WebGL upgrade. Bumping swapToken invalidates any in-flight prior swap. */
@@ -2271,37 +2319,55 @@ export abstract class BaseEngine {
    *  destroys the canvas handle and fires onBackendSwapped, since it replaces a live handle).
    *  On failure, keep the canvas and warn — the map keeps working. While in flight, `upgrading`
    *  is true so a same-type setBackend isn't treated as a no-op (a "canvas" pick during the
-   *  window must still cancel the upgrade via the normal swap's token bump). */
+   *  window must still cancel the upgrade via the normal swap's token bump) AND so engines treat
+   *  the live canvas as a placeholder ({@link skipPlaceholderEmit}).
+   *
+   *  If the upgrade never installs WebGL while something WAS withheld, the placeholder turns out
+   *  to be the final backend — so re-install canvas through the normal swap. That fires
+   *  onBackendSwapped/onBackendChanged with `upgrading` already false, which is exactly the
+   *  notification every engine uses to re-emit, now at full detail. */
   private async upgradeToWebGL(): Promise<void> {
     this.upgrading = true;
+    let installed = false;
     try {
-      const token = ++this.swapToken;
-      let next: BackendHandle;
-      try {
-        next = await this.createWebGLBackend();
-      } catch (err) {
-        if (!this.destroyed) console.warn("d3gl: WebGL upgrade failed, staying on canvas", err);
-        return;
-      }
-      // Defensive guard for any upgrade target that lacks pass-through support. (The real WebGL
-      // backend DOES support pass-through, so this no longer fires for it — but a future/headless
-      // backend might not.) If pass-through layers exist and the target can't render them, aborting
-      // the transparent auto-upgrade is the only safe move — installBackend would destroy the canvas
-      // handle (losing the pass-through raster) and then THROW at its unsupported-backend check.
-      // Tear down the just-created handle (mirroring the createWebGLBackend failure path), keep the
-      // live canvas + currentBackend untouched, and warn. (An EXPLICIT setBackend to an unsupported
-      // backend still throws via installBackend — only this silent upgrade stays on canvas.)
-      if (this.ptSpecs.size > 0 && !next.backend.supportsPassThrough) {
-        next.backend.destroy();
-        if (next.element !== this.host) next.element.remove();
-        if (!this.destroyed)
-          console.warn("d3gl: pass-through layers kept on the canvas backend (the upgrade target does not support pass-through)");
-        return;
-      }
-      this.installBackend(next, token, "webgl");
+      installed = await this.createAndInstallWebGL();
     } finally {
       this.upgrading = false;
     }
+    if (installed || !this.withheldFromPlaceholder || this.destroyed) return;
+    this.withheldFromPlaceholder = false;
+    this.ready = this.swapBackend("canvas");
+    await this.ready;
+  }
+
+  /** The upgrade's create+install step. Returns whether the WebGL handle actually became live
+   *  (false when creation failed, the target can't do pass-through, or the swap was superseded). */
+  private async createAndInstallWebGL(): Promise<boolean> {
+    const token = ++this.swapToken;
+    let next: BackendHandle;
+    try {
+      next = await this.createWebGLBackend();
+    } catch (err) {
+      if (!this.destroyed) console.warn("d3gl: WebGL upgrade failed, staying on canvas", err);
+      return false;
+    }
+    // Defensive guard for any upgrade target that lacks pass-through support. (The real WebGL
+    // backend DOES support pass-through, so this no longer fires for it — but a future/headless
+    // backend might not.) If pass-through layers exist and the target can't render them, aborting
+    // the transparent auto-upgrade is the only safe move — installBackend would destroy the canvas
+    // handle (losing the pass-through raster) and then THROW at its unsupported-backend check.
+    // Tear down the just-created handle (mirroring the createWebGLBackend failure path), keep the
+    // live canvas + currentBackend untouched, and warn. (An EXPLICIT setBackend to an unsupported
+    // backend still throws via installBackend — only this silent upgrade stays on canvas.)
+    if (this.ptSpecs.size > 0 && !next.backend.supportsPassThrough) {
+      next.backend.destroy();
+      if (next.element !== this.host) next.element.remove();
+      if (!this.destroyed)
+        console.warn("d3gl: pass-through layers kept on the canvas backend (the upgrade target does not support pass-through)");
+      return false;
+    }
+    this.installBackend(next, token, "webgl");
+    return this.handle === next;
   }
 }
 
