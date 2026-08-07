@@ -119,8 +119,16 @@ export interface DrawableOpts {
 
 export interface GroupBuilder {
   drawable(id: string | number, draw: (ctx: PathRecorder) => void, opts?: DrawableOpts): void;
-  /** A single filled circle at (x, y) with the given radius (reference px). */
-  point(id: string | number, x: number, y: number, radius: number): void;
+  /**
+   * A single circle at (x, y) with the given radius (reference px), filled and — when
+   * `lineWidth > 0` — stroked on that radius, i.e. covering `[radius − w/2, radius + w/2]`
+   * in the stroke colour. That is the **ring encoding** for a bordered glyph (a disc with a
+   * border of thickness `w` inside outer radius `R` is `radius = R − w/2`, `lineWidth = w`),
+   * the exact vector equivalent of what the instanced-circle fragment shader paints — and
+   * unlike two stacked discs it composites each region ONCE, so a translucent fill keeps its
+   * ring (#269). `points()` (GeoJSON MultiPoint) has no ring semantics and stays fill-only.
+   */
+  point(id: string | number, x: number, y: number, radius: number, lineWidth?: number): void;
   /** Multiple circles (one drawable, e.g. a GeoJSON MultiPoint). */
   points(id: string | number, centers: readonly [number, number][], radius: number): void;
 }
@@ -385,7 +393,7 @@ export class Scene {
   private builderFor(data: GroupData): GroupBuilder {
     return {
       drawable: (id, draw, opts) => this.addDrawable(data, id, draw, opts),
-      point: (id, x, y, radius) => this.addCircleDrawable(data, id, [[x, y]], radius),
+      point: (id, x, y, radius, lineWidth) => this.addCircleDrawable(data, id, [[x, y]], radius, lineWidth),
       points: (id, centers, radius) => this.addCircleDrawable(data, id, centers, radius),
     };
   }
@@ -497,6 +505,7 @@ export class Scene {
     id: string | number,
     centers: readonly [number, number][],
     r: number,
+    lineWidth = 0,
   ): void {
     if (data.idToDrawable.has(id)) throw new Error(`duplicate drawable id: ${String(id)}`);
     const drawableId = data.ranges.length;
@@ -505,7 +514,12 @@ export class Scene {
     data.circles.push(centers.map(([x, y]) => ({ x, y, r })));
     data.circleCount += centers.length;
     data.ids.push(id);
-    data.lineWidths.push(0);
+    // A circle drawable carries its stroke ANALYTICALLY (Canvas `ctx.stroke()` after `arc()`,
+    // SVG `<circle stroke-width>`) — there is no tessellated stroke range, so the ring costs
+    // zero extra geometry. NOTE: the WebGL *Scene* point pass draws the fill disc only and
+    // ignores this width (#276); the network — the only ring producer — renders its glyphs
+    // through the WebGL *instanced* lane, which paints the ring in-shader.
+    data.lineWidths.push(lineWidth);
     data.joins = pushCode(data.joins, 0, drawableId);
     data.caps = pushCode(data.caps, 0, drawableId);
     data.miterLimits = pushLimit(data.miterLimits, DEFAULT_MITER_LIMIT, drawableId);

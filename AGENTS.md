@@ -409,21 +409,40 @@ incompatible with the batched single-pass painter order) would fully remove. It'
 (position-tolerant) and opaque strokes are unaffected. luma.gl has no high-level arc/stroke
 primitive to lean on — strokes are flattened to polylines (`PathRecorder`) and triangulated here.
 
-**One deliberate export divergence (#200).** A *bordered circle* serializes differently per path,
-and this is intended. The WebGL export emits ONE circle stroked on the ring centreline —
-`r·(1 − b/2)` with `stroke-width = r·b` — which is what the fragment shader actually paints, and
-what `traceFrontierHalos` (`network/glyphs.ts`) already emits for the aggregate halo. The Scene path
-behind Canvas/SVG emits TWO stacked discs (`traceFrontierFills` inner + `traceFrontierBorders`
-outer). They read identically for an **opaque** fill and diverge for a **translucent** one, where
-the stacked pair paints an opaque inner disc over the ring and loses it. So the ring encoding is the
-more correct of the two — do **not** "fix" the WebGL side toward the stacked pair to make the counts
-match. `network/__tests__/network-export.browser.test.ts` pins both shapes. Moving the Scene path
-onto the ring encoding is #269.
+**A bordered circle is ONE stroked ring on every path — never two stacked discs (#200, #269).**
+Encode it as a single circle on the ring centreline: radius `r·(1 − b/2)` with `stroke-width = r·b`,
+so the stroke covers `[r·(1 − b), r]` and the fill shows through inside it. That is what the
+instanced-circle fragment shader paints, so all three backends agree — `circlesToDrawables`
+(`core/instanced-vector.ts`) for the WebGL export, `traceFrontierGlyphs` + `emitNodes` and
+`traceFrontierHalos` (`network/glyphs.ts`) for the retained Scene behind Canvas/SVG, via
+`GroupBuilder.point(id, x, y, radius, lineWidth)`.
+
+The Scene path used to stack a border disc under a smaller fill disc. Identical for an **opaque**
+fill, wrong for a **translucent** one: the fill disc composites over the border disc, so the ring
+colour bleeds through the glyph's interior (12.1% of the frame in the harness). Do **not** re-derive
+a bordered glyph as two discs on any backend. Two guards:
+`network/__tests__/network-export.browser.test.ts` asserts both paths export the same `<circle
+r stroke-width>`, and the harness case below pixel-diffs the instanced lane against the Scene twin.
+
+One residual, inherent to fill+stroke: a circle's stroke **straddles** its path, so the ring's inner
+half (`[r·(1 − b), r·(1 − b/2)]`, ~23% of the disc) lands on the fill. With an opaque ring that is
+invisible (0 mismatching pixels measured); with a **translucent** ring it double-blends there —
+~1.16%, the #46 translucent-stroke residual in circle form, pinned by the #155 harness case at <0.02.
+Removing it needs a fill radius decoupled from the stroke radius, i.e. two drawables again, which
+loses the single-composite property that matters more.
+
+**The WebGL *Scene* point pass ignores a circle's `lineWidth`** (it draws the fill disc only, from
+`pointCenters`) — see #276. Not reachable in the product: the network, the only ring producer,
+renders through the WebGL *instanced* lane and only builds the Scene for Canvas/SVG. But a
+ring-encoded circle put in a Scene and rendered through WebGL loses its ring, so keep harness cases
+for it on the instanced-lane-vs-Scene-twin comparison (as `fadedGlyphs` / `translucentBorderedGlyphs`
+do), not on the three-way Scene diff.
 
 Guard it with the **backend-equivalence harness**
 (`map/__tests__/backend-equivalence-harness.ts` + `map/backend-equivalence.browser.test.ts`):
 it renders a Scene through both backends and pixel-diffs them (cases: overlapping bordered
-shapes for draw order, thick polylines for joins/caps). Use a **position-tolerant** diff
+shapes for draw order, thick polylines for joins/caps, a translucent-fill bordered glyph for the
+ring encoding). Use a **position-tolerant** diff
 (radius ≥ 1) — WebGL's tessellated stroke and Canvas's native stroker land ~1px apart along
 edges, so an exact-position diff reports ~6% noise that isn't a real divergence. The live
 `website` "Backend equivalence" example renders both scenes in all three backends side by

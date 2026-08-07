@@ -179,7 +179,7 @@ describe("network() engine", () => {
     net.destroy();
   });
 
-  it("exports a collapsed module map to SVG with border discs, halo rings and half-arrow super-edges (#138)", async () => {
+  it("exports a collapsed module map to SVG with bordered rings, halo rings and half-arrow super-edges (#138)", async () => {
     const net = network(host(), { width: 200, height: 200, backend: "svg" });
     await net.whenReady();
     const g = buildGraph({ nodeCount: 4, source: [0, 2, 1], target: [1, 3, 2], directed: true, nodeFlow: [0.3, 0.2, 0.3, 0.2] });
@@ -195,7 +195,7 @@ describe("network() engine", () => {
         linkStyle: "half-arrow",
         linkBend: 20,
         linkWidth: 4,
-        flowBorder: { flow: "strength", scale: (v) => v, color: "#123456" }, // → stacked border discs
+        flowBorder: { flow: "strength", scale: (v) => v, color: "#123456" }, // → a stroked ring per glyph
       })
       // aggregateOutline is a LOD option (the ring marks collapsed modules) → halo rings around aggregates.
       .lod({ modules, expandPx: 20, maxAggregateRadius: 24, aggregateOutline: { width: 1.5, gap: 2.5, color: "#3a3f52" } })
@@ -204,8 +204,9 @@ describe("network() engine", () => {
     net.setTransform({ k: 1, x: 0, y: 0 });
     net.syncScreenGeometry();
     const svg = net.toSVG();
-    // Two collapsed aggregates, each a border disc under a fill disc → 4 circles.
-    expect((svg.match(/<circle/g) ?? []).length).toBe(4);
+    // Two collapsed aggregates, each ONE ring-encoded circle (fill + the border as its stroke, #269).
+    expect((svg.match(/<circle/g) ?? []).length).toBe(2);
+    expect((svg.match(/<circle[^/]*stroke-width=/g) ?? []).length).toBe(2); // …and both carry the ring
     // The aggregate-outline ring is a stroked arc per aggregate (2) + the fused half-arrow super-edge
     // between the two modules (1) → at least 3 path elements; the half-arrow path is filled.
     expect((svg.match(/<path/g) ?? []).length).toBeGreaterThanOrEqual(3);
@@ -343,7 +344,7 @@ describe("network() engine", () => {
     net.destroy();
   });
 
-  it("exports a flow border to SVG as a border disc under a smaller fill disc (two circles per node)", async () => {
+  it("exports a flow border to SVG as ONE stroked ring per node (#269)", async () => {
     const net = network(host(), { width: 200, height: 200, backend: "svg" });
     await net.whenReady();
     const g = buildGraph({ nodeCount: 3, source: [0, 1], target: [1, 2] });
@@ -357,12 +358,19 @@ describe("network() engine", () => {
       .layout({ backend: "positions", positions: new Float32Array([20, 20, 100, 100, 180, 40]) });
 
     const svg = net.toSVG();
-    // One border disc + one fill disc per node = 6 circles (vs 3 with no flow border).
-    expect((svg.match(/<circle/g) ?? []).length).toBe(6);
+    // ONE circle per node, the border carried as its stroke — never a second, stacked disc, which
+    // would paint over the ring for a translucent fill (#269).
+    expect((svg.match(/<circle/g) ?? []).length).toBe(3);
+    // r = 10, flow 4 ⇒ ring 4 wide, centreline 10 − 2 = 8.
+    expect((svg.match(/r="8"[^/]*stroke-width="4"/g) ?? []).length).toBe(3);
 
-    // Disabling the border returns to 3 circles (the node-borders layer clears, not lingers).
+    // Disabling the border keeps 3 circles at the full radius and drops the ring (none lingers);
+    // the links keep their own stroke-width, so scope the check to the node circles.
     net.style({ flowBorder: undefined });
-    expect((net.toSVG().match(/<circle/g) ?? []).length).toBe(3);
+    const plain = net.toSVG();
+    expect((plain.match(/<circle/g) ?? []).length).toBe(3);
+    expect((plain.match(/<circle[^/]*stroke-width=/g) ?? []).length).toBe(0);
+    expect((plain.match(/<circle[^/]*r="10"/g) ?? []).length).toBe(3);
 
     net.destroy();
   });

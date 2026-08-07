@@ -78,16 +78,16 @@ describe("network toSVG() on the WebGL backend (#200)", () => {
     cv.destroy();
   });
 
-  // A BORDERED circle exports DIFFERENTLY on the two paths, deliberately. WebGL emits one circle
-  // stroked on the ring centreline (r·(1−b/2), stroke-width r·b) — what the fragment shader actually
-  // paints, and what `traceFrontierHalos` already emits for the aggregate halo. The Scene path used
-  // by Canvas/SVG emits two stacked discs (`traceFrontierFills` inner + `traceFrontierBorders`
-  // outer). Both read identically for an OPAQUE fill; they diverge for a translucent one, where the
-  // stacked pair paints an opaque inner disc over the ring. Pinned here so the difference stays a
-  // deliberate choice rather than a latent surprise — and so nobody "fixes" the WebGL side toward
-  // the stacked pair. Moving the Scene path onto the ring encoding is #269.
-  it("bordered nodes: WebGL exports a stroked ring, Canvas exports stacked discs — pinned, not accidental", async () => {
-    const style = { nodeRadius: 8, nodeFill: "#1f77b4", nodeBorder: { width: 3, color: "#ff0000" } } as const;
+  // A BORDERED circle exports the SAME shape on both paths (#269): ONE circle stroked on the ring
+  // centreline (r·(1−b/2), stroke-width r·b) — what the WebGL fragment shader actually paints, and
+  // what `traceFrontierHalos` emits for the aggregate halo. The Scene path behind Canvas/SVG used
+  // to emit two stacked discs, which paint the fill disc OVER the ring — indistinguishable for an
+  // opaque fill, but a translucent fill then shows the ring colour through it. Asserting equality
+  // (not just matching counts) keeps both paths on the ring encoding.
+  it("bordered nodes: WebGL and Canvas both export ONE stroked ring per node", async () => {
+    // A TRANSLUCENT fill — the case the stacked-disc encoding got wrong. Under it the fill disc
+    // painted over the border disc, so this glyph's interior read the ring colour through it.
+    const style = { nodeRadius: 8, nodeFill: "rgba(31, 119, 180, 0.5)", nodeBorder: { width: 3, color: "#ff0000" } } as const;
 
     const gl = network(host(), { width: 200, height: 200 }); // webgl default
     await gl.whenReady();
@@ -101,11 +101,21 @@ describe("network toSVG() on the WebGL backend (#200)", () => {
     cv.setTransform({ k: 1, x: 0, y: 0 });
     const b = cv.toSVG();
 
-    // WebGL: ONE circle per node, carrying the ring as a stroke.
+    // ONE circle per node on BOTH paths, each carrying the ring as a stroke.
     expect(count(a, "circle")).toBe(3);
+    expect(count(b, "circle")).toBe(count(a, "circle"));
     expect(a).toMatch(/stroke-width/);
-    // Canvas: TWO discs per node (border disc + fill disc), no stroked ring.
-    expect(count(b, "circle")).toBe(6);
+    expect(b).toMatch(/stroke-width/);
+    // Same geometry, not merely the same element count: r = 8, b = 3/8 ⇒ centreline 8·(1−3/16) = 6.5
+    // with stroke-width 3. Both documents must carry that ring on every node.
+    const rings = (svg: string): number => (svg.match(/r="6\.5"[^/]*stroke-width="3"/g) ?? []).length;
+    expect(rings(a)).toBe(3);
+    expect(rings(b)).toBe(3);
+    // The ring is an OPAQUE stroke over a half-transparent fill on both paths — nothing occludes it.
+    for (const svg of [a, b]) {
+      expect((svg.match(/<circle[^/]*fill="rgba\(31, 119, 180, 0\.5/g) ?? []).length).toBe(3);
+      expect((svg.match(/<circle[^/]*stroke="rgba\(255, 0, 0, 1/g) ?? []).length).toBe(3);
+    }
 
     gl.destroy();
     cv.destroy();
