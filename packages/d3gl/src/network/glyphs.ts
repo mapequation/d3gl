@@ -1341,10 +1341,34 @@ export function networkLayersFromCache(graph: NetworkGraph, style: ResolvedNetwo
 // networks and toSVG() produces publication output, reusing the existing pipeline.
 // ---------------------------------------------------------------------------
 
-/** Emit each node as a circle (point) drawable, keyed by node index, sized by its resolved radius. */
-export function emitNodes(g: GroupBuilder, graph: NetworkGraph, radii: Float32Array): void {
+/**
+ * Emit ONE bordered-circle drawable — the **ring encoding** (#269), the exact vector twin of what
+ * the instanced-circle fragment shader paints: a circle on the ring centreline `(outer + inner)/2`
+ * stroked `outer − inner` wide, so the stroke covers `[inner, outer]` and the fill shows through
+ * inside it. Each region composites ONCE, so a translucent fill keeps its ring — unlike two stacked
+ * discs, where the fill disc paints over the border disc and the ring bleeds through the fill.
+ * `inner >= outer` (no border) degrades to a plain filled disc.
+ */
+function ringPoint(g: GroupBuilder, id: number, cx: number, cy: number, outer: number, inner: number): void {
+  const w = outer - inner;
+  if (!(w > 0 && outer > 0)) {
+    g.point(id, cx, cy, outer);
+    return;
+  }
+  g.point(id, cx, cy, outer - w / 2, w);
+}
+
+/**
+ * Emit each node as a circle (point) drawable, keyed by node index, sized by its resolved radius.
+ * With `innerRadii` (the flow/const border's inner radius per node) the glyph is ring-encoded —
+ * one circle stroked `radius − inner` wide on the ring centreline; see {@link ringPoint}.
+ */
+export function emitNodes(g: GroupBuilder, graph: NetworkGraph, radii: Float32Array, innerRadii?: Float32Array): void {
   for (let i = 0; i < graph.nodeCount; i++) {
-    g.point(i, graph.positions[i * 2]!, graph.positions[i * 2 + 1]!, radii[i]!);
+    const x = graph.positions[i * 2]!;
+    const y = graph.positions[i * 2 + 1]!;
+    if (innerRadii) ringPoint(g, i, x, y, radii[i]!, innerRadii[i]!);
+    else g.point(i, x, y, radii[i]!);
   }
 }
 
@@ -1477,25 +1501,21 @@ export function rgbaCss(colors: Uint8Array, i: number): string {
 }
 
 /**
- * Trace the LOD frontier's **fill discs** (the inner disc under any border ring) into a Scene group,
- * keyed by tree-node id. Mirrors {@link frontierCircles}' radius/border semantics: with a border, the
- * fill radius is `radius·(1 − borderFraction)` — the smaller disc the {@link emitNodes} stacked-disc
- * border path also draws (the border disc itself is {@link traceFrontierBorders}).
+ * Trace the LOD frontier's node glyphs into a Scene group as ONE ring-encoded circle each, keyed by
+ * tree-node id — the retained-Scene twin of the instanced circle lane, on the same encoding
+ * `circlesToDrawables` (core/instanced-vector.ts) exports and {@link traceFrontierHalos} already
+ * uses (#269). Mirrors
+ * {@link frontierCircles}' radius/border semantics: a `borders[i]` fraction `b` means the ring
+ * occupies `[r·(1 − b), r]`, so the circle sits at `r·(1 − b/2)` and is stroked `r·b` wide. The
+ * layer's `fill` accessor colours the disc and its `stroke` accessor the ring, both read from the
+ * SoA byte buffers via {@link rgbaCss}. No border ⇒ a plain filled disc.
  */
-export function traceFrontierFills(g: GroupBuilder, circles: InstancedCirclesData, frontier: Uint32Array): void {
+export function traceFrontierGlyphs(g: GroupBuilder, circles: InstancedCirclesData, frontier: Uint32Array): void {
   const { centers, radii, borders } = circles;
   for (let i = 0; i < circles.count; i++) {
-    const inner = borders ? radii[i]! * (1 - borders[i]!) : radii[i]!;
-    g.point(frontier[i]!, centers[i * 2]!, centers[i * 2 + 1]!, inner);
-  }
-}
-
-/** Trace the LOD frontier's **border discs** (the outer ring-colour disc under each fill), keyed by tree-node id. Empty when the frontier has no border. */
-export function traceFrontierBorders(g: GroupBuilder, circles: InstancedCirclesData, frontier: Uint32Array): void {
-  if (!circles.borders) return;
-  const { centers, radii } = circles;
-  for (let i = 0; i < circles.count; i++) {
-    g.point(frontier[i]!, centers[i * 2]!, centers[i * 2 + 1]!, radii[i]!);
+    const r = radii[i]!;
+    const inner = borders ? r * (1 - borders[i]!) : r;
+    ringPoint(g, frontier[i]!, centers[i * 2]!, centers[i * 2 + 1]!, r, inner);
   }
 }
 

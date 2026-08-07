@@ -19,7 +19,7 @@ import { clipFromView } from "../../webgl/transform.js";
 import { CanvasBackend } from "../../canvas/canvas-backend.js";
 import { WebGLBackend } from "../../webgl/webgl-backend.js";
 import { svgFromLayers } from "../../svg/index.js";
-import { traceFrontierBorders, traceFrontierFills, rgbaCss } from "../../network/glyphs.js";
+import { traceFrontierGlyphs, rgbaCss } from "../../network/glyphs.js";
 
 export interface PixelBuffer {
   width: number;
@@ -491,13 +491,13 @@ export function clippedShapes(width: number, height: number): Scene {
 }
 
 /**
- * The #155 cross-fade divergence, reproduced at the seam it actually lives on: a fading
- * (translucent) bordered glyph drawn by the WebGL **instanced circle** lane (fill + border
- * resolved per-fragment, composited ONCE at the fade alpha) vs its Canvas/SVG **Scene twin**
- * (`traceFrontierBorders` + `traceFrontierFills` — the LOD-on-Scene stacked-disc path, where
- * border disc and fill disc each composite at the fade alpha, so the fill region shows the
- * border through it → darker). Alphas are faded ×0.55 as a mid-transition cross-fade would;
- * two glyphs overlap (parent↔child mid-transition), compounding the effect.
+ * The #155 cross-fade case, at the seam it actually lives on: a fading bordered glyph drawn by the
+ * WebGL **instanced circle** lane (fill + border resolved per-fragment, composited ONCE at the fade
+ * alpha) vs its Canvas/SVG **Scene twin**. BOTH fill and ring are translucent here — the one thing
+ * the ring encoding (#269) cannot make exact, since a circle's stroke straddles its own path and so
+ * double-blends over the fill on the ring's inner half. Alphas are faded ×0.55 as a mid-transition
+ * cross-fade would; two glyphs overlap (parent↔child mid-transition), compounding the effect. See
+ * {@link translucentBorderedGlyphs} for the opaque-ring case, which IS exact.
  */
 export function fadedGlyphs(width: number, height: number): { circles: InstancedCirclesData; scene: Scene } {
   const fade = 0.55;
@@ -523,14 +523,60 @@ export function fadedGlyphs(width: number, height: number): { circles: Instanced
     borderColors.set([...n.border, alpha], i * 4);
   });
   const circles: InstancedCirclesData = { centers, radii, colors, borders, borderColors, count };
-  const frontier = new Uint32Array(count);
-  for (let i = 0; i < count; i++) frontier[i] = i;
+  return { circles, scene: glyphScene(circles) };
+}
+
+/**
+ * A TRANSLUCENT-fill bordered glyph over an opaque backdrop (#269): the case where the Scene
+ * path's encoding of a bordered circle is observable. The WebGL instanced lane resolves fill vs
+ * ring per fragment and composites each region ONCE; the Scene twin must do the same. Border is
+ * OPAQUE and near-black against a white backdrop, so an inner disc that composites the fill over
+ * the ring colour (the old stacked-disc encoding) reads ~120 RGB units off — far over the diff's
+ * 40-unit colour tolerance — while the correct encoding matches exactly.
+ */
+export function translucentBorderedGlyphs(width: number, height: number): { circles: InstancedCirclesData; scene: Scene } {
+  const nodes = [
+    { x: 0.34, y: 0.36, r: 0.19, fill: [31, 119, 180], border: 0.28 },
+    { x: 0.62, y: 0.42, r: 0.15, fill: [44, 160, 44], border: 0.34 },
+    { x: 0.45, y: 0.7, r: 0.13, fill: [255, 127, 14], border: 0.22 },
+  ];
+  const count = nodes.length;
+  const centers = new Float32Array(count * 2);
+  const radii = new Float32Array(count);
+  const colors = new Uint8Array(count * 4);
+  const borders = new Float32Array(count);
+  const borderColors = new Uint8Array(count * 4);
+  nodes.forEach((n, i) => {
+    centers[i * 2] = width * n.x;
+    centers[i * 2 + 1] = height * n.y;
+    radii[i] = Math.min(width, height) * n.r;
+    borders[i] = n.border;
+    colors.set([...n.fill, 128], i * 4); // translucent fill (α ≈ 0.5)
+    borderColors.set([17, 17, 17, 255], i * 4); // opaque near-black ring
+  });
+  const circles: InstancedCirclesData = { centers, radii, colors, borders, borderColors, count };
+  return { circles, scene: glyphScene(circles) };
+}
+
+/** The Scene twin of an instanced-circle layer: exactly what the network's LOD frontier traces
+ *  into the retained Scene for Canvas/SVG (`traceFrontierGlyphs` — one ring-encoded circle per
+ *  glyph), coloured from the same SoA byte buffers the instanced lane uploads. */
+function glyphScene(circles: InstancedCirclesData): Scene {
+  const frontier = new Uint32Array(circles.count);
+  for (let i = 0; i < circles.count; i++) frontier[i] = i;
   const scene = new Scene();
-  scene.group("glyph-borders", (g) => traceFrontierBorders(g, circles, frontier));
-  scene.group("glyph-fills", (g) => traceFrontierFills(g, circles, frontier));
-  for (let i = 0; i < count; i++) {
-    scene.setFill("glyph-borders", i, rgbaCss(borderColors, i));
-    scene.setFill("glyph-fills", i, rgbaCss(colors, i));
+  scene.group(GLYPH_GROUP, (g) => traceFrontierGlyphs(g, circles, frontier));
+  const borderColors = circles.borderColors;
+  for (let i = 0; i < circles.count; i++) {
+    scene.setFill(GLYPH_GROUP, i, rgbaCss(circles.colors, i));
+    if (borderColors) scene.setStroke(GLYPH_GROUP, i, rgbaCss(borderColors, i));
   }
-  return { circles, scene };
+  return scene;
+}
+
+const GLYPH_GROUP = "glyphs";
+
+/** The Scene layers `glyphScene` produces, in draw order. */
+export function glyphSceneLayers(scene: Scene): RenderLayer[] {
+  return [layerOf(scene, GLYPH_GROUP)];
 }

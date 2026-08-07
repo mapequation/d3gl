@@ -1,5 +1,5 @@
 import { BaseEngine, type BaseEngineOptions, type HoverHit, type InteractiveLayerOptions, type LaneInteractive, type NodeDragSession } from "../map/base-engine.js";
-import { networkLayers, networkLayersFromCache, noLodStyleCache, frontierCircles, frontierHalos, superEdges, makeSuperEdgesScratch, emitNodes, emitLinks, emitArrows, emitHalfLinks, traceFrontierFills, traceFrontierBorders, traceFrontierHalos, traceSuperHalfArrows, traceSuperLines, traceSuperArrows, physicalPieInstances, tracePieWedges, rgbaCss, pickNodes, regionNodes, resolveNodeRadii, resolveNodeRadiusAggregate, resolveImportance, resolveFlowBorder, resolveNodeColors, resolveLinkWidthOf, resolveLinkColorOf, resolveLinkStrokeOf, flowBorderInnerRadii, type ResolvedNetworkStyle, type NoLodStyleCache, type NodeRadiusSpec, type ImportanceSpec, type FlowBorderSpec, type ConstBorder, type LinkWidthSpec, type LinkColorSpec, type LinkStyle } from "./glyphs.js";
+import { networkLayers, networkLayersFromCache, noLodStyleCache, frontierCircles, frontierHalos, superEdges, makeSuperEdgesScratch, emitNodes, emitLinks, emitArrows, emitHalfLinks, traceFrontierGlyphs, traceFrontierHalos, traceSuperHalfArrows, traceSuperLines, traceSuperArrows, physicalPieInstances, tracePieWedges, rgbaCss, pickNodes, regionNodes, resolveNodeRadii, resolveNodeRadiusAggregate, resolveImportance, resolveFlowBorder, resolveNodeColors, resolveLinkWidthOf, resolveLinkColorOf, resolveLinkStrokeOf, flowBorderInnerRadii, type ResolvedNetworkStyle, type NoLodStyleCache, type NodeRadiusSpec, type ImportanceSpec, type FlowBorderSpec, type ConstBorder, type LinkWidthSpec, type LinkColorSpec, type LinkStyle } from "./glyphs.js";
 import { rgb } from "d3-color";
 import { ForceLayout, seedPositions, type ForceParams } from "./force.js";
 import { multilevelLayout, type CoarsenOptions } from "./coarsen.js";
@@ -1537,7 +1537,7 @@ export class Network extends BaseEngine {
    *  therefore still pays O(nodeCount + edgeCount) for the id arrays and id→index maps — this is
    *  O(layers): the right clear when the Scene must not cost anything at all (#201). */
   private clearNetworkScene(): void {
-    for (const name of [this.CONTAINER_LAYER, "links", "arrows", "node-halos", "node-borders", this.NODE_LAYER, this.PIE_LAYER]) {
+    for (const name of [this.CONTAINER_LAYER, "links", "arrows", "node-halos", this.NODE_LAYER, this.PIE_LAYER]) {
       this.removeLayer(name);
     }
     this.sceneActive = false;
@@ -2342,17 +2342,18 @@ export class Network extends BaseEngine {
     });
     // Aggregate-outline halo ring: only the LOD Scene path ({@link registerLODScene}) draws into it,
     // but it's registered empty here too so the layer slot exists in canonical order (links < arrows <
-    // node-halos < node-borders < nodes) — so a backend switch / LOD toggle re-registers into the same
+    // node-halos < nodes) — so a backend switch / LOD toggle re-registers into the same
     // slot and the ring never lingers above the nodes nor draws on a full-graph view.
     this.registerLayer({ name: "node-halos", data: [], ids: [], sizeMode: style.sizeMode, build: () => {} });
     // Per-node fill: a single colour, or the per-node accessor (categorical module colours, #104 rework).
     const fillSpec = this.styleOpts.nodeFill;
     const fillOf = typeof fillSpec === "function" ? (i: number) => fillSpec(i, graph) : () => style.nodeFill;
 
-    // Border (#104 N6/rework): the instanced lane draws the ring in-shader, but the Scene path has no
-    // per-element ring primitive — so render it as two stacked discs, a border-colour disc under a
-    // smaller fill disc (inner radius = radius − ring width). Handles both the flow border (per-node
-    // width) and the constant border (fixed px). Always registered (empty when off) so toggling clears it.
+    // Border (#104 N6/rework, #269): the instanced lane draws the ring in-shader; the Scene path draws
+    // the SAME ring encoding — one circle per node, filled with the node colour and stroked
+    // `radius − inner` wide on the ring centreline. Handles both the flow border (per-node width) and
+    // the constant border (fixed px); with no border `innerRadii === style.nodeRadii`, so the stroke
+    // width is 0 and the glyph is a plain filled disc — no separate layer to toggle or clear.
     const flow = style.flowBorder;
     const cb = style.constBorder;
     const borderColorCss = flow
@@ -2378,25 +2379,15 @@ export class Network extends BaseEngine {
       : cb
         ? Float32Array.from(style.nodeRadii, (r) => Math.max(0, r - Math.min(r, cb.width)))
         : style.nodeRadii;
-    const hasBorder = !!(flow || cb);
-    this.registerLayer({
-      name: "node-borders",
-      data: nodeIds,
-      ids: nodeIds,
-      sizeMode: style.sizeMode,
-      fill: (i) => borderColorAt(i as number),
-      build: (g) => {
-        if (emit && hasBorder) emitNodes(g, graph, style.nodeRadii);
-      },
-    });
     this.registerLayer({
       name: "nodes",
       data: nodeIds,
       ids: nodeIds,
       sizeMode: style.sizeMode,
       fill: (i) => fillOf(i as number),
+      stroke: (i) => borderColorAt(i as number),
       build: (g) => {
-        if (emit) emitNodes(g, graph, innerRadii);
+        if (emit) emitNodes(g, graph, style.nodeRadii, innerRadii);
       },
     });
     // Physical view of a state network (#171): overlapping-module physical nodes as filled arc-wedge pies,
@@ -2429,7 +2420,7 @@ export class Network extends BaseEngine {
    * ({@link superEdges}/{@link frontierHalos}/{@link frontierCircles}) into Scene drawables, keyed by
    * **stable tree-node id** (frontier node, or directed super-edge pair) so the retained-scene diff is
    * stable across re-cuts. Layers are registered in canonical draw order (links < arrows < node-halos <
-   * node-borders < nodes), each into the same slot the full-graph path uses, so toggling LOD or swapping
+   * nodes), each into the same slot the full-graph path uses, so toggling LOD or swapping
    * backends never reorders or leaves stale geometry. With `emit: false` every layer registers empty (the
    * frontier clear). Re-run at each interaction-end via {@link syncScreenGeometry} — the retained Scene
    * can't re-tessellate per frame, so the frontier is static during a gesture and snaps on release (the
@@ -2516,7 +2507,7 @@ export class Network extends BaseEngine {
       },
     });
 
-    // --- Frontier glyphs: a border-colour disc (when bordered) under the smaller fill disc. ---
+    // --- Frontier glyphs: one ring-encoded circle each (fill disc + the border as its stroke, #269). ---
     const circles = emit
       ? frontierCircles(tree, frontier, {
           nodeFill: style.nodeFill,
@@ -2530,23 +2521,14 @@ export class Network extends BaseEngine {
       : null;
     const circleIds = circles ? Array.from(frontier) : [];
     this.registerLayer({
-      name: "node-borders",
-      data: circleIds,
-      ids: circleIds,
-      sizeMode: style.sizeMode,
-      fill: (_d, i) => (circles?.borderColors ? rgbaCss(circles.borderColors, i) : ""),
-      build: (g) => {
-        if (circles) traceFrontierBorders(g, circles, frontier);
-      },
-    });
-    this.registerLayer({
       name: "nodes",
       data: circleIds,
       ids: circleIds,
       sizeMode: style.sizeMode,
       fill: (_d, i) => (circles ? rgbaCss(circles.colors, i) : ""),
+      stroke: (_d, i) => (circles?.borderColors ? rgbaCss(circles.borderColors, i) : ""),
       build: (g) => {
-        if (circles) traceFrontierFills(g, circles, frontier);
+        if (circles) traceFrontierGlyphs(g, circles, frontier);
       },
     });
   }

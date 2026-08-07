@@ -10,6 +10,8 @@ import {
   translucentFills,
   clippedShapes,
   fadedGlyphs,
+  translucentBorderedGlyphs,
+  glyphSceneLayers,
   layerOf,
   renderWebGLBackend,
   renderCanvasBackend,
@@ -196,8 +198,37 @@ describe("backend equivalence: clipped layer (#209)", () => {
   });
 });
 
-describe("backend equivalence: cross-fade glyph compositing (#155, pinned)", () => {
-  it("faded instanced glyphs (WebGL) vs their Scene twin (Canvas/SVG): divergence pinned", async () => {
+describe("backend equivalence: bordered glyph encoding (#269)", () => {
+  it("a TRANSLUCENT-fill bordered glyph composites identically on the instanced lane and its Scene twin", async () => {
+    const backdrop = backdropScene(W, H);
+    const { circles, scene } = translucentBorderedGlyphs(W, H);
+    // Exactly how the engine splits the network across backends: WebGL draws the node glyphs
+    // through the instanced circle lane (fill vs ring resolved per fragment, composited ONCE),
+    // Canvas/SVG draw the traced Scene twin.
+    const gl = await renderWebGLBackend([layerOf(backdrop, "backdrop")], W, H, {
+      instanced: [{ name: "glyphs", primitive: "circles", circles }],
+    });
+    const sceneLayers = [layerOf(backdrop, "backdrop"), ...glyphSceneLayers(scene)];
+    const cv = renderCanvasBackend(sceneLayers, W, H);
+    const svg = await renderSVG(sceneLayers, W, H);
+
+    // Sanity: an opaque backdrop ⇒ every pixel is compared, and the glyphs are ~20% of it, so a
+    // lost/misplaced ring or a double-composited fill disc cannot hide under the threshold.
+    const glCv = diffPixels(gl, cv);
+    expect(glCv.considered).toBe(W * H);
+    // The two Scene-path backends agree with each other…
+    expect(diffPixels(cv, svg).fraction).toBeLessThan(0.01);
+    // …and with the instanced lane. Measured 0 mismatching pixels of 40 000 — an OPAQUE ring over
+    // a translucent fill composites each region exactly once on both encodings. The stacked-disc
+    // encoding painted the fill disc OVER the border disc, so the whole inner disc (~(1−b)² ≈ 50%
+    // of each glyph) read the ring colour through it: 12.1% of the frame, 12× over this bound.
+    expect(glCv.fraction).toBeLessThan(0.01);
+    expect(diffPixels(gl, svg).fraction).toBeLessThan(0.01);
+  });
+});
+
+describe("backend equivalence: cross-fade glyph compositing (#155 residual, pinned)", () => {
+  it("faded instanced glyphs (WebGL) vs their Scene twin (Canvas/SVG): translucent-ring residual only", async () => {
     const backdrop = backdropScene(W, H);
     const { circles, scene } = fadedGlyphs(W, H);
     // WebGL draws the network LOD frontier through the instanced circle lane; Canvas/SVG
@@ -205,28 +236,24 @@ describe("backend equivalence: cross-fade glyph compositing (#155, pinned)", () 
     const gl = await renderWebGLBackend([layerOf(backdrop, "backdrop")], W, H, {
       instanced: [{ name: "glyphs", primitive: "circles", circles }],
     });
-    const sceneLayers = [
-      layerOf(backdrop, "backdrop"),
-      layerOf(scene, "glyph-borders"),
-      layerOf(scene, "glyph-fills"),
-    ];
+    const sceneLayers = [layerOf(backdrop, "backdrop"), ...glyphSceneLayers(scene)];
     const cv = renderCanvasBackend(sceneLayers, W, H);
     const svg = await renderSVG(sceneLayers, W, H);
 
     // The two Scene-path backends agree tightly with each other.
     expect(diffPixels(cv, svg).fraction).toBeLessThan(0.01);
 
-    // KNOWN DIVERGENCE #155 (pinned, not skipped): the instanced lane composites the whole
-    // glyph ONCE at the fade alpha, while the Scene twin stacks border disc + fill disc —
-    // the fill region composites twice and reads darker on Canvas/SVG. Measured ~9.3% of
-    // the frame (the glyphs' fill regions). The floor asserts the divergence (and this
-    // test's sensitivity to it) still exists — when #155 is fixed, it should trip and this
-    // pin should tighten to the usual <0.01. The ceiling fails if compositing drifts further.
+    // RESIDUAL #155 (was ~9.3%, now ~1.16% — measured). The ring encoding (#269) removed the
+    // stacked-disc part: the fill disc no longer paints over a border disc, so the glyph's
+    // interior composites exactly once, as the instanced lane does. What is left is inherent to
+    // the fill+stroke encoding when BOTH are translucent: a circle's stroke straddles its path,
+    // so the ring's inner half (`[r·(1−b), r·(1−b/2)]`, ~23% of the disc) lands ON the fill and
+    // double-blends there — the #46 translucent-stroke residual in circle form, and the reason
+    // that pin also sits at <0.02 rather than <0.01. A regression back to stacked discs scores
+    // ~9%, so this ceiling is the guard; the sharp guard is the opaque-ring case above (<0.01).
     const glCv = diffPixels(gl, cv);
     const glSvg = diffPixels(gl, svg);
-    expect(glCv.fraction).toBeGreaterThan(0.02);
-    expect(glCv.fraction).toBeLessThan(0.25);
-    expect(glSvg.fraction).toBeGreaterThan(0.02);
-    expect(glSvg.fraction).toBeLessThan(0.25);
+    expect(glCv.fraction).toBeLessThan(0.02);
+    expect(glSvg.fraction).toBeLessThan(0.02);
   });
 });
