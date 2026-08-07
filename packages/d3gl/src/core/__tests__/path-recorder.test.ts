@@ -61,10 +61,13 @@ describe("PathRecorder", () => {
     expect(sp.points).toEqual([0, 0, 10, 0, 10, 20, 0, 20]);
   });
 
-  it("throws on arcTo rather than recording subtly wrong geometry", () => {
+  it("flattens arcTo into a tangent arc (geometry pinned in arc-to.test.ts)", () => {
     const r = new PathRecorder();
     r.moveTo(0, 0);
-    expect(() => r.arcTo(10, 0, 10, 10, 5)).toThrow(/not implemented/);
+    r.arcTo(10, 0, 10, 10, 5);
+    const pts = r.subpaths[0]!.points;
+    expect(pts.length / 2).toBeGreaterThan(3);
+    expect(pts.slice(0, 2)).toEqual([0, 0]);
   });
 
   it("bakes translate() into every subsequent path coordinate", () => {

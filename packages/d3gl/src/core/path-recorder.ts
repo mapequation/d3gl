@@ -1,5 +1,5 @@
 import type { PathContext, Subpath } from "./path-context.js";
-import { flattenCubic, flattenQuadratic, flattenArc, DEFAULT_CURVE_TOLERANCE } from "./flatten.js";
+import { flattenCubic, flattenQuadratic, flattenArc, flattenArcTo, DEFAULT_CURVE_TOLERANCE } from "./flatten.js";
 
 /**
  * Records PathContext drawing calls into flattened polylines (subpaths).
@@ -100,14 +100,22 @@ export class PathRecorder implements PathContext {
     this.cy = this.current!.points[len - 1]!;
   }
 
-  arcTo(_x1: number, _y1: number, _x2: number, _y2: number, _radius: number): void {
-    // arcTo draws a tangent arc between two segments — NOT a polyline through the
-    // control points. A naive line approximation would silently diverge from the
-    // CanvasContext backend (which forwards to the real Canvas arcTo), so rather
-    // than record geometry that is subtly wrong, we fail fast. d3's path-emitting
-    // generators do not use arcTo; implement a real tangent-arc flattening when a
-    // consumer actually needs it.
-    throw new Error("PathRecorder.arcTo is not implemented yet");
+  arcTo(x1: number, y1: number, x2: number, y2: number, radius: number): void {
+    x1 += this.tx; y1 += this.ty; x2 += this.tx; y2 += this.ty;
+    if (!this.current) {
+      // Canvas semantics: with no subpath yet, arcTo only seeds one at the corner.
+      this.moveTo(x1 - this.tx, y1 - this.ty);
+      return;
+    }
+    const pts = this.current.points;
+    flattenArcTo(this.cx, this.cy, x1, y1, x2, y2, radius, this.tolerance, pts);
+    const lastX = pts[pts.length - 2];
+    const lastY = pts[pts.length - 1];
+    // Unchanged when the call was a no-op (non-finite argument) — pts still ends at (cx, cy).
+    if (lastX !== undefined && lastY !== undefined) {
+      this.cx = lastX;
+      this.cy = lastY;
+    }
   }
 
   rect(x: number, y: number, w: number, h: number): void {

@@ -17,7 +17,7 @@
  */
 export type { PathContext, Subpath } from "./path-context.js";
 export { PathRecorder } from "./path-recorder.js";
-export { flattenCubic, flattenQuadratic, flattenArc, DEFAULT_CURVE_TOLERANCE } from "./flatten.js";
+export { flattenCubic, flattenQuadratic, flattenArc, flattenArcTo, DEFAULT_CURVE_TOLERANCE } from "./flatten.js";
 export { tessellateFill } from "./tessellate.js";
 export type { FillGeometry } from "./tessellate.js";
 export { signedArea, pointInRing, groupRings } from "./rings.js";

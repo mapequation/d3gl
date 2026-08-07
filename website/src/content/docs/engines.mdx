@@ -95,8 +95,9 @@ an aspect-ratio change (possible in fill-parent mode) re-letterboxes the map to 
 
 ## Curve quality under zoom
 
-Curves you draw through a layer's `draw` callback — `arc`, `bezierCurveTo`, `quadraticCurveTo`,
-and anything a `d3-shape` generator emits — are **flattened to a polyline once**, when the layer
+Curves you draw through a layer's `draw` callback — `arc`, `arcTo`, `bezierCurveTo`,
+`quadraticCurveTo`, and anything a `d3-shape` generator emits — are **flattened to a polyline
+once**, when the layer
 is registered, in **world units**. Zooming only scales that baked polyline, so a facet measuring
 `t` world units measures `t x k` screen px at zoom `k`: at the default tolerance of `0.25`, a
 `k = 40` view shows ~10px flats on an arc rim.
