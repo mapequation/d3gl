@@ -1,7 +1,7 @@
 import { describe, it, expect } from "vitest";
 import { Scene } from "../core/index.js";
 import { MapController } from "./controller.js";
-import { perfBudget } from "../__tests__/perf-budget.js";
+import { perfBudget, perfN } from "../__tests__/perf-budget.js";
 
 const W = 256;
 const H = 256;
@@ -29,8 +29,15 @@ describe("performance budget", () => {
     document.body.appendChild(canvas);
     const controller = await MapController.create(canvas, { width: W, height: H });
 
-    const cols = 64;
-    const rows = 64; // 4096 cells
+    // Deliberately capped near its calibrated size (#262). This guard's central assertion is a
+    // RATIO — `recolorMs < buildMs * 0.25` — and buildMs is carried by an N-INDEPENDENT
+    // shader-compile constant while recolorMs is ~1µs/drawable of d3-color parsing. The ratio
+    // therefore inverts somewhere around 10k-50k drawables with no regression present at all, so
+    // scaling this leg with the tier would manufacture a false failure. Raising the cap means
+    // reformulating the assertion against an absolute per-drawable cost first.
+    const N = perfN(4096, { max: 8192 });
+    const cols = Math.max(1, Math.round(Math.sqrt(N)));
+    const rows = Math.max(1, Math.ceil(N / cols));
     const scene = grid(cols, rows);
     const ids = Array.from({ length: cols * rows }, (_, i) => `${i % cols}-${Math.floor(i / cols)}`);
 

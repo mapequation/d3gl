@@ -37,6 +37,12 @@ import { fileURLToPath } from "node:url";
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
 const FILE_BUDGET_MS = Number(process.env.PERF_BROWSER_FILE_BUDGET_MS) || 300_000;
 const SCALE = process.env.PERF_BUDGET_SCALE ?? "1";
+// Fixture scale for the guards (#262), reaching them through the __PERF_N__ define in
+// packages/d3gl/vitest.config.ts — browser tests cannot read process.env. Deliberately its own
+// variable rather than the node tier's PERF_N: that tier runs at 500k, which under SwiftShader
+// software GL would spend the whole per-file budget on geometry upload. Unset ⇒ each guard's
+// locally-calibrated default, i.e. the pre-#262 behaviour.
+const BROWSER_N = process.env.PERF_BROWSER_N ?? "";
 
 // The browser perf-guard naming convention: `<name>-perf.browser.test.ts(x)` or a
 // bare `perf.browser.test.ts(x)`.
@@ -74,11 +80,14 @@ if (guards.length === 0) {
   process.exit(1);
 }
 
-console.log(`browser perf tier: ${guards.length} guard file(s), PERF_BUDGET_SCALE=${SCALE}, budget ${FILE_BUDGET_MS}ms/file`);
+console.log(
+  `browser perf tier: ${guards.length} guard file(s), PERF_BUDGET_SCALE=${SCALE}, ` +
+    `PERF_BROWSER_N=${BROWSER_N || "(guard defaults)"}, budget ${FILE_BUDGET_MS}ms/file`,
+);
 for (const { file } of guards) console.log(`  ${relative(root, file)}`);
 
 // ---- run each file through its package's watchdog runner, timed ---------------------
-const env = { ...process.env, PERF_BUDGET_SCALE: SCALE };
+const env = { ...process.env, PERF_BUDGET_SCALE: SCALE, PERF_BROWSER_N: BROWSER_N };
 const results = [];
 for (const { pkgDir, file } of guards) {
   const watchdog = join(pkgDir, "scripts", "run-browser-tests.mjs");

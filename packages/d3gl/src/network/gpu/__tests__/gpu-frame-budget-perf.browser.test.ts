@@ -25,7 +25,7 @@ import { makeTestDevice } from "./_device.js";
 import { GpuForceLayout } from "../gpu-force-layout.js";
 import { buildGraph } from "../../graph.js";
 import type { LayoutGraph } from "../../force.js";
-import { perfBudget } from "../../../__tests__/perf-budget.js";
+import { perfBudget, perfN } from "../../../__tests__/perf-budget.js";
 
 /** Minimal seeded LCG PRNG — self-contained, no deps. */
 function makePrng(seed: number): () => number {
@@ -71,7 +71,7 @@ describe("GPU frame budget — pyramid path (per-tick regression tripwire)", () 
   let device: Device;
   beforeAll(async () => { device = await makeTestDevice(); });
 
-  it("single pyramid tick at N=30000 stays under the catastrophic-regression ceiling", () => {
+  it("a single pyramid tick stays under the catastrophic-regression ceiling", () => {
     // N=30000 nodes, 80 communities, pyramid repulsion (forced via repulsionMode).
     // SwiftShader is software GL, so absolute timings are slow but the relative
     // signature of a regression (order-of-magnitude slower) is still detectable.
@@ -80,9 +80,15 @@ describe("GPU frame budget — pyramid path (per-tick regression tripwire)", () 
     // N=30k. We set the ceiling at 10000ms (~10× the expected worst-case minimum)
     // so a genuine regression (e.g. O(n²) re-introduction adding another ~30× cost)
     // trips the assertion while normal run-to-run variance never does.
-    const N = 30_000;
-    const CEILING_MS = perfBudget(10_000);
-    const REPEATS = 3;
+    // The browser tier can raise N via PERF_BROWSER_N (#262). Capped: this file constructs the
+    // layout several times over and a 1M tick is ~30× a 30k one, which would spend the tier's whole
+    // 300s per-file budget here — the file would be killed rather than report a ceiling.
+    const LOCAL_N = 30_000; // the N the 10s ceiling was calibrated at
+    const N = perfN(LOCAL_N, { max: 200_000 });
+    // Linear in N. The only super-linear term is the pyramid's level count, and chooseGrid clamps G
+    // at 1024, so L moves just 9→11 across 30k→1M — well inside the ceiling's deliberate 10× headroom.
+    const CEILING_MS = perfBudget(10_000 * (N / LOCAL_N));
+    const REPEATS = N > 100_000 ? 2 : 3;
 
     const g = makeClusteredGraph(N, 80, 0xdeadbeef);
     const params = { repulsion: 200, attraction: 0.05, centering: 0.2, alpha: 0.05, theta: 0.7 };

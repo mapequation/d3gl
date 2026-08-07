@@ -295,9 +295,9 @@ git -C <primary> checkout -- <files>                         # restore primary t
   `BENCH_<NAME>_LABEL` (report label). Report-only benches are still guarded by the
   per-file budget; add `PERF_ASSERT`-gated ceilings for real assertions (see
   `lod-perf.bench.test.ts`). Local report-only runs (no `PERF_ASSERT`) are unchanged.
-- **Browser perf tier** (`ci.yml` job `perf-browser`, #247, **advisory** —
-  `continue-on-error`, keep it out of branch protection until it has a flake-free
-  record): `node scripts/run-browser-perf-tier.mjs` runs every browser per-frame
+- **Browser perf tier** (`ci.yml` job `perf-browser`, #247, **blocking as of #262** — promoted on
+  a 10-of-11-green record whose single red was the tier's own injected-regression proof; add it to
+  branch protection alongside `policy`): `node scripts/run-browser-perf-tier.mjs` runs every browser per-frame
   guard headless (SwiftShader software GL on CI runners), one watchdogged process
   per file. Discovery is **pattern-driven**: a file named `*-perf.browser.test.ts`
   (or bare `perf.browser.test.ts`) under `packages/*/src` is enrolled automatically —
@@ -305,7 +305,10 @@ git -C <primary> checkout -- <files>                         # restore primary t
   locally-calibrated numbers multiplied by `PERF_BUDGET_SCALE` (CI sets it for
   SwiftShader; unset = 1 = local budgets) via
   `packages/d3gl/src/__tests__/perf-budget.ts` — never loosen a local budget for
-  CI's sake, and never scale a deterministic (count/pixel) assertion.
+  CI's sake, and never scale a deterministic (count/pixel) assertion. **`PERF_BROWSER_N`** (CI:
+  100000) sets the fixture size via the `__PERF_N__` define + `perfN()`; it is a separate variable
+  from the node tier's `PERF_N` because SwiftShader cannot carry 500k. Browser tests cannot read
+  `process.env` — a define is the only way in.
 
 ### Perf-guard coverage map (#258 — check here before claiming a cell is covered)
 
@@ -331,16 +334,41 @@ per-file timeout. Every at-scale leg below now asserts. When you add a guard, ad
 | LOD super-edge **build** | — | `network/__tests__/super-edges-build.test.ts` | equivalence | `BENCH_SUPER_EDGES_BUILD` |
 | retained memory | — | `core/point-memory.bench.test.ts` | — | `BENCH_MEM` |
 | declutter allocation | — | `core/declutter-alloc.bench.test.ts` | — | — |
-| plot lane, per-frame | **WebGL** | `map/plot-points-perf.browser.test.ts` | 5k | ✗ **no scale knob** |
-| declutter flags upload | **WebGL** | `map/declutter-flags-perf.browser.test.ts` | 2k engine / 1M fn | ✗ |
-| hover overlay reuse | **WebGL** | `map/hover-overlay-perf.browser.test.ts` | 100 glyphs | ✗ |
-| instanced pie | **WebGL** | `webgl/__tests__/instanced-pie-perf.browser.test.ts` | 100k | ✗ |
-| GPU layout tick | **WebGL** | `network/gpu/__tests__/gpu-frame-budget-perf.browser.test.ts` | 30k | ✗ |
+| plot lane, per-frame | **WebGL** | `map/plot-points-perf.browser.test.ts` | 5k | `PERF_BROWSER_N` |
+| declutter flags upload | **WebGL** | `map/declutter-flags-perf.browser.test.ts` | 2k engine / 1M fn | `PERF_BROWSER_N` (max 2M) |
+| hover overlay reuse | **WebGL** | `map/hover-overlay-perf.browser.test.ts` | 1000 glyphs / 125 hover changes | ✗ **deliberately unscaled** |
+| instanced pie | **WebGL** | `webgl/__tests__/instanced-pie-perf.browser.test.ts` | 100k | `PERF_BROWSER_N` |
+| GPU layout tick | **WebGL** | `network/gpu/__tests__/gpu-frame-budget-perf.browser.test.ts` | 30k | `PERF_BROWSER_N` (max 200k) |
+| React recolor vs build | **WebGL** | `react/perf.browser.test.ts` | 4096 | capped at 8192 — see below |
 
-**Known holes, tracked:** WebGL guards take no scale variable and their tier is advisory, so the
-default backend is the least-gated path; the at-scale legs drive **backends**, not engines, so the
-layer above the backend seam (accessors, lane emit, LOD integration) is only covered at N ≤ 5000;
-geo's at-scale leg is Canvas-only. Don't read a green tier as "WebGL is fast at 1M".
+**Known holes, tracked:** the at-scale legs drive **backends**, not engines, so the layer above the
+backend seam (accessors, lane emit, LOD integration) is only covered at N ≤ 5000 (#263); geo's
+at-scale leg is Canvas-only (#264).
+
+**Two guards are deliberately NOT scaled, and both would go *vacuously green* if you scaled them:**
+- `hover-overlay-perf` — its layout is a **contract**, not just a size: the 12px cell pitch must stay
+  larger than the 8px glyph so `gap(i)` is genuinely empty and `center(i)` is a distinct target.
+  Grow the glyph count at a fixed viewport and consecutive centres land on the same device pixel,
+  `onPointerMove`'s same-target early exit fires, **no re-target happens at all** — and `built === 0`
+  plus a tiny median both still pass. Scaling it needs a target-strip / bulk-block split so the
+  sweep targets keep their 8px pitch while the bulk supplies the O(N) recomposite. A non-vacuity
+  assertion now pins the contract so this can't rot silently.
+- `react/perf` — its central assertion is a **ratio** (`recolorMs < buildMs * 0.25`), and `buildMs`
+  is carried by an N-independent shader-compile constant while recolor is ~1µs/drawable of
+  d3-color parsing. The ratio inverts somewhere around 10k-50k drawables **with no regression
+  present**. Raising its cap means reformulating against an absolute per-drawable cost first.
+
+**Scaling a browser guard:** size the fixture with `perfN(localDefault, { max })` from
+`packages/d3gl/src/__tests__/perf-budget.ts` — `max` is mandatory thinking, not decoration, because
+each guard hits a different hard wall (the style tables are a 256-wide `GrowTexture`, so past ~2.1M
+rows `createTexture` fails at `setLayers` — an error, not a budget; the SVG legs materialise one DOM
+node per drawable; the hover guard holds two live charts). Then **split any wall-clock ceiling into
+its constant and linear terms** — `perfBudget(c0 + c1 * N / localDefault)`, reducing to exactly the
+calibrated number at the local default. Scaling the whole ceiling by `N/local` instead inflates the
+constant term and hides a real regression at large N; not scaling it at all makes the guard fail on
+the tier's first real run, and the "fix" someone then reaches for is loosening the constant.
+Deterministic assertions (counts, identity, pixels) take N straight from the same `perfN` value and
+are never given slack by either knob.
 
 **Writing an at-scale leg:** gate it `BENCH_<NAME>`, read its size from `BENCH_<NAME>_N` (the tier
 sets it to `$PERF_N` — do **not** hard-code, two benches used to and silently ignored the tier),

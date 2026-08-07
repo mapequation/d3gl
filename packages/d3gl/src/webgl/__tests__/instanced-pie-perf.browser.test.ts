@@ -5,7 +5,7 @@ import { webgl2Adapter } from "@luma.gl/webgl";
 import { InstancedPie } from "../instanced.js";
 import { clipFromView } from "../index.js";
 import type { InstancedPieData } from "../../core/index.js";
-import { perfBudget } from "../../__tests__/perf-budget.js";
+import { perfBudget, perfN } from "../../__tests__/perf-budget.js";
 
 /**
  * Per-frame regression guard for the pie glyph (#171). The pie rides the instanced lane like circles:
@@ -18,7 +18,13 @@ import { perfBudget } from "../../__tests__/perf-budget.js";
  * Also exercises the in-place `update()` path (a re-emit at the same count) — it must sub-upload, not
  * reallocate.
  */
-const N = 100_000; // wedge instances
+const N = perfN(100_000); // wedge instances; the browser tier can raise it via PERF_BROWSER_N (#262)
+// The per-frame cost is c0 + c1*N — a constant pass setup (clear, uniform upload, submit) plus 4N
+// vertex invocations. Splitting the calibrated 50ms into those two terms is what lets N scale
+// without the ceiling becoming either a false failure or meaningless: at the local default this
+// reduces to exactly 50ms, and at a tier N it tracks the honest linear growth. Scaling the whole
+// 50ms by N/100k instead would inflate the constant term and hide a real regression at large N.
+const FRAME_MS = perfBudget(10 + 40 * (N / 100_000));
 
 function makePie(n: number): InstancedPieData {
   const centers = new Float32Array(n * 2);
@@ -85,8 +91,8 @@ describe("InstancedPie per-frame cost (#171)", () => {
 
     // (1) Deterministic signature: NOT ONE buffer created during the sweep (no per-frame rebuild).
     expect(created).toBe(builtAllocations);
-    // (2) Frame budget: generous ceiling (a per-frame 100k-instance buffer rebuild would blow past this).
-    expect(elapsed / FRAMES).toBeLessThan(perfBudget(50));
+    // (2) Frame budget: generous ceiling (a per-frame N-instance buffer rebuild would blow past this).
+    expect(elapsed / FRAMES, `${(elapsed / FRAMES).toFixed(1)}ms/frame at N=${N.toLocaleString()}`).toBeLessThan(FRAME_MS);
 
     // In-place update() at the SAME count must sub-upload, not reallocate.
     const before = created;

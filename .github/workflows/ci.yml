@@ -70,18 +70,19 @@ jobs:
   # scripts/run-browser-perf-tier.mjs), so guards added by future PRs are enrolled
   # automatically on merge — no workflow edit needed. Expected runtime ~5-10 min.
   #
-  # ADVISORY: continue-on-error keeps a red tier from failing the CI workflow run, and
-  # the job must NOT be added to branch protection while its SwiftShader budgets are
-  # young. PERF_BUDGET_SCALE multiplies the guards' locally-calibrated wall-clock
-  # ceilings and test timeouts for the slower software-GL runners (deterministic
-  # allocation/call-count assertions never scale — those stay exact everywhere).
-  # Promote it later — once it has a flake-free record — by deleting the
-  # continue-on-error line, then (optionally) adding "perf-browser" to the required
-  # status checks alongside "policy".
+  # BLOCKING as of #262 (was advisory under #247). Promotion evidence: 10 of 11 runs green,
+  # and the single red was on the tier's OWN development branch (PR #256, an injected-regression
+  # red-run) — 7 consecutive green runs on real branches since, at 79-98s each against a
+  # 30-minute job timeout. #257 (wall-clock budget stability) has landed in between.
+  # WebGL is the default backend; leaving its only per-frame tier unable to fail the build meant
+  # the least-guarded path had the weakest gate.
+  # PERF_BUDGET_SCALE multiplies the guards' locally-calibrated wall-clock ceilings and test
+  # timeouts for the slower software-GL runners (deterministic allocation/call-count assertions
+  # never scale — those stay exact everywhere). PERF_BROWSER_N sets the fixture size.
+  # Add "perf-browser" to the required status checks alongside "policy" to complete the promotion.
   perf-browser:
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v6
 
@@ -109,3 +110,11 @@ jobs:
           # margin). Raise if the tier flakes on timing; the deterministic signatures
           # are unaffected either way.
           PERF_BUDGET_SCALE: "4"
+          # Fixture size for the guards (#262). Deliberately below the node tier's PERF_N=500000:
+          # SwiftShader is software GL, and three independent hard walls sit above this — the
+          # 256-wide style GrowTexture (~2.1M rows), one DOM node per drawable in the SVG export
+          # legs, and two simultaneously-live charts in the hover guard. Measured locally: the whole
+          # tier runs 61s at 100k (vs 51s at the old hardcoded defaults), against a 300s per-file
+          # kill. Raise it once the tier has a record at this scale — it is a one-line change, and
+          # each guard clamps itself via `perfN(local, { max })`.
+          PERF_BROWSER_N: "100000"

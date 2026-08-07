@@ -22,8 +22,18 @@ import { perfBudget } from "../__tests__/perf-budget.js";
  */
 
 const W = 480, H = 320;
+// DELIBERATELY NOT `perfN` (#262). This layout is a *contract*, not just a size: the cell pitch
+// (12 x 12.8 px) must stay comfortably larger than the 8x8 glyph, because that is what makes
+// `gap(i)` a genuinely empty point and `center(i)` a distinct hover target per i. Growing the glyph
+// count at a fixed viewport shrinks the pitch below the glyph and the file goes VACUOUSLY GREEN:
+// once consecutive centres land on the same device pixel, `onPointerMove`'s same-target early exit
+// fires, no re-target happens at all, and both `built === 0` and a tiny median still pass while
+// nothing is being measured. Scaling this guard needs a target-strip / bulk-block split so the
+// sweep targets keep their 8px pitch while the bulk supplies the O(N) recomposite — tracked
+// separately rather than bolted on here.
 const COLS = 40, ROWS = 25; // 1000 glyphs; cell 12 x 12.8 px, glyph 8x8 centred (gaps between)
 const CELL_W = W / COLS, CELL_H = H / ROWS;
+const GLYPH_PX = 8;
 
 function host(): HTMLElement {
   const el = document.createElement("div");
@@ -63,7 +73,15 @@ async function makeChart(): Promise<{ chart: Plot; el: HTMLElement }> {
 }
 
 describe("hover overlay renderer reuse (#218)", () => {
-  it("webgl: a 100-glyph hover sweep (with gap clears) constructs ZERO extra GroupRenderers and stays within budget", async () => {
+  it("webgl: a 1000-glyph, 125-change hover sweep (with gap clears) constructs ZERO extra GroupRenderers and stays within budget", async () => {
+    // Non-vacuity: assert the layout contract the whole sweep rests on, BEFORE measuring. Without
+    // this, a layout change that collapses the targets turns every assertion below green while the
+    // file exercises nothing (#262 audit).
+    expect(Math.min(CELL_W, CELL_H), "cell pitch must exceed the glyph, or gap() lands inside a glyph").toBeGreaterThan(GLYPH_PX + 2);
+    const [ax, ay] = center(1);
+    const [bx, by] = center(2);
+    expect(Math.hypot(bx - ax, by - ay), "consecutive hover targets collapse to one device pixel — no re-target would fire").toBeGreaterThanOrEqual(1);
+
     const { chart, el } = await makeChart();
 
     // Warm-up: the FIRST hover legitimately constructs the overlay's renderer (once per layer).

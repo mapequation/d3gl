@@ -16,7 +16,13 @@ export default defineConfig({
   // Substituted into test sources at transform time (the __D3GL_VERSION__
   // pattern) so browser-side perf guards can scale their wall-clock ceilings
   // via src/__tests__/perf-budget.ts.
-  define: { __PERF_BUDGET_SCALE__: JSON.stringify(String(budgetScale)) },
+  define: {
+    __PERF_BUDGET_SCALE__: JSON.stringify(String(budgetScale)),
+    // Fixture scale for the browser guards (#262). Separate from the node tier's PERF_N:
+    // CI renders under SwiftShader software GL, so the browser tier picks its own N.
+    // Unset ⇒ "" ⇒ each guard keeps its locally-calibrated default.
+    __PERF_N__: JSON.stringify(process.env.PERF_BROWSER_N ?? ""),
+  },
   test: {
     include: ["src/**/*.browser.test.{ts,tsx}"],
     // Bound the in-test / hook / global-teardown phases so a stalled WebGL
