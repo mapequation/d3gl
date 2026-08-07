@@ -99,7 +99,9 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
       // Frontier labels come pre-styled (dark 11px sans-serif + white halo) — no CSS needed.
       net.labels({ max: LABEL_CAPS[(options.maxLabels as number) ?? 1] ?? 12, labelOf: (id, info) => (info.aggregate ? `${info.count}` : `n${id}`) });
       const sizeMode = options.sizing === "World" ? "world" : "screen";
-      const expandPx = (options.expand as number) ?? 120;
+      // Expand slider; "Auto" (0) passes no expandPx, so the cut uses the tree-adaptive default —
+      // ~48px for the structural tree, a module-sized threshold for the partition.
+      const expandPx = (options.expand as number) || undefined;
       const declutter = options.declutter !== "Off";
       // Node-radius range top (leaf max; modules extrapolate above it via the same scale). Smaller →
       // smaller glyphs → declutter keeps more → more nodes + inter-module edges visible.

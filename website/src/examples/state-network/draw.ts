@@ -109,7 +109,8 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
         lodOn
           ? {
               modules: options.lod === "Modules" ? g.stateModules : undefined,
-              expandPx: options.expand as number,
+              // "Auto" (0) ⇒ omitted, i.e. the cut's tree-adaptive default.
+              expandPx: (options.expand as number) || undefined,
               maxAggregateRadius: options.maxRadius as number,
               declutter: options.declutter !== "Off",
               crossLevelEdges: options.crossLevel === "On",

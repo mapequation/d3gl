@@ -143,7 +143,7 @@ frame the engine touches the visible *frontier*, not the whole graph.
 net
   .style({ sizeMode: "screen" }) // constant-pixel glyphs — the natural register for navigating
   .lod({
-    expandPx: 48,            // expand an aggregate once its on-screen footprint reaches ~48px
+    expandPx: 48,            // optional: pin the expand footprint in px (omit ⇒ tree-adaptive default)
     aggregateFill: "#7f97c8",
     maxAggregateRadius: 26,  // cap the aggregate glyph size (pixels, in screen sizeMode)
     declutter: true,         // thin overlapping glyphs by importance (default: the node-size metric)
@@ -169,6 +169,11 @@ What it composes:
   off-screen. By default they connect *same-level* pairs only, so when you expand one region its leaves
   lose their links to the still-collapsed regions; **`crossLevelEdges: true`** restores them by projecting
   the off-frontier endpoint to its nearest visible ancestor (opt-in — zero added cost when off).
+- **`expandPx`** is that threshold, in absolute pixels. **Leave it out** and each tree picks its own:
+  the cut scales the default by how many children the tree's *finest* aggregates hold, so structural
+  coarsening (2 members per aggregate) keeps the familiar ~48px while a provided module partition
+  (30–60 members, 5–12× bigger on screen) gets a module-sized threshold — `lod({ modules })` opens on
+  a **map of modules**, not on raw nodes. Set a value to pin it (the meaning is unchanged).
 - **`crossFade`** smooths level transitions: over a band around the expand threshold (a fraction of
   `expandPx`, e.g. `0.3`), the aggregate and its children draw *together*, the parent easing out as the
   children ease in — so a split/merge reads smoothly instead of popping. Opt-in; off (and free) by default.
@@ -213,7 +218,7 @@ import infomapResult from "./network.json"; // Infomap JSON: { nodes: [{ id, pat
 net
   .data(graph)
   .style({ sizeMode: "screen" })
-  .lod({ modules: infomapResult.nodes, expandPx: 48 })
+  .lod({ modules: infomapResult.nodes }) // no expandPx ⇒ the module-sized default; it opens as a map
   .layout({ backend: "positions", positions });
 
 net.lodSource; // "modules"

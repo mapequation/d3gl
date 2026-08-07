@@ -121,6 +121,15 @@ export interface LODTree extends LODTopology {
    * when no colours are supplied (the engine falls back to a single fill).
    */
   color: Uint8Array;
+  /**
+   * **Leaf-level branching** (#191): how many children the aggregate that owns a *typical leaf* has —
+   * the median child count of the leaf-parents, weighted by how many leaves each owns. `2` for a
+   * binary coarsening tree, `1` for a quadtree bottom cell, `30`–`600` for a provided module
+   * partition. Pure topology, so it is computed **once per tree at build** ({@link leafBranchingOf})
+   * and never changes as the layout converges. Drives the adaptive default expand threshold —
+   * see {@link defaultExpandPx}.
+   */
+  leafBranching: number;
 }
 
 /**
@@ -416,10 +425,53 @@ function leafDescendantCounts(topo: LODTopology): Uint32Array {
   return count;
 }
 
+/** Child-count histogram width for {@link leafBranchingOf} — 16 KB of transient scratch, once per
+ *  tree build. Aggregates with more children than this all land in the last bucket; the threshold it
+ *  feeds is clamped well below what such a branching would ask for anyway. */
+const BRANCHING_BUCKETS = 4096;
+
+/**
+ * The tree's **leaf-level branching** (see {@link LODTree.leafBranching}): the median number of
+ * children of the aggregates that own leaves, **weighted by how many leaves each owns** — i.e. what
+ * the finest aggregate a typical *node* sits in would split into. Weighting by leaf children (rather
+ * than counting aggregates) is what makes it robust in both directions: a coarsening tree's rare
+ * mixed-level parent (one stray leaf riding up several levels beside big sub-aggregates) carries a
+ * weight of 1 and can't drag it up, and a partition of a few big modules plus a long tail of
+ * singletons can't drag it down to 1.
+ *
+ * Exact and allocation-light: one pass over the children CSR — O(tree size), i.e. ~2·nodeCount for a
+ * binary coarsening tree — plus a fixed {@link BRANCHING_BUCKETS}-entry histogram, no sort. Pure
+ * topology (no positions read), so it is computed **once per tree at build** and stays valid for the
+ * life of the tree, however the layout moves.
+ */
+function leafBranchingOf(topo: LODTopology): number {
+  const { size, leafCount, childOffset, children } = topo;
+  const hist = new Uint32Array(BRANCHING_BUCKETS);
+  let total = 0;
+  for (let g = leafCount; g < size; g++) {
+    const c0 = childOffset[g]!;
+    const c1 = childOffset[g + 1]!;
+    let leafKids = 0;
+    for (let p = c0; p < c1; p++) if (children[p]! < leafCount) leafKids++;
+    if (leafKids === 0) continue; // not a leaf-parent — its children are aggregates
+    const b = Math.min(c1 - c0, BRANCHING_BUCKETS - 1);
+    hist[b] = (hist[b] ?? 0) + leafKids;
+    total += leafKids;
+  }
+  if (total === 0) return 1; // a single-level tree (no aggregates): nothing to expand into
+  let acc = 0;
+  for (let b = 0; b < BRANCHING_BUCKETS; b++) {
+    acc += hist[b] ?? 0;
+    if (acc * 2 >= total) return b;
+  }
+  return 1;
+}
+
 function attachGeometry(topo: LODTopology): LODTree {
   const { size } = topo;
   return {
     ...topo,
+    leafBranching: leafBranchingOf(topo),
     // Ensure a parent map (the spatial-quadtree builder doesn't set one) so the cross-fade declutter
     // can test ancestry (#133). Coarsening/module topologies already carry it, so this is a no-op there.
     parent: topo.parent ?? deriveParent(topo),
@@ -695,6 +747,7 @@ export function lodTreeFromTopology(
   const { size } = topo;
   return {
     ...topo,
+    leafBranching: leafBranchingOf(topo),
     cx: geometry?.cx ?? new Float32Array(size),
     cy: geometry?.cy ?? new Float32Array(size),
     extent: geometry?.extent ?? new Float32Array(size),
@@ -947,7 +1000,9 @@ export interface CutOptions {
   /**
    * Expand an aggregate into its children once its on-screen footprint (diameter = `2·extent·k`, in
    * px) reaches this threshold; below it the aggregate draws as a single glyph. Larger → coarser
-   * (fewer, bigger glyphs); smaller → finer. Default 48.
+   * (fewer, bigger glyphs); smaller → finer. An absolute pixel size — omit it to get the tree-adaptive
+   * default ({@link defaultExpandPx}: 48 px for a binary coarsening tree, more for a coarser-branching
+   * one such as a provided module partition).
    */
   expandPx?: number;
   /** True when glyphs are screen-pixel sized; converts the per-node draw radius to world for the cull margin. */
@@ -969,7 +1024,46 @@ export interface CutOptions {
   fadeAlpha?: Float32Array;
 }
 
+/** Floor for the adaptive default (and the historical fixed default): a binary tree's threshold. */
 const DEFAULT_EXPAND_PX = 48;
+/** Branching the historical fixed 48 px default is calibrated for — a binary coarsening tree. The
+ *  adaptive default scales off it as `48·√(c/2)`, so `c = 2` reproduces 48 px *exactly* (no float
+ *  drift), i.e. ≈34 px of screen room per child. */
+const CALIBRATED_BRANCHING = 2;
+/** Ceiling for the adaptive default, as a fraction of the shorter viewport side — see {@link defaultExpandPx}. */
+const MAX_DEFAULT_EXPAND_FRACTION = 0.5;
+
+/**
+ * The **adaptive default** expand threshold, in px, for a tree with no explicit
+ * {@link CutOptions.expandPx} (#191).
+ *
+ * `expandPx` is an absolute on-screen size, but the natural scale of the footprint it is compared
+ * against is set by how many leaves the *finest* aggregate holds: a coarsening tree's leaf-parent
+ * holds 2 leaves and is 7–23 px across at a fit view, a provided-module tree's holds 30–60 and is
+ * 96–123 px. One fixed 48 px therefore did real work on the first (22–34 % of the fit frontier stayed
+ * raw leaves, the rest aggregates) and *nothing* on the second — `lod({ modules })` opened on 100 %
+ * raw leaves, which is why both website examples used to hard-code `240`.
+ *
+ * So scale the default by the tree's own {@link LODTree.leafBranching} `c`: a parent of `c`
+ * equal-sized children is `√c` times their diameter (equal discs, area-conserving), so
+ * `48·√(c/{@link CALIBRATED_BRANCHING})` gives every child the same ~34 px of screen room the 48 px
+ * default gives the two children of a binary parent. That is exactly 48 px for a coarsening tree (and
+ * for a quadtree bottom cell, via the floor), so those keep their calibration **byte-for-byte**,
+ * while a 30–60-member module partition asks for 190–260 px — a genuinely aggregated opening view.
+ *
+ * Clamped both ways: never below the historical 48 px, and never above half the shorter viewport
+ * side, so a tree with enormous leaf-parents (one 2 000-member module) can't push the threshold past
+ * the whole framed layout and collapse the map to a single blob.
+ *
+ * O(1) — a `√`, a multiply and two clamps, off one number computed at tree build. Safe on a tree that
+ * predates the field (`leafBranching` absent ⇒ the flat 48 px default).
+ */
+export function defaultExpandPx(tree: LODTree, width: number, height: number): number {
+  const c = tree.leafBranching;
+  const perChild = c > 0 ? DEFAULT_EXPAND_PX * Math.sqrt(c / CALIBRATED_BRANCHING) : DEFAULT_EXPAND_PX;
+  const cap = MAX_DEFAULT_EXPAND_FRACTION * Math.min(width, height);
+  return Math.max(DEFAULT_EXPAND_PX, Math.min(perChild, cap));
+}
 
 /** Smoothstep (Hermite) ease on [0,1] — the cross-fade ramp (#133), softer than linear at both ends. */
 const smoothstep = (x: number): number => (x <= 0 ? 0 : x >= 1 ? 1 : x * x * (3 - 2 * x));
@@ -1024,7 +1118,9 @@ export function cut(
   scratch?: CutScratch,
 ): Uint32Array {
   const { leafCount, levelCount, levelOffset, childOffset, children, cx, cy, extent, radius } = tree;
-  const expandPx = opts.expandPx ?? DEFAULT_EXPAND_PX;
+  // No explicit threshold ⇒ the tree-adaptive default (#191) — O(1) off `tree.leafBranching`, which
+  // was computed once at tree build; nothing here scales with the tree or the frontier.
+  const expandPx = opts.expandPx ?? defaultExpandPx(tree, width, height);
   const maxAgg = opts.maxAggregateRadius ?? Infinity;
   // Per-node draw radius in world units, so a glyph stays until its *whole body* leaves the viewport
   // (not just its centre) — no popping at the screen edge when zoomed in.
