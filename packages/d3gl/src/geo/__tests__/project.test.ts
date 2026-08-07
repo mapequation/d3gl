@@ -56,6 +56,50 @@ describe("featureGroup", () => {
   });
 });
 
+describe("nested rings survive projection (#73)", () => {
+  /** An island in a lake in land, with a pond on the island — RFC 7946 shape: a
+   *  MultiPolygon of `[land, lake]` and `[island, pond]`, exteriors CLOCKWISE in
+   *  [lon, lat] and holes counter-clockwise (AGENTS.md "GeoJSON winding"). */
+  const cw = (h: number): [number, number][] => [[-h, -h], [-h, h], [h, h], [h, -h], [-h, -h]];
+  const ccw = (h: number): [number, number][] => [...cw(h)].reverse();
+  const atoll: GeoJSON.Feature = {
+    type: "Feature",
+    properties: { id: "atoll" },
+    geometry: { type: "MultiPolygon", coordinates: [[cw(16), ccw(12)], [cw(8), ccw(4)]] },
+  };
+
+  /** True when (x, y) lands on one of the drawable's tessellated fill triangles. */
+  const filled = (buf: { fillVertices: Float32Array; fillIndices: Uint32Array }, x: number, y: number): boolean => {
+    const { fillVertices: v, fillIndices: ix } = buf;
+    for (let t = 0; t < ix.length; t += 3) {
+      const [a, b, c] = [(ix[t] ?? 0) * 3, (ix[t + 1] ?? 0) * 3, (ix[t + 2] ?? 0) * 3];
+      const ax = v[a] ?? 0, ay = v[a + 1] ?? 0;
+      const bx = v[b] ?? 0, by = v[b + 1] ?? 0;
+      const cx = v[c] ?? 0, cy = v[c + 1] ?? 0;
+      const d = (by - cy) * (ax - cx) + (cx - bx) * (ay - cy);
+      if (d === 0) continue;
+      const l1 = ((by - cy) * (x - cx) + (cx - bx) * (y - cy)) / d;
+      const l2 = ((cy - ay) * (x - cx) + (ax - cx) * (y - cy)) / d;
+      if (l1 >= 0 && l2 >= 0 && l1 + l2 <= 1) return true;
+    }
+    return false;
+  };
+
+  it("fills land ▸ lake ▸ island ▸ pond alternately after geoPath projects them", () => {
+    const projection = fitProjection(geoEquirectangular(), atoll, 256, 256);
+    const scene = new Scene();
+    scene.group("atoll", featureGroup([atoll], projection, { id: () => "atoll" }));
+    const buf = scene.buffers("atoll");
+    // Probe on the equator, walking outwards in longitude through every band. Projection
+    // is monotone in lon, so these land in the right ring on screen too.
+    const at = (lon: number): [number, number] => projection([lon, 0]) ?? [NaN, NaN];
+    for (const [lon, want, what] of [[14, true, "land"], [10, false, "lake"], [6, true, "island"], [2, false, "pond"]] as const) {
+      const [x, y] = at(lon);
+      expect(filled(buf, x, y), `${what} at lon ${lon}`).toBe(want);
+    }
+  });
+});
+
 describe("GeoInput accepts a GeoJSON Sphere without casts", () => {
   it("fitProjection + geoLayer take { type: 'Sphere' } and build a fillable ocean", () => {
     // No `as any` / `as unknown as GeoInput`: a Sphere is a first-class GeoInput now.

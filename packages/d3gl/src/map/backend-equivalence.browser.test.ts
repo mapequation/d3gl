@@ -11,6 +11,7 @@ import {
   clippedShapes,
   fadedGlyphs,
   translucentBorderedGlyphs,
+  nestedRingShapes,
   glyphSceneLayers,
   layerOf,
   renderWebGLBackend,
@@ -19,6 +20,7 @@ import {
   diffPixels,
   type BackendRenderOptions,
   type DiffResult,
+  type PixelBuffer,
 } from "./__tests__/backend-equivalence-harness.js";
 
 const W = 200;
@@ -222,6 +224,59 @@ describe("backend equivalence: bordered glyph encoding (#269)", () => {
     // a translucent fill composites each region exactly once on both encodings. The stacked-disc
     // encoding painted the fill disc OVER the border disc, so the whole inner disc (~(1−b)² ≈ 50%
     // of each glyph) read the ring colour through it: 12.1% of the frame, 12× over this bound.
+    expect(glCv.fraction).toBeLessThan(0.01);
+    expect(diffPixels(gl, svg).fraction).toBeLessThan(0.01);
+  });
+});
+
+describe("backend equivalence: nested ring topology (#73)", () => {
+  /** RGB at a pixel (the backdrop is opaque, so alpha is always 255 here). */
+  const rgb = (buf: PixelBuffer, x: number, y: number): [number, number, number] => {
+    const o = (Math.round(y) * buf.width + Math.round(x)) * 4;
+    return [buf.data[o] ?? 0, buf.data[o + 1] ?? 0, buf.data[o + 2] ?? 0];
+  };
+  const near = (a: readonly number[], b: readonly number[]): boolean =>
+    a.every((v, i) => Math.abs(v - (b[i] ?? 0)) <= 12);
+
+  it("an island in a lake fills solid on all three backends", async () => {
+    const backdrop = backdropScene(W, H);
+    const scene = nestedRingShapes(W, H);
+    const layers = [layerOf(backdrop, "backdrop"), layerOf(scene, "nested")];
+    const gl = await renderWebGLBackend(layers, W, H);
+    const cv = renderCanvasBackend(layers, W, H);
+    const svg = await renderSVG(layers, W, H);
+
+    // Deterministic signature: walk the concentric drawable outwards from its centre and
+    // assert the fill ALTERNATES land / lake / island / pond on every backend. Canvas and SVG
+    // get this from the native nonzero fill rule; WebGL has to recover it in `groupRings`.
+    // Radii bracket the ring boundaries at 0.29/0.22/0.14/0.06 × min(W,H).
+    const s = Math.min(W, H);
+    const cx = W * 0.33;
+    const cy = H * 0.36;
+    const LAND: [number, number, number] = [31, 119, 180];
+    const WATER: [number, number, number] = [255, 255, 255]; // the backdrop showing through
+    const probes: { r: number; want: [number, number, number]; what: string }[] = [
+      { r: s * 0.255, want: LAND, what: "land" },
+      { r: s * 0.18, want: WATER, what: "lake" },
+      { r: s * 0.1, want: LAND, what: "island in the lake" },
+      { r: s * 0.03, want: WATER, what: "pond on the island" },
+    ];
+    for (const p of probes) {
+      for (const [name, buf] of [["webgl", gl], ["canvas", cv], ["svg", svg]] as const) {
+        // Two directions per radius, so a single stray triangle can't fake a pass.
+        for (const [dx, dy] of [[1, 0], [-0.6, 0.8]] as const) {
+          const got = rgb(buf, cx + dx * p.r, cy + dy * p.r);
+          expect(near(got, p.want), `${name} @ ${p.what} (r=${p.r.toFixed(1)}): ${got}`).toBe(true);
+        }
+      }
+    }
+
+    // Cross-backend pixel diff: an opaque backdrop ⇒ every pixel is compared. Before #73 the
+    // island/pond rings were classified as extra holes of the land, so earcut dropped the
+    // overlapping-hole geometry and WebGL painted a materially different frame.
+    const glCv = diffPixels(gl, cv);
+    expect(glCv.considered).toBe(W * H);
+    expect(diffPixels(cv, svg).fraction).toBeLessThan(0.01);
     expect(glCv.fraction).toBeLessThan(0.01);
     expect(diffPixels(gl, svg).fraction).toBeLessThan(0.01);
   });

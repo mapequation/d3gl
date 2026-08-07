@@ -386,6 +386,59 @@ function traceDisc(ctx: PathRecorder, cx: number, cy: number, r: number): void {
   ctx.closePath();
 }
 
+/** Trace a closed regular n-gon (a flattened disc). `ccw` picks the winding, which is what
+ *  selects solid vs. hole for a nested ring under the nonzero fill rule. */
+function traceRing(ctx: PathRecorder, cx: number, cy: number, r: number, ccw: boolean, n = 64): void {
+  const step = ((ccw ? 1 : -1) * 2 * Math.PI) / n;
+  ctx.moveTo(cx + r, cy);
+  for (let i = 1; i < n; i++) ctx.lineTo(cx + r * Math.cos(i * step), cy + r * Math.sin(i * step));
+  ctx.closePath();
+}
+
+/**
+ * Nested ring topology (#73): one drawable whose subpaths nest 3 deep — land ▸ lake ▸
+ * island ▸ pond — plus an off-centre island in a lake, plus a plain single-ring control.
+ *
+ * Canvas (`ctx.fill()`) and SVG (`fill-rule: nonzero`) resolve these natively; WebGL has to
+ * recover outer/hole from the geometry (`groupRings` → `tessellateFill`), so this scene is a
+ * direct probe of that recovery. Successive levels alternate winding, the convention `geoPath`
+ * emits (AGENTS.md "GeoJSON winding"), so the fill must alternate solid/hole with depth. Before
+ * #73, ring classification was single-level: every ring inside the land became a hole of it, so
+ * the island and pond vanished (and the overlapping holes made earcut drop geometry outright).
+ *
+ * Fills are OPAQUE over the backdrop, so a wrongly-classified ring is a solid several-thousand-
+ * pixel block of the wrong colour — orders of magnitude past the diff's 1px position tolerance.
+ */
+export function nestedRingShapes(width: number, height: number): Scene {
+  const s = Math.min(width, height);
+  const scene = new Scene();
+  scene.group("nested", (g) => {
+    // Depth 3, concentric: land (solid) ▸ lake (hole) ▸ island (solid) ▸ pond (hole).
+    g.drawable(0, (ctx) => {
+      const cx = width * 0.33;
+      const cy = height * 0.36;
+      traceRing(ctx, cx, cy, s * 0.29, false);
+      traceRing(ctx, cx, cy, s * 0.22, true);
+      traceRing(ctx, cx, cy, s * 0.14, false);
+      traceRing(ctx, cx, cy, s * 0.06, true);
+    });
+    // Depth 2, off-centre: the island sits near the lake's rim, and the whole landmass has a
+    // second, plain lake — so one drawable mixes a depth-1 and a depth-2 ring.
+    g.drawable(1, (ctx) => {
+      traceRing(ctx, width * 0.68, height * 0.66, s * 0.3, false);
+      traceRing(ctx, width * 0.62, height * 0.6, s * 0.17, true);
+      traceRing(ctx, width * 0.57, height * 0.56, s * 0.08, false);
+      traceRing(ctx, width * 0.79, height * 0.76, s * 0.07, true);
+    });
+    // Control: an ordinary single-ring shape must be unaffected by the classifier change.
+    g.drawable(2, (ctx) => traceRing(ctx, width * 0.85, height * 0.16, s * 0.11, false));
+  });
+  scene.setFill("nested", 0, "#1f77b4");
+  scene.setFill("nested", 1, "#2ca02c");
+  scene.setFill("nested", 2, "#d62728");
+  return scene;
+}
+
 /**
  * A full-viewport opaque backdrop layer (group `"backdrop"`). Translucent scenes composite
  * onto it so the diff compares what the USER sees: over a *transparent* background the

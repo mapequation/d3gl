@@ -238,6 +238,30 @@ This has bitten us repeatedly. The rule lives here, in
 `packages/d3gl/src/geo/project.ts` (`featureGroup`), and
 `packages/d3gl/src/geo/geo-layer.ts` (`geoLayer`).
 
+### Winding is DATA, not decoration: it decides solid vs hole (#73)
+
+Canvas (`ctx.fill()`) and SVG (`fill-rule: nonzero`) resolve a drawable's subpaths with the
+**nonzero winding rule** natively. WebGL cannot — `PathRecorder` hands `groupRings`
+(`core/rings.ts`) a flat list of rings with no outer/hole marking, and earcut needs
+`{ outer, holes }`. So **`groupRings` reimplements nonzero**: for each ring it sums the
+directions of the rings enclosing it, and the ring is an outer where the fill turns on
+(outside 0, inside ≠ 0), a hole where it turns off, dropped where neither. Consequences:
+
+- Nesting works at **any depth** — land ▸ lake ▸ island ▸ pond — because the convention makes
+  winding alternate with depth. It used to be single-level, so an island in a lake became a
+  second hole of the land: the island vanished and earcut, handed two overlapping holes,
+  dropped geometry outright (6.2% of the harness frame diverged from Canvas).
+- **Do not "fix" a classifier bug by switching to even-odd / by depth parity.** Even-odd
+  agrees with nonzero only while the data alternates; where it doesn't (two nested rings wound
+  the same way) even-odd invents a hole that Canvas and SVG do not draw, i.e. it *creates* a
+  backend divergence. Nonzero is the reference because it is what the other two backends run.
+- The same classification drives **hit-testing** (`HitIndex` in `core/hit-test.ts` calls
+  `groupRings`), so a fill bug here is also a picking bug — an island in a lake is unclickable.
+- Guards: `core/__tests__/rings.test.ts` (classification + tessellated area),
+  `geo/__tests__/project.test.ts` (through the real `geoPath` projection),
+  `core/__tests__/hit-test.test.ts`, and the `nestedRingShapes` case in
+  `map/backend-equivalence.browser.test.ts` (three-way pixel diff).
+
 ## Worktrees & shell cwd (avoid committing to the wrong repo)
 
 Feature work happens in a worktree under `.claude/worktrees/<name>/`, which is a SECOND
