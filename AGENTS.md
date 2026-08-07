@@ -448,6 +448,26 @@ edges, so an exact-position diff reports ~6% noise that isn't a real divergence.
 `website` "Backend equivalence" example renders both scenes in all three backends side by
 side with synced zoom for eyeballing.
 
+**The render diff does NOT cover the WebGL *export* (#271).** The network's glyphs live in
+GPU-instanced lanes with no retained Scene, so `toSVG()` rebuilds them through
+`core/instanced-vector.ts` — a converter the draw path never runs. Element-count tests agree even
+when a coordinate is wrong, so exports get their own pixel diff:
+`map/export-equivalence.browser.test.ts` rasterises the WebGL and Canvas `toSVG()` for the same
+view (harness helpers `rasterizeSVG` / `diffExports`) and diffs them position-tolerantly. Two
+rules when extending it:
+- **Run every case at ≥ 2 zoom levels, and run the `world`-`sizeMode` twin as a control.** The
+  screen-mode *bake* is the risky branch — the arrow setback and half-arrow taper/bend are
+  constant-**pixel** terms, non-linear in `k`, so they must be solved in pixel space at the export
+  `k` and emitted ÷k. At `k = 1` the bake is the identity and proves nothing; in `world` mode
+  `bake = 1` and the bug cannot appear, which is exactly what makes it a control.
+- **Keep the background transparent** so `considered` counts ink, not the viewport — the fraction
+  then reads as "share of the drawing that moved". Both documents go through the *same*
+  rasteriser, so the noise floor is 0 (measured 0.00000 on all 16 cases), unlike the
+  cross-rasteriser render diff. Don't import the render diff's looser thresholds here.
+
+Bordered nodes are deliberately kept out of that diff (the ring-vs-stacked-discs divergence above);
+fold them in when #269 converges the two encodings.
+
 ## Releases (changesets, CI-published)
 
 Publishing is automated by `.github/workflows/release.yml` (the `changesets/action`

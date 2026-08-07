@@ -129,8 +129,30 @@ export async function renderSVG(
   height: number,
   opts: BackendRenderOptions = {},
 ): Promise<PixelBuffer> {
-  const svg = svgFromLayers(width, height, [...layers], opts.transform ?? IDENTITY, opts.texts ?? []);
+  return rasterizeSVG(svgFromLayers(width, height, [...layers], opts.transform ?? IDENTITY, opts.texts ?? []), width, height);
+}
+
+/**
+ * Rasterize an SVG **document string** — a backend's `toSVG()` output — into a top-left-origin RGBA
+ * buffer, so two backends' *exports* can be pixel-diffed by the same {@link diffPixels} the live
+ * renders use (#271).
+ *
+ * Why this is the right comparison: both documents go through the *same* browser rasterizer, so the
+ * only thing the diff can see is the geometry and colour the two serializers wrote. The live-render
+ * diff cannot substitute — the WebGL export is produced by {@link instancedVectorLayers}, a code path
+ * the GPU render never touches, so an error there (notably the screen-`sizeMode` bake, whose
+ * constant-pixel terms are non-linear in `k`) is invisible on screen and only shows in the file.
+ */
+export async function rasterizeSVG(svg: string, width: number, height: number): Promise<PixelBuffer> {
   return decodeImage(`data:image/svg+xml;charset=utf-8,${encodeURIComponent(svg)}`, width, height);
+}
+
+/** Rasterize two `toSVG()` documents for the same view and diff them position-tolerantly (#271).
+ *  Both are left on a transparent background so `considered` counts INK, not the whole viewport —
+ *  a fraction over ink is what makes a small displaced glyph a large, assertable number. */
+export async function diffExports(a: string, b: string, width: number, height: number, opts: DiffOptions = {}): Promise<DiffResult> {
+  const [pa, pb] = await Promise.all([rasterizeSVG(a, width, height), rasterizeSVG(b, width, height)]);
+  return diffPixels(pa, pb, opts);
 }
 
 /**
