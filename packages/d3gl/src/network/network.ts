@@ -1,5 +1,5 @@
 import { BaseEngine, type BaseEngineOptions, type HoverHit, type InteractiveLayerOptions, type LaneInteractive, type NodeDragSession } from "../map/base-engine.js";
-import { networkLayers, networkLayersFromCache, noLodStyleCache, frontierCircles, frontierHalos, superEdges, makeSuperEdgesScratch, emitNodes, emitLinks, emitArrows, emitHalfLinks, traceFrontierGlyphs, traceFrontierHalos, traceSuperHalfArrows, traceSuperLines, traceSuperArrows, physicalPieInstances, tracePieWedges, rgbaCss, pickNodes, regionNodes, resolveNodeRadii, resolveNodeRadiusAggregate, resolveImportance, resolveFlowBorder, resolveNodeColors, resolveLinkWidthOf, resolveLinkColorOf, resolveLinkStrokeOf, flowBorderInnerRadii, type ResolvedNetworkStyle, type NoLodStyleCache, type NodeRadiusSpec, type ImportanceSpec, type FlowBorderSpec, type ConstBorder, type LinkWidthSpec, type LinkColorSpec, type LinkStyle } from "./glyphs.js";
+import { networkLayers, networkLayersFromCache, noLodStyleCache, drawsLinks, frontierCircles, frontierHalos, superEdges, makeSuperEdgesScratch, emitNodes, emitLinks, emitArrows, emitHalfLinks, traceFrontierGlyphs, traceFrontierHalos, traceSuperHalfArrows, traceSuperLines, traceSuperArrows, physicalPieInstances, tracePieWedges, rgbaCss, pickNodes, regionNodes, resolveNodeRadii, resolveNodeRadiusAggregate, resolveImportance, resolveFlowBorder, resolveNodeColors, resolveLinkWidthOf, resolveLinkColorOf, resolveLinkStrokeOf, flowBorderInnerRadii, type ResolvedNetworkStyle, type NoLodStyleCache, type NodeRadiusSpec, type ImportanceSpec, type FlowBorderSpec, type ConstBorder, type LinkWidthSpec, type LinkColorSpec, type LinkStyle } from "./glyphs.js";
 import { rgb } from "d3-color";
 import { ForceLayout, seedPositions, type ForceParams } from "./force.js";
 import { multilevelLayout, type CoarsenOptions } from "./coarsen.js";
@@ -140,6 +140,11 @@ export interface NetworkStyle {
    * `"half-arrow"` — the **map-of-networks** glyph: one filled shape per link that pinches to the
    * source centre and ends in a barbed arrowhead on the *target* node's boundary, with reciprocal
    * A→B / B→A links nesting around a shared centre curve. (Half-arrow links are world-sized.)
+   * `"none"` — **draw the network as nodes only** (#157): the links, arrowheads and LOD super-edges
+   * are *not built* — no geometry, no per-edge colour/width pass, no GPU upload — so turning links off
+   * on a million-edge graph costs nothing rather than uploading a buffer to hide. A **constant**
+   * `linkWidth: 0` takes the same path. Purely visual: the edges still drive the layout and the LOD
+   * hierarchy, so links can be toggled back on without re-laying out.
    */
   linkStyle?: LinkStyle;
   /**
@@ -148,6 +153,10 @@ export interface NetworkStyle {
    * {@link nodeRadius} (`by` is `"weight"`/`"flow"`, the same per-edge quantity). A **super-edge**
    * applies the same scale to the **accumulated** weight of the edges it subsumes, so link thickness
    * reads as flow at every LOD level. Keep the scale's range minimum ≥ 1 so links never vanish.
+   *
+   * A **constant** `0` means "no links at all" and takes the {@link linkStyle} `"none"` skip path —
+   * the link geometry is never built. A width *scale* that returns 0 for some weights does not: only
+   * a literal constant is read as a global opt-out.
    */
   linkWidth?: LinkWidthSpec;
   /**
@@ -2071,8 +2080,11 @@ export class Network extends BaseEngine {
     // selected aggregate's children count) + the group ids the shader matches against the hovered id.
     const sel = this.selectedIds(this.NODE_LAYER);
     const isSel = sel && sel.size ? this.makeSelectedPredicate(tree, sel) : null;
-    // Super-edges first (drawn under the nodes), among the visible frontier only.
-    if (opts.superEdges !== false && this.graph!.edgeCount > 0) {
+    // Super-edges first (drawn under the nodes), among the visible frontier only. Skipped whole when
+    // the style draws no links (#157: linkStyle "none" / a constant linkWidth 0 / an edgeless graph) —
+    // the gather, the highlight columns and the GPU upload are all avoided, not hidden.
+    const graph = this.graph;
+    if (opts.superEdges !== false && graph && drawsLinks(graph, style)) {
       // One super-edge path for both structural and module trees: gathered from the flow-weighted
       // super-edge CSR and rendered per linkStyle — fused half-arrows, or bent/straight lines +
       // (directed) arrowheads, the same glyph the non-LOD path uses. A node keeps edges to on-frontier
@@ -2277,7 +2289,11 @@ export class Network extends BaseEngine {
       this.registerLODScene(this.lodTree!, style, emit);
       return;
     }
-    const edgeIds = Array.from({ length: graph.edgeCount }, (_, e) => e);
+    // With no links to draw (#157: linkStyle "none", a constant linkWidth 0, or an edgeless graph) the
+    // links/arrows slots register EMPTY — no per-edge id array, no id→index map, no tessellation — while
+    // still existing in canonical order so switching back to `"line"` re-fills the same slots.
+    const drawLinks = drawsLinks(graph, style);
+    const edgeIds = drawLinks ? Array.from({ length: graph.edgeCount }, (_, e) => e) : [];
     const nodeIds = Array.from({ length: graph.nodeCount }, (_, i) => i);
     // `both`-view physical container backdrop (#171): faint discs at the physical nodes, drawn FIRST so
     // the state nodes/links (registered below) sit on top. Always registered (empty off the `both` view)
@@ -2324,7 +2340,7 @@ export class Network extends BaseEngine {
       sizeMode: halfArrow ? "world" : style.sizeMode,
       ...(halfArrow ? { fill: (e) => linkColorAt(e as number) } : { stroke: (e) => linkColorAt(e as number) }),
       build: (g) => {
-        if (!emit) return;
+        if (!emit || !drawLinks) return;
         if (halfArrow) emitHalfLinks(g, graph, style.nodeRadii, style.linkWidthOf, style.linkBend, bake);
         else emitLinks(g, graph, style.linkWidthOf, style.linkBend);
       },
@@ -2337,7 +2353,7 @@ export class Network extends BaseEngine {
       sizeMode: arrowBake !== 1 ? "world" : style.sizeMode,
       fill: (e) => linkColorAt(e as number),
       build: (g) => {
-        if (emit && style.directed && !halfArrow) emitArrows(g, graph, style.arrowSize, style.nodeRadii, style.linkBend, style.linkBend !== 0, arrowBake);
+        if (emit && drawLinks && style.directed && !halfArrow) emitArrows(g, graph, style.arrowSize, style.nodeRadii, style.linkBend, style.linkBend !== 0, arrowBake);
       },
     });
     // Aggregate-outline halo ring: only the LOD Scene path ({@link registerLODScene}) draws into it,
@@ -2432,8 +2448,11 @@ export class Network extends BaseEngine {
     const frontier = emit ? this.computeFrontier(tree, style) : new Uint32Array(0);
 
     // --- Super-edges (drawn under the nodes), among the visible frontier only. ---
+    // Same skip as the WebGL frontier emit (#157): with no links to draw the gather never runs and both
+    // layers register empty (so a style change back to `"line"` re-fills the same slots).
+    const graph = this.graph;
     const se =
-      emit && opts.superEdges !== false && this.graph!.edgeCount > 0
+      emit && opts.superEdges !== false && graph && drawsLinks(graph, style)
         ? superEdges(
             tree,
             frontier,

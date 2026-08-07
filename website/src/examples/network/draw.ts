@@ -33,8 +33,12 @@ function degreeRadius(graph: NetworkGraph): NodeRadiusSpec {
  * super-edges thicken + darken with their accumulated weight); **Sizing** switches world vs **screen**
  * (constant-pixel) glyphs. The
  * **LOD** toggle enables the adaptive hierarchy cut — dense communities collapse to aggregate glyphs
- * and expand into their members as you zoom in — with **Declutter** (thin overlaps) and **Edges**
- * (super-edges between aggregates). Pair LOD with screen sizing. Drag empty space to pan, scroll to zoom.
+ * and expand into their members as you zoom in — with **Declutter** (thin overlaps). Pair LOD with
+ * screen sizing. **Edges** "Off" renders the network as **nodes only** via `style({ linkStyle: "none" })`
+ * — with LOD on or off — and the link, arrowhead and super-edge geometry is then never built or
+ * uploaded (not merely hidden), so switching it off on a million-edge graph *saves* work rather than
+ * costing it. The edges keep driving the layout, so toggling back is instant. Drag empty space to pan,
+ * scroll to zoom.
  * **Hover or click** a glyph to resolve the node — or the module it collapsed into — shown top-left.
  * **Selecting** a node dims the rest of the graph (the `selection.others` focus, consistent with GeoMap
  * + Plot) while keeping the selected node *and its outgoing links* at full strength; **hovering** a node
@@ -155,6 +159,9 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
           directed,
           nodeRadius: options.size === "Uniform" ? 5 : degreeRadius(graph),
           nodeFill: "#4878d0",
+          // Edges "Off" → a nodes-only network: `linkStyle: "none"` skips *building and uploading* the
+          // link/arrowhead/super-edge geometry (with LOD on or off), rather than drawing it invisibly.
+          linkStyle: options.edges === "Off" ? "none" : "line",
           linkWidth: edgeWidth, // Edge size: Uniform (0.8) or ∝ √weight in [0.5, 5]
           linkStroke, // darker + more opaque with accumulated weight (arrowhead shares it)
           // arrowSize left unset → defaults to a function of link width (≈ the half-arrow tip).
@@ -174,7 +181,8 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
                 aggregateFill: "#7f97c8",
                 maxAggregateRadius: 26,
                 declutter: options.declutter !== "Off",
-                superEdges: options.edges !== "Off",
+                // superEdges stays on: the Edges toggle now removes *all* links via linkStyle above,
+                // so it works with LOD off too (`superEdges` only ever governed aggregate↔aggregate links).
                 // Opt-in #139: also link a visible leaf to a still-collapsed module across a mixed frontier.
                 crossLevelEdges: options.crossLevel === "On",
                 // Opt-in #133: ease aggregates ↔ children across the expand threshold (slider × 0.1 = band).

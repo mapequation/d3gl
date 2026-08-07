@@ -34,12 +34,36 @@ pan and zoom while it settles. (On a cross-origin-isolated page positions are sh
 `SharedArrayBuffer`; otherwise they are posted as snapshots — the top-right readout shows whether the
 environment supports it and whether this layout is actually using it.) The **Nodes** slider scales from 10 to
 1,000,000; **Seeding** compares multilevel against a cold start; **Size** switches uniform vs
-degree-weighted radius; **Sizing** switches world vs screen units; and **LOD** / **Declutter** /
-**Edges** control the level-of-detail cut (below). Drag to pan, scroll to zoom.
+degree-weighted radius; **Sizing** switches world vs screen units; **LOD** / **Declutter** control the
+level-of-detail cut (below); and **Edges** turns the links off entirely (next section). Drag to pan,
+scroll to zoom.
 
 <ExampleCard files={["network/draw.ts", "network/data.ts"]}>
   <Network client:visible slot="demo" />
 </ExampleCard>
+
+## Nodes only: turning links off
+
+Set `linkStyle: "none"` to render a network as **nodes only** — a point cloud of the layout, with no
+links, arrowheads or LOD super-edges. It is a *skip*, not a hide: the link geometry is never built,
+never coloured and never uploaded to the GPU, so at a million edges turning links off **saves** the
+work instead of paying for an invisible buffer. A **constant** `linkWidth: 0` takes the same path (a
+width *scale* that happens to reach 0 does not — that thins individual links, it does not opt out).
+
+```ts
+net.style({ linkStyle: "none" }); // nodes only — links/arrows/super-edges are not built at all
+net.style({ linkWidth: 0 });      // same skip, via a constant zero width
+net.style({ linkStyle: "line" }); // …and back; nothing was lost, so this is instant
+```
+
+The edges are still **data**: they keep driving the force layout and the LOD coarsening hierarchy, so
+the arrangement is identical with links shown or hidden, and toggling never re-lays-out the graph.
+Works with LOD on or off, and on all three backends (`toSVG()` exports the nodes alone). A graph with
+genuinely no edges (`buildGraph({ nodeCount, source: [], target: [] })`) renders the same way — every
+link emit is simply an empty loop; its LOD tree is then built from a spatial quadtree over the
+positions, since there is nothing to coarsen.
+
+The **Edges** toggle in the example above is wired to exactly this.
 
 ## Sizing nodes by degree (or any metric)
 
@@ -118,7 +142,7 @@ The half-arrow renders fully instanced on the WebGL lane (the vertex shader plac
 shared centre curve and the barbed head per instance) and traces the identical reference path for
 SVG/Canvas export, so publication output matches the screen. The plain `linkStyle: "line"` (the
 default, see the large-scale example) keeps stroked lines + separate arrowheads for graphs with many
-edges.
+edges, and `linkStyle: "none"` drops the links entirely (see [Nodes only](#nodes-only-turning-links-off)).
 
 The **Sizing** toggle switches `sizeMode`. In **screen** mode the link decorations (width, arrow tip,
 bend, node radii) stay a constant pixel size as you zoom while the nodes still move — the navigation
@@ -169,6 +193,8 @@ What it composes:
   off-screen. By default they connect *same-level* pairs only, so when you expand one region its leaves
   lose their links to the still-collapsed regions; **`crossLevelEdges: true`** restores them by projecting
   the off-frontier endpoint to its nearest visible ancestor (opt-in — zero added cost when off).
+  `superEdges: false` suppresses them under LOD only; to drop links everywhere — LOD on *or* off — use
+  `style({ linkStyle: "none" })` instead.
 - **`expandPx`** is that threshold, in absolute pixels. **Leave it out** and each tree picks its own:
   the cut scales the default by how many children the tree's *finest* aggregates hold, so structural
   coarsening (2 members per aggregate) keeps the familiar ~48px while a provided module partition
