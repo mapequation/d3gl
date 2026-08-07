@@ -1,7 +1,13 @@
 /**
- * Half-arrow link geometry (#104 N6) — the "map of networks" directed-link glyph.
+ * Link curve geometry: the bent-chord helpers every link glyph shares, plus the half-arrow
+ * ("map of networks" directed-link) shape (#104 N6).
  *
- * A directed link is drawn as a single filled shape: it pinches to the **source node centre**,
+ * Dependency-free and backend-agnostic, so it sits in `core/`: the WebGL shaders mirror these
+ * formulas per instance, the Canvas/SVG Scene emitters trace them into retained geometry, and the
+ * export-only vector view of an instanced layer ({@link instancedVectorLayers}, #200) reuses them
+ * to serialize exactly what the GPU drew.
+ *
+ * A directed half-arrow link is drawn as a single filled shape: it pinches to the **source node centre**,
  * runs as a tapered strip that bows around a **shared centre curve**, and ends in a barbed
  * **arrowhead whose tip lands on the target node's boundary**. A reciprocal A→B / B→A pair shares
  * that centre curve and fills opposite sides of it, so the two arrows nest instead of overlapping.
@@ -16,6 +22,31 @@
  * reference), not a fraction of the chord; the side it bows to is derived from the link direction so
  * reciprocal links are consistent without the caller tracking which is which.
  */
+
+/** Quadratic-bezier control point for a bent link: chord midpoint offset ⟂ by `bend`·|chord| — matches the strip shader. */
+export function bezierControl(sx: number, sy: number, tx: number, ty: number, bend: number): [number, number] {
+  const dx = tx - sx;
+  const dy = ty - sy;
+  return [(sx + tx) / 2 - dy * bend, (sy + ty) / 2 + dx * bend];
+}
+
+/** Unit end-tangent of a bent link at the target — matches the arrow shader's bezier `t=1` tangent. */
+export function bentEndTangent(sx: number, sy: number, tx: number, ty: number, bend: number): [number, number] {
+  const dx = tx - sx;
+  const dy = ty - sy;
+  const ex = 0.5 * dx + dy * bend;
+  const ey = 0.5 * dy - dx * bend;
+  const el = Math.hypot(ex, ey) || 1;
+  return [ex / el, ey / el];
+}
+
+/** Unit chord direction source→target (1,0 if degenerate). Used by the Scene/SVG arrow emitters. */
+export function straightUnit(sx: number, sy: number, tx: number, ty: number): [number, number] {
+  const dx = tx - sx;
+  const dy = ty - sy;
+  const len = Math.hypot(dx, dy) || 1;
+  return [dx / len, dy / len];
+}
 
 /** Inputs for one directed half-arrow link (world coordinates/units). */
 export interface HalfLinkParams {

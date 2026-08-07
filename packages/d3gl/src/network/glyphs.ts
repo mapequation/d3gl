@@ -4,7 +4,11 @@ import type { NetworkGraph } from "./graph.js";
 import type { PhysicalPieWedges } from "./pie.js";
 import type { LODTree, LODTransform } from "./lod.js";
 import type { ScreenRect } from "../core/instanced-lane.js";
-import { halfLinkGeometry, traceHalfLink, scaleHalfLink } from "./half-link.js";
+import { halfLinkGeometry, traceHalfLink, scaleHalfLink, bezierControl, bentEndTangent, straightUnit } from "../core/half-link.js";
+
+// Re-exported so the network's link-curve math keeps one import site for consumers/tests, even
+// though the formulas themselves now live in core (shared with the export-only vector view, #200).
+export { bezierControl, bentEndTangent };
 
 /**
  * Glyph builders for the network module (#100, epic #98) — the instanced "emitters".
@@ -905,23 +909,6 @@ export interface SuperEdgesData {
 /** Path-strip samples for a smooth bent link (#104 N6c). */
 const BENT_SAMPLES = 24;
 
-/** Quadratic-bezier control point for a bent link: chord midpoint offset ⟂ by `bend`·|chord| — matches the strip shader. */
-export function bezierControl(sx: number, sy: number, tx: number, ty: number, bend: number): [number, number] {
-  const dx = tx - sx;
-  const dy = ty - sy;
-  return [(sx + tx) / 2 - dy * bend, (sy + ty) / 2 + dx * bend];
-}
-
-/** Unit end-tangent of a bent link at the target — matches the arrow shader's bezier `t=1` tangent. */
-export function bentEndTangent(sx: number, sy: number, tx: number, ty: number, bend: number): [number, number] {
-  const dx = tx - sx;
-  const dy = ty - sy;
-  const ex = 0.5 * dx + dy * bend;
-  const ey = 0.5 * dy - dx * bend;
-  const el = Math.hypot(ex, ey) || 1;
-  return [ex / el, ey / el];
-}
-
 /**
  * Instanced line data for a graph's links, gathering each edge's endpoints from the node positions
  * by index. Straight by default; with `style.bend` the links bow into quadratic beziers (#104 N6c),
@@ -1152,14 +1139,6 @@ export function linkArrowsFromCache(graph: NetworkGraph, attrs: LinkArrowsStyleA
   const { radii, sizes, colors, bends, half } = attrs;
   if (bends) return { sources, targets, radii, sizes, colors, bends, half, count };
   return { sources, targets, radii, sizes, colors, count };
-}
-
-/** Unit chord direction source→target (1,0 if degenerate). Used by the Scene/SVG arrow emitter. */
-function straightUnit(sx: number, sy: number, tx: number, ty: number): [number, number] {
-  const dx = tx - sx;
-  const dy = ty - sy;
-  const len = Math.hypot(dx, dy) || 1;
-  return [dx / len, dy / len];
 }
 
 /** Fully-resolved network style (defaults applied) for assembling the render layers. */

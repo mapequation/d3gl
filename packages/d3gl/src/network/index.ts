@@ -19,8 +19,10 @@ export { network, Network } from "./network.js";
 export type { NetworkOptions, NetworkStyle, NetworkLayoutOptions, NetworkLODOptions, NetworkHit, NetworkLinkHit, StateNetworkOptions } from "./network.js";
 export type { NodeRadiusSpec, NodeMetric, ImportanceSpec, FlowBorderSpec, LinkWidthSpec, LinkColorSpec, LinkStyle } from "./glyphs.js";
 
-export { halfLinkGeometry, traceHalfLink, halfLinkPathString, scaleHalfLink } from "./half-link.js";
-export type { HalfLinkParams, HalfLinkGeometry, PathSink } from "./half-link.js";
+// Half-arrow geometry now lives in core (shared with the export-only vector view of the instanced
+// lanes, #200); re-exported here so the network entry point keeps its published surface.
+export { halfLinkGeometry, traceHalfLink, halfLinkPathString, scaleHalfLink } from "../core/half-link.js";
+export type { HalfLinkParams, HalfLinkGeometry, PathSink } from "../core/half-link.js";
 
 export { randomWalkFlow } from "./flow.js";
 export type { FlowGraph, FlowOptions, FlowResult } from "./flow.js";

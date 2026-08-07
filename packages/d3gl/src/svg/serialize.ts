@@ -1,4 +1,4 @@
-import type { RenderLayer, ViewTransform, DrawableVector, TextData } from "../core/index.js";
+import type { VectorLayer, ViewTransform, DrawableVector, TextData } from "../core/index.js";
 import { SvgPathContext } from "./svg-context.js";
 
 function rgba([r, g, b, a]: readonly [number, number, number, number]): string {
@@ -85,7 +85,7 @@ function drawableElements(d: DrawableVector): string {
  *   (no O(1) transform fast path). False ⇒ `world` is transform-independent.
  */
 export function svgBody(
-  layers: readonly RenderLayer[],
+  layers: readonly VectorLayer[],
   t: ViewTransform,
 ): { defs: string; world: string; screen: string; hasScreen: boolean } {
   const defs: string[] = [];
@@ -107,7 +107,7 @@ export function viewTransform(t: ViewTransform): string {
 
 /** A full SVG document for the given layers under a view transform, with optional screen-space text
  *  labels (#105 N7b-2) drawn on top so `toSVG()` exports include them. */
-export function svgFromLayers(width: number, height: number, layers: readonly RenderLayer[], t: ViewTransform, texts: readonly TextData[] = []): string {
+export function svgFromLayers(width: number, height: number, layers: readonly VectorLayer[], t: ViewTransform, texts: readonly TextData[] = []): string {
   const { defs, world, screen } = svgBody(layers, t);
   return (
     `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}">` +
@@ -120,7 +120,7 @@ export function svgFromLayers(width: number, height: number, layers: readonly Re
 
 /** Shared serialization used by both svgBody and svgFromLayers. */
 function buildGroups(
-  layers: readonly RenderLayer[],
+  layers: readonly VectorLayer[],
   t: ViewTransform,
   defs: string[],
   groups: string[],

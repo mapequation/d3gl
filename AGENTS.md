@@ -408,6 +408,17 @@ incompatible with the batched single-pass painter order) would fully remove. It'
 (position-tolerant) and opaque strokes are unaffected. luma.gl has no high-level arc/stroke
 primitive to lean on — strokes are flattened to polylines (`PathRecorder`) and triangulated here.
 
+**One deliberate export divergence (#200).** A *bordered circle* serializes differently per path,
+and this is intended. The WebGL export emits ONE circle stroked on the ring centreline —
+`r·(1 − b/2)` with `stroke-width = r·b` — which is what the fragment shader actually paints, and
+what `traceFrontierHalos` (`network/glyphs.ts`) already emits for the aggregate halo. The Scene path
+behind Canvas/SVG emits TWO stacked discs (`traceFrontierFills` inner + `traceFrontierBorders`
+outer). They read identically for an **opaque** fill and diverge for a **translucent** one, where
+the stacked pair paints an opaque inner disc over the ring and loses it. So the ring encoding is the
+more correct of the two — do **not** "fix" the WebGL side toward the stacked pair to make the counts
+match. `network/__tests__/network-export.browser.test.ts` pins both shapes. Moving the Scene path
+onto the ring encoding is #269.
+
 Guard it with the **backend-equivalence harness**
 (`map/__tests__/backend-equivalence-harness.ts` + `map/backend-equivalence.browser.test.ts`):
 it renders a Scene through both backends and pixel-diffs them (cases: overlapping bordered
