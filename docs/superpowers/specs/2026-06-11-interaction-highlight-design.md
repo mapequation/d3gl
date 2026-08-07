@@ -350,5 +350,8 @@ Website: shared geo-data tests updated for named rivers; centreCells move.
 - Multi-select gestures (shift-click accumulation), keyboard interaction.
 - Hover/selection on `passThrough` layers (not pickable by design).
 - Per-vertex styling, animated transitions of styles.
-- WebGL pick-buffer picking (CPU `HitIndex` stays; it is fast enough and
-  backend-agnostic).
+- ~~WebGL pick-buffer picking~~ — **implemented since this spec was written** (#141): GPU
+  colour-buffer picking lives in `packages/d3gl/src/webgl/pick.ts` (`pickAt`,
+  `encodePickColor`/`decodePickColor`, `readPixelsToArrayWebGL`). The CPU `HitIndex` also stays —
+  it is backend-agnostic and, since #216, indexes rather than scans — so the two coexist rather
+  than one replacing the other.
