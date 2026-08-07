@@ -38,12 +38,19 @@ export class WebGLBackend implements Backend {
   private bakeDirty = true;
   private bakeW = 2048;
   private bakeH = 1024;
-  /** Pass-through accumulation surface (lazily created when the first PT layer registers). */
+  /**
+   * The ONE pass-through accumulation surface, shared by every registered pass-through layer
+   * (lazily created when the first one registers). Layers do NOT get a framebuffer each: the
+   * engine repaints them as a single cycle that clears this surface once (`"replace-first"`)
+   * and then draws every layer into it (`"replace-rest"`), so N coexisting layers cost the same
+   * width×height×4 bytes as one (#110). Per-layer state that used to live here as a single
+   * value — the `sizeMode` — is keyed by layer name in {@link ptLayers} instead.
+   */
   private pt: PassThroughGL | null = null;
-  /** Registered pass-through layer names; the composite is gated on this being non-empty. */
-  private ptNames = new Set<string>();
-  /** sizeMode of the active PT layer: true ⇒ screen (constant px), false ⇒ world. */
-  private ptScreen = false;
+  /** Registered pass-through layers by name (mirrors the canvas backend); the composite is
+   *  gated on this being non-empty and {@link drawPassThrough} reads the drawn layer's sizeMode
+   *  from it, so two layers can differ (screen vs world). */
+  private ptLayers = new Map<string, PassThroughLayer>();
   /** Export-only text stash (#219): labels retained for toPNG()/toSVG(), never drawn to screen
    *  (the engine's HTML overlay owns live labels — GPU/MSDF text is #69). See {@link textLayerMode}. */
   private textData: readonly TextData[] = [];
@@ -210,14 +217,13 @@ export class WebGLBackend implements Backend {
   }
 
   setPassThroughLayer(layer: PassThroughLayer): void {
-    this.ptNames.add(layer.name);
+    this.ptLayers.set(layer.name, layer);
     this.pt ??= new PassThroughGL(this.device, this.width, this.height);
-    this.ptScreen = layer.sizeMode === "screen";
   }
 
   removePassThroughLayer(name: string): void {
-    this.ptNames.delete(name);
-    if (this.ptNames.size === 0) {
+    this.ptLayers.delete(name);
+    if (this.ptLayers.size === 0) {
       this.pt?.destroy();
       this.pt = null;
     }
@@ -226,7 +232,9 @@ export class WebGLBackend implements Backend {
   drawPassThrough(name: string, batch: DrawBatch, mode: "replace-first" | "replace-rest" | "append"): void {
     if (!this.pt) return;
     const clear = mode === "replace-first";
-    this.pt.setScreenMode(this.ptScreen);
+    // Per-LAYER sizing (#110): read this layer's mode rather than a single last-registration-wins
+    // flag, so a screen-sized layer and a world-sized one can share the accumulation surface.
+    this.pt.setScreenMode(this.ptLayers.get(name)?.sizeMode === "screen");
     // PassThroughGL records its fboTransform internally on a clear (replace-first).
     this.pt.draw(batch, this.viewTransform, clear);
     // The engine does NOT render() after drawPassThrough (mirrors appendToLayer); render now
@@ -477,7 +485,7 @@ export class WebGLBackend implements Backend {
     // the retained base above is re-rendered crisp at the current transform. This shared
     // drawInto path also runs for toPNG()/readPixel() (offscreen target), so PNG export
     // gets the pass-through points for free.
-    if (this.pt && this.ptNames.size > 0) {
+    if (this.pt && this.ptLayers.size > 0) {
       const pass2 = this.device.beginRenderPass({ framebuffer, clearColor: false });
       this.pt.composite(pass2, this.pt.fboTransform ?? this.viewTransform, this.viewTransform);
       pass2.end();
@@ -594,7 +602,7 @@ export class WebGLBackend implements Backend {
     this.globe = null;
     this.pt?.destroy();
     this.pt = null;
-    this.ptNames.clear();
+    this.ptLayers.clear();
     this.picker?.destroy();
     this.picker = null;
     this.pickFbo?.destroy();
