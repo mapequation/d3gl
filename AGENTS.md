@@ -438,6 +438,13 @@ ring-encoded circle put in a Scene and rendered through WebGL loses its ring, so
 for it on the instanced-lane-vs-Scene-twin comparison (as `fadedGlyphs` / `translucentBorderedGlyphs`
 do), not on the three-way Scene diff.
 
+**`toSVG()` is also the typed probe for "what did the WebGL lane actually emit".** `pushExportGeometry`
+(`map/base-engine.ts`) re-runs the *same* `lane.update(transform, w, h)` that `emitInstancedLane` pushes
+to `setInstancedLayer`, so counting elements in the exported document is a deterministic assertion about
+the real emit — no `as unknown as { handle: … }` backend spy, no `any`. Prefer it whenever a test needs
+to prove a layer was (or was NOT) pushed on **any** backend; it makes the same assertion portable across
+WebGL / Canvas / SVG in one loop (see `network/__tests__/network-links-none.browser.test.ts`, #157).
+
 Guard it with the **backend-equivalence harness**
 (`map/__tests__/backend-equivalence-harness.ts` + `map/backend-equivalence.browser.test.ts`):
 it renders a Scene through both backends and pixel-diffs them (cases: overlapping bordered

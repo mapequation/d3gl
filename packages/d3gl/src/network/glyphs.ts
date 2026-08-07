@@ -165,8 +165,13 @@ export type LinkWidthSpec = number | ((weight: number) => number) | { by: "weigh
  */
 export type LinkColorSpec = string | ((weight: number) => string) | { by: "weight" | "flow"; scale: (value: number) => string };
 
-/** How directed links are drawn: plain `"line"` + a separate arrowhead, or a fused `"half-arrow"` (the map glyph). */
-export type LinkStyle = "line" | "half-arrow";
+/**
+ * How links are drawn: plain `"line"` + a separate arrowhead (directed), a fused `"half-arrow"`
+ * (the map glyph), or `"none"` — a nodes-only network (#157). `"none"` **skips building the link /
+ * arrowhead / super-edge geometry altogether** (see {@link drawsLinks}); it is a rendering choice
+ * only, so the edges still drive the force layout and the LOD hierarchy.
+ */
+export type LinkStyle = "line" | "half-arrow" | "none";
 
 export interface LinkStyleResolved {
   /** Per-edge width from its weight; for super-edges, applied to the accumulated subsumed weight. */
@@ -1186,6 +1191,28 @@ export interface ResolvedNetworkStyle {
 }
 
 /**
+ * Does this network draw link geometry at all? The single predicate every link-emitting path
+ * consults (#157) — the no-LOD instanced layers ({@link networkLayers} /
+ * {@link networkLayersFromCache}), the no-LOD style cache ({@link noLodStyleCache}), the LOD
+ * super-edge emit and both retained-Scene registrations. `false` means the links / arrowheads /
+ * super-edge layers are **never built and never uploaded** — not drawn invisibly — so at ~1M edges
+ * there is no buffer to tessellate, colour, or push to the GPU.
+ *
+ * Three ways to end up with no links, all equivalent to the renderer:
+ * - the graph genuinely has none (`edgeCount === 0`) — every emit is then an empty loop;
+ * - `linkStyle: "none"` — "draw this network as nodes only";
+ * - a **constant** `linkWidth: 0`. A width *scale* that happens to return 0 for some weight is NOT
+ *   a global opt-out: `style.linkWidth` is the constant spec's value, and a function / `{ by, scale }`
+ *   spec always resolves to a non-zero representative (see `Network.resolvedStyle`).
+ *
+ * This is a **style** decision only: the edges are graph data and still drive the force layout and
+ * the LOD coarsening tree.
+ */
+export function drawsLinks(graph: NetworkGraph, style: ResolvedNetworkStyle): boolean {
+  return graph.edgeCount > 0 && style.linkStyle !== "none" && style.linkWidth > 0;
+}
+
+/**
  * Assemble the ordered instanced layers for a network: links (under), arrowheads (directed
  * only), then nodes (on top). Pure — the engine just pushes the result to the backend, which
  * keeps "what to render" unit-testable without a DOM or GPU.
@@ -1194,7 +1221,7 @@ export function networkLayers(graph: NetworkGraph, style: ResolvedNetworkStyle):
   const layers: InstancedLayer[] = [];
   const bend = style.linkBend;
   const halfArrow = style.linkStyle === "half-arrow" && style.directed;
-  if (graph.edgeCount > 0) {
+  if (drawsLinks(graph, style)) {
     if (halfArrow) {
       // One fused filled glyph per directed link (the map-of-networks look): the arrowhead is part of
       // the shape, so there's no separate arrows layer. The WebGL lane honours sizeMode — in "screen"
@@ -1257,15 +1284,16 @@ export function networkLayers(graph: NetworkGraph, style: ResolvedNetworkStyle):
  * keyed by the selection version (#240, `Network.noLodSelectedFor`).
  */
 export interface NoLodStyleCache {
-  /** Which layer shape the cache is for (must match the current style to be reusable). */
-  kind: "half-arrows" | "lines" | "lines+arrows" | "lines-only";
+  /** Which layer shape the cache is for (must match the current style to be reusable). `"no-links"`
+   *  is the nodes-only shape — {@link drawsLinks} is false, so no per-edge attrs exist at all. */
+  kind: "half-arrows" | "lines" | "lines+arrows" | "no-links";
   sizeMode: "world" | "screen";
   halfArrows?: HalfArrowStyleAttrs;
   lines?: LinkLinesStyleAttrs;
   arrows?: LinkArrowsStyleAttrs;
-  /** Per-edge source node id (#162 `groups` of every link layer), length `edgeCount`. */
-  groupSource: Float32Array;
-  /** Per-edge target node id (#162 `groups2` — undirected incident hover); absent when directed. */
+  /** Per-edge source node id (#162 `groups` of every link layer), length `edgeCount`; absent on `"no-links"`. */
+  groupSource?: Float32Array;
+  /** Per-edge target node id (#162 `groups2` — undirected incident hover); absent when directed or `"no-links"`. */
   groupTarget?: Float32Array;
   /** `[0, 1, …, nodeCount-1]` — the `nodes` circles layer's `groups` (instance i is node i). */
   nodeGroups: Float32Array;
@@ -1276,12 +1304,15 @@ export function noLodStyleCache(graph: NetworkGraph, style: ResolvedNetworkStyle
   const bend = style.linkBend;
   const halfArrow = style.linkStyle === "half-arrow" && style.directed;
   const sizeMode = style.sizeMode;
+  const nodeGroups = new Float32Array(graph.nodeCount);
+  for (let i = 0; i < graph.nodeCount; i++) nodeGroups[i] = i;
+  // No link layer will be emitted (#157) — so build nothing per edge: not the style attrs, and not
+  // the #162/#214 highlight group columns either (nothing to attach them to). At ~1M edges that is
+  // two Float32Array copies, ~8 MB, that would otherwise be allocated only to be dropped.
+  if (!drawsLinks(graph, style)) return { kind: "no-links", sizeMode, nodeGroups };
   // #162/#214 highlight group columns — one O(edges + nodes) copy per (graph, style) version, not per frame.
   const groupSource = Float32Array.from(graph.source);
   const groupTarget = style.directed ? undefined : Float32Array.from(graph.target);
-  const nodeGroups = new Float32Array(graph.nodeCount);
-  for (let i = 0; i < graph.nodeCount; i++) nodeGroups[i] = i;
-  if (graph.edgeCount === 0) return { kind: "lines-only", sizeMode, groupSource, groupTarget, nodeGroups };
   if (halfArrow) {
     return {
       kind: "half-arrows",
@@ -1310,7 +1341,7 @@ export function noLodStyleCache(graph: NetworkGraph, style: ResolvedNetworkStyle
 export function networkLayersFromCache(graph: NetworkGraph, style: ResolvedNetworkStyle, cache: NoLodStyleCache): InstancedLayer[] {
   const layers: InstancedLayer[] = [];
   const sizeMode = style.sizeMode;
-  if (graph.edgeCount > 0) {
+  if (drawsLinks(graph, style)) {
     if (cache.kind === "half-arrows" && cache.halfArrows) {
       layers.push({ name: "links", primitive: "half-arrows", halfArrows: halfArrowLinksFromCache(graph, cache.halfArrows), sizeMode });
     } else if (cache.lines) {

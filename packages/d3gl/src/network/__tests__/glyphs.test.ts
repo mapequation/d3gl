@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { nodeCircles, linkLines, linkArrows, halfArrowLinks, networkLayers, networkLayersFromCache, noLodStyleCache, pickNodes, resolveNodeRadii, resolveImportance, resolveLinkColorOf, resolveLinkStrokeOf, type ResolvedNetworkStyle } from "../glyphs.js";
+import { nodeCircles, linkLines, linkArrows, halfArrowLinks, networkLayers, networkLayersFromCache, noLodStyleCache, drawsLinks, pickNodes, resolveNodeRadii, resolveImportance, resolveLinkColorOf, resolveLinkStrokeOf, type ResolvedNetworkStyle } from "../glyphs.js";
 import { buildGraph } from "../graph.js";
 
 /** A resolved style with a uniform radius for `n` nodes (defaults applied elsewhere). */
@@ -110,6 +110,29 @@ describe("linkArrows", () => {
   });
 });
 
+describe("drawsLinks (#157)", () => {
+  const g2 = buildGraph({ nodeCount: 2, source: [0], target: [1] });
+  const g0 = buildGraph({ nodeCount: 2, source: [], target: [] });
+
+  it("is true for the ordinary line / half-arrow styles with a positive width", () => {
+    expect(drawsLinks(g2, style(2))).toBe(true);
+    expect(drawsLinks(g2, { ...style(2), linkStyle: "half-arrow", directed: true })).toBe(true);
+  });
+
+  it("is false for an edgeless graph, linkStyle:'none', and a constant linkWidth 0", () => {
+    expect(drawsLinks(g0, style(2))).toBe(false);
+    expect(drawsLinks(g2, { ...style(2), linkStyle: "none" })).toBe(false);
+    expect(drawsLinks(g2, { ...style(2), linkWidth: 0 })).toBe(false);
+    expect(drawsLinks(g2, { ...style(2), linkStyle: "half-arrow", directed: true, linkWidth: 0 })).toBe(false);
+  });
+
+  it("is true for a width SCALE that returns 0 for some weights — only a constant 0 opts out", () => {
+    // `resolvedStyle` keeps the representative `linkWidth` non-zero for any function/{by,scale} spec,
+    // so a scale bottoming out at 0 dims individual links but never skips the whole layer.
+    expect(drawsLinks(g2, { ...style(2), linkWidth: 1, linkWidthOf: (w) => (w > 5 ? 0 : 2) })).toBe(true);
+  });
+});
+
 describe("networkLayers", () => {
   it("emits links then nodes for an undirected graph (no arrows)", () => {
     const g = buildGraph({ nodeCount: 2, source: [0], target: [1] });
@@ -140,6 +163,25 @@ describe("networkLayers", () => {
 
     const bySize = Object.fromEntries(layers.map((l) => [l.name, l.sizeMode]));
     expect(bySize).toEqual({ links: "screen", arrows: "screen", nodes: "screen" });
+  });
+
+  it("emits ONLY nodes for linkStyle:'none' — the link/arrow layers are never built (#157)", () => {
+    const g = buildGraph({ nodeCount: 2, source: [0, 1], target: [1, 0], directed: true });
+    for (const s of [
+      { ...style(2), directed: true, linkStyle: "none" as const },
+      { ...style(2), directed: true, linkStyle: "half-arrow" as const, linkBend: 30, linkWidth: 0 },
+      { ...style(2), directed: true, linkWidth: 0 }, // a constant 0 width takes the same skip path
+    ]) {
+      const layers = networkLayers(g, s);
+      expect(layers.map((l) => l.name)).toEqual(["nodes"]);
+      // From the cache path too — and the cache itself holds no per-edge arrays.
+      const cache = noLodStyleCache(g, s);
+      expect(cache.kind).toBe("no-links");
+      expect(cache.lines).toBeUndefined();
+      expect(cache.arrows).toBeUndefined();
+      expect(cache.halfArrows).toBeUndefined();
+      expect(networkLayersFromCache(g, s, cache).map((l) => l.name)).toEqual(["nodes"]);
+    }
   });
 
   it("emits one fused half-arrow links layer (no separate arrows) for linkStyle:'half-arrow'", () => {
@@ -190,7 +232,7 @@ describe("noLodStyleCache highlight group columns (#214)", () => {
   it("carries source ids, target ids (undirected incident hover), and the node-identity column", () => {
     const g = buildGraph({ nodeCount: 3, source: [0, 1], target: [1, 2] });
     const c = noLodStyleCache(g, { ...style(3), directed: false });
-    expect(Array.from(c.groupSource)).toEqual([0, 1]);
+    expect(Array.from(c.groupSource ?? [])).toEqual([0, 1]);
     expect(Array.from(c.groupTarget ?? [])).toEqual([1, 2]);
     expect(Array.from(c.nodeGroups)).toEqual([0, 1, 2]);
   });
@@ -199,20 +241,21 @@ describe("noLodStyleCache highlight group columns (#214)", () => {
     const g = buildGraph({ nodeCount: 3, source: [0, 1], target: [1, 2], directed: true });
     const c = noLodStyleCache(g, { ...style(3), directed: true });
     expect(c.kind).toBe("lines+arrows");
-    expect(Array.from(c.groupSource)).toEqual([0, 1]);
+    expect(Array.from(c.groupSource ?? [])).toEqual([0, 1]);
     expect(c.groupTarget).toBeUndefined();
     const h = noLodStyleCache(g, { ...style(3), directed: true, linkStyle: "half-arrow" });
     expect(h.kind).toBe("half-arrows");
-    expect(Array.from(h.groupSource)).toEqual([0, 1]);
+    expect(Array.from(h.groupSource ?? [])).toEqual([0, 1]);
     expect(h.groupTarget).toBeUndefined();
     expect(Array.from(h.nodeGroups)).toEqual([0, 1, 2]);
   });
 
-  it("still carries the node column for an edgeless graph (lines-only kind)", () => {
+  it("still carries the node column for an edgeless graph (no-links kind, no per-edge columns)", () => {
     const g = buildGraph({ nodeCount: 2, source: [], target: [] });
     const c = noLodStyleCache(g, style(2));
-    expect(c.kind).toBe("lines-only");
-    expect(c.groupSource.length).toBe(0);
+    expect(c.kind).toBe("no-links");
+    expect(c.groupSource).toBeUndefined(); // nothing to attach them to (#157)
+    expect(c.groupTarget).toBeUndefined();
     expect(Array.from(c.nodeGroups)).toEqual([0, 1]);
   });
 
@@ -238,7 +281,7 @@ describe("noLodStyleCache highlight group columns (#214)", () => {
     expect(c2.groupSource).not.toBe(groupSource);
     expect(c2.groupTarget).not.toBe(groupTarget);
     expect(c2.nodeGroups).not.toBe(nodeGroups);
-    expect(Array.from(c2.groupSource)).toEqual(Array.from(groupSource)); // same content, new identity
+    expect(Array.from(c2.groupSource ?? [])).toEqual(Array.from(groupSource ?? [])); // same content, new identity
   });
 });
 
