@@ -1,5 +1,5 @@
 import type { PathContext, Subpath } from "./path-context.js";
-import { flattenCubic, flattenQuadratic, flattenArc } from "./flatten.js";
+import { flattenCubic, flattenQuadratic, flattenArc, DEFAULT_CURVE_TOLERANCE } from "./flatten.js";
 
 /**
  * Records PathContext drawing calls into flattened polylines (subpaths).
@@ -15,8 +15,8 @@ export class PathRecorder implements PathContext {
   private tx = 0;
   private ty = 0;
 
-  /** Flattening tolerance in coordinate units. */
-  constructor(public tolerance = 0.25) {}
+  /** Flattening tolerance in coordinate units — see {@link DEFAULT_CURVE_TOLERANCE}. */
+  constructor(public tolerance = DEFAULT_CURVE_TOLERANCE) {}
 
   get subpaths(): readonly Subpath[] {
     return this.paths;

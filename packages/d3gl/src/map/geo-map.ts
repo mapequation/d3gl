@@ -208,7 +208,7 @@ export class GeoMap extends BaseEngine {
           }
           // Polygon / MultiPolygon / LineString / MultiLineString / GeometryCollection / Feature:
           // record the projected subpaths (same geoPath path as the retained geo layer).
-          const rec = new PathRecorder(0.25);
+          const rec = new PathRecorder(this.curveTolerance);
           geoPath(this.projection, rec)(f as Parameters<ReturnType<typeof geoPath>>[0]);
           const subpaths = rec.subpaths.map((s) => ({ closed: s.closed, points: s.points.slice() }));
           if (subpaths.length === 0) return null;

@@ -9,6 +9,7 @@ import type {
   VectorLayer,
 } from "./backend.js";
 import { PathRecorder } from "./path-recorder.js";
+import { DEFAULT_CURVE_TOLERANCE } from "./flatten.js";
 import { DEFAULT_MITER_LIMIT } from "./stroke.js";
 import { bezierControl, bentEndTangent, straightUnit, halfLinkGeometry, traceHalfLink, scaleHalfLink } from "./half-link.js";
 import type { Subpath } from "./path-context.js";
@@ -57,9 +58,10 @@ function drawable(
   };
 }
 
-/** Record a path through the shared {@link PathRecorder} (curve flattening identical to the Scene's). */
-function record(draw: (ctx: PathRecorder) => void): Subpath[] {
-  const rec = new PathRecorder();
+/** Record a path through the shared {@link PathRecorder} (curve flattening identical to the Scene's,
+ *  so an exported wedge and its Canvas/SVG Scene twin are baked at the SAME tolerance — #45). */
+function record(draw: (ctx: PathRecorder) => void, tolerance = DEFAULT_CURVE_TOLERANCE): Subpath[] {
+  const rec = new PathRecorder(tolerance);
   draw(rec);
   return rec.subpaths as Subpath[];
 }
@@ -97,7 +99,11 @@ const TAU = Math.PI * 2;
 
 /** Instanced pie wedges → one filled arc sector per wedge. Screen sizeMode pins the sector at a
  *  constant pixel size around its (projected) centre via the drawable anchor, as `tracePieWedges` does. */
-export function pieToDrawables(p: InstancedPieData, screen: boolean): DrawableVector[] {
+export function pieToDrawables(
+  p: InstancedPieData,
+  screen: boolean,
+  tolerance = DEFAULT_CURVE_TOLERANCE,
+): DrawableVector[] {
   const out: DrawableVector[] = [];
   for (let i = 0; i < p.count; i++) {
     const cx = p.centers[i * 2] ?? 0;
@@ -111,7 +117,7 @@ export function pieToDrawables(p: InstancedPieData, screen: boolean): DrawableVe
           ctx.moveTo(cx, cy);
           ctx.arc(cx, cy, r, a0, a1, false);
           ctx.closePath();
-        }),
+        }, tolerance),
         fill: rgbaAt(p.colors, i),
         anchor: screen ? [cx, cy] : null,
       }),
@@ -221,7 +227,11 @@ export function halfArrowsToDrawables(h: InstancedHalfArrowsData, bake = 1): Dra
  * does. Circles, pies and lines carry their sizeMode through — the serializers already place a
  * screen-mode circle at a projected centre with a constant radius.
  */
-export function instancedVectorLayers(layers: readonly InstancedLayer[], k: number): VectorLayer[] {
+export function instancedVectorLayers(
+  layers: readonly InstancedLayer[],
+  k: number,
+  tolerance = DEFAULT_CURVE_TOLERANCE,
+): VectorLayer[] {
   const out: VectorLayer[] = [];
   for (const layer of layers) {
     const screen = layer.sizeMode === "screen";
@@ -231,7 +241,7 @@ export function instancedVectorLayers(layers: readonly InstancedLayer[], k: numb
         out.push({ name: layer.name, sizeMode: layer.sizeMode, drawables: circlesToDrawables(layer.circles) });
         break;
       case "pie":
-        out.push({ name: layer.name, sizeMode: layer.sizeMode, drawables: pieToDrawables(layer.pie, screen) });
+        out.push({ name: layer.name, sizeMode: layer.sizeMode, drawables: pieToDrawables(layer.pie, screen, tolerance) });
         break;
       case "lines":
         out.push({ name: layer.name, sizeMode: layer.sizeMode, drawables: linesToDrawables(layer.lines) });

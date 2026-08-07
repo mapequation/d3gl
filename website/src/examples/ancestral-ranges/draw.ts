@@ -10,6 +10,7 @@ import { makeMammalTree, assignBioregions, REGION_NAMES } from "../shared/mammal
 import { calcMaximumParsimony, aggregateClusters, aggregateSpeciesCount } from "../shared/parsimony.js";
 
 const LINE_MIN = 1, LINE_MAX = 22; // branch-width range when scaling by subtended terminals
+const MAX_ZOOM = 40;
 const LABEL_STYLE = { font: "11px system-ui, sans-serif", color: "#333", textShadow: "none" };
 
 type SizeMode = "world" | "screen";
@@ -138,9 +139,12 @@ function labelOffset(mode: LayoutMode, angle: number, gap: number): [number, num
 export const setup: ImperativeSetup = (host, { width, height, backend }) => {
   const W = width, H = height;
 
-  const chart = plot(host, { width: W, height: H, backend });
+  // Curves (the pie rims, the radial "step" arcs, the bump links) are flattened to polylines
+  // ONCE, in world units — so a facet of t world units is t*k screen px at zoom k. Declaring the
+  // deepest zoom bakes them fine enough to stay sub-pixel all the way in, at no per-frame cost.
+  const chart = plot(host, { width: W, height: H, backend, curveTolerance: 0.25 / MAX_ZOOM });
   // Scroll to zoom, drag to pan; the engine re-places the tip labels on every transform.
-  chart.enableZoom([0.5, 40]);
+  chart.enableZoom([0.5, MAX_ZOOM]);
 
   return {
     engine: chart,

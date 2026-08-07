@@ -1,4 +1,5 @@
 import { PathRecorder } from "./path-recorder.js";
+import { DEFAULT_CURVE_TOLERANCE } from "./flatten.js";
 import { groupRings } from "./rings.js";
 import { tessellateFill } from "./tessellate.js";
 import { expandStroke, DEFAULT_MITER_LIMIT, type LineJoin, type LineCap } from "./stroke.js";
@@ -359,7 +360,7 @@ export interface DrawableVector {
 export class Scene {
   private groups = new Map<string, GroupData>();
 
-  constructor(private readonly tolerance = 0.25) {}
+  constructor(private readonly tolerance = DEFAULT_CURVE_TOLERANCE) {}
 
   /** Build (or rebuild) a named group. The callback registers drawables. */
   group(name: string, build: (g: GroupBuilder) => void): void {
