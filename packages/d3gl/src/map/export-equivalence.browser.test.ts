@@ -146,8 +146,8 @@ describe("export equivalence: the diff is sensitive to the screen-mode bake (#27
   });
 
   // Non-vacuity, part 2 — the arrowheads whose bake this issue is about carry enough of the exported
-  // ink that displacing them clears the 0.5% ceiling by an order of magnitude (the injected 2px tip
-  // offset scored 3.1% here). Measured as the diff between the directed export (heads on) and the
+  // ink that displacing them clears the 0.5% ceiling several times over (the injected 2px tip offset
+  // scored 1.6-4.0%, i.e. 3-8×). Measured as the diff between the directed export (heads on) and the
   // undirected one (heads off) at the deeper zoom.
   it("arrowheads are a large share of the exported ink, so a displaced head cannot hide", async () => {
     const k = ZOOMS[1];
