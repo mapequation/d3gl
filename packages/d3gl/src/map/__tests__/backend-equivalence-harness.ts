@@ -364,6 +364,48 @@ export function strokeJoinShapes(width: number, height: number, opts: JoinSceneO
   return scene;
 }
 
+/**
+ * Rounded rectangles traced with `arcTo` (#86) — the tangent-arc primitive a `draw`
+ * callback reaches for (rounded bars, CSS-style cards). Before #86 the recorder THREW
+ * on `arcTo` and the SVG path context silently emitted two `lineTo`s (square corners),
+ * so this scene could not exist at all.
+ *
+ * The corner radii deliberately span the interesting cases: a small radius, a radius
+ * equal to half the short side (fully round ends, where the tangent points of adjacent
+ * corners coincide), and a wide-but-shallow bar. Fills are opaque with a thick contrasting
+ * border, so a square corner (the old SVG behaviour) leaves a solid wedge of the wrong
+ * colour — far past the diff's 1px position tolerance.
+ */
+export function roundedRectShapes(width: number, height: number): Scene {
+  const bars: { x: number; y: number; w: number; h: number; r: number; fill: string }[] = [
+    { x: width * 0.08, y: height * 0.08, w: width * 0.84, h: height * 0.2, r: height * 0.06, fill: "#1f77b4" },
+    { x: width * 0.08, y: height * 0.38, w: width * 0.5, h: height * 0.2, r: height * 0.1, fill: "#ff7f0e" },
+    { x: width * 0.08, y: height * 0.68, w: width * 0.84, h: height * 0.14, r: height * 0.03, fill: "#2ca02c" },
+  ];
+  const scene = new Scene();
+  scene.group("bars", (g) => {
+    bars.forEach((b, i) => {
+      g.drawable(
+        i,
+        (ctx) => {
+          ctx.moveTo(b.x + b.r, b.y);
+          ctx.arcTo(b.x + b.w, b.y, b.x + b.w, b.y + b.h, b.r);
+          ctx.arcTo(b.x + b.w, b.y + b.h, b.x, b.y + b.h, b.r);
+          ctx.arcTo(b.x, b.y + b.h, b.x, b.y, b.r);
+          ctx.arcTo(b.x, b.y, b.x + b.w, b.y, b.r);
+          ctx.closePath();
+        },
+        { lineWidth: Math.max(3, Math.round(Math.min(width, height) * 0.02)) },
+      );
+    });
+  });
+  bars.forEach((b, i) => {
+    scene.setFill("bars", i, b.fill);
+    scene.setStroke("bars", i, "#111111");
+  });
+  return scene;
+}
+
 // ---------------------------------------------------------------------------
 // #209 scenes: the feature families beyond fills/strokes — text labels, point
 // glyphs (world/screen sizeMode), translucency, clipping, and the instanced-vs-

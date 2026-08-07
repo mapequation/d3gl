@@ -12,6 +12,7 @@ import {
   fadedGlyphs,
   translucentBorderedGlyphs,
   nestedRingShapes,
+  roundedRectShapes,
   glyphSceneLayers,
   layerOf,
   renderWebGLBackend,
@@ -279,6 +280,19 @@ describe("backend equivalence: nested ring topology (#73)", () => {
     expect(diffPixels(cv, svg).fraction).toBeLessThan(0.01);
     expect(glCv.fraction).toBeLessThan(0.01);
     expect(diffPixels(gl, svg).fraction).toBeLessThan(0.01);
+  });
+});
+
+describe("backend equivalence: arcTo rounded rectangles (#86)", () => {
+  it("all three backends draw the same tangent-arc corners", async () => {
+    const layers = [layerOf(backdropScene(W, H), "backdrop"), layerOf(roundedRectShapes(W, H), "bars")];
+    const d = await threeWay(layers);
+    expect(d.glCv.considered).toBe(W * H); // opaque backdrop ⇒ every pixel compared
+    // A backend that squared a corner (the pre-#86 SvgPathContext two-lineTo path) leaves a
+    // solid wedge of the wrong colour — orders of magnitude past the 1px position tolerance.
+    expect(d.glCv.fraction).toBeLessThan(0.01);
+    expect(d.cvSvg.fraction).toBeLessThan(0.01);
+    expect(d.glSvg.fraction).toBeLessThan(0.01);
   });
 });
 

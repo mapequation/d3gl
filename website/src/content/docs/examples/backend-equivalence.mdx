@@ -7,6 +7,7 @@ import ExampleCard from "../../../components/ExampleCard.astro";
 import BordersEquivalence from "../../../examples/backend-equivalence/BordersEquivalence.tsx";
 import JoinsEquivalence from "../../../examples/backend-equivalence/JoinsEquivalence.tsx";
 import TranslucentEquivalence from "../../../examples/backend-equivalence/TranslucentEquivalence.tsx";
+import RoundedEquivalence from "../../../examples/backend-equivalence/RoundedEquivalence.tsx";
 
 d3gl renders the same scene through three backends. Each example below renders a scene in all
 three at once so any compositing divergence is obvious. Zoom/pan any panel to inspect (the view
@@ -33,6 +34,20 @@ sharp corners.
 
 <ExampleCard files={["backend-equivalence/draw.ts"]}>
   <JoinsEquivalence client:visible slot="demo" />
+</ExampleCard>
+
+## Rounded corners (`arcTo`)
+
+Rounded bars drawn with `ctx.arcTo(x1, y1, x2, y2, radius)` — the Canvas-2D **tangent arc**: it
+lines to the point where the circle of the given radius touches the incoming segment, sweeps the
+short arc, and leaves the current point on the outgoing segment. The middle bar uses
+`radius = height / 2`, so its ends are fully round. Degenerate corners (zero radius, collinear or
+coincident points) collapse to a plain corner, exactly as Canvas does. d3gl flattens the arc once
+at build time (honouring [`curveTolerance`](/docs/engines/#curve-quality-under-zoom)), so all three
+backends draw the identical geometry — zoom into a corner to check.
+
+<ExampleCard files={["backend-equivalence/draw.ts"]}>
+  <RoundedEquivalence client:visible slot="demo" />
 </ExampleCard>
 
 ## Translucent strokes

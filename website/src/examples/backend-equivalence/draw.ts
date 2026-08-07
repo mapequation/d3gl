@@ -143,3 +143,46 @@ export function drawStrokeScene(chart: Plot, width: number, height: number, opac
 
   chart.render();
 }
+
+// ---------------------------------------------------------------------------
+// Scene 4 — rounded corners via ctx.arcTo (tangent arcs)
+// ---------------------------------------------------------------------------
+
+/** One rounded bar. `r` is the corner radius; `r = h / 2` gives fully round ends. */
+export interface Bar { x: number; y: number; w: number; h: number; r: number; fill: string; }
+
+export function makeBars(width: number, height: number): Bar[] {
+  const palette = schemeCategory10 as string[];
+  const values = [0.84, 0.52, 0.68];
+  return values.map((v, i) => ({
+    x: width * 0.08,
+    y: height * (0.12 + i * 0.28),
+    w: width * 0.84 * v,
+    h: height * 0.18,
+    r: height * (i === 1 ? 0.09 : 0.05), // the middle bar's radius = h/2: fully round ends
+    fill: palette[i % palette.length]!,
+  }));
+}
+
+/**
+ * Rounded bars drawn with `ctx.arcTo(x1, y1, x2, y2, radius)` — the Canvas-2D tangent-arc
+ * primitive. d3gl flattens the arc once at build time (honouring `curveTolerance`), so the
+ * corners are identical geometry on WebGL, Canvas, and SVG. Zoom in on a corner to check.
+ */
+export function drawRoundedScene(chart: Plot, width: number, height: number): void {
+  chart.layer("bars", makeBars(width, height), {
+    draw: (ctx, b) => {
+      ctx.moveTo(b.x + b.r, b.y);
+      ctx.arcTo(b.x + b.w, b.y, b.x + b.w, b.y + b.h, b.r); // top-right corner
+      ctx.arcTo(b.x + b.w, b.y + b.h, b.x, b.y + b.h, b.r); // bottom-right
+      ctx.arcTo(b.x, b.y + b.h, b.x, b.y, b.r); // bottom-left
+      ctx.arcTo(b.x, b.y, b.x + b.w, b.y, b.r); // top-left
+      ctx.closePath();
+    },
+    fill: (b: Bar) => b.fill,
+    stroke: "#ffffff",
+    lineWidth: 3,
+    id: (_b, i) => i,
+  });
+  chart.render();
+}

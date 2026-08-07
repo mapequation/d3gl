@@ -41,6 +41,15 @@ export interface PathContext {
     endAngle: number,
     counterclockwise?: boolean,
   ): void;
+  /**
+   * Tangent arc with Canvas-2D semantics (#86): line to the point where the circle of
+   * `radius` touches the segment from the current point towards `(x1, y1)`, then sweep the
+   * short arc to where it touches the segment from `(x1, y1)` towards `(x2, y2)`, leaving
+   * the current point there. The rounded-corner primitive (rounded bars, CSS-style cards).
+   * Degenerate inputs — zero radius, coincident or collinear points — draw a straight line
+   * to `(x1, y1)`; a negative radius is an error. Retained backends bake it to a polyline
+   * once, at `tolerance`, so every backend draws the identical geometry.
+   */
   arcTo(x1: number, y1: number, x2: number, y2: number, radius: number): void;
   rect(x: number, y: number, w: number, h: number): void;
   closePath(): void;

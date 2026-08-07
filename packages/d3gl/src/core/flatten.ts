@@ -145,3 +145,95 @@ export function flattenArc(
     out.push(cx + r * Math.cos(a), cy + r * Math.sin(a));
   }
 }
+
+/**
+ * Below this the cross product of the two unit segment directions counts as zero,
+ * i.e. the three points are collinear and the tangent arc degenerates to a corner.
+ */
+const COLLINEAR_EPS = 1e-12;
+
+/**
+ * Tangent arc, matching `CanvasRenderingContext2D.arcTo(x1, y1, x2, y2, radius)` — the
+ * rounded-corner primitive (rounded rects/bars, CSS-style shapes). `(x0, y0)` is the
+ * current point; `(x1, y1)` the corner; `(x2, y2)` the point the outgoing segment heads
+ * towards. The arc is tangent to BOTH half-infinite lines `(x1,y1)→(x0,y0)` and
+ * `(x1,y1)→(x2,y2)`, so the tangent points may lie beyond `(x0,y0)`/`(x2,y2)` — that is
+ * the spec, not a bug.
+ *
+ * Appends, like the flatteners above, EXCLUDING the start point and INCLUDING the end:
+ * first the start tangent point (the straight join from the current point), then the
+ * flattened arc. Degenerate inputs — zero radius, coincident points, collinear points —
+ * collapse to a single point at the corner, exactly as Canvas does.
+ *
+ * This is the ONE source of truth for the seam: `PathRecorder` (WebGL/Canvas/SVG all
+ * render the Scene it records) and `SvgPathContext` both call it, so the same `arcTo`
+ * produces the same polyline everywhere. Flattened rather than kept as an analytic arc
+ * for the same reason `flattenArc` is — see #284 for the symbolic-curve alternative.
+ */
+export function flattenArcTo(
+  x0: number,
+  y0: number,
+  x1: number,
+  y1: number,
+  x2: number,
+  y2: number,
+  radius: number,
+  tolerance: number,
+  out: number[],
+): void {
+  // Canvas ignores a call with any non-finite argument rather than corrupting the path.
+  if (
+    !Number.isFinite(x0) || !Number.isFinite(y0) || !Number.isFinite(x1) || !Number.isFinite(y1) ||
+    !Number.isFinite(x2) || !Number.isFinite(y2) || !Number.isFinite(radius)
+  ) {
+    return;
+  }
+  if (radius < 0) throw new Error(`arcTo: radius must be non-negative (got ${radius})`);
+
+  // Unit directions from the corner back to the current point and on to the next point.
+  let v1x = x0 - x1;
+  let v1y = y0 - y1;
+  let v2x = x2 - x1;
+  let v2y = y2 - y1;
+  const l1 = Math.hypot(v1x, v1y);
+  const l2 = Math.hypot(v2x, v2y);
+  if (radius === 0 || l1 === 0 || l2 === 0) {
+    out.push(x1, y1); // no arc to build: straight line to the corner
+    return;
+  }
+  v1x /= l1;
+  v1y /= l1;
+  v2x /= l2;
+  v2y /= l2;
+  const sin = v1x * v2y - v1y * v2x; // sin θ (signed): 0 when the three points are collinear
+  const cos = v1x * v2x + v1y * v2y; // cos θ
+  if (Math.abs(sin) < COLLINEAR_EPS) {
+    out.push(x1, y1);
+    return;
+  }
+  // Distance from the corner to each tangent point: r / tan(θ/2), with the half-angle
+  // identity tan(θ/2) = sin θ / (1 + cos θ) (stable for θ → π, where the arc vanishes).
+  const d = (radius * (1 + cos)) / Math.abs(sin);
+  const t1x = x1 + v1x * d;
+  const t1y = y1 + v1y * d;
+  const t2x = x1 + v2x * d;
+  const t2y = y1 + v2y * d;
+  // Centre: r along the normal of the incoming segment, on the side the outgoing one lies.
+  const s = sin > 0 ? 1 : -1;
+  const cx = t1x - s * v1y * radius;
+  const cy = t1y + s * v1x * radius;
+  // Skip a zero-length join (the tangent point already IS the current point) so the
+  // polyline never carries a duplicate vertex into the stroke tessellator.
+  if (Math.abs(t1x - x0) > COLLINEAR_EPS || Math.abs(t1y - y0) > COLLINEAR_EPS) out.push(t1x, t1y);
+  // Sweep direction: travelling into the corner along -v1 and out along +v2 turns with
+  // angles DEcreasing when the cross product is positive. |sweep| = π - θ < π, so
+  // flattenArc's normalization picks the short way round.
+  flattenArc(
+    cx, cy, radius,
+    Math.atan2(t1y - cy, t1x - cx),
+    Math.atan2(t2y - cy, t2x - cx),
+    sin > 0,
+    tolerance,
+    out,
+  );
+}
