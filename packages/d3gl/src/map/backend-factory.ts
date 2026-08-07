@@ -19,6 +19,8 @@ import { WebGLBackend } from "../webgl/index.js";
  *   create the WebGL device in the background and swap to it transparently when ready. Falls
  *   back to staying on Canvas (with a `console.warn`) if WebGL is unavailable. In `"auto"` mode
  *   `whenReady()` resolves at the canvas first paint (early); the upgrade is transparent.
+ *   Above ~10,000 drawables the placeholder is left blank (correctly sized, nothing painted) —
+ *   a Canvas2D frame at that scale costs more than the upgrade it is bridging.
  *
  * Switch a live engine with `setBackend(...)` (layers, colors, and the current view are
  * preserved); switching to the already-live backend is a no-op.

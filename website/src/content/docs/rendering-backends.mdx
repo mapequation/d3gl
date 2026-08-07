@@ -74,12 +74,18 @@ above ~10,000 elements the engine **withholds it from the placeholder** and lets
 WebGL backend paint the first frame instead. On a 611k-edge network that turns ~19 s of blocked
 main thread into ~0.2 s, with time-to-first-frame matching `backend: "webgl"`.
 
-You get a blank canvas for the (short) duration of the upgrade rather than a slow one; everything
-else is unchanged — `whenReady()` still resolves at the same moment, smaller scenes still paint
+The same threshold applies to geometry WebGL renders too — every `geoMap` layer, `plot.layer()`,
+every non-decluttered `points()` layer. That geometry is still **built** (it is shared, so
+skipping it would only move identical work later), but above ~10,000 drawables it is not pushed
+to the placeholder and not painted on it: the canvas frame would be thrown away by the WebGL
+install a moment later. Measured on a 120,000-polygon `geoMap`, that takes ~104 ms of main-thread
+work out of the `layer()` call; the cost scales linearly, so ~0.9 s at a million polygons.
+
+You get a blank canvas for the (short) duration of the upgrade rather than a slow one — its box
+is reserved by your CSS, so nothing on the page moves when the real map arrives. Everything else
+is unchanged: `whenReady()` still resolves at the same moment, smaller scenes still paint
 instantly on canvas, and if WebGL turns out to be unavailable the engine falls back to canvas and
-draws the full detail there after all. Geometry that WebGL renders too (every `geoMap` layer,
-`plot.layer()`, non-decluttered points) is never withheld: it is built once and shared, so there
-would be nothing to save.
+draws the full detail there after all.
 
 ## Switching at runtime
 

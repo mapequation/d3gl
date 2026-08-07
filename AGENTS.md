@@ -341,6 +341,7 @@ per-file timeout. Every at-scale leg below now asserts. When you add a guard, ad
 | GPU layout tick | **WebGL** | `network/gpu/__tests__/gpu-frame-budget-perf.browser.test.ts` | 30k | `PERF_BROWSER_N` (max 200k) |
 | React recolor vs build | **WebGL** | `react/perf.browser.test.ts` | 4096 | capped at 8192 — see below |
 | `"auto"` placeholder emit | Canvas→**WebGL** | `map/auto-placeholder-perf.browser.test.ts` | 200k edges / 200k points | `PERF_BROWSER_N` (max 611k) |
+| `"auto"` placeholder **paint** | Canvas→**WebGL** | same file, `#273` describe block | 30k geo polygons | `PERF_BROWSER_N` (max 120k) |
 
 **Known holes, tracked:** the at-scale legs drive **backends**, not engines, so the layer above the
 backend seam (accessors, lane emit, LOD integration) is only covered at N ≤ 5000 (#263); geo's
@@ -375,6 +376,27 @@ are never given slack by either knob.
 sets it to `$PERF_N` — do **not** hard-code, two benches used to and silently ignored the tier),
 assert the deterministic signature *unconditionally*, and put the wall-clock ceiling behind
 `PERF_ASSERT` with an env override. See `frontier-perf.test.ts` for the shape.
+
+## Host sizing: backend canvases are OUT OF FLOW (#39, re-confirmed in #273)
+
+`makeCanvas` (`map/backend-factory.ts`) gives every backend `<canvas>` `position:absolute; top:0;
+left:0`, and the engine constructor promotes a `static` host to `position:relative`. **A backend
+canvas therefore contributes nothing to layout, on any backend, at any point in the lifecycle.**
+Consequences worth remembering before "fixing" a layout complaint:
+
+- **A late-arriving WebGL canvas cannot flush page content down.** That was the pre-#39 symptom and
+  it is gone. Measured across `webgl` / `canvas` / `auto` × all three `resolveSizing` modes: the
+  offsetTop of a sibling after the host is identical before construction, synchronously after it,
+  after `whenReady()` and after the `"auto"` upgrade settles. Guards:
+  `map/auto-layout-shift.browser.test.ts` (incl. a pure-DOM control showing an in-flow canvas *would*
+  shift by its full height, ×2 while two coexist) and `react/host-layout-shift.browser.test.tsx`.
+- **The host box comes from CSS, never from the canvas.** The React wrappers always emit one
+  (`react/host-style.ts`), and `aspectRatio` mode has `resolveSizing` write `width:100%` +
+  `aspect-ratio` on the host — synchronously, inside the constructor, so any reflow it causes is
+  paid before the first paint and is backend-independent.
+- **A bare host in fixed (`width`+`height`) mode gets NO CSS from the engine**, so an unstyled
+  `<div>` collapses to zero height and the map overlaps whatever follows it. Stable, not a shift —
+  but it is why examples and docs always size the host.
 
 ## Backend compositing equivalence (READ before touching the WebGL renderer)
 
