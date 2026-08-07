@@ -32,6 +32,12 @@ import {
  */
 const W = 1280;
 const H = 800;
+// The at-scale leg gates rather than only reporting (#258). Signatures assert whenever the bench
+// runs; wall-clock only under PERF_ASSERT (the single-threaded CI tier), per lod-perf.bench.test.ts.
+// Calibration at 1M on an M-series laptop: settled medians 0.5-7.2ms across the four regimes.
+const ASSERT = !!process.env.PERF_ASSERT;
+const FRAME_MS = Number(process.env.PERF_LABEL_CANDIDATES_MS) || 80;
+const ALLOC_KB_PER_FRAME = Number(process.env.PERF_LABEL_CANDIDATES_ALLOC_KB) || 64;
 
 function makeRng(seed: number): () => number {
   let s = seed >>> 0;
@@ -246,8 +252,11 @@ describe("#212 no-LOD label candidates", () => {
 
   // Empirical BEFORE/AFTER at 1M — env-gated; prints the PR's table. Methodology as the #210
   // bench: warm sweep, gc(), then timed frames with process.memoryUsage() deltas per frame.
-  it.runIf(process.env.BENCH_LABEL_CANDIDATES)("bench: 1M nodes, 24-frame settled pan sweep", () => {
-    const M = 1_000_000;
+  it.runIf(process.env.BENCH_LABEL_CANDIDATES)("bench: at-scale 24-frame settled pan sweep", () => {
+    // Honour the tier's scale convention (#258): scripts/run-perf-tier.mjs sets
+    // BENCH_<NAME>_N to $PERF_N. This used to hard-code 1M and silently ignore it, so PERF_N
+    // couldn't shrink the run and the CI tier wasn't measuring the scale it thought it was.
+    const M = Number(process.env.BENCH_LABEL_CANDIDATES_N) || 1_000_000;
     const f = makeFixture(M, 1234);
     const labelOf: LabelOf = (id) => (id % 7 === 0 ? null : `n${id}`);
     const gc = globalThis.gc;
@@ -262,7 +271,7 @@ describe("#212 no-LOD label candidates", () => {
     };
 
     let frames: WorldRect[] = [];
-    const run = (name: string, fn: (rect: WorldRect) => number[]): void => {
+    const run = (name: string, fn: (rect: WorldRect) => number[]): { median: number; bufKB: number } => {
       for (const rect of frames) fn(rect); // warm
       gc?.();
       const m0 = process.memoryUsage();
@@ -280,29 +289,52 @@ describe("#212 no-LOD label candidates", () => {
       const bufKB = (m1.arrayBuffers - m0.arrayBuffers) / 1024 / frames.length;
       // eslint-disable-next-line no-console
       console.log(`${name}: median ${median.toFixed(3)} ms/frame, p95 ${p95.toFixed(3)} ms/frame, heapUsed ${heapKB.toFixed(0)} KB/frame, arrayBuffers ${bufKB.toFixed(0)} KB/frame`);
+      return { median, bufKB };
     };
 
     for (const [muls, sweepName] of [[[2, 4, 8], "mixed 2-8x"], [[8, 12, 16], "zoomed-in 8-16x"]] as const) {
       frames = makeFrames([...muls], 5);
       for (const [cap, capName] of [[50, "max=50"], [Infinity, "uncapped"]] as const) {
         // BEFORE: the replaced per-frame scan (+ full sort when capped).
-        run(`BEFORE ${sweepName} ${capName}`, (rect) => referenceSelect(f, rect, cap, undefined, labelOf));
+        const before = run(`BEFORE ${sweepName} ${capName}`, (rect) => referenceSelect(f, rect, cap, undefined, labelOf));
         // AFTER (settled): grid built once outside the timed frames, as in steady-state panning.
         const src: CandidateSource = { grid: buildCandidateGrid(f.positions, f.nodeCount), stale: false };
         const list = new CandidateList();
-        run(`AFTER settled ${sweepName} ${capName}`, (rect) => newSelect(src, list, f, rect, cap, undefined, labelOf));
+        const settled = run(`AFTER settled ${sweepName} ${capName}`, (rect) => newSelect(src, list, f, rect, cap, undefined, labelOf));
         // AFTER (streaming): stale every frame — must stay at the BEFORE scan's cost, no index work.
         const staleSrc: CandidateSource = { grid: null, stale: true };
-        run(`AFTER streaming ${sweepName} ${capName}`, (rect) => {
+        const streaming = run(`AFTER streaming ${sweepName} ${capName}`, (rect) => {
           staleSrc.stale = true;
           return newSelect(staleSrc, list, f, rect, cap, undefined, labelOf);
         });
+
+        // --- signatures (always, whenever the bench runs) -----------------------------------
+        // The settled grid path must actually beat the scan it replaced. If the grid ever
+        // degraded to a per-frame scan this ratio collapses to ~1 — the regression #212 exists to
+        // prevent. Measured ratios at 1M: 6.7× / 1.9× / 20.1× / 7.1× across the four regimes, so
+        // 1.3× is comfortably clear of noise while still catching a collapse.
+        expect(
+          before.median / settled.median,
+          `${sweepName} ${capName}: settled grid (${settled.median.toFixed(2)}ms) is not meaningfully faster than the scan (${before.median.toFixed(2)}ms)`,
+        ).toBeGreaterThan(1.3);
+        // Streaming (grid stale every frame) must not be *worse* than the scan — it falls back to
+        // scanning, and must not pay index-rebuild cost on top.
+        expect(
+          streaming.median,
+          `${sweepName} ${capName}: streaming ${streaming.median.toFixed(2)}ms exceeds the scan's ${before.median.toFixed(2)}ms — the stale path is doing index work`,
+        ).toBeLessThan(before.median * 2);
+        if (gc) {
+          expect(settled.bufKB, `${sweepName} ${capName}: settled path grows typed arrays ${settled.bufKB.toFixed(0)}KB/frame`).toBeLessThan(ALLOC_KB_PER_FRAME);
+        }
+        // --- wall-clock (uncontended runs only) ---------------------------------------------
+        if (ASSERT) {
+          expect(settled.median, `${sweepName} ${capName}: settled median ${settled.median.toFixed(2)}ms exceeds ${FRAME_MS}ms at N=${M}`).toBeLessThan(FRAME_MS);
+        }
       }
     }
     const t0 = performance.now();
     buildCandidateGrid(f.positions, f.nodeCount);
     // eslint-disable-next-line no-console
-    console.log(`grid build (once per position change): ${(performance.now() - t0).toFixed(1)} ms at 1M`);
-    expect(true).toBe(true);
+    console.log(`grid build (once per position change): ${(performance.now() - t0).toFixed(1)} ms at ${M.toLocaleString()}`);
   }, 120_000);
 });

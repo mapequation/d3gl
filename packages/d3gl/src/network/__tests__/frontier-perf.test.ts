@@ -29,6 +29,17 @@ import { buildGraph } from "../graph.js";
  */
 const BENCH = !!process.env.BENCH_FRONTIER;
 const BENCH_N = Number(process.env.BENCH_FRONTIER_NODES) || 1_000_000;
+// The at-scale leg gates, it doesn't just report (#258). Signatures below are asserted whenever the
+// bench runs — they are contention-immune counts. Wall-clock ceilings assert only under PERF_ASSERT
+// (the CI perf tier, single-threaded), per the lod-perf.bench.test.ts convention.
+// Calibration at N=500k on an M-series laptop: large median 58-75ms (p95 129ms), small 0.3-0.5ms;
+// abDelta 0.0 KB/frame with --expose-gc. Ceilings are ~10× the measured medians.
+const ASSERT = !!process.env.PERF_ASSERT;
+const LARGE_FRAME_MS = Number(process.env.PERF_FRONTIER_LARGE_MS) || 800;
+const SMALL_FRAME_MS = Number(process.env.PERF_FRONTIER_SMALL_MS) || 50;
+/** Per-frame typed-array growth that still counts as "allocation-free steady state" (KB). A
+ *  regression that re-allocates the frontier every frame moves ~2 MB/frame at N=500k. */
+const ALLOC_KB_PER_FRAME = Number(process.env.PERF_FRONTIER_ALLOC_KB) || 64;
 const W = 1280;
 const H = 800;
 
@@ -287,9 +298,27 @@ describe("#213 cut + declutterFrontier per-frame cost", () => {
             `abDelta=${perFrameKB(m0.arrayBuffers, m1.arrayBuffers)}KB/frame${gc ? "" : " (no --expose-gc; rough)"}\n`;
           console.log(line);
           appendFileSync("/tmp/frontier-perf.txt", `[${process.env.BENCH_FRONTIER_LABEL ?? "run"}] ${line}`);
+
+          // --- signatures (always, whenever the bench runs) --------------------------------------
+          // The "large" regime must genuinely drive a reductions-ON frontier of ALL leaves at this
+          // scale (AGENTS §5: ~1M *visible*, not 1M hidden behind a small frontier). Without this the
+          // at-scale leg could silently degrade to the cheap small-frontier shape and still "pass".
+          if (regime.name === "large") {
+            expect(rawF, `large regime frontier at N=${BENCH_N} must be every leaf`).toBeGreaterThanOrEqual(tree.leafCount);
+          }
+          // Allocation-free steady state — the #213 guarantee, at scale. Only meaningful with
+          // --expose-gc (the CI tier runs with it); without it the delta is noise, so skip.
+          if (gc) {
+            const abKB = (m1.arrayBuffers - m0.arrayBuffers) / FRAMES / 1024;
+            expect(abKB, `${regime.name} fade=${fadeBand}: ${abKB.toFixed(1)}KB/frame of typed-array growth`).toBeLessThan(ALLOC_KB_PER_FRAME);
+          }
+          // --- wall-clock (uncontended runs only) ---------------------------------------------
+          if (ASSERT) {
+            const ceiling = regime.name === "large" ? LARGE_FRAME_MS : SMALL_FRAME_MS;
+            expect(median, `${regime.name} fade=${fadeBand}: median ${median.toFixed(1)}ms exceeds ${ceiling}ms at N=${BENCH_N}`).toBeLessThan(ceiling);
+          }
         }
       }
-      expect(true).toBe(true);
     },
     600_000,
   );
