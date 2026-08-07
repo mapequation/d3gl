@@ -340,6 +340,7 @@ per-file timeout. Every at-scale leg below now asserts. When you add a guard, ad
 | instanced pie | **WebGL** | `webgl/__tests__/instanced-pie-perf.browser.test.ts` | 100k | `PERF_BROWSER_N` |
 | GPU layout tick | **WebGL** | `network/gpu/__tests__/gpu-frame-budget-perf.browser.test.ts` | 30k | `PERF_BROWSER_N` (max 200k) |
 | React recolor vs build | **WebGL** | `react/perf.browser.test.ts` | 4096 | capped at 8192 — see below |
+| `"auto"` placeholder emit | Canvas→**WebGL** | `map/auto-placeholder-perf.browser.test.ts` | 200k edges / 200k points | `PERF_BROWSER_N` (max 611k) |
 
 **Known holes, tracked:** the at-scale legs drive **backends**, not engines, so the layer above the
 backend seam (accessors, lane emit, LOD integration) is only covered at N ≤ 5000 (#263); geo's

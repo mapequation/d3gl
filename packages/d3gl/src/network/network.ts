@@ -1421,6 +1421,20 @@ export class Network extends BaseEngine {
     this.labelSource.stale = true;
     const backend = this.backend();
     if (!backend) return this;
+    // "auto" mode's placeholder canvas (#201). The Scene branch below exists only because a vector
+    // backend has no instanced lane, so at scale it tessellates + paints a full graph that the
+    // WebGL backend landing moments later throws away — a 611k-edge graph blocked the main thread
+    // for ~9.5 s per rebuild before showing anything. Withhold it and let the upgrade paint the
+    // first frame; if WebGL never arrives, BaseEngine re-installs canvas and this rebuilds for real.
+    if (!backend.setInstancedLayer && this.skipPlaceholderEmit(this.graph.nodeCount + this.graph.edgeCount)) {
+      this.unregisterLanes();
+      this.clearNetworkScene();
+      // Nothing is drawn, so nothing is labelled — and `refreshLabels` would scan every node to
+      // place labels over an empty canvas. `routeLabels` no-ops when labels are off (#223 seam).
+      this.routeLabels([]);
+      this.render();
+      return this;
+    }
     const style = this.resolvedStyleCached(this.graph);
 
     if (backend.setInstancedLayer) {
@@ -1511,6 +1525,17 @@ export class Network extends BaseEngine {
       // LOD on but no tree yet (worker streaming) — draw nothing, not pickable.
       this.unregisterLanes();
     }
+  }
+
+  /** Drop every retained Scene layer the vector path registers, in one pass. Unlike
+   *  `registerNetworkScene(graph, style, false)` — which registers the same slots *empty* and
+   *  therefore still pays O(nodeCount + edgeCount) for the id arrays and id→index maps — this is
+   *  O(layers): the right clear when the Scene must not cost anything at all (#201). */
+  private clearNetworkScene(): void {
+    for (const name of [this.CONTAINER_LAYER, "links", "arrows", "node-halos", "node-borders", this.NODE_LAYER, this.PIE_LAYER]) {
+      this.removeLayer(name);
+    }
+    this.sceneActive = false;
   }
 
   /** Unregister both the node lane and its companion ring overlay (backend switch / no graph). */

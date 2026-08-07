@@ -242,6 +242,16 @@ export class Plot extends BaseEngine {
       // Revert to Scene path: drop the lane (and its ring overlay) if one was registered.
       this.unregisterInstancedLane(hlLaneName);
       this.unregisterInstancedLane(laneName);
+      // A lane-eligible layer only lands here because the LIVE backend has no instanced lane. On
+      // "auto" mode's placeholder canvas that backend is about to be replaced, and the `removeLayer`
+      // above (in the useLane branch) will discard this Scene spec the moment it is — so above the
+      // placeholder budget, materializing N circles is pure waste (#201). Withhold it; the upgrade
+      // (or, if WebGL never arrives, BaseEngine's canvas re-install) re-runs this sync for real.
+      const laneEligible = !opts.passThrough && !opts.clipTo && declutter != null && declutter > 0;
+      if (laneEligible && this.skipPlaceholderEmit(list.length)) {
+        if (this.specs.find((s) => s.name === name)) this.removeLayer(name);
+        return;
+      }
       this.registerLayer({
         name, data: list, ids,
         fill: opts.fill, stroke: opts.stroke,
