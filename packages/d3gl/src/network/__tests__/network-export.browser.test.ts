@@ -78,6 +78,39 @@ describe("network toSVG() on the WebGL backend (#200)", () => {
     cv.destroy();
   });
 
+  // A BORDERED circle exports DIFFERENTLY on the two paths, deliberately. WebGL emits one circle
+  // stroked on the ring centreline (r·(1−b/2), stroke-width r·b) — what the fragment shader actually
+  // paints, and what `traceFrontierHalos` already emits for the aggregate halo. The Scene path used
+  // by Canvas/SVG emits two stacked discs (`traceFrontierFills` inner + `traceFrontierBorders`
+  // outer). Both read identically for an OPAQUE fill; they diverge for a translucent one, where the
+  // stacked pair paints an opaque inner disc over the ring. Pinned here so the difference stays a
+  // deliberate choice rather than a latent surprise — and so nobody "fixes" the WebGL side toward
+  // the stacked pair. Moving the Scene path onto the ring encoding is #270.
+  it("bordered nodes: WebGL exports a stroked ring, Canvas exports stacked discs — pinned, not accidental", async () => {
+    const style = { nodeRadius: 8, nodeFill: "#1f77b4", nodeBorder: { width: 3, color: "#ff0000" } } as const;
+
+    const gl = network(host(), { width: 200, height: 200 }); // webgl default
+    await gl.whenReady();
+    gl.data(line()).style(style).layout({ backend: "positions", positions: POS });
+    gl.setTransform({ k: 1, x: 0, y: 0 });
+    const a = gl.toSVG();
+
+    const cv = network(host(), { width: 200, height: 200, backend: "canvas" });
+    await cv.whenReady();
+    cv.data(line()).style(style).layout({ backend: "positions", positions: POS });
+    cv.setTransform({ k: 1, x: 0, y: 0 });
+    const b = cv.toSVG();
+
+    // WebGL: ONE circle per node, carrying the ring as a stroke.
+    expect(count(a, "circle")).toBe(3);
+    expect(a).toMatch(/stroke-width/);
+    // Canvas: TWO discs per node (border disc + fill disc), no stroked ring.
+    expect(count(b, "circle")).toBe(6);
+
+    gl.destroy();
+    cv.destroy();
+  });
+
   it("map style (half-arrow links): exports the fused directed glyph, not just discs", async () => {
     const net = network(host(), { width: 200, height: 200 }); // webgl default
     await net.whenReady();
