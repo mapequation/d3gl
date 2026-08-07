@@ -12,8 +12,8 @@
  *
  * @packageDocumentation
  */
-export { cullLabels, labelGeometry } from "./cull.js";
-export type { LabelBox, CullOptions, TextAnchor, LabelGeometry } from "./cull.js";
+export { cullLabels, labelCullScratch, labelGeometry, labelTransform, labelTextY } from "./cull.js";
+export type { LabelBox, LabelBaseline, LabelCullScratch, CullOptions, TextAnchor, LabelGeometry } from "./cull.js";
 export { LabelLayer, placeLabels, resolveLabelStyle, DEFAULT_LABEL_STYLE, DEFAULT_LABEL_TEXT } from "./label-layer.js";
 export type { LabelAnchor, LabelStyle } from "./label-layer.js";
-export { measureText, canvasFont } from "./measure.js";
+export { measureText, canvasFont, fontRowHeight, TextMeasurer } from "./measure.js";

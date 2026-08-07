@@ -5,6 +5,7 @@ import { ForceLayout, seedPositions, type ForceParams } from "./force.js";
 import { multilevelLayout, type CoarsenOptions } from "./coarsen.js";
 import { buildLODTree, buildSpatialLODTree, computeLODGeometry, computeLODPositions, computeLODStyle, updateLODPositionsForLeaves, cut, makeCutScratch, declutterFrontier, makeDeclutterFrontierScratch, pickFrontier, regionFrontier, visibleWorldRect, leavesUnder, ancestorAwareSelected, type LODTree, type SpatialLODOptions } from "./lod.js";
 import { DEFAULT_LABEL_TEXT, type LabelAnchor, type LabelStyle } from "../labels/label-layer.js";
+import { TextMeasurer, canvasFont } from "../labels/measure.js";
 import { buildModuleLODTree, type ModuleNode } from "./modules.js";
 import { moduleColors, type ModulePathNode, type ModuleColorOptions } from "./module-colors.js";
 import { physicalPieWedges, type PhysicalPieWedges, type PieWedgeOptions } from "./pie.js";
@@ -539,6 +540,10 @@ export class Network extends BaseEngine {
    *  ({@link BaseEngine.labelLayer}), its placement/routing, and the export-anchor retention for the
    *  WebGL export-only text stash (#219) all live in the base (shared with plot/geo labels, #223). */
   private labelOpts: NetworkLabelOptions | null = null;
+  /** Memoizing text measurer for the current label set (#204): label text is derived per frame from
+   *  the frontier, so each distinct string is measured once here and reused on every later frame —
+   *  the collision box is real without putting `measureText` on the per-frame path. */
+  private labelMeasure: TextMeasurer | null = null;
   /** While a node-drag is active (#140), re-pins the held positions over each worker frame before it
    *  paints — in copy mode the worker's streamed snapshot would otherwise clobber the held nodes the
    *  main thread is holding under the cursor. Null when no drag is in flight. */
@@ -854,6 +859,7 @@ export class Network extends BaseEngine {
   labels(opts: NetworkLabelOptions | false): this {
     if (!opts) {
       this.labelOpts = null;
+      this.labelMeasure = null;
       this.clearLabelOverlay(); // destroy overlay + clear backend-native labels (incl. the WebGL export stash)
       this.render(); // repaint so a backend that bakes labels in (Canvas) drops them now
       return this;
@@ -862,6 +868,9 @@ export class Network extends BaseEngine {
     // defaults to the overlay default's equivalent; explicit font/color/halo win. Normalized once
     // here, so refreshLabels() reads plain opts with no per-frame defaulting.
     this.labelOpts = { ...DEFAULT_LABEL_TEXT, ...opts };
+    // Measure label boxes in the font the labels actually render in (explicit `font`, else the
+    // overlay's `style.font`, else the shared default) — one memoizing measurer per label set (#204).
+    this.labelMeasure = new TextMeasurer(canvasFont(opts.font ?? opts.style?.font ?? DEFAULT_LABEL_TEXT.font));
     // (Re)create the shared overlay on every call: className/style land once per element at creation
     // (never on the per-transform path), so a styling change must rebuild the elements. Cheap and
     // flash-free — labels() is a call-path, and the synchronous refreshLabels() below repopulates
@@ -885,6 +894,31 @@ export class Network extends BaseEngine {
     const rect = visibleWorldRect(this.transform, this.width, this.height);
     const inView = (x: number, y: number) => x >= rect.minX && x <= rect.maxX && y >= rect.minY && y <= rect.maxY;
     const anchors: LabelAnchor[] = [];
+    // Label text is derived per frame here (the frontier/viewport decides it), so the box comes from
+    // the memoizing measurer: each distinct string is measured ONCE, every later frame is a lookup —
+    // no `measureText` on the per-frame path (#204). Without a real box every label had a zero-area
+    // collision box, which is why dense regions rendered as overprinted stacks.
+    const measure = this.labelMeasure ?? (this.labelMeasure = new TextMeasurer(canvasFont(opts.font ?? DEFAULT_LABEL_TEXT.font)));
+    /** One glyph label: measured box + the centred placement the overlay CSS, the collision box and
+     *  native text are all derived from (never a hand-written transform — #58's lesson). */
+    const anchorFor = (
+      id: string | number,
+      refX: number,
+      refY: number,
+      text: string,
+      priority: number,
+      offset: [number, number] | undefined,
+      opacity?: number,
+    ): LabelAnchor => ({
+      id, refX, refY, text,
+      width: measure.width(text),
+      height: measure.height,
+      priority,
+      offset,
+      textAnchor: "middle",
+      baseline: "middle",
+      opacity,
+    });
 
     if (this.lodReady() && this.lodTree) {
       const tree = this.lodTree;
@@ -902,7 +936,10 @@ export class Network extends BaseEngine {
         const info = this.lodDatum(tree, g);
         const text = labelText(opts, g, info);
         if (!text) continue; // labelOf returned null/"" — this glyph has no label
-        anchors.push({ id: g, refX: tree.cx[g]!, refY: tree.cy[g]!, text, offset: opts.offset, transform: "translate(-50%, -50%)", opacity: fade ? fade[g] : undefined });
+        // Importance also decides who WINS a collision, not just who makes a `max` cap — so it is
+        // resolved for every candidate (the frontier's own weight when no accessor is given).
+        const priority = impOf ? impOf(g, info) : tree.weight[g] ?? 0;
+        anchors.push(anchorFor(g, tree.cx[g] ?? 0, tree.cy[g] ?? 0, text, priority, opts.offset, fade ? fade[g] : undefined));
         if (anchors.length >= max) break;
       }
     } else {
@@ -928,7 +965,8 @@ export class Network extends BaseEngine {
         for (let id = next(); id >= 0; id = next()) {
           const text = labelText(opts, id, NO_LOD_INFO);
           if (!text) continue;
-          anchors.push({ id, refX: pos[2 * id]!, refY: pos[2 * id + 1]!, text, offset: opts.offset, transform: "translate(-50%, -50%)" });
+          const priority = impOf ? impOf(id, NO_LOD_INFO) : strength[id] ?? 0;
+          anchors.push(anchorFor(id, pos[2 * id] ?? 0, pos[2 * id + 1] ?? 0, text, priority, opts.offset));
           if (anchors.length >= max) break;
         }
       } else {
@@ -936,10 +974,13 @@ export class Network extends BaseEngine {
         if (!ascending) cand.sortAscending();
         const ids = cand.ids;
         for (let i = 0; i < cand.length; i++) {
-          const id = ids[i]!;
+          const id = ids[i] ?? 0;
           const text = labelText(opts, id, NO_LOD_INFO);
           if (!text) continue;
-          anchors.push({ id, refX: pos[2 * id]!, refY: pos[2 * id + 1]!, text, offset: opts.offset, transform: "translate(-50%, -50%)" });
+          // Uncapped: no ranking sort runs, but each label still needs its collision priority —
+          // one accessor read per in-view candidate (a typed `strength` read when none is given).
+          const priority = impOf ? impOf(id, NO_LOD_INFO) : strength[id] ?? 0;
+          anchors.push(anchorFor(id, pos[2 * id] ?? 0, pos[2 * id + 1] ?? 0, text, priority, opts.offset));
         }
       }
     }
@@ -958,15 +999,16 @@ export class Network extends BaseEngine {
         const text = nameOf(p);
         if (!text) continue;
         const dist = this.containerRadii[p]! * k + gap;
-        anchors.push({ id: `phys:${p}`, refX: x, refY: y, text, offset: [DX * dist, DY * dist], transform: "translate(-50%, -50%)" });
+        anchors.push(anchorFor(`phys:${p}`, x, y, text, 0, [DX * dist, DY * dist]));
       }
     }
 
     // Route to the active backend (#105 N7b-2, #219): shared placement, live-vs-export-only text
     // routing, and the export-anchor retention for WebGL toPNG()/toSVG() all live in the base
-    // (also used by plot/geo data labels, #223). Network labels are centred on the glyph
-    // (align "middle" + each anchor's translate(-50%, -50%) transform).
-    this.routeLabels(anchors, "middle");
+    // (also used by plot/geo data labels, #223). Each anchor declares its own centred placement
+    // (`textAnchor`/`baseline` "middle"), which the overlay CSS, the collision box and native text
+    // all derive from.
+    this.routeLabels(anchors);
   }
 
   protected override afterTransform(): void {

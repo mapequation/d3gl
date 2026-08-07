@@ -33,9 +33,11 @@ on-screen pixel distances, so what survives depends on the current zoom, not the
 - **Label culling** is engine-owned via [`chart.labels`](/d3gl/reference/map/interfaces/datalabeloptions/).
   You give it the data plus `labelOf`/`anchorOf`/`importanceOf` accessors; the engine measures each
   label's text once, maps anchors through the transform, drops labels outside the viewport, then
-  greedily places the rest, skipping any whose box overlaps one already placed. Only the surviving
-  labels reach the DOM (an HTML overlay on WebGL; native `<text>`/`fillText` on SVG/Canvas, so they
-  survive `toSVG()`/`toPNG()` export).
+  places the rest in importance order, skipping any whose box overlaps one already placed. Placed
+  boxes go into a uniform screen grid, so each candidate is only tested against its neighbours and
+  the pass stays linear in the number of labels in view. Only the surviving labels reach the DOM (an
+  HTML overlay on WebGL; native `<text>`/`fillText` on SVG/Canvas, so they survive
+  `toSVG()`/`toPNG()` export).
 
 ```ts
 chart.layer("nodes", nodes, {

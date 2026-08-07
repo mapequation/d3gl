@@ -1,6 +1,6 @@
 import type { ViewTransform } from "../webgl/index.js";
-import { cullLabels, labelGeometry } from "./cull.js";
-import type { LabelBox, TextAnchor } from "./cull.js";
+import { cullLabels, labelCullScratch, labelTransform } from "./cull.js";
+import type { LabelBaseline, LabelBox, LabelCullScratch, TextAnchor } from "./cull.js";
 
 /** A label anchored in REFERENCE (projected, pre-transform) pixel space. */
 export interface LabelAnchor {
@@ -24,12 +24,16 @@ export interface LabelAnchor {
    * undefined for a plain axis-aligned label and supply your own {@link transform}.
    */
   rotation?: number;
-  /** Oriented labels only: which way the text runs from the anchor (default "start"). */
+  /** Which way the text runs from the anchor (default "start"). Honoured by plain labels too, so a
+   *  centred label collides on the box it renders in — the library derives its CSS transform (#204). */
   textAnchor?: TextAnchor;
+  /** Plain labels: vertical placement of the box relative to the anchor (default "top"). */
+  baseline?: LabelBaseline;
   /** Oriented labels only: flip 180° to keep the text upright (radial-tree readability flip). */
   keepUpright?: boolean;
-  /** Optional CSS transform for a PLAIN label (ignored when `rotation` is set, since the
-   *  library then generates the transform). Use `offset` for the constant-px gap. */
+  /** Optional CSS transform for a PLAIN label with no declared `textAnchor`/`baseline` (the library
+   *  generates the transform whenever the box's placement is declared). Use `offset` for a
+   *  constant-px gap. */
   transform?: string;
   /** transform-origin for the node; defaults to "0 0" (the anchor point). */
   transformOrigin?: string;
@@ -48,6 +52,8 @@ export function placeLabels(
   anchors: readonly LabelAnchor[],
   transform: ViewTransform,
   viewport: { width: number; height: number },
+  /** Reusable cull buffers — pass the caller's retained one on the per-frame path (#204). */
+  scratch?: LabelCullScratch,
 ): LabelBox[] {
   const boxes: LabelBox[] = anchors.map((a) => ({
     id: a.id,
@@ -60,11 +66,12 @@ export function placeLabels(
     opacity: a.opacity,
     rotation: a.rotation,
     textAnchor: a.textAnchor,
+    baseline: a.baseline,
     keepUpright: a.keepUpright,
     transform: a.transform,
     transformOrigin: a.transformOrigin,
   }));
-  return cullLabels(boxes, { viewport });
+  return cullLabels(boxes, { viewport, scratch });
 }
 
 /**
@@ -121,6 +128,9 @@ export const DEFAULT_LABEL_TEXT: { font: string; color: string; halo: { color: s
  */
 export class LabelLayer {
   private nodes = new Map<string, HTMLDivElement>();
+  /** Retained cull buffers — `update` runs on every transform, so the placement pass reuses them
+   *  instead of allocating a grid + per-candidate geometry per frame (#204). */
+  private readonly cullScratch = labelCullScratch();
 
   constructor(
     private readonly container: HTMLElement,
@@ -139,7 +149,7 @@ export class LabelLayer {
     viewport: { width: number; height: number },
   ): void {
     // Project + cull (shared with the backend-native text path), then render the survivors to DOM.
-    const visible = placeLabels(anchors, transform, viewport);
+    const visible = placeLabels(anchors, transform, viewport, this.cullScratch);
     const seen = new Set<string>();
 
     for (const box of visible) {
@@ -167,10 +177,12 @@ export class LabelLayer {
       });
       node.style.left = `${Math.round(box.x)}px`;
       node.style.top = `${Math.round(box.y)}px`;
-      // Oriented labels: the library generates the transform from the same geometry used for
-      // collision (so render and culling agree). Plain labels keep the caller's transform.
-      node.style.transform =
-        box.rotation !== undefined ? labelGeometry(box).transform : ((box.transform as string) ?? "");
+      // The library generates the transform from the same box used for collision (so render and
+      // culling agree) whenever the placement is declared — rotation, or textAnchor/baseline. A
+      // plain top-left label declares none, so `labelTransform` returns "" and the caller's own
+      // transform applies.
+      const derived = labelTransform(box);
+      node.style.transform = derived || ((box.transform as string) ?? "");
       node.style.transformOrigin = (box.transformOrigin as string) ?? "0 0";
       const op = box.opacity as number | undefined;
       node.style.opacity = op == null ? "" : String(op);

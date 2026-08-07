@@ -410,6 +410,8 @@ guard owns the serialize budget: one DOM node per drawable buys parse time, not 
 | **`plot()` engine sweep**, retained Scene | **WebGL** | `map/plot-engine-sweep-perf.browser.test.ts` | 50k ×2 layers | `PERF_BROWSER_N` (max 300k) |
 | **`network()` engine sweep**, LOD on **and** off | **WebGL** | `network/__tests__/network-sweep-perf.browser.test.ts` | 50k nodes / 50k edges | `PERF_BROWSER_N` (max 200k) |
 | multi pass-through: FBO count + gesture skip | **WebGL** | `map/passthrough-multi-perf.browser.test.ts` | 25k ×2 layers | `PERF_BROWSER_N` (max 50k) |
+| label placement (`cullLabels`) | — | `labels/__tests__/label-cull-perf.test.ts` | 200k candidates, dense **and** spread | `BENCH_LABEL_CULL` |
+| **`network.labels()` per-frame**, LOD on **and** off | **WebGL** | `network/__tests__/network-labels-perf.browser.test.ts` | 20k nodes, uncapped | `PERF_BROWSER_N` (max 50k) |
 
 **Known holes, tracked:** geo's at-scale leg is Canvas-only (#264). *(Closed: #263 — the at-scale
 legs used to drive **backends** only, leaving accessors / lane emit / LOD integration covered at
