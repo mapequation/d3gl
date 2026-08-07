@@ -1,6 +1,6 @@
 import { select, type Selection } from "d3-selection";
 import { zoom as d3zoom, zoomIdentity, type D3ZoomEvent, type ZoomBehavior } from "d3-zoom";
-import { Scene, HitIndex, declutterScreen, declutterScratch, instancedVectorLayers, type Backend, type GroupBuilder, type RenderLayer, type VectorLayer, type ViewTransform, type DeclutterScratch, type TextData } from "../core/index.js";
+import { Scene, HitIndex, declutterScreen, declutterScratch, instancedVectorLayers, DEFAULT_CURVE_TOLERANCE, type Backend, type GroupBuilder, type RenderLayer, type VectorLayer, type ViewTransform, type DeclutterScratch, type TextData } from "../core/index.js";
 import { LabelLayer, placeLabels, resolveLabelStyle, measureText, canvasFont, DEFAULT_LABEL_TEXT, type LabelAnchor, type LabelStyle } from "../labels/index.js";
 import type { TextAnchor, LabelBox } from "../labels/cull.js";
 import { InstancedLane, type ScreenRect } from "../core/instanced-lane.js";
@@ -254,7 +254,30 @@ export interface BaseEngineOptions extends EngineSizing {
   backend?: BackendType;
   /** Class(es) for the hover tooltip box, replacing its default inline look. */
   tooltipClass?: string;
+  /**
+   * Max deviation, **in world units**, between a curve (`arc` / `bezierCurveTo` /
+   * `quadraticCurveTo` in a layer's `draw`) and the polyline it is baked to. Default
+   * {@link DEFAULT_CURVE_TOLERANCE} (0.25).
+   *
+   * The bake happens **once**, when a layer is registered, and the view transform only
+   * scales it — so a facet measuring `t` world units measures `t·k` screen px at zoom `k`
+   * (#45). A chart that zooms to `kMax` and wants sub-pixel curves therefore wants
+   * `curveTolerance: 0.25 / kMax`.
+   *
+   * It is a quality/size dial, not a free win, and it is deliberately opt-in: an arc's
+   * segment count grows as `1/sqrt(tolerance)`, so `0.25 / 40` bakes ~6.3× the vertices
+   * **of the curved drawables only** (straight paths, `rect`s, and `points()` circles —
+   * which every backend draws analytically — are untouched). Costs nothing per frame.
+   *
+   * One setting governs the whole engine, so it also refines **anchored `sizeMode: "screen"`
+   * glyphs**, whose offsets are used directly as pixels and therefore never facet — those
+   * extra vertices buy nothing. (An unanchored screen-`sizeMode` layer *is* world-scaled and
+   * does want the finer bake.) Splitting the tolerance per drawable is tracked separately.
+   */
+  curveTolerance?: number;
 }
+
+
 
 /** Fallback CSS size used only when a responsive host can't be measured yet (detached / zero
  *  box); the ResizeObserver corrects it on the first real layout. Matches the <canvas> defaults. */
@@ -262,7 +285,11 @@ const DEFAULT_WIDTH = 300;
 const DEFAULT_HEIGHT = 150;
 
 export abstract class BaseEngine {
-  protected scene = new Scene();
+  /** Build-time curve-flattening tolerance in world units — see
+   *  {@link BaseEngineOptions.curveTolerance}. Read by every path that records a curve
+   *  outside the Scene (e.g. the geo pass-through recorder), so one option governs them all. */
+  protected readonly curveTolerance: number;
+  protected scene: Scene;
   protected specs: LayerSpec[] = [];
   protected hitIndexes = new Map<string, HitIndex>();
   /** Pass-through layers: no Scene entry, no retained geometry. */
@@ -406,6 +433,8 @@ export abstract class BaseEngine {
   private resizeRaf = 0;
 
   constructor(protected host: HTMLElement, opts: BaseEngineOptions) {
+    this.curveTolerance = opts.curveTolerance ?? DEFAULT_CURVE_TOLERANCE;
+    this.scene = new Scene(this.curveTolerance);
     const backend = opts.backend ?? "webgl";
     this.currentBackend = backend;
     // Backend canvases are positioned absolutely (see makeCanvas) so transiently-coexisting
@@ -1417,7 +1446,7 @@ export abstract class BaseEngine {
     const layers: VectorLayer[] = [];
     for (const entry of this.instancedLanes.values()) {
       const emitted = entry.lane.update(this.transform, this.width, this.height);
-      layers.push(...instancedVectorLayers(emitted, this.transform.k));
+      layers.push(...instancedVectorLayers(emitted, this.transform.k, this.curveTolerance));
     }
     backend.setExportLayers(layers);
   }

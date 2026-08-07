@@ -93,6 +93,39 @@ A resized **`geoMap`** also **refits its projection** to the new box, so the map
 A uniform resize (always the case in `aspectRatio` mode) preserves your original framing exactly;
 an aspect-ratio change (possible in fill-parent mode) re-letterboxes the map to the new shape.
 
+## Curve quality under zoom
+
+Curves you draw through a layer's `draw` callback — `arc`, `bezierCurveTo`, `quadraticCurveTo`,
+and anything a `d3-shape` generator emits — are **flattened to a polyline once**, when the layer
+is registered, in **world units**. Zooming only scales that baked polyline, so a facet measuring
+`t` world units measures `t x k` screen px at zoom `k`: at the default tolerance of `0.25`, a
+`k = 40` view shows ~10px flats on an arc rim.
+
+Set `curveTolerance` to the deviation you can accept at your deepest zoom:
+
+```ts
+const MAX_ZOOM = 40;
+const chart = plot(host, { width, height, curveTolerance: 0.25 / MAX_ZOOM });
+chart.enableZoom([0.5, MAX_ZOOM]);
+```
+
+It is **opt-in**, and it is a quality/size dial rather than a free win:
+
+- **Zero per-frame cost.** The refinement is paid entirely in the one-time bake; nothing about
+  `setTransform`, hover, or drag changes.
+- **Segment count grows as `1 / sqrt(tolerance)`** — so `0.25 / 40` is ~6.3x the vertices, and
+  `0.25 / 100` ~10x, **of the curved drawables only**. Straight paths, `rect`s, and
+  `points()` circles cost nothing extra (every backend draws a circle analytically).
+- **Anchored `sizeMode: "screen"` glyphs never needed it.** They are drawn as constant-pixel
+  offsets from their anchor, so their bake is already in screen units and cannot facet — the
+  extra vertices there are spent for nothing. The tolerance is a single per-engine setting, so
+  a chart that mixes anchored screen glyphs with world-space curves pays for both. (A screen
+  `sizeMode` layer **without** anchors is world-scaled geometry and does facet, so it wants the
+  finer bake.)
+
+A curve-heavy chart of ~4,000 drawables measured 5.4 MB of GPU geometry at the default and
+28.6 MB at `0.25 / 40` — pick the smallest `MAX_ZOOM` your chart actually allows.
+
 ## Engine-specific API
 
 What's unique to each engine is the geometry definition plus a few domain methods:

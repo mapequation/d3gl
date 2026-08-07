@@ -10,6 +10,15 @@
 
 const MAX_DEPTH = 32;
 
+/**
+ * Default flattening tolerance, in **world units** — the max deviation between a curve and
+ * the polyline it is baked to. Every curve is baked ONCE, at build time, and the view
+ * transform only scales the result, so a facet of `t` world units is `t·k` screen px at zoom
+ * `k` (#45). Engines expose this as `curveTolerance`; set it to `0.25 / kMax` for a chart that
+ * needs sub-pixel curves at zoom `kMax`.
+ */
+export const DEFAULT_CURVE_TOLERANCE = 0.25;
+
 /** Cubic bezier from (x0,y0) to (x3,y3) with control points (x1,y1),(x2,y2). */
 export function flattenCubic(
   x0: number,
