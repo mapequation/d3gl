@@ -5,7 +5,10 @@ import type { RenderLayer, ViewTransform } from "../../core/index.js";
 import { geoLayer } from "../geo-layer.js";
 
 /**
- * Per-frame regression guard for the GEO full-detail zoom sweep (#220, AGENTS.md lifecycle §5).
+ * Per-frame regression guard for the GEO full-detail zoom sweep on **Canvas** (#220, AGENTS.md
+ * lifecycle §5). The WebGL and SVG legs need a real GPU / DOM and live in
+ * `map/geo-sweep-perf.browser.test.ts` (#264) — WebGL is the *default* backend, and nothing here
+ * can see its retained `GroupRenderer` geometry or its stencil clip.
  *
  * The geo pipeline's cost split is: projection + tessellation (geoPath → Scene drawables) happens
  * ONCE at layer registration; a zoom is then only the backend trigger (`setTransform` + `render`)
@@ -20,11 +23,38 @@ import { geoLayer } from "../geo-layer.js";
  *      layer is constructed once for the whole sweep, never per frame.
  *   3. **Frame budget:** each frame's backend CPU work holds a generous wall-clock ceiling.
  *
- * Cells are exterior-CW in [lon, lat] (see AGENTS.md "GeoJSON winding"). ~15k cells run in the
- * normal suite; the at-scale leg is env-gated (BENCH_GEO_SWEEP=1, picked up by
+ * Cells are exterior-CW in [lon, lat] (see AGENTS.md "GeoJSON winding"). {@link ALWAYS_ON_N} cells
+ * run in the normal suite; the at-scale leg is env-gated (BENCH_GEO_SWEEP=1, picked up by
  * scripts/run-perf-tier.mjs) — its N is the dominant one-time geoPath build, bounded by the
  * tier's per-file budget, while the same per-frame signatures hold.
  */
+
+/**
+ * Always-on cell count — raised 3.3× from the ~15k that made geo the smallest always-on default of
+ * any engine's guard (#264).
+ *
+ * Why not the 100k the *plot* Canvas/SVG legs use: a geo polygon is not a point. Each cell costs a
+ * `geoPath` stream, a tessellated fill and an expanded stroke ring, and this fixture crosses a
+ * heap-growth cliff above ~75k. Cold is the only number that matters (the always-on leg is the
+ * first thing the process does); measured whole-test wall clock on this machine: 0.37 s at 15k,
+ * 0.60 s at 30k, **0.72 s at 50k**, 1.49 s at 75k, 3.90 s at 100k. Past 50k the serial perf group
+ * (#257, ~14 s total) pays seconds for nothing — the two signatures below are exact at *every* N,
+ * and the CI tier's at-scale leg already drives 500k. So 50k buys the scale, 100k buys only runtime.
+ */
+const ALWAYS_ON_N = 50_000;
+
+/**
+ * Worst-frame ceiling, `c0 + c1 · n/100k`, fitted through the two numbers that were already
+ * calibrated and shipped: 300 ms at the old 15k always-on leg and 3000 ms at the tier's 500k
+ * at-scale leg (it reproduces both to within 1%). So neither historical budget is loosened — the
+ * flat 300 ms simply becomes the honest linear shape it always should have had, instead of being
+ * reused verbatim at a 3.3× larger N. `c0` is the N-independent part of a frame (clear, transform,
+ * clip test, the fixed sphere path); `c1` is the per-drawable trace loop, the only part that grows.
+ * Measured cold worst frames here: 5.0 ms at 15k, 15-21 ms at 30-50k, 48 ms at 75k — so the 50k
+ * always-on leg sits ~30× under its 497 ms ceiling, the margin a regression has to eat through.
+ */
+const frameCeilingMs = (n: number): number => 220 + 555 * (n / 100_000);
+
 class FakePath2D {
   static constructed = 0;
   constructor() { FakePath2D.constructed++; }
@@ -152,28 +182,29 @@ function zoomSweep(n: number): SweepResult {
 }
 
 describe("geo full-detail zoom sweep (project once, per-frame cost pinned)", () => {
-  it("traces each polygon exactly once per frame, reuses the clip, and holds the frame budget at ~15k cells", () => {
-    const r = zoomSweep(15_000);
+  it(`traces each polygon exactly once per frame, reuses the clip, and holds the frame budget at ${ALWAYS_ON_N / 1000}k cells`, () => {
+    const r = zoomSweep(ALWAYS_ON_N);
+    const ceiling = frameCeilingMs(ALWAYS_ON_N);
     // Signature 1: one path per drawable per frame (sphere + cells), constant vertex work.
     for (const bp of r.beginPathsPerFrame) expect(bp).toBe(r.drawableCount);
     for (const lt of r.lineTosPerFrame) expect(lt).toBe(r.lineTosPerFrame[0]);
     expect(r.lineTosPerFrame[0]).toBeGreaterThan(0);
     // Signature 2: the clip silhouette is NOT rebuilt per frame.
     expect(r.path2dBuilt).toBe(0);
-    // Frame budget: generous ceiling for the ~15k-path trace loop on a shared runner.
-    expect(r.worstFrameMs).toBeLessThan(300);
+    // Frame budget: generous ceiling for the N-path trace loop on a shared runner.
+    expect(r.worstFrameMs, `worst frame ${r.worstFrameMs.toFixed(1)}ms (ceiling ${ceiling.toFixed(0)}ms)`).toBeLessThan(ceiling);
   });
 
   it.runIf(process.env.BENCH_GEO_SWEEP)(
     "at-scale leg: same signatures at large N (env-gated; run by the CI perf tier)",
     () => {
       const N = Number(process.env.BENCH_GEO_SWEEP_N) || 500_000;
-      const ceiling = Number(process.env.PERF_GEO_FRAME_MS) || 3000;
+      const ceiling = Number(process.env.PERF_GEO_FRAME_MS) || frameCeilingMs(N);
       const r = zoomSweep(N);
       for (const bp of r.beginPathsPerFrame) expect(bp).toBe(r.drawableCount);
       for (const lt of r.lineTosPerFrame) expect(lt).toBe(r.lineTosPerFrame[0]);
       expect(r.path2dBuilt).toBe(0);
-      console.log(`geo sweep N=${N.toLocaleString()}: build ${r.buildMs.toFixed(0)}ms (once), worst frame ${r.worstFrameMs.toFixed(1)}ms (ceiling ${ceiling}ms)`);
+      console.log(`geo sweep N=${N.toLocaleString()}: build ${r.buildMs.toFixed(0)}ms (once), worst frame ${r.worstFrameMs.toFixed(1)}ms (ceiling ${ceiling.toFixed(0)}ms)`);
       expect(r.worstFrameMs).toBeLessThan(ceiling);
     },
     240_000,

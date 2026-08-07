@@ -359,7 +359,7 @@ per-file timeout. Every at-scale leg below now asserts. When you add a guard, ad
 |---|---|---|---|---|
 | plot points, full detail | Canvas | `canvas/__tests__/canvas-zoom-sweep-perf.test.ts` | 100k | `BENCH_CANVAS_SWEEP` |
 | plot points, retained DOM | SVG | `svg/__tests__/svg-zoom-sweep-perf.test.ts` | 100k | `BENCH_SVG_SWEEP` |
-| geo polygons + clip | Canvas | `geo/__tests__/geo-zoom-sweep-perf.test.ts` | ~15k cells | `BENCH_GEO_SWEEP` |
+| geo polygons + clip | Canvas | `geo/__tests__/geo-zoom-sweep-perf.test.ts` | 50k cells | `BENCH_GEO_SWEEP` |
 | geoMap append | — | `map/__tests__/append-scaling-perf.test.ts` | O(new) delta | — |
 | layer push, Scene seam | — | `core/__tests__/vector-view-perf.test.ts` | 1M, ×20 pushes | — |
 | plot declutter `select()` | — | `map/__tests__/points-lane-scratch-perf.test.ts` | 1M | — |
@@ -383,10 +383,29 @@ per-file timeout. Every at-scale leg below now asserts. When you add a guard, ad
 | `"auto"` placeholder emit | Canvas→**WebGL** | `map/auto-placeholder-perf.browser.test.ts` | 200k edges / 200k points | `PERF_BROWSER_N` (max 611k) |
 | `"auto"` placeholder **paint** | Canvas→**WebGL** | same file, `#273` describe block | 30k geo polygons | `PERF_BROWSER_N` (max 120k) |
 | `pushLayers()` vector view | Canvas + **WebGL** | `map/push-layers-perf.browser.test.ts` | 20k geo polygons | `PERF_BROWSER_N` (max 120k) |
+| geo polygons + clip, per-frame | **WebGL** | `map/geo-sweep-perf.browser.test.ts` | 30k polygons | `PERF_BROWSER_N` (max 200k) |
+| geo polygons + clip, retained DOM | SVG | same file, SVG describe block | 20k polygons | `PERF_BROWSER_N` (max 60k) |
 
 **Known holes, tracked:** the at-scale legs drive **backends**, not engines, so the layer above the
-backend seam (accessors, lane emit, LOD integration) is only covered at N ≤ 5000 (#263); geo's
-at-scale leg is Canvas-only (#264).
+backend seam (accessors, lane emit, LOD integration) is only covered at N ≤ 5000 (#263).
+
+**Geo is now guarded on all three backends** (#264), and the three legs are deliberately *not*
+copies of each other — each pins the contract its own backend actually has:
+- **Canvas** (node, immediate mode) — `beginPath` once per drawable per frame and a constant
+  `lineTo` total; the `Path2D` clip silhouette built once for the whole sweep.
+- **WebGL** (browser, the default backend) — no re-projection (a counting `projection.stream`), no
+  fill/stroke accessor re-run, zero geometry/style writes reaching `WebGLBackend`, and a zero delta
+  on `groupRendererConstructions`. Its wall-clock ceiling is deliberately **constant-dominant**: the
+  CPU frame measured 0.4-0.8 ms flat from 30k to 200k polygons, so a linear term would only make
+  room for the regression it guards against.
+- **SVG** (browser, retained DOM) — a real `MutationObserver` over the whole `<svg>`: a zoom must
+  produce exactly one `transform` attribute record per frame and **zero** structural records.
+
+Two consequences worth keeping: geo's always-on Canvas leg is 50k, not the 100k the *plot* legs use,
+because a geo polygon costs a `geoPath` stream + tessellation + a stroke ring and this fixture
+crosses a heap-growth cliff above ~75k (3.9 s at 100k vs 0.72 s at 50k, cold) for signatures that
+are exact at every N. And the SVG leg is not scaled to the tier's N for the same reason the plot SVG
+guard owns the serialize budget: one DOM node per drawable buys parse time, not strictness.
 
 **Two guards are deliberately NOT scaled, and both would go *vacuously green* if you scaled them:**
 - `hover-overlay-perf` — its layout is a **contract**, not just a size: the 12px cell pitch must stay
