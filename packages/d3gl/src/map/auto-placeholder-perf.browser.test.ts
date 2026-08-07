@@ -16,8 +16,10 @@
  * reason `"auto"` exists.
  */
 import { describe, it, expect, vi } from "vitest";
+import { geoEquirectangular } from "d3-geo";
 import { network, Network } from "../network/network.js";
 import { buildGraph, type NetworkGraph } from "../network/graph.js";
+import { geoMap } from "./geo-map.js";
 import { plot } from "./plot.js";
 import { CanvasBackend } from "../canvas/canvas-backend.js";
 import type { RenderLayer, RenderDelta } from "../core/index.js";
@@ -33,6 +35,15 @@ const BIG_NODES = Math.max(1000, Math.round(BIG_EDGES / 47)); // the reported gr
 /** Small fixture — deliberately NOT scaled: it must stay under the placeholder budget. */
 const SMALL_NODES = 200;
 const SMALL_EDGES = 800;
+
+/**
+ * geoMap polygon counts for the #273 legs (the PAINT guard). Above / below
+ * `AUTO_PLACEHOLDER_MAX_ELEMENTS` (10,000) — one drawable per polygon. The large one is capped
+ * well under the network fixtures: the Scene here is still BUILT (WebGL renders it too, the #201
+ * rule), so this leg is about the paint being skipped, not about the build being cheap.
+ */
+const GEO_BIG = perfN(30_000, { max: 120_000 });
+const GEO_SMALL = 500;
 
 /**
  * Worst tolerated wall-clock for any single `data()`/`style()`/`layout()` call while the
@@ -65,6 +76,29 @@ function makeGraph(nodes: number, edges: number): { graph: NetworkGraph; positio
     positions[2 * i + 1] = rnd() * H;
   }
   return { graph: buildGraph({ nodeCount: nodes, source, target, directed: true }), positions };
+}
+
+/** `n` small square cells tiled over the globe. Rings are wound CLOCKWISE in [lon, lat] —
+ *  a counter-clockwise ring is its own complement and fills the whole map (see AGENTS.md). */
+function makeCells(n: number): GeoJSON.Feature[] {
+  const cols = Math.ceil(Math.sqrt(n * 2));
+  const rows = Math.ceil(n / cols);
+  const dx = 360 / cols;
+  const dy = 180 / rows;
+  const out: GeoJSON.Feature[] = [];
+  for (let i = 0; i < n; i++) {
+    const x = -180 + (i % cols) * dx;
+    const y = -90 + Math.floor(i / cols) * dy;
+    out.push({
+      type: "Feature",
+      properties: {},
+      geometry: {
+        type: "Polygon",
+        coordinates: [[[x, y], [x, y + dy], [x + dx, y + dy], [x + dx, y], [x, y]]],
+      },
+    });
+  }
+  return out;
 }
 
 /**
@@ -232,6 +266,55 @@ describe(`backend "auto" placeholder (#201) — ${BIG_NODES} nodes / ${BIG_EDGES
       h.remove();
     }
   }, 240_000);
+});
+
+/**
+ * #273 — the PAINT half. Unlike the network/decluttered-points legs above, a `geoMap` layer's
+ * Scene geometry is shared: WebGL renders it too, so it is still built. What must not happen is
+ * the placeholder canvas being handed that geometry and running `drawShapes` over all of it for a
+ * frame the WebGL install discards ~100-200 ms later.
+ */
+describe(`backend "auto" placeholder paint (#273) — geoMap, ${GEO_BIG} polygons`, () => {
+  const proj = (): ReturnType<typeof geoEquirectangular> => geoEquirectangular().scale(80).translate([W / 2, H / 2]);
+
+  it("never paints a large shared-geometry layer on the placeholder", async () => {
+    const cells = makeCells(GEO_BIG);
+    const watch = watchCanvas();
+    const h = host();
+    try {
+      const map = geoMap(h, { width: W, height: H, projection: proj(), backend: "auto" });
+      map.layer("cells", cells, { fill: "rgb(200,60,60)", id: (_d, i) => i });
+      // Deterministic signature: zero drawables reached the placeholder ⇒ zero drawShapes passes.
+      expect(watch.drawables()).toBe(0);
+      await until(() => isWebGLCanvas(h));
+      expect(watch.drawables()).toBe(0);
+      // The layer was BUILT, not withheld: WebGL paints it as soon as it lands.
+      expect(await paintedPixels(map.toPNG())).toBeGreaterThan(0);
+      map.destroy();
+    } finally {
+      watch.restore();
+      h.remove();
+    }
+  }, 240_000);
+
+  it("still paints a SMALL layer on the placeholder immediately (non-vacuity)", async () => {
+    const cells = makeCells(GEO_SMALL);
+    const watch = watchCanvas();
+    const h = host();
+    try {
+      const map = geoMap(h, { width: W, height: H, projection: proj(), backend: "auto" });
+      map.layer("cells", cells, { fill: "rgb(60,120,200)", id: (_d, i) => i });
+      // Below the budget the placeholder draws before the WebGL device exists — the whole point
+      // of "auto". If this ever hits 0 the guard above has become vacuous.
+      expect(watch.drawables()).toBeGreaterThanOrEqual(GEO_SMALL);
+      expect(isWebGLCanvas(h)).toBe(false);
+      await until(() => isWebGLCanvas(h));
+      map.destroy();
+    } finally {
+      watch.restore();
+      h.remove();
+    }
+  }, 120_000);
 });
 
 describe("backend \"auto\" placeholder — WebGL unavailable", () => {

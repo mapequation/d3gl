@@ -1719,7 +1719,11 @@ export abstract class BaseEngine {
     }
     return null;
   }
-  render(): this { this.handle?.backend.render(); return this; }
+  render(): this {
+    if (this.skipPlaceholderPaint()) return this; // #273: the throwaway "auto" placeholder stays blank at scale
+    this.handle?.backend.render();
+    return this;
+  }
   // Exports feed the export-only stashes first: labels (#219) — a WebGL backend never draws them live
   // (the HTML overlay does) — and, for toSVG, the instanced lanes' vector view (#200), which has no
   // retained Scene to serialize. Both are pushed once at export time, never per frame. toPNG needs
@@ -2168,7 +2172,13 @@ export abstract class BaseEngine {
   private pushLayers(): void {
     // Apply declutter to the Scene flags BEFORE the upload, so the first draw is already
     // decluttered (setTransform's per-zoom pass otherwise wouldn't run until the first gesture).
+    // Runs even when the push below is withheld: the flags are Scene state the incoming WebGL
+    // backend reads too, so skipping them would only move identical work later (the #201 rule).
     for (const spec of this.specs) if (spec.declutter) this.cullDeclutter(spec, this.transform);
+    // #273: a large scene is not worth pushing to `"auto"`'s throwaway placeholder canvas —
+    // `allRenderLayers()` alone materializes one DrawableVector per drawable, and the paint that
+    // follows is discarded by the WebGL install ~100-200 ms later.
+    if (this.skipPlaceholderPaint()) return;
     this.handle?.backend.setLayers(this.allRenderLayers());
     this.handle?.backend.setTransform(this.transform);
     this.render();
@@ -2232,9 +2242,15 @@ export abstract class BaseEngine {
     if (old && old.element !== this.host) old.element.remove();
     this.handle = next;
     this.currentBackend = type;
-    next.backend.setLayers(this.allRenderLayers());
+    // #273: the same withhold as pushLayers(), for the install that CREATES the placeholder —
+    // `setBackend("auto")` on an engine that already carries a large scene. The placeholder is
+    // left correctly sized but blank; the WebGL install right after runs this with
+    // `currentBackend === "webgl"`, so the real first paint is never skipped. `setTransform` runs
+    // either way (O(1), and it keeps the surface correctly framed), in its original position.
+    const paint = !this.skipPlaceholderPaint();
+    if (paint) next.backend.setLayers(this.allRenderLayers());
     next.backend.setTransform(this.transform);
-    next.backend.render();
+    if (paint) next.backend.render();
     // Replay retained pass-through layers onto the freshly-installed backend (mirrors the
     // retained setLayers re-push above). A deferred/not-ready registration is activated here.
     if (this.ptSpecs.size > 0) {
@@ -2306,10 +2322,53 @@ export abstract class BaseEngine {
     return true;
   }
 
+  /**
+   * The PAINT half of {@link skipPlaceholderEmit} (#273) — should the live backend be left blank?
+   *
+   * `skipPlaceholderEmit` withholds Scene geometry that exists *only* for a vector backend. This
+   * one covers the geometry WebGL renders too — every `geoMap` layer, `plot.layer()`, every
+   * non-decluttered `points()` layer. That geometry must still be BUILT (withholding it would only
+   * move identical work later), but pushing and painting it on `"auto"`'s placeholder canvas is
+   * pure waste: `allRenderLayers()` materializes one `DrawableVector` per drawable and
+   * `CanvasBackend.render()` then runs `drawShapes` over all of them, ~0.7 µs each, for a frame the
+   * WebGL install discards ~100-200 ms later. Above {@link AUTO_PLACEHOLDER_MAX_ELEMENTS} the
+   * placeholder is therefore left correctly sized but EMPTY. Nothing about page layout depends on
+   * it — backend canvases are `position:absolute` (out of flow, see `backend-factory.makeCanvas`),
+   * so the host box comes from the consumer's CSS and never moves.
+   *
+   * Reuses the one budget deliberately: a second, painting-specific threshold would be a knob
+   * nobody can calibrate, and 10k drawables paint in ≲10 ms either way.
+   *
+   * Cost on the hot path: ONE boolean field read (`upgrading` is false except during the upgrade
+   * window), so `render()` — which runs per zoom frame — is unchanged in practice. Inside the
+   * window it is O(layers) (≈1-10), each term an O(1) `Scene.drawableCount`; it never touches the
+   * O(total-drawables) `Scene.drawables()` materialization.
+   *
+   * `currentBackend !== "canvas"` is load-bearing: `installBackend` assigns `currentBackend` before
+   * it paints, and it runs for the WebGL handle while `upgrading` is still true — without this the
+   * upgrade's own first frame would be skipped. An explicit `setBackend()` mid-upgrade is safe for
+   * the same reason it is safe for `skipPlaceholderEmit`: it clears `upgrading` before swapping.
+   */
+  private skipPlaceholderPaint(): boolean {
+    if (!this.upgrading || this.currentBackend !== "canvas") return false;
+    let elements = 0;
+    for (const spec of this.specs) {
+      if (this.interacting && spec.hideOnInteraction) continue; // mirrors renderSpecs(), without its allocation
+      elements += this.scene.drawableCount(spec.name);
+    }
+    return this.skipPlaceholderEmit(elements);
+  }
+
   /** Enter "auto" mode: install a Canvas backend synchronously (instant first paint, no
    *  await, no onBackendSwapped — it is the first install / a fresh canvas), then start the
-   *  background WebGL upgrade. Bumping swapToken invalidates any in-flight prior swap. */
+   *  background WebGL upgrade. Bumping swapToken invalidates any in-flight prior swap.
+   *
+   *  `upgrading` is raised BEFORE the install (rather than only inside {@link upgradeToWebGL})
+   *  so the install itself already sees the canvas as a placeholder. That only matters for
+   *  `setBackend("auto")` on an engine that already holds a scene — from the constructor there
+   *  are no layers yet. */
   private enterAutoMode(): void {
+    this.upgrading = true;
     const handle = createCanvasBackend(this.host, this.width, this.height);
     this.installBackend(handle, ++this.swapToken, "canvas");
     this.upgradeDone = this.upgradeToWebGL();
