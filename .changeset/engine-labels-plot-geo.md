@@ -1,5 +1,0 @@
----
-"@mapequation/d3gl": patch
----
-
-`plot()` and `geoMap()` now own text labels via `chart.labels(data, opts)` / `map.labels(data, opts)` (#223) — the data-driven counterpart of `network.labels()`. Supply the data and d3-style accessors (`labelOf`, `anchorOf`, `importanceOf?`, `offset?`, `rotationOf?`, `max?`, `style?`, `className?`, `font?`/`color?`/`halo?`) and the engine measures each label's text once (real `measureText`, no magic-number metrics), places + culls collisions on every pan/zoom, and routes to the active backend: an HTML overlay on WebGL, native `<text>`/`fillText` on SVG/Canvas so labels survive `toSVG()`/`toPNG()` export. Labels come pre-styled by the built-in default look with a `style` inline override or a full-CSS `className` (the #224 policy, now shared). The overlay ownership, placement, and native-text routing are lifted into `BaseEngine`, so `network.labels()` is now its specialization of one shared path. `@mapequation/d3gl/labels` also exports `measureText`/`canvasFont`.
