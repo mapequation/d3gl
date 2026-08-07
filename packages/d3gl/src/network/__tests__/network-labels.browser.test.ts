@@ -102,6 +102,47 @@ describe("network.labels() — frontier labels (#105 N7b)", () => {
     h.remove();
   });
 
+  it("thins a dense cluster: no two labels overlap, and the most important survives (#204)", async () => {
+    const h = host();
+    const net = network(h, { width: 200, height: 200 });
+    await net.whenReady();
+    // 12 nodes packed into an ~18px box in the middle of the view. Every label ("label-N", ~40px
+    // wide × 14px tall) would overprint every other one — the #204 unreadable stack.
+    const N = 12;
+    const positions = new Float32Array(2 * N);
+    for (let i = 0; i < N; i++) {
+      positions[2 * i] = 92 + (i % 4) * 6;
+      positions[2 * i + 1] = 92 + Math.floor(i / 4) * 6;
+    }
+    const source: number[] = [];
+    const target: number[] = [];
+    for (let i = 1; i < N; i++) { source.push(0); target.push(i); } // node 0 = the hub (top strength)
+    const g = buildGraph({ nodeCount: N, source, target, directed: false });
+    net.data(g).style({ nodeRadius: 3 }).layout({ backend: "positions", positions });
+    net.labels({ labelOf: (id) => `label-${id}` }); // uncapped: collision culling is the only thinning
+    net.setTransform({ k: 1, x: 0, y: 0 });
+
+    const els = labelEls(h);
+    expect(els.length).toBeGreaterThan(0);
+    expect(els.length).toBeLessThan(N); // the stack is thinned, not all 12 painted on top of each other
+
+    // The acceptance criterion: no two RENDERED label boxes overlap (1px slack for rounding).
+    const rects = els.map((e) => e.getBoundingClientRect());
+    for (let i = 0; i < rects.length; i++) {
+      for (let j = i + 1; j < rects.length; j++) {
+        const a = rects[i];
+        const b = rects[j];
+        if (!a || !b) continue;
+        const hit = a.right - 1 > b.left && b.right - 1 > a.left && a.bottom - 1 > b.top && b.bottom - 1 > a.top;
+        expect(`${els[i]?.textContent}×${els[j]?.textContent}:${hit}`).toBe(`${els[i]?.textContent}×${els[j]?.textContent}:false`);
+      }
+    }
+    // Importance-ranked: the hub (highest strength) wins its collisions.
+    expect(els.some((e) => e.textContent === "label-0")).toBe(true);
+    net.destroy();
+    h.remove();
+  });
+
   it("labels come pre-styled by default; `style` overrides inline and restyles on re-call (#224)", async () => {
     const h = host();
     const net = network(h, { width: 200, height: 200 });

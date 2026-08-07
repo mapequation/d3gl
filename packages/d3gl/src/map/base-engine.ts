@@ -1,7 +1,7 @@
 import { select, type Selection } from "d3-selection";
 import { zoom as d3zoom, zoomIdentity, type D3ZoomEvent, type ZoomBehavior } from "d3-zoom";
 import { Scene, HitIndex, declutterScreen, declutterScratch, instancedVectorLayers, DEFAULT_CURVE_TOLERANCE, type Backend, type GroupBuilder, type RenderLayer, type VectorLayer, type ViewTransform, type DeclutterScratch, type TextData } from "../core/index.js";
-import { LabelLayer, placeLabels, resolveLabelStyle, measureText, canvasFont, DEFAULT_LABEL_TEXT, type LabelAnchor, type LabelStyle } from "../labels/index.js";
+import { LabelLayer, placeLabels, labelCullScratch, labelTextY, resolveLabelStyle, measureText, canvasFont, DEFAULT_LABEL_TEXT, type LabelAnchor, type LabelStyle } from "../labels/index.js";
 import type { TextAnchor, LabelBox } from "../labels/cull.js";
 import { InstancedLane, type ScreenRect } from "../core/instanced-lane.js";
 import { createBackend, createCanvasBackend, type BackendType, type BackendHandle } from "./backend-factory.js";
@@ -323,9 +323,9 @@ export abstract class BaseEngine {
    *  the overlay branch of routeLabels runs on every transform/rebuild. Covers BOTH network frontier
    *  labels and plot/geo data labels (#223), since both route through routeLabels. */
   private exportAnchors: readonly LabelAnchor[] = [];
-  /** The text alignment the retained {@link exportAnchors} were routed with ("middle" for network
-   *  glyph-centred labels, "start" for plot/geo beside-the-glyph labels). */
-  private exportAlign: TextAnchor = "middle";
+  /** Retained cull buffers for the native-text placement path (#204) — `routeLabels` places on every
+   *  transform on SVG/Canvas, so the grid + geometry scratch is reused instead of re-allocated. */
+  private readonly labelCull = labelCullScratch();
   /** Retained plot/geo data-label anchors (#223): measured + built ONCE at `labels(data, opts)` call,
    *  re-placed (not rebuilt/re-measured) on every transform. `max` caps the shown set (default ∞). */
   private dataLabels: { anchors: LabelAnchor[]; max: number } | null = null;
@@ -1396,18 +1396,17 @@ export abstract class BaseEngine {
    * export-only stash ({@link Backend.textLayerMode}, #219) — the HTML overlay owns the screen and
    * the anchor set is retained (reference only, zero added per-frame work) so {@link toSVG}/
    * {@link toPNG} can feed the stash at export time. Project + cull is shared ({@link placeLabels})
-   * so both paths place identically. Native text is vertically centred on the box (`y + height/2`,
-   * baseline "middle") and horizontally aligned per `align` — `"start"` for plot/geo labels beside
-   * a glyph, `"middle"` for network labels centred on it.
+   * so both paths place identically. Native text is positioned from the SAME box the culler used
+   * ({@link toTextData}) — the anchor's own `textAnchor`/`baseline` — so the two never disagree.
    */
-  protected routeLabels(anchors: readonly LabelAnchor[], align: TextAnchor = "middle"): void {
+  protected routeLabels(anchors: readonly LabelAnchor[]): void {
     const layer = this.labelLayer;
     if (!layer) return;
     const viewport = { width: this.width, height: this.height };
     const backend = this.backend();
     if (backend?.setTextLayer && backend.textLayerMode !== "export-only") {
-      const survivors = placeLabels(anchors, this.transform, viewport);
-      backend.setTextLayer(this.toTextData(survivors, align));
+      const survivors = placeLabels(anchors, this.transform, viewport, this.labelCull);
+      backend.setTextLayer(this.toTextData(survivors));
       layer.update([], this.transform, viewport); // keep the overlay empty on a native-text backend
     } else {
       layer.update(anchors, this.transform, viewport);
@@ -1415,19 +1414,21 @@ export abstract class BaseEngine {
       // export-only text backend can be fed the placed labels at toPNG()/toSVG() time (#219).
       // Nothing is placed or allocated here — zero added per-frame work.
       this.exportAnchors = anchors;
-      this.exportAlign = align;
     }
   }
 
   /** Map placed label boxes to backend {@link TextData} — the one shape both the live native-text
-   *  path (SVG/Canvas) and the export-only push (WebGL, #219) emit, so exports match across backends. */
-  private toTextData(survivors: readonly LabelBox[], align: TextAnchor): TextData[] {
+   *  path (SVG/Canvas) and the export-only push (WebGL, #219) emit, so exports match across backends.
+   *  Position and alignment come from the box's declared placement: `x` IS the anchor for the box's
+   *  own `textAnchor` (start ⇒ left edge, middle ⇒ centre, end ⇒ right edge) and `y` is the box's
+   *  vertical centre for the backends' "middle" baseline ({@link labelTextY}). */
+  private toTextData(survivors: readonly LabelBox[]): TextData[] {
     const text = this.labelText;
     return survivors.map((b) => ({
       x: b.x,
-      y: b.y + (b.height ?? 0) / 2, // top-left box → vertical centre for the "middle" baseline
+      y: labelTextY(b),
       text: String(b.text),
-      align,
+      align: b.textAnchor ?? "start",
       font: text?.font,
       color: text?.color,
       halo: text?.halo,
@@ -1443,8 +1444,8 @@ export abstract class BaseEngine {
     const backend = this.backend();
     if (!backend?.setTextLayer || backend.textLayerMode !== "export-only") return;
     const active = this.labelLayer !== null;
-    const survivors = active ? placeLabels(this.exportAnchors, this.transform, { width: this.width, height: this.height }) : [];
-    backend.setTextLayer(this.toTextData(survivors, this.exportAlign));
+    const survivors = active ? placeLabels(this.exportAnchors, this.transform, { width: this.width, height: this.height }, this.labelCull) : [];
+    backend.setTextLayer(this.toTextData(survivors));
   }
 
   /**
@@ -1535,7 +1536,7 @@ export abstract class BaseEngine {
     const state = this.dataLabels;
     if (!state || !this.labelLayer) return;
     const all = state.anchors;
-    if (all.length <= state.max) { this.routeLabels(all, "start"); return; }
+    if (all.length <= state.max) { this.routeLabels(all); return; }
     // Cap to the top-k by importance among the in-view candidates (screen-space filter).
     const { k, x, y } = this.transform;
     const W = this.width, H = this.height;
@@ -1546,7 +1547,7 @@ export abstract class BaseEngine {
       if (sx >= 0 && sx <= W && sy >= 0 && sy <= H) inView.push(a);
     }
     inView.sort((p, q) => (q.priority ?? 0) - (p.priority ?? 0));
-    this.routeLabels(inView.slice(0, state.max), "start");
+    this.routeLabels(inView.slice(0, state.max));
   }
 
   /**

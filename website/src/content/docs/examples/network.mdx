@@ -372,8 +372,13 @@ which skips the built-in default so your class's CSS decides everything.
 
 Set `max` to surface only the most important few on a **dense** map — the [directed map of modules](#a-directed-map-of-modules)
 below uses `max: 12`, where flow varies so the top-12 by importance (the tree's `weight` = summed flow)
-are the dominant modules/hubs. Ranking (a sort) runs **only when `max` actually caps**, so the default
-"show all" path pays nothing for it.
+are the dominant modules/hubs.
+
+**Nothing overprints.** Each label's text is measured (once per distinct string, not per frame) and the
+engine places labels in importance order — `importanceOf`, defaulting to the tree's `weight` with LOD on
+and node strength with it off — skipping any whose box would overlap one already placed. So a dense
+centre keeps the labels that matter and drops the rest instead of stacking them, at every zoom level, on
+every backend. Placement is grid-backed, so its cost is linear in the labels currently in view.
 
 The engine owns the wiring — it cuts the frontier, (optionally) ranks by importance, and reconciles an
 **HTML overlay** of `<div>` labels over the canvas (crisp + accessible), re-placing them every pan/zoom.
