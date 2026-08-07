@@ -245,7 +245,12 @@ export interface NetworkLODOptions {
   /**
    * Expand threshold (px): an aggregate whose on-screen footprint (`2·extent·k`) reaches this
    * expands into its children; below it it draws as a single glyph. Larger → coarser (fewer, bigger
-   * aggregates). Default 48.
+   * aggregates).
+   *
+   * **Omit it** to get the tree-adaptive default (#191), which scales with how many children the
+   * tree's finest aggregates hold: 48 px for structural coarsening / a spatial quadtree (unchanged),
+   * ~190–280 px for a provided module partition — so `lod({ modules })` opens on a map of modules
+   * instead of raw nodes. Set it to pin an absolute pixel size (the meaning is unchanged).
    */
   expandPx?: number;
   /** Aggregate-glyph fill (any CSS color). Default = `nodeFill`. */
