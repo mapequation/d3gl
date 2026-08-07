@@ -46,10 +46,14 @@ export interface ViewTransform {
   y: number;
 }
 
-/** One named layer handed to a backend: GPU buffers + the vector view + optional clip. */
-export interface RenderLayer {
+/**
+ * A named layer's **vector view** — everything a CPU rasterizer or serializer needs, with no GPU
+ * buffers. {@link RenderLayer} is this plus the buffers; the export-only stash a backend keeps for
+ * `toSVG()` ({@link Backend.setExportLayers}, #200) is this alone, since instanced-lane content is
+ * never uploaded as Scene geometry.
+ */
+export interface VectorLayer {
   name: string;
-  buffers: GroupBuffers;
   drawables: DrawableVector[];
   /** Name of an earlier layer whose filled silhouette clips this one. */
   clipTo?: string;
@@ -59,6 +63,11 @@ export interface RenderLayer {
    * keep a constant pixel width about their world centerline. Applies to all geometry types.
    */
   sizeMode?: "world" | "screen";
+}
+
+/** One named layer handed to a backend: GPU buffers + the vector view + optional clip. */
+export interface RenderLayer extends VectorLayer {
+  buffers: GroupBuffers;
 }
 
 /**
@@ -380,6 +389,16 @@ export interface Backend {
    * HTML overlay) and needs to push the set only when exporting, NOT per transform (zero per-frame cost).
    */
   readonly textLayerMode?: "live" | "export-only";
+  /**
+   * Export-only **vector stash** for content this backend draws outside the retained Scene (#200) —
+   * the GPU-instanced lanes (network glyphs/links, decluttered plot points). Implemented by the WebGL
+   * backend only: the layers are never rendered (the GPU already drew them), they are appended after
+   * the retained layers in {@link toSVG} so the export shows the same view the screen does. The engine
+   * pushes them at export time alone — like the {@link setTextLayer} stash, this costs nothing per
+   * frame. Replaces the whole set; pass `[]` to clear. Absent on Canvas/SVG, which have no instanced
+   * lanes (those backends draw the same content as retained Scene layers, already in their export).
+   */
+  setExportLayers?(layers: readonly VectorLayer[]): void;
   setTransform(t: ViewTransform): void;
   /**
    * Resize the rendering surface to a new CSS size (px). Re-reads the device pixel ratio

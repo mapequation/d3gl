@@ -1,7 +1,7 @@
 import { luma } from "@luma.gl/core";
 import { webgl2Adapter, WebGLDevice, WEBGLFramebuffer } from "@luma.gl/webgl";
 import type { Device, Framebuffer } from "@luma.gl/core";
-import type { Backend, RenderLayer, RenderDelta, ViewTransform, InstancedLayer, InstancedHighlight } from "../core/index.js";
+import type { Backend, RenderLayer, VectorLayer, RenderDelta, ViewTransform, InstancedLayer, InstancedHighlight } from "../core/index.js";
 import type { GroupBuffers, GroupBufferDelta, PassThroughLayer, DrawBatch, StyleTables, DrawableVector, TextData } from "../core/index.js";
 import { GroupRenderer } from "./renderer.js";
 import { InstancedCircles, InstancedPie, InstancedLines, InstancedArrows, InstancedHalfArrows } from "./instanced.js";
@@ -47,6 +47,9 @@ export class WebGLBackend implements Backend {
   /** Export-only text stash (#219): labels retained for toPNG()/toSVG(), never drawn to screen
    *  (the engine's HTML overlay owns live labels — GPU/MSDF text is #69). See {@link textLayerMode}. */
   private textData: readonly TextData[] = [];
+  /** Export-only geometry stash (#200): the vector view of what the {@link instanced} lanes drew.
+   *  Never rendered (the GPU already drew it) — appended after the retained layers in {@link toSVG}. */
+  private exportLayers: readonly VectorLayer[] = [];
 
   private constructor(
     private readonly device: Device,
@@ -335,6 +338,12 @@ export class WebGLBackend implements Backend {
     this.textData = texts;
   }
 
+  /** Retain the instanced lanes' vector view for toSVG() (#200). No render, no GPU work — an O(1)
+   *  reference swap; the engine builds and pushes the set only when exporting. */
+  setExportLayers(layers: readonly VectorLayer[]): void {
+    this.exportLayers = layers;
+  }
+
   setTransform(t: ViewTransform): void {
     this.viewTransform = t;
     this.clipMatrix = clipFromView(t, this.width, this.height);
@@ -494,7 +503,11 @@ export class WebGLBackend implements Backend {
     }
     // In globe mode, SVG cannot render a 3D sphere; fall back to the baked (equirectangular) layer snapshot.
     // The stashed labels (#219) serialize as <text> on top, exactly as the Canvas/SVG backends emit them.
-    return svgFromLayers(this.width, this.height, this.order.map((n) => this.layers.get(n)!), this.viewTransform, this.textData);
+    // The instanced lanes have no retained Scene, so their export-only vector stash (#200) is appended
+    // after the retained layers — the same order the draw pass uses (retained first, then instanced).
+    const retained: VectorLayer[] = this.order.map((n) => this.layers.get(n)!);
+    const all = this.exportLayers.length > 0 ? [...retained, ...this.exportLayers] : retained;
+    return svgFromLayers(this.width, this.height, all, this.viewTransform, this.textData);
   }
 
   /**

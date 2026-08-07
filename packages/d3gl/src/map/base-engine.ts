@@ -1,6 +1,6 @@
 import { select, type Selection } from "d3-selection";
 import { zoom as d3zoom, zoomIdentity, type D3ZoomEvent, type ZoomBehavior } from "d3-zoom";
-import { Scene, HitIndex, declutterScreen, declutterScratch, type Backend, type GroupBuilder, type RenderLayer, type ViewTransform, type DeclutterScratch, type TextData } from "../core/index.js";
+import { Scene, HitIndex, declutterScreen, declutterScratch, instancedVectorLayers, type Backend, type GroupBuilder, type RenderLayer, type VectorLayer, type ViewTransform, type DeclutterScratch, type TextData } from "../core/index.js";
 import { LabelLayer, placeLabels, resolveLabelStyle, measureText, canvasFont, DEFAULT_LABEL_TEXT, type LabelAnchor, type LabelStyle } from "../labels/index.js";
 import type { TextAnchor, LabelBox } from "../labels/cull.js";
 import { InstancedLane, type ScreenRect } from "../core/instanced-lane.js";
@@ -1379,6 +1379,28 @@ export abstract class BaseEngine {
   }
 
   /**
+   * Feed the instanced lanes' **vector view** to an export-only geometry backend (#200) right before
+   * a `toSVG()`, so a WebGL export contains the glyphs the GPU lanes drew (network nodes/links, LOD
+   * aggregates, decluttered plot points) instead of only the retained Scene — which on a lane-only
+   * engine is empty, and produced the `<defs/><g/>` document the issue reports.
+   *
+   * Each lane is re-selected at the LIVE transform and its emit converted to drawables, so the export
+   * is exactly the current view. Runs ONLY at export time — O(visible glyphs) once per call, never per
+   * frame; no-op on Canvas/SVG (no `setExportLayers`, and those backends draw the same content as
+   * retained Scene layers, so it is already in their export).
+   */
+  private pushExportGeometry(): void {
+    const backend = this.backend();
+    if (!backend?.setExportLayers) return;
+    const layers: VectorLayer[] = [];
+    for (const entry of this.instancedLanes.values()) {
+      const emitted = entry.lane.update(this.transform, this.width, this.height);
+      layers.push(...instancedVectorLayers(emitted, this.transform.k));
+    }
+    backend.setExportLayers(layers);
+  }
+
+  /**
    * Set (or, with `false`, clear) engine-owned data labels for plot/geoMap (#223). Measures each
    * label's text ONCE here (never per frame), building a retained anchor set that {@link afterTransform}
    * re-places on every pan/zoom. Plain labels are vertically centred on the anchor+offset (the measured
@@ -1671,9 +1693,11 @@ export abstract class BaseEngine {
     return null;
   }
   render(): this { this.handle?.backend.render(); return this; }
-  // Exports feed the export-only text stash first (#219): a WebGL backend never draws labels live
-  // (the HTML overlay does), so the placed set is pushed once at export time — never per frame.
-  toSVG(): string { this.pushExportLabels(); return this.handle?.backend.toSVG() ?? ""; }
+  // Exports feed the export-only stashes first: labels (#219) — a WebGL backend never draws them live
+  // (the HTML overlay does) — and, for toSVG, the instanced lanes' vector view (#200), which has no
+  // retained Scene to serialize. Both are pushed once at export time, never per frame. toPNG needs
+  // only the labels: it is a GPU readback, so the lanes are already in the pixels.
+  toSVG(): string { this.pushExportLabels(); this.pushExportGeometry(); return this.handle?.backend.toSVG() ?? ""; }
   toPNG(): string { this.pushExportLabels(); return this.handle?.backend.toPNG() ?? ""; }
   destroy(): void {
     this.destroyed = true;

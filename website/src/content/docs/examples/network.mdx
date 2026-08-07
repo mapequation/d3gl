@@ -177,10 +177,12 @@ What it composes:
 
 The geometry tracks the layout *as it converges* (LOD helps during the solve, not just after), while
 panning and zooming only re-run the cheap cut. On the **WebGL** lane the cut re-runs live every frame.
-On the **Canvas/SVG** backends the same frontier draws as retained geometry — so `toSVG()` **exports a
-level-of-detail map** — but a retained backend can't re-tessellate per frame, so there the frontier is
-static during a gesture and re-cuts when it ends (call `syncScreenGeometry()` to re-cut at a chosen
-zoom before a programmatic export).
+On the **Canvas/SVG** backends the same frontier draws as retained geometry — but a retained backend
+can't re-tessellate per frame, so there the frontier is static during a gesture and re-cuts when it
+ends (call `syncScreenGeometry()` to re-cut at a chosen zoom before a programmatic export).
+
+`toSVG()` **exports a level-of-detail map on every backend**: on Canvas/SVG from that retained
+frontier, and on WebGL from a vector view of the lane's current emit, built at export time only.
 
 With the **worker backend**, enable LOD *before* `layout({ backend: "worker" })` and the worker builds
 the hierarchy itself — it reuses the coarsening it already computes for the multilevel seed, then
