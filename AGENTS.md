@@ -417,7 +417,7 @@ outer). They read identically for an **opaque** fill and diverge for a **translu
 the stacked pair paints an opaque inner disc over the ring and loses it. So the ring encoding is the
 more correct of the two — do **not** "fix" the WebGL side toward the stacked pair to make the counts
 match. `network/__tests__/network-export.browser.test.ts` pins both shapes. Moving the Scene path
-onto the ring encoding is #270.
+onto the ring encoding is #269.
 
 Guard it with the **backend-equivalence harness**
 (`map/__tests__/backend-equivalence-harness.ts` + `map/backend-equivalence.browser.test.ts`):

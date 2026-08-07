@@ -85,7 +85,7 @@ describe("network toSVG() on the WebGL backend (#200)", () => {
   // outer). Both read identically for an OPAQUE fill; they diverge for a translucent one, where the
   // stacked pair paints an opaque inner disc over the ring. Pinned here so the difference stays a
   // deliberate choice rather than a latent surprise — and so nobody "fixes" the WebGL side toward
-  // the stacked pair. Moving the Scene path onto the ring encoding is #270.
+  // the stacked pair. Moving the Scene path onto the ring encoding is #269.
   it("bordered nodes: WebGL exports a stroked ring, Canvas exports stacked discs — pinned, not accidental", async () => {
     const style = { nodeRadius: 8, nodeFill: "#1f77b4", nodeBorder: { width: 3, color: "#ff0000" } } as const;
 
