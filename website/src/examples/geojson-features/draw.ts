@@ -11,6 +11,7 @@ import {
   makeCities,
   makeCluster,
   makeDemoPolygon,
+  makeIslandInLake,
   makeMajorRivers,
   centreCells,
 } from "../shared/geo-data.js";
@@ -63,6 +64,13 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
   map.layer("region", [makeDemoPolygon()], {
     fill: "#9bd1a466", stroke: "#3b8c4e", lineWidth: 1,
     tooltip: () => "Sahara box (demo region)",
+  });
+  // Nested rings: land ▸ lake ▸ island ▸ pond in one MultiPolygon. Ring nesting is
+  // resolved by the nonzero fill rule at any depth, so the island fills solid and its
+  // pond cuts back out — identically on WebGL, Canvas and SVG.
+  map.layer("island-in-a-lake", [makeIslandInLake()], {
+    fill: LAND, stroke: "#9aa3ad", lineWidth: 0.5,
+    tooltip: () => "Island in a lake (nested rings)",
   });
   map.layer("route", [makeRoute()], {
     stroke: "#e8932f", lineWidth: 1.5,

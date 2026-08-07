@@ -61,4 +61,28 @@ describe("HitIndex", () => {
     expect(idx.pick(50, 50, ID)).toBe("a");    // old one still hits
     expect(idx.pick(100, 100, ID)).toBe(null); // gap between them misses
   });
+
+  it("picks an island inside a lake, and misses the lake (#73)", () => {
+    // land ▸ lake ▸ island, each ring wound opposite to the one enclosing it — the
+    // convention geoPath emits. HitIndex classifies rings with the same `groupRings`
+    // the fill does, so hit-testing must agree with what the user sees.
+    const square = (lo: number, hi: number, ccw: boolean): [number, number][] =>
+      ccw
+        ? [[lo, lo], [hi, lo], [hi, hi], [lo, hi]]
+        : [[lo, lo], [lo, hi], [hi, hi], [hi, lo]];
+    const scene = new Scene();
+    scene.group("g", (b) => {
+      b.drawable("atoll", (ctx) => {
+        for (const ring of [square(0, 100, true), square(20, 80, false), square(40, 60, true)]) {
+          ctx.moveTo(ring[0]?.[0] ?? 0, ring[0]?.[1] ?? 0);
+          for (let i = 1; i < ring.length; i++) ctx.lineTo(ring[i]?.[0] ?? 0, ring[i]?.[1] ?? 0);
+          ctx.closePath();
+        }
+      });
+    });
+    const idx = new HitIndex(scene.drawables("g"));
+    expect(idx.pick(10, 10, ID)).toBe("atoll"); // land
+    expect(idx.pick(30, 30, ID)).toBe(null);    // lake — a hole
+    expect(idx.pick(50, 50, ID)).toBe("atoll"); // island inside the lake
+  });
 });

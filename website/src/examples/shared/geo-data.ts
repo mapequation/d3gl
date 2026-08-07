@@ -151,6 +151,36 @@ export function makeDemoPolygon(): Feature<Polygon> {
   };
 }
 
+/**
+ * An island inside a lake inside land, with a pond on the island — the nested ring
+ * topology real geographies have (Manitoulin in Lake Huron, Vulcan Point in Taal).
+ * Encoded the RFC 7946 way: a MultiPolygon of two polygons, `[land, lake]` and
+ * `[island, pond]`, each `[exterior, hole]`.
+ *
+ * Winding alternates with depth — exterior rings CLOCKWISE in [lon, lat] (like
+ * `makeDemoPolygon`), holes counter-clockwise — which is what makes the fill land ▸
+ * water ▸ land ▸ water instead of one solid block. See AGENTS.md "GeoJSON winding".
+ */
+export function makeIslandInLake(): Feature<MultiPolygon, { name: string }> {
+  const [lon, lat] = [-146, -14]; // open water in the South Pacific
+  // Clockwise from the SW corner: up the west side, east along the top, down, back.
+  const cw = (h: number): [number, number][] => [
+    [lon - h, lat - h], [lon - h, lat + h], [lon + h, lat + h], [lon + h, lat - h], [lon - h, lat - h],
+  ];
+  const ccw = (h: number): [number, number][] => [...cw(h)].reverse();
+  return {
+    type: "Feature",
+    properties: { name: "island-in-a-lake" },
+    geometry: {
+      type: "MultiPolygon",
+      coordinates: [
+        [cw(17), ccw(12)], // land with a lake in it
+        [cw(7), ccw(3)],   // an island in that lake, with its own pond
+      ],
+    },
+  };
+}
+
 /** A handful of major rivers as rough named polylines (the bundled world-atlas data
  *  has no rivers), shown on the GeoJSON-features map and used as streaming cluster
  *  centers. Coordinates are approximate [lon, lat] traces, mouth → source. */
