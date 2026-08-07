@@ -895,3 +895,100 @@ describe("passThrough append mixed geometry (engine path)", () => {
     map.destroy();
   });
 });
+
+/**
+ * #110 — TWO simultaneous pass-through layers.
+ *
+ * Before the fix these silently clobbered each other: the WebGL backend held ONE
+ * `PassThroughGL` (one accumulation FBO) plus a single `ptScreen` flag overwritten by
+ * whichever layer registered last, and the ENGINE started every layer's repaint with
+ * `"replace-first"` — which clears (WebGL: the FBO; Canvas: the whole canvas). So the
+ * second layer's repaint wiped the first, with no error and no warning.
+ *
+ * The fix keeps ONE shared accumulation surface (zero extra memory) and makes the clear
+ * CYCLE-scoped instead of layer-scoped: one repaint pass walks every pass-through layer
+ * in registration order, clears once at its first draw, and appends the rest. `sizeMode`
+ * became per-layer on WebGL (it already was on Canvas).
+ */
+describe("multiple pass-through layers (#110)", () => {
+  it("canvas: two pass-through layers both render (the second must not clobber the first)", async () => {
+    const h = host();
+    const chart = plot(h, { width: 200, height: 200, backend: "canvas" });
+    await chart.whenReady();
+    chart.points("a", [{ x: 50, y: 50 }], { x: (d) => d.x, y: (d) => d.y, radius: 8, fill: "rgb(255,0,0)", passThrough: true });
+    chart.points("b", [{ x: 140, y: 140 }], { x: (d) => d.x, y: (d) => d.y, radius: 8, fill: "rgb(0,0,255)", passThrough: true });
+    const ctx = canvasOf(h).getContext("2d")!;
+    expect(at(ctx, 140, 140)[2]!).toBeGreaterThan(180); // second layer drew
+    expect(at(ctx, 50, 50)[0]!).toBeGreaterThan(180);   // FIRST layer survived
+    chart.destroy();
+  });
+
+  it("webgl: two pass-through layers both render (the second must not clobber the first)", async () => {
+    const h = host();
+    const chart = new GLPlot(h, { width: 200, height: 200, backend: "webgl" });
+    await chart.whenReady();
+    chart.points("a", [{ x: 50, y: 50 }], { x: (d) => d.x, y: (d) => d.y, radius: 8, fill: "rgb(255,0,0)", passThrough: true });
+    chart.points("b", [{ x: 140, y: 140 }], { x: (d) => d.x, y: (d) => d.y, radius: 8, fill: "rgb(0,0,255)", passThrough: true });
+    expect(chart.screenPixel(140, 140)[2]!).toBeGreaterThan(180); // second layer drew
+    expect(chart.screenPixel(50, 50)[0]!).toBeGreaterThan(180);   // FIRST layer survived
+    chart.destroy();
+  });
+
+  it("webgl: both layers survive a settle repaint (setTransform re-pulls every layer)", async () => {
+    const h = host();
+    const chart = new GLPlot(h, { width: 200, height: 200, backend: "webgl" });
+    await chart.whenReady();
+    chart.points("a", [{ x: 25, y: 25 }], { x: (d) => d.x, y: (d) => d.y, radius: 8, fill: "rgb(255,0,0)", passThrough: true });
+    chart.points("b", [{ x: 70, y: 70 }], { x: (d) => d.x, y: (d) => d.y, radius: 8, fill: "rgb(0,0,255)", passThrough: true });
+    chart.applyTransform({ k: 2, x: 0, y: 0 }); // programmatic (settle) transform → crisp repaint of BOTH
+    expect(chart.screenPixel(50, 50)[0]!).toBeGreaterThan(180);   // layer a at k=2
+    expect(chart.screenPixel(140, 140)[2]!).toBeGreaterThan(180); // layer b at k=2
+    chart.destroy();
+  });
+
+  it("webgl: each pass-through layer keeps its OWN sizeMode (screen vs world)", async () => {
+    const h = host();
+    const chart = new GLPlot(h, { width: 200, height: 200, backend: "webgl" });
+    await chart.whenReady();
+    // a: screen sizing → constant 6 px radius at any zoom. b: world sizing (default) → 6·k.
+    chart.points("a", [{ x: 25, y: 25 }], { x: (d) => d.x, y: (d) => d.y, radius: 6, fill: "rgb(255,0,0)", sizeMode: "screen", passThrough: true });
+    chart.points("b", [{ x: 70, y: 70 }], { x: (d) => d.x, y: (d) => d.y, radius: 6, fill: "rgb(0,0,255)", passThrough: true });
+    chart.applyTransform({ k: 2, x: 0, y: 0 });
+    // a stays 6 px: its centre is red, 9 px out is empty.
+    expect(chart.screenPixel(50, 50)[0]!).toBeGreaterThan(180);
+    expect(chart.screenPixel(59, 50)[3]!).toBeLessThan(40);
+    // b doubles to 12 px: its centre is blue AND 9 px out is still inside the disc.
+    expect(chart.screenPixel(140, 140)[2]!).toBeGreaterThan(180);
+    expect(chart.screenPixel(149, 140)[2]!).toBeGreaterThan(180);
+    chart.destroy();
+  });
+
+  it("canvas: appending to one pass-through layer leaves the other untouched", async () => {
+    const h = host();
+    const chart = plot(h, { width: 200, height: 200, backend: "canvas" });
+    await chart.whenReady();
+    const a = chart.points("a", [{ x: 50, y: 50 }], { x: (d) => d.x, y: (d) => d.y, radius: 8, fill: "rgb(255,0,0)", passThrough: true });
+    chart.points("b", [{ x: 140, y: 140 }], { x: (d) => d.x, y: (d) => d.y, radius: 8, fill: "rgb(0,0,255)", passThrough: true });
+    a.append([{ x: 50, y: 140 }]);
+    const ctx = canvasOf(h).getContext("2d")!;
+    expect(at(ctx, 50, 140)[0]!).toBeGreaterThan(180);  // appended point
+    expect(at(ctx, 50, 50)[0]!).toBeGreaterThan(180);   // layer a original
+    expect(at(ctx, 140, 140)[2]!).toBeGreaterThan(180); // layer b untouched
+    chart.destroy();
+  });
+
+  it("canvas: a retained-layer push repaints BOTH pass-through layers", async () => {
+    const h = host();
+    const chart = plot(h, { width: 200, height: 200, backend: "canvas" });
+    await chart.whenReady();
+    chart.points("a", [{ x: 50, y: 50 }], { x: (d) => d.x, y: (d) => d.y, radius: 8, fill: "rgb(255,0,0)", passThrough: true });
+    chart.points("b", [{ x: 140, y: 140 }], { x: (d) => d.x, y: (d) => d.y, radius: 8, fill: "rgb(0,0,255)", passThrough: true });
+    // A retained layer → pushLayers() → render() clears the canvas; both PT layers must come back.
+    chart.points("base", [{ x: 100, y: 20 }], { x: (d) => d.x, y: (d) => d.y, radius: 6, fill: "rgb(0,180,0)" });
+    const ctx = canvasOf(h).getContext("2d")!;
+    expect(at(ctx, 100, 20)[1]!).toBeGreaterThan(150);  // retained base
+    expect(at(ctx, 50, 50)[0]!).toBeGreaterThan(180);   // layer a
+    expect(at(ctx, 140, 140)[2]!).toBeGreaterThan(180); // layer b
+    chart.destroy();
+  });
+});

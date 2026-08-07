@@ -102,6 +102,13 @@ or per-feature updates. **Use pass-through** for huge or live-streaming sets whe
 during gestures is fine and picking isn't needed. The demo below streams to **10M** points with a
 flat memory footprint (default **auto** backend → upgrades to WebGL).
 
+Several pass-through layers can coexist — e.g. a streamed point cloud over streamed polygons.
+They share one accumulation surface (so N layers cost no more memory than one) and composite in
+declaration order, on top of the retained layers. The trade-off of sharing it: a pass-through
+layer can't be repainted alone, so anything that invalidates one (`recolor()`, re-declaring it, a
+resize, a settle after pan/zoom) re-pulls **all** of them. `handle.append(batch)` is unaffected
+and stays O(new).
+
 <ExampleCard files={["streaming-passthrough/draw.ts"]}>
   <StreamingPassthrough client:visible slot="demo" />
 </ExampleCard>

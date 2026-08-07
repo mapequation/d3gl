@@ -409,6 +409,7 @@ guard owns the serialize budget: one DOM node per drawable buys parse time, not 
 | **`geoMap()` engine sweep** | **WebGL** | `map/geo-map-sweep-perf.browser.test.ts` | 20k cells | `PERF_BROWSER_N` (max 150k) |
 | **`plot()` engine sweep**, retained Scene | **WebGL** | `map/plot-engine-sweep-perf.browser.test.ts` | 50k ×2 layers | `PERF_BROWSER_N` (max 300k) |
 | **`network()` engine sweep**, LOD on **and** off | **WebGL** | `network/__tests__/network-sweep-perf.browser.test.ts` | 50k nodes / 50k edges | `PERF_BROWSER_N` (max 200k) |
+| multi pass-through: FBO count + gesture skip | **WebGL** | `map/passthrough-multi-perf.browser.test.ts` | 25k ×2 layers | `PERF_BROWSER_N` (max 50k) |
 
 **Known holes, tracked:** geo's at-scale leg is Canvas-only (#264). *(Closed: #263 — the at-scale
 legs used to drive **backends** only, leaving accessors / lane emit / LOD integration covered at
@@ -514,6 +515,37 @@ backend sees it. Consequences to keep in mind:
 - Adding a per-call rebuild back into any of these is a push-path regression, guarded by
   `core/__tests__/vector-view-perf.test.ts` (1M, ×20 pushes) and
   `map/push-layers-perf.browser.test.ts` (the real `pushLayers`, on Canvas and WebGL).
+
+## Pass-through layers share ONE accumulation surface (#110)
+
+Every pass-through (`passThrough: true`) layer draws into a **single** shared surface — the WebGL
+backend's one `PassThroughGL` framebuffer, the Canvas backend's main canvas. There is no
+framebuffer per layer, deliberately: an offscreen RGBA8 surface costs width×height×4 bytes (a
+1920×1080 layer ≈ 8.3 MB) and nothing in the product registers more than one pass-through layer.
+The consequences are contract, not incidental:
+
+- **The clear is CYCLE-scoped, not layer-scoped.** `BaseEngine.repaintPassThrough()` takes no layer
+  name: it walks *every* pass-through layer in declaration order, and only the first
+  `drawPassThrough` of that pass uses `"replace-first"` (which clears — WebGL: the PT framebuffer;
+  Canvas: the whole canvas, then redraws the retained base). Everything after it uses
+  `"replace-rest"`. Re-introducing a per-layer `"replace-first"` makes the second layer's repaint
+  silently erase the first — no error, no warning, wrong output. That was the #110 bug, and it hit
+  **both** backends, so don't reach for a backend-local fix.
+- **A pass-through layer cannot be repainted alone.** The surface has no per-layer channel to
+  erase, so any single-layer invalidation (`recolor()`, re-declaring the layer, `setSize`, a settle
+  transform, a backend swap) repaints the whole set: O(sum of all pass-through layers' items).
+  Appends are exempt — they never clear, so `handle.append()` stays O(new).
+- **Per-layer state lives in a name-keyed map on each backend** (`ptLayers`), never in a single
+  field. `sizeMode` used to be one `ptScreen` boolean on `WebGLBackend`, overwritten by whichever
+  layer registered last.
+- Guards: the `multiple pass-through layers (#110)` suite in `map/passthrough.browser.test.ts`
+  (both backends, real pixels) and `map/passthrough-multi-perf.browser.test.ts`, which pins the
+  memory decision as a number — registering layers 2..4 must allocate **zero** extra framebuffers
+  and textures — plus "a gesture frame re-projects nothing" and "a settle is O(total), not
+  O(layers × items)".
+
+Still unimplemented for pass-through, and unrelated to the above: `clipTo` (accepted and ignored
+on both backends), and `PassThroughGL` is not resized by `WebGLBackend.resize()`.
 
 ## Backend compositing equivalence (READ before touching the WebGL renderer)
 
