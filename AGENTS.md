@@ -406,6 +406,37 @@ because a geo polygon costs a `geoPath` stream + tessellation + a stroke ring an
 crosses a heap-growth cliff above ~75k (3.9 s at 100k vs 0.72 s at 50k, cold) for signatures that
 are exact at every N. And the SVG leg is not scaled to the tier's N for the same reason the plot SVG
 guard owns the serialize budget: one DOM node per drawable buys parse time, not strictness.
+| **`geoMap()` engine sweep** | **WebGL** | `map/geo-map-sweep-perf.browser.test.ts` | 20k cells | `PERF_BROWSER_N` (max 150k) |
+| **`plot()` engine sweep**, retained Scene | **WebGL** | `map/plot-engine-sweep-perf.browser.test.ts` | 50k ×2 layers | `PERF_BROWSER_N` (max 300k) |
+| **`network()` engine sweep**, LOD on **and** off | **WebGL** | `network/__tests__/network-sweep-perf.browser.test.ts` | 50k nodes / 50k edges | `PERF_BROWSER_N` (max 200k) |
+
+**Known holes, tracked:** geo's at-scale leg is Canvas-only (#264). *(Closed: #263 — the at-scale
+legs used to drive **backends** only, leaving accessors / lane emit / LOD integration covered at
+engine level only at N ≤ 5000. The three `*-sweep-perf.browser.test.ts` rows above now drive each
+engine's public entry point through the real `setTransform` at `PERF_BROWSER_N`.)*
+
+**Engine-level sweeps (#263) live in the BROWSER tier, deliberately.** Every engine constructor
+takes an `HTMLElement`, makes backend `<canvas>` elements, and resolves its box from layout; and the
+layer the sweeps exist to cover — instanced lanes, style-table textures, `updateInstancedLayer`'s
+in-place write — only exists on WebGL. A node fake host would make "GPU buffers are updated in
+place" an assertion about the fake, and a node fake *canvas* is precisely the seam
+`canvas-zoom-sweep-perf` already owns. Shared helpers: `packages/d3gl/src/__tests__/engine-sweep.ts`
+(`perfHost`, `zoomSteps`, `sweepFrames`, `GlBufferSpy`). Two things learned building them:
+
+- **`GlBufferSpy` counts uploads, not just create/delete — and the upload counter is the one with
+  teeth.** Patching `createBuffer`/`deleteBuffer`/`bufferData`/`bufferSubData` on
+  `WebGL2RenderingContext.prototype` is the cast-free way to assert both GPU signatures. They catch
+  *different* regressions: re-pushing the same arrays into the **same** buffer every frame (the #186
+  "render re-emit" shape) moves no create/delete count at all. Proven: making the network's
+  full-detail lane `dynamic` re-uploaded 28.8 MB over an 18-frame sweep while create/delete stayed
+  at 0 and every accessor count stayed flat. Assert it as a **ratio of the registration upload**
+  (`< registration / 1000`), not `toBe(0)`, so a future per-frame uniform write isn't a false
+  positive while any geometry re-upload is 1000× over.
+- **Never build a second WebGL engine in the same file after a large one.** Constructing a second
+  engine once a first has uploaded a ~100k-node graph stalls `whenReady()` for **9–12 s** on local
+  headless Chromium (measured 24 ms → 12,168 ms → 9,251 ms → 20 ms across four sequential engines);
+  it turned a 1.6 s network guard into 33 s. Share **one** engine across legs and toggle the thing
+  under test (`lod()` on/off, two layers on one chart). Tracked as #287.
 
 **Two guards are deliberately NOT scaled, and both would go *vacuously green* if you scaled them:**
 - `hover-overlay-perf` — its layout is a **contract**, not just a size: the 12px cell pitch must stay
