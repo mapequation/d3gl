@@ -27,7 +27,7 @@ import { perfHost, sweepFrames, zoomSteps } from "../../__tests__/engine-sweep.j
  * Signatures pinned (deterministic first; wall-clock is the order-of-magnitude backstop):
  *   1. **Zero `measureText` calls across a repeated zoom sweep** — after a warm-up sweep, an
  *      identical second sweep must measure nothing (the memoizing `TextMeasurer`), while the
- *      registration frame must measure a non-zero number of texts (non-vacuity).
+ *      registration frame measures **exactly N** (non-vacuity: one per distinct text, no more).
  *   2. **The DOM label set stays bounded and non-overlapping** — the #204 bug itself: every
  *      candidate used to reach the DOM because its collision box was zero-area. The viewport can
  *      hold only so many label boxes, and no two of them may overlap.

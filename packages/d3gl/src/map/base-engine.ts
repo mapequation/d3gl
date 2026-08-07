@@ -151,7 +151,8 @@ export interface DataLabelOptions<D = unknown> {
   /** Oriented labels: reading-direction angle (radians) per datum — switches to the rotated
    *  collision/render model (text runs along the axis, vertically centred on the anchor). */
   rotationOf?: (d: D, i: number) => number;
-  /** Oriented labels only: which way text runs from the anchor (default `"start"`). */
+  /** Which way text runs from the anchor (default `"start"`). Also places a PLAIN label's box —
+   *  `"middle"` centres it on the anchor — with the CSS transform derived to match (#204). */
   textAnchor?: TextAnchor;
   /** Oriented labels only: flip 180° to keep text upright (radial-tree readability flip). */
   keepUpright?: boolean;
