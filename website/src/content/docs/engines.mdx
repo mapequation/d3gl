@@ -126,15 +126,16 @@ It is **opt-in**, and it is a quality/size dial rather than a free win:
   One consequence: a glyph's bake is sub-pixel on screen, but a `toSVG()` export magnified far
   past 1:1 shows it as the polygon it is (a 16px pie is a ~13-gon).
 
-Measured on the [ancestral ranges](/d3gl/examples/ancestral-ranges/) example at its largest
-setting (512 tips, 2,208 drawables): the geometry the layers retain (vertex, index, and anchor
+Measured on the [ancestral ranges](/d3gl/examples/ancestral-ranges/) example in the rectangular
+layout with 512 tips (2,208 drawables): the geometry the layers retain (vertex, index, and anchor
 buffers) at the default tolerance and at `curveTolerance: 0.25 / 40`:
 
-| coords | links | geometry at the default | at `0.25 / 40` |
-| --- | --- | --- | --- |
-| screen (pies are anchored glyphs) | step (straight) | 1.18 MB | 1.18 MB — nothing refines |
-| screen (pies are anchored glyphs) | bump (curves) | 1.49 MB | 4.87 MB — only the links refine |
-| world (pies scale with zoom) | bump (curves) | 0.98 MB | 5.54 MB — links and pies refine |
+| layout | coords | links | geometry at the default | at `0.25 / 40` |
+| --- | --- | --- | --- | --- |
+| rectangular | screen (pies are anchored glyphs) | step (straight) | 1.18 MB | 1.18 MB — nothing refines |
+| radial | screen (pies are anchored glyphs) | step (arcs) | 1.18 MB | 1.29 MB — only the link arcs refine |
+| rectangular | screen (pies are anchored glyphs) | bump (curves) | 1.49 MB | 4.87 MB — only the links refine |
+| rectangular | world (pies scale with zoom) | bump (curves) | 0.98 MB | 5.54 MB — links and pies refine |
 
 Pick the smallest `MAX_ZOOM` your chart actually allows.
 

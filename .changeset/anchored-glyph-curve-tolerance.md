@@ -12,8 +12,9 @@ at any zoom. Those glyphs now keep the default 0.25px bake, or a coarser one if 
 `sizeMode` layer drawn without anchors. The rule applies on WebGL, Canvas and SVG, to network pies
 and halos, and to the WebGL `toSVG()` export of network pies.
 
-This saves memory: the website ancestral-ranges example (screen pies, step links) at
-`curveTolerance: 0.25 / 40` drops from 5.0 MB to 1.2 MB of geometry, the same as at the default.
+This saves memory: the website ancestral-ranges example (rectangular layout, 512 tips, screen pies,
+step links) at `curveTolerance: 0.25 / 40` drops from 5.0 MB to 1.2 MB of geometry, the same as at
+the default.
 Charts that don't set `curveTolerance` bake exactly the same geometry as before. A glyph's bake is
 sub-pixel on screen, but a vector export magnified far past 1:1 shows it as a polygon.
 
