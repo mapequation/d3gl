@@ -467,6 +467,7 @@ guard owns the serialize budget: one DOM node per drawable buys parse time, not 
 | multi pass-through: FBO count + gesture skip + resize surface/one cycle (#293) | **WebGL** | `map/passthrough-multi-perf.browser.test.ts` | 25k ×2 layers | `PERF_BROWSER_N` (max 50k) |
 | label placement (`cullLabels`) | — | `labels/__tests__/label-cull-perf.test.ts` | 200k candidates, dense **and** spread | `BENCH_LABEL_CULL` |
 | **`network.labels()` per-frame**, LOD on **and** off, + capped LOD top-k (`importanceOf` once per candidate) | **WebGL** | `network/__tests__/network-labels-perf.browser.test.ts` | 20k nodes, uncapped + `max: 50` | `PERF_BROWSER_N` (max 50k) |
+| state-network **pie highlight**: hover sweep, `select()`, zoom, node-drag; LOD off, and LOD on (no pie emitted until #174 — pins its removal) | **WebGL** | `network/__tests__/state-network-pie-highlight-perf.browser.test.ts` | 20k physical nodes / 32k wedges | `PERF_BROWSER_N` (max 100k) |
 
 **Known holes, tracked:** geo's at-scale leg is Canvas-only (#264). The GPU layout tick guard is capped
 at `PERF_BROWSER_N` ≤ 200k (a SwiftShader 1M tick would spend the tier's 300 s per-file budget), so the
