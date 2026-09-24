@@ -57,10 +57,17 @@ export class WebGLBackend implements Backend {
   /** Export-only geometry stash (#200): the vector view of what the {@link instanced} lanes drew.
    *  Never rendered (the GPU already drew it) — appended after the retained layers in {@link toSVG}. */
   private exportLayers: readonly VectorLayer[] = [];
+  /**
+   * The export/readback target behind {@link toPNG} and {@link readPixel} — and nothing else: the
+   * live view renders into the canvas's own stencil-backed drawing buffer (that is where `clipTo`
+   * clips), pass-through accumulates in {@link pt}, pick in {@link pickFbo}. Created by the first
+   * reader ({@link ensureOffscreen}) and kept until {@link resize} or {@link destroy} (#88), so a
+   * chart that never exports never pays its width×height×8 bytes (RGBA8 + depth24-stencil8).
+   */
+  private offscreen: Framebuffer | null = null;
 
   private constructor(
     private readonly device: Device,
-    private offscreen: Framebuffer,
     private width: number,
     private height: number,
   ) {
@@ -83,13 +90,7 @@ export class WebGLBackend implements Backend {
       // render path can clip via the stencil test (WebGL defaults stencil:false).
       webgl: { stencil: true },
     });
-    const offscreen = device.createFramebuffer({
-      width: opts.width,
-      height: opts.height,
-      colorAttachments: ["rgba8unorm"],
-      depthStencilAttachment: "depth24plus-stencil8",
-    });
-    return new WebGLBackend(device, offscreen, opts.width, opts.height);
+    return new WebGLBackend(device, opts.width, opts.height);
   }
 
   setLayers(newLayers: RenderLayer[]): void {
@@ -362,8 +363,9 @@ export class WebGLBackend implements Backend {
 
   /** Resize the onscreen canvas drawing buffer (luma owns it via useDevicePixels), recompute
    *  the clip matrix at the new size, push the new viewport to every renderer (screen-mode point
-   *  sizing) and recreate the offscreen export framebuffer. The engine re-pushes layers + renders
-   *  after. Globe mode reads this.width/height per draw, so it follows automatically. */
+   *  sizing) and release the export framebuffer, which the next export recreates at the new size.
+   *  The engine re-pushes layers + renders after. Globe mode reads this.width/height per draw, so it
+   *  follows automatically. */
   resize(width: number, height: number): void {
     if (width === this.width && height === this.height) return;
     this.width = width;
@@ -384,15 +386,11 @@ export class WebGLBackend implements Backend {
       r.setTransform(this.clipMatrix);
       r.setViewport(width, height);
     }
-    // The offscreen export/readback FBO is fixed-size; recreate it at the new size (mirrors the
-    // globe's destroy+recreate idiom rather than relying on Framebuffer.resize).
-    this.offscreen.destroy();
-    this.offscreen = this.device.createFramebuffer({
-      width,
-      height,
-      colorAttachments: ["rgba8unorm"],
-      depthStencilAttachment: "depth24plus-stencil8",
-    });
+    // The export/readback FBO is fixed-size and useless at the old size: free it now and let the
+    // next toPNG()/readPixel() recreate it (#88). Reallocating here, as this used to, paid a
+    // width×height×8-byte allocation on every resize step for a target most charts never read.
+    this.offscreen?.destroy();
+    this.offscreen = null;
     this.bakeDirty = true;
     // The pick FBO is device-px and size-checked in ensurePickFbo (recreated on mismatch); just mark stale.
     this.pickDirty = true;
@@ -496,9 +494,27 @@ export class WebGLBackend implements Backend {
   toPNG(): string {
     // The stashed labels (#219) are composited onto the readback by png.ts's 2D pass, so the
     // export shows what the screen shows (canvas + HTML overlay). Export-time cost only.
-    if (this.globe) { this.drawGlobeInto(this.offscreen); return toPNG(this.device, this.offscreen, this.width, this.height, this.textData); }
-    this.drawInto(this.offscreen);
-    return toPNG(this.device, this.offscreen, this.width, this.height, this.textData);
+    const fb = this.ensureOffscreen();
+    if (this.globe) this.drawGlobeInto(fb);
+    else this.drawInto(fb);
+    return toPNG(this.device, fb, this.width, this.height, this.textData);
+  }
+
+  /**
+   * The export/readback target, created on first use (#88). CSS px, deliberately NOT device px like
+   * {@link ensurePickFbo}: `toPNG()` (png.ts) reads back exactly `width × height` and `readPixel()`
+   * addresses it in CSS px from a bottom-left origin, so a dpr-scaled target would crop the PNG and
+   * shift readPixel. The depth24-stencil8 attachment is what `clipTo` layers clip against in export.
+   * Only {@link resize} and {@link destroy} release it, so it is always at the current size.
+   */
+  private ensureOffscreen(): Framebuffer {
+    this.offscreen ??= this.device.createFramebuffer({
+      width: this.width,
+      height: this.height,
+      colorAttachments: ["rgba8unorm"],
+      depthStencilAttachment: "depth24plus-stencil8",
+    });
+    return this.offscreen;
   }
 
   toSVG(): string {
@@ -578,10 +594,11 @@ export class WebGLBackend implements Backend {
     return [p[0]!, p[1]!, p[2]!, p[3]!];
   }
 
-  /** Read a pixel from the offscreen framebuffer (renders first). Flips y for WebGL origin. */
+  /** Read a pixel from the offscreen export framebuffer (renders first). Flips y for WebGL origin. */
   readPixel(x: number, y: number): number[] {
-    this.drawInto(this.offscreen);
-    const p = this.device.readPixelsToArrayWebGL(this.offscreen, {
+    const fb = this.ensureOffscreen();
+    this.drawInto(fb);
+    const p = this.device.readPixelsToArrayWebGL(fb, {
       sourceX: Math.floor(x),
       sourceY: Math.floor(this.height - 1 - y),
       sourceWidth: 1,
@@ -607,7 +624,8 @@ export class WebGLBackend implements Backend {
     this.picker = null;
     this.pickFbo?.destroy();
     this.pickFbo = null;
-    this.offscreen.destroy();
+    this.offscreen?.destroy();
+    this.offscreen = null;
     this.device.destroy();
   }
 }

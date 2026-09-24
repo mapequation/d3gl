@@ -424,7 +424,7 @@ layer the sweeps exist to cover — instanced lanes, style-table textures, `upda
 in-place write — only exists on WebGL. A node fake host would make "GPU buffers are updated in
 place" an assertion about the fake, and a node fake *canvas* is precisely the seam
 `canvas-zoom-sweep-perf` already owns. Shared helpers: `packages/d3gl/src/__tests__/engine-sweep.ts`
-(`perfHost`, `zoomSteps`, `sweepFrames`, `GlBufferSpy`). Two things learned building them:
+(`perfHost`, `zoomSteps`, `sweepFrames`, `GlBufferSpy`, `GlSurfaceSpy`). Things learned building them:
 
 - **`GlBufferSpy` counts uploads, not just create/delete — and the upload counter is the one with
   teeth.** Patching `createBuffer`/`deleteBuffer`/`bufferData`/`bufferSubData` on
@@ -435,6 +435,13 @@ place" an assertion about the fake, and a node fake *canvas* is precisely the se
   at 0 and every accessor count stayed flat. Assert it as a **ratio of the registration upload**
   (`< registration / 1000`), not `toBe(0)`, so a future per-frame uniform write isn't a false
   positive while any geometry re-upload is 1000× over.
+- **`GlSurfaceSpy` measures surface memory on the GL calls, never on luma's stats (#88).** luma's
+  `statsManager` is ONE global singleton shared by every device on the page, so an absolute "Texture
+  Memory" says nothing about the backend under test. The spy records each `texStorage2D` (format ×
+  size — luma allocates every 2D texture, attachments included, that way), so "this export target
+  costs W×H×8 bytes" is an exact `toEqual`. Count **releases on `deleteTexture`**, not
+  `deleteFramebuffer`: luma 9.3's `WEBGLFramebuffer.destroy()` never reaches `gl.deleteFramebuffer`
+  (#305), so that count reads 0 even when the attachments — the actual storage — were freed.
 - **Never build a second WebGL engine in the same file after a large one.** Constructing a second
   engine once a first has uploaded a ~100k-node graph stalls `whenReady()` for **9–12 s** on local
   headless Chromium (measured 24 ms → 12,168 ms → 9,251 ms → 20 ms across four sequential engines);
