@@ -7,12 +7,13 @@ import { buildLODTree, buildSpatialLODTree, computeLODGeometry, computeLODPositi
 import { DEFAULT_LABEL_TEXT, type LabelAnchor, type LabelStyle } from "../labels/label-layer.js";
 import { TextMeasurer, canvasFont } from "../labels/measure.js";
 import { buildModuleLODTree, type ModuleLink, type ModuleNode } from "./modules.js";
+import { nestedLayout, type NestedLayoutParams } from "./nested-layout.js";
 import { moduleColors, type ModulePathNode, type ModuleColorOptions } from "./module-colors.js";
 import { physicalPieWedges, type PhysicalPieWedges, type PieWedgeOptions } from "./pie.js";
 import { rosettePositions } from "./rosette.js";
 import { gatherCandidates, descendingByKey, CandidateList, type CandidateSource } from "./label-candidates.js";
 import type { StateNetworkGraph } from "./state-graph.js";
-import { startWorkerLayout, type WorkerLayoutHandle } from "./worker-transport.js";
+import { startNestedWorkerLayout, startWorkerLayout, type WorkerLayoutHandle } from "./worker-transport.js";
 import { startGpuLayout } from "./gpu/gpu-transport.js";
 import { WebGLBackend } from "../webgl/webgl-backend.js";
 import type { NetworkGraph } from "./graph.js";
@@ -35,6 +36,28 @@ export interface NetworkHit {
   aggregate: boolean;
   /** Leaf nodes the target covers — 1 for a leaf, the subtree size for an aggregate. */
   count: number;
+  /**
+   * With a provided module hierarchy (`lod({ modules })`): the target's Infomap path — the module's path
+   * for an aggregate (e.g. `[1, 2]`), the node's full path for a leaf. Lets `labelOf` / click handlers
+   * name a module. Computed when read, O(tree depth).
+   */
+  readonly path?: readonly number[];
+}
+
+/** {@link NetworkHit} on a provided-module tree: `path` is derived from `parent` + `branch` only when read. */
+class ModuleTreeHit implements NetworkHit {
+  constructor(
+    private readonly parent: Int32Array,
+    private readonly branch: Int32Array,
+    private readonly g: number,
+    readonly aggregate: boolean,
+    readonly count: number,
+  ) {}
+  get path(): number[] {
+    const out: number[] = [];
+    for (let g = this.g; g >= 0 && this.parent[g]! >= 0; g = this.parent[g]!) out.push(this.branch[g]!);
+    return out.reverse();
+  }
 }
 
 /**
@@ -225,6 +248,30 @@ export interface NetworkLayoutOptions {
    * O(nodes)) when LOD geometry exists; with LOD off it fits once from the initial extent and holds.
    */
   fit?: boolean;
+  /**
+   * **Nested module layout** (#324) — the "map of modules": with `lod({ modules })` set first, lay the
+   * module tree out top-down, each module's children inside its own disc, arranged only by their
+   * sibling links (the super-edges between them — for an `.ftree` exactly its `*Links` rows, #199).
+   * Every module stays a compact region inside its parent, so the map opens on the top modules and
+   * expands in place; each depth is final, so a streamed layout never oscillates. Runs off-thread on
+   * `backend: "worker"` (streamed top-down, one frame per depth) and synchronously on `"force"`;
+   * `"gpu"` uses the worker until a GPU path exists. Ignored without `lod({ modules })`.
+   *
+   * `true` sizes discs by node flow (leaf count when the graph has none); pass `{ size: "count" }` to
+   * size by leaf count, and `iterations` / `packing` to tune each module's solve.
+   * @see {@link nestedLayout}
+   */
+  nested?: boolean | NestedLayoutConfig;
+}
+
+/** Tuning for {@link NetworkLayoutOptions.nested}. */
+export interface NestedLayoutConfig {
+  /** Disc area by subtree `"flow"` (default; leaf count when the graph has no flow) or leaf `"count"`. */
+  size?: "flow" | "count";
+  /** Force ticks per module solve (default 100). */
+  iterations?: number;
+  /** Fraction of a parent disc its children cover (default 0.45). */
+  packing?: number;
 }
 
 /**
@@ -454,6 +501,12 @@ export class Network extends BaseEngine {
   /** One-shot layout bbox `[minX, minY, maxX, maxY]` for the LOD-off fit fallback: computed once from
    *  positions (no per-frame O(nodes) scan) and held for the run. Null while a LOD tree supplies bounds. */
   private fitFallbackBox: FitBox | null = null;
+  /**
+   * A layout whose final extent is known up front (the nested layout's root disc, #324) frames on it
+   * for the whole stream: its early frames collapse unplaced leaves onto their module centres, so the
+   * live bounds would under-frame the map and then zoom out as depths land.
+   */
+  private fitKnownBox: FitBox | null = null;
   /** Cached top-module ids (the fit nodes, {@link fitNodes}) for the per-frame fit, plus the median scratch
    *  ({@link fitBox}). Recomputed only when the tree identity changes; the scratch is reused across frames. */
   private fitNodesArr: Uint32Array | null = null;
@@ -631,7 +684,7 @@ export class Network extends BaseEngine {
     this.lodHasGeometry = false;
     this.resolvedCache = null;
     this.derivedParentFor = null; this.derivedParent = null; // drop the ancestor-aware parent cache (#162)
-    this.fitFallbackBox = null; this.fitNodesArr = null; this.fitNodesFor = null; // fit caches are tied to the old graph/tree
+    this.fitFallbackBox = null; this.fitKnownBox = null; this.fitNodesArr = null; this.fitNodesFor = null; // fit caches are tied to the old graph/tree
     return this.rebuild();
   }
 
@@ -1049,8 +1102,12 @@ export class Network extends BaseEngine {
       const fit = opts.fit === true && (opts.backend === "worker" || opts.backend === "gpu");
       this.fitOnLayout = fit;
       this.fitFallbackBox = null;
+      this.fitKnownBox = null;
       if (fit) seedPositions(this.graph, this.width, this.height);
-      if (opts.backend === "positions" && opts.positions) {
+      const nestedTree = opts.nested && opts.backend !== "positions" ? this.ensureModuleTree() : undefined;
+      if (nestedTree) {
+        this.startNestedLayout(nestedTree, opts);
+      } else if (opts.backend === "positions" && opts.positions) {
         this.graph.positions.set(opts.positions);
         // The edge-less spatial tree's topology depends on the positions, so drop it to rebuild from
         // the new coordinates (the coarsening tree is position-independent and is kept).
@@ -1113,21 +1170,7 @@ export class Network extends BaseEngine {
         // `layout`), build the module tree up front and hand it to the GPU seed so the layout is laid
         // out top-down over the modules. Build it once here and adopt it as the LOD tree — the settle
         // handler's recomputeLODGeometry then only fills its geometry (it skips the rebuild).
-        let moduleTopology: LODTree | undefined;
-        if (this.lodOptions?.modules) {
-          if (!this.lodTree || !this.lodModules) {
-            this.lodTree = buildModuleLODTree(
-              this.graph.nodeCount,
-              this.lodOptions.modules,
-              this.graph,
-              this.lodOptions.moduleLinks,
-            );
-            this.lodModules = true;
-            this.lodSpatial = false;
-            this.lodHasGeometry = false;
-          }
-          moduleTopology = this.lodTree;
-        }
+        const moduleTopology = this.ensureModuleTree();
         const devicePromise = this.whenBackendSettled().then(() => this.gpuDevice());
         const handle = startGpuLayout(devicePromise, this.graph, {
           width: this.width,
@@ -1171,6 +1214,58 @@ export class Network extends BaseEngine {
       }
     }
     return this.rebuild();
+  }
+
+  /**
+   * The provided-module LOD tree (built now if needed and adopted as the LOD tree), or `undefined`
+   * without `lod({ modules })`. Shared by the layouts that consume the module tree up front — the GPU
+   * module-aware seed (N8.2) and the nested layout (#324); the settle handler's recomputeLODGeometry
+   * then only fills its geometry.
+   */
+  private ensureModuleTree(): LODTree | undefined {
+    if (!this.graph || !this.lodOptions?.modules) return undefined;
+    if (!this.lodTree || !this.lodModules) {
+      this.lodTree = buildModuleLODTree(
+        this.graph.nodeCount,
+        this.lodOptions.modules,
+        this.graph,
+        this.lodOptions.moduleLinks,
+      );
+      this.lodModules = true;
+      this.lodSpatial = false;
+      this.lodHasGeometry = false;
+    }
+    return this.lodTree;
+  }
+
+  /** Nested module layout (#324): off-thread + streamed per depth on worker/gpu, synchronous on force. */
+  private startNestedLayout(tree: LODTree, opts: NetworkLayoutOptions): void {
+    const graph = this.graph;
+    const { parent } = tree;
+    if (!graph || !parent) return; // provided module trees always carry their parent map
+    const topology = { ...tree, parent };
+    const cfg = typeof opts.nested === "object" ? opts.nested : {};
+    const radius = 10 * Math.sqrt(graph.nodeCount); // the root disc, centred on the origin
+    this.fitKnownBox = [-radius, -radius, radius, radius];
+    const params: NestedLayoutParams = {
+      radius,
+      iterations: cfg.iterations,
+      packing: cfg.packing,
+      size: (cfg.size ?? "flow") === "flow" ? (graph.flow ?? undefined) : undefined,
+    };
+    if (opts.backend === "worker" || opts.backend === "gpu") {
+      const handle = startNestedWorkerLayout(graph, topology, params, () => this.scheduleLayoutRepaint());
+      this.layoutHandle = handle;
+      void handle.settled.then(() => {
+        if (this.layoutHandle !== handle) return; // a newer layout superseded this one
+        this.recomputeLODGeometry(true);
+        this.releaseFit(); // final reframe on the settled bounds, then hand the view to zoom/pan
+        this.rebuild();
+      });
+    } else {
+      graph.positions.set(nestedLayout(topology, params).positions);
+      this.recomputeLODGeometry(); // synchronous solve is done
+    }
   }
 
   /** Post-layout bookkeeping for state-network mode (#171/#182), shared by every backend and every
@@ -1374,6 +1469,7 @@ export class Network extends BaseEngine {
    * (the layout stays roughly framed as it refines; use LOD for continuous reframing). Null if unavailable.
    */
   private layoutFitBox(graph: NetworkGraph): FitBox | null {
+    if (this.fitKnownBox) return this.fitKnownBox;
     // Preferred: a fling-out-robust box over the top modules ({@link fitBox}) — O(top modules), refreshed
     // each frame from the live geometry. The fit nodes are cached per tree identity (the scratch too), so
     // the per-frame work is O(top modules), not O(tree size).
@@ -1622,7 +1718,11 @@ export class Network extends BaseEngine {
   }
 
   private lodDatum(tree: LODTree, g: number): NetworkHit {
-    return { aggregate: g >= tree.leafCount, count: tree.count[g]! };
+    const aggregate = g >= tree.leafCount;
+    const count = tree.count[g]!;
+    return tree.branch && tree.parent
+      ? new ModuleTreeHit(tree.parent, tree.branch, g, aggregate, count)
+      : { aggregate, count };
   }
 
   /**

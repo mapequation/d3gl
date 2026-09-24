@@ -11,6 +11,7 @@
 import type { ForceParams } from "./force.js";
 import type { CoarsenOptions } from "./coarsen.js";
 import type { LODTopology } from "./lod.js";
+import type { NestedLayoutParams, NestedLayoutTopology } from "./nested-layout.js";
 
 /** Kick off a layout run. Edge buffers are copied to the worker; the main thread keeps its own. */
 export interface StartMessage {
@@ -65,7 +66,18 @@ export interface UnpinMessage {
   type: "unpin";
 }
 
-export type MainToWorker = StartMessage | StopMessage | PinMessage | UnpinMessage;
+/**
+ * Run the nested module layout (#324) instead of a force layout. The worker posts one `frame` per
+ * finished depth (`tick` = depth, positions always copied — there are only tree-depth many) and a
+ * final `done`.
+ */
+export interface NestedStartMessage {
+  type: "start-nested";
+  topology: NestedLayoutTopology;
+  params: NestedLayoutParams;
+}
+
+export type MainToWorker = StartMessage | StopMessage | PinMessage | UnpinMessage | NestedStartMessage;
 
 /**
  * The LOD tree, posted once after the worker coarsens (only when `lod` was requested). `topology`'s
