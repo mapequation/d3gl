@@ -27,7 +27,7 @@ const VIEW = { Physical: "physical", State: "state", Both: "both" } as const;
  * (main-thread, synchronous), **Worker** (off-thread, progressive), or **GPU** (WebGL2 Barnes-Hut,
  * falling back to Worker when unavailable) — and derives the rosette from it each streamed frame (#182);
  * it also **scales the layout to fill the view** once settled, so it opens framed — no fit-transform.
- * Scroll to zoom, drag to pan.
+ * Scroll to zoom, drag to pan; dragging a node moves it, and ⌘/Ctrl-drag pans even over a node (#178).
  */
 export const setup: ImperativeSetup = (host, { width, height, backend }) => {
   const net = network(host, { width, height, backend });

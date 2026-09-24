@@ -36,7 +36,8 @@ environment supports it and whether this layout is actually using it.) The **Nod
 1,000,000; **Seeding** compares multilevel against a cold start; **Size** switches uniform vs
 degree-weighted radius; **Sizing** switches world vs screen units; **LOD** / **Declutter** control the
 level-of-detail cut (below); and **Edges** turns the links off entirely (next section). Drag to pan,
-scroll to zoom.
+scroll to zoom. Dragging a node moves it, so hold **⌘** (**Ctrl** on Windows/Linux) to pan over nodes.
+See [Dragging nodes](#dragging-nodes).
 
 <ExampleCard files={["network/draw.ts", "network/data.ts"]}>
   <Network client:visible slot="demo" />
@@ -516,6 +517,14 @@ extra wiring.
 net.interactive({ draggable: true, selectable: { multi: true }, hover: true });
 net.enableZoom([0.002, 200]); // pan/zoom; a drag starting on a node moves it instead of panning
 ```
+
+On a **dense** graph almost every press lands on a node, so there is hardly any empty space left to pan
+from. Hold **⌘** (on macOS/iOS; **Ctrl** on Windows and Linux) while you drag and the drag **always pans**,
+even when it starts on a node. No node is grabbed and the layout doesn't reheat. The key is built in and
+detected once per platform, so you don't set anything up. It applies wherever `enableZoom()` is on,
+including `plot()` and a flat-projection `geoMap()`. A ⌘/Ctrl-**click** still toggles the node in a
+multi-selection. The other modifiers keep their meaning: **shift** draws the marquee and **option/alt**
+subtracts from it. (Ctrl can't be the pan key on a Mac because ctrl-click opens the context menu there.)
 
 What moves depends on what you grab:
 

@@ -492,6 +492,38 @@ Consequences worth remembering before "fixing" a layout complaint:
   `<div>` collapses to zero height and the map overlaps whatever follows it. Stable, not a shift —
   but it is why examples and docs always size the host.
 
+## Pan vs node-drag: ONE gate, and the zoom filter is on the wheel path (#140, #178)
+
+Two listeners decide who owns a press, and they must agree. d3-zoom starts a pan from its
+`.filter()` on **`mousedown`**, while node-drag starts from `onPointerDown` on **`pointerdown`**.
+Both call the one predicate `BaseEngine.grabTarget(e)`. They used to carry separate modifier checks,
+and they drifted apart: the filter ignored ⌘, so a ⌘-drag on a node was declined by d3-zoom and
+skipped by node-drag, and nothing happened. Don't give either listener its own modifier logic again.
+
+- **The force-pan modifier** (`map/pan-modifier.ts`, `PAN_MODIFIER`) is ⌘ on Apple platforms and Ctrl
+  elsewhere, detected once. It is not an option. The protected `panModifier` field exists so a test
+  subclass can pin the other platform's key (`network/__tests__/network-force-pan.browser.test.ts`).
+  Ctrl can't be the key on a Mac, because ctrl-click opens the context menu there. That's also why
+  d3-zoom refuses Ctrl by default, and the filter re-admits it only where Ctrl is the pan key.
+- **d3-zoom runs the filter on every wheel tick**, which puts it on the zoom path. Keep the
+  `press` type guard ahead of `grabTarget`, so a wheel event never reaches `pickDraggable`. On a
+  `pickLinks()` lane, a node miss in that pick is a synchronous GPU readback. The force-pan test
+  counts draggable picks across a wheel sweep (expected: 0), and removing the guard makes it fail
+  with 8.
+- **A mouse press is not a gesture until it moves the view.** d3-zoom emits `start` on every
+  mousedown its filter admits, moved or not, and the gesture boundary is expensive:
+  `setInteracting(true/false)` clears hover, re-pushes hideOnInteraction layers (O(all retained
+  drawables), twice), snapshots and settles the pass-through surface, releases a streaming
+  fit-on-layout, and on a Canvas/SVG network the end re-registers the whole Scene (1.3 s per click
+  at 50k nodes / 100k edges). So `enableZoom` defers a `mousedown`-sourced start to the first
+  `zoom` event that changes the transform, and a click that never moved opens no gesture. Wheel,
+  dblclick, touch and programmatic starts still open at once. This matters more since #178 lets a
+  ⌘/Ctrl-click, the multi-select toggle, through to d3-zoom. Guarded by the `opens NO gesture`
+  cases in `network-force-pan.browser.test.ts`, which count `setInteracting(true)` and
+  `syncScreenGeometry()` on all three backends.
+- Touch is still unresolved: a `touchstart` has no `button`, skips the gate, and pans while
+  `onPointerDown` grabs the node (#301).
+
 ## What the Scene hands out is SHARED, not a snapshot (#207, #208, #280)
 
 Every array `Scene` returns is owned by the Scene and reused across calls — `styleTables()` and

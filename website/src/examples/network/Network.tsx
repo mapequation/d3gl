@@ -4,7 +4,7 @@ import { setup } from "./draw.js";
 
 /** Harness for the raw-network example: a node-count slider, Directed/Undirected and uniform/
  *  degree-weighted node-size toggles, and a seeding toggle. Rendering is WebGL-instanced (points +
- *  lines + arrowheads); scroll to zoom, drag to pan. */
+ *  lines + arrowheads); scroll to zoom, drag to pan (⌘/Ctrl-drag pans over nodes too). */
 export default function Network() {
   return (
     <Example
