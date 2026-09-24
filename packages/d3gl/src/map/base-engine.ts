@@ -1968,6 +1968,8 @@ export abstract class BaseEngine {
   enableZoom(extent: [number, number] = [1, 100], onTransform?: (t: ViewTransform) => void): this {
     this.disableInteraction();
     const sel = select<Element, unknown>(this.host);
+    /** d3-zoom started a gesture on a mousedown that has not moved the view yet (see `start` below). */
+    let pressPending = false;
     const behavior = d3zoom<Element, unknown>().scaleExtent(extent)
       // d3-zoom calls this for `wheel`, `mousedown`, `dblclick` and `touchstart` (a TouchEvent has no
       // `button`), and for EVERY wheel tick — the zoom path — so a wheel must never reach a hit-test.
@@ -1994,12 +1996,27 @@ export abstract class BaseEngine {
       // hideOnInteraction layers, re-baked Canvas/SVG networks and released a streaming fit on its first
       // frame. The end of a real gesture that a re-seed interrupts (a dblclick zoom transition) still
       // carries its source event, so it still ends the gesture.
+      // And a MOUSE press only becomes a gesture once it moves the view (#178). d3-zoom starts one on every
+      // mousedown its filter admits, moved or not — so a ⌘/Ctrl-click (the multi-select toggle, which no
+      // longer grabs) or a click on empty space would pay the whole gesture boundary: clear hover,
+      // re-push hideOnInteraction layers, snapshot + settle the pass-through surface, release a streaming
+      // fit, and on a Canvas/SVG network re-register the entire Scene. Every other user source (wheel,
+      // dblclick, touch) is followed by its zoom at once, so it starts as before.
       .on("start", (e: D3ZoomEvent<Element, unknown>) => {
-        if (e.sourceEvent) this.setInteracting(true);
+        if (!e.sourceEvent) return;
+        pressPending = e.sourceEvent instanceof MouseEvent && e.sourceEvent.type === "mousedown";
+        if (!pressPending) this.setInteracting(true);
       })
       .on("zoom", (e: D3ZoomEvent<Element, unknown>) => {
         if (this.suppressZoomEmit) return; // a programmatic syncZoomToView() re-seed — don't recurse
-        this.frameZoom = { k: e.transform.k, x: e.transform.x, y: e.transform.y };
+        const t: ViewTransform = { k: e.transform.k, x: e.transform.x, y: e.transform.y };
+        if (pressPending) {
+          const c = this.latestTransform();
+          if (t.k === c.k && t.x === c.x && t.y === c.y) return; // a press that has not moved the view yet
+          pressPending = false;
+          this.setInteracting(true);
+        }
+        this.frameZoom = t;
         // Continuous input — wheel ticks, a pan's mouse or touch moves — can deliver several events per
         // frame: keep the latest and draw it once, in the engine's next frame (#367). A d3-zoom transition
         // (a double-click zoom) already ticks once per animation frame, and a frame requested from inside
@@ -2009,6 +2026,8 @@ export abstract class BaseEngine {
       })
       .on("end", (e: D3ZoomEvent<Element, unknown>) => {
         if (!e.sourceEvent) return;
+        // A press that never moved the view opened no gesture and left nothing to draw.
+        if (pressPending) { pressPending = false; return; }
         this.flushFrame(); // the gesture settles on its last transform, drawn
         this.setInteracting(false);
       });
@@ -2274,8 +2293,9 @@ export abstract class BaseEngine {
    * both the d3-zoom filter (which declines the pan) and {@link onPointerDown} (which starts the drag)
    * consult, so they cannot disagree about who owns a gesture — they used to, and a ⌘-drag on a node
    * did nothing at all (#178). Only a plain primary press grabs: shift is the marquee (#159), and Ctrl
-   * and ⌘ pan instead, even over a glyph — they include the force-pan modifier ({@link panModifier}) on
-   * every platform. The keys are read BEFORE the hit-test, so a force-pan press costs no pick.
+   * and ⌘ never grab. Whether they PAN is the filter's call: ⌘ wherever d3-zoom admits it, Ctrl only
+   * where it is the platform's force-pan modifier ({@link panModifier}) — on a Mac a Ctrl-press neither
+   * pans nor grabs. The keys are read BEFORE the hit-test, so a modified press costs no pick.
    */
   private grabTarget(e: MouseEvent): HoverHit | null {
     if (e.button !== 0 || e.shiftKey || e.ctrlKey || e.metaKey) return null;
