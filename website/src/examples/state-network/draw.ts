@@ -88,7 +88,7 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
         directed: true,
         sizeMode: view === "both" || options.sizing === "World" ? "world" : "screen",
         linkStyle: halfArrow ? "half-arrow" : "line",
-        linkBend: halfArrow ? 14 : 0.15, // half-arrow: world-unit bow; line: fraction of chord — both bent
+        linkBend: 0.15, // fraction of the link's length, for half-arrows and lines alike
         linkStroke: physical ? "rgba(90,110,150,0.5)" : "rgba(120,132,156,0.32)",
         linkWidth: physical ? { by: "weight", scale: scaleSqrt().domain([0, 8]).range([1, 6]).clamp(true) } : 1,
         nodeBorder: view === "both" ? undefined : { width: 1, color: "#000000" },

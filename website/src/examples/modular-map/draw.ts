@@ -115,7 +115,7 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
         nodeFill: (i) => colors[i]!, // categorical module colour
         // Ring ∝ enter/exit flow; colour omitted ⇒ a darker shade of each glyph's own module colour.
         flowBorder: { flow: enterExit, scale: ringW },
-        linkBend: 14, // px (screen mode)
+        linkBend: 0.15, // fraction of the link's length — keeps its shape at every zoom
         linkWidth: linkW, // half-arrow width ∝ link flow; super-edges use accumulated flow
         linkStroke, // semi-transparent blue, alpha ∝ flow
       });

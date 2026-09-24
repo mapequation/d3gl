@@ -3,7 +3,7 @@ import { scaleLinear } from "d3-scale";
 import type { ImperativeSetup } from "../types.js";
 import { buildReplica, REPLICA_BOUNDS, NODE_FILL_RANGE, NODE_BORDER_RANGE, LINK_RANGE } from "./data.js";
 
-const BENDS = [0, 15, 30, 45, 60]; // the Bend slider's stops (absolute world-unit ⟂ offset)
+const BENDS = [0, 0.07, 0.14, 0.21, 0.28]; // the Bend slider's stops (⟂ offset as a fraction of the chord)
 
 /**
  * The **flow-border + half-arrow** glyph style (the `network-rendering` look), shown on the reference
@@ -38,8 +38,8 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
   return {
     engine: net,
     render: (options) => {
-      const bend = BENDS[(options.bend as number) ?? 2] ?? 30;
-      // World (default): radii/widths/bend are world units and scale with zoom (the reference is a fixed
+      const bend = BENDS[(options.bend as number) ?? 2] ?? 0.14;
+      // World (default): radii/widths are world units and scale with zoom (the reference is a fixed
       // publication layout). Screen: they're constant pixels as you zoom, while the nodes still move
       // apart/together — the navigation register LOD wants. (Screen-mode half-arrows are WebGL-only.)
       const sizeMode = options.sizing === "Screen" ? "screen" : "world";

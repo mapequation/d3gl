@@ -20,8 +20,15 @@
  *
  * The {@link HalfLinkParams.bend} is an **absolute perpendicular offset in world units** (as in the
  * reference), not a fraction of the chord; the side it bows to is derived from the link direction so
- * reciprocal links are consistent without the caller tracking which is which.
+ * reciprocal links are consistent without the caller tracking which is which. d3gl's `linkBend` is a
+ * **fraction of the chord** (#296) — callers convert it with {@link chordBend} in the space they solve
+ * in, so a link keeps its shape at every zoom in both size modes.
  */
+
+/** Absolute half-link bend for a chord-fraction `bend` (#296): `bend`·|centre chord|, as the half-arrow shader computes it. */
+export function chordBend(x0: number, y0: number, x1: number, y1: number, bend: number): number {
+  return bend * Math.hypot(x1 - x0, y1 - y0);
+}
 
 /** Quadratic-bezier control point for a bent link: chord midpoint offset ⟂ by `bend`·|chord| — matches the strip shader. */
 export function bezierControl(sx: number, sy: number, tx: number, ty: number, bend: number): [number, number] {

@@ -11,7 +11,7 @@ import type {
 import { PathRecorder } from "./path-recorder.js";
 import { DEFAULT_CURVE_TOLERANCE } from "./flatten.js";
 import { DEFAULT_MITER_LIMIT } from "./stroke.js";
-import { bezierControl, bentEndTangent, straightUnit, halfLinkGeometry, traceHalfLink, scaleHalfLink } from "./half-link.js";
+import { bezierControl, bentEndTangent, straightUnit, halfLinkGeometry, traceHalfLink, scaleHalfLink, chordBend } from "./half-link.js";
 import type { Subpath } from "./path-context.js";
 
 /**
@@ -200,16 +200,20 @@ export function halfArrowsToDrawables(h: InstancedHalfArrowsData, bake = 1): Dra
   const inv = 1 / bake;
   const out: DrawableVector[] = [];
   for (let e = 0; e < h.count; e++) {
+    const x0 = (h.sources[e * 2] ?? 0) * bake;
+    const y0 = (h.sources[e * 2 + 1] ?? 0) * bake;
+    const x1 = (h.targets[e * 2] ?? 0) * bake;
+    const y1 = (h.targets[e * 2 + 1] ?? 0) * bake;
     const geom = halfLinkGeometry({
-      x0: (h.sources[e * 2] ?? 0) * bake,
-      y0: (h.sources[e * 2 + 1] ?? 0) * bake,
+      x0,
+      y0,
       r0: h.radii[e * 2] ?? 0,
-      x1: (h.targets[e * 2] ?? 0) * bake,
-      y1: (h.targets[e * 2 + 1] ?? 0) * bake,
+      x1,
+      y1,
       r1: h.radii[e * 2 + 1] ?? 0,
       width: h.widths[e * 2] ?? 0,
       oppositeWidth: h.widths[e * 2 + 1] ?? 0,
-      bend: h.bends[e] ?? 0,
+      bend: chordBend(x0, y0, x1, y1, h.bends[e] ?? 0),
     });
     if (!geom) continue;
     const g = bake === 1 ? geom : scaleHalfLink(geom, inv);
