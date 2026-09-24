@@ -1647,6 +1647,8 @@ export abstract class BaseEngine {
   enableZoom(extent: [number, number] = [1, 100], onTransform?: (t: ViewTransform) => void): this {
     this.disableInteraction();
     const sel = select<Element, unknown>(this.host);
+    /** d3-zoom started a gesture on a mousedown that has not moved the view yet (see `start` below). */
+    let pressPending = false;
     const behavior = d3zoom<Element, unknown>().scaleExtent(extent)
       // d3-zoom calls this for `wheel`, `mousedown`, `dblclick` and `touchstart` (a TouchEvent has no
       // `button`), and for EVERY wheel tick — the zoom path — so a wheel must never reach a hit-test.
@@ -1667,10 +1669,25 @@ export abstract class BaseEngine {
         const forcePan = press && e[this.panModifier];
         return (!e.ctrlKey || wheel || forcePan) && !button;
       })
-      .on("start", () => this.setInteracting(true))
+      // A MOUSE press only becomes a gesture once it moves the view (#178). d3-zoom starts one on every
+      // mousedown its filter admits, moved or not — so a ⌘/Ctrl-click (the multi-select toggle, which no
+      // longer grabs) or a click on empty space would pay the whole gesture boundary: clear hover,
+      // re-push hideOnInteraction layers, snapshot + settle the pass-through surface, release a streaming
+      // fit, and on a Canvas/SVG network re-register the entire Scene. Every other source (wheel,
+      // dblclick, touch, a programmatic re-seed) is followed by its zoom at once, so it starts as before.
+      .on("start", (e: D3ZoomEvent<Element, unknown>) => {
+        if (e.sourceEvent instanceof MouseEvent && e.sourceEvent.type === "mousedown") pressPending = true;
+        else this.setInteracting(true);
+      })
       .on("zoom", (e: D3ZoomEvent<Element, unknown>) => {
         if (this.suppressZoomEmit) return; // a programmatic syncZoomToView() re-seed — don't recurse
         const t: ViewTransform = { k: e.transform.k, x: e.transform.x, y: e.transform.y };
+        if (pressPending) {
+          const c = this.transform;
+          if (t.k === c.k && t.x === c.x && t.y === c.y) return; // a press that has not moved the view yet
+          pressPending = false;
+          this.setInteracting(true);
+        }
         this.inZoomGesture = true;
         try {
           this.setTransform(t);
@@ -1679,7 +1696,10 @@ export abstract class BaseEngine {
         }
         onTransform?.(t);
       })
-      .on("end", () => this.setInteracting(false));
+      .on("end", () => {
+        pressPending = false;
+        this.setInteracting(false); // a no-op for a press that never moved: it never started
+      });
     sel.call(behavior);
     this.zoomSel = sel;
     this.zoomBehavior = behavior;
@@ -1929,8 +1949,9 @@ export abstract class BaseEngine {
    * both the d3-zoom filter (which declines the pan) and {@link onPointerDown} (which starts the drag)
    * consult, so they cannot disagree about who owns a gesture — they used to, and a ⌘-drag on a node
    * did nothing at all (#178). Only a plain primary press grabs: shift is the marquee (#159), and Ctrl
-   * and ⌘ pan instead, even over a glyph — they include the force-pan modifier ({@link panModifier}) on
-   * every platform. The keys are read BEFORE the hit-test, so a force-pan press costs no pick.
+   * and ⌘ never grab. Whether they PAN is the filter's call: ⌘ wherever d3-zoom admits it, Ctrl only
+   * where it is the platform's force-pan modifier ({@link panModifier}) — on a Mac a Ctrl-press neither
+   * pans nor grabs. The keys are read BEFORE the hit-test, so a modified press costs no pick.
    */
   private grabTarget(e: MouseEvent): HoverHit | null {
     if (e.button !== 0 || e.shiftKey || e.ctrlKey || e.metaKey) return null;

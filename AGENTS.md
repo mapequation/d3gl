@@ -510,6 +510,17 @@ skipped by node-drag, and nothing happened. Don't give either listener its own m
   `pickLinks()` lane, a node miss in that pick is a synchronous GPU readback. The force-pan test
   counts draggable picks across a wheel sweep (expected: 0), and removing the guard makes it fail
   with 8.
+- **A mouse press is not a gesture until it moves the view.** d3-zoom emits `start` on every
+  mousedown its filter admits, moved or not, and the gesture boundary is expensive:
+  `setInteracting(true/false)` clears hover, re-pushes hideOnInteraction layers (O(all retained
+  drawables), twice), snapshots and settles the pass-through surface, releases a streaming
+  fit-on-layout, and on a Canvas/SVG network the end re-registers the whole Scene (1.3 s per click
+  at 50k nodes / 100k edges). So `enableZoom` defers a `mousedown`-sourced start to the first
+  `zoom` event that changes the transform, and a click that never moved opens no gesture. Wheel,
+  dblclick, touch and programmatic starts still open at once. This matters more since #178 lets a
+  ⌘/Ctrl-click, the multi-select toggle, through to d3-zoom. Guarded by the `opens NO gesture`
+  cases in `network-force-pan.browser.test.ts`, which count `setInteracting(true)` and
+  `syncScreenGeometry()` on all three backends.
 - Touch is still unresolved: a `touchstart` has no `button`, skips the gate, and pans while
   `onPointerDown` grabs the node (#301).
 

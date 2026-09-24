@@ -14,6 +14,17 @@ export function panModifierFor(platform: string): PanModifier {
   return /Mac|iPhone|iPad|iPod/.test(platform) ? "metaKey" : "ctrlKey";
 }
 
-/** This platform's force-pan modifier, detected once at load. Without a `navigator` (SSR) it is Ctrl. */
-export const PAN_MODIFIER: PanModifier =
-  typeof navigator === "undefined" ? "ctrlKey" : panModifierFor(navigator.platform || navigator.userAgent);
+/** The navigator fields detection reads — a structural subset, so a test can pass a plain object. */
+export interface PlatformInfo {
+  readonly platform?: string;
+  readonly userAgent?: string;
+}
+
+/** The force-pan modifier for a navigator: `platform`, falling back to `userAgent` when it is empty.
+ *  Without a navigator (SSR) it is Ctrl. */
+export function detectPanModifier(nav: PlatformInfo | undefined): PanModifier {
+  return nav ? panModifierFor(nav.platform || nav.userAgent || "") : "ctrlKey";
+}
+
+/** This platform's force-pan modifier, detected once at load. */
+export const PAN_MODIFIER: PanModifier = detectPanModifier(typeof navigator === "undefined" ? undefined : navigator);

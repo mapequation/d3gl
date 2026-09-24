@@ -1,8 +1,11 @@
 import { describe, it, expect } from "vitest";
 import { Network } from "../network.js";
 import { buildGraph, type NetworkGraph } from "../graph.js";
+import { geoMercator } from "d3-geo";
 import { Plot } from "../../map/plot.js";
+import { GeoMap } from "../../map/geo-map.js";
 import type { HoverHit } from "../../map/base-engine.js";
+import type { BackendType } from "../../map/backend-factory.js";
 import type { ViewTransform } from "../../core/index.js";
 import type { PanModifier } from "../../map/pan-modifier.js";
 
@@ -26,18 +29,34 @@ function host(): HTMLElement {
   return el;
 }
 
-/** A network whose force-pan key is fixed, and which counts the draggable hit-tests it runs. */
+/** A network whose force-pan key is fixed, and which counts the draggable hit-tests it runs, the
+ *  gesture boundaries it opens and the vector re-bakes a gesture end costs. */
 class NetworkProbe extends Network {
   protected override readonly panModifier: PanModifier;
   draggablePicks = 0;
-  constructor(h: HTMLElement, modifier: PanModifier) {
-    super(h, { width: 200, height: 200 });
+  /** Every `setInteracting(true)`: each clears hover, re-pushes hideOnInteraction layers, snapshots the
+   *  pass-through surface and releases a streaming fit-on-layout. */
+  gestureStarts = 0;
+  /** {@link Network.syncScreenGeometry} calls — a gesture end runs one, and on Canvas/SVG it is a full
+   *  re-registration of the network Scene (O(drawn nodes + edges)). */
+  screenSyncs = 0;
+  constructor(h: HTMLElement, modifier: PanModifier, backend?: BackendType) {
+    super(h, backend ? { width: 200, height: 200, backend } : { width: 200, height: 200 });
     this.panModifier = modifier;
   }
   protected override pickDraggable(x: number, y: number): HoverHit | null {
     this.draggablePicks++;
     return super.pickDraggable(x, y);
   }
+  protected override setInteracting(v: boolean): void {
+    if (v) this.gestureStarts++;
+    super.setInteracting(v);
+  }
+  override syncScreenGeometry(): this {
+    this.screenSyncs++;
+    return super.syncScreenGeometry();
+  }
+  resetCounters(): void { this.draggablePicks = this.gestureStarts = this.screenSyncs = 0; }
   /** The engine's live view transform (what is drawn). */
   viewTransform(): ViewTransform { return { ...this.transform }; }
 }
@@ -46,6 +65,15 @@ class PlotProbe extends Plot {
   protected override readonly panModifier: PanModifier;
   constructor(h: HTMLElement, modifier: PanModifier) {
     super(h, { width: 200, height: 200 });
+    this.panModifier = modifier;
+  }
+  viewTransform(): ViewTransform { return { ...this.transform }; }
+}
+
+class GeoMapProbe extends GeoMap {
+  protected override readonly panModifier: PanModifier;
+  constructor(h: HTMLElement, modifier: PanModifier) {
+    super(h, { width: 200, height: 200, projection: geoMercator().scale(30).translate([100, 100]) });
     this.panModifier = modifier;
   }
   viewTransform(): ViewTransform { return { ...this.transform }; }
@@ -75,9 +103,9 @@ function gesture(h: HTMLElement, path: [number, number][], mods: EventModifierIn
 }
 
 /** Nodes 0..2 at (40,40) (100,100) (160,160), radius 8, world == screen, zoom + drag + multi-select on. */
-async function setup(modifier: PanModifier): Promise<{ h: HTMLElement; net: NetworkProbe; g: NetworkGraph }> {
+async function setup(modifier: PanModifier, backend?: BackendType): Promise<{ h: HTMLElement; net: NetworkProbe; g: NetworkGraph }> {
   const h = host();
-  const net = new NetworkProbe(h, modifier);
+  const net = new NetworkProbe(h, modifier, backend);
   await net.whenReady();
   const g = buildGraph({ nodeCount: 3, source: [0, 1], target: [1, 2], directed: false });
   net.data(g).style({ nodeRadius: 8 }).layout({ backend: "positions", positions: new Float32Array([40, 40, 100, 100, 160, 160]) });
@@ -92,6 +120,12 @@ const xy = (g: NetworkGraph, i: number): [number, number] => [g.positions[i * 2]
 const ids = (net: Network) => net.selection().map((s) => Number(s.id)).sort((a, b) => a - b);
 /** Let d3-zoom's wheel-idle timer (150 ms) end its gesture before the engine is torn down. */
 const wheelIdle = () => new Promise<void>((resolve) => setTimeout(resolve, 200));
+/** Outlast d3-zoom's 250 ms dblclick zoom transition. */
+const dblclickDone = () => new Promise<void>((resolve) => setTimeout(resolve, 400));
+function dblclick(h: HTMLElement, x: number, y: number, mods: EventModifierInit = {}): void {
+  const r = h.getBoundingClientRect();
+  h.dispatchEvent(new MouseEvent("dblclick", { clientX: r.left + x, clientY: r.top + y, bubbles: true, button: 0, view: window, ...mods }));
+}
 
 describe("force-pan modifier (#178)", () => {
   for (const modifier of ["metaKey", "ctrlKey"] as const) {
@@ -127,6 +161,37 @@ describe("force-pan modifier (#178)", () => {
       net.destroy();
     });
 
+    for (const backend of ["webgl", "canvas", "svg"] as const) {
+      it(`${label(modifier)}-click on a node opens NO gesture on ${backend}: no re-bake, no fit release`, async () => {
+        // The multi-select click is let through to d3-zoom now (it no longer grabs), and d3-zoom starts a
+        // gesture on every admitted mousedown. A press that never moves the view must not pay the gesture
+        // boundary — on Canvas/SVG its end re-registers the whole network Scene, and its start releases
+        // a streaming fit-on-layout.
+        const { h, net, g } = await setup(modifier, backend);
+        net.resetCounters();
+        gesture(h, [[100, 100]], held(modifier));
+        expect(net.gestureStarts).toBe(0);
+        expect(net.screenSyncs).toBe(0);
+        expect(net.viewTransform()).toEqual({ k: 1, x: 0, y: 0 });
+        expect(xy(g, 1)).toEqual([100, 100]);
+        // The toggle itself is pinned on WebGL above; this fixture's Canvas/SVG click-pick does not select
+        // even without a modifier, so it is not asserted there.
+        if (backend === "webgl") expect(ids(net)).toEqual([1]);
+        net.destroy();
+      });
+
+      it(`${label(modifier)}-drag on a node pans on ${backend}, as ONE gesture`, async () => {
+        const { h, net, g } = await setup(modifier, backend);
+        net.resetCounters();
+        gesture(h, [[40, 40], [20, 30], [0, 20]], held(modifier));
+        expect(net.viewTransform()).toEqual({ k: 1, x: -40, y: -20 });
+        expect(xy(g, 0)).toEqual([40, 40]);
+        expect(net.gestureStarts).toBe(1); // opened on the first move, not once per move
+        expect(net.screenSyncs).toBe(1); // and re-baked once, at its end
+        net.destroy();
+      });
+    }
+
     it(`plain drag is unchanged (${label(modifier)} platform): on a node it grabs, on empty space it pans`, async () => {
       const { h, net, g } = await setup(modifier);
       gesture(h, [[40, 40], [90, 70]]); // plain drag on node 0 → the node follows, the view stays
@@ -158,6 +223,27 @@ describe("force-pan modifier (#178)", () => {
       net.destroy();
     });
   }
+
+  it("a plain click on empty space opens no gesture either (it used to re-bake a Canvas network)", async () => {
+    const { h, net } = await setup("metaKey", "canvas");
+    net.resetCounters();
+    gesture(h, [[190, 10]]);
+    expect(net.gestureStarts).toBe(0);
+    expect(net.screenSyncs).toBe(0);
+    expect(net.viewTransform()).toEqual({ k: 1, x: 0, y: 0 });
+    net.destroy();
+  });
+
+  it("Ctrl+dblclick still does not zoom where Ctrl is the pan key (only a Ctrl PRESS is re-admitted)", async () => {
+    const { h, net } = await setup("ctrlKey");
+    dblclick(h, 190, 10, { ctrlKey: true });
+    await dblclickDone();
+    expect(net.viewTransform()).toEqual({ k: 1, x: 0, y: 0 });
+    dblclick(h, 190, 10); // control: a plain dblclick does zoom
+    await dblclickDone();
+    expect(net.viewTransform().k).toBeCloseTo(2, 6);
+    net.destroy();
+  });
 
   it("Ctrl on a ⌘ platform does not force-pan (macOS ctrl-click opens the context menu) — nor grab", async () => {
     const { h, net, g } = await setup("metaKey");
@@ -196,5 +282,16 @@ describe("force-pan modifier (#178)", () => {
     gesture(h, [[40, 40], [0, 20]], { ctrlKey: true });
     expect(chart.viewTransform()).toEqual({ k: 1, x: -40, y: -20 });
     chart.destroy();
+  });
+
+  it("a flat-projection geoMap() shares the gate too: Ctrl-drag pans on a Ctrl platform", async () => {
+    const h = host();
+    const map = new GeoMapProbe(h, "ctrlKey");
+    await map.whenReady();
+    map.setTransform({ k: 1, x: 0, y: 0 });
+    map.enableZoom([0.2, 8]); // Mercator is flat → d3-zoom affine pan/zoom (a sphere would rotate)
+    gesture(h, [[40, 40], [0, 20]], { ctrlKey: true });
+    expect(map.viewTransform()).toEqual({ k: 1, x: -40, y: -20 });
+    map.destroy();
   });
 });
