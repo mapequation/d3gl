@@ -587,7 +587,8 @@ export class Network extends BaseEngine {
    *  state-network overlays (#171). BOTH lane branches register all of it, whatever the current mode,
    *  because an emit-set change removes only the names the NEW entry lists — so a pie/container drawn by
    *  the previous lane (no-LOD physical view → `lod()` on, or a state network → `data(plainGraph)`) is
-   *  dropped instead of lingering, stale, on the backend (#175). Removing an absent layer is a no-op. */
+   *  dropped instead of lingering, stale, on the backend (#175). Removing an absent layer is a no-op.
+   *  A new layer that either branch emits (e.g. #174's frontier pie) must join this list. */
   private readonly LANE_LAYERS: readonly string[] = [this.CONTAINER_LAYER, ...LAYER_NAMES, this.PIE_LAYER];
 
   constructor(host: HTMLElement, opts: NetworkOptions = {}) {
@@ -817,11 +818,13 @@ export class Network extends BaseEngine {
    * - `selection: { selected, others }` — `selected.stroke` overrides the **select** ring colour
    *   (default `#2563eb` blue); the hover ring defaults to `#16a34a` green (override via a `hover`
    *   HighlightStyle's `stroke`). A subtract-marquee preview rings the to-be-removed glyphs `#dc2626`
-   *   red. `others.opacity` (default `0.3`) fades every glyph that is NOT selected — nodes, aggregates,
-   *   links and the physical-view pies alike — while the selected ones keep full opacity and get a ring,
-   *   plus their outgoing links. It is a shader uniform, so selecting costs no geometry rebuild. A colour
-   *   in `others` is ignored on these instanced glyphs. `hover: { others: { opacity } }` opts into the
-   *   same fade while hovering.
+   *   red. `others.opacity` (default `0.3`) fades the glyphs that are NOT selected — node discs
+   *   (LOD aggregates included), links/arrows and the physical-view pies — while the selected ones keep
+   *   full opacity and get a ring, plus their outgoing links. Not dimmed: the LOD aggregate halos and the
+   *   `both`-view physical container discs (#315). With LOD off a selection change is a shader uniform
+   *   plus an in-place flag write (no geometry rebuild); under LOD it re-emits only the visible frontier.
+   *   A colour in `others` is ignored on these instanced glyphs. `hover: { others: { opacity } }` opts
+   *   into the same fade while hovering (a uniform push, no re-emit, with LOD on or off).
    *
    * The hit's `datum` is a {@link NetworkHit} (`{ aggregate, count }`); its `members()` lists the leaf
    * node ids the target covers (1 for a leaf, the whole subtree for an aggregate). Observe selection

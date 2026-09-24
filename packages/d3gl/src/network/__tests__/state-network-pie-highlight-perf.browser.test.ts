@@ -25,7 +25,7 @@ import { GlBufferSpy, perfHost, sweepFrames, zoomSteps, type GlBufferUsage } fro
  *   - **zoom sweep** (selection active): the static no-LOD lane never re-emits (so `physicalPieInstances`
  *     and its per-wedge colour parse never run), accessors stay flat, no buffer churn, and the upload
  *     per frame is the ring overlay's alone.
- *   - **node-drag**: every move re-emits the pie (pre-existing, filed as a follow-up) but hands it the
+ *   - **node-drag**: every move re-emits the pie (pre-existing, #314) but hands it the
  *     SAME cached `selected` array the selection built — no O(wedges) flag rebuild per move, and the
  *     renderer's reference check skips the flag upload.
  *   - **LOD on**: the frontier emits no pie (pies are not LOD-aware yet, #174). The leg pins that the
@@ -50,6 +50,8 @@ const H = 400;
 const HOVER_TARGETS = 60;
 const HOVER_ROW = 10;
 const DRAG_MOVES = 8;
+/** LOD-on hover sweep: a lattice over the whole viewport (see the LOD leg for why not the row). */
+const LATTICE_PITCH = 20;
 /** The base network lane's layers — a restyle must never (re)emit any of these. */
 const BASE_LANE = ["nodes", "links", "arrows", "node-halos", "phys-container", "pie"] as const;
 /** Layers the shader highlight drives (network.ts HL_LAYERS): the per-hover push count is this many. */
@@ -66,9 +68,9 @@ const LOD_UPLOAD_BYTES_PER_FRAME = 1024 * 1024;
 // CPU pick (pickNodes scans the full graph with LOD off — the linear term) + one ring emit + four uniform
 // writes + a render submit: measured median 0.2 ms at 20k (local headless Chromium, under load), so 1.5 ms
 // is ~7x — while a base-lane re-emit on hover (the #186 shape) costs what a drag move does, ~4.4 ms.
-// A drag move re-emits the whole no-LOD lane (O(nodes + links + wedges) — the pre-existing cost filed as
-// a follow-up), measured median 4.4 ms at 20k and linear in N, so its linear term carries the ceiling
-// (~4.5x at every N).
+// A drag move re-emits the whole no-LOD lane (O(nodes + links + wedges) — the pre-existing cost, #314;
+// recalibrate this when it lands), measured median 4.4 ms at 20k and linear in N, so its linear term
+// carries the ceiling (~4.5x at every N).
 const HOVER_MS = perfBudget(1 + (0.5 * N) / 20_000);
 const DRAG_MOVE_MS = perfBudget(4 + (16 * N) / 20_000);
 const SETUP_MS = perfBudget(120_000 + N / 2);
@@ -212,7 +214,7 @@ let hoverOff: EventLeg;
 let selectOff: EventLeg & { flagBytes: number; pieFlagLength: number; pieFlagSum: number };
 let zoomOff: { baseEmits: number; pieEmits: number; radiusCalls: number; strokeCalls: number; gpu: GlBufferUsage; frames: number; worstMs: number };
 let dragOff: { moves: number; pieEmits: number; distinctSelected: number; sameAsSelection: boolean; radiusCalls: number; strokeCalls: number; worstMs: number; medianMs: number };
-let lodOn: { pieLive: boolean; pieEmits: number; hoverBaseEmits: number; hoverEvents: number; zoomUploadPerFrame: number; frames: number; pieLiveAfter: boolean };
+let lodOn: { nodesLive: boolean; pieLive: boolean; pieEmits: number; hoverBaseEmits: number; hoverChanges: number; hoverEvents: number; zoomBaseEmits: number; zoomUploadPerFrame: number; frames: number; pieLiveAfter: boolean };
 
 const median = (xs: number[]): number => {
   const s = [...xs].sort((a, b) => a - b);
@@ -257,22 +259,22 @@ beforeAll(async () => {
       h.dispatchEvent(new PointerEvent("pointermove", { clientX: r.left + x, clientY: r.top + y, bubbles: true, pointerId: 1 }));
     const [gapX, gapY] = [SPACING / 2, HOVER_ROW * SPACING + SPACING / 2]; // between four glyphs: no node
 
-    /** Pointer across HOVER_TARGETS consecutive nodes; the first move (ring layer appears) is a warm-up. */
-    const hoverSweep = (): EventLeg => {
-      const [x0, y0] = screenOf(nodeAt(1, HOVER_ROW));
+    /** Pointer across `points`; the first move (ring layer appears) is a warm-up, not measured. */
+    const hoverSweep = (points: readonly (readonly [number, number])[]): EventLeg => {
+      const [x0, y0] = points[0] ?? [0, 0];
       move(x0, y0);
       lane.reset();
       const before = gl.mark();
       const times: number[] = [];
-      for (let j = 0; j < HOVER_TARGETS; j++) {
-        const [x, y] = screenOf(nodeAt(2 + j, HOVER_ROW));
+      for (let j = 1; j < points.length; j++) {
+        const [x, y] = points[j] ?? [0, 0];
         const t0 = performance.now();
         move(x, y);
         times.push(performance.now() - t0);
       }
       const gpu = gl.since(before);
       const leg: EventLeg = {
-        events: HOVER_TARGETS,
+        events: points.length - 1,
         baseEmits: lane.baseEmits(),
         styles: lane.totalStyles(),
         pieStyles: lane.pieStyles.length,
@@ -286,7 +288,8 @@ beforeAll(async () => {
     };
 
     // ── LOD OFF ────────────────────────────────────────────────────────────────────────────────────
-    hoverOff = hoverSweep();
+    // HOVER_TARGETS consecutive nodes along one row (after a warm-up on the node before them).
+    hoverOff = hoverSweep(Array.from({ length: HOVER_TARGETS + 1 }, (_, j) => screenOf(nodeAt(1 + j, HOVER_ROW))));
 
     // Selection changes (select() is the programmatic twin of a click; the marquee commits the same way).
     {
@@ -375,17 +378,29 @@ beforeAll(async () => {
     {
       lane.reset();
       net.lod({ declutter: true, maxAggregateRadius: 24 });
+      // Proof the LOD lane took over: `unregisterLanes()` (LOD on, no tree yet) would drop the pie too.
+      const nodesLive = lane.live.has("nodes");
       const pieLive = lane.live.has("pie");
-      const leg = hoverSweep();
+      // Not the LOD-off row: at k = 1 the frontier is aggregates, and that row can fall entirely in the
+      // gaps between them — no re-target at all, so "no re-emit" would hold vacuously. A viewport-wide
+      // lattice at 20 px pitch crosses glyphs and gaps alike (measured: ~135 distinct targets at 20k).
+      const lattice: [number, number][] = [];
+      for (let y = LATTICE_PITCH / 2; y < H; y += LATTICE_PITCH) for (let x = LATTICE_PITCH / 2; x < W; x += LATTICE_PITCH) lattice.push([x, y]);
+      const leg = hoverSweep(lattice);
       lane.reset();
       const before = gl.mark();
       const { frames } = sweepFrames(zoomSteps(W, H), (t) => net.setTransform(t));
       const zoom = gl.since(before);
       lodOn = {
+        nodesLive,
         pieLive,
         pieEmits: lane.emits.get("pie") ?? 0,
         hoverBaseEmits: leg.baseEmits,
+        // One HL push reaches "pie" per hover change (a no-op under LOD — no pie layer), so this counts
+        // the re-targets the sweep actually produced.
+        hoverChanges: leg.pieStyles,
         hoverEvents: leg.events,
+        zoomBaseEmits: lane.baseEmits(),
         zoomUploadPerFrame: zoom.uploadedBytes / frames,
         frames,
         pieLiveAfter: lane.live.has("pie"),
@@ -433,8 +448,9 @@ describe(`state-network pie highlight — per-interaction cost at N=${N.toLocale
       selectOff.gpu.uploadedBytes,
       `selection uploaded ${selectOff.gpu.uploadedBytes.toLocaleString()} B over ${selectOff.events} changes; the flag columns are ${selectOff.flagBytes.toLocaleString()} B`,
     ).toBeLessThanOrEqual(selectOff.flagBytes + SELECT_SLACK_BYTES * selectOff.events);
-    // Sanity on the scale of that bound: the flags are 4 B per node/link/wedge, far below the geometry.
-    expect(selectOff.flagBytes / selectOff.events).toBeLessThanOrEqual(4 * (N + edgeCount + wedgeCount) * 2);
+    // Pin that bound's base exactly: one float flag per node, per link and per wedge — a column pushed
+    // twice (or a geometry column riding along) moves this, even though the upload check above is relative.
+    expect(selectOff.flagBytes / selectOff.events, "the flag bytes per selection are not exactly 4 B per node + link + wedge").toBe(4 * (N + edgeCount + wedgeCount));
   });
 
   it("LOD OFF — zoom sweep with a selection: the static lane never re-emits, accessors stay flat", () => {
@@ -458,10 +474,13 @@ describe(`state-network pie highlight — per-interaction cost at N=${N.toLocale
   });
 
   it("LOD ON — the no-LOD pie is removed, and no pie work runs per hover or per zoom frame (#174)", () => {
+    expect(lodOn.nodesLive, "lod() did not hand the lane to the LOD frontier").toBe(true);
     expect(lodOn.pieLive, "a stale no-LOD pie layer survived lod() on").toBe(false);
     expect(lodOn.pieLiveAfter, "a pie layer reappeared under LOD").toBe(false);
     expect(lodOn.pieEmits, "the LOD lane emitted a pie").toBe(0);
+    expect(lodOn.hoverChanges, "the LOD hover sweep never re-targeted — the no-re-emit check below is vacuous").toBeGreaterThan(0);
     expect(lodOn.hoverBaseEmits, "an LOD hover re-emitted base-lane geometry").toBe(0);
+    expect(lodOn.zoomBaseEmits, "the LOD lane never re-cut during the zoom sweep — the upload bound below is vacuous").toBeGreaterThan(0);
     expect(lodOn.zoomUploadPerFrame, "the LOD zoom upload is not screen-bounded").toBeLessThan(LOD_UPLOAD_BYTES_PER_FRAME);
   });
 });

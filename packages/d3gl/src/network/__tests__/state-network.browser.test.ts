@@ -447,12 +447,16 @@ describe("physical-view pie highlight (#175)", () => {
     expect(live.has("pie"), "the fixture drew no pie").toBe(true);
 
     net.lod({});
+    // The LOD lane must actually have taken over — `unregisterLanes()` (LOD on, no tree yet) also drops
+    // the pie, and would pass the stale-pie check below without exercising the lane swap at all.
+    expect(live.has("nodes"), "lod() did not hand the lane to the LOD frontier").toBe(true);
     expect(live.has("pie"), "a stale pie layer survived the switch to the LOD lane").toBe(false);
     net.lod(false);
     expect(live.has("pie"), "the pie did not come back with LOD off").toBe(true);
 
     // Same contract when the state network is replaced by a plain graph: its lane has no pie to emit.
     net.data(buildGraph({ nodeCount: 2, source: [0], target: [1], directed: false }));
+    expect(live.has("nodes"), "the plain graph's lane drew no nodes").toBe(true);
     expect(live.has("pie"), "a stale pie layer survived data(plainGraph)").toBe(false);
     net.destroy();
     h.remove();
