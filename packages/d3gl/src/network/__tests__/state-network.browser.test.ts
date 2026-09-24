@@ -1,7 +1,11 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi, afterEach } from "vitest";
 import { network } from "../network.js";
 import { buildStateGraph } from "../state-graph.js";
+import { buildGraph } from "../graph.js";
 import type { ModulePathNode } from "../module-colors.js";
+import { WebGLBackend } from "../../webgl/webgl-backend.js";
+import type { InstancedLayer, InstancedHighlight } from "../../core/backend.js";
+import { decodeImage } from "../../map/__tests__/backend-equivalence-harness.js";
 
 function host(): HTMLElement {
   const el = document.createElement("div");
@@ -225,5 +229,236 @@ describe("state-network async layout backends (#182)", () => {
     }
 
     net.destroy();
+  });
+});
+
+// ── #175: the physical-view pie joins the #162 shader highlight ─────────────────────────────────────
+//
+// A hover/selection restyle on the network lane is a UNIFORM push (`styleInstancedLayer`) plus, for a
+// selection, an in-place `selected` flag write — never a geometry re-emit. The pie layer carried its
+// per-wedge `groups` (physical node id) since #171 but was left out of that push, so selecting or
+// hovering a physical node dimmed every disc and link while the overlapping-module pies stayed at full
+// opacity. These tests pin the pie to the same contract, through the real triggers.
+
+/**
+ * Two overlapping physical nodes (pies) and one single-module disc:
+ *  - physical 0: state 0 (module 1, flow 1) + state 1 (module 2, flow 3) ⇒ wedges [0, 0.25] + [0.25, 1]
+ *  - physical 1: state 2 (module 1, flow 1) + state 3 (module 2, flow 3) ⇒ the same split
+ *  - physical 2: state 4 (module 1) ⇒ solid disc
+ * The 1:3 split makes the SECOND wedge span three quarters of the pie, so {@link pieSample} lands in it
+ * whichever way the y axis runs.
+ */
+function pieStateNetwork() {
+  const graph = buildStateGraph({
+    stateCount: 5,
+    stateToPhysical: [0, 0, 1, 1, 2],
+    source: [0, 1, 3],
+    target: [2, 4, 4],
+    nodeFlow: [1, 3, 1, 3, 1],
+    directed: false,
+  });
+  const modules: ModulePathNode[] = [
+    { id: 0, path: [1, 1] },
+    { id: 1, path: [2, 1] },
+    { id: 2, path: [1, 2] },
+    { id: 3, path: [2, 2] },
+    { id: 4, path: [1, 3] },
+  ];
+  return { graph, modules };
+}
+
+const PIE_POS = new Float32Array([50, 100, 150, 100, 100, 40]);
+const PIE_R = 16;
+/** Half-way out from physical `p`'s centre towards the screen's lower left: angle fraction 0.375 (0.625
+ *  with y flipped), inside the pie's second (module-2) wedge either way, and clear of every link —
+ *  a highlighted link under a faded pie would show through it and mask the fade. */
+const pieSample = (p: number): [number, number] => {
+  const d = (PIE_R / 2) * Math.SQRT1_2;
+  return [(PIE_POS[2 * p] ?? 0) - d, (PIE_POS[2 * p + 1] ?? 0) + d];
+};
+/** The base network lane's layers — a restyle must never (re)emit any of these. */
+const BASE_LANE = new Set(["nodes", "links", "arrows", "pie"]);
+
+function rgbaAt(buf: { width: number; data: Uint8Array }, [x, y]: [number, number]): [number, number, number, number] {
+  const o = (Math.round(y) * buf.width + Math.round(x)) * 4;
+  return [buf.data[o] ?? 0, buf.data[o + 1] ?? 0, buf.data[o + 2] ?? 0, buf.data[o + 3] ?? 0];
+}
+const frame = async (net: ReturnType<typeof network>) => decodeImage(net.toPNG(), 200, 200);
+
+/** Typed spies on the WebGL backend's instanced-layer seam (no `any`, no reach into the engine). */
+function laneSpy() {
+  const set = vi.spyOn(WebGLBackend.prototype, "setInstancedLayer");
+  const update = vi.spyOn(WebGLBackend.prototype, "updateInstancedLayer");
+  const style = vi.spyOn(WebGLBackend.prototype, "styleInstancedLayer");
+  return {
+    /** Names of every layer (re)emitted since the last reset — set + in-place update. */
+    emitted: (): string[] => [...set.mock.calls, ...update.mock.calls].map(([l]) => l.name),
+    /** Every layer object pushed (set + update), in call order. */
+    layers: (): InstancedLayer[] => [...set.mock.calls, ...update.mock.calls].map(([l]) => l),
+    /** The highlight pushes a layer received. */
+    styled: (name: string): InstancedHighlight[] => style.mock.calls.filter(([n]) => n === name).map(([, h]) => h),
+    reset(): void {
+      set.mockClear();
+      update.mockClear();
+      style.mockClear();
+    },
+  };
+}
+/** The last element, or undefined (the lib target predates `Array.prototype.at`). */
+const last = <T,>(xs: readonly T[]): T | undefined => xs[xs.length - 1];
+const pieSelectedOf = (layers: InstancedLayer[]): (Uint8Array | undefined)[] =>
+  layers.flatMap((l) => (l.primitive === "pie" ? [l.pie.selected] : []));
+
+async function physicalPies(h: HTMLElement) {
+  const { graph, modules } = pieStateNetwork();
+  const net = network(h, { width: 200, height: 200, backend: "webgl" });
+  await net.whenReady();
+  net
+    .style({ nodeRadius: PIE_R })
+    .stateNetwork(graph, { modules, view: "physical" })
+    .layout({ backend: "positions", positions: PIE_POS });
+  net.setTransform({ k: 1, x: 0, y: 0 }); // world == screen
+  return net;
+}
+
+describe("physical-view pie highlight (#175)", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("selecting a physical node pushes the dim uniform + per-wedge `selected` flags to the pie — no re-emit", async () => {
+    const h = host();
+    const net = await physicalPies(h);
+    net.interactive({ selectable: true }); // default selection.others = { opacity: 0.3 }
+    const spy = laneSpy();
+    spy.reset();
+
+    net.select("nodes", [1]);
+
+    const pie = spy.styled("pie");
+    expect(pie.some((u) => u.dimActive === true && u.dimOpacity === 0.3)).toBe(true);
+    // Wedge order = physical order, overlapping nodes only: p0's two wedges, then p1's two.
+    const flags = pie.map((u) => u.selected).filter((s): s is Uint8Array => s !== undefined);
+    expect(flags.length).toBeGreaterThan(0);
+    expect([...(last(flags) ?? [])]).toEqual([0, 0, 1, 1]);
+    expect(spy.emitted().filter((n) => BASE_LANE.has(n)), "a selection re-emitted base geometry").toEqual([]);
+
+    net.select("nodes", null);
+    expect(last(spy.styled("pie"))?.dimActive).toBe(false);
+    net.destroy();
+    h.remove();
+  });
+
+  it("the unselected pie visibly fades, the selected one keeps full opacity — and a layout frame keeps it so", async () => {
+    const h = host();
+    const net = await physicalPies(h);
+    net.interactive({ selectable: true });
+    const before = await frame(net);
+    expect(before.data.length).toBeGreaterThan(0);
+    const a0 = rgbaAt(before, pieSample(0));
+    const a1 = rgbaAt(before, pieSample(1));
+    expect(a0[3], "the pie is not drawn at the sample point").toBe(255);
+
+    net.select("nodes", [1]);
+    const selected = await frame(net);
+    // Dimmed to 0.3 over a disc that is itself dimmed to 0.3 ⇒ ≈ 1 - 0.7² = 0.51 alpha (the accepted
+    // double-composite residual). Before #175 the opaque pie covered its dimmed disc: alpha stayed 255.
+    expect(rgbaAt(selected, pieSample(0))[3], "the unselected pie did not fade").toBeLessThan(200);
+    expect(rgbaAt(selected, pieSample(1)), "the selected pie changed").toEqual(a1);
+
+    // A position-only re-layout re-emits the lane in place. The pie's flags must travel on that emit —
+    // a flag-less emit would zero the GPU `a_selected` column and dim the selected pie too.
+    net.layout({ backend: "positions", positions: PIE_POS });
+    const relaid = await frame(net);
+    expect(rgbaAt(relaid, pieSample(1)), "a layout frame cleared the selected pie's flags").toEqual(a1);
+    expect(rgbaAt(relaid, pieSample(0))).toEqual(rgbaAt(selected, pieSample(0)));
+
+    net.select("nodes", null);
+    expect(rgbaAt(await frame(net), pieSample(0))).toEqual(a0);
+    net.destroy();
+    h.remove();
+  });
+
+  it("hovering a physical node drives the pie's hover uniform — no re-emit — and hover.others fades the other pies", async () => {
+    const h = host();
+    const net = await physicalPies(h);
+    net.interactive({ hover: { others: { opacity: 0.5 } } });
+    const before = await frame(net);
+    const spy = laneSpy();
+    spy.reset();
+
+    const r = h.getBoundingClientRect();
+    h.dispatchEvent(new PointerEvent("pointermove", { clientX: r.left + 50, clientY: r.top + 100, bubbles: true }));
+
+    expect(spy.styled("pie").some((u) => u.hoverGroup === 0 && u.dimActive === true && u.dimOpacity === 0.5)).toBe(true);
+    expect(spy.emitted().filter((n) => BASE_LANE.has(n)), "a hover re-emitted base geometry").toEqual([]);
+    const hovered = await frame(net);
+    expect(rgbaAt(hovered, pieSample(1))[3], "the other pie did not fade on hover").toBeLessThan(220);
+    expect(rgbaAt(hovered, pieSample(0)), "the hovered pie changed").toEqual(rgbaAt(before, pieSample(0)));
+
+    h.dispatchEvent(new PointerEvent("pointermove", { clientX: r.left + 199, clientY: r.top + 199, bubbles: true }));
+    expect(last(spy.styled("pie"))?.hoverGroup).toBe(-1);
+    net.destroy();
+    h.remove();
+  });
+
+  it("a node-drag frame re-emits the pie with the SAME cached flags (no per-move rebuild)", async () => {
+    const h = host();
+    const net = await physicalPies(h);
+    net.interactive({ selectable: true, draggable: true });
+    net.select("nodes", [1]);
+    const spy = laneSpy();
+    spy.reset();
+
+    // Grab the selected p1 and drag it: every move repaints through rebuild → lane re-emit.
+    const r = h.getBoundingClientRect();
+    const ev = (type: string, x: number, y: number) =>
+      h.dispatchEvent(new PointerEvent(type, { clientX: r.left + x, clientY: r.top + y, bubbles: true, button: 0, pointerId: 1 }));
+    ev("pointerdown", 150, 100);
+    ev("pointermove", 156, 104);
+    ev("pointermove", 162, 108);
+    ev("pointermove", 168, 112);
+    ev("pointerup", 168, 112);
+
+    const emitted = pieSelectedOf(spy.layers());
+    expect(emitted.length, "the drag never re-emitted the pie").toBeGreaterThanOrEqual(3);
+    const first = emitted[0];
+    expect(first, "the drag emitted the pie without its selected flags").toBeDefined();
+    expect([...(first ?? [])]).toEqual([0, 0, 1, 1]);
+    for (const s of emitted) expect(s, "a drag move rebuilt the pie's selected flags").toBe(first);
+    net.destroy();
+    h.remove();
+  });
+
+  it("the pie never outlives the lane that drew it: lod() in the physical view (pies are not LOD-aware yet, #174) and data() drop it", async () => {
+    const live = new Set<string>();
+    const origSet = WebGLBackend.prototype.setInstancedLayer;
+    const origRemove = WebGLBackend.prototype.removeInstancedLayer;
+    vi.spyOn(WebGLBackend.prototype, "setInstancedLayer").mockImplementation(function (this: WebGLBackend, layer: InstancedLayer) {
+      live.add(layer.name);
+      origSet.call(this, layer);
+    });
+    vi.spyOn(WebGLBackend.prototype, "removeInstancedLayer").mockImplementation(function (this: WebGLBackend, name: string) {
+      live.delete(name);
+      origRemove.call(this, name);
+    });
+    const h = host();
+    const net = await physicalPies(h);
+    expect(live.has("pie"), "the fixture drew no pie").toBe(true);
+
+    net.lod({});
+    // The LOD lane must actually have taken over — `unregisterLanes()` (LOD on, no tree yet) also drops
+    // the pie, and would pass the stale-pie check below without exercising the lane swap at all.
+    expect(live.has("nodes"), "lod() did not hand the lane to the LOD frontier").toBe(true);
+    expect(live.has("pie"), "a stale pie layer survived the switch to the LOD lane").toBe(false);
+    net.lod(false);
+    expect(live.has("pie"), "the pie did not come back with LOD off").toBe(true);
+
+    // Same contract when the state network is replaced by a plain graph: its lane has no pie to emit.
+    net.data(buildGraph({ nodeCount: 2, source: [0], target: [1], directed: false }));
+    expect(live.has("nodes"), "the plain graph's lane drew no nodes").toBe(true);
+    expect(live.has("pie"), "a stale pie layer survived data(plainGraph)").toBe(false);
+    net.destroy();
+    h.remove();
   });
 });

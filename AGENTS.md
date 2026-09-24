@@ -412,6 +412,7 @@ guard owns the serialize budget: one DOM node per drawable buys parse time, not 
 | multi pass-through: FBO count + gesture skip | **WebGL** | `map/passthrough-multi-perf.browser.test.ts` | 25k ×2 layers | `PERF_BROWSER_N` (max 50k) |
 | label placement (`cullLabels`) | — | `labels/__tests__/label-cull-perf.test.ts` | 200k candidates, dense **and** spread | `BENCH_LABEL_CULL` |
 | **`network.labels()` per-frame**, LOD on **and** off | **WebGL** | `network/__tests__/network-labels-perf.browser.test.ts` | 20k nodes, uncapped | `PERF_BROWSER_N` (max 50k) |
+| state-network **pie highlight**: hover sweep, `select()`, zoom, node-drag; LOD off, and LOD on (no pie emitted until #174 — pins its removal) | **WebGL** | `network/__tests__/state-network-pie-highlight-perf.browser.test.ts` | 20k physical nodes / 32k wedges | `PERF_BROWSER_N` (max 100k) |
 
 **Known holes, tracked:** geo's at-scale leg is Canvas-only (#264). *(Closed: #263 — the at-scale
 legs used to drive **backends** only, leaving accessors / lane emit / LOD integration covered at

@@ -1685,7 +1685,9 @@ const TAU = Math.PI * 2;
  * Build instanced pie wedges from {@link PhysicalPieWedges} for the physical nodes that span ≥2 modules
  * — one instance per wedge (its `[startFrac, endFrac]` angular sector). `radius` is per-physical (or a
  * constant) in the active `sizeMode`'s units. Group id = the physical node id, so a hover/select lights
- * the whole pie (#162). Build-once: called on a data/module change, not per frame.
+ * the whole pie (#162). Called on every no-LOD lane emit — which includes each streamed layout frame and
+ * each node-drag move, not only a data/module change — and it rebuilds + re-parses every column each
+ * time; caching the position-independent ones is #314. A zoom/pan never calls it (that lane is static).
  */
 export function physicalPieInstances(wedges: PhysicalPieWedges, positions: ArrayLike<number>, radius: PieRadius): InstancedPieData {
   const { offset, end, color, wedgeCount } = wedges;
@@ -1724,6 +1726,33 @@ export function physicalPieInstances(wedges: PhysicalPieWedges, positions: Array
     }
   }
   return { centers, radii, angles, colors, groups, count: total };
+}
+
+/**
+ * Per-wedge `selected` flags (#175) for the pie instances {@link physicalPieInstances} emits — the SAME
+ * instance order (overlapping physical nodes only, in physical order, each node's wedges contiguous), so
+ * flag `w` belongs to wedge instance `w`. `isSelected` is asked once per overlapping physical node (a
+ * pie's wedges share its flag); `null` ⇒ all zeros. O(physicalCount + wedges); the engine caches the
+ * result per selection version, so it runs on a selection change, not per frame.
+ */
+export function physicalPieSelected(wedges: PhysicalPieWedges, isSelected: ((p: number) => boolean) | null): Uint8Array {
+  const { wedgeCount } = wedges;
+  const physicalCount = wedgeCount.length;
+  let total = 0;
+  for (let p = 0; p < physicalCount; p++) {
+    const n = wedgeCount[p] ?? 0;
+    if (n >= 2) total += n;
+  }
+  const out = new Uint8Array(total);
+  if (!isSelected) return out;
+  let w = 0;
+  for (let p = 0; p < physicalCount; p++) {
+    const n = wedgeCount[p] ?? 0;
+    if (n < 2) continue;
+    if (isSelected(p)) out.fill(1, w, w + n);
+    w += n;
+  }
+  return out;
 }
 
 /**
