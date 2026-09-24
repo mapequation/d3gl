@@ -31,7 +31,7 @@ export { buildLODTree, computeLODGeometry, cut, defaultExpandPx, makeCutScratch,
 export type { LODTree, LODTransform, CutOptions, CutScratch, DeclutterOptions, DeclutterFrontierScratch } from "./lod.js";
 
 export { buildModuleLODTree } from "./modules.js";
-export type { ModuleNode } from "./modules.js";
+export type { ModuleLink, ModuleNode } from "./modules.js";
 
 export { moduleColors } from "./module-colors.js";
 export type { ModulePathNode, ModuleColorOptions } from "./module-colors.js";

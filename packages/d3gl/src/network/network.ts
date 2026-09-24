@@ -6,7 +6,7 @@ import { multilevelLayout, type CoarsenOptions } from "./coarsen.js";
 import { buildLODTree, buildSpatialLODTree, computeLODGeometry, computeLODPositions, computeLODStyle, updateLODPositionsForLeaves, cut, makeCutScratch, declutterFrontier, makeDeclutterFrontierScratch, pickFrontier, regionFrontier, visibleWorldRect, leavesUnder, ancestorAwareSelected, type LODTree, type SpatialLODOptions } from "./lod.js";
 import { DEFAULT_LABEL_TEXT, type LabelAnchor, type LabelStyle } from "../labels/label-layer.js";
 import { TextMeasurer, canvasFont } from "../labels/measure.js";
-import { buildModuleLODTree, type ModuleNode } from "./modules.js";
+import { buildModuleLODTree, type ModuleLink, type ModuleNode } from "./modules.js";
 import { moduleColors, type ModulePathNode, type ModuleColorOptions } from "./module-colors.js";
 import { physicalPieWedges, type PhysicalPieWedges, type PieWedgeOptions } from "./pie.js";
 import { rosettePositions } from "./rosette.js";
@@ -252,6 +252,14 @@ export interface NetworkLODOptions {
    * the off-thread module-tree path is a later refinement.
    */
   modules?: ArrayLike<ModuleNode>;
+  /**
+   * **Module-level links** addressed by path (#199), summed into the map's super-edges alongside those
+   * derived from the graph's edges. Use it when the input carries inter-module links only in aggregate —
+   * an Infomap `.ftree` stores leaf links only inside bottom modules, and each coarser link once per
+   * level in its `*Links` sections — so the map draws exactly those links, with no leaf edges invented
+   * to stand in for them. Requires `modules`. @see {@link ModuleLink}
+   */
+  moduleLinks?: ArrayLike<ModuleLink>;
   /**
    * Expand threshold (px): an aggregate whose on-screen footprint (`2·extent·k`) reaches this
    * expands into its children; below it it draws as a single glyph. Larger → coarser (fewer, bigger
@@ -773,7 +781,15 @@ export class Network extends BaseEngine {
     // Switching the tree SOURCE (provided modules ↔ structural coarsening) must rebuild the tree — the
     // retained one is from the old source. Drop the main-thread tree so recomputeLODGeometry rebuilds
     // (keep a worker-streamed tree; the worker owns it).
-    if (!!options.modules !== this.lodModules && this.lodTree && this.lodTree !== this.lodWorkerTree) {
+    // A different module tree or module-link set likewise invalidates the retained module tree.
+    const prev = this.lodOptions;
+    const moduleInputChanged =
+      this.lodModules && (options.modules !== prev?.modules || options.moduleLinks !== prev?.moduleLinks);
+    if (
+      (!!options.modules !== this.lodModules || moduleInputChanged) &&
+      this.lodTree &&
+      this.lodTree !== this.lodWorkerTree
+    ) {
       this.lodTree = null;
       this.lodHasGeometry = false;
     }
@@ -1100,7 +1116,12 @@ export class Network extends BaseEngine {
         let moduleTopology: LODTree | undefined;
         if (this.lodOptions?.modules) {
           if (!this.lodTree || !this.lodModules) {
-            this.lodTree = buildModuleLODTree(this.graph.nodeCount, this.lodOptions.modules, this.graph);
+            this.lodTree = buildModuleLODTree(
+              this.graph.nodeCount,
+              this.lodOptions.modules,
+              this.graph,
+              this.lodOptions.moduleLinks,
+            );
             this.lodModules = true;
             this.lodSpatial = false;
             this.lodHasGeometry = false;
@@ -2250,7 +2271,12 @@ export class Network extends BaseEngine {
       if (this.lodOptions.modules) {
         // Pass the graph's directed edges so the tree also carries flow-weighted super-edges (the sum
         // of subsumed edge weights per module pair) for the bent half-arrow map links (#104 N6c).
-        this.lodTree = buildModuleLODTree(this.graph.nodeCount, this.lodOptions.modules, this.graph);
+        this.lodTree = buildModuleLODTree(
+              this.graph.nodeCount,
+              this.lodOptions.modules,
+              this.graph,
+              this.lodOptions.moduleLinks,
+            );
         this.lodModules = true;
         this.lodSpatial = false;
       } else if (this.graph.edgeCount === 0) {

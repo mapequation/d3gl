@@ -45,6 +45,23 @@ export interface ModuleEdges {
 }
 
 /**
+ * A link between two tree nodes addressed by Infomap path (#199) — the rows of an Infomap `.ftree`'s
+ * per-module `*Links` sections. `source`/`target` are the paths of **modules or leaves** (e.g. `[1, 1]`
+ * → `[1, 2]` for a link between sub-modules 1 and 2 of top module 1; `[2]` for top module 2; a leaf's
+ * full node path). A `.ftree` stores leaf links only inside bottom modules and every coarser link only
+ * aggregated per level, so these are the real data for the map's inter-module super-edges: each
+ * contributes from its endpoints' own level up to (not including) their lowest common module, exactly
+ * like a graph edge does from the leaves up. Don't repeat links already in the graph's edges — both are
+ * summed.
+ */
+export interface ModuleLink {
+  source: ArrayLike<number>;
+  target: ArrayLike<number>;
+  /** Link flow, summed per ordered pair with any other contribution to it. */
+  flow: number;
+}
+
+/**
  * Build a {@link LODTree} from a provided module hierarchy (the priority-chain entry that precedes
  * structural coarsening). Geometry is left zeroed — fill it with {@link computeLODGeometry} once
  * positions exist.
@@ -52,12 +69,26 @@ export interface ModuleEdges {
  * With `edges` (the graph's directed edge list), also derive **directed, flow-weighted super-edges**
  * (#104 N6c) so a map's inter-module links render as bent half-arrows; omit them (N6a) for a
  * node-only map. `records` must cover every node `0..nodeCount-1` exactly once.
+ *
+ * With `links` ({@link ModuleLink}s, #199), module-level links addressed by path add their flow to the
+ * super-edges directly — for inputs like an Infomap `.ftree` that carry inter-module links only in
+ * aggregate, with no leaf edges to derive them from.
  */
-export function buildModuleLODTree(nodeCount: number, records: ArrayLike<ModuleNode>, edges?: ModuleEdges): LODTree {
-  return lodTreeFromTopology(buildModuleTopology(nodeCount, records, edges));
+export function buildModuleLODTree(
+  nodeCount: number,
+  records: ArrayLike<ModuleNode>,
+  edges?: ModuleEdges,
+  links?: ArrayLike<ModuleLink>,
+): LODTree {
+  return lodTreeFromTopology(buildModuleTopology(nodeCount, records, edges, links));
 }
 
-function buildModuleTopology(nodeCount: number, records: ArrayLike<ModuleNode>, edges?: ModuleEdges): LODTopology {
+function buildModuleTopology(
+  nodeCount: number,
+  records: ArrayLike<ModuleNode>,
+  edges?: ModuleEdges,
+  links?: ArrayLike<ModuleLink>,
+): LODTopology {
   // --- 1. Register every distinct module prefix (root + all ancestors) in first-seen order by
   // walking an integer-keyed prefix tree: each module lazily holds a child map keyed by the next
   // path component (branch id). A prefix corresponds one-to-one with a (parent, branch) chain, so
@@ -74,6 +105,7 @@ function buildModuleTopology(nodeCount: number, records: ArrayLike<ModuleNode>, 
   registerModule(-1); // the root — always present, even for a flat (module-less) network
 
   const leafModule = new Int32Array(nodeCount).fill(-1); // node id → enclosing module's internal index
+  const leafRank = links?.length ? new Float64Array(nodeCount) : null; // node id → last path entry (for link lookup)
   const seen = new Uint8Array(nodeCount);
   for (let r = 0; r < records.length; r++) {
     const { id, path } = records[r]!;
@@ -99,6 +131,7 @@ function buildModuleTopology(nodeCount: number, records: ArrayLike<ModuleNode>, 
       m = child;
     }
     leafModule[id] = m;
+    if (leafRank) leafRank[id] = path[depth - 1]!;
   }
   for (let i = 0; i < nodeCount; i++) {
     if (!seen[i]) throw new Error(`buildModuleLODTree: no record for node id ${i} (records must cover every node)`);
@@ -176,6 +209,77 @@ function buildModuleTopology(nodeCount: number, records: ArrayLike<ModuleNode>, 
     edgeNeighbors: new Uint32Array(0),
     parent, // lets the cross-level super-edge gather walk a node up to its present ancestor (#139)
   };
-  if (edges) Object.assign(topo, buildSuperEdges(size, parent, edges));
+  const hasLinks = !!links?.length;
+  if (edges || hasLinks) {
+    const input =
+      links && leafRank && hasLinks
+        ? withModuleLinks(edges, links, resolveLinkPaths(moduleChild, moduleId, leafModule, leafRank))
+        : edges;
+    if (input) Object.assign(topo, buildSuperEdges(size, parent, input));
+  }
   return topo;
+}
+
+/**
+ * Path → global tree id resolver for {@link ModuleLink} endpoints: walks the module prefix tree, and
+ * falls back to the leaf ranked `path[last]` in the enclosing module. Leaf lookup is a (module, rank)
+ * map built once — O(nodeCount), only when links are given.
+ */
+function resolveLinkPaths(
+  moduleChild: readonly (Map<number, number> | null)[],
+  moduleId: Uint32Array,
+  leafModule: Int32Array,
+  leafRank: Float64Array,
+): (path: ArrayLike<number>) => number {
+  const leafByRank = new Map<number, Map<number, number>>(); // module internal index → rank → leaf id
+  for (let id = 0; id < leafModule.length; id++) {
+    const m = leafModule[id]!;
+    let ranks = leafByRank.get(m);
+    if (!ranks) leafByRank.set(m, (ranks = new Map()));
+    ranks.set(leafRank[id]!, id);
+  }
+  return (path) => {
+    if (path.length < 1) throw new Error("buildModuleLODTree: module link endpoint has an empty path");
+    let m = 0;
+    for (let d = 0; d < path.length; d++) {
+      const child = moduleChild[m]?.get(path[d]!);
+      if (child !== undefined) {
+        m = child;
+        continue;
+      }
+      const leaf = d === path.length - 1 ? leafByRank.get(m)?.get(path[d]!) : undefined;
+      if (leaf === undefined) {
+        throw new Error(`buildModuleLODTree: module link endpoint ${Array.from(path).join(":")} is not in the module tree`);
+      }
+      return leaf;
+    }
+    return moduleId[m]!;
+  };
+}
+
+/** The graph's edges (leaf ids) followed by the module links (resolved global ids), as one edge list. */
+function withModuleLinks(
+  edges: ModuleEdges | undefined,
+  links: ArrayLike<ModuleLink>,
+  resolve: (path: ArrayLike<number>) => number,
+): ModuleEdges {
+  const m = edges?.source.length ?? 0;
+  const n = m + links.length;
+  const source = new Uint32Array(n);
+  const target = new Uint32Array(n);
+  const weight = new Float32Array(n);
+  if (edges) {
+    for (let e = 0; e < m; e++) {
+      source[e] = edges.source[e]!;
+      target[e] = edges.target[e]!;
+      weight[e] = edges.weight[e]!;
+    }
+  }
+  for (let l = 0; l < links.length; l++) {
+    const link = links[l]!;
+    source[m + l] = resolve(link.source);
+    target[m + l] = resolve(link.target);
+    weight[m + l] = link.flow;
+  }
+  return { source, target, weight };
 }
