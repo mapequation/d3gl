@@ -9,7 +9,7 @@ import type {
   VectorLayer,
 } from "./backend.js";
 import { PathRecorder } from "./path-recorder.js";
-import { DEFAULT_CURVE_TOLERANCE } from "./flatten.js";
+import { DEFAULT_CURVE_TOLERANCE, anchoredCurveTolerance } from "./flatten.js";
 import { DEFAULT_MITER_LIMIT } from "./stroke.js";
 import { bezierControl, bentEndTangent, straightUnit, halfLinkGeometry, traceHalfLink, scaleHalfLink, chordBend } from "./half-link.js";
 import type { Subpath } from "./path-context.js";
@@ -98,13 +98,16 @@ export function circlesToDrawables(c: InstancedCirclesData): DrawableVector[] {
 const TAU = Math.PI * 2;
 
 /** Instanced pie wedges → one filled arc sector per wedge. Screen sizeMode pins the sector at a
- *  constant pixel size around its (projected) centre via the drawable anchor, as `tracePieWedges` does. */
+ *  constant pixel size around its (projected) centre via the drawable anchor, as `tracePieWedges` does
+ *  — so a screen wedge is an anchored glyph and bakes at {@link anchoredCurveTolerance}, exactly like
+ *  its Canvas/SVG Scene twin (#283); a world wedge is world-scaled and bakes at `tolerance`. */
 export function pieToDrawables(
   p: InstancedPieData,
   screen: boolean,
   tolerance = DEFAULT_CURVE_TOLERANCE,
 ): DrawableVector[] {
   const out: DrawableVector[] = [];
+  const bake = anchoredCurveTolerance(tolerance, screen);
   for (let i = 0; i < p.count; i++) {
     const cx = p.centers[i * 2] ?? 0;
     const cy = p.centers[i * 2 + 1] ?? 0;
@@ -117,7 +120,7 @@ export function pieToDrawables(
           ctx.moveTo(cx, cy);
           ctx.arc(cx, cy, r, a0, a1, false);
           ctx.closePath();
-        }, tolerance),
+        }, bake),
         fill: rgbaAt(p.colors, i),
         anchor: screen ? [cx, cy] : null,
       }),

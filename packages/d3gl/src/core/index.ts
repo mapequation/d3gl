@@ -17,7 +17,7 @@
  */
 export type { PathContext, Subpath } from "./path-context.js";
 export { PathRecorder } from "./path-recorder.js";
-export { flattenCubic, flattenQuadratic, flattenArc, flattenArcTo, DEFAULT_CURVE_TOLERANCE } from "./flatten.js";
+export { flattenCubic, flattenQuadratic, flattenArc, flattenArcTo, DEFAULT_CURVE_TOLERANCE, anchoredCurveTolerance } from "./flatten.js";
 export { tessellateFill } from "./tessellate.js";
 export type { FillGeometry } from "./tessellate.js";
 export { signedArea, pointInRing, groupRings } from "./rings.js";
@@ -25,7 +25,7 @@ export type { RingGroup } from "./rings.js";
 export { expandStroke, DEFAULT_MITER_LIMIT } from "./stroke.js";
 export type { StrokeGeometry, StrokeOptions, LineJoin, LineCap } from "./stroke.js";
 export { Scene } from "./scene.js";
-export type { GroupBuffers, GroupBufferDelta, GroupBuilder, DrawableRange, DrawableOpts, DrawableVector, StyleTables } from "./scene.js";
+export type { GroupBuffers, GroupBufferDelta, GroupBuilder, GroupOptions, DrawableRange, DrawableOpts, DrawableVector, StyleTables } from "./scene.js";
 export type { Backend, RenderLayer, VectorLayer, RenderDelta, ViewTransform, PointBatch, PassThroughLayer, DrawBatch, ProjectedPath, DrawItem, InstancedLayer, InstancedCirclesData, InstancedPieData, InstancedLinesData, InstancedArrowsData, InstancedHalfArrowsData, InstancedHighlight, TextData } from "./backend.js";
 export { instancedVectorLayers, circlesToDrawables, pieToDrawables, linesToDrawables, arrowsToDrawables, halfArrowsToDrawables } from "./instanced-vector.js";
 export { halfLinkGeometry, halfLinkPathString, traceHalfLink, scaleHalfLink, bezierControl, bentEndTangent, straightUnit } from "./half-link.js";

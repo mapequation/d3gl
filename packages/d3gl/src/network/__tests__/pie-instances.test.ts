@@ -2,7 +2,8 @@ import { describe, it, expect } from "vitest";
 import { rgb } from "d3-color";
 import { buildStateGraph } from "../state-graph.js";
 import { physicalPieWedges } from "../pie.js";
-import { physicalPieInstances } from "../glyphs.js";
+import { physicalPieInstances, tracePieWedges } from "../glyphs.js";
+import { Scene, DEFAULT_CURVE_TOLERANCE, anchoredCurveTolerance, pieToDrawables } from "../../core/index.js";
 
 // Physical A(0): state 0,1,2 spanning modules 1 (0,1) and 2 (2) → overlapping (pie).
 // Physical B(1): state 3,4 both in module 2 → single-module (solid disc, no pie).
@@ -56,5 +57,39 @@ describe("physicalPieInstances", () => {
     const radii = new Float32Array([12, 5]); // A → 12, B → 5 (unused, B skipped)
     const pie = physicalPieInstances(wedges, new Float32Array([0, 0, 0, 0]), radii);
     expect(Array.from(pie.radii)).toEqual([12, 12]);
+  });
+});
+
+describe("pie wedges under curveTolerance (#283)", () => {
+  const positions = new Float32Array([10, 20, 100, 200]);
+  const R = 8;
+
+  /** Per-wedge recorded vertex counts of the Canvas/SVG Scene twin, grouped the way the engine
+   *  registers it: `sizeMode` decides the group's anchored tolerance. */
+  function sceneCounts(tolerance: number, screen: boolean): number[] {
+    const scene = new Scene(tolerance);
+    scene.group("pies", (g) => tracePieWedges(g, wedges, positions, R, screen), {
+      anchoredTolerance: anchoredCurveTolerance(tolerance, screen),
+    });
+    return scene.drawables("pies").map((d) => d.subpaths[0]?.points.length ?? 0);
+  }
+
+  /** Per-wedge vertex counts of the WebGL export of the same pies. */
+  function exportCounts(tolerance: number, screen: boolean): number[] {
+    return pieToDrawables(physicalPieInstances(wedges, positions, R), screen, tolerance).map((d) => d.subpaths[0]?.points.length ?? 0);
+  }
+
+  it("screen wedges bake at the default count however fine curveTolerance is — on both paths", () => {
+    const base = sceneCounts(DEFAULT_CURVE_TOLERANCE, true);
+    expect(base.length).toBe(2);
+    expect(sceneCounts(DEFAULT_CURVE_TOLERANCE / 40, true)).toEqual(base);
+    expect(exportCounts(DEFAULT_CURVE_TOLERANCE / 40, true)).toEqual(base);
+  });
+
+  it("world wedges keep refining, identically on both paths", () => {
+    const base = sceneCounts(DEFAULT_CURVE_TOLERANCE, false);
+    const fine = sceneCounts(DEFAULT_CURVE_TOLERANCE / 40, false);
+    expect(fine[0]).toBeGreaterThan((base[0] ?? 0) * 4);
+    expect(exportCounts(DEFAULT_CURVE_TOLERANCE / 40, false)).toEqual(fine);
   });
 });
