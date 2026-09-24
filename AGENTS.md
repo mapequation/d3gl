@@ -462,7 +462,7 @@ guard owns the serialize budget: one DOM node per drawable buys parse time, not 
 | **`network()` pan/zoom + node-drag INPUT** (#367): wheel, pan, drag and wheel+stream+drag bursts through the real d3-zoom / pointer listeners, LOD off, aggregate frontier **and** all leaves visible; no cut or render inside any handler, exactly one render + ≤1 cut per frame at the latest transform, handlers O(1) per event, the burst's frame ≤ 2× one event's (LOD-off pan/zoom frame: **count-only** — it only renders, and the render is counted; `network-sweep-perf` owns that draw's cost) | **WebGL** (draw counted, not rasterised — see below) | `network/__tests__/network-input-coalesce-perf.browser.test.ts` | 250k nodes / 748k edges, whole graph in view | `PERF_BROWSER_N` (max 250k) |
 | **`network()` fitted position transition** (#427), zoom enabled, LOD on **and** off, vs the unfitted transition: one Scene rebuild per frame, camera re-seeded once per fitted frame, no `syncScreenGeometry` re-cut, no gesture boundary; wall clock at an equal (still) view, moving camera under a ceiling; each frame laid out before the next, as a paint would | Canvas + SVG | `network/__tests__/network-vector-transition-perf.browser.test.ts` | Canvas 20k / SVG 10k nodes | `PERF_BROWSER_N` (Canvas max 40k, SVG max 20k — ~50 retained rebuilds per reduction state) |
 | **`network()` `nodeFill { by }` + `moduleFlow`** (#445), LOD on, every module open, and off; zero accessor calls per frame | **WebGL** | `network/__tests__/network-fill-by-metric-perf.browser.test.ts` | 50k nodes | `PERF_BROWSER_N` (max 200k) |
-| multi pass-through: FBO count + gesture skip | **WebGL** | `map/passthrough-multi-perf.browser.test.ts` | 25k ×2 layers | `PERF_BROWSER_N` (max 50k) |
+| multi pass-through: FBO count + gesture skip + resize surface/one cycle (#293) | **WebGL** | `map/passthrough-multi-perf.browser.test.ts` | 25k ×2 layers | `PERF_BROWSER_N` (max 50k) |
 | label placement (`cullLabels`) | — | `labels/__tests__/label-cull-perf.test.ts` | 200k candidates, dense **and** spread | `BENCH_LABEL_CULL` |
 | **`network.labels()` per-frame**, LOD on **and** off, + capped LOD top-k (`importanceOf` once per candidate) | **WebGL** | `network/__tests__/network-labels-perf.browser.test.ts` | 20k nodes, uncapped + `max: 50` | `PERF_BROWSER_N` (max 50k) |
 
@@ -1077,12 +1077,21 @@ The consequences are contract, not incidental:
   (both backends, real pixels) and `map/passthrough-multi-perf.browser.test.ts`, which pins the
   memory decision as a number — registering layers 2..4 must allocate **zero** extra framebuffers
   and textures — plus "a gesture frame re-projects nothing", "a settle is O(total), not
-  O(layers × items)" and "a resize re-creates the ONE surface and refills it in one cycle" (#293).
+  O(layers × items)" and "a resize re-creates ONLY the ONE surface (zero new GL buffers) and
+  refills it in one cycle" (#293, on a Plot).
 - **The surface follows a resize** (#293): `WebGLBackend.resize()` calls `PassThroughGL.resize()`,
-  which re-creates only the FBO and the screen-mode `u_viewport` (Models and scratch buffers stay).
-  The new surface is empty; `setSize()` repaints right after. It is still **CSS px**, so it is
-  upscaled on HiDPI (#300). Pixel guards: the `#293` suite in `map/passthrough.browser.test.ts`
-  (both backends; screen-mode edge probes catch a stale `u_viewport`).
+  which re-creates only the FBO and updates the screen-mode `u_viewport` (Models and scratch
+  buffers stay — a destroy-and-rebuild also makes exactly one framebuffer, so leg D counts GL
+  buffers to tell them apart). The new surface is empty; `setSize()` repaints right after — one
+  cycle on a Plot or a pass-through-only GeoMap, R+1 on a GeoMap with R retained layers (#302). It
+  is still **CSS px**, so it is upscaled on HiDPI (#300). Pixel guards: the `#293` suite in
+  `map/passthrough.browser.test.ts` (both backends; screen-mode edge probes catch a stale
+  `u_viewport`).
+- **Mid-gesture draws are only right on the FIRST slice.** WebGL records the snapshot-pan reference
+  (`fboRef`) on the `"replace-first"` draw alone; a later slice of a cycle started mid-gesture
+  (`setSize`/`recolor`/registration over more than `PT_CHUNK` items) and a mid-gesture `append()`
+  rasterize at the live transform and are offset by the gesture delta until settle (#306). Canvas
+  drops pass-through pixels after a mid-gesture resize instead (#303).
 
 Still unimplemented for pass-through, and unrelated to the above: `clipTo` (accepted and ignored
 on both backends).

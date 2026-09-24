@@ -1051,6 +1051,10 @@ describe("passThrough surface follows a host resize (#293)", () => {
   });
 
   it("webgl: a resize mid-gesture keeps snapshot-pan anchored to the resized surface", async () => {
+    // Single-slice repaint only (one point, real PT_CHUNK): the resize's replace-first records the
+    // reference transform and the gesture blits from it. A mid-gesture cycle spanning several
+    // slices, or a mid-gesture append, draws later batches at the live transform and is offset
+    // until settle — tracked in #306, not covered here.
     const chart = new GLPlot(host(), { width: 200, height: 200, backend: "webgl" });
     await chart.whenReady();
     chart.points("pts", [{ x: 50, y: 50 }], { ...red, radius: 8 });
