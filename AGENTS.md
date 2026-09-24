@@ -636,7 +636,7 @@ when a coordinate is wrong, so exports get their own pixel diff:
 view (harness helpers `rasterizeSVG` / `diffExports`) and diffs them position-tolerantly. Two
 rules when extending it:
 - **Run every case at ≥ 2 zoom levels, and run the `world`-`sizeMode` twin as a control.** The
-  screen-mode *bake* is the risky branch — the arrow setback and half-arrow taper/bend are
+  screen-mode *bake* is the risky branch — the arrow setback and half-arrow taper/tip are
   constant-**pixel** terms, non-linear in `k`, so they must be solved in pixel space at the export
   `k` and emitted ÷k. At `k = 1` the bake is the identity and proves nothing; in `world` mode
   `bake = 1` and the bug cannot appear, which is exactly what makes it a control.
