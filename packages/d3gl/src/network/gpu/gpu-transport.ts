@@ -6,11 +6,11 @@
  * Milestone A (N8.1): disc seed + streaming rAF loop, reading positions back to the CPU each streamed
  * frame. N8.2 (#180) adds the module-aware seed: given a provided module tree (`moduleTopology`, from
  * `lod({ modules })`), the layout is seeded top-down over it ({@link gpuMultilevelSeed}); otherwise the
- * plain disc. There is no structural (coarsening) multilevel seed on the GPU, so the inherited
- * `multilevel` option only reaches the worker fallback. N8.5 (#183) adds drag/reheat parity: on
- * convergence the loop goes **idle** (keeps the {@link GpuForceLayout} alive, doesn't destroy it), and
- * `pin`/`unpin` hold nodes + resume the loop so the rest reflows — mirroring the CPU worker
- * (layout-worker.ts).
+ * plain disc. There is no structural (coarsening) multilevel seed on the GPU, and `network.ts` does
+ * not forward `multilevel` on the gpu path, so even a worker fallback runs the worker's default
+ * (multilevel on; #312). N8.5 (#183) adds drag/reheat parity: on convergence the loop goes **idle**
+ * (keeps the {@link GpuForceLayout} alive, doesn't destroy it), and `pin`/`unpin` hold nodes + resume
+ * the loop so the rest reflows — mirroring the CPU worker (layout-worker.ts).
  */
 import type { Device } from "@luma.gl/core";
 import { gpuLayoutSupported } from "./device-caps.js";

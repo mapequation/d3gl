@@ -205,9 +205,9 @@ export interface NetworkLayoutOptions {
   backend?: "positions" | "force" | "worker" | "gpu";
   /** Interleaved `[x, y, …]` world coordinates for `backend: "positions"`. */
   positions?: Float32Array;
-  /** Iterations for `backend: "force"` (default 300, per level when multilevel). */
+  /** Iterations for the `"force"` / `"worker"` / `"gpu"` solves (default 300, per level when multilevel). */
   iterations?: number;
-  /** Force parameters for `backend: "force"`. */
+  /** Force parameters for the `"force"` / `"worker"` / `"gpu"` solves. */
   force?: Partial<ForceParams>;
   /**
    * For `backend: "force"` and `backend: "worker"`, seed the layout via multilevel coarsening
@@ -217,17 +217,21 @@ export interface NetworkLayoutOptions {
    *
    * `backend: "gpu"` does not use it: the GPU layout seeds **module-aware** (top-down over the module
    * tree) when {@link Network.lod} was given `modules` before `layout()`, and from a disc otherwise.
+   * It is not forwarded to the gpu backend's worker fallback either, which runs the worker's default
+   * (multilevel on; #312).
    */
   multilevel?: boolean;
   /**
    * For the streaming backends (`"worker"` / `"gpu"`), keep the camera framed on the layout as it
    * converges: the view is fit to the layout's live bounds each streamed frame (centroid → view
    * centre, extent → ~85% of the view) and released to normal zoom/pan once it settles or the user
-   * interacts. Without it a streaming layout converges wherever the solver centres it — the GPU
-   * solve centres the centroid at the origin, so it would otherwise render at the top-left corner
-   * until it settles. Default `false`. Ignored for `"positions"` / `"force"` (already final on the
-   * first paint). The per-frame fit reads the layout's aggregate bounds (O(top-level modules), not
-   * O(nodes)) when LOD geometry exists; with LOD off it fits once from the initial extent and holds.
+   * interacts. Without it a streaming layout converges at the solver's own scale, not the view's, and
+   * a `"gpu"` layout's first paint piles every node at the origin (the top-left corner): the device
+   * resolves asynchronously, so until the first frame streams back a freshly built graph's positions
+   * are still all zero. With it, a box-centred disc is seeded up front so the first paint is framed.
+   * Default `false`. Ignored for `"positions"` / `"force"` (already final on the first paint). The
+   * per-frame fit reads the layout's aggregate bounds (O(top-level modules), not O(nodes)) when LOD
+   * geometry exists; with LOD off it fits once from the initial extent and holds.
    */
   fit?: boolean;
 }
@@ -768,12 +772,13 @@ export class Network extends BaseEngine {
    * backend (see {@link NetworkLODOptions} for how Canvas/SVG re-cut). The tree's geometry follows the
    * layout as it converges (re-cut cheaply on zoom).
    *
-   * **Call this before `layout({ backend: "worker" })`** to get the full win: the worker then builds
-   * and streams the LOD tree itself (#103), so the main thread never coarsens or runs the O(N)
-   * geometry pass. Enabling it *after* a worker run (or on the `force`/`positions`/`gpu` backends) falls
-   * back to building the tree on the main thread from the current positions; on `gpu` its geometry is
-   * then refreshed on the main thread each streamed frame. With `modules`, calling this before
-   * `layout({ backend: "gpu" })` also seeds the GPU layout module-aware (see {@link NetworkLODOptions.modules}).
+   * **Call this before `layout({ backend: "worker" })`** to get the full win: without `modules`, the
+   * worker then builds and streams the LOD tree itself (#103), so the main thread never coarsens or
+   * runs the O(N) geometry pass. Enabling it *after* a worker run (or on the `force`/`positions`/`gpu`
+   * backends), or with `modules`, falls back to building the tree on the main thread from the current
+   * positions; while a `worker`/`gpu` layout streams, its geometry is then refreshed on the main thread
+   * each streamed frame. With `modules`, calling this before `layout({ backend: "gpu" })` also seeds
+   * the GPU layout module-aware (see {@link NetworkLODOptions.modules}).
    */
   lod(options: NetworkLODOptions | false): this {
     if (!options) {

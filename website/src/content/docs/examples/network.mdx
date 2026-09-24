@@ -37,8 +37,8 @@ posted as snapshots — the top-right readout shows whether the environment supp
 layout is actually using it.) The **Nodes** slider scales from 10 to 1,000,000; **Seeding** compares
 multilevel against a cold start (worker only, so it is greyed out on GPU); **Size** switches uniform vs
 degree-weighted radius; **Sizing** switches world vs screen units; **LOD** / **Declutter** control the
-level-of-detail cut (below); and **Edges** turns the links off entirely (next section). Drag to pan,
-scroll to zoom.
+level-of-detail cut (below); and **Edges** turns the links off entirely
+([below](#nodes-only-turning-links-off)). Drag to pan, scroll to zoom.
 
 <ExampleCard files={["network/draw.ts", "network/data.ts"]}>
   <Network client:visible slot="demo" />
@@ -59,26 +59,30 @@ net
 ```
 
 - **It needs the WebGL render backend.** On the Canvas or SVG backend, or on a WebGL2 device without
-  float render targets (`float32-renderable-webgl`), `backend: "gpu"` falls back to `"worker"`. The
-  top-right readout shows which one ran (`layout: gpu`, or `shared` / `copy` for the worker), and so
-  does [`net.layoutTransport`](/d3gl/reference/network/classes/network/#layouttransport). The choice is
-  made when a layout starts: switch this example to Canvas or SVG, then change **Nodes** to start a new
-  layout, and the readout reports the worker.
+  float render targets (`float32-renderable-webgl`), `backend: "gpu"` falls back to `"worker"`. Once
+  the layout settles, the top-right readout shows which one ran (`layout: gpu`, or `shared` / `copy` for
+  the worker); while it streams it can still read `copy`, because a GPU layout confirms its device
+  asynchronously. [`net.layoutTransport`](/d3gl/reference/network/classes/network/#layouttransport)
+  reports the same — read it after `whenSettled()`. The choice is made when a layout starts: switch
+  this example to Canvas or SVG, then change **Nodes** to start a new layout, and the readout reports
+  the worker.
 - **Every streamed frame reads positions back.** The force passes run on the GPU, but each streamed frame
   copies all node positions from the GPU into `graph.positions` so rendering, picking, labels and LOD can
   use them — a synchronous GPU→CPU readback on the main thread, for as long as the layout streams. With
   LOD on, the main thread also refreshes the LOD tree's geometry each streamed frame, which the worker
-  backend can do off-thread ([below](#level-of-detail-lod)). So unlike the worker, the GPU layout does
-  not leave the main thread idle while it solves.
+  backend can do off-thread when LOD is set without `modules` ([below](#level-of-detail-lod)). So unlike
+  the worker, the GPU layout does not leave the main thread idle while it solves.
 - **Seeding is module-aware, not multilevel.** Pass a module hierarchy with `lod({ modules })` **before**
   `layout({ backend: "gpu" })` and the GPU seeds top-down over the module tree, so modules land as
   coherent regions — the [directed map of modules](#a-directed-map-of-modules) below uses it. Without
   modules the GPU starts from a disc. It does not use the worker's `multilevel` option, which is why the
   **Seeding** control is greyed out on GPU. The module-aware seed is GPU-only for now; bringing it to the
   worker is tracked in [#205](https://github.com/mapequation/d3gl/issues/205).
-- **Pass `fit: true`.** The GPU solve centres the layout on the origin, so without `fit` it would open in
-  the top-left corner. `fit: true` frames the camera on the layout's live bounds each streamed frame and
-  hands the view back to pan/zoom once it settles or you interact.
+- **Pass `fit: true`.** The GPU device resolves asynchronously, and until the first frame streams back a
+  freshly built graph's positions are all zero, so the first paint piles every node at the origin (the
+  top-left corner); after that the layout grows at the solver's own scale, not the view's. `fit: true`
+  seeds a box-centred disc so the first paint is already framed, frames the camera on the layout's live
+  bounds each streamed frame, and hands the view back to pan/zoom once it settles or you interact.
 
 ## Nodes only: turning links off
 
