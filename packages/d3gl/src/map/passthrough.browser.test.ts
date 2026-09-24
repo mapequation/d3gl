@@ -992,3 +992,146 @@ describe("multiple pass-through layers (#110)", () => {
     chart.destroy();
   });
 });
+
+/**
+ * #293 — a host resize with a pass-through layer present.
+ *
+ * `setSize()` resizes the backend and then repaints every pass-through layer, so the CONTENT is
+ * re-pulled; the question is only whether the accumulation SURFACE follows. On WebGL it did not:
+ * `PassThroughGL` kept the construction-time width/height for its FBO, for `clipFromView` when
+ * rasterizing, for `blitMatrix` when compositing, and for the screen-mode point `u_viewport`. The
+ * point was rasterized into the old-size FBO and the full-screen blit then stretched it — a Plot
+ * point at CSS (60,60) landed at (90,45) after a 200×200 → 300×150 resize.
+ *
+ * Every case probes both the CORRECT location (must be inked) and the location the stale surface
+ * would have drawn at (must be empty), so neither a blank frame nor a stretched one passes.
+ * A NON-uniform resize is used wherever the view is size-independent (Plot), so both axes are
+ * checked; GeoMap uses a uniform one because that is the exact-refit branch whose new projected
+ * location is known in closed form.
+ */
+describe("passThrough surface follows a host resize (#293)", () => {
+  // proj() is equirectangular, scale 50, translate [100,100]: invert it analytically (no
+  // optional `invert` to unwrap) so a test can place a feature at an exact starting pixel.
+  const lonLatAt = (x: number, y: number): [number, number] => [
+    ((x - 100) / 50) * (180 / Math.PI),
+    ((100 - y) / 50) * (180 / Math.PI),
+  ];
+  const red = { x: (d: { x: number }) => d.x, y: (d: { y: number }) => d.y, fill: "rgb(255,0,0)", passThrough: true as const };
+
+  it("webgl: a world-sized point stays at its CSS location after a non-uniform resize", async () => {
+    const chart = new GLPlot(host(), { width: 200, height: 200, backend: "webgl" });
+    await chart.whenReady();
+    chart.points("pts", [{ x: 60, y: 60 }], { ...red, radius: 6 });
+    expect(chart.screenPixel(60, 60)[0]).toBeGreaterThan(180); // precondition at 200×200
+
+    chart.setSize(300, 150);
+    // Plot world coords are size-independent (identity view), so the point must not move.
+    const px = chart.screenPixel(60, 60);
+    expect(px[0]).toBeGreaterThan(180);
+    expect(px[3]).toBeGreaterThan(180);
+    // Where a 200×200 surface stretched onto 300×150 would have put it: (60·1.5, 60·0.75).
+    expect(chart.screenPixel(90, 45)[3]).toBeLessThan(40);
+    chart.destroy();
+  });
+
+  it("webgl: a screen-sized point keeps a round 6 px radius after a non-uniform resize", async () => {
+    const chart = new GLPlot(host(), { width: 200, height: 200, backend: "webgl" });
+    await chart.whenReady();
+    chart.points("pts", [{ x: 60, y: 60 }], { ...red, radius: 6, sizeMode: "screen" });
+
+    chart.setSize(300, 150);
+    // A centre probe reads red whether or not the screen-mode `u_viewport` followed the resize,
+    // so probe the EDGES: a stale [200,200] viewport in a 300×150 surface turns the 6 px disc
+    // into a 9 × 4.5 px ellipse — 8 px out along x would be inked, 5 px out along y would not.
+    expect(chart.screenPixel(60, 60)[0]).toBeGreaterThan(180);
+    expect(chart.screenPixel(60, 65)[0]).toBeGreaterThan(180); // inside a round r=6 disc
+    expect(chart.screenPixel(68, 60)[3]).toBeLessThan(40);     // outside it
+    expect(chart.screenPixel(90, 45)[3]).toBeLessThan(40);     // not stretched either
+    chart.destroy();
+  });
+
+  it("webgl: a resize mid-gesture keeps snapshot-pan anchored to the resized surface", async () => {
+    const chart = new GLPlot(host(), { width: 200, height: 200, backend: "webgl" });
+    await chart.whenReady();
+    chart.points("pts", [{ x: 50, y: 50 }], { ...red, radius: 8 });
+    chart.interact(true);
+    chart.setSize(300, 150); // e.g. a layout change while the user is dragging
+    chart.applyTransform({ k: 1, x: 40, y: 30 }); // gesture frame: blit the surface, no re-raster
+    expect(chart.screenPixel(90, 80)[0]).toBeGreaterThan(180); // panned by (+40,+30)
+    expect(chart.screenPixel(50, 50)[3]).toBeLessThan(40);
+    chart.interact(false);
+    expect(chart.screenPixel(90, 80)[0]).toBeGreaterThan(180); // and still there once crisp
+    chart.destroy();
+  });
+
+  it("webgl: a GeoMap point lands at its NEW projected location after a refit (one repaint cycle)", async () => {
+    const map = new GLGeoMap(host(), { width: 200, height: 200, projection: proj(), backend: "webgl" });
+    await map.whenReady();
+    let calls = 0;
+    map.layer("cities", [point(...lonLatAt(60, 60))], {
+      fill: () => { calls++; return "rgb(255,0,0)"; },
+      pointRadius: 6,
+      passThrough: true,
+    });
+    expect(map.screenPixel(60, 60)[0]).toBeGreaterThan(180); // precondition at 200×200
+
+    const before = calls;
+    map.setSize(300, 300); // uniform 1.5× → the projection scales exactly: (60,60) → (90,90)
+    // A pass-through-only map re-projects its one item exactly once (a single repaint cycle).
+    expect(calls - before).toBe(1);
+    const px = map.screenPixel(90, 90);
+    expect(px[0]).toBeGreaterThan(180);
+    expect(px[3]).toBeGreaterThan(180);
+    expect(map.screenPixel(60, 60)[3]).toBeLessThan(40);   // the old location is empty
+    expect(map.screenPixel(135, 135)[3]).toBeLessThan(40); // …and so is the stale-stretched one
+    map.destroy();
+  });
+
+  it("canvas: a world-sized point stays at its CSS location after a non-uniform resize", async () => {
+    const h = host();
+    const chart = plot(h, { width: 200, height: 200, backend: "canvas" });
+    await chart.whenReady();
+    chart.points("pts", [{ x: 60, y: 60 }], { ...red, radius: 6 });
+
+    chart.setSize(300, 150);
+    const ctx = canvasOf(h).getContext("2d")!;
+    expect(at(ctx, 60, 60)[0]).toBeGreaterThan(180);
+    expect(at(ctx, 60, 60)[3]).toBeGreaterThan(180);
+    expect(at(ctx, 90, 45)[3]).toBe(0);
+    chart.destroy();
+  });
+
+  it("canvas: a screen-sized point keeps a round 6 px radius after a non-uniform resize", async () => {
+    const h = host();
+    const chart = plot(h, { width: 200, height: 200, backend: "canvas" });
+    await chart.whenReady();
+    chart.points("pts", [{ x: 60, y: 60 }], { ...red, radius: 6, sizeMode: "screen" });
+
+    chart.setSize(300, 150);
+    const ctx = canvasOf(h).getContext("2d")!;
+    expect(at(ctx, 60, 60)[0]).toBeGreaterThan(180);
+    expect(at(ctx, 60, 65)[0]).toBeGreaterThan(180);
+    expect(at(ctx, 68, 60)[3]).toBe(0);
+    chart.destroy();
+  });
+
+  it("canvas: a GeoMap point lands at its NEW projected location after a refit (one repaint cycle)", async () => {
+    const h = host();
+    const map = geoMap(h, { width: 200, height: 200, projection: proj(), backend: "canvas" });
+    await map.whenReady();
+    let calls = 0;
+    map.layer("cities", [point(...lonLatAt(60, 60))], {
+      fill: () => { calls++; return "rgb(255,0,0)"; },
+      pointRadius: 6,
+      passThrough: true,
+    });
+
+    const before = calls;
+    map.setSize(300, 300);
+    expect(calls - before).toBe(1);
+    const ctx = canvasOf(h).getContext("2d")!;
+    expect(at(ctx, 90, 90)[0]).toBeGreaterThan(180);
+    expect(at(ctx, 60, 60)[3]).toBe(0);
+    map.destroy();
+  });
+});

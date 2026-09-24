@@ -235,14 +235,12 @@ export class PassThroughGL {
 
   constructor(
     private readonly device: Device,
-    private readonly width: number,
-    private readonly height: number,
+    /** Surface size in CSS px. Mutable only through {@link resize}: the FBO, `clipFromView`
+     *  (rasterize), `blitMatrix` (composite) and the screen-mode `u_viewport` all read it. */
+    private width: number,
+    private height: number,
   ) {
-    this.fbo = device.createFramebuffer({
-      width,
-      height,
-      colorAttachments: ["rgba8unorm"],
-    });
+    this.fbo = PassThroughGL.createSurface(device, width, height);
 
     // Seed the scratch buffers empty (count 0); they grow on the first draw.
     this.center = new GrowBuffer(device, Float32Array, new Float32Array(0));
@@ -332,6 +330,31 @@ export class PassThroughGL {
       parameters: BLEND,
       vertexCount: 6,
     });
+  }
+
+  /** The colour-only RGBA8 accumulation framebuffer (no depth: points/meshes blend in order). */
+  private static createSurface(device: Device, width: number, height: number): Framebuffer {
+    return device.createFramebuffer({ width, height, colorAttachments: ["rgba8unorm"] });
+  }
+
+  /**
+   * Follow a host resize (#293). Re-creates ONLY the accumulation FBO at the new size and updates
+   * the screen-mode `u_viewport` in the shared uniform record the point Model already reads —
+   * Models, pipelines and the grown scratch buffers are kept. `draw()` rebuilds `u_transform` from the new size on every call and `composite()`
+   * re-binds `u_tex` and rebuilds `u_blit` on every call, so neither needs touching here.
+   *
+   * The new surface is EMPTY: its old contents were rasterized for the old viewport and cannot be
+   * resampled correctly, so the reference transform is dropped too. The caller must follow with a
+   * full repaint — `BaseEngine.setSize()` does, straight after `backend.resize()`, in one cycle.
+   */
+  resize(width: number, height: number): void {
+    if (width === this.width && height === this.height) return;
+    this.width = width;
+    this.height = height;
+    this.fbo.destroy();
+    this.fbo = PassThroughGL.createSurface(this.device, width, height);
+    this.pointUniforms["u_viewport"] = new Float32Array([width, height]);
+    this.fboRef = null;
   }
 
   /** The accumulation FBO's color texture view, bound as u_tex for the blit. */

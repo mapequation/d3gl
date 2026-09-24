@@ -543,11 +543,16 @@ The consequences are contract, not incidental:
 - Guards: the `multiple pass-through layers (#110)` suite in `map/passthrough.browser.test.ts`
   (both backends, real pixels) and `map/passthrough-multi-perf.browser.test.ts`, which pins the
   memory decision as a number — registering layers 2..4 must allocate **zero** extra framebuffers
-  and textures — plus "a gesture frame re-projects nothing" and "a settle is O(total), not
-  O(layers × items)".
+  and textures — plus "a gesture frame re-projects nothing", "a settle is O(total), not
+  O(layers × items)" and "a resize re-creates the ONE surface and refills it in one cycle" (#293).
+- **The surface follows a resize** (#293): `WebGLBackend.resize()` calls `PassThroughGL.resize()`,
+  which re-creates only the FBO and the screen-mode `u_viewport` (Models and scratch buffers stay).
+  The new surface is empty; `setSize()` repaints right after. It is still **CSS px**, so it is
+  upscaled on HiDPI (#300). Pixel guards: the `#293` suite in `map/passthrough.browser.test.ts`
+  (both backends; screen-mode edge probes catch a stale `u_viewport`).
 
 Still unimplemented for pass-through, and unrelated to the above: `clipTo` (accepted and ignored
-on both backends), and `PassThroughGL` is not resized by `WebGLBackend.resize()`.
+on both backends).
 
 ## Backend compositing equivalence (READ before touching the WebGL renderer)
 
