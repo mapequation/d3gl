@@ -1,6 +1,6 @@
 import { select, type Selection } from "d3-selection";
 import { zoom as d3zoom, zoomIdentity, type D3ZoomEvent, type ZoomBehavior } from "d3-zoom";
-import { Scene, HitIndex, declutterScreen, declutterScratch, instancedVectorLayers, DEFAULT_CURVE_TOLERANCE, type Backend, type GroupBuilder, type RenderLayer, type VectorLayer, type ViewTransform, type DeclutterScratch, type TextData } from "../core/index.js";
+import { Scene, HitIndex, declutterScreen, declutterScratch, instancedVectorLayers, DEFAULT_CURVE_TOLERANCE, anchoredCurveTolerance, type Backend, type GroupBuilder, type GroupOptions, type RenderLayer, type VectorLayer, type ViewTransform, type DeclutterScratch, type TextData } from "../core/index.js";
 import { LabelLayer, placeLabels, labelCullScratch, labelTextY, resolveLabelStyle, measureText, canvasFont, DEFAULT_LABEL_TEXT, type LabelAnchor, type LabelStyle } from "../labels/index.js";
 import type { TextAnchor, LabelBox } from "../labels/cull.js";
 import { InstancedLane, type ScreenRect } from "../core/instanced-lane.js";
@@ -267,13 +267,14 @@ export interface BaseEngineOptions extends EngineSizing {
    *
    * It is a quality/size dial, not a free win, and it is deliberately opt-in: an arc's
    * segment count grows as `1/sqrt(tolerance)`, so `0.25 / 40` bakes ~6.3× the vertices
-   * **of the curved drawables only** (straight paths, `rect`s, and `points()` circles —
-   * which every backend draws analytically — are untouched). Costs nothing per frame.
+   * **of the world-scaled curved drawables only** (straight paths, `rect`s, and `points()`
+   * circles — which every backend draws analytically — are untouched). Costs nothing per frame.
    *
-   * One setting governs the whole engine, so it also refines **anchored `sizeMode: "screen"`
-   * glyphs**, whose offsets are used directly as pixels and therefore never facet — those
-   * extra vertices buy nothing. (An unanchored screen-`sizeMode` layer *is* world-scaled and
-   * does want the finer bake.) Splitting the tolerance per drawable is tracked separately.
+   * **Anchored `sizeMode: "screen"` glyphs are exempt** (#283): they are drawn as constant-pixel
+   * offsets from their anchor, so their bake is already in screen px and cannot facet under zoom.
+   * They bake at `max(curveTolerance, 0.25)` — the default's sub-pixel 0.25px, or coarser if you
+   * set a coarser tolerance — see {@link anchoredCurveTolerance}. The split is per drawable: a
+   * screen-`sizeMode` layer drawn **without** anchors is world-scaled geometry, so it refines.
    */
   curveTolerance?: number;
 }
@@ -796,6 +797,15 @@ export abstract class BaseEngine {
     return out.length ? out : [id];
   }
 
+  /** Scene group options for `spec` (#283): anchored drawables of a screen-`sizeMode` layer are
+   *  drawn as pixel offsets, so they bake at a pixel tolerance rather than {@link curveTolerance}.
+   *  Derived from the spec's own `sizeMode` — the same field every push hands the backend — so the
+   *  bake and the draw can't disagree: a spec's sizeMode never changes after registration, and a
+   *  new one arrives as a new spec through {@link registerLayer}, which rebuilds the group. */
+  private groupOptions(spec: LayerSpec): GroupOptions {
+    return { anchoredTolerance: anchoredCurveTolerance(this.curveTolerance, spec.sizeMode === "screen") };
+  }
+
   /** Register/replace a layer: build its Scene group, apply accessors, index, push.
    *  The generic overload is the typed→erased seam: engines construct a `LayerSpec<D>` with
    *  their concrete datum; storage is datum-erased (`LayerSpec<unknown>`) because the engine
@@ -803,7 +813,7 @@ export abstract class BaseEngine {
   protected registerLayer<D>(spec: LayerSpec<D>): void;
   protected registerLayer(spec: LayerSpec): void {
     if (spec.name.endsWith(HIGHLIGHT_SUFFIX)) throw new Error(`layer name suffix "${HIGHLIGHT_SUFFIX}" is reserved`);
-    this.scene.group(spec.name, spec.build);
+    this.scene.group(spec.name, spec.build, this.groupOptions(spec));
     this.applyAccessors(spec);
     this.reapplyOverrides(spec); // rebuilds (rotation/projection) keep overrides
     const at = this.specs.findIndex((s) => s.name === spec.name);
@@ -1161,7 +1171,7 @@ export abstract class BaseEngine {
         const i = index?.get(id) ?? -1;
         draw(i >= 0 ? spec.data[i] : null, b);
       }
-    });
+    }, this.groupOptions(spec)); // the overlay inherits the source's sizeMode, so its bake rule too
     // Colors must wait for the group build to commit (Scene.setFill resolves the group).
     for (const c of colors) {
       if (c.fill) this.scene.setFill(hlName, c.id, c.fill);

@@ -119,6 +119,21 @@ export interface DrawableOpts {
   anchor?: [number, number];
 }
 
+/** Per-group options for {@link Scene.group}. */
+export interface GroupOptions {
+  /**
+   * Curve-flattening tolerance for drawables recorded **with an `anchor`** (default: the Scene's
+   * own tolerance, i.e. no distinction). Unanchored drawables always use the Scene's tolerance.
+   *
+   * The Scene does not know how a group will be rendered; the caller does. An anchored glyph in a
+   * `sizeMode: "screen"` layer is drawn as constant-pixel offsets from its projected anchor, so
+   * its bake is already screen-space and wants a pixel tolerance, not a world one — the engines
+   * pass `anchoredCurveTolerance(tolerance, sizeMode === "screen")` here (#283). Appends
+   * ({@link Scene.appendToGroup}) inherit it.
+   */
+  anchoredTolerance?: number;
+}
+
 export interface GroupBuilder {
   drawable(id: string | number, draw: (ctx: PathRecorder) => void, opts?: DrawableOpts): void;
   /**
@@ -345,7 +360,11 @@ class GroupData {
    *  lives in it — so only a drawable-set change can stale it. Like {@link vectors} it is
    *  already retained downstream (every backend keeps the `GroupBuffers` it was handed). */
   pointCenters: Float32Array | null = null;
-  constructor(public readonly tolerance: number) {}
+  /** `tolerance` bakes unanchored drawables; `anchoredTolerance` those with an `anchor` (#283). */
+  constructor(
+    public readonly tolerance: number,
+    public readonly anchoredTolerance: number = tolerance,
+  ) {}
 }
 
 /**
@@ -382,9 +401,10 @@ export class Scene {
 
   constructor(private readonly tolerance = DEFAULT_CURVE_TOLERANCE) {}
 
-  /** Build (or rebuild) a named group. The callback registers drawables. */
-  group(name: string, build: (g: GroupBuilder) => void): void {
-    const data = new GroupData(this.tolerance);
+  /** Build (or rebuild) a named group. The callback registers drawables. `opts.anchoredTolerance`
+   *  sets the bake of anchored drawables (see {@link GroupOptions}); omitted ⇒ the Scene's tolerance. */
+  group(name: string, build: (g: GroupBuilder) => void, opts?: GroupOptions): void {
+    const data = new GroupData(this.tolerance, opts?.anchoredTolerance ?? this.tolerance);
     build(this.builderFor(data));
     this.groups.set(name, data);
   }
@@ -434,7 +454,10 @@ export class Scene {
     opts?: DrawableOpts,
   ): void {
     if (data.idToDrawable.has(id)) throw new Error(`duplicate drawable id: ${String(id)}`);
-    const recorder = new PathRecorder(data.tolerance);
+    const anchor = opts?.anchor ?? null;
+    // The bake is per DRAWABLE (#283): an anchored one may be drawn as pixel offsets (screen
+    // sizeMode), which the group's anchoredTolerance accounts for; everything else is world-scaled.
+    const recorder = new PathRecorder(anchor ? data.anchoredTolerance : data.tolerance);
     draw(recorder);
     const subpaths = recorder.subpaths;
     const drawableId = data.ranges.length;
@@ -448,7 +471,6 @@ export class Scene {
     data.joins = pushCode(data.joins, JOIN_NAMES.indexOf(join), drawableId);
     data.caps = pushCode(data.caps, CAP_NAMES.indexOf(cap), drawableId);
     data.miterLimits = pushLimit(data.miterLimits, miterLimit, drawableId);
-    const anchor = opts?.anchor ?? null;
     data.anchors.push(anchor);
 
     // ---- Fill ----

@@ -518,6 +518,29 @@ backend sees it. Consequences to keep in mind:
   `core/__tests__/vector-view-perf.test.ts` (1M, ×20 pushes) and
   `map/push-layers-perf.browser.test.ts` (the real `pushLayers`, on Canvas and WebGL).
 
+## Curve bake tolerance is per DRAWABLE (#45, #283)
+
+Curves are flattened once, at `Scene.group()`, and the view only scales the result — so the right
+tolerance depends on how a drawable is *drawn*. World-scaled geometry bakes at the engine's
+`curveTolerance` (world units). An **anchored** drawable in a `sizeMode: "screen"` layer is drawn as
+`anchor′ + (p − anchor)` — its offsets are **pixels** — so it bakes at
+`anchoredCurveTolerance(curveTolerance, true)` = `max(curveTolerance, 0.25)`; refining it buys nothing.
+
+- The Scene stays unaware of render modes: the caller passes `scene.group(name, build,
+  { anchoredTolerance })`, and `addDrawable` picks `anchor ? anchoredTolerance : tolerance`. The
+  engine derives it from `spec.sizeMode` in `BaseEngine.groupOptions` — the same field every push
+  hands the backend, so bake and draw cannot disagree.
+- **Direct Scene users must keep the two in sync themselves.** The backend-equivalence harness
+  passes `sizeMode` only at render time (`layerOf(scene, name, { sizeMode })`); a group baked with a
+  px `anchoredTolerance` but rendered `"world"` would show facets under zoom.
+- A per-group override keyed on `sizeMode` alone is wrong: a screen layer drawn **without** anchors
+  is world-scaled and must refine.
+- The WebGL export twin (`pieToDrawables`) applies the same rule, so a network pie's WebGL and
+  Canvas/SVG exports bake identically. Not yet covered: bent links / half-arrows in the export and
+  `expandStroke`'s round joins/caps (#310).
+- Guards: `core/__tests__/curve-tolerance.test.ts`, `network/__tests__/pie-instances.test.ts`,
+  `map/curve-tolerance.browser.test.ts` (per-layer counts on all three backends + pixel identity).
+
 ## Pass-through layers share ONE accumulation surface (#110)
 
 Every pass-through (`passThrough: true`) layer draws into a **single** shared surface — the WebGL

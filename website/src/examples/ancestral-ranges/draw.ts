@@ -139,9 +139,11 @@ function labelOffset(mode: LayoutMode, angle: number, gap: number): [number, num
 export const setup: ImperativeSetup = (host, { width, height, backend }) => {
   const W = width, H = height;
 
-  // Curves (the pie rims, the radial "step" arcs, the bump links) are flattened to polylines
-  // ONCE, in world units — so a facet of t world units is t*k screen px at zoom k. Declaring the
-  // deepest zoom bakes them fine enough to stay sub-pixel all the way in, at no per-frame cost.
+  // Curves (the radial "step" arcs, the bump links, world-mode pie rims) are flattened to
+  // polylines ONCE, in world units — so a facet of t world units is t*k screen px at zoom k.
+  // Declaring the deepest zoom bakes them fine enough to stay sub-pixel all the way in, at no
+  // per-frame cost. Screen-mode pies are anchored pixel-sized glyphs that can't facet, so d3gl
+  // leaves their bake alone.
   const chart = plot(host, { width: W, height: H, backend, curveTolerance: 0.25 / MAX_ZOOM });
   // Scroll to zoom, drag to pan; the engine re-places the tip labels on every transform.
   chart.enableZoom([0.5, MAX_ZOOM]);
