@@ -362,8 +362,9 @@ export class WebGLBackend implements Backend {
 
   /** Resize the onscreen canvas drawing buffer (luma owns it via useDevicePixels), recompute
    *  the clip matrix at the new size, push the new viewport to every renderer (screen-mode point
-   *  sizing) and recreate the offscreen export framebuffer. The engine re-pushes layers + renders
-   *  after. Globe mode reads this.width/height per draw, so it follows automatically. */
+   *  sizing), recreate the offscreen export framebuffer and resize the pass-through accumulation
+   *  surface. The engine re-pushes layers + renders (and repaints pass-through layers) after.
+   *  Globe mode reads this.width/height per draw, so it follows automatically. */
   resize(width: number, height: number): void {
     if (width === this.width && height === this.height) return;
     this.width = width;
@@ -393,6 +394,10 @@ export class WebGLBackend implements Backend {
       colorAttachments: ["rgba8unorm"],
       depthStencilAttachment: "depth24plus-stencil8",
     });
+    // The ONE shared pass-through surface (#110) follows too (#293): left at the old size it
+    // rasterizes against the old viewport and the full-screen blit stretches it onto the new one.
+    // It comes back empty; the engine's setSize() repaints every pass-through layer right after.
+    this.pt?.resize(width, height);
     this.bakeDirty = true;
     // The pick FBO is device-px and size-checked in ensurePickFbo (recreated on mismatch); just mark stale.
     this.pickDirty = true;
