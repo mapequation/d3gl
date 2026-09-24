@@ -1,5 +1,5 @@
 import { BaseEngine, type BaseEngineOptions, type HoverHit, type InteractiveLayerOptions, type LaneInteractive, type NodeDragSession } from "../map/base-engine.js";
-import { networkLayers, networkLayersFromCache, noLodStyleCache, drawsLinks, frontierCircles, frontierHalos, superEdges, makeSuperEdgesScratch, emitNodes, emitLinks, emitArrows, emitHalfLinks, traceFrontierGlyphs, traceFrontierHalos, traceSuperHalfArrows, traceSuperLines, traceSuperArrows, physicalPieInstances, tracePieWedges, rgbaCss, pickNodes, regionNodes, resolveNodeRadii, resolveNodeRadiusAggregate, resolveImportance, resolveFlowBorder, resolveNodeColors, resolveLinkWidthOf, resolveLinkColorOf, resolveLinkStrokeOf, flowBorderInnerRadii, type ResolvedNetworkStyle, type NoLodStyleCache, type NodeRadiusSpec, type ImportanceSpec, type FlowBorderSpec, type ConstBorder, type LinkWidthSpec, type LinkColorSpec, type LinkStyle } from "./glyphs.js";
+import { networkLayers, networkLayersFromCache, noLodStyleCache, drawsLinks, frontierCircles, frontierHalos, superEdges, makeSuperEdgesScratch, emitNodes, emitLinks, emitArrows, emitHalfLinks, traceFrontierGlyphs, traceFrontierHalos, traceSuperHalfArrows, traceSuperLines, traceSuperArrows, physicalPieInstances, physicalPieSelected, tracePieWedges, rgbaCss, pickNodes, regionNodes, resolveNodeRadii, resolveNodeRadiusAggregate, resolveImportance, resolveFlowBorder, resolveNodeColors, resolveLinkWidthOf, resolveLinkColorOf, resolveLinkStrokeOf, flowBorderInnerRadii, type ResolvedNetworkStyle, type NoLodStyleCache, type NodeRadiusSpec, type ImportanceSpec, type FlowBorderSpec, type ConstBorder, type LinkWidthSpec, type LinkColorSpec, type LinkStyle } from "./glyphs.js";
 import { rgb } from "d3-color";
 import { ForceLayout, seedPositions, type ForceParams } from "./force.js";
 import { multilevelLayout, type CoarsenOptions } from "./coarsen.js";
@@ -351,9 +351,11 @@ const DEFAULT_NODE_FILL = "#4878d0";
 const DEFAULT_LINK_WIDTH = 1;
 const DEFAULT_LINK_STROKE = "#999999";
 const LAYER_NAMES = ["links", "arrows", "node-halos", "nodes"] as const;
-/** Base-lane layers the shader highlight (#162) drives — nodes + links (not the aggregate halos, which
- *  carry no group/selected and so render un-dimmed). */
-const HL_LAYERS = ["nodes", "links", "arrows"] as const;
+/** Base-lane layers the shader highlight (#162) drives — nodes + links, and the state-network physical
+ *  view's pie wedges (#175), which dim/keep exactly like the node discs they sit on (no recolour). Not
+ *  the aggregate halos, which carry no group/selected and so render un-dimmed. A name with no layer on
+ *  the backend (no pie outside the physical view) is a no-op in `styleInstancedLayer`. */
+const HL_LAYERS = ["nodes", "links", "arrows", "pie"] as const;
 /** Scale a laid-out graph's positions (in place) to fill the view at the default `k = 1` zoom — the
  *  same "scale the layout, don't fit-transform" approach the directed-map-of-modules example uses, so
  *  the network opens framed without a custom transform (which would fight d3-zoom's own transform, #171).
@@ -500,6 +502,9 @@ export class Network extends BaseEngine {
   private noLodSelectedCacheFor: { style: ResolvedNetworkStyle; graph: NetworkGraph } | null = null;
   private noLodSelectedNodes: Uint8Array | null = null;
   private noLodSelectedLinks: Uint8Array | null = null;
+  /** The physical-view pie's per-wedge flags (#175), cached on the same contract, plus the wedge set
+   *  they were built for (a new {@link stateNetwork} can swap `pieWedges` under the same key). */
+  private noLodSelectedPie: { wedges: PhysicalPieWedges; flags: Uint8Array } | null = null;
   /** Registry key for the single network instanced lane (#108-B). */
   private readonly NET_LANE = "network";
   /** Registry key for the companion selection/hover ring overlay lane (#105 N7c-2), drawn on top. */
@@ -578,6 +583,12 @@ export class Network extends BaseEngine {
   private readonly PIE_LAYER = "pie";
   /** Registry key + layer name for the `both`-view physical container discs (drawn under the state nodes). */
   private readonly CONTAINER_LAYER = "phys-container";
+  /** Every layer name the base network lane can put on the backend: the standard set plus the
+   *  state-network overlays (#171). BOTH lane branches register all of it, whatever the current mode,
+   *  because an emit-set change removes only the names the NEW entry lists — so a pie/container drawn by
+   *  the previous lane (no-LOD physical view → `lod()` on, or a state network → `data(plainGraph)`) is
+   *  dropped instead of lingering, stale, on the backend (#175). Removing an absent layer is a no-op. */
+  private readonly LANE_LAYERS: readonly string[] = [this.CONTAINER_LAYER, ...LAYER_NAMES, this.PIE_LAYER];
 
   constructor(host: HTMLElement, opts: NetworkOptions = {}) {
     super(host, opts);
@@ -806,7 +817,11 @@ export class Network extends BaseEngine {
    * - `selection: { selected, others }` — `selected.stroke` overrides the **select** ring colour
    *   (default `#2563eb` blue); the hover ring defaults to `#16a34a` green (override via a `hover`
    *   HighlightStyle's `stroke`). A subtract-marquee preview rings the to-be-removed glyphs `#dc2626`
-   *   red. `others` (Scene dimming) is ignored on instanced glyphs — selected glyphs get a ring.
+   *   red. `others.opacity` (default `0.3`) fades every glyph that is NOT selected — nodes, aggregates,
+   *   links and the physical-view pies alike — while the selected ones keep full opacity and get a ring,
+   *   plus their outgoing links. It is a shader uniform, so selecting costs no geometry rebuild. A colour
+   *   in `others` is ignored on these instanced glyphs. `hover: { others: { opacity } }` opts into the
+   *   same fade while hovering.
    *
    * The hit's `datum` is a {@link NetworkHit} (`{ aggregate, count }`); its `members()` lists the leaf
    * node ids the target covers (1 for a leaf, the whole subtree for an aggregate). Observe selection
@@ -1265,6 +1280,11 @@ export class Network extends BaseEngine {
     const radii = cb ? Float32Array.from(resolved.nodeRadii, (r) => Math.max(0, r - Math.min(r, cb.width))) : resolved.nodeRadii;
     const pie = physicalPieInstances(this.pieWedges, graph.positions, radii);
     if (pie.count === 0) return null;
+    // #175: the per-wedge `selected` flags travel ON the emit (like the nodes' via attachNoLodHighlight).
+    // A flag-less emit would zero-fill the GPU column (HighlightBuffers.write) on the next layout/drag
+    // frame and dim the selected pie too. Cached per selection version, so a position-only frame hands
+    // back the same array and its upload is skipped.
+    pie.selected = this.noLodSelectedFor(this.PIE_LAYER);
     return { name: this.PIE_LAYER, primitive: "pie", pie, sizeMode: resolved.sizeMode };
   }
 
@@ -1538,7 +1558,9 @@ export class Network extends BaseEngine {
       };
       const lane = new InstancedLane(strategy, (visible) => this.frontierLayers(tree, this.resolvedStyleCached(this.graph!), visible));
       this.registerInstancedLane(this.NET_LANE, {
-        lane, layerNames: LAYER_NAMES, dynamic: true,
+        // LANE_LAYERS lists the state-network overlays although the frontier never emits them (pies are
+        // not LOD-aware yet, #174), so switching LOD on drops the pie the no-LOD lane drew (#175).
+        lane, layerNames: this.LANE_LAYERS, dynamic: true,
         resolve: (g) => ({ layer: this.NODE_LAYER, id: g, datum: this.lodDatum(tree, g) }),
         interactive: this.laneInteractive((g) => this.lodDatum(tree, g), (g) => leavesUnder(tree, g)),
         // Link picking (#141): frontierLayers sets `linkResolve` per emit (it has the super-edge ids/flows).
@@ -1570,7 +1592,7 @@ export class Network extends BaseEngine {
       });
       this.registerInstancedLane(this.NET_LANE, {
         // Overlay layer names must be in layerNames so a view switch removes them (emit-set-change re-adds).
-        lane, layerNames: this.stateData ? [this.CONTAINER_LAYER, ...LAYER_NAMES, this.PIE_LAYER] : LAYER_NAMES, dynamic: false,
+        lane, layerNames: this.LANE_LAYERS, dynamic: false,
         resolve: (i) => ({ layer: this.NODE_LAYER, id: i, datum: { aggregate: false, count: 1 } satisfies NetworkHit }),
         interactive: this.laneInteractive(() => ({ aggregate: false, count: 1 }), (i) => [i]),
         gpuPick: this.pickLinksEnabled ? (id) => this.linkResolve?.(id) ?? null : undefined,
@@ -1661,8 +1683,9 @@ export class Network extends BaseEngine {
         if (cache.groupTarget) link.groups2 = cache.groupTarget;
         link.selected = linkSelected ??= this.noLodSelectedFor("links"); // links/arrows share the per-edge flag
       }
-      // A "pie" layer (#171 physical view) is not part of the standard node/link set; it carries its own
-      // per-wedge groups (physical node id) from physicalPieInstances, so no attachment is needed here.
+      // A "pie" layer (#171 physical view) is not part of the standard node/link set: its per-wedge groups
+      // (physical node id) come from physicalPieInstances and its `selected` flags are attached where it
+      // is built ({@link pieInstancedLayer}, #175).
     }
     return layers;
   }
@@ -1801,7 +1824,8 @@ export class Network extends BaseEngine {
 
   /** Per-instance `selected` flags for a no-LOD base layer from the current selection (#162) — refreshed
    *  in place on a selection change instead of rebuilding geometry. `nodes`: node i selected; link layers:
-   *  edge e's source (directed) / either endpoint (undirected) selected. Cached per (graph, style,
+   *  edge e's source (directed) / either endpoint (undirected) selected; `pie` (#175): wedge w's physical
+   *  node selected (physical view only, else undefined). Cached per (graph, style,
    *  selection) version (#240): position-only frames get the SAME array instances back (the renderer
    *  skips their re-upload by reference identity); a selection change invalidates
    *  ({@link invalidateNoLodSelected}), so the next call builds FRESH arrays that do upload. */
@@ -1815,6 +1839,16 @@ export class Network extends BaseEngine {
       this.noLodSelectedCacheFor = { style, graph };
     }
     const sel = this.selectedIds(this.NODE_LAYER);
+    if (layer === this.PIE_LAYER) {
+      // Physical view only: the active graph is `sg.physical`, so a selected node id IS the physical id
+      // the pie's wedges are grouped by. No pie layer ⇒ no flags (and nothing for writeSelected to hit).
+      const wedges = this.activeView === "physical" ? this.pieWedges : null;
+      if (!wedges) return undefined;
+      if (this.noLodSelectedPie?.wedges === wedges) return this.noLodSelectedPie.flags;
+      const flags = physicalPieSelected(wedges, sel?.size ? (p) => sel.has(p) : null);
+      this.noLodSelectedPie = { wedges, flags };
+      return flags;
+    }
     if (layer === this.NODE_LAYER) {
       if (this.noLodSelectedNodes) return this.noLodSelectedNodes;
       const out = new Uint8Array(graph.nodeCount);
@@ -1834,6 +1868,7 @@ export class Network extends BaseEngine {
   private invalidateNoLodSelected(): void {
     this.noLodSelectedNodes = null;
     this.noLodSelectedLinks = null;
+    this.noLodSelectedPie = null;
   }
 
   /** Shader-highlight columns for the emitted LOD super-edges (#162): `groups` = source tree-node,
