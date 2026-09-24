@@ -360,10 +360,11 @@ class GroupData {
    *  lives in it — so only a drawable-set change can stale it. Like {@link vectors} it is
    *  already retained downstream (every backend keeps the `GroupBuffers` it was handed). */
   pointCenters: Float32Array | null = null;
-  /** `tolerance` bakes unanchored drawables; `anchoredTolerance` those with an `anchor` (#283). */
+  /** `tolerance` bakes unanchored drawables; `anchoredTolerance` those with an `anchor` (#283).
+   *  Both are required: the "omitted ⇒ the Scene's tolerance" default lives in {@link Scene.group}. */
   constructor(
     public readonly tolerance: number,
-    public readonly anchoredTolerance: number = tolerance,
+    public readonly anchoredTolerance: number,
   ) {}
 }
 

@@ -536,8 +536,10 @@ tolerance depends on how a drawable is *drawn*. World-scaled geometry bakes at t
 - A per-group override keyed on `sizeMode` alone is wrong: a screen layer drawn **without** anchors
   is world-scaled and must refine.
 - The WebGL export twin (`pieToDrawables`) applies the same rule, so a network pie's WebGL and
-  Canvas/SVG exports bake identically. Not yet covered: bent links / half-arrows in the export and
-  `expandStroke`'s round joins/caps (#310).
+  Canvas/SVG exports bake identically. Not yet covered (#310): bent links / half-arrows in the export,
+  `expandStroke`'s round joins/caps, and the **mirror-image** case on the Scene path — screen-mode
+  half-arrows are solved in px, scaled ÷k to world (`emitHalfLinks`, `bake = k`) and then recorded at
+  the *world* tolerance, so their bend facets at `curveTolerance·k` px after each zoom-end re-bake.
 - Guards: `core/__tests__/curve-tolerance.test.ts`, `network/__tests__/pie-instances.test.ts`,
   `map/curve-tolerance.browser.test.ts` (per-layer counts on all three backends + pixel identity).
 

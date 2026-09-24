@@ -129,6 +129,8 @@ const GLYPH_R = 8;
 const GLYPH_FILL = "#ff0000";
 const WORLD_FILL = "#0000ff";
 const UNANCHORED_FILL = "#008000";
+const ANCHORED_WORLD_FILL = "#ff00ff";
+const ANCHORED_DEFAULT_FILL = "#00ffff";
 
 function fullCircle(ctx: PathContext, cx: number, cy: number, r: number): void {
   ctx.moveTo(cx + r, cy);
@@ -156,7 +158,10 @@ async function mountPlot(backend: BackendType, curveTolerance: number | undefine
 }
 
 /** The ancestral-ranges mix in one engine: an anchored screen glyph, a world curve, and an
- *  UNANCHORED screen-sizeMode curve (world-scaled geometry that does want the fine bake). */
+ *  UNANCHORED screen-sizeMode curve (world-scaled geometry that does want the fine bake). Plus
+ *  the two anchored layers the floor must NOT touch — `sizeMode: "world"` and sizeMode omitted
+ *  (which means world): there the anchor is ignored and the drawable is world-scaled, as in the
+ *  ancestral-ranges `coords: "world"` pies. They pin the engine's predicate to `=== "screen"`. */
 function mixedLayers(chart: Plot): void {
   chart.layer("glyph", [0], {
     draw: (ctx: PathContext) => fullCircle(ctx, CX, CY, GLYPH_R),
@@ -171,6 +176,19 @@ function mixedLayers(chart: Plot): void {
     sizeMode: "screen",
     fill: UNANCHORED_FILL,
     id: () => "u",
+  });
+  chart.layer("anchoredWorld", [0], {
+    draw: (ctx: PathContext) => fullCircle(ctx, CX, CY, R),
+    anchor: () => [CX, CY],
+    sizeMode: "world",
+    fill: ANCHORED_WORLD_FILL,
+    id: () => "aw",
+  });
+  chart.layer("anchoredDefault", [0], {
+    draw: (ctx: PathContext) => fullCircle(ctx, CX, CY, R),
+    anchor: () => [CX, CY],
+    fill: ANCHORED_DEFAULT_FILL,
+    id: () => "ad",
   });
 }
 
@@ -206,7 +224,9 @@ describe("#283 anchored screen glyphs are exempt from curveTolerance", () => {
       // eslint-disable-next-line no-console
       console.log(`[#283 ${backend}] default ${JSON.stringify([...base])} | 0.25/${K} ${JSON.stringify([...fine])}`);
       // Guard the fixture: every layer exported something (else the equalities below are vacuous).
-      for (const fill of [GLYPH_FILL, WORLD_FILL, UNANCHORED_FILL]) expect(base.get(fill) ?? 0).toBeGreaterThan(4);
+      for (const fill of [GLYPH_FILL, WORLD_FILL, UNANCHORED_FILL, ANCHORED_WORLD_FILL, ANCHORED_DEFAULT_FILL]) {
+        expect(base.get(fill) ?? 0).toBeGreaterThan(4);
+      }
 
       // The acceptance criterion: same vertex count as at the default…
       expect(fine.get(GLYPH_FILL)).toBe(base.get(GLYPH_FILL));
@@ -214,6 +234,10 @@ describe("#283 anchored screen glyphs are exempt from curveTolerance", () => {
       expect(fine.get(WORLD_FILL) ?? 0).toBeGreaterThan((base.get(WORLD_FILL) ?? 0) * 4);
       // …and so does an unanchored screen layer: the predicate is per drawable, not per sizeMode.
       expect(fine.get(UNANCHORED_FILL) ?? 0).toBeGreaterThan((base.get(UNANCHORED_FILL) ?? 0) * 4);
+      // …and an ANCHORED drawable refines too unless its layer is screen-sized: in world sizeMode
+      // (explicit or omitted) the anchor is ignored and the glyph scales with the zoom.
+      expect(fine.get(ANCHORED_WORLD_FILL) ?? 0).toBeGreaterThan((base.get(ANCHORED_WORLD_FILL) ?? 0) * 4);
+      expect(fine.get(ANCHORED_DEFAULT_FILL) ?? 0).toBeGreaterThan((base.get(ANCHORED_DEFAULT_FILL) ?? 0) * 4);
     });
   }
 
