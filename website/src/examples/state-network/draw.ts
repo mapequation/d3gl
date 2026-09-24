@@ -27,7 +27,8 @@ const VIEW = { Physical: "physical", State: "state", Both: "both" } as const;
  * (main-thread, synchronous), **Worker** (off-thread, progressive), or **GPU** (WebGL2 Barnes-Hut,
  * falling back to Worker when unavailable) — and derives the rosette from it each streamed frame (#182);
  * `fit: true` has the camera **frame the layout** on every backend — following it as it converges on
- * Worker/GPU, once as it lands on Force. Scroll to zoom, drag to pan.
+ * Worker/GPU, once as it lands on Force. Scroll to zoom, drag to pan; dragging a node moves it, and
+ * ⌘/Ctrl-drag pans even over a node (#178).
  */
 export const setup: ImperativeSetup = (host, { width, height, backend }) => {
   const net = network(host, { width, height, backend });
