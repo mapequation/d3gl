@@ -33,16 +33,17 @@ const SIZES = [500, 1_000, 2_000, 5_000, 10_000, 20_000];
  *
  * `net.interactive({ selectable, hover, draggable })` adds the selection/hover rings + node-drag (#140):
  * hover/click rings a node or module, ⇧+drag box-selects (⌥ subtracts), and dragging a glyph — or a whole
- * selection, or a collapsed module — moves it (translate-only here, on the `positions` backend). It shows
- * the selection/hover ring living alongside the per-node **flowBorder** ring and a module's **aggregateOutline**.
+ * selection, or a collapsed module — moves it (translate-only here, on the `positions` backend); hold ⌘
+ * (Ctrl on Windows/Linux) to pan instead, even over a glyph (#178). It shows the selection/hover ring
+ * living alongside the per-node **flowBorder** ring and a module's **aggregateOutline**.
  */
 export const setup: ImperativeSetup = (host, { width, height, backend }) => {
   const net = network(host, { width, height, backend });
   net.enableZoom([0.1, 40]); // default view; zoom out to the module map, in to single nodes
   // Selection + hover rings and node-drag (#140): hover/click rings a node or module (green hover, blue
   // selection), ⇧+drag box-selects (⌥ subtracts, red preview), and dragging a glyph — or a whole selected
-  // set, or a collapsed module — moves it. Note how the selection/hover ring sits alongside the per-node
-  // flowBorder ring and a collapsed module's aggregateOutline.
+  // set, or a collapsed module — moves it (⌘/Ctrl-drag pans instead). Note how the selection/hover ring
+  // sits alongside the per-node flowBorder ring and a collapsed module's aggregateOutline.
   net.interactive({ selectable: { multi: true }, draggable: true, hover: true });
 
   // Labels slider → max cap; the last position is "All" (no limit).

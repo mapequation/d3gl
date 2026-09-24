@@ -9,6 +9,7 @@ import { buildBatch, type DrawItem } from "./draw-batch.js";
 import { composeColor, type StyleOverride, type SelectionOptions } from "./style-overrides.js";
 import { HighlightBuilder, resolveHighlight, hoverParts, HIGHLIGHT_SUFFIX, type HighlightStyle, type HighlightDraw, type HoverOption, type HoverOptions, type PendingColor } from "./highlight.js";
 import { Tooltip } from "./tooltip.js";
+import { PAN_MODIFIER, type PanModifier } from "./pan-modifier.js";
 
 export type Accessor<D, T> = T | ((d: D, i: number) => T);
 export interface HoverHit {
@@ -109,9 +110,10 @@ export interface InteractiveLayerOptions<D = unknown> {
    *  independently of `on("select")`, which is a pure observer. */
   selectable?: boolean | { multi?: boolean };
   /** Opt this layer's glyphs into **node-drag** (#140): a plain drag starting on a glyph moves it
-   *  (instead of panning), reheating the layout. Honored only by engines that implement node-drag
-   *  ({@link BaseEngine.beginNodeDrag} — currently `network()`); ignored by geoMap/plot. The pointer
-   *  listeners are attached when the layer is registered, like `selectable`. */
+   *  (instead of panning), reheating the layout. Hold ⌘ (Ctrl on Windows/Linux) to pan instead, even
+   *  over a glyph (#178), which is how you navigate a dense graph. Honored only by engines that
+   *  implement node-drag ({@link BaseEngine.beginNodeDrag} — currently `network()`); ignored by
+   *  geoMap/plot. The pointer listeners are attached when the layer is registered, like `selectable`. */
   draggable?: boolean;
 }
 
@@ -388,6 +390,10 @@ export abstract class BaseEngine {
   /** True while the user is interacting (a rotation drag, or a zoom/pan gesture).
    *  Layers flagged hideOnInteraction are excluded from the render while this is true. */
   protected interacting = false;
+  /** The **force-pan modifier** (#178): held while dragging, the drag always pans and never grabs a
+   *  draggable glyph. ⌘ on Apple platforms, Ctrl elsewhere — detected once ({@link PAN_MODIFIER}), not
+   *  an option. Protected only so a test subclass can pin the other platform's key. */
+  protected readonly panModifier: PanModifier = PAN_MODIFIER;
   /** Detaches the currently-attached interaction (zoom or rotation), if any. */
   private interactionCleanup: (() => void) | null = null;
   /** Live d3-zoom selection + behaviour set by {@link enableZoom}, kept so a programmatic view
@@ -1635,22 +1641,31 @@ export abstract class BaseEngine {
    * Enable scroll-to-zoom / drag-to-pan via d3-zoom, clamped to `extent`. The optional
    * `onTransform` callback fires after each `setTransform` during zoom — use it to keep an
    * HTML overlay (e.g. a `LabelLayer`) aligned with the GPU geometry as the view changes.
+   * A drag that starts on a draggable glyph moves the glyph instead (#140). Holding ⌘ (Ctrl on
+   * Windows/Linux) makes any drag pan, even over a glyph (#178).
    */
   enableZoom(extent: [number, number] = [1, 100], onTransform?: (t: ViewTransform) => void): this {
     this.disableInteraction();
     const sel = select<Element, unknown>(this.host);
     const behavior = d3zoom<Element, unknown>().scaleExtent(extent)
-      // Reserve shift+drag for the marquee (#159) only when something is marquee-selectable — otherwise
-      // keep d3-zoom's default (which pans on shift+drag). Shift+wheel still zooms (wheel is exempt).
-      .filter((e: Event) => {
-        const me = e as MouseEvent;
-        if (me.shiftKey && e.type !== "wheel" && this.marqueeCapable()) return false;
-        // A plain primary drag starting ON a draggable glyph is a node-drag (#140), not a pan — let
-        // d3-zoom decline it so `onPointerDown` grabs the node. d3-zoom starts a pan on `mousedown`
-        // (its registered event is `mousedown.zoom`, not pointerdown), so the hit-test must run there;
-        // wheel/dblclick keep zooming. (onPointerDown re-resolves the hit to actually start the drag.)
-        if ((e.type === "mousedown" || e.type === "pointerdown") && !me.shiftKey && !me.ctrlKey && !me.button && this.draggableAtEvent(me)) return false;
-        return (!me.ctrlKey || e.type === "wheel") && !me.button;
+      // d3-zoom calls this for `wheel`, `mousedown`, `dblclick` and `touchstart` (a TouchEvent has no
+      // `button`), and for EVERY wheel tick — the zoom path — so a wheel must never reach a hit-test.
+      .filter((e: MouseEvent | TouchEvent) => {
+        const wheel = e.type === "wheel";
+        // Reserve shift+drag for the marquee (#159) only when something is marquee-selectable — otherwise
+        // keep d3-zoom's default (which pans on shift+drag). Shift+wheel still zooms (wheel is exempt).
+        if (e.shiftKey && !wheel && this.marqueeCapable()) return false;
+        const button = "button" in e ? e.button : 0;
+        // A press that GRABS a draggable glyph is a node-drag (#140), not a pan — decline it so
+        // `onPointerDown` owns it. d3-zoom starts a pan on `mousedown` (its registered event is
+        // `mousedown.zoom`, not pointerdown), so the hit-test must run there; `grabTarget` is the same
+        // gate onPointerDown uses, so the two cannot disagree. wheel/dblclick keep zooming.
+        const press = e.type === "mousedown" || e.type === "pointerdown";
+        if (press && "button" in e && this.grabTarget(e)) return false;
+        // d3-zoom's default refuses Ctrl (macOS ctrl-click opens the context menu) — except where Ctrl
+        // IS the force-pan modifier (#178): there a Ctrl-drag must pan, like ⌘ on a Mac.
+        const forcePan = press && e[this.panModifier];
+        return (!e.ctrlKey || wheel || forcePan) && !button;
       })
       .on("start", () => this.setInteracting(true))
       .on("zoom", (e: D3ZoomEvent<Element, unknown>) => {
@@ -1870,11 +1885,9 @@ export abstract class BaseEngine {
     // shift+drag over a marquee-selectable lane starts a region selection instead of a pan (#159).
     if (e.shiftKey && this.marqueeCapable()) { this.startMarquee(e); return; }
     // A plain primary drag starting ON a draggable glyph grabs it (#140). The d3-zoom filter declined
-    // the pan for the same condition; the actual pin/reheat is deferred to the first real move.
-    if (!e.shiftKey && !e.ctrlKey && !e.metaKey && e.button === 0) {
-      const hit = this.draggableAtEvent(e);
-      if (hit) this.startNodeDrag(hit, e);
-    }
+    // the pan through the same `grabTarget`; the actual pin/reheat is deferred to the first real move.
+    const hit = this.grabTarget(e);
+    if (hit) this.startNodeDrag(hit, e);
   };
   /** An interrupted gesture (e.g. setPointerCapture takeover, scroll) must not leave a stale
    *  down-position that would validate the next unrelated pointerup as a click. */
@@ -1911,6 +1924,18 @@ export abstract class BaseEngine {
    */
   protected beginNodeDrag(_hit: HoverHit, _sx: number, _sy: number): NodeDragSession | null { return null; }
 
+  /**
+   * The draggable glyph a press GRABS (#140), or null when the press is not a node-drag. The ONE gate
+   * both the d3-zoom filter (which declines the pan) and {@link onPointerDown} (which starts the drag)
+   * consult, so they cannot disagree about who owns a gesture — they used to, and a ⌘-drag on a node
+   * did nothing at all (#178). Only a plain primary press grabs: shift is the marquee (#159), and Ctrl
+   * and ⌘ pan instead, even over a glyph — they include the force-pan modifier ({@link panModifier}) on
+   * every platform. The keys are read BEFORE the hit-test, so a force-pan press costs no pick.
+   */
+  private grabTarget(e: MouseEvent): HoverHit | null {
+    if (e.button !== 0 || e.shiftKey || e.ctrlKey || e.metaKey) return null;
+    return this.draggableAtEvent(e);
+  }
   /** Resolve {@link pickDraggable} for a pointer event (converts viewport → host CSS px). */
   private draggableAtEvent(e: MouseEvent): HoverHit | null {
     const r = this.host.getBoundingClientRect();

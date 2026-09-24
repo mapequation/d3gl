@@ -802,7 +802,9 @@ export class Network extends BaseEngine {
    *   lag while the layout reheats around it and re-cools on release. Grab a **selected** node to drag
    *   the **whole selection** together; grab a collapsed module to drag its **whole subtree**. Works on
    *   the `force` and `worker` layout backends (reheat) and `positions` (translate-only). Pair with
-   *   `enableZoom()` and the drag takes precedence over panning when it starts on a glyph.
+   *   `enableZoom()` and the drag takes precedence over panning when it starts on a glyph. Hold ⌘
+   *   (Ctrl on Windows/Linux) while dragging to **pan** instead, even over a node (#178). That is how
+   *   you navigate a dense graph where almost every press lands on a node.
    * - `selection: { selected, others }` — `selected.stroke` overrides the **select** ring colour
    *   (default `#2563eb` blue); the hover ring defaults to `#16a34a` green (override via a `hover`
    *   HighlightStyle's `stroke`). A subtract-marquee preview rings the to-be-removed glyphs `#dc2626`

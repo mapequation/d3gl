@@ -38,7 +38,8 @@ function degreeRadius(graph: NetworkGraph): NodeRadiusSpec {
  * — with LOD on or off — and the link, arrowhead and super-edge geometry is then never built or
  * uploaded (not merely hidden), so switching it off on a million-edge graph *saves* work rather than
  * costing it. The edges keep driving the layout, so toggling back is instant. Drag empty space to pan,
- * scroll to zoom.
+ * scroll to zoom. **Hold ⌘ (Ctrl on Windows/Linux) to pan anywhere**, even over a node (#178), which is
+ * how you navigate a dense layout where almost every press lands on one.
  * **Hover or click** a glyph to resolve the node — or the module it collapsed into — shown top-left.
  * **Selecting** a node dims the rest of the graph (the `selection.others` focus, consistent with GeoMap
  * + Plot) while keeping the selected node *and its outgoing links* at full strength; **hovering** a node
@@ -55,7 +56,8 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
   // Node-drag (#140): grab a node or a collapsed module and drag it — it tracks the cursor with no lag
   // while the off-thread worker layout **reheats** around it and re-cools on release. Grab a selected
   // node to drag the whole selection; grab a module aggregate to drag its whole subtree. Plain drag on
-  // empty space still pans. Hover/click also light a ring via the same interactive() opt-in.
+  // empty space still pans, and ⌘/Ctrl-drag pans even over a node (#178; built in, no option). Hover/click
+  // also light a ring via the same interactive() opt-in.
   // #162: the selection/hover highlight is applied in the GPU shader from per-instance flags + uniforms,
   // so hovering across a million-node LOD-off layout is a uniform change — no per-hover geometry rebuild.
   // `selection.others` (set explicitly here, though 0.3 is the default) dims the rest of the graph on
@@ -75,7 +77,7 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
   const readout = document.createElement("div");
   readout.className = "absolute top-2 left-2 pointer-events-none rounded bg-white/85 px-2 py-1 font-mono text-[12px] leading-tight text-[#333]";
   const describe = (hit: { id: string | number; datum: unknown } | null): string => {
-    if (!hit) return "hover a node or module";
+    if (!hit) return "hover a node or module · ⌘/Ctrl+drag to pan";
     const d = hit.datum as NetworkHit;
     return d.aggregate ? `module · ${d.count.toLocaleString()} nodes` : `node ${hit.id}`;
   };
