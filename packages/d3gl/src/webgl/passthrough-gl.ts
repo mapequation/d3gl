@@ -340,12 +340,14 @@ export class PassThroughGL {
   /**
    * Follow a host resize (#293). Re-creates ONLY the accumulation FBO at the new size and updates
    * the screen-mode `u_viewport` in the shared uniform record the point Model already reads —
-   * Models, pipelines and the grown scratch buffers are kept. `draw()` rebuilds `u_transform` from the new size on every call and `composite()`
-   * re-binds `u_tex` and rebuilds `u_blit` on every call, so neither needs touching here.
+   * Models, pipelines and the grown scratch buffers are kept. `draw()` rebuilds `u_transform`
+   * from the new size on every call, and `composite()` re-binds `u_tex` and rebuilds `u_blit` on
+   * every call, so neither needs touching here.
    *
    * The new surface is EMPTY: its old contents were rasterized for the old viewport and cannot be
    * resampled correctly, so the reference transform is dropped too. The caller must follow with a
-   * full repaint — `BaseEngine.setSize()` does, straight after `backend.resize()`, in one cycle.
+   * full repaint — `BaseEngine.setSize()` does, straight after `backend.resize()`: one cycle on a
+   * Plot or a pass-through-only GeoMap; a GeoMap with R retained layers currently runs R+1 (#302).
    */
   resize(width: number, height: number): void {
     if (width === this.width && height === this.height) return;

@@ -409,7 +409,7 @@ guard owns the serialize budget: one DOM node per drawable buys parse time, not 
 | **`geoMap()` engine sweep** | **WebGL** | `map/geo-map-sweep-perf.browser.test.ts` | 20k cells | `PERF_BROWSER_N` (max 150k) |
 | **`plot()` engine sweep**, retained Scene | **WebGL** | `map/plot-engine-sweep-perf.browser.test.ts` | 50k ×2 layers | `PERF_BROWSER_N` (max 300k) |
 | **`network()` engine sweep**, LOD on **and** off | **WebGL** | `network/__tests__/network-sweep-perf.browser.test.ts` | 50k nodes / 50k edges | `PERF_BROWSER_N` (max 200k) |
-| multi pass-through: FBO count + gesture skip | **WebGL** | `map/passthrough-multi-perf.browser.test.ts` | 25k ×2 layers | `PERF_BROWSER_N` (max 50k) |
+| multi pass-through: FBO count + gesture skip + resize surface/one cycle (#293) | **WebGL** | `map/passthrough-multi-perf.browser.test.ts` | 25k ×2 layers | `PERF_BROWSER_N` (max 50k) |
 | label placement (`cullLabels`) | — | `labels/__tests__/label-cull-perf.test.ts` | 200k candidates, dense **and** spread | `BENCH_LABEL_CULL` |
 | **`network.labels()` per-frame**, LOD on **and** off | **WebGL** | `network/__tests__/network-labels-perf.browser.test.ts` | 20k nodes, uncapped | `PERF_BROWSER_N` (max 50k) |
 
@@ -544,12 +544,21 @@ The consequences are contract, not incidental:
   (both backends, real pixels) and `map/passthrough-multi-perf.browser.test.ts`, which pins the
   memory decision as a number — registering layers 2..4 must allocate **zero** extra framebuffers
   and textures — plus "a gesture frame re-projects nothing", "a settle is O(total), not
-  O(layers × items)" and "a resize re-creates the ONE surface and refills it in one cycle" (#293).
+  O(layers × items)" and "a resize re-creates ONLY the ONE surface (zero new GL buffers) and
+  refills it in one cycle" (#293, on a Plot).
 - **The surface follows a resize** (#293): `WebGLBackend.resize()` calls `PassThroughGL.resize()`,
-  which re-creates only the FBO and the screen-mode `u_viewport` (Models and scratch buffers stay).
-  The new surface is empty; `setSize()` repaints right after. It is still **CSS px**, so it is
-  upscaled on HiDPI (#300). Pixel guards: the `#293` suite in `map/passthrough.browser.test.ts`
-  (both backends; screen-mode edge probes catch a stale `u_viewport`).
+  which re-creates only the FBO and updates the screen-mode `u_viewport` (Models and scratch
+  buffers stay — a destroy-and-rebuild also makes exactly one framebuffer, so leg D counts GL
+  buffers to tell them apart). The new surface is empty; `setSize()` repaints right after — one
+  cycle on a Plot or a pass-through-only GeoMap, R+1 on a GeoMap with R retained layers (#302). It
+  is still **CSS px**, so it is upscaled on HiDPI (#300). Pixel guards: the `#293` suite in
+  `map/passthrough.browser.test.ts` (both backends; screen-mode edge probes catch a stale
+  `u_viewport`).
+- **Mid-gesture draws are only right on the FIRST slice.** WebGL records the snapshot-pan reference
+  (`fboRef`) on the `"replace-first"` draw alone; a later slice of a cycle started mid-gesture
+  (`setSize`/`recolor`/registration over more than `PT_CHUNK` items) and a mid-gesture `append()`
+  rasterize at the live transform and are offset by the gesture delta until settle (#306). Canvas
+  drops pass-through pixels after a mid-gesture resize instead (#303).
 
 Still unimplemented for pass-through, and unrelated to the above: `clipTo` (accepted and ignored
 on both backends).
