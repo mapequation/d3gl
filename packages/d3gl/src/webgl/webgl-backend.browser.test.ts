@@ -3,6 +3,8 @@ import { Scene } from "../core/index.js";
 import { WebGLBackend } from "./webgl-backend.js";
 import { groupRendererConstructions } from "./renderer.js";
 import type { DrawableVector } from "../core/index.js";
+import { GlSurfaceSpy } from "../__tests__/engine-sweep.js";
+import type { GlTexStorage } from "../__tests__/engine-sweep.js";
 
 function rectLayer(name: string, x: number, y: number, w: number, h: number, color: string, clipTo?: string) {
   const scene = new Scene();
@@ -326,5 +328,171 @@ describe("WebGLBackend updateLayer in-place replace (#218)", () => {
     expect(backend.readPixel(25, 25)[3]).toBe(0);
     expect(groupRendererConstructions - base).toBe(1); // exactly one rebuild
     backend.destroy();
+  });
+});
+
+/**
+ * The export framebuffer is LAZY (#88). `toPNG()` and `readPixel()` are its only readers: the live
+ * view renders into the canvas's own stencil-backed drawing buffer (that is where `clipTo` clips),
+ * pass-through accumulates in its own `PassThroughGL` surface and pick in its own device-px FBO. So a
+ * chart that never exports must never pay for it — it is W×H×8 bytes (RGBA8 colour +
+ * depth24-stencil8), ≈16.6 MB at 1920×1080 — and it is no longer reallocated on every resize.
+ *
+ * Measured on the GL calls themselves (`GlSurfaceSpy`), never on luma's stats: those are one global
+ * singleton shared by every device on the page, so an absolute number there says nothing about
+ * this backend.
+ */
+describe("WebGLBackend export framebuffer is lazy (#88)", () => {
+  const W = 120;
+  const H = 80;
+  const W2 = 160;
+  const H2 = 100;
+
+  /** What one export target reserves at a CSS size: an RGBA8 colour attachment plus the
+   *  depth24-stencil8 one `clipTo` needs. Both formats are 4 B/texel ⇒ width × height × 8 bytes. */
+  const exportTarget = (width: number, height: number): GlTexStorage[] => [
+    { internalformat: WebGL2RenderingContext.RGBA8, width, height },
+    { internalformat: WebGL2RenderingContext.DEPTH24_STENCIL8, width, height },
+  ];
+  const atSize = (width: number, height: number) => (t: GlTexStorage) => t.width === width && t.height === height;
+
+  async function clippedBackend(width = W, height = H): Promise<WebGLBackend> {
+    const canvas = document.createElement("canvas");
+    canvas.width = width; canvas.height = height;
+    document.body.appendChild(canvas);
+    const backend = await WebGLBackend.create(canvas, { width, height });
+    // A clipTo pair, so the stencil attachment the export keeps is exercised, not just allocated.
+    backend.setLayers([
+      rectLayer("mask", 0, 0, width / 2, height, "rgb(0,0,0)"),
+      rectLayer("red", 0, 0, width, height, "rgb(255,0,0)", "mask"),
+    ]);
+    backend.setTransform({ k: 1, x: 0, y: 0 });
+    return backend;
+  }
+
+  async function pngSize(dataUrl: string): Promise<{ width: number; height: number }> {
+    const img = new Image();
+    img.src = dataUrl;
+    await img.decode();
+    return { width: img.naturalWidth, height: img.naturalHeight };
+  }
+
+  it("create → clipped layers → transform → render → resize allocate NO export framebuffer", async () => {
+    const spy = new GlSurfaceSpy();
+    try {
+      const at = spy.mark();
+      const backend = await clippedBackend();
+      backend.render();
+      backend.setTransform({ k: 2, x: -W / 2, y: -H / 2 });
+      backend.render();
+      backend.resize(W2, H2);
+      backend.render();
+      const live = spy.since(at);
+      // The whole #88 claim: the live path never creates a framebuffer object, and nothing
+      // export-sized is reserved at either size the chart has had.
+      expect(live.framebuffers).toBe(0);
+      expect(live.storage.filter(atSize(W, H))).toEqual([]);
+      expect(live.storage.filter(atSize(W2, H2))).toEqual([]);
+
+      // Non-vacuity: the spy does see the target the moment a reader needs it — at the CURRENT size.
+      const read = spy.mark();
+      backend.readPixel(10, 10);
+      const onRead = spy.since(read);
+      expect(onRead.framebuffers).toBe(1);
+      expect(onRead.storage).toEqual(exportTarget(W2, H2));
+      backend.destroy();
+    } finally {
+      spy.restore();
+    }
+  });
+
+  it("the first toPNG() allocates it once at CSS size; later exports and readPixel reuse it", async () => {
+    const backend = await clippedBackend();
+    const spy = new GlSurfaceSpy();
+    try {
+      const first = spy.mark();
+      const png = backend.toPNG();
+      const onFirst = spy.since(first);
+      expect(onFirst.framebuffers).toBe(1);
+      // Exactly the two attachments and nothing else: W×H×8 bytes, measured.
+      expect(onFirst.storage).toEqual(exportTarget(W, H));
+      expect(await pngSize(png)).toEqual({ width: W, height: H });
+
+      const again = spy.mark();
+      backend.toPNG();
+      const left = backend.readPixel(W / 4, H / 2);
+      const right = backend.readPixel((3 * W) / 4, H / 2);
+      const reused = spy.since(again);
+      expect(reused.framebuffers).toBe(0);
+      expect(reused.textures).toBe(0);
+      expect(reused.storage).toEqual([]);
+      // Behaviour unchanged: the lazily created target still carries the stencil clip.
+      expect(left[0]).toBeGreaterThan(200);
+      expect(right[3]).toBeLessThan(40);
+    } finally {
+      spy.restore();
+      backend.destroy();
+    }
+  });
+
+  it("resize() frees it without reallocating; the next export recreates it at the new size", async () => {
+    const backend = await clippedBackend();
+    const spy = new GlSurfaceSpy();
+    try {
+      backend.toPNG(); // allocate at W×H
+      const resize = spy.mark();
+      backend.resize(W2, H2);
+      const onResize = spy.since(resize);
+      expect(onResize.framebuffers).toBe(0); // no eager reallocation on a resize…
+      expect(onResize.storage).toEqual([]);
+      // …and the stale W×H target's two attachments (its colour + depth-stencil storage) are freed at once.
+      expect(onResize.texturesDeleted).toBe(2);
+
+      const next = spy.mark();
+      const png = backend.toPNG();
+      expect(spy.since(next).storage).toEqual(exportTarget(W2, H2));
+      expect(await pngSize(png)).toEqual({ width: W2, height: H2 });
+    } finally {
+      spy.restore();
+      backend.destroy();
+    }
+  });
+
+  it("stays CSS width×height at devicePixelRatio 2 (toPNG/readPixel read exactly that; pick is device px)", async () => {
+    const own = Object.getOwnPropertyDescriptor(window, "devicePixelRatio");
+    Object.defineProperty(window, "devicePixelRatio", { configurable: true, get: () => 2 });
+    const spy = new GlSurfaceSpy();
+    try {
+      const backend = await clippedBackend();
+      // Non-vacuity: luma really is rendering at 2×, so a device-px target would show as 2W×2H.
+      expect(backend.gpuDevice.getDefaultCanvasContext().devicePixelRatio).toBe(2);
+      const at = spy.mark();
+      const png = backend.toPNG();
+      expect(spy.since(at).storage).toEqual(exportTarget(W, H));
+      expect(await pngSize(png)).toEqual({ width: W, height: H });
+      backend.destroy();
+    } finally {
+      spy.restore();
+      if (own) Object.defineProperty(window, "devicePixelRatio", own);
+      else Reflect.deleteProperty(window, "devicePixelRatio");
+    }
+  });
+
+  it("globe-mode toPNG() allocates it lazily too, at CSS size", async () => {
+    const backend = await clippedBackend(128, 128);
+    const spy = new GlSurfaceSpy();
+    try {
+      backend.setGlobeMode(true, 256, 128);
+      backend.render(); // bake now, so the export window holds only the export target
+      const at = spy.mark();
+      const png = backend.toPNG();
+      const onExport = spy.since(at);
+      expect(onExport.framebuffers).toBe(1);
+      expect(onExport.storage).toEqual(exportTarget(128, 128));
+      expect(await pngSize(png)).toEqual({ width: 128, height: 128 });
+    } finally {
+      spy.restore();
+      backend.destroy();
+    }
   });
 });
