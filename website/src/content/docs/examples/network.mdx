@@ -120,8 +120,9 @@ Every visual channel maps a flow quantity through a d3 scale, so the map reads q
   subsumed weight, so a heavier super-edge reads as thicker and darker. The arrowhead is part of the
   shape, so it always takes the link's colour — there is no separate arrow fill. Keep range minimums
   ≥ 1 so nothing vanishes at low flow.
-- **`linkBend`** — for half-arrows, an absolute world-unit ⟂ offset (the reference's `bend`); the bow
-  side is derived from the link direction so reciprocal links nest automatically.
+- **`linkBend`** — the ⟂ bow as a **fraction of the link's length** (as for `line` links), so a link
+  keeps its shape at every zoom in both size modes; the bow side is derived from the link direction so
+  reciprocal links nest automatically.
 
 ```ts
 import { scaleLinear } from "d3-scale";
@@ -132,7 +133,7 @@ net.data(graph).style({
   nodeRadius: { by: "flow", scale: scaleLinear().domain([lo, hi]).range([20, 30]) }, // size ∝ flow
   nodeFill: (i) => fillColor(graph.flow[i]), // a per-node colour scale on flow
   flowBorder: { flow: enterExitFlow, scale: borderWidth, color: (v) => borderColor(v) }, // ring ∝ enter/exit
-  linkBend: 30,
+  linkBend: 0.14,
   linkWidth: scaleLinear().domain([lo, hi]).range([7, 13]), // width ∝ link flow
   linkStroke: scaleLinear().domain([lo, hi]).range(["#71B2D7", "#418EC7"]), // colour ∝ link flow
 });

@@ -4,7 +4,7 @@ import type { NetworkGraph } from "./graph.js";
 import type { PhysicalPieWedges } from "./pie.js";
 import type { LODTree, LODTransform } from "./lod.js";
 import type { ScreenRect } from "../core/instanced-lane.js";
-import { halfLinkGeometry, traceHalfLink, scaleHalfLink, bezierControl, bentEndTangent, straightUnit } from "../core/half-link.js";
+import { halfLinkGeometry, traceHalfLink, scaleHalfLink, bezierControl, bentEndTangent, straightUnit, chordBend } from "../core/half-link.js";
 
 // Re-exported so the network's link-curve math keeps one import site for consumers/tests, even
 // though the formulas themselves now live in core (shared with the export-only vector view, #200).
@@ -627,7 +627,7 @@ export interface SuperEdgeStyleResolved {
   widthOf: (weight: number) => number;
   /** Colour from the accumulated flow (the same scale as raw links). */
   colorOf: (weight: number) => [number, number, number, number];
-  /** Bend: a fraction of chord for `"line"`, an absolute (world/px) offset for `"half-arrow"` — as for raw links. */
+  /** Bend: a fraction of the chord, for `"line"` and `"half-arrow"` alike (#296) — as for raw links. */
   bend: number;
   /** Arrowhead size for the directed `"line"` style. */
   arrowSize: number;
@@ -983,8 +983,8 @@ export function linkLinesFromCache(graph: NetworkGraph, attrs: LinkLinesStyleAtt
  * directed edge becomes one filled shape (see {@link halfLinkGeometry}): pinched to the source
  * centre, bowed around a shared centre curve, ending in a barbed arrowhead on the *target* node's
  * boundary. A reciprocal A→B / B→A pair is detected so each leaves room for the other's arrow at its
- * source end (`oppositeWidth`) and the two nest. `bend` is an absolute world-unit ⟂ offset (the
- * reference's `bend`). Width and colour encode the edge weight (which is the per-edge flow).
+ * source end (`oppositeWidth`) and the two nest. `bend` is the ⟂ offset as a fraction of the chord
+ * (#296), converted with {@link chordBend} in the space the shape is solved in. Width and colour encode the edge weight (which is the per-edge flow).
  */
 export function halfArrowLinks(graph: NetworkGraph, style: HalfArrowStyleResolved): InstancedHalfArrowsData {
   const count = graph.edgeCount;
@@ -1058,7 +1058,7 @@ export interface HalfArrowStyleResolved {
   nodeRadii: Float32Array;
   widthOf: (weight: number) => number;
   colorOf: (weight: number) => [number, number, number, number];
-  /** Bend in **world units** (the reference's absolute ⟂ offset; sign picks the bow side). */
+  /** Bend as a **fraction of the chord** (#296; sign picks the bow side). */
   bend: number;
 }
 
@@ -1183,9 +1183,8 @@ export interface ResolvedNetworkStyle {
   constBorder: ConstBorder | null;
   /**
    * Link bend (#104 N6c): the quadratic-bezier control offset ⟂ to the chord. For `linkStyle:"line"`
-   * it is a **fraction of chord length** (`0` ⇒ straight); for `linkStyle:"half-arrow"` it is an
-   * **absolute world-unit** offset (the reference's `bend`, ~30), and the bow side is derived from the
-   * link direction so a reciprocal pair nests.
+   * and `linkStyle:"half-arrow"` alike it is a **fraction of chord length** (`0` ⇒ straight; #296);
+   * for half-arrows the bow side is derived from the link direction so a reciprocal pair nests.
    */
   linkBend: number;
 }
@@ -1498,16 +1497,20 @@ export function emitHalfLinks(
     const oppRaw = weightByPair.get(t * n + s);
     // Solve in pixel space (positions × bake, px sizes); scale the result back by 1/bake to emit world
     // geometry the Scene's view transform restores to pixels. bake = 1 ⇒ plain world geometry.
+    const x0 = graph.positions[s * 2]! * bake;
+    const y0 = graph.positions[s * 2 + 1]! * bake;
+    const x1 = graph.positions[t * 2]! * bake;
+    const y1 = graph.positions[t * 2 + 1]! * bake;
     const geom = halfLinkGeometry({
-      x0: graph.positions[s * 2]! * bake,
-      y0: graph.positions[s * 2 + 1]! * bake,
+      x0,
+      y0,
       r0: nodeRadii[s]!,
-      x1: graph.positions[t * 2]! * bake,
-      y1: graph.positions[t * 2 + 1]! * bake,
+      x1,
+      y1,
       r1: nodeRadii[t]!,
       width: widthOf(graph.weight[e]!),
       oppositeWidth: oppRaw === undefined ? widthOf(graph.weight[e]!) : widthOf(oppRaw),
-      bend,
+      bend: chordBend(x0, y0, x1, y1, bend),
     });
     if (!geom) continue;
     const out = bake === 1 ? geom : scaleHalfLink(geom, 1 / bake);
@@ -1585,16 +1588,20 @@ export function traceFrontierHalos(g: GroupBuilder, halos: FrontierHalosData, sc
 export function traceSuperHalfArrows(g: GroupBuilder, ha: InstancedHalfArrowsData, ids: ArrayLike<number>, bake = 1): void {
   const inv = 1 / bake;
   for (let e = 0; e < ha.count; e++) {
+    const x0 = ha.sources[e * 2]! * bake;
+    const y0 = ha.sources[e * 2 + 1]! * bake;
+    const x1 = ha.targets[e * 2]! * bake;
+    const y1 = ha.targets[e * 2 + 1]! * bake;
     const geom = halfLinkGeometry({
-      x0: ha.sources[e * 2]! * bake,
-      y0: ha.sources[e * 2 + 1]! * bake,
+      x0,
+      y0,
       r0: ha.radii[e * 2]!,
-      x1: ha.targets[e * 2]! * bake,
-      y1: ha.targets[e * 2 + 1]! * bake,
+      x1,
+      y1,
       r1: ha.radii[e * 2 + 1]!,
       width: ha.widths[e * 2]!,
       oppositeWidth: ha.widths[e * 2 + 1]!,
-      bend: ha.bends[e]!,
+      bend: chordBend(x0, y0, x1, y1, ha.bends[e]!),
     });
     if (!geom) continue;
     const out = bake === 1 ? geom : scaleHalfLink(geom, inv);

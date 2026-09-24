@@ -184,11 +184,11 @@ export interface NetworkStyle {
    */
   flowBorder?: FlowBorderSpec;
   /**
-   * Bend links into curves (N6c / #104). For `linkStyle:"line"` this is the quadratic-bezier control
-   * offset ⟂ to the chord as a **fraction of chord length** (try ~0.15; `0` (default) keeps links
-   * straight). For `linkStyle:"half-arrow"` it is an **absolute world-unit** offset (the reference's
-   * `bend`, ~30); the bow side is derived from the link direction so a reciprocal A→B / B→A pair nests
-   * around a shared centre curve instead of colliding.
+   * Bend links into curves (N6c / #104). The quadratic-bezier control offset ⟂ to the chord as a
+   * **fraction of chord length**, for `linkStyle:"line"` and `"half-arrow"` alike (try ~0.15; `0`
+   * (default) keeps links straight). Because it is relative, a link keeps its shape at every zoom in
+   * both size modes (#296). For half-arrows the bow side is derived from the link direction so a
+   * reciprocal A→B / B→A pair nests around a shared centre curve instead of colliding.
    */
   linkBend?: number;
 }

@@ -196,7 +196,7 @@ export interface InstancedHalfArrowsData {
   radii: Float32Array;
   /** [width, oppositeWidth] per link, length `2 * count` (opposite width spaces the source foot). */
   widths: Float32Array;
-  /** Bend per link (absolute world-unit ⟂ offset; sign picks the bow side), length `count`. */
+  /** Bend per link (⟂ offset as a fraction of the chord, #296; sign picks the bow side), length `count`. */
   bends: Float32Array;
   /** RGBA bytes per link, length `4 * count`. */
   colors: Uint8Array;

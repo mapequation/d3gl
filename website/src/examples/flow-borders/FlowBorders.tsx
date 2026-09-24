@@ -17,7 +17,7 @@ export default function FlowBorders() {
           max: 4,
           step: 1,
           value: 2,
-          display: ["0", "15", "30", "45", "60"],
+          display: ["0", "0.07", "0.14", "0.21", "0.28"],
         },
         { type: "segmented", key: "sizing", label: "Sizing", options: ["World", "Screen"] },
       ]}

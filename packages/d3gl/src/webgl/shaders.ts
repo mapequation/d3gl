@@ -388,11 +388,12 @@ void main() {
 // Per-vertex a_kind = (code, t): code selects a named anchor (0 x0, 1 x02, 2 x03, 3 x04, 4 x11,
 // 5 x12, 6 x13, 7 x14) or evaluates the inner (8) / outer (9) edge bezier at parameter t; the template
 // (see instanced.ts) lists the foot, body strip and head as a triangle list. Pairs with FILL_FS.
-// `a_bend` is the absolute perpendicular offset (sign = bow direction).
+// `a_bend` is the perpendicular offset as a fraction of the centre chord (sign = bow direction, #296) —
+// scaled by `l` in the working space, so the bow keeps its shape relative to the link at any zoom.
 //
-// sizeMode: in **world** mode the shape is built in world units, then projected — so widths/tips/bend
+// sizeMode: in **world** mode the shape is built in world units, then projected — so widths/tips
 // scale with zoom. In **screen** mode the two node centres are first projected to screen pixels and the
-// *same* math runs in pixel space — so the link decorations (width, tip, bend, node radii) stay a
+// *same* math runs in pixel space — so the link decorations (width, tip, node radii) stay a
 // constant pixel size while the endpoints still move with zoom. The geometry math is scale-free, so
 // only the input/output space differs: screen mode adds two world→px projections up front and a px→clip
 // convert at the end (a uniform branch — the world path is untouched).
@@ -406,7 +407,7 @@ in vec2 a_p0;         // per-instance source centre
 in vec2 a_p1;         // per-instance target centre
 in vec2 a_radii;      // per-instance (r0, r1)
 in vec2 a_widths;     // per-instance (width, oppositeWidth)
-in float a_bend;      // per-instance bend (world or px per sizeMode; sign picks the bow side)
+in float a_bend;      // per-instance bend, a fraction of the chord (sign picks the bow side)
 in vec4 a_color;      // per-instance RGBA (unorm8x4 -> 0..1)${HL_UNIFORMS}
 out vec4 v_color;
 flat out float v_id;  // instance index for GPU-readback picking (#141); ignored by FILL_FS, read by PICK_FS
@@ -424,7 +425,7 @@ void main() {
   float code = a_kind.x;
   float t = a_kind.y;
   bool screen = u_screen > 0.5;
-  // Screen mode: project both node centres to px and build the shape in px (radii/widths/bend are px).
+  // Screen mode: project both node centres to px and build the shape in px (radii/widths are px).
   vec2 p0 = screen ? worldToPx(a_p0) : a_p0;
   vec2 p1 = screen ? worldToPx(a_p1) : a_p1;
   float r0 = a_radii.x;
@@ -442,7 +443,7 @@ void main() {
   float tipWidth = 2.0 * sqrt(width);
   float oppositeTipLength = min(lBetween / 3.0, 10.0 * pow(oppositeWidth, 1.0 / 3.0));
 
-  float bendMagnitude = abs(a_bend);
+  float bendMagnitude = abs(a_bend) * l;
   float outerBendAddition = pow(bendMagnitude / 10.0, 0.4);
   bool positiveCurvature = dir.x > 0.0 || (dir.x == 0.0 && dir.y < 0.0);
   float curvatureSign = positiveCurvature ? 1.0 : -1.0;
