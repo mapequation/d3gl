@@ -379,9 +379,10 @@ describe("WebGLBackend export framebuffer is lazy (#88)", () => {
 
   it("create → clipped layers → transform → render → resize allocate NO export framebuffer", async () => {
     const spy = new GlSurfaceSpy();
+    let backend: WebGLBackend | undefined;
     try {
       const at = spy.mark();
-      const backend = await clippedBackend();
+      backend = await clippedBackend();
       backend.render();
       backend.setTransform({ k: 2, x: -W / 2, y: -H / 2 });
       backend.render();
@@ -400,9 +401,9 @@ describe("WebGLBackend export framebuffer is lazy (#88)", () => {
       const onRead = spy.since(read);
       expect(onRead.framebuffers).toBe(1);
       expect(onRead.storage).toEqual(exportTarget(W2, H2));
-      backend.destroy();
     } finally {
       spy.restore();
+      backend?.destroy();
     }
   });
 
@@ -462,17 +463,18 @@ describe("WebGLBackend export framebuffer is lazy (#88)", () => {
     const own = Object.getOwnPropertyDescriptor(window, "devicePixelRatio");
     Object.defineProperty(window, "devicePixelRatio", { configurable: true, get: () => 2 });
     const spy = new GlSurfaceSpy();
+    let backend: WebGLBackend | undefined;
     try {
-      const backend = await clippedBackend();
+      backend = await clippedBackend();
       // Non-vacuity: luma really is rendering at 2×, so a device-px target would show as 2W×2H.
       expect(backend.gpuDevice.getDefaultCanvasContext().devicePixelRatio).toBe(2);
       const at = spy.mark();
       const png = backend.toPNG();
       expect(spy.since(at).storage).toEqual(exportTarget(W, H));
       expect(await pngSize(png)).toEqual({ width: W, height: H });
-      backend.destroy();
     } finally {
       spy.restore();
+      backend?.destroy();
       if (own) Object.defineProperty(window, "devicePixelRatio", own);
       else Reflect.deleteProperty(window, "devicePixelRatio");
     }
@@ -493,6 +495,29 @@ describe("WebGLBackend export framebuffer is lazy (#88)", () => {
     } finally {
       spy.restore();
       backend.destroy();
+    }
+  });
+
+  it("destroy() releases it: an exported chart frees exactly its two attachments more than a twin that never did", async () => {
+    // luma's device.destroy() frees no resources, so destroy() is the ONLY teardown of the target.
+    // Twins with identical layers free identical renderer textures (style tables), so the delta
+    // isolates the export target's colour + depth-stencil attachments.
+    const exported = await clippedBackend();
+    const idle = await clippedBackend();
+    const spy = new GlSurfaceSpy();
+    try {
+      exported.toPNG();
+      exported.render();
+      idle.render();
+      const a = spy.mark();
+      exported.destroy();
+      const freedExported = spy.since(a).texturesDeleted;
+      const b = spy.mark();
+      idle.destroy();
+      const freedIdle = spy.since(b).texturesDeleted;
+      expect(freedExported - freedIdle).toBe(2);
+    } finally {
+      spy.restore();
     }
   });
 });

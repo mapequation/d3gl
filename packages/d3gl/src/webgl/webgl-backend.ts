@@ -386,9 +386,7 @@ export class WebGLBackend implements Backend {
       r.setTransform(this.clipMatrix);
       r.setViewport(width, height);
     }
-    // The export/readback FBO is fixed-size and useless at the old size: free it now and let the
-    // next toPNG()/readPixel() recreate it (#88). Reallocating here, as this used to, paid a
-    // width×height×8-byte allocation on every resize step for a target most charts never read.
+    // Stale at the old size; the next export recreates it (#88).
     this.offscreen?.destroy();
     this.offscreen = null;
     this.bakeDirty = true;
