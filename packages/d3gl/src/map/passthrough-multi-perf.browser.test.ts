@@ -17,12 +17,15 @@
 //      runs ZERO datum accessors, whatever N is.
 //   C. SETTLE — one settle repaint costs O(total items across all layers), never O(layers × items):
 //      the same N split across two layers runs exactly N accessor calls, the same as one layer of N.
+//   D. RESIZE (#293) — `setSize` re-creates the ONE shared surface at the new size (not one per
+//      layer), and ONLY the surface (zero new GL buffers: no PassThroughGL rebuild), and refills it
+//      in one cycle: exactly 2N accessor calls for two layers of N.
 //
-// A, B and C are all exact counts, so they hold at every N; only the wall-clock ceilings scale.
+// A, B, C and D are all exact counts, so they hold at every N; only the wall-clock ceilings scale.
 import { describe, it, expect, afterEach } from "vitest";
 import { Plot } from "./plot.js";
 import type { ViewTransform } from "../core/index.js";
-import { perfHost, zoomSteps, sweepFrames } from "../__tests__/engine-sweep.js";
+import { perfHost, zoomSteps, sweepFrames, GlBufferSpy } from "../__tests__/engine-sweep.js";
 import { perfBudget, perfN } from "../__tests__/perf-budget.js";
 
 /**
@@ -222,5 +225,45 @@ describe("multiple pass-through layers: memory + per-frame cost (#110)", () => {
     // the second layer's `slice`, and timer noise — a per-layer full repaint would be ~2×.
     expect(twoLayerMs).toBeLessThan(oneLayerMs * 1.6 + perfBudget(2));
     expect(twoLayerMs).toBeLessThan(perfBudget(160));
+  });
+
+  it("D: a resize reallocates ONE shared surface (not one per layer) and repaints in ONE cycle (#293)", async () => {
+    const chart = await newChart();
+    let calls = 0;
+    const opts = {
+      x: (d: Pt) => {
+        calls++;
+        return d.x;
+      },
+      y: (d: Pt) => d.y,
+      radius: 2,
+      passThrough: true as const,
+    };
+    chart.points("a", makePoints(N, 41), { ...opts, fill: "rgb(255,0,0)" });
+    chart.points("b", makePoints(N, 43), { ...opts, fill: "rgb(0,0,255)" });
+
+    const spy = new GlSurfaceSpy();
+    const buffers = new GlBufferSpy();
+    try {
+      const surfacesBefore = spy.mark();
+      const buffersBefore = buffers.mark();
+      const before = calls;
+      chart.setSize(W + 100, H - 100);
+      // The accumulation surface follows the host: exactly two framebuffers are re-created — the
+      // offscreen export target (as before #293) and the ONE pass-through surface. A per-layer
+      // surface would make this 3 here; a resize that leaves the surface behind makes it 1.
+      expect(spy.since(surfacesBefore).framebuffers).toBe(2);
+      // Only the surface is re-created, not the whole PassThroughGL: its Models and scratch
+      // buffers survive, and the scratch already fits a batch of N. A destroy-and-rebuild also
+      // makes exactly one framebuffer, so the surface count above cannot tell the two apart;
+      // this count can (a rebuild measured 19 new buffers here: its own set plus the re-grown scratch).
+      expect(buffers.since(buffersBefore).created).toBe(0);
+      // …and the repaint that refills it is a single cycle over both layers: every item projected
+      // exactly once, never once per layer or once per resized resource.
+      expect(calls - before).toBe(2 * N);
+    } finally {
+      buffers.restore();
+      spy.restore();
+    }
   });
 });
