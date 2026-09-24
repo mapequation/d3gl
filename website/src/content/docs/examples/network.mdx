@@ -24,23 +24,65 @@ physical view, where overlapping-module physical nodes draw as **pie-chart glyph
 This example builds an **LFR benchmark network** — power-law node degrees and power-law community
 sizes with a tunable mixing parameter, the standard benchmark for community detection — and lets
 d3gl's in-library **force layout** (Barnes-Hut) place the nodes; no coordinates are supplied. The
-layout is seeded by **multilevel coarsening**: the graph is collapsed into a hierarchy of
-ever-smaller graphs (each node merged with a neighbour, hubs and their leaves absorbed together so
-power-law graphs still shrink geometrically), the tiny coarsest one is laid out first, and positions
-are projected back down and refined — far faster convergence and fewer tangles than a cold start.
-With `layout({ backend: "worker" })` the entire solve runs in a **Web Worker** and streams positions
-back, so the layout **converges progressively on screen** while the main thread stays responsive —
-pan and zoom while it settles. (On a cross-origin-isolated page positions are shared zero-copy via
-`SharedArrayBuffer`; otherwise they are posted as snapshots — the top-right readout shows whether the
-environment supports it and whether this layout is actually using it.) The **Nodes** slider scales from 10 to
-1,000,000; **Seeding** compares multilevel against a cold start; **Size** switches uniform vs
+**Backend** control picks where the solve runs: in a Web Worker (this section) or on the GPU (the
+example's default, see [GPU backend](#gpu-backend) below). The worker layout is seeded by **multilevel
+coarsening**: the graph is collapsed into a hierarchy of ever-smaller graphs (each node merged with a
+neighbour, hubs and their leaves absorbed together so power-law graphs still shrink geometrically), the
+tiny coarsest one is laid out first, and positions are projected back down and refined — far faster
+convergence and fewer tangles than a cold start. With `layout({ backend: "worker" })` the entire solve
+runs in a **Web Worker** and streams positions back, so the layout **converges progressively on
+screen** while the main thread stays responsive — pan and zoom while it settles. (On a
+cross-origin-isolated page positions are shared zero-copy via `SharedArrayBuffer`; otherwise they are
+posted as snapshots — the top-right readout shows whether the environment supports it and whether this
+layout is actually using it.) The **Nodes** slider scales from 10 to 1,000,000; **Seeding** compares
+multilevel against a cold start (worker only, so it is greyed out on GPU); **Size** switches uniform vs
 degree-weighted radius; **Sizing** switches world vs screen units; **LOD** / **Declutter** control the
-level-of-detail cut (below); and **Edges** turns the links off entirely (next section). Drag to pan,
-scroll to zoom.
+level-of-detail cut (below); and **Edges** turns the links off entirely
+([below](#nodes-only-turning-links-off)). Drag to pan, scroll to zoom.
 
 <ExampleCard files={["network/draw.ts", "network/data.ts"]}>
   <Network client:visible slot="demo" />
 </ExampleCard>
+
+### GPU backend
+
+`layout({ backend: "gpu" })` runs the same force model as a **WebGL2** solve on the renderer's **own**
+device — the luma.gl device the WebGL backend already draws with, so there is no second GPU context.
+Repulsion is exact up to a few thousand nodes and a Barnes-Hut grid pyramid above that; attraction runs
+over the edges. Positions stream back as the solve runs, so the layout converges on screen just like
+the worker, and the layout stays alive after it settles so a [node drag](#dragging-nodes) can reheat it.
+
+```ts
+net
+  .data(graph)
+  .layout({ backend: "gpu", iterations, fit: true }); // fit: keep the camera on the layout while it streams
+```
+
+- **It needs the WebGL render backend.** On the Canvas or SVG backend, or on a WebGL2 device without
+  float render targets (`float32-renderable-webgl`), `backend: "gpu"` falls back to `"worker"`. Once
+  the layout settles, the top-right readout shows which one ran (`layout: gpu`, or `shared` / `copy` for
+  the worker); while it streams it can still read `copy`, because a GPU layout confirms its device
+  asynchronously. [`net.layoutTransport`](/d3gl/reference/network/classes/network/#layouttransport)
+  reports the same — read it after `whenSettled()`. The choice is made when a layout starts: switch
+  this example to Canvas or SVG, then change **Nodes** to start a new layout, and the readout reports
+  the worker.
+- **Every streamed frame reads positions back.** The force passes run on the GPU, but each streamed frame
+  copies all node positions from the GPU into `graph.positions` so rendering, picking, labels and LOD can
+  use them — a synchronous GPU→CPU readback on the main thread, for as long as the layout streams. With
+  LOD on, the main thread also refreshes the LOD tree's geometry each streamed frame, which the worker
+  backend can do off-thread when LOD is set without `modules` ([below](#level-of-detail-lod)). So unlike
+  the worker, the GPU layout does not leave the main thread idle while it solves.
+- **Seeding is module-aware, not multilevel.** Pass a module hierarchy with `lod({ modules })` **before**
+  `layout({ backend: "gpu" })` and the GPU seeds top-down over the module tree, so modules land as
+  coherent regions — the [directed map of modules](#a-directed-map-of-modules) below uses it. Without
+  modules the GPU starts from a disc. It does not use the worker's `multilevel` option, which is why the
+  **Seeding** control is greyed out on GPU. The module-aware seed is GPU-only for now; bringing it to the
+  worker is tracked in [#205](https://github.com/mapequation/d3gl/issues/205).
+- **Pass `fit: true`.** The GPU device resolves asynchronously, and until the first frame streams back a
+  freshly built graph's positions are all zero, so the first paint piles every node at the origin (the
+  top-left corner); after that the layout grows at the solver's own scale, not the view's. `fit: true`
+  seeds a box-centred disc so the first paint is already framed, frames the camera on the layout's live
+  bounds each streamed frame, and hands the view back to pan/zoom once it settles or you interact.
 
 ## Nodes only: turning links off
 
@@ -221,6 +263,9 @@ the hierarchy itself — it reuses the coarsening it already computes for the mu
 streams the tree once plus its aggregate geometry each frame. The main thread then never coarsens or
 runs the per-frame O(N) geometry pass; it only fills the style geometry once and runs the
 on-screen-bounded cut. That keeps the main thread free as the network scales toward millions of nodes.
+On the [GPU backend](#gpu-backend) there is no worker to build the tree, so the main thread builds it and
+refreshes its geometry on each streamed frame; with `lod({ modules })` set first, that module tree also
+seeds the GPU layout.
 
 ```js
 net
@@ -454,8 +499,9 @@ derives the physical network) plus a per-**state-node** module assignment, and `
   rosette confined inside it, drawn with **state-level** links — the memory structure in its physical
   context. Everything is world-sized so the state nodes stay inside their physical node at every zoom.
 
-The **Nodes** slider scales the physical network from 10 to 10,000 (100k+ awaits the module-aware GPU
-layout — the physical force solve + the node2vec trigram enumeration are the current ceiling); the map
+The **Nodes** slider scales the physical network from 10 to 10,000. The next step up is blocked by the demo's
+synthetic data: it builds one state edge per node2vec trigram (Σ deg² over power-law degrees) in plain JS
+arrays on the main thread, and at 100,000 physical nodes that no longer fits in a JS array. The map
 controls (Sizing, Declutter, Expand, Max radius, Labels, Cross-level, Cross-fade) mirror the
 [directed map of modules](#a-directed-map-of-modules) and drive the state-view LOD cut.
 
@@ -481,9 +527,12 @@ filled arc sectors, so the physical view **exports to `toSVG()`** and renders id
 backends. The synthetic data (an **LFR** physical network + **node2vec** triangle-closing trigrams, with
 each state node's module set to its *previous* node's community) is in the `state-network-data.ts` tab.
 
-Positions here are the **CPU stopgap**: d3gl's in-library force layout places the physical nodes and the
-deterministic **rosette** fans each physical node's state nodes onto a ring around it. The module-aware GPU
-`stateLayout` (which will place state nodes with intra-physical structure) is tracked separately.
+The **physical** positions come from the `layout({ backend })` you choose (the example's **Backend**
+control, GPU by default), and the deterministic **rosette** fans each physical node's state nodes onto a
+ring around it, re-derived on every streamed frame. The GPU layout starts the physical graph from a disc
+here: the module hierarchy covers *state* nodes, so the [module-aware seed](#gpu-backend) doesn't apply.
+Placing state nodes by force within their physical node is
+[planned](https://github.com/mapequation/d3gl/issues/189).
 
 <ExampleCard files={["state-network/draw.ts"]}>
   <StateNetwork client:visible slot="demo" />

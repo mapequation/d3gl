@@ -36,6 +36,9 @@ import { Card, CardGrid } from "@astrojs/starlight/components";
   <Card title="Large-scale networks" icon="code-branch">
     The [`network()` engine](/d3gl/examples/network/) draws millions of nodes and links — in-library force layout (worker/GPU) and level-of-detail maps of networks.
   </Card>
+  <Card title="GPU force layout" icon="laptop">
+    [`layout({ backend: "gpu" })`](/d3gl/examples/network/#gpu-backend) solves the force layout on the renderer's own WebGL2 device and streams it on screen as it converges — seeded module by module when you pass a module hierarchy.
+  </Card>
   <Card title="Publication export" icon="document">
     Export crisp PNG and SVG straight from the same scene.
   </Card>

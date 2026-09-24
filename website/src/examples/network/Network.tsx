@@ -3,8 +3,9 @@ import Imperative from "../../components/Imperative.js";
 import { setup } from "./draw.js";
 
 /** Harness for the raw-network example: a node-count slider, Directed/Undirected and uniform/
- *  degree-weighted node-size toggles, and a seeding toggle. Rendering is WebGL-instanced (points +
- *  lines + arrowheads); scroll to zoom, drag to pan. */
+ *  degree-weighted node-size toggles, a layout **Backend** toggle (Worker / GPU) and a seeding toggle —
+ *  **disabled** (greyed, no reflow) on GPU, which doesn't use multilevel seeding. Rendering is
+ *  WebGL-instanced (points + lines + arrowheads); scroll to zoom, drag to pan. */
 export default function Network() {
   return (
     <Example
@@ -37,7 +38,8 @@ export default function Network() {
           value: 0, // off; raise to fade aggregates ↔ children across the expand threshold
           display: ["Off", "0.1", "0.2", "0.3", "0.4", "0.5", "0.6"],
         },
-        { type: "segmented", key: "seeding", label: "Seeding", options: ["Multilevel", "Cold"] },
+        // Multilevel vs cold seeding is a worker option; the GPU backend seeds from a disc (or module-aware).
+        { type: "segmented", key: "seeding", label: "Seeding", options: ["Multilevel", "Cold"], disabled: (o) => o.backend === "GPU" },
         { type: "segmented", key: "backend", label: "Backend", options: ["Worker", "GPU"], value: "GPU" },
       ]}
       width={760}

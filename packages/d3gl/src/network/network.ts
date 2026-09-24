@@ -199,30 +199,39 @@ export interface NetworkStyle {
 export interface NetworkLayoutOptions {
   /** `"positions"` uses caller-supplied coordinates; `"force"` runs the in-library force layout on the
    *  main thread; `"worker"` runs it off-thread with progressive streaming; `"gpu"` runs a WebGL2
-   *  Barnes-Hut solve (falling back to `"worker"` when unavailable). */
+   *  Barnes-Hut solve on the WebGL render backend's own device, streaming positions back (a GPU→CPU
+   *  readback per streamed frame). `"gpu"` falls back to `"worker"` on the Canvas/SVG render backends
+   *  and when the device lacks float render targets; {@link Network.layoutTransport} reports which ran. */
   backend?: "positions" | "force" | "worker" | "gpu";
   /** Interleaved `[x, y, …]` world coordinates for `backend: "positions"`. */
   positions?: Float32Array;
-  /** Iterations for `backend: "force"` (default 300, per level when multilevel). */
+  /** Iterations for the `"force"` / `"worker"` / `"gpu"` solves (default 300, per level when multilevel). */
   iterations?: number;
-  /** Force parameters for `backend: "force"`. */
+  /** Force parameters for the `"force"` / `"worker"` / `"gpu"` solves. */
   force?: Partial<ForceParams>;
   /**
    * For `backend: "force"` and `backend: "worker"`, seed the layout via multilevel coarsening
    * (heavy-edge matching) for faster convergence and fewer tangles on clustered graphs. Default
    * `true`; set `false` for a plain cold-start force run. Tiny / edgeless graphs skip coarsening
    * automatically.
+   *
+   * `backend: "gpu"` does not use it: the GPU layout seeds **module-aware** (top-down over the module
+   * tree) when {@link Network.lod} was given `modules` before `layout()`, and from a disc otherwise.
+   * It is not forwarded to the gpu backend's worker fallback either, which runs the worker's default
+   * (multilevel on; #312).
    */
   multilevel?: boolean;
   /**
    * For the streaming backends (`"worker"` / `"gpu"`), keep the camera framed on the layout as it
    * converges: the view is fit to the layout's live bounds each streamed frame (centroid → view
    * centre, extent → ~85% of the view) and released to normal zoom/pan once it settles or the user
-   * interacts. Without it a streaming layout converges wherever the solver centres it — the GPU
-   * solve centres the centroid at the origin, so it would otherwise render at the top-left corner
-   * until it settles. Default `false`. Ignored for `"positions"` / `"force"` (already final on the
-   * first paint). The per-frame fit reads the layout's aggregate bounds (O(top-level modules), not
-   * O(nodes)) when LOD geometry exists; with LOD off it fits once from the initial extent and holds.
+   * interacts. Without it a streaming layout converges at the solver's own scale, not the view's, and
+   * a `"gpu"` layout's first paint piles every node at the origin (the top-left corner): the device
+   * resolves asynchronously, so until the first frame streams back a freshly built graph's positions
+   * are still all zero. With it, a box-centred disc is seeded up front so the first paint is framed.
+   * Default `false`. Ignored for `"positions"` / `"force"` (already final on the first paint). The
+   * per-frame fit reads the layout's aggregate bounds (O(top-level modules), not O(nodes)) when LOD
+   * geometry exists; with LOD off it fits once from the initial extent and holds.
    */
   fit?: boolean;
 }
@@ -250,6 +259,10 @@ export interface NetworkLODOptions {
    *
    * On the `worker` backend the tree is built on the main thread (the worker supplies only positions);
    * the off-thread module-tree path is a later refinement.
+   *
+   * On the `gpu` backend, setting this **before** `layout()` also seeds the layout from the same tree:
+   * modules are laid out top-down, so they land as coherent regions. (The worker backend's seed does
+   * not use the module tree.)
    */
   modules?: ArrayLike<ModuleNode>;
   /**
@@ -637,11 +650,14 @@ export class Network extends BaseEngine {
    *    ≥2 modules renders as a **pie chart** (wedges ∝ per-module flow/count, module-coloured) and a
    *    single-module node as a solid disc.
    *
-   * Call {@link layout} next: in state-network mode it lays out the physical graph (force backend) and
-   * derives the rosette state positions, so every view has coordinates (the module-aware GPU layout of
-   * #106 will supply these directly once it lands). Switch views with {@link view}: `"physical"` (pies),
-   * `"state"` (spread rosette, module LOD via {@link lod}), or `"both"` (state nodes confined inside their
-   * physical container, state-level links). Colours + pie wedges + container radii are derived once here.
+   * Call {@link layout} next: in state-network mode it lays out the **physical** graph with any backend
+   * (`"positions"`, `"force"`, or the streaming `"worker"` / `"gpu"`) and derives the rosette state
+   * positions from it — on every streamed frame for worker/gpu — so every view has coordinates. The state
+   * positions are always the deterministic rosette, and the GPU backend seeds the physical layout from a
+   * disc (the module tree covers state nodes, so the module-aware seed doesn't apply). Switch views with
+   * {@link view}: `"physical"` (pies), `"state"` (spread rosette, module LOD via {@link lod}), or `"both"`
+   * (state nodes confined inside their physical container, state-level links). Colours + pie wedges +
+   * container radii are derived once here.
    */
   stateNetwork(graph: StateNetworkGraph, opts: StateNetworkOptions): this {
     this.stateData = graph;
@@ -752,13 +768,17 @@ export class Network extends BaseEngine {
   /**
    * Enable (or, with `false`, disable) level-of-detail rendering (#103) — an adaptive hierarchy cut
    * that draws dense regions as aggregate glyphs and expands them into members as you zoom, so
-   * per-frame work tracks the visible frontier rather than the whole graph. Requires the WebGL
-   * backend. The tree's geometry follows the layout as it converges (re-cut cheaply on zoom).
+   * per-frame work tracks the visible frontier rather than the whole graph. Works on every render
+   * backend (see {@link NetworkLODOptions} for how Canvas/SVG re-cut). The tree's geometry follows the
+   * layout as it converges (re-cut cheaply on zoom).
    *
-   * **Call this before `layout({ backend: "worker" })`** to get the full win: the worker then builds
-   * and streams the LOD tree itself (#103), so the main thread never coarsens or runs the O(N)
-   * geometry pass. Enabling it *after* a worker run (or on the `force`/`positions` backends) falls
-   * back to building the tree on the main thread from the current positions.
+   * **Call this before `layout({ backend: "worker" })`** to get the full win: without `modules`, the
+   * worker then builds and streams the LOD tree itself (#103), so the main thread never coarsens or
+   * runs the O(N) geometry pass. Enabling it *after* a worker run (or on the `force`/`positions`/`gpu`
+   * backends), or with `modules`, falls back to building the tree on the main thread from the current
+   * positions; while a `worker`/`gpu` layout streams, its geometry is then refreshed on the main thread
+   * each streamed frame. With `modules`, calling this before `layout({ backend: "gpu" })` also seeds
+   * the GPU layout module-aware (see {@link NetworkLODOptions.modules}).
    */
   lod(options: NetworkLODOptions | false): this {
     if (!options) {
@@ -1015,7 +1035,11 @@ export class Network extends BaseEngine {
     this.refreshLabels();
   }
 
-  /** Configure layout / supply positions (the pluggable contract proper lands in #101). */
+  /**
+   * Configure layout / supply positions (the pluggable contract proper lands in #101). See
+   * {@link NetworkLayoutOptions} for the backends. For a module-aware `backend: "gpu"` seed, call
+   * {@link lod} with `modules` first.
+   */
   layout(opts: NetworkLayoutOptions): this {
     if (this.stateData) return this.layoutStateNetwork(opts);
     this.layoutOpts = { ...this.layoutOpts, ...opts };
@@ -1178,7 +1202,8 @@ export class Network extends BaseEngine {
    *   ({@link scheduleLayoutRepaint}) re-derives the rosette from them, so the state/both views converge
    *   live alongside the physical layout. No worker-built LOD tree is requested here (`lod` stays unset) —
    *   the state-network LOD tree is over the state/module hierarchy, a different structure from the
-   *   worker's physical-graph coarsening; module-aware GPU layout (#106 N8.2-4) is a later milestone.
+   *   worker's physical-graph coarsening. For the same reason no `moduleTopology` is handed to the GPU
+   *   seed (N8.2), so the physical GPU layout starts from the disc.
    */
   private layoutStateNetwork(opts: NetworkLayoutOptions): this {
     const sg = this.stateData!;
