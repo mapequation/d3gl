@@ -25,9 +25,9 @@ const VIEW = { Physical: "physical", State: "state", Both: "both" } as const;
  * The data is synthetic (`state-network-data.ts`): an LFR physical network + node2vec trigrams, node
  * labels `1,2,…` (physical) and `(i,j)` (state). `layout({ backend })` lays out the physical graph — **Force**
  * (main-thread, synchronous), **Worker** (off-thread, progressive), or **GPU** (WebGL2 Barnes-Hut,
- * falling back to Worker when unavailable) — and derives the rosette from it each streamed frame (#182);
- * it also **scales the layout to fill the view** once settled, so it opens framed — no fit-transform.
- * Scroll to zoom, drag to pan.
+ * falling back to Worker when unavailable) — and derives the rosette from it each streamed frame (#182).
+ * A synchronous Force run is **scaled to fill the view**; the streaming Worker/GPU runs are framed by
+ * `fit: true` as they converge, so every backend opens framed. Scroll to zoom, drag to pan.
  */
 export const setup: ImperativeSetup = (host, { width, height, backend }) => {
   const net = network(host, { width, height, backend });

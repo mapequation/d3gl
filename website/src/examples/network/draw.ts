@@ -25,10 +25,12 @@ function degreeRadius(graph: NetworkGraph): NodeRadiusSpec {
  * An **LFR benchmark network** (power-law degrees + power-law communities with a mixing parameter —
  * the standard community-detection benchmark) rendered with the `network()` engine: nodes as
  * GPU-instanced points, links as instanced lines, triangle arrowheads for directed edges. Node
- * positions come from d3gl's in-library **force layout** (Barnes-Hut), seeded by **multilevel
- * coarsening** — no coordinates are supplied. `layout({ backend: "worker" })` runs the whole solve in
- * a Web Worker and streams positions back, so the layout **converges progressively on screen** while
- * the UI stays responsive. The Nodes slider scales 10 → 1,000,000; **Node size** switches a uniform
+ * positions come from d3gl's in-library **force layout** (Barnes-Hut) — no coordinates are supplied.
+ * **Backend** picks where it runs: `layout({ backend: "gpu" })` (the default here) solves on the
+ * renderer's own WebGL2 device, `layout({ backend: "worker" })` runs the CPU solve in a Web Worker,
+ * seeded by **multilevel coarsening** (**Seeding** "Cold" turns that off; the GPU backend doesn't use
+ * it). Both stream positions back, so the layout **converges progressively on screen** while you pan
+ * and zoom. The Nodes slider scales 10 → 1,000,000; **Node size** switches a uniform
  * vs **degree-weighted** radius; **Edge size** switches uniform vs **weight-scaled** links (LOD
  * super-edges thicken + darken with their accumulated weight); **Sizing** switches world vs **screen**
  * (constant-pixel) glyphs. The
@@ -44,16 +46,17 @@ function degreeRadius(graph: NetworkGraph): NodeRadiusSpec {
  * + Plot) while keeping the selected node *and its outgoing links* at full strength; **hovering** a node
  * recolours its outgoing links red (and, via `hover: { others }`, fades the rest). The highlight is applied
  * in the GPU shader, so it stays instant even with LOD off on a million-node layout.
- * **Drag a node or a collapsed module** to move it: it tracks the cursor with no lag while the off-thread
- * worker layout reheats around it and re-cools on release (grab a module to drag its whole subtree).
+ * **Drag a node or a collapsed module** to move it: it tracks the cursor with no lag while the layout
+ * (worker or GPU) reheats around it and re-cools on release (grab a module to drag its whole subtree).
  * **Backend** switches the force solve between `"worker"` (CPU Barnes-Hut in a Web Worker) and `"gpu"`
- * (WebGL2 Barnes-Hut grid-pyramid, with automatic fallback to `"worker"` when float render targets are unavailable).
+ * (WebGL2 Barnes-Hut grid-pyramid), which falls back to `"worker"` on the Canvas/SVG render backends or
+ * when float render targets are unavailable — the top-right readout shows which one ran.
  */
 export const setup: ImperativeSetup = (host, { width, height, backend }) => {
   const net = network(host, { width, height, backend });
   net.enableZoom([0.002, 200]); // wide range: zoom right out to the aggregate map, in to single nodes
   // Node-drag (#140): grab a node or a collapsed module and drag it — it tracks the cursor with no lag
-  // while the off-thread worker layout **reheats** around it and re-cools on release. Grab a selected
+  // while the layout (worker or GPU) **reheats** around it and re-cools on release. Grab a selected
   // node to drag the whole selection; grab a module aggregate to drag its whole subtree. Plain drag on
   // empty space still pans. Hover/click also light a ring via the same interactive() opt-in.
   // #162: the selection/hover highlight is applied in the GPU shader from per-instance flags + uniforms,
@@ -117,15 +120,16 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
     render: (options) => {
       const count = SIZES[(options.nodes as number) ?? 1] ?? 100;
       const directed = options.mode !== "Undirected";
-      // "Cold" disables multilevel seeding so you can watch the difference: multilevel snaps to a
-      // good global arrangement then settles; cold starts from a disc and untangles slowly.
+      // "Cold" disables the worker's multilevel seeding so you can watch the difference: multilevel snaps
+      // to a good global arrangement then settles; cold starts from a disc and untangles slowly. The GPU
+      // backend doesn't use `multilevel` (the Seeding control is greyed out there).
       const multilevel = options.seeding !== "Cold";
       const layoutBackend = options.backend === "GPU" ? "gpu" : "worker";
       const key = `${count}|${directed}|${multilevel}|${layoutBackend}`;
       if (key !== layoutKey) {
         layoutKey = key;
-        // Scale per-tick work down as the graph grows so the off-thread solve stays responsive; the
-        // worker keeps the main thread free regardless, streaming frames as it converges.
+        // Fewer iterations as the graph grows keep the total solve time in check at 1M nodes; either
+        // backend streams frames as it converges.
         const iterations = Math.min(250, Math.max(10, Math.round(2.5e6 / count)));
         // LFR benchmark with clear community structure (low mixing) for the layout + LOD to resolve.
         // Weighted so links vary and LOD super-edges thicken/darken with their accumulated weight.
@@ -172,8 +176,9 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
         // Enable the adaptive cut: aggregates draw a touch lighter than leaves, capped at 26px so
         // big collapsed clusters stay readable in screen mode. Frontier declutter thins overlapping
         // glyphs by importance. The cut tracks the layout as it converges and re-cuts on zoom.
-        // Configured *before* layout() so the worker builds + streams the LOD tree itself (#103) —
-        // the main thread then never coarsens or runs the O(N) geometry pass, only the O(visible) cut.
+        // With LOD already on when a worker layout() starts, the worker builds + streams the tree
+        // itself (#103); on the GPU backend the main thread builds it and refreshes its geometry
+        // each streamed frame. Once the layout settles, a pan/zoom only re-runs the O(visible) cut.
         .lod(
           options.lod === "On"
             ? {
