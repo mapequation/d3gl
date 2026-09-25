@@ -86,6 +86,22 @@ describe("module boundaries on every backend (#329)", () => {
     expect(counts).toEqual([2, 2, 2]); // modules 1 and 2 (never the root: the whole network)
   });
 
+  it("never picks a ring on any backend — it is decoration, like the WebGL lane's", async () => {
+    for (const backend of BACKENDS) {
+      const net = await engine(backend, { ...OPEN_TOP, moduleBoundary: { width: 1.5, color: RING, opacity: 1 } }, K_TOP);
+      expect(uses(net.toSVG(), "stroke", RING), `${backend}: rings drawn`).toBe(2);
+      const layers = new Map<string, number>();
+      for (let y = 10; y < H; y += 20) {
+        for (let x = 10; x < W; x += 20) {
+          const layer = net.pick(x, y)?.layer ?? "none";
+          layers.set(layer, (layers.get(layer) ?? 0) + 1);
+        }
+      }
+      expect(layers.get("module-boundaries"), `${backend}: ${JSON.stringify([...layers])}`).toBeUndefined();
+      net.destroy();
+    }
+  });
+
   it("rings deeper modules as they open on zoom", async () => {
     for (const backend of BACKENDS) {
       const net = await engine(backend, { ...OPEN_TOP, moduleBoundary: { color: RING, opacity: 1 } }, 12);

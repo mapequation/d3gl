@@ -2985,6 +2985,9 @@ export class Network extends BaseEngine {
       data: ringIds,
       ids: ringIds,
       sizeMode: "world",
+      // Decorative, like its WebGL twin (an instanced circles layer no pick resolves): a ring's hit disc
+      // would cover the module's whole interior and shadow the background there on Canvas/SVG only.
+      pickable: false,
       fill: () => "rgba(0, 0, 0, 0)",
       stroke: (_d, i) => (rings ? rgbaCss(rings.borderColors, i) : ""),
       build: (g) => {
