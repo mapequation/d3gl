@@ -331,6 +331,29 @@ describe("module links anchored at expanded modules' boundaries (#329)", () => {
     expect(got.get(`${id("2")}:${id("1")}`)).toBe(3);
   });
 
+  it("draws a link once when the pair of its end's off-screen expanded ancestor holds it too", () => {
+    // Module 1 open to 1:1's leaves near the origin; 1:2 far left drags module 1's centroid off-screen, so
+    // the off-screen rule follows module 2's in-pair 1 → 2 — which holds the flow the link already draws.
+    const recs: ModuleNode[] = [[1, 1, 1], [1, 1, 2], [1, 2, 1], [1, 2, 2], [2, 1, 1], [2, 1, 2], [2, 2, 1]].map((path, id) => ({ id, path }));
+    const positions = new Float32Array([0, 0, 2, 0, -9000, 0, -9002, 0, 30, 0, 32, 2, 36, -2]);
+    const view = { minX: -50, maxX: 50, minY: -50, maxY: 50 };
+    const cases: [string, { source: number[]; target: number[]; weight: number[] } | undefined, ModuleLink[] | undefined][] = [
+      ["anchored module link 1:1 → 2:1", undefined, [{ source: [1, 1], target: [2, 1], flow: 7 }]],
+      ["projected graph edge", { source: [0], target: [4], weight: [7] }, undefined],
+    ];
+    for (const [label, edges, moduleLinks] of cases) {
+      const tree = buildModuleLODTree(7, recs, edges, moduleLinks);
+      computeLODPositions(tree, positions);
+      const byPath = idsByPath(tree);
+      const at = (p: string): number => byPath.get(p)!;
+      expect(tree.cx[at("1")]).toBeLessThan(view.minX); // the premise: module 1's centroid is off-screen
+      const anchor = collector([at("1:1"), at("1")]);
+      const got = drawnPairs(superEdges(tree, Uint32Array.from([0, 1, at("2")]), { ...STYLE, anchor }, view), tree.size);
+      // From 1:1's ring (the link) or from leaf 0 (the edge) to module 2 — and not again from module 1.
+      expect(sorted(got), label).toEqual([[`${moduleLinks ? at("1:1") : 0}:${at("2")}`, 7]]);
+    }
+  });
+
   it("puts a boundary end on the module's circle, at radius 0 (lines, arrowheads and half-arrows)", () => {
     const { tree, discs } = small;
     const m1 = id("1");

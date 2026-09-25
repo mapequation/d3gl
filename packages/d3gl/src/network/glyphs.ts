@@ -750,12 +750,16 @@ export interface SuperEdgesScratch {
   proj: Map<number, number>;
   /** Module links anchored at an expanded module's boundary (#329): pair → summed flow — cleared per call. */
   anchor: Map<number, number>;
+  /** Flow a finer drawn pair already carries, by the off-screen pair that also holds it (pair → summed
+   *  flow), and that pair's non-present ends — cleared per call. @see {@link superEdges} */
+  claimed: Map<number, number>;
+  claimedEnds: Set<number>;
 }
 
 /** Fresh {@link SuperEdgesScratch}. The network engine keeps ONE per instance; {@link superEdges}
  *  falls back to a throwaway one when none is passed (backward-compatible, but then per-call O(tree.size)). */
 export function makeSuperEdgesScratch(): SuperEdgesScratch {
-  return { seen: new Int32Array(0), gen: 0, aS: new Int32Array(256), bS: new Int32Array(256), wS: new Float64Array(256), flowByPair: new Map(), cover: new Map(), proj: new Map(), anchor: new Map() };
+  return { seen: new Int32Array(0), gen: 0, aS: new Int32Array(256), bS: new Int32Array(256), wS: new Float64Array(256), flowByPair: new Map(), cover: new Map(), proj: new Map(), anchor: new Map(), claimed: new Map(), claimedEnds: new Set() };
 }
 
 /**
@@ -768,7 +772,9 @@ export function makeSuperEdgesScratch(): SuperEdgesScratch {
  * mismatch — is skipped, deferred to the LOD cross-fade #133). In a ragged tree a pair may join nodes at
  * different depths (a lift pair, #325 — see `buildSuperEdges`); it is drawn whenever both ends are
  * present, but followed toward a non-present neighbour only from its deeper end, so each edge is drawn
- * once. Width + colour come from the accumulated subsumed flow. Rendered as fused **half-arrows** or
+ * once. A pair toward an off-screen *expanded* neighbour leaves out the flow finer drawn pairs already
+ * carry (a lift pair, a cross-level projection, an anchored module link), so the members it scrolled off
+ * with do not draw it a second time. Width + colour come from the accumulated subsumed flow. Rendered as fused **half-arrows** or
  * bent/straight **lines** + (directed) arrowheads — the same glyph choice the non-LOD path makes. `{}`
  * when the tree has no super-edge CSR (spatial tree).
  *
@@ -810,6 +816,34 @@ export function superEdges(
   const merges = (g: number, h: number): boolean => dep !== undefined && dep[h] !== dep[g] && (dep[h]! < dep[g]! ? h : g) >= tree.leafCount;
   // The parent map, only when the cross-level pass (#139) runs below.
   const par = style.crossLevelEdges ? tree.parent : undefined;
+  // The off-screen rule follows a pair toward a non-present, off-screen neighbour as if it lay outside the
+  // cut. But an EXPANDED neighbour (an ancestor of present nodes whose centroid has scrolled off) holds
+  // flow that finer pairs also draw: a present lift pair (#325), a cross-level projection (#139), an
+  // anchored module link (#329). Each such pair between nodes at different depths `claim`s its flow
+  // against the one off-screen pair that holds it too — its shallower (present) end paired with its deeper
+  // end's ancestor at that depth — and after the gather that pair keeps only the rest: the flow toward
+  // members not drawn (culled, decluttered), or nothing. O(depth) per claim; nothing when no pair claims.
+  const up = tree.parent;
+  const claimed = sc.claimed;
+  const claimedEnds = sc.claimedEnds;
+  claimed.clear();
+  claimedEnds.clear();
+  const claim = (a: number, b: number, w: number): void => {
+    if (!dep || !up || dep[a] === dep[b]) return;
+    const shallowA = dep[a]! < dep[b]!;
+    const s = shallowA ? a : b;
+    if (seen[s] !== gen) return; // a non-present shallower end: no off-screen pair holds it
+    const ds = dep[s]!;
+    let x = shallowA ? b : a;
+    while (dep[x]! > ds) {
+      x = up[x]!;
+      if (seen[x] === gen) return; // a present node on the way (a cross-fade band): it draws its own pair
+    }
+    if (!offScreen(x)) return; // on-screen: the off-screen rule does not follow it
+    const key = shallowA ? s * tree.size + x : x * tree.size + s;
+    claimed.set(key, (claimed.get(key) ?? 0) + w);
+    claimedEnds.add(x);
+  };
   // Anchoring at expanded modules' boundaries (#329), only inside the cross-level pass. Edges from
   // `anchorStart` on are anchored links; an end is on its module's boundary iff `anchored(end)`: an
   // expanded module in view (stamped `-gen`) whose centre is on-screen. `anchorEnds` puts both ends
@@ -867,6 +901,7 @@ export function superEdges(
         if (par && merges(g, h)) continue;
         pushEdge(g, h, flw[p]!);
         flowByPair.set(g * tree.size + h, flw[p]!);
+        if (dep !== undefined && dep[h] !== dep[g]) claim(g, h, flw[p]!); // a lift pair
       } else if (offScreen(h) && !deeper(h, g)) {
         pushEdge(g, h, flw[p]!);
       }
@@ -889,6 +924,7 @@ export function superEdges(
       }
     }
   }
+  const offScreenEnd = len; // the same-level gather's pairs, off-screen ones among them, end here
   // Mixed-level super-edges (#139): the same-level walk skips an off-frontier *on-screen* neighbour (the
   // collapsed↔expanded mismatch). Project it to its nearest present ancestor (`coverOf`) and draw the
   // edge there, deduping per directed pair to sum flow. Iterating from each present node covers both
@@ -954,6 +990,7 @@ export function superEdges(
       const b = key - a * tree.size;
       pushEdge(a, b, w);
       flowByPair.set(key, w); // both endpoints present → feed reciprocal half-arrow widths too
+      claim(a, b, w);
     }
 
     // Module links anchored at expanded modules' boundaries (#329). Once a module expands, every pair that
@@ -963,7 +1000,8 @@ export function superEdges(
     // off-screen rule above): the other end resolves to its present cover, or to itself when it is also
     // anchored or off-screen, and the link is drawn once — a link between two anchored modules from its
     // source's side. Leaf-derived flow never enters these rows (the projection draws it at the children),
-    // so nothing is counted twice. Expanded-not-present modules are stamped `-gen` in `seen`.
+    // and an off-screen ancestor's pair that also holds the link gives it up (`claim`), so nothing is
+    // counted twice. Expanded-not-present modules are stamped `-gen` in `seen`.
     const mlOff = tree.moduleLinkOffset;
     const mlTgt = tree.moduleLinkTarget;
     const mlFlw = tree.moduleLinkFlow;
@@ -1016,8 +1054,34 @@ export function superEdges(
         if (!anchorEnds(a, b)) continue; // the boundaries overlap: nothing to draw between them
         pushEdge(a, b, w);
         flowByPair.set(key, w); // reciprocal anchored links (A→B and B→A) share their widths
+        claim(a, b, w);
       }
     }
+  }
+  // The claims (see `claim`): each off-screen pair of the same-level gather that finer drawn pairs share
+  // flow with keeps the rest, or is dropped when nothing is left (float32 sums: within 1e-4 of its flow).
+  if (claimed.size > 0) {
+    let kept = 0;
+    for (let e = 0; e < len; e++) {
+      const a = sc.aS[e]!;
+      const b = sc.bS[e]!;
+      let w = sc.wS[e]!;
+      const x = seen[a] === gen ? b : a; // an off-screen pair's non-present end
+      if (e < offScreenEnd && seen[x] !== gen && claimedEnds.has(x)) {
+        const c = claimed.get(a * tree.size + b);
+        if (c !== undefined) {
+          const rest = w - c;
+          if (!(rest > w * 1e-4)) continue;
+          w = rest;
+        }
+      }
+      sc.aS[kept] = a;
+      sc.bS[kept] = b;
+      sc.wS[kept] = w;
+      kept++;
+    }
+    if (anchorStart !== Infinity) anchorStart -= len - kept; // only same-level pairs (before it) are dropped
+    len = kept;
   }
   const count = len;
   const aS = sc.aS;
