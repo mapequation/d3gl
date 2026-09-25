@@ -66,6 +66,12 @@ export interface LODTopology {
   superEdgeTarget?: Uint32Array;
   superEdgeFlow?: Float32Array;
   /**
+   * Provided-module trees only (#197/#324): each tree node's last Infomap path entry — a module's branch
+   * id within its parent, a leaf's rank in its module; `-1` for the root. With {@link parent} it spells
+   * any node's path (walk up, collecting entries) — so an aggregate can be named by its module.
+   */
+  branch?: Int32Array;
+  /**
    * The **transpose** of the super-edge CSR (in-adjacency, by target): node `g`'s incoming edges are
    * `[superEdgeInOffset[g] .. superEdgeInOffset[g+1])`, coming from `superEdgeInSource` with the same
    * summed `superEdgeInFlow`. Lets the gather keep a visible node's edges to off-screen neighbours in

@@ -161,7 +161,12 @@ describe("buildModuleLODTree matches the string-keyed reference build (#215)", (
   ];
   for (const f of fixtures) {
     it(`is identical on the ${f.name} fixture`, () => {
-      expect(buildModuleLODTree(f.nodeCount, f.records)).toStrictEqual(referenceModuleLODTree(f.nodeCount, f.records));
+      expect(withoutBranch(buildModuleLODTree(f.nodeCount, f.records))).toStrictEqual(
+        referenceModuleLODTree(f.nodeCount, f.records),
+      );
+    });
+    it(`spells every node's path from parent + branch on the ${f.name} fixture`, () => {
+      expectPathsSpelled(buildModuleLODTree(f.nodeCount, f.records), f.records);
     });
   }
 
@@ -169,12 +174,29 @@ describe("buildModuleLODTree matches the string-keyed reference build (#215)", (
     for (let seed = 1; seed <= 5; seed++) {
       const nodeCount = 100 + seed * 137; // odd sizes, up to ~785 nodes
       const { records, edges } = randomFixture(seed, nodeCount);
-      expect(buildModuleLODTree(nodeCount, records, edges)).toStrictEqual(
-        referenceModuleLODTree(nodeCount, records, edges),
-      );
+      const tree = buildModuleLODTree(nodeCount, records, edges);
+      expect(withoutBranch(tree)).toStrictEqual(referenceModuleLODTree(nodeCount, records, edges));
+      expectPathsSpelled(tree, records);
     }
   });
 });
+
+/** The tree minus `branch` (#324 aggregate identity), which the pre-#215 reference build doesn't produce. */
+function withoutBranch(tree: LODTree): Omit<LODTree, "branch"> {
+  const { branch: _branch, ...rest } = tree;
+  return rest;
+}
+
+/** Walking each leaf up via `parent`, collecting `branch`, spells its record's path. */
+function expectPathsSpelled(tree: LODTree, records: readonly ModuleNode[]): void {
+  const { parent, branch } = tree;
+  if (!parent || !branch) throw new Error("module trees carry parent + branch");
+  for (const { id, path } of records) {
+    const spelled: number[] = [];
+    for (let g = id; parent[g]! >= 0; g = parent[g]!) spelled.push(branch[g]!);
+    expect(spelled.reverse()).toEqual(Array.from(path));
+  }
+}
 
 /** Deterministic LCG in [0, 1) — keeps the randomized fixtures reproducible. */
 function makeRng(seed: number): () => number {

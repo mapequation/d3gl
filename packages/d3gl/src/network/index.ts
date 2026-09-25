@@ -32,6 +32,8 @@ export type { LODTree, LODTransform, CutOptions, CutScratch, DeclutterOptions, D
 
 export { buildModuleLODTree } from "./modules.js";
 export type { ModuleLink, ModuleNode } from "./modules.js";
+export { nestedLayout } from "./nested-layout.js";
+export type { NestedLayoutOptions, NestedLayoutResult, NestedLayoutTopology } from "./nested-layout.js";
 
 export { moduleColors } from "./module-colors.js";
 export type { ModulePathNode, ModuleColorOptions } from "./module-colors.js";

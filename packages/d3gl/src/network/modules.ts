@@ -96,16 +96,18 @@ function buildModuleTopology(
   // did, without the O(nodeCount·depth) transient strings (#215). Each module's parent is recorded
   // at creation; the root (index 0) has none. ---
   const moduleParent: number[] = []; // internal index → parent internal index (-1 for the root)
+  const moduleBranch: number[] = []; // internal index → its path entry within the parent (-1 for the root)
   const moduleChild: (Map<number, number> | null)[] = []; // internal index → (branch id → child internal index)
-  const registerModule = (parent: number): number => {
+  const registerModule = (parent: number, branch: number): number => {
     moduleParent.push(parent);
+    moduleBranch.push(branch);
     moduleChild.push(null);
     return moduleParent.length - 1;
   };
-  registerModule(-1); // the root — always present, even for a flat (module-less) network
+  registerModule(-1, -1); // the root — always present, even for a flat (module-less) network
 
   const leafModule = new Int32Array(nodeCount).fill(-1); // node id → enclosing module's internal index
-  const leafRank = links?.length ? new Float64Array(nodeCount) : null; // node id → last path entry (for link lookup)
+  const leafRank = new Int32Array(nodeCount); // node id → last path entry (its rank in its module)
   const seen = new Uint8Array(nodeCount);
   for (let r = 0; r < records.length; r++) {
     const { id, path } = records[r]!;
@@ -125,13 +127,13 @@ function buildModuleTopology(
       const kids = (moduleChild[m] ??= new Map());
       let child = kids.get(branch);
       if (child === undefined) {
-        child = registerModule(m);
+        child = registerModule(m, branch);
         kids.set(branch, child);
       }
       m = child;
     }
     leafModule[id] = m;
-    if (leafRank) leafRank[id] = path[depth - 1]!;
+    leafRank[id] = path[depth - 1]!;
   }
   for (let i = 0; i < nodeCount; i++) {
     if (!seen[i]) throw new Error(`buildModuleLODTree: no record for node id ${i} (records must cover every node)`);
@@ -198,6 +200,10 @@ function buildModuleTopology(
     }
   }
 
+  const branch = new Int32Array(size);
+  branch.set(leafRank);
+  for (let m = 0; m < moduleCount; m++) branch[moduleId[m]!] = moduleBranch[m]!;
+
   const topo: LODTopology = {
     size,
     leafCount: nodeCount,
@@ -208,11 +214,12 @@ function buildModuleTopology(
     edgeOffset: new Uint32Array(size + 1), // undirected coarse adjacency unused for module trees
     edgeNeighbors: new Uint32Array(0),
     parent, // lets the cross-level super-edge gather walk a node up to its present ancestor (#139)
+    branch, // + parent → any node's Infomap path (aggregate identity for labels/picks)
   };
   const hasLinks = !!links?.length;
   if (edges || hasLinks) {
     const input =
-      links && leafRank && hasLinks
+      links && hasLinks
         ? withModuleLinks(edges, links, resolveLinkPaths(moduleChild, moduleId, leafModule, leafRank))
         : edges;
     if (input) Object.assign(topo, buildSuperEdges(size, parent, input));
@@ -229,7 +236,7 @@ function resolveLinkPaths(
   moduleChild: readonly (Map<number, number> | null)[],
   moduleId: Uint32Array,
   leafModule: Int32Array,
-  leafRank: Float64Array,
+  leafRank: Int32Array,
 ): (path: ArrayLike<number>) => number {
   const leafByRank = new Map<number, Map<number, number>>(); // module internal index → rank → leaf id
   for (let id = 0; id < leafModule.length; id++) {

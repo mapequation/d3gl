@@ -14,6 +14,7 @@ import type { NetworkGraph } from "./graph.js";
 import { multilevelLayout, type CoarsenOptions } from "./coarsen.js";
 import { ForceLayout, seedPositions, type ForceParams } from "./force.js";
 import { lodTreeFromTopology, type LODTree } from "./lod.js";
+import { nestedLayout, type NestedLayoutParams, type NestedLayoutTopology } from "./nested-layout.js";
 import { lodGeometryViews, lodGeometryByteLength, type MainToWorker, type WorkerToMain } from "./worker-protocol.js";
 
 export interface WorkerLayoutOptions {
@@ -216,5 +217,74 @@ export function startWorkerLayout(
       const unpin: MainToWorker = { type: "unpin" };
       worker.postMessage(unpin);
     },
+  };
+}
+
+/**
+ * Run the nested module layout (#324) off-thread: the worker streams one frame per finished depth (top
+ * modules first), each copied into `graph.positions`. Falls back to a synchronous main-thread solve
+ * when Workers are unavailable. The worker exits with the layout — there is no reheat (drag is
+ * translate-only on a nested layout, as on caller-supplied positions).
+ */
+export function startNestedWorkerLayout(
+  graph: NetworkGraph,
+  tree: NestedLayoutTopology,
+  params: NestedLayoutParams,
+  onFrame: () => void,
+): WorkerLayoutHandle {
+  const fallback = (): WorkerLayoutHandle => {
+    graph.positions.set(nestedLayout(tree, params).positions);
+    onFrame();
+    return { shared: false, settled: Promise.resolve(), stop() {}, ...NOOP_DRAG };
+  };
+  if (typeof Worker === "undefined") return fallback();
+  let worker: Worker;
+  try {
+    worker = new Worker(new URL("./layout-worker.js", import.meta.url), { type: "module" });
+  } catch {
+    return fallback();
+  }
+  let resolveSettled!: () => void;
+  const settled = new Promise<void>((r) => (resolveSettled = r));
+  let terminated = false;
+  const terminate = (): void => {
+    if (terminated) return;
+    terminated = true;
+    worker.terminate();
+    resolveSettled();
+  };
+  worker.onmessage = (e: MessageEvent<WorkerToMain>): void => {
+    const msg = e.data;
+    if (msg.type === "lod-topology") return;
+    if (msg.positions) graph.positions.set(msg.positions);
+    onFrame();
+    if (msg.type === "done") terminate();
+  };
+  worker.onerror = (): void => {
+    if (terminated) return;
+    graph.positions.set(nestedLayout(tree, params).positions);
+    onFrame();
+    terminate();
+  };
+  // Clone only the topology the layout reads — not the LOD tree's geometry/style arrays.
+  const topology: NestedLayoutTopology = {
+    size: tree.size,
+    leafCount: tree.leafCount,
+    childOffset: tree.childOffset,
+    children: tree.children,
+    parent: tree.parent,
+    superEdgeOffset: tree.superEdgeOffset,
+    superEdgeTarget: tree.superEdgeTarget,
+    superEdgeFlow: tree.superEdgeFlow,
+  };
+  const start: MainToWorker = { type: "start-nested", topology, params };
+  worker.postMessage(start);
+  return {
+    shared: false,
+    settled,
+    stop() {
+      terminate();
+    },
+    ...NOOP_DRAG,
   };
 }
