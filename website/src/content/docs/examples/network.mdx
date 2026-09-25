@@ -447,7 +447,9 @@ the cut over the same engine-held hierarchy:
 In `sizeMode: "screen"` the glyphs stay a constant pixel size, so the map reads at every zoom — scroll
 out to the map of modules, in to sub-modules and individual nodes. The **Boundaries** control rings
 every module the cut has opened (see [below](#module-boundaries)); try it with **Layout: Nested**, where
-each ring is the module's disc.
+each ring is the module's disc. **Input: .ftree** passes the links between modules as module links, the
+way an Infomap `.ftree` has them: `data(graph, { modules, moduleLinks })`, with only the links inside each
+bottom module left as graph edges.
 
 <ExampleCard files={["modular-map/draw.ts", "modular-map/data.ts"]}>
   <ModularMap client:visible slot="demo" />
@@ -481,7 +483,8 @@ net.lod({
   unchanged, so nothing is counted twice. Where the two rings overlap, as the centroid + extent rings of
   a force layout often do, the link runs between their centres rather than disappearing. An expanded
   module whose centre is off-screen keeps the usual off-screen rule: its links are drawn toward its
-  centre.
+  centre. Try it above with **Input: .ftree**, which hands the example's links between modules over as
+  module links.
 - **Cost.** Each frame costs one ring per expanded module in view. The cut visits those modules anyway,
   so it walks the tree exactly as it does without rings. Anchoring adds those modules' own module links.
   It never costs the whole tree, and it is nothing when the option is off.

@@ -1,7 +1,7 @@
 import { network, buildGraph, moduleColors } from "@mapequation/d3gl/network";
 import { scaleSqrt, type ScaleContinuousNumeric } from "d3-scale";
 import type { ImperativeSetup } from "../types.js";
-import { makeModularMap } from "./data.js";
+import { asFtree, makeModularMap } from "./data.js";
 
 /** Nodes slider → generated network size. Capped where the runtime random-walk flow stays snappy. */
 const SIZES = [500, 1_000, 2_000, 5_000, 10_000, 20_000];
@@ -25,6 +25,11 @@ const SIZES = [500, 1_000, 2_000, 5_000, 10_000, 20_000];
  * has opened is ringed, on its disc under the nested layout. Switching re-lays the map out **warm**, from where the nodes are, and **eases**
  * them there (#328): `layout({ nested: { warm: true }, transition: 800 })` — the same call an app makes
  * after re-clustering, so the new map refines the old one in place instead of restarting from a disc.
+ *
+ * The **Input** control hands the same map over as an Infomap **`.ftree`** would (#199): the graph keeps
+ * only the links inside each bottom module, and the links between modules arrive as **module links**,
+ * `data(graph, { modules, moduleLinks })`. Then no leaf edge carries a module's connectivity once it opens
+ * — with **Boundaries** and **Cross-level edges** on, its links stay drawn, anchored at its ring (#329).
  *
  * The **Nodes** slider resizes the generated network (500 → 20,000): the map is regenerated — flow and
  * all — and re-laid-out, framing itself each time. The **LOD** control switches the cut:
@@ -58,6 +63,7 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
 
   // Regenerated + re-laid-out whenever the Nodes slider changes; flow-derived scales are rebuilt with it.
   let count = -1;
+  let input = ""; // the Input control's last value
   let layoutMode = ""; // the Layout control's last value ("" = a fresh graph, nothing on screen yet)
   let colors: string[] = [];
   let enterExit: Float32Array<ArrayBufferLike> = new Float32Array();
@@ -70,8 +76,9 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
     engine: net,
     render: (options) => {
       const n = SIZES[(options.nodes as number) ?? 1] ?? 1_000;
-      if (n !== count) {
+      if (n !== count || options.input !== input) {
         count = n;
+        input = options.input as string;
         const d = makeModularMap(n);
         enterExit = d.enterExit;
         // Categorical colour per planted module; aggregates inherit their module's colour under LOD.
@@ -86,17 +93,19 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
         // read as density, not black — a reciprocal pair shows its asymmetry in both width AND colour.
         // (The scale interpolates the RGBA range, alpha included.)
         linkStroke = scaleSqrt<string>().domain([0, maxLink]).range(["rgba(150, 186, 221, 0.4)", "rgba(40, 90, 161, 0.9)"]).clamp(true);
+        // ".ftree": only the links inside bottom modules are graph edges; the rest arrive as module links.
+        const ftree = input === ".ftree" ? asFtree(d) : null;
         const graph = buildGraph({
           nodeCount: d.nodeCount,
-          source: d.source,
-          target: d.target,
-          weight: d.linkFlow, // edge weight = flow, so LOD super-edges accumulate flow
+          source: ftree?.source ?? d.source,
+          target: ftree?.target ?? d.target,
+          weight: ftree?.linkFlow ?? d.linkFlow, // edge weight = flow, so LOD super-edges accumulate flow
           directed: true,
           nodeFlow: d.nodeFlow,
         });
-        // The (ragged) module hierarchy travels with the graph (#326), so both layouts read it in every
-        // LOD mode.
-        net.data(graph, { modules: d.modulePaths });
+        // The (ragged) module hierarchy — and an .ftree's module links — travel with the graph (#326), so
+        // both layouts read them in every LOD mode.
+        net.data(graph, { modules: d.modulePaths, moduleLinks: ftree?.moduleLinks });
         layoutMode = "";
       }
       const layout = (options.layout as string) ?? "Force";
