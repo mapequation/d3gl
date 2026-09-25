@@ -367,6 +367,7 @@ per-file timeout. Every at-scale leg below now asserts. When you add a guard, ad
 | hover pick (interaction) | — | `core/__tests__/hit-test-grid-perf.test.ts` | 1M, world+screen | `BENCH_HIT` (`core/hit-test.bench.test.ts`) |
 | network LOD cut + declutter | — | `network/__tests__/frontier-perf.test.ts` | 100k, **all-leaves frontier** | `BENCH_FRONTIER` |
 | network LOD super-edges | — | `network/__tests__/super-edges-perf.test.ts` | 100k + all-leaves; **ragged** module tree 100k (sweep + mixed-level + all-leaves, #325) | `BENCH_SUPER_EDGES` (+ all-leaves; ragged leg too) |
+| network LOD module boundaries (#329): cut collection + rings + anchored module links | — | `network/__tests__/module-boundary-perf.test.ts` | 100k `.ftree`-shaped map: sweep on/off, every module open (declutter on **and** off), raw-network identity | `BENCH_MODULE_BOUNDARY` (+ on/off ratio under `PERF_ASSERT`) |
 | network LOD end-to-end | — | `network/__tests__/lod-perf.bench.test.ts` | — | `BENCH_LOD` |
 | network no-LOD labels | — | `network/__tests__/label-candidates-perf.test.ts` | 100k | `BENCH_LABEL_CANDIDATES` |
 | network selection dim | — | `network/__tests__/selection-dim-perf.test.ts` | 100k | — |
@@ -411,6 +412,7 @@ guard owns the serialize budget: one DOM node per drawable buys parse time, not 
 | **`plot()` engine sweep**, retained Scene | **WebGL** | `map/plot-engine-sweep-perf.browser.test.ts` | 50k ×2 layers | `PERF_BROWSER_N` (max 300k) |
 | **`network()` engine sweep**, LOD on **and** off | **WebGL** | `network/__tests__/network-sweep-perf.browser.test.ts` | 50k nodes / 50k edges | `PERF_BROWSER_N` (max 200k) |
 | **`network()` position transition** (#328), LOD on **and** off, vs a streamed frame | **WebGL** | `network/__tests__/network-transition-perf.browser.test.ts` | 50k nodes | `PERF_BROWSER_N` (max 200k) |
+| **`network()` module boundaries** (#329), sweep on vs off + every module open | **WebGL** | `network/__tests__/network-module-boundary-perf.browser.test.ts` | 50k nodes | `PERF_BROWSER_N` (max 200k) |
 | multi pass-through: FBO count + gesture skip | **WebGL** | `map/passthrough-multi-perf.browser.test.ts` | 25k ×2 layers | `PERF_BROWSER_N` (max 50k) |
 | label placement (`cullLabels`) | — | `labels/__tests__/label-cull-perf.test.ts` | 200k candidates, dense **and** spread | `BENCH_LABEL_CULL` |
 | **`network.labels()` per-frame**, LOD on **and** off | **WebGL** | `network/__tests__/network-labels-perf.browser.test.ts` | 20k nodes, uncapped | `PERF_BROWSER_N` (max 50k) |
@@ -590,7 +592,11 @@ so the stroke covers `[r·(1 − b), r]` and the fill shows through inside it. T
 instanced-circle fragment shader paints, so all three backends agree — `circlesToDrawables`
 (`core/instanced-vector.ts`) for the WebGL export, `traceFrontierGlyphs` + `emitNodes` and
 `traceFrontierHalos` (`network/glyphs.ts`) for the retained Scene behind Canvas/SVG, via
-`GroupBuilder.point(id, x, y, radius, lineWidth)`.
+`GroupBuilder.point(id, x, y, radius, lineWidth)`. The module-boundary rings (`traceBoundaryRings`, #329)
+use the same `point` encoding in a **world** layer, for a reason worth keeping: first traced as an
+`arc` path, the Scene flattened each ring to ~16 segments while WebGL exported an exact `<circle>`, and
+the export pixel diff measured 1% (world) to 13% (a 2px screen ring). A `point` stays a true circle on
+every path (0 in the harness).
 
 The Scene path used to stack a border disc under a smaller fill disc. Identical for an **opaque**
 fill, wrong for a **translucent** one: the fill disc composites over the border disc, so the ring

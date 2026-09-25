@@ -2,7 +2,7 @@ import { rgb } from "d3-color";
 import type { InstancedCirclesData, InstancedPieData, InstancedLinesData, InstancedArrowsData, InstancedHalfArrowsData, InstancedLayer, GroupBuilder } from "../core/index.js";
 import type { NetworkGraph } from "./graph.js";
 import type { PhysicalPieWedges } from "./pie.js";
-import type { LODTree, LODTransform } from "./lod.js";
+import { boundaryCircle, type CutBoundaries, type LODTree, type LODTransform } from "./lod.js";
 import type { ScreenRect } from "../core/instanced-lane.js";
 import { halfLinkGeometry, traceHalfLink, scaleHalfLink, bezierControl, bentEndTangent, straightUnit, chordBend } from "../core/half-link.js";
 
@@ -562,6 +562,8 @@ export interface AggregateOutlineResolved {
   width: number;
   gap: number;
   color: string;
+  /** Multiplies the ring colour's alpha (0-1). */
+  opacity: number;
   maxAggregateRadius?: number;
   /** Cross-fade alpha (#133), indexed by tree-node id — scales each ring's alpha so a halo fades with its aggregate. */
   fadeAlpha?: Float32Array;
@@ -586,6 +588,7 @@ export function frontierHalos(tree: LODTree, frontier: Uint32Array, style: Aggre
   const radii = new Float32Array(count);
   const borders = new Float32Array(count);
   const ring = toRGBA(style.color);
+  ring[3] = Math.round(ring[3] * style.opacity);
   const borderColors = new Uint8Array(count * 4);
   // Stable tree-node id per halo, so the Scene path (#138) keys its ring drawables identically to the
   // frontier glyph they sit behind (and the retained-scene diff stays stable across re-cuts).
@@ -618,6 +621,77 @@ export interface FrontierHalosData extends InstancedCirclesData {
   borderColors: Uint8Array;
 }
 
+/** Resolved module-boundary style (#329): a `width`-thick ring on each expanded module's boundary circle. */
+export interface ModuleBoundaryResolved {
+  /** Ring thickness in the active sizeMode's units (px when {@link screen}). */
+  width: number;
+  /** Ring colour (any CSS colour); its alpha is multiplied by {@link opacity}. */
+  color: string;
+  opacity: number;
+  /** Screen sizeMode: `width` is px, turned into world units at the zoom `k`. */
+  screen: boolean;
+  k: number;
+}
+
+/**
+ * The **module-boundary rings** (#329): one ring per expanded module the cut collected
+ * ({@link CutBoundaries}), on its boundary circle — the nested layout's disc (the tree's `cx`/`cy` with
+ * `boundaries.radius`) or the centroid + `extent` — with the ring's outer edge on the circle. A world-sized ring batch (world radius,
+ * a `width`-thick border: constant px in `screen` sizeMode, so the fraction is re-derived at the zoom
+ * `k`), faded by each module's children's cross-fade alpha. A ring whose circle wholly contains the view
+ * is dropped (its stroke is off-screen). O(collected modules) — the expanded modules in view.
+ */
+export function boundaryRings(
+  tree: LODTree,
+  boundaries: CutBoundaries,
+  style: ModuleBoundaryResolved,
+  view: { minX: number; maxX: number; minY: number; maxY: number },
+): FrontierHalosData {
+  const { ids: expanded, alpha, radius } = boundaries;
+  const n = boundaries.count;
+  const w = style.screen ? style.width / (style.k || 1) : style.width; // ring thickness, world units
+  const circle = new Float64Array(3);
+  // Whether the ring's stroke (the annulus [r − w, r]) can reach the view: not when the view sits wholly
+  // inside its inner circle (a module zoomed deep into). The cut already dropped circles missing the view.
+  const shows = (g: number): boolean => {
+    boundaryCircle(tree, g, radius, circle);
+    const r = circle[2]!;
+    if (!(r > 0)) return false;
+    const inner = r - w;
+    if (inner <= 0) return true;
+    const fx = Math.max(Math.abs(view.minX - circle[0]!), Math.abs(view.maxX - circle[0]!)); // farthest corner
+    const fy = Math.max(Math.abs(view.minY - circle[1]!), Math.abs(view.maxY - circle[1]!));
+    return fx * fx + fy * fy >= inner * inner;
+  };
+  let count = 0;
+  for (let i = 0; i < n; i++) if (shows(expanded[i]!)) count++;
+  const centers = new Float32Array(count * 2);
+  const radii = new Float32Array(count);
+  const borders = new Float32Array(count);
+  const borderColors = new Uint8Array(count * 4);
+  const ids = new Uint32Array(count);
+  const [cr, cg, cb, ca] = toRGBA(style.color);
+  const base = ca * Math.max(0, Math.min(1, style.opacity));
+  let k = 0;
+  for (let i = 0; i < n; i++) {
+    const g = expanded[i]!;
+    if (!shows(g)) continue;
+    boundaryCircle(tree, g, radius, circle);
+    ids[k] = g;
+    centers[k * 2] = circle[0]!;
+    centers[k * 2 + 1] = circle[1]!;
+    radii[k] = circle[2]!;
+    borders[k] = Math.min(1, w / circle[2]!);
+    borderColors[k * 4] = cr;
+    borderColors[k * 4 + 1] = cg;
+    borderColors[k * 4 + 2] = cb;
+    borderColors[k * 4 + 3] = Math.round(base * alpha[i]!);
+    k++;
+  }
+  // Transparent fill (alpha 0): only the ring shows, over the module's own members.
+  return { centers, radii, colors: new Uint8Array(count * 4), borders, borderColors, count, ids };
+}
+
 /** Resolved style for LOD super-edges — the same channels as raw links, applied to accumulated flow. */
 export interface SuperEdgeStyleResolved {
   /** `"line"` (bent/straight + optional arrowhead) or `"half-arrow"` (fused, directed). */
@@ -639,6 +713,15 @@ export interface SuperEdgeStyleResolved {
    * added cost when off** — the projection pass runs only when this is `true`. Needs `tree.parent`.
    */
   crossLevelEdges?: boolean;
+  /**
+   * **Anchor module links** at expanded modules' boundaries (#329): the cut's expanded modules in view
+   * ({@link CutBoundaries}, with the radii their rings are drawn at). A module link (#199) whose endpoint
+   * is one of them — not itself on the frontier, its centre on-screen — is drawn to/from that module's
+   * boundary with its flow, since no finer pair carries it once the module expands. Needs
+   * {@link crossLevelEdges} and a tree built with module links (`tree.moduleLinkOffset`); ignored
+   * otherwise, so a raw network's output is unchanged. Cost: O(those modules' own module links).
+   */
+  anchor?: CutBoundaries;
   /**
    * Cross-fade alpha (#133), indexed by tree-node id. When set, each super-edge's alpha is scaled by the
    * least-visible of its two *present* endpoints (off-screen endpoints count as opaque), so an edge fades
@@ -668,12 +751,18 @@ export interface SuperEdgesScratch {
   /** Cross-level (#139) nearest-present-ancestor memo + projected-pair sums — cleared per call. */
   cover: Map<number, number>;
   proj: Map<number, number>;
+  /** Module links anchored at an expanded module's boundary (#329): pair → summed flow — cleared per call. */
+  anchor: Map<number, number>;
+  /** Flow a finer drawn pair already carries, by the off-screen pair that also holds it (pair → summed
+   *  flow), and that pair's non-present ends — cleared per call. @see {@link superEdges} */
+  claimed: Map<number, number>;
+  claimedEnds: Set<number>;
 }
 
 /** Fresh {@link SuperEdgesScratch}. The network engine keeps ONE per instance; {@link superEdges}
  *  falls back to a throwaway one when none is passed (backward-compatible, but then per-call O(tree.size)). */
 export function makeSuperEdgesScratch(): SuperEdgesScratch {
-  return { seen: new Int32Array(0), gen: 0, aS: new Int32Array(256), bS: new Int32Array(256), wS: new Float64Array(256), flowByPair: new Map(), cover: new Map(), proj: new Map() };
+  return { seen: new Int32Array(0), gen: 0, aS: new Int32Array(256), bS: new Int32Array(256), wS: new Float64Array(256), flowByPair: new Map(), cover: new Map(), proj: new Map(), anchor: new Map(), claimed: new Map(), claimedEnds: new Set() };
 }
 
 /**
@@ -686,7 +775,9 @@ export function makeSuperEdgesScratch(): SuperEdgesScratch {
  * mismatch — is skipped, deferred to the LOD cross-fade #133). In a ragged tree a pair may join nodes at
  * different depths (a lift pair, #325 — see `buildSuperEdges`); it is drawn whenever both ends are
  * present, but followed toward a non-present neighbour only from its deeper end, so each edge is drawn
- * once. Width + colour come from the accumulated subsumed flow. Rendered as fused **half-arrows** or
+ * once. A pair toward an off-screen *expanded* neighbour leaves out the flow finer drawn pairs already
+ * carry (a lift pair, a cross-level projection, an anchored module link), so the members it scrolled off
+ * with do not draw it a second time. Width + colour come from the accumulated subsumed flow. Rendered as fused **half-arrows** or
  * bent/straight **lines** + (directed) arrowheads — the same glyph choice the non-LOD path makes. `{}`
  * when the tree has no super-edge CSR (spatial tree).
  *
@@ -728,6 +819,64 @@ export function superEdges(
   const merges = (g: number, h: number): boolean => dep !== undefined && dep[h] !== dep[g] && (dep[h]! < dep[g]! ? h : g) >= tree.leafCount;
   // The parent map, only when the cross-level pass (#139) runs below.
   const par = style.crossLevelEdges ? tree.parent : undefined;
+  // The off-screen rule follows a pair toward a non-present, off-screen neighbour as if it lay outside the
+  // cut. But an EXPANDED neighbour (an ancestor of present nodes whose centroid has scrolled off) holds
+  // flow that finer pairs also draw: a present lift pair (#325), a cross-level projection (#139), an
+  // anchored module link (#329). Each such pair between nodes at different depths `claim`s its flow
+  // against the one off-screen pair that holds it too — its shallower (present) end paired with its deeper
+  // end's ancestor at that depth — and after the gather that pair keeps only the rest: the flow toward
+  // members not drawn (culled, decluttered), or nothing. O(depth) per claim; nothing when no pair claims.
+  const up = tree.parent;
+  const claimed = sc.claimed;
+  const claimedEnds = sc.claimedEnds;
+  claimed.clear();
+  claimedEnds.clear();
+  const claim = (a: number, b: number, w: number): void => {
+    if (!dep || !up || dep[a] === dep[b]) return;
+    const shallowA = dep[a]! < dep[b]!;
+    const s = shallowA ? a : b;
+    if (seen[s] !== gen) return; // a non-present shallower end: no off-screen pair holds it
+    const ds = dep[s]!;
+    let x = shallowA ? b : a;
+    while (dep[x]! > ds) {
+      x = up[x]!;
+      if (seen[x] === gen) return; // a present node on the way (a cross-fade band): it draws its own pair
+    }
+    if (!offScreen(x)) return; // on-screen: the off-screen rule does not follow it
+    const key = shallowA ? s * tree.size + x : x * tree.size + s;
+    claimed.set(key, (claimed.get(key) ?? 0) + w);
+    claimedEnds.add(x);
+  };
+  // Anchoring at expanded modules' boundaries (#329), only inside the cross-level pass. Edges from
+  // `anchorStart` on are anchored links; an end is on its module's boundary iff `anchored(end)`: an
+  // expanded module in view (stamped `-gen`) whose centre is on-screen. `anchorEnds` puts both ends
+  // where they are drawn (a boundary end moved onto its circle, toward the other end, at radius 0) into
+  // `ends` = [ax, ay, bx, by]. When the two circles overlap (routine for the centroid + extent fallback,
+  // or with the other end's centre inside the ring), there is no gap to run the link across: it runs
+  // between the circles' centres instead, so its flow is still drawn.
+  const anc = style.anchor;
+  let anchorStart = Infinity;
+  const anchored = (x: number): boolean => seen[x] === -gen && !offScreen(x);
+  const ends = new Float64Array(4);
+  const circle = new Float64Array(3);
+  const anchorEnds = (a: number, b: number): void => {
+    const aOn = anchored(a);
+    const bOn = anchored(b);
+    let ra = 0;
+    let rb = 0;
+    if (aOn) { boundaryCircle(tree, a, anc?.radius, circle); ends[0] = circle[0]!; ends[1] = circle[1]!; ra = circle[2]!; }
+    else { ends[0] = tree.cx[a]!; ends[1] = tree.cy[a]!; }
+    if (bOn) { boundaryCircle(tree, b, anc?.radius, circle); ends[2] = circle[0]!; ends[3] = circle[1]!; rb = circle[2]!; }
+    else { ends[2] = tree.cx[b]!; ends[3] = tree.cy[b]!; }
+    const dx = ends[2]! - ends[0]!;
+    const dy = ends[3]! - ends[1]!;
+    const d = Math.hypot(dx, dy);
+    if (!(d > ra + rb)) return; // overlapping circles: centre to centre
+    ends[0] = ends[0]! + (dx / d) * ra;
+    ends[1] = ends[1]! + (dy / d) * ra;
+    ends[2] = ends[2]! - (dx / d) * rb;
+    ends[3] = ends[3]! - (dy / d) * rb;
+  };
 
   // Gather drawable directed super-edges + a reciprocal-flow lookup (for both-on-frontier pairs) into
   // the scratch's reused grow-arrays/map (outputs are copied out below — they never alias the scratch).
@@ -756,6 +905,7 @@ export function superEdges(
         if (par && merges(g, h)) continue;
         pushEdge(g, h, flw[p]!);
         flowByPair.set(g * tree.size + h, flw[p]!);
+        if (dep !== undefined && dep[h] !== dep[g]) claim(g, h, flw[p]!); // a lift pair
       } else if (offScreen(h) && !deeper(h, g)) {
         pushEdge(g, h, flw[p]!);
       }
@@ -778,6 +928,7 @@ export function superEdges(
       }
     }
   }
+  const offScreenEnd = len; // the same-level gather's pairs, off-screen ones among them, end here
   // Mixed-level super-edges (#139): the same-level walk skips an off-frontier *on-screen* neighbour (the
   // collapsed↔expanded mismatch). Project it to its nearest present ancestor (`coverOf`) and draw the
   // edge there, deduping per directed pair to sum flow. Iterating from each present node covers both
@@ -843,7 +994,97 @@ export function superEdges(
       const b = key - a * tree.size;
       pushEdge(a, b, w);
       flowByPair.set(key, w); // both endpoints present → feed reciprocal half-arrow widths too
+      claim(a, b, w);
     }
+
+    // Module links anchored at expanded modules' boundaries (#329). Once a module expands, every pair that
+    // carries one of its module links has an expanded end (the module or its ancestors), so neither walk
+    // above draws it — and no finer pair exists to project. So walk the own links of each expanded module
+    // in view that is not itself present and whose centre is on-screen (an off-screen centre keeps the
+    // off-screen rule above): the other end resolves to its present cover, or to itself when it is also
+    // anchored or off-screen, and the link is drawn once — a link between two anchored modules from its
+    // source's side. Leaf-derived flow never enters these rows (the projection draws it at the children),
+    // and an off-screen ancestor's pair that also holds the link gives it up (`claim`), so nothing is
+    // counted twice. Expanded-not-present modules are stamped `-gen` in `seen`.
+    const mlOff = tree.moduleLinkOffset;
+    const mlTgt = tree.moduleLinkTarget;
+    const mlFlw = tree.moduleLinkFlow;
+    const mlInOff = tree.moduleLinkInOffset;
+    const mlInSrc = tree.moduleLinkInSource;
+    const mlInFlw = tree.moduleLinkInFlow;
+    if (anc && mlOff && mlTgt && mlFlw && mlInOff && mlInSrc && mlInFlw) {
+      const expanded = anc.ids;
+      for (let i = 0; i < anc.count; i++) {
+        const h = expanded[i]!;
+        if (seen[h] !== gen) seen[h] = -gen;
+      }
+      const anchor = sc.anchor;
+      anchor.clear();
+      const fading = style.fadeAlpha !== undefined;
+      // The drawn end of a module link's endpoint x, or -1 when it has none (decluttered / faded out).
+      const rep = (x: number): number => {
+        const c = coverOf(x);
+        if (c >= 0) return c;
+        return anchored(x) || offScreen(x) ? x : -1;
+      };
+      // In a cross-fade band a present module can hold an expanded one; a link to it would point inward.
+      const inside = (a: number, h: number): boolean => {
+        for (let x = par[h]!; x >= 0; x = par[x]!) if (x === a) return true;
+        return false;
+      };
+      const add = (a: number, b: number, w: number): void => {
+        const key = a * tree.size + b;
+        anchor.set(key, (anchor.get(key) ?? 0) + w);
+      };
+      const leaves = tree.leafCount;
+      for (let i = 0; i < anc.count; i++) {
+        const h = expanded[i]!;
+        if (!anchored(h)) continue;
+        const o = h - leaves;
+        for (let p = mlOff[o]!; p < mlOff[o + 1]!; p++) {
+          const b = rep(mlTgt[p]!);
+          if (b >= 0 && !(fading && inside(b, h))) add(h, b, mlFlw[p]!);
+        }
+        for (let p = mlInOff[o]!; p < mlInOff[o + 1]!; p++) {
+          const a = rep(mlInSrc[p]!);
+          // An anchored source draws the link from its own out-row.
+          if (a >= 0 && !anchored(a) && !(fading && inside(a, h))) add(a, h, mlInFlw[p]!);
+        }
+      }
+      anchorStart = len;
+      for (const [key, w] of anchor) {
+        const a = Math.floor(key / tree.size);
+        const b = key - a * tree.size;
+        pushEdge(a, b, w);
+        flowByPair.set(key, w); // reciprocal anchored links (A→B and B→A) share their widths
+        claim(a, b, w);
+      }
+    }
+  }
+  // The claims (see `claim`): each off-screen pair of the same-level gather that finer drawn pairs share
+  // flow with keeps the rest, or is dropped when nothing is left (float32 sums: within 1e-4 of its flow).
+  if (claimed.size > 0) {
+    let kept = 0;
+    for (let e = 0; e < len; e++) {
+      const a = sc.aS[e]!;
+      const b = sc.bS[e]!;
+      let w = sc.wS[e]!;
+      const x = seen[a] === gen ? b : a; // an off-screen pair's non-present end
+      if (e < offScreenEnd && seen[x] !== gen && claimedEnds.has(x)) {
+        const c = claimed.get(a * tree.size + b);
+        if (c !== undefined) {
+          const rest = w - c;
+          if (!(rest > w * 1e-4)) continue;
+          w = rest;
+        }
+      }
+      sc.aS[kept] = a;
+      sc.bS[kept] = b;
+      sc.wS[kept] = w;
+      kept++;
+    }
+    if (anchorStart !== Infinity) anchorStart -= len - kept; // only same-level pairs (before it) are dropped
+    len = kept;
   }
   const count = len;
   const aS = sc.aS;
@@ -871,30 +1112,42 @@ export function superEdges(
   for (let e = 0; e < count; e++) {
     const g = aS[e]!;
     const h = bS[e]!;
-    sources[e * 2] = tree.cx[g]!;
-    sources[e * 2 + 1] = tree.cy[g]!;
-    targets[e * 2] = tree.cx[h]!;
-    targets[e * 2 + 1] = tree.cy[h]!;
+    const anchoredEdge = e >= anchorStart;
+    if (anchoredEdge) {
+      anchorEnds(g, h);
+      sources[e * 2] = ends[0]!;
+      sources[e * 2 + 1] = ends[1]!;
+      targets[e * 2] = ends[2]!;
+      targets[e * 2 + 1] = ends[3]!;
+    } else {
+      sources[e * 2] = tree.cx[g]!;
+      sources[e * 2 + 1] = tree.cy[g]!;
+      targets[e * 2] = tree.cx[h]!;
+      targets[e * 2 + 1] = tree.cy[h]!;
+    }
     const [cr, cg, cb, ca] = style.colorOf(wS[e]!);
     colors[e * 4] = cr;
     colors[e * 4 + 1] = cg;
     colors[e * 4 + 2] = cb;
     if (fa) {
-      const af = seen[g] === gen ? fa[g]! : 1;
-      const bf = seen[h] === gen ? fa[h]! : 1;
+      // An anchored boundary end fades with its module's children (the cut wrote their alpha for it).
+      const af = seen[g] === gen || (anchoredEdge && seen[g] === -gen) ? fa[g]! : 1;
+      const bf = seen[h] === gen || (anchoredEdge && seen[h] === -gen) ? fa[h]! : 1;
       colors[e * 4 + 3] = Math.round(ca * Math.min(af, bf));
     } else {
       colors[e * 4 + 3] = ca;
     }
   }
+  // Draw radius of edge e's end x: a boundary end already sits on its circle (0), else the glyph radius.
+  const endRadius = (e: number, x: number): number => (e >= anchorStart && anchored(x) ? 0 : drawnRadius(x));
 
   if (style.linkStyle === "half-arrow" && style.directed) {
     const radii = new Float32Array(count * 2);
     const widths = new Float32Array(count * 2);
     const bends = new Float32Array(count).fill(style.bend);
     for (let e = 0; e < count; e++) {
-      radii[e * 2] = drawnRadius(aS[e]!);
-      radii[e * 2 + 1] = drawnRadius(bS[e]!);
+      radii[e * 2] = endRadius(e, aS[e]!);
+      radii[e * 2 + 1] = endRadius(e, bS[e]!);
       const w = style.widthOf(wS[e]!);
       const opp = flowByPair.get(bS[e]! * tree.size + aS[e]!);
       widths[e * 2] = w;
@@ -918,7 +1171,7 @@ export function superEdges(
   // one-sided **half** head only for bent links (so reciprocal heads don't collide); straight links
   // get the symmetric triangle — matching the non-LOD path (`half: bend !== 0`).
   const aRadii = new Float32Array(count);
-  for (let e = 0; e < count; e++) aRadii[e] = drawnRadius(bS[e]!);
+  for (let e = 0; e < count; e++) aRadii[e] = endRadius(e, bS[e]!);
   const arrows: InstancedArrowsData = { sources, targets, radii: aRadii, sizes: new Float32Array(count).fill(style.arrowSize), colors, bends, half: style.bend !== 0, count };
   return { lines, arrows, ids, flows };
 }
@@ -1580,28 +1833,33 @@ export function traceFrontierGlyphs(g: GroupBuilder, circles: InstancedCirclesDa
 }
 
 /**
- * Trace the aggregate-outline **halo rings** (a `width`-thick stroked circle a `gap` outside each
- * collapsed-module glyph) into a Scene group, keyed by the halo's tree-node id. In `screen` sizeMode the
- * ring is pinned at a constant pixel size around the projected centre via the drawable `anchor` (the
- * same mechanism a `point` uses); in world mode it's plain world geometry. The stroke colour comes from
- * the layer accessor reading `halos.borderColors`.
+ * Trace the aggregate-outline **halo rings** (a `width`-thick ring a `gap` outside each collapsed-module
+ * glyph) into a Scene group, keyed by the halo's tree-node id: the ring-encoded circle every glyph shares
+ * ({@link ringPoint} — one circle on the ring centreline, stroked the ring's thickness), so Canvas/SVG draw
+ * and export exactly what the WebGL instanced circle does. A `point` follows the layer's sizeMode, so a
+ * `screen`-mode ring stays a constant pixel size. The stroke colour comes from the layer accessor reading
+ * `halos.borderColors`; the layer's fill is transparent.
  */
-export function traceFrontierHalos(g: GroupBuilder, halos: FrontierHalosData, screen: boolean): void {
+export function traceFrontierHalos(g: GroupBuilder, halos: FrontierHalosData): void {
   const { centers, radii, borders, ids } = halos;
   for (let k = 0; k < halos.count; k++) {
-    const cx = centers[k * 2]!;
-    const cy = centers[k * 2 + 1]!;
     const outer = radii[k]!;
-    const w = outer * borders[k]!; // ring thickness (= style.width, in the active sizeMode's units)
-    const mid = outer - w / 2; // stroke centreline radius, so the ring's outer edge sits at `outer`
-    g.drawable(
-      ids[k]!,
-      (ctx) => {
-        ctx.moveTo(cx + mid, cy);
-        ctx.arc(cx, cy, mid, 0, Math.PI * 2);
-      },
-      screen ? { lineWidth: w, anchor: [cx, cy] } : { lineWidth: w },
-    );
+    ringPoint(g, ids[k]!, centers[k * 2]!, centers[k * 2 + 1]!, outer, outer * (1 - borders[k]!));
+  }
+}
+
+/**
+ * Trace the **module-boundary rings** (#329, {@link boundaryRings}) into a world-sizeMode Scene group,
+ * keyed by the module's tree-node id: the ring-encoded circle every path shares ({@link ringPoint} —
+ * one circle on the ring centreline, stroked the ring's thickness), so Canvas/SVG draw and export
+ * exactly what the WebGL instanced circle does. A `screen`-mode width was already turned into world
+ * units at the zoom the rings were built at (the redraw-on-zoom-end bake the half-arrows use).
+ */
+export function traceBoundaryRings(g: GroupBuilder, rings: FrontierHalosData): void {
+  const { centers, radii, borders, ids } = rings;
+  for (let i = 0; i < rings.count; i++) {
+    const outer = radii[i]!;
+    ringPoint(g, ids[i]!, centers[i * 2]!, centers[i * 2 + 1]!, outer, outer * (1 - borders[i]!));
   }
 }
 

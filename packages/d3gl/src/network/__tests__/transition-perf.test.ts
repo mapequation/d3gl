@@ -187,16 +187,11 @@ function runLeg(graph: NetworkGraph, a: Float32Array, b: Float32Array, streamedR
     streamedFrame(i);
     st.push(performance.now() - t0);
   }
-  const streamedKB = frameAllocKB(gc, (i) => streamedFrame(i));
 
   // Transition: warm the loop up on a short one, then time every frame of a real one a → b.
   pos.set(b);
   const warm = crankedTransition(pos, a, 4, transitionRepaint);
   for (let i = 0; i < 5; i++) warm.step();
-  pos.set(a);
-  // Allocation: its own transition, so the timed one below still runs start to end.
-  const probe = crankedTransition(pos, b, ALLOC_FRAMES + 2, transitionRepaint);
-  const transitionKB = frameAllocKB(gc, () => probe.step());
   pos.set(a);
   const run = crankedTransition(pos, b, FRAMES, transitionRepaint);
   const tt: number[] = [];
@@ -212,6 +207,15 @@ function runLeg(graph: NetworkGraph, a: Float32Array, b: Float32Array, streamedR
   run.step(); // the last frame: exactly on the target
   let landed = !run.t.running;
   for (let i = 0; i < pos.length && landed; i++) if (pos[i] !== b[i]) landed = false;
+
+  // Allocation, sampled only AFTER both timed loops: each sample forces a full GC, after which V8
+  // shrinks the heap, so a timed loop run after the probes pays extra collections for the same
+  // allocation (seen in CI: the LOD-off transition frame timed 2.6 → 6.3 ms, #340). The transition
+  // probe is its own transition, so the timed one above ran start to end.
+  const streamedKB = frameAllocKB(gc, (i) => streamedFrame(i));
+  pos.set(a);
+  const probe = crankedTransition(pos, b, ALLOC_FRAMES + 2, transitionRepaint);
+  const transitionKB = frameAllocKB(gc, () => probe.step());
   return { streamed: median(st), transition: median(tt), streamedKB, transitionKB, moved, landed };
 }
 

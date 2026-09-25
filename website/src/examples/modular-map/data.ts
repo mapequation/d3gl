@@ -1,4 +1,4 @@
-import { randomWalkFlow } from "@mapequation/d3gl/network";
+import { randomWalkFlow, type ModuleLink } from "@mapequation/d3gl/network";
 import { generateLFR } from "../network/data.js";
 
 /**
@@ -116,4 +116,38 @@ export function makeModularMap(nodeCount: number): ModularMapData {
 
   const communities = new Set(Array.from(community)).size;
   return { nodeCount: n, communities, source, target, linkFlow, nodeFlow, enterExit, community, modulePaths };
+}
+
+/**
+ * The same map as an Infomap **`.ftree`** carries it (#199): the graph keeps only the links **inside**
+ * each bottom module (leaf → leaf), and every other link becomes a **module link** between the two
+ * sibling modules where its endpoints' paths part — its flow summed per pair, like an `.ftree`'s
+ * `*Links` rows. Both come from the same links, so no flow is invented, and none is counted twice.
+ */
+export function asFtree(d: ModularMapData): { source: Uint32Array; target: Uint32Array; linkFlow: Float32Array; moduleLinks: ModuleLink[] } {
+  const source: number[] = [];
+  const target: number[] = [];
+  const linkFlow: number[] = [];
+  const links = new Map<string, ModuleLink>();
+  for (let e = 0; e < d.source.length; e++) {
+    const a = d.source[e]!;
+    const b = d.target[e]!;
+    const flow = d.linkFlow[e]!;
+    if (d.community[a] === d.community[b]) {
+      source.push(a);
+      target.push(b);
+      linkFlow.push(flow);
+      continue;
+    }
+    // Different bottom modules: the sibling modules under their deepest shared module.
+    const pa = d.modulePaths[a]!.path;
+    const pb = d.modulePaths[b]!.path;
+    let l = 0;
+    while (pa[l] === pb[l]) l++;
+    const key = `${pa.slice(0, l + 1)}>${pb.slice(0, l + 1)}`;
+    const link = links.get(key);
+    if (link) link.flow += flow;
+    else links.set(key, { source: pa.slice(0, l + 1), target: pb.slice(0, l + 1), flow });
+  }
+  return { source: Uint32Array.from(source), target: Uint32Array.from(target), linkFlow: Float32Array.from(linkFlow), moduleLinks: [...links.values()] };
 }

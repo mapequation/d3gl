@@ -1,7 +1,7 @@
 import { network, buildGraph, moduleColors } from "@mapequation/d3gl/network";
 import { scaleSqrt, type ScaleContinuousNumeric } from "d3-scale";
 import type { ImperativeSetup } from "../types.js";
-import { makeModularMap } from "./data.js";
+import { asFtree, makeModularMap } from "./data.js";
 
 /** Nodes slider → generated network size. Capped where the runtime random-walk flow stays snappy. */
 const SIZES = [500, 1_000, 2_000, 5_000, 10_000, 20_000];
@@ -21,9 +21,15 @@ const SIZES = [500, 1_000, 2_000, 5_000, 10_000, 20_000];
  * back to the CPU worker where float render targets are unavailable.)
  *
  * The **Layout** control switches to the **nested** module layout (#324): each module's children laid out
- * inside its own disc. Switching re-lays the map out **warm**, from where the nodes are, and **eases**
+ * inside its own disc — and with **Boundaries** on (`lod({ moduleBoundary })`, #329) every module the cut
+ * has opened is ringed, on its disc under the nested layout. Switching re-lays the map out **warm**, from where the nodes are, and **eases**
  * them there (#328): `layout({ nested: { warm: true }, transition: 800 })` — the same call an app makes
  * after re-clustering, so the new map refines the old one in place instead of restarting from a disc.
+ *
+ * The **Input** control hands the same map over as an Infomap **`.ftree`** would (#199): the graph keeps
+ * only the links inside each bottom module, and the links between modules arrive as **module links**,
+ * `data(graph, { modules, moduleLinks })`. Then no leaf edge carries a module's connectivity once it opens
+ * — with **Boundaries** and **Cross-level edges** on, its links stay drawn, anchored at its ring (#329).
  *
  * The **Nodes** slider resizes the generated network (500 → 20,000): the map is regenerated — flow and
  * all — and re-laid-out, framing itself each time. The **LOD** control switches the cut:
@@ -41,7 +47,7 @@ const SIZES = [500, 1_000, 2_000, 5_000, 10_000, 20_000];
  * `net.interactive({ selectable, hover, draggable })` adds the selection/hover rings + node-drag (#140):
  * hover/click rings a node or module, ⇧+drag box-selects (⌥ subtracts), and dragging a glyph — or a whole
  * selection, or a collapsed module — moves it (translate-only here, on the `positions` backend). It shows
- * the selection/hover ring living alongside the per-node **flowBorder** ring and a module's **aggregateOutline**.
+ * the selection/hover ring living alongside the per-node **flowBorder** ring and a module's **outline**.
  */
 export const setup: ImperativeSetup = (host, { width, height, backend }) => {
   const net = network(host, { width, height, backend });
@@ -49,7 +55,7 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
   // Selection + hover rings and node-drag (#140): hover/click rings a node or module (green hover, blue
   // selection), ⇧+drag box-selects (⌥ subtracts, red preview), and dragging a glyph — or a whole selected
   // set, or a collapsed module — moves it. Note how the selection/hover ring sits alongside the per-node
-  // flowBorder ring and a collapsed module's aggregateOutline.
+  // flowBorder ring and a collapsed module's outline.
   net.interactive({ selectable: { multi: true }, draggable: true, hover: true });
 
   // Labels slider → max cap; the last position is "All" (no limit).
@@ -57,6 +63,7 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
 
   // Regenerated + re-laid-out whenever the Nodes slider changes; flow-derived scales are rebuilt with it.
   let count = -1;
+  let input = ""; // the Input control's last value
   let layoutMode = ""; // the Layout control's last value ("" = a fresh graph, nothing on screen yet)
   let colors: string[] = [];
   let enterExit: Float32Array<ArrayBufferLike> = new Float32Array();
@@ -69,8 +76,9 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
     engine: net,
     render: (options) => {
       const n = SIZES[(options.nodes as number) ?? 1] ?? 1_000;
-      if (n !== count) {
+      if (n !== count || options.input !== input) {
         count = n;
+        input = options.input as string;
         const d = makeModularMap(n);
         enterExit = d.enterExit;
         // Categorical colour per planted module; aggregates inherit their module's colour under LOD.
@@ -85,17 +93,19 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
         // read as density, not black — a reciprocal pair shows its asymmetry in both width AND colour.
         // (The scale interpolates the RGBA range, alpha included.)
         linkStroke = scaleSqrt<string>().domain([0, maxLink]).range(["rgba(150, 186, 221, 0.4)", "rgba(40, 90, 161, 0.9)"]).clamp(true);
+        // ".ftree": only the links inside bottom modules are graph edges; the rest arrive as module links.
+        const ftree = input === ".ftree" ? asFtree(d) : null;
         const graph = buildGraph({
           nodeCount: d.nodeCount,
-          source: d.source,
-          target: d.target,
-          weight: d.linkFlow, // edge weight = flow, so LOD super-edges accumulate flow
+          source: ftree?.source ?? d.source,
+          target: ftree?.target ?? d.target,
+          weight: ftree?.linkFlow ?? d.linkFlow, // edge weight = flow, so LOD super-edges accumulate flow
           directed: true,
           nodeFlow: d.nodeFlow,
         });
-        // The (ragged) module hierarchy travels with the graph (#326), so both layouts read it in every
-        // LOD mode.
-        net.data(graph, { modules: d.modulePaths });
+        // The (ragged) module hierarchy — and an .ftree's module links — travel with the graph (#326), so
+        // both layouts read them in every LOD mode.
+        net.data(graph, { modules: d.modulePaths, moduleLinks: ftree?.moduleLinks });
         layoutMode = "";
       }
       const layout = (options.layout as string) ?? "Force";
@@ -137,8 +147,10 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
         linkStroke, // semi-transparent blue, alpha ∝ flow
       });
       const mode = (options.lod as string) ?? "Modules";
-      // A thin outline ring, set a few px outside the glyph, marks collapsed aggregates as expandable.
-      const aggregateOutline = { width: 1.5, gap: 3 };
+      // #329: one outline per module — a ring a few px outside a collapsed module's glyph (marking it as
+      // expandable) and, once the cut opens it, around its nested disc — so the map of modules stays
+      // readable as you zoom into it. (Style the collapsed ring separately with `aggregateOutline`.)
+      const moduleBoundary = options.boundaries === "Off" ? undefined : { width: 1, opacity: 0.45 };
       // Opt-in #139: keep a visible leaf's links to a still-collapsed module across a mixed frontier.
       // Opt-in #133: ease modules ↔ sub-members across the expand threshold (slider × 0.1 = fade band).
       const crossLevelEdges = options.crossLevel === "On";
@@ -147,13 +159,13 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
         net.lod(false);
       } else if (mode === "Standard") {
         // Structural coarsening — ignores the partition; aggregates joined by plain super-edge lines.
-        net.lod({ source: "structure", expandPx, declutter, aggregateOutline, crossLevelEdges, crossFade });
+        net.lod({ source: "structure", expandPx, declutter, moduleBoundary, crossLevelEdges, crossFade });
       } else {
         // The planted partition (the default source) drives the cut → directed half-arrow super-edges
         // ∝ accumulated flow. No aggregate-radius cap: a module is sized by `nodeRadius` applied to its
         // members' summed flow (the scale extrapolates above the leaf domain), so a module reads as its
         // total flow.
-        net.lod({ expandPx, declutter, superEdges: true, aggregateOutline, crossLevelEdges, crossFade });
+        net.lod({ expandPx, declutter, superEdges: true, moduleBoundary, crossLevelEdges, crossFade });
       }
     },
   };

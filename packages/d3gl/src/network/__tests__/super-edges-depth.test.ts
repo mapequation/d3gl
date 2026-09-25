@@ -1,7 +1,7 @@
 import { describe, it, expect } from "vitest";
 import { buildModuleLODTree, type ModuleLink, type ModuleNode } from "../modules.js";
-import { computeLODGeometry, type LODTree } from "../lod.js";
-import { superEdges, type SuperEdgeStyleResolved } from "../glyphs.js";
+import { computeLODGeometry, type CutBoundaries, type LODTree } from "../lod.js";
+import { makeSuperEdgesScratch, superEdges, type SuperEdgeStyleResolved } from "../glyphs.js";
 import { buildGraph } from "../graph.js";
 
 /**
@@ -305,4 +305,160 @@ describe("super-edges between tree nodes at different depths (#325)", () => {
       ]);
     }
   });
+});
+
+/**
+ * A finite view (#325, #329): the off-screen rule follows a pair toward a non-present neighbour whose
+ * centroid is off-screen. When that neighbour is EXPANDED (its centroid scrolled off while members are
+ * still drawn), the members' own pairs — a lift pair, a cross-level projection, an anchored module link —
+ * carry part of its flow too, and that part must not be drawn a second time.
+ */
+describe("super-edges toward an off-screen expanded module draw each edge once (#325, #329)", () => {
+  const drawn = (tree: LODTree, frontier: number[], view: typeof ALL, crossLevelEdges: boolean, anchor?: CutBoundaries): string[] => {
+    const { ids, flows } = superEdges(tree, Uint32Array.from(frontier), { ...STYLE, crossLevelEdges, anchor }, view);
+    return ids.map((id, e) => `${Math.floor(id / tree.size)}->${id % tree.size} (${flows[e]})`).sort();
+  };
+  const view = { minX: -50, maxX: 50, minY: -50, maxY: 50 };
+
+  // u = 3 (depth 1) and v = 2:1:1 (depth 3) on screen; module 2's centroid is dragged off-screen by 2:2 at
+  // x = 5000 (not drawn — culled), so module 2 is expanded with its centroid off-screen.
+  const records: ModuleNode[] = [
+    { id: 0, path: [3] }, // u
+    { id: 1, path: [2, 1, 1] }, // v
+    { id: 2, path: [2, 1, 2] }, // w
+    { id: 3, path: [2, 2] }, // z, far off-screen
+    { id: 4, path: [1, 1] },
+    { id: 5, path: [1, 2] },
+  ];
+  const place = (source: number[], target: number[], weight: number[]): LODTree => {
+    const graph = buildGraph({ nodeCount: 6, source, target, weight, directed: true });
+    graph.positions.set([0, 0, 10, 0, 12, 4, 5000, 0, -20, 20, -24, 20]);
+    const tree = buildModuleLODTree(6, records, graph);
+    computeLODGeometry(tree, graph, new Float32Array(6).fill(1));
+    return tree;
+  };
+
+  it("draws a present lift pair once, not again toward the deeper end's off-screen same-depth ancestor", () => {
+    const out = place([0], [1], [5]);
+    const m2 = idsByPath(out).get("2")!;
+    expect(out.cx[m2]).toBeGreaterThan(view.maxX); // the premise: module 2's centroid is off-screen
+    const back = place([1], [0], [5]);
+    for (const crossLevelEdges of [false, true]) {
+      expect(drawn(out, [0, 1, 2], view, crossLevelEdges), `u → v, crossLevelEdges=${crossLevelEdges}`).toEqual(["0->1 (5)"]);
+      expect(drawn(back, [0, 1, 2], view, crossLevelEdges), `v → u, crossLevelEdges=${crossLevelEdges}`).toEqual(["1->0 (5)"]);
+    }
+  });
+
+  it("keeps the rest of that off-screen pair: the flow toward members that are not drawn", () => {
+    // u → v (5, drawn direct) and u → z (2, z culled far off-screen): the pair toward module 2 keeps 2.
+    const tree = place([0, 0, 3], [1, 3, 0], [5, 2, 3]);
+    const m2 = idsByPath(tree).get("2")!;
+    for (const crossLevelEdges of [false, true]) {
+      expect(drawn(tree, [0, 1, 2], view, crossLevelEdges), `crossLevelEdges=${crossLevelEdges}`).toEqual([`${m2}->0 (3)`, "0->1 (5)", `0->${m2} (2)`].sort());
+    }
+  });
+
+  /** Whether a present aggregate has a descendant whose centroid is off-screen. The off-screen rule then
+   *  follows that (covered) node as if it lay outside the cut (#330), left out here. */
+  const coveredOffScreen = (tree: LODTree, present: number[], off: (g: number) => boolean): boolean => {
+    for (const p of present) {
+      const stack = [p];
+      while (stack.length > 0) {
+        const g = stack.pop()!;
+        for (let c = tree.childOffset[g]!; c < tree.childOffset[g + 1]!; c++) {
+          const x = tree.children[c]!;
+          if (off(x)) return true;
+          stack.push(x);
+        }
+      }
+    }
+    return false;
+  };
+  /** Every strict ancestor of a cut node but the root: what the cut collects as expanded. */
+  const expandedOf = (tree: LODTree, cutNodes: number[]): number[] => {
+    const parent = tree.parent!;
+    const out = new Set<number>();
+    for (const g of cutNodes) for (let x = parent[g]!; x >= 0 && parent[x]! >= 0; x = parent[x]!) out.add(x);
+    return [...out];
+  };
+
+  const fixtures = [exampleFixture(), randomFixture(1, 12, 5), randomFixture(3, 10, 6)];
+  for (const fx of fixtures) {
+    it(`never draws an edge twice in a finite view, and draws it once between two present covers: ${fx.label}`, () => {
+      const { tree, all } = setup(fx);
+      const n = fx.records.length;
+      const r = rng(5);
+      const graph = buildGraph({ nodeCount: n, source: [], target: [], directed: true });
+      for (let i = 0; i < n * 2; i++) graph.positions[i] = r() * 100;
+      const radii = new Float32Array(n).fill(1);
+      computeLODGeometry(tree, graph, radii);
+      // The gather is linear in the edges, so each edge (graph edge or module link) gets a tree of its own:
+      // the flows it draws never mix with another's, and "drawn twice" reads as a sum of 2w.
+      const m = fx.edges.source.length;
+      const single = all.source.map((_, e) => {
+        const t = e < m
+          ? buildModuleLODTree(n, fx.records, { source: [all.source[e]!], target: [all.target[e]!], weight: [all.weight[e]!] })
+          : buildModuleLODTree(n, fx.records, undefined, [fx.links[e - m]!]);
+        computeLODGeometry(t, graph, radii);
+        return t;
+      });
+      const parent = tree.parent!;
+      const within = (x: number, a: number): boolean => {
+        for (let y = x; y >= 0; y = parent[y]!) if (y === a) return true;
+        return false;
+      };
+      const views = Array.from({ length: 8 }, () => {
+        const x = r() * 90 - 20;
+        const y = r() * 90 - 20;
+        const s = 20 + r() * 40;
+        return { minX: x, maxX: x + s, minY: y, maxY: y + s };
+      });
+      const cuts = cutsOf(tree, tree.size - 1).filter((_, i, a) => a.length <= 200 || r() < 200 / a.length);
+      const scratch = makeSuperEdgesScratch();
+      let checked = 0;
+      let drawnOnce = 0;
+      for (const cutNodes of cuts) {
+        const expanded = expandedOf(tree, cutNodes);
+        const anchor: CutBoundaries = { ids: Uint32Array.from(expanded), alpha: new Float32Array(expanded.length).fill(1), count: expanded.length };
+        const subset = cutNodes.filter(() => r() < 0.7);
+        for (const present of [cutNodes, subset]) {
+          const isPresent = new Set(present);
+          const cover = (x: number): number => {
+            for (let y = x; y >= 0; y = parent[y]!) if (isPresent.has(y)) return y;
+            return -1;
+          };
+          for (const view of views) {
+            const off = (g: number): boolean => tree.cx[g]! < view.minX || tree.cx[g]! > view.maxX || tree.cy[g]! < view.minY || tree.cy[g]! > view.maxY;
+            if (coveredOffScreen(tree, present, off)) continue;
+            for (const crossLevelEdges of [true, false]) {
+              for (let e = 0; e < single.length; e++) {
+                const u = all.source[e]!;
+                const v = all.target[e]!;
+                const w = all.weight[e]!;
+                const { ids, flows } = superEdges(single[e]!, Uint32Array.from(present), { ...STYLE, crossLevelEdges, anchor }, view, scratch);
+                let sum = 0;
+                ids.forEach((id, k) => {
+                  const a = Math.floor(id / tree.size);
+                  const b = id - a * tree.size;
+                  expect(within(u, a) && within(v, b), `edge ${u}→${v} drawn as ${a}→${b}`).toBe(true);
+                  sum += flows[k]!;
+                });
+                const where = `edge ${u}→${v} (${w}), present [${present.join(",")}], view ${JSON.stringify(view)}, crossLevelEdges=${crossLevelEdges}`;
+                expect(sum === 0 || sum === w, `${where}: drew ${sum}`).toBe(true);
+                const a = cover(u);
+                const b = cover(v);
+                if (crossLevelEdges && a >= 0 && b >= 0 && a !== b && u !== v) {
+                  expect(sum, where).toBe(w);
+                  drawnOnce++;
+                }
+              }
+              checked++;
+            }
+          }
+        }
+      }
+      expect(checked).toBeGreaterThan(50); // non-vacuous: plenty of (cut, view) pairs were checked
+      expect(drawnOnce).toBeGreaterThan(checked);
+    });
+  }
 });

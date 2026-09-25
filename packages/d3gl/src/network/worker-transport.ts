@@ -13,8 +13,8 @@
 import type { NetworkGraph } from "./graph.js";
 import { multilevelLayout, type CoarsenOptions } from "./coarsen.js";
 import { ForceLayout, seedPositions, type ForceParams } from "./force.js";
-import { lodTreeFromTopology, type LODTree } from "./lod.js";
-import { nestedLayout, type NestedLayoutParams, type NestedLayoutTopology } from "./nested-layout.js";
+import { lodTreeFromTopology, type BoundaryDiscs, type LODTree } from "./lod.js";
+import { nestedLayout, nestedBoundaryDiscs, type NestedLayoutParams, type NestedLayoutTopology } from "./nested-layout.js";
 import { lodGeometryViews, lodGeometryByteLength, type MainToWorker, type WorkerToMain } from "./worker-protocol.js";
 
 export interface WorkerLayoutOptions {
@@ -234,6 +234,8 @@ export interface NestedWorkerOptions {
    * for them) — for a caller that eases to them (#328). Implies `stream: false`.
    */
   onResult?: (positions: Float32Array) => void;
+  /** Receive the final layout's module boundary discs (#329), just before its positions land. */
+  onBoundaries?: (discs: BoundaryDiscs) => void;
 }
 
 /**
@@ -250,17 +252,23 @@ export function startNestedWorkerLayout(
   onFrame: () => void,
   opts: NestedWorkerOptions = {},
 ): WorkerLayoutHandle {
-  const { onResult } = opts;
-  /** The final positions: to the caller, or into the graph + a repaint. */
-  const land = (positions: Float32Array): void => {
+  const { onResult, onBoundaries } = opts;
+  /** The final positions (and the discs, #329): to the caller, or into the graph + a repaint. */
+  const land = (positions: Float32Array, discs: BoundaryDiscs | undefined): void => {
+    if (discs) onBoundaries?.(discs);
     if (onResult) onResult(positions);
     else {
       graph.positions.set(positions);
       onFrame();
     }
   };
+  /** Solve on this thread: a fallback when no worker runs. */
+  const solveHere = (): void => {
+    const result = nestedLayout(tree, params);
+    land(result.positions, onBoundaries ? nestedBoundaryDiscs(tree, result) : undefined);
+  };
   const fallback = (): WorkerLayoutHandle => {
-    land(nestedLayout(tree, params).positions);
+    solveHere();
     return { shared: false, settled: Promise.resolve(), stop() {}, ...NOOP_DRAG };
   };
   if (typeof Worker === "undefined") return fallback();
@@ -287,7 +295,7 @@ export function startNestedWorkerLayout(
     const msg = e.data;
     if (msg.type === "lod-topology" || terminated) return;
     if (msg.type === "done") {
-      if (msg.positions) land(msg.positions);
+      if (msg.positions) land(msg.positions, msg.boundaries);
       terminate();
       return;
     }
@@ -296,7 +304,7 @@ export function startNestedWorkerLayout(
   };
   worker.onerror = (): void => {
     if (terminated) return;
-    land(nestedLayout(tree, params).positions);
+    solveHere();
     terminate();
   };
   // Clone only the topology the layout reads — not the LOD tree's geometry/style arrays.

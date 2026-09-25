@@ -27,12 +27,12 @@ export type { HalfLinkParams, HalfLinkGeometry, PathSink } from "../core/half-li
 export { randomWalkFlow } from "./flow.js";
 export type { FlowGraph, FlowOptions, FlowResult } from "./flow.js";
 
-export { buildLODTree, computeLODGeometry, cut, defaultExpandPx, makeCutScratch, declutterFrontier, makeDeclutterFrontierScratch } from "./lod.js";
-export type { LODTree, LODTransform, CutOptions, CutScratch, DeclutterOptions, DeclutterFrontierScratch } from "./lod.js";
+export { buildLODTree, computeLODGeometry, cut, defaultExpandPx, makeCutScratch, makeCutBoundaries, declutterFrontier, makeDeclutterFrontierScratch } from "./lod.js";
+export type { LODTree, LODTransform, CutOptions, CutScratch, CutBoundaries, BoundaryDiscs, DeclutterOptions, DeclutterFrontierScratch } from "./lod.js";
 
 export { buildModuleLODTree } from "./modules.js";
 export type { ModuleLink, ModuleNode } from "./modules.js";
-export { nestedLayout } from "./nested-layout.js";
+export { nestedLayout, nestedBoundaryDiscs } from "./nested-layout.js";
 export type { NestedLayoutOptions, NestedLayoutResult, NestedLayoutTopology } from "./nested-layout.js";
 
 export { moduleColors } from "./module-colors.js";
