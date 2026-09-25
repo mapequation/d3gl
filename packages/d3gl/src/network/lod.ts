@@ -36,7 +36,12 @@ export interface LODTopology {
   levelCount: number;
   /** Global-id start of each level; length `levelCount + 1`. Level `k` is `[levelOffset[k], levelOffset[k+1])`. */
   levelOffset: Uint32Array;
-  /** Children CSR: node `g`'s children are `children[childOffset[g] .. childOffset[g+1]]` (one level finer). */
+  /**
+   * Children CSR: node `g`'s children are `children[childOffset[g] .. childOffset[g+1]]` (one level finer).
+   * Within a row, **leaf children (ids `< leafCount`) come before aggregate children**: every builder
+   * scatters children in ascending id order (module trees) or gives a node children of one kind only
+   * (coarsening levels, quadtree cells). The cut's ring-only walk relies on it (#329).
+   */
   childOffset: Uint32Array;
   children: Uint32Array;
   /**
@@ -1389,8 +1394,16 @@ export function cut(
         // Not drawn itself: its ring (and anchored links) fade with its children.
         if (fade && alphaOut && !(drawA > 0 && !ringOnly)) alphaOut[g] = childA;
       }
+      // Walked for rings only, a leaf child has none: push the aggregate children alone. They end the row,
+      // after the leaf children (see `children`), so finding them is O(aggregate children), not O(children)
+      // — a flat bottom module with a million members costs nothing here.
+      let p = childOffset[g]!;
+      if (ringOnly) {
+        p = childOffset[g + 1]!;
+        while (p > childOffset[g]! && children[p - 1]! >= leafCount) p--;
+      }
       const flag = ringOnly ? RING_ONLY : 0;
-      for (let p = childOffset[g]!; p < childOffset[g + 1]!; p++) push(children[p]! + flag, childA);
+      for (; p < childOffset[g + 1]!; p++) push(children[p]! + flag, childA);
     }
   }
 

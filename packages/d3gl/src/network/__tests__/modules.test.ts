@@ -83,6 +83,26 @@ describe("buildModuleLODTree", () => {
     expect(childrenOf(tree, 4)).toEqual([0, 3]);
   });
 
+  it("lists a node's leaf children before its module children (the cut's ring-only walk relies on it, #329)", () => {
+    // Mixed rows in shuffled record order: the root and module `2` hold leaves and modules alike.
+    const tree = buildModuleLODTree(6, [
+      { id: 0, path: [2, 3, 1] },
+      { id: 1, path: [4] },
+      { id: 2, path: [2, 1] },
+      { id: 3, path: [1, 1] },
+      { id: 4, path: [2, 3, 2] },
+      { id: 5, path: [3] },
+    ]);
+    let mixed = 0;
+    for (let g = tree.leafCount; g < tree.size; g++) {
+      const row = Array.from(tree.children.slice(tree.childOffset[g]!, tree.childOffset[g + 1]!));
+      const firstModule = row.findIndex((c) => c >= tree.leafCount);
+      if (firstModule > 0) mixed++;
+      if (firstModule >= 0) expect(row.slice(firstModule).every((c) => c >= tree.leafCount), `row of ${g}: ${row}`).toBe(true);
+    }
+    expect(mixed).toBe(2); // the root ({1, 5} + {`1`, `2`}) and module `2` ({2} + {`2:3`})
+  });
+
   describe("the adaptive cut walks the module tree", () => {
     // Two tight clusters far apart: {0@(0,0),1@(4,0)} and {2@(96,0),3@(100,0)}.
     function geo() {

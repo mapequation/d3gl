@@ -182,6 +182,79 @@ function sweep(m: Map): LODTransform[] {
 
 const fitView = (m: Map): LODTransform => ({ k: m.baseK, x: W / 2, y: H / 2 });
 
+/**
+ * One **flat** bottom module holding `n` leaves directly, packed inside 0.6 R of its disc of radius R (the
+ * room a nested layout leaves around a module's members), plus a small far-off second module; the view
+ * (k = 4) sits on the big module's rim, so its ring is in view and none of its members are. The cut walks
+ * the module ring-only there (#329): its `n` leaf children must cost nothing.
+ */
+function flatRim(n: number): { tree: LODTree; discs: BoundaryDiscs; view: LODTransform } {
+  const R = 2000;
+  const records: ModuleNode[] = new Array<ModuleNode>(n + 4);
+  const positions = new Float32Array((n + 4) * 2);
+  for (let i = 0; i < n; i++) {
+    const rr = 0.6 * R * Math.sqrt((i + 0.5) / n);
+    records[i] = { id: i, path: [1, i + 1] };
+    positions[2 * i] = rr * Math.cos(i * GOLDEN);
+    positions[2 * i + 1] = rr * Math.sin(i * GOLDEN);
+  }
+  for (let j = 0; j < 4; j++) {
+    records[n + j] = { id: n + j, path: [2, j + 1] };
+    positions[2 * (n + j)] = 10 * R + j;
+    positions[2 * (n + j) + 1] = 0;
+  }
+  const g = buildGraph({ nodeCount: n + 4, source: [], target: [], directed: true });
+  g.positions.set(positions);
+  const tree = buildModuleLODTree(n + 4, records);
+  computeLODGeometry(tree, g, new Float32Array(n + 4).fill(4));
+  const rows = tree.size - tree.leafCount;
+  const discs: BoundaryDiscs = { dx: new Float32Array(rows), dy: new Float32Array(rows), r: new Float32Array(rows) };
+  for (let o = 0; o < rows; o++) {
+    const m = tree.leafCount + o;
+    const big = tree.count[m]! >= n; // the big module (and the root, whose ring the cut never draws)
+    discs.dx[o] = big ? -tree.cx[m]! : 0; // the big module's disc: radius R, centred on the origin
+    discs.dy[o] = big ? -tree.cy[m]! : 0;
+    discs.r[o] = big ? R : 10;
+  }
+  const k = 4;
+  return { tree, discs, view: { k, x: W / 2 - R * k, y: H / 2 } }; // view centred on (R, 0): the rim
+}
+
+/** Median cut time over `reps` cuts (after a warm one), what the last cut returned, and the scratch
+ *  stack's length after them (grow-only: it records the deepest stack any cut needed). */
+function rimCut(fx: ReturnType<typeof flatRim>, boundaries: boolean, reps: number): { median: number; frontier: number; rings: number; stack: number } {
+  const sc = makeCutScratch();
+  const bnd = makeCutBoundaries();
+  bnd.discs = fx.discs;
+  const run = (): number => cut(fx.tree, fx.view, W, H, { maxAggregateRadius: 26, boundaries: boundaries ? bnd : undefined }, sc).length;
+  run();
+  const ts: number[] = [];
+  let frontier = 0;
+  for (let i = 0; i < reps; i++) {
+    const t0 = performance.now();
+    frontier = run();
+    ts.push(performance.now() - t0);
+  }
+  return { median: stats(ts).median, frontier, rings: boundaries ? bnd.count : 0, stack: sc.stack.length };
+}
+
+/** The rim guard's assertions at `n` leaves: nothing drawn, one ring collected, the members never walked. */
+function checkRim(n: number, assertTime: boolean): { on: ReturnType<typeof rimCut>; off: ReturnType<typeof rimCut> } {
+  const fx = flatRim(n);
+  const off = rimCut(fx, false, 20);
+  const on = rimCut(fx, true, 20);
+  expect(off.frontier).toBe(0);
+  expect(on.frontier).toBe(0); // no member in view
+  expect(on.rings).toBe(1); // the big module's ring is
+  // Deterministic signature: the ring-only walk never pushed the module's leaf children (it used to grow
+  // the stack to n — 1,048,576 entries at 1M — and pop every one only to drop it).
+  expect(on.stack).toBe(off.stack);
+  expect(on.stack).toBeLessThanOrEqual(256);
+  // Measured: 0.002 ms either way (the leaf pushes took 12.8 ms at 1M, 2.2 ms at 200k).
+  if (assertTime) expect(on.median, `rim cut at N=${n}: ${on.median.toFixed(3)}ms`).toBeLessThan(3 * off.median + 0.5);
+  return { on, off };
+}
+
 /** Modules a cut can open (any extent at all), the root aside — what "every module open" rings. */
 function openable(tree: LODTree): number {
   let n = 0;
@@ -271,6 +344,10 @@ describe("#329 module boundaries per-frame cost", () => {
     }
   });
 
+  it("walks a big flat module ring-only in O(its aggregate children) when only its rim is in view", () => {
+    checkRim(100_000, true);
+  });
+
   (BENCH ? it : it.skip)(
     `bench: module boundaries per frame at ${BENCH_N.toLocaleString()} leaves`,
     () => {
@@ -330,6 +407,9 @@ describe("#329 module boundaries per-frame cost", () => {
           if (ASSERT) expect(ms, `every module open, declutter=${declutter}, boundaries=${boundaries}: ${ms.toFixed(0)}ms at N=${BENCH_N}`).toBeLessThan(ALL_OPEN_MS);
         }
       }
+      // A flat bottom module of N leaves with only its rim in view: ring-only, nothing walked per member.
+      const rim = checkRim(BENCH_N, ASSERT);
+      log(`flat-module rim  boundaries=false ${rim.off.median.toFixed(3)}ms  boundaries=true ${rim.on.median.toFixed(3)}ms  stack=${rim.on.stack}`);
     },
     600_000,
   );
