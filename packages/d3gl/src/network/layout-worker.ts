@@ -205,7 +205,7 @@ addEventListener("message", (e: MessageEvent<MainToWorker>) => {
       // thread terminates the worker on stop anyway.
       const { positions } = nestedLayout(msg.topology, {
         ...msg.params,
-        onDepth: (depth, frame) => post({ type: "frame", tick: depth, positions: frame }),
+        onDepth: msg.stream ? (depth, frame) => post({ type: "frame", tick: depth, positions: frame }) : undefined,
       });
       post({ type: "done", tick: -1, positions });
       return;

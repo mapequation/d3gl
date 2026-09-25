@@ -67,14 +67,17 @@ export interface UnpinMessage {
 }
 
 /**
- * Run the nested module layout (#324) instead of a force layout. The worker posts one `frame` per
- * finished depth (`tick` = depth, positions always copied — there are only tree-depth many) and a
- * final `done`.
+ * Run the nested module layout (#324) instead of a force layout. With `stream`, the worker posts one
+ * `frame` per finished depth (`tick` = depth, positions always copied — there are only tree-depth
+ * many); either way it ends with a `done` carrying the final positions.
  */
 export interface NestedStartMessage {
   type: "start-nested";
   topology: NestedLayoutTopology;
   params: NestedLayoutParams;
+  /** Post a frame per finished depth. Off for a warm start or a transition (#328), which only want
+   *  the final layout. */
+  stream: boolean;
 }
 
 export type MainToWorker = StartMessage | StopMessage | PinMessage | UnpinMessage | NestedStartMessage;

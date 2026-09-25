@@ -8,6 +8,7 @@ import { DEFAULT_LABEL_TEXT, type LabelAnchor, type LabelStyle } from "../labels
 import { TextMeasurer, canvasFont } from "../labels/measure.js";
 import { buildModuleLODTree, checkModuleLinks, moduleRecordIndex, type ModuleLink, type ModuleNode } from "./modules.js";
 import { nestedLayout, type NestedLayoutParams } from "./nested-layout.js";
+import { positionTransition, type PositionTransition } from "./transition.js";
 import { moduleColors, type ModulePathNode, type ModuleColorOptions } from "./module-colors.js";
 import { physicalPieWedges, type PhysicalPieWedges, type PieWedgeOptions } from "./pie.js";
 import { rosettePositions } from "./rosette.js";
@@ -273,10 +274,27 @@ export interface NetworkLayoutOptions {
    * on `"force"`; `"gpu"` uses the worker until a GPU path exists. Ignored without a hierarchy.
    *
    * `true` sizes discs by node flow (leaf count when the graph has none); pass `{ size: "count" }` to
-   * size by leaf count, and `iterations` / `packing` to tune each module's solve.
+   * size by leaf count, and `iterations` / `packing` to tune each module's solve. `{ warm: true }`
+   * re-lays the map out from the current positions — for a re-clustering (#328).
    * @see {@link nestedLayout}
    */
   nested?: boolean | NestedLayoutConfig;
+  /**
+   * **Transition** (#328): ease the nodes from their current positions to the new layout over this
+   * many milliseconds (cubic ease-in-out) on the main thread, instead of jumping or streaming. Default
+   * `0` (no transition). Applies to every layout computed in one go — `"positions"`, `"force"`, and a
+   * `nested` layout on any backend (whose worker then posts only the final layout, no depth frames);
+   * the streaming `"worker"` / `"gpu"` force layouts ignore it (they already animate as they converge),
+   * as does a state network's layout.
+   *
+   * Each transition frame is a positions-only repaint — one O(nodes) interpolation, the LOD tree's
+   * O(tree size) position pass (no style pass) and the normal re-emit — no more than a streamed layout
+   * frame. {@link Network.whenSettled} resolves when it ends. A new `layout()` or `data()`,
+   * {@link Network.stopLayout} and `destroy()` stop it where it is; grabbing a node (`draggable`)
+   * finishes it. The camera stays where it is unless `fit` is set, which frames the final layout once
+   * when the transition starts.
+   */
+  transition?: number;
 }
 
 /** Tuning for {@link NetworkLayoutOptions.nested}. */
@@ -287,6 +305,16 @@ export interface NestedLayoutConfig {
   iterations?: number;
   /** Fraction of a parent disc its children cover (default 0.45). */
   packing?: number;
+  /**
+   * **Warm start** (#328): lay the map out from the nodes' current positions — e.g. after a
+   * re-clustering with the same nodes — instead of from scratch. Each module's children start at
+   * their current centroids and the solve refines that arrangement, and the new map keeps the current
+   * one's centroid and spread, so it stays where it is. No seed disc is placed first and no depth
+   * frames stream (they would collapse the leaves onto their module centres): the layout lands in one
+   * frame, or eases in over {@link NetworkLayoutOptions.transition}. On a graph never laid out (all
+   * positions equal) it is the cold layout. Default `false`.
+   */
+  warm?: boolean;
 }
 
 /**
@@ -513,6 +541,29 @@ function labelText(opts: NetworkLabelOptions, id: number, info: NetworkHit): str
 }
 const DEFAULT_FORCE_ITERATIONS = 300;
 
+/** A layout's transition length in ms (#328): `transition` when a positive finite number, else 0. */
+function transitionDuration(transition: number | undefined): number {
+  return transition !== undefined && Number.isFinite(transition) && transition > 0 ? transition : 0;
+}
+
+/** The bounding box `[minX, minY, maxX, maxY]` of the first `n` interleaved positions — O(n). Null
+ *  when there are none (or none finite). */
+function positionsBox(p: ArrayLike<number>, n: number): FitBox | null {
+  let minX = Infinity;
+  let minY = Infinity;
+  let maxX = -Infinity;
+  let maxY = -Infinity;
+  for (let i = 0; i < n; i++) {
+    const x = p[2 * i]!;
+    const y = p[2 * i + 1]!;
+    if (x < minX) minX = x;
+    if (y < minY) minY = y;
+    if (x > maxX) maxX = x;
+    if (y > maxY) maxY = y;
+  }
+  return minX <= maxX ? [minX, minY, maxX, maxY] : null;
+}
+
 /** A CSS colour as an `rgba(r,g,b,a)` string at the given 0–255 alpha (for the faint `both`-view container fill). */
 function withAlpha(css: string, alpha255: number): string {
   const c = rgb(css);
@@ -566,6 +617,9 @@ export class Network extends BaseEngine {
   private fitScratch: Float32Array | null = null;
   /** Pending coalesced repaint rAF id (0 = none) for progressive worker frames. */
   private layoutRepaintRaf = 0;
+  /** The running position transition (#328), if any — owned by {@link layoutHandle}, kept here so a
+   *  node grab can finish it. */
+  private transition: PositionTransition | null = null;
   /**
    * The engine-owned module hierarchy (#326) from `data(graph, { modules, moduleLinks })`, with each
    * node's record index (`recordOf[id]`, from the one-time alignment check). Independent of
@@ -1187,16 +1241,29 @@ export class Network extends BaseEngine {
       this.fitOnLayout = fit;
       this.fitFallbackBox = null;
       this.fitKnownBox = null;
-      if (fit) seedPositions(this.graph, this.width, this.height);
       const nestedTree = opts.nested && opts.backend !== "positions" ? this.moduleTree() : undefined;
+      // A transition (#328) eases from the current positions, and a warm nested start refines them —
+      // so neither gets the seed disc. Only layouts computed in one go transition.
+      const duration = nestedTree || opts.backend === "positions" || opts.backend === "force" ? transitionDuration(opts.transition) : 0;
+      const warm = !!nestedTree && typeof opts.nested === "object" && opts.nested.warm === true;
+      if (fit && !warm && duration === 0) seedPositions(this.graph, this.width, this.height);
       if (nestedTree) {
-        this.startNestedLayout(nestedTree, opts);
+        this.startNestedLayout(nestedTree, opts, duration);
       } else if (opts.backend === "positions" && opts.positions) {
-        this.graph.positions.set(opts.positions);
-        // The edge-less spatial tree's topology depends on the positions, so drop it to rebuild from
-        // the new coordinates (the coarsening tree is position-independent and is kept).
-        if (this.lodSpatial) { this.lodTree = null; }
-        this.recomputeLODGeometry(); // caller-supplied coordinates are final immediately
+        const graph = this.graph;
+        if (duration > 0) {
+          const target = graph.positions.slice();
+          target.set(opts.positions); // a copy: the caller may reuse its buffer while the transition runs
+          this.transitionTo(graph, target, duration, () => {
+            if (this.lodSpatial) this.lodTree = null; // position-built topology: rebuild it from the final coordinates
+          });
+        } else {
+          graph.positions.set(opts.positions);
+          // The edge-less spatial tree's topology depends on the positions, so drop it to rebuild from
+          // the new coordinates (the coarsening tree is position-independent and is kept).
+          if (this.lodSpatial) { this.lodTree = null; }
+          this.recomputeLODGeometry(); // caller-supplied coordinates are final immediately
+        }
       } else if (opts.backend === "worker") {
         // Off-thread force layout with progressive convergence. The worker can post a frame per
         // tick, so coalesce repaints to one per animation frame (always painting the freshest
@@ -1275,18 +1342,26 @@ export class Network extends BaseEngine {
         // Main-thread force layout. (Off-thread + progressive convergence via a Web Worker is the
         // next slice.) Multilevel coarsening seeds it by default; opt out for a plain cold start.
         const iterations = opts.iterations ?? DEFAULT_FORCE_ITERATIONS;
+        const graph = this.graph;
+        const from = duration > 0 ? graph.positions.slice() : null; // where a transition eases from
         if (opts.multilevel === false) {
-          seedPositions(this.graph, this.width, this.height);
-          new ForceLayout(this.graph, opts.force).run(iterations);
+          seedPositions(graph, this.width, this.height);
+          new ForceLayout(graph, opts.force).run(iterations);
         } else {
-          multilevelLayout(this.graph, {
+          multilevelLayout(graph, {
             width: this.width,
             height: this.height,
             iterations,
             force: opts.force,
           });
         }
-        this.recomputeLODGeometry(); // synchronous solve is done
+        if (from) {
+          const target = graph.positions.slice();
+          graph.positions.set(from); // the solve wrote in place: show the old layout until the transition moves it
+          this.transitionTo(graph, target, duration);
+        } else {
+          this.recomputeLODGeometry(); // synchronous solve is done
+        }
       }
       // Frame the first paint against the seeded (box-centred) layout so a streaming fit opens framed
       // rather than piled at the origin; each subsequent streamed frame reframes in scheduleLayoutRepaint.
@@ -1342,34 +1417,122 @@ export class Network extends BaseEngine {
     return this.lodWorkerTree !== null && this.lodTree === this.lodWorkerTree;
   }
 
-  /** Nested module layout (#324): off-thread + streamed per depth on worker/gpu, synchronous on force. */
-  private startNestedLayout(tree: LODTree, opts: NetworkLayoutOptions): void {
+  /**
+   * Nested module layout (#324): off-thread + streamed per depth on worker/gpu, synchronous on force.
+   * A warm start (#328) seeds from the current positions and lands in one piece, with no depth frames;
+   * with a `duration` the result is eased to ({@link positionTween}) instead of jumped to.
+   */
+  private startNestedLayout(tree: LODTree, opts: NetworkLayoutOptions, duration: number): void {
     const graph = this.graph;
     const { parent } = tree;
     if (!graph || !parent) return; // provided module trees always carry their parent map
     const topology = { ...tree, parent };
     const cfg = typeof opts.nested === "object" ? opts.nested : {};
-    const radius = 10 * Math.sqrt(graph.nodeCount); // the root disc, centred on the origin
-    this.fitKnownBox = [-radius, -radius, radius, radius];
+    const warm = cfg.warm === true;
+    const radius = 10 * Math.sqrt(graph.nodeCount); // a cold root disc, centred on the origin
+    // A warm map is placed over the current one (same leaf centroid + spread), so its extent is known
+    // only once solved ({@link landNested}).
+    this.fitKnownBox = warm ? null : [-radius, -radius, radius, radius];
+    // Created before the solve starts: it snapshots the positions it eases from.
+    const tween = duration > 0 ? this.positionTween(graph, duration) : null;
     const params: NestedLayoutParams = {
-      radius,
+      radius: warm ? undefined : radius,
+      // A snapshot (the transition's, when there is one), not the live buffer: after a shared-memory
+      // worker run that buffer is SAB-backed, and posting it would share it with the worker, not copy it.
+      initial: warm ? (tween?.from ?? graph.positions.slice()) : undefined,
       iterations: cfg.iterations,
       packing: cfg.packing,
       size: (cfg.size ?? "flow") === "flow" ? (graph.flow ?? undefined) : undefined,
     };
     if (opts.backend === "worker" || opts.backend === "gpu") {
-      const handle = startNestedWorkerLayout(graph, topology, params, () => this.scheduleLayoutRepaint());
-      this.layoutHandle = handle;
-      void handle.settled.then(() => {
-        if (this.layoutHandle !== handle) return; // a newer layout superseded this one
-        this.recomputeLODGeometry(true);
-        this.releaseFit(); // final reframe on the settled bounds, then hand the view to zoom/pan
-        this.rebuild();
+      const oneFrame = warm || tween !== null;
+      const solve = startNestedWorkerLayout(graph, topology, params, () => this.scheduleLayoutRepaint(), {
+        stream: !oneFrame,
+        onResult: oneFrame ? (positions) => this.landNested(graph, positions, tween) : undefined,
       });
+      this.onLayoutSettled(tween ? this.transitionHandle(tween, solve) : solve);
     } else {
-      graph.positions.set(nestedLayout(topology, params).positions);
-      this.recomputeLODGeometry(); // synchronous solve is done
+      const positions = nestedLayout(topology, params).positions;
+      if (tween) {
+        this.onLayoutSettled(this.transitionHandle(tween));
+        tween.to(positions);
+      } else {
+        graph.positions.set(positions);
+        this.recomputeLODGeometry(); // synchronous solve is done
+      }
     }
+  }
+
+  /**
+   * A worker nested layout's final positions, when it posts only those (a warm start or a transition,
+   * #328). With `fit`, a warm map's extent is known only now: frame it. Then ease to it, or jump.
+   */
+  private landNested(graph: NetworkGraph, positions: Float32Array, tween: PositionTransition | null): void {
+    if (this.fitOnLayout && !this.fitKnownBox) this.fitKnownBox = positionsBox(positions, graph.nodeCount);
+    if (tween) {
+      if (this.fitOnLayout) this.fitViewToLayout(); // frame the final layout once, as the transition starts
+      tween.to(positions);
+    } else {
+      graph.positions.set(positions);
+      this.scheduleLayoutRepaint();
+    }
+  }
+
+  /**
+   * A position transition of `graph` over `duration` ms (#328), snapshotting its positions now. Each
+   * frame is the positions-only repaint the drag path uses ({@link repaintDuringDrag}): the O(nodes)
+   * interpolation, the LOD tree's O(tree size) position pass (no style pass), then the re-emit. A node
+   * grabbed before the transition started (a worker nested solve still computing its target) is held
+   * under the cursor over each frame ({@link dragReapply}), and kept where it is dropped.
+   */
+  private positionTween(graph: NetworkGraph, duration: number): PositionTransition {
+    return positionTransition(graph.positions, {
+      duration,
+      onFrame: () => {
+        if (this.graph !== graph) return;
+        this.dragReapply?.();
+        this.repaintDuringDrag();
+      },
+    });
+  }
+
+  /** A layout handle for a transition (#328): it settles when the transition ends, and `stop()` also
+   *  stops `solve` — the worker computing the transition's target, if any. */
+  private transitionHandle(tween: PositionTransition, solve?: WorkerLayoutHandle): WorkerLayoutHandle {
+    this.transition = tween;
+    return {
+      shared: false,
+      mainThread: !solve,
+      settled: tween.settled,
+      stop: () => {
+        solve?.stop();
+        tween.stop();
+      },
+      pin() {},
+      unpin() {},
+    };
+  }
+
+  /** Ease `graph`'s positions to an already-computed `target` over `duration` ms (#328). `prepare`
+   *  runs on settle, before the final geometry pass. */
+  private transitionTo(graph: NetworkGraph, target: Float32Array, duration: number, prepare?: () => void): void {
+    const tween = this.positionTween(graph, duration);
+    this.onLayoutSettled(this.transitionHandle(tween), prepare);
+    tween.to(target);
+  }
+
+  /** Make `handle` the running layout, and refresh once it settles (unless superseded): exact LOD
+   *  geometry, the final reframe + release of a streaming fit, one rebuild. */
+  private onLayoutSettled(handle: WorkerLayoutHandle, prepare?: () => void): void {
+    this.layoutHandle = handle;
+    void handle.settled.then(() => {
+      if (this.layoutHandle !== handle) return; // a newer layout superseded this one
+      this.transition = null;
+      prepare?.();
+      this.recomputeLODGeometry(true);
+      this.releaseFit(); // final reframe on the settled bounds, then hand the view to zoom/pan
+      this.rebuild();
+    });
   }
 
   /** Post-layout bookkeeping for state-network mode (#171/#182), shared by every backend and every
@@ -1589,23 +1752,7 @@ export class Network extends BaseEngine {
       if (box) return box;
     }
     // LOD off (no tree): one-time full-position bbox, held so the fallback never costs O(nodes) per frame.
-    if (this.fitFallbackBox) return this.fitFallbackBox;
-    const p = graph.positions;
-    const n = graph.nodeCount;
-    let minX = Infinity;
-    let minY = Infinity;
-    let maxX = -Infinity;
-    let maxY = -Infinity;
-    for (let i = 0; i < n; i++) {
-      const x = p[2 * i]!;
-      const y = p[2 * i + 1]!;
-      if (x < minX) minX = x;
-      if (y < minY) minY = y;
-      if (x > maxX) maxX = x;
-      if (y > maxY) maxY = y;
-    }
-    if (!(minX <= maxX)) return null;
-    return (this.fitFallbackBox = [minX, minY, maxX, maxY]);
+    return (this.fitFallbackBox ??= positionsBox(graph.positions, graph.nodeCount));
   }
 
   /** Final reframe + release of a streaming fit (on settle): fit once more to the settled bounds, then
@@ -1626,17 +1773,20 @@ export class Network extends BaseEngine {
     return b instanceof WebGLBackend ? b.gpuDevice : null;
   }
 
-  /** Stop a running worker layout (no-op if none). The last computed positions are kept. */
+  /** Stop a running worker layout or position transition (no-op if none). The last computed — or
+   *  eased — positions are kept. */
   stopLayout(): this {
     this.layoutHandle?.stop();
     this.layoutHandle = null;
+    this.transition = null;
     this.lodStreaming = false; // no worker run is in flight to stream the LOD tree any more
     if (this.layoutRepaintRaf && typeof cancelAnimationFrame === "function") cancelAnimationFrame(this.layoutRepaintRaf);
     this.layoutRepaintRaf = 0;
     return this;
   }
 
-  /** Resolves when the current worker layout converges or is stopped (immediately if none runs). */
+  /** Resolves when the current worker layout converges — or its position transition ends (#328) — or
+   *  is stopped (immediately if none runs). */
   whenSettled(): Promise<void> {
     return this.layoutHandle?.settled ?? Promise.resolve();
   }
@@ -1678,7 +1828,7 @@ export class Network extends BaseEngine {
    * {@link sharedMemoryAvailable}.
    */
   get layoutTransport(): "gpu" | "shared" | "copy" | "none" {
-    if (!this.layoutHandle) return "none";
+    if (!this.layoutHandle || this.layoutHandle.mainThread) return "none";
     if (this.layoutHandle.transport === "gpu") return "gpu";
     return this.layoutHandle.shared ? "shared" : "copy";
   }
@@ -2167,6 +2317,11 @@ export class Network extends BaseEngine {
     if (!graph || !this.interactiveOpts?.draggable) return null;
     const held = this.heldLeavesFor(hit);
     if (held.length === 0) return null;
+    // A running position transition (#328) would overwrite the held nodes every frame: finish it, so the
+    // drag starts from the final layout. One still waiting for its target (a worker nested solve) instead
+    // holds the grabbed nodes over its frames once it starts, and keeps them where they are dropped.
+    if (this.transition?.running) this.transition.finish();
+    const pending = this.transition;
 
     const pos = graph.positions;
     const start = new Float32Array(held.length * 2); // world positions at grab time
@@ -2234,7 +2389,7 @@ export class Network extends BaseEngine {
       this.repaintDuringDrag(heldIds); // only the held set moved; streamed frames repaint in full (#211)
       return {
         move: (mx, my) => { setDelta(mx, my); applyHeld(); handle.pin(heldIds, heldPos); this.repaintDuringDrag(heldIds); },
-        end: () => { handle.unpin(); this.dragReapply = null; this.settleAfterDrag(); },
+        end: () => { handle.unpin(); this.dragReapply = null; if (pending === this.transition) pending?.keep(heldIds); this.settleAfterDrag(); },
       };
     }
 

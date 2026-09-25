@@ -49,6 +49,11 @@ export interface WorkerLayoutHandle {
    * Used by {@link Network.layoutTransport} to distinguish a real GPU run from a silent worker fallback.
    */
   transport?: "gpu";
+  /**
+   * `true` when the handle runs no layout transport at all — a main-thread position transition of an
+   * already-computed layout (#328) — so {@link Network.layoutTransport} reports `"none"`.
+   */
+  mainThread?: boolean;
   /** Resolves when the layout first converges or is stopped. The worker stays **alive** after
    *  convergence (idle, not terminated) so a node-drag can reheat it (#140); only {@link stop} tears it down. */
   settled: Promise<void>;
@@ -220,9 +225,21 @@ export function startWorkerLayout(
   };
 }
 
+/** How {@link startNestedWorkerLayout} delivers the layout (#328). */
+export interface NestedWorkerOptions {
+  /** Post a frame per finished depth, top modules first (default `true`); else only the final layout. */
+  stream?: boolean;
+  /**
+   * Receive the final positions instead of having them copied into `graph.positions` (no `onFrame`
+   * for them) — for a caller that eases to them (#328). Implies `stream: false`.
+   */
+  onResult?: (positions: Float32Array) => void;
+}
+
 /**
  * Run the nested module layout (#324) off-thread: the worker streams one frame per finished depth (top
- * modules first), each copied into `graph.positions`. Falls back to a synchronous main-thread solve
+ * modules first), each copied into `graph.positions` — or, per `opts`, posts only the final layout,
+ * optionally handed to `opts.onResult` instead (#328). Falls back to a synchronous main-thread solve
  * when Workers are unavailable. The worker exits with the layout — there is no reheat (drag is
  * translate-only on a nested layout, as on caller-supplied positions).
  */
@@ -231,10 +248,19 @@ export function startNestedWorkerLayout(
   tree: NestedLayoutTopology,
   params: NestedLayoutParams,
   onFrame: () => void,
+  opts: NestedWorkerOptions = {},
 ): WorkerLayoutHandle {
+  const { onResult } = opts;
+  /** The final positions: to the caller, or into the graph + a repaint. */
+  const land = (positions: Float32Array): void => {
+    if (onResult) onResult(positions);
+    else {
+      graph.positions.set(positions);
+      onFrame();
+    }
+  };
   const fallback = (): WorkerLayoutHandle => {
-    graph.positions.set(nestedLayout(tree, params).positions);
-    onFrame();
+    land(nestedLayout(tree, params).positions);
     return { shared: false, settled: Promise.resolve(), stop() {}, ...NOOP_DRAG };
   };
   if (typeof Worker === "undefined") return fallback();
@@ -251,19 +277,26 @@ export function startNestedWorkerLayout(
     if (terminated) return;
     terminated = true;
     worker.terminate();
+    // The handlers close over the topology and params (a warm start's `initial`, #328): drop them, so a
+    // finished layout's handle — kept until the next layout() — holds no per-node memory.
+    worker.onmessage = null;
+    worker.onerror = null;
     resolveSettled();
   };
   worker.onmessage = (e: MessageEvent<WorkerToMain>): void => {
     const msg = e.data;
-    if (msg.type === "lod-topology") return;
+    if (msg.type === "lod-topology" || terminated) return;
+    if (msg.type === "done") {
+      if (msg.positions) land(msg.positions);
+      terminate();
+      return;
+    }
     if (msg.positions) graph.positions.set(msg.positions);
     onFrame();
-    if (msg.type === "done") terminate();
   };
   worker.onerror = (): void => {
     if (terminated) return;
-    graph.positions.set(nestedLayout(tree, params).positions);
-    onFrame();
+    land(nestedLayout(tree, params).positions);
     terminate();
   };
   // Clone only the topology the layout reads — not the LOD tree's geometry/style arrays.
@@ -277,7 +310,7 @@ export function startNestedWorkerLayout(
     superEdgeTarget: tree.superEdgeTarget,
     superEdgeFlow: tree.superEdgeFlow,
   };
-  const start: MainToWorker = { type: "start-nested", topology, params };
+  const start: MainToWorker = { type: "start-nested", topology, params, stream: (opts.stream ?? true) && !onResult };
   worker.postMessage(start);
   return {
     shared: false,

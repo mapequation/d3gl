@@ -371,6 +371,7 @@ per-file timeout. Every at-scale leg below now asserts. When you add a guard, ad
 | network no-LOD labels | — | `network/__tests__/label-candidates-perf.test.ts` | 100k | `BENCH_LABEL_CANDIDATES` |
 | network selection dim | — | `network/__tests__/selection-dim-perf.test.ts` | 100k | — |
 | node-drag (interaction) | — | `network/__tests__/lod-drag-incremental-perf.test.ts` | small | `BENCH_DRAG` |
+| position transition frame (#328) | — | `network/__tests__/transition-perf.test.ts` | 100k, LOD on **and** off, vs a streamed layout frame | `BENCH_TRANSITION` |
 | LOD super-edge **build** | — | `network/__tests__/super-edges-build.test.ts` | equivalence | `BENCH_SUPER_EDGES_BUILD` |
 | retained memory | — | `core/point-memory.bench.test.ts` | — | `BENCH_MEM` |
 | declutter allocation | — | `core/declutter-alloc.bench.test.ts` | — | — |
@@ -409,6 +410,7 @@ guard owns the serialize budget: one DOM node per drawable buys parse time, not 
 | **`geoMap()` engine sweep** | **WebGL** | `map/geo-map-sweep-perf.browser.test.ts` | 20k cells | `PERF_BROWSER_N` (max 150k) |
 | **`plot()` engine sweep**, retained Scene | **WebGL** | `map/plot-engine-sweep-perf.browser.test.ts` | 50k ×2 layers | `PERF_BROWSER_N` (max 300k) |
 | **`network()` engine sweep**, LOD on **and** off | **WebGL** | `network/__tests__/network-sweep-perf.browser.test.ts` | 50k nodes / 50k edges | `PERF_BROWSER_N` (max 200k) |
+| **`network()` position transition** (#328), LOD on **and** off, vs a streamed frame | **WebGL** | `network/__tests__/network-transition-perf.browser.test.ts` | 50k nodes | `PERF_BROWSER_N` (max 200k) |
 | multi pass-through: FBO count + gesture skip | **WebGL** | `map/passthrough-multi-perf.browser.test.ts` | 25k ×2 layers | `PERF_BROWSER_N` (max 50k) |
 | label placement (`cullLabels`) | — | `labels/__tests__/label-cull-perf.test.ts` | 200k candidates, dense **and** spread | `BENCH_LABEL_CULL` |
 | **`network.labels()` per-frame**, LOD on **and** off | **WebGL** | `network/__tests__/network-labels-perf.browser.test.ts` | 20k nodes, uncapped | `PERF_BROWSER_N` (max 50k) |

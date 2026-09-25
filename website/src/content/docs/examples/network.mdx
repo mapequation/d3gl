@@ -260,7 +260,8 @@ The engine owns the hierarchy, not the LOD options, so every module feature read
   instead, and `lod(false)` draws every node — both keep the hierarchy, so switching back reuses the
   tree it built (once) rather than rebuilding it;
 - **`layout({ nested: true })`** lays the module tree out top-down, each module's children inside its
-  own disc — with LOD on or off;
+  own disc — with LOD on or off ([re-clustering](#re-clustering-warm-re-layout-and-transitions) re-lays
+  it out *warm*, from the current positions);
 - the **module-aware GPU seed** (`layout({ backend: "gpu" })`) seeds over the modules;
 - every **pick** reports the target's Infomap `path` (`hit.datum.path`): a module's path for an
   aggregate, the node's own path for a leaf, LOD on or off.
@@ -429,6 +430,11 @@ super-modules) lay out as coherent regions. Because the GPU solve streams frames
 → view centre, extent → the view), so the map opens framed and settles in place rather than piling at the
 origin. It releases to normal zoom/pan once it settles.
 
+The **Layout** control switches to the **nested** module layout (`layout({ nested })`): each module's
+children are laid out inside its own disc, arranged by their sibling links, so every module stays a
+compact region of its parent. The switch re-lays the map out *warm* and *eases* into it — see
+[below](#re-clustering-warm-re-layout-and-transitions).
+
 Nodes are coloured **categorically by module** (the planted communities). The **LOD** control switches
 the cut over the same engine-held hierarchy:
 
@@ -444,6 +450,35 @@ out to the map of modules, in to sub-modules and individual nodes.
 <ExampleCard files={["modular-map/draw.ts", "modular-map/data.ts"]}>
   <ModularMap client:visible slot="demo" />
 </ExampleCard>
+
+### Re-clustering: warm re-layout and transitions
+
+Re-running community detection gives the **same nodes a new module hierarchy**. A cold nested layout
+would throw the current map away and start again from a disc. A **warm** one refines it:
+
+```ts
+// Infomap re-ran (other flags, another trial…): same nodes, new tree.
+net
+  .data(graph, { modules: next.nodes }) // positions live in `graph` — data() leaves them alone
+  .layout({ backend: "worker", nested: { warm: true }, transition: 600 });
+await net.whenSettled(); // resolves when the transition ends
+```
+
+- **`nested: { warm: true }`** seeds each module's children at their *current* centroids (instead of a
+  spiral) and starts the solve cooler, so it keeps the arrangement the reader already knows and only
+  refines it. The new map is placed over the old one — same centroid, same spread — so nothing jumps
+  off-screen, and a warm start from a nested layout doesn't drift over repeated re-clusters. It posts no
+  per-depth frames (those would collapse every module to a point first); on a graph never laid out it is
+  the cold layout.
+- **`transition: 600`** eases every node from where it is to its new place over 600 ms (cubic
+  ease-in-out) on the main thread. The worker computes the final layout only; each animation frame is then
+  a positions-only repaint — no more work than a frame of a streaming layout. The camera stays where it
+  is unless you pass `fit: true`, which frames the final map once as the transition starts.
+  `transition` also eases a `"positions"` or `"force"` layout; a new `layout()`, `data()`,
+  `stopLayout()` or `destroy()` stops it where it is, and grabbing a node finishes it.
+
+In the example above, switch **Layout** between *Force* and *Nested*: the nested map is computed warm from
+the force layout's positions and the nodes glide into their modules' discs.
 
 ## State networks: physical ↔ state views
 

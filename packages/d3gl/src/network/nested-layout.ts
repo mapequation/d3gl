@@ -15,15 +15,29 @@
  * in place, and (c) is final per depth — deeper levels only move within their parent's disc — so a
  * streamed layout never oscillates.
  *
+ * A **warm start** (`initial`, #328) re-lays a map out from where its nodes already are — e.g. after
+ * a re-clustering: each module's children are seeded at their current leaf centroids instead of the
+ * spiral, the solve starts cooler so it refines that arrangement, and the result is placed over the
+ * current map (same leaf centroid and spread), so the new map lands where the old one was.
+ *
  * Cost: each module solves its `k` children for `iterations` ticks at O(k + sibling links) per tick
  * (exact O(k²) repulsion/collision up to 32 children, Barnes-Hut / a uniform grid above), so the whole layout is O(Σ_modules
  * (k + links) · iterations) ≈ O((leaves + modules + super-edges) · iterations) — one-shot, never
- * per frame. Memory is O(tree size) for disc centres/radii plus per-module scratch of O(max k).
+ * per frame. Memory is O(tree size) for disc centres/radii plus per-module scratch of O(max k); a warm
+ * start adds O(tree size) for the current centroids and one O(leaves) pass to place the result.
  */
 import type { LODTopology } from "./lod.js";
 import { BarnesHutTree } from "./quadtree.js";
 
 const GOLDEN = Math.PI * (3 - Math.sqrt(5));
+/**
+ * Starting alpha of a warm-seeded module solve (#328); a cold solve starts at 1. At 0.1 a warm start
+ * from a map's own nested layout moves leaves ~2-4% of the root radius and repeated warm starts
+ * converge (each moves less than the last); at 0.3 they moved twice as far and kept drifting.
+ */
+const WARM_ALPHA = 0.1;
+/** Share of the cold spiral kept in a warm seed — splits coincident children deterministically. */
+const WARM_SPIRAL = 0.01;
 
 /** The topology fields the nested layout reads — a module tree with (optional) super-edges. */
 export type NestedLayoutTopology = Pick<LODTopology, "size" | "leafCount" | "childOffset" | "children"> & {
@@ -49,12 +63,29 @@ export interface NestedLayoutOptions {
   /**
    * Called after every depth is final, with the leaf positions so far — leaves below the finished
    * depth sit at their deepest placed ancestor's centre. Lets a caller stream the layout top-down.
+   * Not called on a warm start (`initial`): its placement is final only once every depth is, and
+   * collapsing leaves onto their module centres is what a warm start exists to avoid.
    */
   onDepth?: (depth: number, positions: Float32Array) => void;
+  /**
+   * **Warm start** (#328): the current leaf positions, interleaved `[x, y, …]` (length `2 · leafCount`),
+   * e.g. the layout before a re-clustering. Each module's children are seeded at their current leaf
+   * centroids — relative to the module's own, scaled into its disc — instead of the golden spiral, and
+   * the solve starts cooler, so it refines the current arrangement rather than replacing it. The result
+   * keeps the map where it is: its leaves get the same centroid as `initial` and, unless `radius` is
+   * given, the same RMS spread around it (so a warm start from a nested layout neither drifts nor
+   * shrinks over repeated re-clusters). Non-finite entries count as unknown. A module whose children's
+   * offsets are unknown or all coincide is seeded cold, so an all-coincident `initial` (e.g. the zeros
+   * of a graph never laid out) gives exactly the cold layout.
+   */
+  initial?: ArrayLike<number>;
 }
 
 /** The serialisable subset of {@link NestedLayoutOptions} (no callback) — what the worker receives. */
-export type NestedLayoutParams = Omit<NestedLayoutOptions, "onDepth" | "size"> & { size?: Float32Array };
+export type NestedLayoutParams = Omit<NestedLayoutOptions, "onDepth" | "size" | "initial"> & {
+  size?: Float32Array;
+  initial?: Float32Array;
+};
 
 /** Leaf positions plus every tree node's disc (centre + radius), all in world units. */
 export interface NestedLayoutResult {
@@ -98,6 +129,59 @@ class Scratch {
   }
 }
 
+/**
+ * The current layout a warm start refines (#328): every tree node's leaf centroid (over the leaves with
+ * finite `initial` coordinates, `known` of them), plus the root's centroid and RMS leaf spread.
+ */
+interface WarmStart {
+  ox: Float64Array;
+  oy: Float64Array;
+  known: Float64Array;
+  /** RMS distance of the known leaves from the root centroid (`ox[root]`, `oy[root]`); > 0. */
+  spread: number;
+}
+
+/**
+ * Leaf centroids bottom-up (children have lower ids than their parents, so one ascending pass sums
+ * every subtree) and the root's RMS spread. O(tree size + leaves). Null when no leaf is known or they
+ * all coincide — nothing to refine, so the layout runs cold.
+ */
+function warmStart(topo: NestedLayoutTopology, initial: ArrayLike<number>, root: number): WarmStart | null {
+  const { size, leafCount, parent } = topo;
+  const ox = new Float64Array(size);
+  const oy = new Float64Array(size);
+  const known = new Float64Array(size);
+  for (let i = 0; i < leafCount; i++) {
+    const x = initial[2 * i];
+    const y = initial[2 * i + 1];
+    if (x === undefined || y === undefined || !Number.isFinite(x) || !Number.isFinite(y)) continue;
+    ox[i] = x;
+    oy[i] = y;
+    known[i] = 1;
+  }
+  for (let g = 0; g < size; g++) {
+    const w = known[g]!;
+    if (g >= leafCount && w > 0) {
+      ox[g] = ox[g]! / w; // g's children are all summed in by now: turn its sums into a mean
+      oy[g] = oy[g]! / w;
+    }
+    const p = parent[g]!;
+    if (p < 0) continue;
+    ox[p] = ox[p]! + ox[g]! * w;
+    oy[p] = oy[p]! + oy[g]! * w;
+    known[p] = known[p]! + w;
+  }
+  const n = known[root]!;
+  if (!(n > 0)) return null;
+  let ss = 0;
+  for (let i = 0; i < leafCount; i++) {
+    if (!known[i]) continue;
+    ss += (ox[i]! - ox[root]!) ** 2 + (oy[i]! - oy[root]!) ** 2;
+  }
+  const spread = Math.sqrt(ss / n);
+  return spread > 0 ? { ox, oy, known, spread } : null;
+}
+
 /** Lay out a module tree top-down, each module's children inside its disc. @see the module docs above. */
 export function nestedLayout(topo: NestedLayoutTopology, opts: NestedLayoutOptions = {}): NestedLayoutResult {
   const { size, leafCount, childOffset, children, parent } = topo;
@@ -117,6 +201,7 @@ export function nestedLayout(topo: NestedLayoutTopology, opts: NestedLayoutOptio
     else if (g >= leafCount) root = g;
   }
   if (root < 0) throw new Error("nestedLayout: the topology has no root module");
+  const warm = opts.initial ? warmStart(topo, opts.initial, root) : null;
 
   const cx = new Float32Array(size);
   const cy = new Float32Array(size);
@@ -133,18 +218,67 @@ export function nestedLayout(topo: NestedLayoutTopology, opts: NestedLayoutOptio
       const start = childOffset[g]!;
       const end = childOffset[g + 1]!;
       if (end > start) {
-        solveModule(topo, g, start, end, weight, packing, iterations, scratch, cx, cy, r);
+        solveModule(topo, g, start, end, weight, packing, iterations, scratch, cx, cy, r, warm);
         for (let c = start; c < end; c++) next.push(children[c]!);
       }
     }
-    if (opts.onDepth && next.length) {
+    if (opts.onDepth && !opts.initial && next.length) {
       writeLeafPositions(topo, cx, cy, r, positions);
       opts.onDepth(depth + 1, positions);
     }
     frontier = next;
   }
   writeLeafPositions(topo, cx, cy, r, positions);
+  if (warm) placeOver(topo, warm, root, opts.radius === undefined, positions, cx, cy, r);
   return { positions, cx, cy, r };
+}
+
+/**
+ * Keep a warm-started map where the current one is (#328): translate — and, when `rescale`, scale about
+ * the centroid — so the known leaves get the current map's centroid and RMS spread. A similarity
+ * transform, so containment and non-overlap are unchanged. O(tree size + leaves).
+ */
+function placeOver(
+  topo: NestedLayoutTopology,
+  warm: WarmStart,
+  root: number,
+  rescale: boolean,
+  positions: Float32Array,
+  cx: Float32Array,
+  cy: Float32Array,
+  r: Float32Array,
+): void {
+  const { size, leafCount } = topo;
+  const { known } = warm;
+  let n = 0;
+  let mx = 0;
+  let my = 0;
+  for (let i = 0; i < leafCount; i++) {
+    if (!known[i]) continue;
+    mx += positions[2 * i]!;
+    my += positions[2 * i + 1]!;
+    n++;
+  }
+  mx /= n;
+  my /= n;
+  let ss = 0;
+  for (let i = 0; i < leafCount; i++) {
+    if (!known[i]) continue;
+    ss += (positions[2 * i]! - mx) ** 2 + (positions[2 * i + 1]! - my) ** 2;
+  }
+  const spread = Math.sqrt(ss / n);
+  const s = rescale && spread > 0 ? warm.spread / spread : 1;
+  const tx = warm.ox[root]!;
+  const ty = warm.oy[root]!;
+  for (let i = 0; i < leafCount; i++) {
+    positions[2 * i] = tx + (positions[2 * i]! - mx) * s;
+    positions[2 * i + 1] = ty + (positions[2 * i + 1]! - my) * s;
+  }
+  for (let g = 0; g < size; g++) {
+    cx[g] = tx + (cx[g]! - mx) * s;
+    cy[g] = ty + (cy[g]! - my) * s;
+    r[g] = r[g]! * s;
+  }
 }
 
 /**
@@ -177,6 +311,7 @@ function solveModule(
   cx: Float32Array,
   cy: Float32Array,
   r: Float32Array,
+  warm: WarmStart | null,
 ): void {
   const { children, superEdgeOffset, superEdgeTarget, superEdgeFlow, parent } = topo;
   const k = end - start;
@@ -197,7 +332,19 @@ function solveModule(
   const floor = total > 0 ? total / (k * 50) : 1;
   let sum = 0;
   for (let i = 0; i < k; i++) sum += Math.max(weight[children[start + i]!]!, floor);
-  // Deterministic seed: a golden-angle spiral in heaviest-first order (heaviest near the centre).
+  // Warm start (#328): seed each child at its current centroid's offset from g's, the farthest at the
+  // spiral's outer radius — when every child's centroid is known and they don't all coincide with g's.
+  let far = 0;
+  if (warm) {
+    const { ox, oy, known } = warm;
+    for (let i = 0; i < k && far >= 0; i++) {
+      const c = children[start + i]!;
+      far = known[c]! > 0 ? Math.max(far, Math.hypot(ox[c]! - ox[g]!, oy[c]! - oy[g]!)) : -1;
+    }
+  }
+  const seeded = warm !== null && far > warm.spread * 1e-6;
+  // Deterministic seed: a golden-angle spiral in heaviest-first order (heaviest near the centre). A warm
+  // seed keeps a trace of it (WARM_SPIRAL), which splits coincident children deterministically.
   const order = Array.from({ length: k }, (_, i) => i).sort(
     (a, b) => weight[children[start + b]!]! - weight[children[start + a]!]! || a - b,
   );
@@ -209,6 +356,10 @@ function solveModule(
     const rr = 0.8 * Math.sqrt((rank + 0.5) / k);
     x[i] = rr * Math.cos(rank * GOLDEN);
     y[i] = rr * Math.sin(rank * GOLDEN);
+    if (warm && seeded) {
+      x[i] = (0.8 * (warm.ox[c]! - warm.ox[g]!)) / far + WARM_SPIRAL * x[i]!;
+      y[i] = (0.8 * (warm.oy[c]! - warm.oy[g]!)) / far + WARM_SPIRAL * y[i]!;
+    }
     vx[i] = 0;
     vy[i] = 0;
   }
@@ -246,15 +397,16 @@ function solveModule(
   // Two phases. ORGANISE (first 60%): gravity + springs + many-body repulsion, discs may overlap, so
   // linked siblings can pass each other and the arrangement follows the links rather than the seed.
   // COMPACT (rest): gravity + springs + collision, no repulsion, packing the settled arrangement into
-  // non-overlapping discs without reordering it.
+  // non-overlapping discs without reordering it. A warm seed starts cooler (WARM_ALPHA): the forces
+  // are the same, so it settles into the same kind of arrangement, but the seed carries over.
   const PAD = 1.15; // collision spacing, as a factor on the radius sum
   const GRAVITY = 0.08;
   const REPULSION = (0.5 * GRAVITY) / k; // unlinked siblings spread to ≈ the unit disc against gravity
   const DECAY = 0.4; // velocity decay per tick
   const organise = Math.ceil(iterations * 0.6);
   const alphaMin = 0.001;
-  const alphaDecay = 1 - Math.pow(alphaMin, 1 / iterations);
-  let alpha = 1;
+  let alpha = seeded ? WARM_ALPHA : 1;
+  const alphaDecay = 1 - Math.pow(alphaMin / alpha, 1 / iterations);
   for (let it = 0; it < iterations; it++) {
     const organising = it < organise;
     if (organising) repel(s, k, REPULSION * alpha);
