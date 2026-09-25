@@ -254,7 +254,7 @@ function drag(h: HTMLElement, x0: number, y0: number, x1: number, y1: number, re
   return up;
 }
 
-describe("a transition next to a drag (#328)", () => {
+describe("a transition next to a drag or a stop (#328, #329)", () => {
   /** An engine on a fixed host (so pointer events land on the glyphs), world == screen, LOD off. */
   async function dragEngine(): Promise<{ net: Network; g: NetworkGraph; h: HTMLElement }> {
     const h = host();
@@ -297,6 +297,38 @@ describe("a transition next to a drag (#328)", () => {
     rec.stop();
     for (const s of rec.samples) expect([s[0], s[1]]).toEqual([100, 20]);
     expect(at(g, 0)).toEqual([100, 20]);
+    net.destroy();
+  });
+
+  it("stopLayout() mid-ease drops the nested discs: the rings fall back to the members' extent", async () => {
+    const RING = "#d62728";
+    const h = host();
+    const net = network(h, { width: 200, height: 200, backend: "webgl" });
+    await net.whenReady();
+    const g = graph();
+    const spread = POSITIONS.map((v) => 3 * v - 150); // far from where the nested layout puts the nodes
+    net.data(g, { modules: MODULES }).style({ nodeRadius: 1 }).lod({ expandPx: 1, declutter: false, moduleBoundary: { color: RING, opacity: 1 } });
+    net.layout({ backend: "positions", positions: spread });
+    net.setTransform({ k: 0.4, x: 100, y: 100 });
+    const radii = (): number[] => {
+      const out: number[] = [];
+      for (const m of net.toSVG().matchAll(/<circle [^>]*r="([^"]+)"[^>]*stroke="rgba\(214, 39, 40/g)) out.push(Number(m[1]));
+      return out.sort((a, b) => a - b);
+    };
+    net.layout({ backend: "force", nested: true }); // settled nested: the rings are its discs
+    const discs = radii();
+    net.layout({ backend: "positions", positions: spread });
+    net.layout({ backend: "force", nested: true, transition: 1000 });
+    await new Promise((r) => setTimeout(r, 300));
+    net.stopLayout();
+    const stopped = radii();
+    // The same positions laid out directly (no discs): what the stopped rings must now be.
+    net.layout({ backend: "positions", positions: g.positions.slice() });
+    const fallback = radii();
+    expect(discs.length).toBeGreaterThan(0);
+    expect(stopped).toHaveLength(fallback.length);
+    for (let i = 0; i < stopped.length; i++) expect(stopped[i]).toBeCloseTo(fallback[i]!, 3);
+    expect(stopped).not.toEqual(discs); // non-vacuous: mid-ease the discs no longer fit the members
     net.destroy();
   });
 });

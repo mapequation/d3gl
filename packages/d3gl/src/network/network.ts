@@ -840,7 +840,7 @@ export class Network extends BaseEngine {
    *  Shared by {@link data} (plain graph) and {@link applyView} (state-network view switch); unlike
    *  `data` it does NOT clear the state-network mode. */
   private setActiveGraph(graph: NetworkGraph): this {
-    this.stopLayout(); // any worker layout is tied to the previous graph's buffers
+    this.haltLayout(); // any worker layout is tied to the previous graph's buffers
     this.graph = graph;
     // Drop per-node style arrays sized to the PREVIOUS graph — the idiomatic re-render on a graph swap is
     // `net.data(g).style(s)`, but data() rebuilds first, and resolving a stale-length `flowBorder.flow` /
@@ -1265,7 +1265,7 @@ export class Network extends BaseEngine {
       // Any backend change cancels a running worker layout before re-seeding positions. A prior
       // worker-streamed LOD tree belongs to that superseded run, so drop it: the new layout either
       // re-streams one (worker backend) or builds one on the main thread (force/positions).
-      this.stopLayout();
+      this.haltLayout();
       this.lodWorkerTree = null;
       this.nestedDiscs = null; // the new layout places the nodes; a nested one records its discs as it lands (#329)
       // Fit-on-layout (streaming backends): keep the camera framed on the layout as it converges.
@@ -1608,7 +1608,7 @@ export class Network extends BaseEngine {
     const sg = this.stateData!;
     this.layoutOpts = { ...this.layoutOpts, ...opts };
     const phys = sg.physical;
-    this.stopLayout(); // cancel a running physical-layout worker/GPU stream before re-seeding
+    this.haltLayout(); // cancel a running physical-layout worker/GPU stream before re-seeding
 
     if (opts.backend === "positions" && opts.positions) {
       phys.positions.set(opts.positions);
@@ -1815,15 +1815,26 @@ export class Network extends BaseEngine {
   }
 
   /** Stop a running worker layout or position transition (no-op if none). The last computed — or
-   *  eased — positions are kept. */
+   *  eased — positions are kept. A nested layout's transition stopped mid-ease leaves the nodes between
+   *  two layouts, so its discs no longer hold: the module rings fall back to centroid + extent (#329). */
   stopLayout(): this {
+    const interrupted = this.transition?.running === true && this.nestedDiscs !== null;
+    this.haltLayout();
+    if (interrupted) {
+      this.nestedDiscs = null;
+      this.rebuild(); // the rings redraw around where the members stopped
+    }
+    return this;
+  }
+
+  /** {@link stopLayout} without its repaint, for the callers that go on to set new state and rebuild. */
+  private haltLayout(): void {
     this.layoutHandle?.stop();
     this.layoutHandle = null;
     this.transition = null;
     this.lodStreaming = false; // no worker run is in flight to stream the LOD tree any more
     if (this.layoutRepaintRaf && typeof cancelAnimationFrame === "function") cancelAnimationFrame(this.layoutRepaintRaf);
     this.layoutRepaintRaf = 0;
-    return this;
   }
 
   /** Resolves when the current worker layout converges — or its position transition ends (#328) — or
@@ -1834,7 +1845,7 @@ export class Network extends BaseEngine {
 
   /** Tear down the engine, cancelling any worker layout first. */
   override destroy(): void {
-    this.stopLayout();
+    this.haltLayout();
     super.destroy(); // base tears down the shared label overlay (#105 N7b, #223)
   }
 
