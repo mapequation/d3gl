@@ -848,13 +848,15 @@ export function superEdges(
   // `anchorStart` on are anchored links; an end is on its module's boundary iff `anchored(end)`: an
   // expanded module in view (stamped `-gen`) whose centre is on-screen. `anchorEnds` puts both ends
   // where they are drawn (a boundary end moved onto its circle, toward the other end, at radius 0) into
-  // `ends` = [ax, ay, bx, by], or returns false when the two boundaries overlap.
+  // `ends` = [ax, ay, bx, by]. When the two circles overlap (routine for the centroid + extent fallback,
+  // or with the other end's centre inside the ring), there is no gap to run the link across: it runs
+  // between the circles' centres instead, so its flow is still drawn.
   const anc = style.anchor;
   let anchorStart = Infinity;
   const anchored = (x: number): boolean => seen[x] === -gen && !offScreen(x);
   const ends = new Float64Array(4);
   const circle = new Float64Array(3);
-  const anchorEnds = (a: number, b: number): boolean => {
+  const anchorEnds = (a: number, b: number): void => {
     const aOn = anchored(a);
     const bOn = anchored(b);
     let ra = 0;
@@ -866,12 +868,11 @@ export function superEdges(
     const dx = ends[2]! - ends[0]!;
     const dy = ends[3]! - ends[1]!;
     const d = Math.hypot(dx, dy);
-    if (!(d > ra + rb)) return false;
+    if (!(d > ra + rb)) return; // overlapping circles: centre to centre
     ends[0] = ends[0]! + (dx / d) * ra;
     ends[1] = ends[1]! + (dy / d) * ra;
     ends[2] = ends[2]! - (dx / d) * rb;
     ends[3] = ends[3]! - (dy / d) * rb;
-    return true;
   };
 
   // Gather drawable directed super-edges + a reciprocal-flow lookup (for both-on-frontier pairs) into
@@ -1051,7 +1052,6 @@ export function superEdges(
       for (const [key, w] of anchor) {
         const a = Math.floor(key / tree.size);
         const b = key - a * tree.size;
-        if (!anchorEnds(a, b)) continue; // the boundaries overlap: nothing to draw between them
         pushEdge(a, b, w);
         flowByPair.set(key, w); // reciprocal anchored links (A→B and B→A) share their widths
         claim(a, b, w);
@@ -1111,7 +1111,7 @@ export function superEdges(
     const h = bS[e]!;
     const anchoredEdge = e >= anchorStart;
     if (anchoredEdge) {
-      anchorEnds(g, h); // true: the pass above kept only separated pairs
+      anchorEnds(g, h);
       sources[e * 2] = ends[0]!;
       sources[e * 2 + 1] = ends[1]!;
       targets[e * 2] = ends[2]!;

@@ -477,8 +477,10 @@ net.lod({
   `.ftree`, a link between modules A and B exists only at their level. When A expands there is no finer
   link to show, so it used to disappear. With `crossLevelEdges` on, it is drawn from **A's ring** with
   its own flow instead (ring to ring when both are open), and links from the graph's own edges are
-  unchanged, so nothing is counted twice. An expanded module whose centre is off-screen keeps the usual
-  off-screen rule: its links are drawn toward its centre.
+  unchanged, so nothing is counted twice. Where the two rings overlap, as the centroid + extent rings of
+  a force layout often do, the link runs between their centres rather than disappearing. An expanded
+  module whose centre is off-screen keeps the usual off-screen rule: its links are drawn toward its
+  centre.
 - **Cost.** Each frame costs one ring per expanded module in view (the cut visits those modules
   anyway) plus, when anchoring, those modules' own module links. It never costs the whole tree, and it
   is nothing when the option is off.

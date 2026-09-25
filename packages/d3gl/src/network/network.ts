@@ -405,8 +405,10 @@ export interface NetworkLODOptions {
    * With {@link crossLevelEdges} on, a **module link** (`data(graph, { modules, moduleLinks })`, #199)
    * whose endpoint is an expanded module in view — one that no finer pair can carry, as in an Infomap
    * `.ftree` — is drawn to or from that module's ring, with its flow, instead of disappearing when the
-   * module opens. Links between two expanded modules run ring to ring. An expanded module whose centre
-   * is off-screen keeps the off-screen rule (its links are drawn toward its centre, leaving the view).
+   * module opens. Links between two expanded modules run ring to ring. Where the two circles overlap
+   * (routine for the centroid + extent rings, or when the other end sits inside the ring) there is no gap
+   * to run it across, so it runs between their centres instead. An expanded module whose centre is
+   * off-screen keeps the off-screen rule (its links are drawn toward its centre, leaving the view).
    * Links derived from the graph's own edges are unchanged (their flow is drawn at the members), so
    * nothing is counted twice.
    *

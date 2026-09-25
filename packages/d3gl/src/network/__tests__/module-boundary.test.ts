@@ -171,7 +171,8 @@ const sorted = (m: Map<string, number>): [string, number][] => [...m].sort((x, y
  * modules `expanded`, everything on screen. Every edge (graph edge or module link) with both endpoints
  * under present nodes is drawn there (#325). A module link with an endpoint that has no present cover but
  * is expanded is **anchored**: drawn from/to that module itself (its boundary), the other end at its
- * cover — or at itself when also expanded — unless the two boundaries overlap. Nothing else is drawn.
+ * cover — or at itself when also expanded — even when the two boundaries overlap (it then runs between
+ * their centres). Nothing else is drawn.
  */
 function expectedPairs(tree: LODTree, discs: BoundaryDiscs, fx: Fixture, byPath: Map<string, number>, present: number[], expanded: number[]): { pairs: Map<string, number>; anchored: number; overlapped: number } {
   const parent = tree.parent!;
@@ -219,10 +220,7 @@ function expectedPairs(tree: LODTree, discs: BoundaryDiscs, fx: Fixture, byPath:
     if (ra < 0 || rb < 0) continue; // the other end is decluttered away
     const [ax, ay, aR] = circle(ra, onU);
     const [bx, by, bR] = circle(rb, onV);
-    if (!(Math.hypot(bx - ax, by - ay) > aR + bR)) {
-      overlapped++;
-      continue;
-    }
+    if (!(Math.hypot(bx - ax, by - ay) > aR + bR)) overlapped++; // still drawn, centre to centre
     add(ra, rb, w);
     anchored++;
   }
@@ -250,7 +248,7 @@ describe("module links anchored at expanded modules' boundaries (#329)", () => {
           overlappedTotal += want.overlapped;
         }
       }
-      // Non-vacuity: plenty of links really were anchored, and next to none lost to overlapping discs.
+      // Non-vacuity: plenty of links really were anchored (nested discs next to never overlap).
       expect(anchoredTotal).toBeGreaterThan(cuts.length);
       expect(overlappedTotal).toBeLessThan(anchoredTotal / 50);
     });
@@ -352,6 +350,29 @@ describe("module links anchored at expanded modules' boundaries (#329)", () => {
       // From 1:1's ring (the link) or from leaf 0 (the edge) to module 2 — and not again from module 1.
       expect(sorted(got), label).toEqual([[`${moduleLinks ? at("1:1") : 0}:${at("2")}`, 7]]);
     }
+  });
+
+  it("draws a link whose circles overlap between their centres — the centroid + extent fallback", () => {
+    // No discs (any non-nested layout): each ring is its members' centroid + extent. Modules 1 and 2 are
+    // spread along x and interleave, so their circles overlap — the link must still be drawn.
+    const tree = buildModuleLODTree(records.length, records, undefined, links);
+    computeLODPositions(tree, new Float32Array([-20, 0, -10, 0, 10, 0, 20, 0, -18, 6, -8, 6, 8, 6, 18, 6]));
+    const byPath = idsByPath(tree);
+    const at = (p: string): number => byPath.get(p)!;
+    const [m1, m2] = [at("1"), at("2")];
+    expect(Math.hypot(tree.cx[m2]! - tree.cx[m1]!, tree.cy[m2]! - tree.cy[m1]!)).toBeLessThan(tree.extent[m1]! + tree.extent[m2]!);
+    const frontier = Uint32Array.from([at("1:1"), at("1:2"), at("2:1"), at("2:2")]);
+    const out = superEdges(tree, frontier, { ...STYLE, anchor: collector([m1, m2]) }, ALL);
+    const got = drawnPairs(out, tree.size);
+    expect(got.get(`${m1}:${m2}`)).toBe(5);
+    expect(got.get(`${m2}:${m1}`)).toBe(3);
+    const e = out.ids.indexOf(m1 * tree.size + m2);
+    expect(Array.from(out.lines!.sources.slice(e * 2, e * 2 + 2))).toEqual([tree.cx[m1], tree.cy[m1]]);
+    expect(Array.from(out.lines!.targets.slice(e * 2, e * 2 + 2))).toEqual([tree.cx[m2], tree.cy[m2]]);
+    // A present glyph inside an anchored module's circle: module 1 open, module 2 collapsed within its ring.
+    const inside = drawnPairs(superEdges(tree, Uint32Array.from([at("1:1"), at("1:2"), m2]), { ...STYLE, anchor: collector([m1]) }, ALL), tree.size);
+    expect(inside.get(`${m1}:${m2}`)).toBe(5);
+    expect(inside.get(`${m2}:${m1}`)).toBe(3);
   });
 
   it("puts a boundary end on the module's circle, at radius 0 (lines, arrowheads and half-arrows)", () => {
