@@ -147,6 +147,27 @@ interface Leg {
   landed: boolean;
 }
 
+/** Frames whose allocation {@link frameAllocKB} samples. */
+const ALLOC_FRAMES = 6;
+
+/**
+ * Median typed-array bytes (KB) one frame allocates. A full GC runs before EACH sampled frame, so the
+ * previous frames' garbage is gone and cannot be collected mid-measurement: a single delta across a
+ * loop of frames under-counts whenever V8 collects part-way through (seen in CI: the streamed baseline
+ * measured 2115.9 KB/frame on one runner, 2441.4 on another, for the same commit — #340). Without
+ * `--expose-gc` the numbers are rough and the caller doesn't assert on them.
+ */
+function frameAllocKB(gc: (() => void) | undefined, frame: (i: number) => void): number {
+  const kb: number[] = [];
+  for (let i = 0; i < ALLOC_FRAMES; i++) {
+    gc?.();
+    const m0 = process.memoryUsage().arrayBuffers;
+    frame(i);
+    kb.push((process.memoryUsage().arrayBuffers - m0) / 1024);
+  }
+  return median(kb);
+}
+
 /**
  * Time `FRAMES` streamed frames (copy + `streamedRepaint`) and `FRAMES` transition frames
  * (interpolation + `transitionRepaint`) at `n`, after a warm-up of each.
@@ -160,24 +181,24 @@ function runLeg(graph: NetworkGraph, a: Float32Array, b: Float32Array, streamedR
     streamedRepaint();
   };
   for (let i = 0; i < 4; i++) streamedFrame(i);
-  gc?.();
-  let m0 = process.memoryUsage().arrayBuffers;
   const st: number[] = [];
   for (let i = 0; i < FRAMES; i++) {
     const t0 = performance.now();
     streamedFrame(i);
     st.push(performance.now() - t0);
   }
-  const streamedKB = (process.memoryUsage().arrayBuffers - m0) / FRAMES / 1024;
+  const streamedKB = frameAllocKB(gc, (i) => streamedFrame(i));
 
   // Transition: warm the loop up on a short one, then time every frame of a real one a → b.
   pos.set(b);
   const warm = crankedTransition(pos, a, 4, transitionRepaint);
   for (let i = 0; i < 5; i++) warm.step();
   pos.set(a);
+  // Allocation: its own transition, so the timed one below still runs start to end.
+  const probe = crankedTransition(pos, b, ALLOC_FRAMES + 2, transitionRepaint);
+  const transitionKB = frameAllocKB(gc, () => probe.step());
+  pos.set(a);
   const run = crankedTransition(pos, b, FRAMES, transitionRepaint);
-  gc?.();
-  m0 = process.memoryUsage().arrayBuffers;
   const tt: number[] = [];
   let moved = true;
   let prev = pos[0]!;
@@ -188,7 +209,6 @@ function runLeg(graph: NetworkGraph, a: Float32Array, b: Float32Array, streamedR
     if (pos[0] === prev && a[0] !== b[0]) moved = false;
     prev = pos[0]!;
   }
-  const transitionKB = (process.memoryUsage().arrayBuffers - m0) / FRAMES / 1024;
   run.step(); // the last frame: exactly on the target
   let landed = !run.t.running;
   for (let i = 0; i < pos.length && landed; i++) if (pos[i] !== b[i]) landed = false;
