@@ -62,6 +62,46 @@ export interface ModuleLink {
 }
 
 /**
+ * Check that `records` align with a graph's dense node indices — one record per node `0..nodeCount-1`,
+ * each with a non-empty path — and return the record index of every node (`recordOf[id]`). The same
+ * contract {@link buildModuleLODTree} enforces, checked on its own in O(nodeCount) so the engine can
+ * validate a hierarchy once, when it is set (`Network.data(graph, { modules })`, #326), without building
+ * the tree. Throws on an out-of-range, duplicate, missing or empty-path record.
+ */
+export function moduleRecordIndex(nodeCount: number, records: ArrayLike<ModuleNode>): Int32Array {
+  const recordOf = new Int32Array(nodeCount).fill(-1);
+  for (let r = 0; r < records.length; r++) {
+    const { id, path } = records[r]!;
+    if (!(id >= 0 && id < nodeCount)) throw new Error(`module records: record id ${id} out of range [0, ${nodeCount})`);
+    if (recordOf[id]! >= 0) throw new Error(`module records: duplicate record for node id ${id}`);
+    if (path.length < 1) throw new Error(`module records: node id ${id} has an empty path`);
+    recordOf[id] = r;
+  }
+  for (let i = 0; i < nodeCount; i++) {
+    if (recordOf[i]! < 0) throw new Error(`module records: no record for node id ${i} (records must cover every node)`);
+  }
+  return recordOf;
+}
+
+/**
+ * Check that every {@link ModuleLink} endpoint names a module or a leaf of the hierarchy `records` spell
+ * — what {@link buildModuleLODTree} checks when it resolves them — on its own, so the engine can validate
+ * `moduleLinks` once, when they are set (`Network.data(graph, { modules, moduleLinks })`, #326), without
+ * building the tree. Throws on an empty path or an endpoint that is not in the module tree. `records` must
+ * pass {@link moduleRecordIndex}. O(nodes · depth + links · depth), transient memory only.
+ */
+export function checkModuleLinks(nodeCount: number, records: ArrayLike<ModuleNode>, links: ArrayLike<ModuleLink>): void {
+  if (links.length === 0) return;
+  const { moduleChild, leafModule, leafRank } = modulePrefixTree(nodeCount, records);
+  // Resolve to internal module indices: only whether each endpoint resolves matters here.
+  const resolve = resolveLinkPaths(moduleChild, Uint32Array.from(moduleChild.keys()), leafModule, leafRank, "module links");
+  for (let l = 0; l < links.length; l++) {
+    resolve(links[l]!.source);
+    resolve(links[l]!.target);
+  }
+}
+
+/**
  * Build a {@link LODTree} from a provided module hierarchy (the priority-chain entry that precedes
  * structural coarsening). Geometry is left zeroed — fill it with {@link computeLODGeometry} once
  * positions exist.
@@ -83,12 +123,21 @@ export function buildModuleLODTree(
   return lodTreeFromTopology(buildModuleTopology(nodeCount, records, edges, links));
 }
 
-function buildModuleTopology(
-  nodeCount: number,
-  records: ArrayLike<ModuleNode>,
-  edges?: ModuleEdges,
-  links?: ArrayLike<ModuleLink>,
-): LODTopology {
+/** The module prefix tree the records spell (step 1 of {@link buildModuleTopology}). */
+interface ModulePrefixTree {
+  /** Internal module index → parent internal index (-1 for the root, index 0). */
+  moduleParent: number[];
+  /** Internal module index → its path entry within the parent (-1 for the root). */
+  moduleBranch: number[];
+  /** Internal module index → (branch id → child internal index). */
+  moduleChild: (Map<number, number> | null)[];
+  /** Node id → enclosing module's internal index. */
+  leafModule: Int32Array;
+  /** Node id → last path entry (its rank in its module). */
+  leafRank: Int32Array;
+}
+
+function modulePrefixTree(nodeCount: number, records: ArrayLike<ModuleNode>): ModulePrefixTree {
   // --- 1. Register every distinct module prefix (root + all ancestors) in first-seen order by
   // walking an integer-keyed prefix tree: each module lazily holds a child map keyed by the next
   // path component (branch id). A prefix corresponds one-to-one with a (parent, branch) chain, so
@@ -138,7 +187,16 @@ function buildModuleTopology(
   for (let i = 0; i < nodeCount; i++) {
     if (!seen[i]) throw new Error(`buildModuleLODTree: no record for node id ${i} (records must cover every node)`);
   }
+  return { moduleParent, moduleBranch, moduleChild, leafModule, leafRank };
+}
 
+function buildModuleTopology(
+  nodeCount: number,
+  records: ArrayLike<ModuleNode>,
+  edges?: ModuleEdges,
+  links?: ArrayLike<ModuleLink>,
+): LODTopology {
+  const { moduleParent, moduleBranch, moduleChild, leafModule, leafRank } = modulePrefixTree(nodeCount, records);
   const moduleCount = moduleParent.length;
 
   // --- 2. Module heights (leaves are height 0; a module is 1 + its deepest child's height). A child
@@ -237,6 +295,7 @@ function resolveLinkPaths(
   moduleId: Uint32Array,
   leafModule: Int32Array,
   leafRank: Int32Array,
+  who = "buildModuleLODTree",
 ): (path: ArrayLike<number>) => number {
   const leafByRank = new Map<number, Map<number, number>>(); // module internal index → rank → leaf id
   for (let id = 0; id < leafModule.length; id++) {
@@ -246,7 +305,7 @@ function resolveLinkPaths(
     ranks.set(leafRank[id]!, id);
   }
   return (path) => {
-    if (path.length < 1) throw new Error("buildModuleLODTree: module link endpoint has an empty path");
+    if (path.length < 1) throw new Error(`${who}: module link endpoint has an empty path`);
     let m = 0;
     for (let d = 0; d < path.length; d++) {
       const child = moduleChild[m]?.get(path[d]!);
@@ -256,7 +315,7 @@ function resolveLinkPaths(
       }
       const leaf = d === path.length - 1 ? leafByRank.get(m)?.get(path[d]!) : undefined;
       if (leaf === undefined) {
-        throw new Error(`buildModuleLODTree: module link endpoint ${Array.from(path).join(":")} is not in the module tree`);
+        throw new Error(`${who}: module link endpoint ${Array.from(path).join(":")} is not in the module tree`);
       }
       return leaf;
     }

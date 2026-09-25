@@ -1,6 +1,7 @@
 import { describe, it, expect } from "vitest";
 import {
   buildModuleLODTree,
+  checkModuleLinks,
   type ModuleLink,
   type ModuleNode,
 } from "../modules.js";
@@ -89,5 +90,11 @@ describe("buildModuleLODTree with module links (#199)", () => {
         { source: [1, 9], target: [2], flow: 1 },
       ]),
     ).toThrow(/1:9 is not in the module tree/);
+  });
+
+  it("checks endpoint paths on their own, without building the tree (what data() runs, #326)", () => {
+    expect(() => checkModuleLinks(5, records, links)).not.toThrow();
+    expect(() => checkModuleLinks(5, records, [{ source: [1, 9], target: [2], flow: 1 }])).toThrow(/module links: module link endpoint 1:9 is not in the module tree/);
+    expect(() => checkModuleLinks(5, records, [{ source: [1], target: [], flow: 1 }])).toThrow(/empty path/);
   });
 });

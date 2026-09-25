@@ -22,7 +22,7 @@ export interface ModularMapData {
   nodeFlow: Float32Array;
   enterExit: Float32Array;
   community: Int32Array;
-  /** Infomap-shape module records for `lod({ modules })`: a **ragged** hierarchy — see {@link raggedModulePrefix}. */
+  /** Infomap-shape module records for `data(graph, { modules })`: a **ragged** hierarchy — see {@link raggedModulePrefix}. */
   modulePaths: { id: number; path: number[] }[];
 }
 
