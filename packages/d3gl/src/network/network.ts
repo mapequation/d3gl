@@ -270,6 +270,8 @@ export interface NetworkLayoutOptions {
    * between them — for an `.ftree` exactly its `*Links` rows, #199). Every module stays a compact
    * region inside its parent, so the map opens on the top modules and expands in place; each depth is
    * final, so a streamed layout never oscillates. Works with LOD off or on any {@link NetworkLODOptions.source}.
+   * Once it lands, a LOD cut of the laid-out module tree treats each module as its disc (#329): drawn at
+   * the disc's centre, culled by it, and expanded once the disc's diameter on screen reaches `expandPx`.
    * Runs off-thread on `backend: "worker"` (streamed top-down, one frame per depth) and synchronously
    * on `"force"`; `"gpu"` uses the worker until a GPU path exists. Ignored without a hierarchy.
    *
@@ -360,7 +362,7 @@ export interface NetworkLODOptions {
   /**
    * Expand threshold (px): an aggregate whose on-screen footprint (`2·extent·k`) reaches this
    * expands into its children; below it it draws as a single glyph. Larger → coarser (fewer, bigger
-   * aggregates).
+   * aggregates). After a `layout({ nested })`, a module's extent is its disc's radius (#329).
    *
    * **Omit it** to get the tree-adaptive default (#191), which scales with how many children the
    * tree's finest aggregates hold: 48 px for structural coarsening / a spatial quadtree (unchanged),
@@ -395,9 +397,9 @@ export interface NetworkLODOptions {
    * Draw a thin **boundary ring** around every **expanded** module in view (#329) — the aggregates the
    * cut has opened into their members (in a {@link crossFade} band: those whose members it draws), so
    * the hierarchy stays readable as a map of nested modules while you zoom in. After a
-   * `layout({ nested })` of the tree being cut, the ring is that module's disc (it follows its members
-   * through a drag or a transition); otherwise it is centred on the module's members with their
-   * extent as its radius. `width` in the active sizeMode's units (constant px in `screen` mode, default
+   * `layout({ nested })` of the tree being cut, the ring is that module's disc — which is then also the
+   * module's LOD geometry, so it follows its members through a drag or a transition; otherwise it is
+   * centred on the module's members with their extent as its radius. `width` in the active sizeMode's units (constant px in `screen` mode, default
    * 1), `color` any CSS colour (default a dark neutral), `opacity` 0-1 (default 0.5). Rings fade with
    * the members they enclose under {@link crossFade}, and export with `toSVG()` / `toPNG()`. Omit to
    * disable.
@@ -412,8 +414,8 @@ export interface NetworkLODOptions {
    * Links derived from the graph's own edges are unchanged (their flow is drawn at the members), so
    * nothing is counted twice.
    *
-   * Per frame the cost is the modules in view the cut expands (it visits them anyway) plus, when
-   * anchoring, their own module links — never the whole tree.
+   * Per frame the cost is O(1) per module in view the cut expands (it visits them anyway; the walk is
+   * the same with rings on or off) plus, when anchoring, their own module links — never the whole tree.
    */
   moduleBoundary?: { width?: number; color?: string; opacity?: number };
    /**
@@ -706,8 +708,10 @@ export class Network extends BaseEngine {
   private readonly cutBoundaries: CutBoundaries = makeCutBoundaries();
   /**
    * The module discs of the nested layout that placed the current positions (#329), for the tree it laid
-   * out — the boundary rings' geometry while that tree is cut. Dropped by `data()` and by any other
-   * `layout()` (and a reheating drag), whose positions no longer come from the nested layout.
+   * out — that tree's module geometry while it is cut: every position pass places its modules on them
+   * ({@link lodDiscs}), so the cut culls and expands a module by its disc and rings it there. O(modules)
+   * (three floats each). Dropped by `data()` and by any other `layout()` (and a reheating drag), whose
+   * positions no longer come from the nested layout.
    */
   private nestedDiscs: { tree: LODTree; discs: BoundaryDiscs } | null = null;
   /** The fade alpha the last {@link computeFrontier} produced (the live `fadeScratch`), or null when cross-fade is off. */
@@ -1490,14 +1494,14 @@ export class Network extends BaseEngine {
         stream: !oneFrame,
         onResult: oneFrame ? (positions) => this.landNested(graph, positions, tween) : undefined,
         onBoundaries: (discs) => {
-          if (this.graph === graph) this.nestedDiscs = { tree, discs }; // the boundary rings' geometry (#329)
+          if (this.graph === graph) this.nestedDiscs = { tree, discs }; // the modules' geometry, and their rings' (#329)
         },
       });
       this.onLayoutSettled(tween ? this.transitionHandle(tween, solve) : solve);
     } else {
       const result = nestedLayout(topology, params);
       const positions = result.positions;
-      this.nestedDiscs = { tree, discs: nestedBoundaryDiscs(topology, result) }; // the boundary rings' geometry (#329)
+      this.nestedDiscs = { tree, discs: nestedBoundaryDiscs(topology, result) }; // the modules' geometry, and their rings' (#329)
       if (tween) {
         this.onLayoutSettled(this.transitionHandle(tween));
         tween.to(positions);
@@ -1821,13 +1825,14 @@ export class Network extends BaseEngine {
 
   /** Stop a running worker layout or position transition (no-op if none). The last computed — or
    *  eased — positions are kept. A nested layout's transition stopped mid-ease leaves the nodes between
-   *  two layouts, so its discs no longer hold: the module rings fall back to centroid + extent (#329). */
+   *  two layouts, so its discs no longer hold: the modules (and their rings) fall back to their members'
+   *  centroid + extent (#329). */
   stopLayout(): this {
     const interrupted = this.transition?.running === true && this.nestedDiscs !== null;
     this.haltLayout();
     if (interrupted) {
       this.nestedDiscs = null;
-      this.rebuild(); // the rings redraw around where the members stopped
+      this.settleLODPositions(); // the modules and rings redraw around where the members stopped
     }
     return this;
   }
@@ -2448,14 +2453,14 @@ export class Network extends BaseEngine {
       this.repaintDuringDrag(heldIds); // only the held set moved; streamed frames repaint in full (#211)
       return {
         move: (mx, my) => { setDelta(mx, my); applyHeld(); handle.pin(heldIds, heldPos); this.repaintDuringDrag(heldIds); },
-        end: () => { handle.unpin(); this.dragReapply = null; if (pending === this.transition) pending?.keep(heldIds); this.settleAfterDrag(); },
+        end: () => { handle.unpin(); this.dragReapply = null; if (pending === this.transition) pending?.keep(heldIds); this.settleLODPositions(); },
       };
     }
 
     // positions / no live worker: translate the held set under the cursor, no reheat.
     return {
       move: (mx, my) => { setDelta(mx, my); applyHeld(); this.repaintDuringDrag(heldIds); },
-      end: () => this.settleAfterDrag(),
+      end: () => this.settleLODPositions(),
     };
   }
 
@@ -2482,7 +2487,7 @@ export class Network extends BaseEngine {
    * - **Worker-streamed tree**: skipped entirely — the worker owns the geometry.
    * - **`held` given** (positions / worker / gpu drag moves — only the held leaves moved since the
    *   last pass): incremental {@link updateLODPositionsForLeaves} along the held leaves' ancestor
-   *   chains, O(held · depth). Extents widen conservatively; {@link settleAfterDrag} makes them
+   *   chains, O(held · depth). Extents widen conservatively; {@link settleLODPositions} makes them
    *   exact on release.
    * - **No `held`** (the `force` drag's rAF tick moved *every* free node): one full
    *   {@link computeLODPositions} pass — O(tree size), matching the tick's own O(nodes + edges).
@@ -2498,19 +2503,25 @@ export class Network extends BaseEngine {
       const tree = this.lodReady() ? this.lodTree : null;
       if (!tree) this.recomputeLODGeometry(); // no tree/geometry yet — build once (no-op when LOD is off)
       else if (held) updateLODPositionsForLeaves(tree, graph.positions, held, this.treeParent(tree));
-      else computeLODPositions(tree, graph.positions);
+      else computeLODPositions(tree, graph.positions, this.lodDiscs(tree));
     }
     this.rebuild();
   }
 
   /** One exact position-geometry pass when a drag releases (#211), replacing the drag's grow-only
    *  conservative extents with exact ones (a full {@link computeLODPositions} — O(tree size), once
-   *  per release, click-frequency). Skipped on a worker-streamed tree (the worker owns it — its
-   *  next frame is exact) and when LOD has no main-thread geometry. */
-  private settleAfterDrag(): void {
+   *  per release, click-frequency), and when a stopped transition drops the nested discs (#329).
+   *  Skipped on a worker-streamed tree (the worker owns it — its next frame is exact) and when LOD has
+   *  no main-thread geometry. */
+  private settleLODPositions(): void {
     if (this.drawsWorkerTree() || !this.lodReady() || !this.lodTree || !this.graph) return;
-    computeLODPositions(this.lodTree, this.graph.positions);
+    computeLODPositions(this.lodTree, this.graph.positions, this.lodDiscs(this.lodTree));
     this.rebuild();
+  }
+
+  /** The nested layout's discs when they laid out `tree` (#329): its position passes place the modules on them. */
+  private lodDiscs(tree: LODTree): BoundaryDiscs | undefined {
+    return this.nestedDiscs?.tree === tree ? this.nestedDiscs.discs : undefined;
   }
 
   /** Whether the LOD cut can run (enabled, tree built, geometry computed at least once). */
@@ -2537,11 +2548,11 @@ export class Network extends BaseEngine {
     } else {
       this.fadeAlpha = null;
     }
-    // Module boundaries (#329): the cut also collects the expanded modules in view, tested against the
-    // nested layout's discs when those laid out this tree.
+    // Module boundaries (#329): the cut also collects the expanded modules in view. After a nested layout
+    // their geometry is their discs already ({@link lodDiscs}); the rings are drawn at the discs' radii.
     const bnd = this.cutBoundaries;
     bnd.count = 0;
-    bnd.discs = this.nestedDiscs?.tree === tree ? this.nestedDiscs.discs : undefined;
+    bnd.radius = this.lodDiscs(tree)?.r;
     let frontier = cut(tree, this.transform, this.width, this.height, {
       expandPx: opts.expandPx,
       screenSized: style.sizeMode === "screen",
@@ -2768,7 +2779,7 @@ export class Network extends BaseEngine {
         this.lodModules = false;
       }
     }
-    computeLODGeometry(this.lodTree, this.graph, nodeRadii, leafWeight, leafBorder, leafColors, radiusAggregate);
+    computeLODGeometry(this.lodTree, this.graph, nodeRadii, leafWeight, leafBorder, leafColors, radiusAggregate, this.lodDiscs(this.lodTree));
     this.lodHasGeometry = true;
   }
 

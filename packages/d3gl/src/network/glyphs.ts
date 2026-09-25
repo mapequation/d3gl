@@ -632,8 +632,8 @@ export interface ModuleBoundaryResolved {
 
 /**
  * The **module-boundary rings** (#329): one ring per expanded module the cut collected
- * ({@link CutBoundaries}), on its boundary circle — the nested layout's disc (`boundaries.discs`) or the
- * centroid + `extent` — with the ring's outer edge on the circle. A world-sized ring batch (world radius,
+ * ({@link CutBoundaries}), on its boundary circle — the nested layout's disc (the tree's `cx`/`cy` with
+ * `boundaries.radius`) or the centroid + `extent` — with the ring's outer edge on the circle. A world-sized ring batch (world radius,
  * a `width`-thick border: constant px in `screen` sizeMode, so the fraction is re-derived at the zoom
  * `k`), faded by each module's children's cross-fade alpha. A ring whose circle wholly contains the view
  * is dropped (its stroke is off-screen). O(collected modules) — the expanded modules in view.
@@ -644,14 +644,14 @@ export function boundaryRings(
   style: ModuleBoundaryResolved,
   view: { minX: number; maxX: number; minY: number; maxY: number },
 ): FrontierHalosData {
-  const { ids: expanded, alpha, discs } = boundaries;
+  const { ids: expanded, alpha, radius } = boundaries;
   const n = boundaries.count;
   const w = style.screen ? style.width / (style.k || 1) : style.width; // ring thickness, world units
   const circle = new Float64Array(3);
   // Whether the ring's stroke (the annulus [r − w, r]) can reach the view: not when the view sits wholly
   // inside its inner circle (a module zoomed deep into). The cut already dropped circles missing the view.
   const shows = (g: number): boolean => {
-    boundaryCircle(tree, g, discs, circle);
+    boundaryCircle(tree, g, radius, circle);
     const r = circle[2]!;
     if (!(r > 0)) return false;
     const inner = r - w;
@@ -673,7 +673,7 @@ export function boundaryRings(
   for (let i = 0; i < n; i++) {
     const g = expanded[i]!;
     if (!shows(g)) continue;
-    boundaryCircle(tree, g, discs, circle);
+    boundaryCircle(tree, g, radius, circle);
     ids[k] = g;
     centers[k * 2] = circle[0]!;
     centers[k * 2 + 1] = circle[1]!;
@@ -712,7 +712,7 @@ export interface SuperEdgeStyleResolved {
   crossLevelEdges?: boolean;
   /**
    * **Anchor module links** at expanded modules' boundaries (#329): the cut's expanded modules in view
-   * ({@link CutBoundaries}, with the discs their rings are drawn on). A module link (#199) whose endpoint
+   * ({@link CutBoundaries}, with the radii their rings are drawn at). A module link (#199) whose endpoint
    * is one of them — not itself on the frontier, its centre on-screen — is drawn to/from that module's
    * boundary with its flow, since no finer pair carries it once the module expands. Needs
    * {@link crossLevelEdges} and a tree built with module links (`tree.moduleLinkOffset`); ignored
@@ -861,9 +861,9 @@ export function superEdges(
     const bOn = anchored(b);
     let ra = 0;
     let rb = 0;
-    if (aOn) { boundaryCircle(tree, a, anc?.discs, circle); ends[0] = circle[0]!; ends[1] = circle[1]!; ra = circle[2]!; }
+    if (aOn) { boundaryCircle(tree, a, anc?.radius, circle); ends[0] = circle[0]!; ends[1] = circle[1]!; ra = circle[2]!; }
     else { ends[0] = tree.cx[a]!; ends[1] = tree.cy[a]!; }
-    if (bOn) { boundaryCircle(tree, b, anc?.discs, circle); ends[2] = circle[0]!; ends[3] = circle[1]!; rb = circle[2]!; }
+    if (bOn) { boundaryCircle(tree, b, anc?.radius, circle); ends[2] = circle[0]!; ends[3] = circle[1]!; rb = circle[2]!; }
     else { ends[2] = tree.cx[b]!; ends[3] = tree.cy[b]!; }
     const dx = ends[2]! - ends[0]!;
     const dy = ends[3]! - ends[1]!;

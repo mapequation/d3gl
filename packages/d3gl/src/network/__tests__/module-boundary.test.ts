@@ -131,13 +131,15 @@ function cutsOf(tree: LODTree, g: number): number[][] {
   return out.concat(combos);
 }
 
-/** Lay the fixture out with the nested layout; the tree's geometry follows it, and its discs are returned. */
-function laidOut(fx: Fixture): { tree: LODTree; discs: BoundaryDiscs; byPath: Map<string, number> } {
+/** Lay the fixture out with the nested layout; the tree's geometry follows it — each module on its disc,
+ *  as the engine places it — and the discs and positions are returned. */
+function laidOut(fx: Fixture): { tree: LODTree; discs: BoundaryDiscs; positions: Float32Array; byPath: Map<string, number> } {
   const tree = buildModuleLODTree(fx.records.length, fx.records, fx.edges, fx.links);
   const topo = { ...tree, parent: tree.parent! };
   const result = nestedLayout(topo, { iterations: 60 });
-  computeLODPositions(tree, result.positions);
-  return { tree, discs: nestedBoundaryDiscs(topo, result), byPath: idsByPath(tree) };
+  const discs = nestedBoundaryDiscs(topo, result);
+  computeLODPositions(tree, result.positions, discs);
+  return { tree, discs, positions: result.positions, byPath: idsByPath(tree) };
 }
 
 /** A cut's expanded modules: every strict ancestor of a cut node, except the root (the whole network). */
@@ -149,7 +151,7 @@ function expandedOf(tree: LODTree, cutNodes: number[]): number[] {
 }
 
 function collector(ids: number[], discs?: BoundaryDiscs): CutBoundaries {
-  return { discs, ids: Uint32Array.from(ids), alpha: new Float32Array(ids.length).fill(1), count: ids.length };
+  return { radius: discs?.r, ids: Uint32Array.from(ids), alpha: new Float32Array(ids.length).fill(1), count: ids.length };
 }
 
 /** The drawn directed pairs (`"a:b"` → flow), failing on a pair drawn twice. */
@@ -200,8 +202,7 @@ function expectedPairs(tree: LODTree, discs: BoundaryDiscs, fx: Fixture, byPath:
   // A boundary end's circle, and whether an anchored pair's two ends are clear of each other.
   const circle = (x: number, onBoundary: boolean): [number, number, number] => {
     if (!onBoundary) return [tree.cx[x]!, tree.cy[x]!, 0];
-    const o = x - tree.leafCount;
-    return [tree.cx[x]! + discs.dx[o]!, tree.cy[x]! + discs.dy[o]!, discs.r[o]!];
+    return [tree.cx[x]!, tree.cy[x]!, discs.r[x - tree.leafCount]!];
   };
   for (const [u, v, w, isLink] of all) {
     if (u === v || nested(u, v)) continue;
@@ -270,8 +271,8 @@ describe("module links anchored at expanded modules' boundaries (#329)", () => {
     const tree = buildModuleLODTree(fx.records.length, fx.records, fx.edges); // graph edges only
     const topo = { ...tree, parent: tree.parent! };
     const result = nestedLayout(topo, { iterations: 40 });
-    computeLODPositions(tree, result.positions);
     const discs = nestedBoundaryDiscs(topo, result);
+    computeLODPositions(tree, result.positions, discs);
     expect(tree.moduleLinkOffset).toBeUndefined();
     for (const cutNodes of cutsOf(tree, tree.size - 1)) {
       const frontier = Uint32Array.from(cutNodes);
@@ -378,10 +379,9 @@ describe("module links anchored at expanded modules' boundaries (#329)", () => {
   it("puts a boundary end on the module's circle, at radius 0 (lines, arrowheads and half-arrows)", () => {
     const { tree, discs } = small;
     const m1 = id("1");
-    const o = m1 - tree.leafCount;
-    const cx = tree.cx[m1]! + discs.dx[o]!;
-    const cy = tree.cy[m1]! + discs.dy[o]!;
-    const R = discs.r[o]!;
+    const cx = tree.cx[m1]!; // on its disc: the disc centre
+    const cy = tree.cy[m1]!;
+    const R = discs.r[m1 - tree.leafCount]!;
     const frontier = Uint32Array.from([id("1:1"), id("1:2"), id("2")]);
     const anchor = collector([m1], discs);
     tree.radius.fill(2); // glyph radii, so a boundary end's 0 is told apart from a glyph end's
@@ -391,7 +391,7 @@ describe("module links anchored at expanded modules' boundaries (#329)", () => {
     const sx = lines.lines!.sources[e * 2]!;
     const sy = lines.lines!.sources[e * 2 + 1]!;
     expect(Math.hypot(sx - cx, sy - cy)).toBeCloseTo(R, 3);
-    // The other end stays at module 2's centroid; the arrowhead's tip sits there at 2's glyph radius.
+    // The other end stays at module 2's centre; the arrowhead's tip sits there at 2's glyph radius.
     expect(lines.lines!.targets[e * 2]).toBeCloseTo(tree.cx[id("2")]!, 3);
     const back = lines.ids.indexOf(id("2") * tree.size + m1);
     expect(Math.hypot(lines.lines!.targets[back * 2]! - cx, lines.lines!.targets[back * 2 + 1]! - cy)).toBeCloseTo(R, 3);
@@ -460,12 +460,40 @@ describe("nestedBoundaryDiscs (#329)", () => {
       expect(discs.r[o]).toBe(result.r[g]);
     }
   });
+
+  it("places each module on its disc through computeLODPositions: centre and radius, grown only to hold a member", () => {
+    const fx = ftreeFixture(5, 16, 4);
+    const tree = buildModuleLODTree(fx.records.length, fx.records, fx.edges, fx.links);
+    const topo = { ...tree, parent: tree.parent! };
+    const result = nestedLayout(topo);
+    const discs = nestedBoundaryDiscs(topo, result);
+    const positions = result.positions.slice();
+    computeLODPositions(tree, positions, discs);
+    for (let g = tree.leafCount; g < tree.size; g++) {
+      expect(tree.cx[g]).toBeCloseTo(result.cx[g]!, 2);
+      expect(tree.cy[g]).toBeCloseTo(result.cy[g]!, 2);
+      expect(tree.extent[g]).toBeCloseTo(result.r[g]!, 2); // every member inside: the disc's radius
+    }
+    // A leaf moved far out of its module (a drag, a transition): the disc follows its centroid, and the
+    // extent grows to bound it, so the cut still culls the module by a box that holds every member.
+    const leaf = 0;
+    const m = tree.parent![leaf]!;
+    const before = [tree.cx[m]!, tree.cy[m]!];
+    positions[0] = positions[0]! + 1000;
+    computeLODPositions(tree, positions, discs);
+    expect(tree.cx[m]).toBeCloseTo(before[0]! + 1000 / tree.count[m]!, 2);
+    expect(tree.cy[m]).toBeCloseTo(before[1]!, 2);
+    for (let a = m; a >= 0; a = tree.parent![a]!) {
+      expect(Math.hypot(positions[0]! - tree.cx[a]!, positions[1]! - tree.cy[a]!)).toBeLessThanOrEqual(tree.extent[a]! + 1e-3);
+    }
+  });
 });
 
 // ---- The cut's boundary collection -----------------------------------------------------------------
 
-/** 3 top modules × 3 sub-modules × 12 leaves, laid out nested; sub-module 1:1 holds a sub-sub-module. */
-function mapFixture(): { tree: LODTree; discs: BoundaryDiscs; byPath: Map<string, number> } {
+/** 3 top modules × 3 sub-modules × 12 leaves, laid out nested; sub-module 1:1 holds a sub-sub-module.
+ *  `centroid` is the same map with the members' centroid + extent geometry (no discs). */
+function mapFixture(): { tree: LODTree; centroid: LODTree; discs: BoundaryDiscs; byPath: Map<string, number> } {
   const records: ModuleNode[] = [];
   for (let a = 1; a <= 3; a++) for (let b = 1; b <= 3; b++) for (let c = 1; c <= 12; c++) records.push({ id: records.length, path: a === 1 && b === 1 && c <= 4 ? [a, b, 13, c] : [a, b, c] });
   const source: number[] = [];
@@ -474,11 +502,16 @@ function mapFixture(): { tree: LODTree; discs: BoundaryDiscs; byPath: Map<string
     source.push(i - 1);
     target.push(i);
   }
-  return laidOut({ label: "map", records, edges: { source, target, weight: source.map(() => 1) }, links: [] });
+  const edges = { source, target, weight: source.map(() => 1) };
+  const map = laidOut({ label: "map", records, edges, links: [] });
+  const centroid = buildModuleLODTree(records.length, records, edges);
+  computeLODPositions(centroid, map.positions);
+  return { ...map, centroid };
 }
 
-/** The cut, written out recursively — the oracle for what it expands (no fade). */
-function referenceCollected(tree: LODTree, discs: BoundaryDiscs | undefined, t: LODTransform, expandPx: number): number[] {
+/** The cut, written out recursively — the oracle for what it expands (no fade): every module it opens
+ *  whose circle (centre + extent) meets the view. */
+function referenceCollected(tree: LODTree, t: LODTransform, expandPx: number): number[] {
   const v = visibleWorldRect(t, W, H);
   const out: number[] = [];
   const boxMeets = (g: number): boolean => {
@@ -486,28 +519,24 @@ function referenceCollected(tree: LODTree, discs: BoundaryDiscs | undefined, t: 
     return !(tree.cx[g]! + m < v.minX || tree.cx[g]! - m > v.maxX || tree.cy[g]! + m < v.minY || tree.cy[g]! - m > v.maxY);
   };
   const circleMeets = (g: number): boolean => {
-    const o = g - tree.leafCount;
-    const x = tree.cx[g]! + (discs ? discs.dx[o]! : 0);
-    const y = tree.cy[g]! + (discs ? discs.dy[o]! : 0);
-    const r = discs ? discs.r[o]! : tree.extent[g]!;
+    const x = tree.cx[g]!;
+    const y = tree.cy[g]!;
     const qx = Math.min(Math.max(x, v.minX), v.maxX);
     const qy = Math.min(Math.max(y, v.minY), v.maxY);
-    return Math.hypot(x - qx, y - qy) <= r;
+    return Math.hypot(x - qx, y - qy) <= tree.extent[g]!;
   };
-  const visit = (g: number, ringOnly: boolean): void => {
-    if (g < tree.leafCount) return;
-    if (ringOnly ? !circleMeets(g) : !boxMeets(g) && !circleMeets(g)) return;
-    const only = ringOnly || !boxMeets(g);
+  const visit = (g: number): void => {
+    if (g < tree.leafCount || !boxMeets(g)) return;
     if (2 * tree.extent[g]! * t.k < expandPx) return;
     if (tree.parent![g]! >= 0 && circleMeets(g)) out.push(g);
-    for (let c = tree.childOffset[g]!; c < tree.childOffset[g + 1]!; c++) visit(tree.children[c]!, only);
+    for (let c = tree.childOffset[g]!; c < tree.childOffset[g + 1]!; c++) visit(tree.children[c]!);
   };
-  visit(tree.size - 1, false);
+  visit(tree.size - 1);
   return out.sort((a, b) => a - b);
 }
 
 describe("cut collects the expanded modules in view (#329)", () => {
-  const { tree, discs, byPath } = mapFixture();
+  const { tree, centroid, discs, byPath } = mapFixture();
   const expandPx = 120;
   // A sweep: framed, zoomed in on several spots (centres, module edges, the map's rim), and panned off.
   const views: LODTransform[] = [];
@@ -522,15 +551,14 @@ describe("cut collects the expanded modules in view (#329)", () => {
 
   it("leaves the frontier unchanged, and collects exactly what the cut expands", () => {
     let collected = 0;
-    for (const d of [discs, undefined]) {
+    for (const tr of [tree, centroid]) { // modules on their discs, and on their members' centroid + extent
       for (const t of views) {
         const bnd = makeCutBoundaries();
-        bnd.discs = d;
-        const plain = Array.from(cut(tree, t, W, H, { expandPx }));
-        const withRings = Array.from(cut(tree, t, W, H, { expandPx, boundaries: bnd }));
+        const plain = Array.from(cut(tr, t, W, H, { expandPx }));
+        const withRings = Array.from(cut(tr, t, W, H, { expandPx, boundaries: bnd }));
         expect(withRings).toEqual(plain);
         const got = Array.from(bnd.ids.subarray(0, bnd.count)).sort((a, b) => a - b);
-        expect(got).toEqual(referenceCollected(tree, d, t, expandPx));
+        expect(got).toEqual(referenceCollected(tr, t, expandPx));
         expect(Array.from(bnd.alpha.subarray(0, bnd.count)).every((a) => a === 1)).toBe(true);
         collected += bnd.count;
       }
@@ -541,7 +569,6 @@ describe("cut collects the expanded modules in view (#329)", () => {
   it("never collects the root, nor a module that is drawn collapsed", () => {
     const t: LODTransform = { k: 6, x: W / 2 - tree.cx[tree.size - 1]! * 6, y: H / 2 - tree.cy[tree.size - 1]! * 6 };
     const bnd = makeCutBoundaries();
-    bnd.discs = discs;
     const frontier = new Set(cut(tree, t, W, H, { expandPx, boundaries: bnd }));
     const got = Array.from(bnd.ids.subarray(0, bnd.count));
     expect(got.length).toBeGreaterThan(0);
@@ -549,45 +576,53 @@ describe("cut collects the expanded modules in view (#329)", () => {
     for (const g of got) expect(frontier.has(g)).toBe(false);
   });
 
-  it("follows a module ring-only when its members' box has left the view but its disc still crosses it", () => {
-    // Discs padded well past the members (as a sparse nested disc would be): module 1's rim — and its
-    // sub-modules' — lies far outside the members' cull boxes, and the root's disc still holds that rim.
+  it("reaches a module's rim past its members by the ordinary walk: the disc is the module's geometry", () => {
+    // On its disc, module 1's rim is part of the module to the cut: visited, opened and ringed there like
+    // anywhere else in it. On its members' centroid + extent the same spot is outside its cull box.
     const m = byPath.get("1")!;
     const root = tree.size - 1;
-    const kids = [1, 2, 3].map((b) => byPath.get(`1:${b}`)!);
-    const o = m - tree.leafCount;
-    const padded: BoundaryDiscs = { dx: discs.dx.slice(), dy: discs.dy.slice(), r: discs.r.slice() };
-    padded.r[o] = 3 * (tree.extent[m]! + Math.hypot(discs.dx[o]!, discs.dy[o]!));
+    const r = tree.extent[m]!;
+    expect(r).toBeCloseTo(discs.r[m - tree.leafCount]!, 3);
     const k = 400; // a 2 × 1.5 world-unit view
-    const qx = tree.cx[m]! + discs.dx[o]! + padded.r[o]! - 0.25; // just inside the rim, along +x
-    const qy = tree.cy[m]! + discs.dy[o]!;
-    const reach = (g: number): number => Math.hypot(qx - tree.cx[g]! - discs.dx[g - tree.leafCount]!, qy - tree.cy[g]! - discs.dy[g - tree.leafCount]!) + 10;
-    for (const g of [root, ...kids]) padded.r[g - tree.leafCount] = reach(g);
-    // Module 1 expands; its sub-modules (smaller) would draw collapsed — ring-only, they must not.
-    const kidExt = Math.max(...kids.map((g) => tree.extent[g]!));
-    expect(tree.extent[m]!).toBeGreaterThan(kidExt);
-    const px = k * (tree.extent[m]! + kidExt);
-    const t: LODTransform = { k, x: W / 2 - qx * k, y: H / 2 - qy * k };
-    const bnd = makeCutBoundaries();
-    bnd.discs = padded;
-    const frontier = Array.from(cut(tree, t, W, H, { expandPx: px, boundaries: bnd }));
-    expect(frontier).toEqual(Array.from(cut(tree, t, W, H, { expandPx: px })));
-    expect(frontier).toEqual([]); // nothing drawn out there — only rings cross the view
-    expect(Array.from(bnd.ids.subarray(0, bnd.count))).toEqual([m]);
-    expect(referenceCollected(tree, padded, t, px)).toEqual([m]);
+    const box = (tr: LODTree, g: number, v: ReturnType<typeof visibleWorldRect>): boolean => {
+      const e = tr.extent[g]!;
+      return !(tr.cx[g]! + e < v.minX || tr.cx[g]! - e > v.maxX || tr.cy[g]! + e < v.minY || tr.cy[g]! - e > v.maxY);
+    };
+    // A spot just inside the rim whose view misses every other node's box (and module 1's centroid box).
+    let t: LODTransform | null = null;
+    for (let deg = 0; deg < 360 && !t; deg++) {
+      const a = (deg * Math.PI) / 180;
+      const qx = tree.cx[m]! + (r - 0.25) * Math.cos(a);
+      const qy = tree.cy[m]! + (r - 0.25) * Math.sin(a);
+      const at: LODTransform = { k, x: W / 2 - qx * k, y: H / 2 - qy * k };
+      const v = visibleWorldRect(at, W, H);
+      let clear = !box(centroid, m, v);
+      for (let g = 0; g < tree.size && clear; g++) if (g !== m && g !== root && box(tree, g, v)) clear = false;
+      if (clear) t = at;
+    }
+    expect(t, "a rim spot clear of every member").not.toBeNull();
+    const px = 2 * r * k * 0.99; // module 1 (and the root) open
+    for (const [tr, rings] of [[tree, [m]], [centroid, []]] as const) {
+      const bnd = makeCutBoundaries();
+      const frontier = Array.from(cut(tr, t!, W, H, { expandPx: px, boundaries: bnd }));
+      expect(frontier).toEqual(Array.from(cut(tr, t!, W, H, { expandPx: px })));
+      expect(frontier).toEqual([]); // nothing drawn out there
+      expect(Array.from(bnd.ids.subarray(0, bnd.count))).toEqual(rings);
+      expect(referenceCollected(tr, t!, px)).toEqual(rings);
+    }
   });
 
   it("does not collect an expanded module whose boundary misses the view (a corner of its cull box)", () => {
     const m = byPath.get("2")!;
     const k = 400;
-    // Inside module 2's cull box (centroid ± extent), outside its extent circle: the fallback boundary.
+    // Inside module 2's cull box (centre ± extent), outside its circle.
     const qx = tree.cx[m]! + 0.9 * tree.extent[m]!;
     const qy = tree.cy[m]! + 0.9 * tree.extent[m]!;
     const t: LODTransform = { k, x: W / 2 - qx * k, y: H / 2 - qy * k };
     const bnd = makeCutBoundaries();
     cut(tree, t, W, H, { expandPx, boundaries: bnd });
     expect(Array.from(bnd.ids.subarray(0, bnd.count))).not.toContain(m);
-    expect(referenceCollected(tree, undefined, t, expandPx)).not.toContain(m);
+    expect(referenceCollected(tree, t, expandPx)).not.toContain(m);
   });
 
   it("collects a cross-fading module with its children's alpha, and writes that alpha for it", () => {
@@ -595,7 +630,6 @@ describe("cut collects the expanded modules in view (#329)", () => {
     let banded = 0;
     for (const t of views) {
       const bnd = makeCutBoundaries();
-      bnd.discs = discs;
       const frontier = new Set(cut(tree, t, W, H, { expandPx, fadeBand: 0.3, fadeAlpha, boundaries: bnd }));
       for (let i = 0; i < bnd.count; i++) {
         const g = bnd.ids[i]!;
@@ -611,17 +645,16 @@ describe("cut collects the expanded modules in view (#329)", () => {
 });
 
 describe("boundaryRings (#329)", () => {
-  const { tree, discs, byPath } = mapFixture();
+  const { tree, centroid, discs, byPath } = mapFixture();
   const m1 = byPath.get("1")!;
   const m2 = byPath.get("2")!;
 
   it("rings each collected module on its disc, the outer edge on the boundary, width in px at the zoom", () => {
-    const bnd: CutBoundaries = { discs, ids: Uint32Array.from([m1, m2]), alpha: Float32Array.from([1, 0.5]), count: 2 };
+    const bnd: CutBoundaries = { radius: discs.r, ids: Uint32Array.from([m1, m2]), alpha: Float32Array.from([1, 0.5]), count: 2 };
     const rings = boundaryRings(tree, bnd, { width: 2, color: "rgba(10, 20, 30, 0.8)", opacity: 0.5, screen: true, k: 4 }, ALL);
     expect(rings.count).toBe(2);
-    const o = m1 - tree.leafCount;
-    expect(rings.centers[0]).toBeCloseTo(tree.cx[m1]! + discs.dx[o]!, 4);
-    expect(rings.radii[0]).toBe(discs.r[o]);
+    expect(rings.centers[0]).toBe(tree.cx[m1]); // on its disc: the disc centre
+    expect(rings.radii[0]).toBe(discs.r[m1 - tree.leafCount]);
     expect(rings.radii[0]! * rings.borders[0]!).toBeCloseTo(2 / 4, 5); // 2 px at k = 4, in world units
     expect(Array.from(rings.borderColors.subarray(0, 4))).toEqual([10, 20, 30, Math.round(255 * 0.8 * 0.5)]);
     expect(rings.borderColors[7]).toBe(Math.round(255 * 0.8 * 0.5 * 0.5)); // faded with its children
@@ -632,10 +665,10 @@ describe("boundaryRings (#329)", () => {
 
   it("falls back to the centroid and extent without discs, and drops a ring that encloses the whole view", () => {
     const bnd: CutBoundaries = { ids: Uint32Array.from([m1]), alpha: Float32Array.from([1]), count: 1 };
-    const rings = boundaryRings(tree, bnd, { width: 1, color: "#000", opacity: 1, screen: false, k: 1 }, ALL);
-    expect(rings.centers[0]).toBe(tree.cx[m1]);
-    expect(rings.radii[0]).toBe(tree.extent[m1]);
-    const tiny = { minX: tree.cx[m1]! - 0.1, maxX: tree.cx[m1]! + 0.1, minY: tree.cy[m1]! - 0.1, maxY: tree.cy[m1]! + 0.1 };
-    expect(boundaryRings(tree, bnd, { width: 1, color: "#000", opacity: 1, screen: false, k: 1 }, tiny).count).toBe(0);
+    const rings = boundaryRings(centroid, bnd, { width: 1, color: "#000", opacity: 1, screen: false, k: 1 }, ALL);
+    expect(rings.centers[0]).toBe(centroid.cx[m1]);
+    expect(rings.radii[0]).toBe(centroid.extent[m1]);
+    const tiny = { minX: centroid.cx[m1]! - 0.1, maxX: centroid.cx[m1]! + 0.1, minY: centroid.cy[m1]! - 0.1, maxY: centroid.cy[m1]! + 0.1 };
+    expect(boundaryRings(centroid, bnd, { width: 1, color: "#000", opacity: 1, screen: false, k: 1 }, tiny).count).toBe(0);
   });
 });

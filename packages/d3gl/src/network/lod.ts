@@ -36,12 +36,7 @@ export interface LODTopology {
   levelCount: number;
   /** Global-id start of each level; length `levelCount + 1`. Level `k` is `[levelOffset[k], levelOffset[k+1])`. */
   levelOffset: Uint32Array;
-  /**
-   * Children CSR: node `g`'s children are `children[childOffset[g] .. childOffset[g+1]]` (one level finer).
-   * Within a row, **leaf children (ids `< leafCount`) come before aggregate children**: every builder
-   * scatters children in ascending id order (module trees) or gives a node children of one kind only
-   * (coarsening levels, quadtree cells). The cut's ring-only walk relies on it (#329).
-   */
+  /** Children CSR: node `g`'s children are `children[childOffset[g] .. childOffset[g+1]]` (one level finer). */
   childOffset: Uint32Array;
   children: Uint32Array;
   /**
@@ -114,11 +109,12 @@ export interface LODTopology {
 }
 
 /**
- * Where each module's **boundary ring** is drawn (#329), per aggregate (index `g − leafCount`): the
- * ring's centre as an offset (`dx`, `dy`) from the module's leaf centroid (the tree's `cx`/`cy`), and
- * its radius `r`, in world units. The nested layout's discs give these (`nestedBoundaryDiscs`);
- * keeping the centre relative to the centroid lets a ring follow its members through a drag or a
- * position transition. Without them a ring is drawn at the centroid with radius `extent`.
+ * Each module's **disc** from a nested layout (#329), per aggregate (index `g − leafCount`): its centre
+ * as an offset (`dx`, `dy`) from the module's leaf centroid, and its radius `r`, in world units
+ * (`nestedBoundaryDiscs` gives these). Passed to {@link computeLODPositions}, they become the module's
+ * LOD geometry — `cx`/`cy` the disc centre, `extent` the disc radius — so the cut culls and expands a
+ * module by its disc, and its boundary ring is drawn on it. Keeping the centre relative to the centroid
+ * lets the disc follow its members through a drag or a position transition.
  */
 export interface BoundaryDiscs {
   dx: Float32Array;
@@ -127,14 +123,17 @@ export interface BoundaryDiscs {
 }
 
 /**
- * The **expanded** aggregates a {@link cut} collects for the module-boundary rings (#329), and the
- * discs it tests them with. Pass one as {@link CutOptions.boundaries}; each cut overwrites `ids` /
- * `alpha` / `count` (the arrays grow on demand and are reused — keep one per engine, from
- * {@link makeCutBoundaries}).
+ * The **expanded** aggregates a {@link cut} collects for the module-boundary rings (#329). Pass one as
+ * {@link CutOptions.boundaries}; each cut overwrites `ids` / `alpha` / `count` (the arrays grow on demand
+ * and are reused — keep one per engine, from {@link makeCutBoundaries}).
  */
 export interface CutBoundaries {
-  /** Boundary discs to test against the view; absent ⇒ each module's centroid + `extent`. */
-  discs?: BoundaryDiscs;
+  /**
+   * The ring radius per aggregate (index `g − leafCount`) for the ring drawers — a nested layout's disc
+   * radii ({@link BoundaryDiscs.r}), for a tree whose geometry they placed. Absent ⇒ `extent`. The cut
+   * never reads it: it tests the tree's `cx`/`cy`/`extent`.
+   */
+  radius?: Float32Array;
   /** Output: the expanded aggregates whose boundary meets the view — only `ids[0 .. count)` is valid. */
   ids: Uint32Array;
   /** Output, parallel to `ids`: the alpha each one's children are drawn at (1 without a cross-fade). */
@@ -149,21 +148,14 @@ export function makeCutBoundaries(): CutBoundaries {
 }
 
 /**
- * A module's boundary circle (#329) — the disc its ring is drawn on: `discs` when given (the nested
- * layout's, relative to the centroid), else the centroid + `extent`. Written into `out` as
- * `[x, y, r]` (world units); O(1).
+ * A module's boundary circle (#329) — the circle its ring is drawn on: centred on the module (`cx`/`cy`,
+ * the disc centre when a nested layout placed it), with radius `radius` when given (the disc's, see
+ * {@link CutBoundaries.radius}), else `extent`. Written into `out` as `[x, y, r]` (world units); O(1).
  */
-export function boundaryCircle(tree: LODTree, g: number, discs: BoundaryDiscs | undefined, out: Float64Array): void {
-  if (discs) {
-    const o = g - tree.leafCount;
-    out[0] = tree.cx[g]! + discs.dx[o]!;
-    out[1] = tree.cy[g]! + discs.dy[o]!;
-    out[2] = discs.r[o]!;
-  } else {
-    out[0] = tree.cx[g]!;
-    out[1] = tree.cy[g]!;
-    out[2] = tree.extent[g]!;
-  }
+export function boundaryCircle(tree: LODTree, g: number, radius: Float32Array | undefined, out: Float64Array): void {
+  out[0] = tree.cx[g]!;
+  out[1] = tree.cy[g]!;
+  out[2] = radius ? radius[g - tree.leafCount]! : tree.extent[g]!;
 }
 
 /**
@@ -891,11 +883,16 @@ export function lodTreeFromTopology(
  * (= the mean of its descendant leaf positions), the summed leaf `count`, and a bounding `extent`
  * enclosing all descendant leaves. One bottom-up pass — O(tree size) ≈ O(n).
  *
+ * With a nested layout's `discs` (#329), each module is placed on its disc instead: `cx`/`cy` is the
+ * disc centre (its leaf centroid + the disc's offset) and `extent` the disc radius — grown only if a
+ * member lies outside the disc (mid-transition, or dragged out), so it still bounds every descendant.
+ * The same pass, O(1) more per child.
+ *
  * This is the *only* geometry that changes as the layout converges, so it is the per-frame pass: the
  * layout worker runs it each streamed frame and writes `cx`/`cy`/`extent` into the shared buffer the
  * main thread renders from (#103 worker-LOD). Style-derived geometry is {@link computeLODStyle}.
  */
-export function computeLODPositions(tree: LODTree, positions: ArrayLike<number>): void {
+export function computeLODPositions(tree: LODTree, positions: ArrayLike<number>, discs?: BoundaryDiscs): void {
   const { leafCount, levelCount, levelOffset, childOffset, children, cx, cy, extent, count } = tree;
 
   for (let i = 0; i < leafCount; i++) {
@@ -915,17 +912,31 @@ export function computeLODPositions(tree: LODTree, positions: ArrayLike<number>)
       for (let p = c0; p < c1; p++) {
         const c = children[p]!;
         const cc = count[c]!;
+        let x = cx[c]!;
+        let y = cy[c]!;
+        if (discs && c >= leafCount) {
+          // A child module sits on its disc centre: take its disc offset back off for its leaf centroid.
+          x -= discs.dx[c - leafCount]!;
+          y -= discs.dy[c - leafCount]!;
+        }
         sumC += cc;
-        sx += cc * cx[c]!;
-        sy += cc * cy[c]!;
+        sx += cc * x;
+        sy += cc * y;
       }
-      const gx = sumC > 0 ? sx / sumC : 0;
-      const gy = sumC > 0 ? sy / sumC : 0;
+      let gx = sumC > 0 ? sx / sumC : 0;
+      let gy = sumC > 0 ? sy / sumC : 0;
+      // Bounding radius: the farthest child's centre distance plus that child's own extent — at least
+      // the disc's radius when the module is on its disc.
+      let ext = 0;
+      if (discs) {
+        const o = g - leafCount;
+        gx += discs.dx[o]!;
+        gy += discs.dy[o]!;
+        ext = discs.r[o]!;
+      }
       cx[g] = gx;
       cy[g] = gy;
       count[g] = sumC;
-      // Bounding radius: the farthest child's centre distance plus that child's own extent.
-      let ext = 0;
       for (let p = c0; p < c1; p++) {
         const c = children[p]!;
         const dx = gx - cx[c]!;
@@ -1048,7 +1059,8 @@ export function computeLODStyle(
  *
  * `leafRadii` is the resolved per-node radius (so aggregates respect the node sizing); `leafWeight`
  * is the per-leaf importance, defaulting to `graph.strength` (weighted degree) — pass `graph.flow`
- * or `graph.csr.degree` to prioritise differently.
+ * or `graph.csr.degree` to prioritise differently. `discs` places each module on its nested-layout
+ * disc (#329, see {@link computeLODPositions}).
  */
 export function computeLODGeometry(
   tree: LODTree,
@@ -1058,8 +1070,9 @@ export function computeLODGeometry(
   leafBorder?: ArrayLike<number>,
   leafColors?: ArrayLike<number>,
   radiusAggregate?: RadiusAggregate,
+  discs?: BoundaryDiscs,
 ): void {
-  computeLODPositions(tree, graph.positions);
+  computeLODPositions(tree, graph.positions, discs);
   computeLODStyle(tree, leafRadii, leafWeight, leafBorder, leafColors, radiusAggregate);
 }
 
@@ -1151,13 +1164,12 @@ export interface CutOptions {
    */
   fadeAlpha?: Float32Array;
   /**
-   * Collect the **expanded** aggregates whose boundary circle meets the view (#329) — the modules the
-   * engine rings with `lod({ moduleBoundary })`. Each one the walk expands (in the fade band: one whose
-   * children it draws) is recorded with its children's alpha, at O(1) per expanded node the walk visits
-   * anyway. A module whose cull box has left the view while its boundary still crosses it is followed
-   * **ring-only**: recorded, never emitted, so the returned frontier is identical with or without this.
-   * A tree's single root (a module tree's: the whole network) is never collected. Absent ⇒ the walk is
-   * unchanged.
+   * Collect the **expanded** aggregates whose boundary circle (`cx`/`cy` + `extent`: the disc, after a
+   * nested layout — see {@link BoundaryDiscs}) meets the view (#329) — the modules the engine rings with
+   * `lod({ moduleBoundary })`. Each one the walk expands (in the fade band: one whose children it draws)
+   * is recorded with its children's alpha, at O(1) per expanded node the walk visits anyway; the walk
+   * itself and the returned frontier are unchanged. A tree's single root (a module tree's: the whole
+   * network) is never collected.
    */
   boundaries?: CutBoundaries;
 }
@@ -1227,9 +1239,6 @@ export interface CutScratch {
 export function makeCutScratch(): CutScratch {
   return { frontier: new Uint32Array(256), stack: new Uint32Array(256), alpha: new Float64Array(256) };
 }
-
-/** Stack-entry flag for {@link cut}'s ring-only walk (#329): tree ids stay far below 2³¹. */
-const RING_ONLY = 0x80000000;
 
 /**
  * Adaptive hierarchy cut: walk the tree top-down for the given view and return the **frontier** —
@@ -1308,25 +1317,16 @@ export function cut(
     if (fade && alphaOut) alphaOut[g] = a;
   };
 
-  // Module boundaries (#329): record each expanded aggregate whose boundary circle meets the view. A stack
-  // entry with the RING_ONLY bit set is below a module whose cull box missed the view but whose boundary
-  // did not: it is walked for rings only and never emitted (so the frontier is unchanged by collecting).
+  // Module boundaries (#329): record each expanded aggregate whose boundary circle meets the view.
   const bnd = opts.boundaries;
-  const discs = bnd?.discs;
   // A tree with a single root (every module tree: the whole network) gets no ring for it — it is no module.
   const soleRoot = levelOffset[levelCount]! - levelOffset[levelCount - 1]! === 1 ? levelOffset[levelCount - 1]! : -1;
   let nb = 0;
-  // Whether aggregate g's boundary circle (the one {@link boundaryCircle} gives) meets the view rect.
+  // Whether aggregate g's circle (centre + extent) meets the view rect — tighter than the cull box.
   const meets = (g: number): boolean => {
-    let x = cx[g]!;
-    let y = cy[g]!;
-    let r = extent[g]!;
-    if (discs) {
-      const o = g - leafCount;
-      x += discs.dx[o]!;
-      y += discs.dy[o]!;
-      r = discs.r[o]!;
-    }
+    const x = cx[g]!;
+    const y = cy[g]!;
+    const r = extent[g]!;
     const qx = x < minX ? minX : x > maxX ? maxX : x;
     const qy = y < minY ? minY : y > maxY ? maxY : y;
     return (x - qx) * (x - qx) + (y - qy) * (y - qy) <= r * r;
@@ -1344,27 +1344,15 @@ export function cut(
 
   while (sp > 0) {
     sp--;
-    let g = sc.stack[sp]!;
-    let ringOnly = false;
-    if (bnd && g >= RING_ONLY) {
-      g -= RING_ONLY;
-      ringOnly = true;
-    }
+    const g = sc.stack[sp]!;
     const a = fade ? sc.alpha[sp]! : 1;
     const ext = extent[g]!;
     const gx = cx[g]!;
     const gy = cy[g]!;
-    if (ringOnly) {
-      if (g < leafCount || !meets(g)) continue;
-    } else {
-      // Cull only when the node's drawn body (bbox grown by its draw radius) misses the viewport, so a
-      // glyph stays until its whole body is off-screen — unless its boundary ring still crosses the view.
-      const m = ext + drawMargin(g);
-      if (gx + m < minX || gx - m > maxX || gy + m < minY || gy - m > maxY) {
-        if (!bnd || g < leafCount || !meets(g)) continue;
-        ringOnly = true;
-      }
-    }
+    // Cull only when the node's drawn body (bbox grown by its draw radius) misses the viewport, so a
+    // glyph stays until its whole body is off-screen.
+    const m = ext + drawMargin(g);
+    if (gx + m < minX || gx - m > maxX || gy + m < minY || gy - m > maxY) continue;
     if (g < leafCount) {
       emit(g, a); // a real leaf — nothing finer to expand into
       continue;
@@ -1387,23 +1375,14 @@ export function cut(
     } else {
       drawA = a; // below the band: a single aggregate glyph
     }
-    if (drawA > 0 && !ringOnly) emit(g, drawA);
+    if (drawA > 0) emit(g, drawA);
     if (childA > 0) {
-      if (bnd && g !== soleRoot && (ringOnly || meets(g))) {
+      if (bnd && g !== soleRoot && meets(g)) {
         record(g, childA);
         // Not drawn itself: its ring (and anchored links) fade with its children.
-        if (fade && alphaOut && !(drawA > 0 && !ringOnly)) alphaOut[g] = childA;
+        if (fade && alphaOut && drawA <= 0) alphaOut[g] = childA;
       }
-      // Walked for rings only, a leaf child has none: push the aggregate children alone. They end the row,
-      // after the leaf children (see `children`), so finding them is O(aggregate children), not O(children)
-      // — a flat bottom module with a million members costs nothing here.
-      let p = childOffset[g]!;
-      if (ringOnly) {
-        p = childOffset[g + 1]!;
-        while (p > childOffset[g]! && children[p - 1]! >= leafCount) p--;
-      }
-      const flag = ringOnly ? RING_ONLY : 0;
-      for (; p < childOffset[g + 1]!; p++) push(children[p]! + flag, childA);
+      for (let p = childOffset[g]!; p < childOffset[g + 1]!; p++) push(children[p]!, childA);
     }
   }
 

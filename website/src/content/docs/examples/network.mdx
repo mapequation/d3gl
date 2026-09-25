@@ -468,7 +468,8 @@ net.lod({
 
 - **Where the ring goes.** After `layout({ nested })` the ring is that module's **disc**, and it follows
   the module's members through a drag or a `transition`. After any other layout it is centred on the
-  members, with their extent as its radius.
+  members, with their extent as its radius. The disc is also what the cut sees: after a nested layout a
+  module is culled by its disc and opens once the disc is `expandPx` across on screen, rings or not.
 - **`width`** is in the active `sizeMode`'s units, so in `screen` mode it is a constant pixel stroke
   around a ring that scales with the map. Rings fade with their members under `crossFade`, draw under
   every link and node, and export with `toSVG()` / `toPNG()` on every backend. The root, which is the
@@ -481,9 +482,9 @@ net.lod({
   a force layout often do, the link runs between their centres rather than disappearing. An expanded
   module whose centre is off-screen keeps the usual off-screen rule: its links are drawn toward its
   centre.
-- **Cost.** Each frame costs one ring per expanded module in view (the cut visits those modules
-  anyway) plus, when anchoring, those modules' own module links. It never costs the whole tree, and it
-  is nothing when the option is off.
+- **Cost.** Each frame costs one ring per expanded module in view. The cut visits those modules anyway,
+  so it walks the tree exactly as it does without rings. Anchoring adds those modules' own module links.
+  It never costs the whole tree, and it is nothing when the option is off.
 
 ### Re-clustering: warm re-layout and transitions
 
