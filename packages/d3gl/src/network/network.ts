@@ -6,7 +6,7 @@ import { multilevelLayout, type CoarsenOptions } from "./coarsen.js";
 import { buildLODTree, buildSpatialLODTree, computeLODGeometry, computeLODPositions, computeLODStyle, updateLODPositionsForLeaves, cut, makeCutScratch, declutterFrontier, makeDeclutterFrontierScratch, pickFrontier, regionFrontier, visibleWorldRect, leavesUnder, ancestorAwareSelected, type LODTree, type SpatialLODOptions } from "./lod.js";
 import { DEFAULT_LABEL_TEXT, type LabelAnchor, type LabelStyle } from "../labels/label-layer.js";
 import { TextMeasurer, canvasFont } from "../labels/measure.js";
-import { buildModuleLODTree, type ModuleLink, type ModuleNode } from "./modules.js";
+import { buildModuleLODTree, checkModuleLinks, moduleRecordIndex, type ModuleLink, type ModuleNode } from "./modules.js";
 import { nestedLayout, type NestedLayoutParams } from "./nested-layout.js";
 import { moduleColors, type ModulePathNode, type ModuleColorOptions } from "./module-colors.js";
 import { physicalPieWedges, type PhysicalPieWedges, type PieWedgeOptions } from "./pie.js";
@@ -37,9 +37,12 @@ export interface NetworkHit {
   /** Leaf nodes the target covers — 1 for a leaf, the subtree size for an aggregate. */
   count: number;
   /**
-   * With a provided module hierarchy (`lod({ modules })`): the target's Infomap path — the module's path
-   * for an aggregate (e.g. `[1, 2]`), the node's full path for a leaf. Lets `labelOf` / click handlers
-   * name a module. Computed when read, O(tree depth).
+   * With a module hierarchy (`data(graph, { modules })`, or `lod({ modules })`): the target's Infomap
+   * path — the module's path for a module aggregate (e.g. `[1, 2]`), the node's own full path for a leaf,
+   * with LOD on or off (#326). Absent without a hierarchy, and for an aggregate of structural coarsening.
+   * Lets `labelOf` / click handlers name a module. Computed when read, O(tree depth). With LOD off the
+   * `labelOf` / `importanceOf` info carries no path (it is one shared object, so the per-frame label
+   * pass allocates nothing); read the node's path from your records by `id` there.
    */
   readonly path?: readonly number[];
 }
@@ -57,6 +60,17 @@ class ModuleTreeHit implements NetworkHit {
     const out: number[] = [];
     for (let g = this.g; g >= 0 && this.parent[g]! >= 0; g = this.parent[g]!) out.push(this.branch[g]!);
     return out.reverse();
+  }
+}
+
+/** {@link NetworkHit} for a leaf outside a module tree (LOD off, or structural LOD) when the engine holds
+ *  a hierarchy (#326): `path` is the node's own record path, copied only when read. */
+class LeafRecordHit implements NetworkHit {
+  readonly aggregate = false;
+  readonly count = 1;
+  constructor(private readonly record: ModuleNode) {}
+  get path(): number[] {
+    return Array.from(this.record.path);
   }
 }
 
@@ -249,13 +263,14 @@ export interface NetworkLayoutOptions {
    */
   fit?: boolean;
   /**
-   * **Nested module layout** (#324) — the "map of modules": with `lod({ modules })` set first, lay the
-   * module tree out top-down, each module's children inside its own disc, arranged only by their
-   * sibling links (the super-edges between them — for an `.ftree` exactly its `*Links` rows, #199).
-   * Every module stays a compact region inside its parent, so the map opens on the top modules and
-   * expands in place; each depth is final, so a streamed layout never oscillates. Runs off-thread on
-   * `backend: "worker"` (streamed top-down, one frame per depth) and synchronously on `"force"`;
-   * `"gpu"` uses the worker until a GPU path exists. Ignored without `lod({ modules })`.
+   * **Nested module layout** (#324) — the "map of modules": with a module hierarchy set
+   * (`data(graph, { modules })`, #326, or `lod({ modules })`), lay the module tree out top-down, each
+   * module's children inside its own disc, arranged only by their sibling links (the super-edges
+   * between them — for an `.ftree` exactly its `*Links` rows, #199). Every module stays a compact
+   * region inside its parent, so the map opens on the top modules and expands in place; each depth is
+   * final, so a streamed layout never oscillates. Works with LOD off or on any {@link NetworkLODOptions.source}.
+   * Runs off-thread on `backend: "worker"` (streamed top-down, one frame per depth) and synchronously
+   * on `"force"`; `"gpu"` uses the worker until a GPU path exists. Ignored without a hierarchy.
    *
    * `true` sizes discs by node flow (leaf count when the graph has none); pass `{ size: "count" }` to
    * size by leaf count, and `iterations` / `packing` to tune each module's solve.
@@ -289,22 +304,29 @@ export interface NestedLayoutConfig {
  */
 export interface NetworkLODOptions {
   /**
-   * A **provided module hierarchy** (N6 / #104): the LOD tree's source, taking priority over
-   * structural coarsening. Pass Infomap's JSON `nodes` array directly — each record's `id` is the
-   * dense node index (aligned with `buildGraph`) and `path` its 1-based module chain. Modules then
-   * expand → sub-modules → leaves on zoom through the same adaptive cut as coarsening. Records must
-   * cover every node. @see {@link buildModuleLODTree}
+   * Which hierarchy the cut draws (#326). `"modules"` — the default whenever the engine holds a module
+   * hierarchy ({@link Network.data}`(graph, { modules })`) — cuts that module tree: modules expand →
+   * sub-modules → leaves on zoom. `"structure"` ignores the hierarchy and coarsens the graph
+   * structurally (a spatial quadtree for an edge-less graph), exactly as without one; the hierarchy
+   * still drives the nested layout, the GPU module seed and {@link NetworkHit.path}. Without a
+   * hierarchy both coarsen structurally. An explicit {@link modules} here overrides both.
+   */
+  source?: "modules" | "structure";
+  /**
+   * A module hierarchy scoped to these LOD options — prefer {@link Network.data}`(graph, { modules })`,
+   * which the engine keeps across `lod(false)` and every LOD source (#326). Kept as a back-compat alias:
+   * when given, it takes priority over the engine hierarchy for the cut and every other module consumer
+   * (nested layout, GPU seed, hit paths) while these options are set, and `lod(false)` drops it.
    *
-   * On the `worker` backend the tree is built on the main thread (the worker supplies only positions);
-   * the off-thread module-tree path is a later refinement.
+   * Pass Infomap's JSON `nodes` array directly — each record's `id` is the dense node index (aligned
+   * with `buildGraph`) and `path` its 1-based module chain. Records must cover every node.
+   * @see {@link buildModuleLODTree}
    */
   modules?: ArrayLike<ModuleNode>;
   /**
-   * **Module-level links** addressed by path (#199), summed into the map's super-edges alongside those
-   * derived from the graph's edges. Use it when the input carries inter-module links only in aggregate —
-   * an Infomap `.ftree` stores leaf links only inside bottom modules, and each coarser link once per
-   * level in its `*Links` sections — so the map draws exactly those links, with no leaf edges invented
-   * to stand in for them. Requires `modules`. @see {@link ModuleLink}
+   * **Module-level links** for {@link modules} (#199) — prefer `data(graph, { modules, moduleLinks })`.
+   * Summed into the map's super-edges alongside those derived from the graph's edges. Requires
+   * `modules`. @see {@link NetworkDataOptions.moduleLinks}
    */
   moduleLinks?: ArrayLike<ModuleLink>;
   /**
@@ -359,7 +381,7 @@ export interface NetworkLODOptions {
    *
    * **Off by default and zero added cost when off** — the projection (an `O(depth)` ancestor walk per
    * off-frontier on-screen edge + a dedup map) runs only when enabled; the same-level gather is unchanged.
-   * Needs the directed super-edge CSR (a provided {@link modules} hierarchy); ignored otherwise.
+   * Needs the directed super-edge CSR (the cut drawing a module hierarchy); ignored otherwise.
    */
   crossLevelEdges?: boolean;
   /**
@@ -380,6 +402,34 @@ export interface NetworkLODOptions {
    * the LOD tree is built spatially over the node positions instead. No effect on edge-bearing graphs.
    */
   spatial?: SpatialLODOptions;
+}
+
+/**
+ * A **module hierarchy** for {@link Network.data} (#326) — data the engine owns alongside the graph,
+ * like `stateNetwork(graph, { modules })` does for a state network. Every module consumer reads it
+ * whatever the LOD state: the LOD cut (its default {@link NetworkLODOptions.source}), the nested layout
+ * (`layout({ nested })`), the module-aware GPU seed, and {@link NetworkHit.path}. `lod(false)` keeps it;
+ * a new `data(graph)` without it clears it.
+ */
+export interface NetworkDataOptions {
+  /**
+   * The module assignment (N6 / #104): Infomap's JSON `nodes` array directly — each record's `id` is
+   * the dense node index (aligned with `buildGraph`) and `path` its 1-based module chain (`[2, 1, 3]` =
+   * top module 2 → sub-module 1 → the node ranked 3). Records must cover every node exactly once;
+   * `data()` checks this up front and throws on a misaligned hierarchy. The module tree (and its
+   * super-edges) is built lazily, once per graph + hierarchy, the first time a consumer needs it.
+   * @see {@link buildModuleLODTree}
+   */
+  modules?: ArrayLike<ModuleNode>;
+  /**
+   * **Module-level links** addressed by path (#199), summed into the map's super-edges alongside those
+   * derived from the graph's edges. Use it when the input carries inter-module links only in aggregate —
+   * an Infomap `.ftree` stores leaf links only inside bottom modules, and each coarser link once per
+   * level in its `*Links` sections — so the map draws exactly those links, with no leaf edges invented
+   * to stand in for them. Requires `modules`; `data()` checks up front that every endpoint is a module or
+   * leaf of that hierarchy and throws otherwise. @see {@link ModuleLink}
+   */
+  moduleLinks?: ArrayLike<ModuleLink>;
 }
 
 /**
@@ -516,6 +566,29 @@ export class Network extends BaseEngine {
   private fitScratch: Float32Array | null = null;
   /** Pending coalesced repaint rAF id (0 = none) for progressive worker frames. */
   private layoutRepaintRaf = 0;
+  /**
+   * The engine-owned module hierarchy (#326) from `data(graph, { modules, moduleLinks })`, with each
+   * node's record index (`recordOf[id]`, from the one-time alignment check). Independent of
+   * {@link lodOptions}, so `lod(false)` keeps it; a new `data()` replaces it. Null without one.
+   */
+  private hierarchy: { modules: ArrayLike<ModuleNode>; moduleLinks: ArrayLike<ModuleLink> | undefined; recordOf: Int32Array } | null = null;
+  /**
+   * The module tree last built from a hierarchy (#326), keyed by (graph, modules, moduleLinks) identity,
+   * so LOD toggles, source switches and re-layouts reuse it instead of rebuilding. Part of the engine's
+   * hierarchy data, so it stays resident once any consumer has built it (the cut, the nested layout, the
+   * GPU seed, a hit path) — also after `lod(false)` and under `source: "structure"`, next to the
+   * structural tree that cut draws — until `data()` replaces the hierarchy. Memory: ≈ 64 B per tree node
+   * (nodes + modules) for its per-node arrays, plus 16 B per super-edge pair (out + in rows; a graph edge
+   * adds one pair per level its endpoints' depths differ, #325) and 16 B per module link — measured
+   * 119 MB for 1M nodes, 1,050 modules and 3M edges (3.4M pairs), against 564 MB for the structural
+   * coarsening tree of the same graph.
+   */
+  private moduleTreeCache: {
+    graph: NetworkGraph;
+    modules: ArrayLike<ModuleNode>;
+    moduleLinks: ArrayLike<ModuleLink> | undefined;
+    tree: LODTree;
+  } | null = null;
   /** LOD config when enabled (#103), else null (draw every element). */
   private lodOptions: NetworkLODOptions | null = null;
   /** Retained coarsening tree for the current graph (topology built lazily). */
@@ -649,9 +722,25 @@ export class Network extends BaseEngine {
     void this.whenReady().then(() => this.rebuild());
   }
 
-  /** Set the graph to render (built via `buildGraph` / `parseEdgeList`). Leaves any state-network mode
-   *  ({@link stateNetwork}) — a plain graph replaces it. */
-  data(graph: NetworkGraph): this {
+  /**
+   * Set the graph to render (built via `buildGraph` / `parseEdgeList`), optionally with its **module
+   * hierarchy** (#326): `data(graph, { modules, moduleLinks })`. The engine owns the hierarchy as data,
+   * like the graph — the LOD cut draws it by default, `layout({ nested })` and the GPU module seed lay it
+   * out, and picks report each target's {@link NetworkHit.path} — whether LOD is on, off, or cutting
+   * the graph structurally (`lod({ source: "structure" })`). `lod(false)` keeps it. `data(graph)`
+   * without it clears any previous hierarchy (it belongs to the previous data).
+   *
+   * The records are checked against the graph here, once (every node exactly once), and so are the
+   * module links' endpoints (each a module or leaf of that hierarchy) — a bad hierarchy throws here,
+   * leaving the engine unchanged; the module tree is built lazily, once, when first needed.
+   * Leaves any state-network mode ({@link stateNetwork}) — a plain graph replaces it.
+   */
+  data(graph: NetworkGraph, opts: NetworkDataOptions = {}): this {
+    const { modules, moduleLinks } = opts;
+    if (moduleLinks && !modules) throw new Error("network.data: moduleLinks requires modules");
+    const recordOf = modules ? moduleRecordIndex(graph.nodeCount, modules) : null;
+    if (modules && moduleLinks) checkModuleLinks(graph.nodeCount, modules, moduleLinks);
+    this.hierarchy = modules && recordOf ? { modules, moduleLinks, recordOf } : null;
     this.stateData = null;
     this.pieWedges = null;
     this.stateColors = null;
@@ -678,7 +767,8 @@ export class Network extends BaseEngine {
     if (this.styleOpts.nodeRadius instanceof Float32Array && this.styleOpts.nodeRadius.length !== n) {
       this.styleOpts = { ...this.styleOpts, nodeRadius: undefined };
     }
-    // New topology + position buffer: drop the retained LOD tree and resolved-style cache.
+    // New topology + position buffer: drop the retained LOD tree, the module tree and resolved-style cache.
+    this.moduleTreeCache = null;
     this.lodTree = null;
     this.lodWorkerTree = null;
     this.lodSpatial = false;
@@ -714,6 +804,7 @@ export class Network extends BaseEngine {
     // graph, so a stale `lod({ modules })` would fail `buildModuleLODTree`'s "record for every node" check
     // when `layout()` rebuilds the tree below. Callers re-apply `lod()` after `layout()` with fresh modules.
     this.lodOptions = null;
+    this.hierarchy = null; // a plain graph's hierarchy (#326) doesn't describe the state network
     this.pieWedges = physicalPieWedges(graph, opts.modules, opts.pie);
     // Per-state-node module colours (state/both views); per-physical disc = its dominant (first) wedge's colour.
     this.stateColors = moduleColors(opts.modules, opts.color);
@@ -822,6 +913,10 @@ export class Network extends BaseEngine {
    * and streams the LOD tree itself (#103), so the main thread never coarsens or runs the O(N)
    * geometry pass. Enabling it *after* a worker run (or on the `force`/`positions` backends) falls
    * back to building the tree on the main thread from the current positions.
+   *
+   * With a module hierarchy (`data(graph, { modules })`, #326) the cut draws the module tree by
+   * default; `{ source: "structure" }` coarsens the graph structurally instead. `lod(false)` turns LOD
+   * off but keeps the hierarchy, so re-enabling reuses its tree.
    */
   lod(options: NetworkLODOptions | false): this {
     if (!options) {
@@ -833,26 +928,13 @@ export class Network extends BaseEngine {
       this.lodHasGeometry = false;
       return this.rebuild();
     }
-    // Switching the tree SOURCE (provided modules ↔ structural coarsening) must rebuild the tree — the
-    // retained one is from the old source. Drop the main-thread tree so recomputeLODGeometry rebuilds
-    // (keep a worker-streamed tree; the worker owns it).
-    // A different module tree or module-link set likewise invalidates the retained module tree.
-    const prev = this.lodOptions;
-    const moduleInputChanged =
-      this.lodModules && (options.modules !== prev?.modules || options.moduleLinks !== prev?.moduleLinks);
-    if (
-      (!!options.modules !== this.lodModules || moduleInputChanged) &&
-      this.lodTree &&
-      this.lodTree !== this.lodWorkerTree
-    ) {
-      this.lodTree = null;
-      this.lodHasGeometry = false;
-    }
     this.lodOptions = options;
-    // Keep any worker-streamed tree from a still-current run: reconfiguring LOD options reuses it
-    // (cut-time options apply immediately; the style geometry refreshes). data()/layout() drop it on
-    // a graph or layout change. recomputeLODGeometry builds a main-thread tree only off the worker
-    // backend — on the worker backend the tree comes from the worker (or the settle fallback).
+    // recomputeLODGeometry picks the tree for the (possibly new) source — the cached module tree, or a
+    // structural one — dropping a retained tree from the other source. It keeps any worker-streamed
+    // coarsening tree from a still-current run for the structural source: reconfiguring LOD options
+    // reuses it (cut-time options apply immediately; the style geometry refreshes). data()/layout()
+    // drop it on a graph or layout change. It builds a structural tree on the main thread only off the
+    // worker backend — on the worker backend that tree comes from the worker (or the settle fallback).
     this.recomputeLODGeometry();
     return this.rebuild();
   }
@@ -1106,7 +1188,7 @@ export class Network extends BaseEngine {
       this.fitFallbackBox = null;
       this.fitKnownBox = null;
       if (fit) seedPositions(this.graph, this.width, this.height);
-      const nestedTree = opts.nested && opts.backend !== "positions" ? this.ensureModuleTree() : undefined;
+      const nestedTree = opts.nested && opts.backend !== "positions" ? this.moduleTree() : undefined;
       if (nestedTree) {
         this.startNestedLayout(nestedTree, opts);
       } else if (opts.backend === "positions" && opts.positions) {
@@ -1120,10 +1202,10 @@ export class Network extends BaseEngine {
         // tick, so coalesce repaints to one per animation frame (always painting the freshest
         // positions) to bound main-thread work at large N.
         //
-        // The worker streams a *coarsening* LOD tree; a provided module hierarchy (N6 / #104) is a
-        // different source the worker doesn't build, so with modules the worker supplies positions
+        // The worker streams a *coarsening* LOD tree; a module hierarchy (N6 / #104) is a different
+        // source the worker doesn't build, so while the cut draws modules the worker supplies positions
         // only and the main thread builds the module tree (recomputeLODGeometry, off the worker guard).
-        const useLod = !!this.lodOptions && !this.lodOptions.modules;
+        const useLod = !!this.lodOptions && !this.lodUsesModules();
         this.lodStreaming = useLod; // the worker will stream the tree; main builds none meanwhile
         const handle: WorkerLayoutHandle = startWorkerLayout(
           this.graph,
@@ -1142,9 +1224,10 @@ export class Network extends BaseEngine {
           useLod
             ? (tree) => {
                 if (this.layoutHandle !== handle) return; // a newer layout superseded this one
-                // Adopt the worker's tree: its geometry streams live, so the main thread only fills
-                // the style geometry once. The first frame (which follows this message) renders it.
-                this.lodTree = tree;
+                // Record the worker's tree; recomputeLODGeometry adopts it while the cut is structural
+                // (a switch to modules since launch keeps the module tree). Its geometry streams live,
+                // so the main thread only fills the style geometry once. The first frame (which
+                // follows this message) renders it.
                 this.lodWorkerTree = tree;
                 this.recomputeLODGeometry();
               }
@@ -1168,11 +1251,11 @@ export class Network extends BaseEngine {
         // before resolving, so `startGpuLayout` sees the real WebGL device and doesn't silently fall
         // back to the worker because it was called before the upgrade finished.
         //
-        // N8.2 module-aware seed: when a module hierarchy is provided (`lod({ modules })` set before
-        // `layout`), build the module tree up front and hand it to the GPU seed so the layout is laid
-        // out top-down over the modules. Build it once here and adopt it as the LOD tree — the settle
-        // handler's recomputeLODGeometry then only fills its geometry (it skips the rebuild).
-        const moduleTopology = this.ensureModuleTree();
+        // N8.2 module-aware seed: with a module hierarchy (`data(graph, { modules })`, #326, or
+        // `lod({ modules })`) — whatever the LOD state — hand its tree to the GPU seed so the layout is
+        // laid out top-down over the modules. The tree is cached, so when the cut draws the same
+        // hierarchy the settle handler's recomputeLODGeometry only fills its geometry (no rebuild).
+        const moduleTopology = this.moduleTree();
         const devicePromise = this.whenBackendSettled().then(() => this.gpuDevice());
         const handle = startGpuLayout(devicePromise, this.graph, {
           width: this.width,
@@ -1219,25 +1302,44 @@ export class Network extends BaseEngine {
   }
 
   /**
-   * The provided-module LOD tree (built now if needed and adopted as the LOD tree), or `undefined`
-   * without `lod({ modules })`. Shared by the layouts that consume the module tree up front — the GPU
-   * module-aware seed (N8.2) and the nested layout (#324); the settle handler's recomputeLODGeometry
-   * then only fills its geometry.
+   * The module tree built from `modules` + `moduleLinks` for the current graph — once, then cached per
+   * (graph, modules, moduleLinks) identity (#326), so turning LOD off and on, switching its source, or
+   * re-running a layout never rebuilds it. O(nodes + edges) on a miss (the super-edge build dominates).
    */
-  private ensureModuleTree(): LODTree | undefined {
-    if (!this.graph || !this.lodOptions?.modules) return undefined;
-    if (!this.lodTree || !this.lodModules) {
-      this.lodTree = buildModuleLODTree(
-        this.graph.nodeCount,
-        this.lodOptions.modules,
-        this.graph,
-        this.lodOptions.moduleLinks,
-      );
-      this.lodModules = true;
-      this.lodSpatial = false;
-      this.lodHasGeometry = false;
-    }
-    return this.lodTree;
+  private moduleTreeOf(modules: ArrayLike<ModuleNode>, moduleLinks: ArrayLike<ModuleLink> | undefined): LODTree | undefined {
+    const graph = this.graph;
+    if (!graph) return undefined;
+    const cached = this.moduleTreeCache;
+    if (cached && cached.graph === graph && cached.modules === modules && cached.moduleLinks === moduleLinks) return cached.tree;
+    const tree = buildModuleLODTree(graph.nodeCount, modules, graph, moduleLinks);
+    this.moduleTreeCache = { graph, modules, moduleLinks, tree };
+    return tree;
+  }
+
+  /**
+   * The module tree every module consumer reads (#326) — the nested layout (#324), the GPU module seed
+   * (N8.2), and the cut when it draws modules: an explicit `lod({ modules })`'s (the back-compat alias),
+   * else the engine hierarchy's from `data(graph, { modules })`, whatever the LOD state. `undefined`
+   * without either. Built on first use, then cached ({@link moduleTreeOf}).
+   */
+  private moduleTree(): LODTree | undefined {
+    const o = this.lodOptions;
+    if (o?.modules) return this.moduleTreeOf(o.modules, o.moduleLinks);
+    const h = this.hierarchy;
+    return h ? this.moduleTreeOf(h.modules, h.moduleLinks) : undefined;
+  }
+
+  /** Whether the LOD cut draws a module hierarchy (#326): an explicit `lod({ modules })`, or the engine
+   *  hierarchy unless `source: "structure"`. False with LOD off. */
+  private lodUsesModules(): boolean {
+    const o = this.lodOptions;
+    return !!o && (!!o.modules || (o.source !== "structure" && !!this.hierarchy));
+  }
+
+  /** Whether the cut draws the worker-streamed coarsening tree, whose position geometry the worker owns
+   *  (#103) — so the main thread skips its own geometry pass. */
+  private drawsWorkerTree(): boolean {
+    return this.lodWorkerTree !== null && this.lodTree === this.lodWorkerTree;
   }
 
   /** Nested module layout (#324): off-thread + streamed per depth on worker/gpu, synchronous on force. */
@@ -1436,7 +1538,7 @@ export class Network extends BaseEngine {
       this.layoutRepaintRaf = 0;
       this.dragReapply?.(); // hold the dragged nodes under the cursor over the worker's snapshot (#140, copy mode)
       if (this.stateData) this.applyStateDerivedPositions(); // physical positions just streamed a frame
-      if (!this.lodWorkerTree) this.recomputeLODGeometry(); // worker streams geometry; main only re-cuts
+      if (!this.drawsWorkerTree()) this.recomputeLODGeometry(); // worker streams geometry; main only re-cuts
       // Fit-on-layout: reframe the camera to the layout's freshly-updated bounds BEFORE the rebuild, so
       // the LOD cut + render run once at the framed transform (no extra emit). Cleared on settle/gesture.
       if (this.fitOnLayout) this.fitViewToLayout();
@@ -1548,14 +1650,15 @@ export class Network extends BaseEngine {
   /**
    * Which tree currently drives LOD rendering: `"worker"` when the active tree is the one the layout
    * worker built and streams (so the main thread does no coarsening or O(N) geometry pass),
-   * `"modules"` when it's a provided module hierarchy (N6 / #104), `"spatial"` when it's the edge-less
+   * `"modules"` when it's a module hierarchy (N6 / #104 — `data(graph, { modules })` or
+   * `lod({ modules })`, #326), `"spatial"` when it's the edge-less
    * quadtree built over the node positions, `"main"` when it's the coarsening tree built on the main
    * thread (`force`/`positions` backends, the worker fallback, or LOD enabled after a worker run), or
    * `"none"` when LOD is off or no geometry exists yet. Introspection for debugging and tests.
    */
   get lodSource(): "worker" | "modules" | "spatial" | "main" | "none" {
     if (!this.lodOptions || !this.lodTree || !this.lodHasGeometry) return "none";
-    if (this.lodWorkerTree && this.lodTree === this.lodWorkerTree) return "worker";
+    if (this.drawsWorkerTree()) return "worker";
     if (this.lodModules) return "modules";
     return this.lodSpatial ? "spatial" : "main";
   }
@@ -1678,6 +1781,7 @@ export class Network extends BaseEngine {
       };
       // No-LOD: instance i of every link layer is edge i (parallel emit), so the resolve is static.
       this.linkResolve = (i) => this.noLodLinkHit(graph, i);
+      const leafDatum = this.leafDatumOf();
       const lane = new InstancedLane(strategy, () => {
         const resolved = this.resolvedStyleCached(graph);
         const base = this.attachNoLodHighlight(this.flagPickableLinks(this.noLodLayers(graph, resolved)), this.noLodCache(graph, resolved));
@@ -1690,8 +1794,8 @@ export class Network extends BaseEngine {
       this.registerInstancedLane(this.NET_LANE, {
         // Overlay layer names must be in layerNames so a view switch removes them (emit-set-change re-adds).
         lane, layerNames: this.stateData ? [this.CONTAINER_LAYER, ...LAYER_NAMES, this.PIE_LAYER] : LAYER_NAMES, dynamic: false,
-        resolve: (i) => ({ layer: this.NODE_LAYER, id: i, datum: { aggregate: false, count: 1 } satisfies NetworkHit }),
-        interactive: this.laneInteractive(() => ({ aggregate: false, count: 1 }), (i) => [i]),
+        resolve: (i) => ({ layer: this.NODE_LAYER, id: i, datum: leafDatum(i) }),
+        interactive: this.laneInteractive(leafDatum, (i) => [i]),
         gpuPick: this.pickLinksEnabled ? (id) => this.linkResolve?.(id) ?? null : undefined,
       });
       // No-LOD: the whole graph is drawn, so every selected/hovered node index is "visible" (source=null).
@@ -1722,9 +1826,19 @@ export class Network extends BaseEngine {
   private lodDatum(tree: LODTree, g: number): NetworkHit {
     const aggregate = g >= tree.leafCount;
     const count = tree.count[g]!;
-    return tree.branch && tree.parent
-      ? new ModuleTreeHit(tree.parent, tree.branch, g, aggregate, count)
-      : { aggregate, count };
+    if (tree.branch && tree.parent) return new ModuleTreeHit(tree.parent, tree.branch, g, aggregate, count);
+    // A structural cut over a graph with a hierarchy (#326): a leaf still reports its own path.
+    const h = this.hierarchy;
+    return h && !aggregate ? new LeafRecordHit(h.modules[h.recordOf[g]!]!) : { aggregate, count };
+  }
+
+  /** The hit datum of leaf node `i` outside a module tree (the no-LOD lane): its own record path when
+   *  the engine holds a hierarchy (#326), else a plain leaf. O(1) per hit — no tree is built. */
+  private leafDatumOf(): (i: number) => NetworkHit {
+    const h = this.hierarchy;
+    if (!h) return () => ({ aggregate: false, count: 1 });
+    const { modules, recordOf } = h;
+    return (i) => new LeafRecordHit(modules[recordOf[i]!]!);
   }
 
   /**
@@ -2166,7 +2280,7 @@ export class Network extends BaseEngine {
    */
   private repaintDuringDrag(held?: Uint32Array): void {
     const graph = this.graph;
-    if (!this.lodWorkerTree && graph) {
+    if (!this.drawsWorkerTree() && graph) {
       const tree = this.lodReady() ? this.lodTree : null;
       if (!tree) this.recomputeLODGeometry(); // no tree/geometry yet — build once (no-op when LOD is off)
       else if (held) updateLODPositionsForLeaves(tree, graph.positions, held, this.treeParent(tree));
@@ -2180,7 +2294,7 @@ export class Network extends BaseEngine {
    *  per release, click-frequency). Skipped on a worker-streamed tree (the worker owns it — its
    *  next frame is exact) and when LOD has no main-thread geometry. */
   private settleAfterDrag(): void {
-    if (this.lodWorkerTree || !this.lodReady() || !this.lodTree || !this.graph) return;
+    if (this.drawsWorkerTree() || !this.lodReady() || !this.lodTree || !this.graph) return;
     computeLODPositions(this.lodTree, this.graph.positions);
     this.rebuild();
   }
@@ -2340,10 +2454,12 @@ export class Network extends BaseEngine {
    *   mode** (#182): there `layoutOpts.backend` names the *physical* graph's layout transport, but
    *   `this.graph` (whose tree this method builds) is the state/both view's own graph — no worker ever
    *   streams a tree for it, so the skip would otherwise starve state-view LOD of a tree forever.
-   * - **Main-thread tree** (`force`/`positions` backends, or the worker fallback): build the tree
-   *   lazily, then the full geometry from the current positions + style; tracks convergence.
+   * - **Main-thread tree** (`force`/`positions` backends, the worker fallback, or a module hierarchy on
+   *   any backend): build the tree lazily (a module tree comes from the per-hierarchy cache, #326), then
+   *   the full geometry from the current positions + style; tracks convergence.
    *
-   * O(tree size); the zoom-time cut does not call this (it reuses the geometry).
+   * It also picks the tree for the current source ({@link NetworkLODOptions.source}), so a source switch
+   * or LOD toggle lands here. O(tree size); the zoom-time cut does not call this (it reuses the geometry).
    */
   private recomputeLODGeometry(forceMain = false): void {
     if (!this.lodOptions || !this.graph) return;
@@ -2356,32 +2472,40 @@ export class Network extends BaseEngine {
     const radiusAggregate = resolved.nodeRadiusAggregate ?? undefined;
     // Declutter importance (per-leaf, summed up the tree): defaults to the size metric — see resolveImportance.
     const leafWeight = resolved.importance;
-    if (this.lodWorkerTree) {
+    // Tree choice — the priority chain (epic #98): a module hierarchy (an explicit `lod({ modules })`,
+    // else the engine's unless `source: "structure"`, #326) → structural coarsening → the spatial
+    // quadtree fallback. A module tree (N6 / #104) is position-independent, like coarsening, and cached
+    // per hierarchy, so a source switch or LOD toggle re-adopts it without a rebuild.
+    const moduleTree = this.lodUsesModules() ? this.moduleTree() : undefined;
+    if (!moduleTree && this.lodWorkerTree) {
       computeLODStyle(this.lodWorkerTree, nodeRadii, leafWeight, leafBorder, leafColors, radiusAggregate);
       this.lodTree = this.lodWorkerTree;
+      this.lodModules = false;
+      this.lodSpatial = false;
       this.lodHasGeometry = true;
       return;
     }
+    // A module tree retained from before a switch to the structural source is the wrong tree.
+    if (!moduleTree && this.lodModules) {
+      this.lodTree = null;
+      this.lodModules = false;
+      this.lodHasGeometry = false;
+    }
     // The worker streams a *coarsening* tree on this backend; don't build one on the main thread (the
-    // whole point of worker-LOD). A provided module hierarchy is the exception — the worker doesn't
-    // build it, so the main thread must (it falls through to the module branch below). The settle
-    // handler / deferred fallback force a build when no worker streamed one.
-    if (!this.stateData && this.layoutOpts.backend === "worker" && !this.lodOptions.modules && !forceMain) return;
-    if (!this.lodTree) {
-      // Priority chain (epic #98): provided module hierarchy → structural coarsening → spatial
-      // quadtree fallback. A provided tree (N6 / #104) is position-independent, like coarsening.
-      if (this.lodOptions.modules) {
-        // Pass the graph's directed edges so the tree also carries flow-weighted super-edges (the sum
-        // of subsumed edge weights per module pair) for the bent half-arrow map links (#104 N6c).
-        this.lodTree = buildModuleLODTree(
-              this.graph.nodeCount,
-              this.lodOptions.modules,
-              this.graph,
-              this.lodOptions.moduleLinks,
-            );
+    // whole point of worker-LOD). A module hierarchy is the exception — the worker doesn't build it, so
+    // the main thread must (it takes the module branch below). The settle handler / deferred fallback
+    // force a build when no worker streamed one.
+    if (!moduleTree && !this.stateData && this.layoutOpts.backend === "worker" && !forceMain) return;
+    if (moduleTree) {
+      // Carries flow-weighted super-edges from the graph's directed edges (the sum of subsumed edge
+      // weights per module pair, #104 N6c) plus any module links (#199), for the half-arrow map links.
+      if (this.lodTree !== moduleTree) {
+        this.lodTree = moduleTree;
         this.lodModules = true;
         this.lodSpatial = false;
-      } else if (this.graph.edgeCount === 0) {
+      }
+    } else if (!this.lodTree) {
+      if (this.graph.edgeCount === 0) {
         // Edge-less graphs can't be coarsened (heavy-edge matching needs edges) — build the LOD tree
         // spatially over the positions instead (#103), so the cut still aggregates + prunes in O(visible)
         // rather than degenerating to a single flat level. (Its topology depends on the positions, so

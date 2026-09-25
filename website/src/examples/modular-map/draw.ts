@@ -12,8 +12,9 @@ const SIZES = [500, 1_000, 2_000, 5_000, 10_000, 20_000];
  * by their **enter/exit flow**; directed links are **half-arrows** whose width + colour encode link
  * flow. In **screen** sizeMode the glyphs stay a constant pixel size as you zoom.
  *
- * The layout is the **module-aware GPU seed** (#180 N8.2): the provided module hierarchy is supplied
- * *before* `layout({ backend: "gpu" })`, so the WebGL2 Barnes-Hut solve is seeded **top-down over the
+ * The module hierarchy is **data**: `net.data(graph, { modules })` hands it to the engine with the
+ * graph (#326), so every module feature reads it whatever the LOD mode. The layout is the
+ * **module-aware GPU seed** (#180 N8.2): the WebGL2 Barnes-Hut solve is seeded **top-down over the
  * module tree** — modules (including the ragged, deeper-nested **super-modules** in `data.ts`) lay out
  * as coherent regions rather than an untangling disc. `fit: true` (#206) keeps the camera framed on the
  * layout as it converges — it opens centred and view-filling and settles in place, with no jump. (Falls
@@ -21,8 +22,9 @@ const SIZES = [500, 1_000, 2_000, 5_000, 10_000, 20_000];
  *
  * The **Nodes** slider resizes the generated network (500 → 20,000): the map is regenerated — flow and
  * all — and re-laid-out on the GPU, framing itself each time. The **LOD** control switches the cut:
- * **Off** draws every node + half-arrow; **Standard** is plain structural coarsening (it ignores the
- * planted partition — aggregates joined by simple super-edge lines); **Modules** uses the partition, so
+ * **Off** draws every node + half-arrow; **Standard** is plain structural coarsening
+ * (`source: "structure"` ignores the planted partition — aggregates joined by simple super-edge
+ * lines); **Modules** (the default source once a hierarchy is set) uses the partition, so
  * modules collapse to a single glyph and their connectivity shows as **half-arrow super-edges that
  * thicken with the accumulated flow** between modules. Scroll to zoom: modules expand → sub-modules →
  * leaves (the ragged branches nest to different depths).
@@ -53,7 +55,6 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
   let colors: string[] = [];
   let enterExit: Float32Array<ArrayBufferLike> = new Float32Array();
   let maxNodeFlow = 1;
-  let modulePaths: { id: number; path: number[] }[] = [];
   let ringW: ScaleContinuousNumeric<number, number>;
   let linkW: ScaleContinuousNumeric<number, number>;
   let linkStroke: (w: number) => string;
@@ -65,7 +66,6 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
       if (n !== count) {
         count = n;
         const d = makeModularMap(n);
-        modulePaths = d.modulePaths;
         enterExit = d.enterExit;
         // Categorical colour per planted module; aggregates inherit their module's colour under LOD.
         colors = moduleColors(d.modulePaths, { lightness: 62, chroma: 58 });
@@ -87,12 +87,12 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
           directed: true,
           nodeFlow: d.nodeFlow,
         });
-        // Supply the (ragged) module hierarchy BEFORE laying out, so the GPU force layout seeds
-        // MODULE-AWARE (#180 N8.2): it lays the map out top-down over the module tree, so modules —
-        // including the deeper super-modules — form coherent regions. `fit: true` keeps the camera framed
-        // on the layout as it converges (#206), so the map opens framed and settles in place, no jump.
-        net.data(graph);
-        net.lod({ modules: modulePaths });
+        // The (ragged) module hierarchy travels with the graph (#326), so the GPU force layout seeds
+        // MODULE-AWARE (#180 N8.2) in every LOD mode: it lays the map out top-down over the module tree,
+        // so modules — including the deeper super-modules — form coherent regions. `fit: true` keeps the
+        // camera framed on the layout as it converges (#206), so the map opens framed and settles in
+        // place, no jump.
+        net.data(graph, { modules: d.modulePaths });
         net.layout({ backend: "gpu", fit: true, iterations: 300 });
       }
 
@@ -129,13 +129,14 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
       if (mode === "Off") {
         net.lod(false);
       } else if (mode === "Standard") {
-        // Structural coarsening — no module info; aggregates joined by plain super-edge lines.
-        net.lod({ expandPx, declutter, aggregateOutline, crossLevelEdges, crossFade });
+        // Structural coarsening — ignores the partition; aggregates joined by plain super-edge lines.
+        net.lod({ source: "structure", expandPx, declutter, aggregateOutline, crossLevelEdges, crossFade });
       } else {
-        // The planted partition drives the cut → directed half-arrow super-edges ∝ accumulated flow.
-        // No aggregate-radius cap: a module is sized by `nodeRadius` applied to its members' summed
-        // flow (the scale extrapolates above the leaf domain), so a module reads as its total flow.
-        net.lod({ modules: modulePaths, expandPx, declutter, superEdges: true, aggregateOutline, crossLevelEdges, crossFade });
+        // The planted partition (the default source) drives the cut → directed half-arrow super-edges
+        // ∝ accumulated flow. No aggregate-radius cap: a module is sized by `nodeRadius` applied to its
+        // members' summed flow (the scale extrapolates above the leaf domain), so a module reads as its
+        // total flow.
+        net.lod({ expandPx, declutter, superEdges: true, aggregateOutline, crossLevelEdges, crossFade });
       }
     },
   };

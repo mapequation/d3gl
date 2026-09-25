@@ -6,7 +6,7 @@
  * A recursive 3-ary gasket: each smallest triangle is a 3-node community joined to its siblings by
  * sparse corner bridges, with distinct nodes (no shared corners), so every node has one unambiguous
  * module `path`. The subdivision tree *is* the module hierarchy, emitted in Infomap's JSON `nodes`
- * shape and fed to `net.lod({ modules })`. depth D → 3^D leaf triangles → 3^(D+1) nodes.
+ * shape and fed to `net.data(graph, { modules })`. depth D → 3^D leaf triangles → 3^(D+1) nodes.
  */
 
 export interface SierpinskiGraph {

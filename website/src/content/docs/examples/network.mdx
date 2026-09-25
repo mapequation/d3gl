@@ -233,28 +233,42 @@ net
 ### Maps of networks: a provided module hierarchy
 
 When the app already has a **module hierarchy** — e.g. an [Infomap](https://www.mapequation.org/infomap/)
-clustering — pass it as the LOD source instead of letting d3gl coarsen structurally. d3gl does not
-cluster; the tree is computed app-side and handed in, just like externally-provided positions. Modules
-then expand → sub-modules → leaves on zoom through the *same* adaptive cut.
+clustering — hand it to the engine **with the graph**, as data. d3gl does not cluster; the tree is
+computed app-side and handed in, just like externally-provided positions. The LOD cut then draws it
+instead of coarsening structurally: modules expand → sub-modules → leaves on zoom through the *same*
+adaptive cut.
 
 Pass Infomap's JSON `nodes` array straight through: each record's `id` is the node index (aligned with
 `buildGraph`) and `path` is its 1-based module chain (`[2, 1, 3]` = top module 2 → sub-module 1 → the
-node ranked 3).
+node ranked 3). `data()` checks that the records cover every node once, and throws otherwise.
 
 ```ts
 import infomapResult from "./network.json"; // Infomap JSON: { nodes: [{ id, path, flow, … }], … }
 
 net
-  .data(graph)
+  .data(graph, { modules: infomapResult.nodes })
   .style({ sizeMode: "screen" })
-  .lod({ modules: infomapResult.nodes }) // no expandPx ⇒ the module-sized default; it opens as a map
+  .lod({}) // no expandPx ⇒ the module-sized default; it opens as a map
   .layout({ backend: "positions", positions });
 
 net.lodSource; // "modules"
 ```
 
-The provided hierarchy takes priority over structural coarsening; everything else about the cut
-(declutter, `sizeMode`, the on-screen-bounded per-frame work) is unchanged. Under LOD a **module's**
+The engine owns the hierarchy, not the LOD options, so every module feature reads it in any LOD mode:
+
+- the **LOD cut** draws it by default; `lod({ source: "structure" })` coarsens the graph structurally
+  instead, and `lod(false)` draws every node — both keep the hierarchy, so switching back reuses the
+  tree it built (once) rather than rebuilding it;
+- **`layout({ nested: true })`** lays the module tree out top-down, each module's children inside its
+  own disc — with LOD on or off;
+- the **module-aware GPU seed** (`layout({ backend: "gpu" })`) seeds over the modules;
+- every **pick** reports the target's Infomap `path` (`hit.datum.path`): a module's path for an
+  aggregate, the node's own path for a leaf, LOD on or off.
+
+A new `data(graph)` without a hierarchy clears it. Module-level links (an Infomap `.ftree`'s `*Links`
+rows) go alongside: `data(graph, { modules, moduleLinks })`. (`lod({ modules })` still works as an
+alias scoped to the LOD options — `lod(false)` drops it.) Everything else about the cut (declutter,
+`sizeMode`, the on-screen-bounded per-frame work) is the same as for structural coarsening. Under LOD a **module's**
 flow border sums its members' enter/exit flow, and its bent-half-arrow **super-edges** size by the
 accumulated weight of the edges they subsume — the same flow-border and bent-link glyphs as above,
 driven by the cut.
@@ -265,7 +279,7 @@ When the LOD hierarchy comes from a **provided module tree** (rather than struct
 adaptive cut becomes **modular-aware**: nodes aggregate into their *parent module* as you zoom out, and
 expand back to sub-modules and leaves as you zoom in. This example builds an undirected **Sierpinski
 gasket** whose recursive subdivision *is* the module hierarchy (an Infomap-style `path` per node), fed
-to `net.lod({ modules })`.
+to `net.data(graph, { modules })`.
 
 Each node is coloured by its **top-level module** through a categorical palette, and `nodeFill` accepts
 a per-node accessor — so a module's aggregate glyph and all of its leaves share one colour, and you can
@@ -408,19 +422,19 @@ Flow then drives every channel: node **radius** ∝ visit rate, the **ring** ∝
 and the **half-arrow** width + colour ∝ link flow — so a reciprocal pair's two arrows carry genuinely
 different weight. The **Nodes** slider resizes the generated network (500 → 20,000).
 
-The layout is the **module-aware GPU seed**: the module hierarchy is supplied via `lod({ modules })`
-*before* `layout({ backend: "gpu" })`, so the WebGL2 Barnes-Hut solve is seeded **top-down over the module
-tree** — modules (including the ragged, deeper-nested super-modules) lay out as coherent regions. Because
-the GPU solve streams frames, `fit: true` keeps the camera framed on the layout as it converges (centroid
+The layout is the **module-aware GPU seed**: the module hierarchy is supplied with the graph,
+`data(graph, { modules })`, so `layout({ backend: "gpu" })` seeds the WebGL2 Barnes-Hut solve
+**top-down over the module tree** in every LOD mode — modules (including the ragged, deeper-nested
+super-modules) lay out as coherent regions. Because the GPU solve streams frames, `fit: true` keeps the camera framed on the layout as it converges (centroid
 → view centre, extent → the view), so the map opens framed and settles in place rather than piling at the
 origin. It releases to normal zoom/pan once it settles.
 
-Nodes are coloured **categorically by module** (the planted communities), fed to `lod({ modules })`. The
-**LOD** control switches the cut:
+Nodes are coloured **categorically by module** (the planted communities). The **LOD** control switches
+the cut over the same engine-held hierarchy:
 
 - **Off** — every node and half-arrow.
-- **Standard** — plain structural coarsening; it *ignores* the partition, joining aggregates with simple
-  super-edge lines.
+- **Standard** — plain structural coarsening (`lod({ source: "structure" })`); it *ignores* the
+  partition, joining aggregates with simple super-edge lines.
 - **Modules** — the partition drives the cut, so a module collapses to one glyph and its connectivity
   shows as **half-arrow super-edges that thicken with the accumulated flow** between modules.
 

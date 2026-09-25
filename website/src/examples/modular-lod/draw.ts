@@ -7,7 +7,7 @@ const DEPTHS = [2, 3, 4, 5, 6]; // 27 → 2187 nodes
 /**
  * **Modular-aware level of detail + aggregate inspection.** An undirected Sierpinski gasket whose
  * recursive subdivision *is* a planted module hierarchy (Infomap-style `path` per node), fed to
- * `net.lod({ modules })`. Each node is coloured by its **top-level module** (a categorical palette), so
+ * `net.data(graph, { modules })`. Each node is coloured by its **top-level module** (a categorical palette), so
  * a module glyph and all its leaves share one colour. Zoom out and nodes **aggregate into their parent
  * module**; zoom in and modules expand → sub-modules → leaf triangles — the colour stays, so you can
  * read the hierarchy at any scale.
@@ -97,7 +97,7 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
       const colors = moduleColors(modules);
 
       net
-        .data(graph)
+        .data(graph, { modules }) // the module hierarchy is data: the LOD cut draws it by default
         .style({
           sizeMode: "screen",
           nodeRadius: 6,
@@ -112,7 +112,7 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
         // crossFade (#133): opt-in opacity cross-fade of a module ↔ its sub-modules across the expand
         // threshold (slider × 0.1 = band half-width). The self-similar gasket has no mixed-level frontier,
         // so crossLevelEdges (#139) doesn't apply here.
-        .lod(lod ? { modules, expandPx: 120, maxAggregateRadius: 26, crossFade: ((options.crossFade as number) ?? 0) * 0.1 } : false)
+        .lod(lod ? { expandPx: 120, maxAggregateRadius: 26, crossFade: ((options.crossFade as number) ?? 0) * 0.1 } : false)
         .layout({ backend: "positions", positions });
     },
   };
