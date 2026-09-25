@@ -98,6 +98,34 @@ describe("engine-owned module hierarchy — data(graph, { modules }) (#326)", ()
     net.destroy();
   });
 
+  it("a nested worker layout under a structural cut keeps the LOD geometry on every streamed depth frame", async () => {
+    const net = network(host(), { width: 200, height: 200 });
+    await net.whenReady();
+    const g = graph();
+    net.data(g, { modules: MODULES }).lod({ source: "structure", declutter: false }).layout({ backend: "positions", positions: POSITIONS });
+    expect(net.lodSource).toBe("main");
+    // Every repaint must cut geometry built from the positions it draws: record the leaves' worst drift
+    // between the tree's centroids and the live positions at each rebuild of the run.
+    const eng = net as unknown as { rebuild(): unknown; lodTree: { cx: Float32Array; cy: Float32Array } | null };
+    const rebuild = eng.rebuild.bind(eng);
+    const drift: number[] = [];
+    eng.rebuild = () => {
+      const tree = eng.lodTree;
+      if (tree) {
+        let worst = 0;
+        for (let i = 0; i < g.nodeCount; i++) worst = Math.max(worst, Math.hypot(tree.cx[i]! - g.positions[i * 2]!, tree.cy[i]! - g.positions[i * 2 + 1]!));
+        drift.push(worst);
+      }
+      return rebuild();
+    };
+    net.layout({ backend: "worker", nested: true }); // cold: streams one frame per depth
+    await net.whenSettled();
+    expect(Array.from(g.positions)).toEqual(expectedNested(g, MODULES));
+    expect(drift.length).toBeGreaterThan(2); // the depth frames really were repainted
+    expect(Math.max(...drift), `drift per rebuild: ${drift.join(", ")}`).toBeLessThan(1e-3);
+    net.destroy();
+  });
+
   it("lod(false) keeps the hierarchy: re-enabling LOD and nested layout reuse the one cached tree", async () => {
     const net = network(host(), { width: 200, height: 200 });
     await net.whenReady();

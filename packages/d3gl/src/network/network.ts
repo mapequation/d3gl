@@ -685,6 +685,9 @@ export class Network extends BaseEngine {
   private lodModules = false;
   /** True while a worker-LOD run is in flight (launched, not yet settled/stopped) — it will stream the tree. */
   private lodStreaming = false;
+  /** True while a nested layout (#324) solves on the worker/gpu. It streams positions only — never a LOD
+   *  tree — so the main thread keeps even a structural tree's geometry up to date meanwhile. */
+  private nestedSolving = false;
   /** Dedup guard for the one-shot deferred main-thread LOD-tree fallback (see {@link scheduleLODFallback}). */
   private lodFallbackScheduled = false;
   /** Whether `lodTree` has had its geometry computed at least once, so the cut may run. */
@@ -1482,6 +1485,7 @@ export class Network extends BaseEngine {
     };
     if (opts.backend === "worker" || opts.backend === "gpu") {
       const oneFrame = warm || tween !== null;
+      this.nestedSolving = true;
       const solve = startNestedWorkerLayout(graph, topology, params, () => this.scheduleLayoutRepaint(), {
         stream: !oneFrame,
         onResult: oneFrame ? (positions) => this.landNested(graph, positions, tween) : undefined,
@@ -1569,6 +1573,7 @@ export class Network extends BaseEngine {
     void handle.settled.then(() => {
       if (this.layoutHandle !== handle) return; // a newer layout superseded this one
       this.transition = null;
+      this.nestedSolving = false;
       prepare?.();
       this.recomputeLODGeometry(true);
       this.releaseFit(); // final reframe on the settled bounds, then hand the view to zoom/pan
@@ -1833,6 +1838,7 @@ export class Network extends BaseEngine {
     this.layoutHandle = null;
     this.transition = null;
     this.lodStreaming = false; // no worker run is in flight to stream the LOD tree any more
+    this.nestedSolving = false;
     if (this.layoutRepaintRaf && typeof cancelAnimationFrame === "function") cancelAnimationFrame(this.layoutRepaintRaf);
     this.layoutRepaintRaf = 0;
   }
@@ -2735,9 +2741,10 @@ export class Network extends BaseEngine {
     }
     // The worker streams a *coarsening* tree on this backend; don't build one on the main thread (the
     // whole point of worker-LOD). A module hierarchy is the exception — the worker doesn't build it, so
-    // the main thread must (it takes the module branch below). The settle handler / deferred fallback
-    // force a build when no worker streamed one.
-    if (!moduleTree && !this.stateData && this.layoutOpts.backend === "worker" && !forceMain) return;
+    // the main thread must (it takes the module branch below), and so is a nested layout's run, which
+    // streams positions only (#324). The settle handler / deferred fallback force a build when no worker
+    // streamed one.
+    if (!moduleTree && !this.stateData && this.layoutOpts.backend === "worker" && !forceMain && !this.nestedSolving) return;
     if (moduleTree) {
       // Carries flow-weighted super-edges from the graph's directed edges (the sum of subsumed edge
       // weights per module pair, #104 N6c) plus any module links (#199), for the half-arrow map links.
