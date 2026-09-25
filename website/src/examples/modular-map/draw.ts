@@ -20,8 +20,13 @@ const SIZES = [500, 1_000, 2_000, 5_000, 10_000, 20_000];
  * layout as it converges — it opens centred and view-filling and settles in place, with no jump. (Falls
  * back to the CPU worker where float render targets are unavailable.)
  *
+ * The **Layout** control switches to the **nested** module layout (#324): each module's children laid out
+ * inside its own disc. Switching re-lays the map out **warm**, from where the nodes are, and **eases**
+ * them there (#328): `layout({ nested: { warm: true }, transition: 800 })` — the same call an app makes
+ * after re-clustering, so the new map refines the old one in place instead of restarting from a disc.
+ *
  * The **Nodes** slider resizes the generated network (500 → 20,000): the map is regenerated — flow and
- * all — and re-laid-out on the GPU, framing itself each time. The **LOD** control switches the cut:
+ * all — and re-laid-out, framing itself each time. The **LOD** control switches the cut:
  * **Off** draws every node + half-arrow; **Standard** is plain structural coarsening
  * (`source: "structure"` ignores the planted partition — aggregates joined by simple super-edge
  * lines); **Modules** (the default source once a hierarchy is set) uses the partition, so
@@ -52,6 +57,7 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
 
   // Regenerated + re-laid-out whenever the Nodes slider changes; flow-derived scales are rebuilt with it.
   let count = -1;
+  let layoutMode = ""; // the Layout control's last value ("" = a fresh graph, nothing on screen yet)
   let colors: string[] = [];
   let enterExit: Float32Array<ArrayBufferLike> = new Float32Array();
   let maxNodeFlow = 1;
@@ -87,13 +93,24 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
           directed: true,
           nodeFlow: d.nodeFlow,
         });
-        // The (ragged) module hierarchy travels with the graph (#326), so the GPU force layout seeds
-        // MODULE-AWARE (#180 N8.2) in every LOD mode: it lays the map out top-down over the module tree,
-        // so modules — including the deeper super-modules — form coherent regions. `fit: true` keeps the
-        // camera framed on the layout as it converges (#206), so the map opens framed and settles in
-        // place, no jump.
+        // The (ragged) module hierarchy travels with the graph (#326), so both layouts read it in every
+        // LOD mode.
         net.data(graph, { modules: d.modulePaths });
-        net.layout({ backend: "gpu", fit: true, iterations: 300 });
+        layoutMode = "";
+      }
+      const layout = (options.layout as string) ?? "Force";
+      if (layout !== layoutMode) {
+        const fresh = layoutMode === "";
+        layoutMode = layout;
+        // The GPU force layout seeds MODULE-AWARE (#180 N8.2): it lays the map out top-down over the module
+        // tree, so modules — including the deeper super-modules — form coherent regions. `fit: true` keeps
+        // the camera framed on the layout as it converges (#206), so the map opens framed and settles in
+        // place, no jump.
+        if (layout === "Force") net.layout({ backend: "gpu", fit: true, iterations: 300 });
+        // A fresh graph opens framed on the nested map; a switch refines the current map where it is
+        // (warm) and eases the nodes into it (#328) — the camera stays put.
+        else if (fresh) net.layout({ backend: "worker", nested: true, fit: true });
+        else net.layout({ backend: "worker", nested: { warm: true }, transition: 800 });
       }
 
       // Frontier labels come pre-styled (dark 11px sans-serif + white halo) — no CSS needed.

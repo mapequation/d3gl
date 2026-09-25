@@ -3,8 +3,10 @@ import Imperative from "../../components/Imperative.js";
 import { setup } from "./draw.js";
 
 /** A directed map of modules (LFR planted partition + Infomap-matched flow): categorical module
- *  colours, flow-sized nodes, and half-arrow links/super-edges that thicken with flow. The LOD control
- *  switches Off / Standard (structural) / Modules (the planted partition → half-arrow super-edges). */
+ *  colours, flow-sized nodes, and half-arrow links/super-edges that thicken with flow. The Layout
+ *  control switches the module-aware GPU force layout ↔ the nested module layout (a warm, eased
+ *  re-layout); the LOD control switches Off / Standard (structural) / Modules (the planted partition →
+ *  half-arrow super-edges). */
 export default function ModularMap() {
   return (
     <Example
@@ -19,6 +21,7 @@ export default function ModularMap() {
           value: 1, // 1k — a good default; crank up to stress the module-aware GPU layout
           display: ["500", "1k", "2k", "5k", "10k", "20k"],
         },
+        { type: "segmented", key: "layout", label: "Layout", options: ["Force", "Nested"], value: "Force" },
         { type: "segmented", key: "lod", label: "LOD", options: ["Off", "Standard", "Modules"], value: "Modules" },
         { type: "segmented", key: "sizing", label: "Sizing", options: ["Screen", "World"] },
         { type: "segmented", key: "declutter", label: "Declutter", options: ["On", "Off"] },
