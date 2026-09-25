@@ -250,6 +250,32 @@ describe("network() engine", () => {
     net.destroy();
   });
 
+  it("draws a leaf edge between different tree depths once both leaves are visible, cross-level on or off (#325)", async () => {
+    const net = network(host(), { width: 200, height: 200, backend: "svg" });
+    await net.whenReady();
+    // The only edge: u = 1:3:2:5 (depth 4) → v = 2:1:7 (depth 3). Each bottom module also holds an
+    // unlinked leaf, spread far apart, so a tiny expandPx opens every module down to its four leaves.
+    const g = buildGraph({ nodeCount: 4, source: [0], target: [2], directed: true });
+    const modules = [
+      { id: 0, path: [1, 3, 2, 5] }, { id: 1, path: [1, 3, 2, 1] },
+      { id: 2, path: [2, 1, 7] }, { id: 3, path: [2, 1, 1] },
+    ];
+    for (const crossLevelEdges of [false, true]) {
+      net
+        .data(g)
+        .style({ directed: true })
+        .lod({ modules, expandPx: 1, declutter: false, crossLevelEdges })
+        .layout({ backend: "positions", positions: new Float32Array([20, 40, 20, 160, 180, 40, 180, 160]) });
+      net.setTransform({ k: 1, x: 0, y: 0 });
+      net.syncScreenGeometry();
+      const svg = net.toSVG();
+      expect((svg.match(/<circle/g) ?? []).length, `crossLevelEdges=${crossLevelEdges}`).toBe(4); // all four leaves visible
+      expect((svg.match(/<path/g) ?? []).length, `crossLevelEdges=${crossLevelEdges}`).toBeGreaterThanOrEqual(1); // …and u → v drawn
+    }
+
+    net.destroy();
+  });
+
   it("cross-fades level transitions only when opted in (#133)", async () => {
     const net = network(host(), { width: 200, height: 200, backend: "svg" });
     await net.whenReady();

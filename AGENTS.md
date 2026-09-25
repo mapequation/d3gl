@@ -366,7 +366,7 @@ per-file timeout. Every at-scale leg below now asserts. When you add a guard, ad
 | plot points lane sweep | — | `map/__tests__/points-lane-perf.bench.test.ts` | — | `BENCH_POINTS` |
 | hover pick (interaction) | — | `core/__tests__/hit-test-grid-perf.test.ts` | 1M, world+screen | `BENCH_HIT` (`core/hit-test.bench.test.ts`) |
 | network LOD cut + declutter | — | `network/__tests__/frontier-perf.test.ts` | 100k, **all-leaves frontier** | `BENCH_FRONTIER` |
-| network LOD super-edges | — | `network/__tests__/super-edges-perf.test.ts` | 100k + all-leaves | `BENCH_SUPER_EDGES` (+ all-leaves) |
+| network LOD super-edges | — | `network/__tests__/super-edges-perf.test.ts` | 100k + all-leaves; **ragged** module tree 100k (sweep + mixed-level + all-leaves, #325) | `BENCH_SUPER_EDGES` (+ all-leaves; ragged leg too) |
 | network LOD end-to-end | — | `network/__tests__/lod-perf.bench.test.ts` | — | `BENCH_LOD` |
 | network no-LOD labels | — | `network/__tests__/label-candidates-perf.test.ts` | 100k | `BENCH_LABEL_CANDIDATES` |
 | network selection dim | — | `network/__tests__/selection-dim-perf.test.ts` | 100k | — |

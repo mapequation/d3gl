@@ -166,10 +166,16 @@ export function gpuMultilevelSeed(
     offsetByDepth[2 * i + 1] = r * Math.sin(a);
   }
 
-  // ── 5. Per-depth super-edge lists in slot ids (directed out-edges; every super-edge connects two
-  //       same-depth nodes, so bucket by the source's depth). GpuForceLayout symmetrises via buildCSR.
+  // ── 5. Per-depth super-edge lists in slot ids (directed out-edges between two same-depth nodes, bucketed
+  //       by the source's depth). A ragged tree's CSR also holds lift pairs between different depths
+  //       (#325); a slot only means something within its own depth, so those are skipped. GpuForceLayout
+  //       symmetrises via buildCSR.
   const seCountByDepth = new Uint32Array(maxDepth + 1);
-  for (let g = 0; g < size; g++) seCountByDepth[depth[g]!] = seCountByDepth[depth[g]!]! + (superEdgeOffset[g + 1]! - superEdgeOffset[g]!);
+  for (let g = 0; g < size; g++) {
+    for (let e = superEdgeOffset[g]!; e < superEdgeOffset[g + 1]!; e++) {
+      if (depth[superEdgeTarget[e]!] === depth[g]) seCountByDepth[depth[g]!] = seCountByDepth[depth[g]!]! + 1;
+    }
+  }
   const seSrc: Uint32Array[] = [];
   const seTgt: Uint32Array[] = [];
   for (let d = 0; d <= maxDepth; d++) {
@@ -183,9 +189,11 @@ export function gpuMultilevelSeed(
     const src = seSrc[d]!;
     const tgt = seTgt[d]!;
     for (let e = superEdgeOffset[g]!; e < superEdgeOffset[g + 1]!; e++) {
+      const t = superEdgeTarget[e]!;
+      if (depth[t] !== d) continue; // a lift pair (#325)
       const pos = seCur[d]!;
       src[pos] = gs;
-      tgt[pos] = slot[superEdgeTarget[e]!]!;
+      tgt[pos] = slot[t]!;
       seCur[d] = pos + 1;
     }
   }

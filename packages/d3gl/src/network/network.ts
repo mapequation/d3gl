@@ -344,7 +344,9 @@ export interface NetworkLODOptions {
    /**
    * Draw **super-edges**: links between *both-visible* frontier nodes (leaf↔leaf, module↔module, or
    * aggregate↔aggregate — whatever the cut exposes), sized + coloured by their accumulated flow and
-   * rendered in the active `linkStyle`. Default `true`. @see {@link superEdges}
+   * rendered in the active `linkStyle`. In a ragged module tree, where leaves sit at different depths, a
+   * leaf is also linked to a visible *deeper* node (a finer module or a deeper leaf) holding the other end
+   * of one of its edges (#325). Default `true`. @see {@link superEdges}
    */
   superEdges?: boolean;
   /**

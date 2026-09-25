@@ -60,11 +60,20 @@ export interface LODTopology {
    * node `g`'s out-edges are `[superEdgeOffset[g] .. superEdgeOffset[g+1])`, going to `superEdgeTarget`
    * with summed directed `superEdgeFlow`. A graph edge contributes at every level from the leaves up to
    * its endpoints' lowest common module, so leaf↔leaf and module↔module pairs both have an entry —
-   * whichever the cut makes visible. Absent for coarsening / spatial trees. @see {@link buildModuleLODTree}
+   * whichever the cut makes visible. Between endpoints at different depths (a ragged tree) it also
+   * contributes a **lift pair** per level in between, pairing each deeper-side node with the shallower
+   * endpoint in the edge's direction (#325), so a depth-4 leaf and a depth-3 leaf are linked directly.
+   * Absent for coarsening / spatial trees. @see {@link buildModuleLODTree}
    */
   superEdgeOffset?: Uint32Array;
   superEdgeTarget?: Uint32Array;
   superEdgeFlow?: Float32Array;
+  /**
+   * Per-node depth below the root (root = 0), length `size` — built and present together with the
+   * super-edge CSR. A pair whose endpoints differ in depth is a lift pair (#325); the gather follows it
+   * only from its deeper endpoint, so its flow is never counted twice. @see {@link buildSuperEdges}
+   */
+  depth?: Int32Array;
   /**
    * Provided-module trees only (#197/#324): each tree node's last Infomap path entry — a module's branch
    * id within its parent, a leaf's rank in its module; `-1` for the root. With {@link parent} it spells
@@ -279,18 +288,23 @@ export interface SuperEdgeInput {
  * Directed, flow-weighted super-edge adjacency over a tree (#104 N6). Each graph edge `u→v` contributes
  * at every level from the leaves up to (not including) `u`/`v`'s lowest common ancestor: walk both
  * ancestor chains in lockstep (after equalising depth), adding a directed `a→b` at each level until they
- * meet, summing flow per ordered pair. Tree-generic — works for a coarsening tree or a module tree (it
- * only needs `parent`, with parent ids greater than child ids). The cut renders whichever level is
- * visible. Both the **out**-adjacency (by source) and the **in**-adjacency (the transpose, by target)
- * are returned, so the gather can keep a visible node's edges to off-screen neighbours symmetrically —
- * outgoing (walk the node's out-edges) *and* incoming (walk its in-edges) — without re-scanning
- * off-screen sources (#104: WebGL incoming-link culling fix).
+ * meet, summing flow per ordered pair. When `u` and `v` sit at **different depths** (a ragged module
+ * tree), equalising depth adds a **lift pair** at each step, pairing the deeper side's node at that step
+ * with the shallower endpoint in the edge's direction (#325), so the edge is linked wherever its deeper
+ * side is visible below the shallower endpoint's depth (a depth-4 leaf to a depth-3 leaf). An edge from a node into its own
+ * ancestor lies inside one subtree at every cut and contributes nothing. Tree-generic — works for a
+ * coarsening tree or a module tree (it only needs `parent`, with parent ids greater than child ids).
+ * The cut renders whichever level is visible. Both the **out**-adjacency (by source) and the
+ * **in**-adjacency (the transpose, by target) are returned, so the gather can keep a visible node's
+ * edges to off-screen neighbours symmetrically — outgoing (walk the node's out-edges) *and* incoming
+ * (walk its in-edges) — without re-scanning off-screen sources (#104: WebGL incoming-link culling fix).
+ * The per-node `depth` is returned with them: the gather tells a lift pair by its endpoints' depths.
  */
 export function buildSuperEdges(
   size: number,
   parent: Int32Array,
   edges: SuperEdgeInput,
-): Pick<LODTopology, "superEdgeOffset" | "superEdgeTarget" | "superEdgeFlow" | "superEdgeInOffset" | "superEdgeInSource" | "superEdgeInFlow"> {
+): Pick<LODTopology, "superEdgeOffset" | "superEdgeTarget" | "superEdgeFlow" | "superEdgeInOffset" | "superEdgeInSource" | "superEdgeInFlow" | "depth"> {
   // Depth from root. Parents have higher ids than children, so a single descending pass finalises each
   // parent before its children.
   const depth = new Int32Array(size);
@@ -313,8 +327,23 @@ export function buildSuperEdges(
     let a = edges.source[e]!;
     let b = edges.target[e]!;
     if (a === b) continue; // self-loop
-    while (depth[a]! > depth[b]!) a = parent[a]!;
-    while (depth[b]! > depth[a]!) b = parent[b]!;
+    // Equalise depth: lift the deeper endpoint to the shallower one's depth (only one side moves).
+    let la = a;
+    let lb = b;
+    while (depth[la]! > depth[b]!) la = parent[la]!;
+    while (depth[lb]! > depth[a]!) lb = parent[lb]!;
+    if (la === lb) continue; // one endpoint is the other's ancestor: inside one subtree at every cut
+    // Lift pairs (#325): each node the lift passes → the shallower endpoint (deeper source → b, or a → deeper target).
+    for (let x = a; x !== la; x = parent[x]!) {
+      outDeg[x] = outDeg[x]! + 1;
+      contributions++;
+    }
+    for (let y = b; y !== lb; y = parent[y]!) {
+      outDeg[a] = outDeg[a]! + 1;
+      contributions++;
+    }
+    a = la;
+    b = lb;
     while (a !== b) {
       outDeg[a] = outDeg[a]! + 1;
       contributions++;
@@ -336,8 +365,25 @@ export function buildSuperEdges(
     let b = edges.target[e]!;
     if (a === b) continue;
     const w = edges.weight[e]!;
-    while (depth[a]! > depth[b]!) a = parent[a]!;
-    while (depth[b]! > depth[a]!) b = parent[b]!;
+    let la = a;
+    let lb = b;
+    while (depth[la]! > depth[b]!) la = parent[la]!;
+    while (depth[lb]! > depth[a]!) lb = parent[lb]!;
+    if (la === lb) continue;
+    for (let x = a; x !== la; x = parent[x]!) {
+      const p = cursor[x]!;
+      cursor[x] = p + 1;
+      bucketTarget[p] = b;
+      bucketFlow[p] = w;
+    }
+    for (let y = b; y !== lb; y = parent[y]!) {
+      const p = cursor[a]!;
+      cursor[a] = p + 1;
+      bucketTarget[p] = y;
+      bucketFlow[p] = w;
+    }
+    a = la;
+    b = lb;
     while (a !== b) {
       const p = cursor[a]!;
       cursor[a] = p + 1;
@@ -394,7 +440,7 @@ export function buildSuperEdges(
       inCursor[b] = pos + 1;
     }
   }
-  return { superEdgeOffset, superEdgeTarget, superEdgeFlow, superEdgeInOffset, superEdgeInSource, superEdgeInFlow };
+  return { superEdgeOffset, superEdgeTarget, superEdgeFlow, superEdgeInOffset, superEdgeInSource, superEdgeInFlow, depth };
 }
 
 /** Allocate zeroed geometry arrays over a topology, yielding a renderable {@link LODTree}. */
