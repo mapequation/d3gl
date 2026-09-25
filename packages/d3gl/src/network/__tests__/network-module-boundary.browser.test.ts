@@ -76,7 +76,8 @@ describe("module boundaries on every backend (#329)", () => {
   it("rings each expanded module in view — the same set on WebGL, Canvas and SVG, none when off", async () => {
     const counts: number[] = [];
     for (const backend of BACKENDS) {
-      const net = await engine(backend, { ...OPEN_TOP, moduleBoundary: { width: 1.5, color: RING, opacity: 1 } }, K_TOP);
+      // aggregateOutline: false — count the expanded modules' rings alone, not the collapsed ones' default outline.
+      const net = await engine(backend, { ...OPEN_TOP, moduleBoundary: { width: 1.5, color: RING, opacity: 1 }, aggregateOutline: false }, K_TOP);
       counts.push(uses(net.toSVG(), "stroke", RING));
       net.lod({ ...OPEN_TOP }); // option off
       net.syncScreenGeometry();
@@ -86,10 +87,25 @@ describe("module boundaries on every backend (#329)", () => {
     expect(counts).toEqual([2, 2, 2]); // modules 1 and 2 (never the root: the whole network)
   });
 
+  it("outlines the collapsed modules with the same line by default — the same set on every backend", async () => {
+    const counts: number[] = [];
+    for (const backend of BACKENDS) {
+      const withOutline = await engine(backend, { ...OPEN_TOP, moduleBoundary: { width: 1.5, color: RING, opacity: 1 } }, K_TOP);
+      const total = uses(withOutline.toSVG(), "stroke", RING);
+      withOutline.destroy();
+      const ringsOnly = await engine(backend, { ...OPEN_TOP, moduleBoundary: { width: 1.5, color: RING, opacity: 1 }, aggregateOutline: false }, K_TOP);
+      counts.push(total - uses(ringsOnly.toSVG(), "stroke", RING));
+      ringsOnly.destroy();
+    }
+    expect(counts[0]).toBeGreaterThan(0); // the visible collapsed sub-modules
+    expect(new Set(counts).size).toBe(1);
+  });
+
   it("never picks a ring on any backend — it is decoration, like the WebGL lane's", async () => {
     for (const backend of BACKENDS) {
+      // With the collapsed modules' default outline too: neither ring layer is pickable.
       const net = await engine(backend, { ...OPEN_TOP, moduleBoundary: { width: 1.5, color: RING, opacity: 1 } }, K_TOP);
-      expect(uses(net.toSVG(), "stroke", RING), `${backend}: rings drawn`).toBe(2);
+      expect(uses(net.toSVG(), "stroke", RING), `${backend}: rings drawn`).toBeGreaterThan(2);
       const layers = new Map<string, number>();
       for (let y = 10; y < H; y += 20) {
         for (let x = 10; x < W; x += 20) {
@@ -98,6 +114,7 @@ describe("module boundaries on every backend (#329)", () => {
         }
       }
       expect(layers.get("module-boundaries"), `${backend}: ${JSON.stringify([...layers])}`).toBeUndefined();
+      expect(layers.get("node-halos"), `${backend}: ${JSON.stringify([...layers])}`).toBeUndefined();
       net.destroy();
     }
   });
@@ -140,7 +157,7 @@ function ringRadii(svg: string): number[] {
 
 describe("module boundaries follow the nested layout's discs (#329)", () => {
   it("uses the same discs whether the nested layout ran on the worker or the main thread; other layouts fall back", async () => {
-    const lod: NetworkLODOptions = { ...OPEN_TOP, moduleBoundary: { color: RING, opacity: 1 } };
+    const lod: NetworkLODOptions = { ...OPEN_TOP, moduleBoundary: { color: RING, opacity: 1 }, aggregateOutline: false };
     const radii = async (layout: (net: Network) => Promise<void>): Promise<number[]> => {
       const net = network(host(), { width: W, height: H, backend: "webgl" });
       await net.whenReady();

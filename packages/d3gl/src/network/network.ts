@@ -1,5 +1,5 @@
 import { BaseEngine, type BaseEngineOptions, type HoverHit, type InteractiveLayerOptions, type LaneInteractive, type NodeDragSession } from "../map/base-engine.js";
-import { networkLayers, networkLayersFromCache, noLodStyleCache, drawsLinks, frontierCircles, frontierHalos, boundaryRings, traceBoundaryRings, superEdges, makeSuperEdgesScratch, emitNodes, emitLinks, emitArrows, emitHalfLinks, traceFrontierGlyphs, traceFrontierHalos, traceSuperHalfArrows, traceSuperLines, traceSuperArrows, physicalPieInstances, tracePieWedges, rgbaCss, pickNodes, regionNodes, resolveNodeRadii, resolveNodeRadiusAggregate, resolveImportance, resolveFlowBorder, resolveNodeColors, resolveLinkWidthOf, resolveLinkColorOf, resolveLinkStrokeOf, flowBorderInnerRadii, type ResolvedNetworkStyle, type ModuleBoundaryResolved, type NoLodStyleCache, type NodeRadiusSpec, type ImportanceSpec, type FlowBorderSpec, type ConstBorder, type LinkWidthSpec, type LinkColorSpec, type LinkStyle } from "./glyphs.js";
+import { networkLayers, networkLayersFromCache, noLodStyleCache, drawsLinks, frontierCircles, frontierHalos, boundaryRings, traceBoundaryRings, superEdges, makeSuperEdgesScratch, emitNodes, emitLinks, emitArrows, emitHalfLinks, traceFrontierGlyphs, traceFrontierHalos, traceSuperHalfArrows, traceSuperLines, traceSuperArrows, physicalPieInstances, tracePieWedges, rgbaCss, pickNodes, regionNodes, resolveNodeRadii, resolveNodeRadiusAggregate, resolveImportance, resolveFlowBorder, resolveNodeColors, resolveLinkWidthOf, resolveLinkColorOf, resolveLinkStrokeOf, flowBorderInnerRadii, type ResolvedNetworkStyle, type ModuleBoundaryResolved, type AggregateOutlineResolved, type NoLodStyleCache, type NodeRadiusSpec, type ImportanceSpec, type FlowBorderSpec, type ConstBorder, type LinkWidthSpec, type LinkColorSpec, type LinkStyle } from "./glyphs.js";
 import { rgb } from "d3-color";
 import { ForceLayout, seedPositions, type ForceParams } from "./force.js";
 import { multilevelLayout, type CoarsenOptions } from "./coarsen.js";
@@ -23,6 +23,19 @@ import type { InstancedLayer, ViewTransform } from "../core/index.js";
 import { InstancedLane, type SelectionStrategy } from "../core/instanced-lane.js";
 import { resolveRingColors, ringCircles } from "../map/highlight-ring.js";
 import { hoverParts } from "../map/highlight.js";
+
+/**
+ * The collapsed-module outline ring's resolved line (#329): an explicit `aggregateOutline`, else
+ * `moduleBoundary`'s line (so collapsed and expanded modules share one outline), else none.
+ */
+function aggregateOutlineOf(opts: NetworkLODOptions): Pick<AggregateOutlineResolved, "width" | "gap" | "color" | "opacity"> | null {
+  const ao = opts.aggregateOutline;
+  if (ao === false) return null;
+  if (ao) return { width: ao.width ?? 1.5, gap: ao.gap ?? 2.5, color: ao.color ?? "#3a3f52", opacity: ao.opacity ?? 1 };
+  const mb = opts.moduleBoundary;
+  if (!mb) return null;
+  return { width: mb.width ?? 1, gap: 2.5, color: mb.color ?? "#3a3f52", opacity: mb.opacity ?? 0.5 };
+}
 
 /** Options for the network engine. Inherits sizing, `backend`, and `tooltipClass`. */
 export interface NetworkOptions extends BaseEngineOptions {}
@@ -390,9 +403,14 @@ export interface NetworkLODOptions {
    * Mark **aggregate** glyphs (collapsed modules/subtrees, not leaves) with a thin outline **ring** set
    * a `gap` px outside the glyph, so it reads as expandable — distinguishing a collapsed module from an
    * individual node at intermediate zoom. `width`/`gap` in px (default 1.5 / 2.5), `color` any CSS
-   * colour (default a dark neutral). Omit to disable.
+   * colour (default a dark neutral), `opacity` 0-1 (default 1).
+   *
+   * **Default:** with {@link moduleBoundary} set, collapsed modules get the same line as expanded ones
+   * (its `width`, `color` and `opacity`, at the default gap), so a module keeps one outline whether it
+   * is collapsed or open. Without it, off. Pass an object to style it separately, or `false` to turn it
+   * off.
    */
-  aggregateOutline?: { width?: number; gap?: number; color?: string };
+  aggregateOutline?: { width?: number; gap?: number; color?: string; opacity?: number } | false;
   /**
    * Draw a thin **boundary ring** around every **expanded** module in view (#329) — the aggregates the
    * cut has opened into their members (in a {@link crossFade} band: those whose members it draws), so
@@ -2666,11 +2684,10 @@ export class Network extends BaseEngine {
     }
     // Aggregate-outline affordance: a halo ring behind collapsed-module glyphs (not leaves), under the
     // nodes, so a module reads as expandable. WebGL/LOD-only (the vector full-graph draw has no aggregates).
-    if (opts.aggregateOutline) {
+    const outline = aggregateOutlineOf(opts);
+    if (outline) {
       const halos = frontierHalos(tree, frontier, {
-        width: opts.aggregateOutline.width ?? 1.5,
-        gap: opts.aggregateOutline.gap ?? 2.5,
-        color: opts.aggregateOutline.color ?? "#3a3f52",
+        ...outline,
         maxAggregateRadius: opts.maxAggregateRadius,
         fadeAlpha: this.fadeAlpha ?? undefined,
       });
@@ -3082,25 +3099,26 @@ export class Network extends BaseEngine {
     });
 
     // --- Aggregate-outline halo rings, behind collapsed-module glyphs only (under the nodes). ---
-    const halos =
-      emit && opts.aggregateOutline
-        ? frontierHalos(tree, frontier, {
-            width: opts.aggregateOutline.width ?? 1.5,
-            gap: opts.aggregateOutline.gap ?? 2.5,
-            color: opts.aggregateOutline.color ?? "#3a3f52",
-            maxAggregateRadius: opts.maxAggregateRadius,
-            fadeAlpha: this.fadeAlpha ?? undefined,
-          })
-        : null;
+    const outline = emit ? aggregateOutlineOf(opts) : null;
+    const halos = outline
+      ? frontierHalos(tree, frontier, {
+          ...outline,
+          maxAggregateRadius: opts.maxAggregateRadius,
+          fadeAlpha: this.fadeAlpha ?? undefined,
+        })
+      : null;
     const haloIds = halos ? Array.from(halos.ids) : [];
     this.registerLayer({
       name: "node-halos",
       data: haloIds,
       ids: haloIds,
       sizeMode: style.sizeMode,
+      // Decoration, like its WebGL twin: an instanced circles layer no pick resolves.
+      pickable: false,
+      fill: () => "rgba(0, 0, 0, 0)",
       stroke: (_d, i) => (halos?.borderColors ? rgbaCss(halos.borderColors, i) : ""),
       build: (g) => {
-        if (halos) traceFrontierHalos(g, halos, screen);
+        if (halos) traceFrontierHalos(g, halos);
       },
     });
 

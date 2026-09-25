@@ -47,7 +47,7 @@ const SIZES = [500, 1_000, 2_000, 5_000, 10_000, 20_000];
  * `net.interactive({ selectable, hover, draggable })` adds the selection/hover rings + node-drag (#140):
  * hover/click rings a node or module, ⇧+drag box-selects (⌥ subtracts), and dragging a glyph — or a whole
  * selection, or a collapsed module — moves it (translate-only here, on the `positions` backend). It shows
- * the selection/hover ring living alongside the per-node **flowBorder** ring and a module's **aggregateOutline**.
+ * the selection/hover ring living alongside the per-node **flowBorder** ring and a module's **outline**.
  */
 export const setup: ImperativeSetup = (host, { width, height, backend }) => {
   const net = network(host, { width, height, backend });
@@ -55,7 +55,7 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
   // Selection + hover rings and node-drag (#140): hover/click rings a node or module (green hover, blue
   // selection), ⇧+drag box-selects (⌥ subtracts, red preview), and dragging a glyph — or a whole selected
   // set, or a collapsed module — moves it. Note how the selection/hover ring sits alongside the per-node
-  // flowBorder ring and a collapsed module's aggregateOutline.
+  // flowBorder ring and a collapsed module's outline.
   net.interactive({ selectable: { multi: true }, draggable: true, hover: true });
 
   // Labels slider → max cap; the last position is "All" (no limit).
@@ -147,10 +147,9 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
         linkStroke, // semi-transparent blue, alpha ∝ flow
       });
       const mode = (options.lod as string) ?? "Modules";
-      // A thin outline ring, set a few px outside the glyph, marks collapsed aggregates as expandable.
-      const aggregateOutline = { width: 1.5, gap: 3 };
-      // #329: ring each module the cut has OPENED (its nested disc after the Nested layout), so the map
-      // of modules stays readable as you zoom into it.
+      // #329: one outline per module — a ring a few px outside a collapsed module's glyph (marking it as
+      // expandable) and, once the cut opens it, around its nested disc — so the map of modules stays
+      // readable as you zoom into it. (Style the collapsed ring separately with `aggregateOutline`.)
       const moduleBoundary = options.boundaries === "Off" ? undefined : { width: 1, opacity: 0.45 };
       // Opt-in #139: keep a visible leaf's links to a still-collapsed module across a mixed frontier.
       // Opt-in #133: ease modules ↔ sub-members across the expand threshold (slider × 0.1 = fade band).
@@ -160,13 +159,13 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
         net.lod(false);
       } else if (mode === "Standard") {
         // Structural coarsening — ignores the partition; aggregates joined by plain super-edge lines.
-        net.lod({ source: "structure", expandPx, declutter, aggregateOutline, moduleBoundary, crossLevelEdges, crossFade });
+        net.lod({ source: "structure", expandPx, declutter, moduleBoundary, crossLevelEdges, crossFade });
       } else {
         // The planted partition (the default source) drives the cut → directed half-arrow super-edges
         // ∝ accumulated flow. No aggregate-radius cap: a module is sized by `nodeRadius` applied to its
         // members' summed flow (the scale extrapolates above the leaf domain), so a module reads as its
         // total flow.
-        net.lod({ expandPx, declutter, superEdges: true, aggregateOutline, moduleBoundary, crossLevelEdges, crossFade });
+        net.lod({ expandPx, declutter, superEdges: true, moduleBoundary, crossLevelEdges, crossFade });
       }
     },
   };

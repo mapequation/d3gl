@@ -562,6 +562,8 @@ export interface AggregateOutlineResolved {
   width: number;
   gap: number;
   color: string;
+  /** Multiplies the ring colour's alpha (0-1). */
+  opacity: number;
   maxAggregateRadius?: number;
   /** Cross-fade alpha (#133), indexed by tree-node id — scales each ring's alpha so a halo fades with its aggregate. */
   fadeAlpha?: Float32Array;
@@ -586,6 +588,7 @@ export function frontierHalos(tree: LODTree, frontier: Uint32Array, style: Aggre
   const radii = new Float32Array(count);
   const borders = new Float32Array(count);
   const ring = toRGBA(style.color);
+  ring[3] = Math.round(ring[3] * style.opacity);
   const borderColors = new Uint8Array(count * 4);
   // Stable tree-node id per halo, so the Scene path (#138) keys its ring drawables identically to the
   // frontier glyph they sit behind (and the retained-scene diff stays stable across re-cuts).
@@ -1830,28 +1833,18 @@ export function traceFrontierGlyphs(g: GroupBuilder, circles: InstancedCirclesDa
 }
 
 /**
- * Trace the aggregate-outline **halo rings** (a `width`-thick stroked circle a `gap` outside each
- * collapsed-module glyph) into a Scene group, keyed by the halo's tree-node id. In `screen` sizeMode the
- * ring is pinned at a constant pixel size around the projected centre via the drawable `anchor` (the
- * same mechanism a `point` uses); in world mode it's plain world geometry. The stroke colour comes from
- * the layer accessor reading `halos.borderColors`.
+ * Trace the aggregate-outline **halo rings** (a `width`-thick ring a `gap` outside each collapsed-module
+ * glyph) into a Scene group, keyed by the halo's tree-node id: the ring-encoded circle every glyph shares
+ * ({@link ringPoint} — one circle on the ring centreline, stroked the ring's thickness), so Canvas/SVG draw
+ * and export exactly what the WebGL instanced circle does. A `point` follows the layer's sizeMode, so a
+ * `screen`-mode ring stays a constant pixel size. The stroke colour comes from the layer accessor reading
+ * `halos.borderColors`; the layer's fill is transparent.
  */
-export function traceFrontierHalos(g: GroupBuilder, halos: FrontierHalosData, screen: boolean): void {
+export function traceFrontierHalos(g: GroupBuilder, halos: FrontierHalosData): void {
   const { centers, radii, borders, ids } = halos;
   for (let k = 0; k < halos.count; k++) {
-    const cx = centers[k * 2]!;
-    const cy = centers[k * 2 + 1]!;
     const outer = radii[k]!;
-    const w = outer * borders[k]!; // ring thickness (= style.width, in the active sizeMode's units)
-    const mid = outer - w / 2; // stroke centreline radius, so the ring's outer edge sits at `outer`
-    g.drawable(
-      ids[k]!,
-      (ctx) => {
-        ctx.moveTo(cx + mid, cy);
-        ctx.arc(cx, cy, mid, 0, Math.PI * 2);
-      },
-      screen ? { lineWidth: w, anchor: [cx, cy] } : { lineWidth: w },
-    );
+    ringPoint(g, ids[k]!, centers[k * 2]!, centers[k * 2 + 1]!, outer, outer * (1 - borders[k]!));
   }
 }
 

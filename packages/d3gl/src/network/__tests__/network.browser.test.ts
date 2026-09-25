@@ -204,15 +204,41 @@ describe("network() engine", () => {
     net.setTransform({ k: 1, x: 0, y: 0 });
     net.syncScreenGeometry();
     const svg = net.toSVG();
-    // Two collapsed aggregates, each ONE ring-encoded circle (fill + the border as its stroke, #269).
-    expect((svg.match(/<circle/g) ?? []).length).toBe(2);
-    expect((svg.match(/<circle[^/]*stroke-width=/g) ?? []).length).toBe(2); // …and both carry the ring
-    // The aggregate-outline ring is a stroked arc per aggregate (2) + the fused half-arrow super-edge
-    // between the two modules (1) → at least 3 path elements; the half-arrow path is filled.
-    expect((svg.match(/<path/g) ?? []).length).toBeGreaterThanOrEqual(3);
-    expect(svg).toContain("rgba(58, 63, 82"); // the halo ring colour (#3a3f52) reached the export
+    // Two collapsed aggregates, each ONE ring-encoded circle (fill + the border as its stroke, #269), and
+    // behind each an aggregate-outline halo — also one ring-encoded circle, with no fill (#329), exactly
+    // what the WebGL lane exports for its instanced halo.
+    expect((svg.match(/<circle/g) ?? []).length).toBe(4);
+    expect((svg.match(/<circle[^/]*stroke-width=/g) ?? []).length).toBe(4); // …and all four carry a ring
+    expect((svg.match(/<circle[^>]*fill="none"[^>]*stroke="rgba\(58, 63, 82/g) ?? []).length).toBe(2); // the halos (#3a3f52)
+    // The fused half-arrow super-edge between the two modules is a filled path.
+    expect((svg.match(/<path/g) ?? []).length).toBeGreaterThanOrEqual(1);
 
     net.destroy();
+  });
+
+  it("outlines collapsed modules with the module boundary's line unless aggregateOutline says otherwise (#329)", async () => {
+    // Two collapsed modules; count the stroked ring paths in the export whose colour is the given one.
+    const ringsIn = async (lod: Parameters<ReturnType<typeof network>["lod"]>[0], rgb: string): Promise<number> => {
+      const net = network(host(), { width: 200, height: 200, backend: "svg" });
+      await net.whenReady();
+      const g = buildGraph({ nodeCount: 4, source: [0, 2], target: [1, 3], directed: true });
+      net
+        .data(g, { modules: [{ id: 0, path: [1, 1] }, { id: 1, path: [1, 2] }, { id: 2, path: [2, 1] }, { id: 3, path: [2, 2] }] })
+        .style({ sizeMode: "screen", nodeRadius: 8 })
+        .lod(lod)
+        .layout({ backend: "positions", positions: new Float32Array([70, 90, 85, 90, 115, 110, 130, 110]) });
+      net.setTransform({ k: 1, x: 0, y: 0 });
+      net.syncScreenGeometry();
+      const n = (net.toSVG().match(new RegExp(`<circle[^>]*stroke="rgba\\(${rgb}`, "g")) ?? []).length;
+      net.destroy();
+      return n;
+    };
+    // moduleBoundary alone: both collapsed modules get its line (#123456 at opacity 0.5).
+    expect(await ringsIn({ expandPx: 20, moduleBoundary: { color: "#123456", opacity: 0.5 } }, "18, 52, 86")).toBe(2);
+    // aggregateOutline: false turns the collapsed outline off.
+    expect(await ringsIn({ expandPx: 20, moduleBoundary: { color: "#123456" }, aggregateOutline: false }, "18, 52, 86")).toBe(0);
+    // An explicit aggregateOutline wins over the boundary's line.
+    expect(await ringsIn({ expandPx: 20, moduleBoundary: { color: "#123456" }, aggregateOutline: { color: "#654321" } }, "101, 67, 33")).toBe(2);
   });
 
   it("draws cross-level super-edges between mixed-level visible nodes only when opted in (#139)", async () => {
