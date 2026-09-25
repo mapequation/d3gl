@@ -30,8 +30,11 @@ jobs:
           registry-url: https://registry.npmjs.org
 
       # OIDC trusted publishing to npm needs npm >= 11.5.1; Node 22 ships ~10.x.
+      # Pinned to 11.x: npm 12 rejects unknown CLI flags (EUNKNOWNCONFIG), and pnpm 9's
+      # `pnpm publish` (which `changeset publish` runs) delegates to npm with pnpm's
+      # `--no-git-checks`, so publishing 0.10.0 failed under npm@latest (12.x).
       - name: Upgrade npm (OIDC trusted publishing)
-        run: npm install -g npm@latest
+        run: npm install -g npm@11
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
