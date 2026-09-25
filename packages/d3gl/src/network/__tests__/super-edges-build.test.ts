@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { buildSuperEdges, type SuperEdgeInput } from "../lod.js";
+import { buildModuleLODTree } from "../modules.js";
 
 /**
  * `buildSuperEdges` correctness + scale (#177).
@@ -13,14 +14,15 @@ import { buildSuperEdges, type SuperEdgeInput } from "../lod.js";
  * Two legs:
  *  1. **Equivalence (always on).** Randomised trees + graphs, checked against a straightforward
  *     `Map`-based reference. This is what actually pins the semantics: the CSR pair set, the flow
- *     sums, and the out/in transpose must match exactly.
+ *     sums, and the out/in transpose must match exactly. Uniform-depth trees and **ragged** ones
+ *     (leaves at different depths, whose edges add depth-equalising lift pairs, #325) alike.
  *  2. **Cap crossing (`BENCH_SUPER_EDGES_BUILD`, auto-enrolled in the CI perf tier).** Builds a
  *     hierarchy whose distinct-pair count exceeds 2²⁴ — the input that used to throw. Gated because
  *     crossing the cap costs ~17M pairs however you construct it (~1 GB, tens of seconds); there is
  *     no small input that reaches a 16.7M-entry ceiling.
  */
 
-// ---- reference implementation (the pre-#177 Map version, kept as the oracle) -------------------
+// ---- reference implementation (the pre-#177 Map version, kept as the oracle; lift pairs #325) ----
 
 interface SuperEdgeCSR {
   superEdgeOffset: Uint32Array;
@@ -36,17 +38,29 @@ function referenceSuperEdges(size: number, parent: Int32Array, edges: SuperEdgeI
   for (let g = size - 2; g >= 0; g--) depth[g] = depth[parent[g]!]! + 1;
 
   const flowByPair = new Map<number, number>();
+  const add = (a: number, b: number, w: number): void => {
+    const key = a * size + b;
+    flowByPair.set(key, (flowByPair.get(key) ?? 0) + w);
+  };
   const m = edges.source.length;
   for (let e = 0; e < m; e++) {
     let a = edges.source[e]!;
     let b = edges.target[e]!;
     if (a === b) continue;
     const w = edges.weight[e]!;
-    while (depth[a]! > depth[b]!) a = parent[a]!;
-    while (depth[b]! > depth[a]!) b = parent[b]!;
+    // #325: equalising depth adds a lift pair per step (deeper node → the shallower endpoint) — unless
+    // one endpoint is the other's ancestor, when the edge contributes nothing at all.
+    let la = a;
+    while (depth[la]! > depth[b]!) la = parent[la]!;
+    let lb = b;
+    while (depth[lb]! > depth[a]!) lb = parent[lb]!;
+    if (la === lb) continue;
+    for (let x = a; x !== la; x = parent[x]!) add(x, b, w);
+    for (let y = b; y !== lb; y = parent[y]!) add(a, y, w);
+    a = la;
+    b = lb;
     while (a !== b) {
-      const key = a * size + b;
-      flowByPair.set(key, (flowByPair.get(key) ?? 0) + w);
+      add(a, b, w);
       a = parent[a]!;
       b = parent[b]!;
     }
@@ -116,6 +130,52 @@ function randomTree(leafCount: number, fanout: number): { size: number; parent: 
   const size = parent.length;
   parent[size - 1] = size - 1; // root: self-parent, never walked past (a === b terminates first)
   return { size, parent: Int32Array.from(parent), leafCount };
+}
+
+/**
+ * A **ragged** module tree (#325): leaves at depths 1..`maxDepth`, some directly under the root, built by
+ * the module-tree builder that produces such trees in practice (parent ids > child ids, root last).
+ */
+function raggedTree(leafTarget: number, maxDepth: number, seed: number): { size: number; parent: Int32Array; leafCount: number } {
+  const r = rng(seed);
+  const paths: number[][] = [];
+  const grow = (prefix: number[]): void => {
+    const k = 2 + Math.floor(r() * 4);
+    for (let i = 1; i <= k; i++) {
+      const path = [...prefix, i];
+      if (path.length < maxDepth && paths.length < leafTarget && r() < 0.5) grow(path);
+      else paths.push(path);
+    }
+  };
+  for (let t = 1; paths.length < leafTarget; t++) {
+    if (r() < 0.85) grow([t]);
+    else paths.push([t]);
+  }
+  const tree = buildModuleLODTree(paths.length, paths.map((path, id) => ({ id, path })));
+  if (!tree.parent) throw new Error("module trees carry a parent map");
+  return { size: tree.size, parent: tree.parent, leafCount: tree.leafCount };
+}
+
+/** Random edges between ANY non-root tree nodes — aggregates at other depths, and ancestor pairs too (module links). */
+function randomTreeNodeEdges(size: number, m: number, seed: number): SuperEdgeInput {
+  const r = rng(seed);
+  const source = new Uint32Array(m);
+  const target = new Uint32Array(m);
+  const weight = new Float32Array(m);
+  for (let e = 0; e < m; e++) {
+    source[e] = Math.floor(r() * (size - 1));
+    target[e] = Math.floor(r() * (size - 1));
+    weight[e] = Math.round(r() * 100) / 4;
+  }
+  return { source, target, weight };
+}
+
+function concatEdges(a: SuperEdgeInput, b: SuperEdgeInput): SuperEdgeInput {
+  return {
+    source: Uint32Array.from([...Array.from(a.source), ...Array.from(b.source)]),
+    target: Uint32Array.from([...Array.from(a.target), ...Array.from(b.target)]),
+    weight: Float32Array.from([...Array.from(a.weight), ...Array.from(b.weight)]),
+  };
 }
 
 function randomEdges(leafCount: number, m: number, seed: number): SuperEdgeInput {
@@ -190,6 +250,62 @@ describe("buildSuperEdges — equivalence with the Map reference (#177)", () => 
       expectSameCSR(buildSuperEdges(size, parent, edges), referenceSuperEdges(size, parent, edges), size);
     });
   }
+
+  const ragged: Array<[string, number, number, number, number]> = [
+    // label, leafTarget, maxDepth, edgeCount, seed
+    ["ragged, shallow", 60, 3, 400, 11],
+    ["ragged, deep", 300, 7, 3000, 12],
+    ["ragged, wide", 1000, 4, 6000, 13],
+  ];
+  for (const [label, leafTarget, maxDepth, m, seed] of ragged) {
+    it(`matches the reference with lift pairs (#325): ${label}`, () => {
+      const { size, parent, leafCount } = raggedTree(leafTarget, maxDepth, seed);
+      const edges = concatEdges(randomEdges(leafCount, m, seed), randomTreeNodeEdges(size, m / 4, seed + 1));
+      const got = buildSuperEdges(size, parent, edges);
+      expectSameCSR(got, referenceSuperEdges(size, parent, edges), size);
+      // The build hands out the depth it used, which the gather reads to tell a lift pair.
+      const depth = new Int32Array(size);
+      for (let g = size - 2; g >= 0; g--) depth[g] = depth[parent[g]!]! + 1;
+      expect(Array.from(got.depth!)).toEqual(Array.from(depth));
+      // Non-vacuity: the tree is ragged and the CSR carries pairs between different depths.
+      let lift = 0;
+      for (let g = 0; g < size; g++) for (let p = got.superEdgeOffset[g]!; p < got.superEdgeOffset[g + 1]!; p++) if (depth[got.superEdgeTarget[p]!] !== depth[g]) lift++;
+      expect(lift).toBeGreaterThan(0);
+    });
+  }
+
+  it("adds one lift pair per level between the endpoints' depths, and nothing for an edge into an ancestor (#325)", () => {
+    // u = 1:3:2:5 (depth 4), v = 2:1:7 (depth 3).
+    const tree = buildModuleLODTree(2, [
+      { id: 0, path: [1, 3, 2, 5] },
+      { id: 1, path: [2, 1, 7] },
+    ]);
+    const parent = tree.parent!;
+    const up = (g: number, k: number): number => (k === 0 ? g : up(parent[g]!, k - 1));
+    const u = 0;
+    const v = 1;
+    const edges: SuperEdgeInput = {
+      source: Uint32Array.from([u, v, u]),
+      target: Uint32Array.from([v, u, up(u, 2)]), // u→v, v→u, and u → its own module 1:3
+      weight: Float32Array.from([1, 2, 4]),
+    };
+    const got = buildSuperEdges(tree.size, parent, edges);
+    const pairs = csrPairs(got.superEdgeOffset, got.superEdgeTarget, got.superEdgeFlow, tree.size);
+    expect(new Map([...pairs].sort())).toEqual(
+      new Map(
+        [
+          [`${u}:${v}`, 1], // lift: u (depth 4) → v
+          [`${up(u, 1)}:${v}`, 1], // 1:3:2 (depth 3) → v — the first same-depth pair
+          [`${up(u, 2)}:${up(v, 1)}`, 1], // 1:3 → 2:1
+          [`${up(u, 3)}:${up(v, 2)}`, 1], // 1 → 2
+          [`${v}:${u}`, 2], // and back: v → u (lift on the target side)
+          [`${v}:${up(u, 1)}`, 2],
+          [`${up(v, 1)}:${up(u, 2)}`, 2],
+          [`${up(v, 2)}:${up(u, 3)}`, 2],
+        ].sort(),
+      ),
+    );
+  });
 
   it("handles degenerate inputs identically: no edges, all self-loops, single leaf", () => {
     const { size, parent } = randomTree(32, 2);

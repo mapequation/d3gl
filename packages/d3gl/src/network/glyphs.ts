@@ -683,9 +683,12 @@ export function makeSuperEdgesScratch(): SuperEdgesScratch {
  * a neighbour that is **also on the frontier** *or* whose centroid is **off-screen** (drawn toward it,
  * exiting the view) — so a node's edges don't pop out as a neighbour scrolls off, without dangling into
  * an on-screen region that has no glyph (an off-frontier-but-on-screen neighbour — a collapsed↔expanded
- * mismatch — is skipped, deferred to the LOD cross-fade #133). Width + colour come from the accumulated
- * subsumed flow. Rendered as fused **half-arrows** or bent/straight **lines** + (directed) arrowheads —
- * the same glyph choice the non-LOD path makes. `{}` when the tree has no super-edge CSR (spatial tree).
+ * mismatch — is skipped, deferred to the LOD cross-fade #133). In a ragged tree a pair may join nodes at
+ * different depths (a lift pair, #325 — see `buildSuperEdges`); it is drawn whenever both ends are
+ * present, but followed toward a non-present neighbour only from its deeper end, so each edge is drawn
+ * once. Width + colour come from the accumulated subsumed flow. Rendered as fused **half-arrows** or
+ * bent/straight **lines** + (directed) arrowheads — the same glyph choice the non-LOD path makes. `{}`
+ * when the tree has no super-edge CSR (spatial tree).
  *
  * Pass an engine-owned `scratch` ({@link makeSuperEdgesScratch}) to make the per-call cost
  * O(frontier + drawn super-edges) — without it, presence tracking re-allocates O(tree.size) (#210).
@@ -714,6 +717,17 @@ export function superEdges(
   // the view toward a real node) — an O(1) test, no cull margin needed. Off-frontier *on-screen*
   // neighbours (collapsed↔expanded) are skipped.
   const offScreen = (h: number): boolean => tree.cx[h]! < view.minX || tree.cx[h]! > view.maxX || tree.cy[h]! < view.minY || tree.cy[h]! > view.maxY;
+  // Lift pairs (#325) join nodes at different depths. The shallower endpoint's rows hold one per lift level
+  // for the same edge, so toward a NON-present neighbour a pair is followed only from its deeper end —
+  // `deeper(h, g)` skips it from the shallower one. (No `depth` — a hand-built CSR — ⇒ all same-depth.)
+  const dep = tree.depth;
+  const deeper = (h: number, g: number): boolean => dep !== undefined && dep[h]! > dep[g]!;
+  // A present lift pair whose shallower end is an AGGREGATE (a module-link endpoint): a cross-level
+  // projection can land on the same pair (from an edge ending strictly inside it), so it is summed with the
+  // projections rather than drawn on its own. A leaf has nothing inside it — graph-edge lift pairs draw direct.
+  const merges = (g: number, h: number): boolean => dep !== undefined && dep[h] !== dep[g] && (dep[h]! < dep[g]! ? h : g) >= tree.leafCount;
+  // The parent map, only when the cross-level pass (#139) runs below.
+  const par = style.crossLevelEdges ? tree.parent : undefined;
 
   // Gather drawable directed super-edges + a reciprocal-flow lookup (for both-on-frontier pairs) into
   // the scratch's reused grow-arrays/map (outputs are copied out below — they never alias the scratch).
@@ -736,9 +750,14 @@ export function superEdges(
     const g = frontier[i]!;
     for (let p = off[g]!; p < off[g + 1]!; p++) {
       const h = tgt[p]!;
-      if (seen[h] === gen || offScreen(h)) {
+      if (seen[h] === gen) {
+        // Both present. With cross-level edges on, a lift pair onto an aggregate is summed with the projections
+        // below instead (one may land on the same pair, and a pair draws once).
+        if (par && merges(g, h)) continue;
         pushEdge(g, h, flw[p]!);
-        if (seen[h] === gen) flowByPair.set(g * tree.size + h, flw[p]!);
+        flowByPair.set(g * tree.size + h, flw[p]!);
+      } else if (offScreen(h) && !deeper(h, g)) {
+        pushEdge(g, h, flw[p]!);
       }
     }
   }
@@ -753,7 +772,7 @@ export function superEdges(
       const g = frontier[i]!;
       for (let p = inOff[g]!; p < inOff[g + 1]!; p++) {
         const s = inSrc[p]!;
-        if (seen[s] !== gen && offScreen(s)) {
+        if (seen[s] !== gen && offScreen(s) && !deeper(s, g)) {
           pushEdge(s, g, inFlw[p]!);
         }
       }
@@ -762,12 +781,12 @@ export function superEdges(
   // Mixed-level super-edges (#139): the same-level walk skips an off-frontier *on-screen* neighbour (the
   // collapsed↔expanded mismatch). Project it to its nearest present ancestor (`coverOf`) and draw the
   // edge there, deduping per directed pair to sum flow. Iterating from each present node covers both
-  // directions: the finer present side projects the coarser neighbour *up* to a present ancestor; the
-  // coarse side's walk into a finer-expanded region can't project up (its present nodes are below it) and
-  // is simply redundant — so there's no double counting. Gated on `crossLevelEdges` (+ the parent map),
-  // so it's ZERO added cost when off (the same-level gather above is untouched).
-  const par = tree.parent;
-  if (style.crossLevelEdges && par) {
+  // directions: the finer (deeper) present side projects the coarser neighbour *up* to a present ancestor;
+  // the coarse side's walk into a finer-expanded region finds only nodes above the finer cover (no present
+  // ancestor) or lift pairs deeper than itself (skipped) — so each edge is counted exactly once, pinned
+  // over every cut of ragged trees by `super-edges-depth.test.ts` (#325). Gated on `crossLevelEdges` (+ the
+  // parent map), so it's ZERO added cost when off (the same-level gather above is untouched).
+  if (par) {
     // Nearest present ancestor of `h` (climb parents), or -1 if none — memoised with path-compression so
     // the whole pass stays O(off-frontier-on-screen incidences · depth). Keyed in a Map over only the
     // **touched** nodes: a per-frame `Int32Array(tree.size).fill(-2)` would be an O(all tree nodes)
@@ -788,7 +807,15 @@ export function superEdges(
       const g = frontier[i]!;
       for (let p = off[g]!; p < off[g + 1]!; p++) {
         const h = tgt[p]!;
-        if (seen[h] === gen || offScreen(h)) continue; // already emitted by the same-level walk
+        if (seen[h] === gen) {
+          // A present lift pair onto an aggregate (skipped by the same-level walk): summed with projections.
+          if (merges(g, h)) {
+            const key = g * tree.size + h;
+            proj.set(key, (proj.get(key) ?? 0) + flw[p]!);
+          }
+          continue;
+        }
+        if (offScreen(h) || deeper(h, g)) continue; // off-screen: emitted above; deeper: projected from its own end
         const c = coverOf(h);
         if (c >= 0 && c !== g) {
           const key = g * tree.size + c;
@@ -802,7 +829,7 @@ export function superEdges(
         const g = frontier[i]!;
         for (let p = inOff[g]!; p < inOff[g + 1]!; p++) {
           const s = inSrc[p]!;
-          if (seen[s] === gen || offScreen(s)) continue; // present: from its out-walk; off-screen: handled above
+          if (seen[s] === gen || offScreen(s) || deeper(s, g)) continue; // present: from its out-walk; off-screen: handled above
           const c = coverOf(s);
           if (c >= 0 && c !== g) {
             const key = c * tree.size + g;

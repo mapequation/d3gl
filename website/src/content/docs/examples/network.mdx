@@ -191,9 +191,11 @@ What it composes:
   glyph wins an overlap.
 - **Super-edges** draw connectivity between visible nodes (a leaf↔leaf graph edge, or an
   aggregate↔aggregate coarse edge); a visible node keeps its edges even when a neighbour is
-  off-screen. By default they connect *same-level* pairs only, so when you expand one region its leaves
-  lose their links to the still-collapsed regions; **`crossLevelEdges: true`** restores them by projecting
-  the off-frontier endpoint to its nearest visible ancestor (opt-in — zero added cost when off).
+  off-screen. By default they connect *same-level* pairs (and, in a ragged module tree, a leaf to a
+  visible deeper node holding the other end of its edge), so when you expand one region its leaves lose
+  their links to the still-collapsed regions; **`crossLevelEdges: true`** restores them by projecting
+  the off-frontier endpoint to its nearest visible ancestor (opt-in — zero added cost when off). Either
+  way each underlying edge is counted once.
   `superEdges: false` suppresses them under LOD only; to drop links everywhere — LOD on *or* off — use
   `style({ linkStyle: "none" })` instead.
 - **`expandPx`** is that threshold, in absolute pixels. **Leave it out** and each tree picks its own:

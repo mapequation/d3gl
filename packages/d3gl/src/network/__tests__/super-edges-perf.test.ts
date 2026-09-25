@@ -2,8 +2,9 @@ import { describe, it, expect } from "vitest";
 import { appendFileSync } from "node:fs";
 import { buildLODTree, computeLODGeometry, cut, declutterFrontier, visibleWorldRect, type LODTree, type LODTransform } from "../lod.js";
 import { multilevelSeed } from "../coarsen.js";
-import { superEdges, makeSuperEdgesScratch, type SuperEdgesData } from "../glyphs.js";
+import { superEdges, makeSuperEdgesScratch, type SuperEdgesData, type SuperEdgesScratch } from "../glyphs.js";
 import { buildGraph } from "../graph.js";
+import { buildModuleLODTree, type ModuleNode } from "../modules.js";
 
 /**
  * Per-frame regression guard for #210 (AGENTS.md lifecycle §5): `superEdges` must do **zero
@@ -248,6 +249,248 @@ describe("#210 superEdges per-frame cost", () => {
         expect(allMs, `all-leaves frontier ${allMs.toFixed(0)}ms exceeds ${ALL_FRONTIER_MS}ms at N=${BENCH_N}`).toBeLessThan(ALL_FRONTIER_MS);
       }
       expect(frames.length).toBe(24);
+    },
+    600_000,
+  );
+});
+
+// ---- #325: a RAGGED module tree — super-edges between tree nodes at different depths ---------------
+
+const GOLDEN = Math.PI * (3 - Math.sqrt(5));
+
+/**
+ * A ragged, Infomap-shaped module tree over `n` leaves (#325): modules split recursively into 2-15
+ * sub-modules and bottom out at random (below 16-96 leaves, with probability 0.3 below 4000, or at depth
+ * 8), and ~30% of non-bottom modules also hold 1-4 leaves directly beside their sub-modules — so at 1M,
+ * leaves sit at depths 4-9 and sibling subtrees bottom out at different depths. Each leaf has one edge
+ * inside its module and one to a leaf ≤ 4096 ranks on (a nearby module, often at another depth); every
+ * 16th leaf also has a random long-range edge. At 1M that is 35% of edges between different depths and
+ * Σ|Δdepth| = 0.54 per edge — ~12× an Infomap map of web-NotreDame (4.1%, 0.044; 25 levels) and ~50×
+ * science2001 (1.0%, 0.010) — a stress load of cross-depth (lift) pairs. Positions nest each module's
+ * children in its disc, so modules are spatially compact and the cut stays O(visible).
+ */
+function raggedModuleTree(n: number): { tree: LODTree; centroid: [number, number]; baseK: number; depth: Int32Array; liftSteps: number } {
+  let s = 11 >>> 0;
+  const rng = (): number => ((s = (s * 1664525 + 1013904223) >>> 0) / 4294967296);
+  const records: ModuleNode[] = new Array<ModuleNode>(n);
+  const positions = new Float32Array(n * 2);
+  const leafDepth = new Uint8Array(n);
+  const groupLo = new Uint32Array(n); // the leaf's module's leaf range — its local edge stays inside it
+  const groupHi = new Uint32Array(n);
+  const leaf = (i: number, path: number[], x: number, y: number, lo: number, hi: number): void => {
+    records[i] = { id: i, path };
+    positions[2 * i] = x;
+    positions[2 * i + 1] = y;
+    leafDepth[i] = path.length;
+    groupLo[i] = lo;
+    groupHi[i] = hi;
+  };
+  const place = (lo: number, hi: number, prefix: number[], x: number, y: number, R: number): void => {
+    const size = hi - lo;
+    const depth = prefix.length;
+    if (depth >= 1 && (depth >= 8 || size <= 16 + rng() * 80 || (size <= 4000 && rng() < 0.3))) {
+      for (let i = lo; i < hi; i++) {
+        const rank = i - lo;
+        const rr = R * Math.sqrt((rank + 0.5) / size);
+        leaf(i, [...prefix, rank + 1], x + rr * Math.cos(rank * GOLDEN), y + rr * Math.sin(rank * GOLDEN), lo, hi);
+      }
+      return;
+    }
+    const direct = depth >= 1 && rng() < 0.3 ? 1 + Math.floor(rng() * 4) : 0;
+    const k = Math.min(2 + Math.floor(rng() * 14), size - direct);
+    const weights = Array.from({ length: k }, () => 0.2 + rng());
+    const total = weights.reduce((a, b) => a + b, 0);
+    const slots = direct + k;
+    const at = (j: number): [number, number] => {
+      const rr = 0.8 * R * Math.sqrt((j + 0.5) / slots);
+      return [x + rr * Math.cos(j * GOLDEN), y + rr * Math.sin(j * GOLDEN)];
+    };
+    for (let j = 0; j < direct; j++) leaf(lo + j, [...prefix, j + 1], ...at(j), lo, hi);
+    const first = lo + direct;
+    const rest = hi - first;
+    let start = first;
+    let cum = 0;
+    for (let j = 0; j < k; j++) {
+      cum += weights[j]!;
+      const end = j === k - 1 ? hi : Math.min(hi - (k - 1 - j), Math.max(start + 1, first + Math.round((rest * cum) / total)));
+      const branch = [...prefix, direct + j + 1];
+      if (end - start === 1) leaf(start, branch, ...at(direct + j), lo, hi);
+      else place(start, end, branch, ...at(direct + j), (0.9 * R) / Math.sqrt(slots));
+      start = end;
+    }
+  };
+  place(0, n, [], 0, 0, 4 * Math.sqrt(n));
+
+  const source: number[] = [];
+  const target: number[] = [];
+  for (let i = 0; i < n; i++) {
+    source.push(i, i);
+    target.push(groupLo[i]! + Math.floor(rng() * (groupHi[i]! - groupLo[i]!)), (i + 1 + Math.floor(rng() * 4096)) % n);
+    if (i % 16 === 0) {
+      source.push(i);
+      target.push(Math.floor(rng() * n));
+    }
+  }
+  let liftSteps = 0; // Σ |depth(u) − depth(v)| over the edges: the build's added (pre-dedup) contributions
+  for (let e = 0; e < source.length; e++) if (source[e] !== target[e]) liftSteps += Math.abs(leafDepth[source[e]!]! - leafDepth[target[e]!]!);
+  const g = buildGraph({ nodeCount: n, source, target, directed: true });
+  g.positions.set(positions);
+  const tree = buildModuleLODTree(n, records, g);
+  computeLODGeometry(tree, g, new Float32Array(n).fill(4));
+  const parent = tree.parent!;
+  const depth = new Int32Array(tree.size);
+  for (let v = tree.size - 2; v >= 0; v--) depth[v] = depth[parent[v]!]! + 1;
+  let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+  for (let i = 0; i < n; i++) {
+    const x = positions[i * 2]!, y = positions[i * 2 + 1]!;
+    if (x < minX) minX = x;
+    if (x > maxX) maxX = x;
+    if (y < minY) minY = y;
+    if (y > maxY) maxY = y;
+  }
+  const baseK = 0.9 * Math.min(W / (maxX - minX), H / (maxY - minY));
+  return { tree, centroid: [(minX + maxX) / 2, (minY + maxY) / 2], baseK, depth, liftSteps };
+}
+
+/** CSR entries whose endpoints sit at different depths (the #325 lift pairs), and the CSR total. */
+function liftPairCount(tree: LODTree, depth: Int32Array): { lift: number; total: number } {
+  const off = tree.superEdgeOffset!;
+  const tgt = tree.superEdgeTarget!;
+  let lift = 0;
+  for (let g = 0; g < tree.size; g++) for (let p = off[g]!; p < off[g + 1]!; p++) if (depth[tgt[p]!] !== depth[g]) lift++;
+  return { lift, total: tgt.length };
+}
+
+/**
+ * A large **mixed-level** cut: every leaf of the even-branch top modules, and the depth-3 cut (modules at
+ * depth 3, shallower leaves) of the odd ones — about half the leaves present at once, next to thousands
+ * of collapsed modules at other depths, so the cross-level projection runs over every edge between the
+ * two halves (reductions ON with a large visible set, AGENTS §5).
+ */
+function mixedFrontier(tree: LODTree, depth: Int32Array): Uint32Array {
+  const parent = tree.parent!;
+  const branch = tree.branch!;
+  const top = new Int32Array(tree.size).fill(-1); // top-module branch id of each node (root: -1)
+  for (let v = tree.size - 2; v >= 0; v--) top[v] = depth[v] === 1 ? branch[v]! : top[parent[v]!]!;
+  const out: number[] = [];
+  for (let v = 0; v < tree.size - 1; v++) {
+    const odd = top[v]! % 2 === 1;
+    if (odd ? depth[v] === 3 || (v < tree.leafCount && depth[v]! < 3) : v < tree.leafCount) out.push(v);
+  }
+  return Uint32Array.from(out);
+}
+
+/** One timed superEdges call (after one warm call on the same scratch). */
+function timeOnce(tree: LODTree, frontier: Uint32Array, crossLevelEdges: boolean, scratch: SuperEdgesScratch): { ms: number; edges: number } {
+  const wide = { minX: -1e9, maxX: 1e9, minY: -1e9, maxY: 1e9 };
+  superEdges(tree, frontier, { ...SE_STYLE, crossLevelEdges }, wide, scratch);
+  const t0 = performance.now();
+  const { ids } = superEdges(tree, frontier, { ...SE_STYLE, crossLevelEdges }, wide, scratch);
+  return { ms: performance.now() - t0, edges: ids.length };
+}
+
+describe("#325 superEdges per-frame cost over a RAGGED module tree (cross-depth lift pairs)", () => {
+  it("stays within budget with reductions ON (LOD + declutter, cross-level on/off) and OFF (every leaf present)", () => {
+    const N = 100_000;
+    const { tree, centroid, baseK, depth } = raggedModuleTree(N);
+    const frames = sweepFrames(tree, centroid, baseK, 24);
+    const scratch = makeSuperEdgesScratch();
+    for (const crossLevelEdges of [false, true]) for (const f of frames) superEdges(tree, f.frontier, { ...SE_STYLE, crossLevelEdges }, f.view, scratch); // warm
+    const seenRef = scratch.seen;
+
+    // Reductions ON, zoom sweep: scratch reuse stays invisible + identity-stable, and within budget.
+    const ts: number[] = [];
+    let maxEdges = 0;
+    for (const crossLevelEdges of [false, true]) {
+      for (const f of frames) {
+        const style = { ...SE_STYLE, crossLevelEdges };
+        const t0 = performance.now();
+        const out = superEdges(tree, f.frontier, style, f.view, scratch);
+        ts.push(performance.now() - t0);
+        maxEdges = Math.max(maxEdges, out.ids.length);
+        expect(scratch.seen).toBe(seenRef); // no O(tree.size) realloc per frame (#210)
+        expectSameOutput(out, superEdges(tree, f.frontier, style, f.view));
+      }
+    }
+    expect(maxEdges).toBeGreaterThan(0);
+    // ~10× headroom over dev hardware at 100k (median ~0.4ms, worst frame ~9-12ms at an 8k frontier) —
+    // catches an order-of-magnitude drop without flaking on a slower runner.
+    expect(stats(ts).median).toBeLessThan(5);
+    expect(Math.max(...ts)).toBeLessThan(100);
+
+    // Reductions ON over a large mixed-level visible set, and OFF (every leaf present), cross-level on/off.
+    const mixed = mixedFrontier(tree, depth);
+    const allLeaves = new Uint32Array(tree.leafCount).map((_, i) => i);
+    expect(mixed.length).toBeGreaterThan(N / 4);
+    for (const crossLevelEdges of [false, true]) {
+      const m = timeOnce(tree, mixed, crossLevelEdges, scratch);
+      const a = timeOnce(tree, allLeaves, crossLevelEdges, scratch);
+      expect(a.edges).toBeGreaterThan(N); // ~2 directed edges per leaf drawn
+      // ~10× headroom over dev hardware at 100k (mixed ~15-25ms, all leaves ~30-40ms).
+      expect(m.ms, `mixed frontier crossLevel=${crossLevelEdges}`).toBeLessThan(400);
+      expect(a.ms, `all-leaves frontier crossLevel=${crossLevelEdges}`).toBeLessThan(400);
+    }
+    expect(scratch.seen).toBe(seenRef);
+
+    // Non-vacuity: the tree really is ragged, and its CSR really carries cross-depth (lift) pairs.
+    const { lift, total } = liftPairCount(tree, depth);
+    expect(lift, `lift pairs ${lift} of ${total}`).toBeGreaterThan(total / 50);
+  });
+
+  (BENCH ? it : it.skip)(
+    `bench: superEdges per frame over a ragged module tree at ${BENCH_N.toLocaleString()} leaves`,
+    () => {
+      const tb = performance.now();
+      const { tree, centroid, baseK, depth, liftSteps } = raggedModuleTree(BENCH_N);
+      const buildMs = performance.now() - tb;
+      const { lift, total } = liftPairCount(tree, depth);
+      const log = (line: string): void => {
+        console.log(line);
+        appendFileSync("/tmp/super-edges-perf.txt", `[${process.env.BENCH_SUPER_EDGES_LABEL ?? "run"}] ragged ${line}\n`);
+      };
+      log(`tree.size=${tree.size.toLocaleString()}  csr=${total.toLocaleString()}  liftPairs=${lift.toLocaleString()}  liftSteps=${liftSteps.toLocaleString()}  fixture+build=${buildMs.toFixed(0)}ms`);
+
+      const frames = sweepFrames(tree, centroid, baseK, 24);
+      const maxFrontier = Math.max(...frames.map((f) => f.frontier.length));
+      const scratch = makeSuperEdgesScratch();
+      for (const crossLevelEdges of [false, true]) {
+        const style = { ...SE_STYLE, crossLevelEdges };
+        for (const f of frames) superEdges(tree, f.frontier, style, f.view, scratch); // warm
+        const gc = (globalThis as { gc?: () => void }).gc;
+        gc?.();
+        const m0 = process.memoryUsage();
+        const ts: number[] = [];
+        let edges = 0;
+        let outBytes = 0; // the frames' own typed-array outputs — the only per-frame allocation allowed
+        for (const f of frames) {
+          const t0 = performance.now();
+          const { ids, lines } = superEdges(tree, f.frontier, style, f.view, scratch);
+          ts.push(performance.now() - t0);
+          edges = Math.max(edges, ids.length);
+          if (lines) outBytes += lines.sources.byteLength + lines.targets.byteLength + lines.widths.byteLength + lines.colors.byteLength;
+        }
+        const m1 = process.memoryUsage();
+        const { median, p95 } = stats(ts);
+        const abKB = (m1.arrayBuffers - m0.arrayBuffers - outBytes) / frames.length / 1024;
+        log(`sweep crossLevel=${crossLevelEdges}  maxFrontier=${maxFrontier}  maxEdges=${edges}  median=${median.toFixed(3)}ms  p95=${p95.toFixed(3)}ms  abDelta-outputs=${abKB.toFixed(1)}KB/frame  outputs=${(outBytes / frames.length / 1024).toFixed(1)}KB/frame${gc ? "" : " (no --expose-gc; rough)"}`);
+        if (gc) expect(abKB, `crossLevel=${crossLevelEdges}: typed-array growth per frame beyond its outputs`).toBeLessThan(ALLOC_KB_PER_FRAME);
+        if (ASSERT) expect(median, `sweep crossLevel=${crossLevelEdges}: median ${median.toFixed(2)}ms at N=${BENCH_N}`).toBeLessThan(SWEEP_FRAME_MS);
+      }
+
+      const mixed = mixedFrontier(tree, depth);
+      const allLeaves = new Uint32Array(tree.leafCount).map((_, i) => i);
+      for (const crossLevelEdges of [false, true]) {
+        const m = timeOnce(tree, mixed, crossLevelEdges, makeSuperEdgesScratch());
+        const a = timeOnce(tree, allLeaves, crossLevelEdges, makeSuperEdgesScratch());
+        log(`mixed frontier=${mixed.length.toLocaleString()} crossLevel=${crossLevelEdges}  edges=${m.edges.toLocaleString()}  ${m.ms.toFixed(1)}ms`);
+        log(`all-leaves frontier=${allLeaves.length.toLocaleString()} crossLevel=${crossLevelEdges}  edges=${a.edges.toLocaleString()}  ${a.ms.toFixed(1)}ms`);
+        expect(a.edges, "all-leaves frontier drew no super-edges").toBeGreaterThan(tree.leafCount);
+        if (ASSERT) {
+          expect(m.ms, `mixed frontier crossLevel=${crossLevelEdges}: ${m.ms.toFixed(0)}ms at N=${BENCH_N}`).toBeLessThan(ALL_FRONTIER_MS);
+          expect(a.ms, `all-leaves frontier crossLevel=${crossLevelEdges}: ${a.ms.toFixed(0)}ms at N=${BENCH_N}`).toBeLessThan(ALL_FRONTIER_MS);
+        }
+      }
+      expect(lift, "the ragged fixture's CSR carries no cross-depth pairs").toBeGreaterThan(total / 50);
     },
     600_000,
   );
