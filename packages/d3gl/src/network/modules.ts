@@ -281,8 +281,103 @@ function buildModuleTopology(
         ? withModuleLinks(edges, links, resolveLinkPaths(moduleChild, moduleId, leafModule, leafRank))
         : edges;
     if (input) Object.assign(topo, buildSuperEdges(size, parent, input));
+    // The module links on their own too, by endpoint (#329): what an expanded module's boundary anchors.
+    if (input && hasLinks) Object.assign(topo, moduleLinkRows(size, nodeCount, parent, input, edges?.source.length ?? 0));
   }
   return topo;
+}
+
+/**
+ * The module links (#199) indexed by their own endpoints (#329) — `edges[from ..]`, as resolved tree
+ * ids: per aggregate, its outgoing links (other endpoint + flow, summed per ordered pair) and, as the
+ * transpose, its incoming ones. These are what a module's boundary anchors when the cut expands it,
+ * since no finer pair carries a module link's flow. A link into its own endpoint's ancestor lies
+ * inside one subtree at every cut and is left out, as in {@link buildSuperEdges}. Rows exist for
+ * aggregates only. O(links · depth) time (the ancestor test), O(modules + links) memory.
+ */
+function moduleLinkRows(
+  size: number,
+  leafCount: number,
+  parent: Int32Array,
+  edges: ModuleEdges,
+  from: number,
+): Pick<LODTopology, "moduleLinkOffset" | "moduleLinkTarget" | "moduleLinkFlow" | "moduleLinkInOffset" | "moduleLinkInSource" | "moduleLinkInFlow"> {
+  const rows = size - leafCount;
+  const m = edges.source.length;
+  // Tree ids grow toward the root, so `a` is `b`'s ancestor (or vice versa) iff climbing from the smaller
+  // id while below the larger one lands on it.
+  const nested = (a: number, b: number): boolean => {
+    let x = a < b ? a : b;
+    const top = a < b ? b : a;
+    while (x >= 0 && x < top) x = parent[x]!;
+    return x === top;
+  };
+  const kept = new Uint8Array(m - from);
+  const outOffset = new Uint32Array(rows + 1);
+  const inOffset = new Uint32Array(rows + 1);
+  for (let e = from; e < m; e++) {
+    const s = edges.source[e]!;
+    const t = edges.target[e]!;
+    if (s === t || nested(s, t)) continue;
+    kept[e - from] = 1;
+    if (s >= leafCount) outOffset[s - leafCount + 1]!++;
+    if (t >= leafCount) inOffset[t - leafCount + 1]!++;
+  }
+  for (let r = 0; r < rows; r++) {
+    outOffset[r + 1] = outOffset[r + 1]! + outOffset[r]!;
+    inOffset[r + 1] = inOffset[r + 1]! + inOffset[r]!;
+  }
+  const outOther = new Uint32Array(outOffset[rows]!);
+  const outFlow = new Float32Array(outOffset[rows]!);
+  const inOther = new Uint32Array(inOffset[rows]!);
+  const inFlow = new Float32Array(inOffset[rows]!);
+  const outCursor = outOffset.slice(0, rows);
+  const inCursor = inOffset.slice(0, rows);
+  for (let e = from; e < m; e++) {
+    if (!kept[e - from]) continue;
+    const s = edges.source[e]!;
+    const t = edges.target[e]!;
+    const w = edges.weight[e]!;
+    if (s >= leafCount) {
+      const p = outCursor[s - leafCount]!++;
+      outOther[p] = t;
+      outFlow[p] = w;
+    }
+    if (t >= leafCount) {
+      const p = inCursor[t - leafCount]!++;
+      inOther[p] = s;
+      inFlow[p] = w;
+    }
+  }
+  // Sum repeated pairs within each row, compacting in place (`mark[x] === r` ⇔ x already in row r).
+  const mark = new Int32Array(size).fill(-1);
+  const slot = new Uint32Array(size);
+  const compact = (offset: Uint32Array, other: Uint32Array, flow: Float32Array): [Uint32Array, Float32Array] => {
+    let w = 0;
+    let start = 0;
+    for (let r = 0; r < rows; r++) {
+      const end = offset[r + 1]!;
+      for (let p = start; p < end; p++) {
+        const x = other[p]!;
+        if (mark[x] !== r) {
+          mark[x] = r;
+          slot[x] = w;
+          other[w] = x;
+          flow[w] = flow[p]!;
+          w++;
+        } else {
+          flow[slot[x]!] = flow[slot[x]!]! + flow[p]!;
+        }
+      }
+      start = end;
+      offset[r + 1] = w;
+    }
+    return [other.slice(0, w), flow.slice(0, w)];
+  };
+  const [moduleLinkTarget, moduleLinkFlow] = compact(outOffset, outOther, outFlow);
+  mark.fill(-1);
+  const [moduleLinkInSource, moduleLinkInFlow] = compact(inOffset, inOther, inFlow);
+  return { moduleLinkOffset: outOffset, moduleLinkTarget, moduleLinkFlow, moduleLinkInOffset: inOffset, moduleLinkInSource, moduleLinkInFlow };
 }
 
 /**

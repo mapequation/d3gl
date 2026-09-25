@@ -26,7 +26,7 @@
  * per frame. Memory is O(tree size) for disc centres/radii plus per-module scratch of O(max k); a warm
  * start adds O(tree size) for the current centroids and one O(leaves) pass to place the result.
  */
-import type { LODTopology } from "./lod.js";
+import type { BoundaryDiscs, LODTopology } from "./lod.js";
 import { BarnesHutTree } from "./quadtree.js";
 
 const GOLDEN = Math.PI * (3 - Math.sqrt(5));
@@ -231,6 +231,46 @@ export function nestedLayout(topo: NestedLayoutTopology, opts: NestedLayoutOptio
   writeLeafPositions(topo, cx, cy, r, positions);
   if (warm) placeOver(topo, warm, root, opts.radius === undefined, positions, cx, cy, r);
   return { positions, cx, cy, r };
+}
+
+/**
+ * A nested layout's module **boundary discs** (#329): each module's disc from `result`, with its centre
+ * re-expressed as an offset from the module's leaf centroid in `result.positions` — the
+ * {@link BoundaryDiscs} the network engine rings its expanded modules with (`lod({ moduleBoundary })`),
+ * so a ring stays on its members' disc as they are dragged or eased. One O(tree size) pass, children
+ * before parents (a module tree numbers every child below its parent). Aggregates only.
+ */
+export function nestedBoundaryDiscs(topo: Pick<NestedLayoutTopology, "size" | "leafCount" | "parent">, result: NestedLayoutResult): BoundaryDiscs {
+  const { size, leafCount, parent } = topo;
+  const { positions } = result;
+  const sx = new Float64Array(size);
+  const sy = new Float64Array(size);
+  const count = new Float64Array(size);
+  for (let i = 0; i < leafCount; i++) {
+    sx[i] = positions[2 * i]!;
+    sy[i] = positions[2 * i + 1]!;
+    count[i] = 1;
+  }
+  for (let g = 0; g < size; g++) {
+    const p = parent[g]!;
+    if (p < 0) continue;
+    sx[p] = sx[p]! + sx[g]!;
+    sy[p] = sy[p]! + sy[g]!;
+    count[p] = count[p]! + count[g]!;
+  }
+  const rows = size - leafCount;
+  const dx = new Float32Array(rows);
+  const dy = new Float32Array(rows);
+  const r = new Float32Array(rows);
+  for (let o = 0; o < rows; o++) {
+    const g = leafCount + o;
+    const n = count[g]!;
+    // A module always holds a leaf; the guard only keeps a malformed (empty) one at its disc centre.
+    dx[o] = n > 0 ? result.cx[g]! - sx[g]! / n : 0;
+    dy[o] = n > 0 ? result.cy[g]! - sy[g]! / n : 0;
+    r[o] = result.r[g]!;
+  }
+  return { dx, dy, r };
 }
 
 /**

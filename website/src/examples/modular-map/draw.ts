@@ -21,7 +21,8 @@ const SIZES = [500, 1_000, 2_000, 5_000, 10_000, 20_000];
  * back to the CPU worker where float render targets are unavailable.)
  *
  * The **Layout** control switches to the **nested** module layout (#324): each module's children laid out
- * inside its own disc. Switching re-lays the map out **warm**, from where the nodes are, and **eases**
+ * inside its own disc — and with **Boundaries** on (`lod({ moduleBoundary })`, #329) every module the cut
+ * has opened is ringed, on its disc under the nested layout. Switching re-lays the map out **warm**, from where the nodes are, and **eases**
  * them there (#328): `layout({ nested: { warm: true }, transition: 800 })` — the same call an app makes
  * after re-clustering, so the new map refines the old one in place instead of restarting from a disc.
  *
@@ -139,6 +140,9 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
       const mode = (options.lod as string) ?? "Modules";
       // A thin outline ring, set a few px outside the glyph, marks collapsed aggregates as expandable.
       const aggregateOutline = { width: 1.5, gap: 3 };
+      // #329: ring each module the cut has OPENED (its nested disc after the Nested layout), so the map
+      // of modules stays readable as you zoom into it.
+      const moduleBoundary = options.boundaries === "Off" ? undefined : { width: 1, opacity: 0.45 };
       // Opt-in #139: keep a visible leaf's links to a still-collapsed module across a mixed frontier.
       // Opt-in #133: ease modules ↔ sub-members across the expand threshold (slider × 0.1 = fade band).
       const crossLevelEdges = options.crossLevel === "On";
@@ -147,13 +151,13 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
         net.lod(false);
       } else if (mode === "Standard") {
         // Structural coarsening — ignores the partition; aggregates joined by plain super-edge lines.
-        net.lod({ source: "structure", expandPx, declutter, aggregateOutline, crossLevelEdges, crossFade });
+        net.lod({ source: "structure", expandPx, declutter, aggregateOutline, moduleBoundary, crossLevelEdges, crossFade });
       } else {
         // The planted partition (the default source) drives the cut → directed half-arrow super-edges
         // ∝ accumulated flow. No aggregate-radius cap: a module is sized by `nodeRadius` applied to its
         // members' summed flow (the scale extrapolates above the leaf domain), so a module reads as its
         // total flow.
-        net.lod({ expandPx, declutter, superEdges: true, aggregateOutline, crossLevelEdges, crossFade });
+        net.lod({ expandPx, declutter, superEdges: true, aggregateOutline, moduleBoundary, crossLevelEdges, crossFade });
       }
     },
   };

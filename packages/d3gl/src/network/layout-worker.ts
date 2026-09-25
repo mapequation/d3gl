@@ -18,7 +18,7 @@
  * `DOM` `postMessage(message, options?)` overload accepts — so no worker-lib cast is needed.
  */
 import { ForceLayout, seedPositions } from "./force.js";
-import { nestedLayout } from "./nested-layout.js";
+import { nestedLayout, nestedBoundaryDiscs } from "./nested-layout.js";
 import { multilevelSeed, buildHierarchy } from "./coarsen.js";
 import { flattenHierarchyToTopology, lodTreeFromTopology, computeLODPositions, type LODTree } from "./lod.js";
 import {
@@ -203,11 +203,11 @@ addEventListener("message", (e: MessageEvent<MainToWorker>) => {
     case "start-nested": {
       // One synchronous top-down pass (each depth final); a `stop` can only land after it, and the main
       // thread terminates the worker on stop anyway.
-      const { positions } = nestedLayout(msg.topology, {
+      const result = nestedLayout(msg.topology, {
         ...msg.params,
         onDepth: msg.stream ? (depth, frame) => post({ type: "frame", tick: depth, positions: frame }) : undefined,
       });
-      post({ type: "done", tick: -1, positions });
+      post({ type: "done", tick: -1, positions: result.positions, boundaries: nestedBoundaryDiscs(msg.topology, result) });
       return;
     }
   }

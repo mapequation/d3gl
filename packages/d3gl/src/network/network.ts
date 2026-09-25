@@ -1,13 +1,13 @@
 import { BaseEngine, type BaseEngineOptions, type HoverHit, type InteractiveLayerOptions, type LaneInteractive, type NodeDragSession } from "../map/base-engine.js";
-import { networkLayers, networkLayersFromCache, noLodStyleCache, drawsLinks, frontierCircles, frontierHalos, superEdges, makeSuperEdgesScratch, emitNodes, emitLinks, emitArrows, emitHalfLinks, traceFrontierGlyphs, traceFrontierHalos, traceSuperHalfArrows, traceSuperLines, traceSuperArrows, physicalPieInstances, tracePieWedges, rgbaCss, pickNodes, regionNodes, resolveNodeRadii, resolveNodeRadiusAggregate, resolveImportance, resolveFlowBorder, resolveNodeColors, resolveLinkWidthOf, resolveLinkColorOf, resolveLinkStrokeOf, flowBorderInnerRadii, type ResolvedNetworkStyle, type NoLodStyleCache, type NodeRadiusSpec, type ImportanceSpec, type FlowBorderSpec, type ConstBorder, type LinkWidthSpec, type LinkColorSpec, type LinkStyle } from "./glyphs.js";
+import { networkLayers, networkLayersFromCache, noLodStyleCache, drawsLinks, frontierCircles, frontierHalos, boundaryRings, traceBoundaryRings, superEdges, makeSuperEdgesScratch, emitNodes, emitLinks, emitArrows, emitHalfLinks, traceFrontierGlyphs, traceFrontierHalos, traceSuperHalfArrows, traceSuperLines, traceSuperArrows, physicalPieInstances, tracePieWedges, rgbaCss, pickNodes, regionNodes, resolveNodeRadii, resolveNodeRadiusAggregate, resolveImportance, resolveFlowBorder, resolveNodeColors, resolveLinkWidthOf, resolveLinkColorOf, resolveLinkStrokeOf, flowBorderInnerRadii, type ResolvedNetworkStyle, type ModuleBoundaryResolved, type NoLodStyleCache, type NodeRadiusSpec, type ImportanceSpec, type FlowBorderSpec, type ConstBorder, type LinkWidthSpec, type LinkColorSpec, type LinkStyle } from "./glyphs.js";
 import { rgb } from "d3-color";
 import { ForceLayout, seedPositions, type ForceParams } from "./force.js";
 import { multilevelLayout, type CoarsenOptions } from "./coarsen.js";
-import { buildLODTree, buildSpatialLODTree, computeLODGeometry, computeLODPositions, computeLODStyle, updateLODPositionsForLeaves, cut, makeCutScratch, declutterFrontier, makeDeclutterFrontierScratch, pickFrontier, regionFrontier, visibleWorldRect, leavesUnder, ancestorAwareSelected, type LODTree, type SpatialLODOptions } from "./lod.js";
+import { buildLODTree, buildSpatialLODTree, computeLODGeometry, computeLODPositions, computeLODStyle, updateLODPositionsForLeaves, cut, makeCutScratch, makeCutBoundaries, declutterFrontier, makeDeclutterFrontierScratch, pickFrontier, regionFrontier, visibleWorldRect, leavesUnder, ancestorAwareSelected, type BoundaryDiscs, type CutBoundaries, type LODTree, type SpatialLODOptions } from "./lod.js";
 import { DEFAULT_LABEL_TEXT, type LabelAnchor, type LabelStyle } from "../labels/label-layer.js";
 import { TextMeasurer, canvasFont } from "../labels/measure.js";
 import { buildModuleLODTree, checkModuleLinks, moduleRecordIndex, type ModuleLink, type ModuleNode } from "./modules.js";
-import { nestedLayout, type NestedLayoutParams } from "./nested-layout.js";
+import { nestedLayout, nestedBoundaryDiscs, type NestedLayoutParams } from "./nested-layout.js";
 import { positionTransition, type PositionTransition } from "./transition.js";
 import { moduleColors, type ModulePathNode, type ModuleColorOptions } from "./module-colors.js";
 import { physicalPieWedges, type PhysicalPieWedges, type PieWedgeOptions } from "./pie.js";
@@ -391,6 +391,29 @@ export interface NetworkLODOptions {
    * colour (default a dark neutral). Omit to disable.
    */
   aggregateOutline?: { width?: number; gap?: number; color?: string };
+  /**
+   * Draw a thin **boundary ring** around every **expanded** module in view (#329) — the aggregates the
+   * cut has opened into their members (in a {@link crossFade} band: those whose members it draws), so
+   * the hierarchy stays readable as a map of nested modules while you zoom in. After a
+   * `layout({ nested })` of the tree being cut, the ring is that module's disc (it follows its members
+   * through a drag or a transition); otherwise it is centred on the module's members with their
+   * extent as its radius. `width` in the active sizeMode's units (constant px in `screen` mode, default
+   * 1), `color` any CSS colour (default a dark neutral), `opacity` 0-1 (default 0.5). Rings fade with
+   * the members they enclose under {@link crossFade}, and export with `toSVG()` / `toPNG()`. Omit to
+   * disable.
+   *
+   * With {@link crossLevelEdges} on, a **module link** (`data(graph, { modules, moduleLinks })`, #199)
+   * whose endpoint is an expanded module in view — one that no finer pair can carry, as in an Infomap
+   * `.ftree` — is drawn to or from that module's ring, with its flow, instead of disappearing when the
+   * module opens. Links between two expanded modules run ring to ring. An expanded module whose centre
+   * is off-screen keeps the off-screen rule (its links are drawn toward its centre, leaving the view).
+   * Links derived from the graph's own edges are unchanged (their flow is drawn at the members), so
+   * nothing is counted twice.
+   *
+   * Per frame the cost is the modules in view the cut expands (it visits them anyway) plus, when
+   * anchoring, their own module links — never the whole tree.
+   */
+  moduleBoundary?: { width?: number; color?: string; opacity?: number };
    /**
    * Draw **super-edges**: links between *both-visible* frontier nodes (leaf↔leaf, module↔module, or
    * aggregate↔aggregate — whatever the cut exposes), sized + coloured by their accumulated flow and
@@ -485,7 +508,7 @@ const DEFAULT_NODE_RADIUS = 4;
 const DEFAULT_NODE_FILL = "#4878d0";
 const DEFAULT_LINK_WIDTH = 1;
 const DEFAULT_LINK_STROKE = "#999999";
-const LAYER_NAMES = ["links", "arrows", "node-halos", "nodes"] as const;
+const LAYER_NAMES = ["module-boundaries", "links", "arrows", "node-halos", "nodes"] as const;
 /** Base-lane layers the shader highlight (#162) drives — nodes + links (not the aggregate halos, which
  *  carry no group/selected and so render un-dimmed). */
 const HL_LAYERS = ["nodes", "links", "arrows"] as const;
@@ -673,6 +696,15 @@ export class Network extends BaseEngine {
   private readonly cutScratch = makeCutScratch();
   /** Engine-owned {@link declutterFrontier} scratch (#213), same reuse contract as {@link cutScratch}. */
   private readonly declutterFrontierScratch = makeDeclutterFrontierScratch();
+  /** The expanded modules in view the last {@link computeFrontier} collected for the module-boundary
+   *  rings (#329) — `count` 0 when `moduleBoundary` is off. Reused per cut, like {@link cutScratch}. */
+  private readonly cutBoundaries: CutBoundaries = makeCutBoundaries();
+  /**
+   * The module discs of the nested layout that placed the current positions (#329), for the tree it laid
+   * out — the boundary rings' geometry while that tree is cut. Dropped by `data()` and by any other
+   * `layout()` (and a reheating drag), whose positions no longer come from the nested layout.
+   */
+  private nestedDiscs: { tree: LODTree; discs: BoundaryDiscs } | null = null;
   /** The fade alpha the last {@link computeFrontier} produced (the live `fadeScratch`), or null when cross-fade is off. */
   private fadeAlpha: Float32Array | null = null;
   /** Cached resolved style; invalidated on style()/data() to avoid per-zoom O(n) radii recompute. */
@@ -823,6 +855,7 @@ export class Network extends BaseEngine {
     }
     // New topology + position buffer: drop the retained LOD tree, the module tree and resolved-style cache.
     this.moduleTreeCache = null;
+    this.nestedDiscs = null;
     this.lodTree = null;
     this.lodWorkerTree = null;
     this.lodSpatial = false;
@@ -1232,6 +1265,7 @@ export class Network extends BaseEngine {
       // re-streams one (worker backend) or builds one on the main thread (force/positions).
       this.stopLayout();
       this.lodWorkerTree = null;
+      this.nestedDiscs = null; // the new layout places the nodes; a nested one records its discs as it lands (#329)
       // Fit-on-layout (streaming backends): keep the camera framed on the layout as it converges.
       // Seed a box-centred disc up front so the FIRST paint is framed — until the first frame streams
       // back, `graph.positions` would be all-zeros (the GPU solve seeds on-device, so the CPU copy is
@@ -1449,10 +1483,15 @@ export class Network extends BaseEngine {
       const solve = startNestedWorkerLayout(graph, topology, params, () => this.scheduleLayoutRepaint(), {
         stream: !oneFrame,
         onResult: oneFrame ? (positions) => this.landNested(graph, positions, tween) : undefined,
+        onBoundaries: (discs) => {
+          if (this.graph === graph) this.nestedDiscs = { tree, discs }; // the boundary rings' geometry (#329)
+        },
       });
       this.onLayoutSettled(tween ? this.transitionHandle(tween, solve) : solve);
     } else {
-      const positions = nestedLayout(topology, params).positions;
+      const result = nestedLayout(topology, params);
+      const positions = result.positions;
+      this.nestedDiscs = { tree, discs: nestedBoundaryDiscs(topology, result) }; // the boundary rings' geometry (#329)
       if (tween) {
         this.onLayoutSettled(this.transitionHandle(tween));
         tween.to(positions);
@@ -1961,7 +2000,7 @@ export class Network extends BaseEngine {
    *  therefore still pays O(nodeCount + edgeCount) for the id arrays and id→index maps — this is
    *  O(layers): the right clear when the Scene must not cost anything at all (#201). */
   private clearNetworkScene(): void {
-    for (const name of [this.CONTAINER_LAYER, "links", "arrows", "node-halos", this.NODE_LAYER, this.PIE_LAYER]) {
+    for (const name of [this.CONTAINER_LAYER, "module-boundaries", "links", "arrows", "node-halos", this.NODE_LAYER, this.PIE_LAYER]) {
       this.removeLayer(name);
     }
     this.sceneActive = false;
@@ -2358,6 +2397,7 @@ export class Network extends BaseEngine {
 
     // force: own rAF loop ticks the pinned sim + repaints, so neighbours follow; re-cools on release.
     if (backend === "force") {
+      this.nestedDiscs = null; // the reheat re-lays every node out: a nested layout's discs no longer hold (#329)
       const sim = new ForceLayout(graph, this.layoutOpts.force);
       sim.setPinned(held);
       const rafFn: (cb: FrameRequestCallback) => number =
@@ -2478,12 +2518,18 @@ export class Network extends BaseEngine {
     } else {
       this.fadeAlpha = null;
     }
+    // Module boundaries (#329): the cut also collects the expanded modules in view, tested against the
+    // nested layout's discs when those laid out this tree.
+    const bnd = this.cutBoundaries;
+    bnd.count = 0;
+    bnd.discs = this.nestedDiscs?.tree === tree ? this.nestedDiscs.discs : undefined;
     let frontier = cut(tree, this.transform, this.width, this.height, {
       expandPx: opts.expandPx,
       screenSized: style.sizeMode === "screen",
       maxAggregateRadius: opts.maxAggregateRadius,
       fadeBand,
       fadeAlpha: this.fadeAlpha ?? undefined,
+      boundaries: opts.moduleBoundary ? bnd : undefined,
     }, this.cutScratch); // #213: reused per frame — the walk allocates nothing steady-state
     if (opts.declutter !== false) {
       frontier = declutterFrontier(tree, frontier, this.transform, this.width, this.height, {
@@ -2498,6 +2544,26 @@ export class Network extends BaseEngine {
     return frontier;
   }
 
+  /** The resolved module-boundary ring style (#329) at the live zoom, or null when `moduleBoundary` is off. */
+  private boundaryStyle(style: ResolvedNetworkStyle): ModuleBoundaryResolved | null {
+    const mb = this.lodOptions?.moduleBoundary;
+    if (!mb) return null;
+    return {
+      width: mb.width ?? 1,
+      color: mb.color ?? "#3a3f52",
+      opacity: mb.opacity ?? 0.5,
+      screen: style.sizeMode === "screen",
+      k: this.transform.k,
+    };
+  }
+
+  /** The expanded modules module links anchor at (#329) — the cut's collection when both
+   *  `moduleBoundary` and `crossLevelEdges` are on (superEdges ignores it without module links). */
+  private anchorBoundaries(): CutBoundaries | undefined {
+    const opts = this.lodOptions;
+    return opts?.moduleBoundary && opts.crossLevelEdges ? this.cutBoundaries : undefined;
+  }
+
   /**
    * Build the instanced layers for a given LOD frontier (the index-compacted visible set). The emit
    * body the {@link InstancedLane} (see {@link syncLane}) feeds the cut's visible set into, shared
@@ -2508,6 +2574,13 @@ export class Network extends BaseEngine {
     const opts = this.lodOptions!;
     const layers: InstancedLayer[] = [];
     this.linkResolve = null; // no super-edges drawn this emit ⇒ nothing to link-pick (until set below)
+    // Module-boundary rings (#329) first, under everything: one per expanded module the cut collected.
+    // World-sized circles (the boundary is a world region); a screen-mode ring width is px at this zoom.
+    const boundaryStyle = this.boundaryStyle(style);
+    if (boundaryStyle) {
+      const rings = boundaryRings(tree, this.cutBoundaries, boundaryStyle, visibleWorldRect(this.transform, this.width, this.height));
+      if (rings.count > 0) layers.push({ name: "module-boundaries", primitive: "circles", circles: rings, sizeMode: "world" });
+    }
     // Selection/hover highlight (#162) is applied in the SHADER from per-instance columns (below) + lane
     // uniforms (see onInstancedLaneEmitted) — NO per-instance CPU colour pass here, so a hover/selection
     // restyle never rebuilds this geometry. Bake only the `selected` flag (ancestor-aware, so an expanded
@@ -2536,6 +2609,7 @@ export class Network extends BaseEngine {
           arrowSize: style.arrowSize,
           maxAggregateRadius: opts.maxAggregateRadius,
           crossLevelEdges: opts.crossLevelEdges,
+          anchor: this.anchorBoundaries(),
           fadeAlpha: this.fadeAlpha ?? undefined,
         },
         visibleWorldRect(this.transform, this.width, this.height),
@@ -2764,6 +2838,9 @@ export class Network extends BaseEngine {
           }
       },
     });
+    // Module-boundary rings (#329): only the LOD Scene path draws into it; registered empty here so the
+    // slot exists in canonical order (under the links) whichever path registers first.
+    this.registerLayer({ name: "module-boundaries", data: [], ids: [], sizeMode: "world", build: () => {} });
     // Per-edge link colour (encodes weight/flow); the arrowhead shares it.
     const linkColorAt = (e: number): string => style.linkStrokeOf(graph.weight[e]!);
     // The map glyph (`half-arrow`, directed) is one *filled* shape per link — the head is part of it,
@@ -2882,10 +2959,10 @@ export class Network extends BaseEngine {
   /**
    * Register the LOD cut frontier as retained Scene layers (#138) — the vector-backend twin of the
    * WebGL {@link frontierLayers} emit. Computes the same {@link computeFrontier} and traces the *same* SoA
-   * ({@link superEdges}/{@link frontierHalos}/{@link frontierCircles}) into Scene drawables, keyed by
-   * **stable tree-node id** (frontier node, or directed super-edge pair) so the retained-scene diff is
-   * stable across re-cuts. Layers are registered in canonical draw order (links < arrows < node-halos <
-   * nodes), each into the same slot the full-graph path uses, so toggling LOD or swapping
+   * ({@link superEdges}/{@link frontierHalos}/{@link frontierCircles}/{@link boundaryRings}) into Scene
+   * drawables, keyed by **stable tree-node id** (frontier node, module, or directed super-edge pair) so the
+   * retained-scene diff is stable across re-cuts. Layers are registered in canonical draw order
+   * (module-boundaries < links < arrows < node-halos < nodes), each into the same slot the full-graph path uses, so toggling LOD or swapping
    * backends never reorders or leaves stale geometry. With `emit: false` every layer registers empty (the
    * frontier clear). Re-run at each interaction-end via {@link syncScreenGeometry} — the retained Scene
    * can't re-tessellate per frame, so the frontier is static during a gesture and snaps on release (the
@@ -2895,6 +2972,23 @@ export class Network extends BaseEngine {
     const opts = this.lodOptions!;
     const screen = style.sizeMode === "screen";
     const frontier = emit ? this.computeFrontier(tree, style) : new Uint32Array(0);
+
+    // --- Module-boundary rings (#329), under everything: the same ring-encoded world circles as the
+    // WebGL lane (a screen-mode width baked at this zoom, re-baked at interaction end). ---
+    const boundaryStyle = emit ? this.boundaryStyle(style) : null;
+    const rings = boundaryStyle ? boundaryRings(tree, this.cutBoundaries, boundaryStyle, visibleWorldRect(this.transform, this.width, this.height)) : null;
+    const ringIds = rings ? Array.from(rings.ids) : [];
+    this.registerLayer({
+      name: "module-boundaries",
+      data: ringIds,
+      ids: ringIds,
+      sizeMode: "world",
+      fill: () => "rgba(0, 0, 0, 0)",
+      stroke: (_d, i) => (rings ? rgbaCss(rings.borderColors, i) : ""),
+      build: (g) => {
+        if (rings) traceBoundaryRings(g, rings);
+      },
+    });
 
     // --- Super-edges (drawn under the nodes), among the visible frontier only. ---
     // Same skip as the WebGL frontier emit (#157): with no links to draw the gather never runs and both
@@ -2914,6 +3008,7 @@ export class Network extends BaseEngine {
               arrowSize: style.arrowSize,
               maxAggregateRadius: opts.maxAggregateRadius,
               crossLevelEdges: opts.crossLevelEdges,
+              anchor: this.anchorBoundaries(),
               fadeAlpha: this.fadeAlpha ?? undefined,
             },
             visibleWorldRect(this.transform, this.width, this.height),

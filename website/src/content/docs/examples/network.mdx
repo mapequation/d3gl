@@ -445,11 +445,43 @@ the cut over the same engine-held hierarchy:
   shows as **half-arrow super-edges that thicken with the accumulated flow** between modules.
 
 In `sizeMode: "screen"` the glyphs stay a constant pixel size, so the map reads at every zoom — scroll
-out to the map of modules, in to sub-modules and individual nodes.
+out to the map of modules, in to sub-modules and individual nodes. The **Boundaries** control rings
+every module the cut has opened (see [below](#module-boundaries)); try it with **Layout: Nested**, where
+each ring is the module's disc.
 
 <ExampleCard files={["modular-map/draw.ts", "modular-map/data.ts"]}>
   <ModularMap client:visible slot="demo" />
 </ExampleCard>
+
+### Module boundaries
+
+Once the cut **expands** a module, it is drawn only as its members — nothing marks where it ends.
+`lod({ moduleBoundary })` draws a thin ring around every expanded module in view, so the nested
+hierarchy stays readable as you zoom in, the way the Network Navigator draws its map of modules:
+
+```ts
+net.lod({
+  moduleBoundary: { width: 1, color: "#3a3f52", opacity: 0.5 }, // or {} for these defaults
+  crossLevelEdges: true, // also draw module links at an expanded module's ring (below)
+});
+```
+
+- **Where the ring goes.** After `layout({ nested })` the ring is that module's **disc**, and it follows
+  the module's members through a drag or a `transition`. After any other layout it is centred on the
+  members, with their extent as its radius.
+- **`width`** is in the active `sizeMode`'s units, so in `screen` mode it is a constant pixel stroke
+  around a ring that scales with the map. Rings fade with their members under `crossFade`, draw under
+  every link and node, and export with `toSVG()` / `toPNG()` on every backend. The root, which is the
+  whole network, gets no ring.
+- **Module links stay drawn.** With `data(graph, { modules, moduleLinks })`, as for an Infomap
+  `.ftree`, a link between modules A and B exists only at their level. When A expands there is no finer
+  link to show, so it used to disappear. With `crossLevelEdges` on, it is drawn from **A's ring** with
+  its own flow instead (ring to ring when both are open), and links from the graph's own edges are
+  unchanged, so nothing is counted twice. An expanded module whose centre is off-screen keeps the usual
+  off-screen rule: its links are drawn toward its centre.
+- **Cost.** Each frame costs one ring per expanded module in view (the cut visits those modules
+  anyway) plus, when anchoring, those modules' own module links. It never costs the whole tree, and it
+  is nothing when the option is off.
 
 ### Re-clustering: warm re-layout and transitions
 

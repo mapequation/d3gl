@@ -10,7 +10,7 @@
  */
 import type { ForceParams } from "./force.js";
 import type { CoarsenOptions } from "./coarsen.js";
-import type { LODTopology } from "./lod.js";
+import type { BoundaryDiscs, LODTopology } from "./lod.js";
 import type { NestedLayoutParams, NestedLayoutTopology } from "./nested-layout.js";
 
 /** Kick off a layout run. Edge buffers are copied to the worker; the main thread keeps its own. */
@@ -106,6 +106,8 @@ export interface ProgressMessage {
    * when LOD is on; omitted in shared mode (the renderer reads the geometry SAB directly).
    */
   geometry?: Float32Array;
+  /** A nested layout's `done` (#329): its module boundary discs, for `lod({ moduleBoundary })`. */
+  boundaries?: BoundaryDiscs;
 }
 
 export type WorkerToMain = LODTopologyMessage | ProgressMessage;
