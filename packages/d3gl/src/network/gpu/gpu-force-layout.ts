@@ -431,10 +431,7 @@ export class GpuForceLayout {
     // table's stats (Σx, Σy, Σ|v|, count → the centroid for centering) and box (maxX, maxY, −minX,
     // −minY → the pyramid's cell geometry). No blending: contention-free and deterministic. Its
     // passes submit internally, so the pyramid and force passes below see the results.
-    this.reduce.run(
-      { pos: this.pos.readTex, vel: this.vel.readTex, posWidth: this.width, count: this.count },
-      this.segments,
-    );
+    this.reduceSegments();
 
     // ── 1b. Build the tile pyramid (only when some segment has a tile) ──────
     // Rebuilds every segment's regular-quadtree COM/mass tile over the current positions.
@@ -620,12 +617,32 @@ export class GpuForceLayout {
   }
 
   /**
-   * The segment table's `stats` and `box` textures (1×1 each for the flat layout): the last
-   * {@link beginTick}'s `(Σx, Σy, Σ|v|, count)` and `(maxX, maxY, −minX, −minY)`, which the streaming
-   * readback copies with the positions to catch a non-finite layout (#352).
+   * The segment table's `stats` and `box` textures (1×1 each for the flat layout): the last reductions'
+   * `(Σx, Σy, Σ|v|, count)` and `(maxX, maxY, −minX, −minY)` — from {@link beginTick} or
+   * {@link refreshSegmentStats} — which the streaming readback copies with the positions to catch a
+   * non-finite layout (#352).
    */
   get segmentStats(): { readonly stats: Texture; readonly box: Texture } {
     return this.segments;
+  }
+
+  /**
+   * Re-run the segment reductions over the current positions, so {@link segmentStats} describe them
+   * (#352): after an {@link integrate} they still describe the positions before it, and the streaming
+   * readback's finiteness check must cover the positions it copies. **Between ticks only** — after an
+   * `integrate`, before the next {@link beginTick}, which recomputes the same values from the same
+   * positions. Mid-tick it would change the box and centroid the remaining force bands read. Costs the
+   * reduction tree: a few gather passes over N / 15 texels (0.46 ms at 325k on an M1 Max).
+   */
+  refreshSegmentStats(): void {
+    this.reduceSegments();
+  }
+
+  private reduceSegments(): void {
+    this.reduce.run(
+      { pos: this.pos.readTex, vel: this.vel.readTex, posWidth: this.width, count: this.count },
+      this.segments,
+    );
   }
 
   /**

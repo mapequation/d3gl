@@ -6,29 +6,30 @@
  * Each frame runs, in this order:
  *
  * 1. **Harvest + repaint (throttled).** Poll the budget fences ({@link FrameBudget.beginFrame}). If the
- *    frame that copied the last readback has completed *and* at least `max(minFrameMs, 2 × repaint cost)`
- *    has passed since the previous repaint, `getBufferSubData` the copy into `graph.positions` and run
- *    `onFrame` right away — in this same frame, so the engine repaints the harvested positions with no
- *    extra frame of delay, its draw calls reach the GPU before this frame's layout work, and
- *    `graph.positions` only ever changes right before a repaint (a finished copy waits in its PBO until
- *    the repaint is due). A read that is not ready is never forced, and it happens before any encode, so
- *    nothing it could wait on is freshly queued. The repaint cost is the larger of its main-thread time and the **stall** it
- *    caused: the browser holds the next animation frame until the GPU has drawn the canvas, so the rAF
- *    gap after a repaint frame, less the usual interval, is what the render cost the GPU. Twice that caps
- *    the time spent on layout repaints at about 50% on both sides — the main thread and the GPU the
- *    layout shares with the renderer. A cheap render causes no stall and the term is inert.
+ *    frame that copied the last readback has completed *and* the {@link RepaintThrottle} says the repaint
+ *    is due (`max(minFrameMs, 2 × max(repaint main-thread ms, the GPU stall it caused))` since the previous
+ *    one), `getBufferSubData` the copy into `graph.positions` and run `onFrame` right away — in this same
+ *    frame, so the engine repaints the harvested positions with no extra frame of delay, its draw calls
+ *    reach the GPU before this frame's layout work, and `graph.positions` only ever changes right before a
+ *    repaint (a finished copy waits in its PBO until the repaint is due). A read that is not ready is never
+ *    forced, and it happens before any encode, so nothing it could wait on is freshly queued. A hidden page
+ *    pauses the throttle's stall sampling, so the time a tab spent hidden never delays the next repaint.
  * 2. **Encode.** Work items (P, F_0 … F_{B−1}, I) while the {@link FrameBudget} admits them: at most 2
  *    frames of layout work in flight, a GPU budget of `min(10 ms, 0.6 × rAF interval)` per frame, and at
  *    most 2 ms of encode time. A tick may span frames; its result does not depend on how it was sliced.
  * 3. **Copy + fence.** On the repaint's cadence (reading back more often than repainting is waste), and
  *    when the one PBO is free, copy the positions into it; then insert the frame's single budget fence,
- *    which doubles as the copy's fence.
+ *    which doubles as the copy's fence. The copy carries the reductions' stats, and they always describe
+ *    the copied positions: positions change only at a tick's integrate and at its prep (where a drag's held
+ *    positions are written, never mid-tick), so a copy after a prep reuses that prep's stats and a copy
+ *    between ticks re-runs the reductions first ({@link GpuForceLayout.refreshSegmentStats}).
  *
  * `settled` resolves only after positions from the final tick have been harvested, so the engine's
  * settle handler sees them. The run then goes **idle** (the layout stays alive for a drag reheat, #183).
  * A non-finite layout (NaN / ∞ in the reductions' stats) stops the run with one warning, keeping the last
- * finite positions. A lost context (`isContextLost`, a failed fence wait, `webglcontextlost`) stops it
- * without touching GL again, with one warning.
+ * finite positions — the harvest checks the stats before it touches `graph.positions`. A lost context
+ * (`isContextLost`, a failed fence wait, `webglcontextlost`) stops it without touching GL again, with one
+ * warning.
  */
 import { WebGLDevice } from "@luma.gl/webgl";
 import { DRAG_HEAT, RECOOL_TICKS } from "../force.js";
@@ -37,16 +38,7 @@ import { deleteSync, insertSync, pollSync } from "../../webgl/fence.js";
 import { AsyncPositionReadback, READBACK_STATS_FLOATS } from "./async-readback.js";
 import { FrameBudget, itemCostMs, type FenceSource } from "./frame-budget.js";
 import type { GpuForceLayout } from "./gpu-force-layout.js";
-
-/** Minimum time between two layout repaints, ms: at most 20 per second (spec §15 Q4). */
-export const MIN_FRAME_MS = 50;
-
-/**
- * rAF timestamps land on vsync, so "50 ms since the last repaint" is 3 frames at 60 Hz, which a jittered
- * timestamp can report as 49.9 ms. Within this slack of the interval the repaint counts as due, so the
- * cadence stays 3 frames rather than slipping to 4.
- */
-const THROTTLE_SLACK_MS = 2;
+import { MIN_FRAME_MS, RepaintThrottle } from "./repaint-throttle.js";
 
 /** What one streamed frame did — the argument of a {@link observeGpuLayoutFrames} observer. */
 export interface GpuFrameSample {
@@ -129,8 +121,8 @@ export class GpuStream {
   private readonly onFrame: () => void;
   private readonly iterations: number;
   private readonly frameEvery: number | undefined;
-  private readonly minFrameMs: number;
   private readonly budget: FrameBudget<WebGLSync | null>;
+  private readonly throttle: RepaintThrottle;
   private readonly readback: AsyncPositionReadback;
   private readonly stats = new Float32Array(READBACK_STATS_FLOATS);
   private readonly sample: GpuFrameSample = {
@@ -138,6 +130,8 @@ export class GpuStream {
     harvested: false, harvestedTicks: -1, copied: false, blocked: false, k: 1, bands: 1, budgetMs: 0,
   };
   private readonly canvas: EventTarget | null;
+  /** The page, whose `visibilitychange` pauses the throttle's stall sampling (null outside a document). */
+  private readonly page: Document | null;
   private resolveSettled: () => void = () => {};
   private settledOnce = false;
 
@@ -149,6 +143,13 @@ export class GpuStream {
   private looping = false;
   private dragging = false;
   private coolLeft = 0;
+  /**
+   * The latest held positions of a drag, written into the position texture at the start of the next tick
+   * (just before its reductions) rather than mid-tick, so every tick — and every readback's stats — sees
+   * one consistent set of positions. The engine reuses these arrays, so the write takes the newest values.
+   */
+  private heldIds: Uint32Array | null = null;
+  private heldPositions: Float32Array | null = null;
 
   /** Ticks integrated in this run (all modes). */
   private ticksDone = 0;
@@ -163,19 +164,10 @@ export class GpuStream {
   private copyFrame = 0;
   private copyTicks = 0;
   private copyFinal = false;
-  /** Ticks of the last copy issued, and when it was issued (rAF time). */
+  /** Ticks of the last copy issued. */
   private copiedTicks = 0;
-  private lastCopyAt = Number.NEGATIVE_INFINITY;
-  /** Whether the pending copy's frame has completed, and how long (rAF time) copies take to get there. */
+  /** Whether the pending copy's frame has completed. */
   private copyReady = false;
-  private readyLatencyMs = 1000 / 60;
-  private lastRepaintAt = Number.NEGATIVE_INFINITY;
-  private lastRepaintMs = 0;
-  /** The rAF gap after the last repaint frame, less the median interval: what the render cost the GPU. */
-  private lastStallMs = 0;
-  /** The previous frame's rAF time, and whether that frame repainted. */
-  private prevNow = Number.NaN;
-  private repaintedPrev = false;
 
   constructor(device: WebGLDevice, layout: GpuForceLayout, graph: NetworkGraph, opts: GpuStreamOptions, onFrame: () => void) {
     this.gl = device.gl;
@@ -184,7 +176,7 @@ export class GpuStream {
     this.onFrame = onFrame;
     this.iterations = opts.iterations;
     this.frameEvery = opts.frameEvery;
-    this.minFrameMs = opts.minFrameMs ?? MIN_FRAME_MS;
+    this.throttle = new RepaintThrottle(opts.minFrameMs ?? MIN_FRAME_MS);
     this.budget = new FrameBudget(glFences(this.gl), () => performance.now(), {
       nodes: layout.nodeCount,
       rows: layout.atlasRows,
@@ -197,6 +189,8 @@ export class GpuStream {
     const canvas = this.gl.canvas;
     this.canvas = canvas instanceof EventTarget ? canvas : null;
     this.canvas?.addEventListener("webglcontextlost", this.onContextLost);
+    this.page = typeof document === "undefined" ? null : document;
+    this.page?.addEventListener("visibilitychange", this.onVisibilityChange);
     this.mode = this.iterations > 0 ? "run" : "idle";
   }
 
@@ -210,13 +204,17 @@ export class GpuStream {
   }
 
   /**
-   * Hold `ids` (writing their `positions` into the position texture) and reheat: the rest reflows around
-   * them. Resumes the loop in `drag` mode, or lets a still-running initial run turn into it when it ends.
+   * Hold `ids` and reheat: the rest reflows around them. Their `positions` are written into the position
+   * texture at the start of the next tick, never mid-tick (the latest ones, if several pins arrive first).
+   * Resumes the loop in `drag` mode, or lets a still-running initial run turn into it when it ends.
    */
   pin(ids: Uint32Array, positions?: Float32Array): void {
     if (this.stopped || this.failed) return;
     this.layout.setPinned(ids);
-    if (positions) this.layout.setHeldPositions(ids, positions);
+    if (positions) {
+      this.heldIds = ids;
+      this.heldPositions = positions;
+    }
     this.dragging = true;
     if (this.mode === "idle" || this.mode === "cool") {
       this.mode = "drag";
@@ -269,12 +267,10 @@ export class GpuStream {
       this.lose("a GPU fence wait failed");
       return;
     }
-    if (this.repaintedPrev) this.lastStallMs = Math.max(0, now - this.prevNow - this.budget.intervalMs);
-    this.prevNow = now;
-    this.repaintedPrev = false;
+    this.throttle.beginFrame(now, this.budget.intervalMs);
     if (this.readback.pending && !this.copyReady && this.copyFrame <= this.budget.completedFrame) {
       this.copyReady = true;
-      this.readyLatencyMs = now - this.lastCopyAt;
+      this.throttle.copyCompleted(now);
     }
     // A finished copy is harvested — and repainted — once the repaint is due; the final one at once.
     let harvested = false;
@@ -283,7 +279,7 @@ export class GpuStream {
     if (
       this.readback.pending &&
       this.copyReady &&
-      (this.copyFinal || this.frameEvery !== undefined || this.throttleOpen(now, this.lastRepaintAt))
+      (this.copyFinal || this.frameEvery !== undefined || this.throttle.due(now))
     ) {
       harvested = true;
       if (!this.readback.harvest(this.graph.positions, this.stats)) {
@@ -293,11 +289,15 @@ export class GpuStream {
       const final = this.copyFinal;
       if (this.copyTicks >= this.iterations && this.mode !== "run") this.settle();
       const r0 = performance.now();
-      this.lastRepaintAt = now;
-      this.onFrame();
+      try {
+        this.onFrame();
+      } catch (error) {
+        // The engine's repaint threw (a style accessor, say): report it as uncaught, as a repaint in its
+        // own animation frame would, and keep the layout's loop and its state intact.
+        reportError(error);
+      }
       repaintMs = performance.now() - r0;
-      this.lastRepaintMs = repaintMs;
-      this.repaintedPrev = true;
+      this.throttle.repainted(now, repaintMs);
       if (this.stopped) return; // the repaint superseded this layout
       if (final) this.finish();
     }
@@ -321,11 +321,15 @@ export class GpuStream {
     // 3. The readback copy (on the repaint cadence), then the frame's one budget fence.
     const copied = this.copyDue(now);
     if (copied) {
+      // Between ticks (right after an integrate) the reductions' stats describe the previous positions:
+      // re-run them so the harvest's finiteness check covers the positions it copies. After a prep they
+      // already do — positions change only at integrate and at the prep's held-position write.
+      if (this.phase === 0) this.layout.refreshSegmentStats();
       this.readback.issue(this.layout);
       this.copyTicks = this.ticksDone;
       this.copyFinal = this.finishing;
       this.copiedTicks = this.ticksDone;
-      this.lastCopyAt = now;
+      this.throttle.copyIssued(now);
       this.copyReady = false;
     }
     const frame = this.budget.endFrame(repaintMs > 0);
@@ -375,6 +379,11 @@ export class GpuStream {
   private encodeItem(): void {
     if (this.phase === 0) {
       this.tickBands = Math.min(this.budget.bands, this.layout.atlasRows);
+      if (this.heldIds && this.heldPositions) {
+        this.layout.setHeldPositions(this.heldIds, this.heldPositions);
+        this.heldIds = null;
+        this.heldPositions = null;
+      }
       this.layout.beginTick();
       this.phase = 1;
     } else if (this.phase <= this.tickBands) {
@@ -432,16 +441,7 @@ export class GpuStream {
     if (this.finishing) return true;
     if (this.ticksDone <= this.copiedTicks) return false;
     if (this.frameEvery !== undefined) return this.ticksDone - this.copiedTicks >= this.frameEvery;
-    return this.throttleOpen(now + this.readyLatencyMs, this.lastRepaintAt);
-  }
-
-  /**
-   * Whether the repaint interval `max(minFrameMs, 2 × max(last repaint's main thread, its GPU stall))` has
-   * passed since `since`.
-   */
-  private throttleOpen(now: number, since: number): boolean {
-    const interval = Math.max(this.minFrameMs, 2 * Math.max(this.lastRepaintMs, this.lastStallMs));
-    return now - since >= interval - THROTTLE_SLACK_MS;
+    return this.throttle.copyDue(now);
   }
 
   // ── Lifecycle ──────────────────────────────────────────────────────────────
@@ -450,7 +450,7 @@ export class GpuStream {
     if (this.looping || this.stopped) return;
     this.looping = true;
     this.budget.resume();
-    this.repaintedPrev = false; // the idle gap is not a stall
+    this.throttle.pause(); // the idle gap is not a stall
     this.raf = requestAnimationFrame(this.frame);
   }
 
@@ -468,7 +468,14 @@ export class GpuStream {
     this.looping = false;
     this.readback.abandon();
     this.canvas?.removeEventListener("webglcontextlost", this.onContextLost);
+    this.page?.removeEventListener("visibilitychange", this.onVisibilityChange);
   }
+
+  /** The page was hidden or shown: rAF paused in between, so the gap is neither a frame interval nor a stall. */
+  private readonly onVisibilityChange = (): void => {
+    this.budget.resume();
+    this.throttle.pause();
+  };
 
   private readonly onContextLost = (): void => {
     this.lose("the WebGL context was lost");
