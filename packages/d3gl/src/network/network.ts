@@ -532,6 +532,21 @@ export interface StateNetworkOptions {
   rosetteRadius?: number;
 }
 
+/**
+ * What the last LOD declutter pass cost ({@link Network.declutterStats}). `probes` and `cells` are the
+ * deterministic cost signature: they depend only on the glyphs and the view, never on machine speed.
+ */
+export interface NetworkDeclutterStats {
+  /** Frontier glyphs the pass thinned (the view-culled cut, before declutter). */
+  glyphs: number;
+  /** Distance tests the pass ran. */
+  probes: number;
+  /** Grid cells the pass scanned, empty ones included. */
+  cells: number;
+  /** Grid cells the engine's reused declutter scratch holds: its high-water mark, 4 bytes each. */
+  scratchCells: number;
+}
+
 const DEFAULT_NODE_RADIUS = 4;
 const DEFAULT_NODE_FILL = "#4878d0";
 const DEFAULT_LINK_WIDTH = 1;
@@ -727,6 +742,8 @@ export class Network extends BaseEngine {
   private readonly cutScratch = makeCutScratch();
   /** Engine-owned {@link declutterFrontier} scratch (#213), same reuse contract as {@link cutScratch}. */
   private readonly declutterFrontierScratch = makeDeclutterFrontierScratch();
+  /** Frontier glyphs the last LOD declutter pass was handed; −1 before the first ({@link declutterStats}). */
+  private declutterGlyphs = -1;
   /** The expanded modules in view the last {@link computeFrontier} collected for the module-boundary
    *  rings (#329) — `count` 0 when `moduleBoundary` is off. Reused per cut, like {@link cutScratch}. */
   private readonly cutBoundaries: CutBoundaries = makeCutBoundaries();
@@ -1926,6 +1943,20 @@ export class Network extends BaseEngine {
   }
 
   /**
+   * What the last LOD declutter pass cost: the frontier glyphs it thinned, the distance tests and grid
+   * cells it ran, and how many grid cells the engine's reused scratch holds. `null` until LOD with
+   * declutter has drawn a frame. Introspection for debugging and tests: the per-frame guards read it
+   * after each `setTransform` to assert the declutter's cost signature through the real trigger.
+   */
+  get declutterStats(): NetworkDeclutterStats | null {
+    if (this.declutterGlyphs < 0) return null;
+    const grid = this.declutterFrontierScratch.grid;
+    // declutterFrontier hands a frontier of 0-1 glyphs straight back without a pass.
+    const ran = this.declutterGlyphs > 1;
+    return { glyphs: this.declutterGlyphs, probes: ran ? (grid.probes ?? 0) : 0, cells: ran ? (grid.cells ?? 0) : 0, scratchCells: grid.head.length };
+  }
+
+  /**
    * Which position transport the active layout uses:
    * - `"gpu"` — running on the WebGL GPU path (the handle's `transport` field is `"gpu"`).
    * - `"shared"` — CPU worker, positions stream zero-copy via a `SharedArrayBuffer` (cross-origin isolated page).
@@ -2613,6 +2644,7 @@ export class Network extends BaseEngine {
       boundaries: opts.moduleBoundary ? bnd : undefined,
     }, this.cutScratch); // #213: reused per frame — the walk allocates nothing steady-state
     if (opts.declutter !== false) {
+      this.declutterGlyphs = frontier.length;
       frontier = declutterFrontier(tree, frontier, this.transform, this.width, this.height, {
         screenSized: style.sizeMode === "screen",
         k: this.transform.k,
