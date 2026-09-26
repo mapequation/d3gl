@@ -32,5 +32,5 @@ export { halfLinkGeometry, halfLinkPathString, traceHalfLink, scaleHalfLink, bez
 export type { HalfLinkParams, HalfLinkGeometry, PathSink } from "./half-link.js";
 export { HitIndex } from "./hit-test.js";
 export { declutterScreen, declutterScratch, declutterMembers } from "./declutter.js";
-export type { DeclutterScratch } from "./declutter.js";
+export type { DeclutterScratch, DeclutterLevels } from "./declutter.js";
 export { version } from "./version.js";

@@ -207,7 +207,7 @@ function runSweep(tree: LODTree, centroid: [number, number], baseK: number, fram
     const raw = cut(tree, t, W, H, { expandPx: allLeaves ? 1e-6 : 48, screenSized: true, maxAggregateRadius: 26 }, cutSc);
     maxFrontier = Math.max(maxFrontier, raw.length);
     const frontier = declutterFrontier(tree, raw, t, W, H, { screenSized: true, k, maxAggregateRadius: 26 }, dcSc).slice();
-    probes += dcSc.grid.probes;
+    probes += dcSc.grid.probes ?? 0;
     glyphs += raw.length;
     const out = superEdges(tree, frontier, style, visibleWorldRect(t, W, H), seSc);
     ts.push(performance.now() - t0);
@@ -254,7 +254,7 @@ describe("streamed LOD frame waste — colour resolution + mixed-radius declutte
     const ref = singleGridKept(n, sx, sy, radii, order);
     expect(firstMismatch(out, ref.kept)).toBe(-1);
     expect(ref.probes / n, "the fixture is dense enough to punish the single grid").toBeGreaterThan(30);
-    expect(scratch.probes / n).toBeLessThan(MAX_PROBES_PER_GLYPH);
+    expect((scratch.probes ?? 0) / n).toBeLessThan(MAX_PROBES_PER_GLYPH);
   }, 120_000);
 
   it("reductions OFF: the full-detail colour pass runs the accessor once per distinct weight, not per edge", () => {
@@ -284,7 +284,7 @@ describe("streamed LOD frame waste — colour resolution + mixed-radius declutte
       ts.push(performance.now() - t0);
     }
     const declutterMs = median(ts);
-    const probesPerGlyph = scratch.probes / BENCH_N;
+    const probesPerGlyph = (scratch.probes ?? 0) / BENCH_N;
     expect(probesPerGlyph).toBeLessThan(MAX_PROBES_PER_GLYPH);
 
     // The pipeline sweep on a BENCH_N-leaf tree, all-leaves frame included.

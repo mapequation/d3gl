@@ -181,7 +181,7 @@ describe("declutterScreen per-glyph radius grid", () => {
     const scratch = declutterScratch();
     declutterScreen(n, sx, sy, radii, order, W, H, 1, new Uint8Array(n), scratch);
     const ref = singleGridReference(n, sx, sy, radii, order, W, H, 1);
-    const perGlyph = scratch.probes / n;
+    const perGlyph = (scratch.probes ?? 0) / n;
     // Measured: single grid 52.6 probes/glyph here; radius-class grid 3.2.
     expect(ref.probes / n, "the fixture really is dense for the single grid").toBeGreaterThan(30);
     expect(perGlyph, `${perGlyph.toFixed(2)} probes/glyph`).toBeLessThan(8);
@@ -192,16 +192,51 @@ describe("declutterScreen per-glyph radius grid", () => {
     const { sx, sy, radii, order } = mixedFrontier(n, W, H, 0.05);
     const scratch = declutterScratch();
     const out = new Uint8Array(n);
-    declutterScreen(n, sx, sy, radii, order, W, H, 1, out, scratch);
-    const refs = { head: scratch.head, next: scratch.next, levelCell: scratch.levelCell, levelMaxR: scratch.levelMaxR, levelCols: scratch.levelCols, levelRows: scratch.levelRows, levelBase: scratch.levelBase };
-    for (let k = 0; k < 4; k++) declutterScreen(n, sx, sy, radii, order, W, H, 1, out, scratch);
+    const winners = new Int32Array(n);
+    declutterScreen(n, sx, sy, radii, order, W, H, 1, out, scratch, undefined, winners);
+    const refs = { head: scratch.head, next: scratch.next, levels: scratch.levels, seq: scratch.seq };
+    for (let k = 0; k < 4; k++) declutterScreen(n, sx, sy, radii, order, W, H, 1, out, scratch, undefined, winners);
+    expect(refs.levels, "the per-class tables exist once warm").toBeDefined();
     expect(scratch.head).toBe(refs.head);
     expect(scratch.next).toBe(refs.next);
-    expect(scratch.levelCell).toBe(refs.levelCell);
-    expect(scratch.levelMaxR).toBe(refs.levelMaxR);
-    expect(scratch.levelCols).toBe(refs.levelCols);
-    expect(scratch.levelRows).toBe(refs.levelRows);
-    expect(scratch.levelBase).toBe(refs.levelBase);
+    expect(scratch.levels).toBe(refs.levels);
+    expect(scratch.seq).toBe(refs.seq);
+  });
+
+  it("counts a negative radius as 0 (a point): the single-grid set and winners over the clamped radii", () => {
+    // An unclamped d3 radius scale can extrapolate a leaf's radius below 0 (lod.ts passes it through).
+    // The single grid squared a negative threshold, so such a pair's exclusion depended on which grid
+    // cells it fell in; a point is the only reading that doesn't. Both r ≤ −1 and −1 < r < 0 occur here.
+    const n = 20_000;
+    const { sx, sy, radii, order } = mixedFrontier(n, W, H, 0.05);
+    for (let i = 0; i < n; i += 3) radii[i] = -(radii[i] ?? 0) * (i % 2 === 1 ? 1 : 0.2);
+    const clamped = radii.map((r) => Math.max(r, 0));
+    const ref = singleGridReference(n, sx, sy, clamped, order, W, H, 1);
+    const out = new Uint8Array(n);
+    const winners = new Int32Array(n).fill(-7);
+    declutterScreen(n, sx, sy, radii, order, W, H, 1, out, declutterScratch(), undefined, winners);
+    expect(firstMismatch(out, ref.kept), "kept").toBe(-1);
+    expect(firstMismatch(winners, ref.winners), "winners").toBe(-1);
+    // A point inside a kept disc is covered by it, and a kept point still culls a disc over it.
+    expect(Array.from(declutterScreen(2, [50, 58], [50, 50], Float64Array.of(10, -5), [0, 1], 100, 100, 1, new Uint8Array(2)))).toEqual([1, 0]);
+    expect(Array.from(declutterScreen(2, [50, 58], [50, 50], Float64Array.of(-5, 10), [0, 1], 100, 100, 1, new Uint8Array(2)))).toEqual([1, 0]);
+  });
+
+  it("accepts a hand-built { head, next } scratch (the shape it had before the radius classes)", () => {
+    const n = 5_000;
+    const { sx, sy, radii, order } = mixedFrontier(n, W, H, 0.05);
+    for (const radius of [radii, 3] as const) {
+      const want = new Uint8Array(n);
+      const wantWinners = new Int32Array(n);
+      declutterScreen(n, sx, sy, radius, order, W, H, 1, want, declutterScratch(), undefined, wantWinners);
+      const bare = { head: new Int32Array(0), next: new Int32Array(0) };
+      const got = new Uint8Array(n);
+      const gotWinners = new Int32Array(n);
+      declutterScreen(n, sx, sy, radius, order, W, H, 1, got, bare, undefined, gotWinners);
+      const form = typeof radius === "number" ? "uniform" : "per-glyph";
+      expect(firstMismatch(got, want), `${form}: kept`).toBe(-1);
+      expect(firstMismatch(gotWinners, wantWinners), `${form}: winners`).toBe(-1);
+    }
   });
 });
 

@@ -5,43 +5,55 @@
 
 /** Most radius classes the per-glyph grid splits into (each class halves the cell of the one above). */
 const MAX_LEVELS = 8;
+/** The empty `seq` a call without `winners` indexes nothing from. */
+const NO_SEQ = new Int32Array(0);
 
-/** Reusable grid scratch so a per-frame caller (geo declutter runs on every zoom) allocates nothing. */
+/**
+ * Reusable grid scratch so a per-frame caller (geo declutter runs on every zoom) allocates nothing.
+ * Only `head` and `next` are required — a hand-built `{ head, next }` works; the per-glyph form creates
+ * the rest on first use. Build it with {@link declutterScratch} to have them from the start.
+ */
 export interface DeclutterScratch {
-  /** Per-cell list heads, every radius class's grid back to back. */
+  /** Per-cell list heads (per-glyph radius form: every radius class's grid back to back). */
   head: Int32Array;
   /** Intrusive per-cell list link, per glyph. */
   next: Int32Array;
-  /** Per radius class (per-glyph radius form): cell size in px, coarsest (= 2·spacing·maxR) first. */
-  levelCell: Float64Array;
-  /** Per radius class: 1 / cell size (cell indices multiply — no division per candidate). */
-  levelInv: Float64Array;
-  /** Per radius class: largest radius inserted so far this call (−1 = empty class). */
-  levelMaxR: Float64Array;
-  /** Per radius class: grid columns, rows, and the offset of its cells in {@link head}. */
-  levelCols: Int32Array;
-  levelRows: Int32Array;
-  levelBase: Int32Array;
-  /** Insertion rank of each kept glyph — only filled when `winners` is tracked in the per-glyph form. */
-  seq: Int32Array;
+  /** Per-radius-class grid tables for the per-glyph radius form (created on first use). */
+  levels?: DeclutterLevels;
+  /** Insertion rank of each kept glyph — per-glyph radius form with `winners` only (grown on use). */
+  seq?: Int32Array;
   /** Distance tests the last call ran — the deterministic cost signature per-frame guards assert. */
-  probes: number;
+  probes?: number;
+}
+
+/** The per-radius-class tables of {@link DeclutterScratch} (at most {@link MAX_LEVELS} classes). */
+export interface DeclutterLevels {
+  /** Cell size in px, coarsest (= 2·spacing·maxR) first. */
+  cell: Float64Array;
+  /** 1 / cell size (cell indices multiply — no division per candidate). */
+  inv: Float64Array;
+  /** Largest radius inserted so far this call (−1 = empty class). */
+  maxR: Float64Array;
+  /** Grid columns, rows, and the offset of the class's cells in {@link DeclutterScratch.head}. */
+  cols: Int32Array;
+  rows: Int32Array;
+  base: Int32Array;
+}
+
+function declutterLevels(): DeclutterLevels {
+  return {
+    cell: new Float64Array(MAX_LEVELS),
+    inv: new Float64Array(MAX_LEVELS),
+    maxR: new Float64Array(MAX_LEVELS),
+    cols: new Int32Array(MAX_LEVELS),
+    rows: new Int32Array(MAX_LEVELS),
+    base: new Int32Array(MAX_LEVELS),
+  };
 }
 
 /** A fresh, empty scratch (grown lazily on first use). Hold one per engine and pass it in to reuse it. */
 export function declutterScratch(): DeclutterScratch {
-  return {
-    head: new Int32Array(0),
-    next: new Int32Array(0),
-    levelCell: new Float64Array(MAX_LEVELS),
-    levelInv: new Float64Array(MAX_LEVELS),
-    levelMaxR: new Float64Array(MAX_LEVELS),
-    levelCols: new Int32Array(MAX_LEVELS),
-    levelRows: new Int32Array(MAX_LEVELS),
-    levelBase: new Int32Array(MAX_LEVELS),
-    seq: new Int32Array(0),
-    probes: 0,
-  };
+  return { head: new Int32Array(0), next: new Int32Array(0), levels: declutterLevels(), seq: new Int32Array(0), probes: 0 };
 }
 
 /**
@@ -60,8 +72,9 @@ export function declutterScratch(): DeclutterScratch {
  *
  * `sx`/`sy` are screen-pixel centres. `radius` is the per-glyph exclusion radius in px — a number for
  * the uniform case (a point layer's fixed spacing is passed as **half** the centre-to-centre distance,
- * since two glyphs collide when `dist < rᵢ + rⱼ`). `out` (length ≥ `count`, written in index order) and
- * `scratch` are reused across frames by the caller. Returns `out`.
+ * since two glyphs collide when `dist < rᵢ + rⱼ`). A per-glyph radius below 0 counts as 0 (a point).
+ * `out` (length ≥ `count`, written in index order) and `scratch` are reused across frames by the
+ * caller. Returns `out`.
  *
  * `ignore(i, j)` (optional) drops a specific overlap from the test: when candidate `i` would be occluded
  * by an already-kept glyph `j`, returning true means "not a real overlap" so `i` is not culled by `j`
@@ -105,7 +118,7 @@ export function declutterScreen(
   let minR = Infinity;
   if (radii) {
     for (let i = 0; i < count; i++) {
-      const r = radii[i]!;
+      const r = Math.max(radii[i]!, 0); // a negative radius counts as a point (NaN stays NaN)
       if (r > maxR) maxR = r;
       if (r < minR) minR = r;
     }
@@ -129,7 +142,13 @@ export function declutterScreen(
     // Per-glyph radius (the network LOD frontier shape): one grid per radius class. Class 0 is the
     // single grid above; each finer class halves the cell, down to the smallest glyph's exclusion
     // diameter — or to ~one cell per glyph, past which a finer grid only adds empty cells to clear.
-    const { levelCell, levelInv, levelMaxR, levelCols, levelRows, levelBase } = scratch;
+    const lv = (scratch.levels ??= declutterLevels());
+    const levelCell = lv.cell;
+    const levelInv = lv.inv;
+    const levelMaxR = lv.maxR;
+    const levelCols = lv.cols;
+    const levelRows = lv.rows;
+    const levelBase = lv.base;
     const minCell = Math.max(2 * spacing * minR, Math.sqrt((width * height) / Math.max(count, 4096)));
     let levels = 0;
     let nCells = 0;
@@ -151,15 +170,15 @@ export function declutterScreen(
     // `winners` records the occluder the single grid met first: its 3×3 cells in column-major order,
     // newest-kept first within a cell. The classes find every occluder, so rank them by that order —
     // (single-grid cell rank, insertion rank) — and keep the least.
-    if (winners && scratch.seq.length < count) scratch.seq = new Int32Array(count);
-    const seq = scratch.seq;
+    let seq = scratch.seq ?? NO_SEQ;
+    if (winners && seq.length < count) seq = scratch.seq = new Int32Array(count);
     const rankSpan = count + 1;
     let inserted = 0;
     for (let oi = 0; oi < count; oi++) {
       const i = order ? order[oi]! : oi;
       const x = sx[i]!;
       const y = sy[i]!;
-      const r = radii[i]!;
+      const r = Math.max(radii[i]!, 0);
       if (x < 0 || y < 0 || x > width || y > height) {
         out[i] = 1; // off-screen centre ⇒ keep, and don't insert (so it can't occlude on-screen glyphs)
         if (winners) winners[i] = i; // a kept glyph represents itself
@@ -200,7 +219,7 @@ export function declutterScreen(
               probes++;
               const dx = sx[p]! - x;
               const dy = sy[p]! - y;
-              const thresh = spacing * (r + radii[p]!); // circles must not overlap
+              const thresh = spacing * (r + Math.max(radii[p]!, 0)); // circles must not overlap
               if (dx * dx + dy * dy < thresh * thresh) {
                 if (ignore && ignore(i, p)) continue; // e.g. a cross-fading glyph ignores its ancestor
                 if (!winners) {
