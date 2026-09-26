@@ -22,10 +22,14 @@ import { ADDITIVE_BLEND, fullScreenModel, type PassUniforms } from "./fullscreen
 const CENTER_FS = /* glsl */ `\
 #version 300 es
 precision highp float;
+// Not optional: a fragment shader's defaults are lowp sampler2D and mediump int, and u_segStats
+// carries raw sums (|Σx| up to N·max|x|, ~4e9 at 325k) while slot ids and u_count exceed mediump's 2^15.
+precision highp int;
+precision highp sampler2D;
 
-uniform sampler2D u_pos;
-uniform sampler2D u_segStats;  // (Σx, Σy, Σ|v|, count) per segment
-uniform sampler2D u_segParam;  // (repulsion, centering, softening, alpha0) per segment
+uniform highp sampler2D u_pos;
+uniform highp sampler2D u_segStats;  // (Σx, Σy, Σ|v|, count) per segment
+uniform highp sampler2D u_segParam;  // (repulsion, centering, softening, alpha0) per segment
 uniform int   u_count;
 uniform int   u_width;
 layout(location = 0) out vec2 o_force;
