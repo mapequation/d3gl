@@ -686,8 +686,11 @@ export class Network extends BaseEngine {
    *  ({@link fitViewToLayout}): O(nodes) once per such style, then read per frame. Weakly keyed, so a
    *  replaced style is never kept alive by it. A constant radius needs no scan ({@link maxLeafRadius}). */
   private readonly fitRadii = new WeakMap<ResolvedNetworkStyle, number>();
-  /** Pending coalesced repaint rAF id (0 = none) for progressive worker frames. */
-  private layoutRepaintRaf = 0;
+  /** A streamed layout frame is waiting for the engine's coalesced frame ({@link scheduleLayoutRepaint}). */
+  private streamPending = false;
+  /** Leaves moved since the last drawn frame by a drag, a transition or a force-drag tick
+   *  ({@link repaintDuringDrag}): null = none, `"all"` = every node may have moved, else the held set. */
+  private moved: Uint32Array | "all" | null = null;
   /** The running position transition (#328), if any — owned by {@link layoutHandle}, kept here so a
    *  node grab can finish it. */
   private transition: PositionTransition | null = null;
@@ -910,6 +913,7 @@ export class Network extends BaseEngine {
    *  Shared by {@link data} (plain graph) and {@link applyView} (state-network view switch); unlike
    *  `data` it does NOT clear the state-network mode. */
   private setActiveGraph(graph: NetworkGraph): this {
+    this.moved = null; // leaf ids of the previous graph: the rebuild below draws the new one in full
     this.haltLayout(); // any worker layout is tied to the previous graph's buffers
     this.graph = graph;
     // Drop per-node style arrays sized to the PREVIOUS graph — the idiomatic re-render on a graph swap is
@@ -1662,6 +1666,7 @@ export class Network extends BaseEngine {
         if (this.graph !== graph) return;
         this.dragReapply?.();
         this.repaintDuringDrag();
+        this.flushFrame(); // this tick runs inside an animation frame: draw it here (with any pending zoom), not a frame late
       },
     });
   }
@@ -1848,10 +1853,12 @@ export class Network extends BaseEngine {
   }
 
   /**
-   * Coalesce progressive worker frames into at most one repaint per animation frame. With a
-   * worker-streamed LOD tree the geometry is already fresh (the worker wrote it before posting the
-   * frame), so the main thread only re-cuts; otherwise the positions changed and the LOD geometry is
-   * recomputed here before the cut — LOD tracks the layout *as it converges*, not only once settled.
+   * Coalesce progressive worker frames into at most one repaint per animation frame — the engine's one
+   * coalesced frame, shared with pan/zoom and node-drag input, so a frame that streams while the user
+   * zooms or drags still cuts and renders once (#367). With a worker-streamed LOD tree the geometry is
+   * already fresh (the worker wrote it before posting the frame), so the main thread only re-cuts;
+   * otherwise the positions changed and the LOD geometry is recomputed before the cut ({@link drawFrame})
+   * — LOD tracks the layout *as it converges*, not only once settled.
    *
    * State-network mode (#182) is also driven through here when the physical layout streams: the
    * callback re-derives the rosette from the just-streamed physical positions (O(physicalCount) sizing +
@@ -1866,19 +1873,29 @@ export class Network extends BaseEngine {
     // Raised at message time (not in the rAF): a pan between a streamed frame and its coalesced
     // repaint must not label from a grid indexing the pre-stream positions (#212).
     this.labelSource.stale = true;
-    if (this.layoutRepaintRaf) return;
-    const raf: (cb: FrameRequestCallback) => number =
-      typeof requestAnimationFrame === "function" ? requestAnimationFrame : (cb) => setTimeout(() => cb(0), 16);
-    this.layoutRepaintRaf = raf(() => {
-      this.layoutRepaintRaf = 0;
+    this.streamPending = true;
+    this.requestRedraw();
+  }
+
+  /**
+   * The engine's coalesced frame (#367): everything that moved nodes since the last frame — a streamed
+   * layout frame, drag moves, a transition or force-drag tick — is folded into the LOD geometry, then ONE
+   * {@link rebuild} cuts and renders at the frame's transform (a pending pan/zoom transform is already set).
+   */
+  protected override drawFrame(): void {
+    if (this.streamPending) {
+      this.streamPending = false;
+      this.moved = null; // the streamed frame's full geometry pass below covers any drag move
       this.dragReapply?.(); // hold the dragged nodes under the cursor over the worker's snapshot (#140, copy mode)
       if (this.stateData) this.applyStateDerivedPositions(); // physical positions just streamed a frame
       if (!this.drawsWorkerTree()) this.recomputeLODGeometry(); // worker streams geometry; main only re-cuts
       // Fit-on-layout: reframe the camera to the layout's freshly-updated bounds BEFORE the rebuild, so
       // the LOD cut + render run once at the framed transform (no extra emit). Cleared on settle/gesture.
       if (this.fitOnLayout) this.fitViewToLayout("streaming");
-      this.rebuild();
-    });
+    } else {
+      this.applyMovedGeometry();
+    }
+    this.rebuild();
   }
 
   /**
@@ -1976,8 +1993,8 @@ export class Network extends BaseEngine {
     this.transition = null;
     this.lodStreaming = false; // no worker run is in flight to stream the LOD tree any more
     this.nestedSolving = false;
-    if (this.layoutRepaintRaf && typeof cancelAnimationFrame === "function") cancelAnimationFrame(this.layoutRepaintRaf);
-    this.layoutRepaintRaf = 0;
+    this.streamPending = false; // a streamed frame still waiting to draw belongs to the halted run…
+    if (this.moved === null) this.withdrawRedraw(); // …and so does its redraw, unless a drag move waits too
   }
 
   /** Resolves when the current worker layout converges — or its position transition ends (#328) — or
@@ -2603,6 +2620,7 @@ export class Network extends BaseEngine {
         if (cool < 0) applyHeld(); // hold under the cursor; once released, let the held set settle freely
         sim.tick();
         this.repaintDuringDrag();
+        this.flushFrame(); // this tick runs inside an animation frame: draw it here (with any pending zoom), not a frame late
         if (cool >= 0 && (--cool < 0 || sim.converged)) return; // re-cooled (or tail spent) — stop the loop
         raf = rafFn(frame);
       };
@@ -2649,16 +2667,28 @@ export class Network extends BaseEngine {
   }
 
   /**
-   * Update the LOD geometry from the moved positions and re-emit + repaint. The per-frame paint
-   * shared by every drag backend (#140); a drag move is a continuous pointer interaction, so this
-   * must never run O(tree size) work (#211):
+   * Nodes moved — repaint them in the engine's next coalesced frame (#367). The per-frame paint shared by
+   * every drag backend (#140) and the position transition (#328). A drag move is a continuous pointer
+   * interaction that can fire several times per frame, so a move only records what moved: O(1). The frame
+   * folds it into the LOD geometry once ({@link applyMovedGeometry}) and cuts + renders once, with any
+   * pending zoom or streamed layout frame. `held` = only these leaves moved (the same session's array on
+   * every move); omitted = every node may have moved.
+   */
+  private repaintDuringDrag(held?: Uint32Array): void {
+    this.moved = held && (this.moved === null || this.moved === held) ? held : "all";
+    this.requestRedraw();
+  }
+
+  /**
+   * Fold the nodes moved since the last frame ({@link repaintDuringDrag}) into the LOD geometry, once per
+   * frame. It must never run O(tree size) work for a drag (#211):
    *
    * - **Worker-streamed tree**: skipped entirely — the worker owns the geometry.
-   * - **`held` given** (positions / worker / gpu drag moves — only the held leaves moved since the
-   *   last pass): incremental {@link updateLODPositionsForLeaves} along the held leaves' ancestor
-   *   chains, O(held · depth). Extents widen conservatively; {@link settleLODPositions} makes them
-   *   exact on release.
-   * - **No `held`** (the `force` drag's rAF tick moved *every* free node): one full
+   * - **A held set** (positions / worker / gpu drag moves — only the held leaves moved since the last
+   *   pass): incremental {@link updateLODPositionsForLeaves} along the held leaves' ancestor chains,
+   *   O(held · depth). Extents widen conservatively; {@link settleLODPositions} makes them exact on
+   *   release.
+   * - **`"all"`** (the `force` drag's rAF tick, a transition frame — *every* free node moved): one full
    *   {@link computeLODPositions} pass — O(tree size), matching the tick's own O(nodes + edges).
    *
    * Style-derived geometry (`radius`/`weight`/`border`/`color`) is position-independent, so no
@@ -2666,15 +2696,15 @@ export class Network extends BaseEngine {
    * HCL colour aggregation — on every move). The tree-build fallback stays for a drag that starts
    * before any geometry pass ran.
    */
-  private repaintDuringDrag(held?: Uint32Array): void {
+  private applyMovedGeometry(): void {
+    const moved = this.moved;
+    this.moved = null;
     const graph = this.graph;
-    if (!this.drawsWorkerTree() && graph) {
-      const tree = this.lodReady() ? this.lodTree : null;
-      if (!tree) this.recomputeLODGeometry(); // no tree/geometry yet — build once (no-op when LOD is off)
-      else if (held) updateLODPositionsForLeaves(tree, graph.positions, held, this.treeParent(tree));
-      else computeLODPositions(tree, graph.positions, this.lodDiscs(tree));
-    }
-    this.rebuild();
+    if (!moved || !graph || this.drawsWorkerTree()) return;
+    const tree = this.lodReady() ? this.lodTree : null;
+    if (!tree) this.recomputeLODGeometry(); // no tree/geometry yet — build once (no-op when LOD is off)
+    else if (moved !== "all") updateLODPositionsForLeaves(tree, graph.positions, moved, this.treeParent(tree));
+    else computeLODPositions(tree, graph.positions, this.lodDiscs(tree));
   }
 
   /** One exact position-geometry pass when a drag releases (#211), replacing the drag's grow-only
@@ -2685,7 +2715,9 @@ export class Network extends BaseEngine {
   private settleLODPositions(): void {
     if (this.drawsWorkerTree() || !this.lodReady() || !this.lodTree || !this.graph) return;
     computeLODPositions(this.lodTree, this.graph.positions, this.lodDiscs(this.lodTree));
-    this.rebuild();
+    this.moved = null; // the exact pass covers a drag move still waiting for its frame
+    this.requestRedraw();
+    this.flushFrame(); // draw now — and only once, if that frame (or a zoom) was pending
   }
 
   /** The nested layout's discs when they laid out `tree` (#329): its position passes place the modules on them. */
