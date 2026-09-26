@@ -601,9 +601,11 @@ export function collide(s: Scratch, k: number, pad: number): void {
     const min = (rad[i]! + rad[j]!) * pad;
     const d2 = dx * dx + dy * dy;
     if (d2 >= min * min) return;
-    // `push` scales (dx, dy), whose length is d, to the overlap `min − d`. Coincident discs (d² = 0) have
-    // no such vector: they separate by exactly `min` along a fixed, index-derived unit direction, from the
-    // lower index to the higher (i < j on both paths below) — deterministic (#357).
+    // `push` scales (dx, dy), whose length is d, to the overlap `min − d`. Coincident discs (d² = 0, or NaN
+    // from a non-finite position) have no such vector: they separate by exactly `min` along a fixed,
+    // index-derived unit direction, from the lower index to the higher (i < j on both paths below) —
+    // deterministic (#357). i and j are the module's local child indices (0..k−1); a batched port that
+    // holds every module in one slot range reproduces the direction with `slot − segment start` (#355).
     const d = Math.sqrt(d2);
     const push = d2 > 0 ? (min - d) / d : min;
     const mi = rad[i]! * rad[i]!;
