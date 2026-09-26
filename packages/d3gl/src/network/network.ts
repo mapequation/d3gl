@@ -274,12 +274,13 @@ export interface NetworkLayoutOptions {
    * from a view the user chose. Without it a streaming layout converges wherever the solver centres it
    * — the GPU solve centres the centroid at the origin, so it would otherwise render at the top-left
    * corner until it settles. Default `false`. Ignored for `"positions"` / `"force"` (already final on
-   * the first paint). The box is tight whether LOD is on or off, and ignores a handful of flung-out
-   * stragglers: at most min(64, 0.5% of the nodes) per side, and only when they sit 10-30% or more of the
-   * layout's size beyond the rest. A small disconnected component that far out is dropped the same way and
-   * opens just outside the frame. The pad covers the largest node glyph; with LOD on, an aggregate glyph
-   * larger than that can overhang the frame's edge margin. Computing the box costs O(nodes) per streamed
-   * frame, only while the fit is on.
+   * the first paint). The box is tight whether LOD is on or off. While the layout streams it ignores a
+   * handful of flung-out stragglers: at most min(64, 0.5% of the nodes) per side, and only when they sit
+   * 10-30% or more of the layout's size beyond the rest, so a fling-out cannot shrink the rest to a dot
+   * mid-run. A small disconnected component that far out is dropped the same way and streams just outside
+   * the frame. The settled layout is framed by its exact box, every node included. The pad covers the
+   * largest node glyph; with LOD on, an aggregate glyph larger than that can overhang the frame's edge
+   * margin. Computing the box costs O(nodes) per streamed frame, only while the fit is on.
    */
   fit?: boolean;
   /**
@@ -532,6 +533,13 @@ export interface StateNetworkOptions {
    *  @see {@link rosettePositions} */
   rosetteRadius?: number;
 }
+
+/**
+ * Which box a fit-on-layout reframe uses ({@link layoutBox}): while `"streaming"`, the layout's box less a
+ * handful of flung-out stragglers, so that one cannot blow the frame up mid-run; once `"settled"`, its exact
+ * box, so that the view the user is left with crops no node, a small disconnected component included.
+ */
+type FitPhase = "streaming" | "settled";
 
 const DEFAULT_NODE_RADIUS = 4;
 const DEFAULT_NODE_FILL = "#4878d0";
@@ -1416,7 +1424,7 @@ export class Network extends BaseEngine {
       // branches don't refresh it before this first fit — using it stale collapses the frame to the origin.
       if (this.fitOnLayout) {
         this.recomputeLODGeometry();
-        this.fitViewToLayout();
+        this.fitViewToLayout("streaming");
       }
     }
     return this.rebuild();
@@ -1520,9 +1528,9 @@ export class Network extends BaseEngine {
    * #328). With `fit`, a warm map's extent is known only now: frame it. Then ease to it, or jump.
    */
   private landNested(graph: NetworkGraph, positions: Float32Array, tween: PositionTransition | null): void {
-    if (this.fitOnLayout && !this.fitKnownBox) this.fitKnownBox = layoutBox(positions, graph.nodeCount);
+    if (this.fitOnLayout && !this.fitKnownBox) this.fitKnownBox = layoutBox(positions, graph.nodeCount); // the settled layout: exact
     if (tween) {
-      if (this.fitOnLayout) this.fitViewToLayout(); // frame the final layout once, as the transition starts
+      if (this.fitOnLayout) this.fitViewToLayout("streaming"); // frame the final layout once, as the transition starts
       tween.to(positions);
     } else {
       graph.positions.set(positions);
@@ -1668,7 +1676,7 @@ export class Network extends BaseEngine {
       // screen) is cheap and self-corrects on the first streamed frame regardless.
       this.applyStateDerivedPositions();
       this.recomputeLODGeometry();
-      if (fit) this.fitViewToLayout(); // frame the first paint against the seeded layout
+      if (fit) this.fitViewToLayout("streaming"); // frame the first paint against the seeded layout
       return this.rebuild();
     }
 
@@ -1758,7 +1766,7 @@ export class Network extends BaseEngine {
       if (!this.drawsWorkerTree()) this.recomputeLODGeometry(); // worker streams geometry; main only re-cuts
       // Fit-on-layout: reframe the camera to the layout's freshly-updated bounds BEFORE the rebuild, so
       // the LOD cut + render run once at the framed transform (no extra emit). Cleared on settle/gesture.
-      if (this.fitOnLayout) this.fitViewToLayout();
+      if (this.fitOnLayout) this.fitViewToLayout("streaming");
       this.rebuild();
     });
   }
@@ -1766,15 +1774,16 @@ export class Network extends BaseEngine {
   /**
    * Reframe the camera on the streaming layout's live bounds (box centre → view centre, longest side →
    * ~85% of the view, padded by the largest leaf radius) and re-seed the zoom gesture to match. Called for
-   * a `layout({ fit: true })` run on the first paint and each streamed frame until it settles or the view is
-   * taken over (a user gesture, or a `setTransform`). Sets the transform *state* only (no render) — the
-   * caller's `rebuild()` renders once at the framed transform. Bounds come from {@link layoutFitBox}:
-   * O(nodes) per streamed frame, and only while the fit is on.
+   * a `layout({ fit: true })` run on the first paint and each streamed frame (`"streaming"`), and once on
+   * the settled layout (`"settled"`, {@link releaseFit}), unless the view was taken over first (a user
+   * gesture, or a `setTransform`). Sets the transform *state* only (no render) — the caller's `rebuild()`
+   * renders once at the framed transform. Bounds come from {@link layoutFitBox}: O(nodes) per streamed
+   * frame, and only while the fit is on.
    */
-  private fitViewToLayout(): void {
+  private fitViewToLayout(phase: FitPhase): void {
     const backend = this.backend();
     if (!backend || !this.graph) return;
-    const box = this.layoutFitBox(this.graph);
+    const box = this.layoutFitBox(this.graph, phase);
     if (!box) return;
     // Pad by the drawn leaf radius so the outermost glyphs stay inside the frame: in world units a world-
     // sized glyph grows the box, a screen-sized one keeps that many pixels free around it.
@@ -1806,22 +1815,24 @@ export class Network extends BaseEngine {
 
   /**
    * The layout's world-space bounding box `[minX, minY, maxX, maxY]` for {@link fitViewToLayout}: the box
-   * of the live **leaf positions**, less a handful of flung-out stragglers ({@link layoutBox}) — tight
-   * whether LOD is on or off, and recomputed on every streamed frame so it follows the layout as it grows.
-   * O(nodes) per call with no allocation; called only while a fit is on. A layout whose final extent is
-   * known up front frames on that instead ({@link fitKnownBox}). Null if no position is finite.
+   * of the live **leaf positions** ({@link layoutBox}) — tight whether LOD is on or off, and recomputed on
+   * every streamed frame so it follows the layout as it grows. While `"streaming"` it drops a handful of
+   * flung-out stragglers; `"settled"` it is exact, so a small far component the stream left just outside
+   * the frame is framed once the layout settles. O(nodes) per call with no typed-array allocation; called
+   * only while a fit is on. A layout whose final extent is known up front frames on that instead
+   * ({@link fitKnownBox}). Null if no position is finite.
    */
-  private layoutFitBox(graph: NetworkGraph): FitBox | null {
-    return this.fitKnownBox ?? layoutBox(graph.positions, graph.nodeCount);
+  private layoutFitBox(graph: NetworkGraph, phase: FitPhase): FitBox | null {
+    return this.fitKnownBox ?? layoutBox(graph.positions, graph.nodeCount, { trimStragglers: phase === "streaming" });
   }
 
-  /** Final reframe + release of a streaming fit (on settle): fit once more to the settled bounds, then
-   *  stop per-frame fitting so the view is the user's to pan/zoom (the gesture is already seeded to it).
-   *  Skipped when the view was taken over first — a user gesture ({@link setInteracting}) or a
-   *  `setTransform` — so it never undoes the user's view. */
+  /** Final reframe + release of a streaming fit (on settle): fit once more to the settled layout's exact
+   *  bounds, then stop per-frame fitting so the view is the user's to pan/zoom (the gesture is already
+   *  seeded to it). Skipped when the view was taken over first — a user gesture ({@link setInteracting}) or
+   *  a `setTransform` — so it never undoes the user's view. */
   private releaseFit(): void {
     if (!this.fitOnLayout) return;
-    this.fitViewToLayout();
+    this.fitViewToLayout("settled");
     this.fitOnLayout = false;
   }
 

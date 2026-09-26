@@ -3,7 +3,7 @@ import type { ViewTransform } from "../core/index.js";
 /** World-space bounding box `[minX, minY, maxX, maxY]`. */
 export type FitBox = [number, number, number, number];
 
-/** At most this many leaves per side (and axis) are dropped as stragglers by {@link layoutBox}. */
+/** At most this many leaves per side (and axis) are dropped as stragglers by a trimming {@link layoutBox}. */
 const MAX_STRAGGLERS = 64;
 /** …and at most this share of the leaves — so a small layout (< 200 leaves) is framed exactly. */
 const STRAGGLER_SHARE = 0.005;
@@ -50,28 +50,42 @@ function sideBound(exact: number, trimmed: number, size: number): number {
   return exact + w * (trimmed - exact);
 }
 
+/** Options for {@link layoutBox}. */
+export interface LayoutBoxOptions {
+  /**
+   * Drop a handful of outlying **stragglers** from the box, for a layout that is still streaming (see
+   * {@link layoutBox}). Default `false`: the exact bounding box, for a settled layout.
+   */
+  trimStragglers?: boolean;
+}
+
 /**
  * The box to frame a layout by: the bounding box of its **leaf positions** (`positions` is interleaved
- * `[x0, y0, x1, y1, …]`), less a handful of **stragglers**. Null when no position is finite.
+ * `[x0, y0, x1, y1, …]`). Null when no position is finite.
  *
  * Tight by construction — it reads the leaves themselves, so it is the layout's true extent whatever the
  * LOD tree (an aggregate's `extent` compounds up the tree and would frame a coarsening tree several times
- * too loose, #327). A clean layout gets its exact bounding box.
+ * too loose, #327).
  *
- * Robust to force-layout **fling-outs** (#206): a side drops its outermost leaves — at most
- * `min(64, 0.5% of the leaves)` of them — when they sit more than ~10-30% of the layout's size beyond the
- * rest, so one leaf flung 20× away cannot blow the frame up and shrink the rest to a dot. A group larger
- * than that is part of the layout and is framed; so is a sparse but contiguous edge (a disc's rim). The
- * trade-off: a genuinely separate group no larger than the trim count — a small disconnected component, an
- * isolate — that sits that far out is dropped the same way and opens outside the framed view (zoom out to
- * see it). Layouts under 200 leaves are never trimmed.
+ * By default it is the **exact** bounding box: every finite leaf is framed, so the settled view never
+ * crops a small disconnected component or an isolate.
  *
- * Cost: O(leaves), no allocation. One branch-free pass for the exact bounds, then a count of the leaves in
- * each side's outer 5% band that certifies a layout without stragglers (and usually stops after a few
+ * With `trimStragglers` — the streaming fit, while a force layout is still converging — it is robust to
+ * **fling-outs** (#206): a side drops its outermost leaves — at most `min(64, 0.5% of the leaves)` of them —
+ * when they sit more than ~10-30% of the layout's size beyond the rest, so one leaf flung 20× away cannot
+ * blow the frame up and shrink the rest to a dot. A group larger than that is part of the layout and is
+ * framed; so is a sparse but contiguous edge (a disc's rim), and a clean layout gets its exact box. The
+ * trade-off, only while streaming: a genuinely separate group no larger than the trim count that sits that
+ * far out is dropped the same way and streams just outside the frame, until the settled fit frames it. The
+ * trim is a hard count, so a far group hovering at it can switch consecutive streamed frames between tight
+ * and loose. Layouts under 200 leaves are never trimmed.
+ *
+ * Cost: O(leaves), no allocation. The exact box is one branch-free pass. Trimming adds a count of the leaves
+ * in each side's outer 5% band that certifies a layout without stragglers (and usually stops after a few
  * thousand leaves); only when a side fails that, two more passes histogram the axes (a fixed, reused 2 KB)
  * and locate its trimmed bound.
  */
-export function layoutBox(positions: ArrayLike<number>, count: number): FitBox | null {
+export function layoutBox(positions: ArrayLike<number>, count: number, opts: LayoutBoxOptions = {}): FitBox | null {
   // Pass 1: exact bounds. Branch-free min/max runs several times faster than compare-and-assign on a
   // layout stored in radial order (a seed spiral); a non-finite position poisons it, and only then does the
   // finite-checked pass below run.
@@ -105,7 +119,7 @@ export function layoutBox(positions: ArrayLike<number>, count: number): FitBox |
     }
     if (finite === 0) return null;
   }
-  const trim = Math.min(MAX_STRAGGLERS, Math.floor(finite * STRAGGLER_SHARE));
+  const trim = opts.trimStragglers === true ? Math.min(MAX_STRAGGLERS, Math.floor(finite * STRAGGLER_SHARE)) : 0;
   if (trim === 0) return [minX, minY, maxX, maxY];
 
   // Pass 2: certify. A side whose outer band holds more than `trim` leaves drops nothing ({@link BAND}).
