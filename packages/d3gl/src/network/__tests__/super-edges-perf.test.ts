@@ -4,6 +4,7 @@ import { buildLODTree, computeLODGeometry, cut, declutterFrontier, visibleWorldR
 import { multilevelSeed } from "../coarsen.js";
 import { superEdges, makeSuperEdgesScratch, type SuperEdgesData, type SuperEdgesScratch } from "../glyphs.js";
 import { buildGraph } from "../graph.js";
+import { fitInto } from "./fit-into.js";
 import { buildModuleLODTree, type ModuleNode } from "../modules.js";
 
 /**
@@ -57,6 +58,7 @@ function seededClusteredTree(n: number): { tree: LODTree; centroid: [number, num
   }
   const g = buildGraph({ nodeCount: n, source, target });
   multilevelSeed(g, { width: 2000, height: 2000 });
+  fitInto(g.positions, 2000); // the extent the budgets were calibrated on (see fit-into.ts)
   const tree = buildLODTree(g, {});
   computeLODGeometry(tree, g, new Float32Array(n).fill(4));
   let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;

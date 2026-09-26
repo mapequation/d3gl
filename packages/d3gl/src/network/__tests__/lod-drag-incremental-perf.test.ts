@@ -3,6 +3,7 @@ import { appendFileSync } from "node:fs";
 import { buildLODTree, computeLODGeometry, computeLODPositions, computeLODStyle, updateLODPositionsForLeaves, type LODTree } from "../lod.js";
 import { multilevelSeed } from "../coarsen.js";
 import { buildGraph, type NetworkGraph } from "../graph.js";
+import { fitInto } from "./fit-into.js";
 
 /**
  * Incremental LOD geometry during node-drag (#211, AGENTS.md lifecycle §5). A node-drag is a
@@ -60,20 +61,6 @@ function seededClusteredTree(n: number, fit = true): { tree: LODTree; graph: Net
   if (fit) fitInto(g.positions, 2000);
   const tree = buildLODTree(g, {});
   return { tree, graph: g };
-}
-
-/** Scale positions uniformly into a `size`-wide box at the origin (in place). */
-function fitInto(p: Float32Array, size: number): void {
-  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
-  for (let i = 0; i < p.length; i += 2) {
-    minX = Math.min(minX, p[i]!); maxX = Math.max(maxX, p[i]!);
-    minY = Math.min(minY, p[i + 1]!); maxY = Math.max(maxY, p[i + 1]!);
-  }
-  const s = size / Math.max(maxX - minX, maxY - minY, 1e-9);
-  for (let i = 0; i < p.length; i += 2) {
-    p[i] = (p[i]! - minX) * s;
-    p[i + 1] = (p[i + 1]! - minY) * s;
-  }
 }
 
 /** Parent pointers from the children CSR (coarsening trees carry no `parent`) — built once, as
@@ -225,9 +212,10 @@ describe("#211 incremental LOD geometry during node-drag", () => {
   // this N) a big aggregate's per-move Float32 centroid increment (2 / count) falls below half an ulp
   // and is lost instead of accumulated, so the incremental centroids drift past the tolerance above
   // (~1.2 at a count-8310 aggregate for 100 held leaves × 50 moves) until the exact release pass. The
-  // production layouts sit at that scale (web-NotreDame r95 ≈ 17.5k). `it.fails` keeps the limit in
-  // the suite: it turns red once the incremental update is exact there — then make it a plain `it`.
-  it.fails("at the equilibrium scale the incremental centroids stay within tolerance during a drag (known Float32 limit)", () => {
+  // production layouts sit at that scale (web-NotreDame r95 ≈ 17.5k). This leg pins the measured drift
+  // (not just "something threw"): it turns red once the incremental update is exact there — then flip
+  // the assertion to the 0.1 tolerance above.
+  it("at the equilibrium scale the incremental centroids drift past the tolerance during a drag (known Float32 limit)", () => {
     const eq = seededClusteredTree(N, false);
     const eqParent = parentOf(eq.tree);
     computeLODGeometry(eq.tree, eq.graph, radii, eq.graph.strength, undefined, colors);
@@ -245,7 +233,8 @@ describe("#211 incremental LOD geometry during node-drag", () => {
     for (let g = 0; g < eq.tree.size; g++) {
       maxCentroidErr = Math.max(maxCentroidErr, Math.abs(eq.tree.cx[g]! - ref.cx[g]!), Math.abs(eq.tree.cy[g]! - ref.cy[g]!));
     }
-    expect(maxCentroidErr).toBeLessThan(0.1);
+    expect(maxCentroidErr).toBeGreaterThan(0.1); // the Float32 limit (measured ~1.2), vs the 0.1 tolerance
+    expect(maxCentroidErr).toBeLessThan(10); // bounded: lost increments, not a broken update
   }, 60_000);
 });
 
