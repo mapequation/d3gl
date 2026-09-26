@@ -332,10 +332,10 @@ export function descendingInListOrder(list: CandidateList, keyOf: (id: number) =
   rank.clear();
   for (let i = 0; i < n; i++) rank.push(i);
   const keys = rank.keysFor(n);
-  for (let i = 0; i < n; i++) keys[i] = keyOf(ids[i]!);
+  for (let i = 0; i < n; i++) keys[i] = keyOf(ids[i] ?? 0);
   const next = descendingByKey(rank.ids, keys, n);
   return () => {
     const at = next();
-    return at < 0 ? -1 : ids[at]!;
+    return at < 0 ? -1 : (ids[at] ?? -1);
   };
 }
