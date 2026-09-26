@@ -1,15 +1,7 @@
 import type { Device, Texture, RenderPass } from "@luma.gl/core";
-import { Model } from "@luma.gl/engine";
-
-/**
- * Full-screen triangle vertex shader — shared with IntegratePass and AttractionPass.
- * Each fragment corresponds to one texel (one node).
- */
-const VS = /* glsl */ `\
-#version 300 es
-in vec2 a_clip;
-void main() { gl_Position = vec4(a_clip, 0.0, 1.0); }
-`;
+import type { Model } from "@luma.gl/engine";
+import { SLOT_TEXEL_GLSL } from "../textures.js";
+import { ADDITIVE_BLEND, fullScreenModel, type PassUniforms } from "./fullscreen.js";
 
 /**
  * All-pairs O(n²) repulsion pass — correctness baseline (Task 3).
@@ -41,10 +33,10 @@ uniform int   u_count;
 uniform int   u_width;
 uniform float u_repulsion;
 layout(location = 0) out vec2 o_force;
-
+${SLOT_TEXEL_GLSL}
 void main() {
   ivec2 c = ivec2(gl_FragCoord.xy);
-  int id = c.y * u_width + c.x;
+  int id = texelSlot(c, u_width);
   if (id >= u_count) { discard; }
 
   vec2 pi = texelFetch(u_pos, c, 0).xy;
@@ -52,7 +44,7 @@ void main() {
 
   for (int j = 0; j < u_count; j++) {
     if (j == id) continue;
-    vec2 pj = texelFetch(u_pos, ivec2(j % u_width, j / u_width), 0).xy;
+    vec2 pj = texelFetch(u_pos, slotTexel(j, u_width), 0).xy;
     vec2 d = pi - pj;
     float d2 = dot(d, d);
     float f = u_repulsion / (d2 + 1e-2);
@@ -87,40 +79,17 @@ export interface RepulsionAllPairsUniforms {
  */
 export class RepulsionAllPairsPass {
   private readonly model: Model;
-  private readonly uniforms: Record<string, number>;
+  private readonly uniforms: PassUniforms;
 
   constructor(device: Device) {
-    const clipBuf = device.createBuffer({
-      data: new Float32Array([-1, -1, 3, -1, -1, 3]),
-    });
-
     this.uniforms = {
       u_count: 0,
       u_width: 1,
       u_repulsion: 0,
     };
 
-    this.model = new Model(device, {
-      vs: VS,
-      fs: FS,
-      topology: "triangle-list",
-      vertexCount: 3,
-      attributes: { a_clip: clipBuf },
-      bufferLayout: [{ name: "a_clip", format: "float32x2" }],
-      uniforms: this.uniforms,
-      parameters: {
-        // Additive blend: dst += src. Accumulates alongside other force passes.
-        // Requires EXT_float_blend on WebGL2 for float render targets; luma.gl
-        // enables it automatically via WebGLDeviceFeatures if present.
-        blend: true,
-        blendColorSrcFactor: "one",
-        blendColorDstFactor: "one",
-        blendAlphaSrcFactor: "one",
-        blendAlphaDstFactor: "one",
-        blendColorOperation: "add",
-        blendAlphaOperation: "add",
-      },
-    });
+    // Additive blend: dst += src, accumulating alongside the other force passes.
+    this.model = fullScreenModel(device, FS, this.uniforms, ADDITIVE_BLEND);
   }
 
   /** Draw one all-pairs repulsion step into an already-open render pass. */

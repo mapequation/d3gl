@@ -1,6 +1,8 @@
 import type { Device, Texture, RenderPass } from "@luma.gl/core";
-import { Model } from "@luma.gl/engine";
+import type { Model } from "@luma.gl/engine";
 import type { GridPyramid } from "./grid-pyramid.js";
+import { SLOT_TEXEL_GLSL } from "../textures.js";
+import { ADDITIVE_BLEND, fullScreenModel, type PassUniforms } from "./fullscreen.js";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Barnes-Hut grid-pyramid repulsion (O(n log n)).
@@ -57,12 +59,6 @@ import type { GridPyramid } from "./grid-pyramid.js";
 // initial root, so ≤ 3*L + 1. We size STACK_MAX = 4*(L+1) with margin and cap
 // the loop to avoid a runaway on a degenerate (never-terminating) case.
 
-const VS = /* glsl */ `\
-#version 300 es
-in vec2 a_clip;
-void main() { gl_Position = vec4(a_clip, 0.0, 1.0); }
-`;
-
 /**
  * Build the FS with a compile-time levelCount so the stack is a fixed-size
  * array and the per-level texture bindings are statically indexable (GLSL ES
@@ -105,7 +101,7 @@ layout(location = 0) out vec2 o_force;
 
 const int ROOT_LEVEL = ${L};
 const int STACK_MAX = ${STACK_MAX};
-
+${SLOT_TEXEL_GLSL}
 // Read a pyramid cell (Σx, Σy, mass, 0) at (level, cx, cy). Level is dynamic, so
 // select the sampler via an unrolled static switch (GLSL ES 3.00 rule).
 vec4 fetchCell(int level, int cx, int cy) {
@@ -115,7 +111,7 @@ ${fetchCases.join("\n")}
 
 void main() {
   ivec2 fc = ivec2(gl_FragCoord.xy);
-  int id = fc.y * u_width + fc.x;
+  int id = texelSlot(fc, u_width);
   if (id >= u_count) { discard; }
 
   vec2 pi = texelFetch(u_pos, fc, 0).xy;
@@ -227,15 +223,11 @@ export interface RepulsionPyramidUniforms {
  */
 export class RepulsionPyramidPass {
   private readonly model: Model;
-  private readonly uniforms: Record<string, number>;
+  private readonly uniforms: PassUniforms;
   private readonly levelCount: number;
 
   constructor(device: Device, levelCount: number) {
     this.levelCount = levelCount;
-    const clipBuf = device.createBuffer({
-      data: new Float32Array([-1, -1, 3, -1, -1, 3]),
-    });
-
     this.uniforms = {
       u_count: 0,
       u_width: 1,
@@ -245,25 +237,8 @@ export class RepulsionPyramidPass {
       u_theta2: 0,
     };
 
-    this.model = new Model(device, {
-      vs: VS,
-      fs: makeFs(levelCount),
-      topology: "triangle-list",
-      vertexCount: 3,
-      attributes: { a_clip: clipBuf },
-      bufferLayout: [{ name: "a_clip", format: "float32x2" }],
-      uniforms: this.uniforms,
-      parameters: {
-        // Additive blend: accumulate alongside attraction + centering.
-        blend: true,
-        blendColorSrcFactor: "one",
-        blendColorDstFactor: "one",
-        blendAlphaSrcFactor: "one",
-        blendAlphaDstFactor: "one",
-        blendColorOperation: "add",
-        blendAlphaOperation: "add",
-      },
-    });
+    // Additive blend: accumulate alongside attraction + centering.
+    this.model = fullScreenModel(device, makeFs(levelCount), this.uniforms, ADDITIVE_BLEND);
   }
 
   /**
