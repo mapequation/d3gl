@@ -96,6 +96,38 @@ describe("startGpuLayout fallback", () => {
     expect(String(warn.mock.calls[0]?.[0])).toMatch(/device promise rejected/);
   });
 
+  it("falls back without a warning when the caller expects it (backend:'auto', #375), keeping every option", async () => {
+    const spy = vi.spyOn(workerMod, "startWorkerLayout").mockReturnValue(fakeWorkerHandle({ shared: false }));
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const g = buildGraph({ nodeCount: 3, source: [0], target: [1] });
+    const onTransport = vi.fn();
+    const onLODTree = (): void => {};
+    const quiet: GpuLayoutOptions = { ...ALL_OPTIONS, warnUnsupported: false };
+    // Unsupported, synchronously and through a device promise: the worker runs, silently.
+    const sync = startGpuLayout(null, g, quiet, () => {}, onLODTree, onTransport);
+    const async = startGpuLayout(Promise.resolve(null), g, quiet, () => {}, onLODTree, onTransport);
+    await async.settled;
+    expect(sync.transport).toBe("worker");
+    expect(async.transport).toBe("worker");
+    expect(spy).toHaveBeenCalledTimes(2);
+    for (const call of spy.mock.calls) expect(call[1]).toEqual(expect.objectContaining(ALL_OPTIONS));
+    expect(onTransport).toHaveBeenCalledTimes(2);
+    expect(warn).not.toHaveBeenCalled();
+  });
+
+  it("still warns, with the error, when a quiet GPU layout fails rather than being unsupported", async () => {
+    vi.spyOn(workerMod, "startWorkerLayout").mockReturnValue(fakeWorkerHandle({ shared: false }));
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const g = buildGraph({ nodeCount: 3, source: [0], target: [1] });
+    const cause = new Error("lost");
+    const h = startGpuLayout(Promise.reject(cause), g, { ...ALL_OPTIONS, warnUnsupported: false }, () => {});
+    await h.settled;
+    expect(h.transport).toBe("worker");
+    expect(warn).toHaveBeenCalledOnce();
+    expect(String(warn.mock.calls[0]?.[0])).toMatch(/device promise rejected/);
+    expect(warn.mock.calls[0]?.[1]).toBe(cause);
+  });
+
   it("starts nothing when stopped before the device resolves", async () => {
     const spy = vi.spyOn(workerMod, "startWorkerLayout").mockReturnValue(fakeWorkerHandle({ shared: false }));
     const g = buildGraph({ nodeCount: 3, source: [0], target: [1] });

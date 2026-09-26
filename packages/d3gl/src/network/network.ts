@@ -259,18 +259,26 @@ export interface NetworkLayoutOptions {
    *  Barnes-Hut solve. `"gpu"` falls back to `"worker"`, with one console warning naming the reason, when
    *  the render backend is not WebGL or the device lacks float render targets, float blending
    *  (`EXT_float_blend`) or a large enough texture size for the graph. The fallback is a full worker
-   *  run: it honours `multilevel` and streams the LOD tree like `"worker"`. */
-  backend?: "positions" | "force" | "worker" | "gpu";
+   *  run: it honours `multilevel` and streams the LOD tree like `"worker"`.
+   *
+   *  `"auto"` (#375) asks for "the GPU where it works": it resolves to the GPU solve wherever `"gpu"`
+   *  would run it and to `"worker"` everywhere else, **without** a warning, because there the worker is
+   *  an expected outcome. From then on the layout behaves exactly as on the backend it resolved to —
+   *  `fit`, drag reheat, state networks, `nested`, LOD streaming — and {@link Network.layoutTransport}
+   *  reports which one runs. A GPU run that fails rather than being unsupported (for example a driver
+   *  error while starting) still warns. The default does not change: omitting `backend` behaves as
+   *  before. */
+  backend?: "positions" | "force" | "worker" | "gpu" | "auto";
   /** Interleaved `[x, y, …]` world coordinates for `backend: "positions"`. */
   positions?: Float32Array;
   /**
-   * Tick budget of the force layout (`"force"` / `"worker"` / `"gpu"`, default 300) — a maximum, not a
-   * fixed count (#124), and the length of the anneal: a seeded layout (multilevel, or the GPU's module
-   * seed) cools over it, so a larger budget cools more slowly rather than only adding headroom. A cold
-   * disc start keeps full heat to untangle. The CPU backends stop as soon as the layout has converged
-   * (nodes moving a small fraction of the equilibrium spacing per tick), resolving
-   * {@link Network.whenSettled}. The GPU backend runs the whole budget (its early stop needs a GPU
-   * readback it doesn't do yet).
+   * Tick budget of the force layout (`"force"` / `"worker"` / `"gpu"` / `"auto"`, default 300) — a
+   * maximum, not a fixed count (#124), and the length of the anneal: a seeded layout (multilevel, or the
+   * GPU's module seed) cools over it, so a larger budget cools more slowly rather than only adding
+   * headroom. A cold disc start keeps full heat to untangle. The CPU backends stop as soon as the layout
+   * has converged (nodes moving a small fraction of the equilibrium spacing per tick), resolving
+   * {@link Network.whenSettled}. The GPU solve (`"gpu"`, or `"auto"` resolved to it) runs the whole
+   * budget (its early stop needs a GPU readback it doesn't do yet).
    */
   iterations?: number;
   /**
@@ -282,12 +290,12 @@ export interface NetworkLayoutOptions {
    * For `backend: "force"` and `backend: "worker"`, seed the layout via multilevel coarsening
    * (heavy-edge matching) for faster convergence and fewer tangles on clustered graphs. Default
    * `true`; set `false` for a plain cold-start force run. Tiny / edgeless graphs skip coarsening
-   * automatically. `backend: "gpu"` honours it when it falls back to the worker; the GPU solve itself
+   * automatically. `"gpu"` and `"auto"` honour it when they resolve to the worker; the GPU solve itself
    * seeds from the module hierarchy when there is one, else from a disc.
    */
   multilevel?: boolean;
   /**
-   * For the streaming backends (`"worker"` / `"gpu"`), keep the camera framed on the layout as it
+   * For the streaming backends (`"worker"` / `"gpu"` / `"auto"`), keep the camera framed on the layout as it
    * converges: the view is fit to the bounding box of the node positions each streamed frame (box
    * centre → view centre, longest side → ~85% of the view, padded by the largest node radius) and
    * framed once more on the settled layout. Released to normal zoom/pan once it settles, or as soon as
@@ -314,7 +322,7 @@ export interface NetworkLayoutOptions {
    * Once it lands, a LOD cut of the laid-out module tree treats each module as its disc (#329): drawn at
    * the disc's centre, culled by it, and expanded once the disc's diameter on screen reaches `expandPx`.
    * Runs off-thread on `backend: "worker"` (streamed top-down, one frame per depth) and synchronously
-   * on `"force"`; `"gpu"` uses the worker until a GPU path exists. Ignored without a hierarchy.
+   * on `"force"`; `"gpu"` and `"auto"` use the worker until a GPU path exists. Ignored without a hierarchy.
    *
    * `true` sizes discs by node flow (leaf count when the graph has none); pass `{ size: "count" }` to
    * size by leaf count, and `iterations` / `packing` to tune each module's solve. `{ warm: true }`
@@ -327,8 +335,8 @@ export interface NetworkLayoutOptions {
    * many milliseconds (cubic ease-in-out) on the main thread, instead of jumping or streaming. Default
    * `0` (no transition). Applies to every layout computed in one go — `"positions"`, `"force"`, and a
    * `nested` layout on any backend (whose worker then posts only the final layout, no depth frames);
-   * the streaming `"worker"` / `"gpu"` force layouts ignore it (they already animate as they converge),
-   * as does a state network's layout.
+   * the streaming `"worker"` / `"gpu"` / `"auto"` force layouts ignore it (they already animate as they
+   * converge), as does a state network's layout.
    *
    * Each transition frame is a positions-only repaint — one O(nodes) interpolation, the LOD tree's
    * O(tree size) position pass (no style pass) and the normal re-emit — no more than a streamed layout
@@ -640,13 +648,22 @@ const DEFAULT_FORCE_ITERATIONS = 300;
 /**
  * What a layout backend asks of the engine, known synchronously from the options (spec §12.2):
  * caller-supplied `"positions"`, a main-thread `"force"` solve, or positions that `"streaming"` in
- * asynchronously — the worker, or the GPU, which may itself resolve to the worker. The fit, nested,
- * state-network and drag decisions need only this; which transport a streaming layout actually runs
- * is known once a GPU device settles ({@link WorkerLayoutHandle.transport}).
+ * asynchronously — the worker, or the GPU (`"gpu"` / `"auto"`), which may itself resolve to the worker.
+ * The fit, transition, nested, state-network and drag decisions need only this; which transport a
+ * streaming layout actually runs is known once a GPU device settles ({@link WorkerLayoutHandle.transport}).
  */
 function layoutClass(backend: NetworkLayoutOptions["backend"]): "positions" | "force" | "streaming" | null {
-  if (backend === "worker" || backend === "gpu") return "streaming";
+  if (backend === "worker" || requestsGpu(backend)) return "streaming";
   return backend ?? null;
+}
+
+/**
+ * Whether a layout backend asks for the GPU solve (spec §12.2): `"gpu"`, which warns when it falls back
+ * to the worker, or `"auto"` (#375), which falls back silently because the worker is an expected outcome.
+ * Both start the same run ({@link startGpuLayout}), so everything downstream sees the same handle.
+ */
+function requestsGpu(backend: NetworkLayoutOptions["backend"]): backend is "gpu" | "auto" {
+  return backend === "gpu" || backend === "auto";
 }
 
 /** A layout's transition length in ms (#328): `transition` when a positive finite number, else 0. */
@@ -739,7 +756,7 @@ export class Network extends BaseEngine {
   private lodTree: LODTree | null = null;
   /**
    * The LOD tree streamed by the layout worker (#103), when a worker run has LOD on — `backend: "worker"`,
-   * or a `"gpu"` layout that fell back to the worker (#351).
+   * or a `"gpu"` / `"auto"` layout that resolved to the worker (#351, #375).
    * Its `cx`/`cy`/`extent` are written by the worker each frame (live), so the main thread skips the
    * O(N) build + geometry pass and only fills the style geometry once + runs the O(visible) cut.
    * Null on the `force`/`positions` backends, the GPU solve, the worker's synchronous fallback, or LOD
@@ -1093,10 +1110,11 @@ export class Network extends BaseEngine {
    * per-frame work tracks the visible frontier rather than the whole graph. Requires the WebGL
    * backend. The tree's geometry follows the layout as it converges (re-cut cheaply on zoom).
    *
-   * **Call this before `layout({ backend: "worker" })`** to get the full win: the worker then builds
-   * and streams the LOD tree itself (#103), so the main thread never coarsens or runs the O(N)
-   * geometry pass. Enabling it *after* a worker run (or on the `force`/`positions` backends) falls
-   * back to building the tree on the main thread from the current positions.
+   * **Call this before `layout({ backend: "worker" })`** (or a `"gpu"` / `"auto"` layout that resolves to
+   * the worker) to get the full win: the worker then builds and streams the LOD tree itself (#103), so
+   * the main thread never coarsens or runs the O(N) geometry pass. Enabling it *after* a worker run (or
+   * on the `force`/`positions` backends) falls back to building the tree on the main thread from the
+   * current positions.
    *
    * On an engine that has not run a layout yet, `lod()` cannot know which backend comes next, so the
    * main-thread build waits for the end of the current call chain: a `layout({ backend: "worker" })`
@@ -1180,8 +1198,8 @@ export class Network extends BaseEngine {
    * - `draggable` — grab a node/aggregate and drag it (#140): the held set tracks the cursor with no
    *   lag while the layout reheats around it and re-cools on release. Grab a **selected** node to drag
    *   the **whole selection** together; grab a collapsed module to drag its **whole subtree**. Works on
-   *   the `force` and `worker` layout backends (reheat) and `positions` (translate-only). Pair with
-   *   `enableZoom()` and the drag takes precedence over panning when it starts on a glyph.
+   *   the `force`, `worker`, `gpu` and `auto` layout backends (reheat) and `positions` (translate-only).
+   *   Pair with `enableZoom()` and the drag takes precedence over panning when it starts on a glyph.
    * - `selection: { selected, others }` — `selected.stroke` overrides the **select** ring colour
    *   (default `#2563eb` blue); the hover ring defaults to `#16a34a` green (override via a `hover`
    *   HighlightStyle's `stroke`). A subtract-marquee preview rings the to-be-removed glyphs `#dc2626`
@@ -1533,9 +1551,10 @@ export class Network extends BaseEngine {
   }
 
   /**
-   * The flat streaming layout (`backend: "worker"` / `"gpu"`): off-thread (or on-GPU) force layout with
-   * progressive convergence. Both backends get the SAME worker options, LOD-tree adoption and settle
-   * handling, so a `"gpu"` layout that falls back (#351) is exactly the run `"worker"` would have started:
+   * The flat streaming layout (`backend: "worker"` / `"gpu"` / `"auto"`): off-thread (or on-GPU) force
+   * layout with progressive convergence. Every backend gets the SAME worker options, LOD-tree adoption and
+   * settle handling, so a `"gpu"` or `"auto"` layout that resolves to the worker (#351, #375) is exactly
+   * the run `"worker"` would have started:
    * `multilevel` honoured (#312) and the LOD tree streamed from the worker, so the main thread builds none.
    *
    * The worker can post a frame per tick, so repaints coalesce to one per animation frame
@@ -1580,9 +1599,12 @@ export class Network extends BaseEngine {
           this.recomputeLODGeometry();
         }
       : undefined;
-    if (opts.backend === "gpu") {
+    if (requestsGpu(opts.backend)) {
       const devicePromise = this.whenBackendSettled().then(() => this.gpuDevice());
-      handle = startGpuLayout(devicePromise, graph, { ...workerOpts, moduleTopology: this.moduleTree() }, onFrame, onLODTree,
+      // "auto" expects the worker where the GPU is unsupported: it falls back silently (#375).
+      const warnUnsupported = opts.backend === "gpu";
+      const gpuOpts = { ...workerOpts, moduleTopology: this.moduleTree(), warnUnsupported };
+      handle = startGpuLayout(devicePromise, graph, gpuOpts, onFrame, onLODTree,
         (transport) => {
           // Resolved to the worker fallback: it streams the tree from here on, so main builds none meanwhile.
           if (this.layoutHandle === handle && transport === "worker") this.lodStreaming = useLod;
@@ -1598,16 +1620,16 @@ export class Network extends BaseEngine {
 
   /**
    * The streaming layout's resolved transport (spec §12.2): `"worker"` for any `backend: "worker"`
-   * layout (nested ones included) and for a `"gpu"` layout whose device resolved to the worker fallback,
-   * `"gpu"` once the GPU solve runs, `"pending"` while a GPU device is unsettled, and `null` for the other
-   * backends or a `"gpu"` layout whose handle reports no transport (none started, or a nested run). The
-   * LOD guards key on it rather than on the literal backend: a worker streams the coarsening tree, so the
-   * main thread builds none.
+   * layout (nested ones included) and for a `"gpu"` / `"auto"` layout whose device resolved to the worker
+   * fallback, `"gpu"` once the GPU solve runs, `"pending"` while a GPU device is unsettled, and `null` for
+   * the other backends or a `"gpu"` / `"auto"` layout whose handle reports no transport (none started, or
+   * a nested run). The LOD guards key on it rather than on the literal backend: a worker streams the
+   * coarsening tree, so the main thread builds none.
    */
   private streamingTransport(): "worker" | "gpu" | "pending" | null {
     const backend = this.layoutOpts.backend;
     if (backend === "worker") return "worker";
-    if (backend !== "gpu") return null;
+    if (!requestsGpu(backend)) return null;
     return this.layoutHandle?.transport ?? null;
   }
 
@@ -1758,9 +1780,9 @@ export class Network extends BaseEngine {
    *
    * - `backend: "positions"` supplies the **physical** positions directly.
    * - `backend: "force"` runs the in-library multilevel/force layout on the physical graph, synchronously.
-   * - `backend: "worker"` / `"gpu"` mirror {@link layout}'s async branches, but drive the **physical**
-   *   graph: positions stream progressively into `sg.physical.positions`, and each coalesced frame
-   *   ({@link scheduleLayoutRepaint}) re-derives the rosette from them, so the state/both views converge
+   * - `backend: "worker"` / `"gpu"` / `"auto"` mirror {@link layout}'s async branches, but drive the
+   *   **physical** graph: positions stream progressively into `sg.physical.positions`, and each coalesced
+   *   frame ({@link scheduleLayoutRepaint}) re-derives the rosette from them, so the state/both views converge
    *   live alongside the physical layout. No worker-built LOD tree is requested here (`lod` stays unset) —
    *   the state-network LOD tree is over the state/module hierarchy, a different structure from the
    *   worker's physical-graph coarsening; module-aware GPU layout (#106 N8.2-4) is a later milestone.
@@ -1797,10 +1819,11 @@ export class Network extends BaseEngine {
         force: opts.force,
         multilevel: opts.multilevel,
       };
-      const handle: WorkerLayoutHandle =
-        opts.backend === "worker"
-          ? startWorkerLayout(phys, workerOpts, onPhysFrame)
-          : startGpuLayout(this.whenBackendSettled().then(() => this.gpuDevice()), phys, workerOpts, onPhysFrame);
+      // "auto" expects the worker where the GPU is unsupported: it falls back silently (#375).
+      const handle: WorkerLayoutHandle = requestsGpu(opts.backend)
+        ? startGpuLayout(this.whenBackendSettled().then(() => this.gpuDevice()), phys,
+            { ...workerOpts, warnUnsupported: opts.backend === "gpu" }, onPhysFrame)
+        : startWorkerLayout(phys, workerOpts, onPhysFrame);
       this.layoutHandle = handle;
       void handle.settled.then(() => {
         if (this.layoutHandle !== handle) return; // a newer layout superseded this one
@@ -2090,11 +2113,12 @@ export class Network extends BaseEngine {
    * - `"none"` — no layout active (`force`/`positions` backends, or before `layout()`).
    *
    * It reports the **live** transport (#297): a worker error that falls back to a synchronous solve turns
-   * `"shared"` into `"copy"`, and a `backend: "gpu"` layout that falls back to the worker (#351) reports
-   * the worker's transport. For a `backend: "gpu"` layout it resolves **asynchronously**: it is `"copy"`
-   * until the device promise settles, then `"gpu"` or the fallback worker's `"shared"`/`"copy"`. Read it
-   * after `await net.whenSettled()` or on a subsequent animation frame for the resolved value. The
-   * environment's *capability* (independent of any run) is {@link sharedMemoryAvailable}.
+   * `"shared"` into `"copy"`, and a `backend: "gpu"` / `"auto"` layout that resolves to the worker (#351,
+   * #375) reports the worker's transport. For a `"gpu"` / `"auto"` layout it resolves **asynchronously**:
+   * it is `"copy"` until the device promise settles, then `"gpu"` or the fallback worker's
+   * `"shared"`/`"copy"`. Read it after `await net.whenSettled()` or on a subsequent animation frame for the
+   * resolved value. The environment's *capability* (independent of any run) is
+   * {@link sharedMemoryAvailable}.
    */
   get layoutTransport(): "gpu" | "shared" | "copy" | "none" {
     if (!this.layoutHandle || this.layoutHandle.mainThread) return "none";
@@ -2584,7 +2608,7 @@ export class Network extends BaseEngine {
    *
    * - **force**: a main-thread {@link ForceLayout} pinned to the held set ticks in an rAF loop,
    *   reflowing neighbours; on release it re-cools for a short tail of ticks, then stops.
-   * - **worker / gpu**: the backend pins + reflows the rest (worker off-thread, gpu on the GPU) via
+   * - **worker / gpu / auto**: the backend pins + reflows the rest (worker off-thread, gpu on the GPU) via
    *   {@link WorkerLayoutHandle.pin}; the main thread writes the held positions every move (zero-lag)
    *   and re-pins them over each streamed frame ({@link dragReapply}, copy mode). Released via
    *   {@link WorkerLayoutHandle.unpin}. On the gpu backend the physical-view state layout reheats too.

@@ -14,8 +14,10 @@
 import { describe, it, expect, afterEach, vi } from "vitest";
 import { network } from "../../network.js";
 import { buildGraph } from "../../graph.js";
+import { buildStateGraph } from "../../state-graph.js";
 import { sharedMemoryAvailable } from "../../worker-transport.js";
 import type { MainToWorker } from "../../worker-protocol.js";
+import type { ModuleNode } from "../../modules.js";
 
 const W = 400;
 const H = 300;
@@ -199,7 +201,8 @@ describe("network layout backend:'gpu' integration", () => {
   // settles. Drives the real trigger on a RAGGED module tree (like the map-of-modules example) and asserts
   // the settled view maps the BULK of the nodes INSIDE the viewport at a healthy fill — i.e. not the top-left
   // pile, and not the over-zoomed "all white" collapse the earlier extent-based frame produced (#206).
-  it("fit:true frames a ragged module layout — bulk of nodes inside the viewport at a healthy fill", async () => {
+  // Under backend:"auto" (#375) the fit decision is the same one: "auto" resolves to the GPU here.
+  it.each(["gpu", "auto"] as const)("fit:true on backend:'%s' frames a ragged module layout — bulk of nodes inside the viewport at a healthy fill", async (backend) => {
     const host = makeHost();
     const net = network(host, { width: W, height: H, backend: "webgl" });
     const { buildGraph } = await import("../../graph.js");
@@ -224,7 +227,7 @@ describe("network layout backend:'gpu' integration", () => {
     net.data(g);
     net.lod({ modules });
     net.style({ sizeMode: "screen", nodeRadius: 4 });
-    net.layout({ backend: "gpu", fit: true, iterations: 200 });
+    net.layout({ backend, fit: true, iterations: 200 });
     await net.whenSettled();
     expect(net.layoutTransport).toBe("gpu");
 
@@ -318,6 +321,181 @@ describe("backend:'gpu' on a device without float blending (#351)", () => {
     expect(net.layoutTransport).toBe("gpu");
     expect(workerStarts(posts)).toHaveLength(0); // no worker run
     expect(net.lodSource).toBe("main"); // the GPU streams no tree: the main thread builds it (PR 3c moves it)
+    net.destroy();
+  });
+});
+
+/** The `[d3gl] … fell back to the CPU worker` warnings among `warn`'s calls. */
+function fallbackWarnings(warn: { mock: { calls: unknown[][] } }): unknown[][] {
+  return warn.mock.calls.filter((c) => String(c[0]).includes("fell back to the CPU worker"));
+}
+
+/** Every `start-nested` message posted to a layout worker since `spy` was installed: stream flag + params. */
+function nestedStarts(spy: { mock: { calls: [MainToWorker, ...unknown[]][] } }) {
+  return spy.mock.calls.flatMap(([m]) => (m.type === "start-nested" ? [{ stream: m.stream, params: m.params }] : []));
+}
+
+/** `a[i]`, or NaN past the end (keeps index reads typed without a non-null assertion). */
+const at = (a: ArrayLike<number>, i: number): number => a[i] ?? Number.NaN;
+
+/** Wait up to `frames` animation frames for `done()`. */
+async function frameUntil(done: () => boolean, frames: number): Promise<boolean> {
+  for (let f = 0; f < frames && !done(); f++) await new Promise((r) => requestAnimationFrame(r));
+  return done();
+}
+
+/**
+ * `layout({ backend: "auto" })` (#375, spec §12.2): the GPU when `gpuLayoutSupport` passes for the graph,
+ * else the worker, with no warning. Every decision the engine takes on the backend must then behave as
+ * it does on the resolved one — fit, drag reheat, state networks, nested layouts, LOD streaming — so each
+ * leg compares against `"gpu"` / `"worker"` on the same engine where it can.
+ */
+describe("backend:'auto' (#375)", () => {
+  it("resolves to the GPU on a supported device, silently, with LOD as on backend:'gpu'", async () => {
+    const net = network(makeHost(), { width: W, height: H, backend: "webgl" });
+    const warn = vi.spyOn(console, "warn");
+    const posts = vi.spyOn(Worker.prototype, "postMessage");
+    net.data(clustered(1500)).lod({ expandPx: 48 }).layout({ backend: "auto", iterations: 10 });
+    expect(net.layoutTransport).toBe("copy"); // pending until the device settles, as for "gpu"
+    await net.whenSettled();
+    expect(net.layoutTransport).toBe("gpu");
+    expect(workerStarts(posts)).toHaveLength(0); // no worker run
+    expect(net.lodSource).toBe("main"); // what backend:"gpu" does today (PR 3c moves the tree off main)
+    expect(fallbackWarnings(warn)).toHaveLength(0);
+    net.destroy();
+  });
+
+  it("resolves to the worker's exact run without a warning on a device without float blending, streaming its LOD tree", async () => {
+    const net = await engineWithoutFloatBlend();
+    const warn = vi.spyOn(console, "warn");
+    const posts = vi.spyOn(Worker.prototype, "postMessage");
+    const opts = { multilevel: false, iterations: 25 } as const;
+    net.data(clustered(1500)).style({ sizeMode: "screen" }).lod({ expandPx: 48, coarsen: { minNodes: 6 } });
+
+    net.layout({ backend: "auto", ...opts });
+    await net.whenSettled();
+    expect(fallbackWarnings(warn)).toHaveLength(0); // the worker is an expected outcome of "auto"
+    expect(net.layoutTransport).toBe(sharedMemoryAvailable() ? "shared" : "copy");
+    expect(net.lodSource).toBe("worker"); // the LOD guards saw a worker run: no main-thread tree
+    const autoStarts = workerStarts(posts);
+    expect(autoStarts).toHaveLength(1);
+
+    posts.mockClear();
+    net.layout({ backend: "worker", ...opts });
+    await net.whenSettled();
+    expect(net.lodSource).toBe("worker");
+    const workerRun = workerStarts(posts);
+    expect(workerRun).toHaveLength(1);
+    expect(autoStarts[0]).toEqual(workerRun[0]);
+    net.destroy();
+  });
+
+  it("resolves to the worker without a warning on a Canvas engine", async () => {
+    const net = network(makeHost(), { width: W, height: H, backend: "canvas" });
+    const warn = vi.spyOn(console, "warn");
+    net.data(buildGraph(makeRingGraph())).layout({ backend: "auto", iterations: 5 });
+    await net.whenSettled();
+    expect(net.layoutTransport).toBe(sharedMemoryAvailable() ? "shared" : "copy");
+    expect(fallbackWarnings(warn)).toHaveLength(0);
+    net.destroy();
+  });
+
+  it("streams instead of transitioning, as the other streaming backends do", async () => {
+    const net = network(makeHost(), { width: W, height: H, backend: "webgl" });
+    net.data(buildGraph(makeRingGraph())).layout({ backend: "auto", iterations: 5, transition: 600 });
+    await net.whenSettled();
+    expect(net.layoutTransport).toBe("gpu"); // a transition would report "none" (a main-thread tween)
+    net.destroy();
+  });
+
+  it("a node drag reheats the GPU layout: the held node tracks the cursor and its neighbour reflows", async () => {
+    const net = network(makeHost(), { width: W, height: H, backend: "webgl" });
+    await net.whenReady();
+    const g = buildGraph({ nodeCount: 6, source: [0, 1, 2, 3, 4], target: [1, 2, 3, 4, 5], directed: false });
+    net.data(g).style({ nodeRadius: 8 }).layout({ backend: "auto", iterations: 30 });
+    await net.whenSettled();
+    expect(net.layoutTransport).toBe("gpu");
+    net.interactive({ draggable: true });
+
+    // Put node 0 at the host's centre, then grab it there and drag it by (+60, -40) without releasing.
+    const p = g.positions;
+    const cx = W / 2, cy = H / 2;
+    net.setTransform({ k: 1, x: cx - at(p, 0), y: cy - at(p, 1) });
+    const [n1x, n1y] = [at(p, 2), at(p, 3)];
+    const host = hosts[hosts.length - 1];
+    if (!host) throw new Error("no host");
+    const r = host.getBoundingClientRect();
+    const pointer = (type: string, x: number, y: number) =>
+      host.dispatchEvent(new PointerEvent(type, { clientX: r.left + x, clientY: r.top + y, bubbles: true, button: 0, pointerId: 1 }));
+    const [heldX, heldY] = [at(p, 0) + 60, at(p, 1) - 40];
+    pointer("pointerdown", cx, cy);
+    pointer("pointermove", cx + 60, cy - 40);
+    expect(p[0]).toBeCloseTo(heldX, 2); // held under the cursor by the main thread, zero lag
+    expect(p[1]).toBeCloseTo(heldY, 2);
+    // The GPU layout reheats around the held node: its spring neighbour moves (translate-only would not).
+    const moved = await frameUntil(() => Math.hypot(at(p, 2) - n1x, at(p, 3) - n1y) > 0.5, 120);
+    pointer("pointerup", cx + 60, cy - 40);
+    expect(moved).toBe(true);
+    expect(p[0]).toBeCloseTo(heldX, 2); // the reheat never moved the held node
+    net.destroy();
+  });
+
+  it("lays out a state network's physical graph on the GPU and derives the rosette", async () => {
+    const graph = buildStateGraph({
+      stateCount: 4,
+      stateToPhysical: [0, 0, 1, 2],
+      source: [0, 1],
+      target: [2, 3],
+      nodeFlow: [1, 1, 1, 1],
+      directed: false,
+    });
+    const modules = [{ id: 0, path: [1, 1] }, { id: 1, path: [2, 1] }, { id: 2, path: [1, 2] }, { id: 3, path: [2, 2] }];
+    const net = network(makeHost(), { width: W, height: H, backend: "webgl" });
+    await net.whenReady();
+    net.stateNetwork(graph, { modules, view: "state" }).layout({ backend: "auto", iterations: 20 });
+    await net.whenSettled();
+    expect(net.layoutTransport).toBe("gpu"); // streamed, not the synchronous main-thread force solve
+    expect(new Set(Array.from(graph.physical.positions, (v) => v.toFixed(3))).size).toBeGreaterThan(2);
+    const state = graph.state.positions, phys = graph.physical.positions;
+    for (let s = 0; s < graph.state.nodeCount; s++) {
+      const q = at(graph.stateToPhysical, s);
+      const d = Math.hypot(at(state, 2 * s) - at(phys, 2 * q), at(state, 2 * s + 1) - at(phys, 2 * q + 1));
+      expect(d).toBeLessThan(200); // each state node in its own physical node's rosette
+    }
+    net.destroy();
+  });
+
+  it("runs a nested layout on the worker, exactly as backend:'worker' does (cold streams, warm lands in one frame)", async () => {
+    const n = 60;
+    const g = buildGraph({ nodeCount: n, source: Array.from({ length: n }, (_, i) => i), target: Array.from({ length: n }, (_, i) => (i + 1) % n) });
+    const modules: ModuleNode[] = Array.from({ length: n }, (_, id) => ({ id, path: [Math.floor(id / 10) + 1, (id % 10) + 1] }));
+    const net = network(makeHost(), { width: W, height: H, backend: "webgl" });
+    await net.whenReady();
+    const posts = vi.spyOn(Worker.prototype, "postMessage");
+    net.data(g, { modules });
+
+    net.layout({ backend: "worker", nested: true });
+    await net.whenSettled();
+    const workerCold = nestedStarts(posts);
+    const workerPositions = Array.from(g.positions);
+    const workerTransport = net.layoutTransport;
+    posts.mockClear();
+    net.layout({ backend: "auto", nested: true });
+    const autoCold = nestedStarts(posts); // posted synchronously: never the synchronous CPU solve
+    await net.whenSettled();
+    expect(autoCold).toHaveLength(1);
+    expect(autoCold[0]?.stream).toBe(true); // a cold layout streams one frame per depth
+    expect(autoCold).toEqual(workerCold);
+    expect(Array.from(g.positions)).toEqual(workerPositions);
+    expect(net.layoutTransport).toBe(workerTransport);
+
+    // A warm re-layout with a transition posts only the final layout (#328), then eases to it.
+    posts.mockClear();
+    net.layout({ backend: "auto", nested: { warm: true }, transition: 50 });
+    const autoWarm = nestedStarts(posts);
+    await net.whenSettled();
+    expect(autoWarm).toHaveLength(1);
+    expect(autoWarm[0]?.stream).toBe(false);
     net.destroy();
   });
 });
