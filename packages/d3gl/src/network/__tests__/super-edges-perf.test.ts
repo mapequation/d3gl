@@ -1,9 +1,10 @@
 import { describe, it, expect, vi } from "vitest";
 import { appendFileSync } from "node:fs";
+import { scaleSqrt } from "d3-scale";
 import { Session } from "node:inspector";
 import { buildLODTree, computeLODGeometry, cut, declutterFrontier, visibleWorldRect, type LODTree, type LODTransform } from "../lod.js";
 import { multilevelSeed } from "../coarsen.js";
-import { superEdges, makeSuperEdgesScratch, type SuperEdgesData, type SuperEdgesScratch, type SuperEdgeStyleResolved } from "../glyphs.js";
+import { superEdges, makeSuperEdgesScratch, resolveLinkColorOf, type SuperEdgesData, type SuperEdgesScratch, type SuperEdgeStyleResolved } from "../glyphs.js";
 import { buildGraph } from "../graph.js";
 import { buildModuleLODTree, type ModuleNode } from "../modules.js";
 import { firstDifference, makeMapSuperEdgesScratch, superEdgesMapReference } from "./super-edges-map-reference.js";
@@ -508,11 +509,17 @@ describe("#325 superEdges per-frame cost over a RAGGED module tree (cross-depth 
 
 // ---- #364: the gather's scratch without Maps, against the Map-based gather it replaced ----------------
 
-/** The Network Navigator's link style — directed half-arrows, so the reciprocal-width pass runs too. The
- *  colour and width callbacks return constants (no allocation of their own), so every byte the sampling
- *  profiler attributes to the gather is the gather's. */
-const RGBA: [number, number, number, number] = [100, 110, 140, 200];
-const HALF_STYLE = { ...SE_STYLE, linkStyle: "half-arrow" as const, directed: true, bend: 0.15, colorOf: () => RGBA };
+/** The Network Navigator's link style — directed half-arrows, so the reciprocal-width pass runs too — with
+ *  its colour path: a d3 colour scale of the flow through the engine's memo (`resolveLinkColorOf`), whose
+ *  hits refill one tuple. So the sampling profiler's bytes are the gather's plus that colour path's; the
+ *  width is a constant (a user's scale allocates what it allocates). */
+const HALF_STYLE = {
+  ...SE_STYLE,
+  linkStyle: "half-arrow" as const,
+  directed: true,
+  bend: 0.15,
+  colorOf: resolveLinkColorOf(scaleSqrt<string>().domain([0, 40]).range(["rgba(90,100,120,0.12)", "rgba(60,70,90,0.85)"]).clamp(true)),
+};
 
 /** Map and Set entries written while `run` runs: the #364 signature. The Map-based gather wrote one or
  *  more per drawn pair (the reciprocal-width lookup alone held every pair with both ends present). */

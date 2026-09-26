@@ -208,10 +208,13 @@ const LINK_COLOR_MEMO_MIN_SLOTS = 1 << 6;
  * {@link resolveLinkStrokeOf}). Resolved once per style, and **memoised by weight**: a colour spec is
  * a function of the weight, and a super-edge emit asks for the same accumulated weights frame after
  * frame (a pair's flow is fixed by the tree), so the CSS accessor + `rgb()` parse run once per distinct
- * weight instead of once per drawn edge per frame. A constant colour parses once, into one shared tuple;
- * a scale hands each call a fresh tuple. The memo holds up to {@link LINK_COLOR_MEMO_MAX} weights and
- * starts over when full: a frame with more distinct weights than that (continuous flows) resolves each
- * one again, as with no memo, plus a typed-array probe — never a wrong colour.
+ * weight instead of once per drawn edge per frame. A constant colour parses once, into one shared tuple.
+ * For a scale, a memo hit refills ONE tuple the resolver owns, so a hit allocates nothing (#364: a fresh
+ * tuple per drawn edge per frame was the super-edge gather's largest allocation). The returned tuple is
+ * therefore only valid until the next call: read it at once, as every caller does. The memo holds up to
+ * {@link LINK_COLOR_MEMO_MAX} weights and starts over when full: a frame with more distinct weights than
+ * that (continuous flows) resolves each one again, as with no memo, plus a typed-array probe — never a
+ * wrong colour.
  */
 export function resolveLinkColorOf(spec: LinkColorSpec): (weight: number) => RGBAValue {
   if (typeof spec === "string") {
@@ -220,12 +223,17 @@ export function resolveLinkColorOf(spec: LinkColorSpec): (weight: number) => RGB
   }
   const cssOf = resolveLinkStrokeOf(spec);
   const memo = new LinkColorMemo();
+  const hit: [number, number, number, number] = [0, 0, 0, 0];
   return (w) => {
     if (w !== w) return toRGBA(cssOf(w)); // NaN matches no key — resolve it every time
     const slot = memo.find(w);
     if (slot >= 0) {
       const p = memo.rgbaAt(slot);
-      return [p & 255, (p >>> 8) & 255, (p >>> 16) & 255, p >>> 24];
+      hit[0] = p & 255;
+      hit[1] = (p >>> 8) & 255;
+      hit[2] = (p >>> 16) & 255;
+      hit[3] = p >>> 24;
+      return hit;
     }
     const c = toRGBA(cssOf(w));
     memo.set(w, c[0] | (c[1] << 8) | (c[2] << 16) | (c[3] << 24));
