@@ -381,7 +381,7 @@ per-file timeout. Every at-scale leg below now asserts. When you add a guard, ad
 | declutter flags upload | **WebGL** | `map/declutter-flags-perf.browser.test.ts` | 2k engine / 1M fn | `PERF_BROWSER_N` (max 2M) |
 | hover overlay reuse | **WebGL** | `map/hover-overlay-perf.browser.test.ts` | 1000 glyphs / 125 hover changes | ✗ **deliberately unscaled** |
 | instanced pie | **WebGL** | `webgl/__tests__/instanced-pie-perf.browser.test.ts` | 100k | `PERF_BROWSER_N` |
-| GPU layout tick; hub springs (#350): tick with web-NotreDame's five > 4096 hubs ≤ 2× the no-hub tick, and exactly one extra draw (the chunk pass, K fragments) with no per-tick allocation | **WebGL** | `network/gpu/__tests__/gpu-frame-budget-perf.browser.test.ts` | 30k | `PERF_BROWSER_N` (max 200k) |
+| GPU layout tick; hub springs (#350): hub rows in web-NotreDame's shape, scaled with N (0.52% of rows, its five > 4096 hubs, chunk count K ≥ N/30), tick ≤ 2× a hub-free twin with the same edges, and exactly one extra draw (the chunk pass, K fragments) with no per-tick allocation | **WebGL** | `network/gpu/__tests__/gpu-frame-budget-perf.browser.test.ts` | 30k | `PERF_BROWSER_N` (max 200k) |
 | React recolor vs build | **WebGL** | `react/perf.browser.test.ts` | 4096 | capped at 8192 — see below |
 | `"auto"` placeholder emit | Canvas→**WebGL** | `map/auto-placeholder-perf.browser.test.ts` | 200k edges / 200k points | `PERF_BROWSER_N` (max 611k) |
 | `"auto"` placeholder **paint** | Canvas→**WebGL** | same file, `#273` describe block | 30k geo polygons | `PERF_BROWSER_N` (max 120k) |
