@@ -232,6 +232,8 @@ export class GridPyramid {
   readonly levelOrigins: Int32Array;
 
   private readonly targets: Readonly<Record<PyramidTexture, PyramidTarget>>;
+  /** The three pyramid textures, for the traversal's `u_L0` / `u_Podd` / `u_Peven` (built once). */
+  readonly textures: Readonly<Record<PyramidTexture, Texture>>;
   private readonly scatterModel: Model;
   private readonly reduceModel: Model;
 
@@ -272,6 +274,7 @@ export class GridPyramid {
       odd: target(atlas.odd.width, atlas.odd.height),
       even: target(atlas.even.width, atlas.even.height),
     };
+    this.textures = { l0: this.targets.l0.tex, odd: this.targets.odd.tex, even: this.targets.even.tex };
 
     // ── Models ────────────────────────────────────────────────────────────
     this.scatterUniforms = {
@@ -292,11 +295,6 @@ export class GridPyramid {
     // No blend: each reduce output texel is written exactly once.
     this.reduceUniforms = { u_srcX: 0, u_srcY: 0, u_dstX: 0, u_dstY: 0 };
     this.reduceModel = fullScreenModel(device, REDUCE_FS, this.reduceUniforms, NO_BLEND);
-  }
-
-  /** The three pyramid textures, for the traversal's `u_L0` / `u_Podd` / `u_Peven`. */
-  get textures(): Readonly<Record<PyramidTexture, Texture>> {
-    return { l0: this.targets.l0.tex, odd: this.targets.odd.tex, even: this.targets.even.tex };
   }
 
   /** Where level `ℓ` is packed (0 = the level-0 atlas). */
