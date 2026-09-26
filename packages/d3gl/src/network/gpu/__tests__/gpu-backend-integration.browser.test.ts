@@ -554,12 +554,13 @@ describe("backend:'gpu' whose streaming readback fails to build (#352)", () => {
     const device = await makeTestDevice();
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     const destroy = vi.spyOn(GpuForceLayout.prototype, "destroy");
-    // The solver builds; then every buffer creation fails — the readback's PBOs (and its pack passes'
-    // buffers) — so the stream cannot be built.
+    // The solver builds; then every buffer creation fails — the readback's pack passes' buffers or its
+    // PBOs — so the stream cannot be built.
     let failBuffers = false;
     const createBuffer = WebGL2RenderingContext.prototype.createBuffer;
     vi.spyOn(WebGL2RenderingContext.prototype, "createBuffer").mockImplementation(function (this: WebGL2RenderingContext) {
-      return failBuffers ? null : createBuffer.call(this);
+      if (failBuffers) throw new Error("out of GPU memory");
+      return createBuffer.call(this);
     });
     const hold = GpuForceLayout.prototype.hold;
     vi.spyOn(GpuForceLayout.prototype, "hold").mockImplementation(function (this: GpuForceLayout, heat: number) {
