@@ -299,6 +299,25 @@ export function packTiles(segments: readonly SlotRange[], exactMax: number, minS
   return { width, height, tiles, ...packLevels(width, height, Math.log2(maxSide)) };
 }
 
+/** The largest atlas side the `segInfo` tile origin (`x | y << 16`, spec §5.2) can address. */
+export const TILE_ATLAS_MAX_SIDE = 65536;
+
+/**
+ * Throw unless the tile atlas fits: its level-0 texture (`width × height`, the largest of the three)
+ * within the device's `maxTextureDimension2D`, where a larger side would fail texture or framebuffer
+ * creation, and within {@link TILE_ATLAS_MAX_SIDE}, where a tile origin would wrap. The flat atlas (a
+ * side ≤ 1024) always fits; only many large segments can exceed it, and until the spec §11.1 degrade
+ * (tile sides halve) lands they are refused here rather than corrupted.
+ */
+export function assertAtlasFits(atlas: TextureSize, maxTextureSide: number): void {
+  const limit = Math.min(maxTextureSide, TILE_ATLAS_MAX_SIDE);
+  if (atlas.width <= limit && atlas.height <= limit) return;
+  throw new Error(
+    `GpuForceLayout: the segments' tile atlas is ${atlas.width} × ${atlas.height} texels, beyond the ` +
+      `${limit}-texel limit (device maxTextureDimension2D ${maxTextureSide}, tile origin ${TILE_ATLAS_MAX_SIDE})`,
+  );
+}
+
 /**
  * Pack levels 0…`top` of a `width × height` level-0 atlas (both powers of two): level 0 alone in
  * `l0`; level 1 at (0, 0) of `odd` with levels 3, 5, … stacked in a column to its right; level 2 at

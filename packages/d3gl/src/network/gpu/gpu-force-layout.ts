@@ -14,6 +14,7 @@ import { SegmentTable, type SegmentRow } from "./segment-table.js";
 import {
   FLAT_TILE_MIN_SIDE,
   TILE_MIN_SIDE,
+  assertAtlasFits,
   assertSegmentLocalEdges,
   flatSegments,
   packTiles,
@@ -217,6 +218,10 @@ export class GpuForceLayout {
     const segments = options.segments ?? flatSegments(this.count);
     validateSegments(segments, this.count);
     const singleSegment = segments.length === 1;
+    // Many segments: the slot → segment map, and no spring may cross two segments (isolation). Checked
+    // before the first GPU allocation, so a rejected layout leaks nothing.
+    const slotSeg = singleSegment ? null : slotSegments(segments, this.count);
+    if (slotSeg) assertSegmentLocalEdges(slotSeg, graph.source, graph.target, graph.edgeCount);
     const exactMax =
       options.repulsionMode === "pyramid"
         ? 0
@@ -225,6 +230,7 @@ export class GpuForceLayout {
           : (options.exactMax ?? GPU_REPULSION_ALLPAIRS_MAX);
     // A single segment keeps the flat grid (chooseGrid's floor of 16); many segments use tiles from 8.
     const atlas = packTiles(segments, exactMax, singleSegment ? FLAT_TILE_MIN_SIDE : TILE_MIN_SIDE);
+    assertAtlasFits(atlas, device.limits.maxTextureDimension2D);
 
     const width = atlasWidth(this.count);
     const height = Math.ceil(this.count / width);
@@ -326,12 +332,10 @@ export class GpuForceLayout {
     this.vel.swap();
     this.fbos = [fbo0, fbo1];
 
-    // Many segments: the slot → segment texture, and no spring may cross two segments (isolation).
-    if (singleSegment) {
+    // Many segments: the slot → segment texture (the map was built and checked above).
+    if (!slotSeg) {
       this.slotSeg = null;
     } else {
-      const slotSeg = slotSegments(segments, this.count);
-      assertSegmentLocalEdges(slotSeg, graph.source, graph.target, graph.edgeCount);
       const padded = new Uint32Array(width * height);
       padded.set(slotSeg);
       this.slotSeg = device.createTexture({
