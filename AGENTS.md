@@ -372,6 +372,7 @@ per-file timeout. Every at-scale leg below now asserts. When you add a guard, ad
 | network no-LOD labels | — | `network/__tests__/label-candidates-perf.test.ts` | 100k | `BENCH_LABEL_CANDIDATES` |
 | network selection dim | — | `network/__tests__/selection-dim-perf.test.ts` | 100k | — |
 | node-drag (interaction) | — | `network/__tests__/lod-drag-incremental-perf.test.ts` | small | `BENCH_DRAG` |
+| node-drag, main-thread `force` tick (one per frame over **all** nodes; LOD-independent) | — | `network/__tests__/force-drag-tick-perf.test.ts` | 100k nodes / 200k edges | `BENCH_FORCE_DRAG` |
 | position transition frame (#328) | — | `network/__tests__/transition-perf.test.ts` | 100k, LOD on **and** off, vs a streamed layout frame | `BENCH_TRANSITION` |
 | LOD super-edge **build** | — | `network/__tests__/super-edges-build.test.ts` | equivalence | `BENCH_SUPER_EDGES_BUILD` |
 | retained memory | — | `core/point-memory.bench.test.ts` | — | `BENCH_MEM` |
