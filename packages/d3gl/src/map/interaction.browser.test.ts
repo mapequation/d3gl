@@ -361,6 +361,28 @@ describe("tooltip option", () => {
     host.remove();
   });
 
+  it("a programmatic setTransform with zoom enabled hides the tooltip, as a gesture does (#309)", async () => {
+    const { map, host } = await makeMap();
+    map.layer("cells", [sqPoly(-20, -20, 20), sqPoly(0, 0, 20)], {
+      fill: "rgb(0,0,255)", id: (_f, i) => `c${i}`,
+      tooltip: (_f, id) => `cell ${id}`,
+    });
+    map.render();
+    map.enableZoom([0.5, 40]);
+
+    pointer(host, "pointermove", 108, 91);
+    const tip = host.querySelector<HTMLDivElement>(".d3gl-tooltip");
+    expect(tip?.textContent).toBe("cell c1");
+    expect(tip?.style.display).not.toBe("none");
+
+    // A zoom-to moves the view under a still pointer: the tooltip no longer describes what is under it.
+    map.setTransform({ k: 3, x: -200, y: -200 });
+    expect(tip?.style.display, "the tooltip outlived the view it described").toBe("none");
+
+    map.destroy();
+    host.remove();
+  });
+
   it("tooltipClass replaces the default look; null content hides", async () => {
     const host = document.createElement("div");
     host.style.width = "200px"; host.style.height = "200px";

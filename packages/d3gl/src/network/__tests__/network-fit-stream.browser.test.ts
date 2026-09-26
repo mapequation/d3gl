@@ -15,8 +15,10 @@ import type { ViewTransform } from "../../core/index.js";
  * layout either.
  *
  * Guarded here, through the real d3-zoom wiring on a real host:
- *   1. a programmatic view change is not a gesture on any backend — `setInteracting` and
- *      `syncScreenGeometry` run 0 times — while a real wheel gesture still is;
+ *   1. a programmatic view change is not a gesture on any backend — `setInteracting` runs 0 times —
+ *      while a real wheel gesture still is; with zoom enabled it still settles like a gesture's end on
+ *      Canvas/SVG: the retained LOD frontier and the screen-mode bake re-cut to the new view, as they did
+ *      when the fake gesture's end ran them (without zoom, the caller re-cuts with `syncScreenGeometry`);
  *   2. the camera follows the streaming layout frame after frame and ends framed tightly on the settled
  *      leaves, LOD on and off;
  *   3. a real wheel gesture, or an explicit `setTransform` (the Navigator's zoom-to: `setTransform` then
@@ -143,17 +145,78 @@ describe("a programmatic view change is not a gesture (#309)", () => {
         expect(zoomTransform(host), "d3-zoom went stale after a programmatic setTransform (#202)").toMatchObject(t);
       }
       expect(net.interactingCalls, "a programmatic setTransform ran a gesture boundary").toBe(0);
-      expect(net.screenSyncs, "a programmatic setTransform re-baked the vector scene").toBe(0);
 
       // A real wheel gesture is still a gesture: it starts at once and ends when the wheel goes idle.
+      const syncs = net.screenSyncs;
       wheel(host, -120);
       expect(net.interactingCalls).toBe(1);
+      expect(net.screenSyncs, "a gesture frame re-baked the vector scene").toBe(syncs);
       await sleep(250);
       expect(net.interactingCalls).toBe(2);
-      expect(net.screenSyncs).toBe(1); // the gesture's end re-bakes the vector scene, as before
+      expect(net.screenSyncs).toBe(syncs + 1); // the gesture's end re-bakes the vector scene, as before
       net.destroy();
     });
   }
+});
+
+/** The `<circle>` glyphs a view exports — the drawn LOD frontier on Canvas/SVG (see AGENTS.md: `toSVG()`
+ *  is the typed probe for what was actually emitted). */
+const circles = (svg: string): number => (svg.match(/<circle/g) ?? []).length;
+
+/** The view that zooms `graph`'s leaf bbox about its centre to `zoom` × the 85% framing. */
+function zoomedFrame(graph: NetworkGraph, zoom: number): ViewTransform {
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+  const p = graph.positions;
+  for (let i = 0; i < graph.nodeCount; i++) {
+    const x = p[2 * i] ?? 0;
+    const y = p[2 * i + 1] ?? 0;
+    minX = Math.min(minX, x); minY = Math.min(minY, y);
+    maxX = Math.max(maxX, x); maxY = Math.max(maxY, y);
+  }
+  const k = (zoom * 0.85 * Math.min(W, H)) / Math.max(maxX - minX, maxY - minY);
+  return { k, x: W / 2 - (k * (minX + maxX)) / 2, y: H / 2 - (k * (minY + maxY)) / 2 };
+}
+
+describe("a programmatic setTransform with zoom enabled re-cuts the retained scene (Canvas/SVG)", () => {
+  for (const backend of ["canvas", "svg"] as const) {
+    it(`${backend}: a zoom-to re-cuts the LOD frontier and re-bakes the screen-mode arrows, as a gesture's end does`, async () => {
+      const host = makeHost();
+      const net = new ProbeNetwork(host, { width: W, height: H, backend });
+      await net.whenReady();
+      const graph = randomGraph(3000, 5);
+      net.data(graph).style({ sizeMode: "screen", directed: true }).lod({}).layout({ backend: "force", iterations: 100 });
+      net.setTransform(zoomedFrame(graph, 1));
+      net.enableZoom([1e-4, 1e3]);
+      net.syncScreenGeometry();
+      const framed = circles(net.toSVG());
+
+      // The Navigator's zoom-to: a programmatic view change, then re-enableZoom (#202).
+      net.setTransform(zoomedFrame(graph, 30));
+      net.enableZoom([1e-4, 1e3]);
+      const zoomed = net.toSVG();
+      net.syncScreenGeometry(); // what the view must already show: the frontier and bake cut at this view
+      const forced = net.toSVG();
+      expect(circles(forced), "non-vacuity: the zoom-to did not change the frontier").not.toBe(framed);
+      expect(circles(zoomed), "the zoom-to left the frontier cut for the previous view").toBe(circles(forced));
+      expect(zoomed, "the zoom-to left the retained scene stale").toBe(forced);
+      expect(net.interactingCalls, "the zoom-to ran a gesture boundary").toBe(0);
+      net.destroy();
+    });
+  }
+
+  it("canvas without zoom: a programmatic setTransform leaves the re-cut to syncScreenGeometry (the documented contract)", async () => {
+    const host = makeHost();
+    const net = new ProbeNetwork(host, { width: W, height: H, backend: "canvas" });
+    await net.whenReady();
+    const graph = randomGraph(3000, 5);
+    net.data(graph).style({ sizeMode: "screen" }).lod({}).layout({ backend: "force", iterations: 100 });
+    net.setTransform(zoomedFrame(graph, 1));
+    net.syncScreenGeometry();
+    const syncs = net.screenSyncs;
+    net.setTransform(zoomedFrame(graph, 30));
+    expect(net.screenSyncs, "a zoom-free setTransform re-cut the retained scene on its own").toBe(syncs);
+    net.destroy();
+  });
 });
 
 describe("streaming fit with zoom enabled (#327)", () => {
