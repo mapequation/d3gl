@@ -107,6 +107,31 @@ export function packUintTexture(
 }
 
 /**
+ * Pack a flat `Float32Array` into an `r32float` texture atlas — the float twin of
+ * {@link packUintTexture}, with the same atlas width for the same length (so an array parallel to a
+ * packed uint array is addressed with the same texel coordinate).
+ */
+export function packFloatTexture(
+  device: Device,
+  data: Float32Array,
+): { texture: Texture; width: number; height: number } {
+  const count = data.length;
+  const width = Math.max(1, Math.ceil(Math.sqrt(count)));
+  const height = Math.ceil(count / width);
+  const padded = new Float32Array(width * height);
+  padded.set(data);
+  const texture = device.createTexture({
+    width,
+    height,
+    format: "r32float",
+    data: padded,
+    mipLevels: 1,
+    sampler: { minFilter: "nearest", magFilter: "nearest" },
+  });
+  return { texture, width, height };
+}
+
+/**
  * Read back an entire `rgba32float` texture (all `width × height` texels, 4
  * channels each) via a throwaway FBO. Returns a `Float32Array` of length
  * `width * height * 4` in row-major (x, y) order. Test-only — the layout hot

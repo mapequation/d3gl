@@ -1,10 +1,9 @@
 import type { Device, Texture, Framebuffer, RenderPass } from "@luma.gl/core";
 import type { ForceParams, LayoutGraph } from "../force.js";
 import { Cooling, DAMPING, equilibriumSpacing, springStabilizers, stepCap } from "../force.js";
-import { buildCSR } from "../graph.js";
-import { atlasWidth, pingPong, readbackFloatFboReuse, packUintTexture } from "./textures.js";
+import { atlasWidth, pingPong, readbackFloatFboReuse } from "./textures.js";
 import { IntegratePass } from "./passes/integrate.js";
-import { AttractionPass } from "./passes/attraction.js";
+import { GpuSprings } from "./springs.js";
 import { RepulsionAllPairsPass } from "./passes/repulsion-allpairs.js";
 import { RepulsionPyramidPass } from "./passes/repulsion-pyramid.js";
 import { GridPyramid } from "./passes/grid-pyramid.js";
@@ -56,7 +55,12 @@ export class GpuForceLayout {
   private readonly height: number;
   private readonly params: ForceParams;
   private readonly integratePass: IntegratePass;
-  private readonly attractionPass: AttractionPass;
+  /**
+   * The springs (#350): the CSR textures, the hub chunk table and the row-gather + hub-chunk passes.
+   * Every CSR entry is gathered once per tick; no fragment loops more than `SPRING_CHUNK` times (up to
+   * degree `SPRING_CHUNK · HUB_CHUNK`).
+   */
+  private readonly springs: GpuSprings;
   private readonly repulsionPass: RepulsionAllPairsPass;
   private readonly centroidReducePass: CentroidReducePass;
   private readonly centeringPass: CenteringPass;
@@ -154,15 +158,6 @@ export class GpuForceLayout {
   /** Scratch for a single-texel (x, y) position sub-upload into the read-side position texture. */
   private readonly heldScratch = new Float32Array(2);
 
-  /** CSR offset texture (r32uint): offsets[0..nodeCount] packed into an atlas. */
-  private readonly offsetsTex: Texture;
-  /** CSR neighbors texture (r32uint): the flat neighbor list packed into an atlas. */
-  private readonly neighborsTex: Texture;
-  /** Atlas width of the offsets texture. */
-  private readonly offWidth: number;
-  /** Atlas width of the neighbors texture. */
-  private readonly nbrWidth: number;
-
   constructor(
     device: Device,
     graph: LayoutGraph,
@@ -247,8 +242,9 @@ export class GpuForceLayout {
     // Per-node spring-stiffness stabilizer (#203): 1/(1+K̃) with K̃ = damping·α·attraction·degree,
     // computed ONCE from the edge list (degrees are static) and sampled by the integrate pass so a
     // high-degree hub's aggregate spring can never turn the integration oscillatory-unstable.
-    // Identical math to the CPU ForceLayout (springStabilizers) — keeps backend parity.
-    const stab = springStabilizers(graph.nodeCount, graph.source, graph.target, graph.edgeCount, params);
+    // Identical math to the CPU ForceLayout (springStabilizers) — keeps backend parity, including the
+    // weighted degree of a layout with spring weights (the springs honour them, #350).
+    const stab = springStabilizers(graph.nodeCount, graph.source, graph.target, graph.edgeCount, params, undefined, graph.springWeight);
     const stabPadded = new Float32Array(width * height).fill(1);
     stabPadded.set(stab);
     this.stabTex = device.createTexture({
@@ -279,25 +275,8 @@ export class GpuForceLayout {
     this.vel.swap();
     this.fbos = [fbo0, fbo1];
 
-    // Build symmetric (undirected) CSR from the graph's directed edge list.
-    // LayoutGraph has source/target; buildCSR inserts both directions, so the
-    // GPU gather over csr.neighbors reproduces force.ts's attraction exactly.
-    const csr = buildCSR(graph.nodeCount, graph.source, graph.target);
-
-    // Upload CSR offset and neighbor arrays as r32uint textures — done ONCE in
-    // the constructor, reused every tick.
-    const offResult = packUintTexture(device, csr.offsets);
-    this.offsetsTex = offResult.texture;
-    this.offWidth = offResult.width;
-
-    // neighbors may be empty (no edges) — packUintTexture handles length 0 by
-    // creating a 1×1 zeroed texture, which is never actually fetched.
-    const nbrData = csr.neighbors.length > 0
-      ? csr.neighbors
-      : new Uint32Array(1);
-    const nbrResult = packUintTexture(device, nbrData);
-    this.neighborsTex = nbrResult.texture;
-    this.nbrWidth = nbrResult.width;
+    // Springs: symmetric CSR + hub chunk table, uploaded ONCE here and reused every tick (#350).
+    this.springs = new GpuSprings(device, graph);
 
     // Pre-create the 1×1 sum texture and its FBO for the centroid reduction.
     // No per-tick allocation — keep the createFramebuffer spy test green.
@@ -306,7 +285,6 @@ export class GpuForceLayout {
     this.sumFbo = sumTarget.sumFbo;
 
     this.integratePass = new IntegratePass(device);
-    this.attractionPass = new AttractionPass(device);
     this.repulsionPass = new RepulsionAllPairsPass(device);
     this.centroidReducePass = new CentroidReducePass(device);
     this.centeringPass = new CenteringPass(device);
@@ -368,6 +346,11 @@ export class GpuForceLayout {
       });
     }
 
+    // ── 1c. Hub spring chunks (#350) ─────────────────────────────────────────
+    // Sums every chunk of a row longer than SPRING_CHUNK into its partial — its own render pass into a
+    // different framebuffer, submitted before the force pass gathers the partials. No-op without hubs.
+    this.springs.prepare(this.pos.readTex, this.width);
+
     // ── 2. Clear force texture to zero ────────────────────────────────────────
     // Open a render pass on the force FBO with clearColor:[0,0,0,0] — this zeros
     // all texels so each force pass starts from a known blank slate.
@@ -379,20 +362,12 @@ export class GpuForceLayout {
     // ── 3. Force passes (additive blend, write into forceTex) ─────────────────
     // Order among force passes doesn't matter — additive blend accumulates them.
 
-    // Attraction (spring gather over CSR neighbors).
-    this.attractionPass.run(
-      forcePass,
-      this.pos.readTex,
-      this.offsetsTex,
-      this.neighborsTex,
-      {
-        count: this.count,
-        width: this.width,
-        offWidth: this.offWidth,
-        nbrWidth: this.nbrWidth,
-        attraction: this.params.attraction,
-      },
-    );
+    // Attraction (spring gather over CSR rows, plus each hub row's chunk partials).
+    this.springs.draw(forcePass, this.pos.readTex, {
+      count: this.count,
+      width: this.width,
+      attraction: this.params.attraction,
+    });
 
     // Repulsion. Exact all-pairs O(n²) at/below the threshold (the parity
     // baseline); Barnes-Hut grid-pyramid O(n log n) above it. Both additive-blend
@@ -544,10 +519,8 @@ export class GpuForceLayout {
     this.fbos[1].destroy();
     this.readFbos[0].destroy();
     this.readFbos[1].destroy();
-    this.offsetsTex.destroy();
-    this.neighborsTex.destroy();
+    this.springs.destroy();
     this.integratePass.destroy();
-    this.attractionPass.destroy();
     this.repulsionPass.destroy();
     this.centroidReducePass.destroy();
     this.centeringPass.destroy();
