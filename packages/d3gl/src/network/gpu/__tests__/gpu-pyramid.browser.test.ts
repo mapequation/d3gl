@@ -18,6 +18,9 @@ import { describe, it, expect, beforeAll, vi } from "vitest";
 import type { Device } from "@luma.gl/core";
 import { makeTestDevice } from "./_device.js";
 import { GridPyramid, chooseGrid } from "../passes/grid-pyramid.js";
+import { SegmentedReduce } from "../passes/segmented-reduce.js";
+import { SegmentTable } from "../segment-table.js";
+import { flatSegments } from "../segments.js";
 import { packPositionsTexture, readbackRgbaFbo } from "../textures.js";
 import { GpuForceLayout } from "../gpu-force-layout.js";
 import { buildGraph } from "../../graph.js";
@@ -68,6 +71,32 @@ function repulsionForces(
   return f;
 }
 
+/**
+ * Build a pyramid over `positions` the way the solver does: the box comes from the segmented range
+ * query of the flat segment (the pyramid no longer computes its own). Returns the pyramid and a
+ * cleanup for everything the build allocated.
+ */
+function buildPyramid(device: Device, positions: Float32Array): { pyramid: GridPyramid; release(): void } {
+  const count = positions.length / 2;
+  const { texture: posTex, width } = packPositionsTexture(device, positions);
+  const { texture: velTex } = packPositionsTexture(device, new Float32Array(positions.length));
+  const table = new SegmentTable(device, flatSegments(count), { repulsion: 0, centering: 0, softening: 0, alpha0: 1 });
+  const reduce = new SegmentedReduce(device, count);
+  reduce.run({ pos: posTex, vel: velTex, posWidth: width, count }, table);
+  const pyramid = new GridPyramid(device, count);
+  pyramid.build({ posTex, boxTex: table.box, count, width });
+  return {
+    pyramid,
+    release() {
+      pyramid.destroy();
+      reduce.destroy();
+      table.destroy();
+      posTex.destroy();
+      velTex.destroy();
+    },
+  };
+}
+
 /** Minimal seeded LCG PRNG — self-contained, no deps. */
 function makePrng(seed: number): () => number {
   let s = seed >>> 0;
@@ -106,9 +135,7 @@ describe("GPU grid pyramid — build correctness (Step A)", () => {
     ]);
     const count = positions.length / 2;
 
-    const { texture: posTex, width } = packPositionsTexture(device, positions);
-    const pyramid = new GridPyramid(device, count);
-    pyramid.build({ posTex, count, width });
+    const { pyramid, release } = buildPyramid(device, positions);
 
     // Root = last level (1×1). Read (Σx, Σy, mass, 0).
     const rootTex = pyramid.levelTexture(pyramid.levelCount - 1);
@@ -126,8 +153,7 @@ describe("GPU grid pyramid — build correctness (Step A)", () => {
     expect(sumX / mass).toBeCloseTo(cx, 3);
     expect(sumY / mass).toBeCloseTo(cy, 3);
 
-    pyramid.destroy();
-    posTex.destroy();
+    release();
   });
 
   it("mass is conserved across all pyramid levels (each level sums to count)", () => {
@@ -138,9 +164,7 @@ describe("GPU grid pyramid — build correctness (Step A)", () => {
       positions[i * 2] = (rng() - 0.5) * 1000;
       positions[i * 2 + 1] = (rng() - 0.5) * 1000;
     }
-    const { texture: posTex, width } = packPositionsTexture(device, positions);
-    const pyramid = new GridPyramid(device, count);
-    pyramid.build({ posTex, count, width });
+    const { pyramid, release } = buildPyramid(device, positions);
 
     // Every level's total mass (Σ over all cells of channel 2) must equal count.
     for (let lvl = 0; lvl < pyramid.levelCount; lvl++) {
@@ -151,8 +175,7 @@ describe("GPU grid pyramid — build correctness (Step A)", () => {
       expect(totalMass).toBeCloseTo(count, 2);
     }
 
-    pyramid.destroy();
-    posTex.destroy();
+    release();
   });
 });
 
@@ -296,9 +319,9 @@ describe("GPU Barnes-Hut pyramid repulsion — traversal correctness + perf (Ste
   });
 
   it("pyramid ticking allocates no framebuffers or textures (all pre-created in the constructor)", () => {
-    // The pyramid path rebuilds the pyramid every tick (bbox → scatter → mip
-    // reduce) and traverses it — several extra render passes. All their level
-    // textures, FBOs and the bbox target must be pre-created in the constructor,
+    // The pyramid path rebuilds the pyramid every tick (segment reduction →
+    // scatter → mip reduce) and traverses it — several extra render passes. All
+    // their textures and FBOs must be pre-created in the constructor,
     // so ticking must create ZERO framebuffers AND ZERO textures. (The base spy
     // test only covers the all-pairs path; this guards the new hot path.)
     const g = makeRandomGraph(300, 1000, 0xbeef);

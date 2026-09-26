@@ -52,7 +52,7 @@ import { ADDITIVE_BLEND, fullScreenModel, type PassUniforms } from "./fullscreen
 // with coincident bodies, and negligible vs. the peer contributions.
 //
 // The box used for cell geometry MUST match the padded box the scatter used, so
-// the shader recomputes the padded AABB from the bbox texture with the same PAD.
+// the shader recomputes the padded AABB from the box texture with the same PAD.
 //
 // Stack: fixed-size array. The traversal is DFS; at any moment the stack holds at
 // most 3 siblings per descended level (the 4th is being processed) plus the
@@ -89,7 +89,7 @@ precision highp float;
 precision highp sampler2D;
 
 uniform highp sampler2D u_pos;
-uniform highp sampler2D u_box;   // 1×1 (maxX, maxY, -minX, -minY)
+uniform highp sampler2D u_box;   // segment box (maxX, maxY, -minX, -minY), segment 0 at (0,0)
 ${samplerDecls.join("\n")}
 uniform int   u_count;
 uniform int   u_width;
@@ -243,13 +243,15 @@ export class RepulsionPyramidPass {
 
   /**
    * Draw one BH repulsion step into an already-open force-accumulation render
-   * pass. `pyramid` must have been built this tick and match the levelCount the
-   * pass was constructed with.
+   * pass. `pyramid` must have been built this tick from the same `boxTex` (the
+   * layout's box, `(maxX, maxY, -minX, -minY)` at texel (0, 0)) and match the
+   * levelCount the pass was constructed with.
    */
   run(
     pass: RenderPass,
     posTex: Texture,
     pyramid: GridPyramid,
+    boxTex: Texture,
     u: RepulsionPyramidUniforms,
   ): void {
     this.uniforms["u_count"] = u.count;
@@ -261,7 +263,7 @@ export class RepulsionPyramidPass {
 
     const bindings: Record<string, Texture> = {
       u_pos: posTex,
-      u_box: pyramid.bboxTexture,
+      u_box: boxTex,
     };
     for (let lvl = 0; lvl < this.levelCount; lvl++) {
       bindings[`u_level${lvl}`] = pyramid.levelTexture(lvl);
