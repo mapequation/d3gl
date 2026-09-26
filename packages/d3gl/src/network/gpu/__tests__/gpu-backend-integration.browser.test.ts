@@ -11,8 +11,11 @@
  * promise — to `startGpuLayout`, which waits for it before running the GPU or worker path.
  */
 
-import { describe, it, expect, afterEach } from "vitest";
+import { describe, it, expect, afterEach, vi } from "vitest";
 import { network } from "../../network.js";
+import { buildGraph } from "../../graph.js";
+import { sharedMemoryAvailable } from "../../worker-transport.js";
+import type { MainToWorker } from "../../worker-protocol.js";
 
 const W = 400;
 const H = 300;
@@ -42,7 +45,56 @@ function makeHost(): HTMLElement {
 afterEach(() => {
   for (const h of hosts) h.remove();
   hosts.length = 0;
+  vi.restoreAllMocks();
 });
+
+/** A ring with deterministic chords: coarsens into a real LOD tree (the worker-LOD fixture). */
+function clustered(n: number) {
+  let s = 99 >>> 0;
+  const rng = () => ((s = (s * 1664525 + 1013904223) >>> 0) / 4294967296);
+  const source: number[] = [];
+  const target: number[] = [];
+  for (let i = 0; i < n; i++) {
+    source.push(i);
+    target.push((i + 1) % n);
+    source.push(i);
+    target.push((i + 1 + Math.floor(rng() * (n - 2))) % n);
+  }
+  return buildGraph({ nodeCount: n, source, target });
+}
+
+/**
+ * A WebGL engine whose device has no `EXT_float_blend` — float render targets but no float blending, the
+ * device the old check accepted (#351). luma probes every feature when it creates the device, so hiding
+ * the extension from `getExtension` until the engine is ready is what such a device reports.
+ */
+async function engineWithoutFloatBlend() {
+  const original = WebGL2RenderingContext.prototype.getExtension;
+  const hide = vi.spyOn(WebGL2RenderingContext.prototype, "getExtension").mockImplementation(
+    function (this: WebGL2RenderingContext, name: string) {
+      return name === "EXT_float_blend" ? null : original.call(this, name);
+    },
+  );
+  const net = network(makeHost(), { width: W, height: H, backend: "webgl" });
+  try {
+    await net.whenReady();
+  } finally {
+    hide.mockRestore();
+  }
+  return net;
+}
+
+/** The layout options a worker `start` message carries — what "identical options" compares. */
+function startOptions(m: MainToWorker) {
+  if (m.type !== "start") return null;
+  const { nodeCount, width, height, iterations, force, coarsen, multilevel, frameEvery, lod } = m;
+  return { nodeCount, width, height, iterations, force, coarsen, multilevel, frameEvery, lod };
+}
+
+/** Every `start` message posted to a layout worker since `spy` was installed. */
+function workerStarts(spy: { mock: { calls: [MainToWorker, ...unknown[]][] } }) {
+  return spy.mock.calls.map((c) => startOptions(c[0])).filter((o) => o !== null);
+}
 
 describe("network layout backend:'gpu' integration", () => {
   it("GPU path is taken (layoutTransport === 'gpu') on a WebGL engine", async () => {
@@ -199,6 +251,73 @@ describe("network layout backend:'gpu' integration", () => {
     expect(Math.abs((t.k * cx + t.x) - W / 2)).toBeLessThan(W * 0.25); // centred, not piled at the origin
     expect(Math.abs((t.k * cy + t.y) - H / 2)).toBeLessThan(H * 0.25);
 
+    net.destroy();
+  });
+});
+
+describe("backend:'gpu' on a device without float blending (#351)", () => {
+  it("falls back to the worker with the options backend:'worker' gets, streaming the LOD tree (#312, #297)", async () => {
+    const net = await engineWithoutFloatBlend();
+    const warn = vi.spyOn(console, "warn");
+    const posts = vi.spyOn(Worker.prototype, "postMessage");
+    const g = clustered(1500);
+    const opts = { multilevel: false, iterations: 25 } as const;
+    net.data(g).style({ sizeMode: "screen" }).lod({ expandPx: 48, coarsen: { minNodes: 6 } });
+
+    net.layout({ backend: "gpu", ...opts });
+    expect(net.layoutTransport).toBe("copy"); // pending until the device settles
+    await net.whenSettled();
+
+    // One warning, naming the missing extension.
+    const fallbacks = warn.mock.calls.filter((c) => String(c[0]).includes("fell back to the CPU worker"));
+    expect(fallbacks).toHaveLength(1);
+    expect(String(fallbacks[0]?.[0])).toMatch(/EXT_float_blend/);
+    // The live transport is the fallback worker's (#297), never "gpu".
+    expect(net.layoutTransport).toBe(sharedMemoryAvailable() ? "shared" : "copy");
+    // The worker streamed the LOD tree and the engine adopted it: no main-thread tree build.
+    expect(net.lodSource).toBe("worker");
+
+    const gpuStarts = workerStarts(posts);
+    expect(gpuStarts).toHaveLength(1);
+    expect(gpuStarts[0]?.multilevel).toBe(false); // the cold start the caller asked for (#312)
+    expect(gpuStarts[0]?.lod).toBe(true);
+
+    // The same options on backend:"worker" (same engine: never a second WebGL engine per file) start the
+    // identical worker run.
+    posts.mockClear();
+    net.layout({ backend: "worker", ...opts });
+    await net.whenSettled();
+    expect(net.lodSource).toBe("worker");
+    const workerRun = workerStarts(posts);
+    expect(workerRun).toHaveLength(1);
+    expect(gpuStarts[0]).toEqual(workerRun[0]);
+
+    net.destroy();
+  });
+
+  it("falls back with LOD off too, keeping multilevel's default", async () => {
+    const net = await engineWithoutFloatBlend();
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    const posts = vi.spyOn(Worker.prototype, "postMessage");
+    net.data(clustered(400)).layout({ backend: "gpu", iterations: 10 });
+    await net.whenSettled();
+    const starts = workerStarts(posts);
+    expect(starts).toHaveLength(1);
+    expect(starts[0]?.multilevel).toBe(true); // the worker default, as for backend:"worker"
+    expect(starts[0]?.lod).toBe(false);
+    expect(net.lodSource).toBe("none");
+    expect(net.layoutTransport).not.toBe("gpu");
+    net.destroy();
+  });
+
+  it("a supported device still takes the GPU path with LOD on, building the tree on the main thread", async () => {
+    const net = network(makeHost(), { width: W, height: H, backend: "webgl" });
+    const posts = vi.spyOn(Worker.prototype, "postMessage");
+    net.data(clustered(1500)).lod({ expandPx: 48 }).layout({ backend: "gpu", iterations: 10 });
+    await net.whenSettled();
+    expect(net.layoutTransport).toBe("gpu");
+    expect(workerStarts(posts)).toHaveLength(0); // no worker run
+    expect(net.lodSource).toBe("main"); // the GPU streams no tree: the main thread builds it (PR 3c moves it)
     net.destroy();
   });
 });
