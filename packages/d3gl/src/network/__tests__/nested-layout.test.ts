@@ -397,8 +397,7 @@ describe("collide: coincident sibling discs (#357)", () => {
    * lattice square, and every other disc (small) on a unit lattice — out of everyone's reach, so only the
    * pair can move.
    */
-  function coincidentPair(k: number, a: number, b: number): Scratch {
-    const s = new Scratch();
+  function coincidentPair(k: number, a: number, b: number, s = new Scratch()): Scratch {
     s.ensure(k, k);
     const side = Math.ceil(Math.sqrt(k));
     for (let i = 0; i < k; i++) {
@@ -440,13 +439,17 @@ describe("collide: coincident sibling discs (#357)", () => {
       }
     });
 
-    it(`is deterministic — ${path}`, () => {
-      const first = coincidentPair(k, a, b);
-      const second = coincidentPair(k, a, b);
-      collide(first, k, PAD);
-      collide(second, k, PAD);
-      expect(Array.from(first.x.subarray(0, k))).toEqual(Array.from(second.x.subarray(0, k)));
-      expect(Array.from(first.y.subarray(0, k))).toEqual(Array.from(second.y.subarray(0, k)));
+    it(`gives the same result on a scratch reused from a larger module — ${path}`, () => {
+      // solveModule reuses one Scratch for every module, so the grid's cell heads and chains, and the
+      // arrays past k, hold the previous module's state. Resolve a larger coincident module first.
+      const reused = coincidentPair(64, 7, 50);
+      collide(reused, 64, PAD);
+      coincidentPair(k, a, b, reused);
+      collide(reused, k, PAD);
+      const fresh = coincidentPair(k, a, b);
+      collide(fresh, k, PAD);
+      expect(Array.from(reused.x.subarray(0, k))).toEqual(Array.from(fresh.x.subarray(0, k)));
+      expect(Array.from(reused.y.subarray(0, k))).toEqual(Array.from(fresh.y.subarray(0, k)));
     });
   }
 });
