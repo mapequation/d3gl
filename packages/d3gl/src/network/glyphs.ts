@@ -5,6 +5,7 @@ import type { PhysicalPieWedges } from "./pie.js";
 import { boundaryCircle, type CutBoundaries, type LODTree, type LODTransform } from "./lod.js";
 import type { ScreenRect } from "../core/instanced-lane.js";
 import { halfLinkGeometry, traceHalfLink, scaleHalfLink, bezierControl, bentEndTangent, straightUnit, chordBend } from "../core/half-link.js";
+import { PairIndex } from "./pair-index.js";
 
 // Re-exported so the network's link-curve math keeps one import site for consumers/tests, even
 // though the formulas themselves now live in core (shared with the export-only vector view, #200).
@@ -850,11 +851,14 @@ export interface SuperEdgeStyleResolved {
 }
 
 /**
- * Reusable scratch for {@link superEdges} (#210) — engine-owned so a zoom-frame emit does **zero
- * O(tree.size) work**: `seen` is a generation-stamped presence array (`seen[g] === gen` ⇔ on this
- * call's frontier — the stamp bump replaces a per-frame clear), grown once per tree; the gather
- * arrays grow-double and are reused; the maps are cleared (O(entries touched last call)) and reused.
- * Outputs never alias the scratch, so one scratch per engine can serve every emit path.
+ * Reusable scratch for {@link superEdges} (#210, #364) — engine-owned so a zoom-frame emit does **zero
+ * O(tree.size) work** and allocates nothing beyond its outputs (and what the style callbacks return):
+ * `seen` is a generation-stamped presence array (`seen[g] === gen` ⇔ on this call's frontier — the stamp
+ * bump replaces a per-frame clear), grown once per tree, and the cross-level `cover` memo carries the same
+ * stamp; the gather arrays and pair indexes grow to their high-water and are reused, the indexes emptied
+ * by their own stamp bump. No `Map` or `Set` (#364): keyed by `a · tree.size + b`, they boxed every key
+ * and flow of every frame. Outputs never alias the scratch, so one scratch per engine can serve every
+ * emit path.
  */
 export interface SuperEdgesScratch {
   /** Generation-stamped frontier membership, length ≥ tree.size — grown on demand, never per frame. */
@@ -865,23 +869,55 @@ export interface SuperEdgesScratch {
   aS: Int32Array;
   bS: Int32Array;
   wS: Float64Array;
-  /** Directed-pair flow lookup for reciprocal half-arrow widths — cleared per call. */
-  flowByPair: Map<number, number>;
-  /** Cross-level (#139) nearest-present-ancestor memo + projected-pair sums — cleared per call. */
-  cover: Map<number, number>;
-  proj: Map<number, number>;
-  /** Module links anchored at an expanded module's boundary (#329): pair → summed flow — cleared per call. */
-  anchor: Map<number, number>;
-  /** Flow a finer drawn pair already carries, by the off-screen pair that also holds it (pair → summed
-   *  flow), and that pair's non-present ends — cleared per call. @see {@link superEdges} */
-  claimed: Map<number, number>;
-  claimedEnds: Set<number>;
+  /**
+   * Cross-level (#139) nearest-present-ancestor memo by tree node: `cover[x]` (−1 = none) is this call's
+   * answer for `x` while `coverGen[x] === gen`. Grown to tree.size by the first cross-level call only
+   * (+8 B per tree node); empty while `crossLevelEdges` is off.
+   */
+  cover: Int32Array;
+  coverGen: Int32Array;
+  /**
+   * Directed pair → its row in the gather arrays (keyed by `aS`/`bS`; `wS[row]` is its flow): the projected
+   * (#139), then the anchored (#329) pairs while their flows are summed, then the `pairedRows` for the
+   * reciprocal half-arrow widths. 16-32 B per pair of the largest of those sets so far.
+   */
+  pairs: PairIndex;
+  /** Rows (ascending) whose pair has a reciprocal half-arrow width to give or take: a same-level pair with
+   *  both ends on the frontier, a projected (#139) or an anchored (#329) pair. Half-arrow style only. */
+  pairedRows: Int32Array;
+  /** Flow finer drawn pairs already carry, by the off-screen pair that also holds it: pair → its row of
+   *  `claimA`/`claimB` (the pair), `claimW` (the summed flow) and `claimX` (its non-present end).
+   *  @see {@link superEdges} */
+  claimed: PairIndex;
+  claimA: Int32Array;
+  claimB: Int32Array;
+  claimW: Float64Array;
+  claimX: Int32Array;
+  /** One-hash bit filter over this call's `claimX` (16 bits per claim), so an off-screen pair no claim
+   *  can touch skips the `claimed` lookup. */
+  claimBits: Int32Array;
 }
 
 /** Fresh {@link SuperEdgesScratch}. The network engine keeps ONE per instance; {@link superEdges}
  *  falls back to a throwaway one when none is passed (backward-compatible, but then per-call O(tree.size)). */
 export function makeSuperEdgesScratch(): SuperEdgesScratch {
-  return { seen: new Int32Array(0), gen: 0, aS: new Int32Array(256), bS: new Int32Array(256), wS: new Float64Array(256), flowByPair: new Map(), cover: new Map(), proj: new Map(), anchor: new Map(), claimed: new Map(), claimedEnds: new Set() };
+  return {
+    seen: new Int32Array(0),
+    gen: 0,
+    aS: new Int32Array(256),
+    bS: new Int32Array(256),
+    wS: new Float64Array(256),
+    cover: new Int32Array(0),
+    coverGen: new Int32Array(0),
+    pairs: new PairIndex(),
+    pairedRows: new Int32Array(256),
+    claimed: new PairIndex(),
+    claimA: new Int32Array(16),
+    claimB: new Int32Array(16),
+    claimW: new Float64Array(16),
+    claimX: new Int32Array(16),
+    claimBits: new Int32Array(2),
+  };
 }
 
 /**
@@ -919,7 +955,7 @@ export function superEdges(
   // one-time growth to this tree's size; per call, bumping the generation stamp replaces a clear.
   const sc = scratch ?? makeSuperEdgesScratch();
   if (sc.seen.length < tree.size) sc.seen = new Int32Array(tree.size); // grown once per tree (zero-filled ⇒ never equals a stamp ≥ 1)
-  if (sc.gen === 0x7fffffff) { sc.seen.fill(0); sc.gen = 0; } // stamp wrap — once per 2^31 calls
+  if (sc.gen === 0x7fffffff) { sc.seen.fill(0); sc.coverGen.fill(0); sc.gen = 0; } // stamp wrap — once per 2^31 calls
   const seen = sc.seen;
   const gen = ++sc.gen; // seen[g] === gen ⇔ g is on this call's frontier
   for (let i = 0; i < frontier.length; i++) seen[frontier[i]!] = gen;
@@ -947,9 +983,8 @@ export function superEdges(
   // members not drawn (culled, decluttered), or nothing. O(depth) per claim; nothing when no pair claims.
   const up = tree.parent;
   const claimed = sc.claimed;
-  const claimedEnds = sc.claimedEnds;
-  claimed.clear();
-  claimedEnds.clear();
+  claimed.reset();
+  let claims = 0; // rows of claimA/claimB/claimW/claimX in use
   const claim = (a: number, b: number, w: number): void => {
     if (!dep || !up || dep[a] === dep[b]) return;
     const shallowA = dep[a]! < dep[b]!;
@@ -962,9 +997,24 @@ export function superEdges(
       if (seen[x] === gen) return; // a present node on the way (a cross-fade band): it draws its own pair
     }
     if (!offScreen(x)) return; // on-screen: the off-screen rule does not follow it
-    const key = shallowA ? s * tree.size + x : x * tree.size + s;
-    claimed.set(key, (claimed.get(key) ?? 0) + w);
-    claimedEnds.add(x);
+    const ca = shallowA ? s : x;
+    const cb = shallowA ? x : s;
+    const row = claimed.findOrAdd(ca, cb, claims, sc.claimA, sc.claimB);
+    if (row !== claims) {
+      sc.claimW[row] = (sc.claimW[row] ?? 0) + w;
+      return;
+    }
+    if (claims === sc.claimA.length) {
+      const cap = claims * 2;
+      const na = new Int32Array(cap); na.set(sc.claimA); sc.claimA = na;
+      const nb = new Int32Array(cap); nb.set(sc.claimB); sc.claimB = nb;
+      const nw = new Float64Array(cap); nw.set(sc.claimW); sc.claimW = nw;
+      const nx = new Int32Array(cap); nx.set(sc.claimX); sc.claimX = nx;
+    }
+    sc.claimA[claims] = ca;
+    sc.claimB[claims] = cb;
+    sc.claimX[claims] = x;
+    sc.claimW[claims++] = 0 + w; // as a sum from 0 (−0 → +0)
   };
   // Anchoring at expanded modules' boundaries (#329), only inside the cross-level pass. Edges from
   // `anchorStart` on are anchored links; an end is on its module's boundary iff `anchored(end)`: an
@@ -997,10 +1047,8 @@ export function superEdges(
     ends[3] = ends[3]! - (dy / d) * rb;
   };
 
-  // Gather drawable directed super-edges + a reciprocal-flow lookup (for both-on-frontier pairs) into
-  // the scratch's reused grow-arrays/map (outputs are copied out below — they never alias the scratch).
-  const flowByPair = sc.flowByPair;
-  flowByPair.clear();
+  // Gather drawable directed super-edges into the scratch's reused grow-arrays (outputs are copied out
+  // below — they never alias the scratch).
   let len = 0;
   const pushEdge = (a: number, b: number, w: number): void => {
     if (len === sc.aS.length) {
@@ -1014,6 +1062,17 @@ export function superEdges(
     sc.wS[len] = w;
     len++;
   };
+  // The rows the reciprocal half-arrow widths index (see `pairedRows`), recorded as they are pushed.
+  const reciprocal = style.linkStyle === "half-arrow" && style.directed;
+  let paired = 0;
+  const pairLast = (): void => {
+    if (paired === sc.pairedRows.length) {
+      const nr = new Int32Array(paired * 2);
+      nr.set(sc.pairedRows);
+      sc.pairedRows = nr;
+    }
+    sc.pairedRows[paired++] = len - 1;
+  };
   for (let i = 0; i < frontier.length; i++) {
     const g = frontier[i]!;
     for (let p = off[g]!; p < off[g + 1]!; p++) {
@@ -1023,7 +1082,7 @@ export function superEdges(
         // below instead (one may land on the same pair, and a pair draws once).
         if (par && merges(g, h)) continue;
         pushEdge(g, h, flw[p]!);
-        flowByPair.set(g * tree.size + h, flw[p]!);
+        if (reciprocal) pairLast();
         if (dep !== undefined && dep[h] !== dep[g]) claim(g, h, flw[p]!); // a lift pair
       } else if (offScreen(h) && !deeper(h, g)) {
         pushEdge(g, h, flw[p]!);
@@ -1058,20 +1117,34 @@ export function superEdges(
   // parent map), so it's ZERO added cost when off (the same-level gather above is untouched).
   if (par) {
     // Nearest present ancestor of `h` (climb parents), or -1 if none — memoised with path-compression so
-    // the whole pass stays O(off-frontier-on-screen incidences · depth). Keyed in a Map over only the
-    // **touched** nodes: a per-frame `Int32Array(tree.size).fill(-2)` would be an O(all tree nodes)
-    // allocation + write every frame, defeating LOD's O(visible) intent (#144 perf section).
-    const cover = sc.cover; // node id → nearest present ancestor (-1 = none) — reused, cleared per call
-    cover.clear();
+    // the whole pass stays O(off-frontier-on-screen incidences · depth). The memo is two typed arrays over
+    // tree nodes stamped with this call's generation (#364), so only the **touched** nodes are written and
+    // the stamp bump is the per-frame clear: a per-frame `Int32Array(tree.size).fill(-2)` would be an O(all
+    // tree nodes) allocation + write every frame, defeating LOD's O(visible) intent (#144 perf section).
+    if (sc.cover.length < tree.size) { sc.cover = new Int32Array(tree.size); sc.coverGen = new Int32Array(tree.size); } // once per tree
+    const cover = sc.cover;
+    const coverGen = sc.coverGen;
     const coverOf = (h: number): number => {
       let x = h;
-      while (x >= 0 && !cover.has(x) && seen[x] !== gen) x = par[x]!;
-      const c = x < 0 ? -1 : seen[x] === gen ? x : cover.get(x)!;
-      for (let y = h; y >= 0 && y !== x; y = par[y]!) cover.set(y, c); // backfill the climbed chain
+      while (x >= 0 && coverGen[x] !== gen && seen[x] !== gen) x = par[x]!;
+      const c = x < 0 ? -1 : seen[x] === gen ? x : (cover[x] ?? -1);
+      for (let y = h; y >= 0 && y !== x; y = par[y]!) { cover[y] = c; coverGen[y] = gen; } // backfill the climbed chain
       return c;
     };
-    const proj = sc.proj; // directed pair key (a·size + b) → summed flow — reused, cleared per call
-    proj.clear();
+    // Sum flow per directed pair (projected, then anchored): a pair's first flow pushes it — so pairs are
+    // gathered in first-seen order — and later ones add to its row, found through the pair index.
+    const pairs = sc.pairs;
+    const sumPair = (a: number, b: number, w: number): void => {
+      const row = pairs.findOrAdd(a, b, len, sc.aS, sc.bS); // a new row's keys: written by pushEdge below
+      if (row !== len) {
+        sc.wS[row] = (sc.wS[row] ?? 0) + w;
+        return;
+      }
+      pushEdge(a, b, 0 + w); // as a sum from 0 (−0 → +0)
+      if (reciprocal) pairLast();
+    };
+    pairs.reset();
+    const projStart = len;
     // Out: a present node's out-edge to an off-frontier on-screen target → project the target up (g → c).
     for (let i = 0; i < frontier.length; i++) {
       const g = frontier[i]!;
@@ -1079,18 +1152,12 @@ export function superEdges(
         const h = tgt[p]!;
         if (seen[h] === gen) {
           // A present lift pair onto an aggregate (skipped by the same-level walk): summed with projections.
-          if (merges(g, h)) {
-            const key = g * tree.size + h;
-            proj.set(key, (proj.get(key) ?? 0) + flw[p]!);
-          }
+          if (merges(g, h)) sumPair(g, h, flw[p]!);
           continue;
         }
         if (offScreen(h) || deeper(h, g)) continue; // off-screen: emitted above; deeper: projected from its own end
         const c = coverOf(h);
-        if (c >= 0 && c !== g) {
-          const key = g * tree.size + c;
-          proj.set(key, (proj.get(key) ?? 0) + flw[p]!);
-        }
+        if (c >= 0 && c !== g) sumPair(g, c, flw[p]!);
       }
     }
     // In: a present node's in-edge from an off-frontier on-screen source → project the source up (c → g).
@@ -1101,20 +1168,11 @@ export function superEdges(
           const s = inSrc[p]!;
           if (seen[s] === gen || offScreen(s) || deeper(s, g)) continue; // present: from its out-walk; off-screen: handled above
           const c = coverOf(s);
-          if (c >= 0 && c !== g) {
-            const key = c * tree.size + g;
-            proj.set(key, (proj.get(key) ?? 0) + inFlw[p]!);
-          }
+          if (c >= 0 && c !== g) sumPair(c, g, inFlw[p]!);
         }
       }
     }
-    for (const [key, w] of proj) {
-      const a = Math.floor(key / tree.size);
-      const b = key - a * tree.size;
-      pushEdge(a, b, w);
-      flowByPair.set(key, w); // both endpoints present → feed reciprocal half-arrow widths too
-      claim(a, b, w);
-    }
+    for (let e = projStart; e < len; e++) claim(sc.aS[e] ?? 0, sc.bS[e] ?? 0, sc.wS[e] ?? 0);
 
     // Module links anchored at expanded modules' boundaries (#329). Once a module expands, every pair that
     // carries one of its module links has an expanded end (the module or its ancestors), so neither walk
@@ -1137,8 +1195,8 @@ export function superEdges(
         const h = expanded[i]!;
         if (seen[h] !== gen) seen[h] = -gen;
       }
-      const anchor = sc.anchor;
-      anchor.clear();
+      anchorStart = len;
+      pairs.reset();
       const fading = style.fadeAlpha !== undefined;
       // The drawn end of a module link's endpoint x, or -1 when it has none (decluttered / faded out).
       const rep = (x: number): number => {
@@ -1151,10 +1209,6 @@ export function superEdges(
         for (let x = par[h]!; x >= 0; x = par[x]!) if (x === a) return true;
         return false;
       };
-      const add = (a: number, b: number, w: number): void => {
-        const key = a * tree.size + b;
-        anchor.set(key, (anchor.get(key) ?? 0) + w);
-      };
       const leaves = tree.leafCount;
       for (let i = 0; i < anc.count; i++) {
         const h = expanded[i]!;
@@ -1162,37 +1216,46 @@ export function superEdges(
         const o = h - leaves;
         for (let p = mlOff[o]!; p < mlOff[o + 1]!; p++) {
           const b = rep(mlTgt[p]!);
-          if (b >= 0 && !(fading && inside(b, h))) add(h, b, mlFlw[p]!);
+          if (b >= 0 && !(fading && inside(b, h))) sumPair(h, b, mlFlw[p]!);
         }
         for (let p = mlInOff[o]!; p < mlInOff[o + 1]!; p++) {
           const a = rep(mlInSrc[p]!);
           // An anchored source draws the link from its own out-row.
-          if (a >= 0 && !anchored(a) && !(fading && inside(a, h))) add(a, h, mlInFlw[p]!);
+          if (a >= 0 && !anchored(a) && !(fading && inside(a, h))) sumPair(a, h, mlInFlw[p]!);
         }
       }
-      anchorStart = len;
-      for (const [key, w] of anchor) {
-        const a = Math.floor(key / tree.size);
-        const b = key - a * tree.size;
-        pushEdge(a, b, w);
-        flowByPair.set(key, w); // reciprocal anchored links (A→B and B→A) share their widths
-        claim(a, b, w);
-      }
+      for (let e = anchorStart; e < len; e++) claim(sc.aS[e] ?? 0, sc.bS[e] ?? 0, sc.wS[e] ?? 0);
     }
   }
   // The claims (see `claim`): each off-screen pair of the same-level gather that finer drawn pairs share
   // flow with keeps the rest, or is dropped when nothing is left (float32 sums: within 1e-4 of its flow).
-  if (claimed.size > 0) {
+  if (claims > 0) {
+    // Claims are few and off-screen pairs many (82k drawn pairs vs 158 claims at the Network Navigator's
+    // web-NotreDame view), so the claimed ends go into a one-hash bit filter first (16 bits per claim: ~6%
+    // false positives), and only a pair whose non-present end passes it looks its pair up.
+    let bitsLog = 6;
+    while (bitsLog < 30 && (1 << bitsLog) < claims * 16) bitsLog++;
+    const words = 1 << (bitsLog - 5);
+    if (sc.claimBits.length < words) sc.claimBits = new Int32Array(words);
+    const bits = sc.claimBits;
+    bits.fill(0, 0, words);
+    const shift = 32 - bitsLog;
+    for (let c = 0; c < claims; c++) {
+      const hx = Math.imul(sc.claimX[c] ?? 0, 0x9e3779b1) >>> shift;
+      bits[hx >>> 5] = (bits[hx >>> 5] ?? 0) | (1 << (hx & 31));
+    }
     let kept = 0;
+    let next = 0; // the next paired row to renumber (paired rows are never dropped)
     for (let e = 0; e < len; e++) {
       const a = sc.aS[e]!;
       const b = sc.bS[e]!;
       let w = sc.wS[e]!;
-      const x = seen[a] === gen ? b : a; // an off-screen pair's non-present end
-      if (e < offScreenEnd && seen[x] !== gen && claimedEnds.has(x)) {
-        const c = claimed.get(a * tree.size + b);
-        if (c !== undefined) {
-          const rest = w - c;
+      const x = seen[a] === gen ? b : a; // an off-screen pair's non-present end (a claimed pair's is its `x`)
+      const hx = Math.imul(x, 0x9e3779b1) >>> shift;
+      if (e < offScreenEnd && seen[x] !== gen && ((bits[hx >>> 5] ?? 0) & (1 << (hx & 31))) !== 0) {
+        const c = claimed.find(a, b, sc.claimA, sc.claimB);
+        if (c >= 0) {
+          const rest = w - (sc.claimW[c] ?? 0);
           if (!(rest > w * 1e-4)) continue;
           w = rest;
         }
@@ -1200,6 +1263,7 @@ export function superEdges(
       sc.aS[kept] = a;
       sc.bS[kept] = b;
       sc.wS[kept] = w;
+      if (next < paired && sc.pairedRows[next] === e) sc.pairedRows[next++] = kept;
       kept++;
     }
     if (anchorStart !== Infinity) anchorStart -= len - kept; // only same-level pairs (before it) are dropped
@@ -1219,7 +1283,6 @@ export function superEdges(
   const ids: number[] = new Array(count);
   for (let e = 0; e < count; e++) ids[e] = aS[e]! * tree.size + bS[e]!;
   const maxAgg = style.maxAggregateRadius ?? Infinity;
-  const drawnRadius = (g: number): number => (g < tree.leafCount ? tree.radius[g]! : Math.min(tree.radius[g]!, maxAgg));
 
   // Endpoints (centroids) + per-edge colour are common to both styles.
   const sources = new Float32Array(count * 2);
@@ -1244,10 +1307,12 @@ export function superEdges(
       targets[e * 2] = tree.cx[h]!;
       targets[e * 2 + 1] = tree.cy[h]!;
     }
-    const [cr, cg, cb, ca] = style.colorOf(wS[e]!);
-    colors[e * 4] = cr;
-    colors[e * 4 + 1] = cg;
-    colors[e * 4 + 2] = cb;
+    // Indexed, not destructured: destructuring allocates an array iterator per edge (#364).
+    const rgba = style.colorOf(wS[e]!);
+    const ca = rgba[3];
+    colors[e * 4] = rgba[0];
+    colors[e * 4 + 1] = rgba[1];
+    colors[e * 4 + 2] = rgba[2];
     if (fa) {
       // An anchored boundary end fades with its module's children (the cut wrote their alpha for it).
       const af = seen[g] === gen || (anchoredEdge && seen[g] === -gen) ? fa[g]! : 1;
@@ -1257,20 +1322,39 @@ export function superEdges(
       colors[e * 4 + 3] = ca;
     }
   }
-  // Draw radius of edge e's end x: a boundary end already sits on its circle (0), else the glyph radius.
-  const endRadius = (e: number, x: number): number => (e >= anchorStart && anchored(x) ? 0 : drawnRadius(x));
+  // Draw radius of edge e's end x into out[i]: a boundary end already sits on its circle (0), else the glyph
+  // radius. Written, not returned: a double returned from a closure V8 does not inline is boxed (#233, #364).
+  const putEndRadius = (out: Float32Array, i: number, e: number, x: number): void => {
+    out[i] = e >= anchorStart && anchored(x) ? 0 : x < tree.leafCount ? tree.radius[x]! : Math.min(tree.radius[x]!, maxAgg);
+  };
 
   if (style.linkStyle === "half-arrow" && style.directed) {
     const radii = new Float32Array(count * 2);
     const widths = new Float32Array(count * 2);
     const bends = new Float32Array(count).fill(style.bend);
     for (let e = 0; e < count; e++) {
-      radii[e * 2] = endRadius(e, aS[e]!);
-      radii[e * 2 + 1] = endRadius(e, bS[e]!);
+      putEndRadius(radii, e * 2, e, aS[e]!);
+      putEndRadius(radii, e * 2 + 1, e, bS[e]!);
       const w = style.widthOf(wS[e]!);
-      const opp = flowByPair.get(bS[e]! * tree.size + aS[e]!);
       widths[e * 2] = w;
-      widths[e * 2 + 1] = opp === undefined ? w : style.widthOf(opp);
+      widths[e * 2 + 1] = w;
+    }
+    // Reciprocal widths: a pair's second half takes its reverse pair's width. Only the paired rows give or
+    // take one (see `pairedRows`): an off-screen pair's reverse would need its non-present end to be
+    // present, or an anchored module, whose centre is on-screen. They are 12% of the drawn pairs at the
+    // Network Navigator's web-NotreDame view. Should a pair be drawn twice, its later row answers, as the
+    // Map's last write did.
+    const rows = sc.pairedRows;
+    const pairs = sc.pairs;
+    pairs.reset(paired);
+    for (let i = 0; i < paired; i++) {
+      const e = rows[i] ?? 0;
+      pairs.set(aS[e] ?? -1, bS[e] ?? -1, e, aS, bS);
+    }
+    for (let i = 0; i < paired; i++) {
+      const e = rows[i] ?? 0;
+      const opp = pairs.find(bS[e] ?? -1, aS[e] ?? -1, aS, bS);
+      if (opp >= 0) widths[e * 2 + 1] = style.widthOf(wS[opp] ?? 0);
     }
     return { halfArrows: { sources, targets, radii, widths, bends, colors, count }, ids, flows };
   }
@@ -1290,7 +1374,7 @@ export function superEdges(
   // one-sided **half** head only for bent links (so reciprocal heads don't collide); straight links
   // get the symmetric triangle — matching the non-LOD path (`half: bend !== 0`).
   const aRadii = new Float32Array(count);
-  for (let e = 0; e < count; e++) aRadii[e] = endRadius(e, bS[e]!);
+  for (let e = 0; e < count; e++) putEndRadius(aRadii, e, e, bS[e]!);
   const arrows: InstancedArrowsData = { sources, targets, radii: aRadii, sizes: new Float32Array(count).fill(style.arrowSize), colors, bends, half: style.bend !== 0, count };
   return { lines, arrows, ids, flows };
 }
