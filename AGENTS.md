@@ -369,6 +369,7 @@ per-file timeout. Every at-scale leg below now asserts. When you add a guard, ad
 | network LOD super-edges | — | `network/__tests__/super-edges-perf.test.ts` | 100k + all-leaves; **ragged** module tree 100k (sweep + mixed-level + all-leaves, #325) | `BENCH_SUPER_EDGES` (+ all-leaves; ragged leg too) |
 | network LOD module boundaries (#329): cut collection + rings + anchored module links | — | `network/__tests__/module-boundary-perf.test.ts` | 100k `.ftree`-shaped map: sweep on/off, every module open (declutter on **and** off), raw-network identity | `BENCH_MODULE_BOUNDARY` (+ on/off ratio under `PERF_ASSERT`) |
 | network LOD end-to-end | — | `network/__tests__/lod-perf.bench.test.ts` | — | `BENCH_LOD` |
+| streamed LOD frame: super-edge colour memo + mixed-radius declutter (radius-class grid) | — | `network/__tests__/lod-frame-waste-perf.test.ts` | 100k sweep + all-leaves frontier (colour calls ≪ drawn edges, exact bytes; probes/glyph); 200k dense mixed-radius screen (single-grid identity); 200k-edge full-detail colour pass (calls = distinct weights) | `BENCH_LOD_FRAME_WASTE` |
 | network no-LOD labels | — | `network/__tests__/label-candidates-perf.test.ts` | 100k | `BENCH_LABEL_CANDIDATES` |
 | network selection dim | — | `network/__tests__/selection-dim-perf.test.ts` | 100k | — |
 | node-drag (interaction) | — | `network/__tests__/lod-drag-incremental-perf.test.ts` | small | `BENCH_DRAG` |
@@ -410,12 +411,12 @@ are exact at every N. And the SVG leg is not scaled to the tier's N for the same
 guard owns the serialize budget: one DOM node per drawable buys parse time, not strictness.
 | **`geoMap()` engine sweep** | **WebGL** | `map/geo-map-sweep-perf.browser.test.ts` | 20k cells | `PERF_BROWSER_N` (max 150k) |
 | **`plot()` engine sweep**, retained Scene | **WebGL** | `map/plot-engine-sweep-perf.browser.test.ts` | 50k ×2 layers | `PERF_BROWSER_N` (max 300k) |
-| **`network()` engine sweep**, LOD on **and** off | **WebGL** | `network/__tests__/network-sweep-perf.browser.test.ts` | 50k nodes / 50k edges | `PERF_BROWSER_N` (max 200k) |
+| **`network()` engine sweep**, LOD on **and** off, + held LOD view (unchanged style columns re-emitted as the same arrays, endpoint-only upload) | **WebGL** | `network/__tests__/network-sweep-perf.browser.test.ts` | 50k nodes / 50k edges | `PERF_BROWSER_N` (max 200k) |
 | **`network()` position transition** (#328), LOD on **and** off, vs a streamed frame | **WebGL** | `network/__tests__/network-transition-perf.browser.test.ts` | 50k nodes | `PERF_BROWSER_N` (max 200k) |
 | **`network()` module boundaries** (#329), sweep on vs off + every module open | **WebGL** | `network/__tests__/network-module-boundary-perf.browser.test.ts` | 50k nodes | `PERF_BROWSER_N` (max 200k) |
 | multi pass-through: FBO count + gesture skip | **WebGL** | `map/passthrough-multi-perf.browser.test.ts` | 25k ×2 layers | `PERF_BROWSER_N` (max 50k) |
 | label placement (`cullLabels`) | — | `labels/__tests__/label-cull-perf.test.ts` | 200k candidates, dense **and** spread | `BENCH_LABEL_CULL` |
-| **`network.labels()` per-frame**, LOD on **and** off | **WebGL** | `network/__tests__/network-labels-perf.browser.test.ts` | 20k nodes, uncapped | `PERF_BROWSER_N` (max 50k) |
+| **`network.labels()` per-frame**, LOD on **and** off, + capped LOD top-k (`importanceOf` once per candidate) | **WebGL** | `network/__tests__/network-labels-perf.browser.test.ts` | 20k nodes, uncapped + `max: 50` | `PERF_BROWSER_N` (max 50k) |
 
 **Known holes, tracked:** geo's at-scale leg is Canvas-only (#264). *(Closed: #263 — the at-scale
 legs used to drive **backends** only, leaving accessors / lane emit / LOD integration covered at
