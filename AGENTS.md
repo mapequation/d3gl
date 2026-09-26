@@ -383,7 +383,7 @@ per-file timeout. Every at-scale leg below now asserts. When you add a guard, ad
 | instanced pie | **WebGL** | `webgl/__tests__/instanced-pie-perf.browser.test.ts` | 100k | `PERF_BROWSER_N` |
 | GPU layout tick (+ #349 signatures: no draw of ≥ N vertices × instances into a 1×1 viewport, via any of the five WebGL2 draw calls; zero texture / framebuffer / buffer creation per tick); hub springs (#350): hub rows in web-NotreDame's shape, scaled with N (0.52% of rows, its five > 4096 hubs, chunk count K ≥ N/30), tick ≤ 2× a hub-free twin with the same edges, and exactly one extra draw (the chunk pass, K fragments) with no per-tick allocation | **WebGL** | `network/gpu/__tests__/gpu-frame-budget-perf.browser.test.ts` | 30k | `PERF_BROWSER_N` (max 200k) |
 | GPU layout tick sliced into row bands (#352): 4 bands per tick bitwise equal to the unsliced tick (hub rows included), 12 scissored force draws, no allocation per band | **WebGL** | `network/gpu/__tests__/gpu-frame-budget-perf.browser.test.ts` | 30k | `PERF_BROWSER_N` (max 200k) |
-| GPU layout **streaming** through `network().layout({ backend: "gpu" })`, LOD off **and** on (#352): transport-only main thread per frame (p95 ceiling `c0 + c1·N`), encode median ≤ 2.5 ms; every streaming `readPixels` into a bound PBO; every `getBufferSubData` after a fence inserted after its copy was seen signalled; within a frame the harvest precedes every layout draw; exactly one fence per frame; no GPU object created per streamed frame; repaints ≥ 48 ms apart; `settled` after the final tick's harvest; ticks/s floored against the GPU-only rate | **WebGL** | `network/gpu/__tests__/gpu-stream-perf.browser.test.ts` | 100k | `PERF_BROWSER_N` (max 1M) |
+| GPU layout **streaming** through `network().layout({ backend: "gpu" })`, LOD off **and** on (#352): transport-only main thread per frame (p95 ceiling `c0 + c1·N`), encode median ≤ 2.5 ms; every streaming `readPixels` into a bound PBO; every `getBufferSubData` after a fence inserted after its copy was seen signalled; within a frame the harvest precedes every layout draw; exactly one fence per frame; no GPU object created per streamed frame; repaints ≥ 48 ms apart; `settled` after the final tick's harvest; ticks/s floored against the GPU-only rate. **Node drag** on the same engine (a real pointer drag of the settled layout, LOD off **and** on): the same transport bounds and GL signatures over the held and re-cool frames, no GPU object created, `setPinned` once per pointer move and held-position writes at most once per tick, each over the held set (O(held)), ticks and repaints while held | **WebGL** | `network/gpu/__tests__/gpu-stream-perf.browser.test.ts` | 100k | `PERF_BROWSER_N` (max 1M) |
 | GPU streaming readback `AsyncPositionReadback` (#352), `RG/FLOAT` and packed `RGBA/FLOAT`: exact positions and stats, both PBOs `STREAM_READ`, one `readPixels` per PBO per copy (into the PBO), no allocation per readback, copy and harvest main-thread ceilings, a non-finite layout refused without touching positions | **WebGL** | `network/gpu/__tests__/gpu-async-readback-perf.browser.test.ts` | 1M | `PERF_BROWSER_N` (max 4M) |
 | GPU layout position readback through `GpuForceLayout.readPositions`, `RGBA/FLOAT` (a device that refuses `RG/FLOAT`) and `RG/FLOAT` (#351): exact positions, no GPU allocation and one `readPixels` per readback, one retained RGBA scratch | **WebGL** | `network/gpu/__tests__/gpu-readback-perf.browser.test.ts` | 1M | `PERF_BROWSER_N` (max 4M) |
 | React recolor vs build | **WebGL** | `react/perf.browser.test.ts` | 4096 | capped at 8192 — see below |
@@ -544,7 +544,19 @@ fences the frame, and harvests with `getBufferSubData` once that fence has signa
   only blocks on such a miss and never resizes `k` or B. Before that rule, every 325k render doubled B
   until 50 items per tick left 4.6 ticks/s. Where the browser holds the next animation frame until the
   canvas is drawn (SwiftShader: seconds per 100k-node render), the rAF gap after a repaint frame is
-  the render's cost, and the repaint throttle spaces repaints by twice that.
+  the render's cost, and the repaint throttle spaces repaints by twice that. But a gap is not always a
+  render cost: a hidden tab pauses rAF, and a long task delays it. Taken at face value, one such gap once
+  held the layout's repaints back for as long again. So `RepaintThrottle` does not sample across a
+  `visibilitychange` or an idle resume, and it uses the smaller of the last two stall samples: a real GPU
+  cost repeats after every repaint, and a one-off gap does not.
+- **The stats a copy carries must describe the positions it copies.** The harvest refuses a non-finite
+  layout by checking the reductions' stats before it touches `graph.positions`. Those stats come from the
+  last prep (item P), so they describe the positions *before* that tick's integrate. The first version
+  copied right after an integrate and let a NaN born there reach the screen and the settle handler.
+  Positions change only at the integrate and at the prep, where a drag's held positions are written,
+  never mid-tick. So a copy after a prep reuses its stats, and a copy between ticks re-runs the
+  reductions first (`refreshSegmentStats`). Mid-tick, re-running them would change the box and centroid
+  that the remaining force bands read.
 
 ## Host sizing: backend canvases are OUT OF FLOW (#39, re-confirmed in #273)
 
