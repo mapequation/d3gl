@@ -341,7 +341,12 @@ describe("seedPositions", () => {
     seedPositions(g, 200, 100, { force: { repulsion: 50 } });
     const R = Math.sqrt((50 * n) / DEFAULT_FORCE.centering);
     expect(r95(g.positions, n) / (Math.sqrt(0.95) * R)).toBeCloseTo(1, 1);
-    expect(g.positions[0]! + g.positions[2]!).not.toBe(0); // still centred on the viewport (100, 50)
+    // Still centred on the viewport (100, 50), not the origin: the phyllotaxis centroid is within a
+    // fraction of the spacing of the disc centre.
+    let cx = 0;
+    let cy = 0;
+    for (let i = 0; i < n; i++) { cx += g.positions[i * 2]! / n; cy += g.positions[i * 2 + 1]! / n; }
+    expect(Math.hypot(cx - 100, cy - 50)).toBeLessThan(0.05 * R);
     seedPositions(g, 200, 100, { force: { centering: 0 } }); // no equilibrium → viewport disc
     expect(r95(g.positions, n)).toBeLessThan(55);
   });
