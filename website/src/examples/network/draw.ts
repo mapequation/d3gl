@@ -133,7 +133,9 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
         graph = buildGraph({ nodeCount, source, target, weight, directed });
         // A multilevel worker layout stops once it has converged (#124), so it keeps the default budget
         // as a safety cap. The GPU layout has no early stop yet and a cold start keeps full heat until it
-        // settles, so both get a budget that shrinks as the graph grows ("auto" may resolve to the GPU).
+        // settles, so both get a budget that shrinks as the graph grows. "gpu" and "auto" get it too: the
+        // transport they resolve to is known only after layout(), so where they resolve to the worker, a
+        // multilevel run cools over fewer ticks than "worker" gives it (until the GPU stops early, #124).
         const iterations = layoutBackend !== "worker" || !multilevel ? Math.min(250, Math.max(10, Math.round(2.5e6 / count))) : undefined;
         // fit: true (#238) keeps the camera framed on the streaming layout as it converges, released on
         // settle/interaction — so it opens framed rather than piling at the origin on the GPU backend.

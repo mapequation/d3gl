@@ -1,5 +1,5 @@
 ---
-"@mapequation/d3gl": minor
+"@mapequation/d3gl": patch
 ---
 
 Network layout: new `layout({ backend: "auto" })` runs on the GPU where it can and on the worker everywhere else (#375).
