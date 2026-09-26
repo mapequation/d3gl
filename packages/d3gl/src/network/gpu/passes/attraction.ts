@@ -1,7 +1,7 @@
 // TODO(n8 follow-up): extract shared full-screen-triangle pass helper into gpu/passes/_shared.ts
 // (full-screen-triangle VS + clip buffer + mutable-uniforms Record + ADDITIVE_BLEND params — 6 passes duplicate this).
 
-import type { Device, Texture, RenderPass } from "@luma.gl/core";
+import type { Buffer, Device, Texture, RenderPass } from "@luma.gl/core";
 import { Model } from "@luma.gl/engine";
 import { HUB_CHUNK, SPRING_CHUNK } from "../hub-chunks.js";
 
@@ -15,7 +15,13 @@ in vec2 a_clip;
 void main() { gl_Position = vec4(a_clip, 0.0, 1.0); }
 `;
 
-/** Which spring variant a program is compiled for — fixed per layout, so no per-fragment branch on it. */
+/**
+ * Which spring variant a program is compiled for — fixed per layout, so no per-fragment branch on it.
+ *
+ * TODO(#353): one solver across multilevel levels (`setLevel`, spec §6.4) changes the CSR, the hub table
+ * and the weights per level, so both flags must then become uniform branches (spec §5.4) or be compiled
+ * on for the capacity solver — a hub-free first level would otherwise compile without the hub branch.
+ */
 export interface SpringVariant {
   /**
    * Some row is longer than {@link SPRING_CHUNK}: compile the hub branch (row skip + partial gather).
@@ -88,8 +94,10 @@ vec2 springTerm(uint p, vec2 pi) {
  * fragment loops over more than C neighbours, and no entry is dropped — the old 4096-iteration cap lost
  * 13,507 half-edges on web-NotreDame's 5 largest hubs and broke action-reaction.
  *
- * Padded texels (id >= u_count) are discarded — with additive blending enabled this is essential: a
- * discard avoids adding garbage to padded force texels.
+ * Padded texels (id >= u_count) write 0 and return — a no-op under the additive blend. Not `discard`:
+ * it does not end the invocation on every driver (ANGLE on Metal kept running), and the rest of this
+ * shader reads `offsets[id + 1]`, which is past the offsets atlas on the last padded texel (an undefined
+ * fetch) and bounds the row loop. `return` does end it, so no loop here ever sees a padded texel.
  */
 const ROW_FS = /* glsl */ `\
 ${CSR_GLSL}
@@ -115,17 +123,17 @@ ivec2 offCoord(int i) {
 void main() {
   ivec2 c = ivec2(gl_FragCoord.xy);
   int id = c.y * u_width + c.x;
-  if (id >= u_count) { discard; }
+  if (id >= u_count) { o_force = vec2(0.0); return; }
 
   uint start = texelFetch(u_offsets, offCoord(id),     0).r;
   uint end   = texelFetch(u_offsets, offCoord(id + 1), 0).r;
   vec2 f = vec2(0.0);
 
 #ifdef HUB_CHUNKS
-  // A sum, not "end - start > C": past the last node the offsets texture holds padding (0), so the
-  // difference wraps to ~2^32 there and sends the texel into a 16M-iteration partial loop. The discard
-  // above does not end the invocation on every driver (ANGLE on Metal ran that loop: 280 ms a draw
-  // instead of 0.7 ms), so every loop bound must stay finite on padded texels too.
+  // A sum, not "end - start > C", so a bound can never wrap on uints. Past the last node the offsets
+  // texture holds padding (0): when padded texels only discarded, "end - start" wrapped to ~2^32 there
+  // and ANGLE on Metal, which kept executing the discarded texel, ran a 16M-iteration partial loop (280 ms
+  // a draw instead of 0.7 ms). Padded texels now return above; the sum keeps the bound safe regardless.
   if (end > start + SPRING_CHUNK) {
     // Hub row: lower bound of its first chunk by entry start, then its consecutive partials.
     int lo = 0;
@@ -204,22 +212,26 @@ export interface HubChunkTextures {
   width: number;
 }
 
-/** A full-screen triangle Model; `blend` selects the force passes' additive (ONE, ONE) blend. */
+/**
+ * A full-screen triangle Model and its clip-space vertex buffer; `blend` selects the force passes'
+ * additive (ONE, ONE) blend. The caller destroys both: luma's `Model.destroy()` leaves user-supplied
+ * attribute buffers alone.
+ */
 function fullScreenModel(
   device: Device,
   fs: string,
   uniforms: Record<string, number>,
   blend: boolean,
-): Model {
-  const clipBuf = device.createBuffer({
+): { model: Model; clip: Buffer } {
+  const clip = device.createBuffer({
     data: new Float32Array([-1, -1, 3, -1, -1, 3]),
   });
-  return new Model(device, {
+  const model = new Model(device, {
     vs: VS,
     fs,
     topology: "triangle-list",
     vertexCount: 3,
-    attributes: { a_clip: clipBuf },
+    attributes: { a_clip: clip },
     bufferLayout: [{ name: "a_clip", format: "float32x2" }],
     uniforms,
     parameters: blend
@@ -237,6 +249,7 @@ function fullScreenModel(
       }
       : {},
   });
+  return { model, clip };
 }
 
 /**
@@ -252,6 +265,7 @@ function fullScreenModel(
  */
 export class AttractionPass {
   private readonly model: Model;
+  private readonly clip: Buffer;
   private readonly uniforms: Record<string, number>;
   private readonly variant: SpringVariant;
 
@@ -265,7 +279,9 @@ export class AttractionPass {
       u_attraction: 0,
       ...(variant.hubs ? { u_chunk_count: 0, u_chunk_width: 1 } : {}),
     };
-    this.model = fullScreenModel(device, header(variant) + ROW_FS, this.uniforms, true);
+    const { model, clip } = fullScreenModel(device, header(variant) + ROW_FS, this.uniforms, true);
+    this.model = model;
+    this.clip = clip;
   }
 
   /**
@@ -304,6 +320,7 @@ export class AttractionPass {
 
   destroy(): void {
     this.model.destroy();
+    this.clip.destroy();
   }
 }
 
@@ -322,18 +339,21 @@ export interface HubChunkUniforms {
  */
 export class HubChunkPass {
   private readonly model: Model;
+  private readonly clip: Buffer;
   private readonly uniforms: Record<string, number>;
   private readonly weighted: boolean;
 
   constructor(device: Device, variant: Pick<SpringVariant, "weighted">) {
     this.weighted = variant.weighted;
     this.uniforms = { u_width: 1, u_nbr_width: 1, u_chunk_count: 0, u_chunk_width: 1 };
-    this.model = fullScreenModel(
+    const { model, clip } = fullScreenModel(
       device,
       header({ hubs: true, weighted: variant.weighted }) + CHUNK_FS,
       this.uniforms,
       false,
     );
+    this.model = model;
+    this.clip = clip;
   }
 
   /** Draw the chunk sums into an already-open render pass on the partials framebuffer. */
@@ -354,5 +374,6 @@ export class HubChunkPass {
 
   destroy(): void {
     this.model.destroy();
+    this.clip.destroy();
   }
 }

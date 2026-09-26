@@ -230,4 +230,24 @@ describe("GPU springs vs a float64 reference (#350, T4)", () => {
     }
     spy.mockRestore();
   });
+
+  it("destroy() releases every buffer, texture and framebuffer it created, with or without hubs", () => {
+    // luma's Model.destroy() leaves user-supplied attribute buffers alone, so each pass must destroy its
+    // own full-screen clip buffer — the multilevel seed builds one GpuSprings per level.
+    for (const graph of [makeStar(SPRING_CHUNK, 3), makeStar(SPRING_CHUNK + 1, 3)]) {
+      const buffers = vi.spyOn(device, "createBuffer");
+      const textures = vi.spyOn(device, "createTexture");
+      const framebuffers = vi.spyOn(device, "createFramebuffer");
+      const springs = new GpuSprings(device, graph);
+      const created = [buffers, textures, framebuffers].flatMap((spy) =>
+        spy.mock.results.flatMap((r) => (r.type === "return" ? [r.value] : [])),
+      );
+      buffers.mockRestore();
+      textures.mockRestore();
+      framebuffers.mockRestore();
+      expect(created.length).toBeGreaterThan(0);
+      springs.destroy();
+      expect(created.filter((resource) => !resource.destroyed).map((resource) => resource.id)).toEqual([]);
+    }
+  });
 });
