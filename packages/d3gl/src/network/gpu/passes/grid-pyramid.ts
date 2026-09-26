@@ -1,5 +1,7 @@
-import type { Device, Texture, Framebuffer, RenderPass } from "@luma.gl/core";
+import type { Device, Texture, Framebuffer } from "@luma.gl/core";
 import { Model } from "@luma.gl/engine";
+import { SLOT_TEXEL_GLSL } from "../textures.js";
+import { beginPass, fullScreenModel, NO_BLEND } from "./fullscreen.js";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // GPU grid pyramid — a regular quadtree over the layout bounding box.
@@ -66,9 +68,9 @@ precision highp sampler2D;
 uniform highp sampler2D u_pos;
 uniform int u_width;
 flat out vec4 v_box;
+${SLOT_TEXEL_GLSL}
 void main() {
-  int id = gl_VertexID;
-  ivec2 c = ivec2(id % u_width, id / u_width);
+  ivec2 c = slotTexel(gl_VertexID, u_width);
   vec2 p = texelFetch(u_pos, c, 0).xy;
   v_box = vec4(p.x, p.y, -p.x, -p.y);
   gl_Position = vec4(0.0, 0.0, 0.0, 1.0);
@@ -115,9 +117,9 @@ uniform int   u_grid;            // G (finest grid side)
 uniform float u_pad;             // box padding factor (e.g. 1.01)
 flat out vec2 v_pos;
 flat out float v_r2;
+${SLOT_TEXEL_GLSL}
 void main() {
-  int id = gl_VertexID;
-  ivec2 c = ivec2(id % u_width, id / u_width);
+  ivec2 c = slotTexel(gl_VertexID, u_width);
   vec2 p = texelFetch(u_pos, c, 0).xy;
 
   vec4 b = texelFetch(u_box, ivec2(0, 0), 0);
@@ -166,12 +168,6 @@ void main() {
 //   out(x,y) = Σ in(2x+{0,1}, 2y+{0,1})
 // texelFetch on the finer level; out-of-range fetches never happen because the
 // input is always exactly 2S×2S (G is a power of two).
-const REDUCE_VS = /* glsl */ `\
-#version 300 es
-in vec2 a_clip;
-void main() { gl_Position = vec4(a_clip, 0.0, 1.0); }
-`;
-
 const REDUCE_FS = /* glsl */ `\
 #version 300 es
 precision highp float;
@@ -321,19 +317,8 @@ export class GridPyramid {
       },
     });
 
-    const clipBuf = device.createBuffer({
-      data: new Float32Array([-1, -1, 3, -1, -1, 3]),
-    });
-    this.reduceModel = new Model(device, {
-      vs: REDUCE_VS,
-      fs: REDUCE_FS,
-      topology: "triangle-list",
-      vertexCount: 3,
-      attributes: { a_clip: clipBuf },
-      bufferLayout: [{ name: "a_clip", format: "float32x2" }],
-      // No blend: each reduce output texel is written exactly once.
-      parameters: { blend: false },
-    });
+    // No blend: each reduce output texel is written exactly once.
+    this.reduceModel = fullScreenModel(device, REDUCE_FS, {}, NO_BLEND);
   }
 
   /** Texture for pyramid level `ℓ` (0 = finest G×G, levelCount-1 = 1×1 root). */
@@ -364,9 +349,9 @@ export class GridPyramid {
     // (maxX, maxY, -minX, -minY) all start at -LARGE; MAX with any real node
     // overrides them. LARGE must exceed any plausible world coordinate.
     const LARGE = 1e30;
-    const boxPass = this.device.beginRenderPass({
+    const boxPass = beginPass(this.device, {
       framebuffer: this.boxFbo,
-      clearColor: [-LARGE, -LARGE, -LARGE, -LARGE],
+      clear: [-LARGE, -LARGE, -LARGE, -LARGE],
     });
     this.bboxUniforms["u_width"] = width;
     this.bboxModel.setBindings({ u_pos: posTex });
@@ -377,10 +362,7 @@ export class GridPyramid {
 
     // ── 2. Scatter to finest grid (ADD blend into G×G) ────────────────────
     const finest = this.levels[0]!;
-    const scatterPass = this.device.beginRenderPass({
-      framebuffer: finest.fbo,
-      clearColor: [0, 0, 0, 0],
-    });
+    const scatterPass = beginPass(this.device, { framebuffer: finest.fbo, clear: [0, 0, 0, 0] });
     this.scatterUniforms["u_width"] = width;
     // u_grid / u_pad are constant (set in constructor).
     this.scatterModel.setBindings({ u_pos: posTex, u_box: this.boxTex });
@@ -395,10 +377,7 @@ export class GridPyramid {
     for (let lvl = 0; lvl < this.levelCount - 1; lvl++) {
       const src = this.levels[lvl]!;
       const dst = this.levels[lvl + 1]!;
-      const reducePass = this.device.beginRenderPass({
-        framebuffer: dst.fbo,
-        clearColor: false,
-      });
+      const reducePass = beginPass(this.device, { framebuffer: dst.fbo, clear: false });
       this.reduceModel.setBindings({ u_src: src.tex });
       this.reduceModel.draw(reducePass);
       reducePass.end();

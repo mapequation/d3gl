@@ -9,6 +9,7 @@ import { RepulsionAllPairsPass } from "./passes/repulsion-allpairs.js";
 import { RepulsionPyramidPass } from "./passes/repulsion-pyramid.js";
 import { GridPyramid } from "./passes/grid-pyramid.js";
 import { CentroidReducePass, CenteringPass, makeSumTarget } from "./passes/centering.js";
+import { beginPass } from "./passes/fullscreen.js";
 
 // DAMPING is imported from force.ts so both integrators share one constant.
 
@@ -95,7 +96,7 @@ export class GpuForceLayout {
   private readonly forceTex: Texture;
   /**
    * Pre-created FBO wrapping `forceTex` — used only for the clear-at-tick-start
-   * step (beginRenderPass with clearColor:[0,0,0,0]).  Force passes render into
+   * step (a pass opened with clear [0,0,0,0]).  Force passes render into
    * it with additive blend.  Pre-created in the constructor per the no-per-tick-
    * alloc rule.
    */
@@ -344,10 +345,7 @@ export class GpuForceLayout {
     // Σpos; dividing by nodeCount in CenteringPass gives the centroid.  This is a
     // separate render pass (different FBO size) that must complete before the
     // force pass below reads sumTex.
-    const sumPass = this.device.beginRenderPass({
-      framebuffer: this.sumFbo,
-      clearColor: [0, 0, 0, 0],
-    });
+    const sumPass = beginPass(this.device, { framebuffer: this.sumFbo, clear: [0, 0, 0, 0] });
     this.centroidReducePass.run(sumPass, this.pos.readTex, {
       count: this.count,
       width: this.width,
@@ -371,10 +369,7 @@ export class GpuForceLayout {
     // ── 2. Clear force texture to zero ────────────────────────────────────────
     // Open a render pass on the force FBO with clearColor:[0,0,0,0] — this zeros
     // all texels so each force pass starts from a known blank slate.
-    const forcePass = this.device.beginRenderPass({
-      framebuffer: this.forceFbo,
-      clearColor: [0, 0, 0, 0],
-    });
+    const forcePass = beginPass(this.device, { framebuffer: this.forceFbo, clear: [0, 0, 0, 0] });
 
     // ── 3. Force passes (additive blend, write into forceTex) ─────────────────
     // Order among force passes doesn't matter — additive blend accumulates them.
@@ -427,12 +422,9 @@ export class GpuForceLayout {
     // write textures — no per-tick createFramebuffer.
     const fbo = this.fbos[this.parity]!;
 
-    const renderPass = this.device.beginRenderPass({
-      framebuffer: fbo,
-      // Don't clear — every texel is written by the shader (padded texels get
-      // vec2(0) from the `id >= u_count` branch).
-      clearColor: false,
-    });
+    // Don't clear — every texel is written by the shader (padded texels get
+    // vec2(0) from the `id >= u_count` branch).
+    const renderPass = beginPass(this.device, { framebuffer: fbo, clear: false });
 
     this.integratePass.run(renderPass, this.pos.readTex, this.vel.readTex, this.forceTex, this.pinnedTex, this.stabTex, {
       count: this.count,
@@ -515,7 +507,7 @@ export class GpuForceLayout {
   seedFromProlongation(run: (pass: RenderPass) => void): void {
     // readFbos[0] wraps the current read-side position texture (A, parity 0 at construction), so
     // writing it here seeds exactly what the next tick reads.
-    const pass = this.device.beginRenderPass({ framebuffer: this.readFbos[0]!, clearColor: false });
+    const pass = beginPass(this.device, { framebuffer: this.readFbos[0]!, clear: false });
     run(pass);
     pass.end();
     this.device.submit();

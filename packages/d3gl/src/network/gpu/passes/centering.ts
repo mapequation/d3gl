@@ -1,5 +1,7 @@
 import type { Device, Texture, Framebuffer, RenderPass } from "@luma.gl/core";
 import { Model } from "@luma.gl/engine";
+import { SLOT_TEXEL_GLSL } from "../textures.js";
+import { ADDITIVE_BLEND, fullScreenModel, type PassUniforms } from "./fullscreen.js";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // CentroidReducePass
@@ -124,12 +126,6 @@ export class CentroidReducePass {
 // into the force texture with additive blend (accumulates alongside
 // repulsion + attraction). Padded texels are discarded.
 
-const CENTER_VS = /* glsl */ `\
-#version 300 es
-in vec2 a_clip;
-void main() { gl_Position = vec4(a_clip, 0.0, 1.0); }
-`;
-
 // NOTE: `centroid` is a GLSL ES 3.00 reserved keyword — do not use as a variable
 // name. Use `cx` (centroid x/y pair) or another non-keyword identifier.
 const CENTER_FS = /* glsl */ `\
@@ -142,10 +138,10 @@ uniform int   u_count;
 uniform int   u_width;
 uniform float u_centering;
 layout(location = 0) out vec2 o_force;
-
+${SLOT_TEXEL_GLSL}
 void main() {
   ivec2 c = ivec2(gl_FragCoord.xy);
-  int id = c.y * u_width + c.x;
+  int id = texelSlot(c, u_width);
   if (id >= u_count) { discard; }
 
   vec2 pos_i = texelFetch(u_pos, c, 0).xy;
@@ -182,38 +178,17 @@ export interface CenteringUniforms {
  */
 export class CenteringPass {
   private readonly model: Model;
-  private readonly uniforms: Record<string, number>;
+  private readonly uniforms: PassUniforms;
 
   constructor(device: Device) {
-    const clipBuf = device.createBuffer({
-      data: new Float32Array([-1, -1, 3, -1, -1, 3]),
-    });
-
     this.uniforms = {
       u_count: 0,
       u_width: 1,
       u_centering: 0,
     };
 
-    this.model = new Model(device, {
-      vs: CENTER_VS,
-      fs: CENTER_FS,
-      topology: "triangle-list",
-      vertexCount: 3,
-      attributes: { a_clip: clipBuf },
-      bufferLayout: [{ name: "a_clip", format: "float32x2" }],
-      uniforms: this.uniforms,
-      parameters: {
-        // Additive blend: accumulate alongside repulsion + attraction.
-        blend: true,
-        blendColorSrcFactor: "one",
-        blendColorDstFactor: "one",
-        blendAlphaSrcFactor: "one",
-        blendAlphaDstFactor: "one",
-        blendColorOperation: "add",
-        blendAlphaOperation: "add",
-      },
-    });
+    // Additive blend: accumulate alongside repulsion + attraction.
+    this.model = fullScreenModel(device, CENTER_FS, this.uniforms, ADDITIVE_BLEND);
   }
 
   /** Draw centering forces into an already-open force-accumulation render pass. */
