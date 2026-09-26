@@ -12,6 +12,7 @@ import {
   SEGMENT_HAS_TILE,
   TILE_MAX_SIDE,
   TILE_MIN_SIDE,
+  assertAtlasFits,
   assertSegmentLocalEdges,
   canonicalCover,
   coverDepth,
@@ -301,6 +302,20 @@ describe("tile packing — pow2 tiles in descending size along a Morton curve (s
     const full = packTiles(segmentsOf([200, 3000, 1500]), 32, TILE_MIN_SIDE);
     expect(full.tiles).toEqual([{ x: 0, y: 64, side: 16 }, { x: 0, y: 0, side: 64 }, { x: 64, y: 0, side: 64 }]);
     expect([full.width, full.height]).toEqual([128, 128]);
+  });
+
+  it("assertAtlasFits rejects an atlas beyond the device's texture limit or the 16-bit tile origin", () => {
+    // Five 1024-tiles: Σ side² = 5 · 2²⁰, so A = 4096 and the tiles fit the bottom half (H = 2048).
+    const big = packTiles(segmentsOf([300_000, 300_000, 300_000, 300_000, 300_000]), 32, TILE_MIN_SIDE);
+    expect([big.width, big.height]).toEqual([4096, 2048]);
+    expect(() => assertAtlasFits(big, 4096)).not.toThrow();
+    expect(() => assertAtlasFits(big, 2048)).toThrow(/4096 × 2048 .*2048/);
+    // The flat atlas (≤ 1024) always fits WebGL2's guaranteed 2048; an all-exact layout has no atlas.
+    expect(() => assertAtlasFits(packTiles(flatSegments(1_000_000), 4096, FLAT_TILE_MIN_SIDE), 2048)).not.toThrow();
+    expect(() => assertAtlasFits(packTiles(flatSegments(100), 4096, FLAT_TILE_MIN_SIDE), 2048)).not.toThrow();
+    // segInfo packs a tile origin as x | y << 16: no device limit may admit a side past 65536.
+    expect(() => assertAtlasFits({ width: 65536, height: 65536 }, 1 << 20)).not.toThrow();
+    expect(() => assertAtlasFits({ width: 131072, height: 65536 }, 1 << 20)).toThrow(/65536/);
   });
 });
 

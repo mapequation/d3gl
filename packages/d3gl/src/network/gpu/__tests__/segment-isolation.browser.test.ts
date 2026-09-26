@@ -8,7 +8,7 @@
  * the float32 reference computes for that segment alone (`segmentedReference`), within the §9
  * statistic — which pins the tile origins, the per-tile roots, the per-segment box and centroid.
  */
-import { beforeAll, describe, expect, it } from "vitest";
+import { beforeAll, describe, expect, it, vi } from "vitest";
 import type { Device } from "@luma.gl/core";
 import { makeTestDevice } from "./_device.js";
 import { GpuForceLayout } from "../gpu-force-layout.js";
@@ -88,14 +88,15 @@ describe("segment isolation (T2)", () => {
   let device: Device;
   beforeAll(async () => { device = await makeTestDevice(); });
 
-  // exactMax 32: A and C get tiles (64 and 32 wide, the 32-tile at a nonzero origin), B takes the exact loop.
-  const segments = segmentsOf([600, 24, 400]);
+  // exactMax 32: A and C get tiles of different sides (64, and 32 at the nonzero origin (64, 0)), B takes
+  // the exact loop.
+  const segments = segmentsOf([1100, 24, 400]);
   const exactMax = 32;
   const graph = segmentedGraph(segments, [1200, 300, 800], 2, 0x150);
 
   it("the fixture exercises both paths", () => {
     const atlas = packTiles(segments, exactMax, TILE_MIN_SIDE);
-    expect(atlas.tiles.map((t) => t && [t.x, t.y, t.side])).toEqual([[0, 0, 32], null, [32, 0, 32]]);
+    expect(atlas.tiles.map((t) => t && [t.x, t.y, t.side])).toEqual([[0, 0, 64], null, [64, 0, 32]]);
   });
 
   it("moving one segment's positions leaves every other segment's force texels bitwise unchanged", () => {
@@ -120,11 +121,24 @@ describe("segment isolation (T2)", () => {
     });
   });
 
-  it("a spring across two segments is rejected at construction", () => {
+  it("a spring across two segments is rejected at construction, before any GPU allocation", () => {
     const g = buildGraph({ nodeCount: 6, source: [0, 2], target: [1, 3] });
-    expect(
-      () => new GpuForceLayout(device, g, { ...DEFAULT_FORCE }, { segments: segmentsOf([3, 3]) }),
-    ).toThrow(/edge 1 joins slot 2 \(segment 0\) and slot 3 \(segment 1\)/);
+    // A throw after an allocation would leak it: the half-built layout is never returned to destroy().
+    const texSpy = vi.spyOn(device, "createTexture");
+    const fboSpy = vi.spyOn(device, "createFramebuffer");
+    const bufSpy = vi.spyOn(device, "createBuffer");
+    try {
+      expect(
+        () => new GpuForceLayout(device, g, { ...DEFAULT_FORCE }, { segments: segmentsOf([3, 3]) }),
+      ).toThrow(/edge 1 joins slot 2 \(segment 0\) and slot 3 \(segment 1\)/);
+      expect(texSpy).toHaveBeenCalledTimes(0);
+      expect(fboSpy).toHaveBeenCalledTimes(0);
+      expect(bufSpy).toHaveBeenCalledTimes(0);
+    } finally {
+      texSpy.mockRestore();
+      fboSpy.mockRestore();
+      bufSpy.mockRestore();
+    }
   });
 
   it("softening is per segment: world 1e-2 on both paths; unit 1e-9 on the exact loop and 1e-8 on a tile", () => {
