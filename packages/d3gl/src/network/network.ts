@@ -1597,11 +1597,12 @@ export class Network extends BaseEngine {
   }
 
   /**
-   * The flat streaming layout's resolved transport (spec §12.2): `"worker"` for `backend: "worker"` and
-   * for a `"gpu"` layout whose device resolved to the worker fallback, `"gpu"` once the GPU solve runs,
-   * `"pending"` while a GPU device is unsettled, `null` otherwise (no streaming layout, or a nested one,
-   * which streams positions only). The LOD guards key on it rather than on the literal backend: a
-   * worker streams the coarsening tree, so the main thread builds none.
+   * The streaming layout's resolved transport (spec §12.2): `"worker"` for any `backend: "worker"`
+   * layout (nested ones included) and for a `"gpu"` layout whose device resolved to the worker fallback,
+   * `"gpu"` once the GPU solve runs, `"pending"` while a GPU device is unsettled, and `null` for the other
+   * backends or a `"gpu"` layout whose handle reports no transport (none started, or a nested run). The
+   * LOD guards key on it rather than on the literal backend: a worker streams the coarsening tree, so the
+   * main thread builds none.
    */
   private streamingTransport(): "worker" | "gpu" | "pending" | null {
     const backend = this.layoutOpts.backend;
