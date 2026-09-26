@@ -22,7 +22,10 @@ import { StableColumns } from "../../core/stable-columns.js";
  *   2. **Declutter with mixed radii** — one grid cell of 2·maxR (52 px with the 26 px aggregate cap)
  *      made every rejected 2-3 px leaf test the whole packed neighbourhood. Radius-class grids keep
  *      probes per glyph O(1). Signature: `scratch.probes` per frontier glyph, plus element identity
- *      with the single-grid reference.
+ *      with the single-grid reference. The opposite shape — glyphs at the cap with a tiny glyph kept
+ *      first, so a fine class is non-empty for every large candidate — must not cost more than the
+ *      single grid either (it took ~1,000 empty fine cells per glyph before the single-grid fallback):
+ *      `scratch.cells` per glyph, probes against the single grid's, identity.
  *
  *   3. **Continuous weights** (Infomap flows): a frame can draw more distinct accumulated weights than
  *      the memo holds. It then resolves them again, as with no memo — the lookup must not cost much
@@ -39,7 +42,7 @@ import { StableColumns } from "../../core/stable-columns.js";
  *     edges (`linkLinesStyleAttrs`, #179 then reuses them every position frame): the same memo makes
  *     that O(distinct weights) accessor calls instead of O(edges).
  *
- * Always-on at 100k; the at-scale numbers come from the env-gated leg:
+ * Always-on at 100k-200k; the at-scale numbers come from the env-gated leg:
  *   BENCH_LOD_FRAME_WASTE=1 BENCH_LOD_FRAME_WASTE_N=1000000 npx vitest run packages/d3gl/src/network/__tests__/lod-frame-waste-perf.test.ts
  * Each bench run appends a labelled line to /tmp/lod-frame-waste-perf.txt (BENCH_LOD_FRAME_WASTE_LABEL).
  */
@@ -64,6 +67,9 @@ const STABLE_COMPARE_MS_PER_M = Number(process.env.PERF_LOD_FRAME_WASTE_STABLE_M
 /** Probes per glyph the radius-class grid may spend (measured 3.2 on the dense fixture; the single
  *  grid spends 52 there). Deterministic — never scaled. */
 const MAX_PROBES_PER_GLYPH = 8;
+/** Grid cells per glyph on the cap-dominated screen (measured 3.7; the single grid scans ≤ 9; the
+ *  radius classes alone scanned 288 at 200k and ~1,100 at 1M). Deterministic — never scaled. */
+const MAX_CELLS_PER_GLYPH = 16;
 const W = 1280;
 const H = 800;
 
@@ -102,7 +108,7 @@ function lodFixture(n: number): { graph: NetworkGraph; tree: LODTree; centroid: 
   computeLODGeometry(tree, graph, radii);
   let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
   for (let i = 0; i < n; i++) {
-    const x = graph.positions[i * 2]!, y = graph.positions[i * 2 + 1]!;
+    const x = graph.positions[i * 2] ?? 0, y = graph.positions[i * 2 + 1] ?? 0;
     if (x < minX) minX = x;
     if (x > maxX) maxX = x;
     if (y < minY) minY = y;
@@ -126,6 +132,17 @@ function mixedScreen(n: number): { sx: Float64Array; sy: Float64Array; radii: Fl
   }
   const order = Uint32Array.from({ length: n }, (_, i) => i).sort((a, b) => (radii[b] ?? 0) - (radii[a] ?? 0));
   return { sx, sy, radii, order };
+}
+
+/** Glyphs at the 26 px aggregate cap with one 0.1 px glyph visited first (a heavy leaf ahead of the
+ *  aggregates), index order: a fine radius class is non-empty for every large candidate. */
+function capDominatedScreen(n: number): { sx: Float64Array; sy: Float64Array; radii: Float64Array; order: Uint32Array } {
+  let s = 5 >>> 0;
+  const rng = (): number => ((s = (s * 1664525 + 1013904223) >>> 0) / 4294967296);
+  const sx = Float64Array.from({ length: n }, () => rng() * W);
+  const sy = Float64Array.from({ length: n }, () => rng() * H);
+  const radii = Float64Array.from({ length: n }, (_, i) => (i === 0 ? 0.1 : 26));
+  return { sx, sy, radii, order: Uint32Array.from({ length: n }, (_, i) => i) };
 }
 
 /** The pre-change single-grid kept set (cell = 2·spacing·maxR, 3×3 scan) — the identity reference. */
@@ -180,6 +197,39 @@ function firstMismatch(a: ArrayLike<number>, b: ArrayLike<number>): number {
   for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return i;
   return -1;
 }
+
+/** One unchanged emit of the LOD lane's style columns through `StableColumns` at `S` drawn super-edges:
+ *  identity asserted every frame; returns the median compare time. */
+function stableCompare(S: number): number {
+  const cols = new StableColumns();
+  // The LOD emit's half-arrow + highlight column set: radii (2/edge), widths, bends, groups, groups2
+  // (Float32) and colours (4/edge), selected (Uint8); plus the node lane's groups for ≈S glyphs.
+  const f32 = { "half-arrows.radii": 2 * S, "half-arrows.widths": S, "half-arrows.bends": S, "links.groups": S, "links.groups2": S, "nodes.groups": S };
+  const u8 = { "half-arrows.colors": 4 * S, "links.selected": S };
+  const freshF32 = (n: number): Float32Array => Float32Array.from({ length: n }, (_, i) => (i % 977) * 0.25);
+  const freshU8 = (n: number): Uint8Array => Uint8Array.from({ length: n }, (_, i) => i % 251);
+  const first = new Map<string, Float32Array | Uint8Array>();
+  for (const [k, n] of Object.entries(f32)) first.set(k, cols.float32(k, freshF32(n)));
+  for (const [k, n] of Object.entries(u8)) first.set(k, cols.uint8(k, freshU8(n)));
+  const ts: number[] = [];
+  for (let frame = 0; frame < 5; frame++) {
+    const nextF32 = Object.entries(f32).map(([k, n]) => [k, freshF32(n)] as const);
+    const nextU8 = Object.entries(u8).map(([k, n]) => [k, freshU8(n)] as const);
+    const t0 = performance.now();
+    for (const [k, a] of nextF32) expect(cols.float32(k, a), k).toBe(first.get(k));
+    for (const [k, a] of nextU8) expect(cols.uint8(k, a), k).toBe(first.get(k));
+    ts.push(performance.now() - t0);
+  }
+  // A changed column is taken as-is (and becomes the new reference).
+  const moved = freshF32(S);
+  moved[S - 1] = -1;
+  expect(cols.float32("half-arrows.widths", moved)).toBe(moved);
+  return median(ts);
+}
+
+/** The compare's ceiling at `S` super-edges, split into a 1 ms constant and a linear term (AGENTS.md)
+ *  that add up to exactly the calibrated `STABLE_COMPARE_MS_PER_M` at 1M. */
+const stableCeiling = (S: number): number => 1 + (STABLE_COMPARE_MS_PER_M - 1) * (S / 1_000_000);
 
 function median(ts: number[]): number {
   const s = [...ts].sort((a, b) => a - b);
@@ -274,6 +324,19 @@ describe("streamed LOD frame waste — colour resolution + mixed-radius declutte
     expect((scratch.probes ?? 0) / n).toBeLessThan(MAX_PROBES_PER_GLYPH);
   }, 120_000);
 
+  it("reductions ON, glyphs at the cap with a tiny one kept first: no more work than the single grid", () => {
+    const n = 200_000;
+    const { sx, sy, radii, order } = capDominatedScreen(n);
+    const scratch = declutterScratch();
+    const out = new Uint8Array(n);
+    declutterScreen(n, sx, sy, radii, order, W, H, 1, out, scratch);
+    const ref = singleGridKept(n, sx, sy, radii, order);
+    expect(firstMismatch(out, ref.kept)).toBe(-1);
+    const cells = (scratch.cells ?? 0) / n;
+    expect(cells, `${cells.toFixed(1)} grid cells per glyph`).toBeLessThan(MAX_CELLS_PER_GLYPH);
+    expect(scratch.probes ?? 0, `${scratch.probes} probes vs ${ref.probes} for the single grid`).toBeLessThanOrEqual(ref.probes * 1.25 + n);
+  }, 120_000);
+
   it("reductions OFF: the full-detail colour pass runs the accessor once per distinct weight, not per edge", () => {
     const graph = weightedClusteredGraph(100_000); // 200k edges, weights 1-4
     let calls = 0;
@@ -308,44 +371,22 @@ describe("streamed LOD frame waste — colour resolution + mixed-radius declutte
       }
       return performance.now() - t0;
     };
-    const memoMs: number[] = [];
-    const baseMs: number[] = [];
+    let memoMs = Infinity;
+    let baseMs = Infinity;
     for (let rep = 0; rep < 9; rep++) {
-      memoMs.push(pass(colorOf)); // the same flows every frame, as a held or streamed view redraws them
+      memoMs = Math.min(memoMs, pass(colorOf)); // the same flows every frame, as a held or streamed view redraws them
       for (let e = 0; e < S; e += 997) expect(Array.from(out.subarray(e * 4, e * 4 + 4)), `flow ${flows[e]}`).toEqual(parsed(strokeScale(flows[e] ?? 0)));
-      baseMs.push(pass(unmemoised));
+      baseMs = Math.min(baseMs, pass(unmemoised));
     }
-    const ratio = median(memoMs) / median(baseMs);
-    if (ASSERT) expect(ratio, `memo ${median(memoMs).toFixed(1)}ms vs no memo ${median(baseMs).toFixed(1)}ms`).toBeLessThan(MEMO_OVERHEAD);
+    // Interleaved min-of-9: each side's least-disturbed run, so a load spike on one pass cannot decide it.
+    const ratio = memoMs / baseMs;
+    if (ASSERT) expect(ratio, `memo ${memoMs.toFixed(1)}ms vs no memo ${baseMs.toFixed(1)}ms`).toBeLessThan(MEMO_OVERHEAD);
   }, 120_000);
 
-  it("style-column compare at ≈1M super-edges: an unchanged emit hands back last frame's arrays", () => {
-    const S = 1_000_000; // drawn super-edges (the visible set with LOD on can be this large)
-    const cols = new StableColumns();
-    // The LOD emit's half-arrow + highlight column set: radii (2/edge), widths, bends, groups, groups2
-    // (Float32) and colours (4/edge), selected (Uint8); plus the node lane's groups for ≈S glyphs.
-    const f32 = { "half-arrows.radii": 2 * S, "half-arrows.widths": S, "half-arrows.bends": S, "links.groups": S, "links.groups2": S, "nodes.groups": S };
-    const u8 = { "half-arrows.colors": 4 * S, "links.selected": S };
-    const freshF32 = (n: number): Float32Array => Float32Array.from({ length: n }, (_, i) => (i % 977) * 0.25);
-    const freshU8 = (n: number): Uint8Array => Uint8Array.from({ length: n }, (_, i) => i % 251);
-    const first = new Map<string, Float32Array | Uint8Array>();
-    for (const [k, n] of Object.entries(f32)) first.set(k, cols.float32(k, freshF32(n)));
-    for (const [k, n] of Object.entries(u8)) first.set(k, cols.uint8(k, freshU8(n)));
-    const ts: number[] = [];
-    for (let frame = 0; frame < 5; frame++) {
-      const nextF32 = Object.entries(f32).map(([k, n]) => [k, freshF32(n)] as const);
-      const nextU8 = Object.entries(u8).map(([k, n]) => [k, freshU8(n)] as const);
-      const t0 = performance.now();
-      for (const [k, a] of nextF32) expect(cols.float32(k, a), k).toBe(first.get(k));
-      for (const [k, a] of nextU8) expect(cols.uint8(k, a), k).toBe(first.get(k));
-      ts.push(performance.now() - t0);
-    }
-    // A changed column is taken as-is (and becomes the new reference).
-    const moved = freshF32(S);
-    moved[S - 1] = -1;
-    expect(cols.float32("half-arrows.widths", moved)).toBe(moved);
-    const ms = median(ts);
-    if (ASSERT) expect(ms, `unchanged compare ${ms.toFixed(1)}ms at ${S.toLocaleString()} super-edges`).toBeLessThan(STABLE_COMPARE_MS_PER_M * (S / 1_000_000));
+  it("style-column compare: an unchanged emit hands back last frame's arrays", () => {
+    const S = 100_000; // drawn super-edges; the env-gated leg runs this at BENCH_LOD_FRAME_WASTE_N (≈1M)
+    const ms = stableCompare(S);
+    if (ASSERT) expect(ms, `unchanged compare ${ms.toFixed(1)}ms at ${S.toLocaleString()} super-edges`).toBeLessThan(stableCeiling(S));
   }, 120_000);
 
   (BENCH ? it : it.skip)(`bench: both legs at ${BENCH_N.toLocaleString()}`, () => {
@@ -362,6 +403,22 @@ describe("streamed LOD frame waste — colour resolution + mixed-radius declutte
     const declutterMs = median(ts);
     const probesPerGlyph = (scratch.probes ?? 0) / BENCH_N;
     expect(probesPerGlyph).toBeLessThan(MAX_PROBES_PER_GLYPH);
+
+    // The cap-dominated screen at N (one tiny glyph kept first): the single grid's cost, not the fine
+    // class's empty cells (the radius classes alone took 2.9 s here at 1M; the single grid 52 ms).
+    const cap = capDominatedScreen(BENCH_N);
+    const capTs: number[] = [];
+    for (let rep = 0; rep < 3; rep++) {
+      const t0 = performance.now();
+      declutterScreen(BENCH_N, cap.sx, cap.sy, cap.radii, cap.order, W, H, 1, out, scratch);
+      capTs.push(performance.now() - t0);
+    }
+    const capMs = median(capTs);
+    const capCells = (scratch.cells ?? 0) / BENCH_N;
+    expect(capCells).toBeLessThan(MAX_CELLS_PER_GLYPH);
+
+    // StableColumns: an unchanged emit at N drawn super-edges.
+    const stableMs = stableCompare(BENCH_N);
 
     // The pipeline sweep on a BENCH_N-leaf tree, all-leaves frame included.
     const { graph, tree, centroid, baseK } = lodFixture(BENCH_N);
@@ -384,6 +441,7 @@ describe("streamed LOD frame waste — colour resolution + mixed-radius declutte
 
     const line =
       `N=${BENCH_N.toLocaleString()}  declutter(N-glyph screen) median=${declutterMs.toFixed(1)}ms probes/glyph=${probesPerGlyph.toFixed(2)}  ` +
+      `capDominated median=${capMs.toFixed(1)}ms cells/glyph=${capCells.toFixed(1)}  stableCompare median=${stableMs.toFixed(1)}ms  ` +
       `sweep median=${r.medianMs.toFixed(2)}ms maxFrontier=${r.maxFrontier.toLocaleString()} sweepProbes/glyph=${r.probesPerGlyph.toFixed(2)} ` +
       `colourCalls=${r.callsAfterFirst}/${r.drawnAfterFirst} drawn  fullDetailColours=${graph.edgeCount.toLocaleString()} edges in ${offMs.toFixed(0)}ms (${calls} accessor calls)\n`;
     console.log(line);
@@ -391,6 +449,8 @@ describe("streamed LOD frame waste — colour resolution + mixed-radius declutte
     if (ASSERT) {
       const declutterCeiling = (DECLUTTER_MS_PER_M * BENCH_N) / 1_000_000;
       expect(declutterMs, `declutter median ${declutterMs.toFixed(1)}ms at N=${BENCH_N} (ceiling ${declutterCeiling.toFixed(0)}ms)`).toBeLessThan(declutterCeiling);
+      expect(capMs, `cap-dominated declutter median ${capMs.toFixed(1)}ms at N=${BENCH_N} (ceiling ${declutterCeiling.toFixed(0)}ms)`).toBeLessThan(declutterCeiling);
+      expect(stableMs, `unchanged compare ${stableMs.toFixed(1)}ms at ${BENCH_N.toLocaleString()} super-edges`).toBeLessThan(stableCeiling(BENCH_N));
       expect(r.medianMs, `sweep frame median ${r.medianMs.toFixed(2)}ms at N=${BENCH_N}`).toBeLessThan(SWEEP_FRAME_MS);
     }
   }, 600_000);
