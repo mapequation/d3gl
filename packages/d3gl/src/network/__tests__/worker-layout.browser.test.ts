@@ -40,6 +40,37 @@ describe("worker layout (off-thread, progressive)", () => {
     expect(spread(g.positions)).toBeGreaterThan(2);
   });
 
+  it("stops once converged — iterations is a maximum, not a fixed count (#124)", async () => {
+    // A million-tick budget would keep the worker busy for minutes; the convergence stop settles it
+    // after a few dozen ticks.
+    const g = ring(200);
+    let frames = 0;
+    const handle = startWorkerLayout(g, { width: 400, height: 400, iterations: 1_000_000 }, () => {
+      frames++;
+    });
+    await handle.settled;
+    expect(frames).toBeGreaterThan(0);
+    expect(spread(g.positions)).toBeGreaterThan(2);
+    handle.stop();
+  }, 20_000);
+
+  it("streams by time: at most about one frame per display frame, not one per tick batch", async () => {
+    // Fast ticks (a few hundred nodes): the old cadence posted every ceil(iterations / 60) ticks — 60
+    // frames in a burst far above display rate. By time, the worker posts at most one frame per 16 ms of
+    // its own time (plus the seed frame and the final `done`), so frames ≤ elapsed / 16 + slack.
+    const g = ring(400);
+    let frames = 0;
+    const t0 = performance.now();
+    const handle = startWorkerLayout(g, { width: 400, height: 400, iterations: 300 }, () => {
+      frames++;
+    });
+    await handle.settled;
+    const elapsed = performance.now() - t0;
+    expect(frames).toBeGreaterThanOrEqual(2); // the seed frame + `done`, at least
+    expect(frames).toBeLessThanOrEqual(elapsed / 16 + 3);
+    handle.stop();
+  }, 20_000);
+
   it("stop() cancels mid-run and resolves settled", async () => {
     const g = ring(60);
     const handle = startWorkerLayout(g, { width: 400, height: 400, iterations: 100000, frameEvery: 1 }, () => {});

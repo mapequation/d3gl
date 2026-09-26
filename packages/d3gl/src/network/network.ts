@@ -1,7 +1,7 @@
 import { BaseEngine, type BaseEngineOptions, type HoverHit, type InteractiveLayerOptions, type LaneInteractive, type NodeDragSession } from "../map/base-engine.js";
 import { networkLayers, networkLayersFromCache, noLodStyleCache, drawsLinks, frontierCircles, frontierHalos, boundaryRings, traceBoundaryRings, superEdges, makeSuperEdgesScratch, emitNodes, emitLinks, emitArrows, emitHalfLinks, traceFrontierGlyphs, traceFrontierHalos, traceSuperHalfArrows, traceSuperLines, traceSuperArrows, physicalPieInstances, tracePieWedges, rgbaCss, pickNodes, regionNodes, resolveNodeRadii, resolveNodeRadiusAggregate, resolveImportance, resolveFlowBorder, resolveNodeColors, resolveLinkWidthOf, resolveLinkColorOf, resolveLinkStrokeOf, flowBorderInnerRadii, type ResolvedNetworkStyle, type ModuleBoundaryResolved, type AggregateOutlineResolved, type NoLodStyleCache, type NodeRadiusSpec, type ImportanceSpec, type FlowBorderSpec, type ConstBorder, type LinkWidthSpec, type LinkColorSpec, type LinkStyle } from "./glyphs.js";
 import { rgb } from "d3-color";
-import { ForceLayout, seedPositions, type ForceParams } from "./force.js";
+import { DRAG_HEAT, ForceLayout, seedPositions, type ForceParams } from "./force.js";
 import { multilevelLayout, type CoarsenOptions } from "./coarsen.js";
 import { buildLODTree, buildSpatialLODTree, computeLODGeometry, computeLODPositions, computeLODStyle, updateLODPositionsForLeaves, cut, makeCutScratch, makeCutBoundaries, declutterFrontier, makeDeclutterFrontierScratch, pickFrontier, regionFrontier, visibleWorldRect, leavesUnder, ancestorAwareSelected, type BoundaryDiscs, type CutBoundaries, type LODTree, type SpatialLODOptions } from "./lod.js";
 import { DEFAULT_LABEL_TEXT, type LabelAnchor, type LabelStyle } from "../labels/label-layer.js";
@@ -254,9 +254,19 @@ export interface NetworkLayoutOptions {
   backend?: "positions" | "force" | "worker" | "gpu";
   /** Interleaved `[x, y, …]` world coordinates for `backend: "positions"`. */
   positions?: Float32Array;
-  /** Iterations for `backend: "force"` (default 300, per level when multilevel). */
+  /**
+   * Tick budget of the force layout (`"force"` / `"worker"` / `"gpu"`, default 300) — a maximum, not a
+   * fixed count (#124): a seeded layout (multilevel, or the GPU's module seed) cools over it, a cold
+   * disc start keeps full heat to untangle, and the CPU backends stop as soon as the layout has
+   * converged (nodes moving a small fraction of the equilibrium spacing per tick), resolving
+   * {@link Network.whenSettled}. The GPU backend runs the whole budget (its early stop needs a GPU
+   * readback it doesn't do yet).
+   */
   iterations?: number;
-  /** Force parameters for `backend: "force"`. */
+  /**
+   * Force parameters for the force backends. The layout settles into a disc of radius
+   * `√(repulsion·N/centering)` — node spacing `√(π·repulsion/centering)` — and is seeded at that scale.
+   */
   force?: Partial<ForceParams>;
   /**
    * For `backend: "force"` and `backend: "worker"`, seed the layout via multilevel coarsening
@@ -1307,7 +1317,7 @@ export class Network extends BaseEngine {
       // so neither gets the seed disc. Only layouts computed in one go transition.
       const duration = nestedTree || opts.backend === "positions" || opts.backend === "force" ? transitionDuration(opts.transition) : 0;
       const warm = !!nestedTree && typeof opts.nested === "object" && opts.nested.warm === true;
-      if (fit && !warm && duration === 0) seedPositions(this.graph, this.width, this.height);
+      if (fit && !warm && duration === 0) seedPositions(this.graph, this.width, this.height, { force: opts.force });
       if (nestedTree) {
         this.startNestedLayout(nestedTree, opts, duration);
       } else if (opts.backend === "positions" && opts.positions) {
@@ -1406,8 +1416,8 @@ export class Network extends BaseEngine {
         const graph = this.graph;
         const from = duration > 0 ? graph.positions.slice() : null; // where a transition eases from
         if (opts.multilevel === false) {
-          seedPositions(graph, this.width, this.height);
-          new ForceLayout(graph, opts.force).run(iterations);
+          seedPositions(graph, this.width, this.height, { force: opts.force });
+          new ForceLayout(graph, opts.force).run(iterations, "hot"); // a cold start untangles at full heat
         } else {
           multilevelLayout(graph, {
             width: this.width,
@@ -1656,7 +1666,7 @@ export class Network extends BaseEngine {
       this.fitFallbackBox = null;
       this.fitNodesArr = null;
       this.fitNodesFor = null;
-      if (fit) seedPositions(phys, this.width, this.height);
+      if (fit) seedPositions(phys, this.width, this.height, { force: opts.force });
       const onPhysFrame = () => this.scheduleLayoutRepaint();
       const workerOpts = {
         width: this.width,
@@ -1693,8 +1703,8 @@ export class Network extends BaseEngine {
     // Main-thread force (backend: "force", the synchronous default).
     const iterations = opts.iterations ?? DEFAULT_FORCE_ITERATIONS;
     if (opts.multilevel === false) {
-      seedPositions(phys, this.width, this.height);
-      new ForceLayout(phys, opts.force).run(iterations);
+      seedPositions(phys, this.width, this.height, { force: opts.force });
+      new ForceLayout(phys, opts.force).run(iterations, "hot"); // a cold start untangles at full heat
     } else {
       multilevelLayout(phys, { width: this.width, height: this.height, iterations, force: opts.force });
     }
@@ -2442,6 +2452,7 @@ export class Network extends BaseEngine {
       this.nestedDiscs = null; // the reheat re-lays every node out: a nested layout's discs no longer hold (#329)
       const sim = new ForceLayout(graph, this.layoutOpts.force);
       sim.setPinned(held);
+      sim.hold(DRAG_HEAT); // reflow at the drag heat the worker / gpu backends use
       const rafFn: (cb: FrameRequestCallback) => number =
         typeof requestAnimationFrame === "function" ? requestAnimationFrame : (cb) => setTimeout(() => cb(0), 16);
       let raf = 0;
@@ -2452,13 +2463,13 @@ export class Network extends BaseEngine {
         if (cool < 0) applyHeld(); // hold under the cursor; once released, let the held set settle freely
         sim.tick();
         this.repaintDuringDrag();
-        if (cool >= 0 && --cool < 0) return; // tail finished — stop the loop
+        if (cool >= 0 && (--cool < 0 || sim.converged)) return; // re-cooled (or tail spent) — stop the loop
         raf = rafFn(frame);
       };
       raf = rafFn(frame);
       return {
         move: setDelta,
-        end: () => { sim.setPinned(null); cool = Network.DRAG_COOL_FRAMES; if (!raf) raf = rafFn(frame); },
+        end: () => { sim.setPinned(null); cool = Network.DRAG_COOL_FRAMES; sim.cool(cool, DRAG_HEAT); if (!raf) raf = rafFn(frame); },
       };
     }
 

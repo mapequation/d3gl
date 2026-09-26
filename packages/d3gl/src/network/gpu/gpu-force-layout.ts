@@ -1,6 +1,6 @@
 import type { Device, Texture, Framebuffer, RenderPass } from "@luma.gl/core";
 import type { ForceParams, LayoutGraph } from "../force.js";
-import { DAMPING, springStabilizers } from "../force.js";
+import { Cooling, DAMPING, equilibriumSpacing, springStabilizers, stepCap } from "../force.js";
 import { buildCSR } from "../graph.js";
 import { atlasWidth, pingPong, readbackFloatFboReuse, packUintTexture } from "./textures.js";
 import { IntegratePass } from "./passes/integrate.js";
@@ -30,11 +30,11 @@ export interface GpuForceLayoutOptions {
    */
   repulsionMode?: "allpairs" | "pyramid";
   /**
-   * Override the per-tick displacement clamp (world units). By default it is derived from the seed
-   * positions' bounding box (`span0 * 4`). The multilevel seed (N8.2) seeds each level's position
-   * texture on the **GPU** (prolongation) *after* construction, so the CPU `graph.positions` bbox is
-   * meaningless there — it passes an explicit `maxStep` (a viewport-scaled span) instead. @see
-   * {@link seedFromProlongation}
+   * Override the per-tick displacement clamp (world units). By default it is STEP_CAP equilibrium
+   * spacings ({@link stepCap}, shared with the CPU integrator); only a model without an equilibrium
+   * spacing falls back to 4× the seed positions' bounding box. The multilevel seed (N8.2) seeds each
+   * level's position texture on the **GPU** (prolongation) *after* construction, so it passes its
+   * level's cap explicitly rather than relying on that bbox fallback. @see {@link seedFromProlongation}
    */
   maxStep?: number;
 }
@@ -73,11 +73,12 @@ export class GpuForceLayout {
   private readonly usePyramid: boolean;
 
   /**
-   * Span-based maximum displacement per tick.  Mirrors force.ts's `span0 * 4`
-   * clamp to prevent layout explosion on pathological force configurations.
-   * Set once at construction from the initial position bounding box.
+   * Maximum displacement per tick — STEP_CAP equilibrium spacings, the same {@link stepCap} the CPU
+   * integrator uses — so a dense start can't fling nodes across the layout. Set once at construction.
    */
   private readonly maxStep: number;
+  /** Heat schedule multiplying `alpha` (#124) — the CPU integrator's {@link Cooling}, for parity. */
+  private readonly cooling = new Cooling();
 
   /**
    * Position ping-pong pair. `readTex` = current positions; `writeTex` = render
@@ -185,12 +186,8 @@ export class GpuForceLayout {
     this.width = width;
     this.height = height;
 
-    // Compute initial layout span from positions to set a span-based maxStep.
-    // Mirrors force.ts: span0 = max(2 * rootHalf(), 1) where rootHalf ≈ half-extent.
-    // We approximate by taking the max of x/y extents.  The clamp prevents layout
-    // explosion on the first few ticks (same rationale as the CPU integrator).
-    // TODO(N8.5): if the GPU layout with BH pyramid (Task 5) uses a different span
-    // definition, revisit.
+    // Per-tick step clamp: STEP_CAP equilibrium spacings (shared stepCap). Only a model without a
+    // spacing uses the seed span (max of the x/y extents ≈ force.ts's 2·rootHalf) instead.
     let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
     for (let i = 0; i < graph.nodeCount; i++) {
       const x = graph.positions[i * 2]!;
@@ -200,8 +197,8 @@ export class GpuForceLayout {
     }
     const span0 = Math.max((maxX - minX), (maxY - minY), 1);
     // Explicit override (multilevel seed: positions are GPU-seeded after construction, so the CPU
-    // bbox above is meaningless — the caller passes a viewport-scaled span instead).
-    this.maxStep = options.maxStep ?? span0 * 4;
+    // bbox above is meaningless — the caller passes its level's cap instead).
+    this.maxStep = options.maxStep ?? stepCap(equilibriumSpacing(params), span0);
 
     // Build padded position data (same layout as packPositionsTexture) and seed
     // the position read (A) side with it. Velocity starts zeroed (no seed).
@@ -323,6 +320,16 @@ export class GpuForceLayout {
     this.repulsionPyramidPass = new RepulsionPyramidPass(device, this.pyramid.levelCount);
   }
 
+  /** Cool from heat `from` over `ticks` ticks — the CPU {@link ForceLayout.cool} schedule. */
+  cool(ticks: number, from = 1): void {
+    this.cooling.cool(ticks, from);
+  }
+
+  /** Hold a constant heat — a drag reflow (the CPU {@link ForceLayout.hold}). */
+  hold(heat: number): void {
+    this.cooling.hold(heat);
+  }
+
   /** Execute `ticks` integrate steps on the GPU. */
   runFrame(ticks: number): void {
     for (let i = 0; i < ticks; i++) {
@@ -430,11 +437,9 @@ export class GpuForceLayout {
     this.integratePass.run(renderPass, this.pos.readTex, this.vel.readTex, this.forceTex, this.pinnedTex, this.stabTex, {
       count: this.count,
       width: this.width,
-      alpha: this.params.alpha,
+      alpha: this.params.alpha * this.cooling.heat, // the cooled step (#124), as on the CPU
       damping: DAMPING,
-      // Span-based clamp mirrors force.ts's `span0 * 4` to prevent layout
-      // explosion on pathological forces. See constructor for span0 derivation.
-      maxStep: this.maxStep,
+      maxStep: this.maxStep, // STEP_CAP equilibrium spacings — see constructor
     });
 
     renderPass.end();
@@ -446,6 +451,7 @@ export class GpuForceLayout {
     this.pos.swap();
     this.vel.swap();
     this.parity ^= 1;
+    this.cooling.next();
   }
 
   /**

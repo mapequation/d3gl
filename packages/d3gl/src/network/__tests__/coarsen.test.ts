@@ -1,7 +1,8 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import { buildGraph } from "../graph.js";
-import { coarsenLevel, buildHierarchy, multilevelLayout, type CoarseLevel } from "../coarsen.js";
-import { ForceLayout, seedPositions } from "../force.js";
+import { coarsenLevel, buildHierarchy, multilevelLayout, multilevelSeed, type CoarseLevel } from "../coarsen.js";
+import { DEFAULT_FORCE, ForceLayout, seedPositions } from "../force.js";
+import { BarnesHutTree } from "../quadtree.js";
 
 const level = (nodeCount: number, edges: [number, number, number][]): CoarseLevel => ({
   nodeCount,
@@ -124,6 +125,15 @@ function ringOfCliques(C: number, S: number) {
   return buildGraph({ nodeCount: C * S, source, target });
 }
 
+/** 95th-percentile distance from the centroid. */
+function r95(p: Float32Array, n: number): number {
+  let cx = 0, cy = 0;
+  for (let i = 0; i < n; i++) { cx += p[i * 2]!; cy += p[i * 2 + 1]!; }
+  cx /= n; cy /= n;
+  const r = Array.from({ length: n }, (_, i) => Math.hypot(p[i * 2]! - cx, p[i * 2 + 1]! - cy)).sort((a, b) => a - b);
+  return r[Math.floor(0.95 * (n - 1))]!;
+}
+
 const dist = (p: Float32Array, a: number, b: number) =>
   Math.hypot(p[a * 2]! - p[b * 2]!, p[a * 2 + 1]! - p[b * 2 + 1]!);
 
@@ -149,9 +159,9 @@ describe("multilevelLayout", () => {
     expect(Array.from(g1.positions)).toEqual(Array.from(g2.positions));
   });
 
-  it("skips force solves on levels above maxSeedNodes yet still lays out tightly (#117)", () => {
-    // Force the cap to bite even on a small graph (only the coarsest level is solved; larger levels
-    // are prolongated through). The finest refinement still produces a finite, well-clustered layout.
+  it("caps the solve on levels above maxSeedNodes yet still lays out tightly (#117)", () => {
+    // Force the cap to bite even on a small graph (larger levels get a proportionally shorter solve,
+    // or none). The finest refinement still produces a finite, well-clustered layout.
     const g = ringOfCliques(16, 6); // 96 nodes
     multilevelLayout(g, { width: 800, height: 600, iterations: 60, maxSeedNodes: 8 });
 
@@ -169,6 +179,50 @@ describe("multilevelLayout", () => {
     multilevelLayout(multi, { width: 800, height: 600, iterations });
 
     expect(tangleRatio(multi)).toBeLessThan(tangleRatio(cold));
+  });
+
+  it("seeds at the force equilibrium's scale, so the refinement neither explodes nor collapses", () => {
+    // The finest layout settles into a disc of radius R = √(repulsion·N/centering). The seed must
+    // already be there — mass-weighted coarse levels + mass-proportional prolongation — instead of
+    // the old viewport-sized seed that the refinement then blew up ~2.7× past its final extent.
+    const g = ringOfCliques(100, 12); // 1200 nodes
+    const n = g.nodeCount;
+    multilevelSeed(g, { width: 800, height: 600 });
+    const R95 = Math.sqrt(0.95) * Math.sqrt((DEFAULT_FORCE.repulsion * n) / DEFAULT_FORCE.centering);
+    expect(r95(g.positions, n) / R95).toBeGreaterThan(0.75);
+    expect(r95(g.positions, n) / R95).toBeLessThan(1.25);
+
+    const sim = new ForceLayout(g);
+    sim.cool(300);
+    let peak = r95(g.positions, n);
+    let ticks = 0;
+    while (ticks < 300) {
+      sim.tick();
+      ticks++;
+      peak = Math.max(peak, r95(g.positions, n));
+      if (sim.converged) break;
+    }
+    const final = r95(g.positions, n);
+    expect(peak / final).toBeLessThan(1.3); // no explosion
+    expect(final / R95).toBeGreaterThan(0.75); // no collapse
+    expect(ticks).toBeLessThan(300); // converged before the budget
+  });
+
+  it("bounds the seed's solve work at coarsenIterations · maxSeedNodes node-ticks per level", () => {
+    // Count every coarse-level Barnes-Hut build (one per tick) weighted by its node count.
+    const g = ringOfCliques(64, 12); // 768 nodes → several levels above the tiny cap
+    const hierarchy = buildHierarchy(g);
+    const levels = hierarchy.levels.length;
+    const spy = vi.spyOn(BarnesHutTree.prototype, "build");
+    multilevelSeed(g, { width: 800, height: 600, coarsenIterations: 10, maxSeedNodes: 16 }, hierarchy);
+    const sizes = spy.mock.calls.map((call) => call[1]);
+    spy.mockRestore();
+    const nodeTicks = sizes.reduce((sum, n) => sum + n, 0);
+    expect(nodeTicks).toBeGreaterThan(0);
+    expect(nodeTicks).toBeLessThanOrEqual((levels - 1) * 10 * 16);
+    // Levels past coarsenIterations · maxSeedNodes nodes are prolongated through, never solved.
+    expect(Math.max(...sizes)).toBeLessThanOrEqual(160);
+    expect(hierarchy.levels.some((l, k) => k > 0 && l.nodeCount > 160)).toBe(true); // …and there is one
   });
 
   it("keeps clusters distinct but compact — inter-cluster spacing within a few × the cluster size", () => {
