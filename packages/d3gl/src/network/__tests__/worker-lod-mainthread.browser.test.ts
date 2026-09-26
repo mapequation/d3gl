@@ -99,7 +99,8 @@ describe("worker-LOD source selection (#103)", () => {
  * `lod()` on an engine that has not run a layout yet cannot know whether a `layout({ backend: "worker" })`
  * follows — and that worker streams the structural tree itself (#103). So the main-thread build waits for
  * the end of the call chain: skipped when a worker took over, done before the next frame otherwise, and
- * done at once when a synchronous `pick`/`toSVG`/`toPNG` needs the tree. `lodSource` reports the state
+ * done at once when a synchronous call needs the tree (`pick`, `toSVG`/`toPNG`, `select`/`selection`,
+ * `highlight`, `setStyle`/`clearStyle`). `lodSource` reports the state
  * as it is (`"none"` while deferred), which is what these tests observe: a main-thread build would show
  * up as `"main"`.
  */
@@ -172,6 +173,71 @@ describe("lod() before the first layout defers the main-thread tree build", () =
     net.lod(false).data(placed(600)).lod({ expandPx: 48 });
     expect(net.toSVG()).toContain("<circle");
     expect(net.lodSource).toBe("main");
+
+    net.destroy();
+    host.remove();
+  });
+
+  // select()/selection() resolve against the registered lane (WebGL) or Scene spec (Canvas/SVG). While the
+  // build is queued neither exists, so without the flush a select chained after lod() was dropped: no
+  // managed selection, no on("select").
+  it("a select() chained after lod() is kept and observed, as with an immediate build", async () => {
+    const { net, host } = makeNet();
+    await net.whenReady();
+    const seen: number[] = [];
+    net.on("select", (hits) => seen.push(hits.length));
+
+    net.data(placed(800)).interactive({ selectable: { multi: true } }).lod({ expandPx: 48, declutter: false }).select("nodes", [0, 1, 2]);
+    expect(seen).toEqual([3]);
+    const now = net.selection();
+    expect(now.map((h) => h.id)).toEqual([0, 1, 2]);
+    expect(now.every((h) => h.datum !== null)).toBe(true); // resolved through the LOD lane, not a missing layer
+    await Promise.resolve();
+    await frame();
+    expect(net.selection().map((h) => h.id)).toEqual([0, 1, 2]);
+
+    net.destroy();
+    host.remove();
+  });
+
+  // highlight() resolves against the Scene spec on the vector backends. `expandPx: 1` opens every aggregate,
+  // so leaf 0 is drawn and its highlight adds exactly one outline path to the export.
+  it.each(["svg", "canvas"] as const)("on the %s backend, a highlight() chained after lod() is kept", async (backend) => {
+    const host = document.createElement("div");
+    host.style.width = "240px";
+    host.style.height = "240px";
+    document.body.appendChild(host);
+    const net = network(host, { width: 240, height: 240, backend });
+    await net.whenReady();
+    const paths = () => (net.toSVG().match(/<path/g) ?? []).length;
+
+    net.data(placed(200)).lod({ expandPx: 1, declutter: false }).highlight("nodes", [0]);
+    await Promise.resolve();
+    const withHighlight = paths();
+    net.highlight("nodes", null);
+    expect(withHighlight - paths()).toBe(1);
+
+    net.destroy();
+    host.remove();
+  });
+
+  // Interaction state made BEFORE lod() lives on the layers lod() would clear while its build is queued
+  // (the vector backends clear the network's Scene). So lod() builds at once then, keeping that state.
+  it.each(["svg", "canvas"] as const)("on the %s backend, a highlight made before lod() survives it", async (backend) => {
+    const host = document.createElement("div");
+    host.style.width = "240px";
+    host.style.height = "240px";
+    document.body.appendChild(host);
+    const net = network(host, { width: 240, height: 240, backend });
+    await net.whenReady();
+    const paths = () => (net.toSVG().match(/<path/g) ?? []).length;
+
+    net.data(placed(200)).highlight("nodes", [0]).lod({ expandPx: 1, declutter: false });
+    expect(net.lodSource).toBe("main"); // built at once: nothing may be lost to a queued build
+    await Promise.resolve();
+    const withHighlight = paths();
+    net.highlight("nodes", null);
+    expect(withHighlight - paths()).toBe(1);
 
     net.destroy();
     host.remove();

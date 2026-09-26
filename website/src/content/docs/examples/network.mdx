@@ -227,7 +227,9 @@ on-screen-bounded cut. That keeps the main thread free as the network scales tow
 This holds on a brand-new engine too. Before any layout has run, `lod()` can't know which backend comes
 next, so it leaves its own main-thread build to the end of the current call chain: the worker layout
 that follows wins, and any other path (no layout, `positions`, `force`, `gpu`) still has its tree
-before the next frame. Until the worker's tree arrives nothing is drawn, so nothing is labelled.
+before the next frame. On those paths a call that needs the tree right away — `pick()`, `select()`,
+`highlight()`, `toSVG()` — builds it at once. Until the worker's tree arrives nothing is drawn, so
+nothing is labelled.
 
 ```js
 net

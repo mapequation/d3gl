@@ -711,7 +711,7 @@ export class Network extends BaseEngine {
   /** Dedup guard for the one-shot deferred main-thread LOD-tree fallback (see {@link scheduleLODFallback}). */
   private lodFallbackScheduled = false;
   /** Whether the queued fallback is a build {@link lod} deferred before any layout (see
-   *  {@link defersStructuralBuild}) — the one a synchronous read may pull forward. */
+   *  {@link defersStructuralBuild}) — the one a synchronous call may pull forward ({@link flushDeferredLayers}). */
   private lodBuildDeferred = false;
   /** Whether `lodTree` has had its geometry computed at least once, so the cut may run. */
   private lodHasGeometry = false;
@@ -830,6 +830,8 @@ export class Network extends BaseEngine {
   private readonly PIE_LAYER = "pie";
   /** Registry key + layer name for the `both`-view physical container discs (drawn under the state nodes). */
   private readonly CONTAINER_LAYER = "phys-container";
+  /** Every retained Scene layer the vector path registers ({@link registerNetworkScene}). */
+  private readonly SCENE_LAYERS: readonly string[] = [this.CONTAINER_LAYER, "module-boundaries", "links", "arrows", "node-halos", this.NODE_LAYER, this.PIE_LAYER];
 
   constructor(host: HTMLElement, opts: NetworkOptions = {}) {
     super(host, opts);
@@ -1034,8 +1036,10 @@ export class Network extends BaseEngine {
    * On an engine that has not run a layout yet, `lod()` cannot know which backend comes next, so the
    * main-thread build waits for the end of the current call chain: a `layout({ backend: "worker" })`
    * in the same chain still gets its tree off-thread, and every other path (no layout, `positions`,
-   * `force`, `gpu`) has the tree before the next frame — a synchronous `pick()`/`toSVG()`/`toPNG()`
-   * builds it at once.
+   * `force`, `gpu`) has the tree before the next frame — and a synchronous call that needs it
+   * (`pick()`, `toSVG()`/`toPNG()`, `select()`/`selection()`, `highlight()`, `setStyle()`/`clearStyle()`)
+   * builds it at once. With a worker layout in the chain those calls see what they see during any
+   * worker-streamed load: no cut until the worker's tree lands.
    *
    * With a module hierarchy (`data(graph, { modules })`, #326) the cut draws the module tree by
    * default; `{ source: "structure" }` coarsens the graph structurally instead. `lod(false)` turns LOD
@@ -1071,41 +1075,29 @@ export class Network extends BaseEngine {
    * the structural tree itself (#103), and building it here first would block the main thread for the
    * whole O(N + E) coarsening (≈0.5 s at 325k nodes / 1.5M edges) only to be replaced. Only a tree that
    * would be built from scratch waits: a module tree is never streamed, an existing tree only needs its
-   * geometry refreshed, and state-network mode builds from the state view's own graph (#182).
+   * geometry refreshed, and state-network mode builds from the state view's own graph (#182). Nor does
+   * it wait while the network's layers carry a selection, highlight or style override: the vector
+   * backends clear those layers while a build is queued, which would discard that state.
    */
   private defersStructuralBuild(): boolean {
-    return this.layoutOpts.backend === undefined && !!this.graph && !this.stateData && !this.lodTree && !this.lodUsesModules();
+    return this.layoutOpts.backend === undefined && !!this.graph && !this.stateData && !this.lodTree && !this.lodUsesModules()
+      && !this.SCENE_LAYERS.some((name) => this.hasInteractionState(name));
   }
 
   /** Queue the deferred build ({@link runLODFallback}) and mark it as one a synchronous read may pull
-   *  forward ({@link flushDeferredLODBuild}). */
+   *  forward ({@link flushDeferredLayers}). */
   private deferLODBuild(): void {
     this.lodBuildDeferred = true;
     this.scheduleLODFallback();
   }
 
   /**
-   * A read that needs the tree *now* — `pick()`, `toSVG()`, `toPNG()` — runs a build {@link lod}
-   * deferred at once, so a synchronous caller sees exactly what an immediate build would have given it.
-   * O(1) when nothing is deferred (it also guards every hover pick).
+   * A call that resolves against the network's layers *now* (see {@link BaseEngine.flushDeferredLayers})
+   * runs a build {@link lod} deferred at once, so a synchronous caller sees exactly what an immediate
+   * build would have given it. O(1) when nothing is deferred (it also guards every hover pick).
    */
-  private flushDeferredLODBuild(): void {
+  protected override flushDeferredLayers(): void {
     if (this.lodBuildDeferred) this.runLODFallback();
-  }
-
-  override pick(x: number, y: number, exact = true): HoverHit | null {
-    this.flushDeferredLODBuild();
-    return super.pick(x, y, exact);
-  }
-
-  override toSVG(): string {
-    this.flushDeferredLODBuild();
-    return super.toSVG();
-  }
-
-  override toPNG(): string {
-    this.flushDeferredLODBuild();
-    return super.toPNG();
   }
 
   /**
@@ -2120,7 +2112,7 @@ export class Network extends BaseEngine {
    *  O(layers) plus one re-push of what is left: the right clear when the Scene must not cost anything
    *  at all (#201). */
   private clearNetworkScene(): void {
-    this.removeLayers([this.CONTAINER_LAYER, "module-boundaries", "links", "arrows", "node-halos", this.NODE_LAYER, this.PIE_LAYER]);
+    this.removeLayers(this.SCENE_LAYERS);
     this.sceneActive = false;
   }
 
@@ -2892,8 +2884,8 @@ export class Network extends BaseEngine {
     defer(() => this.runLODFallback());
   }
 
-  /** The scheduled build itself — at the end of the call chain, or pulled forward by a synchronous read
-   *  ({@link flushDeferredLODBuild}). A queued run that finds nothing scheduled any more (already pulled
+  /** The scheduled build itself — at the end of the call chain, or pulled forward by a synchronous call
+   *  ({@link flushDeferredLayers}). A queued run that finds nothing scheduled any more (already pulled
    *  forward, or cancelled by {@link destroy}) does nothing. */
   private runLODFallback(): void {
     if (!this.lodFallbackScheduled) return;
