@@ -1,32 +1,42 @@
 /**
  * GPU-backed layout handle — mirrors {@link startWorkerLayout}'s call shape and return type so
  * `network.ts` treats both symmetrically. Falls back to the worker path when the GPU path is
- * unavailable (no device, non-WebGL backend, SSR).
+ * unavailable for the device or the graph (#351): no device (Canvas/SVG render backend, SSR), no float
+ * render targets, no float blending, a texture limit too small for the graph, or a failed functional
+ * probe (`gpuLayoutSupport` over `gpuCaps`). The fallback is a full worker run: it keeps every layout
+ * option (`multilevel`, `lod`, `coarsen`, `frameEvery`) and streams the LOD tree through `onLODTree`,
+ * exactly as `layout({ backend: "worker" })` would (#312), and one `console.warn` names the reason.
  *
  * Milestone A (N8.1): plain disc seed (at the force equilibrium's scale) + streaming rAF loop, cooled
  * over the iteration budget like the worker (#124). N8.5 (#183) adds drag/reheat parity:
  * on convergence the loop goes **idle** (keeps the {@link GpuForceLayout} alive, doesn't destroy it),
  * and `pin`/`unpin` hold nodes + resume the loop so the rest reflows — mirroring the CPU worker
- * (layout-worker.ts). Multilevel GPU seeding (N8.2) is still a later milestone.
+ * (layout-worker.ts). The GPU run itself ignores `multilevel`, `lod` and `coarsen` (a structural GPU
+ * seed and GPU-side LOD streaming are later milestones); only its fallback uses them.
  */
 import type { Device } from "@luma.gl/core";
-import { gpuLayoutSupported } from "./device-caps.js";
+import { gpuLayoutNeed, gpuLayoutSupport } from "./device-caps.js";
+import { gpuCaps } from "./device-probe.js";
 import { GpuForceLayout } from "./gpu-force-layout.js";
 import { canModuleSeed, gpuMultilevelSeed } from "./gpu-multilevel-seed.js";
 import { startWorkerLayout, type WorkerLayoutHandle, type WorkerLayoutOptions } from "../worker-transport.js";
 import { seedPositions, DEFAULT_FORCE, DRAG_HEAT, RECOOL_TICKS } from "../force.js";
-import type { LODTopology } from "../lod.js";
+import type { LODTopology, LODTree } from "../lod.js";
 import type { NetworkGraph } from "../graph.js";
 
 /**
  * GPU layout options — the worker options plus an optional provided module hierarchy (N8.2). When
  * present (and it carries super-edges), the GPU backend seeds **module-aware**, laying the layout out
  * top-down over the module tree so modules read as coherent regions; otherwise it uses the disc seed.
+ * The worker options are all honoured by the worker fallback.
  */
 export interface GpuLayoutOptions extends WorkerLayoutOptions {
   /** The provided module tree topology (from `lod({ modules })`), for the module-aware multilevel seed. */
   moduleTopology?: LODTopology;
 }
+
+/** The transport a GPU layout resolved to: the GPU solve, or the worker fallback. */
+export type GpuLayoutTransport = "gpu" | "worker";
 
 const TARGET_FRAMES = 60;
 
@@ -39,31 +49,27 @@ const REHEAT_BATCH = 3;
  *
  * Accepts a `Device | null | Promise<Device | null>` so `network.ts` can pass a **device promise**
  * that resolves after the backend settles (including the `"auto"` → WebGL background upgrade).
- * When passed a plain `Device | null` value it behaves synchronously as before.
+ * When passed a plain `Device | null` value it resolves synchronously.
  *
- * - If `gpuLayoutSupported(device)` is false (null device, Canvas/SVG backend, SSR, no float RTT)
- *   → delegates transparently to {@link startWorkerLayout} (which has its own sync fallback).
+ * - If `gpuLayoutSupport` rejects the device for this graph → one warning with the reason, then
+ *   {@link startWorkerLayout} with the same options and `onLODTree` (it has its own sync fallback).
  * - Otherwise: seeds positions, constructs {@link GpuForceLayout}, and runs a streaming rAF loop
  *   until `iterations` are done, calling `onFrame` after each batch.
+ *
+ * `onTransport` reports the resolution before the run starts — so before any frame or LOD tree
+ * arrives — and the handle's `transport` / `shared` read the live state (#297): `"pending"` until the
+ * device settles, then `"gpu"` or `"worker"`.
  */
 export function startGpuLayout(
   deviceOrPromise: Device | null | undefined | Promise<Device | null | undefined>,
   graph: NetworkGraph,
   opts: GpuLayoutOptions,
   onFrame: () => void,
+  onLODTree?: (tree: LODTree) => void,
+  onTransport?: (transport: GpuLayoutTransport) => void,
 ): WorkerLayoutHandle {
-  // Fast path: plain value (not a Promise). Preserves backward compatibility.
-  if (
-    deviceOrPromise === null ||
-    deviceOrPromise === undefined ||
-    !("then" in (deviceOrPromise as object))
-  ) {
-    return startGpuLayoutSync(
-      deviceOrPromise as Device | null | undefined,
-      graph,
-      opts,
-      onFrame,
-    );
+  if (!(deviceOrPromise instanceof Promise)) {
+    return startGpuLayoutSync(deviceOrPromise, graph, opts, onFrame, onLODTree, onTransport);
   }
 
   // Async path: the device resolves later (e.g. after the "auto" → WebGL upgrade).
@@ -76,13 +82,14 @@ export function startGpuLayout(
   let stopped = false;
   let inner: WorkerLayoutHandle | null = null;
 
-  let resolveSettled!: () => void;
-  let rejectSettled!: (e: unknown) => void;
+  let resolveSettled: () => void = () => {};
+  let rejectSettled: (e: unknown) => void = () => {};
   const settled = new Promise<void>((res, rej) => { resolveSettled = res; rejectSettled = rej; });
 
   const wrapper: WorkerLayoutHandle = {
-    shared: false,
-    transport: undefined,
+    // Live (#297): whatever the resolved run reports now, not a value copied when it started.
+    get shared() { return inner?.shared ?? false; },
+    get transport() { return inner ? inner.transport : "pending"; },
     settled,
     stop() {
       if (stopped) return;
@@ -98,52 +105,77 @@ export function startGpuLayout(
     unpin() { inner?.unpin(); },
   };
 
-  Promise.resolve(deviceOrPromise).then((device) => {
-    if (stopped) return;
-    inner = startGpuLayoutSync(device, graph, opts, onFrame);
-    // Mirror transport and shared from the resolved inner handle.
-    wrapper.transport = inner.transport;
-    wrapper.shared = inner.shared;
-    // Forward inner.settled to our outer settled promise.
-    inner.settled.then(resolveSettled, rejectSettled);
-  }).catch((e: unknown) => {
-    if (!stopped) {
-      console.warn("[d3gl] network layout({ backend: 'gpu' }): device promise rejected, falling back to worker.", e);
-      inner = startWorkerLayout(graph, opts, onFrame);
-      wrapper.shared = inner.shared;
-      inner.settled.then(resolveSettled, rejectSettled);
-    }
+  const adopt = (handle: WorkerLayoutHandle): void => {
+    inner = handle;
+    handle.settled.then(resolveSettled, rejectSettled);
+  };
+  deviceOrPromise.then(
+    (device) => {
+      if (!stopped) adopt(startGpuLayoutSync(device, graph, opts, onFrame, onLODTree, onTransport));
+    },
+    (e: unknown) => {
+      if (!stopped) adopt(fallBackToWorker("the device promise rejected", graph, opts, onFrame, onLODTree, onTransport, e));
+    },
+  ).catch((e: unknown) => {
+    // The GPU run failed to start (e.g. a driver rejected a shader): the worker still lays it out.
+    if (!stopped && !inner) adopt(fallBackToWorker("the GPU layout failed to start", graph, opts, onFrame, onLODTree, onTransport, e));
   });
 
   return wrapper;
 }
 
 /**
- * Synchronous variant: accepts a resolved `Device | null | undefined` value.
- * This is the original `startGpuLayout` logic, now a named helper.
+ * The fallback: a worker run with the GPU layout's options and LOD-tree callback, reported as the
+ * `"worker"` transport. `shared` reads the worker handle live (it flips on a worker error, #297).
+ */
+function fallBackToWorker(
+  reason: string,
+  graph: NetworkGraph,
+  opts: GpuLayoutOptions,
+  onFrame: () => void,
+  onLODTree: ((tree: LODTree) => void) | undefined,
+  onTransport: ((transport: GpuLayoutTransport) => void) | undefined,
+  cause?: unknown,
+): WorkerLayoutHandle {
+  const message = `[d3gl] network layout({ backend: 'gpu' }) fell back to the CPU worker: ${reason}.`;
+  if (cause === undefined) console.warn(message);
+  else console.warn(message, cause);
+  onTransport?.("worker");
+  const worker = startWorkerLayout(graph, opts, onFrame, onLODTree);
+  return {
+    get shared() { return worker.shared; },
+    transport: "worker",
+    settled: worker.settled,
+    stop: () => worker.stop(),
+    pin: (ids, positions) => worker.pin(ids, positions),
+    unpin: () => worker.unpin(),
+  };
+}
+
+/**
+ * Synchronous variant: accepts a resolved `Device | null | undefined` value, decides GPU vs worker
+ * for this graph, and starts that run.
  */
 function startGpuLayoutSync(
   device: Device | null | undefined,
   graph: NetworkGraph,
   opts: GpuLayoutOptions,
   onFrame: () => void,
+  onLODTree: ((tree: LODTree) => void) | undefined,
+  onTransport: ((transport: GpuLayoutTransport) => void) | undefined,
 ): WorkerLayoutHandle {
-  if (!gpuLayoutSupported(device)) {
-    // Warn so the silent fallback is observable (the bug this fix addresses).
-    if (device === null || device === undefined) {
-      console.warn(
-        "[d3gl] network layout({ backend: 'gpu' }) fell back to the CPU worker: no WebGL device available" +
-        " (non-WebGL backend, or called before the backend settled — use an async device promise).",
-      );
-    }
-    return startWorkerLayout(graph, opts, onFrame);
+  const verdict = gpuLayoutSupport(gpuCaps(device), gpuLayoutNeed(graph.nodeCount, graph.edgeCount));
+  if (!verdict.ok || !device) {
+    // (`!device` never reaches here with `ok`: no device has no caps, which never pass.)
+    return fallBackToWorker(verdict.ok ? "no WebGL device" : verdict.reason, graph, opts, onFrame, onLODTree, onTransport);
   }
+  onTransport?.("gpu");
 
   // 0-node graph: GpuForceLayout would create a zero-height texture (crash).
   // Return a no-op handle immediately — there is nothing to lay out.
   if (graph.nodeCount === 0) {
     onFrame();
-    return { shared: false, settled: Promise.resolve(), stop() {}, pin() {}, unpin() {} };
+    return { shared: false, transport: "gpu", settled: Promise.resolve(), stop() {}, pin() {}, unpin() {} };
   }
 
   const { width, height, force, iterations: rawIterations } = opts;
@@ -222,7 +254,7 @@ function startGpuLayoutSync(
     }
 
     if (mode === "idle") { looping = false; settle(); return; } // reached rest — pause; layout stays alive
-    // Schedule next batch. gpuLayoutSupported already ensured requestAnimationFrame exists.
+    // Schedule next batch. The support check above ensured a WebGL device, so requestAnimationFrame exists.
     rafHandle = requestAnimationFrame(step);
   };
 

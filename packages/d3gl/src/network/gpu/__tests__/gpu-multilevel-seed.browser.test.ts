@@ -12,11 +12,14 @@
  *      with the per-level solve running on the **GPU** (a bounded, O(depth) number of GPU solves) and
  *      **zero CPU per-level force work** (the CPU ForceLayout.tick is never called). This test FAILS if
  *      someone reintroduces a CPU "small level" force shortcut.
+ *   4. **Portable readback (#351)** — on a device that reads `rg32f` only as `RGBA/FLOAT`, both kinds of
+ *      level (solved and prolongate-only) read their positions back, and the seed matches an `RG/FLOAT` device.
  */
 
 import { describe, it, expect, beforeAll, vi } from "vitest";
 import type { Device } from "@luma.gl/core";
 import { makeTestDevice } from "./_device.js";
+import { makeRgbaReadDevice } from "./_rgba-read-device.js";
 import { gpuMultilevelSeed, canModuleSeed } from "../gpu-multilevel-seed.js";
 import { GpuForceLayout } from "../gpu-force-layout.js";
 import { ForceLayout, seedPositions, DEFAULT_FORCE } from "../../force.js";
@@ -391,4 +394,39 @@ describe("gpuMultilevelSeed — module-aware GPU seed (#180 N8.2)", () => {
     void moduleOf;
     expect(dt).toBeLessThan(60_000);
   }, 120_000);
+});
+
+describe("gpuMultilevelSeed on a device that reads rg32f only as RGBA/FLOAT (#351)", () => {
+  it("reads back solved and prolongate-only levels, and seeds exactly as an RG/FLOAT device", async () => {
+    const W = 800, H = 600;
+    const g = makePlantedGraph(8, 60, 4, 3, 0xa11ce); // 480 nodes
+    const tree = buildModuleLODTree(g.nodeCount, flatRecords(g.moduleOf), { source: g.source, target: g.target, weight: g.weight });
+    expect(canModuleSeed(tree, g.nodeCount)).toBe(true);
+    // Level 1 (8 modules) is solved by a GpuForceLayout; level 2 (the 480 leaves) is past maxSeedNodes,
+    // so it only prolongates, the branch the finest level of a large graph takes.
+    const opts = { width: W, height: H, force: DEFAULT_FORCE, maxSeedNodes: 100 };
+
+    const rgDevice = await makeTestDevice();
+    const expected = new Float32Array(g.nodeCount * 2);
+    gpuMultilevelSeed(rgDevice, tree, { nodeCount: g.nodeCount, positions: expected }, opts);
+    rgDevice.destroy();
+    expect(allFinite(expected)).toBe(true);
+
+    const rgba = await makeRgbaReadDevice();
+    try {
+      const solveSpy = vi.spyOn(GpuForceLayout.prototype, "runFrame");
+      const got = new Float32Array(g.nodeCount * 2);
+      gpuMultilevelSeed(rgba.device, tree, { nodeCount: g.nodeCount, positions: got }, opts);
+      const solves = solveSpy.mock.calls.length;
+      solveSpy.mockRestore();
+      expect(solves).toBe(1); // level 1 solved; level 2 prolongate-only
+      expect(rgba.rejectedRgReads()).toBe(0); // no level asked the device for RG/FLOAT
+      let mismatches = 0;
+      for (let i = 0; i < got.length; i++) if (got[i] !== expected[i]) mismatches++;
+      expect(mismatches).toBe(0);
+    } finally {
+      rgba.device.destroy();
+      rgba.restore();
+    }
+  });
 });
