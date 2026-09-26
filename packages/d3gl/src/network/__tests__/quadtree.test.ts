@@ -68,9 +68,8 @@ describe("BarnesHutTree", () => {
     tree.build(pos, 4);
 
     expect(tree.rootMass()).toBe(4);
-    const [cx, cy] = tree.rootCom();
-    expect(cx).toBeCloseTo(5);
-    expect(cy).toBeCloseTo(5);
+    expect(tree.rootComX()).toBeCloseTo(5);
+    expect(tree.rootComY()).toBeCloseTo(5);
   });
 
   it("θ=0 reproduces direct pairwise repulsion (exact traversal to leaves)", () => {
@@ -104,7 +103,7 @@ describe("BarnesHutTree", () => {
     }
     expect(differing).toBe(0);
     expect(tree.rootMass()).toBe(ref.rootMass);
-    expect(tree.rootCom()).toEqual(ref.rootCom);
+    expect([tree.rootComX(), tree.rootComY()]).toEqual(ref.rootCom);
   });
 
   it("weighted bodies match the reference to rounding (a multilevel coarse level)", () => {
@@ -163,7 +162,7 @@ describe("BarnesHutTree", () => {
     const cold = new BarnesHutTree();
     cold.build(after, n);
     expect(forces(warm, n, 200, 0.9)).toEqual(forces(cold, n, 200, 0.9));
-    expect(warm.rootCom()).toEqual(cold.rootCom());
+    expect([warm.rootComX(), warm.rootComY()]).toEqual([cold.rootComX(), cold.rootComY()]);
   });
 
   it("one tree reused across builds of different sizes matches a fresh tree each time", () => {
@@ -197,17 +196,59 @@ describe("BarnesHutTree", () => {
     expect(tree.rootMass()).toBe(n);
   });
 
+  it("near-coincident bodies in depth-capped buckets match the reference, whatever earlier builds left", () => {
+    // Clumps of 5 bodies 3-5e-9 apart in a layout ~1 across: closer than a depth-24 cell (~6e-8), yet
+    // distinct Float32 positions (the clumps sit below 1e-3, where Float32 resolves ~1e-10), so each
+    // bucket really sums different terms. A bucket sums its bodies in the slot order its build left
+    // behind (the old tree: newest first); this pins that the order moves the forces by rounding at
+    // most, on a fresh tree and on one whose earlier builds left an unrelated order.
+    const clumps = 300;
+    const per = 5;
+    const n = clumps * per;
+    let s = 5;
+    const rng = (): number => (s = (s * 1664525 + 1013904223) >>> 0) / 4294967296;
+    const pos = new Float32Array(n * 2);
+    for (let c = 0; c < clumps; c++) {
+      const cx = c === 0 ? 1 : rng() * 1e-3;
+      const cy = c === 0 ? 1 : rng() * 1e-3;
+      for (let j = 0; j < per; j++) {
+        pos[(c * per + j) * 2] = cx + j * 3e-9;
+        pos[(c * per + j) * 2 + 1] = cy + j * 5e-9;
+      }
+    }
+    const ref = referenceRepulsion(pos, n, 200, 0.9);
+    expect(ref.buckets, "the fixture really buckets its clumps").toBeGreaterThan(clumps / 2);
+    const cold = new BarnesHutTree();
+    cold.build(pos, n);
+    const warm = new BarnesHutTree();
+    warm.build(sunflower(n), n);
+    warm.build(clustered(n, 9), n);
+    warm.build(pos, n);
+    for (const tree of [cold, warm]) {
+      const { fx, fy } = forces(tree, n, 200, 0.9);
+      let worst = 0;
+      for (let i = 0; i < n; i++) {
+        const scale = Math.hypot(ref.fx[i] ?? 0, ref.fy[i] ?? 0) + 1e-9;
+        worst = Math.max(worst, Math.abs((fx[i] ?? 0) - (ref.fx[i] ?? 0)) / scale, Math.abs((fy[i] ?? 0) - (ref.fy[i] ?? 0)) / scale);
+      }
+      expect(worst).toBeLessThan(1e-6);
+      expect(tree.rootMass()).toBe(n);
+      expect(tree.rootComX()).toBeCloseTo(ref.rootCom[0], 12);
+      expect(tree.rootComY()).toBeCloseTo(ref.rootCom[1], 12);
+    }
+  });
+
   it("an empty tree and a single body are well defined", () => {
     const tree = new BarnesHutTree();
     tree.build(new Float32Array(0), 0);
     expect(tree.rootMass()).toBe(0);
-    expect(tree.rootCom()).toEqual([0, 0]);
+    expect([tree.rootComX(), tree.rootComY()]).toEqual([0, 0]);
     expect(tree.rootHalf()).toBe(1);
     expect(forces(tree, 0, 200, 0.9).fx.length).toBe(0);
 
     tree.build(new Float32Array([3, -4]), 1);
     expect(tree.rootMass()).toBe(1);
-    expect(tree.rootCom()).toEqual([3, -4]);
+    expect([tree.rootComX(), tree.rootComY()]).toEqual([3, -4]);
     const { fx, fy } = forces(tree, 1, 200, 0.9);
     expect([fx[0], fy[0]]).toEqual([0, 0]);
   });
