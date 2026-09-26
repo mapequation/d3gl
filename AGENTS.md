@@ -575,8 +575,8 @@ fences the frame, and harvests with `getBufferSubData` once that fence has signa
   being read back" and discards the copy. The harvest then logs "read back without waiting on a fence"
   and stalls the GPU pipeline. That stall does not show in main-thread time: on web-NotreDame, 300 ticks
   took 63 s instead of 11 s. Pack everything a PBO carries into one texture first (the stats ride in their
-  own 32-byte PBO through a 2×1 staging texture). One such warning per PBO at creation is benign:
-  Chrome counts the sizing `bufferData` as a write.
+  own 32-byte PBO through a 2×1 staging texture). Chrome also counts the sizing `bufferData` as a
+  write, so size the storage in the first copy, before the fence, not a frame earlier.
 - **A heavy engine repaint is GPU work the layout's fences see.** Its draws queue ahead of the layout,
   so a miss behind a repaint frame says nothing about the layout's band size. The fence controller
   only blocks on such a miss and never resizes `k` or B. Before that rule, every 325k render doubled B

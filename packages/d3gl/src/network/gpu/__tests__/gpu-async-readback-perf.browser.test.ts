@@ -218,6 +218,7 @@ describe("GPU streaming readback per frame (#352)", () => {
     created.length = 0; // the layout's own buffers are luma's; only the readback's is raw
     const readback = new AsyncPositionReadback(device, layout);
     spy.mockRestore();
+    readback.issue(layout); // the first copy sizes the storage, in the same fence window as its write
     try {
       expect(created.length).toBe(2); // the position PBO and the 32-byte stats PBO
       for (const pbo of created) {
