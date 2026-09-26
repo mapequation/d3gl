@@ -398,6 +398,57 @@ describe("GPU frame budget — pyramid path (per-tick regression tripwire)", () 
     layout.destroy();
   });
 
+  it("a tick sliced into row bands (#352) is bitwise the unsliced tick, and allocates nothing per band", () => {
+    // The streaming transport encodes the force pass one row band at a time (scissored), so one tick's GPU
+    // work can span frames. Bands write disjoint texels and each texel gets springs → repulsion →
+    // centering in the same order whatever B is, so the result must be BITWISE equal (same program, same
+    // inputs). A band that missed its scissor would add a node's force twice; one that skipped rows would
+    // drop it — either breaks the equality. Pyramid path, hub rows included (their chunk pass is in P).
+    const N = perfN(30_000, { max: 200_000 });
+    const g = withHubs(makeClusteredGraph(N, 80, 0xba4d5), 0x51);
+    const params = { repulsion: 200, attraction: 0.05, centering: 0.2, alpha: 0.05, theta: 0.7 };
+    const TICKS = 3;
+    const whole = new GpuForceLayout(device, { ...g, positions: g.positions.slice() }, params, { repulsionMode: "pyramid" });
+    const sliced = new GpuForceLayout(device, { ...g, positions: g.positions.slice() }, params, { repulsionMode: "pyramid" });
+    const a = new Float32Array(N * 2);
+    const b = new Float32Array(N * 2);
+    try {
+      whole.runFrame(TICKS);
+      whole.readPositions(a);
+      sliced.runFrame(0);
+      const fboSpy = vi.spyOn(device, "createFramebuffer");
+      const texSpy = vi.spyOn(device, "createTexture");
+      const bufSpy = vi.spyOn(device, "createBuffer");
+      const draws = vi.spyOn(Model.prototype, "draw");
+      for (let t = 0; t < TICKS; t++) {
+        sliced.beginTick();
+        for (let band = 0; band < 4; band++) sliced.forceBand(band, 4);
+        sliced.integrate();
+      }
+      expect(fboSpy).toHaveBeenCalledTimes(0);
+      expect(texSpy).toHaveBeenCalledTimes(0);
+      expect(bufSpy).toHaveBeenCalledTimes(0);
+      // Each band draws the three force passes (springs, repulsion, centering), each over its rows only.
+      const forceDraws = draws.mock.calls.filter(([pass]) => pass.props.parameters?.scissorRect !== undefined);
+      expect(forceDraws.length).toBe(TICKS * 4 * 3);
+      fboSpy.mockRestore();
+      texSpy.mockRestore();
+      bufSpy.mockRestore();
+      draws.mockRestore();
+      sliced.readPositions(b);
+    } finally {
+      whole.destroy();
+      sliced.destroy();
+    }
+    let mismatches = 0;
+    for (let i = 0; i < N * 2; i++) if (!Object.is(a[i], b[i])) mismatches++;
+    expect(mismatches).toBe(0);
+    // Non-vacuity: the ticks moved the layout.
+    let moved = 0;
+    for (let i = 0; i < N * 2; i++) if (a[i] !== g.positions[i]) moved++;
+    expect(moved).toBeGreaterThan(N);
+  });
+
   it("hub springs (#350): a tick with web-NotreDame-shaped hub rows stays under the same ceiling and near its hub-free twin", () => {
     // Same N and the same clustered base as the no-hub leg above, plus hub rows in web-NotreDame's shape,
     // scaled with N (hubDegrees): 0.52% of the rows, its five > 4096 hubs, and the rest between 257 and
