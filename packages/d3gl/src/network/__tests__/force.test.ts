@@ -178,6 +178,19 @@ describe("ForceLayout", () => {
     };
     expect(run()).toEqual(run());
   });
+
+  it("centres on the mass-weighted centroid the Barnes-Hut build summed", () => {
+    // Masses 9 and 1 at x = 0 and 100, no repulsion or springs: the centroid is x = 10, so centering
+    // pulls the light node 9× as far as the heavy one, towards each other.
+    const positions = new Float32Array([0, 0, 100, 0]);
+    const graph = { nodeCount: 2, edgeCount: 0, source: new Uint32Array(0), target: new Uint32Array(0), positions, mass: new Float32Array([9, 1]) };
+    const sim = new ForceLayout(graph, { repulsion: 0, attraction: 0, centering: 0.2 });
+    sim.tick();
+    const heavyStep = positions[0] ?? NaN;
+    const lightStep = (positions[2] ?? NaN) - 100;
+    expect(heavyStep).toBeGreaterThan(0);
+    expect(lightStep / heavyStep).toBeCloseTo(-9, 3);
+  });
 });
 
 describe("equilibrium scale", () => {
