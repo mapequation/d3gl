@@ -132,7 +132,9 @@ describe("startGpuLayout resumable reheat loop (#183)", () => {
     handle.pin(Uint32Array.of(0), new Float32Array([heldX, heldY]));
     const moved = (): boolean => {
       for (let n = 1; n <= 5; n++) {
-        if (Math.hypot(g.positions[n * 2]! - settledPos[n * 2]!, g.positions[n * 2 + 1]! - settledPos[n * 2 + 1]!) > 1) return true;
+        const dx = (g.positions[n * 2] ?? 0) - (settledPos[n * 2] ?? 0);
+        const dy = (g.positions[n * 2 + 1] ?? 0) - (settledPos[n * 2 + 1] ?? 0);
+        if (Math.hypot(dx, dy) > 1) return true;
       }
       return false;
     };
