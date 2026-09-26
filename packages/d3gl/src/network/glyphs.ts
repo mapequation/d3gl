@@ -177,7 +177,7 @@ export interface LinkStyleResolved {
   /** Per-edge width from its weight; for super-edges, applied to the accumulated subsumed weight. */
   widthOf: (weight: number) => number;
   /** Per-edge RGBA from its weight; for super-edges, applied to the accumulated subsumed weight. */
-  colorOf: (weight: number) => [number, number, number, number];
+  colorOf: (weight: number) => RGBAValue;
   /** Bend (#104 N6c): quadratic-bezier control offset ⟂ to the chord, as a fraction of chord length (0 = straight). */
   bend?: number;
 }
@@ -196,14 +196,38 @@ export function resolveLinkStrokeOf(spec: LinkColorSpec): (weight: number) => st
   return spec.scale; // { by, scale }: `by` is the per-edge weight (== flow); `scale` maps it to a colour
 }
 
-/** Resolve a {@link LinkColorSpec} to a `(weight) => RGBA` function (the WebGL twin of {@link resolveLinkStrokeOf}). */
-export function resolveLinkColorOf(spec: LinkColorSpec): (weight: number) => [number, number, number, number] {
+/** Most weights one resolved link colour remembers (see {@link resolveLinkColorOf}): ≈1 MB when full. */
+const LINK_COLOR_MEMO_MAX = 1 << 14;
+
+/**
+ * Resolve a {@link LinkColorSpec} to a `(weight) => RGBA` function (the WebGL twin of
+ * {@link resolveLinkStrokeOf}). Resolved once per style, and **memoised by weight**: a colour spec is
+ * a function of the weight, and a super-edge emit asks for the same accumulated weights frame after
+ * frame (a pair's flow is fixed by the tree), so the CSS accessor + `rgb()` parse run once per distinct
+ * weight instead of once per drawn edge per frame. A constant colour parses once. The memo holds up to
+ * {@link LINK_COLOR_MEMO_MAX} weights and starts over when full (a set of more distinct weights than
+ * that resolves each weight again, as before, never a wrong colour). The returned tuples are shared —
+ * read them, don't mutate them.
+ */
+export function resolveLinkColorOf(spec: LinkColorSpec): (weight: number) => RGBAValue {
+  if (typeof spec === "string") {
+    const constant = toRGBA(spec);
+    return () => constant;
+  }
   const cssOf = resolveLinkStrokeOf(spec);
-  return (w) => toRGBA(cssOf(w));
+  const memo = new Map<number, RGBAValue>();
+  return (w) => {
+    const hit = memo.get(w);
+    if (hit !== undefined) return hit;
+    if (memo.size >= LINK_COLOR_MEMO_MAX) memo.clear();
+    const c = toRGBA(cssOf(w));
+    memo.set(w, c);
+    return c;
+  };
 }
 
 /** Per-instance RGBA buffer for a batch of links, colouring each by its weight via `colorOf`. */
-function linkColorBytes(weights: ArrayLike<number>, count: number, colorOf: (weight: number) => [number, number, number, number]): Uint8Array {
+function linkColorBytes(weights: ArrayLike<number>, count: number, colorOf: (weight: number) => RGBAValue): Uint8Array {
   const colors = new Uint8Array(count * 4);
   for (let e = 0; e < count; e++) {
     const [r, g, b, a] = colorOf(weights[e]!);
@@ -214,6 +238,9 @@ function linkColorBytes(weights: ArrayLike<number>, count: number, colorOf: (wei
   }
   return colors;
 }
+
+/** A resolved link colour: RGBA bytes, shared between calls (memoised per weight) — read-only. */
+export type RGBAValue = readonly [number, number, number, number];
 
 /** Parse any CSS colour to RGBA bytes (alpha from opacity). */
 function toRGBA(css: string): [number, number, number, number] {
@@ -700,7 +727,7 @@ export interface SuperEdgeStyleResolved {
   /** Width from a super-edge's accumulated subsumed flow (the same scale as raw links). */
   widthOf: (weight: number) => number;
   /** Colour from the accumulated flow (the same scale as raw links). */
-  colorOf: (weight: number) => [number, number, number, number];
+  colorOf: (weight: number) => RGBAValue;
   /** Bend: a fraction of the chord, for `"line"` and `"half-arrow"` alike (#296) — as for raw links. */
   bend: number;
   /** Arrowhead size for the directed `"line"` style. */
@@ -1337,7 +1364,7 @@ export interface HalfArrowStyleResolved {
   /** Per-node radii (world units) — source foot at r0, arrow tip on the target's r1 boundary. */
   nodeRadii: Float32Array;
   widthOf: (weight: number) => number;
-  colorOf: (weight: number) => [number, number, number, number];
+  colorOf: (weight: number) => RGBAValue;
   /** Bend as a **fraction of the chord** (#296; sign picks the bow side). */
   bend: number;
 }
@@ -1347,7 +1374,7 @@ export interface ArrowStyleResolved {
   /** Per-node radii (world units) — the tip is set back by the *target* node's radius. */
   nodeRadii: Float32Array;
   /** Per-edge RGBA from weight — the arrowhead always matches its link's colour. */
-  colorOf: (weight: number) => [number, number, number, number];
+  colorOf: (weight: number) => RGBAValue;
   /** Bend (#104 N6c), matching the link's — the head sits on the bezier end-tangent. */
   bend?: number;
   /** Draw a one-sided **half** arrowhead (#104 N6c). */
@@ -1442,7 +1469,7 @@ export interface ResolvedNetworkStyle {
   /** Representative link colour (single colour, or a fallback for super-edges / Scene strokes). */
   linkStroke: string;
   /** Per-edge RGBA from weight; for super-edges, applied to accumulated weight. The arrow shares it. */
-  linkColorOf: (weight: number) => [number, number, number, number];
+  linkColorOf: (weight: number) => RGBAValue;
   /** Per-edge CSS colour from weight (the Scene/SVG twin of {@link linkColorOf}). */
   linkStrokeOf: (weight: number) => string;
   /** How directed links draw: `"line"` + arrowhead, or a fused `"half-arrow"` (the map glyph). */

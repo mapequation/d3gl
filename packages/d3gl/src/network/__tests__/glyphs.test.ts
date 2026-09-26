@@ -1,6 +1,8 @@
 import { describe, it, expect } from "vitest";
 import { nodeCircles, linkLines, linkArrows, halfArrowLinks, networkLayers, networkLayersFromCache, noLodStyleCache, drawsLinks, pickNodes, resolveNodeRadii, resolveImportance, resolveLinkColorOf, resolveLinkStrokeOf, type ResolvedNetworkStyle } from "../glyphs.js";
 import { buildGraph } from "../graph.js";
+import { scaleSqrt } from "d3-scale";
+import { rgb } from "d3-color";
 
 /** A resolved style with a uniform radius for `n` nodes (defaults applied elsewhere). */
 const style = (n: number): ResolvedNetworkStyle => ({
@@ -53,6 +55,51 @@ describe("link colour {by,scale} parity", () => {
   it("still accepts a bare colour and a (weight)=>css function", () => {
     expect(resolveLinkStrokeOf("#abcdef")(99)).toBe("#abcdef");
     expect(resolveLinkStrokeOf((w) => (w > 1 ? "#111111" : "#eeeeee"))(2)).toBe("#111111");
+  });
+});
+
+describe("link colour resolution is memoised per style (per-frame colour parse)", () => {
+  // The d3 colour scale the Network Navigator passes: an interpolated rgba() string per weight.
+  const scale = scaleSqrt<string>().domain([0, 40]).range(["rgba(90,100,120,0.12)", "rgba(60,70,90,0.85)"]).clamp(true);
+  const parsed = (css: string): number[] => {
+    const c = rgb(css);
+    return [Math.round(c.r) & 255, Math.round(c.g) & 255, Math.round(c.b) & 255, Math.round((Number.isNaN(c.opacity) ? 1 : c.opacity) * 255) & 255];
+  };
+
+  it("runs the colour accessor once per distinct weight, not once per call — same RGBA as parsing every call", () => {
+    let calls = 0;
+    const colorOf = resolveLinkColorOf((w: number) => {
+      calls++;
+      return scale(w);
+    });
+    // A super-edge sweep revisits the same accumulated weights frame after frame.
+    const weights = [1, 2, 3, 5, 8, 13, 21, 34, 55, 1.5, 0.25];
+    for (let frame = 0; frame < 20; frame++) {
+      for (const w of weights) expect(Array.from(colorOf(w)), `w=${w}`).toEqual(parsed(scale(w)));
+    }
+    expect(calls).toBe(weights.length);
+  });
+
+  it("parses a constant stroke once for the style", () => {
+    const colorOf = resolveLinkColorOf("rgba(10, 20, 30, 0.5)");
+    expect(Array.from(colorOf(1))).toEqual([10, 20, 30, 128]);
+    expect(colorOf(2)).toBe(colorOf(7)); // one resolved tuple, whatever the weight
+  });
+
+  it("stays exact past its bound (a weight set larger than the memo)", () => {
+    let calls = 0;
+    const colorOf = resolveLinkColorOf((w: number) => {
+      calls++;
+      return scale(w);
+    });
+    const n = 50_000; // more distinct weights than the memo holds
+    for (let i = 0; i < n; i++) {
+      const w = i / 1000;
+      const got = colorOf(w);
+      if (i % 997 === 0) expect(Array.from(got), `w=${w}`).toEqual(parsed(scale(w)));
+    }
+    expect(calls).toBe(n); // every distinct weight resolved once; nothing is dropped or reused wrongly
+    expect(Array.from(colorOf(0.5))).toEqual(parsed(scale(0.5)));
   });
 });
 
