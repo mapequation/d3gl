@@ -33,11 +33,12 @@
 
 import { describe, it, expect, beforeAll, vi } from "vitest";
 import type { Device } from "@luma.gl/core";
+import { Model } from "@luma.gl/engine";
 import { makeTestDevice } from "./_device.js";
 import { GpuForceLayout } from "../gpu-force-layout.js";
 import { buildCSR, buildGraph } from "../../graph.js";
 import type { LayoutGraph } from "../../force.js";
-import { buildHubChunks } from "../hub-chunks.js";
+import { buildHubChunks, SPRING_CHUNK } from "../hub-chunks.js";
 import { atlasWidth } from "../textures.js";
 import { perfBudget, perfN } from "../../../__tests__/perf-budget.js";
 
@@ -156,26 +157,56 @@ function makeClusteredGraph(count: number, communities: number, seed: number): L
   return g;
 }
 
+/** web-NotreDame's five hubs above the old 4096 cap (the rows it truncated, #350). */
+const CAPPED_HUBS = [10_721, 7_636, 7_026, 4_321, 4_283];
+/** web-NotreDame's hub rows (> SPRING_CHUNK entries) per node: 1,705 of 325,729. */
+const HUB_ROW_SHARE = 1_705 / 325_729;
+
 /**
- * `base` plus web-NotreDame's five > 4096 hubs (degrees 10,721, 7,636, 7,026, 4,321, 4,283), each linked
- * to that many distinct random nodes — the rows the old gather capped at 4096 (#350). Same node count,
- * so the pyramid (and every other pass) is the same as `base`'s; only the springs differ.
+ * Hub row degrees in web-NotreDame's shape, scaled to `n` nodes: {@link CAPPED_HUBS} plus enough rows
+ * between 257 and 4096 entries to make 0.52% of the rows hubs. Those follow a truncated power law
+ * (CCDF exponent 2.9, sampled at stratified quantiles, so deterministic) whose mean, ~390 entries,
+ * matches web-NotreDame's 1,700 such rows (667,655 entries, mean 393). So the chunk count K grows with N
+ * as it does there (K ≈ N/29 on web-NotreDame).
  */
-function withHubs(base: LayoutGraph, seed: number): LayoutGraph {
+function hubDegrees(n: number): number[] {
+  const rows = Math.max(CAPPED_HUBS.length, Math.round(n * HUB_ROW_SHARE));
+  const lo = SPRING_CHUNK + 1;
+  const hi = 4_096;
+  const beta = 2.9;
+  const t = 1 - (lo / hi) ** beta;
+  const m = rows - CAPPED_HUBS.length;
+  const tail = Array.from({ length: m }, (_, i) => Math.round(lo * (1 - ((i + 0.5) / m) * t) ** (-1 / beta)));
+  return [...CAPPED_HUBS, ...tail].map((d) => Math.min(d, n - 1));
+}
+
+/**
+ * `base` plus hub rows in web-NotreDame's shape ({@link hubDegrees}): each hub is linked to `degree`
+ * distinct random nodes. Same node count, so the pyramid (and every other pass) is the same as `base`'s.
+ *
+ * With `spread`, the same leaf endpoints are linked to random nodes instead of to the hubs: the same
+ * edge count and CSR size, but no row near {@link SPRING_CHUNK}. That twin is the ratio leg's control,
+ * so the ratio isolates the hub path (chunk pass + partial gather) from the extra springs themselves.
+ */
+function withHubs(base: LayoutGraph, seed: number, spread = false): LayoutGraph {
   const rng = makePrng(seed);
+  // Its own stream, so the twin keeps the same hub offsets, hence the same leaves and edge count.
+  const spreadRng = makePrng(seed ^ 0x9e3779b9);
   const n = base.nodeCount;
-  const hubDegrees = [10_721, 7_636, 7_026, 4_321, 4_283].map((d) => Math.min(d, n - 6));
+  const degrees = hubDegrees(n);
   const src = Array.from(base.source);
   const tgt = Array.from(base.target);
-  hubDegrees.forEach((degree, h) => {
+  // A stride walk with a stride coprime to n visits `degree` distinct nodes.
+  let stride = 7919;
+  while (gcd(stride, n) !== 1) stride += 2;
+  degrees.forEach((degree, h) => {
+    const hub = Math.floor(((h + 0.5) * n) / degrees.length);
     const offset = Math.floor(rng() * n);
-    // A stride walk with a stride coprime to n visits `degree` distinct nodes.
-    let stride = 7919;
-    while (gcd(stride, n) !== 1) stride += 2;
     for (let k = 0; k < degree; k++) {
       const leaf = (offset + k * stride) % n;
-      if (leaf === h) continue;
-      src.push(h);
+      if (leaf === hub) continue;
+      const other = spread ? Math.floor(spreadRng() * n) : hub;
+      src.push(other === leaf ? (leaf + 1) % n : other);
       tgt.push(leaf);
     }
   });
@@ -192,38 +223,29 @@ function gcd(a: number, b: number): number {
   return b === 0 ? a : gcd(b, a % b);
 }
 
-/** Counts `drawArrays` calls and records each one's viewport size (the fragments a full-screen pass covers). */
-class DrawSpy {
-  readonly viewports: string[] = [];
-  private readonly orig: WebGL2RenderingContext["drawArrays"];
-
-  constructor() {
-    const proto = WebGL2RenderingContext.prototype;
-    this.orig = proto.drawArrays;
-    const spy = this;
-    proto.drawArrays = function (this: WebGL2RenderingContext, mode: GLenum, first: GLint, count: GLsizei): void {
-      // luma's context-state tracker answers VIEWPORT from its cache (a plain array); raw WebGL gives an
-      // Int32Array.
-      const vp: unknown = this.getParameter(this.VIEWPORT);
-      spy.viewports.push(vp instanceof Int32Array || Array.isArray(vp) ? `${vp[2]}x${vp[3]}` : "?");
-      spy.orig.call(this, mode, first, count);
-    };
-  }
-
-  restore(): void {
-    WebGL2RenderingContext.prototype.drawArrays = this.orig;
-  }
+/** The hub chunk count K of `graph`'s CSR (0 when no row is longer than SPRING_CHUNK). */
+function chunkCount(graph: LayoutGraph): number {
+  return buildHubChunks(buildCSR(graph.nodeCount, graph.source, graph.target).offsets).count;
 }
 
-/** The draws of one tick of `layout`, as viewport sizes (sorted, so two ticks compare as multisets). */
+/**
+ * The draws of one tick of `layout`, as the size of the framebuffer each draw renders into — the
+ * fragments a full-screen pass covers (sorted, so two ticks compare as multisets). Every GPU layout pass
+ * draws through luma's `Model.draw`.
+ */
 function tickDraws(layout: GpuForceLayout): string[] {
-  const spy = new DrawSpy();
+  const spy = vi.spyOn(Model.prototype, "draw");
   try {
     layout.runFrame(1);
+    return spy.mock.calls
+      .map(([pass]) => {
+        const fbo = pass.props.framebuffer;
+        return fbo ? `${fbo.width}x${fbo.height}` : "canvas";
+      })
+      .sort();
   } finally {
-    spy.restore();
+    spy.mockRestore();
   }
-  return spy.viewports.slice().sort();
 }
 
 describe("GPU frame budget — pyramid path (per-tick regression tripwire)", () => {
@@ -376,22 +398,30 @@ describe("GPU frame budget — pyramid path (per-tick regression tripwire)", () 
     layout.destroy();
   });
 
-  it("hub springs (#350): a tick with web-NotreDame's > 4096 hubs stays under the same ceiling and near the no-hub tick", () => {
-    // Same N and the same clustered base as the no-hub leg above, plus the five hubs (~34k more edges,
-    // about half of all CSR entries on hub rows, twice web-NotreDame's 23%). Every hub entry is now
-    // gathered — O(2E) — through ≤ HUB_CHUNK-entry chunks, so the tick keeps the no-hub ceiling (the
-    // chunk pass is K ≈ 530 fragments here, next to the N-fragment passes).
+  it("hub springs (#350): a tick with web-NotreDame-shaped hub rows stays under the same ceiling and near its hub-free twin", () => {
+    // Same N and the same clustered base as the no-hub leg above, plus hub rows in web-NotreDame's shape,
+    // scaled with N (hubDegrees): 0.52% of the rows, its five > 4096 hubs, and the rest between 257 and
+    // 4096 entries, so the chunk count K grows with N as there (asserted below, K ≥ N/30). That puts
+    // about a third of the CSR entries on hub rows (web-NotreDame: 23%), and at the tier's 200k cap the
+    // fixture has ~1.4M half-edges. The control is the same edges with the hub endpoints spread over
+    // random nodes, so both ticks gather the same CSR and only the hub path (chunk pass + partial gather)
+    // differs.
     //
-    // The ratio leg is the one with teeth: the absolute ceiling is 10× headroom, but a hub branch that
-    // runs away on some texels costs a multiple of the whole tick. Measured: a uint wrap on padded
-    // texels (ANGLE/Metal keeps executing after `discard`) made this tick 5-7× the no-hub one (348-611 ms
-    // vs 49-82 ms, M1 Max); fixed, the two are within noise (springs are a small share of a tick).
+    // The ratio is the assertion with teeth: the absolute ceiling is 10× headroom, but a hub branch that
+    // runs away on some texels costs a multiple of the whole tick. Measured with the five hubs alone: a
+    // uint wrap on padded texels (ANGLE/Metal keeps executing after `discard`) made this tick 5-7× the
+    // no-hub one (348-611 ms vs 49-82 ms, M1 Max); fixed, the two are within noise.
     const LOCAL_N = 30_000;
     const N = perfN(LOCAL_N, { max: 200_000 });
     const CEILING_MS = perfBudget(10_000 * (N / LOCAL_N));
     const REPEATS = N > 100_000 ? 2 : 3;
-    const plain = makeClusteredGraph(N, 80, 0xdeadbeef);
-    const hubbed = withHubs(plain, 0x4ab);
+    const base = makeClusteredGraph(N, 80, 0xdeadbeef);
+    const hubbed = withHubs(base, 0x4ab);
+    const plain = withHubs(base, 0x4ab, true);
+    expect(plain.edgeCount).toBe(hubbed.edgeCount);
+    const K = chunkCount(hubbed);
+    expect(chunkCount(plain)).toBe(0);
+    expect(K).toBeGreaterThanOrEqual(N / 30);
     const params = { repulsion: 200, attraction: 0.05, centering: 0.2, alpha: 0.05, theta: 0.7 };
     const out = new Float32Array(N * 2);
 
@@ -413,8 +443,8 @@ describe("GPU frame budget — pyramid path (per-tick regression tripwire)", () 
     const plainMs = minTick(plain);
     const hubMs = minTick(hubbed);
     console.log(
-      `  GPU frame budget (hubs): N=${N} E=${hubbed.edgeCount} vs ${plain.edgeCount}, ` +
-      `min-of-${REPEATS} ${hubMs.toFixed(1)}ms vs ${plainMs.toFixed(1)}ms without hubs (ceiling=${CEILING_MS}ms)`,
+      `  GPU frame budget (hubs): N=${N} E=${hubbed.edgeCount} (${hubDegrees(N).length} hub rows, K=${K}), ` +
+      `min-of-${REPEATS} ${hubMs.toFixed(1)}ms vs ${plainMs.toFixed(1)}ms hub-free twin (ceiling=${CEILING_MS}ms)`,
     );
     expect(hubMs).toBeLessThan(CEILING_MS);
     expect(hubMs).toBeLessThan(2 * plainMs + perfBudget(10));
@@ -428,9 +458,9 @@ describe("GPU frame budget — pyramid path (per-tick regression tripwire)", () 
     const N = 30_000;
     const plain = makeClusteredGraph(N, 80, 0xcafe1234);
     const hubbed = withHubs(plain, 0x77);
-    const K = buildHubChunks(buildCSR(N, hubbed.source, hubbed.target).offsets).count;
-    expect(buildHubChunks(buildCSR(N, plain.source, plain.target).offsets).count).toBe(0);
-    expect(K).toBeGreaterThan(0);
+    const K = chunkCount(hubbed);
+    expect(chunkCount(plain)).toBe(0);
+    expect(K).toBeGreaterThanOrEqual(N / 30);
     const params = { repulsion: 200, attraction: 0.05, centering: 0.2, alpha: 0.05, theta: 0.7 };
 
     const plainLayout = new GpuForceLayout(device, plain, params, { repulsionMode: "pyramid" });
