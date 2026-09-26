@@ -510,7 +510,7 @@ export class GpuForceLayout {
   seedFromProlongation(run: (pass: RenderPass) => void): void {
     // readFbos[0] wraps the current read-side position texture (A, parity 0 at construction), so
     // writing it here seeds exactly what the next tick reads.
-    const pass = beginPass(this.device, { framebuffer: this.readFbos[0]!, clear: false });
+    const pass = beginPass(this.device, { framebuffer: this.readFbos[0], clear: false });
     run(pass);
     pass.end();
     this.device.submit();
