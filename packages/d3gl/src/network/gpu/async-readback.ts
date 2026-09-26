@@ -3,8 +3,8 @@
  * `graph.positions` in a later frame once a fence after the copy has signalled — never a synchronous
  * `readPixels` on the frame path.
  *
- * - **One raw position PBO** (spec §15 Q9), created with `gl.createBuffer()` + `bufferData(…,
- *   STREAM_READ)`. luma 9.3.3 cannot make a `*_READ` buffer (its `WEBGLBuffer` emits only `STATIC_DRAW` /
+ * - **One raw position PBO** (spec §15 Q9), created with `gl.createBuffer()` and sized by the first
+ *   copy with `bufferData(…, STREAM_READ)`. luma 9.3.3 cannot make a `*_READ` buffer (its `WEBGLBuffer` emits only `STATIC_DRAW` /
  *   `DYNAMIC_DRAW`), and without a read usage Chrome's `getBufferSubData` cannot use its readback shadow
  *   copy: it falls back to a synchronous round trip to the GPU process. So the PBO is created raw, as
  *   `PickReadback` does, on the `WebGLDevice`'s context (reached by an `instanceof` narrowing, no cast).
@@ -59,14 +59,14 @@ function fboHandle(fbo: Framebuffer): WebGLFramebuffer {
   return fbo.handle;
 }
 
-/** A raw `STREAM_READ` pixel-pack buffer of `bytes`; the previous binding is restored. */
-function streamReadBuffer(gl: WebGL2RenderingContext, bytes: number): WebGLBuffer {
+/**
+ * A raw pixel-pack buffer. Its `STREAM_READ` storage is sized by the first copy ({@link sizeOnce}), not
+ * here: Chrome counts the sizing `bufferData` as a write, so sizing it a frame before the first
+ * `readPixels` would leave a fence in between and log "written again before being read back" once.
+ */
+function packBuffer(gl: WebGL2RenderingContext): WebGLBuffer {
   const pbo = gl.createBuffer();
   if (pbo === null) throw new Error("AsyncPositionReadback: could not create a readback buffer");
-  const previous: WebGLBuffer | null = gl.getParameter(gl.PIXEL_PACK_BUFFER_BINDING);
-  gl.bindBuffer(gl.PIXEL_PACK_BUFFER, pbo);
-  gl.bufferData(gl.PIXEL_PACK_BUFFER, bytes, gl.STREAM_READ);
-  gl.bindBuffer(gl.PIXEL_PACK_BUFFER, previous);
   return pbo;
 }
 
@@ -85,6 +85,8 @@ export class AsyncPositionReadback {
   private readonly pack: PackPositionsPass | null;
   private readonly packStats: PackStatsPass;
   private copying = false;
+  /** Whether the PBOs' storage has been allocated (by the first copy). */
+  private sized = false;
 
   constructor(device: Device, source: ReadbackSource) {
     if (!(device instanceof WebGLDevice)) throw new Error("AsyncPositionReadback: a WebGL2 device is required");
@@ -95,8 +97,8 @@ export class AsyncPositionReadback {
     this.positionBytes = this.pack
       ? this.pack.width * this.pack.height * 16
       : source.positionWidth * source.atlasRows * 8;
-    this.pbo = streamReadBuffer(this.gl, this.positionBytes);
-    this.statsPbo = streamReadBuffer(this.gl, STATS_BYTES);
+    this.pbo = packBuffer(this.gl);
+    this.statsPbo = packBuffer(this.gl);
   }
 
   /** Whether a copy has been issued and not yet harvested (the PBOs are busy). */
@@ -121,7 +123,10 @@ export class AsyncPositionReadback {
     this.packStats.run(source.segmentStats.stats, source.segmentStats.box);
     const previousRead: WebGLFramebuffer | null = gl.getParameter(gl.READ_FRAMEBUFFER_BINDING);
     const previousPack: WebGLBuffer | null = gl.getParameter(gl.PIXEL_PACK_BUFFER_BINDING);
+    const first = !this.sized;
+    this.sized = true;
     gl.bindBuffer(gl.PIXEL_PACK_BUFFER, this.pbo);
+    if (first) gl.bufferData(gl.PIXEL_PACK_BUFFER, this.positionBytes, gl.STREAM_READ);
     if (pack) {
       gl.bindFramebuffer(gl.READ_FRAMEBUFFER, fboHandle(pack.framebuffer));
       gl.readPixels(0, 0, pack.width, pack.height, gl.RGBA, gl.FLOAT, 0);
@@ -130,6 +135,7 @@ export class AsyncPositionReadback {
       gl.readPixels(0, 0, source.positionWidth, source.atlasRows, gl.RG, gl.FLOAT, 0);
     }
     gl.bindBuffer(gl.PIXEL_PACK_BUFFER, this.statsPbo);
+    if (first) gl.bufferData(gl.PIXEL_PACK_BUFFER, STATS_BYTES, gl.STREAM_READ);
     gl.bindFramebuffer(gl.READ_FRAMEBUFFER, fboHandle(this.packStats.framebuffer));
     gl.readPixels(0, 0, 2, 1, gl.RGBA, gl.FLOAT, 0);
     gl.bindFramebuffer(gl.READ_FRAMEBUFFER, previousRead);
