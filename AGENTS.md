@@ -383,7 +383,7 @@ per-file timeout. Every at-scale leg below now asserts. When you add a guard, ad
 | declutter flags upload | **WebGL** | `map/declutter-flags-perf.browser.test.ts` | 2k engine / 1M fn | `PERF_BROWSER_N` (max 2M) |
 | hover overlay reuse | **WebGL** | `map/hover-overlay-perf.browser.test.ts` | 1000 glyphs / 125 hover changes | ✗ **deliberately unscaled** |
 | instanced pie | **WebGL** | `webgl/__tests__/instanced-pie-perf.browser.test.ts` | 100k | `PERF_BROWSER_N` |
-| GPU layout tick (+ #349 signatures: no draw of ≥ N vertices × instances into a 1×1 viewport, via any of the five WebGL2 draw calls; zero texture / framebuffer / buffer creation per tick) | **WebGL** | `network/gpu/__tests__/gpu-frame-budget-perf.browser.test.ts` | 30k | `PERF_BROWSER_N` (max 200k) |
+| GPU layout tick (+ #349 signatures: no draw of ≥ N vertices × instances into a 1×1 viewport, via any of the five WebGL2 draw calls; zero texture / framebuffer / buffer creation per tick); hub springs (#350): tick with web-NotreDame's five > 4096 hubs ≤ 2× the no-hub tick, and exactly one extra draw (the chunk pass, K fragments) with no per-tick allocation | **WebGL** | `network/gpu/__tests__/gpu-frame-budget-perf.browser.test.ts` | 30k | `PERF_BROWSER_N` (max 200k) |
 | GPU layout position readback through `GpuForceLayout.readPositions`, `RGBA/FLOAT` (a device that refuses `RG/FLOAT`) and `RG/FLOAT` (#351): exact positions, no GPU allocation and one `readPixels` per readback, one retained RGBA scratch | **WebGL** | `network/gpu/__tests__/gpu-readback-perf.browser.test.ts` | 1M | `PERF_BROWSER_N` (max 4M) |
 | React recolor vs build | **WebGL** | `react/perf.browser.test.ts` | 4096 | capped at 8192 — see below |
 | `"auto"` placeholder emit | Canvas→**WebGL** | `map/auto-placeholder-perf.browser.test.ts` | 200k edges / 200k points | `PERF_BROWSER_N` (max 611k) |
@@ -513,6 +513,19 @@ off by 5.5e-4 world units, where a serial float32 chain is off by ~130.
   luma's default clear wipes the **whole** attachment, because `gl.clear` ignores the viewport (only a
   scissor limits it). `beginPass` takes the clear as a required argument, so no call site can get the
   default by omission.
+
+## GPU layout shaders: `discard` does not end the invocation (#350)
+
+The GPU force layout computes in raster: one fragment per node over a square atlas, so the last row
+holds **padded texels** past the last node, and every per-node pass starts with
+`if (id >= u_count) { discard; }`. Do not rely on that `discard` to skip the rest of the shader. On
+ANGLE's Metal backend the invocation kept running: the hub branch of the spring gather computed a row
+length as `end - start` from the offsets texture, the padding (0) made it wrap to ~2^32, and the
+discarded texel ran a 16M-iteration loop — 280 ms per draw instead of 0.7 ms, with correct output (the
+result is discarded), so only timing showed it. **Keep every loop bound finite on padded texels**:
+compare as `end > start + C`, never `end - start > C` on `uint`s. The per-tick ratio guard in
+`gpu-frame-budget-perf.browser.test.ts` (hub tick ≤ 2× the no-hub tick) is what catches this class;
+the absolute ceiling has 10× headroom and did not.
 
 ## Host sizing: backend canvases are OUT OF FLOW (#39, re-confirmed in #273)
 
