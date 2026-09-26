@@ -31,6 +31,29 @@ describe("buildCSR", () => {
     expect(Array.from(csr.offsets)).toEqual([0, 1, 2, 2]);
     expect(neighborsOf(csr, 2)).toEqual([]);
   });
+
+  it("scatters per-edge weights parallel to the neighbors, one per entry on both endpoints", () => {
+    // Edge e has weight 10 + e, so each CSR entry names the edge it came from.
+    const source = [0, 1, 1, 3];
+    const target = [1, 2, 3, 0];
+    const csr = buildCSR(4, source, target, [10, 11, 12, 13]);
+    const weights = csr.weights;
+    expect(weights).toBeInstanceOf(Float32Array);
+    expect(weights?.length).toBe(csr.neighbors.length);
+    for (let i = 0; i < 4; i++) {
+      for (let p = csr.offsets[i] ?? 0; p < (csr.offsets[i + 1] ?? 0); p++) {
+        const j = csr.neighbors[p];
+        const e = (weights?.[p] ?? 0) - 10;
+        // The entry's edge joins i and j, in either direction.
+        const ends = [source[e], target[e]].sort();
+        expect(ends).toEqual([i, j].sort());
+      }
+    }
+  });
+
+  it("builds no weights array without edge weights", () => {
+    expect(buildCSR(2, [0], [1]).weights).toBeUndefined();
+  });
 });
 
 describe("buildGraph", () => {
