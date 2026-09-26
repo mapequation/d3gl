@@ -275,7 +275,11 @@ export interface NetworkLayoutOptions {
    * — the GPU solve centres the centroid at the origin, so it would otherwise render at the top-left
    * corner until it settles. Default `false`. Ignored for `"positions"` / `"force"` (already final on
    * the first paint). The box is tight whether LOD is on or off, and ignores a handful of flung-out
-   * stragglers; computing it costs O(nodes) per streamed frame, only while the fit is on.
+   * stragglers: at most min(64, 0.5% of the nodes) per side, and only when they sit 10-30% or more of the
+   * layout's size beyond the rest. A small disconnected component that far out is dropped the same way and
+   * opens just outside the frame. The pad covers the largest node glyph; with LOD on, an aggregate glyph
+   * larger than that can overhang the frame's edge margin. Computing the box costs O(nodes) per streamed
+   * frame, only while the fit is on.
    */
   fit?: boolean;
   /**
@@ -345,7 +349,8 @@ export interface NestedLayoutConfig {
  * On the **WebGL** lane the cut re-runs live every pan/zoom frame. On the **Canvas/SVG** (retained)
  * backends the same frontier draws as Scene layers — so `toSVG()` exports a level-of-detail map (#138) —
  * but the retained Scene can't re-tessellate per frame, so there the frontier is static during a gesture
- * and re-cuts on release (the redraw-on-zoom-end model; force one with {@link Network.syncScreenGeometry}).
+ * and re-cuts on release, and after a programmatic `setTransform` while zoom is enabled (the
+ * redraw-on-zoom-end model; force one with {@link Network.syncScreenGeometry}).
  */
 export interface NetworkLODOptions {
   /**
@@ -638,7 +643,10 @@ export class Network extends BaseEngine {
    */
   private fitKnownBox: FitBox | null = null;
   /** The largest leaf radius per resolved style, for the fit's pad ({@link fitViewToLayout}): O(nodes)
-   *  once per style, then read per frame. Weakly keyed, so a replaced style is never kept alive by it. */
+   *  once per style, then read per frame. Weakly keyed, so a replaced style is never kept alive by it. A
+   *  state network's `both` view re-resolves its style on every streamed frame (its dot radius tracks the
+   *  layout scale; {@link applyStateDerivedPositions}), so there the scan runs once per streamed frame, on
+   *  top of that frame's own O(state nodes) style resolution. */
   private readonly fitRadii = new WeakMap<ResolvedNetworkStyle, number>();
   /** Pending coalesced repaint rAF id (0 = none) for progressive worker frames. */
   private layoutRepaintRaf = 0;
@@ -1733,8 +1741,12 @@ export class Network extends BaseEngine {
    * callback re-derives the rosette from the just-streamed physical positions (O(physicalCount) sizing +
    * O(stateCount) placement) before the LOD/render step, so the state/both views track the physical
    * layout live instead of only once it settles.
+   *
+   * Protected, not private, so an engine-level per-frame guard can drive the streamed frame itself (the
+   * transport's position copy, then this) from a subclass, without a cast — a real worker streams too
+   * slowly and irregularly at guard scale to time frames by.
    */
-  private scheduleLayoutRepaint(): void {
+  protected scheduleLayoutRepaint(): void {
     // Raised at message time (not in the rAF): a pan between a streamed frame and its coalesced
     // repaint must not label from a grid indexing the pre-stream positions (#212).
     this.labelSource.stale = true;
@@ -1778,7 +1790,8 @@ export class Network extends BaseEngine {
     this.syncZoomToView(); // keep the gesture seeded to the framed view so an interaction never jumps
   }
 
-  /** The largest leaf radius of `style`, in its `sizeMode`'s units — O(nodes) once per resolved style. */
+  /** The largest leaf radius of `style`, in its `sizeMode`'s units — O(nodes) once per resolved style
+   *  (once per streamed frame in a state network's `both` view, see {@link fitRadii}). */
   private maxLeafRadius(style: ResolvedNetworkStyle): number {
     let r = this.fitRadii.get(style);
     if (r === undefined) {
@@ -2805,8 +2818,9 @@ export class Network extends BaseEngine {
    * backend reproduces the WebGL screen look at any zoom (the retained Scene can't recompute a
    * screen-space shape per frame, so it's baked into world coords at the active transform; see
    * {@link registerNetworkScene}). **No-op on WebGL** (the shader does it live) and when not drawing
-   * screen-mode half-arrows. Called automatically on backend switch and at interaction-end; call it
-   * explicitly for a "refit" button or before a programmatic export at a chosen transform.
+   * screen-mode half-arrows. Called automatically on backend switch, at interaction-end, and after a
+   * programmatic `setTransform` while zoom is enabled; call it explicitly for a "refit" button, after a
+   * `setTransform` without zoom, or before a programmatic export at a chosen transform.
    */
   syncScreenGeometry(): this {
     const backend = this.backend();
@@ -2832,6 +2846,14 @@ export class Network extends BaseEngine {
   override setTransform(t: ViewTransform): this {
     this.fitOnLayout = false;
     return super.setTransform(t);
+  }
+
+  /** With zoom enabled, a programmatic view change (a zoom-to) settles like a gesture's end: the Canvas/SVG
+   *  LOD frontier and screen-mode bake re-cut to the new view (O(drawn nodes + edges), once per call, never
+   *  per gesture frame). A no-op on WebGL, whose lane re-cuts live. */
+  protected override afterProgrammaticTransform(): void {
+    super.afterProgrammaticTransform();
+    this.syncScreenGeometry();
   }
 
   /**

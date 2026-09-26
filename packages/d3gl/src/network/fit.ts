@@ -61,7 +61,10 @@ function sideBound(exact: number, trimmed: number, size: number): number {
  * Robust to force-layout **fling-outs** (#206): a side drops its outermost leaves — at most
  * `min(64, 0.5% of the leaves)` of them — when they sit more than ~10-30% of the layout's size beyond the
  * rest, so one leaf flung 20× away cannot blow the frame up and shrink the rest to a dot. A group larger
- * than that is part of the layout and is framed; so is a sparse but contiguous edge (a disc's rim).
+ * than that is part of the layout and is framed; so is a sparse but contiguous edge (a disc's rim). The
+ * trade-off: a genuinely separate group no larger than the trim count — a small disconnected component, an
+ * isolate — that sits that far out is dropped the same way and opens outside the framed view (zoom out to
+ * see it). Layouts under 200 leaves are never trimmed.
  *
  * Cost: O(leaves), no allocation. One branch-free pass for the exact bounds, then a count of the leaves in
  * each side's outer 5% band that certifies a layout without stragglers (and usually stops after a few

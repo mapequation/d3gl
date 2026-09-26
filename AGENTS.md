@@ -414,6 +414,7 @@ guard owns the serialize budget: one DOM node per drawable buys parse time, not 
 | **`network()` engine sweep**, LOD on **and** off | **WebGL** | `network/__tests__/network-sweep-perf.browser.test.ts` | 50k nodes / 50k edges | `PERF_BROWSER_N` (max 200k) |
 | **`network()` position transition** (#328), LOD on **and** off, vs a streamed frame | **WebGL** | `network/__tests__/network-transition-perf.browser.test.ts` | 50k nodes | `PERF_BROWSER_N` (max 200k) |
 | **`network()` module boundaries** (#329), sweep on vs off + every module open | **WebGL** | `network/__tests__/network-module-boundary-perf.browser.test.ts` | 50k nodes | `PERF_BROWSER_N` (max 200k) |
+| **`network()` streaming fit** (#327), per streamed frame, fit on vs off at an equal view, LOD on **and** off; box once per frame, never on zoom frames or after release | **WebGL** | `network/__tests__/network-fit-stream-perf.browser.test.ts` | 50k nodes | `PERF_BROWSER_N` (max 200k) |
 | multi pass-through: FBO count + gesture skip | **WebGL** | `map/passthrough-multi-perf.browser.test.ts` | 25k ×2 layers | `PERF_BROWSER_N` (max 50k) |
 | label placement (`cullLabels`) | — | `labels/__tests__/label-cull-perf.test.ts` | 200k candidates, dense **and** spread | `BENCH_LABEL_CULL` |
 | **`network.labels()` per-frame**, LOD on **and** off | **WebGL** | `network/__tests__/network-labels-perf.browser.test.ts` | 20k nodes, uncapped | `PERF_BROWSER_N` (max 50k) |

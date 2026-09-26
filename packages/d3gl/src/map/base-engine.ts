@@ -1336,7 +1336,8 @@ export abstract class BaseEngine {
     // before zooming (#202). Skipped during a gesture — that setTransform came FROM d3-zoom and is
     // already in step, and re-seeding there would add a `behavior.transform` apply per zoom frame.
     // No-ops when zoom isn't enabled.
-    if (!this.inZoomGesture) this.syncZoomToView();
+    const programmatic = !this.inZoomGesture;
+    if (programmatic) this.syncZoomToView();
     this.handle?.backend.setTransform(t);
     for (const [name, entry] of this.instancedLanes) if (entry.dynamic) this.emitInstancedLane(name);
     for (const spec of this.specs) if (spec.declutter) this.declutterLayer(spec, t);
@@ -1350,7 +1351,22 @@ export abstract class BaseEngine {
     // programmatic/settle transform, re-pull + crisp redraw every layer. The size check keeps
     // the zoom path of a retained-only chart free of even the call (#110 kept it deliberately).
     if (this.ptSpecs.size > 0 && !this.interacting) this.repaintPassThrough();
+    // With zoom enabled, a programmatic view change outside a gesture is a finished view change — it settles
+    // like a gesture's end (#309). Without zoom the caller drives the camera, possibly every frame, and the
+    // engine cannot tell when a sequence ends, so it does nothing extra.
+    if (programmatic && this.zoomBehavior && !this.interacting) this.afterProgrammaticTransform();
     return this;
+  }
+
+  /**
+   * Runs after a programmatic {@link setTransform} while zoom is enabled and no gesture is in progress:
+   * the view moved under the pointer, so drop the hover artifacts (tooltip, auto-highlight) that described
+   * the glyph under it before. Subclasses re-cut view-dependent retained geometry here too (the network's
+   * Canvas/SVG LOD frontier). Before #309 this ran as a side effect of the engine's own d3-zoom re-seed,
+   * which was treated as a whole gesture. Not called for the zoom gesture's own frames: its end handles that.
+   */
+  protected afterProgrammaticTransform(): void {
+    this.clearHoverState();
   }
 
   /** Called by {@link setTransform} just before the render (zoom frame or programmatic), after lanes
@@ -1635,6 +1651,8 @@ export abstract class BaseEngine {
    * Enable scroll-to-zoom / drag-to-pan via d3-zoom, clamped to `extent`. The optional
    * `onTransform` callback fires after each `setTransform` during zoom — use it to keep an
    * HTML overlay (e.g. a `LabelLayer`) aligned with the GPU geometry as the view changes.
+   * It fires for user gestures only: not for the view current at enable time (the one last passed
+   * to `setTransform`, identity by default), and not for a programmatic `setTransform`.
    */
   enableZoom(extent: [number, number] = [1, 100], onTransform?: (t: ViewTransform) => void): this {
     this.disableInteraction();

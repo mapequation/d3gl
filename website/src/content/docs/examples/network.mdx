@@ -149,8 +149,9 @@ The **Sizing** toggle switches `sizeMode`. In **screen** mode the link decoratio
 bend, node radii) stay a constant pixel size as you zoom while the nodes still move — the navigation
 register LOD wants. Screen-mode half-arrows are recomputed per frame on the WebGL lane; for SVG/Canvas
 the shape is *baked* into world coords at the current zoom (a retained backend can't recompute a shape
-spanning two moving anchors per frame), refreshed automatically on backend switch and at the end of a
-pan/zoom — call `net.syncScreenGeometry()` to refit on demand (e.g. before a programmatic export).
+spanning two moving anchors per frame), refreshed automatically on backend switch, at the end of a
+pan/zoom, and after a `setTransform` while zoom is enabled — call `net.syncScreenGeometry()` to refit on
+demand (e.g. before a programmatic export).
 
 <ExampleCard files={["flow-borders/draw.ts", "flow-borders/data.ts"]}>
   <FlowBorders client:visible slot="demo" />
@@ -213,7 +214,8 @@ The geometry tracks the layout *as it converges* (LOD helps during the solve, no
 panning and zooming only re-run the cheap cut. On the **WebGL** lane the cut re-runs live every frame.
 On the **Canvas/SVG** backends the same frontier draws as retained geometry — but a retained backend
 can't re-tessellate per frame, so there the frontier is static during a gesture and re-cuts when it
-ends (call `syncScreenGeometry()` to re-cut at a chosen zoom before a programmatic export).
+ends, or after a `setTransform` while zoom is enabled (call `syncScreenGeometry()` to re-cut at a chosen
+zoom before a programmatic export).
 
 `toSVG()` **exports a level-of-detail map on every backend**: on Canvas/SVG from that retained
 frontier, and on WebGL from a vector view of the lane's current emit, built at export time only.
