@@ -4,9 +4,11 @@
  * reduction states (LOD off, then the Navigator's structural LOD on).
  *
  * Before #352 every streamed frame ran a synchronous `readPixels` after queueing a batch of ticks, so the
- * main thread waited for the whole batch: ~230 ms per frame at 325k (a 4 fps UI). Now a frame polls
- * fences, harvests a copy the GPU finished earlier, repaints (throttled), and encodes a budgeted slice of
- * ticks. Pinned here:
+ * main thread waited for the whole batch: on web-NotreDame (325k nodes, M1 Max) animation-frame tasks of
+ * 45 ms on average and up to 366 ms, 97% of the run in long tasks, about 11 frames per second. A node drag
+ * ran 3 ticks and a synchronous read per frame. Now a frame polls fences, harvests a copy the GPU finished
+ * earlier, repaints (throttled), and encodes a budgeted slice of ticks — for the initial run and for a
+ * drag's reheat and re-cool alike. Pinned here:
  *
  * - **Transport-only main thread per frame** (fence polls + harvest + encode + copy + fence, the
  *   repaint excluded) below a ceiling split into constant and linear terms, and the encode part within
@@ -23,8 +25,15 @@
  * The LOD-on leg reports the main-thread ms per layout repaint (on this path the main thread still
  * builds and refits the LOD tree — PR 3c moves the refit to the worker and compares against the worker
  * baseline); both legs assert the same transport signatures.
+ *
+ * **Node drag** (AGENTS §5: a drag is a per-frame path), through the real trigger — pointer events on the
+ * host grab a node of the settled layout, move it one step per animation frame, and release it — with LOD
+ * off and on: the same transport bounds and GL signatures over the held frames and the re-cool frames after
+ * release, no GPU object created, the drag's pin uploads O(held) per pointer move (the held positions
+ * written once per tick, at its start, not per move), and the layout reflowing (ticks and repaints) while
+ * the node is held.
  */
-import { describe, it, expect, beforeAll, afterAll } from "vitest";
+import { describe, it, expect, beforeAll, afterAll, vi } from "vitest";
 import type { Device } from "@luma.gl/core";
 import { network, type Network } from "../../network.js";
 import { buildGraph, type NetworkGraph } from "../../graph.js";
@@ -171,6 +180,84 @@ async function streamLeg(net: Network, graph: NetworkGraph, lod: boolean): Promi
   return { frames, events: log.events, settledAfterFrame, elapsedMs: performance.now() - t0 };
 }
 
+const nextFrame = (): Promise<void> => new Promise((resolve) => requestAnimationFrame(() => resolve()));
+
+/** Frames a drag holds its node (one pointer move each), and frames observed after the release. */
+const DRAG_FRAMES = 24;
+const COOL_FRAMES = 24;
+/** Zoom of the drag: the grabbed node is a drawn leaf under either reduction state (spacing ≈ 56 world units). */
+const DRAG_K = 4;
+
+/** What one drag leg observed. */
+interface DragLeg {
+  held: GpuFrameSample[];
+  cool: GpuFrameSample[];
+  events: GlEvent[];
+  /** Nodes the drag held, and every id count the solver's pin calls saw. */
+  heldCount: number;
+  pinnedSizes: number[];
+  heldWriteSizes: number[];
+  /** Ticks begun during the leg (each may write the held positions once, at its start). */
+  ticksBegun: number;
+  /** Main-thread ms of each pointer move's handler (the engine's held-set repaint plus the pin). */
+  moveMs: number[];
+}
+
+/** Grab node `id` of the settled layout on `net`, drag it for DRAG_FRAMES frames, release, watch COOL_FRAMES frames. */
+async function dragLeg(net: Network, host: HTMLElement, graph: NetworkGraph, id: number): Promise<DragLeg> {
+  const x0 = graph.positions[id * 2] ?? 0;
+  const y0 = graph.positions[id * 2 + 1] ?? 0;
+  net.setTransform({ k: DRAG_K, x: W / 2 - x0 * DRAG_K, y: H / 2 - y0 * DRAG_K });
+  await nextFrame();
+  const rect = host.getBoundingClientRect();
+  const pointer = (type: string, x: number, y: number): void => {
+    host.dispatchEvent(new PointerEvent(type, { clientX: rect.left + x, clientY: rect.top + y, bubbles: true, button: 0, pointerId: 1 }));
+  };
+  const frames: GpuFrameSample[] = [];
+  const log = new GlCallLog();
+  const pinned = vi.spyOn(GpuForceLayout.prototype, "setPinned");
+  const heldWrites = vi.spyOn(GpuForceLayout.prototype, "setHeldPositions");
+  const begun = vi.spyOn(GpuForceLayout.prototype, "beginTick");
+  const unobserve = observeGpuLayoutFrames((s) => {
+    frames.push({ ...s });
+    log.events.push({ kind: "frame-end" });
+  });
+  const moveMs: number[] = [];
+  let released = 0;
+  try {
+    pointer("pointerdown", W / 2, H / 2);
+    pointer("pointermove", W / 2 + 8, H / 2); // past the click slop: the drag session starts
+    for (let f = 1; f <= DRAG_FRAMES; f++) {
+      const t0 = performance.now();
+      pointer("pointermove", W / 2 + 8 + 4 * f, H / 2 - 2 * f);
+      moveMs.push(performance.now() - t0);
+      await nextFrame();
+    }
+    released = frames.length;
+    pointer("pointerup", W / 2 + 8 + 4 * DRAG_FRAMES, H / 2 - 2 * DRAG_FRAMES);
+    for (let f = 0; f < COOL_FRAMES; f++) await nextFrame();
+  } finally {
+    unobserve();
+    log.restore();
+  }
+  const pinnedSizes = pinned.mock.calls.map((c) => c[0]?.length ?? 0);
+  const heldWriteSizes = heldWrites.mock.calls.map((c) => c[0].length);
+  const ticksBegun = begun.mock.calls.length;
+  pinned.mockRestore();
+  heldWrites.mockRestore();
+  begun.mockRestore();
+  return {
+    held: frames.slice(0, released),
+    cool: frames.slice(released),
+    events: log.events,
+    heldCount: pinnedSizes[0] ?? 0,
+    pinnedSizes,
+    heldWriteSizes,
+    ticksBegun,
+    moveMs,
+  };
+}
+
 function median(xs: number[]): number {
   const s = xs.slice().sort((a, b) => a - b);
   return s[s.length >> 1] ?? 0;
@@ -268,6 +355,56 @@ function report(label: string, leg: Leg): { transport: number[]; encode: number[
   return { transport, encode, ticksPerSec };
 }
 
+/** The drag leg's signatures: the transport's per-frame contract holds through the drag, and the pins are O(held). */
+function assertDrag(label: string, leg: DragLeg, transportP95Ms: number, encodeMedianMs: number): void {
+  const frames = [...leg.held, ...leg.cool];
+  const transport = frames.map((s) => s.harvestMs + s.encodeMs);
+  const encode = frames.map((s) => s.encodeMs);
+  const repaints = frames.filter((s) => s.repaintMs > 0);
+  const heldTicks = (leg.held[leg.held.length - 1]?.ticksDone ?? 0) - (leg.held[0]?.ticksDone ?? 0);
+  const heldSpan = ((leg.held[leg.held.length - 1]?.now ?? 0) - (leg.held[0]?.now ?? 0)) / 1000;
+  console.log(
+    `  GPU drag [${label}] N=${N}: held ${leg.heldCount} node(s); ${leg.held.length} held + ${leg.cool.length} re-cool frames, ` +
+      `${repaints.length} repaints (ms median ${median(repaints.map((s) => s.repaintMs)).toFixed(1)}); ` +
+      `transport ms/frame median ${median(transport).toFixed(2)} p95 ${quantile(transport, 0.95).toFixed(2)} max ${Math.max(...transport).toFixed(2)}; ` +
+      `pointer-move handler ms median ${median(leg.moveMs).toFixed(2)} max ${Math.max(...leg.moveMs).toFixed(2)}; ` +
+      `${heldTicks} ticks while held (${(heldTicks / Math.max(1e-3, heldSpan)).toFixed(1)} ticks/s); ` +
+      `setPinned ${leg.pinnedSizes.length}×, held-position writes ${leg.heldWriteSizes.length}× over ${leg.ticksBegun} ticks begun`,
+  );
+
+  expect(leg.heldCount, "the drag grabbed nothing").toBeGreaterThan(0);
+  expect(leg.held.length).toBeGreaterThan(DRAG_FRAMES / 2);
+  // The layout reflows while the node is held: ticks run and positions reach the screen.
+  expect(heldTicks, "no reheat ticks while held").toBeGreaterThan(0);
+  expect(repaints.length, "no layout repaint during the drag").toBeGreaterThan(0);
+
+  // The transport's per-frame bounds hold through the drag and the re-cool.
+  expect(quantile(transport, 0.95)).toBeLessThan(transportP95Ms);
+  expect(median(encode)).toBeLessThan(encodeMedianMs);
+
+  // GL signatures: every copy into a PBO, one fence per frame, the harvest before the frame's layout draws,
+  // and no GPU object created by any drag frame or pointer move.
+  const copies = leg.events.filter((e) => e.kind === "copy");
+  expect(copies.every((e) => e.kind === "copy" && e.toPbo), "a synchronous readPixels during the drag").toBe(true);
+  const segments = perFrame(leg.events);
+  expect(segments.length).toBe(frames.length);
+  segments.forEach((seg, f) => {
+    expect(seg.filter((e) => e.kind === "fence").length, `drag frame ${f} fences`).toBe(1);
+    const harvest = seg.findIndex((e) => e.kind === "harvest");
+    const firstDraw = seg.findIndex((e) => e.kind === "layout-draw");
+    if (harvest >= 0 && firstDraw >= 0) expect(harvest, `drag frame ${f}: harvest after an encode`).toBeLessThan(firstDraw);
+  });
+  expect(leg.events.filter((e) => e.kind === "create").length, "GPU objects created during the drag").toBe(0);
+
+  // Pins are O(held) per pointer move: one setPinned per move (plus the release's), each over the held
+  // set; the held positions are written at most once per tick (at its start), each over the held set.
+  expect(leg.pinnedSizes.length).toBeLessThanOrEqual(DRAG_FRAMES + 3);
+  expect(leg.pinnedSizes.every((n) => n === leg.heldCount || n === 0)).toBe(true);
+  expect(leg.heldWriteSizes.length).toBeGreaterThan(0);
+  expect(leg.heldWriteSizes.length).toBeLessThanOrEqual(leg.ticksBegun);
+  expect(leg.heldWriteSizes.every((n) => n === leg.heldCount)).toBe(true);
+}
+
 describe("GPU layout streaming per frame (#352) — network().layout({ backend: 'gpu' })", () => {
   let host: HTMLElement;
   let net: Network;
@@ -297,6 +434,7 @@ describe("GPU layout streaming per frame (#352) — network().layout({ backend: 
     host = perfHost(W, H);
     net = network(host, { width: W, height: H, backend: "webgl" });
     await net.whenReady();
+    net.interactive({ draggable: true });
     // Warm-up on the same engine: the capability probe, shader compiles and the lane programs.
     net.data(clustered(2_000, 1)).layout({ backend: "gpu", iterations: 5 });
     await net.whenSettled();
@@ -326,11 +464,21 @@ describe("GPU layout streaming per frame (#352) — network().layout({ backend: 
     expect(ticksPerSec).toBeGreaterThan(0.25 * gpuOnlyTicksPerSec * 0.6);
   }, perfBudget(240_000));
 
+  it("LOD off: a node drag reheats through the same budgeted loop — transport bounds, O(held) pins", async () => {
+    const leg = await dragLeg(net, host, graph, 0);
+    assertDrag("LOD off", leg, TRANSPORT_P95_MS, ENCODE_MEDIAN_MS);
+  }, perfBudget(240_000));
+
   it("LOD on (structural cut, declutter, super-edges): the same transport bounds; repaint cost reported", async () => {
     const leg = await streamLeg(net, graph, true);
     const { transport, encode } = report("LOD on", leg);
     assertSignatures(leg);
     expect(quantile(transport, 0.95)).toBeLessThan(TRANSPORT_P95_MS);
     expect(median(encode)).toBeLessThan(ENCODE_MEDIAN_MS);
+  }, perfBudget(240_000));
+
+  it("LOD on: a node drag reheats through the same budgeted loop — transport bounds, O(held) pins", async () => {
+    const leg = await dragLeg(net, host, graph, Math.floor(N / 2));
+    assertDrag("LOD on", leg, TRANSPORT_P95_MS, ENCODE_MEDIAN_MS);
   }, perfBudget(240_000));
 });
