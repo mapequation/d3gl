@@ -45,6 +45,7 @@ import { DEFAULT_FORCE, seedPositions, seedSpacing, stepCap } from "../force.js"
 import type { LODTopology } from "../lod.js";
 import { GpuForceLayout } from "./gpu-force-layout.js";
 import { ProlongatePass } from "./passes/prolongate.js";
+import { beginPass } from "./passes/fullscreen.js";
 import { atlasWidth, packPositionsTexture, packUintTexture, readbackFloatFboReuse } from "./textures.js";
 
 const GOLDEN = Math.PI * (3 - Math.sqrt(5));
@@ -335,7 +336,7 @@ export function gpuMultilevelSeed(
       const cheight = Math.ceil(count / cwidth);
       const posTex = device.createTexture({ width: cwidth, height: cheight, format: "rg32float", mipLevels: 1, sampler: { minFilter: "nearest", magFilter: "nearest" } });
       const fbo = device.createFramebuffer({ width: cwidth, height: cheight, colorAttachments: [posTex] });
-      const pass = device.beginRenderPass({ framebuffer: fbo, clearColor: false });
+      const pass = beginPass(device, { framebuffer: fbo, clear: false });
       seedRun(pass);
       pass.end();
       device.submit();

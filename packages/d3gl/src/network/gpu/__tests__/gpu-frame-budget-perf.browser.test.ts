@@ -17,6 +17,18 @@
  * (b) "Both reduction states (LOD on/off)" from AGENTS.md §5 is a RENDER-path
  *     concept. The layout solver processes all nodes regardless of LOD, so the
  *     LOD on/off distinction does not apply here.
+ *
+ * DETERMINISTIC SIGNATURES (#349)
+ * -------------------------------
+ * The wall-clock ceiling cannot see the regression #349 removed: two point-list
+ * scatters of all N nodes into ONE texel (centroid ADD, bbox MAX), whose blend
+ * serialised on that texel — 17-19 ms each at 325k on a real GPU, yet only ~2×
+ * a whole SwiftShader tick at 30k. So the guard also asserts its signature
+ * directly: no draw of ≥ N vertices (instances counted, any mode, any of the five
+ * WebGL2 draw calls) into a 1×1 viewport, per tick (the grid-pyramid scatter, a
+ * POINTS draw of N vertices into a G×G viewport, is the non-vacuity control, and a
+ * spy self-test proves every draw entry point is seen); and zero texture /
+ * framebuffer / buffer creation per tick.
  */
 
 import { describe, it, expect, beforeAll, vi } from "vitest";
@@ -26,6 +38,81 @@ import { GpuForceLayout } from "../gpu-force-layout.js";
 import { buildGraph } from "../../graph.js";
 import type { LayoutGraph } from "../../force.js";
 import { perfBudget, perfN } from "../../../__tests__/perf-budget.js";
+
+/** One draw call as the spy saw it: primitive mode, vertices × instances, and the viewport size. */
+interface SpiedDraw {
+  mode: GLenum;
+  vertices: number;
+  width: number;
+  height: number;
+}
+
+/**
+ * Records every draw — all five WebGL2 draw entry points, instances folded into the vertex count —
+ * with the viewport it rasterises into (read from the context at draw time). Patches the
+ * prototype — cast-free — and restores it.
+ */
+class DrawSpy {
+  readonly draws: SpiedDraw[] = [];
+  private readonly origArrays: WebGL2RenderingContext["drawArrays"];
+  private readonly origArraysInstanced: WebGL2RenderingContext["drawArraysInstanced"];
+  private readonly origElements: WebGL2RenderingContext["drawElements"];
+  private readonly origElementsInstanced: WebGL2RenderingContext["drawElementsInstanced"];
+  private readonly origRangeElements: WebGL2RenderingContext["drawRangeElements"];
+
+  constructor() {
+    const proto = WebGL2RenderingContext.prototype;
+    this.origArrays = proto.drawArrays;
+    this.origArraysInstanced = proto.drawArraysInstanced;
+    this.origElements = proto.drawElements;
+    this.origElementsInstanced = proto.drawElementsInstanced;
+    this.origRangeElements = proto.drawRangeElements;
+    const spy = this;
+    proto.drawArrays = function (this: WebGL2RenderingContext, mode: GLenum, first: GLint, count: GLsizei): void {
+      spy.record(this, mode, count);
+      spy.origArrays.call(this, mode, first, count);
+    };
+    proto.drawArraysInstanced = function (
+      this: WebGL2RenderingContext, mode: GLenum, first: GLint, count: GLsizei, instances: GLsizei,
+    ): void {
+      spy.record(this, mode, count * instances);
+      spy.origArraysInstanced.call(this, mode, first, count, instances);
+    };
+    proto.drawElements = function (
+      this: WebGL2RenderingContext, mode: GLenum, count: GLsizei, type: GLenum, offset: GLintptr,
+    ): void {
+      spy.record(this, mode, count);
+      spy.origElements.call(this, mode, count, type, offset);
+    };
+    proto.drawElementsInstanced = function (
+      this: WebGL2RenderingContext, mode: GLenum, count: GLsizei, type: GLenum, offset: GLintptr, instances: GLsizei,
+    ): void {
+      spy.record(this, mode, count * instances);
+      spy.origElementsInstanced.call(this, mode, count, type, offset, instances);
+    };
+    proto.drawRangeElements = function (
+      this: WebGL2RenderingContext, mode: GLenum, start: GLuint, end: GLuint, count: GLsizei, type: GLenum,
+      offset: GLintptr,
+    ): void {
+      spy.record(this, mode, count);
+      spy.origRangeElements.call(this, mode, start, end, count, type, offset);
+    };
+  }
+
+  private record(gl: WebGL2RenderingContext, mode: GLenum, vertices: number): void {
+    const viewport: Int32Array = gl.getParameter(gl.VIEWPORT);
+    this.draws.push({ mode, vertices, width: viewport[2] ?? 0, height: viewport[3] ?? 0 });
+  }
+
+  restore(): void {
+    const proto = WebGL2RenderingContext.prototype;
+    proto.drawArrays = this.origArrays;
+    proto.drawArraysInstanced = this.origArraysInstanced;
+    proto.drawElements = this.origElements;
+    proto.drawElementsInstanced = this.origElementsInstanced;
+    proto.drawRangeElements = this.origRangeElements;
+  }
+}
 
 /** Minimal seeded LCG PRNG — self-contained, no deps. */
 function makePrng(seed: number): () => number {
@@ -76,18 +163,24 @@ describe("GPU frame budget — pyramid path (per-tick regression tripwire)", () 
     // SwiftShader is software GL, so absolute timings are slow but the relative
     // signature of a regression (order-of-magnitude slower) is still detectable.
     //
-    // Ceiling rationale: observed min-of-3 per-tick on SwiftShader is ~300–600ms at
-    // N=30k. We set the ceiling at 10000ms (~10× the expected worst-case minimum)
-    // so a genuine regression (e.g. O(n²) re-introduction adding another ~30× cost)
-    // trips the assertion while normal run-to-run variance never does.
+    // Ceiling rationale (recalibrated for #349): the measured tick (one tick + the position readback
+    // fence, min of 3) on local headless SwiftShader, under a load average of ~25, is
+    //   30k: 84-97 ms · 100k: 342-343 ms · 200k: 680-686 ms  (3 interleaved rounds)
+    // i.e. linear at ~3.4 ms per 1k nodes with an intercept indistinguishable from 0. The ceiling is
+    // ~10× that — enough headroom for a 2× contended run, tight enough that an order-of-magnitude
+    // slowdown (an O(n²) re-introduction, per-tick texture rebuilds) trips it. It cannot see a
+    // reintroduced 1-texel scatter, which only doubles a SwiftShader tick: the draw spy below does.
     // The browser tier can raise N via PERF_BROWSER_N (#262). Capped: this file constructs the
     // layout several times over and a 1M tick is ~30× a 30k one, which would spend the tier's whole
     // 300s per-file budget here — the file would be killed rather than report a ceiling.
-    const LOCAL_N = 30_000; // the N the 10s ceiling was calibrated at
+    const LOCAL_N = 30_000; // the N the ceiling is calibrated at
     const N = perfN(LOCAL_N, { max: 200_000 });
-    // Linear in N. The only super-linear term is the pyramid's level count, and chooseGrid clamps G
-    // at 1024, so L moves just 9→11 across 30k→1M — well inside the ceiling's deliberate 10× headroom.
-    const CEILING_MS = perfBudget(10_000 * (N / LOCAL_N));
+    // Split into a constant and a linear term (AGENTS "Scaling a browser guard"): 1.2 s at LOCAL_N,
+    // 3.5 s at 100k, 6.9 s at 200k. The measured intercept is ~0, so the constant is only a floor
+    // against scheduler jitter; the linear term is 10× the measured slope. The only super-linear term
+    // is the pyramid's level count, and chooseGrid clamps G at 1024, so L moves just 9→11 across
+    // 30k→1M — inside the linear term's headroom.
+    const CEILING_MS = perfBudget(200 + 1_000 * (N / LOCAL_N));
     const REPEATS = N > 100_000 ? 2 : 3;
 
     const g = makeClusteredGraph(N, 80, 0xdeadbeef);
@@ -128,6 +221,56 @@ describe("GPU frame budget — pyramid path (per-tick regression tripwire)", () 
     expect(minMs).toBeLessThan(CEILING_MS);
   });
 
+  it("the draw spy sees every WebGL2 draw entry point, instanced or indexed", () => {
+    // Non-vacuity for the #349 signature below: a 1-texel scatter written as an instanced or an
+    // indexed draw must be recorded too, with instances folded into the vertex count. No program is
+    // bound, so GL rejects each draw (INVALID_OPERATION) after the spy has seen it.
+    const gl = document.createElement("canvas").getContext("webgl2");
+    expect(gl).not.toBeNull();
+    if (gl === null) return;
+    gl.viewport(0, 0, 1, 1);
+    const spy = new DrawSpy();
+    try {
+      gl.drawArrays(gl.POINTS, 0, 7);
+      gl.drawArraysInstanced(gl.POINTS, 0, 1, 11);
+      gl.drawElements(gl.POINTS, 13, gl.UNSIGNED_INT, 0);
+      gl.drawElementsInstanced(gl.TRIANGLES, 3, gl.UNSIGNED_INT, 0, 17);
+      gl.drawRangeElements(gl.POINTS, 0, 18, 19, gl.UNSIGNED_INT, 0);
+    } finally {
+      spy.restore();
+    }
+    expect(spy.draws).toEqual([
+      { mode: gl.POINTS, vertices: 7, width: 1, height: 1 },
+      { mode: gl.POINTS, vertices: 11, width: 1, height: 1 },
+      { mode: gl.POINTS, vertices: 13, width: 1, height: 1 },
+      { mode: gl.TRIANGLES, vertices: 51, width: 1, height: 1 },
+      { mode: gl.POINTS, vertices: 19, width: 1, height: 1 },
+    ]);
+  });
+
+  it("no tick scatters N points into one texel (the #349 1-px reduction signature)", () => {
+    const N = perfN(30_000, { max: 200_000 });
+    const g = makeClusteredGraph(N, 80, 0x1e9e1);
+    const params = { repulsion: 200, attraction: 0.05, centering: 0.2, alpha: 0.05, theta: 0.7 };
+    const layout = new GpuForceLayout(device, g, params, { repulsionMode: "pyramid" });
+    const spy = new DrawSpy();
+    const points = WebGL2RenderingContext.POINTS;
+    try {
+      layout.runFrame(3);
+      const out = new Float32Array(N * 2);
+      layout.readPositions(out);
+    } finally {
+      spy.restore();
+      layout.destroy();
+    }
+    // Any mode, any entry point: N instanced quads blended into one texel serialise just the same.
+    const onePixel = spy.draws.filter((d) => d.vertices >= N && d.width * d.height === 1);
+    const scatters = spy.draws.filter((d) => d.mode === points && d.vertices >= N && d.width * d.height > 1);
+    expect(onePixel, "draws of ≥ N vertices into a 1×1 viewport").toEqual([]);
+    // Non-vacuity: the spy does see the grid-pyramid scatter (N points into a G×G grid), once a tick.
+    expect(scatters.length).toBe(3);
+  });
+
   it("pyramid ticking at N=30000 allocates no framebuffers or textures (all pre-created)", () => {
     // Re-affirms the "updated in place, not recreated per frame" AGENTS.md §5 signature
     // at scale on the pyramid path. Mirrors the same assertion from gpu-pyramid.browser.test.ts
@@ -141,19 +284,23 @@ describe("GPU frame budget — pyramid path (per-tick regression tripwire)", () 
     // Reset spies AFTER construction (construction legitimately allocates).
     const fboSpy = vi.spyOn(device, "createFramebuffer");
     const texSpy = vi.spyOn(device, "createTexture");
+    const bufSpy = vi.spyOn(device, "createBuffer");
     // Warm-up tick also post-construction to rule out lazy init.
     layout.runFrame(1);
     // Reset counts (warm-up must also be zero, but reset here to be explicit).
     fboSpy.mockClear();
     texSpy.mockClear();
+    bufSpy.mockClear();
 
     layout.runFrame(5);
 
     expect(fboSpy).toHaveBeenCalledTimes(0);
     expect(texSpy).toHaveBeenCalledTimes(0);
+    expect(bufSpy).toHaveBeenCalledTimes(0);
 
     fboSpy.mockRestore();
     texSpy.mockRestore();
+    bufSpy.mockRestore();
     layout.destroy();
   });
 });

@@ -1,6 +1,8 @@
 import type { Device, Texture, RenderPass } from "@luma.gl/core";
-import { Model } from "@luma.gl/engine";
+import type { Model } from "@luma.gl/engine";
 import type { GridPyramid } from "./grid-pyramid.js";
+import { SLOT_TEXEL_GLSL } from "../textures.js";
+import { ADDITIVE_BLEND, fullScreenModel, type PassUniforms } from "./fullscreen.js";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Barnes-Hut grid-pyramid repulsion (O(n log n)).
@@ -50,18 +52,12 @@ import type { GridPyramid } from "./grid-pyramid.js";
 // with coincident bodies, and negligible vs. the peer contributions.
 //
 // The box used for cell geometry MUST match the padded box the scatter used, so
-// the shader recomputes the padded AABB from the bbox texture with the same PAD.
+// the shader recomputes the padded AABB from the box texture with the same PAD.
 //
 // Stack: fixed-size array. The traversal is DFS; at any moment the stack holds at
 // most 3 siblings per descended level (the 4th is being processed) plus the
 // initial root, so ≤ 3*L + 1. We size STACK_MAX = 4*(L+1) with margin and cap
 // the loop to avoid a runaway on a degenerate (never-terminating) case.
-
-const VS = /* glsl */ `\
-#version 300 es
-in vec2 a_clip;
-void main() { gl_Position = vec4(a_clip, 0.0, 1.0); }
-`;
 
 /**
  * Build the FS with a compile-time levelCount so the stack is a fixed-size
@@ -93,7 +89,7 @@ precision highp float;
 precision highp sampler2D;
 
 uniform highp sampler2D u_pos;
-uniform highp sampler2D u_box;   // 1×1 (maxX, maxY, -minX, -minY)
+uniform highp sampler2D u_box;   // segment box (maxX, maxY, -minX, -minY), segment 0 at (0,0)
 ${samplerDecls.join("\n")}
 uniform int   u_count;
 uniform int   u_width;
@@ -105,7 +101,7 @@ layout(location = 0) out vec2 o_force;
 
 const int ROOT_LEVEL = ${L};
 const int STACK_MAX = ${STACK_MAX};
-
+${SLOT_TEXEL_GLSL}
 // Read a pyramid cell (Σx, Σy, mass, 0) at (level, cx, cy). Level is dynamic, so
 // select the sampler via an unrolled static switch (GLSL ES 3.00 rule).
 vec4 fetchCell(int level, int cx, int cy) {
@@ -115,7 +111,7 @@ ${fetchCases.join("\n")}
 
 void main() {
   ivec2 fc = ivec2(gl_FragCoord.xy);
-  int id = fc.y * u_width + fc.x;
+  int id = texelSlot(fc, u_width);
   if (id >= u_count) { discard; }
 
   vec2 pi = texelFetch(u_pos, fc, 0).xy;
@@ -227,15 +223,11 @@ export interface RepulsionPyramidUniforms {
  */
 export class RepulsionPyramidPass {
   private readonly model: Model;
-  private readonly uniforms: Record<string, number>;
+  private readonly uniforms: PassUniforms;
   private readonly levelCount: number;
 
   constructor(device: Device, levelCount: number) {
     this.levelCount = levelCount;
-    const clipBuf = device.createBuffer({
-      data: new Float32Array([-1, -1, 3, -1, -1, 3]),
-    });
-
     this.uniforms = {
       u_count: 0,
       u_width: 1,
@@ -245,36 +237,21 @@ export class RepulsionPyramidPass {
       u_theta2: 0,
     };
 
-    this.model = new Model(device, {
-      vs: VS,
-      fs: makeFs(levelCount),
-      topology: "triangle-list",
-      vertexCount: 3,
-      attributes: { a_clip: clipBuf },
-      bufferLayout: [{ name: "a_clip", format: "float32x2" }],
-      uniforms: this.uniforms,
-      parameters: {
-        // Additive blend: accumulate alongside attraction + centering.
-        blend: true,
-        blendColorSrcFactor: "one",
-        blendColorDstFactor: "one",
-        blendAlphaSrcFactor: "one",
-        blendAlphaDstFactor: "one",
-        blendColorOperation: "add",
-        blendAlphaOperation: "add",
-      },
-    });
+    // Additive blend: accumulate alongside attraction + centering.
+    this.model = fullScreenModel(device, makeFs(levelCount), this.uniforms, ADDITIVE_BLEND);
   }
 
   /**
    * Draw one BH repulsion step into an already-open force-accumulation render
-   * pass. `pyramid` must have been built this tick and match the levelCount the
-   * pass was constructed with.
+   * pass. `pyramid` must have been built this tick from the same `boxTex` (the
+   * layout's box, `(maxX, maxY, -minX, -minY)` at texel (0, 0)) and match the
+   * levelCount the pass was constructed with.
    */
   run(
     pass: RenderPass,
     posTex: Texture,
     pyramid: GridPyramid,
+    boxTex: Texture,
     u: RepulsionPyramidUniforms,
   ): void {
     this.uniforms["u_count"] = u.count;
@@ -286,7 +263,7 @@ export class RepulsionPyramidPass {
 
     const bindings: Record<string, Texture> = {
       u_pos: posTex,
-      u_box: pyramid.bboxTexture,
+      u_box: boxTex,
     };
     for (let lvl = 0; lvl < this.levelCount; lvl++) {
       bindings[`u_level${lvl}`] = pyramid.levelTexture(lvl);

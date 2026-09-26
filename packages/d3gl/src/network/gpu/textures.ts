@@ -6,6 +6,26 @@ export function atlasWidth(n: number): number {
 }
 
 /**
+ * The slot → texel mapping every per-slot pass shares (row-major in an atlas of width `width`). A
+ * *slot* is an index into the solver's per-node textures. {@link SLOT_TEXEL_GLSL} is the shader twin;
+ * change both together, never one pass on its own.
+ */
+export function slotTexel(slot: number, width: number): [number, number] {
+  return [slot % width, Math.floor(slot / width)];
+}
+
+/** The texel → slot inverse of {@link slotTexel}. */
+export function texelSlot(x: number, y: number, width: number): number {
+  return y * width + x;
+}
+
+/** GLSL twin of {@link slotTexel} / {@link texelSlot}, spliced into every per-slot shader. */
+export const SLOT_TEXEL_GLSL = /* glsl */ `\
+ivec2 slotTexel(int slot, int width) { return ivec2(slot % width, slot / width); }
+int texelSlot(ivec2 texel, int width) { return texel.y * width + texel.x; }
+`;
+
+/**
  * Pack a flat `[x0, y0, x1, y1, …]` positions array into an `rg32float` texture.
  * Each texel stores one node's (x, y) position.
  * Pads the last row if `count` is not a perfect rectangle.
