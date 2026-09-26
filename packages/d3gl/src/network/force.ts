@@ -282,12 +282,13 @@ export class ForceLayout {
     fy.fill(0);
 
     // Repulsion via Barnes-Hut (O(n log n)): build the tree on the current positions, then
-    // accumulate each node's repulsion through the θ-approximated traversal. With masses the tree
+    // accumulate each node's repulsion through the θ-approximated traversal — node by node in the
+    // tree's spatial order, so consecutive traversals share the cells they read. With masses the tree
     // aggregates them, so each node's repulsion arrives as an acceleration (force ÷ its own mass).
     tree.build(positions, nodeCount, mass);
     // Capture the initial layout span once; it bounds the step for a model without a spacing.
     if (this.span0 === 0) this.span0 = Math.max(2 * tree.rootHalf(), 1);
-    for (let i = 0; i < nodeCount; i++) tree.applyForce(i, repulsion, theta, fx, fy);
+    tree.applyForces(repulsion, theta, fx, fy);
 
     // Attraction: a spring along each directed edge pulling its endpoints together.
     if (mass) {

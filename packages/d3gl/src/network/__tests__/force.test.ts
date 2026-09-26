@@ -164,6 +164,20 @@ describe("ForceLayout", () => {
     expect(xs.every((v) => Number.isFinite(v))).toBe(true); // no NaN/∞
     expect(Math.max(...xs.map((v) => Math.abs(v)))).toBeLessThan(1e5); // no runaway drift
   });
+
+  it("ticks are deterministic run to run (the tree's spatial node order is derived, not random)", () => {
+    // The repulsion pass walks nodes in the Barnes-Hut tree's Z order, which each build refines from
+    // the last; the positions a layout produces must still depend on nothing but its input.
+    const run = (): Float32Array => {
+      const g = ringOfCliques(40, 8);
+      seedPositions(g, 800, 600, { force: {} });
+      const sim = new ForceLayout(g);
+      sim.cool(40);
+      for (let t = 0; t < 40; t++) sim.tick();
+      return g.positions;
+    };
+    expect(run()).toEqual(run());
+  });
 });
 
 describe("equilibrium scale", () => {
