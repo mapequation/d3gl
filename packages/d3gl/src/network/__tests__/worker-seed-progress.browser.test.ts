@@ -63,7 +63,7 @@ function startRun(g: NetworkGraph, iterations: number, lod = false) {
     while (!done() && performance.now() < deadline) await new Promise((r) => setTimeout(r, 5));
   };
   const send = (msg: MainToWorker): void => worker.postMessage(msg);
-  return { worker, received, frames, waitFor, send, t0 };
+  return { worker, received, frames, waitFor, send, start, t0 };
 }
 
 /** Index of the first refinement frame (tick ≥ 1), or -1. */
@@ -129,7 +129,7 @@ describe("worker seed progress frames (#368)", () => {
     expect(seedFrames.length - 1).toBeLessThanOrEqual((seedAt - topologyAt) / 16 + 1);
   }, 60_000);
 
-  it("holds a pin that lands mid-seed from the first refinement tick", async () => {
+  it("holds a pin that lands mid-seed: in the progress frames after it, the seed frame and every refinement tick", async () => {
     const g = clustered(N);
     const run = startRun(g, 20);
     workers.push(run.worker);
@@ -142,8 +142,29 @@ describe("worker seed progress frames (#368)", () => {
     const frames = run.frames();
     const first = refinementStart(frames);
     expect(first).toBeGreaterThan(0);
+    const held = (f: ProgressMessage | undefined): boolean => f?.positions?.[0] === X && f.positions[1] === Y;
+    // The seed frame already shows the node where the drag put it (its positions, and the LOD geometry
+    // derived from them), and so does every progress frame from the first one posted after the pin landed.
+    expect(held(frames[first - 1]), "the seed frame lost the held node").toBe(true);
+    const since = frames.findIndex(held);
+    expect(frames.slice(since, first).every(held), "a progress frame after the pin dropped the held node").toBe(true);
     // Every refinement frame holds the node exactly where the drag put it (not lost while there was no layout).
     for (const f of frames.slice(first)) expect([f.positions?.[0], f.positions?.[1]]).toEqual([X, Y]);
+  }, 60_000);
+
+  it("ignores a second start that lands mid-seed: one run, one LOD topology", async () => {
+    const g = clustered(N);
+    const run = startRun(g, 20, true);
+    workers.push(run.worker);
+    await run.waitFor(() => run.frames().length >= 1);
+    expect(refinementStart(run.frames()), "the seed finished before the second start could land mid-seed").toBe(-1);
+    run.send(run.start);
+    await run.waitFor(() => run.frames().some((f) => f.type === "done"));
+    await new Promise((r) => setTimeout(r, 300)); // room for a second run's messages to arrive
+    // A second concurrent run would coarsen again and post its own topology, then share the first run's
+    // module state (the cancel flag, the pending pin, the layout).
+    expect(run.received.filter((r) => r.msg.type === "lod-topology").length).toBe(1);
+    expect(run.frames().filter((f) => f.type === "done").length).toBe(1);
   }, 60_000);
 
   it("drops a pin released mid-seed: the run still settles with done", async () => {
@@ -174,12 +195,14 @@ describe("worker seed progress frames (#368)", () => {
   }, 60_000);
 });
 
-describe("engine: seed progress frames cost one LOD cut each (#368)", () => {
-  it("draws each delivered frame with one LOD cut on the worker tree, and never builds a main-thread tree", async () => {
-    // Every frame the worker posts — progress, seed, refinement, done — funnels through the same
-    // coalesced repaint: one rebuild, whose LOD lane emit runs one cut (InstancedLane.update → select →
-    // computeFrontier → cut). Count both sides.
-    const delivered = { frames: 0, lodSources: new Set<string>() };
+describe("engine: each seed progress frame costs one repaint, LOD on and off (#368)", () => {
+  it("draws each delivered frame with one lane emit — one LOD cut on the worker tree, or one full-detail emit", async () => {
+    // Every frame the worker posts (progress, seed, refinement, done) funnels through the same coalesced
+    // repaint: one rebuild, one lane emit. LOD ON: the emit runs one cut on the worker's tree
+    // (InstancedLane.update → select → computeFrontier → cut), and the main thread never builds a tree.
+    // LOD OFF: the emit is the full-detail draw, O(nodes + edges), exactly as for a refinement frame.
+    // Both legs share one engine (a second WebGL engine after a large one stalls, #287).
+    const delivered = { frames: 0, seedFrames: 0, lodSources: new Set<string>() };
     let net: ReturnType<typeof network> | null = null;
     class CountingWorker extends Worker {
       constructor(url: string | URL, options?: WorkerOptions) {
@@ -190,6 +213,7 @@ describe("engine: seed progress frames cost one LOD cut each (#368)", () => {
         this.addEventListener("message", (e: MessageEvent<WorkerToMain>) => {
           if (e.data.type === "lod-topology") return;
           delivered.frames++;
+          if (e.data.type === "frame" && e.data.tick === 0) delivered.seedFrames++;
           if (net) delivered.lodSources.add(net.lodSource);
         });
       }
@@ -200,29 +224,43 @@ describe("engine: seed progress frames cost one LOD cut each (#368)", () => {
     host.style.width = `${W}px`;
     host.style.height = `${H}px`;
     document.body.appendChild(host);
+    const nextFrame = (): Promise<unknown> => new Promise((r) => requestAnimationFrame(() => r(null)));
     net = network(host, { width: W, height: H });
     try {
       await net.whenReady();
-      net.data(clustered(N)).style({ sizeMode: "screen" }).lod({});
-      await new Promise((r) => requestAnimationFrame(() => r(null)));
-      const before = emits.mock.calls.length;
-      net.layout({ backend: "worker", iterations: 20, fit: true });
-      await net.whenSettled();
-      await new Promise((r) => requestAnimationFrame(() => r(null))); // the last coalesced repaint
-      const run = emits.mock.calls.length - before;
-      expect(net.lodSource).toBe("worker");
-      // Never a main-thread tree (build + O(tree) geometry pass) at any point of the stream.
-      expect([...delivered.lodSources].filter((s) => s !== "worker" && s !== "none")).toEqual([]);
-      expect(delivered.frames, "non-vacuity: progress frames + seed + refinement + done").toBeGreaterThanOrEqual(4);
-      // At most one repaint per delivered frame (coalesced per animation frame), plus layout()'s own
-      // rebuild and the settle rebuild — each one lane emit.
-      expect(run).toBeGreaterThan(0);
-      expect(run).toBeLessThanOrEqual(delivered.frames + 2);
+      net.data(clustered(N)).style({ sizeMode: "screen" });
+      const run = async (engine: ReturnType<typeof network>): Promise<number> => {
+        await nextFrame();
+        delivered.frames = 0;
+        delivered.seedFrames = 0;
+        delivered.lodSources.clear();
+        const before = emits.mock.calls.length;
+        engine.layout({ backend: "worker", iterations: 20, fit: true });
+        await engine.whenSettled();
+        await nextFrame(); // the last coalesced repaint
+        return emits.mock.calls.length - before;
+      };
+      for (const lod of [true, false]) {
+        const leg = lod ? "LOD ON" : "LOD OFF";
+        net.lod(lod ? {} : false);
+        const laneEmits = await run(net);
+        if (lod) {
+          expect(net.lodSource).toBe("worker");
+          // Never a main-thread tree (build + O(tree) geometry pass) at any point of the stream.
+          expect([...delivered.lodSources].filter((s) => s !== "worker" && s !== "none"), leg).toEqual([]);
+        } else expect([...delivered.lodSources], leg).toEqual(["none"]);
+        expect(delivered.seedFrames, `${leg} non-vacuity: progress frames + the seed frame`).toBeGreaterThanOrEqual(2);
+        expect(delivered.frames, `${leg} non-vacuity: progress frames + seed + refinement + done`).toBeGreaterThanOrEqual(4);
+        // At most one repaint per delivered frame (coalesced per animation frame), plus layout()'s own
+        // rebuild and the settle rebuild — each one lane emit.
+        expect(laneEmits, leg).toBeGreaterThan(0);
+        expect(laneEmits, `${leg}: ${laneEmits} lane emits for ${delivered.frames} frames`).toBeLessThanOrEqual(delivered.frames + 2);
+      }
     } finally {
       emits.mockRestore();
       net.destroy();
       host.remove();
       vi.unstubAllGlobals();
     }
-  }, 60_000);
+  }, 90_000);
 });

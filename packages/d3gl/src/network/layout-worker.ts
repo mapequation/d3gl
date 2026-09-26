@@ -54,6 +54,13 @@ let cancelled = false;
  *  pinned, reflow indefinitely), `cool` (post-release settling tail). */
 let mode: "idle" | "run" | "drag" | "cool" = "idle";
 let looping = false;
+/**
+ * {@link runLayout} is past its start and has not handed over to {@link loop} yet. The seed yields to
+ * the event loop (#368), so without this a `start` landing mid-seed would begin a second run on the
+ * same module state. The transport never sends one (a new `layout()` spawns a fresh worker); this keeps
+ * the guard on `start` true to that. Left set when a stop ends the seed: the worker is being terminated.
+ */
+let seeding = false;
 let coolLeft = 0;
 
 /** What {@link postFrame} posts: the positions, the LOD tree whose geometry derives from them, and the tick. */
@@ -78,7 +85,14 @@ interface WorkerState extends FrameSource {
   dragging: boolean;
 }
 let state: WorkerState | null = null;
-/** The latest pin that landed while the seed ran (no {@link state} yet); {@link runLayout} applies it. */
+/**
+ * The latest pin that landed while the seed ran (no {@link state} yet). Copy mode: its positions are
+ * written over every later progress frame, and {@link runLayout} applies it before the seed frame, so
+ * the held nodes show where the drag put them from then on. Shared mode: a pin carries no positions
+ * (the main thread writes the held nodes into the SAB), but the seed rewrites every node there, so the
+ * held nodes sit where the seed put them until the main thread re-applies the drag — on every pointer
+ * move, and before the repaint of every streamed frame — i.e. for the first few refinement ticks.
+ */
 let pendingPin: { ids: Uint32Array; positions: Float32Array | undefined } | null = null;
 
 function post(message: WorkerToMain): void {
@@ -167,7 +181,8 @@ async function loop(): Promise<void> {
  * 0: every node prolongated from the coarse level being solved, at the finished seed's extent — only
  * {@link SeedProgress.atScale} steps) — the first at least {@link FRAME_MS} in, then paced by
  * {@link SEED_FRAME_COST_RATIO} — and yielding every {@link YIELD_MS} so a stop or pin lands mid-seed.
- * Resolves `false` when stopped.
+ * A frame posted after a pin landed shows the held nodes where the drag put them (copy mode, see
+ * {@link pendingPin}). Resolves `false` when stopped.
  */
 async function seedProgressively(steps: Generator<SeedProgress, void, undefined>, frame: FrameSource): Promise<boolean> {
   let lastPost = performance.now();
@@ -177,6 +192,7 @@ async function seedProgressively(steps: Generator<SeedProgress, void, undefined>
     const now = performance.now();
     if (step.atScale && now - lastPost >= wait) {
       step.prolongate();
+      if (pendingPin?.positions) writeHeld(frame.positions, pendingPin.ids, pendingPin.positions);
       postFrame("frame", frame);
       lastPost = performance.now();
       wait = Math.max(FRAME_MS, SEED_FRAME_COST_RATIO * (lastPost - now));
@@ -191,6 +207,7 @@ async function seedProgressively(steps: Generator<SeedProgress, void, undefined>
 }
 
 async function runLayout(msg: StartMessage): Promise<void> {
+  seeding = true;
   cancelled = false;
   const { nodeCount, source, target, weight, sharedPositions, width, height, iterations, force, coarsen, multilevel, frameEvery, lod } =
     msg;
@@ -238,34 +255,35 @@ async function runLayout(msg: StartMessage): Promise<void> {
   // once the layout has converged.
   if (multilevel) layout.cool(iterations);
   else layout.hold(1);
-  state = { layout, positions, lodTree, geomBuffer, shared, frameEvery, runLeft: iterations, dragging: false, tick: 0 };
-  postFrame("frame"); // seed frame (tick 0)
+  const s: WorkerState = { layout, positions, lodTree, geomBuffer, shared, frameEvery, runLeft: iterations, dragging: false, tick: 0 };
+  state = s;
+  seeding = false;
 
   // Stream the finest-level refinement via the shared loop; it idles when converged (worker stays alive).
   mode = iterations > 0 ? "run" : "idle";
-  // A drag that began on a seed frame: hold its nodes from the first refinement tick, as a pin landing
-  // at the loop's first yield would (the held positions reach the main thread with the next frame).
+  // A drag that began on a progress frame: hold its nodes from the seed frame on — its positions and the
+  // LOD geometry derived from them — and from the first refinement tick.
   const held = pendingPin;
   pendingPin = null;
-  if (held) pin(held.ids, held.positions);
+  if (held) holdNodes(s, held.ids, held.positions);
+  postFrame("frame"); // seed frame (tick 0)
   await loop();
 }
 
-/** Hold `ids` and reheat (#140). Applies the pins to the live {@link ForceLayout}; in copy mode also
- *  writes the held positions into the worker's buffer so its snapshot + geometry reflect them. While
- *  the seed runs there is no layout to pin yet: the latest pin waits for {@link runLayout}. */
-function pin(ids: Uint32Array, positions?: Float32Array): void {
-  const s = state;
-  if (!s) {
-    pendingPin = { ids, positions };
-    return;
+/** Write the held nodes' positions (interleaved, in `ids` order) into `positions`. */
+function writeHeld(positions: Float32Array, ids: Uint32Array, held: Float32Array): void {
+  let k = 0;
+  for (const id of ids) {
+    positions[id * 2] = held[k++] ?? 0;
+    positions[id * 2 + 1] = held[k++] ?? 0;
   }
+}
+
+/** Pin `ids` on the live {@link ForceLayout} and switch to reheating; in copy mode also write the held
+ *  positions into the worker's buffer so its snapshot + geometry reflect them. Does not start the loop. */
+function holdNodes(s: WorkerState, ids: Uint32Array, positions: Float32Array | undefined): void {
   s.layout.setPinned(ids);
-  if (positions) for (let k = 0; k < ids.length; k++) {
-    const id = ids[k]!;
-    s.positions[id * 2] = positions[k * 2]!;
-    s.positions[id * 2 + 1] = positions[k * 2 + 1]!;
-  }
+  if (positions) writeHeld(s.positions, ids, positions);
   s.dragging = true;
   // A drag during the initial run rides on the run's own schedule — a cold start's full heat, or the
   // cooling budget — until the run converges or spends its budget, then holds DRAG_HEAT (endRun).
@@ -274,6 +292,17 @@ function pin(ids: Uint32Array, positions?: Float32Array): void {
     mode = "drag";
     s.layout.hold(DRAG_HEAT);
   }
+}
+
+/** Hold `ids` and reheat (#140) via {@link holdNodes}. While the seed runs there is no layout to pin
+ *  yet: the latest pin waits for {@link runLayout} ({@link pendingPin}). */
+function pin(ids: Uint32Array, positions?: Float32Array): void {
+  const s = state;
+  if (!s) {
+    pendingPin = { ids, positions };
+    return;
+  }
+  holdNodes(s, ids, positions);
   if (!looping) void loop();
 }
 
@@ -311,7 +340,7 @@ addEventListener("message", (e: MessageEvent<MainToWorker>) => {
       unpin();
       return;
     case "start":
-      if (!looping) void runLayout(msg);
+      if (!looping && !seeding) void runLayout(msg);
       return;
     case "start-nested": {
       // One synchronous top-down pass (each depth final); a `stop` can only land after it, and the main
