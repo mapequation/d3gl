@@ -887,7 +887,8 @@ export interface SuperEdgesScratch {
   /**
    * Directed pair → its row in the gather arrays (keyed by `aS`/`bS`; `wS[row]` is its flow): the projected
    * (#139), then the anchored (#329) pairs while their flows are summed, then the `pairedRows` for the
-   * reciprocal half-arrow widths. 16-32 B per pair of the largest of those sets so far.
+   * reciprocal half-arrow widths. 16-32 B per pair of the largest of those sets so far (the index alone;
+   * with `pairedRows`, 20-40 B per paired pair).
    */
   pairs: PairIndex;
   /** Rows (ascending) whose pair has a reciprocal half-arrow width to give or take: a same-level pair with
@@ -1204,6 +1205,9 @@ export function superEdges(
         if (seen[h] !== gen) seen[h] = -gen;
       }
       anchorStart = len;
+      // Defensive, O(1): an anchored pair has an end that is not present (the expanded module `h`), while a
+      // projected pair has both ends present, so the two sets never share a key and the reset cannot change
+      // the output. It keeps the index sized to this set alone.
       pairs.reset();
       const fading = style.fadeAlpha !== undefined;
       // The drawn end of a module link's endpoint x, or -1 when it has none (decluttered / faded out).
@@ -1259,13 +1263,15 @@ export function superEdges(
       const b = sc.bS[e]!;
       let w = sc.wS[e]!;
       const x = seen[a] === gen ? b : a; // an off-screen pair's non-present end (a claimed pair's is its `x`)
-      const hx = Math.imul(x, 0x9e3779b1) >>> shift;
-      if (e < offScreenEnd && seen[x] !== gen && ((bits[hx >>> 5] ?? 0) & (1 << (hx & 31))) !== 0) {
-        const c = claimed.find(a, b, sc.claimA, sc.claimB);
-        if (c >= 0) {
-          const rest = w - (sc.claimW[c] ?? 0);
-          if (!(rest > w * 1e-4)) continue;
-          w = rest;
+      if (e < offScreenEnd && seen[x] !== gen) {
+        const hx = Math.imul(x, 0x9e3779b1) >>> shift;
+        if (((bits[hx >>> 5] ?? 0) & (1 << (hx & 31))) !== 0) {
+          const c = claimed.find(a, b, sc.claimA, sc.claimB);
+          if (c >= 0) {
+            const rest = w - (sc.claimW[c] ?? 0);
+            if (!(rest > w * 1e-4)) continue;
+            w = rest;
+          }
         }
       }
       sc.aS[kept] = a;
@@ -1350,8 +1356,11 @@ export function superEdges(
     // Reciprocal widths: a pair's second half takes its reverse pair's width. Only the paired rows give or
     // take one (see `pairedRows`): an off-screen pair's reverse would need its non-present end to be
     // present, or an anchored module, whose centre is on-screen. They are 12% of the drawn pairs at the
-    // Network Navigator's web-NotreDame view. Should a pair be drawn twice, its later row answers, as the
-    // Map's last write did.
+    // Network Navigator's web-NotreDame view. No pair is in these rows twice (the same-level rows come from
+    // the CSR, one per pair; the projected and anchored sums dedupe; a projected pair joins a present node to
+    // a shallower present aggregate, and `merges` sums a CSR pair of that shape with the projections instead
+    // of the same-level rows; an anchored pair has a non-present end). So `set` and `findOrAdd` agree here;
+    // `set` keeps the Map's last-write rule should that ever change.
     const rows = sc.pairedRows;
     const pairs = sc.pairs;
     pairs.reset(paired);

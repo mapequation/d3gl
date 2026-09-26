@@ -623,17 +623,25 @@ describe("#364 superEdges scratch without Maps, against the Map-based gather it 
     const sc = makeSuperEdgesScratch();
     const ref = makeMapSuperEdgesScratch();
     const failures: string[] = [];
+    let claimCalls = 0; // calls in which finer drawn pairs claimed flow from an off-screen pair
     // Warm pass, compared element for element with the Map gather (each side with its one reused scratch).
     for (const base of styles) {
       for (const crossLevelEdges of [false, true]) {
         for (const shape of shapes) {
           const style = { ...base, crossLevelEdges };
-          const diff = firstDifference(superEdges(tree, shape.frontier, style, shape.view, sc), superEdgesMapReference(tree, shape.frontier, style, shape.view, ref));
+          const got = superEdges(tree, shape.frontier, style, shape.view, sc);
+          if (sc.claimed.size > 0) claimCalls++;
+          const diff = firstDifference(got, superEdgesMapReference(tree, shape.frontier, style, shape.view, ref));
           if (diff !== "") failures.push(`${shape.name}, ${base.linkStyle}, crossLevelEdges=${crossLevelEdges}: ${diff}`);
         }
       }
     }
     expect(failures.slice(0, 3), `${failures.length} calls differ`).toEqual([]);
+    // Non-vacuity for the claim filter and index: the finite views claim, so the pass below runs them.
+    // (Anchoring needs module links, which this fixture has none of: super-edges-memo.test.ts asserts its
+    // zero Map/Set writes, and module-boundary-perf times it.)
+    console.log(`#364 warm pass: ${claimCalls} calls with claims`);
+    expect(claimCalls).toBeGreaterThan(0);
     const held = { seen: sc.seen, cover: sc.cover, coverGen: sc.coverGen, pairs: sc.pairs.capacity, claimed: sc.claimed.capacity, pairedRows: sc.pairedRows, aS: sc.aS };
     expect(held.cover.length).toBeGreaterThanOrEqual(tree.size);
 

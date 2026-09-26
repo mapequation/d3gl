@@ -1,4 +1,4 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import {
   computeLODGeometry,
   computeLODPositions,
@@ -177,6 +177,21 @@ interface Exercised {
   claimFrames: number;
   maxClaims: number;
   reciprocal: number;
+  /** `Map`/`Set` entries the typed gather wrote (#364's signature: none, on every path, anchoring too). */
+  mapWrites: number;
+}
+
+/** Run the typed gather, counting the `Map` and `Set` entries written meanwhile into `seen.mapWrites`. */
+function typedGather(seen: Exercised, run: () => ReturnType<typeof superEdges>): ReturnType<typeof superEdges> {
+  const set = vi.spyOn(Map.prototype, "set");
+  const add = vi.spyOn(Set.prototype, "add");
+  try {
+    return run();
+  } finally {
+    seen.mapWrites += set.mock.calls.length + add.mock.calls.length;
+    set.mockRestore();
+    add.mockRestore();
+  }
 }
 
 /** The engine's LOD frame up to the gather: the cut (collecting the expanded modules in view for anchoring,
@@ -216,7 +231,7 @@ function compareOverViews(m: MemoMap, sc: ReturnType<typeof makeSuperEdgesScratc
       for (const base of STYLES) {
         for (const [crossLevelEdges, anchored] of [[false, false], [true, false], [true, true]] as const) {
           const style: SuperEdgeStyleResolved = { ...base, crossLevelEdges, anchor: anchored ? bnd : undefined, fadeAlpha: fading ? fadeAlpha : undefined };
-          const got = superEdges(tree, frontier, style, view, sc);
+          const got = typedGather(seen, () => superEdges(tree, frontier, style, view, sc));
           const want = superEdgesMapReference(tree, frontier, style, view, ref);
           const diff = firstDifference(got, want);
           if (diff !== "") failures.push(`view ${v} (k=${t.k.toFixed(3)}), frontier ${frontier.length}, ${base.linkStyle}${base.directed ? " directed" : ""}, crossLevelEdges=${crossLevelEdges}, anchor=${anchored}: ${diff}`);
@@ -238,7 +253,7 @@ function compareOverViews(m: MemoMap, sc: ReturnType<typeof makeSuperEdgesScratc
   for (const base of STYLES) {
     for (const crossLevelEdges of [false, true]) {
       const style: SuperEdgeStyleResolved = { ...base, crossLevelEdges };
-      const diff = firstDifference(superEdges(tree, leaves, style, all, sc), superEdgesMapReference(tree, leaves, style, all, ref));
+      const diff = firstDifference(typedGather(seen, () => superEdges(tree, leaves, style, all, sc)), superEdgesMapReference(tree, leaves, style, all, ref));
       if (diff !== "") failures.push(`all leaves, ${base.linkStyle}, crossLevelEdges=${crossLevelEdges}: ${diff}`);
       seen.frames++;
     }
@@ -252,10 +267,13 @@ describe("#364 the typed-array super-edge gather reproduces the Map-based gather
     const big = memoMap(20_000, 5);
     const sc = makeSuperEdgesScratch();
     const ref = makeMapSuperEdgesScratch();
-    const seen: Exercised = { frames: 0, edges: 0, projected: 0, anchored: 0, claimFrames: 0, maxClaims: 0, reciprocal: 0 };
+    const seen: Exercised = { frames: 0, edges: 0, projected: 0, anchored: 0, claimFrames: 0, maxClaims: 0, reciprocal: 0, mapWrites: 0 };
     // Small, then big (the memo grows to the bigger tree), then small again on the grown scratch.
     const failures = [...compareOverViews(small, sc, ref, seen), ...compareOverViews(big, sc, ref, seen), ...compareOverViews(small, sc, ref, seen)];
     expect(failures.slice(0, 5), `${failures.length} frames differ`).toEqual([]);
+    // The typed gather wrote no Map or Set entry on any of those calls: the anchored (#329) and claim
+    // passes included, which the per-frame guard's fixture (no module links) does not reach.
+    expect(seen.mapWrites).toBe(0);
 
     // Non-vacuity: every pass that used a Map ran, often, and the scratch grew past its initial sizes
     // (measured: 6.9k calls, 1.8M drawn pairs, 55k projected and 28k anchored pairs, claims on 495 frames
