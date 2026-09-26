@@ -4,6 +4,7 @@ import { buildCSR } from "../graph.js";
 import { buildHubChunks } from "./hub-chunks.js";
 import { atlasWidth, packFloatTexture, packUintTexture } from "./textures.js";
 import { AttractionPass, HubChunkPass, type CsrTextures, type HubChunkTextures } from "./passes/attraction.js";
+import { beginPass } from "./passes/fullscreen.js";
 
 /** Uniforms for one spring draw. */
 export interface SpringUniforms {
@@ -85,7 +86,7 @@ export class GpuSprings {
     const hubs = this.hubs;
     if (!hubs) return;
     // Every partials texel is written (padding with 0), so the target is never cleared.
-    const pass = this.device.beginRenderPass({ framebuffer: hubs.fbo, clearColor: false });
+    const pass = beginPass(this.device, { framebuffer: hubs.fbo, clear: false });
     hubs.pass.run(pass, posTex, this.csr, hubs, { width, nbrWidth: this.nbrWidth });
     pass.end();
     this.device.submit();

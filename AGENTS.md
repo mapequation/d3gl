@@ -522,10 +522,14 @@ holds **padded texels** past the last node, and every per-node pass starts with
 ANGLE's Metal backend the invocation kept running: the hub branch of the spring gather computed a row
 length as `end - start` from the offsets texture, the padding (0) made it wrap to ~2^32, and the
 discarded texel ran a 16M-iteration loop — 280 ms per draw instead of 0.7 ms, with correct output (the
-result is discarded), so only timing showed it. **Keep every loop bound finite on padded texels**:
-compare as `end > start + C`, never `end - start > C` on `uint`s. The per-tick ratio guard in
-`gpu-frame-budget-perf.browser.test.ts` (hub tick ≤ 2× the no-hub tick) is what catches this class;
-the absolute ceiling has 10× headroom and did not.
+result is discarded), so only timing showed it. **In a pass whose loops or fetches depend on texture
+data, end padded texels with a neutral write and `return`** (`o_force = vec2(0.0); return;` is a no-op
+under the additive force blend) — `return` does end the invocation, and it also keeps padded texels
+from fetching past an atlas (`offsets[id + 1]` on the last padded texel is out of range, which GLSL ES
+leaves undefined). The spring gather does this. Independently, **keep every loop bound finite**: compare
+as `end > start + C`, never `end - start > C` on `uint`s. The per-tick ratio guard in
+`gpu-frame-budget-perf.browser.test.ts` (hub tick ≤ 2× its hub-free twin) is what catches this class
+(`discard` plus the wrap: 1,161 ms against 51 ms); the absolute ceiling has 10× headroom and did not.
 
 ## Host sizing: backend canvases are OUT OF FLOW (#39, re-confirmed in #273)
 
