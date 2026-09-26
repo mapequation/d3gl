@@ -582,7 +582,7 @@ function repel(s: Scratch, k: number, strength: number): void {
     fy[i] = 0;
   }
   bh.build(pos32, k);
-  for (let i = 0; i < k; i++) bh.applyForce(i, strength * BH_SCALE, 0.9, fx, fy);
+  bh.applyForces(strength * BH_SCALE, 0.9, fx, fy); // children in the tree's Z order, for locality
   for (let i = 0; i < k; i++) {
     vx[i] = vx[i]! + fx[i]!;
     vy[i] = vy[i]! + fy[i]!;
