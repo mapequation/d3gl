@@ -383,7 +383,7 @@ per-file timeout. Every at-scale leg below now asserts. When you add a guard, ad
 | declutter flags upload | **WebGL** | `map/declutter-flags-perf.browser.test.ts` | 2k engine / 1M fn | `PERF_BROWSER_N` (max 2M) |
 | hover overlay reuse | **WebGL** | `map/hover-overlay-perf.browser.test.ts` | 1000 glyphs / 125 hover changes | ✗ **deliberately unscaled** |
 | instanced pie | **WebGL** | `webgl/__tests__/instanced-pie-perf.browser.test.ts` | 100k | `PERF_BROWSER_N` |
-| GPU layout tick | **WebGL** | `network/gpu/__tests__/gpu-frame-budget-perf.browser.test.ts` | 30k | `PERF_BROWSER_N` (max 200k) |
+| GPU layout tick (+ #349 signatures: no `POINTS` draw of ≥ N vertices into a 1×1 viewport; zero texture / framebuffer / buffer creation per tick) | **WebGL** | `network/gpu/__tests__/gpu-frame-budget-perf.browser.test.ts` | 30k | `PERF_BROWSER_N` (max 200k) |
 | React recolor vs build | **WebGL** | `react/perf.browser.test.ts` | 4096 | capped at 8192 — see below |
 | `"auto"` placeholder emit | Canvas→**WebGL** | `map/auto-placeholder-perf.browser.test.ts` | 200k edges / 200k points | `PERF_BROWSER_N` (max 611k) |
 | `"auto"` placeholder **paint** | Canvas→**WebGL** | same file, `#273` describe block | 30k geo polygons | `PERF_BROWSER_N` (max 120k) |
@@ -480,6 +480,26 @@ are never given slack by either knob.
 sets it to `$PERF_N` — do **not** hard-code, two benches used to and silently ignored the tier),
 assert the deterministic signature *unconditionally*, and put the wall-clock ceiling behind
 `PERF_ASSERT` with an env override. See `frontier-perf.test.ts` for the shape.
+
+## GPU layout: reduce with a gather tree, never a 1-texel scatter (#349)
+
+**Never reduce over all N nodes by scattering N points into one texel** with ADD or MAX blending.
+The blend unit serialises on that texel. The GPU force layout used to find its centroid and its
+bounding box this way: 17.6 ms + 18.8 ms of a 45.6 ms tick at 325k nodes on an M1 Max (53 + 57 of
+138 ms at 1M). Use the segmented reduction instead (`network/gpu/passes/segmented-reduce.ts`). It is
+a 16-ary gather tree over slot order, with pairwise adds and no blending, plus a canonical-cover range
+query per segment. It writes the segment table's `stats` (Σx, Σy, Σ|v|, count) and `box`. It costs
+0.45 ms at 325k (0.88 ms at 1M), and it is also more accurate: at 1M an offset layout's centroid is
+off by 5.5e-4 world units, where a serial float32 chain is off by ~130.
+
+- The guard is the point-draw spy in `gpu-frame-budget-perf.browser.test.ts`: a `POINTS` draw of
+  ≥ N vertices into a 1×1 viewport fails it. The SwiftShader wall-clock ceiling cannot see this
+  regression, because it only doubles a 30k tick there.
+- **Writing a sub-rectangle of a packed texture** (the tree levels share two textures): open the pass
+  with `beginPass(device, { framebuffer, clear: false, viewport })` from `network/gpu/passes/fullscreen.ts`.
+  luma's default clear wipes the **whole** attachment, because `gl.clear` ignores the viewport (only a
+  scissor limits it). `beginPass` takes the clear as a required argument, so no call site can get the
+  default by omission.
 
 ## Host sizing: backend canvases are OUT OF FLOW (#39, re-confirmed in #273)
 
