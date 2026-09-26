@@ -3,6 +3,7 @@ import type { ForceParams, LayoutGraph } from "../force.js";
 import { Cooling, DAMPING, equilibriumSpacing, springStabilizers, stepCap } from "../force.js";
 import { buildCSR } from "../graph.js";
 import { atlasWidth, pingPong, readbackFloatFboReuse, packUintTexture } from "./textures.js";
+import { readsRG } from "./device-probe.js";
 import { IntegratePass } from "./passes/integrate.js";
 import { AttractionPass } from "./passes/attraction.js";
 import { RepulsionAllPairsPass } from "./passes/repulsion-allpairs.js";
@@ -135,6 +136,12 @@ export class GpuForceLayout {
    * After each swap, `parity` selects which one holds the current read texture.
    */
   private readonly readFbos: readonly [Framebuffer, Framebuffer];
+  /**
+   * `RGBA/FLOAT` readback scratch (`width × height × 4` floats), allocated once — and only on a device
+   * whose implementation read format for `rg32f` is not `RG/FLOAT` (#351). `null` where `RG/FLOAT`
+   * reads directly (ANGLE Metal), so the measured path is unchanged.
+   */
+  private readonly rgbaScratch: Float32Array | null;
 
   /**
    * Per-node pinned-flag texture (r8unorm, one byte per node; 255 = held, 0 = free) — the GPU
@@ -219,6 +226,8 @@ export class GpuForceLayout {
     const readFbo1 = makeReadFbo();
     this.pos.swap(); // restore to initial state
     this.readFbos = [readFbo0, readFbo1];
+    // Both parities wrap an rg32f texture, so one read-format query covers them.
+    this.rgbaScratch = readsRG(device, readFbo0) ? null : new Float32Array(width * height * 4);
 
     // Force accumulation texture — cleared each tick, written by force passes.
     this.forceTex = device.createTexture({
@@ -522,7 +531,9 @@ export class GpuForceLayout {
    */
   readPositions(out: Float32Array): void {
     // Reuse the pre-created readback FBO for the current read-side texture (no per-call alloc).
-    const pixels = readbackFloatFboReuse(this.device, this.readFbos[this.parity]!, this.width, this.count);
+    const pixels = readbackFloatFboReuse(
+      this.device, this.readFbos[this.parity]!, this.width, this.count, this.rgbaScratch ?? undefined,
+    );
     out.set(pixels);
   }
 
