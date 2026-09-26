@@ -97,7 +97,7 @@ interface Leg {
 }
 
 function runLeg(pos: Float32Array, n: number): Leg {
-  const gc = (globalThis as { gc?: () => void }).gc;
+  const gc = globalThis.gc; // typed by @types/node; defined only under --expose-gc
   for (let i = 0; i < 3; i++) layoutBox(pos, n); // warm up (JIT)
   gc?.();
   const ab0 = process.memoryUsage().arrayBuffers;
