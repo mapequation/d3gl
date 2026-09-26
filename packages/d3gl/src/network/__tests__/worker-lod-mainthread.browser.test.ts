@@ -1,4 +1,4 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import { network } from "../network.js";
 import { buildGraph } from "../graph.js";
 
@@ -172,6 +172,133 @@ describe("lod() before the first layout defers the main-thread tree build", () =
     net.lod(false).data(placed(600)).lod({ expandPx: 48 });
     expect(net.toSVG()).toContain("<circle");
     expect(net.lodSource).toBe("main");
+
+    net.destroy();
+    host.remove();
+  });
+
+  it("toPNG() builds the deferred tree on demand too", async () => {
+    const { net, host } = makeNet();
+    await net.whenReady();
+
+    net.data(placed(600)).lod({ expandPx: 48 });
+    expect(net.toPNG()).toMatch(/^data:image\/png/);
+    expect(net.lodSource).toBe("main");
+
+    net.destroy();
+    host.remove();
+  });
+
+  it("a gpu layout after lod() gets its main-thread tree at the end of the call chain", async () => {
+    const { net, host } = makeNet();
+    await net.whenReady();
+
+    // No `fit`, so layout() itself builds nothing: the deferred build is what supplies the tree — whether
+    // the solve runs on the GPU or falls back to the worker (which streams no tree for a gpu layout).
+    net.data(clustered(600)).lod({ expandPx: 48 }).layout({ backend: "gpu", iterations: 5 });
+    expect(net.lodSource).toBe("none");
+    await Promise.resolve();
+    expect(net.lodSource).toBe("main");
+    await net.whenSettled();
+    expect(net.lodSource).toBe("main");
+
+    net.destroy();
+    host.remove();
+  });
+
+  it("a graph swap later in the chain gets the tree, built for the new graph", async () => {
+    const { net, host } = makeNet();
+    await net.whenReady();
+
+    // Two graphs in opposite corners, so a pick tells whose tree the cut draws.
+    const corner = (n: number, x0: number) => {
+      const g = clustered(n);
+      for (let i = 0; i < g.nodeCount; i++) {
+        g.positions[2 * i] = x0 + ((i * 37) % 60);
+        g.positions[2 * i + 1] = x0 + ((i * 91) % 60);
+      }
+      return g;
+    };
+    net.data(corner(800, 20)).lod({ expandPx: 48, declutter: false }).data(corner(300, 160));
+    expect(net.lodSource).toBe("none"); // data() dropped the (unbuilt) tree; the build is still queued
+    await Promise.resolve();
+    expect(net.lodSource).toBe("main"); // as `data(g2).lod(o)` would have: a tree before the next frame
+    expect(net.pick(160, 160)).not.toBeNull(); // the new graph's node 0
+    expect(net.pick(20, 20)).toBeNull(); // the old graph's node 0 — its tree was never built
+
+    net.destroy();
+    host.remove();
+  });
+
+  // A vector backend draws the full graph while LOD has no tree. With the build deferred, lod() must not
+  // take that branch: it would tessellate the whole graph once more for a frame nobody sees, and the
+  // queued build replaces it with the cut before the next frame. Before deferral, lod() drew the cut only.
+  it.each(["svg", "canvas"] as const)("on the %s backend, lod() draws only the cut — never the full graph again", async (backend) => {
+    const host = document.createElement("div");
+    host.style.width = "240px";
+    host.style.height = "240px";
+    document.body.appendChild(host);
+    const net = network(host, { width: 240, height: 240, backend });
+    await net.whenReady();
+    // The circles one render of the retained Scene draws: the live DOM on SVG (render() only repaints
+    // when dirty), the `arc` calls of a fresh render on Canvas. Synchronous on purpose — any `await`
+    // would let the queued build run first.
+    const arc = vi.spyOn(CanvasRenderingContext2D.prototype, "arc");
+    const drawn = () => {
+      arc.mockClear();
+      net.render();
+      return backend === "svg" ? host.querySelectorAll("circle").length : arc.mock.calls.length;
+    };
+
+    // The circles painted while `step` runs: the `arc` calls on Canvas, the circles added to the DOM on SVG.
+    const added = new MutationObserver(() => {});
+    added.observe(host, { childList: true, subtree: true });
+    const painted = (step: () => void): number => {
+      arc.mockClear();
+      added.takeRecords();
+      step();
+      if (backend === "canvas") return arc.mock.calls.length;
+      let n = 0;
+      for (const r of added.takeRecords())
+        for (const node of r.addedNodes) if (node instanceof Element) n += node.matches("circle") ? 1 : node.querySelectorAll("circle").length;
+      return n;
+    };
+
+    const g = placed(2000);
+    net.data(g);
+    expect(drawn()).toBe(g.nodeCount); // LOD off: the full graph, one circle per node
+    // The build is queued, so lod() leaves the Scene empty — and clearing it repaints nothing on the way
+    // (removing the layers one at a time repainted the rest of the full graph after each removal).
+    expect(painted(() => net.lod({ expandPx: 48 }))).toBe(0);
+    expect(drawn()).toBe(0);
+    await Promise.resolve(); // the queued build runs first, and draws the cut
+    expect(net.lodSource).toBe("main");
+    const cut = drawn();
+    expect(cut).toBeGreaterThan(0);
+    expect(cut).toBeLessThan(g.nodeCount);
+
+    added.disconnect();
+    arc.mockRestore();
+    net.destroy();
+    host.remove();
+  });
+
+  it("on the svg backend, a worker layout in the chain draws its streamed cut, and no full graph meanwhile", async () => {
+    const host = document.createElement("div");
+    host.style.width = "240px";
+    host.style.height = "240px";
+    document.body.appendChild(host);
+    const net = network(host, { width: 240, height: 240, backend: "svg" });
+    await net.whenReady();
+
+    const g = clustered(1500);
+    net.data(g).lod({ expandPx: 48 }).layout({ backend: "worker", iterations: 25 });
+    expect(host.querySelectorAll("circle").length).toBe(0); // the worker's tree is on its way
+    await net.whenSettled();
+    expect(net.lodSource).toBe("worker");
+    const cut = host.querySelectorAll("circle").length;
+    expect(cut).toBeGreaterThan(0);
+    expect(cut).toBeLessThan(g.nodeCount);
 
     net.destroy();
     host.remove();

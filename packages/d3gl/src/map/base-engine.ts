@@ -834,14 +834,28 @@ export abstract class BaseEngine {
    *  promoted to the instanced lane (the lane owns draw + interaction; a stale Scene spec of the same
    *  name would otherwise double-draw and shadow the lane in pick/selection dispatch). No-op if absent. */
   protected removeLayer(name: string): void {
+    if (this.dropLayer(name)) this.pushLayers();
+  }
+
+  /** {@link removeLayer} for several layers with ONE re-push. Removing them one at a time re-pushes and
+   *  repaints the layers still registered after every removal — O(layers × their drawables) for a clear
+   *  that should cost nothing. No-op (no push) if none is present. */
+  protected removeLayers(names: readonly string[]): void {
+    let removed = false;
+    for (const name of names) removed = this.dropLayer(name) || removed;
+    if (removed) this.pushLayers();
+  }
+
+  /** Drop one layer's spec, indexes, interaction state and Scene group, without re-pushing. */
+  private dropLayer(name: string): boolean {
     const at = this.specs.findIndex((s) => s.name === name);
-    if (at < 0) return;
+    if (at < 0) return false;
     this.specs.splice(at, 1);
     this.hitIndexes.delete(name);
     this.layerIds.delete(name);
     this.dropInteractionState(name);
     this.scene.remove(name);
-    this.pushLayers();
+    return true;
   }
 
   /** Register a pass-through layer (called by subclasses for passThrough:true).

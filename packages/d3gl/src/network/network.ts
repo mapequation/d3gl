@@ -1265,7 +1265,7 @@ export class Network extends BaseEngine {
         if (anchors.length >= max) break;
       }
     } else if (!this.lodAwaitsTree()) {
-      // (Skipped while LOD awaits its tree: the WebGL lane draws nothing then, so there is nothing to label.)
+      // (Skipped while LOD awaits its tree: nothing is drawn then, so there is nothing to label.)
       // No-LOD: rank the nodes in view by strength (weighted degree). The full graph is drawn.
       // Candidate gathering (#212) is O(visible) per pan/zoom frame in the steady state: on settled
       // positions a coarse uniform grid — built at most once per position change, never per frame —
@@ -1956,11 +1956,12 @@ export class Network extends BaseEngine {
     return this.lodSpatial ? "spatial" : "main";
   }
 
-  /** LOD is on but no tree is ready yet (a worker is about to stream it, or {@link lod} deferred the
-   *  build): the WebGL lane draws nothing meanwhile ({@link syncLane}), while a vector backend draws the
-   *  full graph. */
+  /** LOD is on, no tree is ready yet, and nothing is drawn until one is: the WebGL lane draws nothing
+   *  meanwhile ({@link syncLane}) — a worker is about to stream the tree, or {@link lod} deferred the
+   *  build — and a vector backend draws nothing while that deferred build is pending ({@link rebuild}).
+   *  (A vector backend awaiting a streamed tree otherwise draws the full graph.) */
   private lodAwaitsTree(): boolean {
-    return !!this.lodOptions && !this.lodReady() && !!this.backend()?.setInstancedLayer;
+    return !!this.lodOptions && !this.lodReady() && (this.lodBuildDeferred || !!this.backend()?.setInstancedLayer);
   }
 
   /**
@@ -2029,11 +2030,18 @@ export class Network extends BaseEngine {
       }
     } else {
       // SVG/Canvas: emit the glyphs through the PathContext seam as Scene layers, so the
-      // existing pipeline renders them and toSVG() produces publication output. (LOD is a
-      // WebGL-scale feature; vector backends always draw the full graph.)
+      // existing pipeline renders them and toSVG() produces publication output. With LOD on they
+      // draw the cut once a tree is ready (#138), else the full graph.
       this.unregisterLanes();
-      this.registerNetworkScene(this.graph, style, true);
-      this.sceneActive = true;
+      if (this.lodAwaitsTree()) {
+        // lod() deferred its build to the end of the call chain: that build draws the cut before the
+        // next frame (or a worker layout that took over streams it), so the full graph would be
+        // tessellated here only for a frame nobody sees. Draw nothing meanwhile, as the WebGL lane does.
+        this.clearNetworkScene();
+      } else {
+        this.registerNetworkScene(this.graph, style, true);
+        this.sceneActive = true;
+      }
     }
     // Set labels BEFORE the render so a backend that bakes them into the frame (Canvas) draws the
     // current labels in this render rather than one rebuild behind.
@@ -2109,11 +2117,10 @@ export class Network extends BaseEngine {
   /** Drop every retained Scene layer the vector path registers, in one pass. Unlike
    *  `registerNetworkScene(graph, style, false)` — which registers the same slots *empty* and
    *  therefore still pays O(nodeCount + edgeCount) for the id arrays and id→index maps — this is
-   *  O(layers): the right clear when the Scene must not cost anything at all (#201). */
+   *  O(layers) plus one re-push of what is left: the right clear when the Scene must not cost anything
+   *  at all (#201). */
   private clearNetworkScene(): void {
-    for (const name of [this.CONTAINER_LAYER, "module-boundaries", "links", "arrows", "node-halos", this.NODE_LAYER, this.PIE_LAYER]) {
-      this.removeLayer(name);
-    }
+    this.removeLayers([this.CONTAINER_LAYER, "module-boundaries", "links", "arrows", "node-halos", this.NODE_LAYER, this.PIE_LAYER]);
     this.sceneActive = false;
   }
 
