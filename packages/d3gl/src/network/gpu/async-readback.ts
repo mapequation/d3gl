@@ -35,7 +35,13 @@ import { PackPositionsPass, PackStatsPass } from "./passes/readback-pack.js";
 export const READBACK_STATS_FLOATS = 8;
 const STATS_BYTES = READBACK_STATS_FLOATS * 4;
 
-/** What a readback copies: the solver's current positions and its segment-table stats. */
+/**
+ * What a readback copies: the solver's current positions and its segment-table stats. Both copy paths
+ * assume **slot order is node order** (the flat solver's identity permutation, spec §5.1): the `RG/FLOAT`
+ * copy reads the position atlas as it is, and the pack pass addresses slot = node id. A solver with a
+ * slot permutation (gpu-nested) must gather through `slotOfNode` in the pack pass and take it on every
+ * device (spec §6.5.2).
+ */
 export interface ReadbackSource {
   /** The current (read-side) `rg32f` position texture — what the pack pass samples. */
   readonly positionTexture: Texture;
@@ -92,13 +98,25 @@ export class AsyncPositionReadback {
     if (!(device instanceof WebGLDevice)) throw new Error("AsyncPositionReadback: a WebGL2 device is required");
     this.gl = device.gl;
     this.count = source.nodeCount;
-    this.pack = deviceReadsRG(device) ? null : new PackPositionsPass(device, source.nodeCount);
-    this.packStats = new PackStatsPass(device);
-    this.positionBytes = this.pack
-      ? this.pack.width * this.pack.height * 16
-      : source.positionWidth * source.atlasRows * 8;
-    this.pbo = packBuffer(this.gl);
-    this.statsPbo = packBuffer(this.gl);
+    // Built in order; a failure frees what was already built before it propagates.
+    let pack: PackPositionsPass | null = null;
+    let packStats: PackStatsPass | null = null;
+    let pbo: WebGLBuffer | null = null;
+    try {
+      pack = deviceReadsRG(device) ? null : new PackPositionsPass(device, source.nodeCount);
+      packStats = new PackStatsPass(device);
+      pbo = packBuffer(this.gl);
+      this.statsPbo = packBuffer(this.gl);
+    } catch (error) {
+      if (pbo) this.gl.deleteBuffer(pbo);
+      packStats?.destroy();
+      pack?.destroy();
+      throw error;
+    }
+    this.pack = pack;
+    this.packStats = packStats;
+    this.pbo = pbo;
+    this.positionBytes = pack ? pack.width * pack.height * 16 : source.positionWidth * source.atlasRows * 8;
   }
 
   /** Whether a copy has been issued and not yet harvested (the PBOs are busy). */

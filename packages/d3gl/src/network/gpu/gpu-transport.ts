@@ -171,11 +171,15 @@ function startGpuLayoutSync(
     // (`!device` never reaches here with `ok`: no device has no caps, which never pass.)
     return fallBackToWorker(verdict.ok ? "no WebGL device" : verdict.reason, graph, opts, onFrame, onLODTree, onTransport);
   }
-  onTransport?.("gpu");
+  // gpuLayoutSupport passed, so this is a WebGL2 device: the streaming readback needs its raw context.
+  if (!(device instanceof WebGLDevice)) {
+    return fallBackToWorker("no WebGL2 device", graph, opts, onFrame, onLODTree, onTransport);
+  }
 
   // 0-node graph: GpuForceLayout would create a zero-height texture (crash).
   // Return a no-op handle immediately — there is nothing to lay out.
   if (graph.nodeCount === 0) {
+    onTransport?.("gpu");
     onFrame();
     return { shared: false, transport: "gpu", settled: Promise.resolve(), stop() {}, pin() {}, unpin() {} };
   }
@@ -202,15 +206,20 @@ function startGpuLayoutSync(
   if (moduleSeeded) layout.cool(iterations);
   else layout.hold(1);
 
-  // gpuLayoutSupport passed, so this is a WebGL2 device: the streaming readback needs its raw context.
-  if (!(device instanceof WebGLDevice)) {
+  let stream: GpuStream;
+  try {
+    stream = new GpuStream(device, layout, graph, {
+      iterations,
+      ...(opts.frameEvery !== undefined ? { frameEvery: opts.frameEvery } : {}),
+    }, onFrame);
+  } catch (error) {
+    // The readback's programs or buffers failed: free the solver before the caller falls back.
     layout.destroy();
-    return fallBackToWorker("no WebGL2 device", graph, opts, onFrame, onLODTree, onTransport);
+    throw error;
   }
-  const stream = new GpuStream(device, layout, graph, {
-    iterations,
-    ...(opts.frameEvery !== undefined ? { frameEvery: opts.frameEvery } : {}),
-  }, onFrame);
+  // Reported once every GPU resource exists, so a failed start reports only the fallback's "worker";
+  // still before the first frame.
+  onTransport?.("gpu");
   stream.start();
 
   return {
