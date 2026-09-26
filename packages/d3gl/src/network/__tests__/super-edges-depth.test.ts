@@ -3,6 +3,7 @@ import { buildModuleLODTree, type ModuleLink, type ModuleNode } from "../modules
 import { computeLODGeometry, type CutBoundaries, type LODTree } from "../lod.js";
 import { makeSuperEdgesScratch, superEdges, type SuperEdgeStyleResolved } from "../glyphs.js";
 import { buildGraph } from "../graph.js";
+import { firstDifference, makeMapSuperEdgesScratch, superEdgesMapReference } from "./super-edges-map-reference.js";
 
 /**
  * Super-edges between tree nodes at **different depths** (#325). A ragged Infomap tree puts leaves (and
@@ -459,6 +460,70 @@ describe("super-edges toward an off-screen expanded module draw each edge once (
       }
       expect(checked).toBeGreaterThan(50); // non-vacuous: plenty of (cut, view) pairs were checked
       expect(drawnOnce).toBeGreaterThan(checked);
+    });
+  }
+});
+
+/**
+ * #364: the gather's scratch moved from `Map`s to generation-stamped typed arrays and pair indexes. On
+ * every (sampled) cut of the ragged fixtures, a decluttered subset of it, a finite view that pushes some
+ * centroids off-screen and the whole plane, it must reproduce the Map-based gather element for element —
+ * every link style, `crossLevelEdges` on and off, anchoring at the cut's expanded modules — with one
+ * scratch per side across every call, as the engine keeps one.
+ */
+describe("#364 the typed-array gather reproduces the Map-based gather on every cut of the ragged fixtures", () => {
+  const widthOf = (w: number): number => 0.5 + Math.sqrt(w);
+  const colorOf = (w: number): [number, number, number, number] => [(w * 29) % 256, (w * 13) % 256, 90, 60 + ((w * 7) % 190)];
+  const styles: Omit<SuperEdgeStyleResolved, "crossLevelEdges">[] = [
+    { linkStyle: "half-arrow", directed: true, widthOf, colorOf, bend: 0.2, arrowSize: 1, maxAggregateRadius: 3 },
+    { linkStyle: "line", directed: true, widthOf, colorOf, bend: 0.1, arrowSize: 3 },
+    { linkStyle: "line", directed: false, widthOf, colorOf, bend: 0, arrowSize: 3 },
+  ];
+  const fixtures = [exampleFixture(), randomFixture(1, 12, 5), randomFixture(2, 14, 4), randomFixture(3, 10, 6), randomFixture(4, 16, 3)];
+  for (const fx of fixtures) {
+    it(fx.label, () => {
+      const { tree } = setup(fx);
+      const n = fx.records.length;
+      const r = rng(17);
+      const graph = buildGraph({ nodeCount: n, source: [], target: [], directed: true });
+      for (let i = 0; i < n * 2; i++) graph.positions[i] = r() * 100;
+      computeLODGeometry(tree, graph, new Float32Array(n).fill(1));
+      const parent = tree.parent!;
+      const views = [ALL, ...Array.from({ length: 3 }, () => {
+        const x = r() * 60 - 10;
+        const y = r() * 60 - 10;
+        const side = 30 + r() * 30;
+        return { minX: x, maxX: x + side, minY: y, maxY: y + side };
+      })];
+      const cuts = cutsOf(tree, tree.size - 1).filter((_, i, a) => a.length <= 300 || r() < 300 / a.length);
+      const sc = makeSuperEdgesScratch();
+      const ref = makeMapSuperEdgesScratch();
+      const failures: string[] = [];
+      let compared = 0;
+      let drawn = 0;
+      for (const cutNodes of cuts) {
+        const expanded = new Set<number>();
+        for (const g of cutNodes) for (let x = parent[g]!; x >= 0 && parent[x]! >= 0; x = parent[x]!) expanded.add(x);
+        const anchor: CutBoundaries = { ids: Uint32Array.from(expanded), alpha: new Float32Array(expanded.size).fill(1), count: expanded.size };
+        for (const present of [cutNodes, cutNodes.filter(() => r() < 0.7)]) {
+          const frontier = Uint32Array.from(present);
+          for (const view of views) {
+            for (const base of styles) {
+              for (const crossLevelEdges of [false, true]) {
+                const style = { ...base, crossLevelEdges, anchor };
+                const want = superEdgesMapReference(tree, frontier, style, view, ref);
+                const diff = firstDifference(superEdges(tree, frontier, style, view, sc), want);
+                if (diff !== "") failures.push(`cut [${present.join(",")}], view ${JSON.stringify(view)}, ${base.linkStyle}, crossLevelEdges=${crossLevelEdges}: ${diff}`);
+                compared++;
+                drawn += want.ids.length;
+              }
+            }
+          }
+        }
+      }
+      expect(failures.slice(0, 3), `${failures.length} of ${compared} calls differ`).toEqual([]);
+      expect(compared).toBeGreaterThan(300); // non-vacuous: many (cut, view, style) calls, with pairs drawn
+      expect(drawn).toBeGreaterThan(compared);
     });
   }
 });
