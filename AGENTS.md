@@ -384,6 +384,9 @@ per-file timeout. Every at-scale leg below now asserts. When you add a guard, ad
 | hover overlay reuse | **WebGL** | `map/hover-overlay-perf.browser.test.ts` | 1000 glyphs / 125 hover changes | ✗ **deliberately unscaled** |
 | instanced pie | **WebGL** | `webgl/__tests__/instanced-pie-perf.browser.test.ts` | 100k | `PERF_BROWSER_N` |
 | GPU layout tick (+ #349 signatures: no draw of ≥ N vertices × instances into a 1×1 viewport, via any of the five WebGL2 draw calls; zero texture / framebuffer / buffer creation per tick); hub springs (#350): hub rows in web-NotreDame's shape, scaled with N (0.52% of rows, its five > 4096 hubs, chunk count K ≥ N/30), tick ≤ 2× a hub-free twin with the same edges, and exactly one extra draw (the chunk pass, K fragments) with no per-tick allocation; tile pyramid (#354): one scatter into the L0 atlas and one reduce per coarser level, each rasterising exactly its level's rectangle of the packed Podd / Peven textures (draws are attributed by texture identity, never by size: for N in (W² − W, W²], W a power of two, the slot atlas is W × W, the size of L0) | **WebGL** | `network/gpu/__tests__/gpu-frame-budget-perf.browser.test.ts` | 30k | `PERF_BROWSER_N` (max 200k) |
+| GPU layout tick sliced into row bands (#352): 4 bands per tick bitwise equal to the unsliced tick (hub rows included), 12 scissored force draws, no allocation per band | **WebGL** | `network/gpu/__tests__/gpu-frame-budget-perf.browser.test.ts` | 30k | `PERF_BROWSER_N` (max 200k) |
+| GPU layout **streaming** through `network().layout({ backend: "gpu" })`, LOD off **and** on (#352): transport-only main thread per frame (p95 ceiling `c0 + c1·N`), encode median ≤ 2.5 ms; every streaming `readPixels` into a bound PBO; every `getBufferSubData` after a fence inserted after its copy was seen signalled; within a frame the harvest precedes every layout draw; exactly one fence per frame; no GPU object created per streamed frame; repaints ≥ 48 ms apart; `settled` after the final tick's harvest; ticks/s floored against the GPU-only rate | **WebGL** | `network/gpu/__tests__/gpu-stream-perf.browser.test.ts` | 100k | `PERF_BROWSER_N` (max 1M) |
+| GPU streaming readback `AsyncPositionReadback` (#352), `RG/FLOAT` and packed `RGBA/FLOAT`: exact positions and stats, both PBOs `STREAM_READ`, one `readPixels` per PBO per copy (into the PBO), no allocation per readback, copy and harvest main-thread ceilings, a non-finite layout refused without touching positions | **WebGL** | `network/gpu/__tests__/gpu-async-readback-perf.browser.test.ts` | 1M | `PERF_BROWSER_N` (max 4M) |
 | GPU layout position readback through `GpuForceLayout.readPositions`, `RGBA/FLOAT` (a device that refuses `RG/FLOAT`) and `RG/FLOAT` (#351): exact positions, no GPU allocation and one `readPixels` per readback, one retained RGBA scratch | **WebGL** | `network/gpu/__tests__/gpu-readback-perf.browser.test.ts` | 1M | `PERF_BROWSER_N` (max 4M) |
 | React recolor vs build | **WebGL** | `react/perf.browser.test.ts` | 4096 | capped at 8192 — see below |
 | `"auto"` placeholder emit | Canvas→**WebGL** | `map/auto-placeholder-perf.browser.test.ts` | 200k edges / 200k points | `PERF_BROWSER_N` (max 611k) |
@@ -556,6 +559,30 @@ previous build — while every SwiftShader test stayed green, because SwiftShade
   texture fetch or through a function parameter instead of a uniform read in the loop condition (the flat
   exact loop: 3.26 → 3.33 ms per draw at N = 4096). Time a changed per-node loop on real hardware against
   the previous build; `repulsion-fs.test.ts` pins the flat exact loop's shape.
+
+## GPU layout streaming: raw `STREAM_READ` PBOs, one write per fence, repaints cost GPU too (#352)
+
+The streaming GPU layout never reads synchronously on the frame path. It copies positions into a PBO,
+fences the frame, and harvests with `getBufferSubData` once that fence has signalled (`network/gpu/`
+`async-readback.ts`, `gpu-stream.ts`, `frame-budget.ts`). Three things bit while building it:
+
+- **luma `Buffer`s cannot be `STREAM_READ`** (9.3.3's `WEBGLBuffer` emits only `STATIC_DRAW` /
+  `DYNAMIC_DRAW`). Without a `*_READ` usage Chrome's `getBufferSubData` cannot use its readback shadow
+  copy and falls back to a synchronous round trip. Create readback PBOs raw on the `WebGLDevice`'s
+  context, as `PickReadback` does.
+- **Write each READ buffer once per fence.** Chrome keeps the shadow copy only for a buffer written once
+  and then fenced. A second `readPixels` into the same PBO before the harvest logs "written again before
+  being read back" and discards the copy. The harvest then logs "read back without waiting on a fence"
+  and stalls the GPU pipeline. That stall does not show in main-thread time: on web-NotreDame, 300 ticks
+  took 63 s instead of 11 s. Pack everything a PBO carries into one texture first (the stats ride in their
+  own 32-byte PBO through a 2×1 staging texture). One such warning per PBO at creation is benign:
+  Chrome counts the sizing `bufferData` as a write.
+- **A heavy engine repaint is GPU work the layout's fences see.** Its draws queue ahead of the layout,
+  so a miss behind a repaint frame says nothing about the layout's band size. The fence controller
+  only blocks on such a miss and never resizes `k` or B. Before that rule, every 325k render doubled B
+  until 50 items per tick left 4.6 ticks/s. Where the browser holds the next animation frame until the
+  canvas is drawn (SwiftShader: seconds per 100k-node render), the rAF gap after a repaint frame is
+  the render's cost, and the repaint throttle spaces repaints by twice that.
 
 ## Host sizing: backend canvases are OUT OF FLOW (#39, re-confirmed in #273)
 

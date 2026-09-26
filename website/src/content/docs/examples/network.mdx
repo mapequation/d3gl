@@ -42,9 +42,13 @@ tick count to hit. The GPU layout has no early stop yet (it runs its whole budge
 keeps full heat until it settles on its own, so the example gives those two a budget that shrinks as
 the graph grows. **GPU** and **Auto** get that budget whichever transport they resolve to, since that is
 known only after `layout()` returns; where they resolve to the worker, a multilevel run therefore cools
-over fewer ticks than under **Worker**. `layout({ backend: "gpu" })` (the **Backend** control) runs
-the solve in WebGL2 where the device can: float render targets, float blending (`EXT_float_blend`) and
-textures large enough for the graph. Anywhere else it falls back to the worker with one console warning naming the reason, and
+over fewer ticks than under **Worker**. `layout({ backend: "gpu" })` (the **Backend** control) runs the solve in WebGL2 where
+the device can: float render targets, float blending (`EXT_float_blend`) and textures large enough for
+the graph. It streams without blocking the main thread either: each frame gives the layout at most
+`min(10 ms, 0.6 × the frame interval)` of GPU time — a tick larger than that is split across frames in
+row bands — and positions come back through an asynchronous, fenced readback, so pan and zoom never wait
+behind a tick and the page keeps its frame rate while hundreds of thousands of nodes settle; the layout
+repaints at most 20 times a second. Anywhere else it falls back to the worker with one console warning naming the reason, and
 the fallback is the run `backend: "worker"` would start — it honours `multilevel` (**Seeding**) and
 streams the LOD tree from the worker. `layout({ backend: "auto" })` (**Auto**) asks for "the GPU where it
 works": it takes the GPU wherever `"gpu"` would and the worker everywhere else, **without** a warning,
