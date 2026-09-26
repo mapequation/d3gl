@@ -31,7 +31,9 @@
 //   within `encodeCapMs` (2 ms) — the binding limit at small N, where the GPU work is tiny.
 //
 // WebGL sync status only changes between tasks, so a fence is never seen signalled in the task that
-// inserted it: the controller reasons in frames. Fences signal in submission order, so "frame f's fence
+// inserted it: the controller reasons in frames. Every frame inserts its fence, a blocked one too (it may
+// carry a readback copy), so while the GPU stays behind the queue grows by one empty sync object per
+// frame: the gate bounds the queued layout *work*, not the number of fences. Fences signal in submission order, so "frame f's fence
 // signalled" also means every earlier frame's work (and any readback copied in it) has completed —
 // {@link FrameBudget.completedFrame} is what the readback harvest keys on. No timer queries: the
 // estimate is static per device class and the fences correct it (spec §16 lists the follow-up).
@@ -129,7 +131,8 @@ export interface FrameBudgetOptions {
  * The fence controller. Per animation frame the transport calls, in order: {@link beginFrame} (poll
  * fences — before the harvest), {@link open} (the gate), then {@link admit} / {@link spent} around each
  * item it encodes, and {@link endFrame} (insert the frame's budget fence — after any readback copy, so
- * it doubles as the readback fence). Allocates nothing per frame beyond the fence it inserts.
+ * it doubles as the readback fence). Allocates nothing per frame beyond the fence it inserts (the median
+ * interval is sorted in a fixed scratch array, once per frame).
  */
 export class FrameBudget<F> {
   private readonly fences: FenceSource<F>;
@@ -150,6 +153,8 @@ export class FrameBudget<F> {
   private readonly sorted = new Float64Array(INTERVAL_SAMPLES);
   private intervalCount = 0;
   private intervalNext = 0;
+  /** The median of {@link intervals}, recomputed once per frame in {@link beginFrame}. */
+  private median = DEFAULT_INTERVAL_MS;
   private lastNow = Number.NaN;
   /** This frame's budget, fixed at {@link beginFrame} (the median moves only between frames). */
   private frameBudget: number;
@@ -197,7 +202,7 @@ export class FrameBudget<F> {
 
   /** The median rAF interval over the last frames (60 Hz before any). */
   get intervalMs(): number {
-    return this.medianInterval();
+    return this.median;
   }
 
   /** Row bands for the next tick's force pass: the adaptive count, never below the static estimate. */
@@ -227,9 +232,9 @@ export class FrameBudget<F> {
   beginFrame(now: number): "ok" | "lost" {
     if (!Number.isNaN(this.lastNow)) {
       this.pushInterval(now - this.lastNow);
-      const interval = this.medianInterval();
-      this.frameBudget = frameBudgetMs(this.limitMs, interval);
-      this.maxInFlight = framesInFlight(interval);
+      this.median = this.medianInterval();
+      this.frameBudget = frameBudgetMs(this.limitMs, this.median);
+      this.maxInFlight = framesInFlight(this.median);
     }
     this.lastNow = now;
     this.frameIndex++;
@@ -361,11 +366,16 @@ export class FrameBudget<F> {
     if (this.intervalCount < INTERVAL_SAMPLES) this.intervalCount++;
   }
 
+  /**
+   * The median of the valid samples (indices `[0, intervalCount)` until the ring is full), sorted in a
+   * fixed scratch array padded with +∞: no view, no allocation.
+   */
   private medianInterval(): number {
     const n = this.intervalCount;
     if (n === 0) return DEFAULT_INTERVAL_MS;
-    const s = this.sorted.subarray(0, n);
-    s.set(this.intervals.subarray(0, n));
+    const s = this.sorted;
+    s.set(this.intervals);
+    for (let i = n; i < INTERVAL_SAMPLES; i++) s[i] = Number.POSITIVE_INFINITY;
     s.sort();
     return s[n >> 1] ?? DEFAULT_INTERVAL_MS;
   }
