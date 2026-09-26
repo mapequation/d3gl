@@ -1,5 +1,5 @@
 import { BaseEngine, type BaseEngineOptions, type HoverHit, type InteractiveLayerOptions, type LaneInteractive, type NodeDragSession } from "../map/base-engine.js";
-import { networkLayers, networkLayersFromCache, noLodStyleCache, drawsLinks, frontierCircles, frontierHalos, boundaryRings, traceBoundaryRings, superEdges, makeSuperEdgesScratch, emitNodes, emitLinks, emitArrows, emitHalfLinks, traceFrontierGlyphs, traceFrontierHalos, traceSuperHalfArrows, traceSuperLines, traceSuperArrows, physicalPieInstances, tracePieWedges, rgbaCss, pickNodes, regionNodes, resolveNodeRadii, resolveNodeRadiusAggregate, resolveImportance, resolveFlowBorder, resolveNodeColors, resolveLinkWidthOf, resolveLinkColorOf, resolveLinkStrokeOf, flowBorderInnerRadii, type ResolvedNetworkStyle, type ModuleBoundaryResolved, type AggregateOutlineResolved, type NoLodStyleCache, type NodeRadiusSpec, type ImportanceSpec, type FlowBorderSpec, type ConstBorder, type LinkWidthSpec, type LinkColorSpec, type LinkStyle } from "./glyphs.js";
+import { networkLayers, networkLayersFromCache, noLodStyleCache, drawsLinks, frontierCircles, frontierHalos, boundaryRings, traceBoundaryRings, superEdges, makeSuperEdgesScratch, emitNodes, emitLinks, emitArrows, emitHalfLinks, traceFrontierGlyphs, traceFrontierHalos, traceSuperHalfArrows, traceSuperLines, traceSuperArrows, physicalPieInstances, tracePieWedges, rgbaCss, pickNodes, regionNodes, resolveNodeRadii, resolveNodeRadiusAggregate, resolveImportance, resolveFlowBorder, resolveNodeColors, resolveLinkWidthOf, resolveLinkColorOf, resolveLinkStrokeOf, flowBorderInnerRadii, type ResolvedNetworkStyle, type ModuleBoundaryResolved, type AggregateOutlineResolved, type NoLodStyleCache, type NodeRadiusSpec, type ImportanceSpec, type FlowBorderSpec, type ConstBorder, type LinkWidthSpec, type LinkColorSpec, type LinkStyle, type RGBAValue } from "./glyphs.js";
 import { rgb } from "d3-color";
 import { ForceLayout, seedPositions, type ForceParams } from "./force.js";
 import { multilevelLayout, type CoarsenOptions } from "./coarsen.js";
@@ -12,7 +12,7 @@ import { positionTransition, type PositionTransition } from "./transition.js";
 import { moduleColors, type ModulePathNode, type ModuleColorOptions } from "./module-colors.js";
 import { physicalPieWedges, type PhysicalPieWedges, type PieWedgeOptions } from "./pie.js";
 import { rosettePositions } from "./rosette.js";
-import { gatherCandidates, descendingByKey, CandidateList, type CandidateSource } from "./label-candidates.js";
+import { gatherCandidates, descendingByKey, descendingInListOrder, CandidateList, type CandidateSource } from "./label-candidates.js";
 import type { StateNetworkGraph } from "./state-graph.js";
 import { startNestedWorkerLayout, startWorkerLayout, type WorkerLayoutHandle } from "./worker-transport.js";
 import { startGpuLayout } from "./gpu/gpu-transport.js";
@@ -21,6 +21,7 @@ import type { NetworkGraph } from "./graph.js";
 import { fitNodes, fitBox, fitTransform, type FitBox } from "./fit.js";
 import type { InstancedLayer, ViewTransform } from "../core/index.js";
 import { InstancedLane, type SelectionStrategy } from "../core/instanced-lane.js";
+import { StableColumns } from "../core/stable-columns.js";
 import { resolveRingColors, ringCircles } from "../map/highlight-ring.js";
 import { hoverParts } from "../map/highlight.js";
 
@@ -215,6 +216,11 @@ export interface NetworkStyle {
    * Link colour. A single CSS colour (default a light grey), or a `(weight) => cssColour` scale so
    * colour encodes the edge weight/flow (a bare d3 colour scale fits). The arrowhead always takes the
    * link's colour — there is no separate arrow fill.
+   *
+   * The colour is captured once per `style()` (or `data()`) call and remembered **per weight**, so a
+   * scale must be a pure function of the weight. A scale changed in place (a new domain or range, an
+   * accessor reading mutable state such as a theme) takes effect on the next `style()` call — pass it
+   * again then. Until then, what a backend redraws with is unspecified.
    */
   linkStroke?: LinkColorSpec;
   /** Arrowhead size (world units) for directed `linkStyle:"line"` links. Default 3 × linkWidth. */
@@ -526,6 +532,21 @@ export interface StateNetworkOptions {
   rosetteRadius?: number;
 }
 
+/**
+ * What the last LOD declutter pass cost ({@link Network.declutterStats}). `probes` and `cells` are the
+ * deterministic cost signature: they depend only on the glyphs and the view, never on machine speed.
+ */
+export interface NetworkDeclutterStats {
+  /** Frontier glyphs the pass thinned (the view-culled cut, before declutter). */
+  glyphs: number;
+  /** Distance tests the pass ran. */
+  probes: number;
+  /** Grid cells the pass scanned, empty ones included. */
+  cells: number;
+  /** Grid cells the engine's reused declutter scratch holds: its high-water mark, 4 bytes each. */
+  scratchCells: number;
+}
+
 const DEFAULT_NODE_RADIUS = 4;
 const DEFAULT_NODE_FILL = "#4878d0";
 const DEFAULT_LINK_WIDTH = 1;
@@ -721,6 +742,8 @@ export class Network extends BaseEngine {
   private readonly cutScratch = makeCutScratch();
   /** Engine-owned {@link declutterFrontier} scratch (#213), same reuse contract as {@link cutScratch}. */
   private readonly declutterFrontierScratch = makeDeclutterFrontierScratch();
+  /** Frontier glyphs the last LOD declutter pass was handed; −1 before the first ({@link declutterStats}). */
+  private declutterGlyphs = -1;
   /** The expanded modules in view the last {@link computeFrontier} collected for the module-boundary
    *  rings (#329) — `count` 0 when `moduleBoundary` is off. Reused per cut, like {@link cutScratch}. */
   private readonly cutBoundaries: CutBoundaries = makeCutBoundaries();
@@ -736,6 +759,11 @@ export class Network extends BaseEngine {
   private fadeAlpha: Float32Array | null = null;
   /** Cached resolved style; invalidated on style()/data() to avoid per-zoom O(n) radii recompute. */
   private resolvedCache: ResolvedNetworkStyle | null = null;
+  /** The link colour spec resolved once per style()/data() call: the per-weight colour memo
+   *  ({@link resolveLinkColorOf}) and the representative stroke. Kept when only `resolvedCache` is
+   *  dropped — the state-network "both" view re-applies its dot radius on every streamed frame, and
+   *  rebuilding these there would start the memo cold (and re-run the accessor) once per frame. */
+  private linkColors: { colorOf: (weight: number) => RGBAValue; stroke: string } | null = null;
   /** No-LOD style-derived link/arrow attributes cache (#179), keyed by `resolvedCache` identity + graph:
    *  reused on a position-only layout frame so the colour/width scale accessors run O(edges) ONCE per
    *  style version, not per frame. Invalidated implicitly when `resolvedStyleCached` returns a fresh object. */
@@ -777,6 +805,13 @@ export class Network extends BaseEngine {
   /** Reusable candidate-id scratch for {@link refreshLabels} (retained typed buffers — the gather
    *  allocates nothing per frame in the steady state). */
   private readonly labelCand = new CandidateList();
+  /** The LOD twin of {@link labelCand}: the in-view frontier ids (frontier order), plus the list-position
+   *  scratch {@link descendingInListOrder} ranks them in when a `max` cap applies. */
+  private readonly lodLabelCand = new CandidateList();
+  private readonly lodLabelRank = new CandidateList();
+  /** The LOD lane's last emitted style columns ({@link frontierLayers}): an unchanged column is re-emitted
+   *  as the same array so its GPU re-upload is skipped. Cleared whenever the LOD lane stops emitting. */
+  private readonly lodColumns = new StableColumns();
   /** Engine-owned {@link superEdges} scratch (#210): reused every LOD emit so the per-frame gather is
    *  O(frontier + drawn super-edges) — no O(tree.size) allocation per zoom frame. Shared by the WebGL
    *  lane emit and the retained-Scene registration (they never run concurrently; outputs never alias it). */
@@ -889,6 +924,7 @@ export class Network extends BaseEngine {
     this.lodModules = false;
     this.lodHasGeometry = false;
     this.resolvedCache = null;
+    this.linkColors = null;
     this.derivedParentFor = null; this.derivedParent = null; // drop the ancestor-aware parent cache (#162)
     this.fitFallbackBox = null; this.fitKnownBox = null; this.fitNodesArr = null; this.fitNodesFor = null; // fit caches are tied to the old graph/tree
     return this.rebuild();
@@ -1010,6 +1046,7 @@ export class Network extends BaseEngine {
   style(style: NetworkStyle): this {
     this.styleOpts = { ...this.styleOpts, ...style };
     this.resolvedCache = null; // radii/colours/sizeMode changed
+    this.linkColors = null; // the link colour is captured once per style() call
     // Refresh the LOD tree's style geometry (radii/colours) only if a tree already exists. Don't
     // *build* one here: after a data() change the tree is null and the provided modules may not yet
     // match the new graph (lod() supplies fresh ones next) — building now would mismatch and throw.
@@ -1195,19 +1232,30 @@ export class Network extends BaseEngine {
       const lane = this.instancedLanes.get(this.NET_LANE);
       const frontier = lane ? lane.lane.visible : this.computeFrontier(tree, this.resolvedStyleCached(this.graph));
       const fade = this.fadeAlpha; // set by the cut above (lane emit, or the computeFrontier just run)
-      const cand: number[] = [];
+      const cand = this.lodLabelCand;
+      cand.clear();
       for (let i = 0; i < frontier.length; i++) { const g = frontier[i]!; if (inView(tree.cx[g]!, tree.cy[g]!)) cand.push(g); }
       const impOf = opts.importanceOf;
-      if (cand.length > max) cand.sort((a, b) => (impOf ? impOf(b, this.lodDatum(tree, b)) - impOf(a, this.lodDatum(tree, a)) : tree.weight[b]! - tree.weight[a]!));
-      for (const g of cand) {
+      /** Place glyph `g`'s label; true once the `max` cap is reached. */
+      const place = (g: number): boolean => {
         const info = this.lodDatum(tree, g);
         const text = labelText(opts, g, info);
-        if (!text) continue; // labelOf returned null/"" — this glyph has no label
+        if (!text) return false; // labelOf returned null/"" — this glyph has no label
         // Importance also decides who WINS a collision, not just who makes a `max` cap — so it is
         // resolved for every candidate (the frontier's own weight when no accessor is given).
         const priority = impOf ? impOf(g, info) : tree.weight[g] ?? 0;
         anchors.push(anchorFor(g, tree.cx[g] ?? 0, tree.cy[g] ?? 0, text, priority, opts.offset, fade ? fade[g] : undefined));
-        if (anchors.length >= max) break;
+        return anchors.length >= max;
+      };
+      if (cand.length > max) {
+        // Exact top-`max` in the order the old stable sort gave (importance desc, ties in frontier
+        // order), without its O(C log C) comparisons — each of which ran `importanceOf` on two freshly
+        // allocated hit datums. Keys are resolved once per candidate, then a lazy heap pops ~`max`.
+        const next = descendingInListOrder(cand, impOf ? (g) => impOf(g, this.lodDatum(tree, g)) : (g) => tree.weight[g] ?? 0, this.lodLabelRank);
+        for (let g = next(); g >= 0; g = next()) if (place(g)) break;
+      } else {
+        const ids = cand.ids;
+        for (let i = 0; i < cand.length; i++) if (place(ids[i] ?? 0)) break;
       }
     } else {
       // No-LOD: rank the nodes in view by strength (weighted degree). The full graph is drawn.
@@ -1612,7 +1660,7 @@ export class Network extends BaseEngine {
     this.computeStateSizing();
     if (this.activeView === "both" && this.bothDotRadius > 0) {
       this.styleOpts = { ...this.styleOpts, nodeRadius: this.bothDotRadius };
-      this.resolvedCache = null;
+      this.resolvedCache = null; // radii only — `linkColors` (and its warm memo) is kept
     }
     this.deriveStatePositions();
   }
@@ -1895,6 +1943,20 @@ export class Network extends BaseEngine {
   }
 
   /**
+   * What the last LOD declutter pass cost: the frontier glyphs it thinned, the distance tests and grid
+   * cells it ran, and how many grid cells the engine's reused scratch holds. `null` until LOD with
+   * declutter has drawn a frame. Introspection for debugging and tests: the per-frame guards read it
+   * after each `setTransform` to assert the declutter's cost signature through the real trigger.
+   */
+  get declutterStats(): NetworkDeclutterStats | null {
+    if (this.declutterGlyphs < 0) return null;
+    const grid = this.declutterFrontierScratch.grid;
+    // declutterFrontier hands a frontier of 0-1 glyphs straight back without a pass.
+    const ran = this.declutterGlyphs > 1;
+    return { glyphs: this.declutterGlyphs, probes: ran ? (grid.probes ?? 0) : 0, cells: ran ? (grid.cells ?? 0) : 0, scratchCells: grid.head.length };
+  }
+
+  /**
    * Which position transport the active layout uses:
    * - `"gpu"` — running on the WebGL GPU path (the handle's `transport` field is `"gpu"`).
    * - `"shared"` — CPU worker, positions stream zero-copy via a `SharedArrayBuffer` (cross-origin isolated page).
@@ -2001,6 +2063,7 @@ export class Network extends BaseEngine {
       // aggregates capped at maxAggregateRadius — so the ring hugs the glyph exactly at any zoom.
       this.syncHighlightLane(lane, (g) => [tree.cx[g]!, tree.cy[g]!], (g) => (g < tree.leafCount || tree.count[g] === 1 ? tree.radius[g]! : Math.min(tree.radius[g]!, maxAgg)), true);
     } else if (!this.lodOptions) {
+      this.lodColumns.clear(); // the full-detail lane replaces the LOD one — drop its retained columns
       const graph = this.graph;
       const strategy: SelectionStrategy = {
         // No-LOD: the full graph is drawn directly by networkLayers and picked by pickNodes — both scan
@@ -2052,6 +2115,7 @@ export class Network extends BaseEngine {
   private unregisterLanes(): void {
     this.unregisterInstancedLane(this.NET_HL_LANE);
     this.unregisterInstancedLane(this.NET_LANE);
+    this.lodColumns.clear();
   }
 
   private lodDatum(tree: LODTree, g: number): NetworkHit {
@@ -2580,6 +2644,7 @@ export class Network extends BaseEngine {
       boundaries: opts.moduleBoundary ? bnd : undefined,
     }, this.cutScratch); // #213: reused per frame — the walk allocates nothing steady-state
     if (opts.declutter !== false) {
+      this.declutterGlyphs = frontier.length;
       frontier = declutterFrontier(tree, frontier, this.transform, this.width, this.height, {
         screenSized: style.sizeMode === "screen",
         k: this.transform.k,
@@ -2668,11 +2733,35 @@ export class Network extends BaseEngine {
       // = outgoing-from-a-selected-(sub)tree flag. The shader recolours/dims from these; no CPU colour
       // pass. Half-arrows OR lines is present (linkStyle picks one); arrows shares the edge order.
       const lh = this.linkHighlightColumns(ids, tree.size, isSel, style.directed);
+      // Unchanged style columns go out as the SAME arrays as last frame, so the GPU layers' identity
+      // skip drops their re-upload: a held view, a pan within the cut, or a streamed frame that moved
+      // nothing on screen uploads only the endpoints. One compare pass per column (O(drawn edges)).
+      const memo = this.lodColumns;
+      const groups = memo.float32("links.groups", lh.groups);
+      const groups2 = lh.groups2 && memo.float32("links.groups2", lh.groups2);
+      const selected = memo.uint8("links.selected", lh.selected);
       for (const d of [halfArrows, lines, arrows]) {
         if (!d) continue;
-        d.groups = lh.groups;
-        d.selected = lh.selected;
-        if (lh.groups2) d.groups2 = lh.groups2;
+        d.groups = groups;
+        d.selected = selected;
+        if (groups2) d.groups2 = groups2;
+      }
+      if (halfArrows) {
+        halfArrows.radii = memo.float32("half-arrows.radii", halfArrows.radii);
+        halfArrows.widths = memo.float32("half-arrows.widths", halfArrows.widths);
+        halfArrows.bends = memo.float32("half-arrows.bends", halfArrows.bends);
+        halfArrows.colors = memo.uint8("half-arrows.colors", halfArrows.colors);
+      }
+      if (lines) {
+        lines.widths = memo.float32("lines.widths", lines.widths);
+        lines.colors = memo.uint8("lines.colors", lines.colors);
+        if (lines.bends) lines.bends = memo.float32("lines.bends", lines.bends);
+      }
+      if (arrows) {
+        arrows.radii = memo.float32("arrows.radii", arrows.radii);
+        arrows.sizes = memo.float32("arrows.sizes", arrows.sizes);
+        arrows.colors = memo.uint8("arrows.colors", arrows.colors);
+        if (arrows.bends) arrows.bends = memo.float32("arrows.bends", arrows.bends);
       }
       const pick = this.pickLinksEnabled || undefined; // flag link layers into the GPU pick pass (#141)
       if (halfArrows && halfArrows.count > 0) layers.push({ name: "links", primitive: "half-arrows", pickable: pick, halfArrows, sizeMode: style.sizeMode });
@@ -2705,11 +2794,11 @@ export class Network extends BaseEngine {
     // #162: attach the shader-highlight columns for the frontier nodes — group = tree-node id (the hovered
     // id matches its own node); selected = ancestor-aware. The shader dims non-highlighted + keeps
     // selected/hovered from these + the lane uniforms, so a hover/selection never rebuilds these buffers.
-    circles.groups = Float32Array.from(frontier);
+    circles.groups = this.lodColumns.float32("nodes.groups", Float32Array.from(frontier));
     if (isSel) {
       const s = new Uint8Array(frontier.length);
       for (let i = 0; i < frontier.length; i++) s[i] = isSel(frontier[i]!) ? 1 : 0;
-      circles.selected = s;
+      circles.selected = this.lodColumns.uint8("nodes.selected", s);
     }
     layers.push({ name: "nodes", primitive: "circles", circles, sizeMode: style.sizeMode });
     return layers;
@@ -3164,9 +3253,11 @@ export class Network extends BaseEngine {
     // linkStroke: a single colour, or a (weight)=>colour scale. `linkColorOf` packs RGBA bytes for
     // the WebGL lane; `linkStrokeOf` gives the CSS for the Scene path; `linkStroke` is representative.
     const lsSpec: LinkColorSpec = this.styleOpts.linkStroke ?? DEFAULT_LINK_STROKE;
-    const linkColorOf = resolveLinkColorOf(lsSpec);
     const linkStrokeOf = resolveLinkStrokeOf(lsSpec);
-    const linkStroke = typeof lsSpec === "string" ? lsSpec : linkStrokeOf(1);
+    const { colorOf: linkColorOf, stroke: linkStroke } = (this.linkColors ??= {
+      colorOf: resolveLinkColorOf(lsSpec),
+      stroke: typeof lsSpec === "string" ? lsSpec : linkStrokeOf(1),
+    });
     // nodeFill: a single colour, or a per-node accessor → packed RGBA (categorical module colours).
     const fillSpec = this.styleOpts.nodeFill;
     const nodeFill = typeof fillSpec === "function" ? DEFAULT_NODE_FILL : (fillSpec ?? DEFAULT_NODE_FILL);

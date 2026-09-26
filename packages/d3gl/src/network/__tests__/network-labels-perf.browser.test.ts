@@ -185,4 +185,40 @@ describe(`network.labels() per-frame cost (n=${N})`, () => {
     expect(worstFrameMs).toBeLessThan(FRAME_ON_MS);
     spy.mockRestore();
   }, 120_000);
+
+  it("a `max` cap ranks the LOD frontier with importanceOf ONCE per candidate, not per comparison", () => {
+    // The capped LOD path used to run a full comparator sort of the in-view frontier whose every
+    // comparison called `importanceOf` twice on two freshly allocated hit datums: ~2·C·log₂C calls
+    // per frame for an importance order unrelated to the frontier's. Now keys resolve once per
+    // candidate and a lazy heap pops the top-k, so a frame costs ≤ C key reads + one priority read per
+    // placed label. Importance is a scrambled permutation of the ids (7919 is coprime with any N that
+    // is a product of 2s and 5s), so the frontier order gives the sort no presorted runs to exploit.
+    let calls = 0;
+    const MAX = 50;
+    const importance = (id: number): number => (id * 7919) % N;
+    // All-leaves frontier and no declutter: the candidates are exactly the nodes in view, so the
+    // top-k by importance is checkable below.
+    net.lod({ modules: MODULES, expandPx: 1, declutter: false });
+    net.labels({
+      max: MAX,
+      labelOf: (id, info) => (info.aggregate ? `agg${id}` : `n${id}`),
+      importanceOf: (id) => {
+        calls++;
+        return importance(Number(id));
+      },
+    });
+    warm();
+    calls = 0;
+    const { worstFrameMs, frames } = sweepFrames(steps, (t) => { net.setTransform(t); });
+    const perFrame = calls / frames;
+    expect(perFrame, `${perFrame.toFixed(0)} importanceOf calls per frame for ≤ ${N} candidates`).toBeLessThanOrEqual(N + 2 * MAX);
+
+    net.setTransform({ k: 1, x: 0, y: 0 }); // every node in view ⇒ the cap keeps the MAX most important
+    const els = labelEls(host);
+    expect(els.length).toBeGreaterThan(0);
+    expect(els.length).toBeLessThanOrEqual(MAX);
+    const ids = els.map((e) => Number(e.getAttribute("data-label-id")));
+    expect(ids.every((id) => importance(id) >= N - MAX), `labelled ids ${ids.join(",")} are not the top ${MAX} by importance`).toBe(true);
+    expect(worstFrameMs).toBeLessThan(FRAME_ON_MS);
+  }, 120_000);
 });
