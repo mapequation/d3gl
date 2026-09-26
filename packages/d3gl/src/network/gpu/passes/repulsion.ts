@@ -56,8 +56,9 @@ import { ADDITIVE_BLEND, fullScreenModel, type PassUniforms } from "./fullscreen
 // 11 samplers.
 //
 // Stack: fixed-size array. The traversal is DFS; at any moment the stack holds at most 3 siblings per
-// descended level (the 4th is being processed) plus the root, so ≤ 3*L + 1. STACK_MAX = 4*(L+1) with
-// margin, and the loop is capped to avoid a runaway on a degenerate (never-terminating) case.
+// descended level (the 4th is being processed) plus the root, so ≤ 3*L + 1 for L = levels − 1.
+// STACK_MAX = 4*(levels + 1) with margin (as before tiles), and the loop is capped to avoid a runaway on a
+// degenerate (never-terminating) case.
 //
 // Padded texels (slot ≥ u_count) write a neutral 0 and RETURN: `discard` does not end the invocation
 // on ANGLE Metal (AGENTS.md, #350), and both paths loop over texture data.
