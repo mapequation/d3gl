@@ -411,10 +411,9 @@ describe("collide: coincident sibling discs (#357)", () => {
     return s;
   }
 
-  for (const { path, k, a, b } of [
-    { path: "exact loop (k ≤ 32)", k: 8, a: 2, b: 5 },
-    { path: "uniform grid (k > 32)", k: 40, a: 11, b: 29 },
-  ]) {
+  const GRID = { path: "uniform grid (k > 32)", k: 40, a: 11, b: 29 };
+
+  for (const { path, k, a, b } of [{ path: "exact loop (k ≤ 32)", k: 8, a: 2, b: 5 }, GRID]) {
     it(`separates them by exactly the collision distance, along a fixed direction — ${path}`, () => {
       const s = coincidentPair(k, a, b);
       const x0 = s.x.slice(0, k);
@@ -439,17 +438,20 @@ describe("collide: coincident sibling discs (#357)", () => {
       }
     });
 
-    it(`gives the same result on a scratch reused from a larger module — ${path}`, () => {
-      // solveModule reuses one Scratch for every module, so the grid's cell heads and chains, and the
-      // arrays past k, hold the previous module's state. Resolve a larger coincident module first.
-      const reused = coincidentPair(64, 7, 50);
-      collide(reused, 64, PAD);
-      coincidentPair(k, a, b, reused);
-      collide(reused, k, PAD);
-      const fresh = coincidentPair(k, a, b);
-      collide(fresh, k, PAD);
-      expect(Array.from(reused.x.subarray(0, k))).toEqual(Array.from(fresh.x.subarray(0, k)));
-      expect(Array.from(reused.y.subarray(0, k))).toEqual(Array.from(fresh.y.subarray(0, k)));
-    });
   }
+
+  it(`gives the same result on a scratch reused from a larger module — ${GRID.path}`, () => {
+    // solveModule reuses one Scratch for every module, so the grid's cell heads and chains hold the previous
+    // module's state. Resolve a larger coincident module first. Grid path only: the exact loop reads nothing
+    // but x, y and rad, which coincidentPair rewrites, so a stale scratch cannot reach it.
+    const { k, a, b } = GRID;
+    const reused = coincidentPair(64, 7, 50);
+    collide(reused, 64, PAD);
+    coincidentPair(k, a, b, reused);
+    collide(reused, k, PAD);
+    const fresh = coincidentPair(k, a, b);
+    collide(fresh, k, PAD);
+    expect(Array.from(reused.x.subarray(0, k))).toEqual(Array.from(fresh.x.subarray(0, k)));
+    expect(Array.from(reused.y.subarray(0, k))).toEqual(Array.from(fresh.y.subarray(0, k)));
+  });
 });
