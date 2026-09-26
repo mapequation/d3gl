@@ -1,0 +1,5 @@
+---
+"@mapequation/d3gl": patch
+---
+
+The GPU force layout (`layout({ backend: "gpu" })`) stores its Barnes-Hut grid pyramid in three textures instead of one per level. The repulsion pass therefore binds 7 textures instead of 13, well inside WebGL2's guaranteed 16, and a tick gets slightly faster: on an M1 Max the repulsion pass drops from 9.7 to 9.5 ms and the whole tick from 11.1 to 10.8 ms at 325k nodes (about 2%), and the tick from 36.0 to 35.6 ms at 1M (about 1%). Layouts are unchanged: on web-NotreDame (325k nodes) and on a 1M-node graph every node's force is bit-for-bit what it was before. The pyramid of a graph above 4,096 nodes takes about 4% more GPU memory (+0.96 MB at 325k nodes and above). Graphs of 4,096 nodes or fewer no longer allocate a pyramid at all, because they use the exact repulsion loop. Internally the solver now supports segments: groups of nodes that repel, attract and centre only among themselves, each with its own tile of the pyramid. This is groundwork for the GPU nested layout (#333).

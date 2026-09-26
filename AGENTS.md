@@ -381,7 +381,7 @@ per-file timeout. Every at-scale leg below now asserts. When you add a guard, ad
 | declutter flags upload | **WebGL** | `map/declutter-flags-perf.browser.test.ts` | 2k engine / 1M fn | `PERF_BROWSER_N` (max 2M) |
 | hover overlay reuse | **WebGL** | `map/hover-overlay-perf.browser.test.ts` | 1000 glyphs / 125 hover changes | ✗ **deliberately unscaled** |
 | instanced pie | **WebGL** | `webgl/__tests__/instanced-pie-perf.browser.test.ts` | 100k | `PERF_BROWSER_N` |
-| GPU layout tick (+ #349 signatures: no draw of ≥ N vertices × instances into a 1×1 viewport, via any of the five WebGL2 draw calls; zero texture / framebuffer / buffer creation per tick); hub springs (#350): hub rows in web-NotreDame's shape, scaled with N (0.52% of rows, its five > 4096 hubs, chunk count K ≥ N/30), tick ≤ 2× a hub-free twin with the same edges, and exactly one extra draw (the chunk pass, K fragments) with no per-tick allocation | **WebGL** | `network/gpu/__tests__/gpu-frame-budget-perf.browser.test.ts` | 30k | `PERF_BROWSER_N` (max 200k) |
+| GPU layout tick (+ #349 signatures: no draw of ≥ N vertices × instances into a 1×1 viewport, via any of the five WebGL2 draw calls; zero texture / framebuffer / buffer creation per tick); hub springs (#350): hub rows in web-NotreDame's shape, scaled with N (0.52% of rows, its five > 4096 hubs, chunk count K ≥ N/30), tick ≤ 2× a hub-free twin with the same edges, and exactly one extra draw (the chunk pass, K fragments) with no per-tick allocation; tile pyramid (#354): one scatter into the L0 atlas and one reduce per coarser level, each rasterising exactly its level's rectangle of the packed Podd / Peven textures (draws are attributed by texture identity, never by size: for N in (W² − W, W²], W a power of two, the slot atlas is W × W, the size of L0) | **WebGL** | `network/gpu/__tests__/gpu-frame-budget-perf.browser.test.ts` | 30k | `PERF_BROWSER_N` (max 200k) |
 | GPU layout tick sliced into row bands (#352): 4 bands per tick bitwise equal to the unsliced tick (hub rows included), 12 scissored force draws, no allocation per band | **WebGL** | `network/gpu/__tests__/gpu-frame-budget-perf.browser.test.ts` | 30k | `PERF_BROWSER_N` (max 200k) |
 | GPU layout **streaming** through `network().layout({ backend: "gpu" })`, LOD off **and** on (#352): transport-only main thread per frame (p95 ceiling `c0 + c1·N`), encode median ≤ 2.5 ms; every streaming `readPixels` into a bound PBO; every `getBufferSubData` after a fence inserted after its copy was seen signalled; within a frame the harvest precedes every layout draw; exactly one fence per frame; no GPU object created per streamed frame; repaints ≥ 48 ms apart; `settled` after the final tick's harvest; ticks/s floored against the GPU-only rate. **Node drag** on the same engine (a real pointer drag of the settled layout, LOD off **and** on): the same transport bounds and GL signatures over the held and re-cool frames, no GPU object created, `setPinned` once per pointer move and held-position writes at most once per tick, each over the held set (O(held)), ticks and repaints while held | **WebGL** | `network/gpu/__tests__/gpu-stream-perf.browser.test.ts` | 100k | `PERF_BROWSER_N` (max 1M) |
 | GPU streaming readback `AsyncPositionReadback` (#352), `RG/FLOAT` and packed `RGBA/FLOAT`: exact positions and stats, both PBOs `STREAM_READ`, one `readPixels` per PBO per copy (into the PBO), no allocation per readback, copy and harvest main-thread ceilings, a non-finite layout refused without touching positions | **WebGL** | `network/gpu/__tests__/gpu-async-readback-perf.browser.test.ts` | 1M | `PERF_BROWSER_N` (max 4M) |
@@ -499,7 +499,8 @@ off by 5.5e-4 world units, where a serial float32 chain is off by ~130.
   (instances counted, any mode, any of `drawArrays` / `drawArraysInstanced` / `drawElements` /
   `drawElementsInstanced` / `drawRangeElements`) into a 1×1 viewport fails it. The SwiftShader
   wall-clock ceiling cannot see this regression, because it only doubles a 30k tick there.
-- **Writing a sub-rectangle of a packed texture** (the tree levels share two textures): open the pass
+- **Writing a sub-rectangle of a packed texture** (the tree levels share two textures, and so do the grid
+  pyramid's levels 1…L, in Podd / Peven, #354): open the pass
   with `beginPass(device, { framebuffer, clear: false, viewport })` from `network/gpu/passes/fullscreen.ts`.
   luma's default clear wipes the **whole** attachment, because `gl.clear` ignores the viewport (only a
   scissor limits it). `beginPass` takes the clear as a required argument, so no call site can get the
@@ -557,6 +558,26 @@ fences the frame, and harvests with `getBufferSubData` once that fence has signa
   never mid-tick. So a copy after a prep reuses its stats, and a copy between ticks re-runs the
   reductions first (`refreshSegmentStats`). Mid-tick, re-running them would change the box and centroid
   that the remaining force bands read.
+## GPU layout: the #251 cell centre must round alike in the scatter and the traversal (#354)
+
+The grid pyramid's near-field softening (#251) stores each finest cell's second moment about the cell
+centre, `w = Σ|p − cc|²`, and the traversal turns it into the occupants' variance `σ² = w/m − |com − cc|²`.
+That is a cancellation of two numbers up to ~600 world units² into a σ² that can be ~0.1, so it only works
+if the **scatter vertex shader and the traversal fragment shader round `cc = lo + (cell + 0.5) / G ·
+boxSide` bit for bit alike**. GLSL ES 3.00 has no `precise`, and ANGLE Metal compiles with fast math, so
+"the same expression" is not enough: when the tile atlas moved the scatter's clip position to a different
+expression (`(origin + cell + 0.5) / atlas`), the compiler stopped sharing the quotient `(cell + 0.5) / G`
+and rounded `cc` differently. Level 0's `w` channel changed in 91% of occupied cells, and on web-NotreDame
+the multi-occupant nodes' forces moved to p99(r) 1.1e-3 (326 nodes above 1e-2 at tick 20) against the
+previous build — while every SwiftShader test stayed green, because SwiftShader does not contract.
+
+- Keep the scatter computing `q = (cell + 0.5) / G` **once** and deriving both the clip position and the
+  cell centre from it (`passes/grid-pyramid.ts`), and keep both shaders reading the tile side as an opaque
+  integer (`float(side)` from `segInfo.w >> 16`, never `float(1 << rootLevel)`).
+- A change to either shader's box / cell arithmetic needs a **real-GPU** A/B of the level-0 texels (all four
+  channels bitwise) and of per-node forces from identical positions against the previous build. The #354
+  change is bitwise equal on web-NotreDame and on a 1M-node graph at every checked tick; the SwiftShader
+  tests (`flat-equivalence`, `segment-isolation`) cannot see this class of drift.
 
 ## Host sizing: backend canvases are OUT OF FLOW (#39, re-confirmed in #273)
 

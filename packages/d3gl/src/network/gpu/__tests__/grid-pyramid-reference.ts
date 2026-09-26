@@ -1,13 +1,16 @@
 /**
  * `gridPyramidReference` — an executable spec of the flat GPU tick's force computation (spec §13
- * T5), in float32 (`Math.fround` after every operation, in the shaders' operation order):
+ * T5), in float32 (`Math.fround` after every operation, in the shaders' operation order), and
+ * `segmentedReference`, the same per segment (the flat layout is one segment):
  *
  *   1. segment statistics by the 16-ary pairwise tree + canonical-cover range query
  *      (segmented-reduce.ts), and the segment box by exact min/max;
- *   2. the grid pyramid (grid-pyramid.ts): square padded box, level-0 scatter in node order
- *      (blending follows primitive order) with the #251 second moment, 2×2 reduce;
- *   3. Barnes-Hut traversal (repulsion-pyramid.ts): the same DFS stack order, θ-accept, the level-0
- *      forced accept softened by σ² (#251);
+ *   2. the segment's grid pyramid tile (grid-pyramid.ts): square padded box, level-0 scatter in slot
+ *      order (blending follows primitive order) with the #251 second moment, 2×2 reduce — a tile is
+ *      an independent quadtree, so its place in the atlas does not enter the math;
+ *   3. Barnes-Hut traversal from the tile's root (repulsion.ts): the same DFS stack order, θ-accept,
+ *      the level-0 forced accept softened by σ² (#251) — or, for a segment without a tile, the exact
+ *      loop over the segment's other slots in slot order;
  *   4. springs (attraction.ts) over the symmetric CSR in its neighbour order;
  *   5. centering (centering.ts) toward the segment centroid;
  *   6. the force texture's ADD blend in the fixed pass order springs → repulsion → centering.
@@ -17,7 +20,7 @@
  * not bits. Later phases reuse this helper as the flat baseline.
  */
 import { chooseGrid } from "../passes/grid-pyramid.js";
-import { REDUCE_FANOUT, canonicalCover, reduceLayout } from "../segments.js";
+import { REDUCE_FANOUT, canonicalCover, reduceLayout, type SlotRange } from "../segments.js";
 
 const f = Math.fround;
 
@@ -65,11 +68,12 @@ function sum16(v: readonly Vec3[]): Vec3 {
 }
 
 /**
- * The flat segment's statistics exactly as the GPU reduction orders them: level-1 texels are
- * pairwise sums of 16 mapped slots (x, y, 1), level ℓ texels pairwise sums of 16 level-(ℓ−1)
- * texels, and the range query adds the canonical cover of [0, count) sequentially.
+ * A segment's statistics exactly as the GPU reduction orders them: level-1 texels are pairwise sums
+ * of 16 mapped slots (x, y, 1) of the tree over all `count` slots, level ℓ texels pairwise sums of 16
+ * level-(ℓ−1) texels, and the range query adds the canonical cover of the segment's range (default
+ * the flat segment [0, count)) sequentially.
  */
-export function referenceStats(positions: Float32Array, count: number): ReferenceStats {
+export function referenceStats(positions: Float32Array, count: number, range: SlotRange = { start: 0, count }): ReferenceStats {
   const zero: Vec3 = [0, 0, 0];
   const slot = (s: number): Vec3 => (s < count ? [positions[s * 2] ?? 0, positions[s * 2 + 1] ?? 0, 1] : zero);
   const levels: Vec3[][] = [];
@@ -87,14 +91,14 @@ export function referenceStats(positions: Float32Array, count: number): Referenc
     prev = (i: number): Vec3 => texels[i] ?? zero;
   }
   let sx = 0, sy = 0, n = 0;
-  for (const t of canonicalCover(0, count)) {
+  for (const t of canonicalCover(range.start, range.count)) {
     const v = t.level === 0 ? slot(t.index) : (levels[t.level - 1]?.[t.index] ?? zero);
     sx = f(sx + v[0]);
     sy = f(sy + v[1]);
     n = f(n + v[2]);
   }
   let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
-  for (let i = 0; i < count; i++) {
+  for (let i = range.start; i < range.start + range.count; i++) {
     const x = positions[i * 2] ?? 0;
     const y = positions[i * 2 + 1] ?? 0;
     if (x < minX) minX = x;
@@ -107,8 +111,16 @@ export function referenceStats(positions: Float32Array, count: number): Referenc
 
 /** Box padding factor — `GridPyramid.pad`. */
 const PAD = 1.01;
-/** Softening — the absolute 1e-2 of the repulsion passes. */
-const SOFTENING = f(1e-2);
+/** The flat layout's softening — the absolute 1e-2 of the repulsion pass. */
+const FLAT_SOFTENING = 1e-2;
+
+/** One segment of {@link segmentedReference}: its slots, its tile side (or `null`: exact) and ε. */
+export interface ReferenceSegment extends SlotRange {
+  /** The tile's grid side G_s, or `null` when the segment takes the exact loop. */
+  tileSide: number | null;
+  /** Repulsion softening ε. */
+  softening: number;
+}
 
 /**
  * Per-node force (springs + repulsion + centering) of one flat pyramid tick from `positions`,
@@ -120,11 +132,112 @@ export function gridPyramidReference(
   csr: ReferenceCSR,
   params: ReferenceParams,
 ): Float32Array {
+  return segmentedReference(positions, count, csr, params, [
+    { start: 0, count, tileSide: chooseGrid(count), softening: FLAT_SOFTENING },
+  ]);
+}
+
+/**
+ * Per-node force of one segmented tick from `positions` (`count * 2` floats): every segment is solved
+ * on its own — its tile (or its exact loop), its springs, its centroid. See the file header.
+ */
+export function segmentedReference(
+  positions: Float32Array,
+  count: number,
+  csr: ReferenceCSR,
+  params: ReferenceParams,
+  segments: readonly ReferenceSegment[],
+): Float32Array {
+  const out = new Float32Array(count * 2);
+  for (const seg of segments) segmentForces(positions, count, csr, params, seg, out);
+  return out;
+}
+
+/** Write the forces of `seg`'s slots into `out`. */
+function segmentForces(
+  positions: Float32Array,
+  count: number,
+  csr: ReferenceCSR,
+  params: ReferenceParams,
+  seg: ReferenceSegment,
+  out: Float32Array,
+): void {
   const px = (i: number): number => positions[i * 2] ?? 0;
   const py = (i: number): number => positions[i * 2 + 1] ?? 0;
-  const stats = referenceStats(positions, count);
+  const stats = referenceStats(positions, count, seg);
+  const end = seg.start + seg.count;
+  const softening = f(seg.softening);
+  const repulsion = f(params.repulsion);
+  const repel = seg.tileSide === null
+    ? exactRepulsion(positions, seg.start, end, repulsion, softening)
+    : tileRepulsion(positions, seg.start, end, stats, seg.tileSide, repulsion, softening, f(params.theta * params.theta));
 
-  // ── Padded square box (grid-pyramid.ts SCATTER_VS / repulsion-pyramid.ts, same expressions) ──
+  const attraction = f(params.attraction);
+  const centering = f(params.centering);
+  const centX = f(stats.sumX / Math.max(stats.count, 1));
+  const centY = f(stats.sumY / Math.max(stats.count, 1));
+  for (let i = seg.start; i < end; i++) {
+    const xi = px(i), yi = py(i);
+
+    // ── Springs: Σ (p_j − p_i) over the CSR row, then × attraction ──
+    let sx = 0, sy = 0;
+    const start = csr.offsets[i] ?? 0;
+    const stop = csr.offsets[i + 1] ?? 0;
+    for (let p = start; p < stop; p++) {
+      const j = csr.neighbors[p] ?? 0;
+      sx = f(sx + f(px(j) - xi));
+      sy = f(sy + f(py(j) - yi));
+    }
+    const springX = f(attraction * sx);
+    const springY = f(attraction * sy);
+
+    // ── Centering toward the segment centroid ──
+    const centerX = f(centering * f(centX - xi));
+    const centerY = f(centering * f(centY - yi));
+
+    // ── The force texture's ADD blend: 0 + springs, + repulsion, + centering ──
+    const k = i - seg.start;
+    out[i * 2] = f(f(springX + (repel[k * 2] ?? 0)) + centerX);
+    out[i * 2 + 1] = f(f(springY + (repel[k * 2 + 1] ?? 0)) + centerY);
+  }
+}
+
+/** Exact repulsion over the slots [start, end), each from every other one in slot order. */
+function exactRepulsion(positions: Float32Array, start: number, end: number, repulsion: number, softening: number): Float32Array {
+  const px = (i: number): number => positions[i * 2] ?? 0;
+  const py = (i: number): number => positions[i * 2 + 1] ?? 0;
+  const acc = new Float32Array((end - start) * 2);
+  for (let i = start; i < end; i++) {
+    let ax = 0, ay = 0;
+    for (let j = start; j < end; j++) {
+      if (j === i) continue;
+      const dx = f(px(i) - px(j)), dy = f(py(i) - py(j));
+      const d2 = f(f(dx * dx) + f(dy * dy));
+      const force = f(repulsion / f(d2 + softening));
+      ax = f(ax + f(force * dx));
+      ay = f(ay + f(force * dy));
+    }
+    acc[(i - start) * 2] = ax;
+    acc[(i - start) * 2 + 1] = ay;
+  }
+  return acc;
+}
+
+/** Barnes-Hut repulsion of the slots [start, end) over their own tile of side `G`. */
+function tileRepulsion(
+  positions: Float32Array,
+  start: number,
+  end: number,
+  stats: ReferenceStats,
+  G: number,
+  repulsion: number,
+  softening: number,
+  theta2: number,
+): Float32Array {
+  const px = (i: number): number => positions[i * 2] ?? 0;
+  const py = (i: number): number => positions[i * 2 + 1] ?? 0;
+
+  // ── Padded square box (grid-pyramid.ts scatter / repulsion.ts, same expressions) ──
   const ctrX = f(0.5 * f(stats.minX + stats.maxX));
   const ctrY = f(0.5 * f(stats.minY + stats.maxY));
   const hlfX = f(0.5 * f(stats.maxX - stats.minX));
@@ -133,13 +246,12 @@ export function gridPyramidReference(
   const loX = f(ctrX - hlfMax);
   const loY = f(ctrY - hlfMax);
   const boxSide = f(2 * hlfMax);
-  const G = chooseGrid(count);
   const levelCount = Math.log2(G) + 1;
 
-  // ── Level-0 scatter, node order: (Σx, Σy, mass, Σ|p − cellCenter|²) ──
+  // ── Level-0 scatter, slot order: (Σx, Σy, mass, Σ|p − cellCenter|²) ──
   const levels: Float32Array[] = [];
   const level0 = new Float32Array(G * G * 4);
-  for (let i = 0; i < count; i++) {
+  for (let i = start; i < end; i++) {
     const x = px(i), y = py(i);
     const tx = f(f(x - loX) / boxSide);
     const ty = f(f(y - loY) / boxSide);
@@ -159,48 +271,16 @@ export function gridPyramidReference(
 
   // ── 2×2 reduce: out = ((a + b) + c) + d, a/b the lower row ──
   for (let side = G >> 1; side >= 1; side >>= 1) {
-    const src = levels[levels.length - 1] ?? level0;
-    const srcSide = side * 2;
-    const dst = new Float32Array(side * side * 4);
-    for (let y = 0; y < side; y++) {
-      for (let x = 0; x < side; x++) {
-        const a = ((2 * y) * srcSide + 2 * x) * 4;
-        const b = a + 4;
-        const c = ((2 * y + 1) * srcSide + 2 * x) * 4;
-        const d = c + 4;
-        for (let ch = 0; ch < 4; ch++) {
-          dst[(y * side + x) * 4 + ch] = f(f(f((src[a + ch] ?? 0) + (src[b + ch] ?? 0)) + (src[c + ch] ?? 0)) + (src[d + ch] ?? 0));
-        }
-      }
-    }
-    levels.push(dst);
+    levels.push(reduce2x2(levels[levels.length - 1] ?? level0, side, side));
   }
 
-  const out = new Float32Array(count * 2);
-  const theta2 = f(params.theta * params.theta);
-  const repulsion = f(params.repulsion);
-  const attraction = f(params.attraction);
-  const centering = f(params.centering);
-  const centX = f(stats.sumX / Math.max(stats.count, 1));
-  const centY = f(stats.sumY / Math.max(stats.count, 1));
+  const out = new Float32Array((end - start) * 2);
   const stackLevel: number[] = [];
   const stackX: number[] = [];
   const stackY: number[] = [];
 
-  for (let i = 0; i < count; i++) {
+  for (let i = start; i < end; i++) {
     const xi = px(i), yi = py(i);
-
-    // ── Springs: Σ (p_j − p_i) over the CSR row, then × attraction ──
-    let sx = 0, sy = 0;
-    const start = csr.offsets[i] ?? 0;
-    const end = csr.offsets[i + 1] ?? 0;
-    for (let p = start; p < end; p++) {
-      const j = csr.neighbors[p] ?? 0;
-      sx = f(sx + f(px(j) - xi));
-      sy = f(sy + f(py(j) - yi));
-    }
-    const springX = f(attraction * sx);
-    const springY = f(attraction * sy);
 
     // ── Barnes-Hut traversal, the shader's DFS order ──
     let ax = 0, ay = 0;
@@ -222,16 +302,16 @@ export function gridPyramidReference(
       const cellSize = f(boxSide / side);
       let force: number | null = null;
       if (f(cellSize * cellSize) < f(theta2 * d2)) {
-        force = f(f(repulsion * mass) / f(d2 + SOFTENING));
+        force = f(f(repulsion * mass) / f(d2 + softening));
       } else if (level === 0) {
         if (mass > 1.5) {
           const ccx = f(loX + f(f(f(cx + 0.5) / G) * boxSide));
           const ccy = f(loY + f(f(f(cy + 0.5) / G) * boxSide));
           const rx = f(comX - ccx), ry = f(comY - ccy);
           const sigma2 = Math.max(f(f((cell[o + 3] ?? 0) / mass) - f(f(rx * rx) + f(ry * ry))), 0);
-          force = f(f(repulsion * mass) / f(f(d2 + f(2 * sigma2)) + SOFTENING));
+          force = f(f(repulsion * mass) / f(f(d2 + f(2 * sigma2)) + softening));
         } else {
-          force = f(f(repulsion * mass) / f(d2 + SOFTENING));
+          force = f(f(repulsion * mass) / f(d2 + softening));
         }
       } else {
         const bx = cx * 2, by = cy * 2;
@@ -244,14 +324,29 @@ export function gridPyramidReference(
         ay = f(ay + f(force * dy));
       }
     }
-
-    // ── Centering toward the segment centroid ──
-    const centerX = f(centering * f(centX - xi));
-    const centerY = f(centering * f(centY - yi));
-
-    // ── The force texture's ADD blend: 0 + springs, + repulsion, + centering ──
-    out[i * 2] = f(f(springX + ax) + centerX);
-    out[i * 2 + 1] = f(f(springY + ay) + centerY);
+    out[(i - start) * 2] = ax;
+    out[(i - start) * 2 + 1] = ay;
   }
   return out;
+}
+
+/**
+ * One 2×2 reduce of a `2·width × 2·height` level into `width × height`: `((a + b) + c) + d` per
+ * channel, a/b the lower row — the pyramid's reduce pass.
+ */
+export function reduce2x2(src: Float32Array, width: number, height: number): Float32Array {
+  const srcWidth = width * 2;
+  const dst = new Float32Array(width * height * 4);
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const a = ((2 * y) * srcWidth + 2 * x) * 4;
+      const b = a + 4;
+      const c = ((2 * y + 1) * srcWidth + 2 * x) * 4;
+      const d = c + 4;
+      for (let ch = 0; ch < 4; ch++) {
+        dst[(y * width + x) * 4 + ch] = f(f(f((src[a + ch] ?? 0) + (src[b + ch] ?? 0)) + (src[c + ch] ?? 0)) + (src[d + ch] ?? 0));
+      }
+    }
+  }
+  return dst;
 }
