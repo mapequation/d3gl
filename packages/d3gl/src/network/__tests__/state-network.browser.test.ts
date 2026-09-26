@@ -141,7 +141,9 @@ describe("state-network engine (#171)", () => {
     net.toSVG();
     expect(calls).toBeGreaterThan(warm);
     net.destroy();
-  });
+    // A harness limit, not a budget: this file builds one WebGL engine per test, and a later engine's
+    // whenReady() can stall for seconds on a loaded machine (#287) — it timed out at 20 s there.
+  }, 60_000);
 
   it("derives rosette state positions from a force layout of the physical graph (WebGL, no throw)", async () => {
     const { graph, modules } = tinyStateNetwork();
