@@ -413,7 +413,7 @@ describe("GPU frame budget — pyramid path (per-tick regression tripwire)", () 
     // no-hub one (348-611 ms vs 49-82 ms, M1 Max); fixed, the two are within noise.
     const LOCAL_N = 30_000;
     const N = perfN(LOCAL_N, { max: 200_000 });
-    const CEILING_MS = perfBudget(10_000 * (N / LOCAL_N));
+    const CEILING_MS = perfBudget(200 + 1_000 * (N / LOCAL_N)); // the no-hub leg's ceiling (#349 recalibration)
     const REPEATS = N > 100_000 ? 2 : 3;
     const base = makeClusteredGraph(N, 80, 0xdeadbeef);
     const hubbed = withHubs(base, 0x4ab);
