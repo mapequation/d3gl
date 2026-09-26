@@ -124,11 +124,11 @@ export function startGpuLayout(
       if (!stopped) adopt(startGpuLayoutSync(device, graph, opts, onFrame, onLODTree, onTransport));
     },
     (e: unknown) => {
-      if (!stopped) adopt(fallBackToWorker("the device promise rejected", graph, opts, onFrame, onLODTree, onTransport, e));
+      if (!stopped) adopt(fallBackToWorker("the device promise rejected", graph, opts, onFrame, onLODTree, onTransport, { cause: e }));
     },
   ).catch((e: unknown) => {
     // The GPU run failed to start (e.g. a driver rejected a shader): the worker still lays it out.
-    if (!stopped && !inner) adopt(fallBackToWorker("the GPU layout failed to start", graph, opts, onFrame, onLODTree, onTransport, e));
+    if (!stopped && !inner) adopt(fallBackToWorker("the GPU layout failed to start", graph, opts, onFrame, onLODTree, onTransport, { cause: e }));
   });
 
   return wrapper;
@@ -137,8 +137,10 @@ export function startGpuLayout(
 /**
  * The fallback: a worker run with the GPU layout's options and LOD-tree callback, reported as the
  * `"worker"` transport. `shared` reads the worker handle live (it flips on a worker error, #297). It
- * warns once with `reason`, unless the caller expects the fallback (`warnUnsupported: false`) and there
- * is no error `cause`.
+ * warns once with `reason`: always for a `failure` (the device promise rejected or the GPU run threw,
+ * passing the error when there is one), and for an unsupported device or graph unless the caller expects
+ * the fallback (`warnUnsupported: false`). The call site says which it is, never the error value: a
+ * rejection or throw with `undefined` is still a failure.
  */
 function fallBackToWorker(
   reason: string,
@@ -147,11 +149,15 @@ function fallBackToWorker(
   onFrame: () => void,
   onLODTree: ((tree: LODTree) => void) | undefined,
   onTransport: ((transport: GpuLayoutTransport) => void) | undefined,
-  cause?: unknown,
+  failure?: { cause: unknown },
 ): WorkerLayoutHandle {
   const message = `[d3gl] the GPU network layout fell back to the CPU worker: ${reason}.`;
-  if (cause !== undefined) console.warn(message, cause);
-  else if (opts.warnUnsupported !== false) console.warn(message);
+  if (failure) {
+    if (failure.cause === undefined) console.warn(message);
+    else console.warn(message, failure.cause);
+  } else if (opts.warnUnsupported !== false) {
+    console.warn(message);
+  }
   onTransport?.("worker");
   const worker = startWorkerLayout(graph, opts, onFrame, onLODTree);
   return {

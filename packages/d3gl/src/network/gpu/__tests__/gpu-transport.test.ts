@@ -128,6 +128,34 @@ describe("startGpuLayout fallback", () => {
     expect(warn.mock.calls[0]?.[1]).toBe(cause);
   });
 
+  // A failure is told apart from an unsupported device by where it came from, not by the error value: a
+  // promise rejected with nothing, or a start that throws `undefined`, is still a failure and still warns.
+  it("still warns when a quiet GPU layout's device promise rejects with no error value", async () => {
+    vi.spyOn(workerMod, "startWorkerLayout").mockReturnValue(fakeWorkerHandle({ shared: false }));
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const g = buildGraph({ nodeCount: 3, source: [0], target: [1] });
+    const h = startGpuLayout(Promise.reject(), g, { ...ALL_OPTIONS, warnUnsupported: false }, () => {});
+    await h.settled;
+    expect(h.transport).toBe("worker");
+    expect(warn).toHaveBeenCalledOnce();
+    expect(String(warn.mock.calls[0]?.[0])).toMatch(/device promise rejected/);
+  });
+
+  it("still warns when a quiet GPU layout throws `undefined` while starting", async () => {
+    // The start throws once (a stand-in for a driver fault with no error object); the fallback's own start
+    // then succeeds.
+    vi.spyOn(workerMod, "startWorkerLayout")
+      .mockImplementationOnce(() => { throw undefined; })
+      .mockReturnValue(fakeWorkerHandle({ shared: false }));
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const g = buildGraph({ nodeCount: 3, source: [0], target: [1] });
+    const h = startGpuLayout(Promise.resolve(null), g, { ...ALL_OPTIONS, warnUnsupported: false }, () => {});
+    await h.settled;
+    expect(h.transport).toBe("worker");
+    expect(warn).toHaveBeenCalledOnce();
+    expect(String(warn.mock.calls[0]?.[0])).toMatch(/failed to start/);
+  });
+
   it("starts nothing when stopped before the device resolves", async () => {
     const spy = vi.spyOn(workerMod, "startWorkerLayout").mockReturnValue(fakeWorkerHandle({ shared: false }));
     const g = buildGraph({ nodeCount: 3, source: [0], target: [1] });
