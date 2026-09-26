@@ -321,7 +321,7 @@ describe("multilevelSeedSteps (#368)", () => {
       expect(g.positions.every(Number.isFinite)).toBe(true);
       let cx = 0;
       let cy = 0;
-      for (let i = 0; i < n; i++) (cx += g.positions[i * 2]!, cy += g.positions[i * 2 + 1]!);
+      for (let i = 0; i < n; i++) (cx += g.positions[i * 2] ?? 0, cy += g.positions[i * 2 + 1] ?? 0);
       expect(Math.hypot(cx / n - W / 2, cy / n - H / 2)).toBeLessThan(0.05 * R95); // centred on the viewport
       (step.atScale ? atScale : coarse).push(r95(g.positions, n));
     }
