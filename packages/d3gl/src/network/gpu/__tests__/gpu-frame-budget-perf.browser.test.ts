@@ -49,7 +49,8 @@ import { GpuForceLayout } from "../gpu-force-layout.js";
 import { buildCSR, buildGraph } from "../../graph.js";
 import type { LayoutGraph } from "../../force.js";
 import { buildHubChunks, SPRING_CHUNK } from "../hub-chunks.js";
-import { FLAT_TILE_MIN_SIDE, flatSegments, packTiles } from "../segments.js";
+import { FLAT_TILE_MIN_SIDE, flatSegments, packTiles, type PyramidTexture } from "../segments.js";
+import { GridPyramid } from "../passes/grid-pyramid.js";
 import { atlasWidth } from "../textures.js";
 import { perfBudget, perfN } from "../../../__tests__/perf-budget.js";
 
@@ -509,35 +510,37 @@ describe("GPU frame budget — pyramid path (per-tick regression tripwire)", () 
     const g = makeClusteredGraph(N, 80, 0x7117);
     const params = { repulsion: 200, attraction: 0.05, centering: 0.2, alpha: 0.05, theta: 0.7 };
     const atlas = packTiles(flatSegments(N), 0, FLAT_TILE_MIN_SIDE);
-    const size = (t: { width: number; height: number }): string => `${t.width}x${t.height}`;
-    const l0 = size(atlas);
-    const odd = size(atlas.odd);
-    const even = size(atlas.even);
-    // The three pyramid framebuffers are told apart by size; none of the layout's other targets shares one.
-    expect(new Set([l0, odd, even]).size).toBe(3);
 
     const layout = new GpuForceLayout(device, g, params, { repulsionMode: "pyramid" });
     layout.runFrame(1); // warm-up
+    // A draw is attributed to the pyramid texture it renders into by texture IDENTITY, never by size:
+    // for N in (W² − W, W²] with W a power of two, the slot atlas is W × W, exactly the size of L0.
+    const buildSpy = vi.spyOn(GridPyramid.prototype, "build");
     const spy = vi.spyOn(Model.prototype, "draw");
     const TICKS = 2;
-    let draws: { target: string; viewport: string }[];
+    let draws: { target: PyramidTexture | "other"; viewport: string }[];
     try {
       layout.runFrame(TICKS);
+      const pyramid = buildSpy.mock.contexts[0];
+      if (!(pyramid instanceof GridPyramid)) throw new Error("the tick did not build the grid pyramid");
+      const names: readonly PyramidTexture[] = ["l0", "odd", "even"];
       draws = spy.mock.calls.map(([pass]) => {
-        const fbo = pass.props.framebuffer;
+        const views = pass.props.framebuffer?.colorAttachments ?? [];
+        const target = names.find((name) => views.some((view) => view.texture === pyramid.textures[name])) ?? "other";
         const vp = pass.props.parameters?.viewport;
-        return { target: fbo ? `${fbo.width}x${fbo.height}` : "canvas", viewport: vp ? vp.join(",") : "full" };
+        return { target, viewport: vp ? vp.join(",") : "full" };
       });
     } finally {
       spy.mockRestore();
+      buildSpy.mockRestore();
       layout.destroy();
     }
 
-    const scatters = draws.filter((d) => d.target === l0);
-    expect(scatters).toEqual(Array.from({ length: TICKS }, () => ({ target: l0, viewport: "full" })));
-    const reduces = draws.filter((d) => d.target === odd || d.target === even);
+    const scatters = draws.filter((d) => d.target === "l0");
+    expect(scatters).toEqual(Array.from({ length: TICKS }, () => ({ target: "l0", viewport: "full" })));
+    const reduces = draws.filter((d) => d.target === "odd" || d.target === "even");
     const expected = atlas.levels.slice(1).map((lvl) => ({
-      target: lvl.texture === "odd" ? odd : even,
+      target: lvl.texture,
       viewport: [lvl.x, lvl.y, lvl.width, lvl.height].join(","),
     }));
     expect(reduces).toEqual([...expected, ...expected]);
