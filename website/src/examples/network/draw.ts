@@ -48,7 +48,9 @@ function degreeRadius(graph: NetworkGraph): NodeRadiusSpec {
  * worker layout reheats around it and re-cools on release (grab a module to drag its whole subtree).
  * **Backend** switches the force solve between `"worker"` (CPU Barnes-Hut in a Web Worker) and `"gpu"`
  * (WebGL2 Barnes-Hut grid-pyramid). Where the device can't run it (no float render targets or float blending,
- * or textures too small for the graph) `"gpu"` falls back to `"worker"`, keeping Seeding and LOD streaming.
+ * or textures too small for the graph) `"gpu"` falls back to `"worker"` with a console warning, keeping
+ * Seeding and LOD streaming. `"auto"` picks for you: the GPU where it works, else the worker, silently —
+ * the top-right readout shows which transport it resolved to.
  */
 export const setup: ImperativeSetup = (host, { width, height, backend }) => {
   const net = network(host, { width, height, backend });
@@ -87,8 +89,8 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
 
   // Transport readout (#163 + N8): three signals — layout transport (gpu / shared / copy / none),
   // the environment's SAB *capability* (`sharedMemoryAvailable()`), and whether SAB is *in use*.
-  // For a `backend:"gpu"` layout the transport resolves asynchronously (it is "copy" until the
-  // device promise settles), so we also refresh it after the layout settles.
+  // For a `backend:"gpu"` or `"auto"` layout the transport resolves asynchronously (it is "copy" until
+  // the device promise settles), so we also refresh it after the layout settles.
   const sab = document.createElement("div");
   sab.className =
     "absolute top-2 right-2 pointer-events-none rounded bg-white/85 px-2 py-1 font-mono text-[11px] leading-tight [font-variant-numeric:tabular-nums]";
@@ -121,7 +123,7 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
       // "Cold" disables multilevel seeding so you can watch the difference: multilevel snaps to a
       // good global arrangement then settles; cold starts from a disc and untangles slowly.
       const multilevel = options.seeding !== "Cold";
-      const layoutBackend = options.backend === "GPU" ? "gpu" : "worker";
+      const layoutBackend = options.backend === "GPU" ? "gpu" : options.backend === "Auto" ? "auto" : "worker";
       const key = `${count}|${directed}|${multilevel}|${layoutBackend}`;
       if (key !== layoutKey) {
         layoutKey = key;
@@ -131,8 +133,8 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
         graph = buildGraph({ nodeCount, source, target, weight, directed });
         // A multilevel worker layout stops once it has converged (#124), so it keeps the default budget
         // as a safety cap. The GPU layout has no early stop yet and a cold start keeps full heat until it
-        // settles, so both get a budget that shrinks as the graph grows.
-        const iterations = layoutBackend === "gpu" || !multilevel ? Math.min(250, Math.max(10, Math.round(2.5e6 / count))) : undefined;
+        // settles, so both get a budget that shrinks as the graph grows ("auto" may resolve to the GPU).
+        const iterations = layoutBackend !== "worker" || !multilevel ? Math.min(250, Math.max(10, Math.round(2.5e6 / count))) : undefined;
         // fit: true (#238) keeps the camera framed on the streaming layout as it converges, released on
         // settle/interaction — so it opens framed rather than piling at the origin on the GPU backend.
         net.data(graph).layout({ backend: layoutBackend, iterations, multilevel, fit: true });

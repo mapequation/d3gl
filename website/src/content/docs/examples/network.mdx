@@ -44,7 +44,12 @@ the graph grows. `layout({ backend: "gpu" })` (the **Backend** control) runs the
 the device can: float render targets, float blending (`EXT_float_blend`) and textures large enough for
 the graph. Anywhere else it falls back to the worker with one console warning naming the reason, and
 the fallback is the run `backend: "worker"` would start — it honours `multilevel` (**Seeding**) and
-streams the LOD tree from the worker. (On a cross-origin-isolated page positions are shared zero-copy via
+streams the LOD tree from the worker. `layout({ backend: "auto" })` (**Auto**) asks for "the GPU where it
+works": it takes the GPU wherever `"gpu"` would and the worker everywhere else, **without** a warning,
+since there the worker is an expected outcome. Everything else — `fit`, drag reheat, nested layouts, state
+networks, LOD streaming — then behaves exactly as on the backend it resolved to, and `net.layoutTransport`
+(the top-right readout) says which one runs. It is opt-in: omitting `backend` behaves as before.
+(On a cross-origin-isolated page positions are shared zero-copy via
 `SharedArrayBuffer`; otherwise they are posted as snapshots — the top-right readout shows whether the
 environment supports it and whether this layout is actually using it.) The **Nodes** slider scales from 10 to
 1,000,000; **Seeding** compares multilevel against a cold start; **Size** switches uniform vs
@@ -652,14 +657,15 @@ frame that lands in it, however fast the pointer moves:
 | `force` (main thread) | a pinned [`ForceLayout`](#large-scale-layout-in-a-web-worker) reheats neighbours each frame | re-cools until converged (at most a short tail), then stops |
 | `worker` (off thread) | the worker **pins** the held set and reflows the rest off-thread; the main thread holds them under the cursor | the worker is **unpinned** and re-cools until converged |
 | `gpu` (on the GPU) | the GPU layout **pins** the held set (skipped by the integrate pass) and reflows the rest on-GPU; the main thread holds them under the cursor | the layout is **unpinned** and re-cools |
+| `auto` | as `gpu` or `worker`, whichever it resolved to | as that backend |
 | `positions` (fixed coords) | the held set simply **translates** (no simulation to reheat) | — |
 
-On the `worker` and `gpu` backends the layout is kept **alive** (idle) after the initial layout converges, so
+On the `worker`, `gpu` and `auto` backends the layout is kept **alive** (idle) after the initial layout converges, so
 a drag can reheat it instantly without re-seeding — the held nodes are pinned (skipped by the backend's
 integration) while their positions are owned by the main thread, so they never rubber-band behind the cursor.
 
 :::note[Drag is opt-in and gated]
 `draggable` is off until you set it (like every `interactive()` option). It only grabs **node** glyphs — a
-drag starting on a *link* still pans — and it reheats on the `force`/`worker`/`gpu` layout backends; on
+drag starting on a *link* still pans — and it reheats on the `force`/`worker`/`gpu`/`auto` layout backends; on
 `positions` (caller-supplied coordinates) a drag translates the grabbed set without running a simulation.
 :::
