@@ -177,6 +177,118 @@ export class GlBufferSpy {
   }
 }
 
+/** One `texStorage2D` call: the format and size of the storage a texture actually reserved. */
+export interface GlTexStorage {
+  internalformat: GLenum;
+  width: number;
+  height: number;
+}
+
+/** A {@link GlSurfaceSpy} snapshot — pass it back to {@link GlSurfaceSpy.since} for a phase delta. */
+export interface GlSurfaceMark {
+  readonly framebuffers: number;
+  readonly textures: number;
+  readonly texturesDeleted: number;
+  readonly storageAt: number;
+}
+
+/** GL surface traffic over one phase. */
+export interface GlSurfaceUsage {
+  framebuffers: number;
+  textures: number;
+  /** Textures released — for a framebuffer, its attachments, i.e. where its memory actually lives. */
+  texturesDeleted: number;
+  /** Every 2D texture storage reserved in the phase, in call order — what the phase cost in bytes. */
+  storage: readonly GlTexStorage[];
+}
+
+/**
+ * Counts GL surface allocations on the shared prototype — the cast-free way to ask "did this
+ * allocate another framebuffer, and how big was it?". {@link GlBufferSpy} covers buffers;
+ * framebuffers and their attachment textures are what carry a width×height×(bytes per texel)
+ * cost (#110's shared pass-through surface, #88's lazy export target).
+ *
+ * `storage` records luma's `texStorage2D` calls (it allocates every 2D texture, attachments
+ * included, through immutable storage), so a test can state a surface's memory as a measured
+ * format × size rather than an estimate. It is measured on the GL calls themselves, never on luma's
+ * stats, which are one global singleton shared by every device on the page.
+ *
+ * Releases are counted on `deleteTexture`, not `deleteFramebuffer`: luma 9.3's
+ * `WEBGLFramebuffer.destroy()` frees its attachment textures but never reaches
+ * `gl.deleteFramebuffer` (it checks `!this.destroyed` after `super.destroy()` has set it), so a
+ * framebuffer-delete count would read 0 for every framebuffer d3gl frees (#305). The attachments are
+ * what hold the width×height storage, so their deletion is the signal that the memory came back.
+ */
+export class GlSurfaceSpy {
+  framebuffers = 0;
+  textures = 0;
+  texturesDeleted = 0;
+  private readonly storage: GlTexStorage[] = [];
+  private readonly origFramebuffer: WebGL2RenderingContext["createFramebuffer"];
+  private readonly origTexture: WebGL2RenderingContext["createTexture"];
+  private readonly origDeleteTexture: WebGL2RenderingContext["deleteTexture"];
+  private readonly origTexStorage2D: WebGL2RenderingContext["texStorage2D"];
+
+  constructor() {
+    const proto = WebGL2RenderingContext.prototype;
+    this.origFramebuffer = proto.createFramebuffer;
+    this.origTexture = proto.createTexture;
+    this.origDeleteTexture = proto.deleteTexture;
+    this.origTexStorage2D = proto.texStorage2D;
+    const spy = this;
+    proto.createFramebuffer = function (this: WebGL2RenderingContext): WebGLFramebuffer {
+      spy.framebuffers++;
+      return spy.origFramebuffer.call(this);
+    };
+    proto.createTexture = function (this: WebGL2RenderingContext): WebGLTexture {
+      spy.textures++;
+      return spy.origTexture.call(this);
+    };
+    proto.deleteTexture = function (this: WebGL2RenderingContext, texture: WebGLTexture | null): void {
+      spy.texturesDeleted++;
+      spy.origDeleteTexture.call(this, texture);
+    };
+    proto.texStorage2D = function (
+      this: WebGL2RenderingContext,
+      target: GLenum,
+      levels: GLsizei,
+      internalformat: GLenum,
+      width: GLsizei,
+      height: GLsizei,
+    ): void {
+      spy.storage.push({ internalformat, width, height });
+      spy.origTexStorage2D.call(this, target, levels, internalformat, width, height);
+    };
+  }
+
+  mark(): GlSurfaceMark {
+    return {
+      framebuffers: this.framebuffers,
+      textures: this.textures,
+      texturesDeleted: this.texturesDeleted,
+      storageAt: this.storage.length,
+    };
+  }
+
+  since(at: GlSurfaceMark): GlSurfaceUsage {
+    return {
+      framebuffers: this.framebuffers - at.framebuffers,
+      textures: this.textures - at.textures,
+      texturesDeleted: this.texturesDeleted - at.texturesDeleted,
+      storage: this.storage.slice(at.storageAt),
+    };
+  }
+
+  /** Always call this (in a `finally`) — the patch is on a shared prototype. */
+  restore(): void {
+    const proto = WebGL2RenderingContext.prototype;
+    proto.createFramebuffer = this.origFramebuffer;
+    proto.createTexture = this.origTexture;
+    proto.deleteTexture = this.origDeleteTexture;
+    proto.texStorage2D = this.origTexStorage2D;
+  }
+}
+
 /** A zoom-in sweep anchored on the viewport centre — the same shape the backend-level sweeps use. */
 export function zoomSteps(width: number, height: number, ks: readonly number[] = [1, 2, 4, 8, 16, 32]) {
   return ks.map((k) => ({ k, x: (width / 2) * (1 - k), y: (height / 2) * (1 - k) }));

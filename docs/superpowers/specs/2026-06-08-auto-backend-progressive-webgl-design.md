@@ -42,7 +42,8 @@ upgrade to WebGL transparently in the background.
 
 - **Lazy offscreen framebuffer** (`WebGLBackend.create` allocates a 720×380 rgba8 +
   depth24-stencil8 framebuffer eagerly; only `toPNG`/`readPixel`/`pick` need it).
-  Small (~7ms here) independent win — separate change.
+  Small (~7ms here) independent win — separate change. *(Shipped in #88: only `toPNG`/`readPixel`
+  read it — pick has its own FBO — so it is now created on the first export and freed on resize.)*
 - **Device pool / warm-device reuse** across React resize-driven engine recreations
   (~3× cheaper warm). More involved (canvas-bound device) — separate change.
 - **Bioregions double-`buildLayers`** (`MapStore.initEngine` rebuilds in
