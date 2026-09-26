@@ -21,6 +21,7 @@ import type { NetworkGraph } from "./graph.js";
 import { fitNodes, fitBox, fitTransform, type FitBox } from "./fit.js";
 import type { InstancedLayer, ViewTransform } from "../core/index.js";
 import { InstancedLane, type SelectionStrategy } from "../core/instanced-lane.js";
+import { StableColumns } from "../core/stable-columns.js";
 import { resolveRingColors, ringCircles } from "../map/highlight-ring.js";
 import { hoverParts } from "../map/highlight.js";
 
@@ -781,6 +782,9 @@ export class Network extends BaseEngine {
    *  scratch {@link descendingInListOrder} ranks them in when a `max` cap applies. */
   private readonly lodLabelCand = new CandidateList();
   private readonly lodLabelRank = new CandidateList();
+  /** The LOD lane's last emitted style columns ({@link frontierLayers}): an unchanged column is re-emitted
+   *  as the same array so its GPU re-upload is skipped. Cleared whenever the LOD lane stops emitting. */
+  private readonly lodColumns = new StableColumns();
   /** Engine-owned {@link superEdges} scratch (#210): reused every LOD emit so the per-frame gather is
    *  O(frontier + drawn super-edges) — no O(tree.size) allocation per zoom frame. Shared by the WebGL
    *  lane emit and the retained-Scene registration (they never run concurrently; outputs never alias it). */
@@ -2016,6 +2020,7 @@ export class Network extends BaseEngine {
       // aggregates capped at maxAggregateRadius — so the ring hugs the glyph exactly at any zoom.
       this.syncHighlightLane(lane, (g) => [tree.cx[g]!, tree.cy[g]!], (g) => (g < tree.leafCount || tree.count[g] === 1 ? tree.radius[g]! : Math.min(tree.radius[g]!, maxAgg)), true);
     } else if (!this.lodOptions) {
+      this.lodColumns.clear(); // the full-detail lane replaces the LOD one — drop its retained columns
       const graph = this.graph;
       const strategy: SelectionStrategy = {
         // No-LOD: the full graph is drawn directly by networkLayers and picked by pickNodes — both scan
@@ -2067,6 +2072,7 @@ export class Network extends BaseEngine {
   private unregisterLanes(): void {
     this.unregisterInstancedLane(this.NET_HL_LANE);
     this.unregisterInstancedLane(this.NET_LANE);
+    this.lodColumns.clear();
   }
 
   private lodDatum(tree: LODTree, g: number): NetworkHit {
@@ -2683,11 +2689,35 @@ export class Network extends BaseEngine {
       // = outgoing-from-a-selected-(sub)tree flag. The shader recolours/dims from these; no CPU colour
       // pass. Half-arrows OR lines is present (linkStyle picks one); arrows shares the edge order.
       const lh = this.linkHighlightColumns(ids, tree.size, isSel, style.directed);
+      // Unchanged style columns go out as the SAME arrays as last frame, so the GPU layers' identity
+      // skip drops their re-upload: a held view, a pan within the cut, or a streamed frame that moved
+      // nothing on screen uploads only the endpoints. One compare pass per column (O(drawn edges)).
+      const memo = this.lodColumns;
+      const groups = memo.float32("links.groups", lh.groups);
+      const groups2 = lh.groups2 && memo.float32("links.groups2", lh.groups2);
+      const selected = memo.uint8("links.selected", lh.selected);
       for (const d of [halfArrows, lines, arrows]) {
         if (!d) continue;
-        d.groups = lh.groups;
-        d.selected = lh.selected;
-        if (lh.groups2) d.groups2 = lh.groups2;
+        d.groups = groups;
+        d.selected = selected;
+        if (groups2) d.groups2 = groups2;
+      }
+      if (halfArrows) {
+        halfArrows.radii = memo.float32("half-arrows.radii", halfArrows.radii);
+        halfArrows.widths = memo.float32("half-arrows.widths", halfArrows.widths);
+        halfArrows.bends = memo.float32("half-arrows.bends", halfArrows.bends);
+        halfArrows.colors = memo.uint8("half-arrows.colors", halfArrows.colors);
+      }
+      if (lines) {
+        lines.widths = memo.float32("lines.widths", lines.widths);
+        lines.colors = memo.uint8("lines.colors", lines.colors);
+        if (lines.bends) lines.bends = memo.float32("lines.bends", lines.bends);
+      }
+      if (arrows) {
+        arrows.radii = memo.float32("arrows.radii", arrows.radii);
+        arrows.sizes = memo.float32("arrows.sizes", arrows.sizes);
+        arrows.colors = memo.uint8("arrows.colors", arrows.colors);
+        if (arrows.bends) arrows.bends = memo.float32("arrows.bends", arrows.bends);
       }
       const pick = this.pickLinksEnabled || undefined; // flag link layers into the GPU pick pass (#141)
       if (halfArrows && halfArrows.count > 0) layers.push({ name: "links", primitive: "half-arrows", pickable: pick, halfArrows, sizeMode: style.sizeMode });
@@ -2720,11 +2750,11 @@ export class Network extends BaseEngine {
     // #162: attach the shader-highlight columns for the frontier nodes — group = tree-node id (the hovered
     // id matches its own node); selected = ancestor-aware. The shader dims non-highlighted + keeps
     // selected/hovered from these + the lane uniforms, so a hover/selection never rebuilds these buffers.
-    circles.groups = Float32Array.from(frontier);
+    circles.groups = this.lodColumns.float32("nodes.groups", Float32Array.from(frontier));
     if (isSel) {
       const s = new Uint8Array(frontier.length);
       for (let i = 0; i < frontier.length; i++) s[i] = isSel(frontier[i]!) ? 1 : 0;
-      circles.selected = s;
+      circles.selected = this.lodColumns.uint8("nodes.selected", s);
     }
     layers.push({ name: "nodes", primitive: "circles", circles, sizeMode: style.sizeMode });
     return layers;

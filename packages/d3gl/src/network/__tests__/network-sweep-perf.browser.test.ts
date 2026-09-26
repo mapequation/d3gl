@@ -3,6 +3,8 @@ import { network } from "../network.js";
 import { buildGraph } from "../graph.js";
 import { perfBudget, perfN } from "../../__tests__/perf-budget.js";
 import { GlBufferSpy, perfHost, sweepFrames, zoomSteps } from "../../__tests__/engine-sweep.js";
+import { WebGLBackend } from "../../webgl/webgl-backend.js";
+import type { InstancedLayer } from "../../core/index.js";
 
 /**
  * ENGINE-level at-scale zoom sweep for `network()` (#263, gap 2 of #258).
@@ -25,16 +27,22 @@ import { GlBufferSpy, perfHost, sweepFrames, zoomSteps } from "../../__tests__/e
  *   1. **`nodeFill` resolves O(nodes) at registration, ZERO per frame** — in both reduction states,
  *      in the N-invariant `toBe(before)` form. Per-node colour propagates up the LOD tree at build
  *      time, so even a frontier re-cut must not re-invoke it.
- *   2. **`linkStroke` is exactly zero per frame with LOD off, and screen-bounded with LOD on.**
- *      Super-edges are genuinely view-dependent — their accumulated flow changes with the cut — so
- *      per-frame calls are correct under LOD and asserting zero there would be wrong. What must hold
- *      is the scale: an N-independent ceiling, since declutter bounds the frontier in screen space.
+ *   2. **`linkStroke` is exactly zero per frame with LOD off, and O(distinct weights) — not
+ *      O(drawn super-edges × frames) — with LOD on.** Super-edges are view-dependent (the cut decides
+ *      which pairs draw), but a pair's accumulated flow is fixed by the tree and the resolved colour
+ *      is memoised per weight, so a sweep that draws tens of thousands of super-edges resolves only
+ *      the weights it has not seen before. (Before: the scale ran — and its CSS was re-parsed — once
+ *      per drawn super-edge per frame; 52 ms of a 66 ms streamed frame on web-NotreDame.)
  *   3. **GPU buffers are updated in place, not destroyed + recreated, and not re-uploaded** —
  *      `emitInstancedLane`'s `sameSet` fast path plus the bytes actually pushed across the bus, both
  *      counted on the live `WebGL2RenderingContext`, with non-vacuity checks that registration DID
  *      create buffers and DID upload. The upload counter is what gives the full-detail leg teeth:
  *      the accessor assertions there are satisfied for free by the static emit, but re-pushing the
  *      retained instance arrays every frame (the #186 shape) moves no create/delete count at all.
+ *   4. **An LOD re-emit that changes nothing uploads only the endpoints** (held view): every style
+ *      column (widths, colours, group/selected flags) goes out as the SAME array as the frame before,
+ *      so the GPU layers' identity skip drops its upload — the bytes moved equal exactly the columns
+ *      that are always written (link endpoints; node centres, radii, colours).
  *
  * ONE ENGINE, TWO PHASES — deliberate, not tidiness. Constructing a second WebGL engine after a
  * first one has uploaded a ~100k-node graph costs **9-12s in `whenReady()`** on local headless
@@ -94,6 +102,79 @@ function fixture(n: number): { graph: ReturnType<typeof buildGraph>; positions: 
 }
 
 /** One reduction state's measurements: what the sweep re-derived, re-uploaded, and cost. */
+/** Every instanced layer the backend was handed, frame by frame (the typed probe for "what was emitted"). */
+class LayerSpy {
+  frames: InstancedLayer[][] = [];
+  private readonly origUpdate = WebGLBackend.prototype.updateInstancedLayer;
+  private readonly origSet = WebGLBackend.prototype.setInstancedLayer;
+  constructor() {
+    const spy = this;
+    WebGLBackend.prototype.updateInstancedLayer = function (this: WebGLBackend, layer: InstancedLayer): void {
+      spy.frames[spy.frames.length - 1]?.push(layer);
+      spy.origUpdate.call(this, layer);
+    };
+    WebGLBackend.prototype.setInstancedLayer = function (this: WebGLBackend, layer: InstancedLayer): void {
+      spy.frames[spy.frames.length - 1]?.push(layer);
+      spy.origSet.call(this, layer);
+    };
+  }
+  /** Start collecting a new frame's layers. */
+  frame(): void {
+    this.frames.push([]);
+  }
+  restore(): void {
+    WebGLBackend.prototype.updateInstancedLayer = this.origUpdate;
+    WebGLBackend.prototype.setInstancedLayer = this.origSet;
+  }
+}
+
+/** Instances in a frame's link layers (half-arrows / lines) — the super-edges drawn. */
+function drawnLinks(layers: readonly InstancedLayer[]): number {
+  let n = 0;
+  for (const l of layers) {
+    if (l.primitive === "lines") n += l.lines.count;
+    else if (l.primitive === "half-arrows") n += l.halfArrows.count;
+  }
+  return n;
+}
+
+/** Bytes of the columns an in-place update ALWAYS writes (positions; a circle's radius/colour/ring). */
+function alwaysWrittenBytes(layers: readonly InstancedLayer[]): number {
+  let bytes = 0;
+  for (const l of layers) {
+    if (l.primitive === "circles") {
+      const c = l.circles;
+      bytes += c.centers.byteLength + c.radii.byteLength + c.colors.byteLength;
+      if (c.borders) bytes += c.borders.byteLength + (c.borderColors?.byteLength ?? 0);
+    } else if (l.primitive === "lines") bytes += l.lines.sources.byteLength + l.lines.targets.byteLength;
+    else if (l.primitive === "arrows") bytes += l.arrows.sources.byteLength + l.arrows.targets.byteLength;
+    else if (l.primitive === "half-arrows") bytes += l.halfArrows.sources.byteLength + l.halfArrows.targets.byteLength;
+  }
+  return bytes;
+}
+
+/** The style columns (skippable by reference identity) of a frame's layers, keyed by layer + column. */
+function styleColumns(layers: readonly InstancedLayer[]): Map<string, ArrayBufferView> {
+  const out = new Map<string, ArrayBufferView>();
+  const put = (key: string, v: ArrayBufferView | undefined): void => {
+    if (v) out.set(key, v);
+  };
+  for (const l of layers) {
+    if (l.primitive === "lines") {
+      put("lines.widths", l.lines.widths);
+      put("lines.colors", l.lines.colors);
+      put("lines.bends", l.lines.bends);
+      put("lines.groups", l.lines.groups);
+      put("lines.groups2", l.lines.groups2);
+      put("lines.selected", l.lines.selected);
+    } else if (l.primitive === "circles" && l.name === "nodes") {
+      put("nodes.groups", l.circles.groups);
+      put("nodes.selected", l.circles.selected);
+    }
+  }
+  return out;
+}
+
 interface Leg {
   /** Style-accessor calls counted just before the sweep (i.e. the registration total). */
   nodeFillBefore: number;
@@ -106,6 +187,21 @@ interface Leg {
   uploadedBytes: number;
   worstFrameMs: number;
   frames: number;
+  /** Super-edge instances handed to the backend over the sweep (sum over frames). */
+  drawnLinks: number;
+}
+
+/** A held LOD view re-emitted frame after frame: what moved, and what the emits were made of. */
+interface HoldLeg {
+  frames: number;
+  uploadedBytes: number;
+  /** Bytes of the always-written columns over the same frames (the floor an in-place update pays). */
+  alwaysWrittenBytes: number;
+  /** Style columns that came out as a NEW array although the view (and so the cut) did not change. */
+  freshColumns: string[];
+  /** Style columns checked (non-vacuity: the held frames really carried links and nodes). */
+  checkedColumns: number;
+  linkStrokeCalls: number;
 }
 
 let registrationBuffersCreated = 0;
@@ -116,9 +212,11 @@ let buildMs = 0;
 let lodBuildMs = 0;
 let lodOff: Leg;
 let lodOn: Leg;
+let lodHold: HoldLeg;
 
 beforeAll(async () => {
   const spy = new GlBufferSpy();
+  const layerSpy = new LayerSpy();
   try {
     const { graph, positions } = fixture(N);
     let nodeFillCalls = 0;
@@ -156,8 +254,14 @@ beforeAll(async () => {
       const nodeFillBefore = nodeFillCalls;
       const linkStrokeBefore = linkStrokeCalls;
       const before = spy.mark();
-      const { worstFrameMs, frames } = sweepFrames(zoomSteps(W, H), (t) => net.setTransform(t));
+      layerSpy.frames = [];
+      const { worstFrameMs, frames } = sweepFrames(zoomSteps(W, H), (t) => {
+        layerSpy.frame();
+        net.setTransform(t);
+      });
       const buffers = spy.since(before);
+      let links = 0;
+      for (const f of layerSpy.frames) links += drawnLinks(f);
       return {
         nodeFillBefore,
         linkStrokeBefore,
@@ -168,6 +272,7 @@ beforeAll(async () => {
         uploadedBytes: buffers.uploadedBytes,
         worstFrameMs,
         frames,
+        drawnLinks: links,
       };
     };
 
@@ -180,8 +285,38 @@ beforeAll(async () => {
     lodBuildMs = performance.now() - lodStart;
     lodOn = runLeg();
 
+    // Held view: re-emit the same transform. The cut, the declutter and every style column are
+    // unchanged, so only the always-written columns may move across the bus.
+    const steps = zoomSteps(W, H);
+    const held = steps[Math.floor(steps.length / 2)] ?? { k: 1, x: 0, y: 0 };
+    net.setTransform(held); // settle: the first emit at this view may change columns
+    const HOLD = 6;
+    const holdStroke = linkStrokeCalls;
+    layerSpy.frames = [];
+    layerSpy.frame();
+    net.setTransform(held); // reference frame
+    const holdStart = spy.mark();
+    let floor = 0;
+    for (let f = 0; f < HOLD; f++) {
+      layerSpy.frame();
+      net.setTransform(held);
+      floor += alwaysWrittenBytes(layerSpy.frames[layerSpy.frames.length - 1] ?? []);
+    }
+    const holdBytes = spy.since(holdStart).uploadedBytes;
+    const fresh: string[] = [];
+    let checked = 0;
+    for (let f = 1; f < layerSpy.frames.length; f++) {
+      const prev = styleColumns(layerSpy.frames[f - 1] ?? []);
+      for (const [key, col] of styleColumns(layerSpy.frames[f] ?? [])) {
+        checked++;
+        if (prev.get(key) !== col) fresh.push(`frame ${f} ${key}`);
+      }
+    }
+    lodHold = { frames: HOLD, uploadedBytes: holdBytes, alwaysWrittenBytes: floor, freshColumns: fresh, checkedColumns: checked, linkStrokeCalls: linkStrokeCalls - holdStroke };
+
     net.destroy();
   } finally {
+    layerSpy.restore();
     spy.restore();
   }
 }, SETUP_MS);
@@ -231,17 +366,22 @@ describe(`network() engine zoom sweep — per-frame cost at N=${N.toLocaleString
     // Signature 1 — per-node colour stays a build-time cost even though the frontier re-cuts per frame.
     expect(lodOn.nodeFillAfter, "nodeFill re-ran during the LOD zoom sweep").toBe(lodOn.nodeFillBefore);
 
-    // Signature 2 — super-edge colour is view-dependent, so it MUST run per frame; the ceiling is
-    // absolute and N-independent, which is what makes this an O(visible) assertion rather than an
-    // O(N) one: the true value stays flat as N grows while the regression it catches — falling back
-    // to colouring every edge each frame — grows with `EDGES`.
+    // Signature 2 — super-edges are view-dependent (the cut decides which pairs draw), but a pair's
+    // colour is a function of its accumulated flow, memoised per weight for the style: the sweep draws
+    // tens of thousands of super-edges and resolves only the weights it has not met yet. The ceiling
+    // stays absolute and N-independent (O(visible), not O(N)); the ratio pins the memo — before it the
+    // scale ran once per DRAWN super-edge per frame, i.e. sweepLinkStroke === drawnLinks.
     const sweepLinkStroke = lodOn.linkStrokeAfter - lodOn.linkStrokeBefore;
     const perFrame = sweepLinkStroke / lodOn.frames;
-    expect(sweepLinkStroke, "the LOD sweep coloured no super-edge — the frontier never re-cut").toBeGreaterThan(0);
+    expect(lodOn.drawnLinks, "the LOD sweep drew no super-edge — the frontier never re-cut").toBeGreaterThan(1000);
     expect(
       perFrame,
       `LOD sweep resolved ${perFrame.toFixed(0)} link colours per frame (${sweepLinkStroke.toLocaleString()} over ${lodOn.frames} frames) — must stay screen-bounded, not O(${EDGES.toLocaleString()} edges)`,
     ).toBeLessThan(LOD_LINK_COLOURS_PER_FRAME);
+    expect(
+      sweepLinkStroke,
+      `${sweepLinkStroke.toLocaleString()} link-colour resolutions for ${lodOn.drawnLinks.toLocaleString()} drawn super-edges — resolved per drawn edge per frame, not per distinct weight`,
+    ).toBeLessThan(lodOn.drawnLinks / 100);
 
     // Signature 3 — a set-stable re-emit takes the in-place path, so no per-frame buffer churn.
     expect(lodOn.buffersCreated, "GPU buffers were created during the LOD zoom sweep").toBe(0);
@@ -260,5 +400,21 @@ describe(`network() engine zoom sweep — per-frame cost at N=${N.toLocaleString
       lodOn.worstFrameMs,
       `LOD on: worst frame ${lodOn.worstFrameMs.toFixed(2)}ms at N=${N.toLocaleString()} (LOD tree ${lodBuildMs.toFixed(0)}ms once)`,
     ).toBeLessThan(FRAME_MS_LOD);
+  });
+
+  it("LOD ON, held view: an unchanged re-emit hands back the same style columns and uploads only the endpoints", () => {
+    // Non-vacuity: the held frames carried links and nodes, so there were columns to keep stable.
+    expect(lodHold.checkedColumns, "the held frames emitted no style columns").toBeGreaterThanOrEqual(lodHold.frames * 5);
+    expect(lodHold.alwaysWrittenBytes, "the held frames drew nothing").toBeGreaterThan(0);
+    // Signature 4 (deterministic): the SAME array objects, frame after frame — so the identity skip fires.
+    expect(lodHold.freshColumns, "style columns re-emitted as new arrays on an unchanged view").toEqual([]);
+    // …and the bus sees only the always-written columns. Before: every width/colour/group/selected
+    // column re-uploaded too — measured 59 KB against this 30 KB floor over the 6 held frames at 50k.
+    expect(
+      lodHold.uploadedBytes,
+      `held view uploaded ${lodHold.uploadedBytes.toLocaleString()} bytes over ${lodHold.frames} frames; the always-written columns are ${lodHold.alwaysWrittenBytes.toLocaleString()}`,
+    ).toBeLessThanOrEqual(lodHold.alwaysWrittenBytes);
+    // A held view resolves no link colour at all (every weight is already memoised).
+    expect(lodHold.linkStrokeCalls, "link colours re-resolved on an unchanged view").toBe(0);
   });
 });
