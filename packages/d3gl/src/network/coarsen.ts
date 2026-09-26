@@ -55,12 +55,18 @@ export interface MultilevelLayoutOptions {
   height: number;
   /** Force parameters passed to every level's {@link ForceLayout}. */
   force?: Partial<ForceParams>;
-  /** Maximum refinement iterations at the finest level (the solve stops earlier once converged). Default 100. */
+  /**
+   * Refinement iterations at the finest level: the budget the refine cools over — so a larger budget
+   * anneals more slowly, not just with more headroom — and a maximum (it stops earlier once converged).
+   * Default 100.
+   */
   iterations?: number;
   /**
-   * Maximum iterations run at each *coarser* level while seeding (each stops early once converged).
-   * These start near-relaxed after prolongation, so they need far fewer ticks than the finest level —
-   * keeping the seed phase cheap (it runs before any progressive frame). Default 30.
+   * Iterations run at each *coarser* level while seeding, cooled over this budget. These start
+   * near-relaxed after prolongation, so they need far fewer ticks than the finest level — keeping the
+   * seed phase cheap (it runs before any progressive frame). A level can only stop early once it has
+   * run `MIN_SETTLE_TICKS` (30) ticks, so at the default every solved level runs its full share.
+   * Default 30.
    */
   coarsenIterations?: number;
   /**

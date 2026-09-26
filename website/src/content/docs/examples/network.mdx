@@ -34,8 +34,9 @@ starts where it will end up — no blow-up past the final extent, no collapse. W
 `layout({ backend: "worker" })` the entire solve runs in a **Web Worker** and streams positions
 back — a frame about every display frame — so the layout **converges progressively on screen** while
 the main thread stays responsive; pan and zoom while it settles. A multilevel-seeded CPU layout
-(`worker` or `force`) cools as it goes and **stops once it has converged**, so `iterations` is only a
-safety cap there. The GPU layout has no early stop yet (it runs its whole budget) and a cold start
+(`worker` or `force`) cools over its `iterations` budget and **stops once it has converged**, so there
+`iterations` is a safety cap and the length of the cooling (a larger budget cools more slowly), not a
+tick count to hit. The GPU layout has no early stop yet (it runs its whole budget) and a cold start
 keeps full heat until it settles on its own, so the example gives those two a budget that shrinks as
 the graph grows. (On a cross-origin-isolated page positions are shared zero-copy via
 `SharedArrayBuffer`; otherwise they are posted as snapshots — the top-right readout shows whether the
