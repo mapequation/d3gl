@@ -256,9 +256,10 @@ export interface NetworkLayoutOptions {
   positions?: Float32Array;
   /**
    * Tick budget of the force layout (`"force"` / `"worker"` / `"gpu"`, default 300) — a maximum, not a
-   * fixed count (#124): a seeded layout (multilevel, or the GPU's module seed) cools over it, a cold
-   * disc start keeps full heat to untangle, and the CPU backends stop as soon as the layout has
-   * converged (nodes moving a small fraction of the equilibrium spacing per tick), resolving
+   * fixed count (#124), and the length of the anneal: a seeded layout (multilevel, or the GPU's module
+   * seed) cools over it, so a larger budget cools more slowly rather than only adding headroom. A cold
+   * disc start keeps full heat to untangle. The CPU backends stop as soon as the layout has converged
+   * (nodes moving a small fraction of the equilibrium spacing per tick), resolving
    * {@link Network.whenSettled}. The GPU backend runs the whole budget (its early stop needs a GPU
    * readback it doesn't do yet).
    */
