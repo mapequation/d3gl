@@ -190,12 +190,19 @@ export class BarnesHutTree {
             sy += mc * this.comY[ch]!;
           }
         }
-      } else {
+      } else if (mass) {
         for (let b = this.head[c]!; b !== -1; b = this.bodyNext[b]!) {
-          const mb = mass ? mass[b]! : 1;
+          const mb = mass[b]!;
           m += mb;
           sx += mb * positions[b * 2]!;
           sy += mb * positions[b * 2 + 1]!;
+        }
+      } else {
+        // Unit bodies (the finest level): the loop without a per-body mass lookup.
+        for (let b = this.head[c]!; b !== -1; b = this.bodyNext[b]!) {
+          m += 1;
+          sx += positions[b * 2]!;
+          sy += positions[b * 2 + 1]!;
         }
       }
       this.mass[c] = m;
