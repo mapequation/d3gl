@@ -234,6 +234,43 @@ describe("gpuMultilevelSeed — module-aware GPU seed (#180 N8.2)", () => {
     expect(moduleCoherence(frame, g.moduleOf)).toBeLessThan(0.85); // the modules survive the refine
   });
 
+  it("ragged scale: a deeper branch seeds at its own leaves' density, not the whole tree's", () => {
+    // Half the planted modules hang directly under the root (their leaves end at depth 1); the other
+    // half sit one level deeper (leaves at depth 2). The depth-2 solve holds only the deep half's leaves,
+    // so its per-node mass is 1 — scaling its repulsion by the whole tree's leaves-per-node (2 here)
+    // would spread the deep modules wider than the refine's equilibrium density.
+    const W = 800, H = 600;
+    const K = 16, m = 125;
+    const g = makePlantedGraph(K, m, 4, 0, 0x7a66ed);
+    const rank = new Map<number, number>();
+    const records: ModuleNode[] = Array.from(g.moduleOf, (c, id) => {
+      const r = (rank.get(c) ?? 0) + 1; rank.set(c, r);
+      return { id, path: c % 2 === 0 ? [c + 1, r] : [1000 + (c % 4), c + 1, r] };
+    });
+    const tree = buildModuleLODTree(g.nodeCount, records, { source: g.source, target: g.target, weight: g.weight });
+    expect(canModuleSeed(tree, g.nodeCount)).toBe(true);
+    const pos = new Float32Array(g.nodeCount * 2);
+    gpuMultilevelSeed(device, tree, { nodeCount: g.nodeCount, positions: pos }, { width: W, height: H, force: DEFAULT_FORCE });
+    expect(allFinite(pos)).toBe(true);
+    /** Mean over the given modules of their leaves' r95 about the module centroid. */
+    const moduleSpread = (odd: boolean): number => {
+      let total = 0, count = 0;
+      for (let c = odd ? 1 : 0; c < K; c += 2) {
+        const mod = new Float32Array(m * 2);
+        let k = 0;
+        for (let i = 0; i < g.nodeCount; i++) if (g.moduleOf[i] === c) { mod[k * 2] = pos[i * 2]!; mod[k * 2 + 1] = pos[i * 2 + 1]!; k++; }
+        total += r95(mod);
+        count++;
+      }
+      return total / count;
+    };
+    const shallow = moduleSpread(false);
+    const deep = moduleSpread(true);
+    // Same modules, same seed pipeline, one level apart: the deep ones must land at about the shallow
+    // ones' spread (measured 1.14×; scaling the depth-2 repulsion by the whole tree's mean mass: 1.62×).
+    expect(deep / shallow, `deep ${deep.toFixed(0)} vs shallow ${shallow.toFixed(0)}`).toBeLessThan(1.35);
+  });
+
   it("ragged correctness: branches of different depths seed without error, every leaf finite + coherent", () => {
     const W = 800, H = 600;
     const K = 6, m = 40;
