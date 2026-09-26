@@ -246,6 +246,7 @@ export class GridPyramid {
 
   private readonly scatterUniforms: PassUniforms;
   private readonly reduceUniforms: PassUniforms;
+  private readonly singleSegment: boolean;
 
   /**
    * @param atlas the segments' tile atlas (`packTiles`); it must have at least one tile.
@@ -255,6 +256,7 @@ export class GridPyramid {
     if (atlas.levels.length === 0) throw new Error("GridPyramid: the atlas has no tiles");
     this.device = device;
     this.atlas = atlas;
+    this.singleSegment = singleSegment;
     this.levelCount = atlas.levels.length;
     this.levelOrigins = new Int32Array(this.levelCount * 2);
     atlas.levels.forEach((lvl, l) => this.levelOrigins.set([lvl.x, lvl.y], l * 2));
@@ -314,6 +316,7 @@ export class GridPyramid {
    */
   build(input: PyramidBuildInput): void {
     const { posTex, width, count, segments, slotSeg } = input;
+    if (!this.singleSegment && !slotSeg) throw new Error("GridPyramid: a many-segment build needs the slot → segment texture");
 
     // ── 1. Scatter to level 0 (ADD blend into the whole L0 atlas) ─────────
     // L0 holds level 0 alone, so clearing the whole attachment is right here.
