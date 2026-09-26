@@ -250,7 +250,10 @@ export interface NetworkStyle {
 export interface NetworkLayoutOptions {
   /** `"positions"` uses caller-supplied coordinates; `"force"` runs the in-library force layout on the
    *  main thread; `"worker"` runs it off-thread with progressive streaming; `"gpu"` runs a WebGL2
-   *  Barnes-Hut solve. `"gpu"` falls back to `"worker"`, with one console warning naming the reason, when
+   *  Barnes-Hut solve, streamed without blocking the main thread: each frame spends at most
+   *  `min(10 ms, 0.6 × the frame interval)` of GPU time on the layout, positions come back through an
+   *  asynchronous (fenced) readback, and layout repaints are throttled to at most 20 per second and about
+   *  half of the main thread and GPU time. `"gpu"` falls back to `"worker"`, with one console warning naming the reason, when
    *  the render backend is not WebGL or the device lacks float render targets, float blending
    *  (`EXT_float_blend`) or a large enough texture size for the graph. The fallback is a full worker
    *  run: it honours `multilevel` and streams the LOD tree like `"worker"`. */
@@ -1474,9 +1477,9 @@ export class Network extends BaseEngine {
       lod: useLod,
       coarsen: this.lodOptions?.coarsen,
     };
-    const onFrame = (): void => this.scheduleLayoutRepaint();
     // Unset until the transport returns, so a callback can never match a cleared `layoutHandle` (null).
     let handle: WorkerLayoutHandle | undefined;
+    const onFrame = (): void => this.onStreamedFrame(handle);
     const onLODTree = useLod
       ? (tree: LODTree): void => {
           if (this.layoutHandle !== handle) return; // a newer layout superseded this one
@@ -1697,7 +1700,8 @@ export class Network extends BaseEngine {
       this.fitNodesArr = null;
       this.fitNodesFor = null;
       if (fit) seedPositions(phys, this.width, this.height, { force: opts.force });
-      const onPhysFrame = () => this.scheduleLayoutRepaint();
+      let handle: WorkerLayoutHandle | undefined;
+      const onPhysFrame = (): void => this.onStreamedFrame(handle);
       // One option set for both: a GPU layout that falls back runs this worker layout exactly (#312).
       const workerOpts: WorkerLayoutOptions = {
         width: this.width,
@@ -1706,13 +1710,14 @@ export class Network extends BaseEngine {
         force: opts.force,
         multilevel: opts.multilevel,
       };
-      const handle: WorkerLayoutHandle =
+      const started: WorkerLayoutHandle =
         opts.backend === "worker"
           ? startWorkerLayout(phys, workerOpts, onPhysFrame)
           : startGpuLayout(this.whenBackendSettled().then(() => this.gpuDevice()), phys, workerOpts, onPhysFrame);
-      this.layoutHandle = handle;
-      void handle.settled.then(() => {
-        if (this.layoutHandle !== handle) return; // a newer layout superseded this one
+      handle = started;
+      this.layoutHandle = started;
+      void started.settled.then(() => {
+        if (this.layoutHandle !== started) return; // a newer layout superseded this one
         // Without fit, scaleToViewport remaps the physical positions to fill the view at k=1 now that the
         // stream has stopped writing them. With fit, the camera already tracks the layout — derive + refresh
         // geometry from the final positions first, then do the final reframe + release (release needs fresh
@@ -1809,14 +1814,37 @@ export class Network extends BaseEngine {
       typeof requestAnimationFrame === "function" ? requestAnimationFrame : (cb) => setTimeout(() => cb(0), 16);
     this.layoutRepaintRaf = raf(() => {
       this.layoutRepaintRaf = 0;
-      this.dragReapply?.(); // hold the dragged nodes under the cursor over the worker's snapshot (#140, copy mode)
-      if (this.stateData) this.applyStateDerivedPositions(); // physical positions just streamed a frame
-      if (!this.drawsWorkerTree()) this.recomputeLODGeometry(); // worker streams geometry; main only re-cuts
-      // Fit-on-layout: reframe the camera to the layout's freshly-updated bounds BEFORE the rebuild, so
-      // the LOD cut + render run once at the framed transform (no extra emit). Cleared on settle/gesture.
-      if (this.fitOnLayout) this.fitViewToLayout();
-      this.rebuild();
+      this.paintLayoutFrame();
     });
+  }
+
+  /**
+   * A streaming layout delivered a frame. The worker posts one per message, so its repaints coalesce to
+   * one per animation frame ({@link scheduleLayoutRepaint}). The GPU transport (#352) calls this from
+   * inside its own animation frame, after it harvested positions and at most once per frame (it
+   * throttles repaints itself), so the repaint runs right here: the harvested positions reach the screen
+   * in this frame, not the next, and the transport measures the repaint to size its throttle.
+   */
+  private onStreamedFrame(handle: WorkerLayoutHandle | undefined): void {
+    if (handle?.transport !== "gpu") {
+      this.scheduleLayoutRepaint();
+      return;
+    }
+    this.labelSource.stale = true;
+    if (this.layoutRepaintRaf && typeof cancelAnimationFrame === "function") cancelAnimationFrame(this.layoutRepaintRaf);
+    this.layoutRepaintRaf = 0;
+    this.paintLayoutFrame();
+  }
+
+  /** One streamed-frame repaint: held drag nodes, state rosettes, LOD geometry, fit, then the rebuild. */
+  private paintLayoutFrame(): void {
+    this.dragReapply?.(); // hold the dragged nodes under the cursor over the worker's snapshot (#140, copy mode)
+    if (this.stateData) this.applyStateDerivedPositions(); // physical positions just streamed a frame
+    if (!this.drawsWorkerTree()) this.recomputeLODGeometry(); // worker streams geometry; main only re-cuts
+    // Fit-on-layout: reframe the camera to the layout's freshly-updated bounds BEFORE the rebuild, so
+    // the LOD cut + render run once at the framed transform (no extra emit). Cleared on settle/gesture.
+    if (this.fitOnLayout) this.fitViewToLayout();
+    this.rebuild();
   }
 
   /**

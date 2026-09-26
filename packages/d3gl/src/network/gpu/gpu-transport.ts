@@ -7,20 +7,25 @@
  * option (`multilevel`, `lod`, `coarsen`, `frameEvery`) and streams the LOD tree through `onLODTree`,
  * exactly as `layout({ backend: "worker" })` would (#312), and one `console.warn` names the reason.
  *
- * Milestone A (N8.1): plain disc seed (at the force equilibrium's scale) + streaming rAF loop, cooled
- * over the iteration budget like the worker (#124). N8.5 (#183) adds drag/reheat parity:
- * on convergence the loop goes **idle** (keeps the {@link GpuForceLayout} alive, doesn't destroy it),
- * and `pin`/`unpin` hold nodes + resume the loop so the rest reflows — mirroring the CPU worker
- * (layout-worker.ts). The GPU run itself ignores `multilevel`, `lod` and `coarsen` (a structural GPU
- * seed and GPU-side LOD streaming are later milestones); only its fallback uses them.
+ * The GPU run seeds (a disc at the force equilibrium's scale, or the module-aware multilevel seed, N8.2),
+ * cools over the iteration budget like the worker (#124), and streams through {@link GpuStream} (#352):
+ * each animation frame harvests positions a fenced PBO copy delivered, repaints (throttled, in the same
+ * frame), and encodes as many work items — tick prep, force-pass row bands, integrate — as fit a GPU
+ * budget of `min(10 ms, 0.6 × the frame interval)`. The main thread never waits for the GPU: no
+ * synchronous `readPixels` on the frame path. On convergence the loop goes **idle** (the solver stays
+ * alive) and `pin`/`unpin` hold nodes and resume it so the rest reflows (#183), as on the worker. The
+ * GPU run itself ignores `multilevel`, `lod` and `coarsen` (a structural GPU seed and GPU-side LOD
+ * streaming are later milestones); only its fallback uses them.
  */
 import type { Device } from "@luma.gl/core";
+import { WebGLDevice } from "@luma.gl/webgl";
 import { gpuLayoutNeed, gpuLayoutSupport } from "./device-caps.js";
 import { gpuCaps } from "./device-probe.js";
 import { GpuForceLayout } from "./gpu-force-layout.js";
+import { GpuStream } from "./gpu-stream.js";
 import { canModuleSeed, gpuMultilevelSeed } from "./gpu-multilevel-seed.js";
 import { startWorkerLayout, type WorkerLayoutHandle, type WorkerLayoutOptions } from "../worker-transport.js";
-import { seedPositions, DEFAULT_FORCE, DRAG_HEAT, RECOOL_TICKS } from "../force.js";
+import { seedPositions, DEFAULT_FORCE } from "../force.js";
 import type { LODTopology, LODTree } from "../lod.js";
 import type { NetworkGraph } from "../graph.js";
 
@@ -38,14 +43,11 @@ export interface GpuLayoutOptions extends WorkerLayoutOptions {
 /** The transport a GPU layout resolved to: the GPU solve, or the worker fallback. */
 export type GpuLayoutTransport = "gpu" | "worker";
 
-const TARGET_FRAMES = 60;
-
-/** Ticks per streamed frame while reheating (drag / cool) — small batches keep the stream responsive. */
-const REHEAT_BATCH = 3;
-
 /**
  * Start a GPU-accelerated layout run. Returns a {@link WorkerLayoutHandle}-shaped object so the
- * engine treats it identically to the worker backend.
+ * engine treats it identically to the worker backend. `onFrame` runs inside the transport's animation
+ * frame, right after a harvest and at most once per frame, so a caller may repaint synchronously there
+ * (the transport times it to size its repaint throttle); the worker fallback calls it per worker message.
  *
  * Accepts a `Device | null | Promise<Device | null>` so `network.ts` can pass a **device promise**
  * that resolves after the backend settles (including the `"auto"` → WebGL background upgrade).
@@ -53,8 +55,8 @@ const REHEAT_BATCH = 3;
  *
  * - If `gpuLayoutSupport` rejects the device for this graph → one warning with the reason, then
  *   {@link startWorkerLayout} with the same options and `onLODTree` (it has its own sync fallback).
- * - Otherwise: seeds positions, constructs {@link GpuForceLayout}, and runs a streaming rAF loop
- *   until `iterations` are done, calling `onFrame` after each batch.
+ * - Otherwise: seeds positions, constructs {@link GpuForceLayout}, and streams it ({@link GpuStream})
+ *   until `iterations` are done; `settled` resolves once the final positions have been harvested.
  *
  * `onTransport` reports the resolution before the run starts — so before any frame or LOD tree
  * arrives — and the handle's `transport` / `shared` read the live state (#297): `"pending"` until the
@@ -180,7 +182,6 @@ function startGpuLayoutSync(
 
   const { width, height, force, iterations: rawIterations } = opts;
   const iterations = rawIterations ?? 300;
-  const frameEvery = opts.frameEvery ?? Math.max(1, Math.ceil(iterations / TARGET_FRAMES));
 
   // Seed positions. Module-aware multilevel seed (N8.2) when a provided module tree with super-edges
   // is available — lays out top-down over the module hierarchy so modules read as coherent regions —
@@ -195,105 +196,32 @@ function startGpuLayoutSync(
 
   const layout = new GpuForceLayout(device, graph, { ...DEFAULT_FORCE, ...force });
   // As the CPU worker (#124): a module-seeded layout cools over the iteration budget, a cold disc start
-  // keeps full heat to untangle (see ForceLayout.run). The GPU run has no early stop yet — that needs a
-  // per-frame mean-step reduction read back from the GPU, which belongs with the async (fenced)
-  // readback — so it runs the whole budget.
+  // keeps full heat to untangle (see ForceLayout.run). The GPU run has no early stop yet — the per-tick
+  // stop latch reads the mean step back with the positions (#124, spec §6.5.5) — so it runs the whole
+  // budget.
   if (moduleSeeded) layout.cool(iterations);
   else layout.hold(1);
 
-  let resolveSettled!: () => void;
-  const settled = new Promise<void>((r) => (resolveSettled = r));
-  // `settled` resolves once, at first convergence; the layout then stays ALIVE (idle) so a node-drag
-  // can reheat it (#183). `stop()` is the real teardown; it also settles if we never converged.
-  let settledOnce = false;
-  const settle = (): void => { if (settledOnce) return; settledOnce = true; resolveSettled(); };
-
-  let stopped = false;
-  let rafHandle = 0;
-  let ticksDone = 0;
-  // Loop activity, mirroring the worker (layout-worker.ts): `run` (initial cooled run over the
-  // iteration budget), `drag` (held nodes pinned, reflow indefinitely), `cool` (post-release settling
-  // tail), `idle` (at rest — loop paused, layout kept alive for a later reheat).
-  let mode: "idle" | "run" | "drag" | "cool" = iterations > 0 ? "run" : "idle";
-  let looping = false;
-  let coolLeft = 0;
-  let dragging = false;
-
-  const stop = (): void => {
-    if (stopped) return;
-    stopped = true;
-    if (rafHandle) {
-      cancelAnimationFrame(rafHandle);
-      rafHandle = 0;
-    }
+  // gpuLayoutSupport passed, so this is a WebGL2 device: the streaming readback needs its raw context.
+  if (!(device instanceof WebGLDevice)) {
     layout.destroy();
-    settle();
-  };
-
-  const step = (): void => {
-    rafHandle = 0;
-    if (stopped) { looping = false; return; }
-
-    // The initial run clamps its last batch to the iterations remaining; reheat (drag/cool)
-    // streams small fixed batches for responsiveness.
-    const batch = mode === "run" ? Math.min(frameEvery, iterations - ticksDone) : REHEAT_BATCH;
-    layout.runFrame(batch);
-    ticksDone += batch;
-    layout.readPositions(graph.positions);
-    onFrame();
-
-    if (mode === "run") {
-      if (ticksDone >= iterations) {
-        settle();
-        // Converged → keep reflowing at the drag heat if a drag is live.
-        if (dragging) { mode = "drag"; layout.hold(DRAG_HEAT); } else mode = "idle";
-      }
-    } else if (mode === "cool") {
-      coolLeft -= batch;
-      if (coolLeft <= 0) mode = "idle";
-    }
-
-    if (mode === "idle") { looping = false; settle(); return; } // reached rest — pause; layout stays alive
-    // Schedule next batch. The support check above ensured a WebGL device, so requestAnimationFrame exists.
-    rafHandle = requestAnimationFrame(step);
-  };
-
-  // Resume the rAF loop if it isn't already running and there's work to do. Re-entrant-safe via
-  // `looping` so pin/unpin can't spin up a second loop.
-  const resume = (): void => {
-    if (looping || stopped || mode === "idle") return;
-    looping = true;
-    rafHandle = requestAnimationFrame(step);
-  };
-
-  // Kick off the initial run (or, with no iterations, paint the seed + settle immediately).
-  if (mode === "run") resume();
-  else { onFrame(); settle(); }
+    return fallBackToWorker("no WebGL2 device", graph, opts, onFrame, onLODTree, onTransport);
+  }
+  const stream = new GpuStream(device, layout, graph, {
+    iterations,
+    ...(opts.frameEvery !== undefined ? { frameEvery: opts.frameEvery } : {}),
+  }, onFrame);
+  stream.start();
 
   return {
     shared: false,
     transport: "gpu",
-    settled,
-    stop,
+    settled: stream.settled,
+    stop: () => stream.stop(),
     /** Hold `ids` (writing their `positions` into the position texture) and reheat — the rest reflows
-     *  around them. Resumes the loop in "drag" mode (or lets a still-running initial run transition to
-     *  it on convergence). Mirrors the worker's `pin`. */
-    pin(ids: Uint32Array, positions?: Float32Array) {
-      if (stopped) return;
-      layout.setPinned(ids);
-      if (positions) layout.setHeldPositions(ids, positions);
-      dragging = true;
-      // During the initial run the drag rides on the run's schedule until its budget ends (then DRAG_HEAT).
-      if (mode === "idle" || mode === "cool") { mode = "drag"; layout.hold(DRAG_HEAT); }
-      resume();
-    },
+     *  around them. Mirrors the worker's `pin`. */
+    pin: (ids: Uint32Array, positions?: Float32Array) => stream.pin(ids, positions),
     /** Release every pin and re-cool over a short tail, then idle. Mirrors the worker's `unpin`. */
-    unpin() {
-      if (stopped) return;
-      layout.setPinned(null);
-      dragging = false;
-      if (mode === "drag") { mode = "cool"; coolLeft = RECOOL_TICKS; layout.cool(RECOOL_TICKS, DRAG_HEAT); }
-      resume();
-    },
+    unpin: () => stream.unpin(),
   };
 }
