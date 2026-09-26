@@ -214,7 +214,9 @@ function pin(ids: Uint32Array, positions?: Float32Array): void {
     s.positions[id * 2 + 1] = positions[k * 2 + 1]!;
   }
   s.dragging = true;
-  // Keep `run` running (it moves to `drag` when it ends); otherwise reflow at the drag heat.
+  // A drag during the initial run rides on the run's own schedule — a cold start's full heat, or the
+  // cooling budget — until the run converges or spends its budget, then holds DRAG_HEAT (endRun).
+  // Otherwise reflow at the drag heat now.
   if (mode === "idle" || mode === "cool") {
     mode = "drag";
     s.layout.hold(DRAG_HEAT);

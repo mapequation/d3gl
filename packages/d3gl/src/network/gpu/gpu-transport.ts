@@ -251,6 +251,7 @@ function startGpuLayoutSync(
       layout.setPinned(ids);
       if (positions) layout.setHeldPositions(ids, positions);
       dragging = true;
+      // During the initial run the drag rides on the run's schedule until its budget ends (then DRAG_HEAT).
       if (mode === "idle" || mode === "cool") { mode = "drag"; layout.hold(DRAG_HEAT); }
       resume();
     },
