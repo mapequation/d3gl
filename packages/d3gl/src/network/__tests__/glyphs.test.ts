@@ -101,6 +101,31 @@ describe("link colour resolution is memoised per style (per-frame colour parse)"
     expect(calls).toBe(n); // every distinct weight resolved once; nothing is dropped or reused wrongly
     expect(Array.from(colorOf(0.5))).toEqual(parsed(scale(0.5)));
   });
+
+  it("memoises the next working set again after starting over (it never freezes on stale weights)", () => {
+    let calls = 0;
+    const colorOf = resolveLinkColorOf((w: number) => {
+      calls++;
+      return scale(w);
+    });
+    for (let i = 0; i < 50_000; i++) colorOf(i / 1000); // overflow the memo with one region's flows
+    const before = calls;
+    const region = Array.from({ length: 2_000 }, (_, i) => 60 + i / 7); // then zoom to unseen flows
+    for (let frame = 0; frame < 10; frame++) {
+      for (const w of region) expect(Array.from(colorOf(w)), `w=${w}`).toEqual(parsed(scale(w)));
+    }
+    // Once each, plus at most once more if the memo filled up and started over inside the region.
+    expect(calls - before).toBeLessThanOrEqual(2 * region.length);
+  });
+
+  it("resolves odd weights exactly: NaN, ±0, ±Infinity, tiny and huge flows", () => {
+    const colorOf = resolveLinkColorOf((w: number) => scale(w));
+    const odd = [Number.NaN, 0, -0, Infinity, -Infinity, 5e-324, 1e-300, 1e300, 2 ** 53, 1 / 3];
+    for (let pass = 0; pass < 2; pass++) {
+      for (const w of odd) expect(Array.from(colorOf(w)), `w=${w}`).toEqual(parsed(scale(w)));
+    }
+  });
+
 });
 
 describe("nodeCircles", () => {

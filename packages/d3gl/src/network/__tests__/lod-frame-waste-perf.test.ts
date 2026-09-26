@@ -7,6 +7,7 @@ import { multilevelSeed } from "../coarsen.js";
 import { superEdges, makeSuperEdgesScratch, resolveLinkColorOf, linkLinesStyleAttrs, type SuperEdgeStyleResolved } from "../glyphs.js";
 import { buildGraph, type NetworkGraph } from "../graph.js";
 import { declutterScreen, declutterScratch } from "../../core/declutter.js";
+import { StableColumns } from "../../core/stable-columns.js";
 
 /**
  * Per-frame regression guard (AGENTS.md lifecycle §5) for the streamed-LOD-frame waste measured on
@@ -22,6 +23,14 @@ import { declutterScreen, declutterScratch } from "../../core/declutter.js";
  *      made every rejected 2-3 px leaf test the whole packed neighbourhood. Radius-class grids keep
  *      probes per glyph O(1). Signature: `scratch.probes` per frontier glyph, plus element identity
  *      with the single-grid reference.
+ *
+ *   3. **Continuous weights** (Infomap flows): a frame can draw more distinct accumulated weights than
+ *      the memo holds. It then resolves them again, as with no memo — the lookup must not cost much
+ *      more than that. A `Map` memo that clears when full measured +21-43% over no memo; the typed
+ *      table +2-6%. Signature: exact bytes; ceiling (PERF_ASSERT): ≤ MEMO_OVERHEAD × the no-memo pass.
+ *   4. **Style-column compare** (`StableColumns`): the LOD emit compares each style column with last
+ *      frame's to skip its GPU upload — an added O(drawn super-edges) loop per emit. Timed at ≈1M
+ *      super-edges over the emit's real column set (PERF_ASSERT ceiling), identity asserted always.
  *
  * Both reduction states, as §5 asks:
  *   - **reductions ON** — the real cut → declutterFrontier → superEdges pipeline over a zoom sweep,
@@ -44,6 +53,14 @@ const ASSERT = !!process.env.PERF_ASSERT;
 // 2·maxR grid trips it as well as the probe count; the sweep ceiling is an order-of-magnitude backstop.
 const DECLUTTER_MS_PER_M = Number(process.env.PERF_LOD_FRAME_WASTE_DECLUTTER_MS) || 400;
 const SWEEP_FRAME_MS = Number(process.env.PERF_LOD_FRAME_WASTE_SWEEP_MS) || 20;
+/** Colour pass over continuous weights past the memo's bound, as a multiple of the same pass with no
+ *  memo (interleaved, same process). Measured 1.02-1.06 for the typed table; the `Map` memo it replaced
+ *  measured 1.21-1.22 on this leg (1.33-1.43 in a standalone bench), so this ceiling fails it. */
+const MEMO_OVERHEAD = Number(process.env.PERF_LOD_FRAME_WASTE_MEMO_OVERHEAD) || 1.15;
+/** Unchanged-emit compare over ≈1M super-edges' style columns (+ as many node columns), per 1M.
+ *  Measured 19 ms (M1 Max, load average ~13) for the whole unchanged set at 1M super-edges: ~12M
+ *  elements compared. A backstop at ~2× that, so a per-element slowdown of the compare trips it. */
+const STABLE_COMPARE_MS_PER_M = Number(process.env.PERF_LOD_FRAME_WASTE_STABLE_MS) || 40;
 /** Probes per glyph the radius-class grid may spend (measured 3.2 on the dense fixture; the single
  *  grid spends 52 there). Deterministic — never scaled. */
 const MAX_PROBES_PER_GLYPH = 8;
@@ -270,6 +287,65 @@ describe("streamed LOD frame waste — colour resolution + mixed-radius declutte
       const want = parsed(strokeScale(graph.weight[e] ?? 0));
       expect(Array.from(attrs.colors.subarray(e * 4, e * 4 + 4)), `edge ${e}`).toEqual(want);
     }
+  }, 120_000);
+
+  it("continuous weights past the memo's bound: the colour pass costs about what resolving every call does", () => {
+    const S = 100_000; // distinct accumulated flows drawn per frame — well past the memo's 16,384
+    let s = 3 >>> 0;
+    const rng = (): number => ((s = (s * 1664525 + 1013904223) >>> 0) / 4294967296);
+    const flows = Float64Array.from({ length: S }, () => rng() * 64);
+    const colorOf = resolveLinkColorOf((w: number) => strokeScale(w));
+    const unmemoised = (w: number): readonly [number, number, number, number] => parsed(strokeScale(w));
+    const out = new Uint8Array(S * 4);
+    const pass = (of: (w: number) => readonly [number, number, number, number]): number => {
+      const t0 = performance.now();
+      for (let e = 0; e < S; e++) {
+        const [r, g, b, a] = of(flows[e] ?? 0);
+        out[e * 4] = r;
+        out[e * 4 + 1] = g;
+        out[e * 4 + 2] = b;
+        out[e * 4 + 3] = a;
+      }
+      return performance.now() - t0;
+    };
+    const memoMs: number[] = [];
+    const baseMs: number[] = [];
+    for (let rep = 0; rep < 9; rep++) {
+      memoMs.push(pass(colorOf)); // the same flows every frame, as a held or streamed view redraws them
+      for (let e = 0; e < S; e += 997) expect(Array.from(out.subarray(e * 4, e * 4 + 4)), `flow ${flows[e]}`).toEqual(parsed(strokeScale(flows[e] ?? 0)));
+      baseMs.push(pass(unmemoised));
+    }
+    const ratio = median(memoMs) / median(baseMs);
+    if (ASSERT) expect(ratio, `memo ${median(memoMs).toFixed(1)}ms vs no memo ${median(baseMs).toFixed(1)}ms`).toBeLessThan(MEMO_OVERHEAD);
+  }, 120_000);
+
+  it("style-column compare at ≈1M super-edges: an unchanged emit hands back last frame's arrays", () => {
+    const S = 1_000_000; // drawn super-edges (the visible set with LOD on can be this large)
+    const cols = new StableColumns();
+    // The LOD emit's half-arrow + highlight column set: radii (2/edge), widths, bends, groups, groups2
+    // (Float32) and colours (4/edge), selected (Uint8); plus the node lane's groups for ≈S glyphs.
+    const f32 = { "half-arrows.radii": 2 * S, "half-arrows.widths": S, "half-arrows.bends": S, "links.groups": S, "links.groups2": S, "nodes.groups": S };
+    const u8 = { "half-arrows.colors": 4 * S, "links.selected": S };
+    const freshF32 = (n: number): Float32Array => Float32Array.from({ length: n }, (_, i) => (i % 977) * 0.25);
+    const freshU8 = (n: number): Uint8Array => Uint8Array.from({ length: n }, (_, i) => i % 251);
+    const first = new Map<string, Float32Array | Uint8Array>();
+    for (const [k, n] of Object.entries(f32)) first.set(k, cols.float32(k, freshF32(n)));
+    for (const [k, n] of Object.entries(u8)) first.set(k, cols.uint8(k, freshU8(n)));
+    const ts: number[] = [];
+    for (let frame = 0; frame < 5; frame++) {
+      const nextF32 = Object.entries(f32).map(([k, n]) => [k, freshF32(n)] as const);
+      const nextU8 = Object.entries(u8).map(([k, n]) => [k, freshU8(n)] as const);
+      const t0 = performance.now();
+      for (const [k, a] of nextF32) expect(cols.float32(k, a), k).toBe(first.get(k));
+      for (const [k, a] of nextU8) expect(cols.uint8(k, a), k).toBe(first.get(k));
+      ts.push(performance.now() - t0);
+    }
+    // A changed column is taken as-is (and becomes the new reference).
+    const moved = freshF32(S);
+    moved[S - 1] = -1;
+    expect(cols.float32("half-arrows.widths", moved)).toBe(moved);
+    const ms = median(ts);
+    if (ASSERT) expect(ms, `unchanged compare ${ms.toFixed(1)}ms at ${S.toLocaleString()} super-edges`).toBeLessThan(STABLE_COMPARE_MS_PER_M * (S / 1_000_000));
   }, 120_000);
 
   (BENCH ? it : it.skip)(`bench: both legs at ${BENCH_N.toLocaleString()}`, () => {
