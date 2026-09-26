@@ -373,6 +373,7 @@ per-file timeout. Every at-scale leg below now asserts. When you add a guard, ad
 | network selection dim | — | `network/__tests__/selection-dim-perf.test.ts` | 100k | — |
 | node-drag (interaction) | — | `network/__tests__/lod-drag-incremental-perf.test.ts` | small | `BENCH_DRAG` |
 | position transition frame (#328) | — | `network/__tests__/transition-perf.test.ts` | 100k, LOD on **and** off, vs a streamed layout frame | `BENCH_TRANSITION` |
+| streaming fit box, per streamed frame (#327) | — | `network/__tests__/fit-box-perf.test.ts` | 200k leaves (LOD-independent): clean disc in radial **and** shuffled order + 64 stragglers; exact, allocation-free | `BENCH_FIT_BOX` |
 | LOD super-edge **build** | — | `network/__tests__/super-edges-build.test.ts` | equivalence | `BENCH_SUPER_EDGES_BUILD` |
 | retained memory | — | `core/point-memory.bench.test.ts` | — | `BENCH_MEM` |
 | declutter allocation | — | `core/declutter-alloc.bench.test.ts` | — | — |

@@ -3,7 +3,7 @@ import { buildGraph, type NetworkGraph } from "../graph.js";
 import { buildLODTree, buildSpatialLODTree, computeLODGeometry, cut, defaultExpandPx, type LODTransform, type LODTree } from "../lod.js";
 import { buildModuleLODTree, type ModuleNode } from "../modules.js";
 import { multilevelLayout } from "../coarsen.js";
-import { fitNodes, fitBox, fitTransform } from "../fit.js";
+import { layoutBox, fitTransform } from "../fit.js";
 
 /**
  * #191 — the **adaptive default** expand threshold, pinned by frontier composition at the view the
@@ -82,12 +82,12 @@ function withGeometry(tree: LODTree, graph: NetworkGraph): LODTree {
   return tree;
 }
 
-/** The transform `layout({ fit: true })` produces — the view a reader actually opens on. */
-function fitView(tree: LODTree): LODTransform {
-  const nodes = fitNodes(tree);
-  const box = fitBox(tree, nodes, new Float32Array(nodes.length));
+/** The transform `layout({ fit: true })` produces — the view a reader actually opens on: the leaves' box
+ *  ({@link layoutBox}), padded by the 4-unit world radius {@link withGeometry} draws them at. */
+function fitView(graph: NetworkGraph): LODTransform {
+  const box = layoutBox(graph.positions, graph.nodeCount);
   if (!box) throw new Error("no fit box");
-  return fitTransform(box, W, H);
+  return fitTransform([box[0] - 4, box[1] - 4, box[2] + 4, box[3] + 4], W, H);
 }
 
 /** Frontier composition: how many glyphs, and how many of them are raw leaves. */
@@ -105,7 +105,7 @@ describe("adaptive default expandPx (#191)", () => {
 
       it("a provided-module tree opens on a map of modules — no raw leaves at the fit view", () => {
         const tree = withGeometry(buildModuleLODTree(nodeCount, modules, graph), graph);
-        const t = fitView(tree);
+        const t = fitView(graph);
 
         // Pre-fix baseline: the old fixed 48 px default expanded essentially every module into its
         // members (measured: 99.8 % raw leaves at N=600, 95.3 % at N=5000).
@@ -125,7 +125,7 @@ describe("adaptive default expandPx (#191)", () => {
 
       it("a structural coarsening tree is left byte-for-byte as it was calibrated", () => {
         const tree = withGeometry(buildLODTree(graph, {}), graph);
-        const t = fitView(tree);
+        const t = fitView(graph);
 
         expect(tree.leafBranching).toBe(2); // heavy-edge matching pairs nodes
         expect(defaultExpandPx(tree, W, H)).toBe(48);
@@ -142,7 +142,7 @@ describe("adaptive default expandPx (#191)", () => {
 
       it("a spatial quadtree keeps the 48 px default (its bottom cells hold one point)", () => {
         const tree = withGeometry(buildSpatialLODTree(graph.positions, nodeCount, {}), graph);
-        const t = fitView(tree);
+        const t = fitView(graph);
         expect(tree.leafBranching).toBeLessThanOrEqual(2);
         expect(defaultExpandPx(tree, W, H)).toBe(48);
         expect(Array.from(cut(tree, t, W, H, {}))).toEqual(Array.from(cut(tree, t, W, H, { expandPx: 48 })));
@@ -159,7 +159,7 @@ describe("adaptive default expandPx (#191)", () => {
     // …and the cap never drags the default *below* the historical one.
     expect(defaultExpandPx(tree, 60, 60)).toBe(48);
     // An explicit value always wins, with its meaning unchanged (48 px ⇒ the pre-fix all-leaves view).
-    const t = fitView(tree);
+    const t = fitView(graph);
     expect(composition(tree, t, 48).leafPct).toBeGreaterThan(90);
   });
 });

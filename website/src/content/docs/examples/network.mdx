@@ -426,9 +426,9 @@ different weight. The **Nodes** slider resizes the generated network (500 → 20
 The layout is the **module-aware GPU seed**: the module hierarchy is supplied with the graph,
 `data(graph, { modules })`, so `layout({ backend: "gpu" })` seeds the WebGL2 Barnes-Hut solve
 **top-down over the module tree** in every LOD mode — modules (including the ragged, deeper-nested
-super-modules) lay out as coherent regions. Because the GPU solve streams frames, `fit: true` keeps the camera framed on the layout as it converges (centroid
-→ view centre, extent → the view), so the map opens framed and settles in place rather than piling at the
-origin. It releases to normal zoom/pan once it settles.
+super-modules) lay out as coherent regions. Because the GPU solve streams frames, `fit: true` keeps the camera framed on the layout as it converges (the nodes'
+bounding box → the view), so the map opens framed and settles in place rather than piling at the
+origin. It releases to normal zoom/pan once it settles — or as soon as you zoom or pan.
 
 The **Layout** control switches to the **nested** module layout (`layout({ nested })`): each module's
 children are laid out inside its own disc, arranged by their sibling links, so every module stays a

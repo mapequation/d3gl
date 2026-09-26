@@ -1652,7 +1652,15 @@ export abstract class BaseEngine {
         if ((e.type === "mousedown" || e.type === "pointerdown") && !me.shiftKey && !me.ctrlKey && !me.button && this.draggableAtEvent(me)) return false;
         return (!me.ctrlKey || e.type === "wheel") && !me.button;
       })
-      .on("start", () => this.setInteracting(true))
+      // A gesture boundary only for a USER gesture (#309, #327). d3-zoom also emits start/end for the
+      // engine's own `behavior.transform` re-seeds (enableZoom's seed, syncZoomToView after a fit or a
+      // setTransform); those carry no `sourceEvent`, and treating them as gestures cleared hover, re-pushed
+      // hideOnInteraction layers, re-baked Canvas/SVG networks and released a streaming fit on its first
+      // frame. The end of a real gesture that a re-seed interrupts (a dblclick zoom transition) still
+      // carries its source event, so it still ends the gesture.
+      .on("start", (e: D3ZoomEvent<Element, unknown>) => {
+        if (e.sourceEvent) this.setInteracting(true);
+      })
       .on("zoom", (e: D3ZoomEvent<Element, unknown>) => {
         if (this.suppressZoomEmit) return; // a programmatic syncZoomToView() re-seed — don't recurse
         const t: ViewTransform = { k: e.transform.k, x: e.transform.x, y: e.transform.y };
@@ -1664,15 +1672,17 @@ export abstract class BaseEngine {
         }
         onTransform?.(t);
       })
-      .on("end", () => this.setInteracting(false));
+      .on("end", (e: D3ZoomEvent<Element, unknown>) => {
+        if (e.sourceEvent) this.setInteracting(false);
+      });
     sel.call(behavior);
     this.zoomSel = sel;
     this.zoomBehavior = behavior;
     // Seed d3-zoom's internal transform from the engine's CURRENT view so a non-identity base
     // (e.g. a centering translate set via setTransform before enableZoom) is respected, and
-    // zoom-to-cursor deltas measure from it rather than from identity.
-    const t = this.transform;
-    sel.call(behavior.transform, zoomIdentity.translate(t.x, t.y).scale(t.k));
+    // zoom-to-cursor deltas measure from it rather than from identity. The view itself is unchanged,
+    // so this is a silent re-seed: no setTransform, no render, no gesture boundary.
+    this.syncZoomToView();
     this.interactionCleanup = () => { sel.on(".zoom", null); this.zoomSel = null; this.zoomBehavior = null; };
     return this;
   }
