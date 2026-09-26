@@ -151,7 +151,15 @@ export function gpuMultilevelSeed(
   //       number below their parent, so one ascending pass finishes each node before adding it upward.
   const mass = new Float32Array(size);
   for (let g = 0; g < leafCount; g++) mass[g] = 1;
-  for (let g = 0; g < size; g++) if (parent[g]! >= 0) mass[parent[g]!] = mass[parent[g]!]! + mass[g]!;
+  parent.forEach((p, g) => {
+    if (p >= 0) mass[p] = (mass[p] ?? 0) + (mass[g] ?? 0);
+  });
+  // Leaves under each depth's nodes: every leaf at depth 0, fewer below wherever a ragged branch has
+  // already ended (its leaves were placed at a shallower depth and take no part in the deeper solves).
+  const depthMass = new Float64Array(maxDepth + 1);
+  depth.forEach((d, g) => {
+    depthMass[d] = (depthMass[d] ?? 0) + (mass[g] ?? 0);
+  });
 
   // ── 4. Per (depth-ordered) node: parent slot + offset from the parent. Children sit in a phyllotaxis
   //       disc around the parent placed by the cumulative mass of their earlier siblings, at the force
@@ -168,9 +176,9 @@ export function gpuMultilevelSeed(
   let rootFilled = 0;
   let rootRank = 0;
   for (let i = 0; i < size; i++) {
-    const g = depthNodes[i]!;
-    const p = parent[g]!;
-    const m = mass[g]!;
+    const g = depthNodes[i] ?? 0;
+    const p = parent[g] ?? -1;
+    const m = mass[g] ?? 0;
     let before: number;
     let r: number;
     if (p < 0) {
@@ -178,14 +186,14 @@ export function gpuMultilevelSeed(
       rootFilled += m;
       r = rootRank++;
     } else {
-      parentSlotByDepth[i] = slot[p]!;
-      before = filled[p]!;
+      parentSlotByDepth[i] = slot[p] ?? 0;
+      before = filled[p] ?? 0;
       filled[p] = before + m;
-      r = rank[p]!;
+      r = rank[p] ?? 0;
       rank[p] = r + 1;
     }
     const radius = k * Math.sqrt(before + m / 2);
-    const a = (r + (p < 0 ? 0 : slot[p]!)) * GOLDEN;
+    const a = (r + (p < 0 ? 0 : (slot[p] ?? 0))) * GOLDEN;
     offsetByDepth[2 * i] = radius * Math.cos(a);
     offsetByDepth[2 * i + 1] = radius * Math.sin(a);
   }
@@ -236,14 +244,14 @@ export function gpuMultilevelSeed(
   let my = 0;
   let mt = 0;
   for (let q = 0; q < rootCount; q++) {
-    const m = mass[depthNodes[q]!]!;
-    mx += m * offsetByDepth[2 * q]!;
-    my += m * offsetByDepth[2 * q + 1]!;
+    const m = mass[depthNodes[q] ?? 0] ?? 0;
+    mx += m * (offsetByDepth[2 * q] ?? 0);
+    my += m * (offsetByDepth[2 * q + 1] ?? 0);
     mt += m;
   }
   for (let q = 0; q < rootCount; q++) {
-    rootPos[2 * q] = width / 2 + offsetByDepth[2 * q]! - mx / mt;
-    rootPos[2 * q + 1] = height / 2 + offsetByDepth[2 * q + 1]! - my / mt;
+    rootPos[2 * q] = width / 2 + (offsetByDepth[2 * q] ?? 0) - mx / mt;
+    rootPos[2 * q + 1] = height / 2 + (offsetByDepth[2 * q + 1] ?? 0) - my / mt;
   }
   const rootPack = packPositionsTexture(device, rootPos);
 
@@ -304,11 +312,13 @@ export function gpuMultilevelSeed(
         target: seTgt[d]!,
         positions: new Float32Array(count * 2), // dummy; overwritten by the GPU prolongation seed
       };
-      // Each of the level's `count` nodes stands for leafCount/count leaves on average: scaling the
-      // repulsion by that mean mass puts the level's own equilibrium at the finest level's scale (the
-      // disc radius √(repulsion·n/centering) with n·mass = leafCount), so the solve arranges the modules
-      // without contracting them below the area their leaves will need. The step cap scales alike.
-      const meanMass = leafCount / count;
+      // Each of the level's `count` nodes stands for depthMass[d]/count leaves on average (all leaves
+      // still under this depth — a ragged branch that ended above is not in this solve): scaling the
+      // repulsion by that mean mass puts the level's own equilibrium at the finest level's density (the
+      // disc radius √(repulsion·n/centering) with n·mass = its leaves), so the solve arranges the modules
+      // without contracting them below the area their leaves will need, nor spreading them past it. The
+      // step cap scales alike.
+      const meanMass = (depthMass[d] ?? count) / count;
       const levelParams: ForceParams = { ...params, repulsion: params.repulsion * meanMass };
       const layout = new GpuForceLayout(device, levelGraph, levelParams, { maxStep: stepCap(spacing * Math.sqrt(meanMass), 0) });
       layout.seedFromProlongation((pass) => seedRun(pass));

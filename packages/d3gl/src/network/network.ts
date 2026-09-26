@@ -1317,7 +1317,10 @@ export class Network extends BaseEngine {
       // so neither gets the seed disc. Only layouts computed in one go transition.
       const duration = nestedTree || opts.backend === "positions" || opts.backend === "force" ? transitionDuration(opts.transition) : 0;
       const warm = !!nestedTree && typeof opts.nested === "object" && opts.nested.warm === true;
-      if (fit && !warm && duration === 0) seedPositions(this.graph, this.width, this.height, { force: opts.force });
+      // A flat force layout's first paint sits at the scale it converges to (the force equilibrium). A
+      // nested layout ignores `force` — its root disc is 10·√N, the box the camera frames — so it keeps
+      // the viewport disc rather than one ~3× wider than that box.
+      if (fit && !warm && duration === 0) seedPositions(this.graph, this.width, this.height, nestedTree ? undefined : { force: opts.force });
       if (nestedTree) {
         this.startNestedLayout(nestedTree, opts, duration);
       } else if (opts.backend === "positions" && opts.positions) {
