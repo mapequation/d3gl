@@ -32,8 +32,10 @@ Every level is laid out at the force model's own equilibrium scale (a disc of ra
 `√(repulsion·N/centering)`; coarse nodes weigh as many nodes as they stand for), so the refinement
 starts where it will end up — no blow-up past the final extent, no collapse. With
 `layout({ backend: "worker" })` the entire solve runs in a **Web Worker** and streams positions
-back — a frame about every display frame — so the layout **converges progressively on screen** while
-the main thread stays responsive; pan and zoom while it settles. A multilevel-seeded CPU layout
+back — the multilevel seed while it forms (each finer level projected onto every node, already at
+the final extent, so a large graph shows up in a fraction of the seed's time), then a frame about
+every display frame — so the layout **converges progressively on screen** while the main thread
+stays responsive; pan and zoom while it settles. A multilevel-seeded CPU layout
 (`worker` or `force`) cools over its `iterations` budget and **stops once it has converged**, so there
 `iterations` is a safety cap and the length of the cooling (a larger budget cools more slowly), not a
 tick count to hit. The GPU layout has no early stop yet (it runs its whole budget) and a cold start
