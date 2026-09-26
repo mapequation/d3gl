@@ -19,6 +19,24 @@ const MAX_DEPTH = 32;
  */
 export const DEFAULT_CURVE_TOLERANCE = 0.25;
 
+/**
+ * The tolerance an **anchored** drawable is baked at, given the engine's world-unit `tolerance`
+ * and whether its layer is `sizeMode: "screen"` (#283).
+ *
+ * An anchored screen glyph is drawn as `anchor′ + (p − anchor)`: its recorded offsets are used
+ * directly as **pixels** and the zoom never scales them, so its bake is already screen-space and
+ * a refinement below the default's 0.25px sagitta is invisible. It is therefore **floored** at
+ * {@link DEFAULT_CURVE_TOLERANCE} — a floor, not a replacement, so a coarser `tolerance` still
+ * coarsens glyphs and this can never record more vertices than `tolerance` itself would.
+ *
+ * In world sizeMode the anchor is ignored and the drawable is world-scaled like any other curve,
+ * so it keeps `tolerance`. (Unanchored drawables never come here: they are world-scaled in either
+ * sizeMode and always bake at `tolerance`.)
+ */
+export function anchoredCurveTolerance(tolerance: number, screen: boolean): number {
+  return screen ? Math.max(tolerance, DEFAULT_CURVE_TOLERANCE) : tolerance;
+}
+
 /** Cubic bezier from (x0,y0) to (x3,y3) with control points (x1,y1),(x2,y2). */
 export function flattenCubic(
   x0: number,
