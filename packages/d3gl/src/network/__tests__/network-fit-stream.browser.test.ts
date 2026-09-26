@@ -96,6 +96,16 @@ function framing(graph: NetworkGraph, t: ViewTransform): { fill: number; cx: num
 
 const nextFrame = (): Promise<void> => new Promise((r) => requestAnimationFrame(() => r()));
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
+/** Wait (bounded) until `done()` holds — for d3-zoom's wheel-idle end (150 ms), whose timer runs late under load. */
+async function until(done: () => boolean, maxMs = 5000): Promise<void> {
+  const t0 = performance.now();
+  while (!done() && performance.now() - t0 < maxMs) await sleep(20);
+}
+/**
+ * The real-worker cases stream 3000 nodes × 300 iterations and wait for the settle: a few seconds alone, but
+ * several times that on a loaded machine, past the suite's 20 s default. A harness limit, not a budget.
+ */
+const STREAM_TIMEOUT_MS = 90_000;
 
 /** Sample the view on every animation frame until `done` resolves; returns the distinct scales seen. */
 async function sampleUntil(net: ProbeNetwork, done: Promise<void>): Promise<number[]> {
@@ -151,7 +161,7 @@ describe("a programmatic view change is not a gesture (#309)", () => {
       wheel(host, -120);
       expect(net.interactingCalls).toBe(1);
       expect(net.screenSyncs, "a gesture frame re-baked the vector scene").toBe(syncs);
-      await sleep(250);
+      await until(() => net.interactingCalls === 2);
       expect(net.interactingCalls).toBe(2);
       expect(net.screenSyncs).toBe(syncs + 1); // the gesture's end re-bakes the vector scene, as before
       net.destroy();
@@ -246,7 +256,7 @@ describe("streaming fit with zoom enabled (#327)", () => {
       expect(Math.abs(f.cy - H / 2)).toBeLessThan(1);
       expect(zoomTransform(host)).toMatchObject(net.view); // d3-zoom seeded to the final frame
       net.destroy();
-    });
+    }, STREAM_TIMEOUT_MS);
   }
 
   it("a real wheel gesture mid-stream hands the view to the user — no later frame or settle reframes it", async () => {
@@ -260,14 +270,15 @@ describe("streaming fit with zoom enabled (#327)", () => {
     await framesStreamed(net, 2);
 
     wheel(host, -240);
-    await sleep(250); // the wheel gesture ends once it goes idle
+    await until(() => net.interactingCalls === 2); // the wheel gesture ends once it goes idle
+    expect(net.interactingCalls, "the wheel gesture never ended").toBe(2);
     const user = net.view;
     await settled;
     await nextFrame();
     expect(net.view).toEqual(user);
     expect(zoomTransform(host)).toMatchObject(user);
     net.destroy();
-  });
+  }, STREAM_TIMEOUT_MS);
 
   it("an explicit setTransform mid-stream (the Navigator's zoom-to + re-enableZoom, #202) keeps its view", async () => {
     const host = makeHost();
@@ -288,5 +299,5 @@ describe("streaming fit with zoom enabled (#327)", () => {
     expect(net.view).toEqual(target);
     expect(zoomTransform(host)).toMatchObject(target);
     net.destroy();
-  });
+  }, STREAM_TIMEOUT_MS);
 });

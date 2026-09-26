@@ -18,6 +18,31 @@ vi.mock("../fit.js", async (importOriginal) => {
     },
   };
 });
+// Count the work the fit's glue must NOT add to a streamed frame: LOD cuts (the engine's one `cut` call
+// site) and style resolutions (`resolveNodeRadii` runs once per resolved style). A fitted frame does
+// exactly what an unfitted one does, plus the box — these pin that deterministically, in both reduction
+// states, where a wall-clock ratio on a frontier-dominated frame cannot.
+const work = vi.hoisted(() => ({ cuts: 0, styleResolves: 0 }));
+vi.mock("../lod.js", async (importOriginal) => {
+  const mod = await importOriginal<typeof import("../lod.js")>();
+  return {
+    ...mod,
+    cut: (...args: Parameters<typeof mod.cut>) => {
+      work.cuts++;
+      return mod.cut(...args);
+    },
+  };
+});
+vi.mock("../glyphs.js", async (importOriginal) => {
+  const mod = await importOriginal<typeof import("../glyphs.js")>();
+  return {
+    ...mod,
+    resolveNodeRadii: (...args: Parameters<typeof mod.resolveNodeRadii>) => {
+      work.styleResolves++;
+      return mod.resolveNodeRadii(...args);
+    },
+  };
+});
 
 /**
  * ENGINE-level per-frame guard for the streaming fit (#327, AGENTS.md lifecycle §5). The trigger is a
@@ -43,7 +68,15 @@ vi.mock("../fit.js", async (importOriginal) => {
  * Signatures (deterministic): the box runs exactly once per streamed frame while the fit is on, and a
  * stream alternating the spiral with a 1.5× copy of it reframes on every frame; zero times with the fit
  * off; zero times over a `setTransform` zoom sweep, and on every streamed frame after that sweep has
- * taken the view over; and no streamed frame moves a taken-over view.
+ * taken the view over; and no streamed frame moves a taken-over view. A fitted stream also runs exactly as
+ * many LOD cuts (one per frame with LOD on) and style resolutions (none) as an unfitted one.
+ *
+ * Why the LOD ON leg's wall-clock bound is only a coarse backstop: its frame is dominated by the frontier
+ * the view draws (48.8 ms at 50k), so a ratio on it leaves room for several ms of extra work, and an
+ * absolute delta on two noisy ~49 ms medians would flake. The fit's own work does not depend on LOD: the
+ * box is the same O(nodes) pass either way, and the LOD OFF leg bounds it tightly. What LOD could add is
+ * glue — an extra cut or a style re-resolution per fitted frame — and the counts above pin exactly that.
+ * A larger frontier would not test the fit harder either: at an equal view it costs fit on and off alike.
  */
 
 const N = perfN(50_000, { max: 200_000 });
@@ -127,6 +160,9 @@ interface Stream {
   medianMs: number;
   /** `layoutBox` calls over the timed frames (the last round's). */
   boxCalls: number;
+  /** LOD `cut` calls and style resolutions over the timed frames (the last round's). */
+  cuts: number;
+  styleResolves: number;
 }
 
 interface Leg {
@@ -175,6 +211,8 @@ beforeAll(async () => {
     const measure = (): Stream => {
       streamFrame(a); // warm-up, and frames the view (fit on) that the fit-off stream then keeps
       const calls0 = box.calls;
+      const cuts0 = work.cuts;
+      const resolves0 = work.styleResolves;
       const ts: number[] = [];
       for (let i = 1; i <= FRAMES; i++) {
         const t0 = performance.now();
@@ -182,12 +220,17 @@ beforeAll(async () => {
         ts.push(performance.now() - t0);
       }
       ts.sort((x, y) => x - y);
-      return { medianMs: ts[Math.floor(ts.length / 2)] ?? Infinity, boxCalls: box.calls - calls0 };
+      return {
+        medianMs: ts[Math.floor(ts.length / 2)] ?? Infinity,
+        boxCalls: box.calls - calls0,
+        cuts: work.cuts - cuts0,
+        styleResolves: work.styleResolves - resolves0,
+      };
     };
     /** Best of `ROUNDS` alternating rounds: the medians' minimum, so a burst of contention from a parallel
      *  run lands on one round, not on one phase. Counters are the last round's. */
     const best = (rounds: Stream[]): Stream => {
-      const last = rounds[rounds.length - 1] ?? { medianMs: Infinity, boxCalls: -1 };
+      const last = rounds[rounds.length - 1] ?? { medianMs: Infinity, boxCalls: -1, cuts: -1, styleResolves: -1 };
       return { ...last, medianMs: Math.min(...rounds.map((r) => r.medianMs)) };
     };
 
@@ -240,7 +283,7 @@ beforeAll(async () => {
 }, SETUP_MS);
 
 describe(`network() streaming fit — per streamed frame at N=${N.toLocaleString()} (#327)`, () => {
-  for (const [name, get, ceiling, ratio] of [["LOD OFF", () => off, FRAME_MS_OFF, 1.5], ["LOD ON", () => on, FRAME_MS_ON, 1.25]] as const) {
+  for (const [name, get, ceiling, ratio, cutsPerFrame] of [["LOD OFF", () => off, FRAME_MS_OFF, 1.5, 0], ["LOD ON", () => on, FRAME_MS_ON, 1.25, 1]] as const) {
     it(`${name}: the box runs once per streamed frame while fitting, and never on zoom frames or after release`, () => {
       const leg = get();
       expect(leg.reframeScales, "non-vacuity: the fit did not follow the layout's size").toBe(2);
@@ -250,6 +293,14 @@ describe(`network() streaming fit — per streamed frame at N=${N.toLocaleString
       expect(leg.sweepBoxCalls, "a setTransform zoom frame ran the box").toBe(0);
       expect(leg.afterReleaseBoxCalls, "a streamed frame ran the box after the view was taken over").toBe(0);
       expect(leg.afterReleaseMoved, "a streamed frame moved a taken-over view").toBe(false);
+    });
+
+    it(`${name}: a fitted streamed frame runs no extra LOD cut or style resolution`, () => {
+      const { fitOn, fitOff } = get();
+      expect(fitOff.cuts, `non-vacuity: LOD cuts over ${FRAMES} unfitted frames`).toBe(FRAMES * cutsPerFrame);
+      expect(fitOn.cuts, "the fit added LOD cuts to a streamed frame").toBe(fitOff.cuts);
+      expect(fitOff.styleResolves, "an unfitted streamed frame re-resolved the style").toBe(0);
+      expect(fitOn.styleResolves, "the fit re-resolved the style on a streamed frame").toBe(0);
     });
 
     it(`${name}: a fitted streamed frame stays within its budget`, () => {

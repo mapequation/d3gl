@@ -166,6 +166,23 @@ describe("layoutBox is robust to fling-outs (the 'all white' bug)", () => {
     expect(sideError(box, bulk)).toBeLessThan(0.02);
   });
 
+  it("frames a layout under 200 leaves exactly, straggler included — a deliberate cutoff", () => {
+    // The trim is min(64, 0.5% of the leaves), so it is 0 below 200 leaves. That is deliberate: in a sparse
+    // small layout the rim leaves sit far apart, and trimming even one per side would crop a real node
+    // (a 50-leaf disc's outer 5% band holds under one leaf on average). The cost is that a small layout
+    // gets no fling-out protection: this 199-leaf layout frames its straggler, 20× out.
+    const n = N - 1; // 199
+    const pos = cornerLayout(null).subarray(0, 2 * n);
+    pos[4] = 20_000;
+    pos[5] = 20_000;
+    const box = layoutBox(pos, n);
+    if (!box) throw new Error("no box");
+    expect(box).toEqual(exactBox(pos, n));
+    // …while one more leaf (the 200-leaf layout above) turns the protection on.
+    if (!flung || !clean) throw new Error("no box");
+    expect(span(flung)).toBeLessThan(span(clean) * 1.05);
+  });
+
   it("never jumps: the frame follows a straggler drifting back in continuously", () => {
     const pos = cornerLayout(null);
     const bulk = exactBox(pos, N);
