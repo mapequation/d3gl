@@ -1336,7 +1336,8 @@ export abstract class BaseEngine {
     // before zooming (#202). Skipped during a gesture — that setTransform came FROM d3-zoom and is
     // already in step, and re-seeding there would add a `behavior.transform` apply per zoom frame.
     // No-ops when zoom isn't enabled.
-    if (!this.inZoomGesture) this.syncZoomToView();
+    const programmatic = !this.inZoomGesture;
+    if (programmatic) this.syncZoomToView();
     this.handle?.backend.setTransform(t);
     for (const [name, entry] of this.instancedLanes) if (entry.dynamic) this.emitInstancedLane(name);
     for (const spec of this.specs) if (spec.declutter) this.declutterLayer(spec, t);
@@ -1350,7 +1351,22 @@ export abstract class BaseEngine {
     // programmatic/settle transform, re-pull + crisp redraw every layer. The size check keeps
     // the zoom path of a retained-only chart free of even the call (#110 kept it deliberately).
     if (this.ptSpecs.size > 0 && !this.interacting) this.repaintPassThrough();
+    // With zoom enabled, a programmatic view change outside a gesture is a finished view change — it settles
+    // like a gesture's end (#309). Without zoom the caller drives the camera, possibly every frame, and the
+    // engine cannot tell when a sequence ends, so it does nothing extra.
+    if (programmatic && this.zoomBehavior && !this.interacting) this.afterProgrammaticTransform();
     return this;
+  }
+
+  /**
+   * Runs after a programmatic {@link setTransform} while zoom is enabled and no gesture is in progress:
+   * the view moved under the pointer, so drop the hover artifacts (tooltip, auto-highlight) that described
+   * the glyph under it before. Subclasses re-cut view-dependent retained geometry here too (the network's
+   * Canvas/SVG LOD frontier). Before #309 this ran as a side effect of the engine's own d3-zoom re-seed,
+   * which was treated as a whole gesture. Not called for the zoom gesture's own frames: its end handles that.
+   */
+  protected afterProgrammaticTransform(): void {
+    this.clearHoverState();
   }
 
   /** Called by {@link setTransform} just before the render (zoom frame or programmatic), after lanes
@@ -1635,6 +1651,9 @@ export abstract class BaseEngine {
    * Enable scroll-to-zoom / drag-to-pan via d3-zoom, clamped to `extent`. The optional
    * `onTransform` callback fires after each `setTransform` during zoom — use it to keep an
    * HTML overlay (e.g. a `LabelLayer`) aligned with the GPU geometry as the view changes.
+   * It also fires once here, with the view current at enable time (the one last passed to
+   * `setTransform`, identity by default), so the overlay starts in step. It does not fire for a
+   * later programmatic `setTransform`: the caller already knows that view.
    */
   enableZoom(extent: [number, number] = [1, 100], onTransform?: (t: ViewTransform) => void): this {
     this.disableInteraction();
@@ -1652,7 +1671,15 @@ export abstract class BaseEngine {
         if ((e.type === "mousedown" || e.type === "pointerdown") && !me.shiftKey && !me.ctrlKey && !me.button && this.draggableAtEvent(me)) return false;
         return (!me.ctrlKey || e.type === "wheel") && !me.button;
       })
-      .on("start", () => this.setInteracting(true))
+      // A gesture boundary only for a USER gesture (#309, #327). d3-zoom also emits start/end for the
+      // engine's own `behavior.transform` re-seeds (enableZoom's seed, syncZoomToView after a fit or a
+      // setTransform); those carry no `sourceEvent`, and treating them as gestures cleared hover, re-pushed
+      // hideOnInteraction layers, re-baked Canvas/SVG networks and released a streaming fit on its first
+      // frame. The end of a real gesture that a re-seed interrupts (a dblclick zoom transition) still
+      // carries its source event, so it still ends the gesture.
+      .on("start", (e: D3ZoomEvent<Element, unknown>) => {
+        if (e.sourceEvent) this.setInteracting(true);
+      })
       .on("zoom", (e: D3ZoomEvent<Element, unknown>) => {
         if (this.suppressZoomEmit) return; // a programmatic syncZoomToView() re-seed — don't recurse
         const t: ViewTransform = { k: e.transform.k, x: e.transform.x, y: e.transform.y };
@@ -1664,15 +1691,21 @@ export abstract class BaseEngine {
         }
         onTransform?.(t);
       })
-      .on("end", () => this.setInteracting(false));
+      .on("end", (e: D3ZoomEvent<Element, unknown>) => {
+        if (e.sourceEvent) this.setInteracting(false);
+      });
     sel.call(behavior);
     this.zoomSel = sel;
     this.zoomBehavior = behavior;
     // Seed d3-zoom's internal transform from the engine's CURRENT view so a non-identity base
     // (e.g. a centering translate set via setTransform before enableZoom) is respected, and
-    // zoom-to-cursor deltas measure from it rather than from identity.
+    // zoom-to-cursor deltas measure from it rather than from identity. The view itself is unchanged,
+    // so this is a silent re-seed: no setTransform, no render, no gesture boundary. The subscriber
+    // still learns the view it starts from, as it did when the seed ran the zoom handler — e.g. the
+    // identity a `GeoMap.setProjection` just reset to before re-enabling.
+    this.syncZoomToView();
     const t = this.transform;
-    sel.call(behavior.transform, zoomIdentity.translate(t.x, t.y).scale(t.k));
+    onTransform?.({ k: t.k, x: t.x, y: t.y });
     this.interactionCleanup = () => { sel.on(".zoom", null); this.zoomSel = null; this.zoomBehavior = null; };
     return this;
   }
