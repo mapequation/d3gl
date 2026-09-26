@@ -2,8 +2,8 @@ import type { Device, Texture, Framebuffer, RenderPass } from "@luma.gl/core";
 import type { ForceParams, LayoutGraph } from "../force.js";
 import { Cooling, DAMPING, equilibriumSpacing, springStabilizers, stepCap } from "../force.js";
 import { buildCSR } from "../graph.js";
-import { atlasWidth, pingPong, readbackFloatFboReuse, packUintTexture } from "./textures.js";
-import { readsRG } from "./device-probe.js";
+import { atlasWidth, pingPong, packUintTexture } from "./textures.js";
+import { PositionReadback } from "./position-readback.js";
 import { IntegratePass } from "./passes/integrate.js";
 import { AttractionPass } from "./passes/attraction.js";
 import { RepulsionAllPairsPass } from "./passes/repulsion-allpairs.js";
@@ -137,11 +137,11 @@ export class GpuForceLayout {
    */
   private readonly readFbos: readonly [Framebuffer, Framebuffer];
   /**
-   * `RGBA/FLOAT` readback scratch (`width × height × 4` floats), allocated once — and only on a device
-   * whose implementation read format for `rg32f` is not `RG/FLOAT` (#351). `null` where `RG/FLOAT`
-   * reads directly (ANGLE Metal), so the measured path is unchanged.
+   * Reads the position atlas back in a format the device supports (#351): `RG/FLOAT` where that is the
+   * implementation read format (ANGLE Metal), else `RGBA/FLOAT` through a `width × height × 4` scratch it
+   * allocates once.
    */
-  private readonly rgbaScratch: Float32Array | null;
+  private readonly readback: PositionReadback;
 
   /**
    * Per-node pinned-flag texture (r8unorm, one byte per node; 255 = held, 0 = free) — the GPU
@@ -226,8 +226,7 @@ export class GpuForceLayout {
     const readFbo1 = makeReadFbo();
     this.pos.swap(); // restore to initial state
     this.readFbos = [readFbo0, readFbo1];
-    // Both parities wrap an rg32f texture, so one read-format query covers them.
-    this.rgbaScratch = readsRG(device, readFbo0) ? null : new Float32Array(width * height * 4);
+    this.readback = new PositionReadback(device, width, height);
 
     // Force accumulation texture — cleared each tick, written by force passes.
     this.forceTex = device.createTexture({
@@ -531,10 +530,7 @@ export class GpuForceLayout {
    */
   readPositions(out: Float32Array): void {
     // Reuse the pre-created readback FBO for the current read-side texture (no per-call alloc).
-    const pixels = readbackFloatFboReuse(
-      this.device, this.readFbos[this.parity]!, this.width, this.count, this.rgbaScratch ?? undefined,
-    );
-    out.set(pixels);
+    this.readback.read(this.parity === 0 ? this.readFbos[0] : this.readFbos[1], this.count, out);
   }
 
   /**
@@ -544,7 +540,7 @@ export class GpuForceLayout {
    * positions that tick started from, which is what the flat-equivalence contract compares.
    */
   readForces(out: Float32Array): void {
-    out.set(readbackFloatFboReuse(this.device, this.forceFbo, this.width, this.count));
+    this.readback.read(this.forceFbo, this.count, out);
   }
 
   destroy(): void {
