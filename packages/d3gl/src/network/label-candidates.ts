@@ -317,3 +317,25 @@ export function descendingByKey(ids: Uint32Array, keys: Float64Array, length: nu
     return top;
   };
 }
+
+/**
+ * Lazy exact top-k over candidates held in a meaningful order — the LOD label path's in-view
+ * frontier, which is not id-ascending: pops `list`'s ids by `keyOf` **descending, ties in list
+ * order**, precisely the sequence the replaced stable `cand.sort((a, b) => key(b) - key(a))`
+ * produced. `keyOf` runs once per candidate (the comparator sort ran it twice per comparison, and
+ * the LOD accessor allocates a hit datum per call), then {@link descendingByKey} ranks list
+ * positions held in `rank` (engine-owned scratch, reused). `list` is left untouched.
+ */
+export function descendingInListOrder(list: CandidateList, keyOf: (id: number) => number, rank: CandidateList): () => number {
+  const n = list.length;
+  const ids = list.ids;
+  rank.clear();
+  for (let i = 0; i < n; i++) rank.push(i);
+  const keys = rank.keysFor(n);
+  for (let i = 0; i < n; i++) keys[i] = keyOf(ids[i]!);
+  const next = descendingByKey(rank.ids, keys, n);
+  return () => {
+    const at = next();
+    return at < 0 ? -1 : ids[at]!;
+  };
+}

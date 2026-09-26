@@ -12,7 +12,7 @@ import { positionTransition, type PositionTransition } from "./transition.js";
 import { moduleColors, type ModulePathNode, type ModuleColorOptions } from "./module-colors.js";
 import { physicalPieWedges, type PhysicalPieWedges, type PieWedgeOptions } from "./pie.js";
 import { rosettePositions } from "./rosette.js";
-import { gatherCandidates, descendingByKey, CandidateList, type CandidateSource } from "./label-candidates.js";
+import { gatherCandidates, descendingByKey, descendingInListOrder, CandidateList, type CandidateSource } from "./label-candidates.js";
 import type { StateNetworkGraph } from "./state-graph.js";
 import { startNestedWorkerLayout, startWorkerLayout, type WorkerLayoutHandle } from "./worker-transport.js";
 import { startGpuLayout } from "./gpu/gpu-transport.js";
@@ -777,6 +777,10 @@ export class Network extends BaseEngine {
   /** Reusable candidate-id scratch for {@link refreshLabels} (retained typed buffers — the gather
    *  allocates nothing per frame in the steady state). */
   private readonly labelCand = new CandidateList();
+  /** The LOD twin of {@link labelCand}: the in-view frontier ids (frontier order), plus the list-position
+   *  scratch {@link descendingInListOrder} ranks them in when a `max` cap applies. */
+  private readonly lodLabelCand = new CandidateList();
+  private readonly lodLabelRank = new CandidateList();
   /** Engine-owned {@link superEdges} scratch (#210): reused every LOD emit so the per-frame gather is
    *  O(frontier + drawn super-edges) — no O(tree.size) allocation per zoom frame. Shared by the WebGL
    *  lane emit and the retained-Scene registration (they never run concurrently; outputs never alias it). */
@@ -1195,19 +1199,30 @@ export class Network extends BaseEngine {
       const lane = this.instancedLanes.get(this.NET_LANE);
       const frontier = lane ? lane.lane.visible : this.computeFrontier(tree, this.resolvedStyleCached(this.graph));
       const fade = this.fadeAlpha; // set by the cut above (lane emit, or the computeFrontier just run)
-      const cand: number[] = [];
+      const cand = this.lodLabelCand;
+      cand.clear();
       for (let i = 0; i < frontier.length; i++) { const g = frontier[i]!; if (inView(tree.cx[g]!, tree.cy[g]!)) cand.push(g); }
       const impOf = opts.importanceOf;
-      if (cand.length > max) cand.sort((a, b) => (impOf ? impOf(b, this.lodDatum(tree, b)) - impOf(a, this.lodDatum(tree, a)) : tree.weight[b]! - tree.weight[a]!));
-      for (const g of cand) {
+      /** Place glyph `g`'s label; true once the `max` cap is reached. */
+      const place = (g: number): boolean => {
         const info = this.lodDatum(tree, g);
         const text = labelText(opts, g, info);
-        if (!text) continue; // labelOf returned null/"" — this glyph has no label
+        if (!text) return false; // labelOf returned null/"" — this glyph has no label
         // Importance also decides who WINS a collision, not just who makes a `max` cap — so it is
         // resolved for every candidate (the frontier's own weight when no accessor is given).
         const priority = impOf ? impOf(g, info) : tree.weight[g] ?? 0;
         anchors.push(anchorFor(g, tree.cx[g] ?? 0, tree.cy[g] ?? 0, text, priority, opts.offset, fade ? fade[g] : undefined));
-        if (anchors.length >= max) break;
+        return anchors.length >= max;
+      };
+      if (cand.length > max) {
+        // Exact top-`max` in the order the old stable sort gave (importance desc, ties in frontier
+        // order), without its O(C log C) comparisons — each of which ran `importanceOf` on two freshly
+        // allocated hit datums. Keys are resolved once per candidate, then a lazy heap pops ~`max`.
+        const next = descendingInListOrder(cand, impOf ? (g) => impOf(g, this.lodDatum(tree, g)) : (g) => tree.weight[g] ?? 0, this.lodLabelRank);
+        for (let g = next(); g >= 0; g = next()) if (place(g)) break;
+      } else {
+        const ids = cand.ids;
+        for (let i = 0; i < cand.length; i++) if (place(ids[i] ?? 0)) break;
       }
     } else {
       // No-LOD: rank the nodes in view by strength (weighted degree). The full graph is drawn.
