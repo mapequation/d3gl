@@ -324,14 +324,20 @@ function packLevels(width: number, height: number, top: number): Pick<TileAtlas,
 }
 
 /**
- * A segment's `segInfo` texel (spec §5.2): `(start, count, x | y << 16, rootLevel | flags << 8)`. A
- * tiled segment's root is level `log2 side` at cell `(x >> rootLevel, y >> rootLevel)`; an exact
- * segment has no tile (origin and root level 0).
+ * A segment's `segInfo` texel (spec §5.2): `(start, count, x | y << 16, rootLevel | flags << 8 |
+ * side << 16)`. A tiled segment's root is level `rootLevel = log2 side` at cell `(x >> rootLevel,
+ * y >> rootLevel)`; an exact segment has no tile (origin, root level and side 0).
+ *
+ * The side is stored as well as its log2 on purpose: the scatter and the traversal both turn it into
+ * the grid's float `G` with a plain `float(side)`, never `float(1 << rootLevel)`. The #251 near field
+ * needs the two shaders to round the cell centre `lo + (cell + 0.5) / G · boxSide` bit for bit alike,
+ * and a visible power of two lets a fast-math compiler reassociate that expression differently in one
+ * of them (measured on ANGLE Metal; see AGENTS.md).
  */
 export function segmentInfo(seg: SlotRange, tile: Tile | null): [number, number, number, number] {
   if (!tile) return [seg.start, seg.count, 0, SEGMENT_EXACT << 8];
   const rootLevel = 31 - Math.clz32(tile.side);
-  return [seg.start, seg.count, (tile.x | (tile.y << 16)) >>> 0, rootLevel | (SEGMENT_HAS_TILE << 8)];
+  return [seg.start, seg.count, (tile.x | (tile.y << 16)) >>> 0, (rootLevel | (SEGMENT_HAS_TILE << 8) | (tile.side << 16)) >>> 0];
 }
 
 /**

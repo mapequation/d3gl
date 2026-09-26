@@ -92,7 +92,7 @@ precision highp sampler2D;
 precision highp usampler2D;
 
 uniform highp sampler2D u_pos;
-uniform highp usampler2D u_segInfo;  // (start, count, x | y << 16, rootLevel | flags << 8) per segment
+uniform highp usampler2D u_segInfo;  // (start, count, x | y << 16, rootLevel | flags << 8 | side << 16)
 uniform highp sampler2D u_segParam;  // (repulsion, centering, softening, alpha0) per segment
 uniform int   u_count;
 uniform int   u_width;
@@ -131,7 +131,8 @@ vec2 tileRepulsion(vec2 pi, uvec4 info, vec4 b, float repulsion, float eps) {
   float boxSide = 2.0 * hlfMax;
 
   int rootLevel = int(info.w & 255u);
-  int grid = 1 << rootLevel;               // G_s
+  // G_s as an opaque integer, converted exactly as the scatter does (segmentInfo: never 1 << level).
+  int grid = int(info.w >> 16);
   float G = float(grid);
   ivec2 origin = ivec2(int(info.z & 65535u), int(info.z >> 16));
 

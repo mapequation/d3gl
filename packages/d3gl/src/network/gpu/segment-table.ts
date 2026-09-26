@@ -28,7 +28,7 @@ const NEAREST: SamplerProps = { minFilter: "nearest", magFilter: "nearest" };
  *
  * | texture | format | channels | written |
  * |---|---|---|---|
- * | `info`  | `rgba32uint`  | start, count, tile `x \| y << 16`, `rootLevel \| flags << 8` ({@link segmentInfo}) | once |
+ * | `info`  | `rgba32uint`  | start, count, tile `x \| y << 16`, `rootLevel \| flags << 8 \| side << 16` ({@link segmentInfo}) | once |
  * | `param` | `rgba32float` | repulsion, centering, softening, alpha0 | once |
  * | `stats` | `rgba32float` | Σx, Σy, Σ\|v\|, count | per tick, by the range query |
  * | `box`   | `rgba32float` | maxX, maxY, −minX, −minY | per tick, by the range query |
@@ -42,7 +42,7 @@ export class SegmentTable {
   readonly size: number;
   /** Atlas width of every table texture. */
   readonly width: number;
-  /** `(start, count, x | y << 16, rootLevel | flags << 8)` per segment. */
+  /** `(start, count, x | y << 16, rootLevel | flags << 8 | side << 16)` per segment. */
   readonly info: Texture;
   /** `(repulsion, centering, softening, alpha0)` per segment. */
   readonly param: Texture;

@@ -373,11 +373,13 @@ describe("segment table rows — validation, per-slot segment ids, the info texe
     );
   });
 
-  it("segmentInfo packs (start, count, x | y << 16, rootLevel | flags << 8)", () => {
+  it("segmentInfo packs (start, count, x | y << 16, rootLevel | flags << 8 | side << 16)", () => {
     expect(segmentInfo({ start: 7, count: 20 }, null)).toEqual([7, 20, 0, SEGMENT_EXACT << 8]);
     expect(segmentInfo({ start: 100, count: 5000 }, { x: 256, y: 1024, side: 128 })).toEqual([
-      100, 5000, 256 | (1024 << 16), 7 | (SEGMENT_HAS_TILE << 8),
+      100, 5000, 256 | (1024 << 16), 7 | (SEGMENT_HAS_TILE << 8) | (128 << 16),
     ]);
+    // The largest tile keeps its side intact in the top bits.
+    expect((segmentInfo({ start: 0, count: 1 }, { x: 0, y: 0, side: 1024 })[3] >>> 16)).toBe(1024);
   });
 
   it("softening: the world frame keeps the flat 1e-2 on both paths; the unit frame uses the CPU nested values", () => {
