@@ -5,21 +5,22 @@
  *
  * Each frame runs, in this order:
  *
- * 1. **Harvest.** Poll the budget fences ({@link FrameBudget.beginFrame}); if the frame that copied the
- *    last readback has completed, `getBufferSubData` it into `graph.positions`. A read that is not ready
- *    is never forced, and it happens before any encode, so nothing it could wait on is freshly queued.
- * 2. **Repaint (throttled).** When a harvest has landed and at least `max(minFrameMs, 2 × repaint cost)`
- *    has passed since the previous one, `onFrame` runs — in this same frame, so the engine repaints the
- *    harvested positions with no extra frame of delay, and its draw calls reach the GPU before this
- *    frame's layout work. The repaint cost is the larger of its main-thread time and the **stall** it
+ * 1. **Harvest + repaint (throttled).** Poll the budget fences ({@link FrameBudget.beginFrame}). If the
+ *    frame that copied the last readback has completed *and* at least `max(minFrameMs, 2 × repaint cost)`
+ *    has passed since the previous repaint, `getBufferSubData` the copy into `graph.positions` and run
+ *    `onFrame` right away — in this same frame, so the engine repaints the harvested positions with no
+ *    extra frame of delay, its draw calls reach the GPU before this frame's layout work, and
+ *    `graph.positions` only ever changes right before a repaint (a finished copy waits in its PBO until
+ *    the repaint is due). A read that is not ready is never forced, and it happens before any encode, so
+ *    nothing it could wait on is freshly queued. The repaint cost is the larger of its main-thread time and the **stall** it
  *    caused: the browser holds the next animation frame until the GPU has drawn the canvas, so the rAF
  *    gap after a repaint frame, less the usual interval, is what the render cost the GPU. Twice that caps
  *    the time spent on layout repaints at about 50% on both sides — the main thread and the GPU the
  *    layout shares with the renderer. A cheap render causes no stall and the term is inert.
- * 3. **Encode.** Work items (P, F_0 … F_{B−1}, I) while the {@link FrameBudget} admits them: at most 2
+ * 2. **Encode.** Work items (P, F_0 … F_{B−1}, I) while the {@link FrameBudget} admits them: at most 2
  *    frames of layout work in flight, a GPU budget of `min(10 ms, 0.6 × rAF interval)` per frame, and at
  *    most 2 ms of encode time. A tick may span frames; its result does not depend on how it was sliced.
- * 4. **Copy + fence.** On the repaint's cadence (reading back more often than repainting is waste), and
+ * 3. **Copy + fence.** On the repaint's cadence (reading back more often than repainting is waste), and
  *    when the one PBO is free, copy the positions into it; then insert the frame's single budget fence,
  *    which doubles as the copy's fence.
  *
@@ -165,9 +166,9 @@ export class GpuStream {
   /** Ticks of the last copy issued, and when it was issued (rAF time). */
   private copiedTicks = 0;
   private lastCopyAt = Number.NEGATIVE_INFINITY;
-  /** A harvest is waiting for its repaint, and whether it is the final one. */
-  private repaintDue = false;
-  private repaintFinal = false;
+  /** Whether the pending copy's frame has completed, and how long (rAF time) copies take to get there. */
+  private copyReady = false;
+  private readyLatencyMs = 1000 / 60;
   private lastRepaintAt = Number.NEGATIVE_INFINITY;
   private lastRepaintMs = 0;
   /** The rAF gap after the last repaint frame, less the median interval: what the render cost the GPU. */
@@ -271,35 +272,38 @@ export class GpuStream {
     if (this.repaintedPrev) this.lastStallMs = Math.max(0, now - this.prevNow - this.budget.intervalMs);
     this.prevNow = now;
     this.repaintedPrev = false;
+    if (this.readback.pending && !this.copyReady && this.copyFrame <= this.budget.completedFrame) {
+      this.copyReady = true;
+      this.readyLatencyMs = now - this.lastCopyAt;
+    }
+    // A finished copy is harvested — and repainted — once the repaint is due; the final one at once.
     let harvested = false;
-    if (this.readback.pending && this.copyFrame <= this.budget.completedFrame) {
+    let repaintMs = 0;
+    const t1 = performance.now();
+    if (
+      this.readback.pending &&
+      this.copyReady &&
+      (this.copyFinal || this.frameEvery !== undefined || this.throttleOpen(now, this.lastRepaintAt))
+    ) {
       harvested = true;
       if (!this.readback.harvest(this.graph.positions, this.stats)) {
         this.fail();
         return;
       }
-      this.repaintDue = true;
-      this.repaintFinal = this.copyFinal;
+      const final = this.copyFinal;
       if (this.copyTicks >= this.iterations && this.mode !== "run") this.settle();
-    }
-    const t1 = performance.now();
-
-    // 2. Repaint — throttled; the final positions always paint.
-    let repaintMs = 0;
-    if (this.repaintDue && (this.repaintFinal || this.frameEvery !== undefined || this.throttleOpen(now, this.lastRepaintAt))) {
-      const final = this.repaintFinal;
-      this.repaintDue = false;
-      this.repaintFinal = false;
+      const r0 = performance.now();
       this.lastRepaintAt = now;
       this.onFrame();
-      repaintMs = performance.now() - t1;
+      repaintMs = performance.now() - r0;
       this.lastRepaintMs = repaintMs;
       this.repaintedPrev = true;
       if (this.stopped) return; // the repaint superseded this layout
       if (final) this.finish();
     }
+    const harvestMs = performance.now() - t0 - repaintMs;
 
-    // 3. Encode work items within the budget.
+    // 2. Encode work items within the budget.
     const t2 = performance.now();
     let items = 0;
     const open = this.budget.open();
@@ -314,7 +318,7 @@ export class GpuStream {
       }
     }
 
-    // 4. The readback copy (on the repaint cadence), then the frame's one budget fence.
+    // 3. The readback copy (on the repaint cadence), then the frame's one budget fence.
     const copied = this.copyDue(now);
     if (copied) {
       this.readback.issue(this.layout);
@@ -322,6 +326,7 @@ export class GpuStream {
       this.copyFinal = this.finishing;
       this.copiedTicks = this.ticksDone;
       this.lastCopyAt = now;
+      this.copyReady = false;
     }
     const frame = this.budget.endFrame(repaintMs > 0);
     if (copied) this.copyFrame = frame;
@@ -329,7 +334,7 @@ export class GpuStream {
 
     if (observers.size > 0) {
       sample.now = now;
-      sample.harvestMs = t1 - t0;
+      sample.harvestMs = harvestMs;
       sample.repaintMs = repaintMs;
       sample.encodeMs = t3 - t2;
       sample.items = items;
@@ -348,9 +353,9 @@ export class GpuStream {
     else this.looping = false;
   };
 
-  /** Whether the loop still has something to do: ticks to encode, a copy to harvest, a repaint due. */
+  /** Whether the loop still has something to do: ticks to encode, or a copy to harvest and repaint. */
   private active(): boolean {
-    return (this.mode !== "idle" && !this.failed) || this.finishing || this.readback.pending || this.repaintDue;
+    return (this.mode !== "idle" && !this.failed) || this.finishing || this.readback.pending;
   }
 
   /** Whether the current mode has ticks left to encode (a started tick is always finished). */
@@ -416,14 +421,18 @@ export class GpuStream {
     }
   }
 
-  /** Whether to copy positions this frame: the PBO is free and a repaint's worth of time (or ticks) passed. */
+  /**
+   * Whether to copy positions this frame: the PBO is free, there are new ticks, and the copy would be
+   * ready (after the usual copy → ready latency) when the next repaint is due — so a harvested frame is
+   * about one frame old, not a whole repaint interval.
+   */
   private copyDue(now: number): boolean {
     if (this.readback.pending) return false;
     // The final copy goes out as soon as the PBO is free; its harvest clears `finishing` (finish()).
     if (this.finishing) return true;
     if (this.ticksDone <= this.copiedTicks) return false;
     if (this.frameEvery !== undefined) return this.ticksDone - this.copiedTicks >= this.frameEvery;
-    return this.throttleOpen(now, this.lastCopyAt);
+    return this.throttleOpen(now + this.readyLatencyMs, this.lastRepaintAt);
   }
 
   /**
@@ -481,7 +490,6 @@ export class GpuStream {
     this.failed = true;
     this.mode = "idle";
     this.finishing = false;
-    this.repaintDue = false;
     this.looping = false;
     const [sx, sy, sv, count, maxX, maxY, negMinX, negMinY] = this.stats;
     console.warn(
