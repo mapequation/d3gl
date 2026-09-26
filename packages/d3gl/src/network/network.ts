@@ -2589,8 +2589,11 @@ export class Network extends BaseEngine {
         heldPos[k * 2] = px; heldPos[k * 2 + 1] = py;
       }
     };
+    // The grab maps through the DRAWN view (`t0`: what the grab's hit was picked against); each move through
+    // the view the next frame draws, so a pinch/scroll mid-drag — even one whose frame has not run yet (#367)
+    // — keeps the held set under the cursor at the drawn view.
     const setDelta = (mx: number, my: number): void => {
-      const t = this.transform; // read live so a pinch/scroll mid-drag still maps screen → world
+      const t = this.latestTransform();
       dx = (mx - t.x) / t.k - worldStartX;
       dy = (my - t.y) / t.k - worldStartY;
     };
@@ -3068,12 +3071,13 @@ export class Network extends BaseEngine {
     if (ending) this.syncScreenGeometry();
   }
 
-  /** Set the view. An explicit view — a zoom-to-module, a saved camera — also takes over a streaming
-   *  fit-on-layout, as a user gesture does: the next streamed frame (or the settle) must not reframe away
-   *  from it. The fit itself never comes through here ({@link fitViewToLayout} sets the view directly). */
-  override setTransform(t: ViewTransform): this {
+  /** Adopt a view. An explicit view — a gesture frame, a zoom-to-module, a saved camera — also takes over a
+   *  streaming fit-on-layout: the next streamed frame (or the settle) must not reframe away from it. Every
+   *  `setTransform` and every coalesced gesture frame comes through here, including one that draws together
+   *  with a streamed frame (#367). The fit itself never does ({@link fitViewToLayout} sets the view directly). */
+  protected override adoptTransform(t: ViewTransform): void {
     this.fitOnLayout = false;
-    return super.setTransform(t);
+    super.adoptTransform(t);
   }
 
   /** With zoom enabled, a programmatic view change (a zoom-to) settles like a gesture's end: the Canvas/SVG

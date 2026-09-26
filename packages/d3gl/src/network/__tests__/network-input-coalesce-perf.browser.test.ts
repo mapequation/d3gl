@@ -59,6 +59,10 @@ vi.mock("../lod.js", async (importOriginal) => {
  *   - the coalesced frame after a burst costs ONE pass: at most 2× (+2 ms) the frame after a single event
  *     at the same state (a programmatic `setTransform` at the drawn view for pan/zoom, one move's frame for
  *     a drag, one streamed frame for the mix) — a pass per event would be 8-16× — under an absolute ceiling.
+ *     Except LOD OFF pan/zoom, which is COUNT-ONLY here: its frame re-emits nothing (the full-detail lane is
+ *     static) and only renders, and `render()` is counted, not drawn (see {@link Probe}), so both its frame
+ *     and its reference read ~0 ms and a clock would assert nothing. Its one-render-per-frame count above is
+ *     the signature; network-sweep-perf.browser.test.ts owns that draw's CPU cost. Its handlers are timed.
  */
 
 const N = perfN(250_000, { max: 250_000 });
@@ -366,10 +370,17 @@ describe(`network() input coalescing — ≤1 frontier pass per frame at ${N.toL
           }
         });
 
-        it(`${kind}: handlers cost a constant per event; the burst's frame costs one pass`, () => {
+        // LOD OFF pan/zoom: the frame only renders, and render() is counted here, so its clock is ~0 on both
+        // sides — count-only (see the header): time the handlers, leave the frame to the count above.
+        const countOnlyFrame = name === "LOD OFF" && (kind === "wheel" || kind === "pan");
+        const title = countOnlyFrame
+          ? `${kind}: handlers cost a constant per event (the frame is count-only: a counted render)`
+          : `${kind}: handlers cost a constant per event; the burst's frame costs one pass`;
+        it(title, () => {
           const bs = legs[name]?.bursts[kind] ?? [];
           expect(bs).toHaveLength(ROUNDS);
           expect(best(bs.map((b) => b.handlerMs)), "input handlers did per-event work").toBeLessThan(HANDLER_MS_PER_EVENT * BURST);
+          if (countOnlyFrame) return;
           const frame = best(bs.map((b) => b.frameMs));
           const one = best(bs.map((b) => b.oneMs));
           expect(frame, "the burst's frame cost more than one pass").toBeLessThan(FRAME_RATIO * one + FRAME_SLACK_MS);

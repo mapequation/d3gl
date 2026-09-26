@@ -419,7 +419,7 @@ guard owns the serialize budget: one DOM node per drawable buys parse time, not 
 | **`network()` module boundaries** (#329), sweep on vs off + every module open | **WebGL** | `network/__tests__/network-module-boundary-perf.browser.test.ts` | 50k nodes | `PERF_BROWSER_N` (max 200k) |
 | **`network()` streaming fit** (#327), per streamed frame, fit on vs off at an equal view, LOD on **and** off; box once per frame, never on zoom frames or after release; no extra LOD cut or style resolution per fitted frame | **WebGL** | `network/__tests__/network-fit-stream-perf.browser.test.ts` | 50k nodes | `PERF_BROWSER_N` (max 200k) |
 | **`network()` programmatic `setTransform` with zoom enabled** (#309), LOD on **and** off: one re-cut + one Scene rebuild per call, no gesture boundary; zoom-free calls rebuild nothing | Canvas + SVG | `network/__tests__/network-vector-zoom-perf.browser.test.ts` | Canvas 20k / SVG 10k nodes | `PERF_BROWSER_N` (Canvas max 100k, SVG max 30k) |
-| **`network()` pan/zoom + node-drag INPUT** (#367): wheel, pan, drag and wheel+stream+drag bursts through the real d3-zoom / pointer listeners, LOD off, aggregate frontier **and** all leaves visible; no cut or render inside any handler, exactly one render + ≤1 cut per frame at the latest transform, handlers O(1) per event, the burst's frame ≤ 2× one event's | **WebGL** (draw counted, not rasterised — see below) | `network/__tests__/network-input-coalesce-perf.browser.test.ts` | 250k nodes / 748k edges, whole graph in view | `PERF_BROWSER_N` (max 250k) |
+| **`network()` pan/zoom + node-drag INPUT** (#367): wheel, pan, drag and wheel+stream+drag bursts through the real d3-zoom / pointer listeners, LOD off, aggregate frontier **and** all leaves visible; no cut or render inside any handler, exactly one render + ≤1 cut per frame at the latest transform, handlers O(1) per event, the burst's frame ≤ 2× one event's (LOD-off pan/zoom frame: **count-only** — it only renders, and the render is counted; `network-sweep-perf` owns that draw's cost) | **WebGL** (draw counted, not rasterised — see below) | `network/__tests__/network-input-coalesce-perf.browser.test.ts` | 250k nodes / 748k edges, whole graph in view | `PERF_BROWSER_N` (max 250k) |
 | multi pass-through: FBO count + gesture skip | **WebGL** | `map/passthrough-multi-perf.browser.test.ts` | 25k ×2 layers | `PERF_BROWSER_N` (max 50k) |
 | label placement (`cullLabels`) | — | `labels/__tests__/label-cull-perf.test.ts` | 200k candidates, dense **and** spread | `BENCH_LABEL_CULL` |
 | **`network.labels()` per-frame**, LOD on **and** off, + capped LOD top-k (`importanceOf` once per candidate) | **WebGL** | `network/__tests__/network-labels-perf.browser.test.ts` | 20k nodes, uncapped + `max: 50` | `PERF_BROWSER_N` (max 50k) |
@@ -548,7 +548,15 @@ correct:
 
 - **The drawn state is what `pick` answers against.** `this.transform` and each lane's `visible` set move
   only when a frame draws, so a pick between an event and its frame hits what is on screen.
-- **A programmatic `setTransform` draws at once** and drops a pending gesture transform (the latest wins).
+- **A programmatic view change draws at once** and drops a pending gesture transform (the latest wins). The
+  drop lives in `syncZoomToView()`: once d3-zoom is re-seeded to the current view, a transform it reported
+  earlier is stale, so a subclass that sets the view directly (the network's streaming fit) drops it too.
+- **A gesture frame that draws with a redraw skips `setTransform`** (the subclass's `drawFrame()` renders), so
+  put what every view change must do to subclass state in an `adoptTransform()` override, not a
+  `setTransform` one (the network releases a streaming fit there), and have `drawFrame()` re-emit every
+  dynamic lane it owns and re-place its labels.
+- **Map the pointer through `latestTransform()`**, not `this.transform`, where input places something in world
+  space (a drag move between a wheel tick and that tick's frame); `pick` and a grab's hit use the drawn view.
 - **Draw, don't defer, where you already are in a frame or must settle**: a d3-zoom transition tick (its
   source is the `dblclick`), a subclass's own rAF loop (a position transition, a force-drag tick) and a
   gesture's `end` call `flushFrame()`, which draws what is pending right now instead of a frame late.

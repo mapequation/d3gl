@@ -1393,19 +1393,8 @@ export abstract class BaseEngine {
     }
   }
   setTransform(t: ViewTransform): this {
-    this.transform = t;
-    // A PROGRAMMATIC view change (fit, zoomToModule, a centering translate) must carry d3-zoom's
-    // internal transform with it. `enableZoom` seeds that transform once, at call time; without this
-    // the next wheel/drag computes its delta from the stale seed and the view visibly snaps back
-    // before zooming (#202). Skipped during a gesture — that setTransform came FROM d3-zoom and is
-    // already in step, and re-seeding there would add a `behavior.transform` apply per zoom frame.
-    // No-ops when zoom isn't enabled.
     const programmatic = !this.inZoomGesture;
-    if (programmatic) {
-      this.frameZoom = null; // a programmatic view is newer than any gesture transform still waiting for its frame
-      this.syncZoomToView();
-    }
-    this.handle?.backend.setTransform(t);
+    this.adoptTransform(t);
     for (const [name, entry] of this.instancedLanes) if (entry.dynamic) this.emitInstancedLane(name);
     for (const spec of this.specs) if (spec.declutter) this.declutterLayer(spec, t);
     // Refresh view-tracking overlays/labels BEFORE the render, so a backend that draws labels into the
@@ -1423,6 +1412,34 @@ export abstract class BaseEngine {
     // engine cannot tell when a sequence ends, so it does nothing extra.
     if (programmatic && this.zoomBehavior && !this.interacting) this.afterProgrammaticTransform();
     return this;
+  }
+
+  /**
+   * The state half of a view change: set `this.transform`, move the backend's view and, for a PROGRAMMATIC
+   * change (fit, zoomToModule, a centering translate), carry d3-zoom's internal transform with it.
+   * `enableZoom` seeds that transform once, at call time; without the re-seed the next wheel/drag computes
+   * its delta from the stale seed and the view visibly snaps back before zooming (#202). Skipped for a
+   * gesture frame: that view came FROM d3-zoom and is already in step, and re-seeding there would add a
+   * `behavior.transform` apply per zoom frame. No emit, no render.
+   *
+   * Shared by {@link setTransform} and a coalesced gesture frame that hands its draw to {@link drawFrame}
+   * ({@link runFrame}). So a subclass overrides THIS, not `setTransform`, for what every view change —
+   * programmatic or a gesture frame — must do to its own state (the network releases a streaming fit).
+   */
+  protected adoptTransform(t: ViewTransform): void {
+    this.transform = t;
+    if (!this.inZoomGesture) this.syncZoomToView();
+    this.handle?.backend.setTransform(t);
+  }
+
+  /**
+   * The view the next frame draws: the pan/zoom transform d3-zoom last reported while it still waits for its
+   * frame, else the drawn one. For input that maps the pointer through the view the user is moving to — a
+   * drag move between a wheel tick and that tick's frame — so what it places lands under the cursor once the
+   * frame draws. Anything that answers "what is on screen" (`pick`, a grab's hit) reads `this.transform`.
+   */
+  protected latestTransform(): ViewTransform {
+    return this.frameZoom ?? this.transform;
   }
 
   /**
@@ -1480,8 +1497,10 @@ export abstract class BaseEngine {
   /**
    * The subclass redraw a {@link requestRedraw} asked for: bring every view-dependent output (lane emits,
    * labels) up to date at `this.transform` and render. It is its frame's only draw: when a gesture transform
-   * is pending as well, the frame sets that transform first and runs this in place of the transform's own
-   * lane emit + render (and without a `setTransform` call). Default: nothing to redraw.
+   * is pending as well, the frame adopts that transform first ({@link adoptTransform}, whose overrides run)
+   * and runs this in place of the rest of `setTransform` — its dynamic-lane re-emit, {@link afterTransform}
+   * and render, and any `setTransform` override. So an override must re-emit every dynamic lane it owns and
+   * re-place its view-tracking labels itself. Default: nothing to redraw.
    */
   protected drawFrame(): void {}
 
@@ -1507,8 +1526,7 @@ export abstract class BaseEngine {
     this.inZoomGesture = true;
     try {
       if (redraw) {
-        this.transform = t;
-        this.handle?.backend.setTransform(t);
+        this.adoptTransform(t);
         for (const spec of this.specs) if (spec.declutter) this.declutterLayer(spec, t);
         this.drawFrame();
       } else {
@@ -1517,7 +1535,7 @@ export abstract class BaseEngine {
     } finally {
       this.inZoomGesture = false;
     }
-    this.zoomListener?.(t);
+    this.zoomListener?.(this.transform); // the view drawn, which a subclass's frame may have reframed
   }
 
   /** Called by {@link setTransform} just before the render (zoom frame or programmatic), after lanes
@@ -1873,6 +1891,9 @@ export abstract class BaseEngine {
    * this after such a change keeps the gesture continuous. No-op when zoom isn't enabled.
    */
   protected syncZoomToView(): void {
+    // d3-zoom is about to hold the current view: a gesture transform still waiting for its frame is older
+    // than it, and drawing it later would put the view and d3-zoom out of step (#202, #367).
+    this.frameZoom = null;
     const sel = this.zoomSel;
     const behavior = this.zoomBehavior;
     if (!sel || !behavior) return;
