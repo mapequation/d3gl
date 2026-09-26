@@ -41,7 +41,7 @@ const MIN_SPEEDUP = Number(process.env.PERF_DRAG_MIN_SPEEDUP) || 100;
 /** A clustered graph (ring backbone + deterministic short-range chords) laid out by the real
  *  multilevel seed, coarsened into the real LOD tree — the fixture shape of `lod-perf.bench.test.ts`,
  *  with local chords so the super-edge pair set stays bounded at 1M leaves. */
-function seededClusteredTree(n: number): { tree: LODTree; graph: NetworkGraph } {
+function seededClusteredTree(n: number, fit = true): { tree: LODTree; graph: NetworkGraph } {
   let s = 7 >>> 0;
   const rng = (): number => ((s = (s * 1664525 + 1013904223) >>> 0) / 4294967296);
   const source: number[] = [];
@@ -55,8 +55,9 @@ function seededClusteredTree(n: number): { tree: LODTree; graph: NetworkGraph } 
   // Fit the layout into the 2000-unit box the Float32 tolerance below is calibrated on. The seed lays
   // out at the force equilibrium's scale (~14k across at 50k nodes); past |x| = 4096 the Float32 ulp
   // (≥ 0.0005) exceeds a big aggregate's per-move centroid step (2 / count), so those increments are
-  // lost outright rather than accumulated — a separate precision limit of the incremental update.
-  fitInto(g.positions, 2000);
+  // lost outright rather than accumulated — a separate precision limit of the incremental update,
+  // kept visible by the known-failure leg at the end of this file.
+  if (fit) fitInto(g.positions, 2000);
   const tree = buildLODTree(g, {});
   return { tree, graph: g };
 }
@@ -219,6 +220,33 @@ describe("#211 incremental LOD geometry during node-drag", () => {
     expect(perMove).toBeLessThan(fullMedian / 10);
     expect(perMove).toBeLessThan(5); // absolute ceiling (ms), generous against machine noise
   });
+
+  // Known limit, not a regression of this guard: at the force equilibrium's own scale (|x| > 4096 at
+  // this N) a big aggregate's per-move Float32 centroid increment (2 / count) falls below half an ulp
+  // and is lost instead of accumulated, so the incremental centroids drift past the tolerance above
+  // (~1.2 at a count-8310 aggregate for 100 held leaves × 50 moves) until the exact release pass. The
+  // production layouts sit at that scale (web-NotreDame r95 ≈ 17.5k). `it.fails` keeps the limit in
+  // the suite: it turns red once the incremental update is exact there — then make it a plain `it`.
+  it.fails("at the equilibrium scale the incremental centroids stay within tolerance during a drag (known Float32 limit)", () => {
+    const eq = seededClusteredTree(N, false);
+    const eqParent = parentOf(eq.tree);
+    computeLODGeometry(eq.tree, eq.graph, radii, eq.graph.strength, undefined, colors);
+    const held = Array.from({ length: 100 }, (_, k) => (k * 37) % N);
+    for (let m = 0; m < MOVES; m++) {
+      for (const i of held) {
+        eq.graph.positions[i * 2] = eq.graph.positions[i * 2]! + 2;
+        eq.graph.positions[i * 2 + 1] = eq.graph.positions[i * 2 + 1]! + 1;
+      }
+      updateLODPositionsForLeaves(eq.tree, eq.graph.positions, held, eqParent);
+    }
+    const ref: LODTree = { ...eq.tree, cx: new Float32Array(eq.tree.size), cy: new Float32Array(eq.tree.size), extent: new Float32Array(eq.tree.size), count: new Uint32Array(eq.tree.size) };
+    computeLODPositions(ref, eq.graph.positions);
+    let maxCentroidErr = 0;
+    for (let g = 0; g < eq.tree.size; g++) {
+      maxCentroidErr = Math.max(maxCentroidErr, Math.abs(eq.tree.cx[g]! - ref.cx[g]!), Math.abs(eq.tree.cy[g]! - ref.cy[g]!));
+    }
+    expect(maxCentroidErr).toBeLessThan(0.1);
+  }, 60_000);
 });
 
 describe("#211 drag-move LOD geometry bench (env-gated)", () => {
