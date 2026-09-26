@@ -54,8 +54,8 @@ export interface PlotProps {
   backend?: BackendType;
   /** Enable scroll-to-zoom / drag-to-pan, clamped to this `[min, max]` scale extent. */
   zoom?: [number, number];
-  /** Fires after each user pan/zoom with the current view transform (k, x, y) — not for the initial
-   *  view when `zoom` is enabled, and not for a programmatic `setTransform`. */
+  /** Fires after each pan/zoom with the current view transform (k, x, y), and once with the initial
+   *  view when `zoom` is enabled — not for a programmatic `setTransform`. */
   onTransform?: (t: { k: number; x: number; y: number }) => void;
   /** Called once the engine is built, its layers applied, and the first frame drawn. */
   onReady?: (engine: Engine) => void;

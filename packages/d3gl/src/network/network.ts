@@ -642,11 +642,9 @@ export class Network extends BaseEngine {
    * live bounds would under-frame the map and then zoom out as depths land.
    */
   private fitKnownBox: FitBox | null = null;
-  /** The largest leaf radius per resolved style, for the fit's pad ({@link fitViewToLayout}): O(nodes)
-   *  once per style, then read per frame. Weakly keyed, so a replaced style is never kept alive by it. A
-   *  state network's `both` view re-resolves its style on every streamed frame (its dot radius tracks the
-   *  layout scale; {@link applyStateDerivedPositions}), so there the scan runs once per streamed frame, on
-   *  top of that frame's own O(state nodes) style resolution. */
+  /** The largest leaf radius per resolved style with per-node radii, for the fit's pad
+   *  ({@link fitViewToLayout}): O(nodes) once per such style, then read per frame. Weakly keyed, so a
+   *  replaced style is never kept alive by it. A constant radius needs no scan ({@link maxLeafRadius}). */
   private readonly fitRadii = new WeakMap<ResolvedNetworkStyle, number>();
   /** Pending coalesced repaint rAF id (0 = none) for progressive worker frames. */
   private layoutRepaintRaf = 0;
@@ -1790,9 +1788,13 @@ export class Network extends BaseEngine {
     this.syncZoomToView(); // keep the gesture seeded to the framed view so an interaction never jumps
   }
 
-  /** The largest leaf radius of `style`, in its `sizeMode`'s units — O(nodes) once per resolved style
-   *  (once per streamed frame in a state network's `both` view, see {@link fitRadii}). */
+  /** The largest leaf radius of `style` (resolved from the current style options), in its `sizeMode`'s
+   *  units. A constant `nodeRadius` is its own maximum: O(1). That covers the one style re-resolved on every
+   *  streamed frame, a state network's `both` view, whose constant dot radius tracks the layout scale
+   *  ({@link applyStateDerivedPositions}). Per-node radii are scanned once per resolved style, O(nodes). */
   private maxLeafRadius(style: ResolvedNetworkStyle): number {
+    const spec = this.styleOpts.nodeRadius ?? DEFAULT_NODE_RADIUS;
+    if (typeof spec === "number") return Math.max(0, spec);
     let r = this.fitRadii.get(style);
     if (r === undefined) {
       r = 0;

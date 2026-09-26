@@ -1651,8 +1651,9 @@ export abstract class BaseEngine {
    * Enable scroll-to-zoom / drag-to-pan via d3-zoom, clamped to `extent`. The optional
    * `onTransform` callback fires after each `setTransform` during zoom — use it to keep an
    * HTML overlay (e.g. a `LabelLayer`) aligned with the GPU geometry as the view changes.
-   * It fires for user gestures only: not for the view current at enable time (the one last passed
-   * to `setTransform`, identity by default), and not for a programmatic `setTransform`.
+   * It also fires once here, with the view current at enable time (the one last passed to
+   * `setTransform`, identity by default), so the overlay starts in step. It does not fire for a
+   * later programmatic `setTransform`: the caller already knows that view.
    */
   enableZoom(extent: [number, number] = [1, 100], onTransform?: (t: ViewTransform) => void): this {
     this.disableInteraction();
@@ -1699,8 +1700,12 @@ export abstract class BaseEngine {
     // Seed d3-zoom's internal transform from the engine's CURRENT view so a non-identity base
     // (e.g. a centering translate set via setTransform before enableZoom) is respected, and
     // zoom-to-cursor deltas measure from it rather than from identity. The view itself is unchanged,
-    // so this is a silent re-seed: no setTransform, no render, no gesture boundary.
+    // so this is a silent re-seed: no setTransform, no render, no gesture boundary. The subscriber
+    // still learns the view it starts from, as it did when the seed ran the zoom handler — e.g. the
+    // identity a `GeoMap.setProjection` just reset to before re-enabling.
     this.syncZoomToView();
+    const t = this.transform;
+    onTransform?.({ k: t.k, x: t.x, y: t.y });
     this.interactionCleanup = () => { sel.on(".zoom", null); this.zoomSel = null; this.zoomBehavior = null; };
     return this;
   }
