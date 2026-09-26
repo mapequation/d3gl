@@ -344,6 +344,20 @@ async function frameUntil(done: () => boolean, frames: number): Promise<boolean>
   return done();
 }
 
+/** A WebGL engine on a device that runs the GPU layout, ready. */
+async function webglEngine() {
+  const net = network(makeHost(), { width: W, height: H, backend: "webgl" });
+  await net.whenReady();
+  return net;
+}
+
+/** The two ways `"auto"` resolves (#375), each with the `layoutTransport` it then reports: the GPU on a
+ *  supported device, and the worker on a device without float blending. */
+const AUTO_RESOLUTIONS = [
+  { name: "GPU", engine: webglEngine, transport: () => "gpu" },
+  { name: "worker", engine: engineWithoutFloatBlend, transport: () => (sharedMemoryAvailable() ? "shared" : "copy") },
+];
+
 /**
  * `layout({ backend: "auto" })` (#375, spec §12.2): the GPU when `gpuLayoutSupport` passes for the graph,
  * else the worker, with no warning. Every decision the engine takes on the backend must then behave as
@@ -408,13 +422,14 @@ describe("backend:'auto' (#375)", () => {
     net.destroy();
   });
 
-  it("a node drag reheats the GPU layout: the held node tracks the cursor and its neighbour reflows", async () => {
-    const net = network(makeHost(), { width: W, height: H, backend: "webgl" });
-    await net.whenReady();
+  it.each(AUTO_RESOLUTIONS)("a node drag reheats the layout 'auto' resolved to ($name): the held node tracks the cursor and its neighbour reflows", async ({ engine, transport }) => {
+    const net = await engine();
+    const warn = vi.spyOn(console, "warn");
     const g = buildGraph({ nodeCount: 6, source: [0, 1, 2, 3, 4], target: [1, 2, 3, 4, 5], directed: false });
     net.data(g).style({ nodeRadius: 8 }).layout({ backend: "auto", iterations: 30 });
     await net.whenSettled();
-    expect(net.layoutTransport).toBe("gpu");
+    expect(net.layoutTransport).toBe(transport());
+    expect(fallbackWarnings(warn)).toHaveLength(0);
     net.interactive({ draggable: true });
 
     // Put node 0 at the host's centre, then grab it there and drag it by (+60, -40) without releasing.
@@ -432,7 +447,7 @@ describe("backend:'auto' (#375)", () => {
     pointer("pointermove", cx + 60, cy - 40);
     expect(p[0]).toBeCloseTo(heldX, 2); // held under the cursor by the main thread, zero lag
     expect(p[1]).toBeCloseTo(heldY, 2);
-    // The GPU layout reheats around the held node: its spring neighbour moves (translate-only would not).
+    // The layout reheats around the held node: its spring neighbour moves (translate-only would not).
     const moved = await frameUntil(() => Math.hypot(at(p, 2) - n1x, at(p, 3) - n1y) > 0.5, 120);
     pointer("pointerup", cx + 60, cy - 40);
     expect(moved).toBe(true);
@@ -440,7 +455,7 @@ describe("backend:'auto' (#375)", () => {
     net.destroy();
   });
 
-  it("lays out a state network's physical graph on the GPU and derives the rosette", async () => {
+  it.each(AUTO_RESOLUTIONS)("streams a state network's physical graph on the transport 'auto' resolved to ($name) and derives the rosette", async ({ engine, transport }) => {
     const graph = buildStateGraph({
       stateCount: 4,
       stateToPhysical: [0, 0, 1, 2],
@@ -450,11 +465,12 @@ describe("backend:'auto' (#375)", () => {
       directed: false,
     });
     const modules = [{ id: 0, path: [1, 1] }, { id: 1, path: [2, 1] }, { id: 2, path: [1, 2] }, { id: 3, path: [2, 2] }];
-    const net = network(makeHost(), { width: W, height: H, backend: "webgl" });
-    await net.whenReady();
+    const net = await engine();
+    const warn = vi.spyOn(console, "warn");
     net.stateNetwork(graph, { modules, view: "state" }).layout({ backend: "auto", iterations: 20 });
     await net.whenSettled();
-    expect(net.layoutTransport).toBe("gpu"); // streamed, not the synchronous main-thread force solve
+    expect(net.layoutTransport).toBe(transport()); // streamed, not the synchronous main-thread force solve
+    expect(fallbackWarnings(warn)).toHaveLength(0);
     expect(new Set(Array.from(graph.physical.positions, (v) => v.toFixed(3))).size).toBeGreaterThan(2);
     const state = graph.state.positions, phys = graph.physical.positions;
     for (let s = 0; s < graph.state.nodeCount; s++) {
