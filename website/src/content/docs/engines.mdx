@@ -38,7 +38,7 @@ Once you have an engine instance, these work the same regardless of which one yo
 | Highlight | `highlight(layer, idOrIds, styleOrDraw)` |
 | Selection | `select(layer, ids)` |
 | Style overrides | `setStyle(layer, ids, …)`, `clearStyle(layer, ids)` |
-| View | `enableZoom(extent)`, `setTransform(t)`, `render()` |
+| View | `enableZoom(extent)`, `setTransform(t)` (a programmatic view: keeps the zoom gesture in step, never counts as a gesture), `render()` |
 | Sizing | `width` / `height` / `aspectRatio` options, `setSize(w, h)` — see [Sizing](#sizing) |
 | Backend | `setBackend(type)`, `whenReady()` — see [Rendering backends](/d3gl/rendering-backends/) |
 | Export | `toPNG()`, `toSVG()` |
