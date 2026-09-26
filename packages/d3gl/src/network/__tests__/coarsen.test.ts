@@ -1,6 +1,14 @@
 import { describe, it, expect, vi } from "vitest";
 import { buildGraph } from "../graph.js";
-import { coarsenLevel, buildHierarchy, multilevelLayout, multilevelSeed, type CoarseLevel } from "../coarsen.js";
+import {
+  coarsenLevel,
+  buildHierarchy,
+  multilevelLayout,
+  multilevelSeed,
+  multilevelSeedSteps,
+  type CoarseLevel,
+  type SeedProgress,
+} from "../coarsen.js";
 import { DEFAULT_FORCE, ForceLayout, seedPositions } from "../force.js";
 import { BarnesHutTree } from "../quadtree.js";
 
@@ -259,5 +267,81 @@ describe("multilevelLayout", () => {
     const ratio = inter / intra;
     expect(ratio).toBeGreaterThan(1.5); // clusters stay separated, not collapsed into one blob
     expect(ratio).toBeLessThan(6); // …but compact, not flung apart
+  });
+});
+
+describe("multilevelSeedSteps (#368)", () => {
+  const W = 800;
+  const H = 600;
+
+  it("drains to multilevelSeed's exact seed, even when every step is prolongated along the way", () => {
+    const plain = ringOfCliques(100, 12); // 1200 nodes
+    const stepped = ringOfCliques(100, 12);
+    multilevelSeed(plain, { width: W, height: H });
+    let steps = 0;
+    for (const step of multilevelSeedSteps(stepped, { width: W, height: H })) {
+      step.prolongate(); // scratch writes into the finer levels + graph.positions must not leak into the seed
+      steps++;
+    }
+    expect(steps).toBeGreaterThan(0); // one per coarse tick
+    expect(Array.from(stepped.positions)).toEqual(Array.from(plain.positions));
+  });
+
+  it("yields once per coarse tick the seed runs", () => {
+    const g = ringOfCliques(64, 12); // 768 nodes
+    const hierarchy = buildHierarchy(g);
+    const spy = vi.spyOn(BarnesHutTree.prototype, "build"); // one build per tick
+    let steps = 0;
+    for (const _step of multilevelSeedSteps(g, { width: W, height: H, coarsenIterations: 10, maxSeedNodes: 16 }, hierarchy)) steps++;
+    const ticks = spy.mock.calls.length;
+    spy.mockRestore();
+    expect(ticks).toBeGreaterThan(0);
+    expect(steps).toBe(ticks);
+  });
+
+  it("flags the steps drawn at the finished seed's extent: every node, finite, centred, no jump into the seed", () => {
+    // Each progress frame is the level being solved, spread over its finer levels as if those were
+    // unsolved, at the equilibrium density. The coarsest levels are a handful of mass-sized discs that
+    // pack with gaps — wider than the seed — so only a level of about a thousand nodes or more is
+    // `atScale`: from the first frame a caller shows, the fitted view and the LOD extents hold still
+    // into the refinement.
+    const g = ringOfCliques(2000, 10); // 20k nodes: levels from 7 to 10000 nodes
+    const n = g.nodeCount;
+    const R95 = Math.sqrt(0.95) * Math.sqrt((DEFAULT_FORCE.repulsion * n) / DEFAULT_FORCE.centering);
+    const coarse: number[] = [];
+    const atScale: number[] = [];
+    const flags: boolean[] = [];
+    let level: SeedProgress | null = null;
+    for (const step of multilevelSeedSteps(g, { width: W, height: H })) {
+      flags.push(step.atScale);
+      if (step === level) continue; // one progress object per level: measure each level's first tick
+      level = step;
+      g.positions.fill(Number.NaN); // prove the step writes every node
+      step.prolongate();
+      expect(g.positions.every(Number.isFinite)).toBe(true);
+      let cx = 0;
+      let cy = 0;
+      for (let i = 0; i < n; i++) (cx += g.positions[i * 2]!, cy += g.positions[i * 2 + 1]!);
+      expect(Math.hypot(cx / n - W / 2, cy / n - H / 2)).toBeLessThan(0.05 * R95); // centred on the viewport
+      (step.atScale ? atScale : coarse).push(r95(g.positions, n));
+    }
+    const seed = r95(g.positions, n); // the drained generator left the finished seed
+    expect(seed / R95).toBeGreaterThan(0.9); // …at the force equilibrium
+    expect(seed / R95).toBeLessThan(1.1);
+    expect(flags.indexOf(true)).toBeGreaterThan(0); // coarse first, then at scale for good
+    expect(flags.lastIndexOf(false)).toBe(flags.indexOf(true) - 1);
+    // Why the gate: the coarsest level spans ~1.25x the seed (web-NotreDame 1.4x, a scale-free graph 2.4x).
+    expect(Math.max(...coarse) / seed).toBeGreaterThan(1.15);
+    expect(atScale.length).toBeGreaterThan(1);
+    for (const r of atScale) {
+      expect(r / seed).toBeGreaterThan(0.9);
+      expect(r / seed).toBeLessThan(1.1);
+    }
+  });
+
+  it("yields nothing for a graph with no coarsening (the disc seed)", () => {
+    const g = buildGraph({ nodeCount: 5, source: [], target: [] });
+    expect([...multilevelSeedSteps(g, { width: W, height: H })]).toEqual([]);
+    expect(g.positions.every(Number.isFinite)).toBe(true);
   });
 });
