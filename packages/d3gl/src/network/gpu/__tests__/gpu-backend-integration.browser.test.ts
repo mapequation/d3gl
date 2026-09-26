@@ -18,6 +18,7 @@ import { buildStateGraph } from "../../state-graph.js";
 import { sharedMemoryAvailable } from "../../worker-transport.js";
 import type { MainToWorker } from "../../worker-protocol.js";
 import type { ModuleNode } from "../../modules.js";
+import { observeGpuLayoutFrames } from "../gpu-stream.js";
 
 const W = 400;
 const H = 300;
@@ -544,3 +545,45 @@ describe("backend:'auto' (#375)", () => {
     net.destroy();
   });
 });
+
+describe("network layout backend:'gpu' — context loss mid-run (#352)", () => {
+  it("settles, stops its frame loop and warns once when the WebGL context is lost", async () => {
+    const host = makeHost();
+    const net = network(host, { width: W, height: H, backend: "webgl" });
+    await net.whenReady();
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    let frames = 0;
+    const unobserve = observeGpuLayoutFrames(() => { frames++; });
+    try {
+      // Long enough that the loss lands mid-run.
+      net.data(clustered(3000)).layout({ backend: "gpu", iterations: 100_000 });
+      const settled = net.whenSettled();
+      for (let i = 0; i < 200 && frames < 5; i++) await nextFrame();
+      expect(net.layoutTransport).toBe("gpu");
+      expect(frames).toBeGreaterThanOrEqual(5);
+
+      // The engine's WebGL canvas: getContext returns the context the engine already holds.
+      const canvas = host.querySelector("canvas");
+      const gl = canvas?.getContext("webgl2") ?? null;
+      expect(gl).not.toBeNull();
+      const lose = gl?.getExtension("WEBGL_lose_context");
+      expect(lose).toBeTruthy();
+      lose?.loseContext();
+
+      await settled; // resolves: a lost context never signals its fences, the run must not wait on them
+      const lost = warn.mock.calls.filter((c) => String(c[0]).includes("context was lost"));
+      expect(lost).toHaveLength(1);
+      // The loop has stopped: no further frames.
+      const after = frames;
+      for (let i = 0; i < 10; i++) await nextFrame();
+      expect(frames).toBe(after);
+    } finally {
+      unobserve();
+      net.destroy();
+    }
+  });
+});
+
+function nextFrame(): Promise<void> {
+  return new Promise((resolve) => requestAnimationFrame(() => resolve()));
+}

@@ -11,6 +11,9 @@
  *      pin/reheat sequence creates NO framebuffers/textures (AGENTS.md §5).
  *   2. startGpuLayout resumable loop (end-to-end): after convergence the layout is NOT destroyed —
  *      pin() resumes ticking (held node stays put, neighbours reflow), unpin() re-cools + releases.
+ *      Since #352 the reheat batches follow the frame budget and `frameEvery` caps `onFrame` to one per
+ *      that many ticks, so the checks wait for the streamed state (bounded) instead of a fixed number
+ *      of animation frames.
  */
 
 import { describe, it, expect, beforeAll, vi } from "vitest";
@@ -22,6 +25,12 @@ import { buildGraph } from "../../graph.js";
 
 const nextFrame = (): Promise<void> =>
   new Promise((resolve) => requestAnimationFrame(() => resolve()));
+
+/** Wait up to `frames` animation frames for `done()`; returns whether it happened. */
+async function until(done: () => boolean, frames = 600): Promise<boolean> {
+  for (let i = 0; i < frames && !done(); i++) await nextFrame();
+  return done();
+}
 
 const dist = (out: Float32Array, a: number, b: number): number =>
   Math.hypot(out[a * 2]! - out[b * 2]!, out[a * 2 + 1]! - out[b * 2 + 1]!);
@@ -121,7 +130,14 @@ describe("startGpuLayout resumable reheat loop (#183)", () => {
     // Yank node 0 to a far point and pin it there.
     const heldX = settledPos[0]! + 600, heldY = settledPos[1]! + 600;
     handle.pin(Uint32Array.of(0), new Float32Array([heldX, heldY]));
-    for (let i = 0; i < 8; i++) await nextFrame(); // let the drag loop reheat several batches
+    const moved = (): boolean => {
+      for (let n = 1; n <= 5; n++) {
+        if (Math.hypot(g.positions[n * 2]! - settledPos[n * 2]!, g.positions[n * 2 + 1]! - settledPos[n * 2 + 1]!) > 1) return true;
+      }
+      return false;
+    };
+    // Let the drag loop reheat until a streamed frame shows the reflow (bounded).
+    await until(() => frames > framesAtSettle + 1 && moved());
 
     // The loop resumed after convergence (proves it did NOT destroy the layout on settle).
     expect(frames).toBeGreaterThan(framesAtSettle);
@@ -139,7 +155,7 @@ describe("startGpuLayout resumable reheat loop (#183)", () => {
 
     // Release: node 0 integrates again and is pulled back toward its neighbours (leaves the held point).
     handle.unpin();
-    for (let i = 0; i < 8; i++) await nextFrame();
+    await until(() => Math.hypot(g.positions[0]! - heldX, g.positions[1]! - heldY) > 1);
     expect(Math.hypot(g.positions[0]! - heldX, g.positions[1]! - heldY)).toBeGreaterThan(1);
 
     handle.stop();
