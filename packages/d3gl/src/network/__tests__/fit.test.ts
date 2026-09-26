@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { layoutBox, fitTransform, type FitBox } from "../fit.js";
+import { layoutBox, fitTransform, type FitBox, type LayoutBoxOptions } from "../fit.js";
 import { buildModuleLODTree } from "../modules.js";
 import { buildLODTree, computeLODPositions } from "../lod.js";
 import { buildGraph } from "../graph.js";
@@ -10,9 +10,11 @@ import { buildGraph } from "../graph.js";
  *   - **tight** — within a few % of the leaves' true bounding box. The box it replaces padded the
  *     top modules' centroids by their median LOD `extent`, and `extent` compounds up the tree, so
  *     it framed the layout 1.6-4.3× too loose (#327);
- *   - **robust to fling-outs** (#206) — a stray leaf flung far away must not blow the frame up
- *     and shrink the rest of the layout to a dot ("all white").
- * These tests pin both, plus the contrast that shows why no LOD `extent` box is used.
+ *   - **robust to fling-outs while the layout streams** (#206) — a stray leaf flung far away must not
+ *     blow the frame up and shrink the rest of the layout to a dot ("all white");
+ *   - **exact once settled** — the settled (and any non-streaming) fit frames every leaf, so a real small
+ *     component the streaming trim would drop is never cropped from the view the user is left with.
+ * These tests pin all three, plus the contrast that shows why no LOD `extent` box is used.
  */
 
 const W = 800;
@@ -78,14 +80,21 @@ function sideError(box: FitBox, ref: FitBox): number {
   return Math.max(...box.map((v, i) => Math.abs(v - (ref[i] ?? 0)) / s));
 }
 
+/** The streaming fit's options: trim stragglers. The settled fit passes none, and gets the exact box. */
+const STREAMING: LayoutBoxOptions = { trimStragglers: true };
+/** Both fits, for the properties they share. */
+const BOTH: LayoutBoxOptions[] = [STREAMING, {}];
+
 describe("layoutBox is tight", () => {
-  it("equals the exact bounding box of a clean layout (no stragglers)", () => {
+  it("equals the exact bounding box of a clean layout (no stragglers), streaming or settled", () => {
     for (const n of [50, 1000, 20_000]) {
       const pos = disc(n, 400);
-      const box = layoutBox(pos, n);
-      expect(box).not.toBeNull();
-      if (!box) continue;
-      expect(sideError(box, exactBox(pos, n)), `n=${n}`).toBeLessThan(1e-6);
+      for (const opts of BOTH) {
+        const box = layoutBox(pos, n, opts);
+        expect(box).not.toBeNull();
+        if (!box) continue;
+        expect(sideError(box, exactBox(pos, n)), `n=${n} trim=${opts.trimStragglers === true}`).toBeLessThan(1e-6);
+      }
     }
   });
 
@@ -93,7 +102,7 @@ describe("layoutBox is tight", () => {
     const n = 5000;
     let prev = 0;
     for (const r of [100, 400, 1600, 6400]) {
-      const box = layoutBox(disc(n, r), n);
+      const box = layoutBox(disc(n, r), n, STREAMING);
       if (!box) throw new Error("no box");
       expect(span(box) / (2 * r)).toBeGreaterThan(0.99);
       expect(span(box) / (2 * r)).toBeLessThan(1.01);
@@ -106,7 +115,7 @@ describe("layoutBox is tight", () => {
     const n = 20_000;
     const pos = disc(n, 400);
     for (let i = 0; i < 1000; i++) pos[2 * i] = (pos[2 * i] ?? 0) + 5000; // 5% of the layout, far to the right
-    const box = layoutBox(pos, n);
+    const box = layoutBox(pos, n, STREAMING); // even the trimming (streaming) fit keeps it
     if (!box) throw new Error("no box");
     expect(sideError(box, exactBox(pos, n))).toBeLessThan(0.01);
   });
@@ -116,23 +125,27 @@ describe("layoutBox is tight", () => {
     const ref = exactBox(pos, 1000);
     pos[0] = NaN;
     pos[3] = Infinity;
-    const box = layoutBox(pos, 1000);
-    if (!box) throw new Error("no box");
-    expect(sideError(box, ref)).toBeLessThan(0.01);
-    expect(layoutBox(new Float32Array([NaN, NaN, NaN, NaN]), 2)).toBeNull();
-    expect(layoutBox(new Float32Array(0), 0)).toBeNull();
+    for (const opts of BOTH) {
+      const box = layoutBox(pos, 1000, opts);
+      if (!box) throw new Error("no box");
+      expect(sideError(box, ref)).toBeLessThan(0.01);
+      expect(layoutBox(new Float32Array([NaN, NaN, NaN, NaN]), 2, opts)).toBeNull();
+      expect(layoutBox(new Float32Array(0), 0, opts)).toBeNull();
+    }
   });
 
   it("frames a degenerate (single-point) layout without dividing by zero", () => {
-    expect(layoutBox(new Float32Array([7, 9, 7, 9, 7, 9]), 3)).toEqual([7, 9, 7, 9]);
     const many = new Float32Array(2 * 1000).fill(3);
-    expect(layoutBox(many, 1000)).toEqual([3, 3, 3, 3]);
+    for (const opts of BOTH) {
+      expect(layoutBox(new Float32Array([7, 9, 7, 9, 7, 9]), 3, opts)).toEqual([7, 9, 7, 9]);
+      expect(layoutBox(many, 1000, opts)).toEqual([3, 3, 3, 3]);
+    }
   });
 });
 
-describe("layoutBox is robust to fling-outs (the 'all white' bug)", () => {
-  const flung = layoutBox(cornerLayout(2), N);
-  const clean = layoutBox(cornerLayout(null), N);
+describe("a streaming layoutBox is robust to fling-outs (the 'all white' bug)", () => {
+  const flung = layoutBox(cornerLayout(2), N, STREAMING);
+  const clean = layoutBox(cornerLayout(null), N, STREAMING);
 
   it("a flung-out leaf does not change the frame (the bulk's exact box)", () => {
     if (!flung || !clean) throw new Error("no box");
@@ -161,7 +174,7 @@ describe("layoutBox is robust to fling-outs (the 'all white' bug)", () => {
       pos[2 * i] = 20_000 + i;
       pos[2 * i + 1] = -20_000 - i;
     }
-    const box = layoutBox(pos, n);
+    const box = layoutBox(pos, n, STREAMING);
     if (!box) throw new Error("no box");
     expect(sideError(box, bulk)).toBeLessThan(0.02);
   });
@@ -175,7 +188,7 @@ describe("layoutBox is robust to fling-outs (the 'all white' bug)", () => {
     const pos = cornerLayout(null).subarray(0, 2 * n);
     pos[4] = 20_000;
     pos[5] = 20_000;
-    const box = layoutBox(pos, n);
+    const box = layoutBox(pos, n, STREAMING);
     if (!box) throw new Error("no box");
     expect(box).toEqual(exactBox(pos, n));
     // …while one more leaf (the 200-leaf layout above) turns the protection on.
@@ -191,7 +204,7 @@ describe("layoutBox is robust to fling-outs (the 'all white' bug)", () => {
     let prev: FitBox | null = null;
     for (let x = bulk[2] + 2 * size; x >= bulk[2]; x -= step) {
       pos[4] = x; // leaf 2 drifts in along +x, from two layout sizes out to the bulk's edge
-      const box = layoutBox(pos, N);
+      const box = layoutBox(pos, N, STREAMING);
       if (!box) throw new Error("no box");
       if (prev) expect(Math.abs(box[2] - prev[2])).toBeLessThan(2 * step);
       prev = box;
@@ -209,6 +222,60 @@ describe("layoutBox is robust to fling-outs (the 'all white' bug)", () => {
     const r = tree.extent[root] ?? 0;
     const m = mappedLeaves(pos, N, fitTransform([cx - r, cy - r, cx + r, cy + r], W, H), 2);
     expect(m.fill).toBeLessThan(0.1); // the bulk shrinks to a speck — this is the "all white" the fix removes
+  });
+});
+
+describe("only a streaming fit trims stragglers; the settled fit frames the exact box", () => {
+  /**
+   * `n` leaves: a disc of `n − 65` (radius 1, centred on the origin), `65 − far` leaves at its centre, and
+   * `far` leaves spread evenly over x ∈ [x0, x1] on the x-axis. The disc and the far leaves' span are the
+   * same whatever `far`, so so is the exact box.
+   */
+  function discAndFar(n: number, far: number, x0: number, x1: number): Float32Array {
+    const pos = new Float32Array(2 * n);
+    const golden = Math.PI * (3 - Math.sqrt(5));
+    const bulk = n - 65;
+    for (let i = 0; i < bulk; i++) {
+      const d = Math.sqrt((i + 0.5) / bulk);
+      pos[2 * i] = d * Math.cos(i * golden);
+      pos[2 * i + 1] = d * Math.sin(i * golden);
+    }
+    for (let j = 0; j < far; j++) pos[2 * (n - far + j)] = far > 1 ? x0 + ((x1 - x0) * j) / (far - 1) : x1;
+    return pos;
+  }
+
+  it("a small far component is cropped while streaming and fully framed once settled", () => {
+    // 5 nodes at 2-2.2× the radius of a 1,000-leaf disc: within the trim (5 here), and 50% of the
+    // layout's size beyond it, so the streaming fit drops them. They are a real component.
+    const n = 1000;
+    const pos = discAndFar(n, 5, 2, 2.2);
+    const streaming = layoutBox(pos, n, STREAMING);
+    const settled = layoutBox(pos, n);
+    if (!streaming || !settled) throw new Error("no box");
+    expect(streaming[2]).toBeLessThan(1.01); // mid-stream: framed on the disc, the component just outside
+    expect(settled).toEqual(exactBox(pos, n)); // settled: every leaf, the component included
+    expect(settled[2]).toBeCloseTo(2.2, 5);
+  });
+
+  it("the trim's hard count flips a streaming frame at 64/65 far leaves, but never the settled one", () => {
+    // A 20k-leaf layout trims at most 64 leaves per side. 64 far leaves (x ≈ 30-35, ~17× the disc's radius)
+    // are dropped; with a 65th they are kept — so mid-stream, a count hovering at the trim would swing the
+    // frame between tight and ~17× loose. The settled frame reads every leaf, so the count cannot move it.
+    const n = 20_000;
+    const p64 = discAndFar(n, 64, 30, 35);
+    const p65 = discAndFar(n, 65, 30, 35);
+    const s64 = layoutBox(p64, n, STREAMING);
+    const s65 = layoutBox(p65, n, STREAMING);
+    if (!s64 || !s65) throw new Error("no box");
+    expect(s64[2]).toBeLessThan(1.01);
+    expect(s65[2]).toBeGreaterThan(30);
+
+    const e64 = layoutBox(p64, n);
+    const e65 = layoutBox(p65, n);
+    expect(e64).toEqual(exactBox(p64, n));
+    expect(e65).toEqual(exactBox(p65, n));
+    expect(e64).toEqual(e65); // the flip does not reach the settled frame
+    expect(e64?.[2]).toBeCloseTo(35, 5);
   });
 });
 

@@ -23,7 +23,9 @@ import type { ViewTransform } from "../../core/index.js";
  *      leaves, LOD on and off;
  *   3. a real wheel gesture, or an explicit `setTransform` (the Navigator's zoom-to: `setTransform` then
  *      re-`enableZoom`, #202), hands the view over for good — neither a later frame nor the settle
- *      reframes away from it, and d3-zoom stays in step with the view.
+ *      reframes away from it, and d3-zoom stays in step with the view;
+ *   4. stragglers are trimmed only while the layout streams: a small far component is cropped mid-stream
+ *      but framed at settle, and the trim's hard 64/65 count flips a streamed frame, never the settled one.
  */
 
 const W = 400;
@@ -62,6 +64,22 @@ class ProbeNetwork extends Network {
   }
 }
 
+/**
+ * Lays every streamed frame out as a fixed layout: the hook runs after the transport's position copy, so it
+ * replaces the solver's positions on every frame, the settling one included. {@link streamFrame} is that
+ * frame's repaint request, for a stream whose worker has been stopped.
+ */
+class FixtureNetwork extends ProbeNetwork {
+  beforeFrame: (() => void) | null = null;
+  protected override scheduleLayoutRepaint(): void {
+    this.beforeFrame?.();
+    super.scheduleLayoutRepaint();
+  }
+  streamFrame(): void {
+    this.scheduleLayoutRepaint();
+  }
+}
+
 /** A connected random graph: a ring plus random chords — spreads into a disc under the force layout. */
 function randomGraph(n: number, seed: number): NetworkGraph {
   let s = seed >>> 0;
@@ -91,6 +109,26 @@ function framing(graph: NetworkGraph, t: ViewTransform): { fill: number; cx: num
     fill: (t.k * Math.max(maxX - minX, maxY - minY)) / Math.min(W, H),
     cx: t.k * ((minX + maxX) / 2) + t.x,
     cy: t.k * ((minY + maxY) / 2) + t.y,
+  };
+}
+
+/** `positions` mapped through `t`: the exact box's longest side / the shorter view side, its centre, and
+ *  whether every leaf lies inside the view. */
+function framingOf(positions: Float32Array, t: ViewTransform): { fill: number; cx: number; cy: number; allInside: boolean } {
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+  for (let i = 0; i < positions.length / 2; i++) {
+    const x = positions[2 * i] ?? 0;
+    const y = positions[2 * i + 1] ?? 0;
+    minX = Math.min(minX, x); minY = Math.min(minY, y);
+    maxX = Math.max(maxX, x); maxY = Math.max(maxY, y);
+  }
+  const sx = (x: number): number => t.k * x + t.x;
+  const sy = (y: number): number => t.k * y + t.y;
+  return {
+    fill: (t.k * Math.max(maxX - minX, maxY - minY)) / Math.min(W, H),
+    cx: sx((minX + maxX) / 2),
+    cy: sy((minY + maxY) / 2),
+    allInside: sx(minX) >= 0 && sx(maxX) <= W && sy(minY) >= 0 && sy(maxY) <= H,
   };
 }
 
@@ -298,6 +336,98 @@ describe("streaming fit with zoom enabled (#327)", () => {
     await nextFrame();
     expect(net.view).toEqual(target);
     expect(zoomTransform(host)).toMatchObject(target);
+    net.destroy();
+  }, STREAM_TIMEOUT_MS);
+});
+
+describe("stragglers are trimmed only while the layout streams; the settled fit frames the exact box", () => {
+  /** 20k leaves: the trim is min(64, 0.5% of the leaves) = 64 per side. */
+  const N = 20_000;
+  const R = 1000;
+
+  /**
+   * `N` leaves: a disc of `N − 65` (radius {@link R}, centred on the origin), `65 − far` leaves at its
+   * centre, and `far` leaves spread evenly over x ∈ [x0, x1]·R on the x-axis — a small separate component.
+   * The disc and the far leaves' span are the same whatever `far`, so so is the exact box.
+   */
+  function discAndFar(far: number, x0: number, x1: number): Float32Array {
+    const pos = new Float32Array(2 * N);
+    const golden = Math.PI * (3 - Math.sqrt(5));
+    const bulk = N - 65;
+    for (let i = 0; i < bulk; i++) {
+      const d = R * Math.sqrt((i + 0.5) / bulk);
+      pos[2 * i] = d * Math.cos(i * golden);
+      pos[2 * i + 1] = d * Math.sin(i * golden);
+    }
+    for (let j = 0; j < far; j++) pos[2 * (N - far + j)] = R * (far > 1 ? x0 + ((x1 - x0) * j) / (far - 1) : x1);
+    return pos;
+  }
+
+  /**
+   * The view a `fit: true` worker stream frames `positions` at, mid-stream and once settled, on one engine.
+   * Mid-stream: the worker is stopped (the fit stays on) and one frame is streamed by hand, as the perf
+   * guard does — deterministic, where a live worker's frames race the test. Settled: a real run whose every
+   * frame, the settling one included, is laid out as `positions`, so the settle frames exactly them.
+   */
+  async function streamedAndSettled(net: FixtureNetwork, graph: NetworkGraph, positions: Float32Array): Promise<{ streaming: ViewTransform; settled: ViewTransform }> {
+    net.beforeFrame = () => graph.positions.set(positions);
+    net.layout({ backend: "worker", fit: true, multilevel: false, iterations: 10 });
+    net.stopLayout();
+    net.streamFrame();
+    await nextFrame();
+    const streaming = net.view;
+
+    net.layout({ backend: "worker", fit: true, multilevel: false, iterations: 10 });
+    await net.whenSettled();
+    await nextFrame();
+    expect(graph.positions, "the settling frame was not laid out as the fixture").toEqual(positions);
+    return { streaming, settled: net.view };
+  }
+
+  async function makeNet(): Promise<{ net: FixtureNetwork; graph: NetworkGraph }> {
+    const net = new FixtureNetwork(makeHost(), { width: W, height: H, backend: "webgl" });
+    await net.whenReady();
+    const graph = randomGraph(N, 23); // its own layout never shows: every frame is replaced by a fixture
+    net.data(graph).style({ nodeRadius: 2, sizeMode: "screen" });
+    return { net, graph };
+  }
+
+  it("a small far component is cropped mid-stream and fully framed at settle", async () => {
+    const { net, graph } = await makeNet();
+    // 5 nodes at 2-2.2× the disc's radius: within the trim, and 50% of the layout's size beyond the disc.
+    const pos = discAndFar(5, 2, 2.2);
+    const { streaming, settled } = await streamedAndSettled(net, graph, pos);
+
+    // Mid-stream the fit frames the disc (a fling-out cannot blow the frame up), the component just outside.
+    const disc = framingOf(pos.subarray(0, 2 * (N - 65)), streaming);
+    expect(disc.fill).toBeGreaterThan(0.8);
+    expect(disc.fill).toBeLessThan(0.86);
+    expect(streaming.k * 2 * R + streaming.x, "mid-stream, the component should sit outside the frame").toBeGreaterThan(W);
+
+    // Settled, the fit frames every leaf: the exact box at the fit's 85% (less the 2 px glyph pad), centred.
+    const all = framingOf(pos, settled);
+    expect(all.allInside, "the settled view crops the small component").toBe(true);
+    expect(all.fill).toBeGreaterThan(0.8);
+    expect(all.fill).toBeLessThan(0.86);
+    expect(Math.abs(all.cx - W / 2)).toBeLessThan(1);
+    expect(Math.abs(all.cy - H / 2)).toBeLessThan(1);
+    net.destroy();
+  }, STREAM_TIMEOUT_MS);
+
+  it("the trim's hard 64/65 count flips a streamed frame, but never the settled one", async () => {
+    const { net, graph } = await makeNet();
+    // 64 or 65 leaves at 30-35× the disc's radius. The streaming fit drops 64 and keeps 65; the exact box
+    // is the same for both.
+    const p64 = discAndFar(64, 30, 35);
+    const p65 = discAndFar(65, 30, 35);
+    const v64 = await streamedAndSettled(net, graph, p64);
+    const v65 = await streamedAndSettled(net, graph, p65);
+
+    expect(v64.streaming.k / v65.streaming.k, "the streaming trim should flip at 64/65").toBeGreaterThan(5);
+    for (const key of ["k", "x", "y"] as const) expect(v64.settled[key]).toBeCloseTo(v65.settled[key], 6);
+    const f = framingOf(p65, v65.settled);
+    expect(f.allInside).toBe(true);
+    expect(f.fill).toBeGreaterThan(0.8);
     net.destroy();
   }, STREAM_TIMEOUT_MS);
 });

@@ -1,16 +1,16 @@
 import { describe, it, expect } from "vitest";
 import { appendFileSync } from "node:fs";
-import { layoutBox, type FitBox } from "../fit.js";
+import { layoutBox, type FitBox, type LayoutBoxOptions } from "../fit.js";
 
 /**
  * Per-frame regression guard for the streaming fit's box (#327, AGENTS.md lifecycle §5).
  *
- * While a `layout({ fit: true })` streams, each streamed layout frame runs {@link layoutBox} over every
- * leaf position before the repaint: O(nodes) per streamed frame, the same with LOD on or off (it reads the
- * leaves, never the LOD tree), and only while the fit is on — the fit is not reachable from `setTransform`,
- * so a zoom frame never pays it, and a released fit stops paying it. It rides on a frame that already does
- * O(nodes) work (the transport's position copy, the LOD geometry pass or the full-detail re-emit), so the
- * guard pins it to a small constant factor of a pass over the positions:
+ * While a `layout({ fit: true })` streams, each streamed layout frame runs {@link layoutBox} (trimming
+ * stragglers) over every leaf position before the repaint: O(nodes) per streamed frame, the same with LOD
+ * on or off (it reads the leaves, never the LOD tree), and only while the fit is on — the fit is not
+ * reachable from `setTransform`, so a zoom frame never pays it, and a released fit stops paying it. It
+ * rides on a frame that already does O(nodes) work (the transport's position copy, the LOD geometry pass or
+ * the full-detail re-emit), so the guard pins it to a small constant factor of a pass over the positions:
  *   1. allocation-free — no typed-array growth per call (a fixed 2 KB histogram is reused);
  *   2. exact on every input regime: a clean disc gets its exact bounding box — stored in radial order (the
  *      rim last: the certifying pass cannot stop early, two full passes) and shuffled (the usual storage
@@ -36,6 +36,8 @@ const STRAGGLER_MS_PER_M = Number(process.env.PERF_FIT_BOX_STRAGGLER_MS) || 110;
 const ALLOC_KB_PER_CALL = Number(process.env.PERF_FIT_BOX_ALLOC_KB) || 16;
 const CALLS = 15;
 const STRAGGLERS = 64;
+/** The streaming fit's call — the per-frame one. The settle's exact box is its first pass alone, once. */
+const STREAMING: LayoutBoxOptions = { trimStragglers: true };
 
 /** `pos` with its leaves in a deterministic random storage order (Fisher-Yates, fixed seed). */
 function shuffled(pos: Float32Array, n: number): Float32Array {
@@ -98,14 +100,14 @@ interface Leg {
 
 function runLeg(pos: Float32Array, n: number): Leg {
   const gc = globalThis.gc; // typed by @types/node; defined only under --expose-gc
-  for (let i = 0; i < 3; i++) layoutBox(pos, n); // warm up (JIT)
+  for (let i = 0; i < 3; i++) layoutBox(pos, n, STREAMING); // warm up (JIT)
   gc?.();
   const ab0 = process.memoryUsage().arrayBuffers;
   const ts: number[] = [];
   let box: FitBox | null = null;
   for (let i = 0; i < CALLS; i++) {
     const t0 = performance.now();
-    box = layoutBox(pos, n);
+    box = layoutBox(pos, n, STREAMING);
     ts.push(performance.now() - t0);
   }
   const allocKB = (process.memoryUsage().arrayBuffers - ab0) / 1024 / CALLS;

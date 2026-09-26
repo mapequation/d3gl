@@ -82,8 +82,8 @@ function withGeometry(tree: LODTree, graph: NetworkGraph): LODTree {
   return tree;
 }
 
-/** The transform `layout({ fit: true })` produces — the view a reader actually opens on: the leaves' box
- *  ({@link layoutBox}), padded by the 4-unit world radius {@link withGeometry} draws them at. */
+/** The transform `layout({ fit: true })` settles on — the view a reader actually opens on: the leaves'
+ *  exact box ({@link layoutBox}), padded by the 4-unit world radius {@link withGeometry} draws them at. */
 function fitView(graph: NetworkGraph): LODTransform {
   const box = layoutBox(graph.positions, graph.nodeCount);
   if (!box) throw new Error("no fit box");
