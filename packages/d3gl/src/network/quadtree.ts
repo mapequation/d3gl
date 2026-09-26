@@ -1,7 +1,8 @@
 /**
  * Flat-array Barnes-Hut quadtree for O(n log n) repulsion in the force layout (#102, epic #98).
  * Rebuilt each tick from the positions buffer using typed arrays (no per-cell objects) and reused
- * across ticks. The same spatial structure is intended to back LOD culling / picking later.
+ * across ticks. Its records keep only what repulsion reads (no cell centres or bounds), so it is not
+ * a general spatial index.
  *
  * The repulsion pass is memory-bound, so the tree is laid out for it:
  * - **Records in preorder.** Cells and bodies are one array of `[comX, comY, mass, s²]` records in the
@@ -20,7 +21,7 @@
  * None of this changes the approximation: the cells, the opening test and every body's summation
  * order are those of the pointer quadtree it replaces (bit-identical on unit bodies; see
  * `__tests__/bh-reference.ts`), and none of them depends on the order kept from earlier builds —
- * except the order in which a bucket sums its coincident bodies.
+ * except the order in which a bucket sums its coincident bodies, which moves a force by rounding.
  */
 const MAX_DEPTH = 24;
 /**
@@ -243,7 +244,10 @@ export class BarnesHutTree {
     }
   }
 
-  /** Add body `i`'s repulsion to `fx[i]` / `fy[i]` (per unit of its own mass when the build had masses). */
+  /**
+   * Add body `i`'s repulsion to `fx[i]` / `fy[i]` (per unit of its own mass when the build had masses).
+   * A NaN coordinate fails every opening test, so such a body neither gets nor exerts repulsion.
+   */
   applyForce(i: number, repulsion: number, theta: number, fx: Float32Array, fy: Float32Array): void {
     const xi = this.px[i * 2] ?? 0;
     const yi = this.px[i * 2 + 1] ?? 0;
@@ -291,8 +295,13 @@ export class BarnesHutTree {
     return this.records > 0 ? (this.rec[2] ?? 0) : 0;
   }
 
-  /** Mass-weighted centre of the last build's bodies; `[0, 0]` for an empty build. */
-  rootCom(): [number, number] {
-    return this.records > 0 ? [this.rec[0] ?? 0, this.rec[1] ?? 0] : [0, 0];
+  /** x of the mass-weighted centre of the last build's bodies; 0 for an empty build. */
+  rootComX(): number {
+    return this.records > 0 ? (this.rec[0] ?? 0) : 0;
+  }
+
+  /** y of the mass-weighted centre of the last build's bodies; 0 for an empty build. */
+  rootComY(): number {
+    return this.records > 0 ? (this.rec[1] ?? 0) : 0;
   }
 }

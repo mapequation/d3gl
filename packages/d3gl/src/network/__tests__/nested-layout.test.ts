@@ -1,6 +1,7 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import { buildModuleLODTree, type ModuleLink, type ModuleNode } from "../modules.js";
 import { nestedLayout, type NestedLayoutTopology } from "../nested-layout.js";
+import { BarnesHutTree } from "../quadtree.js";
 import type { LODTree } from "../lod.js";
 
 /** Children of tree node `g`. */
@@ -292,6 +293,35 @@ function linkTightness(tree: LODTree, out: Layout): number {
   }
   return sum / modules;
 }
+
+describe("nestedLayout Barnes-Hut repulsion (modules above the exact-sum size)", () => {
+  it("walks each large module's tree once per step, in the tree's spatial order", () => {
+    // 40 top modules of 2 chained leaves: the root solve has 40 children, above the O(k²) exact sum's
+    // limit, so its repulsion goes through the Barnes-Hut tree; every 2-leaf module stays exact.
+    const k = 40;
+    const records: ModuleNode[] = [];
+    const source: number[] = [];
+    const target: number[] = [];
+    const weight: number[] = [];
+    for (let m = 0; m < k; m++) {
+      records.push({ id: 2 * m, path: [m + 1, 1] }, { id: 2 * m + 1, path: [m + 1, 2] });
+      source.push(2 * m);
+      target.push(2 * m + 1);
+      weight.push(1);
+    }
+    const tree = buildModuleLODTree(2 * k, records, { source, target, weight }, []);
+    const walks = vi.spyOn(BarnesHutTree.prototype, "applyForces");
+    const traversals = vi.spyOn(BarnesHutTree.prototype, "applyForce");
+    const out = nestedLayout(tree);
+    const steps = walks.mock.calls.length;
+    const visits = traversals.mock.calls.length;
+    walks.mockRestore();
+    traversals.mockRestore();
+    expect(steps, "the root solve's repulsion uses the tree").toBeGreaterThan(0);
+    expect(visits, "every traversal comes from the Z-order walk, one per child per step").toBe(steps * k);
+    expect(Array.from(out.positions).every(Number.isFinite)).toBe(true);
+  });
+});
 
 describe("nestedLayout warm start (#328)", () => {
   const tree = threeLevel(12, 6, 10);

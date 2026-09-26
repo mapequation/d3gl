@@ -1,7 +1,8 @@
 /**
  * Reference Barnes-Hut repulsion: the pointer-linked quadtree `BarnesHutTree` used before it was laid
  * out in preorder — bodies inserted one by one, cells subdivided until each holds one body (or the
- * depth cap buckets coincident ones), mass / centre of mass summed bottom-up in quadrant order 0..3,
+ * depth cap buckets coincident ones, newest first as its linked list held them), mass / centre of mass
+ * summed bottom-up in quadrant order 0..3,
  * each body's force gathered by a stack DFS that pushes quadrants 0..3 (so it visits 3..0). It pins
  * the approximation the flat tree must keep: the same cells, the same opening test, the same order.
  */
@@ -38,13 +39,13 @@ export function referenceRepulsion(
   repulsion: number,
   theta: number,
   mass?: Float32Array,
-): { fx: Float64Array; fy: Float64Array; rootMass: number; rootCom: [number, number] } {
+): { fx: Float64Array; fy: Float64Array; rootMass: number; rootCom: [number, number]; buckets: number } {
   const x = (i: number): number => positions[i * 2] ?? 0;
   const y = (i: number): number => positions[i * 2 + 1] ?? 0;
   const m = (i: number): number => mass?.[i] ?? 1;
   const fx = new Float64Array(n);
   const fy = new Float64Array(n);
-  if (n === 0) return { fx, fy, rootMass: 0, rootCom: [0, 0] };
+  if (n === 0) return { fx, fy, rootMass: 0, rootCom: [0, 0], buckets: 0 };
 
   let minX = Infinity;
   let minY = Infinity;
@@ -61,6 +62,7 @@ export function referenceRepulsion(
   const root = cell((minX + maxX) / 2, (minY + maxY) / 2, half * 1.0001);
 
   const internal = (c: Cell): boolean => c.child.some((ch) => ch !== undefined);
+  let buckets = 0;
   for (let i = 0; i < n; i++) {
     let c = root;
     let depth = 0;
@@ -70,8 +72,13 @@ export function referenceRepulsion(
         depth++;
         continue;
       }
-      if (c.bodies.length === 0 || depth >= MAX_DEPTH) {
+      if (c.bodies.length === 0) {
         c.bodies.push(i);
+        break;
+      }
+      if (depth >= MAX_DEPTH) {
+        if (c.bodies.length === 1) buckets++;
+        c.bodies.unshift(i); // the old bucket was a linked list with head insertion
         break;
       }
       const j = c.bodies.pop() ?? 0; // subdivide: push the single resident down, then retry i here
@@ -142,5 +149,5 @@ export function referenceRepulsion(
     fx[i] = ax;
     fy[i] = ay;
   }
-  return { fx, fy, rootMass: root.mass, rootCom: [root.comX, root.comY] };
+  return { fx, fy, rootMass: root.mass, rootCom: [root.comX, root.comY], buckets };
 }

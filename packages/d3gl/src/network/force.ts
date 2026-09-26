@@ -337,7 +337,8 @@ export class ForceLayout {
     // Centering: pull every node toward the (mass-weighted) centroid — the tree root's centre of
     // mass, which the build has already summed.
     if (nodeCount > 0) {
-      const [cx, cy] = tree.rootCom();
+      const cx = tree.rootComX();
+      const cy = tree.rootComY();
       for (let i = 0; i < nodeCount; i++) {
         fx[i]! += centering * (cx - positions[i * 2]!);
         fy[i]! += centering * (cy - positions[i * 2 + 1]!);
