@@ -18,22 +18,30 @@
  *
  * ## Per-level work is GPU-parallel and O(level size) — no CPU "it's small" shortcut
  * The one-time CPU precompute is O(tree size + super-edges) (depth, per-depth slot maps, per-depth
- * super-edge CSRs in slot ids, golden-angle offsets) — data prep, not a force solve. Then per depth,
- * from the top down:
+ * super-edge CSRs in slot ids, subtree leaf counts, golden-angle offsets) — data prep, not a force
+ * solve. Then per depth, from the top down:
  *  - **Prolongate** (GPU gather, {@link ProlongatePass}) — each child samples its parent's position +
  *    a deterministic golden-angle offset. One pass, O(level size), no CPU loop over the level.
- *  - **Solve** (GPU force passes via {@link GpuForceLayout}) — repulsion pyramid + attraction over the
- *    level's super-edges + centering + integrate. Levels larger than {@link maxSeedNodes} are
+ *  - **Solve** (GPU force passes via {@link GpuForceLayout}, cooled over its iterations) — repulsion
+ *    pyramid + attraction over the level's super-edges + centering + integrate. Levels larger than {@link maxSeedNodes} are
  *    prolongated **without** a solve (their detail is left to the finest-level refine the caller runs),
  *    bounding the seed cost — mirroring the CPU {@link multilevelSeed}'s `maxSeedNodes`. **Never** a
  *    CPU per-level force loop (that is the exact thing #180 exists to avoid).
+ *
+ * ## Scale: every depth at the finest level's equilibrium
+ * The refine converges to a disc of radius `√(repulsion·N/centering)` (spacing
+ * {@link equilibriumSpacing}), so the seed is laid out at that scale throughout (as the CPU
+ * {@link multilevelSeed}): a module's children ring it at the cumulative leaf count of their earlier
+ * siblings, one equilibrium spacing² of area per leaf, and each depth's solve scales its repulsion by
+ * the depth's mean leaves-per-node so its own equilibrium is the finest one. The refine then starts at
+ * its own scale — no explosion from a viewport-sized seed, no collapse.
  *
  * The finest positions (each leaf's, gathered from whichever depth it terminates at) land in
  * `graph.positions`; the caller's finest-level {@link GpuForceLayout} refine (real edges) then polishes.
  */
 import type { Device, Texture, Framebuffer } from "@luma.gl/core";
 import type { ForceParams, LayoutGraph } from "../force.js";
-import { DEFAULT_FORCE, seedPositions } from "../force.js";
+import { DEFAULT_FORCE, seedPositions, seedSpacing, stepCap } from "../force.js";
 import type { LODTopology } from "../lod.js";
 import { GpuForceLayout } from "./gpu-force-layout.js";
 import { ProlongatePass } from "./passes/prolongate.js";
@@ -104,9 +112,9 @@ export function gpuMultilevelSeed(
   const coarsenIterations = opts.coarsenIterations ?? DEFAULT_COARSEN_ITERATIONS;
   const maxSeedNodes = opts.maxSeedNodes ?? DEFAULT_MAX_SEED_NODES;
 
-  const { size, leafCount, parent, childOffset, children, superEdgeOffset, superEdgeTarget } = topo;
+  const { size, leafCount, parent, superEdgeOffset, superEdgeTarget } = topo;
   if (!parent || !superEdgeOffset || !superEdgeTarget) {
-    seedPositions({ nodeCount: graph.nodeCount, edgeCount: 0, source: EMPTY_U32, target: EMPTY_U32, positions: graph.positions }, width, height);
+    seedPositions({ nodeCount: graph.nodeCount, edgeCount: 0, source: EMPTY_U32, target: EMPTY_U32, positions: graph.positions }, width, height, { force: opts.force });
     return;
   }
 
@@ -117,7 +125,7 @@ export function gpuMultilevelSeed(
   let maxDepth = 0;
   for (let g = 0; g < size; g++) if (depth[g]! > maxDepth) maxDepth = depth[g]!;
   if (maxDepth < 1) {
-    seedPositions({ nodeCount: graph.nodeCount, edgeCount: 0, source: EMPTY_U32, target: EMPTY_U32, positions: graph.positions }, width, height);
+    seedPositions({ nodeCount: graph.nodeCount, edgeCount: 0, source: EMPTY_U32, target: EMPTY_U32, positions: graph.positions }, width, height, { force: opts.force });
     return;
   }
 
@@ -139,31 +147,47 @@ export function gpuMultilevelSeed(
   let maxLevel = 1;
   for (let d = 0; d <= maxDepth; d++) if (depthCount[d]! > maxLevel) maxLevel = depthCount[d]!;
 
-  // ── 3. Sibling rank (a child's index within its parent's child list) — drives the golden-angle disc.
-  const siblingRank = new Uint32Array(size);
-  for (let p = 0; p < size; p++) {
-    for (let k = childOffset[p]!; k < childOffset[p + 1]!; k++) siblingRank[children[k]!] = k - childOffset[p]!;
-  }
+  // ── 3. Leaf count under every tree node (its "mass": how many finest nodes it stands for). Children
+  //       number below their parent, so one ascending pass finishes each node before adding it upward.
+  const mass = new Float32Array(size);
+  for (let g = 0; g < leafCount; g++) mass[g] = 1;
+  for (let g = 0; g < size; g++) if (parent[g]! >= 0) mass[parent[g]!] = mass[parent[g]!]! + mass[g]!;
 
-  // ── 4. Per (depth-ordered) node: parent slot + golden-angle offset (a phyllotaxis disc around the
-  //       parent). Disc radius adapts to the PARENT depth's density (≈ viewport / √parentLevelCount) so a
-  //       child cluster stays smaller than the parent spacing. Stored in depth order for direct texture packing.
+  // ── 4. Per (depth-ordered) node: parent slot + offset from the parent. Children sit in a phyllotaxis
+  //       disc around the parent placed by the cumulative mass of their earlier siblings, at the force
+  //       model's equilibrium spacing — so a module standing for m leaves spreads over m leaves' worth
+  //       of equilibrium area and every depth keeps the finest level's density (the scale the refine
+  //       converges to, so it neither explodes nor collapses). Roots do the same about the viewport
+  //       centre. Stored in depth order for direct texture packing.
+  const spacing = seedSpacing(leafCount, width, height, params);
+  const k = spacing / Math.sqrt(Math.PI);
   const parentSlotByDepth = new Uint32Array(size);
   const offsetByDepth = new Float32Array(size * 2);
-  const base = 0.4 * Math.min(width, height);
+  const filled = new Float32Array(size); // per parent: mass already placed around it
+  const rank = new Uint32Array(size); // per parent: children placed so far
+  let rootFilled = 0;
+  let rootRank = 0;
   for (let i = 0; i < size; i++) {
     const g = depthNodes[i]!;
     const p = parent[g]!;
-    if (p < 0) continue; // root: parent slot 0, zero offset (already zeroed)
-    parentSlotByDepth[i] = slot[p]!;
-    const parentLevelCount = depthCount[depth[p]!]!;
-    const sibCount = childOffset[p + 1]! - childOffset[p]!;
-    const rank = siblingRank[g]!;
-    const j = base / Math.sqrt(Math.max(parentLevelCount, 1));
-    const r = j * Math.sqrt((rank + 0.5) / Math.max(sibCount, 1));
-    const a = rank * GOLDEN;
-    offsetByDepth[2 * i] = r * Math.cos(a);
-    offsetByDepth[2 * i + 1] = r * Math.sin(a);
+    const m = mass[g]!;
+    let before: number;
+    let r: number;
+    if (p < 0) {
+      before = rootFilled;
+      rootFilled += m;
+      r = rootRank++;
+    } else {
+      parentSlotByDepth[i] = slot[p]!;
+      before = filled[p]!;
+      filled[p] = before + m;
+      r = rank[p]!;
+      rank[p] = r + 1;
+    }
+    const radius = k * Math.sqrt(before + m / 2);
+    const a = (r + (p < 0 ? 0 : slot[p]!)) * GOLDEN;
+    offsetByDepth[2 * i] = radius * Math.cos(a);
+    offsetByDepth[2 * i + 1] = radius * Math.sin(a);
   }
 
   // ── 5. Per-depth super-edge lists in slot ids (directed out-edges between two same-depth nodes, bucketed
@@ -205,9 +229,22 @@ export function gpuMultilevelSeed(
   const prolongate = new ProlongatePass(device);
   const scratch = new Float32Array(maxLevel * 2); // reused readback buffer for solved levels
 
+  // Roots: their ring about the viewport centre, shifted so its centre of mass lands on the centre.
   const rootCount = depthCount[0]!;
   const rootPos = new Float32Array(rootCount * 2);
-  seedPositions({ nodeCount: rootCount, edgeCount: 0, source: EMPTY_U32, target: EMPTY_U32, positions: rootPos }, width, height);
+  let mx = 0;
+  let my = 0;
+  let mt = 0;
+  for (let q = 0; q < rootCount; q++) {
+    const m = mass[depthNodes[q]!]!;
+    mx += m * offsetByDepth[2 * q]!;
+    my += m * offsetByDepth[2 * q + 1]!;
+    mt += m;
+  }
+  for (let q = 0; q < rootCount; q++) {
+    rootPos[2 * q] = width / 2 + offsetByDepth[2 * q]! - mx / mt;
+    rootPos[2 * q + 1] = height / 2 + offsetByDepth[2 * q + 1]! - my / mt;
+  }
   const rootPack = packPositionsTexture(device, rootPos);
 
   // The "previous level" the next prolongation samples: either a standalone texture (root / a
@@ -218,7 +255,6 @@ export function gpuMultilevelSeed(
   let prevOwnedTex: Texture | null = rootPack.texture;
   let prevOwnedFbo: Framebuffer | null = null;
 
-  const maxStep = Math.max(width, height) * 4;
 
   /** Scatter this depth's leaf slots into `output` (leaves terminate here; never subdivided deeper). */
   const extractLeaves = (d: number, posArr: Float32Array): void => {
@@ -268,8 +304,15 @@ export function gpuMultilevelSeed(
         target: seTgt[d]!,
         positions: new Float32Array(count * 2), // dummy; overwritten by the GPU prolongation seed
       };
-      const layout = new GpuForceLayout(device, levelGraph, params, { maxStep });
+      // Each of the level's `count` nodes stands for leafCount/count leaves on average: scaling the
+      // repulsion by that mean mass puts the level's own equilibrium at the finest level's scale (the
+      // disc radius √(repulsion·n/centering) with n·mass = leafCount), so the solve arranges the modules
+      // without contracting them below the area their leaves will need. The step cap scales alike.
+      const meanMass = leafCount / count;
+      const levelParams: ForceParams = { ...params, repulsion: params.repulsion * meanMass };
+      const layout = new GpuForceLayout(device, levelGraph, levelParams, { maxStep: stepCap(spacing * Math.sqrt(meanMass), 0) });
       layout.seedFromProlongation((pass) => seedRun(pass));
+      layout.cool(coarsenIterations);
       layout.runFrame(coarsenIterations);
       layout.readPositions(scratch);
       posArr = scratch;

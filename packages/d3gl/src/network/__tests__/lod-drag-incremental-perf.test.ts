@@ -52,8 +52,27 @@ function seededClusteredTree(n: number): { tree: LODTree; graph: NetworkGraph } 
   }
   const g = buildGraph({ nodeCount: n, source, target });
   multilevelSeed(g, { width: 2000, height: 2000 });
+  // Fit the layout into the 2000-unit box the Float32 tolerance below is calibrated on. The seed lays
+  // out at the force equilibrium's scale (~14k across at 50k nodes); past |x| = 4096 the Float32 ulp
+  // (≥ 0.0005) exceeds a big aggregate's per-move centroid step (2 / count), so those increments are
+  // lost outright rather than accumulated — a separate precision limit of the incremental update.
+  fitInto(g.positions, 2000);
   const tree = buildLODTree(g, {});
   return { tree, graph: g };
+}
+
+/** Scale positions uniformly into a `size`-wide box at the origin (in place). */
+function fitInto(p: Float32Array, size: number): void {
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+  for (let i = 0; i < p.length; i += 2) {
+    minX = Math.min(minX, p[i]!); maxX = Math.max(maxX, p[i]!);
+    minY = Math.min(minY, p[i + 1]!); maxY = Math.max(maxY, p[i + 1]!);
+  }
+  const s = size / Math.max(maxX - minX, maxY - minY, 1e-9);
+  for (let i = 0; i < p.length; i += 2) {
+    p[i] = (p[i]! - minX) * s;
+    p[i + 1] = (p[i + 1]! - minY) * s;
+  }
 }
 
 /** Parent pointers from the children CSR (coarsening trees carry no `parent`) — built once, as

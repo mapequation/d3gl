@@ -171,8 +171,11 @@ describe("GpuForceLayout convergence parity vs CPU", () => {
       target: graph.target,
       positions: cpuPositions,
     };
+    // The same cooled 150-tick schedule on both backends (#124) — tick() directly, so the CPU side
+    // doesn't stop early at convergence while the GPU (no early stop) runs all 150.
     const cpu = new ForceLayout(cpuGraph, params);
-    cpu.run(150);
+    cpu.cool(150);
+    for (let t = 0; t < 150; t++) cpu.tick();
 
     // ── GPU run ──────────────────────────────────────────────────────────────
     const gpuGraph: LayoutGraph = {
@@ -183,6 +186,7 @@ describe("GpuForceLayout convergence parity vs CPU", () => {
       positions: gpuPositions,
     };
     const gpu = new GpuForceLayout(device, gpuGraph, params);
+    gpu.cool(150);
     gpu.runFrame(150);
     const gpuPos = new Float32Array(graph.nodeCount * 2);
     gpu.readPositions(gpuPos);
@@ -249,8 +253,11 @@ describe("GpuForceLayout convergence parity vs CPU", () => {
       target: graph.target,
       positions: cpuPositions,
     };
+    // The same cooled 150-tick schedule on both backends (#124) — tick() directly, so the CPU side
+    // doesn't stop early at convergence while the GPU (no early stop) runs all 150.
     const cpu = new ForceLayout(cpuGraph, params);
-    cpu.run(150);
+    cpu.cool(150);
+    for (let t = 0; t < 150; t++) cpu.tick();
 
     // ── GPU run (grid-pyramid BH, θ=0.9), pinned to the pyramid path ──────────
     const gpuGraph: LayoutGraph = {
@@ -261,6 +268,7 @@ describe("GpuForceLayout convergence parity vs CPU", () => {
       positions: gpuPositions,
     };
     const gpu = new GpuForceLayout(device, gpuGraph, params, { repulsionMode: "pyramid" });
+    gpu.cool(150);
     gpu.runFrame(150);
     const gpuPos = new Float32Array(graph.nodeCount * 2);
     gpu.readPositions(gpuPos);

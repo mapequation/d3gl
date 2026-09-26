@@ -29,8 +29,11 @@ export interface StartMessage {
   coarsen?: CoarsenOptions;
   /** Seed via multilevel coarsening (`true`) or a plain disc cold start (`false`). */
   multilevel: boolean;
-  /** Run this many refinement ticks between progress frames. */
-  frameEvery: number;
+  /**
+   * Run exactly this many refinement ticks between progress frames. Omitted (the default), the worker
+   * streams by time instead: a frame about every display frame, and after any longer tick.
+   */
+  frameEvery?: number;
   /**
    * Build the structural LOD tree on the worker and stream it (#103): the worker posts the tree
    * {@link LODTopology} once, then refreshes its position-derived geometry (`cx`/`cy`/`extent`) each
@@ -97,7 +100,8 @@ export interface LODTopologyMessage {
 /** A progress frame (`frame`) or the final converged/cancelled state (`done`). */
 export interface ProgressMessage {
   type: "frame" | "done";
-  /** Finest-level refinement ticks completed so far (0 = the multilevel seed frame). */
+  /** Finest-level refinement ticks completed so far (0 = the multilevel seed frame). A `done` carries
+   *  the tick the layout stopped at: converged, or out of its iteration budget. */
   tick: number;
   /** Position snapshot in copy mode; omitted in shared mode (renderer reads the SAB directly). */
   positions?: Float32Array;
