@@ -17,6 +17,9 @@ import { buildGraph, type NetworkGraph } from "../graph.js";
  * and gave coarse multilevel levels per-node masses and per-edge spring weights. The finest tick —
  * the one the drag runs — must stay the unit-mass path: masses and weights live in separate loops.
  *
+ * This is the tick's unit-level guard; the drag session around it (pointer events, one tick + repaint
+ * per animation frame, the re-cool stop) is guarded end to end in `network-force-drag-perf.browser.test.ts`.
+ *
  * Signature asserted deterministically (contention-immune):
  *   1. one Barnes-Hut build per frame, over all N bodies, with NO mass array (the unit-body path);
  *   2. N repulsion traversals per frame (one per node) — not a second pass;
@@ -41,8 +44,15 @@ const ASSERT = !!process.env.PERF_ASSERT;
 // hide in that noise. Ceilings: ~4× the frame; the ratio at 1.5 catches any added pass of
 // Barnes-Hut scale (which would put it near 2) with room for contention.
 const FRAME_MS_100K = Number(process.env.PERF_FORCE_DRAG_FRAME_MS) || 750;
-/** Per-node share of the frame ceiling for the at-scale leg (Barnes-Hut is O(N log N); linear with slack). */
-const FRAME_MS_PER_NODE = FRAME_MS_100K / 100_000;
+/** The N-independent share of the ceiling (GC and scheduler jitter): the tick itself has no constant term. */
+const FRAME_MS_CONST = 50;
+/**
+ * The frame ceiling at `n` nodes, split into its constant and N·log N terms per AGENTS (scaling the whole
+ * calibrated ceiling would inflate the constant and hide a regression at large N). Exactly
+ * {@link FRAME_MS_100K} at 100k.
+ */
+const frameCeiling = (n: number): number =>
+  FRAME_MS_CONST + (FRAME_MS_100K - FRAME_MS_CONST) * (n * Math.log2(n)) / (100_000 * Math.log2(100_000));
 const OVERHEAD_RATIO = Number(process.env.PERF_FORCE_DRAG_OVERHEAD) || 1.5;
 const WARM_FRAMES = 2;
 const FRAMES = 5;
@@ -146,7 +156,7 @@ describe("main-thread force drag tick (per-frame, lifecycle §5)", () => {
     const n = 100_000;
     const r = runDrag(n);
     expectSignature(r, n);
-    expect(r.frameMs, `median drag frame ${r.frameMs.toFixed(1)} ms`).toBeLessThan(FRAME_MS_100K);
+    expect(r.frameMs, `median drag frame ${r.frameMs.toFixed(1)} ms`).toBeLessThan(frameCeiling(n));
     expect(r.frameMs / r.bhMs, `frame ${r.frameMs.toFixed(1)} ms vs its Barnes-Hut ${r.bhMs.toFixed(1)} ms`).toBeLessThan(OVERHEAD_RATIO);
   });
 
@@ -156,7 +166,7 @@ describe("main-thread force drag tick (per-frame, lifecycle §5)", () => {
     appendFileSync("/tmp/force-drag-perf.txt", `[${process.env.BENCH_FORCE_DRAG_LABEL ?? "run"}] ${line}`);
     expectSignature(r, BENCH_N);
     if (ASSERT) {
-      const ceiling = FRAME_MS_PER_NODE * BENCH_N * Math.log2(BENCH_N) / Math.log2(100_000);
+      const ceiling = frameCeiling(BENCH_N);
       expect(r.frameMs, `median drag frame ${r.frameMs.toFixed(1)} ms exceeds ${ceiling.toFixed(0)} ms at N=${BENCH_N}`).toBeLessThan(ceiling);
       expect(r.frameMs / r.bhMs).toBeLessThan(OVERHEAD_RATIO);
     }
