@@ -710,6 +710,9 @@ export class Network extends BaseEngine {
   private nestedSolving = false;
   /** Dedup guard for the one-shot deferred main-thread LOD-tree fallback (see {@link scheduleLODFallback}). */
   private lodFallbackScheduled = false;
+  /** Whether the queued fallback is a build {@link lod} deferred before any layout (see
+   *  {@link defersStructuralBuild}) — the one a synchronous call may pull forward ({@link flushDeferredLayers}). */
+  private lodBuildDeferred = false;
   /** Whether `lodTree` has had its geometry computed at least once, so the cut may run. */
   private lodHasGeometry = false;
   /** Reusable cross-fade scratch (#133), indexed by tree-node id; grown as the tree grows, reused per cut to avoid GC. */
@@ -827,6 +830,8 @@ export class Network extends BaseEngine {
   private readonly PIE_LAYER = "pie";
   /** Registry key + layer name for the `both`-view physical container discs (drawn under the state nodes). */
   private readonly CONTAINER_LAYER = "phys-container";
+  /** Every retained Scene layer the vector path registers ({@link registerNetworkScene}). */
+  private readonly SCENE_LAYERS: readonly string[] = [this.CONTAINER_LAYER, "module-boundaries", "links", "arrows", "node-halos", this.NODE_LAYER, this.PIE_LAYER];
 
   constructor(host: HTMLElement, opts: NetworkOptions = {}) {
     super(host, opts);
@@ -1028,6 +1033,14 @@ export class Network extends BaseEngine {
    * geometry pass. Enabling it *after* a worker run (or on the `force`/`positions` backends) falls
    * back to building the tree on the main thread from the current positions.
    *
+   * On an engine that has not run a layout yet, `lod()` cannot know which backend comes next, so the
+   * main-thread build waits for the end of the current call chain: a `layout({ backend: "worker" })`
+   * in the same chain still gets its tree off-thread, and every other path (no layout, `positions`,
+   * `force`, `gpu`) has the tree before the next frame — and a synchronous call that needs it
+   * (`pick()`, `toSVG()`/`toPNG()`, `select()`/`selection()`, `highlight()`, `setStyle()`/`clearStyle()`)
+   * builds it at once. With a worker layout in the chain those calls see what they see during any
+   * worker-streamed load: no cut until the worker's tree lands.
+   *
    * With a module hierarchy (`data(graph, { modules })`, #326) the cut draws the module tree by
    * default; `{ source: "structure" }` coarsens the graph structurally instead. `lod(false)` turns LOD
    * off but keeps the hierarchy, so re-enabling reuses its tree.
@@ -1049,8 +1062,42 @@ export class Network extends BaseEngine {
     // reuses it (cut-time options apply immediately; the style geometry refreshes). data()/layout()
     // drop it on a graph or layout change. It builds a structural tree on the main thread only off the
     // worker backend — on the worker backend that tree comes from the worker (or the settle fallback).
-    this.recomputeLODGeometry();
+    // Before any layout() the backend is still unknown, so a from-scratch structural build is deferred
+    // to the end of the call chain instead (see defersStructuralBuild).
+    if (this.defersStructuralBuild()) this.deferLODBuild();
+    else this.recomputeLODGeometry();
     return this.rebuild();
+  }
+
+  /**
+   * Whether {@link lod} should leave the main-thread tree build to the end of the call chain: no
+   * `layout()` has chosen a backend yet — a `layout({ backend: "worker" })` later in this chain streams
+   * the structural tree itself (#103), and building it here first would block the main thread for the
+   * whole O(N + E) coarsening (≈0.5 s at 325k nodes / 1.5M edges) only to be replaced. Only a tree that
+   * would be built from scratch waits: a module tree is never streamed, an existing tree only needs its
+   * geometry refreshed, and state-network mode builds from the state view's own graph (#182). Nor does
+   * it wait while the network's layers carry a selection, highlight or style override: the vector
+   * backends clear those layers while a build is queued, which would discard that state.
+   */
+  private defersStructuralBuild(): boolean {
+    return this.layoutOpts.backend === undefined && !!this.graph && !this.stateData && !this.lodTree && !this.lodUsesModules()
+      && !this.SCENE_LAYERS.some((name) => this.hasInteractionState(name));
+  }
+
+  /** Queue the deferred build ({@link runLODFallback}) and mark it as one a synchronous read may pull
+   *  forward ({@link flushDeferredLayers}). */
+  private deferLODBuild(): void {
+    this.lodBuildDeferred = true;
+    this.scheduleLODFallback();
+  }
+
+  /**
+   * A call that resolves against the network's layers *now* (see {@link BaseEngine.flushDeferredLayers})
+   * runs a build {@link lod} deferred at once, so a synchronous caller sees exactly what an immediate
+   * build would have given it. O(1) when nothing is deferred (it also guards every hover pick).
+   */
+  protected override flushDeferredLayers(): void {
+    if (this.lodBuildDeferred) this.runLODFallback();
   }
 
   /**
@@ -1209,7 +1256,8 @@ export class Network extends BaseEngine {
         anchors.push(anchorFor(g, tree.cx[g] ?? 0, tree.cy[g] ?? 0, text, priority, opts.offset, fade ? fade[g] : undefined));
         if (anchors.length >= max) break;
       }
-    } else {
+    } else if (!this.lodAwaitsTree()) {
+      // (Skipped while LOD awaits its tree: nothing is drawn then, so there is nothing to label.)
       // No-LOD: rank the nodes in view by strength (weighted degree). The full graph is drawn.
       // Candidate gathering (#212) is O(visible) per pan/zoom frame in the steady state: on settled
       // positions a coarse uniform grid — built at most once per position change, never per frame —
@@ -1875,6 +1923,10 @@ export class Network extends BaseEngine {
   /** Tear down the engine, cancelling any worker layout first. */
   override destroy(): void {
     this.haltLayout();
+    // Cancel a queued LOD build: with the worker stopped nothing streams a tree any more, and a destroyed
+    // engine must not coarsen its graph (a React StrictMode re-mount destroys it within the call chain).
+    this.lodFallbackScheduled = false;
+    this.lodBuildDeferred = false;
     super.destroy(); // base tears down the shared label overlay (#105 N7b, #223)
   }
 
@@ -1885,13 +1937,23 @@ export class Network extends BaseEngine {
    * `lod({ modules })`, #326), `"spatial"` when it's the edge-less
    * quadtree built over the node positions, `"main"` when it's the coarsening tree built on the main
    * thread (`force`/`positions` backends, the worker fallback, or LOD enabled after a worker run), or
-   * `"none"` when LOD is off or no geometry exists yet. Introspection for debugging and tests.
+   * `"none"` when LOD is off or no geometry exists yet — including while a worker is about to stream
+   * its tree and while a build `lod()` deferred to the end of the call chain is pending. Introspection
+   * for debugging and tests; reading it never builds anything.
    */
   get lodSource(): "worker" | "modules" | "spatial" | "main" | "none" {
     if (!this.lodOptions || !this.lodTree || !this.lodHasGeometry) return "none";
     if (this.drawsWorkerTree()) return "worker";
     if (this.lodModules) return "modules";
     return this.lodSpatial ? "spatial" : "main";
+  }
+
+  /** LOD is on, no tree is ready yet, and nothing is drawn until one is: the WebGL lane draws nothing
+   *  meanwhile ({@link syncLane}) — a worker is about to stream the tree, or {@link lod} deferred the
+   *  build — and a vector backend draws nothing while that deferred build is pending ({@link rebuild}).
+   *  (A vector backend awaiting a streamed tree otherwise draws the full graph.) */
+  private lodAwaitsTree(): boolean {
+    return !!this.lodOptions && !this.lodReady() && (this.lodBuildDeferred || !!this.backend()?.setInstancedLayer);
   }
 
   /**
@@ -1960,11 +2022,18 @@ export class Network extends BaseEngine {
       }
     } else {
       // SVG/Canvas: emit the glyphs through the PathContext seam as Scene layers, so the
-      // existing pipeline renders them and toSVG() produces publication output. (LOD is a
-      // WebGL-scale feature; vector backends always draw the full graph.)
+      // existing pipeline renders them and toSVG() produces publication output. With LOD on they
+      // draw the cut once a tree is ready (#138), else the full graph.
       this.unregisterLanes();
-      this.registerNetworkScene(this.graph, style, true);
-      this.sceneActive = true;
+      if (this.lodAwaitsTree()) {
+        // lod() deferred its build to the end of the call chain: that build draws the cut before the
+        // next frame (or a worker layout that took over streams it), so the full graph would be
+        // tessellated here only for a frame nobody sees. Draw nothing meanwhile, as the WebGL lane does.
+        this.clearNetworkScene();
+      } else {
+        this.registerNetworkScene(this.graph, style, true);
+        this.sceneActive = true;
+      }
     }
     // Set labels BEFORE the render so a backend that bakes them into the frame (Canvas) draws the
     // current labels in this render rather than one rebuild behind.
@@ -2040,11 +2109,10 @@ export class Network extends BaseEngine {
   /** Drop every retained Scene layer the vector path registers, in one pass. Unlike
    *  `registerNetworkScene(graph, style, false)` — which registers the same slots *empty* and
    *  therefore still pays O(nodeCount + edgeCount) for the id arrays and id→index maps — this is
-   *  O(layers): the right clear when the Scene must not cost anything at all (#201). */
+   *  O(layers) plus one re-push of what is left: the right clear when the Scene must not cost anything
+   *  at all (#201). */
   private clearNetworkScene(): void {
-    for (const name of [this.CONTAINER_LAYER, "module-boundaries", "links", "arrows", "node-halos", this.NODE_LAYER, this.PIE_LAYER]) {
-      this.removeLayer(name);
-    }
+    this.removeLayers(this.SCENE_LAYERS);
     this.sceneActive = false;
   }
 
@@ -2805,21 +2873,32 @@ export class Network extends BaseEngine {
    * `worker`, and no tree exists yet — but only fires if, after the current synchronous call chain,
    * no worker run has taken over the streaming path (i.e. LOD was toggled on after a run settled).
    * The microtask delay lets an imminent `layout({ backend: "worker" })` in the same chain win first,
-   * so the common path never builds a tree the worker would replace.
+   * so the common path never builds a tree the worker would replace. {@link lod} schedules it too, for
+   * the build it defers before any layout ({@link defersStructuralBuild}).
    */
   private scheduleLODFallback(): void {
     if (this.lodFallbackScheduled) return;
     this.lodFallbackScheduled = true;
     const defer: (cb: () => void) => void =
       typeof queueMicrotask === "function" ? queueMicrotask : (cb) => void Promise.resolve().then(cb);
-    defer(() => {
-      this.lodFallbackScheduled = false;
-      // A worker is now streaming, LOD was turned off, the graph/backend changed, or a tree already
-      // landed — nothing to do; the normal path renders it.
-      if (!this.lodOptions || this.lodStreaming || this.lodReady() || this.layoutOpts.backend !== "worker") return;
-      this.recomputeLODGeometry(true); // no live worker: build the tree on the main thread
-      this.rebuild();
-    });
+    defer(() => this.runLODFallback());
+  }
+
+  /** The scheduled build itself — at the end of the call chain, or pulled forward by a synchronous call
+   *  ({@link flushDeferredLayers}). A queued run that finds nothing scheduled any more (already pulled
+   *  forward, or cancelled by {@link destroy}) does nothing. */
+  private runLODFallback(): void {
+    if (!this.lodFallbackScheduled) return;
+    const deferred = this.lodBuildDeferred;
+    this.lodFallbackScheduled = false;
+    this.lodBuildDeferred = false;
+    // A worker is now streaming, LOD was turned off, or a tree already landed — nothing to do; the normal
+    // path renders it. The worker backend's fallback also stands down when the backend changed; a build
+    // lod() deferred runs whatever came next (no layout, positions mid-transition, gpu), as lod() would have.
+    if (!this.lodOptions || this.lodStreaming || this.lodReady()) return;
+    if (!deferred && this.layoutOpts.backend !== "worker") return;
+    this.recomputeLODGeometry(true); // no live worker: build the tree on the main thread
+    this.rebuild();
   }
 
   /**
