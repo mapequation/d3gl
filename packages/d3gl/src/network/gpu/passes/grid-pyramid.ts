@@ -92,7 +92,7 @@ precision highp sampler2D;
 precision highp usampler2D;
 uniform highp sampler2D u_pos;
 uniform highp sampler2D u_segBox;    // (maxX, maxY, -minX, -minY) per segment
-uniform highp usampler2D u_segInfo;  // (start, count, x | y << 16, rootLevel | flags << 8) per segment
+uniform highp usampler2D u_segInfo;  // (start, count, x | y << 16, rootLevel | flags << 8 | side << 16)
 uniform int   u_width;
 uniform vec2  u_atlas;               // level-0 atlas size (A, H)
 uniform float u_pad;                 // box padding factor (e.g. 1.01)
@@ -125,17 +125,25 @@ void main() {
   float boxSide = 2.0 * hlfMax;
 
   vec2 t = (p - lo) / boxSide;
-  float G = float(1 << int(info.w & 255u));
+  // The side as an opaque integer, exactly as the traversal converts it (segmentInfo: never 1 << level).
+  float G = float(int(info.w >> 16));
   vec2 cell = clamp(floor(t * G), vec2(0.0), vec2(G - 1.0));
   vec2 origin = vec2(float(info.z & 65535u), float(info.z >> 16));
 
-  vec2 clip = ((origin + cell + 0.5) / u_atlas) * 2.0 - 1.0;
+  // The cell center in tile units, computed ONCE and shared by the clip position and the second
+  // moment below — keep it that way. The #251 near field needs this shader and the traversal to round
+  // the world cell center lo + q·boxSide bit for bit alike, and a fast-math compiler rounds it
+  // differently when q is not shared: on ANGLE Metal a clip written as (origin + cell + 0.5) / atlas
+  // moved the w channel in 91% of occupied cells (AGENTS.md). The clip below is exact: origin / atlas
+  // and q · (G / atlas) are short binary fractions (atlas and G are powers of two).
+  vec2 q = (cell + 0.5) / G;
+  vec2 clip = (origin / u_atlas + q * (G / u_atlas)) * 2.0 - 1.0;
   gl_Position = vec4(clip, 0.0, 1.0);
   v_pos = p;
   // Second-moment channel (#251): squared offset from the cell center. The center uses the SAME
   // tile-local expression the BH traversal uses to rebuild it, so a single-occupant cell's variance
   // (w/m − |com − cellCenter|²) cancels exactly to 0.
-  vec2 cellCenter = lo + (cell + 0.5) / G * boxSide;
+  vec2 cellCenter = lo + q * boxSide;
   vec2 rel = p - cellCenter;
   v_r2 = dot(rel, rel);
 }
