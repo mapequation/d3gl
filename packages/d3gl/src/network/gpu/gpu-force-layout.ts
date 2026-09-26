@@ -16,6 +16,7 @@ import {
   TILE_MIN_SIDE,
   assertAtlasFits,
   assertSegmentLocalEdges,
+  bandRows,
   flatSegments,
   packTiles,
   segmentSoftening,
@@ -396,14 +397,35 @@ export class GpuForceLayout {
     this.cooling.hold(heat);
   }
 
-  /** Execute `ticks` integrate steps on the GPU. */
+  /**
+   * Execute `ticks` whole ticks on the GPU — each is the three work items {@link beginTick},
+   * {@link forceBand}`(0, 1)` and {@link integrate}. A convenience for tests and one-off solves; the
+   * streaming transport encodes the items itself, a budgeted number per frame (#352).
+   */
   runFrame(ticks: number): void {
     for (let i = 0; i < ticks; i++) {
-      this._tick();
+      this.beginTick();
+      this.forceBand(0, 1);
+      this.integrate();
     }
   }
 
-  private _tick(): void {
+  /** Rows of the position atlas — the domain {@link forceBand} cuts into bands. */
+  get atlasRows(): number {
+    return this.height;
+  }
+
+  /** Nodes this layout solves (every one, whatever the LOD state). */
+  get nodeCount(): number {
+    return this.count;
+  }
+
+  /**
+   * Work item **P** of a tick (#352, spec §6.5.3): everything the force pass reads, computed from the
+   * current positions — the segment reductions, the Barnes-Hut pyramid, the hub chunk partials — and the
+   * clear of the force accumulator. Each part is its own submitted render pass, as before the split.
+   */
+  beginTick(): void {
     // ── 1. Segment reductions ─────────────────────────────────────────────────
     // Gather tree over slot order + one range query for the flat segment: writes the segment
     // table's stats (Σx, Σy, Σ|v|, count → the centroid for centering) and box (maxX, maxY, −minX,
@@ -431,12 +453,31 @@ export class GpuForceLayout {
     // different framebuffer, submitted before the force pass gathers the partials. No-op without hubs.
     this.springs.prepare(this.pos.readTex, this.width);
 
-    // ── 2. Clear force texture to zero ────────────────────────────────────────
-    // Open a render pass on the force FBO with clearColor:[0,0,0,0] — this zeros
-    // all texels so each force pass starts from a known blank slate.
-    const forcePass = beginPass(this.device, { framebuffer: this.forceFbo, clear: [0, 0, 0, 0] });
+    // ── 2. Clear the force texture to zero ────────────────────────────────────
+    // Its own pass (the whole attachment), so the force bands after it can each open the target with
+    // `clear: false` and write only their rows.
+    const clear = beginPass(this.device, { framebuffer: this.forceFbo, clear: [0, 0, 0, 0] });
+    clear.end();
+    this.device.submit();
+  }
 
-    // ── 3. Force passes (additive blend, write into forceTex) ─────────────────
+  /**
+   * Work item **F_b**: the force pass over atlas rows {@link bandRows}`(band, bands)` — springs, then
+   * repulsion, then centering, additively blended into the force texture (a scissor over the band's
+   * rows; the viewport and the slot ↔ texel mapping stay the whole atlas). Positions change only in
+   * {@link integrate}, so every band reads the same positions and pyramid, the bands write disjoint
+   * texels, and each texel receives its three contributions in the same order for any `bands`: the tick
+   * is bitwise independent of how it was sliced. `bands = 1` is the whole atlas without a scissor.
+   */
+  forceBand(band: number, bands: number): void {
+    const [r0, r1] = bandRows(band, bands, this.height);
+    if (r1 <= r0) return;
+    const forcePass = beginPass(this.device, {
+      framebuffer: this.forceFbo,
+      clear: false,
+      ...(bands > 1 ? { scissor: [0, r0, this.width, r1 - r0] } : {}),
+    });
+
     // Fixed order — springs, repulsion, centering. Float addition is not associative, so the ADD
     // blend makes the force bits depend on pass order; keep it stable.
 
@@ -468,8 +509,13 @@ export class GpuForceLayout {
 
     forcePass.end();
     this.device.submit();
+  }
 
-    // ── 3. Integrate pass (reads force, writes pos+vel MRT) ───────────────────
+  /**
+   * Work item **I**: integrate the accumulated force into positions and velocities (MRT), swap the
+   * ping-pongs, and advance the heat schedule — the only item that changes positions.
+   */
+  integrate(): void {
     // Select the pre-created MRT framebuffer whose attachments are the current
     // write textures — no per-tick createFramebuffer.
     const fbo = this.fbos[this.parity]!;
@@ -566,12 +612,30 @@ export class GpuForceLayout {
   }
 
   /**
-   * Read the current node positions back to the CPU.
+   * The pre-created framebuffer holding the current positions (the read side) — what a readback copies.
+   * It changes with every {@link integrate}, so read it at copy time, never cache it.
+   */
+  get positionFramebuffer(): Framebuffer {
+    return this.parity === 0 ? this.readFbos[0] : this.readFbos[1];
+  }
+
+  /**
+   * The segment table's `stats` and `box` textures (1×1 each for the flat layout): the last
+   * {@link beginTick}'s `(Σx, Σy, Σ|v|, count)` and `(maxX, maxY, −minX, −minY)`, which the streaming
+   * readback copies with the positions to catch a non-finite layout (#352).
+   */
+  get segmentStats(): { readonly stats: Texture; readonly box: Texture } {
+    return this.segments;
+  }
+
+  /**
+   * Read the current node positions back to the CPU — synchronously, for tests and one-off reads; the
+   * streaming transport never calls it (it reads through a fenced PBO, #352).
    * Writes `count * 2` floats into `out` starting at index 0.
    */
   readPositions(out: Float32Array): void {
     // Reuse the pre-created readback FBO for the current read-side texture (no per-call alloc).
-    this.readback.read(this.parity === 0 ? this.readFbos[0] : this.readFbos[1], this.count, out);
+    this.readback.read(this.positionFramebuffer, this.count, out);
   }
 
   /**

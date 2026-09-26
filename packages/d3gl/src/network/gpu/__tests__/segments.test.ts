@@ -14,6 +14,7 @@ import {
   TILE_MIN_SIDE,
   assertAtlasFits,
   assertSegmentLocalEdges,
+  bandRows,
   canonicalCover,
   coverDepth,
   demorton,
@@ -414,5 +415,36 @@ describe("segment table rows — validation, per-slot segment ids, the info texe
     // repel()'s exact loop adds 1e-9 in unit coordinates; its BH runs ×1000 (BH_SCALE) with 1e-2.
     expect(segmentSoftening("unit", true)).toBe(1e-9);
     expect(segmentSoftening("unit", false)).toBe(1e-8);
+  });
+});
+
+describe("bandRows — the row bands a sliced force pass covers (#352)", () => {
+  it("covers every atlas row exactly once, in order, for B = 1…8", () => {
+    for (const rows of [1, 2, 3, 7, 571, 1000]) {
+      for (let bands = 1; bands <= 8; bands++) {
+        const seen = new Uint8Array(rows);
+        let next = 0;
+        for (let b = 0; b < bands; b++) {
+          const [r0, r1] = bandRows(b, bands, rows);
+          expect(r0, `rows=${rows} B=${bands} band ${b} starts where the last ended`).toBe(next);
+          expect(r1).toBeGreaterThanOrEqual(r0);
+          for (let r = r0; r < r1; r++) seen[r]!++;
+          next = r1;
+        }
+        expect(next).toBe(rows);
+        expect(seen.every((c) => c === 1), `rows=${rows} B=${bands}`).toBe(true);
+      }
+    }
+  });
+
+  it("splits evenly: band heights differ by at most one row, and no band is empty while B ≤ rows", () => {
+    for (const [rows, bands] of [[571, 3], [1000, 8], [7, 7], [10, 4]] as const) {
+      const heights = Array.from({ length: bands }, (_, b) => {
+        const [r0, r1] = bandRows(b, bands, rows);
+        return r1 - r0;
+      });
+      expect(Math.max(...heights) - Math.min(...heights)).toBeLessThanOrEqual(1);
+      expect(Math.min(...heights)).toBeGreaterThan(0);
+    }
   });
 });

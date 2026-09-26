@@ -34,6 +34,16 @@ export function flatSegments(count: number): SlotRange[] {
 }
 
 /**
+ * Rows `[r0, r1)` of band `band` when a per-slot pass over an atlas of `rows` rows is cut into `bands`
+ * row bands (#352): the bands tile the rows in order, each exactly once, and their heights differ by at
+ * most one row. The streaming transport encodes the force pass one band at a time (a scissor over those
+ * rows), so one tick's GPU work can be spread over frames that each stay within the frame budget.
+ */
+export function bandRows(band: number, bands: number, rows: number): [number, number] {
+  return [Math.floor((band * rows) / bands), Math.floor(((band + 1) * rows) / bands)];
+}
+
+/**
  * Check that `segments` tile the slots `[0, count)` in order: each starts where the previous one ends
  * (empty segments allowed), and together they cover every slot once. Throws otherwise — the passes
  * find a slot's segment by its position, so a gap or an overlap would silently mix segments. Each
