@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { CONVERGED_STEP, Cooling, DEFAULT_FORCE, ForceLayout, MIN_HEAT, STEP_CAP, equilibriumSpacing, seedPositions } from "../force.js";
+import { CONVERGED_STEP, Cooling, DEFAULT_FORCE, DRAG_HEAT, ForceLayout, MIN_HEAT, MIN_SETTLE_TICKS, RECOOL_TICKS, STEP_CAP, equilibriumSpacing, seedPositions } from "../force.js";
 import { BarnesHutTree } from "../quadtree.js";
 import { buildGraph } from "../graph.js";
 
@@ -251,18 +251,69 @@ describe("cooling + convergence (#124)", () => {
     expect(sim.meanStep).toBeLessThan(CONVERGED_STEP * sim.spacing);
   });
 
-  it("run(n, 'hot') keeps full heat — a cold start untangles instead of freezing", () => {
+  it("run(n) keeps full heat by default (a cold start untangles); run(n, 'cool') decays it", () => {
     // Same far-apart pair, same 5 ticks: the cooled run has decayed to MIN_HEAT by its last tick (only
-    // momentum left), the hot one still steps at full heat.
+    // momentum left), the default (hot) one still steps at full heat.
     const hot = buildGraph({ nodeCount: 2, source: [0], target: [1] });
     const cold = buildGraph({ nodeCount: 2, source: [0], target: [1] });
     hot.positions.set([0, 0, 5000, 0]);
     cold.positions.set([0, 0, 5000, 0]);
     const h = new ForceLayout(hot);
     const c = new ForceLayout(cold);
-    h.run(5, "hot");
-    c.run(5);
+    h.run(5);
+    c.run(5, "cool");
     expect(h.meanStep).toBeGreaterThan(2 * c.meanStep);
+  });
+
+  it("batched run(n) calls shorter than MIN_SETTLE_TICKS tick exactly n times at full heat, as before #124", () => {
+    // The pre-#124 contract of run(n) — n ticks at full heat — for a caller that drives the layout in
+    // batches: each call restarts the (hot) schedule, so no batch can stop early or cool.
+    const a = ringOfCliques(6, 5);
+    const b = ringOfCliques(6, 5);
+    seedPositions(a, 400, 400, { force: {} });
+    seedPositions(b, 400, 400, { force: {} });
+    const batched = new ForceLayout(a);
+    const batch = MIN_SETTLE_TICKS - 1;
+    for (let k = 0; k < 8; k++) expect(batched.run(batch)).toBe(batch);
+    const reference = new ForceLayout(b);
+    reference.hold(1);
+    for (let t = 0; t < 8 * batch; t++) reference.tick();
+    expect(Array.from(a.positions)).toEqual(Array.from(b.positions));
+  });
+
+  it("hold(DRAG_HEAT) steps a drag reflow at that fraction of a full-heat tick", () => {
+    // From rest the first step is linear in the heat (v = f·α·heat·damping·stab), so a drag's reflow
+    // at DRAG_HEAT moves nodes exactly that fraction of a fresh full-heat tick.
+    const full = ringOfCliques(6, 5);
+    const drag = ringOfCliques(6, 5);
+    seedPositions(full, 400, 400, { force: {} });
+    seedPositions(drag, 400, 400, { force: {} });
+    const f = new ForceLayout(full);
+    const d = new ForceLayout(drag);
+    f.hold(1);
+    d.hold(DRAG_HEAT);
+    f.tick();
+    d.tick();
+    expect(d.meanStep / f.meanStep).toBeCloseTo(DRAG_HEAT, 5);
+  });
+
+  it("a re-cool from DRAG_HEAT stops once converged, before its RECOOL_TICKS budget", () => {
+    // The post-drag tail every backend runs: cool from DRAG_HEAT over RECOOL_TICKS, stopping at convergence.
+    const g = ringOfCliques(12, 8);
+    seedPositions(g, 800, 600, { force: {} });
+    const sim = new ForceLayout(g);
+    sim.run(1000); // converged layout
+    const held = g.positions[0]!;
+    g.positions[0] = held + 3 * sim.spacing; // a drag moved one node away
+    sim.cool(RECOOL_TICKS, DRAG_HEAT);
+    let ticks = 0;
+    while (ticks < RECOOL_TICKS) {
+      sim.tick();
+      ticks++;
+      if (sim.converged) break;
+    }
+    expect(sim.converged).toBe(true);
+    expect(ticks).toBeLessThan(RECOOL_TICKS);
   });
 
   it("is not converged while accelerating from rest", () => {

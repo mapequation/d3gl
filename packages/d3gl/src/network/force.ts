@@ -305,11 +305,12 @@ export class ForceLayout {
         fx[b]! -= kb * dx;
         fy[b]! -= kb * dy;
       }
-    } else {
+    } else if (springWeight) {
+      // Weighted springs on unit-mass nodes (a caller's own LayoutGraph).
       for (let e = 0; e < edgeCount; e++) {
         const a = source[e]!;
         const b = target[e]!;
-        const k = springWeight ? attraction * springWeight[e]! : attraction;
+        const k = attraction * springWeight[e]!;
         const dx = positions[b * 2]! - positions[a * 2]!;
         const dy = positions[b * 2 + 1]! - positions[a * 2 + 1]!;
         fx[a]! += k * dx;
@@ -317,21 +318,43 @@ export class ForceLayout {
         fx[b]! -= k * dx;
         fy[b]! -= k * dy;
       }
+    } else {
+      // Unit springs: the finest level's loop (also the main-thread drag's per-frame tick), kept free of
+      // any per-edge mass / weight lookup.
+      for (let e = 0; e < edgeCount; e++) {
+        const a = source[e]!;
+        const b = target[e]!;
+        const dx = positions[b * 2]! - positions[a * 2]!;
+        const dy = positions[b * 2 + 1]! - positions[a * 2 + 1]!;
+        fx[a]! += attraction * dx;
+        fy[a]! += attraction * dy;
+        fx[b]! -= attraction * dx;
+        fy[b]! -= attraction * dy;
+      }
     }
 
     // Centering: pull every node toward the (mass-weighted) centroid.
     if (nodeCount > 0) {
       let cx = 0;
       let cy = 0;
-      let total = 0;
-      for (let i = 0; i < nodeCount; i++) {
-        const m = mass ? mass[i]! : 1;
-        cx += m * positions[i * 2]!;
-        cy += m * positions[i * 2 + 1]!;
-        total += m;
+      if (mass) {
+        let total = 0;
+        for (let i = 0; i < nodeCount; i++) {
+          const m = mass[i]!;
+          cx += m * positions[i * 2]!;
+          cy += m * positions[i * 2 + 1]!;
+          total += m;
+        }
+        cx /= total;
+        cy /= total;
+      } else {
+        for (let i = 0; i < nodeCount; i++) {
+          cx += positions[i * 2]!;
+          cy += positions[i * 2 + 1]!;
+        }
+        cx /= nodeCount;
+        cy /= nodeCount;
       }
-      cx /= total;
-      cy /= total;
       for (let i = 0; i < nodeCount; i++) {
         fx[i]! += centering * (cx - positions[i * 2]!);
         fy[i]! += centering * (cy - positions[i * 2 + 1]!);
@@ -382,12 +405,14 @@ export class ForceLayout {
    * Solve for at most `iterations` ticks, stopping as soon as the layout has {@link converged} (#124)
    * — `iterations` is the maximum, not a fixed count. Returns the ticks run.
    *
-   * `"cool"` (the default) decays the heat over the budget: for a seeded layout (multilevel, or a
-   * drag's re-cool) that already has its global arrangement. `"hot"` keeps full heat, for a cold disc
-   * start that still has to untangle — cooling a random start freezes it half-way (web-NotreDame: mean
-   * edge 968 vs 599 after 300 ticks) — so it stops only once it settles on its own.
+   * `"hot"` (the default, as before #124) keeps full heat, which a cold disc start needs to untangle —
+   * cooling a random start freezes it half-way (web-NotreDame: mean edge 968 vs 599 after 300 ticks)
+   * — so it stops only once the layout settles on its own. A call shorter than
+   * {@link MIN_SETTLE_TICKS} never counts as converged, so batched `run(n)` calls tick exactly `n`
+   * times at full heat each. `"cool"` decays the heat over the budget: for a seeded layout
+   * (multilevel, or a drag's re-cool) that already has its global arrangement.
    */
-  run(iterations: number, schedule: "cool" | "hot" = "cool"): number {
+  run(iterations: number, schedule: "cool" | "hot" = "hot"): number {
     if (schedule === "cool") this.cool(iterations);
     else this.hold(1);
     let ticks = 0;

@@ -275,6 +275,16 @@ function asView(level: CoarseLevel, positions: Float32Array, mass: Float32Array)
   };
 }
 
+/** A coarse level (k ≥ 1) as {@link multilevelSeed} solves it. */
+interface SeedLevel {
+  /** Solver view: the level's edges (aggregated weights as springs), positions and masses. */
+  view: LayoutGraph;
+  /** How many finest nodes each of the level's nodes stands for (`view.mass`, typed). */
+  mass: Float32Array;
+  /** Projection from the next finer level (k − 1) into this one. */
+  up: Uint32Array;
+}
+
 /**
  * Place a level's nodes around their parents (the next coarser level's positions): each node lands in
  * a phyllotaxis disc about its parent at the cumulative mass of its earlier siblings, so a parent
@@ -345,23 +355,29 @@ export function multilevelSeed(graph: CoarsenableGraph, opts: MultilevelLayoutOp
   const coarsenIterations = opts.coarsenIterations ?? DEFAULT_COARSEN_ITERATIONS;
   const maxSeedNodes = opts.maxSeedNodes ?? DEFAULT_MAX_SEED_NODES;
   const { levels, projections } = hierarchy ?? buildHierarchy(graph, opts.coarsen);
-  const last = levels.length - 1;
+  const spacing = seedSpacing(graph.nodeCount, width, height, params);
 
-  if (last === 0) {
+  // One record per coarse level k ≥ 1, finest first: its solver view (aggregated edges as spring
+  // weights, its own positions buffer), its masses — how many finest nodes each node stands for,
+  // accumulated finest-up through the projections (level 0 is 1 each, implicit) — and the projection
+  // from the next finer level into it.
+  const coarse: SeedLevel[] = [];
+  let fineMass: Float32Array | undefined;
+  for (const [k, level] of levels.slice(1).entries()) {
+    const up = projections[k]; // level k → level k + 1 (this record's level)
+    if (!up) break; // buildHierarchy pairs every coarse level with its projection
+    const mass = new Float32Array(level.nodeCount);
+    for (let i = 0; i < up.length; i++) mass[up[i]!] = mass[up[i]!]! + (fineMass ? fineMass[i]! : 1);
+    coarse.push({ view: asView(level, new Float32Array(level.nodeCount * 2), mass), mass, up });
+    fineMass = mass;
+  }
+  const top = coarse[coarse.length - 1];
+  if (!top) {
+    // No possible coarsening (tiny or edgeless graph): a reproducible disc seed at the equilibrium.
     seedPositions(graphView(graph), width, height, { force: opts.force });
     return;
   }
-  const spacing = seedSpacing(graph.nodeCount, width, height, params);
 
-  // Masses: how many finest nodes each coarse node stands for (level 0 is 1 each, implicit).
-  const mass: Float32Array[] = [];
-  for (let k = 0; k < last; k++) {
-    const m = new Float32Array(levels[k + 1]!.nodeCount);
-    const fine = k > 0 ? mass[k - 1] : undefined;
-    const projection = projections[k]!;
-    for (let i = 0; i < levels[k]!.nodeCount; i++) m[projection[i]!] = m[projection[i]!]! + (fine ? fine[i]! : 1);
-    mass.push(m); // mass[k - 1] belongs to level k
-  }
   // Coarse springs are the aggregated edge weights. Normalise them to the finest level's unit springs
   // (the finest layout ignores weights): for an unweighted graph a coarse weight is exactly the number
   // of finest edges it stands for; for a weighted one, that count on average.
@@ -374,42 +390,40 @@ export function multilevelSeed(graph: CoarsenableGraph, opts: MultilevelLayoutOp
   }
   const coarseForce: Partial<ForceParams> = { ...opts.force, attraction: params.attraction * (weightSum > 0 ? edges / weightSum : 1) };
 
-  // Positions per level; level 0 aliases graph.positions so the seed lands there.
-  const pos: Float32Array[] = levels.map((lvl, k) =>
-    k === 0 ? graph.positions : new Float32Array(lvl.nodeCount * 2),
-  );
-  /** Solve coarse level `k`: the full budget up to maxSeedNodes, a proportional share above it. */
-  const solve = (k: number): void => {
-    const n = levels[k]!.nodeCount;
+  /** Solve a coarse level, cooled: the full budget up to maxSeedNodes, a proportional share above it. */
+  const solve = ({ view }: SeedLevel): void => {
+    const n = view.nodeCount;
     const ticks = Math.min(coarsenIterations, Math.floor((coarsenIterations * maxSeedNodes) / n));
-    if (n > 1 && ticks > 0) new ForceLayout(asView(levels[k]!, pos[k]!, mass[k - 1]!), coarseForce).run(ticks);
+    if (n > 1 && ticks > 0) new ForceLayout(view, coarseForce).run(ticks, "cool");
   };
 
   // The coarsest level rings a virtual root, shifted so its centre of mass is the viewport centre (the
   // forces conserve it, so the layout stays centred there); then every level down to (but not
   // including) level 0 is prolongated and solved. The caller refines level 0 (streamed, in the worker).
-  const coarsest = levels[last]!.nodeCount;
-  const top = pos[last]!;
-  const topMass = mass[last - 1]!;
-  prolongate(top, new Float32Array(2), new Uint32Array(coarsest), topMass, 1, coarsest, spacing);
+  const coarsest = top.view.nodeCount;
+  const topPos = top.view.positions;
+  prolongate(topPos, new Float32Array(2), new Uint32Array(coarsest), top.mass, 1, coarsest, spacing);
   let mx = 0;
   let my = 0;
   for (let i = 0; i < coarsest; i++) {
-    mx += topMass[i]! * top[i * 2]!;
-    my += topMass[i]! * top[i * 2 + 1]!;
+    mx += top.mass[i]! * topPos[i * 2]!;
+    my += top.mass[i]! * topPos[i * 2 + 1]!;
   }
   const dx = width / 2 - mx / graph.nodeCount;
   const dy = height / 2 - my / graph.nodeCount;
   for (let i = 0; i < coarsest; i++) {
-    top[i * 2] = top[i * 2]! + dx;
-    top[i * 2 + 1] = top[i * 2 + 1]! + dy;
+    topPos[i * 2] = topPos[i * 2]! + dx;
+    topPos[i * 2 + 1] = topPos[i * 2 + 1]! + dy;
   }
-  solve(last);
-  for (let k = last - 1; k >= 1; k--) {
-    prolongate(pos[k]!, pos[k + 1]!, projections[k]!, mass[k - 1], levels[k + 1]!.nodeCount, levels[k]!.nodeCount, spacing);
-    solve(k);
+  solve(top);
+  let coarser = top;
+  for (const level of coarse.slice(0, -1).reverse()) {
+    prolongate(level.view.positions, coarser.view.positions, coarser.up, level.mass, coarser.view.nodeCount, level.view.nodeCount, spacing);
+    solve(level);
+    coarser = level;
   }
-  prolongate(graph.positions, pos[1]!, projections[0]!, undefined, levels[1]!.nodeCount, levels[0]!.nodeCount, spacing);
+  // `coarser` is level 1 now; its projection comes from level 0, the graph itself.
+  prolongate(graph.positions, coarser.view.positions, coarser.up, undefined, coarser.view.nodeCount, coarser.up.length, spacing);
 }
 
 /**
@@ -419,5 +433,5 @@ export function multilevelSeed(graph: CoarsenableGraph, opts: MultilevelLayoutOp
  */
 export function multilevelLayout(graph: CoarsenableGraph, opts: MultilevelLayoutOptions): void {
   multilevelSeed(graph, opts);
-  new ForceLayout(graphView(graph), opts.force).run(opts.iterations ?? DEFAULT_ITERATIONS);
+  new ForceLayout(graphView(graph), opts.force).run(opts.iterations ?? DEFAULT_ITERATIONS, "cool"); // seeded: cool over the budget
 }

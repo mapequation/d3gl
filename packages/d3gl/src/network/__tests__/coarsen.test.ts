@@ -174,8 +174,9 @@ describe("multilevelLayout", () => {
     const multi = ringOfCliques(16, 6);
     const iterations = 80;
 
-    seedPositions(cold, 800, 600);
-    new ForceLayout(cold).run(iterations);
+    // The cold start as the backends run it: an equilibrium-scale disc at full heat.
+    seedPositions(cold, 800, 600, { force: {} });
+    new ForceLayout(cold).run(iterations, "hot");
     multilevelLayout(multi, { width: 800, height: 600, iterations });
 
     expect(tangleRatio(multi)).toBeLessThan(tangleRatio(cold));
