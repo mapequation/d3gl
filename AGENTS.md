@@ -481,11 +481,11 @@ assert the deterministic signature *unconditionally*, and put the wall-clock cei
 
 **Never reduce over all N nodes by scattering N points into one texel** with ADD or MAX blending.
 The blend unit serialises on that texel. The GPU force layout used to find its centroid and its
-bounding box this way: 17.6 ms + 18.8 ms of a 45.6 ms tick at 325k nodes on an M1 Max (53 + 57 of
-138 ms at 1M). Use the segmented reduction instead (`network/gpu/passes/segmented-reduce.ts`). It is
+bounding box this way: 17.3 ms + 18.8 ms of a 43-46 ms tick at 325k nodes on an M1 Max (53 + 57 of
+136-141 ms at 1M). Use the segmented reduction instead (`network/gpu/passes/segmented-reduce.ts`). It is
 a 16-ary gather tree over slot order, with pairwise adds and no blending, plus a canonical-cover range
 query per segment. It writes the segment table's `stats` (Σx, Σy, Σ|v|, count) and `box`. It costs
-0.45 ms at 325k (0.88 ms at 1M), and it is also more accurate: at 1M an offset layout's centroid is
+0.46 ms at 325k (0.7 ms at 1M), and it is also more accurate: at 1M an offset layout's centroid is
 off by 5.5e-4 world units, where a serial float32 chain is off by ~130.
 
 - The guard is the point-draw spy in `gpu-frame-budget-perf.browser.test.ts`: a `POINTS` draw of
