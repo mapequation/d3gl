@@ -306,15 +306,16 @@ function prolongate(
   const rank = new Uint32Array(coarseCount); // per parent: children placed so far
   const k = spacing / Math.sqrt(Math.PI); // a disc of area A·spacing² has radius k·√A
   for (let i = 0; i < n; i++) {
-    const c = projection[i]!;
-    const m = mass ? mass[i]! : 1;
-    const before = filled[c]!;
+    const c = projection[i] ?? 0;
+    const m = mass?.[i] ?? 1;
+    const before = filled[c] ?? 0;
     filled[c] = before + m;
     const r = k * Math.sqrt(before + m / 2);
-    const a = (rank[c]! + c) * GOLDEN; // + c: neighbouring parents don't all start their ring at 0°
-    rank[c] = rank[c]! + 1;
-    fine[i * 2] = coarse[c * 2]! + r * Math.cos(a);
-    fine[i * 2 + 1] = coarse[c * 2 + 1]! + r * Math.sin(a);
+    const turn = rank[c] ?? 0;
+    rank[c] = turn + 1;
+    const a = (turn + c) * GOLDEN; // + c: neighbouring parents don't all start their ring at 0°
+    fine[i * 2] = (coarse[c * 2] ?? 0) + r * Math.cos(a);
+    fine[i * 2 + 1] = (coarse[c * 2 + 1] ?? 0) + r * Math.sin(a);
   }
 }
 
@@ -367,7 +368,9 @@ export function multilevelSeed(graph: CoarsenableGraph, opts: MultilevelLayoutOp
     const up = projections[k]; // level k → level k + 1 (this record's level)
     if (!up) break; // buildHierarchy pairs every coarse level with its projection
     const mass = new Float32Array(level.nodeCount);
-    for (let i = 0; i < up.length; i++) mass[up[i]!] = mass[up[i]!]! + (fineMass ? fineMass[i]! : 1);
+    up.forEach((c, i) => {
+      mass[c] = (mass[c] ?? 0) + (fineMass?.[i] ?? 1);
+    });
     coarse.push({ view: asView(level, new Float32Array(level.nodeCount * 2), mass), mass, up });
     fineMass = mass;
   }
@@ -386,7 +389,7 @@ export function multilevelSeed(graph: CoarsenableGraph, opts: MultilevelLayoutOp
   for (let e = 0; e < graph.source.length; e++) {
     if (graph.source[e] === graph.target[e]) continue;
     edges++;
-    weightSum += graph.weight[e]!;
+    weightSum += graph.weight[e] ?? 0;
   }
   const coarseForce: Partial<ForceParams> = { ...opts.force, attraction: params.attraction * (weightSum > 0 ? edges / weightSum : 1) };
 
@@ -405,15 +408,15 @@ export function multilevelSeed(graph: CoarsenableGraph, opts: MultilevelLayoutOp
   prolongate(topPos, new Float32Array(2), new Uint32Array(coarsest), top.mass, 1, coarsest, spacing);
   let mx = 0;
   let my = 0;
-  for (let i = 0; i < coarsest; i++) {
-    mx += top.mass[i]! * topPos[i * 2]!;
-    my += top.mass[i]! * topPos[i * 2 + 1]!;
-  }
+  top.mass.forEach((m, i) => {
+    mx += m * (topPos[i * 2] ?? 0);
+    my += m * (topPos[i * 2 + 1] ?? 0);
+  });
   const dx = width / 2 - mx / graph.nodeCount;
   const dy = height / 2 - my / graph.nodeCount;
   for (let i = 0; i < coarsest; i++) {
-    topPos[i * 2] = topPos[i * 2]! + dx;
-    topPos[i * 2 + 1] = topPos[i * 2 + 1]! + dy;
+    topPos[i * 2] = (topPos[i * 2] ?? 0) + dx;
+    topPos[i * 2 + 1] = (topPos[i * 2 + 1] ?? 0) + dy;
   }
   solve(top);
   let coarser = top;
