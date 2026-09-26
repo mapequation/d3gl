@@ -119,7 +119,9 @@ Every visual channel maps a flow quantity through a d3 scale, so the map reads q
   `nodeRadius` (`by` is `"weight"`/`"flow"`). A **super-edge** applies the same scale to its accumulated
   subsumed weight, so a heavier super-edge reads as thicker and darker. The arrowhead is part of the
   shape, so it always takes the link's colour — there is no separate arrow fill. Keep range minimums
-  ≥ 1 so nothing vanishes at low flow.
+  ≥ 1 so nothing vanishes at low flow. The `linkStroke` colour is read once per `style()` (or `data()`)
+  call and remembered per weight, so it must be a function of the weight alone: after changing a scale
+  in place (a new domain, a theme swap), call `style()` again to apply it.
 - **`linkBend`** — the ⟂ bow as a **fraction of the link's length** (as for `line` links), so a link
   keeps its shape at every zoom in both size modes; the bow side is derived from the link direction so
   reciprocal links nest automatically.

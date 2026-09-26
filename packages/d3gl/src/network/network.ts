@@ -1,5 +1,5 @@
 import { BaseEngine, type BaseEngineOptions, type HoverHit, type InteractiveLayerOptions, type LaneInteractive, type NodeDragSession } from "../map/base-engine.js";
-import { networkLayers, networkLayersFromCache, noLodStyleCache, drawsLinks, frontierCircles, frontierHalos, boundaryRings, traceBoundaryRings, superEdges, makeSuperEdgesScratch, emitNodes, emitLinks, emitArrows, emitHalfLinks, traceFrontierGlyphs, traceFrontierHalos, traceSuperHalfArrows, traceSuperLines, traceSuperArrows, physicalPieInstances, tracePieWedges, rgbaCss, pickNodes, regionNodes, resolveNodeRadii, resolveNodeRadiusAggregate, resolveImportance, resolveFlowBorder, resolveNodeColors, resolveLinkWidthOf, resolveLinkColorOf, resolveLinkStrokeOf, flowBorderInnerRadii, type ResolvedNetworkStyle, type ModuleBoundaryResolved, type AggregateOutlineResolved, type NoLodStyleCache, type NodeRadiusSpec, type ImportanceSpec, type FlowBorderSpec, type ConstBorder, type LinkWidthSpec, type LinkColorSpec, type LinkStyle } from "./glyphs.js";
+import { networkLayers, networkLayersFromCache, noLodStyleCache, drawsLinks, frontierCircles, frontierHalos, boundaryRings, traceBoundaryRings, superEdges, makeSuperEdgesScratch, emitNodes, emitLinks, emitArrows, emitHalfLinks, traceFrontierGlyphs, traceFrontierHalos, traceSuperHalfArrows, traceSuperLines, traceSuperArrows, physicalPieInstances, tracePieWedges, rgbaCss, pickNodes, regionNodes, resolveNodeRadii, resolveNodeRadiusAggregate, resolveImportance, resolveFlowBorder, resolveNodeColors, resolveLinkWidthOf, resolveLinkColorOf, resolveLinkStrokeOf, flowBorderInnerRadii, type ResolvedNetworkStyle, type ModuleBoundaryResolved, type AggregateOutlineResolved, type NoLodStyleCache, type NodeRadiusSpec, type ImportanceSpec, type FlowBorderSpec, type ConstBorder, type LinkWidthSpec, type LinkColorSpec, type LinkStyle, type RGBAValue } from "./glyphs.js";
 import { rgb } from "d3-color";
 import { ForceLayout, seedPositions, type ForceParams } from "./force.js";
 import { multilevelLayout, type CoarsenOptions } from "./coarsen.js";
@@ -216,6 +216,11 @@ export interface NetworkStyle {
    * Link colour. A single CSS colour (default a light grey), or a `(weight) => cssColour` scale so
    * colour encodes the edge weight/flow (a bare d3 colour scale fits). The arrowhead always takes the
    * link's colour — there is no separate arrow fill.
+   *
+   * The colour is captured once per `style()` (or `data()`) call and remembered **per weight**, so a
+   * scale must be a pure function of the weight. A scale changed in place (a new domain or range, an
+   * accessor reading mutable state such as a theme) takes effect on the next `style()` call — pass it
+   * again then. Until then, what a backend redraws with is unspecified.
    */
   linkStroke?: LinkColorSpec;
   /** Arrowhead size (world units) for directed `linkStyle:"line"` links. Default 3 × linkWidth. */
@@ -737,6 +742,11 @@ export class Network extends BaseEngine {
   private fadeAlpha: Float32Array | null = null;
   /** Cached resolved style; invalidated on style()/data() to avoid per-zoom O(n) radii recompute. */
   private resolvedCache: ResolvedNetworkStyle | null = null;
+  /** The link colour spec resolved once per style()/data() call: the per-weight colour memo
+   *  ({@link resolveLinkColorOf}) and the representative stroke. Kept when only `resolvedCache` is
+   *  dropped — the state-network "both" view re-applies its dot radius on every streamed frame, and
+   *  rebuilding these there would start the memo cold (and re-run the accessor) once per frame. */
+  private linkColors: { colorOf: (weight: number) => RGBAValue; stroke: string } | null = null;
   /** No-LOD style-derived link/arrow attributes cache (#179), keyed by `resolvedCache` identity + graph:
    *  reused on a position-only layout frame so the colour/width scale accessors run O(edges) ONCE per
    *  style version, not per frame. Invalidated implicitly when `resolvedStyleCached` returns a fresh object. */
@@ -897,6 +907,7 @@ export class Network extends BaseEngine {
     this.lodModules = false;
     this.lodHasGeometry = false;
     this.resolvedCache = null;
+    this.linkColors = null;
     this.derivedParentFor = null; this.derivedParent = null; // drop the ancestor-aware parent cache (#162)
     this.fitFallbackBox = null; this.fitKnownBox = null; this.fitNodesArr = null; this.fitNodesFor = null; // fit caches are tied to the old graph/tree
     return this.rebuild();
@@ -1018,6 +1029,7 @@ export class Network extends BaseEngine {
   style(style: NetworkStyle): this {
     this.styleOpts = { ...this.styleOpts, ...style };
     this.resolvedCache = null; // radii/colours/sizeMode changed
+    this.linkColors = null; // the link colour is captured once per style() call
     // Refresh the LOD tree's style geometry (radii/colours) only if a tree already exists. Don't
     // *build* one here: after a data() change the tree is null and the provided modules may not yet
     // match the new graph (lod() supplies fresh ones next) — building now would mismatch and throw.
@@ -1631,7 +1643,7 @@ export class Network extends BaseEngine {
     this.computeStateSizing();
     if (this.activeView === "both" && this.bothDotRadius > 0) {
       this.styleOpts = { ...this.styleOpts, nodeRadius: this.bothDotRadius };
-      this.resolvedCache = null;
+      this.resolvedCache = null; // radii only — `linkColors` (and its warm memo) is kept
     }
     this.deriveStatePositions();
   }
@@ -3209,9 +3221,11 @@ export class Network extends BaseEngine {
     // linkStroke: a single colour, or a (weight)=>colour scale. `linkColorOf` packs RGBA bytes for
     // the WebGL lane; `linkStrokeOf` gives the CSS for the Scene path; `linkStroke` is representative.
     const lsSpec: LinkColorSpec = this.styleOpts.linkStroke ?? DEFAULT_LINK_STROKE;
-    const linkColorOf = resolveLinkColorOf(lsSpec);
     const linkStrokeOf = resolveLinkStrokeOf(lsSpec);
-    const linkStroke = typeof lsSpec === "string" ? lsSpec : linkStrokeOf(1);
+    const { colorOf: linkColorOf, stroke: linkStroke } = (this.linkColors ??= {
+      colorOf: resolveLinkColorOf(lsSpec),
+      stroke: typeof lsSpec === "string" ? lsSpec : linkStrokeOf(1),
+    });
     // nodeFill: a single colour, or a per-node accessor → packed RGBA (categorical module colours).
     const fillSpec = this.styleOpts.nodeFill;
     const nodeFill = typeof fillSpec === "function" ? DEFAULT_NODE_FILL : (fillSpec ?? DEFAULT_NODE_FILL);

@@ -114,6 +114,35 @@ describe("state-network engine (#171)", () => {
     net.destroy();
   });
 
+  it("keeps the resolved link colours across the both view's per-frame restyle (a re-layout resolves none)", async () => {
+    // The both view re-applies its dot radius — and so rebuilds the resolved style — on every streamed
+    // physical frame. Only nodeRadius changes there, so the link colour (resolved once per style() call,
+    // memoised by weight) must survive it: a re-layout re-runs no link colour accessor.
+    const { graph, modules } = tinyStateNetwork();
+    const net = network(host(), { width: 200, height: 200 }); // webgl
+    await net.whenReady();
+    let calls = 0;
+    const linkStroke = (w: number): string => {
+      calls++;
+      return w > 1 ? "#d62728" : "#1f77b4";
+    };
+    const at = (dx: number) => new Float32Array([40 + dx, 100, 120 + dx, 40, 120 + dx, 160]);
+    net.style({ linkStroke }).stateNetwork(graph, { modules, view: "both" }).layout({ backend: "positions", positions: at(0) });
+    expect(net.toSVG()).toMatch(/<(path|line)/); // links drawn (and their colours resolved)
+    const warm = calls;
+    expect(warm, "the accessor ran for the first draw").toBeGreaterThan(0);
+    for (let f = 1; f <= 3; f++) {
+      net.layout({ backend: "positions", positions: at(f * 4) });
+      net.toSVG();
+    }
+    expect(calls, "re-layouts in the both view resolved link colours again").toBe(warm);
+    // A style() call is the documented point where the colour is captured again.
+    net.style({ linkStroke });
+    net.toSVG();
+    expect(calls).toBeGreaterThan(warm);
+    net.destroy();
+  });
+
   it("derives rosette state positions from a force layout of the physical graph (WebGL, no throw)", async () => {
     const { graph, modules } = tinyStateNetwork();
     const net = network(host(), { width: 200, height: 200 }); // default webgl
