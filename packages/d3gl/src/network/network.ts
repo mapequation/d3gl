@@ -259,8 +259,9 @@ export interface NetworkLayoutOptions {
    *  Barnes-Hut solve, streamed without blocking the main thread: each frame spends at most
    *  `min(10 ms, 0.6 × the frame interval)` of GPU time on the layout, positions come back through an
    *  asynchronous (fenced) readback, and layout repaints are throttled to at most 20 per second and about
-   *  half of the main thread and GPU time. `"gpu"` falls back to `"worker"`, with one console warning naming the reason, when
-   *  the render backend is not WebGL or the device lacks float render targets, float blending
+   *  half of the main thread and GPU time (the main-thread figures are measured in Chromium; Firefox and
+   *  Safari are not measured yet). `"gpu"` falls back to `"worker"`, with one console warning naming the
+   *  reason, when the render backend is not WebGL or the device lacks float render targets, float blending
    *  (`EXT_float_blend`) or a large enough texture size for the graph. The fallback is a full worker
    *  run: it honours `multilevel` and streams the LOD tree like `"worker"`.
    *
