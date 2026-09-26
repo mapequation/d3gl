@@ -1,12 +1,14 @@
 # GPU segmented force solver: stage 1 through the flat path, plus async readback
 
-**Date:** 2026-09-26 (revision 2, same day)
-**Status:** Draft design, pre-implementation. Revision 2 answers the webgl-feasibility,
+**Date:** 2026-09-26 (revision 3, same day)
+**Status:** Design, pre-implementation. Revision 2 answers the webgl-feasibility,
 numerics-correctness and engine-integration reviews; §18 records every finding and its verdict.
+Revision 3 records the maintainer's answers to the open questions (§15, all resolved) and resolves
+the issue keys that have been filed (§14).
 **Issues:** #333 (the primitive), #184 (GPU to renderer), #124 (convergence stop), #312, #311, #297,
 #181 and #189 (later consumers), epic #106 (N8)
 **Builds on:** `docs/superpowers/specs/2026-07-02-n8-gpu-layout-design.md` (N8), and the shared force
-schedule on `fix/layout-seed-equilibrium` (#<seed-scale>, §8)
+schedule on `fix/layout-seed-equilibrium` (#345, §8)
 
 **Terms.** *Stage 1* is the flat layout (one segment). *Stage 2* is many segments: nested (#333),
 containment (#181), state layouts (#189). *PR n* is a row of the plan in §14.
@@ -94,7 +96,7 @@ was measured (see §15, Q7).
   - layout GPU work per frame ≤ the budget (default 10 ms, §6.5.3), so pan/zoom never waits behind
     a whole tick;
   - layout updates on screen at the rate the engine can repaint, capped by the repaint throttle
-    (§6.5.4). That rate depends on engine-side work (#<lod-frame-waste>, #<lod-incoherent>, PR 3c)
+    (§6.5.4). That rate depends on engine-side work (#342, #343, PR 3c)
     and is reported as measured, not assumed (§10.3);
   - with the seed and the stop rule, convergence in about 100-150 ticks, i.e. about **2.5-5 s** at
     the measured tick throughput under rendering (§10.3), instead of 300 fixed ticks (13.4 s).
@@ -131,6 +133,11 @@ and PR 3c own it.
    slicing a tick into row bands (§6.5.3); without slicing, one tick at 325k (13-17 ms) or 1M
    (45-55 ms) exceeds a 10 ms budget and the decision would not be met.
 3. The force law stays as it is.
+4. **Revision-3 answers** (2026-09-26): layout `backend: "auto"` is added with the default
+   unchanged, packed pyramid levels, an idle worker after a swap, a fixed 10 ms budget, one
+   animation for cold nested layouts, invariants plus a documented tolerance, the coarsening tree
+   from the worker, the worker LOD refit while the GPU streams, and one PBO. §15 lists them with the
+   rejected alternatives.
 
 ## 4. Architecture
 
@@ -410,7 +417,7 @@ full-screen pass); it is not measured. Memory: 2 chains × ≈ N/15 texels × 16
     not carry base/max level.
   - A single mip texture would therefore need raw `texParameteri` calls per reduce pass through the
     `WebGLDevice` seam, fighting luma's state tracking.
-- **Decision (recommended): packed levels in three textures, pure luma.**
+- **Decision (maintainer, §15 Q2): packed levels in three textures, pure luma.**
   - `L0` (`A × H`, `rgba32f`) holds level 0. It is the only level whose w channel, the second
     moment (#251), is read.
   - `Podd` holds levels 1, 3, 5, …: level 1 at (0,0), the rest stacked in a column to its right.
@@ -422,8 +429,8 @@ full-screen pass); it is not measured. Memory: 2 chains × ≈ N/15 texels × 16
   - `fetchCell(level, cx, cy)` becomes a 3-way branch instead of today's 11-way unrolled switch.
   - The largest dimension is `A`, the same device limit as today's single level.
   - At G = 1024 this uses 23.3 MB instead of 22.4 MB (+4%, §10.2).
-  - Alternative: one mip texture plus raw-GL base/max clamps. It saves the 4% but adds a raw-GL
-    seam. Maintainer decision (§15, Q2).
+  - Rejected: one mip texture plus raw-GL base/max clamps. It would save the 4% but add a raw-GL
+    seam (§15, rejected alternatives).
 
 #### 6.2.4 Exact loop
 
@@ -527,7 +534,7 @@ FBO and `Model`), plus a bare texture per prolongate-only level. It reads positi
     GPU seed in this spec is the **mass-weighted** variant of §8, which lays out every level at the
     finest equilibrium scale by construction. It is expected to be at least as good, but that has
     not been measured on the GPU; gpu-ml-seed-plain re-measures it in its Performance section.
-  - **Source of the tree: the layout worker** (recommended, §15 Q7). The worker already coarsens for
+  - **Source of the tree: the layout worker** (decided, §15 Q7). The worker already coarsens for
     the worker multilevel path. A new `MainToWorker` variant `{ type: "coarsen" }` (in
     `worker-protocol.ts`) returns the levels (counts, CSR with weights, parents, masses, prolongation
     offsets) and the LOD topology as transferables. The main thread builds the solver while the
@@ -593,7 +600,8 @@ FBO and `Model`), plus a bare texture per prolongate-only level. It reads positi
   `getBufferParameter(PIXEL_PACK_BUFFER, BUFFER_USAGE) === STREAM_READ`.
 - **One PBO by default.** The repaint throttle issues a readback at most every `minFrameMs`
   (≥ 50 ms, §6.5.4), so the previous copy has almost always signalled by the time the next is due.
-  If it has not, the copy is skipped for that frame. A ring of 2 is the alternative (§15, Q9). A
+  If it has not, the copy is skipped for that frame. Decided (§15 Q9): one PBO; a ring of 2 was
+  rejected. A
   48-byte stats PBO (raw, `STREAM_READ`) carries `segStats`, `segBox` and the latch state in the
   same fence.
 - **Harvest.** `getBufferSubData(PIXEL_PACK_BUFFER, 0, graph.positions, 0, 2N)` straight into the
@@ -632,7 +640,8 @@ that.
 
 - **Budget.** `budget = min(budgetMs, 0.6 × median rAF interval)`, with `budgetMs = 10` by default.
   At 60 Hz that is 10 ms; at 120 Hz it is 5 ms. Either way the layout gets at most about 60% of the
-  GPU (§15, Q4).
+  GPU. Decided (§15 Q4): this fixed budget for now; it neither drops during pan/zoom nor rises when
+  idle.
 - **Gate: up to 2 frames in flight.** At `afterRender()` of frame f, new items are encoded only if the
   budget fence of frame f−2 has signalled. If it has not, the GPU is behind: encode nothing, halve
   `k`, and hold `k` for 30 frames. Otherwise, once the hold has expired, `k` grows by 1.
@@ -660,7 +669,7 @@ sustain:
 
 - `onFrame` fires only when a new harvest has landed **and** at least
   `max(minFrameMs, 2 × lastRepaintMs)` has passed since the previous `onFrame`.
-  `minFrameMs` defaults to 50 ms (≤ 20 layout repaints per second). The `2 ×` term caps the main
+  `minFrameMs` defaults to 50 ms (≤ 20 layout repaints per second; decided, §15 Q4). The `2 ×` term caps the main
   thread spent on layout repaints at about 50%, whatever the engine costs.
 - The readback copy is issued on the same cadence (reading back more often than repainting is
   waste).
@@ -669,7 +678,7 @@ sustain:
 - **Measured consequence for today's engine.** The worker path's layout frame costs 51.9 ms of main
   thread with LOD on, so the throttle would allow about 10 layout repaints per second at 50% main
   thread. The GPU path without PR 3c would add `computeLODGeometry` (16-23 ms) to every one of them.
-  Faster repaints need the engine-side work (#<lod-frame-waste>, #<lod-incoherent>) and PR 3c
+  Faster repaints need the engine-side work (#342, #343) and PR 3c
   (§12.1). The GPU transport does not claim a user-visible fps on its own.
 - `frameEvery`, when given explicitly, means "at most one `onFrame` per `frameEvery` completed
   ticks". It keeps tick-count-based tests deterministic. When omitted (the default under §8), the
@@ -754,7 +763,7 @@ layout would not be deterministic. The GPU therefore decides it per tick:
     (§12.2), not the literal `layoutOpts.backend === "worker"`;
   - one `console.warn` names the reason; the handle's `transport`/`shared` report the live worker
     transport (#297: getters, not values captured once).
-- **Backend swap (#311, PR 2b). Recommended policy:**
+- **Backend swap (#311, PR 2b). Policy (decided, §15 Q3):**
   - A GPU layout's lifetime is tied to its device. Today `onBackendSwapped` fires **after**
     `old.backend.destroy()`, which destroys the luma device (`base-engine.ts:2290`, then `:2317`;
     `webgl-backend.ts:611` `device.destroy()`), so a teardown there would run against a
@@ -766,9 +775,10 @@ layout would not be deterministic. The GPU therefore decides it per tick:
     state), so a swap does not rerun the full `iterations` (300 × ~700 ms at 325k on the worker). On
     Canvas/SVG that resolves to the worker. This needs a "seed from current positions" option on the
     flat worker path (the nested path has `initial`).
-  - If it had settled, either an idle worker handle is created so drag reheat keeps working (it holds
-    a full copy of the graph: 12 MB of edge endpoints at 325k, plus the node arrays), or the layout
-    just stops. That is a memory trade-off for the maintainer (§15, Q3).
+  - If it had settled, an **idle worker handle** is created so drag reheat keeps working. It holds a
+    full copy of the graph: 12 MB of edge endpoints at 325k (~37 MB at 1M), plus the node arrays.
+    The maintainer accepted that memory (§15 Q3); stopping only was rejected because a drag after
+    the swap would no longer reflow.
 
 ## 7. Tick pipeline (flat, stage 1 complete)
 
@@ -791,7 +801,7 @@ layout would not be deterministic. The GPU therefore decides it per tick:
   hub chunk pass is not part of the force pass at all: it renders into a different framebuffer and
   must finish before the gather reads it.
 
-## 8. The shared force schedule (`fix/layout-seed-equilibrium`, #<seed-scale>)
+## 8. The shared force schedule (`fix/layout-seed-equilibrium`, #345)
 
 That branch (uncommitted at the time of writing; the names below are its current API and may still
 move) changes the shared physics. The GPU path adopts it and defines nothing of its own.
@@ -836,7 +846,7 @@ move) changes the shared physics. The GPU path adopts it and defines nothing of 
 
 **Dependencies.** That branch already edits `gpu-force-layout.ts` (`Cooling`, `alpha · heat`,
 `stepCap`), `gpu-transport.ts` and `gpu-multilevel-seed.ts`, the files PRs 1, 3a and 6 refactor in
-place. **Recommended: land #<seed-scale> first and rebase this series on it.** If it is late:
+place. **Recommended: land #345 first and rebase this series on it.** If it is late:
 
 - PRs 1, 2a, 3a, 4 and 5 do not need it; they keep today's fixed-alpha semantics, and §9 is defined
   against the code they start from;
@@ -938,7 +948,7 @@ node to the next cell or flip an accept. The contract is therefore stated as:
 | Transport main thread per rAF (harvest + encode) | ~230 ms block (sync fence) | ≤ ~3 ms (encode ≤ 2 ms + harvest memcpy of 2.6 MB ≤ ~1-2 ms) | T7, asserted |
 | Pan/zoom GPU latency added by the layout | a whole 5-tick batch (~230 ms) | ≤ the budget (10 ms at 60 Hz) | T7 throughput leg |
 | Layout repaints per second, 325k, LOD off | ~4 | min(20, 1000 / (2 × repaint ms)); repaint ms at 325k / 1.5M edges with LOD off **to be measured** in PR 3a | T7 report |
-| Layout repaints per second, 325k, LOD on | ~4 (GPU) / 1 per 3-4 s (worker) | worker-path repaint is 51.9 ms today → ~10 per second at 50% main thread; better only with #<lod-frame-waste>, #<lod-incoherent> and PR 3c | T7 LOD leg vs the worker baseline |
+| Layout repaints per second, 325k, LOD on | ~4 (GPU) / 1 per 3-4 s (worker) | worker-path repaint is 51.9 ms today → ~10 per second at 50% main thread; better only with #342, #343 and PR 3c | T7 LOD leg vs the worker baseline |
 | Tick throughput, 325k | 300 ticks in 13.4 s (~22/s, UI frozen) | ~35-45 ticks/s (est.; measured under rendering) | T7 ticks/s |
 | Time to converge, 325k | 13.4 s (300 fixed ticks) | ~2.5-5 s (100-150 ticks ÷ measured ticks/s; needs §8 and PR 3b) | T7 report |
 | Time to converge, 1M | ~48 s + a frozen UI (extrap.) | ~12 s at the 10 ms budget (est.) | 1M bench |
@@ -972,7 +982,8 @@ gathers.
   - *collide* phase: rest-length springs `(ra + rb) · PAD` on the same predictor, then collision.
   - Integrate: `v' = (v* + springs) · 0.6`, `x' = x + v'`, then collision in the collide phase.
   - The remaining difference is Jacobi vs Gauss-Seidel: the CPU applies links and collision pairs
-    one at a time. Q6 covers only that.
+    one at a time. Decided (§15 Q6): the GPU output must pass the CPU invariants and stay within a
+    documented tolerance of the CPU reference; that tolerance covers only this difference.
   - Links are the CPU `sparsifyLinks` output with weights (`weights` texture).
 - **Collision: a K-occupant grid, complete by construction.** The CPU grid (`collide()`) uses
   `cell = 2 · maxR · PAD` with unbounded linked lists, so it finds every contact pair. The GPU grid
@@ -1003,7 +1014,7 @@ gathers.
   `d² = 0` it sets `d = 1e-9` and `push = (min − d)/d ≈ min · 1e9`, then multiplies by a *unit*
   vector. Two coincident discs of radius 0.05 end 1.15e8 apart; the composition extent explodes and
   `scale_p` collapses every sibling to a point. The fix (displacement magnitude = `min` when
-  `d² = 0`) lands as its own patch PR before gpu-nested (key #<nested-coincident-fix>, §16).
+  `d² = 0`) lands as its own patch PR before gpu-nested (key #357, §16).
 - **Slot → texel mapping (a measured prerequisite of gpu-nested).** Row-major slots in an atlas
   571-1000+ texels wide put W-strided rows in one 2×2 quad or SIMD group, so a group mixes slots of
   different segments with different paths (exact loop, tile walks of different depths, K-occupant
@@ -1036,7 +1047,7 @@ gathers.
   `landNested` and `fitKnownBox`, and the tween eases them in). The GPU nested path honours
   `stream: false` the same way: solve through the budgeted loop (the main thread never blocks), read
   back once, `landNested`, tween. **Only cold layouts stream**, as one animation of all depths
-  converging together (§15, Q5). The Navigator's `RELAYOUT` is warm with `transition: 600`, so it
+  converging together (decided, §15 Q5; per-depth frames were rejected). The Navigator's `RELAYOUT` is warm with `transition: 600`, so it
   gets "~2 s solve, then the 600 ms tween" instead of today's ~30 s frozen, not a streamed animation.
 - **Cost.**
   - A tick costs about what the flat tick costs at N_tree slots, minus BH depth (walks are
@@ -1096,27 +1107,37 @@ at the fit view, declutter spikes of 50-450 ms when zoomed). A fast GPU stream w
 onto the main thread at the repaint rate. AGENTS lifecycle §5 treats that as a regression against
 the worker baseline, and it may not be deferred.
 
-**Options** (maintainer decision, §15 Q8; PR 3c builds the chosen one):
+**Decision: A, the worker refits the adopted tree** (§15 Q8; PR 3c builds it).
 
-| Option | What runs where | Main thread per repaint vs the worker baseline | Cost to build | Memory |
-|---|---|---|---|---|
-| **A. Worker refit (recommended)** | The worker keeps the coarsening tree it built for `{ type: "coarsen" }`. At each throttled repaint the main thread posts the harvested positions (`{ type: "lod-geometry" }`, a 2.6 MB copy, ~1 ms; shared when `crossOriginIsolated`), and the worker returns the geometry (5.1 MB, transferred), as its frame message does today. Positions and geometry are applied together as one frame | the same work as the worker path's frame; one worker round trip (~20-25 ms) of extra latency | a protocol message and a worker handler around the existing `computeLODPositions` | the worker holds the graph and tree, as on the worker path (12 MB of edge endpoints plus the tree at 325k); the main thread no longer builds a tree |
-| B. GPU refit | centroids as range reductions over the leaves in LOD-DFS order; extents as D bottom-up passes (13 on web-NotreDame); read back with the positions | geometry apply only | new passes, a DFS permutation, +5.1 MB PBO; it is the start of #184's GPU LOD | +5.1 MB GPU at 325k |
-| C. Main-thread refit + throttle | the tree is adopted as a main-thread tree (`lodTree`, `lodWorkerTree = null`), and `recomputeLODGeometry` refits per repaint, bounded by the §6.5.4 duty cap | **+16-23 ms per repaint** (a regression by lifecycle §5, needs sign-off) | smallest | none extra |
+- **What runs where.** The worker keeps the coarsening tree it built for `{ type: "coarsen" }`. At
+  each throttled repaint the main thread posts the harvested positions (`{ type: "lod-geometry" }`, a
+  2.6 MB copy, ~1 ms; shared when `crossOriginIsolated`), and the worker returns the geometry
+  (5.1 MB, transferred), as its frame message does today. Positions and geometry are applied
+  together as one frame.
+- **Main thread per repaint vs the worker baseline:** the same work as the worker path's frame, plus
+  one worker round trip (~20-25 ms) of latency.
+- **Cost to build:** a protocol message and a worker handler around the existing
+  `computeLODPositions`.
+- **Memory:** the worker holds the graph and tree, as on the worker path (12 MB of edge endpoints
+  plus the tree at 325k); the main thread no longer builds a tree.
 
-For any option:
+Rejected (§15): B, a GPU refit (range reductions in LOD-DFS order plus D bottom-up extent passes,
++5.1 MB GPU at 325k, more code; it stays the natural start of #184's GPU LOD), and C, a main-thread
+refit under the throttle (+16-23 ms per repaint, a regression against the worker baseline by
+lifecycle §5).
 
-- **Tree adoption semantics.** With A, the tree is adopted as `lodWorkerTree`, which is correct
-  because the worker keeps writing geometry every frame. With B or C it must be adopted as a
-  main-thread tree or an explicit adopted-tree mode whose geometry the GPU or the main thread
-  refits; adopting it as `lodWorkerTree` would freeze the aggregates at their first positions and
-  make `lodSource` report `"worker"` for geometry the worker never computes.
-- **The repaint throttle** (§6.5.4, PR 3a) bounds the main-thread duty cycle in all three options.
+Also:
+
+- **Tree adoption semantics.** The tree is adopted as `lodWorkerTree`, which is correct because the
+  worker keeps writing geometry every frame. Adopting it as `lodWorkerTree` without the worker refit
+  would freeze the aggregates at their first positions and make `lodSource` report `"worker"` for
+  geometry the worker never computes.
+- **The repaint throttle** (§6.5.4, PR 3a) bounds the main-thread duty cycle.
 - **T7 gets a LOD leg** with the Navigator's LOD config that compares main-thread ms per repaint
   against the worker baseline on the same graph, and T8 asserts that aggregate cx/cy follow the GPU
   frames during streaming.
 - The cut and declutter costs themselves (which the worker path pays per frame too) belong to
-  #<lod-frame-waste> and #<lod-incoherent>. They are not self-deferred: they are reported as measured
+  #342 and #343. They are not self-deferred: they are reported as measured
   in each PR's Performance section, and the throttle keeps them from monopolising the main thread.
 
 ### 12.2 Backend resolution and `"auto"`
@@ -1144,7 +1165,7 @@ For any option:
   `nestedLayout` for nested layouts (1508), which blocks for about 30 s on the Navigator's 325k warm
   re-cluster.
 
-**Proposal** (a maintainer decision, §15 Q1): add `backend: "auto"` in PR 2c:
+**Decision** (§15 Q1): add `backend: "auto"` in PR 2c:
 - it resolves after `whenBackendSettled()` to the GPU when `gpuLayoutSupport(caps, need)` passes for
   *this* graph, and to the worker otherwise (with the worker's own sync fallback);
 - it prints **no warning** on fallback, because falling back is the expected outcome;
@@ -1156,9 +1177,8 @@ For any option:
 - the default of `layout({})` does **not** change in this series. Flipping it later is a separate,
   user-visible decision.
 
-Alternatives: (a) no new value; the app passes `"gpu"`, which falls back safely after PR 2a. PR 2c
-is then dropped, and the resolved-transport part of PR 2a still ships. (b) Make `"auto"` the default
-now. That changes the backend for every user, including SSR and tests.
+Rejected (§15): no new value (the app passes `"gpu"`), and making `"auto"` the default now, which
+would change the backend for every user, including SSR and tests.
 
 ### 12.3 Navigator changes (`src/components/NetworkView.tsx`)
 
@@ -1307,25 +1327,31 @@ one texel. Blend serialises it (17-19 ms at 325k); reduce with a gather tree.* P
 Each row is one PR and one issue key; each ships on its own. Keys are resolved to issue numbers when
 the issues are filed (sub-issues of #333 unless noted). Revision 2 keeps the original keys and adds
 `gpu-swap-policy`, `gpu-auto-backend`, `gpu-convergence-stop`, `gpu-lod-stream` and
-`nested-coincident-fix`.
+`nested-coincident-fix`. Every row is in scope after revision 3, including 2c (`"auto"`, with the
+default unchanged).
+
+**Filed issues.** gpu-reductions #349, gpu-float-blend #351, gpu-async-readback #352, gpu-csr-chunk
+#350, gpu-ml-seed-plain #353, gpu-tile-pyramid #354, gpu-nested #355, nested-coincident-fix #357,
+the shared schedule #345. Not filed yet: gpu-swap-policy (implements #311), gpu-auto-backend,
+gpu-convergence-stop (the GPU part of #124) and gpu-lod-stream.
 
 | # | Key | Scope | Depends on | User-visible outcome | Perf entry (before → after) | Existing tests changed on purpose |
 |---|---|---|---|---|---|---|
 | 1 | **gpu-reductions** | segment table (S = 1), 16-ary reduction tree + range query (MRT, pairwise fragment sums), centering from `segStats`, pyramid box from `segBox`; delete `CentroidReducePass` + the bbox scatter; shared pass helper with the explicit clear; construction-time split measured; T0/T1/T5/T6 | — | 325k tick 45-51 → ~13-17 ms; 1M ~155 → ~50 ms | per tick −2 serialized O(N) point blends (N = all layout nodes), +O(N/15) gathers; +0.7 MB | none |
 | 2a | **gpu-float-blend** | `gpuLayoutSupport` (float RT, `texture-blend-float-webgl`, limits, read-format probe, functional probe); fallback with every option (`multilevel`, `lod`, `coarsen`, `onLODTree`, `lodStreaming`); the resolved-backend class + transport and the LOD guards keyed on it; #297 live transport; T8 fallback legs | — | no silent wrong-force layouts on devices without float blend; a fallback keeps the worker's LOD streaming | no per-frame change (checks once per `layout()`); removes the main-thread tree build + per-frame refit after a fallback | none |
-| 2b | **gpu-swap-policy** | pre-swap hook; destroyed-device-tolerant teardown; warm restart with remaining ticks + heat; flat worker warm-start option; context-loss restart; idle worker or stop-only (Q3); T8 swap + context-loss legs | 2a, 3a | backend swaps and lost contexts keep the layout going | none per frame; idle worker memory if Q3 picks it | none |
-| 2c | **gpu-auto-backend** | `backend: "auto"` (if Q1 adopts it): route all 16 checks through the resolved notion; T8 `"auto"` legs | 2a | apps can ask for "GPU when it works" without warnings | none | none |
-| 3a | **gpu-async-readback** | frame loop driven by the engine (render → layout); work items + band slicing; fence controller (no timer path); raw `STREAM_READ` PBO, format probe, pack only when needed; harvest before encode; repaint throttle; `settled` after harvest; NaN and context-loss detection; T6 additions, T7 | 1 (the stats readback; the PBO/budget part alone would not need it) | main thread ~230 → ≤ 3 ms per rAF; pan/zoom never waits behind a tick; layout repaints at the throttled rate | +2.6 MB GPU at 325k (+8 MB at 1M); −2 × 2.6 MB CPU allocations per frame; layout repaint rate ≤ 20/s and ≤ 50% main thread | `gpu-reheat`, `gpu-frame-budget-perf` |
-| 3b | **gpu-convergence-stop** | per-tick GPU stop latch; `Cooling` in the transport; reheat mapping; T9 | 1, 3a, #<seed-scale> | runs stop at convergence (#124 GPU part) | fewer ticks per run (~100-150 instead of 300 at 325k); +32 B | `gpu-convergence`, `gpu-reheat` |
-| 3c | **gpu-lod-stream** | `{ type: "coarsen" }` protocol; LOD geometry off the main thread per Q8 (A: `{ type: "lod-geometry" }` worker refit); correct tree adoption; T7 LOD leg vs the worker baseline, T8 aggregate test | 2a (resolved transport), 3a | the GPU path with LOD on costs the main thread no more per repaint than the worker path | main thread per repaint: −16-23 ms `computeLODGeometry` vs today's GPU path; −244-308 ms tree build once | none |
+| 2b | **gpu-swap-policy** | pre-swap hook; destroyed-device-tolerant teardown; warm restart with remaining ticks + heat; flat worker warm-start option; context-loss restart; idle worker for a settled layout (Q3); T8 swap + context-loss legs | 2a, 3a | backend swaps and lost contexts keep the layout going; drag reheat still works after a swap | none per frame; idle worker after a swap of a settled layout (~12 MB edge endpoints + node arrays at 325k, ~37 MB at 1M) | none |
+| 2c | **gpu-auto-backend** | `backend: "auto"` (Q1: in; the `layout({})` default stays unchanged): route all 16 checks through the resolved notion; T8 `"auto"` legs | 2a | apps can ask for "GPU when it works" without warnings | none | none |
+| 3a | **gpu-async-readback** | frame loop driven by the engine (render → layout); work items + band slicing; fence controller with the fixed 10 ms budget (Q4, no timer path); one raw `STREAM_READ` PBO (Q9), format probe, pack only when needed; harvest before encode; repaint throttle; `settled` after harvest; NaN and context-loss detection; T6 additions, T7 | 1 (the stats readback; the PBO/budget part alone would not need it) | main thread ~230 → ≤ 3 ms per rAF; pan/zoom never waits behind a tick; layout repaints at the throttled rate | +2.6 MB GPU at 325k (+8 MB at 1M); −2 × 2.6 MB CPU allocations per frame; layout repaint rate ≤ 20/s and ≤ 50% main thread | `gpu-reheat`, `gpu-frame-budget-perf` |
+| 3b | **gpu-convergence-stop** | per-tick GPU stop latch; `Cooling` in the transport; reheat mapping; T9 | 1, 3a, #345 | runs stop at convergence (#124 GPU part) | fewer ticks per run (~100-150 instead of 300 at 325k); +32 B | `gpu-convergence`, `gpu-reheat` |
+| 3c | **gpu-lod-stream** | `{ type: "coarsen" }` protocol; LOD geometry off the main thread by a worker refit (Q8 = A: `{ type: "lod-geometry" }`); correct tree adoption; T7 LOD leg vs the worker baseline, T8 aggregate test | 2a (resolved transport), 3a | the GPU path with LOD on costs the main thread no more per repaint than the worker path | main thread per repaint: −16-23 ms `computeLODGeometry` vs today's GPU path; −244-308 ms tree build once | none |
 | 4 | **gpu-csr-chunk** | rows ≤ 256 gather unchanged, hub chunk render pass + partial gather, `weights` hook, cap removed; T4 | — | hub springs correct (13.5k half-edges restored) | +< 0.1 ms, +< 0.1 MB | fixtures with a > 4096 hub (none today) |
-| 5 | **gpu-tile-pyramid** | tile packing, `L0`/`Podd`/`Peven` packed levels (3 samplers), tile-root traversal, softening per segment, segmented exact loop (`exactMax` option); T2/T3 | 1 | none on flat (equal within §9); unlocks segments | +0.96 MB; same pass count | none |
-| 6 | **gpu-ml-seed-plain** | capacity + `setLevel` (one solver, root-level uniform in the per-level textures), per-level state reset, mass-weighted coarse levels, `leafSeed` gather, seed work items in the budgeted loop, queued pins, seed frame, `multilevel` honoured (#312); T10 | 1, 3a, 3c (tree from the worker), #<seed-scale> | plain graphs converge in fewer ticks (re-measured with the mass-weighted seed); no main-thread tree build | peak memory ↓ (no second solver per level); seed-only textures (§10.2); seed levels spread across frames | `gpu-multilevel-seed`, `gpu-backend-integration` |
-| 7 | **gpu-nested** | nested batched solve (segments = parents), integration constants of §11.1, complete K-occupant collision, composition passes, boundary discs, warm start + two-pass `placeOver`, `stream: false` for warm/tween, slot-mapping measurement, routing `gpu`/`auto` + `nested`; stage-2 tests | 1, 3a, 4, 5, #<nested-coincident-fix> | 1M-leaf nested ≲ 5-10 s (CPU ~60 s); 325k warm re-cluster ~30 s frozen → ~2 s + tween | new per-tick collision passes (collide phase only); tile atlas ≤ ~47 MB at 336k slots | nested tests gain GPU legs |
+| 5 | **gpu-tile-pyramid** | tile packing, `L0`/`Podd`/`Peven` packed levels (3 samplers, Q2), tile-root traversal, softening per segment, segmented exact loop (`exactMax` option); T2/T3 | 1 | none on flat (equal within §9); unlocks segments | +0.96 MB; same pass count | none |
+| 6 | **gpu-ml-seed-plain** | capacity + `setLevel` (one solver, root-level uniform in the per-level textures), per-level state reset, mass-weighted coarse levels, `leafSeed` gather, seed work items in the budgeted loop, queued pins, seed frame, `multilevel` honoured (#312); T10 | 1, 3a, 3c (tree from the worker), #345 | plain graphs converge in fewer ticks (re-measured with the mass-weighted seed); no main-thread tree build | peak memory ↓ (no second solver per level); seed-only textures (§10.2); seed levels spread across frames | `gpu-multilevel-seed`, `gpu-backend-integration` |
+| 7 | **gpu-nested** | nested batched solve (segments = parents), integration constants of §11.1, complete K-occupant collision, composition passes, boundary discs, warm start + two-pass `placeOver`, `stream: false` for warm/tween, slot-mapping measurement, routing `gpu`/`auto` + `nested`; stage-2 tests | 1, 3a, 4, 5, #357 | 1M-leaf nested ≲ 5-10 s (CPU ~60 s); 325k warm re-cluster ~30 s frozen → ~2 s + tween | new per-tick collision passes (collide phase only); tile atlas ≤ ~47 MB at 336k slots | nested tests gain GPU legs |
 
-**Recommended order.** Land #<seed-scale> first. Then, for the flat consumer: **1 → 3a → 3c → 6**,
-with 2a (before 3c), 4 and (once #<seed-scale> has landed) 3b in parallel. The Navigator switch waits for 2a,
-3a and 3c (§12.3). 2b and 2c are independent. Nested: **5 → 7**, after #<nested-coincident-fix>.
+**Recommended order.** Land #345 first. Then, for the flat consumer: **1 → 3a → 3c → 6**,
+with 2a (before 3c), 4 and (once #345 has landed) 3b in parallel. The Navigator switch waits for 2a,
+3a and 3c (§12.3). 2b and 2c are independent of that path and both in scope. Nested: **5 → 7**, after #357.
 
 Why the dependencies changed in revision 2:
 - 6 no longer depends on 5: `setLevel` only needs a per-level root level, which today's per-level
@@ -1337,7 +1363,7 @@ Why the dependencies changed in revision 2:
 
 **Issue mapping.**
 - 3a fixes the Milestone-A half of #184 (the issue stays open for GPU-resident positions).
-- 3b fixes the GPU part of #124. #124 closes in whichever of #<seed-scale> and 3b lands last.
+- 3b fixes the GPU part of #124. #124 closes in whichever of #345 and 3b lands last.
 - 2a fixes #297 and the fallback half of #312 (`Related to #312`); 6 closes #312.
 - 2b fixes #311.
 - 7 fixes #333.
@@ -1347,41 +1373,46 @@ Each PR carries a changeset (patch; `backend: "auto"` is an addition, patch befo
 construction long task), and docs updates: `website/src/content/docs/examples/network.mdx` GPU
 section, the `gpu-transport.ts` header, and the `NetworkLayoutOptions` JSDoc.
 
-## 15. Open questions (maintainer decisions)
+## 15. Maintainer decisions (resolved 2026-09-26)
 
-1. **Layout `backend: "auto"`.** Add it in PR 2c (recommended), or have the app pass `"gpu"`? When,
-   if ever, should it become the default for `layout({})`?
-2. **Pyramid level storage.** Packed levels in 3 textures, pure luma, +4% memory (recommended), or
-   one mip texture with raw-GL base/max-level clamps per reduce pass?
-3. **#311 swap policy.** After a swap, continue warm on the new backend (recommended; needs a flat
-   worker warm-start option). For a settled layout, create an idle worker so drag reheat keeps
-   working (it holds a full copy of the graph: ~12 MB of edge endpoints plus node arrays at 325k, and
-   ~37 MB of endpoints at 1M), or stop only (no memory, but a drag after the swap no longer reflows)?
-4. **GPU budget.** `budgetMs = 10`, clamped to 0.6 × the rAF interval (5 ms at 120 Hz)? Should the
-   budget drop further while the user pans/zooms, or rise when nothing has been touched for a while
-   (an idle boost would cut the 1M convergence from ~12 s towards ~8 s, at the cost of up to a
-   tick's latency on the first gesture)? And `minFrameMs = 50` for the repaint throttle?
-5. **Nested streaming.** For cold layouts, one animation of all depths converging together (natural
-   for the batched solve), or keep per-depth frames? Warm/transition layouts stay one frame either
-   way (§11.1).
-6. **Nested parity tolerance.** How far may the GPU (Jacobi springs and collision) be from the CPU
-   (Gauss-Seidel) beyond the invariants? The integration constants themselves now match (§11.1).
-7. **Coarsening-tree source for the GPU seed.** The worker (recommended, shared with LOD) or the main
-   thread (a ~0.3 s block)? Also: the per-pass timings exist only for M1 Max / ANGLE Metal.
-   Re-measure on at least one Intel/AMD/NVIDIA machine before tuning `budgetMs`, `c_F` or `exactMax`.
-8. **LOD geometry while the GPU streams (§12.1).** A: the worker refits the adopted tree
-   (recommended; same main-thread cost as the worker path, one round trip of latency). B: the GPU
-   refits with range reductions (+5.1 MB GPU at 325k; more code; the start of #184's GPU LOD). C:
-   the main thread refits per repaint under the throttle (+16-23 ms per repaint, a regression
-   against the worker baseline that needs your sign-off).
-9. **Readback memory** (a performance-motivated memory trade-off, so it needs a decision):
+All nine questions of revision 2 are answered. The force law is unchanged.
 
-   | Option | GPU memory 325k / 1M | Behaviour |
-   |---|---|---|
-   | Ring of 2 PBOs + staging always | 7.8 / 24 MB | the original design; readback every frame never skips |
-   | Ring of 2, staging only if the RG probe fails | 5.2 / 16 MB (M1: probe passes) | same, without the pack pass on the measured device |
-   | **1 PBO, staging only if the probe fails (recommended)** | **2.6 / 8 MB** | with the ≥ 50 ms throttle a copy is almost never still pending; if it is, that frame skips its readback |
-   | Staging always adds | +2.6 / +8 MB | only if the probe fails or the permutation is not the identity |
+1. **Layout `backend: "auto"`: in (PR 2c), default unchanged.** `"auto"` resolves to the GPU when
+   `gpuLayoutSupport` passes for this graph and to the worker otherwise, without a warning. The
+   default of `layout({})` does not change in this series (§12.2).
+2. **Pyramid level storage: packed levels** in three textures (`L0`/`Podd`/`Peven`), pure luma,
+   +4% memory (§6.2.3).
+3. **#311 swap policy: warm continue, idle worker.** A converging layout continues warm on the new
+   backend with its remaining ticks and heat; a settled layout gets an idle worker so drag reheat
+   keeps working (~12 MB of edge endpoints plus node arrays at 325k, ~37 MB at 1M) (§6.6).
+4. **GPU budget: fixed for now.** `budgetMs = 10`, clamped to 0.6 × the rAF interval;
+   `minFrameMs = 50` for the repaint throttle. No pan/zoom drop and no idle boost in this series
+   (§6.5.3, §6.5.4).
+5. **Nested streaming: one animation** for cold layouts, all depths converging together;
+   warm/transition layouts stay one frame (§11.1).
+6. **Nested parity: invariants plus a documented tolerance.** GPU output must pass the
+   `nested-layout.test.ts` invariants and stay within a tolerance against the CPU reference on the
+   Navigator's example map that the gpu-nested PR documents (§11.1, §13).
+7. **Coarsening-tree source: the worker**, shared with LOD (§6.4). The per-pass timings are still
+   M1 Max / ANGLE Metal only: re-measure on at least one Intel/AMD/NVIDIA machine before tuning
+   `budgetMs`, `c_F` or `exactMax`.
+8. **LOD geometry while the GPU streams: A, the worker refit** (§12.1, PR 3c).
+9. **Readback memory: one PBO**, staging only if the `RG/FLOAT` read probe fails or the
+   permutation is not the identity: 2.6 MB at 325k, 8 MB at 1M (§6.5.2, §10.2).
+
+### Rejected alternatives
+
+- Q1: no new value (apps pass `"gpu"`); making `"auto"` the default now.
+- Q2: one mip texture with raw-GL base/max-level clamps per reduce pass (saves 4%, adds a raw-GL
+  seam against luma's state tracking).
+- Q3: stop only after a swap of a settled layout (no memory, but a drag no longer reflows).
+- Q4: lowering the budget during pan/zoom; an idle boost (would cut 1M convergence ~12 s → ~8 s at
+  up to a tick's latency on the first gesture). Revisit after the non-M1 re-measure.
+- Q5: per-depth frames for cold nested layouts.
+- Q7: building the tree on the main thread (a ~0.3 s block).
+- Q8: B, a GPU refit (+5.1 MB GPU at 325k, more code; still the start of #184's GPU LOD); C, a
+  main-thread refit per repaint (+16-23 ms, a regression against the worker baseline).
+- Q9: a ring of 2 PBOs with staging always (7.8 / 24 MB) or only on probe failure (5.2 / 16 MB).
 
 ## 16. Follow-ups (file as issues; do not build here)
 
@@ -1400,7 +1431,7 @@ section, the `gpu-transport.ts` header, and the `NetworkLayoutOptions` JSDoc.
   link; promote this into PR 6 if that share exceeds ~150 ms.
 - **Timer-query budget controller** (`EXT_disjoint_timer_query_webgl2` via a luma `QuerySet`), only
   if a non-M1 device shows the fence controller mis-sizing `k` or `B`.
-- **#<nested-coincident-fix>** (file now, fix before gpu-nested): the CPU `collide()` flings
+- **#357** (file now, fix before gpu-nested): the CPU `collide()` flings
   coincident discs ~1e8 apart (§11.1). A live bug in the CPU nested layout, independent of the GPU.
 
 ## 17. Related issues
@@ -1409,7 +1440,7 @@ section, the `gpu-transport.ts` header, and the `NetworkLayoutOptions` JSDoc.
 #311 (backend swap), #297 (live transport), #181 (containment), #189 (state layouts), #180 (module
 seed), #183 (drag reheat), #251 (near-field softening), #141 (PBO pick readback, pattern reused),
 #324/#326/#328/#329 (nested layout, hierarchy, warm start, boundary rings), #106 (N8 epic),
-#<seed-scale> (shared schedule), #<lod-frame-waste> and #<lod-incoherent> (engine-side streaming
+#345 (shared schedule), #342 and #343 (engine-side streaming
 cost).
 
 ## 18. Review notes (revision 2)
@@ -1439,7 +1470,7 @@ was accepted. W = webgl-feasibility, N = numerics-correctness, E = engine-integr
 | N5 | BH discontinuities make trajectory tolerances fail | Accepted | §9 forces from identical positions, p99 + outlier cap; T5. The debug `degreeCap` option is rejected: identical-input force comparison isolates the 5 hub rows exactly |
 | N6 | K-occupant grid misses pairs | Accepted | §11.1 cell from r₉, large = radius > cell/(2·PAD), counted occupancy + extra rounds, symmetric pairs; stage-2 test |
 | N7 | Nested integration constants differ from the CPU | Accepted (verified `nested-layout.ts`) | §11.1 multiplier 0.6, stab ≡ 1, no maxStep, `v*` predictor, ε 1e-9 / 1e-8 |
-| N8 | CPU flings coincident discs apart | Accepted (verified) | §11.1 GPU rule; CPU fix as #<nested-coincident-fix> before gpu-nested (§14, §16) |
+| N8 | CPU flings coincident discs apart | Accepted (verified) | §11.1 GPU rule; CPU fix as #357 before gpu-nested (§14, §16) |
 | N9 | One-pass variance in `placeOver`; no `known` mask | Accepted | §11.1 two range passes over known leaves |
 | N10 | Force pass order matters (ADD is not associative) | Accepted | §7 fixed order springs → repulsion → centering, as today's `_tick` |
 | N11 | Empty ranges and NaN poison the stop rule | Accepted | §5.2 `max(count, 1)`; §6.5.5 NONFINITE flag; §6.5.6 stop + warn; T1, T9 |
@@ -1449,7 +1480,7 @@ was accepted. W = webgl-feasibility, N = numerics-correctness, E = engine-integr
 | E2 | Adopting the tree as `lodWorkerTree` freezes geometry | Accepted (verified `network.ts:1772`, `:2756-2763`) | §6.4, §12.1 adoption semantics per option; `{ type: "coarsen" }` protocol; T8 aggregate test |
 | E3 | Fallback cannot keep "all options" inside `startGpuLayout` | Accepted (verified `network.ts:1388-1394`) | §6.6 options passthrough, `lodStreaming`, LOD guards on the resolved transport; T8 |
 | E4 | `"auto"` breaks 16 literal backend checks | Accepted (counted 16) | §12.2 resolved class + transport; PR 2c lists every check; T8 `"auto"` legs |
-| E5 | §8 contract does not match the real branch | Accepted | §8 rewritten against `Cooling`, per-tick `converged`, `DRAG_HEAT`/`RECOOL_TICKS`, optional `frameEvery`; land #<seed-scale> first |
+| E5 | §8 contract does not match the real branch | Accepted | §8 rewritten against `Cooling`, per-tick `converged`, `DRAG_HEAT`/`RECOOL_TICKS`, optional `frameEvery`; land #345 first |
 | E6 | Phase 2 bundles too much; #311 policy has gaps | Accepted (verified swap order in `base-engine.ts` / `webgl-backend.ts`) | §14 split into 2a/2b/2c; §6.6 pre-swap hook, remaining ticks + heat; Q3 idle-worker memory |
 | E7 | Phase 6 needlessly depends on phase 5; 7-on-6 unexplained | Accepted | §6.4 root-level uniform; §14 dependencies and order |
 | E8 | Pins, stop and frames undefined during coarse seed levels | Accepted | §6.4 queued pins, cancel on stop, seed frame, `iterations: 0`; T10 |
