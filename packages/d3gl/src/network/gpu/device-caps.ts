@@ -8,6 +8,11 @@
 import { atlasWidth } from "./textures.js";
 import { chooseGrid } from "./passes/grid-pyramid.js";
 
+/** Outcome of the functional float-blend probe: the exact sum (`"pass"`), a wrong one (`"wrong-sum"`, a
+ *  driver that blends wrongly or at half precision), or no verdict because the probe could not build or
+ *  run on the device (`"error"`). */
+export type BlendProbe = "pass" | "wrong-sum" | "error";
+
 /** What the GPU layout needs to know about a device. */
 export interface GpuCaps {
   /** The luma device type; the layout runs on WebGL2 only. */
@@ -22,18 +27,22 @@ export interface GpuCaps {
   maxTextureDimension2D: number;
   /** Whether `RG/FLOAT` is the implementation read format of an `rg32f` attachment, so positions read back
    *  at 8 bytes per node. When false the readback uses `RGBA/FLOAT`, which `EXT_color_buffer_float`
-   *  guarantees. Informational: it never rejects a device. */
+   *  guarantees. The same cached value `PositionReadback` reads (`deviceReadsRG`). Informational: it never
+   *  rejects a device. */
   readRG: boolean;
   /** Result of the functional probe (two ADD-blended points summed in an `rg32f` target and read back), or
    *  `null` when it did not run (a prerequisite above is missing). It catches drivers that advertise the
    *  extensions but blend wrongly. */
-  blendProbe: boolean | null;
+  blendProbe: BlendProbe | null;
 }
 
 /** The texture sides the GPU layout allocates for one graph. */
 export interface GpuLayoutNeed {
   /** Position / velocity / force atlas: one texel per node, ⌈√N⌉ wide. */
   positionSide: number;
+  /** CSR offsets atlas: `buildCSR` stores N + 1 offsets, so ⌈√(N + 1)⌉ wide (one wider than the position
+   *  atlas when N is a perfect square). */
+  offsetsSide: number;
   /** Spring (CSR neighbour) atlas: one texel per half-edge, ⌈√2E⌉ wide. */
   springSide: number;
   /** Finest grid-pyramid level: next power of two ≥ √N, clamped to [16, 1024]. */
@@ -45,12 +54,13 @@ export type GpuLayoutSupport = { ok: true } | { ok: false; reason: string };
 
 /**
  * The texture sides {@link GpuForceLayout} allocates for a graph of `nodeCount` nodes and `edgeCount`
- * edges. `buildCSR` stores every edge in both endpoints' rows, so the spring atlas holds 2E texels.
- * O(1).
+ * edges. `buildCSR` stores every edge in both endpoints' rows, so the spring atlas holds 2E texels, and
+ * N + 1 row offsets. O(1).
  */
 export function gpuLayoutNeed(nodeCount: number, edgeCount: number): GpuLayoutNeed {
   return {
     positionSide: atlasWidth(nodeCount),
+    offsetsSide: atlasWidth(nodeCount + 1),
     springSide: atlasWidth(2 * edgeCount),
     pyramidSide: chooseGrid(nodeCount),
   };
@@ -73,6 +83,7 @@ export function gpuLayoutSupport(caps: GpuCaps | null, need: GpuLayoutNeed): Gpu
   const limit = caps.maxTextureDimension2D;
   const sides: [string, number][] = [
     ["position", need.positionSide],
+    ["CSR offsets", need.offsetsSide],
     ["spring", need.springSide],
     ["grid pyramid", need.pyramidSide],
   ];
@@ -81,8 +92,11 @@ export function gpuLayoutSupport(caps: GpuCaps | null, need: GpuLayoutNeed): Gpu
       return { ok: false, reason: `the graph needs a ${side}-texel ${name} texture, past the device's ${limit}-texel limit` };
     }
   }
-  if (caps.blendProbe === false) {
+  if (caps.blendProbe === "wrong-sum") {
     return { ok: false, reason: "float blending gave a wrong sum in the functional probe (driver bug)" };
+  }
+  if (caps.blendProbe === "error") {
+    return { ok: false, reason: "the functional float-blend probe could not run on this device (a lost context, or it failed to build the probe)" };
   }
   return { ok: true };
 }

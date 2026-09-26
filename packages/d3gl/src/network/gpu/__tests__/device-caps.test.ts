@@ -14,7 +14,7 @@ const FULL: GpuCaps = {
   floatBlend: true,
   maxTextureDimension2D: 16384,
   readRG: true,
-  blendProbe: true,
+  blendProbe: "pass",
 };
 
 /** web-NotreDame, the Navigator's large graph. */
@@ -25,6 +25,7 @@ describe("gpuLayoutNeed", () => {
     // Position atlas ⌈√N⌉, spring (CSR) atlas ⌈√2E⌉ — buildCSR stores every edge in both directions —
     // and the grid pyramid's finest level, next power of two ≥ √N clamped to [16, 1024].
     expect(NOTRE_DAME.positionSide).toBe(571);
+    expect(NOTRE_DAME.offsetsSide).toBe(571);
     expect(NOTRE_DAME.springSide).toBe(1731);
     expect(NOTRE_DAME.pyramidSide).toBe(1024);
   });
@@ -69,9 +70,18 @@ describe("gpuLayoutSupport", () => {
   });
 
   it("rejects a device whose float blending fails the functional probe", () => {
-    const r = gpuLayoutSupport({ ...FULL, blendProbe: false }, NOTRE_DAME);
+    const r = gpuLayoutSupport({ ...FULL, blendProbe: "wrong-sum" }, NOTRE_DAME);
     expect(r.ok).toBe(false);
-    if (!r.ok) expect(r.reason).toMatch(/functional probe/);
+    if (!r.ok) expect(r.reason).toMatch(/wrong sum in the functional probe/);
+  });
+
+  it("names a probe that could not run apart from a wrong sum (no 'driver bug' for a thrown probe)", () => {
+    const r = gpuLayoutSupport({ ...FULL, blendProbe: "error" }, NOTRE_DAME);
+    expect(r.ok).toBe(false);
+    if (!r.ok) {
+      expect(r.reason).toMatch(/could not run/);
+      expect(r.reason).not.toMatch(/driver bug/);
+    }
   });
 
   it("accepts a device whose functional probe did not run", () => {
@@ -92,6 +102,20 @@ describe("gpuLayoutSupport", () => {
     }
     // The same graph fits a desktop limit.
     expect(gpuLayoutSupport(FULL, need)).toEqual({ ok: true });
+  });
+
+  it("rejects a graph whose CSR offsets atlas (N + 1 entries) exceeds the limit while its position atlas fits", () => {
+    // N = limit²: the position atlas is exactly limit wide, but buildCSR's offsets hold N + 1 entries,
+    // so packUintTexture sizes them ⌈√(N + 1)⌉ = limit + 1.
+    const need = gpuLayoutNeed(2048 * 2048, 0);
+    expect(need.positionSide).toBe(2048);
+    expect(need.offsetsSide).toBe(2049);
+    const r = gpuLayoutSupport({ ...FULL, maxTextureDimension2D: 2048 }, need);
+    expect(r.ok).toBe(false);
+    if (!r.ok) {
+      expect(r.reason).toMatch(/offsets/);
+      expect(r.reason).toMatch(/2049/);
+    }
   });
 
   it("rejects a graph whose position atlas exceeds the texture limit", () => {

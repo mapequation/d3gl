@@ -45,7 +45,8 @@ import { DEFAULT_FORCE, seedPositions, seedSpacing, stepCap } from "../force.js"
 import type { LODTopology } from "../lod.js";
 import { GpuForceLayout } from "./gpu-force-layout.js";
 import { ProlongatePass } from "./passes/prolongate.js";
-import { atlasWidth, packPositionsTexture, packUintTexture, readbackFloatFboReuse } from "./textures.js";
+import { atlasWidth, packPositionsTexture, packUintTexture } from "./textures.js";
+import { PositionReadback } from "./position-readback.js";
 
 const GOLDEN = Math.PI * (3 - Math.sqrt(5));
 const EMPTY_U32 = new Uint32Array(0);
@@ -339,7 +340,8 @@ export function gpuMultilevelSeed(
       seedRun(pass);
       pass.end();
       device.submit();
-      posArr = readbackFloatFboReuse(device, fbo, cwidth, count);
+      posArr = new Float32Array(count * 2);
+      new PositionReadback(device, cwidth, cheight).read(fbo, count, posArr);
       thisTex = posTex;
       thisWidth = cwidth;
       thisOwnedTex = posTex;
