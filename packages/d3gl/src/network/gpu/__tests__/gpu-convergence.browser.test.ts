@@ -171,8 +171,11 @@ describe("GpuForceLayout convergence parity vs CPU", () => {
       target: graph.target,
       positions: cpuPositions,
     };
+    // The same cooled 150-tick schedule on both backends (#124) — tick() directly, so the CPU side
+    // doesn't stop early at convergence while the GPU (no early stop) runs all 150.
     const cpu = new ForceLayout(cpuGraph, params);
-    cpu.run(150);
+    cpu.cool(150);
+    for (let t = 0; t < 150; t++) cpu.tick();
 
     // ── GPU run ──────────────────────────────────────────────────────────────
     const gpuGraph: LayoutGraph = {
@@ -183,6 +186,7 @@ describe("GpuForceLayout convergence parity vs CPU", () => {
       positions: gpuPositions,
     };
     const gpu = new GpuForceLayout(device, gpuGraph, params);
+    gpu.cool(150);
     gpu.runFrame(150);
     const gpuPos = new Float32Array(graph.nodeCount * 2);
     gpu.readPositions(gpuPos);
@@ -249,8 +253,11 @@ describe("GpuForceLayout convergence parity vs CPU", () => {
       target: graph.target,
       positions: cpuPositions,
     };
+    // The same cooled 150-tick schedule on both backends (#124) — tick() directly, so the CPU side
+    // doesn't stop early at convergence while the GPU (no early stop) runs all 150.
     const cpu = new ForceLayout(cpuGraph, params);
-    cpu.run(150);
+    cpu.cool(150);
+    for (let t = 0; t < 150; t++) cpu.tick();
 
     // ── GPU run (grid-pyramid BH, θ=0.9), pinned to the pyramid path ──────────
     const gpuGraph: LayoutGraph = {
@@ -261,6 +268,7 @@ describe("GpuForceLayout convergence parity vs CPU", () => {
       positions: gpuPositions,
     };
     const gpu = new GpuForceLayout(device, gpuGraph, params, { repulsionMode: "pyramid" });
+    gpu.cool(150);
     gpu.runFrame(150);
     const gpuPos = new Float32Array(graph.nodeCount * 2);
     gpu.readPositions(gpuPos);
@@ -281,5 +289,45 @@ describe("GpuForceLayout convergence parity vs CPU", () => {
     //    the extra margin considered up front turned out unnecessary).
     const relDiff = Math.abs(gpuRatio - cpuRatio) / cpuRatio;
     expect(relDiff).toBeLessThan(0.35);
+  });
+
+  it("the hot cold-start schedule (the flat GPU path without a module tree) matches the CPU's", () => {
+    // Without a module tree the GPU backend seeds the equilibrium disc and keeps full heat (a cold start
+    // has to untangle, #124) — the CPU's `multilevel: false` schedule. Same 5000-node pyramid graph as
+    // above, same start, 150 full-heat ticks on both sides (tick() on the CPU, so its early stop can't
+    // shorten the run the GPU runs in full).
+    const graph = makeClusteredGraph(100, 50, 1, 0x5eed1234);
+    const params = { ...DEFAULT_FORCE };
+    seedPositions(graph, 2000, 1500, { force: params });
+    const view = (positions: Float32Array): LayoutGraph => ({ nodeCount: graph.nodeCount, edgeCount: graph.edgeCount, source: graph.source, target: graph.target, positions });
+
+    const cpuPositions = graph.positions.slice();
+    const cpu = new ForceLayout(view(cpuPositions), params);
+    cpu.hold(1);
+    for (let t = 0; t < 150; t++) cpu.tick();
+
+    const gpu = new GpuForceLayout(device, view(graph.positions.slice()), params, { repulsionMode: "pyramid" });
+    gpu.runFrame(150); // a fresh GPU schedule holds full heat
+    const gpuPos = new Float32Array(graph.nodeCount * 2);
+    gpu.readPositions(gpuPos);
+    gpu.destroy();
+
+    const cpuRatio = spreadRatio(cpuPositions, graph.source, graph.target);
+    const gpuRatio = spreadRatio(gpuPos, graph.source, graph.target);
+    const relDiff = Math.abs(gpuRatio - cpuRatio) / cpuRatio;
+    console.log(`  [hot cold start, N=${graph.nodeCount}] cpuRatio=${cpuRatio.toFixed(4)} gpuRatio=${gpuRatio.toFixed(4)} relDiff=${relDiff.toFixed(4)}`);
+    expect(gpuRatio).toBeLessThan(1.0);
+    expect(relDiff).toBeLessThan(0.35);
+    // spreadRatio is scale-free; the equilibrium scale must match too (mean edge length; measured
+    // within 0.1% of the CPU's).
+    const meanEdge = (p: Float32Array): number => {
+      let total = 0;
+      for (let e = 0; e < graph.edgeCount; e++) {
+        const a = graph.source[e]!, b = graph.target[e]!;
+        total += Math.hypot(p[a * 2]! - p[b * 2]!, p[a * 2 + 1]! - p[b * 2 + 1]!);
+      }
+      return total / graph.edgeCount;
+    };
+    expect(Math.abs(meanEdge(gpuPos) / meanEdge(cpuPositions) - 1)).toBeLessThan(0.05);
   });
 });

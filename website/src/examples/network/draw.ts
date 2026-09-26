@@ -124,13 +124,14 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
       const key = `${count}|${directed}|${multilevel}|${layoutBackend}`;
       if (key !== layoutKey) {
         layoutKey = key;
-        // Scale per-tick work down as the graph grows so the off-thread solve stays responsive; the
-        // worker keeps the main thread free regardless, streaming frames as it converges.
-        const iterations = Math.min(250, Math.max(10, Math.round(2.5e6 / count)));
         // LFR benchmark with clear community structure (low mixing) for the layout + LOD to resolve.
         // Weighted so links vary and LOD super-edges thicken/darken with their accumulated weight.
         const { nodeCount, source, target, weight } = generateLFR(count, { mu: 0.1, seed: 1, weighted: true });
         graph = buildGraph({ nodeCount, source, target, weight, directed });
+        // A multilevel worker layout stops once it has converged (#124), so it keeps the default budget
+        // as a safety cap. The GPU layout has no early stop yet and a cold start keeps full heat until it
+        // settles, so both get a budget that shrinks as the graph grows.
+        const iterations = layoutBackend === "gpu" || !multilevel ? Math.min(250, Math.max(10, Math.round(2.5e6 / count))) : undefined;
         // fit: true (#238) keeps the camera framed on the streaming layout as it converges, released on
         // settle/interaction — so it opens framed rather than piling at the origin on the GPU backend.
         net.data(graph).layout({ backend: layoutBackend, iterations, multilevel, fit: true });

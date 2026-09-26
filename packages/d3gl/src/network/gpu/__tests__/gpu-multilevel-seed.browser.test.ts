@@ -81,6 +81,16 @@ function spreadRatio(pos: Float32Array, source: Uint32Array, target: Uint32Array
   return pd < 1e-10 ? 1 : edgeLen / pd;
 }
 
+/** 95th-percentile distance from the centroid. */
+function r95(pos: Float32Array): number {
+  const n = pos.length / 2;
+  let cx = 0, cy = 0;
+  for (let i = 0; i < n; i++) { cx += pos[i * 2]!; cy += pos[i * 2 + 1]!; }
+  cx /= n; cy /= n;
+  const r = Array.from({ length: n }, (_, i) => Math.hypot(pos[i * 2]! - cx, pos[i * 2 + 1]! - cy)).sort((a, b) => a - b);
+  return r[Math.floor(0.95 * (n - 1))] ?? 0;
+}
+
 /** All sampled positions finite (no NaN / ±Inf). */
 function allFinite(pos: Float32Array, sampleEvery = 1): boolean {
   for (let i = 0; i < pos.length; i += sampleEvery) if (!Number.isFinite(pos[i]!)) return false;
@@ -179,6 +189,86 @@ describe("gpuMultilevelSeed — module-aware GPU seed (#180 N8.2)", () => {
     const ratio = spreadRatio(out, g.source, g.target);
     console.log(`  [seed-quality] post-refine spreadRatio=${ratio.toFixed(3)}`);
     expect(ratio).toBeLessThan(1.0);
+  });
+
+  it("scale: seeds at the force equilibrium, and the cooled refine neither explodes nor collapses", () => {
+    // The refine converges to a disc of radius R = √(repulsion·N/centering) (95th percentile √0.95·R).
+    // The module seed rings children at their leaf counts' share of that area and scales each depth's
+    // repulsion by its mean leaves-per-node, so it must land at that scale — not at a viewport-sized
+    // disc the refine then blows up (the #345 overshoot) or a crowded one it has to inflate. Two
+    // module levels (4 super-modules over 16 modules) so the per-depth scaling is exercised.
+    const W = 800, H = 600;
+    const g = makePlantedGraph(16, 125, 4, 1, 0x5ca1ed); // 2000 nodes
+    const rank = new Map<number, number>();
+    const records: ModuleNode[] = Array.from(g.moduleOf, (c, id) => {
+      const r = (rank.get(c) ?? 0) + 1; rank.set(c, r);
+      return { id, path: [(c % 4) + 1, c + 1, r] };
+    });
+    const tree = buildModuleLODTree(g.nodeCount, records, { source: g.source, target: g.target, weight: g.weight });
+    expect(canModuleSeed(tree, g.nodeCount)).toBe(true);
+    const R95 = Math.sqrt(0.95) * Math.sqrt((DEFAULT_FORCE.repulsion * g.nodeCount) / DEFAULT_FORCE.centering);
+
+    const pos = new Float32Array(g.nodeCount * 2);
+    gpuMultilevelSeed(device, tree, { nodeCount: g.nodeCount, positions: pos }, { width: W, height: H, force: DEFAULT_FORCE });
+    const seed = r95(pos);
+
+    // Refine as gpu-transport runs a module-seeded layout: cooled over the budget, 5 ticks per frame.
+    const iterations = 300;
+    const gpu = new GpuForceLayout(device, { nodeCount: g.nodeCount, edgeCount: g.source.length, source: g.source, target: g.target, positions: pos.slice() }, DEFAULT_FORCE);
+    gpu.cool(iterations);
+    const frame = new Float32Array(g.nodeCount * 2);
+    let peak = seed;
+    for (let t = 0; t < iterations; t += 5) {
+      gpu.runFrame(5);
+      gpu.readPositions(frame);
+      peak = Math.max(peak, r95(frame));
+    }
+    gpu.destroy();
+    const final = r95(frame);
+    console.log(`  [scale-eq] seed r95/R95=${(seed / R95).toFixed(3)} final r95/R95=${(final / R95).toFixed(3)} peak/final=${(peak / final).toFixed(3)} coherence=${moduleCoherence(frame, g.moduleOf).toFixed(3)}`);
+    expect(allFinite(frame)).toBe(true);
+    expect(seed / R95).toBeGreaterThan(0.7); // at scale: not crowded…
+    expect(seed / R95).toBeLessThan(1.3); // …and not a viewport-sized disc (~0.02 here) or inflated
+    expect(peak / final).toBeLessThan(1.3); // no explosion on the way
+    expect(final / R95).toBeGreaterThan(0.75); // no collapse
+    expect(moduleCoherence(frame, g.moduleOf)).toBeLessThan(0.85); // the modules survive the refine
+  });
+
+  it("ragged scale: a deeper branch seeds at its own leaves' density, not the whole tree's", () => {
+    // Half the planted modules hang directly under the root (their leaves end at depth 1); the other
+    // half sit one level deeper (leaves at depth 2). The depth-2 solve holds only the deep half's leaves,
+    // so its per-node mass is 1 — scaling its repulsion by the whole tree's leaves-per-node (2 here)
+    // would spread the deep modules wider than the refine's equilibrium density.
+    const W = 800, H = 600;
+    const K = 16, m = 125;
+    const g = makePlantedGraph(K, m, 4, 0, 0x7a66ed);
+    const rank = new Map<number, number>();
+    const records: ModuleNode[] = Array.from(g.moduleOf, (c, id) => {
+      const r = (rank.get(c) ?? 0) + 1; rank.set(c, r);
+      return { id, path: c % 2 === 0 ? [c + 1, r] : [1000 + (c % 4), c + 1, r] };
+    });
+    const tree = buildModuleLODTree(g.nodeCount, records, { source: g.source, target: g.target, weight: g.weight });
+    expect(canModuleSeed(tree, g.nodeCount)).toBe(true);
+    const pos = new Float32Array(g.nodeCount * 2);
+    gpuMultilevelSeed(device, tree, { nodeCount: g.nodeCount, positions: pos }, { width: W, height: H, force: DEFAULT_FORCE });
+    expect(allFinite(pos)).toBe(true);
+    /** Mean over the given modules of their leaves' r95 about the module centroid. */
+    const moduleSpread = (odd: boolean): number => {
+      let total = 0, count = 0;
+      for (let c = odd ? 1 : 0; c < K; c += 2) {
+        const mod = new Float32Array(m * 2);
+        let k = 0;
+        for (let i = 0; i < g.nodeCount; i++) if (g.moduleOf[i] === c) { mod[k * 2] = pos[i * 2]!; mod[k * 2 + 1] = pos[i * 2 + 1]!; k++; }
+        total += r95(mod);
+        count++;
+      }
+      return total / count;
+    };
+    const shallow = moduleSpread(false);
+    const deep = moduleSpread(true);
+    // Same modules, same seed pipeline, one level apart: the deep ones must land at about the shallow
+    // ones' spread (measured 1.14×; scaling the depth-2 repulsion by the whole tree's mean mass: 1.62×).
+    expect(deep / shallow, `deep ${deep.toFixed(0)} vs shallow ${shallow.toFixed(0)}`).toBeLessThan(1.35);
   });
 
   it("ragged correctness: branches of different depths seed without error, every leaf finite + coherent", () => {

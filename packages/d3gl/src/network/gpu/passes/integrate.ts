@@ -16,7 +16,8 @@ void main() { gl_Position = vec4(a_clip, 0.0, 1.0); }
  *
  * Each fragment maps to one node (id = c.y * u_width + c.x). Reads the current
  * position, velocity, and accumulated force, applies integration
- * (v' = (v + f·α)·damping·stab, |v'| clamped to maxStep; p' = p + v'), and writes
+ * (v' = (v + f·α)·damping·stab, |v'| clamped to maxStep; p' = p + v' — α already carries the
+ * cooling heat, #124), and writes
  * the new position and velocity via MRT to locations 0 and 1 respectively.
  * `stab` is the per-node 1/(1+K̃) spring-stiffness stabilizer (#203) and the step
  * clamp is ISOTROPIC (vector magnitude, mirroring CPU force.ts) — a component-wise
@@ -102,7 +103,7 @@ export class IntegratePass {
       u_width: 1,
       u_alpha: 0,
       u_damping: 0.9,
-      u_maxStep: 1e9, // placeholder default — always overwritten in run() with the span-based clamp
+      u_maxStep: 1e9, // placeholder default — always overwritten in run() with the layout's step cap
     };
 
     this.model = new Model(device, {

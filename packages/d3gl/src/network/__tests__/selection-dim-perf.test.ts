@@ -35,7 +35,11 @@ function seededClusteredTree(n: number): { tree: LODTree; centroid: [number, num
     target.push((i + 1) % n, (i + 1 + Math.floor(rng() * (n - 2))) % n);
   }
   const g = buildGraph({ nodeCount: n, source, target });
-  multilevelSeed(g, { width: 2000, height: 2000 });
+  // The unsolved multilevel seed (coarsenIterations 0): every coarse node's leaves stay inside its own
+  // disc, the spatially coherent layout this guard needs for a small frontier. A solved or refined
+  // layout of this random-chord graph is not coherent with its coarsening tree (the frontier at fit
+  // view is ~0.9 N — with the viewport-scaled seed this fixture used to take as well, once refined).
+  multilevelSeed(g, { width: 2000, height: 2000, coarsenIterations: 0 });
   const tree = buildLODTree(g, {});
   computeLODGeometry(tree, g, new Float32Array(n).fill(4));
   let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;

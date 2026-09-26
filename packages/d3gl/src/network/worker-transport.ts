@@ -25,7 +25,8 @@ export interface WorkerLayoutOptions {
   coarsen?: CoarsenOptions;
   /** Seed via multilevel coarsening (default) or a plain disc cold start. */
   multilevel?: boolean;
-  /** Ticks per progress frame; defaults to ~60 frames across the run. */
+  /** Fixed ticks per progress frame. Omitted (the default), the worker streams by time — about one
+   *  frame per display frame, and one after any longer tick. */
   frameEvery?: number;
   /**
    * Build the structural LOD tree on the worker and stream it (#103). When set, the worker coarsens
@@ -72,8 +73,6 @@ export interface WorkerLayoutHandle {
 /** Handle for the synchronous fallback (no live worker) — reheat is a no-op there. */
 const NOOP_DRAG = { pin() {}, unpin() {} };
 
-const TARGET_FRAMES = 60;
-
 /**
  * Whether this environment can use the `SharedArrayBuffer` zero-copy position transport: `SharedArrayBuffer`
  * exists and the page is cross-origin isolated (served with `Cross-Origin-Opener-Policy: same-origin` +
@@ -99,18 +98,21 @@ export function startWorkerLayout(
 ): WorkerLayoutHandle {
   const { width, height, iterations } = opts;
   const multilevel = opts.multilevel ?? true;
-  const frameEvery = opts.frameEvery ?? Math.max(1, Math.ceil(iterations / TARGET_FRAMES));
   const syncOpts = { width, height, iterations, force: opts.force, coarsen: opts.coarsen };
 
+  /** Solve on this thread (converging early, like the worker): the fallback when no worker runs. */
+  const solveHere = (): void => {
+    if (multilevel) multilevelLayout(graph, syncOpts);
+    else {
+      seedPositions(graph, width, height, { force: opts.force });
+      new ForceLayout(graph, opts.force).run(iterations, "hot"); // a cold start untangles at full heat
+    }
+  };
   // No Worker available (SSR / unsupported) or construction fails: solve synchronously so the
   // layout still happens, then signal one frame + completion. LOD (if requested) is left to the
   // caller's main-thread path — `onLODTree` is never called in the fallback.
   const fallback = (): WorkerLayoutHandle => {
-    if (multilevel) multilevelLayout(graph, syncOpts);
-    else {
-      seedPositions(graph, width, height);
-      new ForceLayout(graph, opts.force).run(iterations);
-    }
+    solveHere();
     onFrame();
     return { shared: false, settled: Promise.resolve(), stop() {}, ...NOOP_DRAG };
   };
@@ -124,8 +126,9 @@ export function startWorkerLayout(
   }
 
   // Give the very first paint a spread disc instead of a pile at the origin while the worker's seed
-  // frame is in flight. NetworkGraph satisfies the force core's LayoutGraph view.
-  seedPositions(graph, width, height);
+  // frame is in flight — at the force model's equilibrium scale, the scale that seed arrives at, so
+  // a fitted view doesn't jump. NetworkGraph satisfies the force core's LayoutGraph view.
+  seedPositions(graph, width, height, { force: opts.force });
 
   const shared = sharedMemoryAvailable();
   let sharedPositions: SharedArrayBuffer | undefined;
@@ -174,11 +177,7 @@ export function startWorkerLayout(
   worker.onerror = (): void => {
     if (terminated) return;
     // Worker failed mid-run — fall back to a synchronous solve so the user still gets a layout.
-    if (multilevel) multilevelLayout(graph, syncOpts);
-    else {
-      seedPositions(graph, width, height);
-      new ForceLayout(graph, opts.force).run(iterations);
-    }
+    solveHere();
     onFrame();
     terminate();
   };
@@ -196,7 +195,7 @@ export function startWorkerLayout(
     force: opts.force,
     coarsen: opts.coarsen,
     multilevel,
-    frameEvery,
+    frameEvery: opts.frameEvery,
     lod: opts.lod,
   };
   worker.postMessage(start);
