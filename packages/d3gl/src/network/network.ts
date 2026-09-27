@@ -1744,8 +1744,8 @@ export class Network extends BaseEngine {
   /**
    * The module tree, for a consumer that can wait for it (#428): the cached tree, or a promise of one
    * built on a worker — this starts the build unless one is under way — so the main thread never blocks
-   * on the O(nodes · depth + edges · depth) build; its share is flattening the records (≈10 ms at 325k
-   * nodes) and copying the edge buffers into the message. The tree lands in the cache and repaints a
+   * on the O(nodes · depth + edges · depth) build; its share is flattening the records (at 325k nodes ≈10 ms
+   * warm, ≈35 ms cold in a browser) and copying the edge buffers into the message. The tree lands in the cache and repaints a
    * cut that draws it. `undefined` without a hierarchy. An explicit `lod({ modules })` is checked here,
    * synchronously, where a main-thread build would have thrown; without a worker the tree is built on
    * the main thread after all.
