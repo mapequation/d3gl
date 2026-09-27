@@ -1115,8 +1115,10 @@ export class Network extends BaseEngine {
    * back to building the tree on the main thread from the current positions.
    *
    * With a module hierarchy (`data(graph, { modules })`, #326) the cut draws the module tree by
-   * default; `{ source: "structure" }` coarsens the graph structurally instead. `lod(false)` turns LOD
-   * off but keeps the hierarchy, so re-enabling reuses its tree.
+   * default; `{ source: "structure" }` coarsens the graph structurally instead. `{ source: "spatial" }`
+   * (#343) groups nodes by position — on the worker backend the worker rebuilds that tree on every
+   * streamed frame, so call this before `layout()` there too. `lod(false)` turns LOD off but keeps the
+   * hierarchy, so re-enabling reuses its tree.
    */
   lod(options: NetworkLODOptions | false): this {
     if (!options) {
