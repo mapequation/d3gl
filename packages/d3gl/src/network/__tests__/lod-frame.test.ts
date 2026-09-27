@@ -1,6 +1,7 @@
 import { describe, it, expect } from "vitest";
 import { buildMortonLODTree, computeLODCrowding, computeLODPositions, computeLODStyle, crowdingHorizon, mortonRootBox, lodTreeFromTopology, buildLODTree } from "../lod.js";
-import { MAX_OUTSTANDING, lodFrameStep, lodTreeFromSpatialFrame, makeSpatialLODStream, makeStructureLODStream, recycleSpatialFrame, setStreamStyle, spatialFrameByteLength, type SpatialLODFrame } from "../lod-frame.js";
+import { MAX_OUTSTANDING, lodFrameStep, lodTreeFromSpatialFrame, makeSpatialLODStream, makeStructureLODStream, recycleSpatialFrame, setStreamSizing, setStreamStyle, spatialFrameByteLength, type LeafStyle, type SpatialLODFrame } from "../lod-frame.js";
+import { lodStyleFields, lodStyleMessage } from "../worker-protocol.js";
 import { buildGraph } from "../graph.js";
 
 function rng(seed: number): () => number {
@@ -155,7 +156,7 @@ describe("lodFrameStep carries the crowding (#426)", () => {
     const g = buildGraph({ nodeCount: n, source: src, target: tgt });
     const tree = buildLODTree(g);
     const worker = lodTreeFromTopology(tree);
-    const stream = makeStructureLODStream(worker, { radii, weight, crowding: { screenSized: true } });
+    const stream = makeStructureLODStream(worker, { radii, crowding: { screenSized: true } });
     const pos = cloud(n, 12);
     expect(lodFrameStep(stream, pos, 1)).toBeNull();
     computeLODPositions(tree, pos);
@@ -164,10 +165,29 @@ describe("lodFrameStep carries the crowding (#426)", () => {
     expect(Array.from(worker.clearZoom)).toEqual(Array.from(tree.clearZoom));
     // A new style reaches the next frame's crowding.
     const bigger = radii.map((r) => r * 3);
-    setStreamStyle(stream, { radii: bigger, weight, crowding: { screenSized: true } }, 2);
+    setStreamSizing(stream, { radii: bigger, crowding: { screenSized: true } });
     lodFrameStep(stream, pos, 2);
     computeLODStyle(tree, bigger, weight);
     computeLODCrowding(tree, { screenSized: true, expandPx: crowdingHorizon(tree) });
     expect(Array.from(worker.clearZoom)).toEqual(Array.from(tree.clearZoom));
+  });
+
+  it("the worker gets the whole leaf style for a spatial stream, only the radii and sizing for a structure stream", () => {
+    // A structure stream reads the radii and the size mode (its crowding); the weight, border and colours a
+    // spatial stream aggregates would be cloned to the worker and kept there for nothing.
+    const style: LeafStyle = { radii, weight, border: new Float32Array(n), colors: new Uint8Array(4 * n), crowding: { screenSized: true, expandPx: 60 } };
+    expect(lodStyleMessage("spatial", style, 3)).toEqual({ type: "lod-style", style, version: 3 });
+    const sizing = lodStyleMessage("structure", style, 3);
+    expect(sizing).toEqual({ type: "lod-sizing", sizing: { radii, crowding: style.crowding } });
+    if (sizing.type === "lod-sizing") {
+      expect(Object.keys(sizing.sizing).sort()).toEqual(["crowding", "radii"]);
+      expect(sizing.sizing.radii).toBe(radii); // the same array, not a copy
+    }
+    // The start message the same way.
+    expect(lodStyleFields("spatial", style, 3)).toEqual({ lodStyle: style, lodStyleVersion: 3 });
+    const start = lodStyleFields("structure", style, 3);
+    expect(Object.keys(start)).toEqual(["lodSizing"]);
+    expect(Object.keys(start.lodSizing ?? {}).sort()).toEqual(["crowding", "radii"]);
+    expect(lodStyleFields("structure", undefined, undefined)).toEqual({});
   });
 });
