@@ -906,6 +906,10 @@ export class GpuStream {
       this.phase = 0;
       this.settle();
     }
+    // The painted positions are the run's final ones: a move from here continues from the mode the run is in
+    // now (idle, or the drag it turned into), not from the copy's — a convergence stop (#376) ends a run with
+    // ticks of its budget left, which a move would otherwise run again (#311).
+    this.recordRunState(this.harvestState);
   }
 
   /**
@@ -1023,7 +1027,11 @@ export class GpuStream {
 
   /** Record where the run stands at the copy just issued: its mode, the ticks left, the next tick's heat. */
   private recordCopyState(): void {
-    const s = this.copyState;
+    this.recordRunState(this.copyState);
+  }
+
+  /** Where the run stands now — its mode, the ticks left of that mode, the next tick's heat — into `s`. */
+  private recordRunState(s: GpuRunState): void {
     s.mode = this.mode;
     s.ticksLeft =
       this.mode === "run" ? Math.max(0, this.iterations - this.ticksDone) : this.mode === "cool" ? Math.max(0, this.coolLeft) : 0;
