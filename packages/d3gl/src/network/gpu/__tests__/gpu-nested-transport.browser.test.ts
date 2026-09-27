@@ -54,11 +54,11 @@ describe("startGpuNestedLayout (#355)", () => {
   it("streams a cold layout as frames of all depths, then lands the direct solve's positions and discs", async () => {
     const g = graphOver(tree);
     let frames = 0;
-    let boundaries: BoundaryDiscs | null = null;
+    const got: { boundaries: BoundaryDiscs | null } = { boundaries: null };
     const handle = startGpuNestedLayout(device, g, tree, { iterations, radius }, () => frames++, {
       frameEvery: 10,
       onBoundaries: (discs) => {
-        boundaries = discs;
+        got.boundaries = discs;
       },
     });
     expect(handle.transport).toBe("pending"); // the prep runs in a worker first
@@ -69,10 +69,9 @@ describe("startGpuNestedLayout (#355)", () => {
     const want = direct(device, tree, iterations);
     expect(Array.from(g.positions)).toEqual(Array.from(want.positions));
     const wantDiscs = nestedBoundaryDiscs(tree, want);
-    expect(boundaries).not.toBeNull();
-    const got = boundaries as BoundaryDiscs | null;
-    expect(Array.from(got?.r ?? [])).toEqual(Array.from(wantDiscs.r));
-    expect(Array.from(got?.dx ?? [])).toEqual(Array.from(wantDiscs.dx));
+    expect(got.boundaries).not.toBeNull();
+    expect(Array.from(got.boundaries?.r ?? [])).toEqual(Array.from(wantDiscs.r));
+    expect(Array.from(got.boundaries?.dx ?? [])).toEqual(Array.from(wantDiscs.dx));
   });
 
   it("reads a warm start back in one frame, placed over the current map, without touching the graph first", async () => {
@@ -82,10 +81,10 @@ describe("startGpuNestedLayout (#355)", () => {
     const initial = g.positions.slice();
     const before = g.positions.slice();
     let frames = 0;
-    let result: Float32Array | null = null;
+    const got: { result: Float32Array | null } = { result: null };
     const handle = startGpuNestedLayout(device, g, tree, { iterations, initial }, () => frames++, {
       onResult: (positions) => {
-        result = positions;
+        got.result = positions;
         // Still the old map when the result arrives: a transition eases from it.
         expect(Array.from(g.positions)).toEqual(Array.from(before));
       },
@@ -93,8 +92,8 @@ describe("startGpuNestedLayout (#355)", () => {
     await handle.settled;
     expect(frames).toBe(0); // with onResult the caller lands it
     const want = direct(device, tree, iterations, initial);
-    expect(result).not.toBeNull();
-    expect(Array.from(result ?? [])).toEqual(Array.from(want.positions));
+    expect(got.result).not.toBeNull();
+    expect(Array.from(got.result ?? [])).toEqual(Array.from(want.positions));
   });
 
   it("falls back to the worker with one warning when there is no device", async () => {

@@ -513,26 +513,27 @@ export class GpuStream {
   }
 
   /**
-   * Whether to copy positions this frame: the PBO is free, there are new ticks, and the copy would be
-   * ready (after the usual copy → ready latency) when the next repaint is due — so a harvested frame is
-   * about one frame old, not a whole repaint interval.
+   * Whether this frame will likely copy, asked before encoding (to reserve the copy's GPU time):
+   * {@link copyDue}, counting on one more tick.
    */
-  /** Whether this frame will likely copy (checked before encoding, to reserve the copy's GPU time). */
   private copyLikely(now: number): boolean {
-    if (this.readback.pending) return false;
-    if (this.finishing) return true;
-    if (!this.streaming) return false;
-    if (this.frameEvery !== undefined) return this.ticksDone + 1 - this.copiedTicks >= this.frameEvery;
-    return this.throttle.copyDue(now);
+    return this.copyDue(now, 1);
   }
 
-  private copyDue(now: number): boolean {
+  /**
+   * Whether to copy positions this frame: the PBO is free, there are new ticks, and the copy would be
+   * ready (after the usual copy → ready latency) when the next repaint is due — so a harvested frame is
+   * about one frame old, not a whole repaint interval. `lookahead`: ticks the frame will still complete
+   * before the copy ({@link copyLikely} asks before encoding).
+   */
+  private copyDue(now: number, lookahead = 0): boolean {
     if (this.readback.pending) return false;
     // The final copy goes out as soon as the PBO is free; its harvest clears `finishing` (finish()).
     if (this.finishing) return true;
     if (!this.streaming) return false;
-    if (this.ticksDone <= this.copiedTicks) return false;
-    if (this.frameEvery !== undefined) return this.ticksDone - this.copiedTicks >= this.frameEvery;
+    const fresh = this.ticksDone + lookahead - this.copiedTicks;
+    if (fresh <= 0) return false;
+    if (this.frameEvery !== undefined) return fresh >= this.frameEvery;
     return this.throttle.copyDue(now);
   }
 
