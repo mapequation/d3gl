@@ -948,8 +948,10 @@ export class Network extends BaseEngine {
    *  selection version: reference-stable across position-only frames (so the renderer's identity check
    *  skips their O(nodes)+O(edges)-per-layer conversion + re-upload), rebuilt FRESH on any selection
    *  change ({@link onLaneSelectionChanged} / {@link interactive} disable call
-   *  {@link invalidateNoLodSelected}) so the changed flags DO upload. Never mutated in place. */
-  private noLodSelectedCacheFor: { style: ResolvedNetworkStyle; graph: NetworkGraph } | null = null;
+   *  {@link invalidateNoLodSelected}) so the changed flags DO upload. Never mutated in place. The key holds
+   *  the selection set too: `select()` replaces it, also while the lane waits for a tree and hears no
+   *  change (#428). */
+  private noLodSelectedCacheFor: { style: ResolvedNetworkStyle; graph: NetworkGraph; selected: ReadonlySet<string | number> | undefined } | null = null;
   private noLodSelectedNodes: Uint8Array | null = null;
   private noLodSelectedLinks: Uint8Array | null = null;
   /** Registry key for the single network instanced lane (#108-B). */
@@ -1254,10 +1256,11 @@ export class Network extends BaseEngine {
    * would build from scratch waits for the end of the current call chain: a streaming `layout()` in the same
    * chain still gets its structural tree off-thread, a `layout({ nested })` on a streaming backend gets the
    * module tree built on a worker (#428), and every other path (no layout, `positions`, `force`) has the
-   * tree before the next frame — and a synchronous call that needs it (`pick()`, `toSVG()`/`toPNG()`,
-   * `select()`/`selection()`, `highlight()`, `setStyle()`/`clearStyle()`) builds it at once. With a worker
-   * building the tree those calls see what they see during any worker-streamed load: no cut until the
-   * worker's tree lands.
+   * tree before the next frame — and a synchronous read that needs it (`pick()`, `toSVG()`/`toPNG()`,
+   * `selection()`) builds it at once. With a worker building the tree those reads see what they see during
+   * any worker-streamed load: no cut until the worker's tree lands. `select()`, `highlight()` and
+   * `setStyle()`/`clearStyle()` never build it: while no tree is drawn they keep their state, and the cut
+   * draws it when its tree lands, exactly as if they were called then.
    *
    * With a module hierarchy (`data(graph, { modules })`, #326) the cut draws the module tree by
    * default; `{ source: "structure" }` coarsens the graph structurally instead. `{ source: "spatial" }`
@@ -1306,18 +1309,12 @@ export class Network extends BaseEngine {
    * chain has built on a worker (#428). Building it here first would block the main thread for the whole
    * build (≈0.5 s structural, ≈0.15 s module, at 325k nodes / 1.5M edges) only to be replaced or
    * duplicated. An existing tree only needs its geometry refreshed, and state-network mode builds from
-   * the state view's own graph (#182). Nor does it wait while the network's layers carry interaction
-   * state ({@link canAwaitTree}).
+   * the state view's own graph (#182). Interaction state on the network's layers does not stop it: the
+   * layers keep it while they wait ({@link awaitedLayer}).
    */
   private defersTreeBuild(): boolean {
-    if (this.laidOut || !this.graph || this.stateData || !this.canAwaitTree()) return false;
+    if (this.laidOut || !this.graph || this.stateData) return false;
     return this.lodUsesModules() ? !this.moduleTreeBuilt() : !this.lodTree;
-  }
-
-  /** Whether the cut may wait for a tree: no network layer carries a selection, highlight or style
-   *  override, which the vector backends' clear while LOD awaits its tree would discard. */
-  private canAwaitTree(): boolean {
-    return !this.SCENE_LAYERS.some((name) => this.hasInteractionState(name));
   }
 
   /** Queue the deferred build ({@link runLODFallback}) and mark it as one a synchronous read may pull
@@ -1334,6 +1331,19 @@ export class Network extends BaseEngine {
    */
   protected override flushDeferredLayers(): void {
     if (this.lodBuildDeferred) this.runLODFallback();
+  }
+
+  /**
+   * While LOD waits for a tree ({@link lodAwaitsTree}) — a build {@link lod} deferred, a tree a worker
+   * streams or builds (#428) — the network draws none of its layers, and registers them when the tree
+   * lands. Interaction state set meanwhile is kept for them (see {@link BaseEngine.awaitedLayer}): on
+   * WebGL the node lane takes a selection, once `interactive()` is on (as a registered lane does); on
+   * Canvas/SVG the Scene layers take selections, highlights and style overrides. O(1).
+   */
+  protected override awaitedLayer(name: string): "lane" | "scene" | null {
+    if (!this.lodAwaitsTree() || !this.SCENE_LAYERS.includes(name)) return null;
+    if (!this.backend()?.setInstancedLayer) return "scene";
+    return name === this.NODE_LAYER && this.interactiveOpts ? "lane" : null;
   }
 
   /**
@@ -1604,9 +1614,7 @@ export class Network extends BaseEngine {
       // A nested layout on a streaming backend starts once its module tree is built — on a worker unless it
       // is already (#428); the synchronous force solve builds it here.
       const streams = layoutClass(opts.backend) === "streaming";
-      const nestedTree = opts.nested && opts.backend !== "positions"
-        ? (streams && this.canAwaitTree() ? this.moduleTreeLater() : this.moduleTree())
-        : undefined;
+      const nestedTree = opts.nested && opts.backend !== "positions" ? (streams ? this.moduleTreeLater() : this.moduleTree()) : undefined;
       // A transition (#328) eases from the current positions, and a warm nested start refines them —
       // so neither is streamed, nor gets the seed disc. Only layouts computed in one go transition.
       const duration = nestedTree || opts.backend === "positions" || opts.backend === "force" ? transitionDuration(opts.transition) : 0;
@@ -2819,7 +2827,9 @@ export class Network extends BaseEngine {
    *  O(layers) plus one re-push of what is left: the right clear when the Scene must not cost anything
    *  at all (#201). */
   private clearNetworkScene(): void {
-    this.removeLayers(this.SCENE_LAYERS);
+    // Only until the layers are drawn again (a tree landing, the WebGL upgrade): they keep their
+    // selection, highlights and style overrides meanwhile (#428).
+    this.removeLayers(this.SCENE_LAYERS, true);
     this.sceneActive = false;
   }
 
@@ -3053,12 +3063,12 @@ export class Network extends BaseEngine {
     const graph = this.graph;
     if (!graph) return undefined;
     const style = this.resolvedStyleCached(graph);
-    const key = this.noLodSelectedCacheFor;
-    if (!key || key.graph !== graph || key.style !== style) {
-      this.invalidateNoLodSelected(); // data/style version changed — flag lengths/semantics may differ
-      this.noLodSelectedCacheFor = { style, graph };
-    }
     const sel = this.selectedIds(this.NODE_LAYER);
+    const key = this.noLodSelectedCacheFor;
+    if (!key || key.graph !== graph || key.style !== style || key.selected !== sel) {
+      this.invalidateNoLodSelected(); // data/style/selection version changed — flag lengths/semantics may differ
+      this.noLodSelectedCacheFor = { style, graph, selected: sel };
+    }
     if (layer === this.NODE_LAYER) {
       if (this.noLodSelectedNodes) return this.noLodSelectedNodes;
       const out = new Uint8Array(graph.nodeCount);

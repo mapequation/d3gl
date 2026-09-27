@@ -406,4 +406,130 @@ describe("the module tree is built off the main thread (#428)", () => {
       vi.unstubAllGlobals();
     }
   });
+
+  // Interaction state set while the tree is on its way — Network Navigator selects its search hits during a
+  // load — is kept by layer name and drawn when the tree lands, exactly as the same calls made after the
+  // landing draw it. Nor does it take the build back to the main thread. `fit` frames the whole map, so
+  // every leaf is drawn and exported.
+  const VIEW = { k: 3, x: 100, y: 100 };
+  it("a select() made while the tree is on its way is kept, observed and drawn once it lands", async () => {
+    const net = network(host(), { width: 200, height: 200 });
+    await net.whenReady();
+    const seen: (string | number)[][] = [];
+    net.on("select", (hits) => seen.push(hits.map((h) => h.id)));
+    net.interactive({ selectable: true });
+    net.data(graph(), { modules: MODULES }).lod({ expandPx: 1, declutter: false }).layout({ backend: "worker", nested: true, fit: true });
+    net.select("nodes", [0]);
+    expect(seen).toEqual([[0]]);
+    expect(net.selection().map((h) => h.id)).toEqual([0]);
+    await net.whenSettled();
+    await frame();
+    expect(builds.count, "the selection pulled the build onto the main thread").toBe(0);
+    expect(net.lodSource).toBe("modules");
+    expect(net.selection()).toMatchObject([{ id: 0, datum: { aggregate: false, count: 1 } }]);
+    const kept = net.toSVG();
+    net.select("nodes", null);
+    const none = net.toSVG();
+    net.select("nodes", [0]);
+    expect(kept).not.toBe(none); // the kept selection is drawn…
+    expect(kept).toBe(net.toSVG()); // …as a selection made after the landing is
+    net.destroy();
+  });
+
+  it.each(["svg", "canvas"] as const)(
+    "on the %s backend, select(), setStyle(), clearStyle() and highlight() chained after lod() are drawn when its build lands",
+    async (backend) => {
+      const net = network(host(), { width: 200, height: 200, backend });
+      await net.whenReady();
+      const g = graph();
+      g.positions.set(POSITIONS); // placed, but by no layout: lod() defers its build to the end of the chain
+      const interact = (): void => {
+        net.select("nodes", [0]).setStyle("nodes", [2], { fill: "#ff0000" }).clearStyle("nodes", [1]).highlight("nodes", [3]);
+      };
+      net.data(g, { modules: MODULES }).lod({ expandPx: 1, declutter: false });
+      interact();
+      expect(net.lodSource).toBe("none"); // the setters kept their state instead of building the tree
+      await Promise.resolve();
+      expect(net.lodSource).toBe("modules");
+      expect(builds.count).toBe(1); // the end-of-chain build, once
+      const kept = net.toSVG();
+      net.select("nodes", null).highlight("nodes", null);
+      const none = net.toSVG();
+      interact();
+      expect(kept).not.toBe(none);
+      expect(kept).toBe(net.toSVG());
+      net.destroy();
+    },
+  );
+
+  // While a worker builds the tree the Scene layers are not drawn either. Overrides and highlights are
+  // keyed by id, so they draw exactly as when set after the landing. (A Scene selection styles the glyphs
+  // drawn when it is applied — here the first cut after the landing — as a select() during a streamed
+  // layout always has; the WebGL lane applies it per frame.)
+  it.each(["svg", "canvas"] as const)(
+    "on the %s backend, a select(), setStyle() and highlight() made while the tree is on its way are kept",
+    async (backend) => {
+      const net = network(host(), { width: 200, height: 200, backend });
+      await net.whenReady();
+      const interact = (): void => {
+        net.setStyle("nodes", [2], { fill: "#ff0000" }).highlight("nodes", [1]);
+      };
+      net.setTransform(VIEW); // a fixed view that holds the whole map
+      net.data(graph(), { modules: MODULES }).lod({ expandPx: 1, declutter: false }).layout({ backend: "worker", nested: true });
+      interact();
+      await net.whenSettled();
+      await frame();
+      expect(builds.count).toBe(0);
+      expect(net.lodSource).toBe("modules");
+      const kept = net.toSVG();
+      net.clearStyle("nodes").highlight("nodes", null);
+      const none = net.toSVG();
+      interact();
+      expect(kept).not.toBe(none);
+      expect(kept).toBe(net.toSVG());
+
+      // A selection is kept and observed too, and resolves against the layer once it is drawn.
+      const seen: (string | number)[][] = [];
+      net.on("select", (hits) => seen.push(hits.map((h) => h.id)));
+      net.data(graph(), { modules: PAIRS }).lod({ expandPx: 1, declutter: false }).layout({ backend: "worker", nested: true });
+      net.select("nodes", [0]);
+      expect(seen).toEqual([[0]]);
+      await net.whenSettled();
+      await frame();
+      expect(builds.count).toBe(0);
+      expect(net.selection().map((h) => [h.id, h.datum !== null])).toEqual([[0, true]]);
+      net.destroy();
+    },
+  );
+
+  it("a selection held when the chain starts leaves the tree to the worker", async () => {
+    const net = network(host(), { width: 200, height: 200 });
+    await net.whenReady();
+    net.interactive({ selectable: true });
+    net.data(graph(), { modules: MODULES }).select("nodes", [0]).lod({ expandPx: 1, declutter: false });
+    expect(net.lodSource).toBe("none"); // lod() waits for the end of the chain, selection or not
+    net.layout({ backend: "worker", nested: true, fit: true });
+    await net.whenSettled();
+    await frame();
+    expect(builds.count, "the selection took the build back to the main thread").toBe(0);
+    expect(net.selection()).toMatchObject([{ id: 0, datum: { aggregate: false, count: 1 } }]);
+    net.destroy();
+  });
+
+  it.each(["svg", "canvas"] as const)("on the %s backend, a highlight held when the chain starts survives the wait", async (backend) => {
+    const net = network(host(), { width: 200, height: 200, backend });
+    await net.whenReady();
+    net.setTransform(VIEW);
+    net.data(graph(), { modules: MODULES }).highlight("nodes", [1]).lod({ expandPx: 1, declutter: false }).layout({ backend: "worker", nested: true });
+    await net.whenSettled();
+    await frame();
+    expect(builds.count).toBe(0);
+    const kept = net.toSVG();
+    net.highlight("nodes", null);
+    const none = net.toSVG();
+    net.highlight("nodes", [1]);
+    expect(kept).not.toBe(none);
+    expect(kept).toBe(net.toSVG());
+    net.destroy();
+  });
 });
