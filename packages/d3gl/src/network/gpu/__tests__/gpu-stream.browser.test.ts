@@ -4,8 +4,8 @@
  * layout that turns non-finite stops with one warning and keeps its last finite positions — whether the
  * NaN came in through a drag's held positions or out of a tick's integrate, which a copy between ticks
  * catches by re-running the reductions. A drag's held positions are written at the start of a tick, never
- * mid-tick. The at-scale per-frame guard is `gpu-stream-perf.browser.test.ts`; context loss is in
- * `gpu-backend-integration`.
+ * mid-tick. The at-scale per-frame guard is T7 (`_gpu-stream-harness.ts`, run by `gpu-stream-nolod-perf`
+ * and `gpu-stream-lod-perf`); context loss is in `gpu-backend-integration`.
  */
 import { describe, it, expect, beforeAll, vi } from "vitest";
 import type { Device } from "@luma.gl/core";
