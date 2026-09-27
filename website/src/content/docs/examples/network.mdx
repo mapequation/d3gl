@@ -44,20 +44,22 @@ the graph grows. **GPU** and **Auto** get that budget whichever transport they r
 known only after `layout()` returns; where they resolve to the worker, a multilevel run therefore cools
 over fewer ticks than under **Worker**. `layout({ backend: "gpu" })` (the **Backend** control) runs the solve in WebGL2 where
 the device can: float render targets, float blending (`EXT_float_blend`) and textures large enough for
-the graph. It streams without blocking the main thread either: each frame gives the layout at most
-`min(10 ms, 0.6 × the frame interval)` of GPU time — a tick larger than that is split across frames in
-row bands — and positions come back through an asynchronous, fenced readback. So pan, zoom and a node
-drag never wait behind a tick, and the page keeps its frame rate while hundreds of thousands of nodes
-settle (measured in Chromium; Firefox and Safari are not measured yet). The layout repaints at most 20
-times a second. On a device without those capabilities it falls back to the worker with one console
-warning naming the reason, and the fallback is the run `backend: "worker"` would start — it honours `multilevel` (**Seeding**) and
-streams the LOD tree from the worker.
+the graph. The main thread never waits for it: each frame gives the layout at most
+`min(10 ms, 0.6 × the frame interval)` of GPU time (a tick larger than that is split across frames in
+row bands), and positions come back through an asynchronous, fenced readback. So a pan, a zoom or a
+node drag waits behind at most about 20 ms of queued layout work (two 60 Hz frames' budget), never a
+whole batch of ticks, and the page keeps its frame rate while hundreds of thousands of nodes settle
+(measured in Chromium; Firefox and Safari are not measured yet). The layout repaints at most 20 times
+a second. On a device without those capabilities it falls back to the worker with one console warning
+naming the reason, and the fallback is the run `backend: "worker"` would start: it honours
+`multilevel` (**Seeding**) and streams the LOD tree from the worker.
 `layout({ backend: "auto" })` (**Auto**) asks for "the GPU where it works": it takes the GPU wherever
 `"gpu"` would and the worker everywhere else, **without** a warning, since there the worker is an
 expected outcome. Everything else — `fit`, drag reheat, nested layouts, state networks, LOD streaming —
 then behaves exactly as on the backend it resolved to, and `net.layoutTransport` (the top-right readout)
 says which one runs. It is opt-in: omitting `backend` behaves as before.
-(On a cross-origin-isolated page positions are shared zero-copy via
+(On a cross-origin-isolated page
+positions are shared zero-copy via
 `SharedArrayBuffer`; otherwise they are posted as snapshots — the top-right readout shows whether the
 environment supports it and whether this layout is actually using it.) The **Nodes** slider scales from 10 to
 1,000,000; **Seeding** compares multilevel against a cold start; **Size** switches uniform vs
