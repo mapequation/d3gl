@@ -363,6 +363,27 @@ describe("GPU layout LOD relay (#377) — engine", () => {
     }
   });
 
+  it("the same on layout({ backend: 'auto' }) (#375): lod() after an earlier auto layout builds no tree", async () => {
+    const net = network(makeHost(), { width: W, height: H, backend: "webgl" });
+    await net.whenReady();
+    try {
+      net.data(clustered(500, 1)).layout({ backend: "auto", iterations: 5 });
+      await net.whenSettled();
+      expect(net.layoutTransport).toBe("gpu");
+      const posts = vi.spyOn(Worker.prototype, "postMessage");
+      net.data(clustered(3000, 3)).style({ sizeMode: "screen" }).lod({ expandPx: 48 });
+      expect(net.lodSource).toBe("none"); // the next auto layout streams the tree from a worker, either way
+      net.layout({ backend: "auto", iterations: 60 });
+      await net.whenSettled();
+      expect(net.layoutTransport).toBe("gpu");
+      expect(net.lodSource).toBe("worker");
+      const types = posts.mock.calls.map((c: [MainToWorker, ...unknown[]]) => c[0].type);
+      expect(types.filter((t) => t === "coarsen")).toHaveLength(1);
+    } finally {
+      net.destroy();
+    }
+  });
+
   it("a failed LOD worker: the engine keeps drawing the adopted tree and refits it itself", async () => {
     vi.spyOn(console, "warn").mockImplementation(() => {});
     const net = network(makeHost(), { width: W, height: H, backend: "webgl" });

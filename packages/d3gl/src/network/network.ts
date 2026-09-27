@@ -1658,16 +1658,17 @@ export class Network extends BaseEngine {
 
   /**
    * Whether a layout worker provides the structural LOD tree, so the main thread builds none (#103): a
-   * worker layout; a GPU layout waiting for its device, or fallen back to the worker; the GPU solve while its
-   * LOD worker streams the tree (#377); and a GPU backend with no layout running — `data()` stopped it, and
-   * the next GPU layout streams its tree from a worker, as the next worker layout would (the deferred
-   * fallback builds one if none follows). A GPU solve without that worker (LOD enabled after it started, or
-   * the worker failed) keeps a main-thread tree, refit per frame.
+   * worker layout; a `"gpu"` / `"auto"` layout waiting for its device, or fallen back to the worker; the GPU
+   * solve while its LOD worker streams the tree (#377); and a `"gpu"` / `"auto"` backend with no layout
+   * running — `data()` stopped it, and the next such layout streams its tree from a worker whichever
+   * transport it resolves to (#375), as the next worker layout would (the deferred fallback builds one if
+   * none follows). A GPU solve without that worker (LOD enabled after it started, or the worker failed)
+   * keeps a main-thread tree, refit per frame.
    */
   private lodTreeFromWorker(): boolean {
     const transport = this.streamingTransport();
     if (transport === "worker" || transport === "pending") return true;
-    if (this.layoutOpts.backend !== "gpu") return false;
+    if (!requestsGpu(this.layoutOpts.backend)) return false;
     if (!this.layoutHandle) return true;
     return transport === "gpu" && this.lodStreaming;
   }
