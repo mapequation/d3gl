@@ -4,6 +4,7 @@ import { Network, type NetworkOptions } from "../network.js";
 import { buildGraph, type NetworkGraph } from "../graph.js";
 import type { ModuleNode } from "../modules.js";
 import type { ViewTransform } from "../../core/index.js";
+import { easeCubicInOut } from "../transition.js";
 
 /**
  * `layout({ fit: true })` beyond streaming (#427), through the real engine and d3-zoom on a real host:
@@ -319,6 +320,79 @@ describe("fit + transition: the user takes the view over, the camera's own moves
     expect(zoomTransform(host)).toMatchObject(grabbed);
     net.destroy();
   });
+});
+
+describe("fit + transition: the destination follows the viewport and the glyph pad (#427)", () => {
+  // The camera heads for the view framing the target in the viewport and with the glyph pad as they are
+  // NOW: a resize or a restyle mid-ease re-aims it from where it is — no jump — and it lands on the view
+  // the settle frames, so there is no snap at the end either. Frames are stepped by hand on a virtual
+  // clock, so each frame's eased progress is known exactly.
+  for (const change of ["resize", "restyle"] as const) {
+    it(`a ${change} mid-ease re-aims the camera from where it is, and it lands on the settled fit`, async () => {
+      const { net } = await engine(true);
+      const { graph, positions: a } = grid(400, 20, 10);
+      net.data(graph).style({ nodeRadius: 3, sizeMode: change === "restyle" ? "world" : "screen" }).enableZoom([0.001, 100]);
+      net.layout({ backend: "positions", positions: a, fit: true });
+
+      const realRaf = globalThis.requestAnimationFrame;
+      const realCaf = globalThis.cancelAnimationFrame;
+      const queue = new Map<number, FrameRequestCallback>();
+      let id = 0;
+      globalThis.requestAnimationFrame = (cb) => (queue.set(++id, cb), id);
+      globalThis.cancelAnimationFrame = (i) => void queue.delete(i);
+      const flush = (): void => {
+        const due = [...queue.values()];
+        queue.clear();
+        for (const cb of due) cb(0);
+      };
+      let clock = 0;
+      const now = vi.spyOn(performance, "now").mockImplementation(() => clock);
+      try {
+        const D = 1000;
+        const b = moved(a, 2, 300, -120);
+        net.layout({ backend: "positions", positions: b, transition: D, fit: true }); // starts at clock 0
+        let settled = false;
+        void net.whenSettled().then(() => void (settled = true));
+        const frames: { e: number; view: ViewTransform }[] = [];
+        let changedAfter = -1; // the last frame before the change
+        for (let i = 0; i < 40 && !settled; i++) {
+          clock += 50;
+          if (i === 8) {
+            changedAfter = frames.length - 1;
+            if (change === "resize") net.setSize(W * 0.6, H * 0.6);
+            else net.style({ nodeRadius: 60, sizeMode: "world" });
+          }
+          flush();
+          frames.push({ e: easeCubicInOut(Math.min(1, clock / D)), view: net.camera });
+          await sleep(0); // the settle's microtasks run here
+        }
+        expect(settled, "the transition never settled").toBe(true);
+        const final = net.camera;
+        const last = frames[frames.length - 1];
+        const before = frames[changedAfter];
+        if (!last || !before) throw new Error("no frames");
+        // The last transition frame is already the settled fit: no snap at the settle.
+        expect(last.view.k).toBeCloseTo(final.k, 9);
+        expect(last.view.x).toBeCloseTo(final.x, 6);
+        expect(last.view.y).toBeCloseTo(final.y, 6);
+        expect(final.k, "non-vacuity: the change did not move the destination").toBeLessThan(before.view.k * 0.9);
+        // From the change on, the camera goes from where it was to the new destination over the progress
+        // left, in step with the nodes — so it never jumps at the change.
+        for (const f of frames.slice(changedAfter + 1)) {
+          expect(cameraFraction(f.view, before.view, final)).toBeCloseTo((f.e - before.e) / (1 - before.e), 6);
+        }
+        if (change === "resize") {
+          const f = framingOf(b, final);
+          expect(f.fill * Math.min(W, H) / Math.min(W * 0.6, H * 0.6)).toBeGreaterThan(0.8); // framed in the new size
+        }
+      } finally {
+        now.mockRestore();
+        globalThis.requestAnimationFrame = realRaf;
+        globalThis.cancelAnimationFrame = realCaf;
+        net.destroy();
+      }
+    });
+  }
 });
 
 describe("fit without a transition frames a layout landed in one go, once (#427)", () => {

@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { layoutBox, fitTransform, interpolateView, type FitBox, type LayoutBoxOptions } from "../fit.js";
+import { layoutBox, fitTransform, interpolateView, fitCameraPath, type FitBox, type LayoutBoxOptions } from "../fit.js";
 import { buildModuleLODTree } from "../modules.js";
 import { buildLODTree, computeLODPositions } from "../lod.js";
 import { buildGraph } from "../graph.js";
@@ -392,5 +392,48 @@ describe("interpolateView (#427): the camera of a fitted transition", () => {
       expect(sy).toBeGreaterThanOrEqual(-1e-6);
       expect(sy).toBeLessThanOrEqual(H + 1e-6);
     }
+  });
+});
+
+describe("fitCameraPath (#427): a fitted transition's camera re-aims when its destination moves", () => {
+  const start = { k: 2, x: -100, y: 40 };
+  const end = { k: 0.5, x: 300, y: 120 };
+  const moved = { k: 0.3, x: 150, y: 90 }; // the destination after a resize or restyle
+  const s = (t: { k: number }): number => 1 / t.k;
+
+  it("with a destination that holds still, is interpolateView from its start", () => {
+    const path = fitCameraPath(start);
+    const view = interpolateView(start, end);
+    for (const e of [0, 0.1, 0.4, 0.75, 1]) expect(path(e, end)).toEqual(view(e));
+  });
+
+  it("re-aims from where it is when the destination moves: no jump, then in step with the rest of the ease", () => {
+    const path = fitCameraPath(start);
+    for (const e of [0.1, 0.2, 0.3]) path(e, end);
+    const at = path(0.3, end); // the view the camera shows at progress 0.3
+    // The destination moves: the camera goes on from where it is, over the progress that is left.
+    expect(path(0.3, moved)).toEqual(at);
+    for (const e of [0.4, 0.6, 0.9]) {
+      const t = path(e, moved);
+      expect((s(t) - s(at)) / (s(moved) - s(at))).toBeCloseTo((e - 0.3) / (1 - 0.3), 9);
+    }
+    expect(path(1, moved)).toEqual(moved); // and ends exactly on it, with the nodes
+  });
+
+  it("zooms monotonically across a re-aim in the same direction", () => {
+    const path = fitCameraPath(start);
+    let prev = start.k;
+    for (let i = 1; i <= 100; i++) {
+      const k = path(i / 100, i < 40 ? end : moved).k;
+      expect(k).toBeLessThanOrEqual(prev);
+      prev = k;
+    }
+  });
+
+  it("ends on the destination given at progress 1, whatever came before", () => {
+    const path = fitCameraPath(start);
+    path(0.5, end);
+    expect(path(1, moved)).toEqual(moved);
+    expect(path(1.2, end)).toEqual(end);
   });
 });

@@ -21,7 +21,7 @@ import { startGpuNestedLayout } from "./gpu/gpu-nested-transport.js";
 import { startGpuLayout } from "./gpu/gpu-transport.js";
 import { WebGLBackend } from "../webgl/webgl-backend.js";
 import type { NetworkGraph } from "./graph.js";
-import { layoutBox, layoutFitTransform, interpolateView, type FitBox } from "./fit.js";
+import { layoutBox, layoutFitTransform, fitCameraPath, type FitBox } from "./fit.js";
 import type { InstancedLayer, ViewTransform } from "../core/index.js";
 import { InstancedLane, type SelectionStrategy } from "../core/instanced-lane.js";
 import { StableColumns } from "../core/stable-columns.js";
@@ -780,9 +780,10 @@ export class Network extends BaseEngine {
    * — a settled layout always frames on its leaves' exact box.
    */
   private fitBound: FitBox | null = null;
-  /** The camera of a fitted transition (#427): the view at the transition's eased progress, from the view
-   *  it started at to the one framing its target ({@link startTransition}). Null without one. */
-  private fitCamera: ((progress: number) => ViewTransform) | null = null;
+  /** The camera of a fitted transition (#427): its target's exact box, measured once when it starts, and
+   *  the path from the view it started at to the view framing that box ({@link startTransition}). Null
+   *  without one. */
+  private fitCamera: { box: FitBox; path: (progress: number, end: ViewTransform) => ViewTransform } | null = null;
   /** The largest leaf radius per resolved style with per-node radii, for the fit's pad
    *  ({@link fitViewToLayout}): O(nodes) once per such style, then read per frame. Weakly keyed, so a
    *  replaced style is never kept alive by it. A constant radius needs no scan ({@link maxLeafRadius}). */
@@ -2038,8 +2039,10 @@ export class Network extends BaseEngine {
       onFrame: (progress) => {
         if (this.graph !== graph) return;
         this.dragReapply?.();
+        // A fitted transition's camera, on the same ease (#427): O(1). It heads for the view framing the
+        // target in the viewport and with the glyph pad as they are now, so a resize or restyle re-aims it.
         const camera = this.fitOnLayout ? this.fitCamera : null;
-        if (camera) this.frameView(camera(progress)); // a fitted transition's camera, on the same ease (#427): O(1)
+        if (camera) this.frameView(camera.path(progress, this.fitTransformFor(graph, camera.box)));
         this.repaintDuringDrag();
         this.flushFrame(); // this tick runs inside an animation frame: draw it here (with any pending zoom), not a frame late
       },
@@ -2049,14 +2052,14 @@ export class Network extends BaseEngine {
   /**
    * Start easing `graph`'s positions to `target` (#328). With a fit on, the camera eases along (#427): from
    * the view now to the one framing `target`'s exact box — the view the settled fit frames — on the
-   * transition's own eased progress, in its frames ({@link interpolateView}). The box is one O(nodes) pass
-   * here, after `to` has applied any nodes the transition keeps where they were dropped; each frame's camera
-   * is O(1).
+   * transition's own eased progress, in its frames ({@link fitCameraPath}). The box is one O(nodes) pass
+   * here, after `to` has applied any nodes the transition keeps where they were dropped; each frame derives
+   * the view framing it from the current size and glyph pad, and moves the camera, in O(1).
    */
   private startTransition(graph: NetworkGraph, tween: PositionTransition, target: Float32Array): void {
     tween.to(target);
     const box = this.fitOnLayout ? layoutBox(target, graph.nodeCount) : null;
-    this.fitCamera = box ? interpolateView(this.transform, this.fitTransformFor(graph, box)) : null;
+    this.fitCamera = box ? { box, path: fitCameraPath(this.transform) } : null;
   }
 
   /** A layout handle for a transition (#328): it settles when the transition ends, and `stop()` also
