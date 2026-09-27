@@ -22,6 +22,7 @@
 import { lodTreeFromTopology, type LODTree } from "./lod.js";
 import {
   buildModuleTopology,
+  copyRecordPaths,
   flattenPaths,
   modulePrefixTree,
   resolveLinkPaths,
@@ -80,21 +81,25 @@ export interface ModuleLink {
 export function flattenModuleRecords(nodeCount: number, records: ArrayLike<ModuleNode>, who = "buildModuleLODTree"): FlatModuleRecords {
   const count = records.length;
   const id = new Uint32Array(count);
+  const offset = new Uint32Array(count + 1);
   const seen = new Uint8Array(nodeCount);
-  const pathOf = (r: number): ArrayLike<number> => records[r]?.path ?? [];
+  let total = 0;
   for (let r = 0; r < count; r++) {
     const record = records[r];
     const i = record ? record.id : NaN;
     if (!(i >= 0 && i < nodeCount)) throw new Error(`${who}: record id ${i} out of range [0, ${nodeCount})`);
     if (seen[i]) throw new Error(`${who}: duplicate record for node id ${i}`);
     seen[i] = 1;
-    if (pathOf(r).length < 1) throw new Error(`${who}: node id ${i} has an empty path`);
+    const length = record ? record.path.length : 0;
+    if (length < 1) throw new Error(`${who}: node id ${i} has an empty path`);
     id[r] = i;
+    total += length;
+    offset[r + 1] = total;
   }
   for (let i = 0; i < nodeCount; i++) {
     if (!seen[i]) throw new Error(`${who}: no record for node id ${i} (records must cover every node)`);
   }
-  return { id, ...flattenPaths(count, pathOf) };
+  return { id, offset, entries: copyRecordPaths(records, offset) };
 }
 
 /** Flatten `links` into {@link FlatModuleLinks}. O(links · depth). Endpoints are checked when resolved. */

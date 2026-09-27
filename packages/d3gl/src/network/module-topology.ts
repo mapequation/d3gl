@@ -56,6 +56,21 @@ export function flattenPaths(count: number, pathOf: (i: number) => ArrayLike<num
 }
 
 /**
+ * The records' paths copied into one entries array laid out by `offset` (length `records + 1`, the running
+ * sum of the path lengths). The copy pass of a flatten whose caller counted the lengths in its own pass.
+ */
+export function copyRecordPaths(records: ArrayLike<{ path: ArrayLike<number> }>, offset: Uint32Array): Int32Array {
+  const entries = new Int32Array(offset[records.length] ?? 0);
+  let w = 0;
+  for (let r = 0; r < records.length; r++) {
+    const path = records[r]?.path;
+    if (!path) continue;
+    for (let d = 0; d < path.length; d++) entries[w++] = path[d] ?? 0;
+  }
+  return entries;
+}
+
+/**
  * The distinct modules a set of paths spell (#428), interned in first-seen order: each record's
  * enclosing-module chain (its path minus the last entry, which is the node's rank in its module).
  */

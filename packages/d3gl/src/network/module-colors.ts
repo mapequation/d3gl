@@ -12,7 +12,7 @@
  * spacing.
  */
 import { hcl } from "d3-color";
-import { flattenPaths, internModules } from "./module-topology.js";
+import { copyRecordPaths, internModules } from "./module-topology.js";
 
 /** A node's placement in the module tree — `path` is the Infomap 1-based chain (last entry is the rank). */
 export interface ModulePathNode {
@@ -43,8 +43,12 @@ export function moduleColors(nodes: ArrayLike<ModulePathNode>, opts: ModuleColor
   const C = opts.chroma ?? 48;
   const rotate = opts.rotate ?? 20;
   const n = nodes.length;
-  const { offset, entries } = flattenPaths(n, (r) => nodes[r]?.path ?? []);
-  const { moduleParent, moduleChild, recordModule } = internModules(offset, entries);
+  const offset = new Uint32Array(n + 1);
+  for (let r = 0, total = 0; r < n; r++) {
+    total += nodes[r]?.path.length ?? 0;
+    offset[r + 1] = total;
+  }
+  const { moduleParent, moduleChild, recordModule } = internModules(offset, copyRecordPaths(nodes, offset));
 
   // Each module's arc: its parent's arc split evenly among the parent's sub-modules, in branch order.
   // A module is registered after its parent, so one forward pass sees every parent's arc first.
