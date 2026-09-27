@@ -339,7 +339,6 @@ export interface CollisionGatherInput {
  */
 export class CollisionGrid {
   private readonly device: Device;
-  private readonly atlas: readonly [number, number];
   private readonly slotCell: Texture;
   /** `(x, y, radius, 0)` per slot, written with the cells: the gather's one fetch per pair. */
   private readonly disc: Texture;
@@ -365,7 +364,6 @@ export class CollisionGrid {
     this.largeWidth = largeWidth;
     const w = Math.max(1, atlasWidth);
     const h = Math.max(1, atlasHeight);
-    this.atlas = [w, h];
     this.slotCell = device.createTexture({ width: slotWidth, height: slotHeight, format: "r32uint", mipLevels: 1, sampler: NEAREST });
     this.disc = device.createTexture({ width: slotWidth, height: slotHeight, format: "rgba32float", mipLevels: 1, sampler: NEAREST });
     this.slotCellFbo = device.createFramebuffer({ width: slotWidth, height: slotHeight, colorAttachments: [this.slotCell, this.disc] });
@@ -387,12 +385,6 @@ export class CollisionGrid {
     this.roundModel = scatter(ROUND_FS, this.roundUniforms, MIN_BLEND);
     this.gatherUniforms = { u_count: 0, u_width: 1, u_tableWidth: 1, u_largeWidth: largeWidth, u_pad: 1, u_relax: COLLISION_RELAX };
     this.gatherModel = fullScreenModel(device, gatherFs(COLLISION_ROUNDS), this.gatherUniforms, NO_BLEND);
-  }
-
-  /** Bytes of GPU memory the grid holds. */
-  get gpuBytes(): number {
-    const [w, h] = this.atlas;
-    return this.slotCell.width * this.slotCell.height * (4 + 16) + w * h * (4 + 2 * 16);
   }
 
   /**

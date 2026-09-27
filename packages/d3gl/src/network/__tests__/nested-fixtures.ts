@@ -223,3 +223,88 @@ export function linkTightness(tree: LODTree, out: Layout): number {
   return sum / modules;
 }
 
+
+/**
+ * A synthetic Infomap-like module tree over `leaves` leaves, for timing the nested layout at scale (#333,
+ * #355): leaves → bottom modules (mean ~40 children) → mid modules (~15) → top modules (~10) → root, every
+ * group size heavy-tailed; about 4 random sibling links per module child with random flows, and a
+ * heavy-tailed leaf flow. Seeded, so every run lays out the same tree (at 325,729 leaves: 336,616 tree
+ * nodes below the root in 10,888 modules; at 1,000,000: 1,033,396 in 33,397).
+ */
+export function infomapLikeTree(leaves: number): { topo: NestedLayoutTopology; flow: Float32Array } {
+  let seed = 12345;
+  const rnd = (): number => (seed = (seed * 1664525 + 1013904223) >>> 0) / 4294967296;
+  const group = (n: number, mean: number): number[] => {
+    const sizes: number[] = [];
+    for (let left = n; left > 0; ) {
+      const s = Math.min(left, Math.max(2, Math.floor((mean / 3) * Math.pow(rnd(), -0.6))));
+      sizes.push(s);
+      left -= s;
+    }
+    return sizes;
+  };
+  const bottom = group(leaves, 40);
+  const mid = group(bottom.length, 15);
+  const top = group(mid.length, 10);
+  const levels = [bottom, mid, top];
+  const counts = [leaves, bottom.length, mid.length, top.length, 1];
+  const size = counts.reduce((a, b) => a + b, 0);
+  const base = [0];
+  for (let i = 1; i < counts.length; i++) base.push((base[i - 1] ?? 0) + (counts[i - 1] ?? 0));
+  const parent = new Int32Array(size).fill(-1);
+  levels.forEach((sizes, lvl) => {
+    let c = base[lvl] ?? 0;
+    const up = base[lvl + 1] ?? 0;
+    sizes.forEach((s, gi) => {
+      for (let j = 0; j < s; j++) parent[c++] = up + gi;
+    });
+  });
+  const root = base[4] ?? 0;
+  for (let g = base[3] ?? 0; g < root; g++) parent[g] = root;
+
+  const childOffset = new Uint32Array(size + 1);
+  for (let g = 0; g < size; g++) {
+    const p = parent[g] ?? -1;
+    if (p >= 0) childOffset[p + 1] = (childOffset[p + 1] ?? 0) + 1;
+  }
+  for (let g = 0; g < size; g++) childOffset[g + 1] = (childOffset[g + 1] ?? 0) + (childOffset[g] ?? 0);
+  const children = new Uint32Array(childOffset[size] ?? 0);
+  const cursor = childOffset.slice(0, size);
+  for (let g = 0; g < size; g++) {
+    const p = parent[g] ?? -1;
+    if (p < 0) continue;
+    const at = cursor[p] ?? 0;
+    children[at] = g;
+    cursor[p] = at + 1;
+  }
+
+  const out: number[][] = Array.from({ length: size }, () => []);
+  for (let g = 0; g < size; g++) {
+    const first = childOffset[g] ?? 0;
+    const k = (childOffset[g + 1] ?? 0) - first;
+    if (k < 2) continue;
+    const m = Math.min(4 * k, (k * (k - 1)) / 2);
+    for (let e = 0; e < m; e++) {
+      const a = children[first + Math.floor(rnd() * k)] ?? 0;
+      const b = children[first + Math.floor(rnd() * k)] ?? 0;
+      if (a !== b) out[a]?.push(b);
+    }
+  }
+  const superEdgeOffset = new Uint32Array(size + 1);
+  for (let g = 0; g < size; g++) superEdgeOffset[g + 1] = (superEdgeOffset[g] ?? 0) + (out[g]?.length ?? 0);
+  const superEdgeTarget = new Uint32Array(superEdgeOffset[size] ?? 0);
+  const superEdgeFlow = new Float32Array(superEdgeTarget.length);
+  let e = 0;
+  for (const targets of out) {
+    for (const t of targets) {
+      superEdgeTarget[e] = t;
+      superEdgeFlow[e++] = rnd();
+    }
+  }
+  const flow = new Float32Array(leaves);
+  for (let i = 0; i < leaves; i++) flow[i] = Math.pow(rnd(), -1.5);
+  return {
+    topo: { size, leafCount: leaves, childOffset, children, parent, superEdgeOffset, superEdgeTarget, superEdgeFlow },
+    flow,
+  };
+}

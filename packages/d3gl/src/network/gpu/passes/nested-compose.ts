@@ -205,11 +205,6 @@ export class NestedComposePass {
     this.device.submit();
   }
 
-  /** Bytes of GPU memory: the staging texture and the node → slot table. */
-  get gpuBytes(): number {
-    return this.width * this.height * 16 + this.nodeSlot.width * this.nodeSlot.height * 4;
-  }
-
   destroy(): void {
     this.model.destroy();
     this.framebuffer.destroy();

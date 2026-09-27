@@ -585,17 +585,6 @@ export class GpuNestedLayout implements StreamSolver {
     }
   }
 
-  /** Bytes of GPU memory the layout holds (textures and render targets; excludes the readback's PBOs). */
-  get gpuBytes(): number {
-    const slotTexels = this.width * this.height;
-    const perSlot = slotTexels * (4 * 8 + 8 + 8 + 4 + 4); // pos ×2, vel ×2, v*, force, radius, slotSeg
-    const pyramid = this.pyramid
-      ? this.pyramid.atlas.width * this.pyramid.atlas.height * 16 +
-        (this.pyramid.atlas.odd.width * this.pyramid.atlas.odd.height + this.pyramid.atlas.even.width * this.pyramid.atlas.even.height) * 16
-      : 0;
-    return perSlot + pyramid + this.collision.gpuBytes + this.compose.gpuBytes;
-  }
-
   destroy(): void {
     this.pos.destroy();
     this.vel.destroy();
