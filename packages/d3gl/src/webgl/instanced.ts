@@ -22,6 +22,25 @@ function selectedFloats(data: WithHighlight): Float32Array {
   return out;
 }
 
+/**
+ * The capacity (in instances) a lane grows to when an update's `count` outgrows its `capacity`: at least
+ * double. An LOD frontier keeps growing while a layout expands or a zoom deepens; an exact fit reallocated
+ * every buffer of the lane on each frame that set a new high, and doubling bounds the reallocations to
+ * log2(peak / first) over the lane's life, like the Scene path's `GrowBuffer` (renderer.ts). A shrink
+ * keeps the room (the tail past `count` is never drawn).
+ */
+function grownCapacity(count: number, capacity: number): number {
+  return Math.max(count, 2 * capacity);
+}
+
+/** A per-instance buffer with room for `capacity` (≥ `count`) instances, holding `data` (`count` instances) from instance 0. */
+function grownBuffer(device: Device, data: ArrayBufferView, count: number, capacity: number): Buffer {
+  if (capacity <= count) return device.createBuffer({ data });
+  const buffer = device.createBuffer({ byteLength: Math.ceil(data.byteLength / count) * capacity });
+  buffer.write(data);
+  return buffer;
+}
+
 /** Highlight tint (0..1) ≈ #dc2626 — the red the selection/hover rings use (#162), so a recoloured link
  *  matches its ring. The shader scales this by the instance's luminance, so weight-encoded links keep their cue. */
 const HL_RED: [number, number, number] = [0.863, 0.149, 0.149];
@@ -70,14 +89,15 @@ class HighlightBuffers {
   attributes(): Record<string, Buffer> {
     return { a_group: this.group, a_group2: this.group2, a_selected: this.selected };
   }
-  /** Rewrite the buffers on a geometry grow (circles' update path). Returns the fresh attributes to re-bind. */
-  recreate(data: WithHighlight): Record<string, Buffer> {
+  /** Reallocate the buffers at the lane's grown `capacity` on a geometry grow (every primitive's update
+   *  path), holding `data`. Returns the fresh attributes to re-bind. */
+  recreate(data: WithHighlight, capacity: number): Record<string, Buffer> {
     this.group.destroy();
     this.group2.destroy();
     this.selected.destroy();
-    this.group = this.device.createBuffer({ data: data.groups ?? minusOnes(data.count) });
-    this.group2 = this.device.createBuffer({ data: data.groups2 ?? minusOnes(data.count) });
-    this.selected = this.device.createBuffer({ data: selectedFloats(data) });
+    this.group = grownBuffer(this.device, data.groups ?? minusOnes(data.count), data.count, capacity);
+    this.group2 = grownBuffer(this.device, data.groups2 ?? minusOnes(data.count), data.count, capacity);
+    this.selected = grownBuffer(this.device, selectedFloats(data), data.count, capacity);
     this.lastGroups = data.groups;
     this.lastGroups2 = data.groups2;
     this.lastSelected = data.selected;
@@ -171,6 +191,10 @@ export class InstancedCircles {
   count: number;
   /** Current buffer capacity (in instances). Used by update() to decide grow vs. sub-update. */
   private _capacity: number;
+  /** Instances the buffers have room for (≥ `count`): kept on a shrink, at least doubled on a grow. */
+  get capacity(): number {
+    return this._capacity;
+  }
   /** Whether the current buffers were allocated with borders (optional-field shape). */
   private _hasBorders: boolean;
   private model: Model;
@@ -267,13 +291,15 @@ export class InstancedCircles {
       this.color.destroy();
       this.border.destroy();
       this.borderColor.destroy();
-      this._capacity = data.count;
+      // A grow at least doubles the room; a borders shape change within it reallocates at the count, as before.
+      if (data.count > this._capacity) this._capacity = grownCapacity(data.count, this._capacity);
+      else this._capacity = data.count;
       this._hasBorders = hasBorders;
-      this.center = device.createBuffer({ data: data.centers });
-      this.radius = device.createBuffer({ data: data.radii });
-      this.color = device.createBuffer({ data: data.colors });
-      this.border = device.createBuffer({ data: data.borders ?? new Float32Array(data.count) });
-      this.borderColor = device.createBuffer({ data: data.borderColors ?? new Uint8Array(data.count * 4) });
+      this.center = grownBuffer(device, data.centers, data.count, this._capacity);
+      this.radius = grownBuffer(device, data.radii, data.count, this._capacity);
+      this.color = grownBuffer(device, data.colors, data.count, this._capacity);
+      this.border = grownBuffer(device, data.borders ?? new Float32Array(data.count), data.count, this._capacity);
+      this.borderColor = grownBuffer(device, data.borderColors ?? new Uint8Array(data.count * 4), data.count, this._capacity);
       // Re-bind all attributes on the model (the buffer objects changed).
       this.model.setAttributes({
         a_center: this.center,
@@ -281,7 +307,7 @@ export class InstancedCircles {
         a_color: this.color,
         a_border: this.border,
         a_borderColor: this.borderColor,
-        ...this.hl.recreate(data), // #162 group/selected grow with the geometry
+        ...this.hl.recreate(data, this._capacity), // #162 group/selected grow with the geometry
       });
     } else {
       // Sub-update: upload only the filled portion of the scratch buffers.
@@ -323,6 +349,10 @@ export class InstancedCircles {
 export class InstancedPie {
   count: number;
   private _capacity: number;
+  /** Instances the buffers have room for (≥ `count`): kept on a shrink, at least doubled on a grow. */
+  get capacity(): number {
+    return this._capacity;
+  }
   private model: Model;
   private corner: Buffer;
   private center: Buffer;
@@ -396,17 +426,17 @@ export class InstancedPie {
       this.radius.destroy();
       this.angles.destroy();
       this.color.destroy();
-      this._capacity = data.count;
-      this.center = device.createBuffer({ data: data.centers });
-      this.radius = device.createBuffer({ data: data.radii });
-      this.angles = device.createBuffer({ data: data.angles });
-      this.color = device.createBuffer({ data: data.colors });
+      this._capacity = grownCapacity(data.count, this._capacity);
+      this.center = grownBuffer(device, data.centers, data.count, this._capacity);
+      this.radius = grownBuffer(device, data.radii, data.count, this._capacity);
+      this.angles = grownBuffer(device, data.angles, data.count, this._capacity);
+      this.color = grownBuffer(device, data.colors, data.count, this._capacity);
       this.model.setAttributes({
         a_center: this.center,
         a_radius: this.radius,
         a_angles: this.angles,
         a_color: this.color,
-        ...this.hl.recreate(data),
+        ...this.hl.recreate(data, this._capacity),
       });
     } else {
       this.center.write(data.centers);
@@ -455,6 +485,10 @@ export class InstancedLines {
   count: number;
   /** Current buffer capacity (in instances). Used by update() to decide grow vs. sub-update. */
   private _capacity: number;
+  /** Instances the buffers have room for (≥ `count`): kept on a shrink, at least doubled on a grow. */
+  get capacity(): number {
+    return this._capacity;
+  }
   /** Vertex samples (M) baked into the corner template buffer — if data.samples changes, caller must recreate. */
   private _samples: number;
   /** Last-uploaded style-derived array refs (#179) — a sub-update skips a buffer whose ref is unchanged. */
@@ -575,12 +609,12 @@ export class InstancedLines {
       this.widthBuf.destroy();
       this.color.destroy();
       this.bend.destroy();
-      this._capacity = data.count;
-      this.source = device.createBuffer({ data: data.sources });
-      this.target = device.createBuffer({ data: data.targets });
-      this.widthBuf = device.createBuffer({ data: data.widths });
-      this.color = device.createBuffer({ data: data.colors });
-      this.bend = device.createBuffer({ data: data.bends ?? new Float32Array(data.count) });
+      this._capacity = grownCapacity(data.count, this._capacity);
+      this.source = grownBuffer(device, data.sources, data.count, this._capacity);
+      this.target = grownBuffer(device, data.targets, data.count, this._capacity);
+      this.widthBuf = grownBuffer(device, data.widths, data.count, this._capacity);
+      this.color = grownBuffer(device, data.colors, data.count, this._capacity);
+      this.bend = grownBuffer(device, data.bends ?? new Float32Array(data.count), data.count, this._capacity);
       // Fresh buffers were created from these arrays — record the refs so a later sub-update skips them.
       this._lastWidths = data.widths;
       this._lastColors = data.colors;
@@ -591,7 +625,7 @@ export class InstancedLines {
         a_width: this.widthBuf,
         a_color: this.color,
         a_bend: this.bend,
-        ...this.hl.recreate(data),
+        ...this.hl.recreate(data, this._capacity),
       });
       if (this.pickModel) {
         this.pickModel.setAttributes({
@@ -648,6 +682,10 @@ export class InstancedArrows {
   count: number;
   /** Current buffer capacity (in instances). Used by update() to decide grow vs. sub-update. */
   private _capacity: number;
+  /** Instances the buffers have room for (≥ `count`): kept on a shrink, at least doubled on a grow. */
+  get capacity(): number {
+    return this._capacity;
+  }
   /** Whether the vertex template was built for the "half" arrowhead shape. If this changes, caller must recreate. */
   private _half: boolean;
   /** Last-uploaded style-derived array refs (#179) — a sub-update skips a buffer whose ref is unchanged. */
@@ -767,13 +805,13 @@ export class InstancedArrows {
       this.radius.destroy();
       this.color.destroy();
       this.bend.destroy();
-      this._capacity = data.count;
-      this.source = device.createBuffer({ data: data.sources });
-      this.target = device.createBuffer({ data: data.targets });
-      this.size = device.createBuffer({ data: data.sizes });
-      this.radius = device.createBuffer({ data: data.radii });
-      this.color = device.createBuffer({ data: data.colors });
-      this.bend = device.createBuffer({ data: data.bends ?? new Float32Array(data.count) });
+      this._capacity = grownCapacity(data.count, this._capacity);
+      this.source = grownBuffer(device, data.sources, data.count, this._capacity);
+      this.target = grownBuffer(device, data.targets, data.count, this._capacity);
+      this.size = grownBuffer(device, data.sizes, data.count, this._capacity);
+      this.radius = grownBuffer(device, data.radii, data.count, this._capacity);
+      this.color = grownBuffer(device, data.colors, data.count, this._capacity);
+      this.bend = grownBuffer(device, data.bends ?? new Float32Array(data.count), data.count, this._capacity);
       // Fresh buffers were created from these arrays — record the refs so a later sub-update skips them.
       this._lastSizes = data.sizes;
       this._lastRadii = data.radii;
@@ -786,7 +824,7 @@ export class InstancedArrows {
         a_radius: this.radius,
         a_color: this.color,
         a_bend: this.bend,
-        ...this.hl.recreate(data),
+        ...this.hl.recreate(data, this._capacity),
       });
       if (this.pickModel) {
         this.pickModel.setAttributes({
@@ -867,6 +905,10 @@ export class InstancedHalfArrows {
   count: number;
   /** Current buffer capacity (in instances). Used by update() to decide grow vs. sub-update. */
   private _capacity: number;
+  /** Instances the buffers have room for (≥ `count`): kept on a shrink, at least doubled on a grow. */
+  get capacity(): number {
+    return this._capacity;
+  }
   /** Vertex samples (M) baked into the kind template buffer — if data.samples changes, caller must recreate. */
   private _samples: number;
   /** Last-uploaded style-derived array refs (#179) — a sub-update skips a buffer whose ref is unchanged. */
@@ -990,13 +1032,13 @@ export class InstancedHalfArrows {
       this.widths.destroy();
       this.bend.destroy();
       this.color.destroy();
-      this._capacity = data.count;
-      this.source = device.createBuffer({ data: data.sources });
-      this.target = device.createBuffer({ data: data.targets });
-      this.radii = device.createBuffer({ data: data.radii });
-      this.widths = device.createBuffer({ data: data.widths });
-      this.bend = device.createBuffer({ data: data.bends });
-      this.color = device.createBuffer({ data: data.colors });
+      this._capacity = grownCapacity(data.count, this._capacity);
+      this.source = grownBuffer(device, data.sources, data.count, this._capacity);
+      this.target = grownBuffer(device, data.targets, data.count, this._capacity);
+      this.radii = grownBuffer(device, data.radii, data.count, this._capacity);
+      this.widths = grownBuffer(device, data.widths, data.count, this._capacity);
+      this.bend = grownBuffer(device, data.bends, data.count, this._capacity);
+      this.color = grownBuffer(device, data.colors, data.count, this._capacity);
       // Fresh buffers were created from these arrays — record the refs so a later sub-update skips them.
       this._lastRadii = data.radii;
       this._lastWidths = data.widths;
@@ -1009,7 +1051,7 @@ export class InstancedHalfArrows {
         a_widths: this.widths,
         a_bend: this.bend,
         a_color: this.color,
-        ...this.hl.recreate(data),
+        ...this.hl.recreate(data, this._capacity),
       });
       if (this.pickModel) {
         this.pickModel.setAttributes({
