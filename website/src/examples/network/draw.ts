@@ -33,7 +33,10 @@ function degreeRadius(graph: NetworkGraph): NodeRadiusSpec {
  * super-edges thicken + darken with their accumulated weight); **Sizing** switches world vs **screen**
  * (constant-pixel) glyphs. The
  * **LOD** toggle enables the adaptive hierarchy cut — dense communities collapse to aggregate glyphs
- * and expand into their members as you zoom in — with **Declutter** (thin overlaps). Pair LOD with
+ * and expand into their members as you zoom in — with **Declutter** (thin overlaps). **Source** picks
+ * the tree the cut draws: **Structure** coarsens the graph by its links, **Spatial** groups nodes by
+ * where the layout put them (a quadtree the worker rebuilds as the layout streams), which keeps the
+ * number of glyphs bounded by the screen however the layout spreads the communities. Pair LOD with
  * screen sizing. **Edges** "Off" renders the network as **nodes only** via `style({ linkStyle: "none" })`
  * — with LOD on or off — and the link, arrowhead and super-edge geometry is then never built or
  * uploaded (not merely hidden), so switching it off on a million-edge graph *saves* work rather than
@@ -122,20 +125,14 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
       const multilevel = options.seeding !== "Cold";
       const layoutBackend = options.backend === "GPU" ? "gpu" : "worker";
       const key = `${count}|${directed}|${multilevel}|${layoutBackend}`;
-      if (key !== layoutKey) {
+      const relayout = key !== layoutKey;
+      if (relayout) {
         layoutKey = key;
-        // Scale per-tick work down as the graph grows so the off-thread solve stays responsive; the
-        // worker keeps the main thread free regardless, streaming frames as it converges.
-        const iterations = Math.min(250, Math.max(10, Math.round(2.5e6 / count)));
         // LFR benchmark with clear community structure (low mixing) for the layout + LOD to resolve.
         // Weighted so links vary and LOD super-edges thicken/darken with their accumulated weight.
         const { nodeCount, source, target, weight } = generateLFR(count, { mu: 0.1, seed: 1, weighted: true });
         graph = buildGraph({ nodeCount, source, target, weight, directed });
-        // fit: true (#238) keeps the camera framed on the streaming layout as it converges, released on
-        // settle/interaction — so it opens framed rather than piling at the origin on the GPU backend.
-        net.data(graph).layout({ backend: layoutBackend, iterations, multilevel, fit: true });
-        updateSab(); // immediate snapshot (gpu transport resolves async; whenSettled() refreshes it)
-        void net.whenSettled().then(updateSab); // refresh once the resolved transport is known
+        net.data(graph);
       }
       if (!graph) return;
 
@@ -177,7 +174,10 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
         .lod(
           options.lod === "On"
             ? {
-                expandPx: 48,
+                // Structure: coarsen by links. Spatial: group by position — the worker rebuilds the tree
+                // on every streamed frame, so the glyph count stays bounded by the screen (#343).
+                source: options.source === "Spatial" ? "spatial" : "structure",
+                expandPx: options.source === "Spatial" ? undefined : 48, // spatial: its tree-adaptive default
                 aggregateFill: "#7f97c8",
                 maxAggregateRadius: 26,
                 declutter: options.declutter !== "Off",
@@ -190,6 +190,17 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
               }
             : false,
         );
+
+      if (relayout) {
+        // Scale per-tick work down as the graph grows so the off-thread solve stays responsive; the
+        // worker keeps the main thread free regardless, streaming frames as it converges.
+        const iterations = Math.min(250, Math.max(10, Math.round(2.5e6 / count)));
+        // fit: true (#238) keeps the camera framed on the streaming layout as it converges, released on
+        // settle/interaction — so it opens framed rather than piling at the origin on the GPU backend.
+        net.layout({ backend: layoutBackend, iterations, multilevel, fit: true });
+        updateSab(); // immediate snapshot (gpu transport resolves async; whenSettled() refreshes it)
+        void net.whenSettled().then(updateSab); // refresh once the resolved transport is known
+      }
     },
   };
 };

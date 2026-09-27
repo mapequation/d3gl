@@ -24,6 +24,7 @@ export default function Network() {
         { type: "segmented", key: "edge", label: "Edge size", options: ["Uniform", "Weight"], value: "Weight" },
         { type: "segmented", key: "coords", label: "Sizing", options: ["World", "Screen"], value: "Screen" },
         { type: "segmented", key: "lod", label: "LOD", options: ["Off", "On"], value: "On" },
+        { type: "segmented", key: "source", label: "Source", options: ["Structure", "Spatial"] },
         { type: "segmented", key: "declutter", label: "Declutter", options: ["On", "Off"] },
         { type: "segmented", key: "edges", label: "Edges", options: ["On", "Off"] },
         { type: "segmented", key: "crossLevel", label: "Cross-level edges", options: ["Off", "On"], value: "On" },
