@@ -42,8 +42,9 @@
 //   when one item per frame still misses the gate — `k` is 1 and the late frame held one item — *and that
 //   item was a band cut at the current growth that twice the growth would cut finer*. It halves — with `k`
 //   halved alongside — once 30 frames that held two consecutive bands of a pass, together at least one band
-//   of half the growth, have each finished within their frame: at half the growth those two bands are one
-//   band of the same work, and it fit a frame. Evidence counts only for the growth it is about: a pass keeps
+//   of half the growth, have each finished before the gate had to wait on them (their fence seen before
+//   frame f+n, where a miss would be decided): at half the growth those two bands are one band of the same
+//   work, and it kept up as well. Evidence counts only for the growth it is about: a pass keeps
 //   the bands it started with, so a band of a pass cut at another growth (one that outlived a change), or a
 //   frame queued before a change, says nothing about the current one. (Growing on such a band once took the
 //   flat 1M force pass at 120 Hz to growth 8, whose 64 bands, MAX_BANDS, are growth 4's too: no frame could
@@ -51,15 +52,15 @@
 //   GPU.) The 30 frames are counted since the last miss that acted and need not be consecutive: a frame
 //   without such a pair, or one whose fence is seen late, neither counts nor resets them, and a miss that
 //   only blocks (a band that cannot be cut finer, an engine repaint) says nothing about a band twice the
-//   size. "Within its frame" is seen by the next frame's poll; the browser's sync status can trail the GPU
-//   (on an M1 Max at 120 Hz, 30-35% of full frames' fences were seen a frame late), so fewer frames count
-//   and the growth returns more slowly — and on a transport that sees every full frame's fence late, never.
-//   Once-per-frame polls cannot tell that from two bands that took more than a frame (#382 D10). (The
-//   spec's first draft halved only when a whole tick fit in one frame; that can never happen again once B
-//   is large, so one transient stall — a first-use shader compile — ratcheted B up for good: measured 64
-//   bands and 0.4 ticks/s. #382's first version counted any frame of two items, which in a nested tick —
-//   tens of small passes beside one large band — nearly every frame is, so the growth fell back and missed
-//   again.)
+//   size. Grow on a frame the gate blocked on, shrink on frames it never had to wait on: the frame between
+//   (seen exactly at f+n) is a dead band, so the growth does not chatter at the gate's edge. At 60 Hz that
+//   is "seen by the next frame"; at 120 Hz it tolerates the browser's sync status trailing the GPU by up to
+//   two frames (on an M1 Max 35-45% of full frames' fences were first seen a frame late; requiring the next
+//   frame, a transport that sees every one late never halved). (The spec's first draft halved only when a
+//   whole tick fit in one frame; that can never happen again once B is large, so one transient stall — a
+//   first-use shader compile — ratcheted B up for good: measured 64 bands and 0.4 ticks/s. #382's first
+//   version counted any frame of two items, which in a nested tick — tens of small passes beside one large
+//   band — nearly every frame is, so the growth fell back and missed again.)
 // - **Main-thread cap.** Items are also admitted only while the measured encode time of the frame stays
 //   within `encodeCapMs` (2 ms) — the binding limit at small N, where the GPU work is tiny.
 //
@@ -95,7 +96,7 @@ export const DEFAULT_BUDGET_MS = 10;
 export const BUDGET_SHARE = 0.6;
 /** Main-thread encode time per frame, ms. */
 export const ENCODE_CAP_MS = 2;
-/** Frames `k` is held after a miss, and frames of two bands each that must fit in time before the band growth halves. */
+/** Frames `k` is held after a miss, and frames of two bands each that must keep up before the band growth halves. */
 export const HOLD_FRAMES = 30;
 /** Frames of layout work that may be in flight on the GPU, at 60 Hz. */
 export const MAX_FRAMES_IN_FLIGHT = 2;
@@ -210,7 +211,7 @@ export class FrameBudget<F> {
   private readonly queueFiner: number[] = [];
   /**
    * The band growth at which each queued frame held two consecutive bands of a pass that half the growth
-   * would cut coarser; 0 when it held none. Such a frame finished in time is evidence for halving.
+   * would cut coarser; 0 when it held none. Such a frame that kept up (seen before the gate waited on it) is evidence for halving.
    */
   private readonly queuePair: number[] = [];
   /** Whether each queued frame also carried the engine's repaint (so a miss on it is not the layout's). */
@@ -238,7 +239,7 @@ export class FrameBudget<F> {
   private hold = 0;
   /** The band growth `g` (1, 2, 4 or 8): the factor every pass's cost estimate is sliced by. */
   private bandGrowth = 1;
-  /** Frames that held two consecutive bands of a pass the growth cut finer and finished in time, since the last miss that acted or growth change. */
+  /** Frames that held two consecutive bands of a pass the growth cut finer and kept up, since the last miss that acted or growth change. */
   private fitStreak = 0;
   private blockedPrev = false;
   private encodeAvgMs = 0;
@@ -310,9 +311,9 @@ export class FrameBudget<F> {
   /**
    * Start frame `now` (the rAF timestamp): record the interval and drop every fence that has signalled,
    * oldest first. `"lost"` when a poll failed — the context is gone and the run must stop without GL.
-   * A frame that held two consecutive bands of a pass the growth cut finer, and whose fence has signalled
-   * by this — the next — frame, finished within its frame: after {@link HOLD_FRAMES} of them since the last
-   * miss that acted, the growth halves, and `k` with it.
+   * A frame that held two consecutive bands of a pass the growth cut finer, and whose fence is seen before
+   * frame f+n (n from {@link framesInFlight}: before the gate had to wait on it), kept up: after
+   * {@link HOLD_FRAMES} of them since the last miss that acted, the growth halves, and `k` with it.
    */
   beginFrame(now: number): "ok" | "lost" {
     if (!Number.isNaN(this.lastNow)) {
@@ -339,7 +340,7 @@ export class FrameBudget<F> {
       this.fences.drop(fence);
       this.done = frame;
       if (this.queueRepaint[0] === true) this.repaintDone = frame;
-      if (this.queuePair[0] === this.bandGrowth && this.frameIndex - frame <= 1) this.pairFit();
+      if (this.queuePair[0] === this.bandGrowth && this.frameIndex - frame < this.maxInFlight) this.pairFit();
       this.queue.shift();
       this.queueFrames.shift();
       this.queueFiner.shift();
@@ -460,9 +461,9 @@ export class FrameBudget<F> {
   }
 
   /**
-   * A frame that held two consecutive bands of a pass the growth cut finer finished within its frame: at
-   * half the growth they are one band of the same work (one fixed cost fewer), which would have fit too.
-   * After {@link HOLD_FRAMES} of them with no miss, halve the growth (down to 1) and `k` with it.
+   * A frame that held two consecutive bands of a pass the growth cut finer kept up: at half the growth they
+   * are one band of the same work (one fixed cost fewer), which would have kept up too. After
+   * {@link HOLD_FRAMES} of them since the last miss that acted, halve the growth (down to 1) and `k` with it.
    */
   private pairFit(): void {
     if (++this.fitStreak < HOLD_FRAMES) return;

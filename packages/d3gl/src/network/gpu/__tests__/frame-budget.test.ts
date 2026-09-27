@@ -602,8 +602,9 @@ describe("FrameBudget band growth: how far every pass's estimate is scaled when 
       r.fences.catchUp();
     }
     expect(r.budget.growth).toBe(2);
-    // Frames whose consecutive bands of the pass finish a frame late (every fence signals two frames after
-    // its frame: never a miss, since two frames may be in flight) do not count.
+    // Frames whose consecutive bands of the pass finish a frame late do not count: every fence is seen two
+    // frames after its frame, at the poll where the gate (two frames at 60 Hz) decides on it — never a miss,
+    // but the gate had to wait on it.
     for (let f = 0; f < 200; f++) {
       frame(r);
       r.fences.signaledThrough = r.fences.inserted - 1;
@@ -631,6 +632,34 @@ describe("FrameBudget band growth: how far every pass's estimate is scaled when 
     }
     expect(r.budget.growth).toBe(1);
     expect(frames).toBeGreaterThanOrEqual(30);
+  });
+
+  it("at 120 Hz counts pairs seen up to three frames late, which the gate (four frames) never waited on", () => {
+    // Up to four frames may be in flight at 120 Hz: a frame whose fence is seen by the third frame after it
+    // was never the frame a gate decision depended on; one seen at the fourth is where the gate decides.
+    const r = rig();
+    const hz120 = { intervalMs: 1000 / 120 };
+    for (let f = 0; f < 3; f++) {
+      frame(r, hz120);
+      r.fences.catchUp();
+    }
+    for (let miss = 0; miss < 8 && r.budget.growth < 2; miss++) {
+      for (let f = 0; f < 5; f++) frame(r, hz120);
+      r.fences.catchUp();
+    }
+    expect(r.budget.growth).toBe(2);
+    for (let f = 0; f < 200; f++) {
+      frame(r, hz120);
+      r.fences.signaledThrough = r.fences.inserted - 3; // seen at the poll four frames later
+    }
+    expect(r.budget.growth).toBe(2);
+    let frames = 0;
+    while (r.budget.growth === 2 && frames < 200) {
+      frame(r, hz120);
+      r.fences.signaledThrough = r.fences.inserted - 2; // seen three frames later
+      frames++;
+    }
+    expect(r.budget.growth).toBe(1);
   });
 
   it("recovers from a transient stall: the growth returns to 1", () => {
@@ -804,8 +833,9 @@ describe("FrameBudget band growth on a stream of passes of very different sizes,
   it("does not oscillate: frames of small passes are no evidence that a band twice the size fits", () => {
     // A 6 ms pass (0.1 ms per band) running at 8× its estimate: 3 bands of 16.8 ms real at growth 1, so one
     // band per frame falls behind the gate; 5 bands of 10.4 ms at growth 2, which keep up. Frames of the
-    // 0.5 ms passes fit, but two bands of the large pass never finish within a frame, so the growth must stay
-    // where one band does. (Counting every frame of two or more items as evidence changes it 7 times here.)
+    // 0.5 ms passes fit, but two bands of the large pass never keep up (the gate waits on them), so the growth
+    // must stay where one band does. (Counting every frame of two or more items as evidence changes it 7
+    // times here.)
     const run = lagging({ costMs: 6, fixedMs: 0.1, factor: 8 }, 6_000);
     expect(run.maxGrowth).toBeGreaterThan(1);
     expect(run.changes, `the growth changed ${run.changes} times`).toBeLessThanOrEqual(2);
@@ -818,13 +848,13 @@ describe("FrameBudget band growth on a stream of passes of very different sizes,
     expect(run.maxGrowth).toBe(1);
   });
 
-  it("returns to growth 1 after transient stalls on a GPU at its estimates whose fences are often seen a frame late", () => {
+  it("returns to growth 1 after transient stalls on a GPU at its estimates whose fences are seen a frame late", () => {
     // The flat force pass at 325k (13 ms) at 120 Hz, the GPU at its estimates, eight 45 ms stalls from other
-    // GPU work. Every other fence is seen 4 ms after it signalled, so a full frame (5 ms of work) is seen a
-    // frame late: on the real GPU (M1 Max, ANGLE Metal, 120 Hz) 30-35% of full frames' fences and about
-    // half of the pair frames' were. The frames seen on time still bring the growth back.
+    // GPU work. Every fence is seen 4 ms after it signalled, so every full frame (5 ms of work) is seen a
+    // frame late (on the real GPU — M1 Max, ANGLE Metal, 120 Hz — 35-45% of full frames' fences were).
+    // Counting only pairs seen by the next frame, the growth stayed at 8.
     const stalls = new Set(Array.from({ length: 8 }, (_, i) => 20 + 20 * i));
-    const run = lagging({ costMs: 13, fixedMs: 0, factor: 1 }, 1_200, { stalls, stallMs: 45, latencyMs: (fence) => (fence % 2 === 0 ? 4 : 0) });
+    const run = lagging({ costMs: 13, fixedMs: 0, factor: 1 }, 1_200, { stalls, stallMs: 45, latencyMs: () => 4 });
     expect(run.maxGrowth).toBeGreaterThan(1);
     expect(run.growth).toBe(1);
   });
