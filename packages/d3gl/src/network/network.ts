@@ -1438,7 +1438,7 @@ export class Network extends BaseEngine {
         this.lodStreaming = useLod; // the worker will stream the tree; main builds none meanwhile
         // The spatial tree (#343) is rebuilt by the worker per frame, style aggregated there too.
         const lodSource = useLod ? this.lodKind() : null;
-        const spatialStyle = lodSource === "spatial" ? this.lodLeafStyle() : null;
+        const spatialStyle = lodSource === "spatial" ? this.lodLeafStyle(this.graph) : null;
         this.lodWorkerSource = lodSource === "spatial" ? "spatial" : useLod ? "structure" : null;
         if (spatialStyle) this.lodStylePosted = spatialStyle.version;
         const handle: WorkerLayoutHandle = startWorkerLayout(
@@ -1598,8 +1598,8 @@ export class Network extends BaseEngine {
    * colours — and its version, bumped whenever the resolved style changes. A worker-built spatial tree
    * carries the version it was aggregated with, so a stale one is re-aggregated here.
    */
-  private lodLeafStyle(): { style: LeafStyle; version: number } {
-    const r = this.resolvedStyleCached(this.graph!);
+  private lodLeafStyle(graph: NetworkGraph): { style: LeafStyle; version: number } {
+    const r = this.resolvedStyleCached(graph);
     if (this.lodStyleVersionOf !== r) {
       this.lodStyleVersionOf = r;
       this.lodStyleVersion++;
@@ -3026,7 +3026,7 @@ export class Network extends BaseEngine {
       if (kind === "spatial") {
         // The worker aggregated the style of the version it had; re-aggregate here only for a newer one,
         // and send the worker the new style for the frames still to come.
-        const { style, version } = this.lodLeafStyle();
+        const { style, version } = this.lodLeafStyle(this.graph);
         if (this.lodStylePosted !== version && this.layoutHandle?.setLODStyle) {
           this.layoutHandle.setLODStyle(style, version);
           this.lodStylePosted = version;
