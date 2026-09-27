@@ -41,11 +41,11 @@ import { nestedLayout, nestedBoundaryDiscs } from "./nested-layout.js";
 import { nestedSolverBuffers, nestedSolverTopology } from "./gpu/nested-topology.js";
 import { multilevelSeedSteps, buildHierarchy, type SeedProgress } from "./coarsen.js";
 import { flattenHierarchyToTopology, lodTreeFromTopology } from "./lod.js";
-import { lodFrameStep, makeSpatialLODStream, makeStructureLODStream, recycleSpatialFrame, type LODStream } from "./lod-frame.js";
+import { lodFrameStep, makeSpatialLODStream, makeStructureLODStream, recycleSpatialFrame, setStreamStyle, type LODStream } from "./lod-frame.js";
 import { answerCoarsen, answerLODGeometry } from "./lod-refit.js";
 import { buildModuleTopology } from "./module-topology.js";
 import {
-  lodGeometryViews,
+  makeLODGeometry,
   lodGeometryByteLength,
   topologyBuffers,
   type CoarsenMessage,
@@ -299,8 +299,9 @@ async function runLayout(msg: StartMessage): Promise<void> {
       buffer = new ArrayBuffer(byteLength);
       geomBuffer = buffer;
     }
-    const tree = lodTreeFromTopology(topology, lodGeometryViews(buffer, topology.size));
-    lodStream = makeStructureLODStream(tree);
+    // The crowding (#426) is computed per frame from the leaf style, into the same buffer.
+    const tree = lodTreeFromTopology(topology, makeLODGeometry(buffer, topology.size));
+    lodStream = makeStructureLODStream(tree, lodStyle);
     // The main thread adopts the tree the moment it lands. A cold start's seed frame follows at once, but a
     // warm start's first frame only follows its first tick (#311), so its geometry goes with the tree: in
     // the SAB (shared mode) or in the message (copy mode, cloned at post time).
@@ -445,10 +446,7 @@ addEventListener("message", (e: MessageEvent<MainToWorker>) => {
       // The layout's own stream (its seed's while it seeds, #368), or the GPU layout's relayed one (#343): a
       // worker runs one or the other.
       const stream = state?.lod ?? seedLOD ?? relayLOD;
-      if (stream?.kind === "spatial") {
-        stream.style = msg.style;
-        stream.styleVersion = msg.version;
-      }
+      if (stream) setStreamStyle(stream, msg.style, msg.version);
       return;
     }
     case "lod-view": {

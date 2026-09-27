@@ -117,6 +117,7 @@ describe("network shift+drag marquee (#159)", () => {
     ];
     net
       .data(g)
+      .style({ nodeRadius: 8 }) // each module's two members (15 apart) overlap, so it stays collapsed (#426)
       .lod({ modules, expandPx: 20 })
       .layout({ backend: "positions", positions: new Float32Array([70, 90, 85, 90, 115, 110, 130, 110]) });
     net.setTransform({ k: 1, x: 0, y: 0 }); // collapse to two aggregates on the frontier

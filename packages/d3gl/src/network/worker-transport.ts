@@ -22,6 +22,7 @@ import {
   lodGeometryViews,
   lodGeometryByteLength,
   transferList,
+  makeLODGeometry,
   type MainToWorker,
   type NestedPrepReply,
   type WorkerToMain,
@@ -53,7 +54,8 @@ export interface WorkerLayoutOptions {
    * with each frame (its style already aggregated from {@link lodStyle}).
    */
   lodSource?: "structure" | "spatial";
-  /** The leaf style a spatial stream aggregates per rebuild (#343), and its version (echoed per tree). */
+  /** The leaf style a spatial stream aggregates per rebuild (#343), and its version (echoed per tree); either
+   *  stream computes its tree's crowding from it per frame (#426). */
   lodStyle?: LeafStyle;
   lodStyleVersion?: number;
   /** The view whose kept glyphs' super-edge rows a spatial stream builds with each tree (#433). */
@@ -112,8 +114,8 @@ export interface WorkerLayoutHandle {
   pin(ids: Uint32Array, positions?: Float32Array): void;
   /** Release every pin and let the layout re-cool, then idle (#140). No-op on the fallback. */
   unpin(): void;
-  /** Send a spatial LOD stream a new leaf style (#343, after `style()`); later frames aggregate it. Absent
-   *  when the run streams no spatial tree. */
+  /** Send the LOD stream a new leaf style (#343, #426, after `style()` or `lod()`); later frames aggregate it
+   *  and compute the crowding with it. Absent when the run streams no LOD tree. */
   setLODStyle?(style: LeafStyle, version: number): void;
   /** Send a spatial LOD stream the main thread's new view (#433); later trees carry the super-edge rows of its
    *  covers. Absent when the run streams no spatial tree. */
@@ -371,8 +373,8 @@ export function startWorkerLayout(
     settle();
   };
 
-  // Copy-mode only: the full `[cx, cy, extent]` buffer backing the LOD tree, refilled each frame from
-  // the message. In shared mode the tree is bound straight to the worker's geometry SAB (no copy).
+  // Copy-mode only: the full `[cx, cy, extent, clearZoom]` buffer backing the LOD tree, refilled each frame
+  // from the message. In shared mode the tree is bound straight to the worker's geometry SAB (no copy).
   let lodGeomFlat: Float32Array | null = null;
 
   worker.onmessage = (e: MessageEvent<WorkerToMain>): void => {
@@ -382,6 +384,7 @@ export function startWorkerLayout(
       const buffer: ArrayBufferLike = sharedGeometry ?? new ArrayBuffer(lodGeometryByteLength(topology.size));
       if (!sharedGeometry) {
         lodGeomFlat = new Float32Array(buffer);
+        makeLODGeometry(buffer, topology.size); // no crowding yet (#426): Infinity, never a zeroed 0
         if (msg.geometry) lodGeomFlat.set(msg.geometry); // a warm start's geometry, before the tree is drawn (#311)
       }
       onLODTree?.(lodTreeFromTopology(topology, lodGeometryViews(buffer, topology.size)));
@@ -464,7 +467,7 @@ export function startWorkerLayout(
       const unpin: MainToWorker = { type: "unpin" };
       worker.postMessage(unpin);
     },
-    setLODStyle: opts.lod && opts.lodSource === "spatial"
+    setLODStyle: opts.lod
       ? (style: LeafStyle, version: number) => {
           if (terminated) return;
           const msg: MainToWorker = { type: "lod-style", style, version };

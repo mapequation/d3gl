@@ -74,6 +74,8 @@ const clustered = (): NetworkGraph => buildGraph({ nodeCount: 4, source: [0, 2, 
 const CLUSTER_MODULES = [
   { id: 0, path: [1, 1] }, { id: 1, path: [1, 2] }, { id: 2, path: [2, 1] }, { id: 3, path: [2, 2] },
 ];
+// Each module's two members are 15 apart: with 8-unit glyphs they overlap, so the cut draws the two
+// modules (#426 opens an aggregate whose members do not overlap).
 const CLUSTER_POS = new Float32Array([70, 90, 85, 90, 115, 110, 130, 110]);
 
 describe('network style({ linkStyle: "none" }) (#157)', () => {
@@ -99,20 +101,20 @@ describe('network style({ linkStyle: "none" }) (#157)', () => {
     await withNet("webgl", (net) => {
       net
         .data(clustered())
-        .style({ nodeRadius: 5, directed: true })
+        .style({ nodeRadius: 8, directed: true })
         .lod({ modules: CLUSTER_MODULES, expandPx: 20 })
         .layout({ backend: "positions", positions: CLUSTER_POS });
       net.setTransform({ k: 1, x: 0, y: 0 });
       expect(count(net.toSVG(), "path")).toBeGreaterThan(0); // baseline: a super-edge is drawn
 
-      net.style({ nodeRadius: 5, directed: true, linkStyle: "none" });
+      net.style({ nodeRadius: 8, directed: true, linkStyle: "none" });
       const svg = net.toSVG();
       expect(count(svg, "circle")).toBe(2); // the two aggregate glyphs still draw
       expect(count(svg, "path")).toBe(0); // no super-edges, no arrowheads
 
       // Back on: the lane's emitted-layer SET changed, so base-engine re-adds the slots in canonical
       // order — the super-edges must come back (nothing was lost by skipping them).
-      net.style({ nodeRadius: 5, directed: true, linkStyle: "line" });
+      net.style({ nodeRadius: 8, directed: true, linkStyle: "line" });
       expect(count(net.toSVG(), "path")).toBeGreaterThan(0);
     });
   });
@@ -121,7 +123,7 @@ describe('network style({ linkStyle: "none" }) (#157)', () => {
     await withNet("svg", (net) => {
       net
         .data(clustered())
-        .style({ nodeRadius: 5, directed: true, linkStyle: "none" })
+        .style({ nodeRadius: 8, directed: true, linkStyle: "none" })
         .lod({ modules: CLUSTER_MODULES, expandPx: 20 })
         .layout({ backend: "positions", positions: CLUSTER_POS });
       net.setTransform({ k: 1, x: 0, y: 0 });

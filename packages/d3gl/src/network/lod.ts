@@ -248,6 +248,17 @@ export interface LODTree extends LODTopology {
    */
   color: Uint8Array;
   /**
+   * **Clear zoom** (#426), per node: the zoom from which no two of the node's members' glyphs overlap on
+   * screen — each drawn at its own radius (`sizeMode` units: constant px, or world units × k) and never
+   * smaller than half a pixel. The cut opens an aggregate once the view is zoomed past it, whatever its
+   * footprint, so an aggregate is drawn only where its members would overlap. Exact up to the zoom at which
+   * the aggregate's footprint reaches the expand threshold — past that the footprint rule opens it anyway,
+   * so the pass stores `Infinity` there (see {@link computeLODCrowding}). `Infinity` too for members that
+   * never part (coincident, or world discs that overlap) and until a crowding pass has run: then only the
+   * footprint rule opens the node. Leaves hold `0`.
+   */
+  clearZoom: Float32Array;
+  /**
    * **Leaf-level branching** (#191): how many children the aggregate that owns a *typical leaf* has —
    * the median child count of the leaf-parents, weighted by how many leaves each owns. `2` for a
    * binary coarsening tree, `1` for a quadtree bottom cell, `30`–`600` for a provided module
@@ -648,6 +659,8 @@ function attachGeometry(topo: LODTopology): LODTree {
     weight: new Float32Array(size),
     border: new Float32Array(size),
     color: new Uint8Array(size * 4),
+    // Unknown until computeLODCrowding runs: the footprint rule alone opens a node meanwhile.
+    clearZoom: new Float32Array(size).fill(Infinity),
   };
 }
 
@@ -690,6 +703,8 @@ const SPATIAL_BUCKET = 8;
  */
 export let mortonTopologyBuilds = 0;
 export let lodStylePasses = 0;
+/** Crowding passes run ({@link computeLODCrowding}, #426) in this realm — test instrumentation, like the two above. */
+export let lodCrowdingPasses = 0;
 /** Bits per axis of a Morton code; a cell is at most this many levels below the root box. */
 const MORTON_BITS = 16;
 /** Quantisation steps per axis (`2^16`). */
@@ -1197,11 +1212,13 @@ export function findMortonCell(tree: LODTopology, box: MortonBox, level: number,
  * position-independent — the worker streams cx/cy/extent but not count, #105).
  *
  * A spatial tree streamed per frame (#343) arrives with everything computed: pass its `count`, style arrays
- * and leaf branching as `computed`, and the assembly is O(1) — views only, no pass over the tree.
+ * and leaf branching as `computed`, and the assembly is O(1) — views only, no pass over the tree. The
+ * {@link LODTree.clearZoom} a worker computes with the geometry (#426) comes with `geometry`; without it the
+ * tree starts with none (`Infinity`: the footprint rule alone opens a node until {@link computeLODCrowding}).
  */
 export function lodTreeFromTopology(
   topo: LODTopology,
-  geometry?: { cx: Float32Array; cy: Float32Array; extent: Float32Array },
+  geometry?: { cx: Float32Array; cy: Float32Array; extent: Float32Array; clearZoom?: Float32Array },
   computed?: { count: Uint32Array; radius: Float32Array; weight: Float32Array; border: Float32Array; color: Uint8Array; leafBranching?: number },
 ): LODTree {
   const { size } = topo;
@@ -1216,6 +1233,7 @@ export function lodTreeFromTopology(
     weight: computed?.weight ?? new Float32Array(size),
     border: computed?.border ?? new Float32Array(size),
     color: computed?.color ?? new Uint8Array(size * 4),
+    clearZoom: geometry?.clearZoom ?? new Float32Array(size).fill(Infinity),
   };
 }
 
@@ -1693,6 +1711,282 @@ export function updateLODPositionsForLeaves(
   }
 }
 
+/** Half a pixel: the least radius a glyph covers on screen (#426). A disc smaller than a pixel still paints
+ *  one, so two glyphs closer than a pixel overlap on screen however small their radii are. */
+const MIN_SCREEN_RADIUS = 0.5;
+
+/**
+ * The zoom from which two glyphs `d` world units apart no longer overlap on screen (#426): the least `k`
+ * with `d·k ≥ ρa + ρb` at it and every larger zoom, a glyph's screen radius being `max(r, ½)` for
+ * screen-sized radii and `max(r·k, ½)` for world radii. `Infinity` when they never part — coincident, or
+ * world discs that overlap (their overlap scales with the zoom). Decreasing in `d` and increasing in both
+ * radii, so a box distance and the largest radius in a subtree bound every pair in it from above.
+ * Screen-sized radii must already be floored at ½; world radii are passed as they are. NaN in, NaN out.
+ */
+function clearZoomOf(d: number, a: number, b: number, screen: boolean): number {
+  if (screen) return (a + b) / d;
+  const hi = a > b ? a : b;
+  const lo = a > b ? b : a;
+  if (d < hi + lo) return Infinity; // world discs that overlap overlap at every zoom
+  // Both below half a pixel until k = ½/hi; the larger one above it (and never the smaller alone) after.
+  return d >= 2 * hi ? (2 * MIN_SCREEN_RADIUS) / d : MIN_SCREEN_RADIUS / (d - hi);
+}
+
+/** The distance from which {@link clearZoomOf}`(d, a, b)` is at most `z` — the inverse of its decreasing
+ *  branch; `Infinity` for `z ≤ 0` (every pair beats it). */
+function clearReachOf(z: number, a: number, b: number, screen: boolean): number {
+  if (!(z > 0)) return Infinity;
+  if (screen) return (a + b) / z;
+  const hi = a > b ? a : b;
+  const lo = a > b ? b : a;
+  const far = (2 * MIN_SCREEN_RADIUS) / z;
+  if (far >= 2 * hi) return far;
+  const near = hi + MIN_SCREEN_RADIUS / z;
+  return near > hi + lo ? near : hi + lo;
+}
+
+/**
+ * Reusable working storage for {@link computeLODCrowding} (#426): each aggregate's members' box and largest
+ * radius, the dual walk's pair stack, and one node's children sorted for the sweep — grown on demand to the
+ * largest tree seen, so a pass run per streamed frame allocates nothing once warm. About 20 B per aggregate
+ * plus 12 B per child of the widest node.
+ */
+export interface LODCrowdingScratch {
+  /** Per aggregate `o = g − leafCount`: its members' box, `[minX, minY, maxX, maxY]` at `4o`. */
+  box: Float32Array;
+  /** Per aggregate: its members' largest effective radius (screen radii floored at ½). */
+  rmax: Float32Array;
+  /** The dual walk's stack of node pairs. */
+  pairA: Uint32Array;
+  pairB: Uint32Array;
+  /** One node's children, sorted by the left edge of their box (`key`) for the sweep. */
+  order: Uint32Array;
+  key: Float64Array;
+}
+
+/** A fresh, empty {@link LODCrowdingScratch}. */
+export function makeLODCrowdingScratch(): LODCrowdingScratch {
+  return { box: new Float32Array(0), rmax: new Float32Array(0), pairA: new Uint32Array(64), pairB: new Uint32Array(64), order: new Uint32Array(16), key: new Float64Array(16) };
+}
+
+/** Options for {@link computeLODCrowding}. */
+export interface CrowdingOptions {
+  /** Glyph radii are screen px (`sizeMode: "screen"`); else world units, drawn × k. */
+  screenSized: boolean;
+  /**
+   * The expand threshold (px) the cut opens a node at by its footprint — the pass's horizon: a node's clear
+   * zoom is only needed below the zoom at which its footprint reaches it, so past that the pass stops and
+   * stores `Infinity`. Use {@link crowdingHorizon}; a cut with a larger `expandPx` than this still never
+   * opens a node whose members overlap, it only opens some later than it could.
+   */
+  expandPx: number;
+}
+
+/** The part of an {@link LODTree} that {@link computeLODCrowding} reads and writes. */
+export type LODCrowdingTree = Pick<
+  LODTree,
+  "size" | "leafCount" | "levelCount" | "levelOffset" | "childOffset" | "children" | "cx" | "cy" | "extent" | "count" | "radius" | "clearZoom"
+>;
+
+/** Sift `key[root]` down the max-heap `key[0, end)`, moving `ids` alongside. */
+function siftDown(key: Float64Array, ids: Uint32Array, root: number, end: number): void {
+  let i = root;
+  for (;;) {
+    let c = 2 * i + 1;
+    if (c >= end) return;
+    if (c + 1 < end && key[c + 1]! > key[c]!) c++;
+    if (!(key[c]! > key[i]!)) return;
+    const tk = key[i]!; key[i] = key[c]!; key[c] = tk;
+    const ti = ids[i]!; ids[i] = ids[c]!; ids[c] = ti;
+    i = c;
+  }
+}
+
+/** Sort `ids[0, n)` ascending by `key[0, n)` (carried along), in place — a heapsort: no allocation, O(n log n). */
+function heapSortByKey(key: Float64Array, ids: Uint32Array, n: number): void {
+  for (let i = (n >> 1) - 1; i >= 0; i--) siftDown(key, ids, i, n);
+  for (let end = n - 1; end > 0; end--) {
+    const tk = key[0]!; key[0] = key[end]!; key[end] = tk;
+    const ti = ids[0]!; ids[0] = ids[end]!; ids[end] = ti;
+    siftDown(key, ids, 0, end);
+  }
+}
+
+/**
+ * The tree's **crowding** (#426): each node's {@link LODTree.clearZoom} — the zoom from which no two of its
+ * members' glyphs overlap on screen — from the leaves' positions (`cx`/`cy`) and radii (`radius`). The cut
+ * opens an aggregate once zoomed past it, so an aggregate is drawn only where its members would overlap.
+ *
+ * Exact per node, over its own members (a node's value is the largest pair zoom among them), computed
+ * bottom-up: a node starts from its children's values — any pair inside one child — and adds the pairs
+ * across its children with a sweep over the children's boxes and a dual walk down both subtrees, pruned
+ * by the box distance and each subtree's largest radius against the value so far. A node whose value
+ * reaches the zoom at which its footprint hits `opts.expandPx` stops there and stores `Infinity`: the
+ * footprint rule opens it first, so its exact value can never matter. That horizon is what keeps the pass
+ * cheap on dense layouts — a crowded node stops at its first children — while every node a view could
+ * open by overlap is exact.
+ *
+ * Run it after the position pass and the style pass, whenever either changes (a style change moves the
+ * radii). O(tree size) for the boxes plus the cross pairs the walk cannot prune — about the members near
+ * the borders between siblings — measured ~10-30 ms at 325k nodes. With `scratch`
+ * ({@link makeLODCrowdingScratch}) a pass allocates nothing once warm.
+ */
+export function computeLODCrowding(tree: LODCrowdingTree, opts: CrowdingOptions, scratch?: LODCrowdingScratch): void {
+  lodCrowdingPasses++;
+  const { size, leafCount, levelCount, levelOffset, childOffset, children, cx, cy, extent, count, radius, clearZoom } = tree;
+  const screen = opts.screenSized;
+  const horizon = opts.expandPx;
+  const sc = scratch ?? makeLODCrowdingScratch();
+  const cells = size - leafCount;
+  if (sc.rmax.length < cells) {
+    sc.box = new Float32Array(4 * cells);
+    sc.rmax = new Float32Array(cells);
+  }
+  const box = sc.box;
+  const rmax = sc.rmax;
+  // A glyph covers at least half a pixel: floor screen radii once here; world radii scale with the zoom.
+  const eff = (i: number): number => {
+    const r = radius[i]!;
+    return screen ? (r > MIN_SCREEN_RADIUS ? r : MIN_SCREEN_RADIUS) : r > 0 ? r : 0;
+  };
+  for (let i = 0; i < leafCount; i++) clearZoom[i] = 0; // a leaf has no two members
+
+  // The largest pair zoom across `a` and `b`'s members above `beta`, stopping at `cap` (a dual walk).
+  const dual = (a: number, b: number, beta: number, cap: number): number => {
+    let pa = sc.pairA;
+    let pb = sc.pairB;
+    let sp = 0;
+    pa[0] = a;
+    pb[0] = b;
+    sp = 1;
+    while (sp > 0 && beta < cap) {
+      sp--;
+      const A = pa[sp]!;
+      const B = pb[sp]!;
+      const aLeaf = A < leafCount;
+      const bLeaf = B < leafCount;
+      const oa = 4 * (A - leafCount);
+      const ob = 4 * (B - leafCount);
+      const ax0 = aLeaf ? cx[A]! : box[oa]!;
+      const ay0 = aLeaf ? cy[A]! : box[oa + 1]!;
+      const ax1 = aLeaf ? ax0 : box[oa + 2]!;
+      const ay1 = aLeaf ? ay0 : box[oa + 3]!;
+      const bx0 = bLeaf ? cx[B]! : box[ob]!;
+      const by0 = bLeaf ? cy[B]! : box[ob + 1]!;
+      const bx1 = bLeaf ? bx0 : box[ob + 2]!;
+      const by1 = bLeaf ? by0 : box[ob + 3]!;
+      const gx = ax0 > bx1 ? ax0 - bx1 : bx0 > ax1 ? bx0 - ax1 : 0;
+      const gy = ay0 > by1 ? ay0 - by1 : by0 > ay1 ? by0 - ay1 : 0;
+      const z = clearZoomOf(Math.sqrt(gx * gx + gy * gy), aLeaf ? eff(A) : rmax[A - leafCount]!, bLeaf ? eff(B) : rmax[B - leafCount]!, screen);
+      if (!(z > beta)) continue; // no pair across them beats beta (NaN: a non-finite position, skipped)
+      if (aLeaf && bLeaf) {
+        beta = z; // two leaves: the box distance is their distance, the bound their exact pair zoom
+        continue;
+      }
+      // Split the side with more members (never a leaf) into its children.
+      const splitA = bLeaf || (!aLeaf && count[A]! >= count[B]!);
+      const s = splitA ? A : B;
+      const need = sp + childOffset[s + 1]! - childOffset[s]!;
+      if (need > pa.length) {
+        const cap2 = Math.max(need, pa.length * 2);
+        const na = new Uint32Array(cap2); na.set(pa); sc.pairA = pa = na;
+        const nb = new Uint32Array(cap2); nb.set(pb); sc.pairB = pb = nb;
+      }
+      for (let p = childOffset[s]!; p < childOffset[s + 1]!; p++) {
+        pa[sp] = splitA ? children[p]! : A;
+        pb[sp] = splitA ? B : children[p]!;
+        sp++;
+      }
+    }
+    return beta;
+  };
+
+  for (let k = 1; k < levelCount; k++) {
+    for (let g = levelOffset[k]!; g < levelOffset[k + 1]!; g++) {
+      const c0 = childOffset[g]!;
+      const c1 = childOffset[g + 1]!;
+      let x0 = Infinity;
+      let y0 = Infinity;
+      let x1 = -Infinity;
+      let y1 = -Infinity;
+      let rm = 0;
+      let beta = 0; // the largest pair zoom inside any one child
+      for (let p = c0; p < c1; p++) {
+        const c = children[p]!;
+        if (c < leafCount) {
+          const x = cx[c]!;
+          const y = cy[c]!;
+          if (x < x0) x0 = x;
+          if (x > x1) x1 = x;
+          if (y < y0) y0 = y;
+          if (y > y1) y1 = y;
+          const r = eff(c);
+          if (r > rm) rm = r;
+        } else {
+          const o = 4 * (c - leafCount);
+          if (box[o]! < x0) x0 = box[o]!;
+          if (box[o + 1]! < y0) y0 = box[o + 1]!;
+          if (box[o + 2]! > x1) x1 = box[o + 2]!;
+          if (box[o + 3]! > y1) y1 = box[o + 3]!;
+          if (rmax[c - leafCount]! > rm) rm = rmax[c - leafCount]!;
+          if (clearZoom[c]! > beta) beta = clearZoom[c]!;
+        }
+      }
+      const og = g - leafCount;
+      box[4 * og] = x0;
+      box[4 * og + 1] = y0;
+      box[4 * og + 2] = x1;
+      box[4 * og + 3] = y1;
+      rmax[og] = rm;
+      // The horizon: the zoom at which the footprint (2·extent·k) reaches expandPx and opens the node anyway.
+      const e = extent[g]!;
+      const cap = e > 0 ? horizon / (2 * e) : Infinity;
+      const n = c1 - c0;
+      if (beta < cap && n > 1) {
+        // Sweep the children by their box's left edge: a pair whose horizontal gap alone is past the reach
+        // at which even the largest radii could beat beta is skipped, and so is every later one.
+        if (sc.order.length < n) {
+          sc.order = new Uint32Array(Math.max(n, sc.order.length * 2));
+          sc.key = new Float64Array(sc.order.length);
+        }
+        const order = sc.order;
+        const key = sc.key;
+        for (let j = 0; j < n; j++) {
+          const c = children[c0 + j]!;
+          order[j] = c;
+          key[j] = c < leafCount ? cx[c]! : box[4 * (c - leafCount)]!;
+        }
+        heapSortByKey(key, order, n);
+        for (let a = 0; a < n && beta < cap; a++) {
+          const A = order[a]!;
+          const aLeaf = A < leafCount;
+          const right = aLeaf ? cx[A]! : box[4 * (A - leafCount) + 2]!;
+          const rA = aLeaf ? eff(A) : rmax[A - leafCount]!;
+          let reach = clearReachOf(beta, rA, rm, screen);
+          for (let b = a + 1; b < n && beta < cap; b++) {
+            if (key[b]! - right >= reach) break;
+            const B = order[b]!;
+            let z: number;
+            if (aLeaf && B < leafCount) {
+              // Two leaves (every pair of a bottom cell): their pair zoom directly, no walk.
+              const dx = cx[A]! - cx[B]!;
+              const dy = cy[A]! - cy[B]!;
+              z = clearZoomOf(Math.sqrt(dx * dx + dy * dy), rA, eff(B), screen);
+            } else {
+              z = dual(A, B, beta, cap);
+            }
+            if (z > beta) {
+              beta = z;
+              reach = clearReachOf(beta, rA, rm, screen);
+            }
+          }
+        }
+      }
+      clearZoom[g] = beta < cap ? beta : Infinity;
+    }
+  }
+}
+
 /** Screen-space transform: `screen = world * k + (x, y)` (matches {@link BaseEngine} `ViewTransform`). */
 export interface LODTransform {
   k: number;
@@ -1703,10 +1997,12 @@ export interface LODTransform {
 export interface CutOptions {
   /**
    * Expand an aggregate into its children once its on-screen footprint (diameter = `2·extent·k`, in
-   * px) reaches this threshold; below it the aggregate draws as a single glyph. Larger → coarser
-   * (fewer, bigger glyphs); smaller → finer. An absolute pixel size — omit it to get the tree-adaptive
-   * default ({@link defaultExpandPx}: 48 px for a binary coarsening tree, more for a coarser-branching
-   * one such as a provided module partition).
+   * px) reaches this threshold; below it the aggregate draws as a single glyph — unless its members'
+   * glyphs would not overlap at this zoom (`k ≥` {@link LODTree.clearZoom}, #426), when it expands
+   * whatever its size. So the threshold only sets how coarse the map is where members *would* overlap.
+   * Larger → coarser (fewer, bigger glyphs); smaller → finer. An absolute pixel size — omit it to get
+   * the tree-adaptive default ({@link defaultExpandPx}: 48 px for a binary coarsening tree, more for a
+   * coarser-branching one such as a provided module partition).
    */
   expandPx?: number;
   /** True when glyphs are screen-pixel sized; converts the per-node draw radius to world for the cull margin. */
@@ -1780,11 +2076,23 @@ const MAX_DEFAULT_EXPAND_FRACTION = 0.5;
  * O(1) — a `√`, a multiply and two clamps, off one number computed at tree build. Safe on a tree that
  * predates the field (`leafBranching` absent ⇒ the flat 48 px default).
  */
-export function defaultExpandPx(tree: LODTree, width: number, height: number): number {
-  const c = tree.leafBranching;
-  const perChild = c > 0 ? DEFAULT_EXPAND_PX * Math.sqrt(c / CALIBRATED_BRANCHING) : DEFAULT_EXPAND_PX;
+export function defaultExpandPx(tree: Pick<LODTree, "leafBranching">, width: number, height: number): number {
   const cap = MAX_DEFAULT_EXPAND_FRACTION * Math.min(width, height);
-  return Math.max(DEFAULT_EXPAND_PX, Math.min(perChild, cap));
+  return Math.max(DEFAULT_EXPAND_PX, Math.min(perChildExpandPx(tree.leafBranching), cap));
+}
+
+/** The adaptive default's per-child size before the viewport cap: `48·√(c/2)` (see {@link defaultExpandPx}). */
+function perChildExpandPx(c: number): number {
+  return c > 0 ? DEFAULT_EXPAND_PX * Math.sqrt(c / CALIBRATED_BRANCHING) : DEFAULT_EXPAND_PX;
+}
+
+/**
+ * The horizon for {@link computeLODCrowding} (#426): the expand threshold the cut uses — `expandPx` when set,
+ * else {@link defaultExpandPx} *without* its viewport cap, so it is never below the threshold of a cut at
+ * any viewport size and a resize needs no new pass. O(1).
+ */
+export function crowdingHorizon(tree: Pick<LODTree, "leafBranching">, expandPx?: number): number {
+  return expandPx ?? Math.max(DEFAULT_EXPAND_PX, perChildExpandPx(tree.leafBranching));
 }
 
 /** Smoothstep (Hermite) ease on [0,1] — the cross-fade ramp (#133), softer than linear at both ends. */
@@ -1822,8 +2130,9 @@ export function makeCutScratch(): CutScratch {
 /**
  * Adaptive hierarchy cut: walk the tree top-down for the given view and return the **frontier** —
  * the set of node ids to draw. A subtree is culled when its bounding box misses the viewport; an
- * aggregate expands when its on-screen footprint is large enough, otherwise it is drawn as one
- * glyph; leaves always draw. Work is proportional to the visible frontier, not to the tree size.
+ * aggregate expands when its members' glyphs would not overlap at this zoom ({@link LODTree.clearZoom},
+ * #426) or its on-screen footprint is large enough, otherwise it is drawn as one glyph; leaves always
+ * draw. Work is proportional to the visible frontier, not to the tree size (O(1) per visited node).
  * With {@link CutOptions.boundaries} it also collects the expanded aggregates whose boundary meets
  * the view (#329), at O(1) per expanded node.
  *
@@ -1848,10 +2157,15 @@ export function cut(
   opts: CutOptions = {},
   scratch?: CutScratch,
 ): Uint32Array {
-  const { leafCount, levelCount, levelOffset, childOffset, children, cx, cy, extent, radius } = tree;
+  const { leafCount, levelCount, levelOffset, childOffset, children, cx, cy, extent, radius, clearZoom } = tree;
   // No explicit threshold ⇒ the tree-adaptive default (#191) — O(1) off `tree.leafBranching`, which
   // was computed once at tree build; nothing here scales with the tree or the frontier.
   const expandPx = opts.expandPx ?? defaultExpandPx(tree, width, height);
+  // Overlap (#426): a node whose members clear each other at this zoom (k ≥ clearZoom) counts as reaching
+  // the threshold — it is lent the footprint `expandPx·k/clearZoom` (≥ expandPx exactly when k ≥
+  // clearZoom), so the expand test and the cross-fade band below take it unchanged. 0 while clearZoom is
+  // Infinity (crowded, or no crowding pass yet), which leaves the footprint rule byte-for-byte as it was.
+  const lend = expandPx * t.k;
   const maxAgg = opts.maxAggregateRadius ?? Infinity;
   // Per-node draw radius in world units, so a glyph stays until its *whole body* leaves the viewport
   // (not just its centre) — no popping at the screen edge when zoomed in.
@@ -1947,7 +2261,9 @@ export function cut(
       emit(g, a); // a real leaf — nothing finer to expand into
       continue;
     }
-    const footprint = 2 * ext * t.k;
+    const own = 2 * ext * t.k;
+    const lent = lend / clearZoom[g]!; // NaN (0/0) only when expandPx is 0: then `own` decides
+    const footprint = lent > own ? lent : own;
     // Decide this node's draw alpha (`drawA`) and/or the alpha to expand its children at (`childA`);
     // -1 = "don't". Inlined (no per-node closure) so the off path stays a plain expand/draw split.
     let drawA = -1;
