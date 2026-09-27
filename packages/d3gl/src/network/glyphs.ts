@@ -1283,6 +1283,44 @@ export function superEdges(
     if (anchorStart !== Infinity) anchorStart -= len - kept; // only same-level pairs (before it) are dropped
     len = kept;
   }
+  return superEdgeBatches(tree, sc, len, paired, style, seen, gen, anchorStart === Infinity ? null : { start: anchorStart, ends, place: anchorEnds, on: anchored });
+}
+
+/**
+ * Module-link anchoring for {@link superEdgeBatches} (#329): edges from `start` on are anchored links, `on(x)`
+ * tells whether end `x` sits on its module's boundary, and `place(a, b)` writes the anchored edge's drawn ends
+ * into `ends` (`[ax, ay, bx, by]`).
+ */
+interface AnchoredEnds {
+  start: number;
+  ends: Float64Array;
+  place: (a: number, b: number) => void;
+  on: (x: number) => boolean;
+}
+
+/**
+ * The instanced batches for the `count` super-edges a gather left in `sc.aS`/`sc.bS`/`sc.wS` (#104 N6) — shared
+ * by the CSR gather ({@link superEdges}) and the leaf-run gather of a spatial tree (#343, `lazySuperEdges`), so
+ * both draw a gathered pair the same way: endpoints at the glyph centres (or an anchored module's boundary),
+ * colour and width from its summed flow, alpha from its least-visible present end under a cross-fade, and
+ * half-arrows' reciprocal widths over the `paired` rows of `sc.pairedRows`. An end `x` is **present** when
+ * `present[x] === gen`. O(count); allocates only the returned arrays.
+ */
+export function superEdgeBatches(
+  tree: LODTree,
+  sc: SuperEdgesScratch,
+  len: number,
+  paired: number,
+  style: SuperEdgeStyleResolved,
+  present: Int32Array,
+  gen: number,
+  anchor: AnchoredEnds | null,
+): SuperEdgesData {
+  const seen = present;
+  const anchorStart = anchor ? anchor.start : Infinity;
+  const ends = anchor ? anchor.ends : EMPTY_ENDS;
+  const anchored = (x: number): boolean => anchor !== null && anchor.on(x);
+  const anchorEnds = (a: number, b: number): void => { if (anchor) anchor.place(a, b); };
   const count = len;
   const aS = sc.aS;
   const bS = sc.bS;
@@ -1413,6 +1451,8 @@ export interface SuperEdgesData {
 
 /** Path-strip samples for a smooth bent link (#104 N6c). */
 const BENT_SAMPLES = 24;
+/** The anchored-ends buffer of a batch with no anchored links (never written). */
+const EMPTY_ENDS = new Float64Array(4);
 
 /**
  * Instanced line data for a graph's links, gathering each edge's endpoints from the node positions
