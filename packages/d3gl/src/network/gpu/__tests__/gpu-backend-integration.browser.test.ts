@@ -98,6 +98,11 @@ function workerStarts(spy: { mock: { calls: [MainToWorker, ...unknown[]][] } }) 
   return spy.mock.calls.map((c) => startOptions(c[0])).filter((o) => o !== null);
 }
 
+/** The `[d3gl] … fell back to the CPU worker` warnings among `warn`'s calls. */
+function fallbackWarnings(warn: { mock: { calls: unknown[][] } }): unknown[][] {
+  return warn.mock.calls.filter((c) => String(c[0]).includes("fell back to the CPU worker"));
+}
+
 describe("network layout backend:'gpu' integration", () => {
   it("GPU path is taken (layoutTransport === 'gpu') on a WebGL engine", async () => {
     const host = makeHost();
@@ -272,7 +277,7 @@ describe("backend:'gpu' on a device without float blending (#351)", () => {
     await net.whenSettled();
 
     // One warning, naming the missing extension.
-    const fallbacks = warn.mock.calls.filter((c) => String(c[0]).includes("fell back to the CPU worker"));
+    const fallbacks = fallbackWarnings(warn);
     expect(fallbacks).toHaveLength(1);
     expect(String(fallbacks[0]?.[0])).toMatch(/EXT_float_blend/);
     // The live transport is the fallback worker's (#297), never "gpu".
@@ -324,11 +329,6 @@ describe("backend:'gpu' on a device without float blending (#351)", () => {
     net.destroy();
   });
 });
-
-/** The `[d3gl] … fell back to the CPU worker` warnings among `warn`'s calls. */
-function fallbackWarnings(warn: { mock: { calls: unknown[][] } }): unknown[][] {
-  return warn.mock.calls.filter((c) => String(c[0]).includes("fell back to the CPU worker"));
-}
 
 /** Every `start-nested` message posted to a layout worker since `spy` was installed: stream flag + params. */
 function nestedStarts(spy: { mock: { calls: [MainToWorker, ...unknown[]][] } }) {
@@ -401,6 +401,35 @@ describe("backend:'auto' (#375)", () => {
     const workerRun = workerStarts(posts);
     expect(workerRun).toHaveLength(1);
     expect(autoStarts[0]).toEqual(workerRun[0]);
+    net.destroy();
+  });
+
+  // A supported device whose GPU run then fails while starting is a fault, not an expected outcome: "auto"
+  // warns (with no error value to print here) and the worker still lays the graph out.
+  it("still warns when the GPU run fails to start on a supported device, and lays out on the worker", async () => {
+    const net = await webglEngine();
+    const g = buildGraph(makeRingGraph());
+    net.data(g).layout({ backend: "auto", iterations: 2 });
+    await net.whenSettled();
+    expect(net.layoutTransport).toBe("gpu"); // supported, and its capability probe is now cached
+
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const posts = vi.spyOn(Worker.prototype, "postMessage");
+    // The next framebuffer the device creates is the GPU layout's own: its start throws `undefined` there,
+    // after the support check passed (a stand-in for a driver fault that carries no error object).
+    const fault = vi.spyOn(WebGL2RenderingContext.prototype, "createFramebuffer").mockImplementationOnce(() => {
+      throw undefined;
+    });
+    net.layout({ backend: "auto", iterations: 5 });
+    await net.whenSettled();
+    expect(fault).toHaveBeenCalled();
+    const fallbacks = fallbackWarnings(warn);
+    expect(fallbacks).toHaveLength(1);
+    expect(String(fallbacks[0]?.[0])).toMatch(/the GPU layout failed to start/);
+    expect(fallbacks[0]).toHaveLength(1); // no `undefined` printed after the message
+    expect(workerStarts(posts)).toHaveLength(1); // one worker run, not a retry
+    expect(net.layoutTransport).toBe(sharedMemoryAvailable() ? "shared" : "copy");
+    expect(Array.from(g.positions).every(Number.isFinite)).toBe(true);
     net.destroy();
   });
 
