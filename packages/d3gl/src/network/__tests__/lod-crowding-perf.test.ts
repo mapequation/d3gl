@@ -256,9 +256,10 @@ function report(results: LegResult[], n: number, label: string): void {
   }
 }
 
-// Calibrated on an M-series laptop at 100k (medians, see the PR): pass 2-8 ms per tree kind, sweep frame
-// 1-5 ms, streamed spatial frame (rebuild + positions + style + crowding) ~15 ms. Ceilings are ~8× those;
-// the at-scale leg splits each into a constant and a per-100k-leaves term.
+// Calibrated on an M1 Max at 100k (medians, under load from parallel runs): pass 7-15 ms per tree kind, sweep
+// frame < 1 ms, streamed spatial frame (rebuild + positions + style + crowding) ~26 ms; at 1M: pass 68-158 ms,
+// stream ~345 ms. Ceilings are 4-8× the 100k medians; the at-scale leg splits each into a constant and a
+// per-100k-leaves term.
 const LOCAL_BUDGET: Record<string, number> = { pass: 60, sweep: 40, stream: 150 };
 const CONSTANT_MS: Record<string, number> = { pass: 5, sweep: 10, stream: 10 };
 const kindOf = (name: string): string => name.slice(0, name.indexOf(":"));
