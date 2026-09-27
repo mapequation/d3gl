@@ -1308,19 +1308,31 @@ export function computeLODPositions(tree: LODPositionTree, positions: ArrayLike<
       bb[o + 1] = minY;
       bb[o + 2] = maxX;
       bb[o + 3] = maxY;
-      // Compounding bound: the farthest child's centre distance plus that child's own extent.
-      let comp = 0;
-      for (let p = c0; p < c1; p++) {
-        const c = children[p]!;
-        const dx = gx - cx[c]!;
-        const dy = gy - cy[c]!;
-        const d = Math.sqrt(dx * dx + dy * dy) + extent[c]!;
-        if (d > comp) comp = d;
-      }
       // Corner bound: the farthest corner of the exact box (every descendant leaf lies in it).
       const ex = Math.max(gx - minX, maxX - gx);
       const ey = Math.max(gy - minY, maxY - gy);
-      const corner = Math.sqrt(ex * ex + ey * ey);
+      const corner2 = ex * ex + ey * ey;
+      const corner = Math.sqrt(corner2);
+      // Compounding bound: the farthest child's centre distance plus that child's own extent — for leaf
+      // children (extent 0) compared squared, one square root at the end. Once it passes the corner bound
+      // the smaller of the two is the corner: stop.
+      let leafD2 = 0;
+      let comp = 0;
+      for (let p = c0; p < c1 && comp < corner && leafD2 < corner2; p++) {
+        const c = children[p]!;
+        const dx = gx - cx[c]!;
+        const dy = gy - cy[c]!;
+        const e = extent[c]!;
+        if (e === 0) {
+          const d2 = dx * dx + dy * dy;
+          if (d2 > leafD2) leafD2 = d2;
+        } else {
+          const d = Math.sqrt(dx * dx + dy * dy) + e;
+          if (d > comp) comp = d;
+        }
+      }
+      const leafD = Math.sqrt(leafD2);
+      if (leafD > comp) comp = leafD;
       const leaves = corner < comp ? corner : comp;
       // On a disc: at least the disc's radius.
       extent[g] = leaves > disc ? leaves : disc;
