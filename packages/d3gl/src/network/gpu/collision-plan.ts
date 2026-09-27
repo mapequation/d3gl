@@ -40,7 +40,7 @@
 //   gather for milliseconds: its fetches are a serial chain that no other work hides once the rest of the
 //   pass is done. So a slot's search is cut into work items of at most {@link COLLISION_PART_VISITS} cell
 //   visits (a slice of its cells, in class then row-major order) or {@link COLLISION_PART_PAIRS} pair tests
-//   (a slice of its segment). The items — of every grid slot, and of the exact slots cut into more than
+//   (a slice of its k − 1 partners). The items — of every grid slot, and of the exact slots cut into more than
 //   one — are gathered in parallel first; each slot's own fragment then sums its items, or runs its exact
 //   loop when that is a single item (the bulk of a map of small modules), in a pass small enough to run at
 //   full occupancy.

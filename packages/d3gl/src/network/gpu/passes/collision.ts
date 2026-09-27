@@ -255,11 +255,11 @@ vec2 push(int i, vec2 xi, float ri, int j, int start) {
 `;
 
 /**
- * The collision search of the item pass: `slotWork(id, sc, part, stat)` — the sum of the
- * pushes slot `id` (at slot-atlas texel `sc`) finds in its work item `part` (a slot that is not cut into
- * items has only part 0). With `COLLISION_STATS`, `stat` accumulates `(cells visited, pairs tested, grid
- * partners pushed, 1 exact slot / 2 overflow)` (cells visited: class cells and the sub-cells of dense ones;
- * pairs tested: list entries, bucket occupants read, and exact-loop partners).
+ * The collision search of the item pass: `slotWork(id, sc, part, parts, stat)` — the sum of the
+ * pushes slot `id` (at slot-atlas texel `sc`) finds in its work item `part` of `parts`. With
+ * `COLLISION_STATS`, `stat` accumulates `(cells visited, pairs tested, grid partners pushed, 1 exact slot /
+ * 2 overflow)` (cells visited: class cells and the sub-cells of dense ones; pairs tested: list entries,
+ * bucket occupants read, and exact-loop partners).
  */
 function collideGlsl(refine: number): string {
   const cellTextures = COLLISION_ROUNDS / 4;
@@ -311,7 +311,7 @@ void searchWindow(ivec2 f, float ri, float padOverSide, int shift, out ivec2 lo,
   hi = min(f + 1 + int(floor(h)), ivec2(F_MAX)) >> shift;
 }
 
-vec2 slotWork(int id, ivec2 sc, int part, inout vec4 stat) {
+vec2 slotWork(int id, ivec2 sc, int part, int parts, inout vec4 stat) {
   int seg = int(texelFetch(u_slotSeg, sc, 0).r);
   ivec2 st = slotTexel(seg, u_tableWidth);
   uvec4 info = texelFetch(u_segInfo, st, 0);
@@ -322,14 +322,16 @@ vec2 slotWork(int id, ivec2 sc, int part, inout vec4 stat) {
   float ri = di.z;
   vec2 acc = vec2(0.0);
   if ((texelFetch(u_slotCollide, sc, 0).r & COLLIDE_EXACT) != 0u) {
-    // An exact slot: its part of the loop over the segment.
-    int j0 = start + part * PART_PAIRS;
-    int j1 = min(j0 + PART_PAIRS, end);
-    for (int j = j0; j < j1; j++) {
-      if (j != id) acc += push(id, xi, ri, j, start);
+    // An exact slot: its part of the loop over its k − 1 partners, the plan's parts of PART_PAIRS each.
+    // Partner q is slot start + q, one further from the slot itself on.
+    int q0 = part * PART_PAIRS;
+    int q1 = min(q0 + PART_PAIRS, end - start - 1);
+    for (int q = q0; q < q1; q++) {
+      int j = start + q;
+      acc += push(id, xi, ri, j < id ? j : j + 1, start);
     }
 #ifdef COLLISION_STATS
-    stat.y += float(max(j1 - j0, 0));
+    stat.y += float(max(q1 - q0, 0));
     stat.w = 1.0;
 #endif
     return acc;
@@ -356,9 +358,11 @@ vec2 slotWork(int id, ivec2 sc, int part, inout vec4 stat) {
   int firstClass = int((grid.z >> 5) & 31u);
   uint subMask = (1u << ((grid.z >> 10) & 31u)) - 1u;
   float padOverSide = u_pad / texelFetch(u_segNested, st, 0).x;
-  // This part's slice [a, b) of the slot's class-cell visits, in class then row-major order.
+  // This part's slice [a, b) of the slot's class-cell visits, in class then row-major order. The plan
+  // sized the parts by its float64 bound on the windows; the last part takes whatever remains, so a window
+  // that float32 rounding widens by a cell is still searched whole.
   int a = part * PART_VISITS;
-  int b = a + PART_VISITS;
+  int b = part == parts - 1 ? 0x7fffffff : a + PART_VISITS;
   int idx = 0;
   bool overflow = false;
   for (int c = firstClass; c < classes && idx < b && !overflow; c++) {
@@ -484,7 +488,7 @@ void main() {
     uvec2 work = texelFetch(u_items, fc, 0).xy;
     int id = int(work.x);
     vec4 stat = vec4(0.0);
-    vec2 acc = slotWork(id, slotTexel(id, u_width), int(work.y & 65535u), stat);
+    vec2 acc = slotWork(id, slotTexel(id, u_width), int(work.y & 65535u), int(work.y >> 16), stat);
 #ifdef COLLISION_STATS
     o_out = stat;
 #else
@@ -555,7 +559,7 @@ void main() {
     for (int j = start; j < end; j++) {
       if (j != id) acc += push(id, di.xy, di.z, j, start);
     }
-    stat = vec4(0.0, float(end - start), 0.0, 1.0);
+    stat = vec4(0.0, float(end - start - 1), 0.0, 1.0);
   }
 #ifdef COLLISION_STATS
   o_out = stat;

@@ -9,7 +9,15 @@ import { NestedJacobiReference } from "./nested-jacobi-reference.js";
 import { GpuNestedLayout } from "../gpu-nested-layout.js";
 import { nestedSolverResult, nestedSolverTopology, type NestedSolverTopology } from "../nested-topology.js";
 import { EXACT_MAX, NESTED, nestedLayout, type NestedLayoutParams, type NestedLayoutResult, type NestedLayoutTopology } from "../../nested-layout.js";
-import { COLLISION_LIST_MAX, collisionPlan, planClassCount } from "../collision-plan.js";
+import {
+  COLLISION_EXACT,
+  COLLISION_ITEM_SHIFT,
+  COLLISION_ITEMIZED,
+  COLLISION_LIST_MAX,
+  COLLISION_PART_PAIRS,
+  collisionPlan,
+  planClassCount,
+} from "../collision-plan.js";
 import { expectNested, kids, linkTightness, meanShift, reclustered, rootOf, similar, spreadOf, threeLevel, topo, twoLevel, zipfModuleTree } from "../../__tests__/nested-fixtures.js";
 import { collisionTwin } from "./collision-twin.js";
 import { COLLISION_RELAX, COLLISION_STEPS } from "../passes/collision.js";
@@ -540,6 +548,29 @@ describe("GPU nested layout (#380): the radius-class collision grid on modules o
     // Each slot sums hundreds of pushes of up to ~0.1 there (float32 rounding ~1e-5); a missed pair is a
     // whole push, 1e-3 or more.
     expect(piled.worst).toBeLessThan(1e-4);
+  });
+
+  it("one collision step equals the all-pairs step where exact loops are cut into work items, whatever k − 1 is modulo a part", () => {
+    // Zipf modules this small take the exact loop everywhere (no grid), cut into parts of COLLISION_PART_PAIRS
+    // partners: 2 · 256 + 1 and 3 · 256 + 1 children fill their last part exactly, 514 leave one partner in a third.
+    for (const [k, seed] of [
+      [513, 4],
+      [514, 5],
+      [769, 6],
+    ] as const) {
+      const solver = zipfSolver(k, 0.1, seed);
+      const s = solver.segCount.indexOf(k);
+      const start = solver.segStart[s] ?? 0;
+      expect(solver.collision.segClasses[s], `${k} children: no grid`).toBe(0);
+      for (let i = start; i < start + k; i++) {
+        const word = solver.collision.slotCollide[i] ?? 0;
+        expect(word & (COLLISION_EXACT | COLLISION_ITEMIZED), `${k} children: slot ${i} exact, in items`).toBe(COLLISION_EXACT | COLLISION_ITEMIZED);
+      }
+      const parts = (solver.collision.items[2 * ((solver.collision.slotCollide[start] ?? 0) >>> COLLISION_ITEM_SHIFT) + 1] ?? 0) >>> 16;
+      expect(parts, `${k} children: parts`).toBe(Math.ceil((k - 1) / COLLISION_PART_PAIRS));
+      // A missed partner is a whole push (≥ 1e-3 this packed); one step's float32 rounding is ~1e-6.
+      expect(oneStep(solver).worst, `${k} children`).toBeLessThan(1e-5);
+    }
   });
 
   /** Every child disc inside its parent's (the fill is 0.92), every position finite. */
