@@ -107,13 +107,39 @@ function bruteClearZoom(tree: LODTree, g: number, screenSized: boolean): number 
   return z;
 }
 
-/** Every aggregate's clear zoom is exact below its horizon, and `Infinity` only past it. */
+/** Each node's parent (-1 for a root), from the children CSR. */
+function parentsOf(tree: LODTree): Int32Array {
+  const up = new Int32Array(tree.size).fill(-1);
+  for (let g = tree.leafCount; g < tree.size; g++) {
+    for (let q = tree.childOffset[g] ?? 0; q < (tree.childOffset[g + 1] ?? 0); q++) up[tree.children[q] ?? 0] = g;
+  }
+  return up;
+}
+
+/**
+ * The zoom up to which `g`'s clear zoom must be exact: its own horizon (where its footprint reaches `horizon`)
+ * or any ancestor's, whichever is larger — an ancestor starts from its children's values, and extents need not
+ * grow up the tree. A node whose extent is not finite (a non-finite member) asks for none: the cut never opens
+ * it, its footprint being NaN.
+ */
+function neededCap(tree: LODTree, up: Int32Array, g: number, horizon: number): number {
+  let cap = 0;
+  for (let a = g; a >= 0; a = up[a] ?? -1) {
+    const e = tree.extent[a] ?? NaN;
+    const c = e > 0 ? horizon / (2 * e) : e === 0 ? Infinity : 0;
+    if (c > cap) cap = c;
+  }
+  return cap;
+}
+
+/** Every aggregate's clear zoom is exact below the horizon it is needed to, and `Infinity` only past it. */
 function expectExact(tree: LODTree, screenSized: boolean, horizon: number): number {
+  const up = parentsOf(tree);
   let finite = 0;
   for (let g = tree.leafCount; g < tree.size; g++) {
     const want = bruteClearZoom(tree, g, screenSized);
-    const got = tree.clearZoom[g]!;
-    const cap = tree.extent[g]! > 0 ? horizon / (2 * tree.extent[g]!) : Infinity;
+    const got = tree.clearZoom[g] ?? NaN;
+    const cap = neededCap(tree, up, g, horizon);
     if (got === Infinity) {
       expect(want >= cap * (1 - 1e-5) || want === Infinity).toBe(true);
     } else {
@@ -196,12 +222,85 @@ describe("computeLODCrowding (#426)", () => {
     lattice(graph, 8, 50);
     graph.positions[0] = NaN;
     const tree = prepare(buildMortonLODTree(graph.positions, n), graph, new Float32Array(n).fill(3));
-    let finite = 0;
-    for (let g = tree.leafCount; g < tree.size; g++) {
-      expect(Number.isNaN(tree.clearZoom[g]!)).toBe(false);
-      if (tree.clearZoom[g]! < Infinity) finite++;
+    for (let g = tree.leafCount; g < tree.size; g++) expect(Number.isNaN(tree.clearZoom[g] ?? NaN)).toBe(false);
+    // Every other aggregate is exact over its finite members (the brute force skips the NaN pairs). The NaN
+    // leaf's ancestors have a NaN footprint, so the cut never opens them and they need no value.
+    expect(expectExact(tree, true, crowdingHorizon(tree))).toBeGreaterThan(0);
+  });
+
+  it("leaves a non-finite member out of the sweep, so it cannot hide a real pair (#426)", () => {
+    // A module on a nested layout's disc keeps a finite extent although one member is NaN (#329), so the cut
+    // can open it by overlap: its clear zoom must still see every finite pair. Sorted by x, the NaN member
+    // used to stall the sort and the sweep stopped at x = 20 before reaching x = 1, the closest pair's.
+    const xs = [0, 5, 20, NaN, 1];
+    const graph = chainGraph(xs.length);
+    xs.forEach((x, i) => {
+      graph.positions[2 * i] = x;
+      graph.positions[2 * i + 1] = 0;
+    });
+    const tree = buildModuleLODTree(xs.length, xs.map((_, id) => ({ id, path: [1, id + 1] })));
+    const cells = tree.size - tree.leafCount;
+    const discs = { dx: new Float32Array(cells), dy: new Float32Array(cells), r: new Float32Array(cells).fill(30) };
+    computeLODGeometry(tree, graph, new Float32Array(xs.length).fill(1), graph.strength, undefined, undefined, undefined, discs);
+    computeLODCrowding(tree, { screenSized: true, expandPx: 1e6 });
+    const module = parentsOf(tree)[0] ?? -1;
+    expect(tree.extent[module]).toBe(30);
+    expect(tree.clearZoom[module]).toBeCloseTo(2, 6); // leaves 0 and 4, 1 apart: (1 + 1) / 1
+    expectExact(tree, true, 1e6);
+  });
+
+  it("stays exact where a child reaches farther from its centroid than its parent (skewed siblings)", () => {
+    // Two mirrored groups, each a tight clump plus one member near the other clump. A group's centroid sits in
+    // its clump, so its extent reaches the far member; the root's centroid is midway, so its extent is smaller.
+    // The group's own horizon comes first — but the root still needs the group's pairs up to its own.
+    const pts = [[0, 0], [0.08, 0], [0, 0.08], [0.08, 0.08], [1, 1], [1, 0.84], [0.92, 0.84], [1, 0.76], [0.92, 0.76], [0.16, 0]];
+    const graph = chainGraph(pts.length);
+    pts.forEach(([x, y], i) => {
+      graph.positions[2 * i] = x ?? 0;
+      graph.positions[2 * i + 1] = y ?? 0;
+    });
+    const tree = buildModuleLODTree(pts.length, pts.map((_, id) => ({ id, path: [1, id < 5 ? 1 : 2, (id % 5) + 1] })));
+    prepare(tree, graph, new Float32Array(pts.length).fill(1), true, 48);
+    const up = parentsOf(tree);
+    const group = up[0] ?? -1;
+    expect(tree.extent[group] ?? 0, "precondition: the group reaches farther than its parent").toBeGreaterThan(tree.extent[up[group] ?? -1] ?? Infinity);
+    expectExact(tree, true, 48);
+    // At k = 28 every pair is ≥ 0.08 · 28 = 2.24 px apart with a 2 px radius sum: every node is drawn.
+    const k = 28;
+    const frontier = Array.from(cut(tree, { k, x: W / 2 - 0.5 * k, y: H / 2 - 0.5 * k }, W, H, { screenSized: true, expandPx: 48 }));
+    expect(frontier.sort((a, b) => a - b)).toEqual(pts.map((_, i) => i));
+  });
+
+  it("stays exact on skewed siblings at scale, on every tree kind", () => {
+    // Clumps of 6, each with one member flung next to a partner clump (the shape above, repeated), at spreads
+    // over two decades so some clumps clear between their own horizon and their parent's.
+    const groups = 60;
+    const n = groups * 7;
+    const graph = chainGraph(n);
+    const r = rng(21);
+    const gx = Float64Array.from({ length: groups }, (_, c) => (c % 2 ? 1 : -1) * 150 + (r() - 0.5) * 40);
+    const gy = Float64Array.from({ length: groups }, () => (r() - 0.5) * 300);
+    const spread = Float64Array.from({ length: groups }, () => 4 * Math.pow(10, 2 * r()));
+    for (let i = 0; i < n; i++) {
+      const c = Math.floor(i / 7);
+      const o = c ^ 1; // the partner clump, mirrored across the middle
+      const at = i % 7 === 6 ? o : c;
+      graph.positions[2 * i] = (gx[at] ?? 0) + (r() - 0.5) * (spread[at] ?? 0);
+      graph.positions[2 * i + 1] = (gy[at] ?? 0) + (r() - 0.5) * (spread[at] ?? 0);
     }
-    expect(finite).toBe(tree.size - tree.leafCount);
+    const radii = Float32Array.from({ length: n }, () => 0.5 + r() * 3);
+    const modules: ModuleNode[] = Array.from({ length: n }, (_, id) => ({ id, path: [Math.floor(id / 14) + 1, (Math.floor(id / 7) % 2) + 1, (id % 7) + 1] }));
+    let skewed = 0;
+    for (const tree of [buildMortonLODTree(graph.positions, n), buildLODTree(graph), buildModuleLODTree(n, modules)]) {
+      for (const horizon of [48, 240]) {
+        computeLODGeometry(tree, graph, radii, graph.strength);
+        computeLODCrowding(tree, { screenSized: true, expandPx: horizon });
+        expectExact(tree, true, horizon);
+      }
+      const up = parentsOf(tree);
+      for (let g = tree.leafCount; g < tree.size; g++) if ((up[g] ?? -1) >= 0 && (tree.extent[g] ?? 0) > (tree.extent[up[g] ?? 0] ?? 0)) skewed++;
+    }
+    expect(skewed, "not vacuous: some child reaches farther than its parent").toBeGreaterThan(0);
   });
 });
 
