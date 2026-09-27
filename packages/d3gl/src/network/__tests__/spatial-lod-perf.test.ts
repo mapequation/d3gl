@@ -169,6 +169,10 @@ function runLegs(f: ReturnType<typeof webLike>, frames: number): LegResult[] {
   // reductions off: every leaf drawn and kept.
   leg("reductions-off", (i) => frame(f, at(f.centroid, f.baseK * (0.5 + i * 0.005)), s, inc, { expandPx: 1e-6, declutter: false }));
   for (const r of results) if (r.name === "reductions-off") expect(r.drawn, "reductions off draws every leaf").toBe(f.tree.leafCount);
+  // The kept glyphs are disjoint covers, so a frame walks each graph incidence at most once: the gather is
+  // O(edges under the kept glyphs), never a multiple of the edge count (e.g. a walk per pair or per cover).
+  const incidences = f.graph.csr.neighbors.length;
+  for (const r of results) expect(r.visits, `${r.name}: incidences walked in one frame`).toBeLessThanOrEqual(incidences);
   // drag: one held leaf moves per frame (the drag repaint), memo warm.
   const held = new Uint32Array([7]);
   const parent = f.tree.parent;
@@ -186,6 +190,7 @@ function runLegs(f: ReturnType<typeof webLike>, frames: number): LegResult[] {
   const b = frame(f, tHeld, s, inc, { declutter: true });
   expect(s.lazy.misses, "held view: rows rebuilt").toBe(0);
   expect(s.lazy.visits, "held view: incidences walked").toBe(0);
+  expect(s.lazy.labelled, "held view: leaves labelled (O(leaves under the frontier))").toBe(0);
   expect(s.lazy.hits).toBe(b.kept);
   expect(b.ids).toEqual(a.ids);
   // Scratch over tree nodes / leaves is never reallocated once warm.

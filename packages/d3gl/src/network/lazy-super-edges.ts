@@ -10,10 +10,20 @@
  * 2. **Rows.** For each kept glyph `g`, walk the graph edges of the leaves in its run and resolve each
  *    neighbour leaf to the cover holding it (a memoised climb of the parent pointers — only touched nodes
  *    are written). Its **row** sums the flow toward each neighbouring cover, out and in.
- * 3. **Pairs.** The same drawing rules as the CSR gather: a pair of kept glyphs is drawn, a pair toward an
- *    off-screen cover is drawn (it exits the view toward it), and a pair toward a decluttered glyph on
- *    screen is skipped. The frontier is an antichain of cells, so there is no mixed-level projection to do:
- *    every neighbour already resolves to the one cover drawn for it.
+ * 3. **Pairs.** A pair of kept glyphs is drawn, a pair toward an off-screen cover is drawn (it exits the
+ *    view toward it), and a pair toward a decluttered glyph on screen is skipped. The frontier is an
+ *    antichain of cells, so there is no mixed-level projection to do: every neighbour already resolves to
+ *    the one cover drawn for it.
+ *
+ * Where this differs from the CSR gather ({@link superEdges}) on the same tree — pinned against it for the
+ * cases they share (every glyph on screen, `crossLevelEdges` on) by `lazy-super-edges.test.ts`:
+ * - kept glyphs at **different depths** are always linked, as the CSR gather does only with
+ *   `crossLevelEdges` (the option has no effect here);
+ * - an **off-screen end** is the culled cover holding the neighbour — a culled subtree's root, drawn at its
+ *   centroid — not the neighbour's same-depth cell, so links leaving the view bundle toward fewer, coarser
+ *   points, which change as panning culls different subtrees;
+ * - an **undirected** pair is drawn once with the flow of both directions (the CSR gather draws one line
+ *   per direction).
  *
  * A row depends only on which nodes are covers, never on the view or on declutter, so rows are memoised
  * **per tree**: a row stays valid while every cover it names is still a cover (and not split by a
@@ -128,10 +138,14 @@ export interface LazySuperEdgesScratch {
   entIn: Float64Array;
   entDir: Uint8Array;
   ents: number;
-  /** Last call: rows answered from the memo, rows rebuilt, and graph incidences walked to rebuild them. */
+  /** Each kept glyph's valid memo row this call, or −1 for a row to rebuild (grown to the kept count). */
+  keptRow: Int32Array;
+  /** Last call: rows answered from the memo, rows rebuilt, graph incidences walked to rebuild them, and
+   *  leaves labelled with their cover (only when a row was rebuilt — 0 on a held view). */
   hits: number;
   misses: number;
   visits: number;
+  labelled: number;
 }
 
 /** A fresh {@link LazySuperEdgesScratch}. */
@@ -158,9 +172,11 @@ export function makeLazySuperEdgesScratch(): LazySuperEdgesScratch {
     entIn: new Float64Array(1024),
     entDir: new Uint8Array(1024),
     ents: 0,
+    keptRow: new Int32Array(64),
     hits: 0,
     misses: 0,
     visits: 0,
+    labelled: 0,
   };
 }
 
@@ -202,53 +218,43 @@ function growRows(sc: LazySuperEdgesScratch, need: number): void {
  */
 function compactRows(sc: LazySuperEdgesScratch, kept: Uint32Array): void {
   const rows: number[] = [];
-  for (let i = 0; i < kept.length; i++) {
-    const g = kept[i]!;
+  for (const g of kept) {
     const row = sc.rowIndex.find(g, g, sc.rowG, sc.rowG);
     if (row >= 0) rows.push(row);
   }
   // Entries move toward the front in their current order, so a row is never overwritten before it moves.
-  rows.sort((a, b) => sc.rowStart[a]! - sc.rowStart[b]!);
-  const g = new Int32Array(rows.length);
-  const start = new Int32Array(rows.length);
-  const len = new Int32Array(rows.length);
+  rows.sort((a, b) => (sc.rowStart[a] ?? 0) - (sc.rowStart[b] ?? 0));
+  const moved = rows.map((row) => ({ g: sc.rowG[row] ?? 0, from: sc.rowStart[row] ?? 0, n: sc.rowLen[row] ?? 0 }));
+  sc.rowIndex.reset(rows.length);
+  sc.rows = 0;
   let ents = 0;
-  for (let i = 0; i < rows.length; i++) {
-    const row = rows[i]!;
-    const from = sc.rowStart[row]!;
-    const n = sc.rowLen[row]!;
+  for (const { g, from, n } of moved) {
     sc.entH.copyWithin(ents, from, from + n);
     sc.entOut.copyWithin(ents, from, from + n);
     sc.entIn.copyWithin(ents, from, from + n);
     sc.entDir.copyWithin(ents, from, from + n);
-    g[i] = sc.rowG[row]!;
-    start[i] = ents;
-    len[i] = n;
+    const i = sc.rows++;
+    sc.rowG[i] = g;
+    sc.rowStart[i] = ents;
+    sc.rowLen[i] = n;
+    sc.rowIndex.findOrAdd(g, g, i, sc.rowG, sc.rowG);
     ents += n;
-  }
-  sc.rowIndex.reset(rows.length);
-  sc.rows = 0;
-  for (let i = 0; i < rows.length; i++) {
-    sc.rowG[i] = g[i]!;
-    sc.rowStart[i] = start[i]!;
-    sc.rowLen[i] = len[i]!;
-    sc.rowIndex.findOrAdd(g[i]!, g[i]!, i, sc.rowG, sc.rowG);
-    sc.rows++;
   }
   sc.ents = ents;
 }
 
 /**
  * The super-edges among the kept glyphs of a spatial tree's cut (#343), gathered from the graph's adjacency
- * through the tree's leaf runs ({@link LODTree.leafOrder}) — see the module comment. Same output as
- * {@link superEdges}: pairs keyed `a · tree.size + b`, drawn per `style.linkStyle`. With `style.directed`,
- * pairs keep the edges' direction (out-flow drawn from its source); otherwise a pair of kept glyphs is drawn
- * once with the flow of both directions. `crossLevelEdges` and anchoring do not apply: every neighbour
- * resolves to the one glyph (or culled cell) that covers it. In a cross-fade band a neighbour resolves to
- * its finest drawn cover.
+ * through the tree's leaf runs ({@link LODTree.leafOrder}) — see the module comment for its drawing rules
+ * and where they differ from {@link superEdges}. The same output shape: pairs keyed `a · tree.size + b`,
+ * drawn per `style.linkStyle`. With `style.directed`, pairs keep the edges' direction (out-flow drawn from
+ * its source); otherwise a pair of kept glyphs is drawn once with the flow of both directions.
+ * `crossLevelEdges` and anchoring do not apply: every neighbour resolves to the one glyph (or culled cell)
+ * that covers it. In a cross-fade band a neighbour resolves to its finest drawn cover.
  *
- * Per call: O(drawn + culled) to stamp the covers, then per kept glyph either O(row length) (memo hit) or
- * O(Σ degree of its leaves) plus the climbs (memo miss). Needs `tree.leafOrder`/`leafStart`/`leafEnd` and
+ * Per call: O(drawn + culled) to stamp the covers and O(kept + memoised rows' length) to check the memo;
+ * then, only if some row missed, O(leaves under the frontier) to label them, and per missed glyph
+ * O(Σ degree of its leaves) plus the climbs. A held view costs the first two terms alone. Needs `tree.leafOrder`/`leafStart`/`leafEnd` and
  * `tree.parent`; returns `{ ids: [] }` without them.
  */
 export function lazySuperEdges(
@@ -265,6 +271,7 @@ export function lazySuperEdges(
   sc.hits = 0;
   sc.misses = 0;
   sc.visits = 0;
+  sc.labelled = 0;
   if (!leafOrder || !leafStart || !leafEnd || !parent) return { ids: [] };
 
   // Stamps: grown once per tree size; the generation bump is the per-call clear.
@@ -284,37 +291,12 @@ export function lazySuperEdges(
   const up = sc.up;
   const upGen = sc.upGen;
   const { drawn, kept, culled, split } = cutSet;
-  // Drawn covers: role, and their leaves labelled. The frontier lists a split node before the nodes below
-  // it, so the finest drawn cover of a leaf is written last.
-  for (let i = 0; i < drawn.length; i++) {
-    const x = drawn[i]!;
-    cover[x] = stamp | DROPPED;
-    for (let r = leafStart[x]!; r < leafEnd[x]!; r++) {
-      const v = leafOrder[r]!;
-      label[2 * v] = gen;
-      label[2 * v + 1] = x;
-    }
-  }
+  // Cover roles: O(drawn + culled). Leaves are labelled with their cover only if a row must be rebuilt.
+  for (let i = 0; i < drawn.length; i++) cover[drawn[i]!] = stamp | DROPPED;
   for (let i = 0; i < kept.length; i++) cover[kept[i]!] = stamp | KEPT;
   for (let i = 0; i < culled.length; i++) cover[culled[i]!] = stamp | CULLED;
   for (let i = 0; i < split.length; i++) upGen[split[i]!] = -gen;
   const fading = split.length > 0;
-  if (fading) {
-    // A culled root under a split node (the only drawn cover with anything culled below it) is the finer
-    // cover of its leaves: label them after the drawn ones. O(depth) per culled root, in a band only.
-    for (let i = 0; i < culled.length; i++) {
-      const c = culled[i]!;
-      for (let x = parent[c]!; x >= 0; x = parent[x]!) {
-        if (cover[x]! >> 3 !== gen) continue;
-        for (let r = leafStart[c]!; r < leafEnd[c]!; r++) {
-          const v = leafOrder[r]!;
-          label[2 * v] = gen;
-          label[2 * v + 1] = c;
-        }
-        break;
-      }
-    }
-  }
 
   // The row memo belongs to one tree and one incidence (weights + direction); start over otherwise.
   if (sc.memoTree !== tree || sc.memoIncidence !== incidence) {
@@ -323,6 +305,61 @@ export function lazySuperEdges(
     sc.rowIndex.reset();
     sc.rows = 0;
     sc.ents = 0;
+  }
+
+  // A memoised row is valid while every cover it names is still a cover, and not split.
+  const rowValid = (row: number): boolean => {
+    const e1 = sc.rowStart[row]! + sc.rowLen[row]!;
+    for (let e = sc.rowStart[row]!; e < e1; e++) {
+      const h = sc.entH[e]!;
+      if (cover[h]! >> 3 !== gen || upGen[h] === -gen) return false;
+    }
+    return true;
+  };
+  // Each kept glyph's memo row, checked before any leaf is labelled: a held view (every row valid) labels
+  // nothing, so it costs O(kept + rows' length), not O(leaves under the frontier).
+  if (sc.keptRow.length < kept.length) sc.keptRow = new Int32Array(Math.max(kept.length, 2 * sc.keptRow.length));
+  const keptRow = sc.keptRow;
+  let rebuild = false;
+  for (let i = 0; i < kept.length; i++) {
+    const g = kept[i]!;
+    const row = sc.rowIndex.find(g, g, sc.rowG, sc.rowG);
+    const ok = row >= 0 && rowValid(row);
+    keptRow[i] = ok ? row : -1;
+    if (!ok) rebuild = true;
+  }
+  if (rebuild) {
+    // Label the drawn covers' leaves. The frontier lists a split node before the nodes below it, so the
+    // finest drawn cover of a leaf is written last.
+    let labelled = 0;
+    for (let i = 0; i < drawn.length; i++) {
+      const x = drawn[i]!;
+      const r1 = leafEnd[x]!;
+      labelled += r1 - leafStart[x]!;
+      for (let r = leafStart[x]!; r < r1; r++) {
+        const v = leafOrder[r]!;
+        label[2 * v] = gen;
+        label[2 * v + 1] = x;
+      }
+    }
+    if (fading) {
+      // A culled root under a split node (the only drawn cover with anything culled below it) is the finer
+      // cover of its leaves: label them after the drawn ones. O(depth) per culled root, in a band only.
+      for (let i = 0; i < culled.length; i++) {
+        const c = culled[i]!;
+        for (let x = parent[c]!; x >= 0; x = parent[x]!) {
+          if (cover[x]! >> 3 !== gen) continue;
+          labelled += leafEnd[c]! - leafStart[c]!;
+          for (let r = leafStart[c]!; r < leafEnd[c]!; r++) {
+            const v = leafOrder[r]!;
+            label[2 * v] = gen;
+            label[2 * v + 1] = c;
+          }
+          break;
+        }
+      }
+    }
+    sc.labelled = labelled;
   }
 
   // The culled root holding leaf v (a leaf no drawn cover labelled): the first stamped ancestor, memoised
@@ -409,16 +446,6 @@ export function lazySuperEdges(
     return row;
   };
 
-  // A memoised row is valid while every cover it names is still a cover, and not split.
-  const rowValid = (row: number): boolean => {
-    const e1 = sc.rowStart[row]! + sc.rowLen[row]!;
-    for (let e = sc.rowStart[row]!; e < e1; e++) {
-      const h = sc.entH[e]!;
-      if (cover[h]! >> 3 !== gen || upGen[h] === -gen) return false;
-    }
-    return true;
-  };
-
   const out = sc.edges;
   let len = 0;
   let paired = 0;
@@ -448,8 +475,8 @@ export function lazySuperEdges(
 
   for (let i = 0; i < kept.length; i++) {
     const g = kept[i]!;
-    let row = rowIndex.find(g, g, sc.rowG, sc.rowG);
-    if (row >= 0 && rowValid(row)) sc.hits++;
+    let row = keptRow[i]!;
+    if (row >= 0) sc.hits++;
     else {
       row = buildRow(g);
       sc.misses++;

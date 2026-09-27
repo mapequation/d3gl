@@ -1,8 +1,8 @@
 import { describe, it, expect } from "vitest";
-import { buildMortonLODTree, computeLODPositions, computeLODStyle, cut, declutterFrontier, makeCutScratch, makeDeclutterFrontierScratch, visibleWorldRect, type LODTransform, type LODTree } from "../lod.js";
+import { buildMortonLODTree, buildSuperEdges, computeLODPositions, computeLODStyle, cut, declutterFrontier, makeCutScratch, makeDeclutterFrontierScratch, visibleWorldRect, type LODTransform, type LODTree } from "../lod.js";
 import { buildGraph, type NetworkGraph } from "../graph.js";
 import { buildLeafIncidence, lazySuperEdges, makeLazySuperEdgesScratch, type LazyCut } from "../lazy-super-edges.js";
-import type { SuperEdgeStyleResolved } from "../glyphs.js";
+import { superEdges, type SuperEdgeStyleResolved } from "../glyphs.js";
 
 function rng(seed: number): () => number {
   let s = seed >>> 0;
@@ -121,6 +121,40 @@ describe("lazySuperEdges (#343)", () => {
     }
   }
 
+  // The rules the two gathers share, locked against the CSR gather on the same tree: with every glyph on
+  // screen there is no off-screen end (the lazy gather draws those toward the culled cover), and with
+  // crossLevelEdges the CSR gather also draws every pair of kept glyphs whatever their depths.
+  for (const directed of [false, true]) {
+    for (const declutter of [false, true]) {
+      it(`draws what the super-edge CSR gather draws with crossLevelEdges, on screen (${directed ? "directed" : "undirected"}, declutter ${declutter ? "on" : "off"})`, () => {
+        const parent = tree.parent;
+        if (!parent) throw new Error("a spatial tree carries its parent map");
+        const withCsr: LODTree = { ...tree, ...buildSuperEdges(tree.size, parent, g) };
+        const all: LODTransform = { k: 0.5, x: W / 2, y: H / 2 }; // the whole layout inside the view
+        const view = visibleWorldRect(all, W, H);
+        const c = cutAt(tree, all, declutter);
+        expect(c.culled.length).toBe(0);
+        const lazy = lazySuperEdges(tree, c, styleOf(directed), view, g.csr, buildLeafIncidence(g, directed));
+        const csr = superEdges(withCsr, c.kept, { ...styleOf(directed), crossLevelEdges: true }, view);
+        expect(lazy.ids.length).toBeGreaterThan(0);
+        // Undirected, the CSR gather keeps each direction's pair (two lines), the lazy gather one line per
+        // pair with the flow of both directions: compare per unordered pair.
+        const unordered = (m: Map<number, number>): Map<number, number> => {
+          if (directed) return m;
+          const u = new Map<number, number>();
+          for (const [k, w] of m) {
+            const a = Math.floor(k / tree.size);
+            const b = k - a * tree.size;
+            const key = Math.min(a, b) * tree.size + Math.max(a, b);
+            u.set(key, (u.get(key) ?? 0) + w);
+          }
+          return u;
+        };
+        expectSame(unordered(asMap(lazy.ids, lazy.flows)), unordered(asMap(csr.ids, csr.flows)));
+      });
+    }
+  }
+
   it("draws directed half-arrows with reciprocal widths between kept pairs", () => {
     const inc = buildLeafIncidence(g, true);
     const c = cutAt(tree, zoomed, true);
@@ -161,10 +195,12 @@ describe("lazySuperEdges (#343)", () => {
     const first = lazySuperEdges(tree, c, styleOf(true), view, g.csr, inc, sc);
     expect(sc.misses).toBe(c.kept.length);
     expect(sc.visits).toBeGreaterThan(0);
+    expect(sc.labelled).toBeGreaterThan(0);
     const again = lazySuperEdges(tree, c, styleOf(true), view, g.csr, inc, sc);
     expect(sc.hits).toBe(c.kept.length);
     expect(sc.misses).toBe(0);
     expect(sc.visits).toBe(0);
+    expect(sc.labelled, "a held view labels no leaf: O(kept + rows), not O(leaves under the frontier)").toBe(0);
     expect(again.ids).toEqual(first.ids);
     expect(again.flows).toEqual(first.flows);
   });
