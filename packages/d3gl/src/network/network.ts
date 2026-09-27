@@ -2136,23 +2136,25 @@ export class Network extends BaseEngine {
     this.layoutOpts = { ...this.layoutOpts, ...opts };
     const phys = sg.physical;
     this.haltLayout(); // cancel a running physical-layout worker/GPU stream before re-seeding
+    // fit: true (#238, #427) frames the physical layout via the CAMERA, as the main layout path does, on
+    // every backend: a streamed one frame by frame, a one-go one once as it lands. The state sizing is
+    // scale-relative (computeStateSizing sizes against physicalSpacing), so leaving positions in force scale
+    // is fine; without fit, the `force` backend remaps them to fill the view at k=1 instead.
+    const fit = opts.fit === true;
+    this.fitOnLayout = fit;
 
     if (opts.backend === "positions" && opts.positions) {
       phys.positions.set(opts.positions);
       this.applyStateDerivedPositions();
       this.recomputeLODGeometry();
+      this.releaseFit(); // with fit: framed once, on the derived positions of the active view
       return this.rebuild();
     }
 
     if (layoutClass(opts.backend) === "streaming") {
-      // fit: true (#238) frames the streaming physical layout via the CAMERA (like the main layout path)
-      // instead of the `scaleToViewport` position-remap — so state networks open framed and converge in
-      // place (no top-left flash + settle snap on the GPU backend). The state sizing is scale-relative
-      // (computeStateSizing sizes against physicalSpacing), so leaving positions in force scale is fine.
-      // Pre-seed so the first paint is framed (the GPU device resolves async → phys is zero until then);
-      // each streamed frame reframes in scheduleLayoutRepaint, released on settle/interaction.
-      const fit = opts.fit === true;
-      this.fitOnLayout = fit;
+      // A streamed fit opens framed and converges in place (no top-left flash + settle snap on the GPU
+      // backend). Pre-seed so the first paint is framed (the GPU device resolves async → phys is zero until
+      // then); each streamed frame reframes in scheduleLayoutRepaint, released on settle/interaction.
       if (fit) seedPositions(phys, this.width, this.height, { force: opts.force });
       let handle: WorkerLayoutHandle | undefined;
       const onPhysFrame = (): void => this.onStreamedFrame(handle);
@@ -2200,11 +2202,13 @@ export class Network extends BaseEngine {
     } else {
       multilevelLayout(phys, { width: this.width, height: this.height, iterations, force: opts.force });
     }
-    // Scale the layout to fill the view at k=1 (the map-of-modules approach) so it opens framed without
-    // a fit-transform. Caller-supplied positions are taken as-is (already placed).
-    scaleToViewport(phys.positions, sg.physicalCount, this.width, this.height);
+    // Without fit, scale the layout to fill the view at k=1 (the map-of-modules approach) so it opens framed
+    // without a fit-transform; with fit, the camera frames it once, as it lands. Caller-supplied positions
+    // are taken as-is (already placed).
+    if (!fit) scaleToViewport(phys.positions, sg.physicalCount, this.width, this.height);
     this.applyStateDerivedPositions();
     this.recomputeLODGeometry();
+    this.releaseFit();
     return this.rebuild();
   }
 
