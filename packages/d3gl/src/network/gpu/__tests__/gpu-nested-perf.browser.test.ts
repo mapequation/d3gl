@@ -237,8 +237,10 @@ function assertSignatures(leg: Leg): void {
   const onePixel = events.filter((e) => e.kind === "layout-draw" && e.viewport1x1 && e.count >= N);
   expect(onePixel.length, "a draw of ≥ N points into a 1×1 viewport").toBe(0);
 
-  // The real transport keeps a frame's estimated layout GPU work within its budget, readback frames
-  // included (#382): past the first item the budget admits one only while the sum fits.
+  // The real transport admits a frame's items through the budget, readback frames included (#382): past the
+  // first item, one only while the estimates' sum fits. A guard on the wiring (schedule → budget → sample);
+  // it cannot see an estimate that is wrong, nor a band's size (`nested-frame-budget.test.ts` checks every
+  // band of the plan this layout binds, `planSizes` in `gpu-nested-layout.browser.test.ts`).
   frames.forEach((s, f) => {
     if (s.items > 1) expect(s.itemsMs, `frame ${f}: ${s.items} items`).toBeLessThanOrEqual(s.budgetMs + 1e-9);
   });

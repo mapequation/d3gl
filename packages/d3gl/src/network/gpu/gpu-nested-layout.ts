@@ -32,10 +32,13 @@ import { EXACT_MAX } from "../nested-layout.js";
 //
 // A solve tick is one stream tick in the organise phase and one per collision step in the compact phase.
 // A stream tick is a sequence of passes ({@link StreamStage}s), and the streaming transport cuts every one
-// of them into row bands sized to the frame budget (#382) — so no work item exceeds half the budget at any
-// N (the budget, for the gather, whose every band waits for its longest fragment), and neither does a frame
-// that reads positions back: the composition is sliced the same way, as items of their own
-// (`nested-plan.ts` has the passes and their cost model):
+// of them into row bands sized to the frame budget (#382) — so no work item is *estimated* above half the
+// budget (above the whole budget, for a pass whose every band pays more than a quarter of it in fixed cost:
+// the gather, whose every band waits for its longest fragment), and no frame above the budget, a frame that
+// reads positions back included: the composition is sliced the same way, as items of their own. Rows and
+// the 64-band cap permitting: a pass is never cut into more bands than either, so past ~20M leaves at
+// 120 Hz a band of the gather or the repulsion outgrows its target (`nested-plan.ts` has the passes and
+// their cost model):
 //
 // | stream tick                 | passes, in order                                                                  |
 // |-----------------------------|-----------------------------------------------------------------------------------|
