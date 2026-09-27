@@ -103,7 +103,7 @@ class VectorProbe extends Network {
     this.reseeds++;
     super.syncZoomToView();
   }
-  get view(): ViewTransform {
+  get camera(): ViewTransform {
     return { ...this.transform };
   }
 }
@@ -212,7 +212,7 @@ beforeAll(async () => {
           const t0 = wallClock();
           frames.step(dt);
           ts.push(wallClock() - t0);
-          ks.push(net.view.k);
+          ks.push(net.camera.k);
           void host.getBoundingClientRect();
         }
         ts.sort((a, b) => a - b);
