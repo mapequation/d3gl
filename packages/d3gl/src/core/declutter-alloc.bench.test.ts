@@ -254,8 +254,18 @@ describe.skipIf(!RUN)("#233 declutterScreen transient allocation", () => {
       const out = new Uint8Array(N);
       const scratch = declutterScratch(); // warmed below — grid growth happens before the bracket
       const run = (): Uint8Array => declutterScreen(N, sx, sy, c.radius, c.order, W, H, 1, out, scratch, undefined, winners);
-      for (let i = 0; i < WARMUP; i++) run();
+      // Collect BEFORE the warm-up, never between it and the measured calls. On V8 12 (Node 22, the
+      // CI runtime) a full GC can throw away the code the warm-up produced: optimized code that
+      // embeds an object the GC collects is deoptimized ("weak objects" — e.g. the `ignore` closure
+      // the byte-identity test above left in declutterScreen's call feedback), and OSR code is only
+      // weakly cached. The measured calls then re-tier through the interpreter, whose tagged
+      // registers box every double — ~20 MB over the first one or two calls at 500k, charged to an
+      // engine whose optimized code allocates nothing. Starting the sampler does not collect
+      // (reading the profile at the end does), so the measured calls run the warm-up's code: the
+      // steady state per-frame callers see. An engine that allocates per call in that steady state
+      // (the #233 regression) still allocates in every measured call.
       gc?.();
+      for (let i = 0; i < WARMUP; i++) run();
       const { engineBytes, maxDelta } = await sampleAllocations(run, FRAMES, "declutterScreen");
       const line =
         `${c.name.padEnd(38)} count=${N.toLocaleString()}  engineAlloc=${(engineBytes / 1024 / 1024).toFixed(2)}MB/${FRAMES} calls ` +
