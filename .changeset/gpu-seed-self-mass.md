@@ -18,6 +18,9 @@ CPU layout's 461. The seed frame's mean edge length is 528 instead of 679, alrea
 start ends at after 300 ticks. These figures replace the tick-149, 495 and 679 figures of the GPU
 multilevel seed entry (#353).
 
-On plain graphs a node that shares its finest cell with one other node now gets that node's exact push,
-where it got 4/3 of it. The tick costs the same: 10.0 ms instead of 10.2 ms at 325k nodes and 36.4 ms at
-1M on an M1 Max.
+On a graph that takes the Barnes-Hut path (above 4,096 nodes by default; smaller graphs use the exact
+loop and are unchanged), a node that shares its finest cell with one other node now gets that node's exact
+push, where it got 4/3 of it. A Barnes-Hut tick costs the same or slightly less. Timed from web-NotreDame's
+settled layout in batches of 20 ticks on an M1 Max, it went from 10.2 to 10.0 ms at 325k nodes, and stayed
+at about 36.5 ms on a 1M-node disc without edges. That setup differs from the one behind the tile pyramid
+entry's 10.8 and 35.6 ms (#354), so compare each pair of figures only with itself.

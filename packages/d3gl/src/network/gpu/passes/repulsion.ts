@@ -44,9 +44,12 @@ import { ADDITIVE_BLEND, fullScreenModel, type PassUniforms } from "./fullscreen
 // Node i's own mass is excluded from every cell it sits in (#403), as the CPU quadtree skips body i in its
 // leaf. The traversal recomputes i's level-0 cell and the terms the scatter added there, (m_i·p_i, m_i,
 // m_i·|p_i − cc|²), with the scatter's own expressions, and a popped cell (ℓ, cx, cy) holds i exactly when
-// it is i's level-0 cell shifted by ℓ; that cell is read less i's terms. Masses are integer-valued, so a
-// cell with i alone reads mass 0 exactly and is skipped, and the lump of the others is (Σ − m_i·p_i) /
-// (M − m_i), softened by the others' own second moment. Keeping i in (the pre-#403 traversal) gave node i
+// it is i's level-0 cell shifted by ℓ; that cell is read less i's terms. A cell holding only i reads exactly
+// the m_i this shader fetches (the scatter blends the same texel of u_mass onto 0, and the reduce adds it to
+// empty siblings), so it reads mass 0 after the subtraction and is skipped. Any other cell holding i leaves
+// the lump of the others, (Σ − m_i·p_i) / (M − m_i), softened by the others' own second moment. Masses are
+// integer-valued, so M − m_i is exact, and on the flat layout (unit masses) `mass > 1.5` below means several
+// other occupants. Keeping i in (the pre-#403 traversal) gave node i
 // sharing its finest cell with one node j (Δ = p_j − p_i) |F_i| = rep·(m_i + m_j)² / ((2·m_i + m_j)·|Δ|)
 // against the exact rep·m_j / |Δ|: 4/3 for unit masses, ≈ m_i / (2·m_j) for a heavy supernode next to a
 // light one on a mass-weighted seed level (#353, ≈ 51× at 100 : 1), and a heavy node alone in its cell
