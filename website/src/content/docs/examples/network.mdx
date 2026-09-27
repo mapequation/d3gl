@@ -282,12 +282,13 @@ coarsens the graph and then refits the tree's geometry to each frame the GPU rea
 
 This holds for new data too. Until a layout has run on the graph `data()` set, `lod()` can't know which
 backend comes next, so it leaves its own main-thread build to the end of the current call chain: the
-worker or GPU layout that follows wins (the GPU layout's LOD worker streams the tree, #377), and any other
-path (no layout, `positions`, `force`) still has its tree before the next frame. On those paths a read
-that needs the tree right away — `pick()`, `selection()`, `toSVG()` — builds it at once. Until the
-worker's tree arrives nothing is drawn, so nothing is labelled. A `select()`, `highlight()` or
-`setStyle()` made while no tree is drawn is kept and drawn when the tree lands, exactly as if it were made
-then — it never builds the tree itself.
+worker or GPU layout that follows wins (the GPU layout's LOD worker streams the tree, #377; a worker
+builds the module tree for a nested layout or a GPU layout's module seed, below), and any other path (no
+layout, `positions`, `force`) still has its tree before the next frame. On those paths a read that needs
+the tree right away — `pick()`, `selection()`, `toSVG()` — builds it at once. Until the worker's tree
+arrives nothing is drawn, so nothing is labelled. A `select()`, `highlight()` or `setStyle()` made while
+no tree is drawn is kept and drawn when the tree lands, exactly as if it were made then — it never builds
+the tree itself.
 
 ```js
 net
@@ -392,13 +393,13 @@ The engine owns the hierarchy, not the LOD options, so every module feature read
   aggregate, the node's own path for a leaf, LOD on or off.
 
 The module tree is built once per hierarchy, when something first needs it — and off the main thread
-when that can wait. A `layout({ nested: true })` on the `worker` or `gpu` backend has a worker build the
-tree (the main thread only packs the records into typed arrays and hands them over) and starts solving
-when it arrives, and a cut that draws the modules draws them from that same tree as soon as it lands —
-nothing is drawn until then, as while a worker streams a structural tree, and a selection made meanwhile
-is drawn when it lands. Everywhere else (`lod()` with no such layout, the `force` and `positions`
-backends, the GPU seed, and wherever Web Workers are unavailable) the tree is built on the main thread
-before the next frame.
+when that can wait. A `layout({ nested: true })` on the `worker` or `gpu` backend, and the GPU seed of a
+`layout({ backend: "gpu" })`, have a worker build the tree (the main thread only packs the records into
+typed arrays and hands them over) and start when it arrives, and a cut that draws the modules draws them
+from that same tree as soon as it lands — nothing is drawn until then, as while a worker streams a
+structural tree, and a selection made meanwhile is drawn when it lands. Everywhere else (`lod()` with no
+such layout, the `force` and `positions` backends, and wherever Web Workers are unavailable) the tree is
+built on the main thread before the next frame.
 
 A new `data(graph)` without a hierarchy clears it. Module-level links (an Infomap `.ftree`'s `*Links`
 rows) go alongside: `data(graph, { modules, moduleLinks })`. (`lod({ modules })` still works as an

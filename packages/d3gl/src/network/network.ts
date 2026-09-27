@@ -823,8 +823,8 @@ export class Network extends BaseEngine {
   } | null = null;
   /**
    * The module tree a worker is building (#428), keyed like {@link moduleTreeCache}: started by the first
-   * consumer that can wait for it — a nested layout on a streaming backend ({@link moduleTreeLater}) —
-   * so the main thread never blocks on the build. It lands in the cache and repaints a cut that draws
+   * consumer that can wait for it — a nested layout on a streaming backend, the GPU seed
+   * ({@link moduleTreeLater}) — so the main thread never blocks on the build. It lands in the cache and repaints a cut that draws
    * it. `settle` also hands over a tree built on the main thread meanwhile ({@link moduleTreeOf}), so
    * whoever awaits `tree` never waits on a cancelled worker. Dropped with the graph or on destroy.
    */
@@ -1254,13 +1254,13 @@ export class Network extends BaseEngine {
    *
    * Until a layout has run on the graph `data()` set, `lod()` cannot know what comes next, so a tree it
    * would build from scratch waits for the end of the current call chain: a streaming `layout()` in the same
-   * chain still gets its structural tree off-thread, a `layout({ nested })` on a streaming backend gets the
-   * module tree built on a worker (#428), and every other path (no layout, `positions`, `force`) has the
-   * tree before the next frame — and a synchronous read that needs it (`pick()`, `toSVG()`/`toPNG()`,
-   * `selection()`) builds it at once. With a worker building the tree those reads see what they see during
-   * any worker-streamed load: no cut until the worker's tree lands. `select()`, `highlight()` and
-   * `setStyle()`/`clearStyle()` never build it: while no tree is drawn they keep their state, and the cut
-   * draws it when its tree lands, exactly as if they were called then.
+   * chain still gets its structural tree off-thread, a `layout({ nested })` on a streaming backend and a
+   * GPU layout's module seed get the module tree built on a worker (#428), and every other path (no layout,
+   * `positions`, `force`) has the tree before the next frame — and a synchronous read that needs it
+   * (`pick()`, `toSVG()`/`toPNG()`, `selection()`) builds it at once. With a worker building the tree those
+   * reads see what they see during any worker-streamed load: no cut until the worker's tree lands.
+   * `select()`, `highlight()` and `setStyle()`/`clearStyle()` never build it: while no tree is drawn they
+   * keep their state, and the cut draws it when its tree lands, exactly as if they were called then.
    *
    * With a module hierarchy (`data(graph, { modules })`, #326) the cut draws the module tree by
    * default; `{ source: "structure" }` coarsens the graph structurally instead. `{ source: "spatial" }`
@@ -2037,8 +2037,8 @@ export class Network extends BaseEngine {
       const devicePromise = this.whenBackendSettled().then(() => this.gpuDevice());
       // "auto" expects the worker where the GPU is unsupported: it falls back silently (#375).
       const warnUnsupported = opts.backend === "gpu";
-      const gpuOpts = { ...workerOpts, moduleTopology: this.moduleTree(), warnUnsupported };
-      handle = startGpuLayout(devicePromise, graph, gpuOpts, onFrame, onLODTree,
+      // The module seed waits for its tree as it waits for its device: a worker builds it (#428).
+      const start = (moduleTopology: LODTree | undefined): WorkerLayoutHandle => startGpuLayout(devicePromise, graph, { ...workerOpts, moduleTopology, warnUnsupported }, onFrame, onLODTree,
         () => {
           // Resolved: the worker fallback streams the tree, and so does the GPU solve's LOD worker (#377) — so
           // main builds none meanwhile. Also when the layout moved to either by a backend swap or a lost context
@@ -2047,6 +2047,8 @@ export class Network extends BaseEngine {
           // the main-thread LOD fallback until the next layout().
           if (this.layoutHandle === handle && !settled) this.lodStreaming = useLod;
         });
+      const tree = this.moduleTreeLater();
+      handle = tree instanceof Promise ? deferredLayoutHandle(tree, start, "pending") : start(tree);
     } else {
       this.lodStreaming = useLod; // the worker will stream the tree; main builds none meanwhile
       handle = startWorkerLayout(graph, workerOpts, onFrame, onLODTree);

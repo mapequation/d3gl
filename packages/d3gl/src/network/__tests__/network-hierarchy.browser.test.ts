@@ -437,6 +437,22 @@ describe("the module tree is built off the main thread (#428)", () => {
     }
   });
 
+  // The GPU layout's module-aware seed (N8.2) waits for its device anyway, so it waits for the worker's
+  // tree too: one pipeline for every streaming backend.
+  it("a GPU layout's module seed gets its tree from a worker, and so does the cut", async () => {
+    const net = network(host(), { width: 200, height: 200 });
+    await net.whenReady();
+    const g = graph();
+    net.data(g, { modules: MODULES }).lod({ declutter: false }).layout({ backend: "gpu", iterations: 20 });
+    expect(builds.count, "the GPU seed built the module tree on the main thread").toBe(0);
+    await net.whenSettled();
+    await frame();
+    expect(builds.count).toBe(0);
+    expect(net.lodSource).toBe("modules");
+    expect(Array.from(g.positions).every(Number.isFinite)).toBe(true);
+    net.destroy();
+  });
+
   // Interaction state set while the tree is on its way — Network Navigator selects its search hits during a
   // load — is kept by layer name and drawn when the tree lands, exactly as the same calls made after the
   // landing draw it. Nor does it take the build back to the main thread. `fit` frames the whole map, so

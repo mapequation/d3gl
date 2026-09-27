@@ -137,11 +137,14 @@ const NOOP_DRAG = { pin() {}, unpin() {} };
  * A handle for a layout that can start only once `ready` resolves (#428) — a nested layout waiting for
  * its module tree to be built off the main thread. `start` runs then, unless the handle was stopped
  * first; `settled` resolves when the started run settles, at once if `start` declines (returns null),
- * or on {@link WorkerLayoutHandle.stop}. It rejects with the error if `start` throws, or if the run's
- * own `settled` rejects, so `whenSettled()` reports a failed start instead of never settling. Pins reach
- * the run once it is live.
+ * or on {@link WorkerLayoutHandle.stop}. It rejects with the error if `ready` rejects, if `start` throws,
+ * or if the run's own `settled` rejects, so `whenSettled()` reports a failed start instead of never
+ * settling. Pins reach the run once it is live, and so do its `shared`, `transport` and `mainThread`
+ * reports: a copy-mode default until then, as `startGpuLayout`'s handle reports while it waits for
+ * its device — with `waiting` as the transport meanwhile (`"pending"` for a GPU start, which the LOD
+ * guards read as a streaming transport still resolving).
  */
-export function deferredLayoutHandle<T>(ready: Promise<T>, start: (value: T) => WorkerLayoutHandle | null): WorkerLayoutHandle {
+export function deferredLayoutHandle<T>(ready: Promise<T>, start: (value: T) => WorkerLayoutHandle | null, waiting?: "pending"): WorkerLayoutHandle {
   let run: WorkerLayoutHandle | null = null;
   let stopped = false;
   let resolveSettled: () => void = () => {};
@@ -162,7 +165,15 @@ export function deferredLayoutHandle<T>(ready: Promise<T>, start: (value: T) => 
     else resolveSettled();
   }, rejectSettled);
   return {
-    shared: false,
+    get shared() {
+      return run?.shared ?? false;
+    },
+    get transport() {
+      return run ? run.transport : waiting;
+    },
+    get mainThread() {
+      return run?.mainThread;
+    },
     settled,
     stop() {
       stopped = true;

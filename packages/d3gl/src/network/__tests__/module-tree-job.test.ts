@@ -130,6 +130,23 @@ describe("deferredLayoutHandle (#428)", () => {
     await expect(handle.settled).rejects.toThrow("run failed");
   });
 
+  // Network.layoutTransport reads the handle: once the run is live it must report the run's transport
+  // (a GPU seed that waited for its tree is still a GPU run), not a fixed copy-mode default.
+  it("reports the transport of the run it starts", async () => {
+    let started: () => void = () => {};
+    const live = new Promise<void>((resolve) => (started = resolve));
+    const handle = deferredLayoutHandle(Promise.resolve(1), () => {
+      started();
+      return { ...run(new Promise<void>(() => {})), shared: true, transport: "gpu" };
+    });
+    expect([handle.shared, handle.transport, handle.mainThread]).toEqual([false, undefined, undefined]);
+    await live;
+    expect([handle.shared, handle.transport]).toEqual([true, "gpu"]);
+    const onMain = deferredLayoutHandle(Promise.resolve(1), () => ({ ...run(Promise.resolve()), mainThread: true }));
+    await onMain.settled;
+    expect(onMain.mainThread).toBe(true);
+  });
+
   it("settles at once when the start declines, or when stopped before it", async () => {
     await deferredLayoutHandle(Promise.resolve(1), () => null).settled;
     const start = vi.fn(() => null);
