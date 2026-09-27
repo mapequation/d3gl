@@ -30,8 +30,8 @@ import { EXACT_MAX } from "../nested-layout.js";
 // with the nested physics of `nested-layout.ts` (the same constants, {@link NESTED}):
 //
 // A solve tick is one stream tick (work items P, F_b, I) in the organise phase and one per collision
-// step in the compact phase, so every item stays within the frame budget at any N — the collision gather
-// is the heaviest pass and is cut into row bands like the repulsion:
+// step in the compact phase. The heaviest pass, the collision gather, is cut into row bands like the
+// repulsion (one unsliced compact tick was 29 ms at 1M):
 //
 // | stream tick                 | P                                                    | F_b                    | I                  |
 // |-----------------------------|------------------------------------------------------|------------------------|--------------------|
@@ -41,6 +41,14 @@ import { EXACT_MAX } from "../nested-layout.js";
 //
 // The composition (`passes/nested-compose.ts`) maps the local solutions into world discs and packs leaf
 // positions and module discs in node order, for the streaming readback ({@link prepareReadback}).
+//
+// Not every item fits the frame budget. Two cannot be cut: compact step 1's P (4.2 ms at 325k, 7.3 ms at
+// 1M on an M1 Max) and the composition a copy frame adds (2.7-5.6 / 4.5-9.9 ms), which the frame reserves
+// but which never stops its first item. So a copy frame can carry up to ~12 ms of layout GPU work at 325k
+// and ~17 ms at 1M, against a 10 ms budget at 60 Hz (5 ms at 120 Hz). A large module whose radii are
+// heavy-tailed makes both the gather and P grow as k² (every grid slot on the exact loop; the count and
+// round scatters contending at hundreds of discs per cell): one 60,000-child module takes a 55 ms gather
+// and a 12 ms P, and no band count fixes P.
 //
 // Not the CPU's: Jacobi instead of Gauss-Seidel links and collision pairs (every term reads one state),
 // and grid-pyramid Barnes-Hut instead of the CPU's adaptive quadtree for segments above 32 children (the
