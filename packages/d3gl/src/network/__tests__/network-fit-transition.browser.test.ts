@@ -14,7 +14,8 @@ import { easeCubicInOut } from "../transition.js";
  *      exact box; nothing moves at the `layout()` call itself;
  *   2. a real wheel gesture, an explicit `setTransform` or a node grab mid-transition hands the view to
  *      the user for good, while the camera's own moves never count as a gesture (#309);
- *   3. a layout landed in one go (`"positions"`, `"force"`) is framed once, as it lands;
+ *   3. a layout landed in one go (`"positions"`, `"force"`, a warm nested map without a transition) is
+ *      framed once, as it lands — a worker's still-solving map keeps the view it had until then;
  *   4. a cold nested map streamed depth by depth frames a box its final layout is known to lie in — so
  *      the camera only zooms in as depths land (#324) — and settles on the leaves' exact box, like a flat
  *      layout, instead of the root disc it used to keep (fill 0.53 in the Navigator).
@@ -130,21 +131,83 @@ async function until(done: () => boolean, maxMs = 5000): Promise<void> {
   while (!done() && performance.now() - t0 < maxMs) await sleep(10);
 }
 
+/**
+ * Frames stepped by hand on a virtual clock: `requestAnimationFrame` queues, {@link Stepper.step} advances
+ * the clock by `ms` and runs the queued frames, so each transition frame's eased progress is known exactly
+ * and every frame is seen, however fast the machine paints.
+ */
+interface Stepper {
+  step(ms: number): void;
+  restore(): void;
+}
+function stepper(): Stepper {
+  const realRaf = globalThis.requestAnimationFrame;
+  const realCaf = globalThis.cancelAnimationFrame;
+  const queue = new Map<number, FrameRequestCallback>();
+  let id = 0;
+  globalThis.requestAnimationFrame = (cb) => (queue.set(++id, cb), id);
+  globalThis.cancelAnimationFrame = (i) => void queue.delete(i);
+  let clock = 0;
+  const now = vi.spyOn(performance, "now").mockImplementation(() => clock);
+  return {
+    step(ms) {
+      clock += ms;
+      const due = [...queue.values()];
+      queue.clear();
+      for (const cb of due) cb(clock);
+    },
+    restore() {
+      now.mockRestore();
+      globalThis.requestAnimationFrame = realRaf;
+      globalThis.cancelAnimationFrame = realCaf;
+    },
+  };
+}
+
 interface Sample {
   positions: Float32Array;
   view: ViewTransform;
 }
-/** Record the positions and the view once per animation frame until `stop()`. */
-function sampler(net: ProbeNetwork, graph: NetworkGraph): { samples: Sample[]; stop(): void } {
+/**
+ * Step `frames` by `ms` until `net`'s layout settles, recording the positions and the view after each step,
+ * then step once more for the settle's repaint. Real time passes between steps, so a worker computing the
+ * target posts its result meanwhile; the transition itself runs on the virtual clock alone, so each of its
+ * frames is stepped, and recorded, exactly once.
+ */
+async function stepUntilSettled(net: ProbeNetwork, graph: NetworkGraph, frames: Stepper, ms: number, maxSteps = 4000): Promise<Sample[]> {
+  let settled = false;
+  void net.whenSettled().then(() => void (settled = true));
   const samples: Sample[] = [];
-  let on = true;
-  const tick = (): void => {
-    if (!on) return;
+  for (let i = 0; i < maxSteps && !settled; i++) {
+    frames.step(ms);
     samples.push({ positions: graph.positions.slice(), view: net.camera });
-    requestAnimationFrame(tick);
-  };
-  requestAnimationFrame(tick);
-  return { samples, stop: () => void (on = false) };
+    await sleep(1); // a worker's message, and the settle's microtasks, run here
+  }
+  expect(settled, "the layout never settled").toBe(true);
+  frames.step(ms);
+  return samples;
+}
+
+/** Whether `a` and `b` hold the same values. */
+const same = (a: Float32Array, b: Float32Array): boolean => a.length === b.length && a.every((v, i) => v === b[i]);
+
+/**
+ * The re-cluster fixture (the Navigator's RELAYOUT): 8 nodes in two top modules, laid out small and off
+ * centre under a zoomed-out view, and the pairwise re-clustering to switch them to.
+ */
+async function reclusterFixture(net: ProbeNetwork): Promise<{ graph: NetworkGraph; pairs: ModuleNode[] }> {
+  const graph = buildGraph({ nodeCount: 8, source: [0, 2, 0, 4, 6, 4, 5, 3], target: [1, 3, 2, 5, 7, 6, 7, 4], directed: true });
+  const modules: ModuleNode[] = [
+    { id: 0, path: [1, 1, 1] }, { id: 1, path: [1, 1, 2] }, { id: 2, path: [1, 2, 1] }, { id: 3, path: [1, 2, 2] },
+    { id: 4, path: [2, 1] }, { id: 5, path: [2, 2] }, { id: 6, path: [2, 3] }, { id: 7, path: [2, 4] },
+  ];
+  const pairs: ModuleNode[] = modules.map(({ id }) => ({ id, path: [Math.floor(id / 2) + 1, (id % 2) + 1] }));
+  const positions = new Float32Array([20, 20, 40, 20, 20, 40, 40, 40, 140, 140, 160, 140, 140, 160, 160, 160]);
+  net.data(graph, { modules }).lod(false).enableZoom([0.001, 100]).layout({ backend: "positions", positions });
+  net.setTransform({ k: 0.4, x: 150, y: 100 }); // zoomed out, off-centre: the map is small and not framed
+  await nextFrame();
+  await nextFrame();
+  return { graph, pairs };
 }
 
 /** Where `sample` sits on the straight path `from → to`: one common fraction for every node, or NaN. */
@@ -179,79 +242,109 @@ describe("fit + transition: the camera eases along with the nodes (#427)", () =>
     net.data(graph).style({ nodeRadius: 3, sizeMode: "screen" }).enableZoom([0.001, 100]);
     net.layout({ backend: "positions", positions: a, fit: true });
     expectFramed(a, net.camera); // no transition: framed once, as it lands
-    await nextFrame(); // let the first paint land: a transition is timed, so a stalled first frame would skip it
-    await nextFrame();
 
     const start = net.camera;
     const b = moved(a, 2, 300, -120); // twice the extent, elsewhere
-    const rec = sampler(net, graph);
-    net.layout({ backend: "positions", positions: b, transition: 1000, fit: true });
-    expect(net.camera).toEqual(start); // nothing jumps at the call
-    await net.whenSettled();
-    await nextFrame();
-    rec.stop();
-    const end = net.camera;
+    const D = 1000;
+    const STEP = 50;
+    const frames = stepper();
+    try {
+      net.layout({ backend: "positions", positions: b, transition: D, fit: true }); // starts at clock 0
+      expect(net.camera).toEqual(start); // nothing jumps at the call
+      const samples = await stepUntilSettled(net, graph, frames, STEP, (2 * D) / STEP);
+      const end = net.camera;
 
-    expectFramed(b, end);
-    expect(zoomTransform(host)).toMatchObject(end); // d3-zoom kept in step with the camera
-    expect(net.interactingCalls, "the camera's own moves ran a gesture boundary").toBe(0);
+      expectFramed(b, end);
+      expect(zoomTransform(host)).toMatchObject(end); // d3-zoom kept in step with the camera
+      expect(net.interactingCalls, "the camera's own moves ran a gesture boundary").toBe(0);
 
-    const moving = rec.samples.filter((s) => {
-      const f = pathFraction(s.positions, a, b);
-      return f > 1e-4 && f < 1 - 1e-4;
-    });
-    // A handful is enough to show it eased: a loaded machine paints few frames (the checks below hold on each).
-    expect(moving.length, "no intermediate frame — it jumped instead of easing").toBeGreaterThanOrEqual(3);
-    let prevK = start.k;
-    for (const s of rec.samples) {
-      const fp = pathFraction(s.positions, a, b);
-      expect(Number.isFinite(fp), "an off-path position frame").toBe(true);
-      // The camera is exactly as far along its path as the nodes are along theirs: same ease, same frame.
-      expect(cameraFraction(s.view, start, end)).toBeCloseTo(fp, 3);
-      expect(s.view.k).toBeLessThanOrEqual(prevK + 1e-12); // zooms out monotonically onto the larger map
-      prevK = s.view.k;
-      expect(framingOf(s.positions, s.view).allInside, "a node left the screen mid-transition").toBe(true);
+      // Every frame of the ease is seen, the last one included: the virtual clock steps each one.
+      expect(samples).toHaveLength(D / STEP);
+      let prevK = start.k;
+      samples.forEach((s, i) => {
+        const fp = pathFraction(s.positions, a, b);
+        expect(fp, `frame ${i + 1} is not at the transition's eased progress`).toBeCloseTo(easeCubicInOut(((i + 1) * STEP) / D), 4);
+        // The camera is exactly as far along its path as the nodes are along theirs: same ease, same frame.
+        expect(cameraFraction(s.view, start, end)).toBeCloseTo(fp, 3);
+        expect(s.view.k).toBeLessThanOrEqual(prevK + 1e-12); // zooms out monotonically onto the larger map
+        prevK = s.view.k;
+        expect(framingOf(s.positions, s.view).allInside, "a node left the screen mid-transition").toBe(true);
+      });
+    } finally {
+      frames.restore();
+      net.destroy();
     }
-    net.destroy();
   });
 
   it("a warm nested re-cluster eases the camera from where it is to the new map (the Navigator's RELAYOUT)", async () => {
-    const { net } = await engine();
-    const g = buildGraph({ nodeCount: 8, source: [0, 2, 0, 4, 6, 4, 5, 3], target: [1, 3, 2, 5, 7, 6, 7, 4], directed: true });
-    const MODULES: ModuleNode[] = [
-      { id: 0, path: [1, 1, 1] }, { id: 1, path: [1, 1, 2] }, { id: 2, path: [1, 2, 1] }, { id: 3, path: [1, 2, 2] },
-      { id: 4, path: [2, 1] }, { id: 5, path: [2, 2] }, { id: 6, path: [2, 3] }, { id: 7, path: [2, 4] },
-    ];
-    const PAIRS: ModuleNode[] = MODULES.map(({ id }) => ({ id, path: [Math.floor(id / 2) + 1, (id % 2) + 1] }));
-    const POSITIONS = new Float32Array([20, 20, 40, 20, 20, 40, 40, 40, 140, 140, 160, 140, 140, 160, 160, 160]);
-    net.data(g, { modules: MODULES }).lod(false).layout({ backend: "positions", positions: POSITIONS });
-    net.setTransform({ k: 0.4, x: 150, y: 100 }); // zoomed out, off-centre: the map is small and not framed
-    await nextFrame();
-    await nextFrame();
-
+    const { net, host } = await engine();
+    const { graph, pairs } = await reclusterFixture(net);
     const start = net.camera;
-    const from = g.positions.slice();
-    net.data(g, { modules: PAIRS });
-    const rec = sampler(net, g);
-    net.layout({ backend: "worker", nested: { warm: true }, transition: 800, fit: true });
-    await net.whenSettled();
-    await nextFrame();
-    rec.stop();
-    const to = g.positions.slice();
-    const end = net.camera;
+    const from = graph.positions.slice();
+    net.data(graph, { modules: pairs });
+    const D = 800;
+    const STEP = 50;
+    const frames = stepper();
+    try {
+      net.layout({ backend: "worker", nested: { warm: true }, transition: D, fit: true });
+      expect(net.camera).toEqual(start); // nothing jumps at the call
+      const samples = await stepUntilSettled(net, graph, frames, STEP);
+      const to = graph.positions.slice();
+      const end = net.camera;
 
-    expectFramed(to, end);
-    expect(end.k).toBeGreaterThan(start.k);
-    let prevK = start.k;
-    for (const s of rec.samples) {
-      const fp = pathFraction(s.positions, from, to);
-      expect(Number.isFinite(fp), "an off-path position frame").toBe(true);
-      expect(cameraFraction(s.view, start, end)).toBeCloseTo(fp, 3); // still at `start` while the worker solves
-      expect(s.view.k).toBeGreaterThanOrEqual(prevK - 1e-12);
-      prevK = s.view.k;
+      expectFramed(to, end);
+      expect(end.k).toBeGreaterThan(start.k);
+      expect(zoomTransform(host)).toMatchObject(end);
+      expect(net.interactingCalls, "the camera's own moves ran a gesture boundary").toBe(0);
+      let prevK = start.k;
+      for (const s of samples) {
+        const fp = pathFraction(s.positions, from, to);
+        expect(Number.isFinite(fp), "an off-path position frame").toBe(true);
+        expect(cameraFraction(s.view, start, end)).toBeCloseTo(fp, 3); // still at `start` while the worker solves
+        expect(s.view.k).toBeGreaterThanOrEqual(prevK - 1e-12);
+        prevK = s.view.k;
+      }
+      // Once the target lands, each frame of the ease is stepped and seen, every one but the last mid-way.
+      const easing = samples.filter((s) => {
+        const f = pathFraction(s.positions, from, to);
+        return f > 0 && f < 1;
+      });
+      expect(easing.length, "the camera jumped instead of easing").toBe(D / STEP - 1);
+    } finally {
+      frames.restore();
+      net.destroy();
     }
-    expect(rec.samples.some((s) => cameraFraction(s.view, start, end) > 0.05 && cameraFraction(s.view, start, end) < 0.95), "the camera jumped instead of easing").toBe(true);
-    net.destroy();
+  });
+
+  it("a warm nested re-cluster without a transition holds the camera while the worker solves, then frames the map once as it lands", async () => {
+    const { net, host } = await engine();
+    const { graph, pairs } = await reclusterFixture(net);
+    const start = net.camera;
+    const from = graph.positions.slice();
+    net.data(graph, { modules: pairs });
+    const frames = stepper();
+    try {
+      net.layout({ backend: "worker", nested: { warm: true }, fit: true });
+      expect(net.camera, "the camera moved at the call: it framed the layout being replaced").toEqual(start);
+      const samples = await stepUntilSettled(net, graph, frames, 16);
+      const to = graph.positions.slice();
+      const end = net.camera;
+
+      expect(same(from, to), "non-vacuity: the re-cluster moved no node").toBe(false);
+      expectFramed(to, end);
+      expect(zoomTransform(host)).toMatchObject(end);
+      expect(net.interactingCalls).toBe(0);
+      // Each frame shows the old map at the old view (the worker still solving) or the new map framed: the
+      // camera never moves before the map lands, and frames it in one step, on its exact box.
+      for (const s of samples) {
+        const landed = same(s.positions, to);
+        expect(landed || same(s.positions, from), "a frame between the two maps").toBe(true);
+        expect(s.view).toEqual(landed ? end : start);
+      }
+    } finally {
+      frames.restore();
+      net.destroy();
+    }
   });
 });
 
@@ -321,38 +414,6 @@ describe("fit + transition: the user takes the view over, the camera's own moves
     net.destroy();
   });
 });
-
-/**
- * Frames stepped by hand on a virtual clock: `requestAnimationFrame` queues, {@link Stepper.step} advances
- * the clock by `ms` and runs the queued frames, so each transition frame's eased progress is known exactly.
- */
-interface Stepper {
-  step(ms: number): void;
-  restore(): void;
-}
-function stepper(): Stepper {
-  const realRaf = globalThis.requestAnimationFrame;
-  const realCaf = globalThis.cancelAnimationFrame;
-  const queue = new Map<number, FrameRequestCallback>();
-  let id = 0;
-  globalThis.requestAnimationFrame = (cb) => (queue.set(++id, cb), id);
-  globalThis.cancelAnimationFrame = (i) => void queue.delete(i);
-  let clock = 0;
-  const now = vi.spyOn(performance, "now").mockImplementation(() => clock);
-  return {
-    step(ms) {
-      clock += ms;
-      const due = [...queue.values()];
-      queue.clear();
-      for (const cb of due) cb(clock);
-    },
-    restore() {
-      now.mockRestore();
-      globalThis.requestAnimationFrame = realRaf;
-      globalThis.cancelAnimationFrame = realCaf;
-    },
-  };
-}
 
 describe("fit + transition: the destination follows the viewport and the glyph pad (#427)", () => {
   // The camera heads for the view framing the target in the viewport and with the glyph pad as they are
