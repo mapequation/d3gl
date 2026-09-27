@@ -384,7 +384,8 @@ per-file timeout. Every at-scale leg below now asserts. When you add a guard, ad
 | GPU layout tick (+ #349 signatures: no draw of ≥ N vertices × instances into a 1×1 viewport, via any of the five WebGL2 draw calls; zero texture / framebuffer / buffer creation per tick); hub springs (#350): hub rows in web-NotreDame's shape, scaled with N (0.52% of rows, its five > 4096 hubs, chunk count K ≥ N/30), tick ≤ 2× a hub-free twin with the same edges, and exactly one extra draw (the chunk pass, K fragments) with no per-tick allocation; tile pyramid (#354): one scatter into the L0 atlas and one reduce per coarser level, each rasterising exactly its level's rectangle of the packed Podd / Peven textures (draws are attributed by texture identity, never by size: for N in (W² − W, W²], W a power of two, the slot atlas is W × W, the size of L0) | **WebGL** | `network/gpu/__tests__/gpu-frame-budget-perf.browser.test.ts` | 30k | `PERF_BROWSER_N` (max 200k) |
 | GPU layout tick sliced into row bands (#352): 4 bands per tick bitwise equal to the unsliced tick (hub rows included), 12 scissored force draws, no allocation per band | **WebGL** | `network/gpu/__tests__/gpu-frame-budget-perf.browser.test.ts` | 30k | `PERF_BROWSER_N` (max 200k) |
 | GPU layout **streaming** through `network().layout({ backend: "gpu" })`, LOD off **and** on (#352): transport-only main thread per frame (p95 ceiling `c0 + c1·N`), encode median ≤ 2.5 ms; every streaming `readPixels` into a bound PBO; every `getBufferSubData` after a fence inserted after its copy was seen signalled; within a frame the harvest precedes every layout draw; exactly one fence per frame; no GPU object created per streamed frame; repaints ≥ 48 ms apart; `settled` after the final tick's harvest; ticks/s floored against the GPU-only rate. **Node drag** on the same engine (a real pointer drag of the settled layout, LOD off **and** on): the same transport bounds and GL signatures over the held and re-cool frames, no GPU object created, `setPinned` once per pointer move and held-position writes at most once per tick, each over the held set (O(held)), ticks and repaints while held | **WebGL** | `network/gpu/__tests__/gpu-stream-perf.browser.test.ts` | 100k | `PERF_BROWSER_N` (max 1M) |
-| GPU **nested** layout streaming through `network().data(g, { modules }).layout({ backend: "gpu", nested })`, LOD off **and** on (#355): transport-only main thread per frame (p95 ceiling `c0 + c1·N`), encode median ≤ 2.5 ms; every streaming `readPixels` into a PBO, every harvest after its copy's fence signalled, one fence per frame, the harvest before the frame's layout draws, no GPU object created per streamed frame, no draw of ≥ N points into a 1×1 viewport, `settled` after the final stream tick's harvest; repaints ≥ 48 ms apart; stream ticks/s (LOD off) floored against the same solve's GPU-only rate. Per solve tick: no allocation (ticks and readbacks), and a collision step draws exactly one count scatter and 8 round scatters of N points | **WebGL** | `network/gpu/__tests__/gpu-nested-perf.browser.test.ts` | 20k leaves | `PERF_BROWSER_N` (max 1M) |
+| GPU **nested** layout streaming through `network().data(g, { modules }).layout({ backend: "gpu", nested })`, LOD off **and** on (#355): transport-only main thread per frame (p95 ceiling `c0 + c1·N`), encode median ≤ 2.5 ms; every streaming `readPixels` into a PBO, every harvest after its copy's fence signalled, one fence per frame, the harvest before the frame's layout draws, no GPU object created per streamed frame, no draw of ≥ N points into a 1×1 viewport, `settled` after the final stream tick's harvest; repaints ≥ 48 ms apart; stream ticks/s (LOD off) floored against the same solve's GPU-only rate. Per solve tick: no allocation (ticks, a readback whole and one cut into bands), and a collision step draws exactly one count scatter and 8 round scatters of N points whole, 27 covering every slot once per pass in 3 bands (#382) | **WebGL** | `network/gpu/__tests__/gpu-nested-perf.browser.test.ts` | 20k leaves | `PERF_BROWSER_N` (max 1M) |
+| GPU layout **per-frame GPU budget** at 1M-equivalent (#382): the nested plan of a 1,000,000-leaf map (`nestedPlanSizes`) streamed through the real `StreamSchedule` and `FrameBudget` (fake fences) for a whole cold layout with readbacks, at 60 and 120 Hz — every frame's estimated GPU work ≤ the budget (copy frames included), every band ≤ half the budget (≤ the budget for a pass whose bands wait on a long fragment), no tick band between a readback's passes and its copy; `stageBands` and the band growth; the schedule's items (a band each, a pass's band count fixed at its first band, a readback exclusive over frames); every pass of a nested tick and readback cut into 1-7 bands bitwise equal to unsliced, and a readback between any two bands leaves the solve bitwise unchanged | — / **WebGL** | `network/gpu/__tests__/nested-frame-budget.test.ts`, `stream-schedule.test.ts`, `frame-budget.test.ts`; `gpu-nested-layout.browser.test.ts` | 1M (deterministic, node) | — |
 | GPU streaming readback `AsyncPositionReadback` (#352), `RG/FLOAT` and packed `RGBA/FLOAT`: exact positions and stats, both PBOs `STREAM_READ`, one `readPixels` per PBO per copy (into the PBO), no allocation per readback, copy and harvest main-thread ceilings, a non-finite layout refused without touching positions | **WebGL** | `network/gpu/__tests__/gpu-async-readback-perf.browser.test.ts` | 1M | `PERF_BROWSER_N` (max 4M) |
 | GPU layout position readback through `GpuForceLayout.readPositions`, `RGBA/FLOAT` (a device that refuses `RG/FLOAT`) and `RG/FLOAT` (#351): exact positions, no GPU allocation and one `readPixels` per readback, one retained RGBA scratch | **WebGL** | `network/gpu/__tests__/gpu-readback-perf.browser.test.ts` | 1M | `PERF_BROWSER_N` (max 4M) |
 | React recolor vs build | **WebGL** | `react/perf.browser.test.ts` | 4096 | capped at 8192 — see below |
@@ -589,8 +590,8 @@ previous build — while every SwiftShader test stayed green, because SwiftShade
 
 ## GPU nested layout: dead passes hide behind complete fallbacks; fence what you time (#355)
 
-The nested layout solves every module at once on the GPU (`network/gpu/gpu-nested-layout.ts`). Four things
-cost time while building it:
+The nested layout solves every module at once on the GPU (`network/gpu/gpu-nested-layout.ts`). Five things
+cost time while building it and slicing it into bands (#382):
 
 - **A texture bound to any active sampler of a program while it is that draw's render target is a feedback
   loop, and WebGL drops the draw** — even when the shader's branch never reads that sampler at run time
@@ -619,8 +620,23 @@ cost time while building it:
     still takes 5.5 s (the CPU: 298 s), but frames stall up to 157 ms in the compact phase.
   - **Do not fix that with more bands.** Sizing the gather's bands from its worst case (Σ k² pair tests at
     16 ps each) removed the stalls (worst rAF gap 16 ms) but took the 60k map from 5.5 s to 39.5 s: P
-    cannot be sliced, so it still overran its frame, and the fence controller then throttled the stream
-    to one item per frame. Occupancy is the problem; bound it (radius classes), then the budget holds.
+    could not be sliced then, so it still overran its frame, and the fence controller throttled the stream
+    to one item per frame. Every pass is sliceable now (#382), but no band count shortens one fragment:
+    a large slot, or one next to an overflowing cell, loops over its whole module (~0.3 µs per sibling), and
+    **every band waits for its longest fragment** — at 1M (largest module 6,643) the gather took 8.2 ms
+    whole, 9.5 in 2 bands, 12.5 in 4, 17.1 in 16. `nested-plan.ts` charges that tail to every band, and
+    `stageBands` then sizes the gather's bands to the whole budget rather than half of it. Occupancy is the
+    problem; bound it (radius classes, #380), then the budget holds for any module.
+- **Time GPU work on a shared machine with timer queries, and filter the contention.** Headless Chromium
+  exposes `EXT_disjoint_timer_query_webgl2` with `--enable-privileged-webgl-extensions`. A query — or a
+  fence — spans other processes' GPU work and the GPU process's scheduling gaps: at load average 35-45 a
+  lone 4 ms gather read 12-15 ms per streamed frame, and every pass ~2.4× its quiet cost. The solve is
+  deterministic, so time each pass isolated (drain, query, drain) over R runs of the same layout and take
+  the minimum per (tick, pass); compare two builds interleaved, never against numbers from another hour.
+  Do not sum isolated items into frames to compare schedules: each isolated item pays the drain and the
+  contention again, so a schedule of many small items looks heavier than one of few large ones.
+  A stage timed by repeating it on one state is wrong for the collision: repeating the springs drifts the
+  positions, and the gather's cost depends on how many cells overflow.
 - **Row-major slots put different segments in one SIMD group, and it costs.** The slot atlas is
   `⌈√slots⌉` wide, so a 2×2 quad or a SIMD group spans rows that are hundreds of slots apart: different
   segments, with different loop lengths (exact loop, tile walk, collision fallback). Measured on the real
