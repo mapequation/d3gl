@@ -684,6 +684,8 @@ const MORTON_STEPS = 1 << MORTON_BITS;
  * build used — it returns `prev` itself while every position still lies inside it and the layout still
  * fills more than an eighth of its side, so a streamed layout rebuilds over the **same cells** frame to
  * frame (only their membership changes) and an aggregate can be found again by its cell. O(count).
+ * A non-finite coordinate (NaN, or ±Infinity from a diverged layout) is left out of the box and clamped
+ * into an edge cell by the build, so one diverged node cannot collapse every other into a single cell.
  */
 export function mortonRootBox(positions: ArrayLike<number>, count: number, prev?: MortonBox): MortonBox {
   let minX = Infinity;
@@ -693,10 +695,15 @@ export function mortonRootBox(positions: ArrayLike<number>, count: number, prev?
   for (let i = 0; i < count; i++) {
     const x = positions[i * 2]!;
     const y = positions[i * 2 + 1]!;
-    if (x < minX) minX = x;
-    if (x > maxX) maxX = x;
-    if (y < minY) minY = y;
-    if (y > maxY) maxY = y;
+    // `v > -Infinity && v < Infinity` is false for NaN and both infinities.
+    if (x > -Infinity && x < Infinity) {
+      if (x < minX) minX = x;
+      if (x > maxX) maxX = x;
+    }
+    if (y > -Infinity && y < Infinity) {
+      if (y < minY) minY = y;
+      if (y > maxY) maxY = y;
+    }
   }
   if (!(maxX >= minX) || !(maxY >= minY)) return prev ?? { x0: 0, y0: 0, side: 1 }; // no finite position
   const span = Math.max(maxX - minX, maxY - minY);

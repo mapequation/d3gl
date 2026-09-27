@@ -199,6 +199,27 @@ describe("mortonRootBox (#343)", () => {
     const shrunk = pos.map((v) => v / 64);
     expect(mortonRootBox(shrunk, n, box).side).toBeLessThan(box.side);
   });
+
+  it("ignores infinite coordinates like NaN ones: a diverged node lands in an edge cell, the tree still splits", () => {
+    const n = 2000;
+    const pos = clusteredCloud(n);
+    const finite = mortonRootBox(pos, n);
+    pos[0] = Infinity;
+    pos[3] = -Infinity;
+    pos[5] = NaN;
+    const box = mortonRootBox(pos, n);
+    expect(Number.isFinite(box.x0) && Number.isFinite(box.y0) && Number.isFinite(box.side)).toBe(true);
+    expect(box.side).toBeLessThanOrEqual(finite.side);
+    const tree = buildMortonLODTree(pos, n, { box });
+    // No bottom cell swallowed the graph: every node holds at most the bucket's worth of leaf children.
+    let largest = 0;
+    for (let g = n; g < tree.size; g++) {
+      let leaves = 0;
+      for (let p = tree.childOffset[g]!; p < tree.childOffset[g + 1]!; p++) if (tree.children[p]! < n) leaves++;
+      largest = Math.max(largest, leaves);
+    }
+    expect(largest).toBeLessThanOrEqual(8);
+  });
 });
 
 describe("findMortonCell (#343)", () => {
