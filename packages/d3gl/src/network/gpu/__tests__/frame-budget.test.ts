@@ -15,6 +15,7 @@ import {
   type FenceSource,
   type FenceStatus,
 } from "../frame-budget.js";
+import { StreamSchedule, type StageCost, type StreamStage } from "../stream-schedule.js";
 
 /** Fences numbered in insertion order; everything up to `signaledThrough` has signalled. */
 class FakeFences implements FenceSource<number> {
@@ -50,9 +51,11 @@ interface Rig {
   budget: FrameBudget<number>;
   /** rAF timestamp of the next frame. */
   now: number;
-  /** A flat force pass of `nodes` nodes over `rows` atlas rows: its estimated GPU time (the flat model). */
-  forceMs: number;
-  rows: number;
+  /** A flat force pass of `nodes` nodes over `rows` atlas rows (the flat model): what the items are bands of. */
+  pass: StageCost;
+  /** The next band of {@link pass}, and its band count (fixed at its first band). */
+  band: number;
+  bands: number;
 }
 
 function rig(opts: { nodes?: number; rows?: number; budgetMs?: number; encodeCapMs?: number } = {}): Rig {
@@ -62,17 +65,23 @@ function rig(opts: { nodes?: number; rows?: number; budgetMs?: number; encodeCap
     ...(opts.budgetMs !== undefined ? { budgetMs: opts.budgetMs } : {}),
     ...(opts.encodeCapMs !== undefined ? { encodeCapMs: opts.encodeCapMs } : {}),
   });
-  return { fences, clock, budget, now: 0, forceMs: itemCostMs("force", opts.nodes ?? 1_000, 1), rows: opts.rows ?? 64 };
+  // Default: an 8 ms force pass (200k nodes): 2 bands at a 10 ms budget, which the band growth can cut finer.
+  const pass = { costMs: itemCostMs("force", opts.nodes ?? 200_000), fixedMs: 0, rows: opts.rows ?? 448 };
+  return { fences, clock, budget, now: 0, pass, band: 0, bands: 1 };
 }
 
 /** The bands the rig's force pass would be cut into if it started now. */
 function bands(r: Rig): number {
-  return r.budget.bandsFor(r.forceMs, r.rows);
+  return r.budget.bandsFor(r.pass.costMs, r.pass.rows);
 }
+
+/** A pass of one row: it always runs whole, so no band growth can cut it. */
+const WHOLE: StageCost = { costMs: 1, fixedMs: 0, rows: 1 };
 
 /**
  * One animation frame: poll fences, then encode items while the controller admits them (each costs
  * `costMs` of estimated GPU time and `encodeMs` of main thread), then insert the frame's budget fence.
+ * `sliceable`: the items are consecutive bands of the rig's pass (else each is a whole one-row pass).
  * Returns the number of items encoded.
  */
 function frame(
@@ -85,7 +94,13 @@ function frame(
   if (r.budget.open()) {
     while (r.budget.admit(costMs)) {
       r.clock.t += encodeMs;
-      r.budget.spent(costMs, sliceable);
+      if (sliceable) {
+        if (r.band === 0) r.bands = bands(r);
+        r.budget.spent(costMs, r.pass, r.band, r.bands);
+        r.band = (r.band + 1) % r.bands;
+      } else {
+        r.budget.spent(costMs, WHOLE, 0, 1);
+      }
       items++;
     }
   }
@@ -363,17 +378,13 @@ describe("FrameBudget budget: min(budgetMs, 0.6 × median rAF interval)", () => 
 describe("stageBands: every pass is cut into bands of at most half the budget (#382)", () => {
   it("cuts a pass into bands of about half the budget, at most its rows", () => {
     // ≈ 40 ns per node for the whole flat force pass (M1 Max): 325k → 13 ms → 3 bands of 5 ms at a 10 ms budget.
-    expect(stageBands(itemCostMs("force", 325_729, 1), 10, 571)).toBe(3);
-    expect(stageBands(itemCostMs("force", 1_000_000, 1), 10, 1000)).toBe(8);
-    expect(stageBands(itemCostMs("force", 1_000, 1), 10, 32)).toBe(1);
-    expect(stageBands(itemCostMs("force", 1_000_000, 1), 5, 1000)).toBe(16); // 120 Hz halves the budget
-    expect(stageBands(itemCostMs("force", 1_000_000, 1), 10, 4)).toBe(4); // never more bands than rows
+    expect(stageBands(itemCostMs("force", 325_729), 10, 571)).toBe(3);
+    expect(stageBands(itemCostMs("force", 1_000_000), 10, 1000)).toBe(8);
+    expect(stageBands(itemCostMs("force", 1_000), 10, 32)).toBe(1);
+    expect(stageBands(itemCostMs("force", 1_000_000), 5, 1000)).toBe(16); // 120 Hz halves the budget
+    expect(stageBands(itemCostMs("force", 1_000_000), 10, 4)).toBe(4); // never more bands than rows
     expect(stageBands(1_000, 10, 1_000_000)).toBe(64); // never more than MAX_BANDS
     expect(stageBands(0, 10, 100)).toBe(1);
-    // A solver's own model: the nested collision gather, 13 ns per leaf — 13 ms at 1M → 3 bands of ≤ 5 ms.
-    const nested = { prep: 10, force: 13, integrate: 4 };
-    expect(itemCostMs("force", 1_000_000, 4, nested)).toBeCloseTo(13 / 4, 9);
-    expect(stageBands(itemCostMs("force", 1_000_000, 1, nested), 10, 1000)).toBe(3);
   });
 
   it("leaves room for what every band pays whatever its size", () => {
@@ -400,10 +411,49 @@ describe("stageBands: every pass is cut into bands of at most half the budget (#
     expect(stageBands(55, 10, 1_000, 1, 18)).toBe(Math.ceil(55 / 2.5));
   });
 
+  it("switches to bands of the whole budget exactly where a half-budget band would carry more fixed than divisible work", () => {
+    // At 5 ms a half-budget band is 2.5 ms: with f ≤ 1.25 ms its divisible part 2.5 − f is at least f.
+    // Past that, most of every such band would be the fixed cost paid again, so the bands aim at 5 ms.
+    expect(stageBands(9, 5, 1_000, 1, 1.25)).toBe(Math.ceil(9 / 1.25)); // 2.5 − 1.25 = 1.25 of work per band
+    expect(stageBands(9, 5, 1_000, 1, 1.26)).toBe(Math.ceil(9 / (5 - 1.26)));
+    for (const f of [0, 0.3, 0.9, 1.25]) {
+      const b = stageBands(9, 5, 1_000, 1, f);
+      // Half-budget bands: each within 2.5 ms, and the fixed cost it repeats at most its divisible work.
+      expect(f + 9 / b).toBeLessThanOrEqual(2.5 + 1e-9);
+      expect(f).toBeLessThanOrEqual(2.5 - f + 1e-9);
+    }
+  });
+
   it("scales the estimate by the band growth, so a pass far below half the budget stays one band", () => {
     expect(stageBands(4, 10, 317, 8)).toBe(7); // ⌈8 · 4 / 5⌉
-    expect(stageBands(itemCostMs("force", 325_729, 1), 10, 571, 2)).toBe(6);
+    expect(stageBands(itemCostMs("force", 325_729), 10, 571, 2)).toBe(6);
     expect(stageBands(0.05, 10, 1_000, 8)).toBe(1); // a 0.05 ms pass: one band however slow the GPU
+  });
+
+  it("never lets the growth cut a pass into bands that carry less divisible work than fixed", () => {
+    // The nested collision gather at 1M: 9 ms of work, and each band waits ~2.09 ms for its longest
+    // fragment. The budget asks for 4 bands at 60 and 120 Hz; a fifth band would carry 1.8 ms of work for
+    // 2.09 ms of tail, so no growth adds one (at g = 8 it would be 25 bands, ~61 ms per gather).
+    for (const budget of [10, 5]) {
+      for (const g of [1, 2, 4, 8]) expect(stageBands(9, budget, 1_000, g, 2.09), `${budget} ms, g = ${g}`).toBe(4);
+    }
+    // At 325k (2.93 ms of work, 1.48 ms of tail): one band, whatever the growth.
+    for (const g of [1, 2, 4, 8]) expect(stageBands(2.93, 5, 1_000, g, 1.48)).toBe(1);
+    // A pass whose fixed cost is small keeps growing: the nested repulsion at 1M (6.2 ms, 0.2 ms per band).
+    expect(stageBands(6.2, 10, 1_000, 1, 0.2)).toBe(2);
+    expect(stageBands(6.2, 10, 1_000, 8, 0.2)).toBe(11);
+    // Wherever the growth adds bands, each keeps at least its fixed cost in divisible work (B·f ≤ c); it
+    // never takes away the bands the budget itself needs.
+    for (const [cost, fixed] of [[9, 2.09], [4, 1], [30, 0.6], [12, 0.2], [0.5, 0.4], [55, 18], [3, 0.7]] as const) {
+      for (const budget of [10, 5]) {
+        const base = stageBands(cost, budget, 1_000, 1, fixed);
+        for (const g of [2, 4, 8]) {
+          const b = stageBands(cost, budget, 1_000, g, fixed);
+          expect(b).toBeGreaterThanOrEqual(base);
+          if (b > base) expect(b * fixed, `${cost} + ${fixed}/band at ${budget} ms, g = ${g}`).toBeLessThanOrEqual(cost + 1e-9);
+        }
+      }
+    }
   });
 });
 
@@ -458,7 +508,7 @@ describe("FrameBudget band growth: how far every pass's estimate is scaled when 
     expect(r.budget.growth).toBe(1);
   });
 
-  it("halves back, with k, once two items per frame have fit for 30 frames", () => {
+  it("halves back, with k, once two consecutive bands of the pass have fit a frame 30 times", () => {
     const r = rig();
     frame(r);
     frame(r);
@@ -478,8 +528,66 @@ describe("FrameBudget band growth: how far every pass's estimate is scaled when 
       frames++;
     }
     expect(r.budget.growth).toBe(1);
-    expect(r.budget.k).toBe(Math.max(1, Math.floor((kBefore + 1) / 2)));
-    // The hold after the miss (30) + growing k to 2 + 30 frames of ≥ 2 items.
+    // The evidence arrives with the fence poll as the frame begins: k halves there, then grows by one as
+    // that frame's items fill it.
+    expect(r.budget.k).toBe(Math.max(1, Math.floor(kBefore / 2)) + 1);
+    // The hold after the miss (30) + growing k to 2 + 30 frames whose two bands finished in time.
+    expect(frames).toBeGreaterThanOrEqual(30);
+  });
+
+  it("does not grow when the late band's pass is bound by its fixed cost: more bands would only repeat it", () => {
+    // The nested gather at 1M: 4 bands already carry about as much tail as work each.
+    const r = rig();
+    const gather: StageCost = { costMs: 9, fixedMs: 2.09, rows: 1_000 };
+    const gatherFrame = (): void => {
+      r.now += 1000 / 60;
+      r.budget.beginFrame(r.now);
+      if (r.budget.open() && r.budget.admit(4.34)) r.budget.spent(4.34, gather, 0, 4);
+      r.budget.endFrame();
+    };
+    for (let miss = 0; miss < 4; miss++) {
+      gatherFrame();
+      gatherFrame();
+      gatherFrame();
+      gatherFrame();
+      r.fences.catchUp();
+    }
+    expect(r.budget.k).toBe(1);
+    expect(r.budget.growth).toBe(1);
+  });
+
+  it("counts toward halving back only frames that held two consecutive bands of a pass the growth cut finer, on time", () => {
+    const r = rig();
+    frame(r);
+    frame(r);
+    frame(r); // miss 1: k = 1
+    r.fences.catchUp();
+    frame(r);
+    frame(r);
+    frame(r); // miss 2 at k = 1: growth 2 — the pass now runs in 4 bands where 2 would do at growth 1
+    expect(r.budget.growth).toBe(2);
+    r.fences.catchUp();
+    // Frames of several whole passes each fit, and on time — but say nothing about a band twice the size.
+    for (let f = 0; f < 200; f++) {
+      frame(r, { sliceable: false });
+      r.fences.catchUp();
+    }
+    expect(r.budget.growth).toBe(2);
+    // Frames whose consecutive bands of the pass finish a frame late (every fence signals two frames after
+    // its frame: never a miss, since two frames may be in flight) do not count.
+    for (let f = 0; f < 200; f++) {
+      frame(r);
+      r.fences.signaledThrough = r.fences.inserted - 1;
+    }
+    expect(r.budget.growth).toBe(2);
+    // Frames whose consecutive bands finish within the frame do: one band of twice the size fits there too.
+    let frames = 0;
+    while (r.budget.growth === 2 && frames < 200) {
+      frame(r);
+      r.fences.catchUp();
+      frames++;
+    }
+    expect(r.budget.growth).toBe(1);
     expect(frames).toBeGreaterThanOrEqual(30);
   });
 
@@ -526,13 +634,95 @@ describe("FrameBudget band growth: how far every pass's estimate is scaled when 
   });
 });
 
-describe("itemCostMs — the static cost model behind the budget", () => {
-  it("splits the force pass evenly over the bands and scales every item with N", () => {
-    expect(itemCostMs("force", 325_729, 3)).toBeCloseTo(itemCostMs("force", 325_729, 1) / 3, 9);
-    expect(itemCostMs("prep", 650_000, 1)).toBeCloseTo(2 * itemCostMs("prep", 325_000, 1), 9);
+describe("itemCostMs — the flat layout's static cost model behind the budget", () => {
+  it("scales every pass with N", () => {
+    expect(itemCostMs("prep", 650_000)).toBeCloseTo(2 * itemCostMs("prep", 325_000), 9);
+    expect(itemCostMs("force", 1_000_000)).toBeCloseTo(40, 9);
     // At 325k a whole tick is in the measured 14-16 ms range (M1 Max, #349).
-    const tick = itemCostMs("prep", 325_729, 1) + itemCostMs("force", 325_729, 1) + itemCostMs("integrate", 325_729, 1);
+    const tick = itemCostMs("prep", 325_729) + itemCostMs("force", 325_729) + itemCostMs("integrate", 325_729);
     expect(tick).toBeGreaterThan(12);
     expect(tick).toBeLessThan(18);
+  });
+});
+
+/**
+ * A GPU that runs each frame's work in submission order, starting no earlier than the frame's rAF time, at
+ * `factor` × the work's estimate per pass: its fences signal when the work before them is done.
+ */
+class LaggingGpu implements FenceSource<number> {
+  private readonly doneAt: number[] = [];
+  /** The current frame's rAF time. */
+  now = 0;
+  /** Real GPU ms encoded in the current frame so far. */
+  pendingMs = 0;
+  private busyUntil = 0;
+  insert(): number {
+    this.busyUntil = Math.max(this.busyUntil, this.now) + this.pendingMs;
+    this.pendingMs = 0;
+    this.doneAt.push(this.busyUntil);
+    return this.doneAt.length - 1;
+  }
+  poll(fence: number): FenceStatus {
+    return (this.doneAt[fence] ?? Number.POSITIVE_INFINITY) <= this.now ? "signaled" : "pending";
+  }
+  drop(): void {}
+}
+
+/**
+ * Stream ticks of one large pass (whose real GPU time is `factor` × its estimate) and 16 small passes of
+ * 0.5 ms (at their estimate) through the real schedule and budget at 120 Hz for `frames` frames. Returns
+ * how often the band growth changed, its largest value, and the ticks done.
+ */
+function lagging(large: { costMs: number; fixedMs: number; factor: number }, frames: number): { changes: number; maxGrowth: number; ticks: number } {
+  const gpu = new LaggingGpu();
+  const budget = new FrameBudget(gpu, () => 0);
+  const pass = (costMs: number, fixedMs: number, rows: number, factor: number): StreamStage => ({
+    costMs,
+    fixedMs,
+    rows,
+    run: (_band, bands) => {
+      gpu.pendingMs += factor * (fixedMs + costMs / bands);
+    },
+  });
+  const stages = [pass(large.costMs, large.fixedMs, 1_000, large.factor), ...Array.from({ length: 16 }, () => pass(0.5, 0.05, 100, 1))];
+  let ticks = 0;
+  const schedule = new StreamSchedule(budget, { tickStages: () => stages }, {
+    tickStart: () => {},
+    tickEnd: () => {
+      ticks++;
+    },
+    readbackStart: () => {},
+    copy: () => {},
+  });
+  let changes = 0;
+  let maxGrowth = 1;
+  let growth = budget.growth;
+  for (let f = 0; f < frames; f++) {
+    gpu.now = f * (1000 / 120);
+    budget.beginFrame(gpu.now);
+    schedule.frame(budget.open(), () => true, () => false);
+    budget.endFrame();
+    if (budget.growth !== growth) changes++;
+    growth = budget.growth;
+    maxGrowth = Math.max(maxGrowth, growth);
+  }
+  return { changes, maxGrowth, ticks };
+}
+
+describe("FrameBudget band growth on a stream of passes of very different sizes, on a GPU slower than estimated", () => {
+  it("does not oscillate: frames of small passes are no evidence that a band twice the size fits", () => {
+    // A 6 ms pass (0.1 ms per band) running at 4× its estimate: 3 bands of 8.4 ms real at growth 1, more than
+    // a 120 Hz frame; 5 bands of 5.2 ms at growth 2. Frames of the 0.5 ms passes fit, but two bands of the
+    // large pass never finish within a frame, so the growth must stay where one band does.
+    const run = lagging({ costMs: 6, fixedMs: 0.1, factor: 4 }, 6_000);
+    expect(run.maxGrowth).toBeGreaterThan(1);
+    expect(run.changes, `the growth changed ${run.changes} times`).toBeLessThanOrEqual(2);
+  });
+
+  it("does not grow for a pass bound by its fixed cost, which more bands cannot shrink", () => {
+    // The nested gather at 1M (9 ms, 2.09 ms of tail per band) running at 5× its estimate. More bands would
+    // only pay the tail again: at growth 8 its 25 bands would cost 3.3× its 4.
+    const run = lagging({ costMs: 9, fixedMs: 2.09, factor: 5 }, 6_000);
+    expect(run.maxGrowth).toBe(1);
   });
 });

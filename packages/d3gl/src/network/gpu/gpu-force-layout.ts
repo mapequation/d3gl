@@ -395,9 +395,9 @@ export class GpuForceLayout {
 
     const n = this.count;
     this.stages = [
-      { costMs: itemCostMs("prep", n, 1), fixedMs: 0, rows: 1, run: () => this.beginTick() },
-      { costMs: itemCostMs("force", n, 1), fixedMs: 0, rows: height, run: (band, bands) => this.forceBand(band, bands) },
-      { costMs: itemCostMs("integrate", n, 1), fixedMs: 0, rows: 1, run: () => this.integrate() },
+      { costMs: itemCostMs("prep", n), fixedMs: 0, rows: 1, run: () => this.beginTick() },
+      { costMs: itemCostMs("force", n), fixedMs: 0, rows: height, run: (band, bands) => this.forceBand(band, bands) },
+      { costMs: itemCostMs("integrate", n), fixedMs: 0, rows: 1, run: () => this.integrate() },
     ];
   }
 

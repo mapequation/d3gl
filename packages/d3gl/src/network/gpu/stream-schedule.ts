@@ -4,12 +4,14 @@
 // ─────────────────────────────────────────────────────────────────────────────
 //
 // A solver's tick is a sequence of passes (stages), and so is the preparation of a readback (the nested
-// layout's composition). Every pass is cut into row bands of at most half the frame budget
-// ({@link FrameBudget.bandsFor}), and each band is one work item, so the budget holds at any N: no item is
-// estimated above half of it, and the budget admits a frame's items while their sum fits. A tick's items
-// may span frames; a readback's run exclusively (no tick item between its first pass and its copy), then
-// the copy — frames after the readback started, when the budget holds its passes back, which is why the
-// repaint throttle times a readback from its start.
+// layout's composition). Every pass is cut into row bands sized to the frame budget
+// ({@link FrameBudget.bandsFor}: at most half of it, or all of it for a pass whose every band waits on a
+// long fragment), and each band is one work item; the budget admits a frame's items while their estimated
+// sum fits. The bound is on the estimates, and it has one limit: a band whose fixed cost alone passes
+// three quarters of the budget exceeds it however the pass is cut (the nested gather of a module past
+// ~12,000 children at 120 Hz, #380). A tick's items may span frames; a readback's run exclusively (no tick
+// item between its first pass and its copy), then the copy — frames after the readback started, when the
+// budget holds its passes back, which is why the repaint throttle times a readback from its start.
 //
 // `GpuStream` owns the GL side (fences, the copy, the harvest); this schedule only walks the stages, so
 // node tests can drive it with fake stages and a fake-fence {@link FrameBudget}.
@@ -55,7 +57,8 @@ export interface ScheduleBudget {
   readonly budgetMs: number;
   bandsFor(costMs: number, rows: number, fixedMs?: number): number;
   admit(costMs: number): boolean;
-  spent(costMs: number, sliceable?: boolean): void;
+  /** An admitted item was encoded: band `band` of `bands` of `pass`. */
+  spent(costMs: number, pass: StageCost, band: number, bands: number): void;
 }
 
 /** What the schedule's owner does at a tick's boundaries and around a readback. */
@@ -112,9 +115,8 @@ export class StreamSchedule {
   private preparing = false;
   private readonly readback = new StageCursor();
   private copiedNow = false;
-  /** The next item's estimated GPU time, and whether its pass has rows to slice further. */
+  /** The next item's estimated GPU time. */
   private itemMs = 0;
-  private itemSliceable = false;
   private sliced = 1;
   private frameMs = 0;
 
@@ -216,7 +218,6 @@ export class StreamSchedule {
     if (!stage) return false;
     const bands = cursor.band === 0 ? this.bandsOf(stage) : cursor.bands;
     this.itemMs = stage.fixedMs + stage.costMs / bands;
-    this.itemSliceable = stage.rows > 1;
     return this.budget.admit(this.itemMs);
   }
 
@@ -228,12 +229,13 @@ export class StreamSchedule {
       cursor.bands = this.bandsOf(stage);
       if (stage.rows > 1) this.sliced = cursor.bands;
     }
-    stage.run(cursor.band, cursor.bands);
+    const band = cursor.band;
+    stage.run(band, cursor.bands);
+    this.budget.spent(this.itemMs, stage, band, cursor.bands);
+    this.frameMs += this.itemMs;
     if (++cursor.band >= cursor.bands) {
       cursor.band = 0;
       cursor.stage++;
     }
-    this.budget.spent(this.itemMs, this.itemSliceable);
-    this.frameMs += this.itemMs;
   }
 }
