@@ -1,5 +1,6 @@
 import { describe, it, expect } from "vitest";
-import { buildModuleLODTree, type ModuleNode, type ModuleEdges } from "../modules.js";
+import { buildModuleLODTree, flattenModuleRecords, type ModuleNode, type ModuleEdges } from "../modules.js";
+import { buildModuleTopology } from "../module-topology.js";
 import {
   computeLODPositions,
   computeLODStyle,
@@ -179,7 +180,55 @@ describe("buildModuleLODTree matches the string-keyed reference build (#215)", (
       expectPathsSpelled(tree, records);
     }
   });
+
+  // #428: records in tree order (as Infomap writes them) share their module chain with the record before
+  // them, which the build reuses instead of walking the prefix tree again — the registration order, and
+  // so every id, must not change.
+  it("is identical on records in tree order, where consecutive records share their module chain", () => {
+    for (let seed = 1; seed <= 5; seed++) {
+      const nodeCount = 100 + seed * 137;
+      const { records, edges } = randomFixture(seed, nodeCount);
+      const sorted = [...records].sort((a, b) => comparePaths(a.path, b.path));
+      const tree = buildModuleLODTree(nodeCount, sorted, edges);
+      expect(withoutBranch(tree)).toStrictEqual(referenceModuleLODTree(nodeCount, sorted, edges));
+      expectPathsSpelled(tree, sorted);
+    }
+  });
 });
+
+// #428: the flat, transferable form of the records is what a worker builds the tree from; it must build
+// exactly the tree the records themselves do.
+describe("buildModuleTopology over flattened records (#428)", () => {
+  it("builds the tree buildModuleLODTree builds, super-edges included", () => {
+    for (let seed = 1; seed <= 3; seed++) {
+      const nodeCount = 90 + seed * 101;
+      const { records, edges } = randomFixture(seed, nodeCount);
+      const flat = flattenModuleRecords(nodeCount, records);
+      expect(lodTreeFromTopology(buildModuleTopology(nodeCount, flat, edges))).toStrictEqual(buildModuleLODTree(nodeCount, records, edges));
+    }
+  });
+
+  it("flattens record r to its id and its path's entries", () => {
+    const flat = flattenModuleRecords(3, [{ id: 2, path: [1, 1] }, { id: 0, path: [2] }, { id: 1, path: [1, 2, 3] }]);
+    expect(Array.from(flat.id)).toEqual([2, 0, 1]);
+    expect(Array.from(flat.offset)).toEqual([0, 2, 3, 6]);
+    expect(Array.from(flat.entries)).toEqual([1, 1, 2, 1, 2, 3]);
+  });
+
+  it("validates while flattening, as the build does", () => {
+    expect(() => flattenModuleRecords(2, [{ id: 0, path: [1] }, { id: 5, path: [1] }])).toThrow(/out of range/);
+    expect(() => flattenModuleRecords(2, [{ id: 0, path: [1] }, { id: 0, path: [1] }])).toThrow(/duplicate/);
+    expect(() => flattenModuleRecords(2, [{ id: 0, path: [1] }])).toThrow(/no record for node id 1/);
+    expect(() => flattenModuleRecords(1, [{ id: 0, path: [] }])).toThrow(/empty path/);
+  });
+});
+
+/** Lexicographic path order — the order of an Infomap `.tree` file. */
+function comparePaths(a: ArrayLike<number>, b: ArrayLike<number>): number {
+  const n = Math.min(a.length, b.length);
+  for (let d = 0; d < n; d++) if (a[d] !== b[d]) return (a[d] ?? 0) - (b[d] ?? 0);
+  return a.length - b.length;
+}
 
 /** The tree minus `branch` (#324 aggregate identity), which the pre-#215 reference build doesn't produce. */
 function withoutBranch(tree: LODTree): Omit<LODTree, "branch"> {
