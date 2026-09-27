@@ -48,7 +48,7 @@ describe("network toSVG() on the WebGL backend (#200)", () => {
     await net.whenReady();
     net
       .data(clustered())
-      .style({ directed: true, nodeRadius: 5 })
+      .style({ directed: true, nodeRadius: 8 }) // each module's two members (15 apart) overlap (#426)
       .lod({ modules: CLUSTER_MODULES, expandPx: 20 })
       .layout({ backend: "positions", positions: CLUSTER_POS });
     net.setTransform({ k: 1, x: 0, y: 0 }); // each module collapses to one aggregate

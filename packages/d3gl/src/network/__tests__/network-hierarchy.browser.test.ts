@@ -184,7 +184,7 @@ describe("engine-owned module hierarchy — data(graph, { modules }) (#326)", ()
     const g = graph();
     net
       .data(g, { modules: MODULES })
-      .style({ nodeRadius: 5 })
+      .style({ nodeRadius: 12 }) // members 20 apart overlap, so the modules stay collapsed at k = 1 (#426)
       .layout({ backend: "positions", positions: POSITIONS })
       .lod({ expandPx: 60, declutter: false });
     expect(net.lodSource).toBe("modules");
@@ -237,7 +237,8 @@ describe("engine-owned module hierarchy — data(graph, { modules }) (#326)", ()
     const net = network(host(), { width: 200, height: 200 });
     await net.whenReady();
     const g = graph();
-    net.data(g, { modules: MODULES }).style({ nodeRadius: 5 }).layout({ backend: "positions", positions: POSITIONS });
+    // Members 20 apart overlap, so module aggregates stay collapsed at k = 1 (#426); at 4× the footprint opens them.
+    net.data(g, { modules: MODULES }).style({ nodeRadius: 12 }).layout({ backend: "positions", positions: POSITIONS });
 
     // LOD off: every node is a leaf; its path is its own record's path — and no tree is built for it.
     expect(net.pick(20, 20)).toMatchObject({ id: 0, datum: { aggregate: false, count: 1 } });
