@@ -203,7 +203,8 @@ export function nestedSolverBuffers(t: NestedSolverTopology): ArrayBuffer[] {
   const arrays = [
     t.segStart, t.segCount, t.segModule, t.segOwner, t.segAlpha0, t.slotNode, t.nodeSlot, t.radius, t.seed,
     t.linkSource, t.linkTarget, t.linkWeight,
-    c.slotCollide, c.segCellSide, c.segClasses, c.segList, c.segBucketBase, c.segBucketMask, c.binnedSlots,
+    c.slotCollide, c.items, c.segCellSide, c.segClasses, c.segList, c.segBucketBase, c.segBucketMask, c.segSubBase,
+    c.binnedSlots, c.slotWork,
   ];
   const buffers: ArrayBuffer[] = [];
   for (const a of arrays) if (a.buffer instanceof ArrayBuffer) buffers.push(a.buffer);

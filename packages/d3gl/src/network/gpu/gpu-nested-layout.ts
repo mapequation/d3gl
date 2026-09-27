@@ -7,7 +7,7 @@ import { SegmentedReduce, type RangeTarget, type ReduceMap } from "./passes/segm
 import { GridPyramid } from "./passes/grid-pyramid.js";
 import { RepulsionPass } from "./passes/repulsion.js";
 import { NestedIntegratePass, NestedPredictPass, type NestedSlotInputs } from "./passes/nested.js";
-import { COLLISION_STEPS, CollisionGrid, type CollisionGatherInput } from "./passes/collision.js";
+import { COLLISION_STEPS, CollisionGrid, type CollisionInputs } from "./passes/collision.js";
 import { COLLISION_LIST_MAX } from "./collision-plan.js";
 import { NestedComposePass } from "./passes/nested-compose.js";
 import { GpuSprings } from "./springs.js";
@@ -43,13 +43,15 @@ import { EXACT_MAX } from "../nested-layout.js";
 // The composition (`passes/nested-compose.ts`) maps the local solutions into world discs and packs leaf
 // positions and module discs in node order, for the streaming readback ({@link prepareReadback}).
 //
-// Not every item fits the frame budget. Two cannot be cut: compact step 1's P (4.2 ms at 325k, 7.3 ms at
+// The collision gather's cost follows the contacts, not the leaves: a module of heavy-tailed radii can do
+// ten times the work per leaf of an even one. So its bands are cut at equal shares of the collision
+// plan's per-slot work estimate (`collision-plan.ts`), not at equal rows, and costed by the plan's total,
+// so that a band costs what the frame budget expects (#380).
+//
+// Not every item fits the frame budget. Two cannot be cut: compact step 1's P (4-5 ms at 325k, 7.5 ms at
 // 1M on an M1 Max) and the composition a copy frame adds (2.7-5.6 / 4.5-9.9 ms), which the frame reserves
 // but which never stops its first item. So a copy frame can carry up to ~12 ms of layout GPU work at 325k
-// and ~17 ms at 1M, against a 10 ms budget at 60 Hz (5 ms at 120 Hz). A large module whose radii are
-// heavy-tailed makes both the gather and P grow as k² (every grid slot on the exact loop; the count and
-// round scatters contending at hundreds of discs per cell): one 60,000-child module takes a 55 ms gather
-// and a 12 ms P, and no band count fixes P.
+// and ~17 ms at 1M, against a 10 ms budget at 60 Hz (5 ms at 120 Hz).
 //
 // Not the CPU's: Jacobi instead of Gauss-Seidel links and collision pairs (every term reads one state),
 // and grid-pyramid Barnes-Hut instead of the CPU's adaptive quadtree for segments above 32 children (the
@@ -62,27 +64,39 @@ const NEAREST: SamplerProps = { minFilter: "nearest", magFilter: "nearest" };
 const NESTED_THETA = 0.9;
 
 /**
- * GPU time per leaf of the nested solve's work items, ns, per stream tick kind — measured on an M1 Max
- * (ANGLE Metal) on the synthetic Infomap-like maps (325,729 and 1,000,000 leaves; the per-leaf cost of
- * the larger map is lower, so these fit 325k and overestimate 1M):
- *
- * - organise: P 1.9 ms at 325k (reductions + tile pyramid), a whole-atlas repulsion band 2.1 ms, I 1.6 ms
- *   (predict + springs + integrate);
- * - compact, collision step 1: P 4.2 ms (the solve tick's predict + springs + integrate, the reductions,
- *   the collision cells and rounds), a whole-atlas gather band 4.9 ms, I a swap;
- * - compact, collision step 2: P ~1.3 ms (reductions, cells, rounds), the gather again.
- *
- * The flat layout's model would misjudge this solve both ways; a slower GPU is caught by the frame
- * budget's fences, as for the flat layout.
+ * GPU time per leaf of the organise ticks' work items, ns — measured on an M1 Max (ANGLE Metal) on the
+ * synthetic Infomap-like maps (325,729 and 1,000,000 leaves): P 1.9 ms at 325k (reductions + tile
+ * pyramid), a whole-atlas repulsion band 2.1 ms, I 1.6 ms (predict + springs + integrate).
  */
-const NESTED_NS: Readonly<Record<"organise" | "compact0" | "compact1", ItemCosts>> = {
-  organise: { prep: 4, force: 6, integrate: 4 },
-  compact0: { prep: 10, force: 13, integrate: 0.2 },
-  compact1: { prep: 3, force: 13, integrate: 0.2 },
-};
+const NESTED_ORGANISE_NS: ItemCosts = { prep: 4, force: 6, integrate: 4 };
 
-/** The band count's model: the heaviest band pass (the collision gather). */
-export const NESTED_ITEM_NS_PER_LEAF: ItemCosts = { prep: 10, force: 13, integrate: 4 };
+/**
+ * The compact ticks' work items, measured on the same M1 Max over web-NotreDame's Infomap trees, the
+ * synthetic 325k and 1M maps and one-module Zipf maps of 20,000 and 60,000 children (#380):
+ *
+ * - P (the solve tick's predict + springs + integrate on step 1, the reductions, the cell pass and the
+ *   occupancy scatters) is 3.4-5.4 ms, 7.5 at 1M: a fixed ~3.2 ms of passes plus 4 ns per leaf;
+ * - the unbanded gather is 4.0 ms plus 47 ps per unit of the collision plan's work estimate (its pair
+ *   tests plus 16 per cell visit), within ±8% on all six maps (5.2-11.7 ms) — where the previous 13 ns per
+ *   leaf was off by 0.06-1.1× between them (0.06× on the 20,000-child Zipf module: the frame stalls);
+ * - I is a swap.
+ *
+ * A slower GPU is caught by the frame budget's fences, as for the flat layout.
+ */
+const NESTED_COMPACT = { prepMs: 3.2, prepNsPerLeaf: 4, gatherMs: 4, gatherPsPerWork: 47, integrateNsPerLeaf: 0.2 } as const;
+
+/**
+ * The share of the measured compact gather time the frame budget is told. The per-leaf model this
+ * replaces told it about half on web-NotreDame's Infomap trees (4.2 ms for a 9 ms gather), and the fence
+ * gate — two frames in flight — absorbed that: those layouts streamed without a blocked frame. Kept here,
+ * so they pace as before (2.1-2.2 s cold on the M1 Max), and now the same factor on every map, where the
+ * per-leaf model's ranged 0.06-1.1 (0.06 on a 20,000-child Zipf module: the gate blocked ~200 frames and
+ * frames stalled). At 1 — the budget told the whole measured time — those trees take ~2.85 s instead.
+ */
+const NESTED_GATHER_BUDGET_SHARE = 0.5;
+
+/** Work units a slot adds to its band besides its search (its resolve): a cell visit's worth. */
+const NESTED_SLOT_BASE_WORK = 16;
 
 /** GPU time per leaf of a readback's composition (two reductions and the compose pass), ns: 4.7 ms at 325k. */
 const NESTED_READBACK_NS = 12;
@@ -127,8 +141,6 @@ export interface GpuNestedLayoutOptions {
   rootY?: number;
   /** Test hook: ticks of the organise phase (default `⌈0.6 · iterations⌉`, the CPU's). */
   organise?: number;
-  /** Test hook: the collision grid's occupant rounds K (default `COLLISION_ROUNDS`). */
-  collisionRounds?: number;
   /** Test hook: build the collision grid's per-slot statistics pass ({@link GpuNestedLayout.collisionStats}). */
   collisionStats?: boolean;
 }
@@ -160,11 +172,11 @@ export class GpuNestedLayout implements StreamSolver {
   private readonly forceFbo: Framebuffer;
   private readonly radius: Texture;
   private readonly slotSeg: Texture;
-  /** Per segment `(finest collision cell side, owner slot, 0, 0)`. */
+  /** Per segment `(finest collision sub-cell side, owner slot, 0, 0)`. */
   private readonly segNested: Texture;
   /** Per slot its collision class and exact bit (`r32uint`). */
   private readonly slotCollide: Texture;
-  /** Per segment its collision list (2 `rgba32uint` texels) and grid (bucket base, bucket mask, classes, 0). */
+  /** Per segment its collision list (2 `rgba32uint` texels) and grid (bucket base, bucket mask, classes, sub-cell base). */
   private readonly segCollide: Texture;
   /** The segment table — S segments plus one range over every slot (the readback's finiteness check). */
   private readonly segments: SegmentTable;
@@ -179,7 +191,7 @@ export class GpuNestedLayout implements StreamSolver {
   private readonly collision: CollisionGrid;
   private readonly compose: NestedComposePass;
   private readonly slotInputs: NestedSlotInputs;
-  private readonly gatherInput: CollisionGatherInput;
+  private readonly gatherInput: CollisionInputs;
   private readonly springInputs: NestedSpringInputs;
   /**
    * The nested map's textures per mode. Mode 2 reads mode 1's sums (the segment table's `stats`); mode 1
@@ -205,13 +217,24 @@ export class GpuNestedLayout implements StreamSolver {
 
   /** The readback's staging texture: leaf positions then module discs, in node order. */
   readonly packed: PackedPositions;
-  /** The frame budget's band model for this solve's work items (see {@link itemCostMs} for the rest). */
-  readonly itemCosts: ItemCosts = NESTED_ITEM_NS_PER_LEAF;
+  /**
+   * The frame budget's per-leaf band model, which it sizes its static band count by: the organise
+   * repulsion's, or the compact gather's plan-based estimate per leaf when that is heavier (see
+   * {@link itemCostMs} for the per-item estimates).
+   */
+  readonly itemCosts: ItemCosts;
+  /** The compact gather's unbanded GPU time estimate as the frame budget is told it, ms ({@link NESTED_COMPACT}). */
+  private readonly gatherMs: number;
+  /** Cumulative gather work up to each slot atlas row (`height + 1` entries): the compact bands' cuts. */
+  private readonly rowWork: Float64Array;
 
   /** The next item's estimated GPU time, ms, for the stream tick the solve is at. */
   itemCostMs(kind: ItemKind, bands: number): number {
-    const table = this.organising ? NESTED_NS.organise : this.step === 0 ? NESTED_NS.compact0 : NESTED_NS.compact1;
-    return itemCostMs(kind, this.topo.leafCount, bands, table);
+    const leaves = this.topo.leafCount;
+    if (this.organising) return itemCostMs(kind, leaves, bands, NESTED_ORGANISE_NS);
+    if (kind === "prep") return NESTED_COMPACT.prepMs + (NESTED_COMPACT.prepNsPerLeaf * leaves) / 1e6;
+    if (kind === "force") return this.gatherMs / Math.max(1, bands);
+    return (NESTED_COMPACT.integrateNsPerLeaf * leaves) / 1e6;
   }
 
   /** Estimated GPU time of a readback's composition, ms. */
@@ -319,7 +342,7 @@ export class GpuNestedLayout implements StreamSolver {
       const classes = new Uint32Array(width * height);
       classes.set(plan.slotCollide);
       this.slotCollide = own(device.createTexture({ width, height, format: "r32uint", data: classes, mipLevels: 1, sampler: NEAREST }));
-      // 3 texels per segment row: its list (−1 → NO_CELL pads), then (bucket base, bucket mask, classes, 0).
+      // 3 texels per segment row: its list (−1 → NO_CELL pads), then (bucket base, bucket mask, classes, sub-cell base).
       const collideWidth = atlasWidth(3 * rows.length);
       const collide = new Uint32Array(collideWidth * Math.ceil((3 * rows.length) / collideWidth) * 4);
       for (let s = 0; s < S; s++) {
@@ -327,6 +350,7 @@ export class GpuNestedLayout implements StreamSolver {
         collide[12 * s + 8] = plan.segBucketBase[s] ?? 0;
         collide[12 * s + 9] = plan.segBucketMask[s] ?? 0;
         collide[12 * s + 10] = plan.segClasses[s] ?? 0;
+        collide[12 * s + 11] = plan.segSubBase[s] ?? 0;
       }
       this.segCollide = own(device.createTexture({ width: collideWidth, height: collide.length / (4 * collideWidth), format: "rgba32uint", data: collide, mipLevels: 1, sampler: NEAREST }));
       const extentTex = (): Texture => own(device.createTexture({ width: tw, height: th, format: "rgba32float", mipLevels: 1, sampler: NEAREST }));
@@ -364,14 +388,21 @@ export class GpuNestedLayout implements StreamSolver {
       this.predict = own(new NestedPredictPass(device));
       this.integratePass = own(new NestedIntegratePass(device, 1 - NESTED.DECAY));
       this.collision = own(
-        new CollisionGrid(device, width, height, plan.bucketCount, plan.binnedSlots, {
-          refine: plan.refine,
-          ...(options.collisionRounds === undefined ? {} : { rounds: options.collisionRounds }),
-          stats: options.collisionStats === true,
-        }),
+        new CollisionGrid(device, width, height, plan, { stats: options.collisionStats === true }),
       );
       this.compose = own(new NestedComposePass(device, topo.nodeSlot, topo.leafCount, topo.depth, NESTED.FILL, NESTED.ONLY_CHILD));
       this.packed = { framebuffer: this.compose.framebuffer, width: this.compose.width, height: this.compose.height, extraFloats: this.compose.extraFloats };
+
+      // The compact gather's cost and its bands' cuts, from the collision plan's per-slot work.
+      this.gatherMs = NESTED_GATHER_BUDGET_SHARE * (NESTED_COMPACT.gatherMs + (NESTED_COMPACT.gatherPsPerWork * plan.gatherWork) / 1e9);
+      const gatherNsPerLeaf = (this.gatherMs * 1e6) / Math.max(1, topo.leafCount);
+      this.itemCosts = { ...NESTED_ORGANISE_NS, force: Math.max(NESTED_ORGANISE_NS.force, gatherNsPerLeaf) };
+      this.rowWork = new Float64Array(height + 1);
+      for (let r = 0; r < height; r++) {
+        let work = 0;
+        for (let i = r * width; i < Math.min(slots, (r + 1) * width); i++) work += (plan.slotWork[i] ?? 0) + NESTED_SLOT_BASE_WORK;
+        this.rowWork[r + 1] = (this.rowWork[r] ?? 0) + work;
+      }
 
       this.slotInputs = {
         count: slots,
@@ -482,10 +513,13 @@ export class GpuNestedLayout implements StreamSolver {
     this.collision.prepare({ ...this.gatherInput, pos: this.pos.readTex, radius: this.radius });
   }
 
-  /** Work item **F_b**: atlas rows of band `band` — the repulsion (organise) or the collision gather (compact). */
+  /**
+   * Work item **F_b**: band `band` of `bands` of the slot atlas's rows — the repulsion over equal rows
+   * (organise), or the collision gather over rows of equal estimated work (compact).
+   */
   forceBand(band: number, bands: number): void {
     if (!this.organising) {
-      this.collision.gather(this.posFbo(this.posParity ^ 1), this.gatherInput, band, bands);
+      this.collision.gather(this.posFbo(this.posParity ^ 1), this.gatherInput, this.workRow(band, bands), this.workRow(band + 1, bands));
       return;
     }
     const r0 = Math.floor((band * this.height) / bands);
@@ -559,6 +593,25 @@ export class GpuNestedLayout implements StreamSolver {
     this.velParity ^= 1;
   }
 
+  /**
+   * The first slot atlas row of compact band `band` of `bands`: the first row whose cumulative gather work
+   * reaches `band / bands` of the total (0 for band 0, the atlas height for band `bands`), so consecutive
+   * bands tile the rows in order.
+   */
+  private workRow(band: number, bands: number): number {
+    if (band <= 0) return 0;
+    if (band >= bands) return this.height;
+    const target = ((this.rowWork[this.height] ?? 0) * band) / bands;
+    let lo = 0;
+    let hi = this.height;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      if ((this.rowWork[mid] ?? 0) < target) lo = mid + 1;
+      else hi = mid;
+    }
+    return lo;
+  }
+
   /** A solve tick is complete: advance the alpha schedules. */
   private endTick(): void {
     this.alphaCold -= this.alphaCold * this.decayCold;
@@ -607,13 +660,13 @@ export class GpuNestedLayout implements StreamSolver {
   }
 
   /**
-   * Tests only (a layout built with `collisionStats`): what the current compact tick's collision step
-   * does per slot — `(cells visited, pairs tested, grid partners pushed, 1 exact slot / 2 overflow)`, 4
-   * floats per slot — from the state its work item P prepared (call it after {@link beginTick} of a compact
-   * tick).
+   * Tests only (a layout built with `collisionStats`): what the current collision step does per slot,
+   * summed over its work items — `(cells visited, pairs tested, grid partners pushed, 1 exact slot / 2
+   * overflow)`, 4 floats per slot — from the state its work item P prepared (call it after
+   * {@link beginTick} of a compact tick).
    */
   collisionStats(): Float32Array {
-    return this.collision.gatherStats(this.gatherInput).subarray(0, 4 * this.slots);
+    return this.collision.gatherStats(this.gatherInput);
   }
 
   /** The slots' local positions (each in its parent's unit disc), synchronously — for tests: `2 · slots` floats. */
