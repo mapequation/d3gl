@@ -78,12 +78,15 @@ const NESTED_ORGANISE_NS: ItemCosts = { prep: 4, force: 6, integrate: 4 };
  *   occupancy scatters) is 3.4-5.4 ms, 7.5 at 1M: a fixed ~3.2 ms of passes plus 4 ns per leaf;
  * - the unbanded gather is 4.0 ms plus 47 ps per unit of the collision plan's work estimate (its pair
  *   tests plus 16 per cell visit), within ±8% on all six maps (5.2-11.7 ms) — where the previous 13 ns per
- *   leaf was off by 0.06-1.1× between them (0.06× on the 20,000-child Zipf module: the frame stalls);
+ *   leaf was off by 0.06-1.1× between them (0.06× on the 20,000-child Zipf module: the frame stalls). The
+ *   4 ms is the work items' pass (its longest serial chains); a map without items — every module small
+ *   enough for single-item exact loops — has 0.3 ms instead (1.0 / 1.2 ms at 20k / 100k leaves, fence
+ *   wait included);
  * - I is a swap.
  *
  * A slower GPU is caught by the frame budget's fences, as for the flat layout.
  */
-const NESTED_COMPACT = { prepMs: 3.2, prepNsPerLeaf: 4, gatherMs: 4, gatherPsPerWork: 47, integrateNsPerLeaf: 0.2 } as const;
+const NESTED_COMPACT = { prepMs: 3.2, prepNsPerLeaf: 4, gatherMs: 4, gatherMsWithoutItems: 0.3, gatherPsPerWork: 47, integrateNsPerLeaf: 0.2 } as const;
 
 /**
  * The share of the compact items' measured GPU time the frame budget is told. The per-leaf model this
@@ -395,7 +398,8 @@ export class GpuNestedLayout implements StreamSolver {
       this.packed = { framebuffer: this.compose.framebuffer, width: this.compose.width, height: this.compose.height, extraFloats: this.compose.extraFloats };
 
       // The compact gather's cost and its bands' cuts, from the collision plan's per-slot work.
-      this.gatherMs = NESTED_COMPACT_BUDGET_SHARE * (NESTED_COMPACT.gatherMs + (NESTED_COMPACT.gatherPsPerWork * plan.gatherWork) / 1e9);
+      const gatherFloorMs = plan.itemCount > 0 ? NESTED_COMPACT.gatherMs : NESTED_COMPACT.gatherMsWithoutItems;
+      this.gatherMs = NESTED_COMPACT_BUDGET_SHARE * (gatherFloorMs + (NESTED_COMPACT.gatherPsPerWork * plan.gatherWork) / 1e9);
       const gatherNsPerLeaf = (this.gatherMs * 1e6) / Math.max(1, topo.leafCount);
       this.itemCosts = { ...NESTED_ORGANISE_NS, force: Math.max(NESTED_ORGANISE_NS.force, gatherNsPerLeaf) };
       this.rowWork = new Float64Array(height + 1);
