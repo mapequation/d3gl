@@ -91,7 +91,7 @@ describe.skipIf(N === 0)(`GPU nested layout timing bench (#355), ${N} leaves`, (
     fence(device, layout);
     const compactMs = (performance.now() - t0) / 10;
     t0 = performance.now();
-    layout.prepareReadback();
+    layout.composeReadback();
     device.readPixelsToArrayWebGL(layout.packed.framebuffer, { sourceWidth: 1, sourceHeight: 1 });
     const composeMs = performance.now() - t0;
     layout.destroy();

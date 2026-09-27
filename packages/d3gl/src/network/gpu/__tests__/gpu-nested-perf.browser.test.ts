@@ -5,8 +5,8 @@
  *
  * A cold nested layout streams as one animation of all depths: each frame polls fences, harvests a
  * composed copy the GPU finished earlier (leaf positions and module discs, packed in node order),
- * repaints (throttled), and encodes a budgeted slice of stream ticks — the organise ticks' repulsion and
- * the compact ticks' collision gathers cut into row bands. Pinned here:
+ * repaints (throttled), and encodes a budgeted slice of stream ticks — every pass cut into row bands
+ * (#382), the composition of a readback too. Pinned here:
  *
  * - **Transport-only main thread per frame** (fence polls + harvest + encode + copy + fence, the repaint
  *   excluded) below a ceiling split into constant and linear terms, and the encode within the
@@ -19,8 +19,9 @@
  *   harvest precedes the frame's layout draws; no GPU object created per streamed frame once the stream
  *   runs; `settled` only after the final stream tick's positions were harvested.
  * - **Per tick:** a solve tick allocates nothing, and a compact collision step draws exactly one count
- *   scatter and {@link COLLISION_ROUNDS} round scatters of N points (the K-occupant grid's fixed passes),
- *   never a draw of N points into a 1×1 viewport (#349).
+ *   scatter and {@link COLLISION_ROUNDS} round scatters of N points (the K-occupant grid's fixed passes) —
+ *   in bands, scatters covering every slot once per pass — never a draw of N points into a 1×1 viewport
+ *   (#349).
  */
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { Device } from "@luma.gl/core";
@@ -343,24 +344,28 @@ describe("GPU nested solve per tick (#355)", () => {
     const solver = nestedSolverTopology({ ...tree, parent }, { iterations: 10, size: graph.flow ?? undefined });
     const layout = new GpuNestedLayout(device, solver);
     const log = new GlCallLog();
+    const scatters = (from: number): number[] =>
+      log.events.slice(from).flatMap((e) => (e.kind === "layout-draw" && e.points ? [e.count] : []));
     try {
       layout.runTicks(6); // organise
-      layout.prepareReadback();
+      layout.composeReadback();
       const organiseCreates = log.events.filter((e) => e.kind === "create").length;
-      const before = log.events.length;
-      layout.beginTick(); // compact, collision step 1: its cells, counts and rounds
-      layout.forceBand(0, 3);
-      layout.forceBand(1, 3);
-      layout.forceBand(2, 3);
-      layout.integrate();
-      const step = log.events.slice(before).filter((e) => e.kind === "layout-draw" && e.points);
+      // Compact, collision step 1, whole: one count scatter and the rounds, each over every slot.
+      let before = log.events.length;
+      for (const stage of layout.tickStages()) stage.run(0, 1);
+      const whole = scatters(before);
+      // Collision step 2 with every pass in 3 bands: the same passes, each cut into 3 slot ranges.
+      before = log.events.length;
+      for (const stage of layout.tickStages()) for (let b = 0; b < 3; b++) stage.run(b, 3);
+      const sliced = scatters(before);
       layout.runTicks(3);
-      layout.prepareReadback();
+      for (const stage of layout.readbackStages()) for (let b = 0; b < 4; b++) stage.run(b, 4);
       expect(organiseCreates, "GPU objects created by organise ticks or a readback").toBe(0);
-      expect(log.events.filter((e) => e.kind === "create").length, "GPU objects created by compact ticks").toBe(0);
+      expect(log.events.filter((e) => e.kind === "create").length, "GPU objects created by compact ticks or a sliced readback").toBe(0);
       // One count scatter and the rounds, each over every slot: the grid's fixed pass count.
-      expect(step.length).toBe(1 + COLLISION_ROUNDS);
-      expect(step.every((e) => e.kind === "layout-draw" && e.count === solver.slotCount)).toBe(true);
+      expect(whole).toEqual(new Array<number>(1 + COLLISION_ROUNDS).fill(solver.slotCount));
+      expect(sliced.length).toBe(3 * (1 + COLLISION_ROUNDS));
+      expect(sliced.reduce((a, c) => a + c, 0)).toBe((1 + COLLISION_ROUNDS) * solver.slotCount);
       expect(log.events.some((e) => e.kind === "layout-draw" && e.viewport1x1 && e.count >= solver.slotCount)).toBe(false);
     } finally {
       log.restore();

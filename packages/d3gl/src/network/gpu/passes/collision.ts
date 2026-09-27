@@ -2,7 +2,8 @@ import type { Device, Framebuffer, RenderPass, RenderPipelineParameters, Sampler
 import { Model } from "@luma.gl/engine";
 import { SLOT_TEXEL_GLSL } from "../textures.js";
 import { SEGMENT_OF_GLSL, segmentDefines, type SegmentTable } from "../segment-table.js";
-import { ADDITIVE_BLEND, beginPass, fullScreenModel, NO_BLEND, type PassUniforms } from "./fullscreen.js";
+import { bandRows, bandSlots } from "../segments.js";
+import { ADDITIVE_BLEND, beginPass, fullScreenModel, NO_BLEND, type PassTarget, type PassUniforms } from "./fullscreen.js";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // The nested layout's disc collision on the GPU (#355, spec §11.1): a per-segment K-occupant grid that
@@ -137,6 +138,7 @@ precision highp usampler2D;
 uniform highp usampler2D u_slotCell;
 uniform highp sampler2D u_prev;      // round r − 1 (rounds only)
 uniform int u_width;
+uniform int u_first;                 // the first slot of this draw (a band of slots, #382)
 uniform vec2 u_atlas;                // collision atlas size
 uniform int u_round;                 // −1: the count pass; r ≥ 0: round r
 flat out float v_id;
@@ -144,8 +146,9 @@ ${SLOT_TEXEL_GLSL}
 ${TILE_GLSL}
 void main() {
   gl_PointSize = 1.0;
-  uint c = texelFetch(u_slotCell, slotTexel(gl_VertexID, u_width), 0).r;
-  v_id = float(gl_VertexID);
+  int slot = u_first + gl_VertexID;
+  uint c = texelFetch(u_slotCell, slotTexel(slot, u_width), 0).r;
+  v_id = float(slot);
   if (c == NO_CELL) { gl_Position = vec4(2.0, 2.0, 0.0, 1.0); return; }
   ivec2 cell = ivec2(int(c & 65535u), int(c >> 16));
   if (u_round > 0) {
@@ -330,8 +333,10 @@ export interface CollisionGatherInput {
 /**
  * The collision grid's textures and passes, created once for a slot atlas and a collision atlas
  * (`width × height`, the pyramid tile atlas halved). A Jacobi collision step is {@link prepare} (the cell
- * pass, the count scatter, {@link COLLISION_ROUNDS} round scatters) then {@link gather}, which may be cut
- * into row bands — each its own submitted render pass; nothing is allocated.
+ * pass, the count scatter, {@link COLLISION_ROUNDS} round scatters) then {@link gather}. Every one of
+ * these passes may be cut into bands of slot-atlas rows (#382) — {@link cells}, {@link count},
+ * {@link round}, {@link gather} — each band its own submitted render pass, with the same result for any
+ * band count; nothing is allocated.
  *
  * Memory: `slotCell` 4 B and the disc 16 B per slot atlas texel; the count 4 B and the two round textures
  * 16 B each per collision atlas texel (36 B per cell). With no tiled segment the grid is 1×1 and only exact
@@ -357,7 +362,6 @@ export class CollisionGrid {
   private readonly gatherUniforms: PassUniforms;
   /** Atlas width of the per-segment large-slot texture (2 texels per segment). */
   readonly largeWidth: number;
-  private slots = 0;
 
   constructor(device: Device, slotWidth: number, slotHeight: number, atlasWidth: number, atlasHeight: number, largeWidth: number) {
     this.device = device;
@@ -377,8 +381,8 @@ export class CollisionGrid {
     ];
     this.cellUniforms = { u_count: 0, u_width: 1, u_tableWidth: 1, u_cellScale: 1 };
     this.cellModel = fullScreenModel(device, CELL_FS, this.cellUniforms, NO_BLEND);
-    this.scatterUniforms = { u_width: 1, u_atlas: new Float32Array([w, h]), u_round: -1 };
-    this.roundUniforms = { u_width: 1, u_atlas: new Float32Array([w, h]), u_round: 0, u_channel: 0 };
+    this.scatterUniforms = { u_width: 1, u_first: 0, u_atlas: new Float32Array([w, h]), u_round: -1 };
+    this.roundUniforms = { u_width: 1, u_first: 0, u_atlas: new Float32Array([w, h]), u_round: 0, u_channel: 0 };
     const scatter = (fs: string, uniforms: PassUniforms, parameters: RenderPipelineParameters): Model =>
       new Model(device, { vs: SCATTER_VS, fs, topology: "point-list", vertexCount: 1, uniforms, parameters });
     this.countModel = scatter(COUNT_FS, this.scatterUniforms, ADDITIVE_BLEND);
@@ -389,11 +393,20 @@ export class CollisionGrid {
 
   /**
    * Encode the first half of a collision step: every slot's cell and disc (from `input.pos` and this
-   * tick's box), the occupancy counts and the {@link COLLISION_ROUNDS} rounds. Then {@link gather}.
+   * tick's box), the occupancy counts and the {@link COLLISION_ROUNDS} rounds — {@link cells},
+   * {@link count} and each {@link round}, unsliced. Then {@link gather}.
    */
   prepare(input: CollisionPrepareInput): void {
+    this.cells(input);
+    this.count(input);
+    for (let r = 0; r < COLLISION_ROUNDS; r++) this.round(r, input);
+  }
+
+  /** Every slot's cell (or NO_CELL) and its disc, from this tick's box — over the rows of band `band` of `bands`. */
+  cells(input: CollisionPrepareInput, band = 0, bands = 1): void {
+    const [r0, r1] = bandRows(band, bands, Math.ceil(input.count / input.width));
+    if (r1 <= r0) return;
     const { segments } = input;
-    // 1. Every slot's cell (or NO_CELL) and its disc, from this tick's box.
     const cu = this.cellUniforms;
     cu["u_count"] = input.count;
     cu["u_width"] = input.width;
@@ -407,29 +420,38 @@ export class CollisionGrid {
       u_segInfo: segments.info,
       u_slotSeg: input.slotSeg,
     });
-    this.draw(this.cellModel, { framebuffer: this.slotCellFbo, clear: false });
+    this.draw(this.cellModel, bands > 1 ? { framebuffer: this.slotCellFbo, clear: false, scissor: [0, r0, input.width, r1 - r0] } : { framebuffer: this.slotCellFbo, clear: false });
+  }
 
-    // 2. Occupancy: the counts, then the rounds.
-    if (this.slots !== input.count) {
-      this.slots = input.count;
-      this.countModel.setVertexCount(input.count);
-      this.roundModel.setVertexCount(input.count);
-    }
+  /**
+   * The occupancy count (ADD) of the slots of band `band` of `bands` — after every band of {@link cells}.
+   * Its first band clears the counts. Integer counts add exactly in any order.
+   */
+  count(input: CollisionPrepareInput, band = 0, bands = 1): void {
+    const [first, end] = bandSlots(band, bands, input.width, input.count);
     this.scatterUniforms["u_width"] = input.width;
+    this.scatterUniforms["u_first"] = first;
     this.countModel.setBindings({ u_slotCell: this.slotCell, u_prev: this.rounds[1] });
-    this.draw(this.countModel, { framebuffer: this.cellCountFbo, clear: [0, 0, 0, 0] });
-    for (let r = 0; r < COLLISION_ROUNDS; r++) {
-      const even = (r & 1) === 0;
-      const ru = this.roundUniforms;
-      ru["u_width"] = input.width;
-      ru["u_round"] = r;
-      ru["u_channel"] = r >> 1;
-      // Round r reads round r − 1 from the other texture (round 0 reads nothing it uses).
-      this.roundModel.setBindings({ u_slotCell: this.slotCell, u_prev: even ? this.rounds[1] : this.rounds[0] });
-      // Rounds 0 and 1 open their texture with the empty clear; later rounds keep it.
-      const framebuffer = even ? this.roundFbos[0] : this.roundFbos[1];
-      this.draw(this.roundModel, r < 2 ? { framebuffer, clear: [EMPTY, EMPTY, EMPTY, EMPTY] } : { framebuffer, clear: false });
-    }
+    this.scatter(this.countModel, end - first, band === 0 ? { framebuffer: this.cellCountFbo, clear: [0, 0, 0, 0] } : { framebuffer: this.cellCountFbo, clear: false });
+  }
+
+  /**
+   * Round `r` (MIN) of the slots of band `band` of `bands` — after every band of round r − 1 (and of
+   * {@link cells}). Round r reads round r − 1 from the other texture (round 0 reads nothing it uses); the
+   * first band of rounds 0 and 1 opens its texture with the empty clear, later ones keep it. MIN is exact
+   * in any order.
+   */
+  round(r: number, input: CollisionPrepareInput, band = 0, bands = 1): void {
+    const [first, end] = bandSlots(band, bands, input.width, input.count);
+    const even = (r & 1) === 0;
+    const ru = this.roundUniforms;
+    ru["u_width"] = input.width;
+    ru["u_first"] = first;
+    ru["u_round"] = r;
+    ru["u_channel"] = r >> 1;
+    this.roundModel.setBindings({ u_slotCell: this.slotCell, u_prev: even ? this.rounds[1] : this.rounds[0] });
+    const framebuffer = even ? this.roundFbos[0] : this.roundFbos[1];
+    this.scatter(this.roundModel, end - first, r < 2 && band === 0 ? { framebuffer, clear: [EMPTY, EMPTY, EMPTY, EMPTY] } : { framebuffer, clear: false });
   }
 
   /**
@@ -465,9 +487,20 @@ export class CollisionGrid {
     this.gather(target, input);
   }
 
-  private draw(model: Model, target: Parameters<typeof beginPass>[1]): void {
+  private draw(model: Model, target: PassTarget): void {
     const pass: RenderPass = beginPass(this.device, target);
     model.draw(pass);
+    pass.end();
+    this.device.submit();
+  }
+
+  /** A point scatter of `points` slots into `target` (a pass with no draw when there are none: it may carry a clear). */
+  private scatter(model: Model, points: number, target: PassTarget): void {
+    const pass: RenderPass = beginPass(this.device, target);
+    if (points > 0) {
+      model.setVertexCount(points);
+      model.draw(pass);
+    }
     pass.end();
     this.device.submit();
   }

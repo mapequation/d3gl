@@ -14,16 +14,22 @@
  *    repaint (a finished copy waits in its PBO until the repaint is due). A read that is not ready is never
  *    forced, and it happens before any encode, so nothing it could wait on is freshly queued. A hidden page
  *    pauses the throttle's stall sampling, so the time a tab spent hidden never delays the next repaint.
- * 2. **Encode.** Work items (P, F_0 … F_{B−1}, I) while the {@link FrameBudget} admits them: at most 33 ms
- *    of frames of layout work in flight (`framesInFlight`: 2 frames at 60 Hz, 4 at 120 Hz), a GPU
- *    budget of `min(10 ms, 0.6 × rAF interval)` per frame, and at most 2 ms of encode time. A tick may
- *    span frames; its result does not depend on how it was sliced.
- * 3. **Copy + fence.** On the repaint's cadence (reading back more often than repainting is waste), and
- *    when the one PBO is free, copy the positions into it; then insert the frame's single budget fence,
- *    which doubles as the copy's fence. The copy carries the reductions' stats, and they always describe
- *    the copied positions: positions change only at a tick's integrate and at its prep (where a drag's held
- *    positions are written, never mid-tick), so a copy after a prep reuses that prep's stats and a copy
- *    between ticks re-runs the reductions first ({@link GpuForceLayout.refreshSegmentStats}).
+ * 2. **Encode.** Work items while the {@link FrameBudget} admits them: at most 33 ms of frames of layout
+ *    work in flight (`framesInFlight`: 2 frames at 60 Hz, 4 at 120 Hz), a GPU budget of `min(10 ms,
+ *    0.6 × rAF interval)` per frame, and at most 2 ms of encode time. A tick is the solver's sequence of
+ *    passes (`stream-schedule.ts`); every pass is cut into row bands of at most half the budget (#382), and
+ *    each band is an item — so no item overruns a frame at any N. A tick may span frames; its result does
+ *    not depend on how it was sliced.
+ * 3. **Readback + copy + fence.** On the repaint's cadence (reading back more often than repainting is
+ *    waste), and when the one PBO is free, the solver's readback passes run as items too (the nested
+ *    layout's composition), exclusively — no tick item runs until the copy — over as many frames as the
+ *    budget needs; then the positions are copied into the PBO. Every frame ends with its single budget
+ *    fence, which doubles as the fence of a copy issued in it. The copy carries the reductions' stats, and
+ *    they always describe the copied positions: for the flat layout, positions change only at a tick's
+ *    integrate and at its prep (where a drag's held positions are written, never mid-tick), so a copy
+ *    after a prep reuses that prep's stats and a copy between ticks re-runs the reductions first
+ *    ({@link GpuForceLayout.refreshSegmentStats}); the nested layout's readback passes reduce the positions
+ *    they compose.
  *
  * `settled` resolves only after positions from the final tick have been harvested, so the engine's
  * settle handler sees them. The run then goes **idle** (the layout stays alive for a drag reheat, #183).
@@ -38,36 +44,21 @@ import { DRAG_HEAT, RECOOL_TICKS } from "../force.js";
 import type { NetworkGraph } from "../graph.js";
 import { deleteSync, insertSync, pollSync } from "../../webgl/fence.js";
 import { AsyncPositionReadback, READBACK_STATS_FLOATS, type ReadbackSource } from "./async-readback.js";
-import { FrameBudget, ITEM_NS_PER_NODE, itemCostMs, type FenceSource, type ItemCosts, type ItemKind } from "./frame-budget.js";
+import { FrameBudget, type FenceSource } from "./frame-budget.js";
+import { StreamSchedule, type StageSource } from "./stream-schedule.js";
 import { MIN_FRAME_MS, RepaintThrottle } from "./repaint-throttle.js";
 import { reportUncaught } from "./report-uncaught.js";
 
 /**
- * A solver the stream drives: a tick is the work items **P** ({@link beginTick}), **F_b**
- * ({@link forceBand}, `b = 0 … B − 1`) and **I** ({@link integrate}) — positions change only in I — and it
- * is its own {@link ReadbackSource}. The flat {@link GpuForceLayout} and the nested layout's batched solve
- * (#355) are both one.
+ * A solver the stream drives, and its own {@link ReadbackSource}: a tick is a sequence of passes
+ * ({@link StageSource.tickStages}), each sliced into bands (`stream-schedule.ts`). The flat
+ * {@link GpuForceLayout} (prep, force, integrate) and the nested layout's batched solve (#355) are both one.
  */
-export interface StreamSolver extends ReadbackSource {
+export interface StreamSolver extends ReadbackSource, StageSource {
   /**
-   * The solver's GPU cost per node of each work item, ns, which the frame budget sizes its bands by.
-   * Default the flat layout's {@link ITEM_NS_PER_NODE}.
-   */
-  readonly itemCosts?: ItemCosts;
-  /**
-   * The estimated GPU time of the next item of `kind`, ms, when it depends on where the solve is (the
-   * nested layout's phases); otherwise the stream estimates it from {@link itemCosts}.
-   */
-  itemCostMs?(kind: ItemKind, bands: number): number;
-  /** Estimated GPU time of {@link prepareReadback}, ms, which a frame that copies reserves in its budget. Default 0. */
-  readonly readbackCostMs?: number;
-  beginTick(): void;
-  forceBand(band: number, bands: number): void;
-  integrate(): void;
-  /**
-   * Make the readback source describe the current positions, right before a copy. `betweenTicks`: the
-   * copy follows an integrate (the next P has not run), so reductions from the last P describe the
-   * positions before it; otherwise it follows a P, whose reductions are current.
+   * The last step right before a copy, after any {@link StageSource.readbackStages}: make the readback
+   * source's stats describe the current positions. `betweenTicks`: the copy follows a tick's last pass (the
+   * next has not started); the flat layout then re-runs its reductions, whose last run was that tick's prep.
    */
   prepareReadback(betweenTicks: boolean): void;
   destroy(): void;
@@ -93,6 +84,8 @@ export interface GpuFrameSample {
   encodeMs: number;
   /** Work items encoded this frame. */
   items: number;
+  /** Their estimated GPU time, ms — within `budgetMs` whenever more than one item ran (#382). */
+  itemsMs: number;
   /** Ticks completed so far in this run. */
   ticksDone: number;
   /** Whether a readback was harvested this frame. */
@@ -103,7 +96,7 @@ export interface GpuFrameSample {
   copied: boolean;
   /** Whether the gate blocked this frame (the frames `framesInFlight` allows were already in flight). */
   blocked: boolean;
-  /** The controller's item cap and band count after this frame, and its budget. */
+  /** The controller's item cap after this frame, the band count of the last sliced pass started, and the budget. */
   k: number;
   bands: number;
   budgetMs: number;
@@ -175,7 +168,6 @@ export class GpuStream {
 
   private readonly gl: WebGL2RenderingContext;
   private readonly layout: StreamSolver;
-  private readonly costs: ItemCosts;
   private readonly drag: DragSolver | null;
   private readonly graph: NetworkGraph;
   private readonly into: Float32Array | null;
@@ -190,7 +182,7 @@ export class GpuStream {
   private readonly readback: AsyncPositionReadback;
   private readonly stats = new Float32Array(READBACK_STATS_FLOATS);
   private readonly sample: GpuFrameSample = {
-    now: 0, harvestMs: 0, repaintMs: 0, encodeMs: 0, items: 0, ticksDone: 0,
+    now: 0, harvestMs: 0, repaintMs: 0, encodeMs: 0, items: 0, itemsMs: 0, ticksDone: 0,
     harvested: false, harvestedTicks: -1, copied: false, blocked: false, k: 1, bands: 1, budgetMs: 0,
   };
   private readonly canvas: EventTarget | null;
@@ -215,12 +207,12 @@ export class GpuStream {
   private heldIds: Uint32Array | null = null;
   private heldPositions: Float32Array | null = null;
 
-  /** Ticks integrated in this run (all modes). */
+  /** Ticks completed in this run (all modes). */
   private ticksDone = 0;
-  /** Next item of the current tick: 0 = P, 1 … bands = F_{phase−1}, bands + 1 = I. */
-  private phase = 0;
-  /** Bands of the current tick, fixed when its P is encoded. */
-  private tickBands = 1;
+  /** Which bands of which passes each frame encodes, the readback's passes included (#382). */
+  private readonly schedule: StreamSchedule;
+  /** The current frame's rAF timestamp (the copy hook reads it). */
+  private now = 0;
   /** The current mode's ticks are done: copy once more (unthrottled), harvest, then {@link finish}. */
   private finishing = false;
 
@@ -246,14 +238,16 @@ export class GpuStream {
     this.iterations = opts.iterations;
     this.frameEvery = opts.frameEvery;
     this.throttle = new RepaintThrottle(opts.minFrameMs ?? MIN_FRAME_MS);
-    this.costs = layout.itemCosts ?? ITEM_NS_PER_NODE;
-    this.budget = new FrameBudget(glFences(this.gl), () => performance.now(), {
-      nodes: layout.nodeCount,
-      rows: layout.atlasRows,
-      costs: this.costs,
-      ...(opts.budgetMs !== undefined ? { budgetMs: opts.budgetMs } : {}),
-    });
+    this.budget = new FrameBudget(glFences(this.gl), () => performance.now(), opts.budgetMs !== undefined ? { budgetMs: opts.budgetMs } : {});
     this.readback = new AsyncPositionReadback(device, layout);
+    this.schedule = new StreamSchedule(this.budget, layout, {
+      tickStart: () => this.writeHeld(),
+      tickEnd: () => {
+        this.ticksDone++;
+        this.tickDone();
+      },
+      copy: (betweenTicks) => this.issueCopy(betweenTicks),
+    });
     this.settled = new Promise<void>((resolve) => {
       this.resolveSettled = resolve;
     });
@@ -378,37 +372,14 @@ export class GpuStream {
     }
     const harvestMs = performance.now() - t0 - repaintMs;
 
-    // 2. Encode work items within the budget.
+    // 2. Encode work items within the budget — a readback being prepared first (nothing may move the
+    // positions before its copy), then the ticks — and 3. a readback on the repaint cadence: its passes as
+    // items, then the copy. Then the frame's one budget fence.
     const t2 = performance.now();
-    let items = 0;
+    this.now = now;
     const open = this.budget.open();
-    // A frame that will copy reserves the readback's own GPU work (the nested layout's composition).
-    if (open && this.copyLikely(now)) this.budget.reserve(this.layout.readbackCostMs ?? 0);
-    if (open) {
-      while (this.hasWork()) {
-        const cost = this.nextItemCost();
-        if (!this.budget.admit(cost)) break;
-        const band = this.phase > 0 && this.phase <= this.tickBands;
-        this.encodeItem();
-        this.budget.spent(cost, band);
-        items++;
-      }
-    }
-
-    // 3. The readback copy (on the repaint cadence), then the frame's one budget fence.
-    const copied = this.copyDue(now);
-    if (copied) {
-      // Between ticks (right after an integrate) the reductions' stats describe the previous positions:
-      // re-run them so the harvest's finiteness check covers the positions it copies. After a prep they
-      // already do — positions change only at integrate and at the prep's held-position write.
-      this.layout.prepareReadback(this.phase === 0);
-      this.readback.issue(this.layout);
-      this.copyTicks = this.ticksDone;
-      this.copyFinal = this.finishing;
-      this.copiedTicks = this.ticksDone;
-      this.throttle.copyIssued(now);
-      this.copyReady = false;
-    }
+    const items = this.schedule.frame(open, this.hasWork, this.copyDue);
+    const copied = this.schedule.copied;
     // `harvested` ⇔ onFrame ran (a failed harvest returned above). Not `repaintMs > 0`: a clamped clock
     // (~1 ms in Firefox and Safari without cross-origin isolation) measures a cheap repaint as 0.
     const frame = this.budget.endFrame(harvested);
@@ -421,13 +392,14 @@ export class GpuStream {
       sample.repaintMs = repaintMs;
       sample.encodeMs = t3 - t2;
       sample.items = items;
+      sample.itemsMs = this.schedule.frameCostMs;
       sample.ticksDone = this.ticksDone;
       sample.harvested = harvested;
       sample.harvestedTicks = harvested ? this.copyTicks : -1;
       sample.copied = copied;
       sample.blocked = !open;
       sample.k = this.budget.k;
-      sample.bands = this.budget.bands;
+      sample.bands = this.schedule.lastBands;
       sample.budgetMs = this.budget.budgetMs;
       for (const observer of observers) observer(sample);
     }
@@ -436,50 +408,40 @@ export class GpuStream {
     else this.looping = false;
   };
 
-  /** Whether the loop still has something to do: ticks to encode, or a copy to harvest and repaint. */
+  /** Whether the loop still has something to do: ticks to encode, a readback to prepare, or a copy to harvest. */
   private active(): boolean {
-    return (this.mode !== "idle" && !this.failed) || this.finishing || this.readback.pending;
+    return (this.mode !== "idle" && !this.failed) || this.finishing || this.schedule.reading || this.readback.pending;
   }
 
   /** Whether the current mode has ticks left to encode (a started tick is always finished). */
-  private hasWork(): boolean {
-    return this.mode !== "idle" && !this.finishing && !this.failed;
-  }
+  private readonly hasWork = (): boolean => this.mode !== "idle" && !this.finishing && !this.failed;
 
-  /** The estimated GPU time of the next item. */
-  private nextItemCost(): number {
-    const n = this.layout.nodeCount;
-    const kind: ItemKind = this.phase === 0 ? "prep" : this.phase <= this.tickBands ? "force" : "integrate";
-    const solverCost = this.layout.itemCostMs?.(kind, this.tickBands);
-    if (solverCost !== undefined) return solverCost;
-    if (this.phase === 0) return itemCostMs("prep", n, 1, this.costs);
-    if (this.phase <= this.tickBands) return itemCostMs("force", n, this.tickBands, this.costs);
-    return itemCostMs("integrate", n, 1, this.costs);
-  }
-
-  /** Encode the next work item of the current tick. */
-  private encodeItem(): void {
-    if (this.phase === 0) {
-      this.tickBands = Math.min(this.budget.bands, this.layout.atlasRows);
-      if (this.heldIds && this.heldPositions && this.drag) {
-        this.drag.setHeldPositions(this.heldIds, this.heldPositions);
-        this.heldIds = null;
-        this.heldPositions = null;
-      }
-      this.layout.beginTick();
-      this.phase = 1;
-    } else if (this.phase <= this.tickBands) {
-      this.layout.forceBand(this.phase - 1, this.tickBands);
-      this.phase++;
-    } else {
-      this.layout.integrate();
-      this.phase = 0;
-      this.ticksDone++;
-      this.tickDone();
+  /** A tick's first band is next: write a drag's latest held positions, so the whole tick sees one set. */
+  private writeHeld(): void {
+    if (this.heldIds && this.heldPositions && this.drag) {
+      this.drag.setHeldPositions(this.heldIds, this.heldPositions);
+      this.heldIds = null;
+      this.heldPositions = null;
     }
   }
 
-  /** A tick was integrated: advance the mode's schedule. */
+  /**
+   * Copy the positions into the PBO, fenced by this frame's budget fence. Between ticks the flat layout's
+   * stats describe the previous positions, so {@link StreamSolver.prepareReadback} re-runs its reductions
+   * first; after a prep they already describe these (positions change only at integrate and at the prep's
+   * held-position write).
+   */
+  private issueCopy(betweenTicks: boolean): void {
+    this.layout.prepareReadback(betweenTicks);
+    this.readback.issue(this.layout);
+    this.copyTicks = this.ticksDone;
+    this.copyFinal = this.finishing;
+    this.copiedTicks = this.ticksDone;
+    this.throttle.copyIssued(this.now);
+    this.copyReady = false;
+  }
+
+  /** A tick was completed: advance the mode's schedule. */
   private tickDone(): void {
     if (this.mode === "run" && this.ticksDone >= this.iterations) {
       if (this.dragging) {
@@ -513,29 +475,20 @@ export class GpuStream {
   }
 
   /**
-   * Whether this frame will likely copy, asked before encoding (to reserve the copy's GPU time):
-   * {@link copyDue}, counting on one more tick.
-   */
-  private copyLikely(now: number): boolean {
-    return this.copyDue(now, 1);
-  }
-
-  /**
-   * Whether to copy positions this frame: the PBO is free, there are new ticks, and the copy would be
+   * Whether to start a readback this frame: the PBO is free, there are new ticks, and the copy would be
    * ready (after the usual copy → ready latency) when the next repaint is due — so a harvested frame is
-   * about one frame old, not a whole repaint interval. `lookahead`: ticks the frame will still complete
-   * before the copy ({@link copyLikely} asks before encoding).
+   * about one frame old, not a whole repaint interval.
    */
-  private copyDue(now: number, lookahead = 0): boolean {
+  private readonly copyDue = (): boolean => {
     if (this.readback.pending) return false;
     // The final copy goes out as soon as the PBO is free; its harvest clears `finishing` (finish()).
     if (this.finishing) return true;
     if (!this.streaming) return false;
-    const fresh = this.ticksDone + lookahead - this.copiedTicks;
+    const fresh = this.ticksDone - this.copiedTicks;
     if (fresh <= 0) return false;
     if (this.frameEvery !== undefined) return fresh >= this.frameEvery;
-    return this.throttle.copyDue(now);
-  }
+    return this.throttle.copyDue(this.now);
+  };
 
   // ── Lifecycle ──────────────────────────────────────────────────────────────
 
@@ -559,6 +512,7 @@ export class GpuStream {
     if (this.raf) cancelAnimationFrame(this.raf);
     this.raf = 0;
     this.looping = false;
+    this.schedule.abandon();
     this.readback.abandon();
     this.canvas?.removeEventListener("webglcontextlost", this.onContextLost);
     this.page?.removeEventListener("visibilitychange", this.onVisibilityChange);

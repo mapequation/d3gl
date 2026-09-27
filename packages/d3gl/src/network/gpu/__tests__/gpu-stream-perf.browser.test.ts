@@ -41,7 +41,7 @@ import { network, type Network } from "../../network.js";
 import { buildGraph, type NetworkGraph } from "../../graph.js";
 import { DEFAULT_FORCE, seedPositions } from "../../force.js";
 import { GpuForceLayout } from "../gpu-force-layout.js";
-import { DEFAULT_BUDGET_MS, frameBudgetMs, staticBands } from "../frame-budget.js";
+import { DEFAULT_BUDGET_MS, frameBudgetMs, itemCostMs, stageBands } from "../frame-budget.js";
 import { observeGpuLayoutFrames, type GpuFrameSample } from "../gpu-stream.js";
 import { MIN_FRAME_MS } from "../repaint-throttle.js";
 import { makeTestDevice } from "./_device.js";
@@ -458,7 +458,7 @@ describe("GPU layout streaming per frame (#352) — network().layout({ backend: 
       gpuOnlyReport = `B=1 ${gpuOnlyTicksPerSec.toFixed(1)} ticks/s (encode ${(encodeMs / 10).toFixed(2)} ms/tick)`;
       // The static band counts the stream starts from at 60 Hz and 120 Hz (report only; 5 ticks keep the
       // SwiftShader tier's cost small).
-      const sliced = new Set([60, 120].map((hz) => staticBands(N, frameBudgetMs(DEFAULT_BUDGET_MS, 1000 / hz), solo.atlasRows)));
+      const sliced = new Set([60, 120].map((hz) => stageBands(itemCostMs("force", N, 1), frameBudgetMs(DEFAULT_BUDGET_MS, 1000 / hz), solo.atlasRows)));
       for (const bands of sliced) {
         if (bands === 1) continue;
         const { ticksPerSec, encodeMsPerTick } = slicedRate(solo, out, bands, 5);

@@ -5,6 +5,7 @@ import { buildHubChunks } from "./hub-chunks.js";
 import { atlasWidth, packFloatTexture, packUintTexture } from "./textures.js";
 import { AttractionPass, HubChunkPass, type CsrTextures, type HubChunkTextures, type NestedSpringInputs } from "./passes/attraction.js";
 import { beginPass } from "./passes/fullscreen.js";
+import { bandRows } from "./segments.js";
 
 /** Uniforms for one spring draw. */
 export interface SpringUniforms {
@@ -84,16 +85,24 @@ export class GpuSprings {
     return this.hubs?.count ?? 0;
   }
 
+  /** Rows of the hub chunk atlas — the most bands {@link prepare} can cut (0 without hubs). */
+  get hubRows(): number {
+    const hubs = this.hubs;
+    return hubs ? Math.ceil(hubs.count / hubs.width) : 0;
+  }
+
   /**
-   * Encode the hub chunk pass over the current positions: its own render pass into the partials
-   * texture, submitted before the caller opens the force pass that {@link draw}s into. No-op (no render
-   * pass, no draw) when the graph has no hubs.
+   * Encode the hub chunk pass over the current positions — over the chunk atlas rows of band `band` of
+   * `bands` (#382): its own render pass into the partials texture, submitted before the caller opens the
+   * force pass that {@link draw}s into. No-op (no render pass, no draw) when the graph has no hubs.
    */
-  prepare(posTex: Texture, width: number, nested?: NestedSpringInputs): void {
+  prepare(posTex: Texture, width: number, nested?: NestedSpringInputs, band = 0, bands = 1): void {
     const hubs = this.hubs;
     if (!hubs) return;
+    const [r0, r1] = bandRows(band, bands, this.hubRows);
+    if (r1 <= r0) return;
     // Every partials texel is written (padding with 0), so the target is never cleared.
-    const pass = beginPass(this.device, { framebuffer: hubs.fbo, clear: false });
+    const pass = beginPass(this.device, bands > 1 ? { framebuffer: hubs.fbo, clear: false, scissor: [0, r0, hubs.width, r1 - r0] } : { framebuffer: hubs.fbo, clear: false });
     hubs.pass.run(pass, posTex, this.csr, hubs, { width, nbrWidth: this.nbrWidth }, nested);
     pass.end();
     this.device.submit();

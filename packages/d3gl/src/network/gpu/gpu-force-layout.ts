@@ -11,6 +11,8 @@ import { CenteringPass } from "./passes/centering.js";
 import { beginPass } from "./passes/fullscreen.js";
 import { SegmentedReduce } from "./passes/segmented-reduce.js";
 import { SegmentTable, type SegmentRow } from "./segment-table.js";
+import { itemCostMs } from "./frame-budget.js";
+import type { StreamStage } from "./stream-schedule.js";
 import {
   FLAT_TILE_MIN_SIDE,
   TILE_MIN_SIDE,
@@ -103,6 +105,11 @@ export class GpuForceLayout {
   /** Repulsion per segment: the tile-root traversal for tiled segments, the exact loop for the rest. */
   private readonly repulsionPass: RepulsionPass;
   private readonly centeringPass: CenteringPass;
+  /**
+   * A streamed tick's passes (#352, #382): {@link beginTick} and {@link integrate} whole, the force pass
+   * ({@link forceBand}) in row bands — with the flat cost model's estimates (`ITEM_NS_PER_NODE`).
+   */
+  private readonly stages: readonly StreamStage[];
 
   /**
    * The segment table — S = 1 for the flat layout: one segment `[0, count)`. Each segment's `stats`
@@ -385,6 +392,18 @@ export class GpuForceLayout {
       exact: atlas.levels.length === 0 || rows.some((row) => row.tile === null && row.count > 0),
     });
     this.centeringPass = new CenteringPass(device, singleSegment);
+
+    const n = this.count;
+    this.stages = [
+      { costMs: itemCostMs("prep", n, 1), fixedMs: 0, rows: 1, run: () => this.beginTick() },
+      { costMs: itemCostMs("force", n, 1), fixedMs: 0, rows: height, run: (band, bands) => this.forceBand(band, bands) },
+      { costMs: itemCostMs("integrate", n, 1), fixedMs: 0, rows: 1, run: () => this.integrate() },
+    ];
+  }
+
+  /** The passes of a streamed tick: P, the force pass in row bands, I (see {@link beginTick}). */
+  tickStages(): readonly StreamStage[] {
+    return this.stages;
   }
 
   /** Cool from heat `from` over `ticks` ticks — the CPU {@link ForceLayout.cool} schedule. */

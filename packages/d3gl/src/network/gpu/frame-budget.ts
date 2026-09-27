@@ -4,9 +4,10 @@
 //
 // The GPU layout shares one GL context with the renderer, and the GPU does not preempt a draw. So a
 // frame that queues a whole tick (13-17 ms at 325k, 45-55 ms at 1M) makes the next rendered frame wait
-// behind it. The transport therefore encodes a tick as **work items** — P (prep: reductions, pyramid,
-// hub chunks, force clear), F_b (the force pass over row band b of B) and I (integrate) — and this
-// controller decides, per frame, how many of them to encode:
+// behind it. The transport therefore encodes a tick as **work items**: a tick is a sequence of passes
+// (the flat layout's P, force and I; the nested layout's reductions, pyramid, springs, collision, …),
+// each cut into row bands, and each band is one item (`stream-schedule.ts`).
+// This controller sizes the bands and decides, per frame, how many items to encode:
 //
 // - **Gate: at most 2 frames in flight** at 60 Hz — stated in time, 33 ms, so 4 frames at 120 Hz (a
 //   frame's layout work is at most its budget, so the queued layout work stays ≤ ~20 ms at any rate;
@@ -15,21 +16,27 @@
 //   behind, so it encodes nothing, halves `k` (to half of what the late frame — the oldest in flight —
 //   encoded) and holds it for 30 frames. Only that frame's lateness counts: the GPU runs work in order,
 //   so nothing queued after its fence can have delayed it. A miss is not the layout's own, and only
-//   blocks without resizing `k` or B, when the late frame encoded no item, or when an engine repaint
+//   blocks without resizing `k` or the bands, when the late frame encoded no item, or when an engine repaint
 //   ran on the GPU ahead of its items — in the late frame itself, or in a frame that completed within
 //   the last n frames before it. Repaint draws are not layout work, and the repaint throttle already
 //   bounds them.
 // - **`k` counts items**, not ticks, so a tick may span frames. It grows by one per frame while it is
 //   the binding limit and no hold is active.
 // - **Budget.** `min(budgetMs, 0.6 × median rAF interval)`: 10 ms at 60 Hz, 5 ms at 120 Hz. The items
-//   of one frame are admitted while their *estimated* GPU time ({@link itemCostMs}) fits it; the first
-//   item always runs, so a run always progresses.
-// - **Bands.** B starts from the static estimate (a band ≈ half the budget); it doubles when one item
-//   per frame still misses the gate *and a force band was among the late items* (slicing cannot shrink
-//   P or I), up to 8× the static estimate, and halves — with `k` halved alongside, so a frame's GPU work stays the same — once two or
-//   more items per frame have fit for 30 frames without a miss. (The spec's first draft halved only when
-//   a whole tick fit in one frame; that can never happen again once B is large, so one transient stall —
-//   a first-use shader compile — ratcheted B up for good: measured 64 bands and 0.4 ticks/s.)
+//   of one frame are admitted while their *estimated* GPU time fits it; the first item always runs, so a
+//   run always progresses.
+// - **Bands.** Every pass of a tick is sliceable into row bands (#382): a pass whose estimated GPU time
+//   is c, plus f that each band pays whatever its size, is cut into `⌈g · c / (budget / 2 − f)⌉` bands
+//   ({@link stageBands}; into bands of the whole budget when f is more than a quarter of it), so no band is
+//   estimated above half the budget — or above the budget, for such a pass — and a frame's first item
+//   never overruns it, at any N. `g` is one **band growth** shared by
+//   every pass: it doubles when one item per frame still misses the gate *and a sliceable item was late*
+//   (slicing cannot shrink a pass of one row), up to 8×, and halves — with `k` halved alongside, so a
+//   frame's GPU work stays the same — once two or more items per frame have fit for 30 frames without a
+//   miss. It scales the cost estimate, not the band count, so a pass far below half the budget stays one
+//   band however slow the GPU. (The spec's first draft halved only when a whole tick fit in one frame;
+//   that can never happen again once B is large, so one transient stall — a first-use shader compile —
+//   ratcheted B up for good: measured 64 bands and 0.4 ticks/s.)
 // - **Main-thread cap.** Items are also admitted only while the measured encode time of the frame stays
 //   within `encodeCapMs` (2 ms) — the binding limit at small N, where the GPU work is tiny.
 //
@@ -74,9 +81,9 @@ const MAX_IN_FLIGHT_FRAMES = 8;
 /** Upper bound on the row bands of one force pass (≥ 9 rows each at 325k's 571 rows). */
 export const MAX_BANDS = 64;
 /**
- * Adaptive slicing stops at this multiple of the static estimate: room for a GPU 8× slower than the
- * calibration device. Past it a thinner band stops paying for itself — each band re-runs the force
- * pass's fixed setup (measured on SwiftShader at 100k: a 1/16 band costs 22% of the whole pass, not 6%).
+ * Adaptive slicing stops at this multiple of the cost estimate: room for a GPU 8× slower than the
+ * calibration device. Past it a thinner band stops paying for itself — each band re-runs the pass's
+ * fixed setup (measured on SwiftShader at 100k: a 1/16 force band costs 22% of the whole pass, not 6%).
  */
 export const MAX_BAND_GROWTH = 8;
 /** Upper bound on `k`: a guard, not a tuning knob (the budget and the encode cap bind first). */
@@ -115,27 +122,35 @@ export function frameBudgetMs(limitMs: number, intervalMs: number): number {
   return Math.min(limitMs, BUDGET_SHARE * intervalMs);
 }
 
+/** The GPU time a band aims at: half the frame budget, so two fit a frame and the first never overruns it. */
+export function bandTargetMs(budgetMs: number): number {
+  return budgetMs / 2;
+}
+
 /**
- * The static band count: bands of about half the budget, at least 1 and at most the atlas rows (and
- * {@link MAX_BANDS}). 325k at 10 ms → 3; 1M → 8.
+ * The bands a pass is cut into (#382). `costMs` is the pass's estimated GPU time that slicing divides,
+ * `fixedMs` what every band pays whatever its size (its render passes' setup, or the longest single
+ * fragment, which every band may have to wait for), and `growth` the fence controller's band growth. A band
+ * aims at half the budget ({@link bandTargetMs}), so two fit a frame: `⌈g · costMs / (target − fixedMs)⌉`
+ * bands. A pass whose fixed cost is more than half that target would pay it on many thin bands, so its bands
+ * aim at the whole budget instead (one per frame): `⌈g · costMs / (budget − fixedMs)⌉`. Either way a band
+ * gets at least half a target of divisible work — past `fixedMs ≥ 0.75 · budget` no band count keeps it
+ * within the budget. At least 1 band, at most `rows` (a pass cannot be cut finer than its rows) and
+ * {@link MAX_BANDS}. The flat force pass at a 10 ms budget: 325k → 3 bands, 1M → 8; at 5 ms (120 Hz), 1M → 16.
  */
-export function staticBands(nodes: number, budgetMs: number, rows: number, costs: ItemCosts = ITEM_NS_PER_NODE): number {
-  const b = Math.ceil(itemCostMs("force", nodes, 1, costs) / (budgetMs / 2));
+export function stageBands(costMs: number, budgetMs: number, rows: number, growth = 1, fixedMs = 0): number {
+  const target = bandTargetMs(budgetMs);
+  const room = fixedMs <= target / 2 ? target - fixedMs : budgetMs - fixedMs;
+  const b = Math.ceil((growth * costMs) / Math.max(room, target / 2));
   return Math.max(1, Math.min(b, rows, MAX_BANDS));
 }
 
 /** Sizing inputs of a {@link FrameBudget}. */
 export interface FrameBudgetOptions {
-  /** Nodes the solver processes per item (every node, whatever the LOD state). */
-  nodes: number;
-  /** Rows of the position atlas: the most bands a force pass can be cut into. */
-  rows: number;
   /** GPU budget per frame before the rAF clamp. Default {@link DEFAULT_BUDGET_MS}. */
   budgetMs?: number;
   /** Main-thread encode time per frame. Default {@link ENCODE_CAP_MS}. */
   encodeCapMs?: number;
-  /** The solver's cost model. Default the flat layout's {@link ITEM_NS_PER_NODE}. */
-  costs?: ItemCosts;
 }
 
 /**
@@ -148,16 +163,13 @@ export interface FrameBudgetOptions {
 export class FrameBudget<F> {
   private readonly fences: FenceSource<F>;
   private readonly clock: () => number;
-  private readonly nodes: number;
-  private readonly costs: ItemCosts;
-  private readonly maxBands: number;
   private readonly limitMs: number;
   private readonly encodeCapMs: number;
   /** Pending fences, oldest first, and the frame each one closed (parallel queues). */
   private readonly queue: F[] = [];
   private readonly queueFrames: number[] = [];
-  /** Whether each queued frame encoded a force band (so a miss on it is one slicing can help). */
-  private readonly queueForce: boolean[] = [];
+  /** Whether each queued frame encoded a sliceable item (so a miss on it is one slicing can help). */
+  private readonly queueSliced: boolean[] = [];
   /** Whether each queued frame also carried the engine's repaint (so a miss on it is not the layout's). */
   private readonly queueRepaint: boolean[] = [];
   /** Work items each queued frame encoded (a miss halves `k` from the late frame's count). */
@@ -181,7 +193,8 @@ export class FrameBudget<F> {
   private done = 0;
   private items = 1;
   private hold = 0;
-  private adaptiveBands = 1;
+  /** The band growth `g` (1, 2, 4 or 8): the factor every pass's cost estimate is sliced by. */
+  private bandGrowth = 1;
   /** Consecutive open frames that absorbed ≥ 2 items with no miss. */
   private fitStreak = 0;
   private blockedPrev = false;
@@ -191,16 +204,13 @@ export class FrameBudget<F> {
   private opened = false;
   private frameItems = 0;
   private frameCostMs = 0;
-  private frameForce = false;
+  private frameSliced = false;
   private openedAt = 0;
   private itemStart = 0;
 
-  constructor(fences: FenceSource<F>, clock: () => number, opts: FrameBudgetOptions) {
+  constructor(fences: FenceSource<F>, clock: () => number, opts: FrameBudgetOptions = {}) {
     this.fences = fences;
     this.clock = clock;
-    this.nodes = opts.nodes;
-    this.costs = opts.costs ?? ITEM_NS_PER_NODE;
-    this.maxBands = Math.max(1, Math.min(opts.rows, MAX_BANDS));
     this.limitMs = opts.budgetMs ?? DEFAULT_BUDGET_MS;
     this.encodeCapMs = opts.encodeCapMs ?? ENCODE_CAP_MS;
     this.frameBudget = frameBudgetMs(this.limitMs, DEFAULT_INTERVAL_MS);
@@ -221,9 +231,18 @@ export class FrameBudget<F> {
     return this.median;
   }
 
-  /** Row bands for the next tick's force pass: the adaptive count, never below the static estimate. */
-  get bands(): number {
-    return Math.min(this.maxBands, Math.max(this.adaptiveBands, staticBands(this.nodes, this.budgetMs, this.maxBands, this.costs)));
+  /** The band growth `g`: 1 until one item per frame misses, then up to {@link MAX_BAND_GROWTH}. */
+  get growth(): number {
+    return this.bandGrowth;
+  }
+
+  /**
+   * The row bands of a pass that starts now ({@link stageBands} at this frame's budget and the current
+   * growth): `costMs` its estimated GPU time, `rows` the most bands it can be cut into, `fixedMs` what
+   * each band pays whatever its size.
+   */
+  bandsFor(costMs: number, rows: number, fixedMs = 0): number {
+    return stageBands(costMs, this.frameBudget, rows, this.bandGrowth, fixedMs);
   }
 
   /** The last frame whose budget fence has signalled: all its GPU work, readback copy included, is done. */
@@ -257,7 +276,7 @@ export class FrameBudget<F> {
     this.opened = false;
     this.frameItems = 0;
     this.frameCostMs = 0;
-    this.frameForce = false;
+    this.frameSliced = false;
     while (this.queue.length > 0) {
       const fence = this.queue[0];
       const frame = this.queueFrames[0];
@@ -270,7 +289,7 @@ export class FrameBudget<F> {
       if (this.queueRepaint[0] === true) this.repaintDone = frame;
       this.queue.shift();
       this.queueFrames.shift();
-      this.queueForce.shift();
+      this.queueSliced.shift();
       this.queueRepaint.shift();
       this.queueItems.shift();
     }
@@ -280,16 +299,16 @@ export class FrameBudget<F> {
   /**
    * The gate: whether this frame may encode items (the fence of frame f−n has signalled, n from
    * {@link framesInFlight}). A blocked frame starting a miss that is the layout's own
-   * ({@link layoutMiss}) halves `k` to half of what the late frame encoded — and doubles B when `k` was
-   * already 1 and the late frame held a force band — then holds `k`; any other miss only blocks.
+   * ({@link layoutMiss}) halves `k` to half of what the late frame encoded — and doubles the band growth
+   * when `k` was already 1 and the late frame held a sliceable item — then holds `k`; any other miss only
+   * blocks.
    */
   open(): boolean {
     const blocked = this.queue.length >= this.maxInFlight;
     if (blocked) {
       if (!this.blockedPrev && this.layoutMiss()) {
-        if (this.items === 1 && this.queueForce[0] === true) {
-          const cap = MAX_BAND_GROWTH * staticBands(this.nodes, this.frameBudget, this.maxBands, this.costs);
-          this.adaptiveBands = Math.min(this.maxBands, cap, this.bands * 2);
+        if (this.items === 1 && this.queueSliced[0] === true) {
+          this.bandGrowth = Math.min(MAX_BAND_GROWTH, this.bandGrowth * 2);
         }
         this.items = Math.max(1, Math.floor((this.queueItems[0] ?? 0) / 2));
         this.hold = HOLD_FRAMES;
@@ -323,23 +342,15 @@ export class FrameBudget<F> {
   }
 
   /**
-   * Count `ms` of GPU work the transport will add to this frame outside the items — a readback's
-   * composition — against its budget. The first item is still always admitted.
-   */
-  reserve(ms: number): void {
-    if (this.opened) this.frameCostMs += ms;
-  }
-
-  /**
    * Record that the admitted item was encoded (its measured encode time feeds the cap). `sliceable`:
-   * the item is a force band, whose size B controls.
+   * the item holds a band of a pass of more than one row, whose size the band growth controls.
    */
   spent(costMs: number, sliceable = false): void {
     const dt = this.clock() - this.itemStart;
     this.encodeAvgMs = this.encodeAvgMs === 0 ? dt : this.encodeAvgMs * 0.8 + dt * 0.2;
     this.frameItems++;
     this.frameCostMs += costMs;
-    if (sliceable) this.frameForce = true;
+    if (sliceable) this.frameSliced = true;
   }
 
   /**
@@ -351,13 +362,12 @@ export class FrameBudget<F> {
     if (this.opened) {
       if (this.frameItems >= this.items && this.hold === 0) this.items = Math.min(MAX_ITEMS, this.items + 1);
       // Two items per frame have fit for HOLD_FRAMES frames: one item twice the size fits as well.
-      // Halve B (down to the static estimate) and k with it, so the next frames queue the same work.
+      // Halve the band growth (down to 1) and k with it, so the next frames queue the same work.
       if (this.frameItems >= 2) {
         if (++this.fitStreak >= HOLD_FRAMES) {
           this.fitStreak = 0;
-          const floor = staticBands(this.nodes, this.frameBudget, this.maxBands, this.costs);
-          if (this.adaptiveBands > floor) {
-            this.adaptiveBands = Math.max(floor, Math.floor(this.adaptiveBands / 2));
+          if (this.bandGrowth > 1) {
+            this.bandGrowth /= 2;
             this.items = Math.max(1, Math.floor(this.items / 2));
           }
         }
@@ -367,7 +377,7 @@ export class FrameBudget<F> {
     }
     this.queue.push(this.fences.insert());
     this.queueFrames.push(this.frameIndex);
-    this.queueForce.push(this.frameForce);
+    this.queueSliced.push(this.frameSliced);
     this.queueRepaint.push(repainted);
     this.queueItems.push(this.frameItems);
     return this.frameIndex;
@@ -383,7 +393,7 @@ export class FrameBudget<F> {
     if (dropFences) for (const fence of this.queue) this.fences.drop(fence);
     this.queue.length = 0;
     this.queueFrames.length = 0;
-    this.queueForce.length = 0;
+    this.queueSliced.length = 0;
     this.queueRepaint.length = 0;
     this.queueItems.length = 0;
   }

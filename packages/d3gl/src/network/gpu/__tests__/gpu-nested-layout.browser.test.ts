@@ -220,28 +220,83 @@ describe("GPU nested layout (#355) against its Jacobi reference", () => {
     }
   });
 
-  it("is bitwise independent of how its stream ticks are cut into bands (repulsion and collision gathers)", () => {
+  it("is bitwise independent of how every pass of its stream ticks and readbacks is cut into bands (#382)", () => {
+    // A 600-child segment (tiles, the collision grid, overflow) among exact ones, over 3 depths.
     const { topo: tree, size } = makeTree([600, 45, 90, 12], 2, 2, 13);
     const solver = nestedSolverTopology(tree, { size, iterations: 20 });
     const whole = new GpuNestedLayout(device, solver);
     const sliced = new GpuNestedLayout(device, solver);
-    try {
-      whole.runTicks(solver.iterations);
-      for (let t = 0; t < sliced.streamTicks; t++) {
-        const bands = 1 + (t % 5); // 1 … 5 bands, a different cut every stream tick
-        sliced.beginTick();
-        for (let b = 0; b < bands; b++) sliced.forceBand(b, bands);
-        sliced.integrate();
+    const leaves = solver.leafCount;
+    const modules = solver.treeSize - leaves;
+    const composed = (layout: GpuNestedLayout, cut: (stage: number) => number): Float32Array => {
+      for (const [i, stage] of layout.readbackStages().entries()) {
+        const bands = Math.min(stage.rows, cut(i));
+        for (let b = 0; b < bands; b++) stage.run(b, bands);
       }
+      const { width, height, framebuffer } = layout.packed;
+      const px = device.readPixelsToArrayWebGL(framebuffer, { sourceWidth: width, sourceHeight: height });
+      if (!(px instanceof Float32Array)) throw new Error("expected a float readback");
+      return px.slice(0, 4 * Math.ceil(leaves / 2) + 4 * modules);
+    };
+    try {
+      let t = 0;
+      let passes = 0;
+      while (whole.ticks < solver.iterations) {
+        for (const stage of whole.tickStages()) stage.run(0, 1);
+        // A different cut for every pass: 1 … 7 bands (at most its rows), cycling through the stream ticks.
+        for (const stage of sliced.tickStages()) {
+          const bands = Math.min(stage.rows, 1 + ((t + passes++) % 7));
+          for (let b = 0; b < bands; b++) stage.run(b, bands);
+        }
+        t++;
+        if (t % 7 === 3) {
+          // A readback between two ticks — sliced on one side — changes nothing the solve reads.
+          expect(Array.from(composed(sliced, (i) => 2 + i))).toEqual(Array.from(composed(whole, () => 1)));
+        }
+      }
+      expect(t).toBe(sliced.streamTicks);
+      expect(passes).toBeGreaterThan(t * 4);
       expect(sliced.ticks).toBe(solver.iterations);
       const a = new Float32Array(2 * solver.slotCount);
       const b = new Float32Array(2 * solver.slotCount);
       whole.readLocal(a);
       sliced.readLocal(b);
       expect(Array.from(b)).toEqual(Array.from(a));
+      expect(Array.from(composed(sliced, (i) => 3 + 2 * i))).toEqual(Array.from(composed(whole, () => 1)));
     } finally {
       whole.destroy();
       sliced.destroy();
+    }
+  });
+
+  it("a readback between any two bands of a tick leaves the solve bitwise unchanged (#382)", () => {
+    // The stream may compose between any two work items: the composition has its own scratch and sums.
+    const { topo: tree, size } = makeTree([600, 45, 90, 12], 2, 2, 13);
+    const solver = nestedSolverTopology(tree, { size, iterations: 12 });
+    const plain = new GpuNestedLayout(device, solver);
+    const probed = new GpuNestedLayout(device, solver);
+    try {
+      while (plain.ticks < solver.iterations) {
+        for (const stage of plain.tickStages()) {
+          const bands = Math.min(2, stage.rows);
+          for (let b = 0; b < bands; b++) stage.run(b, bands);
+        }
+        for (const stage of probed.tickStages()) {
+          const bands = Math.min(2, stage.rows);
+          for (let b = 0; b < bands; b++) {
+            stage.run(b, bands);
+            probed.composeReadback();
+          }
+        }
+      }
+      const a = new Float32Array(2 * solver.slotCount);
+      const b = new Float32Array(2 * solver.slotCount);
+      plain.readLocal(a);
+      probed.readLocal(b);
+      expect(Array.from(b)).toEqual(Array.from(a));
+    } finally {
+      plain.destroy();
+      probed.destroy();
     }
   });
 

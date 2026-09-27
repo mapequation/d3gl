@@ -2,6 +2,7 @@ import type { Device, Framebuffer, SamplerProps, Texture } from "@luma.gl/core";
 import type { Model } from "@luma.gl/engine";
 import { SLOT_TEXEL_GLSL, atlasWidth } from "../textures.js";
 import { SEGMENT_OF_GLSL, segmentDefines, type SegmentTable } from "../segment-table.js";
+import { bandRows } from "../segments.js";
 import { beginPass, fullScreenModel, NO_BLEND, type PassUniforms } from "./fullscreen.js";
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -114,8 +115,10 @@ export interface ComposeInput {
   radius: Texture;
   slotSeg: Texture;
   width: number;
-  /** The segment table: `info`, and `stats` holding the weighted-centroid sums of the current positions. */
+  /** The segment table (its `info`). */
   segments: SegmentTable;
+  /** Per segment `(Σ rad² x, Σ rad² y, Σ rad², k)` of the current positions (the segment table's atlas). */
+  segSum: Texture;
   /** Per segment, x = its children's extent about their centroid. */
   segExtent: Texture;
   segNested: Texture;
@@ -178,8 +181,13 @@ export class NestedComposePass {
     this.model = fullScreenModel(device, composeFs(depth), this.uniforms, NO_BLEND);
   }
 
-  /** Compose every leaf's and module's world position into the staging texture (every texel written). */
-  run(input: ComposeInput): void {
+  /**
+   * Compose every leaf's and module's world position into the staging texture's rows of band `band` of
+   * `bands` (a scissor; every texel of them written, so the bands tile the texture with no clear, #382).
+   */
+  run(input: ComposeInput, band = 0, bands = 1): void {
+    const [r0, r1] = bandRows(band, bands, this.height);
+    if (r1 <= r0) return;
     const u = this.uniforms;
     u["u_width"] = input.width;
     u["u_tableWidth"] = input.segments.width;
@@ -192,14 +200,14 @@ export class NestedComposePass {
     this.model.setBindings({
       u_pos: input.pos,
       u_rad: input.radius,
-      u_segSum: input.segments.stats,
+      u_segSum: input.segSum,
       u_segExtent: input.segExtent,
       u_segNested: input.segNested,
       u_segInfo: input.segments.info,
       u_nodeSlot: this.nodeSlot,
       u_slotSeg: input.slotSeg,
     });
-    const pass = beginPass(this.device, { framebuffer: this.framebuffer, clear: false });
+    const pass = beginPass(this.device, bands > 1 ? { framebuffer: this.framebuffer, clear: false, scissor: [0, r0, this.width, r1 - r0] } : { framebuffer: this.framebuffer, clear: false });
     this.model.draw(pass);
     pass.end();
     this.device.submit();
