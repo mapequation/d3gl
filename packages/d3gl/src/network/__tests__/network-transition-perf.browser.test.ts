@@ -1,5 +1,7 @@
 import { describe, it, expect, beforeAll, vi } from "vitest";
+import { zoomTransform } from "d3-zoom";
 import { Network, type NetworkOptions } from "../network.js";
+import type { ViewTransform } from "../../core/index.js";
 import { buildGraph } from "../graph.js";
 import type { ModuleNode } from "../modules.js";
 import { perfBudget, perfN } from "../../__tests__/perf-budget.js";
@@ -68,13 +70,20 @@ vi.mock("../glyphs.js", async (importOriginal) => {
  * bytes per frame within the streamed frame's; `nodeFill` (resolved once at registration) never re-runs;
  * `linkStroke` no more often than on a streamed frame.
  *
- * **With `fit`** (#427) the camera eases along: each frame also moves the view — O(1): an interpolation, the
- * backend transform and the zoom re-seed — and the fit's O(nodes) box runs once, when the transition
- * starts, never per frame. A fitted transition frame is timed against an unfitted one at an equal view
- * (the transition is an hour long, so the camera's eased step is ~1e-12 and the drawn frontier is the
- * same): the camera is set exactly once per frame, the box 0 times over the frames (1 at the start), and
- * it runs exactly as many LOD cuts (one per frame with LOD on) and style resolutions (none), with no more
- * uploads or buffer churn; its median stays within 1.3× + 1 ms of the unfitted frame's.
+ * **With `fit`** (#427) the camera eases along: each frame also moves the view — O(1): the view framing the
+ * target box, the camera path, the backend transform and the d3-zoom re-seed (zoom is enabled on the
+ * engine, as in the Navigator, so the re-seed really runs) — and the fit's O(nodes) box runs once, when the
+ * transition starts, never per frame. Two fitted legs, each timed against the unfitted transition:
+ *   - **still camera**, LOD on and off: the transition is an hour long, so the camera's eased step is ~1e-12
+ *     and the drawn frontier is the same — which is what makes the LOD-on cut counts comparable. The camera
+ *     is set exactly once per frame, the box 0 times over the frames (1 at the start), and the frame runs
+ *     exactly as many LOD cuts (one per frame with LOD on) and style resolutions (none), with no more uploads
+ *     or buffer churn and no gesture boundary; its median stays within 1.3× + 1 ms of the unfitted frame's.
+ *   - **moving camera**, LOD off (where a frame's work does not depend on the view): a 1 s transition to a
+ *     layout twice the extent, stepped on a virtual clock so every timed frame is mid-ease — the fitted
+ *     camera zooms out about 2× across them — against the unfitted transition on the same clock. Same
+ *     signatures, same budget: a zoom that really changes `k` adds nothing but the O(1) camera. Up to
+ *     {@link MOVING_MAX} nodes (see there).
  */
 
 // 100k locally, the browser tier's CI scale too (#343): the LOD ON ratio below needs the style pass to be a
@@ -96,6 +105,18 @@ const SETUP_MS = perfBudget(120_000 + N / 2);
 // ceilings are the same functions of N as before.
 const FRAME_MS_OFF = perfBudget(4 + (4 * N) / 50_000);
 const FRAME_MS_ON = perfBudget(20 + (10 * N) / 50_000);
+/** Frame timing's clock: the moving-camera leg replaces `performance.now` with a virtual clock. */
+const wallClock = performance.now.bind(performance);
+/** The moving-camera leg's transition, on its virtual clock: every timed frame lands mid-ease. */
+const MOVING_MS = 1000;
+/**
+ * The moving-camera leg's size wall. A fitted frame shows the whole layout, so every node and every one of
+ * this fixture's long tree edges is on screen each frame; stepped without waiting for the GPU, software GL
+ * falls behind above ~100k (a 200k run stalled on the queued frames for minutes, while its CPU frame
+ * measured the same as the unfitted one's). The CI tier runs at 100k, so the leg is at scale there.
+ */
+const MOVING_MAX = 100_000;
+const MOVING = N <= MOVING_MAX;
 
 /** A 3-level module hierarchy over a binary tree, and two unrelated position sets to move between. */
 function fixture(n: number): { graph: ReturnType<typeof buildGraph>; modules: ModuleNode[]; a: Float32Array; b: Float32Array } {
@@ -120,11 +141,20 @@ function fixture(n: number): { graph: ReturnType<typeof buildGraph>; modules: Mo
   return { graph: buildGraph({ nodeCount: n, source, target, directed: false }), modules, a, b };
 }
 
-/** Exposes the streamed-frame trigger and counts the camera's zoom re-seeds, without reaching into privates. */
+/** Exposes the streamed-frame trigger and the view, and counts the camera's zoom re-seeds and any gesture
+ *  boundary, without reaching into privates. */
 class TransitionProbe extends Network {
   cameraSyncs = 0;
+  gestureBoundaries = 0;
   constructor(host: HTMLElement, opts: NetworkOptions) {
     super(host, opts);
+  }
+  get camera(): ViewTransform {
+    return { ...this.transform };
+  }
+  protected override setInteracting(v: boolean): void {
+    this.gestureBoundaries++;
+    super.setInteracting(v);
   }
   /** A worker message's repaint request — what the transport calls after copying the positions. */
   streamFrame(): void {
@@ -172,19 +202,33 @@ interface Leg {
   fittedStartBoxes: number;
 }
 
+/** The moving-camera leg (LOD off): the unfitted and fitted transition on one virtual clock, and the
+ *  fitted camera's scale over the timed frames (the last round's). */
+interface MovingLeg {
+  unfitted: Phase;
+  fitted: Phase;
+  ks: number[];
+  /** d3-zoom's transform equalled the camera after the fitted frames: the per-frame re-seed really ran. */
+  zoomInStep: boolean;
+}
+
 let registrationUploaded = 0;
 let registrationNodeFill = 0;
 let off: Leg;
 let on: Leg;
 let spatial: Leg;
+let moving: MovingLeg | null = null;
+let gestureBoundaries = -1;
 
 beforeAll(async () => {
   const realRaf = globalThis.requestAnimationFrame;
   const realCaf = globalThis.cancelAnimationFrame;
   const spy = new GlBufferSpy();
   try {
-    const net = new TransitionProbe(perfHost(W, H), { width: W, height: H, backend: "webgl" });
+    const host = perfHost(W, H);
+    const net = new TransitionProbe(host, { width: W, height: H, backend: "webgl" });
     await net.whenReady();
+    net.enableZoom([1e-6, 1e6]); // the fitted camera re-seeds d3-zoom every frame, as in the Navigator
     globalThis.requestAnimationFrame = (cb) => {
       frames.set(++frameId, cb);
       return frameId;
@@ -219,9 +263,9 @@ beforeAll(async () => {
       const mark = spy.mark();
       const ts: number[] = [];
       for (let i = 1; i <= FRAMES; i++) {
-        const t0 = performance.now();
+        const t0 = wallClock();
         frame(i);
-        ts.push(performance.now() - t0);
+        ts.push(wallClock() - t0);
       }
       const used = spy.since(mark);
       ts.sort((x, y) => x - y);
@@ -275,13 +319,54 @@ beforeAll(async () => {
       return { streamed: best(streamed), transition: best(transition), fitted: best(fitted), fittedStartBoxes };
     };
 
+    /** The moving-camera leg: `a` framed, then a 1 s transition to twice its extent, stepped on a virtual
+     *  clock so warm-up and timed frames all land mid-ease (progress ≈ 0.002 → 0.94). */
+    const movingLeg = (engine: TransitionProbe): MovingLeg => {
+      const wide = a.map((v, i) => 2 * v + (i % 2 ? -40 : 60));
+      const run = (fit: boolean): { phase: Phase; ks: number[]; zoomInStep: boolean } => {
+        graph.positions.set(a);
+        engine.layout({ backend: "positions", positions: a, fit: true }); // both runs start from the same framed view
+        flush();
+        let virtual = 0;
+        const clock = vi.spyOn(performance, "now").mockImplementation(() => virtual);
+        try {
+          engine.layout({ backend: "positions", positions: wide, transition: MOVING_MS, fit });
+          const ks: number[] = [];
+          const phase = measure(() => {
+            virtual += MOVING_MS / (FRAMES + 3);
+            flush();
+            ks.push(engine.camera.k);
+          });
+          const z = zoomTransform(host);
+          const t = engine.camera;
+          engine.stopLayout();
+          return { phase, ks: ks.slice(1), zoomInStep: z.k === t.k && z.x === t.x && z.y === t.y }; // the timed frames' (after the warm-up)
+        } finally {
+          clock.mockRestore();
+        }
+      };
+      const unfitted: Phase[] = [];
+      const fitted: Phase[] = [];
+      let last = { ks: [] as number[], zoomInStep: false };
+      for (let round = 0; round < ROUNDS; round++) {
+        unfitted.push(run(false).phase);
+        const f = run(true);
+        fitted.push(f.phase);
+        last = f;
+      }
+      return { unfitted: best(unfitted), fitted: best(fitted), ks: last.ks, zoomInStep: last.zoomInStep };
+    };
+
     off = leg(net);
+    if (MOVING) moving = movingLeg(net);
+    net.setTransform({ k: 1, x: 0, y: 0 }); // back to the view the other legs run at
     net.lod({}); // the module tree: a registration event (tree + geometry), then the same two phases
     flush();
     on = leg(net);
     net.lod({ source: "spatial" }); // the spatial tree (#343): rebuilt per streamed frame, refit per transition frame
     flush();
     spatial = leg(net);
+    gestureBoundaries = net.gestureBoundaries; // the camera re-seeds d3-zoom every fitted frame: never a gesture
     net.destroy();
   } finally {
     globalThis.requestAnimationFrame = realRaf;
@@ -362,4 +447,34 @@ describe(`network() position transition — per-frame cost vs a streamed layout 
       expect(transition.medianMs, msg).toBeLessThan(ceiling);
     });
   }
+
+  it("the fitted camera's zoom re-seeds are never a gesture (#427, #309)", () => {
+    expect(gestureBoundaries, "the camera's own re-seed ran a gesture boundary").toBe(0);
+  });
+
+  it.skipIf(!MOVING)("LOD OFF, moving camera (#427): a zoom that really changes k adds only the O(1) camera", () => {
+    if (!moving) throw new Error("the moving-camera leg did not run");
+    const { unfitted, fitted, ks } = moving;
+    // Non-vacuity: the camera zooms out on every timed frame, about 2× across them.
+    expect(ks).toHaveLength(FRAMES);
+    for (let i = 1; i < ks.length; i++) expect(ks[i], `k at frame ${i}: ${ks.join(", ")}`).toBeLessThan(ks[i - 1] ?? NaN);
+    expect((ks[ks.length - 1] ?? NaN) / (ks[0] ?? NaN)).toBeLessThan(0.7);
+    expect(moving.zoomInStep, "d3-zoom was not re-seeded to the moving camera — the timed frame skipped the re-seed").toBe(true);
+    expect(fitted.boxCalls, "the fit box ran on a transition frame").toBe(0);
+    expect(fitted.cameraSyncs, "the camera is not set once per frame").toBe(FRAMES);
+    expect(unfitted.cameraSyncs).toBe(0);
+    expect(fitted.cuts).toBe(unfitted.cuts);
+    expect(fitted.styleResolves, "a style pass ran on a fitted frame").toBe(0);
+    expect(fitted.nodeFill, "nodeFill re-ran during the fitted transition").toBe(0);
+    expect(fitted.linkStroke).toBeLessThanOrEqual(unfitted.linkStroke);
+    expect(fitted.created).toBeLessThanOrEqual(unfitted.created);
+    expect(fitted.deleted).toBeLessThanOrEqual(unfitted.deleted);
+    expect(
+      fitted.uploadedPerFrame,
+      `fitted uploads ${(fitted.uploadedPerFrame / 1024).toFixed(0)} KB/frame vs unfitted ${(unfitted.uploadedPerFrame / 1024).toFixed(0)} KB/frame`,
+    ).toBeLessThanOrEqual(unfitted.uploadedPerFrame * 1.02 + 4096);
+    const msg = `moving camera: fitted ${fitted.medianMs.toFixed(2)}ms vs unfitted ${unfitted.medianMs.toFixed(2)}ms at N=${N.toLocaleString()}`;
+    expect(fitted.medianMs, msg).toBeLessThanOrEqual(unfitted.medianMs * 1.3 + 1);
+    expect(fitted.medianMs, msg).toBeLessThan(FRAME_MS_OFF);
+  });
 });
