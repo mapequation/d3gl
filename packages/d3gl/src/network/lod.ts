@@ -1747,9 +1747,9 @@ function clearReachOf(z: number, a: number, b: number, screen: boolean): number 
 
 /**
  * Reusable working storage for {@link computeLODCrowding} (#426): each aggregate's members' box and largest
- * radius, the dual walk's pair stack, and one node's children sorted for the sweep — grown on demand to the
+ * radius, the dual walk's pair stack, and one node's children gathered for the sweep — grown on demand to the
  * largest tree seen, so a pass run per streamed frame allocates nothing once warm. About 20 B per aggregate
- * plus 12 B per child of the widest node.
+ * plus 44 B per child of the widest node.
  */
 export interface LODCrowdingScratch {
   /** Per aggregate `o = g − leafCount`: its members' box, `[minX, minY, maxX, maxY]` at `4o`. */
@@ -1759,14 +1759,38 @@ export interface LODCrowdingScratch {
   /** The dual walk's stack of node pairs. */
   pairA: Uint32Array;
   pairB: Uint32Array;
-  /** One node's children, sorted by the left edge of their box (`key`) for the sweep. */
+  /**
+   * One node's children, gathered once per node so its sweep reads them from one place: the child id, its
+   * box (a leaf's is its point) and its largest effective radius, and the sweep order (by the box's left edge).
+   */
+  kid: Uint32Array;
+  kx0: Float64Array;
+  ky0: Float64Array;
+  kx1: Float64Array;
+  ky1: Float64Array;
+  kr: Float64Array;
   order: Uint32Array;
-  key: Float64Array;
 }
 
 /** A fresh, empty {@link LODCrowdingScratch}. */
 export function makeLODCrowdingScratch(): LODCrowdingScratch {
-  return { box: new Float32Array(0), rmax: new Float32Array(0), pairA: new Uint32Array(64), pairB: new Uint32Array(64), order: new Uint32Array(16), key: new Float64Array(16) };
+  const k = 16;
+  return {
+    box: new Float32Array(0), rmax: new Float32Array(0), pairA: new Uint32Array(64), pairB: new Uint32Array(64),
+    kid: new Uint32Array(k), kx0: new Float64Array(k), ky0: new Float64Array(k), kx1: new Float64Array(k), ky1: new Float64Array(k), kr: new Float64Array(k), order: new Uint32Array(k),
+  };
+}
+
+/** Grow the per-child arrays of `sc` to hold `n` children. */
+function growChildScratch(sc: LODCrowdingScratch, n: number): void {
+  const cap = Math.max(n, sc.kid.length * 2);
+  sc.kid = new Uint32Array(cap);
+  sc.kx0 = new Float64Array(cap);
+  sc.ky0 = new Float64Array(cap);
+  sc.kx1 = new Float64Array(cap);
+  sc.ky1 = new Float64Array(cap);
+  sc.kr = new Float64Array(cap);
+  sc.order = new Uint32Array(cap);
 }
 
 /** Options for {@link computeLODCrowding}. */
@@ -1788,27 +1812,42 @@ export type LODCrowdingTree = Pick<
   "size" | "leafCount" | "levelCount" | "levelOffset" | "childOffset" | "children" | "cx" | "cy" | "extent" | "count" | "radius" | "clearZoom"
 >;
 
-/** Sift `key[root]` down the max-heap `key[0, end)`, moving `ids` alongside. */
-function siftDown(key: Float64Array, ids: Uint32Array, root: number, end: number): void {
+/** Sift entry `root` down the max-heap `order[0, end)` of indices into `key`. */
+function siftDown(order: Uint32Array, key: Float64Array, root: number, end: number): void {
   let i = root;
   for (;;) {
     let c = 2 * i + 1;
     if (c >= end) return;
-    if (c + 1 < end && key[c + 1]! > key[c]!) c++;
-    if (!(key[c]! > key[i]!)) return;
-    const tk = key[i]!; key[i] = key[c]!; key[c] = tk;
-    const ti = ids[i]!; ids[i] = ids[c]!; ids[c] = ti;
+    if (c + 1 < end && key[order[c + 1]!]! > key[order[c]!]!) c++;
+    if (!(key[order[c]!]! > key[order[i]!]!)) return;
+    const t = order[i]!; order[i] = order[c]!; order[c] = t;
     i = c;
   }
 }
 
-/** Sort `ids[0, n)` ascending by `key[0, n)` (carried along), in place — a heapsort: no allocation, O(n log n). */
-function heapSortByKey(key: Float64Array, ids: Uint32Array, n: number): void {
-  for (let i = (n >> 1) - 1; i >= 0; i--) siftDown(key, ids, i, n);
+/**
+ * Sort the indices `order[0, n)` ascending by `key[order[i]]`, in place, allocating nothing: an insertion
+ * sort for a short list (a spatial bottom cell's ≤ 8 leaves, a quadtree cell's ≤ 4 children), a heapsort —
+ * O(n log n) — for a long one (a module with thousands of members). Either gives the same order.
+ */
+function sortByKey(order: Uint32Array, key: Float64Array, n: number): void {
+  if (n <= 16) {
+    for (let i = 1; i < n; i++) {
+      const v = order[i]!;
+      const kv = key[v]!;
+      let j = i - 1;
+      while (j >= 0 && key[order[j]!]! > kv) {
+        order[j + 1] = order[j]!;
+        j--;
+      }
+      order[j + 1] = v;
+    }
+    return;
+  }
+  for (let i = (n >> 1) - 1; i >= 0; i--) siftDown(order, key, i, n);
   for (let end = n - 1; end > 0; end--) {
-    const tk = key[0]!; key[0] = key[end]!; key[end] = tk;
-    const ti = ids[0]!; ids[0] = ids[end]!; ids[end] = ti;
-    siftDown(key, ids, 0, end);
+    const t = order[0]!; order[0] = order[end]!; order[end] = t;
+    siftDown(order, key, 0, end);
   }
 }
 
@@ -1827,8 +1866,8 @@ function heapSortByKey(key: Float64Array, ids: Uint32Array, n: number): void {
  * open by overlap is exact.
  *
  * Run it after the position pass and the style pass, whenever either changes (a style change moves the
- * radii). O(tree size) for the boxes plus the cross pairs the walk cannot prune — about the members near
- * the borders between siblings — measured ~10-30 ms at 325k nodes. With `scratch`
+ * radii). O(tree size) for the boxes plus the pairs the sweep and the walks cannot prune — every pair of a
+ * bottom cell that is not yet crowded, and the members near the borders between siblings. With `scratch`
  * ({@link makeLODCrowdingScratch}) a pass allocates nothing once warm.
  */
 export function computeLODCrowding(tree: LODCrowdingTree, opts: CrowdingOptions, scratch?: LODCrowdingScratch): void {
@@ -1855,10 +1894,9 @@ export function computeLODCrowding(tree: LODCrowdingTree, opts: CrowdingOptions,
   const dual = (a: number, b: number, beta: number, cap: number): number => {
     let pa = sc.pairA;
     let pb = sc.pairB;
-    let sp = 0;
     pa[0] = a;
     pb[0] = b;
-    sp = 1;
+    let sp = 1;
     while (sp > 0 && beta < cap) {
       sp--;
       const A = pa[sp]!;
@@ -1904,33 +1942,42 @@ export function computeLODCrowding(tree: LODCrowdingTree, opts: CrowdingOptions,
   for (let k = 1; k < levelCount; k++) {
     for (let g = levelOffset[k]!; g < levelOffset[k + 1]!; g++) {
       const c0 = childOffset[g]!;
-      const c1 = childOffset[g + 1]!;
+      const n = childOffset[g + 1]! - c0;
+      if (n > sc.kid.length) growChildScratch(sc, n);
+      const { kid, kx0, ky0, kx1, ky1, kr, order } = sc;
+      // Gather the children once — id, box, largest radius — and fold them into this node's box.
       let x0 = Infinity;
       let y0 = Infinity;
       let x1 = -Infinity;
       let y1 = -Infinity;
       let rm = 0;
       let beta = 0; // the largest pair zoom inside any one child
-      for (let p = c0; p < c1; p++) {
-        const c = children[p]!;
+      for (let j = 0; j < n; j++) {
+        const c = children[c0 + j]!;
+        kid[j] = c;
+        order[j] = j;
         if (c < leafCount) {
           const x = cx[c]!;
           const y = cy[c]!;
-          if (x < x0) x0 = x;
-          if (x > x1) x1 = x;
-          if (y < y0) y0 = y;
-          if (y > y1) y1 = y;
-          const r = eff(c);
-          if (r > rm) rm = r;
+          kx0[j] = x;
+          kx1[j] = x;
+          ky0[j] = y;
+          ky1[j] = y;
+          kr[j] = eff(c);
         } else {
           const o = 4 * (c - leafCount);
-          if (box[o]! < x0) x0 = box[o]!;
-          if (box[o + 1]! < y0) y0 = box[o + 1]!;
-          if (box[o + 2]! > x1) x1 = box[o + 2]!;
-          if (box[o + 3]! > y1) y1 = box[o + 3]!;
-          if (rmax[c - leafCount]! > rm) rm = rmax[c - leafCount]!;
+          kx0[j] = box[o]!;
+          ky0[j] = box[o + 1]!;
+          kx1[j] = box[o + 2]!;
+          ky1[j] = box[o + 3]!;
+          kr[j] = rmax[c - leafCount]!;
           if (clearZoom[c]! > beta) beta = clearZoom[c]!;
         }
+        if (kx0[j]! < x0) x0 = kx0[j]!;
+        if (ky0[j]! < y0) y0 = ky0[j]!;
+        if (kx1[j]! > x1) x1 = kx1[j]!;
+        if (ky1[j]! > y1) y1 = ky1[j]!;
+        if (kr[j]! > rm) rm = kr[j]!;
       }
       const og = g - leafCount;
       box[4 * og] = x0;
@@ -1941,37 +1988,37 @@ export function computeLODCrowding(tree: LODCrowdingTree, opts: CrowdingOptions,
       // The horizon: the zoom at which the footprint (2·extent·k) reaches expandPx and opens the node anyway.
       const e = extent[g]!;
       const cap = e > 0 ? horizon / (2 * e) : Infinity;
-      const n = c1 - c0;
       if (beta < cap && n > 1) {
         // Sweep the children by their box's left edge: a pair whose horizontal gap alone is past the reach
         // at which even the largest radii could beat beta is skipped, and so is every later one.
-        if (sc.order.length < n) {
-          sc.order = new Uint32Array(Math.max(n, sc.order.length * 2));
-          sc.key = new Float64Array(sc.order.length);
-        }
-        const order = sc.order;
-        const key = sc.key;
-        for (let j = 0; j < n; j++) {
-          const c = children[c0 + j]!;
-          order[j] = c;
-          key[j] = c < leafCount ? cx[c]! : box[4 * (c - leafCount)]!;
-        }
-        heapSortByKey(key, order, n);
+        sortByKey(order, kx0, n);
         for (let a = 0; a < n && beta < cap; a++) {
-          const A = order[a]!;
+          const ja = order[a]!;
+          const A = kid[ja]!;
           const aLeaf = A < leafCount;
-          const right = aLeaf ? cx[A]! : box[4 * (A - leafCount) + 2]!;
-          const rA = aLeaf ? eff(A) : rmax[A - leafCount]!;
+          const ax = kx0[ja]!;
+          const ay = ky0[ja]!;
+          const right = kx1[ja]!;
+          const rA = kr[ja]!;
           let reach = clearReachOf(beta, rA, rm, screen);
           for (let b = a + 1; b < n && beta < cap; b++) {
-            if (key[b]! - right >= reach) break;
-            const B = order[b]!;
+            const jb = order[b]!;
+            if (kx0[jb]! - right >= reach) break;
+            const B = kid[jb]!;
             let z: number;
             if (aLeaf && B < leafCount) {
-              // Two leaves (every pair of a bottom cell): their pair zoom directly, no walk.
-              const dx = cx[A]! - cx[B]!;
-              const dy = cy[A]! - cy[B]!;
-              z = clearZoomOf(Math.sqrt(dx * dx + dy * dy), rA, eff(B), screen);
+              // Two leaves (every pair of a bottom cell): their pair zoom directly, no walk. With screen radii
+              // it is (ra + rb) / d, so a pair that cannot beat beta is told apart without a root.
+              const dx = ax - kx0[jb]!;
+              const dy = ay - ky0[jb]!;
+              const d2 = dx * dx + dy * dy;
+              if (screen) {
+                const sum = rA + kr[jb]!;
+                if (!(sum * sum > beta * beta * d2)) continue;
+                z = sum / Math.sqrt(d2);
+              } else {
+                z = clearZoomOf(Math.sqrt(d2), rA, kr[jb]!, false);
+              }
             } else {
               z = dual(A, B, beta, cap);
             }
