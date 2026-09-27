@@ -8,7 +8,8 @@ import { makeTestDevice } from "./_device.js";
 import { NestedJacobiReference } from "./nested-jacobi-reference.js";
 import { GpuNestedLayout } from "../gpu-nested-layout.js";
 import { nestedSolverResult, nestedSolverTopology, type NestedSolverTopology } from "../nested-topology.js";
-import { NESTED, nestedLayout, type NestedLayoutParams, type NestedLayoutResult, type NestedLayoutTopology } from "../../nested-layout.js";
+import { EXACT_MAX, NESTED, nestedLayout, type NestedLayoutParams, type NestedLayoutResult, type NestedLayoutTopology } from "../../nested-layout.js";
+import { COLLISION_LIST_MAX, collisionPlan, planClassCount } from "../collision-plan.js";
 import { expectNested, kids, linkTightness, meanShift, reclustered, rootOf, similar, spreadOf, threeLevel, topo, twoLevel } from "../../__tests__/nested-fixtures.js";
 import { COLLISION_RELAX, COLLISION_STEPS } from "../passes/collision.js";
 
@@ -136,7 +137,10 @@ describe("GPU nested layout (#355) against its Jacobi reference", () => {
     const { topo, size } = makeTree([600, 45, 90], 1, 2, 11);
     const solver = nestedSolverTopology(topo, { size, iterations: 12 });
     expect(Math.max(...solver.segCount)).toBe(600);
-    expect(solver.segLarge.some((s) => s >= 0)).toBe(true); // large slots exist
+    // The 600-child segment is binned over several radius classes, with a list, and no exact slot.
+    const big = solver.segCount.indexOf(600);
+    expect(planClassCount(solver.collision.segClasses[big] ?? 0)).toBeGreaterThan(3);
+    expect(solver.collision.segList[big * COLLISION_LIST_MAX] ?? -1).toBeGreaterThanOrEqual(0);
     expect(compareTicks(solver, 12, 0)).toBeLessThan(2e-5);
   });
 
@@ -194,13 +198,9 @@ describe("GPU nested layout (#355) against its Jacobi reference", () => {
       seed[2 * b + 1] = seed[2 * a + 1] ?? 0;
       radius[a] = 0.05;
       radius[b] = 0.1;
-      const solver: NestedSolverTopology = { ...base, seed, radius, segR9: base.segR9.slice().fill(0.01), segLarge: base.segLarge.slice().fill(-1) };
-      const large = solver.segLarge;
-      if (k > 32) {
-        // The two big discs are the segment's large slots (radius above r₉ = 0.01).
-        large[seg * 8] = a;
-        large[seg * 8 + 1] = b;
-      }
+      // The collision plan of the new radii: at k = 40 the two big discs are the segment's list.
+      const collision = collisionPlan(radius, base.segStart, base.segCount, EXACT_MAX, NESTED.PAD);
+      const solver: NestedSolverTopology = { ...base, seed, radius, collision };
       const layout = new GpuNestedLayout(device, solver, { organise: 0 });
       try {
         runAll(layout, 1);

@@ -8,6 +8,7 @@ import { GridPyramid } from "./passes/grid-pyramid.js";
 import { RepulsionPass } from "./passes/repulsion.js";
 import { NestedIntegratePass, NestedPredictPass, type NestedSlotInputs } from "./passes/nested.js";
 import { COLLISION_STEPS, CollisionGrid, type CollisionGatherInput } from "./passes/collision.js";
+import { COLLISION_LIST_MAX } from "./collision-plan.js";
 import { NestedComposePass } from "./passes/nested-compose.js";
 import { GpuSprings } from "./springs.js";
 import type { NestedSpringInputs } from "./passes/attraction.js";
@@ -16,7 +17,7 @@ import { TILE_MIN_SIDE, assertAtlasFits, packTiles, segmentSoftening, slotSegmen
 import type { PackedPositions } from "./async-readback.js";
 import type { StreamSolver } from "./gpu-stream.js";
 import { itemCostMs, type ItemCosts, type ItemKind } from "./frame-budget.js";
-import { NESTED_LARGE_MAX, type NestedSolverTopology } from "./nested-topology.js";
+import type { NestedSolverTopology } from "./nested-topology.js";
 import { EXACT_MAX } from "../nested-layout.js";
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -126,6 +127,10 @@ export interface GpuNestedLayoutOptions {
   rootY?: number;
   /** Test hook: ticks of the organise phase (default `⌈0.6 · iterations⌉`, the CPU's). */
   organise?: number;
+  /** Test hook: the collision grid's occupant rounds K (default `COLLISION_ROUNDS`). */
+  collisionRounds?: number;
+  /** Test hook: build the collision grid's per-slot statistics pass ({@link GpuNestedLayout.collisionStats}). */
+  collisionStats?: boolean;
 }
 
 /**
@@ -155,10 +160,12 @@ export class GpuNestedLayout implements StreamSolver {
   private readonly forceFbo: Framebuffer;
   private readonly radius: Texture;
   private readonly slotSeg: Texture;
-  /** Per segment `(r₉, owner slot, 0, 0)`. */
+  /** Per segment `(finest collision cell side, owner slot, 0, 0)`. */
   private readonly segNested: Texture;
-  /** Per segment its large slots (2 `rgba32uint` texels). */
-  private readonly segLarge: Texture;
+  /** Per slot its collision class and exact bit (`r32uint`). */
+  private readonly slotCollide: Texture;
+  /** Per segment its collision list (2 `rgba32uint` texels) and grid (bucket base, bucket mask, classes, 0). */
+  private readonly segCollide: Texture;
   /** The segment table — S segments plus one range over every slot (the readback's finiteness check). */
   private readonly segments: SegmentTable;
   /** Mode 2's target: each range's extent about its centroid (box x). */
@@ -302,20 +309,26 @@ export class GpuNestedLayout implements StreamSolver {
       const tw = this.segments.width;
       const th = Math.ceil(rows.length / tw);
       const nested = new Float32Array(tw * th * 4);
+      const plan = topo.collision;
       for (let s = 0; s < S; s++) {
-        nested[s * 4] = topo.segR9[s] ?? 0;
+        nested[s * 4] = plan.segCellSide[s] ?? 0;
         nested[s * 4 + 1] = topo.segOwner[s] ?? -1;
       }
       nested[S * 4 + 1] = -1;
       this.segNested = own(device.createTexture({ width: tw, height: th, format: "rgba32float", data: nested, mipLevels: 1, sampler: NEAREST }));
-      const largeWidth = atlasWidth(2 * rows.length);
-      const largeRows = Math.ceil((2 * rows.length) / largeWidth);
-      const large = new Uint32Array(largeWidth * largeRows * 4).fill(0xffffffff);
-      for (let i = 0; i < S * NESTED_LARGE_MAX; i++) {
-        const slot = topo.segLarge[i] ?? -1;
-        if (slot >= 0) large[i] = slot;
+      const classes = new Uint32Array(width * height);
+      classes.set(plan.slotCollide);
+      this.slotCollide = own(device.createTexture({ width, height, format: "r32uint", data: classes, mipLevels: 1, sampler: NEAREST }));
+      // 3 texels per segment row: its list (−1 → NO_CELL pads), then (bucket base, bucket mask, classes, 0).
+      const collideWidth = atlasWidth(3 * rows.length);
+      const collide = new Uint32Array(collideWidth * Math.ceil((3 * rows.length) / collideWidth) * 4);
+      for (let s = 0; s < S; s++) {
+        for (let q = 0; q < COLLISION_LIST_MAX; q++) collide[12 * s + q] = (plan.segList[s * COLLISION_LIST_MAX + q] ?? -1) >>> 0;
+        collide[12 * s + 8] = plan.segBucketBase[s] ?? 0;
+        collide[12 * s + 9] = plan.segBucketMask[s] ?? 0;
+        collide[12 * s + 10] = plan.segClasses[s] ?? 0;
       }
-      this.segLarge = own(device.createTexture({ width: largeWidth, height: largeRows, format: "rgba32uint", data: large, mipLevels: 1, sampler: NEAREST }));
+      this.segCollide = own(device.createTexture({ width: collideWidth, height: collide.length / (4 * collideWidth), format: "rgba32uint", data: collide, mipLevels: 1, sampler: NEAREST }));
       const extentTex = (): Texture => own(device.createTexture({ width: tw, height: th, format: "rgba32float", mipLevels: 1, sampler: NEAREST }));
       const extentStats = extentTex();
       const extentBox = extentTex();
@@ -350,7 +363,13 @@ export class GpuNestedLayout implements StreamSolver {
       this.springs = own(new GpuSprings(device, links, { nested: true }));
       this.predict = own(new NestedPredictPass(device));
       this.integratePass = own(new NestedIntegratePass(device, 1 - NESTED.DECAY));
-      this.collision = own(new CollisionGrid(device, width, height, atlas.width >> 1, atlas.height >> 1, largeWidth));
+      this.collision = own(
+        new CollisionGrid(device, width, height, plan.bucketCount, plan.binnedSlots, {
+          refine: plan.refine,
+          ...(options.collisionRounds === undefined ? {} : { rounds: options.collisionRounds }),
+          stats: options.collisionStats === true,
+        }),
+      );
       this.compose = own(new NestedComposePass(device, topo.nodeSlot, topo.leafCount, topo.depth, NESTED.FILL, NESTED.ONLY_CHILD));
       this.packed = { framebuffer: this.compose.framebuffer, width: this.compose.width, height: this.compose.height, extraFloats: this.compose.extraFloats };
 
@@ -367,7 +386,10 @@ export class GpuNestedLayout implements StreamSolver {
       this.gatherInput = {
         slotSeg: this.slotSeg,
         segments: this.segments,
-        segLarge: this.segLarge,
+        segNested: this.segNested,
+        slotCollide: this.slotCollide,
+        segCollide: this.segCollide,
+        collideWidth,
         count: slots,
         width,
         rows: height,
@@ -457,16 +479,7 @@ export class GpuNestedLayout implements StreamSolver {
     if (this.step === 0) this.advance(false);
     // This collision step's cells and occupancy, from the positions it starts at.
     this.runReduce(1, this.segments);
-    this.collision.prepare({
-      pos: this.pos.readTex,
-      radius: this.radius,
-      slotSeg: this.slotSeg,
-      segments: this.segments,
-      segNested: this.segNested,
-      count: this.slots,
-      width: this.width,
-      pad: NESTED.PAD,
-    });
+    this.collision.prepare({ ...this.gatherInput, pos: this.pos.readTex, radius: this.radius });
   }
 
   /** Work item **F_b**: atlas rows of band `band` — the repulsion (organise) or the collision gather (compact). */
@@ -591,6 +604,16 @@ export class GpuNestedLayout implements StreamSolver {
       const from = 4 * Math.ceil(this.topo.leafCount / 2);
       discs.set(pixels.subarray(from, from + Math.min(discs.length, this.compose.extraFloats)));
     }
+  }
+
+  /**
+   * Tests only (a layout built with `collisionStats`): what the current compact tick's collision step
+   * does per slot — `(cells visited, pairs tested, grid partners pushed, 1 exact slot / 2 overflow)`, 4
+   * floats per slot — from the state its work item P prepared (call it after {@link beginTick} of a compact
+   * tick).
+   */
+  collisionStats(): Float32Array {
+    return this.collision.gatherStats(this.gatherInput).subarray(0, 4 * this.slots);
   }
 
   /** The slots' local positions (each in its parent's unit disc), synchronously — for tests: `2 · slots` floats. */

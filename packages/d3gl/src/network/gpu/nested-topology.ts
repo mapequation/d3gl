@@ -15,9 +15,10 @@
 //   index `slot − segment start` is the CPU solve's local child index.
 // - **Per slot:** its unit-disc radius and seed position, from the CPU's own {@link setupModule} — the
 //   GPU solves exactly the problem the CPU solves.
-// - **Per segment:** its parent module, the parent's slot (the composition's owner), its starting alpha
-//   (1 cold, {@link WARM_ALPHA} warm), and for collision the 9th-largest radius and the at most 8 larger
-//   ("large") slots.
+// - **Per segment:** its parent module, the parent's slot (the composition's owner) and its starting alpha
+//   (1 cold, {@link WARM_ALPHA} warm).
+// - **Collision:** the radius-class grid's static data — every slot's class, each segment's list, exact
+//   slots and hash buckets (`collision-plan.ts`, #380).
 // - **Links:** every segment's sparsified, weighted sibling links in slot ids (a spring each way stays two
 //   links, as the CPU solves it). They never cross segments, by construction.
 //
@@ -26,8 +27,10 @@
 //
 // Everything here is typed arrays, so the result can be posted from a worker with its buffers
 // transferred. Cost: O(tree size + Σ links · log links) (the per-module link sparsification sorts).
+import { collisionPlan, type CollisionPlan } from "./collision-plan.js";
 import {
   EXACT_MAX,
+  NESTED,
   Scratch,
   WARM_ALPHA,
   placeOver,
@@ -38,9 +41,6 @@ import {
   type NestedLayoutResult,
   type NestedLayoutTopology,
 } from "../nested-layout.js";
-
-/** Most "large" slots a segment has: every other slot's radius is at most the 9th-largest (spec §11.1). */
-export const NESTED_LARGE_MAX = 8;
 
 /** The data of one batched nested solve — see the file header. */
 export interface NestedSolverTopology {
@@ -55,18 +55,8 @@ export interface NestedSolverTopology {
   readonly segOwner: Int32Array;
   /** Each segment's starting alpha: 1, or {@link WARM_ALPHA} when its children are warm-seeded. */
   readonly segAlpha0: Float32Array;
-  /**
-   * Each segment's 9th-largest child radius (0 when it has at most 9 children): its collision grid's
-   * cells are at least `2 · r₉ · PAD` wide, so two discs no larger than r₉ that touch are at most one
-   * cell apart. Only read for segments above {@link EXACT_MAX} children.
-   */
-  readonly segR9: Float32Array;
-  /**
-   * Each segment's slots with a radius above its r₉ (at most {@link NESTED_LARGE_MAX}; −1 pads),
-   * {@link NESTED_LARGE_MAX} entries per segment. Collision tests them exactly, never through the grid.
-   * Filled only for segments above {@link EXACT_MAX} children.
-   */
-  readonly segLarge: Int32Array;
+  /** The collision grid's classes, lists, exact slots and buckets (segments above {@link EXACT_MAX} children). */
+  readonly collision: CollisionPlan;
   /** Tree id of each slot's node. */
   readonly slotNode: Uint32Array;
   /** Slot of each tree node, −1 for the root. */
@@ -126,8 +116,6 @@ export function nestedSolverTopology(topo: NestedLayoutTopology, params: NestedL
   const segModule = new Uint32Array(segments);
   const segOwner = new Int32Array(segments);
   const segAlpha0 = new Float32Array(segments);
-  const segR9 = new Float32Array(segments);
-  const segLarge = new Int32Array(segments * NESTED_LARGE_MAX).fill(-1);
   const slotCount = size - 1;
   const slotNode = new Uint32Array(slotCount);
   const nodeSlot = new Int32Array(size).fill(-1);
@@ -162,7 +150,6 @@ export function nestedSolverTopology(topo: NestedLayoutTopology, params: NestedL
   const linkSource: number[] = [];
   const linkTarget: number[] = [];
   const linkWeight: number[] = [];
-  const order: number[] = [];
   modules.forEach((g, s) => {
     const start = childOffset[g] ?? 0;
     const end = childOffset[g + 1] ?? 0;
@@ -182,19 +169,6 @@ export function nestedSolverTopology(topo: NestedLayoutTopology, params: NestedL
       linkTarget.push(base + (setup.lb[l] ?? 0));
       linkWeight.push(setup.lw[l] ?? 0);
     }
-    if (k <= EXACT_MAX) return;
-    // Collision: r₉ and the slots above it (at most 8, since only 8 radii exceed the 9th-largest) —
-    // compared in float32, as the cell pass compares them: a slot it bins must not also be large.
-    order.length = 0;
-    for (let i = 0; i < k; i++) order.push(i);
-    order.sort((a, b) => (scratch.rad[b] ?? 0) - (scratch.rad[a] ?? 0) || a - b);
-    const r9 = Math.fround(scratch.rad[order[NESTED_LARGE_MAX] ?? 0] ?? 0);
-    segR9[s] = r9;
-    let large = 0;
-    for (let rank = 0; rank < NESTED_LARGE_MAX; rank++) {
-      const i = order[rank] ?? 0;
-      if (Math.fround(scratch.rad[i] ?? 0) > r9) segLarge[s * NESTED_LARGE_MAX + large++] = base + i;
-    }
   });
 
   const rootRadius = params.radius ?? 10 * Math.sqrt(leafCount);
@@ -205,8 +179,7 @@ export function nestedSolverTopology(topo: NestedLayoutTopology, params: NestedL
     segModule,
     segOwner,
     segAlpha0,
-    segR9,
-    segLarge,
+    collision: collisionPlan(radius, segStart, segCount, EXACT_MAX, NESTED.PAD),
     slotNode,
     nodeSlot,
     radius,
@@ -226,9 +199,11 @@ export function nestedSolverTopology(topo: NestedLayoutTopology, params: NestedL
 
 /** The typed arrays of a {@link NestedSolverTopology} — the buffers a worker transfers when it posts one. */
 export function nestedSolverBuffers(t: NestedSolverTopology): ArrayBuffer[] {
+  const c = t.collision;
   const arrays = [
-    t.segStart, t.segCount, t.segModule, t.segOwner, t.segAlpha0, t.segR9, t.segLarge,
-    t.slotNode, t.nodeSlot, t.radius, t.seed, t.linkSource, t.linkTarget, t.linkWeight,
+    t.segStart, t.segCount, t.segModule, t.segOwner, t.segAlpha0, t.slotNode, t.nodeSlot, t.radius, t.seed,
+    t.linkSource, t.linkTarget, t.linkWeight,
+    c.slotCollide, c.segCellSide, c.segClasses, c.segList, c.segBucketBase, c.segBucketMask, c.binnedSlots,
   ];
   const buffers: ArrayBuffer[] = [];
   for (const a of arrays) if (a.buffer instanceof ArrayBuffer) buffers.push(a.buffer);
