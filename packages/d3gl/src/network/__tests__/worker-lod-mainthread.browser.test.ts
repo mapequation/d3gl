@@ -383,6 +383,44 @@ describe("lod() before the first layout defers the main-thread tree build", () =
     host.remove();
   });
 
+  // #359/#428: the deferral keys on "no layout has placed this graph", not "no layout has ever run", so a
+  // reused engine (every load after the first) leaves the tree to the worker too.
+  it("after an earlier layout, data(g2).lod() still leaves the tree to a worker layout in the chain", async () => {
+    const { net, host } = makeNet();
+    await net.whenReady();
+
+    net.data(placed(600)).layout({ backend: "force", iterations: 5 });
+    net.data(clustered(1500)).style({ sizeMode: "screen" }).lod({ expandPx: 48 });
+    expect(net.lodSource).toBe("none"); // deferred: data() set a graph no layout has placed yet
+    net.layout({ backend: "worker", iterations: 25 });
+    await Promise.resolve();
+    expect(net.lodSource).toBe("none"); // the end-of-chain build stood down: no main-thread tree
+    await net.whenSettled();
+    expect(net.lodSource).toBe("worker");
+
+    net.destroy();
+    host.remove();
+  });
+
+  it("after an earlier layout, data(g2).lod() with no worker layout builds before the next frame", async () => {
+    const { net, host } = makeNet();
+    await net.whenReady();
+
+    net.data(placed(600)).layout({ backend: "worker", iterations: 5 });
+    await net.whenSettled();
+    net.data(placed(800)).lod({ expandPx: 48 });
+    expect(net.lodSource).toBe("none");
+    await Promise.resolve();
+    expect(net.lodSource).toBe("main");
+    // Once a layout has placed the graph, lod() builds at once again.
+    net.layout({ backend: "positions", positions: new Float32Array(1600).map((_, i) => 10 + ((i * 53) % 220)) });
+    net.lod(false).lod({ expandPx: 32 });
+    expect(net.lodSource).toBe("main");
+
+    net.destroy();
+    host.remove();
+  });
+
   it("positions and force layouts after lod() still build synchronously", async () => {
     const { net, host } = makeNet();
     await net.whenReady();
