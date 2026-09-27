@@ -343,6 +343,8 @@ export class GpuStream {
     }
     // A finished copy is harvested — and repainted — once the repaint is due; the final one at once.
     let harvested = false;
+    // Ticks of the copy harvested here — read now: a copy issued later in this frame overwrites copyTicks.
+    let harvestedTicks = -1;
     let repaintMs = 0;
     const t1 = performance.now();
     if (
@@ -351,6 +353,7 @@ export class GpuStream {
       (this.copyFinal || this.frameEvery !== undefined || this.throttle.due(now))
     ) {
       harvested = true;
+      harvestedTicks = this.copyTicks;
       if (!this.readback.harvest(this.into ?? this.graph.positions, this.stats, this.extra)) {
         this.fail();
         return;
@@ -395,7 +398,7 @@ export class GpuStream {
       sample.itemsMs = this.schedule.frameCostMs;
       sample.ticksDone = this.ticksDone;
       sample.harvested = harvested;
-      sample.harvestedTicks = harvested ? this.copyTicks : -1;
+      sample.harvestedTicks = harvestedTicks;
       sample.copied = copied;
       sample.blocked = !open;
       sample.k = this.budget.k;
