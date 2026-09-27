@@ -101,8 +101,9 @@ export interface NestedLayoutOptions {
    *
    * `bounds` is a box the **final** layout lies in, known already (#427): the placed leaves, and the
    * disc of each unplaced leaf's deepest placed ancestor. Every child disc lies inside its parent's, so
-   * it only shrinks depth by depth, and once every leaf is placed it is their exact box — what a
-   * streaming fit frames a cold nested layout by.
+   * it only shrinks depth by depth — the first depth's lies inside the root disc
+   * ({@link nestedRootBounds}), the bound known before any depth — and once every leaf is placed it is
+   * their exact box: what a streaming fit frames a cold nested layout by.
    */
   onDepth?: (depth: number, positions: Float32Array, bounds: FitBox) => void;
   /**
@@ -248,6 +249,22 @@ export function subtreeWeights(
   return { weight, root };
 }
 
+/** The root disc's radius: `radius`, else the default `10·√leafCount`. */
+function rootRadius(leafCount: number, radius: number | undefined): number {
+  return radius ?? 10 * Math.sqrt(leafCount);
+}
+
+/**
+ * The box a cold nested layout's final positions lie in before any depth is placed (#427): its root disc,
+ * centred on the origin, for a `radius` as in {@link NestedLayoutOptions.radius}. A transport streaming the
+ * layout posts it as the stream's first bound, so a fit frames the map from its first paint; each depth's
+ * `onDepth` bound lies inside it. O(1).
+ */
+export function nestedRootBounds(leafCount: number, radius?: number): FitBox {
+  const r = rootRadius(leafCount, radius);
+  return [-r, -r, r, r];
+}
+
 /** Lay out a module tree top-down, each module's children inside its disc. @see the module docs above. */
 export function nestedLayout(topo: NestedLayoutTopology, opts: NestedLayoutOptions = {}): NestedLayoutResult {
   const { size, leafCount, childOffset, children, parent } = topo;
@@ -260,7 +277,7 @@ export function nestedLayout(topo: NestedLayoutTopology, opts: NestedLayoutOptio
   const cx = new Float32Array(size);
   const cy = new Float32Array(size);
   const r = new Float32Array(size);
-  r[root] = opts.radius ?? 10 * Math.sqrt(leafCount);
+  r[root] = rootRadius(leafCount, opts.radius);
 
   const positions = new Float32Array(2 * leafCount);
   const scratch = new Scratch();

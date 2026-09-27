@@ -1,4 +1,4 @@
-import { describe, it, expect, afterEach } from "vitest";
+import { describe, it, expect, afterEach, vi } from "vitest";
 import { zoomTransform } from "d3-zoom";
 import { Network, type NetworkOptions } from "../network.js";
 import { buildGraph, type NetworkGraph } from "../graph.js";
@@ -44,7 +44,7 @@ class ProbeNetwork extends Network {
     this.interactingCalls++;
     super.setInteracting(v);
   }
-  get view(): ViewTransform {
+  get camera(): ViewTransform {
     return { ...this.transform };
   }
 }
@@ -56,7 +56,7 @@ class DepthProbe extends ProbeNetwork {
   protected override scheduleLayoutRepaint(): void {
     super.scheduleLayoutRepaint();
     this.flushFrames();
-    this.frameScales.push(this.view.k);
+    this.frameScales.push(this.camera.k);
   }
 }
 
@@ -139,7 +139,7 @@ function sampler(net: ProbeNetwork, graph: NetworkGraph): { samples: Sample[]; s
   let on = true;
   const tick = (): void => {
     if (!on) return;
-    samples.push({ positions: graph.positions.slice(), view: net.view });
+    samples.push({ positions: graph.positions.slice(), view: net.camera });
     requestAnimationFrame(tick);
   };
   requestAnimationFrame(tick);
@@ -177,19 +177,19 @@ describe("fit + transition: the camera eases along with the nodes (#427)", () =>
     const { graph, positions: a } = grid(400, 20, 10);
     net.data(graph).style({ nodeRadius: 3, sizeMode: "screen" }).enableZoom([0.001, 100]);
     net.layout({ backend: "positions", positions: a, fit: true });
-    expectFramed(a, net.view); // no transition: framed once, as it lands
+    expectFramed(a, net.camera); // no transition: framed once, as it lands
     await nextFrame(); // let the first paint land: a transition is timed, so a stalled first frame would skip it
     await nextFrame();
 
-    const start = net.view;
+    const start = net.camera;
     const b = moved(a, 2, 300, -120); // twice the extent, elsewhere
     const rec = sampler(net, graph);
     net.layout({ backend: "positions", positions: b, transition: 1000, fit: true });
-    expect(net.view).toEqual(start); // nothing jumps at the call
+    expect(net.camera).toEqual(start); // nothing jumps at the call
     await net.whenSettled();
     await nextFrame();
     rec.stop();
-    const end = net.view;
+    const end = net.camera;
 
     expectFramed(b, end);
     expect(zoomTransform(host)).toMatchObject(end); // d3-zoom kept in step with the camera
@@ -228,7 +228,7 @@ describe("fit + transition: the camera eases along with the nodes (#427)", () =>
     await nextFrame();
     await nextFrame();
 
-    const start = net.view;
+    const start = net.camera;
     const from = g.positions.slice();
     net.data(g, { modules: PAIRS });
     const rec = sampler(net, g);
@@ -237,7 +237,7 @@ describe("fit + transition: the camera eases along with the nodes (#427)", () =>
     await nextFrame();
     rec.stop();
     const to = g.positions.slice();
-    const end = net.view;
+    const end = net.camera;
 
     expectFramed(to, end);
     expect(end.k).toBeGreaterThan(start.k);
@@ -264,10 +264,10 @@ describe("fit + transition: the user takes the view over, the camera's own moves
     await nextFrame();
     await nextFrame();
     const b = moved(a, 2, 300, -120);
-    const k0 = net.view.k;
+    const k0 = net.camera.k;
     net.layout({ backend: "positions", positions: b, transition: 1500, fit: true });
-    await until(() => net.view.k < k0 * 0.97, 3000); // the camera is under way
-    expect(net.view.k, "the camera never started easing").toBeLessThan(k0 * 0.97);
+    await until(() => net.camera.k < k0 * 0.97, 3000); // the camera is under way
+    expect(net.camera.k, "the camera never started easing").toBeLessThan(k0 * 0.97);
     return { net, host, graph, b };
   }
 
@@ -276,10 +276,10 @@ describe("fit + transition: the user takes the view over, the camera's own moves
     wheel(host, -240);
     await until(() => net.interactingCalls === 2); // the wheel gesture ends once it goes idle
     expect(net.interactingCalls, "the wheel gesture never ended").toBe(2);
-    const user = net.view;
+    const user = net.camera;
     await net.whenSettled();
     await nextFrame();
-    expect(net.view).toEqual(user);
+    expect(net.camera).toEqual(user);
     expect(zoomTransform(host)).toMatchObject(user);
     expect(Array.from(graph.positions)).toEqual(Array.from(b));
     net.destroy();
@@ -291,7 +291,7 @@ describe("fit + transition: the user takes the view over, the camera's own moves
     net.setTransform(target);
     await net.whenSettled();
     await nextFrame();
-    expect(net.view).toEqual(target);
+    expect(net.camera).toEqual(target);
     expect(zoomTransform(host)).toMatchObject(target);
     expect(net.interactingCalls).toBe(0);
     expect(Array.from(graph.positions)).toEqual(Array.from(b));
@@ -301,7 +301,7 @@ describe("fit + transition: the user takes the view over, the camera's own moves
   it("a node grabbed mid-transition keeps the view it had: the camera holds still under the cursor", async () => {
     const { net, host, graph } = await running(true);
     net.interactive({ draggable: true });
-    const grabbed = net.view;
+    const grabbed = net.camera;
     const id = 0;
     const x = grabbed.k * (graph.positions[2 * id] ?? NaN) + grabbed.x;
     const y = grabbed.k * (graph.positions[2 * id + 1] ?? NaN) + grabbed.y;
@@ -315,7 +315,7 @@ describe("fit + transition: the user takes the view over, the camera's own moves
     await net.whenSettled();
     await nextFrame();
     await nextFrame();
-    expect(net.view).toEqual(grabbed);
+    expect(net.camera).toEqual(grabbed);
     expect(zoomTransform(host)).toMatchObject(grabbed);
     net.destroy();
   });
@@ -328,10 +328,10 @@ describe("fit without a transition frames a layout landed in one go, once (#427)
     net.data(graph).style({ nodeRadius: 3, sizeMode: "screen" });
     net.setTransform({ k: 0.1, x: 0, y: 0 });
     net.layout({ backend: "positions", positions: moved(positions, 3, -500, 800), fit: true });
-    expectFramed(graph.positions, net.view);
+    expectFramed(graph.positions, net.camera);
     net.setTransform({ k: 0.1, x: 0, y: 0 });
     net.layout({ backend: "force", fit: true, iterations: 50 });
-    expectFramed(graph.positions, net.view);
+    expectFramed(graph.positions, net.camera);
     net.destroy();
   });
 });
@@ -386,18 +386,18 @@ describe("a cold nested map frames its actual bounds, not the root disc (#427)",
     };
     try {
       net.layout({ backend: "worker", nested: true, fit: true });
-      const rootDisc = net.view; // the first paint: framed on the root disc, the only bound known yet
+      const rootDisc = net.camera; // the first paint: framed on the root disc, the only bound known yet
       await net.whenSettled();
       net.flushFrames();
 
-      expectFramed(graph.positions, net.view);
+      expectFramed(graph.positions, net.camera);
       expect(net.interactingCalls).toBe(0);
       // One fitted repaint per depth (top modules, sub-modules, leaves), then the final layout's.
       const ks = [rootDisc.k, ...net.frameScales];
       expect(net.frameScales.length, `frames: ${ks.join(", ")}`).toBe(4);
       for (let i = 1; i < ks.length; i++) expect(ks[i], `zoomed out at frame ${i}: ${ks.join(", ")}`).toBeGreaterThanOrEqual((ks[i - 1] ?? NaN) - 1e-12);
       expect(ks[1], "the first depth did not tighten the root disc").toBeGreaterThan(rootDisc.k * 1.01);
-      expect(net.frameScales[3]).toBe(net.view.k); // the leaves' exact box, streamed and settled alike
+      expect(net.frameScales[3]).toBe(net.camera.k); // the leaves' exact box, streamed and settled alike
       // The root disc it used to keep framed this map at under two thirds of the fit's fill.
       expect(framingOf(graph.positions, rootDisc).fill).toBeLessThan(0.7);
     } finally {
@@ -407,12 +407,33 @@ describe("a cold nested map frames its actual bounds, not the root disc (#427)",
     }
   });
 
+  it("a transport that posts no depth bound frames the leaves it has from the first paint, never the root disc", async () => {
+    // Without Workers the nested solve runs on the main thread and lands in one go: a transport with no
+    // per-depth bound (as is the GPU nested stream). The engine assumes none: it frames the live leaves.
+    const { net } = await engine();
+    const { graph, modules } = threeLevel(6, 5, 40);
+    net.data(graph, { modules }).lod(false).style({ nodeRadius: 2, sizeMode: "screen" }).enableZoom([0.001, 100]);
+    vi.stubGlobal("Worker", undefined);
+    try {
+      net.layout({ backend: "worker", nested: true, fit: true });
+      const first = net.camera; // the synchronous first paint: the solve has already landed
+      expectFramed(graph.positions, first);
+      await net.whenSettled();
+      await nextFrame();
+      expectFramed(graph.positions, net.camera);
+      expect(net.camera.k, "the settle snapped away from the first paint").toBeCloseTo(first.k, 6);
+    } finally {
+      vi.unstubAllGlobals();
+      net.destroy();
+    }
+  });
+
   it("synchronous (\"force\"): framed once on the leaves' exact box", async () => {
     const { net } = await engine();
     const { graph, modules } = threeLevel(6, 5, 40);
     net.data(graph, { modules }).lod(false).style({ nodeRadius: 2, sizeMode: "screen" });
     net.layout({ backend: "force", nested: true, fit: true });
-    expectFramed(graph.positions, net.view);
+    expectFramed(graph.positions, net.camera);
     net.destroy();
   });
 });

@@ -1,6 +1,6 @@
 import { describe, it, expect, vi } from "vitest";
 import { buildModuleLODTree, type ModuleNode } from "../modules.js";
-import { Scratch, collide, nestedLayout } from "../nested-layout.js";
+import { Scratch, collide, nestedLayout, nestedRootBounds } from "../nested-layout.js";
 import { BarnesHutTree } from "../quadtree.js";
 import {
   expectNested,
@@ -163,6 +163,15 @@ describe("nestedLayout's streamed bound (#427): what a cold map's fit frames whi
     if (!first || !exact) throw new Error("no bound");
     expect(side(first)).toBeLessThan(2 * R);
     expect(side(exact)).toBeLessThan(side(first));
+  });
+
+  it("starts inside the root disc: the bound a transport posts before any depth (nestedRootBounds)", () => {
+    const root = nestedRootBounds(tree.leafCount);
+    expect(root).toEqual([-R, -R, R, R]);
+    expect(nestedRootBounds(tree.leafCount, 7)).toEqual([-7, -7, 7, 7]);
+    const first = bounds[0];
+    if (!first) throw new Error("no bound");
+    expect(first[0] >= root[0] && first[1] >= root[1] && first[2] <= root[2] && first[3] <= root[3]).toBe(true);
   });
 });
 

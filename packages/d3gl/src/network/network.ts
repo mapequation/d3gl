@@ -772,11 +772,12 @@ export class Network extends BaseEngine {
    *  first user gesture or node grab, or by a `setTransform`. */
   private fitOnLayout = false;
   /**
-   * A bound on a streaming layout's final extent that is known before its leaves are placed: a cold nested
-   * layout's (#324) root disc, then each streamed depth's placed discs (#427). Its early frames collapse
-   * unplaced leaves onto their module centres, so the live bounds would under-frame the map and then zoom
-   * out as depths land; this bound only shrinks, down to the leaves' exact box. Streamed frames only — a
-   * settled layout always frames on its leaves' exact box.
+   * A bound on a streaming layout's final extent that is known before its leaves are placed, as its
+   * transport posts it (#427): a cold nested layout's (#324) root disc, then each streamed depth's placed
+   * discs. Its early frames collapse unplaced leaves onto their module centres, so the live bounds would
+   * under-frame the map and then zoom out as depths land; this bound only shrinks, down to the leaves' exact
+   * box. Null while no transport has posted one — the fit then frames the live leaves. Streamed frames only
+   * — a settled layout always frames on its leaves' exact box.
    */
   private fitBound: FitBox | null = null;
   /** The camera of a fitted transition (#427): the view at the transition's eased progress, from the view
@@ -1969,10 +1970,10 @@ export class Network extends BaseEngine {
     if (layoutClass(opts.backend) === "streaming") {
       const oneFrame = warm || tween !== null;
       this.nestedSolving = true;
-      // A cold map streamed depth by depth frames on a box its final layout is known to lie in (#427): the
-      // root disc until the first depth lands, then each depth's placed discs — shrinking to the leaves'
-      // exact box. A warm map, or one eased in, is framed once it lands.
-      if (!oneFrame) this.fitBound = [-radius, -radius, radius, radius];
+      // A cold map streamed depth by depth frames on the bound the transport posts (#427): the root disc as
+      // the stream starts, then each depth's placed discs — shrinking to the leaves' exact box. The engine
+      // assumes no bound: a transport that posts none frames the live leaves, as a flat stream does. A warm
+      // map, or one eased in, is framed once it lands.
       const delivery = {
         stream: !oneFrame,
         onResult: oneFrame ? (positions: Float32Array) => this.landNested(graph, positions, tween) : undefined,
