@@ -670,7 +670,8 @@ await net.whenSettled(); // resolves when the transition ends
   jump — even when it grew. The view's visible rectangle moves in a straight line as the nodes do, so
   the zoom is monotonic and a node on screen at both ends stays on screen throughout. The camera waits
   where it is while the layout computes the new map, and it is yours again the moment you zoom, pan or
-  drag a node (or call `setTransform`) — it never pulls the view away from you. If the view is resized,
+  drag a node (or call `setTransform`) — it never pulls the view away from you. Stopping the layout
+  (`stopLayout()`, a new `layout()` or `data()`) stops the camera where it is, too. If the view is resized,
   or the node size changes, on the way, the camera re-aims from where it is and still ends framed. Its
   per-frame cost is constant: the new map's box is measured once, when the transition starts. Without
   `fit` the camera stays where it is.
