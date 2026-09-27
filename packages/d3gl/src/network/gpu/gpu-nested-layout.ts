@@ -5,10 +5,10 @@ import { atlasWidth, pingPong, type PingPong } from "./textures.js";
 import { beginPass, type PassTarget, type PassUniforms } from "./passes/fullscreen.js";
 import { SegmentedReduce, rangeRows, type RangeTarget, type ReduceInput, type ReduceMap } from "./passes/segmented-reduce.js";
 import { GridPyramid, type PyramidBuildInput } from "./passes/grid-pyramid.js";
-import { RepulsionPass } from "./passes/repulsion.js";
+import { RepulsionPass, type RepulsionInput } from "./passes/repulsion.js";
 import { NestedIntegratePass, NestedPredictPass, type NestedSlotInputs } from "./passes/nested.js";
 import { COLLISION_STEPS, CollisionGrid, type CollisionGatherInput, type CollisionPrepareInput } from "./passes/collision.js";
-import { NestedComposePass } from "./passes/nested-compose.js";
+import { NestedComposePass, type ComposeInput } from "./passes/nested-compose.js";
 import { GpuSprings } from "./springs.js";
 import type { NestedSpringInputs } from "./passes/attraction.js";
 import { SegmentTable, type SegmentRow } from "./segment-table.js";
@@ -164,6 +164,11 @@ export class GpuNestedLayout implements StreamSolver {
   private readonly slotInputs: NestedSlotInputs;
   private readonly gatherInput: CollisionGatherInput;
   private readonly prepareInput: CollisionPrepareInput;
+  /** The other passes' inputs, created once; each band only points them at the current positions. */
+  private readonly reduceInputs: ReduceInput;
+  private readonly pyramidInputs: PyramidBuildInput;
+  private readonly repulsionInputs: RepulsionInput;
+  private readonly composeInputs: ComposeInput;
   private readonly springInputs: NestedSpringInputs;
   /**
    * The nested map's textures per mode. Mode 2 reads mode 1's sums (the composition's `sums.stats`); mode 1
@@ -367,6 +372,30 @@ export class GpuNestedLayout implements StreamSolver {
         count: slots,
         width,
         pad: NESTED.PAD,
+      };
+      this.reduceInputs = { pos: this.pos.readTex, posWidth: width, count: slots };
+      this.pyramidInputs = { posTex: this.pos.readTex, width, count: slots, segments: this.segments, slotSeg: this.slotSeg };
+      this.repulsionInputs = {
+        posTex: this.pos.readTex,
+        count: slots,
+        width,
+        theta: NESTED_THETA,
+        segments: this.segments,
+        pyramid: this.pyramid,
+        slotSeg: this.slotSeg,
+      };
+      this.composeInputs = {
+        pos: this.pos.readTex,
+        radius: this.radius,
+        slotSeg: this.slotSeg,
+        width,
+        segments: this.segments,
+        segSum: this.sums.stats,
+        segExtent: this.extent.box,
+        segNested: this.segNested,
+        rootX: this.rootX,
+        rootY: this.rootY,
+        rootRadius: topo.rootRadius,
       };
 
       // ── The passes of each stream tick and of a readback (see the file header) ──
@@ -577,23 +606,9 @@ export class GpuNestedLayout implements StreamSolver {
 
   /** The composition + pack into the staging texture, from the composition's sums and extents. */
   private composeBand(band: number, bands: number): void {
-    this.compose.run(
-      {
-        pos: this.pos.readTex,
-        radius: this.radius,
-        slotSeg: this.slotSeg,
-        width: this.width,
-        segments: this.segments,
-        segSum: this.sums.stats,
-        segExtent: this.extent.box,
-        segNested: this.segNested,
-        rootX: this.rootX,
-        rootY: this.rootY,
-        rootRadius: this.topo.rootRadius,
-      },
-      band,
-      bands,
-    );
+    const input = this.composeInputs;
+    input.pos = this.pos.readTex;
+    this.compose.run(input, band, bands);
   }
 
   /** Repulsion into the force accumulator, which the first band clears. */
@@ -602,15 +617,9 @@ export class GpuNestedLayout implements StreamSolver {
     const [r0, r1] = bandRows(band, bands, this.height);
     if (r1 <= r0) return;
     const pass = beginPass(this.device, this.slotTarget(this.forceFbo, band, bands));
-    this.repulsion.run(pass, {
-      posTex: this.pos.readTex,
-      count: this.slots,
-      width: this.width,
-      theta: NESTED_THETA,
-      segments: this.segments,
-      pyramid: this.pyramid,
-      slotSeg: this.slotSeg,
-    });
+    const input = this.repulsionInputs;
+    input.posTex = this.pos.readTex;
+    this.repulsion.run(pass, input);
     pass.end();
     this.device.submit();
   }
@@ -695,12 +704,18 @@ export class GpuNestedLayout implements StreamSolver {
     return { framebuffer, clear: false, scissor: [0, r0, this.width, r1 - r0] };
   }
 
+  /** The reductions' input, at the current positions. */
   private reduceInput(): ReduceInput {
-    return { pos: this.pos.readTex, posWidth: this.width, count: this.slots };
+    const input = this.reduceInputs;
+    input.pos = this.pos.readTex;
+    return input;
   }
 
+  /** The pyramid scatter's input, at the current positions. */
   private pyramidInput(): PyramidBuildInput {
-    return { posTex: this.pos.readTex, width: this.width, count: this.slots, segments: this.segments, slotSeg: this.slotSeg };
+    const input = this.pyramidInputs;
+    input.posTex = this.pos.readTex;
+    return input;
   }
 
   /** The collision passes' inputs, at the current positions. */
