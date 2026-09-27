@@ -1,7 +1,9 @@
 /**
- * T7 — the streaming GPU layout's per-frame guard (#352, spec §13), through the real trigger:
- * `network().data(g).lod(…).layout({ backend: "gpu" })`, real animation frames, one engine for both
- * reduction states (LOD off, then the Navigator's structural LOD on).
+ * T7 — the streaming GPU layout's per-frame guard (#352, spec §13), run as two files, one per reduction state
+ * (`gpu-stream-nolod-perf.browser.test.ts`, `gpu-stream-lod-perf.browser.test.ts`; see {@link StreamHalf}),
+ * through the real trigger:
+ * `network().data(g).lod(…).layout({ backend: "gpu" })`, real animation frames, one engine per reduction
+ * state (LOD off; the Navigator's structural LOD on).
  *
  * Before #352 every streamed frame ran a synchronous `readPixels` after queueing a batch of ticks, so the
  * main thread waited for the whole batch: on web-NotreDame (325k nodes, M1 Max) animation-frame tasks of
@@ -456,6 +458,39 @@ function slicedRate(solo: GpuForceLayout, out: Float32Array, bands: number, tick
   return { ticksPerSec: (ticks * 1000) / (performance.now() - t0), encodeMsPerTick: encode / ticks };
 }
 
+/**
+ * The GPU-only tick rate on this machine: a separate solver from the seed the layout starts from, run and
+ * fenced, before any stream. Also reported with the tick cut into the static band counts the stream starts
+ * from at 60 Hz and 120 Hz (report only; 5 ticks keep the SwiftShader tier's cost small).
+ */
+async function gpuOnlyRate(graph: NetworkGraph): Promise<{ ticksPerSec: number; report: string }> {
+  const device: Device = await makeTestDevice();
+  try {
+    const seeded = { ...graph, positions: graph.positions.slice() };
+    seedPositions(seeded, W, H, { force: DEFAULT_FORCE });
+    const solo = new GpuForceLayout(device, seeded, DEFAULT_FORCE);
+    const out = new Float32Array(N * 2);
+    solo.runFrame(2);
+    solo.readPositions(out);
+    const t0 = performance.now();
+    solo.runFrame(10);
+    const encodeMs = performance.now() - t0;
+    solo.readPositions(out);
+    const ticksPerSec = 10_000 / (performance.now() - t0);
+    let report = `B=1 ${ticksPerSec.toFixed(1)} ticks/s (encode ${(encodeMs / 10).toFixed(2)} ms/tick)`;
+    const sliced = new Set([60, 120].map((hz) => staticBands(N, frameBudgetMs(DEFAULT_BUDGET_MS, 1000 / hz), solo.atlasRows)));
+    for (const bands of sliced) {
+      if (bands === 1) continue;
+      const rate = slicedRate(solo, out, bands, 5);
+      report += `; B=${bands} ${rate.ticksPerSec.toFixed(1)} ticks/s (encode ${rate.encodeMsPerTick.toFixed(2)} ms/tick)`;
+    }
+    solo.destroy();
+    return { ticksPerSec, report };
+  } finally {
+    device.destroy();
+  }
+}
+
 function report(label: string, leg: Leg): { transport: number[]; encode: number[]; ticksPerSec: number } {
   const { frames } = leg;
   const transport = frames.map((s) => s.harvestMs + s.encodeMs);
@@ -526,91 +561,78 @@ function assertDrag(label: string, leg: DragLeg, transportP95Ms: number, encodeM
   expect(leg.heldWriteSizes.every((n) => n === leg.heldCount)).toBe(true);
 }
 
-describe("GPU layout streaming per frame (#352) — network().layout({ backend: 'gpu' })", () => {
-  let host: HTMLElement;
-  let net: Network;
-  let graph: NetworkGraph;
-  let gpuOnlyTicksPerSec = 0;
-  let gpuOnlyReport = "";
+/**
+ * Which half of T7 a file runs. T7 runs as two files, one per reduction state, because the browser tier
+ * gives each file its own process and a 300 s budget (scripts/run-browser-perf-tier.mjs). On the CI runners
+ * the legs together take 140-280 s: under SwiftShader every 100k-node full-detail repaint holds the next
+ * animation frame for seconds, and a drag repaints tens of times. That is past the budget on a slow runner.
+ * Each half builds its own engine and fixture; only the LOD-off half measures the GPU-only tick rate its
+ * throughput floor needs.
+ */
+export type StreamHalf = "LOD off" | "LOD on";
 
-  beforeAll(async () => {
-    graph = clustered(N, 0x5712);
-    // The GPU-only tick rate on this machine: a separate solver from the seed the layout starts from,
-    // run and fenced, before any stream.
-    const device: Device = await makeTestDevice();
-    try {
-      const seeded = { ...graph, positions: graph.positions.slice() };
-      seedPositions(seeded, W, H, { force: DEFAULT_FORCE });
-      const solo = new GpuForceLayout(device, seeded, DEFAULT_FORCE);
-      const out = new Float32Array(N * 2);
-      solo.runFrame(2);
-      solo.readPositions(out);
-      const t0 = performance.now();
-      solo.runFrame(10);
-      const encodeMs = performance.now() - t0;
-      solo.readPositions(out);
-      gpuOnlyTicksPerSec = 10_000 / (performance.now() - t0);
-      gpuOnlyReport = `B=1 ${gpuOnlyTicksPerSec.toFixed(1)} ticks/s (encode ${(encodeMs / 10).toFixed(2)} ms/tick)`;
-      // The static band counts the stream starts from at 60 Hz and 120 Hz (report only; 5 ticks keep the
-      // SwiftShader tier's cost small).
-      const sliced = new Set([60, 120].map((hz) => staticBands(N, frameBudgetMs(DEFAULT_BUDGET_MS, 1000 / hz), solo.atlasRows)));
-      for (const bands of sliced) {
-        if (bands === 1) continue;
-        const { ticksPerSec, encodeMsPerTick } = slicedRate(solo, out, bands, 5);
-        gpuOnlyReport += `; B=${bands} ${ticksPerSec.toFixed(1)} ticks/s (encode ${encodeMsPerTick.toFixed(2)} ms/tick)`;
-      }
-      solo.destroy();
-    } finally {
-      device.destroy();
-    }
-    host = perfHost(W, H);
-    net = network(host, { width: W, height: H, backend: "webgl" });
-    await net.whenReady();
-    net.interactive({ draggable: true });
-    // Warm-up on the same engine: the capability probe, shader compiles and the lane programs.
-    net.data(clustered(2_000, 1)).layout({ backend: "gpu", iterations: 5 });
-    await net.whenSettled();
-  }, perfBudget(120_000));
+/** Register T7's legs for one reduction state (see {@link StreamHalf}). */
+export function describeGpuStream(half: StreamHalf): void {
+  const off = half === "LOD off";
+  describe(`GPU layout streaming per frame (#352), ${half} — network().layout({ backend: 'gpu' })`, () => {
+    let host: HTMLElement;
+    let net: Network;
+    let graph: NetworkGraph;
+    let gpuOnlyTicksPerSec = 0;
+    let gpuOnlyReport = "";
 
-  afterAll(() => {
-    net?.destroy();
-    host?.remove();
+    beforeAll(async () => {
+      graph = clustered(N, 0x5712);
+      if (off) ({ ticksPerSec: gpuOnlyTicksPerSec, report: gpuOnlyReport } = await gpuOnlyRate(graph));
+      host = perfHost(W, H);
+      net = network(host, { width: W, height: H, backend: "webgl" });
+      await net.whenReady();
+      net.interactive({ draggable: true });
+      // Warm-up on the same engine: the capability probe, shader compiles and the lane programs.
+      net.data(clustered(2_000, 1)).layout({ backend: "gpu", iterations: 5 });
+      await net.whenSettled();
+    }, perfBudget(120_000));
+
+    afterAll(() => {
+      net?.destroy();
+      host?.remove();
+    });
+
+    // Calibrated at LOCAL_N (see the PR's Performance section for the measured numbers). The transport's
+    // own main-thread work per frame is a fence poll, a memcpy of 8 B per node on harvest frames, and at
+    // most 2 ms of encode: constant plus a small linear term. A synchronous read in the frame waits for
+    // every queued tick (tens of ms at this N on a real GPU, seconds under SwiftShader).
+    const TRANSPORT_P95_MS = perfBudget(4 + 2 * (N / LOCAL_N));
+    const ENCODE_MEDIAN_MS = perfBudget(2.5);
+
+    it.runIf(off)("LOD off: bounded transport main thread, async readback signatures, throughput", async () => {
+      const leg = await streamLeg(net, graph, false);
+      const { transport, encode, ticksPerSec } = report("LOD off", leg);
+      console.log(`  GPU-only tick rate: ${gpuOnlyReport}`);
+      assertSignatures(leg);
+      expect(quantile(transport, 0.95)).toBeLessThan(TRANSPORT_P95_MS);
+      expect(median(encode)).toBeLessThan(ENCODE_MEDIAN_MS);
+      // The layout gets ≤ 60% of each frame's GPU time, and the encode cap binds at small N: a quarter of
+      // the GPU-only rate is a floor a working stream clears with room to spare.
+      expect(ticksPerSec).toBeGreaterThan(0.25 * gpuOnlyTicksPerSec * 0.6);
+    }, perfBudget(240_000));
+
+    it.runIf(off)("LOD off: a node drag reheats through the same budgeted loop — transport bounds, O(held) pins", async () => {
+      const leg = await dragLeg(net, host, graph, 0);
+      assertDrag("LOD off", leg, TRANSPORT_P95_MS, ENCODE_MEDIAN_MS);
+    }, perfBudget(240_000));
+
+    it.runIf(!off)("LOD on (structural cut, declutter, super-edges): the same transport bounds; repaint cost reported", async () => {
+      const leg = await streamLeg(net, graph, true);
+      const { transport, encode } = report("LOD on", leg);
+      assertSignatures(leg);
+      expect(quantile(transport, 0.95)).toBeLessThan(TRANSPORT_P95_MS);
+      expect(median(encode)).toBeLessThan(ENCODE_MEDIAN_MS);
+    }, perfBudget(240_000));
+
+    it.runIf(!off)("LOD on: a node drag reheats through the same budgeted loop — transport bounds, O(held) pins", async () => {
+      const leg = await dragLeg(net, host, graph, Math.floor(N / 2));
+      assertDrag("LOD on", leg, TRANSPORT_P95_MS, ENCODE_MEDIAN_MS);
+    }, perfBudget(240_000));
   });
-
-  // Calibrated at LOCAL_N (see the PR's Performance section for the measured numbers). The transport's
-  // own main-thread work per frame is a fence poll, a memcpy of 8 B per node on harvest frames, and at
-  // most 2 ms of encode: constant plus a small linear term. A synchronous read in the frame waits for
-  // every queued tick (tens of ms at this N on a real GPU, seconds under SwiftShader).
-  const TRANSPORT_P95_MS = perfBudget(4 + 2 * (N / LOCAL_N));
-  const ENCODE_MEDIAN_MS = perfBudget(2.5);
-
-  it("LOD off: bounded transport main thread, async readback signatures, throughput", async () => {
-    const leg = await streamLeg(net, graph, false);
-    const { transport, encode, ticksPerSec } = report("LOD off", leg);
-    console.log(`  GPU-only tick rate: ${gpuOnlyReport}`);
-    assertSignatures(leg);
-    expect(quantile(transport, 0.95)).toBeLessThan(TRANSPORT_P95_MS);
-    expect(median(encode)).toBeLessThan(ENCODE_MEDIAN_MS);
-    // The layout gets ≤ 60% of each frame's GPU time, and the encode cap binds at small N: a quarter of
-    // the GPU-only rate is a floor a working stream clears with room to spare.
-    expect(ticksPerSec).toBeGreaterThan(0.25 * gpuOnlyTicksPerSec * 0.6);
-  }, perfBudget(240_000));
-
-  it("LOD off: a node drag reheats through the same budgeted loop — transport bounds, O(held) pins", async () => {
-    const leg = await dragLeg(net, host, graph, 0);
-    assertDrag("LOD off", leg, TRANSPORT_P95_MS, ENCODE_MEDIAN_MS);
-  }, perfBudget(240_000));
-
-  it("LOD on (structural cut, declutter, super-edges): the same transport bounds; repaint cost reported", async () => {
-    const leg = await streamLeg(net, graph, true);
-    const { transport, encode } = report("LOD on", leg);
-    assertSignatures(leg);
-    expect(quantile(transport, 0.95)).toBeLessThan(TRANSPORT_P95_MS);
-    expect(median(encode)).toBeLessThan(ENCODE_MEDIAN_MS);
-  }, perfBudget(240_000));
-
-  it("LOD on: a node drag reheats through the same budgeted loop — transport bounds, O(held) pins", async () => {
-    const leg = await dragLeg(net, host, graph, Math.floor(N / 2));
-    assertDrag("LOD on", leg, TRANSPORT_P95_MS, ENCODE_MEDIAN_MS);
-  }, perfBudget(240_000));
-});
+}
