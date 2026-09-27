@@ -780,7 +780,8 @@ describe("backend:'gpu' across a render-backend swap (#311)", () => {
     try {
       const g = clustered(1500);
       const budget = 1000;
-      net.data(g).style({ nodeRadius: 6 }).interactive({ draggable: true }).layout({ backend: "gpu", iterations: budget });
+      // A cold start (no multilevel seed, #353), whose held heat the worker continues.
+      net.data(g).style({ nodeRadius: 6 }).interactive({ draggable: true }).layout({ backend: "gpu", iterations: budget, multilevel: false });
       await until(() => harvested > 0, "a GPU harvest");
       expect(net.layoutTransport).toBe("gpu");
       const ticks = harvested;
@@ -850,7 +851,9 @@ describe("backend:'gpu' across a render-backend swap (#311)", () => {
     });
     try {
       const budget = 600;
-      net.data(clustered(1500)).layout({ backend: "gpu", iterations: budget });
+      // Counts ticks, so no convergence stop (#376) may cut the budget short: without repulsion the model has
+      // no equilibrium spacing and the stop never arms (as on the CPU); a cold start, no multilevel seed (#353).
+      net.data(clustered(1500)).layout({ backend: "gpu", iterations: budget, multilevel: false, force: { repulsion: 0 } });
       await until(() => harvested > 0, "a GPU harvest");
       const ticks = harvested;
 

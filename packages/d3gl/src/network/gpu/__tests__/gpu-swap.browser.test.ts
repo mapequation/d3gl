@@ -240,7 +240,10 @@ describe("GPU layout swap policy at the transport (#311)", () => {
     const unobserve = observeGpuLayoutFrames((s) => {
       if (s.harvested) finals.push(s.harvestedTicks);
     });
-    const handle = startGpuLayout(first, g, { width: W, height: H, iterations: budget, frameEvery: 5 }, () => {}, undefined,
+    // Counts ticks, so no convergence stop (#376) may cut the budget short: a model without repulsion has no
+    // equilibrium spacing, so the stop never arms (as on the CPU); and a cold start, no multilevel seed (#353).
+    const noStop = { multilevel: false, force: { ...DEFAULT_FORCE, repulsion: 0 } };
+    const handle = startGpuLayout(first, g, { width: W, height: H, iterations: budget, frameEvery: 5, ...noStop }, () => {}, undefined,
       (t) => transports.push(t));
     try {
       await until(() => follow.harvested() >= 10, "a few harvests");
