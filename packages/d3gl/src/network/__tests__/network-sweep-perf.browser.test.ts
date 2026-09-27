@@ -253,6 +253,10 @@ let lodHold: HoldLeg;
 let lodHoldArrows: HoldLeg;
 let lodHoldHalfArrows: HoldLeg;
 let lodDense: Leg;
+let lodSpatial: Leg;
+let lodSpatialHold: HoldLeg;
+let spatialHeldStats: { hits: number; misses: number; visits: number } | null = null;
+let spatialSweepStats: { hits: number; misses: number; visits: number } | null = null;
 
 beforeAll(async () => {
   const spy = new GlBufferSpy();
@@ -393,6 +397,17 @@ beforeAll(async () => {
     net.lod({ declutter: true, maxAggregateRadius: 24, expandPx: 1e-6 });
     lodDense = runLeg(zoomSteps(W, H, [0.15, 0.2, 0.3, 0.45, 0.7, 1]));
 
+    // The spatial source (#343), same engine: a Morton tree built once over the static positions, its
+    // links gathered lazily from the graph's edges (no super-edge CSR) with the per-tree row memo.
+    net.style({ nodeRadius: 3, directed: false, linkStyle: "line" });
+    net.lod({ source: "spatial", declutter: true, maxAggregateRadius: 24 });
+    lodSpatial = runLeg();
+    spatialSweepStats = net.superEdgeStats;
+    net.setTransform(held);
+    net.setTransform(held); // an unchanged re-emit: every row from the memo
+    spatialHeldStats = net.superEdgeStats;
+    lodSpatialHold = runHold();
+
     net.destroy();
   } finally {
     layerSpy.restore();
@@ -513,6 +528,29 @@ describe(`network() engine zoom sweep — per-frame cost at N=${N.toLocaleString
     ["directed lines + arrowheads", lodHoldArrows, ["arrows", "lines"]],
     ["half-arrows", lodHoldHalfArrows, ["half-arrows"]],
   ];
+
+  it("LOD ON, spatial source (#343): lazy links from the row memo, O(visible) re-cut, in-place re-upload", () => {
+    // Non-vacuity: the spatial tree drew links, and gathered them lazily — so no super-edge CSR exists.
+    expect(spatialSweepStats, "the spatial leg never ran the lazy super-edge gather").not.toBeNull();
+    expect(lodSpatial.drawnLinks, "the spatial sweep drew no link").toBeGreaterThan(1000);
+    expect(lodSpatial.nodeFillAfter, "nodeFill re-ran during the spatial sweep").toBe(lodSpatial.nodeFillBefore);
+    const perFrame = (lodSpatial.linkStrokeAfter - lodSpatial.linkStrokeBefore) / lodSpatial.frames;
+    expect(perFrame, `spatial sweep resolved ${perFrame.toFixed(0)} link colours per frame`).toBeLessThan(LOD_LINK_COLOURS_PER_FRAME);
+    expect(lodSpatial.buffersCreated, "GPU buffers were created during the spatial sweep").toBe(0);
+    expect(lodSpatial.buffersDeleted, "GPU buffers were destroyed during the spatial sweep").toBe(0);
+    const uploadPerFrame = lodSpatial.uploadedBytes / lodSpatial.frames;
+    expect(uploadPerFrame, `spatial sweep uploaded ${(uploadPerFrame / 1024).toFixed(0)} KB per frame`).toBeLessThan(LOD_UPLOAD_BYTES_PER_FRAME);
+    expect(lodSpatial.worstFrameMs, `spatial: worst frame ${lodSpatial.worstFrameMs.toFixed(2)}ms at N=${N.toLocaleString()}`).toBeLessThan(FRAME_MS_LOD);
+    expectDeclutterBounded("spatial sweep", lodSpatial);
+    // Deterministic: a held view walks no edge and rebuilds no row — every kept glyph's links from the memo.
+    expect(spatialHeldStats?.misses, "held view: rows rebuilt").toBe(0);
+    expect(spatialHeldStats?.visits, "held view: edge incidences walked").toBe(0);
+    expect(spatialHeldStats?.hits, "held view: rows answered from the memo").toBeGreaterThan(0);
+    // …and the held frames hand back the same style columns and upload only the endpoints.
+    expect(lodSpatialHold.freshColumns, "spatial: style columns re-emitted as new arrays on an unchanged view").toEqual([]);
+    expect(lodSpatialHold.uploadedBytes).toBeLessThanOrEqual(lodSpatialHold.alwaysWrittenBytes);
+    expect(lodSpatialHold.linkStrokeCalls, "spatial: link colours re-resolved on an unchanged view").toBe(0);
+  });
 
   it("LOD ON, held view: an unchanged re-emit hands back the same style columns and uploads only the endpoints", () => {
     for (const [name, leg, primitives] of holdLegs()) {

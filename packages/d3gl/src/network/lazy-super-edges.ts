@@ -83,7 +83,7 @@ const CULLED = 3;
 /** Direction flags per row entry. */
 const HAS_OUT = 1;
 const HAS_IN = 2;
-/** Row entries the memo keeps before it starts over (20-21 B each: ~5 MB). */
+/** Row entries the memo may hold (21 B each: ~5 MB) before it drops the rows the last frame did not use. */
 const MEMO_MAX_ENTRIES = 1 << 18;
 /** Generations before the stamps wrap (`gen << 3` must stay a positive Int32). */
 const MAX_GEN = (1 << 28) - 1;
@@ -196,6 +196,49 @@ function growRows(sc: LazySuperEdgesScratch, need: number): void {
 }
 
 /**
+ * Drop every memoised row but those of `kept` (this frame's glyphs), moving their entries to the front of
+ * the arena in place — a held view that follows then still answers from the memo. O(this frame's rows'
+ * entries + kept · log kept), only when the arena has grown past its bound.
+ */
+function compactRows(sc: LazySuperEdgesScratch, kept: Uint32Array): void {
+  const rows: number[] = [];
+  for (let i = 0; i < kept.length; i++) {
+    const g = kept[i]!;
+    const row = sc.rowIndex.find(g, g, sc.rowG, sc.rowG);
+    if (row >= 0) rows.push(row);
+  }
+  // Entries move toward the front in their current order, so a row is never overwritten before it moves.
+  rows.sort((a, b) => sc.rowStart[a]! - sc.rowStart[b]!);
+  const g = new Int32Array(rows.length);
+  const start = new Int32Array(rows.length);
+  const len = new Int32Array(rows.length);
+  let ents = 0;
+  for (let i = 0; i < rows.length; i++) {
+    const row = rows[i]!;
+    const from = sc.rowStart[row]!;
+    const n = sc.rowLen[row]!;
+    sc.entH.copyWithin(ents, from, from + n);
+    sc.entOut.copyWithin(ents, from, from + n);
+    sc.entIn.copyWithin(ents, from, from + n);
+    sc.entDir.copyWithin(ents, from, from + n);
+    g[i] = sc.rowG[row]!;
+    start[i] = ents;
+    len[i] = n;
+    ents += n;
+  }
+  sc.rowIndex.reset(rows.length);
+  sc.rows = 0;
+  for (let i = 0; i < rows.length; i++) {
+    sc.rowG[i] = g[i]!;
+    sc.rowStart[i] = start[i]!;
+    sc.rowLen[i] = len[i]!;
+    sc.rowIndex.findOrAdd(g[i]!, g[i]!, i, sc.rowG, sc.rowG);
+    sc.rows++;
+  }
+  sc.ents = ents;
+}
+
+/**
  * The super-edges among the kept glyphs of a spatial tree's cut (#343), gathered from the graph's adjacency
  * through the tree's leaf runs ({@link LODTree.leafOrder}) — see the module comment. Same output as
  * {@link superEdges}: pairs keyed `a · tree.size + b`, drawn per `style.linkStyle`. With `style.directed`,
@@ -273,9 +316,8 @@ export function lazySuperEdges(
     }
   }
 
-  // The row memo belongs to one tree and one incidence (weights + direction); start over otherwise, or when
-  // it has grown past its bound (rows rebuilt since keep appending).
-  if (sc.memoTree !== tree || sc.memoIncidence !== incidence || sc.ents > MEMO_MAX_ENTRIES) {
+  // The row memo belongs to one tree and one incidence (weights + direction); start over otherwise.
+  if (sc.memoTree !== tree || sc.memoIncidence !== incidence) {
     sc.memoTree = tree;
     sc.memoIncidence = incidence;
     sc.rowIndex.reset();
@@ -435,5 +477,7 @@ export function lazySuperEdges(
       // else: a decluttered glyph on screen — skipped, as by the CSR gather.
     }
   }
+  // Rebuilt rows append, so the arena grows as the view moves: past its bound, keep only this frame's rows.
+  if (sc.ents > MEMO_MAX_ENTRIES) compactRows(sc, kept);
   return superEdgeBatches(tree, out, len, paired, style, cover, stamp | KEPT, null);
 }
