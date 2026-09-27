@@ -1223,8 +1223,9 @@ export type LODPositionTree = Pick<
 
 /**
  * Scratch for {@link computeLODPositions}'s exact bounding boxes (#343): 4 floats per aggregate, grown
- * on demand. Keep one per tree consumer (the engine, the layout worker) so a per-frame refit allocates
- * nothing; `computeLODPositions` makes a throwaway one when none is passed.
+ * on demand. Keep one per tree consumer (the engine, the layout worker) so its memory goes with that
+ * consumer; a call without one reuses the module's shared scratch (`sharedBounds`), so the pass
+ * allocates nothing per frame either way once warm.
  */
 export interface LODBoundsScratch {
   bounds: Float32Array;
@@ -1234,6 +1235,15 @@ export interface LODBoundsScratch {
 export function makeLODBoundsScratch(): LODBoundsScratch {
   return { bounds: new Float32Array(0) };
 }
+
+/**
+ * The box scratch a {@link computeLODPositions} call without its own reuses — the public
+ * {@link computeLODGeometry} with no `bounds`, a transition or drag frame driven directly. Grown to the
+ * largest tree passed without a scratch, then reused: a fresh one per call would allocate 16 B per
+ * aggregate on every frame. The pass is synchronous and every aggregate's box is written before it is
+ * read, so one per thread serves every caller.
+ */
+const sharedBounds = makeLODBoundsScratch();
 
 /**
  * Fill the tree's **position-derived** geometry from a layout snapshot: each leaf's centroid is its
@@ -1259,7 +1269,7 @@ export function makeLODBoundsScratch(): LODBoundsScratch {
  */
 export function computeLODPositions(tree: LODPositionTree, positions: ArrayLike<number>, discs?: BoundaryDiscs, scratch?: LODBoundsScratch): void {
   const { leafCount, levelCount, levelOffset, childOffset, children, cx, cy, extent, count } = tree;
-  const sc = scratch ?? makeLODBoundsScratch();
+  const sc = scratch ?? sharedBounds;
   const need = 4 * (tree.size - leafCount);
   if (sc.bounds.length < need) sc.bounds = new Float32Array(need);
   const bb = sc.bounds; // aggregate g's box: bb[4o .. 4o + 4) = minX, minY, maxX, maxY with o = g − leafCount
@@ -1574,7 +1584,8 @@ export function computeLODStyle(
  * `leafRadii` is the resolved per-node radius (so aggregates respect the node sizing); `leafWeight`
  * is the per-leaf importance, defaulting to `graph.strength` (weighted degree) — pass `graph.flow`
  * or `graph.csr.degree` to prioritise differently. `discs` places each module on its nested-layout
- * disc (#329, see {@link computeLODPositions}); `bounds` is the position pass's reusable box scratch.
+ * disc (#329, see {@link computeLODPositions}); `bounds` is the position pass's reusable box scratch —
+ * without one the pass reuses a shared scratch, so a repeated call allocates nothing for it.
  */
 export function computeLODGeometry(
   tree: LODTree,
