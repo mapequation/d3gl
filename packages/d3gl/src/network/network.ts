@@ -3321,9 +3321,10 @@ export class Network extends BaseEngine {
         this.repaintDuringDrag();
         this.flushFrame(); // this tick runs inside an animation frame: draw it here (with any pending zoom), not a frame late
         if (cool >= 0 && (--cool < 0 || sim.converged)) {
-          // Re-cooled (or tail spent) — stop the loop. The drag frames refit a spatial tree (#343); rebuild it
-          // once now that the nodes have come to rest, as a release does on the other backends.
-          if (this.lodSpatial) this.settleLODPositions();
+          // Re-cooled (or tail spent) — stop the loop. The drag frames refit a spatial tree (#343) and held every
+          // tree's crowding (#426) while the whole layout reflowed; settle both once now that the nodes have come
+          // to rest, as a release does on the other backends.
+          this.settleLODPositions();
           return;
         }
         raf = rafFn(frame);
