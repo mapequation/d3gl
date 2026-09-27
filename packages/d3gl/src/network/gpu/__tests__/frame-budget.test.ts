@@ -1,7 +1,8 @@
 /**
  * The streaming layout's fence controller (#352, spec §6.5.3) — node, pure, with fake fences and a fake
  * clock. It decides how many work items (tick prep, force bands, integrate) the GPU transport encodes in
- * one animation frame: at most 2 frames of layout work in flight, a GPU budget per frame of
+ * one animation frame: at most 33 ms of frames of layout work in flight (2 frames at 60 Hz, 4 at 120 Hz;
+ * a miss counts only against the oldest frame in flight), a GPU budget per frame of
  * min(10 ms, 0.6 × the rAF interval), and at most 2 ms of main-thread encode time.
  */
 import { describe, expect, it } from "vitest";
@@ -193,41 +194,99 @@ describe("FrameBudget k: items per frame", () => {
     frame(r); // 9 items
     frame(r); // 10 items
     expect(frame(r)).toBe(0);
-    expect(r.budget.k).toBe(5); // ⌊10 / 2⌋ — half of what the late frames actually encoded
+    expect(r.budget.k).toBe(4); // ⌊9 / 2⌋ — half of what the late frame (the oldest in flight) encoded
     // Still behind for a few more frames: one miss episode halves once.
     frame(r);
     frame(r);
-    expect(r.budget.k).toBe(5);
+    expect(r.budget.k).toBe(4);
     r.fences.catchUp();
-    // The hold: k stays 5 for 30 frames from the miss, then grows by one per frame again.
+    // The hold: k stays 4 for 30 frames from the miss, then grows by one per frame again.
     const held: number[] = [];
     for (let f = 0; f < 27; f++) {
       held.push(frame(r));
       r.fences.catchUp();
     }
-    expect(new Set(held)).toEqual(new Set([5]));
+    expect(new Set(held)).toEqual(new Set([4]));
     const grown: number[] = [];
     for (let f = 0; f < 3; f++) {
       grown.push(frame(r));
       r.fences.catchUp();
     }
-    expect(grown).toEqual([5, 6, 7]);
+    expect(grown).toEqual([4, 5, 6]);
   });
 
-  it("a miss behind a frame that carried the engine's repaint blocks, but resizes neither k nor B", () => {
+  it("a miss on the frame that carried the engine's repaint blocks, but resizes neither k nor B", () => {
     const r = rig();
     for (let f = 0; f < 6; f++) {
       frame(r);
       r.fences.catchUp();
     }
     expect(r.budget.k).toBe(7);
-    frame(r, { repainted: true }); // the render queues behind the layout
+    frame(r, { repainted: true }); // the late frame: its render queues ahead of its layout items
     frame(r);
-    expect(frame(r)).toBe(0); // blocked: two frames in flight, one of them repainted
+    expect(frame(r)).toBe(0); // blocked: two frames in flight, the oldest repainted
     expect(r.budget.k).toBeGreaterThanOrEqual(7);
     expect(r.budget.bands).toBe(1);
     r.fences.catchUp();
     expect(frame(r)).toBeGreaterThanOrEqual(7); // no hold, no halving
+  });
+
+  it("a repaint in a newer frame in flight does not excuse the late frame: k halves and holds", () => {
+    // The GPU runs work in order, so a repaint queued after the late frame's fence cannot have delayed it.
+    const r = rig();
+    for (let f = 0; f < 6; f++) {
+      frame(r);
+      r.fences.catchUp();
+    }
+    expect(r.budget.k).toBe(7);
+    frame(r); // the late frame: 7 layout items, no repaint
+    frame(r, { repainted: true }); // behind it on the GPU
+    expect(frame(r)).toBe(0);
+    expect(r.budget.k).toBe(3); // ⌊7 / 2⌋
+    r.fences.catchUp();
+    const held: number[] = [];
+    for (let f = 0; f < 10; f++) {
+      held.push(frame(r));
+      r.fences.catchUp();
+    }
+    expect(new Set(held)).toEqual(new Set([3]));
+  });
+
+  it("a repaint that completed just before the late frame excuses the miss: its GPU time ran first", () => {
+    // Frame 1 repaints and completes, but its render pushed frame 2's layout items late.
+    const r = rig();
+    for (let f = 0; f < 6; f++) {
+      frame(r);
+      r.fences.catchUp();
+    }
+    expect(r.budget.k).toBe(7);
+    const repaintFence = r.fences.inserted + 1;
+    frame(r, { repainted: true });
+    frame(r); // the late frame
+    r.fences.signaledThrough = repaintFence;
+    frame(r); // opens: only the late frame is in flight
+    expect(frame(r)).toBe(0); // blocked on the late frame, one frame after the repaint
+    expect(r.budget.k).toBeGreaterThanOrEqual(7);
+    r.fences.catchUp();
+    expect(frame(r)).toBeGreaterThanOrEqual(7); // no hold, no halving
+  });
+
+  it("a miss on a frame that encoded no item only blocks", () => {
+    // An empty late frame (a blocked one) holds no layout work that k or B could shrink.
+    const r = rig();
+    for (let f = 0; f < 6; f++) {
+      frame(r);
+      r.fences.catchUp();
+    }
+    frame(r); // 7 items
+    frame(r); // 8 items
+    const emptyFence = r.fences.inserted + 1;
+    expect(frame(r)).toBe(0); // miss 1: k = ⌊7 / 2⌋ = 3, and this blocked frame's fence is empty
+    expect(r.budget.k).toBe(3);
+    r.fences.signaledThrough = emptyFence - 1;
+    expect(frame(r)).toBe(3); // opens behind the empty fence
+    expect(frame(r)).toBe(0); // blocked again, on the empty frame
+    expect(r.budget.k).toBe(3);
   });
 
   it("keeps k ≥ 1 through repeated misses", () => {
@@ -331,6 +390,19 @@ describe("FrameBudget bands: row bands per force pass", () => {
     frame(r, { sliceable: false });
     frame(r, { sliceable: false });
     frame(r, { sliceable: false }); // miss 2 at k = 1, but only prep / integrate were in flight
+    expect(r.budget.k).toBe(1);
+    expect(r.budget.bands).toBe(1);
+  });
+
+  it("does not slice further when only a newer frame in flight held a force band", () => {
+    const r = rig();
+    frame(r);
+    frame(r);
+    frame(r); // miss 1: k = 1
+    r.fences.catchUp();
+    frame(r, { sliceable: false }); // the late frame: a prep or an integrate
+    frame(r); // a force band, queued behind it
+    frame(r); // miss 2 at k = 1
     expect(r.budget.k).toBe(1);
     expect(r.budget.bands).toBe(1);
   });
