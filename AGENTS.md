@@ -589,7 +589,7 @@ previous build — while every SwiftShader test stayed green, because SwiftShade
 
 ## GPU nested layout: dead passes hide behind complete fallbacks; fence what you time (#355)
 
-The nested layout solves every module at once on the GPU (`network/gpu/gpu-nested-layout.ts`). Three things
+The nested layout solves every module at once on the GPU (`network/gpu/gpu-nested-layout.ts`). Four things
 cost time while building it:
 
 - **A texture bound to any active sampler of a program while it is that draw's render target is a feedback
@@ -610,6 +610,15 @@ cost time while building it:
   dozens in a cell: on the synthetic 325k Infomap-like map, 78% of the grid slots overflow the 8 rounds
   and take the exact loop (81M pair tests, ~5 ms per collision step; a compact tick runs two in 13 ms). The CPU's
   grid (cells of 2·maxR·PAD) has the same O(k²) worst case. A radius-class grid is the follow-up.
+- **Row-major slots put different segments in one SIMD group, and it costs.** The slot atlas is
+  `⌈√slots⌉` wide, so a 2×2 quad or a SIMD group spans rows that are hundreds of slots apart: different
+  segments, with different loop lengths (exact loop, tile walk, collision fallback). Measured on the real
+  GPU on the synthetic 100k-leaf map with a narrow atlas as the proxy for an 8×8-blocked mapping (a group
+  then covers ≤ 32 consecutive slots): width 8 against 322 cuts an organise tick 2.2 → 1.5 ms and a compact
+  tick 9.6 → 5.9 ms, with bitwise-equal output. At 325k the narrowest atlas that fits (width 24) gains only
+  13-20%, and 1M cannot be tested this way. Measure a mapping change as a real blocked mapping (a define in
+  the per-slot shaders, blocked uploads), not a narrower atlas: width 64 was *slower* than 322 at 100k.
+  `gpu-nested-bench.browser.test.ts` (`PERF_BROWSER_N=<leaves>`, hardware-GL Chromium) times the solve.
 
 ## Host sizing: backend canvases are OUT OF FLOW (#39, re-confirmed in #273)
 
