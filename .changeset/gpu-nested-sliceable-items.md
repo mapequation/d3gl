@@ -30,8 +30,8 @@ a pan or zoom frame waited behind it.
 - Cost (M1 Max, cold layouts, 60 / 120 Hz): the synthetic 1M-leaf map takes 9% less at 60 Hz and 10% more
   at 120 Hz; the 325k maps and web-NotreDame's multilevel tree are within ±8%; web-NotreDame's two-level
   tree (one 8,528-child module) takes 8% more at 60 Hz and 31-39% more at 120 Hz; a map with one
-  60,000-child power-law module takes 12-36% more, with its worst frames' GPU work cut from ~350 ms to
-  ~170 ms; small maps (20k-100k leaves) take 22-36% more at 60 Hz and 36-70% more at 120 Hz, where the
+  60,000-child power-law module takes 11-13% more, with its worst frames' GPU work cut from ~280 ms to
+  70-120 ms; small maps (20k-100k leaves) take 22-36% more at 60 Hz and 36-70% more at 120 Hz, where the
   passes' fixed costs bind and the old frames ran up to twice over their budget. A frame now holds only
   what its budget admits. The composition has its own reduction scratch and sums, 3.3 MB more GPU memory
   at 1M (1.1 MB at 325k), freed at settle.

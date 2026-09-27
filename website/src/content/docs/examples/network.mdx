@@ -543,8 +543,8 @@ await net.whenSettled(); // resolves when the transition ends
   the passes do. The limit is the largest module. One child's pass over its whole module cannot be split,
   so past about 12,000 children at 120 Hz (25,000 at 60 Hz) a single band of the disc collision exceeds
   the budget, and when the children's sizes are very uneven the collision's cost grows with the square of
-  their number: one module of 60,000 children with power-law flows lays out in about 7 s (the CPU: 5
-  minutes), but frames stall for up to about 170 ms of GPU work while it packs. Infomap's modules on
+  their number: one module of 60,000 children with power-law flows lays out in 6-7 s (the CPU: 5
+  minutes), but frames stall for up to about 120 ms of GPU work while it packs. Infomap's modules on
   web-NotreDame (at most 8,528 children) lay out in about 2.2 s at 60 Hz and 2-3 s at 120 Hz (M1 Max).
 - **`transition: 600`** eases every node from where it is to its new place over 600 ms (cubic
   ease-in-out) on the main thread. The layout computes the final positions only; each animation frame is then
