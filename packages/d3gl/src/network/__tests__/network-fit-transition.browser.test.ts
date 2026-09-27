@@ -322,54 +322,71 @@ describe("fit + transition: the user takes the view over, the camera's own moves
   });
 });
 
+/**
+ * Frames stepped by hand on a virtual clock: `requestAnimationFrame` queues, {@link Stepper.step} advances
+ * the clock by `ms` and runs the queued frames, so each transition frame's eased progress is known exactly.
+ */
+interface Stepper {
+  step(ms: number): void;
+  restore(): void;
+}
+function stepper(): Stepper {
+  const realRaf = globalThis.requestAnimationFrame;
+  const realCaf = globalThis.cancelAnimationFrame;
+  const queue = new Map<number, FrameRequestCallback>();
+  let id = 0;
+  globalThis.requestAnimationFrame = (cb) => (queue.set(++id, cb), id);
+  globalThis.cancelAnimationFrame = (i) => void queue.delete(i);
+  let clock = 0;
+  const now = vi.spyOn(performance, "now").mockImplementation(() => clock);
+  return {
+    step(ms) {
+      clock += ms;
+      const due = [...queue.values()];
+      queue.clear();
+      for (const cb of due) cb(clock);
+    },
+    restore() {
+      now.mockRestore();
+      globalThis.requestAnimationFrame = realRaf;
+      globalThis.cancelAnimationFrame = realCaf;
+    },
+  };
+}
+
 describe("fit + transition: the destination follows the viewport and the glyph pad (#427)", () => {
   // The camera heads for the view framing the target in the viewport and with the glyph pad as they are
   // NOW: a resize or a restyle mid-ease re-aims it from where it is — no jump — and it lands on the view
-  // the settle frames, so there is no snap at the end either. Frames are stepped by hand on a virtual
-  // clock, so each frame's eased progress is known exactly.
+  // the settle frames, so there is no snap at the end either.
   for (const change of ["resize", "restyle"] as const) {
     it(`a ${change} mid-ease re-aims the camera from where it is, and it lands on the settled fit`, async () => {
       const { net } = await engine(true);
       const { graph, positions: a } = grid(400, 20, 10);
       net.data(graph).style({ nodeRadius: 3, sizeMode: change === "restyle" ? "world" : "screen" }).enableZoom([0.001, 100]);
       net.layout({ backend: "positions", positions: a, fit: true });
-
-      const realRaf = globalThis.requestAnimationFrame;
-      const realCaf = globalThis.cancelAnimationFrame;
-      const queue = new Map<number, FrameRequestCallback>();
-      let id = 0;
-      globalThis.requestAnimationFrame = (cb) => (queue.set(++id, cb), id);
-      globalThis.cancelAnimationFrame = (i) => void queue.delete(i);
-      const flush = (): void => {
-        const due = [...queue.values()];
-        queue.clear();
-        for (const cb of due) cb(0);
-      };
-      let clock = 0;
-      const now = vi.spyOn(performance, "now").mockImplementation(() => clock);
+      const frames = stepper();
       try {
         const D = 1000;
         const b = moved(a, 2, 300, -120);
         net.layout({ backend: "positions", positions: b, transition: D, fit: true }); // starts at clock 0
         let settled = false;
         void net.whenSettled().then(() => void (settled = true));
-        const frames: { e: number; view: ViewTransform }[] = [];
+        const seen: { e: number; view: ViewTransform }[] = [];
         let changedAfter = -1; // the last frame before the change
-        for (let i = 0; i < 40 && !settled; i++) {
-          clock += 50;
-          if (i === 8) {
-            changedAfter = frames.length - 1;
+        for (let i = 1; i <= 40 && !settled; i++) {
+          if (i === 9) {
+            changedAfter = seen.length - 1;
             if (change === "resize") net.setSize(W * 0.6, H * 0.6);
             else net.style({ nodeRadius: 60, sizeMode: "world" });
           }
-          flush();
-          frames.push({ e: easeCubicInOut(Math.min(1, clock / D)), view: net.camera });
+          frames.step(50);
+          seen.push({ e: easeCubicInOut(Math.min(1, (50 * i) / D)), view: net.camera });
           await sleep(0); // the settle's microtasks run here
         }
         expect(settled, "the transition never settled").toBe(true);
         const final = net.camera;
-        const last = frames[frames.length - 1];
-        const before = frames[changedAfter];
+        const last = seen[seen.length - 1];
+        const before = seen[changedAfter];
         if (!last || !before) throw new Error("no frames");
         // The last transition frame is already the settled fit: no snap at the settle.
         expect(last.view.k).toBeCloseTo(final.k, 9);
@@ -378,7 +395,7 @@ describe("fit + transition: the destination follows the viewport and the glyph p
         expect(final.k, "non-vacuity: the change did not move the destination").toBeLessThan(before.view.k * 0.9);
         // From the change on, the camera goes from where it was to the new destination over the progress
         // left, in step with the nodes — so it never jumps at the change.
-        for (const f of frames.slice(changedAfter + 1)) {
+        for (const f of seen.slice(changedAfter + 1)) {
           expect(cameraFraction(f.view, before.view, final)).toBeCloseTo((f.e - before.e) / (1 - before.e), 6);
         }
         if (change === "resize") {
@@ -386,9 +403,63 @@ describe("fit + transition: the destination follows the viewport and the glyph p
           expect(f.fill * Math.min(W, H) / Math.min(W * 0.6, H * 0.6)).toBeGreaterThan(0.8); // framed in the new size
         }
       } finally {
-        now.mockRestore();
-        globalThis.requestAnimationFrame = realRaf;
-        globalThis.cancelAnimationFrame = realCaf;
+        frames.restore();
+        net.destroy();
+      }
+    });
+  }
+});
+
+describe("fit + transition on Canvas and SVG: each frame's retained scene is cut at that frame's camera (#427)", () => {
+  // The camera moves through frameView (transform state + zoom re-seed), not setTransform, so no
+  // programmatic-transform hook re-bakes the vector scene: the frame's own rebuild must, at the view the
+  // camera just took. A frame baked at the previous view would draw screen-sized glyphs, labels and link
+  // widths one camera step behind.
+  const num = (v: string | undefined): number => Number(v ?? NaN);
+  for (const backend of ["canvas", "svg"] as const) {
+    it(`${backend}: glyphs, labels and link widths mid-transition match the camera and positions of that frame`, async () => {
+      const host = makeHost(true);
+      const net = new ProbeNetwork(host, { width: W, height: H, backend });
+      await net.whenReady();
+      const { graph, positions: a } = grid(100, 10, 20);
+      net.data(graph).style({ nodeRadius: 4, sizeMode: "screen", linkWidth: 1 }).enableZoom([0.001, 100]);
+      net.labels({ labelOf: (i) => `n${i}` });
+      net.layout({ backend: "positions", positions: a, fit: true });
+      const start = net.camera;
+      const frames = stepper();
+      try {
+        net.layout({ backend: "positions", positions: moved(a, 2.5, 200, -90), transition: 1000, fit: true });
+        for (let i = 0; i < 9; i++) frames.step(50); // mid-ease
+        const t = net.camera;
+        expect(t.k, "non-vacuity: the camera did not move").toBeLessThan(start.k * 0.8);
+        const mid = net.toSVG();
+
+        // Node glyphs: screen-sized, at this frame's positions through this frame's camera.
+        const circles = [...mid.matchAll(/<circle cx="([^"]+)" cy="([^"]+)" r="([^"]+)"/g)];
+        expect(circles.length).toBe(graph.nodeCount);
+        circles.forEach((m, i) => {
+          expect(num(m[1])).toBeCloseTo(t.k * (graph.positions[2 * i] ?? NaN) + t.x, 2);
+          expect(num(m[2])).toBeCloseTo(t.k * (graph.positions[2 * i + 1] ?? NaN) + t.y, 2);
+          expect(num(m[3])).toBeCloseTo(4, 6);
+        });
+        // Labels: on their nodes, at this frame.
+        const labels = [...mid.matchAll(/<text x="([^"]+)" y="([^"]+)"[^>]*>n(\d+)<\/text>/g)];
+        expect(labels.length, "no label was placed").toBeGreaterThan(0);
+        for (const m of labels) {
+          const i = num(m[3]);
+          expect(num(m[1])).toBeCloseTo(t.k * (graph.positions[2 * i] ?? NaN) + t.x, 2);
+          expect(num(m[2])).toBeCloseTo(t.k * (graph.positions[2 * i + 1] ?? NaN) + t.y, 2);
+        }
+        // Links: a 1px screen width baked into world units at this frame's k.
+        const widths = [...mid.matchAll(/<path d="[^"]*" fill="none" stroke="[^"]*" stroke-width="([^"]+)"/g)];
+        expect(widths.length).toBe(graph.edgeCount);
+        for (const m of widths) expect(num(m[1]) * t.k).toBeCloseTo(1, 3);
+        // …and the whole document is what a forced re-cut at this view gives.
+        net.syncScreenGeometry();
+        expect(net.toSVG(), "the retained scene lagged the camera").toBe(mid);
+        expect(net.interactingCalls).toBe(0);
+      } finally {
+        frames.restore();
         net.destroy();
       }
     });
