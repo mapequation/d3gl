@@ -1357,18 +1357,58 @@ const rgb2lrgb = (v: number): number => ((v /= 255) <= 0.04045 ? v / 12.92 : Mat
 const xyz2lab = (t: number): number => (t > LAB_T3 ? Math.pow(t, 1 / 3) : t / LAB_T2 + LAB_T0);
 const lab2xyz = (t: number): number => (t > LAB_T1 ? t * t * t : LAB_T2 * (t - LAB_T0));
 const lrgb2rgb = (v: number): number => 255 * (v <= 0.0031308 ? 12.92 * v : 1.055 * Math.pow(v, 1 / 2.4) - 0.055);
-/** Reused `[h, c, l]` / `[r, g, b]` out-parameter for the colour conversions below. */
-const hclOut = new Float64Array(3);
+/** Reused out-parameter for the colour conversions below (`[h, c, l]`, `[r, g, b]` or the hue terms). */
+const hclOut = new Float64Array(4);
+/** `rgb2lrgb` of every byte value — the same numbers d3-color computes for an integer channel. */
+const LRGB = Float64Array.from({ length: 256 }, (_, v) => rgb2lrgb(v));
+/** Direct-mapped memo of a colour's contribution to the aggregate colour mean, by 24-bit colour (16k slots,
+ *  ~650 KB): a categorical palette converts each colour once. It stores the computed values, so a hit is
+ *  bit-identical to converting again. */
+const HCL_MEMO_BITS = 14;
+const hclMemoKey = new Int32Array(1 << HCL_MEMO_BITS).fill(-1);
+const hclMemoVal = new Float64Array(4 << HCL_MEMO_BITS);
 
 /**
- * `hcl(rgb(r, g, b))` from d3-color, as the same float operations in the same order — so the result is
- * bit-identical — but written into `out` as `[h, c, l]` instead of allocating two colour objects. The
- * aggregate colour pass runs it once per tree node (#343: every streamed frame for a spatial tree).
+ * A byte colour's terms in {@link computeLODStyle}'s chroma-weighted circular hue mean, into `out`:
+ * `[cos(h)·c, sin(h)·c, c, l]` — the hue terms 0 for an achromatic colour (NaN hue) and chroma/lightness 0
+ * where d3-color gives NaN — computed exactly as the pass did, through the memo.
+ */
+function hueTerms(r: number, g: number, b: number, out: Float64Array): void {
+  const key = (r << 16) | (g << 8) | b;
+  const slot = Math.imul(key, 0x9e3779b1) >>> (32 - HCL_MEMO_BITS);
+  if (hclMemoKey[slot] === key) {
+    out[0] = hclMemoVal[4 * slot]!;
+    out[1] = hclMemoVal[4 * slot + 1]!;
+    out[2] = hclMemoVal[4 * slot + 2]!;
+    out[3] = hclMemoVal[4 * slot + 3]!;
+    return;
+  }
+  rgbToHcl(r, g, b, out);
+  const h = out[0]!;
+  const ch = Number.isNaN(out[1]!) ? 0 : out[1]!;
+  const l = Number.isNaN(out[2]!) ? 0 : out[2]!;
+  // (Adding +0 for a NaN hue leaves a sum from +0 unchanged — the pass skipped the term instead.)
+  out[0] = Number.isNaN(h) ? 0 : Math.cos((h * Math.PI) / 180) * ch;
+  out[1] = Number.isNaN(h) ? 0 : Math.sin((h * Math.PI) / 180) * ch;
+  out[2] = ch;
+  out[3] = l;
+  hclMemoKey[slot] = key;
+  hclMemoVal[4 * slot] = out[0]!;
+  hclMemoVal[4 * slot + 1] = out[1]!;
+  hclMemoVal[4 * slot + 2] = ch;
+  hclMemoVal[4 * slot + 3] = l;
+}
+
+/**
+ * `hcl(rgb(r, g, b))` from d3-color for byte channels, as the same float operations in the same order — so
+ * the result is bit-identical — but written into `out` as `[h, c, l]` instead of allocating two colour
+ * objects. The aggregate colour pass runs it once per tree node (#343: every streamed frame for a spatial
+ * tree), through {@link hueTerms}' memo.
  */
 function rgbToHcl(r: number, g: number, b: number, out: Float64Array): void {
-  const lr = rgb2lrgb(r);
-  const lg = rgb2lrgb(g);
-  const lb = rgb2lrgb(b);
+  const lr = LRGB[r]!;
+  const lg = LRGB[g]!;
+  const lb = LRGB[b]!;
   const y = xyz2lab((0.2225045 * lr + 0.7168786 * lg + 0.0606169 * lb) / LAB_YN);
   let x = y;
   let z = y;
@@ -1467,15 +1507,11 @@ export function computeLODStyle(
         else sumR2 += radius[c]! * radius[c]!;
         sb += border[c]!;
         if (leafColors) {
-          rgbToHcl(color[c * 4]!, color[c * 4 + 1]!, color[c * 4 + 2]!, hclOut);
-          const h = hclOut[0]!;
-          const ch = Number.isNaN(hclOut[1]!) ? 0 : hclOut[1]!;
-          if (!Number.isNaN(h)) {
-            hx += Math.cos((h * Math.PI) / 180) * ch;
-            hy += Math.sin((h * Math.PI) / 180) * ch;
-          }
-          sumC += ch;
-          sumL += Number.isNaN(hclOut[2]!) ? 0 : hclOut[2]!;
+          hueTerms(color[c * 4]!, color[c * 4 + 1]!, color[c * 4 + 2]!, hclOut);
+          hx += hclOut[0]!;
+          hy += hclOut[1]!;
+          sumC += hclOut[2]!;
+          sumL += hclOut[3]!;
           sumA += color[c * 4 + 3]!;
           nc++;
         }

@@ -319,7 +319,7 @@ describe("computeLODPositions tight extents (#343)", () => {
 });
 
 describe("computeLODStyle colours (#343: inline HCL, bit-identical to d3-color)", () => {
-  it("aggregates colours exactly as hcl(rgb(...)) / rgb(hcl(...)) did", () => {
+  for (const palette of [false, true]) it(`aggregates colours exactly as hcl(rgb(...)) / rgb(hcl(...)) did (${palette ? "an 8-colour palette: memo hits" : "random colours"})`, () => {
     const n = 2000;
     const pos = clusteredCloud(n, 12);
     const tree = buildMortonLODTree(pos, n);
@@ -327,6 +327,7 @@ describe("computeLODStyle colours (#343: inline HCL, bit-identical to d3-color)"
     const colors = new Uint8Array(4 * n);
     for (let i = 0; i < 4 * n; i++) colors[i] = Math.floor(r() * 256);
     for (let i = 0; i < n; i += 7) colors[4 * i] = colors[4 * i + 1] = colors[4 * i + 2] = i % 256; // greys
+    if (palette) for (let i = 0; i < 4 * n; i++) colors[i] = colors[(i % 4) + 4 * ((i >> 2) % 8)]!;
     computeLODStyle(tree, new Float32Array(n).fill(1), new Float32Array(n).fill(1), undefined, colors);
     // Reference: the d3-color pass the inline conversion replaced.
     const ref = new Uint8Array(4 * tree.size);
