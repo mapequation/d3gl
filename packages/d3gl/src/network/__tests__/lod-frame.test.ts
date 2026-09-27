@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { buildMortonLODTree, computeLODPositions, computeLODStyle, mortonRootBox, lodTreeFromTopology, buildLODTree } from "../lod.js";
-import { lodFrameStep, lodTreeFromSpatialFrame, makeSpatialLODStream, makeStructureLODStream, recycleSpatialFrame, spatialFrameByteLength } from "../lod-frame.js";
+import { MAX_OUTSTANDING, lodFrameStep, lodTreeFromSpatialFrame, makeSpatialLODStream, makeStructureLODStream, recycleSpatialFrame, spatialFrameByteLength, type SpatialLODFrame } from "../lod-frame.js";
 import { buildGraph } from "../graph.js";
 
 function rng(seed: number): () => number {
@@ -69,6 +69,35 @@ describe("lodFrameStep (#343): the one per-frame LOD step", () => {
     const d = lodFrameStep(stream, pos, 3);
     if (!d) throw new Error("no frame");
     expect(lodTreeFromSpatialFrame(d).color.every((v) => v === 0)).toBe(true);
+  });
+
+  it("bounds the frames in flight: a stalled main thread pauses the rebuilds, a returned buffer resumes them", () => {
+    const pos = cloud(n, 5);
+    const stream = makeSpatialLODStream(n, { radii, weight });
+    const out: SpatialLODFrame[] = [];
+    const buffers = new Set<ArrayBuffer>();
+    // The main thread hands nothing back for 20 frames (a long task, a hidden tab).
+    for (let f = 1; f <= 20; f++) {
+      const frame = lodFrameStep(stream, pos.map((v) => v + f), f);
+      if (frame) { out.push(frame); buffers.add(frame.buffer); }
+    }
+    expect(out.length).toBe(MAX_OUTSTANDING);
+    expect(stream.pending).toBe(true);
+    // One buffer back: the skipped frame is due, and builds the latest positions into the returned buffer.
+    const first = out[0];
+    if (!first) throw new Error("no frame");
+    expect(recycleSpatialFrame(stream, first.buffer)).toBe(true);
+    const resumed = lodFrameStep(stream, pos.map((v) => v + 20), 20);
+    expect(resumed?.header.frame).toBe(20);
+    expect(resumed?.buffer).toBe(first.buffer);
+    expect(stream.pending).toBe(false);
+    // Nothing more is due until another frame is skipped.
+    const second = out[1];
+    if (!second) throw new Error("no frame");
+    expect(recycleSpatialFrame(stream, second.buffer)).toBe(false);
+    // Over the whole stall, no more than MAX_OUTSTANDING distinct buffers were ever allocated.
+    if (resumed) buffers.add(resumed.buffer);
+    expect(buffers.size).toBeLessThanOrEqual(MAX_OUTSTANDING);
   });
 
   it("refits a structure stream in place and posts nothing", () => {

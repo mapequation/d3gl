@@ -16,8 +16,9 @@
  *
  * The worker backend's frame loop calls it for every frame it posts. A GPU layout's LOD worker (#377) can
  * call the same function for every position snapshot it harvests: bind the geometry buffer the request
- * handed back to a structure stream's tree first (as its refit does), and post a spatial stream's frame
- * with its transfer list.
+ * handed back to a structure stream's tree first (as its refit does), post a spatial stream's frame with its
+ * transfer list, and pass returned buffers to {@link recycleSpatialFrame} (re-running the step when it says a
+ * skipped frame is due).
  */
 import {
   buildMortonTopology,
@@ -181,6 +182,10 @@ export interface SpatialLODStream {
   pool: ArrayBuffer[];
   /** The frame id last built for (−1: none), so unchanged positions are not rebuilt. */
   built: number;
+  /** Frames built and not handed back yet ({@link recycleSpatialFrame}): posted, queued or still drawn. */
+  outstanding: number;
+  /** Whether a frame was skipped for back-pressure ({@link MAX_OUTSTANDING}) and is still to be built. */
+  pending: boolean;
 }
 
 export type LODStream = StructureLODStream | SpatialLODStream;
@@ -192,27 +197,36 @@ export function makeStructureLODStream(tree: LODPositionTree): StructureLODStrea
 
 /** A spatial stream over `leafCount` leaves, aggregating `style` (version `styleVersion`) when given. */
 export function makeSpatialLODStream(leafCount: number, style?: LeafStyle, styleVersion = -1): SpatialLODStream {
-  return { kind: "spatial", leafCount, box: undefined, scratch: makeMortonScratch(), bounds: makeLODBoundsScratch(), style: style ?? null, styleVersion: style ? styleVersion : -1, pool: [], built: -1 };
+  return { kind: "spatial", leafCount, box: undefined, scratch: makeMortonScratch(), bounds: makeLODBoundsScratch(), style: style ?? null, styleVersion: style ? styleVersion : -1, pool: [], built: -1, outstanding: 0, pending: false };
 }
 
 /** Pooled buffers kept at most (a streamed frame is usually 1-2 in flight). */
 const POOL_MAX = 3;
 
-/** Hand a frame's buffer back to its stream for the next rebuild. */
-export function recycleSpatialFrame(stream: SpatialLODStream, buffer: ArrayBuffer): void {
+/**
+ * Frames a spatial stream lets be outstanding at once (#343) — built and not handed back: the one the main
+ * thread draws, the one it just replaced (released after the repaint), and one on its way. Past that the
+ * main thread is not keeping up (a long task, a stalled tab), so {@link lodFrameStep} skips the rebuild
+ * rather than allocating another frame buffer, and builds the latest positions once one comes back. Frame
+ * buffers in existence per stream are therefore at most this many plus {@link POOL_MAX}.
+ */
+export const MAX_OUTSTANDING = 3;
+
+/**
+ * Hand a frame's buffer back to its stream for the next rebuild. Returns whether a frame skipped for
+ * back-pressure is now due: the caller then runs {@link lodFrameStep} again for the current positions.
+ */
+export function recycleSpatialFrame(stream: SpatialLODStream, buffer: ArrayBuffer): boolean {
+  if (stream.outstanding > 0) stream.outstanding--;
   if (stream.pool.length < POOL_MAX && buffer.byteLength > 0) stream.pool.push(buffer);
+  return stream.pending && stream.outstanding < MAX_OUTSTANDING;
 }
 
 /** A pooled buffer of at least `bytes` (and not more than twice it), or a fresh one with 1/8 slack. */
 function takeBuffer(stream: SpatialLODStream, bytes: number): ArrayBuffer {
-  for (let i = 0; i < stream.pool.length; i++) {
-    const b = stream.pool[i]!;
-    if (b.byteLength >= bytes && b.byteLength <= 2 * bytes) {
-      stream.pool.splice(i, 1);
-      return b;
-    }
-  }
-  return new ArrayBuffer(Math.ceil((bytes * 9) / 8 / 8) * 8);
+  const i = stream.pool.findIndex((b) => b.byteLength >= bytes && b.byteLength <= 2 * bytes);
+  const [pooled] = i >= 0 ? stream.pool.splice(i, 1) : [];
+  return pooled ?? new ArrayBuffer(Math.ceil((bytes * 9) / 8 / 8) * 8);
 }
 
 /**
@@ -220,7 +234,9 @@ function takeBuffer(stream: SpatialLODStream, bytes: number): ArrayBuffer {
  * position geometry to `positions` in place and returns `null`. For a spatial stream, rebuilds the Morton tree
  * over `positions` (in the stream's stable root box), refits it, aggregates the stream's leaf style onto it,
  * and returns the packed frame to transfer — or `null` when `frame` was already built (the layout has not
- * moved since: converged). O(tree size) either way; the rebuild adds the O(leaves) sort and O(cells) splits.
+ * moved since: converged), or when {@link MAX_OUTSTANDING} frames are still out (back-pressure: the stream
+ * marks itself `pending`, and {@link recycleSpatialFrame} says when to call again). O(tree size) either way;
+ * the rebuild adds the O(leaves) sort and O(cells) splits.
  */
 export function lodFrameStep(stream: LODStream, positions: ArrayLike<number>, frame: number): SpatialLODFrame | null {
   if (stream.kind === "structure") {
@@ -228,7 +244,13 @@ export function lodFrameStep(stream: LODStream, positions: ArrayLike<number>, fr
     return null;
   }
   if (frame === stream.built) return null;
+  if (stream.outstanding >= MAX_OUTSTANDING) {
+    stream.pending = true; // built once a buffer comes back (see recycleSpatialFrame)
+    return null;
+  }
   stream.built = frame;
+  stream.pending = false;
+  stream.outstanding++;
   const n = stream.leafCount;
   const box = mortonRootBox(positions, n, stream.box);
   stream.box = box;

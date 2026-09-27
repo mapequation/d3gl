@@ -229,7 +229,8 @@ addEventListener("message", (e: MessageEvent<MainToWorker>) => {
       }
       return;
     case "lod-recycle":
-      if (state?.lod?.kind === "spatial") recycleSpatialFrame(state.lod, msg.buffer);
+      // A frame skipped for back-pressure (#343) is built for the current positions once a buffer is back.
+      if (state?.lod?.kind === "spatial" && recycleSpatialFrame(state.lod, msg.buffer)) postFrame("frame");
       return;
     case "start-nested": {
       // One synchronous top-down pass (each depth final); a `stop` can only land after it, and the main
