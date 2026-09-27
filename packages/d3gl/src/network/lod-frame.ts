@@ -64,25 +64,33 @@ import {
 } from "./spatial-rows.js";
 
 /**
- * The per-leaf style a spatial stream aggregates onto every rebuilt tree (#343) — the inputs of
- * {@link computeLODStyle}: draw radii, declutter importance, and optionally the flow-border metric and
- * RGBA colours. A spatial aggregate is sized area-additively (√Σr²): a cell is a region of the layout, not
- * a unit of the sizing metric, so the leaf scale is never applied to summed values here.
+ * What a tree's crowding reads of the leaf style (#426) — all a structure stream is given: the leaves' draw
+ * radii and how they are sized.
  */
-export interface LeafStyle {
+export interface LeafSizing {
   radii: Float32Array;
-  weight: Float32Array;
-  border?: Float32Array;
-  colors?: Uint8Array;
-  /** Whether links are drawn (#433): a stream that knows the edges builds super-edge rows only then.
-   *  Default true. */
-  links?: boolean;
   /**
    * How the glyphs are sized, and the cut's explicit threshold, for the tree's crowding (#426): with it,
    * every tree a stream rebuilds or refits carries its {@link LODTree.clearZoom} (see
    * {@link computeLODCrowding}); without it, none (`Infinity`: only the footprint rule opens a node).
    */
   crowding?: LeafCrowding;
+}
+
+/**
+ * The per-leaf style a spatial stream aggregates onto every rebuilt tree (#343) — the inputs of
+ * {@link computeLODStyle}: draw radii, declutter importance, and optionally the flow-border metric and
+ * RGBA colours — plus the sizing its crowding reads. A spatial aggregate is sized area-additively (√Σr²): a
+ * cell is a region of the layout, not a unit of the sizing metric, so the leaf scale is never applied to
+ * summed values here.
+ */
+export interface LeafStyle extends LeafSizing {
+  weight: Float32Array;
+  border?: Float32Array;
+  colors?: Uint8Array;
+  /** Whether links are drawn (#433): a stream that knows the edges builds super-edge rows only then.
+   *  Default true. */
+  links?: boolean;
 }
 
 /** The glyph sizing and cut threshold a stream computes a tree's crowding with (#426). */
@@ -225,10 +233,10 @@ export interface StructureLODStream {
   kind: "structure";
   tree: StructureStreamTree;
   bounds: LODBoundsScratch;
-  /** The leaf style its crowding is computed with (#426), or null for none (`clearZoom` stays `Infinity`). */
-  style: LeafStyle | null;
-  /** The style whose radii the tree's leaves hold (copied once per style, not per frame). */
-  radiiOf: LeafStyle | null;
+  /** The leaf sizing its crowding is computed with (#426), or null for none (`clearZoom` stays `Infinity`). */
+  style: LeafSizing | null;
+  /** The sizing whose radii the tree's leaves hold (copied once per sizing, not per frame). */
+  radiiOf: LeafSizing | null;
   crowding: LODCrowdingScratch;
 }
 
@@ -299,10 +307,10 @@ export type LODStream = StructureLODStream | SpatialLODStream;
 
 /**
  * A structure stream refitting `tree` (its `cx`/`cy`/`extent`/`clearZoom` bound to the buffer the main thread
- * reads), with the crowding of `style` (#426) when given.
+ * reads), with the crowding of `sizing` (#426) when given.
  */
-export function makeStructureLODStream(tree: StructureStreamTree, style?: LeafStyle): StructureLODStream {
-  return { kind: "structure", tree, bounds: makeLODBoundsScratch(), style: style ?? null, radiiOf: null, crowding: makeLODCrowdingScratch() };
+export function makeStructureLODStream(tree: StructureStreamTree, sizing?: LeafSizing): StructureLODStream {
+  return { kind: "structure", tree, bounds: makeLODBoundsScratch(), style: sizing ?? null, radiiOf: null, crowding: makeLODCrowdingScratch() };
 }
 
 /** The directed edges a spatial stream builds super-edge rows from (#433): the layout's own edge list. */
@@ -326,10 +334,15 @@ export function makeSpatialLODStream(leafCount: number, style?: LeafStyle, style
   return { kind: "spatial", leafCount, box: undefined, scratch: makeMortonScratch(), bounds: makeLODBoundsScratch(), crowding: makeLODCrowdingScratch(), style: style ?? null, styleVersion: style ? styleVersion : -1, pool: [], built: -1, outstanding: 0, pending: false, links, view: view ?? null };
 }
 
-/** Give a stream a new leaf style (#343, #426): later frames aggregate it and compute the crowding with it. */
-export function setStreamStyle(stream: LODStream, style: LeafStyle, version: number): void {
+/** Give a spatial stream a new leaf style (#343, #426): later frames aggregate it and compute the crowding with it. */
+export function setStreamStyle(stream: SpatialLODStream, style: LeafStyle, version: number): void {
   stream.style = style;
-  if (stream.kind === "spatial") stream.styleVersion = version;
+  stream.styleVersion = version;
+}
+
+/** Give a structure stream a new leaf sizing (#426): later frames compute the crowding with it. */
+export function setStreamSizing(stream: StructureLODStream, sizing: LeafSizing): void {
+  stream.style = sizing;
 }
 
 /** Pooled buffers kept at most (a streamed frame is usually 1-2 in flight). */
@@ -393,7 +406,7 @@ export function lodFrameStep(stream: LODStream, positions: ArrayLike<number>, fr
     computeLODPositions(tree, positions, undefined, stream.bounds);
     const crowd = stream.style?.crowding;
     if (stream.style && crowd) {
-      // The crowding reads the leaves' radii off the tree: copy them in once per style.
+      // The crowding reads the leaves' radii off the tree: copy them in once per sizing.
       if (stream.radiiOf !== stream.style) {
         tree.radius.set(stream.style.radii.subarray(0, tree.leafCount));
         stream.radiiOf = stream.style;

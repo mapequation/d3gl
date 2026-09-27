@@ -22,6 +22,8 @@ import { nestedLayout, nestedBoundaryDiscs, nestedRootBounds, type NestedLayoutP
 import {
   lodGeometryViews,
   lodGeometryByteLength,
+  lodStyleFields,
+  lodStyleMessage,
   transferList,
   makeLODGeometry,
   type MainToWorker,
@@ -457,8 +459,8 @@ export function startWorkerLayout(
     frameEvery: opts.frameEvery,
     lod: opts.lod,
     lodSource: opts.lodSource,
-    lodStyle: opts.lodStyle,
-    lodStyleVersion: opts.lodStyleVersion,
+    // A spatial stream gets the whole leaf style, a structure stream only the sizing its crowding reads.
+    ...lodStyleFields(opts.lodSource ?? "structure", opts.lodStyle, opts.lodStyleVersion),
     lodView: opts.lodView,
     // Copy mode clones the positions into the message (at post time); shared mode carried them into the SAB.
     warm: warm && { ...warm, ...(shared ? {} : { positions: graph.positions }) },
@@ -490,8 +492,7 @@ export function startWorkerLayout(
     setLODStyle: opts.lod
       ? (style: LeafStyle, version: number) => {
           if (terminated) return;
-          const msg: MainToWorker = { type: "lod-style", style, version };
-          worker.postMessage(msg);
+          worker.postMessage(lodStyleMessage(opts.lodSource ?? "structure", style, version));
         }
       : undefined,
     setLODView: opts.lod && opts.lodSource === "spatial"

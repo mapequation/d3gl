@@ -252,4 +252,42 @@ describe("LOD aggregates only where glyphs would overlap (#426)", () => {
       host.remove();
     }
   });
+
+  it("a structure stream takes a new style mid-run: the worker's crowding follows the new radii", async () => {
+    // While the worker streams, only it computes the crowding (from the leaf sizing it was sent); a style change
+    // must reach it, or the frames keep the old radii until the layout settles.
+    const { net, host } = makeNet();
+    let settled = false;
+    try {
+      await net.whenReady();
+      const g = ring(300);
+      net.data(g).style({ sizeMode: "screen", nodeRadius: 60 }).lod({ source: "structure", maxAggregateRadius: 18 });
+      // 60 frames of 500 ticks each: a few seconds of streaming, a frame every few tens of ms.
+      net.layout({ backend: "worker", iterations: 30_000 });
+      void net.whenSettled().then(() => {
+        settled = true;
+      });
+      const glyphs = (): number => {
+        net.setTransform(frame(g.positions));
+        return net.declutterStats?.glyphs ?? NaN;
+      };
+      await new Promise((r) => setTimeout(r, 300));
+      expect(net.lodSource).toBe("worker");
+      const big = glyphs(); // 60 px glyphs overlap everywhere: aggregates
+      expect(big).toBeLessThan(100);
+      net.style({ sizeMode: "screen", nodeRadius: 0.5 });
+      // The worker's next frames compute the crowding with the half-pixel glyphs: they open while it streams.
+      let small = glyphs();
+      for (let i = 0; i < 60 && !settled && small <= 2 * big; i++) {
+        await new Promise((r) => setTimeout(r, 50));
+        small = glyphs();
+      }
+      expect(settled, "the crowding followed the new style only once the layout settled").toBe(false);
+      expect(small, "the crowding follows the half-pixel glyphs").toBeGreaterThan(2 * big);
+    } finally {
+      net.stopLayout();
+      net.destroy();
+      host.remove();
+    }
+  });
 });

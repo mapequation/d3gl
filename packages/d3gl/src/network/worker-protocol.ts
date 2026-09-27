@@ -11,7 +11,7 @@
 import type { ForceParams } from "./force.js";
 import type { CoarsenOptions } from "./coarsen.js";
 import type { BoundaryDiscs, LODTopology } from "./lod.js";
-import type { LeafStyle, LODView, SpatialLODFrame } from "./lod-frame.js";
+import type { LeafSizing, LeafStyle, LODView, SpatialLODFrame } from "./lod-frame.js";
 import type { NestedLayoutParams, NestedLayoutTopology } from "./nested-layout.js";
 import type { SeedPlan, SeedPlanOptions } from "./gpu/seed-plan.js";
 import type { NestedSolverTopology } from "./gpu/nested-topology.js";
@@ -43,7 +43,7 @@ export interface StartMessage {
   /**
    * Build the structural LOD tree on the worker and stream it (#103): the worker posts the tree
    * {@link LODTopology} once, then refreshes its position-derived geometry (`cx`/`cy`/`extent`, and the
-   * crowding `clearZoom` with a {@link lodStyle}, #426) each frame — shared via a SAB, or in the per-frame
+   * crowding `clearZoom` with a {@link lodSizing}, #426) each frame — shared via a SAB, or in the per-frame
    * message in copy mode — so the main thread renders the LOD frontier with no O(N) coarsening or
    * geometry pass of its own.
    */
@@ -56,13 +56,15 @@ export interface StartMessage {
    */
   lodSource?: "structure" | "spatial";
   /**
-   * The leaf style a spatial tree aggregates onto every rebuild (#343), and its version (echoed per frame).
-   * Either tree computes its crowding from it per frame (#426, {@link LeafStyle.crowding}).
+   * A spatial stream's leaf style, which it aggregates onto every rebuild (#343) and computes the crowding
+   * with (#426), and its version (echoed per frame). See {@link lodStyleFields}.
    */
   lodStyle?: LeafStyle;
   lodStyleVersion?: number;
   /** The main thread's view, whose kept glyphs' super-edge rows a spatial tree carries (#433). */
   lodView?: LODView;
+  /** A structure stream's leaf sizing, which it computes the crowding with per frame (#426). */
+  lodSizing?: LeafSizing;
   /**
    * Continue a layout another transport was running (#311) instead of seeding one: no disc, no multilevel
    * seed, no seed frame. `iterations` is the ticks left of its budget; 0 starts the worker idle, alive for
@@ -94,7 +96,7 @@ export interface WarmStart {
   recool?: boolean;
 }
 
-/** A new leaf style for the streamed tree's per-frame aggregation and crowding (#343, #426), after `style()` or
+/** A new leaf style for a spatial stream's per-frame aggregation and crowding (#343, #426), after `style()` or
  *  `lod()` changed it — to a layout worker's stream, or to a GPU layout's LOD worker streaming the spatial tree. */
 export interface LODStyleMessage {
   type: "lod-style";
@@ -106,6 +108,37 @@ export interface LODStyleMessage {
 export interface LODViewMessage {
   type: "lod-view";
   view: LODView;
+}
+
+/** A new leaf sizing for a structure stream's per-frame crowding (#426), after `style()` or `lod()` changed it. */
+export interface LODSizingMessage {
+  type: "lod-sizing";
+  sizing: LeafSizing;
+}
+
+/**
+ * The part of a leaf style a structure stream reads (#426): the radii and the sizing its crowding needs — a
+ * new object holding the same arrays, so posting it clones nothing else (weight, border and colours are
+ * only aggregated onto a spatial tree).
+ */
+function leafSizing(style: LeafSizing): LeafSizing {
+  return { radii: style.radii, crowding: style.crowding };
+}
+
+/** The message that hands the worker's LOD stream a new leaf style (#343, #426): all of it to a spatial
+ *  stream, only its sizing to a structure stream. */
+export function lodStyleMessage(source: "structure" | "spatial", style: LeafStyle, version: number): LODStyleMessage | LODSizingMessage {
+  return source === "spatial" ? { type: "lod-style", style, version } : { type: "lod-sizing", sizing: leafSizing(style) };
+}
+
+/** The start message's leaf style fields for a stream of `source` (#343, #426), as {@link lodStyleMessage}. */
+export function lodStyleFields(
+  source: "structure" | "spatial",
+  style: LeafStyle | undefined,
+  version: number | undefined,
+): Pick<StartMessage, "lodStyle" | "lodStyleVersion" | "lodSizing"> {
+  if (!style) return {};
+  return source === "spatial" ? { lodStyle: style, lodStyleVersion: version } : { lodSizing: leafSizing(style) };
 }
 
 /** A spatial frame's buffer handed back for reuse once its tree is no longer drawn (#343; transferred) — by the
@@ -227,7 +260,7 @@ export interface LODGeometryRequest {
   /** The frame id: the ticks the positions hold. A spatial stream skips a frame id it already built (the
    *  layout has not moved since: converged), as the worker backend's step skips a tick it built. */
   frame: number;
-  /** `[cx, cy, extent]`, length `3 · topology.size` ({@link lodGeometryViews}). */
+  /** `[cx, cy, extent, clearZoom]`, length `4 · topology.size` ({@link lodGeometryViews}). */
   geometry?: Float32Array;
 }
 
@@ -238,6 +271,7 @@ export type MainToWorker =
   | UnpinMessage
   | NestedStartMessage
   | LODStyleMessage
+  | LODSizingMessage
   | LODViewMessage
   | LODRecycleMessage
   | CoarsenMessage
