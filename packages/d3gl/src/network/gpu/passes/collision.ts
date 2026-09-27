@@ -78,7 +78,10 @@ ivec2 collisionOrigin(uvec4 info) { return ivec2(int(info.z & 65535u), int(info.
 int collisionSide(uvec4 info) { return int(info.w >> 16) >> 1; }
 `;
 
-/** Cell pass: each slot's grid cell (packed `x | y << 16` in the collision atlas), or NO_CELL. */
+/**
+ * Cell pass: each slot's grid cell (packed `x | y << 16` in the collision atlas), or NO_CELL — and, by
+ * MRT, its disc `(x, y, radius, 0)` in one texel, so every pair test of the gather is one fetch.
+ */
 const CELL_FS = /* glsl */ `\
 #version 300 es
 ${segmentDefines(false)}
@@ -94,16 +97,20 @@ uniform int u_count;
 uniform int u_width;
 uniform float u_cellScale;           // 2 · PAD · (1 + margin)
 layout(location = 0) out uint o_cell;
+layout(location = 1) out vec4 o_disc;
 ${SLOT_TEXEL_GLSL}
 ${SEGMENT_OF_GLSL}
 ${TILE_GLSL}
 void main() {
   ivec2 fc = ivec2(gl_FragCoord.xy);
-  if (texelSlot(fc, u_width) >= u_count) { o_cell = NO_CELL; return; }
+  if (texelSlot(fc, u_width) >= u_count) { o_cell = NO_CELL; o_disc = vec4(0.0); return; }
+  vec2 p = texelFetch(u_pos, fc, 0).xy;
+  float r = texelFetch(u_rad, fc, 0).r;
+  o_disc = vec4(p, r, 0.0);
   ivec2 st = segmentTexelOf(fc);
   uvec4 info = texelFetch(u_segInfo, st, 0);
   float r9 = texelFetch(u_segNested, st, 0).x;
-  if (((info.w >> 8) & SEGMENT_HAS_TILE) == 0u || texelFetch(u_rad, fc, 0).r > r9) { o_cell = NO_CELL; return; }
+  if (((info.w >> 8) & SEGMENT_HAS_TILE) == 0u || r > r9) { o_cell = NO_CELL; return; }
   vec4 b = texelFetch(u_segBox, st, 0);
   vec2 mn = -b.zw;
   float side = max(max(b.x - mn.x, b.y - mn.y), 1e-30);
@@ -111,7 +118,7 @@ void main() {
   float n = clamp(floor(side / max(r9 * u_cellScale, 1e-30)), 1.0, float(collisionSide(info)));
   float cellSize = side / n;
   int last = int(n) - 1;
-  ivec2 c = clamp(ivec2(floor((texelFetch(u_pos, fc, 0).xy - mn) / cellSize)), ivec2(0), ivec2(last));
+  ivec2 c = clamp(ivec2(floor((p - mn) / cellSize)), ivec2(0), ivec2(last));
   ivec2 cell = collisionOrigin(info) + c;
   o_cell = uint(cell.x) | (uint(cell.y) << 16);
 }
@@ -181,8 +188,7 @@ ${segmentDefines(false)}
 precision highp float;
 precision highp int;
 precision highp usampler2D;
-uniform highp sampler2D u_pos;
-uniform highp sampler2D u_rad;
+uniform highp sampler2D u_disc;      // (x, y, radius, 0) per slot, from the cell pass
 uniform highp sampler2D u_cellCount;
 uniform highp sampler2D u_roundA;    // rounds 0, 2, 4, 6 in x, y, z, w
 uniform highp sampler2D u_roundB;    // rounds 1, 3, 5, 7
@@ -204,8 +210,9 @@ ${TILE_GLSL}
 // coincident pair separates by exactly min along (cos(a + b), sin(a + b)), a and b their local indices,
 // from the lower slot to the higher (#357).
 vec2 push(int i, vec2 xi, float ri, int j, int start) {
-  vec2 xj = texelFetch(u_pos, slotTexel(j, u_width), 0).xy;
-  float rj = texelFetch(u_rad, slotTexel(j, u_width), 0).r;
+  vec3 dj = texelFetch(u_disc, slotTexel(j, u_width), 0).xyz;
+  vec2 xj = dj.xy;
+  float rj = dj.z;
   vec2 d = xi - xj;
   float minD = (ri + rj) * u_pad;
   float d2 = dot(d, d);
@@ -244,8 +251,9 @@ void main() {
   uvec4 info = texelFetch(u_segInfo, st, 0);
   int start = int(info.x);
   int end = start + int(info.y);
-  vec2 xi = texelFetch(u_pos, fc, 0).xy;
-  float ri = texelFetch(u_rad, fc, 0).r;
+  vec3 di = texelFetch(u_disc, fc, 0).xyz;
+  vec2 xi = di.xy;
+  float ri = di.z;
   uint cellCode = texelFetch(u_slotCell, fc, 0).r;
   vec2 acc = vec2(0.0);
 
@@ -291,37 +299,50 @@ void main() {
 `;
 }
 
-/** What one collision step reads. */
-export interface CollisionInput {
-  /** Current positions (read) and the framebuffer of the other position texture (written). */
+/** What {@link CollisionGrid.prepare} reads. */
+export interface CollisionPrepareInput {
+  /** Current positions. */
   pos: Texture;
-  target: Framebuffer;
   radius: Texture;
   slotSeg: Texture;
   /** The segment table: info, and this tick's box (reduced over `pos`). */
   segments: SegmentTable;
   /** Per segment `(r₉, owner slot, 0, 0)`, the segment table's atlas. */
   segNested: Texture;
-  /** Per segment its large slots, {@link CollisionGrid}'s `largeWidth` atlas, 2 texels per segment. */
-  segLarge: Texture;
   count: number;
   width: number;
   pad: number;
 }
 
+/** What {@link CollisionGrid.gather} reads besides the prepared state. */
+export interface CollisionGatherInput {
+  slotSeg: Texture;
+  segments: SegmentTable;
+  /** Per segment its large slots, {@link CollisionGrid}'s `largeWidth` atlas, 2 texels per segment. */
+  segLarge: Texture;
+  count: number;
+  width: number;
+  /** Rows of the slot atlas (the bands' domain). */
+  rows: number;
+  pad: number;
+}
+
 /**
  * The collision grid's textures and passes, created once for a slot atlas and a collision atlas
- * (`width × height`, the pyramid tile atlas halved). {@link step} encodes one Jacobi collision step: the
- * cell pass, the count scatter, {@link COLLISION_ROUNDS} round scatters and the gather — each its own
- * submitted render pass; nothing is allocated.
+ * (`width × height`, the pyramid tile atlas halved). A Jacobi collision step is {@link prepare} (the cell
+ * pass, the count scatter, {@link COLLISION_ROUNDS} round scatters) then {@link gather}, which may be cut
+ * into row bands — each its own submitted render pass; nothing is allocated.
  *
- * Memory: `slotCell` 4 B per slot atlas texel; the count 4 B and the two round textures 16 B each per
- * collision atlas texel (36 B per cell). With no tiled segment the grid is 1×1 and only exact loops run.
+ * Memory: `slotCell` 4 B and the disc 16 B per slot atlas texel; the count 4 B and the two round textures
+ * 16 B each per collision atlas texel (36 B per cell). With no tiled segment the grid is 1×1 and only exact
+ * loops run.
  */
 export class CollisionGrid {
   private readonly device: Device;
   private readonly atlas: readonly [number, number];
   private readonly slotCell: Texture;
+  /** `(x, y, radius, 0)` per slot, written with the cells: the gather's one fetch per pair. */
+  private readonly disc: Texture;
   private readonly slotCellFbo: Framebuffer;
   private readonly cellCount: Texture;
   private readonly cellCountFbo: Framebuffer;
@@ -346,7 +367,8 @@ export class CollisionGrid {
     const h = Math.max(1, atlasHeight);
     this.atlas = [w, h];
     this.slotCell = device.createTexture({ width: slotWidth, height: slotHeight, format: "r32uint", mipLevels: 1, sampler: NEAREST });
-    this.slotCellFbo = device.createFramebuffer({ width: slotWidth, height: slotHeight, colorAttachments: [this.slotCell] });
+    this.disc = device.createTexture({ width: slotWidth, height: slotHeight, format: "rgba32float", mipLevels: 1, sampler: NEAREST });
+    this.slotCellFbo = device.createFramebuffer({ width: slotWidth, height: slotHeight, colorAttachments: [this.slotCell, this.disc] });
     const cells = (): Texture => device.createTexture({ width: w, height: h, format: "rgba32float", mipLevels: 1, sampler: NEAREST });
     this.cellCount = device.createTexture({ width: w, height: h, format: "r32float", mipLevels: 1, sampler: NEAREST });
     this.cellCountFbo = device.createFramebuffer({ width: w, height: h, colorAttachments: [this.cellCount] });
@@ -370,14 +392,16 @@ export class CollisionGrid {
   /** Bytes of GPU memory the grid holds. */
   get gpuBytes(): number {
     const [w, h] = this.atlas;
-    return this.slotCell.width * this.slotCell.height * 4 + w * h * (4 + 2 * 16);
+    return this.slotCell.width * this.slotCell.height * (4 + 16) + w * h * (4 + 2 * 16);
   }
 
-  /** Encode one collision step: positions `input.pos` → `input.target`. */
-  step(input: CollisionInput): void {
-    const { device } = this;
+  /**
+   * Encode the first half of a collision step: every slot's cell and disc (from `input.pos` and this
+   * tick's box), the occupancy counts and the {@link COLLISION_ROUNDS} rounds. Then {@link gather}.
+   */
+  prepare(input: CollisionPrepareInput): void {
     const { segments } = input;
-    // 1. Every slot's cell (or NO_CELL), from this tick's box.
+    // 1. Every slot's cell (or NO_CELL) and its disc, from this tick's box.
     const cu = this.cellUniforms;
     cu["u_count"] = input.count;
     cu["u_width"] = input.width;
@@ -414,25 +438,39 @@ export class CollisionGrid {
       const framebuffer = even ? this.roundFbos[0] : this.roundFbos[1];
       this.draw(this.roundModel, r < 2 ? { framebuffer, clear: [EMPTY, EMPTY, EMPTY, EMPTY] } : { framebuffer, clear: false });
     }
+  }
 
-    // 3. The gather: each slot's Jacobi step into the other position texture (every texel written).
+  /**
+   * Encode the second half: the gather — each slot's Jacobi step, from the discs {@link prepare} wrote,
+   * into `target` (the other position texture) — over the slot atlas rows of band `band` of `bands` (a
+   * scissor; every band reads the same prepared state, so the result does not depend on the slicing).
+   */
+  gather(target: Framebuffer, input: CollisionGatherInput, band = 0, bands = 1): void {
+    const r0 = Math.floor((band * input.rows) / bands);
+    const r1 = Math.floor(((band + 1) * input.rows) / bands);
+    if (r1 <= r0) return;
     const gu = this.gatherUniforms;
     gu["u_count"] = input.count;
     gu["u_width"] = input.width;
-    gu["u_tableWidth"] = segments.width;
+    gu["u_tableWidth"] = input.segments.width;
     gu["u_pad"] = input.pad;
     this.gatherModel.setBindings({
-      u_pos: input.pos,
-      u_rad: input.radius,
+      u_disc: this.disc,
       u_cellCount: this.cellCount,
       u_roundA: this.rounds[0],
       u_roundB: this.rounds[1],
-      u_segInfo: segments.info,
+      u_segInfo: input.segments.info,
       u_slotCell: this.slotCell,
       u_segLarge: input.segLarge,
       u_slotSeg: input.slotSeg,
     });
-    this.draw(this.gatherModel, { framebuffer: input.target, clear: false });
+    this.draw(this.gatherModel, bands > 1 ? { framebuffer: target, clear: false, scissor: [0, r0, input.width, r1 - r0] } : { framebuffer: target, clear: false });
+  }
+
+  /** One whole collision step, `input.pos` → `target`: {@link prepare}, then an unsliced {@link gather}. */
+  step(target: Framebuffer, input: CollisionPrepareInput & CollisionGatherInput): void {
+    this.prepare(input);
+    this.gather(target, input);
   }
 
   private draw(model: Model, target: Parameters<typeof beginPass>[1]): void {
@@ -449,6 +487,7 @@ export class CollisionGrid {
     this.gatherModel.destroy();
     this.slotCellFbo.destroy();
     this.slotCell.destroy();
+    this.disc.destroy();
     this.cellCountFbo.destroy();
     this.cellCount.destroy();
     this.roundFbos[0].destroy();

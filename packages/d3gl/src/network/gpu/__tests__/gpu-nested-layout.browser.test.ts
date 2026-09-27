@@ -81,13 +81,9 @@ function makeTree(groups: readonly number[], tops: number, linksPerChild: number
   return { topo: { size, leafCount: leaves, childOffset, children, parent, superEdgeOffset, superEdgeTarget, superEdgeFlow }, size: metric };
 }
 
-/** Run every tick of `layout` (one band per tick, as `runFrame` does for the flat solver). */
+/** Run `ticks` solve ticks of `layout`, every item unsliced. */
 function runAll(layout: GpuNestedLayout, ticks: number): void {
-  for (let t = 0; t < ticks; t++) {
-    layout.beginTick();
-    layout.forceBand(0, 1);
-    layout.integrate();
-  }
+  layout.runTicks(ticks);
 }
 
 /** Largest |a − b| over two arrays. */
@@ -221,6 +217,31 @@ describe("GPU nested layout (#355) against its Jacobi reference", () => {
       } finally {
         layout.destroy();
       }
+    }
+  });
+
+  it("is bitwise independent of how its stream ticks are cut into bands (repulsion and collision gathers)", () => {
+    const { topo: tree, size } = makeTree([600, 45, 90, 12], 2, 2, 13);
+    const solver = nestedSolverTopology(tree, { size, iterations: 20 });
+    const whole = new GpuNestedLayout(device, solver);
+    const sliced = new GpuNestedLayout(device, solver);
+    try {
+      whole.runTicks(solver.iterations);
+      for (let t = 0; t < sliced.streamTicks; t++) {
+        const bands = 1 + (t % 5); // 1 … 5 bands, a different cut every stream tick
+        sliced.beginTick();
+        for (let b = 0; b < bands; b++) sliced.forceBand(b, bands);
+        sliced.integrate();
+      }
+      expect(sliced.ticks).toBe(solver.iterations);
+      const a = new Float32Array(2 * solver.slotCount);
+      const b = new Float32Array(2 * solver.slotCount);
+      whole.readLocal(a);
+      sliced.readLocal(b);
+      expect(Array.from(b)).toEqual(Array.from(a));
+    } finally {
+      whole.destroy();
+      sliced.destroy();
     }
   });
 

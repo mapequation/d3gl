@@ -92,7 +92,7 @@ export function startGpuNestedLayout(
     let s: GpuStream;
     try {
       s = new GpuStream(device, layout, graph, {
-        iterations: solver.iterations,
+        iterations: layout.streamTicks,
         stream: !oneFrame,
         extra: discs,
         ...(into ? { into } : {}),

@@ -90,9 +90,15 @@ const DEFAULT_INTERVAL_MS = 1000 / 60;
  */
 export const ITEM_NS_PER_NODE: Readonly<Record<ItemKind, number>> = { prep: 5, force: 40, integrate: 1 };
 
-/** The estimated GPU time of one work item, ms: a force band is 1/B of the force pass. */
-export function itemCostMs(kind: ItemKind, nodes: number, bands: number): number {
-  const ms = (ITEM_NS_PER_NODE[kind] * nodes) / 1e6;
+/** GPU time per node of each work item, ns — a solver's cost model ({@link ITEM_NS_PER_NODE} for the flat layout). */
+export type ItemCosts = Readonly<Record<ItemKind, number>>;
+
+/**
+ * The estimated GPU time of one work item, ms: a force band is 1/B of the force pass. `costs`: the
+ * solver's model, default the flat layout's {@link ITEM_NS_PER_NODE}.
+ */
+export function itemCostMs(kind: ItemKind, nodes: number, bands: number, costs: ItemCosts = ITEM_NS_PER_NODE): number {
+  const ms = (costs[kind] * nodes) / 1e6;
   return kind === "force" ? ms / Math.max(1, bands) : ms;
 }
 
@@ -110,8 +116,8 @@ export function frameBudgetMs(limitMs: number, intervalMs: number): number {
  * The static band count: bands of about half the budget, at least 1 and at most the atlas rows (and
  * {@link MAX_BANDS}). 325k at 10 ms → 3; 1M → 8.
  */
-export function staticBands(nodes: number, budgetMs: number, rows: number): number {
-  const b = Math.ceil(itemCostMs("force", nodes, 1) / (budgetMs / 2));
+export function staticBands(nodes: number, budgetMs: number, rows: number, costs: ItemCosts = ITEM_NS_PER_NODE): number {
+  const b = Math.ceil(itemCostMs("force", nodes, 1, costs) / (budgetMs / 2));
   return Math.max(1, Math.min(b, rows, MAX_BANDS));
 }
 
@@ -125,6 +131,8 @@ export interface FrameBudgetOptions {
   budgetMs?: number;
   /** Main-thread encode time per frame. Default {@link ENCODE_CAP_MS}. */
   encodeCapMs?: number;
+  /** The solver's cost model. Default the flat layout's {@link ITEM_NS_PER_NODE}. */
+  costs?: ItemCosts;
 }
 
 /**
@@ -138,6 +146,7 @@ export class FrameBudget<F> {
   private readonly fences: FenceSource<F>;
   private readonly clock: () => number;
   private readonly nodes: number;
+  private readonly costs: ItemCosts;
   private readonly maxBands: number;
   private readonly limitMs: number;
   private readonly encodeCapMs: number;
@@ -184,6 +193,7 @@ export class FrameBudget<F> {
     this.fences = fences;
     this.clock = clock;
     this.nodes = opts.nodes;
+    this.costs = opts.costs ?? ITEM_NS_PER_NODE;
     this.maxBands = Math.max(1, Math.min(opts.rows, MAX_BANDS));
     this.limitMs = opts.budgetMs ?? DEFAULT_BUDGET_MS;
     this.encodeCapMs = opts.encodeCapMs ?? ENCODE_CAP_MS;
@@ -207,7 +217,7 @@ export class FrameBudget<F> {
 
   /** Row bands for the next tick's force pass: the adaptive count, never below the static estimate. */
   get bands(): number {
-    return Math.min(this.maxBands, Math.max(this.adaptiveBands, staticBands(this.nodes, this.budgetMs, this.maxBands)));
+    return Math.min(this.maxBands, Math.max(this.adaptiveBands, staticBands(this.nodes, this.budgetMs, this.maxBands, this.costs)));
   }
 
   /** The last frame whose budget fence has signalled: all its GPU work, readback copy included, is done. */
@@ -269,7 +279,7 @@ export class FrameBudget<F> {
     if (blocked) {
       if (!this.blockedPrev && !this.queueRepaint.some(Boolean)) {
         if (this.items === 1 && this.queueForce.some(Boolean)) {
-          const cap = MAX_BAND_GROWTH * staticBands(this.nodes, this.frameBudget, this.maxBands);
+          const cap = MAX_BAND_GROWTH * staticBands(this.nodes, this.frameBudget, this.maxBands, this.costs);
           this.adaptiveBands = Math.min(this.maxBands, cap, this.bands * 2);
         }
         this.items = Math.max(1, Math.floor(this.lastItems / 2));
@@ -304,6 +314,14 @@ export class FrameBudget<F> {
   }
 
   /**
+   * Count `ms` of GPU work the transport will add to this frame outside the items — a readback's
+   * composition — against its budget. The first item is still always admitted.
+   */
+  reserve(ms: number): void {
+    if (this.opened) this.frameCostMs += ms;
+  }
+
+  /**
    * Record that the admitted item was encoded (its measured encode time feeds the cap). `sliceable`:
    * the item is a force band, whose size B controls.
    */
@@ -329,7 +347,7 @@ export class FrameBudget<F> {
       if (this.frameItems >= 2) {
         if (++this.fitStreak >= HOLD_FRAMES) {
           this.fitStreak = 0;
-          const floor = staticBands(this.nodes, this.frameBudget, this.maxBands);
+          const floor = staticBands(this.nodes, this.frameBudget, this.maxBands, this.costs);
           if (this.adaptiveBands > floor) {
             this.adaptiveBands = Math.max(floor, Math.floor(this.adaptiveBands / 2));
             this.items = Math.max(1, Math.floor(this.items / 2));

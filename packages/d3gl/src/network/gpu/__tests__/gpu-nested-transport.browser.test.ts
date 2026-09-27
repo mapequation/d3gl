@@ -26,11 +26,7 @@ function direct(device: Device, tree: NestedLayoutTopology, iterations: number, 
   const solver = nestedSolverTopology(tree, { iterations, radius: initial ? undefined : 10 * Math.sqrt(tree.leafCount), initial });
   const layout = new GpuNestedLayout(device, solver);
   try {
-    for (let t = 0; t < solver.iterations; t++) {
-      layout.beginTick();
-      layout.forceBand(0, 1);
-      layout.integrate();
-    }
+    layout.runTicks(solver.iterations);
     const positions = new Float32Array(2 * solver.leafCount);
     const discs = new Float32Array(4 * (solver.treeSize - solver.leafCount));
     layout.readComposed(positions, discs);
@@ -140,7 +136,7 @@ describe("layout({ backend: 'gpu', nested }) through the engine (#355)", () => {
     const g = buildGraph({ nodeCount: n, source: Array.from({ length: n - 1 }, (_, i) => i), target: Array.from({ length: n - 1 }, (_, i) => i + 1) });
     const net = network(host(), { width: 300, height: 300, backend: "webgl" });
     await net.whenReady();
-    net.data(g, { modules: records }).layout({ backend: "gpu", nested: true, iterations: 30 });
+    net.data(g, { modules: records }).layout({ backend: "gpu", nested: { iterations: 30 } });
     await net.whenSettled();
     expect(net.layoutTransport).toBe("gpu");
     const radius = 10 * Math.sqrt(n);
@@ -152,7 +148,7 @@ describe("layout({ backend: 'gpu', nested }) through the engine (#355)", () => {
     const tree = buildModuleLODTree(n, records, g);
     expect(tree.size).toBeGreaterThan(n);
     const cold = g.positions.slice();
-    net.layout({ backend: "gpu", nested: { warm: true }, transition: 100, iterations: 30 });
+    net.layout({ backend: "gpu", nested: { warm: true, iterations: 30 }, transition: 100 });
     await net.whenSettled();
     let moved = 0;
     for (let i = 0; i < n; i++) moved += Math.hypot((g.positions[2 * i] ?? 0) - (cold[2 * i] ?? 0), (g.positions[2 * i + 1] ?? 0) - (cold[2 * i + 1] ?? 0));

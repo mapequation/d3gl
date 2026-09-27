@@ -7,7 +7,7 @@ import { SegmentedReduce, type RangeTarget, type ReduceMap } from "./passes/segm
 import { GridPyramid } from "./passes/grid-pyramid.js";
 import { RepulsionPass } from "./passes/repulsion.js";
 import { NestedIntegratePass, NestedPredictPass, type NestedSlotInputs } from "./passes/nested.js";
-import { COLLISION_STEPS, CollisionGrid } from "./passes/collision.js";
+import { COLLISION_STEPS, CollisionGrid, type CollisionGatherInput } from "./passes/collision.js";
 import { NestedComposePass } from "./passes/nested-compose.js";
 import { GpuSprings } from "./springs.js";
 import type { NestedSpringInputs } from "./passes/attraction.js";
@@ -15,6 +15,7 @@ import { SegmentTable, type SegmentRow } from "./segment-table.js";
 import { TILE_MIN_SIDE, assertAtlasFits, packTiles, segmentSoftening, slotSegments, type SlotRange } from "./segments.js";
 import type { PackedPositions } from "./async-readback.js";
 import type { StreamSolver } from "./gpu-stream.js";
+import { itemCostMs, type ItemCosts, type ItemKind } from "./frame-budget.js";
 import { NESTED_LARGE_MAX, type NestedSolverTopology } from "./nested-topology.js";
 import { EXACT_MAX } from "../nested-layout.js";
 
@@ -28,11 +29,15 @@ import { EXACT_MAX } from "../nested-layout.js";
 // tile-atlas grid pyramid with its per-segment traversal and the exact loop, the chunked CSR springs —
 // with the nested physics of `nested-layout.ts` (the same constants, {@link NESTED}):
 //
-// | item | organise phase (first 60% of the ticks)            | compact phase (the rest)               |
-// |------|-----------------------------------------------------|----------------------------------------|
-// | P    | reductions (box) → pyramid; clear the force texture | clear the force texture                |
-// | F_b  | repulsion of band b (tile traversal / exact loop)   | —                                      |
-// | I    | predict v*; springs at x + v* (zero rest); integrate | the same with rest lengths; then 2 collision steps |
+// A solve tick is one stream tick (work items P, F_b, I) in the organise phase and one per collision
+// step in the compact phase, so every item stays within the frame budget at any N — the collision gather
+// is the heaviest pass and is cut into row bands like the repulsion:
+//
+// | stream tick                 | P                                                    | F_b                    | I                  |
+// |-----------------------------|------------------------------------------------------|------------------------|--------------------|
+// | organise (first 60%)        | reductions (box) → tile pyramid; clear force         | repulsion, band b      | predict v*; springs at x + v* (zero rest); integrate |
+// | compact, collision step 1   | predict; springs (rest lengths); integrate; reductions; collision cells, counts, rounds | collision gather, band b | swap |
+// | compact, collision step 2   | reductions; collision cells, counts, rounds           | collision gather, band b | swap; next tick   |
 //
 // The composition (`passes/nested-compose.ts`) maps the local solutions into world discs and packs leaf
 // positions and module discs in node order, for the streaming readback ({@link prepareReadback}).
@@ -46,6 +51,32 @@ const NEAREST: SamplerProps = { minFilter: "nearest", magFilter: "nearest" };
 
 /** Barnes-Hut opening angle of the CPU nested solve's `repel()`. */
 const NESTED_THETA = 0.9;
+
+/**
+ * GPU time per leaf of the nested solve's work items, ns, per stream tick kind — measured on an M1 Max
+ * (ANGLE Metal) on the synthetic Infomap-like maps (325,729 and 1,000,000 leaves; the per-leaf cost of
+ * the larger map is lower, so these fit 325k and overestimate 1M):
+ *
+ * - organise: P 1.9 ms at 325k (reductions + tile pyramid), a whole-atlas repulsion band 2.1 ms, I 1.6 ms
+ *   (predict + springs + integrate);
+ * - compact, collision step 1: P 4.2 ms (the solve tick's predict + springs + integrate, the reductions,
+ *   the collision cells and rounds), a whole-atlas gather band 4.9 ms, I a swap;
+ * - compact, collision step 2: P ~1.3 ms (reductions, cells, rounds), the gather again.
+ *
+ * The flat layout's model would misjudge this solve both ways; a slower GPU is caught by the frame
+ * budget's fences, as for the flat layout.
+ */
+const NESTED_NS: Readonly<Record<"organise" | "compact0" | "compact1", ItemCosts>> = {
+  organise: { prep: 4, force: 6, integrate: 4 },
+  compact0: { prep: 10, force: 13, integrate: 0.2 },
+  compact1: { prep: 3, force: 13, integrate: 0.2 },
+};
+
+/** The band count's model: the heaviest band pass (the collision gather). */
+export const NESTED_ITEM_NS_PER_LEAF: ItemCosts = { prep: 10, force: 13, integrate: 4 };
+
+/** GPU time per leaf of a readback's composition (two reductions and the compose pass), ns: 4.7 ms at 325k. */
+const NESTED_READBACK_NS = 12;
 
 /**
  * The nested reduce map: in mode 1 each slot's `(rad² · x, rad² · y, rad², 1)` and box `(x, y, −x, −y)` —
@@ -133,6 +164,7 @@ export class GpuNestedLayout implements StreamSolver {
   private readonly collision: CollisionGrid;
   private readonly compose: NestedComposePass;
   private readonly slotInputs: NestedSlotInputs;
+  private readonly gatherInput: CollisionGatherInput;
   private readonly springInputs: NestedSpringInputs;
   /**
    * The nested map's textures per mode. Mode 2 reads mode 1's sums (the segment table's `stats`); mode 1
@@ -144,8 +176,10 @@ export class GpuNestedLayout implements StreamSolver {
   private readonly rootX: number;
   private readonly rootY: number;
 
-  /** Ticks done, the organise → compact switch, and each start's alpha and decay. */
+  /** Solve ticks done, the organise → compact switch, and each start's alpha and decay. */
   private tick = 0;
+  /** The collision step the current compact tick is at (0 … COLLISION_STEPS − 1). */
+  private step = 0;
   private readonly organise: number;
   private alphaCold = 1;
   private alphaWarm = WARM_ALPHA;
@@ -154,6 +188,19 @@ export class GpuNestedLayout implements StreamSolver {
 
   /** The readback's staging texture: leaf positions then module discs, in node order. */
   readonly packed: PackedPositions;
+  /** The frame budget's band model for this solve's work items (see {@link itemCostMs} for the rest). */
+  readonly itemCosts: ItemCosts = NESTED_ITEM_NS_PER_LEAF;
+
+  /** The next item's estimated GPU time, ms, for the stream tick the solve is at. */
+  itemCostMs(kind: ItemKind, bands: number): number {
+    const table = this.organising ? NESTED_NS.organise : this.step === 0 ? NESTED_NS.compact0 : NESTED_NS.compact1;
+    return itemCostMs(kind, this.topo.leafCount, bands, table);
+  }
+
+  /** Estimated GPU time of a readback's composition, ms. */
+  get readbackCostMs(): number {
+    return (NESTED_READBACK_NS * this.topo.leafCount) / 1e6;
+  }
 
   constructor(device: Device, topo: NestedSolverTopology, options: GpuNestedLayoutOptions = {}) {
     this.device = device;
@@ -301,6 +348,15 @@ export class GpuNestedLayout implements StreamSolver {
       alphaWarm: WARM_ALPHA,
     };
     this.springInputs = { vstar: this.vstar, radius: this.radius, rest: 0, pad: NESTED.PAD };
+    this.gatherInput = {
+      slotSeg: this.slotSeg,
+      segments: this.segments,
+      segLarge: this.segLarge,
+      count: slots,
+      width,
+      rows: height,
+      pad: NESTED.PAD,
+    };
   }
 
   // ── StreamSolver / ReadbackSource ──────────────────────────────────────────
@@ -315,9 +371,27 @@ export class GpuNestedLayout implements StreamSolver {
     return this.height;
   }
 
-  /** Ticks integrated so far. */
+  /** Solve ticks completed so far. */
   get ticks(): number {
     return this.tick;
+  }
+
+  /**
+   * Stream ticks of the whole solve — what the streaming transport runs: one per organise tick and
+   * {@link COLLISION_STEPS} per compact tick.
+   */
+  get streamTicks(): number {
+    return this.organise + COLLISION_STEPS * Math.max(0, this.topo.iterations - this.organise);
+  }
+
+  /** Run `ticks` whole solve ticks, every item unsliced — for tests and one-off solves. */
+  runTicks(ticks: number): void {
+    const until = this.tick + ticks;
+    while (this.tick < until) {
+      this.beginTick();
+      this.forceBand(0, 1);
+      this.integrate();
+    }
   }
 
   get positionTexture(): Texture {
@@ -346,10 +420,7 @@ export class GpuNestedLayout implements StreamSolver {
     return this.tick < this.organise;
   }
 
-  /**
-   * Work item **P**: in the organise phase the reductions (for the boxes) and the tile pyramid the
-   * repulsion bands traverse; in both phases the clear of the force accumulator.
-   */
+  /** Work item **P** of the current stream tick (see the file header). */
   beginTick(): void {
     if (this.organising) {
       this.runReduce(1, this.segments);
@@ -360,13 +431,30 @@ export class GpuNestedLayout implements StreamSolver {
         segments: this.segments,
         slotSeg: this.slotSeg,
       });
+      this.clearForce();
+      return;
     }
-    this.clearForce();
+    if (this.step === 0) this.advance(false);
+    // This collision step's cells and occupancy, from the positions it starts at.
+    this.runReduce(1, this.segments);
+    this.collision.prepare({
+      pos: this.pos.readTex,
+      radius: this.radius,
+      slotSeg: this.slotSeg,
+      segments: this.segments,
+      segNested: this.segNested,
+      count: this.slots,
+      width: this.width,
+      pad: NESTED.PAD,
+    });
   }
 
-  /** Work item **F_b**: the repulsion of atlas rows of band `band` (organise phase only). */
+  /** Work item **F_b**: atlas rows of band `band` — the repulsion (organise) or the collision gather (compact). */
   forceBand(band: number, bands: number): void {
-    if (!this.organising) return;
+    if (!this.organising) {
+      this.collision.gather(this.posFbo(this.posParity ^ 1), this.gatherInput, band, bands);
+      return;
+    }
     const r0 = Math.floor((band * this.height) / bands);
     const r1 = Math.floor(((band + 1) * this.height) / bands);
     if (r1 <= r0) return;
@@ -389,11 +477,25 @@ export class GpuNestedLayout implements StreamSolver {
   }
 
   /**
-   * Work item **I**: predict v*, gather the springs at x + v*, integrate (MRT), then — in the compact phase
-   * — one collision step; then advance the alpha schedules.
+   * Work item **I**: in the organise phase predict, springs and integrate; in the compact phase the swap
+   * to the collided positions. The last item of a solve tick advances the alpha schedules.
    */
   integrate(): void {
-    const organising = this.organising;
+    if (this.organising) {
+      this.advance(true);
+      this.endTick();
+      return;
+    }
+    this.swapPos(); // the gather bands wrote every slot of the other position texture
+    this.step++;
+    if (this.step >= COLLISION_STEPS) {
+      this.step = 0;
+      this.endTick();
+    }
+  }
+
+  /** Predict v*, gather the springs at x + v* (zero rest while organising), integrate (MRT), swap. */
+  private advance(organising: boolean): void {
     const input = this.slotInputs;
     input.alphaCold = this.alphaCold;
     input.alphaWarm = this.alphaWarm;
@@ -422,24 +524,10 @@ export class GpuNestedLayout implements StreamSolver {
     this.swapPos();
     this.vel.swap();
     this.velParity ^= 1;
+  }
 
-    for (let c = 0; c < (organising ? 0 : COLLISION_STEPS); c++) {
-      this.runReduce(1, this.segments);
-      this.collision.step({
-        pos: this.pos.readTex,
-        target: this.posFbo(this.posParity ^ 1),
-        radius: this.radius,
-        slotSeg: this.slotSeg,
-        segments: this.segments,
-        segNested: this.segNested,
-        segLarge: this.segLarge,
-        count: this.slots,
-        width: this.width,
-        pad: NESTED.PAD,
-      });
-      this.swapPos();
-    }
-
+  /** A solve tick is complete: advance the alpha schedules. */
+  private endTick(): void {
     this.alphaCold -= this.alphaCold * this.decayCold;
     this.alphaWarm -= this.alphaWarm * this.decayWarm;
     this.tick++;

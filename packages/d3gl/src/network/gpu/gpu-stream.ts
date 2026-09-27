@@ -36,7 +36,7 @@ import { DRAG_HEAT, RECOOL_TICKS } from "../force.js";
 import type { NetworkGraph } from "../graph.js";
 import { deleteSync, insertSync, pollSync } from "../../webgl/fence.js";
 import { AsyncPositionReadback, READBACK_STATS_FLOATS, type ReadbackSource } from "./async-readback.js";
-import { FrameBudget, itemCostMs, type FenceSource } from "./frame-budget.js";
+import { FrameBudget, ITEM_NS_PER_NODE, itemCostMs, type FenceSource, type ItemCosts, type ItemKind } from "./frame-budget.js";
 import { MIN_FRAME_MS, RepaintThrottle } from "./repaint-throttle.js";
 
 /**
@@ -46,6 +46,18 @@ import { MIN_FRAME_MS, RepaintThrottle } from "./repaint-throttle.js";
  * (#355) are both one.
  */
 export interface StreamSolver extends ReadbackSource {
+  /**
+   * The solver's GPU cost per node of each work item, ns, which the frame budget sizes its bands by.
+   * Default the flat layout's {@link ITEM_NS_PER_NODE}.
+   */
+  readonly itemCosts?: ItemCosts;
+  /**
+   * The estimated GPU time of the next item of `kind`, ms, when it depends on where the solve is (the
+   * nested layout's phases); otherwise the stream estimates it from {@link itemCosts}.
+   */
+  itemCostMs?(kind: ItemKind, bands: number): number;
+  /** Estimated GPU time of {@link prepareReadback}, ms, which a frame that copies reserves in its budget. Default 0. */
+  readonly readbackCostMs?: number;
   beginTick(): void;
   forceBand(band: number, bands: number): void;
   integrate(): void;
@@ -154,6 +166,7 @@ export class GpuStream {
 
   private readonly gl: WebGL2RenderingContext;
   private readonly layout: StreamSolver;
+  private readonly costs: ItemCosts;
   private readonly drag: DragSolver | null;
   private readonly graph: NetworkGraph;
   private readonly into: Float32Array | null;
@@ -222,9 +235,11 @@ export class GpuStream {
     this.iterations = opts.iterations;
     this.frameEvery = opts.frameEvery;
     this.throttle = new RepaintThrottle(opts.minFrameMs ?? MIN_FRAME_MS);
+    this.costs = layout.itemCosts ?? ITEM_NS_PER_NODE;
     this.budget = new FrameBudget(glFences(this.gl), () => performance.now(), {
       nodes: layout.nodeCount,
       rows: layout.atlasRows,
+      costs: this.costs,
       ...(opts.budgetMs !== undefined ? { budgetMs: opts.budgetMs } : {}),
     });
     this.readback = new AsyncPositionReadback(device, layout);
@@ -354,6 +369,8 @@ export class GpuStream {
     const t2 = performance.now();
     let items = 0;
     const open = this.budget.open();
+    // A frame that will copy reserves the readback's own GPU work (the nested layout's composition).
+    if (open && this.copyLikely(now)) this.budget.reserve(this.layout.readbackCostMs ?? 0);
     if (open) {
       while (this.hasWork()) {
         const cost = this.nextItemCost();
@@ -417,9 +434,12 @@ export class GpuStream {
   /** The estimated GPU time of the next item. */
   private nextItemCost(): number {
     const n = this.layout.nodeCount;
-    if (this.phase === 0) return itemCostMs("prep", n, 1);
-    if (this.phase <= this.tickBands) return itemCostMs("force", n, this.tickBands);
-    return itemCostMs("integrate", n, 1);
+    const kind: ItemKind = this.phase === 0 ? "prep" : this.phase <= this.tickBands ? "force" : "integrate";
+    const solverCost = this.layout.itemCostMs?.(kind, this.tickBands);
+    if (solverCost !== undefined) return solverCost;
+    if (this.phase === 0) return itemCostMs("prep", n, 1, this.costs);
+    if (this.phase <= this.tickBands) return itemCostMs("force", n, this.tickBands, this.costs);
+    return itemCostMs("integrate", n, 1, this.costs);
   }
 
   /** Encode the next work item of the current tick. */
@@ -482,6 +502,15 @@ export class GpuStream {
    * ready (after the usual copy → ready latency) when the next repaint is due — so a harvested frame is
    * about one frame old, not a whole repaint interval.
    */
+  /** Whether this frame will likely copy (checked before encoding, to reserve the copy's GPU time). */
+  private copyLikely(now: number): boolean {
+    if (this.readback.pending) return false;
+    if (this.finishing) return true;
+    if (!this.streaming) return false;
+    if (this.frameEvery !== undefined) return this.ticksDone + 1 - this.copiedTicks >= this.frameEvery;
+    return this.throttle.copyDue(now);
+  }
+
   private copyDue(now: number): boolean {
     if (this.readback.pending) return false;
     // The final copy goes out as soon as the PBO is free; its harvest clears `finishing` (finish()).
