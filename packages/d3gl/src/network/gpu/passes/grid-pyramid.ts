@@ -3,7 +3,7 @@ import { Model } from "@luma.gl/engine";
 import { SLOT_TEXEL_GLSL } from "../textures.js";
 import { FLAT_TILE_MIN_SIDE, tileSide, type PyramidLevel, type PyramidTexture, type TileAtlas } from "../segments.js";
 import { SEGMENT_OF_GLSL, segmentDefines, type SegmentTable } from "../segment-table.js";
-import { ADDITIVE_BLEND, beginPass, fullScreenModel, NO_BLEND, type PassUniforms } from "./fullscreen.js";
+import { ADDITIVE_BLEND, beginPass, fullScreenModel, NO_BLEND, type PassTarget, type PassUniforms } from "./fullscreen.js";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // GPU tile-atlas grid pyramid — one regular quadtree per segment (spec §6.2).
@@ -197,6 +197,16 @@ interface PyramidTarget {
   readonly fbo: Framebuffer;
 }
 
+/** One reduce pass (level ℓ → ℓ+1): the level it reads, the level it writes, and how. */
+interface ReduceStep {
+  readonly src: PyramidLevel;
+  readonly dst: PyramidLevel;
+  /** `dst`'s rectangle of its packed texture, without a clear. */
+  readonly target: PassTarget;
+  /** The packed texture holding `src`. */
+  readonly bindings: { readonly u_src: Texture };
+}
+
 /** Inputs of a pyramid build. */
 export interface PyramidBuildInput {
   /** Current slot positions (rg32float slot atlas). */
@@ -236,6 +246,10 @@ export class GridPyramid {
   readonly textures: Readonly<Record<PyramidTexture, Texture>>;
   private readonly scatterModel: Model;
   private readonly reduceModel: Model;
+  /** The scatter's target: the whole L0 atlas, cleared (L0 holds level 0 alone). */
+  private readonly scatterTarget: PassTarget;
+  /** The L − 1 reduce passes in build order, built once: the atlas is fixed per topology. */
+  private readonly reduceSteps: readonly ReduceStep[];
 
   /**
    * Box padding factor so max-corner nodes fall strictly inside the grid. The
@@ -277,6 +291,17 @@ export class GridPyramid {
       even: target(atlas.even.width, atlas.even.height),
     };
     this.textures = { l0: this.targets.l0.tex, odd: this.targets.odd.tex, even: this.targets.even.tex };
+    this.scatterTarget = { framebuffer: this.targets.l0.fbo, clear: [0, 0, 0, 0] };
+    // The reduce passes of `build` step 2, one per level ℓ → ℓ+1, with their targets and bindings.
+    this.reduceSteps = atlas.levels.slice(1).map((dst, l) => {
+      const src = this.level(l);
+      return {
+        src,
+        dst,
+        target: { framebuffer: this.targets[dst.texture].fbo, clear: false, viewport: [dst.x, dst.y, dst.width, dst.height] },
+        bindings: { u_src: this.targets[src.texture].tex },
+      };
+    });
 
     // ── Models ────────────────────────────────────────────────────────────
     this.scatterUniforms = {
@@ -320,7 +345,7 @@ export class GridPyramid {
 
     // ── 1. Scatter to level 0 (ADD blend into the whole L0 atlas) ─────────
     // L0 holds level 0 alone, so clearing the whole attachment is right here.
-    const scatterPass = beginPass(this.device, { framebuffer: this.targets.l0.fbo, clear: [0, 0, 0, 0] });
+    const scatterPass = beginPass(this.device, this.scatterTarget);
     this.scatterUniforms["u_width"] = width;
     this.scatterUniforms["u_tableWidth"] = segments.width;
     this.scatterModel.setBindings(
@@ -337,19 +362,13 @@ export class GridPyramid {
     // Each pass reads level ℓ from one texture and writes level ℓ+1's rectangle of the other: no
     // clear (the other levels share the target), no blend (every output texel is written once).
     const u = this.reduceUniforms;
-    for (let l = 0; l < this.levelCount - 1; l++) {
-      const src = this.level(l);
-      const dst = this.level(l + 1);
-      const pass = beginPass(this.device, {
-        framebuffer: this.targets[dst.texture].fbo,
-        clear: false,
-        viewport: [dst.x, dst.y, dst.width, dst.height],
-      });
+    for (const { src, dst, target, bindings } of this.reduceSteps) {
+      const pass = beginPass(this.device, target);
       u["u_srcX"] = src.x;
       u["u_srcY"] = src.y;
       u["u_dstX"] = dst.x;
       u["u_dstY"] = dst.y;
-      this.reduceModel.setBindings({ u_src: this.targets[src.texture].tex });
+      this.reduceModel.setBindings(bindings);
       this.reduceModel.draw(pass);
       pass.end();
       this.device.submit();
