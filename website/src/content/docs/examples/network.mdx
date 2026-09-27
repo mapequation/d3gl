@@ -262,7 +262,10 @@ net
   edges through the glyphs' members, with the same rules (drawn pairs, links toward off-screen cells).
   The work is proportional to the edges of the drawn glyphs' members; an unchanged view re-emits them
   from a per-tree memo. Every neighbour resolves to the one glyph that covers it, so links between
-  glyphs at different levels are always drawn (`crossLevelEdges` makes no difference here).
+  glyphs at different levels are always drawn (`crossLevelEdges` makes no difference here). At the fit
+  view that is every edge in view: about 10 ms per frame for a 325k-node, 1.5M-edge web graph, but
+  ~190 ms for a million nodes with 5.8M edges — where a layout that keeps communities together, such as
+  this example's, draws a compact map with `"structure"` at a fraction of the cost.
 - **Aggregates are regions.** An aggregate is sized area-additively (its ink ≈ its members' total) and
   reads as "this part of the map" — it is not a community. Its id changes with each rebuild; a selected
   or hovered aggregate is carried over to the cell in the same place (leaves keep their ids).
