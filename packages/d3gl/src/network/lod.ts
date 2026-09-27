@@ -1771,7 +1771,7 @@ const CROWDING_BUCKET = 64;
  * one node's children gathered at a time — grown on demand to the largest tree seen, so a pass run per
  * streamed frame allocates nothing once warm. 28 B per aggregate; about 6 B per child of an indexed node (a
  * wide node that is not crowded: 36 B per index entry, at most one per 16 children, and 4 B in `perm`); and
- * 48 B per child of the widest node.
+ * 28 B per child of the widest node.
  */
 export interface LODCrowdingScratch {
   /** Per aggregate `o = g − leafCount`: its members' box, `[minX, minY, maxX, maxY]` at `4o`. */
@@ -1807,13 +1807,14 @@ export interface LODCrowdingScratch {
   /**
    * One node's children, gathered once per node: the child id, its box (a leaf's is its point), its largest
    * effective radius, and the children that can form a pair (`order`, reordered by the index and the sweeps).
+   * Single precision loses nothing: positions, boxes and radii are all stored in it.
    */
   kid: Uint32Array;
-  kx0: Float64Array;
-  ky0: Float64Array;
-  kx1: Float64Array;
-  ky1: Float64Array;
-  kr: Float64Array;
+  kx0: Float32Array;
+  ky0: Float32Array;
+  kx1: Float32Array;
+  ky1: Float32Array;
+  kr: Float32Array;
   order: Uint32Array;
 }
 
@@ -1824,7 +1825,7 @@ export function makeLODCrowdingScratch(): LODCrowdingScratch {
     box: new Float32Array(0), rmax: new Float32Array(0), lo: new Float32Array(0), kdRoot: new Uint32Array(0),
     kdBox: new Float32Array(0), kdR: new Float32Array(0), kdCount: new Uint32Array(0), kdLeft: new Uint32Array(0), kdLo: new Uint32Array(0), kdHi: new Uint32Array(0),
     perm: new Uint32Array(0), kdStack: new Uint32Array(96), pairA: new Uint32Array(64), pairB: new Uint32Array(64),
-    kid: new Uint32Array(k), kx0: new Float64Array(k), ky0: new Float64Array(k), kx1: new Float64Array(k), ky1: new Float64Array(k), kr: new Float64Array(k), order: new Uint32Array(k),
+    kid: new Uint32Array(k), kx0: new Float32Array(k), ky0: new Float32Array(k), kx1: new Float32Array(k), ky1: new Float32Array(k), kr: new Float32Array(k), order: new Uint32Array(k),
   };
 }
 
@@ -1832,11 +1833,11 @@ export function makeLODCrowdingScratch(): LODCrowdingScratch {
 function growChildScratch(sc: LODCrowdingScratch, n: number): void {
   const cap = Math.max(n, sc.kid.length * 2);
   sc.kid = new Uint32Array(cap);
-  sc.kx0 = new Float64Array(cap);
-  sc.ky0 = new Float64Array(cap);
-  sc.kx1 = new Float64Array(cap);
-  sc.ky1 = new Float64Array(cap);
-  sc.kr = new Float64Array(cap);
+  sc.kx0 = new Float32Array(cap);
+  sc.ky0 = new Float32Array(cap);
+  sc.kx1 = new Float32Array(cap);
+  sc.ky1 = new Float32Array(cap);
+  sc.kr = new Float32Array(cap);
   sc.order = new Uint32Array(cap);
 }
 
@@ -1906,7 +1907,7 @@ export type LODCrowdingTree = Pick<
  * allocating nothing. Equal keys (a lattice's columns) split evenly. A NaN key (a box with members at both
  * infinities) only makes the split uneven: the index stays correct whatever the partition.
  */
-function selectNth(order: Uint32Array, e0: Float64Array, e1: Float64Array, lo: number, hi: number, nth: number): void {
+function selectNth(order: Uint32Array, e0: Float32Array, e1: Float32Array, lo: number, hi: number, nth: number): void {
   let l = lo;
   let r = hi - 1;
   while (r > l) {
