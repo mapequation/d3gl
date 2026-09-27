@@ -1,8 +1,29 @@
-import { describe, it, expect, afterEach } from "vitest";
+import { describe, it, expect, afterEach, vi } from "vitest";
 import { zoomTransform } from "d3-zoom";
 import { Network, type NetworkOptions } from "../network.js";
 import { buildGraph, type NetworkGraph } from "../graph.js";
 import type { ViewTransform } from "../../core/index.js";
+import type { WorkerLayoutHandle } from "../worker-transport.js";
+
+// While `transport.idle` is set, a flat worker layout starts an idle transport: its handle is live (the
+// layout runs, so its fit stays on) but it streams nothing and never settles until stopped. The test then
+// streams the frames itself ({@link FixtureNetwork.streamFrame}) — deterministic, where a real worker's
+// frames and its settle race the test. Off, the real worker runs.
+const transport = vi.hoisted(() => ({ idle: false }));
+vi.mock("../worker-transport.js", async (importOriginal) => {
+  const mod = await importOriginal<typeof import("../worker-transport.js")>();
+  return {
+    ...mod,
+    startWorkerLayout: (...args: Parameters<typeof mod.startWorkerLayout>): WorkerLayoutHandle => {
+      if (!transport.idle) return mod.startWorkerLayout(...args);
+      let stop = (): void => {};
+      const settled = new Promise<void>((resolve) => {
+        stop = () => resolve();
+      });
+      return { shared: false, settled, stop, pin() {}, unpin() {} };
+    },
+  };
+});
 
 /**
  * Streaming `layout({ fit: true })` with zoom enabled (#327, #309).
@@ -67,7 +88,7 @@ class ProbeNetwork extends Network {
 /**
  * Lays every streamed frame out as a fixed layout: the hook runs after the transport's position copy, so it
  * replaces the solver's positions on every frame, the settling one included. {@link streamFrame} is that
- * frame's repaint request, for a stream whose worker has been stopped.
+ * frame's repaint request, for a stream driven by hand (an idle transport, or one already stopped).
  */
 class FixtureNetwork extends ProbeNetwork {
   beforeFrame: (() => void) | null = null;
@@ -405,6 +426,37 @@ describe("streaming fit with zoom enabled (#327)", () => {
     expect(zoomTransform(host)).toMatchObject(grabbed);
     net.destroy();
   }, STREAM_TIMEOUT_MS);
+
+  it("stopLayout() ends the fit with its layout: a repaint request after the stop does not reframe (#427)", async () => {
+    const host = makeHost();
+    const net = new FixtureNetwork(host, { width: W, height: H, backend: "webgl" });
+    await net.whenReady();
+    const graph = randomGraph(2000, 29);
+    const R = 200;
+    const disc = new Float32Array(2 * graph.nodeCount);
+    const golden = Math.PI * (3 - Math.sqrt(5));
+    for (let i = 0; i < graph.nodeCount; i++) {
+      const d = R * Math.sqrt((i + 0.5) / graph.nodeCount);
+      disc[2 * i] = d * Math.cos(i * golden);
+      disc[2 * i + 1] = d * Math.sin(i * golden);
+    }
+    let fixture = disc;
+    net.beforeFrame = () => graph.positions.set(fixture);
+    net.data(graph).style({ nodeRadius: 2, sizeMode: "screen" }).enableZoom([0.001, 100]);
+    net.layout({ backend: "worker", fit: true, multilevel: false, iterations: 10_000 });
+    net.streamFrame();
+    await nextFrame();
+    const framed = net.view;
+    expect(framingOf(disc, framed).fill, "non-vacuity: the stream was not framed").toBeGreaterThan(0.8);
+
+    net.stopLayout();
+    fixture = disc.map((v) => 3 * v); // a layout 3× larger: a fit still armed would zoom out to it
+    net.streamFrame();
+    await nextFrame();
+    expect(net.view, "a repaint after stopLayout() reframed the camera").toEqual(framed);
+    expect(zoomTransform(host)).toMatchObject(framed);
+    net.destroy();
+  }, STREAM_TIMEOUT_MS);
 });
 
 describe("stragglers are trimmed only while the layout streams; the settled fit frames the exact box", () => {
@@ -432,14 +484,18 @@ describe("stragglers are trimmed only while the layout streams; the settled fit 
 
   /**
    * The view a `fit: true` worker stream frames `positions` at, mid-stream and once settled, on one engine.
-   * Mid-stream: the worker is stopped (the fit stays on) and one frame is streamed by hand, as the perf
-   * guard does — deterministic, where a live worker's frames race the test. Settled: a real run whose every
-   * frame, the settling one included, is laid out as `positions`, so the settle frames exactly them.
+   * Mid-stream: an idle transport (the layout runs, so its fit stays on) and one frame streamed by hand, as
+   * the perf guard does — deterministic, where a live worker's frames race the test. Settled: a real run
+   * whose every frame, the settling one included, is laid out as `positions`, so the settle frames exactly them.
    */
   async function streamedAndSettled(net: FixtureNetwork, graph: NetworkGraph, positions: Float32Array): Promise<{ streaming: ViewTransform; settled: ViewTransform }> {
     net.beforeFrame = () => graph.positions.set(positions);
-    net.layout({ backend: "worker", fit: true, multilevel: false, iterations: 10 });
-    net.stopLayout();
+    transport.idle = true;
+    try {
+      net.layout({ backend: "worker", fit: true, multilevel: false, iterations: 10 });
+    } finally {
+      transport.idle = false;
+    }
     net.streamFrame();
     await nextFrame();
     const streaming = net.view;

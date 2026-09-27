@@ -334,8 +334,8 @@ export interface NetworkLayoutOptions {
    * The last frame is the landed layout's exact box, every node included; then the view is the user's
    * again. It is also released — left where it is, never reframed — as soon as the user zooms, pans or
    * grabs a node, or the view is set with `setTransform`, so the camera never moves away from a view the
-   * user chose. The engine's own camera moves are not gestures and don't release it. `stopLayout()` leaves
-   * the camera where it is. Default `false`.
+   * user chose. The engine's own camera moves are not gestures and don't release it. The fit ends with its
+   * layout: `stopLayout()`, a new `layout()` or `data()` leave the camera where it is. Default `false`.
    *
    * The box is tight whether LOD is on or off. While a force layout streams it ignores a handful of
    * flung-out stragglers: at most min(64, 0.5% of the nodes) per side, and only when they sit 10-30% or more
@@ -344,9 +344,10 @@ export interface NetworkLayoutOptions {
    * nested map streams top-down on the worker, each depth's leaves collapsed onto their module centres, so
    * while it streams it is framed on a box the worker knows its final layout lies in — the root disc, then
    * each depth's placed discs — which only shrinks as depths land: the camera only zooms in, down to the
-   * leaves' exact box. A stream with no such bound frames its live leaves, like a force layout. The pad covers the largest node glyph; with LOD on, an aggregate glyph larger than that can
-   * overhang the frame's edge margin. Cost: the box is O(nodes) per streamed frame, only while the fit is
-   * on; a transition computes it once, when it starts, and moves the camera in O(1) per frame.
+   * leaves' exact box. A stream with no such bound frames its live leaves, like a force layout. The pad
+   * covers the largest node glyph; with LOD on, an aggregate glyph larger than that can overhang the frame's
+   * edge margin. Cost: the box is O(nodes) per streamed frame, only while the fit is on; a transition
+   * computes it once, when it starts, and moves the camera in O(1) per frame.
    */
   fit?: boolean;
   /**
@@ -770,7 +771,7 @@ export class Network extends BaseEngine {
   /** While true (a `layout({ fit: true })` until its layout has landed), the camera follows the layout:
    *  each streamed frame reframes it on the layout's live bounds ({@link fitViewToLayout}) and a transition
    *  eases it along ({@link fitCamera}). Cleared once the layout settles (after a last, exact frame), on the
-   *  first user gesture or node grab, or by a `setTransform`. */
+   *  first user gesture or node grab, by a `setTransform`, or when the layout is stopped ({@link haltLayout}). */
   private fitOnLayout = false;
   /**
    * A bound on a streaming layout's final extent that is known before its leaves are placed, as its
@@ -2412,7 +2413,8 @@ export class Network extends BaseEngine {
   }
 
   /** Stop a running worker layout or position transition (no-op if none). The last computed — or
-   *  eased — positions are kept. A nested layout's transition stopped mid-ease leaves the nodes between
+   *  eased — positions are kept, and so is the camera: a `fit` ends with its layout, where it stopped
+   *  (#427). A nested layout's transition stopped mid-ease leaves the nodes between
    *  two layouts, so its discs no longer hold: the modules (and their rings) fall back to their members'
    *  centroid + extent (#329). A spatial LOD tree, refit through the transition, is rebuilt where the
    *  nodes stopped (#343). */
@@ -2431,7 +2433,10 @@ export class Network extends BaseEngine {
     this.layoutHandle?.stop();
     this.layoutHandle = null;
     this.transition = null;
-    this.fitCamera = null; // a stopped transition's camera stops where it is
+    // The fit lives exactly as long as its layout: a stopped one leaves the camera where it is, and nothing
+    // after the stop — a late repaint request, the next frame — may reframe it.
+    this.fitOnLayout = false;
+    this.fitCamera = null;
     this.lodStreaming = false; // no worker run is in flight to stream the LOD tree any more
     this.lodRetired.length = 0; // their worker is gone: the buffers stay here, for the collector
     this.nestedSolving = false;
