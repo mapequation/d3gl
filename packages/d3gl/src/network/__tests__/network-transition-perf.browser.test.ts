@@ -483,7 +483,7 @@ describe(`network() position transition — per-frame cost vs a streamed layout 
         fitted.uploadedPerFrame,
         `fitted uploads ${(fitted.uploadedPerFrame / 1024).toFixed(0)} KB/frame vs unfitted ${(unfitted.uploadedPerFrame / 1024).toFixed(0)} KB/frame`,
       ).toBeLessThanOrEqual(unfitted.uploadedPerFrame * 1.02 + 4096);
-    const msg = `${name} moving camera: fitted ${fitted.medianMs.toFixed(2)}ms vs unfitted ${unfitted.medianMs.toFixed(2)}ms at N=${N.toLocaleString()}`;
+      const msg = `${name} moving camera: fitted ${fitted.medianMs.toFixed(2)}ms vs unfitted ${unfitted.medianMs.toFixed(2)}ms at N=${N.toLocaleString()}`;
       expect(fitted.medianMs, msg).toBeLessThanOrEqual(unfitted.medianMs * 1.3 + 1);
       expect(fitted.medianMs, msg).toBeLessThan(ceiling);
     });
