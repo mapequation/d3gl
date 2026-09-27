@@ -14,7 +14,8 @@
 //   2 frames of 8.3 ms would block behind any render longer than 17 ms). Every frame ends with one
 //   *budget fence*. A frame encodes only if the fence of frame f−n has signalled; otherwise the GPU is
 //   behind, so it encodes nothing, halves `k` (to half of what the late frame — the oldest in flight —
-//   encoded) and holds it for 30 frames. Only that frame's lateness counts: the GPU runs work in order,
+//   encoded, never above the current `k`: a frame queued before an earlier cut may hold more) and holds it
+//   for 30 frames. Only that frame's lateness counts: the GPU runs work in order,
 //   so nothing queued after its fence can have delayed it. A miss changes nothing, and only blocks, when
 //   no lever can shorten the late frame — it encoded no item, or one item that cannot be cut finer (a pass
 //   bound by its fixed cost, like the nested gather of a huge module: fewer items per frame cannot shorten
@@ -38,15 +39,27 @@
 //   scales the divisible estimate (`⌈g · c / (budget / 2 − f)⌉`), so a pass far below half the budget
 //   stays one band however slow the GPU, and it never cuts a pass into more bands than carry their fixed
 //   cost in divisible work (B·f ≤ c: past that a thinner band only pays f again). It doubles, up to 8×,
-//   when one item per frame still misses the gate *and the late frame held a band that more growth would
-//   cut finer*. It halves — with `k` halved alongside — once 30 frames that held two consecutive bands of
-//   a pass it cut finer have each finished within their frame, with no miss since: at half the growth
-//   those two bands are one band of the same work, and it fit a frame. Frames of other items, or ones the
-//   GPU finished late, say nothing about a band twice the size and do not count. (The spec's first draft
-//   halved only when a whole tick fit in one frame; that can never happen again once B is large, so one
-//   transient stall — a first-use shader compile — ratcheted B up for good: measured 64 bands and 0.4
-//   ticks/s. #382's first version counted any frame of two items, which in a nested tick — tens of small
-//   passes beside one large band — nearly every frame is, so the growth fell back and missed again.)
+//   when one item per frame still misses the gate — `k` is 1 and the late frame held one item — *and that
+//   item was a band cut at the current growth that twice the growth would cut finer*. It halves — with `k`
+//   halved alongside — once 30 frames that held two consecutive bands of a pass, together at least one band
+//   of half the growth, have each finished within their frame: at half the growth those two bands are one
+//   band of the same work, and it fit a frame. Evidence counts only for the growth it is about: a pass keeps
+//   the bands it started with, so a band of a pass cut at another growth (one that outlived a change), or a
+//   frame queued before a change, says nothing about the current one. (Growing on such a band once took the
+//   flat 1M force pass at 120 Hz to growth 8, whose 64 bands, MAX_BANDS, are growth 4's too: no frame could
+//   then hold two bands that half the growth cuts coarser, and it stayed there ~3,150 frames on the real
+//   GPU.) The 30 frames are counted since the last miss that acted and need not be consecutive: a frame
+//   without such a pair, or one whose fence is seen late, neither counts nor resets them, and a miss that
+//   only blocks (a band that cannot be cut finer, an engine repaint) says nothing about a band twice the
+//   size. "Within its frame" is seen by the next frame's poll; the browser's sync status can trail the GPU
+//   (on an M1 Max at 120 Hz, 30-35% of full frames' fences were seen a frame late), so fewer frames count
+//   and the growth returns more slowly — and on a transport that sees every full frame's fence late, never.
+//   Once-per-frame polls cannot tell that from two bands that took more than a frame (#382 D10). (The
+//   spec's first draft halved only when a whole tick fit in one frame; that can never happen again once B
+//   is large, so one transient stall — a first-use shader compile — ratcheted B up for good: measured 64
+//   bands and 0.4 ticks/s. #382's first version counted any frame of two items, which in a nested tick —
+//   tens of small passes beside one large band — nearly every frame is, so the growth fell back and missed
+//   again.)
 // - **Main-thread cap.** Items are also admitted only while the measured encode time of the frame stays
 //   within `encodeCapMs` (2 ms) — the binding limit at small N, where the GPU work is tiny.
 //
@@ -190,8 +203,11 @@ export class FrameBudget<F> {
   /** Pending fences, oldest first, and the frame each one closed (parallel queues). */
   private readonly queue: F[] = [];
   private readonly queueFrames: number[] = [];
-  /** Whether each queued frame encoded a band that more growth would cut finer (so a miss on it is one slicing can help). */
-  private readonly queueFiner: boolean[] = [];
+  /**
+   * The band growth at which each queued frame held a band cut at that growth that twice the growth would
+   * cut finer (so a miss on it is one slicing can help); 0 when it held none.
+   */
+  private readonly queueFiner: number[] = [];
   /**
    * The band growth at which each queued frame held two consecutive bands of a pass that half the growth
    * would cut coarser; 0 when it held none. Such a frame finished in time is evidence for halving.
@@ -222,7 +238,7 @@ export class FrameBudget<F> {
   private hold = 0;
   /** The band growth `g` (1, 2, 4 or 8): the factor every pass's cost estimate is sliced by. */
   private bandGrowth = 1;
-  /** Frames that held two consecutive bands of a pass the growth cut finer and finished in time, since the last miss or growth change. */
+  /** Frames that held two consecutive bands of a pass the growth cut finer and finished in time, since the last miss that acted or growth change. */
   private fitStreak = 0;
   private blockedPrev = false;
   private encodeAvgMs = 0;
@@ -295,8 +311,8 @@ export class FrameBudget<F> {
    * Start frame `now` (the rAF timestamp): record the interval and drop every fence that has signalled,
    * oldest first. `"lost"` when a poll failed — the context is gone and the run must stop without GL.
    * A frame that held two consecutive bands of a pass the growth cut finer, and whose fence has signalled
-   * by this — the next — frame, finished within its frame: after {@link HOLD_FRAMES} of them with no miss,
-   * the growth halves, and `k` with it.
+   * by this — the next — frame, finished within its frame: after {@link HOLD_FRAMES} of them since the last
+   * miss that acted, the growth halves, and `k` with it.
    */
   beginFrame(now: number): "ok" | "lost" {
     if (!Number.isNaN(this.lastNow)) {
@@ -337,20 +353,22 @@ export class FrameBudget<F> {
   /**
    * The gate: whether this frame may encode items (the fence of frame f−n has signalled, n from
    * {@link framesInFlight}). A blocked frame starting a miss that is the layout's own ({@link layoutMiss})
-   * halves `k` to half of what the late frame encoded — and doubles the band growth when `k` was already 1
-   * and the late frame held a band that more growth would cut finer — then holds `k`. A late frame of one
-   * item that cannot be cut finer, and any other miss, only block: no lever shortens such an item, and
+   * halves `k` to half of what the late frame encoded (never raising it) — and doubles the band growth when
+   * `k` was already 1, the late frame held one item, and it was a band cut at the current growth that twice
+   * the growth would cut finer — then holds `k`. A late frame of one item that cannot be cut finer (or whose
+   * evidence is about another growth), and any other miss, only block: no lever shortens such an item, and
    * fewer items per frame would only slow every other pass (#382).
    */
   open(): boolean {
     const blocked = this.queue.length >= this.maxInFlight;
     if (blocked) {
       const late = this.queueItems[0] ?? 0;
-      if (!this.blockedPrev && this.layoutMiss() && (late >= 2 || this.queueFiner[0] === true)) {
-        if (this.items === 1 && this.queueFiner[0] === true) {
+      const finer = this.queueFiner[0] === this.bandGrowth;
+      if (!this.blockedPrev && this.layoutMiss() && (late >= 2 || finer)) {
+        if (this.items === 1 && late === 1 && finer) {
           this.bandGrowth = Math.min(MAX_BAND_GROWTH, this.bandGrowth * 2);
         }
-        this.items = Math.max(1, Math.floor(late / 2));
+        this.items = Math.max(1, Math.min(this.items, Math.floor(late / 2)));
         this.hold = HOLD_FRAMES;
         this.fitStreak = 0;
       } else if (this.hold > 0) {
@@ -383,10 +401,11 @@ export class FrameBudget<F> {
 
   /**
    * Record that the admitted item was encoded (its measured encode time feeds the cap): band `band` of
-   * `bands` of `pass` (a pass of one row runs whole, as its band 0 of 1). The band growth reads it: whether
-   * more growth would cut the pass finer (a miss on this frame is then one slicing can help), and whether
-   * it follows the pass's previous band in this frame while half the growth would cut the pass coarser
-   * (the two bands are then one band's work at half the growth).
+   * `bands` of `pass` (a pass of one row runs whole, as its band 0 of 1). The band growth reads it, always
+   * about the current growth g: whether the band is no larger than g cuts it and 2g would cut it finer (a
+   * miss on this frame is then one slicing can help), and whether it follows the pass's previous band in
+   * this frame while g/2 would cut the pass coarser and the two carry at least one band of g/2 (they are
+   * then that band's work).
    */
   spent(costMs: number, pass: StageCost, band: number, bands: number): void {
     const dt = this.clock() - this.itemStart;
@@ -394,8 +413,11 @@ export class FrameBudget<F> {
     this.frameItems++;
     this.frameCostMs += costMs;
     const g = this.bandGrowth;
-    if (g < MAX_BAND_GROWTH && this.bandsAt(pass, 2 * g) > bands) this.frameFiner = true;
-    if (g > 1 && pass === this.lastPass && band === this.lastBand + 1 && this.bandsAt(pass, g / 2) < bands) this.framePair = true;
+    if (g < MAX_BAND_GROWTH && bands >= this.bandsAt(pass, g) && this.bandsAt(pass, 2 * g) > bands) this.frameFiner = true;
+    if (g > 1 && pass === this.lastPass && band === this.lastBand + 1) {
+      const half = this.bandsAt(pass, g / 2);
+      if (half < bands && bands <= 2 * half) this.framePair = true;
+    }
     this.lastPass = pass;
     this.lastBand = band;
   }
@@ -409,7 +431,7 @@ export class FrameBudget<F> {
     if (this.opened && this.frameItems >= this.items && this.hold === 0) this.items = Math.min(MAX_ITEMS, this.items + 1);
     this.queue.push(this.fences.insert());
     this.queueFrames.push(this.frameIndex);
-    this.queueFiner.push(this.frameFiner);
+    this.queueFiner.push(this.opened && this.frameFiner ? this.bandGrowth : 0);
     this.queuePair.push(this.opened && this.framePair ? this.bandGrowth : 0);
     this.queueRepaint.push(repainted);
     this.queueItems.push(this.frameItems);

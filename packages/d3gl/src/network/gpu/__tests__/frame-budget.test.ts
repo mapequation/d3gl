@@ -319,6 +319,28 @@ describe("FrameBudget k: items per frame", () => {
     }
   });
 
+  it("never raises k on a miss, nor grows the bands, for a late frame encoded before an earlier cut", () => {
+    // At 120 Hz four frames may be in flight, so frames queued while k still grew can be the late one of a
+    // later miss, after a first miss has already cut k below half of what they encoded.
+    const r = rig();
+    const hz120 = { intervalMs: 1000 / 120 };
+    frame(r, hz120); // 1 item; k = 2
+    r.fences.catchUp();
+    expect(frame(r, hz120)).toBe(2);
+    expect(frame(r, hz120)).toBe(3);
+    expect(frame(r, hz120)).toBe(4);
+    expect(frame(r, hz120)).toBe(5); // four frames in flight, k = 6
+    expect(frame(r, hz120)).toBe(0); // miss 1, on the 2-item frame: k = ⌊2 / 2⌋ = 1
+    expect(r.budget.k).toBe(1);
+    r.fences.signaledThrough = 3; // the 2- and 3-item frames finish
+    expect(frame(r, hz120)).toBe(1); // opens at k = 1
+    // Miss 2, on the 4-item frame queued before miss 1: half of it (2) is more than k already is, and it
+    // was never one item per frame, so it says nothing about the band size either.
+    expect(frame(r, hz120)).toBe(0);
+    expect(r.budget.k).toBe(1);
+    expect(r.budget.growth).toBe(1);
+  });
+
   it("caps the estimated GPU time per frame at the budget, always admitting a first item", () => {
     const r = rig({ budgetMs: 10 });
     for (let f = 0; f < 20; f++) {
@@ -587,6 +609,19 @@ describe("FrameBudget band growth: how far every pass's estimate is scaled when 
       r.fences.signaledThrough = r.fences.inserted - 1;
     }
     expect(r.budget.growth).toBe(2);
+    // Nor do two consecutive bands of a pass cut at a higher growth (one that outlived a halving: 16 bands
+    // where growth 2 cuts 4), finished in time: together they are an eighth of the pass, not the half that
+    // one band at growth 1 would carry.
+    for (let f = 0; f < 200; f++) {
+      r.now += 1000 / 60;
+      r.budget.beginFrame(r.now);
+      if (r.budget.open()) {
+        for (let b = 0; b < 2 && r.budget.admit(0.01); b++) r.budget.spent(0.01, r.pass, 2 * (f % 8) + b, 16);
+      }
+      r.budget.endFrame();
+      r.fences.catchUp();
+    }
+    expect(r.budget.growth).toBe(2);
     // Frames whose consecutive bands finish within the frame do: one band of twice the size fits there too.
     let frames = 0;
     while (r.budget.growth === 2 && frames < 200) {
@@ -600,9 +635,10 @@ describe("FrameBudget band growth: how far every pass's estimate is scaled when 
 
   it("recovers from a transient stall: the growth returns to 1", () => {
     // A first-use stall (e.g. a shader compile on the first draw) misses the gate over and over at
-    // k = 1 and doubles the growth each time; a GPU that then keeps up must bring it back down.
+    // k = 1 and doubles the growth each time a band of the growth it was cut at misses; a GPU that then
+    // keeps up must bring it back down.
     const r = rig();
-    for (let miss = 0; miss < 4; miss++) {
+    for (let miss = 0; miss < 12 && r.budget.growth < 8; miss++) {
       frame(r);
       frame(r);
       frame(r);
@@ -612,6 +648,35 @@ describe("FrameBudget band growth: how far every pass's estimate is scaled when 
     expect(r.budget.growth).toBe(8);
     for (let f = 0; f < 600 && r.budget.growth > 1; f++) {
       frame(r);
+      r.fences.catchUp();
+    }
+    expect(r.budget.growth).toBe(1);
+  });
+
+  it("grows only on a band cut at the current growth, so it never reaches a growth that cuts nothing finer and returns to 1", () => {
+    // The flat force pass at 1M and 120 Hz: 16 bands at growth 1, 32 at 2, and 64 (MAX_BANDS) at both 4 and
+    // 8. A pass keeps the bands it started with, and at k = 1 a 32-band pass outlives the miss that doubles
+    // the growth to 4. A late band of it said "growth 8 would cut this finer" (64 > 32), and growth 4 already
+    // does. Growing on it reached 8, where no frame can hold two bands that half the growth cuts coarser (64
+    // at 4 too): measured on the real GPU, the growth then stayed at 8 for ~3,150 frames after a stall.
+    const r = rig({ nodes: 1_000_000, rows: 1_000 });
+    const hz120 = { intervalMs: 1000 / 120 };
+    for (let f = 0; f < 3; f++) {
+      frame(r, hz120);
+      r.fences.catchUp();
+    }
+    expect(bands(r)).toBe(16);
+    let maxGrowth = 1;
+    for (let miss = 0; miss < 16; miss++) {
+      for (let f = 0; f < 5; f++) frame(r, hz120); // the fifth frame finds four in flight: a miss
+      r.fences.catchUp();
+      maxGrowth = Math.max(maxGrowth, r.budget.growth);
+    }
+    expect(maxGrowth).toBeGreaterThan(1);
+    expect(maxGrowth, "growth 8 cuts the pass no finer than growth 4").toBeLessThanOrEqual(4);
+    let frames = 0;
+    for (; frames < 2_000 && r.budget.growth > 1; frames++) {
+      frame(r, hz120);
       r.fences.catchUp();
     }
     expect(r.budget.growth).toBe(1);
@@ -654,15 +719,20 @@ describe("itemCostMs — the flat layout's static cost model behind the budget",
 
 /**
  * A GPU that runs each frame's work in submission order, starting no earlier than the frame's rAF time, at
- * `factor` × the work's estimate per pass: its fences signal when the work before them is done.
+ * `factor` × the work's estimate per pass: its fences signal when the work before them is done, and a poll
+ * sees fence `i` signalled `latencyMs(i)` after that (the browser's sync status can trail the GPU).
  */
 class LaggingGpu implements FenceSource<number> {
   private readonly doneAt: number[] = [];
+  private readonly latencyMs: (fence: number) => number;
   /** The current frame's rAF time. */
   now = 0;
   /** Real GPU ms encoded in the current frame so far. */
   pendingMs = 0;
   private busyUntil = 0;
+  constructor(latencyMs: (fence: number) => number = () => 0) {
+    this.latencyMs = latencyMs;
+  }
   insert(): number {
     this.busyUntil = Math.max(this.busyUntil, this.now) + this.pendingMs;
     this.pendingMs = 0;
@@ -670,18 +740,31 @@ class LaggingGpu implements FenceSource<number> {
     return this.doneAt.length - 1;
   }
   poll(fence: number): FenceStatus {
-    return (this.doneAt[fence] ?? Number.POSITIVE_INFINITY) <= this.now ? "signaled" : "pending";
+    return (this.doneAt[fence] ?? Number.POSITIVE_INFINITY) + this.latencyMs(fence) <= this.now ? "signaled" : "pending";
   }
   drop(): void {}
 }
 
+/** How a {@link lagging} run went: how often the band growth changed, its largest and last value, the ticks done. */
+interface LaggingRun {
+  changes: number;
+  maxGrowth: number;
+  growth: number;
+  ticks: number;
+}
+
 /**
  * Stream ticks of one large pass (whose real GPU time is `factor` × its estimate) and 16 small passes of
- * 0.5 ms (at their estimate) through the real schedule and budget at 120 Hz for `frames` frames. Returns
- * how often the band growth changed, its largest value, and the ticks done.
+ * 0.5 ms (at their estimate) through the real schedule and budget at 120 Hz for `frames` frames. `stalls`:
+ * frames that queue `stallMs` of other GPU work ahead of their items; `latencyMs`: the fences' observation
+ * latency ({@link LaggingGpu}).
  */
-function lagging(large: { costMs: number; fixedMs: number; factor: number }, frames: number): { changes: number; maxGrowth: number; ticks: number } {
-  const gpu = new LaggingGpu();
+function lagging(
+  large: { costMs: number; fixedMs: number; factor: number },
+  frames: number,
+  opts: { stalls?: ReadonlySet<number>; stallMs?: number; latencyMs?: (fence: number) => number } = {},
+): LaggingRun {
+  const gpu = new LaggingGpu(opts.latencyMs);
   const budget = new FrameBudget(gpu, () => 0);
   const pass = (costMs: number, fixedMs: number, rows: number, factor: number): StreamStage => ({
     costMs,
@@ -706,6 +789,7 @@ function lagging(large: { costMs: number; fixedMs: number; factor: number }, fra
   let growth = budget.growth;
   for (let f = 0; f < frames; f++) {
     gpu.now = f * (1000 / 120);
+    if (opts.stalls?.has(f)) gpu.pendingMs += opts.stallMs ?? 0;
     budget.beginFrame(gpu.now);
     schedule.frame(budget.open(), () => true, () => false);
     budget.endFrame();
@@ -713,17 +797,36 @@ function lagging(large: { costMs: number; fixedMs: number; factor: number }, fra
     growth = budget.growth;
     maxGrowth = Math.max(maxGrowth, growth);
   }
-  return { changes, maxGrowth, ticks };
+  return { changes, maxGrowth, growth, ticks };
 }
 
 describe("FrameBudget band growth on a stream of passes of very different sizes, on a GPU slower than estimated", () => {
   it("does not oscillate: frames of small passes are no evidence that a band twice the size fits", () => {
-    // A 6 ms pass (0.1 ms per band) running at 4× its estimate: 3 bands of 8.4 ms real at growth 1, more than
-    // a 120 Hz frame; 5 bands of 5.2 ms at growth 2. Frames of the 0.5 ms passes fit, but two bands of the
-    // large pass never finish within a frame, so the growth must stay where one band does.
-    const run = lagging({ costMs: 6, fixedMs: 0.1, factor: 4 }, 6_000);
+    // A 6 ms pass (0.1 ms per band) running at 8× its estimate: 3 bands of 16.8 ms real at growth 1, so one
+    // band per frame falls behind the gate; 5 bands of 10.4 ms at growth 2, which keep up. Frames of the
+    // 0.5 ms passes fit, but two bands of the large pass never finish within a frame, so the growth must stay
+    // where one band does. (Counting every frame of two or more items as evidence changes it 7 times here.)
+    const run = lagging({ costMs: 6, fixedMs: 0.1, factor: 8 }, 6_000);
     expect(run.maxGrowth).toBeGreaterThan(1);
     expect(run.changes, `the growth changed ${run.changes} times`).toBeLessThanOrEqual(2);
+  });
+
+  it("does not grow while one band per frame keeps up, however far over the estimate the frames of several items run", () => {
+    // At 4× the 6 ms pass's bands are 8.4 ms real: over a 120 Hz frame, but one per frame never falls 33 ms
+    // behind, so only k answers the late frames of several items.
+    const run = lagging({ costMs: 6, fixedMs: 0.1, factor: 4 }, 6_000);
+    expect(run.maxGrowth).toBe(1);
+  });
+
+  it("returns to growth 1 after transient stalls on a GPU at its estimates whose fences are often seen a frame late", () => {
+    // The flat force pass at 325k (13 ms) at 120 Hz, the GPU at its estimates, eight 45 ms stalls from other
+    // GPU work. Every other fence is seen 4 ms after it signalled, so a full frame (5 ms of work) is seen a
+    // frame late: on the real GPU (M1 Max, ANGLE Metal, 120 Hz) 30-35% of full frames' fences and about
+    // half of the pair frames' were. The frames seen on time still bring the growth back.
+    const stalls = new Set(Array.from({ length: 8 }, (_, i) => 20 + 20 * i));
+    const run = lagging({ costMs: 13, fixedMs: 0, factor: 1 }, 1_200, { stalls, stallMs: 45, latencyMs: (fence) => (fence % 2 === 0 ? 4 : 0) });
+    expect(run.maxGrowth).toBeGreaterThan(1);
+    expect(run.growth).toBe(1);
   });
 
   it("does not grow for a pass bound by its fixed cost, which more bands cannot shrink", () => {
@@ -741,6 +844,19 @@ describe("FrameBudget band growth on a stream of passes of very different sizes,
     const frames = 6_000;
     const run = lagging({ costMs: 0.6, fixedMs: 18.1, factor: 3.2 }, frames);
     const floor = (3.2 * 18.7) / (1000 / 120);
+    expect(run.maxGrowth).toBe(1);
+    expect(frames / run.ticks, `${run.ticks} ticks in ${frames} frames`).toBeLessThan(floor + 3);
+  });
+
+  it("still halves k for a late frame of several items when one of them is a band that cannot be cut finer", () => {
+    // The nested gather at 1M (9 ms, 2.09 ms of tail per band: 4 bands of 4.34 ms, within the 5 ms budget)
+    // running at 3× its estimate (13 ms a band). Its bands share frames with the small passes, so its late
+    // frames hold several items and halve k, and the small passes lose frames to the band's lateness: ~10
+    // frames a tick, where the 4 bands alone need 6.25 and the small passes ~1. Pinned, as decision D7's
+    // trade-off: only a late frame of one such band leaves k alone.
+    const frames = 6_000;
+    const run = lagging({ costMs: 9, fixedMs: 2.09, factor: 3 }, frames);
+    const floor = (4 * 3 * (2.09 + 9 / 4) + 16 * 0.55) / (1000 / 120);
     expect(run.maxGrowth).toBe(1);
     expect(frames / run.ticks, `${run.ticks} ticks in ${frames} frames`).toBeLessThan(floor + 3);
   });
