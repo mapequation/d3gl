@@ -556,10 +556,11 @@ origin. It releases to normal zoom/pan once it settles — or as soon as you zoo
 `fit` means the same on every layout: the camera **ends on the final layout's exact bounding box**, and
 gets there with the layout. A streamed layout is reframed frame by frame; a layout with a `transition`
 eases the camera along with the nodes ([below](#re-clustering-warm-re-layout-and-transitions)); a
-layout that lands in one go (`"positions"`, `"force"`) is framed once. A cold nested map streams
-top-down, each depth collapsing its unplaced nodes onto their module's centre, so while it streams it
-is framed on a box it is known to end inside — the root disc, then each depth's placed discs — and the
-camera only zooms in as depths land, ending on the nodes' own box like any other layout.
+layout that lands in one go (`"positions"`, `"force"`, a state network's too) is framed once. A cold
+nested map streams top-down, each depth collapsing its unplaced nodes onto their module's centre, so
+while it streams it is framed on a box the worker knows it will end inside — the root disc, then each
+depth's placed discs — and the camera only zooms in as depths land, ending on the nodes' own box like
+any other layout.
 
 The **Layout** control switches to the **nested** module layout (`layout({ nested })`): each module's
 children are laid out inside its own disc, arranged by their sibling links, so every module stays a
@@ -669,9 +670,10 @@ await net.whenSettled(); // resolves when the transition ends
   jump — even when it grew. The view's visible rectangle moves in a straight line as the nodes do, so
   the zoom is monotonic and a node on screen at both ends stays on screen throughout. The camera waits
   where it is while the layout computes the new map, and it is yours again the moment you zoom, pan or
-  drag a node (or call `setTransform`) — it never pulls the view away from you. Its per-frame cost is
-  constant: the new map's box is measured once, when the transition starts. Without `fit` the camera
-  stays where it is.
+  drag a node (or call `setTransform`) — it never pulls the view away from you. If the view is resized,
+  or the node size changes, on the way, the camera re-aims from where it is and still ends framed. Its
+  per-frame cost is constant: the new map's box is measured once, when the transition starts. Without
+  `fit` the camera stays where it is.
 
 In the example above, switch **Layout** between *Force* and *Nested*: the nested map is computed warm from
 the force layout's positions and the nodes glide into their modules' discs while the camera eases along to

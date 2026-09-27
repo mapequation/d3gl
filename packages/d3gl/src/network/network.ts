@@ -326,9 +326,10 @@ export interface NetworkLayoutOptions {
    * - a layout with a {@link transition} eases the camera along with the nodes, from the current view to
    *   the one framing the final layout, on the same easing in the same frames — so a re-clustering ends
    *   framed, with no jump. The world rectangle the view shows moves in a straight line, as the nodes do:
-   *   the zoom is monotonic, and a node on screen at both ends stays on screen throughout;
-   * - any other layout (`"positions"`, `"force"`, a warm `nested` map without a transition) is framed once,
-   *   when it lands.
+   *   the zoom is monotonic, and a node on screen at both ends stays on screen throughout. A resize or a
+   *   node-size change mid-ease re-aims the camera from where it is, so it still ends framed, with no jump;
+   * - any other layout (`"positions"`, `"force"`, a warm `nested` map without a transition, and a state
+   *   network's layouts alike) is framed once, when it lands.
    *
    * The last frame is the landed layout's exact box, every node included; then the view is the user's
    * again. It is also released — left where it is, never reframed — as soon as the user zooms, pans or
@@ -340,10 +341,10 @@ export interface NetworkLayoutOptions {
    * flung-out stragglers: at most min(64, 0.5% of the nodes) per side, and only when they sit 10-30% or more
    * of the layout's size beyond the rest, so a fling-out cannot shrink the rest to a dot mid-run. A small
    * disconnected component that far out is dropped the same way and streams just outside the frame. A cold
-   * nested map on the worker streams top-down, each depth's leaves collapsed onto their module centres, so while it
-   * streams it is framed on a box its final layout is known to lie in — the root disc, then each depth's
-   * placed discs — which only shrinks as depths land: the camera only zooms in, down to the leaves' exact
-   * box. The pad covers the largest node glyph; with LOD on, an aggregate glyph larger than that can
+   * nested map streams top-down on the worker, each depth's leaves collapsed onto their module centres, so
+   * while it streams it is framed on a box the worker knows its final layout lies in — the root disc, then
+   * each depth's placed discs — which only shrinks as depths land: the camera only zooms in, down to the
+   * leaves' exact box. A stream with no such bound frames its live leaves, like a force layout. The pad covers the largest node glyph; with LOD on, an aggregate glyph larger than that can
    * overhang the frame's edge margin. Cost: the box is O(nodes) per streamed frame, only while the fit is
    * on; a transition computes it once, when it starts, and moves the camera in O(1) per frame.
    */
