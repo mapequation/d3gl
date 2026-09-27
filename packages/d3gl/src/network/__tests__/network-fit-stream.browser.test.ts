@@ -350,6 +350,61 @@ describe("streaming fit with zoom enabled (#327)", () => {
     expect(zoomTransform(host)).toMatchObject(target);
     net.destroy();
   }, STREAM_TIMEOUT_MS);
+
+  it("a node grabbed mid-stream hands the view to the user: the camera holds still under the cursor (#427)", async () => {
+    const host = makeHost();
+    const net = new FixtureNetwork(host, { width: W, height: H, backend: "webgl" });
+    await net.whenReady();
+    const graph = randomGraph(3000, 19);
+    // Every streamed frame is laid out as a fixture, so the node to grab sits where the test sees it: a
+    // disc, with node 0 alone just outside it.
+    const R = 200;
+    const disc = new Float32Array(2 * graph.nodeCount);
+    const golden = Math.PI * (3 - Math.sqrt(5));
+    for (let i = 1; i < graph.nodeCount; i++) {
+      const d = R * Math.sqrt(i / graph.nodeCount);
+      disc[2 * i] = d * Math.cos(i * golden);
+      disc[2 * i + 1] = d * Math.sin(i * golden);
+    }
+    disc[0] = 1.15 * R;
+    let fixture = disc;
+    let frames = 0;
+    net.beforeFrame = () => {
+      graph.positions.set(fixture);
+      frames++;
+    };
+    net.data(graph).style({ nodeRadius: 6, sizeMode: "screen" }).enableZoom([0.001, 100]).interactive({ draggable: true });
+    net.layout({ backend: "worker", fit: true, multilevel: false, iterations: 300 });
+    const settled = net.whenSettled();
+    await until(() => frames >= 2);
+    await nextFrame();
+    await nextFrame();
+
+    const grabbed = net.view;
+    const r = host.getBoundingClientRect();
+    const pointer = (type: string, sx: number, sy: number): void => {
+      host.dispatchEvent(new PointerEvent(type, { clientX: r.left + sx, clientY: r.top + sy, bubbles: true, button: 0, pointerId: 1 }));
+    };
+    const [x, y] = [grabbed.k * (disc[0] ?? NaN) + grabbed.x, grabbed.k * (disc[1] ?? NaN) + grabbed.y];
+    pointer("pointerdown", x, y);
+    pointer("pointermove", x - 20, y + 10);
+    expect(graph.positions[0], "non-vacuity: the grab did not take hold of node 0").toBeCloseTo((x - 20 - grabbed.x) / grabbed.k, 3);
+
+    // The layout grows 3× under the held node: a fit still following it would zoom out on the next frame.
+    fixture = disc.map((v) => 3 * v);
+    const f0 = frames;
+    await until(() => frames >= f0 + 2);
+    expect(frames, "the stream stopped while the node was held").toBeGreaterThanOrEqual(f0 + 2);
+    await nextFrame();
+    expect(net.view, "a streamed frame reframed the camera under the held node").toEqual(grabbed);
+
+    pointer("pointerup", x - 20, y + 10);
+    await settled;
+    await nextFrame();
+    expect(net.view, "the settle reframed the camera after a grab").toEqual(grabbed);
+    expect(zoomTransform(host)).toMatchObject(grabbed);
+    net.destroy();
+  }, STREAM_TIMEOUT_MS);
 });
 
 describe("stragglers are trimmed only while the layout streams; the settled fit frames the exact box", () => {
