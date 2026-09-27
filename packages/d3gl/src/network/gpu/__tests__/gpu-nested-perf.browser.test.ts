@@ -237,6 +237,12 @@ function assertSignatures(leg: Leg): void {
   const onePixel = events.filter((e) => e.kind === "layout-draw" && e.viewport1x1 && e.count >= N);
   expect(onePixel.length, "a draw of ≥ N points into a 1×1 viewport").toBe(0);
 
+  // The real transport keeps a frame's estimated layout GPU work within its budget, readback frames
+  // included (#382): past the first item the budget admits one only while the sum fits.
+  frames.forEach((s, f) => {
+    if (s.items > 1) expect(s.itemsMs, `frame ${f}: ${s.items} items`).toBeLessThanOrEqual(s.budgetMs + 1e-9);
+  });
+
   const finalHarvest = frames.findIndex((s) => s.harvestedTicks === STREAM_TICKS);
   expect(finalHarvest, `harvested ticks: ${frames.filter((s) => s.harvested).map((s) => s.harvestedTicks).join(", ")}; ticks done ${frames.map((s) => s.ticksDone).slice(-5).join(", ")}`).toBeGreaterThanOrEqual(0);
   expect(finalHarvest).toBeLessThan(leg.settledAfterFrame);

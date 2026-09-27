@@ -332,6 +332,11 @@ function assertSignatures(leg: Leg): void {
     expect((repaints[i] ?? 0) - (repaints[i - 1] ?? 0)).toBeGreaterThanOrEqual(MIN_FRAME_MS - 2);
   }
 
+  // A frame's estimated layout GPU work stays within its budget (#382).
+  frames.forEach((s, f) => {
+    if (s.items > 1) expect(s.itemsMs, `frame ${f}: ${s.items} items`).toBeLessThanOrEqual(s.budgetMs + 1e-9);
+  });
+
   // settled only after the final positions were harvested.
   const finalHarvest = frames.findIndex((s) => s.harvestedTicks === ITERATIONS);
   expect(finalHarvest).toBeGreaterThanOrEqual(0);
@@ -404,9 +409,12 @@ function assertDrag(label: string, leg: DragLeg, transportP95Ms: number, encodeM
   expect(heldTicks, "no reheat ticks while held").toBeGreaterThan(0);
   expect(repaints.length, "no layout repaint during the drag").toBeGreaterThan(0);
 
-  // The transport's per-frame bounds hold through the drag and the re-cool.
+  // The transport's per-frame bounds hold through the drag and the re-cool, and so does the GPU budget (#382).
   expect(quantile(transport, 0.95)).toBeLessThan(transportP95Ms);
   expect(median(encode)).toBeLessThan(encodeMedianMs);
+  frames.forEach((s, f) => {
+    if (s.items > 1) expect(s.itemsMs, `drag frame ${f}: ${s.items} items`).toBeLessThanOrEqual(s.budgetMs + 1e-9);
+  });
 
   // GL signatures: every copy into a PBO, one fence per frame, the harvest before the frame's layout draws,
   // and no GPU object created by any drag frame or pointer move.

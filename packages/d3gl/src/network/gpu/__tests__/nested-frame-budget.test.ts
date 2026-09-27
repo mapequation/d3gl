@@ -8,7 +8,8 @@
  *
  * The composition's passes are work items, so a readback often waits a frame for budget before its copy;
  * the throttle times a readback from its start, so the repaints still land on their cadence (timed from the
- * copy, three in four repaints at 1M came a frame late: every 67 ms at 60 Hz instead of 50).
+ * copy, 60 of 80 repaints at 1M came a frame late at 60 Hz, a median 67 ms apart instead of 50, and 89 of 97
+ * at 120 Hz, 58 ms apart).
  *
  * Before #382 two items could not be cut: compact step 1's prep (predict, springs, integrate, the
  * reductions, the collision cells and scatters) and the composition a copy frame added before its copy,
@@ -56,10 +57,9 @@ interface Run {
 
 /**
  * Stream a cold nested layout of `plan` at `hz` through the real schedule and budget (see the file header),
- * with readbacks on the real repaint throttle's cadence, wired as `GpuStream` wires it. `timeFromCopy`: time
- * a readback's latency from its copy instead of its start (what the stream did before; for comparison).
+ * with readbacks on the real repaint throttle's cadence, wired as `GpuStream` wires it.
  */
-function stream(plan: NestedPlan, hz: number, iterations: number, timeFromCopy = false): Run {
+function stream(plan: NestedPlan, hz: number, iterations: number): Run {
   const organise = Math.ceil(iterations * NESTED.ORGANISE);
   const total = organise + COLLISION_STEPS * (iterations - organise);
   const run: Run = { frames: [], events: [], maxBandMs: 0, maxSmallBandMs: 0, ticks: 0, copies: 0, repaints: [] };
@@ -111,11 +111,8 @@ function stream(plan: NestedPlan, hz: number, iterations: number, timeFromCopy =
     tickEnd: () => {
       run.ticks++;
     },
-    readbackStart: () => {
-      if (!timeFromCopy) throttle.readbackStarted(now);
-    },
+    readbackStart: () => throttle.readbackStarted(now),
     copy: () => {
-      if (timeFromCopy) throttle.readbackStarted(now);
       run.copies++;
       pending = true;
       ready = false;

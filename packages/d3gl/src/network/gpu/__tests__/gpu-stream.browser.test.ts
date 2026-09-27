@@ -63,6 +63,29 @@ describe("GPU streaming run (#352)", () => {
     handle.stop();
   });
 
+  it("reports the ticks of the copy a frame harvested, not those of a copy it issued later in the frame", async () => {
+    // frameEvery: 1 — a harvest frame goes on to encode ticks and copy them again, in the same frame. A copy
+    // carries the ticks done when it was issued (at most those at the end of its frame), and a harvest reads
+    // the newest copy issued in an earlier frame.
+    const g = ring(300);
+    const samples: GpuFrameSample[] = [];
+    const unobserve = observeGpuLayoutFrames((s) => samples.push({ ...s }));
+    const handle = startGpuLayout(device, g, { width: 400, height: 300, iterations: 60, frameEvery: 1 }, () => {});
+    await handle.settled;
+    unobserve();
+    handle.stop();
+    let copiedBy = -1; // ticks done by the end of the last earlier frame that copied
+    let both = 0;
+    for (const [f, s] of samples.entries()) {
+      if (s.harvested) {
+        expect(s.harvestedTicks, `frame ${f}`).toBeLessThanOrEqual(copiedBy);
+        if (s.copied && s.ticksDone > copiedBy) both++;
+      }
+      if (s.copied) copiedBy = s.ticksDone;
+    }
+    expect(both, "a frame that harvested and then copied fresh ticks").toBeGreaterThan(0);
+  });
+
   it("an explicit frameEvery allows at most one onFrame per that many ticks", async () => {
     const g = ring(300);
     let frames = 0;

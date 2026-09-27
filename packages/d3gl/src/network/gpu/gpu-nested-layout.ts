@@ -16,7 +16,7 @@ import { TILE_MIN_SIDE, assertAtlasFits, bandRows, packTiles, segmentSoftening, 
 import type { PackedPositions } from "./async-readback.js";
 import type { StreamSolver } from "./gpu-stream.js";
 import type { StreamStage } from "./stream-schedule.js";
-import { largestModule, nestedPlan, type NestedStep } from "./nested-plan.js";
+import { largestModule, nestedPlan, type NestedPlanSizes, type NestedStep } from "./nested-plan.js";
 import { NESTED_LARGE_MAX, type NestedSolverTopology } from "./nested-topology.js";
 import { EXACT_MAX } from "../nested-layout.js";
 
@@ -171,6 +171,11 @@ export class GpuNestedLayout implements StreamSolver {
    * the render target is a feedback loop, and WebGL drops the draw, whether the shader reads it or not.
    */
   private readonly reduceBindings: readonly [Record<string, Texture>, Record<string, Texture>];
+  /**
+   * The sizes its passes are cut over, read off the textures it built — what `nestedPlanSizes` derives from
+   * the topology alone, for checking the frame budget at a scale without a GPU.
+   */
+  readonly planSizes: NestedPlanSizes;
   /** The passes of each kind of stream tick, and of a readback (see the file header). */
   private readonly organisePlan: readonly StreamStage[];
   private readonly compactPlans: readonly [readonly StreamStage[], readonly StreamStage[]];
@@ -365,7 +370,7 @@ export class GpuNestedLayout implements StreamSolver {
       };
 
       // ── The passes of each stream tick and of a readback (see the file header) ──
-      const plan = nestedPlan({
+      this.planSizes = {
         leaves: topo.leafCount,
         slotRows: height,
         treeRows: this.reduce.level1Rows,
@@ -374,7 +379,8 @@ export class GpuNestedLayout implements StreamSolver {
         hubRows: this.springs.hubRows,
         composeRows: this.compose.height,
         largestModule: largestModule(topo),
-      });
+      };
+      const plan = nestedPlan(this.planSizes);
       const bind = (steps: readonly NestedStep[]): StreamStage[] =>
         steps.map((step) => ({ costMs: step.costMs, fixedMs: step.fixedMs, rows: step.rows, run: this.passOf(step) }));
       this.organisePlan = bind(plan.organise);

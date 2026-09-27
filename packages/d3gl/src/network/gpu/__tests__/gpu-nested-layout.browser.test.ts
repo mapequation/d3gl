@@ -9,7 +9,8 @@ import { NestedJacobiReference } from "./nested-jacobi-reference.js";
 import { GpuNestedLayout } from "../gpu-nested-layout.js";
 import { nestedSolverResult, nestedSolverTopology, type NestedSolverTopology } from "../nested-topology.js";
 import { NESTED, nestedLayout, type NestedLayoutParams, type NestedLayoutResult, type NestedLayoutTopology } from "../../nested-layout.js";
-import { expectNested, kids, linkTightness, meanShift, reclustered, rootOf, similar, spreadOf, threeLevel, topo, twoLevel } from "../../__tests__/nested-fixtures.js";
+import { expectNested, infomapLikeTree, kids, linkTightness, meanShift, reclustered, rootOf, similar, spreadOf, threeLevel, topo, twoLevel } from "../../__tests__/nested-fixtures.js";
+import { nestedPlanSizes } from "../nested-plan.js";
 import { COLLISION_RELAX, COLLISION_STEPS } from "../passes/collision.js";
 
 /** Minimal seeded LCG PRNG. */
@@ -79,6 +80,31 @@ function makeTree(groups: readonly number[], tops: number, linksPerChild: number
   const metric = new Float32Array(leaves);
   for (let i = 0; i < leaves; i++) metric[i] = Math.pow(rnd() + 1e-3, -1.5);
   return { topo: { size, leafCount: leaves, childOffset, children, parent, superEdgeOffset, superEdgeTarget, superEdgeFlow }, size: metric };
+}
+
+/**
+ * `tree` with `spokes` more super-edges from its first leaf to as many of its siblings (the first leaves of
+ * its module): a row of the springs' CSR longer than `SPRING_CHUNK`, which the springs cut into hub chunks.
+ */
+function withHub(tree: NestedLayoutTopology, spokes: number): NestedLayoutTopology {
+  const edges = tree.superEdgeOffset ?? new Uint32Array(tree.size + 1);
+  const offset = new Uint32Array(tree.size + 1);
+  const target: number[] = [];
+  const flow: number[] = [];
+  for (let g = 0; g < tree.size; g++) {
+    for (let e = edges[g] ?? 0; e < (edges[g + 1] ?? 0); e++) {
+      target.push(tree.superEdgeTarget?.[e] ?? 0);
+      flow.push(tree.superEdgeFlow?.[e] ?? 0);
+    }
+    if (g === 0) {
+      for (let t = 1; t <= spokes; t++) {
+        target.push(t);
+        flow.push(1);
+      }
+    }
+    offset[g + 1] = target.length;
+  }
+  return { ...tree, superEdgeOffset: offset, superEdgeTarget: Uint32Array.from(target), superEdgeFlow: Float32Array.from(flow) };
 }
 
 /** Run `ticks` solve ticks of `layout`, every item unsliced. */
@@ -266,6 +292,24 @@ describe("GPU nested layout (#355) against its Jacobi reference", () => {
     } finally {
       whole.destroy();
       sliced.destroy();
+    }
+  });
+
+  it("cuts its passes over the sizes nestedPlanSizes derives from the topology alone (#382)", () => {
+    // The 1M frame-budget guard (nested-frame-budget.test.ts) streams the plan of nestedPlanSizes: it must be
+    // the plan the layout binds. Maps with the tile pyramid, hub rows, exact segments and several depths.
+    const { topo: tree, size } = makeTree([600, 45, 90, 12], 2, 2, 13);
+    const hubbed = nestedSolverTopology(withHub(tree, 300), { size, iterations: 4 });
+    const { topo: big, flow } = infomapLikeTree(20_000);
+    for (const solver of [hubbed, nestedSolverTopology(big, { size: flow, iterations: 4 })]) {
+      const layout = new GpuNestedLayout(device, solver);
+      try {
+        expect(layout.planSizes.levelRows).toBeGreaterThan(0);
+        if (solver === hubbed) expect(layout.planSizes.hubRows, "the fixture has hub rows").toBeGreaterThan(0);
+        expect(nestedPlanSizes(solver)).toEqual(layout.planSizes);
+      } finally {
+        layout.destroy();
+      }
     }
   });
 
