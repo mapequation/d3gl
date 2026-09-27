@@ -253,37 +253,41 @@ describe("LOD aggregates only where glyphs would overlap (#426)", () => {
     }
   });
 
-  it("a structure stream takes a new style mid-run: the worker's crowding follows the new radii", async () => {
-    // While the worker streams, only it computes the crowding (from the leaf sizing it was sent); a style change
-    // must reach it, or the frames keep the old radii until the layout settles.
+  it("a structure stream takes a new style: the worker's next frames compute the crowding with it", async () => {
+    // Settled, a style change's crowding is computed on the main thread. A drag then reheats the worker, whose
+    // frames write the crowding again, with the sizing it was last sent: the style change must have reached it.
     const { net, host } = makeNet();
-    let settled = false;
     try {
       await net.whenReady();
       const g = ring(300);
       net.data(g).style({ sizeMode: "screen", nodeRadius: 60 }).lod({ source: "structure", maxAggregateRadius: 18 });
-      // 60 frames of 500 ticks each: a few seconds of streaming, a frame every few tens of ms.
-      net.layout({ backend: "worker", iterations: 30_000 });
-      void net.whenSettled().then(() => {
-        settled = true;
-      });
-      const glyphs = (): number => {
-        net.setTransform(frame(g.positions));
-        return net.declutterStats?.glyphs ?? NaN;
-      };
-      await new Promise((r) => setTimeout(r, 300));
+      net.layout({ backend: "worker", iterations: 300 });
+      await net.whenSettled();
       expect(net.lodSource).toBe("worker");
-      const big = glyphs(); // 60 px glyphs overlap everywhere: aggregates
-      expect(big).toBeLessThan(100);
+      const t = frame(g.positions);
+      net.setTransform(t);
+      const big = net.declutterStats?.glyphs ?? NaN;
+      expect(big, "60 px glyphs overlap everywhere: aggregates").toBeLessThan(100);
       net.style({ sizeMode: "screen", nodeRadius: 0.5 });
-      // The worker's next frames compute the crowding with the half-pixel glyphs: they open while it streams.
-      let small = glyphs();
-      for (let i = 0; i < 60 && !settled && small <= 2 * big; i++) {
-        await new Promise((r) => setTimeout(r, 50));
-        small = glyphs();
-      }
-      expect(settled, "the crowding followed the new style only once the layout settled").toBe(false);
-      expect(small, "the crowding follows the half-pixel glyphs").toBeGreaterThan(2 * big);
+      net.setTransform(t);
+      expect(net.declutterStats?.glyphs ?? NaN, "half-pixel glyphs clear: every node").toBeGreaterThan(2 * big);
+      // Grab node 0 (a leaf now) and hold it: the worker reheats and streams frames while it is held.
+      net.interactive({ draggable: true });
+      const r = host.getBoundingClientRect();
+      const ev = (type: string, x: number, y: number): boolean =>
+        (type === "pointerdown" ? host : window).dispatchEvent(new PointerEvent(type, { clientX: r.left + x, clientY: r.top + y, bubbles: true, button: 0, pointerId: 1 }));
+      const x = t.k * (g.positions[0] ?? 0) + t.x;
+      const y = t.k * (g.positions[1] ?? 0) + t.y;
+      const before = [g.positions[300], g.positions[301]];
+      ev("pointerdown", x, y);
+      ev("pointermove", x + 3, y + 3);
+      await new Promise((res) => setTimeout(res, 500));
+      net.setTransform(t);
+      const held = net.declutterStats?.glyphs ?? NaN;
+      const moved = g.positions[300] !== before[0] || g.positions[301] !== before[1];
+      ev("pointerup", x + 3, y + 3);
+      expect(moved, "precondition: the drag reheated the worker").toBe(true);
+      expect(held, "the worker's frames compute the crowding with the half-pixel glyphs").toBeGreaterThan(2 * big);
     } finally {
       net.stopLayout();
       net.destroy();
