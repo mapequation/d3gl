@@ -20,7 +20,9 @@
  *   per frame; no GPU object created per frame once the stream runs; repaints at least `minFrameMs`
  *   (50 ms) apart; `settled` resolves only after the final tick's positions were harvested.
  * - **Throughput:** ticks/s under rendering, reported and floored against the GPU-only tick rate
- *   measured in the same file (a separate solver, before the stream).
+ *   measured in the same file (a separate solver, before the stream). The GPU-only rate is also reported
+ *   with the tick cut into the static band counts of a 60 Hz and a 120 Hz budget, with the main-thread
+ *   encode time per tick, so the cost of band slicing reads apart from the budget share.
  *
  * The LOD-on leg reports the main-thread ms per layout repaint (on this path the main thread still
  * builds and refits the LOD tree — PR 3c moves the refit to the worker and compares against the worker
@@ -39,6 +41,7 @@ import { network, type Network } from "../../network.js";
 import { buildGraph, type NetworkGraph } from "../../graph.js";
 import { DEFAULT_FORCE, seedPositions } from "../../force.js";
 import { GpuForceLayout } from "../gpu-force-layout.js";
+import { DEFAULT_BUDGET_MS, frameBudgetMs, staticBands } from "../frame-budget.js";
 import { observeGpuLayoutFrames, type GpuFrameSample } from "../gpu-stream.js";
 import { MIN_FRAME_MS } from "../repaint-throttle.js";
 import { makeTestDevice } from "./_device.js";
@@ -335,6 +338,29 @@ function assertSignatures(leg: Leg): void {
   expect(finalHarvest).toBeLessThan(leg.settledAfterFrame);
 }
 
+/**
+ * GPU-only ticks/s over `ticks` ticks each cut into `bands` row bands (P, F_0 … F_{bands−1}, I), fenced by a
+ * synchronous read, and the main-thread encode ms per tick. One warm-up tick first.
+ */
+function slicedRate(solo: GpuForceLayout, out: Float32Array, bands: number, ticks: number): { ticksPerSec: number; encodeMsPerTick: number } {
+  const tick = (): void => {
+    solo.beginTick();
+    for (let b = 0; b < bands; b++) solo.forceBand(b, bands);
+    solo.integrate();
+  };
+  tick();
+  solo.readPositions(out);
+  let encode = 0;
+  const t0 = performance.now();
+  for (let t = 0; t < ticks; t++) {
+    const e0 = performance.now();
+    tick();
+    encode += performance.now() - e0;
+  }
+  solo.readPositions(out);
+  return { ticksPerSec: (ticks * 1000) / (performance.now() - t0), encodeMsPerTick: encode / ticks };
+}
+
 function report(label: string, leg: Leg): { transport: number[]; encode: number[]; ticksPerSec: number } {
   const { frames } = leg;
   const transport = frames.map((s) => s.harvestMs + s.encodeMs);
@@ -410,6 +436,7 @@ describe("GPU layout streaming per frame (#352) — network().layout({ backend: 
   let net: Network;
   let graph: NetworkGraph;
   let gpuOnlyTicksPerSec = 0;
+  let gpuOnlyReport = "";
 
   beforeAll(async () => {
     graph = clustered(N, 0x5712);
@@ -425,8 +452,18 @@ describe("GPU layout streaming per frame (#352) — network().layout({ backend: 
       solo.readPositions(out);
       const t0 = performance.now();
       solo.runFrame(10);
+      const encodeMs = performance.now() - t0;
       solo.readPositions(out);
       gpuOnlyTicksPerSec = 10_000 / (performance.now() - t0);
+      gpuOnlyReport = `B=1 ${gpuOnlyTicksPerSec.toFixed(1)} ticks/s (encode ${(encodeMs / 10).toFixed(2)} ms/tick)`;
+      // The static band counts the stream starts from at 60 Hz and 120 Hz (report only; 5 ticks keep the
+      // SwiftShader tier's cost small).
+      const sliced = new Set([60, 120].map((hz) => staticBands(N, frameBudgetMs(DEFAULT_BUDGET_MS, 1000 / hz), solo.atlasRows)));
+      for (const bands of sliced) {
+        if (bands === 1) continue;
+        const { ticksPerSec, encodeMsPerTick } = slicedRate(solo, out, bands, 5);
+        gpuOnlyReport += `; B=${bands} ${ticksPerSec.toFixed(1)} ticks/s (encode ${encodeMsPerTick.toFixed(2)} ms/tick)`;
+      }
       solo.destroy();
     } finally {
       device.destroy();
@@ -455,7 +492,7 @@ describe("GPU layout streaming per frame (#352) — network().layout({ backend: 
   it("LOD off: bounded transport main thread, async readback signatures, throughput", async () => {
     const leg = await streamLeg(net, graph, false);
     const { transport, encode, ticksPerSec } = report("LOD off", leg);
-    console.log(`  GPU-only tick rate: ${gpuOnlyTicksPerSec.toFixed(1)} ticks/s`);
+    console.log(`  GPU-only tick rate: ${gpuOnlyReport}`);
     assertSignatures(leg);
     expect(quantile(transport, 0.95)).toBeLessThan(TRANSPORT_P95_MS);
     expect(median(encode)).toBeLessThan(ENCODE_MEDIAN_MS);
