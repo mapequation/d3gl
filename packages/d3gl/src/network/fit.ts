@@ -16,13 +16,15 @@ export type FitBox = [number, number, number, number];
  * radius) is inflated by that one leaf — which blows the frame up and shrinks the whole layout to a dot.
  *
  * O(tree size) — call **once per tree** and cache; the per-frame {@link fitBox} then reads these nodes'
- * live geometry, O(fit nodes).
+ * live geometry, O(fit nodes). A spatial tree (#343), rebuilt every streamed frame, has its one root on
+ * the top level: only that level is scanned, O(root children).
  */
 export function fitNodes(tree: LODTree): Uint32Array {
   const { parent, size, levelCount, levelOffset, childOffset, children } = tree;
   const isRoot = (g: number): boolean => (parent ? parent[g]! < 0 : g >= levelOffset[Math.max(0, levelCount - 1)]!);
   const out: number[] = [];
-  for (let g = 0; g < size; g++) {
+  const first = tree.morton ? levelOffset[Math.max(0, levelCount - 1)]! : 0;
+  for (let g = first; g < size; g++) {
     if (!isRoot(g)) continue;
     const c0 = childOffset[g]!;
     const c1 = childOffset[g + 1]!;

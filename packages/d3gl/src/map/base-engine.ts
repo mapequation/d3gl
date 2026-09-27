@@ -674,6 +674,35 @@ export abstract class BaseEngine {
     return op < 1 ? op : null;
   }
 
+  /**
+   * Re-key `layer`'s selection, hover and subtract-preview ids through `map` (`null` drops an id) — for an
+   * engine whose ids are renumbered under the same user-visible glyphs (#343: a spatial LOD tree rebuilt
+   * per streamed frame, where an aggregate's id changes but its cell stays). Emits and repaints nothing
+   * (the caller repaints with the renumbered state), and fires no `select` callback: the selection still
+   * shows the same glyphs. O(selected + hovered) — nothing when both are empty.
+   */
+  protected remapLaneIds(layer: string, map: (id: string | number) => string | number | null): void {
+    const remap = (sets: Map<string, Set<string | number>>): void => {
+      const set = sets.get(layer);
+      if (!set || set.size === 0) return;
+      const next = new Set<string | number>();
+      for (const id of set) {
+        const to = map(id);
+        if (to !== null) next.add(to);
+      }
+      if (next.size > 0) sets.set(layer, next);
+      else sets.delete(layer);
+    };
+    remap(this.selected);
+    remap(this.laneHilite);
+    remap(this.laneRemove);
+    const last = this.lastHover;
+    if (last && last.layer === layer) {
+      const to = map(last.id);
+      this.lastHover = to === null ? null : { ...last, id: to };
+    }
+  }
+
   /** Drop any managed selection + hover highlight for `layer` — e.g. when an engine disables that
    *  layer's interaction (so a stale selection can't survive as un-highlightable ghost state). */
   protected clearLayerSelection(layer: string): void {
