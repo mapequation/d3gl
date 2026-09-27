@@ -21,6 +21,12 @@
 //   really costs GPU time stalls the frame after *every* repaint, so it is honoured from its second repaint
 //   on; a one-off gap is a single sample and never widens the throttle. It also recovers at once: the first
 //   repaint that does not stall brings the term back to 0.
+//
+// The **copy latency** the throttle plans with runs from the start of a readback — the frame the stream
+// decided to copy — to the frame its copy is seen complete. A readback whose passes wait for frame budget
+// (the nested layout's composition, #382) copies a frame or more after it started, and that wait is part of
+// how long the positions take to be ready: timed from the copy instead, the throttle would start each such
+// readback a frame too late, and every repaint would slip a frame behind its cadence.
 
 /** Minimum time between two layout repaints, ms: at most 20 per second (spec §15 Q4). */
 export const MIN_FRAME_MS = 50;
@@ -35,7 +41,7 @@ const THROTTLE_SLACK_MS = 2;
 /**
  * When the next layout repaint — and the readback copy that feeds it — is due. The stream calls, per
  * frame: {@link beginFrame}, then {@link due} before harvesting, {@link repainted} after the engine's
- * repaint, and {@link copyDue} / {@link copyIssued} / {@link copyCompleted} around its readback copies.
+ * repaint, and {@link copyDue} / {@link readbackStarted} / {@link copyCompleted} around its readbacks.
  * Allocates nothing.
  */
 export class RepaintThrottle {
@@ -49,8 +55,8 @@ export class RepaintThrottle {
   private prevNow = Number.NaN;
   private repaintedPrev = false;
   /**
-   * rAF time from issuing a copy to seeing its frame complete, and when the pending copy was issued (NaN:
-   * none, or a pause intervened since).
+   * rAF time from starting a readback to seeing its copy's frame complete, and when the pending readback
+   * started (NaN: none, or a pause intervened since).
    */
   private copyLatencyMs = 1000 / 60;
   private copyAt = Number.NaN;
@@ -90,19 +96,20 @@ export class RepaintThrottle {
   }
 
   /**
-   * Whether to copy positions at `now`: the copy would be complete (after the usual copy latency) when the
-   * next repaint is due, so a harvested frame is about one frame old, not a whole repaint interval.
+   * Whether to start a readback at `now`: its copy would be complete (after the usual latency from a
+   * readback's start) when the next repaint is due, so a harvested frame is about one frame old, not a
+   * whole repaint interval.
    */
   copyDue(now: number): boolean {
     return this.due(now + this.copyLatencyMs);
   }
 
-  /** A readback copy was issued in frame `now`. */
-  copyIssued(now: number): void {
+  /** A readback started in frame `now` (its copy follows once its passes are encoded, maybe frames later). */
+  readbackStarted(now: number): void {
     this.copyAt = now;
   }
 
-  /** The pending copy's frame was seen complete in frame `now`: sample the copy latency. */
+  /** The pending copy's frame was seen complete in frame `now`: sample the latency since its readback started. */
   copyCompleted(now: number): void {
     if (!Number.isNaN(this.copyAt)) this.copyLatencyMs = now - this.copyAt;
     this.copyAt = Number.NaN;

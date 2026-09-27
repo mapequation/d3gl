@@ -111,14 +111,27 @@ describe("RepaintThrottle (#352)", () => {
     t.beginFrame(0, FRAME);
     t.repainted(0, 1);
     // A copy that takes 20 ms to be seen complete.
-    t.copyIssued(10);
+    t.readbackStarted(10);
     t.copyCompleted(30);
     expect(t.copyDue(MIN_FRAME_MS - 20 - 2 - 1)).toBe(false);
     expect(t.copyDue(MIN_FRAME_MS - 20)).toBe(true);
     // A copy in flight across a hidden-page gap: its "latency" is the gap, not the copy.
-    t.copyIssued(100);
+    t.readbackStarted(100);
     t.pause();
     t.copyCompleted(60_100);
     expect(t.copyDue(MIN_FRAME_MS - 20 - 2 - 1)).toBe(false);
+  });
+
+  it("times a readback from its start, so the frames its passes wait for budget before the copy count (#382)", () => {
+    // A readback started at 0 whose passes ran in the next frame, copied there (≈ 17 ms), and whose copy was
+    // seen complete a frame after that: 33 ms from the start. The next one is started 33 ms before the
+    // repaint is due, so its copy lands in time even though it too waits a frame.
+    const t = new RepaintThrottle();
+    t.beginFrame(0, FRAME);
+    t.repainted(0, 1);
+    t.readbackStarted(0);
+    t.copyCompleted(2 * FRAME);
+    expect(t.copyDue(MIN_FRAME_MS - 2 * FRAME - 2 - 1)).toBe(false);
+    expect(t.copyDue(MIN_FRAME_MS - 2 * FRAME)).toBe(true);
   });
 });

@@ -246,6 +246,8 @@ export class GpuStream {
         this.ticksDone++;
         this.tickDone();
       },
+      // The throttle times a readback from here: its passes may wait frames for budget before the copy.
+      readbackStart: () => this.throttle.readbackStarted(this.now),
       copy: (betweenTicks) => this.issueCopy(betweenTicks),
     });
     this.settled = new Promise<void>((resolve) => {
@@ -440,7 +442,6 @@ export class GpuStream {
     this.copyTicks = this.ticksDone;
     this.copyFinal = this.finishing;
     this.copiedTicks = this.ticksDone;
-    this.throttle.copyIssued(this.now);
     this.copyReady = false;
   }
 
@@ -479,8 +480,9 @@ export class GpuStream {
 
   /**
    * Whether to start a readback this frame: the PBO is free, there are new ticks, and the copy would be
-   * ready (after the usual copy → ready latency) when the next repaint is due — so a harvested frame is
-   * about one frame old, not a whole repaint interval.
+   * ready (after the usual latency from a readback's start — its passes' wait for budget included — to its
+   * copy's completion) when the next repaint is due — so a harvested frame is about one frame old, not a
+   * whole repaint interval.
    */
   private readonly copyDue = (): boolean => {
     if (this.readback.pending) return false;

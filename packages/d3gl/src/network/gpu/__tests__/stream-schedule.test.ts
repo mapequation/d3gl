@@ -1,7 +1,8 @@
 /**
  * The streaming layout's work items (#382): which bands of which passes a frame encodes — node, pure, with a
  * fake budget. Every pass is cut into the bands its budget asks for, each band is one item, a readback's
- * passes run exclusively before its copy, and a pass keeps the band count it started with.
+ * passes run exclusively before its copy — its start reported when it starts, frames before the copy when
+ * the budget holds its passes back — and a pass keeps the band count it started with.
  */
 import { describe, expect, it } from "vitest";
 import { stageBands } from "../frame-budget.js";
@@ -61,6 +62,7 @@ function rig(budgetMs: number, tick: (log: Event[]) => StreamStage[], readback: 
         log.push("end");
         r.ticks++;
       },
+      readbackStart: () => log.push("read"),
       copy: (betweenTicks) => {
         log.push("copy");
         r.copies.push(betweenTicks);
@@ -104,7 +106,8 @@ describe("StreamSchedule (#382)", () => {
     frame(r, { ticks: 100 }); // R alone: the readback goes first, and nothing runs beside it
     frame(r, { ticks: 100 }); // S, the copy, then ticks again in what is left
     frame(r, { ticks: 100 });
-    expect(r.log.join(" ")).toBe(`| ${five} | R0/1 | S0/1 copy start T0/1 end | ${five}`);
+    // The readback started in the first frame — two frames before its copy.
+    expect(r.log.join(" ")).toBe(`| ${five} read | R0/1 | S0/1 copy start T0/1 end | ${five}`);
     expect(r.copies).toEqual([true]); // between ticks
   });
 
@@ -113,14 +116,14 @@ describe("StreamSchedule (#382)", () => {
     frame(r, { ticks: 1, copy: false });
     expect(r.log.join(" ")).toBe("| start P0/1 I0/1 end");
     expect(frame(r, { open: false, ticks: 2, copy: true })).toBe(0);
-    expect(r.log.slice(-2).join(" ")).toBe("| copy");
+    expect(r.log.slice(-3).join(" ")).toBe("| read copy");
   });
 
   it("tells the copy whether a tick is under way", () => {
     // A 2-band pass of 5 ms bands at 10 ms: the frame ends mid-tick; the copy follows that frame's items.
     const r = rig(10, (log) => [stage("F", 20, 100, log)], () => []);
     frame(r, { ticks: 1, copy: true });
-    expect(r.log.join(" ")).toBe("| start F0/4 F1/4 copy");
+    expect(r.log.join(" ")).toBe("| start F0/4 F1/4 read copy");
     expect(r.copies).toEqual([false]);
   });
 
@@ -128,9 +131,9 @@ describe("StreamSchedule (#382)", () => {
     const r = rig(10, (log) => [stage("T", 1, 1, log)], (log) => [stage("R", 1, 1, log)]);
     frame(r, { open: false, ticks: 1, copy: true });
     expect(r.schedule.reading).toBe(true);
-    expect(r.log.join(" ")).toBe("|");
+    expect(r.log.join(" ")).toBe("| read");
     frame(r, { ticks: 1 });
-    expect(r.log.join(" ")).toBe("| | R0/1 copy start T0/1 end");
+    expect(r.log.join(" ")).toBe("| read | R0/1 copy start T0/1 end");
     expect(r.schedule.reading).toBe(false);
   });
 });

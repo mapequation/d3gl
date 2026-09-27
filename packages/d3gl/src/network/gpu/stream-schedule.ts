@@ -8,7 +8,8 @@
 // ({@link FrameBudget.bandsFor}), and each band is one work item, so the budget holds at any N: no item is
 // estimated above half of it, and the budget admits a frame's items while their sum fits. A tick's items
 // may span frames; a readback's run exclusively (no tick item between its first pass and its copy), then
-// the copy.
+// the copy — frames after the readback started, when the budget holds its passes back, which is why the
+// repaint throttle times a readback from its start.
 //
 // `GpuStream` owns the GL side (fences, the copy, the harvest); this schedule only walks the stages, so
 // node tests can drive it with fake stages and a fake-fence {@link FrameBudget}.
@@ -57,12 +58,17 @@ export interface ScheduleBudget {
   spent(costMs: number, sliceable?: boolean): void;
 }
 
-/** What the schedule's owner does at a tick's boundaries and at the copy. */
+/** What the schedule's owner does at a tick's boundaries and around a readback. */
 export interface ScheduleHooks {
   /** A tick is about to encode its first band (the flat layout writes a drag's held positions here). */
   tickStart(): void;
   /** A tick's last band was encoded. */
   tickEnd(): void;
+  /**
+   * A readback starts: its passes follow, as items, and then the copy — in this frame, or frames later when
+   * the budget holds them back (the repaint throttle times a readback's latency from here).
+   */
+  readbackStart(): void;
   /** A readback's passes are all encoded: copy now. `betweenTicks`: no tick is under way. */
   copy(betweenTicks: boolean): void;
 }
@@ -170,6 +176,7 @@ export class StreamSchedule {
     }
     if (!this.preparing && !this.copiedNow && copyDue()) {
       this.preparing = true;
+      this.hooks.readbackStart();
       this.readback.start(this.source.readbackStages?.() ?? NO_STAGES);
       items += this.readbackItems(open);
     }
