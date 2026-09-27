@@ -265,9 +265,9 @@ coarsens the graph and then refits the tree's geometry to each frame the GPU rea
 `net.lodSource` reports `"worker"` for both.
 
 This holds on a brand-new engine too. Before any layout has run, `lod()` can't know which backend comes
-next, so it leaves its own main-thread build to the end of the current call chain: the worker layout
-that follows wins, and any other path (no layout, `positions`, `force`, `gpu`) still has its tree
-before the next frame. On those paths a call that needs the tree right away — `pick()`, `select()`,
+next, so it leaves its own main-thread build to the end of the current call chain: the worker or GPU
+layout that follows wins (the GPU layout's LOD worker streams the tree, #377), and any other path (no
+layout, `positions`, `force`) still has its tree before the next frame. On those paths a call that needs the tree right away — `pick()`, `select()`,
 `highlight()`, `toSVG()` — builds it at once. Until the worker's tree arrives nothing is drawn, so
 nothing is labelled.
 
