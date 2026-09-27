@@ -8,6 +8,7 @@ import {
   crowdingHorizon,
   cut,
   declutterFrontier,
+  lodCrowdingPairs,
   lodCrowdingPasses,
   makeCutScratch,
   makeDeclutterFrontierScratch,
@@ -28,14 +29,20 @@ import { buildGraph, type NetworkGraph } from "../graph.js";
  *     worker for each streamed spatial or structure frame, on the main thread when a layout lands, a
  *     style changes, a drag or transition settles (and per repaint for a main-thread tree a GPU or nested
  *     layout streams). It must stay a small multiple of the position pass: O(tree size) plus the cross
- *     pairs near sibling borders, on sparse *and* dense layouts, for every tree kind.
+ *     pairs near sibling borders, on sparse *and* dense layouts, for every tree kind, in `screen` and
+ *     `world` size modes — and O(m log m) on a node of `m` children however wide: one flat module of every
+ *     leaf, and modules of 10k members, on a packed lattice (swept along one axis alone they cost O(m·√m)).
  *   - **the cut** tests one more number per visited node (`k ≥ clearZoom`): the zoom sweep with the
- *     crowding computed — reductions ON (cut + declutter) — must stay within the frame budget, and the
- *     frontier the overlap rule opens must stay bounded by what the screen can show without overlap.
+ *     crowding computed — reductions ON (cut + declutter), in both size modes — must stay within the frame
+ *     budget. The frontier it opens is not screen-bounded: members opened from different aggregates may
+ *     overlap each other, so in the worst case every visible leaf is drawn — the all-leaves legs of
+ *     `frontier-perf` and `spatial-lod-perf` cover that frontier at 1M.
  *
  * Deterministic signatures, asserted unconditionally: a warm pass reallocates none of its scratch; one
- * call is one pass; no clear zoom is NaN; a streamed spatial frame carries the crowding in its own buffer
- * (a recycled buffer is reused, nothing grows once warm). Wall-clock ceilings: generous (~8× the calibrated
+ * call is one pass; no clear zoom is NaN; on the wide modules a pass examines at most
+ * {@link PAIRS_PER_MEMBER} node pairs per member (a one-axis sweep examined 100-500); the cut draws no
+ * aggregate whose members clear at its zoom; a streamed spatial frame carries the crowding in its own buffer
+ * (a recycled buffer is reused, nothing grows once warm). Wall-clock ceilings: generous (~4-8× the calibrated
  * medians) always-on at 100k; under `PERF_ASSERT` at the tier's N, split into a constant and a per-100k term:
  *   BENCH_LOD_CROWDING=1 BENCH_LOD_CROWDING_NODES=1000000 pnpm exec vitest run packages/d3gl/src/network/__tests__/lod-crowding-perf.test.ts
  * Each bench run appends a labelled line per leg to /tmp/lod-crowding-perf.txt (BENCH_LOD_CROWDING_LABEL).
@@ -53,7 +60,10 @@ function rng(seed: number): () => number {
   return () => (s = (s * 1664525 + 1013904223) >>> 0) / 4294967296;
 }
 
-interface Fixture { name: string; graph: NetworkGraph; tree: LODTree; radii: Float32Array; centroid: [number, number]; baseK: number }
+interface Fixture { name: string; graph: NetworkGraph; tree: LODTree; radii: Float32Array; worldRadii: Float32Array; centroid: [number, number]; baseK: number; wide?: boolean }
+
+/** The most node pairs a pass may examine per member on the wide modules (6-10 measured; a one-axis sweep, 100-500). */
+const PAIRS_PER_MEMBER = 40;
 
 /** Communities of 50 scattered widely around random centres (the spatial-lod-perf web-like layout). */
 function webLikeGraph(n: number): { graph: NetworkGraph; R: number } {
@@ -150,24 +160,61 @@ function degreeRadii(graph: NetworkGraph): Float32Array {
   return r;
 }
 
-function fixture(name: string, made: { graph: NetworkGraph; R: number }, build: (g: NetworkGraph) => LODTree): Fixture {
+function fixture(name: string, made: { graph: NetworkGraph; R: number }, build: (g: NetworkGraph) => LODTree, radius?: number): Fixture {
   const { graph, R } = made;
   const tree = build(graph);
-  const radii = degreeRadii(graph);
+  const radii = radius === undefined ? degreeRadii(graph) : new Float32Array(graph.nodeCount).fill(radius);
+  // World discs a tenth of the screen legs' size: well inside most layouts' spacing, so members part once a
+  // pixel apart (the half-pixel floor) — the world-mode frontier at its widest.
+  const worldRadii = radii.map((r) => r / 10);
   computeLODGeometry(tree, graph, radii, graph.strength);
-  return { name, graph, tree, radii, centroid: [0, 0], baseK: (0.85 * Math.min(W, H)) / (2.4 * R) };
+  return { name, graph, tree, radii, worldRadii, centroid: [0, 0], baseK: (0.85 * Math.min(W, H)) / (2.4 * R) };
 }
 
-/** Every fixture at `n`: sparse and dense spatial trees, a coarsening tree, a flat module map. */
-function fixtures(n: number): Fixture[] {
+/** Every leaf on one square lattice, 12 apart: the layout the wide modules below are packed on. */
+function packedLattice(n: number): { graph: NetworkGraph; R: number } {
+  const graph = buildGraph({ nodeCount: n, source: new Uint32Array(0), target: new Uint32Array(0) });
+  const side = Math.ceil(Math.sqrt(n));
+  for (let i = 0; i < n; i++) {
+    graph.positions[2 * i] = ((i % side) - side / 2) * 12;
+    graph.positions[2 * i + 1] = (Math.floor(i / side) - side / 2) * 12;
+  }
+  return { graph, R: 6 * side };
+}
+
+/** One module per `size`-member square tile of the lattice. */
+function tiles(n: number, size: number): ModuleNode[] {
+  const side = Math.ceil(Math.sqrt(n));
+  const t = Math.round(Math.sqrt(size));
+  const per = Math.ceil(side / t);
+  const rank = new Uint32Array(per * per);
+  return Array.from({ length: n }, (_, id) => {
+    const m = Math.floor(Math.floor(id / side) / t) * per + Math.floor((id % side) / t);
+    const r = (rank[m] ?? 0) + 1;
+    rank[m] = r;
+    return { id, path: [m + 1, r] };
+  });
+}
+
+/** Every fixture at `n`: sparse and dense spatial trees, a coarsening tree, a module map of 50-member modules;
+ *  with `wide`, also one flat module of every leaf and 10k-member modules, packed on a lattice. */
+function fixtures(n: number, wide = true): Fixture[] {
   const web = webLikeGraph(n);
   const modules: ModuleNode[] = Array.from({ length: n }, (_, id) => ({ id, path: [Math.floor(id / 50) + 1, (id % 50) + 1] }));
-  return [
+  const out = [
     fixture("spatial-web", web, (g) => buildMortonLODTree(g.positions, g.nodeCount)),
     fixture("spatial-hubs", hubsGraph(n), (g) => buildMortonLODTree(g.positions, g.nodeCount)),
     fixture("structure", clusteredGraph(n), (g) => buildLODTree(g)),
     fixture("modules", packedModules(n), () => buildModuleLODTree(n, modules)),
   ];
+  if (wide) {
+    // Sub-pixel glyphs (at the half-pixel floor), so neither module map is crowded below its horizon at any N
+    // up to ~2M: every member pair is computed, the pass's worst case on a wide node.
+    const lattice = packedLattice(n);
+    out.push({ ...fixture("modules-flat", lattice, () => buildModuleLODTree(n, Array.from({ length: n }, (_, id) => ({ id, path: [1, id + 1] }))), 0.5), wide: true });
+    out.push({ ...fixture("modules-10k", lattice, () => buildModuleLODTree(n, tiles(n, 10_000)), 0.5), wide: true });
+  }
+  return out;
 }
 
 const at = (c: [number, number], k: number): LODTransform => ({ k, x: W / 2 - c[0] * k, y: H / 2 - c[1] * k });
@@ -182,52 +229,59 @@ interface LegResult { name: string; median: number; frontier: number }
 function runLegs(fs: Fixture[], reps: number): LegResult[] {
   const out: LegResult[] = [];
   for (const f of fs) {
-    const sc = makeLODCrowdingScratch();
-    const opts = { screenSized: true, expandPx: crowdingHorizon(f.tree) };
-    computeLODCrowding(f.tree, opts, sc); // warm: JIT + scratch high-water
-    const warm = { box: sc.box, rmax: sc.rmax, pairA: sc.pairA, order: sc.order };
-    const passes = lodCrowdingPasses;
-    const ts: number[] = [];
-    for (let i = 0; i < reps; i++) {
-      const t0 = performance.now();
-      computeLODCrowding(f.tree, opts, sc);
-      ts.push(performance.now() - t0);
-    }
-    expect(lodCrowdingPasses - passes, "one call is one pass").toBe(reps);
-    expect(sc.box, `${f.name}: box scratch reallocated once warm`).toBe(warm.box);
-    expect(sc.rmax).toBe(warm.rmax);
-    expect(sc.pairA).toBe(warm.pairA);
-    expect(sc.order).toBe(warm.order);
-    let nan = 0;
-    let open = 0;
-    for (let g = f.tree.leafCount; g < f.tree.size; g++) {
-      const z = f.tree.clearZoom[g] ?? NaN;
-      if (Number.isNaN(z)) nan++;
-      else if (z < Infinity) open++;
-    }
-    expect(nan, `${f.name}: NaN clear zooms`).toBe(0);
-    expect(open, `${f.name}: aggregates that can open by overlap (not vacuous)`).toBeGreaterThan(0);
-    out.push({ name: `pass:${f.name}`, median: median(ts), frontier: open });
+    for (const screenSized of [true, false]) {
+      const mode = (f.wide ? "-wide" : "") + (screenSized ? "" : "-world");
+      computeLODGeometry(f.tree, f.graph, screenSized ? f.radii : f.worldRadii, f.graph.strength);
+      const sc = makeLODCrowdingScratch();
+      const opts = { screenSized, expandPx: crowdingHorizon(f.tree) };
+      computeLODCrowding(f.tree, opts, sc); // warm: JIT + scratch high-water
+      const warm = { box: sc.box, rmax: sc.rmax, pairA: sc.pairA, order: sc.order, kdBox: sc.kdBox, perm: sc.perm, kdStack: sc.kdStack };
+      const passes = lodCrowdingPasses;
+      const pairs0 = lodCrowdingPairs;
+      const ts: number[] = [];
+      for (let i = 0; i < reps; i++) {
+        const t0 = performance.now();
+        computeLODCrowding(f.tree, opts, sc);
+        ts.push(performance.now() - t0);
+      }
+      expect(lodCrowdingPasses - passes, "one call is one pass").toBe(reps);
+      const again = { box: sc.box, rmax: sc.rmax, pairA: sc.pairA, order: sc.order, kdBox: sc.kdBox, perm: sc.perm, kdStack: sc.kdStack };
+      for (const k of ["box", "rmax", "pairA", "order", "kdBox", "perm", "kdStack"] as const) expect(again[k], `${f.name}${mode}: ${k} reallocated once warm`).toBe(warm[k]);
+      const perMember = (lodCrowdingPairs - pairs0) / reps / f.tree.leafCount;
+      if (f.wide) expect(perMember, `${f.name}${mode}: node pairs examined per member`).toBeLessThan(PAIRS_PER_MEMBER);
+      let nan = 0;
+      let open = 0;
+      for (let g = f.tree.leafCount; g < f.tree.size; g++) {
+        const z = f.tree.clearZoom[g] ?? NaN;
+        if (Number.isNaN(z)) nan++;
+        else if (z < Infinity) open++;
+      }
+      expect(nan, `${f.name}${mode}: NaN clear zooms`).toBe(0);
+      expect(open, `${f.name}${mode}: aggregates that can open by overlap (not vacuous)`).toBeGreaterThan(0);
+      out.push({ name: `pass${mode}:${f.name}`, median: median(ts), frontier: open });
+      if (f.wide) continue; // the cut over these is the all-leaves frontier frontier-perf owns
 
-    // The zoom sweep, fit → 64×, reductions ON (cut + declutter), on the engine's scratch.
-    const cs = makeCutScratch();
-    const ds = makeDeclutterFrontierScratch();
-    const frameTs: number[] = [];
-    let widest = 0;
-    const frames = 13;
-    for (let i = 0; i < frames; i++) {
-      const t = at(f.centroid, f.baseK * Math.pow(2, (6 * i) / (frames - 1)));
-      const t0 = performance.now();
-      const drawn = cut(f.tree, t, W, H, { screenSized: true, maxAggregateRadius: MAX_AGG }, cs);
-      const kept = declutterFrontier(f.tree, drawn, t, W, H, { screenSized: true, k: t.k, maxAggregateRadius: MAX_AGG }, ds);
-      frameTs.push(performance.now() - t0);
-      widest = Math.max(widest, drawn.length);
-      void kept;
+      // The zoom sweep, fit → 64×, reductions ON (cut + declutter), on the engine's scratch.
+      const cs = makeCutScratch();
+      const ds = makeDeclutterFrontierScratch();
+      const frameTs: number[] = [];
+      let widest = 0;
+      const frames = 13;
+      for (let i = 0; i < frames; i++) {
+        const t = at(f.centroid, f.baseK * Math.pow(2, (6 * i) / (frames - 1)));
+        const t0 = performance.now();
+        const drawn = cut(f.tree, t, W, H, { screenSized, maxAggregateRadius: MAX_AGG }, cs);
+        const kept = declutterFrontier(f.tree, drawn, t, W, H, { screenSized, k: t.k, maxAggregateRadius: MAX_AGG }, ds);
+        frameTs.push(performance.now() - t0);
+        widest = Math.max(widest, drawn.length);
+        void kept;
+        // The rule's signature: no drawn aggregate's members clear at this zoom (it would have opened).
+        let clear = 0;
+        for (const g of drawn) if (g >= f.tree.leafCount && (f.tree.clearZoom[g] ?? Infinity) <= t.k) clear++;
+        expect(clear, `${f.name}${mode}: drawn aggregates whose members clear at k = ${t.k}`).toBe(0);
+      }
+      out.push({ name: `sweep${mode}:${f.name}`, median: median(frameTs), frontier: widest });
     }
-    // Leaves the overlap rule opens do not overlap one another, so they are bounded by the screen area over
-    // the smallest glyph's (2 px radius) disc; aggregates by the footprint rule, as before.
-    expect(widest, `${f.name}: widest frontier of the sweep`).toBeLessThan((W * H) / (Math.PI * 4));
-    out.push({ name: `sweep:${f.name}`, median: median(frameTs), frontier: widest });
   }
 
   // A streamed spatial frame (the worker's per-frame step) with the crowding, buffers recycled as the engine does.
@@ -256,12 +310,14 @@ function report(results: LegResult[], n: number, label: string): void {
   }
 }
 
-// Calibrated on an M1 Max at 100k (medians, under load from parallel runs): pass 7-15 ms per tree kind, sweep
-// frame < 1 ms, streamed spatial frame (rebuild + positions + style + crowding) ~26 ms; at 1M: pass 68-158 ms,
-// stream ~345 ms. Ceilings are 4-8× the 100k medians; the at-scale leg splits each into a constant and a
-// per-100k-leaves term.
-const LOCAL_BUDGET: Record<string, number> = { pass: 60, sweep: 40, stream: 150 };
-const CONSTANT_MS: Record<string, number> = { pass: 5, sweep: 10, stream: 10 };
+// Calibrated on an M1 Max at 100k (medians, under load from parallel runs): pass 8-15 ms per tree kind in
+// screen mode and 5-18 ms in world mode, 25-33 ms on the wide modules (both modes); sweep frame < 1 ms;
+// streamed spatial frame (rebuild + positions + style + crowding) 22-26 ms. At 1M: pass 88-169 ms (screen),
+// 79-150 ms (world), 268-460 ms on the wide modules, stream ~210 ms. Ceilings are 4-8× the 100k medians; the
+// at-scale leg splits each into a constant and a per-100k-leaves term (the wide modules' O(m log m) grows a
+// little faster than linear: at 1M they sit at a third of their 1,455 ms ceiling).
+const LOCAL_BUDGET: Record<string, number> = { pass: 60, "pass-world": 60, "pass-wide": 150, "pass-wide-world": 150, sweep: 40, "sweep-world": 40, stream: 150 };
+const CONSTANT_MS: Record<string, number> = { pass: 5, "pass-world": 5, "pass-wide": 5, "pass-wide-world": 5, sweep: 10, "sweep-world": 10, stream: 10 };
 const kindOf = (name: string): string => name.slice(0, name.indexOf(":"));
 
 describe("#426 overlap-aware cut: crowding pass + cut sweep", () => {
@@ -279,7 +335,7 @@ describe("#426 overlap-aware cut: crowding pass + cut sweep", () => {
         const kind = kindOf(r.name);
         const local = LOCAL_BUDGET[kind] ?? 0;
         const c0 = CONSTANT_MS[kind] ?? 0;
-        const env = Number(process.env[`PERF_LOD_CROWDING_${kind.toUpperCase()}_MS`]);
+        const env = Number(process.env[`PERF_LOD_CROWDING_${kind.toUpperCase().replaceAll("-", "_")}_MS`]);
         const ceiling = env > 0 ? env : c0 + ((local - c0) * BENCH_N) / LOCAL_N;
         expect(r.median, `${r.name}: median ${r.median.toFixed(1)}ms exceeds ${ceiling.toFixed(0)}ms at N=${BENCH_N}`).toBeLessThan(ceiling);
       }

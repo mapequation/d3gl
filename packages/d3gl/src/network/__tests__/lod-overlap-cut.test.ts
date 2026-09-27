@@ -10,6 +10,7 @@ import {
   declutterFrontier,
   defaultExpandPx,
   leavesUnder,
+  lodCrowdingPairs,
   makeLODCrowdingScratch,
   type LODTransform,
   type LODTree,
@@ -86,6 +87,12 @@ function prepare(tree: LODTree, graph: NetworkGraph, radii: Float32Array, screen
 }
 
 const MIN_R = 0.5;
+/**
+ * The most node pairs a crowding pass may examine per member on a packed lattice (see the wide-node guard):
+ * measured 6-7 on a flat module or tiles and 15-18 on two interleaved modules; the one-axis sweep this
+ * replaced examined 100 per member on the 40k-member flat module and 10,150 on the interleaved pair.
+ */
+const PAIRS_PER_MEMBER = 40;
 /** Brute force: the zoom from which no two of `g`'s members overlap on screen (see LODTree.clearZoom). */
 function bruteClearZoom(tree: LODTree, g: number, screenSized: boolean): number {
   const m = leavesUnder(tree, g);
@@ -301,6 +308,140 @@ describe("computeLODCrowding (#426)", () => {
       for (let g = tree.leafCount; g < tree.size; g++) if ((up[g] ?? -1) >= 0 && (tree.extent[g] ?? 0) > (tree.extent[up[g] ?? 0] ?? 0)) skewed++;
     }
     expect(skewed, "not vacuous: some child reaches farther than its parent").toBeGreaterThan(0);
+  });
+});
+
+describe("computeLODCrowding on wide nodes (#426)", () => {
+  // A module map's nodes can have thousands of children. The pass indexes a wide node's children in two
+  // dimensions, so both its own pairs and an ancestor's walk into it prune by box distance on both axes.
+
+  it("stays exact on wide nodes — a flat module map, a wide level of modules, and wide interleaved modules", () => {
+    const n = 2400;
+    const graph = chainGraph(n);
+    const r = rng(33);
+    for (let i = 0; i < n; i++) {
+      const c = i % 11;
+      const spread = c < 4 ? 30 : 400;
+      graph.positions[2 * i] = (c - 5) * 250 + (r() - 0.5) * spread;
+      graph.positions[2 * i + 1] = ((i * 29) % 7) * 120 + (r() - 0.5) * spread;
+    }
+    // Two interleaved top modules of 100 submodules of 12 members (an index over modules), and six interleaved
+    // modules of 400 members (an index over leaves, and walks between two indexes whose boxes coincide).
+    const nested: ModuleNode[] = Array.from({ length: n }, (_, id) => ({ id, path: [(id % 2) + 1, (Math.floor(id / 2) % 100) + 1, Math.floor(id / 200) + 1] }));
+    const six: ModuleNode[] = Array.from({ length: n }, (_, id) => ({ id, path: [(id % 6) + 1, Math.floor(id / 6) + 1] }));
+    for (const screenSized of [true, false]) {
+      // World discs small enough that some modules hold no overlapping pair (those never part: Infinity).
+      const radii = Float32Array.from({ length: n }, () => (screenSized ? 0.2 + r() * 6 : 0.05 + r() * 0.2));
+      let finite = 0;
+      for (const tree of [buildModuleLODTree(n, blocks(n, n)), buildModuleLODTree(n, nested), buildModuleLODTree(n, six)]) {
+        for (const horizon of [48, 700, Infinity]) {
+          computeLODGeometry(tree, graph, radii, graph.strength);
+          computeLODCrowding(tree, { screenSized, expandPx: horizon }, makeLODCrowdingScratch());
+          finite += expectExact(tree, screenSized, horizon);
+        }
+      }
+      expect(finite, "not vacuous: some wide nodes clear below their horizon").toBeGreaterThan(0);
+    }
+  });
+
+  it("tests a leaf beside a wide module against the module's members up to the leaf's full reach", () => {
+    // A 10 × 10 module (indexed: more children than a bucket) and, beside it in the same parent, one large
+    // leaf 30 left of its first column. The parent's walk scans the module's nearest bucket, in x order, for
+    // the leaf: its closest member (x-gap 30) beats the module's own value although it sits past half the
+    // reach the scan may stop at (45), so a scan cut short would miss it.
+    const side = 10;
+    const n = side * side + 1;
+    const graph = chainGraph(n);
+    for (let i = 0; i < side * side; i++) {
+      graph.positions[2 * i] = 100 + (i % side) * 10;
+      graph.positions[2 * i + 1] = Math.floor(i / side) * 10;
+    }
+    graph.positions[2 * (n - 1)] = 70;
+    graph.positions[2 * (n - 1) + 1] = 45;
+    const modules: ModuleNode[] = Array.from({ length: n }, (_, id) => ({ id, path: id < side * side ? [1, 1, id + 1] : [1, 2] }));
+    const tree = buildModuleLODTree(n, modules);
+    const radii = new Float32Array(n).fill(1);
+    radii[n - 1] = 8;
+    computeLODGeometry(tree, graph, radii, graph.strength);
+    computeLODCrowding(tree, { screenSized: true, expandPx: Infinity }, makeLODCrowdingScratch());
+    const up = parentsOf(tree);
+    const module = up[0] ?? -1;
+    const parent = up[module] ?? -1;
+    expect(up[n - 1], "precondition: the leaf and the module share a parent").toBe(parent);
+    expect(tree.clearZoom[module]).toBeCloseTo(0.2, 6); // (1 + 1) / 10
+    expect(tree.clearZoom[parent]).toBeCloseTo(9 / Math.hypot(30, 5), 6); // the leaf and (100, 40)
+    expectExact(tree, true, Infinity);
+
+    // The same with a wide level of modules: 100 pairs of members 1 apart (clear zoom 2) on the lattice, and the
+    // leaf 3 left of the first column's (100, 40): past a third of its reach (9 / 2), still beating 2.
+    const m = side * side;
+    const g2 = chainGraph(2 * m + 1);
+    for (let i = 0; i < m; i++) {
+      for (let r = 0; r < 2; r++) {
+        g2.positions[2 * (2 * i + r)] = 100 + (i % side) * 10 + r;
+        g2.positions[2 * (2 * i + r) + 1] = Math.floor(i / side) * 10;
+      }
+    }
+    g2.positions[4 * m] = 97;
+    g2.positions[4 * m + 1] = 40;
+    const t2 = buildModuleLODTree(2 * m + 1, Array.from({ length: 2 * m + 1 }, (_, id) => ({ id, path: id < 2 * m ? [1, 1, (id >> 1) + 1, (id & 1) + 1] : [1, 2] })));
+    const r2 = new Float32Array(2 * m + 1).fill(1);
+    r2[2 * m] = 8;
+    computeLODGeometry(t2, g2, r2, g2.strength);
+    computeLODCrowding(t2, { screenSized: true, expandPx: Infinity }, makeLODCrowdingScratch());
+    const up2 = parentsOf(t2);
+    const top = up2[2 * m] ?? -1;
+    expect(t2.clearZoom[up2[up2[0] ?? -1] ?? -1]).toBeCloseTo(2, 6); // the wide level: its pairs' own value
+    expect(t2.clearZoom[top]).toBeCloseTo(3, 6); // the leaf and (100, 40): 9 / 3
+    expectExact(t2, true, Infinity);
+  });
+
+  it("prunes in two dimensions: the pairs a pass examines stay a small multiple of the members on a packed lattice", () => {
+    // A 200 × 200 lattice, 12 apart, as one flat module of 40k members and as 16 modules of 50 × 50 under one
+    // root (the root's walk runs between adjacent 2.5k-member modules). Swept along one axis, a flat module
+    // costs about √m pairs per member and a walk between two adjacent wide modules √m·m.
+    // Jittered, a bound from a box distance is loose, so a walk between two modules splits many of their
+    // members instead of stopping at the first.
+    const side = 200;
+    const n = side * side;
+    const graph = chainGraph(n);
+    const exact = new Float32Array(2 * n);
+    const jittered = new Float32Array(2 * n);
+    lattice(graph, side, 12);
+    exact.set(graph.positions.subarray(0, 2 * n));
+    const r = rng(17);
+    for (let i = 0; i < 2 * n; i++) jittered[i] = (exact[i] ?? 0) + (r() - 0.5) * 4;
+    // Two modules whose members interleave (their boxes coincide): every member of one sits inside the other's box.
+    const ranks = [0, 0];
+    const checkerboard: ModuleNode[] = Array.from({ length: n }, (_, id) => {
+      const m = ((id % side) + Math.floor(id / side)) % 2;
+      const r = (ranks[m] ?? 0) + 1;
+      ranks[m] = r;
+      return { id, path: [m + 1, r] };
+    });
+    const cases: { name: string; modules: ModuleNode[]; screenSized: boolean; radius: number; at: Float32Array }[] = [
+      { name: "flat, screen r=3", modules: blocks(n, n), screenSized: true, radius: 3, at: exact },
+      { name: "flat, screen r=0.2 (half-pixel floor)", modules: blocks(n, n), screenSized: true, radius: 0.2, at: exact },
+      { name: "flat, world r=1", modules: blocks(n, n), screenSized: false, radius: 1, at: exact },
+      { name: "flat jittered, screen r=2", modules: blocks(n, n), screenSized: true, radius: 2, at: jittered },
+      { name: "16 tiles, screen r=2", modules: patches(side, 50, 50), screenSized: true, radius: 2, at: exact },
+      { name: "16 tiles jittered, screen r=2", modules: patches(side, 50, 50), screenSized: true, radius: 2, at: jittered },
+      { name: "16 tiles jittered, world r=1", modules: patches(side, 50, 50), screenSized: false, radius: 1, at: jittered },
+      { name: "2 interleaved modules (checkerboard), screen r=2", modules: checkerboard, screenSized: true, radius: 2, at: exact },
+      { name: "2 interleaved modules jittered, world r=1", modules: checkerboard, screenSized: false, radius: 1, at: jittered },
+    ];
+    for (const c of cases) {
+      graph.positions.set(c.at);
+      const tree = buildModuleLODTree(n, c.modules);
+      computeLODGeometry(tree, graph, new Float32Array(n).fill(c.radius), graph.strength);
+      const before = lodCrowdingPairs;
+      computeLODCrowding(tree, { screenSized: c.screenSized, expandPx: crowdingHorizon(tree) }, makeLODCrowdingScratch());
+      const perMember = (lodCrowdingPairs - before) / n;
+      // Not vacuous: the widest node was computed exactly (its value below its horizon), not cut short.
+      const root = tree.size - 1;
+      expect(tree.clearZoom[root] ?? Infinity, `${c.name}: the root's clear zoom is exact`).toBeLessThan(Infinity);
+      expect(perMember, `${c.name}: pairs examined per member`).toBeLessThan(PAIRS_PER_MEMBER);
+    }
   });
 });
 
