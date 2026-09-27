@@ -356,11 +356,13 @@ net
   .layout({ backend: "worker", iterations }); // …so the worker rebuilds the tree as it streams (or "gpu": its LOD worker)
 ```
 
-- **Bounded by the screen.** The frontier is set by the view area over the expand threshold, not by the
-  graph: a few hundred glyphs at the fit view and up to ~2k when zoomed in, so the cut and declutter
-  cost next to nothing at any size. The cells the overlap rule opens add only nodes that do not overlap
-  one another — as many as the view can show side by side. A bottom cell (up to 8 nodes) opens as soon
-  as its members fit.
+- **Bounded by the screen where glyphs overlap.** The footprint rule sets the frontier by the view area
+  over the expand threshold, not by the graph: a few hundred glyphs at the fit view and up to ~2k when
+  zoomed in, so the cut and declutter cost next to nothing at any size. The overlap rule adds the members
+  of every cell whose own glyphs clear one another. The nodes of one cell do not overlap each other, but
+  nodes of neighbouring cells may, so where glyphs are small next to their spacing (a sparse layout, or
+  `sizeMode: "world"` zoomed in) the frontier can reach every visible node, as with LOD off. A bottom cell
+  (up to 8 nodes) opens as soon as its members fit.
 - **It follows the layout.** A tree built from older positions blows up as nodes wander out of their
   cells, so the `"worker"` backend **rebuilds it in the worker on every streamed frame** — topology,
   geometry and aggregated style, handed to the main thread whole (transferred, not copied) — and stops

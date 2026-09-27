@@ -910,7 +910,8 @@ export class Network extends BaseEngine {
   private readonly mortonScratch = makeMortonScratch();
   /** Bounding-box scratch for every main-thread position pass (#343): 16 B per aggregate once used. */
   private readonly lodBounds = makeLODBoundsScratch();
-  /** Scratch for every main-thread crowding pass (#426): ~20 B per aggregate once used. */
+  /** Scratch for every main-thread crowding pass (#426): 28 B per aggregate once used, plus ~6 B per child
+   *  of each wide module it indexes (see LODCrowdingScratch). */
   private readonly lodCrowding = makeLODCrowdingScratch();
   /** Super-edge gather state for spatial trees (#343, #433): cover stamps, row memo, gather arrays. */
   private readonly lazyScratch = makeLazySuperEdgesScratch();
