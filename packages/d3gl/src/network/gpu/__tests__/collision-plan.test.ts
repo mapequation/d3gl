@@ -12,12 +12,15 @@ import {
   COLLISION_LIST_MAX,
   COLLISION_PART_PAIRS,
   COLLISION_PART_VISITS,
+  COLLISION_SUB_SHIFT,
   cellHash,
   collisionPlan,
   planClassCount,
   planFirstBinned,
   planHasClass,
   planSubBuckets,
+  searchCellsPerAxis,
+  searchReach,
   type CollisionPlan,
 } from "../collision-plan.js";
 import { bruteForcePartners, collisionTwin, type TwinTopology } from "./collision-twin.js";
@@ -174,6 +177,53 @@ describe("collisionPlan (#380)", () => {
     }
     expect(most).toBeGreaterThan(1);
     expect(COLLISION_PART_VISITS).toBeGreaterThan(0);
+  }, 30_000);
+
+  it("sizes a grid slot's work items for its windows as the GPU rounds them: none past COLLISION_PART_VISITS", () => {
+    // The most class cells per axis a window [F − ⌈h⌉, F + 1 + ⌊h⌋] >> s spans, over every F (unclamped).
+    const spanned = (h: number, s: number): number => {
+      let most = 0;
+      const base = 2 ** 20; // positive, so >> floors
+      for (let f = base; f < base + 2 ** s; f++) most = Math.max(most, ((f + 1 + Math.floor(h)) >> s) - ((f - Math.ceil(h)) >> s) + 1);
+      return most;
+    };
+    // The plan's per-axis bound holds for any half-width within half a finest sub-cell of its reach —
+    // among them a reach just under an integer that float32 rounds over, where 1 + ⌊h⌋ + ⌈h⌉ jumps by 2.
+    const wrong: string[] = [];
+    for (let s = 0; s <= 6; s++) {
+      for (let n = 0; n < 150; n++) {
+        for (const reach of [n, n + 1e-6, n + 0.5, n + 1 - 1e-6]) {
+          for (const h of [reach - 0.5, reach, reach + 1e-6, reach + 0.5]) {
+            if (h >= 0 && spanned(h, s) > searchCellsPerAxis(reach, s)) wrong.push(`reach ${reach}, h ${h}, s ${s}`);
+          }
+        }
+      }
+    }
+    expect(wrong.slice(0, 5)).toEqual([]);
+    // The GPU's float32 reach (GLSL ES highp: +, −, × correctly rounded, ÷ within 2.5 ULP; u_pad rounded
+    // too) is within reach · 10 · 2^−24 < reach · 2^−20 of the plan's. At that far end — a window only grows
+    // with h, and these are unclamped — every grid slot's windows span at most its parts' visits.
+    const { plan, radius } = oneSegment(radiiOf(zipf(20_000)));
+    const word = plan.segClasses[0] ?? 0;
+    const C = planClassCount(word);
+    const padOverSide = NESTED.PAD / (plan.segCellSide[0] ?? 1);
+    let cut = 0;
+    for (let i = 0; i < 20_000; i++) {
+      const code = plan.slotCollide[i] ?? 0;
+      if ((code & COLLISION_EXACT) !== 0) continue;
+      const parts = (plan.items[2 * (code >>> COLLISION_ITEM_SHIFT) + 1] ?? 0) >>> 16;
+      let cells = 0;
+      for (let c = planFirstBinned(word); c < C; c++) {
+        if (!planHasClass(word, c)) continue;
+        const s = C - 1 - c + COLLISION_SUB_SHIFT;
+        const reach = searchReach(radius[i] ?? 0, padOverSide, s + plan.refine);
+        cells += spanned(reach * (1 + 2 ** -20), s) ** 2;
+      }
+      if (cells > parts * COLLISION_PART_VISITS) wrong.push(`slot ${i}: ${cells} cells in ${parts} parts`);
+      if (parts > 1) cut++;
+    }
+    expect(wrong.slice(0, 5)).toEqual([]);
+    expect(cut).toBeGreaterThan(0);
   }, 30_000);
 
   it("sizes each grid segment's tables to powers of two, back to back, and estimates the gather's work", () => {

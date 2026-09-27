@@ -17,6 +17,7 @@ import {
   COLLISION_PART_PAIRS,
   collisionPlan,
   planClassCount,
+  type CollisionPlan,
 } from "../collision-plan.js";
 import { expectNested, kids, linkTightness, meanShift, reclustered, rootOf, similar, spreadOf, threeLevel, topo, twoLevel, zipfModuleTree } from "../../__tests__/nested-fixtures.js";
 import { collisionTwin } from "./collision-twin.js";
@@ -571,6 +572,32 @@ describe("GPU nested layout (#380): the radius-class collision grid on modules o
       // A missed partner is a whole push (≥ 1e-3 this packed); one step's float32 rounding is ~1e-6.
       expect(oneStep(solver).worst, `${k} children`).toBeLessThan(1e-5);
     }
+  });
+
+  it("a grid slot's last work item searches to the end of its windows, however few parts the plan counted", () => {
+    // The plan's parts cover the windows as the GPU rounds them (collision-plan.test.ts), so the last part
+    // never has more than COLLISION_PART_VISITS; that it runs to the end keeps the search complete even
+    // without that bound. Handed a plan of one part per grid slot, each grid slot's one item visits every
+    // cell of its windows: the twin's visits, and the all-pairs step.
+    const solver = zipfSolver(3000, 2, 1);
+    const plan = solver.collision;
+    const slotCollide = new Uint32Array(plan.slotCollide.length);
+    const items: number[] = [];
+    let cut = 0;
+    plan.slotCollide.forEach((code, i) => {
+      const own = (code & COLLISION_ITEMIZED) !== 0;
+      const parts = own ? (plan.items[2 * (code >>> COLLISION_ITEM_SHIFT) + 1] ?? 0) >>> 16 : 0;
+      const grid = (code & COLLISION_EXACT) === 0;
+      if (grid && parts > 1) cut++;
+      const keep = grid ? 1 : parts;
+      slotCollide[i] = ((code & ((1 << COLLISION_ITEM_SHIFT) - 1)) | ((items.length / 2) << COLLISION_ITEM_SHIFT)) >>> 0;
+      for (let p = 0; p < keep; p++) items.push(i, (p | (keep << 16)) >>> 0);
+    });
+    expect(cut, "grid slots the plan cuts into several parts").toBeGreaterThan(0);
+    const collision: CollisionPlan = { ...plan, slotCollide, items: Uint32Array.from(items), itemCount: items.length / 2 };
+    const step = oneStep({ ...solver, collision });
+    expect(step.visits).toBeGreaterThan(0);
+    expect(step.worst).toBeLessThan(1e-5);
   });
 
   /** Every child disc inside its parent's (the fill is 0.92), every position finite. */

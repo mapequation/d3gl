@@ -358,9 +358,9 @@ vec2 slotWork(int id, ivec2 sc, int part, int parts, inout vec4 stat) {
   int firstClass = int((grid.z >> 5) & 31u);
   uint subMask = (1u << ((grid.z >> 10) & 31u)) - 1u;
   float padOverSide = u_pad / texelFetch(u_segNested, st, 0).x;
-  // This part's slice [a, b) of the slot's class-cell visits, in class then row-major order. The plan
-  // sized the parts by its float64 bound on the windows; the last part takes whatever remains, so a window
-  // that float32 rounding widens by a cell is still searched whole.
+  // This part's slice [a, b) of the slot's class-cell visits, in class then row-major order. The plan's
+  // parts cover the most cells these float32 windows can span (searchCellsPerAxis), so no part has more
+  // than PART_VISITS; the last part still runs to the end, so completeness does not rest on that bound.
   int a = part * PART_VISITS;
   int b = part == parts - 1 ? 0x7fffffff : a + PART_VISITS;
   int idx = 0;

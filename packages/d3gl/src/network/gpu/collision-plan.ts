@@ -39,11 +39,12 @@
 //   it takes (thousands of cells, or the whole segment), and one fragment doing it alone would hold the
 //   gather for milliseconds: its fetches are a serial chain that no other work hides once the rest of the
 //   pass is done. So a slot's search is cut into work items of at most {@link COLLISION_PART_VISITS} cell
-//   visits (a slice of its cells, in class then row-major order) or {@link COLLISION_PART_PAIRS} pair tests
-//   (a slice of its k − 1 partners). The items — of every grid slot, and of the exact slots cut into more than
-//   one — are gathered in parallel first; each slot's own fragment then sums its items, or runs its exact
-//   loop when that is a single item (the bulk of a map of small modules), in a pass small enough to run at
-//   full occupancy.
+//   visits (a slice of its cells, in class then row-major order, sized by {@link searchCellsPerAxis}, which
+//   bounds the windows as the GPU rounds them) or {@link COLLISION_PART_PAIRS} pair tests (a slice of its
+//   k − 1 partners). The items — of every grid slot, and of the exact slots cut into more than one — are
+//   gathered in parallel first; each slot's own fragment then sums its items, or runs its exact loop when
+//   that is a single item (the bulk of a map of small modules), in a pass small enough to run at full
+//   occupancy.
 // - **Buckets.** The cells are sparse (a class's discs cover a small part of the box), so they are
 //   hashed: a segment of n binned slots owns the power of two of buckets at or above
 //   `BUCKETS_PER_SLOT · n` for its class cells, and of `SUB_BUCKETS_PER_SLOT · n` for its refined sub-cells.
@@ -161,8 +162,8 @@ export function planHasClass(word: number, c: number): boolean {
  * `r_i · PAD / side + 2^(s + ρ − 1)` finest sub-cells, widened by a relative 2⁻¹⁰ and 1/16 cell for float32
  * rounding (of the reach, and of the binned positions: at most ~0.008 cells at {@link COLLISION_F_MAX}).
  * The GPU gather computes the same expression ({@link COLLISION_GLSL}'s `searchReach`, with e = s + ρ); a
- * slightly different rounding there only changes how many extra cells it visits, never which partners it
- * finds.
+ * slightly different rounding there only changes how many extra cells it visits (never past
+ * {@link searchCellsPerAxis}), never which partners it finds.
  */
 export function searchReach(radius: number, padOverSide: number, e: number): number {
   return (radius * padOverSide + 2 ** (e - 1)) * (1 + 1 / 1024) + 1 / 16;
@@ -170,7 +171,12 @@ export function searchReach(radius: number, padOverSide: number, e: number): num
 
 /**
  * Class cells per axis that a search of half-width `reach` finest sub-cells visits at most, in a class
- * whose cells are `2^s` finest sub-cells: the finest cells `[F − ⌈reach⌉, F + 1 + ⌊reach⌋]` shifted by s.
+ * whose cells are `2^s` finest sub-cells: the finest cells `[F − ⌈h⌉, F + 1 + ⌊h⌋]` shifted by s, for any
+ * half-width h ≤ reach + 1/2 (they span at most ⌈W / 2^s⌉ + 1 class cells, W = 1 + ⌊h⌋ + ⌈h⌉ ≤
+ * ⌊2 · reach + 2⌋ + 1). The GPU's float32 reach is within reach · 2⁻²⁰ of the plan's float64 one (GLSL ES
+ * highp: +, −, × correctly rounded, ÷ within 2.5 ULP): under 1/32 cell at any reach below 2¹⁵, and at a
+ * larger reach this bound already exceeds the class cells of all {@link COLLISION_F_MAX} + 1 finest cells,
+ * which a window is clamped to. So the parts sized from it bound the GPU's windows.
  */
 export function searchCellsPerAxis(reach: number, s: number): number {
   return Math.floor((2 * reach + 2) / 2 ** s) + 2;
