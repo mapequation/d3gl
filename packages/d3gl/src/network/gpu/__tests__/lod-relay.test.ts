@@ -253,7 +253,7 @@ describe("LOD relay: streaming (#377)", () => {
       relay.commit();
     }
     // The adoption refit has no buffer to hand back; each of the 5 frames hands back the previous reply's.
-    expect(worker.refitGeometry).toEqual([-1, ...Array.from({ length: 5 }, () => 3 * size)]);
+    expect(worker.refitGeometry).toEqual([-1, ...Array.from({ length: 5 }, () => 4 * size)]); // [cx, cy, extent, clearZoom] (#426)
   });
 
   it("wakes the stream when a frame is back", () => {

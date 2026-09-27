@@ -42,9 +42,10 @@ export interface StartMessage {
   frameEvery?: number;
   /**
    * Build the structural LOD tree on the worker and stream it (#103): the worker posts the tree
-   * {@link LODTopology} once, then refreshes its position-derived geometry (`cx`/`cy`/`extent`) each
-   * frame — shared via a SAB, or in the per-frame message in copy mode — so the main thread renders
-   * the LOD frontier with no O(N) coarsening or geometry pass of its own.
+   * {@link LODTopology} once, then refreshes its position-derived geometry (`cx`/`cy`/`extent`, and the
+   * crowding `clearZoom` with a {@link lodStyle}, #426) each frame — shared via a SAB, or in the per-frame
+   * message in copy mode — so the main thread renders the LOD frontier with no O(N) coarsening or
+   * geometry pass of its own.
    */
   lod?: boolean;
   /**
@@ -54,7 +55,10 @@ export interface StartMessage {
    * `lodStyle.links` (#433). The worker still coarsens for the multilevel seed either way.
    */
   lodSource?: "structure" | "spatial";
-  /** The leaf style a spatial tree aggregates onto every rebuild (#343), and its version (echoed per frame). */
+  /**
+   * The leaf style a spatial tree aggregates onto every rebuild (#343), and its version (echoed per frame).
+   * Either tree computes its crowding from it per frame (#426, {@link LeafStyle.crowding}).
+   */
   lodStyle?: LeafStyle;
   lodStyleVersion?: number;
   /** The main thread's view, whose kept glyphs' super-edge rows a spatial tree carries (#433). */
@@ -90,8 +94,8 @@ export interface WarmStart {
   recool?: boolean;
 }
 
-/** A new leaf style for the spatial tree's per-frame aggregation (#343), after `style()` changed it — to a
- *  layout worker's stream, or to a GPU layout's LOD worker streaming the spatial tree. */
+/** A new leaf style for the streamed tree's per-frame aggregation and crowding (#343, #426), after `style()` or
+ *  `lod()` changed it — to a layout worker's stream, or to a GPU layout's LOD worker streaming the spatial tree. */
 export interface LODStyleMessage {
   type: "lod-style";
   style: LeafStyle;
@@ -270,8 +274,8 @@ export interface ProgressMessage {
   /** Position snapshot in copy mode; omitted in shared mode (renderer reads the SAB directly). */
   positions?: Float32Array;
   /**
-   * LOD geometry snapshot (`[cx, cy, extent]` concatenated, length `3 · topology.size`) in copy mode
-   * when LOD is on; omitted in shared mode (the renderer reads the geometry SAB directly).
+   * LOD geometry snapshot (`[cx, cy, extent, clearZoom]` concatenated, length `4 · topology.size`) in copy
+   * mode when LOD is on; omitted in shared mode (the renderer reads the geometry SAB directly).
    */
   geometry?: Float32Array;
   /** A nested layout's `done` (#329): its module boundary discs, for `lod({ moduleBoundary })`. */
@@ -346,22 +350,37 @@ export function transferList(views: readonly (ArrayBufferView | undefined)[]): A
 }
 
 /**
- * The three position-derived geometry arrays packed contiguously in one buffer, `[cx, cy, extent]`
- * each of length `size`. One layout shared by the worker (writer) and the main thread (reader), over
- * either a `SharedArrayBuffer` (zero-copy) or a transferred copy.
+ * The four per-frame geometry arrays packed contiguously in one buffer, `[cx, cy, extent, clearZoom]`
+ * each of length `size` (the crowding, #426, rides with the positions it was computed from). One layout
+ * shared by the worker (writer) and the main thread (reader), over either a `SharedArrayBuffer`
+ * (zero-copy) or a transferred copy. Views only — a fresh buffer is zeroed, so whoever allocates one
+ * fills `clearZoom` with `Infinity` (no crowding yet) before a tree reads it: see {@link makeLODGeometry}.
  */
 export function lodGeometryViews(
   buffer: ArrayBufferLike,
   size: number,
-): { cx: Float32Array; cy: Float32Array; extent: Float32Array } {
+): { cx: Float32Array; cy: Float32Array; extent: Float32Array; clearZoom: Float32Array } {
+  const f = Float32Array.BYTES_PER_ELEMENT;
   return {
     cx: new Float32Array(buffer, 0, size),
-    cy: new Float32Array(buffer, size * Float32Array.BYTES_PER_ELEMENT, size),
-    extent: new Float32Array(buffer, 2 * size * Float32Array.BYTES_PER_ELEMENT, size),
+    cy: new Float32Array(buffer, size * f, size),
+    extent: new Float32Array(buffer, 2 * size * f, size),
+    clearZoom: new Float32Array(buffer, 3 * size * f, size),
   };
 }
 
-/** Byte length of the LOD geometry buffer for a tree of `size` nodes (`[cx, cy, extent]`). */
+/** Byte length of the LOD geometry buffer for a tree of `size` nodes (`[cx, cy, extent, clearZoom]`). */
 export function lodGeometryByteLength(size: number): number {
-  return 3 * size * Float32Array.BYTES_PER_ELEMENT;
+  return 4 * size * Float32Array.BYTES_PER_ELEMENT;
+}
+
+/**
+ * The views of a newly allocated geometry buffer, with `clearZoom` set to `Infinity` (#426): a zeroed
+ * clear zoom would read as "every member clears at any zoom" and open the whole tree before the first
+ * crowding pass.
+ */
+export function makeLODGeometry(buffer: ArrayBufferLike, size: number): ReturnType<typeof lodGeometryViews> {
+  const views = lodGeometryViews(buffer, size);
+  views.clearZoom.fill(Infinity);
+  return views;
 }

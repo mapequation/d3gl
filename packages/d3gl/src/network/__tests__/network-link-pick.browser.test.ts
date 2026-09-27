@@ -66,7 +66,8 @@ describe("network GPU link picking (#141)", () => {
     ];
     net
       .data(g)
-      .style({ directed: true, linkStyle: "line", linkWidth: 6 })
+      // 8-unit glyphs: each module's members (15 apart) overlap, so both stay collapsed (#426).
+      .style({ directed: true, linkStyle: "line", linkWidth: 6, nodeRadius: 8 })
       .lod({ modules, expandPx: 20 })
       .layout({ backend: "positions", positions: new Float32Array([70, 90, 85, 90, 115, 110, 130, 110]) });
     net.setTransform({ k: 1, x: 0, y: 0 }); // collapse to two aggregates

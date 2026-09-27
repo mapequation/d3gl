@@ -2,7 +2,7 @@ import { describe, it, expect } from "vitest";
 import { network, type Network, type NetworkHit } from "../network.js";
 import { buildGraph, type NetworkGraph } from "../graph.js";
 import type { HoverHit } from "../../map/base-engine.js";
-import { lodStylePasses, mortonTopologyBuilds } from "../lod.js";
+import { lodCrowdingPasses, lodStylePasses, mortonTopologyBuilds } from "../lod.js";
 
 /**
  * `lod({ source: "spatial" })` (#343) through the engine: the worker rebuilds a Morton tree per streamed
@@ -272,17 +272,20 @@ describe("lod({ source: 'spatial' }) (#343)", () => {
       ev("pointermove", x0 + 25, y0 + 15);
       const builds0 = mortonTopologyBuilds;
       const styles0 = lodStylePasses;
+      const crowd0 = lodCrowdingPasses;
       const before = [g.positions[4]!, g.positions[5]!];
       step(20);
       expect(g.positions[4] !== before[0] || g.positions[5] !== before[1], "the drag's reheat never ticked the layout").toBe(true);
       expect(mortonTopologyBuilds - builds0, "spatial trees built during the drag frames").toBe(0);
       expect(lodStylePasses - styles0, "style passes during the drag frames").toBe(0);
+      expect(lodCrowdingPasses - crowd0, "crowding passes during the drag frames (#426)").toBe(0);
       // Release: the cool-down tail still only refits; its last frame rebuilds the tree once.
       ev("pointerup", x0 + 25, y0 + 15);
       step(95);
       expect(queue.size, "the force drag's rAF loop did not stop after its tail").toBe(0);
       expect(mortonTopologyBuilds - builds0, "one rebuild once the nodes came to rest").toBe(1);
       expect(lodStylePasses - styles0).toBe(1);
+      expect(lodCrowdingPasses - crowd0, "one crowding pass with the rebuild").toBe(1);
     } finally {
       globalThis.requestAnimationFrame = realRaf;
       globalThis.cancelAnimationFrame = realCaf;

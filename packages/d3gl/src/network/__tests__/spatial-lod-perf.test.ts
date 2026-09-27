@@ -2,7 +2,9 @@ import { describe, it, expect } from "vitest";
 import { appendFileSync } from "node:fs";
 import {
   buildMortonLODTree,
+  computeLODCrowding,
   computeLODGeometry,
+  crowdingHorizon,
   cut,
   declutterFrontier,
   makeCutScratch,
@@ -104,6 +106,8 @@ function webLike(n: number): { graph: NetworkGraph; tree: LODTree; centroid: [nu
   const radii = new Float32Array(n);
   for (let i = 0; i < n; i++) radii[i] = 2 + Math.sqrt(graph.csr.degree[i]!);
   computeLODGeometry(tree, graph, radii, graph.strength);
+  // As the engine does with every tree it draws (#426): the cut opens an aggregate whose members clear.
+  computeLODCrowding(tree, { screenSized: true, expandPx: crowdingHorizon(tree) });
   const baseK = (0.85 * Math.min(W, H)) / (2.4 * R);
   return { graph, tree, centroid: [0, 0], baseK };
 }

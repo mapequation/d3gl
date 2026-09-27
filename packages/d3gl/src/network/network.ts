@@ -3,7 +3,7 @@ import { networkLayers, networkLayersFromCache, noLodStyleCache, drawsLinks, fro
 import { rgb } from "d3-color";
 import { DRAG_HEAT, ForceLayout, seedPositions, type ForceParams } from "./force.js";
 import { multilevelLayout, type CoarsenOptions } from "./coarsen.js";
-import { buildLODTree, buildMortonLODTree, mortonRootBox, makeMortonScratch, makeLODBoundsScratch, findMortonCell, computeLODGeometry, computeLODPositions, computeLODStyle, lodTreeFromTopology, updateLODPositionsForLeaves, cut, makeCutScratch, makeCutBoundaries, declutterFrontier, makeDeclutterFrontierScratch, pickFrontier, regionFrontier, visibleWorldRect, leavesUnder, ancestorAwareSelected, type BoundaryDiscs, type CutBoundaries, type LODTree, type MortonBox, type SpatialLODOptions } from "./lod.js";
+import { buildLODTree, buildMortonLODTree, mortonRootBox, makeMortonScratch, makeLODBoundsScratch, makeLODCrowdingScratch, findMortonCell, computeLODCrowding, computeLODGeometry, computeLODPositions, computeLODStyle, crowdingHorizon, lodTreeFromTopology, updateLODPositionsForLeaves, cut, makeCutScratch, makeCutBoundaries, declutterFrontier, makeDeclutterFrontierScratch, pickFrontier, regionFrontier, visibleWorldRect, leavesUnder, ancestorAwareSelected, type BoundaryDiscs, type CutBoundaries, type LODTree, type MortonBox, type SpatialLODOptions } from "./lod.js";
 import { DEFAULT_LABEL_TEXT, type LabelAnchor, type LabelStyle } from "../labels/label-layer.js";
 import { TextMeasurer, canvasFont } from "../labels/measure.js";
 import { buildModuleLODTree, checkModuleLinks, flattenModuleLinks, flattenModuleRecords, moduleRecordIndex, type ModuleLink, type ModuleNode } from "./modules.js";
@@ -424,7 +424,8 @@ export interface NestedLayoutConfig {
 /**
  * Level-of-detail (#103): an adaptive hierarchy cut so a large network draws only what's visible.
  * Each pan/zoom re-cuts a retained coarsening tree — dense regions collapse to aggregate glyphs and
- * expand into their members as you zoom in — bounding per-frame work to the visible frontier. Opt-in
+ * expand into their members as you zoom in, as soon as their glyphs would no longer overlap (#426) —
+ * bounding per-frame work to the visible frontier. Opt-in
  * via {@link Network.lod}; off by default (every node/link drawn). The tree's geometry updates as the
  * layout converges (so LOD helps during the solve, not only after), and the zoom-time path re-cuts
  * only the visible frontier. Best paired with `style({ sizeMode: "screen" })`.
@@ -484,8 +485,11 @@ export interface NetworkLODOptions {
   moduleLinks?: ArrayLike<ModuleLink>;
   /**
    * Expand threshold (px): an aggregate whose on-screen footprint (`2·extent·k`) reaches this
-   * expands into its children; below it it draws as a single glyph. Larger → coarser (fewer, bigger
-   * aggregates). After a `layout({ nested })`, a module's extent is its disc's radius (#329).
+   * expands into its children; below it it draws as a single glyph — unless its members' glyphs would
+   * not overlap at the current zoom, when it expands whatever its size (#426: an aggregate is drawn only
+   * where its members would overlap, so a small graph opens on every node). The threshold therefore sets
+   * how coarse the map is where members *would* overlap. Larger → coarser (fewer, bigger aggregates).
+   * After a `layout({ nested })`, a module's extent is its disc's radius (#329).
    *
    * **Omit it** to get the tree-adaptive default (#191), which scales with how many children the
    * tree's finest aggregates hold: 48 px for structural coarsening / a spatial quadtree (unchanged),
@@ -906,6 +910,8 @@ export class Network extends BaseEngine {
   private readonly mortonScratch = makeMortonScratch();
   /** Bounding-box scratch for every main-thread position pass (#343): 16 B per aggregate once used. */
   private readonly lodBounds = makeLODBoundsScratch();
+  /** Scratch for every main-thread crowding pass (#426): ~20 B per aggregate once used. */
+  private readonly lodCrowding = makeLODCrowdingScratch();
   /** Super-edge gather state for spatial trees (#343, #433): cover stamps, row memo, gather arrays. */
   private readonly lazyScratch = makeLazySuperEdgesScratch();
   /** The graph's per-incidence weights/directions for the lazy gather, built once per graph + direction. */
@@ -914,12 +920,14 @@ export class Network extends BaseEngine {
   private cutFrontier: Uint32Array = new Uint32Array(0);
   /** Whether a spatial tree's gather (lazy or from rows) has run (so {@link superEdgeStats} reports it). */
   private lazyGathered = false;
-  /** Version of the leaf style a spatial worker tree aggregates (#343), bumped per resolved style. */
+  /** Version of the leaf style a worker tree aggregates (#343) and computes its crowding with (#426), bumped
+   *  per resolved style and per explicit `expandPx`. */
   private lodStyleVersion = 0;
   /** The view last sent to a spatial stream (#433), whose kept glyphs' super-edge rows its trees carry. */
   private lodViewPosted: LODView | null = null;
   private lodStyleVersionOf: ResolvedNetworkStyle | null = null;
-  /** The leaf style version the spatial worker stream last received. */
+  private lodStyleExpandPx: number | undefined = undefined;
+  /** The leaf style version the worker's LOD stream last received. */
   private lodStylePosted = -1;
   /** Whether the current `lodTree` was built from a provided module hierarchy (N6 / #104). */
   private lodModules = false;
@@ -1920,17 +1928,33 @@ export class Network extends BaseEngine {
 
   /**
    * The leaf style a spatial tree aggregates (#343) — radii, declutter importance, flow-border metric,
-   * colours — and its version, bumped whenever the resolved style changes. A worker-built spatial tree
+   * colours — plus what a worker tree's crowding needs (#426: the size mode, the explicit `expandPx`), and
+   * its version, bumped whenever the resolved style or `expandPx` changes. A worker-built spatial tree
    * carries the version it was aggregated with, so a stale one is re-aggregated here.
    */
   private lodLeafStyle(graph: NetworkGraph): { style: LeafStyle; version: number } {
     const r = this.resolvedStyleCached(graph);
-    if (this.lodStyleVersionOf !== r) {
+    const expandPx = this.lodOptions?.expandPx;
+    if (this.lodStyleVersionOf !== r || this.lodStyleExpandPx !== expandPx) {
       this.lodStyleVersionOf = r;
+      this.lodStyleExpandPx = expandPx;
       this.lodStyleVersion++;
     }
     const links = drawsLinks(graph, r); // the worker builds super-edge rows only for drawn links (#433)
-    return { style: { radii: r.nodeRadii, weight: r.importance, border: r.flowBorder?.metric, colors: r.nodeColors, links }, version: this.lodStyleVersion };
+    const crowding = { screenSized: r.sizeMode === "screen", expandPx };
+    return { style: { radii: r.nodeRadii, weight: r.importance, border: r.flowBorder?.metric, colors: r.nodeColors, links, crowding }, version: this.lodStyleVersion };
+  }
+
+  /**
+   * The tree's crowding (#426) from its current positions and radii — so the cut opens an aggregate whose
+   * members would not overlap — computed up to the cut's own expand threshold ({@link crowdingHorizon}).
+   * O(tree size) plus the cross pairs near sibling borders; run with every position + style pass on a
+   * main-thread tree (never per zoom frame).
+   */
+  private updateLODCrowding(tree: LODTree): void {
+    if (!this.lodOptions || !this.graph) return;
+    const screenSized = this.resolvedStyleCached(this.graph).sizeMode === "screen";
+    computeLODCrowding(tree, { screenSized, expandPx: crowdingHorizon(tree, this.lodOptions.expandPx) }, this.lodCrowding);
   }
 
   /**
@@ -2083,11 +2107,12 @@ export class Network extends BaseEngine {
     const useLod = !!this.lodOptions && !this.lodUsesModules();
     // The spatial tree (#343) is rebuilt by a worker per frame, style aggregated there too — on the worker
     // backend, on a "gpu" layout's worker fallback (#351) and by the GPU layout's LOD worker alike — with the
-    // super-edge rows of the glyphs the view the cut runs at keeps (#433).
+    // super-edge rows of the glyphs the view the cut runs at keeps (#433). Either tree's crowding (#426) is
+    // computed there per frame from the same leaf style.
     const lodSource = useLod ? this.lodKind() : null;
-    const spatialStyle = lodSource === "spatial" ? this.lodLeafStyle(graph) : null;
+    const leafStyle = useLod ? this.lodLeafStyle(graph) : null;
     this.lodWorkerSource = lodSource === "spatial" ? "spatial" : useLod ? "structure" : null;
-    if (spatialStyle) this.lodStylePosted = spatialStyle.version;
+    if (leafStyle) this.lodStylePosted = leafStyle.version;
     const workerOpts: WorkerLayoutOptions = {
       width: this.width,
       height: this.height,
@@ -2098,9 +2123,9 @@ export class Network extends BaseEngine {
       // multilevel seed so the graph is coarsened once and the main thread never coarsens.
       lod: useLod,
       lodSource: lodSource === "spatial" ? "spatial" : "structure",
-      lodStyle: spatialStyle?.style,
-      lodStyleVersion: spatialStyle?.version,
-      lodView: spatialStyle ? this.postedLODView(this.resolvedStyleCached(graph)) : undefined,
+      lodStyle: leafStyle?.style,
+      lodStyleVersion: leafStyle?.version,
+      lodView: lodSource === "spatial" ? this.postedLODView(this.resolvedStyleCached(graph)) : undefined,
       coarsen: this.lodOptions?.coarsen,
     };
     // Unset until the transport returns, so a callback can never match a cleared `layoutHandle` (null).
@@ -2695,14 +2720,15 @@ export class Network extends BaseEngine {
    *  (#427). A nested layout's transition stopped mid-ease leaves the nodes between
    *  two layouts, so its discs no longer hold: the modules (and their rings) fall back to their members'
    *  centroid + extent (#329). A spatial LOD tree, refit through the transition, is rebuilt where the
-   *  nodes stopped (#343). */
+   *  nodes stopped (#343), and any tree's crowding (#426), held through it, is recomputed there. */
   stopLayout(): this {
     const running = this.transition?.running === true;
     const interrupted = running && this.nestedDiscs !== null;
     this.haltLayout();
     if (interrupted) this.nestedDiscs = null;
-    // The modules and rings redraw around where the members stopped; a spatial tree is rebuilt there.
-    if (interrupted || (running && this.lodSpatial)) this.settleLODPositions();
+    // The modules and rings redraw around where the members stopped; a spatial tree is rebuilt there, and
+    // the crowding follows the nodes to where they stopped.
+    if (running) this.settleLODPositions();
     return this;
   }
 
@@ -3576,6 +3602,10 @@ export class Network extends BaseEngine {
    * re-aggregates the style (O(nodes) + O(tree) colour work per frame). Its extents grow while members
    * leave their cells, so the frontier can widen for the length of the gesture; {@link settleLODPositions}
    * (drag release, the `force` drag's cool-down tail) and a transition's settle rebuild it once.
+   *
+   * The crowding (#426, {@link LODTree.clearZoom}) is held too — it is an O(tree) pass, like the style — so
+   * the aggregates the view opened stay open through the gesture; the same settle recomputes it where the
+   * nodes came to rest.
    */
   private applyMovedGeometry(): void {
     const moved = this.moved;
@@ -3595,9 +3625,13 @@ export class Network extends BaseEngine {
    *  no main-thread geometry. */
   private settleLODPositions(): void {
     if (this.drawsWorkerTree() || !this.lodReady() || !this.lodTree || !this.graph) return;
-    // A spatial tree is rebuilt (#343): the moved nodes may have left their cells.
+    // A spatial tree is rebuilt (#343): the moved nodes may have left their cells. Either way the crowding
+    // (#426), held through the gesture, is recomputed where the nodes came to rest.
     if (this.lodSpatial) this.recomputeLODGeometry();
-    else computeLODPositions(this.lodTree, this.graph.positions, this.lodDiscs(this.lodTree), this.lodBounds);
+    else {
+      computeLODPositions(this.lodTree, this.graph.positions, this.lodDiscs(this.lodTree), this.lodBounds);
+      this.updateLODCrowding(this.lodTree);
+    }
     this.moved = null; // the exact pass covers a drag move still waiting for its frame
     this.requestRedraw();
     this.flushFrame(); // draw now — and only once, if that frame (or a zoom) was pending
@@ -3894,22 +3928,27 @@ export class Network extends BaseEngine {
     if (kind !== "spatial") this.leafIncidence = null; // only a spatial tree's gathers read it (2-10 B per edge)
     const moduleTree = kind === "modules" ? this.moduleTree() : undefined;
     if (!moduleTree && this.lodWorkerTree && this.lodWorkerSource === kind) {
+      // Send the worker a newer style (and crowding inputs, #426) for the frames still to come.
+      const { style, version } = this.lodLeafStyle(this.graph);
+      if (this.lodStylePosted !== version && this.layoutHandle?.setLODStyle) {
+        this.layoutHandle.setLODStyle(style, version);
+        this.lodStylePosted = version;
+      }
       if (kind === "spatial") {
-        // The worker aggregated the style of the version it had; re-aggregate here only for a newer one,
-        // and send the worker the new style for the frames still to come.
-        const { style, version } = this.lodLeafStyle(this.graph);
-        if (this.lodStylePosted !== version && this.layoutHandle?.setLODStyle) {
-          this.layoutHandle.setLODStyle(style, version);
-          this.lodStylePosted = version;
-        }
+        // The worker aggregated the style — and computed the crowding — of the version it had; redo both
+        // here only for a newer one.
         const header = this.lodStreamed?.header;
         if (header && header.styleVersion !== version) {
           computeLODStyle(this.lodWorkerTree, nodeRadii, leafWeight, leafBorder, leafColors);
+          this.updateLODCrowding(this.lodWorkerTree);
           header.styleVersion = version;
         }
       } else {
         computeLODStyle(this.lodWorkerTree, nodeRadii, leafWeight, leafBorder, leafColors, radiusAggregate, fillAggregate);
         this.applyLODBorderStyle(this.lodWorkerTree, resolved);
+        // A streaming worker refits the crowding every frame; once it has settled (idle, writing nothing)
+        // a new style's crowding is computed here, once.
+        if (!this.lodStreaming) this.updateLODCrowding(this.lodWorkerTree);
       }
       this.lodTree = this.lodWorkerTree;
       this.lodModules = false;
@@ -3956,6 +3995,7 @@ export class Network extends BaseEngine {
       this.lodBox = box;
       const tree = buildMortonLODTree(graph.positions, graph.nodeCount, { ...this.lodOptions.spatial, box }, this.mortonScratch);
       computeLODGeometry(tree, graph, nodeRadii, leafWeight, leafBorder, leafColors, undefined, undefined, this.lodBounds);
+      this.updateLODCrowding(tree);
       this.lodTree = tree;
       this.lodSpatial = true;
       this.lodModules = false;
@@ -3969,6 +4009,7 @@ export class Network extends BaseEngine {
     }
     computeLODGeometry(this.lodTree, graph, nodeRadii, leafWeight, leafBorder, leafColors, radiusAggregate, this.lodDiscs(this.lodTree), this.lodBounds, fillAggregate);
     this.applyLODBorderStyle(this.lodTree, resolved);
+    this.updateLODCrowding(this.lodTree);
     this.lodHasGeometry = true;
   }
 

@@ -186,6 +186,8 @@ interface Phase {
   /** `computeLODStyle` passes and spatial tree builds over the phase's frames (warm-up excluded). */
   stylePasses: number;
   treeBuilds: number;
+  /** Crowding passes (#426): O(tree) like the style pass, so a transition frame runs none either. */
+  crowdingPasses: number;
   created: number;
   deleted: number;
   uploadedPerFrame: number;
@@ -269,6 +271,7 @@ beforeAll(async () => {
       const style0 = real.lod?.lodStylePasses ?? 0;
       const builds0 = real.lod?.mortonTopologyBuilds ?? 0;
       const [box0, syncs0, cuts0, styles0] = [box.calls, net.cameraSyncs, work.cuts, work.styleResolves];
+      const crowd0 = real.lod?.lodCrowdingPasses ?? 0;
       const mark = spy.mark();
       const ts: number[] = [];
       for (let i = 1; i <= FRAMES; i++) {
@@ -282,6 +285,7 @@ beforeAll(async () => {
         medianMs: ts[Math.floor(ts.length / 2)]!,
         stylePasses: (real.lod?.lodStylePasses ?? 0) - style0,
         treeBuilds: (real.lod?.mortonTopologyBuilds ?? 0) - builds0,
+        crowdingPasses: (real.lod?.lodCrowdingPasses ?? 0) - crowd0,
         created: used.created,
         deleted: used.deleted,
         uploadedPerFrame: used.uploadedBytes / FRAMES,
@@ -433,6 +437,10 @@ describe(`network() position transition — per-frame cost vs a streamed layout 
     expect(spatial.transition.treeBuilds, "spatial trees built during the transition").toBe(0);
     expect(spatial.transition.stylePasses, "style passes during the spatial tree's transition").toBe(0);
     expect(off.transition.stylePasses + off.transition.treeBuilds).toBe(0);
+    // The crowding (#426) follows the style pass: once per streamed frame, never on a transition frame.
+    expect(on.streamed.crowdingPasses, "the module leg's streamed frames ran no crowding pass — vacuous").toBeGreaterThanOrEqual(FRAMES);
+    expect(spatial.streamed.crowdingPasses).toBeGreaterThanOrEqual(FRAMES);
+    expect(on.transition.crowdingPasses + spatial.transition.crowdingPasses + off.transition.crowdingPasses, "crowding passes during a transition").toBe(0);
   });
 
   for (const [name, get, ceiling] of [["LOD OFF", () => off, FRAME_MS_OFF], ["LOD ON", () => on, FRAME_MS_ON], ["LOD ON spatial", () => spatial, FRAME_MS_ON]] as const) {

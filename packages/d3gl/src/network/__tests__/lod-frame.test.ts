@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
-import { buildMortonLODTree, computeLODPositions, computeLODStyle, mortonRootBox, lodTreeFromTopology, buildLODTree } from "../lod.js";
-import { MAX_OUTSTANDING, lodFrameStep, lodTreeFromSpatialFrame, makeSpatialLODStream, makeStructureLODStream, recycleSpatialFrame, spatialFrameByteLength, type SpatialLODFrame } from "../lod-frame.js";
+import { buildMortonLODTree, computeLODCrowding, computeLODPositions, computeLODStyle, crowdingHorizon, mortonRootBox, lodTreeFromTopology, buildLODTree } from "../lod.js";
+import { MAX_OUTSTANDING, lodFrameStep, lodTreeFromSpatialFrame, makeSpatialLODStream, makeStructureLODStream, recycleSpatialFrame, setStreamStyle, spatialFrameByteLength, type SpatialLODFrame } from "../lod-frame.js";
 import { buildGraph } from "../graph.js";
 
 function rng(seed: number): () => number {
@@ -113,5 +113,61 @@ describe("lodFrameStep (#343): the one per-frame LOD step", () => {
     computeLODPositions(tree, pos);
     expect(Array.from(worker.cx)).toEqual(Array.from(tree.cx));
     expect(Array.from(worker.extent)).toEqual(Array.from(tree.extent));
+    expect(worker.clearZoom.every((z) => z === Infinity)).toBe(true); // no style: no crowding (#426)
+  });
+});
+
+describe("lodFrameStep carries the crowding (#426)", () => {
+  const n = 2000;
+  const radii = Float32Array.from({ length: n }, (_, i) => 1 + (i % 6));
+  const weight = new Float32Array(n).fill(1);
+
+  it("a spatial frame's clear zoom equals a main-thread crowding pass over the same tree", () => {
+    const pos = cloud(n, 11);
+    for (const crowding of [{ screenSized: true }, { screenSized: false }, { screenSized: true, expandPx: 300 }]) {
+      const stream = makeSpatialLODStream(n, { radii, weight, crowding }, 1);
+      const frame = lodFrameStep(stream, pos, 1);
+      if (!frame) throw new Error("no frame");
+      const got = lodTreeFromSpatialFrame(frame);
+      const want = buildMortonLODTree(pos, n, { box: mortonRootBox(pos, n) });
+      computeLODPositions(want, pos);
+      computeLODStyle(want, radii, weight);
+      computeLODCrowding(want, { screenSized: crowding.screenSized, expandPx: crowdingHorizon(want, crowding.expandPx) });
+      expect(Array.from(got.clearZoom)).toEqual(Array.from(want.clearZoom));
+      expect(got.clearZoom.subarray(n).some((z) => z < Infinity)).toBe(true); // not vacuous
+    }
+    // Without crowding inputs, a reused buffer is reset to "none" rather than keeping the last frame's.
+    const stream = makeSpatialLODStream(n, { radii, weight, crowding: { screenSized: true } }, 1);
+    const a = lodFrameStep(stream, pos, 1);
+    if (!a) throw new Error("no frame");
+    recycleSpatialFrame(stream, a.buffer);
+    setStreamStyle(stream, { radii, weight }, 2);
+    const b = lodFrameStep(stream, pos, 2);
+    expect(b?.buffer).toBe(a.buffer);
+    if (!b) throw new Error("no frame");
+    expect(lodTreeFromSpatialFrame(b).clearZoom.every((z) => z === Infinity)).toBe(true);
+  });
+
+  it("a structure stream refits its crowding in place from the style it was given", () => {
+    const src: number[] = [];
+    const tgt: number[] = [];
+    for (let i = 1; i < n; i++) { src.push(i); tgt.push(i >> 1); }
+    const g = buildGraph({ nodeCount: n, source: src, target: tgt });
+    const tree = buildLODTree(g);
+    const worker = lodTreeFromTopology(tree);
+    const stream = makeStructureLODStream(worker, { radii, weight, crowding: { screenSized: true } });
+    const pos = cloud(n, 12);
+    expect(lodFrameStep(stream, pos, 1)).toBeNull();
+    computeLODPositions(tree, pos);
+    computeLODStyle(tree, radii, weight);
+    computeLODCrowding(tree, { screenSized: true, expandPx: crowdingHorizon(tree) });
+    expect(Array.from(worker.clearZoom)).toEqual(Array.from(tree.clearZoom));
+    // A new style reaches the next frame's crowding.
+    const bigger = radii.map((r) => r * 3);
+    setStreamStyle(stream, { radii: bigger, weight, crowding: { screenSized: true } }, 2);
+    lodFrameStep(stream, pos, 2);
+    computeLODStyle(tree, bigger, weight);
+    computeLODCrowding(tree, { screenSized: true, expandPx: crowdingHorizon(tree) });
+    expect(Array.from(worker.clearZoom)).toEqual(Array.from(tree.clearZoom));
   });
 });
