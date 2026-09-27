@@ -706,6 +706,12 @@ export let mortonTopologyBuilds = 0;
 export let lodStylePasses = 0;
 /** Crowding passes run ({@link computeLODCrowding}, #426) in this realm — test instrumentation, like the two above. */
 export let lodCrowdingPasses = 0;
+/**
+ * Node pairs the crowding passes examined in this realm (#426): every pair whose bound or exact pair zoom a
+ * pass evaluated. Test instrumentation, like the counters above — the deterministic signature that a pass
+ * prunes in two dimensions (pairs per member stay bounded on a wide node) rather than along one axis.
+ */
+export let lodCrowdingPairs = 0;
 /** Bits per axis of a Morton code; a cell is at most this many levels below the root box. */
 const MORTON_BITS = 16;
 /** Quantisation steps per axis (`2^16`). */
@@ -1747,10 +1753,25 @@ function clearReachOf(z: number, a: number, b: number, screen: boolean): number 
 }
 
 /**
+ * Children per bucket of the 2-D index the crowding pass builds over a wide node's children (#426). A bucket
+ * is swept along x: sorted by the children's left edges, each tested against the next ones until the
+ * horizontal gap alone is past the reach at which a pair could beat the value so far. That one-axis window
+ * grows as the square root of what it sweeps, so a wider node is split at the median of its children's box
+ * centres, along the longer side, until each bucket holds at most this many, and its buckets are joined by a
+ * dual walk that prunes on both axes. The size balances the two: on 100k-leaf fixtures, buckets of 16 and 32
+ * cost 1.8× and 1.6× the plain sweep on 50-member modules and 64 matches it, while a 100k-member module stays
+ * 5× faster than one sweep. A spatial tree (≤ 8 children per node), a coarsening tree and most modules are
+ * one bucket each: swept exactly as without an index.
+ */
+const CROWDING_BUCKET = 64;
+
+/**
  * Reusable working storage for {@link computeLODCrowding} (#426): each aggregate's members' box, largest
- * radius and horizon extent, the dual walk's pair stack, and one node's children gathered for the sweep —
- * grown on demand to the largest tree seen, so a pass run per streamed frame allocates nothing once warm.
- * About 24 B per aggregate plus 44 B per child of the widest node.
+ * radius, horizon extent and 2-D index root, the index entries of the wide nodes, the walk's pair stack, and
+ * one node's children gathered at a time — grown on demand to the largest tree seen, so a pass run per
+ * streamed frame allocates nothing once warm. 28 B per aggregate; about 6 B per child of an indexed node (a
+ * wide node that is not crowded: 36 B per index entry, at most one per 16 children, and 4 B in `perm`); and
+ * 48 B per child of the widest node.
  */
 export interface LODCrowdingScratch {
   /** Per aggregate `o = g − leafCount`: its members' box, `[minX, minY, maxX, maxY]` at `4o`. */
@@ -1762,12 +1783,30 @@ export interface LODCrowdingScratch {
    * its clear zoom must be exact (`Infinity`: none needed, see {@link computeLODCrowding}).
    */
   lo: Float32Array;
-  /** The dual walk's stack of node pairs. */
+  /**
+   * Per aggregate: 1 + the index entry at the root of the 2-D index over its children, or 0 when it has none —
+   * its children form one bucket ({@link CROWDING_BUCKET}), or it is crowded (no walk ever enters it).
+   */
+  kdRoot: Uint32Array;
+  /** Per index entry `p`: its members' box at `4p`, largest effective radius and member (leaf) count. */
+  kdBox: Float32Array;
+  kdR: Float32Array;
+  kdCount: Uint32Array;
+  /** Per index entry: its first child entry (the second is next to it), or 0 for a bucket. */
+  kdLeft: Uint32Array;
+  /** Per entry: the range `[kdLo, kdHi)` of {@link perm} its children fill (a bucket's, in x order). */
+  kdLo: Uint32Array;
+  kdHi: Uint32Array;
+  /** Every indexed node's children, bucket by bucket, each in x order: a bucket is a range of it. */
+  perm: Uint32Array;
+  /** The index's job stack: an entry's own pairs, or the pairs across its two halves. */
+  kdStack: Uint32Array;
+  /** The walk's stack of handle pairs (a tree node id, or `size` + an index entry). */
   pairA: Uint32Array;
   pairB: Uint32Array;
   /**
-   * One node's children, gathered once per node so its sweep reads them from one place: the child id, its
-   * box (a leaf's is its point) and its largest effective radius, and the sweep order (by the box's left edge).
+   * One node's children, gathered once per node: the child id, its box (a leaf's is its point), its largest
+   * effective radius, and the children that can form a pair (`order`, reordered by the index and the sweeps).
    */
   kid: Uint32Array;
   kx0: Float64Array;
@@ -1782,7 +1821,9 @@ export interface LODCrowdingScratch {
 export function makeLODCrowdingScratch(): LODCrowdingScratch {
   const k = 16;
   return {
-    box: new Float32Array(0), rmax: new Float32Array(0), lo: new Float32Array(0), pairA: new Uint32Array(64), pairB: new Uint32Array(64),
+    box: new Float32Array(0), rmax: new Float32Array(0), lo: new Float32Array(0), kdRoot: new Uint32Array(0),
+    kdBox: new Float32Array(0), kdR: new Float32Array(0), kdCount: new Uint32Array(0), kdLeft: new Uint32Array(0), kdLo: new Uint32Array(0), kdHi: new Uint32Array(0),
+    perm: new Uint32Array(0), kdStack: new Uint32Array(96), pairA: new Uint32Array(64), pairB: new Uint32Array(64),
     kid: new Uint32Array(k), kx0: new Float64Array(k), ky0: new Float64Array(k), kx1: new Float64Array(k), ky1: new Float64Array(k), kr: new Float64Array(k), order: new Uint32Array(k),
   };
 }
@@ -1797,6 +1838,47 @@ function growChildScratch(sc: LODCrowdingScratch, n: number): void {
   sc.ky1 = new Float64Array(cap);
   sc.kr = new Float64Array(cap);
   sc.order = new Uint32Array(cap);
+}
+
+/** Grow the index entries of `sc` to hold `n`, keeping the ones in use (an ancestor's walk still reads them). */
+function growIndexScratch(sc: LODCrowdingScratch, n: number): void {
+  const cap = Math.max(n, sc.kdR.length * 2, 64);
+  const kdBox = new Float32Array(4 * cap);
+  kdBox.set(sc.kdBox);
+  sc.kdBox = kdBox;
+  const kdR = new Float32Array(cap);
+  kdR.set(sc.kdR);
+  sc.kdR = kdR;
+  const kdCount = new Uint32Array(cap);
+  kdCount.set(sc.kdCount);
+  sc.kdCount = kdCount;
+  const kdLeft = new Uint32Array(cap);
+  kdLeft.set(sc.kdLeft);
+  sc.kdLeft = kdLeft;
+  const kdLo = new Uint32Array(cap);
+  kdLo.set(sc.kdLo);
+  sc.kdLo = kdLo;
+  const kdHi = new Uint32Array(cap);
+  kdHi.set(sc.kdHi);
+  sc.kdHi = kdHi;
+}
+
+/** Grow `sc.perm` to hold `n`, keeping its contents. */
+function growPermScratch(sc: LODCrowdingScratch, n: number): void {
+  const perm = new Uint32Array(Math.max(n, sc.perm.length * 2, 64));
+  perm.set(sc.perm);
+  sc.perm = perm;
+}
+
+/** Grow the walk's pair stack of `sc` to hold `n` pairs, keeping its contents. */
+function growPairScratch(sc: LODCrowdingScratch, n: number): void {
+  const cap = Math.max(n, sc.pairA.length * 2);
+  const a = new Uint32Array(cap);
+  a.set(sc.pairA);
+  sc.pairA = a;
+  const b = new Uint32Array(cap);
+  b.set(sc.pairB);
+  sc.pairB = b;
 }
 
 /** Options for {@link computeLODCrowding}. */
@@ -1818,42 +1900,39 @@ export type LODCrowdingTree = Pick<
   "size" | "leafCount" | "levelCount" | "levelOffset" | "childOffset" | "children" | "cx" | "cy" | "extent" | "count" | "radius" | "clearZoom"
 >;
 
-/** Sift entry `root` down the max-heap `order[0, end)` of indices into `key`. */
-function siftDown(order: Uint32Array, key: Float64Array, root: number, end: number): void {
-  let i = root;
-  for (;;) {
-    let c = 2 * i + 1;
-    if (c >= end) return;
-    if (c + 1 < end && key[order[c + 1]!]! > key[order[c]!]!) c++;
-    if (!(key[order[c]!]! > key[order[i]!]!)) return;
-    const t = order[i]!; order[i] = order[c]!; order[c] = t;
-    i = c;
-  }
-}
-
 /**
- * Sort the indices `order[0, n)` ascending by `key[order[i]]`, in place, allocating nothing: an insertion
- * sort for a short list (a spatial bottom cell's ≤ 8 leaves, a quadtree cell's ≤ 4 children), a heapsort —
- * O(n log n) — for a long one (a module with thousands of members). Either gives the same order.
+ * Reorder `order[lo, hi)` so that `order[nth]` holds the entry of rank `nth − lo` by `e0[j] + e1[j]` (twice a
+ * box centre), with no larger key before it and no smaller one after — Hoare's selection, expected O(hi − lo),
+ * allocating nothing. Equal keys (a lattice's columns) split evenly. A NaN key (a box with members at both
+ * infinities) only makes the split uneven: the index stays correct whatever the partition.
  */
-function sortByKey(order: Uint32Array, key: Float64Array, n: number): void {
-  if (n <= 16) {
-    for (let i = 1; i < n; i++) {
-      const v = order[i]!;
-      const kv = key[v]!;
-      let j = i - 1;
-      while (j >= 0 && key[order[j]!]! > kv) {
-        order[j + 1] = order[j]!;
+function selectNth(order: Uint32Array, e0: Float64Array, e1: Float64Array, lo: number, hi: number, nth: number): void {
+  let l = lo;
+  let r = hi - 1;
+  while (r > l) {
+    const jl = order[l] ?? 0;
+    const jm = order[(l + r) >>> 1] ?? 0;
+    const jr = order[r] ?? 0;
+    const a = (e0[jl] ?? 0) + (e1[jl] ?? 0);
+    const b = (e0[jm] ?? 0) + (e1[jm] ?? 0);
+    const c = (e0[jr] ?? 0) + (e1[jr] ?? 0);
+    const pivot = a < b ? (b < c ? b : a < c ? c : a) : a < c ? a : b < c ? c : b; // median of three
+    let i = l;
+    let j = r;
+    while (i <= j) {
+      for (let q = order[i] ?? 0; (e0[q] ?? 0) + (e1[q] ?? 0) < pivot; q = order[i] ?? 0) i++;
+      for (let q = order[j] ?? 0; (e0[q] ?? 0) + (e1[q] ?? 0) > pivot; q = order[j] ?? 0) j--;
+      if (i <= j) {
+        const t = order[i] ?? 0;
+        order[i] = order[j] ?? 0;
+        order[j] = t;
+        i++;
         j--;
       }
-      order[j + 1] = v;
     }
-    return;
-  }
-  for (let i = (n >> 1) - 1; i >= 0; i--) siftDown(order, key, i, n);
-  for (let end = n - 1; end > 0; end--) {
-    const t = order[0]!; order[0] = order[end]!; order[end] = t;
-    siftDown(order, key, 0, end);
+    if (nth <= j) r = j;
+    else if (nth >= i) l = i;
+    else return;
   }
 }
 
@@ -1864,28 +1943,32 @@ function sortByKey(order: Uint32Array, key: Float64Array, n: number): void {
  *
  * Exact per node, over its own members (a node's value is the largest pair zoom among them), computed
  * bottom-up: a node starts from its children's values — any pair inside one child — and adds the pairs
- * across its children with a sweep over the children's boxes and a dual walk down both subtrees, pruned
- * by the box distance and each subtree's largest radius against the value so far. A node whose value
- * reaches its **horizon** stops there and stores `Infinity`. The horizon is the zoom at which the node's
- * footprint hits `opts.expandPx` — the footprint rule opens it first, so its exact value cannot matter past
- * it — or, when later, an ancestor's: an ancestor starts from its children's values, and extents need not
- * grow up the tree (a clump with one far member reaches farther from its centroid than its parent's members
- * do from theirs). So each node is exact up to `expandPx / (2·e)`, `e` the least extent on its path to the
- * root — at most twice its own horizon, since an ancestor's extent is at least half a descendant's (both
- * bound the descendant's members, whose box the ancestor's contains; a nested layout's discs nest too). That
- * horizon is what keeps the pass cheap on dense layouts — a crowded node stops at its first children — while
- * every node a view could open by overlap is exact. A node whose extent is not finite (a member with a
+ * across its children: a sweep of the children along x, and a dual walk down two children's subtrees, pruned
+ * by the box distance and each side's largest radius against the value so far. A node with more than
+ * {@link CROWDING_BUCKET} children is swept in buckets of a 2-D index over its children (median splits of
+ * their boxes, built as the node's pass goes) and its buckets are joined by the walk, which also descends
+ * through that index when an ancestor walks into the node. So the pass prunes on both axes at any width: a
+ * flat module of `m` members, and a walk between two wide modules whose members interleave, cost about
+ * O(m log m) — swept along one axis alone they cost O(m·√m) and O(m²).
+ *
+ * A node whose value reaches its **horizon** stops there and stores `Infinity`. The horizon is the zoom at
+ * which the node's footprint hits `opts.expandPx` — the footprint rule opens it first, so its exact value
+ * cannot matter past it — or, when later, an ancestor's: an ancestor starts from its children's values, and
+ * extents need not grow up the tree (a clump with one far member reaches farther from its centroid than its
+ * parent's members do from theirs). So each node is exact up to `expandPx / (2·e)`, `e` the least extent on
+ * its path to the root — at most twice its own horizon, since an ancestor's extent is at least half a
+ * descendant's (both bound the descendant's members, whose box the ancestor's contains; a nested layout's
+ * discs nest too). That horizon keeps the pass cheap on dense layouts — a crowded node stops at its first
+ * children, or after one root-to-bucket path of its index, and no ancestor walks into it (the ancestor
+ * inherits its `Infinity`) — while every node a view could open by overlap is exact. A node whose extent is not finite (a member with a
  * non-finite position) needs none: the cut never opens a node whose footprint is NaN. Such a member forms no
  * pair anywhere.
  *
  * Run it after the position pass and the style pass, whenever either changes (a style change moves the
- * radii). O(tree size) for the boxes plus the pairs the sweep and the walks cannot prune — every pair of a
- * bottom cell that is not yet crowded, and the members near the borders between siblings. With `scratch`
+ * radii). O(tree size) for the boxes, O(m log m) to index a node of `m` > {@link CROWDING_BUCKET} children
+ * that is not crowded, plus the pairs the sweeps and the walks cannot prune — those inside a bucket's x window
+ * while the node is not yet crowded, and the members near the borders between siblings. With `scratch`
  * ({@link makeLODCrowdingScratch}) a pass allocates nothing once warm.
- *
- * Worst case: the sweep prunes along one axis, so a node with `m` children spread evenly (a module on a
- * lattice or a packed disc) visits about `√m` of them per child — O(m·√m) — until its value reaches its
- * horizon, which bounds that window to about `expandPx / (2ρ)` children, `ρ` the smallest glyph radius.
  */
 export function computeLODCrowding(tree: LODCrowdingTree, opts: CrowdingOptions, scratch?: LODCrowdingScratch): void {
   lodCrowdingPasses++;
@@ -1898,14 +1981,27 @@ export function computeLODCrowding(tree: LODCrowdingTree, opts: CrowdingOptions,
     sc.box = new Float32Array(4 * cells);
     sc.rmax = new Float32Array(cells);
     sc.lo = new Float32Array(cells);
+    sc.kdRoot = new Uint32Array(cells);
   }
-  const box = sc.box;
-  const rmax = sc.rmax;
-  const lo = sc.lo;
+  const { box, rmax, lo, kdRoot } = sc;
+  let entries = 0; // index entries in use
+  let permTop = 0; // perm in use
+  let seen = 0; // node pairs examined (lodCrowdingPairs)
   // A glyph covers at least half a pixel: floor screen radii once here; world radii scale with the zoom.
   const eff = (i: number): number => {
-    const r = radius[i]!;
+    const r = radius[i] ?? 0;
     return screen ? (r > MIN_SCREEN_RADIUS ? r : MIN_SCREEN_RADIUS) : r > 0 ? r : 0;
+  };
+  // The larger of `beta` and the pair zoom of two leaves `(dx, dy)` apart with effective radii `ra`, `rb`. With
+  // screen radii it is (ra + rb) / d, so a pair that cannot beat beta ((ra + rb)² ≤ beta²·d²) needs no root.
+  const leafPair = (dx: number, dy: number, ra: number, rb: number, beta: number): number => {
+    const d2 = dx * dx + dy * dy;
+    if (screen) {
+      const sum = ra + rb;
+      return sum * sum > beta * beta * d2 ? sum / Math.sqrt(d2) : beta;
+    }
+    const z = clearZoomOf(Math.sqrt(d2), ra, rb, false);
+    return z > beta ? z : beta;
   };
   for (let i = 0; i < leafCount; i++) clearZoom[i] = 0; // a leaf has no two members
 
@@ -1927,59 +2023,311 @@ export function computeLODCrowding(tree: LODCrowdingTree, opts: CrowdingOptions,
     }
   }
 
-  // The largest pair zoom across `a` and `b`'s members above `beta`, stopping at `cap` (a dual walk).
-  const dual = (a: number, b: number, beta: number, cap: number): number => {
+  /**
+   * The largest pair zoom above `beta` across the handle pairs on the stack's first `sp` slots, stopping at
+   * `cap`. A handle is a tree node (`< size`) or an entry of a wide node's index (`size + p`). A pair is
+   * dropped once its box distance and largest radii cannot beat `beta`; else the side with more members
+   * (never a leaf) is split: an index entry into its two halves or its bucket's members, a tree node into its
+   * index's two root halves or, unindexed, its children. A bucket against one leaf is scanned directly, in
+   * its x order, up to the reach at which a pair can still beat `beta`.
+   */
+  const walk = (sp0: number, beta0: number, cap: number): number => {
+    let sp = sp0;
+    let beta = beta0;
     let pa = sc.pairA;
     let pb = sc.pairB;
-    pa[0] = a;
-    pb[0] = b;
-    let sp = 1;
+    let pairs = 0;
+    const { kdBox, kdR, kdCount, kdLeft, kdLo, kdHi, perm } = sc;
     while (sp > 0 && beta < cap) {
       sp--;
-      const A = pa[sp]!;
-      const B = pb[sp]!;
-      const aLeaf = A < leafCount;
-      const bLeaf = B < leafCount;
-      const oa = 4 * (A - leafCount);
-      const ob = 4 * (B - leafCount);
-      const ax0 = aLeaf ? cx[A]! : box[oa]!;
-      const ay0 = aLeaf ? cy[A]! : box[oa + 1]!;
-      const ax1 = aLeaf ? ax0 : box[oa + 2]!;
-      const ay1 = aLeaf ? ay0 : box[oa + 3]!;
-      const bx0 = bLeaf ? cx[B]! : box[ob]!;
-      const by0 = bLeaf ? cy[B]! : box[ob + 1]!;
-      const bx1 = bLeaf ? bx0 : box[ob + 2]!;
-      const by1 = bLeaf ? by0 : box[ob + 3]!;
+      pairs++;
+      const A = pa[sp] ?? 0;
+      const B = pb[sp] ?? 0;
+      let ax0: number, ay0: number, ax1: number, ay1: number, ra: number, na: number;
+      if (A < leafCount) {
+        ax0 = ax1 = cx[A] ?? 0;
+        ay0 = ay1 = cy[A] ?? 0;
+        ra = eff(A);
+        na = 1;
+      } else if (A < size) {
+        const o = A - leafCount;
+        ax0 = box[4 * o] ?? 0;
+        ay0 = box[4 * o + 1] ?? 0;
+        ax1 = box[4 * o + 2] ?? 0;
+        ay1 = box[4 * o + 3] ?? 0;
+        ra = rmax[o] ?? 0;
+        na = count[A] ?? 0;
+      } else {
+        const q = A - size;
+        ax0 = kdBox[4 * q] ?? 0;
+        ay0 = kdBox[4 * q + 1] ?? 0;
+        ax1 = kdBox[4 * q + 2] ?? 0;
+        ay1 = kdBox[4 * q + 3] ?? 0;
+        ra = kdR[q] ?? 0;
+        na = kdCount[q] ?? 0;
+      }
+      let bx0: number, by0: number, bx1: number, by1: number, rb: number, nb: number;
+      if (B < leafCount) {
+        bx0 = bx1 = cx[B] ?? 0;
+        by0 = by1 = cy[B] ?? 0;
+        rb = eff(B);
+        nb = 1;
+      } else if (B < size) {
+        const o = B - leafCount;
+        bx0 = box[4 * o] ?? 0;
+        by0 = box[4 * o + 1] ?? 0;
+        bx1 = box[4 * o + 2] ?? 0;
+        by1 = box[4 * o + 3] ?? 0;
+        rb = rmax[o] ?? 0;
+        nb = count[B] ?? 0;
+      } else {
+        const q = B - size;
+        bx0 = kdBox[4 * q] ?? 0;
+        by0 = kdBox[4 * q + 1] ?? 0;
+        bx1 = kdBox[4 * q + 2] ?? 0;
+        by1 = kdBox[4 * q + 3] ?? 0;
+        rb = kdR[q] ?? 0;
+        nb = kdCount[q] ?? 0;
+      }
       const gx = ax0 > bx1 ? ax0 - bx1 : bx0 > ax1 ? bx0 - ax1 : 0;
       const gy = ay0 > by1 ? ay0 - by1 : by0 > ay1 ? by0 - ay1 : 0;
-      const z = clearZoomOf(Math.sqrt(gx * gx + gy * gy), aLeaf ? eff(A) : rmax[A - leafCount]!, bLeaf ? eff(B) : rmax[B - leafCount]!, screen);
+      const z = clearZoomOf(Math.sqrt(gx * gx + gy * gy), ra, rb, screen);
       if (!(z > beta)) continue; // no pair across them beats beta (NaN: a non-finite position, skipped)
-      if (aLeaf && bLeaf) {
+      if (A < leafCount && B < leafCount) {
         beta = z; // two leaves: the box distance is their distance, the bound their exact pair zoom
         continue;
       }
-      // Split the side with more members (never a leaf) into its children.
-      const splitA = bLeaf || (!aLeaf && count[A]! >= count[B]!);
+      const splitA = B < leafCount || (A >= leafCount && na >= nb);
       const s = splitA ? A : B;
-      const need = sp + childOffset[s + 1]! - childOffset[s]!;
-      if (need > pa.length) {
-        const cap2 = Math.max(need, pa.length * 2);
-        const na = new Uint32Array(cap2); na.set(pa); sc.pairA = pa = na;
-        const nb = new Uint32Array(cap2); nb.set(pb); sc.pairB = pb = nb;
+      const t = splitA ? B : A;
+      const rs = splitA ? ra : rb;
+      let l = 0; // the first of the two index halves `s` splits into; 0: it splits into a range of tree nodes
+      let from = 0;
+      let to = 0;
+      let list: Uint32Array = children;
+      let sorted = false; // the range is in x order (an index bucket)
+      if (s >= size) {
+        const q = s - size;
+        l = kdLeft[q] ?? 0;
+        from = kdLo[q] ?? 0;
+        to = kdHi[q] ?? 0;
+        list = perm;
+        sorted = true;
+      } else {
+        const root = kdRoot[s - leafCount] ?? 0;
+        if (root > 0) l = kdLeft[root - 1] ?? 0;
+        from = childOffset[s] ?? 0;
+        to = childOffset[s + 1] ?? 0;
       }
-      for (let p = childOffset[s]!; p < childOffset[s + 1]!; p++) {
-        pa[sp] = splitA ? children[p]! : A;
-        pb[sp] = splitA ? B : children[p]!;
+      if (l > 0) {
+        if (sp + 2 > pa.length) {
+          growPairScratch(sc, sp + 2);
+          pa = sc.pairA;
+          pb = sc.pairB;
+        }
+        pa[sp] = size + l;
+        pb[sp] = t;
+        pa[sp + 1] = size + l + 1;
+        pb[sp + 1] = t;
+        sp += 2;
+        continue;
+      }
+      if (sp + to - from > pa.length) {
+        growPairScratch(sc, sp + to - from);
+        pa = sc.pairA;
+        pb = sc.pairB;
+      }
+      if (t < leafCount) {
+        // A range of tree nodes against one leaf: each leaf in it directly (no push per pair), the rest walked;
+        // a bucket, in x order, only up to the reach at which a pair can still beat beta.
+        const tx = cx[t] ?? 0;
+        const ty = cy[t] ?? 0;
+        const rt = eff(t);
+        let reach = sorted ? clearReachOf(beta, rt, rs, screen) : Infinity;
+        for (let i = from; i < to; i++) {
+          const c = list[i] ?? 0;
+          if (c < leafCount) {
+            const x = cx[c] ?? 0;
+            if (x - tx >= reach) break;
+            pairs++;
+            const was = beta;
+            beta = leafPair(x - tx, (cy[c] ?? 0) - ty, eff(c), rt, beta);
+            if (sorted && beta > was) reach = clearReachOf(beta, rt, rs, screen);
+          } else {
+            if ((box[4 * (c - leafCount)] ?? 0) - tx >= reach) break;
+            pa[sp] = c;
+            pb[sp] = t;
+            sp++;
+          }
+        }
+        continue;
+      }
+      for (let i = from; i < to; i++) {
+        pa[sp] = list[i] ?? 0;
+        pb[sp] = t;
         sp++;
+      }
+    }
+    seen += pairs;
+    return beta;
+  };
+
+  /**
+   * Sweep the children `sc.order[a, b)` of the node being processed (gathered into the child scratch) — one
+   * bucket: sort them by their box's left edge, then test each against the later ones until the horizontal
+   * gap alone is past the reach at which even the largest radii (`rm`) could beat beta. Two leaves directly,
+   * anything else by a {@link walk}. With `base ≥ 0` the bucket's tree nodes are written, in that order, to
+   * `perm[base + a, base + b)` for an ancestor's walk.
+   */
+  const sweep = (a: number, b: number, rm: number, beta0: number, cap: number, base: number): number => {
+    const { kid, kx0, ky0, kx1, kr, order } = sc;
+    let beta = beta0;
+    // Insertion sort: a bucket holds at most CROWDING_BUCKET children.
+    for (let i = a + 1; i < b; i++) {
+      const v = order[i] ?? 0;
+      const kv = kx0[v] ?? 0;
+      let j = i - 1;
+      while (j >= a && (kx0[order[j] ?? 0] ?? 0) > kv) {
+        order[j + 1] = order[j] ?? 0;
+        j--;
+      }
+      order[j + 1] = v;
+    }
+    if (base >= 0) {
+      const perm = sc.perm;
+      for (let i = a; i < b; i++) perm[base + i] = kid[order[i] ?? 0] ?? 0;
+    }
+    for (let i = a; i < b && beta < cap; i++) {
+      const ja = order[i] ?? 0;
+      const A = kid[ja] ?? 0;
+      const aLeaf = A < leafCount;
+      const ax = kx0[ja] ?? 0;
+      const ay = ky0[ja] ?? 0;
+      const right = kx1[ja] ?? 0;
+      const rA = kr[ja] ?? 0;
+      let reach = clearReachOf(beta, rA, rm, screen);
+      for (let j = i + 1; j < b && beta < cap; j++) {
+        const jb = order[j] ?? 0;
+        if ((kx0[jb] ?? 0) - right >= reach) break;
+        seen++;
+        const B = kid[jb] ?? 0;
+        let z: number;
+        if (aLeaf && B < leafCount) {
+          z = leafPair(ax - (kx0[jb] ?? 0), ay - (ky0[jb] ?? 0), rA, kr[jb] ?? 0, beta);
+        } else {
+          sc.pairA[0] = A;
+          sc.pairB[0] = B;
+          z = walk(1, beta, cap);
+        }
+        if (z > beta) {
+          beta = z;
+          reach = clearReachOf(beta, rA, rm, screen);
+        }
       }
     }
     return beta;
   };
 
+  /** A new index entry over `sc.order[a, b)` of the node being processed: its members' box, radius and count. */
+  const entry = (a: number, b: number, base: number): number => {
+    const p = entries++;
+    const { kid, kx0, ky0, kx1, ky1, kr, order, kdBox, kdR, kdCount, kdLeft, kdLo, kdHi } = sc;
+    let x0 = Infinity;
+    let y0 = Infinity;
+    let x1 = -Infinity;
+    let y1 = -Infinity;
+    let rm = 0;
+    let members = 0;
+    for (let i = a; i < b; i++) {
+      const j = order[i] ?? 0;
+      const c = kid[j] ?? 0;
+      const u0 = kx0[j] ?? 0;
+      const v0 = ky0[j] ?? 0;
+      const u1 = kx1[j] ?? 0;
+      const v1 = ky1[j] ?? 0;
+      const r = kr[j] ?? 0;
+      if (u0 < x0) x0 = u0;
+      if (v0 < y0) y0 = v0;
+      if (u1 > x1) x1 = u1;
+      if (v1 > y1) y1 = v1;
+      if (r > rm) rm = r;
+      members += c < leafCount ? 1 : (count[c] ?? 0);
+    }
+    kdBox[4 * p] = x0;
+    kdBox[4 * p + 1] = y0;
+    kdBox[4 * p + 2] = x1;
+    kdBox[4 * p + 3] = y1;
+    kdR[p] = rm;
+    kdCount[p] = members;
+    kdLeft[p] = 0;
+    kdLo[p] = base + a;
+    kdHi[p] = base + b;
+    return p;
+  };
+
+  /**
+   * A wide node's own pairs, through a 2-D index over its `m` children (`sc.order[0, m)`), built as the pass
+   * goes: an entry over more than {@link CROWDING_BUCKET} children is split at the median centre along its
+   * box's longer side when first reached, its halves' own pairs come first — they hold the nearest ones —
+   * and the pairs across them after, walked; a bucket is swept. A node found crowded stops with its index
+   * half built (no walk enters a crowded node: an ancestor inherits its `Infinity`). Returns the node's value
+   * (≥ `cap` when crowded) and sets its index root. O(m log m) for a full index.
+   */
+  const indexed = (og: number, m: number, beta0: number, cap: number): number => {
+    let beta = beta0;
+    // Halves of a range over a bucket hold at least half a bucket: at most 2m/B buckets, 4m/B entries.
+    const need = entries + Math.ceil((4 * m) / CROWDING_BUCKET) + 1;
+    if (need > sc.kdR.length) growIndexScratch(sc, need);
+    if (permTop + m > sc.perm.length) growPermScratch(sc, permTop + m);
+    const base = permTop;
+    permTop += m;
+    const root = entry(0, m, base);
+    kdRoot[og] = root + 1;
+    // Jobs: `2p` for an entry's own pairs, `2p + 1` for the pairs across its two halves.
+    let st = sc.kdStack;
+    st[0] = 2 * root;
+    let sp = 1;
+    while (sp > 0 && beta < cap) {
+      const job = st[--sp] ?? 0;
+      const p = job >>> 1;
+      const { kdBox, kdR, kdLeft, kdLo, kdHi } = sc;
+      if (job & 1) {
+        const l = kdLeft[p] ?? 0;
+        sc.pairA[0] = size + l;
+        sc.pairB[0] = size + l + 1;
+        beta = walk(1, beta, cap);
+        continue;
+      }
+      const a = (kdLo[p] ?? 0) - base;
+      const b = (kdHi[p] ?? 0) - base;
+      if (b - a <= CROWDING_BUCKET) {
+        beta = sweep(a, b, kdR[p] ?? 0, beta, cap, base);
+        continue;
+      }
+      const mid = (a + b) >>> 1;
+      if ((kdBox[4 * p + 3] ?? 0) - (kdBox[4 * p + 1] ?? 0) > (kdBox[4 * p + 2] ?? 0) - (kdBox[4 * p] ?? 0)) selectNth(sc.order, sc.ky0, sc.ky1, a, b, mid);
+      else selectNth(sc.order, sc.kx0, sc.kx1, a, b, mid);
+      const l = entry(a, mid, base);
+      entry(mid, b, base);
+      kdLeft[p] = l;
+      if (sp + 3 > st.length) {
+        const grown = new Uint32Array(2 * st.length);
+        grown.set(st);
+        sc.kdStack = st = grown;
+      }
+      st[sp] = 2 * p + 1;
+      st[sp + 1] = 2 * (l + 1);
+      st[sp + 2] = 2 * l;
+      sp += 3;
+    }
+    return beta;
+  };
+
   for (let k = 1; k < levelCount; k++) {
-    for (let g = levelOffset[k]!; g < levelOffset[k + 1]!; g++) {
-      const c0 = childOffset[g]!;
-      const n = childOffset[g + 1]! - c0;
+    const gEnd = levelOffset[k + 1] ?? 0;
+    for (let g = levelOffset[k] ?? 0; g < gEnd; g++) {
+      const c0 = childOffset[g] ?? 0;
+      const n = (childOffset[g + 1] ?? 0) - c0;
       if (n > sc.kid.length) growChildScratch(sc, n);
       const { kid, kx0, ky0, kx1, ky1, kr, order } = sc;
       // Gather the children once — id, box, largest radius — and fold them into this node's box.
@@ -1989,35 +2337,38 @@ export function computeLODCrowding(tree: LODCrowdingTree, opts: CrowdingOptions,
       let y1 = -Infinity;
       let rm = 0;
       let beta = 0; // the largest pair zoom inside any one child
-      let swept = 0; // children in the sweep: a leaf with a non-finite position forms no pair, so it stays out
+      let swept = 0; // children that can form a pair: a leaf at a finite position, an aggregate with members
       for (let j = 0; j < n; j++) {
-        const c = children[c0 + j]!;
+        const c = children[c0 + j] ?? 0;
         kid[j] = c;
+        let u0: number, v0: number, u1: number, v1: number, r: number;
         if (c < leafCount) {
-          const x = cx[c]!;
-          const y = cy[c]!;
-          kx0[j] = x;
-          kx1[j] = x;
-          ky0[j] = y;
-          ky1[j] = y;
-          kr[j] = eff(c);
+          u0 = u1 = cx[c] ?? 0;
+          v0 = v1 = cy[c] ?? 0;
+          r = eff(c);
           // A NaN sort key would stall the sort, and the sweep's early break would then skip real pairs.
-          if (Number.isFinite(x) && Number.isFinite(y)) order[swept++] = j;
+          if (Number.isFinite(u0) && Number.isFinite(v0)) order[swept++] = j;
         } else {
-          const o = 4 * (c - leafCount);
-          kx0[j] = box[o]!;
-          ky0[j] = box[o + 1]!;
-          kx1[j] = box[o + 2]!;
-          ky1[j] = box[o + 3]!;
-          kr[j] = rmax[c - leafCount]!;
-          if (clearZoom[c]! > beta) beta = clearZoom[c]!;
-          order[swept++] = j;
+          const o = c - leafCount;
+          u0 = box[4 * o] ?? 0;
+          v0 = box[4 * o + 1] ?? 0;
+          u1 = box[4 * o + 2] ?? 0;
+          v1 = box[4 * o + 3] ?? 0;
+          r = rmax[o] ?? 0;
+          const z = clearZoom[c] ?? 0;
+          if (z > beta) beta = z;
+          if (u0 <= u1 && v0 <= v1) order[swept++] = j; // an aggregate with no finite member has an empty box
         }
-        if (kx0[j]! < x0) x0 = kx0[j]!;
-        if (ky0[j]! < y0) y0 = ky0[j]!;
-        if (kx1[j]! > x1) x1 = kx1[j]!;
-        if (ky1[j]! > y1) y1 = ky1[j]!;
-        if (kr[j]! > rm) rm = kr[j]!;
+        kx0[j] = u0;
+        ky0[j] = v0;
+        kx1[j] = u1;
+        ky1[j] = v1;
+        kr[j] = r;
+        if (u0 < x0) x0 = u0;
+        if (v0 < y0) y0 = v0;
+        if (u1 > x1) x1 = u1;
+        if (v1 > y1) y1 = v1;
+        if (r > rm) rm = r;
       }
       const og = g - leafCount;
       box[4 * og] = x0;
@@ -2025,54 +2376,20 @@ export function computeLODCrowding(tree: LODCrowdingTree, opts: CrowdingOptions,
       box[4 * og + 2] = x1;
       box[4 * og + 3] = y1;
       rmax[og] = rm;
+      kdRoot[og] = 0;
       // The horizon: the zoom at which the footprint (2·extent·k) of this node, or of the ancestor whose comes
       // last, reaches expandPx — past it the footprint rule opens them anyway.
       const e = lo[og] ?? Infinity;
       const cap = e === Infinity ? 0 : e > 0 ? horizon / (2 * e) : Infinity;
       if (beta < cap && swept > 1) {
-        // Sweep the children by their box's left edge: a pair whose horizontal gap alone is past the reach
-        // at which even the largest radii could beat beta is skipped, and so is every later one.
-        sortByKey(order, kx0, swept);
-        for (let a = 0; a < swept && beta < cap; a++) {
-          const ja = order[a]!;
-          const A = kid[ja]!;
-          const aLeaf = A < leafCount;
-          const ax = kx0[ja]!;
-          const ay = ky0[ja]!;
-          const right = kx1[ja]!;
-          const rA = kr[ja]!;
-          let reach = clearReachOf(beta, rA, rm, screen);
-          for (let b = a + 1; b < swept && beta < cap; b++) {
-            const jb = order[b]!;
-            if (kx0[jb]! - right >= reach) break;
-            const B = kid[jb]!;
-            let z: number;
-            if (aLeaf && B < leafCount) {
-              // Two leaves (every pair of a bottom cell): their pair zoom directly, no walk. With screen radii
-              // it is (ra + rb) / d, so a pair that cannot beat beta is told apart without a root.
-              const dx = ax - kx0[jb]!;
-              const dy = ay - ky0[jb]!;
-              const d2 = dx * dx + dy * dy;
-              if (screen) {
-                const sum = rA + kr[jb]!;
-                if (!(sum * sum > beta * beta * d2)) continue;
-                z = sum / Math.sqrt(d2);
-              } else {
-                z = clearZoomOf(Math.sqrt(d2), rA, kr[jb]!, false);
-              }
-            } else {
-              z = dual(A, B, beta, cap);
-            }
-            if (z > beta) {
-              beta = z;
-              reach = clearReachOf(beta, rA, rm, screen);
-            }
-          }
-        }
+        // One bucket (every spatial node, and any node of at most CROWDING_BUCKET children): swept, unindexed;
+        // a wider node through its 2-D index.
+        beta = swept <= CROWDING_BUCKET ? sweep(0, swept, rm, beta, cap, -1) : indexed(og, swept, beta, cap);
       }
       clearZoom[g] = beta < cap ? beta : Infinity;
     }
   }
+  lodCrowdingPairs += seen;
 }
 
 /** Screen-space transform: `screen = world * k + (x, y)` (matches {@link BaseEngine} `ViewTransform`). */
@@ -2350,7 +2667,7 @@ export function cut(
       continue;
     }
     const own = 2 * ext * t.k;
-    const lent = lend / clearZoom[g]!; // NaN (0/0) only when expandPx is 0: then `own` decides
+    const lent = lend / (clearZoom[g] ?? Infinity); // NaN (0/0) only when expandPx is 0: then `own` decides
     const footprint = lent > own ? lent : own;
     // Decide this node's draw alpha (`drawA`) and/or the alpha to expand its children at (`childA`);
     // -1 = "don't". Inlined (no per-node closure) so the off path stays a plain expand/draw split.
