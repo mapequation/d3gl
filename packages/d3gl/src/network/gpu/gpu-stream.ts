@@ -17,9 +17,11 @@
  * 2. **Encode.** Work items while the {@link FrameBudget} admits them: at most 33 ms of frames of layout
  *    work in flight (`framesInFlight`: 2 frames at 60 Hz, 4 at 120 Hz), a GPU budget of `min(10 ms,
  *    0.6 × rAF interval)` per frame, and at most 2 ms of encode time. A tick is the solver's sequence of
- *    passes (`stream-schedule.ts`); every pass is cut into row bands of at most half the budget (#382), and
- *    each band is an item — so no item overruns a frame at any N. A tick may span frames; its result does
- *    not depend on how it was sliced.
+ *    passes (`stream-schedule.ts`); every pass is cut into row bands sized to the budget (at most half of
+ *    it, or all of it for a pass whose every band waits on a long fragment; #382), and each band is an
+ *    item — so a frame's *estimated* layout GPU work stays within the budget at any N, save one band whose
+ *    fixed cost alone passes three quarters of it (the nested gather of a module past ~12,000 children at
+ *    120 Hz, #380). A tick may span frames; its result does not depend on how it was sliced.
  * 3. **Readback + copy + fence.** On the repaint's cadence (reading back more often than repainting is
  *    waste), and when the one PBO is free, the solver's readback passes run as items too (the nested
  *    layout's composition), exclusively — no tick item runs until the copy — over as many frames as the
@@ -84,7 +86,7 @@ export interface GpuFrameSample {
   encodeMs: number;
   /** Work items encoded this frame. */
   items: number;
-  /** Their estimated GPU time, ms — within `budgetMs` whenever more than one item ran (#382). */
+  /** Their estimated GPU time, ms — within `budgetMs` whenever more than one item ran (#382): the budget admits a second item only while the sum fits. */
   itemsMs: number;
   /** Ticks completed so far in this run. */
   ticksDone: number;

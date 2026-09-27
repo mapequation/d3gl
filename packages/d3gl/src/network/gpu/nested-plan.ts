@@ -4,7 +4,7 @@
 // ─────────────────────────────────────────────────────────────────────────────
 //
 // `GpuNestedLayout` binds each step to its pass; the streaming schedule (`stream-schedule.ts`) cuts every
-// step into row bands of at most half the frame budget. See `gpu-nested-layout.ts` for what each pass does.
+// step into row bands sized to the frame budget. See `gpu-nested-layout.ts` for what each pass does.
 
 import { buildCSR } from "../graph.js";
 import { EXACT_MAX } from "../nested-layout.js";
@@ -30,11 +30,17 @@ export interface PassCost {
  * GPU cost of each pass of the nested solve, measured on an M1 Max (ANGLE Metal) on the synthetic
  * Infomap-like maps (325,729 and 1,000,000 leaves; largest module 4,592 and 6,643 children), each pass
  * timed alone, whole and in 4 bands, over the states of a whole layout (the early compact ticks are the
- * collision's heaviest). `fixedMs` comes from the band difference; the two terms together cover both maps'
- * measured cost with a margin of ~15-25%, so that the estimate neither overruns a frame nor leaves most of
- * it idle. Most small passes are all setup (a render pass costs ~0.05-0.3 ms whatever it draws); the springs,
- * the repulsion and the collision gather scale. A slower GPU is caught by the frame budget's fences, as for
- * the flat layout. Measured whole, 325k / 1M, in the comments.
+ * collision's heaviest). `fixedMs` comes from the band difference. Measured whole, 325k / 1M, in the
+ * comments: each range runs from the quietest reading to the busiest on a GPU shared with other work.
+ *
+ * **The estimates are not an upper bound.** Each is at or above its pass's lowest reading (save the
+ * pyramid levels at 325k, 0.04 ms under), and a collision step at the top of its passes' ranges runs up to
+ * ~5% (1M) or ~7% (325k) above its estimate — single small passes up to ~35% (the reduction tree at 325k,
+ * 0.30 ms against 0.22). A frame's real GPU time can exceed the budget by as much; a GPU that runs later
+ * than that is what the frame budget's fences catch (`k` halves, the bands grow), as for the flat layout.
+ * Covering the top of every range instead would cost throughput on every frame for readings that are mostly
+ * other processes' work (#382, D2). Most small passes are all setup (a render pass costs ~0.05-0.3 ms
+ * whatever it draws); the springs, the repulsion and the collision gather scale.
  */
 export const NESTED_COST = {
   /** Reduction tree level 1 (the map over 16 slots per texel): 0.18-0.30 / 0.32-0.46 ms. */
@@ -49,7 +55,11 @@ export const NESTED_COST = {
   repulsion: { fixedMs: 0.2, nsPerLeaf: 6.2 },
   /** Predict v*: 0.04-0.10 ms. */
   predict: { fixedMs: 0.06, nsPerLeaf: 0.05 },
-  /** The springs' hub chunk partials (only with hub rows; none on the measured maps). */
+  /**
+   * The springs' hub chunk partials, only with hub rows. **Not measured** (the measured maps have no hub
+   * rows): a guess near the flat layout's hub pass on web-NotreDame (0.28 ms at 64-entry chunks,
+   * `hub-chunks.ts`; this model gives 0.26 ms at 325k leaves).
+   */
   hubs: { fixedMs: 0.1, nsPerLeaf: 0.5 },
   /** The springs' row gather + integrate (the first band clears the accumulator): 0.8-0.98 / 2.1-2.5 ms. */
   springs: { fixedMs: 0.12, nsPerLeaf: 2.6 },
@@ -57,7 +67,7 @@ export const NESTED_COST = {
   cells: { fixedMs: 0.06, nsPerLeaf: 0.04 },
   /** Collision occupancy count (a scatter of every slot): 0.06-0.22 / 0.16-0.26 ms. */
   count: { fixedMs: 0.08, nsPerLeaf: 0.2 },
-  /** One collision round (a scatter of every slot; later rounds contend more): 0.15-0.20 / 0.18-0.40 ms. */
+  /** One collision round (a scatter of every slot; later rounds contend more): 0.15-0.20 / 0.18-0.46 ms. */
   round: { fixedMs: 0.1, nsPerLeaf: 0.3 },
   /**
    * Collision gather: 4.1-4.7 / 8.2-11.3 ms whole. A large slot, or one next to an overflowing cell, loops

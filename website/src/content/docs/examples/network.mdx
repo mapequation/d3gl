@@ -538,11 +538,14 @@ await net.whenSettled(); // resolves when the transition ends
   applies them one by one, so the two maps differ in detail but keep the same invariants: every child
   inside its parent, siblings apart, linked siblings close. Every pass of the solve, and the composition
   that each repaint reads back, is cut into bands sized to the frame's GPU budget (10 ms at 60 Hz, 5 ms at
-  120 Hz), so pan and zoom never wait behind more layout work than that — at 1,000,000 leaves too. One
-  limit: the disc collision costs time quadratic in the largest module when its children's sizes are very
-  uneven, and one child's pass over its whole module cannot be split — one module of 60,000 children with
-  power-law flows lays out in seconds (the CPU: 5 minutes), but frames stall while it packs. Infomap's
-  modules on web-NotreDame (at most 8,528 children) stay at about 2 s with no stall.
+  120 Hz), so by the solve's cost estimates a frame queues no more layout work than that — at 1,000,000
+  leaves too. The estimates are measured costs, not bounds: on a busy GPU a frame runs over by as much as
+  the passes do. The limit is the largest module. One child's pass over its whole module cannot be split,
+  so past about 12,000 children at 120 Hz (25,000 at 60 Hz) a single band of the disc collision exceeds
+  the budget, and when the children's sizes are very uneven the collision's cost grows with the square of
+  their number: one module of 60,000 children with power-law flows lays out in about 7 s (the CPU: 5
+  minutes), but frames stall for up to about 170 ms of GPU work while it packs. Infomap's modules on
+  web-NotreDame (at most 8,528 children) lay out in about 2.2 s at 60 Hz and 2-3 s at 120 Hz (M1 Max).
 - **`transition: 600`** eases every node from where it is to its new place over 600 ms (cubic
   ease-in-out) on the main thread. The layout computes the final positions only; each animation frame is then
   a positions-only repaint — no more work than a frame of a streaming layout. The camera stays where it

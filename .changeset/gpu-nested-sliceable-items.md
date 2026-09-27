@@ -13,13 +13,21 @@ behind it.
   predict, the springs and integrate, the collision cells, the count and each occupancy round (scatters
   cut into slot ranges), the gather — and so is each pass of the composition, which runs as work items of
   its own before the copy, with no tick in between.
-- The estimate of every frame stays within the budget, copy frames included (asserted from the plan of a
-  1M-leaf map at 60 and 120 Hz). The gather's bands each wait for its longest fragment, a slot that loops
-  over its whole module, so the cost model charges that to every band and sizes those bands to the whole
-  budget.
+- Every frame's *estimated* layout GPU work stays within the budget, copy frames included (asserted from
+  the plan of a 1M-leaf map at 60 and 120 Hz, and on every frame of the streaming guards). The estimates
+  are measured costs, not bounds: a busy GPU runs over them by as much as its passes do. One band of the
+  gather cannot be shorter than its longest fragment, a slot that loops over its whole module, so past a
+  module of about 12,000 children at 120 Hz (25,000 at 60 Hz) that band alone exceeds the budget.
+- The frame budget's controller works with such mixed items: it grows a pass's bands only while each band
+  carries its fixed cost in work, halves the growth back only when two bands of a pass fit a frame, and a
+  late frame of one band that cannot be cut finer no longer throttles every other pass to one item per
+  frame. A readback's repaint cadence is timed from its start, so a composition that waits for budget does
+  not delay the repaint.
 - The layout is bitwise the same for any slicing, and bitwise the same as before (checked on the real GPU
-  at 100k, 325k and 1M leaves; the composition too). The flat layout is unchanged: its prep and integrate
-  stay whole, and its positions are bitwise equal to before.
-- Cost: a 1M-leaf cold layout takes about 5-16% longer (M1 Max, 60 and 120 Hz), because a frame now holds
-  only what fits its budget. The composition has its own reduction scratch and sums, 3.3 MB more GPU memory
-  at 1M (1.1 MB at 325k), freed at settle.
+  at 100k, 325k and 1M leaves; the composition too). The flat layout's positions are bitwise unchanged.
+- Cost (M1 Max, cold layouts, 60 / 120 Hz): the synthetic 1M-leaf map takes 9% less at 60 Hz and 10% more
+  at 120 Hz; the 325k maps and web-NotreDame's multilevel tree are within ±8%; web-NotreDame's two-level
+  tree (one 8,528-child module) takes 8% more at 60 Hz and 31-39% more at 120 Hz; a map with one
+  60,000-child power-law module takes 12-36% more, with its worst frames' GPU work cut from ~350 ms to
+  ~170 ms. A frame now holds only what its budget admits. The composition has its own reduction scratch
+  and sums, 3.3 MB more GPU memory at 1M (1.1 MB at 325k), freed at settle.
