@@ -81,7 +81,7 @@ function infomapLike(n: number): { graph: NetworkGraph; modules: ModuleNode[] } 
   return { graph: buildGraph({ nodeCount: n, source, target, nodeFlow: flow }), modules };
 }
 
-// ── GL call log (the flat streaming guard's, gpu-stream-perf.browser.test.ts) ────────────────────────
+// ── GL call log (the flat streaming guard's, _gpu-stream-harness.ts) ────────────────────────────────
 
 type GlEvent =
   | { kind: "copy"; toPbo: boolean }
