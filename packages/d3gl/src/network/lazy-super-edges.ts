@@ -89,10 +89,12 @@ const MEMO_MAX_ENTRIES = 1 << 18;
 const MAX_GEN = (1 << 28) - 1;
 
 /**
- * Reusable state for {@link lazySuperEdges} (#343), engine-owned: the cover stamps and the climb memo over
- * tree nodes (generation-stamped, so a frame writes only the nodes it touches: 12 B per tree node, grown once
- * per tree size), the row memo (valid for one tree + incidence), and the gather arrays shared with
- * {@link superEdgeBatches}. Counters report what the last call did, for the per-frame guards.
+ * Reusable state for {@link lazySuperEdges} (#343), engine-owned. Everything is generation-stamped, so a
+ * frame writes only what it touches and the stamp bump is the clear: the cover roles, the culled-climb memo
+ * and the per-row accumulation slots over tree nodes (20 B per tree node), and each leaf's cover label
+ * (8 B per leaf) — grown once per tree size. Plus the row memo (valid for one tree + incidence)
+ * and the gather arrays shared with {@link superEdgeBatches}. Counters report what the last call did, for
+ * the per-frame guards.
  */
 export interface LazySuperEdgesScratch {
   /** Gather arrays, pair index and paired rows for {@link superEdgeBatches}. */
@@ -100,10 +102,17 @@ export interface LazySuperEdgesScratch {
   gen: number;
   /** `cover[x] >> 3 === gen` ⇔ x covers leaves this call (drawn or culled); the low 3 bits are its role. */
   cover: Int32Array;
-  /** Climb memo: `upGen[x] === gen` ⇒ `up[x]` is the cover holding x; `upGen[x] === −gen` marks a cover
-   *  the cut split (drew and expanded, in a cross-fade band). */
+  /** Each leaf's cover, interleaved `[gen, cover]`: leaf `v` is under `label[2v + 1]` while `label[2v] ===
+   *  gen`. Written over the drawn covers' runs (finest last), and by a culled climb for the leaf it starts at. */
+  label: Int32Array;
+  /** Culled-climb memo: `upGen[x] === gen` ⇒ `up[x]` is the culled root holding x; `upGen[x] === −gen`
+   *  marks a cover the cut split (drew and expanded, in a cross-fade band). */
   up: Int32Array;
   upGen: Int32Array;
+  /** Per-row accumulation: `rowMark[h] === rowSeq` ⇒ `rowSlot[h]` is h's entry in the row being built. */
+  rowMark: Int32Array;
+  rowSlot: Int32Array;
+  rowSeq: number;
   /** The tree and incidence the row memo belongs to. */
   memoTree: LODTree | null;
   memoIncidence: LeafIncidence | null;
@@ -119,8 +128,6 @@ export interface LazySuperEdgesScratch {
   entIn: Float64Array;
   entDir: Uint8Array;
   ents: number;
-  /** Per-row accumulation index: cover → its entry in the row being built (keyed `(h, h)` over `entH`). */
-  rowPairs: PairIndex;
   /** Last call: rows answered from the memo, rows rebuilt, and graph incidences walked to rebuild them. */
   hits: number;
   misses: number;
@@ -133,8 +140,12 @@ export function makeLazySuperEdgesScratch(): LazySuperEdgesScratch {
     edges: makeSuperEdgesScratch(),
     gen: 0,
     cover: new Int32Array(0),
+    label: new Int32Array(0),
     up: new Int32Array(0),
     upGen: new Int32Array(0),
+    rowMark: new Int32Array(0),
+    rowSlot: new Int32Array(0),
+    rowSeq: 0,
     memoTree: null,
     memoIncidence: null,
     rowIndex: new PairIndex(),
@@ -147,7 +158,6 @@ export function makeLazySuperEdgesScratch(): LazySuperEdgesScratch {
     entIn: new Float64Array(1024),
     entDir: new Uint8Array(1024),
     ents: 0,
-    rowPairs: new PairIndex(),
     hits: 0,
     misses: 0,
     visits: 0,
@@ -219,18 +229,49 @@ export function lazySuperEdges(
     sc.cover = new Int32Array(tree.size);
     sc.up = new Int32Array(tree.size);
     sc.upGen = new Int32Array(tree.size);
+    sc.rowMark = new Int32Array(tree.size);
+    sc.rowSlot = new Int32Array(tree.size);
   }
-  if (sc.gen >= MAX_GEN) { sc.cover.fill(0); sc.upGen.fill(0); sc.gen = 0; }
+  if (sc.label.length < 2 * tree.leafCount) sc.label = new Int32Array(2 * tree.leafCount);
+  if (sc.gen >= MAX_GEN) { sc.cover.fill(0); sc.upGen.fill(0); sc.label.fill(0); sc.gen = 0; }
   const gen = ++sc.gen;
   const stamp = gen << 3;
   const cover = sc.cover;
+  const label = sc.label;
   const up = sc.up;
   const upGen = sc.upGen;
   const { drawn, kept, culled, split } = cutSet;
-  for (let i = 0; i < drawn.length; i++) cover[drawn[i]!] = stamp | DROPPED;
+  // Drawn covers: role, and their leaves labelled. The frontier lists a split node before the nodes below
+  // it, so the finest drawn cover of a leaf is written last.
+  for (let i = 0; i < drawn.length; i++) {
+    const x = drawn[i]!;
+    cover[x] = stamp | DROPPED;
+    for (let r = leafStart[x]!; r < leafEnd[x]!; r++) {
+      const v = leafOrder[r]!;
+      label[2 * v] = gen;
+      label[2 * v + 1] = x;
+    }
+  }
   for (let i = 0; i < kept.length; i++) cover[kept[i]!] = stamp | KEPT;
   for (let i = 0; i < culled.length; i++) cover[culled[i]!] = stamp | CULLED;
   for (let i = 0; i < split.length; i++) upGen[split[i]!] = -gen;
+  const fading = split.length > 0;
+  if (fading) {
+    // A culled root under a split node (the only drawn cover with anything culled below it) is the finer
+    // cover of its leaves: label them after the drawn ones. O(depth) per culled root, in a band only.
+    for (let i = 0; i < culled.length; i++) {
+      const c = culled[i]!;
+      for (let x = parent[c]!; x >= 0; x = parent[x]!) {
+        if (cover[x]! >> 3 !== gen) continue;
+        for (let r = leafStart[c]!; r < leafEnd[c]!; r++) {
+          const v = leafOrder[r]!;
+          label[2 * v] = gen;
+          label[2 * v + 1] = c;
+        }
+        break;
+      }
+    }
+  }
 
   // The row memo belongs to one tree and one incidence (weights + direction); start over otherwise, or when
   // it has grown past its bound (rows rebuilt since keep appending).
@@ -242,15 +283,15 @@ export function lazySuperEdges(
     sc.ents = 0;
   }
 
-  // The cover holding leaf/node v: v itself when stamped, else the first stamped ancestor — memoised with
-  // path compression over the climbed chain (only touched nodes are written).
-  const resolve = (v: number): number => {
-    if (cover[v]! >> 3 === gen) return v;
-    if (upGen[v] === gen) return up[v]!;
+  // The culled root holding leaf v (a leaf no drawn cover labelled): the first stamped ancestor, memoised
+  // with path compression over the climbed chain (only touched nodes are written).
+  const climb = (v: number): number => {
     let x = parent[v]!;
     while (x >= 0 && cover[x]! >> 3 !== gen && upGen[x] !== gen) x = parent[x]!;
     const c = x < 0 ? -1 : cover[x]! >> 3 === gen ? x : up[x]!;
-    for (let y = v; y !== x; y = parent[y]!) { up[y] = c; upGen[y] = gen; }
+    label[2 * v] = gen;
+    label[2 * v + 1] = c;
+    for (let y = parent[v]!; y !== x; y = parent[y]!) { up[y] = c; upGen[y] = gen; }
     return c;
   };
 
@@ -259,7 +300,8 @@ export function lazySuperEdges(
   const incOut = incidence.out;
   const uniform = incidence.uniform;
   const rowIndex = sc.rowIndex;
-  const rowPairs = sc.rowPairs;
+  const rowMark = sc.rowMark;
+  const rowSlot = sc.rowSlot;
 
   // Build g's row at the end of the entry arena; returns its row id.
   const buildRow = (g: number): number => {
@@ -270,7 +312,8 @@ export function lazySuperEdges(
     let entIn = sc.entIn;
     let entDir = sc.entDir;
     let visits = 0;
-    rowPairs.reset();
+    if (sc.rowSeq === 0x7fffffff) { rowMark.fill(0); sc.rowSeq = 0; }
+    const seq = ++sc.rowSeq;
     const g0 = leafStart[g]!;
     const g1 = leafEnd[g]!;
     for (let r = g0; r < g1; r++) {
@@ -278,12 +321,13 @@ export function lazySuperEdges(
       const p1 = offsets[u + 1]!;
       visits += p1 - offsets[u]!;
       for (let p = offsets[u]!; p < p1; p++) {
-        const h = resolve(neighbors[p]!);
-        if (h < 0) continue;
-        // Nested with g (inside it, or an ancestor in a fade band): not a pair.
-        if (leafStart[h]! < g1 && g0 < leafEnd[h]!) continue;
-        const e = rowPairs.findOrAdd(h, h, ents, entH, entH);
-        if (e === ents) {
+        const v = neighbors[p]!;
+        const h = label[2 * v] === gen ? label[2 * v + 1]! : climb(v);
+        // Not a pair with itself — nor, in a fade band, with a cover nested in or around it.
+        if (h === g || h < 0 || (fading && leafStart[h]! < g1 && g0 < leafEnd[h]!)) continue;
+        let e: number;
+        if (rowMark[h] === seq) e = rowSlot[h]!;
+        else {
           if (ents === entH.length) {
             sc.ents = ents;
             growEntries(sc, ents + 1);
@@ -292,11 +336,13 @@ export function lazySuperEdges(
             entIn = sc.entIn;
             entDir = sc.entDir;
           }
+          e = ents++;
+          rowMark[h] = seq;
+          rowSlot[h] = e;
           entH[e] = h;
           entOut[e] = 0;
           entIn[e] = 0;
           entDir[e] = 0;
-          ents++;
         }
         const w = incW ? incW[p]! : uniform;
         if (!incOut || incOut[p] === 1) {
