@@ -11,6 +11,9 @@
  * - **Transport-only main thread per frame** (fence polls + harvest + encode + copy + fence, the repaint
  *   excluded) below a ceiling split into constant and linear terms, and the encode within the
  *   controller's 2 ms cap (N-independent).
+ * - **Repaints** at least `minFrameMs` apart (the throttle), and **throughput**: stream ticks per second
+ *   above a floor set by the same solve's GPU-only rate on this machine — the one check that sees a
+ *   GPU-process stall (a harvest that waits on the GPU does not show in main-thread time).
  * - **Deterministic signatures:** every `readPixels` on the streaming path lands in a bound PBO; every
  *   harvest comes after a fence inserted after its copy was seen signalled; one fence per frame; the
  *   harvest precedes the frame's layout draws; no GPU object created per streamed frame once the stream
@@ -28,11 +31,12 @@ import { observeGpuLayoutFrames, type GpuFrameSample } from "../gpu-stream.js";
 import { GpuNestedLayout } from "../gpu-nested-layout.js";
 import { nestedSolverTopology } from "../nested-topology.js";
 import { COLLISION_ROUNDS, COLLISION_STEPS } from "../passes/collision.js";
+import { MIN_FRAME_MS } from "../repaint-throttle.js";
 import { makeTestDevice } from "./_device.js";
 import { perfBudget, perfN } from "../../../__tests__/perf-budget.js";
 import { perfHost } from "../../../__tests__/engine-sweep.js";
 
-const LOCAL_N = 20_000; // the leaves the ceilings below were calibrated at
+const LOCAL_N = 20_000; // the leaves the fixture defaults to (the ceilings below were measured there)
 // Capped: SwiftShader runs the compact phase's collision gathers slowly (a dense segment falls back to
 // its exact loop); real-GPU runs at 325k / 1M go through PERF_BROWSER_N by hand.
 const N = perfN(LOCAL_N, { max: 1_000_000 });
@@ -224,6 +228,11 @@ function assertSignatures(leg: Leg): void {
   const firstRepaint = frames.findIndex((s) => s.repaintMs > 0);
   const later = segments.slice(firstRepaint + 1).flat().filter((e) => e.kind === "create").length;
   expect(later, "GPU objects created per streamed frame").toBe(0);
+  // Repaints (a harvest runs onFrame) throttled to ≥ minFrameMs apart; the final one always paints.
+  const repaints = frames.filter((s) => s.harvested).map((s) => s.now);
+  for (let i = 1; i < repaints.length - 1; i++) {
+    expect((repaints[i] ?? 0) - (repaints[i - 1] ?? 0), `repaint ${i} after the previous`).toBeGreaterThanOrEqual(MIN_FRAME_MS - 2);
+  }
   const onePixel = events.filter((e) => e.kind === "layout-draw" && e.viewport1x1 && e.count >= N);
   expect(onePixel.length, "a draw of ≥ N points into a 1×1 viewport").toBe(0);
 
@@ -232,27 +241,52 @@ function assertSignatures(leg: Leg): void {
   expect(finalHarvest).toBeLessThan(leg.settledAfterFrame);
 }
 
-function report(label: string, leg: Leg): { transport: number[]; encode: number[] } {
+function report(label: string, leg: Leg): { transport: number[]; encode: number[]; ticksPerSec: number } {
   const { frames } = leg;
   const transport = frames.map((s) => s.harvestMs + s.encodeMs);
   const encode = frames.map((s) => s.encodeMs);
   const repaint = frames.filter((s) => s.repaintMs > 0).map((s) => s.repaintMs);
+  const first = frames[0]?.now ?? 0;
+  const last = frames[frames.length - 1]?.now ?? first;
+  const ticksPerSec = (STREAM_TICKS / Math.max(1, last - first)) * 1000;
   console.log(
     `  GPU nested stream [${label}] N=${N}: ${frames.length} frames, ${repaint.length} repaints, ` +
       `transport ms/frame median ${median(transport).toFixed(2)} p95 ${quantile(transport, 0.95).toFixed(2)} max ${Math.max(...transport).toFixed(2)}; ` +
       `encode median ${median(encode).toFixed(2)}; repaint ms median ${median(repaint).toFixed(1)}; ` +
-      `${STREAM_TICKS} stream ticks in ${leg.elapsedMs.toFixed(0)} ms; bands max ${Math.max(...frames.map((s) => s.bands))}, blocked ${frames.filter((s) => s.blocked).length}`,
+      `${STREAM_TICKS} stream ticks in ${leg.elapsedMs.toFixed(0)} ms (${ticksPerSec.toFixed(1)} stream ticks/s over the frames); ` +
+      `bands max ${Math.max(...frames.map((s) => s.bands))}, blocked ${frames.filter((s) => s.blocked).length}`,
   );
-  return { transport, encode };
+  return { transport, encode, ticksPerSec };
 }
 
 describe("GPU nested layout per frame (#355) — network().layout({ backend: 'gpu', nested })", () => {
   let host: HTMLElement;
   let net: Network;
   let fixture: { graph: NetworkGraph; modules: ModuleNode[] };
+  let gpuOnlyTicksPerSec = 0;
 
   beforeAll(async () => {
     fixture = infomapLike(N);
+    // The GPU-only rate of the same solve on this machine: its stream ticks unsliced, fenced by a read, on
+    // a device of its own, before any stream (one warm-up tick first).
+    const device = await makeTestDevice();
+    try {
+      const tree = buildModuleLODTree(fixture.graph.nodeCount, fixture.modules, fixture.graph);
+      const parent = tree.parent;
+      if (!parent) throw new Error("module trees carry a parent map");
+      const solver = nestedSolverTopology({ ...tree, parent }, { iterations: ITERATIONS, size: fixture.graph.flow ?? undefined });
+      const solo = new GpuNestedLayout(device, solver);
+      const local = new Float32Array(2 * solver.slotCount);
+      solo.runTicks(1);
+      solo.readLocal(local);
+      const t0 = performance.now();
+      solo.runTicks(ITERATIONS - 1);
+      solo.readLocal(local);
+      gpuOnlyTicksPerSec = ((STREAM_TICKS - 1) * 1000) / (performance.now() - t0);
+      solo.destroy();
+    } finally {
+      device.destroy();
+    }
     host = perfHost(W, H);
     net = network(host, { width: W, height: H, backend: "webgl" });
     await net.whenReady();
@@ -267,17 +301,23 @@ describe("GPU nested layout per frame (#355) — network().layout({ backend: 'gp
     host?.remove();
   });
 
-  // Calibrated at LOCAL_N: the transport's own main-thread work per frame is fence polls, a memcpy of
-  // 8 B per leaf (+ 16 B per module) on harvest frames and at most 2 ms of encode.
-  const TRANSPORT_P95_MS = perfBudget(4 + 2 * (N / LOCAL_N));
+  // The transport's own main-thread work per frame is fence polls, a memcpy of 8 B per leaf (+ 16 B per
+  // module, about 0.4 B per leaf here) on harvest frames and at most 2 ms of encode: the flat guard's
+  // ceiling, whose linear term is per 100k nodes (measured at 20k leaves on SwiftShader: p95 2.0 ms, max
+  // 2.6 ms, against 4.4 ms). A synchronous read in the frame waits for every queued stream tick.
+  const TRANSPORT_P95_MS = perfBudget(4 + 2 * (N / 100_000));
   const ENCODE_MEDIAN_MS = perfBudget(2.5);
 
-  it("LOD off: bounded transport main thread and the async readback signatures", async () => {
+  it("LOD off: bounded transport main thread, the async readback signatures, throughput", async () => {
     const leg = await streamLeg(net, fixture.graph, fixture.modules, false);
-    const { transport, encode } = report("LOD off", leg);
+    const { transport, encode, ticksPerSec } = report("LOD off", leg);
+    console.log(`  GPU-only nested solve: ${gpuOnlyTicksPerSec.toFixed(1)} stream ticks/s`);
     assertSignatures(leg);
     expect(quantile(transport, 0.95)).toBeLessThan(TRANSPORT_P95_MS);
     expect(median(encode)).toBeLessThan(ENCODE_MEDIAN_MS);
+    // The layout gets ≤ 60% of each frame's GPU time and the repaints share the main thread: a quarter of
+    // that share of the GPU-only rate is a floor a working stream clears with room to spare (the flat guard's).
+    expect(ticksPerSec).toBeGreaterThan(0.25 * gpuOnlyTicksPerSec * 0.6);
   }, perfBudget(300_000));
 
   it("LOD on (the module tree, declutter): the same transport bounds and signatures", async () => {
