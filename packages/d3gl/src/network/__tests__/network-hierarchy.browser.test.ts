@@ -6,13 +6,15 @@ import { nestedLayout } from "../nested-layout.js";
 
 // Count module-tree builds (#326): the engine must build the tree once per (graph, hierarchy), not once
 // per lod()/layout() call, and never on the pick path.
-const builds = vi.hoisted(() => ({ count: 0 }));
+// `fail` makes the next builds throw (a main-thread fallback that cannot build).
+const builds = vi.hoisted(() => ({ count: 0, fail: null as string | null }));
 vi.mock("../modules.js", async (importOriginal) => {
   const mod = await importOriginal<typeof import("../modules.js")>();
   return {
     ...mod,
     buildModuleLODTree: (...args: Parameters<typeof mod.buildModuleLODTree>) => {
       builds.count++;
+      if (builds.fail) throw new Error(builds.fail);
       return mod.buildModuleLODTree(...args);
     },
   };
@@ -60,6 +62,7 @@ const pathOf = (hit: { datum: unknown } | null): readonly number[] | undefined =
 
 beforeEach(() => {
   builds.count = 0;
+  builds.fail = null;
 });
 
 describe("engine-owned module hierarchy — data(graph, { modules }) (#326)", () => {
@@ -401,6 +404,33 @@ describe("the module tree is built off the main thread (#428)", () => {
       expect(builds.count).toBe(1);
       expect(net.lodSource).toBe("modules");
       expect(Array.from(g.positions)).toEqual(expected);
+      net.destroy();
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("a tree that can be built neither on the worker nor on the main thread rejects whenSettled()", async () => {
+    // A worker that fails, then a main-thread fallback that throws: the nested layout can never start.
+    class FailingWorker {
+      onmessage: ((e: MessageEvent) => void) | null = null;
+      onerror: ((e: Event) => void) | null = null;
+      onmessageerror: ((e: MessageEvent) => void) | null = null;
+      postMessage(): void {
+        setTimeout(() => this.onerror?.(new Event("error")), 0);
+      }
+      terminate(): void {}
+    }
+    vi.stubGlobal("Worker", FailingWorker);
+    try {
+      const net = network(host(), { width: 200, height: 200 });
+      await net.whenReady();
+      net.data(graph(), { modules: MODULES });
+      builds.fail = "no tree";
+      net.layout({ backend: "worker", nested: true });
+      const hung = new Promise<string>((resolve) => setTimeout(() => resolve("never settled"), 2000));
+      const outcome = await Promise.race([net.whenSettled().then(() => "settled", (e: Error) => e.message), hung]);
+      expect(outcome).toBe("no tree");
       net.destroy();
     } finally {
       vi.unstubAllGlobals();

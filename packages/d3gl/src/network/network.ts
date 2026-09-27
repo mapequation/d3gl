@@ -1775,15 +1775,23 @@ export class Network extends BaseEngine {
     }, graph);
     if (!build) return this.moduleTree(); // no worker to wait for: build it now
     let settle: (tree: LODTree) => void = () => {};
-    const tree = new Promise<LODTree>((resolve) => {
+    let fail: (error: unknown) => void = () => {};
+    const tree = new Promise<LODTree>((resolve, reject) => {
       settle = resolve;
+      fail = reject;
     });
     const job = { graph, modules, moduleLinks, tree, settle, cancel: build.cancel };
     this.moduleTreeJob = job;
     void build.topology.then((topology) => {
       if (this.moduleTreeJob !== job) return; // cancelled with its graph, or built on the main thread meanwhile
       this.moduleTreeJob = null;
-      const built = topology ? lodTreeFromTopology(topology) : buildModuleLODTree(graph.nodeCount, modules, graph, moduleLinks);
+      let built: LODTree;
+      try {
+        built = topology ? lodTreeFromTopology(topology) : buildModuleLODTree(graph.nodeCount, modules, graph, moduleLinks);
+      } catch (error) {
+        fail(error); // whoever waits for the tree reports it (whenSettled() rejects) instead of never starting
+        return;
+      }
       if (this.isCurrentModuleTree(job)) this.moduleTreeCache = { graph, modules, moduleLinks, tree: built };
       settle(built);
       // A cut waiting for it draws it on the next frame — after whoever awaits the tree has started.
@@ -2241,15 +2249,24 @@ export class Network extends BaseEngine {
    *  geometry, the final reframe + release of a streaming fit, one rebuild. */
   private onLayoutSettled(handle: WorkerLayoutHandle, prepare?: () => void): void {
     this.layoutHandle = handle;
-    void handle.settled.then(() => {
-      if (this.layoutHandle !== handle) return; // a newer layout superseded this one
-      this.transition = null;
-      this.nestedSolving = false;
-      prepare?.();
-      this.recomputeLODGeometry(true);
-      this.releaseFit(); // final reframe on the settled bounds, then hand the view to zoom/pan
-      this.rebuild();
-    });
+    void handle.settled.then(
+      () => {
+        if (this.layoutHandle !== handle) return; // a newer layout superseded this one
+        this.transition = null;
+        this.nestedSolving = false;
+        prepare?.();
+        this.recomputeLODGeometry(true);
+        this.releaseFit(); // final reframe on the settled bounds, then hand the view to zoom/pan
+        this.rebuild();
+      },
+      () => {
+        // The run never started (#428: no module tree could be built). whenSettled() hands the caller the
+        // error; the engine only stops waiting for the run.
+        if (this.layoutHandle !== handle) return;
+        this.transition = null;
+        this.nestedSolving = false;
+      },
+    );
   }
 
   /** Post-layout bookkeeping for state-network mode (#171/#182), shared by every backend and every
