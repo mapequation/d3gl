@@ -559,6 +559,75 @@ describe("GPU pyramid level-0 near field — sub-cell clump probe (#251)", () =>
     // above this (a cell-size floor shifts near-cell terms by ~50%).
     expect(relL2).toBeLessThan(1e-4);
   });
+
+  it("a node sharing its finest cell is repelled by its cell-mate, not by its own mass (#403): θ=0 matches all-pairs", () => {
+    // One node per finest cell, except PAIRS of nodes that share a cell. With θ = 0 every occupied cell is
+    // force-accepted at level 0, so a single occupant repels by the exact point kernel; a pair member's own
+    // cell must count only its cell-mate — then the whole field is the exact all-pairs field. Lumping the
+    // node's own mass in (the pre-#403 traversal) gives it (m_i + m_j)² / ((2·m_i + m_j)·m_j) = 4/3 of its
+    // cell-mate's force.
+    const rng = makePrng(0x403403);
+    const count = 600; // chooseGrid(600) = 32
+    expect(chooseGrid(count)).toBe(G);
+    const pairs = 40;
+    const positions = new Float32Array(count * 2);
+    positions.set([-S, -S, S, -S, -S, S, S, S]); // corner anchors pin the bbox
+    // Interior cells in a shuffled order (a keyed sort: no swaps through possibly-undefined entries).
+    const cells: Array<[number, number]> = [];
+    for (let cy = 1; cy < G - 1; cy++) for (let cx = 1; cx < G - 1; cx++) cells.push([cx, cy]);
+    const keys = cells.map(() => rng());
+    const order = cells.map((_, i) => i).sort((a, b) => (keys[a] ?? 0) - (keys[b] ?? 0));
+    let k = 4;
+    const members: number[] = [];
+    for (const [c, i] of order.entries()) {
+      if (k >= count) break;
+      const [cx, cy] = cells[i] ?? [0, 0];
+      const x = LO + (cx + 0.5) * CELL, y = LO + (cy + 0.5) * CELL;
+      if (c < pairs) {
+        // Two nodes a few units apart around the cell centre (≪ cellSize/2 ≈ 63: both stay in the cell).
+        const a = 2 * Math.PI * rng(), r = 1 + 4 * rng();
+        positions.set([x + r * Math.cos(a), y + r * Math.sin(a), x - r * Math.cos(a), y - r * Math.sin(a)], k * 2);
+        members.push(k, k + 1);
+        k += 2;
+      } else {
+        positions.set([x + (rng() - 0.5) * CELL * 0.4, y + (rng() - 0.5) * CELL * 0.4], k * 2);
+        k++;
+      }
+    }
+    expect(k).toBe(count);
+    const g = graphFromPositions(positions);
+    // The force texture itself (a displacement at these positions would round at ~1e-2 of a pair's force).
+    const forces = (mode: "allpairs" | "pyramid"): Float32Array => {
+      const layout = new GpuForceLayout(device, g, { repulsion: 200, attraction: 0, centering: 0, alpha: 1e-4, theta: 0 }, { repulsionMode: mode });
+      layout.beginTick();
+      layout.forceBand(0, 1);
+      const out = new Float32Array(count * 2);
+      layout.readForces(out);
+      layout.destroy();
+      return out;
+    };
+    const fExact = forces("allpairs");
+    const fBH = forces("pyramid");
+
+    const at = (f: Float32Array, i: number): number => f[i] ?? 0;
+    let worst = 0;
+    for (const i of members) {
+      const e = Math.hypot(at(fBH, i * 2) - at(fExact, i * 2), at(fBH, i * 2 + 1) - at(fExact, i * 2 + 1));
+      worst = Math.max(worst, e / Math.hypot(at(fExact, i * 2), at(fExact, i * 2 + 1)));
+    }
+    let num = 0, den = 0;
+    for (let i = 0; i < count * 2; i++) {
+      const e = at(fBH, i) - at(fExact, i);
+      num += e * e;
+      den += at(fExact, i) * at(fExact, i);
+    }
+    const relL2 = Math.sqrt(num / den);
+    console.log(`  #403 shared cells θ=0: pair members' worst relative error ${worst.toExponential(2)}, relL2 vs all-pairs ${relL2.toExponential(2)}`);
+    // Float noise only (the pair's two positions are ~2000 world units from the origin, their offset a few
+    // units: its float32 rounding is ~1e-4 of it); the self-lump's 4/3 would be 0.33.
+    expect(worst).toBeLessThan(1e-3);
+    expect(relL2).toBeLessThan(1e-4);
+  });
 });
 
 const EPS = 2 ** -23;

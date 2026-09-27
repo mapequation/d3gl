@@ -4,12 +4,14 @@
  *
  * 1. **Levels are the CPU's.** A seed level's forces, from identical positions, are the CPU's mass-weighted
  *    forces: repulsion by the other slots' masses, springs `attraction · w / mass`, centering on the
- *    mass-weighted centroid — on an all-pairs level and on a Barnes-Hut level.
+ *    mass-weighted centroid — on an all-pairs level and on a Barnes-Hut level, where no slot is repelled by its
+ *    own mass (#403).
  * 2. **Per-level state.** `setLevel` zeroes the level's velocities (by MRT), points the segment at its slots,
  *    and allocates nothing; placing every level without solves lands the graph's nodes exactly where the
  *    plan puts them (a coarsening's prolongation, a module tree's leaf seed).
- * 3. **Seed quality.** A coarsening seed lands at the force equilibrium's scale and keeps clusters together;
- *    the module seed keeps modules coherent, ragged branches at their own density, and every leaf once.
+ * 3. **Seed quality.** A coarsening seed lands at the force equilibrium's scale and keeps clusters together, and a
+ *    hub-heavy one throws no supernode out of its settled extent (#403); the module seed keeps modules coherent,
+ *    ragged branches at their own density, and every leaf once.
  * 4. **Scale.** A ≈1M-node wide module tree and a deep one seed with no CPU force work, one GPU placement per
  *    level, on one solver.
  * 5. **Portable readback (#351).** A device that reads `rg32f` only as `RGBA/FLOAT` seeds exactly as an
@@ -126,6 +128,32 @@ function clustered(k: number, m: number, perNode: number, seed: number): Graph {
   return { nodeCount: n, source, target, weight: new Float32Array(e).fill(1), groupOf };
 }
 
+/**
+ * Web-like stars: node i ≥ `hubCount` links to hub h with probability ∝ 1 / (h + 1) (Zipf, so the first hubs
+ * take thousands of leaves), then to a random leaf of its own hub, plus `extra · n` random links. The
+ * coarsening's adoption folds each star into its hub, so the Barnes-Hut seed levels carry heavy supernodes
+ * next to light ones, as web-NotreDame's do (#403).
+ */
+function hubs(n: number, hubCount: number, extra: number, seed: number): Graph {
+  const rng = makePrng(seed);
+  let z = 0;
+  for (let h = 0; h < hubCount; h++) z += 1 / (h + 1);
+  const src: number[] = [], tgt: number[] = [];
+  const groupOf = new Int32Array(n);
+  const members: number[][] = Array.from({ length: hubCount }, () => []);
+  for (let h = 0; h < hubCount; h++) groupOf[h] = h;
+  for (let i = hubCount; i < n; i++) {
+    let u = rng() * z, h = 0;
+    while (h < hubCount - 1 && (u -= 1 / (h + 1)) > 0) h++;
+    groupOf[i] = h;
+    members[h]?.push(i);
+    src.push(h); tgt.push(i);
+  }
+  for (const mem of members) for (const a of mem) { src.push(a); tgt.push(mem[Math.floor(rng() * mem.length)] ?? a); }
+  for (let e = 0; e < extra * n; e++) { src.push(Math.floor(rng() * n)); tgt.push(Math.floor(rng() * n)); }
+  return { nodeCount: n, source: Uint32Array.from(src), target: Uint32Array.from(tgt), weight: new Float32Array(src.length).fill(1), groupOf };
+}
+
 /** Flat one-level module records: path = [group + 1, rank]. */
 function flatRecords(groupOf: Int32Array): ModuleNode[] {
   const rank = new Map<number, number>();
@@ -193,17 +221,43 @@ function levelForces(level: SeedLevel, pos: Float32Array, attraction: number, pa
   return f;
 }
 
-/** Per slot `|ΔF| / (|F| + F_s)` (spec §9's statistic, F_s = repulsion / spacing), sorted ascending. */
-function relativeErrors(gpu: Float32Array, cpu: Float64Array, params: ForceParams = DEFAULT_FORCE): number[] {
+/** Per slot `|ΔF| / (|F| + F_s)` (spec §9's statistic, F_s = repulsion / spacing), in slot order. */
+function slotErrors(gpu: Float32Array, cpu: Float64Array, params: ForceParams = DEFAULT_FORCE): number[] {
   const fs = params.repulsion / Math.sqrt((Math.PI * params.repulsion) / params.centering);
   const out: number[] = [];
   for (let i = 0; i < cpu.length / 2; i++) {
     const d = Math.hypot(gpu[i * 2]! - cpu[i * 2]!, gpu[i * 2 + 1]! - cpu[i * 2 + 1]!);
     out.push(d / (Math.hypot(cpu[i * 2]!, cpu[i * 2 + 1]!) + fs));
   }
-  return out.sort((a, b) => a - b);
+  return out;
+}
+/** {@link slotErrors}, sorted ascending. */
+function relativeErrors(gpu: Float32Array, cpu: Float64Array, params: ForceParams = DEFAULT_FORCE): number[] {
+  return slotErrors(gpu, cpu, params).sort((a, b) => a - b);
 }
 const quantile = (xs: number[], q: number): number => xs[Math.min(xs.length - 1, Math.floor(q * xs.length))] ?? NaN;
+/** The q-quantile of per-slot `errors` over the finest nodes the slots stand for: slot i counts `mass[i]` times. */
+function massQuantile(errors: readonly number[], mass: Float32Array, q: number): number {
+  const order = errors.map((_, i) => i).sort((a, b) => (errors[a] ?? 0) - (errors[b] ?? 0));
+  const total = mass.reduce((sum, m) => sum + m, 0);
+  let seen = 0;
+  for (const i of order) {
+    seen += mass[i] ?? 0;
+    if (seen >= q * total) return errors[i] ?? NaN;
+  }
+  return NaN;
+}
+
+/** Extent of a layout: max − min of x and of y. */
+function extent(pos: Float32Array): { w: number; h: number } {
+  let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+  for (let i = 0; i < pos.length; i += 2) {
+    const x = pos[i] ?? 0, y = pos[i + 1] ?? 0;
+    minX = Math.min(minX, x); maxX = Math.max(maxX, x);
+    minY = Math.min(minY, y); maxY = Math.max(maxY, y);
+  }
+  return { w: maxX - minX, h: maxY - minY };
+}
 
 /** Place levels 0 … k of `plan` on `layout`, running none of their ticks. */
 function stepTo(layout: GpuForceLayout, plan: SeedPlan, k: number): void {
@@ -241,8 +295,13 @@ describe("GPU multilevel seed: one solver, the CPU's mass-weighted levels (#353)
     expect(quantile(errors, 1)).toBeLessThan(1e-3);
   });
 
-  it("a Barnes-Hut seed level's forces are the mass-weighted grid-pyramid tick's, and near the CPU's exact forces", () => {
-    const g = clustered(300, 60, 3, 0x22); // 18k nodes: level 1 is past the all-pairs size
+  /**
+   * The first Barnes-Hut seed level of `g`'s plan (more than exactMax slots), placed without its ticks: per-slot
+   * forces against the algorithm's own reference — the grid pyramid with the level's masses in its statistics
+   * and scatter, weighted springs over the slot's mass (the flat-equivalence contract's statistic, spec §9) —
+   * and against the CPU's exact forces, in slot order.
+   */
+  function barnesHutLevel(g: CoarseLevel): { k: number; level: SeedLevel; vsRef: number[]; vsExact: number[] } {
     const plan = coarseSeedPlan(g, buildHierarchy(g), { width: W, height: H });
     if (!plan) throw new Error("no plan");
     const k = plan.levels.findIndex((l) => l.count > 4096);
@@ -257,15 +316,17 @@ describe("GPU multilevel seed: one solver, the CPU's mass-weighted levels (#353)
     const gpu = new Float32Array(level.count * 2);
     layout.readForces(gpu);
     layout.destroy();
-    // The algorithm's own reference (the flat-equivalence contract's statistic, spec §9): the grid pyramid
-    // with the level's masses in its statistics and scatter, weighted springs over the slot's mass.
-    const params = { ...DEFAULT_FORCE, attraction: plan.attraction };
-    const ref = gridPyramidReference(pos, level.count, level, params, level);
-    const vsRef = relativeErrors(gpu, Float64Array.from(ref));
+    const ref = gridPyramidReference(pos, level.count, level, { ...DEFAULT_FORCE, attraction: plan.attraction }, level);
+    return { k, level, vsRef: slotErrors(gpu, Float64Array.from(ref)), vsExact: slotErrors(gpu, levelForces(level, pos, plan.attraction)) };
+  }
+
+  it("a Barnes-Hut seed level's forces are the mass-weighted grid-pyramid tick's, and near the CPU's exact forces", () => {
+    const { k, level, vsRef: refErrors, vsExact: exactErrors } = barnesHutLevel(clustered(300, 60, 3, 0x22)); // 18k nodes: level 1 is past the all-pairs size
+    const vsRef = refErrors.slice().sort((a, b) => a - b);
     const outliers = vsRef.filter((r) => r > 1e-2).length;
     // Against exact forces the traversal's approximation remains (θ = 0.9 on a freshly prolongated level:
     // tight phyllotaxis discs, the #251 near field); masses ignored would put the median off by the mean mass.
-    const vsExact = relativeErrors(gpu, levelForces(level, pos, plan.attraction));
+    const vsExact = exactErrors.slice().sort((a, b) => a - b);
     console.log(
       `  [level ${k}, ${level.count} slots, Barnes-Hut θ=0.9] vs the mass-weighted pyramid reference p99 ${quantile(vsRef, 0.99).toExponential(2)} ` +
         `(${outliers} over 1e-2); vs exact p50 ${quantile(vsExact, 0.5).toExponential(2)} p99 ${quantile(vsExact, 0.99).toExponential(2)}`,
@@ -273,10 +334,34 @@ describe("GPU multilevel seed: one solver, the CPU's mass-weighted levels (#353)
     expect(quantile(vsRef, 0.99)).toBeLessThan(1e-4);
     expect(outliers).toBeLessThanOrEqual(Math.ceil(0.001 * level.count));
     expect(quantile(vsExact, 0.5)).toBeLessThan(0.03);
-    // The tail is the near field's: a heavy supernode sharing its finest cell with lighter ones is repelled by
-    // a lump that includes its own mass (≈ m_i / 2m_j too strong, see the repulsion.ts header). Measured
-    // p99 0.47 here; bounded so it cannot grow unseen (and would drop if the node's own mass were excluded).
+    // The tail is the #251 near field of the freshly placed discs: several slots of like mass (at most 5 here)
+    // share a finest cell and repel each other as one softened lump. Measured p99 0.47, the same with and
+    // without a slot's own mass in its cell (#403); bounded so it cannot grow unseen.
     expect(quantile(vsExact, 0.99)).toBeLessThan(0.6);
+  }, 60_000);
+
+  it("…and on a hub-heavy level a supernode is not repelled by its own mass (#403)", () => {
+    // Stars fold into supernodes of up to thousands of nodes next to light ones. A slot's own mass left in its
+    // finest cell made a heavy one ≈ m_i / 2m_j too repulsive next to a light cell-mate, and alone in its cell
+    // it pushed itself by rep·m_i·δ / ε, δ the rounding of its cell's centroid. Per finest node (a slot counts
+    // by its mass) the error against exact forces had a p99 of 0.31 (SwiftShader) to 4.4 (M1 Max) at this
+    // placement; without the slot's own mass it is 0.054 on both.
+    const { k, level, vsRef: refErrors, vsExact } = barnesHutLevel(hubs(40_000, 50, 0.3, 13));
+    const vsRef = refErrors.slice().sort((a, b) => a - b);
+    const outliers = vsRef.filter((r) => r > 1e-2).length;
+    const heaviest = level.mass.reduce((a, b) => Math.max(a, b), 0);
+    const sorted = vsExact.slice().sort((a, b) => a - b);
+    const perNode = massQuantile(vsExact, level.mass, 0.99);
+    console.log(
+      `  [level ${k}, ${level.count} slots, heaviest ${heaviest}] vs reference p99 ${quantile(vsRef, 0.99).toExponential(2)} (${outliers} over 1e-2); ` +
+        `vs exact p50 ${quantile(sorted, 0.5).toExponential(2)} p99 ${quantile(sorted, 0.99).toExponential(2)}, per finest node p50 ` +
+        `${massQuantile(vsExact, level.mass, 0.5).toExponential(2)} p99 ${perNode.toExponential(2)}`,
+    );
+    expect(heaviest).toBeGreaterThan(1000); // the fixture has the heavy supernodes it is about
+    expect(quantile(vsRef, 0.99)).toBeLessThan(1e-4);
+    expect(outliers).toBeLessThanOrEqual(Math.ceil(0.001 * level.count));
+    expect(quantile(sorted, 0.5)).toBeLessThan(0.02);
+    expect(perNode).toBeLessThan(0.1);
   }, 60_000);
 
   it("setLevel zeroes the level's velocities, points the segment at its slots (mass-weighted), and allocates nothing", () => {
@@ -422,6 +507,32 @@ describe("GPU multilevel seed: one solver, the CPU's mass-weighted levels (#353)
     // The CPU's seed, up to Barnes-Hut vs exact leaves and float32: the same quality.
     expect(meanEdge(got, g.source, g.target)).toBeLessThan(1.3 * meanEdge(cpu.positions, g.source, g.target));
   });
+
+  it("a hub-heavy graph's seed frame already spans its settled layout: no supernode thrown out (#403)", () => {
+    // The stream shows the seed frame first and fits the view to it, so a supernode the seed throws out
+    // becomes stragglers the camera then zooms in from (web-NotreDame: 1.24× the settled extent, a 1.43× zoom
+    // over the first 0.6 s). A slot's own mass left in its finest cell (#403) threw heavy supernodes out on the
+    // Barnes-Hut levels: 1.34× here on SwiftShader, 3.39× on an M1 Max; 1.05× on both without it.
+    const g = hubs(40_000, 50, 0.3, 13);
+    const plan = coarseSeedPlan(g, buildHierarchy(g), { width: W, height: H });
+    if (!plan) throw new Error("no plan");
+    const heavy = plan.levels.filter((l) => l.count > 4096 && l.ticks > 0 && l.mass.some((m) => m > 1000));
+    expect(heavy.length).toBeGreaterThan(0); // Barnes-Hut seed levels with heavy supernodes
+    const layout = solver(device, g);
+    layout.runSeed(plan);
+    const seed = new Float32Array(g.nodeCount * 2);
+    layout.readPositions(seed);
+    layout.cool(300);
+    layout.runFrame(150); // the shared stop rule ends a seeded run near here; its extent is settled by then
+    const settled = new Float32Array(g.nodeCount * 2);
+    layout.readPositions(settled);
+    layout.destroy();
+    const a = extent(seed), b = extent(settled);
+    const ratio = Math.max(a.w / b.w, a.h / b.h);
+    console.log(`  [hub seed frame] extent / settled: w ${(a.w / b.w).toFixed(3)} h ${(a.h / b.h).toFixed(3)}`);
+    expect(allFinite(settled)).toBe(true);
+    expect(ratio).toBeLessThan(1.1);
+  }, 120_000);
 });
 
 describe("GPU multilevel seed from a module tree (#180 N8.2, on one solver)", () => {

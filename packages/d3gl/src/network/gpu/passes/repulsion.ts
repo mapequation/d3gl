@@ -23,8 +23,8 @@ import { ADDITIVE_BLEND, fullScreenModel, type PassUniforms } from "./fullscreen
 // Tile-root traversal (matches quadtree.ts's force law exactly). A tile of side G_s at atlas origin
 // (ox, oy) has root level L_s = log2 G_s at cell (ox >> L_s, oy >> L_s); a cell (ℓ, cx, cy) — in
 // level-ℓ atlas coordinates — has children (ℓ-1, 2cx+{0,1}, 2cy+{0,1}), which stay inside the tile.
-//   pop (ℓ, cx, cy); read (Σx,Σy,mass,w); if mass==0 skip;
-//   com = (Σx,Σy)/mass;  d = p_i − com;  d2 = dot(d,d);
+//   pop (ℓ, cx, cy); read (Σx,Σy,mass,w); if the cell holds node i, subtract i's own terms (below);
+//   if mass ≤ 0 skip;  com = (Σx,Σy)/mass;  d = p_i − com;  d2 = dot(d,d);
 //   cellSize = boxSide / (G_s>>ℓ)   (world side of a level-ℓ cell; = 2*half in quadtree.ts terms);
 //   if cellSize² < θ²·d2 (θ-accept, any level):  accept as one body →
 //     acc += repulsion * mass / (d2 + ε) * d;
@@ -37,30 +37,29 @@ import { ADDITIVE_BLEND, fullScreenModel, type PassUniforms } from "./fullscreen
 //     disc center and in the far field, at worst 0.5× at the disc edge — where
 //     the un-softened 1/d point kernel overestimated a sub-cell clump ~3–5× vs
 //     the CPU BH reference (whose adaptive leaves resolve clump members
-//     individually). A single-occupant cell has σ² = 0 EXACTLY (the scatter and
-//     this shader compute cc with the same expression, so the moments cancel)
-//     and takes the plain point kernel — bit-identical to the θ-accept branch.
+//     individually). A cell with one other occupant (mass ≤ 1.5 on the flat
+//     layout) takes the plain point kernel — bit-identical to the θ-accept branch.
 //   else: push the 4 children (ℓ-1, 2cx+{0,1}, 2cy+{0,1}).
 //
-// The node's own self-contribution isn't explicitly excluded: at a leaf that contains only node i,
-// d≈0 and the softened force ≈ repulsion*1/ε * (near-zero vector) ≈ 0, so it's harmless. When a leaf
-// holds node i plus others, i's own term is a small softened self-force in the aggregate — the same
-// approximation the CPU quadtree makes for a leaf bucket with coincident bodies.
-//
-// On a mass-weighted multilevel seed level (#353) that self term is NOT negligible when masses are
-// uneven. For node i sharing its finest cell with one node j (Δ = p_j − p_i), the lump gives
-// |F_i| = rep·(m_i + m_j)² / ((2·m_i + m_j)·|Δ|) against the exact rep·m_j / |Δ|: 4/3 for unit masses
-// (the flat case above), ≈ m_i / (2·m_j) for a heavy supernode next to a light one (≈ 51× at 100 : 1).
-// The light node's force stays within 1 + m_j² / (m_i·(m_i + 2·m_j)) of exact. Only seed levels above
-// exactMax traverse a tile, and the seed's quality holds against the CPU seed (gpu-multilevel-seed
-// tests); the tail is bounded there, and excluding the node's own mass from its own cell on massive
-// levels is the open follow-up. On a seed level a single supernode of mass > 1 also takes the moment
-// branch below; its σ² is 0 up to rounding (clamped at 0), so it gets the point kernel's force to
-// within that rounding.
+// Node i's own mass is excluded from every cell it sits in (#403), as the CPU quadtree skips body i in its
+// leaf. The traversal recomputes i's level-0 cell and the terms the scatter added there, (m_i·p_i, m_i,
+// m_i·|p_i − cc|²), with the scatter's own expressions, and a popped cell (ℓ, cx, cy) holds i exactly when
+// it is i's level-0 cell shifted by ℓ; that cell is read less i's terms. Masses are integer-valued, so a
+// cell with i alone reads mass 0 exactly and is skipped, and the lump of the others is (Σ − m_i·p_i) /
+// (M − m_i), softened by the others' own second moment. Keeping i in (the pre-#403 traversal) gave node i
+// sharing its finest cell with one node j (Δ = p_j − p_i) |F_i| = rep·(m_i + m_j)² / ((2·m_i + m_j)·|Δ|)
+// against the exact rep·m_j / |Δ|: 4/3 for unit masses, ≈ m_i / (2·m_j) for a heavy supernode next to a
+// light one on a mass-weighted seed level (#353, ≈ 51× at 100 : 1), and a heavy node alone in its cell
+// pushed itself by rep·m_i·δ / ε, δ the rounding of the cell's centroid: that threw heavy supernodes out
+// of their neighbourhoods on web-NotreDame. The subtraction is float32: the others' centroid is known to
+// ~ulp(|Σ|) / (M − m_i), i.e. ~2⁻²⁴·m_i·|p_i| / m_j for one light cell-mate j of a heavy node — a few world
+// units at web-NotreDame's worst (m_i ≈ 2,660 at |p| ≈ 18,000), against a cell side of ~140.
+// On a seed level a single other occupant of mass > 1 takes the moment branch below; its σ² is 0 up to
+// that rounding (clamped at 0), so it gets the point kernel's force to within it.
 //
 // A seed level's masses (#353) enter the tile path through the pyramid (its scatter is mass-weighted)
-// and the exact loop as node j's mass, m_j / (d² + ε): a uniform branch compiled only into a
-// `multilevel` program, which the graph's own level skips (m = 1 changes no bit).
+// and slot i's own terms (m_i), and the exact loop as node j's mass, m_j / (d² + ε): a uniform branch
+// compiled only into a `multilevel` program, which the graph's own level skips (m = 1 changes no bit).
 //
 // The box used for cell geometry MUST match the padded box the scatter used, so the shader recomputes
 // the padded AABB from the segment's box with the same PAD.
@@ -90,8 +89,8 @@ export interface RepulsionVariant {
   /** Some non-empty segment has no tile: compile the exact loop. */
   exact: boolean;
   /**
-   * Compile the exact loop's mass fetch for a multilevel seed's mass-weighted levels (#353), as a uniform
-   * branch the graph's own level skips.
+   * Compile the mass fetch for a multilevel seed's mass-weighted levels (#353) — node j's mass in the exact
+   * loop, slot i's own in the traversal (#403) — as a uniform branch the graph's own level skips.
    */
   multilevel?: boolean;
 }
@@ -127,7 +126,7 @@ uniform ivec2 u_levelOrigin[LEVELS]; // each level's origin in its texture
 uniform float u_pad;                 // box padding factor (must match scatter)
 uniform float u_theta2;              // θ²
 #endif
-#if defined(EXACT) && defined(MULTILEVEL)
+#ifdef MULTILEVEL
 uniform int u_massive;               // a mass-weighted seed level (#353): node j repels by its mass
 uniform highp sampler2D u_mass;      // per-slot mass (slot atlas), sampled only when u_massive
 #endif
@@ -143,8 +142,8 @@ vec4 fetchCell(int level, int cx, int cy) {
   return texelFetch(u_Peven, t, 0);
 }
 
-// Barnes-Hut over the segment's tile (see the header).
-vec2 tileRepulsion(vec2 pi, uvec4 info, vec4 b, float repulsion, float eps) {
+// Barnes-Hut over the segment's tile (see the header). mi is slot i's own mass (1 off a seed level).
+vec2 tileRepulsion(vec2 pi, float mi, uvec4 info, vec4 b, float repulsion, float eps) {
   // Padded SQUARE world box — identical to the scatter's mapping so cell
   // geometry lines up exactly (half = pad·max(halfX, halfY), like quadtree.ts).
   vec2 mx = b.xy;
@@ -161,6 +160,14 @@ vec2 tileRepulsion(vec2 pi, uvec4 info, vec4 b, float repulsion, float eps) {
   int grid = int(info.w >> 16);
   float G = float(grid);
   ivec2 origin = ivec2(int(info.z & 65535u), int(info.z >> 16));
+
+  // Slot i's own terms in the pyramid (#403): its level-0 cell and what the scatter added there, computed
+  // with the scatter's expressions (grid-pyramid.ts) — every cell holding i is read less these.
+  vec2 t = (pi - lo) / boxSide;
+  vec2 selfCell = clamp(floor(t * G), vec2(0.0), vec2(G - 1.0));
+  vec2 selfRel = pi - (lo + (selfCell + 0.5) / G * boxSide);
+  vec4 selfTerm = vec4(mi * pi, mi, mi * dot(selfRel, selfRel));
+  ivec2 selfAt = origin + ivec2(selfCell);
 
   // Traversal stack of cell coords. Each entry: (level, cx, cy).
   int stLevel[STACK_MAX];
@@ -181,8 +188,9 @@ vec2 tileRepulsion(vec2 pi, uvec4 info, vec4 b, float repulsion, float eps) {
     int cy = stCy[sp];
 
     vec4 cell = fetchCell(level, cx, cy);
+    if (cx == (selfAt.x >> level) && cy == (selfAt.y >> level)) cell -= selfTerm; // the cells i sits in
     float mass = cell.z;
-    if (mass == 0.0) continue;
+    if (mass <= 0.0) continue; // empty, or i alone
 
     vec2 com = cell.xy / mass;
     vec2 d = pi - com;
@@ -200,8 +208,8 @@ vec2 tileRepulsion(vec2 pi, uvec4 info, vec4 b, float repulsion, float eps) {
     } else if (level == 0) {
       // Forced near-field accept at the finest level (#251): soften the lump
       // by its occupants' second central moment (see header). mass is an
-      // integer count, so mass > 1.5 ⇔ multi-occupant; single occupants keep
-      // the exact point kernel of the θ-accept branch.
+      // integer count (i's own left out), so mass > 1.5 ⇔ several other
+      // occupants; a single one keeps the exact point kernel of the θ-accept branch.
       float f;
       if (mass > 1.5) {
         // Same tile-local expression as the scatter's cellCenter, so the m=1 variance cancels exactly.
@@ -272,14 +280,19 @@ void main() {
   uvec4 info = texelFetch(u_segInfo, st, 0);
   vec4 param = texelFetch(u_segParam, st, 0);
   vec2 pi = texelFetch(u_pos, fc, 0).xy;
+#if defined(TILES) && defined(MULTILEVEL)
+  float mi = u_massive != 0 ? texelFetch(u_mass, fc, 0).r : 1.0;
+#elif defined(TILES)
+  float mi = 1.0;
+#endif
 #if defined(TILES) && defined(EXACT)
   if (((info.w >> 8) & SEGMENT_HAS_TILE) != 0u) {
-    o_force = tileRepulsion(pi, info, texelFetch(u_segBox, st, 0), param.x, param.z);
+    o_force = tileRepulsion(pi, mi, info, texelFetch(u_segBox, st, 0), param.x, param.z);
   } else {
     o_force = exactRepulsion(id, pi, info, param.x, param.z);
   }
 #elif defined(TILES)
-  o_force = tileRepulsion(pi, info, texelFetch(u_segBox, st, 0), param.x, param.z);
+  o_force = tileRepulsion(pi, mi, info, texelFetch(u_segBox, st, 0), param.x, param.z);
 #else
   o_force = exactRepulsion(id, pi, info, param.x, param.z);
 #endif
@@ -310,8 +323,8 @@ export interface RepulsionInput {
 /** Options of a {@link RepulsionPass}. */
 export interface RepulsionOptions {
   /**
-   * Compile the exact loop's mass fetch for seed levels (#353, {@link RepulsionVariant.multilevel}); `unit`
-   * is bound in place of the masses when a draw has none (never sampled then).
+   * Compile the mass fetch for seed levels (#353, {@link RepulsionVariant.multilevel}); `unit` is bound in
+   * place of the masses when a draw has none (never sampled then).
    */
   multilevel?: { unit: Texture };
 }
@@ -326,13 +339,13 @@ export class RepulsionPass {
   private readonly model: Model;
   private readonly uniforms: PassUniforms;
   private readonly variant: RepulsionVariant;
-  /** The stand-in bound as `u_mass` on a draw without masses (a multilevel exact loop only). */
+  /** The stand-in bound as `u_mass` on a draw without masses (a multilevel pass only). */
   private readonly unit: Texture | null;
 
   constructor(device: Device, variant: RepulsionVariant, opts: RepulsionOptions = {}) {
     if (variant.multilevel && !opts.multilevel) throw new Error("RepulsionPass: a multilevel variant needs its unit-mass stand-in");
     this.variant = variant;
-    this.unit = variant.multilevel && variant.exact ? (opts.multilevel?.unit ?? null) : null;
+    this.unit = variant.multilevel ? (opts.multilevel?.unit ?? null) : null;
     this.uniforms = {
       u_count: 0,
       u_width: 1,

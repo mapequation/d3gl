@@ -9,8 +9,9 @@
  *      order (blending follows primitive order) with the #251 second moment, 2×2 reduce — a tile is
  *      an independent quadtree, so its place in the atlas does not enter the math;
  *   3. Barnes-Hut traversal from the tile's root (repulsion.ts): the same DFS stack order, θ-accept,
- *      the level-0 forced accept softened by σ² (#251) — or, for a segment without a tile, the exact
- *      loop over the segment's other slots in slot order;
+ *      the level-0 forced accept softened by σ² (#251), every cell the slot sits in less the slot's own
+ *      scattered terms (#403) — or, for a segment without a tile, the exact loop over the segment's
+ *      other slots in slot order;
  *   4. springs (attraction.ts) over the symmetric CSR in its neighbour order;
  *   5. centering (centering.ts) toward the segment centroid;
  *   6. the force texture's ADD blend in the fixed pass order springs → repulsion → centering.
@@ -288,8 +289,11 @@ function tileRepulsion(
   const levelCount = Math.log2(G) + 1;
 
   // ── Level-0 scatter, slot order: (Σx, Σy, mass, Σ|p − cellCenter|²), mass-weighted on a seed level ──
+  // Each slot's own cell and terms are kept: the traversal takes them back out of that cell (#403).
   const levels: Float32Array[] = [];
   const level0 = new Float32Array(G * G * 4);
+  const selfCell = new Int32Array((end - start) * 2);
+  const selfTerm = new Float32Array((end - start) * 4);
   for (let i = start; i < end; i++) {
     const x = px(i), y = py(i);
     const tx = f(f(x - loX) / boxSide);
@@ -302,10 +306,14 @@ function tileRepulsion(
     const r2 = f(f(rx * rx) + f(ry * ry));
     const o = (cy * G + cx) * 4;
     const m = mass ? (mass[i] ?? 0) : 1;
-    level0[o] = f((level0[o] ?? 0) + f(m * x));
-    level0[o + 1] = f((level0[o + 1] ?? 0) + f(m * y));
+    const k = i - start;
+    selfCell[k * 2] = cx;
+    selfCell[k * 2 + 1] = cy;
+    selfTerm.set([f(m * x), f(m * y), m, f(m * r2)], k * 4);
+    level0[o] = f((level0[o] ?? 0) + (selfTerm[k * 4] ?? 0));
+    level0[o + 1] = f((level0[o + 1] ?? 0) + (selfTerm[k * 4 + 1] ?? 0));
     level0[o + 2] = f((level0[o + 2] ?? 0) + m);
-    level0[o + 3] = f((level0[o + 3] ?? 0) + f(m * r2));
+    level0[o + 3] = f((level0[o + 3] ?? 0) + (selfTerm[k * 4 + 3] ?? 0));
   }
   levels.push(level0);
 
@@ -321,6 +329,8 @@ function tileRepulsion(
 
   for (let i = start; i < end; i++) {
     const xi = px(i), yi = py(i);
+    const k = i - start;
+    const selfX = selfCell[k * 2] ?? 0, selfY = selfCell[k * 2 + 1] ?? 0;
 
     // ── Barnes-Hut traversal, the shader's DFS order ──
     let ax = 0, ay = 0;
@@ -333,10 +343,17 @@ function tileRepulsion(
       const side = G >> level;
       const cell = levels[level] ?? level0;
       const o = (cy * side + cx) * 4;
-      const mass = cell[o + 2] ?? 0;
-      if (mass === 0) continue;
-      const comX = f((cell[o] ?? 0) / mass);
-      const comY = f((cell[o + 1] ?? 0) / mass);
+      // The cell the slot sits in, at any level, holds the slot's own terms: take them out (#403).
+      let sumX = cell[o] ?? 0, sumY = cell[o + 1] ?? 0, mass = cell[o + 2] ?? 0, moment = cell[o + 3] ?? 0;
+      if (cx === selfX >> level && cy === selfY >> level) {
+        sumX = f(sumX - (selfTerm[k * 4] ?? 0));
+        sumY = f(sumY - (selfTerm[k * 4 + 1] ?? 0));
+        mass = f(mass - (selfTerm[k * 4 + 2] ?? 0));
+        moment = f(moment - (selfTerm[k * 4 + 3] ?? 0));
+      }
+      if (mass <= 0) continue;
+      const comX = f(sumX / mass);
+      const comY = f(sumY / mass);
       const dx = f(xi - comX), dy = f(yi - comY);
       const d2 = f(f(dx * dx) + f(dy * dy));
       const cellSize = f(boxSide / side);
@@ -348,7 +365,7 @@ function tileRepulsion(
           const ccx = f(loX + f(f(f(cx + 0.5) / G) * boxSide));
           const ccy = f(loY + f(f(f(cy + 0.5) / G) * boxSide));
           const rx = f(comX - ccx), ry = f(comY - ccy);
-          const sigma2 = Math.max(f(f((cell[o + 3] ?? 0) / mass) - f(f(rx * rx) + f(ry * ry))), 0);
+          const sigma2 = Math.max(f(f(moment / mass) - f(f(rx * rx) + f(ry * ry))), 0);
           force = f(f(repulsion * mass) / f(f(d2 + f(2 * sigma2)) + softening));
         } else {
           force = f(f(repulsion * mass) / f(d2 + softening));
