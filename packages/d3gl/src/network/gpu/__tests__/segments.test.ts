@@ -374,6 +374,17 @@ describe("segment table rows — validation, per-slot segment ids, the info texe
     expect(() => validateSegments([{ start: 0, count: 3 }, { start: 4, count: 1 }], 5)).toThrow(/slot 3/);
     expect(() => validateSegments([{ start: 0, count: 3 }, { start: 2, count: 2 }], 4)).toThrow(/slot 3/);
     expect(() => validateSegments(segmentsOf([3, 4]), 8)).toThrow(/8 slots/);
+    // A negative count walks `next` back, so the following segment could start inside an earlier
+    // one and still pass the start check: [0, 5), then -2, then [3, 8) overlaps slots 3-4.
+    const overlapping = [
+      { start: 0, count: 5 },
+      { start: 5, count: -2 },
+      { start: 3, count: 5 },
+    ];
+    expect(() => validateSegments(overlapping, 8)).toThrow(/segment 1 has count -2/);
+    expect(() => validateSegments([{ start: 0, count: 2.5 }, { start: 2.5, count: 1.5 }], 4)).toThrow(
+      /segment 0 has count 2.5/,
+    );
   });
 
   it("slotSegments maps every slot to its segment", () => {
