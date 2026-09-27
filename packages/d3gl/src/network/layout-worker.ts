@@ -480,7 +480,7 @@ addEventListener("message", (e: MessageEvent<MainToWorker>) => {
       // thread terminates the worker on stop anyway.
       const result = nestedLayout(msg.topology, {
         ...msg.params,
-        onDepth: msg.stream ? (depth, frame) => post({ type: "frame", tick: depth, positions: frame }) : undefined,
+        onDepth: msg.stream ? (depth, frame, bounds) => post({ type: "frame", tick: depth, positions: frame, bounds }) : undefined,
       });
       post({ type: "done", tick: -1, positions: result.positions, boundaries: nestedBoundaryDiscs(msg.topology, result) });
       return;

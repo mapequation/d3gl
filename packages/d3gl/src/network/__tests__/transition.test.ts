@@ -68,6 +68,27 @@ describe("position transitions (#328)", () => {
     expect(t.from).toHaveLength(0); // a settled transition holds no per-node memory
   });
 
+  it("hands each frame its eased progress — what the positions moved by — and exactly 1 on the last (#427)", () => {
+    const f = manualFrames();
+    const positions = new Float32Array([0, 0]);
+    const seen: number[] = [];
+    const moved: number[] = [];
+    const t = positionTransition(positions, {
+      ...f.opts,
+      duration: 100,
+      onFrame: (progress) => {
+        seen.push(progress);
+        moved.push((positions[0] ?? NaN) / 100);
+      },
+    });
+    t.to(new Float32Array([100, 100]));
+    f.step(25);
+    f.step(50);
+    f.step(1000);
+    expect(seen).toEqual([easeCubicInOut(0.25), easeCubicInOut(0.75), 1]);
+    moved.forEach((m, i) => expect(m).toBeCloseTo(seen[i] ?? NaN, 6)); // the same ease, the same frame
+  });
+
   it("stops where it is", async () => {
     const f = manualFrames();
     const positions = new Float32Array([0, 0]);

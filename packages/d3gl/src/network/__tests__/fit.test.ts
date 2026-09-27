@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { layoutBox, fitTransform, type FitBox, type LayoutBoxOptions } from "../fit.js";
+import { layoutBox, fitTransform, interpolateView, type FitBox, type LayoutBoxOptions } from "../fit.js";
 import { buildModuleLODTree } from "../modules.js";
 import { buildLODTree, computeLODPositions } from "../lod.js";
 import { buildGraph } from "../graph.js";
@@ -337,5 +337,60 @@ describe("fitTransform", () => {
     const t = fitTransform([50, 50, 50, 50], W, H);
     expect(Number.isFinite(t.k)).toBe(true);
     expect(t.k * 50 + t.x).toBeCloseTo(W / 2, 6);
+  });
+});
+
+describe("interpolateView (#427): the camera of a fitted transition", () => {
+  const a = { k: 2, x: -100, y: 40 };
+  const b = { k: 0.5, x: 300, y: 120 };
+  /** The world rectangle a view shows in the W×H viewport: [minX, minY, maxX, maxY]. */
+  const rect = (t: { k: number; x: number; y: number }): FitBox => [-t.x / t.k, -t.y / t.k, (W - t.x) / t.k, (H - t.y) / t.k];
+
+  it("starts and ends exactly on its two views", () => {
+    const view = interpolateView(a, b);
+    expect(view(0)).toEqual(a);
+    expect(view(1)).toEqual(b);
+    expect(view(-0.5)).toEqual(a); // clamped
+    expect(view(1.5)).toEqual(b);
+  });
+
+  it("zooms monotonically, in either direction", () => {
+    for (const [from, to] of [[a, b], [b, a]] as const) {
+      const view = interpolateView(from, to);
+      let prev = view(0).k;
+      for (let i = 1; i <= 100; i++) {
+        const k = view(i / 100).k;
+        if (to.k < from.k) expect(k).toBeLessThanOrEqual(prev);
+        else expect(k).toBeGreaterThanOrEqual(prev);
+        prev = k;
+      }
+    }
+  });
+
+  it("moves the world rectangle it shows in a straight line, as the node positions move", () => {
+    const view = interpolateView(a, b);
+    const ra = rect(a);
+    const rb = rect(b);
+    for (const e of [0.1, 0.25, 0.5, 0.8]) {
+      const r = rect(view(e));
+      r.forEach((v, i) => expect(v).toBeCloseTo((ra[i] ?? NaN) + ((rb[i] ?? NaN) - (ra[i] ?? NaN)) * e, 6));
+    }
+  });
+
+  it("keeps on screen, at every step, a node on screen at both ends (moving in a straight line)", () => {
+    const view = interpolateView(a, b);
+    // A node inside `a`'s view at the start and inside `b`'s at the end, eased like the positions.
+    const [x0, y0] = [60, 0];
+    const [x1, y1] = [-500, 700];
+    for (let i = 0; i <= 50; i++) {
+      const e = i / 50;
+      const t = view(e);
+      const sx = t.k * (x0 + (x1 - x0) * e) + t.x;
+      const sy = t.k * (y0 + (y1 - y0) * e) + t.y;
+      expect(sx).toBeGreaterThanOrEqual(-1e-6);
+      expect(sx).toBeLessThanOrEqual(W + 1e-6);
+      expect(sy).toBeGreaterThanOrEqual(-1e-6);
+      expect(sy).toBeLessThanOrEqual(H + 1e-6);
+    }
   });
 });

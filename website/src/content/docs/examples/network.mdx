@@ -551,7 +551,15 @@ The layout is the **module-aware GPU seed**: the module hierarchy is supplied wi
 **top-down over the module tree** in every LOD mode — modules (including the ragged, deeper-nested
 super-modules) lay out as coherent regions. Because the GPU solve streams frames, `fit: true` keeps the camera framed on the layout as it converges (the nodes'
 bounding box → the view), so the map opens framed and settles in place rather than piling at the
-origin. It releases to normal zoom/pan once it settles — or as soon as you zoom or pan.
+origin. It releases to normal zoom/pan once it settles — or as soon as you zoom, pan or drag a node.
+
+`fit` means the same on every layout: the camera **ends on the final layout's exact bounding box**, and
+gets there with the layout. A streamed layout is reframed frame by frame; a layout with a `transition`
+eases the camera along with the nodes ([below](#re-clustering-warm-re-layout-and-transitions)); a
+layout that lands in one go (`"positions"`, `"force"`) is framed once. A cold nested map streams
+top-down, each depth collapsing its unplaced nodes onto their module's centre, so while it streams it
+is framed on a box it is known to end inside — the root disc, then each depth's placed discs — and the
+camera only zooms in as depths land, ending on the nodes' own box like any other layout.
 
 The **Layout** control switches to the **nested** module layout (`layout({ nested })`): each module's
 children are laid out inside its own disc, arranged by their sibling links, so every module stays a
@@ -624,7 +632,7 @@ would throw the current map away and start again from a disc. A **warm** one ref
 // Infomap re-ran (other flags, another trial…): same nodes, new tree.
 net
   .data(graph, { modules: next.nodes }) // positions live in `graph` — data() leaves them alone
-  .layout({ backend: "gpu", nested: { warm: true }, transition: 600 });
+  .layout({ backend: "gpu", nested: { warm: true }, transition: 600, fit: true });
 await net.whenSettled(); // resolves when the transition ends
 ```
 
@@ -653,13 +661,21 @@ await net.whenSettled(); // resolves when the transition ends
   layout GPU work, over the 10 ms frame budget.
 - **`transition: 600`** eases every node from where it is to its new place over 600 ms (cubic
   ease-in-out) on the main thread. The layout computes the final positions only; each animation frame is then
-  a positions-only repaint — no more work than a frame of a streaming layout. The camera stays where it
-  is unless you pass `fit: true`, which frames the final map once as the transition starts.
-  `transition` also eases a `"positions"` or `"force"` layout; a new `layout()`, `data()`,
-  `stopLayout()` or `destroy()` stops it where it is, and grabbing a node finishes it.
+  a positions-only repaint — no more work than a frame of a streaming layout. `transition` also eases a
+  `"positions"` or `"force"` layout; a new `layout()`, `data()`, `stopLayout()` or `destroy()` stops it
+  where it is, and grabbing a node finishes it.
+- **`fit: true`** eases the **camera** along with the nodes: from wherever the view is to the one that
+  frames the new map, on the same easing in the same frames, so the re-clustered map ends framed with no
+  jump — even when it grew. The view's visible rectangle moves in a straight line as the nodes do, so
+  the zoom is monotonic and a node on screen at both ends stays on screen throughout. The camera waits
+  where it is while the layout computes the new map, and it is yours again the moment you zoom, pan or
+  drag a node (or call `setTransform`) — it never pulls the view away from you. Its per-frame cost is
+  constant: the new map's box is measured once, when the transition starts. Without `fit` the camera
+  stays where it is.
 
 In the example above, switch **Layout** between *Force* and *Nested*: the nested map is computed warm from
-the force layout's positions and the nodes glide into their modules' discs.
+the force layout's positions and the nodes glide into their modules' discs while the camera eases along to
+frame the new map — zoom in first to see it pull back out with the nodes.
 
 ## State networks: physical ↔ state views
 

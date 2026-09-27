@@ -227,3 +227,26 @@ export function layoutFitTransform(box: FitBox, width: number, height: number, p
   const padded: FitBox = screenSized ? box : [box[0] - pad, box[1] - pad, box[2] + pad, box[3] + pad];
   return fitTransform(padded, width, height, { padPx: screenSized ? pad : 0 });
 }
+
+/**
+ * The camera of a fitted transition (#427): the view at eased progress `e` on the way from `a` to `b`
+ * (clamped to `[0, 1]`, exactly `a` at 0 and `b` at 1). It moves the **world rectangle** the view shows in
+ * a straight line — `1/k`, `x/k` and `y/k` are linear in `e` — as a transition moves the node positions.
+ * So the zoom is monotonic, and a node on screen at both ends, eased on the same progress, stays on screen
+ * at every step between (both the node and each edge of the view move linearly, so the node stays between
+ * the edges). Pure and O(1) per call.
+ */
+export function interpolateView(a: ViewTransform, b: ViewTransform): (e: number) => ViewTransform {
+  const s0 = 1 / a.k;
+  const s1 = 1 / b.k;
+  const u0 = a.x * s0;
+  const u1 = b.x * s1;
+  const v0 = a.y * s0;
+  const v1 = b.y * s1;
+  return (e) => {
+    if (!(e > 0)) return a;
+    if (e >= 1) return b;
+    const k = 1 / (s0 + (s1 - s0) * e);
+    return { k, x: (u0 + (u1 - u0) * e) * k, y: (v0 + (v1 - v0) * e) * k };
+  };
+}

@@ -1,0 +1,10 @@
+---
+"@mapequation/d3gl": patch
+---
+
+`layout({ fit: true })` now frames every layout, and a `transition` eases the camera along with the nodes ([#427](https://github.com/mapequation/d3gl/issues/427)).
+
+- **Fit + transition.** With `transition` and `fit: true` (a re-clustering: `layout({ nested: { warm: true }, transition, fit: true })`), the camera eases from the current view to the view that frames the final layout, on the transition's own easing in the same frames. The map ends framed, with no jump, even when it grew. The world rectangle the view shows moves in a straight line as the nodes do, so the zoom is monotonic and a node on screen at both ends stays on screen throughout. Before, the camera jumped twice: to the old layout at the call, then to the new one when the worker's result landed. The camera waits while a worker computes the target. The box is measured once when the transition starts; each frame moves the camera in O(1).
+- **Released on a real interaction.** A wheel or drag gesture, a node grab or an explicit `setTransform` during the transition leaves the camera where it is; the nodes still ease to the end. The engine's own camera moves are not gestures. A node grab now also releases a streaming fit, so the camera holds still under the cursor.
+- **`fit` on every backend.** `"positions"` and `"force"` layouts (and a warm nested layout without a transition) are framed once, when they land. Before, `fit` was ignored there.
+- **Cold nested maps frame their actual bounds.** A cold nested layout used to stay framed on its root disc (radius `10·√N`), which the solved map only partly fills (fill 0.53 on a Navigator map, 0.65 on a generated one). It now settles on the nodes' exact bounding box like a flat layout (0.80 on the generated map). While it streams, it frames a box it is known to end inside: the root disc, then each depth's placed discs. So the camera only zooms in as depths land. The worker posts that box with each depth frame (`nestedLayout`'s `onDepth` gets it as a third argument).

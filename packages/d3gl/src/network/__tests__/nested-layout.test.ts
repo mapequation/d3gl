@@ -15,6 +15,7 @@ import {
   topo,
   twoLevel,
 } from "./nested-fixtures.js";
+import { layoutBox, type FitBox } from "../fit.js";
 
 describe("nestedLayout (#324)", () => {
   const { tree, nodeCount } = twoLevel();
@@ -119,6 +120,52 @@ describe("nestedLayout Barnes-Hut repulsion (modules above the exact-sum size)",
     expect(Array.from(out.positions).every(Number.isFinite)).toBe(true);
   });
 });
+
+describe("nestedLayout's streamed bound (#427): what a cold map's fit frames while its depths land", () => {
+  const tree = threeLevel(12, 6, 10);
+  const R = 10 * Math.sqrt(tree.leafCount);
+  const bounds: FitBox[] = [];
+  const out = nestedLayout(topo(tree), { onDepth: (_depth, _positions, box) => bounds.push([...box]) });
+  const exact = layoutBox(out.positions, tree.leafCount);
+  const side = (b: FitBox): number => Math.max(b[2] - b[0], b[3] - b[1]);
+
+  it("is posted with every depth frame", () => {
+    expect(bounds).toHaveLength(3); // top modules, sub-modules, leaves
+  });
+
+  it("holds every leaf's final position from the first depth on", () => {
+    for (const [minX, minY, maxX, maxY] of bounds) {
+      for (let i = 0; i < tree.leafCount; i++) {
+        const x = out.positions[2 * i] ?? NaN;
+        const y = out.positions[2 * i + 1] ?? NaN;
+        expect(x >= minX && x <= maxX && y >= minY && y <= maxY, `leaf ${i} outside ${[minX, minY, maxX, maxY].join(", ")}`).toBe(true);
+      }
+    }
+  });
+
+  it("only shrinks, depth by depth — the camera only zooms in as depths land (#324)", () => {
+    for (let d = 1; d < bounds.length; d++) {
+      const [a, b] = [bounds[d - 1], bounds[d]];
+      if (!a || !b) throw new Error("missing depth");
+      expect(b[0]).toBeGreaterThanOrEqual(a[0]);
+      expect(b[1]).toBeGreaterThanOrEqual(a[1]);
+      expect(b[2]).toBeLessThanOrEqual(a[2]);
+      expect(b[3]).toBeLessThanOrEqual(a[3]);
+    }
+  });
+
+  it("ends as the leaves' exact box — the box a flat layout's fit frames (#347)", () => {
+    expect(bounds[bounds.length - 1]).toEqual(exact);
+  });
+
+  it("is tighter than the root disc from the first depth on", () => {
+    const first = bounds[0];
+    if (!first || !exact) throw new Error("no bound");
+    expect(side(first)).toBeLessThan(2 * R);
+    expect(side(exact)).toBeLessThan(side(first));
+  });
+});
+
 describe("nestedLayout warm start (#328)", () => {
   const tree = threeLevel(12, 6, 10);
   const R = 10 * Math.sqrt(tree.leafCount);

@@ -1,10 +1,49 @@
-import { describe, it, expect, beforeAll } from "vitest";
-import { network, type Network } from "../network.js";
+import { describe, it, expect, beforeAll, vi } from "vitest";
+import { Network, type NetworkOptions } from "../network.js";
 import { buildGraph } from "../graph.js";
 import type { ModuleNode } from "../modules.js";
-import { lodStylePasses, mortonTopologyBuilds } from "../lod.js";
 import { perfBudget, perfN } from "../../__tests__/perf-budget.js";
 import { GlBufferSpy, perfHost } from "../../__tests__/engine-sweep.js";
+
+// Count the fit's O(nodes) box (#427): once when a fitted transition starts, never per frame.
+const box = vi.hoisted(() => ({ calls: 0 }));
+vi.mock("../fit.js", async (importOriginal) => {
+  const mod = await importOriginal<typeof import("../fit.js")>();
+  return {
+    ...mod,
+    layoutBox: (...args: Parameters<typeof mod.layoutBox>) => {
+      box.calls++;
+      return mod.layoutBox(...args);
+    },
+  };
+});
+// Count the work a fitted frame's camera must NOT add: LOD cuts (the engine's one `cut` call site) and
+// style resolutions (`resolveNodeRadii` runs once per resolved style).
+const work = vi.hoisted(() => ({ cuts: 0, styleResolves: 0 }));
+// The real module, for its live pass counters (#343): the mock below copies each export once, so a counter
+// imported through it would stay at its value then.
+const real = vi.hoisted(() => ({ lod: null as null | typeof import("../lod.js") }));
+vi.mock("../lod.js", async (importOriginal) => {
+  const mod = await importOriginal<typeof import("../lod.js")>();
+  real.lod = mod;
+  return {
+    ...mod,
+    cut: (...args: Parameters<typeof mod.cut>) => {
+      work.cuts++;
+      return mod.cut(...args);
+    },
+  };
+});
+vi.mock("../glyphs.js", async (importOriginal) => {
+  const mod = await importOriginal<typeof import("../glyphs.js")>();
+  return {
+    ...mod,
+    resolveNodeRadii: (...args: Parameters<typeof mod.resolveNodeRadii>) => {
+      work.styleResolves++;
+      return mod.resolveNodeRadii(...args);
+    },
+  };
+});
 
 /**
  * ENGINE-level per-frame guard for position transitions (#328, AGENTS.md lifecycle §5): a transition
@@ -28,6 +67,14 @@ import { GlBufferSpy, perfHost } from "../../__tests__/engine-sweep.js";
  * the style pass happens to be; GPU buffers created/deleted — none beyond the streamed frame's; uploaded
  * bytes per frame within the streamed frame's; `nodeFill` (resolved once at registration) never re-runs;
  * `linkStroke` no more often than on a streamed frame.
+ *
+ * **With `fit`** (#427) the camera eases along: each frame also moves the view — O(1): an interpolation, the
+ * backend transform and the zoom re-seed — and the fit's O(nodes) box runs once, when the transition
+ * starts, never per frame. A fitted transition frame is timed against an unfitted one at an equal view
+ * (the transition is an hour long, so the camera's eased step is ~1e-12 and the drawn frontier is the
+ * same): the camera is set exactly once per frame, the box 0 times over the frames (1 at the start), and
+ * it runs exactly as many LOD cuts (one per frame with LOD on) and style resolutions (none), with no more
+ * uploads or buffer churn; its median stays within 1.3× + 1 ms of the unfitted frame's.
  */
 
 // 100k locally, the browser tier's CI scale too (#343): the LOD ON ratio below needs the style pass to be a
@@ -73,6 +120,22 @@ function fixture(n: number): { graph: ReturnType<typeof buildGraph>; modules: Mo
   return { graph: buildGraph({ nodeCount: n, source, target, directed: false }), modules, a, b };
 }
 
+/** Exposes the streamed-frame trigger and counts the camera's zoom re-seeds, without reaching into privates. */
+class TransitionProbe extends Network {
+  cameraSyncs = 0;
+  constructor(host: HTMLElement, opts: NetworkOptions) {
+    super(host, opts);
+  }
+  /** A worker message's repaint request — what the transport calls after copying the positions. */
+  streamFrame(): void {
+    this.scheduleLayoutRepaint();
+  }
+  protected override syncZoomToView(): void {
+    this.cameraSyncs++;
+    super.syncZoomToView();
+  }
+}
+
 /** The frame queue that stands in for `requestAnimationFrame` for the whole file. */
 const frames = new Map<number, FrameRequestCallback>();
 let frameId = 0;
@@ -93,11 +156,20 @@ interface Phase {
   uploadedPerFrame: number;
   nodeFill: number;
   linkStroke: number;
+  /** Over the timed frames (the last round's): the fit's box, the camera's zoom re-seeds, LOD cuts, style
+   *  resolutions. */
+  boxCalls: number;
+  cameraSyncs: number;
+  cuts: number;
+  styleResolves: number;
 }
 
 interface Leg {
   streamed: Phase;
   transition: Phase;
+  /** A transition with `fit` (#427), and the fit boxes its `layout()` call ran (the last round's). */
+  fitted: Phase;
+  fittedStartBoxes: number;
 }
 
 let registrationUploaded = 0;
@@ -111,7 +183,7 @@ beforeAll(async () => {
   const realCaf = globalThis.cancelAnimationFrame;
   const spy = new GlBufferSpy();
   try {
-    const net = network(perfHost(W, H), { width: W, height: H, backend: "webgl" });
+    const net = new TransitionProbe(perfHost(W, H), { width: W, height: H, backend: "webgl" });
     await net.whenReady();
     globalThis.requestAnimationFrame = (cb) => {
       frames.set(++frameId, cb);
@@ -136,14 +208,14 @@ beforeAll(async () => {
     flush();
     registrationUploaded = spy.since(atStart).uploadedBytes;
     registrationNodeFill = nodeFill;
-    const scheduleLayoutRepaint = (): void => (net as unknown as { scheduleLayoutRepaint(): void }).scheduleLayoutRepaint();
 
     const measure = (frame: (i: number) => void): Phase => {
       frame(0); // warm-up
       const fill0 = nodeFill;
       const stroke0 = linkStroke;
-      const style0 = lodStylePasses;
-      const builds0 = mortonTopologyBuilds;
+      const style0 = real.lod?.lodStylePasses ?? 0;
+      const builds0 = real.lod?.mortonTopologyBuilds ?? 0;
+      const [box0, syncs0, cuts0, styles0] = [box.calls, net.cameraSyncs, work.cuts, work.styleResolves];
       const mark = spy.mark();
       const ts: number[] = [];
       for (let i = 1; i <= FRAMES; i++) {
@@ -155,27 +227,33 @@ beforeAll(async () => {
       ts.sort((x, y) => x - y);
       return {
         medianMs: ts[Math.floor(ts.length / 2)]!,
-        stylePasses: lodStylePasses - style0,
-        treeBuilds: mortonTopologyBuilds - builds0,
+        stylePasses: (real.lod?.lodStylePasses ?? 0) - style0,
+        treeBuilds: (real.lod?.mortonTopologyBuilds ?? 0) - builds0,
         created: used.created,
         deleted: used.deleted,
         uploadedPerFrame: used.uploadedBytes / FRAMES,
         nodeFill: nodeFill - fill0,
         linkStroke: linkStroke - stroke0,
+        boxCalls: box.calls - box0,
+        cameraSyncs: net.cameraSyncs - syncs0,
+        cuts: work.cuts - cuts0,
+        styleResolves: work.styleResolves - styles0,
       };
     };
     /** Best of `ROUNDS` alternating rounds: the phase medians' minimum, so a burst of contention from
      *  a parallel run lands on one round, not on one phase. Counters are the last round's. */
     const best = (rounds: Phase[]): Phase => ({ ...rounds[rounds.length - 1]!, medianMs: Math.min(...rounds.map((r) => r.medianMs)) });
-    const leg = (engine: Network): Leg => {
+    const leg = (engine: TransitionProbe): Leg => {
       const streamed: Phase[] = [];
       const transition: Phase[] = [];
+      const fitted: Phase[] = [];
+      let fittedStartBoxes = 0;
       for (let round = 0; round < ROUNDS; round++) {
         // A streamed layout frame: the transport copies the message's positions, then the coalesced repaint.
         streamed.push(
           measure((i) => {
             graph.positions.set(i % 2 ? a : b);
-            scheduleLayoutRepaint();
+            engine.streamFrame();
             flush();
           }),
         );
@@ -185,8 +263,16 @@ beforeAll(async () => {
         flush();
         transition.push(measure(() => flush()));
         engine.stopLayout();
+        // The same with `fit` (#427): the camera eases along, from the view it is at (see the header).
+        graph.positions.set(a);
+        const box0 = box.calls;
+        engine.layout({ backend: "positions", positions: b, transition: 3_600_000, fit: true });
+        fittedStartBoxes = box.calls - box0;
+        flush();
+        fitted.push(measure(() => flush()));
+        engine.stopLayout();
       }
-      return { streamed: best(streamed), transition: best(transition) };
+      return { streamed: best(streamed), transition: best(transition), fitted: best(fitted), fittedStartBoxes };
     };
 
     off = leg(net);
@@ -239,6 +325,28 @@ describe(`network() position transition — per-frame cost vs a streamed layout 
         transition.uploadedPerFrame,
         `transition uploads ${(transition.uploadedPerFrame / 1024).toFixed(0)} KB/frame vs streamed ${(streamed.uploadedPerFrame / 1024).toFixed(0)} KB/frame`,
       ).toBeLessThanOrEqual(streamed.uploadedPerFrame * 1.02 + 4096);
+    });
+
+    it(`${name}: a fitted transition frame (#427) moves the camera in O(1) — no fit box, cut, style pass or upload beyond the unfitted frame's`, () => {
+      const { transition, fitted, fittedStartBoxes } = get();
+      expect(fittedStartBoxes, "the fit box runs once, when the transition starts").toBe(1);
+      expect(fitted.boxCalls, "the fit box ran on a transition frame").toBe(0);
+      expect(fitted.cameraSyncs, "the camera is not set once per frame").toBe(FRAMES);
+      expect(transition.cameraSyncs, "an unfitted transition moved the camera").toBe(0);
+      expect(fitted.cuts, `LOD cuts: fitted ${fitted.cuts} vs unfitted ${transition.cuts}`).toBe(transition.cuts);
+      expect(fitted.styleResolves, "a style pass ran on a fitted frame").toBe(0);
+      expect(fitted.nodeFill, "nodeFill re-ran during the fitted transition").toBe(0);
+      expect(fitted.linkStroke).toBeLessThanOrEqual(transition.linkStroke * 1.1);
+      expect(fitted.created).toBeLessThanOrEqual(transition.created);
+      expect(fitted.deleted).toBeLessThanOrEqual(transition.deleted);
+      expect(fitted.uploadedPerFrame).toBeLessThanOrEqual(transition.uploadedPerFrame * 1.02 + 4096);
+    });
+
+    it(`${name}: a fitted transition frame stays within the unfitted frame's budget (#427)`, () => {
+      const { transition, fitted } = get();
+      const msg = `${name}: fitted ${fitted.medianMs.toFixed(2)}ms vs unfitted ${transition.medianMs.toFixed(2)}ms at N=${N.toLocaleString()}`;
+      expect(fitted.medianMs, msg).toBeLessThanOrEqual(transition.medianMs * 1.3 + 1);
+      expect(fitted.medianMs, msg).toBeLessThan(ceiling);
     });
 
     it(`${name}: a transition frame stays within the streamed frame's budget`, () => {

@@ -15,6 +15,7 @@ import type { Device } from "@luma.gl/core";
 import { multilevelLayout, type CoarsenOptions } from "./coarsen.js";
 import { ForceLayout, seedPositions, type ForceParams } from "./force.js";
 import { lodTreeFromTopology, type BoundaryDiscs, type LODTree } from "./lod.js";
+import type { FitBox } from "./fit.js";
 import { nestedLayout, nestedBoundaryDiscs, type NestedLayoutParams, type NestedLayoutTopology } from "./nested-layout.js";
 import {
   lodGeometryViews,
@@ -352,6 +353,11 @@ export interface NestedWorkerOptions {
   onResult?: (positions: Float32Array) => void;
   /** Receive the final layout's module boundary discs (#329), just before its positions land. */
   onBoundaries?: (discs: BoundaryDiscs) => void;
+  /**
+   * Receive each streamed depth's bound on the final layout (#427, the `bounds` of `nestedLayout`'s
+   * `onDepth`), just before that depth's positions land — for a streaming fit to frame the map on it.
+   */
+  onBounds?: (bounds: FitBox) => void;
 }
 
 /**
@@ -410,6 +416,7 @@ export function startNestedWorkerLayout(
       terminate();
       return;
     }
+    if (msg.bounds) opts.onBounds?.(msg.bounds);
     if (msg.positions) graph.positions.set(msg.positions);
     onFrame();
   };

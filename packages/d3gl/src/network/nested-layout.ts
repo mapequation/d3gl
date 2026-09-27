@@ -26,6 +26,7 @@
  * per frame. Memory is O(tree size) for disc centres/radii plus per-module scratch of O(max k); a warm
  * start adds O(tree size) for the current centroids and one O(leaves) pass to place the result.
  */
+import type { FitBox } from "./fit.js";
 import type { BoundaryDiscs, LODTopology } from "./lod.js";
 import { BarnesHutTree } from "./quadtree.js";
 
@@ -97,8 +98,13 @@ export interface NestedLayoutOptions {
    * depth sit at their deepest placed ancestor's centre. Lets a caller stream the layout top-down.
    * Not called on a warm start (`initial`): its placement is final only once every depth is, and
    * collapsing leaves onto their module centres is what a warm start exists to avoid.
+   *
+   * `bounds` is a box the **final** layout lies in, known already (#427): the placed leaves, and the
+   * disc of each unplaced leaf's deepest placed ancestor. Every child disc lies inside its parent's, so
+   * it only shrinks depth by depth, and once every leaf is placed it is their exact box — what a
+   * streaming fit frames a cold nested layout by.
    */
-  onDepth?: (depth: number, positions: Float32Array) => void;
+  onDepth?: (depth: number, positions: Float32Array, bounds: FitBox) => void;
   /**
    * **Warm start** (#328): the current leaf positions, interleaved `[x, y, …]` (length `2 · leafCount`),
    * e.g. the layout before a re-clustering. Each module's children are seeded at their current leaf
@@ -271,8 +277,8 @@ export function nestedLayout(topo: NestedLayoutTopology, opts: NestedLayoutOptio
       }
     }
     if (opts.onDepth && !opts.initial && next.length) {
-      writeLeafPositions(topo, cx, cy, r, positions);
-      opts.onDepth(depth + 1, positions);
+      const bounds = writeLeafPositions(topo, cx, cy, r, positions);
+      opts.onDepth(depth + 1, positions, bounds);
     }
     frontier = next;
   }
@@ -380,16 +386,30 @@ export function placeOver(
 
 /**
  * Each leaf at its deepest placed ancestor's centre. Discs are placed top-down and every placed disc has
- * a positive radius, so `r > 0` marks a placed node.
+ * a positive radius, so `r > 0` marks a placed node. Returns the box the final leaf positions lie in
+ * (see {@link NestedLayoutOptions.onDepth}): a placed leaf's position, else its placed ancestor's disc —
+ * in the same pass, at no extra walk.
  */
-function writeLeafPositions(topo: NestedLayoutTopology, cx: Float32Array, cy: Float32Array, r: Float32Array, out: Float32Array): void {
+function writeLeafPositions(topo: NestedLayoutTopology, cx: Float32Array, cy: Float32Array, r: Float32Array, out: Float32Array): FitBox {
   const { leafCount, parent } = topo;
+  let minX = Infinity;
+  let minY = Infinity;
+  let maxX = -Infinity;
+  let maxY = -Infinity;
   for (let i = 0; i < leafCount; i++) {
     let g = i;
     while (!(r[g]! > 0) && parent[g]! >= 0) g = parent[g]!;
-    out[2 * i] = cx[g]!;
-    out[2 * i + 1] = cy[g]!;
+    const x = cx[g] ?? NaN;
+    const y = cy[g] ?? NaN;
+    out[2 * i] = x;
+    out[2 * i + 1] = y;
+    const pad = g === i ? 0 : (r[g] ?? 0); // a placed leaf is final; an unplaced one lands inside this disc
+    minX = Math.min(minX, x - pad);
+    minY = Math.min(minY, y - pad);
+    maxX = Math.max(maxX, x + pad);
+    maxY = Math.max(maxY, y + pad);
   }
+  return [minX, minY, maxX, maxY];
 }
 
 /**

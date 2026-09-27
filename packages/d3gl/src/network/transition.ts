@@ -32,8 +32,12 @@ export function lerpPositions(out: Float32Array, from: Float32Array, to: Float32
 export interface PositionTransitionOptions {
   /** Length in milliseconds. A non-positive or non-finite value jumps to the target on the first frame. */
   duration: number;
-  /** Called after each frame's write, the last one included — repaint here. */
-  onFrame: () => void;
+  /**
+   * Called after each frame's write, the last one included — repaint here. `progress` is the eased
+   * fraction of the way the positions have moved, exactly 1 on the last frame, so a caller can move
+   * something else (the camera of a fitted transition, #427) on the same ease in the same frame.
+   */
+  onFrame: (progress: number) => void;
   /** Easing on `[0, 1]`. Default {@link easeCubicInOut}. */
   ease?: (t: number) => number;
   /** Clock in milliseconds. Default `performance.now`. */
@@ -122,12 +126,13 @@ export function positionTransition(positions: Float32Array, opts: PositionTransi
     const t = duration > 0 ? (now() - start) / duration : 1;
     if (t >= 1) {
       positions.set(target);
-      opts.onFrame();
+      opts.onFrame(1);
       end();
       return;
     }
-    lerpPositions(positions, from, target, ease(Math.max(0, t)));
-    opts.onFrame();
+    const progress = ease(Math.max(0, t));
+    lerpPositions(positions, from, target, progress);
+    opts.onFrame(progress);
     raf = requestFrame(frame);
   };
 
