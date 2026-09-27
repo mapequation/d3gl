@@ -324,12 +324,15 @@ git -C <primary> checkout -- <files>                         # restore primary t
   a wall-clock watchdog (`packages/d3gl/scripts/run-browser-tests.mjs`) turns any
   rare connect/teardown stall into a fast failure instead of an infinite hang. CI
   does not run the full browser suite (node only) — only the browser perf tier below.
-- **A `vi.mock` in a browser test also replaces the module inside every Worker the test spawns** (#428).
-  The mock factory's `importOriginal` cannot run there, so the worker fails to load and the engine
-  silently takes its main-thread fallback — the test then measures the fallback, not the worker path.
-  `network-hierarchy.browser.test.ts` mocks `modules.js` to count main-thread module-tree builds; that is
-  why the layout worker imports the build core from `module-topology.js` instead. Never mock a module a
-  worker imports (`layout-worker.ts` and everything it pulls in) from a browser test.
+- **A `vi.mock` in a browser test also reaches every Web Worker the test spawns, and kills it** (#377, #428):
+  vitest serves the worker the mock proxy, which throws there (`getFactoryModule` of undefined), so the
+  worker never loads and the engine silently takes its main-thread fallback — the test then measures the
+  fallback, not the worker path. Never mock a module a worker imports (`layout-worker.ts` and everything it
+  pulls in). Two ways to count main-thread calls anyway: split the counted function out of what the worker
+  imports (#428: the layout worker builds module trees from `module-topology.js`, so
+  `network-hierarchy.browser.test.ts` can mock `buildModuleLODTree` in `modules.js`), or run the worker's
+  real code in-process on a timer (#377: `gpu/__tests__/_in-process-lod-worker.ts`) and keep every test that
+  needs the real worker in a mock-free file.
 - **At-scale perf tier** (`ci.yml` job `perf`, #220): `node scripts/run-perf-tier.mjs`
   runs every **env-gated node bench** with its gates ON at a reduced-but-real N
   (`PERF_N`, CI default 500k) and assertions enabled (`PERF_ASSERT=1`), single-threaded

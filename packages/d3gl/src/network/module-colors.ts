@@ -36,7 +36,8 @@ export interface ModuleColorOptions {
  *
  * A colour belongs to a module, so each is computed once per module (#428): O(nodes · depth) integer work
  * to find every node's module (see {@link internModules}), plus one HCL conversion per module that holds
- * a node — not one per node. 0.2 s → ≈20 ms for a 325k-node, ~40k-module Infomap map.
+ * a node — not one per node. For a 325k-node, ~40k-module Infomap map: 0.2 s → 58-66 ms in a production
+ * browser build (cold), 0.22 s → 24-26 ms in Node once warm.
  */
 export function moduleColors(nodes: ArrayLike<ModulePathNode>, opts: ModuleColorOptions = {}): string[] {
   const L = opts.lightness ?? 65;
