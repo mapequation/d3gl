@@ -265,9 +265,10 @@ export interface NetworkLayoutOptions {
    *  would run it and to `"worker"` everywhere else, **without** a warning, because there the worker is
    *  an expected outcome. From then on the layout behaves exactly as on the backend it resolved to —
    *  `fit`, drag reheat, state networks, `nested`, LOD streaming — and {@link Network.layoutTransport}
-   *  reports which one runs. A GPU run that fails rather than being unsupported (for example a driver
-   *  error while starting) still warns. The default does not change: omitting `backend` behaves as
-   *  before. */
+   *  reports which one runs. A GPU run that fails rather than being unsupported still warns: a driver
+   *  error while starting, or an engine created with render backend `"webgl"` whose WebGL setup failed
+   *  (its device never arrives; with render backend `"auto"` a failed upgrade stays on Canvas, which is
+   *  unsupported and silent). The default does not change: omitting `backend` behaves as before. */
   backend?: "positions" | "force" | "worker" | "gpu" | "auto";
   /** Interleaved `[x, y, …]` world coordinates for `backend: "positions"`. */
   positions?: Float32Array;
