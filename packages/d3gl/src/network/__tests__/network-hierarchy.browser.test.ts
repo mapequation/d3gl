@@ -6,8 +6,9 @@ import { nestedLayout } from "../nested-layout.js";
 
 // Count module-tree builds (#326): the engine must build the tree once per (graph, hierarchy), not once
 // per lod()/layout() call, and never on the pick path.
-// `fail` makes the next builds throw (a main-thread fallback that cannot build).
-const builds = vi.hoisted(() => ({ count: 0, fail: null as string | null }));
+// `fail` makes the next builds throw (a main-thread fallback that cannot build); `checks` counts module-link
+// checks, each a full pass over the records.
+const builds = vi.hoisted(() => ({ count: 0, fail: null as string | null, checks: 0 }));
 vi.mock("../modules.js", async (importOriginal) => {
   const mod = await importOriginal<typeof import("../modules.js")>();
   return {
@@ -16,6 +17,10 @@ vi.mock("../modules.js", async (importOriginal) => {
       builds.count++;
       if (builds.fail) throw new Error(builds.fail);
       return mod.buildModuleLODTree(...args);
+    },
+    checkModuleLinks: (...args: Parameters<typeof mod.checkModuleLinks>) => {
+      builds.checks++;
+      mod.checkModuleLinks(...args);
     },
   };
 });
@@ -63,6 +68,7 @@ const pathOf = (hit: { datum: unknown } | null): readonly number[] | undefined =
 beforeEach(() => {
   builds.count = 0;
   builds.fail = null;
+  builds.checks = 0;
 });
 
 describe("engine-owned module hierarchy — data(graph, { modules }) (#326)", () => {
@@ -450,6 +456,18 @@ describe("the module tree is built off the main thread (#428)", () => {
     expect(builds.count).toBe(0);
     expect(net.lodSource).toBe("modules");
     expect(Array.from(g.positions).every(Number.isFinite)).toBe(true);
+    net.destroy();
+  });
+
+  it("checks an explicit lod({ modules, moduleLinks }) once, when it is set", async () => {
+    const net = network(host(), { width: 200, height: 200 });
+    await net.whenReady();
+    net.data(graph()).lod({ modules: MODULES, moduleLinks: [{ source: [1], target: [2], flow: 0.5 }] });
+    expect(builds.checks).toBe(1);
+    net.layout({ backend: "worker", nested: true });
+    await net.whenSettled();
+    expect(builds.checks, "the tree job checked the links lod() had checked").toBe(1);
+    expect(builds.count).toBe(0);
     net.destroy();
   });
 

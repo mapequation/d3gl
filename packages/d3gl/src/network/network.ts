@@ -836,6 +836,9 @@ export class Network extends BaseEngine {
     settle(tree: LODTree): void;
     cancel(): void;
   } | null = null;
+  /** The explicit `lod({ modules })` {@link lod} checked against a graph when it deferred its build (#428),
+   *  so the tree job does not check the same records again ({@link moduleSource}). */
+  private lodAliasChecked: { options: NetworkLODOptions; graph: NetworkGraph } | null = null;
   /**
    * Whether a `layout()` has run since {@link data} set the current graph. Until one has, the positions
    * are not a layout's, and {@link lod} leaves a from-scratch tree build to the end of the call chain
@@ -1295,6 +1298,7 @@ export class Network extends BaseEngine {
       if (options.modules && this.graph) {
         moduleRecordIndex(this.graph.nodeCount, options.modules);
         if (options.moduleLinks) checkModuleLinks(this.graph.nodeCount, options.modules, options.moduleLinks);
+        this.lodAliasChecked = { options, graph: this.graph }; // once, as data() checks its hierarchy once
       }
       this.deferLODBuild();
     } else this.recomputeLODGeometry();
@@ -1721,10 +1725,14 @@ export class Network extends BaseEngine {
   }
 
   /** The hierarchy the module consumers read (#326): an explicit `lod({ modules })`'s (the back-compat
-   *  alias, `checked` false), else the engine's from `data(graph, { modules })` (checked there). */
+   *  alias, `checked` once {@link lod} has checked it against this graph), else the engine's from
+   *  `data(graph, { modules })` (checked there). */
   private moduleSource(): { modules: ArrayLike<ModuleNode>; moduleLinks: ArrayLike<ModuleLink> | undefined; checked: boolean } | undefined {
     const o = this.lodOptions;
-    if (o?.modules) return { modules: o.modules, moduleLinks: o.moduleLinks, checked: false };
+    if (o?.modules) {
+      const c = this.lodAliasChecked;
+      return { modules: o.modules, moduleLinks: o.moduleLinks, checked: c !== null && c.options === o && c.graph === this.graph };
+    }
     const h = this.hierarchy;
     return h ? { modules: h.modules, moduleLinks: h.moduleLinks, checked: true } : undefined;
   }
