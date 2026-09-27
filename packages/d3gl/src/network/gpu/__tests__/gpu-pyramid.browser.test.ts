@@ -664,19 +664,68 @@ describe("GPU tile pyramid — tiles and packed levels (T3)", () => {
   });
 
   it("writing a packed level leaves the other levels of its texture unchanged (the clear rule, §6)", () => {
-    // Fill Podd / Peven with a sentinel first: after the build, every texel outside a level's rectangle
-    // must still hold it (bitwise), and every level must be the 2×2 reduce of the level below — so no
-    // pass cleared its texture (luma's default clear ignores the viewport) or wrote past its rectangle.
+    // Fill Podd / Peven with a sentinel first, then snapshot both after every pass of the build (it
+    // submits once per pass: the scatter, then one reduce per level ℓ ≥ 1). The pass that writes
+    // level ℓ may change only ℓ's rectangle: every other texel of both textures — levels ℓ ± 2 in the
+    // same texture included — must be bitwise what it was before that pass. So no pass cleared its
+    // texture (luma's default clear ignores the viewport) or wrote past its rectangle. After the
+    // build every texel outside the rectangles still holds the sentinel, and every level is the 2×2
+    // reduce of the level below.
     const SENTINEL = 12345.5;
+    type Snapshot = Readonly<Record<"odd" | "even", Float32Array>>;
     for (const [segs, exactMax] of [[segmentsOf([5000]), 0], [segmentsOf([3000, 200]), 32]] as const) {
       const pos = sharedRegion(segs, [1500, 300], [[0, 0], [100, 100]], 0x5e17);
-      const { pyramid, release } = buildPyramid(device, pos, segs, exactMax, (p) => {
-        for (const tex of [p.textures.odd, p.textures.even]) {
-          tex.writeData(new Float32Array(tex.width * tex.height * 4).fill(SENTINEL));
-        }
+      const snapshots: Snapshot[] = [];
+      let watched: GridPyramid | null = null;
+      const snapshot = (p: GridPyramid): Snapshot => ({
+        odd: readbackRgbaFbo(device, p.textures.odd),
+        even: readbackRgbaFbo(device, p.textures.even),
       });
+      const submit = device.submit;
+      const spy = vi.spyOn(device, "submit").mockImplementation((commandBuffer) => {
+        submit.call(device, commandBuffer);
+        if (watched) snapshots.push(snapshot(watched));
+      });
+      let built: BuiltPyramid;
+      try {
+        built = buildPyramid(device, pos, segs, exactMax, (p) => {
+          for (const tex of [p.textures.odd, p.textures.even]) {
+            tex.writeData(new Float32Array(tex.width * tex.height * 4).fill(SENTINEL));
+          }
+          snapshots.push(snapshot(p));
+          watched = p;
+        });
+      } finally {
+        spy.mockRestore();
+      }
+      const { pyramid, release } = built;
       const atlas = pyramid.atlas;
       expect(atlas.levels.length).toBeGreaterThanOrEqual(5); // levels ℓ and ℓ ± 2 share a texture
+      // The fill, the scatter, then one reduce per coarser level.
+      expect(snapshots.length).toBe(atlas.levels.length + 1);
+      for (let p = 1; p < snapshots.length; p++) {
+        const before = snapshots[p - 1];
+        const after = snapshots[p];
+        if (!before || !after) throw new Error(`no snapshot around pass ${p - 1}`);
+        // Pass 0 is the scatter (it writes L0 only); pass p ≥ 1 writes level p.
+        const written = p === 1 ? null : pyramid.level(p - 1);
+        for (const which of ["odd", "even"] as const) {
+          const tex = pyramid.textures[which];
+          const a = new Uint32Array(before[which].buffer);
+          const b = new Uint32Array(after[which].buffer);
+          let changed = 0;
+          for (let y = 0; y < tex.height; y++) {
+            for (let x = 0; x < tex.width; x++) {
+              const inside = written !== null && written.texture === which &&
+                x >= written.x && x < written.x + written.width && y >= written.y && y < written.y + written.height;
+              if (inside) continue;
+              const o = (y * tex.width + x) * 4;
+              for (let ch = 0; ch < 4; ch++) if (a[o + ch] !== b[o + ch]) changed++;
+            }
+          }
+          expect(changed, `pass ${p - 1} changed ${which} texels outside its level's rectangle`).toBe(0);
+        }
+      }
       for (const which of ["odd", "even"] as const) {
         const tex = pyramid.textures[which];
         const all = readbackRgbaFbo(device, tex);
@@ -695,10 +744,14 @@ describe("GPU tile pyramid — tiles and packed levels (T3)", () => {
         const below = readLevel(device, pyramid, l - 1);
         const lvl = readLevel(device, pyramid, l);
         const expected = reduce2x2(below.data, lvl.width, lvl.height);
+        // A compiler may add a + b + c + d in another order than the reference's left fold. Two orders
+        // of a 4-term float32 sum differ by at most ~3ε·Σ|term|, so the bound scales with the children's
+        // magnitudes, not the result's: a 2×2 block straddling x = 0 (children +5 and −4) cancels.
+        const magnitude = reduce2x2(below.data.map(Math.abs), lvl.width, lvl.height);
         for (let k = 0; k < expected.length; k++) {
           const e = expected[k] ?? 0;
           if (k % 4 === 2) expect(lvl.data[k], `level ${l} mass`).toBe(e); // integers: exact
-          else expect(Math.abs((lvl.data[k] ?? 0) - e), `level ${l}`).toBeLessThanOrEqual(4 * EPS * Math.abs(e) + 1e-30);
+          else expect(Math.abs((lvl.data[k] ?? 0) - e), `level ${l}`).toBeLessThanOrEqual(4 * EPS * (magnitude[k] ?? 0) + 1e-30);
         }
       }
       release();
