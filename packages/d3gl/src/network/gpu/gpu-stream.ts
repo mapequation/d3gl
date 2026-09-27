@@ -30,7 +30,8 @@
  * A non-finite layout (NaN / ∞ in the reductions' stats) stops the run with one warning, keeping the last
  * finite positions — the harvest checks the stats before it touches `graph.positions`. A lost context
  * (`isContextLost`, a failed fence wait, `webglcontextlost`) stops it without touching GL again, with one
- * warning.
+ * warning. An owner that handles a failure itself passes `onFailure`, which replaces the warning (the
+ * nested layout lays the map out on the worker instead, #355).
  */
 import { WebGLDevice } from "@luma.gl/webgl";
 import { DRAG_HEAT, RECOOL_TICKS } from "../force.js";
@@ -145,6 +146,12 @@ export interface GpuStreamOptions {
   into?: Float32Array;
   /** Where a packed source's extra floats land on each harvest (the nested layout's module discs, #355). */
   extra?: Float32Array;
+  /**
+   * Called once, instead of the warning, when the run stops on a non-finite layout or a lost context —
+   * right before `settled` resolves, so the owner can tell a failed run from a finished one. Its argument
+   * names the reason. Default: warn and keep the last finite positions.
+   */
+  onFailure?: (reason: string) => void;
 }
 
 type Mode = "idle" | "run" | "drag" | "cool";
@@ -175,6 +182,7 @@ export class GpuStream {
   private readonly extra: Float32Array | undefined;
   private readonly streaming: boolean;
   private readonly onFrame: () => void;
+  private readonly onFailure: ((reason: string) => void) | undefined;
   private readonly iterations: number;
   private readonly frameEvery: number | undefined;
   private readonly budget: FrameBudget<WebGLSync | null>;
@@ -234,6 +242,7 @@ export class GpuStream {
     this.extra = opts.extra;
     this.streaming = opts.stream ?? true;
     this.onFrame = onFrame;
+    this.onFailure = opts.onFailure;
     this.iterations = opts.iterations;
     this.frameEvery = opts.frameEvery;
     this.throttle = new RepaintThrottle(opts.minFrameMs ?? MIN_FRAME_MS);
@@ -571,7 +580,7 @@ export class GpuStream {
     this.halt();
     this.budget.dispose(false);
     this.readback.destroy(false);
-    console.warn(`[d3gl] network layout({ backend: 'gpu' }) stopped: ${reason}.`);
+    this.reportFailure(reason, "");
     this.settle();
   }
 
@@ -582,11 +591,18 @@ export class GpuStream {
     this.finishing = false;
     this.looping = false;
     const [sx, sy, sv, count, maxX, maxY, negMinX, negMinY] = this.stats;
-    console.warn(
-      "[d3gl] network layout({ backend: 'gpu' }) stopped: the layout became non-finite " +
+    this.reportFailure(
+      "the layout became non-finite " +
         `(Σx=${sx}, Σy=${sy}, Σ|v|=${sv}, count=${count}, box=[${negMinX === undefined ? "" : -negMinX}, ` +
-        `${negMinY === undefined ? "" : -negMinY}, ${maxX}, ${maxY}]); keeping the last finite positions.`,
+        `${negMinY === undefined ? "" : -negMinY}, ${maxX}, ${maxY}])`,
+      "; keeping the last finite positions",
     );
     this.settle();
+  }
+
+  /** A failed run: to the owner's `onFailure` when it has one (it decides what follows), else one warning. */
+  private reportFailure(reason: string, consequence: string): void {
+    if (this.onFailure) this.onFailure(reason);
+    else console.warn(`[d3gl] network layout({ backend: 'gpu' }) stopped: ${reason}${consequence}.`);
   }
 }

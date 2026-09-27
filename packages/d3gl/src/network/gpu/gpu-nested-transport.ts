@@ -16,6 +16,10 @@
  * 4. The final layout's module discs come back with it: a warm start is placed over the current map
  *    (float64, on the CPU, as the CPU layout does), the boundary discs (#329) go to `onBoundaries`, then
  *    the positions land. The GPU resources are freed once it settles — a nested layout has no reheat.
+ *
+ * A solve that stops before its final harvest — a non-finite layout, a lost context — lands none of it
+ * (a one-frame layout's arrays were never filled): one warning names the reason, and the worker lays the
+ * map out with the same delivery options, as it does when the device cannot run the solve.
  */
 import type { Device } from "@luma.gl/core";
 import { WebGLDevice } from "@luma.gl/webgl";
@@ -83,12 +87,19 @@ export function startGpuNestedLayout(
 
   const run = (device: WebGLDevice, solver: NestedSolverTopology): void => {
     if (stopped) return;
-    const layout = new GpuNestedLayout(device, solver);
+    // Now that the links are known, the springs' CSR too must fit the device.
+    const verdict = gpuLayoutSupport(gpuCaps(device), gpuLayoutNeed(solver.slotCount, solver.linkSource.length));
+    if (!verdict.ok) {
+      fallBack(verdict.reason);
+      return;
+    }
+    const layout = new GpuNestedLayout(device, solver); // frees what it created if it throws
     const oneFrame = opts.onResult !== undefined || opts.stream === false;
     const modules = solver.treeSize - solver.leafCount;
     const discs = new Float32Array(4 * modules);
     // A one-frame layout harvests into its own array: `graph.positions` stays as it is until it lands.
     const into = oneFrame ? new Float32Array(2 * solver.leafCount) : undefined;
+    let failure: string | null = null;
     let s: GpuStream;
     try {
       s = new GpuStream(device, layout, graph, {
@@ -97,6 +108,9 @@ export function startGpuNestedLayout(
         extra: discs,
         ...(into ? { into } : {}),
         ...(opts.frameEvery !== undefined ? { frameEvery: opts.frameEvery } : {}),
+        onFailure: (reason) => {
+          failure = reason;
+        },
       }, oneFrame ? () => {} : onFrame);
     } catch (error) {
       layout.destroy();
@@ -105,7 +119,15 @@ export function startGpuNestedLayout(
     stream = s;
     report("gpu");
     s.settled.then(() => {
-      if (stopped) return;
+      if (stopped || stream !== s) return;
+      if (failure !== null) {
+        // Stopped before its final harvest: nothing of it lands. Free it (no GL call on a lost context)
+        // and lay the map out on the worker.
+        stream = null;
+        s.stop();
+        fallBack(`the GPU solve stopped: ${failure}`);
+        return;
+      }
       // The final harvest has landed (in `graph.positions`, or `into`): place a warm start, record the
       // boundary discs, then deliver the positions (a streamed layout's are already painted).
       const positions = into ?? graph.positions.subarray(0, 2 * solver.leafCount);
@@ -119,7 +141,13 @@ export function startGpuNestedLayout(
       s.stop(); // no reheat: free the GPU resources now
       resolveSettled();
     }, resolveSettled);
-    s.start();
+    try {
+      s.start();
+    } catch (error) {
+      stream = null; // its settle must not land anything
+      s.stop();
+      throw error;
+    }
   };
 
   const begin = (device: Device | null | undefined): void => {

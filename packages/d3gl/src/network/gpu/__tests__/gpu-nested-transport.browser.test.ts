@@ -4,7 +4,9 @@
  */
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import type { Device } from "@luma.gl/core";
+import { WebGLDevice } from "@luma.gl/webgl";
 import { makeTestDevice } from "./_device.js";
+import { AsyncPositionReadback } from "../async-readback.js";
 import { startGpuNestedLayout } from "../gpu-nested-transport.js";
 import { GpuNestedLayout } from "../gpu-nested-layout.js";
 import { nestedSolverResult, nestedSolverTopology } from "../nested-topology.js";
@@ -105,6 +107,59 @@ describe("startGpuNestedLayout (#355)", () => {
     expect(String(warn.mock.calls[0]?.[0])).toMatch(/fell back to the CPU worker/);
     // The worker runs the CPU layout itself.
     expect(Array.from(g.positions)).toEqual(Array.from(nestedLayout(tree, { iterations, radius }).positions));
+  });
+
+  it("a warm start whose GPU solve fails lands none of it: the worker lays it out, with one warning", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    // The harvest refuses the copy, as it does when the reductions come back non-finite.
+    vi.spyOn(AsyncPositionReadback.prototype, "harvest").mockReturnValue(false);
+    const g = graphOver(tree);
+    g.positions.set(nestedLayout(tree, { iterations, radius }).positions);
+    const initial = g.positions.slice();
+    const before = g.positions.slice();
+    const got: { results: Float32Array[]; boundaries: BoundaryDiscs[]; transports: string[] } = { results: [], boundaries: [], transports: [] };
+    const handle = startGpuNestedLayout(device, g, tree, { iterations, initial }, () => {}, {
+      onTransport: (t) => got.transports.push(t),
+      onResult: (positions) => got.results.push(positions),
+      onBoundaries: (discs) => got.boundaries.push(discs),
+    });
+    await handle.settled;
+    expect(got.transports).toEqual(["gpu", "worker"]);
+    expect(handle.transport).toBe("worker");
+    // Only the worker's result lands — the CPU warm start — never the GPU's unharvested (all-zero) arrays.
+    const want = nestedLayout(tree, { iterations, initial });
+    expect(got.results.length).toBe(1);
+    expect(Array.from(got.results[0] ?? [])).toEqual(Array.from(want.positions));
+    expect(got.boundaries.length).toBe(1);
+    expect(Array.from(got.boundaries[0]?.r ?? [])).toEqual(Array.from(nestedBoundaryDiscs(tree, want).r));
+    expect(Array.from(g.positions)).toEqual(Array.from(before)); // with onResult the caller lands it
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(String(warn.mock.calls[0]?.[0])).toMatch(/fell back to the CPU worker: the GPU solve stopped: the layout became non-finite/);
+  });
+
+  it("a cold layout that loses its context mid-stream restarts on the worker and lands the CPU layout", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    if (!(device instanceof WebGLDevice)) throw new Error("the test device is WebGL2");
+    const canvas = device.gl.canvas;
+    const g = graphOver(tree);
+    const got: { frames: number; boundaries: BoundaryDiscs[]; transports: string[] } = { frames: 0, boundaries: [], transports: [] };
+    const handle = startGpuNestedLayout(device, g, tree, { iterations, radius }, () => {
+      // After the first streamed GPU frame: the context is lost (the event the stream listens for).
+      if (++got.frames === 1) canvas.dispatchEvent(new Event("webglcontextlost"));
+    }, {
+      frameEvery: 10,
+      onTransport: (t) => got.transports.push(t),
+      onBoundaries: (discs) => got.boundaries.push(discs),
+    });
+    await handle.settled;
+    expect(got.transports).toEqual(["gpu", "worker"]);
+    const want = nestedLayout(tree, { iterations, radius });
+    expect(Array.from(g.positions)).toEqual(Array.from(want.positions));
+    // One set of boundary discs — the worker's — and none from the lost GPU solve.
+    expect(got.boundaries.length).toBe(1);
+    expect(Array.from(got.boundaries[0]?.r ?? [])).toEqual(Array.from(nestedBoundaryDiscs(tree, want).r));
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(String(warn.mock.calls[0]?.[0])).toMatch(/fell back to the CPU worker: the GPU solve stopped: the WebGL context was lost/);
   });
 
   it("stops mid-run: settles, and no frame lands after it", async () => {
