@@ -416,7 +416,10 @@ describe("GPU nested solve per tick (#355, #380)", () => {
 });
 
 describe("GPU nested layout per frame on a module of very uneven child sizes (#380)", () => {
-  // Capped: at CI's 100k the organise phase of a 100k-child module is the tier's per-file budget.
+  // Capped at 60,000 children, for two reasons measured at CI's 100k on SwiftShader. This leg alone took
+  // 270 s (137 s at 60,000), and the tier gives the whole file 300 s. And this fixture's layout piles more
+  // than 12 discs into a sub-cell at the first compact steps, so the exact fallback runs (#380 D3, 9,503
+  // slots at the first compact step), which the pair-work test rejects.
   const BIG = Math.min(N, 60_000);
   let host: HTMLElement;
   let net: Network;
