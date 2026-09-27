@@ -519,7 +519,8 @@ export class GpuNestedLayout implements StreamSolver {
    */
   forceBand(band: number, bands: number): void {
     if (!this.organising) {
-      this.collision.gather(this.posFbo(this.posParity ^ 1), this.gatherInput, this.workRow(band, bands), this.workRow(band + 1, bands));
+      const [r0, r1] = this.gatherBandRows(band, bands);
+      this.collision.gather(this.posFbo(this.posParity ^ 1), this.gatherInput, r0, r1);
       return;
     }
     const r0 = Math.floor((band * this.height) / bands);
@@ -591,6 +592,14 @@ export class GpuNestedLayout implements StreamSolver {
     this.swapPos();
     this.vel.swap();
     this.velParity ^= 1;
+  }
+
+  /**
+   * The slot atlas rows `[r0, r1)` compact band `band` of `bands` gathers: rows of about `1 / bands` of the
+   * collision plan's estimated work each (a band cannot split a row), tiling the atlas in order.
+   */
+  gatherBandRows(band: number, bands: number): [number, number] {
+    return [this.workRow(band, bands), this.workRow(band + 1, bands)];
   }
 
   /**

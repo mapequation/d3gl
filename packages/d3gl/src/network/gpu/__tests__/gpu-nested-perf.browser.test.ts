@@ -19,8 +19,14 @@
  *   harvest precedes the frame's layout draws; no GPU object created per streamed frame once the stream
  *   runs; `settled` only after the final stream tick's positions were harvested.
  * - **Per tick:** a solve tick allocates nothing, and a compact collision step draws exactly one count
- *   scatter and {@link COLLISION_ROUNDS} round scatters of N points (the K-occupant grid's fixed passes),
- *   never a draw of N points into a 1×1 viewport (#349).
+ *   scatter and K round scatters per hash table (the class cells', {@link COLLISION_ROUNDS}; the sub-cells',
+ *   {@link COLLISION_SUB_ROUNDS}) of the binned slots (the radius-class grid's fixed passes), never a draw
+ *   of N points into a 1×1 viewport (#349).
+ * - **A module of very uneven child sizes** (#380; a single-scale grid made its gather quadratic, 157 ms
+ *   frames at 60,000 children): the same per-frame bounds and signatures through the real trigger, a
+ *   collision step's pair work within 3× of the collision plan's estimate with no slot on the exact
+ *   fallback, and the gather cut into bands of equal estimated work (the frame budget admits a band by its
+ *   share of the estimate; bands of equal rows put the big module's work in the first).
  */
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { Device } from "@luma.gl/core";
@@ -30,7 +36,8 @@ import { buildModuleLODTree, type ModuleNode } from "../../modules.js";
 import { observeGpuLayoutFrames, type GpuFrameSample } from "../gpu-stream.js";
 import { GpuNestedLayout } from "../gpu-nested-layout.js";
 import { nestedSolverTopology } from "../nested-topology.js";
-import { COLLISION_ROUNDS, COLLISION_STEPS } from "../passes/collision.js";
+import { COLLISION_ROUNDS, COLLISION_STEPS, COLLISION_SUB_ROUNDS } from "../passes/collision.js";
+import type { NestedSolverTopology } from "../nested-topology.js";
 import { MIN_FRAME_MS } from "../repaint-throttle.js";
 import { makeTestDevice } from "./_device.js";
 import { perfBudget, perfN } from "../../../__tests__/perf-budget.js";
@@ -79,6 +86,43 @@ function infomapLike(n: number): { graph: NetworkGraph; modules: ModuleNode[] } 
     flow[id] = (rng() + 0.05) ** -1.2;
   }
   return { graph: buildGraph({ nodeCount: n, source, target, nodeFlow: flow }), modules };
+}
+
+/**
+ * A two-level map with one module of `big` leaves of Zipf flows (1/rank: radii spanning √big) and 20
+ * modules of 40, leaves chained inside each module plus a random link from 30% of them — the shape that
+ * made a single-scale collision grid quadratic (#380).
+ */
+function zipfLike(big: number): { graph: NetworkGraph; modules: ModuleNode[] } {
+  const rng = makePrng(0x380);
+  const n = big + 800;
+  const modules: ModuleNode[] = [];
+  const source: number[] = [];
+  const target: number[] = [];
+  const flow = new Float32Array(n);
+  for (let id = 0; id < n; id++) {
+    const inBig = id < big;
+    const rank = inBig ? id : (id - big) % 40;
+    modules.push({ id, path: [inBig ? 1 : 2 + Math.floor((id - big) / 40), rank + 1] });
+    flow[id] = inBig ? 1 / (id + 1) : 0.001 * (rng() + 0.05) ** -1.2;
+    if (rank > 0) {
+      source.push(id - 1);
+      target.push(id);
+    }
+    if (rng() < 0.3) {
+      source.push(id);
+      target.push(Math.floor(rng() * n));
+    }
+  }
+  return { graph: buildGraph({ nodeCount: n, source, target, nodeFlow: flow }), modules };
+}
+
+/** The batched solve of a map, as the engine builds it (tests drive its work items directly). */
+function solverOf({ graph, modules }: { graph: NetworkGraph; modules: ModuleNode[] }, iterations: number): NestedSolverTopology {
+  const tree = buildModuleLODTree(graph.nodeCount, modules, graph);
+  const parent = tree.parent;
+  if (!parent) throw new Error("module trees carry a parent map");
+  return nestedSolverTopology({ ...tree, parent }, { iterations, size: graph.flow ?? undefined });
 }
 
 // ── GL call log (the flat streaming guard's, _gpu-stream-harness.ts) ────────────────────────────────
@@ -174,6 +218,28 @@ async function streamLeg(net: Network, graph: NetworkGraph, modules: ModuleNode[
   return { frames, events: log.events, settledAfterFrame, elapsedMs: performance.now() - t0 };
 }
 
+/**
+ * The GPU-only rate of a map's solve on this machine, stream ticks per second: its stream ticks unsliced,
+ * fenced by a read, on a device of its own, before any stream (one warm-up tick first).
+ */
+async function gpuOnlyRate(map: { graph: NetworkGraph; modules: ModuleNode[] }): Promise<number> {
+  const device = await makeTestDevice();
+  try {
+    const solver = solverOf(map, ITERATIONS);
+    const solo = new GpuNestedLayout(device, solver);
+    const local = new Float32Array(2 * solver.slotCount);
+    solo.runTicks(1);
+    solo.readLocal(local);
+    const t0 = performance.now();
+    solo.runTicks(ITERATIONS - 1);
+    solo.readLocal(local);
+    solo.destroy();
+    return ((STREAM_TICKS - 1) * 1000) / (performance.now() - t0);
+  } finally {
+    device.destroy();
+  }
+}
+
 function median(xs: number[]): number {
   const s = xs.slice().sort((a, b) => a - b);
   return s[s.length >> 1] ?? 0;
@@ -267,26 +333,7 @@ describe("GPU nested layout per frame (#355) — network().layout({ backend: 'gp
 
   beforeAll(async () => {
     fixture = infomapLike(N);
-    // The GPU-only rate of the same solve on this machine: its stream ticks unsliced, fenced by a read, on
-    // a device of its own, before any stream (one warm-up tick first).
-    const device = await makeTestDevice();
-    try {
-      const tree = buildModuleLODTree(fixture.graph.nodeCount, fixture.modules, fixture.graph);
-      const parent = tree.parent;
-      if (!parent) throw new Error("module trees carry a parent map");
-      const solver = nestedSolverTopology({ ...tree, parent }, { iterations: ITERATIONS, size: fixture.graph.flow ?? undefined });
-      const solo = new GpuNestedLayout(device, solver);
-      const local = new Float32Array(2 * solver.slotCount);
-      solo.runTicks(1);
-      solo.readLocal(local);
-      const t0 = performance.now();
-      solo.runTicks(ITERATIONS - 1);
-      solo.readLocal(local);
-      gpuOnlyTicksPerSec = ((STREAM_TICKS - 1) * 1000) / (performance.now() - t0);
-      solo.destroy();
-    } finally {
-      device.destroy();
-    }
+    gpuOnlyTicksPerSec = await gpuOnlyRate(fixture);
     host = perfHost(W, H);
     net = network(host, { width: W, height: H, backend: "webgl" });
     await net.whenReady();
@@ -329,18 +376,17 @@ describe("GPU nested layout per frame (#355) — network().layout({ backend: 'gp
   }, perfBudget(300_000));
 });
 
-describe("GPU nested solve per tick (#355)", () => {
+describe("GPU nested solve per tick (#355, #380)", () => {
   let device: Device;
   beforeAll(async () => {
     device = await makeTestDevice();
   });
 
   it("allocates nothing per tick or per readback, and a collision step draws its fixed scatters", () => {
-    const { graph, modules } = infomapLike(Math.min(N, 50_000));
-    const tree = buildModuleLODTree(graph.nodeCount, modules, graph);
-    const parent = tree.parent;
-    if (!parent) throw new Error("module trees carry a parent map");
-    const solver = nestedSolverTopology({ ...tree, parent }, { iterations: 10, size: graph.flow ?? undefined });
+    // A Zipf module, so the radius-class grid bins slots (an even map's small modules take the exact loop).
+    const solver = solverOf(zipfLike(Math.min(N, 20_000)), 10);
+    const binned = solver.collision.binnedSlots.length;
+    expect(binned).toBeGreaterThan(0);
     const layout = new GpuNestedLayout(device, solver);
     const log = new GlCallLog();
     try {
@@ -348,7 +394,7 @@ describe("GPU nested solve per tick (#355)", () => {
       layout.prepareReadback();
       const organiseCreates = log.events.filter((e) => e.kind === "create").length;
       const before = log.events.length;
-      layout.beginTick(); // compact, collision step 1: its cells, counts and rounds
+      layout.beginTick(); // compact, collision step 1: its cells, then each table's counts and rounds
       layout.forceBand(0, 3);
       layout.forceBand(1, 3);
       layout.forceBand(2, 3);
@@ -358,12 +404,115 @@ describe("GPU nested solve per tick (#355)", () => {
       layout.prepareReadback();
       expect(organiseCreates, "GPU objects created by organise ticks or a readback").toBe(0);
       expect(log.events.filter((e) => e.kind === "create").length, "GPU objects created by compact ticks").toBe(0);
-      // One count scatter and the rounds, each over every slot: the grid's fixed pass count.
-      expect(step.length).toBe(1 + COLLISION_ROUNDS);
-      expect(step.every((e) => e.kind === "layout-draw" && e.count === solver.slotCount)).toBe(true);
+      // Per table one count scatter and its rounds, each over the binned slots: the grid's fixed pass count.
+      expect(step.length).toBe(2 + COLLISION_ROUNDS + COLLISION_SUB_ROUNDS);
+      expect(step.every((e) => e.kind === "layout-draw" && e.count === binned)).toBe(true);
       expect(log.events.some((e) => e.kind === "layout-draw" && e.viewport1x1 && e.count >= solver.slotCount)).toBe(false);
     } finally {
       log.restore();
+      layout.destroy();
+    }
+  });
+});
+
+describe("GPU nested layout per frame on a module of very uneven child sizes (#380)", () => {
+  // Capped: at CI's 100k the organise phase of a 100k-child module is the tier's per-file budget.
+  const BIG = Math.min(N, 60_000);
+  let host: HTMLElement;
+  let net: Network;
+  let fixture: { graph: NetworkGraph; modules: ModuleNode[] };
+  let gpuOnlyTicksPerSec = 0;
+  let device: Device;
+
+  beforeAll(async () => {
+    fixture = zipfLike(BIG);
+    gpuOnlyTicksPerSec = await gpuOnlyRate(fixture);
+    device = await makeTestDevice();
+    host = perfHost(W, H);
+    net = network(host, { width: W, height: H, backend: "webgl" });
+    await net.whenReady();
+    const warm = zipfLike(2_000);
+    net.data(warm.graph, { modules: warm.modules }).layout({ backend: "gpu", nested: { iterations: 5 } });
+    await net.whenSettled();
+  }, perfBudget(300_000));
+
+  afterAll(() => {
+    net?.destroy();
+    host?.remove();
+  });
+
+  const TRANSPORT_P95_MS = perfBudget(4 + 2 * ((BIG + 800) / 100_000));
+  const ENCODE_MEDIAN_MS = perfBudget(2.5);
+
+  it("LOD off: bounded transport main thread, the async readback signatures, throughput", async () => {
+    const leg = await streamLeg(net, fixture.graph, fixture.modules, false);
+    const { transport, encode, ticksPerSec } = report("Zipf, LOD off", leg);
+    console.log(`  GPU-only nested solve (Zipf ${BIG}): ${gpuOnlyTicksPerSec.toFixed(1)} stream ticks/s`);
+    assertSignatures(leg);
+    expect(quantile(transport, 0.95)).toBeLessThan(TRANSPORT_P95_MS);
+    expect(median(encode)).toBeLessThan(ENCODE_MEDIAN_MS);
+    expect(ticksPerSec).toBeGreaterThan(0.25 * gpuOnlyTicksPerSec * 0.6);
+  }, perfBudget(600_000));
+
+  it("a collision step's pair work stays within 3× of the collision plan's estimate, with no slot on the exact fallback", () => {
+    const solver = solverOf(fixture, ITERATIONS);
+    const layout = new GpuNestedLayout(device, solver, { collisionStats: true });
+    try {
+      layout.runTicks(Math.ceil(0.6 * ITERATIONS));
+      const ratios: number[] = [];
+      while (layout.ticks < ITERATIONS) {
+        layout.beginTick();
+        const stats = layout.collisionStats();
+        let work = 0;
+        let overflow = 0;
+        for (let i = 0; i < solver.slotCount; i++) {
+          work += 16 * (stats[4 * i] ?? 0) + (stats[4 * i + 1] ?? 0);
+          if (stats[4 * i + 3] === 2) overflow++;
+        }
+        expect(overflow, `tick ${layout.ticks}: slots sent to the exact fallback`).toBe(0);
+        ratios.push(work / solver.collision.gatherWork);
+        layout.forceBand(0, 1);
+        layout.integrate();
+      }
+      console.log(`  Zipf ${BIG}: pair work per collision step / plan estimate: ${Math.min(...ratios).toFixed(2)}-${Math.max(...ratios).toFixed(2)} (single-scale grid at 60,000 children: 36)`);
+      expect(Math.max(...ratios)).toBeLessThan(3);
+    } finally {
+      layout.destroy();
+    }
+  }, perfBudget(300_000));
+
+  it("cuts the gather into bands of equal estimated work, which rows alone would not", () => {
+    // The frame budget admits a band by its share of the gather's estimate; a band must carry that share.
+    // Rows alone would not: the big module's slots sit in the first rows.
+    const solver = solverOf(fixture, ITERATIONS);
+    const layout = new GpuNestedLayout(device, solver);
+    try {
+      const width = Math.max(1, Math.ceil(Math.sqrt(solver.slotCount)));
+      const rows = Math.ceil(solver.slotCount / width);
+      const rowWork = (r0: number, r1: number): number => {
+        let w = 0;
+        for (let i = r0 * width; i < Math.min(solver.slotCount, r1 * width); i++) w += (solver.collision.slotWork[i] ?? 0) + 16;
+        return w;
+      };
+      const total = rowWork(0, rows);
+      let widestRow = 0;
+      for (let r = 0; r < rows; r++) widestRow = Math.max(widestRow, rowWork(r, r + 1));
+      for (const bands of [2, 4, 8]) {
+        let next = 0;
+        const shares: string[] = [];
+        for (let b = 0; b < bands; b++) {
+          const [r0, r1] = layout.gatherBandRows(b, bands);
+          expect(r0).toBe(next);
+          next = r1;
+          const share = rowWork(r0, r1) / total;
+          shares.push(share.toFixed(3));
+          expect(share, `band ${b} of ${bands}`).toBeLessThanOrEqual(1 / bands + widestRow / total);
+        }
+        expect(next).toBe(rows);
+        const firstEqualRows = rowWork(0, Math.floor(rows / bands)) / total;
+        console.log(`  Zipf ${BIG}, ${bands} bands: work shares ${shares.join(" / ")} (the first of ${bands} equal-row bands: ${firstEqualRows.toFixed(3)})`);
+      }
+    } finally {
       layout.destroy();
     }
   });

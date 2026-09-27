@@ -308,3 +308,35 @@ export function infomapLikeTree(leaves: number): { topo: NestedLayoutTopology; f
     flow,
   };
 }
+
+/**
+ * A two-level map with one large module of very uneven child sizes (#380): `big` leaves with Zipf flows
+ * (1/rank) in module 1 — radii spanning √big — and `small` modules of 40 leaves with heavy-tailed flows;
+ * leaves chained inside each module plus a random link from 30% of them. Seeded. The collision worst case
+ * of a single-scale grid: at 60,000 children it took 3.6 billion pair tests per collision step.
+ */
+export function zipfModuleTree(big: number, small = 200): { topo: NestedLayoutTopology; flow: Float32Array } {
+  let seed = 7;
+  const rnd = (): number => (seed = (seed * 1664525 + 1013904223) >>> 0) / 4294967296;
+  const n = big + 40 * small;
+  const records: ModuleNode[] = [];
+  const source: number[] = [];
+  const target: number[] = [];
+  const flow = new Float32Array(n);
+  for (let id = 0; id < n; id++) {
+    const inBig = id < big;
+    const m = inBig ? 0 : 1 + Math.floor((id - big) / 40);
+    const rank = inBig ? id : (id - big) % 40;
+    records.push({ id, path: [m + 1, rank + 1] });
+    flow[id] = inBig ? 1 / (id + 1) : 0.001 * (rnd() + 0.05) ** -1.2;
+    if (rank > 0) {
+      source.push(id - 1);
+      target.push(id);
+    }
+    if (rnd() < 0.3) {
+      source.push(id);
+      target.push(Math.floor(rnd() * n));
+    }
+  }
+  return { topo: topo(buildModuleLODTree(n, records, { source, target, weight: new Float32Array(source.length).fill(1) })), flow };
+}

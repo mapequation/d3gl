@@ -78,9 +78,9 @@ export const COLLISION_SUB_SHIFT = 2;
  */
 export const COLLISION_VISIT_COST = 16;
 /** Cell visits of one work item of a grid slot. */
-export const COLLISION_PART_VISITS = 128;
+export const COLLISION_PART_VISITS = 32;
 /** Pair tests of one work item of an exact slot. */
-export const COLLISION_PART_PAIRS = 512;
+export const COLLISION_PART_PAIRS = 256;
 /** `slotCollide` bit: the slot takes the exact loop over its segment. */
 export const COLLISION_EXACT = 16;
 /** `slotCollide` bit: the slot's search runs in work items (every grid slot, and the exact slots cut into more than one). */

@@ -3,8 +3,9 @@
  * same problem the CPU `nestedLayout` solves, laid out for one segmented solve.
  */
 import { describe, expect, it } from "vitest";
-import { EXACT_MAX, Scratch, WARM_ALPHA, nestedLayout, setupModule, subtreeWeights } from "../../nested-layout.js";
-import { NESTED_LARGE_MAX, nestedSolverBuffers, nestedSolverResult, nestedSolverTopology } from "../nested-topology.js";
+import { EXACT_MAX, NESTED, Scratch, WARM_ALPHA, nestedLayout, setupModule, subtreeWeights } from "../../nested-layout.js";
+import { nestedSolverBuffers, nestedSolverResult, nestedSolverTopology } from "../nested-topology.js";
+import { COLLISION_EXACT, collisionPlan } from "../collision-plan.js";
 import { assertSegmentLocalEdges, slotSegments } from "../segments.js";
 import { threeLevel, topo } from "../../__tests__/nested-fixtures.js";
 import { buildModuleLODTree, type ModuleNode } from "../../modules.js";
@@ -95,60 +96,23 @@ describe("nestedSolverTopology — one segmented solve over a module tree (#355)
     expect(single.segAlpha0.every((a) => a === 1)).toBe(true);
   });
 
-  it("lists each large segment's r₉ and its at most 8 larger slots", () => {
+  it("carries the collision plan of its own float32 radii and segments (#380)", () => {
     const flow = new Float32Array(tree.leafCount);
     for (let i = 0; i < flow.length; i++) flow[i] = 1 + ((i * 7919) % 97) ** 2; // uneven sub-module weights
     const sized = nestedSolverTopology(tree, { size: flow });
-    let checked = 0;
+    const plan = collisionPlan(sized.radius, sized.segStart, sized.segCount, EXACT_MAX, NESTED.PAD);
+    expect(sized.collision.slotCollide).toEqual(plan.slotCollide);
+    expect(sized.collision.items).toEqual(plan.items);
+    expect(sized.collision.segClasses).toEqual(plan.segClasses);
+    expect(sized.collision.segCellSide).toEqual(plan.segCellSide);
+    expect(sized.collision.binnedSlots).toEqual(plan.binnedSlots);
+    expect(sized.collision.gatherWork).toBe(plan.gatherWork);
+    // The 40-child segments' searches all cost more than their exact loops: no grid, every slot exact.
     for (let s = 0; s < sized.segStart.length; s++) {
-      const k = sized.segCount[s] ?? 0;
-      const large = Array.from(sized.segLarge.subarray(s * NESTED_LARGE_MAX, (s + 1) * NESTED_LARGE_MAX)).filter((x) => x >= 0);
-      if (k <= EXACT_MAX) {
-        expect(large).toEqual([]);
-        continue;
-      }
-      checked++;
+      expect(sized.collision.segClasses[s]).toBe(0);
       const base = sized.segStart[s] ?? 0;
-      const radii = Array.from(sized.radius.subarray(base, base + k)).sort((a, b) => b - a);
-      const r9 = sized.segR9[s] ?? 0;
-      expect(r9).toBe(radii[NESTED_LARGE_MAX]);
-      for (let i = base; i < base + k; i++) expect(large.includes(i)).toBe((sized.radius[i] ?? 0) > r9);
+      for (let i = base; i < base + (sized.segCount[s] ?? 0); i++) expect((sized.collision.slotCollide[i] ?? 0) & COLLISION_EXACT).toBe(COLLISION_EXACT);
     }
-    expect(checked).toBe(3);
-  });
-
-  it("marks a slot large exactly when the collision shader will: its float32 radius above the float32 r₉", () => {
-    // One top module of 40 sub-modules (> EXACT_MAX) of 2 leaves. Eight sub-modules weigh 1 + 1e-9 (a leaf
-    // of 1e-9 added in float64), the ninth 1: their radii differ in float64 but round to one float32, which
-    // is all the cell pass sees (r > r₉ in float32). A slot marked large there would also be binned into
-    // the grid, and its neighbours would push it twice.
-    const records: ModuleNode[] = [];
-    const flow: number[] = [];
-    for (let m = 0; m < 40; m++) {
-      for (let j = 0; j < 2; j++) {
-        records.push({ id: records.length, path: [1, m + 1, j + 1] });
-        flow.push(m < 8 ? (j === 0 ? 1 : 1e-9) : m === 8 ? (j === 0 ? 1 : 0) : 0.1);
-      }
-    }
-    const t = topo(buildModuleLODTree(records.length, records));
-    const size = Float32Array.from(flow);
-    const sized = nestedSolverTopology(t, { size });
-    const s = Array.from(sized.segCount).findIndex((k) => k === 40);
-    expect(s).toBeGreaterThanOrEqual(0);
-    const base = sized.segStart[s] ?? 0;
-    // The precondition: in float64 eight radii exceed r₉, in float32 none does.
-    const { weight } = subtreeWeights(t, size);
-    const scratch = new Scratch();
-    const g = sized.segModule[s] ?? 0;
-    setupModule(t, g, t.childOffset[g] ?? 0, t.childOffset[g + 1] ?? 0, weight, 0.45, scratch, null);
-    const rad64 = Array.from(scratch.rad.subarray(0, 40));
-    const r9 = rad64.slice().sort((a, b) => b - a)[NESTED_LARGE_MAX] ?? 0;
-    expect(rad64.filter((r) => r > r9).length).toBe(8);
-    expect(rad64.filter((r) => Math.fround(r) > Math.fround(r9)).length).toBe(0);
-    // So no slot is large: the grid bins them all (cells of 2 · r₉ · PAD cover them).
-    expect(sized.segR9[s]).toBe(Math.fround(r9));
-    expect(Array.from(sized.segLarge.subarray(s * NESTED_LARGE_MAX, (s + 1) * NESTED_LARGE_MAX))).toEqual(new Array(NESTED_LARGE_MAX).fill(-1));
-    for (let i = base; i < base + 40; i++) expect((sized.radius[i] ?? 0) > (sized.segR9[s] ?? 0)).toBe(false);
   });
 
   it("starts warm-seeded segments at WARM_ALPHA and records where the result goes", () => {
@@ -191,7 +155,8 @@ describe("nestedSolverTopology — one segmented solve over a module tree (#355)
 
   it("hands a worker its typed arrays' buffers to transfer", () => {
     const buffers = nestedSolverBuffers(solver);
-    expect(buffers).toHaveLength(14);
-    expect(new Set(buffers).size).toBe(14);
+    // 12 solve arrays and the collision plan's 10.
+    expect(buffers).toHaveLength(22);
+    expect(new Set(buffers).size).toBe(22);
   });
 });
