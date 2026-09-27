@@ -15,7 +15,14 @@ import { multilevelLayout, type CoarsenOptions } from "./coarsen.js";
 import { ForceLayout, seedPositions, type ForceParams } from "./force.js";
 import { lodTreeFromTopology, type BoundaryDiscs, type LODTree } from "./lod.js";
 import { nestedLayout, nestedBoundaryDiscs, type NestedLayoutParams, type NestedLayoutTopology } from "./nested-layout.js";
-import { lodGeometryViews, lodGeometryByteLength, type MainToWorker, type WorkerToMain } from "./worker-protocol.js";
+import {
+  lodGeometryViews,
+  lodGeometryByteLength,
+  type MainToWorker,
+  type NestedPrepReply,
+  type WorkerToMain,
+} from "./worker-protocol.js";
+import { nestedSolverTopology, type NestedSolverTopology } from "./gpu/nested-topology.js";
 
 export interface WorkerLayoutOptions {
   width: number;
@@ -330,5 +337,79 @@ export function startNestedWorkerLayout(
       terminate();
     },
     ...NOOP_DRAG,
+  };
+}
+
+/** A pending {@link prepareNestedSolve}: its result, and `cancel` (terminates the worker; the promise never settles). */
+export interface NestedPrep {
+  readonly solver: Promise<NestedSolverTopology>;
+  cancel(): void;
+}
+
+/**
+ * Build the batched GPU nested layout's solve data (#355, `nestedSolverTopology`) in a layout worker, so
+ * the main thread spends nothing on it (150 ms at 325k leaves, 450 ms at 1M, measured in Node): one
+ * `nested-prep` message, one reply with its arrays transferred, then the worker exits. Falls back to
+ * building it here, in a later task, when Workers are unavailable or the worker fails.
+ */
+export function prepareNestedSolve(tree: NestedLayoutTopology, params: NestedLayoutParams): NestedPrep {
+  let cancelled = false;
+  let worker: Worker | null = null;
+  const here = (): Promise<NestedSolverTopology> =>
+    new Promise((resolve, reject) => {
+      setTimeout(() => {
+        if (cancelled) return;
+        try {
+          resolve(nestedSolverTopology(tree, params));
+        } catch (error) {
+          reject(error);
+        }
+      }, 0);
+    });
+  const solver = new Promise<NestedSolverTopology>((resolve, reject) => {
+    if (typeof Worker === "undefined") {
+      here().then(resolve, reject);
+      return;
+    }
+    try {
+      worker = new Worker(new URL("./layout-worker.js", import.meta.url), { type: "module" });
+    } catch {
+      here().then(resolve, reject);
+      return;
+    }
+    const w = worker;
+    const done = (): void => {
+      w.onmessage = null;
+      w.onerror = null;
+      w.terminate();
+    };
+    w.onmessage = (e: MessageEvent<NestedPrepReply>): void => {
+      done();
+      if (!cancelled) resolve(e.data.solver);
+    };
+    w.onerror = (): void => {
+      done();
+      if (!cancelled) here().then(resolve, reject);
+    };
+    // Clone only the topology the prep reads — not the LOD tree's geometry/style arrays.
+    const topology: NestedLayoutTopology = {
+      size: tree.size,
+      leafCount: tree.leafCount,
+      childOffset: tree.childOffset,
+      children: tree.children,
+      parent: tree.parent,
+      superEdgeOffset: tree.superEdgeOffset,
+      superEdgeTarget: tree.superEdgeTarget,
+      superEdgeFlow: tree.superEdgeFlow,
+    };
+    const message: MainToWorker = { type: "nested-prep", topology, params };
+    w.postMessage(message);
+  });
+  return {
+    solver,
+    cancel() {
+      cancelled = true;
+      worker?.terminate();
+    },
   };
 }

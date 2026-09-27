@@ -12,6 +12,7 @@ import type { ForceParams } from "./force.js";
 import type { CoarsenOptions } from "./coarsen.js";
 import type { BoundaryDiscs, LODTopology } from "./lod.js";
 import type { NestedLayoutParams, NestedLayoutTopology } from "./nested-layout.js";
+import type { NestedSolverTopology } from "./gpu/nested-topology.js";
 
 /** Kick off a layout run. Edge buffers are copied to the worker; the main thread keeps its own. */
 export interface StartMessage {
@@ -83,7 +84,17 @@ export interface NestedStartMessage {
   stream: boolean;
 }
 
-export type MainToWorker = StartMessage | StopMessage | PinMessage | UnpinMessage | NestedStartMessage;
+/**
+ * Build the batched GPU nested layout's solve data off the main thread (#355): the worker replies with
+ * one {@link NestedPrepReply} (its buffers transferred) and is then done. O(tree size + links · log links).
+ */
+export interface NestedPrepMessage {
+  type: "nested-prep";
+  topology: NestedLayoutTopology;
+  params: NestedLayoutParams;
+}
+
+export type MainToWorker = StartMessage | StopMessage | PinMessage | UnpinMessage | NestedStartMessage | NestedPrepMessage;
 
 /**
  * The LOD tree, posted once after the worker coarsens (only when `lod` was requested). `topology`'s
@@ -115,6 +126,12 @@ export interface ProgressMessage {
 }
 
 export type WorkerToMain = LODTopologyMessage | ProgressMessage;
+
+/** The reply to a {@link NestedPrepMessage}: the GPU nested solve's data (#355). Its own channel, not a layout message. */
+export interface NestedPrepReply {
+  type: "nested-prep";
+  solver: NestedSolverTopology;
+}
 
 /**
  * The three position-derived geometry arrays packed contiguously in one buffer, `[cx, cy, extent]`

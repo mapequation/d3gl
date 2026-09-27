@@ -21,12 +21,14 @@
  */
 import { DRAG_HEAT, ForceLayout, RECOOL_TICKS, seedPositions } from "./force.js";
 import { nestedLayout, nestedBoundaryDiscs } from "./nested-layout.js";
+import { nestedSolverBuffers, nestedSolverTopology } from "./gpu/nested-topology.js";
 import { multilevelSeed, buildHierarchy } from "./coarsen.js";
 import { flattenHierarchyToTopology, lodTreeFromTopology, computeLODPositions, type LODTree } from "./lod.js";
 import {
   lodGeometryViews,
   lodGeometryByteLength,
   type MainToWorker,
+  type NestedPrepReply,
   type ProgressMessage,
   type StartMessage,
   type WorkerToMain,
@@ -265,6 +267,13 @@ addEventListener("message", (e: MessageEvent<MainToWorker>) => {
         onDepth: msg.stream ? (depth, frame) => post({ type: "frame", tick: depth, positions: frame }) : undefined,
       });
       post({ type: "done", tick: -1, positions: result.positions, boundaries: nestedBoundaryDiscs(msg.topology, result) });
+      return;
+    }
+    case "nested-prep": {
+      // The GPU nested layout's CPU prep (#355): its arrays are transferred, not copied.
+      const solver = nestedSolverTopology(msg.topology, msg.params);
+      const reply: NestedPrepReply = { type: "nested-prep", solver };
+      postMessage(reply, { transfer: nestedSolverBuffers(solver) });
       return;
     }
   }
