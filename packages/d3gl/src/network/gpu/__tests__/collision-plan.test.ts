@@ -147,24 +147,24 @@ describe("collisionPlan (#380)", () => {
   it("cuts searches into work items in slot order: every grid slot's, and exact loops above one part of pair tests", () => {
     const { plan } = oneSegment(radiiOf(zipf(20_000)));
     let item = 0;
+    const wrong: string[] = [];
     for (let i = 0; i < plan.slotCollide.length; i++) {
       const word = plan.slotCollide[i] ?? 0;
-      expect(word >>> COLLISION_ITEM_SHIFT, `slot ${i}'s items start after its predecessors'`).toBe(item);
+      if (word >>> COLLISION_ITEM_SHIFT !== item) wrong.push(`slot ${i}: items before it ${word >>> COLLISION_ITEM_SHIFT}, not ${item}`);
       const exact = (word & COLLISION_EXACT) !== 0;
-      const itemized = (word & COLLISION_ITEMIZED) !== 0;
-      if (!itemized) {
+      if ((word & COLLISION_ITEMIZED) === 0) {
         // A single-item exact loop runs in the slot's own fragment.
-        expect(exact).toBe(true);
+        if (!exact) wrong.push(`slot ${i}: a grid slot without items`);
         continue;
       }
       const parts = (plan.items[2 * item + 1] ?? 0) >>> 16;
-      if (exact) expect(parts).toBe(Math.ceil((20_000 - 1) / COLLISION_PART_PAIRS));
+      if (exact && parts !== Math.ceil((20_000 - 1) / COLLISION_PART_PAIRS)) wrong.push(`slot ${i}: ${parts} exact parts`);
       for (let p = 0; p < parts; p++) {
-        expect(plan.items[2 * item]).toBe(i);
-        expect(plan.items[2 * item + 1]).toBe((p | (parts << 16)) >>> 0);
+        if (plan.items[2 * item] !== i || plan.items[2 * item + 1] !== ((p | (parts << 16)) >>> 0)) wrong.push(`item ${item}: not slot ${i}'s part ${p} of ${parts}`);
         item++;
       }
     }
+    expect(wrong.slice(0, 5)).toEqual([]);
     expect(item).toBe(plan.itemCount);
     // The heaviest grid slots' searches span several items of at most COLLISION_PART_VISITS cells.
     let most = 0;
@@ -174,7 +174,7 @@ describe("collisionPlan (#380)", () => {
     }
     expect(most).toBeGreaterThan(1);
     expect(COLLISION_PART_VISITS).toBeGreaterThan(0);
-  });
+  }, 30_000);
 
   it("sizes each grid segment's tables to powers of two, back to back, and estimates the gather's work", () => {
     const { plan } = oneSegment(radiiOf(zipf(20_000)));

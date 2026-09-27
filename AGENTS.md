@@ -384,7 +384,7 @@ per-file timeout. Every at-scale leg below now asserts. When you add a guard, ad
 | GPU layout tick (+ #349 signatures: no draw of ≥ N vertices × instances into a 1×1 viewport, via any of the five WebGL2 draw calls; zero texture / framebuffer / buffer creation per tick); hub springs (#350): hub rows in web-NotreDame's shape, scaled with N (0.52% of rows, its five > 4096 hubs, chunk count K ≥ N/30), tick ≤ 2× a hub-free twin with the same edges, and exactly one extra draw (the chunk pass, K fragments) with no per-tick allocation; tile pyramid (#354): one scatter into the L0 atlas and one reduce per coarser level, each rasterising exactly its level's rectangle of the packed Podd / Peven textures (draws are attributed by texture identity, never by size: for N in (W² − W, W²], W a power of two, the slot atlas is W × W, the size of L0) | **WebGL** | `network/gpu/__tests__/gpu-frame-budget-perf.browser.test.ts` | 30k | `PERF_BROWSER_N` (max 200k) |
 | GPU layout tick sliced into row bands (#352): 4 bands per tick bitwise equal to the unsliced tick (hub rows included), 12 scissored force draws, no allocation per band | **WebGL** | `network/gpu/__tests__/gpu-frame-budget-perf.browser.test.ts` | 30k | `PERF_BROWSER_N` (max 200k) |
 | GPU layout **streaming** through `network().layout({ backend: "gpu" })`, LOD off **and** on (#352): transport-only main thread per frame (p95 ceiling `c0 + c1·N`), encode median ≤ 2.5 ms; every streaming `readPixels` into a bound PBO; every `getBufferSubData` after a fence inserted after its copy was seen signalled; within a frame the harvest precedes every layout draw; exactly one fence per frame; no GPU object created per streamed frame (under LOD from the cut's first repaint; an instanced lane may grow, at least doubling); repaints ≥ 48 ms apart; `settled` after the final tick's harvest; ticks/s floored against the GPU-only rate. **Node drag** on the same engine (a real pointer drag of the settled layout, LOD off **and** on): the same transport bounds and GL signatures over the held and re-cool frames, no GPU object created, `setPinned` once per pointer move and held-position writes at most once per tick, each over the held set (O(held)), ticks and repaints while held | **WebGL** | `network/gpu/__tests__/_gpu-stream-harness.ts`, run as `gpu-stream-nolod-perf.browser.test.ts` and `gpu-stream-lod-perf.browser.test.ts` (one file per reduction state, each under the tier's 300 s per-file budget) | 100k | `PERF_BROWSER_N` (max 1M) |
-| GPU **nested** layout streaming through `network().data(g, { modules }).layout({ backend: "gpu", nested })`, LOD off **and** on (#355): transport-only main thread per frame (p95 ceiling `c0 + c1·N`), encode median ≤ 2.5 ms; every streaming `readPixels` into a PBO, every harvest after its copy's fence signalled, one fence per frame, the harvest before the frame's layout draws, no GPU object created per streamed frame, no draw of ≥ N points into a 1×1 viewport, `settled` after the final stream tick's harvest; repaints ≥ 48 ms apart; stream ticks/s (LOD off) floored against the same solve's GPU-only rate. Per solve tick: no allocation (ticks and readbacks), and a collision step draws exactly one count scatter and 8 round scatters of N points | **WebGL** | `network/gpu/__tests__/gpu-nested-perf.browser.test.ts` | 20k leaves | `PERF_BROWSER_N` (max 1M) |
+| GPU **nested** layout streaming through `network().data(g, { modules }).layout({ backend: "gpu", nested })`, LOD off **and** on (#355): transport-only main thread per frame (p95 ceiling `c0 + c1·N`), encode median ≤ 2.5 ms; every streaming `readPixels` into a PBO, every harvest after its copy's fence signalled, one fence per frame, the harvest before the frame's layout draws, no GPU object created per streamed frame, no draw of ≥ N points into a 1×1 viewport, `settled` after the final stream tick's harvest; repaints ≥ 48 ms apart; stream ticks/s (LOD off) floored against the same solve's GPU-only rate. Per solve tick: no allocation (ticks and readbacks), and a collision step draws exactly one count scatter and K round scatters per hash table (8 for the class cells, 12 for the sub-cells) of the binned slots. A **module of very uneven child sizes** (#380, a Zipf module): the same transport bounds, signatures and throughput floor through the real trigger, a collision step's pair work within 3× of the collision plan's estimate with no slot on the exact fallback, and compact bands of equal estimated work | **WebGL** | `network/gpu/__tests__/gpu-nested-perf.browser.test.ts` | 20k leaves (Zipf: 20k children) | `PERF_BROWSER_N` (max 1M; Zipf max 60k) |
 | GPU streaming readback `AsyncPositionReadback` (#352), `RG/FLOAT` and packed `RGBA/FLOAT`: exact positions and stats, both PBOs `STREAM_READ`, one `readPixels` per PBO per copy (into the PBO), no allocation per readback, copy and harvest main-thread ceilings, a non-finite layout refused without touching positions | **WebGL** | `network/gpu/__tests__/gpu-async-readback-perf.browser.test.ts` | 1M | `PERF_BROWSER_N` (max 4M) |
 | GPU layout position readback through `GpuForceLayout.readPositions`, `RGBA/FLOAT` (a device that refuses `RG/FLOAT`) and `RG/FLOAT` (#351): exact positions, no GPU allocation and one `readPixels` per readback, one retained RGBA scratch | **WebGL** | `network/gpu/__tests__/gpu-readback-perf.browser.test.ts` | 1M | `PERF_BROWSER_N` (max 4M) |
 | React recolor vs build | **WebGL** | `react/perf.browser.test.ts` | 4096 | capped at 8192 — see below |
@@ -629,22 +629,12 @@ cost time while building it:
   336k-slot repulsion pass "took" 0.04 ms (it is 2.1 ms) and a compact tick 1 ms (it is 13 ms). To time
   GPU work, read one texel of the texture the measured work wrote last (everything queued before it
   completes first), or poll a fence across tasks.
-- **Heavy-tailed radii defeat a single-scale collision grid.** The cells must be ≥ 2·r₉·PAD wide for
-  completeness (r₉ the 9th-largest radius), but most discs are far smaller, so a dense pack of them puts
-  dozens in a cell: on the synthetic 325k Infomap-like map, 78% of the grid slots overflow the 8 rounds
-  and take the exact loop (81M pair tests, ~5 ms per collision step; a compact tick runs two in 13 ms). The CPU's
-  grid (cells of 2·maxR·PAD) has the same O(k²) worst case. A radius-class grid is the follow-up.
-  - **It is quadratic in the largest module, and the frame budget cannot see it.** The cell count per
-    side is about 1/(r₉·PAD) whatever k is, so occupancy grows with k·r₉². web-NotreDame's own Infomap
-    trees are fine (largest module 2,660 / 8,528 children: compact tick 9 / 22 ms, whole layout 2.2 s on an
-    M1 Max). One 60,000-child module with Zipf flows is not: 90% of its slots overflow, a gather is 55 ms
-    unbanded (3.6e9 pair tests) and compact step 1's P is 12 ms, because the count and round scatters put
-    ~400 discs on each cell's texel and blending serialises them (#349's lesson, at cell scale). The layout
-    still takes 5.5 s (the CPU: 298 s), but frames stall up to 157 ms in the compact phase.
-  - **Do not fix that with more bands.** Sizing the gather's bands from its worst case (Σ k² pair tests at
-    16 ps each) removed the stalls (worst rAF gap 16 ms) but took the 60k map from 5.5 s to 39.5 s: P
-    cannot be sliced, so it still overran its frame, and the fence controller then throttled the stream
-    to one item per frame. Occupancy is the problem; bound it (radius classes), then the budget holds.
+- **Heavy-tailed radii defeat a single-scale collision grid** (fixed in #380, next section). Cells ≥ 2·r₉·PAD
+  wide put dozens of small discs in a cell, and every slot near an overflowing cell took the exact loop:
+  O(k²) in the largest module (one 60,000-child Zipf module: a 55 ms gather, frames stalling 157 ms). Sizing
+  the gather's bands from that worst case removed the stalls but took the layout from 5.5 s to 39.5 s: the
+  unsliceable P still overran its frame and the fence controller throttled the stream. The work had to be
+  bounded, not sliced.
 - **Row-major slots put different segments in one SIMD group, and it costs.** The slot atlas is
   `⌈√slots⌉` wide, so a 2×2 quad or a SIMD group spans rows that are hundreds of slots apart: different
   segments, with different loop lengths (exact loop, tile walk, collision fallback). Measured on the real
@@ -654,6 +644,46 @@ cost time while building it:
   13-20%, and 1M cannot be tested this way. Measure a mapping change as a real blocked mapping (a define in
   the per-slot shaders, blocked uploads), not a narrower atlas: width 64 was *slower* than 322 at 100k.
   `gpu-nested-bench.browser.test.ts` (`PERF_BROWSER_N=<leaves>`, hardware-GL Chromium) times the solve.
+
+## GPU nested collision: bound the work, then the serial chain, then cost it by the work (#380)
+
+The nested layout's collision (`network/gpu/passes/collision.ts`, plan in `network/gpu/collision-plan.ts`)
+bins each disc at the scale of its own radius class: classes of halving radius, class cells of the class's
+contact distance over 2^ρ (ρ = 1), nested by integer shifts of one finest-cell coordinate, hashed per
+segment. A slot visits, per class, the cells its disc padded by the class's largest radius overlaps. What it
+took to make that fast on the real GPU (M1 Max, ANGLE Metal), in the order it was found:
+
+- **Real nested layouts end deeply overlapped — on the CPU too.** Two thirds of a 20,000-child Zipf module's
+  discs have a sibling within half the padded distance at the end (CPU 67%, GPU 73%). So a class cell as
+  wide as its discs' contact distance still holds dozens of them (up to 58 at 60,000 children), and a fixed
+  K overflows whatever the cell size. Cells denser than K are **refined**: their occupants are binned again
+  by 4×4 sub-cell into a second, smaller table (the scatter's vertex shader culls every other slot), and a
+  visitor descends into them. Only a sub-cell with more than 12 — discs piled within an eighth of their
+  contact distance — falls back to an exact loop, restricted to the work item's own cells. Size the
+  sub-table with room: at 0.25 buckets per binned slot hash collisions made a 9-occupant sub-bucket (an
+  overflow); at 0.5 the fullest held 8 over every compact tick of the real maps.
+- **A GPU gather takes as long as its slowest fragment's serial chain, not its total work.** A large disc
+  among small ones has thousands of cells to visit, or its whole segment to loop: one fragment doing it
+  held the pass for 10-30 ms (a hash, then dependent random fetches, with nothing left to hide the latency
+  once the rest of the pass was done), and 60,000-child loops lost the GL context to the GPU watchdog.
+  Short-circuiting those loops halved the gather, which is how it was found. Every grid slot's search and
+  every exact loop above 256 pair tests is **cut into work items** (32 class-cell visits or 256 pair
+  tests), gathered in parallel into partial sums; each slot's own fragment sums them, or runs its exact
+  loop when that is a single item. Weigh a cell visit in the exact-or-grid choice by its measured cost
+  (~16 coherent pair tests): at 1:1, slots just under the threshold did k random lookups.
+- **Cost the gather by its work, and cut its bands by it.** The frame budget costed the compact gather per
+  leaf: 0.06× of the truth on a 20,000-child Zipf module (the fence gate blocked ~200 frames), 1.1× on 1M.
+  The plan now estimates each slot's work (pair tests, and cell visits at 16), which fits the measured
+  gather within ±8% on every map as 4 ms + 47 ps per unit; bands are cut at equal shares of it (rows would
+  put the big module's work in the first band). The estimates handed to the budget are **half** the
+  measured times, the factor the per-leaf model had on web-NotreDame's trees, which the two-frames-in-flight
+  gate absorbs: those trees then pace as before (~1.9 s cold), every map streams without a blocked frame,
+  and at a factor of 1 they took ~2.85 s. That factor is a pacing policy, not a measurement.
+- **Measure new against old in one session, and subtract the fence wait.** Machine load moved timings by
+  ±15% between runs; the fence-poll wait (`fenceSync` + `clientWaitSync` across tasks) adds ~0.7 ms per
+  measurement, so N separately fenced bands look N × 0.7 ms slower than one. The CPU twin of the search
+  (`gpu/__tests__/collision-twin.ts`) predicts the GPU's visits and fallbacks exactly — use it (and the
+  layout's `collisionStats`) to test the fast path's own output, not only the result.
 
 ## Host sizing: backend canvases are OUT OF FLOW (#39, re-confirmed in #273)
 

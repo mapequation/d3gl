@@ -37,8 +37,8 @@ import { EXACT_MAX } from "../nested-layout.js";
 // | stream tick                 | P                                                    | F_b                    | I                  |
 // |-----------------------------|------------------------------------------------------|------------------------|--------------------|
 // | organise (first 60%)        | reductions (box) → tile pyramid; clear force         | repulsion, band b      | predict v*; springs at x + v* (zero rest); integrate |
-// | compact, collision step 1   | predict; springs (rest lengths); integrate; reductions; collision cells, counts, rounds | collision gather, band b | swap |
-// | compact, collision step 2   | reductions; collision cells, counts, rounds           | collision gather, band b | swap; next tick   |
+// | compact, collision step 1   | predict; springs (rest lengths); integrate; reductions; collision cells, both tables' counts and rounds | collision work items, then resolve, of band b | swap |
+// | compact, collision step 2   | reductions; collision cells, both tables' counts and rounds | collision work items, then resolve, of band b | swap; next tick |
 //
 // The composition (`passes/nested-compose.ts`) maps the local solutions into world discs and packs leaf
 // positions and module discs in node order, for the streaming readback ({@link prepareReadback}).
@@ -86,14 +86,15 @@ const NESTED_ORGANISE_NS: ItemCosts = { prep: 4, force: 6, integrate: 4 };
 const NESTED_COMPACT = { prepMs: 3.2, prepNsPerLeaf: 4, gatherMs: 4, gatherPsPerWork: 47, integrateNsPerLeaf: 0.2 } as const;
 
 /**
- * The share of the measured compact gather time the frame budget is told. The per-leaf model this
- * replaces told it about half on web-NotreDame's Infomap trees (4.2 ms for a 9 ms gather), and the fence
- * gate — two frames in flight — absorbed that: those layouts streamed without a blocked frame. Kept here,
- * so they pace as before (2.1-2.2 s cold on the M1 Max), and now the same factor on every map, where the
- * per-leaf model's ranged 0.06-1.1 (0.06 on a 20,000-child Zipf module: the gate blocked ~200 frames and
- * frames stalled). At 1 — the budget told the whole measured time — those trees take ~2.85 s instead.
+ * The share of the compact items' measured GPU time the frame budget is told. The per-leaf model this
+ * replaces told it about half on web-NotreDame's Infomap trees (4.2 ms for a 9 ms gather, 3.3 / 1 ms for
+ * a 5 / 3 ms P), and the fence gate — two frames in flight — absorbed that: those layouts streamed without
+ * a blocked frame. Kept here, so they pace as before (2.1-2.2 s cold on the M1 Max), and now the same
+ * factor on every map, where the per-leaf model's ranged 0.06-1.1 (0.06 on a 20,000-child Zipf module:
+ * the gate blocked ~200 frames and frames stalled). At 1 — the budget told the whole measured time —
+ * those trees take ~2.85 s instead.
  */
-const NESTED_GATHER_BUDGET_SHARE = 0.5;
+const NESTED_COMPACT_BUDGET_SHARE = 0.5;
 
 /** Work units a slot adds to its band besides its search (its resolve): a cell visit's worth. */
 const NESTED_SLOT_BASE_WORK = 16;
@@ -232,7 +233,7 @@ export class GpuNestedLayout implements StreamSolver {
   itemCostMs(kind: ItemKind, bands: number): number {
     const leaves = this.topo.leafCount;
     if (this.organising) return itemCostMs(kind, leaves, bands, NESTED_ORGANISE_NS);
-    if (kind === "prep") return NESTED_COMPACT.prepMs + (NESTED_COMPACT.prepNsPerLeaf * leaves) / 1e6;
+    if (kind === "prep") return NESTED_COMPACT_BUDGET_SHARE * (NESTED_COMPACT.prepMs + (NESTED_COMPACT.prepNsPerLeaf * leaves) / 1e6);
     if (kind === "force") return this.gatherMs / Math.max(1, bands);
     return (NESTED_COMPACT.integrateNsPerLeaf * leaves) / 1e6;
   }
@@ -394,7 +395,7 @@ export class GpuNestedLayout implements StreamSolver {
       this.packed = { framebuffer: this.compose.framebuffer, width: this.compose.width, height: this.compose.height, extraFloats: this.compose.extraFloats };
 
       // The compact gather's cost and its bands' cuts, from the collision plan's per-slot work.
-      this.gatherMs = NESTED_GATHER_BUDGET_SHARE * (NESTED_COMPACT.gatherMs + (NESTED_COMPACT.gatherPsPerWork * plan.gatherWork) / 1e9);
+      this.gatherMs = NESTED_COMPACT_BUDGET_SHARE * (NESTED_COMPACT.gatherMs + (NESTED_COMPACT.gatherPsPerWork * plan.gatherWork) / 1e9);
       const gatherNsPerLeaf = (this.gatherMs * 1e6) / Math.max(1, topo.leafCount);
       this.itemCosts = { ...NESTED_ORGANISE_NS, force: Math.max(NESTED_ORGANISE_NS.force, gatherNsPerLeaf) };
       this.rowWork = new Float64Array(height + 1);
