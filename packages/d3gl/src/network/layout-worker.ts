@@ -12,15 +12,21 @@
  * over a short tail before idling again. State the resume path needs (the graph, the {@link ForceLayout}
  * instance, the LOD tree + geometry buffer) is therefore kept in module scope between runs.
  *
+ * With LOD on, every posted frame runs the one per-frame LOD step ({@link lodFrameStep}, #343): refit the
+ * coarsening tree in place (`lodSource: "structure"`), or rebuild the spatial tree and transfer it with the
+ * frame (`"spatial"`).
+ *
  * The page's lib is `["ES2020","DOM"]` (the library targets the browser main thread too), so the
- * worker globals here are typed against `DOM`. We deliberately use single-argument `postMessage`
- * (no transferables): structured clone copies the snapshot synchronously at post time, which the
- * `DOM` `postMessage(message, options?)` overload accepts — so no worker-lib cast is needed.
+ * worker globals here are typed against `DOM`. Positions use single-argument `postMessage` (no
+ * transferables): structured clone copies the snapshot synchronously at post time, so the worker may keep
+ * writing its buffer. A spatial frame's buffer is transferred instead, through the `DOM`
+ * `postMessage(message, { transfer })` overload — so no worker-lib cast is needed either way.
  */
 import { ForceLayout, seedPositions } from "./force.js";
 import { nestedLayout, nestedBoundaryDiscs } from "./nested-layout.js";
 import { multilevelSeed, buildHierarchy } from "./coarsen.js";
-import { flattenHierarchyToTopology, lodTreeFromTopology, computeLODPositions, type LODTree } from "./lod.js";
+import { flattenHierarchyToTopology, lodTreeFromTopology } from "./lod.js";
+import { lodFrameStep, makeSpatialLODStream, makeStructureLODStream, recycleSpatialFrame, type LODStream } from "./lod-frame.js";
 import {
   lodGeometryViews,
   lodGeometryByteLength,
@@ -46,8 +52,10 @@ let coolLeft = 0;
 interface WorkerState {
   layout: ForceLayout;
   positions: Float32Array;
-  lodTree: LODTree | null;
-  /** Copy-mode geometry buffer re-posted each frame; null in shared mode (worker writes the SAB directly). */
+  /** The per-frame LOD step's state (#343): the coarsening tree to refit, or the spatial tree's stream. */
+  lod: LODStream | null;
+  /** Copy-mode geometry buffer re-posted each frame (structure only); null in shared mode (worker writes the
+   *  SAB directly) and for a spatial stream (its frames carry their own buffers). */
   geomBuffer: ArrayBufferLike | null;
   shared: boolean;
   frameEvery: number;
@@ -60,8 +68,9 @@ interface WorkerState {
 }
 let state: WorkerState | null = null;
 
-function post(message: WorkerToMain): void {
-  postMessage(message);
+function post(message: WorkerToMain, transfer?: Transferable[]): void {
+  if (transfer) postMessage(message, { transfer });
+  else postMessage(message);
 }
 
 function yieldToEventLoop(): Promise<void> {
@@ -72,11 +81,18 @@ function yieldToEventLoop(): Promise<void> {
 function postFrame(type: "frame" | "done"): void {
   const s = state;
   if (!s) return;
-  if (s.lodTree) computeLODPositions(s.lodTree, s.positions); // writes cx/cy/extent into the geometry buffer
+  // The per-frame LOD step (#343): refit the coarsening tree in place (cx/cy/extent in the geometry buffer),
+  // or rebuild the spatial tree into a frame to transfer (none when nothing moved since the last one).
+  const lodFrame = s.lod ? lodFrameStep(s.lod, s.positions, s.tick) : null;
   const message: ProgressMessage = { type, tick: s.tick };
   if (!s.shared) message.positions = s.positions;
-  if (s.lodTree && s.geomBuffer) message.geometry = new Float32Array(s.geomBuffer); // copy-mode snapshot
-  post(message);
+  if (s.lod?.kind === "structure" && s.geomBuffer) message.geometry = new Float32Array(s.geomBuffer); // copy-mode snapshot
+  if (lodFrame) {
+    message.lodFrame = lodFrame;
+    post(message, [lodFrame.buffer]);
+  } else {
+    post(message);
+  }
 }
 
 /**
@@ -110,7 +126,7 @@ async function loop(): Promise<void> {
 
 async function runLayout(msg: StartMessage): Promise<void> {
   cancelled = false;
-  const { nodeCount, source, target, weight, sharedPositions, width, height, iterations, force, coarsen, multilevel, frameEvery, lod } =
+  const { nodeCount, source, target, weight, sharedPositions, width, height, iterations, force, coarsen, multilevel, frameEvery, lod, lodSource, lodStyle, lodStyleVersion } =
     msg;
   const shared = sharedPositions !== undefined;
   const positions = shared ? new Float32Array(sharedPositions) : new Float32Array(nodeCount * 2);
@@ -122,10 +138,16 @@ async function runLayout(msg: StartMessage): Promise<void> {
   // owns the position-derived geometry (`cx`/`cy`/`extent`) — recomputed each frame, written to a SAB
   // (shared mode) or posted with the frame (copy mode); the main thread fills the style-derived
   // geometry once and runs only the O(visible) cut.
-  const hierarchy = lod ? buildHierarchy(graph, coarsen) : undefined;
-  let lodTree: LODTree | null = null;
+  const spatial = lod === true && lodSource === "spatial";
+  // The spatial tree needs no coarsening; the multilevel seed coarsens for itself when it gets none.
+  const hierarchy = lod && !spatial ? buildHierarchy(graph, coarsen) : undefined;
+  let lodStream: LODStream | null = null;
   let geomBuffer: ArrayBufferLike | null = null; // copy-mode buffer re-posted each frame
-  if (lod && hierarchy) {
+  if (spatial) {
+    // The spatial tree (#343) is rebuilt from each frame's positions and travels with the frame: nothing to
+    // post up front, and the coarsening hierarchy only seeds the layout.
+    lodStream = makeSpatialLODStream(nodeCount, lodStyle, lodStyleVersion);
+  } else if (lod && hierarchy) {
     // Pass the edges so the streamed tree carries the flow-weighted super-edge CSR too — the unified
     // super-edge path needs it on the worker (coarsening) tree just like the main-thread one.
     const topology = flattenHierarchyToTopology(hierarchy, nodeCount, { source, target, weight });
@@ -139,7 +161,7 @@ async function runLayout(msg: StartMessage): Promise<void> {
       buffer = new ArrayBuffer(byteLength);
       geomBuffer = buffer;
     }
-    lodTree = lodTreeFromTopology(topology, lodGeometryViews(buffer, topology.size));
+    lodStream = makeStructureLODStream(lodTreeFromTopology(topology, lodGeometryViews(buffer, topology.size)));
     post({ type: "lod-topology", topology, sharedGeometry });
   }
 
@@ -147,7 +169,7 @@ async function runLayout(msg: StartMessage): Promise<void> {
   if (multilevel) multilevelSeed(graph, { width, height, iterations, force, coarsen }, hierarchy);
   else seedPositions(graph, width, height);
 
-  state = { layout: new ForceLayout(graph, force), positions, lodTree, geomBuffer, shared, frameEvery, runLeft: iterations, dragging: false, tick: 0 };
+  state = { layout: new ForceLayout(graph, force), positions, lod: lodStream, geomBuffer, shared, frameEvery, runLeft: iterations, dragging: false, tick: 0 };
   postFrame("frame"); // seed frame (tick 0)
 
   // Stream the finest-level refinement via the shared loop; it idles when converged (worker stays alive).
@@ -199,6 +221,15 @@ addEventListener("message", (e: MessageEvent<MainToWorker>) => {
       return;
     case "start":
       if (!looping) void runLayout(msg);
+      return;
+    case "lod-style":
+      if (state?.lod?.kind === "spatial") {
+        state.lod.style = msg.style;
+        state.lod.styleVersion = msg.version;
+      }
+      return;
+    case "lod-recycle":
+      if (state?.lod?.kind === "spatial") recycleSpatialFrame(state.lod, msg.buffer);
       return;
     case "start-nested": {
       // One synchronous top-down pass (each depth final); a `stop` can only land after it, and the main

@@ -11,6 +11,7 @@
 import type { ForceParams } from "./force.js";
 import type { CoarsenOptions } from "./coarsen.js";
 import type { BoundaryDiscs, LODTopology } from "./lod.js";
+import type { LeafStyle, SpatialLODFrame } from "./lod-frame.js";
 import type { NestedLayoutParams, NestedLayoutTopology } from "./nested-layout.js";
 
 /** Kick off a layout run. Edge buffers are copied to the worker; the main thread keeps its own. */
@@ -38,6 +39,29 @@ export interface StartMessage {
    * the LOD frontier with no O(N) coarsening or geometry pass of its own.
    */
   lod?: boolean;
+  /**
+   * Which tree the worker streams with `lod` (#343): `"structure"` (default) posts the coarsening tree's
+   * topology once and refits its geometry each frame; `"spatial"` rebuilds a Morton tree every streamed frame
+   * and transfers it whole with the frame ({@link ProgressMessage.lodFrame}). The worker still coarsens for
+   * the multilevel seed either way.
+   */
+  lodSource?: "structure" | "spatial";
+  /** The leaf style a spatial tree aggregates onto every rebuild (#343), and its version (echoed per frame). */
+  lodStyle?: LeafStyle;
+  lodStyleVersion?: number;
+}
+
+/** A new leaf style for the spatial tree's per-frame aggregation (#343), after `style()` changed it. */
+export interface LODStyleMessage {
+  type: "lod-style";
+  style: LeafStyle;
+  version: number;
+}
+
+/** A spatial frame's buffer handed back for reuse once its tree is no longer drawn (#343; transferred). */
+export interface LODRecycleMessage {
+  type: "lod-recycle";
+  buffer: ArrayBuffer;
 }
 
 export interface StopMessage {
@@ -80,7 +104,7 @@ export interface NestedStartMessage {
   stream: boolean;
 }
 
-export type MainToWorker = StartMessage | StopMessage | PinMessage | UnpinMessage | NestedStartMessage;
+export type MainToWorker = StartMessage | StopMessage | PinMessage | UnpinMessage | NestedStartMessage | LODStyleMessage | LODRecycleMessage;
 
 /**
  * The LOD tree, posted once after the worker coarsens (only when `lod` was requested). `topology`'s
@@ -108,6 +132,11 @@ export interface ProgressMessage {
   geometry?: Float32Array;
   /** A nested layout's `done` (#329): its module boundary discs, for `lod({ moduleBoundary })`. */
   boundaries?: BoundaryDiscs;
+  /**
+   * The spatial LOD tree rebuilt for this frame's positions (#343, `lodSource: "spatial"`), its buffer
+   * transferred. Absent when the positions did not move since the last one (the layout converged).
+   */
+  lodFrame?: SpatialLODFrame;
 }
 
 export type WorkerToMain = LODTopologyMessage | ProgressMessage;

@@ -1081,10 +1081,11 @@ export function buildMortonTopology(
 /**
  * A spatial LOD tree over `positions`, ready for geometry (#343) — {@link buildMortonTopology} with the
  * tree's geometry arrays attached (zeroed; fill them with {@link computeLODGeometry}). The spatial source
- * (`lod({ source: "spatial" })`) on the main thread, and the tree of an edge-less graph.
+ * (`lod({ source: "spatial" })`) on the main thread, and the tree of an edge-less graph. Pass a `scratch`
+ * ({@link makeMortonScratch}) to reuse the sort buffers across rebuilds.
  */
-export function buildMortonLODTree(positions: ArrayLike<number>, count: number, opts: MortonLODOptions = {}): LODTree {
-  return attachGeometry(buildMortonTopology(positions, count, opts));
+export function buildMortonLODTree(positions: ArrayLike<number>, count: number, opts: MortonLODOptions = {}, scratch?: MortonScratch): LODTree {
+  return attachGeometry(buildMortonTopology(positions, count, opts, scratch));
 }
 
 /**
@@ -1169,23 +1170,27 @@ export function findMortonCell(tree: LODTopology, box: MortonBox, level: number,
  * the converging geometry with no copy. Style-derived geometry (`radius`/`weight`) is main-allocated
  * and filled once with {@link computeLODStyle}; the topological `count` is filled here (it's
  * position-independent — the worker streams cx/cy/extent but not count, #105).
+ *
+ * A spatial tree streamed per frame (#343) arrives with everything computed: pass its `count`, style arrays
+ * and leaf branching as `computed`, and the assembly is O(1) — views only, no pass over the tree.
  */
 export function lodTreeFromTopology(
   topo: LODTopology,
   geometry?: { cx: Float32Array; cy: Float32Array; extent: Float32Array },
+  computed?: { count: Uint32Array; radius: Float32Array; weight: Float32Array; border: Float32Array; color: Uint8Array; leafBranching?: number },
 ): LODTree {
   const { size } = topo;
   return {
     ...topo,
-    leafBranching: leafBranchingOf(topo),
+    leafBranching: computed?.leafBranching ?? leafBranchingOf(topo),
     cx: geometry?.cx ?? new Float32Array(size),
     cy: geometry?.cy ?? new Float32Array(size),
     extent: geometry?.extent ?? new Float32Array(size),
-    radius: new Float32Array(size),
-    count: leafDescendantCounts(topo),
-    weight: new Float32Array(size),
-    border: new Float32Array(size),
-    color: new Uint8Array(size * 4),
+    radius: computed?.radius ?? new Float32Array(size),
+    count: computed?.count ?? leafDescendantCounts(topo),
+    weight: computed?.weight ?? new Float32Array(size),
+    border: computed?.border ?? new Float32Array(size),
+    color: computed?.color ?? new Uint8Array(size * 4),
   };
 }
 
