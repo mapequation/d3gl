@@ -20,7 +20,7 @@ import { startGpuLayout } from "../gpu-transport.js";
 import { GpuForceLayout } from "../gpu-force-layout.js";
 import { GpuStream, observeGpuLayoutFrames, type GpuFrameSample } from "../gpu-stream.js";
 import { buildGraph, type NetworkGraph } from "../../graph.js";
-import { DEFAULT_FORCE, seedPositions } from "../../force.js";
+import { DEFAULT_FORCE, MIN_SETTLE_TICKS, seedPositions } from "../../force.js";
 import { buildHierarchy } from "../../coarsen.js";
 import { coarseSeedPlan, type SeedPlan } from "../seed-plan.js";
 
@@ -57,11 +57,15 @@ describe("GPU streaming run (#352)", () => {
     const unobserve = observeGpuLayoutFrames((s) => samples.push({ ...s }));
     let frames = 0;
     let framesAtSettle = -1;
-    // A cold start (no multilevel seed, #353): at full heat it runs its whole budget, never stopping early (#376).
-    const handle = startGpuLayout(device, g, { width: 400, height: 300, iterations: 40, multilevel: false }, () => { frames++; });
+    // A cold start (no multilevel seed, #353) with a budget below MIN_SETTLE_TICKS, so the run cannot stop
+    // early (#376) and its final tick is the budget's: this ring stops at tick 33 at full heat, and whether a
+    // copy between that stop and a longer budget's end is harvested depends on frame timing.
+    const iterations = 25;
+    expect(iterations).toBeLessThan(MIN_SETTLE_TICKS);
+    const handle = startGpuLayout(device, g, { width: 400, height: 300, iterations, multilevel: false }, () => { frames++; });
     await handle.settled.then(() => { framesAtSettle = frames; });
     unobserve();
-    const final = samples.findIndex((s) => s.harvestedTicks === 40);
+    const final = samples.findIndex((s) => s.harvestedTicks === iterations);
     expect(final).toBeGreaterThanOrEqual(0);
     expect(samples[final]?.repaintMs).toBeGreaterThanOrEqual(0);
     // The final harvest was painted before settle resolved.
