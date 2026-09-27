@@ -535,9 +535,16 @@ describe("FrameBudget band growth: how far every pass's estimate is scaled when 
     expect(frames).toBeGreaterThanOrEqual(30);
   });
 
-  it("does not grow when the late band's pass is bound by its fixed cost: more bands would only repeat it", () => {
-    // The nested gather at 1M: 4 bands already carry about as much tail as work each.
+  it("neither grows nor cuts k when the late frame is one band that cannot be cut finer: no lever shortens it", () => {
+    // The nested gather at 1M: 4 bands already carry about as much tail as work each, so more growth would
+    // only repeat the tail — and fewer items per frame would only slow every other pass.
     const r = rig();
+    for (let f = 0; f < 12; f++) {
+      frame(r, { sliceable: false });
+      r.fences.catchUp();
+    }
+    const k = r.budget.k;
+    expect(k).toBeGreaterThan(4);
     const gather: StageCost = { costMs: 9, fixedMs: 2.09, rows: 1_000 };
     const gatherFrame = (): void => {
       r.now += 1000 / 60;
@@ -552,7 +559,7 @@ describe("FrameBudget band growth: how far every pass's estimate is scaled when 
       gatherFrame();
       r.fences.catchUp();
     }
-    expect(r.budget.k).toBe(1);
+    expect(r.budget.k).toBe(k);
     expect(r.budget.growth).toBe(1);
   });
 
@@ -724,5 +731,17 @@ describe("FrameBudget band growth on a stream of passes of very different sizes,
     // only pay the tail again: at growth 8 its 25 bands would cost 3.3× its 4.
     const run = lagging({ costMs: 9, fixedMs: 2.09, factor: 5 }, 6_000);
     expect(run.maxGrowth).toBe(1);
+  });
+
+  it("keeps the other passes' frames when one band that cannot be cut finer runs long", () => {
+    // The gather of one 60,000-child module: 0.6 ms of work and ~18 ms of tail per band (one band a tick),
+    // running at ~3.2× that (~60 ms, as measured). Its every frame is late, and nothing shortens it; cutting
+    // k to one item per frame after each such miss left the 16 small passes one per frame — ~18 frames a
+    // tick where the gather alone needs ~7.
+    const frames = 6_000;
+    const run = lagging({ costMs: 0.6, fixedMs: 18.1, factor: 3.2 }, frames);
+    const floor = (3.2 * 18.7) / (1000 / 120);
+    expect(run.maxGrowth).toBe(1);
+    expect(frames / run.ticks, `${run.ticks} ticks in ${frames} frames`).toBeLessThan(floor + 3);
   });
 });

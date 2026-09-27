@@ -15,11 +15,13 @@
 //   *budget fence*. A frame encodes only if the fence of frame f−n has signalled; otherwise the GPU is
 //   behind, so it encodes nothing, halves `k` (to half of what the late frame — the oldest in flight —
 //   encoded) and holds it for 30 frames. Only that frame's lateness counts: the GPU runs work in order,
-//   so nothing queued after its fence can have delayed it. A miss is not the layout's own, and only
-//   blocks without resizing `k` or the bands, when the late frame encoded no item, or when an engine repaint
-//   ran on the GPU ahead of its items — in the late frame itself, or in a frame that completed within
-//   the last n frames before it. Repaint draws are not layout work, and the repaint throttle already
-//   bounds them.
+//   so nothing queued after its fence can have delayed it. A miss changes nothing, and only blocks, when
+//   no lever can shorten the late frame — it encoded no item, or one item that cannot be cut finer (a pass
+//   bound by its fixed cost, like the nested gather of a huge module: fewer items per frame cannot shorten
+//   it, and would only slow every other pass; #382) — or when it is not the layout's own: an engine repaint
+//   ran on the GPU ahead of its items, in the late frame itself or in a frame that completed within the
+//   last n frames before it. Repaint draws are not layout work, and the repaint throttle already bounds
+//   them.
 // - **`k` counts items**, not ticks, so a tick may span frames. It grows by one per frame while it is
 //   the binding limit and no hold is active.
 // - **Budget.** `min(budgetMs, 0.6 × median rAF interval)`: 10 ms at 60 Hz, 5 ms at 120 Hz. The items
@@ -334,19 +336,21 @@ export class FrameBudget<F> {
 
   /**
    * The gate: whether this frame may encode items (the fence of frame f−n has signalled, n from
-   * {@link framesInFlight}). A blocked frame starting a miss that is the layout's own
-   * ({@link layoutMiss}) halves `k` to half of what the late frame encoded — and doubles the band growth
-   * when `k` was already 1 and the late frame held a band that more growth would cut finer — then holds
-   * `k`; any other miss only blocks.
+   * {@link framesInFlight}). A blocked frame starting a miss that is the layout's own ({@link layoutMiss})
+   * halves `k` to half of what the late frame encoded — and doubles the band growth when `k` was already 1
+   * and the late frame held a band that more growth would cut finer — then holds `k`. A late frame of one
+   * item that cannot be cut finer, and any other miss, only block: no lever shortens such an item, and
+   * fewer items per frame would only slow every other pass (#382).
    */
   open(): boolean {
     const blocked = this.queue.length >= this.maxInFlight;
     if (blocked) {
-      if (!this.blockedPrev && this.layoutMiss()) {
+      const late = this.queueItems[0] ?? 0;
+      if (!this.blockedPrev && this.layoutMiss() && (late >= 2 || this.queueFiner[0] === true)) {
         if (this.items === 1 && this.queueFiner[0] === true) {
           this.bandGrowth = Math.min(MAX_BAND_GROWTH, this.bandGrowth * 2);
         }
-        this.items = Math.max(1, Math.floor((this.queueItems[0] ?? 0) / 2));
+        this.items = Math.max(1, Math.floor(late / 2));
         this.hold = HOLD_FRAMES;
         this.fitStreak = 0;
       } else if (this.hold > 0) {
