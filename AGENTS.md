@@ -384,6 +384,7 @@ per-file timeout. Every at-scale leg below now asserts. When you add a guard, ad
 | GPU layout tick (+ #349 signatures: no draw of ≥ N vertices × instances into a 1×1 viewport, via any of the five WebGL2 draw calls; zero texture / framebuffer / buffer creation per tick); hub springs (#350): hub rows in web-NotreDame's shape, scaled with N (0.52% of rows, its five > 4096 hubs, chunk count K ≥ N/30), tick ≤ 2× a hub-free twin with the same edges, and exactly one extra draw (the chunk pass, K fragments) with no per-tick allocation; tile pyramid (#354): one scatter into the L0 atlas and one reduce per coarser level, each rasterising exactly its level's rectangle of the packed Podd / Peven textures (draws are attributed by texture identity, never by size: for N in (W² − W, W²], W a power of two, the slot atlas is W × W, the size of L0) | **WebGL** | `network/gpu/__tests__/gpu-frame-budget-perf.browser.test.ts` | 30k | `PERF_BROWSER_N` (max 200k) |
 | GPU layout tick sliced into row bands (#352): 4 bands per tick bitwise equal to the unsliced tick (hub rows included), 12 scissored force draws, no allocation per band | **WebGL** | `network/gpu/__tests__/gpu-frame-budget-perf.browser.test.ts` | 30k | `PERF_BROWSER_N` (max 200k) |
 | GPU layout **streaming** through `network().layout({ backend: "gpu" })`, LOD off **and** on (#352): transport-only main thread per frame (p95 ceiling `c0 + c1·N`), encode median ≤ 2.5 ms; every streaming `readPixels` into a bound PBO; every `getBufferSubData` after a fence inserted after its copy was seen signalled; within a frame the harvest precedes every layout draw; exactly one fence per frame; no GPU object created per streamed frame; repaints ≥ 48 ms apart; `settled` after the final tick's harvest; ticks/s floored against the GPU-only rate. **Node drag** on the same engine (a real pointer drag of the settled layout, LOD off **and** on): the same transport bounds and GL signatures over the held and re-cool frames, no GPU object created, `setPinned` once per pointer move and held-position writes at most once per tick, each over the held set (O(held)), ticks and repaints while held | **WebGL** | `network/gpu/__tests__/gpu-stream-perf.browser.test.ts` | 100k | `PERF_BROWSER_N` (max 1M) |
+| GPU **nested** layout streaming through `network().data(g, { modules }).layout({ backend: "gpu", nested })`, LOD off **and** on (#355): transport-only main thread per frame (p95 ceiling `c0 + c1·N`), encode median ≤ 2.5 ms; every streaming `readPixels` into a PBO, every harvest after its copy's fence signalled, one fence per frame, the harvest before the frame's layout draws, no GPU object created per streamed frame, no draw of ≥ N points into a 1×1 viewport, `settled` after the final stream tick's harvest. Per solve tick: no allocation (ticks and readbacks), and a collision step draws exactly one count scatter and 8 round scatters of N points | **WebGL** | `network/gpu/__tests__/gpu-nested-perf.browser.test.ts` | 20k leaves | `PERF_BROWSER_N` (max 1M) |
 | GPU streaming readback `AsyncPositionReadback` (#352), `RG/FLOAT` and packed `RGBA/FLOAT`: exact positions and stats, both PBOs `STREAM_READ`, one `readPixels` per PBO per copy (into the PBO), no allocation per readback, copy and harvest main-thread ceilings, a non-finite layout refused without touching positions | **WebGL** | `network/gpu/__tests__/gpu-async-readback-perf.browser.test.ts` | 1M | `PERF_BROWSER_N` (max 4M) |
 | GPU layout position readback through `GpuForceLayout.readPositions`, `RGBA/FLOAT` (a device that refuses `RG/FLOAT`) and `RG/FLOAT` (#351): exact positions, no GPU allocation and one `readPixels` per readback, one retained RGBA scratch | **WebGL** | `network/gpu/__tests__/gpu-readback-perf.browser.test.ts` | 1M | `PERF_BROWSER_N` (max 4M) |
 | React recolor vs build | **WebGL** | `react/perf.browser.test.ts` | 4096 | capped at 8192 — see below |
@@ -578,6 +579,30 @@ previous build — while every SwiftShader test stayed green, because SwiftShade
   channels bitwise) and of per-node forces from identical positions against the previous build. The #354
   change is bitwise equal on web-NotreDame and on a 1M-node graph at every checked tick; the SwiftShader
   tests (`flat-equivalence`, `segment-isolation`) cannot see this class of drift.
+
+## GPU nested layout: dead passes hide behind complete fallbacks; fence what you time (#355)
+
+The nested layout solves every module at once on the GPU (`network/gpu/gpu-nested-layout.ts`). Three things
+cost time while building it:
+
+- **A texture bound to any active sampler of a program while it is that draw's render target is a feedback
+  loop, and WebGL drops the draw** — even when the shader's branch never reads that sampler at run time
+  (it is active because some branch uses it). The nested reduction's mode 1 rendered into the segment
+  table's `stats` while `u_segSum` (read only by mode 2) was bound to the same texture: every range query
+  silently wrote nothing. Bind a stand-in for the unused sampler. Worse, the tests still passed: with a zero
+  box every collision cell overflowed, and the grid's overflow fallback — the exact loop — gave the right
+  answer, only slowly. **A complete fallback can mask a dead fast path**: test the fast path's own output
+  (the composition test caught this one), not only the end result.
+- **`gl.finish()` does not wait for the GPU on ANGLE Metal**, and neither does a `readPixels` from a
+  framebuffer the measured passes did not write (it waits only for that resource). Timed that way, a
+  336k-slot repulsion pass "took" 0.04 ms (it is 2.1 ms) and a compact tick 1 ms (it is 13 ms). To time
+  GPU work, read one texel of the texture the measured work wrote last (everything queued before it
+  completes first), or poll a fence across tasks.
+- **Heavy-tailed radii defeat a single-scale collision grid.** The cells must be ≥ 2·r₉·PAD wide for
+  completeness (r₉ the 9th-largest radius), but most discs are far smaller, so a dense pack of them puts
+  dozens in a cell: on the synthetic 325k Infomap-like map, 78% of the grid slots overflow the 8 rounds
+  and take the exact loop (81M pair tests, ~5 ms per collision step; a compact tick runs two in 13 ms). The CPU's
+  grid (cells of 2·maxR·PAD) has the same O(k²) worst case. A radius-class grid is the follow-up.
 
 ## Host sizing: backend canvases are OUT OF FLOW (#39, re-confirmed in #273)
 
