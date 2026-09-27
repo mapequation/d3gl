@@ -275,3 +275,132 @@ describe("engine-owned module hierarchy — data(graph, { modules }) (#326)", ()
     net.destroy();
   });
 });
+
+// #428: the module tree a nested layout on a streaming backend needs is built on a worker — the main thread
+// flattens the records and posts them, and never runs the build itself. `builds` counts main-thread builds
+// only: the worker imports ./module-topology.js, which this file does not mock (a vi.mock also replaces
+// the module inside a worker the test spawns, and breaks it).
+describe("the module tree is built off the main thread (#428)", () => {
+  const frame = () => new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+
+  it("a nested layout on the worker gets its tree from a worker, and so does the cut", async () => {
+    const net = network(host(), { width: 200, height: 200 });
+    await net.whenReady();
+    const g = graph();
+    const expected = expectedNested(g, MODULES); // (a main-thread build of the test's own)
+    builds.count = 0;
+    net.data(g, { modules: MODULES }).lod({ expandPx: 60, declutter: false }).layout({ backend: "worker", nested: true });
+    expect(net.lodSource).toBe("none"); // the tree is on its way
+    expect(net.pick(100, 100)).toBeNull(); // and a synchronous read does not build it here: no cut yet
+    await Promise.resolve();
+    expect(net.lodSource).toBe("none"); // lod()'s deferred build stood down for the worker's
+    await net.whenSettled();
+    await frame(); // the tree's landing repaint
+    expect(builds.count, "the main thread built the module tree").toBe(0);
+    expect(net.lodSource).toBe("modules");
+    expect(Array.from(g.positions)).toEqual(expected);
+    // The worker's tree is the module tree: laid out by hand, the cut draws — and picks — its modules.
+    net.layout({ backend: "positions", positions: POSITIONS });
+    expect(net.pick(30, 30)).toMatchObject({ datum: { aggregate: true, count: 4 } });
+    expect(pathOf(net.pick(30, 30))).toEqual([1]);
+    expect(pathOf(net.pick(150, 150))).toEqual([2]);
+    expect(builds.count, "the worker's tree was not reused").toBe(0);
+    net.destroy();
+  });
+
+  it("with LOD off, the nested layout still solves on the worker's tree", async () => {
+    const net = network(host(), { width: 200, height: 200 });
+    await net.whenReady();
+    const g = graph();
+    const expected = expectedNested(g, MODULES);
+    builds.count = 0;
+    net.data(g, { modules: MODULES }).layout({ backend: "worker", nested: true });
+    await net.whenSettled();
+    expect(builds.count).toBe(0);
+    expect(Array.from(g.positions)).toEqual(expected);
+    net.destroy();
+  });
+
+  it("a warm re-layout with a transition, on a new hierarchy, waits for its tree too", async () => {
+    const net = network(host(), { width: 200, height: 200 });
+    await net.whenReady();
+    const g = graph();
+    net.data(g, { modules: MODULES }).layout({ backend: "positions", positions: POSITIONS });
+    // A re-clustering: the same nodes and buffers as a new graph object, with a new partition.
+    const g2: NetworkGraph = { ...g };
+    net.data(g2, { modules: PAIRS }).lod({ declutter: false }).layout({ backend: "worker", nested: { warm: true }, transition: 50 });
+    await net.whenSettled();
+    await frame();
+    expect(builds.count).toBe(0);
+    expect(net.lodSource).toBe("modules");
+    expect(Array.from(g2.positions).every(Number.isFinite)).toBe(true);
+    net.destroy();
+  });
+
+  it("drops a tree still in flight when data() swaps the graph, and builds the new one", async () => {
+    const net = network(host(), { width: 200, height: 200 });
+    await net.whenReady();
+    const g = graph();
+    const g2 = graph();
+    const expected = expectedNested(g2, PAIRS);
+    builds.count = 0;
+    net.data(g, { modules: MODULES }).lod({}).layout({ backend: "worker", nested: true });
+    net.data(g2, { modules: PAIRS }).lod({}).layout({ backend: "worker", nested: true });
+    await net.whenSettled();
+    await frame();
+    expect(builds.count).toBe(0);
+    expect(net.lodSource).toBe("modules");
+    expect(Array.from(g2.positions)).toEqual(expected);
+    net.destroy();
+  });
+
+  it("without a layout, lod() builds the tree on the main thread before the next frame", async () => {
+    const net = network(host(), { width: 200, height: 200 });
+    await net.whenReady();
+    net.data(graph(), { modules: MODULES }).lod({});
+    expect(net.lodSource).toBe("none"); // deferred to the end of the call chain
+    await Promise.resolve();
+    expect(net.lodSource).toBe("modules");
+    expect(builds.count).toBe(1);
+    net.destroy();
+  });
+
+  it("checks an explicit lod({ modules }) when it is set, though its build waits", async () => {
+    const net = network(host(), { width: 200, height: 200 });
+    await net.whenReady();
+    net.data(graph(), { modules: MODULES });
+    expect(() => net.lod({ modules: MODULES.slice(1) })).toThrow(/no record for node id 0/);
+    expect(() => net.lod({ modules: MODULES, moduleLinks: [{ source: [99], target: [1], flow: 1 }] })).toThrow(/endpoint 99/);
+    net.destroy();
+  });
+
+  it("an engine destroyed while its tree is on the way builds nothing", async () => {
+    const net = network(host(), { width: 200, height: 200 });
+    await net.whenReady();
+    net.data(graph(), { modules: MODULES }).lod({}).layout({ backend: "worker", nested: true });
+    net.destroy();
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    expect(builds.count).toBe(0);
+    expect(net.lodSource).toBe("none");
+  });
+
+  it("without Web Workers, the tree is built on the main thread after all", async () => {
+    vi.stubGlobal("Worker", undefined);
+    try {
+      const net = network(host(), { width: 200, height: 200 });
+      await net.whenReady();
+      const g = graph();
+      const expected = expectedNested(g, MODULES);
+      builds.count = 0;
+      net.data(g, { modules: MODULES }).lod({}).layout({ backend: "worker", nested: true });
+      await net.whenSettled();
+      await frame();
+      expect(builds.count).toBe(1);
+      expect(net.lodSource).toBe("modules");
+      expect(Array.from(g.positions)).toEqual(expected);
+      net.destroy();
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+});

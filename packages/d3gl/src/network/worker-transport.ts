@@ -14,12 +14,14 @@ import type { NetworkGraph } from "./graph.js";
 import type { Device } from "@luma.gl/core";
 import { multilevelLayout, type CoarsenOptions } from "./coarsen.js";
 import { ForceLayout, seedPositions, type ForceParams } from "./force.js";
-import { lodTreeFromTopology, type BoundaryDiscs, type LODTree } from "./lod.js";
+import { lodTreeFromTopology, type BoundaryDiscs, type LODTopology, type LODTree } from "./lod.js";
 import type { FitBox } from "./fit.js";
+import type { FlatModuleLinks, FlatModuleRecords } from "./module-topology.js";
 import { nestedLayout, nestedBoundaryDiscs, nestedRootBounds, type NestedLayoutParams, type NestedLayoutTopology } from "./nested-layout.js";
 import {
   lodGeometryViews,
   lodGeometryByteLength,
+  transferList,
   type MainToWorker,
   type NestedPrepReply,
   type WorkerToMain,
@@ -130,6 +132,105 @@ export interface WorkerLayoutHandle {
 
 /** Handle for the synchronous fallback (no live worker) — reheat is a no-op there. */
 const NOOP_DRAG = { pin() {}, unpin() {} };
+
+/**
+ * A handle for a layout that can start only once `ready` resolves (#428) — a nested layout waiting for
+ * its module tree to be built off the main thread. `start` runs then, unless the handle was stopped
+ * first; `settled` resolves when the started run settles, at once if `start` declines (returns null),
+ * or on {@link WorkerLayoutHandle.stop}. Pins reach the run once it is live.
+ */
+export function deferredLayoutHandle<T>(ready: Promise<T>, start: (value: T) => WorkerLayoutHandle | null): WorkerLayoutHandle {
+  let run: WorkerLayoutHandle | null = null;
+  let stopped = false;
+  let resolveSettled: () => void = () => {};
+  const settled = new Promise<void>((resolve) => {
+    resolveSettled = resolve;
+  });
+  void ready.then((value) => {
+    if (stopped) return;
+    run = start(value);
+    if (run) void run.settled.then(resolveSettled);
+    else resolveSettled();
+  });
+  return {
+    shared: false,
+    settled,
+    stop() {
+      stopped = true;
+      run?.stop();
+      resolveSettled();
+    },
+    pin(ids, positions) {
+      run?.pin(ids, positions);
+    },
+    unpin() {
+      run?.unpin();
+    },
+    setLODStyle(style, version) {
+      run?.setLODStyle?.(style, version);
+    },
+    setLODView(view) {
+      run?.setLODView?.(view);
+    },
+    moveDevice(next) {
+      run?.moveDevice?.(next);
+    },
+  };
+}
+
+/** A module tree being built on a worker ({@link buildModuleTopologyOffThread}). */
+export interface ModuleTopologyJob {
+  /** The built topology — or null when no worker could build it (none available, or it failed), so the
+   *  caller builds it itself. Never settles once {@link cancel}led. */
+  topology: Promise<LODTopology | null>;
+  /** Stop the build and tear its worker down. */
+  cancel(): void;
+}
+
+/**
+ * Build a module hierarchy's {@link LODTopology} on a Web Worker (#428), off the main thread — what
+ * `buildModuleTopology(nodeCount, records, edges, links)` computes. `records` and `links` are
+ * **transferred** (the caller flattened them for this and must not use them afterwards); the edge buffers
+ * are copied, so the graph keeps its own. The main thread's share is that copy and the post; the tree's
+ * buffers come back transferred, so receiving it costs no copy either.
+ */
+export function buildModuleTopologyOffThread(
+  nodeCount: number,
+  records: FlatModuleRecords,
+  edges: { source: Uint32Array; target: Uint32Array; weight: Float32Array },
+  links?: FlatModuleLinks,
+): ModuleTopologyJob {
+  const none: ModuleTopologyJob = { topology: Promise.resolve(null), cancel() {} };
+  if (typeof Worker === "undefined") return none;
+  let worker: Worker;
+  try {
+    worker = new Worker(new URL("./layout-worker.js", import.meta.url), { type: "module" });
+  } catch {
+    return none;
+  }
+  let resolveTopology: (topology: LODTopology | null) => void = () => {};
+  const topology = new Promise<LODTopology | null>((resolve) => {
+    resolveTopology = resolve;
+  });
+  const cancel = (): void => {
+    worker.terminate();
+    worker.onmessage = null;
+    worker.onerror = null;
+  };
+  worker.onmessage = (e: MessageEvent<WorkerToMain>): void => {
+    const msg = e.data;
+    if (msg.type !== "module-tree") return;
+    cancel();
+    resolveTopology(msg.topology);
+  };
+  worker.onerror = (): void => {
+    cancel();
+    resolveTopology(null);
+  };
+  const message: MainToWorker = { type: "build-module-tree", nodeCount, records, links, source: edges.source, target: edges.target, weight: edges.weight };
+  worker.postMessage(message, transferList([records.id, records.offset, records.entries, links?.sourceOffset, links?.source, links?.targetOffset, links?.target, links?.flow]));
+  return { topology, cancel };
+}
 
 /**
  * Whether this environment can use the `SharedArrayBuffer` zero-copy position transport: `SharedArrayBuffer`
@@ -248,7 +349,7 @@ export function startWorkerLayout(
       onLODTree?.(lodTreeFromTopology(topology, lodGeometryViews(buffer, topology.size)));
       return;
     }
-    if (msg.type === "lod-geometry" || msg.type === "seed-plan") return; // only the GPU layout's coarsening worker sends these (#377, #353)
+    if (msg.type === "lod-geometry" || msg.type === "seed-plan" || msg.type === "module-tree") return; // only the GPU layout's coarsening worker (#377, #353) or a module-tree build (#428) sends these
     // frame | done
     if (msg.positions && !shared) graph.positions.set(msg.positions);
     if (msg.geometry && lodGeomFlat) lodGeomFlat.set(msg.geometry); // copy-mode geometry snapshot
@@ -413,7 +514,7 @@ export function startNestedWorkerLayout(
   };
   worker.onmessage = (e: MessageEvent<WorkerToMain>): void => {
     const msg = e.data;
-    if (msg.type === "lod-topology" || msg.type === "lod-geometry" || msg.type === "seed-plan" || terminated) return;
+    if (msg.type === "lod-topology" || msg.type === "lod-geometry" || msg.type === "seed-plan" || msg.type === "module-tree" || terminated) return;
     if (msg.type === "done") {
       if (msg.positions) land(msg.positions, msg.boundaries);
       terminate();

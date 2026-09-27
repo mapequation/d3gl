@@ -280,10 +280,11 @@ coarsens the graph and then refits the tree's geometry to each frame the GPU rea
 [spatial source](#spatial-lod-grouping-by-position), rebuilds the spatial tree for each one), and
 `net.lodSource` reports `"worker"` for both.
 
-This holds on a brand-new engine too. Before any layout has run, `lod()` can't know which backend comes
-next, so it leaves its own main-thread build to the end of the current call chain: the worker or GPU
-layout that follows wins (the GPU layout's LOD worker streams the tree, #377), and any other path (no
-layout, `positions`, `force`) still has its tree before the next frame. On those paths a call that needs the tree right away — `pick()`, `select()`,
+This holds for new data too. Until a layout has run on the graph `data()` set, `lod()` can't know which
+backend comes next, so it leaves its own main-thread build to the end of the current call chain: the
+worker or GPU layout that follows wins (the GPU layout's LOD worker streams the tree, #377), and any other
+path (no layout, `positions`, `force`) still has its tree before the next frame. On those paths a call
+that needs the tree right away — `pick()`, `select()`,
 `highlight()`, `toSVG()` — builds it at once. Until the worker's tree arrives nothing is drawn, so
 nothing is labelled.
 
@@ -388,6 +389,14 @@ The engine owns the hierarchy, not the LOD options, so every module feature read
 - the **module-aware GPU seed** (`layout({ backend: "gpu" })`) seeds over the modules;
 - every **pick** reports the target's Infomap `path` (`hit.datum.path`): a module's path for an
   aggregate, the node's own path for a leaf, LOD on or off.
+
+The module tree is built once per hierarchy, when something first needs it — and off the main thread
+when that can wait. A `layout({ nested: true })` on the `worker` or `gpu` backend has a worker build the
+tree (the main thread only packs the records into typed arrays and hands them over) and starts solving
+when it arrives, and a cut that draws the modules draws them from that same tree as soon as it lands —
+nothing is drawn until then, as while a worker streams a structural tree. Everywhere else (`lod()` with
+no such layout, the `force` and `positions` backends, the GPU seed) the tree is built on the main thread
+before the next frame.
 
 A new `data(graph)` without a hierarchy clears it. Module-level links (an Infomap `.ftree`'s `*Links`
 rows) go alongside: `data(graph, { modules, moduleLinks })`. (`lod({ modules })` still works as an

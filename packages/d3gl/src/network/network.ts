@@ -3,10 +3,10 @@ import { networkLayers, networkLayersFromCache, noLodStyleCache, drawsLinks, fro
 import { rgb } from "d3-color";
 import { DRAG_HEAT, ForceLayout, seedPositions, type ForceParams } from "./force.js";
 import { multilevelLayout, type CoarsenOptions } from "./coarsen.js";
-import { buildLODTree, buildMortonLODTree, mortonRootBox, makeMortonScratch, makeLODBoundsScratch, findMortonCell, computeLODGeometry, computeLODPositions, computeLODStyle, updateLODPositionsForLeaves, cut, makeCutScratch, makeCutBoundaries, declutterFrontier, makeDeclutterFrontierScratch, pickFrontier, regionFrontier, visibleWorldRect, leavesUnder, ancestorAwareSelected, type BoundaryDiscs, type CutBoundaries, type LODTree, type MortonBox, type SpatialLODOptions } from "./lod.js";
+import { buildLODTree, buildMortonLODTree, mortonRootBox, makeMortonScratch, makeLODBoundsScratch, findMortonCell, computeLODGeometry, computeLODPositions, computeLODStyle, lodTreeFromTopology, updateLODPositionsForLeaves, cut, makeCutScratch, makeCutBoundaries, declutterFrontier, makeDeclutterFrontierScratch, pickFrontier, regionFrontier, visibleWorldRect, leavesUnder, ancestorAwareSelected, type BoundaryDiscs, type CutBoundaries, type LODTree, type MortonBox, type SpatialLODOptions } from "./lod.js";
 import { DEFAULT_LABEL_TEXT, type LabelAnchor, type LabelStyle } from "../labels/label-layer.js";
 import { TextMeasurer, canvasFont } from "../labels/measure.js";
-import { buildModuleLODTree, checkModuleLinks, moduleRecordIndex, type ModuleLink, type ModuleNode } from "./modules.js";
+import { buildModuleLODTree, checkModuleLinks, flattenModuleLinks, flattenModuleRecords, moduleRecordIndex, type ModuleLink, type ModuleNode } from "./modules.js";
 import { nestedLayout, nestedBoundaryDiscs, type NestedLayoutParams } from "./nested-layout.js";
 import { positionTransition, type PositionTransition } from "./transition.js";
 import { moduleColors, type ModulePathNode, type ModuleColorOptions } from "./module-colors.js";
@@ -14,7 +14,7 @@ import { physicalPieWedges, type PhysicalPieWedges, type PieWedgeOptions } from 
 import { rosettePositions } from "./rosette.js";
 import { gatherCandidates, descendingByKey, descendingInListOrder, CandidateList, type CandidateSource } from "./label-candidates.js";
 import type { StateNetworkGraph } from "./state-graph.js";
-import { startNestedWorkerLayout, startWorkerLayout, type StreamedLODTree, type WorkerLayoutHandle, type WorkerLayoutOptions } from "./worker-transport.js";
+import { buildModuleTopologyOffThread, deferredLayoutHandle, startNestedWorkerLayout, startWorkerLayout, type StreamedLODTree, type WorkerLayoutHandle, type WorkerLayoutOptions } from "./worker-transport.js";
 import { buildLeafIncidence, lazySuperEdges, makeLazySuperEdgesScratch, type LeafIncidence } from "./lazy-super-edges.js";
 import type { LeafStyle, LODView } from "./lod-frame.js";
 import { startGpuNestedLayout } from "./gpu/gpu-nested-transport.js";
@@ -821,6 +821,28 @@ export class Network extends BaseEngine {
     moduleLinks: ArrayLike<ModuleLink> | undefined;
     tree: LODTree;
   } | null = null;
+  /**
+   * The module tree a worker is building (#428), keyed like {@link moduleTreeCache}: started by the first
+   * consumer that can wait for it — a nested layout on a streaming backend ({@link moduleTreeLater}) —
+   * so the main thread never blocks on the build. It lands in the cache and repaints a cut that draws
+   * it. `settle` also hands over a tree built on the main thread meanwhile ({@link moduleTreeOf}), so
+   * whoever awaits `tree` never waits on a cancelled worker. Dropped with the graph or on destroy.
+   */
+  private moduleTreeJob: {
+    graph: NetworkGraph;
+    modules: ArrayLike<ModuleNode>;
+    moduleLinks: ArrayLike<ModuleLink> | undefined;
+    tree: Promise<LODTree>;
+    settle(tree: LODTree): void;
+    cancel(): void;
+  } | null = null;
+  /**
+   * Whether a `layout()` has run since {@link data} set the current graph. Until one has, the positions
+   * are not a layout's, and {@link lod} leaves a from-scratch tree build to the end of the call chain
+   * ({@link defersTreeBuild}), where a layout later in the chain may already be building it off the
+   * main thread.
+   */
+  private laidOut = false;
   /** LOD config when enabled (#103), else null (draw every element). */
   private lodOptions: NetworkLODOptions | null = null;
   /** Retained coarsening tree for the current graph (topology built lazily). */
@@ -1073,6 +1095,8 @@ export class Network extends BaseEngine {
     }
     // New topology + position buffer: drop the retained LOD tree, the module tree and resolved-style cache.
     this.moduleTreeCache = null;
+    this.cancelModuleTreeJob();
+    this.laidOut = false;
     this.nestedDiscs = null;
     this.lodTree = null;
     this.lodWorkerTree = null;
@@ -1226,13 +1250,14 @@ export class Network extends BaseEngine {
    * on the `force`/`positions` backends) falls back to building the tree on the main thread from the
    * current positions.
    *
-   * On an engine that has not run a layout yet, `lod()` cannot know which backend comes next, so the
-   * main-thread build waits for the end of the current call chain: a streaming `layout()` in the same
-   * chain still gets its tree off-thread, and every other path (no layout, `positions`, `force`) has the
+   * Until a layout has run on the graph `data()` set, `lod()` cannot know what comes next, so a tree it
+   * would build from scratch waits for the end of the current call chain: a streaming `layout()` in the same
+   * chain still gets its structural tree off-thread, a `layout({ nested })` on a streaming backend gets the
+   * module tree built on a worker (#428), and every other path (no layout, `positions`, `force`) has the
    * tree before the next frame — and a synchronous call that needs it (`pick()`, `toSVG()`/`toPNG()`,
-   * `select()`/`selection()`, `highlight()`, `setStyle()`/`clearStyle()`) builds it at once. With a
-   * streaming layout in the chain those calls see what they see during any worker-streamed load: no cut
-   * until the worker's tree lands.
+   * `select()`/`selection()`, `highlight()`, `setStyle()`/`clearStyle()`) builds it at once. With a worker
+   * building the tree those calls see what they see during any worker-streamed load: no cut until the
+   * worker's tree lands.
    *
    * With a module hierarchy (`data(graph, { modules })`, #326) the cut draws the module tree by
    * default; `{ source: "structure" }` coarsens the graph structurally instead. `{ source: "spatial" }`
@@ -1260,26 +1285,39 @@ export class Network extends BaseEngine {
     // reuses it (cut-time options apply immediately; the style geometry refreshes). data()/layout()
     // drop it on a graph or layout change. It builds a structural tree on the main thread only off the
     // worker backend — on the worker backend that tree comes from the worker (or the settle fallback).
-    // Before any layout() the backend is still unknown, so a from-scratch structural build is deferred
-    // to the end of the call chain instead (see defersStructuralBuild).
-    if (this.defersStructuralBuild()) this.deferLODBuild();
-    else this.recomputeLODGeometry();
+    // Before a layout() on this graph, a from-scratch build is deferred to the end of the call chain
+    // instead (see defersTreeBuild). A build deferred there must not be where a bad explicit
+    // lod({ modules }) throws: check it now, as data() checks the engine's hierarchy (#326).
+    if (this.defersTreeBuild()) {
+      if (options.modules && this.graph) {
+        moduleRecordIndex(this.graph.nodeCount, options.modules);
+        if (options.moduleLinks) checkModuleLinks(this.graph.nodeCount, options.modules, options.moduleLinks);
+      }
+      this.deferLODBuild();
+    } else this.recomputeLODGeometry();
     return this.rebuild();
   }
 
   /**
    * Whether {@link lod} should leave the main-thread tree build to the end of the call chain: no
-   * `layout()` has chosen a backend yet — a `layout({ backend: "worker" })` later in this chain streams
-   * the structural tree itself (#103), and building it here first would block the main thread for the
-   * whole O(N + E) coarsening (≈0.5 s at 325k nodes / 1.5M edges) only to be replaced. Only a tree that
-   * would be built from scratch waits: a module tree is never streamed, an existing tree only needs its
-   * geometry refreshed, and state-network mode builds from the state view's own graph (#182). Nor does
-   * it wait while the network's layers carry a selection, highlight or style override: the vector
-   * backends clear those layers while a build is queued, which would discard that state.
+   * `layout()` has run since {@link data} set the graph, and the tree would be built from scratch — a
+   * structural tree, which a `layout({ backend: "worker" })` later in this chain streams itself (#103),
+   * or a module tree not built yet, which a `layout({ nested })` on a streaming backend later in this
+   * chain has built on a worker (#428). Building it here first would block the main thread for the whole
+   * build (≈0.5 s structural, ≈0.15 s module, at 325k nodes / 1.5M edges) only to be replaced or
+   * duplicated. An existing tree only needs its geometry refreshed, and state-network mode builds from
+   * the state view's own graph (#182). Nor does it wait while the network's layers carry interaction
+   * state ({@link canAwaitTree}).
    */
-  private defersStructuralBuild(): boolean {
-    return this.layoutOpts.backend === undefined && !!this.graph && !this.stateData && !this.lodTree && !this.lodUsesModules()
-      && !this.SCENE_LAYERS.some((name) => this.hasInteractionState(name));
+  private defersTreeBuild(): boolean {
+    if (this.laidOut || !this.graph || this.stateData || !this.canAwaitTree()) return false;
+    return this.lodUsesModules() ? !this.moduleTreeBuilt() : !this.lodTree;
+  }
+
+  /** Whether the cut may wait for a tree: no network layer carries a selection, highlight or style
+   *  override, which the vector backends' clear while LOD awaits its tree would discard. */
+  private canAwaitTree(): boolean {
+    return !this.SCENE_LAYERS.some((name) => this.hasInteractionState(name));
   }
 
   /** Queue the deferred build ({@link runLODFallback}) and mark it as one a synchronous read may pull
@@ -1548,6 +1586,7 @@ export class Network extends BaseEngine {
       // worker-streamed LOD tree belongs to that superseded run, so drop it: the new layout either
       // re-streams one (worker backend) or builds one on the main thread (force/positions).
       this.haltLayout();
+      this.laidOut = true;
       this.lodWorkerTree = null;
       this.lodWorkerSource = null;
       this.lodStreamed = null;
@@ -1562,7 +1601,12 @@ export class Network extends BaseEngine {
       const fit = opts.fit === true;
       this.fitOnLayout = fit;
       this.fitBound = null;
-      const nestedTree = opts.nested && opts.backend !== "positions" ? this.moduleTree() : undefined;
+      // A nested layout on a streaming backend starts once its module tree is built — on a worker unless it
+      // is already (#428); the synchronous force solve builds it here.
+      const streams = layoutClass(opts.backend) === "streaming";
+      const nestedTree = opts.nested && opts.backend !== "positions"
+        ? (streams && this.canAwaitTree() ? this.moduleTreeLater() : this.moduleTree())
+        : undefined;
       // A transition (#328) eases from the current positions, and a warm nested start refines them —
       // so neither is streamed, nor gets the seed disc. Only layouts computed in one go transition.
       const duration = nestedTree || opts.backend === "positions" || opts.backend === "force" ? transitionDuration(opts.transition) : 0;
@@ -1646,6 +1690,14 @@ export class Network extends BaseEngine {
     if (cached && cached.graph === graph && cached.modules === modules && cached.moduleLinks === moduleLinks) return cached.tree;
     const tree = buildModuleLODTree(graph.nodeCount, modules, graph, moduleLinks);
     this.moduleTreeCache = { graph, modules, moduleLinks, tree };
+    // A synchronous consumer could not wait for a worker building this tree (#428): it is built now, so
+    // stop the worker and hand the tree to whoever awaits it.
+    const job = this.moduleTreeJob;
+    if (job && job.graph === graph && job.modules === modules && job.moduleLinks === moduleLinks) {
+      this.moduleTreeJob = null;
+      job.cancel();
+      job.settle(tree);
+    }
     return tree;
   }
 
@@ -1656,10 +1708,82 @@ export class Network extends BaseEngine {
    * without either. Built on first use, then cached ({@link moduleTreeOf}).
    */
   private moduleTree(): LODTree | undefined {
+    const source = this.moduleSource();
+    return source ? this.moduleTreeOf(source.modules, source.moduleLinks) : undefined;
+  }
+
+  /** The hierarchy the module consumers read (#326): an explicit `lod({ modules })`'s (the back-compat
+   *  alias, `checked` false), else the engine's from `data(graph, { modules })` (checked there). */
+  private moduleSource(): { modules: ArrayLike<ModuleNode>; moduleLinks: ArrayLike<ModuleLink> | undefined; checked: boolean } | undefined {
     const o = this.lodOptions;
-    if (o?.modules) return this.moduleTreeOf(o.modules, o.moduleLinks);
+    if (o?.modules) return { modules: o.modules, moduleLinks: o.moduleLinks, checked: false };
     const h = this.hierarchy;
-    return h ? this.moduleTreeOf(h.modules, h.moduleLinks) : undefined;
+    return h ? { modules: h.modules, moduleLinks: h.moduleLinks, checked: true } : undefined;
+  }
+
+  /** Whether `entry` is keyed to the current graph and module source ({@link moduleSource}). O(1) and
+   *  allocation-free: {@link awaitsModuleTree} runs on the streamed-frame and label paths. */
+  private isCurrentModuleTree(entry: { graph: NetworkGraph; modules: ArrayLike<ModuleNode>; moduleLinks: ArrayLike<ModuleLink> | undefined } | null): boolean {
+    if (!entry || entry.graph !== this.graph) return false;
+    const alias = this.lodOptions?.modules;
+    if (alias) return entry.modules === alias && entry.moduleLinks === this.lodOptions?.moduleLinks;
+    const h = this.hierarchy;
+    return !!h && entry.modules === h.modules && entry.moduleLinks === h.moduleLinks;
+  }
+
+  /** Whether the module tree for the current graph and source is built (cached). */
+  private moduleTreeBuilt(): boolean {
+    return this.isCurrentModuleTree(this.moduleTreeCache);
+  }
+
+  /** Whether the cut draws a module tree that a worker is still building (#428). */
+  private awaitsModuleTree(): boolean {
+    return this.moduleTreeJob !== null && this.lodUsesModules() && this.isCurrentModuleTree(this.moduleTreeJob);
+  }
+
+  /**
+   * The module tree, for a consumer that can wait for it (#428): the cached tree, or a promise of one
+   * built on a worker — this starts the build unless one is under way — so the main thread never blocks
+   * on the O(nodes · depth + edges · depth) build; its share is flattening the records (≈10 ms at 325k
+   * nodes) and copying the edge buffers into the message. The tree lands in the cache and repaints a
+   * cut that draws it. `undefined` without a hierarchy. An explicit `lod({ modules })` is checked here,
+   * synchronously, where a main-thread build would have thrown; without a worker the tree is built on
+   * the main thread after all.
+   */
+  private moduleTreeLater(): LODTree | Promise<LODTree> | undefined {
+    const graph = this.graph;
+    const source = this.moduleSource();
+    if (!graph || !source) return undefined;
+    if (this.moduleTreeBuilt()) return this.moduleTree();
+    const running = this.moduleTreeJob;
+    if (running && this.isCurrentModuleTree(running)) return running.tree;
+    this.cancelModuleTreeJob();
+    const { modules, moduleLinks } = source;
+    const records = flattenModuleRecords(graph.nodeCount, modules); // checks the records, as the build would
+    if (moduleLinks?.length && !source.checked) checkModuleLinks(graph.nodeCount, modules, moduleLinks, "buildModuleLODTree");
+    const build = buildModuleTopologyOffThread(graph.nodeCount, records, graph, moduleLinks?.length ? flattenModuleLinks(moduleLinks) : undefined);
+    let settle: (tree: LODTree) => void = () => {};
+    const tree = new Promise<LODTree>((resolve) => {
+      settle = resolve;
+    });
+    const job = { graph, modules, moduleLinks, tree, settle, cancel: build.cancel };
+    this.moduleTreeJob = job;
+    void build.topology.then((topology) => {
+      if (this.moduleTreeJob !== job) return; // cancelled with its graph, or built on the main thread meanwhile
+      this.moduleTreeJob = null;
+      const built = topology ? lodTreeFromTopology(topology) : buildModuleLODTree(graph.nodeCount, modules, graph, moduleLinks);
+      if (this.isCurrentModuleTree(job)) this.moduleTreeCache = { graph, modules, moduleLinks, tree: built };
+      settle(built);
+      // A cut waiting for it draws it on the next frame — after whoever awaits the tree has started.
+      if (this.lodUsesModules()) this.scheduleLayoutRepaint();
+    });
+    return tree;
+  }
+
+  /** Stop a module-tree build under way (#428) — its graph or hierarchy is gone. */
+  private cancelModuleTreeJob(): void {
+    this.moduleTreeJob?.cancel();
+    this.moduleTreeJob = null;
   }
 
   /** Whether the LOD cut draws a module hierarchy (#326): an explicit `lod({ modules })`, or the engine
@@ -1951,11 +2075,9 @@ export class Network extends BaseEngine {
    * A warm start (#328) seeds from the current positions and lands in one piece, with no depth frames;
    * with a `duration` the result is eased to ({@link positionTween}) instead of jumped to.
    */
-  private startNestedLayout(tree: LODTree, opts: NetworkLayoutOptions, duration: number): void {
+  private startNestedLayout(tree: LODTree | Promise<LODTree>, opts: NetworkLayoutOptions, duration: number): void {
     const graph = this.graph;
-    const { parent } = tree;
-    if (!graph || !parent) return; // provided module trees always carry their parent map
-    const topology = { ...tree, parent };
+    if (!graph) return;
     const cfg = typeof opts.nested === "object" ? opts.nested : {};
     const warm = cfg.warm === true;
     const radius = 10 * Math.sqrt(graph.nodeCount); // a cold root disc, centred on the origin
@@ -1970,37 +2092,47 @@ export class Network extends BaseEngine {
       packing: cfg.packing,
       size: (cfg.size ?? "flow") === "flow" ? (graph.flow ?? undefined) : undefined,
     };
-    if (layoutClass(opts.backend) === "streaming") {
+    if (tree instanceof Promise || layoutClass(opts.backend) === "streaming") {
       const oneFrame = warm || tween !== null;
       this.nestedSolving = true;
-      // A cold map streamed depth by depth frames on the bound the transport posts (#427): the root disc as
-      // the stream starts, then each depth's placed discs — shrinking to the leaves' exact box. The engine
-      // assumes no bound: a transport that posts none frames the live leaves, as a flat stream does. A warm
-      // map, or one eased in, is framed once it lands.
-      const delivery = {
-        stream: !oneFrame,
-        onResult: oneFrame ? (positions: Float32Array) => this.landNested(graph, positions, tween) : undefined,
-        onBoundaries: (discs: BoundaryDiscs) => {
-          if (this.graph === graph) this.nestedDiscs = { tree, discs }; // the modules' geometry, and their rings' (#329)
-        },
-        onBounds: (bounds: FitBox) => {
-          if (this.graph === graph) this.fitBound = bounds;
-        },
+      const solveOn = (t: LODTree): WorkerLayoutHandle | null => {
+        const { parent } = t;
+        if (!parent || this.graph !== graph) return null; // provided module trees always carry their parent map
+        const topology = { ...t, parent };
+        // A cold map streamed depth by depth frames on the bound the transport posts (#427): the root disc as
+        // the stream starts, then each depth's placed discs — shrinking to the leaves' exact box. The engine
+        // assumes no bound: a transport that posts none frames the live leaves, as a flat stream does. A warm
+        // map, or one eased in, is framed once it lands.
+        const delivery = {
+          stream: !oneFrame,
+          onResult: oneFrame ? (positions: Float32Array) => this.landNested(graph, positions, tween) : undefined,
+          onBoundaries: (discs: BoundaryDiscs) => {
+            if (this.graph === graph) this.nestedDiscs = { tree: t, discs }; // the modules' geometry, and their rings' (#329)
+          },
+          onBounds: (bounds: FitBox) => {
+            if (this.graph === graph) this.fitBound = bounds;
+          },
+        };
+        if (requestsGpu(opts.backend)) {
+          // The batched GPU solve (#355): every module at every depth at once, streamed from the GPU; the
+          // worker when the device cannot run it — silently on "auto", which expects it there (#375), as the
+          // flat layout does. A GPU frame repaints inside the transport's own animation frame
+          // ({@link onStreamedFrame}).
+          const devicePromise = this.whenBackendSettled().then(() => this.gpuDevice());
+          const gpuDelivery = { ...delivery, warnUnsupported: opts.backend === "gpu" };
+          const gpu: WorkerLayoutHandle = startGpuNestedLayout(devicePromise, graph, topology, params, () => this.onStreamedFrame(gpu), gpuDelivery);
+          return gpu;
+        }
+        return startNestedWorkerLayout(graph, topology, params, () => this.scheduleLayoutRepaint(), delivery);
       };
-      let solve: WorkerLayoutHandle | undefined;
-      if (requestsGpu(opts.backend)) {
-        // The batched GPU solve (#355): every module at every depth at once, streamed from the GPU; the
-        // worker when the device cannot run it — silently on "auto", which expects it there (#375), as the
-        // flat layout does. A GPU frame repaints inside the transport's own animation frame
-        // ({@link onStreamedFrame}).
-        const devicePromise = this.whenBackendSettled().then(() => this.gpuDevice());
-        const gpuDelivery = { ...delivery, warnUnsupported: opts.backend === "gpu" };
-        solve = startGpuNestedLayout(devicePromise, graph, topology, params, () => this.onStreamedFrame(solve), gpuDelivery);
-      } else {
-        solve = startNestedWorkerLayout(graph, topology, params, () => this.scheduleLayoutRepaint(), delivery);
-      }
+      // A module tree still on its way from a worker (#428): the solve starts when it lands.
+      const solve = tree instanceof Promise ? deferredLayoutHandle(tree, solveOn) : solveOn(tree);
+      if (!solve) return;
       this.onLayoutSettled(tween ? this.transitionHandle(tween, solve) : solve);
     } else {
+      const { parent } = tree;
+      if (!parent) return; // provided module trees always carry their parent map
+      const topology = { ...tree, parent };
       const result = nestedLayout(topology, params);
       const positions = result.positions;
       this.nestedDiscs = { tree, discs: nestedBoundaryDiscs(topology, result) }; // the modules' geometry, and their rings' (#329)
@@ -2457,6 +2589,7 @@ export class Network extends BaseEngine {
     // engine must not coarsen its graph (a React StrictMode re-mount destroys it within the call chain).
     this.lodFallbackScheduled = false;
     this.lodBuildDeferred = false;
+    this.cancelModuleTreeJob(); // nor build its module tree (#428)
     super.destroy(); // base tears down the shared label overlay (#105 N7b, #223)
   }
 
@@ -2482,10 +2615,11 @@ export class Network extends BaseEngine {
 
   /** LOD is on, no tree is ready yet, and nothing is drawn until one is: the WebGL lane draws nothing
    *  meanwhile ({@link syncLane}) — a worker is about to stream the tree, or {@link lod} deferred the
-   *  build — and a vector backend draws nothing while that deferred build is pending ({@link rebuild}).
+   *  build — and a vector backend draws nothing while that deferred build is pending, or while a worker
+   *  builds the module tree the cut draws (#428) ({@link rebuild}).
    *  (A vector backend awaiting a streamed tree otherwise draws the full graph.) */
   private lodAwaitsTree(): boolean {
-    return !!this.lodOptions && !this.lodReady() && (this.lodBuildDeferred || !!this.backend()?.setInstancedLayer);
+    return !!this.lodOptions && !this.lodReady() && (this.lodBuildDeferred || this.awaitsModuleTree() || !!this.backend()?.setInstancedLayer);
   }
 
   /**
@@ -3471,6 +3605,15 @@ export class Network extends BaseEngine {
    */
   private recomputeLODGeometry(forceMain = false): void {
     if (!this.lodOptions || !this.graph) return;
+    // The cut draws a module tree a worker is still building (#428): nothing to draw until it lands, and
+    // it repaints then. Not even `forceMain` builds it here — the worker is already doing that work.
+    if (this.awaitsModuleTree()) {
+      this.lodTree = null;
+      this.lodModules = false;
+      this.lodSpatial = false;
+      this.lodHasGeometry = false;
+      return;
+    }
     const resolved = this.resolvedStyleCached(this.graph);
     const nodeRadii = resolved.nodeRadii;
     const leafBorder = resolved.flowBorder?.metric; // per-leaf flow metric; sum-aggregated onto the tree
@@ -3599,6 +3742,7 @@ export class Network extends BaseEngine {
     // deferred runs whatever else came next (no layout, positions mid-transition), as lod() would have.
     if (!this.lodOptions || this.lodStreaming || this.lodReady()) return;
     if (this.streamingTransport() === "pending") return;
+    if (this.awaitsModuleTree()) return; // a worker is building the module tree; it repaints the cut when it lands (#428)
     if (!deferred && !this.lodTreeFromWorker()) return;
     this.recomputeLODGeometry(true); // no live worker: build the tree on the main thread
     this.rebuild();

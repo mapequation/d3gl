@@ -16,6 +16,7 @@ import type { NestedLayoutParams, NestedLayoutTopology } from "./nested-layout.j
 import type { SeedPlan, SeedPlanOptions } from "./gpu/seed-plan.js";
 import type { NestedSolverTopology } from "./gpu/nested-topology.js";
 import type { FitBox } from "./fit.js";
+import type { FlatModuleLinks, FlatModuleRecords } from "./module-topology.js";
 
 /** Kick off a layout run. Edge buffers are copied to the worker; the main thread keeps its own. */
 export interface StartMessage {
@@ -156,6 +157,21 @@ export interface NestedPrepMessage {
 }
 
 /**
+ * Build a module hierarchy's LOD tree off the main thread (#428): the worker answers with one
+ * `module-tree` message and is then terminated. `records` and `links` are transferred (the main thread
+ * flattened them for this message); the edge buffers are copied, as for a layout run.
+ */
+export interface ModuleTreeStartMessage {
+  type: "build-module-tree";
+  nodeCount: number;
+  records: FlatModuleRecords;
+  links?: FlatModuleLinks;
+  source: Uint32Array;
+  target: Uint32Array;
+  weight: Float32Array;
+}
+
+/**
  * The GPU layout's coarsening worker: coarsen the graph, with no layout, for the LOD tree (#377) and/or the
  * GPU's multilevel seed (#353) — one hierarchy for both, as the worker backend shares it between its seed
  * and its LOD tree. With `seed`, the worker first posts a {@link SeedPlanMessage} (its arrays transferred).
@@ -216,7 +232,8 @@ export type MainToWorker =
   | LODRecycleMessage
   | CoarsenMessage
   | LODGeometryRequest
-  | NestedPrepMessage;
+  | NestedPrepMessage
+  | ModuleTreeStartMessage;
 
 /**
  * The LOD tree, posted once after the worker coarsens (only when `lod` was requested, or for a
@@ -287,12 +304,39 @@ export interface SeedPlanMessage {
   plan: SeedPlan | null;
 }
 
-export type WorkerToMain = LODTopologyMessage | ProgressMessage | LODGeometryMessage | SeedPlanMessage;
+export type WorkerToMain = LODTopologyMessage | ProgressMessage | LODGeometryMessage | SeedPlanMessage | ModuleTreeMessage;
 
 /** The reply to a {@link NestedPrepMessage}: the GPU nested solve's data (#355). Its own channel, not a layout message. */
 export interface NestedPrepReply {
   type: "nested-prep";
   solver: NestedSolverTopology;
+}
+
+/** The module tree a `build-module-tree` asked for (#428): its topology, every buffer transferred. */
+export interface ModuleTreeMessage {
+  type: "module-tree";
+  topology: LODTopology;
+}
+
+/**
+ * The distinct buffers behind a topology's typed arrays — the transfer list that moves a worker-built
+ * tree to the main thread without a copy (#428). A shared buffer is left out: it is shared, not moved.
+ */
+export function topologyBuffers(topo: LODTopology): ArrayBuffer[] {
+  return transferList([
+    topo.levelOffset, topo.childOffset, topo.children, topo.parent, topo.edgeOffset, topo.edgeNeighbors,
+    topo.superEdgeOffset, topo.superEdgeTarget, topo.superEdgeFlow, topo.depth, topo.branch,
+    topo.superEdgeInOffset, topo.superEdgeInSource, topo.superEdgeInFlow,
+    topo.moduleLinkOffset, topo.moduleLinkTarget, topo.moduleLinkFlow,
+    topo.moduleLinkInOffset, topo.moduleLinkInSource, topo.moduleLinkInFlow,
+  ]);
+}
+
+/** The distinct, transferable (non-shared) buffers behind `views` — a `postMessage` transfer list. */
+export function transferList(views: readonly (ArrayBufferView | undefined)[]): ArrayBuffer[] {
+  const buffers = new Set<ArrayBuffer>();
+  for (const view of views) if (view && view.buffer instanceof ArrayBuffer) buffers.add(view.buffer);
+  return [...buffers];
 }
 
 /**
