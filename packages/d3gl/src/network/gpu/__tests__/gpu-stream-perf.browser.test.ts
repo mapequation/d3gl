@@ -17,8 +17,10 @@
  * - **Deterministic signatures:** every `readPixels` on the streaming path lands in a bound PBO (a numeric
  *   offset, never a CPU array); every `getBufferSubData` comes after a fence inserted after the last copy
  *   has been seen signalled; within each frame the harvest precedes every layout draw; exactly one fence
- *   per frame; no GPU object created per frame once the stream runs; repaints at least `minFrameMs`
- *   (50 ms) apart; `settled` resolves only after the final tick's positions were harvested.
+ *   per frame; no GPU object created per frame once the stream runs (under LOD, once the cut first
+ *   draws), except an instanced lane outgrowing its buffers, which at least doubles them; repaints at
+ *   least `minFrameMs` (50 ms) apart; `settled` resolves only after the final tick's positions were
+ *   harvested.
  * - **Throughput:** ticks/s under rendering, reported and floored against the GPU-only tick rate
  *   measured in the same file (a separate solver, before the stream). The GPU-only rate is also reported
  *   with the tick cut into the static band counts of a 60 Hz and a 120 Hz budget, with the main-thread
@@ -45,6 +47,7 @@ import { DEFAULT_BUDGET_MS, frameBudgetMs, staticBands } from "../frame-budget.j
 import { observeGpuLayoutFrames, type GpuFrameSample } from "../gpu-stream.js";
 import { MIN_FRAME_MS } from "../repaint-throttle.js";
 import { makeTestDevice } from "./_device.js";
+import { InstancedArrows, InstancedCircles, InstancedHalfArrows, InstancedLines, InstancedPie } from "../../../webgl/instanced.js";
 import { perfBudget, perfN } from "../../../__tests__/perf-budget.js";
 import { perfHost } from "../../../__tests__/engine-sweep.js";
 
@@ -94,11 +97,15 @@ type GlEvent =
   | { kind: "wait"; sync: WebGLSync; signaled: boolean }
   | { kind: "layout-draw" }
   | { kind: "create" }
+  | { kind: "lane-begin" }
+  | { kind: "lane-end"; before: number; after: number }
   | { kind: "frame-end" };
 
 /**
  * Logs the GL calls the streaming contract is about, in order, by wrapping the installed prototype
  * methods (cast-free: `defineProperty` takes the wrapper as a plain value) and restoring them after.
+ * Each instanced lane's `update` is bracketed with its capacity before and after, so a GPU object
+ * created inside it reads as that lane growing (see {@link attributeCreates}).
  */
 class GlCallLog {
   readonly events: GlEvent[] = [];
@@ -126,6 +133,28 @@ class GlCallLog {
     for (const name of ["createBuffer", "createTexture", "createFramebuffer"] as const) {
       this.wrap(proto, name, () => log.push({ kind: "create" }));
     }
+    this.wrapLane(InstancedCircles.prototype);
+    this.wrapLane(InstancedPie.prototype);
+    this.wrapLane(InstancedLines.prototype);
+    this.wrapLane(InstancedArrows.prototype);
+    this.wrapLane(InstancedHalfArrows.prototype);
+  }
+
+  private wrapLane<A extends unknown[], R>(proto: { readonly capacity: number; update(...args: A): R }): void {
+    const installed = proto.update;
+    const log = this.events;
+    Object.defineProperty(proto, "update", {
+      configurable: true,
+      writable: true,
+      value: function (this: { readonly capacity: number }, ...args: A): R {
+        const before = this.capacity;
+        log.push({ kind: "lane-begin" });
+        const result = installed.apply(this, args);
+        log.push({ kind: "lane-end", before, after: this.capacity });
+        return result;
+      },
+    });
+    this.restores.push(() => Object.defineProperty(proto, "update", { configurable: true, writable: true, value: installed }));
   }
 
   private wrap(
@@ -155,22 +184,31 @@ class GlCallLog {
 /** What one leg observed. */
 interface Leg {
   frames: GpuFrameSample[];
+  /** Per frame: whether the frame ended with the LOD tree in place (`lodSource` not "none"). */
+  cut: boolean[];
+  lod: boolean;
   events: GlEvent[];
   settledAfterFrame: number;
   elapsedMs: number;
 }
 
-/** Run one GPU layout on `net` over `graph`, recording every streamed frame and the GL call log. */
+/**
+ * Run one GPU layout on `net` over `graph` at the whole-graph view (both legs alike, whatever view a
+ * drag leg left behind), recording every streamed frame and the GL call log.
+ */
 async function streamLeg(net: Network, graph: NetworkGraph, lod: boolean): Promise<Leg> {
   const frames: GpuFrameSample[] = [];
+  const cut: boolean[] = [];
   const log = new GlCallLog();
   let settledAfterFrame = -1;
   const unobserve = observeGpuLayoutFrames((s) => {
     frames.push({ ...s });
+    cut.push(net.lodSource !== "none");
     log.events.push({ kind: "frame-end" });
   });
   const t0 = performance.now();
   try {
+    net.setTransform({ k: 1, x: 0, y: 0 });
     net.data(graph).lod(lod ? { source: "structure", declutter: true, superEdges: true } : false);
     net.layout({ backend: "gpu", iterations: ITERATIONS });
     await net.whenSettled();
@@ -180,7 +218,7 @@ async function streamLeg(net: Network, graph: NetworkGraph, lod: boolean): Promi
     log.restore();
   }
   expect(net.layoutTransport).toBe("gpu");
-  return { frames, events: log.events, settledAfterFrame, elapsedMs: performance.now() - t0 };
+  return { frames, cut, lod, events: log.events, settledAfterFrame, elapsedMs: performance.now() - t0 };
 }
 
 const nextFrame = (): Promise<void> => new Promise((resolve) => requestAnimationFrame(() => resolve()));
@@ -188,8 +226,29 @@ const nextFrame = (): Promise<void> => new Promise((resolve) => requestAnimation
 /** Frames a drag holds its node (one pointer move each), and frames observed after the release. */
 const DRAG_FRAMES = 24;
 const COOL_FRAMES = 24;
-/** Zoom of the drag: the grabbed node is a drawn leaf under either reduction state (spacing ≈ 56 world units). */
+/** Zoom of the drag: leaves are drawn at their own size under either reduction state (spacing ≈ 56 world units). */
 const DRAG_K = 4;
+/** Nodes {@link centreOnDrawnLeaf} tries before it gives up. */
+const GRAB_TRIES = 64;
+
+/**
+ * Centre the view at the drag zoom on the first node, from `from` on, that is drawn as a leaf under the
+ * view centre, and return its id. Which nodes are drawn there depends on the layout, and the GPU layout
+ * differs by platform: SwiftShader compiles its shaders with LLVM on arm64 and with Subzero on x86-64 (the
+ * CI runners), so the same run lands the nodes elsewhere. Under LOD the declutter hides a few leaves
+ * outright (about 3% at this N), with no drawn glyph over their centre, so a fixed id can leave the
+ * pointer-down nothing to grab. The search asks the same `pick` the pointer-down grab resolves through.
+ */
+function centreOnDrawnLeaf(net: Network, graph: NetworkGraph, from: number): number {
+  for (let id = from; id < Math.min(graph.nodeCount, from + GRAB_TRIES); id++) {
+    const x0 = graph.positions[id * 2] ?? 0;
+    const y0 = graph.positions[id * 2 + 1] ?? 0;
+    net.setTransform({ k: DRAG_K, x: W / 2 - x0 * DRAG_K, y: H / 2 - y0 * DRAG_K });
+    const hit = net.pick(W / 2, H / 2);
+    if (hit?.layer === "nodes" && hit.id === id) return id;
+  }
+  throw new Error(`no node in ${from}…${from + GRAB_TRIES - 1} is drawn as a leaf under the view centre at k=${DRAG_K}`);
+}
 
 /** What one drag leg observed. */
 interface DragLeg {
@@ -206,11 +265,12 @@ interface DragLeg {
   moveMs: number[];
 }
 
-/** Grab node `id` of the settled layout on `net`, drag it for DRAG_FRAMES frames, release, watch COOL_FRAMES frames. */
-async function dragLeg(net: Network, host: HTMLElement, graph: NetworkGraph, id: number): Promise<DragLeg> {
-  const x0 = graph.positions[id * 2] ?? 0;
-  const y0 = graph.positions[id * 2 + 1] ?? 0;
-  net.setTransform({ k: DRAG_K, x: W / 2 - x0 * DRAG_K, y: H / 2 - y0 * DRAG_K });
+/**
+ * Grab a drawn leaf of the settled layout on `net` (the first from node `from` on), drag it for DRAG_FRAMES
+ * frames, release, watch COOL_FRAMES frames.
+ */
+async function dragLeg(net: Network, host: HTMLElement, graph: NetworkGraph, from: number): Promise<DragLeg> {
+  centreOnDrawnLeaf(net, graph, from);
   await nextFrame();
   const rect = host.getBoundingClientRect();
   const pointer = (type: string, x: number, y: number): void => {
@@ -281,6 +341,32 @@ function perFrame(events: GlEvent[]): GlEvent[][] {
   return out;
 }
 
+/**
+ * Split the GPU objects created in `events` into the grows of an instanced lane (created inside its
+ * `update` while its capacity rose) and the rest (`stray`): anything the transport or the engine created
+ * outside a lane update, and a lane update that recreated its buffers without growing them.
+ */
+function attributeCreates(events: GlEvent[]): { stray: number; grows: { before: number; after: number }[] } {
+  let stray = 0;
+  let open = false;
+  let inLane = 0;
+  const grows: { before: number; after: number }[] = [];
+  for (const e of events) {
+    if (e.kind === "lane-begin") {
+      open = true;
+      inLane = 0;
+    } else if (e.kind === "create") {
+      if (open) inLane++;
+      else stray++;
+    } else if (e.kind === "lane-end") {
+      open = false;
+      if (inLane > 0 && e.after > e.before) grows.push({ before: e.before, after: e.after });
+      else stray += inLane;
+    }
+  }
+  return { stray, grows };
+}
+
 /** The deterministic streaming signatures every leg must show. */
 function assertSignatures(leg: Leg): void {
   const { frames, events } = leg;
@@ -321,10 +407,19 @@ function assertSignatures(leg: Leg): void {
   });
 
   // No GPU object created per frame once the stream runs (the first repaint of new data may allocate
-  // the lanes' buffers; everything after it reuses them).
-  const firstRepaint = frames.findIndex((s) => s.repaintMs > 0);
-  const later = segments.slice(firstRepaint + 1).flat().filter((e) => e.kind === "create").length;
-  expect(later, "GPU objects created per streamed frame").toBe(0);
+  // the lanes' buffers; everything after it reuses them). Under LOD that repaint is the first to draw
+  // the cut: the main thread builds the tree on a GPU frame, and until it has geometry the cut draws
+  // nothing, so the lanes register with the tree, frames after the stream's first repaint. One
+  // exception, bounded: the visible frontier grows while the layout spreads (a few hundred glyphs
+  // growing about fourfold at this N), and a lane that outgrows its buffers reallocates them. Each grow
+  // must at least double the lane's capacity, so it happens log2(peak / first) times over the run; an
+  // exact fit reallocated on every repaint that set a new high.
+  const firstRepaint = frames.findIndex((s, f) => s.repaintMs > 0 && (!leg.lod || leg.cut[f] === true));
+  const { stray, grows } = attributeCreates(segments.slice(firstRepaint + 1).flat());
+  expect(stray, "GPU objects created per streamed frame").toBe(0);
+  for (const g of grows) {
+    expect(g.after, `an instanced lane grew from ${g.before} to ${g.after} instances, less than double`).toBeGreaterThanOrEqual(2 * g.before);
+  }
 
   // Repaints throttled to ≥ minFrameMs apart (the final one, which always paints, excepted).
   const repaints = frames.filter((s) => s.repaintMs > 0).map((s) => s.now);

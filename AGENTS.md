@@ -598,6 +598,29 @@ fences the frame, and harvests with `getBufferSubData` once that fence has signa
   never mid-tick. So a copy after a prep reuses its stats, and a copy between ticks re-runs the
   reductions first (`refreshSegmentStats`). Mid-tick, re-running them would change the box and centroid
   that the remaining force bands read.
+- **A GPU layout lands its nodes differently on each platform, so a guard must not assume where a given
+  node lands.** SwiftShader compiles shaders with LLVM on arm64 Macs and with Subzero on the x86-64 CI
+  runners (`UNMASKED_RENDERER_WEBGL` names the JIT). The same seed and tick count give different float
+  results, and the layout diverges. T7's drag once grabbed node N/2 because it was a drawn leaf at k=4 on
+  a Mac. On CI the LOD declutter hid it, with no glyph over its centre, and the pointer-down grabbed
+  nothing. About 3% of leaves are hidden like that at 100k. Find the node to grab through `pick`, the
+  same way the pointer-down does (`centreOnDrawnLeaf`). To reproduce a CI-only layout on an Apple-silicon
+  Mac, run the file under Rosetta. Install the x64 headless shell with
+  `PLAYWRIGHT_BROWSERS_PATH=<dir> PLAYWRIGHT_HOST_PLATFORM_OVERRIDE=mac15 playwright install
+  chromium-headless-shell`, then point a local config's `playwright({ launchOptions: { executablePath } })`
+  at it.
+- **Under LOD the lanes keep changing while a layout streams, so a "no GPU object per frame" guard must
+  say which changes it allows.** Three things created GPU objects in T7's LOD leg after its first repaint,
+  and none of them was the transport. (1) The frontier grows as the layout spreads (163 → 431 circles and
+  353 → 1472 links at 100k). The lanes grew exact-fit and reallocated all 8 buffers on each repaint that
+  set a new high. They now at least double (`grownCapacity`, webgl/instanced.ts), so reallocations are
+  bounded by log2(peak / first). T7 counts a creation inside a lane's `update` as a grow and requires it to
+  double. (2) The main thread builds the LOD tree on a GPU frame, and the cut draws nothing until the tree
+  has geometry. So the lanes register with the tree, many frames after the stream's first repaint (frame
+  140 of ~550 under Rosetta). T7 starts counting at the first repaint with `lodSource !== "none"`. (3) A
+  stream leg inherited the drag leg's k = 4 zoom. There, links entered the view mid-run, and a change of
+  the lane's layer set re-registers every layer (`emitInstancedLane` keeps the z-order that way). Each
+  stream leg now starts at the whole-graph view.
 
 ## Host sizing: backend canvases are OUT OF FLOW (#39, re-confirmed in #273)
 
