@@ -528,7 +528,7 @@ as `end > start + C`, never `end - start > C` on `uint`s. The per-tick ratio gua
 
 The streaming GPU layout never reads synchronously on the frame path. It copies positions into a PBO,
 fences the frame, and harvests with `getBufferSubData` once that fence has signalled (`network/gpu/`
-`async-readback.ts`, `gpu-stream.ts`, `frame-budget.ts`). Three things bit while building it:
+`async-readback.ts`, `gpu-stream.ts`, `frame-budget.ts`). Four things bit while building it:
 
 - **luma `Buffer`s cannot be `STREAM_READ`** (9.3.3's `WEBGLBuffer` emits only `STATIC_DRAW` /
   `DYNAMIC_DRAW`). Without a `*_READ` usage Chrome's `getBufferSubData` cannot use its readback shadow
@@ -541,10 +541,13 @@ fences the frame, and harvests with `getBufferSubData` once that fence has signa
   took 63 s instead of 11 s. Pack everything a PBO carries into one texture first (the stats ride in their
   own 32-byte PBO through a 2×1 staging texture). Chrome also counts the sizing `bufferData` as a
   write, so size the storage in the first copy, before the fence, not a frame earlier.
-- **A heavy engine repaint is GPU work the layout's fences see.** Its draws queue ahead of the layout,
-  so a miss behind a repaint frame says nothing about the layout's band size. The fence controller
-  only blocks on such a miss and never resizes `k` or B. Before that rule, every 325k render doubled B
-  until 50 items per tick left 4.6 ticks/s. Where the browser holds the next animation frame until the
+- **A heavy engine repaint is GPU work the layout's fences see.** Its draws queue ahead of the layout
+  items of its own frame and of every later frame. So a late fence right behind a repaint says nothing
+  about the layout's band size: the late frame carried the repaint, or one did that completed within the
+  frames in flight before it. The fence controller only blocks on such a miss and never resizes `k` or B.
+  Before that rule, every 325k render doubled B until 50 items per tick left 4.6 ticks/s. Only the late
+  frame (the oldest in flight) and what ran before it count. A repaint queued after it cannot have
+  delayed its fence, because the GPU runs work in order, so it excuses nothing. Where the browser holds the next animation frame until the
   canvas is drawn (SwiftShader: seconds per 100k-node render), the rAF gap after a repaint frame is
   the render's cost, and the repaint throttle spaces repaints by twice that. But a gap is not always a
   render cost: a hidden tab pauses rAF, and a long task delays it. Taken at face value, one such gap once

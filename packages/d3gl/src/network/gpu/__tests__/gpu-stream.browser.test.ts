@@ -175,4 +175,56 @@ describe("GPU streaming run (#352)", () => {
       stream.stop();
     }
   });
+
+  it("keeps a drag that starts and ends while the run finishes: the GPU learns the drop, the harvest keeps it", async () => {
+    // The window: after the final integrate, before the final harvest — no prep of the run is left to
+    // write the held positions, so the drag must carry on as a reheat that does.
+    const g = ring(300);
+    const iterations = 30;
+    let samples = 0;
+    let dropped = false;
+    const { layout, stream } = streamOver(g, iterations, () => {});
+    const writes: [number, number][] = [];
+    const setHeld = layout.setHeldPositions.bind(layout);
+    vi.spyOn(layout, "setHeldPositions").mockImplementation((ids, positions) => {
+      if (ids[0] === 3) writes.push([positions[0] ?? Number.NaN, positions[1] ?? Number.NaN]);
+      setHeld(ids, positions);
+    });
+    let before: [number, number] = [0, 0];
+    const drop = new Float32Array(2);
+    const unobserve = observeGpuLayoutFrames((s) => {
+      samples++;
+      if (dropped || s.ticksDone < iterations) return;
+      dropped = true;
+      queueMicrotask(() => {
+        // What the engine's drag does: hold the node under the cursor in graph.positions, pin it, release.
+        before = [g.positions[6] ?? 0, g.positions[7] ?? 0];
+        drop[0] = before[0] + 50;
+        drop[1] = before[1] - 50;
+        g.positions[6] = drop[0];
+        g.positions[7] = drop[1];
+        stream.pin(Uint32Array.of(3), drop);
+        stream.unpin();
+      });
+    });
+    try {
+      stream.start();
+      await stream.settled;
+      // Let the loop go idle: no streamed frame for 5 animation frames.
+      for (let i = 0, quiet = 0, last = samples; i < 2000 && quiet < 5; i++) {
+        await nextFrame();
+        quiet = samples === last ? quiet + 1 : 0;
+        last = samples;
+      }
+      expect(dropped).toBe(true);
+      expect(writes, "the drop position never reached the GPU").toContainEqual([drop[0], drop[1]]);
+      const gpu = new Float32Array(g.positions.length);
+      layout.readPositions(gpu);
+      expect(Array.from(g.positions), "the last harvest does not show what the GPU holds").toEqual(Array.from(gpu));
+      expect([g.positions[6], g.positions[7]], "the dropped node snapped back").not.toEqual(before);
+    } finally {
+      unobserve();
+      stream.stop();
+    }
+  });
 });

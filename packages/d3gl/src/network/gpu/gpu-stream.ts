@@ -14,9 +14,10 @@
  *    repaint (a finished copy waits in its PBO until the repaint is due). A read that is not ready is never
  *    forced, and it happens before any encode, so nothing it could wait on is freshly queued. A hidden page
  *    pauses the throttle's stall sampling, so the time a tab spent hidden never delays the next repaint.
- * 2. **Encode.** Work items (P, F_0 … F_{B−1}, I) while the {@link FrameBudget} admits them: at most 2
- *    frames of layout work in flight, a GPU budget of `min(10 ms, 0.6 × rAF interval)` per frame, and at
- *    most 2 ms of encode time. A tick may span frames; its result does not depend on how it was sliced.
+ * 2. **Encode.** Work items (P, F_0 … F_{B−1}, I) while the {@link FrameBudget} admits them: at most 33 ms
+ *    of frames of layout work in flight (`framesInFlight`: 2 frames at 60 Hz, 4 at 120 Hz), a GPU
+ *    budget of `min(10 ms, 0.6 × rAF interval)` per frame, and at most 2 ms of encode time. A tick may
+ *    span frames; its result does not depend on how it was sliced.
  * 3. **Copy + fence.** On the repaint's cadence (reading back more often than repainting is waste), and
  *    when the one PBO is free, copy the positions into it; then insert the frame's single budget fence,
  *    which doubles as the copy's fence. The copy carries the reductions' stats, and they always describe
@@ -38,6 +39,7 @@ import { deleteSync, insertSync, pollSync } from "../../webgl/fence.js";
 import { AsyncPositionReadback, READBACK_STATS_FLOATS, type ReadbackSource } from "./async-readback.js";
 import { FrameBudget, ITEM_NS_PER_NODE, itemCostMs, type FenceSource, type ItemCosts, type ItemKind } from "./frame-budget.js";
 import { MIN_FRAME_MS, RepaintThrottle } from "./repaint-throttle.js";
+import { reportUncaught } from "./report-uncaught.js";
 
 /**
  * A solver the stream drives: a tick is the work items **P** ({@link beginTick}), **F_b**
@@ -98,7 +100,7 @@ export interface GpuFrameSample {
   harvestedTicks: number;
   /** Whether a readback copy was issued this frame. */
   copied: boolean;
-  /** Whether the gate blocked this frame (2 frames already in flight). */
+  /** Whether the gate blocked this frame (the frames `framesInFlight` allows were already in flight). */
   blocked: boolean;
   /** The controller's item cap and band count after this frame, and its budget. */
   k: number;
@@ -266,7 +268,9 @@ export class GpuStream {
   /**
    * Hold `ids` and reheat: the rest reflows around them. Their `positions` are written into the position
    * texture at the start of the next tick, never mid-tick (the latest ones, if several pins arrive first).
-   * Resumes the loop in `drag` mode, or lets a still-running initial run turn into it when it ends.
+   * Resumes the loop in `drag` mode, or lets an initial run with ticks left turn into it when they end.
+   * A run whose ticks are all encoded (its final copy not yet harvested) has no tick left to write the
+   * held positions, so it turns into a drag now, as an idle layout does.
    */
   pin(ids: Uint32Array, positions?: Float32Array): void {
     const drag = this.drag;
@@ -277,7 +281,7 @@ export class GpuStream {
       this.heldPositions = positions;
     }
     this.dragging = true;
-    if (this.mode === "idle" || this.mode === "cool") {
+    if (this.mode === "idle" || this.mode === "cool" || (this.mode === "run" && this.finishing)) {
       this.mode = "drag";
       drag.hold(DRAG_HEAT);
       this.finishing = false;
@@ -356,7 +360,7 @@ export class GpuStream {
       } catch (error) {
         // The engine's repaint threw (a style accessor, say): report it as uncaught, as a repaint in its
         // own animation frame would, and keep the layout's loop and its state intact.
-        reportError(error);
+        reportUncaught(error);
       }
       repaintMs = performance.now() - r0;
       this.throttle.repainted(now, repaintMs);
@@ -396,7 +400,9 @@ export class GpuStream {
       this.throttle.copyIssued(now);
       this.copyReady = false;
     }
-    const frame = this.budget.endFrame(repaintMs > 0);
+    // `harvested` ⇔ onFrame ran (a failed harvest returned above). Not `repaintMs > 0`: a clamped clock
+    // (~1 ms in Firefox and Safari without cross-origin isolation) measures a cheap repaint as 0.
+    const frame = this.budget.endFrame(harvested);
     if (copied) this.copyFrame = frame;
     const t3 = performance.now();
 
