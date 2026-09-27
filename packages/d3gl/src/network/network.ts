@@ -3457,9 +3457,9 @@ export class Network extends BaseEngine {
           this.repaintDuringDrag();
         },
         release: (ticks) => { sim.setPinned(null); sim.cool(ticks, DRAG_HEAT); },
-        // The drag frames refit a spatial tree (#343); rebuild it once the nodes have come to rest, as a
-        // release does on the other backends.
-        done: () => { if (this.lodSpatial) this.settleLODPositions(); },
+        // The drag frames refit a spatial tree (#343) and held every tree's crowding (#426) while the whole layout
+        // reflowed; settle both once the nodes have come to rest, as a release does on the other backends.
+        done: () => this.settleLODPositions(),
         alive: () => !!this.graph,
         move: setDelta,
       });
