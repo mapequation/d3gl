@@ -3,7 +3,7 @@
  * nested layout's invariants on its output.
  */
 import { beforeAll, describe, expect, it } from "vitest";
-import type { Device } from "@luma.gl/core";
+import type { Device, Framebuffer, FramebufferProps, Texture, TextureProps } from "@luma.gl/core";
 import { makeTestDevice } from "./_device.js";
 import { NestedJacobiReference } from "./nested-jacobi-reference.js";
 import { GpuNestedLayout } from "../gpu-nested-layout.js";
@@ -242,6 +242,46 @@ describe("GPU nested layout (#355) against its Jacobi reference", () => {
     } finally {
       whole.destroy();
       sliced.destroy();
+    }
+  });
+
+  it("frees every texture and framebuffer it created when its construction fails partway, and on destroy", () => {
+    const solver = nestedSolverTopology(makeTree([40, 50, 60], 1, 1).topo, { iterations: 10 });
+    const created: (Texture | Framebuffer)[] = [];
+    const createTexture = device.createTexture.bind(device);
+    const createFramebuffer = device.createFramebuffer.bind(device);
+    let fbos = 0;
+    let failAt = 0; // 0: never
+    device.createTexture = (props: TextureProps): Texture => {
+      const t = createTexture(props);
+      created.push(t);
+      return t;
+    };
+    device.createFramebuffer = (props: FramebufferProps): Framebuffer => {
+      if (++fbos === failAt) throw new Error("injected: the device refused a framebuffer");
+      const f = createFramebuffer(props);
+      created.push(f);
+      return f;
+    };
+    try {
+      // The framebuffers the constructor creates itself come first: the two position FBOs, the four
+      // integrate MRTs, v* and force. Fail at the first (after the four ping-pong textures) and at force's.
+      for (const k of [1, 8]) {
+        created.length = 0;
+        fbos = 0;
+        failAt = k;
+        expect(() => new GpuNestedLayout(device, solver)).toThrow(/injected/);
+        expect(created.length, `resources created before framebuffer ${k}`).toBeGreaterThanOrEqual(k + 3);
+        expect(created.filter((r) => !r.destroyed).length, `resources left alive after a failure at framebuffer ${k}`).toBe(0);
+      }
+      created.length = 0;
+      failAt = 0;
+      new GpuNestedLayout(device, solver).destroy();
+      expect(created.length).toBeGreaterThan(20);
+      expect(created.filter((r) => !r.destroyed).length, "resources left alive by destroy()").toBe(0);
+    } finally {
+      device.createTexture = createTexture;
+      device.createFramebuffer = createFramebuffer;
     }
   });
 

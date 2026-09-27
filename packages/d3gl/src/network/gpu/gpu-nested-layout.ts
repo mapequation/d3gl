@@ -175,6 +175,8 @@ export class GpuNestedLayout implements StreamSolver {
   private readonly reduceUniforms: PassUniforms = { u_segTableWidth: 1, u_mode: 1 };
   private readonly rootX: number;
   private readonly rootY: number;
+  /** Every GPU resource and pass this layout created, in creation order ({@link destroy} frees them in reverse). */
+  private readonly owned: { destroy(): void }[] = [];
 
   /** Solve ticks done, the organise → compact switch, and each start's alpha and decay. */
   private tick = 0;
@@ -205,158 +207,168 @@ export class GpuNestedLayout implements StreamSolver {
   constructor(device: Device, topo: NestedSolverTopology, options: GpuNestedLayoutOptions = {}) {
     this.device = device;
     this.topo = topo;
-    const slots = topo.slotCount;
-    if (slots < 1) throw new Error("GpuNestedLayout: the tree has no node below its root");
-    if (slots >= 1 << 24) throw new Error("GpuNestedLayout: slot ids must stay exact in float32 (below 2^24)");
-    this.slots = slots;
-    this.rootX = options.rootX ?? 0;
-    this.rootY = options.rootY ?? 0;
-    const width = atlasWidth(slots);
-    const height = Math.ceil(slots / width);
-    this.width = width;
-    this.height = height;
-    const T = topo.iterations;
-    this.organise = options.organise ?? Math.ceil(T * NESTED.ORGANISE);
-    this.decayCold = nestedAlphaDecay(1, T);
-    this.decayWarm = nestedAlphaDecay(WARM_ALPHA, T);
+    // Anything created before a later step throws (a shader the driver rejects, a limit) is freed.
+    const own = <T extends { destroy(): void }>(resource: T): T => {
+      this.owned.push(resource);
+      return resource;
+    };
+    try {
+      const slots = topo.slotCount;
+      if (slots < 1) throw new Error("GpuNestedLayout: the tree has no node below its root");
+      if (slots >= 1 << 24) throw new Error("GpuNestedLayout: slot ids must stay exact in float32 (below 2^24)");
+      this.slots = slots;
+      this.rootX = options.rootX ?? 0;
+      this.rootY = options.rootY ?? 0;
+      const width = atlasWidth(slots);
+      const height = Math.ceil(slots / width);
+      this.width = width;
+      this.height = height;
+      const T = topo.iterations;
+      this.organise = options.organise ?? Math.ceil(T * NESTED.ORGANISE);
+      this.decayCold = nestedAlphaDecay(1, T);
+      this.decayWarm = nestedAlphaDecay(WARM_ALPHA, T);
 
-    // Segments + one whole-slot range; tiles for segments above EXACT_MAX (the CPU's exact threshold).
-    const S = topo.segStart.length;
-    const segments: SlotRange[] = [];
-    for (let s = 0; s < S; s++) segments.push({ start: topo.segStart[s] ?? 0, count: topo.segCount[s] ?? 0 });
-    const atlas = packTiles(segments, EXACT_MAX, TILE_MIN_SIDE);
-    assertAtlasFits(atlas, device.limits.maxTextureDimension2D);
-    const rows: SegmentRow[] = segments.map((seg, s) => {
-      const tile = atlas.tiles[s] ?? null;
-      return {
-        ...seg,
-        tile,
-        frozen: seg.count === 1,
-        param: {
-          repulsion: NESTED.REPULSION_K / Math.max(1, seg.count),
-          centering: NESTED.GRAVITY,
-          softening: segmentSoftening("unit", tile === null),
-          alpha0: topo.segAlpha0[s] ?? 1,
+      // Segments + one whole-slot range; tiles for segments above EXACT_MAX (the CPU's exact threshold).
+      const S = topo.segStart.length;
+      const segments: SlotRange[] = [];
+      for (let s = 0; s < S; s++) segments.push({ start: topo.segStart[s] ?? 0, count: topo.segCount[s] ?? 0 });
+      const atlas = packTiles(segments, EXACT_MAX, TILE_MIN_SIDE);
+      assertAtlasFits(atlas, device.limits.maxTextureDimension2D);
+      const rows: SegmentRow[] = segments.map((seg, s) => {
+        const tile = atlas.tiles[s] ?? null;
+        return {
+          ...seg,
+          tile,
+          frozen: seg.count === 1,
+          param: {
+            repulsion: NESTED.REPULSION_K / Math.max(1, seg.count),
+            centering: NESTED.GRAVITY,
+            softening: segmentSoftening("unit", tile === null),
+            alpha0: topo.segAlpha0[s] ?? 1,
+          },
+        };
+      });
+      rows.push({ start: 0, count: slots, tile: null, param: { repulsion: 0, centering: 0, softening: 0, alpha0: 1 } });
+
+      const slotData = (n: number, data: ArrayLike<number>, floats: number, pad = 0): Float32Array => {
+        const out = new Float32Array(width * height * floats).fill(pad);
+        for (let i = 0; i < n * floats; i++) out[i] = data[i] ?? 0;
+        return out;
+      };
+      this.pos = own(pingPong(device, width, height, slotData(slots, topo.seed, 2)));
+      this.vel = own(pingPong(device, width, height));
+      const posFbo = (): Framebuffer => own(device.createFramebuffer({ width, height, colorAttachments: [this.pos.readTex] }));
+      const posA = posFbo();
+      this.pos.swap();
+      const posB = posFbo();
+      this.pos.swap();
+      this.posFbos = [posA, posB];
+      // MRT pairs [pos write, vel write] for each (pos parity, vel parity): the write side of parity p is
+      // the texture NOT read at p — B at 0, A at 1.
+      const mrt = (): Framebuffer => own(device.createFramebuffer({ width, height, colorAttachments: [this.pos.writeTex, this.vel.writeTex] }));
+      const pp: Framebuffer[] = [];
+      for (let p = 0; p < 2; p++) {
+        for (let v = 0; v < 2; v++) {
+          if (p === 1) this.pos.swap();
+          if (v === 1) this.vel.swap();
+          pp.push(mrt());
+          if (p === 1) this.pos.swap();
+          if (v === 1) this.vel.swap();
+        }
+      }
+      const [f00, f01, f10, f11] = pp;
+      if (!f00 || !f01 || !f10 || !f11) throw new Error("GpuNestedLayout: missing integrate framebuffer");
+      this.integrateFbos = [[f00, f01], [f10, f11]];
+
+      const tex2 = (): Texture => own(device.createTexture({ width, height, format: "rg32float", mipLevels: 1, sampler: NEAREST }));
+      this.vstar = tex2();
+      this.vstarFbo = own(device.createFramebuffer({ width, height, colorAttachments: [this.vstar] }));
+      this.force = tex2();
+      this.forceFbo = own(device.createFramebuffer({ width, height, colorAttachments: [this.force] }));
+      this.radius = own(device.createTexture({ width, height, format: "r32float", data: slotData(slots, topo.radius, 1), mipLevels: 1, sampler: NEAREST }));
+      const seg = new Uint32Array(width * height);
+      seg.set(slotSegments(segments, slots));
+      this.slotSeg = own(device.createTexture({ width, height, format: "r32uint", data: seg, mipLevels: 1, sampler: NEAREST }));
+
+      this.segments = own(new SegmentTable(device, rows));
+      const tw = this.segments.width;
+      const th = Math.ceil(rows.length / tw);
+      const nested = new Float32Array(tw * th * 4);
+      for (let s = 0; s < S; s++) {
+        nested[s * 4] = topo.segR9[s] ?? 0;
+        nested[s * 4 + 1] = topo.segOwner[s] ?? -1;
+      }
+      nested[S * 4 + 1] = -1;
+      this.segNested = own(device.createTexture({ width: tw, height: th, format: "rgba32float", data: nested, mipLevels: 1, sampler: NEAREST }));
+      const largeWidth = atlasWidth(2 * rows.length);
+      const largeRows = Math.ceil((2 * rows.length) / largeWidth);
+      const large = new Uint32Array(largeWidth * largeRows * 4).fill(0xffffffff);
+      for (let i = 0; i < S * NESTED_LARGE_MAX; i++) {
+        const slot = topo.segLarge[i] ?? -1;
+        if (slot >= 0) large[i] = slot;
+      }
+      this.segLarge = own(device.createTexture({ width: largeWidth, height: largeRows, format: "rgba32uint", data: large, mipLevels: 1, sampler: NEAREST }));
+      const extentTex = (): Texture => own(device.createTexture({ width: tw, height: th, format: "rgba32float", mipLevels: 1, sampler: NEAREST }));
+      const extentStats = extentTex();
+      const extentBox = extentTex();
+      this.extent = {
+        stats: extentStats,
+        box: extentBox,
+        target: {
+          target: own(device.createFramebuffer({ width: tw, height: th, colorAttachments: [extentStats, extentBox] })),
+          width: tw,
+          size: rows.length,
+          info: this.segments.info,
         },
       };
-    });
-    rows.push({ start: 0, count: slots, tile: null, param: { repulsion: 0, centering: 0, softening: 0, alpha0: 1 } });
 
-    const slotData = (n: number, data: ArrayLike<number>, floats: number, pad = 0): Float32Array => {
-      const out = new Float32Array(width * height * floats).fill(pad);
-      for (let i = 0; i < n * floats; i++) out[i] = data[i] ?? 0;
-      return out;
-    };
-    this.pos = pingPong(device, width, height, slotData(slots, topo.seed, 2));
-    this.vel = pingPong(device, width, height);
-    const posFbo = (): Framebuffer => device.createFramebuffer({ width, height, colorAttachments: [this.pos.readTex] });
-    const posA = posFbo();
-    this.pos.swap();
-    const posB = posFbo();
-    this.pos.swap();
-    this.posFbos = [posA, posB];
-    // MRT pairs [pos write, vel write] for each (pos parity, vel parity): the write side of parity p is
-    // the texture NOT read at p — B at 0, A at 1.
-    const mrt = (): Framebuffer => device.createFramebuffer({ width, height, colorAttachments: [this.pos.writeTex, this.vel.writeTex] });
-    const pp: Framebuffer[] = [];
-    for (let p = 0; p < 2; p++) {
-      for (let v = 0; v < 2; v++) {
-        if (p === 1) this.pos.swap();
-        if (v === 1) this.vel.swap();
-        pp.push(mrt());
-        if (p === 1) this.pos.swap();
-        if (v === 1) this.vel.swap();
-      }
+      this.reduce = own(new SegmentedReduce(device, slots, NESTED_REDUCE_MAP));
+      this.reduceBindings = [
+        { u_slotSeg: this.slotSeg, u_rad: this.radius, u_segSum: this.extent.stats },
+        { u_slotSeg: this.slotSeg, u_rad: this.radius, u_segSum: this.segments.stats },
+      ];
+      this.reduceUniforms["u_segTableWidth"] = tw;
+      this.pyramid = atlas.levels.length > 0 ? own(new GridPyramid(device, atlas, false)) : null;
+      this.repulsion = own(new RepulsionPass(device, { singleSegment: false, levelCount: atlas.levels.length, exact: true }));
+
+      const links: LayoutGraph = {
+        nodeCount: slots,
+        edgeCount: topo.linkSource.length,
+        source: topo.linkSource,
+        target: topo.linkTarget,
+        springWeight: topo.linkWeight,
+        positions: new Float32Array(0),
+      };
+      this.springs = own(new GpuSprings(device, links, { nested: true }));
+      this.predict = own(new NestedPredictPass(device));
+      this.integratePass = own(new NestedIntegratePass(device, 1 - NESTED.DECAY));
+      this.collision = own(new CollisionGrid(device, width, height, atlas.width >> 1, atlas.height >> 1, largeWidth));
+      this.compose = own(new NestedComposePass(device, topo.nodeSlot, topo.leafCount, topo.depth, NESTED.FILL, NESTED.ONLY_CHILD));
+      this.packed = { framebuffer: this.compose.framebuffer, width: this.compose.width, height: this.compose.height, extraFloats: this.compose.extraFloats };
+
+      this.slotInputs = {
+        count: slots,
+        width,
+        slotSeg: this.slotSeg,
+        segParam: this.segments.param,
+        tableWidth: tw,
+        alphaCold: 1,
+        alphaWarm: WARM_ALPHA,
+      };
+      this.springInputs = { vstar: this.vstar, radius: this.radius, rest: 0, pad: NESTED.PAD };
+      this.gatherInput = {
+        slotSeg: this.slotSeg,
+        segments: this.segments,
+        segLarge: this.segLarge,
+        count: slots,
+        width,
+        rows: height,
+        pad: NESTED.PAD,
+      };
+    } catch (error) {
+      this.destroy();
+      throw error;
     }
-    const [f00, f01, f10, f11] = pp;
-    if (!f00 || !f01 || !f10 || !f11) throw new Error("GpuNestedLayout: missing integrate framebuffer");
-    this.integrateFbos = [[f00, f01], [f10, f11]];
-
-    const tex2 = (): Texture => device.createTexture({ width, height, format: "rg32float", mipLevels: 1, sampler: NEAREST });
-    this.vstar = tex2();
-    this.vstarFbo = device.createFramebuffer({ width, height, colorAttachments: [this.vstar] });
-    this.force = tex2();
-    this.forceFbo = device.createFramebuffer({ width, height, colorAttachments: [this.force] });
-    this.radius = device.createTexture({ width, height, format: "r32float", data: slotData(slots, topo.radius, 1), mipLevels: 1, sampler: NEAREST });
-    const seg = new Uint32Array(width * height);
-    seg.set(slotSegments(segments, slots));
-    this.slotSeg = device.createTexture({ width, height, format: "r32uint", data: seg, mipLevels: 1, sampler: NEAREST });
-
-    this.segments = new SegmentTable(device, rows);
-    const tw = this.segments.width;
-    const th = Math.ceil(rows.length / tw);
-    const nested = new Float32Array(tw * th * 4);
-    for (let s = 0; s < S; s++) {
-      nested[s * 4] = topo.segR9[s] ?? 0;
-      nested[s * 4 + 1] = topo.segOwner[s] ?? -1;
-    }
-    nested[S * 4 + 1] = -1;
-    this.segNested = device.createTexture({ width: tw, height: th, format: "rgba32float", data: nested, mipLevels: 1, sampler: NEAREST });
-    const largeWidth = atlasWidth(2 * rows.length);
-    const largeRows = Math.ceil((2 * rows.length) / largeWidth);
-    const large = new Uint32Array(largeWidth * largeRows * 4).fill(0xffffffff);
-    for (let i = 0; i < S * NESTED_LARGE_MAX; i++) {
-      const slot = topo.segLarge[i] ?? -1;
-      if (slot >= 0) large[i] = slot;
-    }
-    this.segLarge = device.createTexture({ width: largeWidth, height: largeRows, format: "rgba32uint", data: large, mipLevels: 1, sampler: NEAREST });
-    const extentTex = (): Texture => device.createTexture({ width: tw, height: th, format: "rgba32float", mipLevels: 1, sampler: NEAREST });
-    const extentStats = extentTex();
-    const extentBox = extentTex();
-    this.extent = {
-      stats: extentStats,
-      box: extentBox,
-      target: {
-        target: device.createFramebuffer({ width: tw, height: th, colorAttachments: [extentStats, extentBox] }),
-        width: tw,
-        size: rows.length,
-        info: this.segments.info,
-      },
-    };
-
-    this.reduce = new SegmentedReduce(device, slots, NESTED_REDUCE_MAP);
-    this.reduceBindings = [
-      { u_slotSeg: this.slotSeg, u_rad: this.radius, u_segSum: this.extent.stats },
-      { u_slotSeg: this.slotSeg, u_rad: this.radius, u_segSum: this.segments.stats },
-    ];
-    this.reduceUniforms["u_segTableWidth"] = tw;
-    this.pyramid = atlas.levels.length > 0 ? new GridPyramid(device, atlas, false) : null;
-    this.repulsion = new RepulsionPass(device, { singleSegment: false, levelCount: atlas.levels.length, exact: true });
-
-    const links: LayoutGraph = {
-      nodeCount: slots,
-      edgeCount: topo.linkSource.length,
-      source: topo.linkSource,
-      target: topo.linkTarget,
-      springWeight: topo.linkWeight,
-      positions: new Float32Array(0),
-    };
-    this.springs = new GpuSprings(device, links, { nested: true });
-    this.predict = new NestedPredictPass(device);
-    this.integratePass = new NestedIntegratePass(device, 1 - NESTED.DECAY);
-    this.collision = new CollisionGrid(device, width, height, atlas.width >> 1, atlas.height >> 1, largeWidth);
-    this.compose = new NestedComposePass(device, topo.nodeSlot, topo.leafCount, topo.depth, NESTED.FILL, NESTED.ONLY_CHILD);
-    this.packed = { framebuffer: this.compose.framebuffer, width: this.compose.width, height: this.compose.height, extraFloats: this.compose.extraFloats };
-
-    this.slotInputs = {
-      count: slots,
-      width,
-      slotSeg: this.slotSeg,
-      segParam: this.segments.param,
-      tableWidth: tw,
-      alphaCold: 1,
-      alphaWarm: WARM_ALPHA,
-    };
-    this.springInputs = { vstar: this.vstar, radius: this.radius, rest: 0, pad: NESTED.PAD };
-    this.gatherInput = {
-      slotSeg: this.slotSeg,
-      segments: this.segments,
-      segLarge: this.segLarge,
-      count: slots,
-      width,
-      rows: height,
-      pad: NESTED.PAD,
-    };
   }
 
   // ── StreamSolver / ReadbackSource ──────────────────────────────────────────
@@ -586,31 +598,8 @@ export class GpuNestedLayout implements StreamSolver {
   }
 
   destroy(): void {
-    this.pos.destroy();
-    this.vel.destroy();
-    for (const pair of this.integrateFbos) for (const fbo of pair) fbo.destroy();
-    this.posFbos[0].destroy();
-    this.posFbos[1].destroy();
-    this.vstarFbo.destroy();
-    this.vstar.destroy();
-    this.forceFbo.destroy();
-    this.force.destroy();
-    this.radius.destroy();
-    this.slotSeg.destroy();
-    this.segNested.destroy();
-    this.segLarge.destroy();
-    this.extent.target.target.destroy();
-    this.extent.stats.destroy();
-    this.extent.box.destroy();
-    this.segments.destroy();
-    this.reduce.destroy();
-    this.pyramid?.destroy();
-    this.repulsion.destroy();
-    this.springs.destroy();
-    this.predict.destroy();
-    this.integratePass.destroy();
-    this.collision.destroy();
-    this.compose.destroy();
+    for (let i = this.owned.length - 1; i >= 0; i--) this.owned[i]?.destroy();
+    this.owned.length = 0;
   }
 
   // ── Internals ──────────────────────────────────────────────────────────────
