@@ -582,6 +582,10 @@ previous build — while every SwiftShader test stayed green, because SwiftShade
   channels bitwise) and of per-node forces from identical positions against the previous build. The #354
   change is bitwise equal on web-NotreDame and on a 1M-node graph at every checked tick; the SwiftShader
   tests (`flat-equivalence`, `segment-isolation`) cannot see this class of drift.
+- Speed has the same blind spot. ANGLE Metal compiles a loop about 2% slower when its bound comes from a
+  texture fetch or through a function parameter instead of a uniform read in the loop condition (the flat
+  exact loop: 3.26 → 3.33 ms per draw at N = 4096). Time a changed per-node loop on real hardware against
+  the previous build; `repulsion-fs.test.ts` pins the flat exact loop's shape.
 
 ## GPU nested layout: dead passes hide behind complete fallbacks; fence what you time (#355)
 

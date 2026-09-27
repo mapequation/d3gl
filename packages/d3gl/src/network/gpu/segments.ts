@@ -46,12 +46,17 @@ export function bandRows(band: number, bands: number, rows: number): [number, nu
 /**
  * Check that `segments` tile the slots `[0, count)` in order: each starts where the previous one ends
  * (empty segments allowed), and together they cover every slot once. Throws otherwise — the passes
- * find a slot's segment by its position, so a gap or an overlap would silently mix segments.
+ * find a slot's segment by its position, so a gap or an overlap would silently mix segments. Each
+ * count must be a non-negative integer: a negative one would walk the cursor back and let the next
+ * segment start inside an earlier one.
  */
 export function validateSegments(segments: readonly SlotRange[], count: number): void {
   if (segments.length === 0) throw new Error("segments: at least one segment is required");
   let next = 0;
   segments.forEach((seg, s) => {
+    if (!Number.isInteger(seg.count) || seg.count < 0) {
+      throw new Error(`segments: segment ${s} has count ${seg.count}; a count is a non-negative integer`);
+    }
     if (seg.start !== next) {
       throw new Error(`segments: segment ${s} starts at slot ${seg.start}, but slot ${next} is next`);
     }

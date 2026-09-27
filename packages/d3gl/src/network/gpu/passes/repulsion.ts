@@ -207,11 +207,20 @@ vec2 tileRepulsion(vec2 pi, uvec4 info, vec4 b, float repulsion, float eps) {
 
 #ifdef EXACT
 // Exact repulsion from every other slot of the segment, in slot order.
+//
+// With one segment the loop reads its bound from the uniform, in the loop condition itself. The
+// segment's row gives the same range ([0, count), validateSegments), but ANGLE Metal compiles a loop
+// whose bound comes from a texture fetch or a function parameter about 2% slower: 3.26 → 3.33 ms per
+// draw at N = 4096 on an M1 Max (#354). The uniform keeps the flat exact path at its old cost.
 vec2 exactRepulsion(int id, vec2 pi, uvec4 info, float repulsion, float eps) {
+  vec2 acc = vec2(0.0);
+#ifdef SINGLE_SEGMENT
+  for (int j = 0; j < u_count; j++) {
+#else
   int start = int(info.x);
   int end = start + int(info.y);
-  vec2 acc = vec2(0.0);
   for (int j = start; j < end; j++) {
+#endif
     if (j == id) continue;
     vec2 pj = texelFetch(u_pos, slotTexel(j, u_width), 0).xy;
     vec2 d = pi - pj;

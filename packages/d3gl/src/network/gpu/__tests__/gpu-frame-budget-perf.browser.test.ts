@@ -569,7 +569,7 @@ describe("GPU frame budget — pyramid path (per-tick regression tripwire)", () 
     const buildSpy = vi.spyOn(GridPyramid.prototype, "build");
     const spy = vi.spyOn(Model.prototype, "draw");
     const TICKS = 2;
-    let draws: { target: PyramidTexture | "other"; viewport: string }[];
+    let draws: { target: PyramidTexture | "other"; viewport: string; fragments: number }[];
     try {
       layout.runFrame(TICKS);
       const pyramid = buildSpy.mock.contexts[0];
@@ -579,7 +579,10 @@ describe("GPU frame budget — pyramid path (per-tick regression tripwire)", () 
         const views = pass.props.framebuffer?.colorAttachments ?? [];
         const target = names.find((name) => views.some((view) => view.texture === pyramid.textures[name])) ?? "other";
         const vp = pass.props.parameters?.viewport;
-        return { target, viewport: vp ? vp.join(",") : "full" };
+        const fb = pass.props.framebuffer;
+        // What the draw rasterises: its viewport, or the whole attachment without one.
+        const fragments = vp ? (vp[2] ?? 0) * (vp[3] ?? 0) : (fb?.width ?? 0) * (fb?.height ?? 0);
+        return { target, viewport: vp ? vp.join(",") : "full", fragments };
       });
     } finally {
       spy.mockRestore();
@@ -588,14 +591,18 @@ describe("GPU frame budget — pyramid path (per-tick regression tripwire)", () 
     }
 
     const scatters = draws.filter((d) => d.target === "l0");
-    expect(scatters).toEqual(Array.from({ length: TICKS }, () => ({ target: "l0", viewport: "full" })));
+    expect(scatters.map(({ target, viewport }) => ({ target, viewport }))).toEqual(
+      Array.from({ length: TICKS }, () => ({ target: "l0", viewport: "full" })),
+    );
     const reduces = draws.filter((d) => d.target === "odd" || d.target === "even");
     const expected = atlas.levels.slice(1).map((lvl) => ({
       target: lvl.texture,
       viewport: [lvl.x, lvl.y, lvl.width, lvl.height].join(","),
     }));
-    expect(reduces).toEqual([...expected, ...expected]);
-    const fragments = atlas.levels.slice(1).reduce((n, lvl) => n + lvl.width * lvl.height, 0);
-    expect(fragments).toBeLessThan((atlas.width * atlas.height) / 3);
+    expect(reduces.map(({ target, viewport }) => ({ target, viewport }))).toEqual([...expected, ...expected]);
+    // The reduces of one tick rasterise Σ_{ℓ≥1} (A>>ℓ)(H>>ℓ) < A·H/3 fragments, counted from the draws'
+    // own viewports: independent of packTiles, so a level layout that grew its rectangles fails here.
+    const fragmentsPerTick = reduces.reduce((n, d) => n + d.fragments, 0) / TICKS;
+    expect(fragmentsPerTick).toBeLessThan((atlas.width * atlas.height) / 3);
   });
 });
