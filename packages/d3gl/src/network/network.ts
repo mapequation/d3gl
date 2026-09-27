@@ -1744,11 +1744,12 @@ export class Network extends BaseEngine {
   /**
    * The module tree, for a consumer that can wait for it (#428): the cached tree, or a promise of one
    * built on a worker — this starts the build unless one is under way — so the main thread never blocks
-   * on the O(nodes · depth + edges · depth) build; its share is flattening the records (at 325k nodes ≈10 ms
-   * warm, ≈35 ms cold in a browser) and copying the edge buffers into the message. The tree lands in the cache and repaints a
-   * cut that draws it. `undefined` without a hierarchy. An explicit `lod({ modules })` is checked here,
-   * synchronously, where a main-thread build would have thrown; without a worker the tree is built on
-   * the main thread after all.
+   * on the O(nodes · depth + edges · depth) build. Its share is flattening the records, O(nodes + total path
+   * length), and copying the edge buffers into the message, O(edges): at 325k nodes / 1.5M edges 39-43 ms
+   * in a production browser build (flattening alone ≈9 ms in Node, warm). The tree lands in the cache and
+   * repaints a cut that draws it. `undefined` without a hierarchy. An explicit `lod({ modules })` is checked
+   * here, synchronously, where a main-thread build would have thrown. Where no worker can be created the
+   * tree is built here and returned synchronously, so the consumer runs as it did before #428.
    */
   private moduleTreeLater(): LODTree | Promise<LODTree> | undefined {
     const graph = this.graph;
@@ -1759,9 +1760,12 @@ export class Network extends BaseEngine {
     if (running && this.isCurrentModuleTree(running)) return running.tree;
     this.cancelModuleTreeJob();
     const { modules, moduleLinks } = source;
-    const records = flattenModuleRecords(graph.nodeCount, modules); // checks the records, as the build would
-    if (moduleLinks?.length && !source.checked) checkModuleLinks(graph.nodeCount, modules, moduleLinks, "buildModuleLODTree");
-    const build = buildModuleTopologyOffThread(graph.nodeCount, records, graph, moduleLinks?.length ? flattenModuleLinks(moduleLinks) : undefined);
+    const build = buildModuleTopologyOffThread(graph.nodeCount, () => {
+      const records = flattenModuleRecords(graph.nodeCount, modules); // checks the records, as the build would
+      if (moduleLinks?.length && !source.checked) checkModuleLinks(graph.nodeCount, modules, moduleLinks, "buildModuleLODTree");
+      return { records, links: moduleLinks?.length ? flattenModuleLinks(moduleLinks) : undefined };
+    }, graph);
+    if (!build) return this.moduleTree(); // no worker to wait for: build it now
     let settle: (tree: LODTree) => void = () => {};
     const tree = new Promise<LODTree>((resolve) => {
       settle = resolve;

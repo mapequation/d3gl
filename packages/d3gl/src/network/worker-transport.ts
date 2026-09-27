@@ -137,21 +137,30 @@ const NOOP_DRAG = { pin() {}, unpin() {} };
  * A handle for a layout that can start only once `ready` resolves (#428) — a nested layout waiting for
  * its module tree to be built off the main thread. `start` runs then, unless the handle was stopped
  * first; `settled` resolves when the started run settles, at once if `start` declines (returns null),
- * or on {@link WorkerLayoutHandle.stop}. Pins reach the run once it is live.
+ * or on {@link WorkerLayoutHandle.stop}. It rejects with the error if `start` throws, or if the run's
+ * own `settled` rejects, so `whenSettled()` reports a failed start instead of never settling. Pins reach
+ * the run once it is live.
  */
 export function deferredLayoutHandle<T>(ready: Promise<T>, start: (value: T) => WorkerLayoutHandle | null): WorkerLayoutHandle {
   let run: WorkerLayoutHandle | null = null;
   let stopped = false;
   let resolveSettled: () => void = () => {};
-  const settled = new Promise<void>((resolve) => {
+  let rejectSettled: (error: unknown) => void = () => {};
+  const settled = new Promise<void>((resolve, reject) => {
     resolveSettled = resolve;
+    rejectSettled = reject;
   });
   void ready.then((value) => {
     if (stopped) return;
-    run = start(value);
-    if (run) void run.settled.then(resolveSettled);
+    try {
+      run = start(value);
+    } catch (error) {
+      rejectSettled(error);
+      return;
+    }
+    if (run) run.settled.then(resolveSettled, rejectSettled);
     else resolveSettled();
-  });
+  }, rejectSettled);
   return {
     shared: false,
     settled,
@@ -180,33 +189,39 @@ export function deferredLayoutHandle<T>(ready: Promise<T>, start: (value: T) => 
 
 /** A module tree being built on a worker ({@link buildModuleTopologyOffThread}). */
 export interface ModuleTopologyJob {
-  /** The built topology — or null when no worker could build it (none available, or it failed), so the
-   *  caller builds it itself. Never settles once {@link cancel}led. */
+  /** The built topology — or null when the worker failed (an error, or a message that could not be
+   *  deserialized), so the caller builds it itself. Never settles once {@link cancel}led. */
   topology: Promise<LODTopology | null>;
   /** Stop the build and tear its worker down. */
   cancel(): void;
 }
 
+/** What {@link buildModuleTopologyOffThread} posts: the flat records and, when there are any, module links. */
+export interface ModuleTopologyInput {
+  records: FlatModuleRecords;
+  links?: FlatModuleLinks;
+}
+
 /**
  * Build a module hierarchy's {@link LODTopology} on a Web Worker (#428), off the main thread — what
- * `buildModuleTopology(nodeCount, records, edges, links)` computes. `records` and `links` are
- * **transferred** (the caller flattened them for this and must not use them afterwards); the edge buffers
- * are copied, so the graph keeps its own. The main thread's share is that copy and the post; the tree's
- * buffers come back transferred, so receiving it costs no copy either.
+ * `buildModuleTopology(nodeCount, records, edges, links)` computes. Returns null, having run nothing, when
+ * no worker can be created (no `Worker`, or its construction throws): the caller builds the tree itself,
+ * synchronously. Otherwise `input` runs once the worker exists; its records and links are **transferred**
+ * (the caller flattens them for this and must not use them afterwards), and the edge buffers are copied,
+ * so the graph keeps its own. The main thread's share is that copy and the post; the tree's buffers come
+ * back transferred, so receiving it costs no copy either.
  */
 export function buildModuleTopologyOffThread(
   nodeCount: number,
-  records: FlatModuleRecords,
+  input: () => ModuleTopologyInput,
   edges: { source: Uint32Array; target: Uint32Array; weight: Float32Array },
-  links?: FlatModuleLinks,
-): ModuleTopologyJob {
-  const none: ModuleTopologyJob = { topology: Promise.resolve(null), cancel() {} };
-  if (typeof Worker === "undefined") return none;
+): ModuleTopologyJob | null {
+  if (typeof Worker === "undefined") return null;
   let worker: Worker;
   try {
     worker = new Worker(new URL("./layout-worker.js", import.meta.url), { type: "module" });
   } catch {
-    return none;
+    return null;
   }
   let resolveTopology: (topology: LODTopology | null) => void = () => {};
   const topology = new Promise<LODTopology | null>((resolve) => {
@@ -216,6 +231,12 @@ export function buildModuleTopologyOffThread(
     worker.terminate();
     worker.onmessage = null;
     worker.onerror = null;
+    worker.onmessageerror = null;
+  };
+  /** The worker cannot deliver the tree: tear it down and let the caller build it. */
+  const fail = (): void => {
+    cancel();
+    resolveTopology(null);
   };
   worker.onmessage = (e: MessageEvent<WorkerToMain>): void => {
     const msg = e.data;
@@ -223,10 +244,16 @@ export function buildModuleTopologyOffThread(
     cancel();
     resolveTopology(msg.topology);
   };
-  worker.onerror = (): void => {
-    cancel();
-    resolveTopology(null);
-  };
+  worker.onerror = fail;
+  worker.onmessageerror = fail; // the tree arrived but could not be deserialized
+  let payload: ModuleTopologyInput;
+  try {
+    payload = input();
+  } catch (error) {
+    cancel(); // invalid records: no build, and no worker left behind
+    throw error;
+  }
+  const { records, links } = payload;
   const message: MainToWorker = { type: "build-module-tree", nodeCount, records, links, source: edges.source, target: edges.target, weight: edges.weight };
   worker.postMessage(message, transferList([records.id, records.offset, records.entries, links?.sourceOffset, links?.source, links?.targetOffset, links?.target, links?.flow]));
   return { topology, cancel };

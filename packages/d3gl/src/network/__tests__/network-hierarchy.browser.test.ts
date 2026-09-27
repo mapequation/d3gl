@@ -393,6 +393,9 @@ describe("the module tree is built off the main thread (#428)", () => {
       const expected = expectedNested(g, MODULES);
       builds.count = 0;
       net.data(g, { modules: MODULES }).lod({}).layout({ backend: "worker", nested: true });
+      // Solved in place, as before #428: nothing waits for a worker that cannot exist.
+      expect(builds.count).toBe(1);
+      expect(Array.from(g.positions)).toEqual(expected);
       await net.whenSettled();
       await frame();
       expect(builds.count).toBe(1);
