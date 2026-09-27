@@ -579,10 +579,10 @@ fences the frame, and harvests with `getBufferSubData` once that fence has signa
   bounded by log2(peak / first). T7 counts a creation inside a lane's `update` as a grow and requires it to
   double. (2) The main thread builds the LOD tree on a GPU frame, and the cut draws nothing until the tree
   has geometry. So the lanes register with the tree, many frames after the stream's first repaint (frame
-  140 of ~550 under Rosetta). T7 starts counting at the first repaint with `lodSource !== "none"`. (3) A
-  stream leg inherited the drag leg's k = 4 zoom. There, links entered the view mid-run, and a change of
-  the lane's layer set re-registers every layer (`emitInstancedLane` keeps the z-order that way). Each
-  stream leg now starts at the whole-graph view.
+  140 of ~550 under Rosetta). T7 starts counting at the first repaint with `lodSource !== "none"`. (3) The LOD
+  stream leg inherited the LOD-off drag's k = 4 zoom. There, links entered the view mid-run, and a change of
+  the lane's layer set re-registers every layer (`emitInstancedLane` keeps the z-order that way). Each T7
+  half now runs its stream leg first, on its own engine; a stream leg after a drag sets its view.
 
 ## Host sizing: backend canvases are OUT OF FLOW (#39, re-confirmed in #273)
 

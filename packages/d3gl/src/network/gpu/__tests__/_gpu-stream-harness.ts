@@ -195,8 +195,9 @@ interface Leg {
 }
 
 /**
- * Run one GPU layout on `net` over `graph` at the whole-graph view (both legs alike, whatever view a
- * drag leg left behind), recording every streamed frame and the GL call log.
+ * Run one GPU layout on `net` over `graph` at the current view, recording every streamed frame and the GL
+ * call log. A leg that follows a drag must set its view first: at the drag's k = 4 zoom the cut's layer set
+ * changes as links enter the view, and each change re-registers the lane's layers.
  */
 async function streamLeg(net: Network, graph: NetworkGraph, lod: boolean): Promise<Leg> {
   const frames: GpuFrameSample[] = [];
@@ -210,7 +211,6 @@ async function streamLeg(net: Network, graph: NetworkGraph, lod: boolean): Promi
   });
   const t0 = performance.now();
   try {
-    net.setTransform({ k: 1, x: 0, y: 0 });
     net.data(graph).lod(lod ? { source: "structure", declutter: true, superEdges: true } : false);
     net.layout({ backend: "gpu", iterations: ITERATIONS });
     await net.whenSettled();
@@ -597,6 +597,8 @@ export function describeGpuStream(half: StreamHalf): void {
       net?.destroy();
       host?.remove();
     });
+
+    // Each half's stream leg runs first, on its own engine at its initial view (k = 1), before any drag.
 
     // Calibrated at LOCAL_N (see the PR's Performance section for the measured numbers). The transport's
     // own main-thread work per frame is a fence poll, a memcpy of 8 B per node on harvest frames, and at
