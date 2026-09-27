@@ -252,8 +252,9 @@ export interface LODTree extends LODTopology {
    * screen — each drawn at its own radius (`sizeMode` units: constant px, or world units × k) and never
    * smaller than half a pixel. The cut opens an aggregate once the view is zoomed past it, whatever its
    * footprint, so an aggregate is drawn only where its members would overlap. Exact up to the zoom at which
-   * the aggregate's footprint reaches the expand threshold — past that the footprint rule opens it anyway,
-   * so the pass stores `Infinity` there (see {@link computeLODCrowding}). `Infinity` too for members that
+   * the aggregate's footprint — or an ancestor's, whichever comes later — reaches the expand threshold: past
+   * that the footprint rule opens it anyway, so the pass stores `Infinity` there (see
+   * {@link computeLODCrowding}). `Infinity` too for members that
    * never part (coincident, or world discs that overlap) and until a crowding pass has run: then only the
    * footprint rule opens the node. Leaves hold `0`.
    */
@@ -1746,16 +1747,21 @@ function clearReachOf(z: number, a: number, b: number, screen: boolean): number 
 }
 
 /**
- * Reusable working storage for {@link computeLODCrowding} (#426): each aggregate's members' box and largest
- * radius, the dual walk's pair stack, and one node's children gathered for the sweep — grown on demand to the
- * largest tree seen, so a pass run per streamed frame allocates nothing once warm. About 20 B per aggregate
- * plus 44 B per child of the widest node.
+ * Reusable working storage for {@link computeLODCrowding} (#426): each aggregate's members' box, largest
+ * radius and horizon extent, the dual walk's pair stack, and one node's children gathered for the sweep —
+ * grown on demand to the largest tree seen, so a pass run per streamed frame allocates nothing once warm.
+ * About 24 B per aggregate plus 44 B per child of the widest node.
  */
 export interface LODCrowdingScratch {
   /** Per aggregate `o = g − leafCount`: its members' box, `[minX, minY, maxX, maxY]` at `4o`. */
   box: Float32Array;
   /** Per aggregate: its members' largest effective radius (screen radii floored at ½). */
   rmax: Float32Array;
+  /**
+   * Per aggregate: the least extent on its path to the root — the one whose horizon comes last, up to which
+   * its clear zoom must be exact (`Infinity`: none needed, see {@link computeLODCrowding}).
+   */
+  lo: Float32Array;
   /** The dual walk's stack of node pairs. */
   pairA: Uint32Array;
   pairB: Uint32Array;
@@ -1776,7 +1782,7 @@ export interface LODCrowdingScratch {
 export function makeLODCrowdingScratch(): LODCrowdingScratch {
   const k = 16;
   return {
-    box: new Float32Array(0), rmax: new Float32Array(0), pairA: new Uint32Array(64), pairB: new Uint32Array(64),
+    box: new Float32Array(0), rmax: new Float32Array(0), lo: new Float32Array(0), pairA: new Uint32Array(64), pairB: new Uint32Array(64),
     kid: new Uint32Array(k), kx0: new Float64Array(k), ky0: new Float64Array(k), kx1: new Float64Array(k), ky1: new Float64Array(k), kr: new Float64Array(k), order: new Uint32Array(k),
   };
 }
@@ -1860,15 +1866,26 @@ function sortByKey(order: Uint32Array, key: Float64Array, n: number): void {
  * bottom-up: a node starts from its children's values — any pair inside one child — and adds the pairs
  * across its children with a sweep over the children's boxes and a dual walk down both subtrees, pruned
  * by the box distance and each subtree's largest radius against the value so far. A node whose value
- * reaches the zoom at which its footprint hits `opts.expandPx` stops there and stores `Infinity`: the
- * footprint rule opens it first, so its exact value can never matter. That horizon is what keeps the pass
- * cheap on dense layouts — a crowded node stops at its first children — while every node a view could
- * open by overlap is exact.
+ * reaches its **horizon** stops there and stores `Infinity`. The horizon is the zoom at which the node's
+ * footprint hits `opts.expandPx` — the footprint rule opens it first, so its exact value cannot matter past
+ * it — or, when later, an ancestor's: an ancestor starts from its children's values, and extents need not
+ * grow up the tree (a clump with one far member reaches farther from its centroid than its parent's members
+ * do from theirs). So each node is exact up to `expandPx / (2·e)`, `e` the least extent on its path to the
+ * root — at most twice its own horizon, since an ancestor's extent is at least half a descendant's (both
+ * bound the descendant's members, whose box the ancestor's contains; a nested layout's discs nest too). That
+ * horizon is what keeps the pass cheap on dense layouts — a crowded node stops at its first children — while
+ * every node a view could open by overlap is exact. A node whose extent is not finite (a member with a
+ * non-finite position) needs none: the cut never opens a node whose footprint is NaN. Such a member forms no
+ * pair anywhere.
  *
  * Run it after the position pass and the style pass, whenever either changes (a style change moves the
  * radii). O(tree size) for the boxes plus the pairs the sweep and the walks cannot prune — every pair of a
  * bottom cell that is not yet crowded, and the members near the borders between siblings. With `scratch`
  * ({@link makeLODCrowdingScratch}) a pass allocates nothing once warm.
+ *
+ * Worst case: the sweep prunes along one axis, so a node with `m` children spread evenly (a module on a
+ * lattice or a packed disc) visits about `√m` of them per child — O(m·√m) — until its value reaches its
+ * horizon, which bounds that window to about `expandPx / (2ρ)` children, `ρ` the smallest glyph radius.
  */
 export function computeLODCrowding(tree: LODCrowdingTree, opts: CrowdingOptions, scratch?: LODCrowdingScratch): void {
   lodCrowdingPasses++;
@@ -1880,15 +1897,35 @@ export function computeLODCrowding(tree: LODCrowdingTree, opts: CrowdingOptions,
   if (sc.rmax.length < cells) {
     sc.box = new Float32Array(4 * cells);
     sc.rmax = new Float32Array(cells);
+    sc.lo = new Float32Array(cells);
   }
   const box = sc.box;
   const rmax = sc.rmax;
+  const lo = sc.lo;
   // A glyph covers at least half a pixel: floor screen radii once here; world radii scale with the zoom.
   const eff = (i: number): number => {
     const r = radius[i]!;
     return screen ? (r > MIN_SCREEN_RADIUS ? r : MIN_SCREEN_RADIUS) : r > 0 ? r : 0;
   };
   for (let i = 0; i < leafCount; i++) clearZoom[i] = 0; // a leaf has no two members
+
+  // Each node's horizon extent, top-down: the least extent on its path to the root (see the doc above). A
+  // non-finite extent asks for no horizon (`Infinity`: cap 0), so it never widens a descendant's.
+  for (let g = leafCount; g < size; g++) {
+    const e = extent[g] ?? NaN;
+    lo[g - leafCount] = e >= 0 ? e : Infinity;
+  }
+  for (let k = levelCount - 1; k >= 1; k--) {
+    const end = levelOffset[k + 1] ?? 0;
+    for (let g = levelOffset[k] ?? 0; g < end; g++) {
+      const m = lo[g - leafCount] ?? Infinity;
+      const last = childOffset[g + 1] ?? 0;
+      for (let p = childOffset[g] ?? 0; p < last; p++) {
+        const o = (children[p] ?? 0) - leafCount;
+        if (o >= 0 && (lo[o] ?? 0) > m) lo[o] = m;
+      }
+    }
+  }
 
   // The largest pair zoom across `a` and `b`'s members above `beta`, stopping at `cap` (a dual walk).
   const dual = (a: number, b: number, beta: number, cap: number): number => {
@@ -1952,10 +1989,10 @@ export function computeLODCrowding(tree: LODCrowdingTree, opts: CrowdingOptions,
       let y1 = -Infinity;
       let rm = 0;
       let beta = 0; // the largest pair zoom inside any one child
+      let swept = 0; // children in the sweep: a leaf with a non-finite position forms no pair, so it stays out
       for (let j = 0; j < n; j++) {
         const c = children[c0 + j]!;
         kid[j] = c;
-        order[j] = j;
         if (c < leafCount) {
           const x = cx[c]!;
           const y = cy[c]!;
@@ -1964,6 +2001,8 @@ export function computeLODCrowding(tree: LODCrowdingTree, opts: CrowdingOptions,
           ky0[j] = y;
           ky1[j] = y;
           kr[j] = eff(c);
+          // A NaN sort key would stall the sort, and the sweep's early break would then skip real pairs.
+          if (Number.isFinite(x) && Number.isFinite(y)) order[swept++] = j;
         } else {
           const o = 4 * (c - leafCount);
           kx0[j] = box[o]!;
@@ -1972,6 +2011,7 @@ export function computeLODCrowding(tree: LODCrowdingTree, opts: CrowdingOptions,
           ky1[j] = box[o + 3]!;
           kr[j] = rmax[c - leafCount]!;
           if (clearZoom[c]! > beta) beta = clearZoom[c]!;
+          order[swept++] = j;
         }
         if (kx0[j]! < x0) x0 = kx0[j]!;
         if (ky0[j]! < y0) y0 = ky0[j]!;
@@ -1985,14 +2025,15 @@ export function computeLODCrowding(tree: LODCrowdingTree, opts: CrowdingOptions,
       box[4 * og + 2] = x1;
       box[4 * og + 3] = y1;
       rmax[og] = rm;
-      // The horizon: the zoom at which the footprint (2·extent·k) reaches expandPx and opens the node anyway.
-      const e = extent[g]!;
-      const cap = e > 0 ? horizon / (2 * e) : Infinity;
-      if (beta < cap && n > 1) {
+      // The horizon: the zoom at which the footprint (2·extent·k) of this node, or of the ancestor whose comes
+      // last, reaches expandPx — past it the footprint rule opens them anyway.
+      const e = lo[og] ?? Infinity;
+      const cap = e === Infinity ? 0 : e > 0 ? horizon / (2 * e) : Infinity;
+      if (beta < cap && swept > 1) {
         // Sweep the children by their box's left edge: a pair whose horizontal gap alone is past the reach
         // at which even the largest radii could beat beta is skipped, and so is every later one.
-        sortByKey(order, kx0, n);
-        for (let a = 0; a < n && beta < cap; a++) {
+        sortByKey(order, kx0, swept);
+        for (let a = 0; a < swept && beta < cap; a++) {
           const ja = order[a]!;
           const A = kid[ja]!;
           const aLeaf = A < leafCount;
@@ -2001,7 +2042,7 @@ export function computeLODCrowding(tree: LODCrowdingTree, opts: CrowdingOptions,
           const right = kx1[ja]!;
           const rA = kr[ja]!;
           let reach = clearReachOf(beta, rA, rm, screen);
-          for (let b = a + 1; b < n && beta < cap; b++) {
+          for (let b = a + 1; b < swept && beta < cap; b++) {
             const jb = order[b]!;
             if (kx0[jb]! - right >= reach) break;
             const B = kid[jb]!;
