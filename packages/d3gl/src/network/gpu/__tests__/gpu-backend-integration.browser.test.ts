@@ -380,7 +380,7 @@ describe("backend:'auto' (#375)", () => {
     await net.whenSettled();
     expect(net.layoutTransport).toBe("gpu");
     expect(workerStarts(posts)).toHaveLength(0); // no worker run
-    expect(net.lodSource).toBe("main"); // what backend:"gpu" does today (PR 3c moves the tree off main)
+    expect(net.lodSource).toBe("worker"); // as backend:"gpu": its LOD worker streams the tree (#377)
     expect(fallbackWarnings(warn)).toHaveLength(0);
     net.destroy();
   });
