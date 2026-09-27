@@ -19,6 +19,14 @@ export interface SpringVariant {
   hubs: boolean;
   /** Per-entry spring weights (`LayoutGraph.springWeight`): multiply each term by its weight. */
   weighted: boolean;
+  /**
+   * The nested layout's springs (#355, spec §11.1) instead of the flat zero-rest linear ones: each term
+   * reads the **predictor** positions `pos + v*` and the discs' radii, and is the CPU nested solve's link
+   * correction without its `0.5 · alpha` (the integrate pass applies that): `w · max(0, d − rest) / d ·
+   * m_j / (m_i + m_j) · (p_j − p_i)`, with `m = radius²` (the smaller disc moves more) and `rest = 0` in the
+   * organise phase or `(r_i + r_j) · PAD` in the compact phase. Needs `weighted`.
+   */
+  nested?: boolean;
 }
 
 /** `#version` line plus the variant's defines — the one place a variant reaches GLSL. */
@@ -26,15 +34,18 @@ function header(variant: SpringVariant): string {
   return (
     `#version 300 es\n#define SPRING_CHUNK ${SPRING_CHUNK}u\n#define HUB_CHUNK ${HUB_CHUNK}u\n` +
     (variant.hubs ? "#define HUB_CHUNKS\n" : "") +
-    (variant.weighted ? "#define WEIGHTED_SPRINGS\n" : "")
+    (variant.weighted ? "#define WEIGHTED_SPRINGS\n" : "") +
+    (variant.nested ? "#define NESTED_SPRINGS\n" : "")
   );
 }
 
 /**
  * GLSL shared by the row gather and the chunk pass: the uniforms and samplers that address the CSR and
- * the positions, and `springTerm(p, pi)` — CSR entry `p`'s spring term `w · (pos[j] − pos[i])`. Both
- * passes sum the same terms in the same (CSR) order, so a hub's chunked sum and a short row's direct sum
- * are the same computation split at different places.
+ * the positions, `nodeOf(j)` — slot j's position (the predictor `pos + v*` and its radius on the nested
+ * variant) — and `springTerm(p, me)`, CSR entry `p`'s spring term on node `me`: `w · (pos[j] − pos[i])`
+ * flat, the nested link correction on the nested variant ({@link SpringVariant.nested}). Both passes sum
+ * the same terms in the same (CSR) order, so a hub's chunked sum and a short row's direct sum are the same
+ * computation split at different places.
  */
 const CSR_GLSL = /* glsl */ `\
 precision highp float;
@@ -46,6 +57,12 @@ uniform usampler2D u_neighbors;
 #ifdef WEIGHTED_SPRINGS
 uniform sampler2D  u_weights; // parallel to u_neighbors, same atlas width
 #endif
+#ifdef NESTED_SPRINGS
+uniform sampler2D  u_vstar;   // the predictor velocity v*: the springs read pos + v*
+uniform sampler2D  u_rad;     // disc radius per slot
+uniform float u_rest;         // 0: zero-rest springs (organise); 1: rest (r_i + r_j) · PAD (compact)
+uniform float u_pad;          // collision spacing PAD
+#endif
 uniform int u_width;
 uniform int u_nbr_width;
 
@@ -53,13 +70,29 @@ ${SLOT_TEXEL_GLSL}
 ivec2 nbrCoord(uint p) {
   return ivec2(int(p) % u_nbr_width, int(p) / u_nbr_width);
 }
-vec2 posOf(uint j) {
-  return texelFetch(u_pos, slotTexel(int(j), u_width), 0).xy;
+struct Node { vec2 p; float r; };
+Node nodeOf(uint j) {
+  ivec2 t = slotTexel(int(j), u_width);
+#ifdef NESTED_SPRINGS
+  return Node(texelFetch(u_pos, t, 0).xy + texelFetch(u_vstar, t, 0).xy, texelFetch(u_rad, t, 0).r);
+#else
+  return Node(texelFetch(u_pos, t, 0).xy, 0.0);
+#endif
 }
-vec2 springTerm(uint p, vec2 pi) {
+vec2 springTerm(uint p, Node me) {
   ivec2 nc = nbrCoord(p);
-  vec2 d = posOf(texelFetch(u_neighbors, nc, 0).r) - pi;
-#ifdef WEIGHTED_SPRINGS
+  Node other = nodeOf(texelFetch(u_neighbors, nc, 0).r);
+  vec2 d = other.p - me.p;
+#ifdef NESTED_SPRINGS
+  // nested-layout.ts solveModule: d = |Δ| || 1e-9; f = max(0, d − rest) / d (· alpha · w · 0.5, applied
+  // later); the endpoint gets the partner's share m_j / (m_i + m_j) of the correction.
+  float len = length(d);
+  if (!(len > 0.0)) len = 1e-9;
+  float rest = u_rest * (me.r + other.r) * u_pad;
+  float mi = me.r * me.r;
+  float mj = other.r * other.r;
+  return texelFetch(u_weights, nc, 0).r * (max(0.0, len - rest) / len) * (mj / (mi + mj)) * d;
+#elif defined(WEIGHTED_SPRINGS)
   return texelFetch(u_weights, nc, 0).r * d;
 #else
   return d;
@@ -141,9 +174,9 @@ void main() {
   }
 #endif
 
-  vec2 pi = texelFetch(u_pos, c, 0).xy;
+  Node me = nodeOf(uint(id));
   for (uint p = start; p < end; p++) {
-    f += springTerm(p, pi);
+    f += springTerm(p, me);
   }
   o_force = u_attraction * f;
 }
@@ -167,10 +200,10 @@ void main() {
   int k = c.y * u_chunk_width + c.x;
   if (k >= u_chunk_count) { o_partial = vec2(0.0); return; }
   uvec4 chunk = texelFetch(u_chunks, c, 0);
-  vec2 pi = posOf(chunk.r);
+  Node me = nodeOf(chunk.r);
   vec2 f = vec2(0.0);
   for (uint p = chunk.g; p < chunk.b; p++) {
-    f += springTerm(p, pi);
+    f += springTerm(p, me);
   }
   o_partial = f;
 }
@@ -183,6 +216,27 @@ export interface AttractionUniforms {
   offWidth: number;
   nbrWidth: number;
   attraction: number;
+}
+
+/** The nested variant's extra inputs ({@link SpringVariant.nested}). */
+export interface NestedSpringInputs {
+  /** The predictor velocity v* (`rg32float`, slot atlas): the springs read `pos + v*`. */
+  vstar: Texture;
+  /** Disc radius per slot (`r32float`, slot atlas). */
+  radius: Texture;
+  /** 0 in the organise phase (zero-rest springs), 1 in the compact phase (rest `(r_i + r_j) · PAD`). */
+  rest: number;
+  /** The collision spacing PAD. */
+  pad: number;
+}
+
+/** Bind the nested variant's inputs (only called on a nested variant). */
+function bindNested(uniforms: PassUniforms, bindings: Record<string, Texture>, nested: NestedSpringInputs | undefined): void {
+  if (!nested) throw new Error("nested springs: the nested variant needs its predictor and radius inputs");
+  uniforms["u_rest"] = nested.rest;
+  uniforms["u_pad"] = nested.pad;
+  bindings["u_vstar"] = nested.vstar;
+  bindings["u_rad"] = nested.radius;
 }
 
 /** The CSR textures both spring passes read. `weights` is bound only on a weighted variant. */
@@ -219,6 +273,7 @@ export class AttractionPass {
   private readonly variant: SpringVariant;
 
   constructor(device: Device, variant: SpringVariant) {
+    if (variant.nested && !variant.weighted) throw new Error("AttractionPass: nested springs need per-link weights");
     this.variant = variant;
     this.uniforms = {
       u_count: 0,
@@ -227,6 +282,7 @@ export class AttractionPass {
       u_nbr_width: 1,
       u_attraction: 0,
       ...(variant.hubs ? { u_chunk_count: 0, u_chunk_width: 1 } : {}),
+      ...(variant.nested ? { u_rest: 0, u_pad: 1 } : {}),
     };
     // Additive blend: dst += src, so the force passes accumulate into one texture.
     this.model = fullScreenModel(device, header(variant) + ROW_FS, this.uniforms, ADDITIVE_BLEND);
@@ -242,6 +298,7 @@ export class AttractionPass {
     csr: CsrTextures,
     hubs: HubChunkTextures | null,
     u: AttractionUniforms,
+    nested?: NestedSpringInputs,
   ): void {
     this.uniforms["u_count"] = u.count;
     this.uniforms["u_width"] = u.width;
@@ -261,6 +318,7 @@ export class AttractionPass {
       bindings["u_chunks"] = hubs.chunks;
       bindings["u_partials"] = hubs.partials;
     }
+    if (this.variant.nested) bindNested(this.uniforms, bindings, nested);
     this.model.setBindings(bindings);
 
     this.model.draw(pass);
@@ -288,15 +346,22 @@ export class HubChunkPass {
   private readonly model: Model;
   private readonly uniforms: PassUniforms;
   private readonly weighted: boolean;
+  private readonly nested: boolean;
 
-  constructor(device: Device, variant: Pick<SpringVariant, "weighted">) {
+  constructor(device: Device, variant: Pick<SpringVariant, "weighted" | "nested">) {
     this.weighted = variant.weighted;
-    this.uniforms = { u_width: 1, u_nbr_width: 1, u_chunk_count: 0, u_chunk_width: 1 };
-    this.model = fullScreenModel(device, header({ hubs: true, weighted: variant.weighted }) + CHUNK_FS, this.uniforms, NO_BLEND);
+    this.nested = variant.nested === true;
+    this.uniforms = { u_width: 1, u_nbr_width: 1, u_chunk_count: 0, u_chunk_width: 1, ...(this.nested ? { u_rest: 0, u_pad: 1 } : {}) };
+    this.model = fullScreenModel(
+      device,
+      header({ hubs: true, weighted: variant.weighted, nested: this.nested }) + CHUNK_FS,
+      this.uniforms,
+      NO_BLEND,
+    );
   }
 
   /** Draw the chunk sums into an already-open render pass on the partials framebuffer. */
-  run(pass: RenderPass, posTex: Texture, csr: CsrTextures, hubs: HubChunkTextures, u: HubChunkUniforms): void {
+  run(pass: RenderPass, posTex: Texture, csr: CsrTextures, hubs: HubChunkTextures, u: HubChunkUniforms, nested?: NestedSpringInputs): void {
     this.uniforms["u_width"] = u.width;
     this.uniforms["u_nbr_width"] = u.nbrWidth;
     this.uniforms["u_chunk_count"] = hubs.count;
@@ -307,6 +372,7 @@ export class HubChunkPass {
       u_chunks: hubs.chunks,
     };
     if (this.weighted && csr.weights) bindings["u_weights"] = csr.weights;
+    if (this.nested) bindNested(this.uniforms, bindings, nested);
     this.model.setBindings(bindings);
     this.model.draw(pass);
   }

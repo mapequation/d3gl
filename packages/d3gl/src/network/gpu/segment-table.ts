@@ -1,5 +1,5 @@
 import type { Device, Framebuffer, SamplerProps, Texture } from "@luma.gl/core";
-import { SEGMENT_HAS_TILE, segmentInfo, type SlotRange, type Tile } from "./segments.js";
+import { SEGMENT_FROZEN, SEGMENT_HAS_TILE, segmentInfo, type SlotRange, type Tile } from "./segments.js";
 import { atlasWidth } from "./textures.js";
 
 /** Per-segment force parameters — the `segParam` texel, constant for a topology. */
@@ -18,6 +18,8 @@ export interface SegmentParam {
 export interface SegmentRow extends SlotRange {
   readonly tile: Tile | null;
   readonly param: SegmentParam;
+  /** A nested segment of one child ({@link SEGMENT_FROZEN}, #355). Default `false`. */
+  readonly frozen?: boolean;
 }
 
 const NEAREST: SamplerProps = { minFilter: "nearest", magFilter: "nearest" };
@@ -64,7 +66,7 @@ export class SegmentTable {
     const info = new Uint32Array(width * height * 4);
     const params = new Float32Array(width * height * 4);
     rows.forEach((row, s) => {
-      info.set(segmentInfo(row, row.tile), s * 4);
+      info.set(segmentInfo(row, row.tile, row.frozen === true), s * 4);
       params[s * 4] = row.param.repulsion;
       params[s * 4 + 1] = row.param.centering;
       params[s * 4 + 2] = row.param.softening;
@@ -92,7 +94,10 @@ export class SegmentTable {
  * pays nothing for segments), plus the `segInfo` flag the passes branch on ({@link SEGMENT_HAS_TILE}).
  */
 export function segmentDefines(singleSegment: boolean): string {
-  return `${singleSegment ? "#define SINGLE_SEGMENT\n" : ""}#define SEGMENT_HAS_TILE ${SEGMENT_HAS_TILE}u\n`;
+  return (
+    `${singleSegment ? "#define SINGLE_SEGMENT\n" : ""}#define SEGMENT_HAS_TILE ${SEGMENT_HAS_TILE}u\n` +
+    `#define SEGMENT_FROZEN ${SEGMENT_FROZEN}u\n`
+  );
 }
 
 /**

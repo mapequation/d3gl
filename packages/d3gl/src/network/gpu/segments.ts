@@ -204,9 +204,13 @@ export const TILE_MAX_SIDE = 1024;
 
 /** `segInfo.w` flag: the segment is solved by the exact loop (it has no tile). */
 export const SEGMENT_EXACT = 1;
+/**
+ * `segInfo.w` flag: a nested segment of one child (spec §11.1, #355) — no forces act on it, and the
+ * composition places the child at its parent's centre with 0.9 of its radius, as the CPU does.
+ */
+export const SEGMENT_FROZEN = 2;
 /** `segInfo.w` flag: the segment owns a pyramid tile and is solved by the tile-root traversal. */
 export const SEGMENT_HAS_TILE = 4;
-// Bit 2 (value 2) is reserved for FROZEN — a k = 1 nested segment (gpu-nested, spec §11.1).
 
 /**
  * The grid side of a segment of `count` slots: `clamp(nextPow2(⌈√count⌉), minSide, 1024)`. About one
@@ -363,10 +367,16 @@ function packLevels(width: number, height: number, top: number): Pick<TileAtlas,
  * and a visible power of two lets a fast-math compiler reassociate that expression differently in one
  * of them (measured on ANGLE Metal; see AGENTS.md).
  */
-export function segmentInfo(seg: SlotRange, tile: Tile | null): [number, number, number, number] {
-  if (!tile) return [seg.start, seg.count, 0, SEGMENT_EXACT << 8];
+export function segmentInfo(seg: SlotRange, tile: Tile | null, frozen = false): [number, number, number, number] {
+  const extra = frozen ? SEGMENT_FROZEN : 0;
+  if (!tile) return [seg.start, seg.count, 0, ((SEGMENT_EXACT | extra) << 8) >>> 0];
   const rootLevel = 31 - Math.clz32(tile.side);
-  return [seg.start, seg.count, (tile.x | (tile.y << 16)) >>> 0, (rootLevel | (SEGMENT_HAS_TILE << 8) | (tile.side << 16)) >>> 0];
+  return [
+    seg.start,
+    seg.count,
+    (tile.x | (tile.y << 16)) >>> 0,
+    (rootLevel | ((SEGMENT_HAS_TILE | extra) << 8) | (tile.side << 16)) >>> 0,
+  ];
 }
 
 /**

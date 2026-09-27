@@ -210,6 +210,7 @@ function startGpuLayoutSync(
   try {
     stream = new GpuStream(device, layout, graph, {
       iterations,
+      drag: layout,
       ...(opts.frameEvery !== undefined ? { frameEvery: opts.frameEvery } : {}),
     }, onFrame);
   } catch (error) {

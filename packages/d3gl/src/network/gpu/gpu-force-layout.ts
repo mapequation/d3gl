@@ -638,6 +638,14 @@ export class GpuForceLayout {
     this.reduceSegments();
   }
 
+  /**
+   * The streaming readback's hook before a copy (#352): between ticks the reductions are re-run so the
+   * copied stats describe the copied positions ({@link refreshSegmentStats}); after a prep they already do.
+   */
+  prepareReadback(betweenTicks: boolean): void {
+    if (betweenTicks) this.refreshSegmentStats();
+  }
+
   private reduceSegments(): void {
     this.reduce.run(
       { pos: this.pos.readTex, vel: this.vel.readTex, posWidth: this.width, count: this.count },

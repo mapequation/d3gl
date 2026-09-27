@@ -47,18 +47,20 @@ const STATS_FS = /* glsl */ `\
 precision highp float;
 precision highp sampler2D;
 
-uniform highp sampler2D u_stats; // (Σx, Σy, Σ|v|, count) of segment 0
-uniform highp sampler2D u_box;   // (maxX, maxY, −minX, −minY) of segment 0
+uniform highp sampler2D u_stats; // the range table's sum chain, e.g. (Σx, Σy, Σ|v|, count) per segment
+uniform highp sampler2D u_box;   // its max chain, (maxX, maxY, −minX, −minY) per segment
+uniform ivec2 u_texel;           // the range whose stats are copied (the flat layout's one segment: (0, 0))
 layout(location = 0) out vec4 o_stat;
 
 void main() {
-  o_stat = gl_FragCoord.x < 1.0 ? texelFetch(u_stats, ivec2(0), 0) : texelFetch(u_box, ivec2(0), 0);
+  o_stat = gl_FragCoord.x < 1.0 ? texelFetch(u_stats, u_texel, 0) : texelFetch(u_box, u_texel, 0);
 }
 `;
 
 /**
- * The flat segment table's `stats` and `box` texels side by side in one 2×1 `rgba32float` staging
- * texture, so the stats readback is one `readPixels` into its own PBO. One 2-fragment draw per copy.
+ * One range's `stats` and `box` texels — the flat segment table's only segment, or the nested solve's
+ * whole-slot range — side by side in one 2×1 `rgba32float` staging texture, so the stats readback is one
+ * `readPixels` into its own PBO. One 2-fragment draw per copy.
  */
 export class PackStatsPass {
   /** The 2×1 staging framebuffer the readback copies from. */
@@ -66,6 +68,7 @@ export class PackStatsPass {
   private readonly device: Device;
   private readonly texture: Texture;
   private readonly model: Model;
+  private readonly uniforms: PassUniforms;
 
   constructor(device: Device) {
     this.device = device;
@@ -77,11 +80,17 @@ export class PackStatsPass {
       sampler: { minFilter: "nearest", magFilter: "nearest" },
     });
     this.framebuffer = device.createFramebuffer({ width: 2, height: 1, colorAttachments: [this.texture] });
-    this.model = fullScreenModel(device, STATS_FS, {}, NO_BLEND);
+    this.uniforms = { u_texel: new Int32Array(2) };
+    this.model = fullScreenModel(device, STATS_FS, this.uniforms, NO_BLEND);
   }
 
-  /** Copy `stats` (texel 0) and `box` (texel 1) of segment 0 into the staging texture. */
-  run(stats: Texture, box: Texture): void {
+  /** Copy `stats` (staging texel 0) and `box` (staging texel 1) of the range at table texel `(x, y)`. */
+  run(stats: Texture, box: Texture, x = 0, y = 0): void {
+    const texel = this.uniforms["u_texel"];
+    if (texel instanceof Int32Array) {
+      texel[0] = x;
+      texel[1] = y;
+    }
     this.model.setBindings({ u_stats: stats, u_box: box });
     const pass = beginPass(this.device, { framebuffer: this.framebuffer, clear: false });
     this.model.draw(pass);

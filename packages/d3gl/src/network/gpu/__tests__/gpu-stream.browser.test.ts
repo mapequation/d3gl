@@ -41,7 +41,7 @@ describe("GPU streaming run (#352)", () => {
     seedPositions(g, 400, 300, { force: DEFAULT_FORCE });
     const layout = new GpuForceLayout(device, g, DEFAULT_FORCE);
     layout.hold(1);
-    return { layout, stream: new GpuStream(device, layout, g, { iterations }, onFrame) };
+    return { layout, stream: new GpuStream(device, layout, g, { iterations, drag: layout }, onFrame) };
   }
 
   it("settles only after the final tick's positions were harvested, and repaints them", async () => {

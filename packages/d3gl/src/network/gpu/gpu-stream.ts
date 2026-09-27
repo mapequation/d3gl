@@ -35,10 +35,36 @@ import { WebGLDevice } from "@luma.gl/webgl";
 import { DRAG_HEAT, RECOOL_TICKS } from "../force.js";
 import type { NetworkGraph } from "../graph.js";
 import { deleteSync, insertSync, pollSync } from "../../webgl/fence.js";
-import { AsyncPositionReadback, READBACK_STATS_FLOATS } from "./async-readback.js";
+import { AsyncPositionReadback, READBACK_STATS_FLOATS, type ReadbackSource } from "./async-readback.js";
 import { FrameBudget, itemCostMs, type FenceSource } from "./frame-budget.js";
-import type { GpuForceLayout } from "./gpu-force-layout.js";
 import { MIN_FRAME_MS, RepaintThrottle } from "./repaint-throttle.js";
+
+/**
+ * A solver the stream drives: a tick is the work items **P** ({@link beginTick}), **F_b**
+ * ({@link forceBand}, `b = 0 … B − 1`) and **I** ({@link integrate}) — positions change only in I — and it
+ * is its own {@link ReadbackSource}. The flat {@link GpuForceLayout} and the nested layout's batched solve
+ * (#355) are both one.
+ */
+export interface StreamSolver extends ReadbackSource {
+  beginTick(): void;
+  forceBand(band: number, bands: number): void;
+  integrate(): void;
+  /**
+   * Make the readback source describe the current positions, right before a copy. `betweenTicks`: the
+   * copy follows an integrate (the next P has not run), so reductions from the last P describe the
+   * positions before it; otherwise it follows a P, whose reductions are current.
+   */
+  prepareReadback(betweenTicks: boolean): void;
+  destroy(): void;
+}
+
+/** A solver that can hold nodes under a drag and reheat (#183) — the flat layout; the nested one cannot. */
+export interface DragSolver {
+  setPinned(ids: Uint32Array | null): void;
+  setHeldPositions(ids: Uint32Array, positions: Float32Array): void;
+  hold(heat: number): void;
+  cool(ticks: number, from?: number): void;
+}
 
 /** What one streamed frame did — the argument of a {@link observeGpuLayoutFrames} observer. */
 export interface GpuFrameSample {
@@ -94,6 +120,17 @@ export interface GpuStreamOptions {
   budgetMs?: number;
   /** Minimum time between repaints, ms. Default {@link MIN_FRAME_MS}. */
   minFrameMs?: number;
+  /** The solver's drag interface; without one, `pin` / `unpin` do nothing (the nested layout, #355). */
+  drag?: DragSolver;
+  /**
+   * `false`: no intermediate copies — only the final positions are read back and harvested, in one
+   * frame (a nested warm start or transition, #328). Default `true`: stream on the repaint cadence.
+   */
+  stream?: boolean;
+  /** Where harvests land instead of `graph.positions` (a caller that eases to the result, #328). */
+  into?: Float32Array;
+  /** Where a packed source's extra floats land on each harvest (the nested layout's module discs, #355). */
+  extra?: Float32Array;
 }
 
 type Mode = "idle" | "run" | "drag" | "cool";
@@ -116,8 +153,12 @@ export class GpuStream {
   readonly settled: Promise<void>;
 
   private readonly gl: WebGL2RenderingContext;
-  private readonly layout: GpuForceLayout;
+  private readonly layout: StreamSolver;
+  private readonly drag: DragSolver | null;
   private readonly graph: NetworkGraph;
+  private readonly into: Float32Array | null;
+  private readonly extra: Float32Array | undefined;
+  private readonly streaming: boolean;
   private readonly onFrame: () => void;
   private readonly iterations: number;
   private readonly frameEvery: number | undefined;
@@ -169,10 +210,14 @@ export class GpuStream {
   /** Whether the pending copy's frame has completed. */
   private copyReady = false;
 
-  constructor(device: WebGLDevice, layout: GpuForceLayout, graph: NetworkGraph, opts: GpuStreamOptions, onFrame: () => void) {
+  constructor(device: WebGLDevice, layout: StreamSolver, graph: NetworkGraph, opts: GpuStreamOptions, onFrame: () => void) {
     this.gl = device.gl;
     this.layout = layout;
+    this.drag = opts.drag ?? null;
     this.graph = graph;
+    this.into = opts.into ?? null;
+    this.extra = opts.extra;
+    this.streaming = opts.stream ?? true;
     this.onFrame = onFrame;
     this.iterations = opts.iterations;
     this.frameEvery = opts.frameEvery;
@@ -209,8 +254,9 @@ export class GpuStream {
    * Resumes the loop in `drag` mode, or lets a still-running initial run turn into it when it ends.
    */
   pin(ids: Uint32Array, positions?: Float32Array): void {
-    if (this.stopped || this.failed) return;
-    this.layout.setPinned(ids);
+    const drag = this.drag;
+    if (this.stopped || this.failed || !drag) return;
+    drag.setPinned(ids);
     if (positions) {
       this.heldIds = ids;
       this.heldPositions = positions;
@@ -218,7 +264,7 @@ export class GpuStream {
     this.dragging = true;
     if (this.mode === "idle" || this.mode === "cool") {
       this.mode = "drag";
-      this.layout.hold(DRAG_HEAT);
+      drag.hold(DRAG_HEAT);
       this.finishing = false;
       this.copyFinal = false; // a final copy in flight is harvested as an ordinary frame
     }
@@ -227,13 +273,14 @@ export class GpuStream {
 
   /** Release every pin and re-cool over a short tail, then idle. */
   unpin(): void {
-    if (this.stopped || this.failed) return;
-    this.layout.setPinned(null);
+    const drag = this.drag;
+    if (this.stopped || this.failed || !drag) return;
+    drag.setPinned(null);
     this.dragging = false;
     if (this.mode === "drag") {
       this.mode = "cool";
       this.coolLeft = RECOOL_TICKS;
-      this.layout.cool(RECOOL_TICKS, DRAG_HEAT);
+      drag.cool(RECOOL_TICKS, DRAG_HEAT);
     }
     this.resume();
   }
@@ -282,7 +329,7 @@ export class GpuStream {
       (this.copyFinal || this.frameEvery !== undefined || this.throttle.due(now))
     ) {
       harvested = true;
-      if (!this.readback.harvest(this.graph.positions, this.stats)) {
+      if (!this.readback.harvest(this.into ?? this.graph.positions, this.stats, this.extra)) {
         this.fail();
         return;
       }
@@ -324,7 +371,7 @@ export class GpuStream {
       // Between ticks (right after an integrate) the reductions' stats describe the previous positions:
       // re-run them so the harvest's finiteness check covers the positions it copies. After a prep they
       // already do — positions change only at integrate and at the prep's held-position write.
-      if (this.phase === 0) this.layout.refreshSegmentStats();
+      this.layout.prepareReadback(this.phase === 0);
       this.readback.issue(this.layout);
       this.copyTicks = this.ticksDone;
       this.copyFinal = this.finishing;
@@ -379,8 +426,8 @@ export class GpuStream {
   private encodeItem(): void {
     if (this.phase === 0) {
       this.tickBands = Math.min(this.budget.bands, this.layout.atlasRows);
-      if (this.heldIds && this.heldPositions) {
-        this.layout.setHeldPositions(this.heldIds, this.heldPositions);
+      if (this.heldIds && this.heldPositions && this.drag) {
+        this.drag.setHeldPositions(this.heldIds, this.heldPositions);
         this.heldIds = null;
         this.heldPositions = null;
       }
@@ -404,7 +451,7 @@ export class GpuStream {
         // The run's budget is spent with a drag live: keep reflowing at the drag heat. The next harvest
         // carries ticks ≥ iterations and settles.
         this.mode = "drag";
-        this.layout.hold(DRAG_HEAT);
+        this.drag?.hold(DRAG_HEAT);
       } else {
         this.finishing = true;
       }
@@ -420,7 +467,7 @@ export class GpuStream {
       this.settle();
       if (this.dragging) {
         this.mode = "drag";
-        this.layout.hold(DRAG_HEAT);
+        this.drag?.hold(DRAG_HEAT);
       } else {
         this.mode = "idle";
       }
@@ -439,6 +486,7 @@ export class GpuStream {
     if (this.readback.pending) return false;
     // The final copy goes out as soon as the PBO is free; its harvest clears `finishing` (finish()).
     if (this.finishing) return true;
+    if (!this.streaming) return false;
     if (this.ticksDone <= this.copiedTicks) return false;
     if (this.frameEvery !== undefined) return this.ticksDone - this.copiedTicks >= this.frameEvery;
     return this.throttle.copyDue(now);
