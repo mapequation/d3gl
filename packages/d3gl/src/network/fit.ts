@@ -16,8 +16,15 @@ export type FitBox = [number, number, number, number];
  * radius) is inflated by that one leaf — which blows the frame up and shrinks the whole layout to a dot.
  *
  * O(tree size) — call **once per tree** and cache; the per-frame {@link fitBox} then reads these nodes'
- * live geometry, O(fit nodes). A spatial tree (#343), rebuilt every streamed frame, has its one root on
- * the top level: only that level is scanned, O(root children).
+ * live geometry, O(fit nodes).
+ *
+ * A **spatial** tree (#343) is different: its root's children are the 2-4 quadrants of a power-of-two box,
+ * so their centroids depend on where the layout falls on that grid (an off-centre, loose frame that jumps
+ * when the box re-sizes), and a flung-out node sits in a quadrant of its own — its centroid IS the outlier.
+ * Its fit nodes are cells instead: the root's most populous cell is split until there are
+ * {@link SPATIAL_FIT_CELLS}, and cells holding under {@link SPATIAL_FIT_MIN_SHARE} of the nodes (a
+ * fling-out's) are left out. Only the top of the tree is touched — O(SPATIAL_FIT_CELLS²), independent of
+ * the node count — which matters because it is rebuilt every streamed frame.
  */
 export function fitNodes(tree: LODTree): Uint32Array {
   const { parent, size, levelCount, levelOffset, childOffset, children } = tree;
@@ -31,7 +38,33 @@ export function fitNodes(tree: LODTree): Uint32Array {
     if (c1 > c0) for (let p = c0; p < c1; p++) out.push(children[p]!);
     else out.push(g); // a root with no children (tiny graph) frames against itself
   }
-  return Uint32Array.from(out);
+  return tree.morton ? spatialFitCells(tree, out) : Uint32Array.from(out);
+}
+
+/** Cells a spatial tree frames against (#343) — enough that none dominates the centroid box. */
+const SPATIAL_FIT_CELLS = 32;
+/** A cell holding less than this share of the nodes is left out of a spatial tree's fit (a fling-out). */
+const SPATIAL_FIT_MIN_SHARE = 0.005;
+
+/** Split the most populous of `nodes` until there are {@link SPATIAL_FIT_CELLS}, then drop the sparse ones. */
+function spatialFitCells(tree: LODTree, nodes: number[]): Uint32Array {
+  const { count, childOffset, children } = tree;
+  const size = (g: number): number => count[g] ?? 0;
+  while (nodes.length < SPATIAL_FIT_CELLS) {
+    let best = -1;
+    for (let i = 0; i < nodes.length; i++) {
+      const g = nodes[i] ?? 0;
+      if ((childOffset[g + 1] ?? 0) > (childOffset[g] ?? 0) && (best < 0 || size(g) > size(nodes[best] ?? 0))) best = i;
+    }
+    if (best < 0) break; // only leaves left (a tiny graph)
+    const g = nodes[best] ?? 0;
+    nodes[best] = nodes[nodes.length - 1] ?? g;
+    nodes.pop();
+    for (let p = childOffset[g] ?? 0; p < (childOffset[g + 1] ?? 0); p++) nodes.push(children[p] ?? 0);
+  }
+  const min = SPATIAL_FIT_MIN_SHARE * tree.leafCount;
+  const kept = nodes.filter((g) => size(g) >= min);
+  return Uint32Array.from(kept.length > 0 ? kept : nodes);
 }
 
 /**

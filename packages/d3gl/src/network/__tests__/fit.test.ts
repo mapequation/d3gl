@@ -1,7 +1,7 @@
 import { describe, it, expect } from "vitest";
 import { fitNodes, fitBox, fitTransform, type FitBox } from "../fit.js";
 import { buildModuleLODTree } from "../modules.js";
-import { computeLODPositions } from "../lod.js";
+import { buildMortonLODTree, computeLODPositions } from "../lod.js";
 
 /**
  * Guards fit-on-layout's framing (#206). The library-shipped bug this replaces: framing to the tree
@@ -89,6 +89,53 @@ describe("fitBox is robust to fling-outs (the 'all white' bug)", () => {
     const m = mappedLeaves(pos, t, 2);
     expect(m.fill).toBeLessThan(0.1); // the bulk shrinks to a speck — this is the "all white" the fix removes
   });
+});
+
+describe("fitBox on a spatial tree (#343): robust to fling-outs, centred wherever the layout sits on the grid", () => {
+  /** `n` points uniform in a disc of radius 100 around (cx, cy), optionally one flung to (20000, 20000). */
+  function disc(n: number, cx: number, cy: number, fling: boolean): Float32Array {
+    let s = 12345;
+    const r = (): number => (s = (s * 1664525 + 1013904223) >>> 0) / 4294967296;
+    const pos = new Float32Array(2 * n);
+    for (let i = 0; i < n; i++) {
+      const a = r() * Math.PI * 2;
+      const d = Math.sqrt(r()) * 100;
+      pos[2 * i] = cx + Math.cos(a) * d;
+      pos[2 * i + 1] = cy + Math.sin(a) * d;
+    }
+    if (fling) {
+      pos[0] = 20000;
+      pos[1] = 20000;
+    }
+    return pos;
+  }
+  function spatialFit(pos: Float32Array): FitBox {
+    const n = pos.length / 2;
+    const tree = buildMortonLODTree(pos, n);
+    computeLODPositions(tree, pos);
+    const nodes = fitNodes(tree);
+    const box = fitBox(tree, nodes, new Float32Array(nodes.length));
+    if (!box) throw new Error("no fit box");
+    return box;
+  }
+  const span = (b: FitBox): number => Math.max(b[2] - b[0], b[3] - b[1]);
+
+  it("a flung-out node barely changes the frame", () => {
+    const clean = spatialFit(disc(20_000, 0, 0, false));
+    const flung = spatialFit(disc(20_000, 0, 0, true));
+    expect(span(flung)).toBeLessThan(span(clean) * 1.5);
+    expect(span(flung)).toBeLessThan(300); // the true span is 200
+  });
+
+  for (const [cx, cy] of [[0, 0], [37, 18.5], [130, 65], [-411, 777]] as const) {
+    it(`frames a disc centred at (${cx}, ${cy}) tightly and centred, whatever its place on the power-of-two grid`, () => {
+      const b = spatialFit(disc(20_000, cx, cy, false));
+      expect(span(b)).toBeGreaterThan(160);
+      expect(span(b)).toBeLessThan(300);
+      expect(Math.abs((b[0] + b[2]) / 2 - cx)).toBeLessThan(20);
+      expect(Math.abs((b[1] + b[3]) / 2 - cy)).toBeLessThan(20);
+    });
+  }
 });
 
 describe("fitTransform", () => {
