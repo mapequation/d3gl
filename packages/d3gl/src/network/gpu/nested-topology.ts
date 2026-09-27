@@ -183,16 +183,17 @@ export function nestedSolverTopology(topo: NestedLayoutTopology, params: NestedL
       linkWeight.push(setup.lw[l] ?? 0);
     }
     if (k <= EXACT_MAX) return;
-    // Collision: r₉ and the slots above it (at most 8, since only 8 radii exceed the 9th-largest).
+    // Collision: r₉ and the slots above it (at most 8, since only 8 radii exceed the 9th-largest) —
+    // compared in float32, as the cell pass compares them: a slot it bins must not also be large.
     order.length = 0;
     for (let i = 0; i < k; i++) order.push(i);
     order.sort((a, b) => (scratch.rad[b] ?? 0) - (scratch.rad[a] ?? 0) || a - b);
-    const r9 = scratch.rad[order[NESTED_LARGE_MAX] ?? 0] ?? 0;
+    const r9 = Math.fround(scratch.rad[order[NESTED_LARGE_MAX] ?? 0] ?? 0);
     segR9[s] = r9;
     let large = 0;
     for (let rank = 0; rank < NESTED_LARGE_MAX; rank++) {
       const i = order[rank] ?? 0;
-      if ((scratch.rad[i] ?? 0) > r9) segLarge[s * NESTED_LARGE_MAX + large++] = base + i;
+      if (Math.fround(scratch.rad[i] ?? 0) > r9) segLarge[s * NESTED_LARGE_MAX + large++] = base + i;
     }
   });
 

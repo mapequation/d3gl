@@ -117,6 +117,40 @@ describe("nestedSolverTopology — one segmented solve over a module tree (#355)
     expect(checked).toBe(3);
   });
 
+  it("marks a slot large exactly when the collision shader will: its float32 radius above the float32 r₉", () => {
+    // One top module of 40 sub-modules (> EXACT_MAX) of 2 leaves. Eight sub-modules weigh 1 + 1e-9 (a leaf
+    // of 1e-9 added in float64), the ninth 1: their radii differ in float64 but round to one float32, which
+    // is all the cell pass sees (r > r₉ in float32). A slot marked large there would also be binned into
+    // the grid, and its neighbours would push it twice.
+    const records: ModuleNode[] = [];
+    const flow: number[] = [];
+    for (let m = 0; m < 40; m++) {
+      for (let j = 0; j < 2; j++) {
+        records.push({ id: records.length, path: [1, m + 1, j + 1] });
+        flow.push(m < 8 ? (j === 0 ? 1 : 1e-9) : m === 8 ? (j === 0 ? 1 : 0) : 0.1);
+      }
+    }
+    const t = topo(buildModuleLODTree(records.length, records));
+    const size = Float32Array.from(flow);
+    const sized = nestedSolverTopology(t, { size });
+    const s = Array.from(sized.segCount).findIndex((k) => k === 40);
+    expect(s).toBeGreaterThanOrEqual(0);
+    const base = sized.segStart[s] ?? 0;
+    // The precondition: in float64 eight radii exceed r₉, in float32 none does.
+    const { weight } = subtreeWeights(t, size);
+    const scratch = new Scratch();
+    const g = sized.segModule[s] ?? 0;
+    setupModule(t, g, t.childOffset[g] ?? 0, t.childOffset[g + 1] ?? 0, weight, 0.45, scratch, null);
+    const rad64 = Array.from(scratch.rad.subarray(0, 40));
+    const r9 = rad64.slice().sort((a, b) => b - a)[NESTED_LARGE_MAX] ?? 0;
+    expect(rad64.filter((r) => r > r9).length).toBe(8);
+    expect(rad64.filter((r) => Math.fround(r) > Math.fround(r9)).length).toBe(0);
+    // So no slot is large: the grid bins them all (cells of 2 · r₉ · PAD cover them).
+    expect(sized.segR9[s]).toBe(Math.fround(r9));
+    expect(Array.from(sized.segLarge.subarray(s * NESTED_LARGE_MAX, (s + 1) * NESTED_LARGE_MAX))).toEqual(new Array(NESTED_LARGE_MAX).fill(-1));
+    for (let i = base; i < base + 40; i++) expect((sized.radius[i] ?? 0) > (sized.segR9[s] ?? 0)).toBe(false);
+  });
+
   it("starts warm-seeded segments at WARM_ALPHA and records where the result goes", () => {
     const cold = nestedLayout(tree);
     const warm = nestedSolverTopology(tree, { initial: cold.positions });
