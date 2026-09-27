@@ -673,6 +673,15 @@ export interface SpatialLODOptions {
 
 /** Leaves per bottom cell of a spatial tree (#343) — see {@link SpatialLODOptions.bucket}. */
 const SPATIAL_BUCKET = 8;
+
+/**
+ * Spatial topologies built ({@link buildMortonTopology}) and style passes run ({@link computeLODStyle})
+ * in this realm since module load — live ESM bindings read by the per-frame guards (#328, #343) to assert
+ * that a position transition frame or a drag frame rebuilds no tree and runs no style pass. Test
+ * instrumentation only, like `groupRendererConstructions`; never read on a render path.
+ */
+export let mortonTopologyBuilds = 0;
+export let lodStylePasses = 0;
 /** Bits per axis of a Morton code; a cell is at most this many levels below the root box. */
 const MORTON_BITS = 16;
 /** Quantisation steps per axis (`2^16`). */
@@ -930,6 +939,7 @@ export function buildMortonTopology(
   scratch: MortonScratch = makeMortonScratch(),
   allocate: MortonAllocate = allocateMortonTopology,
 ): LODTopology & MortonTopologyArrays & { morton: MortonCells } {
+  mortonTopologyBuilds++;
   const bucket = Math.max(1, opts.bucket ?? SPATIAL_BUCKET);
   const maxDepth = Math.max(0, Math.min(MORTON_BITS, opts.maxDepth ?? MORTON_BITS));
   const box = opts.box ?? mortonRootBox(positions, count);
@@ -1492,6 +1502,7 @@ export function computeLODStyle(
   leafColors?: ArrayLike<number>,
   radiusAggregate?: RadiusAggregate,
 ): void {
+  lodStylePasses++;
   const { leafCount, levelCount, levelOffset, childOffset, children, radius, weight, border, color } = tree;
   // Summed additive metric per node, only when sizing aggregates by the leaf scale (else null → the
   // area-additive √Σr² fallback). One temp array per style recompute, never per frame.

@@ -21,6 +21,9 @@ export interface HoverHit {
    * itself + the glyphs absorbed under it; a plain glyph → `[id]`. Lazy: enumeration runs only when
    * called (network = subtree DFS, declutter = a `winners` inverse-scan), never on the pick hot path.
    * Present on `on("hover" | "click")` hits and every `selection()` entry; absent for non-pickable hits.
+   * It reads the frame the hit came from, so call it while that frame is current (in the event handler,
+   * or on a fresh `selection()`): a network's spatial LOD tree is replaced — and its ids renumbered — by
+   * every streamed layout frame (#343), after which an old hit's `members()` no longer resolves.
    */
   members?: () => (string | number)[];
 }

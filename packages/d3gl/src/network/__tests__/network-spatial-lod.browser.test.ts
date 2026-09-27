@@ -2,6 +2,7 @@ import { describe, it, expect } from "vitest";
 import { network, type Network, type NetworkHit } from "../network.js";
 import { buildGraph, type NetworkGraph } from "../graph.js";
 import type { HoverHit } from "../../map/base-engine.js";
+import { lodStylePasses, mortonTopologyBuilds } from "../lod.js";
 
 /**
  * `lod({ source: "spatial" })` (#343) through the engine: the worker rebuilds a Morton tree per streamed
@@ -180,6 +181,138 @@ describe("lod({ source: 'spatial' }) (#343)", () => {
     expect(members1).toEqual(members0);
     net.destroy();
     host.remove();
+  });
+
+  it("carries a selected aggregate over when a worker-streamed spatial tree gives way to a main-thread one", async () => {
+    const { net, host } = makeNet();
+    await net.whenReady();
+    const n = 6000;
+    const g = webLike(n, 6);
+    net.interactive({ selectable: true, hover: true });
+    net.data(g).style({ sizeMode: "screen", nodeRadius: 3 }).lod({ source: "spatial", maxAggregateRadius: 18 }).layout({ backend: "worker", iterations: 60, fit: true });
+    await net.whenSettled();
+    expect(net.lodSource).toBe("worker");
+    const hit = findAggregate(net, host);
+    expect(hit).not.toBeNull();
+    if (!hit) return;
+    net.select("nodes", [hit.id]);
+    const members0 = new Set((net.selection()[0]!.members?.() ?? []).map(Number));
+    expect(members0.size).toBeGreaterThan(2);
+    // The layout handed back as caller positions, with the far half of it collapsed onto one point (the
+    // extreme nodes stay, so the extent does too): the main thread rebuilds the spatial tree with far fewer
+    // cells, so the ids after them shift, while the selected cell's own members stay where they were. (A
+    // fresh root box may re-express the cell on a coarser or finer grid — the carried-over glyph's members
+    // then contain, or are contained in, the selected ones.)
+    const pos = g.positions.slice();
+    const [cx0, cy0] = centroid(g, [...members0]);
+    const extremes = new Set<number>();
+    let far = 0;
+    let span = 0;
+    for (const pick of [(i: number) => pos[2 * i]!, (i: number) => -pos[2 * i]!, (i: number) => pos[2 * i + 1]!, (i: number) => -pos[2 * i + 1]!]) {
+      let best = 0;
+      for (let i = 1; i < n; i++) if (pick(i) > pick(best)) best = i;
+      extremes.add(best);
+    }
+    for (let i = 0; i < n; i++) {
+      const d = Math.hypot(pos[2 * i]! - cx0, pos[2 * i + 1]! - cy0);
+      if (d > span) { span = d; far = i; }
+    }
+    for (let i = 0; i < n; i++) {
+      if (members0.has(i) || extremes.has(i) || Math.hypot(pos[2 * i]! - cx0, pos[2 * i + 1]! - cy0) < span / 2) continue;
+      pos[2 * i] = pos[2 * far]!;
+      pos[2 * i + 1] = pos[2 * far + 1]!;
+    }
+    net.layout({ backend: "positions", positions: pos });
+    expect(net.lodSource).toBe("spatial");
+    const sel = net.selection();
+    expect(sel.length).toBe(1);
+    const members1 = new Set((sel[0]!.members?.() ?? []).map(Number));
+    const inner = members1.size <= members0.size ? members1 : members0;
+    const outer = inner === members1 ? members0 : members1;
+    for (const m of inner) expect(outer.has(m), `member ${m} of the carried-over cell`).toBe(true);
+    // At most a level apart (a quarter or four times the area), not an unrelated ancestor holding both.
+    expect(outer.size, `carried over to a cell of ${members1.size} nodes from one of ${members0.size}`).toBeLessThanOrEqual(8 * inner.size);
+    net.destroy();
+    host.remove();
+  });
+
+  it("a force drag refits the spatial tree per frame and rebuilds it once the nodes come to rest", async () => {
+    const realRaf = globalThis.requestAnimationFrame;
+    const realCaf = globalThis.cancelAnimationFrame;
+    const queue = new Map<number, FrameRequestCallback>();
+    let id = 0;
+    const step = (frames: number): void => {
+      for (let f = 0; f < frames; f++) {
+        const due = [...queue.values()];
+        queue.clear();
+        for (const cb of due) cb(performance.now());
+      }
+    };
+    const { net, host } = makeNet();
+    try {
+      await net.whenReady();
+      const n = 3000;
+      const g = webLike(n, 8);
+      net.data(g).style({ sizeMode: "screen", nodeRadius: 6 }).lod({ source: "spatial", maxAggregateRadius: 18 }).layout({ backend: "force", iterations: 30 });
+      // Node 0 at the centre of the view: grab whatever glyph sits over it.
+      net.setTransform({ k: 1, x: 200 - g.positions[0]!, y: 200 - g.positions[1]! });
+      net.interactive({ draggable: true });
+      expect(net.lodSource).toBe("spatial");
+      globalThis.requestAnimationFrame = (cb) => { queue.set(++id, cb); return id; };
+      globalThis.cancelAnimationFrame = (i) => void queue.delete(i);
+      const r = host.getBoundingClientRect();
+      const [x0, y0] = [200, 200];
+      const ev = (type: string, x: number, y: number): boolean =>
+        (type === "pointerdown" ? host : window).dispatchEvent(new PointerEvent(type, { clientX: r.left + x, clientY: r.top + y, bubbles: true, button: 0, pointerId: 1 }));
+      ev("pointerdown", x0, y0);
+      ev("pointermove", x0 + 25, y0 + 15);
+      const builds0 = mortonTopologyBuilds;
+      const styles0 = lodStylePasses;
+      const before = [g.positions[4]!, g.positions[5]!];
+      step(20);
+      expect(g.positions[4] !== before[0] || g.positions[5] !== before[1], "the drag's reheat never ticked the layout").toBe(true);
+      expect(mortonTopologyBuilds - builds0, "spatial trees built during the drag frames").toBe(0);
+      expect(lodStylePasses - styles0, "style passes during the drag frames").toBe(0);
+      // Release: the cool-down tail still only refits; its last frame rebuilds the tree once.
+      ev("pointerup", x0 + 25, y0 + 15);
+      step(95);
+      expect(queue.size, "the force drag's rAF loop did not stop after its tail").toBe(0);
+      expect(mortonTopologyBuilds - builds0, "one rebuild once the nodes came to rest").toBe(1);
+      expect(lodStylePasses - styles0).toBe(1);
+    } finally {
+      globalThis.requestAnimationFrame = realRaf;
+      globalThis.cancelAnimationFrame = realCaf;
+      net.destroy();
+      host.remove();
+    }
+  });
+
+  it("keeps a main-thread spatial tree following a settled worker's reheat after a source switch", async () => {
+    const { net, host } = makeNet();
+    try {
+      await net.whenReady();
+      const n = 3000;
+      const g = webLike(n, 10);
+      // The worker streams the coarsening tree; the source switches to spatial once it has settled.
+      net.data(g).style({ sizeMode: "screen", nodeRadius: 6 }).lod({ maxAggregateRadius: 18 }).layout({ backend: "worker", iterations: 40 });
+      await net.whenSettled();
+      net.lod({ source: "spatial", maxAggregateRadius: 18 });
+      for (let i = 0; i < 100 && net.lodSource !== "spatial"; i++) await new Promise((r) => setTimeout(r, 10));
+      expect(net.lodSource).toBe("spatial"); // built on the main thread: the worker streams the other kind
+      net.setTransform({ k: 1, x: 200 - g.positions[0]!, y: 200 - g.positions[1]! });
+      net.interactive({ draggable: true });
+      // Hold a node: the worker reheats and streams frames; each moves every node, so the tree is rebuilt.
+      const builds0 = mortonTopologyBuilds;
+      const r = host.getBoundingClientRect();
+      host.dispatchEvent(new PointerEvent("pointerdown", { clientX: r.left + 200, clientY: r.top + 200, bubbles: true, button: 0, pointerId: 1 }));
+      window.dispatchEvent(new PointerEvent("pointermove", { clientX: r.left + 230, clientY: r.top + 215, bubbles: true, button: 0, pointerId: 1 }));
+      for (let i = 0; i < 200 && mortonTopologyBuilds === builds0; i++) await new Promise((res) => setTimeout(res, 10));
+      expect(mortonTopologyBuilds, "the spatial tree was never rebuilt during the worker's reheat").toBeGreaterThan(builds0);
+      window.dispatchEvent(new PointerEvent("pointerup", { clientX: r.left + 230, clientY: r.top + 215, bubbles: true, button: 0, pointerId: 1 }));
+    } finally {
+      net.destroy();
+      host.remove();
+    }
   });
 
   it("draws the spatial frontier and its lazily gathered links on the Canvas backend too", async () => {
