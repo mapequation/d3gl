@@ -1621,12 +1621,16 @@ export class Network extends BaseEngine {
   }
 
   /** A layout handle for a transition (#328): it settles when the transition ends, and `stop()` also
-   *  stops `solve` — the worker computing the transition's target, if any. */
+   *  stops `solve` — the worker computing the transition's target, if any. It reports `solve`'s live
+   *  transport (#297), so a GPU nested solve under a transition reads as `"gpu"`. */
   private transitionHandle(tween: PositionTransition, solve?: WorkerLayoutHandle): WorkerLayoutHandle {
     this.transition = tween;
     return {
       shared: false,
       mainThread: !solve,
+      get transport() {
+        return solve?.transport;
+      },
       settled: tween.settled,
       stop: () => {
         solve?.stop();

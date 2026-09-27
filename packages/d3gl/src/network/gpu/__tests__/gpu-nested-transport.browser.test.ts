@@ -205,6 +205,7 @@ describe("layout({ backend: 'gpu', nested }) through the engine (#355)", () => {
     const cold = g.positions.slice();
     net.layout({ backend: "gpu", nested: { warm: true, iterations: 30 }, transition: 100 });
     await net.whenSettled();
+    expect(net.layoutTransport).toBe("gpu"); // the transition's handle reports the solve's transport (#297)
     let moved = 0;
     for (let i = 0; i < n; i++) moved += Math.hypot((g.positions[2 * i] ?? 0) - (cold[2 * i] ?? 0), (g.positions[2 * i + 1] ?? 0) - (cold[2 * i + 1] ?? 0));
     expect(moved / n).toBeLessThan(0.1 * radius); // a refinement of the map, placed where it was
