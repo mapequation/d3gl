@@ -37,9 +37,13 @@ import { EXACT_MAX } from "../nested-layout.js";
 //
 // | stream tick                 | P                                                    | F_b                    | I                  |
 // |-----------------------------|------------------------------------------------------|------------------------|--------------------|
-// | organise (first 60%)        | reductions (box) → tile pyramid; clear force         | repulsion, band b      | predict v*; springs at x + v* (zero rest); integrate |
+// | organise (first 60%)        | reductions (box) → tile pyramid                      | clear force, repulsion, band b | predict v*; springs at x + v* (zero rest); integrate |
 // | compact, collision step 1   | predict; springs (rest lengths); integrate; reductions; collision cells, both tables' counts and rounds | collision work items, then resolve, of band b | swap |
 // | compact, collision step 2   | reductions; collision cells, both tables' counts and rounds | collision work items, then resolve, of band b | swap; next tick |
+//
+// Each item submits once, after its render passes (#402), and a force clear is the first draw's `clear`
+// (a band's rows, the springs' whole target), never a pass of its own. The compact swap, and a gather band
+// without rows, encode nothing.
 //
 // The composition (`passes/nested-compose.ts`) maps the local solutions into world discs and packs leaf
 // positions and module discs in node order, for the streaming readback ({@link prepareReadback}).
@@ -563,23 +567,27 @@ export class GpuNestedLayout implements StreamSolver {
         segments: this.segments,
         slotSeg: this.slotSeg,
       });
-      this.clearForce();
+      this.device.submit();
       return;
     }
     if (this.step === 0) this.advance(false);
     // This collision step's cells and occupancy, from the positions it starts at.
     this.runReduce(1, this.segments);
     this.collision.prepare({ ...this.gatherInput, pos: this.pos.readTex, radius: this.radius });
+    this.device.submit();
   }
 
   /**
    * Work item **F_b**: band `band` of `bands` of the slot atlas's rows — the repulsion over equal rows
-   * (organise), or the collision gather over rows of equal estimated work (compact).
+   * (organise), which clears its rows of the force texture as it opens it, or the collision gather over
+   * rows of equal estimated work (compact).
    */
   forceBand(band: number, bands: number): void {
     if (!this.organising) {
       const [r0, r1] = this.gatherBandRows(band, bands);
+      if (r1 <= r0) return;
       this.collision.gather(this.posFbo(this.posParity ^ 1), this.gatherInput, r0, r1);
+      this.device.submit();
       return;
     }
     const r0 = Math.floor((band * this.height) / bands);
@@ -587,7 +595,7 @@ export class GpuNestedLayout implements StreamSolver {
     if (r1 <= r0) return;
     const pass = beginPass(this.device, {
       framebuffer: this.forceFbo,
-      clear: false,
+      clear: [0, 0, 0, 0],
       ...(bands > 1 ? { scissor: [0, r0, this.width, r1 - r0] } : {}),
     });
     this.repulsion.run(pass, {
@@ -610,6 +618,7 @@ export class GpuNestedLayout implements StreamSolver {
   integrate(): void {
     if (this.organising) {
       this.advance(true);
+      this.device.submit();
       this.endTick();
       return;
     }
@@ -621,7 +630,11 @@ export class GpuNestedLayout implements StreamSolver {
     }
   }
 
-  /** Predict v*, gather the springs at x + v* (zero rest while organising), integrate (MRT), swap. */
+  /**
+   * Predict v*, gather the springs at x + v* (zero rest while organising) into the force texture — cleared as
+   * the springs' pass opens it, after the predict has read the force it held — integrate (MRT), swap. The
+   * item that calls it submits.
+   */
   private advance(organising: boolean): void {
     const input = this.slotInputs;
     input.alphaCold = this.alphaCold;
@@ -630,16 +643,13 @@ export class GpuNestedLayout implements StreamSolver {
     let pass = beginPass(this.device, { framebuffer: this.vstarFbo, clear: false });
     this.predict.run(pass, this.pos.readTex, this.vel.readTex, this.force, organising, input);
     pass.end();
-    this.device.submit();
 
-    this.clearForce();
     const springs = this.springInputs;
     springs.rest = organising ? 0 : 1;
     this.springs.prepare(this.pos.readTex, this.width, springs);
-    pass = beginPass(this.device, { framebuffer: this.forceFbo, clear: false });
+    pass = beginPass(this.device, { framebuffer: this.forceFbo, clear: [0, 0, 0, 0] });
     this.springs.draw(pass, this.pos.readTex, { count: this.slots, width: this.width, attraction: 1 }, null, springs);
     pass.end();
-    this.device.submit();
 
     const [atPos0, atPos1] = this.integrateFbos;
     const pair = this.posParity === 0 ? atPos0 : atPos1;
@@ -647,7 +657,6 @@ export class GpuNestedLayout implements StreamSolver {
     pass = beginPass(this.device, { framebuffer: fbo, clear: false });
     this.integratePass.run(pass, this.pos.readTex, this.vstar, this.force, input);
     pass.end();
-    this.device.submit();
     this.swapPos();
     this.vel.swap();
     this.velParity ^= 1;
@@ -691,7 +700,8 @@ export class GpuNestedLayout implements StreamSolver {
    * Compose the current local positions into world positions and discs, packed in node order for the
    * readback: the weighted centroids and boxes (mode 1, whose whole-slot range the harvest checks for
    * finiteness), the extents (mode 2), then the composition. Positions change only in {@link integrate},
-   * so this is safe at any point of a tick; it recomputes the reductions itself either way.
+   * so this is safe at any point of a tick; it recomputes the reductions itself either way. It encodes and
+   * does not submit: the readback's copy submits (or {@link readComposed}, synchronously).
    */
   prepareReadback(): void {
     this.runReduce(1, this.segments);
@@ -717,6 +727,7 @@ export class GpuNestedLayout implements StreamSolver {
    */
   readComposed(positions: Float32Array, discs?: Float32Array): void {
     this.prepareReadback();
+    this.device.submit();
     const { width, height, framebuffer } = this.compose;
     const pixels = this.device.readPixelsToArrayWebGL(framebuffer, { sourceWidth: width, sourceHeight: height });
     if (!(pixels instanceof Float32Array)) throw new Error("GpuNestedLayout: expected a float readback");
@@ -764,12 +775,6 @@ export class GpuNestedLayout implements StreamSolver {
       mode === 1 ? this.reduceBindings[0] : this.reduceBindings[1],
       this.reduceUniforms,
     );
-  }
-
-  private clearForce(): void {
-    const pass = beginPass(this.device, { framebuffer: this.forceFbo, clear: [0, 0, 0, 0] });
-    pass.end();
-    this.device.submit();
   }
 
   /** The framebuffer of the position texture that is the read side at parity `p`. */

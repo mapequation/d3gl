@@ -388,7 +388,8 @@ export class GridPyramid {
    *   1. clear L0 to 0 then ADD-scatter every tiled slot → (Σx, Σy, mass, Σ|p−cc|²)
    *   2. reduce level ℓ → ℓ+1 into its rectangle of Podd / Peven, one pass per level
    *
-   * Each pass is submitted, so the passes after it (and the traversal) see its results.
+   * Nothing is submitted: WebGL runs each pass as it is encoded, so the passes after it (and the traversal)
+   * see its results, and the caller's work item submits once (#402).
    */
   build(input: PyramidBuildInput): void {
     const { posTex, width, count, segments, slotSeg, grid } = input;
@@ -417,7 +418,6 @@ export class GridPyramid {
     this.scatterModel.setVertexCount(count);
     this.scatterModel.draw(scatterPass);
     scatterPass.end();
-    this.device.submit();
 
     // ── 2. Packed reduce (level ℓ → ℓ+1) ──────────────────────────────────
     // Each pass reads level ℓ from one texture and writes level ℓ+1's rectangle of the other: no
@@ -435,7 +435,6 @@ export class GridPyramid {
       this.reduceModel.setBindings(bindings);
       this.reduceModel.draw(pass);
       pass.end();
-      this.device.submit();
     }
   }
 

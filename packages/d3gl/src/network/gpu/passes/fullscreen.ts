@@ -9,6 +9,13 @@ import { Model } from "@luma.gl/engine";
 // reduction levels) is one full-screen triangle over a target atlas: each fragment is one output
 // texel. This module owns that setup once, and owns the render-pass opening so the clear is always
 // an explicit choice (see {@link beginPass}).
+//
+// **No pass submits (#402).** WebGL runs a render pass's draws as they are encoded, so a pass needs no
+// `device.submit()` for the passes after it to see its output. What luma's submit adds is main-thread work:
+// a new command encoder, a command buffer and a promise (6.5 µs a call on an M1 Max, a quarter of a small
+// pass's encode). So the passes never submit; the solvers submit once per **work item** (`beginTick`,
+// `forceBand`, `integrate`, a seed step, a readback copy), after all of its passes. And **no pass only
+// clears**: a clear is the `clear` of the first pass that draws into its target, never a pass of its own.
 
 /**
  * Full-screen triangle generated from `gl_VertexID` — vertices (-1,-1), (3,-1), (-1,3) cover the

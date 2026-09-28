@@ -77,7 +77,7 @@ export interface CenteringSegments {
  * Full-screen triangle centering force pass. Reads the segment table's `stats` (produced this tick
  * by the range query) and centering strength, and writes `centering * (centroid − pos_i)` into the
  * force texture with additive blend. Runs INSIDE the force-accumulation render pass, after the
- * range query's own pass has been submitted.
+ * range query's own pass has been encoded.
  */
 export class CenteringPass {
   private readonly model: Model;

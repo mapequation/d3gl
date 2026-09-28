@@ -145,7 +145,6 @@ export class StopLatchPass {
     const pass = beginPass(this.device, { framebuffer: this.current === 0 ? this.fbos[1] : this.fbos[0], clear: false });
     this.model.draw(pass);
     pass.end();
-    this.device.submit();
     this.current = this.current === 0 ? 1 : 0;
   }
 

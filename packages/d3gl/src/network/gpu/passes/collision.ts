@@ -656,7 +656,7 @@ interface StatsPasses {
  * The collision grid's textures and passes, created once for a slot atlas and a {@link CollisionPlan}. A
  * Jacobi collision step is {@link prepare} (the cell pass, then per table a count scatter and K round
  * scatters), then {@link gather} — the work items and the resolve of each row band of the slot atlas, each
- * its own submitted render pass. Nothing is allocated per step.
+ * its own render pass. Nothing is allocated or submitted per step (the caller's work item submits, #402).
  *
  * Memory: the key 16 B and the disc 16 B per slot atlas texel; the work items 8 B and their partial sums
  * 8 B per item-atlas texel (the parts of the slots cut into more than one); 4 B per binned slot (the
@@ -938,7 +938,6 @@ export class CollisionGrid {
     const pass: RenderPass = beginPass(this.device, target);
     model.draw(pass);
     pass.end();
-    this.device.submit();
   }
 
   destroy(): void {

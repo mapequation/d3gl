@@ -116,11 +116,15 @@ interface ActiveLevel {
  * GPU-side force-directed layout. Mirrors {@link ForceLayout} semantics but runs
  * the integration step entirely on the GPU via a ping-pong compute-in-raster loop.
  *
- * Force accumulation (Tasks 2–4): each tick begins by clearing `forceTex` to zero
- * via a dedicated `forceFbo`, then each force pass draws into it with additive
+ * Force accumulation (Tasks 2–4): each force band clears its rows of `forceTex` to zero
+ * as it opens `forceFbo`, then each force pass draws into it with additive
  * blending (ONE, ONE) so contributions accumulate.  Finally the integrate pass reads
  * the summed force texture.  All FBOs are pre-created in the constructor — no
  * `createFramebuffer` on the hot path.
+ *
+ * Every work item ({@link beginTick}, {@link forceBand}, {@link integrate}, {@link setLevel}, {@link endSeed})
+ * submits once, after all of its render passes; no pass submits on its own (#402). A readback copy's passes
+ * ({@link prepareReadback}) are submitted by the copy.
  */
 export class GpuForceLayout {
   private readonly device: Device;
@@ -645,6 +649,7 @@ export class GpuForceLayout {
     };
     this.segments.setRange(0, { start: 0, count: level.count }, seedTile);
     this.cooling.cool(level.ticks);
+    this.device.submit(); // the seed step is one work item (#402)
   }
 
   /**
@@ -663,11 +668,11 @@ export class GpuForceLayout {
       const pass = beginPass(this.device, { framebuffer: this.writeFramebuffer, clear: false });
       seed.gatherLeaves(pass);
       pass.end();
-      this.device.submit();
       this.pos.swap();
       this.vel.swap();
       this.parity ^= 1;
     }
+    this.device.submit(); // the seed step is one work item (#402)
     this.active = this.finest;
     this.segments.setRange(0, { start: 0, count: this.count }, this.flatTile);
     this.cooling.hold(1);
@@ -707,7 +712,10 @@ export class GpuForceLayout {
     this.endSeed();
   }
 
-  /** The prolongation of the current seed placement into the write side (positions + zero velocities), then swap. */
+  /**
+   * The prolongation of the current seed placement into the write side (positions + zero velocities), then
+   * swap. The seed step that calls it submits.
+   */
   private prolongateInto(count: number, scissor: PassViewport | undefined): void {
     const seed = this.seed;
     if (!seed) throw new Error("GpuForceLayout: no seed is running");
@@ -720,7 +728,6 @@ export class GpuForceLayout {
       width: this.width,
     });
     pass.end();
-    this.device.submit();
     this.pos.swap();
     this.vel.swap();
     this.parity ^= 1;
@@ -729,22 +736,22 @@ export class GpuForceLayout {
   /**
    * Work item **P** of a tick (#352, spec §6.5.3): everything the force pass reads, computed from the
    * current positions — the segment reductions and the stop latch over them (#376), the Barnes-Hut
-   * pyramid, the hub chunk partials — and the clear of the force accumulator. Each part is its own
-   * submitted render pass, as before the split.
+   * pyramid, the hub chunk partials. Each is a render pass (or a chain of them) that reads the one before,
+   * and the item submits once, after the last (#402). The force accumulator is cleared by the force bands.
    */
   beginTick(): void {
     // ── 1. Segment reductions ─────────────────────────────────────────────────
     // Gather tree over slot order + one range query for the flat segment: writes the segment
     // table's stats (Σx, Σy, Σ|v|, count → the centroid for centering) and box (maxX, maxY, −minX,
-    // −minY → the pyramid's cell geometry). No blending: contention-free and deterministic. Its
-    // passes submit internally, so the pyramid and force passes below see the results.
+    // −minY → the pyramid's cell geometry). No blending: contention-free and deterministic. WebGL runs
+    // its passes as they are encoded, so the pyramid and force passes below see the results.
     this.reduceSegments();
 
     // ── 1b. Build the tile pyramid (only when some segment has a tile) ──────
     // Rebuilds every segment's regular-quadtree COM/mass tile over the current positions — or a seed
-    // level's tile in the atlas corner, mass-weighted (#353). Runs its own render passes and submits
-    // internally, so it completes before the force pass below reads the pyramid. Skipped entirely when
-    // every segment (or the seed level) takes the exact loop.
+    // level's tile in the atlas corner, mass-weighted (#353). Its own render passes, encoded before the
+    // force pass that reads the pyramid. Skipped entirely when every segment (or the seed level) takes the
+    // exact loop.
     const level = this.active;
     if (level === this.finest) {
       this.pyramid?.build({
@@ -768,15 +775,8 @@ export class GpuForceLayout {
 
     // ── 1c. Hub spring chunks (#350) ─────────────────────────────────────────
     // Sums every chunk of a row longer than SPRING_CHUNK into its partial — its own render pass into a
-    // different framebuffer, submitted before the force pass gathers the partials. No-op without hubs.
+    // different framebuffer, encoded before the force pass gathers the partials. No-op without hubs.
     level.springs.prepare(this.pos.readTex, this.width);
-
-    // ── 2. Clear the force texture to zero ────────────────────────────────────
-    // Its own pass (the whole attachment, or a seed level's rows), so the force bands after it can each
-    // open the target with `clear: false` and write only their rows.
-    const scissor = this.levelScissor();
-    const clear = beginPass(this.device, { framebuffer: this.forceFbo, clear: [0, 0, 0, 0], ...(scissor ? { scissor } : {}) });
-    clear.end();
     this.device.submit();
   }
 
@@ -786,7 +786,9 @@ export class GpuForceLayout {
    * rows; the viewport and the slot ↔ texel mapping stay the whole atlas). Positions change only in
    * {@link integrate}, so every band reads the same positions and pyramid, the bands write disjoint
    * texels, and each texel receives its three contributions in the same order for any `bands`: the tick
-   * is bitwise independent of how it was sliced. `bands = 1` is the whole atlas without a scissor.
+   * is bitwise independent of how it was sliced. `bands = 1` is the whole atlas without a scissor. The band
+   * opens the force texture with a clear, which the scissor limits to its rows, so no pass of the tick only
+   * clears (#402).
    */
   forceBand(band: number, bands: number): void {
     const level = this.active;
@@ -794,7 +796,7 @@ export class GpuForceLayout {
     if (r1 <= r0) return;
     const forcePass = beginPass(this.device, {
       framebuffer: this.forceFbo,
-      clear: false,
+      clear: [0, 0, 0, 0],
       ...(bands > 1 || level.rows < this.height ? { scissor: [0, r0, this.width, r1 - r0] } : {}),
     });
 

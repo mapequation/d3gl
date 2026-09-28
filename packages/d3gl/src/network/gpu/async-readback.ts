@@ -121,6 +121,7 @@ function packBuffer(gl: WebGL2RenderingContext): WebGLBuffer {
  * signalled) moves it to the CPU, reading each PBO exactly once.
  */
 export class AsyncPositionReadback {
+  private readonly device: Device;
   private readonly gl: WebGL2RenderingContext;
   private readonly pbo: WebGLBuffer;
   private readonly statsPbo: WebGLBuffer;
@@ -153,6 +154,7 @@ export class AsyncPositionReadback {
    */
   constructor(device: Device, source: ReadbackSource, extra?: Float32Array) {
     if (!(device instanceof WebGLDevice)) throw new Error("AsyncPositionReadback: a WebGL2 device is required");
+    this.device = device;
     this.gl = device.gl;
     this.count = source.nodeCount;
     const packed = source.packed;
@@ -222,8 +224,9 @@ export class AsyncPositionReadback {
 
   /**
    * Copy `source`'s current positions, stats and extra floats into the PBOs — GPU → GPU, the main thread
-   * does not wait; one `readPixels` per PBO. The caller must insert a fence after this and
-   * {@link harvest} only once it has signalled.
+   * does not wait; one `readPixels` per PBO. The copy is one work item: the source's `prepareReadback` and the
+   * staging passes here are submitted once, before the copies (#402). The caller must insert a fence after
+   * this and {@link harvest} only once it has signalled.
    */
   issue(source: ReadbackSource): void {
     const gl = this.gl;
@@ -232,6 +235,7 @@ export class AsyncPositionReadback {
     if (pack) pack.run(source.positionTexture, source.positionWidth);
     const [sx, sy] = source.statsTexel ?? [0, 0];
     this.packStats.run(source.segmentStats.stats, source.segmentStats.box, source.stopState ?? null, sx, sy);
+    this.device.submit();
     const previousRead: WebGLFramebuffer | null = gl.getParameter(gl.READ_FRAMEBUFFER_BINDING);
     const previousPack: WebGLBuffer | null = gl.getParameter(gl.PIXEL_PACK_BUFFER_BINDING);
     const first = !this.sized;

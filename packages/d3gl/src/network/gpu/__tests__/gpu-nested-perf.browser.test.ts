@@ -21,7 +21,9 @@
  * - **Per tick:** a solve tick allocates nothing, and a compact collision step draws exactly one count
  *   scatter and K round scatters per hash table (the class cells', {@link COLLISION_ROUNDS}; the sub-cells',
  *   {@link COLLISION_SUB_ROUNDS}) of the binned slots (the radius-class grid's fixed passes), never a draw
- *   of N points into a 1×1 viewport (#349).
+ *   of N points into a 1×1 viewport (#349). Every work item that encodes a pass submits once, after its
+ *   passes, a readback copy too, and no pass only clears (#402): the force clear is the repulsion band's and
+ *   the springs' own. Through the real trigger the stream legs count the submits per item and per copy.
  * - **A module of very uneven child sizes** (#380; a single-scale grid made its gather quadratic, 157 ms
  *   frames at 60,000 children): the same per-frame bounds and signatures through the real trigger (in
  *   `gpu-nested-zipf-perf.browser.test.ts`, a file of its own for the tier's 300 s per file), a
@@ -44,6 +46,8 @@ import type { ModuleNode } from "../../modules.js";
 import { GpuNestedLayout, nestedLayoutPlan } from "../gpu-nested-layout.js";
 import { COLLISION_ROUNDS, COLLISION_SUB_ROUNDS } from "../passes/collision.js";
 import { makeTestDevice } from "./_device.js";
+import { recordItems, type ItemRecord } from "./_item-recorder.js";
+import { AsyncPositionReadback } from "../async-readback.js";
 import { perfBudget } from "../../../__tests__/perf-budget.js";
 import { perfHost } from "../../../__tests__/engine-sweep.js";
 import {
@@ -151,6 +155,61 @@ describe("GPU nested solve per tick (#355, #380)", () => {
       log.restore();
       layout.destroy();
     }
+  });
+});
+
+describe("GPU nested solve work items (#402)", () => {
+  let device: Device;
+  beforeAll(async () => {
+    device = await makeTestDevice();
+  });
+
+  it.each([
+    ["an Infomap-shaped map", () => solverOf(infomapLike(Math.min(N, 50_000)), 10)],
+    ["a Zipf module (binned slots)", () => solverOf(zipfLike(Math.min(N, 20_000)), 10)],
+  ] as const)("every work item submits once, after its passes, a copy too, and no pass only clears: %s", (_label, make) => {
+    const layout = new GpuNestedLayout(device, nestedLayoutPlan(make()));
+    const readback = new AsyncPositionReadback(device, layout);
+    const rec = recordItems(device);
+    const items: { phase: string; item: string; record: ItemRecord }[] = [];
+    const tick = (phase: string): void => {
+      items.push({ phase, item: "P", record: rec.record(() => layout.beginTick()) });
+      for (let b = 0; b < 3; b++) items.push({ phase, item: `F_${b}`, record: rec.record(() => layout.forceBand(b, 3)) });
+      items.push({ phase, item: "I", record: rec.record(() => layout.integrate()) });
+    };
+    let copy: ItemRecord;
+    try {
+      layout.runTicks(1); // warm-up
+      tick("organise");
+      tick("organise");
+      layout.runTicks(4); // past the 6 organise ticks of 10: the stream ticks below are collision steps
+      for (let s = 0; s < 4; s++) tick(`compact, step ${(s % 2) + 1}`);
+      copy = rec.record(() => {
+        layout.prepareReadback();
+        readback.issue(layout);
+      });
+    } finally {
+      rec.restore();
+      readback.abandon();
+      readback.destroy();
+      layout.destroy();
+    }
+    expect(copy.submits).toBe(1);
+    expect(copy.clearOnly).toBe(0);
+    expect(copy.passes).toBeGreaterThan(3); // two reductions and the composition
+    // An item submits once if it encodes a pass (the compact swap, and a gather band without rows, encode
+    // none), and every pass draws.
+    const wrong = items.filter(({ record }) => record.submits !== (record.passes > 0 ? 1 : 0) || record.clearOnly !== 0);
+    expect(wrong).toEqual([]);
+    const passes = (phase: string, item: string): number[] =>
+      items.filter((i) => i.phase === phase && i.item === item).map((i) => i.record.passes);
+    // Organise: a band is one pass (its clear, then the repulsion); I is the predict, the springs (their
+    // clear) and the integrate, plus a hub chunk pass on a map with hub rows.
+    expect(passes("organise", "F_1")).toEqual([1, 1]);
+    for (const n of passes("organise", "I")) expect([3, 4]).toContain(n);
+    // Compact: P always encodes (the reductions, the cells); the swap nothing.
+    for (const n of passes("compact, step 2", "P")) expect(n).toBeGreaterThan(3);
+    expect(passes("compact, step 2", "I")).toEqual([0, 0]);
   });
 });
 

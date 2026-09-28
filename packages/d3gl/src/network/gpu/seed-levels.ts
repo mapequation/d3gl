@@ -170,7 +170,6 @@ export class SeedLevels {
     const pass = beginPass(this.device, { framebuffer: leaf.fbo, clear: false });
     this.leafPass.scatter(pass, posTex, leaf.entries, leaf.entriesWidth, leaves, this.width, this.height);
     pass.end();
-    this.device.submit();
   }
 
   /** Copy the leaf seed (every node) into an open MRT `[position, velocity]` pass. */

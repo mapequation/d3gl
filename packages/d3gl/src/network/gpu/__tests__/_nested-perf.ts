@@ -8,7 +8,8 @@
  * (the warm re-layout with a transition on `"auto"`) and `gpu-nested-interaction-perf.browser.test.ts` (a
  * node drag and a zoom sweep while the solve runs). See `gpu-nested-perf.browser.test.ts` for what they pin.
  */
-import { expect } from "vitest";
+import { expect, vi } from "vitest";
+import { WebGLDevice } from "@luma.gl/webgl";
 import type { Network } from "../../network.js";
 import { buildGraph, type NetworkGraph } from "../../graph.js";
 import { buildModuleLODTree, type ModuleNode } from "../../modules.js";
@@ -17,6 +18,7 @@ import { GpuNestedLayout, nestedLayoutPlan } from "../gpu-nested-layout.js";
 import { nestedSolverTopology, type NestedSolverTopology } from "../nested-topology.js";
 import { COLLISION_STEPS } from "../passes/collision.js";
 import { MIN_FRAME_MS } from "../repaint-throttle.js";
+import { AsyncPositionReadback } from "../async-readback.js";
 import { makeTestDevice } from "./_device.js";
 import { perfN } from "../../../__tests__/perf-budget.js";
 
@@ -207,11 +209,52 @@ export interface Leg {
   events: GlEvent[];
   settledAfterFrame: number;
   elapsedMs: number;
+  /** `device.submit()` calls of each solver work item, and of each readback copy's `issue` (#402). */
+  itemSubmits: number[];
+  copySubmits: number[];
+}
+
+/**
+ * Counts the `device.submit()` calls of each of the nested solve's work items (P, F_b, I) and of each readback
+ * copy's `issue` (#402), by spying the prototypes (the spies call through).
+ */
+export function submitScope(): { itemSubmits: number[]; copySubmits: number[]; restore: () => void } {
+  let submits = 0;
+  const itemSubmits: number[] = [];
+  const copySubmits: number[] = [];
+  const proto = GpuNestedLayout.prototype;
+  const { beginTick, forceBand, integrate } = proto;
+  const { issue } = AsyncPositionReadback.prototype;
+  const { submit } = WebGLDevice.prototype;
+  const counted = (into: number[], run: () => void): void => {
+    const before = submits;
+    try {
+      run();
+    } finally {
+      into.push(submits - before);
+    }
+  };
+  const spies = [
+    vi.spyOn(proto, "beginTick").mockImplementation(function (this: GpuNestedLayout) { counted(itemSubmits, () => beginTick.call(this)); }),
+    vi.spyOn(proto, "forceBand").mockImplementation(function (this: GpuNestedLayout, band: number, bands: number) {
+      counted(itemSubmits, () => forceBand.call(this, band, bands));
+    }),
+    vi.spyOn(proto, "integrate").mockImplementation(function (this: GpuNestedLayout) { counted(itemSubmits, () => integrate.call(this)); }),
+    vi.spyOn(AsyncPositionReadback.prototype, "issue").mockImplementation(function (this: AsyncPositionReadback, source) {
+      counted(copySubmits, () => issue.call(this, source));
+    }),
+    vi.spyOn(WebGLDevice.prototype, "submit").mockImplementation(function (this: WebGLDevice, ...args: Parameters<WebGLDevice["submit"]>) {
+      submits++;
+      submit.apply(this, args);
+    }),
+  ];
+  return { itemSubmits, copySubmits, restore: () => { for (const spy of spies) spy.mockRestore(); } };
 }
 
 export async function streamLeg(net: Network, graph: NetworkGraph, modules: ModuleNode[], lod: boolean): Promise<Leg> {
   const frames: GpuFrameSample[] = [];
   const log = new GlCallLog();
+  const scope = submitScope();
   let settledAfterFrame = -1;
   const unobserve = observeGpuLayoutFrames((s) => {
     frames.push({ ...s });
@@ -226,9 +269,13 @@ export async function streamLeg(net: Network, graph: NetworkGraph, modules: Modu
   } finally {
     unobserve();
     log.restore();
+    scope.restore();
   }
   expect(net.layoutTransport).toBe("gpu");
-  return { frames, events: log.events, settledAfterFrame, elapsedMs: performance.now() - t0 };
+  return {
+    frames, events: log.events, settledAfterFrame, elapsedMs: performance.now() - t0,
+    itemSubmits: scope.itemSubmits, copySubmits: scope.copySubmits,
+  };
 }
 
 /**
@@ -296,6 +343,13 @@ export function assertSignatures(leg: Leg): void {
   const copies = events.filter((e) => e.kind === "copy");
   expect(copies.length).toBeGreaterThan(1); // a cold layout streams: more than the final copy
   expect(copies.every((e) => e.kind === "copy" && e.toPbo), "a synchronous readPixels on the streaming path").toBe(true);
+
+  // At most one submit per work item (the compact swap and a gather band without rows encode nothing) and
+  // exactly one per readback copy (#402); the per-tick test pins which items encode passes.
+  expect(leg.itemSubmits.filter((n) => n === 1).length).toBeGreaterThanOrEqual(2 * STREAM_TICKS); // every P, and F_b
+  expect(leg.itemSubmits.filter((n) => n > 1), "work items that submitted more than once").toEqual([]);
+  expect(leg.copySubmits.length).toBeGreaterThan(0);
+  expect(leg.copySubmits.filter((n) => n !== 1), "readback copies that did not submit exactly once").toEqual([]);
 
   assertFencedHarvests(events);
   // One write, then one read, per PBO per copy: a harvest that reads a PBO twice (positions, then the

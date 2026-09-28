@@ -202,7 +202,6 @@ export class NestedComposePass {
     const pass = beginPass(this.device, { framebuffer: this.framebuffer, clear: false });
     this.model.draw(pass);
     pass.end();
-    this.device.submit();
   }
 
   destroy(): void {

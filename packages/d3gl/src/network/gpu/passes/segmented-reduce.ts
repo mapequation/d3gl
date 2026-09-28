@@ -339,8 +339,8 @@ export class SegmentedReduce {
   /**
    * Rebuild the tree over `input` and query every range of `table` into its target — the segment table's
    * `stats` and `box` for a {@link SegmentTable}. O(N + N/15) texel reads in L + 1 small passes (L = 4 at
-   * 325k and at 1M), plus ≤ 30 reads per tree level per range for the query. Each pass is submitted, so
-   * later passes see the results. `bindings` / `uniforms` feed the map's own textures and uniforms (see
+   * 325k and at 1M), plus ≤ 30 reads per tree level per range for the query. Nothing is submitted (the
+   * caller's work item submits). `bindings` / `uniforms` feed the map's own textures and uniforms (see
    * {@link ReduceMap}); they are set on the level-1 and query passes, the two that apply the map.
    */
   run(input: ReduceInput, table: RangeTarget, bindings: Readonly<Record<string, Texture>> = NO_BINDINGS, uniforms: Readonly<PassUniforms> = NO_UNIFORMS): void {
@@ -379,7 +379,6 @@ export class SegmentedReduce {
         this.levelModel.draw(pass);
       }
       pass.end();
-      device.submit();
     });
 
     // Range query: every table texel is written (padding gets the identities), so no clear.
@@ -402,7 +401,6 @@ export class SegmentedReduce {
     });
     this.queryModel.draw(pass);
     pass.end();
-    device.submit();
   }
 
   destroy(): void {
