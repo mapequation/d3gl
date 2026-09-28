@@ -80,6 +80,20 @@ describe("link colour resolution is memoised per style (per-frame colour parse)"
     expect(calls).toBe(weights.length);
   });
 
+  it("allocates nothing on a memo hit: every hit fills the resolver's one tuple (#364)", () => {
+    // The super-edge gather colours every drawn pair per frame and reads the tuple at once; a fresh tuple
+    // per hit was the largest allocation left in it (5.95 MB per call at the Network Navigator's view).
+    const colorOf = resolveLinkColorOf((w: number) => scale(w));
+    for (const w of [1, 2, 3]) colorOf(w); // misses: resolve and remember
+    const first = colorOf(1);
+    expect(Array.from(first)).toEqual(parsed(scale(1)));
+    for (const w of [2, 3, 1, 2]) {
+      const hit = colorOf(w);
+      expect(hit, `w=${w}`).toBe(first); // no allocation: the same tuple, refilled
+      expect(Array.from(hit), `w=${w}`).toEqual(parsed(scale(w)));
+    }
+  });
+
   it("parses a constant stroke once for the style", () => {
     const colorOf = resolveLinkColorOf("rgba(10, 20, 30, 0.5)");
     expect(Array.from(colorOf(1))).toEqual([10, 20, 30, 128]);

@@ -1,10 +1,13 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import { appendFileSync } from "node:fs";
+import { scaleSqrt } from "d3-scale";
+import { Session } from "node:inspector";
 import { buildLODTree, computeLODGeometry, cut, declutterFrontier, visibleWorldRect, type LODTree, type LODTransform } from "../lod.js";
 import { multilevelSeed } from "../coarsen.js";
-import { superEdges, makeSuperEdgesScratch, type SuperEdgesData, type SuperEdgesScratch } from "../glyphs.js";
+import { superEdges, makeSuperEdgesScratch, resolveLinkColorOf, type SuperEdgesData, type SuperEdgesScratch, type SuperEdgeStyleResolved } from "../glyphs.js";
 import { buildGraph } from "../graph.js";
 import { buildModuleLODTree, type ModuleNode } from "../modules.js";
+import { firstDifference, makeMapSuperEdgesScratch, superEdgesMapReference } from "./super-edges-map-reference.js";
 
 /**
  * Per-frame regression guard for #210 (AGENTS.md lifecycle §5): `superEdges` must do **zero
@@ -39,6 +42,14 @@ const ASSERT = !!process.env.PERF_ASSERT;
 const SWEEP_FRAME_MS = Number(process.env.PERF_SUPER_EDGES_MS) || 20;
 const ALL_FRONTIER_MS = Number(process.env.PERF_SUPER_EDGES_ALL_MS) || 3000;
 const ALLOC_KB_PER_FRAME = Number(process.env.PERF_SUPER_EDGES_ALLOC_KB) || 256;
+// #364, against the Map-based gather on the same inputs (interleaved min-of-5), under PERF_ASSERT. Measured
+// at 1M leaves (ragged module tree, half-arrows): sweep 0.76-0.82x, mixed cut 0.34-0.39x, every leaf
+// 0.32-0.33x; transient heap 0.1-0.8 B per drawn pair vs the Map gather's 90-199. The ceilings: never slower
+// than the path it replaces, at least the issue's 25% faster where the Maps did their work (the mixed cut,
+// every leaf), and no per-pair garbage.
+const VS_MAP_MAX = Number(process.env.PERF_SUPER_EDGES_VS_MAP) || 1;
+const VS_MAP_LARGE_MAX = Number(process.env.PERF_SUPER_EDGES_VS_MAP_LARGE) || 0.75;
+const TRANSIENT_B_PER_PAIR = Number(process.env.PERF_SUPER_EDGES_TRANSIENT_B) || 4;
 const W = 1280;
 const H = 800;
 
@@ -491,6 +502,229 @@ describe("#325 superEdges per-frame cost over a RAGGED module tree (cross-depth 
         }
       }
       expect(lift, "the ragged fixture's CSR carries no cross-depth pairs").toBeGreaterThan(total / 50);
+    },
+    600_000,
+  );
+});
+
+// ---- #364: the gather's scratch without Maps, against the Map-based gather it replaced ----------------
+
+/** The Network Navigator's link style — directed half-arrows, so the reciprocal-width pass runs too — with
+ *  its colour path: a d3 colour scale of the flow through the engine's memo (`resolveLinkColorOf`), whose
+ *  hits refill one tuple. So the sampling profiler's bytes are the gather's plus that colour path's; the
+ *  width is a constant (a user's scale allocates what it allocates). */
+const HALF_STYLE = {
+  ...SE_STYLE,
+  linkStyle: "half-arrow" as const,
+  directed: true,
+  bend: 0.15,
+  colorOf: resolveLinkColorOf(scaleSqrt<string>().domain([0, 40]).range(["rgba(90,100,120,0.12)", "rgba(60,70,90,0.85)"]).clamp(true)),
+};
+
+/** Map and Set entries written while `run` runs: the #364 signature. The Map-based gather wrote one or
+ *  more per drawn pair (the reciprocal-width lookup alone held every pair with both ends present). */
+function mapWrites(run: () => void): number {
+  const set = vi.spyOn(Map.prototype, "set");
+  const add = vi.spyOn(Set.prototype, "add");
+  try {
+    run();
+    return set.mock.calls.length + add.mock.calls.length;
+  } finally {
+    set.mockRestore();
+    add.mockRestore();
+  }
+}
+
+/** Bytes the scratch retains between calls: presence, gather rows, the cover memo and the pair indexes. */
+function scratchBytes(sc: SuperEdgesScratch): number {
+  return sc.seen.byteLength + gatherBytes(sc) + memoBytes(sc);
+}
+/** The gather rows (`aS`/`bS`/`wS`), which the Map-based gather retained too. */
+function gatherBytes(sc: SuperEdgesScratch): number {
+  return sc.aS.byteLength + sc.bS.byteLength + sc.wS.byteLength;
+}
+/** What #364 added: the cover memo, the pair indexes and their row arrays. */
+function memoBytes(sc: SuperEdgesScratch): number {
+  return sc.cover.byteLength + sc.coverGen.byteLength + sc.pairs.byteLength + sc.pairedRows.byteLength +
+    sc.claimed.byteLength + sc.claimA.byteLength + sc.claimB.byteLength + sc.claimW.byteLength + sc.claimX.byteLength + sc.claimBits.byteLength;
+}
+
+type Shape = { name: string; frontier: Uint32Array; view: Frame["view"] };
+
+/**
+ * Interleaved min-of-`reps` wall-clock of the two gathers on the same input, alternating which goes first
+ * so each pays for its own garbage (the Map gather's GC would otherwise land in the other's timings).
+ */
+function versusMap(tree: LODTree, shape: Shape, style: SuperEdgeStyleResolved, sc: SuperEdgesScratch, ref: ReturnType<typeof makeMapSuperEdgesScratch>, reps: number): { ms: number; mapMs: number } {
+  let ms = Infinity;
+  let mapMs = Infinity;
+  const timeNew = (): void => {
+    const t0 = performance.now();
+    superEdges(tree, shape.frontier, style, shape.view, sc);
+    ms = Math.min(ms, performance.now() - t0);
+  };
+  const timeMap = (): void => {
+    const t0 = performance.now();
+    superEdgesMapReference(tree, shape.frontier, style, shape.view, ref);
+    mapMs = Math.min(mapMs, performance.now() - t0);
+  };
+  for (let r = 0; r < reps; r++) {
+    if (r % 2 === 0) { timeNew(); timeMap(); } else { timeMap(); timeNew(); }
+  }
+  return { ms, mapMs };
+}
+
+/** One node of the V8 sampling heap profile (the structural subset used here). */
+interface SamplingNode {
+  callFrame: { functionName: string };
+  selfSize: number;
+  children: SamplingNode[];
+}
+
+function bytesAllocatedIn(node: SamplingNode, name: string, inside: boolean): number {
+  const here = inside || node.callFrame.functionName === name;
+  let sum = here ? node.selfSize : 0;
+  for (const c of node.children) sum += bytesAllocatedIn(c, name, here);
+  return sum;
+}
+
+/** Bytes the sampling heap profiler (GC-collected objects included, as in #233) attributes to `fnName` and
+ *  its callees over `calls` runs of `run`. */
+async function sampledBytes(run: () => void, calls: number, fnName: string): Promise<number> {
+  const session = new Session();
+  session.connect();
+  await new Promise<void>((resolve, reject) => {
+    session.post("HeapProfiler.startSampling", { samplingInterval: 16384, includeObjectsCollectedByMajorGC: true, includeObjectsCollectedByMinorGC: true }, (err) => (err ? reject(err) : resolve()));
+  });
+  for (let i = 0; i < calls; i++) run();
+  const head = await new Promise<SamplingNode>((resolve, reject) => {
+    session.post("HeapProfiler.stopSampling", (err, r) => (err ? reject(err) : resolve(r.profile.head)));
+  });
+  session.disconnect();
+  return bytesAllocatedIn(head, fnName, false);
+}
+
+/** The frontier shapes of a ragged module tree: a zoom sweep and a large mixed-level cut (reductions ON),
+ *  and every leaf present with everything on screen (reductions OFF). `all` lists every shape. */
+function raggedShapes(tree: LODTree, frames: Frame[], depth: Int32Array): { sweep: Shape[]; mixed: Shape; leaves: Shape; all: Shape[] } {
+  const wide = { minX: -1e9, maxX: 1e9, minY: -1e9, maxY: 1e9 };
+  const sweep = frames.map((f, i) => ({ name: `sweep ${i}`, frontier: f.frontier, view: f.view }));
+  const mixed = { name: "mixed", frontier: mixedFrontier(tree, depth), view: wide };
+  const leaves = { name: "all leaves", frontier: new Uint32Array(tree.leafCount).map((_, i) => i), view: wide };
+  return { sweep, mixed, leaves, all: [...sweep, mixed, leaves] };
+}
+
+describe("#364 superEdges scratch without Maps, against the Map-based gather it replaced", () => {
+  it("writes no Map or Set entry per frame, keeps its memo, and draws what the Map gather drew, reductions ON and OFF", () => {
+    const N = 100_000;
+    const { tree, centroid, baseK, depth } = raggedModuleTree(N);
+    const { mixed, leaves, all: shapes } = raggedShapes(tree, sweepFrames(tree, centroid, baseK, 24), depth);
+    const styles = [SE_STYLE, HALF_STYLE];
+    const sc = makeSuperEdgesScratch();
+    const ref = makeMapSuperEdgesScratch();
+    const failures: string[] = [];
+    let claimCalls = 0; // calls in which finer drawn pairs claimed flow from an off-screen pair
+    // Warm pass, compared element for element with the Map gather (each side with its one reused scratch).
+    for (const base of styles) {
+      for (const crossLevelEdges of [false, true]) {
+        for (const shape of shapes) {
+          const style = { ...base, crossLevelEdges };
+          const got = superEdges(tree, shape.frontier, style, shape.view, sc);
+          if (sc.claimed.size > 0) claimCalls++;
+          const diff = firstDifference(got, superEdgesMapReference(tree, shape.frontier, style, shape.view, ref));
+          if (diff !== "") failures.push(`${shape.name}, ${base.linkStyle}, crossLevelEdges=${crossLevelEdges}: ${diff}`);
+        }
+      }
+    }
+    expect(failures.slice(0, 3), `${failures.length} calls differ`).toEqual([]);
+    // Non-vacuity for the claim filter and index: the finite views claim, so the pass below runs them.
+    // (Anchoring needs module links, which this fixture has none of: super-edges-memo.test.ts asserts its
+    // zero Map/Set writes, and module-boundary-perf times it.)
+    console.log(`#364 warm pass: ${claimCalls} calls with claims`);
+    expect(claimCalls).toBeGreaterThan(0);
+    const held = { seen: sc.seen, cover: sc.cover, coverGen: sc.coverGen, pairs: sc.pairs.capacity, claimed: sc.claimed.capacity, pairedRows: sc.pairedRows, aS: sc.aS };
+    expect(held.cover.length).toBeGreaterThanOrEqual(tree.size);
+
+    // 1. Deterministic signature: the whole second pass (every shape, style and crossLevelEdges) writes no
+    // Map or Set entry, where the Map gather writes one or more per drawn pair on one of those inputs.
+    const pass = (): void => {
+      for (const base of styles) for (const crossLevelEdges of [false, true]) for (const shape of shapes) superEdges(tree, shape.frontier, { ...base, crossLevelEdges }, shape.view, sc);
+    };
+    expect(mapWrites(pass)).toBe(0);
+    expect(mapWrites(() => superEdgesMapReference(tree, mixed.frontier, { ...HALF_STYLE, crossLevelEdges: true }, mixed.view, ref))).toBeGreaterThan(N / 10);
+
+    // 2. Nothing is reallocated once warm: the cover memo (O(tree.size), grown once) and the pair indexes
+    // (at their high-water) keep their identity and capacity across the pass.
+    expect(sc.seen).toBe(held.seen);
+    expect(sc.cover).toBe(held.cover);
+    expect(sc.coverGen).toBe(held.coverGen);
+    expect(sc.pairs.capacity).toBe(held.pairs);
+    expect(sc.claimed.capacity).toBe(held.claimed);
+    expect(sc.pairedRows).toBe(held.pairedRows);
+    expect(sc.aS).toBe(held.aS);
+
+    // 3. Baseline comparison (reported; asserted at scale under PERF_ASSERT, see the bench below): the mixed
+    // cut and every leaf, cross-level on, half-arrows — the Map-heaviest inputs.
+    for (const shape of [mixed, leaves]) {
+      const { ms, mapMs } = versusMap(tree, shape, { ...HALF_STYLE, crossLevelEdges: true }, sc, ref, 5);
+      console.log(`#364 ${shape.name} (frontier ${shape.frontier.length}): ${ms.toFixed(1)}ms vs Map ${mapMs.toFixed(1)}ms (${(ms / mapMs).toFixed(2)}x), scratch ${(scratchBytes(sc) / 2 ** 20).toFixed(1)} MB`);
+      expect(ms, `${shape.name}: ${ms.toFixed(1)}ms`).toBeLessThan(400); // the #325 all-leaves ceiling
+    }
+  });
+
+  (BENCH ? it : it.skip)(
+    `bench: superEdges vs the Map-based gather at ${BENCH_N.toLocaleString()} leaves (ragged module tree)`,
+    async () => {
+      const { tree, centroid, baseK, depth } = raggedModuleTree(BENCH_N);
+      const { sweep, mixed, leaves, all: shapes } = raggedShapes(tree, sweepFrames(tree, centroid, baseK, 24), depth);
+      const log = (line: string): void => {
+        console.log(line);
+        appendFileSync("/tmp/super-edges-perf.txt", `[${process.env.BENCH_SUPER_EDGES_LABEL ?? "run"}] #364 ${line}\n`);
+      };
+      const failures: string[] = [];
+      for (const crossLevelEdges of [false, true]) {
+        const style = { ...HALF_STYLE, crossLevelEdges };
+        const sc = makeSuperEdgesScratch();
+        const ref = makeMapSuperEdgesScratch();
+        // Identical output on every shape (deterministic, always asserted), which also warms both sides.
+        for (const shape of shapes) {
+          const diff = firstDifference(superEdges(tree, shape.frontier, style, shape.view, sc), superEdgesMapReference(tree, shape.frontier, style, shape.view, ref));
+          if (diff !== "") failures.push(`${shape.name}, crossLevelEdges=${crossLevelEdges}: ${diff}`);
+        }
+        expect(mapWrites(() => { for (const shape of shapes) superEdges(tree, shape.frontier, style, shape.view, sc); }), `crossLevelEdges=${crossLevelEdges}: Map/Set writes`).toBe(0);
+
+        // Reductions ON, zoom sweep: summed min-of-5 per frame, against the Map gather.
+        let sweepMs = 0;
+        let sweepMapMs = 0;
+        for (const shape of sweep) {
+          const t = versusMap(tree, shape, style, sc, ref, 5);
+          sweepMs += t.ms;
+          sweepMapMs += t.mapMs;
+        }
+        log(`crossLevel=${crossLevelEdges} sweep (24 frames, max frontier ${Math.max(...sweep.map((f) => f.frontier.length))}): ${sweepMs.toFixed(1)}ms vs Map ${sweepMapMs.toFixed(1)}ms (${(sweepMs / sweepMapMs).toFixed(2)}x)`);
+        if (ASSERT) expect(sweepMs / sweepMapMs, `crossLevel=${crossLevelEdges} sweep vs the Map gather`).toBeLessThan(VS_MAP_MAX);
+        for (const shape of [mixed, leaves]) {
+          const { ms, mapMs } = versusMap(tree, shape, style, sc, ref, 5);
+          const edges = superEdges(tree, shape.frontier, style, shape.view, sc).ids.length;
+          // Transient heap per call beyond the on-heap outputs (ids + flows, 16 B per drawn pair).
+          const calls = 4;
+          const outBytes = 16 * edges * calls;
+          const own = (await sampledBytes(() => superEdges(tree, shape.frontier, style, shape.view, sc), calls, "superEdges")) - outBytes;
+          const map = (await sampledBytes(() => superEdgesMapReference(tree, shape.frontier, style, shape.view, ref), calls, "superEdgesMapReference")) - outBytes;
+          log(
+            `crossLevel=${crossLevelEdges} ${shape.name} (frontier ${shape.frontier.length.toLocaleString()}, ${edges.toLocaleString()} pairs): ${ms.toFixed(1)}ms vs Map ${mapMs.toFixed(1)}ms (${(ms / mapMs).toFixed(2)}x); ` +
+              `transient ${(own / calls / edges).toFixed(2)} B/pair vs Map ${(map / calls / edges).toFixed(2)} B/pair; ` +
+              `scratch ${(scratchBytes(sc) / 2 ** 20).toFixed(1)} MB (seen ${(sc.seen.byteLength / 2 ** 20).toFixed(1)}, rows ${(gatherBytes(sc) / 2 ** 20).toFixed(1)}, ` +
+              `#364 memo ${(memoBytes(sc) / 2 ** 20).toFixed(1)}: cover ${((sc.cover.byteLength + sc.coverGen.byteLength) / 2 ** 20).toFixed(1)}, pairs ${(sc.pairs.byteLength / 2 ** 20).toFixed(1)}, ` +
+              `pairedRows ${(sc.pairedRows.byteLength / 2 ** 20).toFixed(1)}) at tree.size ${tree.size.toLocaleString()}`,
+          );
+          if (ASSERT) {
+            expect(ms / mapMs, `crossLevel=${crossLevelEdges} ${shape.name} vs the Map gather`).toBeLessThan(VS_MAP_LARGE_MAX);
+            expect(own / calls / edges, `crossLevel=${crossLevelEdges} ${shape.name}: transient bytes per drawn pair`).toBeLessThan(TRANSIENT_B_PER_PAIR);
+          }
+        }
+      }
+      expect(failures.slice(0, 3), `${failures.length} calls differ`).toEqual([]);
     },
     600_000,
   );
