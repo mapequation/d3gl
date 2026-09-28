@@ -144,6 +144,10 @@ function postFrame(type: "frame" | "done", s: FrameSource | null = state, lodFra
   // The per-frame LOD step (#343): refit the coarsening tree in place (cx/cy/extent in the geometry buffer),
   // or rebuild the spatial tree into a frame to transfer (none when nothing moved since the last one).
   const lodFrame = s.lod ? lodFrameStep(s.lod, s.positions, lodFrameId) : null;
+  // A spatial stream held back by back-pressure (#343) posts no frame until a buffer returns and the frame it
+  // skipped is built (`lod-recycle`): the tree is what the engine draws and frames, so its positions — and the
+  // super-edge rows cut for their fit (#433) — travel with it, not ahead of it.
+  if (!lodFrame && type === "frame" && s.lod?.kind === "spatial" && s.lod.pending) return;
   const message: ProgressMessage = { type, tick: s.tick };
   if (!s.shared) message.positions = s.positions;
   if (s.lod?.kind === "structure" && s.geomBuffer) message.geometry = new Float32Array(s.geomBuffer); // copy-mode snapshot
