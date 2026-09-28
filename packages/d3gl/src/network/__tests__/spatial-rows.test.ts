@@ -2,8 +2,8 @@ import { describe, it, expect } from "vitest";
 import { buildMortonLODTree, computeLODPositions, computeLODStyle, cut, declutterFrontier, makeCutScratch, makeDeclutterFrontierScratch, visibleWorldRect, type LODTransform, type LODTree } from "../lod.js";
 import { buildGraph, type NetworkGraph } from "../graph.js";
 import { buildLeafIncidence, lazySuperEdges, makeLazySuperEdgesScratch, rowSuperEdges, type LazyCut } from "../lazy-super-edges.js";
-import { allocateSpatialRows, buildCoverRows, cutRowCells, makeSpatialRowsScratch, rowOf, spatialRowsGraph, type SpatialRows } from "../spatial-rows.js";
-import { lodFrameStep, lodTreeFromSpatialFrame, makeSpatialLODStream, recycleSpatialFrame, type LODView } from "../lod-frame.js";
+import { allocateSpatialRows, buildCoverRows, cutRowCells, makeSpatialRowsScratch, rowOf, spatialRowsByteLength, spatialRowsGraph, type SpatialRows } from "../spatial-rows.js";
+import { MAX_OUTSTANDING, lodFrameStep, lodTreeFromSpatialFrame, makeSpatialLODStream, recycleSpatialFrame, spatialFrameByteLength, type LODView, type SpatialLODFrame } from "../lod-frame.js";
 import { layoutBox, layoutFitTransform } from "../fit.js";
 import type { SuperEdgeStyleResolved, SuperEdgesData } from "../glyphs.js";
 
@@ -19,7 +19,9 @@ import type { SuperEdgeStyleResolved, SuperEdgesData } from "../glyphs.js";
  *     that cut's covers it walks no leaf run; with rows for another view's cut, or none, it walks the unlisted
  *     covers' leaves and still draws the same;
  *   - a spatial stream given the edges and a view (a transform, or the fit) ships the rows of that view's
- *     covers with every rebuilt tree, reuses returned buffers, and builds none without links or a view.
+ *     covers with every rebuilt tree, reuses returned buffers, and builds none without links or a view;
+ *   - when the rows shrink (a zoom-in), the stream's pool drops the buffers too large for them, so a warm
+ *     stream at the new view allocates nothing and holds no stale buffer.
  */
 
 function rng(seed: number): () => number {
@@ -333,5 +335,89 @@ describe("a spatial stream ships the rows of its view's covers with each tree (#
     // No edges given: no rows either.
     const bare = makeSpatialLODStream(g.nodeCount, style, 1, undefined, view);
     expect(lodFrameStep(bare, g.positions, 1)?.rows).toBeUndefined();
+  });
+
+  it("drops pooled rows buffers too large for the rows after a zoom-in: the warm stream reuses buffers and holds no stale one", () => {
+    const g = fixture(6000, 11);
+    const style = { radii: new Float32Array(g.nodeCount).fill(3), weight: g.strength };
+    const fit: LODView = { transform: { k: 0.6, x: W / 2, y: H / 2 }, fitPad: 3, width: W, height: H, maxAggregateRadius: 20, screenSized: true, fadeBand: 0 };
+    const stream = makeSpatialLODStream(g.nodeCount, style, 1, g, fit);
+    // The engine draws one tree and holds the one it replaced until the next repaint, then hands it back.
+    const held: SpatialLODFrame[] = [];
+    let id = 0;
+    const seen = new Set<ArrayBuffer>();
+    const step = (): SpatialLODFrame => {
+      const f = lodFrameStep(stream, g.positions, ++id);
+      if (!f?.rows) throw new Error("no rows");
+      held.push(f);
+      const old = held.length > 2 ? held.shift() : undefined;
+      if (old) recycleSpatialFrame(stream, old.buffer, old.rows?.buffer);
+      return f;
+    };
+    for (let i = 0; i < 6; i++) seen.add(step().rows?.buffer ?? new ArrayBuffer(0));
+    const fitBytes = spatialRowsByteLength(held[held.length - 1]?.rows?.sizes ?? { size: 0, leafCount: 0, cells: 0, outEntries: 0, inEntries: 0 });
+    // Zoom in: the rows shrink by far more than half.
+    stream.view = { ...fit, transform: { k: 40, x: W / 2, y: H / 2 } };
+    let fresh = 0;
+    for (let i = 0; i < 12; i++) {
+      const f = step();
+      const rows = f.rows;
+      if (!rows) throw new Error("no rows");
+      const bytes = spatialRowsByteLength(rows.sizes);
+      expect(bytes * 4).toBeLessThan(fitBytes);
+      if (!seen.has(rows.buffer)) {
+        seen.add(rows.buffer);
+        // Only while the fit view's frames are still out does the stream allocate for the new size.
+        if (i >= MAX_OUTSTANDING) fresh++;
+      }
+      // Once the fit view's frames are back, nothing pooled is too large (or too small) for this view's rows.
+      const links = stream.links;
+      if (!links) throw new Error("no links");
+      if (i >= MAX_OUTSTANDING) for (const b of links.pool) {
+        expect(b.byteLength).toBeGreaterThanOrEqual(bytes);
+        expect(b.byteLength).toBeLessThanOrEqual(2 * bytes);
+      }
+    }
+    expect(fresh).toBe(0);
+  });
+
+  it("drops pooled frame buffers too small for the tree after it grows (a collapsed layout spreads out)", () => {
+    const g = fixture(6000, 12);
+    const style = { radii: new Float32Array(g.nodeCount).fill(3), weight: g.strength };
+    const stream = makeSpatialLODStream(g.nodeCount, style, 1);
+    const held: SpatialLODFrame[] = [];
+    const seen = new Set<ArrayBuffer>();
+    let id = 0;
+    const step = (positions: Float32Array): SpatialLODFrame => {
+      const f = lodFrameStep(stream, positions, ++id);
+      if (!f) throw new Error("no frame");
+      held.push(f);
+      const old = held.length > 2 ? held.shift() : undefined;
+      if (old) recycleSpatialFrame(stream, old.buffer);
+      return f;
+    };
+    // Every node on one of a few dozen points: the tree has a few cells over its leaves.
+    const collapsed = g.positions.map((v, i) => Math.round((v + (i % 2) * 7) / 120) * 120);
+    let small = 0;
+    for (let i = 0; i < 6; i++) {
+      const f = step(collapsed);
+      seen.add(f.buffer);
+      small = spatialFrameByteLength(f.header);
+    }
+    let fresh = 0;
+    for (let i = 0; i < 12; i++) {
+      const f = step(g.positions);
+      const bytes = spatialFrameByteLength(f.header);
+      expect(bytes).toBeGreaterThan((9 / 8) * small); // past the slack of the buffers the collapsed trees used
+      if (!seen.has(f.buffer)) {
+        seen.add(f.buffer);
+        if (i >= MAX_OUTSTANDING) fresh++;
+      }
+      if (i >= MAX_OUTSTANDING) for (const b of stream.pool) {
+        expect(b.byteLength).toBeGreaterThanOrEqual(bytes);
+        expect(b.byteLength).toBeLessThanOrEqual(2 * bytes);
+      }
+    }
+    expect(fresh).toBe(0);
   });
 });

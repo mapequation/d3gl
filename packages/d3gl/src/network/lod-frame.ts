@@ -305,11 +305,22 @@ export function recycleSpatialFrame(stream: SpatialLODStream, buffer: ArrayBuffe
   return stream.pending && stream.outstanding < MAX_OUTSTANDING;
 }
 
-/** A buffer of `pool` of at least `bytes` (and not more than twice it), or a fresh one with 1/8 slack. */
+/**
+ * A buffer of `pool` that fits `bytes` — at least `bytes` and at most twice it — or a fresh one with 1/8 slack.
+ * Pooled buffers that do not fit are dropped, not kept: a stream whose sizes moved on (a zoom-in shrinks the rows,
+ * a layout spreading out grows the tree) would otherwise hold them for the rest of the stream and allocate on
+ * every frame once they fill the pool. So the pool only ever keeps buffers the next frame can take. O(POOL_MAX).
+ */
 function takeBuffer(pool: ArrayBuffer[], bytes: number): ArrayBuffer {
-  const i = pool.findIndex((b) => b.byteLength >= bytes && b.byteLength <= 2 * bytes);
-  const [pooled] = i >= 0 ? pool.splice(i, 1) : [];
-  return pooled ?? new ArrayBuffer(Math.ceil((bytes * 9) / 8 / 8) * 8);
+  let taken: ArrayBuffer | undefined;
+  let kept = 0;
+  for (const b of pool) {
+    if (b.byteLength < bytes || b.byteLength > 2 * bytes) continue; // dropped
+    if (taken) pool[kept++] = b;
+    else taken = b;
+  }
+  pool.length = kept;
+  return taken ?? new ArrayBuffer(Math.ceil((bytes * 9) / 8 / 8) * 8);
 }
 
 /**
