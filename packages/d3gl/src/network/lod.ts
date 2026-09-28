@@ -887,15 +887,15 @@ function radixSortMorton(sc: MortonScratch, count: number): void {
   let iDst = sc.idxB;
   for (let shift = 0; shift < 32; shift += MORTON_BITS) {
     hist.fill(0);
-    for (let i = 0; i < count; i++) hist[((kSrc[i]! >>> shift) & 0xffff) + 1]!++;
-    for (let d = 0; d < MORTON_STEPS; d++) hist[d + 1] = hist[d + 1]! + hist[d]!;
+    for (let i = 0; i < count; i++) { const d = (((kSrc[i] ?? 0) >>> shift) & 0xffff) + 1; hist[d] = (hist[d] ?? 0) + 1; }
+    for (let d = 0; d < MORTON_STEPS; d++) hist[d + 1] = (hist[d + 1] ?? 0) + (hist[d] ?? 0);
     for (let i = 0; i < count; i++) {
-      const k = kSrc[i]!;
+      const k = kSrc[i] ?? 0;
       const d = (k >>> shift) & 0xffff;
-      const at = hist[d]!;
+      const at = hist[d] ?? 0;
       hist[d] = at + 1;
       kDst[at] = k;
-      iDst[at] = iSrc[i]!;
+      iDst[at] = iSrc[i] ?? 0;
     }
     const tk = kSrc; kSrc = kDst; kDst = tk;
     const ti = iSrc; iSrc = iDst; iDst = ti;
@@ -906,7 +906,7 @@ function radixSortMorton(sc: MortonScratch, count: number): void {
 function lowerBound(keys: Uint32Array, lo: number, hi: number, key: number): number {
   while (lo < hi) {
     const mid = (lo + hi) >>> 1;
-    if (keys[mid]! < key) lo = mid + 1;
+    if ((keys[mid] ?? 0) < key) lo = mid + 1;
     else hi = mid;
   }
   return lo;
@@ -973,8 +973,8 @@ export function buildMortonTopology(
   const keys = sc.keyA;
   const idx = sc.idxA;
   for (let i = 0; i < count; i++) {
-    const fx = (positions[i * 2]! - box.x0) * scale;
-    const fy = (positions[i * 2 + 1]! - box.y0) * scale;
+    const fx = ((positions[i * 2] ?? 0) - box.x0) * scale;
+    const fy = ((positions[i * 2 + 1] ?? 0) - box.y0) * scale;
     const qx = fx >= 0 ? (fx < MORTON_STEPS ? fx | 0 : MORTON_STEPS - 1) : 0;
     const qy = fy >= 0 ? (fy < MORTON_STEPS ? fy | 0 : MORTON_STEPS - 1) : 0;
     keys[i] = (spreadBits(qx) | (spreadBits(qy) << 1)) >>> 0;
@@ -998,15 +998,15 @@ export function buildMortonTopology(
   stackParent[0] = -1;
   while (sp > 0) {
     sp--;
-    const lo = stackLo[sp]!;
-    const hi = stackHi[sp]!;
+    const lo = stackLo[sp] ?? 0;
+    const hi = stackHi[sp] ?? 0;
     if (cells === sc.cellLo.length) growCells(sc, cells * 2);
     const c = cells++;
     sc.cellLo[c] = lo;
     sc.cellHi[c] = hi;
-    sc.cellParent[c] = stackParent[sp]!;
-    const first = sorted[lo]!;
-    const level = commonLevel(first, sorted[hi - 1]!);
+    sc.cellParent[c] = stackParent[sp] ?? -1;
+    const first = sorted[lo] ?? 0;
+    const level = commonLevel(first, sorted[hi - 1] ?? 0);
     if (hi - lo <= bucket || level >= maxDepth) {
       sc.cellBottom[c] = 1;
       continue;
@@ -1028,10 +1028,10 @@ export function buildMortonTopology(
   cellHeight.fill(0, 0, cells);
   for (let c = cells - 1; c >= 0; c--) {
     if (cellBottom[c] === 1) cellHeight[c] = 1;
-    const p = cellParent[c]!;
-    if (p >= 0 && cellHeight[p]! < cellHeight[c]! + 1) cellHeight[p] = cellHeight[c]! + 1;
+    const p = cellParent[c] ?? -1;
+    if (p >= 0 && (cellHeight[p] ?? 0) < (cellHeight[c] ?? 0) + 1) cellHeight[p] = (cellHeight[c] ?? 0) + 1;
   }
-  const maxHeight = cellHeight[0]!; // the root is the tallest
+  const maxHeight = cellHeight[0] ?? 0; // the root is the tallest
   const levelCount = maxHeight + 1;
   const size = count + cells;
   const a = allocate({ size, leafCount: count, levelCount });
@@ -1040,62 +1040,62 @@ export function buildMortonTopology(
   // 5. Level offsets (leaves, then cells by height) and each cell's global id, handed out per height in
   //    creation order.
   levelOffset.fill(0);
-  for (let c = 0; c < cells; c++) levelOffset[cellHeight[c]! + 1]!++;
+  for (let c = 0; c < cells; c++) { const h = (cellHeight[c] ?? 0) + 1; levelOffset[h] = (levelOffset[h] ?? 0) + 1; }
   levelOffset[1] = count;
-  for (let h = 1; h <= maxHeight; h++) levelOffset[h + 1] = levelOffset[h + 1]! + levelOffset[h]!;
+  for (let h = 1; h <= maxHeight; h++) levelOffset[h + 1] = (levelOffset[h + 1] ?? 0) + (levelOffset[h] ?? 0);
   const next = levelOffset.slice(0, levelCount); // per-height id cursor (tiny: one entry per level)
   for (let c = 0; c < cells; c++) {
-    const h = cellHeight[c]!;
-    cellId[c] = next[h]!;
-    next[h] = next[h]! + 1;
+    const h = cellHeight[c] ?? 0;
+    cellId[c] = next[h] ?? 0;
+    next[h] = (next[h] ?? 0) + 1;
   }
 
   // 6. Children CSR: a bottom cell parents its run's leaves, an internal cell its child cells.
   childOffset.fill(0);
   for (let c = 0; c < cells; c++) {
-    if (cellBottom[c] === 1) childOffset[cellId[c]! + 1] = cellHi[c]! - cellLo[c]!;
-    const p = cellParent[c]!;
-    if (p >= 0) childOffset[cellId[p]! + 1]!++;
+    if (cellBottom[c] === 1) childOffset[(cellId[c] ?? 0) + 1] = (cellHi[c] ?? 0) - (cellLo[c] ?? 0);
+    const p = cellParent[c] ?? -1;
+    if (p >= 0) { const o = (cellId[p] ?? 0) + 1; childOffset[o] = (childOffset[o] ?? 0) + 1; }
   }
   for (let g = 0; g < size; g++) childOffset[g + 1] = childOffset[g + 1]! + childOffset[g]!;
   // Scatter in creation order (an internal cell lists its children in Morton order; a bottom cell its
   // leaves in rank order), with the parents, leaf runs and cells alongside. `leafEnd` doubles as the
   // children cursor until the leaf runs are written.
   const fill = leafEnd;
-  for (let g = count; g < size; g++) fill[g] = childOffset[g]!;
+  for (let g = count; g < size; g++) fill[g] = childOffset[g] ?? 0;
   for (let c = 0; c < cells; c++) {
-    const g = cellId[c]!;
-    const lo = cellLo[c]!;
-    const hi = cellHi[c]!;
-    const p = cellParent[c]!;
+    const g = cellId[c] ?? 0;
+    const lo = cellLo[c] ?? 0;
+    const hi = cellHi[c] ?? 0;
+    const p = cellParent[c] ?? -1;
     if (p >= 0) {
-      const pg = cellId[p]!;
+      const pg = cellId[p] ?? 0;
       parent[g] = pg;
-      children[fill[pg]!] = g;
-      fill[pg] = fill[pg]! + 1;
+      children[fill[pg] ?? 0] = g;
+      fill[pg] = (fill[pg] ?? 0) + 1;
     } else {
       parent[g] = -1;
     }
     if (cellBottom[c] === 1) {
       for (let r = lo; r < hi; r++) {
-        const leaf = order[r]!;
-        children[fill[g]!] = leaf;
-        fill[g] = fill[g]! + 1;
+        const leaf = order[r] ?? 0;
+        children[fill[g] ?? 0] = leaf;
+        fill[g] = (fill[g] ?? 0) + 1;
         parent[leaf] = g;
       }
     }
-    const first = sorted[lo]!;
-    const level = commonLevel(first, sorted[hi - 1]!);
+    const first = sorted[lo] ?? 0;
+    const level = commonLevel(first, sorted[hi - 1] ?? 0);
     mortonLevel[g - count] = level;
     mortonCode[g - count] = (first & mortonMask(level)) >>> 0;
   }
   for (let c = 0; c < cells; c++) {
-    const g = cellId[c]!;
-    leafStart[g] = cellLo[c]!;
-    leafEnd[g] = cellHi[c]!;
+    const g = cellId[c] ?? 0;
+    leafStart[g] = cellLo[c] ?? 0;
+    leafEnd[g] = cellHi[c] ?? 0;
   }
   for (let r = 0; r < count; r++) {
-    const leaf = order[r]!;
+    const leaf = order[r] ?? 0;
     leafOrder[r] = leaf;
     leafStart[leaf] = r;
     leafEnd[leaf] = r + 1;
@@ -1162,25 +1162,25 @@ export function findMortonCell(tree: LODTopology, box: MortonBox, level: number,
     cd = nl === 0 ? 0 : ((spreadBits(Math.floor(jx)) | (spreadBits(Math.floor(jy)) << 1)) << (32 - 2 * nl)) >>> 0;
   }
   const { leafCount, childOffset, children, levelOffset, levelCount } = tree;
-  const root = levelOffset[levelCount - 1]!;
+  const root = levelOffset[levelCount - 1] ?? 0;
   let g = root;
   for (;;) {
     const o = g - leafCount;
-    const gl = cells.level[o]!;
+    const gl = cells.level[o] ?? 0;
     if (gl >= lv) {
       // g's cell is at or below the square's depth: it lies inside the square iff it matches there.
-      return ((cells.code[o]! & mortonMask(lv)) >>> 0) === ((cd & mortonMask(lv)) >>> 0) ? g : -1;
+      return (((cells.code[o] ?? 0) & mortonMask(lv)) >>> 0) === ((cd & mortonMask(lv)) >>> 0) ? g : -1;
     }
     // g's cell strictly contains the square iff their prefixes agree to g's depth.
-    if (((cells.code[o]! ^ cd) & mortonMask(gl)) >>> 0 !== 0) return -1;
+    if ((((cells.code[o] ?? 0) ^ cd) & mortonMask(gl)) >>> 0 !== 0) return -1;
     let next = -1;
     let leafChildren = false;
-    for (let p = childOffset[g]!; p < childOffset[g + 1]!; p++) {
-      const c = children[p]!;
+    for (let p = childOffset[g] ?? 0; p < (childOffset[g + 1] ?? 0); p++) {
+      const c = children[p] ?? 0;
       if (c < leafCount) { leafChildren = true; break; }
       const co = c - leafCount;
-      const m = mortonMask(Math.min(cells.level[co]!, lv));
-      if (((cells.code[co]! ^ cd) & m) >>> 0 === 0) { next = c; break; }
+      const m = mortonMask(Math.min(cells.level[co] ?? 0, lv));
+      if ((((cells.code[co] ?? 0) ^ cd) & m) >>> 0 === 0) { next = c; break; }
     }
     if (leafChildren) return g; // a bottom cell covering the square: its closest cover
     if (next < 0) return -1; // the square's quadrant holds no leaf of this tree
@@ -1312,14 +1312,14 @@ export function computeLODPositions(tree: LODPositionTree, positions: ArrayLike<
           if (y > maxY) maxY = y;
         } else {
           const o = 4 * (c - leafCount);
-          if (bb[o]! < minX) minX = bb[o]!;
-          if (bb[o + 1]! < minY) minY = bb[o + 1]!;
-          if (bb[o + 2]! > maxX) maxX = bb[o + 2]!;
-          if (bb[o + 3]! > maxY) maxY = bb[o + 3]!;
+          if ((bb[o] ?? 0) < minX) minX = bb[o] ?? 0;
+          if ((bb[o + 1] ?? 0) < minY) minY = bb[o + 1] ?? 0;
+          if ((bb[o + 2] ?? 0) > maxX) maxX = bb[o + 2] ?? 0;
+          if ((bb[o + 3] ?? 0) > maxY) maxY = bb[o + 3] ?? 0;
           if (discs) {
             // A child module sits on its disc centre: take its disc offset back off for its leaf centroid.
-            x -= discs.dx[c - leafCount]!;
-            y -= discs.dy[c - leafCount]!;
+            x -= discs.dx[c - leafCount] ?? 0;
+            y -= discs.dy[c - leafCount] ?? 0;
           }
         }
         sumC += cc;
@@ -1333,7 +1333,7 @@ export function computeLODPositions(tree: LODPositionTree, positions: ArrayLike<
         const o = g - leafCount;
         gx += discs.dx[o]!;
         gy += discs.dy[o]!;
-        disc = discs.r[o]!;
+        disc = discs.r[o] ?? 0;
       }
       cx[g] = gx;
       cy[g] = gy;
@@ -1357,7 +1357,7 @@ export function computeLODPositions(tree: LODPositionTree, positions: ArrayLike<
         const c = children[p]!;
         const dx = gx - cx[c]!;
         const dy = gy - cy[c]!;
-        const e = extent[c]!;
+        const e = extent[c] ?? 0;
         if (e === 0) {
           const d2 = dx * dx + dy * dy;
           if (d2 > leafD2) leafD2 = d2;
@@ -1424,24 +1424,24 @@ function hueTerms(r: number, g: number, b: number, out: Float64Array): void {
   const key = (r << 16) | (g << 8) | b;
   const slot = Math.imul(key, 0x9e3779b1) >>> (32 - HCL_MEMO_BITS);
   if (hclMemoKey[slot] === key) {
-    out[0] = hclMemoVal[4 * slot]!;
-    out[1] = hclMemoVal[4 * slot + 1]!;
-    out[2] = hclMemoVal[4 * slot + 2]!;
-    out[3] = hclMemoVal[4 * slot + 3]!;
+    out[0] = hclMemoVal[4 * slot] ?? 0;
+    out[1] = hclMemoVal[4 * slot + 1] ?? 0;
+    out[2] = hclMemoVal[4 * slot + 2] ?? 0;
+    out[3] = hclMemoVal[4 * slot + 3] ?? 0;
     return;
   }
   rgbToHcl(r, g, b, out);
-  const h = out[0]!;
-  const ch = Number.isNaN(out[1]!) ? 0 : out[1]!;
-  const l = Number.isNaN(out[2]!) ? 0 : out[2]!;
+  const h = out[0] ?? 0;
+  const ch = Number.isNaN(out[1] ?? 0) ? 0 : (out[1] ?? 0);
+  const l = Number.isNaN(out[2] ?? 0) ? 0 : (out[2] ?? 0);
   // (Adding +0 for a NaN hue leaves a sum from +0 unchanged — the pass skipped the term instead.)
   out[0] = Number.isNaN(h) ? 0 : Math.cos((h * Math.PI) / 180) * ch;
   out[1] = Number.isNaN(h) ? 0 : Math.sin((h * Math.PI) / 180) * ch;
   out[2] = ch;
   out[3] = l;
   hclMemoKey[slot] = key;
-  hclMemoVal[4 * slot] = out[0]!;
-  hclMemoVal[4 * slot + 1] = out[1]!;
+  hclMemoVal[4 * slot] = out[0] ?? 0;
+  hclMemoVal[4 * slot + 1] = out[1] ?? 0;
   hclMemoVal[4 * slot + 2] = ch;
   hclMemoVal[4 * slot + 3] = l;
 }
@@ -1453,9 +1453,9 @@ function hueTerms(r: number, g: number, b: number, out: Float64Array): void {
  * tree), through {@link hueTerms}' memo.
  */
 function rgbToHcl(r: number, g: number, b: number, out: Float64Array): void {
-  const lr = LRGB[r]!;
-  const lg = LRGB[g]!;
-  const lb = LRGB[b]!;
+  const lr = LRGB[r] ?? 0;
+  const lg = LRGB[g] ?? 0;
+  const lb = LRGB[b] ?? 0;
   const y = xyz2lab((0.2225045 * lr + 0.7168786 * lg + 0.0606169 * lb) / LAB_YN);
   let x = y;
   let z = y;
@@ -1555,11 +1555,11 @@ export function computeLODStyle(
         else sumR2 += radius[c]! * radius[c]!;
         sb += border[c]!;
         if (leafColors) {
-          hueTerms(color[c * 4]!, color[c * 4 + 1]!, color[c * 4 + 2]!, hclOut);
-          hx += hclOut[0]!;
-          hy += hclOut[1]!;
-          sumC += hclOut[2]!;
-          sumL += hclOut[3]!;
+          hueTerms(color[c * 4] ?? 0, color[c * 4 + 1] ?? 0, color[c * 4 + 2] ?? 0, hclOut);
+          hx += hclOut[0] ?? 0;
+          hy += hclOut[1] ?? 0;
+          sumC += hclOut[2] ?? 0;
+          sumL += hclOut[3] ?? 0;
           sumA += color[c * 4 + 3]!;
           nc++;
         }
@@ -1575,9 +1575,9 @@ export function computeLODStyle(
       if (leafColors && nc > 0) {
         const hue = (Math.atan2(hy, hx) * 180) / Math.PI;
         hclToRgb(hue, sumC / nc, sumL / nc, hclOut);
-        color[g * 4] = Math.max(0, Math.min(255, Math.round(hclOut[0]!)));
-        color[g * 4 + 1] = Math.max(0, Math.min(255, Math.round(hclOut[1]!)));
-        color[g * 4 + 2] = Math.max(0, Math.min(255, Math.round(hclOut[2]!)));
+        color[g * 4] = Math.max(0, Math.min(255, Math.round(hclOut[0] ?? 0)));
+        color[g * 4 + 1] = Math.max(0, Math.min(255, Math.round(hclOut[1] ?? 0)));
+        color[g * 4 + 2] = Math.max(0, Math.min(255, Math.round(hclOut[2] ?? 0)));
         color[g * 4 + 3] = Math.round(sumA / nc);
       }
     }
