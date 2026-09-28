@@ -7,7 +7,8 @@ import { SegmentedReduce, type RangeTarget, type ReduceMap } from "./passes/segm
 import { GridPyramid } from "./passes/grid-pyramid.js";
 import { RepulsionPass } from "./passes/repulsion.js";
 import { NestedIntegratePass, NestedPredictPass, type NestedSlotInputs } from "./passes/nested.js";
-import { COLLISION_STEPS, CollisionGrid, type CollisionGatherInput } from "./passes/collision.js";
+import { COLLISION_STEPS, CollisionGrid, collisionGridSide, type CollisionInputs } from "./passes/collision.js";
+import { COLLISION_LIST_MAX } from "./collision-plan.js";
 import { NestedComposePass } from "./passes/nested-compose.js";
 import { GpuSprings } from "./springs.js";
 import type { NestedSpringInputs } from "./passes/attraction.js";
@@ -17,7 +18,7 @@ import { NESTED_MAX_SLOTS, gpuNestedSlotNeed, type GpuLayoutNeed } from "./devic
 import type { PackedPositions } from "./async-readback.js";
 import type { StreamSolver } from "./gpu-stream.js";
 import { itemCostMs, type ItemCosts, type ItemKind } from "./frame-budget.js";
-import { NESTED_LARGE_MAX, type NestedSolverTopology } from "./nested-topology.js";
+import type { NestedSolverTopology } from "./nested-topology.js";
 import { EXACT_MAX } from "../nested-layout.js";
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -37,19 +38,21 @@ import { EXACT_MAX } from "../nested-layout.js";
 // | stream tick                 | P                                                    | F_b                    | I                  |
 // |-----------------------------|------------------------------------------------------|------------------------|--------------------|
 // | organise (first 60%)        | reductions (box) → tile pyramid; clear force         | repulsion, band b      | predict v*; springs at x + v* (zero rest); integrate |
-// | compact, collision step 1   | predict; springs (rest lengths); integrate; reductions; collision cells, counts, rounds | collision gather, band b | swap |
-// | compact, collision step 2   | reductions; collision cells, counts, rounds           | collision gather, band b | swap; next tick   |
+// | compact, collision step 1   | predict; springs (rest lengths); integrate; reductions; collision cells, both tables' counts and rounds | collision work items, then resolve, of band b | swap |
+// | compact, collision step 2   | reductions; collision cells, both tables' counts and rounds | collision work items, then resolve, of band b | swap; next tick |
 //
 // The composition (`passes/nested-compose.ts`) maps the local solutions into world discs and packs leaf
 // positions and module discs in node order, for the streaming readback ({@link prepareReadback}).
 //
-// Not every item fits the frame budget. Two cannot be cut: compact step 1's P (4.2 ms at 325k, 7.3 ms at
+// The collision gather's cost follows the contacts, not the leaves: a module of heavy-tailed radii can do
+// ten times the work per leaf of an even one. So its bands are cut at equal shares of the collision
+// plan's per-slot work estimate (`collision-plan.ts`), not at equal rows, and costed by the plan's total,
+// so that a band costs what the frame budget expects (#380).
+//
+// Not every item fits the frame budget. Two cannot be cut: compact step 1's P (4-5 ms at 325k, 7.5 ms at
 // 1M on an M1 Max) and the composition a copy frame adds (2.7-5.6 / 4.5-9.9 ms), which the frame reserves
 // but which never stops its first item. So a copy frame can carry up to ~12 ms of layout GPU work at 325k
-// and ~17 ms at 1M, against a 10 ms budget at 60 Hz (5 ms at 120 Hz). A large module whose radii are
-// heavy-tailed makes both the gather and P grow as k² (every grid slot on the exact loop; the count and
-// round scatters contending at hundreds of discs per cell): one 60,000-child module takes a 55 ms gather
-// and a 12 ms P, and no band count fixes P.
+// and ~17 ms at 1M, against a 10 ms budget at 60 Hz (5 ms at 120 Hz).
 //
 // Not the CPU's: Jacobi instead of Gauss-Seidel links and collision pairs (every term reads one state),
 // and grid-pyramid Barnes-Hut instead of the CPU's adaptive quadtree for segments above 32 children (the
@@ -62,27 +65,43 @@ const NEAREST: SamplerProps = { minFilter: "nearest", magFilter: "nearest" };
 const NESTED_THETA = 0.9;
 
 /**
- * GPU time per leaf of the nested solve's work items, ns, per stream tick kind — measured on an M1 Max
- * (ANGLE Metal) on the synthetic Infomap-like maps (325,729 and 1,000,000 leaves; the per-leaf cost of
- * the larger map is lower, so these fit 325k and overestimate 1M):
- *
- * - organise: P 1.9 ms at 325k (reductions + tile pyramid), a whole-atlas repulsion band 2.1 ms, I 1.6 ms
- *   (predict + springs + integrate);
- * - compact, collision step 1: P 4.2 ms (the solve tick's predict + springs + integrate, the reductions,
- *   the collision cells and rounds), a whole-atlas gather band 4.9 ms, I a swap;
- * - compact, collision step 2: P ~1.3 ms (reductions, cells, rounds), the gather again.
- *
- * The flat layout's model would misjudge this solve both ways; a slower GPU is caught by the frame
- * budget's fences, as for the flat layout.
+ * GPU time per leaf of the organise ticks' work items, ns — measured on an M1 Max (ANGLE Metal) on the
+ * synthetic Infomap-like maps (325,729 and 1,000,000 leaves): P 1.9 ms at 325k (reductions + tile
+ * pyramid), a whole-atlas repulsion band 2.1 ms, I 1.6 ms (predict + springs + integrate).
  */
-const NESTED_NS: Readonly<Record<"organise" | "compact0" | "compact1", ItemCosts>> = {
-  organise: { prep: 4, force: 6, integrate: 4 },
-  compact0: { prep: 10, force: 13, integrate: 0.2 },
-  compact1: { prep: 3, force: 13, integrate: 0.2 },
-};
+const NESTED_ORGANISE_NS: ItemCosts = { prep: 4, force: 6, integrate: 4 };
 
-/** The band count's model: the heaviest band pass (the collision gather). */
-export const NESTED_ITEM_NS_PER_LEAF: ItemCosts = { prep: 10, force: 13, integrate: 4 };
+/**
+ * The compact ticks' work items, measured on the same M1 Max over web-NotreDame's Infomap trees, the
+ * synthetic 325k and 1M maps and one-module Zipf maps of 20,000 and 60,000 children (#380):
+ *
+ * - P (the solve tick's predict + springs + integrate on step 1, the reductions, the cell pass and the
+ *   occupancy scatters) is 3.4-5.4 ms, 7.5 at 1M: a fixed ~3.2 ms of passes plus 4 ns per leaf;
+ * - the unbanded gather is 4.0 ms plus 47 ps per unit of the collision plan's work estimate (its pair
+ *   tests plus 16 per cell visit), within ±8% on all six maps (5.2-11.7 ms) — where the previous 13 ns per
+ *   leaf was off by 0.06-1.1× between them (0.06× on the 20,000-child Zipf module: the frame stalls). The
+ *   4 ms is the work items' pass (its longest serial chains); a map without items — every module small
+ *   enough for single-item exact loops — has 0.3 ms instead (1.0 / 1.2 ms at 20k / 100k leaves, fence
+ *   wait included);
+ * - I is a swap.
+ *
+ * A slower GPU is caught by the frame budget's fences, as for the flat layout.
+ */
+const NESTED_COMPACT = { prepMs: 3.2, prepNsPerLeaf: 4, gatherMs: 4, gatherMsWithoutItems: 0.3, gatherPsPerWork: 47, integrateNsPerLeaf: 0.2 } as const;
+
+/**
+ * The share of the compact items' measured GPU time the frame budget is told. The per-leaf model this
+ * replaces told it about half on web-NotreDame's Infomap trees (4.2 ms for a 9 ms gather, 3.3 / 1 ms for
+ * a 5 / 3 ms P), and the fence gate — two frames in flight — absorbed that: those layouts streamed without
+ * a blocked frame. Kept here, so they pace as before (2.1-2.2 s cold on the M1 Max), and now the same
+ * factor on every map, where the per-leaf model's ranged 0.06-1.1 (0.06 on a 20,000-child Zipf module:
+ * the gate blocked ~200 frames and frames stalled). At 1 — the budget told the whole measured time —
+ * those trees take ~2.85 s instead.
+ */
+const NESTED_COMPACT_BUDGET_SHARE = 0.5;
+
+/** Work units a slot adds to its band besides its search (its resolve): a cell visit's worth. */
+const NESTED_SLOT_BASE_WORK = 16;
 
 /** GPU time per leaf of a readback's composition (two reductions and the compose pass), ns: 4.7 ms at 325k. */
 const NESTED_READBACK_NS = 12;
@@ -123,29 +142,32 @@ void mapSlot(int s, out vec4 sum, out vec4 box) {
 /**
  * How a {@link GpuNestedLayout} of `topo` lays the solve out in textures, derived once: the segments as
  * slot ranges, their tile atlas (a tile for each segment above {@link EXACT_MAX} children, the CPU's exact
- * threshold), and the large-slot table's size. {@link gpuNestedLayoutNeed} checks it against the device
- * and the constructor allocates it, so the verdict and the allocation share one size rule, and a
+ * threshold), and the segment collision table's size. {@link gpuNestedLayoutNeed} checks it against the
+ * device and the constructor allocates it, so the verdict and the allocation share one size rule, and a
  * transport packs the tiles once. O(S log S) over S segments (the tile packing).
  */
 export interface NestedLayoutPlan {
   readonly topo: NestedSolverTopology;
   readonly segments: readonly SlotRange[];
   readonly atlas: TileAtlas;
-  /** The large-slot table: `NESTED_LARGE_MAX` slot ids (two `rgba32uint` texels) per segment-table row — S segments and the whole-slot range. */
-  readonly large: { readonly width: number; readonly height: number };
+  /**
+   * The segment collision table: 3 `rgba32uint` texels per segment-table row — S segments and the
+   * whole-slot range — its collision list (2), then its grid (bucket base, bucket mask, classes, sub-cell base).
+   */
+  readonly collide: { readonly width: number; readonly height: number };
 }
 
 /** The {@link NestedLayoutPlan} of `topo`. O(S log S) over S segments. */
 export function nestedLayoutPlan(topo: NestedSolverTopology): NestedLayoutPlan {
   const segments: SlotRange[] = [];
   for (let s = 0; s < topo.segStart.length; s++) segments.push({ start: topo.segStart[s] ?? 0, count: topo.segCount[s] ?? 0 });
-  const largeTexels = 2 * (segments.length + 1);
-  const largeWidth = atlasWidth(largeTexels);
+  const collideTexels = 3 * (segments.length + 1);
+  const collideWidth = atlasWidth(collideTexels);
   return {
     topo,
     segments,
     atlas: packTiles(segments, EXACT_MAX, TILE_MIN_SIDE),
-    large: { width: largeWidth, height: Math.ceil(largeTexels / largeWidth) },
+    collide: { width: collideWidth, height: Math.ceil(collideTexels / collideWidth) },
   };
 }
 
@@ -154,17 +176,18 @@ export function nestedLayoutPlan(topo: NestedSolverTopology): NestedLayoutPlan {
  * slot atlas (every per-slot texture, the collision cells' slot targets, the composition's staging
  * texture, at most as many texels), the CSR offsets (and the composition's node map, as many), and the
  * slot count ({@link gpuNestedSlotNeed}, checked before the prep too); then the springs, the tile atlas
- * (the pyramid's level 0; its coarser levels and the collision grid are smaller) and the large-slot table
- * (the segment tables are smaller). A transport checks it before constructing, so a tree the device
+ * (the pyramid's level 0; its coarser levels are smaller), the segment collision table (the other segment
+ * tables are smaller) and the collision grid's own textures ({@link collisionGridSide}: its hash tables,
+ * work items and binned-slot list). A transport checks it before constructing, so a tree the device
  * cannot run is unsupported rather than a constructor throw. O(1).
  */
 export function gpuNestedLayoutNeed(plan: NestedLayoutPlan): GpuLayoutNeed {
-  const { topo, atlas, large } = plan;
+  const { topo, atlas, collide } = plan;
   return {
     ...gpuNestedSlotNeed(topo.slotCount),
     springSide: atlasWidth(2 * topo.linkSource.length),
     pyramidSide: Math.max(atlas.width, atlas.height),
-    nested: { slots: topo.slotCount, largeSide: large.width },
+    nested: { slots: topo.slotCount, collideSide: collide.width, gridSide: collisionGridSide(atlasWidth(topo.slotCount), topo.collision) },
   };
 }
 
@@ -175,6 +198,8 @@ export interface GpuNestedLayoutOptions {
   rootY?: number;
   /** Test hook: ticks of the organise phase (default `⌈0.6 · iterations⌉`, the CPU's). */
   organise?: number;
+  /** Test hook: build the collision grid's per-slot statistics pass ({@link GpuNestedLayout.collisionStats}). */
+  collisionStats?: boolean;
 }
 
 /**
@@ -205,10 +230,12 @@ export class GpuNestedLayout implements StreamSolver {
   private readonly forceFbo: Framebuffer;
   private readonly radius: Texture;
   private readonly slotSeg: Texture;
-  /** Per segment `(r₉, owner slot, 0, 0)`. */
+  /** Per segment `(finest collision sub-cell side, owner slot, 0, 0)`. */
   private readonly segNested: Texture;
-  /** Per segment its large slots (2 `rgba32uint` texels). */
-  private readonly segLarge: Texture;
+  /** Per slot its collision class and exact bit (`r32uint`). */
+  private readonly slotCollide: Texture;
+  /** Per segment its collision list (2 `rgba32uint` texels) and grid (bucket base, bucket mask, classes, sub-cell base). */
+  private readonly segCollide: Texture;
   /** The segment table — S segments plus one range over every slot (the readback's finiteness check). */
   private readonly segments: SegmentTable;
   /** Mode 2's target: each range's extent about its centroid (box x). */
@@ -222,7 +249,7 @@ export class GpuNestedLayout implements StreamSolver {
   private readonly collision: CollisionGrid;
   private readonly compose: NestedComposePass;
   private readonly slotInputs: NestedSlotInputs;
-  private readonly gatherInput: CollisionGatherInput;
+  private readonly gatherInput: CollisionInputs;
   private readonly springInputs: NestedSpringInputs;
   /**
    * The nested map's textures per mode. Mode 2 reads mode 1's sums (the segment table's `stats`); mode 1
@@ -248,13 +275,24 @@ export class GpuNestedLayout implements StreamSolver {
 
   /** The readback's staging texture: leaf positions then module discs, in node order. */
   readonly packed: PackedPositions;
-  /** The frame budget's band model for this solve's work items (see {@link itemCostMs} for the rest). */
-  readonly itemCosts: ItemCosts = NESTED_ITEM_NS_PER_LEAF;
+  /**
+   * The frame budget's per-leaf band model, which it sizes its static band count by: the organise
+   * repulsion's, or the compact gather's plan-based estimate per leaf when that is heavier (see
+   * {@link itemCostMs} for the per-item estimates).
+   */
+  readonly itemCosts: ItemCosts;
+  /** The compact gather's unbanded GPU time estimate as the frame budget is told it, ms ({@link NESTED_COMPACT}). */
+  private readonly gatherMs: number;
+  /** Cumulative gather work up to each slot atlas row (`height + 1` entries): the compact bands' cuts. */
+  private readonly rowWork: Float64Array;
 
   /** The next item's estimated GPU time, ms, for the stream tick the solve is at. */
   itemCostMs(kind: ItemKind, bands: number): number {
-    const table = this.organising ? NESTED_NS.organise : this.step === 0 ? NESTED_NS.compact0 : NESTED_NS.compact1;
-    return itemCostMs(kind, this.topo.leafCount, bands, table);
+    const leaves = this.topo.leafCount;
+    if (this.organising) return itemCostMs(kind, leaves, bands, NESTED_ORGANISE_NS);
+    if (kind === "prep") return NESTED_COMPACT_BUDGET_SHARE * (NESTED_COMPACT.prepMs + (NESTED_COMPACT.prepNsPerLeaf * leaves) / 1e6);
+    if (kind === "force") return this.gatherMs / Math.max(1, bands);
+    return (NESTED_COMPACT.integrateNsPerLeaf * leaves) / 1e6;
   }
 
   /** Estimated GPU time of a readback's composition, ms. */
@@ -352,19 +390,27 @@ export class GpuNestedLayout implements StreamSolver {
       const tw = this.segments.width;
       const th = Math.ceil(rows.length / tw);
       const nested = new Float32Array(tw * th * 4);
+      const collision = topo.collision;
       for (let s = 0; s < S; s++) {
-        nested[s * 4] = topo.segR9[s] ?? 0;
+        nested[s * 4] = collision.segCellSide[s] ?? 0;
         nested[s * 4 + 1] = topo.segOwner[s] ?? -1;
       }
       nested[S * 4 + 1] = -1;
       this.segNested = own(device.createTexture({ width: tw, height: th, format: "rgba32float", data: nested, mipLevels: 1, sampler: NEAREST }));
-      const { width: largeWidth, height: largeRows } = plan.large;
-      const large = new Uint32Array(largeWidth * largeRows * 4).fill(0xffffffff);
-      for (let i = 0; i < S * NESTED_LARGE_MAX; i++) {
-        const slot = topo.segLarge[i] ?? -1;
-        if (slot >= 0) large[i] = slot;
+      const classes = new Uint32Array(width * height);
+      classes.set(collision.slotCollide);
+      this.slotCollide = own(device.createTexture({ width, height, format: "r32uint", data: classes, mipLevels: 1, sampler: NEAREST }));
+      // 3 texels per segment row: its list (−1 → NO_CELL pads), then (bucket base, bucket mask, classes, sub-cell base).
+      const { width: collideWidth, height: collideRows } = plan.collide;
+      const collide = new Uint32Array(collideWidth * collideRows * 4);
+      for (let s = 0; s < S; s++) {
+        for (let q = 0; q < COLLISION_LIST_MAX; q++) collide[12 * s + q] = (collision.segList[s * COLLISION_LIST_MAX + q] ?? -1) >>> 0;
+        collide[12 * s + 8] = collision.segBucketBase[s] ?? 0;
+        collide[12 * s + 9] = collision.segBucketMask[s] ?? 0;
+        collide[12 * s + 10] = collision.segClasses[s] ?? 0;
+        collide[12 * s + 11] = collision.segSubBase[s] ?? 0;
       }
-      this.segLarge = own(device.createTexture({ width: largeWidth, height: largeRows, format: "rgba32uint", data: large, mipLevels: 1, sampler: NEAREST }));
+      this.segCollide = own(device.createTexture({ width: collideWidth, height: collideRows, format: "rgba32uint", data: collide, mipLevels: 1, sampler: NEAREST }));
       const extentTex = (): Texture => own(device.createTexture({ width: tw, height: th, format: "rgba32float", mipLevels: 1, sampler: NEAREST }));
       const extentStats = extentTex();
       const extentBox = extentTex();
@@ -399,9 +445,23 @@ export class GpuNestedLayout implements StreamSolver {
       this.springs = own(new GpuSprings(device, links, { nested: true, rowScale: topo.springScale }));
       this.predict = own(new NestedPredictPass(device));
       this.integratePass = own(new NestedIntegratePass(device, 1 - NESTED.DECAY));
-      this.collision = own(new CollisionGrid(device, width, height, atlas.width >> 1, atlas.height >> 1, largeWidth));
+      this.collision = own(
+        new CollisionGrid(device, width, height, collision, { stats: options.collisionStats === true }),
+      );
       this.compose = own(new NestedComposePass(device, topo.nodeSlot, topo.leafCount, topo.depth, NESTED.FILL, NESTED.ONLY_CHILD));
       this.packed = { framebuffer: this.compose.framebuffer, width: this.compose.width, height: this.compose.height, extraFloats: this.compose.extraFloats };
+
+      // The compact gather's cost and its bands' cuts, from the collision plan's per-slot work.
+      const gatherFloorMs = collision.itemCount > 0 ? NESTED_COMPACT.gatherMs : NESTED_COMPACT.gatherMsWithoutItems;
+      this.gatherMs = NESTED_COMPACT_BUDGET_SHARE * (gatherFloorMs + (NESTED_COMPACT.gatherPsPerWork * collision.gatherWork) / 1e9);
+      const gatherNsPerLeaf = (this.gatherMs * 1e6) / Math.max(1, topo.leafCount);
+      this.itemCosts = { ...NESTED_ORGANISE_NS, force: Math.max(NESTED_ORGANISE_NS.force, gatherNsPerLeaf) };
+      this.rowWork = new Float64Array(height + 1);
+      for (let r = 0; r < height; r++) {
+        let work = 0;
+        for (let i = r * width; i < Math.min(slots, (r + 1) * width); i++) work += (collision.slotWork[i] ?? 0) + NESTED_SLOT_BASE_WORK;
+        this.rowWork[r + 1] = (this.rowWork[r] ?? 0) + work;
+      }
 
       this.slotInputs = {
         count: slots,
@@ -416,7 +476,10 @@ export class GpuNestedLayout implements StreamSolver {
       this.gatherInput = {
         slotSeg: this.slotSeg,
         segments: this.segments,
-        segLarge: this.segLarge,
+        segNested: this.segNested,
+        slotCollide: this.slotCollide,
+        segCollide: this.segCollide,
+        collideWidth,
         count: slots,
         width,
         rows: height,
@@ -506,22 +569,17 @@ export class GpuNestedLayout implements StreamSolver {
     if (this.step === 0) this.advance(false);
     // This collision step's cells and occupancy, from the positions it starts at.
     this.runReduce(1, this.segments);
-    this.collision.prepare({
-      pos: this.pos.readTex,
-      radius: this.radius,
-      slotSeg: this.slotSeg,
-      segments: this.segments,
-      segNested: this.segNested,
-      count: this.slots,
-      width: this.width,
-      pad: NESTED.PAD,
-    });
+    this.collision.prepare({ ...this.gatherInput, pos: this.pos.readTex, radius: this.radius });
   }
 
-  /** Work item **F_b**: atlas rows of band `band` — the repulsion (organise) or the collision gather (compact). */
+  /**
+   * Work item **F_b**: band `band` of `bands` of the slot atlas's rows — the repulsion over equal rows
+   * (organise), or the collision gather over rows of equal estimated work (compact).
+   */
   forceBand(band: number, bands: number): void {
     if (!this.organising) {
-      this.collision.gather(this.posFbo(this.posParity ^ 1), this.gatherInput, band, bands);
+      const [r0, r1] = this.gatherBandRows(band, bands);
+      this.collision.gather(this.posFbo(this.posParity ^ 1), this.gatherInput, r0, r1);
       return;
     }
     const r0 = Math.floor((band * this.height) / bands);
@@ -595,6 +653,33 @@ export class GpuNestedLayout implements StreamSolver {
     this.velParity ^= 1;
   }
 
+  /**
+   * The slot atlas rows `[r0, r1)` compact band `band` of `bands` gathers: rows of about `1 / bands` of the
+   * collision plan's estimated work each (a band cannot split a row), tiling the atlas in order.
+   */
+  gatherBandRows(band: number, bands: number): [number, number] {
+    return [this.workRow(band, bands), this.workRow(band + 1, bands)];
+  }
+
+  /**
+   * The first slot atlas row of compact band `band` of `bands`: the first row whose cumulative gather work
+   * reaches `band / bands` of the total (0 for band 0, the atlas height for band `bands`), so consecutive
+   * bands tile the rows in order.
+   */
+  private workRow(band: number, bands: number): number {
+    if (band <= 0) return 0;
+    if (band >= bands) return this.height;
+    const target = ((this.rowWork[this.height] ?? 0) * band) / bands;
+    let lo = 0;
+    let hi = this.height;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      if ((this.rowWork[mid] ?? 0) < target) lo = mid + 1;
+      else hi = mid;
+    }
+    return lo;
+  }
+
   /** A solve tick is complete: advance the alpha schedules. */
   private endTick(): void {
     this.alphaCold -= this.alphaCold * this.decayCold;
@@ -642,27 +727,19 @@ export class GpuNestedLayout implements StreamSolver {
     }
   }
 
+  /**
+   * Tests only (a layout built with `collisionStats`): what the current collision step does per slot,
+   * summed over its work items — `(cells visited, pairs tested, grid partners pushed, 1 exact slot / 2
+   * overflow)`, 4 floats per slot — from the state its work item P prepared (call it after
+   * {@link beginTick} of a compact tick).
+   */
+  collisionStats(): Float32Array {
+    return this.collision.gatherStats(this.gatherInput);
+  }
+
   /** The slots' local positions (each in its parent's unit disc), synchronously — for tests: `2 · slots` floats. */
   readLocal(out: Float32Array): void {
-    this.readSlots(this.positionFramebuffer, out);
-  }
-
-  /**
-   * The slots' velocities, synchronously — for tests, which restart a reference from the solve's own state:
-   * `2 · slots` floats. Wraps the velocity texture in a framebuffer for the read and frees it after.
-   */
-  readVelocity(out: Float32Array): void {
-    const fbo = this.device.createFramebuffer({ width: this.width, height: this.height, colorAttachments: [this.vel.readTex] });
-    try {
-      this.readSlots(fbo, out);
-    } finally {
-      fbo.destroy();
-    }
-  }
-
-  /** x, y of every slot's texel of the `rg32float` slot atlas `framebuffer` wraps, into `out`. */
-  private readSlots(framebuffer: Framebuffer, out: Float32Array): void {
-    const pixels = this.device.readPixelsToArrayWebGL(framebuffer, { sourceWidth: this.width, sourceHeight: this.height });
+    const pixels = this.device.readPixelsToArrayWebGL(this.positionFramebuffer, { sourceWidth: this.width, sourceHeight: this.height });
     if (!(pixels instanceof Float32Array)) throw new Error("GpuNestedLayout: expected a float readback");
     // rg32float reads back as RGBA or RG depending on the device: take x, y of every texel either way.
     const channels = pixels.length / (this.width * this.height);
