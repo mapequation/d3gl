@@ -11,9 +11,9 @@ import { perfHost } from "../../__tests__/engine-sweep.js";
  *
  * With the spatial source every streamed frame brings a new tree, so the lazy gather's per-tree row memo never
  * hit and each repaint walked every edge under the frontier — O(edges) on the main thread per frame (2E
- * incidences at a fit view). The worker now builds, with each tree, the super-edge rows of the covers the
- * engine's cut will draw (it cuts at the engine's view, or at the fit it computes from the frame's positions),
- * and the repaint reads O(rows of the drawn and culled covers).
+ * incidences at a fit view). The worker now builds, with each tree, the super-edge rows of the glyphs the
+ * engine's cut and declutter will keep (it cuts at the engine's view, or at the fit it computes from the
+ * frame's positions), and the repaint reads those rows — bounded by what the kept glyphs link to.
  *
  * Deterministic signature, on every animation frame that drew a worker tree while the layout streamed (the
  * camera following the fit): **0 edge incidences walked** and **0 rows computed** on the main thread
