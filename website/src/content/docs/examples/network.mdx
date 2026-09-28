@@ -50,16 +50,19 @@ row bands), and positions come back through an asynchronous, fenced readback. So
 node drag waits behind at most about 20 ms of queued layout work (two 60 Hz frames' budget), never a
 whole batch of ticks, and the page keeps its frame rate while hundreds of thousands of nodes settle
 (measured in Chromium; Firefox and Safari are not measured yet). The layout repaints at most 20 times
-a second. On a device without those capabilities it falls back to the worker with one console warning
-naming the reason, and the fallback is the run `backend: "worker"` would start: it honours
-`multilevel` (**Seeding**) and streams the LOD tree from the worker.
+a second. With LOD on, the LOD tree stays off the main thread as with the worker layout: a worker
+coarsens the graph while the GPU solver is built, and refits the tree to every frame the GPU reads
+back, so a frame is painted (positions and aggregates together) one worker round trip after it was
+read back (the top-right readout's **LOD tree** shows `worker`). On a device without those
+capabilities it falls back to the worker with one console warning naming the reason, and the fallback
+is the run `backend: "worker"` would start: it honours `multilevel` (**Seeding**) and streams the LOD
+tree from the worker.
 `layout({ backend: "auto" })` (**Auto**) asks for "the GPU where it works": it takes the GPU wherever
 `"gpu"` would and the worker everywhere else, **without** a warning, since there the worker is an
 expected outcome. Everything else — `fit`, drag reheat, nested layouts, state networks, LOD streaming —
 then behaves exactly as on the backend it resolved to, and `net.layoutTransport` (the top-right readout)
 says which one runs. It is opt-in: omitting `backend` behaves as before.
-(On a cross-origin-isolated page
-positions are shared zero-copy via
+(On a cross-origin-isolated page positions are shared zero-copy via
 `SharedArrayBuffer`; otherwise they are posted as snapshots — the top-right readout shows whether the
 environment supports it and whether this layout is actually using it.) The **Nodes** slider scales from 10 to
 1,000,000; **Seeding** compares multilevel against a cold start; **Size** switches uniform vs
@@ -257,6 +260,9 @@ the hierarchy itself — it reuses the coarsening it already computes for the mu
 streams the tree once plus its aggregate geometry each frame. The main thread then never coarsens or
 runs the per-frame O(N) geometry pass; it only fills the style geometry once and runs the
 on-screen-bounded cut. That keeps the main thread free as the network scales toward millions of nodes.
+The **GPU backend** does the same: `layout({ backend: "gpu" })` after `lod()` starts a worker that only
+coarsens the graph and then refits the tree's geometry to each frame the GPU reads back, and
+`net.lodSource` reports `"worker"` for both.
 
 This holds on a brand-new engine too. Before any layout has run, `lod()` can't know which backend comes
 next, so it leaves its own main-thread build to the end of the current call chain: the worker layout
@@ -268,7 +274,7 @@ nothing is labelled.
 ```js
 net
   .lod({ expandPx: 48, maxAggregateRadius: 26 }) // configure LOD first…
-  .layout({ backend: "worker" }); // …so the worker builds + streams the tree
+  .layout({ backend: "worker" }); // …so the worker builds + streams the tree (or "gpu": its LOD worker)
 ```
 
 ### Maps of networks: a provided module hierarchy

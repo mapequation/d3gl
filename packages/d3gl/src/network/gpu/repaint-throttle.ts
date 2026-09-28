@@ -21,6 +21,14 @@
 //   really costs GPU time stalls the frame after *every* repaint, so it is honoured from its second repaint
 //   on; a one-off gap is a single sample and never widens the throttle. It also recovers at once: the first
 //   repaint that does not stall brings the term back to 0.
+//
+// A harvest is not always paintable in its own frame either. With LOD on (#377) the LOD worker refits the
+// tree to the harvested positions first, and the frame is painted once it replies. The throttle samples that
+// round trip and harvests (and copies) that much earlier, so the repaint still lands when it is due rather
+// than one round trip late. A frame painted where it was harvested has a round trip of 0, and while the sink
+// paints frames where they are harvested (no tree yet, or the LOD worker failed) nothing leads. As with the
+// stall, the round trip must repeat: the smaller of the last two samples counts, so a reply that waited out
+// one long task (a heavy repaint) does not make the next harvest land right after every repaint.
 
 /** Minimum time between two layout repaints, ms: at most 20 per second (spec §15 Q4). */
 export const MIN_FRAME_MS = 50;
@@ -33,10 +41,11 @@ export const MIN_FRAME_MS = 50;
 const THROTTLE_SLACK_MS = 2;
 
 /**
- * When the next layout repaint — and the readback copy that feeds it — is due. The stream calls, per
- * frame: {@link beginFrame}, then {@link due} before harvesting, {@link repainted} after the engine's
- * repaint, and {@link copyDue} / {@link copyIssued} / {@link copyCompleted} around its readback copies.
- * Allocates nothing.
+ * When the next layout repaint — and the harvest and readback copy that feed it — is due. The stream calls,
+ * per frame: {@link beginFrame}, then {@link harvestDue} before harvesting, {@link submitted} /
+ * {@link returned} around the harvest's way to being paintable, {@link due} before painting it,
+ * {@link repainted} after the engine's repaint, and {@link copyDue} / {@link copyIssued} /
+ * {@link copyCompleted} around its readback copies. Allocates nothing.
  */
 export class RepaintThrottle {
   private readonly minFrameMs: number;
@@ -54,6 +63,14 @@ export class RepaintThrottle {
    */
   private copyLatencyMs = 1000 / 60;
   private copyAt = Number.NaN;
+  /**
+   * The last two samples of the rAF time from handing a harvest on to seeing it paintable (the LOD worker's
+   * refit round trip, #377; 0 when painted in its own frame), newest first, and when the pending one was
+   * handed on (NaN: none, or a pause since).
+   */
+  private relay0 = 0;
+  private relay1 = 0;
+  private relayAt = Number.NaN;
 
   constructor(minFrameMs = MIN_FRAME_MS) {
     this.minFrameMs = minFrameMs;
@@ -90,11 +107,35 @@ export class RepaintThrottle {
   }
 
   /**
-   * Whether to copy positions at `now`: the copy would be complete (after the usual copy latency) when the
-   * next repaint is due, so a harvested frame is about one frame old, not a whole repaint interval.
+   * Whether to harvest at `now`: the harvest would be paintable (after the usual round trip, #377, when the
+   * sink `relays` it) when the next repaint is due. Equal to {@link due} while frames are painted where they
+   * are harvested.
    */
-  copyDue(now: number): boolean {
-    return this.due(now + this.copyLatencyMs);
+  harvestDue(now: number, relays: boolean): boolean {
+    return this.due(now + this.leadMs(relays));
+  }
+
+  /**
+   * Whether to copy positions at `now`: the copy would be complete (after the usual copy latency) and, once
+   * harvested, paintable (after the usual round trip, when the sink `relays` it) when the next repaint is due,
+   * so a painted frame is about one frame plus the round trip old, not a whole repaint interval.
+   */
+  copyDue(now: number, relays: boolean): boolean {
+    return this.due(now + this.copyLatencyMs + this.leadMs(relays));
+  }
+
+  /** A harvest was handed on in frame `now`, to be painted once it is back (#377). */
+  submitted(now: number): void {
+    this.relayAt = now;
+  }
+
+  /** The harvest handed on last is paintable in frame `now`: sample the round trip. */
+  returned(now: number): void {
+    if (!Number.isNaN(this.relayAt)) {
+      this.relay1 = this.relay0;
+      this.relay0 = now - this.relayAt;
+    }
+    this.relayAt = Number.NaN;
   }
 
   /** A readback copy was issued in frame `now`. */
@@ -108,9 +149,15 @@ export class RepaintThrottle {
     this.copyAt = Number.NaN;
   }
 
+  /** How much earlier than the repaint a relayed frame must be harvested: the repeated round trip. */
+  private leadMs(relays: boolean): number {
+    return relays ? Math.min(this.relay0, this.relay1) : 0;
+  }
+
   /** The loop paused (a hidden page, an idle resume): the gap to the next frame is not a render or copy cost. */
   pause(): void {
     this.repaintedPrev = false;
     this.copyAt = Number.NaN;
+    this.relayAt = Number.NaN;
   }
 }

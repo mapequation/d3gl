@@ -15,18 +15,25 @@
  * or stop lands within about one tick. State the resume path needs (the graph, the {@link ForceLayout}
  * instance, the LOD tree + geometry buffer) is therefore kept in module scope between runs.
  *
+ * The GPU layout with LOD on (#377) uses the same worker for its LOD tree only: `coarsen` builds the tree
+ * (no layout), and each `lod-geometry` refits its position geometry to positions the GPU harvested.
+ *
  * The page's lib is `["ES2020","DOM"]` (the library targets the browser main thread too), so the
- * worker globals here are typed against `DOM`. We deliberately use single-argument `postMessage`
- * (no transferables): structured clone copies the snapshot synchronously at post time, which the
- * `DOM` `postMessage(message, options?)` overload accepts — so no worker-lib cast is needed.
+ * worker globals here are typed against `DOM`. The layout's frames use single-argument `postMessage`
+ * (no transferables): structured clone copies the snapshot synchronously at post time, so the worker
+ * may keep writing its buffer. The LOD refit's messages transfer their buffers instead, through the
+ * `DOM` `postMessage(message, { transfer })` overload — so no worker-lib cast is needed either way.
  */
 import { DRAG_HEAT, ForceLayout, RECOOL_TICKS, seedPositions } from "./force.js";
 import { nestedLayout, nestedBoundaryDiscs } from "./nested-layout.js";
 import { multilevelSeedSteps, buildHierarchy, type SeedProgress } from "./coarsen.js";
-import { flattenHierarchyToTopology, lodTreeFromTopology, computeLODPositions, type LODTree } from "./lod.js";
+import { flattenHierarchyToTopology, lodTreeFromTopology, computeLODPositions, type LODPositionTree, type LODTree } from "./lod.js";
+import { coarsenForRefit, refitGeometry, topologyTransferables } from "./lod-refit.js";
 import {
   lodGeometryViews,
   lodGeometryByteLength,
+  type CoarsenMessage,
+  type LODGeometryRequest,
   type MainToWorker,
   type ProgressMessage,
   type StartMessage,
@@ -95,8 +102,9 @@ let state: WorkerState | null = null;
  */
 let pendingPin: { ids: Uint32Array; positions: Float32Array | undefined } | null = null;
 
-function post(message: WorkerToMain): void {
-  postMessage(message);
+function post(message: WorkerToMain, transfer?: Transferable[]): void {
+  if (transfer) postMessage(message, { transfer });
+  else postMessage(message);
 }
 
 /**
@@ -270,6 +278,27 @@ async function runLayout(msg: StartMessage): Promise<void> {
   await loop();
 }
 
+/**
+ * The GPU layout's LOD tree (#377): coarsen only — no layout, no graph kept. The topology goes to the main
+ * thread by transfer (the worker keeps its own copies of what a refit reads), and the graph's edges are
+ * dropped with this call: a refit needs only the tree.
+ */
+let refitTree: LODPositionTree | null = null;
+function coarsenOnly(msg: CoarsenMessage): void {
+  const { topology, tree } = coarsenForRefit(msg, msg.coarsen);
+  refitTree = tree;
+  post({ type: "lod-topology", topology }, topologyTransferables(topology));
+}
+
+/** Refit the coarsen-only tree to the GPU's harvested positions and hand both buffers back (#377). */
+function refitLOD(msg: LODGeometryRequest): void {
+  const tree = refitTree;
+  if (!tree) return; // the main thread requests refits only after the topology arrived
+  const buffer = msg.geometry?.buffer ?? new ArrayBuffer(lodGeometryByteLength(tree.size));
+  const geometry = refitGeometry(tree, msg.positions, buffer);
+  post({ type: "lod-geometry", positions: msg.positions, geometry }, [msg.positions.buffer, geometry.buffer]);
+}
+
 /** Write the held nodes' positions (interleaved, in `ids` order) into `positions`. */
 function writeHeld(positions: Float32Array, ids: Uint32Array, held: Float32Array): void {
   let k = 0;
@@ -341,6 +370,12 @@ addEventListener("message", (e: MessageEvent<MainToWorker>) => {
       return;
     case "start":
       if (!looping && !seeding) void runLayout(msg);
+      return;
+    case "coarsen":
+      coarsenOnly(msg);
+      return;
+    case "lod-geometry":
+      refitLOD(msg);
       return;
     case "start-nested": {
       // One synchronous top-down pass (each depth final); a `stop` can only land after it, and the main

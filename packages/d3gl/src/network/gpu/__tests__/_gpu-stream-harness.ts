@@ -28,9 +28,13 @@
  *   with the tick cut into the static band counts of a 60 Hz and a 120 Hz budget, with the main-thread
  *   encode time per tick, so the cost of band slicing reads apart from the budget share.
  *
- * The LOD-on leg reports the main-thread ms per layout repaint (on this path the main thread still
- * builds and refits the LOD tree — PR 3c moves the refit to the worker and compares against the worker
- * baseline); both legs assert the same transport signatures.
+ * The LOD-on leg (#377) streams through the LOD worker: it builds the tree and refits it to each harvested
+ * frame, and the frame is painted with its geometry once the worker replies, so the main thread builds and
+ * refits nothing (the call counts are pinned in `gpu-lod-mainthread.browser.test.ts`). Its main-thread ms
+ * per layout repaint — putting the frame on the graph plus the engine's repaint — is compared against the
+ * **worker backend's** on the same engine, graph and view (AGENTS lifecycle §5: the baseline the GPU path
+ * must not exceed), and asserted within a stated margin of it. Both legs assert the same transport
+ * signatures.
  *
  * **Node drag** (AGENTS §5: a drag is a per-frame path), through the real trigger — pointer events on the
  * host grab a node of the settled layout, move it one step per animation frame, and release it — with LOD
@@ -186,6 +190,8 @@ class GlCallLog {
 /** What one leg observed. */
 interface Leg {
   frames: GpuFrameSample[];
+  /** Per frame: whether the worker's LOD tree was drawn (#377). */
+  treeFrames: boolean[];
   /** Per frame: whether the frame ended with the LOD tree in place (`lodSource` not "none"). */
   cut: boolean[];
   lod: boolean;
@@ -201,11 +207,13 @@ interface Leg {
  */
 async function streamLeg(net: Network, graph: NetworkGraph, lod: boolean): Promise<Leg> {
   const frames: GpuFrameSample[] = [];
+  const treeFrames: boolean[] = [];
   const cut: boolean[] = [];
   const log = new GlCallLog();
   let settledAfterFrame = -1;
   const unobserve = observeGpuLayoutFrames((s) => {
     frames.push({ ...s });
+    treeFrames.push(net.lodSource === "worker");
     cut.push(net.lodSource !== "none");
     log.events.push({ kind: "frame-end" });
   });
@@ -220,7 +228,7 @@ async function streamLeg(net: Network, graph: NetworkGraph, lod: boolean): Promi
     log.restore();
   }
   expect(net.layoutTransport).toBe("gpu");
-  return { frames, cut, lod, events: log.events, settledAfterFrame, elapsedMs: performance.now() - t0 };
+  return { frames, treeFrames, cut, lod, events: log.events, settledAfterFrame, elapsedMs: performance.now() - t0 };
 }
 
 const nextFrame = (): Promise<void> => new Promise((resolve) => requestAnimationFrame(() => resolve()));
@@ -228,6 +236,13 @@ const nextFrame = (): Promise<void> => new Promise((resolve) => requestAnimation
 /** Frames a drag holds its node (one pointer move each), and frames observed after the release. */
 const DRAG_FRAMES = 24;
 const COOL_FRAMES = 24;
+/**
+ * After its moves, a drag keeps holding its node, still, until the layout has repainted once, for at most
+ * this long. The repaint throttle keeps the stall samples of the run before the drag, so on software GL
+ * (SwiftShader: seconds of GPU stall per fit-view frame at 100k, measured 4.5-9.3 s intervals) the first
+ * reflow repaint can land after the DRAG_FRAMES moves. On a GPU the stall term is about 0.
+ */
+const HOLD_UNTIL_REPAINT_MS = 20_000;
 /** Zoom of the drag: leaves are drawn at their own size under either reduction state (spacing ≈ 56 world units). */
 const DRAG_K = 4;
 /** Nodes {@link centreOnDrawnLeaf} tries before it gives up. */
@@ -269,7 +284,8 @@ interface DragLeg {
 
 /**
  * Grab a drawn leaf of the settled layout on `net` (the first from node `from` on), drag it for DRAG_FRAMES
- * frames, release, watch COOL_FRAMES frames.
+ * frames, hold it still until the layout has repainted (at most HOLD_UNTIL_REPAINT_MS), release, watch
+ * COOL_FRAMES frames.
  */
 async function dragLeg(net: Network, host: HTMLElement, graph: NetworkGraph, from: number): Promise<DragLeg> {
   centreOnDrawnLeaf(net, graph, from);
@@ -298,6 +314,8 @@ async function dragLeg(net: Network, host: HTMLElement, graph: NetworkGraph, fro
       moveMs.push(performance.now() - t0);
       await nextFrame();
     }
+    const holdUntil = performance.now() + HOLD_UNTIL_REPAINT_MS;
+    while (!frames.some((s) => s.repainted) && performance.now() < holdUntil) await nextFrame();
     released = frames.length;
     pointer("pointerup", W / 2 + 8 + 4 * DRAG_FRAMES, H / 2 - 2 * DRAG_FRAMES);
     for (let f = 0; f < COOL_FRAMES; f++) await nextFrame();
@@ -416,15 +434,16 @@ function assertSignatures(leg: Leg): void {
   // growing about fourfold at this N), and a lane that outgrows its buffers reallocates them. Each grow
   // must at least double the lane's capacity, so it happens log2(peak / first) times over the run; an
   // exact fit reallocated on every repaint that set a new high.
-  const firstRepaint = frames.findIndex((s, f) => s.repaintMs > 0 && (!leg.lod || leg.cut[f] === true));
+  const firstRepaint = frames.findIndex((s, f) => s.repainted && (!leg.lod || leg.cut[f] === true));
   const { stray, grows } = attributeCreates(segments.slice(firstRepaint + 1).flat());
   expect(stray, "GPU objects created per streamed frame").toBe(0);
   for (const g of grows) {
     expect(g.after, `an instanced lane grew from ${g.before} to ${g.after} instances, less than double`).toBeGreaterThanOrEqual(2 * g.before);
   }
 
-  // Repaints throttled to ≥ minFrameMs apart (the final one, which always paints, excepted).
-  const repaints = frames.filter((s) => s.repaintMs > 0).map((s) => s.now);
+  // Repaints throttled to ≥ minFrameMs apart (the final one, which always paints, excepted). Counted by the
+  // `repainted` flag, as the drag legs are: a clamped clock measures a cheap repaint as 0 ms.
+  const repaints = frames.filter((s) => s.repainted).map((s) => s.now);
   for (let i = 1; i < repaints.length - 1; i++) {
     expect((repaints[i] ?? 0) - (repaints[i - 1] ?? 0)).toBeGreaterThanOrEqual(MIN_FRAME_MS - 2);
   }
@@ -495,7 +514,7 @@ function report(label: string, leg: Leg): { transport: number[]; encode: number[
   const { frames } = leg;
   const transport = frames.map((s) => s.harvestMs + s.encodeMs);
   const encode = frames.map((s) => s.encodeMs);
-  const repaint = frames.filter((s) => s.repaintMs > 0).map((s) => s.repaintMs);
+  const repaint = frames.filter((s) => s.repainted).map((s) => s.repaintMs);
   const intervals = frames.slice(1).map((s, i) => s.now - (frames[i]?.now ?? s.now));
   const first = frames[0]?.now ?? 0;
   const last = frames[frames.length - 1]?.now ?? first;
@@ -516,7 +535,7 @@ function assertDrag(label: string, leg: DragLeg, transportP95Ms: number, encodeM
   const frames = [...leg.held, ...leg.cool];
   const transport = frames.map((s) => s.harvestMs + s.encodeMs);
   const encode = frames.map((s) => s.encodeMs);
-  const repaints = frames.filter((s) => s.repaintMs > 0);
+  const repaints = frames.filter((s) => s.repainted);
   const heldTicks = (leg.held[leg.held.length - 1]?.ticksDone ?? 0) - (leg.held[0]?.ticksDone ?? 0);
   const heldSpan = ((leg.held[leg.held.length - 1]?.now ?? 0) - (leg.held[0]?.now ?? 0)) / 1000;
   console.log(
@@ -561,6 +580,35 @@ function assertDrag(label: string, leg: DragLeg, transportP95Ms: number, encodeM
   expect(leg.heldWriteSizes.every((n) => n === leg.heldCount)).toBe(true);
 }
 
+/** Ticks of the worker-backend baseline leg: a CPU tick at this N takes ~0.1-0.3 s and posts one frame. */
+const WORKER_ITERATIONS = 12;
+
+/**
+ * The fit-like view both LOD-on legs are measured at: the whole force-equilibrium disc (radius
+ * √(repulsion·N / centering), where both layouts are seeded) in view — the Navigator's `fit: true` framing,
+ * and the largest LOD frontier a layout frame paints.
+ */
+function fitView(): { k: number; x: number; y: number } {
+  const radius = Math.sqrt((DEFAULT_FORCE.repulsion * N) / DEFAULT_FORCE.centering);
+  return { k: (0.85 * Math.min(W, H)) / (2 * radius), x: W / 2, y: H / 2 };
+}
+
+/** Main-thread ms of every animation-frame callback while installed — the worker backend's layout repaints. */
+function timeAnimationFrames(): { durations: number[]; restore: () => void } {
+  const installed = window.requestAnimationFrame;
+  const durations: number[] = [];
+  window.requestAnimationFrame = (callback: FrameRequestCallback): number =>
+    installed.call(window, (t: number) => {
+      const t0 = performance.now();
+      try {
+        callback(t);
+      } finally {
+        durations.push(performance.now() - t0);
+      }
+    });
+  return { durations, restore: () => { window.requestAnimationFrame = installed; } };
+}
+
 /**
  * Which half of T7 a file runs. T7 runs as two files, one per reduction state, because the browser tier
  * gives each file its own process and a 300 s budget (scripts/run-browser-perf-tier.mjs). On the CI runners
@@ -580,6 +628,8 @@ export function describeGpuStream(half: StreamHalf): void {
     let graph: NetworkGraph;
     let gpuOnlyTicksPerSec = 0;
     let gpuOnlyReport = "";
+    /** The LOD-on leg's main-thread ms per repaint with the worker's tree drawn (commit + repaint), for the baseline leg. */
+    let gpuLodRepaintMs: number[] = [];
 
     beforeAll(async () => {
       graph = clustered(N, 0x5712);
@@ -624,17 +674,69 @@ export function describeGpuStream(half: StreamHalf): void {
       assertDrag("LOD off", leg, TRANSPORT_P95_MS, ENCODE_MEDIAN_MS);
     }, perfBudget(240_000));
 
-    it.runIf(!off)("LOD on (structural cut, declutter, super-edges): the same transport bounds; repaint cost reported", async () => {
+    it.runIf(!off)("LOD on (structural cut, declutter, super-edges): the same transport bounds; the tree from the LOD worker", async () => {
+      net.setTransform(fitView());
       const leg = await streamLeg(net, graph, true);
       const { transport, encode } = report("LOD on", leg);
       assertSignatures(leg);
       expect(quantile(transport, 0.95)).toBeLessThan(TRANSPORT_P95_MS);
       expect(median(encode)).toBeLessThan(ENCODE_MEDIAN_MS);
+      // The worker's tree is drawn (#377): the frames painted with it went through the LOD worker, and
+      // settled with it.
+      expect(net.lodSource).toBe("worker");
+      const withTree = leg.frames.filter((s, i) => s.repainted && leg.treeFrames[i] === true);
+      expect(withTree.length, "no repaint drew the LOD worker's tree").toBeGreaterThan(3);
+      gpuLodRepaintMs = withTree.map((s) => s.commitMs + s.repaintMs);
+      const commit = withTree.map((s) => s.commitMs);
+      console.log(
+        `  GPU stream [LOD on] N=${N}: ${withTree.length} repaints with the worker's tree; main thread per repaint ` +
+          `(commit + repaint) median ${median(gpuLodRepaintMs).toFixed(2)} p95 ${quantile(gpuLodRepaintMs, 0.95).toFixed(2)} ms, ` +
+          `of which commit (positions + geometry) median ${median(commit).toFixed(2)} max ${Math.max(...commit).toFixed(2)} ms`,
+      );
     }, perfBudget(240_000));
 
     it.runIf(!off)("LOD on: a node drag reheats through the same budgeted loop — transport bounds, O(held) pins", async () => {
       const leg = await dragLeg(net, host, graph, Math.floor(N / 2));
       assertDrag("LOD on", leg, TRANSPORT_P95_MS, ENCODE_MEDIAN_MS);
+    }, perfBudget(240_000));
+
+    // Lifecycle §5 baseline: the worker backend on the same engine, graph and view, and from the same kind of
+    // start — a disc cold start (`multilevel: false`), as the GPU run's. (A multilevel seed is built from the
+    // same coarsening hierarchy as the LOD tree, so its aggregates are compact and its frontier a fraction of
+    // a disc start's; comparing it would measure the seed, not the transport.) The worker's frames arrive one
+    // per CPU tick, each coalesced into one animation-frame repaint; timed here are those repaints alone (its
+    // message handler's positions + geometry copies are left out, so the baseline is if anything low), while
+    // the GPU side counts its commit (the same copies) plus the repaint. The layouts still differ (60 GPU
+    // ticks against a few CPU ticks), so the margin is generous; the regression it bounds — a main-thread
+    // geometry pass per repaint, O(tree) — is also pinned by exact call counts in
+    // `gpu-lod-mainthread.browser.test.ts`.
+    const BASELINE_RATIO = 1.5;
+    const BASELINE_SLACK_MS = perfBudget(2);
+
+    it.runIf(!off)("LOD on: main-thread ms per layout repaint within the worker backend's (lifecycle §5 baseline)", async () => {
+      expect(gpuLodRepaintMs.length, "the LOD-on GPU leg must run first").toBeGreaterThan(0);
+      net.data(graph).lod({ source: "structure", declutter: true, superEdges: true });
+      net.setTransform(fitView());
+      const frames = timeAnimationFrames();
+      try {
+        net.layout({ backend: "worker", iterations: WORKER_ITERATIONS, multilevel: false });
+        await net.whenSettled();
+      } finally {
+        frames.restore();
+      }
+      expect(net.lodSource).toBe("worker");
+      const worker = frames.durations;
+      // Under SwiftShader a fit-view repaint holds the next animation frame for seconds, so the worker's frames
+      // coalesce into as few as one repaint; on a real GPU each tick gets its own.
+      expect(worker.length, "the worker streamed no frame").toBeGreaterThanOrEqual(1);
+      const gpu = median(gpuLodRepaintMs);
+      const base = median(worker);
+      console.log(
+        `  LOD repaint baseline N=${N}: GPU (commit + repaint) median ${gpu.toFixed(2)} ms over ${gpuLodRepaintMs.length} repaints; ` +
+          `worker backend repaint median ${base.toFixed(2)} ms (p95 ${quantile(worker, 0.95).toFixed(2)}) over ${worker.length} frames; ` +
+          `ratio ${(gpu / Math.max(1e-3, base)).toFixed(2)}`,
+      );
+      expect(gpu).toBeLessThan(BASELINE_RATIO * base + BASELINE_SLACK_MS);
     }, perfBudget(240_000));
   });
 }

@@ -878,6 +878,16 @@ export function lodTreeFromTopology(
 }
 
 /**
+ * The part of an {@link LODTree} that {@link computeLODPositions} reads and writes: the level layout, the
+ * children CSR, and the position geometry (`cx`/`cy`/`extent`, plus the leaf `count`). The GPU layout's LOD
+ * worker keeps only this between refits (#377) — no style arrays, no super-edges.
+ */
+export type LODPositionTree = Pick<
+  LODTree,
+  "size" | "leafCount" | "levelCount" | "levelOffset" | "childOffset" | "children" | "cx" | "cy" | "extent" | "count"
+>;
+
+/**
  * Fill the tree's **position-derived** geometry from a layout snapshot: each leaf's centroid is its
  * own position (extent 0, count 1); each aggregate gets the count-weighted centroid of its children
  * (= the mean of its descendant leaf positions), the summed leaf `count`, and a bounding `extent`
@@ -892,7 +902,7 @@ export function lodTreeFromTopology(
  * layout worker runs it each streamed frame and writes `cx`/`cy`/`extent` into the shared buffer the
  * main thread renders from (#103 worker-LOD). Style-derived geometry is {@link computeLODStyle}.
  */
-export function computeLODPositions(tree: LODTree, positions: ArrayLike<number>, discs?: BoundaryDiscs): void {
+export function computeLODPositions(tree: LODPositionTree, positions: ArrayLike<number>, discs?: BoundaryDiscs): void {
   const { leafCount, levelCount, levelOffset, childOffset, children, cx, cy, extent, count } = tree;
 
   for (let i = 0; i < leafCount; i++) {
