@@ -204,7 +204,7 @@ describe("GPU layout swap policy at the transport (#311)", () => {
     const follow = followFrames();
     const g = seededRing(400);
     const style = (r: number): LeafStyle => ({ radii: new Float32Array(g.nodeCount).fill(r), weight: g.strength, links: true });
-    const view = (k: number): LODView => ({ transform: { k, x: W / 2, y: H / 2 }, fitPad: 3, width: W, height: H, screenSized: true, fadeBand: 0 });
+    const view = (k: number): LODView => ({ transform: { k, x: W / 2, y: H / 2 }, fitPad: 3, width: W, height: H, screenSized: true, fadeBand: 0, declutter: true });
     let trees = 0;
     const handle = startGpuLayout(device, g, {
       width: W, height: H, iterations: 600, frameEvery: 5, warm: { heat: 1, decaying: true },

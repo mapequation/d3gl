@@ -484,8 +484,8 @@ describe("LOD relay: the spatial source (#343)", () => {
     expect(withSeed?.type === "coarsen" && withSeed.source.length).toBe(seeded.graph.edgeCount);
   });
 
-  it("with a view, every relayed tree carries the super-edge rows of that view's covers (#433); a new view is posted", () => {
-    const view: LODView = { transform: { k: 0.5, x: 400, y: 300 }, fitPad: 2, width: 800, height: 600, maxAggregateRadius: 20, screenSized: true, fadeBand: 0 };
+  it("with a view, every relayed tree carries the super-edge rows of the glyphs that view keeps (#433); a new view is posted", () => {
+    const view: LODView = { transform: { k: 0.5, x: 400, y: 300 }, fitPad: 2, width: 800, height: 600, maxAggregateRadius: 20, screenSized: true, fadeBand: 0, declutter: true };
     const { worker, relay, trees, handles, frame } = startSpatial(1500, null, view);
     const request = worker.received[0];
     expect(request?.type === "coarsen" && request.lodView).toEqual(view);

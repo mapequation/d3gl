@@ -1806,7 +1806,7 @@ export class Network extends BaseEngine {
     const useLod = !!this.lodOptions && !this.lodUsesModules();
     // The spatial tree (#343) is rebuilt by a worker per frame, style aggregated there too — on the worker
     // backend, on a "gpu" layout's worker fallback (#351) and by the GPU layout's LOD worker alike — with the
-    // super-edge rows of the covers of the view the cut runs at (#433).
+    // super-edge rows of the glyphs the view the cut runs at keeps (#433).
     const lodSource = useLod ? this.lodKind() : null;
     const spatialStyle = lodSource === "spatial" ? this.lodLeafStyle(graph) : null;
     this.lodWorkerSource = lodSource === "spatial" ? "spatial" : useLod ? "structure" : null;

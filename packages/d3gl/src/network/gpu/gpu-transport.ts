@@ -518,7 +518,7 @@ class GpuLayoutRun implements WorkerLayoutHandle {
         unpin: () => started.unpin(),
         /** A new leaf style for the spatial tree the LOD worker rebuilds per frame (#343). */
         ...(relay && streamsSpatial(opts) ? { setLODStyle: (style: LeafStyle, version: number) => relay.setStyle(style, version) } : {}),
-        /** The engine's new view, whose covers' super-edge rows the LOD worker builds with each tree (#433). */
+        /** The engine's new view, whose kept glyphs' super-edge rows the LOD worker builds with each tree (#433). */
         ...(relay && streamsSpatial(opts) ? { setLODView: (view: LODView) => relay.setView(view) } : {}),
       },
       stream: started,

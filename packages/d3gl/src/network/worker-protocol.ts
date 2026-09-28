@@ -180,7 +180,7 @@ export interface CoarsenMessage {
   /** The leaf style a spatial tree aggregates onto every rebuild (#343), and its version (echoed per frame). */
   lodStyle?: LeafStyle;
   lodStyleVersion?: number;
-  /** The main thread's view, whose covers' super-edge rows a spatial tree carries (#433). */
+  /** The main thread's view, whose kept glyphs' super-edge rows a spatial tree carries (#433). */
   lodView?: LODView;
   /** Build the GPU multilevel seed's plan from the same hierarchy and post it first. */
   seed?: SeedPlanOptions;

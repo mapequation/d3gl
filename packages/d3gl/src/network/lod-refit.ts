@@ -11,7 +11,7 @@
  * Each relayed frame runs the worker backend's own per-frame step, {@link lodFrameStep} (#343): rebuild if
  * spatial, else refit. With the spatial source the worker coarsens nothing for the tree (only for the seed's
  * plan, when asked): each frame rebuilds the Morton tree for the harvested positions and transfers it — with
- * the super-edge rows of the covers of the main thread's view, summed from the edges (#433) — and a frame id
+ * the super-edge rows of the glyphs the main thread's view keeps, summed from the edges (#433) — and a frame id
  * it already built is skipped, so the rebuilds stop once the layout has converged.
  */
 import { buildHierarchy, type CoarseLevel, type CoarsenOptions, type Hierarchy } from "./coarsen.js";

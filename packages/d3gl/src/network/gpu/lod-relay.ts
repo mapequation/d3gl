@@ -72,7 +72,7 @@ export interface LODRelayOptions {
   /** The leaf style a spatial tree aggregates per rebuild, and its version (see {@link LODRelay.setStyle}). */
   style?: LeafStyle;
   styleVersion?: number;
-  /** The view whose covers' super-edge rows each rebuilt spatial tree carries (#433; see {@link LODRelay.setView}). */
+  /** The view whose kept glyphs' super-edge rows each rebuilt spatial tree carries (#433; see {@link LODRelay.setView}). */
   view?: LODView;
 }
 
@@ -237,7 +237,7 @@ export class LODRelay implements FrameSink {
     if (this.spatial && this.phase === "streaming") this.send({ type: "lod-style", style, version }, []);
   }
 
-  /** The main thread's new view (#433): later spatial trees carry the super-edge rows of its covers. */
+  /** The main thread's new view (#433): later spatial trees carry the super-edge rows of the glyphs it keeps. */
   setView(view: LODView): void {
     if (this.spatial && this.phase === "streaming") this.send({ type: "lod-view", view }, []);
   }
