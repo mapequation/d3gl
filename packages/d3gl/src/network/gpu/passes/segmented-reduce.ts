@@ -55,21 +55,36 @@ vec4 max16(vec4 v[16]) {
  * Shared GLSL: the level-0 map, slot s → sum term (x, y, |v|, 1) and box term (x, y, −x, −y).
  * Slots at or beyond `u_count` are padding and map to the identities. Needs `u_pos`, `u_vel`,
  * `u_count`, `u_posWidth` and {@link COMBINE_GLSL}.
+ *
+ * Compiled with `MULTILEVEL` (a solver that runs a multilevel seed, #353), a mass-weighted seed level
+ * (`u_massive`) maps slot s to (m·x, m·y, |v|, m) with its mass m from `u_mass`, so the sum chain's
+ * `Σ(m·p) / Σm` is the level's mass-weighted centroid, as on the CPU. The finest level skips the fetch
+ * (m = 1, and 1·x = x exactly), so its sums are the flat program's. On a seed level the `w` channel is
+ * therefore `Σm`, not the slot count: the mean step `Σ|v| / count` of a seed level needs the level's slot
+ * count (see `SegmentTable.stats`).
  */
 const MAP_GLSL = /* glsl */ `\
+#ifdef MULTILEVEL
+uniform int u_massive;
+uniform highp sampler2D u_mass;
+#endif
 void mapSlot(int s, out vec4 sum, out vec4 box) {
   if (s >= u_count) { sum = vec4(0.0); box = BOX_IDENTITY; return; }
   ivec2 t = slotTexel(s, u_posWidth);
   vec2 p = texelFetch(u_pos, t, 0).xy;
   vec2 v = texelFetch(u_vel, t, 0).xy;
+#ifdef MULTILEVEL
+  float m = u_massive != 0 ? texelFetch(u_mass, t, 0).r : 1.0;
+  sum = vec4(m * p, length(v), m);
+#else
   sum = vec4(p, length(v), 1.0);
+#endif
   box = vec4(p, -p);
 }
 `;
 
 /** Tree level 1: map 16 slots, combine pairwise. */
 const LEVEL1_FS = /* glsl */ `\
-#version 300 es
 precision highp float;
 precision highp int;
 uniform highp sampler2D u_pos;
@@ -141,7 +156,6 @@ function queryFs(): string {
     rowCases.push(`  if (lvl == ${l}) return u_row${l};`);
   }
   return /* glsl */ `\
-#version 300 es
 precision highp float;
 precision highp int;
 precision highp usampler2D;
@@ -215,8 +229,26 @@ export interface ReduceInput {
   vel: Texture;
   /** Slot atlas width of `pos` and `vel`. */
   posWidth: number;
-  /** Real slots: `[0, count)`; the rest are padding. At most the reduction's capacity. */
+  /**
+   * Real slots: `[0, count)`; the rest are padding. At most the reduction's capacity. Below it (a
+   * multilevel seed level, #353) only the tree texels a range inside `[0, count)` can read are rebuilt, so
+   * the reduction costs O(count), not O(capacity).
+   */
   count: number;
+  /**
+   * A mass-weighted seed level's per-slot masses (`r32float`, slot atlas), or null (unit masses). Only on
+   * a reduction built with `multilevel`.
+   */
+  mass?: Texture | null;
+}
+
+/** Options of a {@link SegmentedReduce}. */
+export interface SegmentedReduceOptions {
+  /**
+   * Compile the level-0 map for mass-weighted seed levels (#353) as a uniform branch; `unit` is bound in
+   * place of the masses when a run has none (it is never sampled then).
+   */
+  multilevel?: { unit: Texture };
 }
 
 const NEAREST: SamplerProps = { minFilter: "nearest", magFilter: "nearest" };
@@ -244,9 +276,13 @@ export class SegmentedReduce {
   private readonly level1Uniforms: PassUniforms;
   private readonly levelUniforms: PassUniforms;
   private readonly queryUniforms: PassUniforms;
+  /** The stand-in bound as `u_mass` on a run without masses (multilevel only). */
+  private readonly unit: Texture | null;
 
-  constructor(device: Device, capacity: number) {
+  constructor(device: Device, capacity: number, opts: SegmentedReduceOptions = {}) {
     this.device = device;
+    this.unit = opts.multilevel?.unit ?? null;
+    const header = `#version 300 es\n${this.unit ? "#define MULTILEVEL\n" : ""}`;
     const layout = reduceLayout(capacity);
     this.layout = layout;
     const make = (height: number): Texture =>
@@ -261,13 +297,17 @@ export class SegmentedReduce {
     this.level1Uniforms = { u_count: 0, u_posWidth: 1, u_width: layout.width, u_rowOffset: 0, u_size: 0 };
     this.levelUniforms = { u_width: layout.width, u_rowOffset: 0, u_size: 0, u_srcRowOffset: 0, u_srcSize: 0 };
     this.queryUniforms = { u_count: 0, u_posWidth: 1, u_width: layout.width, u_tableWidth: 1, u_ranges: 0 };
+    if (this.unit) {
+      this.level1Uniforms["u_massive"] = 0;
+      this.queryUniforms["u_massive"] = 0;
+    }
     for (let l = 1; l <= REDUCE_MAX_LEVELS; l++) {
       this.queryUniforms[`u_row${l}`] = layout.levels[l - 1]?.rowOffset ?? 0;
     }
     // No blend anywhere: every output texel is written exactly once, by a gather.
-    this.level1Model = fullScreenModel(device, LEVEL1_FS, this.level1Uniforms, NO_BLEND);
+    this.level1Model = fullScreenModel(device, header + LEVEL1_FS, this.level1Uniforms, NO_BLEND);
     this.levelModel = fullScreenModel(device, LEVEL_FS, this.levelUniforms, NO_BLEND);
-    this.queryModel = fullScreenModel(device, queryFs(), this.queryUniforms, NO_BLEND);
+    this.queryModel = fullScreenModel(device, header + queryFs(), this.queryUniforms, NO_BLEND);
   }
 
   /**
@@ -277,11 +317,19 @@ export class SegmentedReduce {
    */
   run(input: ReduceInput, table: SegmentTable): void {
     const { layout, device } = this;
+    const mass = this.massBinding(input);
+    const partial = input.count < layout.capacity;
+    let reach = input.count; // tree texels of the current level a range inside [0, count) can read
     layout.levels.forEach((level, k) => {
+      reach = Math.floor(reach / 16);
+      // Below capacity (a seed level), stop where no range can read and rebuild only the rows it can:
+      // level ℓ texel j < ⌊count / 16^ℓ⌋ reads only level ℓ−1 texels below ⌊count / 16^(ℓ−1)⌋.
+      if (partial && reach === 0) return;
+      const rows = partial ? Math.min(level.rows, Math.ceil(reach / layout.width)) : level.rows;
       const pass = beginPass(device, {
         framebuffer: this.fbo[level.texture],
         clear: false, // other levels share this texture: write only this level's rows
-        viewport: [0, level.rowOffset, layout.width, level.rows],
+        viewport: [0, level.rowOffset, layout.width, rows],
       });
       if (k === 0) {
         const u = this.level1Uniforms;
@@ -289,7 +337,8 @@ export class SegmentedReduce {
         u["u_posWidth"] = input.posWidth;
         u["u_rowOffset"] = level.rowOffset;
         u["u_size"] = level.size;
-        this.level1Model.setBindings({ u_pos: input.pos, u_vel: input.vel });
+        if (mass) u["u_massive"] = mass.massive;
+        this.level1Model.setBindings({ u_pos: input.pos, u_vel: input.vel, ...(mass ? { u_mass: mass.texture } : {}) });
         this.level1Model.draw(pass);
       } else {
         const src = layout.levels[k - 1];
@@ -313,6 +362,7 @@ export class SegmentedReduce {
     u["u_posWidth"] = input.posWidth;
     u["u_tableWidth"] = table.width;
     u["u_ranges"] = table.size;
+    if (mass) u["u_massive"] = mass.massive;
     this.queryModel.setBindings({
       u_pos: input.pos,
       u_vel: input.vel,
@@ -321,10 +371,17 @@ export class SegmentedReduce {
       u_sumB: this.sum[1],
       u_boxB: this.box[1],
       u_info: table.info,
+      ...(mass ? { u_mass: mass.texture } : {}),
     });
     this.queryModel.draw(pass);
     pass.end();
     device.submit();
+  }
+
+  /** The mass binding of a multilevel reduction (the level's masses, or the unit stand-in), else null. */
+  private massBinding(input: ReduceInput): { texture: Texture; massive: number } | null {
+    if (!this.unit) return null;
+    return input.mass ? { texture: input.mass, massive: 1 } : { texture: this.unit, massive: 0 };
   }
 
   destroy(): void {

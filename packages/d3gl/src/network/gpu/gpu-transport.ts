@@ -9,20 +9,25 @@
  * `layout({ backend: "auto" })` (#375) runs the same code with {@link GpuLayoutOptions.warnUnsupported}
  * off: there the worker is an expected outcome, so an unsupported device or graph falls back silently.
  *
- * The GPU run seeds (a disc at the force equilibrium's scale, or the module-aware multilevel seed, N8.2),
- * cools over the iteration budget like the worker (#124), and streams through {@link GpuStream} (#352):
+ * The GPU run seeds with a **multilevel seed** unless `multilevel: false` (#312, #353): from the module tree
+ * when one is provided (N8.2, #180), else from the graph's coarsening hierarchy, which a layout worker builds
+ * (heavy-edge matching, the worker backend's own seed) while this thread builds the solver. The seed runs on
+ * the one GPU solver, level by level, inside the streamed frame loop (see {@link GpuStream}), with every
+ * level at the force equilibrium's scale; a seeded run then cools over the iteration budget like the worker
+ * (#124). With `multilevel: false`, an edge-less graph or no worker, it starts cold from a disc at the
+ * equilibrium's scale, at full heat. It streams through {@link GpuStream} (#352):
  * each animation frame harvests positions a fenced PBO copy delivered, repaints (throttled, in the same
  * frame), and encodes as many work items — tick prep, force-pass row bands, integrate — as fit a GPU
  * budget of `min(10 ms, 0.6 × the frame interval)`. The main thread never waits for the GPU: no
  * synchronous `readPixels` on the frame path. On convergence the loop goes **idle** (the solver stays
  * alive) and `pin`/`unpin` hold nodes and resume it so the rest reflows (#183), as on the worker.
  *
- * With `lod` on, the GPU run keeps the LOD tree off the main thread as the worker backend does (#377): a
- * layout worker coarsens the graph (`coarsen`) while the solver is built, and refits the tree's geometry to
- * every harvested frame before it is painted ({@link LODRelay}); the tree reaches `onLODTree` once, with
- * geometry, and `onLODTree(null)` withdraws it if that worker fails (the caller then builds its own). The
- * GPU run itself still ignores `multilevel` (a structural GPU seed is a later milestone); its fallback
- * honours it.
+ * With `lod` on, the GPU run keeps the LOD tree off the main thread as the worker
+ * backend does (#377): a layout worker coarsens the graph (`coarsen`) while the solver is built, and refits
+ * the tree's geometry to every harvested frame before it is painted ({@link LODRelay}); the tree reaches
+ * `onLODTree` once, with geometry, and `onLODTree(null)` withdraws it if that worker fails (the caller then
+ * builds its own). The same worker builds the multilevel seed's plan from the same coarsening, so the graph
+ * is coarsened once.
  */
 import type { Device } from "@luma.gl/core";
 import { WebGLDevice } from "@luma.gl/webgl";
@@ -30,8 +35,9 @@ import { gpuLayoutNeed, gpuLayoutSupport } from "./device-caps.js";
 import { gpuCaps } from "./device-probe.js";
 import { GpuForceLayout } from "./gpu-force-layout.js";
 import { GpuStream } from "./gpu-stream.js";
-import { canModuleSeed, gpuMultilevelSeed } from "./gpu-multilevel-seed.js";
-import { LODRelay } from "./lod-relay.js";
+import { moduleSeedPlan, type SeedPlan, type SeedPlanOptions } from "./seed-plan.js";
+import { SeedWorker } from "./seed-worker.js";
+import { LODRelay, type SeedRequest } from "./lod-relay.js";
 import { spawnLayoutWorker, startWorkerLayout, type WorkerLayoutHandle, type WorkerLayoutOptions } from "../worker-transport.js";
 import { seedPositions, DEFAULT_FORCE } from "../force.js";
 import type { LODTopology, LODTree } from "../lod.js";
@@ -39,9 +45,9 @@ import type { NetworkGraph } from "../graph.js";
 
 /**
  * GPU layout options — the worker options plus an optional provided module hierarchy (N8.2). When
- * present (and it carries super-edges), the GPU backend seeds **module-aware**, laying the layout out
- * top-down over the module tree so modules read as coherent regions; otherwise it uses the disc seed.
- * The worker options are all honoured by the worker fallback.
+ * present (and it carries super-edges), the GPU backend's multilevel seed is **module-aware**, laying the
+ * layout out top-down over the module tree so modules read as coherent regions; otherwise it seeds from the
+ * graph's coarsening. The worker options are all honoured, by the GPU run and by the worker fallback.
  */
 export interface GpuLayoutOptions extends WorkerLayoutOptions {
   /** The provided module tree topology (from `lod({ modules })`), for the module-aware multilevel seed. */
@@ -73,7 +79,8 @@ export type GpuLayoutTransport = "gpu" | "worker";
  * - If `gpuLayoutSupport` rejects the device for this graph → one warning with the reason (none with
  *   `warnUnsupported: false`), then {@link startWorkerLayout} with the same options and `onLODTree` (it
  *   has its own sync fallback).
- * - Otherwise: seeds positions, constructs {@link GpuForceLayout}, and streams it ({@link GpuStream})
+ * - Otherwise: seeds a disc (on screen until the multilevel seed's first frame), constructs
+ *   {@link GpuForceLayout}, starts the seed's coarsening worker, and streams the run ({@link GpuStream})
  *   until `iterations` are done; `settled` resolves once the final positions have been harvested.
  *
  * `onTransport` reports the resolution before the run starts — so before any frame or LOD tree
@@ -213,64 +220,87 @@ function startGpuLayoutSync(
   const { width, height, force, iterations: rawIterations } = opts;
   const iterations = rawIterations ?? 300;
 
-  // With LOD on, the LOD worker starts coarsening now, while this thread seeds and builds the solver (#377).
-  const relay = opts.lod && onLODTree ? startLODRelay(graph, opts, onLODTree) : null;
+  // The multilevel seed (#312, #353): from the provided module tree when there is one (its plan is built
+  // here, as the module seed always was), else from the graph's coarsening, which a layout worker builds —
+  // the LOD relay's worker with LOD on (one coarsening for the tree and the seed), else a seed-only worker.
+  const multilevel = (opts.multilevel ?? true) && graph.edgeCount > 0;
+  const planOptions: SeedPlanOptions = { width, height, ...(force ? { force } : {}) };
+  const modulePlan = multilevel && opts.moduleTopology ? moduleSeedPlan(opts.moduleTopology, graph, planOptions) : null;
+  const coarsenSeed = multilevel && !modulePlan;
+  // The worker's plan may only be handed to the stream once it exists; a reply is a later task, so this
+  // buffers nothing in practice, but it keeps the order explicit.
+  let stream: GpuStream | null = null;
+  let earlyPlan: SeedPlan | null | undefined;
+  const seedRequest: SeedRequest = {
+    options: planOptions,
+    onPlan: (plan) => {
+      if (stream) stream.seed(plan);
+      else earlyPlan = plan;
+    },
+  };
 
-  // Seed positions. Module-aware multilevel seed (N8.2) when a provided module tree with super-edges
-  // is available — lays out top-down over the module hierarchy so modules read as coherent regions —
-  // else the plain phyllotaxis disc. The finest-level refine below (real edges) polishes either seed.
-  const topo = opts.moduleTopology;
-  const moduleSeeded = !!topo && canModuleSeed(topo, graph.nodeCount);
+  // With LOD on, the LOD worker starts coarsening now, while this thread seeds and builds the solver (#377).
+  // If it cannot start, no second worker is tried for the seed: the relay's one warning covers both.
+  const lodWorker = opts.lod === true && onLODTree !== undefined;
+  const relay = lodWorker ? startLODRelay(graph, opts, onLODTree, coarsenSeed ? seedRequest : null) : null;
+  const seedWorker = coarsenSeed && !lodWorker ? startSeedWorker(graph, opts, seedRequest) : null;
+  const seeded = modulePlan !== null || (coarsenSeed && (relay !== null || seedWorker !== null));
+
+  // The disc at the force equilibrium's scale: on screen until the seed's first frame (the same scale, so that
+  // frame rearranges the layout without zooming), and a cold start's seed.
+  seedPositions(graph, width, height, { force });
   let layout: GpuForceLayout;
   try {
-    // The module seed builds a solver per level on the GPU, which can fail as the finest one can.
-    if (topo && moduleSeeded) {
-      gpuMultilevelSeed(device, topo, graph, { width, height, force });
-    } else {
-      seedPositions(graph, width, height, { force });
-    }
-    layout = new GpuForceLayout(device, graph, { ...DEFAULT_FORCE, ...force });
+    layout = new GpuForceLayout(device, graph, { ...DEFAULT_FORCE, ...force }, { multilevel: seeded });
   } catch (error) {
     relay?.destroy(); // the caller falls back to a worker run, which streams its own tree
+    seedWorker?.destroy();
     throw error;
   }
-  // As the CPU worker (#124): a module-seeded layout cools over the iteration budget, a cold disc start
-  // keeps full heat to untangle (see ForceLayout.run). The GPU run has no early stop yet — the per-tick
-  // stop latch reads the mean step back with the positions (#124, spec §6.5.5) — so it runs the whole
-  // budget.
-  if (moduleSeeded) layout.cool(iterations);
-  else layout.hold(1);
+  // As the CPU worker (#124): a cold disc start keeps full heat to untangle (see ForceLayout.run); a seeded
+  // run cools over the iteration budget once the seed has placed the nodes (the stream sets it). The GPU run
+  // has no early stop yet — the per-tick stop latch reads the mean step back with the positions (#124, spec
+  // §6.5.5) — so it runs the whole budget.
+  if (!seeded) layout.hold(1);
 
-  let stream: GpuStream;
+  let started: GpuStream;
   try {
-    stream = new GpuStream(device, layout, graph, {
+    started = new GpuStream(device, layout, graph, {
       iterations,
       ...(opts.frameEvery !== undefined ? { frameEvery: opts.frameEvery } : {}),
       ...(relay ? { sink: relay } : {}),
+      seeded,
     }, onFrame);
   } catch (error) {
     // The readback's programs or buffers failed: free the solver before the caller falls back.
     layout.destroy();
     relay?.destroy();
+    seedWorker?.destroy();
     throw error;
   }
+  stream = started;
   // Reported once every GPU resource exists, so a failed start reports only the fallback's "worker";
   // still before the first frame, and before the LOD tree (a later task).
   onTransport?.("gpu");
   // LOD on but no worker to build the tree (or an edge-less graph, which does not coarsen): the caller builds it.
   if (opts.lod && !relay) onLODTree?.(null);
-  stream.start();
+  if (modulePlan) started.seed(modulePlan);
+  else if (earlyPlan !== undefined) started.seed(earlyPlan);
+  started.start();
 
   return {
     shared: false,
     transport: "gpu",
-    settled: stream.settled,
-    stop: () => stream.stop(),
+    settled: started.settled,
+    stop: () => {
+      started.stop();
+      seedWorker?.destroy();
+    },
     /** Hold `ids` (writing their `positions` into the position texture) and reheat — the rest reflows
      *  around them. Mirrors the worker's `pin`. */
-    pin: (ids: Uint32Array, positions?: Float32Array) => stream.pin(ids, positions),
+    pin: (ids: Uint32Array, positions?: Float32Array) => started.pin(ids, positions),
     /** Release every pin and re-cool over a short tail, then idle. Mirrors the worker's `unpin`. */
-    unpin: () => stream.unpin(),
+    unpin: () => started.unpin(),
   };
 }
 
@@ -278,19 +308,45 @@ function startGpuLayoutSync(
  * The GPU run's LOD tree, built and refit in a layout worker (#377), or null where no worker can run (with
  * one warning). An edge-less graph gets none: it does not coarsen, and its caller builds a spatial tree.
  */
-function startLODRelay(graph: NetworkGraph, opts: GpuLayoutOptions, onLODTree: (tree: LODTree | null) => void): LODRelay | null {
+function startLODRelay(
+  graph: NetworkGraph,
+  opts: GpuLayoutOptions,
+  onLODTree: (tree: LODTree | null) => void,
+  seed: SeedRequest | null,
+): LODRelay | null {
   if (graph.edgeCount === 0) return null;
+  const instead = seed
+    ? "the LOD tree is built on the main thread and the layout starts from a disc instead of its multilevel seed"
+    : "the LOD tree is built on the main thread instead";
   const worker = spawnLayoutWorker();
   if (!worker) {
-    console.warn("[d3gl] network layout({ backend: 'gpu' }): no LOD worker could start; the LOD tree is built on the main thread instead.");
+    console.warn(`[d3gl] network layout({ backend: 'gpu' }): no LOD worker could start; ${instead}.`);
     return null;
   }
   try {
-    return new LODRelay(worker, graph, opts.coarsen, onLODTree);
+    return new LODRelay(worker, graph, opts.coarsen, onLODTree, seed);
   } catch (error) {
     // The coarsen request could not be posted; the relay freed its worker. The caller withdraws the tree once
     // it has reported the transport.
-    console.warn("[d3gl] network layout({ backend: 'gpu' }): a message to the LOD worker failed; the LOD tree is built on the main thread instead.", error);
+    console.warn(`[d3gl] network layout({ backend: 'gpu' }): a message to the LOD worker failed; ${instead}.`, error);
+    return null;
+  }
+}
+
+/**
+ * The multilevel seed's coarsening worker with LOD off (#353), or null where no worker can run (with one
+ * warning: the layout starts from its disc).
+ */
+function startSeedWorker(graph: NetworkGraph, opts: GpuLayoutOptions, seed: SeedRequest): SeedWorker | null {
+  const worker = spawnLayoutWorker();
+  if (!worker) {
+    console.warn("[d3gl] network layout({ backend: 'gpu' }): no layout worker could start to coarsen the graph; the layout starts from a disc instead of its multilevel seed.");
+    return null;
+  }
+  try {
+    return new SeedWorker(worker, graph, opts.coarsen, seed.options, seed.onPlan);
+  } catch (error) {
+    console.warn("[d3gl] network layout({ backend: 'gpu' }): a message to the layout worker failed; the layout starts from a disc instead of its multilevel seed.", error);
     return null;
   }
 }

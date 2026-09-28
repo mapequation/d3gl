@@ -42,7 +42,17 @@ tick count to hit. The GPU layout has no early stop yet (it runs its whole budge
 keeps full heat until it settles on its own, so the example gives those two a budget that shrinks as
 the graph grows. **GPU** and **Auto** get that budget whichever transport they resolve to, since that is
 known only after `layout()` returns; where they resolve to the worker, a multilevel run therefore cools
-over fewer ticks than under **Worker**. `layout({ backend: "gpu" })` (the **Backend** control) runs the solve in WebGL2 where
+over fewer ticks than under **Worker**. The GPU layout seeds multilevel too: a worker coarsens the graph
+(the same heavy-edge matching) while the GPU solver is built, and the GPU then lays out every coarse level
+on that one solver, coarsest first, inside the same per-frame GPU budget as the refinement. Until its first
+frame the equilibrium-sized disc stays on screen; that frame already shows the global arrangement, at the
+same scale, and a seeded GPU layout cools over its budget like the worker's. The seed is paced by animation
+frames, so that first frame comes later than a disc start's: on web-NotreDame about 0.8 s later at 120 Hz,
+and about twice that on a 60 Hz display. On web-NotreDame (325k nodes) the
+seeded GPU layout meets the CPU layouts' convergence rule by tick 149, with shorter edges than a disc start
+reaches in its whole 300-tick budget, which never meets it (**Seeding** "Cold" — `multilevel: false` —
+starts the GPU layout from the disc, with or without a module hierarchy).
+`layout({ backend: "gpu" })` (the **Backend** control) runs the solve in WebGL2 where
 the device can: float render targets, float blending (`EXT_float_blend`) and textures large enough for
 the graph. The main thread never waits for it: each frame gives the layout at most
 `min(10 ms, 0.6 × the frame interval)` of GPU time (a tick larger than that is split across frames in

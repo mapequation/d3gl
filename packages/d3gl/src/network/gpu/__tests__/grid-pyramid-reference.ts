@@ -18,6 +18,10 @@
  * GLSL ES 3.00 has no `precise`, so the GPU may contract an FMA or round a division differently;
  * the contract (§9) compares per-node forces from IDENTICAL positions with a relative statistic,
  * not bits. Later phases reuse this helper as the flat baseline.
+ *
+ * With `level` (a multilevel seed level, #353) it is that level's tick: masses in the statistics' map
+ * (m·x, m·y, m), the pyramid's scatter (m·x, m·y, m, m·r²) and the exact loop (node j repels by m_j),
+ * weighted spring terms, and each row's sum scaled by `attraction / m_i`.
  */
 import { chooseGrid } from "../passes/grid-pyramid.js";
 import { REDUCE_FANOUT, canonicalCover, reduceLayout, type SlotRange } from "../segments.js";
@@ -36,6 +40,12 @@ export interface ReferenceParams {
 export interface ReferenceCSR {
   offsets: Uint32Array;
   neighbors: Uint32Array;
+}
+
+/** A multilevel seed level's per-slot masses and per-entry spring weights (#353). */
+export interface ReferenceLevel {
+  mass: Float32Array;
+  weights: Float32Array;
 }
 
 /** The segment statistics the reduction produces for the flat segment. */
@@ -69,13 +79,22 @@ function sum16(v: readonly Vec3[]): Vec3 {
 
 /**
  * A segment's statistics exactly as the GPU reduction orders them: level-1 texels are pairwise sums
- * of 16 mapped slots (x, y, 1) of the tree over all `count` slots, level ℓ texels pairwise sums of 16
+ * of 16 mapped slots (x, y, 1) — (m·x, m·y, m) with `mass` (#353) — of the tree over all `count` slots, level ℓ texels pairwise sums of 16
  * level-(ℓ−1) texels, and the range query adds the canonical cover of the segment's range (default
  * the flat segment [0, count)) sequentially.
  */
-export function referenceStats(positions: Float32Array, count: number, range: SlotRange = { start: 0, count }): ReferenceStats {
+export function referenceStats(
+  positions: Float32Array,
+  count: number,
+  range: SlotRange = { start: 0, count },
+  mass?: Float32Array,
+): ReferenceStats {
   const zero: Vec3 = [0, 0, 0];
-  const slot = (s: number): Vec3 => (s < count ? [positions[s * 2] ?? 0, positions[s * 2 + 1] ?? 0, 1] : zero);
+  const slot = (s: number): Vec3 => {
+    if (s >= count) return zero;
+    const m = mass ? (mass[s] ?? 0) : 1;
+    return [f(m * (positions[s * 2] ?? 0)), f(m * (positions[s * 2 + 1] ?? 0)), m];
+  };
   const levels: Vec3[][] = [];
   const layout = reduceLayout(count);
   let prev = (i: number): Vec3 => slot(i);
@@ -131,15 +150,17 @@ export function gridPyramidReference(
   count: number,
   csr: ReferenceCSR,
   params: ReferenceParams,
+  level?: ReferenceLevel,
 ): Float32Array {
   return segmentedReference(positions, count, csr, params, [
     { start: 0, count, tileSide: chooseGrid(count), softening: FLAT_SOFTENING },
-  ]);
+  ], level);
 }
 
 /**
  * Per-node force of one segmented tick from `positions` (`count * 2` floats): every segment is solved
- * on its own — its tile (or its exact loop), its springs, its centroid. See the file header.
+ * on its own — its tile (or its exact loop), its springs, its centroid. With `level`, a multilevel seed
+ * level's tick (#353, see the file header). See the file header.
  */
 export function segmentedReference(
   positions: Float32Array,
@@ -147,9 +168,10 @@ export function segmentedReference(
   csr: ReferenceCSR,
   params: ReferenceParams,
   segments: readonly ReferenceSegment[],
+  level?: ReferenceLevel,
 ): Float32Array {
   const out = new Float32Array(count * 2);
-  for (const seg of segments) segmentForces(positions, count, csr, params, seg, out);
+  for (const seg of segments) segmentForces(positions, count, csr, params, seg, out, level);
   return out;
 }
 
@@ -161,16 +183,18 @@ function segmentForces(
   params: ReferenceParams,
   seg: ReferenceSegment,
   out: Float32Array,
+  level: ReferenceLevel | undefined,
 ): void {
   const px = (i: number): number => positions[i * 2] ?? 0;
   const py = (i: number): number => positions[i * 2 + 1] ?? 0;
-  const stats = referenceStats(positions, count, seg);
+  const mass = level?.mass;
+  const stats = referenceStats(positions, count, seg, mass);
   const end = seg.start + seg.count;
   const softening = f(seg.softening);
   const repulsion = f(params.repulsion);
   const repel = seg.tileSide === null
-    ? exactRepulsion(positions, seg.start, end, repulsion, softening)
-    : tileRepulsion(positions, seg.start, end, stats, seg.tileSide, repulsion, softening, f(params.theta * params.theta));
+    ? exactRepulsion(positions, seg.start, end, repulsion, softening, mass)
+    : tileRepulsion(positions, seg.start, end, stats, seg.tileSide, repulsion, softening, f(params.theta * params.theta), mass);
 
   const attraction = f(params.attraction);
   const centering = f(params.centering);
@@ -179,17 +203,24 @@ function segmentForces(
   for (let i = seg.start; i < end; i++) {
     const xi = px(i), yi = py(i);
 
-    // ── Springs: Σ (p_j − p_i) over the CSR row, then × attraction ──
+    // ── Springs: Σ (p_j − p_i) over the CSR row (weighted on a seed level), then × attraction (/ m_i) ──
     let sx = 0, sy = 0;
     const start = csr.offsets[i] ?? 0;
     const stop = csr.offsets[i + 1] ?? 0;
     for (let p = start; p < stop; p++) {
       const j = csr.neighbors[p] ?? 0;
-      sx = f(sx + f(px(j) - xi));
-      sy = f(sy + f(py(j) - yi));
+      if (level) {
+        const w = level.weights[p] ?? 0;
+        sx = f(sx + f(w * f(px(j) - xi)));
+        sy = f(sy + f(w * f(py(j) - yi)));
+      } else {
+        sx = f(sx + f(px(j) - xi));
+        sy = f(sy + f(py(j) - yi));
+      }
     }
-    const springX = f(attraction * sx);
-    const springY = f(attraction * sy);
+    const kSpring = level ? f(attraction / (level.mass[i] ?? 0)) : attraction;
+    const springX = f(kSpring * sx);
+    const springY = f(kSpring * sy);
 
     // ── Centering toward the segment centroid ──
     const centerX = f(centering * f(centX - xi));
@@ -202,8 +233,15 @@ function segmentForces(
   }
 }
 
-/** Exact repulsion over the slots [start, end), each from every other one in slot order. */
-function exactRepulsion(positions: Float32Array, start: number, end: number, repulsion: number, softening: number): Float32Array {
+/** Exact repulsion over the slots [start, end), each from every other one in slot order (by its mass, #353). */
+function exactRepulsion(
+  positions: Float32Array,
+  start: number,
+  end: number,
+  repulsion: number,
+  softening: number,
+  mass: Float32Array | undefined,
+): Float32Array {
   const px = (i: number): number => positions[i * 2] ?? 0;
   const py = (i: number): number => positions[i * 2 + 1] ?? 0;
   const acc = new Float32Array((end - start) * 2);
@@ -213,7 +251,7 @@ function exactRepulsion(positions: Float32Array, start: number, end: number, rep
       if (j === i) continue;
       const dx = f(px(i) - px(j)), dy = f(py(i) - py(j));
       const d2 = f(f(dx * dx) + f(dy * dy));
-      const force = f(repulsion / f(d2 + softening));
+      const force = mass ? f(f(repulsion * (mass[j] ?? 0)) / f(d2 + softening)) : f(repulsion / f(d2 + softening));
       ax = f(ax + f(force * dx));
       ay = f(ay + f(force * dy));
     }
@@ -233,6 +271,7 @@ function tileRepulsion(
   repulsion: number,
   softening: number,
   theta2: number,
+  mass: Float32Array | undefined,
 ): Float32Array {
   const px = (i: number): number => positions[i * 2] ?? 0;
   const py = (i: number): number => positions[i * 2 + 1] ?? 0;
@@ -248,7 +287,7 @@ function tileRepulsion(
   const boxSide = f(2 * hlfMax);
   const levelCount = Math.log2(G) + 1;
 
-  // ── Level-0 scatter, slot order: (Σx, Σy, mass, Σ|p − cellCenter|²) ──
+  // ── Level-0 scatter, slot order: (Σx, Σy, mass, Σ|p − cellCenter|²), mass-weighted on a seed level ──
   const levels: Float32Array[] = [];
   const level0 = new Float32Array(G * G * 4);
   for (let i = start; i < end; i++) {
@@ -262,10 +301,11 @@ function tileRepulsion(
     const rx = f(x - ccx), ry = f(y - ccy);
     const r2 = f(f(rx * rx) + f(ry * ry));
     const o = (cy * G + cx) * 4;
-    level0[o] = f((level0[o] ?? 0) + x);
-    level0[o + 1] = f((level0[o + 1] ?? 0) + y);
-    level0[o + 2] = f((level0[o + 2] ?? 0) + 1);
-    level0[o + 3] = f((level0[o + 3] ?? 0) + r2);
+    const m = mass ? (mass[i] ?? 0) : 1;
+    level0[o] = f((level0[o] ?? 0) + f(m * x));
+    level0[o + 1] = f((level0[o + 1] ?? 0) + f(m * y));
+    level0[o + 2] = f((level0[o + 2] ?? 0) + m);
+    level0[o + 3] = f((level0[o + 3] ?? 0) + f(m * r2));
   }
   levels.push(level0);
 

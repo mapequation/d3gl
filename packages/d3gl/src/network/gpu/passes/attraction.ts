@@ -5,11 +5,10 @@ import { SLOT_TEXEL_GLSL } from "../textures.js";
 import { ADDITIVE_BLEND, NO_BLEND, fullScreenModel, type PassUniforms } from "./fullscreen.js";
 
 /**
- * Which spring variant a program is compiled for — fixed per layout, so no per-fragment branch on it.
- *
- * TODO(#353): one solver across multilevel levels (`setLevel`, spec §6.4) changes the CSR, the hub table
- * and the weights per level, so both flags must then become uniform branches (spec §5.4) or be compiled
- * on for the capacity solver — a hub-free first level would otherwise compile without the hub branch.
+ * Which spring variant a program is compiled for — fixed per spring set, so no per-fragment branch on it.
+ * The finest level's springs and a multilevel seed's springs (#353) are separate sets with their own CSR
+ * textures: the seed's are compiled once for every seed level (weighted, mass-weighted, with the hub branch
+ * when any level has a hub), and the finest level's program stays the flat one.
  */
 export interface SpringVariant {
   /**
@@ -19,6 +18,11 @@ export interface SpringVariant {
   hubs: boolean;
   /** Per-entry spring weights (`LayoutGraph.springWeight`): multiply each term by its weight. */
   weighted: boolean;
+  /**
+   * Mass-weighted seed levels (#353): divide each row's sum by its slot's mass, as the CPU applies an
+   * aggregated spring as an acceleration on each endpoint's mass (`k · w / mass`). Row pass only.
+   */
+  massive?: boolean;
 }
 
 /** `#version` line plus the variant's defines — the one place a variant reaches GLSL. */
@@ -26,7 +30,8 @@ function header(variant: SpringVariant): string {
   return (
     `#version 300 es\n#define SPRING_CHUNK ${SPRING_CHUNK}u\n#define HUB_CHUNK ${HUB_CHUNK}u\n` +
     (variant.hubs ? "#define HUB_CHUNKS\n" : "") +
-    (variant.weighted ? "#define WEIGHTED_SPRINGS\n" : "")
+    (variant.weighted ? "#define WEIGHTED_SPRINGS\n" : "") +
+    (variant.massive ? "#define MASSIVE_SPRINGS\n" : "")
   );
 }
 
@@ -95,6 +100,9 @@ uniform usampler2D u_offsets;
 uniform int   u_count;
 uniform int   u_off_width;
 uniform float u_attraction;
+#ifdef MASSIVE_SPRINGS
+uniform sampler2D u_mass;      // per-slot mass (slot atlas): the row's sum is an acceleration on it
+#endif
 #ifdef HUB_CHUNKS
 uniform usampler2D u_chunks;   // rgba32ui (row, entry start, entry end, 0), ascending entry start
 uniform sampler2D  u_partials; // rg32f, one partial sum per chunk
@@ -118,6 +126,11 @@ void main() {
   uint start = texelFetch(u_offsets, offCoord(id),     0).r;
   uint end   = texelFetch(u_offsets, offCoord(id + 1), 0).r;
   vec2 f = vec2(0.0);
+#ifdef MASSIVE_SPRINGS
+  float k = u_attraction / texelFetch(u_mass, c, 0).r;
+#else
+  float k = u_attraction;
+#endif
 
 #ifdef HUB_CHUNKS
   // A sum, not "end - start > C", so a bound can never wrap on uints. Past the last node the offsets
@@ -133,10 +146,10 @@ void main() {
       if (texelFetch(u_chunks, chunkCoord(mid), 0).g < start) { lo = mid + 1; } else { hi = mid; }
     }
     int n = int((end - start + HUB_CHUNK - 1u) / HUB_CHUNK);
-    for (int k = 0; k < n; k++) {
-      f += texelFetch(u_partials, chunkCoord(lo + k), 0).xy;
+    for (int q = 0; q < n; q++) {
+      f += texelFetch(u_partials, chunkCoord(lo + q), 0).xy;
     }
-    o_force = u_attraction * f;
+    o_force = k * f;
     return;
   }
 #endif
@@ -145,7 +158,7 @@ void main() {
   for (uint p = start; p < end; p++) {
     f += springTerm(p, pi);
   }
-  o_force = u_attraction * f;
+  o_force = k * f;
 }
 `;
 
@@ -242,6 +255,7 @@ export class AttractionPass {
     csr: CsrTextures,
     hubs: HubChunkTextures | null,
     u: AttractionUniforms,
+    mass: Texture | null = null,
   ): void {
     this.uniforms["u_count"] = u.count;
     this.uniforms["u_width"] = u.width;
@@ -255,6 +269,7 @@ export class AttractionPass {
       u_neighbors: csr.neighbors,
     };
     if (this.variant.weighted && csr.weights) bindings["u_weights"] = csr.weights;
+    if (this.variant.massive && mass) bindings["u_mass"] = mass;
     if (this.variant.hubs && hubs) {
       this.uniforms["u_chunk_count"] = hubs.count;
       this.uniforms["u_chunk_width"] = hubs.width;

@@ -16,6 +16,8 @@ import { buildGraph, type NetworkGraph } from "../../graph.js";
 import { computeLODPositions, lodTreeFromTopology, type LODTree } from "../../lod.js";
 import type { WorkerToMain } from "../../worker-protocol.js";
 import { LODRelay } from "../lod-relay.js";
+import { SeedWorker } from "../seed-worker.js";
+import type { SeedPlan } from "../seed-plan.js";
 import { InProcessLODWorker } from "./_in-process-lod-worker.js";
 
 /** `ErrorEvent` is not a Node global: the fields a worker `error` event carries. */
@@ -249,5 +251,78 @@ describe("LOD relay: failure and teardown (#377)", () => {
     expect(worker.onmessage).toBeNull();
     worker.flush();
     expect(trees).toHaveLength(0);
+  });
+});
+
+describe("the multilevel seed's plan from the coarsening worker (#353)", () => {
+  const options = { width: 800, height: 600 };
+
+  it("the relay asks for the plan with its tree and hands it over first, once, before it adopts the tree", () => {
+    const graph = clustered(1500);
+    const worker = new InProcessLODWorker();
+    const plans: (SeedPlan | null)[] = [];
+    const trees: (LODTree | null)[] = [];
+    const relay = new LODRelay(worker, graph, { minNodes: 4 }, (tree) => trees.push(tree), { options, onPlan: (plan) => plans.push(plan) });
+    const request = worker.received[0];
+    expect(request?.type === "coarsen" && request.lod && request.seed).toEqual(options);
+    worker.flush();
+    expect(plans.length).toBe(1);
+    expect(plans[0]?.nodeCount).toBe(graph.nodeCount);
+    expect(plans[0]?.levels.length).toBeGreaterThan(1);
+    expect(trees).toEqual([expect.objectContaining({ size: expect.any(Number) })]); // adopted after the plan
+    relay.destroy();
+  });
+
+  it("a relay without a seed request asks for no plan", () => {
+    const { worker, relay } = start();
+    const request = worker.received[0];
+    expect(request?.type === "coarsen" && request.seed).toBeUndefined();
+    relay.destroy();
+  });
+
+  it("the relay hands over null when its worker fails before the plan, and nothing after the plan", () => {
+    const graph = clustered(800);
+    const worker = new InProcessLODWorker();
+    const plans: (SeedPlan | null)[] = [];
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    const relay = new LODRelay(worker, graph, undefined, () => {}, { options, onPlan: (plan) => plans.push(plan) });
+    worker.onerror?.(new WorkerError());
+    expect(plans).toEqual([null]);
+    worker.onerror?.(new WorkerError());
+    expect(plans).toEqual([null]);
+    relay.destroy();
+  });
+
+  it("the seed-only worker (LOD off) asks for the plan without the tree, delivers it once and terminates", () => {
+    const graph = clustered(1500);
+    const worker = new InProcessLODWorker();
+    const plans: (SeedPlan | null)[] = [];
+    new SeedWorker(worker, graph, undefined, options, (plan) => plans.push(plan));
+    const request = worker.received[0];
+    expect(request?.type === "coarsen" && !request.lod && request.seed).toEqual(options);
+    worker.flush();
+    expect(plans.length).toBe(1);
+    expect(plans[0]?.levels.length).toBeGreaterThan(1);
+    expect(worker.terminated).toBe(true);
+  });
+
+  it("the seed-only worker warns and delivers null when the worker fails; destroyed, it delivers nothing", () => {
+    const graph = clustered(800);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const failing = new InProcessLODWorker();
+    const plans: (SeedPlan | null)[] = [];
+    new SeedWorker(failing, graph, undefined, options, (plan) => plans.push(plan));
+    failing.onerror?.(new WorkerError());
+    expect(plans).toEqual([null]);
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(failing.terminated).toBe(true);
+
+    const stopped = new InProcessLODWorker();
+    const late: (SeedPlan | null)[] = [];
+    const seedWorker = new SeedWorker(stopped, graph, undefined, options, (plan) => late.push(plan));
+    seedWorker.destroy();
+    stopped.flush();
+    expect(late).toEqual([]);
+    expect(stopped.terminated).toBe(true);
   });
 });

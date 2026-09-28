@@ -377,7 +377,10 @@ describe("GPU frame budget — pyramid path (per-tick regression tripwire)", () 
     expect(scatters.length).toBe(3);
   });
 
-  it("pyramid ticking at N=30000 allocates no framebuffers or textures (all pre-created)", () => {
+  // Every seeded GPU layout (#353, the default) ticks the graph's level on a solver built with `multilevel`,
+  // whose reduction, pyramid scatter, all-pairs and traversal programs carry the mass branch: the per-tick
+  // signatures below run on both kinds of solver.
+  it.each([false, true])("pyramid ticking at N=30000 allocates no framebuffers or textures (all pre-created), multilevel %s", (multilevel) => {
     // Re-affirms the "updated in place, not recreated per frame" AGENTS.md §5 signature
     // at scale on the pyramid path. Mirrors the same assertion from gpu-pyramid.browser.test.ts
     // but at a larger N representative of the hot path.
@@ -385,7 +388,7 @@ describe("GPU frame budget — pyramid path (per-tick regression tripwire)", () 
     const g = makeClusteredGraph(N, 80, 0xcafe1234);
     const params = { repulsion: 200, attraction: 0.05, centering: 0.2, alpha: 0.05, theta: 0.7 };
 
-    const layout = new GpuForceLayout(device, g, params, { repulsionMode: "pyramid" });
+    const layout = new GpuForceLayout(device, g, params, { repulsionMode: "pyramid", multilevel });
 
     // Reset spies AFTER construction (construction legitimately allocates).
     const fboSpy = vi.spyOn(device, "createFramebuffer");
@@ -410,7 +413,7 @@ describe("GPU frame budget — pyramid path (per-tick regression tripwire)", () 
     layout.destroy();
   });
 
-  it("a tick sliced into row bands (#352) is bitwise the unsliced tick, and allocates nothing per band", () => {
+  it.each([false, true])("a tick sliced into row bands (#352) is bitwise the unsliced tick, and allocates nothing per band, multilevel %s", (multilevel) => {
     // The streaming transport encodes the force pass one row band at a time (scissored), so one tick's GPU
     // work can span frames. Bands write disjoint texels and each texel gets springs → repulsion →
     // centering in the same order whatever B is, so the result must be BITWISE equal (same program, same
@@ -420,8 +423,8 @@ describe("GPU frame budget — pyramid path (per-tick regression tripwire)", () 
     const g = withHubs(makeClusteredGraph(N, 80, 0xba4d5), 0x51);
     const params = { repulsion: 200, attraction: 0.05, centering: 0.2, alpha: 0.05, theta: 0.7 };
     const TICKS = 3;
-    const whole = new GpuForceLayout(device, { ...g, positions: g.positions.slice() }, params, { repulsionMode: "pyramid" });
-    const sliced = new GpuForceLayout(device, { ...g, positions: g.positions.slice() }, params, { repulsionMode: "pyramid" });
+    const whole = new GpuForceLayout(device, { ...g, positions: g.positions.slice() }, params, { repulsionMode: "pyramid", multilevel });
+    const sliced = new GpuForceLayout(device, { ...g, positions: g.positions.slice() }, params, { repulsionMode: "pyramid", multilevel });
     const a = new Float32Array(N * 2);
     const b = new Float32Array(N * 2);
     try {
@@ -459,6 +462,40 @@ describe("GPU frame budget — pyramid path (per-tick regression tripwire)", () 
     let moved = 0;
     for (let i = 0; i < N * 2; i++) if (a[i] !== g.positions[i]) moved++;
     expect(moved).toBeGreaterThan(N);
+  });
+
+  it("a multilevel solver's ticks of the graph's level are bitwise a flat solver's (#353: the mass branch multiplies by 1)", () => {
+    // After a seed the run ticks the graph's level on the multilevel solver: its reduction, scatter and
+    // all-pairs programs take the unit-mass branch and the traversal's root level is a uniform. That must change
+    // no bit of the flat tick, on the pyramid path (hub rows included) and on the all-pairs path.
+    const params = { repulsion: 200, attraction: 0.05, centering: 0.2, alpha: 0.05, theta: 0.7 };
+    const TICKS = 3;
+    const cases: { mode: "pyramid" | "allpairs"; g: LayoutGraph }[] = [
+      { mode: "pyramid", g: withHubs(makeClusteredGraph(perfN(30_000, { max: 200_000 }), 80, 0xf1a7), 0x52) },
+      { mode: "allpairs", g: makeClusteredGraph(3_000, 20, 0xa11) },
+    ];
+    for (const { mode, g } of cases) {
+      const n = g.nodeCount;
+      const flat = new GpuForceLayout(device, { ...g, positions: g.positions.slice() }, params, { repulsionMode: mode });
+      const multi = new GpuForceLayout(device, { ...g, positions: g.positions.slice() }, params, { repulsionMode: mode, multilevel: true });
+      const a = new Float32Array(n * 2);
+      const b = new Float32Array(n * 2);
+      try {
+        flat.runFrame(TICKS);
+        flat.readPositions(a);
+        multi.runFrame(TICKS);
+        multi.readPositions(b);
+      } finally {
+        flat.destroy();
+        multi.destroy();
+      }
+      let mismatches = 0;
+      for (let i = 0; i < n * 2; i++) if (!Object.is(a[i], b[i])) mismatches++;
+      expect(mismatches, `${mode}: positions differing from the flat solver's`).toBe(0);
+      let moved = 0;
+      for (let i = 0; i < n * 2; i++) if (a[i] !== g.positions[i]) moved++;
+      expect(moved, `${mode}: the ticks did not move the layout`).toBeGreaterThan(n);
+    }
   });
 
   it("hub springs (#350): a tick with web-NotreDame-shaped hub rows stays under the same ceiling and near its hub-free twin", () => {

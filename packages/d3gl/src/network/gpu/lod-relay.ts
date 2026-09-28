@@ -19,6 +19,10 @@
  *    nothing and clones nothing. The main thread pays two memcpys per repaint (positions, geometry), the
  *    same copies the worker backend's copy mode makes per frame.
  *
+ * The same coarsening also yields the GPU's multilevel seed (#353): with a `seed` request the relay asks the
+ * worker for its plan too, and hands it to `seed.onPlan` as soon as it arrives — before the topology, which
+ * takes longer to build — or `null` if the worker fails first.
+ *
  * `holding` keeps the run's `settled` until the tree is adopted, so the settle handler sees the final
  * positions with their geometry. If the worker fails (it errors, a reply cannot be delivered, or a message
  * cannot be posted), the relay warns once, withdraws the tree (`onLODTree(null)`: the engine builds its own,
@@ -28,6 +32,7 @@
  */
 import type { CoarsenOptions } from "../coarsen.js";
 import type { NetworkGraph } from "../graph.js";
+import type { SeedPlan, SeedPlanOptions } from "./seed-plan.js";
 import { lodTreeFromTopology, type LODTopology, type LODTree } from "../lod.js";
 import {
   lodGeometryByteLength,
@@ -45,6 +50,13 @@ export interface LODWorkerPort {
   onerror: ((event: ErrorEvent) => void) | null;
   onmessageerror: ((event: MessageEvent) => void) | null;
   terminate(): void;
+}
+
+/** A request for the GPU multilevel seed's plan (#353), built from the relay's coarsening. */
+export interface SeedRequest {
+  readonly options: SeedPlanOptions;
+  /** The plan (null: the graph cannot be coarsened), or null when the worker failed before sending it. Called once. */
+  readonly onPlan: (plan: SeedPlan | null) => void;
 }
 
 /** Where the relay is: building the tree, refitting it for adoption, streaming, or out of service. */
@@ -72,6 +84,8 @@ export class LODRelay implements FrameSink {
   /** The worker's geometry buffer, held from a reply until the next request hands it back. */
   private geometry: Float32Array | null = null;
   private wake: () => void = () => {};
+  /** The seed plan's request, until the plan (or the failure) has been handed over. */
+  private seed: SeedRequest | null;
 
   /**
    * Start the tree on `port`: post the graph's edges for coarsening (copied; the main thread keeps its own).
@@ -79,16 +93,23 @@ export class LODRelay implements FrameSink {
    * Throws, with the worker terminated and no callback run, when the coarsen request cannot be posted: the
    * caller reports its transport before it withdraws the tree, and a withdrawal from here would precede that.
    */
-  constructor(port: LODWorkerPort, graph: NetworkGraph, coarsen: CoarsenOptions | undefined, onLODTree: (tree: LODTree | null) => void) {
+  constructor(
+    port: LODWorkerPort,
+    graph: NetworkGraph,
+    coarsen: CoarsenOptions | undefined,
+    onLODTree: (tree: LODTree | null) => void,
+    seed: SeedRequest | null = null,
+  ) {
     this.port = port;
     this.graph = graph;
     this.onLODTree = onLODTree;
+    this.seed = seed;
     port.onmessage = (event) => this.receive(event.data);
     port.onerror = () => this.fail("the LOD worker failed");
     port.onmessageerror = () => this.fail("a reply from the LOD worker could not be read");
     const { nodeCount, source, target, weight } = graph;
     try {
-      port.postMessage({ type: "coarsen", nodeCount, source, target, weight, coarsen }, []);
+      port.postMessage({ type: "coarsen", nodeCount, source, target, weight, coarsen, lod: true, ...(seed ? { seed: seed.options } : {}) }, []);
     } catch (error) {
       this.phase = "destroyed";
       this.release();
@@ -146,14 +167,23 @@ export class LODRelay implements FrameSink {
   destroy(): void {
     if (this.phase === "destroyed") return;
     this.phase = "destroyed";
+    this.seed = null; // the run is over: nobody waits for the plan
     this.release();
   }
 
   // ── The worker's replies ───────────────────────────────────────────────────
 
   private receive(msg: WorkerToMain): void {
-    if (msg.type === "lod-topology") this.refitForAdoption(msg.topology);
+    if (msg.type === "seed-plan") this.handOverSeed(msg.plan);
+    else if (msg.type === "lod-topology") this.refitForAdoption(msg.topology);
     else if (msg.type === "lod-geometry") this.returned(msg.positions, msg.geometry);
+  }
+
+  /** Hand the seed plan (or its failure, null) to the request, once. */
+  private handOverSeed(plan: SeedPlan | null): void {
+    const seed = this.seed;
+    this.seed = null;
+    seed?.onPlan(plan);
   }
 
   /** The tree's topology arrived: build the tree and refit it to the positions on screen before adopting it. */
@@ -206,6 +236,7 @@ export class LODRelay implements FrameSink {
     const message = `[d3gl] network layout({ backend: 'gpu' }): ${reason}; the LOD tree is built on the main thread instead.`;
     if (cause === undefined) console.warn(message);
     else console.warn(message, cause);
+    this.handOverSeed(null); // the layout starts from its disc
     this.onLODTree(null);
     this.wake();
   }

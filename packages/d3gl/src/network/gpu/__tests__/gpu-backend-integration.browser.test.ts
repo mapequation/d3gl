@@ -551,6 +551,61 @@ describe("backend:'auto' (#375)", () => {
   });
 });
 
+describe("backend:'gpu' multilevel seed for a plain graph (#353, #312)", () => {
+  /** Every `coarsen` message posted to a layout worker since `spy` was installed. */
+  function coarsenPosts(spy: { mock: { calls: [MainToWorker, ...unknown[]][] } }) {
+    return spy.mock.calls.map((c) => c[0]).filter((m) => m.type === "coarsen");
+  }
+
+  it("seeds from the graph's coarsening, built in a worker, and paints the seed first; multilevel:false keeps the disc", async () => {
+    const net = network(makeHost(), { width: W, height: H, backend: "webgl" });
+    const posts = vi.spyOn(Worker.prototype, "postMessage");
+    const harvests: number[] = [];
+    const unobserve = observeGpuLayoutFrames((s) => {
+      if (s.harvested) harvests.push(s.harvestedTicks);
+    });
+    try {
+      net.data(clustered(1500)).layout({ backend: "gpu", iterations: 20 });
+      await net.whenSettled();
+      expect(net.layoutTransport).toBe("gpu");
+      // A seed-only worker (LOD off): it coarsens, sends the plan, and no worker layout runs.
+      const seeded = coarsenPosts(posts);
+      expect(seeded).toHaveLength(1);
+      expect(seeded[0]?.type === "coarsen" && seeded[0].seed).toEqual({ width: W, height: H });
+      expect(seeded[0]?.type === "coarsen" && seeded[0].lod).toBe(false);
+      expect(workerStarts(posts)).toHaveLength(0);
+      expect(harvests[0], "the first frame is not the seed").toBe(0);
+
+      posts.mockClear();
+      harvests.length = 0;
+      net.layout({ backend: "gpu", iterations: 20, multilevel: false });
+      await net.whenSettled();
+      expect(coarsenPosts(posts)).toHaveLength(0); // no coarsening: a cold start from the disc
+      expect(harvests[0]).toBeGreaterThan(0); // no seed frame
+    } finally {
+      unobserve();
+      net.destroy();
+    }
+  });
+
+  it("with LOD on, the LOD worker's one coarsening builds both the seed and the tree", async () => {
+    const net = network(makeHost(), { width: W, height: H, backend: "webgl" });
+    const posts = vi.spyOn(Worker.prototype, "postMessage");
+    try {
+      net.data(clustered(1500)).lod({ expandPx: 48 }).layout({ backend: "gpu", iterations: 10 });
+      await net.whenSettled();
+      expect(net.layoutTransport).toBe("gpu");
+      const coarsen = coarsenPosts(posts);
+      expect(coarsen).toHaveLength(1);
+      expect(coarsen[0]?.type === "coarsen" && coarsen[0].lod).toBe(true);
+      expect(coarsen[0]?.type === "coarsen" && coarsen[0].seed).toEqual({ width: W, height: H });
+      expect(net.lodSource).toBe("worker");
+    } finally {
+      net.destroy();
+    }
+  });
+});
+
 describe("backend:'gpu' whose streaming readback fails to build (#352)", () => {
   it("falls back to the worker, reports only the worker transport, and frees the solver", async () => {
     const device = await makeTestDevice();
@@ -572,7 +627,8 @@ describe("backend:'gpu' whose streaming readback fails to build (#352)", () => {
     const reports: GpuLayoutTransport[] = [];
     const g = buildGraph(makeRingGraph());
     try {
-      const handle = startGpuLayout(Promise.resolve(device), g, { width: W, height: H, iterations: 5 }, () => {}, undefined, (t) => {
+      // A disc-seeded run (`multilevel: false`): it holds full heat right before building the stream.
+      const handle = startGpuLayout(Promise.resolve(device), g, { width: W, height: H, iterations: 5, multilevel: false }, () => {}, undefined, (t) => {
         reports.push(t);
         failBuffers = false;
       });

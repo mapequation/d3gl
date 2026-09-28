@@ -84,8 +84,10 @@ export interface MultilevelLayoutOptions {
 const DEFAULT_MIN_NODES = 8;
 const DEFAULT_MAX_LEVELS = 32;
 const DEFAULT_ITERATIONS = 100;
-const DEFAULT_COARSEN_ITERATIONS = 30;
-const DEFAULT_MAX_SEED_NODES = 16384;
+/** Default {@link MultilevelLayoutOptions.coarsenIterations}, shared with the GPU seed plan. */
+export const DEFAULT_COARSEN_ITERATIONS = 30;
+/** Default {@link MultilevelLayoutOptions.maxSeedNodes}, shared with the GPU seed plan. */
+export const DEFAULT_MAX_SEED_NODES = 16384;
 /**
  * Smallest coarse level whose solve is shown as seed progress ({@link SeedProgress.atScale}, #368). A
  * coarser level is a handful of mass-sized discs that pack with gaps: prolongated, it spans up to
@@ -96,6 +98,87 @@ const DEFAULT_MAX_SEED_NODES = 16384;
  */
 const SEED_PROGRESS_MIN_NODES = 1024;
 const GOLDEN = Math.PI * (3 - Math.sqrt(5));
+
+/**
+ * Ticks the multilevel seed solves a coarse level of `n` nodes for: the full `coarsenIterations` up to
+ * `maxSeedNodes` nodes, a proportional share above it (the same `coarsenIterations · maxSeedNodes`
+ * node-ticks), and none for a single node or a level past `coarsenIterations · maxSeedNodes` nodes. The CPU
+ * seed ({@link multilevelSeed}) and the GPU seed plan (`gpu/seed-plan.ts`) both schedule by it.
+ */
+export function seedLevelTicks(n: number, coarsenIterations: number, maxSeedNodes: number): number {
+  if (n <= 1) return 0;
+  return Math.max(0, Math.min(coarsenIterations, Math.floor((coarsenIterations * maxSeedNodes) / n)));
+}
+
+/**
+ * The coarse springs' strength factor: coarse levels carry aggregated edge weights, and multiplying the
+ * attraction by `edges / Σ weight` normalises them to the finest level's unit springs — for an unweighted
+ * graph a coarse weight is then exactly the number of finest edges it stands for; for a weighted one, that
+ * count on average. Self-loops are left out (they aggregate to nothing). 1 for a graph without weight.
+ */
+export function coarseAttractionScale(graph: CoarseLevel): number {
+  let edges = 0;
+  let weightSum = 0;
+  for (let e = 0; e < graph.source.length; e++) {
+    if (graph.source[e] === graph.target[e]) continue;
+    edges++;
+    weightSum += graph.weight[e] ?? 0;
+  }
+  return weightSum > 0 ? edges / weightSum : 1;
+}
+
+/**
+ * How many finest nodes each node of every coarse level stands for, accumulated finest-up through the
+ * projections: `result[k − 1]` is level k's (level 0 is 1 each, implicit).
+ */
+export function coarseLevelMasses(hierarchy: Hierarchy): Float32Array[] {
+  const masses: Float32Array[] = [];
+  let fineMass: Float32Array | undefined;
+  for (const [k, level] of hierarchy.levels.slice(1).entries()) {
+    const up = hierarchy.projections[k];
+    if (!up) break; // buildHierarchy pairs every coarse level with its projection
+    const mass = new Float32Array(level.nodeCount);
+    up.forEach((c, i) => {
+      mass[c] = (mass[c] ?? 0) + (fineMass?.[i] ?? 1);
+    });
+    masses.push(mass);
+    fineMass = mass;
+  }
+  return masses;
+}
+
+/**
+ * The prolongation's placement rule: node `i` of a finer level lands in a phyllotaxis disc about its
+ * parent `projection[i]`, at the cumulative mass of its earlier siblings, so a parent standing for `m`
+ * finest nodes spreads them over `m` nodes' worth of equilibrium area (`spacing²` each). Deterministic
+ * golden-angle turns (offset by the parent id, so neighbouring parents don't all start their ring at 0°),
+ * no RNG, never coincident. `emit(i, parent, dx, dy)` receives each node's offset from its parent, in
+ * float64: the CPU seed adds it to the parent's position, the GPU seed plan stores it for the GPU to add.
+ * `mass` is the finer level's own (omitted = 1 each, the finest level).
+ */
+export function placeChildren(
+  projection: ArrayLike<number>,
+  mass: Float32Array | undefined,
+  coarseCount: number,
+  n: number,
+  spacing: number,
+  emit: (i: number, parent: number, dx: number, dy: number) => void,
+): void {
+  const filled = new Float32Array(coarseCount); // per parent: mass already placed around it
+  const rank = new Uint32Array(coarseCount); // per parent: children placed so far
+  const k = spacing / Math.sqrt(Math.PI); // a disc of area A·spacing² has radius k·√A
+  for (let i = 0; i < n; i++) {
+    const c = projection[i] ?? 0;
+    const m = mass?.[i] ?? 1;
+    const before = filled[c] ?? 0;
+    filled[c] = before + m;
+    const r = k * Math.sqrt(before + m / 2);
+    const turn = rank[c] ?? 0;
+    rank[c] = turn + 1;
+    const a = (turn + c) * GOLDEN;
+    emit(i, c, r * Math.cos(a), r * Math.sin(a));
+  }
+}
 
 /** Symmetric (undirected) adjacency with per-incidence weights; self-loops dropped. */
 function symmetricAdjacency(level: CoarseLevel): {
@@ -304,12 +387,9 @@ interface SeedLevel {
 }
 
 /**
- * Place a level's nodes around their parents (the next coarser level's positions): each node lands in
- * a phyllotaxis disc about its parent at the cumulative mass of its earlier siblings, so a parent
- * standing for `m` finest nodes spreads them over `m` nodes' worth of equilibrium area (`spacing²`
- * each) — the level keeps the finest equilibrium density however unevenly the coarsening grouped it.
- * Deterministic golden-angle turns, no RNG, never coincident. `mass` is the level's own (omitted =
- * 1 each, the finest level).
+ * Place a level's nodes around their parents (the next coarser level's positions) by
+ * {@link placeChildren}: the level keeps the finest equilibrium density however unevenly the coarsening
+ * grouped it. `mass` is the level's own (omitted = 1 each, the finest level).
  */
 function prolongate(
   fine: Float32Array,
@@ -320,21 +400,10 @@ function prolongate(
   n: number,
   spacing: number,
 ): void {
-  const filled = new Float32Array(coarseCount); // per parent: mass already placed around it
-  const rank = new Uint32Array(coarseCount); // per parent: children placed so far
-  const k = spacing / Math.sqrt(Math.PI); // a disc of area A·spacing² has radius k·√A
-  for (let i = 0; i < n; i++) {
-    const c = projection[i] ?? 0;
-    const m = mass?.[i] ?? 1;
-    const before = filled[c] ?? 0;
-    filled[c] = before + m;
-    const r = k * Math.sqrt(before + m / 2);
-    const turn = rank[c] ?? 0;
-    rank[c] = turn + 1;
-    const a = (turn + c) * GOLDEN; // + c: neighbouring parents don't all start their ring at 0°
-    fine[i * 2] = (coarse[c * 2] ?? 0) + r * Math.cos(a);
-    fine[i * 2 + 1] = (coarse[c * 2 + 1] ?? 0) + r * Math.sin(a);
-  }
+  placeChildren(projection, mass, coarseCount, n, spacing, (i, c, dx, dy) => {
+    fine[i * 2] = (coarse[c * 2] ?? 0) + dx;
+    fine[i * 2 + 1] = (coarse[c * 2 + 1] ?? 0) + dy;
+  });
 }
 
 /** A {@link CoarsenableGraph}'s own edge list + positions, as the {@link ForceLayout} view. */
@@ -418,16 +487,11 @@ export function* multilevelSeedSteps(
   // accumulated finest-up through the projections (level 0 is 1 each, implicit) — and the projection
   // from the next finer level into it.
   const coarse: SeedLevel[] = [];
-  let fineMass: Float32Array | undefined;
-  for (const [k, level] of levels.slice(1).entries()) {
+  for (const [k, mass] of coarseLevelMasses({ levels, projections }).entries()) {
+    const level = levels[k + 1];
     const up = projections[k]; // level k → level k + 1 (this record's level)
-    if (!up) break; // buildHierarchy pairs every coarse level with its projection
-    const mass = new Float32Array(level.nodeCount);
-    up.forEach((c, i) => {
-      mass[c] = (mass[c] ?? 0) + (fineMass?.[i] ?? 1);
-    });
+    if (!level || !up) break;
     coarse.push({ view: asView(level, new Float32Array(level.nodeCount * 2), mass), mass, up });
-    fineMass = mass;
   }
   const top = coarse[coarse.length - 1];
   if (!top) {
@@ -439,14 +503,7 @@ export function* multilevelSeedSteps(
   // Coarse springs are the aggregated edge weights. Normalise them to the finest level's unit springs
   // (the finest layout ignores weights): for an unweighted graph a coarse weight is exactly the number
   // of finest edges it stands for; for a weighted one, that count on average.
-  let edges = 0;
-  let weightSum = 0;
-  for (let e = 0; e < graph.source.length; e++) {
-    if (graph.source[e] === graph.target[e]) continue;
-    edges++;
-    weightSum += graph.weight[e] ?? 0;
-  }
-  const coarseForce: Partial<ForceParams> = { ...opts.force, attraction: params.attraction * (weightSum > 0 ? edges / weightSum : 1) };
+  const coarseForce: Partial<ForceParams> = { ...opts.force, attraction: params.attraction * coarseAttractionScale(graph) };
 
   /** Prolongate `from` through the `finer` coarse levels (next finer first) down into `graph.positions`. */
   const descend = (from: SeedLevel, finer: readonly SeedLevel[]): void => {
@@ -460,14 +517,15 @@ export function* multilevelSeedSteps(
   };
 
   /**
-   * Solve a coarse level, cooled: the full budget up to maxSeedNodes, a proportional share above it —
-   * {@link ForceLayout.run}'s `"cool"` loop, yielding after each tick. `finer` are the levels below it.
+   * Solve a coarse level, cooled: the full budget up to maxSeedNodes, a proportional share above it
+   * ({@link seedLevelTicks}, shared with the GPU seed plan) — {@link ForceLayout.run}'s `"cool"` loop,
+   * yielding after each tick. `finer` are the levels below it.
    */
   function* solve(level: SeedLevel, finer: readonly SeedLevel[]): Generator<SeedProgress, void, undefined> {
     const { view } = level;
     const n = view.nodeCount;
-    const ticks = Math.min(coarsenIterations, Math.floor((coarsenIterations * maxSeedNodes) / n));
-    if (n <= 1 || ticks <= 0) return;
+    const ticks = seedLevelTicks(n, coarsenIterations, maxSeedNodes);
+    if (ticks <= 0) return;
     const layout = new ForceLayout(view, coarseForce);
     layout.cool(ticks);
     const progress: SeedProgress = { atScale: n >= SEED_PROGRESS_MIN_NODES, prolongate: () => descend(level, finer) };
