@@ -228,6 +228,40 @@ function runLeg(graph: NetworkGraph, a: Float32Array, b: Float32Array, streamedR
 }
 
 
+function runInterleaved(graph: NetworkGraph, a: Float32Array, b: Float32Array, streamedRepaint: () => void, transitionRepaint: () => void): Leg {
+  const pos = graph.positions;
+  const streamedFrame = (i: number): void => { pos.set(i % 2 ? a : b); streamedRepaint(); };
+  for (let i = 0; i < 4; i++) streamedFrame(i);
+  pos.set(b);
+  const warm = crankedTransition(pos, a, 4, transitionRepaint);
+  for (let i = 0; i < 5; i++) warm.step();
+  pos.set(a);
+  const run = crankedTransition(pos, b, FRAMES, transitionRepaint);
+  mark("timed-s");
+  const st: number[] = [];
+  const tt: number[] = [];
+  for (let i = 0; i < FRAMES; i++) {
+    let t0 = performance.now(); streamedFrame(i); st.push(performance.now() - t0);
+    t0 = performance.now(); run.step(); tt.push(performance.now() - t0);
+  }
+  mark("timed-t");
+  run.step();
+  return { streamed: median(st), transition: median(tt), streamedKB: 0, transitionKB: 0, moved: true, landed: true };
+}
+
+function prelude(n: number): void {
+  const { graph, tree, a, b } = fixture(n);
+  const radii = new Float32Array(n).fill(4);
+  const colors = leafColors(n);
+  graph.positions.set(a);
+  computeLODGeometry(tree, graph, radii, graph.strength, undefined, colors);
+  runLeg(graph, a, b, () => computeLODGeometry(tree, graph, radii, graph.strength, undefined, colors), () => computeLODPositions(tree, graph.positions), true);
+  const style = plainStyle(n);
+  const cache = noLodStyleCache(graph, style);
+  runLeg(graph, a, b, () => void networkLayersFromCache(graph, style, cache), () => void networkLayersFromCache(graph, style, cache), true);
+  runLeg(graph, a, b, () => {}, () => {}, true);
+}
+
 function diag(n: number): { line: string; gcs: { t: number; d: number; k: number }[] } {
   const gcs: { t: number; d: number; k: number }[] = [];
   const obs = new PerformanceObserver((l) => { for (const e of l.getEntries()) gcs.push({ t: e.startTime, d: e.duration, k: (e as unknown as { detail: { kind: number } }).detail.kind }); });
@@ -245,17 +279,19 @@ function diag(n: number): { line: string; gcs: { t: number; d: number; k: number
   const res: string[] = [];
   const r = (name: string, leg: Leg): void => { res.push(`${name} ${leg.streamed.toFixed(2)}/${leg.transition.toFixed(2)}=${(leg.transition / leg.streamed).toFixed(2)}`); };
   LEG = "offA"; r("offA(fresh)", runLeg(graph, a, b, offRepaint, offRepaint, false));
-  LEG = "onT"; r("onTimed", runLeg(graph, a, b, onS, onT, false));
-  LEG = "offB"; r("offB(afterOnTimed)", runLeg(graph, a, b, offRepaint, offRepaint, false));
+  LEG = "offAi"; r("offAi(fresh,interleaved)", runInterleaved(graph, a, b, offRepaint, offRepaint));
   LEG = "onP"; r("onProbed", runLeg(graph, a, b, onS, onT, true));
-  LEG = "offC"; r("offC(afterOnProbes)", runLeg(graph, a, b, offRepaint, offRepaint, true));
-  LEG = "offD"; r("offD(again)", runLeg(graph, a, b, offRepaint, offRepaint, false));
+  LEG = "offC"; r("offC(asTheGuard)", runLeg(graph, a, b, offRepaint, offRepaint, true));
+  LEG = "offCi"; r("offCi(interleaved)", runInterleaved(graph, a, b, offRepaint, offRepaint));
+  LEG = "offD"; r("offD(seq again)", runLeg(graph, a, b, offRepaint, offRepaint, true));
+  LEG = "offDi"; r("offDi(interleaved again)", runInterleaved(graph, a, b, offRepaint, offRepaint));
   return { line: res.join("  "), gcs };
 }
 
 describe("zz transition diag", () => {
   (process.env.BENCH_TRANSITION_DIAG ? it : it.skip)("diag", async () => {
     const n = Number(process.env.BENCH_TRANSITION_DIAG_N) || 500_000;
+    prelude(100_000); // the guard file runs its 100k test first in the same process
     const { line, gcs } = diag(n);
     await new Promise((res) => setTimeout(res, 300));
     const marks = MARKS;

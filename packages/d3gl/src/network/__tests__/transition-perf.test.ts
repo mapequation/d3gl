@@ -170,7 +170,15 @@ function frameAllocKB(gc: (() => void) | undefined, frame: (i: number) => void):
 
 /**
  * Time `FRAMES` streamed frames (copy + `streamedRepaint`) and `FRAMES` transition frames
- * (interpolation + `transitionRepaint`) at `n`, after a warm-up of each.
+ * (interpolation + `transitionRepaint`) at `n`, after a warm-up of each — **interleaved**, a streamed frame
+ * then a transition frame, so both kinds run in the same heap and allocator state. With reductions off both
+ * allocate the emit's endpoint arrays (~20 B per node per frame), and what an allocation costs — a
+ * scavenge, a major GC started by the external-memory pressure of the frames before, fresh pages to fault
+ * in — depends on what the process did before, not on the frame. Timed as two loops, one after the other,
+ * the second loop inherited the first's state: the same OFF frames measured 1.2× in a fresh process and
+ * 1.7-1.9× after the LOD-on leg on CI (#433), and #416 moved it by making the LOD-on leg allocation-free
+ * (its colour memo), which left a different state behind. A transition frame never reads the positions a
+ * streamed frame wrote (it eases from its own snapshot), so alternating them changes neither.
  */
 function runLeg(graph: NetworkGraph, a: Float32Array, b: Float32Array, streamedRepaint: () => void, transitionRepaint: () => void): Leg {
   const gc = (globalThis as { gc?: () => void }).gc;
@@ -181,24 +189,21 @@ function runLeg(graph: NetworkGraph, a: Float32Array, b: Float32Array, streamedR
     streamedRepaint();
   };
   for (let i = 0; i < 4; i++) streamedFrame(i);
-  const st: number[] = [];
-  for (let i = 0; i < FRAMES; i++) {
-    const t0 = performance.now();
-    streamedFrame(i);
-    st.push(performance.now() - t0);
-  }
-
   // Transition: warm the loop up on a short one, then time every frame of a real one a → b.
   pos.set(b);
   const warm = crankedTransition(pos, a, 4, transitionRepaint);
   for (let i = 0; i < 5; i++) warm.step();
   pos.set(a);
   const run = crankedTransition(pos, b, FRAMES, transitionRepaint);
+  const st: number[] = [];
   const tt: number[] = [];
   let moved = true;
   let prev = pos[0]!;
   for (let i = 0; i < FRAMES; i++) {
-    const t0 = performance.now();
+    let t0 = performance.now();
+    streamedFrame(i);
+    st.push(performance.now() - t0);
+    t0 = performance.now();
     run.step();
     tt.push(performance.now() - t0);
     if (pos[0] === prev && a[0] !== b[0]) moved = false;
