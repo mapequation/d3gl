@@ -1,8 +1,10 @@
 import { describe, it, expect, vi, afterEach } from "vitest";
-import { startGpuLayout, type GpuLayoutOptions } from "../gpu-transport.js";
+import { continuationOf, startGpuLayout, type GpuLayoutOptions } from "../gpu-transport.js";
+import type { GpuRunState } from "../gpu-stream.js";
 import * as workerMod from "../../worker-transport.js";
 import type { WorkerLayoutHandle } from "../../worker-transport.js";
 import { buildGraph } from "../../graph.js";
+import { DRAG_HEAT, RECOOL_TICKS } from "../../force.js";
 
 /** A stand-in worker handle whose `shared` the test flips, to check the GPU handle reads it live. */
 function fakeWorkerHandle(state: { shared: boolean }): WorkerLayoutHandle {
@@ -182,5 +184,42 @@ describe("startGpuLayout zero-node guard", () => {
     await handle.settled;
     expect(frames).toBe(1); // nothing to lay out: one paint
     expect(spy).not.toHaveBeenCalled();
+  });
+});
+
+describe("continuationOf: where a moved GPU layout goes on (#311)", () => {
+  const at = (mode: GpuRunState["mode"], ticksLeft: number, heat = 0.42, decaying = true): GpuRunState =>
+    ({ mode, ticksLeft, heat, decaying });
+
+  it("the initial run continues over the ticks it had left, on its own heat schedule — with or without a drag", () => {
+    expect(continuationOf(at("run", 187), false)).toEqual({ iterations: 187, warm: { heat: 0.42, decaying: true } });
+    expect(continuationOf(at("run", 187, 1, false), true)).toEqual({ iterations: 187, warm: { heat: 1, decaying: false } });
+  });
+
+  it("a settled layout continues idle, alive for a drag (spec Q3)", () => {
+    expect(continuationOf(at("idle", 0), false).iterations).toBe(0);
+    expect(continuationOf(at("run", 0), false).iterations).toBe(0); // the final harvest of the initial run
+  });
+
+  it("a live drag continues idle, so the replayed pin reheats it at the drag heat", () => {
+    expect(continuationOf(at("drag", 0, DRAG_HEAT, false), true).iterations).toBe(0);
+    expect(continuationOf(at("cool", 60), true).iterations).toBe(0); // grabbed again mid re-cool
+    expect(continuationOf(at("idle", 0), true).iterations).toBe(0);
+  });
+
+  it("a re-cool continues over its tail, as a re-cool; a drag released since the last harvest gets its whole re-cool", () => {
+    // `recool`: a pin during the tail reheats at the drag heat at once, as it does in any re-cool, instead of
+    // riding the tail's decaying heat as a drag during the initial run does.
+    expect(continuationOf(at("cool", 60, 0.1), false)).toEqual({ iterations: 60, warm: { heat: 0.1, decaying: true, recool: true } });
+    const wholeRecool = { iterations: RECOOL_TICKS, warm: { heat: DRAG_HEAT, decaying: true, recool: true } };
+    expect(continuationOf(at("drag", 0, DRAG_HEAT, false), false)).toEqual(wholeRecool);
+  });
+
+  it("a drag released while the move waited for its device gets its whole re-cool, not the idle run it was live for", () => {
+    const wholeRecool = { iterations: RECOOL_TICKS, warm: { heat: DRAG_HEAT, decaying: true, recool: true } };
+    expect(continuationOf(at("idle", 0), false, true)).toEqual(wholeRecool); // grabbed after the last harvest
+    expect(continuationOf(at("cool", 60), false, true)).toEqual(wholeRecool); // its release restarts the re-cool
+    // A drag during the initial run rode on it: releasing it changes nothing there.
+    expect(continuationOf(at("run", 187), false, true)).toEqual({ iterations: 187, warm: { heat: 0.42, decaying: true } });
   });
 });

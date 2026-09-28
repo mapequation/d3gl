@@ -56,22 +56,89 @@
  * have been harvested and painted (with LOD on, together with the LOD tree's geometry for them), so the
  * engine's settle handler sees them. The run then goes **idle** (the layout stays alive for a drag reheat,
  * #183).
- * A non-finite layout (NaN / ∞ in the reductions' stats) stops the run with one warning, keeping the last
- * finite positions — the harvest checks the stats before it touches `graph.positions`. A lost context
- * (`isContextLost`, a failed fence wait, `webglcontextlost`) stops it without touching GL again, with one
- * warning.
+ * A non-finite layout (NaN / ∞ in the reductions' stats) stops the run, keeping the last finite positions —
+ * the harvest checks the stats before it touches `graph.positions`. A lost context (`isContextLost`, a
+ * failed fence wait, `webglcontextlost`) stops it without touching GL again (a fence wait that failed on a
+ * context that is still alive frees the run's GPU objects as it stops). Either way the run tells its
+ * owner (`onInterrupt` with its cause, or `onFailure` — the nested layout lays the map out on the worker
+ * instead, #355), or warns once. Each copy records where the run stands at its positions — mode,
+ * ticks left, heat — and the frame painted from it keeps that record ({@link GpuStream.runState}), so a
+ * stopped run can continue elsewhere from the positions on screen (#311): after a render-backend swap, a
+ * lost context, or a non-finite layout.
  */
 import { WebGLDevice } from "@luma.gl/webgl";
 import { DRAG_HEAT, RECOOL_TICKS } from "../force.js";
 import type { NetworkGraph } from "../graph.js";
 import { deleteSync, insertSync, pollSync } from "../../webgl/fence.js";
-import { AsyncPositionReadback, READBACK_STATS_FLOATS, READBACK_STOP_OFFSET } from "./async-readback.js";
-import { FrameBudget, itemCostMs, type FenceSource } from "./frame-budget.js";
-import type { GpuForceLayout } from "./gpu-force-layout.js";
+import { AsyncPositionReadback, READBACK_STATS_FLOATS, READBACK_STOP_OFFSET, type ReadbackSource } from "./async-readback.js";
+import { FrameBudget, ITEM_NS_PER_NODE, itemCostMs, type FenceSource, type ItemCosts, type ItemKind } from "./frame-budget.js";
 import { MIN_FRAME_MS, RepaintThrottle } from "./repaint-throttle.js";
 import { reportUncaught } from "./report-uncaught.js";
 import type { SeedPlan } from "./seed-plan.js";
 import { STOP_NONFINITE, STOP_STOPPED } from "./stop-latch.js";
+
+/**
+ * A solver the stream drives: a tick is the work items **P** ({@link beginTick}), **F_b**
+ * ({@link forceBand}, `b = 0 … B − 1`) and **I** ({@link integrate}) — positions change only in I — and it
+ * is its own {@link ReadbackSource}. The flat {@link GpuForceLayout} and the nested layout's batched solve
+ * (#355) are both one.
+ */
+export interface StreamSolver extends ReadbackSource {
+  /**
+   * The solver's GPU cost per node of each work item, ns, which the frame budget sizes its bands by.
+   * Default the flat layout's {@link ITEM_NS_PER_NODE}.
+   */
+  readonly itemCosts?: ItemCosts;
+  /**
+   * The estimated GPU time of the next item of `kind`, ms, when it depends on where the solve is (the
+   * nested layout's phases); otherwise the stream estimates it from {@link itemCosts}.
+   */
+  itemCostMs?(kind: ItemKind, bands: number): number;
+  /** Estimated GPU time of {@link prepareReadback}, ms, which a frame that copies reserves in its budget. Default 0. */
+  readonly readbackCostMs?: number;
+  beginTick(): void;
+  forceBand(band: number, bands: number): void;
+  integrate(): void;
+  /**
+   * Make the readback source describe the current positions, right before a copy. `betweenTicks`: the
+   * copy follows an integrate (the next P has not run), so reductions from the last P describe the
+   * positions before it; otherwise it follows a P, whose reductions are current.
+   */
+  prepareReadback(betweenTicks: boolean): void;
+  destroy(): void;
+}
+
+/** A solver that can hold nodes under a drag and reheat (#183) — the flat layout; the nested one cannot. */
+export interface DragSolver {
+  setPinned(ids: Uint32Array | null): void;
+  setHeldPositions(ids: Uint32Array, positions: Float32Array): void;
+  hold(heat: number): void;
+  cool(ticks: number, from?: number): void;
+}
+
+/**
+ * The flat layout's own contract with the stream ({@link GpuForceLayout}), on top of a {@link StreamSolver}
+ * that drags: the level its ticks run on and its multilevel seed (#353), its stop latch (#376), and its heat
+ * schedule, which a moved run continues (#311). A solver without it (the nested one) is never seeded, never
+ * stops early and is never moved.
+ */
+export interface FlatStreamSolver extends StreamSolver, DragSolver {
+  /** Slots and atlas rows of the level the ticks run on: the graph's, or a seed level's. */
+  readonly levelSlots: number;
+  readonly levelRows: number;
+  beginSeed(plan: SeedPlan): void;
+  setLevel(k: number): void;
+  endSeed(): void;
+  cancelSeed(): void;
+  stopOnConvergence: boolean;
+  readonly scheduleEpoch: number;
+  readonly heat: number;
+  readonly heatDecaying: boolean;
+}
+
+function isFlat(solver: StreamSolver): solver is FlatStreamSolver {
+  return "beginSeed" in solver && "scheduleEpoch" in solver;
+}
 
 /** What one streamed frame did — the argument of a {@link observeGpuLayoutFrames} observer. */
 export interface GpuFrameSample {
@@ -151,6 +218,40 @@ export interface GpuStreamOptions {
    * with `multilevel`.
    */
   seeded?: boolean;
+  /**
+   * Called in place of the warning when the run stops by itself (#311): its WebGL context was lost or a
+   * fence wait failed (the run has then freed its GPU objects, or on a lost context dropped them without a
+   * GL call) or its layout turned non-finite (it has stopped encoding). `graph.positions` still holds the last finite harvest, and {@link GpuStream.runState}
+   * says where the run stood at it, so the owner can continue the layout elsewhere; it then calls
+   * {@link GpuStream.stop}, which frees whatever is left.
+   */
+  onInterrupt?: (reason: string, cause: "lost" | "non-finite") => void;
+  /**
+   * The run continues a layout that moved here (#311), from positions already on screen: `iterations` of a
+   * re-cool's tail after a drag are resumed as a re-cool (a pin reheats at the drag heat at once, instead of
+   * riding the tail as a drag during the initial run does), and an idle start paints nothing.
+   */
+  resumed?: { recool: boolean };
+  /**
+   * The solver's drag interface; without one, `pin` / `unpin` do nothing (the nested layout, #355). Default:
+   * the solver itself when it drags (the flat layout).
+   */
+  drag?: DragSolver;
+  /**
+   * `false`: no intermediate copies — only the final positions are read back and harvested, in one
+   * frame (a nested warm start or transition, #328). Default `true`: stream on the repaint cadence.
+   */
+  stream?: boolean;
+  /** Where harvests land instead of `graph.positions` (a caller that eases to the result, #328). */
+  into?: Float32Array;
+  /** Where a packed source's extra floats land on each harvest (the nested layout's module discs, #355). */
+  extra?: Float32Array;
+  /**
+   * Called once, instead of the warning, when the run stops on a non-finite layout or a lost context —
+   * right before `settled` resolves, so the owner can tell a failed run from a finished one (#355). Its
+   * argument names the reason. {@link onInterrupt}, when given, is called instead.
+   */
+  onFailure?: (reason: string) => void;
 }
 
 /**
@@ -183,19 +284,24 @@ export interface FrameSink {
   destroy(): void;
 }
 
-/** The default {@link FrameSink}: harvests land in `graph.positions`, painted in the frame they were harvested. */
+/**
+ * The default {@link FrameSink}: harvests land in `graph.positions` — or in `into`, for a caller that eases to
+ * the result (#328, #355) — painted in the frame they were harvested.
+ */
 export class DirectSink implements FrameSink {
   readonly relays = false;
   readonly holding = false;
   private readonly graph: NetworkGraph;
+  private readonly into: Float32Array | null;
   private submitted = false;
 
-  constructor(graph: NetworkGraph) {
+  constructor(graph: NetworkGraph, into: Float32Array | null = null) {
     this.graph = graph;
+    this.into = into;
   }
 
   target(): Float32Array {
-    return this.graph.positions;
+    return this.into ?? this.graph.positions; // `graph.positions` read live: a shared-memory start swaps it
   }
 
   submit(): void {
@@ -218,6 +324,21 @@ export class DirectSink implements FrameSink {
 
 type Mode = "idle" | "run" | "drag" | "cool";
 
+/**
+ * Where a run stood at a set of positions (#311): those a readback copy holds, then the last ones harvested
+ * into `graph.positions`. A run stopped mid-way continues elsewhere from exactly there.
+ */
+export interface GpuRunState {
+  /** What the run was doing. */
+  mode: Mode;
+  /** Ticks left of that mode's budget: the initial run's, or a re-cool's tail (0 in `drag` and `idle`). */
+  ticksLeft: number;
+  /** The heat of the next tick. */
+  heat: number;
+  /** Whether that heat decays (`cool`) or is held (`hold`). */
+  decaying: boolean;
+}
+
 /** GL sync objects as the frame budget's fences. */
 function glFences(gl: WebGL2RenderingContext): FenceSource<WebGLSync | null> {
   return {
@@ -236,7 +357,14 @@ export class GpuStream {
   readonly settled: Promise<void>;
 
   private readonly gl: WebGL2RenderingContext;
-  private readonly layout: GpuForceLayout;
+  private readonly layout: StreamSolver;
+  /** The flat layout's extras (#353 seed, #376 stop, #311 heat), or null (the nested solve, #355). */
+  private readonly flat: FlatStreamSolver | null;
+  private readonly drag: DragSolver | null;
+  private readonly costs: ItemCosts;
+  private readonly extra: Float32Array | undefined;
+  private readonly streaming: boolean;
+  private readonly onFailure: ((reason: string) => void) | undefined;
   private readonly graph: NetworkGraph;
   private readonly onFrame: () => void;
   private readonly iterations: number;
@@ -260,7 +388,6 @@ export class GpuStream {
 
   private mode: Mode;
   private stopped = false;
-  private lost = false;
   private failed = false;
   private raf = 0;
   private looping = false;
@@ -318,22 +445,47 @@ export class GpuStream {
   /** A drag's pins while the seed runs: applied once the graph's nodes are placed. */
   private pendingPinIds: Uint32Array | null = null;
   private pendingPinPositions: Float32Array | null = null;
+  /**
+   * Where the run stood at the pending copy's positions, at the frame harvested from it and not painted yet
+   * (#377: out with the LOD worker), and at the positions last painted — those in `graph.positions` (#311).
+   */
+  private readonly copyState: GpuRunState;
+  private readonly frameState: GpuRunState;
+  private readonly harvestState: GpuRunState;
+  /**
+   * Nothing of a seeded run has been painted yet (#353): `graph.positions` holds the transport's placeholder
+   * disc, not positions of the run, so {@link runState} has none to continue from.
+   */
+  private placeholder: boolean;
+  private readonly onInterrupt: ((reason: string, cause: "lost" | "non-finite") => void) | undefined;
+  /** The run continues a moved layout whose positions are already on screen (#311). */
+  private readonly resumed: boolean;
 
-  constructor(device: WebGLDevice, layout: GpuForceLayout, graph: NetworkGraph, opts: GpuStreamOptions, onFrame: () => void) {
+  constructor(device: WebGLDevice, layout: StreamSolver, graph: NetworkGraph, opts: GpuStreamOptions, onFrame: () => void) {
+    const flat = isFlat(layout) ? layout : null;
+    if (opts.seeded && !flat) throw new Error("GpuStream: only the flat layout runs a multilevel seed");
     this.gl = device.gl;
     this.layout = layout;
+    this.flat = flat;
+    this.drag = opts.drag ?? flat;
     this.graph = graph;
+    this.extra = opts.extra;
+    this.streaming = opts.stream ?? true;
     this.onFrame = onFrame;
     this.iterations = opts.iterations;
     this.frameEvery = opts.frameEvery;
+    this.onInterrupt = opts.onInterrupt;
+    this.onFailure = opts.onFailure;
     this.throttle = new RepaintThrottle(opts.minFrameMs ?? MIN_FRAME_MS);
+    this.costs = layout.itemCosts ?? ITEM_NS_PER_NODE;
     this.budget = new FrameBudget(glFences(this.gl), () => performance.now(), {
       nodes: layout.nodeCount,
       rows: layout.atlasRows,
+      costs: this.costs,
       ...(opts.budgetMs !== undefined ? { budgetMs: opts.budgetMs } : {}),
     });
     this.readback = new AsyncPositionReadback(device, layout);
-    this.sink = opts.sink ?? new DirectSink(graph);
+    this.sink = opts.sink ?? new DirectSink(graph, opts.into ?? null);
     this.sink.listen(() => this.resume());
     this.settled = new Promise<void>((resolve) => {
       this.resolveSettled = resolve;
@@ -344,18 +496,41 @@ export class GpuStream {
     this.page = typeof document === "undefined" ? null : document;
     this.page?.addEventListener("visibilitychange", this.onVisibilityChange);
     this.seedState = opts.seeded ? "waiting" : "none";
-    this.mode = this.iterations > 0 || opts.seeded ? "run" : "idle";
+    this.resumed = opts.resumed !== undefined;
+    this.mode = this.iterations > 0 || opts.seeded ? (opts.resumed?.recool ? "cool" : "run") : "idle";
+    if (this.mode === "cool") this.coolLeft = this.iterations;
+    // Nothing painted yet: `graph.positions` holds the seed the solver started from — or, for a seeded run,
+    // the transport's placeholder disc.
+    const start: GpuRunState = {
+      mode: this.mode, ticksLeft: this.iterations, heat: flat?.heat ?? 1, decaying: flat?.heatDecaying ?? false,
+    };
+    this.copyState = { ...start };
+    this.frameState = { ...start };
+    this.harvestState = start;
+    this.placeholder = opts.seeded === true;
   }
 
   /**
-   * Start the initial run — or, with no iterations and no seed to wait for, paint the seed and settle at
-   * once. A seeded stream waits for its plan ({@link seed}) before it encodes anything.
+   * Where the run stood at the positions last painted into `graph.positions` — or at its seed, before the
+   * first frame (#311). A layout moved elsewhere continues from there: those positions, the ticks left, the
+   * heat. Null while a seeded run (#353) has painted nothing: the disc on screen is a placeholder, so a move
+   * then starts the layout afresh. The object is the stream's own, updated at each painted frame; read it,
+   * don't keep it.
+   */
+  runState(): Readonly<GpuRunState> | null {
+    return this.placeholder ? null : this.harvestState;
+  }
+
+  /**
+   * Start the initial run (or a resumed re-cool) — or, with no iterations and no seed to wait for, paint the
+   * seed and settle at once (a resumed idle run paints nothing: its positions are already on screen). A seeded
+   * stream waits for its plan ({@link seed}) before it encodes anything.
    */
   start(): void {
-    if (this.mode === "run") {
+    if (this.mode !== "idle") {
       if (this.seedState !== "waiting") this.resume(); // a seeded stream starts when its plan arrives
     } else {
-      this.onFrame();
+      if (!this.resumed) this.onFrame();
       this.settle();
     }
   }
@@ -379,7 +554,7 @@ export class GpuStream {
       return;
     }
     this.seedState = "none";
-    this.layout.hold(1); // a cold disc start untangles at full heat (ForceLayout.run)
+    this.requireFlat().hold(1); // a cold disc start untangles at full heat (ForceLayout.run)
     this.applyPendingPin();
     if (this.iterations > 0) {
       this.resume();
@@ -401,7 +576,8 @@ export class GpuStream {
    * latency, about a repaint interval, after the worker, which turns at its stop tick.
    */
   pin(ids: Uint32Array, positions?: Float32Array): void {
-    if (this.stopped || this.failed) return;
+    const drag = this.drag;
+    if (this.stopped || this.failed || !drag) return; // a solver without a drag interface ignores it (#355)
     if (this.seedState !== "none") {
       // The solver's slots are a seed level's, not nodes: hold the pins until the nodes are placed.
       this.pendingPinIds = ids;
@@ -409,7 +585,7 @@ export class GpuStream {
       this.dragging = true;
       return;
     }
-    this.layout.setPinned(ids);
+    drag.setPinned(ids);
     if (positions) {
       this.heldIds = ids;
       this.heldPositions = positions;
@@ -428,33 +604,35 @@ export class GpuStream {
 
   /** Release every pin and re-cool over a short tail, then idle. */
   unpin(): void {
-    if (this.stopped || this.failed) return;
+    const drag = this.drag;
+    if (this.stopped || this.failed || !drag) return;
     if (this.seedState !== "none") {
       this.pendingPinIds = null;
       this.pendingPinPositions = null;
       this.dragging = false;
       return;
     }
-    this.layout.setPinned(null);
+    drag.setPinned(null);
     this.dragging = false;
     if (this.mode === "drag") {
       this.mode = "cool";
       this.coolLeft = RECOOL_TICKS;
-      this.layout.cool(RECOOL_TICKS, DRAG_HEAT);
+      drag.cool(RECOOL_TICKS, DRAG_HEAT);
       this.stopTick = -1;
     }
     this.resume();
   }
 
-  /** Cancel the run and free every GPU resource (none on a lost context) and the sink; resolves `settled`. */
+  /**
+   * Cancel the run and free every GPU resource and the sink; resolves `settled`. On a lost context — noticed
+   * or not yet (its event is still queued) — it makes no GL call and only drops its handles (#311). A luma
+   * device that was destroyed while its context lives on is freed normally: `WebGLDevice.destroy()` only
+   * detaches the device from the context, so the deletes still release the memory.
+   */
   stop(): void {
     if (this.stopped) return;
     this.halt();
-    if (!this.lost) {
-      this.budget.dispose(true);
-      this.readback.destroy(true);
-      this.layout.destroy();
-    }
+    this.release();
     this.sink.destroy();
     this.settle(true);
   }
@@ -491,12 +669,13 @@ export class GpuStream {
       if (target) {
         harvested = true;
         harvestedTicks = this.copyTicks; // before this frame's copy, if any, moves copyTicks on
-        if (!this.readback.harvest(target, this.stats) || (this.stopFlags() & STOP_NONFINITE) !== 0) {
+        if (!this.readback.harvest(target, this.stats, this.extra) || (this.stopFlags() & STOP_NONFINITE) !== 0) {
           this.fail();
           return;
         }
         this.frameSubmitted = true;
         this.frameTicks = this.copyTicks;
+        copyRunState(this.copyState, this.frameState);
         // A convergence stop of the current schedule (#376): these are the stop tick's positions — the final
         // ones, decided now, from the stats copied with them, and finished once the frame is painted. (Read
         // the stop even from a final copy: it records the stop tick.)
@@ -532,6 +711,11 @@ export class GpuStream {
           if (own) this.copiedTicks = Math.min(this.copiedTicks, this.frameTicks - 1);
           this.stopping = false;
         } else {
+          if (own) {
+            // These positions are on the graph now: a move continues from where the run stood at them (#311).
+            copyRunState(this.frameState, this.harvestState);
+            this.placeholder = false;
+          }
           if (own && this.frameTicks >= this.iterations && this.mode !== "run") this.settle();
           const r0 = performance.now();
           try {
@@ -556,6 +740,8 @@ export class GpuStream {
     const t2 = performance.now();
     let items = 0;
     const open = this.budget.open();
+    // A frame that will copy reserves the readback's own GPU work (the nested layout's composition, #355).
+    if (open && this.copyLikely(now)) this.budget.reserve(this.layout.readbackCostMs ?? 0);
     if (open) {
       while (this.hasWork()) {
         const cost = this.nextItemCost();
@@ -574,15 +760,14 @@ export class GpuStream {
       // Between ticks (right after an integrate) the reductions' stats describe the previous positions:
       // re-run them so the harvest's finiteness check covers the positions it copies. After a prep they
       // already do — positions change only at integrate and at the prep's held-position write.
-      if (this.phase === 0) {
-        this.armStop();
-        this.layout.refreshSegmentStats();
-      }
+      if (this.phase === 0) this.armStop();
+      this.layout.prepareReadback(this.phase === 0);
       this.readback.issue(this.layout);
       this.seedFrame = false;
       this.copyTicks = this.ticksDone;
       this.copyFinal = this.finishing;
       this.copiedTicks = this.ticksDone;
+      this.recordCopyState();
       this.throttle.copyIssued(now);
       this.copyReady = false;
     }
@@ -652,18 +837,35 @@ export class GpuStream {
     if (this.seedStepNext()) {
       // A placement is one gather over the level's slots, about an integrate's cost.
       const level = this.seedPlan?.levels[this.seedNext];
-      return itemCostMs("integrate", level ? level.count : this.layout.nodeCount, 1);
+      return itemCostMs("integrate", level ? level.count : this.layout.nodeCount, 1, this.costs);
     }
-    const n = this.layout.levelSlots;
+    const n = this.levelSlots();
     if (this.wholeSeedTick()) return this.tickCostMs(n);
-    if (this.phase === 0) return itemCostMs("prep", n, 1);
-    if (this.phase <= this.tickBands) return itemCostMs("force", n, this.tickBands);
-    return itemCostMs("integrate", n, 1);
+    const kind: ItemKind = this.phase === 0 ? "prep" : this.phase <= this.tickBands ? "force" : "integrate";
+    // A solver whose items depend on where it is (the nested layout's phases, #355) estimates them itself.
+    const solverCost = this.layout.itemCostMs?.(kind, this.tickBands);
+    if (solverCost !== undefined) return solverCost;
+    return itemCostMs(kind, n, kind === "force" ? this.tickBands : 1, this.costs);
+  }
+
+  /** Slots and atlas rows of the level the ticks run on: a multilevel seed's level (#353), else every node. */
+  private levelSlots(): number {
+    return this.flat?.levelSlots ?? this.layout.nodeCount;
+  }
+
+  private levelRows(): number {
+    return this.flat?.levelRows ?? this.layout.atlasRows;
+  }
+
+  /** The flat layout, which the multilevel seed needs (a seeded stream is only ever built over one). */
+  private requireFlat(): FlatStreamSolver {
+    if (!this.flat) throw new Error("GpuStream: a multilevel seed step without the flat layout");
+    return this.flat;
   }
 
   /** The estimated GPU time of a whole unsliced tick over `n` slots. */
   private tickCostMs(n: number): number {
-    return itemCostMs("prep", n, 1) + itemCostMs("force", n, 1) + itemCostMs("integrate", n, 1);
+    return itemCostMs("prep", n, 1, this.costs) + itemCostMs("force", n, 1, this.costs) + itemCostMs("integrate", n, 1, this.costs);
   }
 
   /**
@@ -673,13 +875,13 @@ export class GpuStream {
    * seed frame would wait for them.
    */
   private wholeSeedTick(): boolean {
-    return this.seedState === "running" && this.phase === 0 && this.tickCostMs(this.layout.levelSlots) <= this.budget.budgetMs / 2;
+    return this.seedState === "running" && this.phase === 0 && this.tickCostMs(this.levelSlots()) <= this.budget.budgetMs / 2;
   }
 
   /** Create the seed's resources for `plan` (#353); false, with one warning, if that fails. */
   private startSeed(plan: SeedPlan): boolean {
     try {
-      this.layout.beginSeed(plan);
+      this.requireFlat().beginSeed(plan);
       return true;
     } catch (error) {
       console.warn("[d3gl] network layout({ backend: 'gpu' }): the multilevel seed could not start; the layout starts from a disc instead.", error);
@@ -696,17 +898,18 @@ export class GpuStream {
     if (!plan) throw new Error("GpuStream: a seed step without a plan");
     const level = plan.levels[this.seedNext];
     if (level) {
-      this.layout.setLevel(this.seedNext);
+      this.requireFlat().setLevel(this.seedNext);
       this.seedTicksLeft = level.ticks;
       this.seedNext++;
       return;
     }
-    this.layout.endSeed();
+    const flat = this.requireFlat();
+    flat.endSeed();
     this.seedState = "none";
     this.seedPlan = null;
     this.seedFrame = true;
     // A seeded layout has its global arrangement: cool over the budget, as the CPU worker does (#124).
-    this.layout.cool(this.iterations);
+    flat.cool(this.iterations);
     this.applyPendingPin();
     if (this.iterations === 0) this.finishing = true; // the seed frame is the final one
   }
@@ -715,7 +918,7 @@ export class GpuStream {
   private applyPendingPin(): void {
     const ids = this.pendingPinIds;
     if (!ids) return;
-    this.layout.setPinned(ids);
+    this.drag?.setPinned(ids);
     if (this.pendingPinPositions) {
       this.heldIds = ids;
       this.heldPositions = this.pendingPinPositions;
@@ -730,7 +933,7 @@ export class GpuStream {
    * harvested yet). The solver stays until {@link stop}, which the engine's next `layout()` or `data()` calls.
    */
   private abortSeed(error: unknown): void {
-    this.layout.cancelSeed();
+    this.flat?.cancelSeed();
     this.seedState = "none";
     this.seedPlan = null;
     this.pendingPinIds = null;
@@ -762,10 +965,10 @@ export class GpuStream {
     }
     if (this.phase === 0) {
       // A seed level's force pass gets bands in proportion to its slots (at least one, at most its rows).
-      const rows = this.layout.levelRows;
-      this.tickBands = Math.max(1, Math.min(rows, Math.ceil((this.budget.bands * this.layout.levelSlots) / this.layout.nodeCount)));
+      const rows = this.levelRows();
+      this.tickBands = Math.max(1, Math.min(rows, Math.ceil((this.budget.bands * this.levelSlots()) / this.layout.nodeCount)));
       if (this.heldIds && this.heldPositions) {
-        this.layout.setHeldPositions(this.heldIds, this.heldPositions);
+        this.drag?.setHeldPositions(this.heldIds, this.heldPositions);
         this.heldIds = null;
         this.heldPositions = null;
       }
@@ -827,6 +1030,10 @@ export class GpuStream {
       this.phase = 0;
       this.settle();
     }
+    // The painted positions are the run's final ones: a move from here continues from the mode the run is in
+    // now (idle, or the drag it turned into), not from the copy's — a convergence stop (#376) ends a run with
+    // ticks of its budget left, which a move would otherwise run again (#311).
+    this.recordRunState(this.harvestState);
   }
 
   /**
@@ -834,20 +1041,30 @@ export class GpuStream {
    * ready (after the usual copy → ready latency) when the next repaint is due — so a harvested frame is
    * about one frame old, not a whole repaint interval.
    */
-  private copyDue(now: number): boolean {
+  private copyDue(now: number, lookahead = 0): boolean {
     if (this.readback.pending) return false;
     if (this.seedState !== "none") return false; // the slots hold a seed level, not the nodes (#353)
     if (this.seedFrame) return true; // the seed frame: tick 0, once
     // An idle stream has shown its final positions, and a harvested stop is on its way to the screen: a
     // stop's frozen ticks after its copy changed nothing (#376).
     if (this.mode === "idle" || this.stopping) return false;
-    if (this.ticksDone <= this.copiedTicks) return false;
+    const fresh = this.ticksDone + lookahead - this.copiedTicks;
+    if (fresh <= 0) return false;
     // The final copy goes out as soon as the PBO is free, once: `finishing` holds until that frame is painted
     // (finish()), which with LOD on is a worker round trip after its harvest (#377), and a frame lost with the
     // worker is copied again because the loss rewinds `copiedTicks`.
     if (this.finishing) return true;
-    if (this.frameEvery !== undefined) return this.ticksDone - this.copiedTicks >= this.frameEvery;
+    if (!this.streaming) return false; // only the final positions are read back (#328, #355)
+    if (this.frameEvery !== undefined) return fresh >= this.frameEvery;
     return this.throttle.copyDue(now, this.sink.relays);
+  }
+
+  /**
+   * Whether this frame will likely copy, asked before encoding (to reserve the copy's GPU time, #355):
+   * {@link copyDue}, counting on one more tick.
+   */
+  private copyLikely(now: number): boolean {
+    return this.copyDue(now, 1);
   }
 
   // ── Convergence stop (#376) ────────────────────────────────────────────────
@@ -857,12 +1074,12 @@ export class GpuStream {
    * never does (the worker checks `converged` only in `run` and `cool` mode).
    */
   private armStop(): void {
-    this.layout.stopOnConvergence = this.mode === "run" || this.mode === "cool";
+    if (this.flat) this.flat.stopOnConvergence = this.mode === "run" || this.mode === "cool";
   }
 
   /** Hold a heat — a new schedule, so the previous one's stop no longer applies. */
   private hold(heat: number): void {
-    this.layout.hold(heat);
+    this.drag?.hold(heat);
     this.stopTick = -1;
   }
 
@@ -878,7 +1095,7 @@ export class GpuStream {
    */
   private harvestedStop(): boolean {
     if ((this.stopFlags() & STOP_STOPPED) === 0) return false;
-    if (this.stats[READBACK_STOP_OFFSET + 2] !== this.layout.scheduleEpoch) return false;
+    if (!this.flat || this.stats[READBACK_STOP_OFFSET + 2] !== this.flat.scheduleEpoch) return false;
     if (this.mode !== "run" && this.mode !== "cool") return false;
     this.stopTick = this.stats[READBACK_STOP_OFFSET + 1] ?? -1;
     return true;
@@ -910,6 +1127,17 @@ export class GpuStream {
     this.resolveSettled();
   }
 
+  /**
+   * Free the solver, the readback and the fences — or, on a lost context, only drop them: a lost context takes
+   * no GL call (#311). Asked of the context itself, because its `webglcontextlost` event is queued.
+   */
+  private release(): void {
+    const touchGl = !this.gl.isContextLost();
+    this.budget.dispose(touchGl);
+    this.readback.destroy(touchGl);
+    if (touchGl) this.layout.destroy();
+  }
+
   /** Stop the loop and forget the pending copy; the caller decides what else to free. */
   private halt(): void {
     this.stopped = true;
@@ -931,22 +1159,41 @@ export class GpuStream {
     this.lose("the WebGL context was lost");
   };
 
-  /** The context is gone: stop without another GL call, keep the last harvested positions, settle. */
+  /** Record where the run stands at the copy just issued: its mode, the ticks left, the next tick's heat. */
+  private recordCopyState(): void {
+    this.recordRunState(this.copyState);
+  }
+
+  /** Where the run stands now — its mode, the ticks left of that mode, the next tick's heat — into `s`. */
+  private recordRunState(s: GpuRunState): void {
+    s.mode = this.mode;
+    s.ticksLeft =
+      this.mode === "run" ? Math.max(0, this.iterations - this.ticksDone) : this.mode === "cool" ? Math.max(0, this.coolLeft) : 0;
+    s.heat = this.flat?.heat ?? 1;
+    s.decaying = this.flat?.heatDecaying ?? false;
+  }
+
+  /**
+   * The context is gone, or a fence wait failed: stop, keep the last harvested positions, settle — and tell
+   * the owner ({@link GpuStreamOptions.onInterrupt}), or warn. A lost context takes no further GL call. A
+   * fence wait that failed on a context that is still alive (an invalid sync, not a loss) frees the run's GPU
+   * objects here, since the stream is stopped and a later {@link stop} does nothing.
+   */
   private lose(reason: string): void {
     if (this.stopped) return;
-    this.lost = true;
     this.halt();
-    this.budget.dispose(false);
-    this.readback.destroy(false);
+    this.release();
     this.sink.destroy();
-    console.warn(`[d3gl] network layout({ backend: 'gpu' }) stopped: ${reason}.`);
+    if (this.onInterrupt) this.onInterrupt(reason, "lost");
+    else this.reportFailure(reason, "");
     this.settle(true);
   }
 
   /**
-   * The reductions came back non-finite: stop encoding, keep the last finite positions, settle. The sink stays
-   * until {@link stop} (the engine's next `layout()` / `data()`, or `destroy()`), so a frame the LOD worker is
-   * refitting, or the tree's first geometry, still lands and is painted (#377).
+   * The reductions came back non-finite: stop encoding, keep the last finite positions, settle — and tell
+   * the owner ({@link GpuStreamOptions.onInterrupt}), or warn. The sink stays until {@link stop} (the owner's
+   * move, the engine's next `layout()` / `data()`, or `destroy()`), so a frame the LOD worker is refitting,
+   * or the tree's first geometry, still lands and is painted (#377).
    */
   private fail(): void {
     this.failed = true;
@@ -954,11 +1201,26 @@ export class GpuStream {
     this.finishing = false;
     this.looping = false;
     const [sx, sy, sv, count, maxX, maxY, negMinX, negMinY] = this.stats;
-    console.warn(
-      "[d3gl] network layout({ backend: 'gpu' }) stopped: the layout became non-finite " +
-        `(Σx=${sx}, Σy=${sy}, Σ|v|=${sv}, count=${count}, box=[${negMinX === undefined ? "" : -negMinX}, ` +
-        `${negMinY === undefined ? "" : -negMinY}, ${maxX}, ${maxY}]); keeping the last finite positions.`,
-    );
+    const reason =
+      "the layout became non-finite " +
+      `(Σx=${sx}, Σy=${sy}, Σ|v|=${sv}, count=${count}, box=[${negMinX === undefined ? "" : -negMinX}, ` +
+      `${negMinY === undefined ? "" : -negMinY}, ${maxX}, ${maxY}])`;
+    if (this.onInterrupt) this.onInterrupt(reason, "non-finite");
+    else this.reportFailure(reason, "; keeping the last finite positions");
     this.settle(true);
   }
+
+  /** A failed run: to the owner's `onFailure` when it has one (it decides what follows, #355), else one warning. */
+  private reportFailure(reason: string, consequence: string): void {
+    if (this.onFailure) this.onFailure(reason);
+    else console.warn(`[d3gl] network layout({ backend: 'gpu' }) stopped: ${reason}${consequence}.`);
+  }
+}
+
+/** Copy one {@link GpuRunState} into another, field by field (no allocation per harvest). */
+function copyRunState(from: GpuRunState, to: GpuRunState): void {
+  to.mode = from.mode;
+  to.ticksLeft = from.ticksLeft;
+  to.heat = from.heat;
+  to.decaying = from.decaying;
 }

@@ -17,8 +17,13 @@
  *
  * With LOD on, every posted frame runs the one per-frame LOD step ({@link lodFrameStep}, #343): refit the
  * coarsening tree in place (`lodSource: "structure"`), or rebuild the spatial tree — with the super-edge
- * rows of the main thread's view's covers (#433), so its link gather stays O(visible) — and transfer it with
+ * rows of the main thread's view's covers (#433), so its link gather walks no graph edges — and transfer it with
  * the frame (`"spatial"`).
+ *
+ * A **warm** start (`StartMessage.warm`, #311) continues a layout another transport was running — a GPU
+ * layout whose render backend was swapped away, or whose WebGL context was lost: no seed, the positions it
+ * left off at, its heat schedule over the ticks it had left. With no ticks left the worker starts idle,
+ * alive for a drag reheat.
  *
  * The GPU layout uses the same worker to coarsen, with no layout: `coarsen` builds its multilevel seed's plan
  * (#353) and, with LOD on, its LOD tree (#377), and each `lod-geometry` refits the tree's position geometry to
@@ -33,6 +38,7 @@
  */
 import { DRAG_HEAT, ForceLayout, RECOOL_TICKS, seedPositions } from "./force.js";
 import { nestedLayout, nestedBoundaryDiscs } from "./nested-layout.js";
+import { nestedSolverBuffers, nestedSolverTopology } from "./gpu/nested-topology.js";
 import { multilevelSeedSteps, buildHierarchy, type SeedProgress } from "./coarsen.js";
 import { flattenHierarchyToTopology, lodTreeFromTopology, type LODPositionTree } from "./lod.js";
 import { lodFrameStep, makeSpatialLODStream, makeStructureLODStream, recycleSpatialFrame, type LODStream } from "./lod-frame.js";
@@ -43,6 +49,7 @@ import {
   type CoarsenMessage,
   type LODGeometryRequest,
   type MainToWorker,
+  type NestedPrepReply,
   type ProgressMessage,
   type StartMessage,
   type WorkerToMain,
@@ -253,10 +260,11 @@ async function seedProgressively(steps: Generator<SeedProgress, void, undefined>
 async function runLayout(msg: StartMessage): Promise<void> {
   seeding = true;
   cancelled = false;
-  const { nodeCount, source, target, weight, sharedPositions, width, height, iterations, force, coarsen, multilevel, frameEvery, lod, lodSource, lodStyle, lodStyleVersion, lodView } =
+  const { nodeCount, source, target, weight, sharedPositions, width, height, iterations, force, coarsen, multilevel, frameEvery, lod, lodSource, lodStyle, lodStyleVersion, lodView, warm } =
     msg;
   const shared = sharedPositions !== undefined;
-  const positions = shared ? new Float32Array(sharedPositions) : new Float32Array(nodeCount * 2);
+  // A warm start's copy-mode positions arrived as this worker's own clone: continue in them.
+  const positions = shared ? new Float32Array(sharedPositions) : (warm?.positions ?? new Float32Array(nodeCount * 2));
   // Satisfies both CoarsenableGraph (multilevelSeed) and LayoutGraph (ForceLayout / seedPositions).
   const graph = { nodeCount, edgeCount: source.length, source, target, weight, positions };
 
@@ -289,37 +297,56 @@ async function runLayout(msg: StartMessage): Promise<void> {
       buffer = new ArrayBuffer(byteLength);
       geomBuffer = buffer;
     }
-    lodStream = makeStructureLODStream(lodTreeFromTopology(topology, lodGeometryViews(buffer, topology.size)));
-    post({ type: "lod-topology", topology, sharedGeometry });
+    const tree = lodTreeFromTopology(topology, lodGeometryViews(buffer, topology.size));
+    lodStream = makeStructureLODStream(tree);
+    // The main thread adopts the tree the moment it lands. A cold start's seed frame follows at once, but a
+    // warm start's first frame only follows its first tick (#311), so its geometry goes with the tree: in
+    // the SAB (shared mode) or in the message (copy mode, cloned at post time).
+    let geometry: Float32Array | undefined;
+    if (warm) {
+      lodFrameStep(lodStream, positions, 0); // a structure stream refits in place
+      if (!shared) geometry = new Float32Array(buffer);
+    }
+    post({ type: "lod-topology", topology, sharedGeometry, geometry });
   }
 
   // Seed: multilevel coarsening, streamed as it forms (a 300k-node seed takes ~1 s), or a plain disc
-  // cold start.
-  if (multilevel) {
-    const steps = multilevelSeedSteps(graph, { width, height, iterations, force, coarsen }, hierarchy);
-    seedLOD = lodStream;
-    if (!(await seedProgressively(steps, { positions, lod: lodStream, geomBuffer, shared, tick: 0 }))) return; // stopped
-    seedLOD = null;
-  } else seedPositions(graph, width, height, { force });
+  // cold start. A warm start (#311) continues positions another transport left off at: no seed.
+  if (!warm) {
+    if (multilevel) {
+      const steps = multilevelSeedSteps(graph, { width, height, iterations, force, coarsen }, hierarchy);
+      seedLOD = lodStream;
+      if (!(await seedProgressively(steps, { positions, lod: lodStream, geomBuffer, shared, tick: 0 }))) return; // stopped
+      seedLOD = null;
+    } else seedPositions(graph, width, height, { force });
+  }
 
   const layout = new ForceLayout(graph, force);
-  // A multilevel seed already has the global arrangement: cool over the budget. A cold disc start
-  // still has to untangle, so it keeps full heat (see ForceLayout.run). Either way the loop stops
-  // once the layout has converged.
-  if (multilevel) layout.cool(iterations);
-  else layout.hold(1);
+  if (warm) {
+    // Continue a layout another transport was running (#311): its positions are already on screen, so
+    // there is no seed and no seed frame; its heat schedule goes on over the ticks left.
+    if (warm.decaying) layout.cool(iterations, warm.heat);
+    else layout.hold(warm.heat);
+  } else if (multilevel) {
+    // A multilevel seed already has the global arrangement: cool over the budget. A cold disc start
+    // still has to untangle, so it keeps full heat (see ForceLayout.run). Either way the loop stops
+    // once the layout has converged.
+    layout.cool(iterations);
+  } else layout.hold(1);
   const s: WorkerState = { layout, positions, lod: lodStream, geomBuffer, shared, frameEvery, runLeft: iterations, dragging: false, tick: 0 };
   state = s;
   seeding = false;
 
   // Stream the finest-level refinement via the shared loop; it idles when converged (worker stays alive).
-  mode = iterations > 0 ? "run" : "idle";
+  // A warm re-cool's tail resumes as a re-cool, so a pin there reheats at once, as it would have (#311).
+  mode = iterations > 0 ? (warm?.recool ? "cool" : "run") : "idle";
+  if (mode === "cool") coolLeft = iterations;
   // A drag that began on a progress frame: hold its nodes from the seed frame on — its positions and the
   // LOD geometry derived from them — and from the first refinement tick.
   const held = pendingPin;
   pendingPin = null;
   if (held) holdNodes(s, held.ids, held.positions);
-  postFrame("frame"); // seed frame (tick 0)
+  if (!warm) postFrame("frame"); // seed frame (tick 0); a warm start's positions are already on screen
   await loop();
 }
 
@@ -450,6 +477,13 @@ addEventListener("message", (e: MessageEvent<MainToWorker>) => {
         onDepth: msg.stream ? (depth, frame) => post({ type: "frame", tick: depth, positions: frame }) : undefined,
       });
       post({ type: "done", tick: -1, positions: result.positions, boundaries: nestedBoundaryDiscs(msg.topology, result) });
+      return;
+    }
+    case "nested-prep": {
+      // The GPU nested layout's CPU prep (#355): its arrays are transferred, not copied.
+      const solver = nestedSolverTopology(msg.topology, msg.params);
+      const reply: NestedPrepReply = { type: "nested-prep", solver };
+      postMessage(reply, { transfer: nestedSolverBuffers(solver) });
       return;
     }
   }

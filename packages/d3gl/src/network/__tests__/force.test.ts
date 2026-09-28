@@ -268,6 +268,28 @@ describe("cooling + convergence (#124)", () => {
     expect(c.heat).toBe(0.3);
   });
 
+  it("cool(ticksLeft, heat) continues a decaying schedule where it stood — a moved layout keeps its heat (#311)", () => {
+    for (const [ticks, from, done] of [[300, 1, 0], [300, 1, 137], [RECOOL_TICKS, DRAG_HEAT, 55], [40, 1, 39]] as const) {
+      const whole = new Cooling();
+      whole.cool(ticks, from);
+      for (let t = 0; t < done; t++) whole.next();
+      expect(whole.decaying).toBe(true);
+      const moved = new Cooling();
+      moved.cool(ticks - done, whole.heat);
+      for (let t = done; t < ticks + 10; t++) {
+        expect(moved.heat).toBeCloseTo(whole.heat, 12);
+        whole.next();
+        moved.next();
+      }
+      expect(moved.heat).toBeCloseTo(MIN_HEAT, 12); // the same floor, reached on the same tick
+    }
+    const held = new Cooling();
+    held.hold(0.7);
+    expect(held.decaying).toBe(false);
+    held.cool(0);
+    expect(held.decaying).toBe(false); // no budget left: nothing to decay over
+  });
+
   it("run() stops once converged — iterations is the maximum, not a fixed count", () => {
     const g = ringOfCliques(12, 8);
     seedPositions(g, 800, 600, { force: {} });

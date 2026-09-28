@@ -309,6 +309,31 @@ describe("FrameBudget k: items per frame", () => {
     expect(frame(r, { costMs: 25 })).toBe(1); // one item larger than the whole budget still runs
   });
 
+  it("counts a reserved readback against the budget, still admitting a first item (#355)", () => {
+    const r = rig({ budgetMs: 10 });
+    for (let f = 0; f < 20; f++) {
+      frame(r, { costMs: 4 });
+      r.fences.catchUp();
+    }
+    r.now += 1000 / 60;
+    expect(r.budget.beginFrame(r.now)).toBe("ok");
+    expect(r.budget.open()).toBe(true);
+    r.budget.reserve(5); // the nested layout's composition before a copy
+    let items = 0;
+    while (r.budget.admit(4)) {
+      r.budget.spent(4, true);
+      items++;
+    }
+    r.budget.endFrame();
+    expect(items).toBe(1); // 5 + 4 ≤ 10, 5 + 8 > 10: one item where two fit without the reservation
+    r.fences.catchUp();
+    r.now += 1000 / 60;
+    r.budget.beginFrame(r.now);
+    r.budget.open();
+    r.budget.reserve(50); // a reservation past the budget never stalls the run
+    expect(r.budget.admit(4)).toBe(true);
+  });
+
   it("caps the measured main-thread encode time per frame at 2 ms", () => {
     const r = rig({ encodeCapMs: 2 });
     for (let f = 0; f < 30; f++) {
@@ -351,6 +376,18 @@ describe("FrameBudget budget: min(budgetMs, 0.6 × median rAF interval)", () => 
     expect(rig().budget.budgetMs).toBeCloseTo(10, 6);
     expect(frameBudgetMs(10, 1000 / 60)).toBeCloseTo(10, 6);
     expect(frameBudgetMs(10, 1000 / 144)).toBeCloseTo(0.6 * (1000 / 144), 6);
+  });
+});
+
+describe("a solver's cost model (#355)", () => {
+  it("itemCostMs and staticBands take a solver's ns-per-node table in place of the flat layout's", () => {
+    const nested = { prep: 10, force: 13, integrate: 4 };
+    expect(itemCostMs("force", 1_000_000, 4, nested)).toBeCloseTo(13 / 4, 9);
+    expect(itemCostMs("prep", 325_729, 1, nested)).toBeCloseTo(3.25729, 6);
+    expect(staticBands(1_000_000, 10, 1000, nested)).toBe(3); // 13 ms of band pass ÷ 5 ms per band
+    expect(staticBands(325_729, 10, 581, nested)).toBe(1);
+    const r = new FrameBudget(new FakeFences(), new FakeClock().now, { nodes: 1_000_000, rows: 1000, costs: nested });
+    expect(r.bands).toBe(3);
   });
 });
 

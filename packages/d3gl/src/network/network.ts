@@ -17,6 +17,7 @@ import type { StateNetworkGraph } from "./state-graph.js";
 import { startNestedWorkerLayout, startWorkerLayout, type StreamedLODTree, type WorkerLayoutHandle, type WorkerLayoutOptions } from "./worker-transport.js";
 import { buildLeafIncidence, lazySuperEdges, makeLazySuperEdgesScratch, rowSuperEdges, type LeafIncidence } from "./lazy-super-edges.js";
 import type { LeafStyle, LODView } from "./lod-frame.js";
+import { startGpuNestedLayout } from "./gpu/gpu-nested-transport.js";
 import { startGpuLayout } from "./gpu/gpu-transport.js";
 import { WebGLBackend } from "../webgl/webgl-backend.js";
 import type { NetworkGraph } from "./graph.js";
@@ -268,7 +269,12 @@ export interface NetworkLayoutOptions {
    *  one console warning naming the
    *  reason, when the render backend is not WebGL or the device lacks float render targets, float blending
    *  (`EXT_float_blend`) or a large enough texture size for the graph. The fallback is a full worker
-   *  run: it honours `multilevel` and streams the LOD tree like `"worker"`.
+   *  run: it honours `multilevel` and streams the LOD tree like `"worker"`. A GPU layout lives on the
+   *  render backend's WebGL device: when {@link Network.setBackend} swaps that backend out, or its WebGL
+   *  context is lost, the layout frees its GPU resources and continues **warm** — from its last positions,
+   *  with the ticks left of its budget and its current heat — on the GPU of a new WebGL backend, else on
+   *  the worker (one console warning; none for `"auto"` after a swap). A layout that had settled continues
+   *  idle, so a node drag still reflows it (#311).
    *
    *  `"auto"` (#375) asks for "the GPU where it works": it resolves to the GPU solve wherever `"gpu"`
    *  would run it and to `"worker"` everywhere else, **without** a warning, because there the worker is
@@ -336,8 +342,10 @@ export interface NetworkLayoutOptions {
    * final, so a streamed layout never oscillates. Works with LOD off or on any {@link NetworkLODOptions.source}.
    * Once it lands, a LOD cut of the laid-out module tree treats each module as its disc (#329): drawn at
    * the disc's centre, culled by it, and expanded once the disc's diameter on screen reaches `expandPx`.
-   * Runs off-thread on `backend: "worker"` (streamed top-down, one frame per depth) and synchronously
-   * on `"force"`; `"gpu"` and `"auto"` use the worker until a GPU path exists. Ignored without a hierarchy.
+   * Runs off-thread on `backend: "worker"` (streamed top-down, one frame per depth), on the GPU on
+   * `"gpu"` (#355: every module at every depth solved at once, streamed as one animation of all depths
+   * converging together; the worker when the device cannot run it, with a warning), and synchronously on
+   * `"force"`. `"auto"` runs it on the worker (#375). Ignored without a hierarchy.
    *
    * `true` sizes discs by node flow (leaf count when the graph has none); pass `{ size: "count" }` to
    * size by leaf count, and `iterations` / `packing` to tune each module's solve. `{ warm: true }`
@@ -1810,6 +1818,7 @@ export class Network extends BaseEngine {
     };
     // Unset until the transport returns, so a callback can never match a cleared `layoutHandle` (null).
     let handle: WorkerLayoutHandle | undefined;
+    let settled = false; // this layout's settle handler has run (it clears `lodStreaming` once)
     const onFrame = (): void => this.onStreamedFrame(handle);
     const onLODTree = useLod
       ? (tree: LODTree | null, streamed?: StreamedLODTree): void => {
@@ -1829,7 +1838,8 @@ export class Network extends BaseEngine {
           }
           // Record the worker's tree; recomputeLODGeometry adopts it while the cut is structural (a switch
           // to modules since launch keeps the module tree). Its geometry arrives with every frame, so the main
-          // thread only fills the style geometry once. The next frame renders it.
+          // thread only fills the style geometry once. The next frame renders it; a warm start's tree (#311)
+          // lands with the geometry of the positions already on screen.
           this.lodWorkerTree = tree;
           this.recomputeLODGeometry();
         }
@@ -1842,14 +1852,18 @@ export class Network extends BaseEngine {
       handle = startGpuLayout(devicePromise, graph, gpuOpts, onFrame, onLODTree,
         () => {
           // Resolved: the worker fallback streams the tree, and so does the GPU solve's LOD worker (#377) — so
-          // main builds none meanwhile.
-          if (this.layoutHandle === handle) this.lodStreaming = useLod;
+          // main builds none meanwhile. Also when the layout moved to either by a backend swap or a lost context
+          // (#311) — but not after the layout settled: a move then starts an idle run, whose tree is adopted when
+          // it lands, and the settle handler that clears the flag has already run, so a raised flag would block
+          // the main-thread LOD fallback until the next layout().
+          if (this.layoutHandle === handle && !settled) this.lodStreaming = useLod;
         });
     } else {
       this.lodStreaming = useLod; // the worker will stream the tree; main builds none meanwhile
       handle = startWorkerLayout(graph, workerOpts, onFrame, onLODTree);
     }
     this.onLayoutSettled(handle, () => {
+      settled = true;
       this.lodStreaming = false;
     });
   }
@@ -1916,13 +1930,23 @@ export class Network extends BaseEngine {
     if (layoutClass(opts.backend) === "streaming") {
       const oneFrame = warm || tween !== null;
       this.nestedSolving = true;
-      const solve = startNestedWorkerLayout(graph, topology, params, () => this.scheduleLayoutRepaint(), {
+      const delivery = {
         stream: !oneFrame,
-        onResult: oneFrame ? (positions) => this.landNested(graph, positions, tween) : undefined,
-        onBoundaries: (discs) => {
+        onResult: oneFrame ? (positions: Float32Array) => this.landNested(graph, positions, tween) : undefined,
+        onBoundaries: (discs: BoundaryDiscs) => {
           if (this.graph === graph) this.nestedDiscs = { tree, discs }; // the modules' geometry, and their rings' (#329)
         },
-      });
+      };
+      let solve: WorkerLayoutHandle | undefined;
+      if (opts.backend === "gpu") {
+        // The batched GPU solve (#355): every module at every depth at once, streamed from the GPU; the
+        // worker when the device cannot run it. A GPU frame repaints inside the transport's own animation
+        // frame ({@link onStreamedFrame}).
+        const devicePromise = this.whenBackendSettled().then(() => this.gpuDevice());
+        solve = startGpuNestedLayout(devicePromise, graph, topology, params, () => this.onStreamedFrame(solve), delivery);
+      } else {
+        solve = startNestedWorkerLayout(graph, topology, params, () => this.scheduleLayoutRepaint(), delivery);
+      }
       this.onLayoutSettled(tween ? this.transitionHandle(tween, solve) : solve);
     } else {
       const result = nestedLayout(topology, params);
@@ -1973,12 +1997,16 @@ export class Network extends BaseEngine {
   }
 
   /** A layout handle for a transition (#328): it settles when the transition ends, and `stop()` also
-   *  stops `solve` — the worker computing the transition's target, if any. */
+   *  stops `solve` — the worker computing the transition's target, if any. It reports `solve`'s live
+   *  transport (#297), so a GPU nested solve under a transition reads as `"gpu"`. */
   private transitionHandle(tween: PositionTransition, solve?: WorkerLayoutHandle): WorkerLayoutHandle {
     this.transition = tween;
     return {
       shared: false,
       mainThread: !solve,
+      get transport() {
+        return solve?.transport;
+      },
       settled: tween.settled,
       stop: () => {
         solve?.stop();
@@ -2920,17 +2948,20 @@ export class Network extends BaseEngine {
     if (this.transition?.running) this.transition.finish();
     const pending = this.transition;
 
-    const pos = graph.positions;
+    const grabbed = graph.positions;
     const start = new Float32Array(held.length * 2); // world positions at grab time
-    for (let k = 0; k < held.length; k++) { const id = held[k]!; start[k * 2] = pos[id * 2]!; start[k * 2 + 1] = pos[id * 2 + 1]!; }
+    for (let k = 0; k < held.length; k++) { const id = held[k]!; start[k * 2] = grabbed[id * 2]!; start[k * 2 + 1] = grabbed[id * 2 + 1]!; }
     const t0 = this.transform;
     const worldStartX = (sx - t0.x) / t0.k, worldStartY = (sy - t0.y) / t0.k;
     let dx = 0, dy = 0; // world-space cursor delta since grab
 
     const heldIds = Uint32Array.from(held);
     const heldPos = new Float32Array(held.length * 2); // interleaved held positions, for the worker pin message
-    // Hold every grabbed leaf at (start + cursor delta), mirrored into `heldPos` for the worker pin.
+    // Hold every grabbed leaf at (start + cursor delta), mirrored into `heldPos` for the worker pin. Reads
+    // `graph.positions` per call, not once per drag: a GPU layout moved to a shared-memory worker mid-drag
+    // swaps it for a view of the shared buffer (#311), and a shared-mode pin sends ids only.
     const applyHeld = (): void => {
+      const pos = graph.positions;
       for (let k = 0; k < held.length; k++) {
         const id = held[k]!;
         const px = start[k * 2]! + dx, py = start[k * 2 + 1]! + dy;
@@ -3857,6 +3888,18 @@ export class Network extends BaseEngine {
       constBorder,
       linkBend: this.styleOpts.linkBend ?? 0,
     };
+  }
+
+  /**
+   * A backend swap is about to destroy the outgoing backend and its WebGL device (#311). A GPU layout runs
+   * on that device, so it moves now, while the device is alive: it frees its textures and fences there and
+   * continues warm on the next backend's device once that has settled — the GPU again on WebGL (including
+   * after an `"auto"` upgrade), else the CPU worker — with its remaining ticks and heat, or idle (alive for a
+   * drag) if it had settled. The handle stays the same, so a drag in progress and the settle handler keep
+   * working. A worker layout is not bound to a device and keeps running.
+   */
+  protected override onBeforeBackendSwap(): void {
+    this.layoutHandle?.moveDevice?.(this.whenBackendSettled().then(() => this.gpuDevice()));
   }
 
   /** Re-push instanced layers after a backend swap (the first install doesn't fire this). */

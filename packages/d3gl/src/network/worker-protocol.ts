@@ -14,6 +14,7 @@ import type { BoundaryDiscs, LODTopology } from "./lod.js";
 import type { LeafStyle, LODView, SpatialLODFrame } from "./lod-frame.js";
 import type { NestedLayoutParams, NestedLayoutTopology } from "./nested-layout.js";
 import type { SeedPlan, SeedPlanOptions } from "./gpu/seed-plan.js";
+import type { NestedSolverTopology } from "./gpu/nested-topology.js";
 
 /** Kick off a layout run. Edge buffers are copied to the worker; the main thread keeps its own. */
 export interface StartMessage {
@@ -55,6 +56,30 @@ export interface StartMessage {
   lodStyleVersion?: number;
   /** The main thread's view, whose covers' super-edge rows a spatial tree carries (#433). */
   lodView?: LODView;
+  /**
+   * Continue a layout another transport was running (#311) instead of seeding one: no disc, no multilevel
+   * seed, no seed frame. `iterations` is the ticks left of its budget; 0 starts the worker idle, alive for
+   * a drag reheat.
+   */
+  warm?: WarmStart;
+}
+
+/**
+ * Where a layout left off, for a worker that continues it (#311): its positions and its heat schedule.
+ * `cool(iterations, heat)` continues a decaying schedule (see `Cooling.decaying`), `hold(heat)` a held one.
+ */
+export interface WarmStart {
+  /** Copy mode: the positions to continue from. Omitted in shared mode, where they are in `sharedPositions`. */
+  positions?: Float32Array;
+  /** The heat of the next tick. */
+  heat: number;
+  /** Whether that heat decays to the floor over `iterations` ticks, or is held. */
+  decaying: boolean;
+  /**
+   * The ticks are the tail of a re-cool after a drag: the worker resumes it as one, so a pin reheats at the
+   * drag heat at once instead of riding the tail's decaying heat, as a drag during the initial run does.
+   */
+  recool?: boolean;
 }
 
 /** A new leaf style for the spatial tree's per-frame aggregation (#343), after `style()` changed it. */
@@ -119,6 +144,16 @@ export interface NestedStartMessage {
 }
 
 /**
+ * Build the batched GPU nested layout's solve data off the main thread (#355): the worker replies with
+ * one {@link NestedPrepReply} (its buffers transferred) and is then done. O(tree size + links · log links).
+ */
+export interface NestedPrepMessage {
+  type: "nested-prep";
+  topology: NestedLayoutTopology;
+  params: NestedLayoutParams;
+}
+
+/**
  * The GPU layout's coarsening worker: coarsen the graph, with no layout, for the LOD tree (#377) and/or the
  * GPU's multilevel seed (#353) — one hierarchy for both, as the worker backend shares it between its seed
  * and its LOD tree. With `seed`, the worker first posts a {@link SeedPlanMessage} (its arrays transferred).
@@ -164,7 +199,8 @@ export type MainToWorker =
   | LODViewMessage
   | LODRecycleMessage
   | CoarsenMessage
-  | LODGeometryRequest;
+  | LODGeometryRequest
+  | NestedPrepMessage;
 
 /**
  * The LOD tree, posted once after the worker coarsens (only when `lod` was requested, or for a
@@ -177,6 +213,12 @@ export interface LODTopologyMessage {
   topology: LODTopology;
   /** Shared (zero-copy) mode: the geometry SAB the worker updates each frame; absent in copy mode. */
   sharedGeometry?: SharedArrayBuffer;
+  /**
+   * Copy mode, a warm start only (#311): the geometry of the positions it continues from, laid out as a
+   * frame's {@link ProgressMessage.geometry}. No seed frame follows a warm start, and the main thread draws
+   * the tree as soon as it lands. (Shared mode fills `sharedGeometry` before posting instead.)
+   */
+  geometry?: Float32Array;
 }
 
 /** A progress frame (`frame`) or the final converged/cancelled state (`done`). */
@@ -220,6 +262,12 @@ export interface SeedPlanMessage {
 }
 
 export type WorkerToMain = LODTopologyMessage | ProgressMessage | LODGeometryMessage | SeedPlanMessage;
+
+/** The reply to a {@link NestedPrepMessage}: the GPU nested solve's data (#355). Its own channel, not a layout message. */
+export interface NestedPrepReply {
+  type: "nested-prep";
+  solver: NestedSolverTopology;
+}
 
 /**
  * The three position-derived geometry arrays packed contiguously in one buffer, `[cx, cy, extent]`

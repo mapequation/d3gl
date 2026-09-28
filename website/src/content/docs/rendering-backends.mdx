@@ -101,6 +101,11 @@ Switching to the backend that is **already live** is a no-op (no re-render, no f
 particular, once `"auto"` has upgraded, the live backend *is* `"webgl"`, so selecting `"webgl"`
 does nothing.
 
+A network's GPU force layout (`layout({ backend: "gpu" })`) runs on the WebGL backend's device, so it
+moves with a swap: it frees its GPU memory before the old backend goes and continues where it was on the
+new one — on the GPU again for WebGL (including `"auto"`), on the CPU worker for Canvas and SVG. See
+[Network](/d3gl/examples/network/).
+
 ## React
 
 The `<GeoMap>` component takes the same `backend` prop, including `"auto"`:

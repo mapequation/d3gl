@@ -1,11 +1,12 @@
 /**
  * The streaming GPU run's contract at small N (#352, spec §6.5): `settled` only after the final tick's
  * positions were harvested, an explicit `frameEvery` caps `onFrame` to once per that many ticks, and a
- * layout that turns non-finite stops with one warning and keeps its last finite positions — whether the
- * NaN came in through a drag's held positions or out of a tick's integrate, which a copy between ticks
- * catches by re-running the reductions. A drag's held positions are written at the start of a tick, never
- * mid-tick. The at-scale per-frame guard is T7 (`_gpu-stream-harness.ts`, run by `gpu-stream-nolod-perf`,
- * `gpu-stream-lod-perf` and `gpu-stream-seed-perf`); context loss is in `gpu-backend-integration`.
+ * layout that turns non-finite stops the GPU run and keeps its last finite positions — whether the NaN came
+ * in through a drag's held positions or out of a tick's integrate, which a copy between ticks catches by
+ * re-running the reductions — and, through the transport, continues on the worker from them (#311). A
+ * drag's held positions are written at the start of a tick, never mid-tick. The at-scale per-frame guard is
+ * T7 (`_gpu-stream-harness.ts`, run by `gpu-stream-nolod-perf`, `gpu-stream-lod-perf` and
+ * `gpu-stream-seed-perf`); context loss is in `gpu-backend-integration` and `gpu-swap`.
  *
  * The multilevel seed in the stream (#353, T10): its levels are work items of the loop, nothing is copied
  * until the nodes are placed, the first frame is the seed (tick 0), a drag's pins wait for the nodes, a stop
@@ -23,6 +24,7 @@ import { buildGraph, type NetworkGraph } from "../../graph.js";
 import { DEFAULT_FORCE, MIN_SETTLE_TICKS, seedPositions } from "../../force.js";
 import { buildHierarchy } from "../../coarsen.js";
 import { coarseSeedPlan, type SeedPlan } from "../seed-plan.js";
+import type { MainToWorker } from "../../worker-protocol.js";
 
 const nextFrame = (): Promise<void> => new Promise((resolve) => requestAnimationFrame(() => resolve()));
 
@@ -111,28 +113,43 @@ describe("GPU streaming run (#352)", () => {
     handle.stop();
   });
 
-  it("stops with one warning and keeps the last finite positions when the layout turns non-finite", async () => {
+  it("stops the GPU run on a non-finite layout and continues on the worker from the last finite positions (#311)", async () => {
     const g = ring(300);
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const posts: string[] = [];
+    const post = Worker.prototype.postMessage;
+    vi.spyOn(Worker.prototype, "postMessage").mockImplementation(function (this: Worker, message: MainToWorker) {
+      posts.push(message.type);
+      post.call(this, message);
+    });
     let frames = 0;
+    let gpuFrames = 0;
+    const unobserve = observeGpuLayoutFrames(() => { gpuFrames++; });
     // A cold start: at full heat it is still running when the NaN arrives (a seeded run, #353, could have
     // converged and settled already, #376).
-    const handle = startGpuLayout(device, g, { width: 400, height: 300, iterations: 100_000, multilevel: false }, () => { frames++; });
+    const handle = startGpuLayout(device, g, { width: 400, height: 300, iterations: 2000, multilevel: false }, () => { frames++; });
     try {
       for (let i = 0; i < 200 && frames < 2; i++) await nextFrame();
       expect(frames).toBeGreaterThanOrEqual(2);
       // Hold one node at NaN: the next tick's reductions (Σx, the box) go non-finite.
       handle.pin(Uint32Array.of(7), new Float32Array([Number.NaN, Number.NaN]));
-      await handle.settled;
+      await handle.settled; // the worker's continuation converged
       const nonFinite = warn.mock.calls.filter((c) => String(c[0]).includes("non-finite"));
       expect(nonFinite).toHaveLength(1);
+      expect(String(nonFinite[0]?.[0])).toMatch(/continues on the CPU worker from the last finite positions/);
+      expect(handle.transport).toBe("worker");
+      // The poisoned drag was not replayed onto the worker, so its layout stayed finite.
+      expect(posts).toContain("start");
+      expect(posts).not.toContain("pin");
       for (let i = 0; i < 300 * 2; i++) expect(Number.isFinite(g.positions[i] ?? Number.NaN)).toBe(true);
-      // The loop has stopped, and a later drag does not restart it.
-      const after = frames;
-      handle.pin(Uint32Array.of(1), new Float32Array([0, 0]));
+      // The GPU loop has stopped; the drag's next move reaches the worker.
+      const after = gpuFrames;
       for (let i = 0; i < 10; i++) await nextFrame();
-      expect(frames).toBe(after);
+      expect(gpuFrames).toBe(after);
+      handle.pin(Uint32Array.of(1), new Float32Array([0, 0]));
+      expect(posts).toContain("pin");
     } finally {
+      unobserve();
       warn.mockRestore();
       handle.stop();
     }

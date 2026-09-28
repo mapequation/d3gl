@@ -158,6 +158,15 @@ export class Cooling {
   next(): void {
     this.heat = Math.max(this.floor, this.heat * this.decay);
   }
+
+  /**
+   * Whether the heat is still decaying ({@link cool}) rather than held ({@link hold}). With `ticksLeft`
+   * ticks of a `cool(ticks, from)` budget left, `cool(ticksLeft, heat)` continues the same geometric decay
+   * to the same floor — how a layout moved to another transport keeps its schedule (#311).
+   */
+  get decaying(): boolean {
+    return this.decay !== 1;
+  }
 }
 
 /**

@@ -3,7 +3,7 @@ import type { LayoutGraph } from "../force.js";
 import { buildCSR } from "../graph.js";
 import { buildHubChunks } from "./hub-chunks.js";
 import { atlasWidth, packFloatTexture, packUintTexture, writeTexels } from "./textures.js";
-import { AttractionPass, HubChunkPass, type CsrTextures, type HubChunkTextures } from "./passes/attraction.js";
+import { AttractionPass, HubChunkPass, type CsrTextures, type HubChunkTextures, type NestedSpringInputs } from "./passes/attraction.js";
 import { beginPass } from "./passes/fullscreen.js";
 import type { SeedLevel } from "./seed-plan.js";
 
@@ -78,6 +78,10 @@ interface SeedStaging {
  * the neighbours) and every term is multiplied by it, as the CPU {@link ForceLayout} does for unit-mass
  * weighted springs. Without it the programs compile with no weight fetch.
  *
+ * With `nested` (#355), the terms are the nested layout's link corrections instead (see
+ * {@link SpringVariant.nested}): they need the graph's `springWeight` and the {@link NestedSpringInputs}
+ * on every {@link prepare} and {@link draw}.
+ *
  * **A multilevel seed's springs** (#353) are a second set, built from a {@link SeedSpringCapacity}: textures
  * sized to the largest seed level, weighted and mass-weighted (each row's sum divided by its slot's mass —
  * the CPU's `k · w / mass` per endpoint), rewritten per level by {@link setRows} with sub-uploads (no
@@ -94,10 +98,13 @@ export class GpuSprings {
   private readonly staging: SeedStaging | null;
   /** A graph's springs own their programs; a seed's borrow the solver's ({@link SeedSpringPasses}). */
   private readonly ownsPasses: boolean;
+  private readonly nested: boolean;
 
-  constructor(device: Device, source: LayoutGraph | SeedSpringCapacity) {
+  constructor(device: Device, source: LayoutGraph | SeedSpringCapacity, variant: { nested?: boolean } = {}) {
     this.device = device;
+    this.nested = variant.nested === true;
     if ("seedLevels" in source) {
+      if (this.nested) throw new Error("GpuSprings: a seed's springs are not nested");
       const { rows, entries, chunks } = source.seedLevels;
       this.offWidth = atlasWidth(rows + 1);
       this.nbrWidth = atlasWidth(Math.max(1, entries));
@@ -128,6 +135,7 @@ export class GpuSprings {
     this.staging = null;
     this.ownsPasses = true;
     const graph = source;
+    if (this.nested && !graph.springWeight) throw new Error("GpuSprings: nested springs need per-link weights");
     // Symmetric (undirected) CSR from the directed edge list: buildCSR inserts both directions, so the
     // gather reproduces force.ts's per-edge springs (each edge pulls both endpoints).
     const csr = buildCSR(graph.nodeCount, graph.source, graph.target, graph.springWeight);
@@ -146,8 +154,8 @@ export class GpuSprings {
 
     const table = buildHubChunks(csr.offsets);
     const weighted = weights !== null;
-    this.hubs = table.count > 0 ? createHubResources(device, table.table, table.count, new HubChunkPass(device, { weighted })) : null;
-    this.attraction = new AttractionPass(device, { hubs: this.hubs !== null, weighted });
+    this.hubs = table.count > 0 ? createHubResources(device, table.table, table.count, new HubChunkPass(device, { weighted, nested: this.nested })) : null;
+    this.attraction = new AttractionPass(device, { hubs: this.hubs !== null, weighted, nested: this.nested });
   }
 
   /** Number of hub chunks (0 when no row is longer than `SPRING_CHUNK`). */
@@ -179,28 +187,29 @@ export class GpuSprings {
    * texture, submitted before the caller opens the force pass that {@link draw}s into. No-op (no render
    * pass, no draw) when the graph has no hubs.
    */
-  prepare(posTex: Texture, width: number): void {
+  prepare(posTex: Texture, width: number, nested?: NestedSpringInputs): void {
     const hubs = this.hubs;
     if (!hubs || hubs.count === 0) return;
     // Every partials texel is written (padding with 0), so the target is never cleared.
     const pass = beginPass(this.device, { framebuffer: hubs.fbo, clear: false });
-    hubs.pass.run(pass, posTex, this.csr, hubs, { width, nbrWidth: this.nbrWidth });
+    hubs.pass.run(pass, posTex, this.csr, hubs, { width, nbrWidth: this.nbrWidth }, nested);
     pass.end();
     this.device.submit();
   }
 
   /**
    * Draw the spring forces into an open additive force pass, after {@link prepare} for this tick. A seed's
-   * springs take the level's per-slot `mass` texture (each row's sum is an acceleration on it).
+   * springs take the level's per-slot `mass` texture (each row's sum is an acceleration on it); nested
+   * springs (#355) their {@link NestedSpringInputs}.
    */
-  draw(pass: RenderPass, posTex: Texture, u: SpringUniforms, mass: Texture | null = null): void {
+  draw(pass: RenderPass, posTex: Texture, u: SpringUniforms, mass: Texture | null = null, nested?: NestedSpringInputs): void {
     this.attraction.run(pass, posTex, this.csr, this.hubs, {
       count: u.count,
       width: u.width,
       offWidth: this.offWidth,
       nbrWidth: this.nbrWidth,
       attraction: u.attraction,
-    }, mass);
+    }, mass, nested);
   }
 
   destroy(): void {

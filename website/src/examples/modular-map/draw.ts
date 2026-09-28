@@ -22,9 +22,12 @@ const SIZES = [500, 1_000, 2_000, 5_000, 10_000, 20_000];
  *
  * The **Layout** control switches to the **nested** module layout (#324): each module's children laid out
  * inside its own disc — and with **Boundaries** on (`lod({ moduleBoundary })`, #329) every module the cut
- * has opened is ringed, on its disc under the nested layout. Switching re-lays the map out **warm**, from where the nodes are, and **eases**
- * them there (#328): `layout({ nested: { warm: true }, transition: 800 })` — the same call an app makes
- * after re-clustering, so the new map refines the old one in place instead of restarting from a disc.
+ * has opened is ringed, on its disc under the nested layout. It runs on the GPU (`backend: "gpu"`, #355):
+ * every module at every depth solves at once, and a fresh map streams in as one animation of all depths.
+ * Switching re-lays the map out **warm**, from where the nodes are, and **eases** them there (#328):
+ * `layout({ backend: "gpu", nested: { warm: true }, transition: 800 })` — the same call an app makes after
+ * re-clustering, so the new map refines the old one in place instead of restarting from a disc. (Both fall
+ * back to the CPU worker where the GPU layout cannot run.)
  *
  * The **Input** control hands the same map over as an Infomap **`.ftree`** would (#199): the graph keeps
  * only the links inside each bottom module, and the links between modules arrive as **module links**,
@@ -117,10 +120,11 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
         // the camera framed on the layout as it converges (#206), so the map opens framed and settles in
         // place, no jump.
         if (layout === "Force") net.layout({ backend: "gpu", fit: true, iterations: 300 });
-        // A fresh graph opens framed on the nested map; a switch refines the current map where it is
-        // (warm) and eases the nodes into it (#328) — the camera stays put.
-        else if (fresh) net.layout({ backend: "worker", nested: true, fit: true });
-        else net.layout({ backend: "worker", nested: { warm: true }, transition: 800 });
+        // The nested map solves on the GPU (#355). A fresh graph opens framed on it, streaming all depths
+        // together; a switch refines the current map where it is (warm) and eases the nodes into it (#328) —
+        // the camera stays put.
+        else if (fresh) net.layout({ backend: "gpu", nested: true, fit: true });
+        else net.layout({ backend: "gpu", nested: { warm: true }, transition: 800 });
       }
 
       // Frontier labels come pre-styled (dark 11px sans-serif + white halo) — no CSS needed.

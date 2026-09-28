@@ -581,10 +581,17 @@ export abstract class BaseEngine {
    * upgrade. `whenReady()` alone resolves at first paint (Canvas in `"auto"` mode); this method
    * additionally awaits the WebGL device so a WebGL-only feature (GPU layout) can safely use it.
    * On any non-`"auto"` backend this is equivalent to `whenReady()`.
+   *
+   * A backend pick while it waits supersedes the swap it was waiting for, so it then waits for the newest
+   * one too (#311): an explicit `setBackend("webgl")` during an `"auto"` upgrade ends the upgrade while the
+   * Canvas placeholder is still live, before the picked backend exists.
    */
   protected async whenBackendSettled(): Promise<void> {
-    await this.ready;
-    if (this.upgradeDone) await this.upgradeDone;
+    for (let token = Number.NaN; token !== this.swapToken; ) {
+      token = this.swapToken;
+      await this.ready;
+      if (this.upgradeDone) await this.upgradeDone;
+    }
   }
   /** Idempotent: addEventListener dedupes on the same handler reference. */
   private attachPointer(): void {
@@ -2495,6 +2502,15 @@ export abstract class BaseEngine {
   protected onBackendSwapped(): void {}
 
   /**
+   * Pre-swap hook: called right before a backend SWAP destroys the outgoing backend (an existing
+   * handle is being replaced by `next`, already created) — NOT on the first install, and not for a
+   * swap that was superseded. The outgoing backend and its GPU device are still alive, so a subclass
+   * can release what it built on them: the network hands a running GPU layout over to the next backend
+   * here, freeing its textures and fences on the device they belong to (#311). Default: no-op.
+   */
+  protected onBeforeBackendSwap(): void {}
+
+  /**
    * Backend-changed hook: called after EVERY backend install (first install AND swaps),
    * after setLayers/setTransform/passThrough-repaint, but before the blanket instanced-lane
    * re-emit. Subclasses override to re-evaluate which layers should be lane vs. Scene paths
@@ -2507,7 +2523,8 @@ export abstract class BaseEngine {
    * Install `next` as the live backend (shared by swapBackend and the "auto" upgrade).
    * Honors the swap-supersede / destroyed guards. Destroys + detaches the previous
    * handle, pushes the current specs + transform, renders, and — only if it REPLACED an
-   * existing handle — fires onBackendSwapped(). The first install (old === null) does NOT
+   * existing handle — fires onBeforeBackendSwap() before the old handle is destroyed and
+   * onBackendSwapped() after the new one is live. The first install (old === null) does NOT
    * notify, so it is safe to call synchronously during construction (before a subclass has
    * finished initializing its own fields, e.g. GeoMap's projection).
    */
@@ -2520,6 +2537,9 @@ export abstract class BaseEngine {
       return;
     }
     const old = this.handle;
+    // While the outgoing backend (and its GPU device) is still alive: let a subclass release what it
+    // built on it (#311).
+    if (old) this.onBeforeBackendSwap();
     // Keep the rendering surface at the OLD surface's DOM position instead of at the end of
     // the host, where makeCanvas() appended the new canvas. This makes the canvas a stable
     // base layer: anything the caller appended to the host AFTER it (e.g. an HTML stats

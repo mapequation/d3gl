@@ -11,11 +11,19 @@
  * frame here). The main thread then never coarsens or runs the O(N) geometry pass.
  */
 import type { NetworkGraph } from "./graph.js";
+import type { Device } from "@luma.gl/core";
 import { multilevelLayout, type CoarsenOptions } from "./coarsen.js";
 import { ForceLayout, seedPositions, type ForceParams } from "./force.js";
 import { lodTreeFromTopology, type BoundaryDiscs, type LODTree } from "./lod.js";
 import { nestedLayout, nestedBoundaryDiscs, type NestedLayoutParams, type NestedLayoutTopology } from "./nested-layout.js";
-import { lodGeometryViews, lodGeometryByteLength, type MainToWorker, type WorkerToMain } from "./worker-protocol.js";
+import {
+  lodGeometryViews,
+  lodGeometryByteLength,
+  type MainToWorker,
+  type NestedPrepReply,
+  type WorkerToMain,
+} from "./worker-protocol.js";
+import { nestedSolverTopology, type NestedSolverTopology } from "./gpu/nested-topology.js";
 import { lodTreeFromSpatialFrame, type LeafStyle, type LODView, type SpatialFrameHeader } from "./lod-frame.js";
 
 export interface WorkerLayoutOptions {
@@ -47,6 +55,15 @@ export interface WorkerLayoutOptions {
   lodStyleVersion?: number;
   /** The view whose covers' super-edge rows a spatial stream builds with each tree (#433). */
   lodView?: LODView;
+  /**
+   * Continue the layout `graph.positions` holds instead of seeding one (#311): no disc, no multilevel
+   * seed, and its heat schedule resumed — `cool(iterations, heat)` when it was decaying, else
+   * `hold(heat)` — over `iterations`, the ticks it had left. `iterations: 0` starts the worker idle, alive
+   * for a drag reheat. How a GPU layout goes on after its render backend is swapped away or its context is
+   * lost. `multilevel` is ignored; `lod` still streams the tree. `recool`: the ticks are a re-cool's tail
+   * after a drag, resumed as one (a pin then reheats at the drag heat at once).
+   */
+  warm?: { heat: number; decaying: boolean; recool?: boolean };
 }
 
 /**
@@ -98,6 +115,16 @@ export interface WorkerLayoutHandle {
   /** Send a spatial LOD stream the main thread's new view (#433); later trees carry the super-edge rows of its
    *  covers. Absent when the run streams no spatial tree. */
   setLODView?(view: LODView): void;
+  /**
+   * Set by `startGpuLayout` only (#311): the render backend that owns this layout's WebGL device is about
+   * to be replaced — call it while that device is still alive. A GPU run stops and frees its GPU
+   * resources now, then continues **warm** on whatever `next` resolves to (a GPU run on a new WebGL
+   * device, else the CPU worker): from its last harvested positions, with the ticks left of its budget
+   * and its current heat. A settled layout continues as an idle run, so a drag still reflows. The handle
+   * stays the same object. No-op while the layout runs on the worker (not bound to a device) or waits
+   * for a device.
+   */
+  moveDevice?(next: Promise<Device | null | undefined>): void;
 }
 
 /** Handle for the synchronous fallback (no live worker) — reheat is a no-op there. */
@@ -142,13 +169,22 @@ export function startWorkerLayout(
    */
   onLODTree?: (tree: LODTree, streamed?: StreamedLODTree) => void,
 ): WorkerLayoutHandle {
-  const { width, height, iterations } = opts;
+  const { width, height, iterations, warm } = opts;
   const multilevel = opts.multilevel ?? true;
   const syncOpts = { width, height, iterations, force: opts.force, coarsen: opts.coarsen };
 
   /** Solve on this thread (converging early, like the worker): the fallback when no worker runs. */
   const solveHere = (): void => {
-    if (multilevel) multilevelLayout(graph, syncOpts);
+    if (warm) {
+      // Continue from the current positions on the handed-over schedule, until converged (#311).
+      const layout = new ForceLayout(graph, opts.force);
+      if (warm.decaying) layout.cool(iterations, warm.heat);
+      else layout.hold(warm.heat);
+      for (let t = 0; t < iterations; t++) {
+        layout.tick();
+        if (layout.converged) break;
+      }
+    } else if (multilevel) multilevelLayout(graph, syncOpts);
     else {
       seedPositions(graph, width, height, { force: opts.force });
       new ForceLayout(graph, opts.force).run(iterations, "hot"); // a cold start untangles at full heat
@@ -167,8 +203,9 @@ export function startWorkerLayout(
 
   // Give the very first paint a spread disc instead of a pile at the origin while the worker's seed
   // frame is in flight — at the force model's equilibrium scale, the scale that seed arrives at, so
-  // a fitted view doesn't jump. NetworkGraph satisfies the force core's LayoutGraph view.
-  seedPositions(graph, width, height, { force: opts.force });
+  // a fitted view doesn't jump. NetworkGraph satisfies the force core's LayoutGraph view. A warm start
+  // continues the positions already on screen (#311).
+  if (!warm) seedPositions(graph, width, height, { force: opts.force });
 
   // Live (#297): a worker error below falls back to a synchronous solve, after which no worker shares it.
   let shared = sharedMemoryAvailable();
@@ -203,7 +240,10 @@ export function startWorkerLayout(
     if (msg.type === "lod-topology") {
       const { topology, sharedGeometry } = msg;
       const buffer: ArrayBufferLike = sharedGeometry ?? new ArrayBuffer(lodGeometryByteLength(topology.size));
-      if (!sharedGeometry) lodGeomFlat = new Float32Array(buffer);
+      if (!sharedGeometry) {
+        lodGeomFlat = new Float32Array(buffer);
+        if (msg.geometry) lodGeomFlat.set(msg.geometry); // a warm start's geometry, before the tree is drawn (#311)
+      }
       onLODTree?.(lodTreeFromTopology(topology, lodGeometryViews(buffer, topology.size)));
       return;
     }
@@ -258,6 +298,8 @@ export function startWorkerLayout(
     lodStyle: opts.lodStyle,
     lodStyleVersion: opts.lodStyleVersion,
     lodView: opts.lodView,
+    // Copy mode clones the positions into the message (at post time); shared mode carried them into the SAB.
+    warm: warm && { ...warm, ...(shared ? {} : { positions: graph.positions }) },
   };
   worker.postMessage(start);
 
@@ -396,5 +438,79 @@ export function startNestedWorkerLayout(
       terminate();
     },
     ...NOOP_DRAG,
+  };
+}
+
+/** A pending {@link prepareNestedSolve}: its result, and `cancel` (terminates the worker; the promise never settles). */
+export interface NestedPrep {
+  readonly solver: Promise<NestedSolverTopology>;
+  cancel(): void;
+}
+
+/**
+ * Build the batched GPU nested layout's solve data (#355, `nestedSolverTopology`) in a layout worker, so
+ * the main thread spends nothing on it (150 ms at 325k leaves, 450 ms at 1M, measured in Node): one
+ * `nested-prep` message, one reply with its arrays transferred, then the worker exits. Falls back to
+ * building it here, in a later task, when Workers are unavailable or the worker fails.
+ */
+export function prepareNestedSolve(tree: NestedLayoutTopology, params: NestedLayoutParams): NestedPrep {
+  let cancelled = false;
+  let worker: Worker | null = null;
+  const here = (): Promise<NestedSolverTopology> =>
+    new Promise((resolve, reject) => {
+      setTimeout(() => {
+        if (cancelled) return;
+        try {
+          resolve(nestedSolverTopology(tree, params));
+        } catch (error) {
+          reject(error);
+        }
+      }, 0);
+    });
+  const solver = new Promise<NestedSolverTopology>((resolve, reject) => {
+    if (typeof Worker === "undefined") {
+      here().then(resolve, reject);
+      return;
+    }
+    try {
+      worker = new Worker(new URL("./layout-worker.js", import.meta.url), { type: "module" });
+    } catch {
+      here().then(resolve, reject);
+      return;
+    }
+    const w = worker;
+    const done = (): void => {
+      w.onmessage = null;
+      w.onerror = null;
+      w.terminate();
+    };
+    w.onmessage = (e: MessageEvent<NestedPrepReply>): void => {
+      done();
+      if (!cancelled) resolve(e.data.solver);
+    };
+    w.onerror = (): void => {
+      done();
+      if (!cancelled) here().then(resolve, reject);
+    };
+    // Clone only the topology the prep reads — not the LOD tree's geometry/style arrays.
+    const topology: NestedLayoutTopology = {
+      size: tree.size,
+      leafCount: tree.leafCount,
+      childOffset: tree.childOffset,
+      children: tree.children,
+      parent: tree.parent,
+      superEdgeOffset: tree.superEdgeOffset,
+      superEdgeTarget: tree.superEdgeTarget,
+      superEdgeFlow: tree.superEdgeFlow,
+    };
+    const message: MainToWorker = { type: "nested-prep", topology, params };
+    w.postMessage(message);
+  });
+  return {
+    solver,
+    cancel() {
+      cancelled = true;
+      worker?.terminate();
+    },
   };
 }
