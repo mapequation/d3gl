@@ -8,8 +8,9 @@
 // ({@link FrameBudget.bandsFor}: at most half of it, or all of it for a pass whose every band waits on a
 // long fragment), and each band is one work item; the budget admits a frame's items while their estimated
 // sum fits. The bound is on the estimates, and it has one limit: a band whose fixed cost alone passes
-// three quarters of the budget exceeds it however the pass is cut (the nested gather of a module past
-// ~12,000 children at 120 Hz, #380). A tick's items may span frames; a readback's run exclusively (no tick
+// three quarters of the budget exceeds it however the pass is cut (no pass of the GPU layout has one: the
+// nested collision bounds every fragment's work, #380; its longest work item costs ≤ 0.9 ms a band). A
+// tick's items may span frames; a readback's run exclusively (no tick
 // item between its first pass and its copy), then the copy — frames after the readback started, when the
 // budget holds its passes back, which is why the repaint throttle times a readback from its start.
 //

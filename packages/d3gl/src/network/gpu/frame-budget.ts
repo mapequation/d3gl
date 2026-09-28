@@ -18,8 +18,8 @@
 //   for 30 frames. Only that frame's lateness counts: the GPU runs work in order,
 //   so nothing queued after its fence can have delayed it. A miss changes nothing, and only blocks, when
 //   no lever can shorten the late frame — it encoded no item, or one item that cannot be cut finer (a pass
-//   bound by its fixed cost, like the nested gather of a huge module: fewer items per frame cannot shorten
-//   it, and would only slow every other pass; #382) — or when it is not the layout's own: an engine repaint
+//   bound by its fixed cost, a whole one-row pass or a band of a pass bound by its slowest fragment: fewer
+//   items per frame cannot shorten it, and would only slow every other pass; #382) — or when it is not the layout's own: an engine repaint
 //   ran on the GPU ahead of its items, in the late frame itself or in a frame that completed within the
 //   last n frames before it. Repaint draws are not layout work, and the repaint throttle already bounds
 //   them.
@@ -33,8 +33,9 @@
 //   is c, plus f that each band pays whatever its size, is cut into `⌈c / (budget / 2 − f)⌉` bands
 //   ({@link stageBands}; into bands of the whole budget when a half-budget band would carry more fixed
 //   than divisible work, f > budget / 4), so no band is estimated above half the budget — or above the
-//   budget, for such a pass. Past f > 0.75 · budget no band fits the budget whatever the slicing (the
-//   nested gather of a module past ~12,000 children at 120 Hz, #380), and that band alone overruns it.
+//   budget, for such a pass. Past f > 0.75 · budget no band fits the budget whatever the slicing, and that
+//   band alone overruns it (no pass of the GPU layout comes near: the nested collision's work items, bound
+//   by their longest item, pay ≤ 0.9 ms a band, #380).
 // - **Band growth.** `g` is one factor shared by every pass, for a GPU slower than the estimates: it
 //   scales the divisible estimate (`⌈g · c / (budget / 2 − f)⌉`), so a pass far below half the budget
 //   stays one band however slow the GPU, and it never cuts a pass into more bands than carry their fixed
@@ -168,8 +169,8 @@ export function bandTargetMs(budgetMs: number): number {
  *   needs. A pass with no fixed cost (the flat force pass) grows up to {@link MAX_BAND_GROWTH}×.
  *
  * At least 1 band, at most `rows` (a pass cannot be cut finer than its rows) and {@link MAX_BANDS}. The flat
- * force pass at a 10 ms budget: 325k → 3 bands, 1M → 8; at 5 ms (120 Hz), 1M → 16. The nested gather at 1M
- * (9 ms of work, 2.09 ms of tail per band): 4 bands at either rate, whatever the growth.
+ * force pass at a 10 ms budget: 325k → 3 bands, 1M → 8; at 5 ms (120 Hz), 1M → 16. The nested collision's
+ * work items at 1M (7.2 ms of work, 0.42 ms per band): 2 bands at 10 ms, 4 at 5 ms.
  */
 export function stageBands(costMs: number, budgetMs: number, rows: number, growth = 1, fixedMs = 0): number {
   const target = bandTargetMs(budgetMs);
