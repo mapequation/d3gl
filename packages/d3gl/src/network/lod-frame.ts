@@ -42,7 +42,7 @@ import {
   type MortonTopologyArrays,
   type MortonTopologySizes,
 } from "./lod.js";
-import { fitBox, fitNodes, fitTransform } from "./fit.js";
+import { layoutBox, layoutFitTransform } from "./fit.js";
 import {
   buildCoverRows,
   cutRowCells,
@@ -196,12 +196,15 @@ export interface StructureLODStream {
 /**
  * The view a spatial stream builds super-edge rows for (#433): what the main thread's LOD cut is called with
  * — so the worker cuts each rebuilt tree the same way and builds the rows of exactly the covers it will draw.
- * `transform: null` while the view follows the layout's fit, which the worker computes from each tree as the
- * engine does (`fitNodes` → `fitBox` → `fitTransform`). A view that has moved on only costs speed: the main
- * thread walks a cover the rows do not list through its leaves.
+ * `transform: null` while the camera follows the streaming layout's fit, which the worker computes from the
+ * frame's positions as the engine does (`layoutBox` without stragglers → `layoutFitTransform` padded by
+ * `fitPad`). A view that has moved on only costs speed: the main thread sums a cover the rows do not list
+ * from its leaves, once per tree.
  */
 export interface LODView {
   transform: { k: number; x: number; y: number } | null;
+  /** The drawn leaf radius the fit keeps inside the frame (world units, or screen pixels when screen-sized). */
+  fitPad: number;
   width: number;
   height: number;
   expandPx?: number;
@@ -222,7 +225,6 @@ export interface SpatialLinks {
   cut: CutScratch;
   /** The cut's cells the rows are built for ({@link cutRowCells}), grown to the largest cut. */
   cells: Uint32Array;
-  fit: Float32Array;
   pool: ArrayBuffer[];
 }
 
@@ -272,7 +274,7 @@ export interface SpatialEdges {
 export function makeSpatialLODStream(leafCount: number, style?: LeafStyle, styleVersion = -1, edges?: SpatialEdges, view?: LODView): SpatialLODStream {
   let links: SpatialLinks | null = null;
   if (edges && edges.source.length > 0) {
-    links = { graph: spatialRowsGraph(leafCount, edges), scratch: makeSpatialRowsScratch(), cut: makeCutScratch(), cells: new Uint32Array(256), fit: new Float32Array(64), pool: [] };
+    links = { graph: spatialRowsGraph(leafCount, edges), scratch: makeSpatialRowsScratch(), cut: makeCutScratch(), cells: new Uint32Array(256), pool: [] };
   }
   return { kind: "spatial", leafCount, box: undefined, scratch: makeMortonScratch(), bounds: makeLODBoundsScratch(), style: style ?? null, styleVersion: style ? styleVersion : -1, pool: [], built: -1, outstanding: 0, pending: false, links, view: view ?? null };
 }
@@ -364,7 +366,7 @@ export function lodFrameStep(stream: LODStream, positions: ArrayLike<number>, fr
   if (!style?.colors) views.color.fill(0); // a reused buffer holds the last frame's colours
   // The super-edge rows of the covers the main thread's view will draw (#433), into a pooled buffer.
   const links = stream.links;
-  const rows = links && stream.view && style?.links !== false ? coverRows(tree, stream.view, links) : undefined;
+  const rows = links && stream.view && style?.links !== false ? coverRows(tree, positions, stream.view, links) : undefined;
   return {
     header: {
       size: topology.size,
@@ -382,20 +384,18 @@ export function lodFrameStep(stream: LODStream, positions: ArrayLike<number>, fr
 
 /**
  * The super-edge rows of the covers `view`'s cut draws on `tree` (#433): the engine's cut, at the view's
- * transform — or, while it follows the fit, at the fit the engine computes from this tree — with the culled
+ * transform — or, while it follows the fit, at the fit the engine frames `positions` at — with the culled
  * roots recorded; its covers whose rows can matter ({@link cutRowCells}, with the drawn glyphs as the floor)
  * get one. O(drawn + culled) for the cut, then {@link buildCoverRows}: O(edges under those covers) ≤ 2E.
  */
-function coverRows(tree: LODTree, view: LODView, links: SpatialLinks): SpatialRowsFrame | undefined {
+function coverRows(tree: LODTree, positions: ArrayLike<number>, view: LODView, links: SpatialLinks): SpatialRowsFrame | undefined {
   const { parent, leafOrder, leafStart, leafEnd } = tree;
   if (!parent || !leafOrder || !leafStart || !leafEnd) return undefined;
   let t = view.transform;
   if (!t) {
-    const nodes = fitNodes(tree);
-    if (links.fit.length < nodes.length) links.fit = new Float32Array(nodes.length);
-    const box = fitBox(tree, nodes, links.fit);
+    const box = layoutBox(positions, tree.leafCount, { trimStragglers: true });
     if (!box) return undefined;
-    t = fitTransform(box, view.width, view.height);
+    t = layoutFitTransform(box, view.width, view.height, view.fitPad, view.screenSized);
   }
   const sc = links.cut;
   const drawn = cut(tree, t, view.width, view.height, {

@@ -374,7 +374,9 @@ per-file timeout. Every at-scale leg below now asserts. When you add a guard, ad
 | network no-LOD labels | — | `network/__tests__/label-candidates-perf.test.ts` | 100k | `BENCH_LABEL_CANDIDATES` |
 | network selection dim | — | `network/__tests__/selection-dim-perf.test.ts` | 100k | — |
 | node-drag (interaction) | — | `network/__tests__/lod-drag-incremental-perf.test.ts` | small | `BENCH_DRAG` |
+| node-drag, main-thread `force` tick (one per frame over **all** nodes; LOD-independent) | — | `network/__tests__/force-drag-tick-perf.test.ts` | 100k nodes / 200k edges | `BENCH_FORCE_DRAG` |
 | position transition frame (#328) | — | `network/__tests__/transition-perf.test.ts` | 100k, LOD on **and** off, vs a streamed layout frame | `BENCH_TRANSITION` |
+| streaming fit box, per streamed frame (#327) | — | `network/__tests__/fit-box-perf.test.ts` | 200k leaves (LOD-independent): clean disc in radial **and** shuffled order + 64 stragglers; exact, allocation-free | `BENCH_FIT_BOX` |
 | LOD super-edge **build** | — | `network/__tests__/super-edges-build.test.ts` | equivalence | `BENCH_SUPER_EDGES_BUILD` |
 | retained memory | — | `core/point-memory.bench.test.ts` | — | `BENCH_MEM` |
 | declutter allocation | — | `core/declutter-alloc.bench.test.ts` | — | — |
@@ -382,7 +384,7 @@ per-file timeout. Every at-scale leg below now asserts. When you add a guard, ad
 | declutter flags upload | **WebGL** | `map/declutter-flags-perf.browser.test.ts` | 2k engine / 1M fn | `PERF_BROWSER_N` (max 2M) |
 | hover overlay reuse | **WebGL** | `map/hover-overlay-perf.browser.test.ts` | 1000 glyphs / 125 hover changes | ✗ **deliberately unscaled** |
 | instanced pie | **WebGL** | `webgl/__tests__/instanced-pie-perf.browser.test.ts` | 100k | `PERF_BROWSER_N` |
-| GPU layout tick | **WebGL** | `network/gpu/__tests__/gpu-frame-budget-perf.browser.test.ts` | 30k | `PERF_BROWSER_N` (max 200k) |
+| GPU layout tick (+ #349 signatures: no draw of ≥ N vertices × instances into a 1×1 viewport, via any of the five WebGL2 draw calls; zero texture / framebuffer / buffer creation per tick) | **WebGL** | `network/gpu/__tests__/gpu-frame-budget-perf.browser.test.ts` | 30k | `PERF_BROWSER_N` (max 200k) |
 | React recolor vs build | **WebGL** | `react/perf.browser.test.ts` | 4096 | capped at 8192 — see below |
 | `"auto"` placeholder emit | Canvas→**WebGL** | `map/auto-placeholder-perf.browser.test.ts` | 200k edges / 200k points | `PERF_BROWSER_N` (max 611k) |
 | `"auto"` placeholder **paint** | Canvas→**WebGL** | same file, `#273` describe block | 30k geo polygons | `PERF_BROWSER_N` (max 120k) |
@@ -414,12 +416,19 @@ guard owns the serialize budget: one DOM node per drawable buys parse time, not 
 | **`plot()` engine sweep**, retained Scene | **WebGL** | `map/plot-engine-sweep-perf.browser.test.ts` | 50k ×2 layers | `PERF_BROWSER_N` (max 300k) |
 | **`network()` engine sweep**, LOD on **and** off, + held LOD view per link primitive (lines, directed lines + arrowheads, half-arrows: unchanged style columns re-emitted as the same arrays, endpoint-only upload) + declutter cost signature via `net.declutterStats` (probes/cells per glyph, scratch high-water) on the sweep and a dense mixed-radius all-leaves leg + the **spatial source** (#343: lazy links via `net.superEdgeStats`, held view 0 rows rebuilt / 0 incidences walked, same style columns, endpoint-only upload) | **WebGL** | `network/__tests__/network-sweep-perf.browser.test.ts` | 50k nodes / 50k edges | `PERF_BROWSER_N` (max 200k) |
 | **`network()` position transition** (#328), LOD on **and** off + the spatial source (#343), vs a streamed frame; count signature: **no `computeLODStyle` pass and no spatial tree build** on a transition frame (`lodStylePasses` / `mortonTopologyBuilds`), ≥ 1 per streamed frame | **WebGL** | `network/__tests__/network-transition-perf.browser.test.ts` | 100k nodes (the ON ratio needs the style pass to be a real share of the streamed frame — see the file) | `PERF_BROWSER_N` (max 200k) |
+| **`network()` node-drag, main-thread `force` backend** (real pointer drag: one tick + repaint per frame, re-cool stop), LOD on **and** off | **WebGL** | `network/__tests__/network-force-drag-perf.browser.test.ts` | 50k nodes / 100k edges | `PERF_BROWSER_N` (max 200k) |
 | **`network()` module boundaries** (#329), sweep on vs off + every module open | **WebGL** | `network/__tests__/network-module-boundary-perf.browser.test.ts` | 50k nodes | `PERF_BROWSER_N` (max 200k) |
+| **`network()` streaming fit** (#327), per streamed frame, fit on vs off at an equal view, LOD on **and** off; box once per frame, never on zoom frames or after release; no extra LOD cut or style resolution per fitted frame | **WebGL** | `network/__tests__/network-fit-stream-perf.browser.test.ts` | 50k nodes | `PERF_BROWSER_N` (max 200k) |
+| **`network()` programmatic `setTransform` with zoom enabled** (#309), LOD on **and** off: one re-cut + one Scene rebuild per call, no gesture boundary; zoom-free calls rebuild nothing | Canvas + SVG | `network/__tests__/network-vector-zoom-perf.browser.test.ts` | Canvas 20k / SVG 10k nodes | `PERF_BROWSER_N` (Canvas max 100k, SVG max 30k) |
+| **`network()` pan/zoom + node-drag INPUT** (#367): wheel, pan, drag and wheel+stream+drag bursts through the real d3-zoom / pointer listeners, LOD off, aggregate frontier **and** all leaves visible; no cut or render inside any handler, exactly one render + ≤1 cut per frame at the latest transform, handlers O(1) per event, the burst's frame ≤ 2× one event's (LOD-off pan/zoom frame: **count-only** — it only renders, and the render is counted; `network-sweep-perf` owns that draw's cost) | **WebGL** (draw counted, not rasterised — see below) | `network/__tests__/network-input-coalesce-perf.browser.test.ts` | 250k nodes / 748k edges, whole graph in view | `PERF_BROWSER_N` (max 250k) |
 | multi pass-through: FBO count + gesture skip | **WebGL** | `map/passthrough-multi-perf.browser.test.ts` | 25k ×2 layers | `PERF_BROWSER_N` (max 50k) |
 | label placement (`cullLabels`) | — | `labels/__tests__/label-cull-perf.test.ts` | 200k candidates, dense **and** spread | `BENCH_LABEL_CULL` |
 | **`network.labels()` per-frame**, LOD on **and** off, + capped LOD top-k (`importanceOf` once per candidate) | **WebGL** | `network/__tests__/network-labels-perf.browser.test.ts` | 20k nodes, uncapped + `max: 50` | `PERF_BROWSER_N` (max 50k) |
 
-**Known holes, tracked:** geo's at-scale leg is Canvas-only (#264). *(Closed: #263 — the at-scale
+**Known holes, tracked:** geo's at-scale leg is Canvas-only (#264). The GPU layout tick guard is capped
+at `PERF_BROWSER_N` ≤ 200k (a SwiftShader 1M tick would spend the tier's 300 s per-file budget), so the
+≈1M tick §5 asks for is measured only by hand on real hardware (#333); the #349 draw signature is exact
+at any N and is the automated part. *(Closed: #263 — the at-scale
 legs used to drive **backends** only, leaving accessors / lane emit / LOD integration covered at
 engine level only at N ≤ 5000. The three `*-sweep-perf.browser.test.ts` rows above now drive each
 engine's public entry point through the real `setTransform` at `PERF_BROWSER_N`.)*
@@ -441,6 +450,13 @@ place" an assertion about the fake, and a node fake *canvas* is precisely the se
   at 0 and every accessor count stayed flat. Assert it as a **ratio of the registration upload**
   (`< registration / 1000`), not `toBe(0)`, so a future per-frame uniform write isn't a false
   positive while any geometry re-upload is 1000× over.
+- **Local headless Chromium rasterises on SwiftShader** (its GPU process runs `--use-angle=swiftshader-webgl`),
+  so drawing a ≈1M-instance frame costs **seconds** there and every later draw queues behind it: a guard that
+  renders a 1M-drawable scene a few dozen times stalls for minutes (#367 measured 15-45 s idle waits between
+  bursts, and a hook timeout at 490 s), without any of that being CPU work the guard is about. A guard whose
+  subject is CPU-side work at ≈1M may **count** `render()` in its probe subclass instead of submitting it
+  (`network-input-coalesce-perf`), as long as it asserts the render count and another guard owns the real
+  draw's CPU cost (`network-sweep-perf`).
 - **Never build a second WebGL engine in the same file after a large one.** Constructing a second
   engine once a first has uploaded a ~100k-node graph stalls `whenReady()` for **9–12 s** on local
   headless Chromium (measured 24 ms → 12,168 ms → 9,251 ms → 20 ms across four sequential engines);
@@ -476,6 +492,27 @@ are never given slack by either knob.
 sets it to `$PERF_N` — do **not** hard-code, two benches used to and silently ignored the tier),
 assert the deterministic signature *unconditionally*, and put the wall-clock ceiling behind
 `PERF_ASSERT` with an env override. See `frontier-perf.test.ts` for the shape.
+
+## GPU layout: reduce with a gather tree, never a 1-texel scatter (#349)
+
+**Never reduce over all N nodes by scattering N points into one texel** with ADD or MAX blending.
+The blend unit serialises on that texel. The GPU force layout used to find its centroid and its
+bounding box this way: 17.3 ms + 18.8 ms of a 43-46 ms tick at 325k nodes on an M1 Max (53 + 57 of
+136-141 ms at 1M). Use the segmented reduction instead (`network/gpu/passes/segmented-reduce.ts`). It is
+a 16-ary gather tree over slot order, with pairwise adds and no blending, plus a canonical-cover range
+query per segment. It writes the segment table's `stats` (Σx, Σy, Σ|v|, count) and `box`. It costs
+0.46 ms at 325k (0.7 ms at 1M), and it is also more accurate: at 1M an offset layout's centroid is
+off by 5.5e-4 world units, where a serial float32 chain is off by ~130.
+
+- The guard is the draw spy in `gpu-frame-budget-perf.browser.test.ts`: any draw of ≥ N vertices
+  (instances counted, any mode, any of `drawArrays` / `drawArraysInstanced` / `drawElements` /
+  `drawElementsInstanced` / `drawRangeElements`) into a 1×1 viewport fails it. The SwiftShader
+  wall-clock ceiling cannot see this regression, because it only doubles a 30k tick there.
+- **Writing a sub-rectangle of a packed texture** (the tree levels share two textures): open the pass
+  with `beginPass(device, { framebuffer, clear: false, viewport })` from `network/gpu/passes/fullscreen.ts`.
+  luma's default clear wipes the **whole** attachment, because `gl.clear` ignores the viewport (only a
+  scissor limits it). `beginPass` takes the clear as a required argument, so no call site can get the
+  default by omission.
 
 ## Host sizing: backend canvases are OUT OF FLOW (#39, re-confirmed in #273)
 
@@ -523,6 +560,34 @@ backend sees it. Consequences to keep in mind:
 - Adding a per-call rebuild back into any of these is a push-path regression, guarded by
   `core/__tests__/vector-view-perf.test.ts` (1M, ×20 pushes) and
   `map/push-layers-perf.browser.test.ts` (the real `pushLayers`, on Canvas and WebGL).
+
+## Continuous input draws once per animation frame (#367)
+
+A wheel burst, a pan's mouse moves and a node drag's pointer moves can deliver several events inside one
+frame, and a network frame at scale (LOD cut + declutter + super-edge gather + render) costs tens to
+hundreds of ms. So **no continuous-input handler draws**: `BaseEngine`'s d3-zoom handler records the latest
+transform, a subclass records what moved and calls `requestRedraw()`, and ONE engine frame
+(`runFrame`) draws the latest transform and the subclass's `drawFrame()` together — one lane emit, one
+render, however many events and sources (a streamed layout frame included) were pending. Rules that keep it
+correct:
+
+- **The drawn state is what `pick` answers against.** `this.transform` and each lane's `visible` set move
+  only when a frame draws, so a pick between an event and its frame hits what is on screen.
+- **A programmatic view change draws at once** and drops a pending gesture transform (the latest wins). The
+  drop lives in `syncZoomToView()`: once d3-zoom is re-seeded to the current view, a transform it reported
+  earlier is stale, so a subclass that sets the view directly (the network's streaming fit) drops it too.
+- **A gesture frame that draws with a redraw skips `setTransform`** (the subclass's `drawFrame()` renders), so
+  put what every view change must do to subclass state in an `adoptTransform()` override, not a
+  `setTransform` one (the network releases a streaming fit there), and have `drawFrame()` re-emit every
+  dynamic lane it owns and re-place its labels.
+- **Map the pointer through `latestTransform()`**, not `this.transform`, where input places something in world
+  space (a drag move between a wheel tick and that tick's frame); `pick` and a grab's hit use the drawn view.
+- **Draw, don't defer, where you already are in a frame or must settle**: a d3-zoom transition tick (its
+  source is the `dblclick`), a subclass's own rAF loop (a position transition, a force-drag tick) and a
+  gesture's `end` call `flushFrame()`, which draws what is pending right now instead of a frame late.
+- **Withdraw a request whose state is gone** (`withdrawRedraw()`, e.g. a halted layout's streamed frame).
+- Guards: `map/zoom-coalesce.browser.test.ts` (base engine), `network/__tests__/network-input-coalesce.browser.test.ts`
+  (WebGL/Canvas/SVG) and the ≈1M per-frame guard `network-input-coalesce-perf.browser.test.ts`.
 
 ## Pass-through layers share ONE accumulation surface (#110)
 

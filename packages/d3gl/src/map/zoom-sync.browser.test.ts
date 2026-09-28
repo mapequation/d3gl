@@ -1,6 +1,9 @@
 import { describe, it, expect } from "vitest";
 import { zoomTransform } from "d3-zoom";
-import { plot } from "./plot.js";
+import { geoEquirectangular, geoMercator } from "d3-geo";
+import { plot, Plot, type PlotOptions } from "./plot.js";
+import { geoMap } from "./geo-map.js";
+import type { ViewTransform } from "../core/index.js";
 
 /**
  * Programmatic `setTransform` must carry d3-zoom's internal transform with it (#202).
@@ -87,6 +90,84 @@ describe("programmatic setTransform keeps the zoom gesture in step (#202)", () =
     expect(syncs - afterEnable - duringGesture).toBe(1);
 
     chart.destroy();
+    el.remove();
+  });
+});
+
+/** Counts gesture boundaries on the base engine (the hook every engine's gesture side effects hang off). */
+class BoundaryPlot extends Plot {
+  boundaries = 0;
+  constructor(host: HTMLElement, opts: PlotOptions) {
+    super(host, opts);
+  }
+  protected override setInteracting(v: boolean): void {
+    this.boundaries++;
+    super.setInteracting(v);
+  }
+}
+
+describe("a programmatic view change is not a gesture (#309)", () => {
+  it("enableZoom's seed and a programmatic setTransform run no gesture boundary; a wheel does", async () => {
+    const el = host();
+    const chart = new BoundaryPlot(el, { width: 240, height: 180, backend: "webgl" });
+    await chart.whenReady();
+    chart.points("pts", [{ x: 0, y: 0 }, { x: 50, y: 50 }], { x: (d) => d.x, y: (d) => d.y, radius: 4, fill: "#333" });
+    chart.enableZoom([0.5, 40]);
+    expect(chart.boundaries, "enableZoom's own seed ran a gesture boundary").toBe(0);
+
+    chart.setTransform({ k: 4, x: -120, y: -60 });
+    chart.setTransform({ k: 2, x: -30, y: -15 });
+    expect(chart.boundaries, "a programmatic setTransform ran a gesture boundary").toBe(0);
+    expect(gestureTransform(el)).toEqual({ k: 2, x: -30, y: -15 }); // still re-seeded (#202)
+
+    const r = el.getBoundingClientRect();
+    el.dispatchEvent(new WheelEvent("wheel", { clientX: r.left + 120, clientY: r.top + 90, deltaY: -60, bubbles: true, cancelable: true }));
+    expect(chart.boundaries, "a real wheel gesture must still start a gesture").toBe(1);
+    await until(() => chart.boundaries === 2); // d3-zoom ends a wheel gesture once it goes idle (150 ms)
+    expect(chart.boundaries).toBe(2);
+
+    chart.destroy();
+    el.remove();
+  });
+});
+
+/** Wait (bounded) until `done()` holds — for d3-zoom's wheel-idle end, whose timer runs late under load. */
+async function until(done: () => boolean, maxMs = 5000): Promise<void> {
+  const t0 = performance.now();
+  while (!done() && performance.now() - t0 < maxMs) await new Promise((res) => setTimeout(res, 20));
+}
+
+describe("onTransform keeps an overlay in step with the view (#309)", () => {
+  it("enableZoom reports the view it seeds from once; a programmatic setTransform is not reported", async () => {
+    const el = host();
+    const chart = plot(el, { width: 240, height: 180, backend: "webgl" });
+    await chart.whenReady();
+    chart.points("pts", [{ x: 0, y: 0 }, { x: 50, y: 50 }], { x: (d) => d.x, y: (d) => d.y, radius: 4, fill: "#333" });
+    chart.setTransform({ k: 2, x: -30, y: -15 });
+
+    const seen: ViewTransform[] = [];
+    chart.enableZoom([0.5, 40], (t) => seen.push({ ...t }));
+    expect(seen, "an overlay synced through onTransform never learned the view it starts from").toEqual([{ k: 2, x: -30, y: -15 }]);
+
+    chart.setTransform({ k: 4, x: -120, y: -60 });
+    expect(seen).toHaveLength(1);
+
+    chart.destroy();
+    el.remove();
+  });
+
+  it("geoMap.setProjection tells onTransform about the view reset", async () => {
+    const el = host();
+    const map = geoMap(el, { width: 240, height: 180, projection: geoEquirectangular().scale(40).translate([120, 90]), backend: "canvas" });
+    await map.whenReady();
+    const seen: ViewTransform[] = [];
+    map.enableZoom([0.5, 40], (t) => seen.push({ ...t }));
+    map.setTransform({ k: 3, x: -200, y: -100 });
+
+    map.setProjection(geoMercator().scale(40).translate([120, 90]));
+    expect(seen.at(-1), "an overlay kept the pre-projection view after setProjection reset it").toEqual({ k: 1, x: 0, y: 0 });
+
+    map.destroy();
     el.remove();
   });
 });

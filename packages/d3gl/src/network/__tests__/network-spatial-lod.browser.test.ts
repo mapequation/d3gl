@@ -125,34 +125,37 @@ describe("lod({ source: 'spatial' }) (#343)", () => {
   // build in this realm (the worker's builds never touch its counter).
   it("streamed repaints gather links from the worker's rows: no leaf-run walk and no main-thread row build per frame", async () => {
     const { net, host } = makeNet();
-    await net.whenReady();
-    const g = webLike(20_000);
     const installed = window.requestAnimationFrame;
-    const samples: { visits: number; entries: number; misses: number }[] = [];
-    window.requestAnimationFrame = (callback: FrameRequestCallback): number =>
-      installed.call(window, (t: number) => {
-        callback(t);
-        const stats = net.superEdgeStats;
-        if (stats && net.lodSource === "worker") samples.push({ visits: stats.visits, entries: stats.entries, misses: stats.misses });
-      });
-    const builds0 = spatialRowBuilds;
     try {
+      await net.whenReady();
+      const g = webLike(20_000);
+      // Every animation frame drawn while the layout streams (the settle reframes to the exact box, a view
+      // the last streamed tree's rows were not cut for: its missing rows are summed once, then kept).
+      let settled = false;
+      const samples: { visits: number; entries: number; misses: number }[] = [];
+      window.requestAnimationFrame = (callback: FrameRequestCallback): number =>
+        installed.call(window, (t: number) => {
+          callback(t);
+          const stats = net.superEdgeStats;
+          if (!settled && stats && net.lodSource === "worker") samples.push({ visits: stats.visits, entries: stats.entries, misses: stats.misses });
+        });
+      const builds0 = spatialRowBuilds;
       net.data(g).style({ sizeMode: "screen", nodeRadius: 3 }).lod({ source: "spatial", maxAggregateRadius: 18 }).layout({ backend: "worker", iterations: 60, fit: true });
-      await net.whenSettled();
+      await net.whenSettled().then(() => { settled = true; });
+      expect(samples.length, "no repaint drew a worker tree").toBeGreaterThan(3);
+      for (const [i, s] of samples.entries()) {
+        expect(s.visits, `streamed repaint ${i} of ${samples.length} walked leaf runs`).toBe(0);
+        expect(s.misses).toBe(0);
+        expect(s.entries).toBeGreaterThan(0);
+      }
+      expect(spatialRowBuilds - builds0, "rows built on the main thread").toBe(0);
+      // Every edge under the frontier is what the lazy gather would have walked: the rows read are far fewer.
+      expect(Math.max(...samples.map((s) => s.entries))).toBeLessThan(g.csr.neighbors.length);
     } finally {
       window.requestAnimationFrame = installed;
+      net.destroy();
+      host.remove();
     }
-    expect(samples.length, "no repaint drew a worker tree").toBeGreaterThan(3);
-    for (const s of samples) {
-      expect(s.visits, "a streamed repaint walked leaf runs").toBe(0);
-      expect(s.misses).toBe(0);
-      expect(s.entries).toBeGreaterThan(0);
-    }
-    expect(spatialRowBuilds - builds0, "rows built on the main thread").toBe(0);
-    // Every edge under the frontier is what the lazy gather would have walked: the rows read are far fewer.
-    expect(Math.max(...samples.map((s) => s.entries))).toBeLessThan(g.csr.neighbors.length);
-    net.destroy();
-    host.remove();
   }, 60_000);
 
   it("carries a selected aggregate over to the same cell while the worker rebuilds the tree", async () => {

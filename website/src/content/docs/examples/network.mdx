@@ -28,9 +28,17 @@ layout is seeded by **multilevel coarsening**: the graph is collapsed into a hie
 ever-smaller graphs (each node merged with a neighbour, hubs and their leaves absorbed together so
 power-law graphs still shrink geometrically), the tiny coarsest one is laid out first, and positions
 are projected back down and refined — far faster convergence and fewer tangles than a cold start.
-With `layout({ backend: "worker" })` the entire solve runs in a **Web Worker** and streams positions
-back, so the layout **converges progressively on screen** while the main thread stays responsive —
-pan and zoom while it settles. (On a cross-origin-isolated page positions are shared zero-copy via
+Every level is laid out at the force model's own equilibrium scale (a disc of radius
+`√(repulsion·N/centering)`; coarse nodes weigh as many nodes as they stand for), so the refinement
+starts where it will end up — no blow-up past the final extent, no collapse. With
+`layout({ backend: "worker" })` the entire solve runs in a **Web Worker** and streams positions
+back — a frame about every display frame — so the layout **converges progressively on screen** while
+the main thread stays responsive; pan and zoom while it settles. A multilevel-seeded CPU layout
+(`worker` or `force`) cools over its `iterations` budget and **stops once it has converged**, so there
+`iterations` is a safety cap and the length of the cooling (a larger budget cools more slowly), not a
+tick count to hit. The GPU layout has no early stop yet (it runs its whole budget) and a cold start
+keeps full heat until it settles on its own, so the example gives those two a budget that shrinks as
+the graph grows. (On a cross-origin-isolated page positions are shared zero-copy via
 `SharedArrayBuffer`; otherwise they are posted as snapshots — the top-right readout shows whether the
 environment supports it and whether this layout is actually using it.) The **Nodes** slider scales from 10 to
 1,000,000; **Seeding** compares multilevel against a cold start; **Size** switches uniform vs
@@ -151,8 +159,9 @@ The **Sizing** toggle switches `sizeMode`. In **screen** mode the link decoratio
 bend, node radii) stay a constant pixel size as you zoom while the nodes still move — the navigation
 register LOD wants. Screen-mode half-arrows are recomputed per frame on the WebGL lane; for SVG/Canvas
 the shape is *baked* into world coords at the current zoom (a retained backend can't recompute a shape
-spanning two moving anchors per frame), refreshed automatically on backend switch and at the end of a
-pan/zoom — call `net.syncScreenGeometry()` to refit on demand (e.g. before a programmatic export).
+spanning two moving anchors per frame), refreshed automatically on backend switch, at the end of a
+pan/zoom, and after a `setTransform` while zoom is enabled — call `net.syncScreenGeometry()` to refit on
+demand (e.g. before a programmatic export).
 
 <ExampleCard files={["flow-borders/draw.ts", "flow-borders/data.ts"]}>
   <FlowBorders client:visible slot="demo" />
@@ -212,10 +221,12 @@ What it composes:
   visible when zoomed out). LOD pairs naturally with `"screen"`.
 
 The geometry tracks the layout *as it converges* (LOD helps during the solve, not just after), while
-panning and zooming only re-run the cheap cut. On the **WebGL** lane the cut re-runs live every frame.
+panning and zooming only re-run the cheap cut. On the **WebGL** lane the cut re-runs live every frame —
+once per animation frame, however many wheel or pan events arrive in it (the latest view wins).
 On the **Canvas/SVG** backends the same frontier draws as retained geometry — but a retained backend
 can't re-tessellate per frame, so there the frontier is static during a gesture and re-cuts when it
-ends (call `syncScreenGeometry()` to re-cut at a chosen zoom before a programmatic export).
+ends, or after a `setTransform` while zoom is enabled (call `syncScreenGeometry()` to re-cut at a chosen
+zoom before a programmatic export).
 
 `toSVG()` **exports a level-of-detail map on every backend**: on Canvas/SVG from that retained
 frontier, and on WebGL from a vector view of the lane's current emit, built at export time only.
@@ -226,10 +237,17 @@ streams the tree once plus its aggregate geometry each frame. The main thread th
 runs the per-frame O(N) geometry pass; it only fills the style geometry once and runs the
 on-screen-bounded cut. That keeps the main thread free as the network scales toward millions of nodes.
 
+This holds on a brand-new engine too. Before any layout has run, `lod()` can't know which backend comes
+next, so it leaves its own main-thread build to the end of the current call chain: the worker layout
+that follows wins, and any other path (no layout, `positions`, `force`, `gpu`) still has its tree
+before the next frame. On those paths a call that needs the tree right away — `pick()`, `select()`,
+`highlight()`, `toSVG()` — builds it at once. Until the worker's tree arrives nothing is drawn, so
+nothing is labelled.
+
 ```js
 net
   .lod({ expandPx: 48, maxAggregateRadius: 26 }) // configure LOD first…
-  .layout({ backend: "worker", iterations }); // …so the worker builds + streams the tree
+  .layout({ backend: "worker" }); // …so the worker builds + streams the tree
 ```
 
 ### Spatial LOD: grouping by position
@@ -483,9 +501,9 @@ different weight. The **Nodes** slider resizes the generated network (500 → 20
 The layout is the **module-aware GPU seed**: the module hierarchy is supplied with the graph,
 `data(graph, { modules })`, so `layout({ backend: "gpu" })` seeds the WebGL2 Barnes-Hut solve
 **top-down over the module tree** in every LOD mode — modules (including the ragged, deeper-nested
-super-modules) lay out as coherent regions. Because the GPU solve streams frames, `fit: true` keeps the camera framed on the layout as it converges (centroid
-→ view centre, extent → the view), so the map opens framed and settles in place rather than piling at the
-origin. It releases to normal zoom/pan once it settles.
+super-modules) lay out as coherent regions. Because the GPU solve streams frames, `fit: true` keeps the camera framed on the layout as it converges (the nodes'
+bounding box → the view), so the map opens framed and settles in place rather than piling at the
+origin. It releases to normal zoom/pan once it settles — or as soon as you zoom or pan.
 
 The **Layout** control switches to the **nested** module layout (`layout({ nested })`): each module's
 children are laid out inside its own disc, arranged by their sibling links, so every module stays a
@@ -674,12 +692,14 @@ What moves depends on what you grab:
   leaves. (`members()` enumerates exactly those leaves, the same set selection uses.)
 
 The held node tracks the cursor with **no lag** on every backend, because the held positions are written on
-the **main thread** each pointer move — the layout backend only reflows *the rest*:
+the **main thread** each pointer move — the layout backend only reflows *the rest*. The redraw itself (the
+LOD update, the cut and the render) runs once per animation frame, together with any zoom or streamed layout
+frame that lands in it, however fast the pointer moves:
 
 | `layout({ backend })` | While dragging | On release |
 | --- | --- | --- |
-| `force` (main thread) | a pinned [`ForceLayout`](#large-scale-layout-in-a-web-worker) reheats neighbours each frame | re-cools over a short tail, then stops |
-| `worker` (off thread) | the worker **pins** the held set and reflows the rest off-thread; the main thread holds them under the cursor | the worker is **unpinned** and re-cools |
+| `force` (main thread) | a pinned [`ForceLayout`](#large-scale-layout-in-a-web-worker) reheats neighbours each frame | re-cools until converged (at most a short tail), then stops |
+| `worker` (off thread) | the worker **pins** the held set and reflows the rest off-thread; the main thread holds them under the cursor | the worker is **unpinned** and re-cools until converged |
 | `gpu` (on the GPU) | the GPU layout **pins** the held set (skipped by the integrate pass) and reflows the rest on-GPU; the main thread holds them under the cursor | the layout is **unpinned** and re-cools |
 | `positions` (fixed coords) | the held set simply **translates** (no simulation to reheat) | — |
 

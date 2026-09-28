@@ -38,8 +38,9 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
       // the engine re-places them on every pan/zoom + layout frame — no manual overlay/transform tracking.
       // The built-in label style (dark 11px sans-serif + white halo) covers every backend, export included.
       .labels({ labelOf: (id) => names?.[id] ?? null, offset: [7, -4] })
-      // The worker seeds a viewport-centred disc, so this opens framed at k=1 as it converges — no fit
-      // needed here (fit is for the solvers that centre elsewhere, e.g. the GPU origin — see network/state).
+      // The worker seeds a disc centred on the viewport at the layout's own final scale (radius ≈ 32·√N at
+      // the default forces), so a small network like the sample opens framed at k=1 and converges in place.
+      // For large files add `fit: true` to keep the camera framed on the layout (see the network example).
       .layout({ backend: "worker", iterations: 300 });
   };
 

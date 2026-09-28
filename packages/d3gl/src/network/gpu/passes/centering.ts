@@ -1,159 +1,55 @@
-import type { Device, Texture, Framebuffer, RenderPass } from "@luma.gl/core";
-import { Model } from "@luma.gl/engine";
-
-// ─────────────────────────────────────────────────────────────────────────────
-// CentroidReducePass
-// ─────────────────────────────────────────────────────────────────────────────
-//
-// Scatter-reduces all node positions into a single 1×1 rg32float texel via
-// additive blending. Draws exactly `count` POINT primitives; each uses
-// gl_VertexID to look up its own position, outputs gl_Position = (0,0,0,1)
-// (so every point lands in the same pixel), and writes the position as a
-// fragment color. Additive blend accumulates the sum of all positions into
-// the single 1×1 target. Padded texels beyond nodeCount are never emitted
-// because the draw call issues only `count` vertices.
-//
-// TODO(N8.5 budget): if 1px-blend centroid reduction is a bottleneck at 1M
-// nodes, switch to a log-depth mip halving reduction.
-
-const REDUCE_VS = /* glsl */ `\
-#version 300 es
-precision highp float;
-precision highp sampler2D;
-uniform highp sampler2D u_pos;
-uniform int u_width;
-
-flat out vec2 v_pos;
-
-void main() {
-  int id = gl_VertexID;
-  ivec2 c = ivec2(id % u_width, id / u_width);
-  v_pos = texelFetch(u_pos, c, 0).xy;
-  gl_Position = vec4(0.0, 0.0, 0.0, 1.0);
-  gl_PointSize = 1.0;
-}
-`;
-
-// NOTE: output must be vec4 even for rg32float target; some WebGL2 drivers
-// require the FS output type to match the attachment's channel count. We write
-// (x, y, 0, 0) and only the RG channels are blended into the rg32float target.
-// The `flat` qualifier is mandatory for integer types but also avoids any
-// interpolation artefacts on point primitives.
-const REDUCE_FS = /* glsl */ `\
-#version 300 es
-precision highp float;
-
-flat in highp vec2 v_pos;
-out vec4 o_sum;
-
-void main() {
-  o_sum = vec4(v_pos, 0.0, 1.0);
-}
-`;
-
-/** Uniforms consumed by the centroid reduce pass. */
-export interface CentroidReduceUniforms {
-  /** Number of real nodes (not padded). */
-  count: number;
-  /** Atlas width of the positions texture. */
-  width: number;
-}
-
-/**
- * Scatter-reduces all node positions into a 1×1 rg32float sum texture via
- * additive blending.  The caller must clear the 1×1 target to zero before
- * calling run(), then divide by nodeCount in the CenteringPass to get the
- * centroid.
- *
- * Draw topology is "point-list"; vertexCount = nodeCount so padded texels
- * are never sampled.
- */
-export class CentroidReducePass {
-  private readonly model: Model;
-  private readonly uniforms: Record<string, number>;
-
-  constructor(device: Device) {
-    this.uniforms = {
-      u_width: 1,
-    };
-
-    this.model = new Model(device, {
-      vs: REDUCE_VS,
-      fs: REDUCE_FS,
-      topology: "point-list",
-      vertexCount: 1,   // overridden in run() via uniforms + actual count
-      uniforms: this.uniforms,
-      parameters: {
-        // Additive blend: accumulate all position vectors into one texel.
-        blend: true,
-        blendColorSrcFactor: "one",
-        blendColorDstFactor: "one",
-        blendAlphaSrcFactor: "one",
-        blendAlphaDstFactor: "one",
-        blendColorOperation: "add",
-        blendAlphaOperation: "add",
-      },
-    });
-  }
-
-  /**
-   * Draw `count` points into an already-open render pass backed by the 1×1
-   * sum FBO (which the caller must have cleared to zero). After this call the
-   * single 1×1 texel holds Σ(pos[i]).
-   */
-  run(pass: RenderPass, posTex: Texture, u: CentroidReduceUniforms): void {
-    this.uniforms["u_width"] = u.width;
-    this.model.setBindings({ u_pos: posTex });
-    // Mutate vertexCount so Model draws exactly count points.
-    this.model.setVertexCount(u.count);
-    this.model.draw(pass);
-  }
-
-  destroy(): void {
-    this.model.destroy();
-  }
-}
+import type { Device, Texture, RenderPass } from "@luma.gl/core";
+import type { Model } from "@luma.gl/engine";
+import { SLOT_TEXEL_GLSL } from "../textures.js";
+import { ADDITIVE_BLEND, fullScreenModel, type PassUniforms } from "./fullscreen.js";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // CenteringPass
 // ─────────────────────────────────────────────────────────────────────────────
 //
-// Full-screen triangle pass over nodes. For each node reads the 1×1 sum
-// texel, divides by nodeCount to get the centroid, and writes
-//   o_force = centering * (centroid − pos_i)
-// into the force texture with additive blend (accumulates alongside
-// repulsion + attraction). Padded texels are discarded.
-
-const CENTER_VS = /* glsl */ `\
-#version 300 es
-in vec2 a_clip;
-void main() { gl_Position = vec4(a_clip, 0.0, 1.0); }
-`;
+// Full-screen triangle pass over nodes. Each node reads its segment's statistics from the segment
+// table — `stats = (Σx, Σy, Σ|v|, count)`, written this tick by the range query of
+// {@link SegmentedReduce} — and its segment's centering strength from `param.y`, and writes
+//   o_force = centering * (Σpos / max(count, 1) − pos_i)
+// into the force texture with additive blend (accumulating alongside repulsion + attraction).
+// Padded texels are discarded.
+//
+// The flat layout has one segment, so the segment id is a compile-time constant and every node
+// reads texel (0, 0) of the 1×1 table textures.
 
 // NOTE: `centroid` is a GLSL ES 3.00 reserved keyword — do not use as a variable
 // name. Use `cx` (centroid x/y pair) or another non-keyword identifier.
 const CENTER_FS = /* glsl */ `\
 #version 300 es
 precision highp float;
+// Not optional: a fragment shader's defaults are lowp sampler2D and mediump int, and u_segStats
+// carries raw sums (|Σx| up to N·max|x|, ~4e9 at 325k) while slot ids and u_count exceed mediump's 2^15.
+precision highp int;
+precision highp sampler2D;
 
-uniform sampler2D u_pos;
-uniform sampler2D u_sum;   // 1×1 rg32float holding Σ pos
+uniform highp sampler2D u_pos;
+uniform highp sampler2D u_segStats;  // (Σx, Σy, Σ|v|, count) per segment
+uniform highp sampler2D u_segParam;  // (repulsion, centering, softening, alpha0) per segment
 uniform int   u_count;
 uniform int   u_width;
-uniform float u_centering;
 layout(location = 0) out vec2 o_force;
+${SLOT_TEXEL_GLSL}
+// Single segment (the flat layout): every slot belongs to segment 0.
+const ivec2 SEGMENT = ivec2(0, 0);
 
 void main() {
   ivec2 c = ivec2(gl_FragCoord.xy);
-  int id = c.y * u_width + c.x;
+  int id = texelSlot(c, u_width);
   if (id >= u_count) { discard; }
 
   vec2 pos_i = texelFetch(u_pos, c, 0).xy;
-  vec2 sumPos = texelFetch(u_sum, ivec2(0, 0), 0).xy;
-  // cx = centroid position. ('centroid' is a GLSL reserved keyword — avoid it.)
-  vec2 cx = sumPos / float(u_count);
+  vec4 stats = texelFetch(u_segStats, SEGMENT, 0);
+  float centering = texelFetch(u_segParam, SEGMENT, 0).y;
+  // cx = the segment's centroid ('centroid' is a GLSL reserved keyword — avoid it). max(count, 1):
+  // an empty segment yields a zero centroid, never NaN.
+  vec2 cx = stats.xy / max(stats.w, 1.0);
 
-  o_force = u_centering * (cx - pos_i);
+  o_force = centering * (cx - pos_i);
 }
 `;
 
@@ -161,96 +57,44 @@ void main() {
 export interface CenteringUniforms {
   count: number;
   width: number;
-  centering: number;
+}
+
+/** The segment-table textures the centering pass reads. */
+export interface CenteringSegments {
+  /** `(Σx, Σy, Σ|v|, count)` per segment — this tick's range-query output. */
+  stats: Texture;
+  /** `(repulsion, centering, softening, alpha0)` per segment. */
+  param: Texture;
 }
 
 /**
- * Full-screen triangle centering force pass.  Reads the 1×1 sum texture
- * produced by {@link CentroidReducePass}, computes the centroid, and writes
- *   centering * (centroid − pos_i)
- * into the force texture with additive blend.
- *
- * This pass must be run AFTER CentroidReducePass (which populates the 1×1
- * sum texture) and INSIDE the same force-accumulation render pass (additive
- * blend into forceTex).
- *
- * However: the centroid reduce uses a 1×1 target (the sum FBO) while this
- * pass uses the full-size force FBO.  They are different render passes with
- * different framebuffers, so the centroid reduce runs first (separate pass,
- * separate FBO), then the force render pass is (re-)opened and this centering
- * pass draws into it.
+ * Full-screen triangle centering force pass. Reads the segment table's `stats` (produced this tick
+ * by the range query) and centering strength, and writes `centering * (centroid − pos_i)` into the
+ * force texture with additive blend. Runs INSIDE the force-accumulation render pass, after the
+ * range query's own pass has been submitted.
  */
 export class CenteringPass {
   private readonly model: Model;
-  private readonly uniforms: Record<string, number>;
+  private readonly uniforms: PassUniforms;
 
   constructor(device: Device) {
-    const clipBuf = device.createBuffer({
-      data: new Float32Array([-1, -1, 3, -1, -1, 3]),
-    });
-
     this.uniforms = {
       u_count: 0,
       u_width: 1,
-      u_centering: 0,
     };
-
-    this.model = new Model(device, {
-      vs: CENTER_VS,
-      fs: CENTER_FS,
-      topology: "triangle-list",
-      vertexCount: 3,
-      attributes: { a_clip: clipBuf },
-      bufferLayout: [{ name: "a_clip", format: "float32x2" }],
-      uniforms: this.uniforms,
-      parameters: {
-        // Additive blend: accumulate alongside repulsion + attraction.
-        blend: true,
-        blendColorSrcFactor: "one",
-        blendColorDstFactor: "one",
-        blendAlphaSrcFactor: "one",
-        blendAlphaDstFactor: "one",
-        blendColorOperation: "add",
-        blendAlphaOperation: "add",
-      },
-    });
+    // Additive blend: accumulate alongside repulsion + attraction.
+    this.model = fullScreenModel(device, CENTER_FS, this.uniforms, ADDITIVE_BLEND);
   }
 
   /** Draw centering forces into an already-open force-accumulation render pass. */
-  run(
-    pass: RenderPass,
-    posTex: Texture,
-    sumTex: Texture,
-    u: CenteringUniforms,
-  ): void {
+  run(pass: RenderPass, posTex: Texture, segments: CenteringSegments, u: CenteringUniforms): void {
     this.uniforms["u_count"] = u.count;
     this.uniforms["u_width"] = u.width;
-    this.uniforms["u_centering"] = u.centering;
-    this.model.setBindings({ u_pos: posTex, u_sum: sumTex });
+    this.model.setBindings({ u_pos: posTex, u_segStats: segments.stats, u_segParam: segments.param });
     this.model.draw(pass);
   }
 
   destroy(): void {
     this.model.destroy();
   }
-}
-
-/** Pre-create the 1×1 rg32float sum texture and its dedicated FBO. */
-export function makeSumTarget(device: Device): {
-  sumTex: Texture;
-  sumFbo: Framebuffer;
-} {
-  const sumTex = device.createTexture({
-    width: 1,
-    height: 1,
-    format: "rg32float",
-    mipLevels: 1,
-    sampler: { minFilter: "nearest", magFilter: "nearest" },
-  });
-  const sumFbo = device.createFramebuffer({
-    width: 1,
-    height: 1,
-    colorAttachments: [sumTex],
-  });
-  return { sumTex, sumFbo };
 }

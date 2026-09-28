@@ -1,7 +1,7 @@
 import { BaseEngine, type BaseEngineOptions, type HoverHit, type InteractiveLayerOptions, type LaneInteractive, type NodeDragSession } from "../map/base-engine.js";
 import { networkLayers, networkLayersFromCache, noLodStyleCache, drawsLinks, frontierCircles, frontierHalos, boundaryRings, traceBoundaryRings, superEdges, makeSuperEdgesScratch, emitNodes, emitLinks, emitArrows, emitHalfLinks, traceFrontierGlyphs, traceFrontierHalos, traceSuperHalfArrows, traceSuperLines, traceSuperArrows, physicalPieInstances, tracePieWedges, rgbaCss, pickNodes, regionNodes, resolveNodeRadii, resolveNodeRadiusAggregate, resolveImportance, resolveFlowBorder, resolveNodeColors, resolveLinkWidthOf, resolveLinkColorOf, resolveLinkStrokeOf, flowBorderInnerRadii, type ResolvedNetworkStyle, type SuperEdgeStyleResolved, type SuperEdgesData, type ModuleBoundaryResolved, type AggregateOutlineResolved, type NoLodStyleCache, type NodeRadiusSpec, type ImportanceSpec, type FlowBorderSpec, type ConstBorder, type LinkWidthSpec, type LinkColorSpec, type LinkStyle, type RGBAValue } from "./glyphs.js";
 import { rgb } from "d3-color";
-import { ForceLayout, seedPositions, type ForceParams } from "./force.js";
+import { DRAG_HEAT, ForceLayout, seedPositions, type ForceParams } from "./force.js";
 import { multilevelLayout, type CoarsenOptions } from "./coarsen.js";
 import { buildLODTree, buildMortonLODTree, mortonRootBox, makeMortonScratch, makeLODBoundsScratch, findMortonCell, computeLODGeometry, computeLODPositions, computeLODStyle, updateLODPositionsForLeaves, cut, makeCutScratch, makeCutBoundaries, declutterFrontier, makeDeclutterFrontierScratch, pickFrontier, regionFrontier, visibleWorldRect, leavesUnder, ancestorAwareSelected, type BoundaryDiscs, type CutBoundaries, type LODTree, type MortonBox, type SpatialLODOptions } from "./lod.js";
 import { DEFAULT_LABEL_TEXT, type LabelAnchor, type LabelStyle } from "../labels/label-layer.js";
@@ -20,7 +20,7 @@ import type { LeafStyle, LODView } from "./lod-frame.js";
 import { startGpuLayout } from "./gpu/gpu-transport.js";
 import { WebGLBackend } from "../webgl/webgl-backend.js";
 import type { NetworkGraph } from "./graph.js";
-import { fitNodes, fitBox, fitTransform, type FitBox } from "./fit.js";
+import { layoutBox, layoutFitTransform, type FitBox } from "./fit.js";
 import type { InstancedLayer, ViewTransform } from "../core/index.js";
 import { InstancedLane, type SelectionStrategy } from "../core/instanced-lane.js";
 import { StableColumns } from "../core/stable-columns.js";
@@ -262,9 +262,20 @@ export interface NetworkLayoutOptions {
   backend?: "positions" | "force" | "worker" | "gpu";
   /** Interleaved `[x, y, …]` world coordinates for `backend: "positions"`. */
   positions?: Float32Array;
-  /** Iterations for `backend: "force"` (default 300, per level when multilevel). */
+  /**
+   * Tick budget of the force layout (`"force"` / `"worker"` / `"gpu"`, default 300) — a maximum, not a
+   * fixed count (#124), and the length of the anneal: a seeded layout (multilevel, or the GPU's module
+   * seed) cools over it, so a larger budget cools more slowly rather than only adding headroom. A cold
+   * disc start keeps full heat to untangle. The CPU backends stop as soon as the layout has converged
+   * (nodes moving a small fraction of the equilibrium spacing per tick), resolving
+   * {@link Network.whenSettled}. The GPU backend runs the whole budget (its early stop needs a GPU
+   * readback it doesn't do yet).
+   */
   iterations?: number;
-  /** Force parameters for `backend: "force"`. */
+  /**
+   * Force parameters for the force backends. The layout settles into a disc of radius
+   * `√(repulsion·N/centering)` — node spacing `√(π·repulsion/centering)` — and is seeded at that scale.
+   */
   force?: Partial<ForceParams>;
   /**
    * For `backend: "force"` and `backend: "worker"`, seed the layout via multilevel coarsening
@@ -275,13 +286,20 @@ export interface NetworkLayoutOptions {
   multilevel?: boolean;
   /**
    * For the streaming backends (`"worker"` / `"gpu"`), keep the camera framed on the layout as it
-   * converges: the view is fit to the layout's live bounds each streamed frame (centroid → view
-   * centre, extent → ~85% of the view) and released to normal zoom/pan once it settles or the user
-   * interacts. Without it a streaming layout converges wherever the solver centres it — the GPU
-   * solve centres the centroid at the origin, so it would otherwise render at the top-left corner
-   * until it settles. Default `false`. Ignored for `"positions"` / `"force"` (already final on the
-   * first paint). The per-frame fit reads the layout's aggregate bounds (O(top-level modules), not
-   * O(nodes)) when LOD geometry exists; with LOD off it fits once from the initial extent and holds.
+   * converges: the view is fit to the bounding box of the node positions each streamed frame (box
+   * centre → view centre, longest side → ~85% of the view, padded by the largest node radius) and
+   * framed once more on the settled layout. Released to normal zoom/pan once it settles, or as soon as
+   * the user zooms/pans or the view is set with `setTransform` — so the camera never reframes away
+   * from a view the user chose. Without it a streaming layout converges wherever the solver centres it
+   * — the GPU solve centres the centroid at the origin, so it would otherwise render at the top-left
+   * corner until it settles. Default `false`. Ignored for `"positions"` / `"force"` (already final on
+   * the first paint). The box is tight whether LOD is on or off. While the layout streams it ignores a
+   * handful of flung-out stragglers: at most min(64, 0.5% of the nodes) per side, and only when they sit
+   * 10-30% or more of the layout's size beyond the rest, so a fling-out cannot shrink the rest to a dot
+   * mid-run. A small disconnected component that far out is dropped the same way and streams just outside
+   * the frame. The settled layout is framed by its exact box, every node included. The pad covers the
+   * largest node glyph; with LOD on, an aggregate glyph larger than that can overhang the frame's edge
+   * margin. Computing the box costs O(nodes) per streamed frame, only while the fit is on.
    */
   fit?: boolean;
   /**
@@ -352,7 +370,8 @@ export interface NestedLayoutConfig {
  * On the **WebGL** lane the cut re-runs live every pan/zoom frame. On the **Canvas/SVG** (retained)
  * backends the same frontier draws as Scene layers — so `toSVG()` exports a level-of-detail map (#138) —
  * but the retained Scene can't re-tessellate per frame, so there the frontier is static during a gesture
- * and re-cuts on release (the redraw-on-zoom-end model; force one with {@link Network.syncScreenGeometry}).
+ * and re-cuts on release, and after a programmatic `setTransform` while zoom is enabled (the
+ * redraw-on-zoom-end model; force one with {@link Network.syncScreenGeometry}).
  */
 export interface NetworkLODOptions {
   /**
@@ -569,6 +588,13 @@ export interface NetworkDeclutterStats {
   scratchCells: number;
 }
 
+/**
+ * Which box a fit-on-layout reframe uses ({@link layoutBox}): while `"streaming"`, the layout's box less a
+ * handful of flung-out stragglers, so that one cannot blow the frame up mid-run; once `"settled"`, its exact
+ * box, so that the view the user is left with crops no node, a small disconnected component included.
+ */
+type FitPhase = "streaming" | "settled";
+
 const DEFAULT_NODE_RADIUS = 4;
 const DEFAULT_NODE_FILL = "#4878d0";
 const DEFAULT_LINK_WIDTH = 1;
@@ -634,24 +660,6 @@ function transitionDuration(transition: number | undefined): number {
   return transition !== undefined && Number.isFinite(transition) && transition > 0 ? transition : 0;
 }
 
-/** The bounding box `[minX, minY, maxX, maxY]` of the first `n` interleaved positions — O(n). Null
- *  when there are none (or none finite). */
-function positionsBox(p: ArrayLike<number>, n: number): FitBox | null {
-  let minX = Infinity;
-  let minY = Infinity;
-  let maxX = -Infinity;
-  let maxY = -Infinity;
-  for (let i = 0; i < n; i++) {
-    const x = p[2 * i]!;
-    const y = p[2 * i + 1]!;
-    if (x < minX) minX = x;
-    if (y < minY) minY = y;
-    if (x > maxX) maxX = x;
-    if (y > maxY) maxY = y;
-  }
-  return minX <= maxX ? [minX, minY, maxX, maxY] : null;
-}
-
 /** A CSS colour as an `rgba(r,g,b,a)` string at the given 0–255 alpha (for the faint `both`-view container fill). */
 function withAlpha(css: string, alpha255: number): string {
   const c = rgb(css);
@@ -687,24 +695,24 @@ export class Network extends BaseEngine {
   /** Live handle to a running worker layout, if any. */
   private layoutHandle: WorkerLayoutHandle | null = null;
   /** While true (a streaming `layout({ fit: true })` before it settles), each streamed frame reframes
-   *  the camera to the layout's live bounds ({@link fitViewToLayout}). Cleared on settle or first gesture. */
+   *  the camera to the layout's live bounds ({@link fitViewToLayout}). Cleared on settle, on the first user
+   *  gesture, or by a `setTransform`. */
   private fitOnLayout = false;
-  /** One-shot layout bbox `[minX, minY, maxX, maxY]` for the LOD-off fit fallback: computed once from
-   *  positions (no per-frame O(nodes) scan) and held for the run. Null while a LOD tree supplies bounds. */
-  private fitFallbackBox: FitBox | null = null;
   /**
    * A layout whose final extent is known up front (the nested layout's root disc, #324) frames on it
    * for the whole stream: its early frames collapse unplaced leaves onto their module centres, so the
    * live bounds would under-frame the map and then zoom out as depths land.
    */
   private fitKnownBox: FitBox | null = null;
-  /** Cached top-module ids (the fit nodes, {@link fitNodes}) for the per-frame fit, plus the median scratch
-   *  ({@link fitBox}). Recomputed only when the tree identity changes; the scratch is reused across frames. */
-  private fitNodesArr: Uint32Array | null = null;
-  private fitNodesFor: LODTree | null = null;
-  private fitScratch: Float32Array | null = null;
-  /** Pending coalesced repaint rAF id (0 = none) for progressive worker frames. */
-  private layoutRepaintRaf = 0;
+  /** The largest leaf radius per resolved style with per-node radii, for the fit's pad
+   *  ({@link fitViewToLayout}): O(nodes) once per such style, then read per frame. Weakly keyed, so a
+   *  replaced style is never kept alive by it. A constant radius needs no scan ({@link maxLeafRadius}). */
+  private readonly fitRadii = new WeakMap<ResolvedNetworkStyle, number>();
+  /** A streamed layout frame is waiting for the engine's coalesced frame ({@link scheduleLayoutRepaint}). */
+  private streamPending = false;
+  /** Leaves moved since the last drawn frame by a drag, a transition or a force-drag tick
+   *  ({@link repaintDuringDrag}): null = none, `"all"` = every node may have moved, else the held set. */
+  private moved: Uint32Array | "all" | null = null;
   /** The running position transition (#328), if any — owned by {@link layoutHandle}, kept here so a
    *  node grab can finish it. */
   private transition: PositionTransition | null = null;
@@ -787,6 +795,9 @@ export class Network extends BaseEngine {
   private nestedSolving = false;
   /** Dedup guard for the one-shot deferred main-thread LOD-tree fallback (see {@link scheduleLODFallback}). */
   private lodFallbackScheduled = false;
+  /** Whether the queued fallback is a build {@link lod} deferred before any layout (see
+   *  {@link defersStructuralBuild}) — the one a synchronous call may pull forward ({@link flushDeferredLayers}). */
+  private lodBuildDeferred = false;
   /** Whether `lodTree` has had its geometry computed at least once, so the cut may run. */
   private lodHasGeometry = false;
   /** Reusable cross-fade scratch (#133), indexed by tree-node id; grown as the tree grows, reused per cut to avoid GC. */
@@ -918,6 +929,8 @@ export class Network extends BaseEngine {
   private readonly PIE_LAYER = "pie";
   /** Registry key + layer name for the `both`-view physical container discs (drawn under the state nodes). */
   private readonly CONTAINER_LAYER = "phys-container";
+  /** Every retained Scene layer the vector path registers ({@link registerNetworkScene}). */
+  private readonly SCENE_LAYERS: readonly string[] = [this.CONTAINER_LAYER, "module-boundaries", "links", "arrows", "node-halos", this.NODE_LAYER, this.PIE_LAYER];
 
   constructor(host: HTMLElement, opts: NetworkOptions = {}) {
     super(host, opts);
@@ -956,6 +969,7 @@ export class Network extends BaseEngine {
    *  Shared by {@link data} (plain graph) and {@link applyView} (state-network view switch); unlike
    *  `data` it does NOT clear the state-network mode. */
   private setActiveGraph(graph: NetworkGraph): this {
+    this.moved = null; // leaf ids of the previous graph: the rebuild below draws the new one in full
     this.haltLayout(); // any worker layout is tied to the previous graph's buffers
     this.graph = graph;
     // Drop per-node style arrays sized to the PREVIOUS graph — the idiomatic re-render on a graph swap is
@@ -986,7 +1000,7 @@ export class Network extends BaseEngine {
     this.resolvedCache = null;
     this.linkColors = null;
     this.derivedParentFor = null; this.derivedParent = null; // drop the ancestor-aware parent cache (#162)
-    this.fitFallbackBox = null; this.fitKnownBox = null; this.fitNodesArr = null; this.fitNodesFor = null; // fit caches are tied to the old graph/tree
+    this.fitKnownBox = null; // tied to the old graph
     return this.rebuild();
   }
 
@@ -1125,6 +1139,14 @@ export class Network extends BaseEngine {
    * geometry pass. Enabling it *after* a worker run (or on the `force`/`positions` backends) falls
    * back to building the tree on the main thread from the current positions.
    *
+   * On an engine that has not run a layout yet, `lod()` cannot know which backend comes next, so the
+   * main-thread build waits for the end of the current call chain: a `layout({ backend: "worker" })`
+   * in the same chain still gets its tree off-thread, and every other path (no layout, `positions`,
+   * `force`, `gpu`) has the tree before the next frame — and a synchronous call that needs it
+   * (`pick()`, `toSVG()`/`toPNG()`, `select()`/`selection()`, `highlight()`, `setStyle()`/`clearStyle()`)
+   * builds it at once. With a worker layout in the chain those calls see what they see during any
+   * worker-streamed load: no cut until the worker's tree lands.
+   *
    * With a module hierarchy (`data(graph, { modules })`, #326) the cut draws the module tree by
    * default; `{ source: "structure" }` coarsens the graph structurally instead. `{ source: "spatial" }`
    * (#343) groups nodes by position — on the worker backend the worker rebuilds that tree on every
@@ -1151,8 +1173,42 @@ export class Network extends BaseEngine {
     // reuses it (cut-time options apply immediately; the style geometry refreshes). data()/layout()
     // drop it on a graph or layout change. It builds a structural tree on the main thread only off the
     // worker backend — on the worker backend that tree comes from the worker (or the settle fallback).
-    this.recomputeLODGeometry();
+    // Before any layout() the backend is still unknown, so a from-scratch structural build is deferred
+    // to the end of the call chain instead (see defersStructuralBuild).
+    if (this.defersStructuralBuild()) this.deferLODBuild();
+    else this.recomputeLODGeometry();
     return this.rebuild();
+  }
+
+  /**
+   * Whether {@link lod} should leave the main-thread tree build to the end of the call chain: no
+   * `layout()` has chosen a backend yet — a `layout({ backend: "worker" })` later in this chain streams
+   * the structural tree itself (#103), and building it here first would block the main thread for the
+   * whole O(N + E) coarsening (≈0.5 s at 325k nodes / 1.5M edges) only to be replaced. Only a tree that
+   * would be built from scratch waits: a module tree is never streamed, an existing tree only needs its
+   * geometry refreshed, and state-network mode builds from the state view's own graph (#182). Nor does
+   * it wait while the network's layers carry a selection, highlight or style override: the vector
+   * backends clear those layers while a build is queued, which would discard that state.
+   */
+  private defersStructuralBuild(): boolean {
+    return this.layoutOpts.backend === undefined && !!this.graph && !this.stateData && !this.lodTree && !this.lodUsesModules()
+      && !this.SCENE_LAYERS.some((name) => this.hasInteractionState(name));
+  }
+
+  /** Queue the deferred build ({@link runLODFallback}) and mark it as one a synchronous read may pull
+   *  forward ({@link flushDeferredLayers}). */
+  private deferLODBuild(): void {
+    this.lodBuildDeferred = true;
+    this.scheduleLODFallback();
+  }
+
+  /**
+   * A call that resolves against the network's layers *now* (see {@link BaseEngine.flushDeferredLayers})
+   * runs a build {@link lod} deferred at once, so a synchronous caller sees exactly what an immediate
+   * build would have given it. O(1) when nothing is deferred (it also guards every hover pick).
+   */
+  protected override flushDeferredLayers(): void {
+    if (this.lodBuildDeferred) this.runLODFallback();
   }
 
   /**
@@ -1322,7 +1378,8 @@ export class Network extends BaseEngine {
         const ids = cand.ids;
         for (let i = 0; i < cand.length; i++) if (place(ids[i] ?? 0)) break;
       }
-    } else {
+    } else if (!this.lodAwaitsTree()) {
+      // (Skipped while LOD awaits its tree: nothing is drawn then, so there is nothing to label.)
       // No-LOD: rank the nodes in view by strength (weighted degree). The full graph is drawn.
       // Candidate gathering (#212) is O(visible) per pan/zoom frame in the steady state: on settled
       // positions a coarse uniform grid — built at most once per position change, never per frame —
@@ -1415,14 +1472,16 @@ export class Network extends BaseEngine {
       // by the first streamed frame; each frame then reframes via {@link fitViewToLayout}.
       const fit = opts.fit === true && (opts.backend === "worker" || opts.backend === "gpu");
       this.fitOnLayout = fit;
-      this.fitFallbackBox = null;
       this.fitKnownBox = null;
       const nestedTree = opts.nested && opts.backend !== "positions" ? this.moduleTree() : undefined;
       // A transition (#328) eases from the current positions, and a warm nested start refines them —
       // so neither gets the seed disc. Only layouts computed in one go transition.
       const duration = nestedTree || opts.backend === "positions" || opts.backend === "force" ? transitionDuration(opts.transition) : 0;
       const warm = !!nestedTree && typeof opts.nested === "object" && opts.nested.warm === true;
-      if (fit && !warm && duration === 0) seedPositions(this.graph, this.width, this.height);
+      // A flat force layout's first paint sits at the scale it converges to (the force equilibrium). A
+      // nested layout ignores `force` — its root disc is 10·√N, the box the camera frames — so it keeps
+      // the viewport disc rather than one ~3× wider than that box.
+      if (fit && !warm && duration === 0) seedPositions(this.graph, this.width, this.height, nestedTree ? undefined : { force: opts.force });
       if (nestedTree) {
         this.startNestedLayout(nestedTree, opts, duration);
       } else if (opts.backend === "positions" && opts.positions) {
@@ -1532,8 +1591,8 @@ export class Network extends BaseEngine {
         const graph = this.graph;
         const from = duration > 0 ? graph.positions.slice() : null; // where a transition eases from
         if (opts.multilevel === false) {
-          seedPositions(graph, this.width, this.height);
-          new ForceLayout(graph, opts.force).run(iterations);
+          seedPositions(graph, this.width, this.height, { force: opts.force });
+          new ForceLayout(graph, opts.force).run(iterations, "hot"); // a cold start untangles at full heat
         } else {
           multilevelLayout(graph, {
             width: this.width,
@@ -1557,7 +1616,7 @@ export class Network extends BaseEngine {
       // branches don't refresh it before this first fit — using it stale collapses the frame to the origin.
       if (this.fitOnLayout) {
         this.recomputeLODGeometry();
-        this.fitViewToLayout();
+        this.fitViewToLayout("streaming");
       }
     }
     return this.rebuild();
@@ -1622,14 +1681,16 @@ export class Network extends BaseEngine {
 
   /**
    * The view the LOD cut runs at (#433): its inputs as a spatial stream needs them to cut each tree it
-   * rebuilds the same way — the transform, or `null` while the camera follows the layout's fit (the stream
-   * computes that fit from each tree, as {@link fitViewToLayout} does).
+   * rebuilds the same way — the transform, or `null` while the camera follows the streaming layout's fit (the
+   * stream frames each frame's positions with {@link layoutFitTransform} and `fitPad`, as
+   * {@link fitViewToLayout} does).
    */
   private lodView(style: ResolvedNetworkStyle): LODView {
     const opts = this.lodOptions;
     const t = this.transform;
     return {
-      transform: this.fitOnLayout ? null : { k: t.k, x: t.x, y: t.y },
+      transform: this.fitOnLayout && !this.fitKnownBox ? null : { k: t.k, x: t.x, y: t.y },
+      fitPad: this.maxLeafRadius(style),
       width: this.width,
       height: this.height,
       expandPx: opts?.expandPx,
@@ -1661,6 +1722,7 @@ export class Network extends BaseEngine {
     const same =
       p !== null &&
       (t === null ? pt === null : pt != null && pt.k === t.k && pt.x === t.x && pt.y === t.y) &&
+      p.fitPad === v.fitPad &&
       p.width === v.width &&
       p.height === v.height &&
       p.expandPx === v.expandPx &&
@@ -1786,9 +1848,9 @@ export class Network extends BaseEngine {
    * #328). With `fit`, a warm map's extent is known only now: frame it. Then ease to it, or jump.
    */
   private landNested(graph: NetworkGraph, positions: Float32Array, tween: PositionTransition | null): void {
-    if (this.fitOnLayout && !this.fitKnownBox) this.fitKnownBox = positionsBox(positions, graph.nodeCount);
+    if (this.fitOnLayout && !this.fitKnownBox) this.fitKnownBox = layoutBox(positions, graph.nodeCount); // the settled layout: exact
     if (tween) {
-      if (this.fitOnLayout) this.fitViewToLayout(); // frame the final layout once, as the transition starts
+      if (this.fitOnLayout) this.fitViewToLayout("streaming"); // frame the final layout once, as the transition starts
       tween.to(positions);
     } else {
       graph.positions.set(positions);
@@ -1810,6 +1872,7 @@ export class Network extends BaseEngine {
         if (this.graph !== graph) return;
         this.dragReapply?.();
         this.repaintDuringDrag();
+        this.flushFrame(); // this tick runs inside an animation frame: draw it here (with any pending zoom), not a frame late
       },
     });
   }
@@ -1904,10 +1967,7 @@ export class Network extends BaseEngine {
       // each streamed frame reframes in scheduleLayoutRepaint, released on settle/interaction.
       const fit = opts.fit === true;
       this.fitOnLayout = fit;
-      this.fitFallbackBox = null;
-      this.fitNodesArr = null;
-      this.fitNodesFor = null;
-      if (fit) seedPositions(phys, this.width, this.height);
+      if (fit) seedPositions(phys, this.width, this.height, { force: opts.force });
       const onPhysFrame = () => this.scheduleLayoutRepaint();
       const workerOpts = {
         width: this.width,
@@ -1937,15 +1997,15 @@ export class Network extends BaseEngine {
       // screen) is cheap and self-corrects on the first streamed frame regardless.
       this.applyStateDerivedPositions();
       this.recomputeLODGeometry();
-      if (fit) this.fitViewToLayout(); // frame the first paint against the seeded layout
+      if (fit) this.fitViewToLayout("streaming"); // frame the first paint against the seeded layout
       return this.rebuild();
     }
 
     // Main-thread force (backend: "force", the synchronous default).
     const iterations = opts.iterations ?? DEFAULT_FORCE_ITERATIONS;
     if (opts.multilevel === false) {
-      seedPositions(phys, this.width, this.height);
-      new ForceLayout(phys, opts.force).run(iterations);
+      seedPositions(phys, this.width, this.height, { force: opts.force });
+      new ForceLayout(phys, opts.force).run(iterations, "hot"); // a cold start untangles at full heat
     } else {
       multilevelLayout(phys, { width: this.width, height: this.height, iterations, force: opts.force });
     }
@@ -1999,87 +2059,110 @@ export class Network extends BaseEngine {
   }
 
   /**
-   * Coalesce progressive worker frames into at most one repaint per animation frame. With a
-   * worker-streamed LOD tree the geometry is already fresh (the worker wrote it before posting the
-   * frame), so the main thread only re-cuts; otherwise the positions changed and the LOD geometry is
-   * recomputed here before the cut — LOD tracks the layout *as it converges*, not only once settled.
+   * Coalesce progressive worker frames into at most one repaint per animation frame — the engine's one
+   * coalesced frame, shared with pan/zoom and node-drag input, so a frame that streams while the user
+   * zooms or drags still cuts and renders once (#367). With a worker-streamed LOD tree the geometry is
+   * already fresh (the worker wrote it before posting the frame), so the main thread only re-cuts;
+   * otherwise the positions changed and the LOD geometry is recomputed before the cut ({@link drawFrame})
+   * — LOD tracks the layout *as it converges*, not only once settled.
    *
    * State-network mode (#182) is also driven through here when the physical layout streams: the
    * callback re-derives the rosette from the just-streamed physical positions (O(physicalCount) sizing +
    * O(stateCount) placement) before the LOD/render step, so the state/both views track the physical
    * layout live instead of only once it settles.
+   *
+   * Protected, not private, so an engine-level per-frame guard can drive the streamed frame itself (the
+   * transport's position copy, then this) from a subclass, without a cast — a real worker streams too
+   * slowly and irregularly at guard scale to time frames by.
    */
-  private scheduleLayoutRepaint(): void {
+  protected scheduleLayoutRepaint(): void {
     // Raised at message time (not in the rAF): a pan between a streamed frame and its coalesced
     // repaint must not label from a grid indexing the pre-stream positions (#212).
     this.labelSource.stale = true;
-    if (this.layoutRepaintRaf) return;
-    const raf: (cb: FrameRequestCallback) => number =
-      typeof requestAnimationFrame === "function" ? requestAnimationFrame : (cb) => setTimeout(() => cb(0), 16);
-    this.layoutRepaintRaf = raf(() => {
-      this.layoutRepaintRaf = 0;
+    this.streamPending = true;
+    this.requestRedraw();
+  }
+
+  /**
+   * The engine's coalesced frame (#367): everything that moved nodes since the last frame — a streamed
+   * layout frame, drag moves, a transition or force-drag tick — is folded into the LOD geometry, then ONE
+   * {@link rebuild} cuts and renders at the frame's transform (a pending pan/zoom transform is already set).
+   */
+  protected override drawFrame(): void {
+    if (this.streamPending) {
+      this.streamPending = false;
+      this.moved = null; // the streamed frame's full geometry pass below covers any drag move
       this.dragReapply?.(); // hold the dragged nodes under the cursor over the worker's snapshot (#140, copy mode)
       if (this.stateData) this.applyStateDerivedPositions(); // physical positions just streamed a frame
       if (!this.drawsWorkerTree()) this.recomputeLODGeometry(); // worker streams geometry; main only re-cuts
       // Fit-on-layout: reframe the camera to the layout's freshly-updated bounds BEFORE the rebuild, so
       // the LOD cut + render run once at the framed transform (no extra emit). Cleared on settle/gesture.
-      if (this.fitOnLayout) this.fitViewToLayout();
-      this.rebuild(); // also hands the spatial trees this repaint replaced back to the worker (#343)
-    });
+      if (this.fitOnLayout) this.fitViewToLayout("streaming");
+    } else {
+      this.applyMovedGeometry();
+    }
+    this.rebuild(); // also hands the spatial trees this repaint replaced back to the worker (#343)
   }
 
   /**
-   * Reframe the camera on the streaming layout's live bounds (centroid → view centre, longest extent →
-   * ~85% of the view) and re-seed the zoom gesture to match. Called for a `layout({ fit: true })` run on
-   * the first paint and each streamed frame until it settles or the user interacts. Sets the transform
-   * *state* only (no render) — the caller's `rebuild()` renders once at the framed transform. Bounds come
-   * from {@link layoutFitBox} (O(top-level modules), not O(nodes)).
+   * Reframe the camera on the streaming layout's live bounds (box centre → view centre, longest side →
+   * ~85% of the view, padded by the largest leaf radius) and re-seed the zoom gesture to match. Called for
+   * a `layout({ fit: true })` run on the first paint and each streamed frame (`"streaming"`), and once on
+   * the settled layout (`"settled"`, {@link releaseFit}), unless the view was taken over first (a user
+   * gesture, or a `setTransform`). Sets the transform *state* only (no render) — the caller's `rebuild()`
+   * renders once at the framed transform. Bounds come from {@link layoutFitBox}: O(nodes) per streamed
+   * frame, and only while the fit is on.
    */
-  private fitViewToLayout(): void {
+  private fitViewToLayout(phase: FitPhase): void {
     const backend = this.backend();
     if (!backend || !this.graph) return;
-    const box = this.layoutFitBox(this.graph);
+    const box = this.layoutFitBox(this.graph, phase);
     if (!box) return;
-    const t = fitTransform(box, this.width, this.height);
+    // Pad by the drawn leaf radius so the outermost glyphs stay inside the frame: in world units a world-
+    // sized glyph grows the box, a screen-sized one keeps that many pixels free around it.
+    const style = this.resolvedStyleCached(this.graph);
+    const t = layoutFitTransform(box, this.width, this.height, this.maxLeafRadius(style), style.sizeMode === "screen");
     this.transform = t;
     backend.setTransform(t); // state only (no render); rebuild() emits the cut + renders once at `t`
     this.syncZoomToView(); // keep the gesture seeded to the framed view so an interaction never jumps
   }
 
-  /**
-   * The layout's world-space bounding box `[minX, minY, maxX, maxY]` for {@link fitViewToLayout}. When LOD
-   * geometry exists it's the union of the tree's **top-level (root) nodes'** `cx/cy ± extent` — O(number of
-   * top-level modules), independent of node count, and the whole graph is bounded because a root's extent
-   * bounds all its descendant leaves. With LOD off (no tree) it falls back to a **one-time** full-position
-   * bbox, computed once and held in {@link fitFallbackBox} so the fallback never costs O(nodes) per frame
-   * (the layout stays roughly framed as it refines; use LOD for continuous reframing). Null if unavailable.
-   */
-  private layoutFitBox(graph: NetworkGraph): FitBox | null {
-    if (this.fitKnownBox) return this.fitKnownBox;
-    // Preferred: a fling-out-robust box over the top modules ({@link fitBox}) — O(top modules), refreshed
-    // each frame from the live geometry. The fit nodes are cached per tree identity (the scratch too), so
-    // the per-frame work is O(top modules), not O(tree size).
-    if (this.lodTree && this.lodHasGeometry) {
-      let nodes = this.fitNodesArr;
-      if (this.fitNodesFor !== this.lodTree || !nodes) {
-        nodes = fitNodes(this.lodTree);
-        this.fitNodesArr = nodes;
-        this.fitNodesFor = this.lodTree;
-      }
-      if (!this.fitScratch || this.fitScratch.length < nodes.length) this.fitScratch = new Float32Array(nodes.length);
-      const box = fitBox(this.lodTree, nodes, this.fitScratch);
-      if (box) return box;
+  /** The largest leaf radius of `style` (resolved from the current style options), in its `sizeMode`'s
+   *  units. A constant `nodeRadius` is its own maximum: O(1). That covers the one style re-resolved on every
+   *  streamed frame, a state network's `both` view, whose constant dot radius tracks the layout scale
+   *  ({@link applyStateDerivedPositions}). Per-node radii are scanned once per resolved style, O(nodes). */
+  private maxLeafRadius(style: ResolvedNetworkStyle): number {
+    const spec = this.styleOpts.nodeRadius ?? DEFAULT_NODE_RADIUS;
+    if (typeof spec === "number") return Math.max(0, spec);
+    let r = this.fitRadii.get(style);
+    if (r === undefined) {
+      r = 0;
+      for (const v of style.nodeRadii) if (v > r) r = v;
+      this.fitRadii.set(style, r);
     }
-    // LOD off (no tree): one-time full-position bbox, held so the fallback never costs O(nodes) per frame.
-    return (this.fitFallbackBox ??= positionsBox(graph.positions, graph.nodeCount));
+    return r;
   }
 
-  /** Final reframe + release of a streaming fit (on settle): fit once more to the settled bounds, then
-   *  stop per-frame fitting so the view is the user's to pan/zoom (the gesture is already seeded to it).
-   *  (A gesture *before* settle releases the fit via {@link setInteracting}.) */
+  /**
+   * The layout's world-space bounding box `[minX, minY, maxX, maxY]` for {@link fitViewToLayout}: the box
+   * of the live **leaf positions** ({@link layoutBox}) — tight whether LOD is on or off, and recomputed on
+   * every streamed frame so it follows the layout as it grows. While `"streaming"` it drops a handful of
+   * flung-out stragglers; `"settled"` it is exact, so a small far component the stream left just outside
+   * the frame is framed once the layout settles. O(nodes) per call with no typed-array allocation; called
+   * only while a fit is on. A layout whose final extent is known up front frames on that instead
+   * ({@link fitKnownBox}). Null if no position is finite.
+   */
+  private layoutFitBox(graph: NetworkGraph, phase: FitPhase): FitBox | null {
+    return this.fitKnownBox ?? layoutBox(graph.positions, graph.nodeCount, { trimStragglers: phase === "streaming" });
+  }
+
+  /** Final reframe + release of a streaming fit (on settle): fit once more to the settled layout's exact
+   *  bounds, then stop per-frame fitting so the view is the user's to pan/zoom (the gesture is already
+   *  seeded to it). Skipped when the view was taken over first — a user gesture ({@link setInteracting}) or
+   *  a `setTransform` — so it never undoes the user's view. */
   private releaseFit(): void {
     if (!this.fitOnLayout) return;
-    this.fitViewToLayout();
+    this.fitViewToLayout("settled");
     this.fitOnLayout = false;
   }
 
@@ -2115,8 +2198,8 @@ export class Network extends BaseEngine {
     this.lodStreaming = false; // no worker run is in flight to stream the LOD tree any more
     this.lodRetired.length = 0; // their worker is gone: the buffers stay here, for the collector
     this.nestedSolving = false;
-    if (this.layoutRepaintRaf && typeof cancelAnimationFrame === "function") cancelAnimationFrame(this.layoutRepaintRaf);
-    this.layoutRepaintRaf = 0;
+    this.streamPending = false; // a streamed frame still waiting to draw belongs to the halted run…
+    if (this.moved === null) this.withdrawRedraw(); // …and so does its redraw, unless a drag move waits too
   }
 
   /** Resolves when the current worker layout converges — or its position transition ends (#328) — or
@@ -2128,6 +2211,10 @@ export class Network extends BaseEngine {
   /** Tear down the engine, cancelling any worker layout first. */
   override destroy(): void {
     this.haltLayout();
+    // Cancel a queued LOD build: with the worker stopped nothing streams a tree any more, and a destroyed
+    // engine must not coarsen its graph (a React StrictMode re-mount destroys it within the call chain).
+    this.lodFallbackScheduled = false;
+    this.lodBuildDeferred = false;
     super.destroy(); // base tears down the shared label overlay (#105 N7b, #223)
   }
 
@@ -2138,13 +2225,23 @@ export class Network extends BaseEngine {
    * `lod({ modules })`, #326), `"spatial"` when it's the spatial tree the main thread built over the
    * node positions (`source: "spatial"` or an edge-less graph, #343), `"main"` when it's the coarsening tree built on the main
    * thread (`force`/`positions` backends, the worker fallback, or LOD enabled after a worker run), or
-   * `"none"` when LOD is off or no geometry exists yet. Introspection for debugging and tests.
+   * `"none"` when LOD is off or no geometry exists yet — including while a worker is about to stream
+   * its tree and while a build `lod()` deferred to the end of the call chain is pending. Introspection
+   * for debugging and tests; reading it never builds anything.
    */
   get lodSource(): "worker" | "modules" | "spatial" | "main" | "none" {
     if (!this.lodOptions || !this.lodTree || !this.lodHasGeometry) return "none";
     if (this.drawsWorkerTree()) return "worker";
     if (this.lodModules) return "modules";
     return this.lodSpatial ? "spatial" : "main";
+  }
+
+  /** LOD is on, no tree is ready yet, and nothing is drawn until one is: the WebGL lane draws nothing
+   *  meanwhile ({@link syncLane}) — a worker is about to stream the tree, or {@link lod} deferred the
+   *  build — and a vector backend draws nothing while that deferred build is pending ({@link rebuild}).
+   *  (A vector backend awaiting a streamed tree otherwise draws the full graph.) */
+  private lodAwaitsTree(): boolean {
+    return !!this.lodOptions && !this.lodReady() && (this.lodBuildDeferred || !!this.backend()?.setInstancedLayer);
   }
 
   /**
@@ -2244,11 +2341,18 @@ export class Network extends BaseEngine {
       }
     } else {
       // SVG/Canvas: emit the glyphs through the PathContext seam as Scene layers, so the
-      // existing pipeline renders them and toSVG() produces publication output. (LOD is a
-      // WebGL-scale feature; vector backends always draw the full graph.)
+      // existing pipeline renders them and toSVG() produces publication output. With LOD on they
+      // draw the cut once a tree is ready (#138), else the full graph.
       this.unregisterLanes();
-      this.registerNetworkScene(this.graph, style, true);
-      this.sceneActive = true;
+      if (this.lodAwaitsTree()) {
+        // lod() deferred its build to the end of the call chain: that build draws the cut before the
+        // next frame (or a worker layout that took over streams it), so the full graph would be
+        // tessellated here only for a frame nobody sees. Draw nothing meanwhile, as the WebGL lane does.
+        this.clearNetworkScene();
+      } else {
+        this.registerNetworkScene(this.graph, style, true);
+        this.sceneActive = true;
+      }
     }
     // Set labels BEFORE the render so a backend that bakes them into the frame (Canvas) draws the
     // current labels in this render rather than one rebuild behind.
@@ -2327,11 +2431,10 @@ export class Network extends BaseEngine {
   /** Drop every retained Scene layer the vector path registers, in one pass. Unlike
    *  `registerNetworkScene(graph, style, false)` — which registers the same slots *empty* and
    *  therefore still pays O(nodeCount + edgeCount) for the id arrays and id→index maps — this is
-   *  O(layers): the right clear when the Scene must not cost anything at all (#201). */
+   *  O(layers) plus one re-push of what is left: the right clear when the Scene must not cost anything
+   *  at all (#201). */
   private clearNetworkScene(): void {
-    for (const name of [this.CONTAINER_LAYER, "module-boundaries", "links", "arrows", "node-halos", this.NODE_LAYER, this.PIE_LAYER]) {
-      this.removeLayer(name);
-    }
+    this.removeLayers(this.SCENE_LAYERS);
     this.sceneActive = false;
   }
 
@@ -2710,8 +2813,11 @@ export class Network extends BaseEngine {
         heldPos[k * 2] = px; heldPos[k * 2 + 1] = py;
       }
     };
+    // The grab maps through the DRAWN view (`t0`: what the grab's hit was picked against); each move through
+    // the view the next frame draws, so a pinch/scroll mid-drag — even one whose frame has not run yet (#367)
+    // — keeps the held set under the cursor at the drawn view.
     const setDelta = (mx: number, my: number): void => {
-      const t = this.transform; // read live so a pinch/scroll mid-drag still maps screen → world
+      const t = this.latestTransform();
       dx = (mx - t.x) / t.k - worldStartX;
       dy = (my - t.y) / t.k - worldStartY;
     };
@@ -2730,6 +2836,7 @@ export class Network extends BaseEngine {
       this.nestedDiscs = null; // the reheat re-lays every node out: a nested layout's discs no longer hold (#329)
       const sim = new ForceLayout(graph, this.layoutOpts.force);
       sim.setPinned(held);
+      sim.hold(DRAG_HEAT); // reflow at the drag heat the worker / gpu backends use
       const rafFn: (cb: FrameRequestCallback) => number =
         typeof requestAnimationFrame === "function" ? requestAnimationFrame : (cb) => setTimeout(() => cb(0), 16);
       let raf = 0;
@@ -2740,9 +2847,10 @@ export class Network extends BaseEngine {
         if (cool < 0) applyHeld(); // hold under the cursor; once released, let the held set settle freely
         sim.tick();
         this.repaintDuringDrag();
-        if (cool >= 0 && --cool < 0) {
-          // Tail finished — stop the loop. The drag frames refit a spatial tree (#343); rebuild it once now
-          // that the nodes have come to rest, as a release does on the other backends.
+        this.flushFrame(); // this tick runs inside an animation frame: draw it here (with any pending zoom), not a frame late
+        if (cool >= 0 && (--cool < 0 || sim.converged)) {
+          // Re-cooled (or tail spent) — stop the loop. The drag frames refit a spatial tree (#343); rebuild it
+          // once now that the nodes have come to rest, as a release does on the other backends.
           if (this.lodSpatial) this.settleLODPositions();
           return;
         }
@@ -2751,7 +2859,7 @@ export class Network extends BaseEngine {
       raf = rafFn(frame);
       return {
         move: setDelta,
-        end: () => { sim.setPinned(null); cool = Network.DRAG_COOL_FRAMES; if (!raf) raf = rafFn(frame); },
+        end: () => { sim.setPinned(null); cool = Network.DRAG_COOL_FRAMES; sim.cool(cool, DRAG_HEAT); if (!raf) raf = rafFn(frame); },
       };
     }
 
@@ -2791,18 +2899,29 @@ export class Network extends BaseEngine {
   }
 
   /**
-   * Update the LOD geometry from the moved positions and re-emit + repaint. The per-frame paint
-   * shared by every drag backend (#140); a drag move is a continuous pointer interaction, so this
-   * must never run O(tree size) work (#211):
+   * Nodes moved — repaint them in the engine's next coalesced frame (#367). The per-frame paint shared by
+   * every drag backend (#140) and the position transition (#328). A drag move is a continuous pointer
+   * interaction that can fire several times per frame, so a move only records what moved: O(1). The frame
+   * folds it into the LOD geometry once ({@link applyMovedGeometry}) and cuts + renders once, with any
+   * pending zoom or streamed layout frame. `held` = only these leaves moved (the same session's array on
+   * every move); omitted = every node may have moved.
+   */
+  private repaintDuringDrag(held?: Uint32Array): void {
+    this.moved = held && (this.moved === null || this.moved === held) ? held : "all";
+    this.requestRedraw();
+  }
+
+  /**
+   * Fold the nodes moved since the last frame ({@link repaintDuringDrag}) into the LOD geometry, once per
+   * frame. It must never run O(tree size) work for a drag (#211):
    *
    * - **Worker-streamed tree**: skipped entirely — the worker owns the geometry.
-   * - **`held` given** (positions / worker / gpu drag moves — only the held leaves moved since the
-   *   last pass): incremental {@link updateLODPositionsForLeaves} along the held leaves' ancestor
-   *   chains, O(held · depth). Extents widen conservatively; {@link settleLODPositions} makes them
-   *   exact on release.
-   * - **No `held`** (the `force` drag's rAF tick moved *every* free node, or a position transition
-   *   frame, #328): one full {@link computeLODPositions} pass — O(tree size), matching the tick's own
-   *   O(nodes + edges).
+   * - **A held set** (positions / worker / gpu drag moves — only the held leaves moved since the last
+   *   pass): incremental {@link updateLODPositionsForLeaves} along the held leaves' ancestor chains,
+   *   O(held · depth). Extents widen conservatively; {@link settleLODPositions} makes them exact on
+   *   release.
+   * - **`"all"`** (the `force` drag's rAF tick, a transition frame — *every* free node moved): one full
+   *   {@link computeLODPositions} pass — O(tree size), matching the tick's own O(nodes + edges).
    *
    * Style-derived geometry (`radius`/`weight`/`border`/`color`) is position-independent, so no
    * drag frame recomputes it (the old full `recomputeLODGeometry` re-ran it — with its O(tree)
@@ -2814,15 +2933,15 @@ export class Network extends BaseEngine {
    * leave their cells, so the frontier can widen for the length of the gesture; {@link settleLODPositions}
    * (drag release, the `force` drag's cool-down tail) and a transition's settle rebuild it once.
    */
-  private repaintDuringDrag(held?: Uint32Array): void {
+  private applyMovedGeometry(): void {
+    const moved = this.moved;
+    this.moved = null;
     const graph = this.graph;
-    if (!this.drawsWorkerTree() && graph) {
-      const tree = this.lodReady() ? this.lodTree : null;
-      if (!tree) this.recomputeLODGeometry(); // no tree/geometry yet — build once (no-op when LOD is off)
-      else if (held) updateLODPositionsForLeaves(tree, graph.positions, held, this.treeParent(tree));
-      else computeLODPositions(tree, graph.positions, this.lodDiscs(tree), this.lodBounds); // a spatial tree too: rebuilt on settle (#343)
-    }
-    this.rebuild();
+    if (!moved || !graph || this.drawsWorkerTree()) return;
+    const tree = this.lodReady() ? this.lodTree : null;
+    if (!tree) this.recomputeLODGeometry(); // no tree/geometry yet — build once (no-op when LOD is off)
+    else if (moved !== "all") updateLODPositionsForLeaves(tree, graph.positions, moved, this.treeParent(tree));
+    else computeLODPositions(tree, graph.positions, this.lodDiscs(tree), this.lodBounds); // a spatial tree too: rebuilt on settle (#343)
   }
 
   /** One exact position-geometry pass when a drag releases (#211), replacing the drag's grow-only
@@ -2835,7 +2954,9 @@ export class Network extends BaseEngine {
     // A spatial tree is rebuilt (#343): the moved nodes may have left their cells.
     if (this.lodSpatial) this.recomputeLODGeometry();
     else computeLODPositions(this.lodTree, this.graph.positions, this.lodDiscs(this.lodTree), this.lodBounds);
-    this.rebuild();
+    this.moved = null; // the exact pass covers a drag move still waiting for its frame
+    this.requestRedraw();
+    this.flushFrame(); // draw now — and only once, if that frame (or a zoom) was pending
   }
 
   /** The nested layout's discs when they laid out `tree` (#329): its position passes place the modules on them. */
@@ -3198,21 +3319,32 @@ export class Network extends BaseEngine {
    * `worker`, and no tree exists yet — but only fires if, after the current synchronous call chain,
    * no worker run has taken over the streaming path (i.e. LOD was toggled on after a run settled).
    * The microtask delay lets an imminent `layout({ backend: "worker" })` in the same chain win first,
-   * so the common path never builds a tree the worker would replace.
+   * so the common path never builds a tree the worker would replace. {@link lod} schedules it too, for
+   * the build it defers before any layout ({@link defersStructuralBuild}).
    */
   private scheduleLODFallback(): void {
     if (this.lodFallbackScheduled) return;
     this.lodFallbackScheduled = true;
     const defer: (cb: () => void) => void =
       typeof queueMicrotask === "function" ? queueMicrotask : (cb) => void Promise.resolve().then(cb);
-    defer(() => {
-      this.lodFallbackScheduled = false;
-      // A worker is now streaming, LOD was turned off, the graph/backend changed, or a tree already
-      // landed — nothing to do; the normal path renders it.
-      if (!this.lodOptions || this.lodStreaming || this.lodReady() || this.layoutOpts.backend !== "worker") return;
-      this.recomputeLODGeometry(true); // no live worker: build the tree on the main thread
-      this.rebuild();
-    });
+    defer(() => this.runLODFallback());
+  }
+
+  /** The scheduled build itself — at the end of the call chain, or pulled forward by a synchronous call
+   *  ({@link flushDeferredLayers}). A queued run that finds nothing scheduled any more (already pulled
+   *  forward, or cancelled by {@link destroy}) does nothing. */
+  private runLODFallback(): void {
+    if (!this.lodFallbackScheduled) return;
+    const deferred = this.lodBuildDeferred;
+    this.lodFallbackScheduled = false;
+    this.lodBuildDeferred = false;
+    // A worker is now streaming, LOD was turned off, or a tree already landed — nothing to do; the normal
+    // path renders it. The worker backend's fallback also stands down when the backend changed; a build
+    // lod() deferred runs whatever came next (no layout, positions mid-transition, gpu), as lod() would have.
+    if (!this.lodOptions || this.lodStreaming || this.lodReady()) return;
+    if (!deferred && this.layoutOpts.backend !== "worker") return;
+    this.recomputeLODGeometry(true); // no live worker: build the tree on the main thread
+    this.rebuild();
   }
 
   /**
@@ -3220,8 +3352,9 @@ export class Network extends BaseEngine {
    * backend reproduces the WebGL screen look at any zoom (the retained Scene can't recompute a
    * screen-space shape per frame, so it's baked into world coords at the active transform; see
    * {@link registerNetworkScene}). **No-op on WebGL** (the shader does it live) and when not drawing
-   * screen-mode half-arrows. Called automatically on backend switch and at interaction-end; call it
-   * explicitly for a "refit" button or before a programmatic export at a chosen transform.
+   * screen-mode half-arrows. Called automatically on backend switch, at interaction-end, and after a
+   * programmatic `setTransform` while zoom is enabled; call it explicitly for a "refit" button, after a
+   * `setTransform` without zoom, or before a programmatic export at a chosen transform.
    */
   syncScreenGeometry(): this {
     const backend = this.backend();
@@ -3232,12 +3365,30 @@ export class Network extends BaseEngine {
 
   /** Re-bake the vector-backend screen-mode geometry when a pan/zoom gesture ends (cheap, O(edges)).
    *  A gesture START also takes over a streaming fit-on-layout (stop auto-framing so it doesn't fight
-   *  the pan/zoom; the gesture is already seeded to the framed view — each fit frame calls syncZoomToView). */
+   *  the pan/zoom; the gesture is already seeded to the framed view — each fit frame calls syncZoomToView).
+   *  Only a real user gesture gets here: the engine's own zoom re-seeds are not gestures (#309, #327). */
   protected override setInteracting(v: boolean): void {
     const ending = this.interacting && !v;
     if (v) this.fitOnLayout = false;
     super.setInteracting(v);
     if (ending) this.syncScreenGeometry();
+  }
+
+  /** Adopt a view. An explicit view — a gesture frame, a zoom-to-module, a saved camera — also takes over a
+   *  streaming fit-on-layout: the next streamed frame (or the settle) must not reframe away from it. Every
+   *  `setTransform` and every coalesced gesture frame comes through here, including one that draws together
+   *  with a streamed frame (#367). The fit itself never does ({@link fitViewToLayout} sets the view directly). */
+  protected override adoptTransform(t: ViewTransform): void {
+    this.fitOnLayout = false;
+    super.adoptTransform(t);
+  }
+
+  /** With zoom enabled, a programmatic view change (a zoom-to) settles like a gesture's end: the Canvas/SVG
+   *  LOD frontier and screen-mode bake re-cut to the new view (O(drawn nodes + edges), once per call, never
+   *  per gesture frame). A no-op on WebGL, whose lane re-cuts live. */
+  protected override afterProgrammaticTransform(): void {
+    super.afterProgrammaticTransform();
+    this.syncScreenGeometry();
   }
 
   /**

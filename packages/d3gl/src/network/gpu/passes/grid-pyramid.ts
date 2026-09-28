@@ -1,5 +1,7 @@
-import type { Device, Texture, Framebuffer, RenderPass } from "@luma.gl/core";
+import type { Device, Texture, Framebuffer } from "@luma.gl/core";
 import { Model } from "@luma.gl/engine";
+import { SLOT_TEXEL_GLSL } from "../textures.js";
+import { ADDITIVE_BLEND, beginPass, fullScreenModel, NO_BLEND } from "./fullscreen.js";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // GPU grid pyramid — a regular quadtree over the layout bounding box.
@@ -20,14 +22,14 @@ import { Model } from "@luma.gl/engine";
 // sum the (Σx, Σy, mass) of their four children, so the root holds the totals
 // over all nodes — exactly the CPU BarnesHutTree's root mass/COM.
 //
-// Build per tick:
-//   1. bboxPass   — POINTS scatter with MAX blend → 1×1 (maxX, maxY, -minX, -minY)
-//   2. scatterPass — POINTS scatter with ADD blend → level-0 grid (Σx, Σy, mass)
-//   3. reducePass  — full-screen triangle per level, summing 2×2 blocks → level ℓ+1
+// Build per tick, from the layout's bounding box — the segment table's `box` texel
+// (maxX, maxY, -minX, -minY), which the segmented range query computes this tick
+// (see segmented-reduce.ts; it replaced a 1-px MAX-blend scatter of every node):
+//   1. scatterPass — POINTS scatter with ADD blend → level-0 grid (Σx, Σy, mass)
+//   2. reducePass  — full-screen triangle per level, summing 2×2 blocks → level ℓ+1
 //
-// All level textures + FBOs and the bbox target are pre-created in the
-// constructor — no per-tick createTexture / createFramebuffer (keeps the spy
-// test green).
+// All level textures + FBOs are pre-created in the constructor — no per-tick
+// createTexture / createFramebuffer (keeps the spy test green).
 
 // ── Grid-resolution choice ──────────────────────────────────────────────────
 //
@@ -50,39 +52,6 @@ export function chooseGrid(count: number): number {
   if (g > 1024) g = 1024;
   return g;
 }
-
-// ── Bounding-box reduction (POINTS + MAX blend) ──────────────────────────────
-//
-// Each node emits a single point at pixel (0,0). We pack the AABB as
-//   (maxX, maxY, -minX, -minY)
-// and combine with the MAX blend equation (gl.MAX, exposed by luma.gl as
-// blendColorOperation:'max'). max(-minX) = -min(minX) recovers minX by negation.
-// WebGL2 supports MIN/MAX blend natively (no extension needed for the equation;
-// the float *target* still needs EXT_color_buffer_float, enabled by luma.gl).
-const BBOX_VS = /* glsl */ `\
-#version 300 es
-precision highp float;
-precision highp sampler2D;
-uniform highp sampler2D u_pos;
-uniform int u_width;
-flat out vec4 v_box;
-void main() {
-  int id = gl_VertexID;
-  ivec2 c = ivec2(id % u_width, id / u_width);
-  vec2 p = texelFetch(u_pos, c, 0).xy;
-  v_box = vec4(p.x, p.y, -p.x, -p.y);
-  gl_Position = vec4(0.0, 0.0, 0.0, 1.0);
-  gl_PointSize = 1.0;
-}
-`;
-
-const BBOX_FS = /* glsl */ `\
-#version 300 es
-precision highp float;
-flat in vec4 v_box;
-out vec4 o_box;
-void main() { o_box = v_box; }
-`;
 
 // ── Scatter to the finest grid (POINTS + ADD blend) ──────────────────────────
 //
@@ -109,15 +78,15 @@ const SCATTER_VS = /* glsl */ `\
 precision highp float;
 precision highp sampler2D;
 uniform highp sampler2D u_pos;
-uniform highp sampler2D u_box;   // 1×1 (maxX, maxY, -minX, -minY)
+uniform highp sampler2D u_box;   // segment box (maxX, maxY, -minX, -minY), segment 0 at (0,0)
 uniform int   u_width;
 uniform int   u_grid;            // G (finest grid side)
 uniform float u_pad;             // box padding factor (e.g. 1.01)
 flat out vec2 v_pos;
 flat out float v_r2;
+${SLOT_TEXEL_GLSL}
 void main() {
-  int id = gl_VertexID;
-  ivec2 c = ivec2(id % u_width, id / u_width);
+  ivec2 c = slotTexel(gl_VertexID, u_width);
   vec2 p = texelFetch(u_pos, c, 0).xy;
 
   vec4 b = texelFetch(u_box, ivec2(0, 0), 0);
@@ -166,12 +135,6 @@ void main() {
 //   out(x,y) = Σ in(2x+{0,1}, 2y+{0,1})
 // texelFetch on the finer level; out-of-range fetches never happen because the
 // input is always exactly 2S×2S (G is a power of two).
-const REDUCE_VS = /* glsl */ `\
-#version 300 es
-in vec2 a_clip;
-void main() { gl_Position = vec4(a_clip, 0.0, 1.0); }
-`;
-
 const REDUCE_FS = /* glsl */ `\
 #version 300 es
 precision highp float;
@@ -202,6 +165,11 @@ interface Level {
 export interface PyramidBuildInput {
   /** Current node positions texture (rg32float atlas). */
   posTex: Texture;
+  /**
+   * The layout's bounding box, `(maxX, maxY, -minX, -minY)` at texel (0, 0) — the segment table's
+   * `box` for the flat layout's single segment, computed this tick by the range query.
+   */
+  boxTex: Texture;
   /** Number of real nodes. */
   count: number;
   /** Atlas width of the positions texture. */
@@ -210,8 +178,8 @@ export interface PyramidBuildInput {
 
 /**
  * GPU grid pyramid — builds and holds a regular-quadtree COM/mass pyramid over
- * the current layout. Owns the bbox target, all level textures, their FBOs and
- * the three build models. Rebuilt each tick via {@link build}.
+ * the current layout. Owns all level textures, their FBOs and the two build
+ * models. Rebuilt each tick via {@link build} from the layout's box.
  *
  * The level textures are exposed via {@link levelTextures} and {@link levelCount}
  * so the BH repulsion pass can `texelFetch` any level.
@@ -224,22 +192,17 @@ export class GridPyramid {
   readonly levelCount: number;
 
   private readonly levels: readonly Level[];
-  /** 1×1 rgba32float bbox target (maxX, maxY, -minX, -minY). */
-  private readonly boxTex: Texture;
-  private readonly boxFbo: Framebuffer;
 
-  private readonly bboxModel: Model;
   private readonly scatterModel: Model;
   private readonly reduceModel: Model;
 
   /**
    * Box padding factor so max-corner nodes fall strictly inside the grid. The
    * BH repulsion pass must apply the SAME padding when it recomputes cell
-   * geometry from the bbox texture, so it's exposed as a public readonly.
+   * geometry from the box texture, so it's exposed as a public readonly.
    */
   readonly pad = 1.01;
 
-  private readonly bboxUniforms: Record<string, number>;
   private readonly scatterUniforms: Record<string, number>;
 
   constructor(device: Device, count: number) {
@@ -267,42 +230,7 @@ export class GridPyramid {
     }
     this.levels = levels;
 
-    // 1×1 bbox target.
-    this.boxTex = device.createTexture({
-      width: 1,
-      height: 1,
-      format: "rgba32float",
-      mipLevels: 1,
-      sampler: { minFilter: "nearest", magFilter: "nearest" },
-    });
-    this.boxFbo = device.createFramebuffer({
-      width: 1,
-      height: 1,
-      colorAttachments: [this.boxTex],
-    });
-
     // ── Models ────────────────────────────────────────────────────────────
-    this.bboxUniforms = { u_width: 1 };
-    this.bboxModel = new Model(device, {
-      vs: BBOX_VS,
-      fs: BBOX_FS,
-      topology: "point-list",
-      vertexCount: 1, // overridden per build via setVertexCount
-      uniforms: this.bboxUniforms,
-      parameters: {
-        // MAX blend equation (gl.MAX) — combine per-node (maxX,maxY,-minX,-minY)
-        // into the componentwise max. Factors are ignored by MIN/MAX in GL, but
-        // luma.gl requires them; 'one'/'one' is the conventional choice.
-        blend: true,
-        blendColorSrcFactor: "one",
-        blendColorDstFactor: "one",
-        blendAlphaSrcFactor: "one",
-        blendAlphaDstFactor: "one",
-        blendColorOperation: "max",
-        blendAlphaOperation: "max",
-      },
-    });
-
     this.scatterUniforms = { u_width: 1, u_grid: G, u_pad: this.pad };
     this.scatterModel = new Model(device, {
       vs: SCATTER_VS,
@@ -310,30 +238,11 @@ export class GridPyramid {
       topology: "point-list",
       vertexCount: 1, // overridden per build
       uniforms: this.scatterUniforms,
-      parameters: {
-        blend: true,
-        blendColorSrcFactor: "one",
-        blendColorDstFactor: "one",
-        blendAlphaSrcFactor: "one",
-        blendAlphaDstFactor: "one",
-        blendColorOperation: "add",
-        blendAlphaOperation: "add",
-      },
+      parameters: ADDITIVE_BLEND,
     });
 
-    const clipBuf = device.createBuffer({
-      data: new Float32Array([-1, -1, 3, -1, -1, 3]),
-    });
-    this.reduceModel = new Model(device, {
-      vs: REDUCE_VS,
-      fs: REDUCE_FS,
-      topology: "triangle-list",
-      vertexCount: 3,
-      attributes: { a_clip: clipBuf },
-      bufferLayout: [{ name: "a_clip", format: "float32x2" }],
-      // No blend: each reduce output texel is written exactly once.
-      parameters: { blend: false },
-    });
+    // No blend: each reduce output texel is written exactly once.
+    this.reduceModel = fullScreenModel(device, REDUCE_FS, {}, NO_BLEND);
   }
 
   /** Texture for pyramid level `ℓ` (0 = finest G×G, levelCount-1 = 1×1 root). */
@@ -341,64 +250,36 @@ export class GridPyramid {
     return this.levels[level]!.tex;
   }
 
-  /** The (unpadded reference) bbox target texture: (maxX, maxY, -minX, -minY). */
-  get bboxTexture(): Texture {
-    return this.boxTex;
-  }
-
   /**
-   * Rebuild the pyramid from the current positions. Runs three sub-steps, each
-   * in its own render pass (different FBO sizes / clear needs):
-   *   1. clear bbox to -∞ then MAX-scatter → (maxX, maxY, -minX, -minY)
-   *   2. clear finest grid to 0 then ADD-scatter → (Σx, Σy, mass, 0)
-   *   3. reduce finest → … → 1×1 root (one pass per coarser level)
+   * Rebuild the pyramid from the current positions and the layout's box. Runs
+   * two sub-steps, each in its own render pass (different FBO sizes / clear needs):
+   *   1. clear finest grid to 0 then ADD-scatter → (Σx, Σy, mass, Σ|p−cc|²)
+   *   2. reduce finest → … → 1×1 root (one pass per coarser level)
    *
    * Caller must `device.submit()` after (or between) as needed; this method
    * submits internally after each pass so downstream reads see the results.
    */
   build(input: PyramidBuildInput): void {
-    const { posTex, count, width } = input;
+    const { posTex, boxTex, count, width } = input;
 
-    // ── 1. Bounding box (MAX blend into 1×1) ──────────────────────────────
-    // Clear to a very negative value so the first MAX picks up real data.
-    // (maxX, maxY, -minX, -minY) all start at -LARGE; MAX with any real node
-    // overrides them. LARGE must exceed any plausible world coordinate.
-    const LARGE = 1e30;
-    const boxPass = this.device.beginRenderPass({
-      framebuffer: this.boxFbo,
-      clearColor: [-LARGE, -LARGE, -LARGE, -LARGE],
-    });
-    this.bboxUniforms["u_width"] = width;
-    this.bboxModel.setBindings({ u_pos: posTex });
-    this.bboxModel.setVertexCount(count);
-    this.bboxModel.draw(boxPass);
-    boxPass.end();
-    this.device.submit();
-
-    // ── 2. Scatter to finest grid (ADD blend into G×G) ────────────────────
+    // ── 1. Scatter to finest grid (ADD blend into G×G) ────────────────────
     const finest = this.levels[0]!;
-    const scatterPass = this.device.beginRenderPass({
-      framebuffer: finest.fbo,
-      clearColor: [0, 0, 0, 0],
-    });
+    const scatterPass = beginPass(this.device, { framebuffer: finest.fbo, clear: [0, 0, 0, 0] });
     this.scatterUniforms["u_width"] = width;
     // u_grid / u_pad are constant (set in constructor).
-    this.scatterModel.setBindings({ u_pos: posTex, u_box: this.boxTex });
+    this.scatterModel.setBindings({ u_pos: posTex, u_box: boxTex });
     this.scatterModel.setVertexCount(count);
     this.scatterModel.draw(scatterPass);
     scatterPass.end();
     this.device.submit();
 
-    // ── 3. Mip reduce (finest → 1×1) ──────────────────────────────────────
+    // ── 2. Mip reduce (finest → 1×1) ──────────────────────────────────────
     // Each pass reads level ℓ and writes level ℓ+1 (half the side). No blend;
     // no clear needed since every output texel is written by the shader.
     for (let lvl = 0; lvl < this.levelCount - 1; lvl++) {
       const src = this.levels[lvl]!;
       const dst = this.levels[lvl + 1]!;
-      const reducePass = this.device.beginRenderPass({
-        framebuffer: dst.fbo,
-        clearColor: false,
-      });
+      const reducePass = beginPass(this.device, { framebuffer: dst.fbo, clear: false });
       this.reduceModel.setBindings({ u_src: src.tex });
       this.reduceModel.draw(reducePass);
       reducePass.end();
@@ -411,9 +292,6 @@ export class GridPyramid {
       lvl.tex.destroy();
       lvl.fbo.destroy();
     }
-    this.boxTex.destroy();
-    this.boxFbo.destroy();
-    this.bboxModel.destroy();
     this.scatterModel.destroy();
     this.reduceModel.destroy();
   }

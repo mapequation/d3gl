@@ -4,7 +4,7 @@ import { buildGraph, type NetworkGraph } from "../graph.js";
 import { buildLeafIncidence, lazySuperEdges, makeLazySuperEdgesScratch, rowSuperEdges, type LazyCut } from "../lazy-super-edges.js";
 import { allocateSpatialRows, buildCoverRows, cutRowCells, makeSpatialRowsScratch, rowOf, spatialRowsGraph, type SpatialRows } from "../spatial-rows.js";
 import { lodFrameStep, lodTreeFromSpatialFrame, makeSpatialLODStream, recycleSpatialFrame, type LODView } from "../lod-frame.js";
-import { fitBox, fitNodes, fitTransform } from "../fit.js";
+import { layoutBox, layoutFitTransform } from "../fit.js";
 import type { SuperEdgeStyleResolved, SuperEdgesData } from "../glyphs.js";
 
 /**
@@ -294,7 +294,7 @@ describe("a spatial stream ships the rows of its view's covers with each tree (#
     const g = fixture(3000, 7);
     const style = { radii: new Float32Array(g.nodeCount).fill(3), weight: g.strength };
     const t: LODTransform = { k: 1.3, x: W / 2 - 60, y: H / 2 + 30 };
-    const view: LODView = { transform: t, width: W, height: H, maxAggregateRadius: 20, screenSized: true, fadeBand: 0 };
+    const view: LODView = { transform: t, fitPad: 3, width: W, height: H, maxAggregateRadius: 20, screenSized: true, fadeBand: 0 };
     const stream = makeSpatialLODStream(g.nodeCount, style, 1, g, view);
     const f1 = lodFrameStep(stream, g.positions, 1);
     if (!f1?.rows) throw new Error("no rows");
@@ -313,14 +313,15 @@ describe("a spatial stream ships the rows of its view's covers with each tree (#
     recycleSpatialFrame(stream, f1.buffer, f1.rows.buffer);
     const f2 = lodFrameStep(stream, g.positions, 2);
     expect(f2?.rows?.buffer).toBe(rowsBuffer);
-    // Following the fit: the cut at the fit the engine computes from the tree.
+    // Following the fit: the cut at the fit the engine frames the positions at.
     stream.view = { ...view, transform: null };
     const f3 = lodFrameStep(stream, g.positions, 3);
     if (!f3?.rows) throw new Error("no rows at the fit");
     const fitTree = lodTreeFromSpatialFrame(f3);
-    const box = fitBox(fitTree, fitNodes(fitTree), new Float32Array(64));
+    const box = layoutBox(g.positions, g.nodeCount, { trimStragglers: true });
     if (!box) throw new Error("no fit box");
-    expect(fitTree.rows?.cell).toEqual(rowsForCut(fitTree, g, cutAt(fitTree, fitTransform(box, W, H), false)).cell);
+    const fitT = layoutFitTransform(box, W, H, 3, true);
+    expect(fitTree.rows?.cell).toEqual(rowsForCut(fitTree, g, cutAt(fitTree, fitT, false)).cell);
     // No links drawn, or no view: no rows.
     stream.style = { ...style, links: false };
     const f4 = lodFrameStep(stream, g.positions, 4);

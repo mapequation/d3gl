@@ -97,8 +97,11 @@ export interface NestedLayoutResult {
   r: Float32Array;
 }
 
-/** Reusable per-solve scratch, grown to the largest module's child count. */
-class Scratch {
+/**
+ * Reusable per-solve scratch, grown to the largest module's child count. Exported (with {@link collide}) for
+ * the collision tests only; the package API (`network/index.ts`) does not re-export it.
+ */
+export class Scratch {
   x = new Float64Array(0);
   y = new Float64Array(0);
   vx = new Float64Array(0);
@@ -582,7 +585,7 @@ function repel(s: Scratch, k: number, strength: number): void {
     fy[i] = 0;
   }
   bh.build(pos32, k);
-  for (let i = 0; i < k; i++) bh.applyForce(i, strength * BH_SCALE, 0.9, fx, fy);
+  bh.applyForces(strength * BH_SCALE, 0.9, fx, fy); // children in the tree's Z order, for locality
   for (let i = 0; i < k; i++) {
     vx[i] = vx[i]! + fx[i]!;
     vy[i] = vy[i]! + fy[i]!;
@@ -590,7 +593,7 @@ function repel(s: Scratch, k: number, strength: number): void {
 }
 
 /** Push overlapping discs apart (position-based). O(k²) for small k, a uniform grid otherwise. */
-function collide(s: Scratch, k: number, pad: number): void {
+export function collide(s: Scratch, k: number, pad: number): void {
   const { x, y, rad } = s;
   const resolve = (i: number, j: number): void => {
     const dx = x[j]! - x[i]!;
@@ -598,12 +601,17 @@ function collide(s: Scratch, k: number, pad: number): void {
     const min = (rad[i]! + rad[j]!) * pad;
     const d2 = dx * dx + dy * dy;
     if (d2 >= min * min) return;
-    const d = Math.sqrt(d2) || 1e-9;
-    const push = (min - d) / d;
+    // `push` scales (dx, dy), whose length is d, to the overlap `min − d`. Coincident discs (d² = 0) have no
+    // such vector: they separate by exactly `min` along a fixed, index-derived unit direction, from the lower
+    // index to the higher (i < j on both paths below) — deterministic (#357). (d² = NaN, from a non-finite
+    // position, takes the same branch: the NaN disc stays NaN and its finite partner moves by its share of
+    // `min`, not of min·1e9.) i and j are the module's local child indices (0..k−1); a batched port that
+    // holds every module in one slot range reproduces the direction with `slot − segment start` (#355).
+    const d = Math.sqrt(d2);
+    const push = d2 > 0 ? (min - d) / d : min;
     const mi = rad[i]! * rad[i]!;
     const mj = rad[j]! * rad[j]!;
     const sj = mi / (mi + mj);
-    // Coincident discs: separate along a fixed, index-derived direction (deterministic).
     const ux = d2 > 0 ? dx : Math.cos(i + j);
     const uy = d2 > 0 ? dy : Math.sin(i + j);
     x[j] = x[j]! + ux * push * sj;

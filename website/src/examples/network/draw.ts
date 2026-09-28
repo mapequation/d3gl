@@ -192,9 +192,10 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
         );
 
       if (relayout) {
-        // Scale per-tick work down as the graph grows so the off-thread solve stays responsive; the
-        // worker keeps the main thread free regardless, streaming frames as it converges.
-        const iterations = Math.min(250, Math.max(10, Math.round(2.5e6 / count)));
+        // A multilevel worker layout stops once it has converged (#124), so it keeps the default budget
+        // as a safety cap. The GPU layout has no early stop yet and a cold start keeps full heat until it
+        // settles, so both get a budget that shrinks as the graph grows.
+        const iterations = layoutBackend === "gpu" || !multilevel ? Math.min(250, Math.max(10, Math.round(2.5e6 / count))) : undefined;
         // fit: true (#238) keeps the camera framed on the streaming layout as it converges, released on
         // settle/interaction — so it opens framed rather than piling at the origin on the GPU backend.
         net.layout({ backend: layoutBackend, iterations, multilevel, fit: true });

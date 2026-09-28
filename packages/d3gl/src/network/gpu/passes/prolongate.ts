@@ -1,5 +1,7 @@
 import type { Device, Texture, RenderPass } from "@luma.gl/core";
-import { Model } from "@luma.gl/engine";
+import type { Model } from "@luma.gl/engine";
+import { SLOT_TEXEL_GLSL } from "../textures.js";
+import { fullScreenModel, NO_BLEND, type PassUniforms } from "./fullscreen.js";
 
 /**
  * Prolongation gather pass (N8.2 module-aware multilevel seed).
@@ -16,12 +18,6 @@ import { Model } from "@luma.gl/engine";
  * the depth/slot precompute in {@link ./../gpu-multilevel-seed.js}), so the only per-level work is
  * this gather. Writes `o_pos` once per texel (no blend).
  */
-const VS = /* glsl */ `\
-#version 300 es
-in vec2 a_clip;
-void main() { gl_Position = vec4(a_clip, 0.0, 1.0); }
-`;
-
 const FS = /* glsl */ `\
 #version 300 es
 precision highp float;
@@ -34,13 +30,13 @@ uniform int u_count;               // number of real children at this level
 uniform int u_width;               // this (child) level's atlas width
 uniform int u_parent_width;        // coarser level's atlas width
 layout(location = 0) out vec2 o_pos;
-
+${SLOT_TEXEL_GLSL}
 void main() {
   ivec2 c = ivec2(gl_FragCoord.xy);
-  int id = c.y * u_width + c.x;
+  int id = texelSlot(c, u_width);
   if (id >= u_count) { o_pos = vec2(0.0); return; }
   uint ps = texelFetch(u_parent_slot, c, 0).r;
-  ivec2 pc = ivec2(int(ps) % u_parent_width, int(ps) / u_parent_width);
+  ivec2 pc = slotTexel(int(ps), u_parent_width);
   vec2 pp = texelFetch(u_parent_pos, pc, 0).xy;
   vec2 off = texelFetch(u_offset, c, 0).xy;
   o_pos = pp + off;
@@ -67,24 +63,12 @@ export interface ProlongateInput {
  */
 export class ProlongatePass {
   private readonly model: Model;
-  private readonly uniforms: Record<string, number>;
+  private readonly uniforms: PassUniforms;
 
   constructor(device: Device) {
-    const clipBuf = device.createBuffer({
-      data: new Float32Array([-1, -1, 3, -1, -1, 3]),
-    });
     this.uniforms = { u_count: 0, u_width: 1, u_parent_width: 1 };
-    this.model = new Model(device, {
-      vs: VS,
-      fs: FS,
-      topology: "triangle-list",
-      vertexCount: 3,
-      attributes: { a_clip: clipBuf },
-      bufferLayout: [{ name: "a_clip", format: "float32x2" }],
-      uniforms: this.uniforms,
-      // Write each texel exactly once — no blend.
-      parameters: { blend: false },
-    });
+    // Write each texel exactly once — no blend.
+    this.model = fullScreenModel(device, FS, this.uniforms, NO_BLEND);
   }
 
   /** Gather child seed positions into an already-open render pass (the finer level's position FBO). */

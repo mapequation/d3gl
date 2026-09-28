@@ -1,18 +1,7 @@
-// TODO(n8 follow-up): extract shared full-screen-triangle pass helper into gpu/passes/_shared.ts
-// (full-screen-triangle VS + clip buffer + mutable-uniforms Record + ADDITIVE_BLEND params — 6 passes duplicate this).
-
 import type { Device, Texture, RenderPass } from "@luma.gl/core";
-import { Model } from "@luma.gl/engine";
-
-/**
- * Full-screen triangle vertex shader — shared with IntegratePass.
- * Each fragment corresponds to one texel (one node).
- */
-const VS = /* glsl */ `\
-#version 300 es
-in vec2 a_clip;
-void main() { gl_Position = vec4(a_clip, 0.0, 1.0); }
-`;
+import type { Model } from "@luma.gl/engine";
+import { SLOT_TEXEL_GLSL } from "../textures.js";
+import { ADDITIVE_BLEND, fullScreenModel, type PassUniforms } from "./fullscreen.js";
 
 /**
  * Attraction (spring) gather pass.
@@ -47,6 +36,7 @@ uniform int   u_nbr_width;
 uniform float u_attraction;
 layout(location = 0) out vec2 o_force;
 
+${SLOT_TEXEL_GLSL}
 ivec2 offCoord(int i) {
   return ivec2(i % u_off_width, i / u_off_width);
 }
@@ -56,7 +46,7 @@ ivec2 nbrCoord(uint p) {
 
 void main() {
   ivec2 c = ivec2(gl_FragCoord.xy);
-  int id = c.y * u_width + c.x;
+  int id = texelSlot(c, u_width);
   if (id >= u_count) { discard; }
 
   uint start = texelFetch(u_offsets, offCoord(id),     0).r;
@@ -69,7 +59,7 @@ void main() {
   uint lim = end < cap ? end : cap;
   for (uint p = start; p < lim; p++) {
     uint j = texelFetch(u_neighbors, nbrCoord(p), 0).r;
-    ivec2 jc = ivec2(int(j) % u_width, int(j) / u_width);
+    ivec2 jc = slotTexel(int(j), u_width);
     vec2 pj = texelFetch(u_pos, jc, 0).xy;
     f += (pj - pi);
   }
@@ -101,13 +91,9 @@ export interface AttractionUniforms {
  */
 export class AttractionPass {
   private readonly model: Model;
-  private readonly uniforms: Record<string, number>;
+  private readonly uniforms: PassUniforms;
 
   constructor(device: Device) {
-    const clipBuf = device.createBuffer({
-      data: new Float32Array([-1, -1, 3, -1, -1, 3]),
-    });
-
     this.uniforms = {
       u_count: 0,
       u_width: 1,
@@ -116,28 +102,8 @@ export class AttractionPass {
       u_attraction: 0,
     };
 
-    this.model = new Model(device, {
-      vs: VS,
-      fs: FS,
-      topology: "triangle-list",
-      vertexCount: 3,
-      attributes: { a_clip: clipBuf },
-      bufferLayout: [{ name: "a_clip", format: "float32x2" }],
-      uniforms: this.uniforms,
-      parameters: {
-        // Additive blend: dst += src.  Accumulates contributions from multiple
-        // force passes without overwriting.  Requires EXT_float_blend on WebGL2
-        // for float render targets; luma.gl enables it automatically via
-        // WebGLDeviceFeatures if the extension is present.
-        blend: true,
-        blendColorSrcFactor: "one",
-        blendColorDstFactor: "one",
-        blendAlphaSrcFactor: "one",
-        blendAlphaDstFactor: "one",
-        blendColorOperation: "add",
-        blendAlphaOperation: "add",
-      },
-    });
+    // Additive blend: dst += src, so the force passes accumulate into one texture.
+    this.model = fullScreenModel(device, FS, this.uniforms, ADDITIVE_BLEND);
   }
 
   /** Draw one attraction gather step into an already-open render pass. */

@@ -85,6 +85,24 @@ describe("engine-owned module hierarchy — data(graph, { modules }) (#326)", ()
     net.destroy();
   });
 
+  it("a fresh fitted nested layout opens inside the box the camera frames, not at the flat force scale", async () => {
+    // The camera frames a cold nested layout's known root disc (radius 10·√N about the origin) before
+    // any depth frame arrives, so the first paint's seed must sit inside it. The flat layouts' seed
+    // disc sized to the force equilibrium (radius √(repulsion·N/centering) ≈ 31.6·√N) overflows it ~3×.
+    const n = 1000;
+    const g = buildGraph({ nodeCount: n, source: Array.from({ length: n }, (_, i) => i), target: Array.from({ length: n }, (_, i) => (i + 1) % n) });
+    const records: ModuleNode[] = Array.from({ length: n }, (_, id) => ({ id, path: [Math.floor(id / 50) + 1, (id % 50) + 1] }));
+    const net = network(host(), { width: 200, height: 200 });
+    await net.whenReady();
+    net.data(g, { modules: records }).layout({ backend: "worker", nested: true, fit: true });
+    const radius = 10 * Math.sqrt(n);
+    let worst = 0;
+    for (let i = 0; i < 2 * n; i++) worst = Math.max(worst, Math.abs(g.positions[i]!));
+    net.destroy();
+    expect(worst).toBeGreaterThan(0); // seeded, not a pile at the origin
+    expect(worst).toBeLessThanOrEqual(radius);
+  });
+
   it("without a hierarchy, nested falls back to the force layout; data(graph) clears a previous one", async () => {
     const net = network(host(), { width: 200, height: 200 });
     await net.whenReady();

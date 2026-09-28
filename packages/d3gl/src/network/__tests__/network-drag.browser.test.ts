@@ -180,8 +180,11 @@ describe("network node-drag (#140)", () => {
     ev("pointerdown", cx0, cy0);
     ev("pointermove", cx0 + 40, cy0); // begins + first move
     ev("pointermove", cx0 + 50, cy0 + 10); // second move — still incremental
+    // The moves only record what moved; the engine's next frame folds them into the geometry once (#367).
+    expect(tree.cx[aggLeft], "a drag move updated the LOD geometry inside its handler").toBeCloseTo(cx0, 2);
+    await new Promise<void>((r) => requestAnimationFrame(() => r()));
 
-    // Per-move: the dragged module's aggregate follows live (its chain IS updated)…
+    // Per frame: the dragged module's aggregate follows live (its chain IS updated)…
     expect(tree.cx[aggLeft]).toBeCloseTo(cx0 + 50, 2);
     expect(tree.cy[aggLeft]).toBeCloseTo(cy0 + 10, 2);
     // …while both sentinels survive: no full positions pass, no style pass, on any move.

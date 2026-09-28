@@ -3,7 +3,8 @@
  * `network.ts` treats both symmetrically. Falls back to the worker path when the GPU path is
  * unavailable (no device, non-WebGL backend, SSR).
  *
- * Milestone A (N8.1): plain disc seed + streaming rAF loop. N8.5 (#183) adds drag/reheat parity:
+ * Milestone A (N8.1): plain disc seed (at the force equilibrium's scale) + streaming rAF loop, cooled
+ * over the iteration budget like the worker (#124). N8.5 (#183) adds drag/reheat parity:
  * on convergence the loop goes **idle** (keeps the {@link GpuForceLayout} alive, doesn't destroy it),
  * and `pin`/`unpin` hold nodes + resume the loop so the rest reflows — mirroring the CPU worker
  * (layout-worker.ts). Multilevel GPU seeding (N8.2) is still a later milestone.
@@ -13,7 +14,7 @@ import { gpuLayoutSupported } from "./device-caps.js";
 import { GpuForceLayout } from "./gpu-force-layout.js";
 import { canModuleSeed, gpuMultilevelSeed } from "./gpu-multilevel-seed.js";
 import { startWorkerLayout, type WorkerLayoutHandle, type WorkerLayoutOptions } from "../worker-transport.js";
-import { seedPositions, DEFAULT_FORCE } from "../force.js";
+import { seedPositions, DEFAULT_FORCE, DRAG_HEAT, RECOOL_TICKS } from "../force.js";
 import type { LODTopology } from "../lod.js";
 import type { NetworkGraph } from "../graph.js";
 
@@ -29,12 +30,8 @@ export interface GpuLayoutOptions extends WorkerLayoutOptions {
 
 const TARGET_FRAMES = 60;
 
-/** Ticks per streamed frame while reheating (drag / cool) — small batches keep the stream responsive
- *  (mirrors the worker's REHEAT_BATCH in layout-worker.ts). */
+/** Ticks per streamed frame while reheating (drag / cool) — small batches keep the stream responsive. */
 const REHEAT_BATCH = 3;
-/** Tail of refinement ticks after a drag releases, so the layout re-cools instead of freezing
- *  mid-reflow (mirrors the worker's COOL_TICKS). */
-const COOL_TICKS = 120;
 
 /**
  * Start a GPU-accelerated layout run. Returns a {@link WorkerLayoutHandle}-shaped object so the
@@ -157,13 +154,20 @@ function startGpuLayoutSync(
   // is available — lays out top-down over the module hierarchy so modules read as coherent regions —
   // else the plain phyllotaxis disc. The finest-level refine below (real edges) polishes either seed.
   const topo = opts.moduleTopology;
-  if (topo && canModuleSeed(topo, graph.nodeCount)) {
+  const moduleSeeded = !!topo && canModuleSeed(topo, graph.nodeCount);
+  if (topo && moduleSeeded) {
     gpuMultilevelSeed(device, topo, graph, { width, height, force });
   } else {
-    seedPositions(graph, width, height);
+    seedPositions(graph, width, height, { force });
   }
 
   const layout = new GpuForceLayout(device, graph, { ...DEFAULT_FORCE, ...force });
+  // As the CPU worker (#124): a module-seeded layout cools over the iteration budget, a cold disc start
+  // keeps full heat to untangle (see ForceLayout.run). The GPU run has no early stop yet — that needs a
+  // per-frame mean-step reduction read back from the GPU, which belongs with the async (fenced)
+  // readback — so it runs the whole budget.
+  if (moduleSeeded) layout.cool(iterations);
+  else layout.hold(1);
 
   let resolveSettled!: () => void;
   const settled = new Promise<void>((r) => (resolveSettled = r));
@@ -175,8 +179,8 @@ function startGpuLayoutSync(
   let stopped = false;
   let rafHandle = 0;
   let ticksDone = 0;
-  // Loop activity, mirroring the worker (layout-worker.ts): `run` (initial fixed-iteration
-  // convergence), `drag` (held nodes pinned, reflow indefinitely), `cool` (post-release settling
+  // Loop activity, mirroring the worker (layout-worker.ts): `run` (initial cooled run over the
+  // iteration budget), `drag` (held nodes pinned, reflow indefinitely), `cool` (post-release settling
   // tail), `idle` (at rest — loop paused, layout kept alive for a later reheat).
   let mode: "idle" | "run" | "drag" | "cool" = iterations > 0 ? "run" : "idle";
   let looping = false;
@@ -207,7 +211,11 @@ function startGpuLayoutSync(
     onFrame();
 
     if (mode === "run") {
-      if (ticksDone >= iterations) { settle(); mode = dragging ? "drag" : "idle"; } // converged → keep reflowing if a drag is live
+      if (ticksDone >= iterations) {
+        settle();
+        // Converged → keep reflowing at the drag heat if a drag is live.
+        if (dragging) { mode = "drag"; layout.hold(DRAG_HEAT); } else mode = "idle";
+      }
     } else if (mode === "cool") {
       coolLeft -= batch;
       if (coolLeft <= 0) mode = "idle";
@@ -243,7 +251,8 @@ function startGpuLayoutSync(
       layout.setPinned(ids);
       if (positions) layout.setHeldPositions(ids, positions);
       dragging = true;
-      if (mode === "idle" || mode === "cool") mode = "drag";
+      // During the initial run the drag rides on the run's schedule until its budget ends (then DRAG_HEAT).
+      if (mode === "idle" || mode === "cool") { mode = "drag"; layout.hold(DRAG_HEAT); }
       resume();
     },
     /** Release every pin and re-cool over a short tail, then idle. Mirrors the worker's `unpin`. */
@@ -251,7 +260,7 @@ function startGpuLayoutSync(
       if (stopped) return;
       layout.setPinned(null);
       dragging = false;
-      if (mode === "drag") { mode = "cool"; coolLeft = COOL_TICKS; }
+      if (mode === "drag") { mode = "cool"; coolLeft = RECOOL_TICKS; layout.cool(RECOOL_TICKS, DRAG_HEAT); }
       resume();
     },
   };

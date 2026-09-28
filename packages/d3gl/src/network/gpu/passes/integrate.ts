@@ -1,22 +1,15 @@
 import type { Device, Texture, RenderPass } from "@luma.gl/core";
-import { Model } from "@luma.gl/engine";
-
-/**
- * Full-screen triangle vertex shader. Emits a clip-space triangle that covers
- * the entire viewport so each fragment corresponds to exactly one texel.
- */
-const VS = /* glsl */ `\
-#version 300 es
-in vec2 a_clip;
-void main() { gl_Position = vec4(a_clip, 0.0, 1.0); }
-`;
+import type { Model } from "@luma.gl/engine";
+import { SLOT_TEXEL_GLSL } from "../textures.js";
+import { fullScreenModel, NO_BLEND, type PassUniforms } from "./fullscreen.js";
 
 /**
  * Integrate pass fragment shader.
  *
  * Each fragment maps to one node (id = c.y * u_width + c.x). Reads the current
  * position, velocity, and accumulated force, applies integration
- * (v' = (v + f·α)·damping·stab, |v'| clamped to maxStep; p' = p + v'), and writes
+ * (v' = (v + f·α)·damping·stab, |v'| clamped to maxStep; p' = p + v' — α already carries the
+ * cooling heat, #124), and writes
  * the new position and velocity via MRT to locations 0 and 1 respectively.
  * `stab` is the per-node 1/(1+K̃) spring-stiffness stabilizer (#203) and the step
  * clamp is ISOTROPIC (vector magnitude, mirroring CPU force.ts) — a component-wise
@@ -47,9 +40,10 @@ uniform float u_damping;
 uniform float u_maxStep;
 layout(location = 0) out vec2 o_pos;
 layout(location = 1) out vec2 o_vel;
+${SLOT_TEXEL_GLSL}
 void main() {
   ivec2 c = ivec2(gl_FragCoord.xy);
-  int id = c.y * u_width + c.x;
+  int id = texelSlot(c, u_width);
   if (id >= u_count) { o_pos = vec2(0.0); o_vel = vec2(0.0); return; }
   vec2 p = texelFetch(u_pos,   c, 0).xy;
   vec2 v = texelFetch(u_vel,   c, 0).xy;
@@ -89,31 +83,19 @@ export interface IntegrateUniforms {
 export class IntegratePass {
   private readonly model: Model;
   /** Mutable uniforms dict — mutated before each draw so Model picks them up. */
-  private readonly uniforms: Record<string, number>;
+  private readonly uniforms: PassUniforms;
 
   constructor(device: Device) {
-    // Full-screen triangle: three vertices cover the [-1,1] clip square.
-    const clipBuf = device.createBuffer({
-      data: new Float32Array([-1, -1, 3, -1, -1, 3]),
-    });
-
     this.uniforms = {
       u_count: 0,
       u_width: 1,
       u_alpha: 0,
       u_damping: 0.9,
-      u_maxStep: 1e9, // placeholder default — always overwritten in run() with the span-based clamp
+      u_maxStep: 1e9, // placeholder default — always overwritten in run() with the layout's step cap
     };
 
-    this.model = new Model(device, {
-      vs: VS,
-      fs: FS,
-      topology: "triangle-list",
-      vertexCount: 3,
-      attributes: { a_clip: clipBuf },
-      bufferLayout: [{ name: "a_clip", format: "float32x2" }],
-      uniforms: this.uniforms,
-    });
+    // Each output texel is written exactly once (MRT pos + vel), so no blend.
+    this.model = fullScreenModel(device, FS, this.uniforms, NO_BLEND);
   }
 
   /** Draw one integrate step into an already-open render pass. */

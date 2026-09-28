@@ -1,6 +1,6 @@
 import type { Device, Texture, Framebuffer, RenderPass } from "@luma.gl/core";
 import type { ForceParams, LayoutGraph } from "../force.js";
-import { DAMPING, springStabilizers } from "../force.js";
+import { Cooling, DAMPING, equilibriumSpacing, springStabilizers, stepCap } from "../force.js";
 import { buildCSR } from "../graph.js";
 import { atlasWidth, pingPong, readbackFloatFboReuse, packUintTexture } from "./textures.js";
 import { IntegratePass } from "./passes/integrate.js";
@@ -8,7 +8,11 @@ import { AttractionPass } from "./passes/attraction.js";
 import { RepulsionAllPairsPass } from "./passes/repulsion-allpairs.js";
 import { RepulsionPyramidPass } from "./passes/repulsion-pyramid.js";
 import { GridPyramid } from "./passes/grid-pyramid.js";
-import { CentroidReducePass, CenteringPass, makeSumTarget } from "./passes/centering.js";
+import { CenteringPass } from "./passes/centering.js";
+import { beginPass } from "./passes/fullscreen.js";
+import { SegmentedReduce } from "./passes/segmented-reduce.js";
+import { SegmentTable } from "./segment-table.js";
+import { flatSegments } from "./segments.js";
 
 // DAMPING is imported from force.ts so both integrators share one constant.
 
@@ -30,11 +34,11 @@ export interface GpuForceLayoutOptions {
    */
   repulsionMode?: "allpairs" | "pyramid";
   /**
-   * Override the per-tick displacement clamp (world units). By default it is derived from the seed
-   * positions' bounding box (`span0 * 4`). The multilevel seed (N8.2) seeds each level's position
-   * texture on the **GPU** (prolongation) *after* construction, so the CPU `graph.positions` bbox is
-   * meaningless there — it passes an explicit `maxStep` (a viewport-scaled span) instead. @see
-   * {@link seedFromProlongation}
+   * Override the per-tick displacement clamp (world units). By default it is STEP_CAP equilibrium
+   * spacings ({@link stepCap}, shared with the CPU integrator); only a model without an equilibrium
+   * spacing falls back to 4× the seed positions' bounding box. The multilevel seed (N8.2) seeds each
+   * level's position texture on the **GPU** (prolongation) *after* construction, so it passes its
+   * level's cap explicitly rather than relying on that bbox fallback. @see {@link seedFromProlongation}
    */
   maxStep?: number;
 }
@@ -58,8 +62,19 @@ export class GpuForceLayout {
   private readonly integratePass: IntegratePass;
   private readonly attractionPass: AttractionPass;
   private readonly repulsionPass: RepulsionAllPairsPass;
-  private readonly centroidReducePass: CentroidReducePass;
   private readonly centeringPass: CenteringPass;
+
+  /**
+   * The segment table — S = 1 for the flat layout: one segment `[0, count)` whose `stats`
+   * `(Σx, Σy, Σ|v|, count)` feed centering and whose `box` feeds the pyramid, both written each tick
+   * by {@link reduce}.
+   */
+  private readonly segments: SegmentTable;
+  /**
+   * Contention-free segmented reduction (16-ary gather tree + range query) — replaced the two 1-px
+   * point scatters (centroid, bbox) that serialised every node on one texel.
+   */
+  private readonly reduce: SegmentedReduce;
 
   /**
    * Barnes-Hut repulsion — used when {@link usePyramid} is true. The pyramid
@@ -73,11 +88,12 @@ export class GpuForceLayout {
   private readonly usePyramid: boolean;
 
   /**
-   * Span-based maximum displacement per tick.  Mirrors force.ts's `span0 * 4`
-   * clamp to prevent layout explosion on pathological force configurations.
-   * Set once at construction from the initial position bounding box.
+   * Maximum displacement per tick — STEP_CAP equilibrium spacings, the same {@link stepCap} the CPU
+   * integrator uses — so a dense start can't fling nodes across the layout. Set once at construction.
    */
   private readonly maxStep: number;
+  /** Heat schedule multiplying `alpha` (#124) — the CPU integrator's {@link Cooling}, for parity. */
+  private readonly cooling = new Cooling();
 
   /**
    * Position ping-pong pair. `readTex` = current positions; `writeTex` = render
@@ -94,23 +110,11 @@ export class GpuForceLayout {
   private readonly forceTex: Texture;
   /**
    * Pre-created FBO wrapping `forceTex` — used only for the clear-at-tick-start
-   * step (beginRenderPass with clearColor:[0,0,0,0]).  Force passes render into
+   * step (a pass opened with clear [0,0,0,0]).  Force passes render into
    * it with additive blend.  Pre-created in the constructor per the no-per-tick-
    * alloc rule.
    */
   private readonly forceFbo: Framebuffer;
-
-  /**
-   * 1×1 rg32float texture that accumulates Σpos over all nodes during the
-   * centroid reduction.  Pre-created in the constructor — no per-tick alloc.
-   */
-  private readonly sumTex: Texture;
-  /**
-   * Pre-created FBO wrapping `sumTex`.  Cleared to zero before each centroid
-   * reduction, then CentroidReducePass scatters all node positions into it via
-   * additive blend.
-   */
-  private readonly sumFbo: Framebuffer;
 
   /**
    * The two MRT framebuffer configurations, pre-created once. `swap()` only ever
@@ -185,12 +189,8 @@ export class GpuForceLayout {
     this.width = width;
     this.height = height;
 
-    // Compute initial layout span from positions to set a span-based maxStep.
-    // Mirrors force.ts: span0 = max(2 * rootHalf(), 1) where rootHalf ≈ half-extent.
-    // We approximate by taking the max of x/y extents.  The clamp prevents layout
-    // explosion on the first few ticks (same rationale as the CPU integrator).
-    // TODO(N8.5): if the GPU layout with BH pyramid (Task 5) uses a different span
-    // definition, revisit.
+    // Per-tick step clamp: STEP_CAP equilibrium spacings (shared stepCap). Only a model without a
+    // spacing uses the seed span (max of the x/y extents ≈ force.ts's 2·rootHalf) instead.
     let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
     for (let i = 0; i < graph.nodeCount; i++) {
       const x = graph.positions[i * 2]!;
@@ -200,8 +200,8 @@ export class GpuForceLayout {
     }
     const span0 = Math.max((maxX - minX), (maxY - minY), 1);
     // Explicit override (multilevel seed: positions are GPU-seeded after construction, so the CPU
-    // bbox above is meaningless — the caller passes a viewport-scaled span instead).
-    this.maxStep = options.maxStep ?? span0 * 4;
+    // bbox above is meaningless — the caller passes its level's cap instead).
+    this.maxStep = options.maxStep ?? stepCap(equilibriumSpacing(params), span0);
 
     // Build padded position data (same layout as packPositionsTexture) and seed
     // the position read (A) side with it. Velocity starts zeroed (no seed).
@@ -302,16 +302,19 @@ export class GpuForceLayout {
     this.neighborsTex = nbrResult.texture;
     this.nbrWidth = nbrResult.width;
 
-    // Pre-create the 1×1 sum texture and its FBO for the centroid reduction.
-    // No per-tick allocation — keep the createFramebuffer spy test green.
-    const sumTarget = makeSumTarget(device);
-    this.sumTex = sumTarget.sumTex;
-    this.sumFbo = sumTarget.sumFbo;
+    // Segment table (S = 1) + its reduction: every texture, FBO and model created here, once —
+    // ticking allocates nothing (the createFramebuffer / createTexture spy tests stay green).
+    this.segments = new SegmentTable(device, flatSegments(this.count), {
+      repulsion: params.repulsion,
+      centering: params.centering,
+      softening: 1e-2, // the flat layout's absolute softening (repulsion passes, quadtree.ts)
+      alpha0: 1,
+    });
+    this.reduce = new SegmentedReduce(device, this.count);
 
     this.integratePass = new IntegratePass(device);
     this.attractionPass = new AttractionPass(device);
     this.repulsionPass = new RepulsionAllPairsPass(device);
-    this.centroidReducePass = new CentroidReducePass(device);
     this.centeringPass = new CenteringPass(device);
 
     // Barnes-Hut pyramid + traversal pass. Pre-created in the constructor
@@ -323,6 +326,16 @@ export class GpuForceLayout {
     this.repulsionPyramidPass = new RepulsionPyramidPass(device, this.pyramid.levelCount);
   }
 
+  /** Cool from heat `from` over `ticks` ticks — the CPU {@link ForceLayout.cool} schedule. */
+  cool(ticks: number, from = 1): void {
+    this.cooling.cool(ticks, from);
+  }
+
+  /** Hold a constant heat — a drag reflow (the CPU {@link ForceLayout.hold}). */
+  hold(heat: number): void {
+    this.cooling.hold(heat);
+  }
+
   /** Execute `ticks` integrate steps on the GPU. */
   runFrame(ticks: number): void {
     for (let i = 0; i < ticks; i++) {
@@ -331,22 +344,15 @@ export class GpuForceLayout {
   }
 
   private _tick(): void {
-    // ── 1. Centroid reduction ─────────────────────────────────────────────────
-    // Clear the 1×1 sum texture to zero, then scatter all node positions into it
-    // via additive blend (CentroidReducePass).  The resulting single texel holds
-    // Σpos; dividing by nodeCount in CenteringPass gives the centroid.  This is a
-    // separate render pass (different FBO size) that must complete before the
-    // force pass below reads sumTex.
-    const sumPass = this.device.beginRenderPass({
-      framebuffer: this.sumFbo,
-      clearColor: [0, 0, 0, 0],
-    });
-    this.centroidReducePass.run(sumPass, this.pos.readTex, {
-      count: this.count,
-      width: this.width,
-    });
-    sumPass.end();
-    this.device.submit();
+    // ── 1. Segment reductions ─────────────────────────────────────────────────
+    // Gather tree over slot order + one range query for the flat segment: writes the segment
+    // table's stats (Σx, Σy, Σ|v|, count → the centroid for centering) and box (maxX, maxY, −minX,
+    // −minY → the pyramid's cell geometry). No blending: contention-free and deterministic. Its
+    // passes submit internally, so the pyramid and force passes below see the results.
+    this.reduce.run(
+      { pos: this.pos.readTex, vel: this.vel.readTex, posWidth: this.width, count: this.count },
+      this.segments,
+    );
 
     // ── 1b. Build the Barnes-Hut pyramid (only when this layout uses it) ──────
     // Rebuilds the regular-quadtree COM/mass pyramid over the current positions.
@@ -356,6 +362,7 @@ export class GpuForceLayout {
     if (this.usePyramid) {
       this.pyramid.build({
         posTex: this.pos.readTex,
+        boxTex: this.segments.box,
         count: this.count,
         width: this.width,
       });
@@ -364,13 +371,11 @@ export class GpuForceLayout {
     // ── 2. Clear force texture to zero ────────────────────────────────────────
     // Open a render pass on the force FBO with clearColor:[0,0,0,0] — this zeros
     // all texels so each force pass starts from a known blank slate.
-    const forcePass = this.device.beginRenderPass({
-      framebuffer: this.forceFbo,
-      clearColor: [0, 0, 0, 0],
-    });
+    const forcePass = beginPass(this.device, { framebuffer: this.forceFbo, clear: [0, 0, 0, 0] });
 
     // ── 3. Force passes (additive blend, write into forceTex) ─────────────────
-    // Order among force passes doesn't matter — additive blend accumulates them.
+    // Fixed order — springs, repulsion, centering. Float addition is not associative, so the ADD
+    // blend makes the force bits depend on pass order; keep it stable.
 
     // Attraction (spring gather over CSR neighbors).
     this.attractionPass.run(
@@ -391,7 +396,7 @@ export class GpuForceLayout {
     // baseline); Barnes-Hut grid-pyramid O(n log n) above it. Both additive-blend
     // their per-node force into forceTex.
     if (this.usePyramid) {
-      this.repulsionPyramidPass.run(forcePass, this.pos.readTex, this.pyramid, {
+      this.repulsionPyramidPass.run(forcePass, this.pos.readTex, this.pyramid, this.segments.box, {
         count: this.count,
         width: this.width,
         repulsion: this.params.repulsion,
@@ -405,11 +410,11 @@ export class GpuForceLayout {
       });
     }
 
-    // Centering: pull every node toward the centroid (Σpos / count computed above).
-    this.centeringPass.run(forcePass, this.pos.readTex, this.sumTex, {
+    // Centering: pull every node toward its segment's centroid (the reduction's stats above) with
+    // the segment's centering strength.
+    this.centeringPass.run(forcePass, this.pos.readTex, this.segments, {
       count: this.count,
       width: this.width,
-      centering: this.params.centering,
     });
 
     forcePass.end();
@@ -420,21 +425,16 @@ export class GpuForceLayout {
     // write textures — no per-tick createFramebuffer.
     const fbo = this.fbos[this.parity]!;
 
-    const renderPass = this.device.beginRenderPass({
-      framebuffer: fbo,
-      // Don't clear — every texel is written by the shader (padded texels get
-      // vec2(0) from the `id >= u_count` branch).
-      clearColor: false,
-    });
+    // Don't clear — every texel is written by the shader (padded texels get
+    // vec2(0) from the `id >= u_count` branch).
+    const renderPass = beginPass(this.device, { framebuffer: fbo, clear: false });
 
     this.integratePass.run(renderPass, this.pos.readTex, this.vel.readTex, this.forceTex, this.pinnedTex, this.stabTex, {
       count: this.count,
       width: this.width,
-      alpha: this.params.alpha,
+      alpha: this.params.alpha * this.cooling.heat, // the cooled step (#124), as on the CPU
       damping: DAMPING,
-      // Span-based clamp mirrors force.ts's `span0 * 4` to prevent layout
-      // explosion on pathological forces. See constructor for span0 derivation.
-      maxStep: this.maxStep,
+      maxStep: this.maxStep, // STEP_CAP equilibrium spacings — see constructor
     });
 
     renderPass.end();
@@ -446,6 +446,7 @@ export class GpuForceLayout {
     this.pos.swap();
     this.vel.swap();
     this.parity ^= 1;
+    this.cooling.next();
   }
 
   /**
@@ -509,7 +510,7 @@ export class GpuForceLayout {
   seedFromProlongation(run: (pass: RenderPass) => void): void {
     // readFbos[0] wraps the current read-side position texture (A, parity 0 at construction), so
     // writing it here seeds exactly what the next tick reads.
-    const pass = this.device.beginRenderPass({ framebuffer: this.readFbos[0]!, clearColor: false });
+    const pass = beginPass(this.device, { framebuffer: this.readFbos[0], clear: false });
     run(pass);
     pass.end();
     this.device.submit();
@@ -525,6 +526,16 @@ export class GpuForceLayout {
     out.set(pixels);
   }
 
+  /**
+   * Read back the per-node force the last tick accumulated (springs + repulsion + centering, before
+   * integration) — `count * 2` floats into `out`. A synchronous read for tests and one-off checks,
+   * like {@link readPositions}; never on the streaming path. The force is a function of the
+   * positions that tick started from, which is what the flat-equivalence contract compares.
+   */
+  readForces(out: Float32Array): void {
+    out.set(readbackFloatFboReuse(this.device, this.forceFbo, this.width, this.count));
+  }
+
   destroy(): void {
     this.pos.destroy();
     this.vel.destroy();
@@ -532,8 +543,8 @@ export class GpuForceLayout {
     this.forceFbo.destroy();
     this.pinnedTex.destroy();
     this.stabTex.destroy();
-    this.sumTex.destroy();
-    this.sumFbo.destroy();
+    this.segments.destroy();
+    this.reduce.destroy();
     this.fbos[0].destroy();
     this.fbos[1].destroy();
     this.readFbos[0].destroy();
@@ -543,7 +554,6 @@ export class GpuForceLayout {
     this.integratePass.destroy();
     this.attractionPass.destroy();
     this.repulsionPass.destroy();
-    this.centroidReducePass.destroy();
     this.centeringPass.destroy();
     this.pyramid.destroy();
     this.repulsionPyramidPass.destroy();
