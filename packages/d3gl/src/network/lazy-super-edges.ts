@@ -291,10 +291,10 @@ function stampCovers(sc: LazySuperEdgesScratch, size: number, cutSet: LazyCut): 
   const stamp = gen << 3;
   const { cover, upGen } = sc;
   const { drawn, kept, culled, split } = cutSet;
-  for (let i = 0; i < drawn.length; i++) cover[drawn[i]!] = stamp | DROPPED;
-  for (let i = 0; i < kept.length; i++) cover[kept[i]!] = stamp | KEPT;
-  for (let i = 0; i < culled.length; i++) cover[culled[i]!] = stamp | CULLED;
-  for (let i = 0; i < split.length; i++) upGen[split[i]!] = -gen;
+  for (let i = 0; i < drawn.length; i++) cover[drawn[i] ?? 0] = stamp | DROPPED;
+  for (let i = 0; i < kept.length; i++) cover[kept[i] ?? 0] = stamp | KEPT;
+  for (let i = 0; i < culled.length; i++) cover[culled[i] ?? 0] = stamp | CULLED;
+  for (let i = 0; i < split.length; i++) upGen[split[i] ?? 0] = -gen;
   return gen;
 }
 
@@ -689,9 +689,9 @@ export function rowSuperEdges(
   // touched nodes are written; a split glyph's `−gen` mark sits on a stamped node, so it is never written).
   const resolve = (t: number): number => {
     let x = t;
-    while (x >= 0 && cover[x]! >> 3 !== gen && upGen[x] !== gen) x = parent[x]!;
-    const c = x < 0 ? -1 : cover[x]! >> 3 === gen ? (upGen[x] === -gen ? -1 : x) : up[x]!;
-    for (let y = t; y !== x; y = parent[y]!) { up[y] = c; upGen[y] = gen; }
+    while (x >= 0 && (cover[x] ?? 0) >> 3 !== gen && upGen[x] !== gen) x = parent[x] ?? -1;
+    const c = x < 0 ? -1 : (cover[x] ?? 0) >> 3 === gen ? (upGen[x] === -gen ? -1 : x) : (up[x] ?? 0);
+    for (let y = t; y !== x; y = parent[y] ?? -1) { up[y] = c; upGen[y] = gen; }
     return c;
   };
 
@@ -704,9 +704,9 @@ export function rowSuperEdges(
   // root, and a decluttered glyph whose centre left the view). A decluttered glyph on screen is linked to
   // nothing, so a pair found only from its rows would be dropped anyway — except, in a band, inside a kept
   // split glyph, whose row sums its members' pairs.
-  const offScreen = (h: number): boolean => tree.cx[h]! < view.minX || tree.cx[h]! > view.maxX || tree.cy[h]! < view.minY || tree.cy[h]! > view.maxY;
+  const offScreen = (h: number): boolean => (tree.cx[h] ?? 0) < view.minX || (tree.cx[h] ?? 0) > view.maxX || (tree.cy[h] ?? 0) < view.minY || (tree.cy[h] ?? 0) > view.maxY;
   const inKeptSplit = (c: number): boolean => {
-    for (let y = parent[c]!; y >= 0; y = parent[y]!) if (upGen[y] === -gen && (cover[y]! & 7) === KEPT) return true;
+    for (let y = parent[c] ?? -1; y >= 0; y = parent[y] ?? -1) if (upGen[y] === -gen && ((cover[y] ?? 0) & 7) === KEPT) return true;
     return false;
   };
   // Outside a band, a cover shallower than every kept glyph is not walked either: its row keeps only
@@ -715,18 +715,21 @@ export function rowSuperEdges(
   let floor = 0;
   if (!fading) {
     floor = Infinity;
-    for (let i = 0; i < cutSet.kept.length; i++) floor = Math.min(floor, depth[cutSet.kept[i]!]!);
+    for (let i = 0; i < cutSet.kept.length; i++) floor = Math.min(floor, depth[cutSet.kept[i] ?? 0] ?? 0);
   }
   if (sc.walked.length < drawn.length + culled.length) sc.walked = new Uint32Array(Math.max(drawn.length + culled.length, 2 * sc.walked.length));
   const walked = sc.walked;
   let m = 0;
   for (let i = 0; i < drawn.length; i++) {
-    const c = drawn[i]!;
+    const c = drawn[i] ?? 0;
     if (fading && upGen[c] === -gen) continue; // split: its members are the finer covers
-    const kept = (cover[c]! & 7) === KEPT;
-    if (kept || (depth[c]! >= floor && (offScreen(c) || (fading && inKeptSplit(c))))) walked[m++] = c;
+    const kept = ((cover[c] ?? 0) & 7) === KEPT;
+    if (kept || ((depth[c] ?? 0) >= floor && (offScreen(c) || (fading && inKeptSplit(c))))) walked[m++] = c;
   }
-  for (let i = 0; i < culled.length; i++) if (depth[culled[i]!]! >= floor) walked[m++] = culled[i]!;
+  for (let i = 0; i < culled.length; i++) {
+    const c = culled[i] ?? 0;
+    if ((depth[c] ?? 0) >= floor) walked[m++] = c;
+  }
   const walkList = walked.subarray(0, m);
 
   // A walked cell the worker's rows do not list (its view moved since): its row from this tree's cache, or
@@ -743,21 +746,21 @@ export function rowSuperEdges(
   if (sc.missing.length < m) sc.missing = new Uint32Array(Math.max(m, 2 * sc.missing.length));
   let k = 0;
   for (let i = 0; i < m; i++) {
-    const c = walkList[i]!;
+    const c = walkList[i] ?? 0;
     if (c < n) continue; // a leaf's row is its graph edges
     if (rowOf(rows, c) >= 0 || sc.cacheIndex.find(c, c, sc.cacheCell, sc.cacheCell) >= 0) sc.hits++;
     else sc.missing[k++] = c;
   }
   if (k > 0) {
     const missing = sc.missing.subarray(0, k);
-    missing.sort((a, b) => depth[a]! - depth[b]!);
+    missing.sort((a, b) => (depth[a] ?? 0) - (depth[b] ?? 0));
     if (sc.label.length < 2 * n) sc.label = new Int32Array(2 * n);
     const label = sc.label;
     let liftDepth = -1;
     let lift = 0;
     for (let i = 0; i < k; i++) {
-      const c = missing[i]!;
-      const dc = depth[c]!;
+      const c = missing[i] ?? 0;
+      const dc = depth[c] ?? 0;
       if (dc !== liftDepth) {
         liftDepth = dc;
         if (sc.liftGen <= -MAX_GEN) { label.fill(0); sc.liftGen = 0; }
@@ -766,24 +769,24 @@ export function rowSuperEdges(
       if (sc.rowSeq === 0x7fffffff) { rowMark.fill(0); sc.rowSeq = 0; }
       const rs = ++sc.rowSeq;
       const first = sc.cacheEnts;
-      for (let q = leafStart[c]!; q < leafEnd[c]!; q++) {
-        const u = leafOrder[q]!;
-        const p1 = offsets[u + 1]!;
-        sc.visits += p1 - offsets[u]!;
-        for (let p = offsets[u]!; p < p1; p++) {
+      for (let q = leafStart[c] ?? 0; q < (leafEnd[c] ?? 0); q++) {
+        const u = leafOrder[q] ?? 0;
+        const p1 = offsets[u + 1] ?? 0;
+        sc.visits += p1 - (offsets[u] ?? 0);
+        for (let p = offsets[u] ?? 0; p < p1; p++) {
           // The neighbour's node at this cell's depth (itself when shallower), memoised per leaf and depth.
-          const v = neighbors[p]!;
+          const v = neighbors[p] ?? 0;
           let t: number;
-          if (label[2 * v] === lift) t = label[2 * v + 1]!;
+          if (label[2 * v] === lift) t = label[2 * v + 1] ?? 0;
           else {
             t = v;
-            while (depth[t]! > dc) t = parent[t]!;
+            while ((depth[t] ?? 0) > dc) t = parent[t] ?? -1;
             label[2 * v] = lift;
             label[2 * v + 1] = t;
           }
           if (t === c) continue; // inside the cell
           let e: number;
-          if (rowMark[t] === rs) e = rowSlot[t]!;
+          if (rowMark[t] === rs) e = rowSlot[t] ?? 0;
           else {
             if (sc.cacheEnts === sc.cacheNode.length) growCacheEntries(sc, sc.cacheEnts + 1);
             e = sc.cacheEnts++;
@@ -794,13 +797,13 @@ export function rowSuperEdges(
             sc.cacheIn[e] = 0;
             sc.cacheDir[e] = 0;
           }
-          const w = incW ? incW[p]! : uniform;
+          const w = incW ? (incW[p] ?? 0) : uniform;
           if (incOut[p] === 1) {
-            sc.cacheOut[e] = sc.cacheOut[e]! + w;
-            sc.cacheDir[e] = sc.cacheDir[e]! | HAS_OUT;
+            sc.cacheOut[e] = (sc.cacheOut[e] ?? 0) + w;
+            sc.cacheDir[e] = (sc.cacheDir[e] ?? 0) | HAS_OUT;
           } else {
-            sc.cacheIn[e] = sc.cacheIn[e]! + w;
-            sc.cacheDir[e] = sc.cacheDir[e]! | HAS_IN;
+            sc.cacheIn[e] = (sc.cacheIn[e] ?? 0) + w;
+            sc.cacheDir[e] = (sc.cacheDir[e] ?? 0) | HAS_IN;
           }
         }
       }
@@ -820,7 +823,7 @@ export function rowSuperEdges(
   let seq = 0;
   const add = (c: number, w: number, out: boolean): void => {
     let e: number;
-    if (rowMark[c] === seq) e = rowSlot[c]!;
+    if (rowMark[c] === seq) e = rowSlot[c] ?? 0;
     else {
       if (sc.ents === sc.entH.length) growEntries(sc, sc.ents + 1);
       e = sc.ents++;
@@ -832,18 +835,18 @@ export function rowSuperEdges(
       sc.entDir[e] = 0;
     }
     if (out) {
-      sc.entOut[e] = sc.entOut[e]! + w;
-      sc.entDir[e] = sc.entDir[e]! | HAS_OUT;
+      sc.entOut[e] = (sc.entOut[e] ?? 0) + w;
+      sc.entDir[e] = (sc.entDir[e] ?? 0) | HAS_OUT;
     } else {
-      sc.entIn[e] = sc.entIn[e]! + w;
-      sc.entDir[e] = sc.entDir[e]! | HAS_IN;
+      sc.entIn[e] = (sc.entIn[e] ?? 0) + w;
+      sc.entDir[e] = (sc.entDir[e] ?? 0) | HAS_IN;
     }
   };
   // Whether the walked cover keeps the pair with cover c: c strictly shallower, or at its depth with a larger id.
-  const keeps = (c: number): boolean => c >= 0 && c !== x && (depth[c]! < dx || (depth[c]! === dx && x < c));
+  const keeps = (c: number): boolean => c >= 0 && c !== x && ((depth[c] ?? 0) < dx || ((depth[c] ?? 0) === dx && x < c));
   const walk = (cov: number): void => {
     x = cov;
-    dx = depth[cov]!;
+    dx = depth[cov] ?? 0;
     if (sc.rowSeq === 0x7fffffff) { rowMark.fill(0); sc.rowSeq = 0; }
     seq = ++sc.rowSeq;
     const start = sc.ents;
@@ -851,37 +854,37 @@ export function rowSuperEdges(
       // A leaf: its graph edges are its row, each resolved from the neighbour — the row's entry would be the
       // neighbour's node at this depth (or the neighbour, when shallower), whose finest cover is the
       // neighbour's when that is no deeper than the leaf, and none otherwise — so `keeps` applies as is.
-      const p1 = offsets[cov + 1]!;
-      entries += p1 - offsets[cov]!;
-      for (let p = offsets[cov]!; p < p1; p++) {
-        const c = resolve(neighbors[p]!);
-        if (keeps(c)) add(c, incW ? incW[p]! : uniform, incOut[p] === 1);
+      const p1 = offsets[cov + 1] ?? 0;
+      entries += p1 - (offsets[cov] ?? 0);
+      for (let p = offsets[cov] ?? 0; p < p1; p++) {
+        const c = resolve((neighbors[p] ?? 0));
+        if (keeps(c)) add(c, incW ? (incW[p] ?? 0) : uniform, incOut[p] === 1);
       }
     } else {
       const r = rowOf(rows, cov);
       if (r >= 0) {
-        const o1 = outOffset[r + 1]!;
-        const i1 = inOffset[r + 1]!;
-        entries += o1 - outOffset[r]! + i1 - inOffset[r]!;
-        for (let e = outOffset[r]!; e < o1; e++) {
-          const c = resolve(outNode[e]!);
-          if (keeps(c)) add(c, outFlow[e]!, true);
+        const o1 = outOffset[r + 1] ?? 0;
+        const i1 = inOffset[r + 1] ?? 0;
+        entries += o1 - (outOffset[r] ?? 0) + i1 - (inOffset[r] ?? 0);
+        for (let e = outOffset[r] ?? 0; e < o1; e++) {
+          const c = resolve((outNode[e] ?? 0));
+          if (keeps(c)) add(c, (outFlow[e] ?? 0), true);
         }
-        for (let e = inOffset[r]!; e < i1; e++) {
-          const c = resolve(inNode[e]!);
-          if (keeps(c)) add(c, inFlow[e]!, false);
+        for (let e = inOffset[r] ?? 0; e < i1; e++) {
+          const c = resolve((inNode[e] ?? 0));
+          if (keeps(c)) add(c, (inFlow[e] ?? 0), false);
         }
       } else {
         const cr = sc.cacheIndex.find(cov, cov, sc.cacheCell, sc.cacheCell);
-        const e0 = sc.cacheStart[cr]!;
-        const e1 = e0 + sc.cacheLen[cr]!;
+        const e0 = sc.cacheStart[cr] ?? 0;
+        const e1 = e0 + (sc.cacheLen[cr] ?? 0);
         entries += e1 - e0;
         for (let e = e0; e < e1; e++) {
-          const c = resolve(sc.cacheNode[e]!);
+          const c = resolve((sc.cacheNode[e] ?? 0));
           if (!keeps(c)) continue;
-          const d = sc.cacheDir[e]!;
-          if (d & HAS_OUT) add(c, sc.cacheOut[e]!, true);
-          if (d & HAS_IN) add(c, sc.cacheIn[e]!, false);
+          const d = sc.cacheDir[e] ?? 0;
+          if (d & HAS_OUT) add(c, (sc.cacheOut[e] ?? 0), true);
+          if (d & HAS_IN) add(c, (sc.cacheIn[e] ?? 0), false);
         }
       }
     }
@@ -891,7 +894,7 @@ export function rowSuperEdges(
     sc.rowStart[i] = start;
     sc.rowLen[i] = sc.ents - start;
   };
-  for (let i = 0; i < m; i++) walk(walkList[i]!);
+  for (let i = 0; i < m; i++) walk((walkList[i] ?? 0));
   sc.entries = entries;
 
   // Draw, by the lazy gather's rules.
@@ -932,15 +935,15 @@ export function rowSuperEdges(
   };
   const swap = (dir: number): number => ((dir & HAS_OUT) << 1) | ((dir & HAS_IN) >> 1);
   for (let i = 0; i < sc.rows; i++) {
-    const a = sc.rowG[i]!;
-    const aKept = (cover[a]! & 7) === KEPT;
-    const e1 = sc.rowStart[i]! + sc.rowLen[i]!;
-    for (let e = sc.rowStart[i]!; e < e1; e++) {
-      const b = sc.entH[e]!;
-      const ab = sc.entOut[e]!;
-      const ba = sc.entIn[e]!;
-      const dir = sc.entDir[e]!;
-      const bKept = (cover[b]! & 7) === KEPT;
+    const a = sc.rowG[i] ?? 0;
+    const aKept = ((cover[a] ?? 0) & 7) === KEPT;
+    const e1 = (sc.rowStart[i] ?? 0) + (sc.rowLen[i] ?? 0);
+    for (let e = sc.rowStart[i] ?? 0; e < e1; e++) {
+      const b = sc.entH[e] ?? 0;
+      const ab = sc.entOut[e] ?? 0;
+      const ba = sc.entIn[e] ?? 0;
+      const dir = sc.entDir[e] ?? 0;
+      const bKept = ((cover[b] ?? 0) & 7) === KEPT;
       if (aKept && bKept) {
         if (!directed) push(a < b ? a : b, a < b ? b : a, ab + ba);
         else {
@@ -972,36 +975,36 @@ export function rowSuperEdges(
         sc.aggDir[r] = 0;
         aggs++;
       }
-      sc.aggOut[r] = sc.aggOut[r]! + sh;
-      sc.aggIn[r] = sc.aggIn[r]! + hs;
-      sc.aggDir[r] = sc.aggDir[r]! | dir;
+      sc.aggOut[r] = (sc.aggOut[r] ?? 0) + sh;
+      sc.aggIn[r] = (sc.aggIn[r] ?? 0) + hs;
+      sc.aggDir[r] = (sc.aggDir[r] ?? 0) | dir;
     };
     // Every kept split glyph above cover c that does not also hold cover h.
     const lift = (c: number, h: number, ch: number, hc: number, dir: number): void => {
-      const r = leafStart[h]!;
-      for (let y = parent[c]!; y >= 0; y = parent[y]!) {
-        if (upGen[y] !== -gen || (cover[y]! & 7) !== KEPT) continue;
-        if (r >= leafStart[y]! && r < leafEnd[y]!) continue;
+      const r = leafStart[h] ?? 0;
+      for (let y = parent[c] ?? -1; y >= 0; y = parent[y] ?? -1) {
+        if (upGen[y] !== -gen || ((cover[y] ?? 0) & 7) !== KEPT) continue;
+        if (r >= (leafStart[y] ?? 0) && r < (leafEnd[y] ?? 0)) continue;
         addAgg(y, h, ch, hc, dir);
       }
     };
     for (let i = 0; i < sc.rows; i++) {
-      const a = sc.rowG[i]!;
-      const e1 = sc.rowStart[i]! + sc.rowLen[i]!;
-      for (let e = sc.rowStart[i]!; e < e1; e++) {
-        const b = sc.entH[e]!;
-        const dir = sc.entDir[e]!;
-        lift(a, b, sc.entOut[e]!, sc.entIn[e]!, dir);
-        lift(b, a, sc.entIn[e]!, sc.entOut[e]!, swap(dir));
+      const a = sc.rowG[i] ?? 0;
+      const e1 = (sc.rowStart[i] ?? 0) + (sc.rowLen[i] ?? 0);
+      for (let e = sc.rowStart[i] ?? 0; e < e1; e++) {
+        const b = sc.entH[e] ?? 0;
+        const dir = sc.entDir[e] ?? 0;
+        lift(a, b, (sc.entOut[e] ?? 0), (sc.entIn[e] ?? 0), dir);
+        lift(b, a, (sc.entIn[e] ?? 0), (sc.entOut[e] ?? 0), swap(dir));
       }
     }
     for (let r = 0; r < aggs; r++) {
-      const g = sc.aggS[r]!;
-      const h = sc.aggH[r]!;
-      const gh = sc.aggOut[r]!;
-      const hg = sc.aggIn[r]!;
-      const dir = sc.aggDir[r]!;
-      if ((cover[h]! & 7) === KEPT) {
+      const g = sc.aggS[r] ?? 0;
+      const h = sc.aggH[r] ?? 0;
+      const gh = sc.aggOut[r] ?? 0;
+      const hg = sc.aggIn[r] ?? 0;
+      const dir = sc.aggDir[r] ?? 0;
+      if (((cover[h] ?? 0) & 7) === KEPT) {
         // Only from the split glyph's side: the other glyph's members resolve to its finer covers.
         if (!directed) { if (g < h) push(g, h, gh + hg); }
         else if (dir & HAS_OUT) { push(g, h, gh); if (reciprocal) pairLast(); }

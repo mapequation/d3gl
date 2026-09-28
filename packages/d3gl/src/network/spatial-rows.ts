@@ -96,7 +96,7 @@ export function rowOf(rows: SpatialRows, x: number): number {
   let hi = cell.length;
   while (lo < hi) {
     const mid = (lo + hi) >>> 1;
-    if (cell[mid]! < x) lo = mid + 1;
+    if ((cell[mid] ?? 0) < x) lo = mid + 1;
     else hi = mid;
   }
   return lo < cell.length && cell[lo] === x ? lo : -1;
@@ -139,7 +139,7 @@ export interface IncidenceEdges {
  */
 export function incidenceArrays(csr: CSR, edges: IncidenceEdges, directed: boolean): IncidenceArrays {
   const { edgeCount, weight: w } = edges;
-  let uniformWeight = edgeCount > 0 ? w[0]! : 1;
+  let uniformWeight = edgeCount > 0 ? (w[0] ?? 0) : 1;
   for (let e = 1; e < edgeCount; e++) {
     if (w[e] !== uniformWeight) { uniformWeight = NaN; break; }
   }
@@ -156,12 +156,12 @@ function incidenceWeights(csr: CSR, { source, target, weight: w, edgeCount, node
   const weight = new Float32Array(csr.neighbors.length);
   const cursor = csr.offsets.slice(0, nodeCount);
   for (let e = 0; e < edgeCount; e++) {
-    const s = source[e]!;
-    const t = target[e]!;
-    weight[cursor[s]!] = w[e]!;
-    cursor[s] = cursor[s]! + 1;
-    weight[cursor[t]!] = w[e]!;
-    cursor[t] = cursor[t]! + 1;
+    const s = source[e] ?? 0;
+    const t = target[e] ?? 0;
+    weight[cursor[s] ?? 0] = w[e] ?? 0;
+    cursor[s] = (cursor[s] ?? 0) + 1;
+    weight[cursor[t] ?? 0] = w[e] ?? 0;
+    cursor[t] = (cursor[t] ?? 0) + 1;
   }
   return weight;
 }
@@ -171,11 +171,11 @@ function incidenceDirections(csr: CSR, { source, target, edgeCount, nodeCount }:
   const out = new Uint8Array(csr.neighbors.length);
   const cursor = csr.offsets.slice(0, nodeCount);
   for (let e = 0; e < edgeCount; e++) {
-    const s = source[e]!;
-    const t = target[e]!;
-    out[cursor[s]!] = 1; // the target's entry stays 0: an in-edge of t
-    cursor[s] = cursor[s]! + 1;
-    cursor[t] = cursor[t]! + 1;
+    const s = source[e] ?? 0;
+    const t = target[e] ?? 0;
+    out[cursor[s] ?? 0] = 1; // the target's entry stays 0: an in-edge of t
+    cursor[s] = (cursor[s] ?? 0) + 1;
+    cursor[t] = (cursor[t] ?? 0) + 1;
   }
   return out;
 }
@@ -307,7 +307,7 @@ export function cutRowCells(
 ): number {
   const depthOf = (x: number): number => {
     let d = 0;
-    for (let y = parent[x]!; y >= 0; y = parent[y]!) d++;
+    for (let y = parent[x] ?? -1; y >= 0; y = parent[y] ?? -1) d++;
     return d;
   };
   const { drawn, culled, split } = cutSet;
@@ -315,7 +315,7 @@ export function cutRowCells(
   let min = 0;
   if (!fading) {
     min = Infinity;
-    for (let i = 0; i < floor.length; i++) min = Math.min(min, depthOf(floor[i]!));
+    for (let i = 0; i < floor.length; i++) min = Math.min(min, depthOf(floor[i] ?? 0));
   }
   const need = drawn.length + culled.length;
   if (out.cells.length < need) out.cells = new Uint32Array(Math.max(need, 2 * out.cells.length));
@@ -328,19 +328,19 @@ export function cutRowCells(
     let hi = splits.length;
     while (lo < hi) {
       const mid = (lo + hi) >>> 1;
-      if (splits[mid]! < g) lo = mid + 1;
+      if ((splits[mid] ?? 0) < g) lo = mid + 1;
       else hi = mid;
     }
     return lo < splits.length && splits[lo] === g;
   };
   let m = 0;
   for (let i = 0; i < drawn.length; i++) {
-    const g = drawn[i]!;
+    const g = drawn[i] ?? 0;
     if (isSplit(g) || (!fading && depthOf(g) < min)) continue;
     cells[m++] = g;
   }
   for (let i = 0; i < culled.length; i++) {
-    const g = culled[i]!;
+    const g = culled[i] ?? 0;
     if (!fading && depthOf(g) < min) continue;
     cells[m++] = g;
   }
@@ -379,8 +379,8 @@ export function buildCoverRows(
   // Depth below the root: a spatial tree numbers a parent above its children, so a descending pass sets it first.
   const depth = sc.depth;
   for (let g = size - 1; g >= 0; g--) {
-    const p = parent[g]!;
-    depth[g] = p < 0 ? 0 : depth[p]! + 1;
+    const p = parent[g] ?? -1;
+    depth[g] = p < 0 ? 0 : (depth[p] ?? 0) + 1;
   }
   // The listed cells, deduplicated (a mark per cell, from the merge marks' sequence) and ascending.
   growCells(sc, covers.length);
@@ -388,7 +388,7 @@ export function buildCoverRows(
   const listed = ++sc.seq;
   let cells = 0;
   for (let i = 0; i < covers.length; i++) {
-    const x = covers[i]!;
+    const x = covers[i] ?? 0;
     if (x < n || x >= size || sc.markOut[x] === listed) continue;
     sc.markOut[x] = listed;
     sc.cells[cells++] = x;
@@ -400,12 +400,15 @@ export function buildCoverRows(
   // whatever the mix of cover depths. A counting sort of the cell indices by depth, descending.
   const byDepth = sc.byDepth;
   byDepth.fill(0);
-  for (let i = 0; i < cells; i++) byDepth[255 - depth[cellIds[i]!]! + 1]!++;
-  for (let d = 0; d < 256; d++) byDepth[d + 1] = byDepth[d + 1]! + byDepth[d]!;
   for (let i = 0; i < cells; i++) {
-    const d = 255 - depth[cellIds[i]!]!;
-    sc.order[byDepth[d]!] = i;
-    byDepth[d] = byDepth[d]! + 1;
+    const k = 256 - (depth[cellIds[i] ?? 0] ?? 0);
+    byDepth[k] = (byDepth[k] ?? 0) + 1;
+  }
+  for (let d = 0; d < 256; d++) byDepth[d + 1] = (byDepth[d + 1] ?? 0) + (byDepth[d] ?? 0);
+  for (let i = 0; i < cells; i++) {
+    const d = 255 - (depth[cellIds[i] ?? 0] ?? 0);
+    sc.order[byDepth[d] ?? 0] = i;
+    byDepth[d] = (byDepth[d] ?? 0) + 1;
   }
   const { markOut, slotOut, markIn, slotIn, up, upGen } = sc;
   const { offsets, neighbors } = graph.csr;
@@ -417,31 +420,31 @@ export function buildCoverRows(
   if (sc.liftGen >= 0x7fffffff) { upGen.fill(0); sc.liftGen = 0; }
   const gen = ++sc.liftGen; // up[v] is valid for this build while upGen[v] === gen
   for (let o = 0; o < cells; o++) {
-    const i = sc.order[o]!;
-    const x = cellIds[i]!;
-    const dx = depth[x]!;
+    const i = sc.order[o] ?? 0;
+    const x = cellIds[i] ?? 0;
+    const dx = depth[x] ?? 0;
     const seq = ++sc.seq;
     sc.outStart[i] = outLen;
     sc.inStart[i] = inLen;
-    const r1 = leafEnd[x]!;
-    for (let r = leafStart[x]!; r < r1; r++) {
-      const u = leafOrder[r]!;
-      const p1 = offsets[u + 1]!;
-      for (let p = offsets[u]!; p < p1; p++) {
+    const r1 = leafEnd[x] ?? 0;
+    for (let r = leafStart[x] ?? 0; r < r1; r++) {
+      const u = leafOrder[r] ?? 0;
+      const p1 = offsets[u + 1] ?? 0;
+      for (let p = offsets[u] ?? 0; p < p1; p++) {
         // The neighbour's node at this cell's depth (itself when shallower), lifted on from where it last was.
-        const v = neighbors[p]!;
-        let t = upGen[v] === gen ? up[v]! : v;
-        while (depth[t]! > dx) t = parent[t]!;
+        const v = neighbors[p] ?? 0;
+        let t = upGen[v] === gen ? (up[v] ?? 0) : v;
+        while ((depth[t] ?? 0) > dx) t = parent[t] ?? -1;
         up[v] = t;
         upGen[v] = gen;
         // Only a node under this cell lifts onto it, and nothing at its depth or above lies inside it: so
         // `t === x` is exactly an edge inside the cell, self-loops included.
         if (t === x) continue;
-        const w = incW ? incW[p]! : uniform;
+        const w = incW ? (incW[p] ?? 0) : uniform;
         if (incOut[p] === 1) {
           if (markOut[t] === seq) {
-            const e = slotOut[t]!;
-            sc.outFlow[e] = sc.outFlow[e]! + w;
+            const e = slotOut[t] ?? 0;
+            sc.outFlow[e] = (sc.outFlow[e] ?? 0) + w;
           } else {
             if (outLen === sc.outNode.length) growOut(sc, outLen + 1);
             markOut[t] = seq;
@@ -450,8 +453,8 @@ export function buildCoverRows(
             sc.outFlow[outLen++] = 0 + w; // a sum from +0
           }
         } else if (markIn[t] === seq) {
-          const e = slotIn[t]!;
-          sc.inFlow[e] = sc.inFlow[e]! + w;
+          const e = slotIn[t] ?? 0;
+          sc.inFlow[e] = (sc.inFlow[e] ?? 0) + w;
         } else {
           if (inLen === sc.inNode.length) growIn(sc, inLen + 1);
           markIn[t] = seq;
@@ -461,8 +464,8 @@ export function buildCoverRows(
         }
       }
     }
-    sc.outLen[i] = outLen - sc.outStart[i]!;
-    sc.inLen[i] = inLen - sc.inStart[i]!;
+    sc.outLen[i] = outLen - (sc.outStart[i] ?? 0);
+    sc.inLen[i] = inLen - (sc.inStart[i] ?? 0);
   }
   const sizes: SpatialRowsSizes = { size, leafCount: n, cells, outEntries: outLen, inEntries: inLen };
   const rows = allocate(sizes);
@@ -474,13 +477,13 @@ export function buildCoverRows(
   for (let i = 0; i < cells; i++) {
     rows.outOffset[i] = oa;
     rows.inOffset[i] = ia;
-    const os = sc.outStart[i]!;
-    const ol = sc.outLen[i]!;
+    const os = sc.outStart[i] ?? 0;
+    const ol = sc.outLen[i] ?? 0;
     rows.outNode.set(sc.outNode.subarray(os, os + ol), oa);
     rows.outFlow.set(sc.outFlow.subarray(os, os + ol), oa);
     oa += ol;
-    const is = sc.inStart[i]!;
-    const il = sc.inLen[i]!;
+    const is = sc.inStart[i] ?? 0;
+    const il = sc.inLen[i] ?? 0;
     rows.inNode.set(sc.inNode.subarray(is, is + il), ia);
     rows.inFlow.set(sc.inFlow.subarray(is, is + il), ia);
     ia += il;
