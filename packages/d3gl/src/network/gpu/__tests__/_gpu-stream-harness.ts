@@ -67,7 +67,7 @@ import { DEFAULT_BUDGET_MS, frameBudgetMs, staticBands } from "../frame-budget.j
 import { observeGpuLayoutFrames, type GpuFrameSample } from "../gpu-stream.js";
 import { MIN_FRAME_MS } from "../repaint-throttle.js";
 import { makeTestDevice } from "./_device.js";
-import { InstancedArrows, InstancedCircles, InstancedHalfArrows, InstancedLines, InstancedPie } from "../../../webgl/instanced.js";
+import { expectLaneGrowthOnly, wrapLaneUpdates } from "./_lane-growth.js";
 import { perfBudget, perfN } from "../../../__tests__/perf-budget.js";
 import { perfHost } from "../../../__tests__/engine-sweep.js";
 
@@ -127,7 +127,7 @@ type GlEvent =
  * Logs the GL calls the streaming contract is about, in order, by wrapping the installed prototype
  * methods (cast-free: `defineProperty` takes the wrapper as a plain value) and restoring them after.
  * Each instanced lane's `update` is bracketed with its capacity before and after, so a GPU object
- * created inside it reads as that lane growing (see {@link attributeCreates}).
+ * created inside it reads as that lane growing (`_lane-growth.ts`).
  */
 class GlCallLog {
   readonly events: GlEvent[] = [];
@@ -156,28 +156,7 @@ class GlCallLog {
     for (const name of ["createBuffer", "createTexture", "createFramebuffer"] as const) {
       this.wrap(proto, name, () => log.push({ kind: "create", inSolver: inSolver() }));
     }
-    this.wrapLane(InstancedCircles.prototype);
-    this.wrapLane(InstancedPie.prototype);
-    this.wrapLane(InstancedLines.prototype);
-    this.wrapLane(InstancedArrows.prototype);
-    this.wrapLane(InstancedHalfArrows.prototype);
-  }
-
-  private wrapLane<A extends unknown[], R>(proto: { readonly capacity: number; update(...args: A): R }): void {
-    const installed = proto.update;
-    const log = this.events;
-    Object.defineProperty(proto, "update", {
-      configurable: true,
-      writable: true,
-      value: function (this: { readonly capacity: number }, ...args: A): R {
-        const before = this.capacity;
-        log.push({ kind: "lane-begin" });
-        const result = installed.apply(this, args);
-        log.push({ kind: "lane-end", before, after: this.capacity });
-        return result;
-      },
-    });
-    this.restores.push(() => Object.defineProperty(proto, "update", { configurable: true, writable: true, value: installed }));
+    this.restores.push(wrapLaneUpdates(log));
   }
 
   private wrap(
@@ -451,32 +430,6 @@ function perFrame(events: GlEvent[]): GlEvent[][] {
   return out;
 }
 
-/**
- * Split the GPU objects created in `events` into the grows of an instanced lane (created inside its
- * `update` while its capacity rose) and the rest (`stray`): anything the transport or the engine created
- * outside a lane update, and a lane update that recreated its buffers without growing them.
- */
-function attributeCreates(events: GlEvent[]): { stray: number; grows: { before: number; after: number }[] } {
-  let stray = 0;
-  let open = false;
-  let inLane = 0;
-  const grows: { before: number; after: number }[] = [];
-  for (const e of events) {
-    if (e.kind === "lane-begin") {
-      open = true;
-      inLane = 0;
-    } else if (e.kind === "create") {
-      if (open) inLane++;
-      else stray++;
-    } else if (e.kind === "lane-end") {
-      open = false;
-      if (inLane > 0 && e.after > e.before) grows.push({ before: e.before, after: e.after });
-      else stray += inLane;
-    }
-  }
-  return { stray, grows };
-}
-
 /** The deterministic streaming signatures every leg must show. */
 function assertSignatures(leg: Leg): void {
   const { frames, events } = leg;
@@ -533,11 +486,7 @@ function assertSignatures(leg: Leg): void {
   // must at least double the lane's capacity, so it happens log2(peak / first) times over the run; an
   // exact fit reallocated on every repaint that set a new high.
   const firstRepaint = frames.findIndex((s, f) => s.repainted && (!leg.lod || leg.cut[f] === true));
-  const { stray, grows } = attributeCreates(segments.slice(firstRepaint + 1).flat());
-  expect(stray, "GPU objects created per streamed frame").toBe(0);
-  for (const g of grows) {
-    expect(g.after, `an instanced lane grew from ${g.before} to ${g.after} instances, less than double`).toBeGreaterThanOrEqual(2 * g.before);
-  }
+  expectLaneGrowthOnly(segments.slice(firstRepaint + 1).flat());
 
   // Repaints throttled to ≥ minFrameMs apart (the final one, which always paints, excepted). Counted by the
   // `repainted` flag, as the drag legs are: a clamped clock measures a cheap repaint as 0 ms.
