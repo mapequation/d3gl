@@ -258,18 +258,26 @@ net
   once the layout has converged. The other backends rebuild it on the main thread whenever a layout
   lands (a new layout, a streamed GPU frame); a position transition or a drag only refits the tree it
   has, and rebuilds it once the nodes come to rest.
-- **Links are gathered per frame.** A rebuilt tree has no super-edge table (building one per frame
+- **Links are summed from the graph.** A rebuilt tree has no super-edge table (building one per frame
   would cost more than the layout tick); the links between drawn glyphs are summed from the graph's own
   edges through the glyphs' members. Every neighbour resolves to the one glyph that covers it, so links
   between glyphs at different levels are always drawn (`crossLevelEdges` makes no difference here), a
   link leaving the view points at the off-screen cell that holds its neighbour (a coarser cell the
   further away it is), and an undirected pair is one line carrying both directions' flow.
-  The work is proportional to the edges of the drawn glyphs' members; an unchanged view re-emits them
-  from a per-tree memo. At the fit view that is every edge in view: about 10 ms per frame for a
-  325k-node, 1.5M-edge web graph (a zoom frame in the browser: 5 ms median, 8 ms p90), but ~190 ms for
-  a million nodes with 5.8M edges. So the spatial source is for graphs up to a few hundred thousand
-  nodes today; at millions of edges, a layout that keeps communities together, such as this example's,
-  draws a compact map with `"structure"` at a fraction of the cost.
+- **While the worker streams, it sums them too.** It cuts each tree it rebuilds the way the main thread
+  will — at your view, or at the fit while the camera follows the layout — and hands over the summed
+  links of those glyphs with the tree. A streamed repaint then reads a few thousand summed rows instead
+  of every edge in view: 0.2-0.5 ms instead of 10-12 ms at the fit view of a 325k-node, 1.5M-edge web
+  graph, for 36-43 ms more work per rebuild in the worker (11-15 ms at 4× zoom, 1-2 ms at 16×). A glyph the worker
+  did not cut for — mid-gesture, or after you zoom a settled layout — is summed on the main thread once
+  per tree.
+- **Elsewhere the main thread sums them.** On the other backends, and for a tree the main thread
+  rebuilt, the work is proportional to the edges of the drawn glyphs' members, and an unchanged view
+  re-emits them from a per-tree memo. At the fit view that is every edge in view: about 10 ms per frame
+  for the 325k-node graph (a zoom frame in the browser: 5 ms median, 8 ms p90), but ~190 ms for a million
+  nodes with 5.8M edges. So away from a streaming worker the spatial source is for graphs up to a few
+  hundred thousand nodes; at millions of edges, a layout that keeps communities together, such as this
+  example's, draws a compact map with `"structure"` at a fraction of the cost.
 - **Aggregates are regions.** An aggregate is sized area-additively (its ink ≈ its members' total) and
   reads as "this part of the map" — it is not a community. Its id changes with each rebuild; a selected
   or hovered aggregate is carried over to the cell in the same place (leaves keep their ids).
