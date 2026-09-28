@@ -15,12 +15,15 @@
  * the one GPU solver, level by level, inside the streamed frame loop (see {@link GpuStream}), with every
  * level at the force equilibrium's scale; a seeded run then cools over the iteration budget like the worker
  * (#124). With `multilevel: false`, an edge-less graph or no worker, it starts cold from a disc at the
- * equilibrium's scale, at full heat. It streams through {@link GpuStream} (#352):
+ * equilibrium's scale, at full heat. Either way it **stops once it has converged**, by the worker's rule,
+ * decided on the GPU once per tick (#124, #376), so `iterations` is a cap, as on the worker. It streams
+ * through {@link GpuStream} (#352):
  * each animation frame harvests positions a fenced PBO copy delivered, repaints (throttled, in the same
  * frame), and encodes as many work items — tick prep, force-pass row bands, integrate — as fit a GPU
  * budget of `min(10 ms, 0.6 × the frame interval)`. The main thread never waits for the GPU: no
  * synchronous `readPixels` on the frame path. On convergence the loop goes **idle** (the solver stays
- * alive) and `pin`/`unpin` hold nodes and resume it so the rest reflows (#183), as on the worker.
+ * alive) and `pin`/`unpin` hold nodes and resume it so the rest reflows (#183) — at the drag heat, then a
+ * re-cool that stops once converged, at most `RECOOL_TICKS` — as on the worker.
  *
  * With `lod` on, the GPU run keeps the LOD tree off the main thread as the worker
  * backend does (#377): a layout worker coarsens the graph (`coarsen`) while the solver is built, and refits
@@ -81,7 +84,8 @@ export type GpuLayoutTransport = "gpu" | "worker";
  *   has its own sync fallback).
  * - Otherwise: seeds a disc (on screen until the multilevel seed's first frame), constructs
  *   {@link GpuForceLayout}, starts the seed's coarsening worker, and streams the run ({@link GpuStream})
- *   until `iterations` are done; `settled` resolves once the final positions have been harvested.
+ *   until it has converged or `iterations` are done; `settled` resolves once the final positions have been
+ *   harvested.
  *
  * `onTransport` reports the resolution before the run starts — so before any frame or LOD tree
  * arrives — and the handle's `transport` / `shared` read the live state (#297): `"pending"` until the
@@ -258,9 +262,9 @@ function startGpuLayoutSync(
     throw error;
   }
   // As the CPU worker (#124): a cold disc start keeps full heat to untangle (see ForceLayout.run); a seeded
-  // run cools over the iteration budget once the seed has placed the nodes (the stream sets it). The GPU run
-  // has no early stop yet — the per-tick stop latch reads the mean step back with the positions (#124, spec
-  // §6.5.5) — so it runs the whole budget.
+  // run cools over the iteration budget once the seed has placed the nodes (the stream sets it). Either way
+  // the stream stops the run once it has converged (the solver's per-tick stop latch, #376), or when the
+  // budget is spent.
   if (!seeded) layout.hold(1);
 
   let started: GpuStream;

@@ -1,6 +1,6 @@
 import type { Device, Texture, Framebuffer } from "@luma.gl/core";
 import type { ForceParams, LayoutGraph } from "../force.js";
-import { Cooling, DAMPING, equilibriumSpacing, springStabilizers, stepCap } from "../force.js";
+import { CONVERGED_STEP, Cooling, DAMPING, equilibriumSpacing, springStabilizers, stepCap, stopArmed } from "../force.js";
 import { atlasWidth, pingPong } from "./textures.js";
 import { PositionReadback } from "./position-readback.js";
 import { IntegratePass } from "./passes/integrate.js";
@@ -29,6 +29,7 @@ import {
 } from "./segments.js";
 import { SeedLevels, SeedPasses } from "./seed-levels.js";
 import type { SeedPlan } from "./seed-plan.js";
+import { StopLatchPass } from "./passes/stop-latch.js";
 
 // DAMPING is imported from force.ts so both integrators share one constant.
 
@@ -182,6 +183,31 @@ export class GpuForceLayout {
   private readonly maxStep: number;
   /** Heat schedule multiplying `alpha` (#124) — the CPU integrator's {@link Cooling}, for parity. */
   private readonly cooling = new Cooling();
+  /** The force model's equilibrium spacing — the unit of the convergence test (0: no stop). */
+  private readonly spacing: number;
+  /**
+   * The per-tick convergence stop (#376): a one-texel latch evaluated after every reduction, read by the
+   * integrate pass. See `stop-latch.ts`.
+   */
+  private readonly stop: StopLatchPass;
+  /**
+   * Ticks integrated on the graph's level since construction (pass-through ticks after a stop included; a
+   * multilevel seed's ticks are not counted, #353).
+   */
+  private ticks = 0;
+  /** Ticks integrated since the heat schedule was last set — the CPU's `settleTicks`. */
+  private settleTicks = 0;
+  /** The heat schedule's epoch: every {@link cool} / {@link hold} starts a new one (#376). */
+  private epoch = 0;
+  /** The tick boundary (value of {@link ticks}) the latch last evaluated the rule at; −1 before any. */
+  private latchedAt = -1;
+  /**
+   * Whether the latch may stop the layout (#376): the CPU loop's stop check. The streaming transport
+   * turns it on in a run or a re-cool and off in a drag, as the worker checks `converged` only in those
+   * modes. Off by default, so {@link runFrame} ticks like `ForceLayout.tick` (the step history is recorded
+   * either way). Non-finite stats freeze the integrate whether or not it is on.
+   */
+  stopOnConvergence = false;
 
   /**
    * Position ping-pong pair. `readTex` = current positions; `writeTex` = render
@@ -302,7 +328,8 @@ export class GpuForceLayout {
     const span0 = Math.max((maxX - minX), (maxY - minY), 1);
     // The same cap on every level of a multilevel seed: mass-weighted levels share the finest equilibrium
     // scale (spec §8).
-    this.maxStep = stepCap(equilibriumSpacing(params), span0);
+    this.spacing = equilibriumSpacing(params);
+    this.maxStep = stepCap(this.spacing, span0);
 
     // Build padded position data (same layout as packPositionsTexture) and seed
     // the position read (A) side with it. Velocity starts zeroed (no seed).
@@ -450,6 +477,7 @@ export class GpuForceLayout {
       multilevel ? { multilevel } : {},
     );
     this.centeringPass = new CenteringPass(device, singleSegment);
+    this.stop = new StopLatchPass(device);
     this.seedPasses = multilevel ? new SeedPasses(device) : null;
 
     this.finest = {
@@ -477,14 +505,30 @@ export class GpuForceLayout {
     return this.active.rows < this.height ? [0, 0, this.width, this.active.rows] : undefined;
   }
 
-  /** Cool from heat `from` over `ticks` ticks — the CPU {@link ForceLayout.cool} schedule. */
+  /**
+   * Cool from heat `from` over `ticks` ticks — the CPU {@link ForceLayout.cool} schedule. Starts a new
+   * schedule: its first `MIN_SETTLE_TICKS` ticks cannot stop, and a stop of the previous one is
+   * released (#376).
+   */
   cool(ticks: number, from = 1): void {
     this.cooling.cool(ticks, from);
+    this.newSchedule();
   }
 
-  /** Hold a constant heat — a drag reflow (the CPU {@link ForceLayout.hold}). */
+  /** Hold a constant heat — a drag reflow (the CPU {@link ForceLayout.hold}). Starts a new schedule, as {@link cool}. */
   hold(heat: number): void {
     this.cooling.hold(heat);
+    this.newSchedule();
+  }
+
+  private newSchedule(): void {
+    this.settleTicks = 0;
+    this.epoch++;
+  }
+
+  /** The current heat schedule's epoch — what a harvested stop must carry to belong to it (#376). */
+  get scheduleEpoch(): number {
+    return this.epoch;
   }
 
   /**
@@ -657,8 +701,9 @@ export class GpuForceLayout {
 
   /**
    * Work item **P** of a tick (#352, spec §6.5.3): everything the force pass reads, computed from the
-   * current positions — the segment reductions, the Barnes-Hut pyramid, the hub chunk partials — and the
-   * clear of the force accumulator. Each part is its own submitted render pass, as before the split.
+   * current positions — the segment reductions and the stop latch over them (#376), the Barnes-Hut
+   * pyramid, the hub chunk partials — and the clear of the force accumulator. Each part is its own
+   * submitted render pass, as before the split.
    */
   beginTick(): void {
     // ── 1. Segment reductions ─────────────────────────────────────────────────
@@ -764,7 +809,9 @@ export class GpuForceLayout {
 
   /**
    * Work item **I**: integrate the accumulated force into positions and velocities (MRT), swap the
-   * ping-pongs, and advance the heat schedule — the only item that changes positions.
+   * ping-pongs, and advance the heat schedule — the only item that changes positions. Once the stop latch
+   * has latched in the current schedule (or the layout went non-finite) the integrate passes positions
+   * and velocities through unchanged (#376).
    */
   integrate(): void {
     // Select the pre-created MRT framebuffer whose attachments are the current
@@ -777,12 +824,13 @@ export class GpuForceLayout {
     const renderPass = beginPass(this.device, { framebuffer: fbo, clear: false, ...(scissor ? { scissor } : {}) });
 
     const level = this.active;
-    this.integratePass.run(renderPass, this.pos.readTex, this.vel.readTex, this.forceTex, this.pinnedTex, level.stab, {
+    this.integratePass.run(renderPass, this.pos.readTex, this.vel.readTex, this.forceTex, this.pinnedTex, level.stab, this.stop.state, {
       count: level.count,
       width: this.width,
       alpha: this.params.alpha * this.cooling.heat, // the cooled step (#124), as on the CPU
       damping: DAMPING,
       maxStep: this.maxStep, // STEP_CAP equilibrium spacings — see constructor
+      epoch: this.epoch, // a stop latched in this schedule freezes the integrate (#376)
     });
 
     renderPass.end();
@@ -795,6 +843,9 @@ export class GpuForceLayout {
     this.vel.swap();
     this.parity ^= 1;
     this.cooling.next();
+    if (this.seed) return; // a seed level's tick is not one of the run's (see reduceSegments)
+    this.ticks++;
+    this.settleTicks++;
   }
 
   /**
@@ -876,18 +927,56 @@ export class GpuForceLayout {
    * readback's finiteness check must cover the positions it copies. **Between ticks only** — after an
    * `integrate`, before the next {@link beginTick}, which recomputes the same values from the same
    * positions. Mid-tick it would change the box and centroid the remaining force bands read. Costs the
-   * reduction tree: a few gather passes over N / 15 texels (0.46 ms at 325k on an M1 Max).
+   * reduction tree: a few gather passes over N / 15 texels (0.46 ms at 325k on an M1 Max). The stop latch
+   * evaluates the tick just integrated here, as the next `beginTick` would have (#376), so the copy
+   * carries the stop as soon as there is one.
    */
   refreshSegmentStats(): void {
     this.reduceSegments();
   }
 
+  /**
+   * The segment reductions, then the stop latch over their stats (#376). The latch evaluates the rule only
+   * at the first reduction after an integrate: a copy between ticks and the next tick's prep both reduce,
+   * with the same velocities, so the stop does not depend on whether a copy happened.
+   */
   private reduceSegments(): void {
     const level = this.active;
     this.reduce.run(
       { pos: this.pos.readTex, vel: this.vel.readTex, posWidth: this.width, count: level.count, mass: level.mass },
       this.segments,
     );
+    // A multilevel seed level (#353) is not the run: its stats are mass-weighted (`w` is Σm, not its slots)
+    // and its ticks are the seed's. The latch reads the graph's level only, from the run's first tick, as the
+    // CPU refine checks `converged` only after its seed.
+    if (this.seed) return;
+    const evaluate = this.latchedAt !== this.ticks;
+    this.latchedAt = this.ticks;
+    this.stop.run(this.segments.stats, {
+      evaluate,
+      sample: this.ticks > 0,
+      armed: this.stopOnConvergence && stopArmed(this.spacing, this.settleTicks),
+      threshold: CONVERGED_STEP * this.spacing,
+      tick: this.ticks,
+      epoch: this.epoch,
+    });
+  }
+
+  /**
+   * The stop latch's current texel `(prevStep, stopTick, epoch, flags)` (#376), from the last reduction —
+   * what the streaming readback copies with the stats. See `stop-latch.ts`.
+   */
+  get stopState(): Texture {
+    return this.stop.state;
+  }
+
+  /**
+   * Read the stop latch's current texel synchronously into `out[0..4)` — `(prevStep, stopTick, epoch,
+   * flags)`. For tests and one-off reads, like {@link readPositions}; the streaming transport reads it with
+   * the stats through its PBO.
+   */
+  readStopState(out: Float32Array): void {
+    this.stop.read(out);
   }
 
   /**
@@ -934,5 +1023,6 @@ export class GpuForceLayout {
     this.repulsionPass.destroy();
     this.centeringPass.destroy();
     this.pyramid?.destroy();
+    this.stop.destroy();
   }
 }

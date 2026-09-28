@@ -283,10 +283,10 @@ export interface NetworkLayoutOptions {
    * Tick budget of the force layout (`"force"` / `"worker"` / `"gpu"` / `"auto"`, default 300) — a
    * maximum, not a fixed count (#124), and the length of the anneal: a multilevel-seeded layout cools over
    * it, so a larger budget cools more slowly rather than only adding headroom. A cold disc start keeps
-   * full heat to untangle. The CPU backends stop as soon as the layout has converged (nodes moving a small
-   * fraction of the equilibrium spacing per tick), resolving {@link Network.whenSettled}. The GPU solve
-   * (`"gpu"`, or `"auto"` resolved to it) runs the whole budget (its early stop needs a GPU readback it
-   * doesn't do yet).
+   * full heat to untangle. Every backend stops as soon as the layout has converged (nodes moving a small
+   * fraction of the equilibrium spacing per tick, and no faster than the tick before), resolving
+   * {@link Network.whenSettled}; the GPU solve (`"gpu"`, or `"auto"` resolved to it) decides that on the
+   * GPU, once per tick, so its stop tick does not depend on frame timing (#376).
    */
   iterations?: number;
   /**

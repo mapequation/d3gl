@@ -43,12 +43,12 @@ describe("GPU streaming run (#352)", () => {
   });
 
   /** A seeded solver over `g` and a stream over it, built directly (not through the transport). */
-  function streamOver(g: NetworkGraph, iterations: number, onFrame: () => void): { layout: GpuForceLayout; stream: GpuStream } {
+  function streamOver(g: NetworkGraph, iterations: number, onFrame: () => void, frameEvery?: number): { layout: GpuForceLayout; stream: GpuStream } {
     if (!(device instanceof WebGLDevice)) throw new Error("expected a WebGL2 device");
     seedPositions(g, 400, 300, { force: DEFAULT_FORCE });
     const layout = new GpuForceLayout(device, g, DEFAULT_FORCE);
     layout.hold(1);
-    return { layout, stream: new GpuStream(device, layout, g, { iterations }, onFrame) };
+    return { layout, stream: new GpuStream(device, layout, g, { iterations, ...(frameEvery !== undefined ? { frameEvery } : {}) }, onFrame) };
   }
 
   it("settles only after the final tick's positions were harvested, and repaints them", async () => {
@@ -57,7 +57,8 @@ describe("GPU streaming run (#352)", () => {
     const unobserve = observeGpuLayoutFrames((s) => samples.push({ ...s }));
     let frames = 0;
     let framesAtSettle = -1;
-    const handle = startGpuLayout(device, g, { width: 400, height: 300, iterations: 40 }, () => { frames++; });
+    // A cold start (no multilevel seed, #353): at full heat it runs its whole budget, never stopping early (#376).
+    const handle = startGpuLayout(device, g, { width: 400, height: 300, iterations: 40, multilevel: false }, () => { frames++; });
     await handle.settled.then(() => { framesAtSettle = frames; });
     unobserve();
     const final = samples.findIndex((s) => s.harvestedTicks === 40);
@@ -68,6 +69,32 @@ describe("GPU streaming run (#352)", () => {
     expect(samples.slice(final + 1).every((s) => !s.harvested)).toBe(true);
     for (let i = 0; i < 300 * 2; i++) expect(Number.isFinite(g.positions[i] ?? Number.NaN)).toBe(true);
     handle.stop();
+  });
+
+  it("a harvest reports the ticks of the copy it read, also in a frame that issues the next copy", async () => {
+    const g = ring(300);
+    const { stream } = streamOver(g, 60, () => {}, 1);
+    const samples: GpuFrameSample[] = [];
+    const unobserve = observeGpuLayoutFrames((s) => samples.push({ ...s }));
+    try {
+      stream.start();
+      await stream.settled;
+    } finally {
+      unobserve();
+      stream.stop();
+    }
+    // A copy holds the ticks done when it was issued (the frame's `ticksDone`: nothing is encoded after it).
+    let inFlight = -1;
+    let harvestAndCopy = 0;
+    for (const s of samples) {
+      if (s.harvested) {
+        expect(s.harvestedTicks).toBe(inFlight);
+        if (s.copied && s.ticksDone > inFlight) harvestAndCopy++;
+      }
+      if (s.copied) inFlight = s.ticksDone;
+    }
+    // Not vacuous: some frames harvested one copy and issued a newer one.
+    expect(harvestAndCopy).toBeGreaterThan(0);
   });
 
   it("an explicit frameEvery allows at most one onFrame per that many ticks", async () => {
@@ -84,7 +111,9 @@ describe("GPU streaming run (#352)", () => {
     const g = ring(300);
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     let frames = 0;
-    const handle = startGpuLayout(device, g, { width: 400, height: 300, iterations: 100_000 }, () => { frames++; });
+    // A cold start: at full heat it is still running when the NaN arrives (a seeded run, #353, could have
+    // converged and settled already, #376).
+    const handle = startGpuLayout(device, g, { width: 400, height: 300, iterations: 100_000, multilevel: false }, () => { frames++; });
     try {
       for (let i = 0; i < 200 && frames < 2; i++) await nextFrame();
       expect(frames).toBeGreaterThanOrEqual(2);

@@ -43,9 +43,19 @@
  * solver); if that fails the run starts cold as well, and a seed step that throws mid-seed frees the seed and
  * settles with the disc on screen, one warning each, so `settled` always resolves.
  *
- * `settled` resolves only after positions from the final tick have been harvested and painted (with LOD on,
- * together with the LOD tree's geometry for them), so the engine's settle handler sees them. The run then
- * goes **idle** (the layout stays alive for a drag reheat, #183).
+ * **Convergence stop (#376).** A run and a post-drag re-cool stop once the layout has converged, by the
+ * CPU's rule, decided on the GPU once per tick: the solver's stop latch (`stop-latch.ts`) freezes the
+ * integrate at the stop tick, and every copy carries the latch's texel with the stats. The stream arms the
+ * latch in `run` and `cool` mode and disarms it in `drag`, as the worker checks `converged` only there,
+ * and it keeps encoding (frozen) ticks until a harvest shows the stop in the current schedule: those
+ * positions are the stop tick's, so the run finishes on them (with LOD on, once the relayed frame is
+ * painted). The stop tick does not depend on frame timing, band count or when the copies happened. The
+ * latch reads the graph's level only: a multilevel seed's levels never stop it (#353).
+ *
+ * `settled` resolves only after positions from the final tick — the stop tick, or the last of the budget —
+ * have been harvested and painted (with LOD on, together with the LOD tree's geometry for them), so the
+ * engine's settle handler sees them. The run then goes **idle** (the layout stays alive for a drag reheat,
+ * #183).
  * A non-finite layout (NaN / ∞ in the reductions' stats) stops the run with one warning, keeping the last
  * finite positions — the harvest checks the stats before it touches `graph.positions`. A lost context
  * (`isContextLost`, a failed fence wait, `webglcontextlost`) stops it without touching GL again, with one
@@ -55,12 +65,13 @@ import { WebGLDevice } from "@luma.gl/webgl";
 import { DRAG_HEAT, RECOOL_TICKS } from "../force.js";
 import type { NetworkGraph } from "../graph.js";
 import { deleteSync, insertSync, pollSync } from "../../webgl/fence.js";
-import { AsyncPositionReadback, READBACK_STATS_FLOATS } from "./async-readback.js";
+import { AsyncPositionReadback, READBACK_STATS_FLOATS, READBACK_STOP_OFFSET } from "./async-readback.js";
 import { FrameBudget, itemCostMs, type FenceSource } from "./frame-budget.js";
 import type { GpuForceLayout } from "./gpu-force-layout.js";
 import { MIN_FRAME_MS, RepaintThrottle } from "./repaint-throttle.js";
 import { reportUncaught } from "./report-uncaught.js";
 import type { SeedPlan } from "./seed-plan.js";
+import { STOP_NONFINITE, STOP_STOPPED } from "./stop-latch.js";
 
 /** What one streamed frame did — the argument of a {@link observeGpuLayoutFrames} observer. */
 export interface GpuFrameSample {
@@ -85,8 +96,17 @@ export interface GpuFrameSample {
   ticksDone: number;
   /** Whether a readback was harvested this frame. */
   harvested: boolean;
-  /** Ticks the positions harvested this frame are the result of (−1 when nothing was harvested). */
+  /**
+   * Ticks encoded when the positions harvested this frame were copied (−1 when nothing was harvested). After
+   * a convergence stop the ticks encoded before the stream learned of it are frozen: the positions are the
+   * {@link stopTick}'s.
+   */
   harvestedTicks: number;
+  /**
+   * The tick the current run's or re-cool's convergence stop latched at, once a harvest has shown it; −1
+   * before (#376). A new schedule (a drag) resets it.
+   */
+  stopTick: number;
   /** Whether a readback copy was issued this frame. */
   copied: boolean;
   /** Whether the gate blocked this frame (the frames `framesInFlight` allows were already in flight). */
@@ -228,7 +248,7 @@ export class GpuStream {
   private readonly sink: FrameSink;
   private readonly sample: GpuFrameSample = {
     now: 0, harvestMs: 0, commitMs: 0, repainted: false, repaintMs: 0, encodeMs: 0, items: 0, ticksDone: 0,
-    harvested: false, harvestedTicks: -1, copied: false, blocked: false, k: 1, bands: 1, budgetMs: 0,
+    harvested: false, harvestedTicks: -1, stopTick: -1, copied: false, blocked: false, k: 1, bands: 1, budgetMs: 0,
   };
   private readonly canvas: EventTarget | null;
   /** The page, whose `visibilitychange` pauses the throttle's stall sampling (null outside a document). */
@@ -254,14 +274,22 @@ export class GpuStream {
   private heldIds: Uint32Array | null = null;
   private heldPositions: Float32Array | null = null;
 
-  /** Ticks integrated in this run (all modes). */
+  /** Ticks integrated in this run (all modes; frozen ticks after a stop included). */
   private ticksDone = 0;
+  /** The stop tick a harvest showed for the current schedule, −1 before (#376). */
+  private stopTick = -1;
   /** Next item of the current tick: 0 = P, 1 … bands = F_{phase−1}, bands + 1 = I. */
   private phase = 0;
   /** Bands of the current tick, fixed when its P is encoded. */
   private tickBands = 1;
   /** The current mode's ticks are done: copy once more (unthrottled), harvest, then {@link finish}. */
   private finishing = false;
+  /**
+   * A harvested convergence stop is on its way to the screen (#376) — with LOD on, out with the LOD worker
+   * for a round trip (#377): encode and copy nothing more until it is painted ({@link finish}), so no copy of
+   * the frozen ticks after it is harvested and repainted once the run has settled.
+   */
+  private stopping = false;
 
   /** Frame whose budget fence covers the pending copy, the ticks it holds, and whether it is the final one. */
   private copyFrame = 0;
@@ -367,7 +395,10 @@ export class GpuStream {
    * texture at the start of the next tick, never mid-tick (the latest ones, if several pins arrive first).
    * Resumes the loop in `drag` mode, or lets an initial run with ticks left turn into it when they end.
    * A run whose ticks are all encoded (its final copy not yet harvested) has no tick left to write the
-   * held positions, so it turns into a drag now, as an idle layout does.
+   * held positions, so it turns into a drag now, as an idle layout does. A run with ticks left keeps its
+   * schedule, as on the worker; if it converges during the drag, the frozen integrate holds every node but
+   * the held ones until a harvest shows the stop and the run turns into the drag (#376) — one copy-to-harvest
+   * latency, about a repaint interval, after the worker, which turns at its stop tick.
    */
   pin(ids: Uint32Array, positions?: Float32Array): void {
     if (this.stopped || this.failed) return;
@@ -386,10 +417,11 @@ export class GpuStream {
     this.dragging = true;
     if (this.mode === "idle" || this.mode === "cool" || (this.mode === "run" && this.finishing)) {
       this.mode = "drag";
-      this.layout.hold(DRAG_HEAT);
+      this.hold(DRAG_HEAT);
       this.finishing = false;
       this.copyFinal = false; // a final copy in flight is harvested as an ordinary frame
       this.frameFinal = false; // so is a final frame the LOD worker is refitting
+      this.stopping = false; // and a harvested stop of the schedule the drag replaced
     }
     this.resume();
   }
@@ -409,6 +441,7 @@ export class GpuStream {
       this.mode = "cool";
       this.coolLeft = RECOOL_TICKS;
       this.layout.cool(RECOOL_TICKS, DRAG_HEAT);
+      this.stopTick = -1;
     }
     this.resume();
   }
@@ -458,13 +491,18 @@ export class GpuStream {
       if (target) {
         harvested = true;
         harvestedTicks = this.copyTicks; // before this frame's copy, if any, moves copyTicks on
-        if (!this.readback.harvest(target, this.stats)) {
+        if (!this.readback.harvest(target, this.stats) || (this.stopFlags() & STOP_NONFINITE) !== 0) {
           this.fail();
           return;
         }
         this.frameSubmitted = true;
         this.frameTicks = this.copyTicks;
-        this.frameFinal = this.copyFinal;
+        // A convergence stop of the current schedule (#376): these are the stop tick's positions — the final
+        // ones, decided now, from the stats copied with them, and finished once the frame is painted. (Read
+        // the stop even from a final copy: it records the stop tick.)
+        const stopped = this.harvestedStop();
+        this.frameFinal = this.copyFinal || stopped;
+        if (stopped) this.stopping = true;
         this.frameAway = true;
         this.sink.submit();
         this.throttle.submitted(now);
@@ -489,8 +527,10 @@ export class GpuStream {
         this.frameSubmitted = false;
         if (!applied) {
           // Lost with the LOD worker: nothing changed on the graph. Copy those ticks again (the final copy
-          // too — `finishing` still holds), now straight into the graph.
+          // too — `finishing` still holds; a stop's copy shows the latched stop again), now straight into
+          // the graph.
           if (own) this.copiedTicks = Math.min(this.copiedTicks, this.frameTicks - 1);
+          this.stopping = false;
         } else {
           if (own && this.frameTicks >= this.iterations && this.mode !== "run") this.settle();
           const r0 = performance.now();
@@ -534,7 +574,10 @@ export class GpuStream {
       // Between ticks (right after an integrate) the reductions' stats describe the previous positions:
       // re-run them so the harvest's finiteness check covers the positions it copies. After a prep they
       // already do — positions change only at integrate and at the prep's held-position write.
-      if (this.phase === 0) this.layout.refreshSegmentStats();
+      if (this.phase === 0) {
+        this.armStop();
+        this.layout.refreshSegmentStats();
+      }
       this.readback.issue(this.layout);
       this.seedFrame = false;
       this.copyTicks = this.ticksDone;
@@ -561,6 +604,7 @@ export class GpuStream {
       sample.ticksDone = this.ticksDone;
       sample.harvested = harvested;
       sample.harvestedTicks = harvestedTicks;
+      sample.stopTick = this.stopTick;
       sample.copied = copied;
       sample.blocked = !open;
       sample.k = this.budget.k;
@@ -584,13 +628,18 @@ export class GpuStream {
       this.finishing ||
       this.readback.pending ||
       this.sink.ready ||
-      (!this.failed && this.ticksDone > this.copiedTicks)
+      // Ticks to copy again after the LOD worker lost a frame — never once idle: a convergence stop's frozen
+      // ticks after its copy changed nothing, and an idle stream copies nothing (#376).
+      (!this.failed && this.mode !== "idle" && this.ticksDone > this.copiedTicks)
     );
   }
 
-  /** Whether the current mode has ticks left to encode (a started tick is always finished). */
+  /**
+   * Whether the current mode has ticks left to encode. A started tick is finished, except the frozen one a
+   * convergence stop sends the stream idle in, which {@link finish} drops.
+   */
   private hasWork(): boolean {
-    return this.mode !== "idle" && !this.finishing && !this.failed && this.seedState !== "waiting";
+    return this.mode !== "idle" && !this.finishing && !this.stopping && !this.failed && this.seedState !== "waiting";
   }
 
   /** Whether the next item is a seed step: placing the next seed level, or the graph's nodes (#353). */
@@ -720,6 +769,7 @@ export class GpuStream {
         this.heldIds = null;
         this.heldPositions = null;
       }
+      this.armStop();
       this.layout.beginTick();
       this.phase = 1;
     } else if (this.phase <= this.tickBands) {
@@ -744,7 +794,7 @@ export class GpuStream {
         // The run's budget is spent with a drag live: keep reflowing at the drag heat. The next harvest
         // carries ticks ≥ iterations and settles.
         this.mode = "drag";
-        this.layout.hold(DRAG_HEAT);
+        this.hold(DRAG_HEAT);
       } else {
         this.finishing = true;
       }
@@ -753,19 +803,28 @@ export class GpuStream {
     }
   }
 
-  /** The final positions of a run (or a re-cool) were harvested and painted. */
+  /**
+   * The final positions of a run (or a re-cool) were harvested and painted. A convergence stop is harvested
+   * at any point of a tick, and the ticks after the stop are frozen, so a stream that goes idle drops the
+   * tick it is in (#376). A later pin then starts a fresh tick, whose prep writes the held positions and
+   * clears the force accumulator, instead of finishing that one from its old prep with the held nodes
+   * where they were.
+   */
   private finish(): void {
     this.finishing = false;
+    this.stopping = false;
     if (this.mode === "run") {
       this.settle();
       if (this.dragging) {
         this.mode = "drag";
-        this.layout.hold(DRAG_HEAT);
+        this.hold(DRAG_HEAT);
       } else {
         this.mode = "idle";
+        this.phase = 0;
       }
     } else if (this.mode === "cool") {
       this.mode = "idle";
+      this.phase = 0;
       this.settle();
     }
   }
@@ -779,6 +838,9 @@ export class GpuStream {
     if (this.readback.pending) return false;
     if (this.seedState !== "none") return false; // the slots hold a seed level, not the nodes (#353)
     if (this.seedFrame) return true; // the seed frame: tick 0, once
+    // An idle stream has shown its final positions, and a harvested stop is on its way to the screen: a
+    // stop's frozen ticks after its copy changed nothing (#376).
+    if (this.mode === "idle" || this.stopping) return false;
     if (this.ticksDone <= this.copiedTicks) return false;
     // The final copy goes out as soon as the PBO is free, once: `finishing` holds until that frame is painted
     // (finish()), which with LOD on is a worker round trip after its harvest (#377), and a frame lost with the
@@ -786,6 +848,40 @@ export class GpuStream {
     if (this.finishing) return true;
     if (this.frameEvery !== undefined) return this.ticksDone - this.copiedTicks >= this.frameEvery;
     return this.throttle.copyDue(now, this.sink.relays);
+  }
+
+  // ── Convergence stop (#376) ────────────────────────────────────────────────
+
+  /**
+   * Arm the solver's stop latch for the next reduction: a run and a re-cool stop at convergence, a drag
+   * never does (the worker checks `converged` only in `run` and `cool` mode).
+   */
+  private armStop(): void {
+    this.layout.stopOnConvergence = this.mode === "run" || this.mode === "cool";
+  }
+
+  /** Hold a heat — a new schedule, so the previous one's stop no longer applies. */
+  private hold(heat: number): void {
+    this.layout.hold(heat);
+    this.stopTick = -1;
+  }
+
+  /** The harvested stop latch's flags. */
+  private stopFlags(): number {
+    return this.stats[READBACK_STOP_OFFSET + 3] ?? 0;
+  }
+
+  /**
+   * Whether the harvested copy shows a convergence stop that ends the current mode: latched in the current
+   * schedule (a stop read after a drag started a new one is stale) while a run or a re-cool is live.
+   * Records its tick.
+   */
+  private harvestedStop(): boolean {
+    if ((this.stopFlags() & STOP_STOPPED) === 0) return false;
+    if (this.stats[READBACK_STOP_OFFSET + 2] !== this.layout.scheduleEpoch) return false;
+    if (this.mode !== "run" && this.mode !== "cool") return false;
+    this.stopTick = this.stats[READBACK_STOP_OFFSET + 1] ?? -1;
+    return true;
   }
 
   // ── Lifecycle ──────────────────────────────────────────────────────────────

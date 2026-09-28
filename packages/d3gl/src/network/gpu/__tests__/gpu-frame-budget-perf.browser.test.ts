@@ -47,10 +47,11 @@ import { Model } from "@luma.gl/engine";
 import { makeTestDevice } from "./_device.js";
 import { GpuForceLayout } from "../gpu-force-layout.js";
 import { buildCSR, buildGraph } from "../../graph.js";
-import type { LayoutGraph } from "../../force.js";
+import { MIN_SETTLE_TICKS, type LayoutGraph } from "../../force.js";
 import { buildHubChunks, SPRING_CHUNK } from "../hub-chunks.js";
 import { FLAT_TILE_MIN_SIDE, flatSegments, packTiles, type PyramidTexture } from "../segments.js";
 import { GridPyramid } from "../passes/grid-pyramid.js";
+import { STOP_STOPPED } from "../stop-latch.js";
 import { atlasWidth } from "../textures.js";
 import { perfBudget, perfN } from "../../../__tests__/perf-budget.js";
 
@@ -241,9 +242,10 @@ function chunkCount(graph: LayoutGraph): number {
 }
 
 /**
- * The draws of one tick of `layout`, as the size of the framebuffer each draw renders into — the
- * fragments a full-screen pass covers (sorted, so two ticks compare as multisets). Every GPU layout pass
- * draws through luma's `Model.draw`.
+ * The draws of one tick of `layout`, as the size each draw rasterises — its pass's viewport, else the
+ * framebuffer it renders into: the fragments a full-screen pass covers (sorted, so two ticks compare as
+ * multisets). The viewport matters for the tile pyramid's packed levels (#354), whose reduces each write
+ * their level's rectangle of a larger texture. Every GPU layout pass draws through luma's `Model.draw`.
  */
 function tickDraws(layout: GpuForceLayout): string[] {
   const spy = vi.spyOn(Model.prototype, "draw");
@@ -251,6 +253,8 @@ function tickDraws(layout: GpuForceLayout): string[] {
     layout.runFrame(1);
     return spy.mock.calls
       .map(([pass]) => {
+        const vp = pass.props.parameters?.viewport;
+        if (vp) return `${vp[2] ?? 0}x${vp[3] ?? 0}`;
         const fbo = pass.props.framebuffer;
         return fbo ? `${fbo.width}x${fbo.height}` : "canvas";
       })
@@ -642,4 +646,51 @@ describe("GPU frame budget — pyramid path (per-tick regression tripwire)", () 
     const fragmentsPerTick = reduces.reduce((n, d) => n + d.fragments, 0) / TICKS;
     expect(fragmentsPerTick).toBeLessThan((atlas.width * atlas.height) / 3);
   });
+
+  it("the stop latch (#376): one 1-fragment draw per tick and the same draw list unarmed, latching and frozen, allocating nothing", () => {
+    // The convergence stop is decided per tick in ONE fragment (the latch), after the range query, and the
+    // integrate reads its texel. So a tick draws into 1×1 targets exactly three times — the pyramid's root
+    // level, the range query into the segment table, and the latch — and its draw list is the same whether
+    // the stop is unarmed, armed and latching in this tick, or latched (a frozen tick: the integrate passes
+    // through in-shader). A latch run per band, per level or per slot would show here, and a readback of the
+    // step, per tick or on the stop, would allocate.
+    const N = perfN(30_000, { max: 200_000 });
+    const g = makeClusteredGraph(N, 80, 0x5709);
+    const params = { repulsion: 200, attraction: 0.05, centering: 0.2, alpha: 0.05, theta: 0.7 };
+    const layout = new GpuForceLayout(device, g, params, { repulsionMode: "pyramid" });
+    const state = new Float32Array(4);
+    try {
+      // Zero heat from rest: nothing moves, so every step is exactly 0 and the latch sets at the first prep
+      // it is armed at. The draw list does not depend on the heat.
+      layout.hold(0);
+      layout.runFrame(1); // warm-up
+      const unarmed = tickDraws(layout);
+      layout.stopOnConvergence = true;
+      layout.hold(0); // a new schedule: armed once it is MIN_SETTLE_TICKS ticks old
+      layout.runFrame(MIN_SETTLE_TICKS);
+      layout.readStopState(state);
+      expect(state[3]).toBe(0);
+      const fboSpy = vi.spyOn(device, "createFramebuffer");
+      const texSpy = vi.spyOn(device, "createTexture");
+      const bufSpy = vi.spyOn(device, "createBuffer");
+      const latching = tickDraws(layout); // armed: the latch sets in this tick's prep and freezes its integrate
+      const frozen = tickDraws(layout);
+      layout.runFrame(4);
+      expect(fboSpy).toHaveBeenCalledTimes(0);
+      expect(texSpy).toHaveBeenCalledTimes(0);
+      expect(bufSpy).toHaveBeenCalledTimes(0);
+      fboSpy.mockRestore();
+      texSpy.mockRestore();
+      bufSpy.mockRestore();
+      // Not vacuous: the stop latched at the prep of the tick measured as `latching`.
+      layout.readStopState(state);
+      expect(state[3]).toBe(STOP_STOPPED);
+      expect(state[1]).toBe(MIN_SETTLE_TICKS + 2);
+      expect(unarmed.filter((d) => d === "1x1")).toHaveLength(3);
+      expect(latching).toEqual(unarmed);
+      expect(frozen).toEqual(unarmed);
+    } finally {
+      layout.destroy();
+    }
+  }, 120_000);
 });

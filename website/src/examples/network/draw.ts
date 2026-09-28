@@ -134,12 +134,11 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
         // Weighted so links vary and LOD super-edges thicken/darken with their accumulated weight.
         const { nodeCount, source, target, weight } = generateLFR(count, { mu: 0.1, seed: 1, weighted: true });
         graph = buildGraph({ nodeCount, source, target, weight, directed });
-        // A multilevel worker layout stops once it has converged (#124), so it keeps the default budget
-        // as a safety cap. The GPU layout has no early stop yet and a cold start keeps full heat until it
-        // settles, so both get a budget that shrinks as the graph grows. "gpu" and "auto" get it too: the
-        // transport they resolve to is known only after layout(), so where they resolve to the worker, a
-        // multilevel run cools over fewer ticks than "worker" gives it (until the GPU stops early, #124).
-        const iterations = layoutBackend !== "worker" || !multilevel ? Math.min(250, Math.max(10, Math.round(2.5e6 / count))) : undefined;
+        // Every layout stops once it has converged (#124; on the GPU, decided there once per tick, #376), and
+        // a multilevel one — the worker's, or the GPU's own seed (#353) — converges well within the default
+        // budget, which it keeps as a safety cap. A cold start keeps full heat until it settles, which can
+        // outlast that budget on a large graph, so cold starts get a budget that shrinks as the graph grows.
+        const iterations = !multilevel ? Math.min(250, Math.max(10, Math.round(2.5e6 / count))) : undefined;
         // fit: true (#238) keeps the camera framed on the streaming layout as it converges, released on
         // settle/interaction — so it opens framed rather than piling at the origin on the GPU backend.
         net.data(graph).layout({ backend: layoutBackend, iterations, multilevel, fit: true });

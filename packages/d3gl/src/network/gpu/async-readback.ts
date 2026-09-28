@@ -11,15 +11,16 @@
  * - **One write per PBO per copy.** Chrome keeps that shadow copy only if the buffer is written once and
  *   then fenced; a second write before the harvest discards it ("written again before being read back")
  *   and the harvest stalls the GPU pipeline — measured on web-NotreDame when the stats rode in the
- *   position PBO as two extra `readPixels`. So the 32 bytes of stats have their own PBO, filled by one
- *   `readPixels` of a 2×1 staging texture ({@link PackStatsPass}).
+ *   position PBO as two extra `readPixels`. So the 48 bytes of stats have their own PBO, filled by one
+ *   `readPixels` of a 3×1 staging texture ({@link PackStatsPass}).
  * - **The copy reads the position texture itself** where the device reads `rg32f` as `RG/FLOAT` (the #351
  *   probe; ANGLE Metal): 8 bytes per atlas texel, no staging texture. Elsewhere the pack pass writes the
  *   positions into a staging `rgba32f` texture in node order first ({@link PackPositionsPass}) and the
  *   copy reads that as `RGBA/FLOAT`, the format WebGL2 guarantees.
  * - **The stats** are the segment table's `stats` `(Σx, Σy, Σ|v|, count)` and `box`
  *   `(maxX, maxY, −minX, −minY)` from the last tick's reductions, so the harvest can refuse a non-finite
- *   layout without scanning N positions.
+ *   layout without scanning N positions, and the stop latch's texel `(prevStep, stopTick, epoch, flags)`
+ *   (#376), so the transport learns of a convergence stop with the positions it froze.
  * - **The harvest allocates nothing**: `getBufferSubData` writes straight into the caller's positions
  *   array and a caller-owned 8-float stats array (luma's `Buffer.readSyncWebGL` would allocate per call).
  *
@@ -29,10 +30,15 @@
 import type { Device, Framebuffer, Texture } from "@luma.gl/core";
 import { WebGLDevice, WEBGLFramebuffer } from "@luma.gl/webgl";
 import { deviceReadsRG } from "./device-probe.js";
-import { PackPositionsPass, PackStatsPass } from "./passes/readback-pack.js";
+import { PackPositionsPass, PackStatsPass, STATS_TEXELS } from "./passes/readback-pack.js";
 
-/** Floats of stats a harvest returns: `stats` (Σx, Σy, Σ|v|, count) then `box` (maxX, maxY, −minX, −minY). */
-export const READBACK_STATS_FLOATS = 8;
+/**
+ * Floats of stats a harvest returns: `stats` (Σx, Σy, Σ|v|, count), then `box` (maxX, maxY, −minX, −minY),
+ * then the stop latch (prevStep, stopTick, epoch, flags) from {@link READBACK_STOP_OFFSET}.
+ */
+export const READBACK_STATS_FLOATS = STATS_TEXELS * 4;
+/** Where the stop latch's texel starts in the harvested stats (#376). */
+export const READBACK_STOP_OFFSET = 8;
 const STATS_BYTES = READBACK_STATS_FLOATS * 4;
 
 /**
@@ -55,6 +61,8 @@ export interface ReadbackSource {
   readonly nodeCount: number;
   /** The segment table's `stats` and `box` textures (1×1 each for the flat layout). */
   readonly segmentStats: { readonly stats: Texture; readonly box: Texture };
+  /** The stop latch's current texel (1×1), from the same reduction as {@link segmentStats} (#376). */
+  readonly stopState: Texture;
 }
 
 /** The raw WebGL handle behind a luma framebuffer, or an error for a non-WebGL one (never on this path). */
@@ -138,7 +146,7 @@ export class AsyncPositionReadback {
     const gl = this.gl;
     const pack = this.pack;
     if (pack) pack.run(source.positionTexture, source.positionWidth);
-    this.packStats.run(source.segmentStats.stats, source.segmentStats.box);
+    this.packStats.run(source.segmentStats.stats, source.segmentStats.box, source.stopState);
     const previousRead: WebGLFramebuffer | null = gl.getParameter(gl.READ_FRAMEBUFFER_BINDING);
     const previousPack: WebGLBuffer | null = gl.getParameter(gl.PIXEL_PACK_BUFFER_BINDING);
     const first = !this.sized;
@@ -155,7 +163,7 @@ export class AsyncPositionReadback {
     gl.bindBuffer(gl.PIXEL_PACK_BUFFER, this.statsPbo);
     if (first) gl.bufferData(gl.PIXEL_PACK_BUFFER, STATS_BYTES, gl.STREAM_READ);
     gl.bindFramebuffer(gl.READ_FRAMEBUFFER, fboHandle(this.packStats.framebuffer));
-    gl.readPixels(0, 0, 2, 1, gl.RGBA, gl.FLOAT, 0);
+    gl.readPixels(0, 0, STATS_TEXELS, 1, gl.RGBA, gl.FLOAT, 0);
     gl.bindFramebuffer(gl.READ_FRAMEBUFFER, previousRead);
     gl.bindBuffer(gl.PIXEL_PACK_BUFFER, previousPack);
     this.copying = true;
