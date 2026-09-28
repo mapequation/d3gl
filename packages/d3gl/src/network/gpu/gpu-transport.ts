@@ -114,6 +114,32 @@ export function continuationOf(state: Readonly<GpuRunState>, dragging: boolean, 
 }
 
 /**
+ * A GPU layout's fallback to the worker that is a fault rather than an unsupported device or graph
+ * (#375): its device promise rejected, or its run threw or stopped. `cause` is the error, when there is
+ * one; a fault without one (a solve that stopped) is `{ kind: "failure" }`.
+ */
+export interface GpuLayoutFailure {
+  readonly kind: "failure";
+  readonly cause?: unknown;
+}
+
+/**
+ * Print a GPU layout's fallback warning — the one rule the flat run and the nested solve (#355) share
+ * (#375): a `failure` always warns, passing its `cause` when there is one; an unsupported device or
+ * graph warns unless the caller expects the worker (`warnUnsupported: false`, `layout({ backend: "auto" })`).
+ * The call site says which it is, never the error value: a rejection or throw with `undefined` is still
+ * a failure.
+ */
+export function warnGpuFallback(message: string, warnUnsupported: boolean | undefined, failure?: GpuLayoutFailure): void {
+  if (failure) {
+    if (failure.cause === undefined) console.warn(message);
+    else console.warn(message, failure.cause);
+  } else if (warnUnsupported !== false) {
+    console.warn(message);
+  }
+}
+
+/**
  * Start a GPU-accelerated layout run. Returns a {@link WorkerLayoutHandle}-shaped object so the
  * engine treats it identically to the worker backend. `onFrame` runs inside the transport's animation
  * frame, right after positions reached the graph and at most once per frame, so a caller may repaint
@@ -232,7 +258,7 @@ class GpuLayoutRun implements WorkerLayoutHandle {
     }
     const toWorker = (reason: string, cause: unknown): void => {
       if (this.generation !== generation || this.inner) return;
-      this.adopt({ handle: this.fallBackToWorker(fallback(reason), resume?.(), { cause }), stream: null }, replay);
+      this.adopt({ handle: this.fallBackToWorker(fallback(reason), resume?.(), { kind: "failure", cause }), stream: null }, replay);
     };
     device
       .then(start, (e: unknown) => toWorker("the device promise rejected", e))
@@ -313,19 +339,12 @@ class GpuLayoutRun implements WorkerLayoutHandle {
 
   /**
    * The worker run for a device the GPU path cannot use, continuing `cont` when the layout moved. It warns
-   * once with `message`: always for a `failure` (the device promise rejected, the GPU run threw, its context
-   * was lost or its layout turned non-finite — passing the error when there is one), and for an unsupported
-   * device or graph unless the caller expects the worker (`warnUnsupported: false`, #375). The call site says
-   * which it is, never the error value: a rejection or throw with `undefined` is still a failure.
+   * once with `message` under {@link warnGpuFallback}'s rule: always for a `failure` (the device promise
+   * rejected, the GPU run threw, its context was lost or its layout turned non-finite), and for an
+   * unsupported device or graph unless the caller expects the worker (`warnUnsupported: false`, #375).
    */
-  private fallBackToWorker(message: string, cont: Continuation | undefined, failure?: { cause: unknown }): WorkerLayoutHandle {
-    const text = `[d3gl] the GPU network layout ${message}.`;
-    if (failure) {
-      if (failure.cause === undefined) console.warn(text);
-      else console.warn(text, failure.cause);
-    } else if (this.opts.warnUnsupported !== false) {
-      console.warn(text);
-    }
+  private fallBackToWorker(message: string, cont: Continuation | undefined, failure?: GpuLayoutFailure): WorkerLayoutHandle {
+    warnGpuFallback(`[d3gl] the GPU network layout ${message}.`, this.opts.warnUnsupported, failure);
     this.onTransport?.("worker");
     const opts = cont ? { ...this.opts, iterations: cont.iterations, warm: cont.warm } : this.opts;
     const worker = startWorkerLayout(this.graph, opts, this.onFrame, this.onLODTree);
@@ -342,7 +361,7 @@ class GpuLayoutRun implements WorkerLayoutHandle {
   /** Decide GPU vs worker for this graph on `device`, and start that run. */
   private launch(device: Device | null | undefined, cont: Continuation | undefined, fallback: (reason: string) => string, failure: boolean): Launched {
     const { graph, opts, onLODTree } = this;
-    const fault = failure ? { cause: undefined } : undefined;
+    const fault: GpuLayoutFailure | undefined = failure ? { kind: "failure" } : undefined;
     const verdict = gpuLayoutSupport(gpuCaps(device), gpuLayoutNeed(graph.nodeCount, graph.edgeCount));
     if (!verdict.ok || !device) {
       // (`!device` never reaches here with `ok`: no device has no caps, which never pass.)

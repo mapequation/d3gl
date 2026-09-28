@@ -8,11 +8,15 @@
  *   `DYNAMIC_DRAW`), and without a read usage Chrome's `getBufferSubData` cannot use its readback shadow
  *   copy: it falls back to a synchronous round trip to the GPU process. So the PBO is created raw, as
  *   `PickReadback` does, on the `WebGLDevice`'s context (reached by an `instanceof` narrowing, no cast).
- * - **One write per PBO per copy.** Chrome keeps that shadow copy only if the buffer is written once and
- *   then fenced; a second write before the harvest discards it ("written again before being read back")
- *   and the harvest stalls the GPU pipeline — measured on web-NotreDame when the stats rode in the
- *   position PBO as two extra `readPixels`. So the 48 bytes of stats have their own PBO, filled by one
- *   `readPixels` of a 3×1 staging texture ({@link PackStatsPass}).
+ * - **One write, then one read, per PBO per copy.** Chrome keeps that shadow copy only if the buffer is
+ *   written once and then fenced; a second write before the harvest discards it ("written again before
+ *   being read back") and the harvest stalls the GPU pipeline — measured on web-NotreDame when the stats
+ *   rode in the position PBO as two extra `readPixels`. The copy also serves only one `getBufferSubData`:
+ *   a second read of the same copy is a synchronous round trip ("read back without waiting on a fence"),
+ *   which the nested layout paid on every harvest while its module discs shared the position PBO. So the
+ *   48 bytes of stats have their own PBO, filled by one `readPixels` of a 3×1 staging texture
+ *   ({@link PackStatsPass}), and a packed source's extra floats have theirs, filled by one `readPixels` of
+ *   the staging rows that hold them.
  * - **The copy reads the position texture itself** where the device reads `rg32f` as `RG/FLOAT` (the #351
  *   probe; ANGLE Metal): 8 bytes per atlas texel, no staging texture. Elsewhere the pack pass writes the
  *   positions into a staging `rgba32f` texture in node order first ({@link PackPositionsPass}) and the
@@ -22,7 +26,8 @@
  *   layout without scanning N positions, and the stop latch's texel `(prevStep, stopTick, epoch, flags)`
  *   (#376), so the transport learns of a convergence stop with the positions it froze.
  * - **The harvest allocates nothing**: `getBufferSubData` writes straight into the caller's positions
- *   array and a caller-owned 8-float stats array (luma's `Buffer.readSyncWebGL` would allocate per call).
+ *   array, a caller-owned 8-float stats array and the extra floats' array (luma's `Buffer.readSyncWebGL`
+ *   would allocate per call).
  *
  * The copy is not fenced here: the caller inserts one fence per frame after it (the frame budget's), and
  * harvests once that frame has completed. Fences signal in submission order, so that is safe.
@@ -111,40 +116,79 @@ function packBuffer(gl: WebGL2RenderingContext): WebGLBuffer {
 }
 
 /**
- * The position PBO and the stats PBO, one copy in flight at a time. {@link issue} copies; {@link harvest}
- * (once the caller's fence after the copy has signalled) moves it to the CPU.
+ * The position PBO, the stats PBO and — for a packed source's extra floats — the extras PBO, one copy in
+ * flight at a time. {@link issue} copies; {@link harvest} (once the caller's fence after the copy has
+ * signalled) moves it to the CPU, reading each PBO exactly once.
  */
 export class AsyncPositionReadback {
   private readonly gl: WebGL2RenderingContext;
   private readonly pbo: WebGLBuffer;
   private readonly statsPbo: WebGLBuffer;
+  /** The extra floats' PBO, when a packed source's extras are read back (see the constructor). */
+  private readonly extraPbo: WebGLBuffer | null;
+  /** Rows of the copy the position PBO holds: the atlas, the pack pass's staging texture, or a packed source's position rows. */
+  private readonly positionRows: number;
   /** Bytes of the position PBO. */
   private readonly positionBytes: number;
   private readonly count: number;
   /** Staging pack pass for the positions, only where the device does not read `RG/FLOAT` (and the source packs none). */
   private readonly pack: PackPositionsPass | null;
   private readonly packStats: PackStatsPass;
-  /** Byte offset and length of the extra floats after the positions (a packed source's module discs). */
-  private readonly extraOffset: number;
+  /** Where the harvest lands the extra floats, and how many (a packed source's module discs; 0 for none). */
+  private readonly extra: Float32Array | null;
   private readonly extraFloats: number;
+  /** The staging rows the extras PBO copies (first row, count), its bytes, and the extras' byte offset in it. */
+  private readonly extraRow: number;
+  private readonly extraRows: number;
+  private readonly extraBytes: number;
+  private readonly extraOffset: number;
   private copying = false;
   /** Whether the PBOs' storage has been allocated (by the first copy). */
   private sized = false;
 
-  constructor(device: Device, source: ReadbackSource) {
+  /**
+   * @param extra where each harvest lands a packed source's extra floats (up to its length and
+   *   {@link PackedPositions.extraFloats}). Without it none are copied: every PBO a copy writes, the
+   *   harvest reads.
+   */
+  constructor(device: Device, source: ReadbackSource, extra?: Float32Array) {
     if (!(device instanceof WebGLDevice)) throw new Error("AsyncPositionReadback: a WebGL2 device is required");
     this.gl = device.gl;
     this.count = source.nodeCount;
+    const packed = source.packed;
+    // Positions fill texels [0, ⌈count / 2⌉) of a packed source's staging texture, its extra floats the
+    // texels after them; each PBO copies only the whole rows that hold its part.
+    const positionTexels = Math.ceil(source.nodeCount / 2);
+    this.extraFloats = packed ? Math.min(extra?.length ?? 0, packed.extraFloats) : 0;
+    this.extra = this.extraFloats > 0 && extra ? extra : null;
+    if (packed) {
+      const lastTexel = positionTexels + Math.ceil(this.extraFloats / 4) - 1;
+      if (Math.max(positionTexels - 1, lastTexel) >= packed.width * packed.height) {
+        throw new Error("AsyncPositionReadback: the packed positions and extra floats overflow the staging texture");
+      }
+      this.extraRow = Math.floor(positionTexels / packed.width);
+      this.extraRows = this.extra ? Math.floor(lastTexel / packed.width) - this.extraRow + 1 : 0;
+      this.extraBytes = packed.width * this.extraRows * 16;
+      this.extraOffset = (positionTexels - this.extraRow * packed.width) * 16;
+    } else {
+      this.extraRow = 0;
+      this.extraRows = 0;
+      this.extraBytes = 0;
+      this.extraOffset = 0;
+    }
     // Built in order; a failure frees what was already built before it propagates.
     let pack: PackPositionsPass | null = null;
     let packStats: PackStatsPass | null = null;
     let pbo: WebGLBuffer | null = null;
+    let statsPbo: WebGLBuffer | null = null;
     try {
-      pack = source.packed || deviceReadsRG(device) ? null : new PackPositionsPass(device, source.nodeCount);
+      pack = packed || deviceReadsRG(device) ? null : new PackPositionsPass(device, source.nodeCount);
       packStats = new PackStatsPass(device);
       pbo = packBuffer(this.gl);
-      this.statsPbo = packBuffer(this.gl);
+      statsPbo = packBuffer(this.gl);
+      this.extraPbo = this.extra ? packBuffer(this.gl) : null;
     } catch (error) {
+      if (statsPbo) this.gl.deleteBuffer(statsPbo);
       if (pbo) this.gl.deleteBuffer(pbo);
       packStats?.destroy();
       pack?.destroy();
@@ -153,17 +197,17 @@ export class AsyncPositionReadback {
     this.pack = pack;
     this.packStats = packStats;
     this.pbo = pbo;
-    const packed = source.packed;
+    this.statsPbo = statsPbo;
+    this.positionRows = packed
+      ? Math.max(1, Math.ceil(positionTexels / packed.width))
+      : pack
+        ? pack.height
+        : source.atlasRows;
     this.positionBytes = packed
-      ? packed.width * packed.height * 16
+      ? packed.width * this.positionRows * 16
       : pack
         ? pack.width * pack.height * 16
         : source.positionWidth * source.atlasRows * 8;
-    this.extraOffset = Math.ceil(source.nodeCount / 2) * 16;
-    this.extraFloats = packed?.extraFloats ?? 0;
-    if (this.extraOffset + this.extraFloats * 4 > this.positionBytes) {
-      throw new Error("AsyncPositionReadback: the packed positions and extra floats overflow the staging texture");
-    }
   }
 
   /** Whether a copy has been issued and not yet harvested (the PBOs are busy). */
@@ -171,15 +215,15 @@ export class AsyncPositionReadback {
     return this.copying;
   }
 
-  /** Bytes of GPU memory this readback holds: the two PBOs, the stats staging texel pair, and on the pack path the position staging texture. */
+  /** Bytes of GPU memory this readback holds: its PBOs, the stats staging texel pair, and on the pack path the position staging texture. */
   get gpuBytes(): number {
-    return this.positionBytes + 2 * STATS_BYTES + (this.pack ? this.pack.width * this.pack.height * 16 : 0);
+    return this.positionBytes + this.extraBytes + 2 * STATS_BYTES + (this.pack ? this.pack.width * this.pack.height * 16 : 0);
   }
 
   /**
-   * Copy `source`'s current positions and stats into the PBOs — GPU → GPU, the main thread does not
-   * wait; one `readPixels` per PBO. The caller must insert a fence after this and {@link harvest} only
-   * once it has signalled.
+   * Copy `source`'s current positions, stats and extra floats into the PBOs — GPU → GPU, the main thread
+   * does not wait; one `readPixels` per PBO. The caller must insert a fence after this and
+   * {@link harvest} only once it has signalled.
    */
   issue(source: ReadbackSource): void {
     const gl = this.gl;
@@ -197,7 +241,12 @@ export class AsyncPositionReadback {
     const staged = packed ?? pack;
     if (staged) {
       gl.bindFramebuffer(gl.READ_FRAMEBUFFER, fboHandle(staged.framebuffer));
-      gl.readPixels(0, 0, staged.width, staged.height, gl.RGBA, gl.FLOAT, 0);
+      gl.readPixels(0, 0, staged.width, this.positionRows, gl.RGBA, gl.FLOAT, 0);
+      if (this.extraPbo) {
+        gl.bindBuffer(gl.PIXEL_PACK_BUFFER, this.extraPbo);
+        if (first) gl.bufferData(gl.PIXEL_PACK_BUFFER, this.extraBytes, gl.STREAM_READ);
+        gl.readPixels(0, this.extraRow, staged.width, this.extraRows, gl.RGBA, gl.FLOAT, 0);
+      }
     } else {
       gl.bindFramebuffer(gl.READ_FRAMEBUFFER, fboHandle(source.positionFramebuffer));
       gl.readPixels(0, 0, source.positionWidth, source.atlasRows, gl.RG, gl.FLOAT, 0);
@@ -213,12 +262,12 @@ export class AsyncPositionReadback {
 
   /**
    * Move the finished copy to the CPU: the stats into `stats` (≥ {@link READBACK_STATS_FLOATS} floats),
-   * then — only when every stat is finite — the positions into `positions[0 .. 2·count)`, so a layout
-   * that went non-finite never overwrites the last good positions. Returns whether the stats were
-   * finite. With `extra`, a packed source's extra floats (see {@link PackedPositions}) land in it too
-   * (up to its length). Call it only after a fence inserted after {@link issue} has signalled.
+   * then — only when every stat is finite — the positions into `positions[0 .. 2·count)` and the extra
+   * floats (see {@link PackedPositions}) into the constructor's `extra`, so a layout that went
+   * non-finite never overwrites the last good positions. One `getBufferSubData` per PBO. Returns whether
+   * the stats were finite. Call it only after a fence inserted after {@link issue} has signalled.
    */
-  harvest(positions: Float32Array, stats: Float32Array, extra?: Float32Array): boolean {
+  harvest(positions: Float32Array, stats: Float32Array): boolean {
     const gl = this.gl;
     const previousPack: WebGLBuffer | null = gl.getParameter(gl.PIXEL_PACK_BUFFER_BINDING);
     gl.bindBuffer(gl.PIXEL_PACK_BUFFER, this.statsPbo);
@@ -227,11 +276,13 @@ export class AsyncPositionReadback {
     for (let i = 0; i < READBACK_STATS_FLOATS; i++) {
       if (!Number.isFinite(stats[i] ?? Number.NaN)) finite = false;
     }
-    gl.bindBuffer(gl.PIXEL_PACK_BUFFER, this.pbo);
     if (finite) {
+      gl.bindBuffer(gl.PIXEL_PACK_BUFFER, this.pbo);
       gl.getBufferSubData(gl.PIXEL_PACK_BUFFER, 0, positions, 0, this.count * 2);
-      const floats = Math.min(extra?.length ?? 0, this.extraFloats);
-      if (extra && floats > 0) gl.getBufferSubData(gl.PIXEL_PACK_BUFFER, this.extraOffset, extra, 0, floats);
+      if (this.extraPbo && this.extra) {
+        gl.bindBuffer(gl.PIXEL_PACK_BUFFER, this.extraPbo);
+        gl.getBufferSubData(gl.PIXEL_PACK_BUFFER, this.extraOffset, this.extra, 0, this.extraFloats);
+      }
     }
     gl.bindBuffer(gl.PIXEL_PACK_BUFFER, previousPack);
     this.copying = false;
@@ -249,6 +300,7 @@ export class AsyncPositionReadback {
     if (!touchGl) return;
     this.gl.deleteBuffer(this.pbo);
     this.gl.deleteBuffer(this.statsPbo);
+    if (this.extraPbo) this.gl.deleteBuffer(this.extraPbo);
     this.pack?.destroy();
     this.packStats.destroy();
   }

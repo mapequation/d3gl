@@ -12,7 +12,8 @@ import { NestedComposePass } from "./passes/nested-compose.js";
 import { GpuSprings } from "./springs.js";
 import type { NestedSpringInputs } from "./passes/attraction.js";
 import { SegmentTable, type SegmentRow } from "./segment-table.js";
-import { TILE_MIN_SIDE, assertAtlasFits, packTiles, segmentSoftening, slotSegments, type SlotRange } from "./segments.js";
+import { TILE_MIN_SIDE, assertAtlasFits, packTiles, segmentSoftening, slotSegments, type SlotRange, type TileAtlas } from "./segments.js";
+import { NESTED_MAX_SLOTS, gpuNestedSlotNeed, type GpuLayoutNeed } from "./device-caps.js";
 import type { PackedPositions } from "./async-readback.js";
 import type { StreamSolver } from "./gpu-stream.js";
 import { itemCostMs, type ItemCosts, type ItemKind } from "./frame-budget.js";
@@ -119,6 +120,54 @@ void mapSlot(int s, out vec4 sum, out vec4 box) {
   uniforms: { u_segTableWidth: 1, u_mode: 1 },
 };
 
+/**
+ * How a {@link GpuNestedLayout} of `topo` lays the solve out in textures, derived once: the segments as
+ * slot ranges, their tile atlas (a tile for each segment above {@link EXACT_MAX} children, the CPU's exact
+ * threshold), and the large-slot table's size. {@link gpuNestedLayoutNeed} checks it against the device
+ * and the constructor allocates it, so the verdict and the allocation share one size rule, and a
+ * transport packs the tiles once. O(S log S) over S segments (the tile packing).
+ */
+export interface NestedLayoutPlan {
+  readonly topo: NestedSolverTopology;
+  readonly segments: readonly SlotRange[];
+  readonly atlas: TileAtlas;
+  /** The large-slot table: `NESTED_LARGE_MAX` slot ids (two `rgba32uint` texels) per segment-table row — S segments and the whole-slot range. */
+  readonly large: { readonly width: number; readonly height: number };
+}
+
+/** The {@link NestedLayoutPlan} of `topo`. O(S log S) over S segments. */
+export function nestedLayoutPlan(topo: NestedSolverTopology): NestedLayoutPlan {
+  const segments: SlotRange[] = [];
+  for (let s = 0; s < topo.segStart.length; s++) segments.push({ start: topo.segStart[s] ?? 0, count: topo.segCount[s] ?? 0 });
+  const largeTexels = 2 * (segments.length + 1);
+  const largeWidth = atlasWidth(largeTexels);
+  return {
+    topo,
+    segments,
+    atlas: packTiles(segments, EXACT_MAX, TILE_MIN_SIDE),
+    large: { width: largeWidth, height: Math.ceil(largeTexels / largeWidth) },
+  };
+}
+
+/**
+ * Every texture side and limit a {@link GpuNestedLayout} of `plan` needs, for `gpuLayoutSupport`: the
+ * slot atlas (every per-slot texture, the collision cells' slot targets, the composition's staging
+ * texture, at most as many texels), the CSR offsets (and the composition's node map, as many), and the
+ * slot count ({@link gpuNestedSlotNeed}, checked before the prep too); then the springs, the tile atlas
+ * (the pyramid's level 0; its coarser levels and the collision grid are smaller) and the large-slot table
+ * (the segment tables are smaller). A transport checks it before constructing, so a tree the device
+ * cannot run is unsupported rather than a constructor throw. O(1).
+ */
+export function gpuNestedLayoutNeed(plan: NestedLayoutPlan): GpuLayoutNeed {
+  const { topo, atlas, large } = plan;
+  return {
+    ...gpuNestedSlotNeed(topo.slotCount),
+    springSide: atlasWidth(2 * topo.linkSource.length),
+    pyramidSide: Math.max(atlas.width, atlas.height),
+    nested: { slots: topo.slotCount, largeSide: large.width },
+  };
+}
+
 /** Options of {@link GpuNestedLayout}. */
 export interface GpuNestedLayoutOptions {
   /** The root disc's centre, world units. Default (0, 0) (a cold layout's; a warm one is placed after). */
@@ -129,10 +178,11 @@ export interface GpuNestedLayoutOptions {
 }
 
 /**
- * The batched GPU nested layout — see the file header. Built once per layout from a
- * {@link NestedSolverTopology}; every texture, framebuffer and program is created here, so ticking and
- * reading back allocate nothing. A {@link StreamSolver}: the streaming transport encodes its work items
- * within the frame budget and reads the composed positions back through a fenced PBO.
+ * The batched GPU nested layout — see the file header. Built once per layout from the
+ * {@link NestedLayoutPlan} of a {@link NestedSolverTopology}; every texture, framebuffer and program is
+ * created here, so ticking and reading back allocate nothing. A {@link StreamSolver}: the streaming
+ * transport encodes its work items within the frame budget and reads the composed positions back through
+ * a fenced PBO.
  */
 export class GpuNestedLayout implements StreamSolver {
   private readonly device: Device;
@@ -212,7 +262,8 @@ export class GpuNestedLayout implements StreamSolver {
     return (NESTED_READBACK_NS * this.topo.leafCount) / 1e6;
   }
 
-  constructor(device: Device, topo: NestedSolverTopology, options: GpuNestedLayoutOptions = {}) {
+  constructor(device: Device, plan: NestedLayoutPlan, options: GpuNestedLayoutOptions = {}) {
+    const topo = plan.topo;
     this.device = device;
     this.topo = topo;
     // Anything created before a later step throws (a shader the driver rejects, a limit) is freed.
@@ -223,7 +274,7 @@ export class GpuNestedLayout implements StreamSolver {
     try {
       const slots = topo.slotCount;
       if (slots < 1) throw new Error("GpuNestedLayout: the tree has no node below its root");
-      if (slots >= 1 << 24) throw new Error("GpuNestedLayout: slot ids must stay exact in float32 (below 2^24)");
+      if (slots >= NESTED_MAX_SLOTS) throw new Error("GpuNestedLayout: slot ids must stay exact in float32 (below 2^24)");
       this.slots = slots;
       this.rootX = options.rootX ?? 0;
       this.rootY = options.rootY ?? 0;
@@ -237,10 +288,9 @@ export class GpuNestedLayout implements StreamSolver {
       this.decayWarm = nestedAlphaDecay(WARM_ALPHA, T);
 
       // Segments + one whole-slot range; tiles for segments above EXACT_MAX (the CPU's exact threshold).
+      // A transport has checked the atlas (gpuNestedLayoutNeed); the assertion guards direct callers.
       const S = topo.segStart.length;
-      const segments: SlotRange[] = [];
-      for (let s = 0; s < S; s++) segments.push({ start: topo.segStart[s] ?? 0, count: topo.segCount[s] ?? 0 });
-      const atlas = packTiles(segments, EXACT_MAX, TILE_MIN_SIDE);
+      const { segments, atlas } = plan;
       assertAtlasFits(atlas, device.limits.maxTextureDimension2D);
       const rows: SegmentRow[] = segments.map((seg, s) => {
         const tile = atlas.tiles[s] ?? null;
@@ -308,8 +358,7 @@ export class GpuNestedLayout implements StreamSolver {
       }
       nested[S * 4 + 1] = -1;
       this.segNested = own(device.createTexture({ width: tw, height: th, format: "rgba32float", data: nested, mipLevels: 1, sampler: NEAREST }));
-      const largeWidth = atlasWidth(2 * rows.length);
-      const largeRows = Math.ceil((2 * rows.length) / largeWidth);
+      const { width: largeWidth, height: largeRows } = plan.large;
       const large = new Uint32Array(largeWidth * largeRows * 4).fill(0xffffffff);
       for (let i = 0; i < S * NESTED_LARGE_MAX; i++) {
         const slot = topo.segLarge[i] ?? -1;
@@ -347,7 +396,7 @@ export class GpuNestedLayout implements StreamSolver {
         springWeight: topo.linkWeight,
         positions: new Float32Array(0),
       };
-      this.springs = own(new GpuSprings(device, links, { nested: true }));
+      this.springs = own(new GpuSprings(device, links, { nested: true, rowScale: topo.springScale }));
       this.predict = own(new NestedPredictPass(device));
       this.integratePass = own(new NestedIntegratePass(device, 1 - NESTED.DECAY));
       this.collision = own(new CollisionGrid(device, width, height, atlas.width >> 1, atlas.height >> 1, largeWidth));
@@ -595,7 +644,25 @@ export class GpuNestedLayout implements StreamSolver {
 
   /** The slots' local positions (each in its parent's unit disc), synchronously — for tests: `2 · slots` floats. */
   readLocal(out: Float32Array): void {
-    const pixels = this.device.readPixelsToArrayWebGL(this.positionFramebuffer, { sourceWidth: this.width, sourceHeight: this.height });
+    this.readSlots(this.positionFramebuffer, out);
+  }
+
+  /**
+   * The slots' velocities, synchronously — for tests, which restart a reference from the solve's own state:
+   * `2 · slots` floats. Wraps the velocity texture in a framebuffer for the read and frees it after.
+   */
+  readVelocity(out: Float32Array): void {
+    const fbo = this.device.createFramebuffer({ width: this.width, height: this.height, colorAttachments: [this.vel.readTex] });
+    try {
+      this.readSlots(fbo, out);
+    } finally {
+      fbo.destroy();
+    }
+  }
+
+  /** x, y of every slot's texel of the `rg32float` slot atlas `framebuffer` wraps, into `out`. */
+  private readSlots(framebuffer: Framebuffer, out: Float32Array): void {
+    const pixels = this.device.readPixelsToArrayWebGL(framebuffer, { sourceWidth: this.width, sourceHeight: this.height });
     if (!(pixels instanceof Float32Array)) throw new Error("GpuNestedLayout: expected a float readback");
     // rg32float reads back as RGBA or RG depending on the device: take x, y of every texel either way.
     const channels = pixels.length / (this.width * this.height);

@@ -127,6 +127,73 @@ export function reclustered(): { flat: LODTree; merged: LODTree; split: LODTree 
   };
 }
 
+/**
+ * A directed partition in the shape of web-NotreDame's directed Infomap tree (#355), where hubs are small:
+ * a directory page links out to many pages but few link back, so its flow — the directed PageRank Infomap
+ * sizes nodes by — is little more than its teleportation share, and its disc is no larger than its
+ * pages'. It then takes half or more of each of its links' correction, so its summed link share D grows
+ * with its degree (about a quarter of its weighted degree at equal radii). Under undirected flow a hub's
+ * disc grows with its degree instead, so its share of each link shrinks as its links multiply.
+ *
+ * Three top modules over 220 pages. Module 1 is a directory page linking to 150 pages that each link on
+ * to module 3 only: its disc is its pages' size, so D ≈ 38 (web-NotreDame's largest: 612 links, D =
+ * 135). Module 2 is two directory pages that link each other, with 24 pages each, chained: they sit at
+ * the radius floor, below some of their pages, and D ≈ 3.7 each (two linked hubs, the stiffest spring
+ * mode). Module 3 is 20 pages in a cycle, linking back to module 2's first pages. Nothing else links a
+ * directory. The flow is the directed PageRank (teleportation 0.15; no page is dangling) — `flow` for
+ * the size metric, `source` / `target` for the graph. (D is the solver's, from its sparsified link
+ * weights and radii: `nested-topology.test.ts`.)
+ */
+export function directedPartition(): { tree: LODTree; modules: ModuleNode[]; source: number[]; target: number[]; flow: Float32Array } {
+  const modules: ModuleNode[] = [];
+  const source: number[] = [];
+  const target: number[] = [];
+  const link = (a: number, b: number): void => {
+    source.push(a);
+    target.push(b);
+  };
+  let id = 0;
+  const page = (path: number[]): number => {
+    modules.push({ id, path });
+    return id++;
+  };
+  const directory = page([1, 1]);
+  const pages = Array.from({ length: 150 }, (_, p) => page([1, p + 2]));
+  const a = page([2, 1]);
+  const b = page([2, 2]);
+  const lists = [a, b].map((hub, h) => ({ hub, list: Array.from({ length: 24 }, (_, p) => page([2, 3 + 24 * h + p])) }));
+  const cycle = Array.from({ length: 20 }, (_, p) => page([3, p + 1]));
+  pages.forEach((leaf, p) => {
+    link(directory, leaf);
+    link(leaf, cycle[p % cycle.length] ?? leaf);
+  });
+  link(a, b);
+  link(b, a);
+  for (const { hub, list } of lists) {
+    list.forEach((leaf, p) => {
+      link(hub, leaf);
+      link(leaf, list[p + 1] ?? cycle[0] ?? leaf); // on to the next page; the last to module 3
+    });
+    link(cycle[10] ?? 0, list[0] ?? 0);
+  }
+  cycle.forEach((leaf, p) => link(leaf, cycle[(p + 1) % cycle.length] ?? leaf));
+  const n = id;
+  // Directed PageRank by power iteration, teleportation 0.15 (every page links out).
+  const out = new Uint32Array(n);
+  for (const s of source) out[s] = (out[s] ?? 0) + 1;
+  let flow = new Float64Array(n).fill(1 / n);
+  for (let it = 0; it < 200; it++) {
+    const next = new Float64Array(n).fill(0.15 / n);
+    source.forEach((s, e) => {
+      const t = target[e] ?? 0;
+      next[t] = (next[t] ?? 0) + (0.85 * (flow[s] ?? 0)) / (out[s] ?? 1);
+    });
+    flow = next;
+  }
+  const weight = source.map(() => 1); // an unweighted edge list, as web-NotreDame's
+  return { tree: buildModuleLODTree(n, modules, { source, target, weight }), modules, source, target, flow: Float32Array.from(flow) };
+}
+
 type Layout = Pick<NestedLayoutResult, "positions" | "cx" | "cy" | "r">;
 
 /** Mean leaf displacement between two layouts. */
@@ -167,19 +234,49 @@ export function similar(p: Float32Array, angle: number, scale = 1, dx = 0, dy = 
   return out;
 }
 
-/** The layout invariants: every child disc inside its parent's, no two sibling discs overlapping. */
-export function expectNested(tree: LODTree, out: Layout): void {
-  const parent = tree.parent!;
-  const dist = (a: number, b: number): number => Math.hypot(out.cx[a]! - out.cx[b]!, out.cy[a]! - out.cy[b]!);
+/** Distance between the centres of tree nodes `a` and `b`. */
+function centreDistance(out: Pick<Layout, "cx" | "cy">, a: number, b: number): number {
+  return Math.hypot((out.cx[a] ?? 0) - (out.cx[b] ?? 0), (out.cy[a] ?? 0) - (out.cy[b] ?? 0));
+}
+
+/** Finite positions, and every child disc inside its parent's. */
+export function expectContained(tree: LODTree, out: Layout): void {
+  const { parent } = tree;
+  if (!parent) throw new Error("module trees carry a parent map");
   expect(Array.from(out.positions).every(Number.isFinite)).toBe(true);
   for (let g = 0; g < tree.size; g++) {
-    const p = parent[g]!;
-    if (p >= 0) expect(dist(g, p) + out.r[g]!).toBeLessThanOrEqual(out.r[p]! * 1.0001);
+    const p = parent[g] ?? -1;
+    if (p >= 0) expect(centreDistance(out, g, p) + (out.r[g] ?? 0)).toBeLessThanOrEqual((out.r[p] ?? 0) * 1.0001);
   }
+}
+
+/** The worst sibling distance over the two radii's sum, over every module (≥ 1 when no siblings overlap). */
+export function worstSeparation(tree: LODTree, out: Pick<Layout, "cx" | "cy" | "r">): number {
+  let worst = Infinity;
   for (let g = tree.leafCount; g < tree.size; g++) {
     const c = kids(tree, g);
     for (let a = 0; a < c.length; a++) {
-      for (let b = a + 1; b < c.length; b++) expect(dist(c[a]!, c[b]!)).toBeGreaterThanOrEqual((out.r[c[a]!]! + out.r[c[b]!]!) * 0.98);
+      for (let b = a + 1; b < c.length; b++) {
+        const ca = c[a] ?? 0;
+        const cb = c[b] ?? 0;
+        worst = Math.min(worst, centreDistance(out, ca, cb) / ((out.r[ca] ?? 0) + (out.r[cb] ?? 0)));
+      }
+    }
+  }
+  return worst;
+}
+
+/** The layout invariants: every child disc inside its parent's, no two sibling discs overlapping. */
+export function expectNested(tree: LODTree, out: Layout): void {
+  expectContained(tree, out);
+  for (let g = tree.leafCount; g < tree.size; g++) {
+    const c = kids(tree, g);
+    for (let a = 0; a < c.length; a++) {
+      for (let b = a + 1; b < c.length; b++) {
+        const ca = c[a] ?? 0;
+        const cb = c[b] ?? 0;
+        expect(centreDistance(out, ca, cb)).toBeGreaterThanOrEqual(((out.r[ca] ?? 0) + (out.r[cb] ?? 0)) * 0.98);
+      }
     }
   }
 }

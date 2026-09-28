@@ -17,7 +17,7 @@ import type { Device, Texture, TextureProps } from "@luma.gl/core";
 import { buildGraph } from "../../graph.js";
 import { infomapLikeTree } from "../../__tests__/nested-fixtures.js";
 import { perfNOverride } from "../../../__tests__/perf-budget.js";
-import { GpuNestedLayout } from "../gpu-nested-layout.js";
+import { GpuNestedLayout, nestedLayoutPlan } from "../gpu-nested-layout.js";
 import { startGpuNestedLayout } from "../gpu-nested-transport.js";
 import { nestedSolverTopology } from "../nested-topology.js";
 import { makeTestDevice } from "./_device.js";
@@ -71,7 +71,7 @@ describe.skipIf(N === 0)(`GPU nested layout timing bench (#355), ${N} leaves`, (
     const solver = nestedSolverTopology(topo, { size: flow, radius });
     const prepMs = performance.now() - t0;
     t0 = performance.now();
-    const { value: layout, bytes } = textureBytes(device, () => new GpuNestedLayout(device, solver));
+    const { value: layout, bytes } = textureBytes(device, () => new GpuNestedLayout(device, nestedLayoutPlan(solver)));
     fence(device, layout);
     const buildMs = performance.now() - t0;
     const pboBytes = layout.packed.width * layout.packed.height * 16; // the stream's readback PBO

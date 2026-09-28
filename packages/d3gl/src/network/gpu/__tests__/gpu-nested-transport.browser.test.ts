@@ -8,7 +8,7 @@ import { WebGLDevice } from "@luma.gl/webgl";
 import { makeTestDevice } from "./_device.js";
 import { AsyncPositionReadback } from "../async-readback.js";
 import { startGpuNestedLayout } from "../gpu-nested-transport.js";
-import { GpuNestedLayout } from "../gpu-nested-layout.js";
+import { GpuNestedLayout, gpuNestedLayoutNeed, nestedLayoutPlan } from "../gpu-nested-layout.js";
 import { nestedSolverResult, nestedSolverTopology } from "../nested-topology.js";
 import { buildGraph, type NetworkGraph } from "../../graph.js";
 import { nestedBoundaryDiscs, nestedLayout, type NestedLayoutTopology } from "../../nested-layout.js";
@@ -23,10 +23,53 @@ function graphOver(tree: NestedLayoutTopology): NetworkGraph {
   return buildGraph({ nodeCount: n, source: Array.from({ length: n }, (_, i) => i), target: Array.from({ length: n }, (_, i) => (i + 1) % n) });
 }
 
+/**
+ * `T × S × L` leaves in `T` top modules of `S` bottom modules, **without links**. A bottom module of 33
+ * leaves takes an 8 × 8 tile (64 texels for 33 slots), so the segments' tile atlas outgrows the slot
+ * atlas: at `(10, 8, 33)`, 2,730 slots in a 53-texel slot atlas and a 128 × 64 tile atlas.
+ */
+function linklessThreeLevel(T: number, S: number, L: number): NestedLayoutTopology {
+  const records: ModuleNode[] = [];
+  for (let id = 0; id < T * S * L; id++) records.push({ id, path: [Math.floor(id / (S * L)) + 1, Math.floor((id % (S * L)) / L) + 1, (id % L) + 1] });
+  return topo(buildModuleLODTree(T * S * L, records));
+}
+
+/**
+ * 1,128 leaves, **without links**, in two top modules: one of 16 bottom modules of 33 leaves (an 8 × 8 tile
+ * each, a 32 × 32 tile atlas), one of 20 bottom modules of 30 (the exact loop). 1,166 slots: a 35-texel
+ * slot atlas, while the flat layout's grid estimate for as many nodes is 64 texels.
+ */
+function tiledAndExact(): NestedLayoutTopology {
+  const records: ModuleNode[] = [];
+  let id = 0;
+  for (let b = 0; b < 16; b++) for (let l = 0; l < 33; l++) records.push({ id: id++, path: [1, b + 1, l + 1] });
+  for (let b = 0; b < 20; b++) for (let l = 0; l < 30; l++) records.push({ id: id++, path: [2, b + 1, l + 1] });
+  return topo(buildModuleLODTree(id, records));
+}
+
+/**
+ * `n` leaves, each under a chain of two single-child modules: 3n slots in 2n + 1 segments, so the
+ * large-slot table (two texels per segment row) is the largest texture the nested layout allocates.
+ */
+function singleChildChains(n: number): NestedLayoutTopology {
+  const records: ModuleNode[] = [];
+  for (let id = 0; id < n; id++) records.push({ id, path: [id + 1, 1, 1] });
+  return topo(buildModuleLODTree(n, records));
+}
+
+/** A fresh WebGL2 test device that reports `max` as its `maxTextureDimension2D` (read before any probe). */
+async function deviceWithTextureLimit(max: number): Promise<Device> {
+  const device = await makeTestDevice();
+  const limits = device.limits;
+  const capped = new Proxy(limits, { get: (target, key) => (key === "maxTextureDimension2D" ? max : Reflect.get(target, key)) });
+  Object.defineProperty(device, "limits", { configurable: true, value: capped });
+  return device;
+}
+
 /** The direct solver's composed result on `device` — the reference the handle's output must equal bitwise. */
 function direct(device: Device, tree: NestedLayoutTopology, iterations: number, initial?: Float32Array): ReturnType<typeof nestedSolverResult> {
   const solver = nestedSolverTopology(tree, { iterations, radius: initial ? undefined : 10 * Math.sqrt(tree.leafCount), initial });
-  const layout = new GpuNestedLayout(device, solver);
+  const layout = new GpuNestedLayout(device, nestedLayoutPlan(solver));
   try {
     layout.runTicks(solver.iterations);
     const positions = new Float32Array(2 * solver.leafCount);
@@ -106,6 +149,122 @@ describe("startGpuNestedLayout (#355)", () => {
     expect(String(warn.mock.calls[0]?.[0])).toMatch(/fell back to the CPU worker/);
     // The worker runs the CPU layout itself.
     expect(Array.from(g.positions)).toEqual(Array.from(nestedLayout(tree, { iterations, radius }).positions));
+  });
+
+  it("falls back silently with warnUnsupported: false (\"auto\", #375) when there is no device", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const g = graphOver(tree);
+    const handle = startGpuNestedLayout(null, g, tree, { iterations, radius }, () => {}, { warnUnsupported: false });
+    await handle.settled;
+    expect(handle.transport).toBe("worker");
+    expect(warn).not.toHaveBeenCalled();
+    expect(Array.from(g.positions)).toEqual(Array.from(nestedLayout(tree, { iterations, radius }).positions));
+  });
+
+  // A 64-texel device: the slot atlas (53), the CSR offsets (53) and the pre-prep grid estimate (64) fit,
+  // so each case below reaches the check after the prep, where the segments and links are known.
+  describe("a tree past the device's textures, found after the prep, is unsupported, not a failure (#375)", () => {
+    const small = 64;
+    let limited: Device;
+    beforeAll(async () => {
+      limited = await deviceWithTextureLimit(small);
+    });
+
+    const cases: [string, NestedLayoutTopology, RegExp][] = [
+      ["the tile atlas (128 × 64)", linklessThreeLevel(10, 8, 33), /needs a 128-texel tile atlas texture, past the device's 64-texel limit/],
+      ["the springs' CSR", topo(threeLevel(10, 8, 33)), /needs a \d+-texel spring texture, past the device's 64-texel limit/],
+    ];
+    it.each(cases)("%s: silent with warnUnsupported: false, one warning naming it without", async (_label, tree, reason) => {
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      const params = { iterations: 10, radius: 10 * Math.sqrt(tree.leafCount) };
+      const want = nestedLayout(tree, params).positions;
+      const auto = graphOver(tree);
+      const handle = startGpuNestedLayout(limited, auto, tree, params, () => {}, { warnUnsupported: false });
+      await handle.settled;
+      expect(handle.transport).toBe("worker");
+      expect(warn).not.toHaveBeenCalled();
+      expect(Array.from(auto.positions)).toEqual(Array.from(want));
+
+      const gpu = graphOver(tree);
+      const warned = startGpuNestedLayout(limited, gpu, tree, params, () => {});
+      await warned.settled;
+      expect(warned.transport).toBe("worker");
+      expect(warn).toHaveBeenCalledTimes(1);
+      expect(warn.mock.calls[0]?.length, "an unsupported tree passes no error value").toBe(1);
+      expect(String(warn.mock.calls[0]?.[0])).toMatch(reason);
+      expect(Array.from(gpu.positions)).toEqual(Array.from(want));
+    });
+
+    it("the verdict covers every texture the nested layout allocates", () => {
+      for (const tree of [...cases.map(([, t]) => t), singleChildChains(500)]) {
+        const solver = nestedSolverTopology(tree, { iterations: 10, radius: 10 * Math.sqrt(tree.leafCount) });
+        const plan = nestedLayoutPlan(solver);
+        const need = gpuNestedLayoutNeed(plan);
+        const covered = Math.max(need.positionSide, need.offsetsSide, need.springSide, need.pyramidSide, need.nested?.largeSide ?? 0);
+        const sides: number[] = [];
+        const createTexture = vi.spyOn(device, "createTexture");
+        const createFramebuffer = vi.spyOn(device, "createFramebuffer");
+        const layout = new GpuNestedLayout(device, plan);
+        try {
+          for (const [props] of [...createTexture.mock.calls, ...createFramebuffer.mock.calls]) sides.push(props.width ?? 0, props.height ?? 0);
+        } finally {
+          layout.destroy();
+          vi.restoreAllMocks();
+        }
+        expect(sides.length).toBeGreaterThan(0);
+        expect(Math.max(...sides)).toBeLessThanOrEqual(covered);
+      }
+    });
+
+    // Where the large-slot table is the largest texture, the largest side the layout allocates is the
+    // need's large-slot side exactly: the verdict and the constructor size that table by one rule.
+    it("names the large-slot table's exact side where it is the largest texture (single-child chains)", () => {
+      const solver = nestedSolverTopology(singleChildChains(500), { iterations: 10, radius: 10 * Math.sqrt(500) });
+      const plan = nestedLayoutPlan(solver);
+      const need = gpuNestedLayoutNeed(plan);
+      const large = need.nested?.largeSide ?? 0;
+      expect(large).toBeGreaterThan(Math.max(need.positionSide, need.offsetsSide, need.springSide, need.pyramidSide));
+      const sides: number[] = [];
+      const createTexture = vi.spyOn(device, "createTexture");
+      const layout = new GpuNestedLayout(device, plan);
+      try {
+        for (const [props] of createTexture.mock.calls) sides.push(props.width ?? 0, props.height ?? 0);
+      } finally {
+        layout.destroy();
+        vi.restoreAllMocks();
+      }
+      expect(Math.max(...sides)).toBe(large);
+    });
+  });
+
+  // Before the prep, only the slot count is known: the check there is the nested solve's (the slot atlas,
+  // the CSR offsets, the slot count), not the flat layout's, whose grid pyramid the nested solve never
+  // allocates. On a 60-texel device that grid estimate (64) would reject a tree every nested texture fits.
+  it("checks the nested need before the prep, not the flat grid estimate: a tree that fits runs on the GPU", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const limited = await deviceWithTextureLimit(60);
+    try {
+      const fits = tiledAndExact();
+      const params = { iterations: 10, radius: 10 * Math.sqrt(fits.leafCount) };
+      const g = graphOver(fits);
+      const handle = startGpuNestedLayout(limited, g, fits, params, () => {}, { warnUnsupported: false });
+      await handle.settled;
+      expect(warn).not.toHaveBeenCalled();
+      expect(handle.transport).toBe("gpu");
+      expect(Array.from(g.positions)).toEqual(Array.from(direct(limited, fits, 10).positions));
+    } finally {
+      limited.destroy();
+    }
+  });
+
+  it("an empty module tree falls back silently with warnUnsupported: false", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const empty = topo(buildModuleLODTree(0, []));
+    const g = buildGraph({ nodeCount: 0, source: [], target: [] });
+    const handle = startGpuNestedLayout(device, g, empty, { iterations, radius }, () => {}, { warnUnsupported: false });
+    await handle.settled;
+    expect(handle.transport).toBe("worker");
+    expect(warn).not.toHaveBeenCalled();
   });
 
   it("a warm start whose GPU solve fails lands none of it: the worker lays it out, with one warning", async () => {
