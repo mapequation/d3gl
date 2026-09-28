@@ -1,4 +1,5 @@
 import { decodePickColor } from "./palette.js";
+import { deleteSync, insertSync, pollSync } from "./fence.js";
 
 /**
  * Stall-free single-pixel readback from the GPU pick FBO (#141).
@@ -47,13 +48,10 @@ export class PickReadback {
     // Harvest the readback issued on the previous call (the other slot); update `last` if it's ready.
     const prev = this.slots[1 - this.cur]!;
     if (prev.sync) {
-      // SYNC_FLUSH_COMMANDS_BIT forces a flush as part of the (non-blocking, timeout 0) poll, so the
-      // fence is guaranteed reachable — without it a sync can spin un-signaled forever if the commands
-      // were never flushed to the GPU (observed under headless software-GL contention).
-      const status = gl.clientWaitSync(prev.sync, gl.SYNC_FLUSH_COMMANDS_BIT, 0);
-      if (status === gl.ALREADY_SIGNALED || status === gl.CONDITION_SATISFIED) {
+      // A non-blocking poll that flushes, so the fence is guaranteed reachable (webgl/fence.ts).
+      if (pollSync(gl, prev.sync) === "signaled") {
         this.last = this.harvest(prev.pbo);
-        gl.deleteSync(prev.sync);
+        deleteSync(gl, prev.sync);
         prev.sync = null;
       }
       // Not ready yet (rare): keep `last`; this slot is harvested again next time it comes around.
@@ -61,14 +59,14 @@ export class PickReadback {
     // Kick a new non-blocking readback into the current slot. Abandon any unharvested fence first.
     const slot = this.slots[this.cur]!;
     if (slot.sync) {
-      gl.deleteSync(slot.sync);
+      deleteSync(gl, slot.sync);
       slot.sync = null;
     }
     gl.bindFramebuffer(gl.READ_FRAMEBUFFER, fb);
     gl.bindBuffer(gl.PIXEL_PACK_BUFFER, slot.pbo);
     gl.readPixels(px, py, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, 0); // → PBO, no CPU wait
-    slot.sync = gl.fenceSync(gl.SYNC_GPU_COMMANDS_COMPLETE, 0);
-    gl.flush(); // ensure the fence + copy are actually submitted so they can complete by next call
+    // Fence + flush, so the copy is submitted and can complete by the next call.
+    slot.sync = insertSync(gl);
     gl.bindBuffer(gl.PIXEL_PACK_BUFFER, null);
     gl.bindFramebuffer(gl.READ_FRAMEBUFFER, null);
     this.cur = 1 - this.cur;
@@ -103,7 +101,7 @@ export class PickReadback {
   destroy(): void {
     const gl = this.gl;
     for (const s of this.slots) {
-      if (s.sync) gl.deleteSync(s.sync);
+      deleteSync(gl, s.sync);
       gl.deleteBuffer(s.pbo);
     }
   }

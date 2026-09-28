@@ -385,6 +385,10 @@ per-file timeout. Every at-scale leg below now asserts. When you add a guard, ad
 | hover overlay reuse | **WebGL** | `map/hover-overlay-perf.browser.test.ts` | 1000 glyphs / 125 hover changes | ✗ **deliberately unscaled** |
 | instanced pie | **WebGL** | `webgl/__tests__/instanced-pie-perf.browser.test.ts` | 100k | `PERF_BROWSER_N` |
 | GPU layout tick (+ #349 signatures: no draw of ≥ N vertices × instances into a 1×1 viewport, via any of the five WebGL2 draw calls; zero texture / framebuffer / buffer creation per tick); hub springs (#350): hub rows in web-NotreDame's shape, scaled with N (0.52% of rows, its five > 4096 hubs, chunk count K ≥ N/30), tick ≤ 2× a hub-free twin with the same edges, and exactly one extra draw (the chunk pass, K fragments) with no per-tick allocation; tile pyramid (#354): one scatter into the L0 atlas and one reduce per coarser level, each rasterising exactly its level's rectangle of the packed Podd / Peven textures (draws are attributed by texture identity, never by size: for N in (W² − W, W²], W a power of two, the slot atlas is W × W, the size of L0) | **WebGL** | `network/gpu/__tests__/gpu-frame-budget-perf.browser.test.ts` | 30k | `PERF_BROWSER_N` (max 200k) |
+| GPU layout tick sliced into row bands (#352): 4 bands per tick bitwise equal to the unsliced tick (hub rows included), 12 scissored force draws, no allocation per band | **WebGL** | `network/gpu/__tests__/gpu-frame-budget-perf.browser.test.ts` | 30k | `PERF_BROWSER_N` (max 200k) |
+| GPU layout **streaming** through `network().layout({ backend: "gpu" })`, LOD off **and** on (#352): transport-only main thread per frame (p95 ceiling `c0 + c1·N`), encode median ≤ 2.5 ms; every streaming `readPixels` into a bound PBO; every `getBufferSubData` after a fence inserted after its copy was seen signalled; within a frame the harvest precedes every layout draw; exactly one fence per frame; no GPU object created per streamed frame (under LOD from the cut's first repaint; an instanced lane may grow, at least doubling); repaints ≥ 48 ms apart; `settled` after the final tick's harvest; ticks/s floored against the GPU-only rate. **Node drag** on the same engine (a real pointer drag of the settled layout, LOD off **and** on): the same transport bounds and GL signatures over the held and re-cool frames, no GPU object created, `setPinned` once per pointer move and held-position writes at most once per tick, each over the held set (O(held)), ticks and repaints while held | **WebGL** | `network/gpu/__tests__/_gpu-stream-harness.ts`, run as `gpu-stream-nolod-perf.browser.test.ts` and `gpu-stream-lod-perf.browser.test.ts` (one file per reduction state, each under the tier's 300 s per-file budget) | 100k | `PERF_BROWSER_N` (max 1M) |
+| GPU layout **LOD while streaming** (#377): the LOD-on leg of the row above runs at a fit view (the whole equilibrium disc), draws the LOD worker's tree (`lodSource === "worker"`), and its main-thread ms per repaint (commit + repaint) stays within 1.5× + 2 ms of the **worker backend's** repaint on the same engine, graph and view, both from a disc cold start (a multilevel seed shares the LOD tree's hierarchy, so its frontier is a fraction of a cold start's: comparing it measures the seed). LOD lanes may grow their buffers on a few repaints after the tree arrives, never outside a repaint, never on most. The ratio is a loose bound (the GPU leg runs 60 ticks, the worker's 12, so their frontiers differ): it catches an order-of-magnitude regression, not a reintroduced 5-15 ms geometry pass, and the Navigator switch's gate (spec §12.3) reads the measured ratios in #377 (0.83 at 325k, 0.74 at 1M, 1.06 at 100k on an M1 Max). **Deterministic signatures** — the regression guards: `gpu-lod-mainthread.browser.test.ts`, zero main-thread `buildLODTree` / `computeLODGeometry` / `computeLODPositions` through `lod()` after a GPU layout, the streamed repaints, a node drag with its re-cool, and pan/zoom; `gpu-lod-relay.browser.test.ts`, the final frame of a run and of a re-cool is copied, refit and painted once (no repaint or refit after `settled`, no copy repeating the previous copy's ticks) | **WebGL** | `network/gpu/__tests__/_gpu-stream-harness.ts` (run by `gpu-stream-lod-perf.browser.test.ts`) + `gpu-lod-mainthread.browser.test.ts` + `gpu-lod-relay.browser.test.ts` | 100k / 6k / 4k | `PERF_BROWSER_N` (max 1M) / ✗ counts |
+| GPU streaming readback `AsyncPositionReadback` (#352), `RG/FLOAT` and packed `RGBA/FLOAT`: exact positions and stats, both PBOs `STREAM_READ`, one `readPixels` per PBO per copy (into the PBO), no allocation per readback, copy and harvest main-thread ceilings, a non-finite layout refused without touching positions | **WebGL** | `network/gpu/__tests__/gpu-async-readback-perf.browser.test.ts` | 1M | `PERF_BROWSER_N` (max 4M) |
 | GPU layout position readback through `GpuForceLayout.readPositions`, `RGBA/FLOAT` (a device that refuses `RG/FLOAT`) and `RG/FLOAT` (#351): exact positions, no GPU allocation and one `readPixels` per readback, one retained RGBA scratch | **WebGL** | `network/gpu/__tests__/gpu-readback-perf.browser.test.ts` | 1M | `PERF_BROWSER_N` (max 4M) |
 | React recolor vs build | **WebGL** | `react/perf.browser.test.ts` | 4096 | capped at 8192 — see below |
 | `"auto"` placeholder emit | Canvas→**WebGL** | `map/auto-placeholder-perf.browser.test.ts` | 200k edges / 200k points | `PERF_BROWSER_N` (max 611k) |
@@ -557,6 +561,99 @@ previous build — while every SwiftShader test stayed green, because SwiftShade
   texture fetch or through a function parameter instead of a uniform read in the loop condition (the flat
   exact loop: 3.26 → 3.33 ms per draw at N = 4096). Time a changed per-node loop on real hardware against
   the previous build; `repulsion-fs.test.ts` pins the flat exact loop's shape.
+
+## GPU layout streaming: raw `STREAM_READ` PBOs, one write per fence, repaints cost GPU too (#352)
+
+The streaming GPU layout never reads synchronously on the frame path. It copies positions into a PBO,
+fences the frame, and harvests with `getBufferSubData` once that fence has signalled (`network/gpu/`
+`async-readback.ts`, `gpu-stream.ts`, `frame-budget.ts`). Four things bit while building it:
+
+- **luma `Buffer`s cannot be `STREAM_READ`** (9.3.3's `WEBGLBuffer` emits only `STATIC_DRAW` /
+  `DYNAMIC_DRAW`). Without a `*_READ` usage Chrome's `getBufferSubData` cannot use its readback shadow
+  copy and falls back to a synchronous round trip. Create readback PBOs raw on the `WebGLDevice`'s
+  context, as `PickReadback` does.
+- **Write each READ buffer once per fence.** Chrome keeps the shadow copy only for a buffer written once
+  and then fenced. A second `readPixels` into the same PBO before the harvest logs "written again before
+  being read back" and discards the copy. The harvest then logs "read back without waiting on a fence"
+  and stalls the GPU pipeline. That stall does not show in main-thread time: on web-NotreDame, 300 ticks
+  took 63 s instead of 11 s. Pack everything a PBO carries into one texture first (the stats ride in their
+  own 32-byte PBO through a 2×1 staging texture). Chrome also counts the sizing `bufferData` as a
+  write, so size the storage in the first copy, before the fence, not a frame earlier.
+- **A heavy engine repaint is GPU work the layout's fences see.** Its draws queue ahead of the layout
+  items of its own frame and of every later frame. So a late fence right behind a repaint says nothing
+  about the layout's band size: the late frame carried the repaint, or one did that completed within the
+  frames in flight before it. The fence controller only blocks on such a miss and never resizes `k` or B.
+  Before that rule, every 325k render doubled B until 50 items per tick left 4.6 ticks/s. Only the late
+  frame (the oldest in flight) and what ran before it count. A repaint queued after it cannot have
+  delayed its fence, because the GPU runs work in order, so it excuses nothing. Where the browser holds the next animation frame until the
+  canvas is drawn (SwiftShader: seconds per 100k-node render), the rAF gap after a repaint frame is
+  the render's cost, and the repaint throttle spaces repaints by twice that. But a gap is not always a
+  render cost: a hidden tab pauses rAF, and a long task delays it. Taken at face value, one such gap once
+  held the layout's repaints back for as long again. So `RepaintThrottle` does not sample across a
+  `visibilitychange` or an idle resume, and it uses the smaller of the last two stall samples: a real GPU
+  cost repeats after every repaint, and a one-off gap does not.
+- **The stats a copy carries must describe the positions it copies.** The harvest refuses a non-finite
+  layout by checking the reductions' stats before it touches `graph.positions`. Those stats come from the
+  last prep (item P), so they describe the positions *before* that tick's integrate. The first version
+  copied right after an integrate and let a NaN born there reach the screen and the settle handler.
+  Positions change only at the integrate and at the prep, where a drag's held positions are written,
+  never mid-tick. So a copy after a prep reuses its stats, and a copy between ticks re-runs the
+  reductions first (`refreshSegmentStats`). Mid-tick, re-running them would change the box and centroid
+  that the remaining force bands read.
+- **A GPU layout lands its nodes differently on each platform, so a guard must not assume where a given
+  node lands.** SwiftShader compiles shaders with LLVM on arm64 Macs and with Subzero on the x86-64 CI
+  runners (`UNMASKED_RENDERER_WEBGL` names the JIT). The same seed and tick count give different float
+  results, and the layout diverges. T7's drag once grabbed node N/2 because it was a drawn leaf at k=4 on
+  a Mac. On CI the LOD declutter hid it, with no glyph over its centre, and the pointer-down grabbed
+  nothing. About 3% of leaves are hidden like that at 100k. Find the node to grab through `pick`, the
+  same way the pointer-down does (`centreOnDrawnLeaf`). To reproduce a CI-only layout on an Apple-silicon
+  Mac, run the file under Rosetta. Install the x64 headless shell with
+  `PLAYWRIGHT_BROWSERS_PATH=<dir> PLAYWRIGHT_HOST_PLATFORM_OVERRIDE=mac15 playwright install
+  chromium-headless-shell`, then point a local config's `playwright({ launchOptions: { executablePath } })`
+  at it.
+- **Under LOD the lanes keep changing while a layout streams, so a "no GPU object per frame" guard must
+  say which changes it allows.** Three things created GPU objects in T7's LOD leg after its first repaint,
+  and none of them was the transport. (1) The frontier grows as the layout spreads (163 → 431 circles and
+  353 → 1472 links at 100k). The lanes grew exact-fit and reallocated all 8 buffers on each repaint that
+  set a new high. They now at least double (`grownCapacity`, webgl/instanced.ts), so reallocations are
+  bounded by log2(peak / first). T7 counts a creation inside a lane's `update` as a grow and requires it to
+  double. (2) The main thread builds the LOD tree on a GPU frame, and the cut draws nothing until the tree
+  has geometry. So the lanes register with the tree, many frames after the stream's first repaint (frame
+  140 of ~550 under Rosetta). T7 starts counting at the first repaint with `lodSource !== "none"`. (3) The LOD
+  stream leg inherited the LOD-off drag's k = 4 zoom. There, links entered the view mid-run, and a change of
+  the lane's layer set re-registers every layer (`emitInstancedLane` keeps the z-order that way). Each T7
+  half now runs its stream leg first, on its own engine; a stream leg after a drag sets its view.
+
+## GPU layout with LOD on: the tree comes from a worker, and browser tests cannot mock what a worker imports (#377)
+
+With LOD on, the GPU layout keeps the LOD tree off the main thread as the worker backend does: a layout
+worker only coarsens the graph (`{ type: "coarsen" }`, `network/lod-refit.ts`) and then refits the tree's
+geometry to each frame the GPU reads back (`{ type: "lod-geometry" }`). The stream harvests into the
+relay's buffer instead of `graph.positions` and paints the frame, positions and geometry together, once
+the worker replies (`network/gpu/lod-relay.ts`, the stream's `FrameSink`). Five things to know:
+
+- **Transfer the topology, never clone it.** With super-edges the coarsening tree's topology is 213 MB at
+  325k nodes and 773 MB at 1M (synthetic, 4.6 edges per node). The coarsen reply transfers every buffer, and
+  the worker keeps its own copies of the few arrays a refit reads. A refit hands both buffers back and forth,
+  so a streamed frame allocates and clones nothing.
+- **A frame the worker has not returned is not on the graph.** Positions reach `graph.positions` only at
+  the commit right before the repaint, with their geometry, so labels, picking and the cut never see
+  positions without their aggregates. The repaint throttle harvests one round trip early to keep its cadence.
+- **A relayed final frame keeps the run `finishing` for a round trip.** The run ends only when its final
+  frame is painted, one worker round trip after the harvest, so any rule keyed on `finishing` alone fires
+  again in the frames between. The first version re-issued the final copy there: every settle and every
+  drag re-cool paid a second copy, refit and full repaint after `settled` (seconds at 1M in a fit view).
+  `copyDue` checks for new ticks first (`gpu-lod-relay.browser.test.ts` counts copies and repaints).
+- **`vi.mock` of a module a real Web Worker imports kills the worker** in a browser test: vitest serves the
+  worker the mock proxy, which throws there (`getFactoryModule` of undefined), and the relay falls back to
+  the main thread. So the main-thread call counts live in their own file with an in-process worker
+  (`gpu/__tests__/_in-process-lod-worker.ts`, the worker's real code on a timer), and every test that needs
+  the real worker (T7's worker baseline, `gpu-lod-relay.browser.test.ts`) stays mock-free.
+- **A drag from idle inherits the last run's stall samples.** The repaint throttle keeps its stall samples
+  while the layout idles, so on software GL, where a fit-view LOD frame at 100k nodes stalls the GPU for
+  seconds, a drag's first reflow repaint can land 4-9 s after the drag starts (SwiftShader; on a GPU the
+  stall term is about 0). A test that expects a repaint within a fixed number of drag frames flakes:
+  T7's drag legs hold the node still until one lands (at most 20 s).
 
 ## Host sizing: backend canvases are OUT OF FLOW (#39, re-confirmed in #273)
 

@@ -90,10 +90,12 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
   net.on("hover", (hit) => { readout.textContent = describe(hit); });
   net.on("click", (hit) => { if (hit) readout.textContent = `clicked ${describe(hit)}`; });
 
-  // Transport readout (#163 + N8): three signals — layout transport (gpu / shared / copy / none),
-  // the environment's SAB *capability* (`sharedMemoryAvailable()`), and whether SAB is *in use*.
-  // For a `backend:"gpu"` or `"auto"` layout the transport resolves asynchronously (it is "copy" until
-  // the device promise settles), so we also refresh it after the layout settles.
+  // Transport readout (#163 + N8): layout transport (gpu / shared / copy / none), the environment's SAB
+  // *capability* (`sharedMemoryAvailable()`), whether SAB is *in use*, and where the LOD tree comes from
+  // (`lodSource`: "worker" = built and refit off the main thread — by the worker layout, or with the GPU
+  // layout by its LOD worker, #377). For a `backend:"gpu"` or `"auto"` layout the transport resolves
+  // asynchronously (it is "copy" until the device promise settles), so we also refresh it after the layout
+  // settles.
   const sab = document.createElement("div");
   sab.className =
     "absolute top-2 right-2 pointer-events-none rounded bg-white/85 px-2 py-1 font-mono text-[11px] leading-tight [font-variant-numeric:tabular-nums]";
@@ -108,7 +110,8 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
     sab.innerHTML =
       `<span title="Active layout transport: gpu = WebGL GPU path; shared = CPU worker, zero-copy SharedArrayBuffer; copy = CPU worker, per-frame postMessage snapshots; none = no layout running.">layout: <b>${transport}</b></span><br>` +
       `<span title="Environment capability: SharedArrayBuffer needs a cross-origin-isolated page (COOP: same-origin + COEP: require-corp). Set on the dev/preview server; GitHub Pages can't send these headers — see issue #163.">SAB supported: <b>${yesNo(supported)}</b></span><br>` +
-      `<span title="Actual SAB transport of the running worker layout: yes = positions stream zero-copy through a SharedArrayBuffer; no = posted as per-frame snapshots (also when the worker fell back to a synchronous solve).">SAB in use: <b>${yesNo(inUse)}</b></span>`;
+      `<span title="Actual SAB transport of the running worker layout: yes = positions stream zero-copy through a SharedArrayBuffer; no = posted as per-frame snapshots (also when the worker fell back to a synchronous solve).">SAB in use: <b>${yesNo(inUse)}</b></span><br>` +
+      `<span title="Where the LOD tree comes from: worker = built and refit off the main thread (the worker layout, or the GPU layout's LOD worker); main = built on the main thread; none = LOD off or no tree yet.">LOD tree: <b>${net.lodSource}</b></span>`;
   };
   updateSab();
 

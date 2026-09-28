@@ -115,6 +115,21 @@ export function sharedMemoryAvailable(): boolean {
   return typeof SharedArrayBuffer !== "undefined" && globalThis.crossOriginIsolated === true;
 }
 
+/**
+ * A fresh layout worker, or null where none can run: no `Worker` (SSR), or the bundler / runtime cannot
+ * construct one. Every layout worker starts here — the flat and nested worker layouts and the GPU layout's
+ * LOD relay (#377) — because the URL is resolved relative to this module, which the published build keeps
+ * next to `layout-worker.js`.
+ */
+export function spawnLayoutWorker(): Worker | null {
+  if (typeof Worker === "undefined") return null;
+  try {
+    return new Worker(new URL("./layout-worker.js", import.meta.url), { type: "module" });
+  } catch {
+    return null;
+  }
+}
+
 export function startWorkerLayout(
   graph: NetworkGraph,
   opts: WorkerLayoutOptions,
@@ -147,14 +162,8 @@ export function startWorkerLayout(
     onFrame();
     return { shared: false, settled: Promise.resolve(), stop() {}, ...NOOP_DRAG };
   };
-  if (typeof Worker === "undefined") return fallback();
-
-  let worker: Worker;
-  try {
-    worker = new Worker(new URL("./layout-worker.js", import.meta.url), { type: "module" });
-  } catch {
-    return fallback();
-  }
+  const worker = spawnLayoutWorker();
+  if (!worker) return fallback();
 
   // Give the very first paint a spread disc instead of a pile at the origin while the worker's seed
   // frame is in flight — at the force model's equilibrium scale, the scale that seed arrives at, so
@@ -198,6 +207,7 @@ export function startWorkerLayout(
       onLODTree?.(lodTreeFromTopology(topology, lodGeometryViews(buffer, topology.size)));
       return;
     }
+    if (msg.type === "lod-geometry") return; // only the GPU layout's LOD worker refits on request (#377)
     // frame | done
     if (msg.positions && !shared) graph.positions.set(msg.positions);
     if (msg.geometry && lodGeomFlat) lodGeomFlat.set(msg.geometry); // copy-mode geometry snapshot
@@ -335,13 +345,8 @@ export function startNestedWorkerLayout(
     solveHere();
     return { shared: false, settled: Promise.resolve(), stop() {}, ...NOOP_DRAG };
   };
-  if (typeof Worker === "undefined") return fallback();
-  let worker: Worker;
-  try {
-    worker = new Worker(new URL("./layout-worker.js", import.meta.url), { type: "module" });
-  } catch {
-    return fallback();
-  }
+  const worker = spawnLayoutWorker();
+  if (!worker) return fallback();
   let resolveSettled!: () => void;
   const settled = new Promise<void>((r) => (resolveSettled = r));
   let terminated = false;
@@ -357,7 +362,7 @@ export function startNestedWorkerLayout(
   };
   worker.onmessage = (e: MessageEvent<WorkerToMain>): void => {
     const msg = e.data;
-    if (msg.type === "lod-topology" || terminated) return;
+    if (msg.type === "lod-topology" || msg.type === "lod-geometry" || terminated) return;
     if (msg.type === "done") {
       if (msg.positions) land(msg.positions, msg.boundaries);
       terminate();

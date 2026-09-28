@@ -18,6 +18,10 @@ import { buildStateGraph } from "../../state-graph.js";
 import { sharedMemoryAvailable } from "../../worker-transport.js";
 import type { MainToWorker } from "../../worker-protocol.js";
 import type { ModuleNode } from "../../modules.js";
+import { observeGpuLayoutFrames } from "../gpu-stream.js";
+import { startGpuLayout, type GpuLayoutTransport } from "../gpu-transport.js";
+import { GpuForceLayout } from "../gpu-force-layout.js";
+import { makeTestDevice } from "./_device.js";
 
 const W = 400;
 const H = 300;
@@ -318,14 +322,16 @@ describe("backend:'gpu' on a device without float blending (#351)", () => {
     net.destroy();
   });
 
-  it("a supported device still takes the GPU path with LOD on, building the tree on the main thread", async () => {
+  it("a supported device still takes the GPU path with LOD on, its LOD worker streaming the tree (#377)", async () => {
     const net = network(makeHost(), { width: W, height: H, backend: "webgl" });
     const posts = vi.spyOn(Worker.prototype, "postMessage");
     net.data(clustered(1500)).lod({ expandPx: 48 }).layout({ backend: "gpu", iterations: 10 });
     await net.whenSettled();
     expect(net.layoutTransport).toBe("gpu");
-    expect(workerStarts(posts)).toHaveLength(0); // no worker run
-    expect(net.lodSource).toBe("main"); // the GPU streams no tree: the main thread builds it (PR 3c moves it)
+    expect(workerStarts(posts)).toHaveLength(0); // no worker layout run
+    // A coarsen-only worker builds the tree and refits it per frame; the engine adopts it (#377).
+    expect(posts.mock.calls.map((c: [MainToWorker, ...unknown[]]) => c[0].type).filter((t) => t === "coarsen")).toHaveLength(1);
+    expect(net.lodSource).toBe("worker");
     net.destroy();
   });
 });
@@ -374,7 +380,7 @@ describe("backend:'auto' (#375)", () => {
     await net.whenSettled();
     expect(net.layoutTransport).toBe("gpu");
     expect(workerStarts(posts)).toHaveLength(0); // no worker run
-    expect(net.lodSource).toBe("main"); // what backend:"gpu" does today (PR 3c moves the tree off main)
+    expect(net.lodSource).toBe("worker"); // as backend:"gpu": its LOD worker streams the tree (#377)
     expect(fallbackWarnings(warn)).toHaveLength(0);
     net.destroy();
   });
@@ -544,3 +550,83 @@ describe("backend:'auto' (#375)", () => {
     net.destroy();
   });
 });
+
+describe("backend:'gpu' whose streaming readback fails to build (#352)", () => {
+  it("falls back to the worker, reports only the worker transport, and frees the solver", async () => {
+    const device = await makeTestDevice();
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const destroy = vi.spyOn(GpuForceLayout.prototype, "destroy");
+    // The solver builds; then every buffer creation fails — the readback's pack passes' buffers or its
+    // PBOs — so the stream cannot be built.
+    let failBuffers = false;
+    const createBuffer = WebGL2RenderingContext.prototype.createBuffer;
+    vi.spyOn(WebGL2RenderingContext.prototype, "createBuffer").mockImplementation(function (this: WebGL2RenderingContext) {
+      if (failBuffers) throw new Error("out of GPU memory");
+      return createBuffer.call(this);
+    });
+    const hold = GpuForceLayout.prototype.hold;
+    vi.spyOn(GpuForceLayout.prototype, "hold").mockImplementation(function (this: GpuForceLayout, heat: number) {
+      hold.call(this, heat);
+      failBuffers = true; // the disc-seeded run holds its heat right before it builds the stream
+    });
+    const reports: GpuLayoutTransport[] = [];
+    const g = buildGraph(makeRingGraph());
+    try {
+      const handle = startGpuLayout(Promise.resolve(device), g, { width: W, height: H, iterations: 5 }, () => {}, undefined, (t) => {
+        reports.push(t);
+        failBuffers = false;
+      });
+      await handle.settled;
+      expect(reports).toEqual(["worker"]);
+      expect(handle.transport).not.toBe("gpu");
+      expect(destroy).toHaveBeenCalledTimes(1);
+      expect(warn.mock.calls.filter((c) => String(c[0]).includes("failed to start"))).toHaveLength(1);
+      handle.stop();
+    } finally {
+      failBuffers = false;
+      device.destroy();
+    }
+  });
+});
+
+describe("network layout backend:'gpu' — context loss mid-run (#352)", () => {
+  it("settles, stops its frame loop and warns once when the WebGL context is lost", async () => {
+    const host = makeHost();
+    const net = network(host, { width: W, height: H, backend: "webgl" });
+    await net.whenReady();
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    let frames = 0;
+    const unobserve = observeGpuLayoutFrames(() => { frames++; });
+    try {
+      // Long enough that the loss lands mid-run.
+      net.data(clustered(3000)).layout({ backend: "gpu", iterations: 100_000 });
+      const settled = net.whenSettled();
+      for (let i = 0; i < 200 && frames < 5; i++) await nextFrame();
+      expect(net.layoutTransport).toBe("gpu");
+      expect(frames).toBeGreaterThanOrEqual(5);
+
+      // The engine's WebGL canvas: getContext returns the context the engine already holds.
+      const canvas = host.querySelector("canvas");
+      const gl = canvas?.getContext("webgl2") ?? null;
+      expect(gl).not.toBeNull();
+      const lose = gl?.getExtension("WEBGL_lose_context");
+      expect(lose).toBeTruthy();
+      lose?.loseContext();
+
+      await settled; // resolves: a lost context never signals its fences, the run must not wait on them
+      const lost = warn.mock.calls.filter((c) => String(c[0]).includes("context was lost"));
+      expect(lost).toHaveLength(1);
+      // The loop has stopped: no further frames.
+      const after = frames;
+      for (let i = 0; i < 10; i++) await nextFrame();
+      expect(frames).toBe(after);
+    } finally {
+      unobserve();
+      net.destroy();
+    }
+  });
+});
+
+function nextFrame(): Promise<void> {
+  return new Promise((resolve) => requestAnimationFrame(() => resolve()));
+}

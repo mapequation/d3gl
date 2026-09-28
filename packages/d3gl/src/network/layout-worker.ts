@@ -20,20 +20,27 @@
  * rows of the main thread's view's covers (#433), so its link gather stays O(visible) — and transfer it with
  * the frame (`"spatial"`).
  *
+ * The GPU layout with LOD on (#377) uses the same worker for its LOD tree only: `coarsen` builds the tree
+ * (no layout), and each `lod-geometry` refits its position geometry to positions the GPU harvested.
+ *
  * The page's lib is `["ES2020","DOM"]` (the library targets the browser main thread too), so the
  * worker globals here are typed against `DOM`. Positions use single-argument `postMessage` (no
  * transferables): structured clone copies the snapshot synchronously at post time, so the worker may keep
- * writing its buffer. A spatial frame's buffers are transferred instead, through the `DOM`
- * `postMessage(message, { transfer })` overload — so no worker-lib cast is needed either way.
+ * writing its buffer. A spatial frame's buffers and the LOD refit's messages are transferred instead,
+ * through the `DOM` `postMessage(message, { transfer })` overload — so no worker-lib cast is needed either
+ * way.
  */
 import { DRAG_HEAT, ForceLayout, RECOOL_TICKS, seedPositions } from "./force.js";
 import { nestedLayout, nestedBoundaryDiscs } from "./nested-layout.js";
 import { multilevelSeedSteps, buildHierarchy, type SeedProgress } from "./coarsen.js";
-import { flattenHierarchyToTopology, lodTreeFromTopology } from "./lod.js";
+import { flattenHierarchyToTopology, lodTreeFromTopology, type LODPositionTree } from "./lod.js";
 import { lodFrameStep, makeSpatialLODStream, makeStructureLODStream, recycleSpatialFrame, type LODStream } from "./lod-frame.js";
+import { coarsenForRefit, refitGeometry, topologyTransferables } from "./lod-refit.js";
 import {
   lodGeometryViews,
   lodGeometryByteLength,
+  type CoarsenMessage,
+  type LODGeometryRequest,
   type MainToWorker,
   type ProgressMessage,
   type StartMessage,
@@ -314,6 +321,27 @@ async function runLayout(msg: StartMessage): Promise<void> {
   await loop();
 }
 
+/**
+ * The GPU layout's LOD tree (#377): coarsen only — no layout, no graph kept. The topology goes to the main
+ * thread by transfer (the worker keeps its own copies of what a refit reads), and the graph's edges are
+ * dropped with this call: a refit needs only the tree.
+ */
+let refitTree: LODPositionTree | null = null;
+function coarsenOnly(msg: CoarsenMessage): void {
+  const { topology, tree } = coarsenForRefit(msg, msg.coarsen);
+  refitTree = tree;
+  post({ type: "lod-topology", topology }, topologyTransferables(topology));
+}
+
+/** Refit the coarsen-only tree to the GPU's harvested positions and hand both buffers back (#377). */
+function refitLOD(msg: LODGeometryRequest): void {
+  const tree = refitTree;
+  if (!tree) return; // the main thread requests refits only after the topology arrived
+  const buffer = msg.geometry?.buffer ?? new ArrayBuffer(lodGeometryByteLength(tree.size));
+  const geometry = refitGeometry(tree, msg.positions, buffer);
+  post({ type: "lod-geometry", positions: msg.positions, geometry }, [msg.positions.buffer, geometry.buffer]);
+}
+
 /** Write the held nodes' positions (interleaved, in `ids` order) into `positions`. */
 function writeHeld(positions: Float32Array, ids: Uint32Array, held: Float32Array): void {
   let k = 0;
@@ -407,6 +435,12 @@ addEventListener("message", (e: MessageEvent<MainToWorker>) => {
       if (stream?.kind === "spatial" && recycleSpatialFrame(stream, msg.buffer, msg.rows) && state) postFrame("frame");
       return;
     }
+    case "coarsen":
+      coarsenOnly(msg);
+      return;
+    case "lod-geometry":
+      refitLOD(msg);
+      return;
     case "start-nested": {
       // One synchronous top-down pass (each depth final); a `stop` can only land after it, and the main
       // thread terminates the worker on stop anyway.

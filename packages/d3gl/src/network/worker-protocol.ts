@@ -117,12 +117,53 @@ export interface NestedStartMessage {
   stream: boolean;
 }
 
-export type MainToWorker = StartMessage | StopMessage | PinMessage | UnpinMessage | NestedStartMessage | LODStyleMessage | LODViewMessage | LODRecycleMessage;
+/**
+ * The GPU layout's LOD worker (#377): coarsen the graph into the LOD tree and stream it, with no layout.
+ * The worker posts the {@link LODTopologyMessage} once (its arrays transferred, not cloned), then answers
+ * each {@link LODGeometryRequest} with the tree's position geometry refit to the positions it carries —
+ * the work the worker backend does per frame, for positions the GPU harvested. Edge buffers are copied;
+ * the main thread keeps its own.
+ */
+export interface CoarsenMessage {
+  type: "coarsen";
+  nodeCount: number;
+  source: Uint32Array;
+  target: Uint32Array;
+  weight: Float32Array;
+  coarsen?: CoarsenOptions;
+}
+
 
 /**
- * The LOD tree, posted once after the worker coarsens (only when `lod` was requested). `topology`'s
- * typed arrays are structured-cloned to the main thread; in shared mode `sharedGeometry` is the SAB
- * the worker writes the per-frame `cx`/`cy`/`extent` into (laid out by {@link lodGeometryViews}).
+ * Refit the coarsen-only tree's position geometry to `positions` (#377). Both buffers are transferred, both
+ * ways: `positions` comes back in the reply, and `geometry` is the previous reply's buffer handed back for
+ * reuse (absent on the first request, when the worker allocates it) — so a refit allocates nothing.
+ */
+export interface LODGeometryRequest {
+  type: "lod-geometry";
+  /** Interleaved `[x, y, …]`, length `2 · nodeCount`. */
+  positions: Float32Array;
+  /** `[cx, cy, extent]`, length `3 · topology.size` ({@link lodGeometryViews}). */
+  geometry?: Float32Array;
+}
+
+export type MainToWorker =
+  | StartMessage
+  | StopMessage
+  | PinMessage
+  | UnpinMessage
+  | NestedStartMessage
+  | LODStyleMessage
+  | LODViewMessage
+  | LODRecycleMessage
+  | CoarsenMessage
+  | LODGeometryRequest;
+
+/**
+ * The LOD tree, posted once after the worker coarsens (only when `lod` was requested, or for a
+ * {@link CoarsenMessage}). `topology`'s typed arrays are structured-cloned to the main thread — transferred
+ * for a {@link CoarsenMessage}; in shared mode `sharedGeometry` is the SAB the worker writes the per-frame
+ * `cx`/`cy`/`extent` into (laid out by {@link lodGeometryViews}).
  */
 export interface LODTopologyMessage {
   type: "lod-topology";
@@ -155,7 +196,14 @@ export interface ProgressMessage {
   lodFrame?: SpatialLODFrame;
 }
 
-export type WorkerToMain = LODTopologyMessage | ProgressMessage;
+/** The reply to an {@link LODGeometryRequest} (#377): its positions, and `[cx, cy, extent]` refit to them. */
+export interface LODGeometryMessage {
+  type: "lod-geometry";
+  positions: Float32Array;
+  geometry: Float32Array;
+}
+
+export type WorkerToMain = LODTopologyMessage | ProgressMessage | LODGeometryMessage;
 
 /**
  * The three position-derived geometry arrays packed contiguously in one buffer, `[cx, cy, extent]`

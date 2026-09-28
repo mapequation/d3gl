@@ -60,7 +60,7 @@ describe("streamed spatial LOD links (#433) — network().lod({ source: 'spatial
           if (!settled && stats && net.lodSource === "worker") samples.push({ visits: stats.visits, entries: stats.entries, misses: stats.misses });
         });
       const builds0 = spatialRowBuilds;
-      net.data(g).style({ sizeMode: "screen", nodeRadius: 3 }).lod({ source: "spatial", maxAggregateRadius: 18 }).layout({ backend: "worker", iterations: 60, multilevel: false, fit: true }); // a cold start keeps its heat: every tick streams
+      net.data(g).style({ sizeMode: "screen", nodeRadius: 3 }).lod({ source: "spatial", maxAggregateRadius: 18 }).layout({ backend: "worker", iterations: 200, multilevel: false, fit: true }); // a cold start keeps its heat: a long stream
       await net.whenSettled().then(() => { settled = true; });
       expect(samples.length, "no repaint drew a worker tree").toBeGreaterThan(3);
       for (const [i, s] of samples.entries()) {
