@@ -51,7 +51,8 @@ import { EXACT_MAX } from "../nested-layout.js";
 // own slots, in draw order, or computes its own work items), so the solve is bitwise the same for any
 // band counts. Each band of a pass that fills an accumulator clears its own rows as it opens it — the clear is
 // the first draw's `clear`, never a pass of its own (#402) — and the positions swap after the last band of the
-// pass that writes them (the integrate, the resolve). Each band is one work item, and submits once (#402).
+// pass that writes them (the integrate, the resolve). Each band is one work item; no band submits, the stream
+// submits once per frame (#402).
 //
 // The composition (`passes/nested-compose.ts`) maps the local solutions into world discs and packs leaf
 // positions and module discs in node order, for the streaming readback ({@link readbackStages}). It has
@@ -493,16 +494,8 @@ export class GpuNestedLayout implements StreamSolver {
         composeRows: this.compose.height,
       };
       const steps = nestedPlan(this.planSizes);
-      // Each band is one work item, and submits once, after its passes (#402).
       const bind = (list: readonly NestedStep[]): NestedStage[] =>
-        list.map((step) => {
-          const pass = this.passOf(step);
-          const run = (band: number, bands: number): void => {
-            pass(band, bands);
-            device.submit();
-          };
-          return { pass: step.pass, costMs: step.costMs, fixedMs: step.fixedMs, rows: step.rows, run };
-        });
+        list.map((step) => ({ pass: step.pass, costMs: step.costMs, fixedMs: step.fixedMs, rows: step.rows, run: this.passOf(step) }));
       this.organisePlan = bind(steps.organise);
       this.compactPlans = [bind(steps.compact[0]), bind(steps.compact[1])];
       this.readbackPlan = bind(steps.readback);

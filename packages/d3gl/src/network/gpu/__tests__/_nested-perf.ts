@@ -8,8 +8,7 @@
  * (the warm re-layout with a transition on `"auto"`) and `gpu-nested-interaction-perf.browser.test.ts` (a
  * node drag and a zoom sweep while the solve runs). See `gpu-nested-perf.browser.test.ts` for what they pin.
  */
-import { expect, vi } from "vitest";
-import { WebGLDevice } from "@luma.gl/webgl";
+import { expect } from "vitest";
 import type { Network } from "../../network.js";
 import { buildGraph, type NetworkGraph } from "../../graph.js";
 import { buildModuleLODTree, type ModuleNode } from "../../modules.js";
@@ -18,8 +17,7 @@ import { GpuNestedLayout, nestedLayoutPlan } from "../gpu-nested-layout.js";
 import { nestedSolverTopology, type NestedSolverTopology } from "../nested-topology.js";
 import { COLLISION_STEPS } from "../passes/collision.js";
 import { MIN_FRAME_MS } from "../repaint-throttle.js";
-import { AsyncPositionReadback } from "../async-readback.js";
-import { StreamSchedule } from "../stream-schedule.js";
+import { expectOneSubmitPerFrame, recordFrameSubmits, type FrameSubmits } from "./_item-recorder.js";
 import { makeTestDevice } from "./_device.js";
 import { perfN } from "../../../__tests__/perf-budget.js";
 
@@ -210,52 +208,14 @@ export interface Leg {
   events: GlEvent[];
   settledAfterFrame: number;
   elapsedMs: number;
-  /** `device.submit()` calls of each streamed work item (a band of a pass), and of each readback copy's `issue` (#402). */
-  itemSubmits: number[];
-  copySubmits: number[];
-}
-
-/**
- * Counts the `device.submit()` calls of each streamed work item (a band of a pass, as the stream schedule
- * encodes it, #382) and of each readback copy's `issue` (#402), by spying the prototypes (the spies call
- * through).
- */
-export function submitScope(): { itemSubmits: number[]; copySubmits: number[]; restore: () => void } {
-  let submits = 0;
-  const itemSubmits: number[] = [];
-  const copySubmits: number[] = [];
-  // The schedule's one encode of an admitted band (private: reached through the prototype, tests only).
-  const schedule = StreamSchedule.prototype as unknown as { encode(cursor: unknown): void };
-  const { encode } = schedule;
-  const { issue } = AsyncPositionReadback.prototype;
-  const { submit } = WebGLDevice.prototype;
-  const counted = (into: number[], run: () => void): void => {
-    const before = submits;
-    try {
-      run();
-    } finally {
-      into.push(submits - before);
-    }
-  };
-  const spies = [
-    vi.spyOn(schedule, "encode").mockImplementation(function (this: StreamSchedule, cursor: unknown) {
-      counted(itemSubmits, () => encode.call(this, cursor));
-    }),
-    vi.spyOn(AsyncPositionReadback.prototype, "issue").mockImplementation(function (this: AsyncPositionReadback, source) {
-      counted(copySubmits, () => issue.call(this, source));
-    }),
-    vi.spyOn(WebGLDevice.prototype, "submit").mockImplementation(function (this: WebGLDevice, ...args: Parameters<WebGLDevice["submit"]>) {
-      submits++;
-      submit.apply(this, args);
-    }),
-  ];
-  return { itemSubmits, copySubmits, restore: () => { for (const spy of spies) spy.mockRestore(); } };
+  /** `device.submit()` calls of each streamed frame (#402, #382). */
+  frameSubmits: FrameSubmits[];
 }
 
 export async function streamLeg(net: Network, graph: NetworkGraph, modules: ModuleNode[], lod: boolean): Promise<Leg> {
   const frames: GpuFrameSample[] = [];
   const log = new GlCallLog();
-  const scope = submitScope();
+  const scope = recordFrameSubmits();
   let settledAfterFrame = -1;
   const unobserve = observeGpuLayoutFrames((s) => {
     frames.push({ ...s });
@@ -275,7 +235,7 @@ export async function streamLeg(net: Network, graph: NetworkGraph, modules: Modu
   expect(net.layoutTransport).toBe("gpu");
   return {
     frames, events: log.events, settledAfterFrame, elapsedMs: performance.now() - t0,
-    itemSubmits: scope.itemSubmits, copySubmits: scope.copySubmits,
+    frameSubmits: scope.frames,
   };
 }
 
@@ -345,12 +305,9 @@ export function assertSignatures(leg: Leg): void {
   expect(copies.length).toBeGreaterThan(1); // a cold layout streams: more than the final copy
   expect(copies.every((e) => e.kind === "copy" && e.toPbo), "a synchronous readPixels on the streaming path").toBe(true);
 
-  // Exactly one submit per work item (a band of a pass, #382) and per readback copy (#402); the per-tick
+  // One submit per streamed frame, after its last work item and its readback copy (#402, #382); the per-tick
   // test pins what the items encode.
-  expect(leg.itemSubmits.length).toBeGreaterThanOrEqual(2 * STREAM_TICKS);
-  expect(leg.itemSubmits.filter((n) => n !== 1), "work items that did not submit exactly once").toEqual([]);
-  expect(leg.copySubmits.length).toBeGreaterThan(0);
-  expect(leg.copySubmits.filter((n) => n !== 1), "readback copies that did not submit exactly once").toEqual([]);
+  expectOneSubmitPerFrame(leg.frameSubmits);
 
   assertFencedHarvests(events);
   // One write, then one read, per PBO per copy: a harvest that reads a PBO twice (positions, then the

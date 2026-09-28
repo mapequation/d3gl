@@ -97,16 +97,16 @@ import { STOP_NONFINITE, STOP_STOPPED } from "./stop-latch.js";
  * A solver the stream drives, and its own {@link ReadbackSource}: a tick is a sequence of passes
  * ({@link StageSource.tickStages}), each sliced into bands (`stream-schedule.ts`). The flat
  * {@link GpuForceLayout} (prep, force, integrate) and the nested layout's batched solve (#355) are both one.
- * Each work item — a band of a pass — that encodes a render pass ends with one `device.submit()`, and nothing
- * below it submits (#402); a readback copy is one item too — {@link prepareReadback} encodes, and the
- * readback's `issue` submits.
+ * No work item (a band of a pass), no readback copy and no pass submits: WebGL runs a render pass as it is
+ * encoded, so luma's `device.submit()` only closes its command encoder (main-thread work), and the stream
+ * pays it once per frame, after the frame's last item and copy (#402).
  */
 export interface StreamSolver extends ReadbackSource, StageSource {
   /**
    * The last step right before a copy, after any {@link StageSource.readbackStages}: make the readback
    * source's stats describe the current positions. `betweenTicks`: the copy follows a tick's last pass (the
    * next has not started); the flat layout then re-runs its reductions, whose last run was that tick's prep.
-   * Encodes without submitting: the copy's `AsyncPositionReadback.issue` submits the whole copy once.
+   * Encodes without submitting (the stream submits once per frame).
    */
   prepareReadback(betweenTicks: boolean): void;
   destroy(): void;
@@ -370,6 +370,7 @@ export class GpuStream {
   /** Resolves once the initial run's final positions have been harvested, or the run stopped. */
   readonly settled: Promise<void>;
 
+  private readonly device: WebGLDevice;
   private readonly gl: WebGL2RenderingContext;
   private readonly layout: StreamSolver;
   /** The flat layout's extras (#353 seed, #376 stop, #311 heat), or null (the nested solve, #355). */
@@ -486,6 +487,7 @@ export class GpuStream {
   constructor(device: WebGLDevice, layout: StreamSolver, graph: NetworkGraph, opts: GpuStreamOptions, onFrame: () => void) {
     const flat = isFlat(layout) ? layout : null;
     if (opts.seeded && !flat) throw new Error("GpuStream: only the flat layout runs a multilevel seed");
+    this.device = device;
     this.gl = device.gl;
     this.layout = layout;
     this.flat = flat;
@@ -774,6 +776,9 @@ export class GpuStream {
     const open = this.budget.open();
     const items = this.schedule.frame(open, this.hasWork, this.copyDue);
     const copied = this.schedule.copied;
+    // One submit for the frame's items and copy, before its fence (#402): WebGL ran their passes as they were
+    // encoded, and luma's submit only closes its command encoder, so a frame pays it once, not per item.
+    if (items > 0 || copied) this.device.submit();
     // `repainted` ⇔ onFrame ran. Not `repaintMs > 0`: a clamped clock (~1 ms in Firefox and Safari without
     // cross-origin isolation) measures a cheap repaint as 0. Not `harvested`: a relayed frame is painted
     // in a later frame than the one that harvested it (#377).

@@ -795,8 +795,8 @@ layout would not be deterministic. The GPU therefore decides it per tick:
 | 8 | I | Integrate (`alpha·heat`, `maxStep`, latch pass-through) | `pos`/`vel` write (MRT) | none | integrate |
 | per frame | — | Budget fence; throttled readback copy (pack only if needed) → PBO; stats → PBO | PBOs | none | sync `readPixels` |
 
-- **One `device.submit()` per work item (#402)**, after its last render pass; no pass submits on its own, and a
-  readback copy (its reductions and staging passes) submits once. WebGL runs a pass's draws as they are
+- **One `device.submit()` per frame (#402, #382)**, after the frame's last work item and its readback copy; no
+  pass, work item or copy submits on its own. WebGL runs a pass's draws as they are
   encoded, so the passes after it see its output without a submit; luma's submit only allocates (a command
   encoder, a command buffer, a promise: 6.5 µs of main thread each on an M1 Max).
 - **No pass only clears (#402).** The force clear, which was its own pass in P, is each band's `clearColor`,

@@ -57,12 +57,11 @@
  */
 import { describe, it, expect, beforeAll, afterAll, vi } from "vitest";
 import type { Device } from "@luma.gl/core";
-import { WebGLDevice } from "@luma.gl/webgl";
 import { network, type Network } from "../../network.js";
 import { buildGraph, type NetworkGraph } from "../../graph.js";
 import { DEFAULT_FORCE, seedPositions } from "../../force.js";
 import { GpuForceLayout } from "../gpu-force-layout.js";
-import { AsyncPositionReadback } from "../async-readback.js";
+import { expectOneSubmitPerFrame, recordFrameSubmits, type FrameSubmits } from "./_item-recorder.js";
 import { DEFAULT_BUDGET_MS, frameBudgetMs, flatPassCostMs, stageBands } from "../frame-budget.js";
 import { observeGpuLayoutFrames, type GpuFrameSample } from "../gpu-stream.js";
 import { MIN_FRAME_MS } from "../repaint-throttle.js";
@@ -217,39 +216,23 @@ interface Leg {
   elapsedMs: number;
   /** Main-thread ms of each `GpuForceLayout.beginSeed` (the seed's allocation, when its plan arrives). */
   beginSeedMs: number[];
-  /** `device.submit()` calls of each solver work item, and of each readback copy's `issue` (#402). */
-  itemSubmits: number[];
-  copySubmits: number[];
+  /** `device.submit()` calls of each streamed frame (#402, #382). */
+  frameSubmits: FrameSubmits[];
 }
 
 /**
  * Mark the solver's work items — a seed level's placement (`setLevel`), the nodes' (`endSeed`), and a tick's
  * items — so the GL log can tell a GPU object a work item creates in a frame from the engine's own (its first
- * repaint of new data sizes its lanes) and from the solver's construction. `inside()` reads the mark. It also
- * counts the `device.submit()` calls of each item (`itemSubmits`) and of each readback copy's `issue`
- * (`copySubmits`), which runs after the solver's `prepareReadback` (#402: once each).
+ * repaint of new data sizes its lanes) and from the solver's construction. `inside()` reads the mark.
  */
-function solverScope(): { inside: () => boolean; itemSubmits: number[]; copySubmits: number[]; restore: () => void } {
+function solverScope(): { inside: () => boolean; restore: () => void } {
   let depth = 0;
-  let submits = 0;
-  const itemSubmits: number[] = [];
-  const copySubmits: number[] = [];
   const proto = GpuForceLayout.prototype;
   const { setLevel, endSeed, beginTick, forceBand, integrate } = proto;
-  const { issue } = AsyncPositionReadback.prototype;
-  const { submit } = WebGLDevice.prototype;
-  const counted = (into: number[], run: () => void): void => {
-    const before = submits;
-    try {
-      run();
-    } finally {
-      into.push(submits - before);
-    }
-  };
   const scoped = (run: () => void): void => {
     depth++;
     try {
-      counted(itemSubmits, run);
+      run();
     } finally {
       depth--;
     }
@@ -260,15 +243,8 @@ function solverScope(): { inside: () => boolean; itemSubmits: number[]; copySubm
     vi.spyOn(proto, "beginTick").mockImplementation(function (this: GpuForceLayout) { scoped(() => beginTick.call(this)); }),
     vi.spyOn(proto, "forceBand").mockImplementation(function (this: GpuForceLayout, band: number, bands: number) { scoped(() => forceBand.call(this, band, bands)); }),
     vi.spyOn(proto, "integrate").mockImplementation(function (this: GpuForceLayout) { scoped(() => integrate.call(this)); }),
-    vi.spyOn(AsyncPositionReadback.prototype, "issue").mockImplementation(function (this: AsyncPositionReadback, source) {
-      counted(copySubmits, () => issue.call(this, source));
-    }),
-    vi.spyOn(WebGLDevice.prototype, "submit").mockImplementation(function (this: WebGLDevice, ...args: Parameters<WebGLDevice["submit"]>) {
-      submits++;
-      submit.apply(this, args);
-    }),
   ];
-  return { inside: () => depth > 0, itemSubmits, copySubmits, restore: () => { for (const spy of spies) spy.mockRestore(); } };
+  return { inside: () => depth > 0, restore: () => { for (const spy of spies) spy.mockRestore(); } };
 }
 
 /**
@@ -281,6 +257,7 @@ async function streamLeg(net: Network, graph: NetworkGraph, lod: boolean, multil
   const treeFrames: boolean[] = [];
   const cut: boolean[] = [];
   const scope = solverScope();
+  const submits = recordFrameSubmits();
   const log = new GlCallLog(scope.inside);
   let settledAfterFrame = -1;
   const unobserve = observeGpuLayoutFrames((s) => {
@@ -313,11 +290,12 @@ async function streamLeg(net: Network, graph: NetworkGraph, lod: boolean, multil
     log.restore();
     seedSpy.mockRestore();
     scope.restore();
+    submits.restore();
   }
   expect(net.layoutTransport).toBe("gpu");
   return {
     frames, treeFrames, cut, lod, events: log.events, settledAfterFrame, elapsedMs: performance.now() - t0, beginSeedMs,
-    itemSubmits: scope.itemSubmits, copySubmits: scope.copySubmits,
+    frameSubmits: submits.frames,
   };
 }
 
@@ -503,13 +481,10 @@ function assertSignatures(leg: Leg): void {
     }
   });
 
-  // One submit per solver work item (a seed step or a tick's P, F_b or I) and per readback copy (#402):
-  // luma's submit allocates a command encoder, a command buffer and a promise, and none of it is needed
-  // between the passes of an item.
-  expect(leg.itemSubmits.length).toBeGreaterThanOrEqual(3 * ticksRun(frames)); // a tick is P, F_0 … F_{B−1}, I
-  expect(leg.itemSubmits.filter((n) => n !== 1), "work items that did not submit exactly once").toEqual([]);
-  expect(leg.copySubmits.length).toBeGreaterThan(0);
-  expect(leg.copySubmits.filter((n) => n !== 1), "readback copies that did not submit exactly once").toEqual([]);
+  // One submit per streamed frame, after its last work item (a seed step, a band of a pass) and its readback
+  // copy (#402, #382): luma's submit allocates a command encoder, a command buffer and a promise, and none of
+  // it is needed between the items of a frame.
+  expectOneSubmitPerFrame(leg.frameSubmits);
 
   const segments = perFrame(events);
   expect(segments.length).toBe(frames.length);

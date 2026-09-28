@@ -667,7 +667,7 @@ interface StatsPasses {
  * Jacobi collision step is {@link prepare} (the {@link cells} pass, then per table a count scatter and K
  * round {@link scatter}s), then {@link gather} (the work {@link items}, then the {@link resolve}) — each pass
  * sliceable into bands, each band its own render pass (#382). Nothing is allocated or submitted per step
- * (the caller's work item submits, #402).
+ * (the stream submits once per frame, #402).
  *
  * Memory: the key 16 B and the disc 16 B per slot atlas texel; the work items 8 B and their partial sums
  * 8 B per item-atlas texel (the parts of the slots cut into more than one); 4 B per binned slot (the

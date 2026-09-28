@@ -124,9 +124,9 @@ interface ActiveLevel {
  * the summed force texture.  All FBOs are pre-created in the constructor — no
  * `createFramebuffer` on the hot path.
  *
- * Every work item ({@link beginTick}, {@link forceBand}, {@link integrate}, {@link setLevel}, {@link endSeed})
- * submits once, after all of its render passes; no pass submits on its own (#402). A readback copy's passes
- * ({@link prepareReadback}) are submitted by the copy.
+ * No work item ({@link beginTick}, {@link forceBand}, {@link integrate}, {@link setLevel}, {@link endSeed})
+ * and no pass submits: WebGL runs a render pass as it is encoded, and the stream submits once per frame,
+ * after the frame's last item (#402).
  */
 export class GpuForceLayout {
   private readonly device: Device;
@@ -678,7 +678,6 @@ export class GpuForceLayout {
     };
     this.segments.setRange(0, { start: 0, count: level.count }, seedTile);
     this.cooling.cool(level.ticks);
-    this.device.submit(); // the seed step is one work item (#402)
   }
 
   /**
@@ -701,7 +700,6 @@ export class GpuForceLayout {
       this.vel.swap();
       this.parity ^= 1;
     }
-    this.device.submit(); // the seed step is one work item (#402)
     this.active = this.finest;
     this.segments.setRange(0, { start: 0, count: this.count }, this.flatTile);
     this.cooling.hold(1);
@@ -743,7 +741,7 @@ export class GpuForceLayout {
 
   /**
    * The prolongation of the current seed placement into the write side (positions + zero velocities), then
-   * swap. The seed step that calls it submits.
+   * swap.
    */
   private prolongateInto(count: number, scissor: PassViewport | undefined): void {
     const seed = this.seed;
@@ -765,8 +763,8 @@ export class GpuForceLayout {
   /**
    * Work item **P** of a tick (#352, spec §6.5.3): everything the force pass reads, computed from the
    * current positions — the segment reductions and the stop latch over them (#376), the Barnes-Hut
-   * pyramid, the hub chunk partials. Each is a render pass (or a chain of them) that reads the one before,
-   * and the item submits once, after the last (#402). The force accumulator is cleared by the force bands.
+   * pyramid, the hub chunk partials. Each is a render pass (or a chain of them) that reads the one before.
+   * The force accumulator is cleared by the force bands.
    */
   beginTick(): void {
     // ── 1. Segment reductions ─────────────────────────────────────────────────
@@ -806,7 +804,6 @@ export class GpuForceLayout {
     // Sums every chunk of a row longer than SPRING_CHUNK into its partial — its own render pass into a
     // different framebuffer, encoded before the force pass gathers the partials. No-op without hubs.
     level.springs.prepare(this.pos.readTex, this.width);
-    this.device.submit();
   }
 
   /**
@@ -862,7 +859,6 @@ export class GpuForceLayout {
     }, this.slotSeg);
 
     forcePass.end();
-    this.device.submit();
   }
 
   /**
@@ -892,7 +888,6 @@ export class GpuForceLayout {
     });
 
     renderPass.end();
-    this.device.submit();
 
     // Swap both ping-pongs so the freshly-written textures become the read
     // sources for the next tick, and flip parity so the next tick writes into

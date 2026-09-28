@@ -391,7 +391,7 @@ export class GridPyramid {
    *   2. reduce level ℓ → ℓ+1 into its rectangle of Podd / Peven, one pass per level
    *
    * Nothing is submitted: WebGL runs each pass as it is encoded, so the passes after it (and the traversal)
-   * see its results, and the caller's work item submits once (#402).
+   * see its results, and the stream submits once per frame (#402).
    */
   build(input: PyramidBuildInput): void {
     this.scatter(input);

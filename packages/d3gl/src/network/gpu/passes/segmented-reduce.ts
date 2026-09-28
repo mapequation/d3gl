@@ -352,7 +352,7 @@ export class SegmentedReduce {
    * Rebuild the tree over `input` and query every range of `table` into its target — the segment table's
    * `stats` and `box` for a {@link SegmentTable}. O(N + N/15) texel reads in L + 1 small passes (L = 4 at
    * 325k and at 1M), plus ≤ 30 reads per tree level per range for the query. Nothing is submitted (the
-   * caller's work item submits). `bindings` / `uniforms` feed the map's own textures and uniforms (see
+   * stream submits once per frame, #402). `bindings` / `uniforms` feed the map's own textures and uniforms (see
    * {@link ReduceMap}); they are set on the level-1 and query passes, the two that apply the map.
    *
    * The same work sliceable into row bands (#382), in this order: {@link buildLevel1} (the O(N) level),

@@ -21,9 +21,9 @@
  * - **Per tick:** a solve tick allocates nothing, and a compact collision step draws exactly one count
  *   scatter and K round scatters per hash table (the class cells', {@link COLLISION_ROUNDS}; the sub-cells',
  *   {@link COLLISION_SUB_ROUNDS}) of the binned slots (the radius-class grid's fixed passes), never a draw
- *   of N points into a 1×1 viewport (#349). Every work item that encodes a pass submits once, after its
- *   passes, a readback copy too, and no pass only clears (#402): the force clear is the repulsion band's and
- *   the springs' own. Through the real trigger the stream legs count the submits per item and per copy.
+ *   of N points into a 1×1 viewport (#349). No work item and no readback copy submits, and no pass only
+ *   clears (#402): the force clear is the repulsion band's and the springs' own. Through the real trigger the stream legs count the submits per frame: none while the
+ *   schedule encodes a frame's items and copy, one after (#382).
  *   The scatters run whole, or cut into bands that cover every binned slot once per scatter (#382). A
  *   readback cut into bands allocates nothing either.
  * - **The admission wiring (#382):** every streamed frame of more than one work item was admitted within
@@ -188,7 +188,7 @@ describe("GPU nested solve work items (#402)", () => {
   it.each([
     ["an Infomap-shaped map", () => solverOf(infomapLike(Math.min(N, 50_000)), 10)],
     ["a Zipf module (binned slots)", () => solverOf(zipfLike(Math.min(N, 20_000)), 10)],
-  ] as const)("every work item submits once, after its passes, a copy too, and no pass only clears: %s", (_label, make) => {
+  ] as const)("no work item or copy submits, and no pass only clears (#402): %s", (_label, make) => {
     const layout = new GpuNestedLayout(device, nestedLayoutPlan(make()));
     const readback = new AsyncPositionReadback(device, layout);
     const rec = recordItems(device);
@@ -218,11 +218,11 @@ describe("GPU nested solve work items (#402)", () => {
       readback.destroy();
       layout.destroy();
     }
-    expect(copy.submits).toBe(1);
+    expect(copy.submits).toBe(0);
     expect(copy.clearOnly).toBe(0);
     expect(copy.passes).toBeGreaterThan(0); // the stats' staging pass (the composition ran as items before)
-    // Every item submits once, and every pass draws.
-    const wrong = items.filter(({ record }) => record.submits !== 1 || record.clearOnly !== 0);
+    // No item submits (the stream submits once per frame), and every pass draws.
+    const wrong = items.filter(({ record }) => record.submits !== 0 || record.clearOnly !== 0);
     expect(wrong).toEqual([]);
     const passes = (phase: string, item: string): number[] =>
       items.filter((i) => i.phase === phase && i.item === item).map((i) => i.record.passes);

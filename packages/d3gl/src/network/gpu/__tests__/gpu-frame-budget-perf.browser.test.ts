@@ -40,13 +40,14 @@
  * reduce that lost its viewport would rasterise its whole packed texture (and
  * overwrite the other levels there).
  *
- * ONE SUBMIT PER WORK ITEM, NO CLEAR-ONLY PASS (#402)
- * ---------------------------------------------------
+ * ONE SUBMIT PER FRAME, NO CLEAR-ONLY PASS (#402, #382)
+ * -----------------------------------------------------
  * A small level's tick is mostly fixed cost per render pass, and luma's
  * `device.submit()` builds a command encoder, a command buffer and a promise on
- * the main thread each time (6.5 µs on an M1 Max). So every work item (P, F_b,
- * I, a seed step, a readback copy) submits exactly once, after its passes, and a
- * clear is the first drawing pass's `clear`. Per item the guard counts submits,
+ * the main thread each time (6.5 µs on an M1 Max). So no work item (P, F_b, I,
+ * a seed step) and no readback copy submits — the stream submits once per frame
+ * (T7 counts it) — and a clear is the first drawing pass's `clear`. Per item the
+ * guard counts submits,
  * render passes (P's are its dependency chains: the reduction tree and its query,
  * the latch, the L0 scatter and the pyramid's reduces, the hub chunks) and passes
  * that draw nothing, and pins that each force band clears exactly its own rows.
@@ -787,11 +788,11 @@ describe("GPU frame budget — pyramid path (per-tick regression tripwire)", () 
       layout.destroy();
     }
   }, 120_000);
-  it.each([false, true])("every work item submits once, after its passes, and no pass only clears (#402), multilevel %s", (multilevel) => {
+  it.each([false, true])("no work item or copy submits, and no pass only clears (#402), multilevel %s", (multilevel) => {
     // P's passes are its dependency chains — the reduction tree's levels and the range query, the stop latch,
     // the L0 scatter and one reduce per coarser pyramid level, the hub chunks — each reading the one before, and
-    // the force clear is the first band's (each band's) clear. A pass that submitted, or a clear of its own,
-    // shows here; so does a pass added to a tick. A multilevel solver runs a seed first: its steps and its
+    // the force clear is the first band's (each band's) clear. The stream submits once per frame, so an item
+    // or a pass that submitted, or a clear of its own, shows here; so does a pass added to a tick. A multilevel solver runs a seed first: its steps and its
     // levels' ticks are items too.
     const N = perfN(30_000, { max: 200_000 });
     const g = withHubs(makeClusteredGraph(N, 80, 0x402), 0x54);
@@ -822,25 +823,25 @@ describe("GPU frame budget — pyramid path (per-tick regression tripwire)", () 
         seedItems.push(rec.record(() => layout.endSeed()));
         expect(seedItems.length).toBeGreaterThan(3 * plan.levels.length);
         expect(seedItems.filter((item) => item.passes === 0)).toEqual([]);
-        expect(seedItems.filter((item) => item.submits !== 1 || item.clearOnly !== 0)).toEqual([]);
+        expect(seedItems.filter((item) => item.submits !== 0 || item.clearOnly !== 0)).toEqual([]);
       }
       layout.runFrame(1); // warm-up on the graph's level
       const reduce = reduceLayout(N).levels.length + 1; // the tree's levels, then the range query
       const pyramid = packTiles(flatSegments(N), 0, FLAT_TILE_MIN_SIDE).levels.length; // the L0 scatter, a reduce per coarser level
-      const prep: ItemRecord = { passes: reduce + 1 + pyramid + 1, clearOnly: 0, submits: 1 }; // + the latch, + the hub chunks
-      const one: ItemRecord = { passes: 1, clearOnly: 0, submits: 1 };
+      const prep: ItemRecord = { passes: reduce + 1 + pyramid + 1, clearOnly: 0, submits: 0 }; // + the latch, + the hub chunks
+      const one: ItemRecord = { passes: 1, clearOnly: 0, submits: 0 };
       for (let t = 0; t < 2; t++) {
         expect(rec.record(() => layout.beginTick()), "P").toEqual(prep);
         for (let b = 0; b < 4; b++) expect(rec.record(() => layout.forceBand(b, 4)), `F_${b}`).toEqual(one);
         expect(rec.record(() => layout.integrate()), "I").toEqual(one);
       }
-      expect(rec.record(() => layout.runFrame(1)), "an unsliced tick").toEqual({ passes: prep.passes + 2, clearOnly: 0, submits: 3 });
-      // A readback copy between ticks is one item: the reductions and the latch again, then the staging passes.
+      expect(rec.record(() => layout.runFrame(1)), "an unsliced tick").toEqual({ passes: prep.passes + 2, clearOnly: 0, submits: 0 });
+      // A readback copy between ticks: the reductions and the latch again, then the staging passes.
       const staging = (deviceReadsRG(device) ? 0 : 1) + 1; // positions (where RG/FLOAT does not read back), stats
       expect(rec.record(() => {
         layout.prepareReadback(true);
         readback.issue(layout);
-      }), "a copy").toEqual({ passes: reduce + 1 + staging, clearOnly: 0, submits: 1 });
+      }), "a copy").toEqual({ passes: reduce + 1 + staging, clearOnly: 0, submits: 0 });
     } finally {
       rec.restore();
       readback.abandon();
