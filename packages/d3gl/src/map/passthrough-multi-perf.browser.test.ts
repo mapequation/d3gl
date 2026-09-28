@@ -22,50 +22,8 @@
 import { describe, it, expect, afterEach } from "vitest";
 import { Plot } from "./plot.js";
 import type { ViewTransform } from "../core/index.js";
-import { perfHost, zoomSteps, sweepFrames } from "../__tests__/engine-sweep.js";
+import { perfHost, zoomSteps, sweepFrames, GlSurfaceSpy } from "../__tests__/engine-sweep.js";
 import { perfBudget, perfN } from "../__tests__/perf-budget.js";
-
-/**
- * Counts GL surface allocations on the shared prototype — the cast-free way to ask "did this
- * allocate another framebuffer?". `GlBufferSpy` (engine-sweep.ts) covers buffers; framebuffers and
- * their colour-attachment textures are the ones that carry the width×height×4 cost #110 is about.
- */
-class GlSurfaceSpy {
-  framebuffers = 0;
-  textures = 0;
-  private readonly origFramebuffer: WebGL2RenderingContext["createFramebuffer"];
-  private readonly origTexture: WebGL2RenderingContext["createTexture"];
-
-  constructor() {
-    const proto = WebGL2RenderingContext.prototype;
-    this.origFramebuffer = proto.createFramebuffer;
-    this.origTexture = proto.createTexture;
-    const spy = this;
-    proto.createFramebuffer = function (this: WebGL2RenderingContext): WebGLFramebuffer | null {
-      spy.framebuffers++;
-      return spy.origFramebuffer.call(this);
-    };
-    proto.createTexture = function (this: WebGL2RenderingContext): WebGLTexture | null {
-      spy.textures++;
-      return spy.origTexture.call(this);
-    };
-  }
-
-  mark(): { framebuffers: number; textures: number } {
-    return { framebuffers: this.framebuffers, textures: this.textures };
-  }
-
-  since(at: { framebuffers: number; textures: number }): { framebuffers: number; textures: number } {
-    return { framebuffers: this.framebuffers - at.framebuffers, textures: this.textures - at.textures };
-  }
-
-  /** Always call this (in a `finally`) — the patch is on a shared prototype. */
-  restore(): void {
-    const proto = WebGL2RenderingContext.prototype;
-    proto.createFramebuffer = this.origFramebuffer;
-    proto.createTexture = this.origTexture;
-  }
-}
 
 /** `setInteracting` is protected, `setTransform` public — a subclass reaches both with no cast. */
 class PerfPlot extends Plot {
