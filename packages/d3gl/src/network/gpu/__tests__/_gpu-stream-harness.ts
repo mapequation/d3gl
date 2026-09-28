@@ -1,6 +1,7 @@
 /**
- * T7 — the streaming GPU layout's per-frame guard (#352, spec §13), run as two files, one per reduction state
- * (`gpu-stream-nolod-perf.browser.test.ts`, `gpu-stream-lod-perf.browser.test.ts`; see {@link StreamHalf}),
+ * T7 — the streaming GPU layout's per-frame guard (#352, spec §13), run as three files: one per reduction
+ * state and one for the seeded LOD run (`gpu-stream-nolod-perf.browser.test.ts`,
+ * `gpu-stream-lod-perf.browser.test.ts`, `gpu-stream-seed-perf.browser.test.ts`; see {@link StreamPart}),
  * through the real trigger:
  * `network().data(g).lod(…).layout({ backend: "gpu" })`, real animation frames, one engine per reduction
  * state (LOD off; the Navigator's structural LOD on).
@@ -28,13 +29,24 @@
  *   with the tick cut into the static band counts of a 60 Hz and a 120 Hz budget, with the main-thread
  *   encode time per tick, so the cost of band slicing reads apart from the budget share.
  *
+ * **The multilevel seed** (#353) runs first — `layout({ backend: "gpu" })` seeds from the graph's coarsening
+ * by default — as budgeted work items of the same loop, so its frames carry the same transport bounds and GL
+ * signatures. It is streamed with LOD off and, in a leg of its own, with LOD on (the Navigator's config: the
+ * plan comes from the LOD relay's worker, and the tree is adopted while the seed runs). Pinned on top: the
+ * first frame harvested is the seed frame (tick 0); no seed frame creates a GPU object (the seed's textures
+ * are created once, in `beginSeed`, when the plan arrives, outside the frame loop); `beginSeed` itself stays
+ * within a few ms, so a compile of a program the page has not built yet trips it (122 ms on an M1 Max; luma
+ * reuses a program built earlier, so the deterministic guard is the fresh-device compile spy in
+ * `gpu-multilevel-seed.browser.test.ts`); and no seed frame exceeds a max transport ceiling. The disc-start LOD-on leg (`multilevel: false`) keeps the baseline
+ * comparison below like for like.
+ *
  * The LOD-on leg (#377) streams through the LOD worker: it builds the tree and refits it to each harvested
  * frame, and the frame is painted with its geometry once the worker replies, so the main thread builds and
  * refits nothing (the call counts are pinned in `gpu-lod-mainthread.browser.test.ts`). Its main-thread ms
  * per layout repaint — putting the frame on the graph plus the engine's repaint — is compared against the
  * **worker backend's** on the same engine, graph and view (AGENTS lifecycle §5: the baseline the GPU path
- * must not exceed), and asserted within a stated margin of it. Both legs assert the same transport
- * signatures.
+ * must not exceed), both from a disc cold start, and asserted within a stated margin of it. Both legs assert
+ * the same transport signatures.
  *
  * **Node drag** (AGENTS §5: a drag is a per-frame path), through the real trigger — pointer events on the
  * host grab a node of the settled layout, move it one step per animation frame, and release it — with LOD
@@ -102,7 +114,9 @@ type GlEvent =
   | { kind: "fence"; sync: WebGLSync | null }
   | { kind: "wait"; sync: WebGLSync; signaled: boolean }
   | { kind: "layout-draw" }
-  | { kind: "create" }
+  | { kind: "create"; inSolver: boolean }
+  | { kind: "seed-begin" }
+  | { kind: "seed-begun" }
   | { kind: "lane-begin" }
   | { kind: "lane-end"; before: number; after: number }
   | { kind: "frame-end" };
@@ -117,7 +131,8 @@ class GlCallLog {
   readonly events: GlEvent[] = [];
   private readonly restores: (() => void)[] = [];
 
-  constructor() {
+  /** `inSolver` says whether a GPU object is created inside a solver work item (see {@link solverScope}). */
+  constructor(inSolver: () => boolean = () => false) {
     const proto = WebGL2RenderingContext.prototype;
     const log = this.events;
     this.wrap(proto, "readPixels", (gl, args) => log.push({ kind: "copy", toPbo: typeof args[6] === "number" }));
@@ -137,7 +152,7 @@ class GlCallLog {
       if (gl.getParameter(gl.DRAW_FRAMEBUFFER_BINDING) !== null) log.push({ kind: "layout-draw" });
     });
     for (const name of ["createBuffer", "createTexture", "createFramebuffer"] as const) {
-      this.wrap(proto, name, () => log.push({ kind: "create" }));
+      this.wrap(proto, name, () => log.push({ kind: "create", inSolver: inSolver() }));
     }
     this.wrapLane(InstancedCircles.prototype);
     this.wrapLane(InstancedPie.prototype);
@@ -198,6 +213,35 @@ interface Leg {
   events: GlEvent[];
   settledAfterFrame: number;
   elapsedMs: number;
+  /** Main-thread ms of each `GpuForceLayout.beginSeed` (the seed's allocation, when its plan arrives). */
+  beginSeedMs: number[];
+}
+
+/**
+ * Mark the solver's work items — a seed level's placement (`setLevel`), the nodes' (`endSeed`), and a tick's
+ * items — so the GL log can tell a GPU object a work item creates in a frame from the engine's own (its first
+ * repaint of new data sizes its lanes) and from the solver's construction. `inside()` reads the mark.
+ */
+function solverScope(): { inside: () => boolean; restore: () => void } {
+  let depth = 0;
+  const proto = GpuForceLayout.prototype;
+  const { setLevel, endSeed, beginTick, forceBand, integrate } = proto;
+  const scoped = (run: () => void): void => {
+    depth++;
+    try {
+      run();
+    } finally {
+      depth--;
+    }
+  };
+  const spies = [
+    vi.spyOn(proto, "setLevel").mockImplementation(function (this: GpuForceLayout, k: number) { scoped(() => setLevel.call(this, k)); }),
+    vi.spyOn(proto, "endSeed").mockImplementation(function (this: GpuForceLayout) { scoped(() => endSeed.call(this)); }),
+    vi.spyOn(proto, "beginTick").mockImplementation(function (this: GpuForceLayout) { scoped(() => beginTick.call(this)); }),
+    vi.spyOn(proto, "forceBand").mockImplementation(function (this: GpuForceLayout, band: number, bands: number) { scoped(() => forceBand.call(this, band, bands)); }),
+    vi.spyOn(proto, "integrate").mockImplementation(function (this: GpuForceLayout) { scoped(() => integrate.call(this)); }),
+  ];
+  return { inside: () => depth > 0, restore: () => { for (const spy of spies) spy.mockRestore(); } };
 }
 
 /**
@@ -205,11 +249,12 @@ interface Leg {
  * call log. A leg that follows a drag must set its view first: at the drag's k = 4 zoom the cut's layer set
  * changes as links enter the view, and each change re-registers the lane's layers.
  */
-async function streamLeg(net: Network, graph: NetworkGraph, lod: boolean): Promise<Leg> {
+async function streamLeg(net: Network, graph: NetworkGraph, lod: boolean, multilevel = true): Promise<Leg> {
   const frames: GpuFrameSample[] = [];
   const treeFrames: boolean[] = [];
   const cut: boolean[] = [];
-  const log = new GlCallLog();
+  const scope = solverScope();
+  const log = new GlCallLog(scope.inside);
   let settledAfterFrame = -1;
   const unobserve = observeGpuLayoutFrames((s) => {
     frames.push({ ...s });
@@ -217,18 +262,33 @@ async function streamLeg(net: Network, graph: NetworkGraph, lod: boolean): Promi
     cut.push(net.lodSource !== "none");
     log.events.push({ kind: "frame-end" });
   });
+  // The seed's allocation, marked in the GL log and timed: it runs when the plan arrives, outside any frame.
+  const beginSeedMs: number[] = [];
+  const beginSeed = GpuForceLayout.prototype.beginSeed;
+  const seedSpy = vi.spyOn(GpuForceLayout.prototype, "beginSeed").mockImplementation(function (this: GpuForceLayout, plan) {
+    log.events.push({ kind: "seed-begin" });
+    const b0 = performance.now();
+    try {
+      beginSeed.call(this, plan);
+    } finally {
+      beginSeedMs.push(performance.now() - b0);
+      log.events.push({ kind: "seed-begun" });
+    }
+  });
   const t0 = performance.now();
   try {
     net.data(graph).lod(lod ? { source: "structure", declutter: true, superEdges: true } : false);
-    net.layout({ backend: "gpu", iterations: ITERATIONS });
+    net.layout({ backend: "gpu", iterations: ITERATIONS, multilevel });
     await net.whenSettled();
     settledAfterFrame = frames.length;
   } finally {
     unobserve();
     log.restore();
+    seedSpy.mockRestore();
+    scope.restore();
   }
   expect(net.layoutTransport).toBe("gpu");
-  return { frames, treeFrames, cut, lod, events: log.events, settledAfterFrame, elapsedMs: performance.now() - t0 };
+  return { frames, treeFrames, cut, lod, events: log.events, settledAfterFrame, elapsedMs: performance.now() - t0, beginSeedMs };
 }
 
 const nextFrame = (): Promise<void> => new Promise((resolve) => requestAnimationFrame(() => resolve()));
@@ -448,8 +508,11 @@ function assertSignatures(leg: Leg): void {
     expect((repaints[i] ?? 0) - (repaints[i - 1] ?? 0)).toBeGreaterThanOrEqual(MIN_FRAME_MS - 2);
   }
 
-  // settled only after the final positions were harvested.
-  const finalHarvest = frames.findIndex((s) => s.harvestedTicks === ITERATIONS);
+  // settled only after the final positions were harvested: the budget's last tick, or the tick the
+  // convergence stop latched at (#376) — a seeded layout (#353) converges within the budget.
+  const finalTick = ticksRun(frames);
+  expect(finalTick).toBeLessThanOrEqual(ITERATIONS);
+  const finalHarvest = frames.findIndex((s) => s.harvestedTicks >= finalTick);
   expect(finalHarvest).toBeGreaterThanOrEqual(0);
   expect(finalHarvest).toBeLessThan(leg.settledAfterFrame);
 }
@@ -510,6 +573,12 @@ async function gpuOnlyRate(graph: NetworkGraph): Promise<{ ticksPerSec: number; 
   }
 }
 
+/** The ticks a streamed run refined: its budget, or fewer when the convergence stop latched first (#376). */
+function ticksRun(frames: readonly GpuFrameSample[]): number {
+  const stopTick = frames[frames.length - 1]?.stopTick ?? -1;
+  return stopTick >= 0 ? stopTick : ITERATIONS;
+}
+
 function report(label: string, leg: Leg): { transport: number[]; encode: number[]; ticksPerSec: number } {
   const { frames } = leg;
   const transport = frames.map((s) => s.harvestMs + s.encodeMs);
@@ -518,16 +587,68 @@ function report(label: string, leg: Leg): { transport: number[]; encode: number[
   const intervals = frames.slice(1).map((s, i) => s.now - (frames[i]?.now ?? s.now));
   const first = frames[0]?.now ?? 0;
   const last = frames[frames.length - 1]?.now ?? first;
-  const ticksPerSec = (ITERATIONS / Math.max(1, last - first)) * 1000;
+  const ticks = ticksRun(frames);
+  const ticksPerSec = (ticks / Math.max(1, last - first)) * 1000;
   console.log(
     `  GPU stream [${label}] N=${N}: ${frames.length} frames, ${repaint.length} repaints, ` +
       `transport ms/frame median ${median(transport).toFixed(2)} p95 ${quantile(transport, 0.95).toFixed(2)} max ${Math.max(...transport).toFixed(2)}; ` +
       `encode median ${median(encode).toFixed(2)} p95 ${quantile(encode, 0.95).toFixed(2)}; ` +
       `repaint ms median ${median(repaint).toFixed(1)} max ${Math.max(0, ...repaint).toFixed(1)}; ` +
       `rAF interval median ${median(intervals).toFixed(1)} ms; ${ticksPerSec.toFixed(1)} ticks/s; ` +
-      `${ITERATIONS} ticks in ${leg.elapsedMs.toFixed(0)} ms; bands ${frames[frames.length - 1]?.bands}, blocked ${frames.filter((s) => s.blocked).length}`,
+      `${ticks} ticks in ${leg.elapsedMs.toFixed(0)} ms; bands ${frames[frames.length - 1]?.bands}, blocked ${frames.filter((s) => s.blocked).length}`,
   );
   return { transport, encode, ticksPerSec };
+}
+
+/**
+ * Ceilings of the seed (#353). `beginSeed` creates the seed's textures and uploads nothing but a root texel and
+ * the hub table: measured 7.4-9.0 ms on an M1 Max and under SwiftShader alike, the same for a 2,000-node graph
+ * as at 325k (a constant, so the ceiling is not split by N). Its programs are the solver's, compiled at
+ * construction (a hub-row spring program compiled here instead cost 122 ms on an M1 Max). A seed frame encodes placements (a level's sub-uploads plus one gather) and seed ticks
+ * under the 2 ms encode cap; the largest level's upload is the costliest item.
+ */
+const BEGIN_SEED_MS = perfBudget(15);
+const SEED_FRAME_MAX_MS = perfBudget(20);
+
+/**
+ * The multilevel seed's signatures (#353): it ran once — the first frame harvested is the seed frame, tick 0;
+ * no seed work item created a GPU object (the seed's textures come from `beginSeed`, when the plan arrives,
+ * outside the frame loop); `beginSeed` compiled nothing (its ceiling); and no seed frame's transport exceeded
+ * its ceiling.
+ */
+function assertSeed(label: string, leg: Leg): { seedFrames: number; seedMs: number } {
+  const { frames, events } = leg;
+  const firstHarvest = frames.findIndex((s) => s.harvested);
+  expect(firstHarvest, "nothing was harvested").toBeGreaterThanOrEqual(0);
+  expect(frames[firstHarvest]?.harvestedTicks, "the first frame harvested is not the seed frame").toBe(0);
+  expect(leg.beginSeedMs.length, "the seed did not start exactly once").toBe(1);
+  // The seed's frames: every one before the first harvest. Their work items create nothing; `beginSeed`
+  // (between its markers) creates the seed's textures, once.
+  let inBeginSeed = false;
+  let creates = 0;
+  let seedCreates = 0;
+  for (const seg of perFrame(events).slice(0, firstHarvest)) {
+    for (const e of seg) {
+      if (e.kind === "seed-begin") inBeginSeed = true;
+      else if (e.kind === "seed-begun") inBeginSeed = false;
+      else if (e.kind === "create" && inBeginSeed) seedCreates++;
+      else if (e.kind === "create" && e.inSolver) creates++;
+    }
+  }
+  expect(creates, "GPU objects created by a seed work item").toBe(0);
+  expect(seedCreates, "beginSeed created no texture (a vacuous marker?)").toBeGreaterThan(0);
+  const seedTransport = frames.slice(0, firstHarvest).map((s) => s.harvestMs + s.encodeMs);
+  const seedEncode = frames.slice(0, firstHarvest).map((s) => s.encodeMs);
+  const seedMs = (frames[firstHarvest]?.now ?? 0) - (frames[0]?.now ?? 0);
+  const beginMs = leg.beginSeedMs[0] ?? 0;
+  console.log(
+    `  GPU seed [${label}] N=${N}: ${firstHarvest} frames (${seedMs.toFixed(0)} ms) to the seed frame; beginSeed ${beginMs.toFixed(2)} ms; ` +
+      `seed frames' transport median ${median(seedTransport).toFixed(2)} max ${Math.max(0, ...seedTransport).toFixed(2)} ms, ` +
+      `encode median ${median(seedEncode).toFixed(2)} max ${Math.max(0, ...seedEncode).toFixed(2)} ms`,
+  );
+  expect(beginMs, "beginSeed over its ceiling (a compile or an upload moved into it?)").toBeLessThan(BEGIN_SEED_MS);
+  expect(Math.max(0, ...seedTransport), "a seed frame over the max transport ceiling").toBeLessThan(SEED_FRAME_MAX_MS);
+  return { seedFrames: firstHarvest, seedMs };
 }
 
 /** The drag leg's signatures: the transport's per-frame contract holds through the drag, and the pins are O(held). */
@@ -610,19 +731,19 @@ function timeAnimationFrames(): { durations: number[]; restore: () => void } {
 }
 
 /**
- * Which half of T7 a file runs. T7 runs as two files, one per reduction state, because the browser tier
- * gives each file its own process and a 300 s budget (scripts/run-browser-perf-tier.mjs). On the CI runners
- * the legs together take 140-280 s: under SwiftShader every 100k-node full-detail repaint holds the next
- * animation frame for seconds, and a drag repaints tens of times. That is past the budget on a slow runner.
- * Each half builds its own engine and fixture; only the LOD-off half measures the GPU-only tick rate its
- * throughput floor needs.
+ * Which part of T7 a file runs. T7 runs as three files, one per reduction state and one for the seeded LOD
+ * run (the Navigator's config, #353), because the browser tier gives each file its own process and a 300 s
+ * budget (scripts/run-browser-perf-tier.mjs). On the CI runners the legs together take 250-300 s and more:
+ * under SwiftShader every 100k-node full-detail repaint holds the next animation frame for seconds, a drag
+ * repaints tens of times, and each of the four streams runs 60 ticks. Each part builds its own engine and
+ * fixture; only the LOD-off part measures the GPU-only tick rate its throughput floor needs.
  */
-export type StreamHalf = "LOD off" | "LOD on";
+export type StreamPart = "LOD off" | "LOD on" | "LOD on, seeded";
 
-/** Register T7's legs for one reduction state (see {@link StreamHalf}). */
-export function describeGpuStream(half: StreamHalf): void {
-  const off = half === "LOD off";
-  describe(`GPU layout streaming per frame (#352), ${half} — network().layout({ backend: 'gpu' })`, () => {
+/** Register T7's legs for one part (see {@link StreamPart}). */
+export function describeGpuStream(part: StreamPart): void {
+  const off = part === "LOD off";
+  describe(`GPU layout streaming per frame (#352), ${part} — network().layout({ backend: 'gpu' })`, () => {
     let host: HTMLElement;
     let net: Network;
     let graph: NetworkGraph;
@@ -648,7 +769,7 @@ export function describeGpuStream(half: StreamHalf): void {
       host?.remove();
     });
 
-    // Each half's stream leg runs first, on its own engine at its initial view (k = 1), before any drag.
+    // Each part's first stream leg runs on its own engine at its initial view (k = 1), before any drag.
 
     // Calibrated at LOCAL_N (see the PR's Performance section for the measured numbers). The transport's
     // own main-thread work per frame is a fence poll, a memcpy of 8 B per node on harvest frames, and at
@@ -662,6 +783,7 @@ export function describeGpuStream(half: StreamHalf): void {
       const { transport, encode, ticksPerSec } = report("LOD off", leg);
       console.log(`  GPU-only tick rate: ${gpuOnlyReport}`);
       assertSignatures(leg);
+      assertSeed("LOD off", leg);
       expect(quantile(transport, 0.95)).toBeLessThan(TRANSPORT_P95_MS);
       expect(median(encode)).toBeLessThan(ENCODE_MEDIAN_MS);
       // The layout gets ≤ 60% of each frame's GPU time, and the encode cap binds at small N: a quarter of
@@ -674,9 +796,10 @@ export function describeGpuStream(half: StreamHalf): void {
       assertDrag("LOD off", leg, TRANSPORT_P95_MS, ENCODE_MEDIAN_MS);
     }, perfBudget(240_000));
 
-    it.runIf(!off)("LOD on (structural cut, declutter, super-edges): the same transport bounds; the tree from the LOD worker", async () => {
+    it.runIf(part === "LOD on")("LOD on (structural cut, declutter, super-edges): the same transport bounds; the tree from the LOD worker", async () => {
       net.setTransform(fitView());
-      const leg = await streamLeg(net, graph, true);
+      // From a disc, as the worker baseline below (a seed would make this leg's frontier the seed's).
+      const leg = await streamLeg(net, graph, true, false);
       const { transport, encode } = report("LOD on", leg);
       assertSignatures(leg);
       expect(quantile(transport, 0.95)).toBeLessThan(TRANSPORT_P95_MS);
@@ -695,25 +818,26 @@ export function describeGpuStream(half: StreamHalf): void {
       );
     }, perfBudget(240_000));
 
-    it.runIf(!off)("LOD on: a node drag reheats through the same budgeted loop — transport bounds, O(held) pins", async () => {
+    it.runIf(part === "LOD on")("LOD on: a node drag reheats through the same budgeted loop — transport bounds, O(held) pins", async () => {
       const leg = await dragLeg(net, host, graph, Math.floor(N / 2));
       assertDrag("LOD on", leg, TRANSPORT_P95_MS, ENCODE_MEDIAN_MS);
     }, perfBudget(240_000));
 
     // Lifecycle §5 baseline: the worker backend on the same engine, graph and view, and from the same kind of
-    // start — a disc cold start (`multilevel: false`), as the GPU run's. (A multilevel seed is built from the
-    // same coarsening hierarchy as the LOD tree, so its aggregates are compact and its frontier a fraction of
-    // a disc start's; comparing it would measure the seed, not the transport.) The worker's frames arrive one
-    // per CPU tick, each coalesced into one animation-frame repaint; timed here are those repaints alone (its
-    // message handler's positions + geometry copies are left out, so the baseline is if anything low), while
-    // the GPU side counts its commit (the same copies) plus the repaint. The layouts still differ (60 GPU
-    // ticks against a few CPU ticks), so the margin is generous; the regression it bounds — a main-thread
-    // geometry pass per repaint, O(tree) — is also pinned by exact call counts in
-    // `gpu-lod-mainthread.browser.test.ts`.
+    // start — a disc cold start (`multilevel: false`), as the LOD-on GPU leg's. (A multilevel seed is built from
+    // the same coarsening hierarchy as the LOD tree, so its aggregates are compact and its frontier a fraction
+    // of a disc start's; a seeded side against a cold one would measure the seed, not the transport, and two
+    // seeded sides 60 GPU ticks against 12 CPU ticks apart differ in frontier by more than the margin: 1.59
+    // under SwiftShader, #353.) The worker's frames arrive one per CPU tick, each coalesced into one
+    // animation-frame repaint; timed here are those repaints alone (its message handler's positions + geometry
+    // copies are left out, so the baseline is if anything low), while the GPU side counts its commit (the same
+    // copies) plus the repaint. The layouts still differ (60 GPU ticks against a few CPU ticks), so the margin
+    // is generous; the regression it bounds — a main-thread geometry pass per repaint, O(tree) — is also pinned
+    // by exact call counts in `gpu-lod-mainthread.browser.test.ts`.
     const BASELINE_RATIO = 1.5;
     const BASELINE_SLACK_MS = perfBudget(2);
 
-    it.runIf(!off)("LOD on: main-thread ms per layout repaint within the worker backend's (lifecycle §5 baseline)", async () => {
+    it.runIf(part === "LOD on")("LOD on: main-thread ms per layout repaint within the worker backend's (lifecycle §5 baseline)", async () => {
       expect(gpuLodRepaintMs.length, "the LOD-on GPU leg must run first").toBeGreaterThan(0);
       net.data(graph).lod({ source: "structure", declutter: true, superEdges: true });
       net.setTransform(fitView());
@@ -737,6 +861,22 @@ export function describeGpuStream(half: StreamHalf): void {
           `ratio ${(gpu / Math.max(1e-3, base)).toFixed(2)}`,
       );
       expect(gpu).toBeLessThan(BASELINE_RATIO * base + BASELINE_SLACK_MS);
+    }, perfBudget(240_000));
+
+    // The Navigator's real path (#353): LOD on with the default seed. The LOD relay's worker builds the plan and
+    // the tree from one coarsening, the tree is adopted while the seed runs, and the seed frame goes through the
+    // relay's refit before it is painted. Its own leg, without the baseline ratio: a seeded layout's frontier is
+    // not a disc start's, so the worker comparison above stays on disc starts.
+    it.runIf(part === "LOD on, seeded")("LOD on, seeded (the Navigator's config): the seed through the LOD relay keeps every transport bound", async () => {
+      net.setTransform(fitView());
+      const leg = await streamLeg(net, graph, true);
+      const { transport, encode } = report("LOD on, seeded", leg);
+      assertSignatures(leg);
+      assertSeed("LOD on", leg);
+      expect(quantile(transport, 0.95)).toBeLessThan(TRANSPORT_P95_MS);
+      expect(median(encode)).toBeLessThan(ENCODE_MEDIAN_MS);
+      expect(net.lodSource).toBe("worker");
+      expect(leg.frames.some((s, i) => s.repainted && leg.treeFrames[i] === true), "no repaint drew the LOD worker's tree").toBe(true);
     }, perfBudget(240_000));
   });
 }

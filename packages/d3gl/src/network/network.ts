@@ -283,12 +283,12 @@ export interface NetworkLayoutOptions {
   positions?: Float32Array;
   /**
    * Tick budget of the force layout (`"force"` / `"worker"` / `"gpu"` / `"auto"`, default 300) — a
-   * maximum, not a fixed count (#124), and the length of the anneal: a seeded layout (multilevel, or the
-   * GPU's module seed) cools over it, so a larger budget cools more slowly rather than only adding
-   * headroom. A cold disc start keeps full heat to untangle. The CPU backends stop as soon as the layout
-   * has converged (nodes moving a small fraction of the equilibrium spacing per tick), resolving
-   * {@link Network.whenSettled}. The GPU solve (`"gpu"`, or `"auto"` resolved to it) runs the whole
-   * budget (its early stop needs a GPU readback it doesn't do yet).
+   * maximum, not a fixed count (#124), and the length of the anneal: a multilevel-seeded layout cools over
+   * it, so a larger budget cools more slowly rather than only adding headroom. A cold disc start keeps
+   * full heat to untangle. Every backend stops as soon as the layout has converged (nodes moving a small
+   * fraction of the equilibrium spacing per tick, and no faster than the tick before), resolving
+   * {@link Network.whenSettled}; the GPU solve (`"gpu"`, or `"auto"` resolved to it) decides that on the
+   * GPU, once per tick, so its stop tick does not depend on frame timing (#376).
    */
   iterations?: number;
   /**
@@ -297,11 +297,16 @@ export interface NetworkLayoutOptions {
    */
   force?: Partial<ForceParams>;
   /**
-   * For `backend: "force"` and `backend: "worker"`, seed the layout via multilevel coarsening
-   * (heavy-edge matching) for faster convergence and fewer tangles on clustered graphs. Default
-   * `true`; set `false` for a plain cold-start force run. Tiny / edgeless graphs skip coarsening
-   * automatically. `"gpu"` and `"auto"` honour it when they resolve to the worker; the GPU solve itself
-   * seeds from the module hierarchy when there is one, else from a disc.
+   * Seed the force layout (`"force"` / `"worker"` / `"gpu"` / `"auto"`) via multilevel coarsening
+   * (heavy-edge matching) for faster convergence and fewer tangles on clustered graphs. Default `true`; set
+   * `false` for a plain cold-start force run from a disc. Tiny / edgeless graphs skip coarsening
+   * automatically. The GPU solve (`"gpu"`, or `"auto"` resolved to it) seeds from the module hierarchy
+   * when there is one (#180), else from the graph's coarsening, which a layout worker builds while the GPU
+   * solver is built (#353); the GPU lays every coarse level out on its one solver inside the per-frame GPU
+   * budget, and the first frame it paints is the seed (paced by animation frames: on web-NotreDame about
+   * 0.8 s after a disc start's first frame at 120 Hz, about twice that at 60 Hz). `false` starts the GPU
+   * layout from the disc with or without a module hierarchy. Where `"gpu"` / `"auto"` resolve to the
+   * worker, it honours `multilevel` too.
    */
   multilevel?: boolean;
   /**

@@ -74,14 +74,23 @@ export type PassViewport = [number, number, number, number];
  * site gets luma's default clear by omission:
  *
  * - a colour clears the **whole** attachment (luma 9.3.3 `WEBGLRenderPass.clear()` calls `gl.clear`,
- *   which ignores the viewport — only a scissor limits it), so a clearing pass takes no viewport;
+ *   which ignores the viewport — only a scissor limits it), so a clearing pass takes no viewport, only an
+ *   optional `scissor`: luma applies the pass's scissor before its clear, so the clear and the pass's draws
+ *   then touch only that rectangle (how a multilevel seed level clears just its own rows or grid, #353);
  * - `false` keeps the contents, and may restrict rasterisation to a `viewport` sub-rectangle — how a
  *   pass writes one level of a packed texture without touching the others — or to a `scissor`
  *   rectangle, which keeps the viewport (so the slot ↔ texel mapping) of the whole attachment and only
  *   drops the fragments outside it: how the force pass runs one row band at a time (#352).
  */
 export type PassTarget =
-  | { readonly framebuffer: Framebuffer; readonly clear: ClearColor }
+  | {
+      readonly framebuffer: Framebuffer;
+      readonly clear: ClearColor;
+      /** Limits the clear (and the draws) to this rectangle. */
+      readonly scissor?: PassViewport;
+      /** Maps the draws onto this rectangle; it does not limit the clear, so pair it with an equal `scissor`. */
+      readonly viewport?: PassViewport;
+    }
   | {
       readonly framebuffer: Framebuffer;
       readonly clear: false;
@@ -112,5 +121,8 @@ export function beginPass(device: Device, target: PassTarget): RenderPass {
     clearColor: [r, g, b, a],
     clearDepth: false,
     clearStencil: false,
+    ...(target.scissor || target.viewport
+      ? { parameters: { ...(target.viewport ? { viewport: target.viewport } : {}), ...(target.scissor ? { scissorRect: target.scissor } : {}) } }
+      : {}),
   });
 }

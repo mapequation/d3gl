@@ -13,6 +13,7 @@ import type { CoarsenOptions } from "./coarsen.js";
 import type { BoundaryDiscs, LODTopology } from "./lod.js";
 import type { LeafStyle, LODView, SpatialLODFrame } from "./lod-frame.js";
 import type { NestedLayoutParams, NestedLayoutTopology } from "./nested-layout.js";
+import type { SeedPlan, SeedPlanOptions } from "./gpu/seed-plan.js";
 
 /** Kick off a layout run. Edge buffers are copied to the worker; the main thread keeps its own. */
 export interface StartMessage {
@@ -118,11 +119,13 @@ export interface NestedStartMessage {
 }
 
 /**
- * The GPU layout's LOD worker (#377): coarsen the graph into the LOD tree and stream it, with no layout.
- * The worker posts the {@link LODTopologyMessage} once (its arrays transferred, not cloned), then answers
- * each {@link LODGeometryRequest} with the tree's position geometry refit to the positions it carries —
- * the work the worker backend does per frame, for positions the GPU harvested. Edge buffers are copied;
- * the main thread keeps its own.
+ * The GPU layout's coarsening worker: coarsen the graph, with no layout, for the LOD tree (#377) and/or the
+ * GPU's multilevel seed (#353) — one hierarchy for both, as the worker backend shares it between its seed
+ * and its LOD tree. With `seed`, the worker first posts a {@link SeedPlanMessage} (its arrays transferred).
+ * With `lod`, it then posts the {@link LODTopologyMessage} once (transferred, not cloned) and answers each
+ * {@link LODGeometryRequest} with the tree's position geometry refit to the positions it carries — the work
+ * the worker backend does per frame, for positions the GPU harvested. Edge buffers are copied; the main
+ * thread keeps its own.
  */
 export interface CoarsenMessage {
   type: "coarsen";
@@ -131,6 +134,10 @@ export interface CoarsenMessage {
   target: Uint32Array;
   weight: Float32Array;
   coarsen?: CoarsenOptions;
+  /** Build the LOD tree's topology, post it, and keep the tree for refits. */
+  lod: boolean;
+  /** Build the GPU multilevel seed's plan from the same hierarchy and post it first. */
+  seed?: SeedPlanOptions;
 }
 
 
@@ -203,7 +210,16 @@ export interface LODGeometryMessage {
   geometry: Float32Array;
 }
 
-export type WorkerToMain = LODTopologyMessage | ProgressMessage | LODGeometryMessage;
+/**
+ * The GPU multilevel seed's plan (#353), the first reply to a {@link CoarsenMessage} with `seed` — its arrays
+ * transferred. `null` when the graph cannot be coarsened: the GPU run starts from its disc.
+ */
+export interface SeedPlanMessage {
+  type: "seed-plan";
+  plan: SeedPlan | null;
+}
+
+export type WorkerToMain = LODTopologyMessage | ProgressMessage | LODGeometryMessage | SeedPlanMessage;
 
 /**
  * The three position-derived geometry arrays packed contiguously in one buffer, `[cx, cy, extent]`

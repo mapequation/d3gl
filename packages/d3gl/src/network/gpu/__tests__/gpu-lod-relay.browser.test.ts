@@ -305,7 +305,7 @@ describe("GPU layout LOD relay (#377) — a relay that fails while the run start
 });
 
 describe("GPU layout LOD relay (#377) — no worker", () => {
-  it("no LOD worker can start (a page that blocks workers): one warning, the tree withdrawn, the run goes on", async () => {
+  it("no LOD worker can start (a page that blocks workers): one warning, the tree withdrawn, the run goes on from its disc", async () => {
     const device = await makeTestDevice();
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     vi.stubGlobal(
@@ -326,7 +326,10 @@ describe("GPU layout LOD relay (#377) — no worker", () => {
       await handle.settled;
       expect(handle.transport).toBe("gpu");
       expect(frames).toBeGreaterThan(0);
-      expect(warn.mock.calls.filter((c) => String(c[0]).includes("no LOD worker could start"))).toHaveLength(1);
+      // One warning for the one cause, naming both consequences: no second worker is tried for the seed (#353).
+      expect(warn).toHaveBeenCalledTimes(1);
+      expect(String(warn.mock.calls[0]?.[0])).toContain("no LOD worker could start");
+      expect(String(warn.mock.calls[0]?.[0])).toContain("multilevel seed");
     } finally {
       handle.stop();
       device.destroy();
@@ -384,7 +387,7 @@ describe("GPU layout LOD relay (#377) — engine", () => {
     }
   });
 
-  it("lod({ source: 'spatial' }) starts no LOD worker: the spatial tree follows the GPU frames on the main thread (#343)", async () => {
+  it("lod({ source: 'spatial' }) starts no LOD worker: the spatial tree follows the GPU frames on the main thread, and a seed-only worker coarsens for the multilevel seed (#343, #353)", async () => {
     const warn = vi.spyOn(console, "warn");
     const net = network(makeHost(), { width: W, height: H, backend: "webgl" });
     await net.whenReady();
@@ -394,8 +397,10 @@ describe("GPU layout LOD relay (#377) — engine", () => {
       await net.whenSettled();
       expect(net.layoutTransport).toBe("gpu");
       expect(net.lodSource).toBe("spatial"); // never the relay's coarsening tree
-      expect(posts.mock.calls.filter((c: [MainToWorker, ...unknown[]]) => c[0].type === "coarsen")).toHaveLength(0);
-      expect(warn.mock.calls.filter((c) => String(c[0]).includes("LOD worker"))).toHaveLength(0);
+      const coarsens = posts.mock.calls.map((c: [MainToWorker, ...unknown[]]) => c[0]).filter((m) => m.type === "coarsen");
+      expect(coarsens.filter((m) => m.lod)).toHaveLength(0); // no LOD tree from a worker
+      expect(coarsens.filter((m) => m.seed !== undefined)).toHaveLength(1); // the multilevel seed's plan still is
+      expect(warn.mock.calls.filter((c) => String(c[0]).includes("worker"))).toHaveLength(0);
     } finally {
       net.destroy();
     }

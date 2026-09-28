@@ -49,19 +49,25 @@ precision highp sampler2D;
 
 uniform highp sampler2D u_stats; // (Σx, Σy, Σ|v|, count) of segment 0
 uniform highp sampler2D u_box;   // (maxX, maxY, −minX, −minY) of segment 0
+uniform highp sampler2D u_stop;  // the stop latch (prevStep, stopTick, epoch, flags), #376
 layout(location = 0) out vec4 o_stat;
 
 void main() {
-  o_stat = gl_FragCoord.x < 1.0 ? texelFetch(u_stats, ivec2(0), 0) : texelFetch(u_box, ivec2(0), 0);
+  float x = gl_FragCoord.x;
+  o_stat = x < 1.0 ? texelFetch(u_stats, ivec2(0), 0) : x < 2.0 ? texelFetch(u_box, ivec2(0), 0) : texelFetch(u_stop, ivec2(0), 0);
 }
 `;
 
+/** Texels of the stats staging row: `stats`, `box`, the stop latch. */
+export const STATS_TEXELS = 3;
+
 /**
- * The flat segment table's `stats` and `box` texels side by side in one 2×1 `rgba32float` staging
- * texture, so the stats readback is one `readPixels` into its own PBO. One 2-fragment draw per copy.
+ * The flat segment table's `stats` and `box` texels and the stop latch's texel (#376) side by side in one
+ * 3×1 `rgba32float` staging texture, so the stats readback is one `readPixels` into its own PBO. One
+ * 3-fragment draw per copy.
  */
 export class PackStatsPass {
-  /** The 2×1 staging framebuffer the readback copies from. */
+  /** The 3×1 ({@link STATS_TEXELS}) staging framebuffer the readback copies from. */
   readonly framebuffer: Framebuffer;
   private readonly device: Device;
   private readonly texture: Texture;
@@ -70,19 +76,19 @@ export class PackStatsPass {
   constructor(device: Device) {
     this.device = device;
     this.texture = device.createTexture({
-      width: 2,
+      width: STATS_TEXELS,
       height: 1,
       format: "rgba32float",
       mipLevels: 1,
       sampler: { minFilter: "nearest", magFilter: "nearest" },
     });
-    this.framebuffer = device.createFramebuffer({ width: 2, height: 1, colorAttachments: [this.texture] });
+    this.framebuffer = device.createFramebuffer({ width: STATS_TEXELS, height: 1, colorAttachments: [this.texture] });
     this.model = fullScreenModel(device, STATS_FS, {}, NO_BLEND);
   }
 
-  /** Copy `stats` (texel 0) and `box` (texel 1) of segment 0 into the staging texture. */
-  run(stats: Texture, box: Texture): void {
-    this.model.setBindings({ u_stats: stats, u_box: box });
+  /** Copy `stats` (texel 0) and `box` (texel 1) of segment 0 and the stop latch (texel 2) into the staging texture. */
+  run(stats: Texture, box: Texture, stop: Texture): void {
+    this.model.setBindings({ u_stats: stats, u_box: box, u_stop: stop });
     const pass = beginPass(this.device, { framebuffer: this.framebuffer, clear: false });
     this.model.draw(pass);
     pass.end();

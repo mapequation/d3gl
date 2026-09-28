@@ -47,10 +47,11 @@ import { Model } from "@luma.gl/engine";
 import { makeTestDevice } from "./_device.js";
 import { GpuForceLayout } from "../gpu-force-layout.js";
 import { buildCSR, buildGraph } from "../../graph.js";
-import type { LayoutGraph } from "../../force.js";
+import { MIN_SETTLE_TICKS, type LayoutGraph } from "../../force.js";
 import { buildHubChunks, SPRING_CHUNK } from "../hub-chunks.js";
 import { FLAT_TILE_MIN_SIDE, flatSegments, packTiles, type PyramidTexture } from "../segments.js";
 import { GridPyramid } from "../passes/grid-pyramid.js";
+import { STOP_STOPPED } from "../stop-latch.js";
 import { atlasWidth } from "../textures.js";
 import { perfBudget, perfN } from "../../../__tests__/perf-budget.js";
 
@@ -241,9 +242,10 @@ function chunkCount(graph: LayoutGraph): number {
 }
 
 /**
- * The draws of one tick of `layout`, as the size of the framebuffer each draw renders into — the
- * fragments a full-screen pass covers (sorted, so two ticks compare as multisets). Every GPU layout pass
- * draws through luma's `Model.draw`.
+ * The draws of one tick of `layout`, as the size each draw rasterises — its pass's viewport, else the
+ * framebuffer it renders into: the fragments a full-screen pass covers (sorted, so two ticks compare as
+ * multisets). The viewport matters for the tile pyramid's packed levels (#354), whose reduces each write
+ * their level's rectangle of a larger texture. Every GPU layout pass draws through luma's `Model.draw`.
  */
 function tickDraws(layout: GpuForceLayout): string[] {
   const spy = vi.spyOn(Model.prototype, "draw");
@@ -251,6 +253,8 @@ function tickDraws(layout: GpuForceLayout): string[] {
     layout.runFrame(1);
     return spy.mock.calls
       .map(([pass]) => {
+        const vp = pass.props.parameters?.viewport;
+        if (vp) return `${vp[2] ?? 0}x${vp[3] ?? 0}`;
         const fbo = pass.props.framebuffer;
         return fbo ? `${fbo.width}x${fbo.height}` : "canvas";
       })
@@ -377,7 +381,10 @@ describe("GPU frame budget — pyramid path (per-tick regression tripwire)", () 
     expect(scatters.length).toBe(3);
   });
 
-  it("pyramid ticking at N=30000 allocates no framebuffers or textures (all pre-created)", () => {
+  // Every seeded GPU layout (#353, the default) ticks the graph's level on a solver built with `multilevel`,
+  // whose reduction, pyramid scatter, all-pairs and traversal programs carry the mass branch: the per-tick
+  // signatures below run on both kinds of solver.
+  it.each([false, true])("pyramid ticking at N=30000 allocates no framebuffers or textures (all pre-created), multilevel %s", (multilevel) => {
     // Re-affirms the "updated in place, not recreated per frame" AGENTS.md §5 signature
     // at scale on the pyramid path. Mirrors the same assertion from gpu-pyramid.browser.test.ts
     // but at a larger N representative of the hot path.
@@ -385,7 +392,7 @@ describe("GPU frame budget — pyramid path (per-tick regression tripwire)", () 
     const g = makeClusteredGraph(N, 80, 0xcafe1234);
     const params = { repulsion: 200, attraction: 0.05, centering: 0.2, alpha: 0.05, theta: 0.7 };
 
-    const layout = new GpuForceLayout(device, g, params, { repulsionMode: "pyramid" });
+    const layout = new GpuForceLayout(device, g, params, { repulsionMode: "pyramid", multilevel });
 
     // Reset spies AFTER construction (construction legitimately allocates).
     const fboSpy = vi.spyOn(device, "createFramebuffer");
@@ -410,7 +417,7 @@ describe("GPU frame budget — pyramid path (per-tick regression tripwire)", () 
     layout.destroy();
   });
 
-  it("a tick sliced into row bands (#352) is bitwise the unsliced tick, and allocates nothing per band", () => {
+  it.each([false, true])("a tick sliced into row bands (#352) is bitwise the unsliced tick, and allocates nothing per band, multilevel %s", (multilevel) => {
     // The streaming transport encodes the force pass one row band at a time (scissored), so one tick's GPU
     // work can span frames. Bands write disjoint texels and each texel gets springs → repulsion →
     // centering in the same order whatever B is, so the result must be BITWISE equal (same program, same
@@ -420,8 +427,8 @@ describe("GPU frame budget — pyramid path (per-tick regression tripwire)", () 
     const g = withHubs(makeClusteredGraph(N, 80, 0xba4d5), 0x51);
     const params = { repulsion: 200, attraction: 0.05, centering: 0.2, alpha: 0.05, theta: 0.7 };
     const TICKS = 3;
-    const whole = new GpuForceLayout(device, { ...g, positions: g.positions.slice() }, params, { repulsionMode: "pyramid" });
-    const sliced = new GpuForceLayout(device, { ...g, positions: g.positions.slice() }, params, { repulsionMode: "pyramid" });
+    const whole = new GpuForceLayout(device, { ...g, positions: g.positions.slice() }, params, { repulsionMode: "pyramid", multilevel });
+    const sliced = new GpuForceLayout(device, { ...g, positions: g.positions.slice() }, params, { repulsionMode: "pyramid", multilevel });
     const a = new Float32Array(N * 2);
     const b = new Float32Array(N * 2);
     try {
@@ -459,6 +466,40 @@ describe("GPU frame budget — pyramid path (per-tick regression tripwire)", () 
     let moved = 0;
     for (let i = 0; i < N * 2; i++) if (a[i] !== g.positions[i]) moved++;
     expect(moved).toBeGreaterThan(N);
+  });
+
+  it("a multilevel solver's ticks of the graph's level are bitwise a flat solver's (#353: the mass branch multiplies by 1)", () => {
+    // After a seed the run ticks the graph's level on the multilevel solver: its reduction, scatter and
+    // all-pairs programs take the unit-mass branch and the traversal's root level is a uniform. That must change
+    // no bit of the flat tick, on the pyramid path (hub rows included) and on the all-pairs path.
+    const params = { repulsion: 200, attraction: 0.05, centering: 0.2, alpha: 0.05, theta: 0.7 };
+    const TICKS = 3;
+    const cases: { mode: "pyramid" | "allpairs"; g: LayoutGraph }[] = [
+      { mode: "pyramid", g: withHubs(makeClusteredGraph(perfN(30_000, { max: 200_000 }), 80, 0xf1a7), 0x52) },
+      { mode: "allpairs", g: makeClusteredGraph(3_000, 20, 0xa11) },
+    ];
+    for (const { mode, g } of cases) {
+      const n = g.nodeCount;
+      const flat = new GpuForceLayout(device, { ...g, positions: g.positions.slice() }, params, { repulsionMode: mode });
+      const multi = new GpuForceLayout(device, { ...g, positions: g.positions.slice() }, params, { repulsionMode: mode, multilevel: true });
+      const a = new Float32Array(n * 2);
+      const b = new Float32Array(n * 2);
+      try {
+        flat.runFrame(TICKS);
+        flat.readPositions(a);
+        multi.runFrame(TICKS);
+        multi.readPositions(b);
+      } finally {
+        flat.destroy();
+        multi.destroy();
+      }
+      let mismatches = 0;
+      for (let i = 0; i < n * 2; i++) if (!Object.is(a[i], b[i])) mismatches++;
+      expect(mismatches, `${mode}: positions differing from the flat solver's`).toBe(0);
+      let moved = 0;
+      for (let i = 0; i < n * 2; i++) if (a[i] !== g.positions[i]) moved++;
+      expect(moved, `${mode}: the ticks did not move the layout`).toBeGreaterThan(n);
+    }
   });
 
   it("hub springs (#350): a tick with web-NotreDame-shaped hub rows stays under the same ceiling and near its hub-free twin", () => {
@@ -605,4 +646,51 @@ describe("GPU frame budget — pyramid path (per-tick regression tripwire)", () 
     const fragmentsPerTick = reduces.reduce((n, d) => n + d.fragments, 0) / TICKS;
     expect(fragmentsPerTick).toBeLessThan((atlas.width * atlas.height) / 3);
   });
+
+  it("the stop latch (#376): one 1-fragment draw per tick and the same draw list unarmed, latching and frozen, allocating nothing", () => {
+    // The convergence stop is decided per tick in ONE fragment (the latch), after the range query, and the
+    // integrate reads its texel. So a tick draws into 1×1 targets exactly three times — the pyramid's root
+    // level, the range query into the segment table, and the latch — and its draw list is the same whether
+    // the stop is unarmed, armed and latching in this tick, or latched (a frozen tick: the integrate passes
+    // through in-shader). A latch run per band, per level or per slot would show here, and a readback of the
+    // step, per tick or on the stop, would allocate.
+    const N = perfN(30_000, { max: 200_000 });
+    const g = makeClusteredGraph(N, 80, 0x5709);
+    const params = { repulsion: 200, attraction: 0.05, centering: 0.2, alpha: 0.05, theta: 0.7 };
+    const layout = new GpuForceLayout(device, g, params, { repulsionMode: "pyramid" });
+    const state = new Float32Array(4);
+    try {
+      // Zero heat from rest: nothing moves, so every step is exactly 0 and the latch sets at the first prep
+      // it is armed at. The draw list does not depend on the heat.
+      layout.hold(0);
+      layout.runFrame(1); // warm-up
+      const unarmed = tickDraws(layout);
+      layout.stopOnConvergence = true;
+      layout.hold(0); // a new schedule: armed once it is MIN_SETTLE_TICKS ticks old
+      layout.runFrame(MIN_SETTLE_TICKS);
+      layout.readStopState(state);
+      expect(state[3]).toBe(0);
+      const fboSpy = vi.spyOn(device, "createFramebuffer");
+      const texSpy = vi.spyOn(device, "createTexture");
+      const bufSpy = vi.spyOn(device, "createBuffer");
+      const latching = tickDraws(layout); // armed: the latch sets in this tick's prep and freezes its integrate
+      const frozen = tickDraws(layout);
+      layout.runFrame(4);
+      expect(fboSpy).toHaveBeenCalledTimes(0);
+      expect(texSpy).toHaveBeenCalledTimes(0);
+      expect(bufSpy).toHaveBeenCalledTimes(0);
+      fboSpy.mockRestore();
+      texSpy.mockRestore();
+      bufSpy.mockRestore();
+      // Not vacuous: the stop latched at the prep of the tick measured as `latching`.
+      layout.readStopState(state);
+      expect(state[3]).toBe(STOP_STOPPED);
+      expect(state[1]).toBe(MIN_SETTLE_TICKS + 2);
+      expect(unarmed.filter((d) => d === "1x1")).toHaveLength(3);
+      expect(latching).toEqual(unarmed);
+      expect(frozen).toEqual(unarmed);
+    } finally {
+      layout.destroy();
+    }
+  }, 120_000);
 });

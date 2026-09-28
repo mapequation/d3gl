@@ -76,6 +76,25 @@ export const MIN_SETTLE_TICKS = Math.round(3 / (1 - DAMPING));
 export const MIN_HEAT = 0.02;
 
 /**
+ * The half of the convergence test (#124) that is known before a tick's step: the model has an
+ * equilibrium spacing, and the current heat schedule has run at least {@link MIN_SETTLE_TICKS} ticks.
+ * {@link ForceLayout.converged} is `stopArmed && stepSettled`. The GPU layout evaluates this half on the
+ * CPU and {@link stepSettled} on the GPU, where the step is (#376).
+ */
+export function stopArmed(spacing: number, settleTicks: number): boolean {
+  return spacing > 0 && settleTicks >= MIN_SETTLE_TICKS;
+}
+
+/**
+ * The other half (#124): the last tick moved nodes by less than {@link CONVERGED_STEP} of the spacing
+ * on average, and by no more than the tick before (a layout accelerating from rest has small first
+ * steps without being settled). `step` and `prevStep` are mean per-node steps in world units.
+ */
+export function stepSettled(step: number, prevStep: number, spacing: number): boolean {
+  return step < CONVERGED_STEP * spacing && step <= prevStep;
+}
+
+/**
  * Nearest-neighbour spacing of the force model's equilibrium, `√(π·repulsion/centering)`: 1/d
  * repulsion balanced by linear centering settles into a uniform disc with this much area per node
  * (virial estimate — springs only tighten it). Independent of the node count and the viewport, so it
@@ -235,12 +254,7 @@ export class ForceLayout {
    * an equilibrium spacing — that one runs its whole tick budget.
    */
   get converged(): boolean {
-    return (
-      this.spacing > 0 &&
-      this.settleTicks >= MIN_SETTLE_TICKS &&
-      this.step < CONVERGED_STEP * this.spacing &&
-      this.step <= this.prevStep
-    );
+    return stopArmed(this.spacing, this.settleTicks) && stepSettled(this.step, this.prevStep, this.spacing);
   }
 
   /**

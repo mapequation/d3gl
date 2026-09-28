@@ -4,8 +4,13 @@
  * layout that turns non-finite stops with one warning and keeps its last finite positions — whether the
  * NaN came in through a drag's held positions or out of a tick's integrate, which a copy between ticks
  * catches by re-running the reductions. A drag's held positions are written at the start of a tick, never
- * mid-tick. The at-scale per-frame guard is T7 (`_gpu-stream-harness.ts`, run by `gpu-stream-nolod-perf`
- * and `gpu-stream-lod-perf`); context loss is in `gpu-backend-integration`.
+ * mid-tick. The at-scale per-frame guard is T7 (`_gpu-stream-harness.ts`, run by `gpu-stream-nolod-perf`,
+ * `gpu-stream-lod-perf` and `gpu-stream-seed-perf`); context loss is in `gpu-backend-integration`.
+ *
+ * The multilevel seed in the stream (#353, T10): its levels are work items of the loop, nothing is copied
+ * until the nodes are placed, the first frame is the seed (tick 0), a drag's pins wait for the nodes, a stop
+ * during the seed drops every fence and frees the seed, `iterations: 0` paints the seed frame and settles,
+ * and without a plan the run starts cold from the disc.
  */
 import { describe, it, expect, beforeAll, vi } from "vitest";
 import type { Device } from "@luma.gl/core";
@@ -15,7 +20,9 @@ import { startGpuLayout } from "../gpu-transport.js";
 import { GpuForceLayout } from "../gpu-force-layout.js";
 import { GpuStream, observeGpuLayoutFrames, type GpuFrameSample } from "../gpu-stream.js";
 import { buildGraph, type NetworkGraph } from "../../graph.js";
-import { DEFAULT_FORCE, seedPositions } from "../../force.js";
+import { DEFAULT_FORCE, MIN_SETTLE_TICKS, seedPositions } from "../../force.js";
+import { buildHierarchy } from "../../coarsen.js";
+import { coarseSeedPlan, type SeedPlan } from "../seed-plan.js";
 
 const nextFrame = (): Promise<void> => new Promise((resolve) => requestAnimationFrame(() => resolve()));
 
@@ -36,12 +43,12 @@ describe("GPU streaming run (#352)", () => {
   });
 
   /** A seeded solver over `g` and a stream over it, built directly (not through the transport). */
-  function streamOver(g: NetworkGraph, iterations: number, onFrame: () => void): { layout: GpuForceLayout; stream: GpuStream } {
+  function streamOver(g: NetworkGraph, iterations: number, onFrame: () => void, frameEvery?: number): { layout: GpuForceLayout; stream: GpuStream } {
     if (!(device instanceof WebGLDevice)) throw new Error("expected a WebGL2 device");
     seedPositions(g, 400, 300, { force: DEFAULT_FORCE });
     const layout = new GpuForceLayout(device, g, DEFAULT_FORCE);
     layout.hold(1);
-    return { layout, stream: new GpuStream(device, layout, g, { iterations }, onFrame) };
+    return { layout, stream: new GpuStream(device, layout, g, { iterations, ...(frameEvery !== undefined ? { frameEvery } : {}) }, onFrame) };
   }
 
   it("settles only after the final tick's positions were harvested, and repaints them", async () => {
@@ -50,10 +57,15 @@ describe("GPU streaming run (#352)", () => {
     const unobserve = observeGpuLayoutFrames((s) => samples.push({ ...s }));
     let frames = 0;
     let framesAtSettle = -1;
-    const handle = startGpuLayout(device, g, { width: 400, height: 300, iterations: 40 }, () => { frames++; });
+    // A cold start (no multilevel seed, #353) with a budget below MIN_SETTLE_TICKS, so the run cannot stop
+    // early (#376) and its final tick is the budget's: this ring stops at tick 33 at full heat, and whether a
+    // copy between that stop and a longer budget's end is harvested depends on frame timing.
+    const iterations = 25;
+    expect(iterations).toBeLessThan(MIN_SETTLE_TICKS);
+    const handle = startGpuLayout(device, g, { width: 400, height: 300, iterations, multilevel: false }, () => { frames++; });
     await handle.settled.then(() => { framesAtSettle = frames; });
     unobserve();
-    const final = samples.findIndex((s) => s.harvestedTicks === 40);
+    const final = samples.findIndex((s) => s.harvestedTicks === iterations);
     expect(final).toBeGreaterThanOrEqual(0);
     expect(samples[final]?.repaintMs).toBeGreaterThanOrEqual(0);
     // The final harvest was painted before settle resolved.
@@ -61,6 +73,32 @@ describe("GPU streaming run (#352)", () => {
     expect(samples.slice(final + 1).every((s) => !s.harvested)).toBe(true);
     for (let i = 0; i < 300 * 2; i++) expect(Number.isFinite(g.positions[i] ?? Number.NaN)).toBe(true);
     handle.stop();
+  });
+
+  it("a harvest reports the ticks of the copy it read, also in a frame that issues the next copy", async () => {
+    const g = ring(300);
+    const { stream } = streamOver(g, 60, () => {}, 1);
+    const samples: GpuFrameSample[] = [];
+    const unobserve = observeGpuLayoutFrames((s) => samples.push({ ...s }));
+    try {
+      stream.start();
+      await stream.settled;
+    } finally {
+      unobserve();
+      stream.stop();
+    }
+    // A copy holds the ticks done when it was issued (the frame's `ticksDone`: nothing is encoded after it).
+    let inFlight = -1;
+    let harvestAndCopy = 0;
+    for (const s of samples) {
+      if (s.harvested) {
+        expect(s.harvestedTicks).toBe(inFlight);
+        if (s.copied && s.ticksDone > inFlight) harvestAndCopy++;
+      }
+      if (s.copied) inFlight = s.ticksDone;
+    }
+    // Not vacuous: some frames harvested one copy and issued a newer one.
+    expect(harvestAndCopy).toBeGreaterThan(0);
   });
 
   it("an explicit frameEvery allows at most one onFrame per that many ticks", async () => {
@@ -77,7 +115,9 @@ describe("GPU streaming run (#352)", () => {
     const g = ring(300);
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     let frames = 0;
-    const handle = startGpuLayout(device, g, { width: 400, height: 300, iterations: 100_000 }, () => { frames++; });
+    // A cold start: at full heat it is still running when the NaN arrives (a seeded run, #353, could have
+    // converged and settled already, #376).
+    const handle = startGpuLayout(device, g, { width: 400, height: 300, iterations: 100_000, multilevel: false }, () => { frames++; });
     try {
       for (let i = 0; i < 200 && frames < 2; i++) await nextFrame();
       expect(frames).toBeGreaterThanOrEqual(2);
@@ -222,6 +262,243 @@ describe("GPU streaming run (#352)", () => {
       layout.readPositions(gpu);
       expect(Array.from(g.positions), "the last harvest does not show what the GPU holds").toEqual(Array.from(gpu));
       expect([g.positions[6], g.positions[7]], "the dropped node snapped back").not.toEqual(before);
+    } finally {
+      unobserve();
+      stream.stop();
+    }
+  });
+});
+
+describe("GPU streaming run: the multilevel seed as work items (#353, T10)", () => {
+  let device: Device;
+  beforeAll(async () => {
+    device = await makeTestDevice();
+  });
+
+  /** A clustered graph that coarsens over several levels. */
+  function clusters(k: number, m: number): NetworkGraph {
+    const source: number[] = [];
+    const target: number[] = [];
+    let s = 7;
+    const rng = (): number => {
+      s = (Math.imul(1664525, s) + 1013904223) >>> 0;
+      return s / 2 ** 32;
+    };
+    for (let i = 0; i < k * m; i++) {
+      for (let e = 0; e < 3; e++) {
+        source.push(i);
+        target.push(rng() < 0.9 ? Math.floor(i / m) * m + Math.floor(rng() * m) : Math.floor(rng() * k * m));
+      }
+    }
+    return buildGraph({ nodeCount: k * m, source, target });
+  }
+
+  function planFor(g: NetworkGraph): SeedPlan {
+    const plan = coarseSeedPlan(g, buildHierarchy(g), { width: 400, height: 300, force: DEFAULT_FORCE });
+    if (!plan) throw new Error("no plan");
+    return plan;
+  }
+
+  /** A seeded stream over `g` (the disc on the graph, a multilevel solver), built directly. */
+  function seededStream(g: NetworkGraph, iterations: number, onFrame: () => void, frameEvery?: number): { layout: GpuForceLayout; stream: GpuStream } {
+    if (!(device instanceof WebGLDevice)) throw new Error("expected a WebGL2 device");
+    seedPositions(g, 400, 300, { force: DEFAULT_FORCE });
+    const layout = new GpuForceLayout(device, g, DEFAULT_FORCE, { multilevel: true });
+    const opts = { iterations, seeded: true, ...(frameEvery !== undefined ? { frameEvery } : {}) };
+    return { layout, stream: new GpuStream(device, layout, g, opts, onFrame) };
+  }
+
+  /** The same seed, run synchronously on its own solver: what the streamed seed frame must show. */
+  function syncSeed(g: NetworkGraph, plan: SeedPlan): Float32Array {
+    const view = { ...g, positions: new Float32Array(g.nodeCount * 2) };
+    seedPositions(view, 400, 300, { force: DEFAULT_FORCE });
+    const layout = new GpuForceLayout(device, view, DEFAULT_FORCE, { multilevel: true });
+    layout.runSeed(plan);
+    const out = new Float32Array(g.nodeCount * 2);
+    layout.readPositions(out);
+    layout.destroy();
+    return out;
+  }
+
+  it("waits for its plan, copies nothing until the nodes are placed, and paints the seed as its first frame", async () => {
+    const g = clusters(40, 50);
+    const plan = planFor(g);
+    const expected = syncSeed(g, plan);
+    const samples: GpuFrameSample[] = [];
+    const unobserve = observeGpuLayoutFrames((s) => samples.push({ ...s }));
+    const painted: Float32Array[] = [];
+    const { layout, stream } = seededStream(g, 20, () => painted.push(g.positions.slice()), 1);
+    const levels = vi.spyOn(layout, "setLevel");
+    const ends = vi.spyOn(layout, "endSeed");
+    try {
+      stream.start();
+      for (let i = 0; i < 5; i++) await nextFrame();
+      expect(samples.length, "the stream ran frames before it had a plan").toBe(0);
+      expect(painted.length).toBe(0);
+      stream.seed(plan);
+      await stream.settled;
+      expect(levels).toHaveBeenCalledTimes(plan.levels.length);
+      expect(ends).toHaveBeenCalledTimes(1);
+      const firstCopy = samples.findIndex((s) => s.copied);
+      const lastSeedStep = samples.findIndex((s) => s.ticksDone > 0);
+      expect(firstCopy).toBeGreaterThanOrEqual(0);
+      expect(samples.slice(0, firstCopy).every((s) => s.ticksDone === 0)).toBe(true);
+      expect(lastSeedStep === -1 || firstCopy <= lastSeedStep).toBe(true);
+      expect(samples.find((s) => s.harvested)?.harvestedTicks).toBe(0); // the seed frame
+      expect(Array.from(painted[0] ?? []), "the seed frame is not the seed").toEqual(Array.from(expected));
+      expect(samples.some((s) => s.harvestedTicks === 20)).toBe(true);
+    } finally {
+      unobserve();
+      stream.stop();
+    }
+  });
+
+  it("holds a drag's pins until the nodes are placed, then holds the node where the drag put it", async () => {
+    const g = clusters(20, 40);
+    const plan = planFor(g);
+    const { layout, stream } = seededStream(g, 30, () => {}, 5);
+    const order: string[] = [];
+    const setPinned = layout.setPinned.bind(layout);
+    vi.spyOn(layout, "setPinned").mockImplementation((ids) => { order.push(ids ? "pin" : "unpin"); setPinned(ids); });
+    const endSeed = layout.endSeed.bind(layout);
+    vi.spyOn(layout, "endSeed").mockImplementation(() => { order.push("endSeed"); endSeed(); });
+    try {
+      stream.start();
+      stream.pin(Uint32Array.of(5), new Float32Array([1234, -567])); // before the plan: the seed has not run
+      stream.seed(plan);
+      await stream.settled;
+      expect(order.slice(0, 2)).toEqual(["endSeed", "pin"]);
+      const gpu = new Float32Array(g.nodeCount * 2);
+      layout.readPositions(gpu);
+      expect([gpu[10], gpu[11]]).toEqual([1234, -567]);
+    } finally {
+      stream.stop();
+    }
+  });
+
+  it("a stop during the seed deletes every fence it inserted and frees the seed's resources", async () => {
+    const g = clusters(40, 50);
+    const plan = planFor(g);
+    const proto = WebGL2RenderingContext.prototype;
+    const fences = vi.spyOn(proto, "fenceSync");
+    const deletes = vi.spyOn(proto, "deleteSync");
+    const { layout, stream } = seededStream(g, 1000, () => {});
+    const destroy = vi.spyOn(layout, "destroy");
+    try {
+      let seeding = false;
+      const unobserve = observeGpuLayoutFrames(() => { seeding ||= layout.seeding; });
+      stream.start();
+      stream.seed(plan);
+      for (let i = 0; i < 200 && !seeding; i++) await nextFrame();
+      unobserve();
+      expect(seeding, "the seed never started").toBe(true);
+      expect(layout.seeding).toBe(true);
+      stream.stop();
+      await stream.settled;
+      expect(destroy).toHaveBeenCalledTimes(1); // the solver and the seed's resources with it
+      expect(layout.seeding).toBe(false);
+      expect(fences.mock.calls.length).toBeGreaterThan(0);
+      expect(deletes.mock.calls.length).toBe(fences.mock.calls.length);
+    } finally {
+      fences.mockRestore();
+      deletes.mockRestore();
+    }
+  });
+
+  it("with no iterations, paints the seed frame once and settles", async () => {
+    const g = clusters(20, 40);
+    const plan = planFor(g);
+    const expected = syncSeed(g, plan);
+    let frames = 0;
+    const { stream } = seededStream(g, 0, () => { frames++; });
+    try {
+      stream.start();
+      stream.seed(plan);
+      await stream.settled;
+      expect(frames).toBe(1);
+      expect(Array.from(g.positions)).toEqual(Array.from(expected));
+    } finally {
+      stream.stop();
+    }
+  });
+
+  /** `settled`, or a rejection after `ms` — a loop that died in its animation frame never settles. */
+  function settledWithin(stream: GpuStream, ms: number): Promise<void> {
+    return Promise.race([
+      stream.settled,
+      new Promise<void>((_, reject) => setTimeout(() => reject(new Error(`not settled within ${ms} ms`)), ms)),
+    ]);
+  }
+
+  it("a seed that cannot start (its resources fail) warns once and starts cold from the disc", async () => {
+    const g = clusters(20, 40);
+    const plan = planFor(g);
+    const samples: GpuFrameSample[] = [];
+    const unobserve = observeGpuLayoutFrames((s) => samples.push({ ...s }));
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const { layout, stream } = seededStream(g, 20, () => {}, 20);
+    vi.spyOn(layout, "beginSeed").mockImplementation(() => {
+      throw new Error("a seed program failed to link");
+    });
+    const hold = vi.spyOn(layout, "hold");
+    try {
+      stream.start();
+      stream.seed(plan);
+      await settledWithin(stream, 15_000);
+      expect(warn).toHaveBeenCalledTimes(1);
+      expect(String(warn.mock.calls[0]?.[0])).toContain("multilevel seed");
+      expect(layout.seeding).toBe(false);
+      expect(hold).toHaveBeenCalledWith(1); // full heat, as a cold start
+      expect(samples.find((s) => s.harvested)?.harvestedTicks).toBe(20); // the whole run, and no seed frame
+    } finally {
+      unobserve();
+      warn.mockRestore();
+      stream.stop();
+    }
+  });
+
+  it("a seed step that fails mid-seed frees the seed, warns once and settles with the disc on screen", async () => {
+    const g = clusters(40, 50);
+    const plan = planFor(g);
+    expect(plan.levels.length).toBeGreaterThan(1);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    let painted = 0;
+    const { layout, stream } = seededStream(g, 20, () => { painted++; });
+    const disc = g.positions.slice();
+    const setLevel = layout.setLevel.bind(layout);
+    vi.spyOn(layout, "setLevel").mockImplementation((k) => {
+      if (k === 1) throw new Error("a level upload failed");
+      setLevel(k);
+    });
+    try {
+      stream.start();
+      stream.seed(plan);
+      await settledWithin(stream, 15_000);
+      expect(warn).toHaveBeenCalledTimes(1);
+      expect(String(warn.mock.calls[0]?.[0])).toContain("multilevel seed");
+      expect(layout.seeding, "the seed's resources were kept").toBe(false);
+      expect(painted).toBe(0);
+      expect(Array.from(g.positions)).toEqual(Array.from(disc)); // nothing of the coarse levels reached the graph
+    } finally {
+      warn.mockRestore();
+      stream.stop();
+    }
+  });
+
+  it("without a plan (the worker failed), starts cold from the disc", async () => {
+    const g = clusters(20, 40);
+    const samples: GpuFrameSample[] = [];
+    const unobserve = observeGpuLayoutFrames((s) => samples.push({ ...s }));
+    const { layout, stream } = seededStream(g, 20, () => {}, 20);
+    const hold = vi.spyOn(layout, "hold");
+    const begin = vi.spyOn(layout, "beginSeed");
+    try {
+      stream.start();
+      stream.seed(null);
+      await stream.settled;
+      expect(begin).not.toHaveBeenCalled();
+      expect(hold).toHaveBeenCalledWith(1); // full heat, as a cold start
+      expect(samples.find((s) => s.harvested)?.harvestedTicks).toBe(20); // no seed frame
     } finally {
       unobserve();
       stream.stop();

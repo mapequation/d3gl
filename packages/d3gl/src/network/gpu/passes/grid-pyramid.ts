@@ -43,6 +43,13 @@ import { ADDITIVE_BLEND, beginPass, fullScreenModel, NO_BLEND, type PassTarget, 
 //
 // All textures + FBOs are pre-created in the constructor — no per-tick createTexture /
 // createFramebuffer (keeps the spy test green).
+//
+// A multilevel seed level (#353) is a smaller tile in the corner of the flat atlas: its single segment's
+// row names a tile at (0, 0) of side chooseGrid(level count), and a build with `grid` clears and writes
+// only that corner of L0 and reduces only the tile's levels, up to its root. Its slots carry masses: the
+// scatter emits (m·x, m·y, m, m·r²), so a cell's COM and second moment are mass-weighted, as the CPU
+// tree's. That is a uniform branch compiled only into a `multilevel` pyramid; on the graph's level
+// m = 1, which changes no bit.
 
 // ── Grid-resolution choice ──────────────────────────────────────────────────
 //
@@ -82,10 +89,10 @@ export function chooseGrid(count: number): number {
 // the root square: half = max extent / 2). A square box keeps cells square, so cellSize = boxSide /
 // cellsPerSide is a single unambiguous value the BH traversal reuses. Then
 //   cell = clamp(floor((p - lo) / boxSide * G_s), 0, G_s-1).
-function scatterVs(singleSegment: boolean): string {
+function scatterVs(singleSegment: boolean, multilevel: boolean): string {
   return /* glsl */ `\
 #version 300 es
-${segmentDefines(singleSegment)}
+${segmentDefines(singleSegment)}${multilevel ? "#define MULTILEVEL\n" : ""}
 precision highp float;
 precision highp int;
 precision highp sampler2D;
@@ -98,6 +105,11 @@ uniform vec2  u_atlas;               // level-0 atlas size (A, H)
 uniform float u_pad;                 // box padding factor (e.g. 1.01)
 flat out vec2 v_pos;
 flat out float v_r2;
+#ifdef MULTILEVEL
+uniform int u_massive;               // a mass-weighted seed level (#353)
+uniform highp sampler2D u_mass;      // per-slot mass (slot atlas), sampled only when u_massive
+flat out float v_mass;
+#endif
 ${SLOT_TEXEL_GLSL}
 ${SEGMENT_OF_GLSL}
 void main() {
@@ -110,9 +122,15 @@ void main() {
     gl_Position = vec4(2.0, 2.0, 0.0, 1.0);
     v_pos = vec2(0.0);
     v_r2 = 0.0;
+#ifdef MULTILEVEL
+    v_mass = 0.0;
+#endif
     return;
   }
   vec2 p = texelFetch(u_pos, c, 0).xy;
+#ifdef MULTILEVEL
+  v_mass = u_massive != 0 ? texelFetch(u_mass, c, 0).r : 1.0;
+#endif
 
   vec4 b = texelFetch(u_segBox, st, 0);
   vec2 mx = b.xy;
@@ -150,17 +168,28 @@ void main() {
 `;
 }
 
-const SCATTER_FS = /* glsl */ `\
+function scatterFs(multilevel: boolean): string {
+  return /* glsl */ `\
 #version 300 es
-precision highp float;
+${multilevel ? "#define MULTILEVEL\n" : ""}precision highp float;
 flat in vec2 v_pos;
 flat in float v_r2;
+#ifdef MULTILEVEL
+flat in float v_mass;
+#endif
 out vec4 o_cell;
 void main() {
+#ifdef MULTILEVEL
+  // A mass-weighted seed level (#353): (Σm·x, Σm·y, Σm, Σm·|p−cellCenter|²), so a cell's COM and second
+  // moment are mass-weighted, as the CPU tree's. On the graph's level m = 1, which changes no bit.
+  o_cell = vec4(v_mass * v_pos, v_mass, v_mass * v_r2);
+#else
   // (Σx, Σy, mass=1, Σ|p−cellCenter|²). Additive blend accumulates per cell.
   o_cell = vec4(v_pos, 1.0, v_r2);
+#endif
 }
 `;
+}
 
 // ── Packed reduce (full-screen triangle over one level's rectangle, sum 2×2 children) ──────────
 //
@@ -219,6 +248,23 @@ export interface PyramidBuildInput {
   segments: SegmentTable;
   /** Segment id per slot (`r32uint`, slot atlas) — only when there is more than one segment. */
   slotSeg: Texture | null;
+  /**
+   * A multilevel seed level's tile side (#353): its single segment's tile sits at (0, 0) with this side (a
+   * power of two, at most the atlas's), so the build clears and writes only that corner of L0 and reduces
+   * only the tile's levels, up to its root at level `log2(grid)`. Omitted: the whole atlas.
+   */
+  grid?: number;
+  /** A mass-weighted seed level's per-slot masses (slot atlas), or null. Only on a `multilevel` pyramid. */
+  mass?: Texture | null;
+}
+
+/** Options of a {@link GridPyramid}. */
+export interface GridPyramidOptions {
+  /**
+   * Compile the scatter for mass-weighted seed levels (#353) as a uniform branch; `unit` is bound in place
+   * of the masses when a build has none (never sampled then).
+   */
+  multilevel?: { unit: Texture };
 }
 
 /**
@@ -261,16 +307,20 @@ export class GridPyramid {
   private readonly scatterUniforms: PassUniforms;
   private readonly reduceUniforms: PassUniforms;
   private readonly singleSegment: boolean;
+  /** The stand-in bound as `u_mass` on a build without masses (multilevel only). */
+  private readonly unit: Texture | null;
 
   /**
    * @param atlas the segments' tile atlas (`packTiles`); it must have at least one tile.
    * @param singleSegment S = 1 (the flat layout): the segment id is the constant 0, no `slotSeg`.
+   * @param opts `multilevel`: compile the scatter for a multilevel seed's mass-weighted levels (#353).
    */
-  constructor(device: Device, atlas: TileAtlas, singleSegment: boolean) {
+  constructor(device: Device, atlas: TileAtlas, singleSegment: boolean, opts: GridPyramidOptions = {}) {
     if (atlas.levels.length === 0) throw new Error("GridPyramid: the atlas has no tiles");
     this.device = device;
     this.atlas = atlas;
     this.singleSegment = singleSegment;
+    this.unit = opts.multilevel?.unit ?? null;
     this.levelCount = atlas.levels.length;
     this.levelOrigins = new Int32Array(this.levelCount * 2);
     atlas.levels.forEach((lvl, l) => this.levelOrigins.set([lvl.x, lvl.y], l * 2));
@@ -309,10 +359,11 @@ export class GridPyramid {
       u_atlas: new Float32Array([atlas.width, atlas.height]),
       u_pad: this.pad,
       u_tableWidth: 1,
+      ...(this.unit ? { u_massive: 0 } : {}),
     };
     this.scatterModel = new Model(device, {
-      vs: scatterVs(singleSegment),
-      fs: SCATTER_FS,
+      vs: scatterVs(singleSegment, this.unit !== null),
+      fs: scatterFs(this.unit !== null),
       topology: "point-list",
       vertexCount: 1, // overridden per build
       uniforms: this.scatterUniforms,
@@ -340,19 +391,29 @@ export class GridPyramid {
    * Each pass is submitted, so the passes after it (and the traversal) see its results.
    */
   build(input: PyramidBuildInput): void {
-    const { posTex, width, count, segments, slotSeg } = input;
+    const { posTex, width, count, segments, slotSeg, grid } = input;
     if (!this.singleSegment && !slotSeg) throw new Error("GridPyramid: a many-segment build needs the slot → segment texture");
+    if (grid !== undefined && (!this.singleSegment || grid > (this.atlas.tiles[0]?.side ?? 0))) {
+      throw new Error("GridPyramid: a corner build (a seed level's tile) needs the flat layout and fits its tile");
+    }
+    if (input.mass && !this.unit) throw new Error("GridPyramid: a mass-weighted build needs a multilevel pyramid");
 
     // ── 1. Scatter to level 0 (ADD blend into the whole L0 atlas) ─────────
-    // L0 holds level 0 alone, so clearing the whole attachment is right here.
-    const scatterPass = beginPass(this.device, this.scatterTarget);
+    // L0 holds level 0 alone, so clearing the whole attachment is right here; a seed level's tile clears
+    // only its corner (the scissor), which is all its traversal reads.
+    const scatterPass = beginPass(
+      this.device,
+      grid === undefined ? this.scatterTarget : { ...this.scatterTarget, scissor: [0, 0, grid, grid] },
+    );
     this.scatterUniforms["u_width"] = width;
     this.scatterUniforms["u_tableWidth"] = segments.width;
-    this.scatterModel.setBindings(
-      slotSeg
-        ? { u_pos: posTex, u_segBox: segments.box, u_segInfo: segments.info, u_slotSeg: slotSeg }
-        : { u_pos: posTex, u_segBox: segments.box, u_segInfo: segments.info },
-    );
+    const bindings: Record<string, Texture> = { u_pos: posTex, u_segBox: segments.box, u_segInfo: segments.info };
+    if (slotSeg) bindings["u_slotSeg"] = slotSeg;
+    if (this.unit) {
+      this.scatterUniforms["u_massive"] = input.mass ? 1 : 0;
+      bindings["u_mass"] = input.mass ?? this.unit;
+    }
+    this.scatterModel.setBindings(bindings);
     this.scatterModel.setVertexCount(count);
     this.scatterModel.draw(scatterPass);
     scatterPass.end();
@@ -360,10 +421,13 @@ export class GridPyramid {
 
     // ── 2. Packed reduce (level ℓ → ℓ+1) ──────────────────────────────────
     // Each pass reads level ℓ from one texture and writes level ℓ+1's rectangle of the other: no
-    // clear (the other levels share the target), no blend (every output texel is written once).
+    // clear (the other levels share the target), no blend (every output texel is written once). A seed
+    // level's tile reduces only its own levels, each over its corner of the level's rectangle.
     const u = this.reduceUniforms;
-    for (const { src, dst, target, bindings } of this.reduceSteps) {
-      const pass = beginPass(this.device, target);
+    const steps = grid === undefined ? this.reduceSteps : this.reduceSteps.slice(0, Math.log2(grid));
+    for (const [l, { src, dst, target, bindings }] of steps.entries()) {
+      const side = grid === undefined ? 0 : grid >> (l + 1);
+      const pass = beginPass(this.device, grid === undefined ? target : { ...target, viewport: [dst.x, dst.y, side, side] });
       u["u_srcX"] = src.x;
       u["u_srcY"] = src.y;
       u["u_dstX"] = dst.x;

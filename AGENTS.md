@@ -385,9 +385,11 @@ per-file timeout. Every at-scale leg below now asserts. When you add a guard, ad
 | hover overlay reuse | **WebGL** | `map/hover-overlay-perf.browser.test.ts` | 1000 glyphs / 125 hover changes | ✗ **deliberately unscaled** |
 | instanced pie | **WebGL** | `webgl/__tests__/instanced-pie-perf.browser.test.ts` | 100k | `PERF_BROWSER_N` |
 | GPU layout tick (+ #349 signatures: no draw of ≥ N vertices × instances into a 1×1 viewport, via any of the five WebGL2 draw calls; zero texture / framebuffer / buffer creation per tick); hub springs (#350): hub rows in web-NotreDame's shape, scaled with N (0.52% of rows, its five > 4096 hubs, chunk count K ≥ N/30), tick ≤ 2× a hub-free twin with the same edges, and exactly one extra draw (the chunk pass, K fragments) with no per-tick allocation; tile pyramid (#354): one scatter into the L0 atlas and one reduce per coarser level, each rasterising exactly its level's rectangle of the packed Podd / Peven textures (draws are attributed by texture identity, never by size: for N in (W² − W, W²], W a power of two, the slot atlas is W × W, the size of L0) | **WebGL** | `network/gpu/__tests__/gpu-frame-budget-perf.browser.test.ts` | 30k | `PERF_BROWSER_N` (max 200k) |
-| GPU layout tick sliced into row bands (#352): 4 bands per tick bitwise equal to the unsliced tick (hub rows included), 12 scissored force draws, no allocation per band | **WebGL** | `network/gpu/__tests__/gpu-frame-budget-perf.browser.test.ts` | 30k | `PERF_BROWSER_N` (max 200k) |
-| GPU layout **streaming** through `network().layout({ backend: "gpu" })`, LOD off **and** on (#352): transport-only main thread per frame (p95 ceiling `c0 + c1·N`), encode median ≤ 2.5 ms; every streaming `readPixels` into a bound PBO; every `getBufferSubData` after a fence inserted after its copy was seen signalled; within a frame the harvest precedes every layout draw; exactly one fence per frame; no GPU object created per streamed frame (under LOD from the cut's first repaint; an instanced lane may grow, at least doubling); repaints ≥ 48 ms apart; `settled` after the final tick's harvest; ticks/s floored against the GPU-only rate. **Node drag** on the same engine (a real pointer drag of the settled layout, LOD off **and** on): the same transport bounds and GL signatures over the held and re-cool frames, no GPU object created, `setPinned` once per pointer move and held-position writes at most once per tick, each over the held set (O(held)), ticks and repaints while held | **WebGL** | `network/gpu/__tests__/_gpu-stream-harness.ts`, run as `gpu-stream-nolod-perf.browser.test.ts` and `gpu-stream-lod-perf.browser.test.ts` (one file per reduction state, each under the tier's 300 s per-file budget) | 100k | `PERF_BROWSER_N` (max 1M) |
+| GPU layout tick sliced into row bands (#352): 4 bands per tick bitwise equal to the unsliced tick (hub rows included), 12 scissored force draws, no allocation per band — on a flat **and** a `multilevel` solver (#353: every seeded run ticks the graph's level on the latter), whose graph-level ticks are also pinned bitwise equal to the flat solver's (pyramid with hub rows, and all-pairs) | **WebGL** | `network/gpu/__tests__/gpu-frame-budget-perf.browser.test.ts` | 30k | `PERF_BROWSER_N` (max 200k) |
+| GPU layout convergence stop (#376): exactly three 1×1 draws per tick — the pyramid root, the range query and the one-fragment stop latch — and the same draw list unarmed, on the tick the latch sets (armed past `MIN_SETTLE_TICKS`), and on a frozen tick after it; no allocation per tick with the stop armed or latched | **WebGL** | `network/gpu/__tests__/gpu-frame-budget-perf.browser.test.ts` | 30k | `PERF_BROWSER_N` (max 200k) |
+| GPU layout **streaming** through `network().layout({ backend: "gpu" })`, LOD off **and** on (#352): transport-only main thread per frame (p95 ceiling `c0 + c1·N`), encode median ≤ 2.5 ms; every streaming `readPixels` into a bound PBO; every `getBufferSubData` after a fence inserted after its copy was seen signalled; within a frame the harvest precedes every layout draw; exactly one fence per frame; no GPU object created per streamed frame (under LOD from the cut's first repaint; an instanced lane may grow, at least doubling); repaints ≥ 48 ms apart; `settled` after the final tick's harvest; ticks/s floored against the GPU-only rate. **Node drag** on the same engine (a real pointer drag of the settled layout, LOD off **and** on): the same transport bounds and GL signatures over the held and re-cool frames, no GPU object created, `setPinned` once per pointer move and held-position writes at most once per tick, each over the held set (O(held)), ticks and repaints while held | **WebGL** | `network/gpu/__tests__/_gpu-stream-harness.ts`, run as `gpu-stream-nolod-perf.browser.test.ts`, `gpu-stream-lod-perf.browser.test.ts` and `gpu-stream-seed-perf.browser.test.ts` (one file per reduction state and one for the seeded LOD run, each under the tier's 300 s per-file budget) | 100k | `PERF_BROWSER_N` (max 1M) |
 | GPU layout **LOD while streaming** (#377): the LOD-on leg of the row above runs at a fit view (the whole equilibrium disc), draws the LOD worker's tree (`lodSource === "worker"`), and its main-thread ms per repaint (commit + repaint) stays within 1.5× + 2 ms of the **worker backend's** repaint on the same engine, graph and view, both from a disc cold start (a multilevel seed shares the LOD tree's hierarchy, so its frontier is a fraction of a cold start's: comparing it measures the seed). LOD lanes may grow their buffers on a few repaints after the tree arrives, never outside a repaint, never on most. The ratio is a loose bound (the GPU leg runs 60 ticks, the worker's 12, so their frontiers differ): it catches an order-of-magnitude regression, not a reintroduced 5-15 ms geometry pass, and the Navigator switch's gate (spec §12.3) reads the measured ratios in #377 (0.83 at 325k, 0.74 at 1M, 1.06 at 100k on an M1 Max). **Deterministic signatures** — the regression guards: `gpu-lod-mainthread.browser.test.ts`, zero main-thread `buildLODTree` / `computeLODGeometry` / `computeLODPositions` through `lod()` after a GPU layout, the streamed repaints, a node drag with its re-cool, and pan/zoom; `gpu-lod-relay.browser.test.ts`, the final frame of a run and of a re-cool is copied, refit and painted once (no repaint or refit after `settled`, no copy repeating the previous copy's ticks) | **WebGL** | `network/gpu/__tests__/_gpu-stream-harness.ts` (run by `gpu-stream-lod-perf.browser.test.ts`) + `gpu-lod-mainthread.browser.test.ts` + `gpu-lod-relay.browser.test.ts` | 100k / 6k / 4k | `PERF_BROWSER_N` (max 1M) / ✗ counts |
+| GPU **multilevel seed** (#353) on one solver: a seed level's forces from identical positions equal the mass-weighted grid-pyramid reference (p99 ≤ 1e-4) and the CPU's exact mass-weighted forces on an all-pairs level; `setLevel` and a level's ticks create no texture, framebuffer or buffer (`beginSeed` sizes everything once) and start every slot at rest (Σ\|v\| = 0); a whole seed compiles no shader and links no program on a fresh device (the seed's programs are built with the solver); placing the levels without solves lands the nodes exactly where the plan does (prolongation, and a ragged module tree's leaf seed). Streamed, LOD off **and** on (T7: the LOD-on seeded leg is the Navigator's path — plan and tree from the relay's worker, adoption during the seed; the disc-start LOD-on leg keeps the like-for-like worker baseline): the seed's frames carry every transport bound and GL signature of the row above, the first frame harvested is the seed frame (tick 0), no seed work item creates a GPU object, `beginSeed` (the seed's one allocation, when the plan arrives, outside the frame loop) stays under a ceiling a program compile would trip, and every seed frame stays under a max transport ceiling. `gpu-stream.browser.test.ts` pins T10: no frame before the plan, pins held until the nodes are placed, a stop mid-seed deletes every fence, `iterations: 0` paints the seed once, a seed that cannot start runs cold from the disc and a seed step that throws settles (one warning each) | **WebGL** | `network/gpu/__tests__/gpu-multilevel-seed.browser.test.ts` + `_gpu-stream-harness.ts` (run by `gpu-stream-nolod-perf.browser.test.ts` and `gpu-stream-seed-perf.browser.test.ts`) + `gpu-stream.browser.test.ts` | 18k (BH level) / 1M module tree / 100k streamed | `PERF_BROWSER_N` (max 1M) on the streamed legs |
 | GPU streaming readback `AsyncPositionReadback` (#352), `RG/FLOAT` and packed `RGBA/FLOAT`: exact positions and stats, both PBOs `STREAM_READ`, one `readPixels` per PBO per copy (into the PBO), no allocation per readback, copy and harvest main-thread ceilings, a non-finite layout refused without touching positions | **WebGL** | `network/gpu/__tests__/gpu-async-readback-perf.browser.test.ts` | 1M | `PERF_BROWSER_N` (max 4M) |
 | GPU layout position readback through `GpuForceLayout.readPositions`, `RGBA/FLOAT` (a device that refuses `RG/FLOAT`) and `RG/FLOAT` (#351): exact positions, no GPU allocation and one `readPixels` per readback, one retained RGBA scratch | **WebGL** | `network/gpu/__tests__/gpu-readback-perf.browser.test.ts` | 1M | `PERF_BROWSER_N` (max 4M) |
 | React recolor vs build | **WebGL** | `react/perf.browser.test.ts` | 4096 | capped at 8192 — see below |
@@ -654,6 +656,64 @@ the worker replies (`network/gpu/lod-relay.ts`, the stream's `FrameSink`). Five 
   seconds, a drag's first reflow repaint can land 4-9 s after the drag starts (SwiftShader; on a GPU the
   stall term is about 0). A test that expects a repaint within a fixed number of drag frames flakes:
   T7's drag legs hold the node still until one lands (at most 20 s).
+
+## GPU layout multilevel seed: one solver, levels as budgeted work items, nothing read back (#353)
+
+`layout({ backend: "gpu" })` seeds multilevel like the CPU backends (`multilevel: false` gives the disc). A
+layout worker builds the plan — the CPU `multilevelSeed`'s levels, masses, aggregated weights and schedule,
+from the same coarsening as the LOD tree (`gpu/seed-plan.ts`, `answerCoarsen` in `lod-refit.ts`) — and the
+stream runs it on the one solver (`GpuForceLayout.beginSeed` / `setLevel` / `endSeed`) as work items under
+the frame budget. Four things to know:
+
+- **Programs at construction, one allocation at `beginSeed`, never in a frame.** A solver built with
+  `multilevel` compiles every seed program (the seed springs' row gather and chunk pass, the prolongation, the
+  leaf seed: `SeedPasses`) in its constructor, so a failed compile fails the construction, where the transport
+  falls back to the worker. The first version built them in the frame that started the seed: 120-128 ms of
+  compile in one rAF on an M1 Max, and a throw there killed the loop with `settled` never resolving.
+  `beginSeed` runs when the plan arrives (`GpuStream.seed`, outside the frame loop, in a try/catch that starts
+  the run cold from the disc) and creates only the seed-only textures (masses, stabilizers, parent slots, the
+  seed's own springs, a module tree's node-order leaf seed), sized to the plan's largest level and freed at
+  `endSeed`; a level is sub-uploaded into them (`writeTexels`: full rows from a view, one scratch row) and
+  prolongated with **zero velocities by MRT**, and its offsets ride in the force texture, free between levels.
+  A new per-level resource breaks `gpu-multilevel-seed.browser.test.ts`'s zero-creation spy; a program built
+  during a seed breaks its compile spy and T7's `beginSeed` ceiling.
+- **Mass-weighted levels reuse the flat programs through a uniform branch** (`u_massive`), compiled only into
+  a solver built with `multilevel`; one without it compiles exactly the flat programs, and the graph's level
+  of a multilevel solver multiplies by m = 1, which changes no bit (pinned bitwise in
+  `gpu-frame-budget-perf.browser.test.ts`). The seed's springs are their own
+  (weighted, mass-divided) program over their own CSR textures, so the graph's springs are never rewritten.
+  On the tile atlas (#354) a level is the flat segment's row pointed at the level's slots and at its own
+  path: a tile of side `chooseGrid(count)` in the atlas corner above `exactMax` (the pyramid builds and
+  reduces only that corner), else the exact loop — `SegmentTable.setRange` rewrites the whole `info` texel,
+  never just the range, or the tile flag and side are lost. A multilevel solver compiles both repulsion paths.
+- **A seed tick costs the main thread ~0.4 ms however small its level** — the render passes' fixed cost, each
+  closed by a `device.submit()` that builds a luma command encoder and a promise. Under the 2 ms encode cap
+  the seed is therefore main-thread-bound (web-NotreDame's 329 seed ticks: ~100 frames at 120 Hz), and a
+  level whose whole tick fits half the budget is one item, so the item cap `k` does not bind as well. Fewer
+  passes or submits per tick would shorten the seed; more seed ticks per level lengthen it frame for frame.
+- **The seed frame is copied in the frame that places the nodes**, before any tick of the run (the encode
+  loop stops after `endSeed`), and nothing is copied before it: the slots hold coarse levels until then. A
+  frame sample's `harvestedTicks` is taken at the harvest, before that frame's own copy moves `copyTicks`.
+
+## GPU layout stop: decided on the GPU once per tick, tagged with its schedule (#376)
+
+The CPU layouts check `converged` after every tick. The streaming GPU layout learns its mean step only from
+a readback several frames later, so a stop decided on the CPU would land a frame-timing-dependent number of
+ticks late and the final layout would change from run to run. So a one-fragment **latch** pass after each
+tick's reductions applies the CPU rule on the GPU (`network/gpu/stop-latch.ts`, `passes/stop-latch.ts`), and
+the integrate passes everything through once it has latched. `stopArmed` (mode, spacing, settle ticks) is the
+CPU half and arrives as one flag; `stepSettled` is the GPU half. Two things are easy to get wrong:
+
+- **Evaluate once per tick boundary.** The reductions run twice between two integrates when a readback copy
+  lands between ticks (it re-runs them for its stats) and the next prep runs them again. The latch runs after
+  both, but only the first may evaluate the rule: a second one compares the step with itself (`step ≤ step`)
+  and stops a layout whose step has just grown. The step itself is the same both times (velocities change
+  only at the integrate), so evaluating once keeps the stop independent of when copies happen.
+- **Tag the stop with its schedule.** The transport learns of a stop frames after the GPU latched it, and in
+  between a drag may have started a new heat schedule. Every `cool` / `hold` starts a new epoch: the latch
+  releases an older epoch's stop, the integrate freezes only for the current one (a drag that begins
+  mid-tick integrates at once), and the stream ignores a harvested stop from another epoch. Without the
+  check a stale stop ends the next re-cool at once (the stale-stop case in `gpu-stop.browser.test.ts`).
 
 ## Host sizing: backend canvases are OUT OF FLOW (#39, re-confirmed in #273)
 

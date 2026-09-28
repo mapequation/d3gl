@@ -38,11 +38,20 @@ every display frame — so the layout **converges progressively on screen** whil
 stays responsive; pan and zoom while it settles. A multilevel-seeded CPU layout
 (`worker` or `force`) cools over its `iterations` budget and **stops once it has converged**, so there
 `iterations` is a safety cap and the length of the cooling (a larger budget cools more slowly), not a
-tick count to hit. The GPU layout has no early stop yet (it runs its whole budget) and a cold start
-keeps full heat until it settles on its own, so the example gives those two a budget that shrinks as
-the graph grows. **GPU** and **Auto** get that budget whichever transport they resolve to, since that is
-known only after `layout()` returns; where they resolve to the worker, a multilevel run therefore cools
-over fewer ticks than under **Worker**. `layout({ backend: "gpu" })` (the **Backend** control) runs the solve in WebGL2 where
+tick count to hit. The GPU layout stops by the same test, decided on the GPU once per tick, so where it
+stops does not depend on the frame rate. A cold start keeps full heat until it settles on its own, which on
+a large graph can take longer than the default budget, so the example gives cold starts (**Seeding** set to
+cold, on any backend) a budget that shrinks as the graph grows. The GPU layout seeds multilevel too: a worker coarsens the graph
+(the same heavy-edge matching) while the GPU solver is built, and the GPU then lays out every coarse level
+on that one solver, coarsest first, inside the same per-frame GPU budget as the refinement. Until its first
+frame the equilibrium-sized disc stays on screen; that frame already shows the global arrangement, at the
+same scale, and a seeded GPU layout cools over its budget like the worker's. The seed is paced by animation
+frames, so that first frame comes later than a disc start's: on web-NotreDame about 0.8 s later at 120 Hz,
+and about twice that on a 60 Hz display. On web-NotreDame (325k nodes) the
+seeded GPU layout meets the CPU layouts' convergence rule by tick 149, with shorter edges than a disc start
+reaches in its whole 300-tick budget, which never meets it (**Seeding** "Cold" — `multilevel: false` —
+starts the GPU layout from the disc, with or without a module hierarchy).
+`layout({ backend: "gpu" })` (the **Backend** control) runs the solve in WebGL2 where
 the device can: float render targets, float blending (`EXT_float_blend`) and textures large enough for
 the graph. The main thread never waits for it: each frame gives the layout at most
 `min(10 ms, 0.6 × the frame interval)` of GPU time (a tick larger than that is split across frames in
@@ -727,7 +736,7 @@ frame that lands in it, however fast the pointer moves:
 | --- | --- | --- |
 | `force` (main thread) | a pinned [`ForceLayout`](#large-scale-layout-in-a-web-worker) reheats neighbours each frame | re-cools until converged (at most a short tail), then stops |
 | `worker` (off thread) | the worker **pins** the held set and reflows the rest off-thread; the main thread holds them under the cursor | the worker is **unpinned** and re-cools until converged |
-| `gpu` (on the GPU) | the GPU layout **pins** the held set (skipped by the integrate pass) and reflows the rest on-GPU; the main thread holds them under the cursor | the layout is **unpinned** and re-cools |
+| `gpu` (on the GPU) | the GPU layout **pins** the held set (skipped by the integrate pass) and reflows the rest on-GPU; the main thread holds them under the cursor | the layout is **unpinned** and re-cools until converged |
 | `auto` | as `gpu` or `worker`, whichever it resolved to | as that backend |
 | `positions` (fixed coords) | the held set simply **translates** (no simulation to reheat) | — |
 

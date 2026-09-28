@@ -28,7 +28,7 @@ const NEAREST: SamplerProps = { minFilter: "nearest", magFilter: "nearest" };
  *
  * | texture | format | channels | written |
  * |---|---|---|---|
- * | `info`  | `rgba32uint`  | start, count, tile `x \| y << 16`, `rootLevel \| flags << 8 \| side << 16` ({@link segmentInfo}) | once |
+ * | `info`  | `rgba32uint`  | start, count, tile `x \| y << 16`, `rootLevel \| flags << 8 \| side << 16` ({@link segmentInfo}) | once (per seed level, {@link setRange}) |
  * | `param` | `rgba32float` | repulsion, centering, softening, alpha0 | once |
  * | `stats` | `rgba32float` | Σx, Σy, Σ\|v\|, count | per tick, by the range query |
  * | `box`   | `rgba32float` | maxX, maxY, −minX, −minY | per tick, by the range query |
@@ -46,12 +46,19 @@ export class SegmentTable {
   readonly info: Texture;
   /** `(repulsion, centering, softening, alpha0)` per segment. */
   readonly param: Texture;
-  /** `(Σx, Σy, Σ|v|, count)` per segment — the range query's first output. */
+  /**
+   * `(Σx, Σy, Σ|v|, count)` per segment — the range query's first output. On a mass-weighted multilevel seed
+   * level (#353) it is `(Σm·x, Σm·y, Σ|v|, Σm)`: `w` is the level's total mass (the graph's node count on every
+   * level), not its slot count, so a mean step over a seed level divides `Σ|v|` by the level's slots, never by
+   * `w`. (The per-tick stop latch, #124, is to read it only on the graph's level, where `Σm` is the count.)
+   */
   readonly stats: Texture;
   /** `(maxX, maxY, −minX, −minY)` per segment — the range query's second output. */
   readonly box: Texture;
   /** MRT framebuffer `[stats, box]` the range query renders into. */
   readonly target: Framebuffer;
+  /** One `info` texel, for {@link setRange}. */
+  private readonly infoScratch = new Uint32Array(4);
 
   constructor(device: Device, rows: readonly SegmentRow[]) {
     const size = rows.length;
@@ -75,6 +82,17 @@ export class SegmentTable {
     this.stats = device.createTexture({ width, height, format: "rgba32float", mipLevels: 1, sampler: NEAREST });
     this.box = device.createTexture({ width, height, format: "rgba32float", mipLevels: 1, sampler: NEAREST });
     this.target = device.createFramebuffer({ width, height, colorAttachments: [this.stats, this.box] });
+  }
+
+  /**
+   * Move segment `s` to `range` and `tile` (its whole `info` texel, {@link segmentInfo}: a one-texel
+   * sub-upload, no allocation) — how the one solver of a multilevel seed (#353) points its single segment
+   * at each level's slots, with that level's pyramid tile or the exact loop (`null`).
+   */
+  setRange(s: number, range: SlotRange, tile: Tile | null): void {
+    if (s < 0 || s >= this.size) throw new Error(`SegmentTable.setRange: no segment ${s}`);
+    this.infoScratch.set(segmentInfo(range, tile));
+    this.info.writeData(this.infoScratch, { x: s % this.width, y: Math.floor(s / this.width), width: 1, height: 1 });
   }
 
   destroy(): void {

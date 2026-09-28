@@ -4,78 +4,77 @@ import { SLOT_TEXEL_GLSL } from "../textures.js";
 import { fullScreenModel, NO_BLEND, type PassUniforms } from "./fullscreen.js";
 
 /**
- * Prolongation gather pass (N8.2 module-aware multilevel seed).
+ * Prolongation gather pass (the multilevel seed, #180 / #353).
  *
- * Seeds a finer level's position texture from its parent level's positions in ONE GPU pass —
- * O(level size), fully parallel, NO CPU loop over the level (the hard constraint of #180). A
- * full-screen triangle covers the finer level's atlas; each fragment is one finer node (a "child"
- * at some tree slot). It reads that child's **parent slot** (a precomputed r32uint texture, one
- * texel per child), `texelFetch`es the parent's position from the coarser level's position texture,
- * and adds the child's precomputed **golden-angle offset** (an rg32float texture) so siblings that
- * share a parent separate into a phyllotaxis disc around it instead of landing coincident.
+ * Seeds a finer level's positions from the level above in ONE GPU pass — O(level size), fully parallel,
+ * no CPU loop over the level. A full-screen triangle covers the solver's slot atlas; each fragment is one
+ * slot of the finer level. It reads that slot's **parent slot** (an `r32uint` texel), fetches the parent's
+ * position from the level above, and adds the slot's precomputed **phyllotaxis offset**, so siblings that
+ * share a parent spread into a disc around it instead of landing coincident. Both levels live in the one
+ * solver's atlas (same width), so a parent slot maps to its texel with the same function.
  *
- * The parent-slot map and the offset vectors are precomputed once on the CPU (O(tree size), part of
- * the depth/slot precompute in {@link ./../gpu-multilevel-seed.js}), so the only per-level work is
- * this gather. Writes `o_pos` once per texel (no blend).
+ * It renders by MRT into the solver's write side: the position (location 0) and a **zero velocity**
+ * (location 1). After the ping-pong swap that zero is the velocity the level's first tick reads, so no slot
+ * inherits the velocity of the unrelated slot that held its index on the level above (spec §6.4). Padded
+ * texels write zeros. No blend: every texel is written once.
  */
 const FS = /* glsl */ `\
 #version 300 es
 precision highp float;
+precision highp int;
 precision highp usampler2D;
 
-uniform sampler2D  u_parent_pos;   // coarser level positions (rg32float atlas)
-uniform usampler2D u_parent_slot;  // per child → its parent's slot in the coarser atlas (r32uint)
-uniform sampler2D  u_offset;       // per child → golden-angle offset (rg32float)
-uniform int u_count;               // number of real children at this level
-uniform int u_width;               // this (child) level's atlas width
-uniform int u_parent_width;        // coarser level's atlas width
+uniform sampler2D  u_parent_pos;   // the level above's positions (the solver's read side)
+uniform usampler2D u_parent_slot;  // per slot → its parent's slot (r32uint, slot atlas)
+uniform sampler2D  u_offset;       // per slot → its offset from the parent (rg32float, slot atlas)
+uniform int u_count;               // slots of this level
+uniform int u_width;               // slot atlas width
 layout(location = 0) out vec2 o_pos;
+layout(location = 1) out vec2 o_vel;
 ${SLOT_TEXEL_GLSL}
 void main() {
   ivec2 c = ivec2(gl_FragCoord.xy);
   int id = texelSlot(c, u_width);
+  o_vel = vec2(0.0);
   if (id >= u_count) { o_pos = vec2(0.0); return; }
   uint ps = texelFetch(u_parent_slot, c, 0).r;
-  ivec2 pc = slotTexel(int(ps), u_parent_width);
-  vec2 pp = texelFetch(u_parent_pos, pc, 0).xy;
-  vec2 off = texelFetch(u_offset, c, 0).xy;
-  o_pos = pp + off;
+  vec2 pp = texelFetch(u_parent_pos, slotTexel(int(ps), u_width), 0).xy;
+  o_pos = pp + texelFetch(u_offset, c, 0).xy;
 }
 `;
 
 /** Uniforms + bindings for one prolongation gather. */
 export interface ProlongateInput {
+  /** The level above's positions. */
   parentPosTex: Texture;
+  /** Per slot: its parent's slot. */
   parentSlotTex: Texture;
+  /** Per slot: its offset from the parent. */
   offsetTex: Texture;
-  /** Real children count at this level. */
+  /** Slots of this level. */
   count: number;
-  /** This (child) level's atlas width. */
+  /** Slot atlas width (shared by every texture above). */
   width: number;
-  /** Coarser (parent) level's atlas width. */
-  parentWidth: number;
 }
 
 /**
- * GPU prolongation pass — one instance reused across every level of the multilevel seed (the model
- * is atlas-size-agnostic: it reads `gl_FragCoord` and takes width/count as uniforms). The caller
- * opens a render pass on the finer level's position FBO and calls {@link run}.
+ * GPU prolongation pass — one instance reused for every level of the multilevel seed (its model reads
+ * `gl_FragCoord` and takes the width and count as uniforms). The caller opens a render pass on the solver's
+ * MRT `[position, velocity]` write framebuffer and calls {@link run}.
  */
 export class ProlongatePass {
   private readonly model: Model;
   private readonly uniforms: PassUniforms;
 
   constructor(device: Device) {
-    this.uniforms = { u_count: 0, u_width: 1, u_parent_width: 1 };
-    // Write each texel exactly once — no blend.
+    this.uniforms = { u_count: 0, u_width: 1 };
     this.model = fullScreenModel(device, FS, this.uniforms, NO_BLEND);
   }
 
-  /** Gather child seed positions into an already-open render pass (the finer level's position FBO). */
+  /** Gather the level's seed positions (and zero velocities) into an already-open MRT render pass. */
   run(pass: RenderPass, u: ProlongateInput): void {
     this.uniforms["u_count"] = u.count;
     this.uniforms["u_width"] = u.width;
-    this.uniforms["u_parent_width"] = u.parentWidth;
     this.model.setBindings({
       u_parent_pos: u.parentPosTex,
       u_parent_slot: u.parentSlotTex,

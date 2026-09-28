@@ -47,6 +47,21 @@ import { ADDITIVE_BLEND, fullScreenModel, type PassUniforms } from "./fullscreen
 // holds node i plus others, i's own term is a small softened self-force in the aggregate — the same
 // approximation the CPU quadtree makes for a leaf bucket with coincident bodies.
 //
+// On a mass-weighted multilevel seed level (#353) that self term is NOT negligible when masses are
+// uneven. For node i sharing its finest cell with one node j (Δ = p_j − p_i), the lump gives
+// |F_i| = rep·(m_i + m_j)² / ((2·m_i + m_j)·|Δ|) against the exact rep·m_j / |Δ|: 4/3 for unit masses
+// (the flat case above), ≈ m_i / (2·m_j) for a heavy supernode next to a light one (≈ 51× at 100 : 1).
+// The light node's force stays within 1 + m_j² / (m_i·(m_i + 2·m_j)) of exact. Only seed levels above
+// exactMax traverse a tile, and the seed's quality holds against the CPU seed (gpu-multilevel-seed
+// tests); the tail is bounded there, and excluding the node's own mass from its own cell on massive
+// levels is the open follow-up. On a seed level a single supernode of mass > 1 also takes the moment
+// branch below; its σ² is 0 up to rounding (clamped at 0), so it gets the point kernel's force to
+// within that rounding.
+//
+// A seed level's masses (#353) enter the tile path through the pyramid (its scatter is mass-weighted)
+// and the exact loop as node j's mass, m_j / (d² + ε): a uniform branch compiled only into a
+// `multilevel` program, which the graph's own level skips (m = 1 changes no bit).
+//
 // The box used for cell geometry MUST match the padded box the scatter used, so the shader recomputes
 // the padded AABB from the segment's box with the same PAD.
 //
@@ -74,6 +89,11 @@ export interface RepulsionVariant {
   levelCount: number;
   /** Some non-empty segment has no tile: compile the exact loop. */
   exact: boolean;
+  /**
+   * Compile the exact loop's mass fetch for a multilevel seed's mass-weighted levels (#353), as a uniform
+   * branch the graph's own level skips.
+   */
+  multilevel?: boolean;
 }
 
 /** The fragment shader of a {@link RepulsionVariant}. */
@@ -83,7 +103,8 @@ export function repulsionFs(variant: RepulsionVariant): string {
   const defines =
     segmentDefines(variant.singleSegment) +
     (tiles ? `#define TILES\n#define LEVELS ${variant.levelCount}\n#define STACK_MAX ${4 * (variant.levelCount + 1)}\n` : "") +
-    (variant.exact ? "#define EXACT\n" : "");
+    (variant.exact ? "#define EXACT\n" : "") +
+    (variant.multilevel ? "#define MULTILEVEL\n" : "");
   return /* glsl */ `\
 #version 300 es
 ${defines}
@@ -105,6 +126,10 @@ uniform highp sampler2D u_Peven;     // levels 2, 4, …
 uniform ivec2 u_levelOrigin[LEVELS]; // each level's origin in its texture
 uniform float u_pad;                 // box padding factor (must match scatter)
 uniform float u_theta2;              // θ²
+#endif
+#if defined(EXACT) && defined(MULTILEVEL)
+uniform int u_massive;               // a mass-weighted seed level (#353): node j repels by its mass
+uniform highp sampler2D u_mass;      // per-slot mass (slot atlas), sampled only when u_massive
 #endif
 layout(location = 0) out vec2 o_force;
 ${SLOT_TEXEL_GLSL}
@@ -222,10 +247,16 @@ vec2 exactRepulsion(int id, vec2 pi, uvec4 info, float repulsion, float eps) {
   for (int j = start; j < end; j++) {
 #endif
     if (j == id) continue;
-    vec2 pj = texelFetch(u_pos, slotTexel(j, u_width), 0).xy;
+    ivec2 tj = slotTexel(j, u_width);
+    vec2 pj = texelFetch(u_pos, tj, 0).xy;
     vec2 d = pi - pj;
     float d2 = dot(d, d);
+#ifdef MULTILEVEL
+    float mj = u_massive != 0 ? texelFetch(u_mass, tj, 0).r : 1.0;
+    float f = repulsion * mj / (d2 + eps);
+#else
     float f = repulsion / (d2 + eps);
+#endif
     acc += f * d;
   }
   return acc;
@@ -272,6 +303,17 @@ export interface RepulsionInput {
   pyramid: GridPyramid | null;
   /** Segment id per slot — required when the variant has more than one segment. */
   slotSeg: Texture | null;
+  /** A mass-weighted seed level's per-slot masses (#353), or null. Only on a `multilevel` pass. */
+  mass?: Texture | null;
+}
+
+/** Options of a {@link RepulsionPass}. */
+export interface RepulsionOptions {
+  /**
+   * Compile the exact loop's mass fetch for seed levels (#353, {@link RepulsionVariant.multilevel}); `unit`
+   * is bound in place of the masses when a draw has none (never sampled then).
+   */
+  multilevel?: { unit: Texture };
 }
 
 /**
@@ -284,9 +326,13 @@ export class RepulsionPass {
   private readonly model: Model;
   private readonly uniforms: PassUniforms;
   private readonly variant: RepulsionVariant;
+  /** The stand-in bound as `u_mass` on a draw without masses (a multilevel exact loop only). */
+  private readonly unit: Texture | null;
 
-  constructor(device: Device, variant: RepulsionVariant) {
+  constructor(device: Device, variant: RepulsionVariant, opts: RepulsionOptions = {}) {
+    if (variant.multilevel && !opts.multilevel) throw new Error("RepulsionPass: a multilevel variant needs its unit-mass stand-in");
     this.variant = variant;
+    this.unit = variant.multilevel && variant.exact ? (opts.multilevel?.unit ?? null) : null;
     this.uniforms = {
       u_count: 0,
       u_width: 1,
@@ -294,6 +340,7 @@ export class RepulsionPass {
       u_theta2: 0,
       u_tableWidth: 1,
       u_levelOrigin: new Int32Array(Math.max(1, variant.levelCount) * 2),
+      ...(this.unit ? { u_massive: 0 } : {}),
     };
     // Additive blend: accumulate alongside attraction + centering.
     this.model = fullScreenModel(device, repulsionFs(variant), this.uniforms, ADDITIVE_BLEND);
@@ -326,6 +373,10 @@ export class RepulsionPass {
     if (!this.variant.singleSegment) {
       if (!input.slotSeg) throw new Error("RepulsionPass: a many-segment variant needs the slot → segment texture");
       bindings["u_slotSeg"] = input.slotSeg;
+    }
+    if (this.unit) {
+      u["u_massive"] = input.mass ? 1 : 0;
+      bindings["u_mass"] = input.mass ?? this.unit;
     }
     this.model.setBindings(bindings);
     this.model.draw(pass);
