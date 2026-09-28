@@ -22,12 +22,14 @@ import { buildGraph, type NetworkGraph } from "../graph.js";
  *
  * Signature asserted deterministically (contention-immune):
  *   1. one Barnes-Hut build per frame, over all N bodies, with NO mass array (the unit-body path);
- *   2. N repulsion traversals per frame (one per node) — not a second pass;
+ *   2. N repulsion traversals per frame (one per node) — not a second pass — all from ONE
+ *      `applyForces` walk, which visits the nodes in the tree's Z order (an id-order loop over
+ *      `applyForce` does the same work at ~1.25× the time: consecutive traversals no longer share cells);
  *   3. the held node stays exactly under the cursor while the rest moves (the drag's contract).
  * Wall-clock (generous, catches an order-of-magnitude drop): the median drag frame at N, and the
- * frame's time over its own Barnes-Hut work (build + N traversals on the same positions, interleaved)
- * — the springs, centering, integration and step sum are O(N + E) and within that ratio's noise; a
- * second pass of Barnes-Hut scale would double it.
+ * frame's time over its own Barnes-Hut work (build + the same Z-order walk on the same positions,
+ * interleaved) — the springs, centering, integration and step sum are O(N + E) and within that
+ * ratio's noise; a second pass of Barnes-Hut scale would double it.
  *
  * N is 100k in the normal suite; the at-scale leg reads BENCH_FORCE_DRAG / BENCH_FORCE_DRAG_NODES
  * (the CI perf tier sets it to $PERF_N) and asserts its ceilings under PERF_ASSERT:
@@ -38,12 +40,12 @@ import { buildGraph, type NetworkGraph } from "../graph.js";
 const BENCH = !!process.env.BENCH_FORCE_DRAG;
 const BENCH_N = Number(process.env.BENCH_FORCE_DRAG_NODES) || 1_000_000;
 const ASSERT = !!process.env.PERF_ASSERT;
-// Calibration on an M-series laptop under heavy shared load (load avg ~7-8): 100k nodes / 200k edges,
-// median drag frame ~170 ms; 500k ~1.3 s. The frame measured 0.85-0.95× its own Barnes-Hut work
-// (the tick's tight loop beats the standalone one) — the springs, centering, integration and step sum
-// hide in that noise. Ceilings: ~4× the frame; the ratio at 1.5 catches any added pass of
-// Barnes-Hut scale (which would put it near 2) with room for contention.
-const FRAME_MS_100K = Number(process.env.PERF_FORCE_DRAG_FRAME_MS) || 750;
+// Calibration on an M1 Max under shared load (load avg 6-12), with the preorder Barnes-Hut tree (#348):
+// 100k nodes / 200k edges, median drag frame ~75 ms; 500k ~410 ms. The frame measured ~1.0× its own
+// Barnes-Hut work (build + Z-order walk) — the springs, centering, integration and step sum hide in
+// that noise. Ceilings: ~4× the frame; the ratio at 1.5 catches any added pass of Barnes-Hut scale
+// (which would put it near 2) with room for contention.
+const FRAME_MS_100K = Number(process.env.PERF_FORCE_DRAG_FRAME_MS) || 300;
 /** The N-independent share of the ceiling (GC and scheduler jitter): the tick itself has no constant term. */
 const FRAME_MS_CONST = 50;
 /**
@@ -94,6 +96,7 @@ interface DragRun {
   buildBodies: number;
   buildMassArgs: number;
   traversals: number;
+  walks: number;
   heldExact: boolean;
   othersMoved: boolean;
 }
@@ -112,19 +115,22 @@ function runDrag(n: number): DragRun {
   const before = g.positions.slice();
   const build = vi.spyOn(BarnesHutTree.prototype, "build");
   const apply = vi.spyOn(BarnesHutTree.prototype, "applyForce");
+  const walk = vi.spyOn(BarnesHutTree.prototype, "applyForces");
   dragFrame(sim, g, held, x0 + 10, y0 + 5);
   const builds = build.mock.calls.length;
   const buildBodies = build.mock.calls[0]?.[1] ?? -1;
   const buildMassArgs = build.mock.calls.filter((call) => call[2] !== undefined).length;
   const traversals = apply.mock.calls.length;
+  const walks = walk.mock.calls.length;
   build.mockRestore();
   apply.mockRestore();
+  walk.mockRestore();
   const heldExact = g.positions[0] === Math.fround(x0 + 10) && g.positions[1] === Math.fround(y0 + 5);
   let othersMoved = false;
   for (let i = 2; i < g.positions.length && !othersMoved; i++) othersMoved = g.positions[i] !== before[i];
 
-  // Timed frames, interleaved with the frame's own Barnes-Hut work on the same positions (build + one
-  // traversal per node) so machine contention hits both sides of the overhead ratio alike.
+  // Timed frames, interleaved with the frame's own Barnes-Hut work on the same positions (build + the
+  // Z-order walk, one traversal per node) so machine contention hits both sides of the ratio alike.
   const tree = new BarnesHutTree();
   const fx = new Float32Array(n);
   const fy = new Float32Array(n);
@@ -133,13 +139,13 @@ function runDrag(n: number): DragRun {
   for (let f = 0; f < FRAMES; f++) {
     let t0 = performance.now();
     tree.build(g.positions, n);
-    for (let i = 0; i < n; i++) tree.applyForce(i, DEFAULT_FORCE.repulsion, DEFAULT_FORCE.theta, fx, fy);
+    tree.applyForces(DEFAULT_FORCE.repulsion, DEFAULT_FORCE.theta, fx, fy);
     bh.push(performance.now() - t0);
     t0 = performance.now();
     dragFrame(sim, g, held, x0 + 11 + f, y0 + 5);
     frames.push(performance.now() - t0);
   }
-  return { frameMs: median(frames), bhMs: median(bh), builds, buildBodies, buildMassArgs, traversals, heldExact, othersMoved };
+  return { frameMs: median(frames), bhMs: median(bh), builds, buildBodies, buildMassArgs, traversals, walks, heldExact, othersMoved };
 }
 
 function expectSignature(r: DragRun, n: number): void {
@@ -147,6 +153,7 @@ function expectSignature(r: DragRun, n: number): void {
   expect(r.buildBodies, "the build spans every node").toBe(n);
   expect(r.buildMassArgs, "the finest tick takes the unit-mass path (no mass array)").toBe(0);
   expect(r.traversals, "one repulsion traversal per node per frame").toBe(n);
+  expect(r.walks, "the traversals come from one walk in the tree's Z order").toBe(1);
   expect(r.heldExact, "the held node stays exactly under the cursor").toBe(true);
   expect(r.othersMoved, "the rest of the layout reflows").toBe(true);
 }
