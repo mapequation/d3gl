@@ -3,7 +3,8 @@ import type { Model } from "@luma.gl/engine";
 import type { GridPyramid } from "./grid-pyramid.js";
 import { SLOT_TEXEL_GLSL } from "../textures.js";
 import { SEGMENT_OF_GLSL, segmentDefines, type SegmentTable } from "../segment-table.js";
-import { ADDITIVE_BLEND, fullScreenModel, type PassUniforms } from "./fullscreen.js";
+import { ADDITIVE_BLEND, fullScreenProgram, layoutModel, type PassUniforms } from "./fullscreen.js";
+import type { LayoutProgram } from "../programs.js";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Repulsion — per segment, by the tile-root Barnes-Hut traversal or the exact loop (spec §6.2).
@@ -332,6 +333,11 @@ export interface RepulsionOptions {
   multilevel?: { unit: Texture };
 }
 
+/** The repulsion pass's program for `variant` (#385). */
+export function repulsionProgram(variant: RepulsionVariant): LayoutProgram {
+  return fullScreenProgram(repulsionFs(variant));
+}
+
 /**
  * GPU repulsion pass: a full-screen triangle over the slot atlas whose fragments add each slot's
  * repulsion from its own segment into the force texture (additive blend, like the other force
@@ -359,7 +365,7 @@ export class RepulsionPass {
       ...(this.unit ? { u_massive: 0 } : {}),
     };
     // Additive blend: accumulate alongside attraction + centering.
-    this.model = fullScreenModel(device, repulsionFs(variant), this.uniforms, ADDITIVE_BLEND);
+    this.model = layoutModel(device, repulsionProgram(variant), this.uniforms, ADDITIVE_BLEND);
   }
 
   /** Draw one repulsion step into an already-open force-accumulation render pass. */

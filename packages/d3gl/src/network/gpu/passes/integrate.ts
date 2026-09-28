@@ -1,7 +1,8 @@
 import type { Device, Texture, RenderPass } from "@luma.gl/core";
 import type { Model } from "@luma.gl/engine";
 import { SLOT_TEXEL_GLSL } from "../textures.js";
-import { fullScreenModel, NO_BLEND, type PassUniforms } from "./fullscreen.js";
+import { fullScreenProgram, layoutModel, NO_BLEND, type PassUniforms } from "./fullscreen.js";
+import type { LayoutProgram } from "../programs.js";
 import { STOP_LATCH_GLSL } from "./stop-latch.js";
 
 /**
@@ -91,6 +92,11 @@ export interface IntegrateUniforms {
   epoch: number;
 }
 
+/** The integrate pass's program (#385). */
+export function integrateProgram(): LayoutProgram {
+  return fullScreenProgram(FS);
+}
+
 /**
  * GPU integrate pass. Holds the full-screen triangle model; the caller is
  * responsible for creating the MRT framebuffer and swapping ping-pongs.
@@ -115,7 +121,7 @@ export class IntegratePass {
     };
 
     // Each output texel is written exactly once (MRT pos + vel), so no blend.
-    this.model = fullScreenModel(device, FS, this.uniforms, NO_BLEND);
+    this.model = layoutModel(device, integrateProgram(), this.uniforms, NO_BLEND);
   }
 
   /** Draw one integrate step into an already-open render pass. */

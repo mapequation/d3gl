@@ -3,14 +3,15 @@ import type { LayoutGraph } from "../force.js";
 import { NESTED, WARM_ALPHA, nestedAlphaDecay } from "../nested-layout.js";
 import { atlasWidth, pingPong, type PingPong } from "./textures.js";
 import { beginPass, type PassUniforms } from "./passes/fullscreen.js";
-import { SegmentedReduce, type RangeTarget, type ReduceMap } from "./passes/segmented-reduce.js";
-import { GridPyramid } from "./passes/grid-pyramid.js";
-import { RepulsionPass } from "./passes/repulsion.js";
-import { NestedIntegratePass, NestedPredictPass, type NestedSlotInputs } from "./passes/nested.js";
-import { COLLISION_STEPS, CollisionGrid, collisionGridSide, type CollisionInputs } from "./passes/collision.js";
+import { SegmentedReduce, segmentedReducePrograms, type RangeTarget, type ReduceMap } from "./passes/segmented-reduce.js";
+import { GridPyramid, gridPyramidPrograms } from "./passes/grid-pyramid.js";
+import { RepulsionPass, repulsionProgram, type RepulsionVariant } from "./passes/repulsion.js";
+import { NestedIntegratePass, NestedPredictPass, nestedIntegrateProgram, nestedPredictProgram, type NestedSlotInputs } from "./passes/nested.js";
+import { COLLISION_STEPS, CollisionGrid, collisionGridProgramList, collisionGridSide, type CollisionInputs } from "./passes/collision.js";
 import { COLLISION_LIST_MAX } from "./collision-plan.js";
-import { NestedComposePass } from "./passes/nested-compose.js";
-import { GpuSprings } from "./springs.js";
+import { NestedComposePass, nestedComposeProgram } from "./passes/nested-compose.js";
+import { GpuSprings, springPrograms, springVariant } from "./springs.js";
+import type { LayoutProgram } from "./programs.js";
 import type { NestedSpringInputs } from "./passes/attraction.js";
 import { SegmentTable, type SegmentRow } from "./segment-table.js";
 import { TILE_MIN_SIDE, assertAtlasFits, packTiles, segmentSoftening, slotSegments, type SlotRange, type TileAtlas } from "./segments.js";
@@ -161,6 +162,11 @@ export interface NestedLayoutPlan {
   readonly collide: { readonly width: number; readonly height: number };
 }
 
+/** The nested layout's repulsion variant: many segments, the exact loop and the tiles of `atlas`. */
+function nestedRepulsion(atlas: TileAtlas): RepulsionVariant {
+  return { singleSegment: false, levelCount: atlas.levels.length, exact: true };
+}
+
 /** The {@link NestedLayoutPlan} of `topo`. O(S log S) over S segments. */
 export function nestedLayoutPlan(topo: NestedSolverTopology): NestedLayoutPlan {
   const segments: SlotRange[] = [];
@@ -304,6 +310,39 @@ export class GpuNestedLayout implements StreamSolver {
     return (NESTED_READBACK_NS * this.topo.leafCount) / 1e6;
   }
 
+  /**
+   * Every program a nested layout of `plan` with `options` compiles, as its passes declare them (#385) — so a
+   * transport can compile them all at once, in parallel, before it builds the layout. Pure, no GPU work. The
+   * springs' variant (hub rows or not) needs the links' row lengths, counted here over the plan's links:
+   * O(slots + links), one slot-sized count array (the constructor's CSR build counts them again).
+   */
+  static programs(plan: NestedLayoutPlan, options: GpuNestedLayoutOptions = {}): LayoutProgram[] {
+    const { topo, atlas } = plan;
+    const reduce = segmentedReducePrograms(NESTED_REDUCE_MAP);
+    // Each link adds to both endpoints' rows, as buildCSR counts them for the springs' CSR.
+    const degree = new Uint32Array(topo.slotCount);
+    for (let e = 0; e < topo.linkSource.length; e++) {
+      const i = topo.linkSource[e] ?? 0;
+      const j = topo.linkTarget[e] ?? 0;
+      degree[i] = (degree[i] ?? 0) + 1;
+      degree[j] = (degree[j] ?? 0) + 1;
+    }
+    const programs = [reduce.level1, reduce.level, reduce.query];
+    if (atlas.levels.length > 0) {
+      const pyramid = gridPyramidPrograms(false, false);
+      programs.push(pyramid.scatter, pyramid.reduce);
+    }
+    programs.push(
+      repulsionProgram(nestedRepulsion(atlas)),
+      ...springPrograms(springVariant({ springWeight: topo.linkWeight }, degree, true)),
+      nestedPredictProgram(),
+      nestedIntegrateProgram(),
+      ...collisionGridProgramList(topo.collision, { stats: options.collisionStats === true }),
+      nestedComposeProgram(topo.depth),
+    );
+    return programs;
+  }
+
   constructor(device: Device, plan: NestedLayoutPlan, options: GpuNestedLayoutOptions = {}) {
     const topo = plan.topo;
     this.device = device;
@@ -436,7 +475,7 @@ export class GpuNestedLayout implements StreamSolver {
       ];
       this.reduceUniforms["u_segTableWidth"] = tw;
       this.pyramid = atlas.levels.length > 0 ? own(new GridPyramid(device, atlas, false)) : null;
-      this.repulsion = own(new RepulsionPass(device, { singleSegment: false, levelCount: atlas.levels.length, exact: true }));
+      this.repulsion = own(new RepulsionPass(device, nestedRepulsion(atlas)));
 
       const links: LayoutGraph = {
         nodeCount: slots,

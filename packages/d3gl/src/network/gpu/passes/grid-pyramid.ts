@@ -1,9 +1,10 @@
 import type { Device, Texture, Framebuffer } from "@luma.gl/core";
-import { Model } from "@luma.gl/engine";
+import type { Model } from "@luma.gl/engine";
 import { SLOT_TEXEL_GLSL } from "../textures.js";
 import { FLAT_TILE_MIN_SIDE, tileSide, type PyramidLevel, type PyramidTexture, type TileAtlas } from "../segments.js";
 import { SEGMENT_OF_GLSL, segmentDefines, type SegmentTable } from "../segment-table.js";
-import { ADDITIVE_BLEND, beginPass, fullScreenModel, NO_BLEND, type PassTarget, type PassUniforms } from "./fullscreen.js";
+import { ADDITIVE_BLEND, beginPass, fullScreenProgram, layoutModel, NO_BLEND, type PassTarget, type PassUniforms } from "./fullscreen.js";
+import type { LayoutProgram } from "../programs.js";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // GPU tile-atlas grid pyramid — one regular quadtree per segment (spec §6.2).
@@ -267,6 +268,14 @@ export interface GridPyramidOptions {
   multilevel?: { unit: Texture };
 }
 
+/** The pyramid's scatter and reduce programs; `multilevel` compiles the mass-weighted scatter (#353, #385). */
+export function gridPyramidPrograms(singleSegment: boolean, multilevel: boolean): { scatter: LayoutProgram; reduce: LayoutProgram } {
+  return {
+    scatter: { vs: scatterVs(singleSegment, multilevel), fs: scatterFs(multilevel) },
+    reduce: fullScreenProgram(REDUCE_FS),
+  };
+}
+
 /**
  * GPU tile-atlas grid pyramid — builds and holds one regular-quadtree COM/mass pyramid per tiled
  * segment, packed into the three textures `L0` / `Podd` / `Peven`. Owns the textures, their FBOs and
@@ -361,18 +370,13 @@ export class GridPyramid {
       u_tableWidth: 1,
       ...(this.unit ? { u_massive: 0 } : {}),
     };
-    this.scatterModel = new Model(device, {
-      vs: scatterVs(singleSegment, this.unit !== null),
-      fs: scatterFs(this.unit !== null),
-      topology: "point-list",
-      vertexCount: 1, // overridden per build
-      uniforms: this.scatterUniforms,
-      parameters: ADDITIVE_BLEND,
-    });
+    const programs = gridPyramidPrograms(singleSegment, this.unit !== null);
+    // One point per slot: vertexCount is overridden per build.
+    this.scatterModel = layoutModel(device, programs.scatter, this.scatterUniforms, ADDITIVE_BLEND, { topology: "point-list", vertexCount: 1 });
 
     // No blend: each reduce output texel is written exactly once.
     this.reduceUniforms = { u_srcX: 0, u_srcY: 0, u_dstX: 0, u_dstY: 0 };
-    this.reduceModel = fullScreenModel(device, REDUCE_FS, this.reduceUniforms, NO_BLEND);
+    this.reduceModel = layoutModel(device, programs.reduce, this.reduceUniforms, NO_BLEND);
   }
 
   /** Where level `ℓ` is packed (0 = the level-0 atlas). */

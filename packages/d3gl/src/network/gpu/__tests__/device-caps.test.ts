@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { NESTED_MAX_SLOTS, gpuLayoutNeed, gpuLayoutSupport, gpuNestedSlotNeed, type GpuCaps, type GpuLayoutNeed } from "../device-caps.js";
+import { NESTED_MAX_SLOTS, gpuLayoutNeed, gpuLayoutSupport, gpuNestedSlotNeed, type GpuCaps, type GpuLayoutNeed, type StaticGpuCaps } from "../device-caps.js";
 
 /**
  * The GPU layout's capability matrix (#351): a pure decision over a typed {@link GpuCaps} record, so
@@ -208,5 +208,27 @@ describe("gpuNestedSlotNeed: the nested check before the prep (#355, #375)", () 
     // ⌈√1166⌉ = 35 fits; the flat pyramid's next power of two ≥ √1166 is 64.
     expect(gpuLayoutSupport(caps, gpuLayoutNeed(1_166, 0))).toEqual({ ok: false, reason: "the graph needs a 64-texel grid pyramid texture, past the device's 60-texel limit" });
     expect(gpuLayoutSupport(caps, gpuNestedSlotNeed(1_166))).toEqual({ ok: true });
+  });
+});
+
+describe("gpuLayoutSupport on static caps (#385: checked before the programs compile)", () => {
+  const STATIC: StaticGpuCaps = { type: "webgl", floatRenderable: true, floatBlend: true, maxTextureDimension2D: 16384 };
+
+  it("passes a device on its features and limits alone: the probe decides later", () => {
+    expect(gpuLayoutSupport(STATIC, NOTRE_DAME)).toEqual({ ok: true });
+  });
+
+  it("fails on the same features and limits the full record fails on, with the same reasons", () => {
+    const variants: StaticGpuCaps[] = [
+      { ...STATIC, type: "webgpu" },
+      { ...STATIC, floatRenderable: false },
+      { ...STATIC, floatBlend: false },
+      { ...STATIC, maxTextureDimension2D: 1024 },
+    ];
+    for (const caps of variants) {
+      const full = gpuLayoutSupport({ ...caps, readRG: true, blendProbe: "pass" }, NOTRE_DAME);
+      expect(full.ok).toBe(false);
+      expect(gpuLayoutSupport(caps, NOTRE_DAME)).toEqual(full);
+    }
   });
 });

@@ -1,5 +1,6 @@
-import type { Device, Framebuffer, RenderPass, RenderPipelineParameters } from "@luma.gl/core";
+import type { Device, Framebuffer, PrimitiveTopology, RenderPass, RenderPipelineParameters } from "@luma.gl/core";
 import { Model } from "@luma.gl/engine";
+import { noteProgramBuilt, type LayoutProgram } from "../programs.js";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Shared setup for the GPU layout's compute-in-raster passes.
@@ -53,21 +54,41 @@ export const NO_BLEND: RenderPipelineParameters = { blend: false };
  */
 export type PassUniforms = Record<string, number | Float32Array | Int32Array>;
 
-/** A full-screen-triangle {@link Model} for fragment shader `fs` (no vertex buffer, 3 vertices). */
-export function fullScreenModel(
+/** The full-screen-triangle program of fragment shader `fs` (#385: what a pass declares, and the warm-up links). */
+export function fullScreenProgram(fs: string): LayoutProgram {
+  return { vs: FULLSCREEN_VS, fs };
+}
+
+/** How a layout model draws: a full-screen triangle (the default), or `vertexCount` points (a scatter). */
+export interface LayoutDraw {
+  readonly topology: PrimitiveTopology;
+  readonly vertexCount: number;
+}
+
+const FULL_SCREEN_DRAW: LayoutDraw = { topology: "triangle-list", vertexCount: 3 };
+
+/**
+ * The {@link Model} of a layout pass's `program` (no vertex buffer; a full-screen triangle unless `draw` says
+ * otherwise). Every layout model is built here — the only way a layout pass builds one — so the device records
+ * the program as built (#385): a later layout on it finds the program in luma's cache and warms nothing.
+ */
+export function layoutModel(
   device: Device,
-  fs: string,
+  program: LayoutProgram,
   uniforms: PassUniforms,
   parameters: RenderPipelineParameters,
+  draw: LayoutDraw = FULL_SCREEN_DRAW,
 ): Model {
-  return new Model(device, {
-    vs: FULLSCREEN_VS,
-    fs,
-    topology: "triangle-list",
-    vertexCount: 3,
+  const model = new Model(device, {
+    vs: program.vs,
+    fs: program.fs,
+    topology: draw.topology,
+    vertexCount: draw.vertexCount,
     uniforms,
     parameters,
   });
+  noteProgramBuilt(device, program);
+  return model;
 }
 
 /** An RGBA clear colour. */

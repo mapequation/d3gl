@@ -35,7 +35,8 @@
 import type { Device, Framebuffer, Texture } from "@luma.gl/core";
 import { WebGLDevice, WEBGLFramebuffer } from "@luma.gl/webgl";
 import { deviceReadsRG } from "./device-probe.js";
-import { PackPositionsPass, PackStatsPass, STATS_TEXELS } from "./passes/readback-pack.js";
+import { PackPositionsPass, PackStatsPass, STATS_TEXELS, packPositionsProgram, packStatsProgram } from "./passes/readback-pack.js";
+import type { LayoutProgram } from "./programs.js";
 
 /**
  * Floats of stats a harvest returns: `stats` (Σx, Σy, Σ|v|, count), then `box` (maxX, maxY, −minX, −minY),
@@ -210,6 +211,15 @@ export class AsyncPositionReadback {
       : pack
         ? pack.width * pack.height * 16
         : source.positionWidth * source.atlasRows * 8;
+  }
+
+  /**
+   * The programs a readback on `device` compiles (#385): the stats staging pass, and the position pack pass for a
+   * source that is not `packed` (a solver that packs its own positions, as the nested one does, needs none) where
+   * the device does not read `RG/FLOAT` (the cached read-format probe, which compiles nothing).
+   */
+  static programs(device: Device, packed: boolean): LayoutProgram[] {
+    return packed || deviceReadsRG(device) ? [packStatsProgram()] : [packPositionsProgram(), packStatsProgram()];
   }
 
   /** Whether a copy has been issued and not yet harvested (the PBOs are busy). */

@@ -3,13 +3,14 @@ import type { ForceParams, LayoutGraph } from "../force.js";
 import { CONVERGED_STEP, Cooling, DAMPING, equilibriumSpacing, springStabilizers, stepCap, stopArmed } from "../force.js";
 import { atlasWidth, pingPong } from "./textures.js";
 import { PositionReadback } from "./position-readback.js";
-import { IntegratePass } from "./passes/integrate.js";
-import { GpuSprings } from "./springs.js";
-import { RepulsionPass } from "./passes/repulsion.js";
-import { GridPyramid } from "./passes/grid-pyramid.js";
-import { CenteringPass } from "./passes/centering.js";
+import { IntegratePass, integrateProgram } from "./passes/integrate.js";
+import { GpuSprings, springPrograms, springVariant, type SpringGraph } from "./springs.js";
+import { RepulsionPass, repulsionProgram, type RepulsionVariant } from "./passes/repulsion.js";
+import { GridPyramid, gridPyramidPrograms } from "./passes/grid-pyramid.js";
+import { CenteringPass, centeringProgram } from "./passes/centering.js";
 import { beginPass, type PassViewport } from "./passes/fullscreen.js";
-import { FLAT_REDUCE_MAP, MULTILEVEL_REDUCE_MAP, SegmentedReduce } from "./passes/segmented-reduce.js";
+import { FLAT_REDUCE_MAP, MULTILEVEL_REDUCE_MAP, SegmentedReduce, segmentedReducePrograms } from "./passes/segmented-reduce.js";
+import type { LayoutProgram } from "./programs.js";
 import type { PassUniforms } from "./passes/fullscreen.js";
 import { SegmentTable, type SegmentRow } from "./segment-table.js";
 import {
@@ -27,10 +28,11 @@ import {
   type SegmentFrame,
   type SlotRange,
   type Tile,
+  type TileAtlas,
 } from "./segments.js";
 import { SeedLevels, SeedPasses } from "./seed-levels.js";
 import type { SeedPlan } from "./seed-plan.js";
-import { StopLatchPass } from "./passes/stop-latch.js";
+import { StopLatchPass, stopLatchProgram } from "./passes/stop-latch.js";
 
 // DAMPING is imported from force.ts so both integrators share one constant.
 
@@ -90,6 +92,59 @@ export interface GpuForceLayoutOptions {
 interface ReduceMassInputs {
   readonly bindings: Readonly<Record<string, Texture>>;
   readonly uniforms: PassUniforms;
+}
+
+/** The segments of a solver, the largest one the exact loop solves, and the tile atlas of the rest. */
+interface SolverShape {
+  readonly segments: readonly SlotRange[];
+  readonly singleSegment: boolean;
+  readonly exactMax: number;
+  readonly atlas: TileAtlas;
+}
+
+/**
+ * The shape a solver of `nodeCount` nodes takes under `options` — validated, and shared by the constructor
+ * and {@link GpuForceLayout.programs}, so both see the same repulsion paths. Allocates no GPU resource.
+ */
+function solverShape(nodeCount: number, options: GpuForceLayoutOptions): SolverShape {
+  // Segments (flat: one) and the repulsion path of each: segments above exactMax get a pyramid tile.
+  const segments = options.segments ?? flatSegments(nodeCount);
+  validateSegments(segments, nodeCount);
+  const singleSegment = segments.length === 1;
+  // A multilevel seed (#353) runs on the flat layout's one segment, in the world frame.
+  if (options.multilevel && (!singleSegment || (options.frame ?? "world") !== "world")) {
+    throw new Error("GpuForceLayout: a multilevel seed runs on the flat layout (one segment, the world frame)");
+  }
+  const exactMax =
+    options.repulsionMode === "pyramid"
+      ? 0
+      : options.repulsionMode === "allpairs"
+        ? Infinity
+        : (options.exactMax ?? GPU_REPULSION_ALLPAIRS_MAX);
+  // A single segment keeps the flat grid (chooseGrid's floor of 16); many segments use tiles from 8.
+  const atlas = packTiles(segments, exactMax, singleSegment ? FLAT_TILE_MIN_SIDE : TILE_MIN_SIDE);
+  return { segments, singleSegment, exactMax, atlas };
+}
+
+/**
+ * The repulsion program a solver of `shape` compiles: for exactly the paths its segments take (the flat
+ * layout: one of the two), with the traversal stack sized by the pyramid's level count. A multilevel solver
+ * (#353) compiles both: a seed level at or below exactMax takes the exact loop (mass-weighted), a larger one
+ * its tile.
+ */
+function repulsionVariant(shape: SolverShape, multilevel: boolean): RepulsionVariant {
+  const levelCount = shape.atlas.levels.length;
+  return {
+    singleSegment: shape.singleSegment,
+    levelCount,
+    exact: levelCount === 0 || multilevel || shape.segments.some((seg, s) => (shape.atlas.tiles[s] ?? null) === null && seg.count > 0),
+    multilevel,
+  };
+}
+
+/** The reduction map of a solver: a multilevel one (#353) reduces a seed level's masses too. */
+function reduceMap(multilevel: boolean): typeof FLAT_REDUCE_MAP {
+  return multilevel ? MULTILEVEL_REDUCE_MAP : FLAT_REDUCE_MAP;
 }
 
 /**
@@ -304,27 +359,13 @@ export class GpuForceLayout {
     this.count = graph.nodeCount;
     this.params = params;
 
-    // Segments (flat: one) and the repulsion path of each: segments above exactMax get a pyramid tile.
-    const segments = options.segments ?? flatSegments(this.count);
-    validateSegments(segments, this.count);
-    const singleSegment = segments.length === 1;
-    // A multilevel seed (#353) runs on the flat layout's one segment, in the world frame.
-    if (options.multilevel && (!singleSegment || (options.frame ?? "world") !== "world")) {
-      throw new Error("GpuForceLayout: a multilevel seed runs on the flat layout (one segment, the world frame)");
-    }
+    const shape = solverShape(this.count, options);
+    const { segments, singleSegment, exactMax, atlas } = shape;
     // Many segments: the slot → segment map, and no spring may cross two segments (isolation). Checked
     // before the first GPU allocation, so a rejected layout leaks nothing.
     const slotSeg = singleSegment ? null : slotSegments(segments, this.count);
     if (slotSeg) assertSegmentLocalEdges(slotSeg, graph.source, graph.target, graph.edgeCount);
-    const exactMax =
-      options.repulsionMode === "pyramid"
-        ? 0
-        : options.repulsionMode === "allpairs"
-          ? Infinity
-          : (options.exactMax ?? GPU_REPULSION_ALLPAIRS_MAX);
     this.exactMax = exactMax;
-    // A single segment keeps the flat grid (chooseGrid's floor of 16); many segments use tiles from 8.
-    const atlas = packTiles(segments, exactMax, singleSegment ? FLAT_TILE_MIN_SIDE : TILE_MIN_SIDE);
     assertAtlasFits(atlas, device.limits.maxTextureDimension2D);
     this.flatTile = singleSegment ? (atlas.tiles[0] ?? null) : null;
 
@@ -472,7 +513,7 @@ export class GpuForceLayout {
       ? device.createTexture({ width: 1, height: 1, format: "r32float", data: new Float32Array([1]), mipLevels: 1, sampler: { minFilter: "nearest", magFilter: "nearest" } })
       : null;
     const multilevel = this.unit ? { unit: this.unit } : undefined;
-    this.reduce = new SegmentedReduce(device, this.count, this.unit ? MULTILEVEL_REDUCE_MAP : FLAT_REDUCE_MAP);
+    this.reduce = new SegmentedReduce(device, this.count, reduceMap(this.unit !== null));
     this.unitMassInputs = this.unit ? { bindings: { u_mass: this.unit }, uniforms: { u_massive: 0 } } : null;
 
     // The tile pyramid, only when some segment has a tile. Pre-created in the constructor (all its
@@ -481,19 +522,7 @@ export class GpuForceLayout {
     this.pyramid = atlas.levels.length > 0 ? new GridPyramid(device, atlas, singleSegment, multilevel ? { multilevel } : {}) : null;
 
     this.integratePass = new IntegratePass(device);
-    // Compiled for exactly the paths this layout's segments take (the flat layout: one of the two),
-    // with the traversal stack sized by the pyramid's level count. A multilevel solver (#353) compiles both:
-    // a seed level at or below exactMax takes the exact loop (mass-weighted), a larger one its tile.
-    this.repulsionPass = new RepulsionPass(
-      device,
-      {
-        singleSegment,
-        levelCount: atlas.levels.length,
-        exact: atlas.levels.length === 0 || multilevel !== undefined || rows.some((row) => row.tile === null && row.count > 0),
-        multilevel: multilevel !== undefined,
-      },
-      multilevel ? { multilevel } : {},
-    );
+    this.repulsionPass = new RepulsionPass(device, repulsionVariant(shape, multilevel !== undefined), multilevel ? { multilevel } : {});
     this.centeringPass = new CenteringPass(device, singleSegment);
     this.stop = new StopLatchPass(device);
     this.seedPasses = multilevel ? new SeedPasses(device) : null;
@@ -508,6 +537,27 @@ export class GpuForceLayout {
       attraction: params.attraction,
     };
     this.active = this.finest;
+  }
+
+  /**
+   * Every program a solver built for `graph` with `options` compiles, as its passes declare them (#385) — so a
+   * transport can compile them all at once, in parallel, before it builds the solver (`ProgramWarmup`). Pure, no
+   * GPU work: the springs' variant (hub rows or not) reads the degrees `graph` already holds (O(nodes) reads,
+   * stopping at the first hub row, no allocation), never its edges. Throws where the constructor would reject the
+   * segments.
+   */
+  static programs(graph: SpringGraph, options: GpuForceLayoutOptions = {}): LayoutProgram[] {
+    const shape = solverShape(graph.nodeCount, options);
+    const multilevel = options.multilevel === true;
+    const reduce = segmentedReducePrograms(reduceMap(multilevel));
+    const programs = [...springPrograms(springVariant(graph, graph.csr.degree)), reduce.level1, reduce.level, reduce.query];
+    if (shape.atlas.levels.length > 0) {
+      const pyramid = gridPyramidPrograms(shape.singleSegment, multilevel);
+      programs.push(pyramid.scatter, pyramid.reduce);
+    }
+    programs.push(integrateProgram(), repulsionProgram(repulsionVariant(shape, multilevel)), centeringProgram(shape.singleSegment), stopLatchProgram());
+    if (multilevel) programs.push(...SeedPasses.programs());
+    return programs;
   }
 
   /**

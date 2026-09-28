@@ -17,9 +17,11 @@
  * record is not cached, because nothing it measured says anything about the device.
  */
 import type { Device, Framebuffer, Texture } from "@luma.gl/core";
-import { Model } from "@luma.gl/engine";
+import type { Model } from "@luma.gl/engine";
 import { WebGLDevice, WEBGLFramebuffer } from "@luma.gl/webgl";
-import type { BlendProbe, GpuCaps } from "./device-caps.js";
+import type { BlendProbe, GpuCaps, StaticGpuCaps } from "./device-caps.js";
+import { ADDITIVE_BLEND, layoutModel } from "./passes/fullscreen.js";
+import type { LayoutProgram } from "./programs.js";
 
 /** GL enums for the guaranteed float readback (`EXT_color_buffer_float`). */
 const GL_RGBA = 0x1908;
@@ -51,8 +53,40 @@ out vec4 o_value;
 void main() { o_value = vec4(v_value, 0.0, 0.0); }
 `;
 
+/** The functional blend probe's program (#385: compiled with the layout's programs, before the probe runs). */
+export function blendProbeProgram(): LayoutProgram {
+  return { vs: PROBE_VS, fs: PROBE_FS };
+}
+
 const caps = new WeakMap<Device, GpuCaps>();
 const readFormats = new WeakMap<Device, boolean>();
+
+/**
+ * The GPU layout's view of `device` from its features and limits alone — no probe, no GL work — or `null`
+ * when there is none: what {@link gpuCaps} reports besides its two probes. A transport checks it before it
+ * compiles the layout's programs (#385), unless the device was probed already ({@link cachedGpuCaps}).
+ */
+export function gpuStaticCaps(device: Device | null | undefined): StaticGpuCaps | null {
+  return device ? staticCaps(device) : null;
+}
+
+/**
+ * The full record {@link gpuCaps} cached for `device`, probes included, or `null` when it has not probed the device
+ * (or cannot: no device). Runs no probe. A transport checks it before it compiles (#385), so a device whose probe
+ * failed for an earlier layout falls back at once instead of compiling the layout's programs first.
+ */
+export function cachedGpuCaps(device: Device | null | undefined): GpuCaps | null {
+  return device ? (caps.get(device) ?? null) : null;
+}
+
+function staticCaps(device: Device): StaticGpuCaps {
+  return {
+    type: device.type,
+    floatRenderable: device.features.has("float32-renderable-webgl"),
+    floatBlend: device.features.has("texture-blend-float-webgl"),
+    maxTextureDimension2D: device.limits.maxTextureDimension2D,
+  };
+}
 
 /**
  * The GPU layout's view of `device`, or `null` when there is none. Cached per device (except on a lost
@@ -63,29 +97,21 @@ export function gpuCaps(device: Device | null | undefined): GpuCaps | null {
   if (!device) return null;
   const hit = caps.get(device);
   if (hit) return hit;
-  const floatRenderable = device.features.has("float32-renderable-webgl");
-  const floatBlend = device.features.has("texture-blend-float-webgl");
+  const base = staticCaps(device);
   let readRG = false;
   let blendProbe: BlendProbe | null = null;
   // An rg32f target needs float render targets; the blend draw also needs float blending (without it the
   // draw is an INVALID_OPERATION, which the extension check already reports more clearly).
-  if (device.type === "webgl" && floatRenderable) {
+  if (device.type === "webgl" && base.floatRenderable) {
     const probed = withProbeTarget(device, (fbo) => ({
       readRG: cachedReadsRG(device, fbo),
-      blendProbe: floatBlend ? probeFloatBlend(device, fbo) : null,
+      blendProbe: base.floatBlend ? probeFloatBlend(device, fbo) : null,
     }));
     readRG = probed?.readRG ?? false;
     blendProbe = probed ? probed.blendProbe : "error";
   }
   const lost = device.isLost;
-  const result: GpuCaps = {
-    type: device.type,
-    floatRenderable,
-    floatBlend,
-    maxTextureDimension2D: device.limits.maxTextureDimension2D,
-    readRG,
-    blendProbe: lost ? "error" : blendProbe,
-  };
+  const result: GpuCaps = { ...base, readRG, blendProbe: lost ? "error" : blendProbe };
   if (!lost) caps.set(device, result);
   return result;
 }
@@ -162,21 +188,7 @@ export function readsRG(device: Device, fbo: Framebuffer): boolean {
 export function probeFloatBlend(device: Device, fbo: Framebuffer): BlendProbe {
   let model: Model | null = null;
   try {
-    model = new Model(device, {
-      vs: PROBE_VS,
-      fs: PROBE_FS,
-      topology: "point-list",
-      vertexCount: 2,
-      parameters: {
-        blend: true,
-        blendColorSrcFactor: "one",
-        blendColorDstFactor: "one",
-        blendAlphaSrcFactor: "one",
-        blendAlphaDstFactor: "one",
-        blendColorOperation: "add",
-        blendAlphaOperation: "add",
-      },
-    });
+    model = layoutModel(device, blendProbeProgram(), {}, ADDITIVE_BLEND, { topology: "point-list", vertexCount: 2 });
     const pass = device.beginRenderPass({ framebuffer: fbo, clearColor: [0, 0, 0, 0] });
     model.draw(pass);
     pass.end();

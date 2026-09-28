@@ -40,6 +40,13 @@ export interface GpuCaps {
 /** Slots the GPU nested layout can index (#355): its passes read slot ids as float32, exact below 2^24. */
 export const NESTED_MAX_SLOTS = 1 << 24;
 
+/**
+ * The part of {@link GpuCaps} read from the device's features and limits alone — no probe, no GL work
+ * (`gpuStaticCaps`). A transport checks it before it compiles the layout's programs (#385), and the whole
+ * record, probes included, before it builds the solver.
+ */
+export type StaticGpuCaps = Omit<GpuCaps, "readRG" | "blendProbe">;
+
 /** The texture sides the GPU layout allocates for one graph. */
 export interface GpuLayoutNeed {
   /** Position / velocity / force atlas: one texel per node, ⌈√N⌉ wide. */
@@ -108,9 +115,10 @@ export function gpuNestedSlotNeed(slots: number): GpuLayoutNeed {
  * device (a Canvas/SVG render backend, SSR). The checks run in the order a user can act on them; the
  * first failure names its reason, which the caller logs before it falls back to the worker. A nested
  * `need` also checks the tree against the nested layout's own limits: its slot count, its tile atlas
- * against the 16-bit tile origin, its collision table and its collision grid.
+ * against the 16-bit tile origin, its collision table and its collision grid. Static caps (no probe results,
+ * {@link StaticGpuCaps}) pass or fail on the device's features and limits alone.
  */
-export function gpuLayoutSupport(caps: GpuCaps | null, need: GpuLayoutNeed): GpuLayoutSupport {
+export function gpuLayoutSupport(caps: GpuCaps | StaticGpuCaps | null, need: GpuLayoutNeed): GpuLayoutSupport {
   if (!caps) return { ok: false, reason: "no WebGL device (a Canvas/SVG render backend, or SSR)" };
   if (caps.type !== "webgl") return { ok: false, reason: `the render device is ${caps.type}, not WebGL2` };
   if (!caps.floatRenderable) {
@@ -139,6 +147,7 @@ export function gpuLayoutSupport(caps: GpuCaps | null, need: GpuLayoutNeed): Gpu
   if (nested && need.pyramidSide > TILE_ATLAS_MAX_SIDE) {
     return { ok: false, reason: `the graph needs a ${need.pyramidSide}-texel tile atlas, past the ${TILE_ATLAS_MAX_SIDE} texels a tile origin addresses` };
   }
+  if (!("blendProbe" in caps)) return { ok: true };
   if (caps.blendProbe === "wrong-sum") {
     return { ok: false, reason: "float blending gave a wrong sum in the functional probe (driver bug)" };
   }

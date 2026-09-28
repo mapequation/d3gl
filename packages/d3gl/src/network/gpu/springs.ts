@@ -1,9 +1,19 @@
 import type { Device, Framebuffer, RenderPass, SamplerProps, Texture } from "@luma.gl/core";
 import type { LayoutGraph } from "../force.js";
-import { buildCSR } from "../graph.js";
-import { buildHubChunks } from "./hub-chunks.js";
+import { buildCSR, type CSR } from "../graph.js";
+import { buildHubChunks, hasHubRows } from "./hub-chunks.js";
 import { atlasWidth, packFloatTexture, packUintTexture, writeTexels } from "./textures.js";
-import { AttractionPass, HubChunkPass, type CsrTextures, type HubChunkTextures, type NestedSpringInputs } from "./passes/attraction.js";
+import {
+  AttractionPass,
+  HubChunkPass,
+  attractionProgram,
+  hubChunkProgram,
+  type CsrTextures,
+  type HubChunkTextures,
+  type NestedSpringInputs,
+  type SpringVariant,
+} from "./passes/attraction.js";
+import type { LayoutProgram } from "./programs.js";
 import { beginPass } from "./passes/fullscreen.js";
 import type { SeedLevel } from "./seed-plan.js";
 
@@ -37,12 +47,40 @@ export interface SeedSpringPasses {
   readonly hubChunk: HubChunkPass;
 }
 
+/** The seed springs' variant: weighted and mass-weighted, with the hub branch (#353). */
+const SEED_SPRINGS: SpringVariant = { hubs: true, weighted: true, massive: true };
+
 /** Compile a multilevel seed's spring programs (owned by the solver, destroyed with it). */
 export function createSeedSpringPasses(device: Device): SeedSpringPasses {
   return {
-    attraction: new AttractionPass(device, { hubs: true, weighted: true, massive: true }),
-    hubChunk: new HubChunkPass(device, { weighted: true }),
+    attraction: new AttractionPass(device, SEED_SPRINGS),
+    hubChunk: new HubChunkPass(device, SEED_SPRINGS),
   };
+}
+
+/** The programs {@link createSeedSpringPasses} compiles (#385). */
+export function seedSpringPrograms(): LayoutProgram[] {
+  return [attractionProgram(SEED_SPRINGS), hubChunkProgram(SEED_SPRINGS)];
+}
+
+/**
+ * A layout graph that carries its undirected CSR's row lengths — a `NetworkGraph` does (`graph.csr`, built from the
+ * same edges by the same `buildCSR` as the solver's springs) — so its springs' variant is known before the solver.
+ */
+export type SpringGraph = LayoutGraph & { readonly csr: Pick<CSR, "degree"> };
+
+/**
+ * The variant a graph's {@link GpuSprings} compile (#385): the hub branch when some CSR row is longer than
+ * `SPRING_CHUNK` (the rows {@link buildHubChunks} splits), read from the row lengths `degree` (no pass over the
+ * edges), weights when the graph has them, and the nested terms for `nested` springs.
+ */
+export function springVariant(graph: Pick<LayoutGraph, "springWeight">, degree: ArrayLike<number>, nested = false): SpringVariant {
+  return { hubs: hasHubRows(degree), weighted: graph.springWeight !== undefined, nested };
+}
+
+/** The programs a graph's {@link GpuSprings} compile: the row gather, and the chunk pass when it has hubs (#385). */
+export function springPrograms(variant: SpringVariant): LayoutProgram[] {
+  return variant.hubs ? [attractionProgram(variant), hubChunkProgram(variant)] : [attractionProgram(variant)];
 }
 
 /**

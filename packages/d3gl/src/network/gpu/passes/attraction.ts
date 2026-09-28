@@ -2,7 +2,8 @@ import type { Device, Texture, RenderPass } from "@luma.gl/core";
 import type { Model } from "@luma.gl/engine";
 import { HUB_CHUNK, SPRING_CHUNK } from "../hub-chunks.js";
 import { SLOT_TEXEL_GLSL } from "../textures.js";
-import { ADDITIVE_BLEND, NO_BLEND, fullScreenModel, type PassUniforms } from "./fullscreen.js";
+import { ADDITIVE_BLEND, NO_BLEND, fullScreenProgram, layoutModel, type PassUniforms } from "./fullscreen.js";
+import type { LayoutProgram } from "../programs.js";
 
 /**
  * Which spring variant a program is compiled for — fixed per spring set, so no per-fragment branch on it.
@@ -269,6 +270,16 @@ export interface HubChunkTextures {
   width: number;
 }
 
+/** The row gather's program for `variant` (#385). */
+export function attractionProgram(variant: SpringVariant): LayoutProgram {
+  return fullScreenProgram(header(variant) + ROW_FS);
+}
+
+/** The hub chunk pass's program, weighted or not, flat or nested (#385). */
+export function hubChunkProgram(variant: Pick<SpringVariant, "weighted" | "nested">): LayoutProgram {
+  return fullScreenProgram(header({ hubs: true, weighted: variant.weighted, nested: variant.nested === true }) + CHUNK_FS);
+}
+
 /**
  * GPU attraction (spring) gather pass. Draws a full-screen triangle; each fragment computes one node's
  * spring-force contribution over its CSR neighbours (or its hub partials) and writes it into the force
@@ -298,7 +309,7 @@ export class AttractionPass {
       ...(variant.nested ? { u_rest: 0, u_pad: 1 } : {}),
     };
     // Additive blend: dst += src, so the force passes accumulate into one texture.
-    this.model = fullScreenModel(device, header(variant) + ROW_FS, this.uniforms, ADDITIVE_BLEND);
+    this.model = layoutModel(device, attractionProgram(variant), this.uniforms, ADDITIVE_BLEND);
   }
 
   /**
@@ -367,12 +378,7 @@ export class HubChunkPass {
     this.weighted = variant.weighted;
     this.nested = variant.nested === true;
     this.uniforms = { u_width: 1, u_nbr_width: 1, u_chunk_count: 0, u_chunk_width: 1, ...(this.nested ? { u_rest: 0, u_pad: 1 } : {}) };
-    this.model = fullScreenModel(
-      device,
-      header({ hubs: true, weighted: variant.weighted, nested: this.nested }) + CHUNK_FS,
-      this.uniforms,
-      NO_BLEND,
-    );
+    this.model = layoutModel(device, hubChunkProgram(variant), this.uniforms, NO_BLEND);
   }
 
   /** Draw the chunk sums into an already-open render pass on the partials framebuffer. */

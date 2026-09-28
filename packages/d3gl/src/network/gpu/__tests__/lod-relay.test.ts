@@ -140,6 +140,72 @@ describe("LOD relay: coarsen and adopt (#377)", () => {
   });
 });
 
+describe("LOD relay started ahead of its stream (#385)", () => {
+  function unarmed(n = 1200): { graph: NetworkGraph; worker: InProcessLODWorker; relay: LODRelay; trees: (LODTree | null)[] } {
+    const graph = clustered(n);
+    const worker = new InProcessLODWorker();
+    const trees: (LODTree | null)[] = [];
+    const relay = new LODRelay(worker, graph, { coarsen: { minNodes: 4 } }, (tree) => trees.push(tree), null, false);
+    return { graph, worker, relay, trees };
+  }
+
+  it("holds the topology until arm(), then refits it to the positions on screen at that time and adopts it", () => {
+    const { graph, worker, relay, trees } = unarmed();
+    worker.flush(); // the topology arrives: held, no adoption refit yet
+    expect(trees).toHaveLength(0);
+    expect(worker.received.map((m) => m.type)).toEqual(["coarsen"]);
+    expect(relay.holding).toBe(true);
+    // The run places its disc after the topology arrived; the adopted geometry is refit to it.
+    for (let i = 0; i < graph.positions.length; i++) graph.positions[i] = (graph.positions[i] ?? 0) * 0.5 + 3;
+    const onScreen = graph.positions.slice();
+    relay.listen(() => {});
+    relay.arm();
+    expect(worker.received.map((m) => m.type)).toEqual(["coarsen", "lod-geometry"]);
+    worker.flush();
+    expect(trees).toHaveLength(1);
+    const tree = trees[0];
+    if (!tree) throw new Error("no tree");
+    const want = expectedGeometry(tree, onScreen);
+    expect(tree.cx).toEqual(want.cx);
+    expect(tree.extent).toEqual(want.extent);
+    expect(relay.relays).toBe(true);
+    relay.arm(); // idempotent
+    expect(trees).toHaveLength(1);
+  });
+
+  it("a worker that fails before arm() withdraws the tree and warns only at arm(); destroyed unarmed, the relay calls and says nothing", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const failed = unarmed();
+    failed.worker.onerror?.(new WorkerError());
+    expect(failed.trees).toEqual([]);
+    expect(failed.relay.holding).toBe(false);
+    // The run may still fall back to the worker, which streams the tree: "built on the main thread" would be wrong.
+    expect(warn).not.toHaveBeenCalled();
+    failed.relay.arm();
+    expect(failed.trees).toEqual([null]);
+    expect(warn).toHaveBeenCalledOnce();
+    expect(String(warn.mock.calls[0]?.[0])).toMatch(/the LOD worker failed; the LOD tree is built on the main thread instead/);
+    failed.relay.arm(); // idempotent
+    expect(warn).toHaveBeenCalledOnce();
+
+    warn.mockClear();
+    const dropped = unarmed();
+    dropped.worker.flush();
+    dropped.relay.destroy();
+    expect(dropped.worker.terminated).toBe(true);
+    dropped.relay.arm();
+    expect(dropped.trees).toEqual([]);
+
+    // Failed, then destroyed unarmed (the run fell back to the worker): no warning, no withdrawal, ever.
+    const abandoned = unarmed();
+    abandoned.worker.onerror?.(new WorkerError());
+    abandoned.relay.destroy();
+    abandoned.relay.arm();
+    expect(abandoned.trees).toEqual([]);
+    expect(warn).not.toHaveBeenCalled();
+  });
+});
+
 describe("LOD relay: streaming (#377)", () => {
   it("puts a harvest on the graph only at commit, together with the tree's geometry for it", () => {
     const { graph, worker, relay, trees } = start();

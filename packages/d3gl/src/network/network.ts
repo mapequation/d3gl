@@ -2529,8 +2529,9 @@ export class Network extends BaseEngine {
    * `"shared"` into `"copy"`, and a `backend: "gpu"` / `"auto"` layout that resolves to the worker (#351,
    * #375) reports the worker's transport. For a `"gpu"` / `"auto"` layout it resolves **asynchronously**:
    * it is `"copy"` until the device promise settles, then `"gpu"` or the fallback worker's
-   * `"shared"`/`"copy"`. Read it after `await net.whenSettled()` or on a subsequent animation frame for the
-   * resolved value. The environment's *capability* (independent of any run) is
+   * `"shared"`/`"copy"`. A GPU run whose programs compile in parallel first (#385) reads `"gpu"` while they
+   * compile, and moves to the worker's transport if a link, the float-blend probe or the context then fails.
+   * Read it after `await net.whenSettled()` for the value the run ended on. The environment's *capability* (independent of any run) is
    * {@link sharedMemoryAvailable}.
    */
   get layoutTransport(): "gpu" | "shared" | "copy" | "none" {

@@ -1,5 +1,5 @@
 import type { Device, Framebuffer, RenderPass, RenderPipelineParameters, SamplerProps, Texture } from "@luma.gl/core";
-import { Model } from "@luma.gl/engine";
+import type { Model } from "@luma.gl/engine";
 import { SLOT_TEXEL_GLSL, atlasWidth } from "../textures.js";
 import { SEGMENT_OF_GLSL, segmentDefines, type SegmentTable } from "../segment-table.js";
 import {
@@ -11,7 +11,8 @@ import {
   COLLISION_PART_VISITS,
   type CollisionPlan,
 } from "../collision-plan.js";
-import { ADDITIVE_BLEND, beginPass, fullScreenModel, NO_BLEND, type PassUniforms } from "./fullscreen.js";
+import { ADDITIVE_BLEND, beginPass, fullScreenProgram, layoutModel, NO_BLEND, type PassUniforms } from "./fullscreen.js";
+import type { LayoutProgram } from "../programs.js";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // The nested layout's disc collision on the GPU (#355, #380, spec §11.1): a per-segment radius-class grid
@@ -629,6 +630,42 @@ function itemAtlasRows(slotWidth: number, items: number): number {
   return Math.max(1, Math.ceil(items / slotWidth));
 }
 
+/** The programs of a {@link CollisionGrid}: each one's source. */
+export interface CollisionGridPrograms {
+  /** Every slot's key and disc. */
+  readonly cell: LayoutProgram;
+  /** The tables' count scatter and round scatter (points). */
+  readonly count: LayoutProgram;
+  readonly round: LayoutProgram;
+  /** The work items' search, and the per-slot resolve. */
+  readonly item: LayoutProgram;
+  readonly resolve: LayoutProgram;
+  /** The statistics variants of the search and the resolve ({@link CollisionGridOptions.stats}), or null. */
+  readonly stats: { readonly item: LayoutProgram; readonly resolve: LayoutProgram } | null;
+}
+
+/**
+ * The programs a {@link CollisionGrid} compiles (#385): fixed but for the plan's cell refinement, which the
+ * search compiles in, and the statistics passes a test asks for. Pure, no GPU work.
+ */
+export function collisionGridPrograms(refine: number, stats: boolean): CollisionGridPrograms {
+  const vs = scatterVs(COLLISION_ROUNDS);
+  return {
+    cell: fullScreenProgram(CELL_FS),
+    count: { vs, fs: COUNT_FS },
+    round: { vs, fs: ROUND_FS },
+    item: fullScreenProgram(itemFs(refine, false)),
+    resolve: fullScreenProgram(resolveFs(false)),
+    stats: stats ? { item: fullScreenProgram(itemFs(refine, true)), resolve: fullScreenProgram(resolveFs(true)) } : null,
+  };
+}
+
+/** {@link collisionGridPrograms} of `plan` and `options`, as a list. */
+export function collisionGridProgramList(plan: Pick<CollisionPlan, "refine">, options: CollisionGridOptions = {}): LayoutProgram[] {
+  const p = collisionGridPrograms(plan.refine, options.stats === true);
+  return [p.cell, p.count, p.round, p.item, p.resolve, ...(p.stats ? [p.stats.item, p.stats.resolve] : [])];
+}
+
 /**
  * The largest texture side a {@link CollisionGrid} of `plan` allocates besides its slot-atlas textures
  * (the keys and discs, `slotWidth` wide): its two hash tables, the work-item atlas and the binned-slot
@@ -744,15 +781,14 @@ export class CollisionGrid {
       this.subs = table(plan.subBucketCount, COLLISION_SUB_ROUNDS);
       const shifts = { u_bucketShift: this.cells.shift, u_subShift: this.subs.shift };
       this.cellUniforms = { u_count: 0, u_width: 1, u_tableWidth: 1, u_collideWidth: 1, ...shifts };
-      this.cellModel = keep(fullScreenModel(device, CELL_FS, this.cellUniforms, NO_BLEND));
+      const programs = collisionGridPrograms(plan.refine, options.stats === true);
+      this.cellModel = keep(layoutModel(device, programs.cell, this.cellUniforms, NO_BLEND));
       const scatterBase = { u_width: 1, u_binnedWidth: bw, ...shifts, u_atlas: this.cells.atlas, u_sub: 0, u_prevChannel: 0 };
       this.scatterUniforms = { ...scatterBase, u_round: -1 };
       this.roundUniforms = { ...scatterBase, u_round: 0, u_channel: 0 };
-      const vs = scatterVs(COLLISION_ROUNDS);
-      const scatter = (fs: string, uniforms: PassUniforms, parameters: RenderPipelineParameters): Model =>
-        keep(new Model(device, { vs, fs, topology: "point-list", vertexCount: Math.max(1, binnedSlots.length), uniforms, parameters }));
-      this.countModel = scatter(COUNT_FS, this.scatterUniforms, ADDITIVE_BLEND);
-      this.roundModel = scatter(ROUND_FS, this.roundUniforms, MIN_BLEND);
+      const points = { topology: "point-list" as const, vertexCount: Math.max(1, binnedSlots.length) };
+      this.countModel = keep(layoutModel(device, programs.count, this.scatterUniforms, ADDITIVE_BLEND, points));
+      this.roundModel = keep(layoutModel(device, programs.round, this.roundUniforms, MIN_BLEND, points));
       this.searchUniforms = {
         u_count: 0,
         u_width: 1,
@@ -765,9 +801,9 @@ export class CollisionGrid {
         u_relax: COLLISION_RELAX,
         ...shifts,
       };
-      this.itemModel = keep(fullScreenModel(device, itemFs(plan.refine, false), this.searchUniforms, NO_BLEND));
-      this.resolveModel = keep(fullScreenModel(device, resolveFs(false), this.searchUniforms, NO_BLEND));
-      if (options.stats) {
+      this.itemModel = keep(layoutModel(device, programs.item, this.searchUniforms, NO_BLEND));
+      this.resolveModel = keep(layoutModel(device, programs.resolve, this.searchUniforms, NO_BLEND));
+      if (programs.stats) {
         const items = keep(device.createTexture({ width: iw, height: ih, format: "rgba32float", mipLevels: 1, sampler: NEAREST }));
         const slots = keep(device.createTexture({ width: slotWidth, height: slotHeight, format: "rgba32float", mipLevels: 1, sampler: NEAREST }));
         this.stats = {
@@ -775,8 +811,8 @@ export class CollisionGrid {
           itemsFbo: keep(device.createFramebuffer({ width: iw, height: ih, colorAttachments: [items] })),
           slots,
           slotsFbo: keep(device.createFramebuffer({ width: slotWidth, height: slotHeight, colorAttachments: [slots] })),
-          itemModel: keep(fullScreenModel(device, itemFs(plan.refine, true), this.searchUniforms, NO_BLEND)),
-          resolveModel: keep(fullScreenModel(device, resolveFs(true), this.searchUniforms, NO_BLEND)),
+          itemModel: keep(layoutModel(device, programs.stats.item, this.searchUniforms, NO_BLEND)),
+          resolveModel: keep(layoutModel(device, programs.stats.resolve, this.searchUniforms, NO_BLEND)),
         };
       } else {
         this.stats = null;
