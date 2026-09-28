@@ -63,7 +63,7 @@ import { buildGraph, type NetworkGraph } from "../../graph.js";
 import { DEFAULT_FORCE, seedPositions } from "../../force.js";
 import { GpuForceLayout } from "../gpu-force-layout.js";
 import { AsyncPositionReadback } from "../async-readback.js";
-import { DEFAULT_BUDGET_MS, frameBudgetMs, itemCostMs, stageBands } from "../frame-budget.js";
+import { DEFAULT_BUDGET_MS, frameBudgetMs, flatPassCostMs, stageBands } from "../frame-budget.js";
 import { observeGpuLayoutFrames, type GpuFrameSample } from "../gpu-stream.js";
 import { MIN_FRAME_MS } from "../repaint-throttle.js";
 import { makeTestDevice } from "./_device.js";
@@ -604,7 +604,7 @@ async function gpuOnlyRate(graph: NetworkGraph): Promise<{ ticksPerSec: number; 
     solo.readPositions(out);
     const ticksPerSec = 10_000 / (performance.now() - t0);
     let report = `B=1 ${ticksPerSec.toFixed(1)} ticks/s (encode ${(encodeMs / 10).toFixed(2)} ms/tick)`;
-    const sliced = new Set([60, 120].map((hz) => stageBands(itemCostMs("force", N), frameBudgetMs(DEFAULT_BUDGET_MS, 1000 / hz), solo.atlasRows)));
+    const sliced = new Set([60, 120].map((hz) => stageBands(flatPassCostMs("force", N), frameBudgetMs(DEFAULT_BUDGET_MS, 1000 / hz), solo.atlasRows)));
     for (const bands of sliced) {
       if (bands === 1) continue;
       const rate = slicedRate(solo, out, bands, 5);

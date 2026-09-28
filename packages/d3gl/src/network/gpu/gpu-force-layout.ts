@@ -31,18 +31,10 @@ import {
 import { SeedLevels, SeedPasses } from "./seed-levels.js";
 import type { SeedPlan } from "./seed-plan.js";
 import { StopLatchPass } from "./passes/stop-latch.js";
-import { itemCostMs } from "./frame-budget.js";
-import type { StreamStage } from "./stream-schedule.js";
+import { flatPassCostMs } from "./frame-budget.js";
+import type { EstimatedStage, StreamStage } from "./stream-schedule.js";
 
 // DAMPING is imported from force.ts so both integrators share one constant.
-
-/** A pass of the flat layout's streamed tick: a {@link StreamStage} whose estimate and rows follow the level. */
-interface FlatStage {
-  costMs: number;
-  readonly fixedMs: number;
-  rows: number;
-  run(band: number, bands: number): void;
-}
 
 /**
  * The flat layout's `exactMax` — the node-count threshold for the repulsion algorithm. At or below
@@ -189,11 +181,11 @@ export class GpuForceLayout {
   /**
    * A streamed tick's passes (#352, #382): {@link beginTick} and {@link integrate} whole, the force pass
    * ({@link forceBand}) in row bands of the level's rows — estimated by the flat cost model over the level's
-   * slots (`ITEM_NS_PER_NODE`), set by {@link tickStages} when a tick starts.
+   * slots (`FLAT_NS_PER_NODE`), set by {@link tickStages} when a tick starts.
    */
-  private readonly prepStage: FlatStage;
-  private readonly forceStage: FlatStage;
-  private readonly integrateStage: FlatStage;
+  private readonly prepStage: EstimatedStage;
+  private readonly forceStage: EstimatedStage;
+  private readonly integrateStage: EstimatedStage;
   private readonly stages: readonly StreamStage[];
   /** A multilevel solver's seed programs (#353), compiled with it; null on a flat solver. */
   private readonly seedPasses: SeedPasses | null;
@@ -540,10 +532,10 @@ export class GpuForceLayout {
    */
   tickStages(): readonly StreamStage[] {
     const level = this.active;
-    this.prepStage.costMs = itemCostMs("prep", level.count);
-    this.forceStage.costMs = itemCostMs("force", level.count);
+    this.prepStage.costMs = flatPassCostMs("prep", level.count);
+    this.forceStage.costMs = flatPassCostMs("force", level.count);
     this.forceStage.rows = level.rows;
-    this.integrateStage.costMs = itemCostMs("integrate", level.count);
+    this.integrateStage.costMs = flatPassCostMs("integrate", level.count);
     return this.stages;
   }
 

@@ -89,7 +89,7 @@ export interface FenceSource<F> {
 }
 
 /** The passes of a flat tick: P, the force pass (in bands), I. */
-export type ItemKind = "prep" | "force" | "integrate";
+export type FlatPass = "prep" | "force" | "integrate";
 
 /** Default GPU budget per frame, ms (spec §15 Q4: fixed for now). */
 export const DEFAULT_BUDGET_MS = 10;
@@ -126,11 +126,11 @@ const DEFAULT_INTERVAL_MS = 1000 / 60;
  * bulk. Other devices are unmeasured (spec §15 Q7); on a slower GPU the fence gate halves `k` and grows
  * the bands instead. (The nested layout's model is `nested-plan.ts`'s.)
  */
-export const ITEM_NS_PER_NODE: Readonly<Record<ItemKind, number>> = { prep: 5, force: 40, integrate: 1 };
+export const FLAT_NS_PER_NODE: Readonly<Record<FlatPass, number>> = { prep: 5, force: 40, integrate: 1 };
 
 /** The estimated GPU time of a whole pass of the flat tick over `nodes` nodes, ms (the schedule divides it into bands). */
-export function itemCostMs(kind: ItemKind, nodes: number): number {
-  return (ITEM_NS_PER_NODE[kind] * nodes) / 1e6;
+export function flatPassCostMs(pass: FlatPass, nodes: number): number {
+  return (FLAT_NS_PER_NODE[pass] * nodes) / 1e6;
 }
 
 /** Frames that may be in flight at a frame interval: 33 ms worth, at least 2 (60 Hz: 2, 120 Hz: 4). */

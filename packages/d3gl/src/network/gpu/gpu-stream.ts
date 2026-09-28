@@ -86,8 +86,8 @@ import { DRAG_HEAT, RECOOL_TICKS } from "../force.js";
 import type { NetworkGraph } from "../graph.js";
 import { deleteSync, insertSync, pollSync } from "../../webgl/fence.js";
 import { AsyncPositionReadback, READBACK_STATS_FLOATS, READBACK_STOP_OFFSET, type ReadbackSource } from "./async-readback.js";
-import { FrameBudget, itemCostMs, type FenceSource } from "./frame-budget.js";
-import { StreamSchedule, type StageSource, type StreamStage } from "./stream-schedule.js";
+import { FrameBudget, flatPassCostMs, type FenceSource } from "./frame-budget.js";
+import { NO_STAGES, StreamSchedule, type EstimatedStage, type StageSource, type StreamStage } from "./stream-schedule.js";
 import { MIN_FRAME_MS, RepaintThrottle } from "./repaint-throttle.js";
 import { reportUncaught } from "./report-uncaught.js";
 import type { SeedPlan } from "./seed-plan.js";
@@ -196,9 +196,6 @@ export interface GpuFrameSample {
 }
 
 const observers = new Set<(sample: Readonly<GpuFrameSample>) => void>();
-
-/** A solver without readback passes of its own copies at once. */
-const NO_STAGES: readonly StreamStage[] = [];
 
 /**
  * Observe every streamed GPU layout frame (tests and benchmarks). The sample object is reused across
@@ -338,17 +335,6 @@ export class DirectSink implements FrameSink {
 
 type Mode = "idle" | "run" | "drag" | "cool";
 
-/**
- * A pass the stream supplies itself (a step of the multilevel seed, #353), its estimate updated before each
- * tick that runs it — a {@link StreamStage} whose cost the stream may rewrite.
- */
-interface OwnStage {
-  costMs: number;
-  readonly fixedMs: number;
-  readonly rows: number;
-  run(band: number, bands: number): void;
-}
-
 /** What the tick the schedule is running is: the solver's, or a step or a whole level tick of the seed (#353). */
 type TickKind = "solver" | "seed-step" | "seed-tick";
 
@@ -441,8 +427,8 @@ export class GpuStream {
   /** What the tick the schedule last started (or is about to start) is. */
   private tickKind: TickKind = "solver";
   /** The seed's placement step (`setLevel` / `endSeed`) and a whole seed-level tick, as one-pass ticks (#353). */
-  private readonly seedStep: OwnStage;
-  private readonly seedTick: OwnStage;
+  private readonly seedStep: EstimatedStage;
+  private readonly seedTick: EstimatedStage;
   private readonly seedStepStages: readonly StreamStage[];
   private readonly seedTickStages: readonly StreamStage[];
   /** The current mode's ticks are done: copy once more (unthrottled), harvest, then {@link finish}. */
@@ -865,7 +851,7 @@ export class GpuStream {
     if (this.seedStepNext()) {
       // A placement is one gather over the level's slots, about an integrate's cost.
       const level = this.seedPlan?.levels[this.seedNext];
-      this.seedStep.costMs = itemCostMs("integrate", level ? level.count : this.layout.nodeCount);
+      this.seedStep.costMs = flatPassCostMs("integrate", level ? level.count : this.layout.nodeCount);
       this.tickKind = "seed-step";
       return this.seedStepStages;
     }
@@ -891,7 +877,7 @@ export class GpuStream {
 
   /** The estimated GPU time of a whole unsliced flat tick over `n` slots. */
   private tickCostMs(n: number): number {
-    return itemCostMs("prep", n) + itemCostMs("force", n) + itemCostMs("integrate", n);
+    return flatPassCostMs("prep", n) + flatPassCostMs("force", n) + flatPassCostMs("integrate", n);
   }
 
   /**

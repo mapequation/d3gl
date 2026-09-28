@@ -23,7 +23,7 @@
  */
 import { describe, expect, it } from "vitest";
 import { infomapLikeTree, zipfModuleTree } from "../../__tests__/nested-fixtures.js";
-import { FrameBudget, bandTargetMs, itemCostMs, type FenceSource, type FenceStatus } from "../frame-budget.js";
+import { FrameBudget, bandTargetMs, flatPassCostMs, type FenceSource, type FenceStatus } from "../frame-budget.js";
 import { NESTED_COST, nestedPlan, nestedPlanSizes, type NestedPlan, type NestedStep } from "../nested-plan.js";
 import { nestedSolverTopology } from "../nested-topology.js";
 import { StreamSchedule, type StageCost, type StreamStage } from "../stream-schedule.js";
@@ -278,9 +278,9 @@ describe("the flat GPU layout's frame budget (#352, #382)", () => {
     // GpuForceLayout.tickStages: P and I whole, the force pass in bands of the atlas rows (the flat cost model).
     const rows = Math.ceil(nodes / atlasWidth(nodes));
     const stages: readonly StageCost[] = [
-      { costMs: itemCostMs("prep", nodes), fixedMs: 0, rows: 1 },
-      { costMs: itemCostMs("force", nodes), fixedMs: 0, rows },
-      { costMs: itemCostMs("integrate", nodes), fixedMs: 0, rows: 1 },
+      { costMs: flatPassCostMs("prep", nodes), fixedMs: 0, rows: 1 },
+      { costMs: flatPassCostMs("force", nodes), fixedMs: 0, rows },
+      { costMs: flatPassCostMs("integrate", nodes), fixedMs: 0, rows: 1 },
     ];
     const layout: Layout = { tickStages: () => stages, readbackStages: [], ticks: 300 };
     for (const hz of [60, 120]) {
@@ -288,7 +288,7 @@ describe("the flat GPU layout's frame budget (#352, #382)", () => {
         const run = stream(layout, hz);
         expect(run.ticks).toBe(300);
         // P alone is at most the budget here: 1.6 ms at 325k, 5 ms at 1M — the whole 120 Hz budget (#429).
-        expect(itemCostMs("prep", nodes)).toBeLessThanOrEqual(5 + 1e-9);
+        expect(flatPassCostMs("prep", nodes)).toBeLessThanOrEqual(5 + 1e-9);
         console.log(expectWithinBudget(run, hz, `flat, ${nodes} nodes`));
       }, 60_000);
     }

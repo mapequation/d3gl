@@ -10,7 +10,7 @@ import {
   FrameBudget,
   frameBudgetMs,
   framesInFlight,
-  itemCostMs,
+  flatPassCostMs,
   stageBands,
   type FenceSource,
   type FenceStatus,
@@ -66,7 +66,7 @@ function rig(opts: { nodes?: number; rows?: number; budgetMs?: number; encodeCap
     ...(opts.encodeCapMs !== undefined ? { encodeCapMs: opts.encodeCapMs } : {}),
   });
   // Default: an 8 ms force pass (200k nodes): 2 bands at a 10 ms budget, which the band growth can cut finer.
-  const pass = { costMs: itemCostMs("force", opts.nodes ?? 200_000), fixedMs: 0, rows: opts.rows ?? 448 };
+  const pass = { costMs: flatPassCostMs("force", opts.nodes ?? 200_000), fixedMs: 0, rows: opts.rows ?? 448 };
   return { fences, clock, budget, now: 0, pass, band: 0, bands: 1 };
 }
 
@@ -400,11 +400,11 @@ describe("FrameBudget budget: min(budgetMs, 0.6 × median rAF interval)", () => 
 describe("stageBands: every pass is cut into bands of at most half the budget (#382)", () => {
   it("cuts a pass into bands of about half the budget, at most its rows", () => {
     // ≈ 40 ns per node for the whole flat force pass (M1 Max): 325k → 13 ms → 3 bands of 5 ms at a 10 ms budget.
-    expect(stageBands(itemCostMs("force", 325_729), 10, 571)).toBe(3);
-    expect(stageBands(itemCostMs("force", 1_000_000), 10, 1000)).toBe(8);
-    expect(stageBands(itemCostMs("force", 1_000), 10, 32)).toBe(1);
-    expect(stageBands(itemCostMs("force", 1_000_000), 5, 1000)).toBe(16); // 120 Hz halves the budget
-    expect(stageBands(itemCostMs("force", 1_000_000), 10, 4)).toBe(4); // never more bands than rows
+    expect(stageBands(flatPassCostMs("force", 325_729), 10, 571)).toBe(3);
+    expect(stageBands(flatPassCostMs("force", 1_000_000), 10, 1000)).toBe(8);
+    expect(stageBands(flatPassCostMs("force", 1_000), 10, 32)).toBe(1);
+    expect(stageBands(flatPassCostMs("force", 1_000_000), 5, 1000)).toBe(16); // 120 Hz halves the budget
+    expect(stageBands(flatPassCostMs("force", 1_000_000), 10, 4)).toBe(4); // never more bands than rows
     expect(stageBands(1_000, 10, 1_000_000)).toBe(64); // never more than MAX_BANDS
     expect(stageBands(0, 10, 100)).toBe(1);
   });
@@ -448,7 +448,7 @@ describe("stageBands: every pass is cut into bands of at most half the budget (#
 
   it("scales the estimate by the band growth, so a pass far below half the budget stays one band", () => {
     expect(stageBands(4, 10, 317, 8)).toBe(7); // ⌈8 · 4 / 5⌉
-    expect(stageBands(itemCostMs("force", 325_729), 10, 571, 2)).toBe(6);
+    expect(stageBands(flatPassCostMs("force", 325_729), 10, 571, 2)).toBe(6);
     expect(stageBands(0.05, 10, 1_000, 8)).toBe(1); // a 0.05 ms pass: one band however slow the GPU
   });
 
@@ -735,12 +735,12 @@ describe("FrameBudget band growth: how far every pass's estimate is scaled when 
   });
 });
 
-describe("itemCostMs — the flat layout's static cost model behind the budget", () => {
+describe("flatPassCostMs — the flat layout's static cost model behind the budget", () => {
   it("scales every pass with N", () => {
-    expect(itemCostMs("prep", 650_000)).toBeCloseTo(2 * itemCostMs("prep", 325_000), 9);
-    expect(itemCostMs("force", 1_000_000)).toBeCloseTo(40, 9);
+    expect(flatPassCostMs("prep", 650_000)).toBeCloseTo(2 * flatPassCostMs("prep", 325_000), 9);
+    expect(flatPassCostMs("force", 1_000_000)).toBeCloseTo(40, 9);
     // At 325k a whole tick is in the measured 14-16 ms range (M1 Max, #349).
-    const tick = itemCostMs("prep", 325_729) + itemCostMs("force", 325_729) + itemCostMs("integrate", 325_729);
+    const tick = flatPassCostMs("prep", 325_729) + flatPassCostMs("force", 325_729) + flatPassCostMs("integrate", 325_729);
     expect(tick).toBeGreaterThan(12);
     expect(tick).toBeLessThan(18);
   });
