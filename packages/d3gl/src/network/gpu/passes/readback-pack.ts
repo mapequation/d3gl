@@ -47,14 +47,15 @@ const STATS_FS = /* glsl */ `\
 precision highp float;
 precision highp sampler2D;
 
-uniform highp sampler2D u_stats; // (Σx, Σy, Σ|v|, count) of segment 0
-uniform highp sampler2D u_box;   // (maxX, maxY, −minX, −minY) of segment 0
-uniform highp sampler2D u_stop;  // the stop latch (prevStep, stopTick, epoch, flags), #376
+uniform highp sampler2D u_stats; // the range table's sum chain, e.g. (Σx, Σy, Σ|v|, count) per segment
+uniform highp sampler2D u_box;   // its max chain, (maxX, maxY, −minX, −minY) per segment
+uniform highp sampler2D u_stop;  // the stop latch (prevStep, stopTick, epoch, flags), #376; zeros without one
+uniform ivec2 u_texel;           // the range whose stats are copied (the flat layout's one segment: (0, 0))
 layout(location = 0) out vec4 o_stat;
 
 void main() {
   float x = gl_FragCoord.x;
-  o_stat = x < 1.0 ? texelFetch(u_stats, ivec2(0), 0) : x < 2.0 ? texelFetch(u_box, ivec2(0), 0) : texelFetch(u_stop, ivec2(0), 0);
+  o_stat = x < 1.0 ? texelFetch(u_stats, u_texel, 0) : x < 2.0 ? texelFetch(u_box, u_texel, 0) : texelFetch(u_stop, ivec2(0), 0);
 }
 `;
 
@@ -62,9 +63,10 @@ void main() {
 export const STATS_TEXELS = 3;
 
 /**
- * The flat segment table's `stats` and `box` texels and the stop latch's texel (#376) side by side in one
- * 3×1 `rgba32float` staging texture, so the stats readback is one `readPixels` into its own PBO. One
- * 3-fragment draw per copy.
+ * One range's `stats` and `box` texels — the flat segment table's only segment, or the nested solve's
+ * whole-slot range (#355) — and the stop latch's texel (#376) side by side in one 3×1 `rgba32float` staging
+ * texture, so the stats readback is one `readPixels` into its own PBO. One 3-fragment draw per copy. A solve
+ * without a stop latch (the nested one: a fixed tick count) copies a zero texel there: no stop, no flag.
  */
 export class PackStatsPass {
   /** The 3×1 ({@link STATS_TEXELS}) staging framebuffer the readback copies from. */
@@ -72,6 +74,9 @@ export class PackStatsPass {
   private readonly device: Device;
   private readonly texture: Texture;
   private readonly model: Model;
+  private readonly uniforms: PassUniforms;
+  /** The zero texel copied as the stop latch of a solve without one. */
+  private readonly noStop: Texture;
 
   constructor(device: Device) {
     this.device = device;
@@ -83,12 +88,29 @@ export class PackStatsPass {
       sampler: { minFilter: "nearest", magFilter: "nearest" },
     });
     this.framebuffer = device.createFramebuffer({ width: STATS_TEXELS, height: 1, colorAttachments: [this.texture] });
-    this.model = fullScreenModel(device, STATS_FS, {}, NO_BLEND);
+    this.noStop = device.createTexture({
+      width: 1,
+      height: 1,
+      format: "rgba32float",
+      data: new Float32Array(4),
+      mipLevels: 1,
+      sampler: { minFilter: "nearest", magFilter: "nearest" },
+    });
+    this.uniforms = { u_texel: new Int32Array(2) };
+    this.model = fullScreenModel(device, STATS_FS, this.uniforms, NO_BLEND);
   }
 
-  /** Copy `stats` (texel 0) and `box` (texel 1) of segment 0 and the stop latch (texel 2) into the staging texture. */
-  run(stats: Texture, box: Texture, stop: Texture): void {
-    this.model.setBindings({ u_stats: stats, u_box: box, u_stop: stop });
+  /**
+   * Copy `stats` (staging texel 0) and `box` (staging texel 1) of the range at table texel `(x, y)`, and the
+   * stop latch (texel 2; zeros for a solve without one), into the staging texture.
+   */
+  run(stats: Texture, box: Texture, stop: Texture | null, x = 0, y = 0): void {
+    const texel = this.uniforms["u_texel"];
+    if (texel instanceof Int32Array) {
+      texel[0] = x;
+      texel[1] = y;
+    }
+    this.model.setBindings({ u_stats: stats, u_box: box, u_stop: stop ?? this.noStop });
     const pass = beginPass(this.device, { framebuffer: this.framebuffer, clear: false });
     this.model.draw(pass);
     pass.end();
@@ -99,6 +121,7 @@ export class PackStatsPass {
     this.model.destroy();
     this.framebuffer.destroy();
     this.texture.destroy();
+    this.noStop.destroy();
   }
 }
 

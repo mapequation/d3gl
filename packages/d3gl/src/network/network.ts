@@ -15,6 +15,7 @@ import { rosettePositions } from "./rosette.js";
 import { gatherCandidates, descendingByKey, descendingInListOrder, CandidateList, type CandidateSource } from "./label-candidates.js";
 import type { StateNetworkGraph } from "./state-graph.js";
 import { startNestedWorkerLayout, startWorkerLayout, type WorkerLayoutHandle, type WorkerLayoutOptions } from "./worker-transport.js";
+import { startGpuNestedLayout } from "./gpu/gpu-nested-transport.js";
 import { startGpuLayout } from "./gpu/gpu-transport.js";
 import { WebGLBackend } from "../webgl/webgl-backend.js";
 import type { NetworkGraph } from "./graph.js";
@@ -339,8 +340,10 @@ export interface NetworkLayoutOptions {
    * final, so a streamed layout never oscillates. Works with LOD off or on any {@link NetworkLODOptions.source}.
    * Once it lands, a LOD cut of the laid-out module tree treats each module as its disc (#329): drawn at
    * the disc's centre, culled by it, and expanded once the disc's diameter on screen reaches `expandPx`.
-   * Runs off-thread on `backend: "worker"` (streamed top-down, one frame per depth) and synchronously
-   * on `"force"`; `"gpu"` and `"auto"` use the worker until a GPU path exists. Ignored without a hierarchy.
+   * Runs off-thread on `backend: "worker"` (streamed top-down, one frame per depth), on the GPU on
+   * `"gpu"` (#355: every module at every depth solved at once, streamed as one animation of all depths
+   * converging together; the worker when the device cannot run it, with a warning), and synchronously on
+   * `"force"`. `"auto"` runs it on the worker (#375). Ignored without a hierarchy.
    *
    * `true` sizes discs by node flow (leaf count when the graph has none); pass `{ size: "count" }` to
    * size by leaf count, and `iterations` / `packing` to tune each module's solve. `{ warm: true }`
@@ -1719,13 +1722,23 @@ export class Network extends BaseEngine {
     if (layoutClass(opts.backend) === "streaming") {
       const oneFrame = warm || tween !== null;
       this.nestedSolving = true;
-      const solve = startNestedWorkerLayout(graph, topology, params, () => this.scheduleLayoutRepaint(), {
+      const delivery = {
         stream: !oneFrame,
-        onResult: oneFrame ? (positions) => this.landNested(graph, positions, tween) : undefined,
-        onBoundaries: (discs) => {
+        onResult: oneFrame ? (positions: Float32Array) => this.landNested(graph, positions, tween) : undefined,
+        onBoundaries: (discs: BoundaryDiscs) => {
           if (this.graph === graph) this.nestedDiscs = { tree, discs }; // the modules' geometry, and their rings' (#329)
         },
-      });
+      };
+      let solve: WorkerLayoutHandle | undefined;
+      if (opts.backend === "gpu") {
+        // The batched GPU solve (#355): every module at every depth at once, streamed from the GPU; the
+        // worker when the device cannot run it. A GPU frame repaints inside the transport's own animation
+        // frame ({@link onStreamedFrame}).
+        const devicePromise = this.whenBackendSettled().then(() => this.gpuDevice());
+        solve = startGpuNestedLayout(devicePromise, graph, topology, params, () => this.onStreamedFrame(solve), delivery);
+      } else {
+        solve = startNestedWorkerLayout(graph, topology, params, () => this.scheduleLayoutRepaint(), delivery);
+      }
       this.onLayoutSettled(tween ? this.transitionHandle(tween, solve) : solve);
     } else {
       const result = nestedLayout(topology, params);
@@ -1776,12 +1789,16 @@ export class Network extends BaseEngine {
   }
 
   /** A layout handle for a transition (#328): it settles when the transition ends, and `stop()` also
-   *  stops `solve` — the worker computing the transition's target, if any. */
+   *  stops `solve` — the worker computing the transition's target, if any. It reports `solve`'s live
+   *  transport (#297), so a GPU nested solve under a transition reads as `"gpu"`. */
   private transitionHandle(tween: PositionTransition, solve?: WorkerLayoutHandle): WorkerLayoutHandle {
     this.transition = tween;
     return {
       shared: false,
       mainThread: !solve,
+      get transport() {
+        return solve?.transport;
+      },
       settled: tween.settled,
       stop: () => {
         solve?.stop();

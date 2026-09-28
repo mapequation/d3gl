@@ -9,7 +9,8 @@ import { RepulsionPass } from "./passes/repulsion.js";
 import { GridPyramid } from "./passes/grid-pyramid.js";
 import { CenteringPass } from "./passes/centering.js";
 import { beginPass, type PassViewport } from "./passes/fullscreen.js";
-import { SegmentedReduce } from "./passes/segmented-reduce.js";
+import { FLAT_REDUCE_MAP, MULTILEVEL_REDUCE_MAP, SegmentedReduce } from "./passes/segmented-reduce.js";
+import type { PassUniforms } from "./passes/fullscreen.js";
 import { SegmentTable, type SegmentRow } from "./segment-table.js";
 import {
   FLAT_TILE_MIN_SIDE,
@@ -83,6 +84,12 @@ export interface GpuForceLayoutOptions {
    * so a seed compiles nothing and a failed compile fails this construction.
    */
   multilevel?: boolean;
+}
+
+/** The multilevel reduction map's texture and uniform (#353, `MULTILEVEL_REDUCE_MAP`) for one kind of level. */
+interface ReduceMassInputs {
+  readonly bindings: Readonly<Record<string, Texture>>;
+  readonly uniforms: PassUniforms;
 }
 
 /**
@@ -175,6 +182,12 @@ export class GpuForceLayout {
   private readonly unit: Texture | null;
   /** One `rg32float` texel: the virtual root a seed's top level is placed about. */
   private readonly rootScratch = new Float32Array(2);
+  /**
+   * The multilevel reduction map's inputs (#353): unit masses on the graph's level, the seed's masses on a
+   * seed level — built once each, so a reduction allocates nothing. Null on a flat solver.
+   */
+  private readonly unitMassInputs: ReduceMassInputs | null;
+  private seedMassInputs: ReduceMassInputs | null = null;
 
   /**
    * Maximum displacement per tick — STEP_CAP equilibrium spacings, the same {@link stepCap} the CPU
@@ -455,7 +468,8 @@ export class GpuForceLayout {
       ? device.createTexture({ width: 1, height: 1, format: "r32float", data: new Float32Array([1]), mipLevels: 1, sampler: { minFilter: "nearest", magFilter: "nearest" } })
       : null;
     const multilevel = this.unit ? { unit: this.unit } : undefined;
-    this.reduce = new SegmentedReduce(device, this.count, multilevel ? { multilevel } : {});
+    this.reduce = new SegmentedReduce(device, this.count, this.unit ? MULTILEVEL_REDUCE_MAP : FLAT_REDUCE_MAP);
+    this.unitMassInputs = this.unit ? { bindings: { u_mass: this.unit }, uniforms: { u_massive: 0 } } : null;
 
     // The tile pyramid, only when some segment has a tile. Pre-created in the constructor (all its
     // textures + FBOs) so no per-tick allocation. A multilevel one (#353) scatters a seed level's masses and
@@ -595,6 +609,7 @@ export class GpuForceLayout {
     // A level's tile (seedTileFor) lies inside the flat tile only while the level is no larger than the graph.
     if (plan.levels.some((level) => level.count > this.count)) throw new Error("GpuForceLayout.beginSeed: a seed level is larger than the graph");
     this.seed = new SeedLevels(this.device, plan, this.width, this.height, this.seedPasses);
+    this.seedMassInputs = { bindings: { u_mass: this.seed.mass }, uniforms: { u_massive: 1 } };
     this.seedLevel = -1;
     this.rootScratch[0] = plan.root[0];
     this.rootScratch[1] = plan.root[1];
@@ -657,6 +672,7 @@ export class GpuForceLayout {
     this.segments.setRange(0, { start: 0, count: this.count }, this.flatTile);
     this.cooling.hold(1);
     seed.destroy();
+    this.seedMassInputs = null;
     this.seed = null;
     this.seedLevel = -1;
   }
@@ -672,6 +688,7 @@ export class GpuForceLayout {
     this.active = this.finest;
     this.segments.setRange(0, { start: 0, count: this.count }, this.flatTile);
     seed.destroy();
+    this.seedMassInputs = null;
     this.seed = null;
     this.seedLevel = -1;
   }
@@ -946,15 +963,26 @@ export class GpuForceLayout {
   }
 
   /**
+   * The streaming readback's hook before a copy (#352): between ticks the reductions are re-run so the
+   * copied stats describe the copied positions ({@link refreshSegmentStats}); after a prep they already do.
+   */
+  prepareReadback(betweenTicks: boolean): void {
+    if (betweenTicks) this.refreshSegmentStats();
+  }
+
+  /**
    * The segment reductions, then the stop latch over their stats (#376). The latch evaluates the rule only
    * at the first reduction after an integrate: a copy between ticks and the next tick's prep both reduce,
    * with the same velocities, so the stop does not depend on whether a copy happened.
    */
   private reduceSegments(): void {
     const level = this.active;
+    const mass = level.mass ? this.seedMassInputs : this.unitMassInputs;
     this.reduce.run(
-      { pos: this.pos.readTex, vel: this.vel.readTex, posWidth: this.width, count: level.count, mass: level.mass },
+      { pos: this.pos.readTex, vel: this.vel.readTex, posWidth: this.width, count: level.count },
       this.segments,
+      mass?.bindings,
+      mass?.uniforms,
     );
     // A multilevel seed level (#353) is not the run: its stats are mass-weighted (`w` is Σm, not its slots)
     // and its ticks are the seed's. The latch reads the graph's level only, from the run's first tick, as the
