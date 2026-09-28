@@ -362,7 +362,6 @@ export class GpuStream {
   private readonly flat: FlatStreamSolver | null;
   private readonly drag: DragSolver | null;
   private readonly costs: ItemCosts;
-  private readonly extra: Float32Array | undefined;
   private readonly streaming: boolean;
   private readonly onFailure: ((reason: string) => void) | undefined;
   private readonly graph: NetworkGraph;
@@ -469,7 +468,6 @@ export class GpuStream {
     this.flat = flat;
     this.drag = opts.drag ?? flat;
     this.graph = graph;
-    this.extra = opts.extra;
     this.streaming = opts.stream ?? true;
     this.onFrame = onFrame;
     this.iterations = opts.iterations;
@@ -484,7 +482,7 @@ export class GpuStream {
       costs: this.costs,
       ...(opts.budgetMs !== undefined ? { budgetMs: opts.budgetMs } : {}),
     });
-    this.readback = new AsyncPositionReadback(device, layout);
+    this.readback = new AsyncPositionReadback(device, layout, opts.extra);
     this.sink = opts.sink ?? new DirectSink(graph, opts.into ?? null);
     this.sink.listen(() => this.resume());
     this.settled = new Promise<void>((resolve) => {
@@ -669,7 +667,7 @@ export class GpuStream {
       if (target) {
         harvested = true;
         harvestedTicks = this.copyTicks; // before this frame's copy, if any, moves copyTicks on
-        if (!this.readback.harvest(target, this.stats, this.extra) || (this.stopFlags() & STOP_NONFINITE) !== 0) {
+        if (!this.readback.harvest(target, this.stats) || (this.stopFlags() & STOP_NONFINITE) !== 0) {
           this.fail();
           return;
         }

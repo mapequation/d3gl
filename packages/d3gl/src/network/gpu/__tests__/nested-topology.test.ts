@@ -3,10 +3,18 @@
  * same problem the CPU `nestedLayout` solves, laid out for one segmented solve.
  */
 import { describe, expect, it } from "vitest";
-import { EXACT_MAX, Scratch, WARM_ALPHA, nestedLayout, setupModule, subtreeWeights } from "../../nested-layout.js";
-import { NESTED_LARGE_MAX, nestedSolverBuffers, nestedSolverResult, nestedSolverTopology } from "../nested-topology.js";
+import { EXACT_MAX, NESTED, Scratch, WARM_ALPHA, nestedLayout, setupModule, subtreeWeights } from "../../nested-layout.js";
+import {
+  NESTED_LARGE_MAX,
+  NESTED_SPRING_GAIN_MAX,
+  nestedSolverBuffers,
+  nestedSolverResult,
+  nestedSolverTopology,
+  type NestedSolverTopology,
+} from "../nested-topology.js";
 import { assertSegmentLocalEdges, slotSegments } from "../segments.js";
-import { threeLevel, topo } from "../../__tests__/nested-fixtures.js";
+import { directedPartition, threeLevel, topo } from "../../__tests__/nested-fixtures.js";
+import { NestedJacobiReference } from "./nested-jacobi-reference.js";
 import { buildModuleLODTree, type ModuleNode } from "../../modules.js";
 
 describe("nestedSolverTopology — one segmented solve over a module tree (#355)", () => {
@@ -191,7 +199,136 @@ describe("nestedSolverTopology — one segmented solve over a module tree (#355)
 
   it("hands a worker its typed arrays' buffers to transfer", () => {
     const buffers = nestedSolverBuffers(solver);
-    expect(buffers).toHaveLength(14);
-    expect(new Set(buffers).size).toBe(14);
+    expect(buffers).toHaveLength(15);
+    expect(new Set(buffers).size).toBe(15);
+  });
+});
+
+/** Each slot's summed link share `D_i = ½ · Σ_j w_ij · r_j² / (r_i² + r_j²)`, from the solver's own links and radii. */
+function linkShare(t: NestedSolverTopology): Float64Array {
+  const share = new Float64Array(t.slotCount);
+  t.linkSource.forEach((a, l) => {
+    const b = t.linkTarget[l] ?? 0;
+    const w = t.linkWeight[l] ?? 0;
+    const ma = (t.radius[a] ?? 0) ** 2;
+    const mb = (t.radius[b] ?? 0) ** 2;
+    share[a] = (share[a] ?? 0) + (0.5 * w * mb) / (ma + mb);
+    share[b] = (share[b] ?? 0) + (0.5 * w * ma) / (ma + mb);
+  });
+  return share;
+}
+
+/** Each slot's segment's starting alpha. */
+function slotAlpha0(t: NestedSolverTopology): Float64Array {
+  const alpha0 = new Float64Array(t.slotCount);
+  t.segStart.forEach((start, s) => alpha0.fill(t.segAlpha0[s] ?? 1, start, start + (t.segCount[s] ?? 0)));
+  return alpha0;
+}
+
+/** Largest |local coordinate| of the float64 reference after each tick of a whole solve of `t`. */
+function peaks(t: NestedSolverTopology): number[] {
+  const ref = new NestedJacobiReference(t);
+  const out: number[] = [];
+  for (let tick = 0; tick < t.iterations; tick++) {
+    ref.step();
+    let peak = 0;
+    for (let i = 0; i < t.slotCount; i++) peak = Math.max(peak, Math.abs(ref.x[i] ?? Number.NaN), Math.abs(ref.y[i] ?? Number.NaN));
+    out.push(peak);
+  }
+  return out;
+}
+
+describe("the nested solve's spring relaxation: Jacobi springs stay stable at a hub (#355)", () => {
+  const { tree, flow } = directedPartition();
+  const solver = nestedSolverTopology(topo(tree), { size: flow });
+
+  it("holds every slot's α₀ · ω · D to NESTED_SPRING_GAIN_MAX and leaves every other slot's springs as they are", () => {
+    const share = linkShare(solver);
+    const alpha0 = slotAlpha0(solver);
+    let relaxed = 0;
+    for (let i = 0; i < solver.slotCount; i++) {
+      const gain = (alpha0[i] ?? 1) * (share[i] ?? 0);
+      const omega = solver.springScale[i] ?? 0;
+      if (gain <= NESTED_SPRING_GAIN_MAX) expect(omega, `slot ${i}`).toBe(1);
+      else {
+        relaxed++;
+        expect(omega * gain, `slot ${i}`).toBeCloseTo(NESTED_SPRING_GAIN_MAX, 6);
+      }
+    }
+    // The directory page (D ≈ 38: 150 links at its pages' size) and module 2's two linked directories (D ≈ 3.7).
+    expect(relaxed).toBe(3);
+    expect(Math.max(...share)).toBeGreaterThan(30);
+  });
+
+  it("relaxes a warm segment's springs from its starting alpha: a hub a cold solve relaxes may keep its springs", () => {
+    const cold = nestedLayout(topo(tree), { size: flow });
+    const warm = nestedSolverTopology(topo(tree), { size: flow, initial: cold.positions });
+    const share = linkShare(warm);
+    const alpha0 = slotAlpha0(warm);
+    let kept = 0;
+    for (let i = 0; i < warm.slotCount; i++) {
+      const gain = (alpha0[i] ?? 1) * (share[i] ?? 0);
+      if (gain <= NESTED_SPRING_GAIN_MAX) {
+        expect(warm.springScale[i], `slot ${i}`).toBe(1);
+        if ((share[i] ?? 0) > NESTED_SPRING_GAIN_MAX) kept++;
+      } else expect((warm.springScale[i] ?? 0) * gain, `slot ${i}`).toBeCloseTo(NESTED_SPRING_GAIN_MAX, 6);
+    }
+    expect(Array.from(warm.segAlpha0).every((a) => a === Math.fround(WARM_ALPHA))).toBe(true);
+    expect(kept, "hubs a cold solve relaxes but WARM_ALPHA keeps within the bound").toBe(2);
+  });
+
+  it("the bound: the stiffest capped mode damps at least as fast as a free slot's velocity, gravity included; past 16/9 it diverges", () => {
+    // One mode of spring gain g, with gravity q = G · α, as a tick applies them: the predictor reads
+    // gravity at x (v* = v − q · x), the springs read y = x + v*, then v' = keep · (v* − g · y), x' = x + v'.
+    const keep = 1 - NESTED.DECAY;
+    const tick = (g: number, q: number, x: number, v: number): [number, number] => {
+      const vs = v - q * x;
+      const next = keep * (vs - g * (x + vs));
+      return [x + next, next];
+    };
+    /** The eigenvalues of one tick's map of (x, v), from its columns. */
+    const roots = (g: number, q: number): number[] => {
+      const [a, c] = tick(g, q, 1, 0);
+      const [b, d] = tick(g, q, 0, 1);
+      const trace = a + d;
+      const det = a * d - b * c;
+      const disc = trace * trace - 4 * det;
+      return disc < 0 ? [Math.sqrt(det), Math.sqrt(det)] : [(trace + Math.sqrt(disc)) / 2, (trace - Math.sqrt(disc)) / 2];
+    };
+    const cap = 2 * NESTED_SPRING_GAIN_MAX; // two linked capped slots moving against each other: g = 2 · α · ω · D
+    // Every gain from where a spring mode turns oscillating (g > 1) to the cap, and every gravity alpha
+    // can give: the negative root stays within keep.
+    for (let g = 1; g <= cap + 1e-12; g += (cap - 1) / 16) {
+      for (const alpha of [0, 0.001, 0.1, 0.5, 1]) {
+        expect(Math.min(...roots(g, NESTED.GRAVITY * alpha)), `g ${g.toFixed(3)}, α ${alpha}`).toBeGreaterThanOrEqual(-keep - 1e-12);
+      }
+    }
+    // At the cap with alpha 1: 0.46 and −0.59 (NESTED_SPRING_GAIN_MAX's doc).
+    const [up, down] = roots(cap, NESTED.GRAVITY);
+    expect(up).toBeCloseTo(0.464, 3);
+    expect(down).toBeCloseTo(-0.588, 3);
+    // Gravity read at y like the springs would add to g: at the cap its negative root would pass keep.
+    expect(Math.min(...roots(cap + NESTED.GRAVITY, 0))).toBeLessThan(-keep);
+    // A free-running mode at the cap damps at least as fast as keep^t, with and without gravity.
+    const run = (g: number, q: number, ticks: number): number => {
+      let x = 1;
+      let v = 0;
+      for (let t = 0; t < ticks; t++) [x, v] = tick(g, q, x, v);
+      return Math.hypot(x, v);
+    };
+    expect(run(cap, 0, 100)).toBeLessThan(2 * keep ** 100);
+    expect(run(cap, NESTED.GRAVITY, 100)).toBeLessThan(2 * keep ** 100);
+    expect(run((2 * (1 + keep)) / (3 * keep) + 0.01, 0, 400)).toBeGreaterThan(1);
+  });
+
+  it("keeps a directed partition's solve bounded every tick, where the unrelaxed Jacobi springs overflow float32", () => {
+    // Local coordinates are the unit disc: siblings spread to about its size (NESTED.REPULSION_K), so a
+    // stable solve stays within a few radii. The unrelaxed springs of the same tree peak past float32's
+    // range (1.9e40 in float64 here): the GPU solve went non-finite on web-NotreDame's directed tree.
+    const relaxed = peaks(solver);
+    expect(relaxed.every(Number.isFinite)).toBe(true);
+    expect(Math.max(...relaxed)).toBeLessThan(2);
+    const unrelaxed = peaks({ ...solver, springScale: new Float32Array(solver.slotCount).fill(1) });
+    expect(Math.max(...unrelaxed)).toBeGreaterThan(3.4e38);
   });
 });

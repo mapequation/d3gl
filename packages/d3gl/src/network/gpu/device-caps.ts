@@ -7,6 +7,7 @@
  */
 import { atlasWidth } from "./textures.js";
 import { chooseGrid } from "./passes/grid-pyramid.js";
+import { TILE_ATLAS_MAX_SIDE } from "./segments.js";
 
 /** Outcome of the functional float-blend probe: the exact sum (`"pass"`), a wrong one (`"wrong-sum"`, a
  *  driver that blends wrongly or at half precision), or no verdict because the probe could not build or
@@ -36,6 +37,9 @@ export interface GpuCaps {
   blendProbe: BlendProbe | null;
 }
 
+/** Slots the GPU nested layout can index (#355): its passes read slot ids as float32, exact below 2^24. */
+export const NESTED_MAX_SLOTS = 1 << 24;
+
 /** The texture sides the GPU layout allocates for one graph. */
 export interface GpuLayoutNeed {
   /** Position / velocity / force atlas: one texel per node, ⌈√N⌉ wide. */
@@ -45,8 +49,22 @@ export interface GpuLayoutNeed {
   offsetsSide: number;
   /** Spring (CSR neighbour) atlas: one texel per half-edge, ⌈√2E⌉ wide. */
   springSide: number;
-  /** Finest grid-pyramid level: next power of two ≥ √N, clamped to [16, 1024]. */
+  /** Finest grid-pyramid level: next power of two ≥ √N, clamped to [16, 1024]. For the nested layout, the
+   *  larger side of its segments' tile atlas (the pyramid's level 0, `packTiles`; 0 without tiles). */
   pyramidSide: number;
+  /** What only the nested layout needs ({@link GpuNestedNeed}); absent for the flat layout. */
+  nested?: GpuNestedNeed;
+}
+
+/**
+ * The GPU nested layout's needs past the four sides above (#355, `gpuNestedLayoutNeed`): the limits its
+ * constructor enforces, so the verdict — not a throw — finds a tree the device cannot run.
+ */
+export interface GpuNestedNeed {
+  /** Slots (tree nodes below the root), below {@link NESTED_MAX_SLOTS}. */
+  slots: number;
+  /** The per-segment large-slot table: `NESTED_LARGE_MAX` slot ids per segment, ⌈√(2(S + 1))⌉ wide. */
+  largeSide: number;
 }
 
 /** The GPU layout's verdict for one device and graph. */
@@ -67,9 +85,28 @@ export function gpuLayoutNeed(nodeCount: number, edgeCount: number): GpuLayoutNe
 }
 
 /**
+ * The part of a GPU nested layout's need its slot count alone decides (#355, #375), for the check before
+ * the prep builds the segments and links: the slot atlas (every per-slot texture), the CSR offsets and
+ * the slot count. It names no grid pyramid, which the nested solve never allocates; the springs, the tile
+ * atlas and the large-slot table are 0 until the prep sizes them (`gpuNestedLayoutNeed`, which extends
+ * this one). O(1).
+ */
+export function gpuNestedSlotNeed(slots: number): GpuLayoutNeed {
+  return {
+    positionSide: atlasWidth(slots),
+    offsetsSide: atlasWidth(slots + 1),
+    springSide: 0,
+    pyramidSide: 0,
+    nested: { slots, largeSide: 0 },
+  };
+}
+
+/**
  * Whether the GPU layout can run for `need` on a device with `caps`; `caps` is `null` when there is no
  * device (a Canvas/SVG render backend, SSR). The checks run in the order a user can act on them; the
- * first failure names its reason, which the caller logs before it falls back to the worker.
+ * first failure names its reason, which the caller logs before it falls back to the worker. A nested
+ * `need` also checks the tree against the nested layout's own limits: its slot count, its tile atlas
+ * against the 16-bit tile origin, and its large-slot table.
  */
 export function gpuLayoutSupport(caps: GpuCaps | null, need: GpuLayoutNeed): GpuLayoutSupport {
   if (!caps) return { ok: false, reason: "no WebGL device (a Canvas/SVG render backend, or SSR)" };
@@ -80,17 +117,25 @@ export function gpuLayoutSupport(caps: GpuCaps | null, need: GpuLayoutNeed): Gpu
   if (!caps.floatBlend) {
     return { ok: false, reason: "the device cannot blend into float textures (EXT_float_blend)" };
   }
+  const nested = need.nested;
+  if (nested && nested.slots >= NESTED_MAX_SLOTS) {
+    return { ok: false, reason: `the module tree has ${nested.slots} nodes below its root, past the ${NESTED_MAX_SLOTS} slots the GPU nested layout indexes` };
+  }
   const limit = caps.maxTextureDimension2D;
   const sides: [string, number][] = [
     ["position", need.positionSide],
     ["CSR offsets", need.offsetsSide],
     ["spring", need.springSide],
-    ["grid pyramid", need.pyramidSide],
+    [nested ? "tile atlas" : "grid pyramid", need.pyramidSide],
   ];
+  if (nested) sides.push(["large-slot table", nested.largeSide]);
   for (const [name, side] of sides) {
     if (side > limit) {
       return { ok: false, reason: `the graph needs a ${side}-texel ${name} texture, past the device's ${limit}-texel limit` };
     }
+  }
+  if (nested && need.pyramidSide > TILE_ATLAS_MAX_SIDE) {
+    return { ok: false, reason: `the graph needs a ${need.pyramidSide}-texel tile atlas, past the ${TILE_ATLAS_MAX_SIDE} texels a tile origin addresses` };
   }
   if (caps.blendProbe === "wrong-sum") {
     return { ok: false, reason: "float blending gave a wrong sum in the functional probe (driver bug)" };

@@ -26,8 +26,10 @@ import { fullScreenModel, NO_BLEND, type PassUniforms } from "./fullscreen.js";
 //
 // The one difference from the CPU is Jacobi vs Gauss-Seidel: the CPU applies its links one after
 // another (each reads the velocities the previous ones changed); here every link reads the same v*
-// (spec §11.1, Q6: covered by the documented tolerance). No step clamp and no stabilizer: the CPU nested
-// solve has neither.
+// (spec §11.1, Q6: covered by the documented tolerance). No step clamp and no velocity stabilizer: the CPU
+// nested solve has neither. Summed at once, a hub's springs can overshoot where the CPU's cannot, so a slot
+// past the Jacobi bound has its spring terms relaxed (`NestedSolverTopology.springScale`, folded into its
+// CSR row weights: nothing here reads it).
 //
 // Each segment's alpha follows its own schedule from `segParam.w` (alpha0: 1 cold, WARM_ALPHA warm,
 // #328). The CPU decays alpha by a float64 recurrence per module; the solver replays it on the CPU for

@@ -20,6 +20,9 @@
 //   ("large") slots.
 // - **Links:** every segment's sparsified, weighted sibling links in slot ids (a spring each way stays two
 //   links, as the CPU solves it). They never cross segments, by construction.
+// - **Per slot, its spring relaxation** ω ≤ 1 ({@link nestedSpringScale}): the GPU applies all of a slot's
+//   springs at once (Jacobi), and ω keeps that update stable at a hub, where the CPU's one link at a time
+//   needs none.
 //
 // k = 1 segments are FROZEN on the GPU: no forces act on a lone child (its seed is the origin), and the
 // composition places it at its parent's centre with 0.9 of its radius, as the CPU does.
@@ -28,6 +31,7 @@
 // transferred. Cost: O(tree size + Σ links · log links) (the per-module link sparsification sorts).
 import {
   EXACT_MAX,
+  NESTED,
   Scratch,
   WARM_ALPHA,
   placeOver,
@@ -41,6 +45,54 @@ import {
 
 /** Most "large" slots a segment has: every other slot's radius is at most the 9th-largest (spec §11.1). */
 export const NESTED_LARGE_MAX = 8;
+
+/**
+ * The largest spring gain `α₀ · ω · D` a slot keeps on the GPU (see {@link nestedSpringScale}):
+ * `(1 + keep) / (1 + 2 · keep)` with `keep = 1 − DECAY`, so 8/11.
+ *
+ * The CPU solve applies a module's links one after another, each from the positions the links before it
+ * left, so each is a partial projection and the pass never overshoots. The GPU applies every link of a
+ * slot at once from one predictor `y = x + v*` (Jacobi): slot i's velocity takes `½ · α · Σ_j w_ij · s_ij
+ * · (y_j − y_i)`, where `s_ij = r_j² / (r_i² + r_j²)` is its share of the correction (the smaller disc
+ * moves more). With `m = r²` and the relaxations `Ω = diag(ω)`, that operator is `−Ω M⁻¹ L`, L the
+ * Laplacian of the symmetric weights `½ · w_ij · m_i · m_j / (m_i + m_j)`. A positive diagonal times a
+ * symmetric positive semidefinite matrix has real, non-negative modes, and by Gershgorin their gains g lie
+ * in `[0, 2 · α · max_i ω_i · D_i]`, where `D_i = ½ · Σ_j w_ij · s_ij` is slot i's summed share of its
+ * links. The stiffest mode is two linked slots moving against each other, at `g = 2 · α · ω · D`.
+ *
+ * Per tick, a mode of gain g maps its `(x, v)` by a matrix of trace `1 + keep − 2 · keep · g` and
+ * determinant `keep · (1 − g)`. It diverges past `g = 2 (1 + keep) / (3 · keep)` (16/9; on web-NotreDame's
+ * directed Infomap tree 3,768 slots have a D past it, up to 135 at 612 links: a low-flow hub's disc is no
+ * larger than its neighbours', so it takes half or more of each link's correction and D grows with its
+ * degree). Up to `g = 2 (1 + keep) / (1 + 2 · keep)` (16/11) its oscillating (negative) root stays within
+ * `keep`: the stiffest mode then damps at least as fast as a free slot's velocity. Every slot's
+ * `α₀ · ω · D` is held to half that.
+ *
+ * Gravity keeps these modes: it is `G · α` for every slot of a segment (the identity on its modes), and
+ * the predictor reads it at x, before the springs read `y`. With gravity `q = G · α`, the trace becomes
+ * `1 + keep − keep · (2g + q − g · q)` and the determinant stays `keep · (1 − g)`, which moves a negative
+ * root (g > 1) toward zero: at the cap with `q = G` (α = 1) the roots are 0.46 and −0.59. So the bound
+ * holds with gravity. Were gravity read at `y` like the springs, it would add to g instead.
+ */
+export const NESTED_SPRING_GAIN_MAX = (2 - NESTED.DECAY) / (3 - 2 * NESTED.DECAY);
+
+/**
+ * Slot i's spring relaxation on the GPU, `ω_i = min(1, NESTED_SPRING_GAIN_MAX / (α₀ · D_i))`, from its
+ * segment's starting alpha `alpha0` (alpha only decays from it) and its summed link share `share` = D_i
+ * (see {@link NESTED_SPRING_GAIN_MAX}). ω scales only slot i's own spring terms: a slot within the bound
+ * keeps the CPU's springs exactly, and a hub's springs pull it less per tick against its repulsion and
+ * gravity, so its static balance with them is not the CPU's. Scaling its whole step instead would keep
+ * that balance, but it slows the hub against every force within the solve's fixed ticks, and it landed
+ * no nearer the CPU layout (the float64 reference on `gpu-backend-integration`'s hub-heavy map: module
+ * 2's hubs at 0.15 / 0.11 of its radius from its centre, against 0.32 / 0.33 relaxed this way and the
+ * CPU's 0.54 / 0.55).
+ * It reads only static data (weights and radii), so the solve folds it into the springs' CSR row weights
+ * once and spends nothing on it per tick.
+ */
+export function nestedSpringScale(alpha0: number, share: number): number {
+  const gain = alpha0 * share;
+  return gain > NESTED_SPRING_GAIN_MAX ? NESTED_SPRING_GAIN_MAX / gain : 1;
+}
 
 /** The data of one batched nested solve — see the file header. */
 export interface NestedSolverTopology {
@@ -79,6 +131,12 @@ export interface NestedSolverTopology {
   readonly linkSource: Uint32Array;
   readonly linkTarget: Uint32Array;
   readonly linkWeight: Float32Array;
+  /**
+   * Each slot's spring relaxation ω ∈ (0, 1] ({@link nestedSpringScale}): the factor on its own spring
+   * terms, carried in its row of the springs' CSR. 1 for every slot within
+   * {@link NESTED_SPRING_GAIN_MAX}, so only hubs differ from the CPU's springs.
+   */
+  readonly springScale: Float32Array;
   /** Composition depth: the longest chain of segments from the root's down to a leaf's. */
   readonly depth: number;
   /** Leaves (tree ids `0 … leafCount − 1`) and tree nodes. */
@@ -133,6 +191,7 @@ export function nestedSolverTopology(topo: NestedLayoutTopology, params: NestedL
   const nodeSlot = new Int32Array(size).fill(-1);
   const radius = new Float32Array(slotCount);
   const seed = new Float32Array(2 * slotCount);
+  const springScale = new Float32Array(slotCount).fill(1);
 
   let slot = 0;
   let maxDepth = 0;
@@ -163,6 +222,7 @@ export function nestedSolverTopology(topo: NestedLayoutTopology, params: NestedL
   const linkTarget: number[] = [];
   const linkWeight: number[] = [];
   const order: number[] = [];
+  let share = new Float64Array(0);
   modules.forEach((g, s) => {
     const start = childOffset[g] ?? 0;
     const end = childOffset[g + 1] ?? 0;
@@ -172,16 +232,28 @@ export function nestedSolverTopology(topo: NestedLayoutTopology, params: NestedL
     if (k === 1) return; // FROZEN: radius and seed stay 0, no links
     const setup = setupModule(topo, g, start, end, weight, packing, scratch, warm);
     segAlpha0[s] = setup.seeded ? WARM_ALPHA : 1;
+    if (share.length < k) share = new Float64Array(k);
     for (let i = 0; i < k; i++) {
       radius[base + i] = scratch.rad[i] ?? 0;
       seed[2 * (base + i)] = scratch.x[i] ?? 0;
       seed[2 * (base + i) + 1] = scratch.y[i] ?? 0;
     }
+    // Each child's summed link share D (`share`, k entries), then its spring relaxation.
+    share.fill(0, 0, k);
     for (let l = 0; l < setup.la.length; l++) {
-      linkSource.push(base + (setup.la[l] ?? 0));
-      linkTarget.push(base + (setup.lb[l] ?? 0));
-      linkWeight.push(setup.lw[l] ?? 0);
+      const a = setup.la[l] ?? 0;
+      const b = setup.lb[l] ?? 0;
+      const w = setup.lw[l] ?? 0;
+      linkSource.push(base + a);
+      linkTarget.push(base + b);
+      linkWeight.push(w);
+      const ma = (scratch.rad[a] ?? 0) ** 2;
+      const mb = (scratch.rad[b] ?? 0) ** 2;
+      share[a] = (share[a] ?? 0) + (0.5 * w * mb) / (ma + mb);
+      share[b] = (share[b] ?? 0) + (0.5 * w * ma) / (ma + mb);
     }
+    const alpha0 = segAlpha0[s] ?? 1;
+    for (let i = 0; i < k; i++) springScale[base + i] = nestedSpringScale(alpha0, share[i] ?? 0);
     if (k <= EXACT_MAX) return;
     // Collision: r₉ and the slots above it (at most 8, since only 8 radii exceed the 9th-largest) —
     // compared in float32, as the cell pass compares them: a slot it bins must not also be large.
@@ -214,6 +286,7 @@ export function nestedSolverTopology(topo: NestedLayoutTopology, params: NestedL
     linkSource: Uint32Array.from(linkSource),
     linkTarget: Uint32Array.from(linkTarget),
     linkWeight: Float32Array.from(linkWeight),
+    springScale,
     depth: maxDepth,
     leafCount,
     treeSize: size,
@@ -228,7 +301,7 @@ export function nestedSolverTopology(topo: NestedLayoutTopology, params: NestedL
 export function nestedSolverBuffers(t: NestedSolverTopology): ArrayBuffer[] {
   const arrays = [
     t.segStart, t.segCount, t.segModule, t.segOwner, t.segAlpha0, t.segR9, t.segLarge,
-    t.slotNode, t.nodeSlot, t.radius, t.seed, t.linkSource, t.linkTarget, t.linkWeight,
+    t.slotNode, t.nodeSlot, t.radius, t.seed, t.linkSource, t.linkTarget, t.linkWeight, t.springScale,
   ];
   const buffers: ArrayBuffer[] = [];
   for (const a of arrays) if (a.buffer instanceof ArrayBuffer) buffers.push(a.buffer);
