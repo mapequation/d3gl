@@ -6,6 +6,8 @@
  * probe (`gpuLayoutSupport` over `gpuCaps`). The fallback is a full worker run: it keeps every layout
  * option (`multilevel`, `lod`, `coarsen`, `frameEvery`) and streams the LOD tree through `onLODTree`,
  * exactly as `layout({ backend: "worker" })` would (#312), and one `console.warn` names the reason.
+ * `layout({ backend: "auto" })` (#375) runs the same code with {@link GpuLayoutOptions.warnUnsupported}
+ * off: there the worker is an expected outcome, so an unsupported device or graph falls back silently.
  *
  * Milestone A (N8.1): plain disc seed (at the force equilibrium's scale) + streaming rAF loop, cooled
  * over the iteration budget like the worker (#124). N8.5 (#183) adds drag/reheat parity:
@@ -33,6 +35,13 @@ import type { NetworkGraph } from "../graph.js";
 export interface GpuLayoutOptions extends WorkerLayoutOptions {
   /** The provided module tree topology (from `lod({ modules })`), for the module-aware multilevel seed. */
   moduleTopology?: LODTopology;
+  /**
+   * Warn when the device or the graph is unsupported and the layout falls back to the worker (default
+   * `true`: `layout({ backend: "gpu" })` asked for the GPU). `layout({ backend: "auto" })` passes `false`
+   * (#375), because there the worker is an expected outcome. A GPU run that fails rather than being
+   * unsupported (its device promise rejects, or it throws while starting) warns either way, with the error.
+   */
+  warnUnsupported?: boolean;
 }
 
 /** The transport a GPU layout resolved to: the GPU solve, or the worker fallback. */
@@ -51,8 +60,9 @@ const REHEAT_BATCH = 3;
  * that resolves after the backend settles (including the `"auto"` → WebGL background upgrade).
  * When passed a plain `Device | null` value it resolves synchronously.
  *
- * - If `gpuLayoutSupport` rejects the device for this graph → one warning with the reason, then
- *   {@link startWorkerLayout} with the same options and `onLODTree` (it has its own sync fallback).
+ * - If `gpuLayoutSupport` rejects the device for this graph → one warning with the reason (none with
+ *   `warnUnsupported: false`), then {@link startWorkerLayout} with the same options and `onLODTree` (it
+ *   has its own sync fallback).
  * - Otherwise: seeds positions, constructs {@link GpuForceLayout}, and runs a streaming rAF loop
  *   until `iterations` are done, calling `onFrame` after each batch.
  *
@@ -114,11 +124,11 @@ export function startGpuLayout(
       if (!stopped) adopt(startGpuLayoutSync(device, graph, opts, onFrame, onLODTree, onTransport));
     },
     (e: unknown) => {
-      if (!stopped) adopt(fallBackToWorker("the device promise rejected", graph, opts, onFrame, onLODTree, onTransport, e));
+      if (!stopped) adopt(fallBackToWorker("the device promise rejected", graph, opts, onFrame, onLODTree, onTransport, { cause: e }));
     },
   ).catch((e: unknown) => {
     // The GPU run failed to start (e.g. a driver rejected a shader): the worker still lays it out.
-    if (!stopped && !inner) adopt(fallBackToWorker("the GPU layout failed to start", graph, opts, onFrame, onLODTree, onTransport, e));
+    if (!stopped && !inner) adopt(fallBackToWorker("the GPU layout failed to start", graph, opts, onFrame, onLODTree, onTransport, { cause: e }));
   });
 
   return wrapper;
@@ -126,7 +136,11 @@ export function startGpuLayout(
 
 /**
  * The fallback: a worker run with the GPU layout's options and LOD-tree callback, reported as the
- * `"worker"` transport. `shared` reads the worker handle live (it flips on a worker error, #297).
+ * `"worker"` transport. `shared` reads the worker handle live (it flips on a worker error, #297). It
+ * warns once with `reason`: always for a `failure` (the device promise rejected or the GPU run threw,
+ * passing the error when there is one), and for an unsupported device or graph unless the caller expects
+ * the fallback (`warnUnsupported: false`). The call site says which it is, never the error value: a
+ * rejection or throw with `undefined` is still a failure.
  */
 function fallBackToWorker(
   reason: string,
@@ -135,11 +149,15 @@ function fallBackToWorker(
   onFrame: () => void,
   onLODTree: ((tree: LODTree) => void) | undefined,
   onTransport: ((transport: GpuLayoutTransport) => void) | undefined,
-  cause?: unknown,
+  failure?: { cause: unknown },
 ): WorkerLayoutHandle {
-  const message = `[d3gl] network layout({ backend: 'gpu' }) fell back to the CPU worker: ${reason}.`;
-  if (cause === undefined) console.warn(message);
-  else console.warn(message, cause);
+  const message = `[d3gl] the GPU network layout fell back to the CPU worker: ${reason}.`;
+  if (failure) {
+    if (failure.cause === undefined) console.warn(message);
+    else console.warn(message, failure.cause);
+  } else if (opts.warnUnsupported !== false) {
+    console.warn(message);
+  }
   onTransport?.("worker");
   const worker = startWorkerLayout(graph, opts, onFrame, onLODTree);
   return {
