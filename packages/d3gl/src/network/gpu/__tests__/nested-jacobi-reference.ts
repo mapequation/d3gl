@@ -23,7 +23,11 @@ export class NestedJacobiReference {
   readonly vy: Float64Array;
   private readonly topo: NestedSolverTopology;
   private readonly segOf: Uint32Array;
-  /** CSR of the links in buildCSR's order (per link: its source's row, then its target's): neighbour and weight. */
+  /**
+   * CSR of the links in buildCSR's order (per link: its source's row, then its target's): neighbour and
+   * weight, the weight times the row slot's spring relaxation (`springScale`) and rounded to float32, as
+   * the GPU springs upload it.
+   */
   private readonly rowStart: Uint32Array;
   private readonly rowNbr: Uint32Array;
   private readonly rowW: Float64Array;
@@ -70,8 +74,8 @@ export class NestedJacobiReference {
       const a = at(topo.linkSource, l);
       const b = at(topo.linkTarget, l);
       const w = at(topo.linkWeight, l);
-      put(a, b, w);
-      put(b, a, w);
+      put(a, b, Math.fround(w * at(topo.springScale, a)));
+      put(b, a, Math.fround(w * at(topo.springScale, b)));
     }
   }
 

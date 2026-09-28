@@ -6,10 +6,25 @@ import { beforeAll, describe, expect, it } from "vitest";
 import type { Device, Framebuffer, FramebufferProps, Texture, TextureProps } from "@luma.gl/core";
 import { makeTestDevice } from "./_device.js";
 import { NestedJacobiReference } from "./nested-jacobi-reference.js";
-import { GpuNestedLayout } from "../gpu-nested-layout.js";
+import { GpuNestedLayout, nestedLayoutPlan } from "../gpu-nested-layout.js";
 import { nestedSolverResult, nestedSolverTopology, type NestedSolverTopology } from "../nested-topology.js";
 import { NESTED, nestedLayout, type NestedLayoutParams, type NestedLayoutResult, type NestedLayoutTopology } from "../../nested-layout.js";
-import { expectNested, kids, linkTightness, meanShift, reclustered, rootOf, similar, spreadOf, threeLevel, topo, twoLevel } from "../../__tests__/nested-fixtures.js";
+import {
+  directedPartition,
+  expectContained,
+  expectNested,
+  kids,
+  linkTightness,
+  meanShift,
+  reclustered,
+  rootOf,
+  similar,
+  spreadOf,
+  threeLevel,
+  topo,
+  twoLevel,
+  worstSeparation,
+} from "../../__tests__/nested-fixtures.js";
 import { COLLISION_RELAX, COLLISION_STEPS } from "../passes/collision.js";
 
 /** Minimal seeded LCG PRNG. */
@@ -99,15 +114,30 @@ describe("GPU nested layout (#355) against its Jacobi reference", () => {
     device = await makeTestDevice();
   });
 
-  /** GPU and reference after every tick of `ticks`, compared on the slots' local positions. */
-  function compareTicks(topo: NestedSolverTopology, ticks: number, organise?: number): number {
-    const layout = new GpuNestedLayout(device, topo, organise === undefined ? {} : { organise });
+  /**
+   * GPU and reference after every tick of `ticks`, compared on the slots' local positions. With `restart`,
+   * the reference starts each tick from the GPU's own positions and velocities, so each tick is compared
+   * alone and float32 rounding does not compound across ticks.
+   */
+  function compareTicks(topo: NestedSolverTopology, ticks: number, organise?: number, restart = false): number {
+    const layout = new GpuNestedLayout(device, nestedLayoutPlan(topo), organise === undefined ? {} : { organise });
     const ref = new NestedJacobiReference(topo, organise);
     const local = new Float32Array(2 * topo.slotCount);
+    const vel = new Float32Array(2 * topo.slotCount);
     const want = new Float64Array(2 * topo.slotCount);
     let worst = 0;
     try {
       for (let t = 0; t < ticks; t++) {
+        if (restart && t > 0) {
+          layout.readLocal(local);
+          layout.readVelocity(vel);
+          for (let i = 0; i < topo.slotCount; i++) {
+            ref.x[i] = local[2 * i] ?? 0;
+            ref.y[i] = local[2 * i + 1] ?? 0;
+            ref.vx[i] = vel[2 * i] ?? 0;
+            ref.vy[i] = vel[2 * i + 1] ?? 0;
+          }
+        }
         runAll(layout, 1);
         ref.step();
         layout.readLocal(local);
@@ -133,17 +163,20 @@ describe("GPU nested layout (#355) against its Jacobi reference", () => {
 
   it("finds every colliding pair through the grid: a heavy-tailed 600-child segment matches the exact reference", () => {
     // No organise phase, so no Barnes-Hut: springs, integration and collision only, all exact-comparable.
+    // Each tick is compared from the GPU's own state: in this dense pack the float64 reference itself
+    // amplifies a 1e-9 displacement about 1e4-fold over the 12 ticks (a small disc wedged among several
+    // larger ones), so free-running float32 and float64 solves drift apart whatever the grid finds.
     const { topo, size } = makeTree([600, 45, 90], 1, 2, 11);
     const solver = nestedSolverTopology(topo, { size, iterations: 12 });
     expect(Math.max(...solver.segCount)).toBe(600);
     expect(solver.segLarge.some((s) => s >= 0)).toBe(true); // large slots exist
-    expect(compareTicks(solver, 12, 0)).toBeLessThan(2e-5);
+    expect(compareTicks(solver, 12, 0, true)).toBeLessThan(2e-5);
   });
 
   it("a collision step keeps each segment's mass-weighted centre where the integration put it", () => {
     const { topo, size } = makeTree([400, 50], 1, 0, 3); // no links: gravity only, then collision
     const solver = nestedSolverTopology(topo, { size, iterations: 10 });
-    const layout = new GpuNestedLayout(device, solver, { organise: 0 });
+    const layout = new GpuNestedLayout(device, nestedLayoutPlan(solver), { organise: 0 });
     try {
       runAll(layout, 1);
       const local = new Float32Array(2 * solver.slotCount);
@@ -201,7 +234,7 @@ describe("GPU nested layout (#355) against its Jacobi reference", () => {
         large[seg * 8] = a;
         large[seg * 8 + 1] = b;
       }
-      const layout = new GpuNestedLayout(device, solver, { organise: 0 });
+      const layout = new GpuNestedLayout(device, nestedLayoutPlan(solver), { organise: 0 });
       try {
         runAll(layout, 1);
         const local = new Float32Array(2 * solver.slotCount);
@@ -223,8 +256,8 @@ describe("GPU nested layout (#355) against its Jacobi reference", () => {
   it("is bitwise independent of how its stream ticks are cut into bands (repulsion and collision gathers)", () => {
     const { topo: tree, size } = makeTree([600, 45, 90, 12], 2, 2, 13);
     const solver = nestedSolverTopology(tree, { size, iterations: 20 });
-    const whole = new GpuNestedLayout(device, solver);
-    const sliced = new GpuNestedLayout(device, solver);
+    const whole = new GpuNestedLayout(device, nestedLayoutPlan(solver));
+    const sliced = new GpuNestedLayout(device, nestedLayoutPlan(solver));
     try {
       whole.runTicks(solver.iterations);
       for (let t = 0; t < sliced.streamTicks; t++) {
@@ -270,13 +303,13 @@ describe("GPU nested layout (#355) against its Jacobi reference", () => {
         created.length = 0;
         fbos = 0;
         failAt = k;
-        expect(() => new GpuNestedLayout(device, solver)).toThrow(/injected/);
+        expect(() => new GpuNestedLayout(device, nestedLayoutPlan(solver))).toThrow(/injected/);
         expect(created.length, `resources created before framebuffer ${k}`).toBeGreaterThanOrEqual(k + 3);
         expect(created.filter((r) => !r.destroyed).length, `resources left alive after a failure at framebuffer ${k}`).toBe(0);
       }
       created.length = 0;
       failAt = 0;
-      new GpuNestedLayout(device, solver).destroy();
+      new GpuNestedLayout(device, nestedLayoutPlan(solver)).destroy();
       expect(created.length).toBeGreaterThan(20);
       expect(created.filter((r) => !r.destroyed).length, "resources left alive by destroy()").toBe(0);
     } finally {
@@ -288,7 +321,7 @@ describe("GPU nested layout (#355) against its Jacobi reference", () => {
   it("composes like the reference: leaves and module discs in world units", () => {
     const { topo: tree, size } = makeTree([6, 12, 3, 30, 1, 9, 20, 2], 3, 3);
     const solver = nestedSolverTopology(tree, { size, iterations: 30 });
-    const layout = new GpuNestedLayout(device, solver);
+    const layout = new GpuNestedLayout(device, nestedLayoutPlan(solver));
     const ref = new NestedJacobiReference(solver);
     try {
       runAll(layout, 30);
@@ -327,7 +360,7 @@ describe("GPU nested layout (#355): the CPU layout's invariants and behaviour on
    */
   function gpuNested(tree: NestedLayoutTopology, params: NestedLayoutParams = {}): NestedLayoutResult {
     const solver = nestedSolverTopology(tree, params);
-    const layout = new GpuNestedLayout(device, solver);
+    const layout = new GpuNestedLayout(device, nestedLayoutPlan(solver));
     try {
       runAll(layout, solver.iterations);
       const positions = new Float32Array(2 * solver.leafCount);
@@ -374,6 +407,49 @@ describe("GPU nested layout (#355): the CPU layout's invariants and behaviour on
     it("is deterministic on one device: two runs are bitwise equal", () => {
       expect(Array.from(gpuNested(topo(tree)).positions)).toEqual(Array.from(gpuNested(topo(tree)).positions));
     });
+  });
+
+  it("keeps a directed partition's small hubs bounded: finite and O(1) every tick, nested, links as tight as the CPU's", () => {
+    // web-NotreDame's directed Infomap tree went non-finite here: a low-flow hub's disc is no larger than
+    // its neighbours', so it takes half or more of each link's correction, its summed share D grows with
+    // its degree, and the Jacobi springs overshot (see NESTED_SPRING_GAIN_MAX). The fixture's hubs are
+    // that shape (D ≈ 38, and two linked hubs).
+    const { tree, flow } = directedPartition();
+    const solver = nestedSolverTopology(topo(tree), { size: flow });
+    /** Largest |local coordinate| over every tick of a GPU solve of `t`, and whether every tick stayed finite. */
+    const run = (t: NestedSolverTopology): { peak: number; finite: boolean } => {
+      const layout = new GpuNestedLayout(device, nestedLayoutPlan(t));
+      const local = new Float32Array(2 * t.slotCount);
+      let peak = 0;
+      let finite = true;
+      try {
+        for (let tick = 0; tick < t.iterations; tick++) {
+          runAll(layout, 1);
+          layout.readLocal(local);
+          for (const v of local) {
+            if (!Number.isFinite(v)) finite = false;
+            else peak = Math.max(peak, Math.abs(v));
+          }
+        }
+      } finally {
+        layout.destroy();
+      }
+      return { peak, finite };
+    };
+    const relaxed = run(solver);
+    expect(relaxed.finite).toBe(true);
+    expect(relaxed.peak, "local coordinates are the unit disc").toBeLessThan(2);
+    // The control: the same tree with the springs unrelaxed overflows float32, as web-NotreDame's did.
+    expect(run({ ...solver, springScale: new Float32Array(solver.slotCount).fill(1) }).finite).toBe(false);
+    // The layout's invariants, held to the CPU layout's own result on the tree: its 151-child module packs
+    // tiny discs pulled toward one hub, and the CPU leaves siblings overlapping there too (0.84 of the
+    // radius sum), as on the heavy-tailed map below.
+    const out = gpuNested(topo(tree), { size: flow });
+    const cpu = nestedLayout(topo(tree), { size: flow });
+    expectContained(tree, out);
+    expect(worstSeparation(tree, out)).toBeGreaterThanOrEqual(worstSeparation(tree, cpu) - 0.02);
+    const tight = linkTightness(tree, cpu);
+    expect(linkTightness(tree, out), `the CPU's ${tight.toFixed(3)}`).toBeLessThan(tight + 0.02);
   });
 
   it("keeps the invariants on a three-level map whose bottom modules take the tile and grid paths (50 children)", () => {

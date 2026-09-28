@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { gpuLayoutNeed, gpuLayoutSupport, type GpuCaps } from "../device-caps.js";
+import { NESTED_MAX_SLOTS, gpuLayoutNeed, gpuLayoutSupport, gpuNestedSlotNeed, type GpuCaps, type GpuLayoutNeed } from "../device-caps.js";
 
 /**
  * The GPU layout's capability matrix (#351): a pure decision over a typed {@link GpuCaps} record, so
@@ -131,5 +131,75 @@ describe("gpuLayoutSupport", () => {
 
   it("does not depend on the readback format (RGBA/FLOAT is the guaranteed fallback)", () => {
     expect(gpuLayoutSupport({ ...FULL, readRG: false }, NOTRE_DAME)).toEqual({ ok: true });
+  });
+});
+
+describe("gpuLayoutSupport with a nested need (#355, #375)", () => {
+  const atlasSide = (n: number): number => Math.ceil(Math.sqrt(n));
+  /** A tree of web-NotreDame's directed Infomap tree's size (372,729 slots, 47,001 segments, 600,941 kept links) with a 1024-texel tile atlas. */
+  const tree = (over: Partial<GpuLayoutNeed> = {}, nested: Partial<NonNullable<GpuLayoutNeed["nested"]>> = {}): GpuLayoutNeed => ({
+    ...gpuLayoutNeed(372_729, 600_941),
+    pyramidSide: 1024,
+    ...over,
+    nested: { slots: 372_729, largeSide: atlasSide(2 * 47_002), ...nested },
+  });
+
+  it("accepts a tree whose every texture fits", () => {
+    expect(gpuLayoutSupport(FULL, tree())).toEqual({ ok: true });
+  });
+
+  it("names the tile atlas, not a grid pyramid, when it is past the texture limit", () => {
+    const r = gpuLayoutSupport({ ...FULL, maxTextureDimension2D: 4096 }, tree({ pyramidSide: 8192 }));
+    expect(r).toEqual({ ok: false, reason: "the graph needs a 8192-texel tile atlas texture, past the device's 4096-texel limit" });
+  });
+
+  it("rejects a tile atlas past the 16-bit tile origin on a device that allocates it", () => {
+    const r = gpuLayoutSupport({ ...FULL, maxTextureDimension2D: 1 << 17 }, tree({ pyramidSide: 1 << 17 }));
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.reason).toMatch(/131072-texel tile atlas, past the 65536 texels a tile origin addresses/);
+  });
+
+  it("rejects a large-slot table past the texture limit", () => {
+    const r = gpuLayoutSupport({ ...FULL, maxTextureDimension2D: 2048 }, tree({}, { largeSide: 2049 }));
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.reason).toMatch(/2049-texel large-slot table/);
+  });
+
+  it("rejects a tree past the slots float32 indexes exactly, whatever the device", () => {
+    const r = gpuLayoutSupport(FULL, tree({}, { slots: NESTED_MAX_SLOTS }));
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.reason).toMatch(/16777216 nodes below its root/);
+    expect(gpuLayoutSupport(FULL, tree({}, { slots: NESTED_MAX_SLOTS - 1 }))).toEqual({ ok: true });
+  });
+
+  it("checks the device's capabilities first", () => {
+    const r = gpuLayoutSupport({ ...FULL, floatBlend: false, blendProbe: null }, tree({}, { slots: NESTED_MAX_SLOTS }));
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.reason).toMatch(/EXT_float_blend/);
+  });
+});
+
+describe("gpuNestedSlotNeed: the nested check before the prep (#355, #375)", () => {
+  it("rejects a tree past the slots float32 indexes exactly from its slot count alone", () => {
+    const r = gpuLayoutSupport(FULL, gpuNestedSlotNeed(NESTED_MAX_SLOTS));
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.reason).toMatch(/16777216 nodes below its root/);
+    expect(gpuLayoutSupport(FULL, gpuNestedSlotNeed(NESTED_MAX_SLOTS - 1))).toEqual({ ok: true });
+  });
+
+  it("sizes the slot atlas and the CSR offsets as the flat need does, and no grid pyramid", () => {
+    const need = gpuNestedSlotNeed(372_729);
+    const flat = gpuLayoutNeed(372_729, 0);
+    expect([need.positionSide, need.offsetsSide]).toEqual([flat.positionSide, flat.offsetsSide]);
+    // The nested solve allocates no grid pyramid; its tile atlas, springs and large-slot table wait for the prep.
+    expect([need.pyramidSide, need.springSide, need.nested?.largeSide]).toEqual([0, 0, 0]);
+    expect(need.nested?.slots).toBe(372_729);
+  });
+
+  it("accepts a tree the flat grid estimate would reject: 1,166 slots on a 60-texel device", () => {
+    const caps = { ...FULL, maxTextureDimension2D: 60 };
+    // ⌈√1166⌉ = 35 fits; the flat pyramid's next power of two ≥ √1166 is 64.
+    expect(gpuLayoutSupport(caps, gpuLayoutNeed(1_166, 0))).toEqual({ ok: false, reason: "the graph needs a 64-texel grid pyramid texture, past the device's 60-texel limit" });
+    expect(gpuLayoutSupport(caps, gpuNestedSlotNeed(1_166))).toEqual({ ok: true });
   });
 });

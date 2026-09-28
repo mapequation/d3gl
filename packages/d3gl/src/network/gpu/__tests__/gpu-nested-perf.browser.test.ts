@@ -21,129 +21,51 @@
  * - **Per tick:** a solve tick allocates nothing, and a compact collision step draws exactly one count
  *   scatter and {@link COLLISION_ROUNDS} round scatters of N points (the K-occupant grid's fixed passes),
  *   never a draw of N points into a 1×1 viewport (#349).
+ *
+ * The **warm re-layout with a transition** — `layout({ backend: "auto", nested: { warm: true }, transition })`,
+ * the call an app makes after re-clustering, which `"auto"` sends to the GPU solve (#375) where it used to
+ * run on the worker — reads back only the final layout, in one frame, then eases to it. Pinned against
+ * the worker's warm + transition run on the same engine and map: the same transport bounds and GL
+ * signatures over the solve's frames, exactly one copy (each PBO written once and read once), and every
+ * callback of each solve frame within the transport ceiling (the worker spends no main-thread frame on the
+ * solve; the tween's frames are the same code on both paths).
+ *
+ * A node drag and a zoom sweep while the nested solve runs have their own guard,
+ * `gpu-nested-interaction-perf.browser.test.ts`; the fixture and the GL call log are `_nested-perf.ts`.
  */
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { Device } from "@luma.gl/core";
 import { network, type Network } from "../../network.js";
-import { buildGraph, type NetworkGraph } from "../../graph.js";
+import type { NetworkGraph } from "../../graph.js";
 import { buildModuleLODTree, type ModuleNode } from "../../modules.js";
 import { observeGpuLayoutFrames, type GpuFrameSample } from "../gpu-stream.js";
-import { GpuNestedLayout } from "../gpu-nested-layout.js";
+import { GpuNestedLayout, nestedLayoutPlan } from "../gpu-nested-layout.js";
 import { nestedSolverTopology } from "../nested-topology.js";
-import { COLLISION_ROUNDS, COLLISION_STEPS } from "../passes/collision.js";
+import { COLLISION_ROUNDS } from "../passes/collision.js";
 import { MIN_FRAME_MS } from "../repaint-throttle.js";
 import { makeTestDevice } from "./_device.js";
 import { perfBudget, perfN } from "../../../__tests__/perf-budget.js";
 import { perfHost } from "../../../__tests__/engine-sweep.js";
+import {
+  GlCallLog,
+  H,
+  ITERATIONS,
+  RafTimer,
+  STREAM_TICKS,
+  W,
+  assertFencedHarvests,
+  infomapLike,
+  median,
+  pboAccesses,
+  perFrame,
+  quantile,
+  type GlEvent,
+} from "./_nested-perf.js";
 
 const LOCAL_N = 20_000; // the leaves the fixture defaults to (the ceilings below were measured there)
 // Capped: SwiftShader runs the compact phase's collision gathers slowly (a dense segment falls back to
 // its exact loop); real-GPU runs at 325k / 1M go through PERF_BROWSER_N by hand.
 const N = perfN(LOCAL_N, { max: 1_000_000 });
-const ITERATIONS = 30; // 18 organise + 12 compact solve ticks = 18 + 24 stream ticks
-const STREAM_TICKS = 18 + COLLISION_STEPS * 12;
-const W = 800;
-const H = 600;
-
-/** Minimal seeded LCG. */
-function makePrng(seed: number): () => number {
-  let s = seed >>> 0;
-  return () => {
-    s = (Math.imul(1664525, s) + 1013904223) >>> 0;
-    return s / 0x100000000;
-  };
-}
-
-/**
- * An Infomap-shaped map over `n` leaves: top modules of ~10 mid modules of ~40 leaves (so the bottom
- * segments take the tile + grid paths), leaves chained inside each bottom module, a few random links
- * between modules (the super-edges the sibling springs read), and a heavy-tailed flow.
- */
-function infomapLike(n: number): { graph: NetworkGraph; modules: ModuleNode[] } {
-  const rng = makePrng(0x355);
-  const modules: ModuleNode[] = [];
-  const source: number[] = [];
-  const target: number[] = [];
-  const flow = new Float32Array(n);
-  for (let id = 0; id < n; id++) {
-    const bottom = Math.floor(id / 40);
-    modules.push({ id, path: [Math.floor(bottom / 10) + 1, (bottom % 10) + 1, (id % 40) + 1] });
-    if (id % 40) {
-      source.push(id - 1);
-      target.push(id);
-    }
-    if (rng() < 0.2) {
-      source.push(id);
-      target.push(Math.floor(rng() * n));
-    }
-    flow[id] = (rng() + 0.05) ** -1.2;
-  }
-  return { graph: buildGraph({ nodeCount: n, source, target, nodeFlow: flow }), modules };
-}
-
-// ── GL call log (the flat streaming guard's, _gpu-stream-harness.ts) ────────────────────────────────
-
-type GlEvent =
-  | { kind: "copy"; toPbo: boolean }
-  | { kind: "harvest" }
-  | { kind: "fence"; sync: WebGLSync | null }
-  | { kind: "wait"; sync: WebGLSync; signaled: boolean }
-  | { kind: "layout-draw"; count: number; viewport1x1: boolean; points: boolean }
-  | { kind: "create" }
-  | { kind: "frame-end" };
-
-class GlCallLog {
-  readonly events: GlEvent[] = [];
-  private readonly restores: (() => void)[] = [];
-
-  constructor() {
-    const proto = WebGL2RenderingContext.prototype;
-    const log = this.events;
-    this.wrap(proto, "readPixels", (_gl, args) => log.push({ kind: "copy", toPbo: typeof args[6] === "number" }));
-    this.wrap(proto, "getBufferSubData", (gl, args) => {
-      if (args[0] === gl.PIXEL_PACK_BUFFER) log.push({ kind: "harvest" });
-    });
-    this.wrap(proto, "clientWaitSync", (gl, args, result) => {
-      const sync = args[0];
-      if (sync instanceof WebGLSync) {
-        log.push({ kind: "wait", sync, signaled: result === gl.ALREADY_SIGNALED || result === gl.CONDITION_SATISFIED });
-      }
-    });
-    this.wrap(proto, "fenceSync", (_gl, _args, result) => log.push({ kind: "fence", sync: result instanceof WebGLSync ? result : null }));
-    this.wrap(proto, "drawArrays", (gl, args) => {
-      if (gl.getParameter(gl.DRAW_FRAMEBUFFER_BINDING) === null) return;
-      const vp: unknown = gl.getParameter(gl.VIEWPORT);
-      const one = vp instanceof Int32Array && vp[2] === 1 && vp[3] === 1;
-      log.push({ kind: "layout-draw", count: typeof args[2] === "number" ? args[2] : 0, viewport1x1: one, points: args[0] === gl.POINTS });
-    });
-    for (const name of ["createBuffer", "createTexture", "createFramebuffer"] as const) {
-      this.wrap(proto, name, () => log.push({ kind: "create" }));
-    }
-  }
-
-  private wrap(
-    proto: WebGL2RenderingContext,
-    name: "readPixels" | "getBufferSubData" | "clientWaitSync" | "fenceSync" | "drawArrays" | "createBuffer" | "createTexture" | "createFramebuffer",
-    after: (gl: WebGL2RenderingContext, args: unknown[], result: unknown) => void,
-  ): void {
-    const installed: unknown = Reflect.get(proto, name);
-    if (typeof installed !== "function") throw new Error(`no ${name}`);
-    Object.defineProperty(proto, name, {
-      configurable: true,
-      writable: true,
-      value: function (this: WebGL2RenderingContext, ...args: unknown[]) {
-        const result: unknown = Reflect.apply(installed, this, args);
-        after(this, args, result);
-        return result;
-      },
-    });
-    this.restores.push(() => Object.defineProperty(proto, name, { configurable: true, writable: true, value: installed }));
-  }
-
-  restore(): void {
-    for (const r of this.restores) r();
-  }
-}
 
 interface Leg {
   frames: GpuFrameSample[];
@@ -174,25 +96,6 @@ async function streamLeg(net: Network, graph: NetworkGraph, modules: ModuleNode[
   return { frames, events: log.events, settledAfterFrame, elapsedMs: performance.now() - t0 };
 }
 
-function median(xs: number[]): number {
-  const s = xs.slice().sort((a, b) => a - b);
-  return s[s.length >> 1] ?? 0;
-}
-function quantile(xs: number[], q: number): number {
-  const s = xs.slice().sort((a, b) => a - b);
-  return s[Math.min(s.length - 1, Math.floor(q * s.length))] ?? 0;
-}
-
-function perFrame(events: GlEvent[]): GlEvent[][] {
-  const out: GlEvent[][] = [[]];
-  for (const e of events) {
-    if (e.kind === "frame-end") out.push([]);
-    else out[out.length - 1]?.push(e);
-  }
-  out.pop();
-  return out;
-}
-
 function assertSignatures(leg: Leg): void {
   const { frames, events } = leg;
   expect(frames.length).toBeGreaterThan(3);
@@ -200,20 +103,10 @@ function assertSignatures(leg: Leg): void {
   expect(copies.length).toBeGreaterThan(1); // a cold layout streams: more than the final copy
   expect(copies.every((e) => e.kind === "copy" && e.toPbo), "a synchronous readPixels on the streaming path").toBe(true);
 
-  const fenceAt = new Map<WebGLSync, number>();
-  let lastCopy = -1;
-  events.forEach((e, i) => {
-    if (e.kind === "copy") lastCopy = i;
-    else if (e.kind === "fence" && e.sync) fenceAt.set(e.sync, i);
-    else if (e.kind === "harvest") {
-      let ok = false;
-      for (let j = i - 1; j > lastCopy && !ok; j--) {
-        const w = events[j];
-        if (w?.kind === "wait" && w.signaled && (fenceAt.get(w.sync) ?? -1) > lastCopy) ok = true;
-      }
-      expect(ok, `harvest #${i} before its copy's fence signalled`).toBe(true);
-    }
-  });
+  assertFencedHarvests(events);
+  // One write, then one read, per PBO per copy: a harvest that reads a PBO twice (positions, then the
+  // module discs, from one buffer) stalls the GPU pipeline once per harvest.
+  for (const accesses of pboAccesses(events)) expect(accesses, "a readback PBO's writes (w) and reads (r)").toMatch(/^(wr)*w?$/);
 
   const segments = perFrame(events);
   expect(segments.length).toBe(frames.length);
@@ -259,6 +152,85 @@ function report(label: string, leg: Leg): { transport: number[]; encode: number[
   return { transport, encode, ticksPerSec };
 }
 
+// ── The warm re-layout with a transition (#328, #375) ────────────────────────────────────────────────
+
+// About 60 tween frames on a real GPU. Software GL (SwiftShader) renders a tween frame of 20k leaves in
+// 250-800 ms (LOD off), so there the tween has a handful of frames: the per-frame bound below is taken over
+// the solve's frames, where the two paths differ, not over the tween's, where they run the same code.
+const TRANSITION_MS = 1000;
+
+interface WarmLeg {
+  /** The GPU stream's frames (none on the worker). */
+  frames: GpuFrameSample[];
+  events: GlEvent[];
+  /** Main-thread ms of every frame from the call until it settled: the solve's and the tween's. */
+  rafMs: number[];
+  /** Main-thread ms of every callback of each GPU solve frame (the transport's, and anything else in that frame). */
+  solveMs: number[];
+  transport: string | null;
+  elapsedMs: number;
+}
+
+/**
+ * Lay the map out cold on the worker (the map a re-clustering starts from), then time the warm re-layout
+ * with a transition on `backend` until it settles (the transition's end).
+ */
+async function warmLeg(net: Network, graph: NetworkGraph, modules: ModuleNode[], lod: boolean, backend: "auto" | "worker"): Promise<WarmLeg> {
+  net.data(graph, { modules }).lod(lod ? { declutter: true } : false);
+  net.layout({ backend: "worker", nested: { iterations: ITERATIONS } });
+  await net.whenSettled();
+  const frames: GpuFrameSample[] = [];
+  const log = new GlCallLog();
+  const raf = new RafTimer();
+  const unobserve = observeGpuLayoutFrames((s) => {
+    frames.push({ ...s });
+    log.events.push({ kind: "frame-end" });
+  });
+  const t0 = performance.now();
+  let transport: string | null = null;
+  try {
+    net.layout({ backend, nested: { warm: true, iterations: ITERATIONS }, transition: TRANSITION_MS });
+    await net.whenSettled();
+    transport = net.layoutTransport;
+  } finally {
+    unobserve();
+    raf.restore();
+    log.restore();
+  }
+  return { frames, events: log.events, rafMs: raf.frames, solveMs: raf.at(frames.map((f) => f.now)), transport, elapsedMs: performance.now() - t0 };
+}
+
+/** The one-frame GPU solve's signatures: one copy, each PBO written once and read once after its fence. */
+function assertOneFrameSignatures(leg: WarmLeg): void {
+  const { frames, events } = leg;
+  expect(frames.length).toBeGreaterThan(1);
+  const copies = events.filter((e) => e.kind === "copy");
+  expect(copies.every((e) => e.kind === "copy" && e.toPbo), "a synchronous readPixels on the one-frame path").toBe(true);
+  // Exactly one copy: the final layout — positions, stats and module discs, one PBO each.
+  expect(pboAccesses(events), "each readback PBO's writes (w) and reads (r)").toEqual(["wr", "wr", "wr"]);
+  assertFencedHarvests(events);
+  expect(frames.filter((s) => s.copied).length, "copies").toBe(1);
+  expect(frames.filter((s) => s.harvested).map((s) => s.harvestedTicks), "harvests").toEqual([STREAM_TICKS]);
+  const segments = perFrame(events);
+  expect(segments.length).toBe(frames.length);
+  segments.forEach((seg, f) => expect(seg.filter((e) => e.kind === "fence").length, `frame ${f} fences`).toBe(1));
+  // The solve's GPU objects are all built before its first frame.
+  expect(segments.slice(1).flat().filter((e) => e.kind === "create").length, "GPU objects created per solve frame").toBe(0);
+  expect(events.filter((e) => e.kind === "layout-draw" && e.viewport1x1 && e.count >= N).length, "a draw of ≥ N points into a 1×1 viewport").toBe(0);
+}
+
+function reportWarm(label: string, gpu: WarmLeg, worker: WarmLeg): number[] {
+  const transport = gpu.frames.map((s) => s.harvestMs + s.encodeMs);
+  const f = (xs: number[]): string => `p95 ${quantile(xs, 0.95).toFixed(2)} max ${Math.max(0, ...xs).toFixed(2)} (${xs.length} frames)`;
+  console.log(
+    `  warm re-layout + ${TRANSITION_MS} ms transition [${label}] N=${N}: "auto" (GPU) ${gpu.elapsedMs.toFixed(0)} ms, ` +
+      `${gpu.frames.length} solve frames, transport ms/frame median ${median(transport).toFixed(2)} p95 ${quantile(transport, 0.95).toFixed(2)}, ` +
+      `main thread ms/frame over the solve ${f(gpu.solveMs)}, over solve + tween ${f(gpu.rafMs)}; ` +
+      `worker ${worker.elapsedMs.toFixed(0)} ms, main thread ms/frame (its tween) ${f(worker.rafMs)}`,
+  );
+  return transport;
+}
+
 describe("GPU nested layout per frame (#355) — network().layout({ backend: 'gpu', nested })", () => {
   let host: HTMLElement;
   let net: Network;
@@ -275,7 +247,7 @@ describe("GPU nested layout per frame (#355) — network().layout({ backend: 'gp
       const parent = tree.parent;
       if (!parent) throw new Error("module trees carry a parent map");
       const solver = nestedSolverTopology({ ...tree, parent }, { iterations: ITERATIONS, size: fixture.graph.flow ?? undefined });
-      const solo = new GpuNestedLayout(device, solver);
+      const solo = new GpuNestedLayout(device, nestedLayoutPlan(solver));
       const local = new Float32Array(2 * solver.slotCount);
       solo.runTicks(1);
       solo.readLocal(local);
@@ -327,6 +299,29 @@ describe("GPU nested layout per frame (#355) — network().layout({ backend: 'gp
     expect(quantile(transport, 0.95)).toBeLessThan(TRANSPORT_P95_MS);
     expect(median(encode)).toBeLessThan(ENCODE_MEDIAN_MS);
   }, perfBudget(300_000));
+
+  // The warm re-layout's frames are the one-frame solve's (transport only: nothing repaints until it
+  // lands) and then the tween's. The worker spends no main-thread frame on the solve (it posts only the
+  // final layout), so each "auto" solve frame — every callback in it — is bounded by the transport's
+  // ceiling alone. The tween's frames run the same code on both paths (the transition guard,
+  // `transition-perf.test.ts`, bounds them); both runs' are reported.
+  it.each([
+    ["LOD off", false],
+    ["LOD on", true],
+  ])("warm re-layout with a transition on \"auto\" (%s): one copy, fenced, each solve frame within the transport ceiling", async (label, lod) => {
+    const worker = await warmLeg(net, fixture.graph, fixture.modules, lod, "worker");
+    const gpu = await warmLeg(net, fixture.graph, fixture.modules, lod, "auto");
+    const transport = reportWarm(label, gpu, worker);
+    expect(worker.transport).toBe("copy"); // the worker's transport (`layoutTransport`)
+    expect(worker.frames.length).toBe(0);
+    expect(gpu.transport).toBe("gpu");
+    assertOneFrameSignatures(gpu);
+    expect(quantile(transport, 0.95)).toBeLessThan(TRANSPORT_P95_MS);
+    expect(median(gpu.frames.map((s) => s.encodeMs))).toBeLessThan(ENCODE_MEDIAN_MS);
+    // Every solve frame's callbacks (the frames the worker leaves idle): a sample of every solve frame.
+    expect(gpu.solveMs.length, "solve frames timed").toBe(gpu.frames.length);
+    expect(quantile(gpu.solveMs, 0.95)).toBeLessThan(TRANSPORT_P95_MS);
+  }, perfBudget(300_000));
 });
 
 describe("GPU nested solve per tick (#355)", () => {
@@ -341,7 +336,7 @@ describe("GPU nested solve per tick (#355)", () => {
     const parent = tree.parent;
     if (!parent) throw new Error("module trees carry a parent map");
     const solver = nestedSolverTopology({ ...tree, parent }, { iterations: 10, size: graph.flow ?? undefined });
-    const layout = new GpuNestedLayout(device, solver);
+    const layout = new GpuNestedLayout(device, nestedLayoutPlan(solver));
     const log = new GlCallLog();
     try {
       layout.runTicks(6); // organise

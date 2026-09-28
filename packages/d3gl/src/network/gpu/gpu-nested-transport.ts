@@ -1,13 +1,18 @@
 /**
  * The GPU nested module layout (#355, spec §11.1) as a layout handle — the `layout({ backend: "gpu",
- * nested })` counterpart of {@link startNestedWorkerLayout}, with the same call shape and delivery options.
+ * nested })` / `layout({ backend: "auto", nested })` (#375) counterpart of {@link startNestedWorkerLayout},
+ * with the same call shape and delivery options.
  *
  * 1. The device settles (a promise, so the `"auto"` → WebGL upgrade is seen). Without GPU support for
- *    this tree — no WebGL2 device, no float render targets or float blending, textures past the device
- *    limit — one warning names the reason and the worker lays it out, exactly as `backend: "worker"`
- *    would.
+ *    this tree — no WebGL2 device, no float render targets or float blending, a slot atlas past the device
+ *    limit or more slots than the solve indexes ({@link gpuNestedSlotNeed}, from the tree's size alone) —
+ *    the worker lays it out, exactly as `backend: "worker"` would: after one warning naming the reason
+ *    for `"gpu"`, silently for `"auto"` (`warnUnsupported: false`), which expects the worker there.
  * 2. A layout worker builds the solve's data ({@link prepareNestedSolve}: slots, segments, radii, seeds,
- *    links), so the main thread spends nothing on it.
+ *    links), so the main thread spends nothing on it. With the segments and links known, every texture
+ *    the solve allocates is checked against the device ({@link gpuNestedLayoutNeed} of the
+ *    {@link nestedLayoutPlan} the layout then allocates: the springs, the tile atlas, the large-slot
+ *    table) — an unsupported tree, as in step 1.
  * 3. {@link GpuNestedLayout} solves every module at every depth at once, streamed by {@link GpuStream}:
  *    work items within the frame budget, positions composed on the GPU and read back through a fenced PBO.
  *    A **cold** layout streams as one animation of all depths converging together (decided, §15 Q5); a
@@ -19,7 +24,9 @@
  *
  * A solve that stops before its final harvest — a non-finite layout, a lost context — lands none of it
  * (a one-frame layout's arrays were never filled): one warning names the reason, and the worker lays the
- * map out with the same delivery options, as it does when the device cannot run the solve.
+ * map out with the same delivery options, as it does when the device cannot run the solve. That is a
+ * fault, not an unsupported device, so it warns under `"auto"` too — as does a device promise or a prep
+ * that rejects, or a solve that throws while starting ({@link warnGpuFallback}).
  */
 import type { Device } from "@luma.gl/core";
 import { WebGLDevice } from "@luma.gl/webgl";
@@ -32,19 +39,26 @@ import {
   type NestedWorkerOptions,
   type WorkerLayoutHandle,
 } from "../worker-transport.js";
-import { gpuLayoutNeed, gpuLayoutSupport } from "./device-caps.js";
+import { gpuLayoutSupport, gpuNestedSlotNeed } from "./device-caps.js";
 import { gpuCaps } from "./device-probe.js";
-import { GpuNestedLayout } from "./gpu-nested-layout.js";
+import { GpuNestedLayout, gpuNestedLayoutNeed, nestedLayoutPlan } from "./gpu-nested-layout.js";
 import { GpuStream } from "./gpu-stream.js";
 import { nestedSolverResult, type NestedSolverTopology } from "./nested-topology.js";
-import type { GpuLayoutTransport } from "./gpu-transport.js";
+import { warnGpuFallback, type GpuLayoutFailure, type GpuLayoutTransport } from "./gpu-transport.js";
 
-/** Delivery options of a GPU nested layout — the worker's, plus the transport report. */
+/** Delivery options of a GPU nested layout — the worker's, plus the transport report and whether an unsupported device warns. */
 export interface GpuNestedOptions extends NestedWorkerOptions {
   /** Called once the run resolved to the GPU solve or the worker fallback, before any frame. */
   onTransport?: (transport: GpuLayoutTransport) => void;
   /** Test hook: at most one readback per this many ticks, in place of the repaint throttle. */
   frameEvery?: number;
+  /**
+   * Warn when the device or the module tree is unsupported and the layout falls back to the worker
+   * (default `true`), as `GpuLayoutOptions.warnUnsupported` does for the flat layout:
+   * `layout({ backend: "auto", nested })` passes `false` (#375). A solve that fails rather than being
+   * unsupported warns either way (see the file header).
+   */
+  warnUnsupported?: boolean;
 }
 
 /**
@@ -74,11 +88,9 @@ export function startGpuNestedLayout(
     opts.onTransport?.(t);
   };
 
-  const fallBack = (reason: string, cause?: unknown): void => {
+  const fallBack = (reason: string, failure?: GpuLayoutFailure): void => {
     if (stopped) return;
-    const message = `[d3gl] network layout({ backend: 'gpu', nested }) fell back to the CPU worker: ${reason}.`;
-    if (cause === undefined) console.warn(message);
-    else console.warn(message, cause);
+    warnGpuFallback(`[d3gl] the GPU nested layout fell back to the CPU worker: ${reason}.`, opts.warnUnsupported, failure);
     report("worker");
     const worker = startNestedWorkerLayout(graph, tree, params, onFrame, opts);
     inner = worker;
@@ -87,13 +99,15 @@ export function startGpuNestedLayout(
 
   const run = (device: WebGLDevice, solver: NestedSolverTopology): void => {
     if (stopped) return;
-    // Now that the links are known, the springs' CSR too must fit the device.
-    const verdict = gpuLayoutSupport(gpuCaps(device), gpuLayoutNeed(solver.slotCount, solver.linkSource.length));
+    // Now that the segments and links are known, every texture the solve allocates must fit the device:
+    // the plan the verdict checks is the one the layout allocates.
+    const plan = nestedLayoutPlan(solver);
+    const verdict = gpuLayoutSupport(gpuCaps(device), gpuNestedLayoutNeed(plan));
     if (!verdict.ok) {
       fallBack(verdict.reason);
       return;
     }
-    const layout = new GpuNestedLayout(device, solver); // frees what it created if it throws
+    const layout = new GpuNestedLayout(device, plan); // frees what it created if it throws
     const oneFrame = opts.onResult !== undefined || opts.stream === false;
     const modules = solver.treeSize - solver.leafCount;
     const discs = new Float32Array(4 * modules);
@@ -125,7 +139,7 @@ export function startGpuNestedLayout(
         // and lay the map out on the worker.
         stream = null;
         s.stop();
-        fallBack(`the GPU solve stopped: ${failure}`);
+        fallBack(`the GPU solve stopped: ${failure}`, { kind: "failure" });
         return;
       }
       // The final harvest has landed (in `graph.positions`, or `into`): place a warm start, record the
@@ -156,7 +170,8 @@ export function startGpuNestedLayout(
       fallBack("the module tree has no node below its root");
       return;
     }
-    const verdict = gpuLayoutSupport(gpuCaps(device), gpuLayoutNeed(tree.size - 1, 0));
+    // What the slot count alone decides (the slot atlas, the CSR offsets, the slot limit), before the prep.
+    const verdict = gpuLayoutSupport(gpuCaps(device), gpuNestedSlotNeed(tree.size - 1));
     if (!verdict.ok) {
       fallBack(verdict.reason);
       return;
@@ -173,16 +188,16 @@ export function startGpuNestedLayout(
         try {
           run(device, solver);
         } catch (error) {
-          // A tile atlas past the device limit, a driver that rejects a shader: the worker lays it out.
-          fallBack("the GPU nested layout failed to start", error);
+          // A fault — a driver that rejects a shader, an allocation that fails: the worker lays it out.
+          fallBack("the GPU nested layout failed to start", { kind: "failure", cause: error });
         }
       },
-      (error: unknown) => fallBack("its solve could not be prepared", error),
+      (error: unknown) => fallBack("its solve could not be prepared", { kind: "failure", cause: error }),
     );
   };
 
   if (deviceOrPromise instanceof Promise) {
-    deviceOrPromise.then(begin, (error: unknown) => fallBack("the device promise rejected", error));
+    deviceOrPromise.then(begin, (error: unknown) => fallBack("the device promise rejected", { kind: "failure", cause: error }));
   } else {
     begin(deviceOrPromise);
   }

@@ -80,7 +80,9 @@ interface SeedStaging {
  *
  * With `nested` (#355), the terms are the nested layout's link corrections instead (see
  * {@link SpringVariant.nested}): they need the graph's `springWeight` and the {@link NestedSpringInputs}
- * on every {@link prepare} and {@link draw}.
+ * on every {@link prepare} and {@link draw}. A `rowScale` (the nested solve's per-slot spring relaxation,
+ * `NestedSolverTopology.springScale`) multiplies every entry of node i's CSR row by `rowScale[i]`, once
+ * here: node i's own spring terms scale, its neighbours' terms toward it do not, and a tick is unchanged.
  *
  * **A multilevel seed's springs** (#353) are a second set, built from a {@link SeedSpringCapacity}: textures
  * sized to the largest seed level, weighted and mass-weighted (each row's sum divided by its slot's mass —
@@ -100,7 +102,11 @@ export class GpuSprings {
   private readonly ownsPasses: boolean;
   private readonly nested: boolean;
 
-  constructor(device: Device, source: LayoutGraph | SeedSpringCapacity, variant: { nested?: boolean } = {}) {
+  constructor(
+    device: Device,
+    source: LayoutGraph | SeedSpringCapacity,
+    variant: { nested?: boolean; rowScale?: Float32Array } = {},
+  ) {
     this.device = device;
     this.nested = variant.nested === true;
     if ("seedLevels" in source) {
@@ -139,6 +145,8 @@ export class GpuSprings {
     // Symmetric (undirected) CSR from the directed edge list: buildCSR inserts both directions, so the
     // gather reproduces force.ts's per-edge springs (each edge pulls both endpoints).
     const csr = buildCSR(graph.nodeCount, graph.source, graph.target, graph.springWeight);
+    const { rowScale } = variant;
+    if (rowScale && csr.weights) scaleRows(csr.offsets, csr.weights, rowScale);
 
     const offResult = packUintTexture(device, csr.offsets);
     this.offWidth = offResult.width;
@@ -223,6 +231,15 @@ export class GpuSprings {
       this.hubs.partials.destroy();
       if (this.ownsPasses) this.hubs.pass.destroy();
     }
+  }
+}
+
+/** In place: every entry of row i of a CSR (`offsets`, `weights`) times `scale[i]`. O(entries), once. */
+function scaleRows(offsets: Uint32Array, weights: Float32Array, scale: Float32Array): void {
+  for (let i = 0; i + 1 < offsets.length; i++) {
+    const f = scale[i] ?? 1;
+    if (f === 1) continue;
+    for (let p = offsets[i] ?? 0; p < (offsets[i + 1] ?? 0); p++) weights[p] = (weights[p] ?? 0) * f;
   }
 }
 

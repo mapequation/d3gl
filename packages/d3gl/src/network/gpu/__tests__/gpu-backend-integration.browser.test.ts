@@ -12,13 +12,12 @@
  */
 
 import { describe, it, expect, afterEach, vi } from "vitest";
-import { network, Network } from "../../network.js";
-import { buildGraph } from "../../graph.js";
+import { network, Network, type NetworkLayoutOptions } from "../../network.js";
+import { buildGraph, type NetworkGraph } from "../../graph.js";
 import { buildStateGraph } from "../../state-graph.js";
 import { sharedMemoryAvailable } from "../../worker-transport.js";
 import type { MainToWorker, StartMessage } from "../../worker-protocol.js";
-import type { ModuleNode } from "../../modules.js";
-import type { NetworkGraph } from "../../graph.js";
+import { buildModuleLODTree, type ModuleNode } from "../../modules.js";
 import { WebGLBackend } from "../../../webgl/webgl-backend.js";
 import { createBackend, type BackendHandle } from "../../../map/backend-factory.js";
 import { WebGLDevice } from "@luma.gl/webgl";
@@ -26,6 +25,12 @@ import { GpuStream, observeGpuLayoutFrames } from "../gpu-stream.js";
 import { startGpuLayout, type GpuLayoutTransport } from "../gpu-transport.js";
 import { GpuForceLayout } from "../gpu-force-layout.js";
 import { makeTestDevice } from "./_device.js";
+import { AsyncPositionReadback } from "../async-readback.js";
+import { GpuNestedLayout, nestedLayoutPlan } from "../gpu-nested-layout.js";
+import { nestedSolverResult, nestedSolverTopology } from "../nested-topology.js";
+import { nestedLayout } from "../../nested-layout.js";
+import type { LODTree } from "../../lod.js";
+import { directedPartition, expectContained, linkTightness, topo, worstSeparation } from "../../__tests__/nested-fixtures.js";
 
 const W = 400;
 const H = 300;
@@ -361,6 +366,62 @@ async function webglEngine() {
   return net;
 }
 
+/** A 60-node ring in six modules of ten: a two-level map for the nested legs. */
+function nestedFixture(): { g: NetworkGraph; modules: ModuleNode[] } {
+  const n = 60;
+  const g = buildGraph({ nodeCount: n, source: Array.from({ length: n }, (_, i) => i), target: Array.from({ length: n }, (_, i) => (i + 1) % n) });
+  const modules: ModuleNode[] = Array.from({ length: n }, (_, id) => ({ id, path: [Math.floor(id / 10) + 1, (id % 10) + 1] }));
+  return { g, modules };
+}
+
+/**
+ * A hub-heavy two-level map (#355), sized by leaf count: module 1 is a star, one leaf linked to 40 others,
+ * so its summed link share D = ½·Σ w·share is 10, past the ≈ 1.78 the springs' momentum leaves stable
+ * without the spring relaxation; module 2 is two linked hubs of 20 spokes each (D ≈ 5), the coupled shape
+ * a per-slot normalisation alone does not bound. Unrelaxed, the GPU solve stayed finite on it (its local
+ * positions peaked near 1e13), kept every child inside its parent and the siblings apart, and lost the
+ * arrangement: the star's hub landed at 0.88 of its module's radius (the CPU: 0.37), and linked siblings
+ * sat farther apart than the average pair (link tightness 1.87, the CPU's 0.81).
+ */
+function hubHeavy(): { g: NetworkGraph; modules: ModuleNode[]; tree: LODTree } {
+  const source: number[] = [];
+  const target: number[] = [];
+  const modules: ModuleNode[] = [];
+  let id = 0;
+  const hub = id++;
+  modules.push({ id: hub, path: [1, 1] });
+  for (let s = 0; s < 40; s++) {
+    const leaf = id++;
+    modules.push({ id: leaf, path: [1, s + 2] });
+    source.push(hub);
+    target.push(leaf);
+  }
+  const a = id++;
+  const b = id++;
+  modules.push({ id: a, path: [2, 1] }, { id: b, path: [2, 2] });
+  source.push(a);
+  target.push(b);
+  let rank = 3;
+  for (let s = 0; s < 20; s++) {
+    for (const h of [a, b]) {
+      const leaf = id++;
+      modules.push({ id: leaf, path: [2, rank++] });
+      source.push(h);
+      target.push(leaf);
+    }
+  }
+  const g = buildGraph({ nodeCount: id, source, target });
+  return { g, modules, tree: buildModuleLODTree(id, modules, g) };
+}
+
+/** Reset `g`'s positions to `from`, lay `net` out with `opts`, and return the positions it settled on. */
+async function layoutFrom(net: Network, g: NetworkGraph, from: Float32Array, opts: NetworkLayoutOptions): Promise<number[]> {
+  g.positions.set(from);
+  net.layout(opts);
+  await net.whenSettled();
+  return Array.from(g.positions);
+}
+
 /** The two ways `"auto"` resolves (#375), each with the `layoutTransport` it then reports: the GPU on a
  *  supported device, and the worker on a device without float blending. */
 const AUTO_RESOLUTIONS = [
@@ -520,14 +581,40 @@ describe("backend:'auto' (#375)", () => {
     net.destroy();
   });
 
-  it("runs a nested layout on the worker, exactly as backend:'worker' does (cold streams, warm lands in one frame)", async () => {
-    const n = 60;
-    const g = buildGraph({ nodeCount: n, source: Array.from({ length: n }, (_, i) => i), target: Array.from({ length: n }, (_, i) => (i + 1) % n) });
-    const modules: ModuleNode[] = Array.from({ length: n }, (_, id) => ({ id, path: [Math.floor(id / 10) + 1, (id % 10) + 1] }));
-    const net = network(makeHost(), { width: W, height: H, backend: "webgl" });
-    await net.whenReady();
-    const posts = vi.spyOn(Worker.prototype, "postMessage");
+  it("lays a nested map out on the GPU solve 'gpu' runs, silently: cold streams, a warm re-layout with a transition reads back once (#355)", async () => {
+    const { g, modules } = nestedFixture();
+    const net = await webglEngine();
     net.data(g, { modules });
+    const warn = vi.spyOn(console, "warn");
+    const posts = vi.spyOn(Worker.prototype, "postMessage");
+
+    net.layout({ backend: "gpu", nested: true });
+    await net.whenSettled();
+    const gpuCold = Array.from(g.positions);
+    net.layout({ backend: "auto", nested: true });
+    expect(net.layoutTransport).toBe("copy"); // pending until the device settles, as for "gpu"
+    await net.whenSettled();
+    expect(net.layoutTransport).toBe("gpu");
+    expect(Array.from(g.positions)).toEqual(gpuCold); // the same solve, bitwise
+
+    // The Navigator's re-cluster: a warm re-layout with a transition, from the same map on both backends.
+    const map = g.positions.slice();
+    const gpuWarm = await layoutFrom(net, g, map, { backend: "gpu", nested: { warm: true }, transition: 50 });
+    const autoWarm = await layoutFrom(net, g, map, { backend: "auto", nested: { warm: true }, transition: 50 });
+    expect(net.layoutTransport).toBe("gpu"); // the transition's handle reports the solve's transport (#297)
+    expect(autoWarm).toEqual(gpuWarm);
+    expect(autoWarm).not.toEqual(Array.from(map)); // it did re-lay the map out
+    expect(nestedStarts(posts)).toHaveLength(0); // never the worker's nested run
+    expect(fallbackWarnings(warn)).toHaveLength(0);
+    net.destroy();
+  });
+
+  it("resolves a nested layout to the worker's exact run without a warning on a device without float blending (cold streams, warm + transition lands in one frame)", async () => {
+    const { g, modules } = nestedFixture();
+    const net = await engineWithoutFloatBlend();
+    net.data(g, { modules });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const posts = vi.spyOn(Worker.prototype, "postMessage");
 
     net.layout({ backend: "worker", nested: true });
     await net.whenSettled();
@@ -536,22 +623,173 @@ describe("backend:'auto' (#375)", () => {
     const workerTransport = net.layoutTransport;
     posts.mockClear();
     net.layout({ backend: "auto", nested: true });
-    const autoCold = nestedStarts(posts); // posted synchronously: never the synchronous CPU solve
     await net.whenSettled();
+    const autoCold = nestedStarts(posts);
     expect(autoCold).toHaveLength(1);
     expect(autoCold[0]?.stream).toBe(true); // a cold layout streams one frame per depth
     expect(autoCold).toEqual(workerCold);
     expect(Array.from(g.positions)).toEqual(workerPositions);
     expect(net.layoutTransport).toBe(workerTransport);
 
-    // A warm re-layout with a transition posts only the final layout (#328), then eases to it.
+    // A warm re-layout with a transition posts only the final layout (#328), then eases to it, as on "worker".
+    const map = g.positions.slice();
+    const workerWarm = await layoutFrom(net, g, map, { backend: "worker", nested: { warm: true }, transition: 50 });
     posts.mockClear();
-    net.layout({ backend: "auto", nested: { warm: true }, transition: 50 });
-    const autoWarm = nestedStarts(posts);
+    const autoWarm = await layoutFrom(net, g, map, { backend: "auto", nested: { warm: true }, transition: 50 });
+    const autoWarmStarts = nestedStarts(posts);
+    expect(autoWarmStarts).toHaveLength(1);
+    expect(autoWarmStarts[0]?.stream).toBe(false);
+    expect(autoWarm).toEqual(workerWarm);
+    expect(fallbackWarnings(warn)).toHaveLength(0); // the worker is an expected outcome of "auto"
+
+    // "gpu" on the same device takes the same worker run, with the one warning "auto" leaves out.
+    net.layout({ backend: "gpu", nested: true });
     await net.whenSettled();
-    expect(autoWarm).toHaveLength(1);
-    expect(autoWarm[0]?.stream).toBe(false);
+    expect(fallbackWarnings(warn)).toHaveLength(1);
     net.destroy();
+  });
+
+  // A supported device whose nested GPU solve then fails is a fault, not an expected outcome: "auto" warns,
+  // and the worker lays the map out with the same delivery — here the Navigator's warm re-layout with a
+  // transition, so nothing of the failed solve lands and the CPU's warm map is eased to.
+  it.each([
+    {
+      fault: "stops before its final harvest",
+      reason: /the GPU nested layout fell back to the CPU worker: the GPU solve stopped/,
+      // The harvest refuses the copy, as it does when the reductions come back non-finite.
+      inject: () => vi.spyOn(AsyncPositionReadback.prototype, "harvest").mockReturnValue(false),
+    },
+    {
+      fault: "throws while starting",
+      reason: /the GPU nested layout fell back to the CPU worker: the GPU nested layout failed to start/,
+      // A driver fault that carries no error object.
+      inject: () => vi.spyOn(GpuStream.prototype, "start").mockImplementationOnce(() => {
+        throw undefined;
+      }),
+    },
+  ])("still warns when the nested GPU solve $fault, and the worker lays out the warm map with its transition", async ({ reason, inject }) => {
+    const { g, modules } = nestedFixture();
+    const net = await webglEngine();
+    net.data(g, { modules });
+    net.layout({ backend: "auto", nested: true });
+    await net.whenSettled();
+    expect(net.layoutTransport).toBe("gpu"); // supported
+    const map = g.positions.slice();
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const workerWarm = await layoutFrom(net, g, map, { backend: "worker", nested: { warm: true }, transition: 50 });
+
+    const posts = vi.spyOn(Worker.prototype, "postMessage");
+    inject();
+    const autoWarm = await layoutFrom(net, g, map, { backend: "auto", nested: { warm: true }, transition: 50 });
+    const fallbacks = fallbackWarnings(warn);
+    expect(fallbacks).toHaveLength(1);
+    expect(String(fallbacks[0]?.[0])).toMatch(reason);
+    expect(fallbacks[0]).toHaveLength(1); // no `undefined` printed after the message
+    const starts = nestedStarts(posts);
+    expect(starts).toHaveLength(1); // one worker run, not a retry
+    expect(starts[0]?.stream).toBe(false); // the warm + transition delivery kept: only the final layout
+    expect(autoWarm).toEqual(workerWarm);
+    expect(net.layoutTransport).toBe("copy"); // the worker's transport
+    net.destroy();
+  });
+
+  // What the Navigator hit on a hub-heavy tree: a cold streaming solve that paints GPU frames, then goes
+  // non-finite. The worker then streams the map from scratch, and nothing of the GPU solve lands after it.
+  it("still warns when a cold nested GPU solve goes non-finite mid-stream, and the worker streams the map from scratch", async () => {
+    const { g, modules } = nestedFixture();
+    const net = await webglEngine();
+    net.data(g, { modules });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const posts = vi.spyOn(Worker.prototype, "postMessage");
+    net.layout({ backend: "worker", nested: true });
+    await net.whenSettled();
+    const workerCold = nestedStarts(posts);
+    const workerPositions = Array.from(g.positions);
+    posts.mockClear();
+
+    // The first two harvests land (GPU frames paint), then the harvest refuses the copy, as it does when
+    // the reductions come back non-finite.
+    const harvest = AsyncPositionReadback.prototype.harvest;
+    let harvests = 0;
+    vi.spyOn(AsyncPositionReadback.prototype, "harvest").mockImplementation(function (this: AsyncPositionReadback, positions, stats) {
+      return ++harvests <= 2 ? Reflect.apply(harvest, this, [positions, stats]) : false;
+    });
+    const harvested: boolean[] = []; // per GPU frame (the stream reuses its sample object)
+    const gpuFrames = vi.fn((sample: { harvested: boolean }) => harvested.push(sample.harvested));
+    const unobserve = observeGpuLayoutFrames(gpuFrames);
+    try {
+      g.positions.fill(0);
+      net.layout({ backend: "auto", nested: true });
+      await net.whenSettled();
+    } finally {
+      unobserve();
+    }
+    expect(harvests).toBe(3); // two streamed frames, then the refusal stopped the stream
+    expect(harvested.filter(Boolean)).toHaveLength(2);
+    const fallbacks = fallbackWarnings(warn);
+    expect(fallbacks).toHaveLength(1);
+    expect(String(fallbacks[0]?.[0])).toMatch(/fell back to the CPU worker: the GPU solve stopped: the layout became non-finite/);
+    const starts = nestedStarts(posts);
+    expect(starts).toEqual(workerCold); // one worker run, the cold streaming one (stream: true)
+    expect(starts[0]?.stream).toBe(true);
+    // No GPU frame after the worker started, and the worker's map is what lands.
+    const workerStart = posts.mock.invocationCallOrder[posts.mock.calls.findIndex(([m]) => m.type === "start-nested")] ?? 0;
+    expect(Math.max(...gpuFrames.mock.invocationCallOrder)).toBeLessThan(workerStart);
+    expect(Array.from(g.positions)).toEqual(workerPositions);
+    expect(net.layoutTransport).toBe("copy");
+    net.destroy();
+  });
+
+  // The merge gate of "auto"'s nested routing (#375): a tree with hubs must lay out on the GPU and keep the
+  // layout's invariants — every child inside its parent, siblings apart (as far as the CPU layout keeps
+  // them on the same tree), linked siblings close (held to the CPU's, as the GPU nested tests hold a warm
+  // start). Unrelaxed, the GPU solve's Jacobi springs overshot at a hub (#355): on web-NotreDame's directed
+  // tree (D up to 135) it went non-finite and "auto" fell back to the worker with a warning — the directed
+  // partition here is that shape; on the hub-heavy map (D = 10) it stayed finite, so nothing fell back or
+  // warned, and the arrangement was lost. The spring relaxation (`NESTED_SPRING_GAIN_MAX`) bounds both.
+  it.each<{ name: string; map: () => { g: NetworkGraph; modules: ModuleNode[]; tree: LODTree } }>([
+    { name: "a hub-heavy map (leaf-count sizes)", map: hubHeavy },
+    {
+      name: "a directed partition (PageRank flow sizes: web-NotreDame's small hubs)",
+      map: () => {
+        const { modules, source, target, flow } = directedPartition();
+        const g = buildGraph({ nodeCount: flow.length, source, target, directed: true, nodeFlow: flow });
+        return { g, modules, tree: buildModuleLODTree(g.nodeCount, modules, g) };
+      },
+    },
+  ])("lays $name out on the GPU under 'auto' and keeps its invariants (#355)", async ({ map }) => {
+    const { g, modules, tree } = map();
+    const net = await webglEngine();
+    const device = await makeTestDevice();
+    try {
+      net.data(g, { modules });
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      net.layout({ backend: "auto", nested: true });
+      await net.whenSettled();
+      expect(fallbackWarnings(warn), "the GPU nested solve fell back to the worker").toEqual([]);
+      expect(net.layoutTransport).toBe("gpu");
+      // The map "auto" landed is the GPU solve's (the engine's parameters: the root radius, the graph's sizes).
+      const params = { radius: 10 * Math.sqrt(g.nodeCount), size: g.flow ?? undefined };
+      const solver = nestedSolverTopology(topo(tree), params);
+      const layout = new GpuNestedLayout(device, nestedLayoutPlan(solver));
+      const positions = new Float32Array(2 * solver.leafCount);
+      const discs = new Float32Array(4 * (solver.treeSize - solver.leafCount));
+      try {
+        layout.runTicks(solver.iterations);
+        layout.readComposed(positions, discs);
+      } finally {
+        layout.destroy();
+      }
+      const out = nestedSolverResult(solver, positions, discs, undefined, false);
+      expect(Array.from(g.positions)).toEqual(Array.from(out.positions));
+      const cpu = nestedLayout(topo(tree), params);
+      expectContained(tree, out);
+      expect(worstSeparation(tree, out), "siblings apart").toBeGreaterThanOrEqual(Math.min(0.98, worstSeparation(tree, cpu) - 0.02));
+      expect(linkTightness(tree, out), "linked siblings' distance over the average pair's").toBeLessThan(linkTightness(tree, cpu) + 0.02);
+    } finally {
+      device.destroy();
+      net.destroy();
+    }
   });
 });
 

@@ -345,7 +345,8 @@ export interface NetworkLayoutOptions {
    * Runs off-thread on `backend: "worker"` (streamed top-down, one frame per depth), on the GPU on
    * `"gpu"` (#355: every module at every depth solved at once, streamed as one animation of all depths
    * converging together; the worker when the device cannot run it, with a warning), and synchronously on
-   * `"force"`. `"auto"` runs it on the worker (#375). Ignored without a hierarchy.
+   * `"force"`. `"auto"` runs the same GPU solve wherever `"gpu"` would, and the worker elsewhere without a
+   * warning (#375). Ignored without a hierarchy.
    *
    * `true` sizes discs by node flow (leaf count when the graph has none); pass `{ size: "count" }` to
    * size by leaf count, and `iterations` / `packing` to tune each module's solve. `{ warm: true }`
@@ -703,7 +704,8 @@ function layoutClass(backend: NetworkLayoutOptions["backend"]): "positions" | "f
 /**
  * Whether a layout backend asks for the GPU solve (spec §12.2): `"gpu"`, which warns when it falls back
  * to the worker, or `"auto"` (#375), which falls back silently because the worker is an expected outcome.
- * Both start the same run ({@link startGpuLayout}), so everything downstream sees the same handle.
+ * Both start the same run ({@link startGpuLayout}, or {@link startGpuNestedLayout} for a `nested` layout),
+ * so everything downstream sees the same handle.
  */
 function requestsGpu(backend: NetworkLayoutOptions["backend"]): backend is "gpu" | "auto" {
   return backend === "gpu" || backend === "auto";
@@ -1876,9 +1878,9 @@ export class Network extends BaseEngine {
    * The streaming layout's resolved transport (spec §12.2): `"worker"` for any `backend: "worker"`
    * layout (nested ones included) and for a `"gpu"` / `"auto"` layout whose device resolved to the worker
    * fallback, `"gpu"` once the GPU solve runs, `"pending"` while a GPU device is unsettled, and `null` for
-   * the other backends or a `"gpu"` / `"auto"` layout whose handle reports no transport (none started, or
-   * a nested run). The LOD guards key on it rather than on the literal backend: a worker streams the
-   * coarsening tree, so the main thread builds none.
+   * the other backends or a `"gpu"` / `"auto"` layout whose handle reports no transport (none started).
+   * The LOD guards key on it rather than on the literal backend: a worker streams the coarsening tree, so
+   * the main thread builds none.
    */
   private streamingTransport(): "worker" | "gpu" | "pending" | null {
     const backend = this.layoutOpts.backend;
@@ -1905,7 +1907,8 @@ export class Network extends BaseEngine {
   }
 
   /**
-   * Nested module layout (#324): off-thread + streamed per depth on worker/gpu, synchronous on force.
+   * Nested module layout (#324): off-thread + streamed per depth on the worker, on the GPU (all depths at
+   * once, #355) on gpu/auto where the device can run it (#375), synchronous on force.
    * A warm start (#328) seeds from the current positions and lands in one piece, with no depth frames;
    * with a `duration` the result is eased to ({@link positionTween}) instead of jumped to.
    */
@@ -1942,12 +1945,14 @@ export class Network extends BaseEngine {
         },
       };
       let solve: WorkerLayoutHandle | undefined;
-      if (opts.backend === "gpu") {
+      if (requestsGpu(opts.backend)) {
         // The batched GPU solve (#355): every module at every depth at once, streamed from the GPU; the
-        // worker when the device cannot run it. A GPU frame repaints inside the transport's own animation
-        // frame ({@link onStreamedFrame}).
+        // worker when the device cannot run it — silently on "auto", which expects it there (#375), as the
+        // flat layout does. A GPU frame repaints inside the transport's own animation frame
+        // ({@link onStreamedFrame}).
         const devicePromise = this.whenBackendSettled().then(() => this.gpuDevice());
-        solve = startGpuNestedLayout(devicePromise, graph, topology, params, () => this.onStreamedFrame(solve), delivery);
+        const gpuDelivery = { ...delivery, warnUnsupported: opts.backend === "gpu" };
+        solve = startGpuNestedLayout(devicePromise, graph, topology, params, () => this.onStreamedFrame(solve), gpuDelivery);
       } else {
         solve = startNestedWorkerLayout(graph, topology, params, () => this.scheduleLayoutRepaint(), delivery);
       }
@@ -1985,8 +1990,8 @@ export class Network extends BaseEngine {
    * A position transition of `graph` over `duration` ms (#328), snapshotting its positions now. Each
    * frame is the positions-only repaint the drag path uses ({@link repaintDuringDrag}): the O(nodes)
    * interpolation, the LOD tree's O(tree size) position pass (no style pass), then the re-emit. A node
-   * grabbed before the transition started (a worker nested solve still computing its target) is held
-   * under the cursor over each frame ({@link dragReapply}), and kept where it is dropped.
+   * grabbed before the transition started (a nested solve, on the worker or the GPU, still computing its
+   * target) is held under the cursor over each frame ({@link dragReapply}), and kept where it is dropped.
    */
   private positionTween(graph: NetworkGraph, duration: number): PositionTransition {
     return positionTransition(graph.positions, {
@@ -2947,8 +2952,9 @@ export class Network extends BaseEngine {
     const held = this.heldLeavesFor(hit);
     if (held.length === 0) return null;
     // A running position transition (#328) would overwrite the held nodes every frame: finish it, so the
-    // drag starts from the final layout. One still waiting for its target (a worker nested solve) instead
-    // holds the grabbed nodes over its frames once it starts, and keeps them where they are dropped.
+    // drag starts from the final layout. One still waiting for its target (a nested solve, on the worker
+    // or the GPU) instead holds the grabbed nodes over its frames once it starts, and keeps them where
+    // they are dropped. A streamed nested frame (a worker depth, a GPU harvest) re-holds them too.
     if (this.transition?.running) this.transition.finish();
     const pending = this.transition;
 
