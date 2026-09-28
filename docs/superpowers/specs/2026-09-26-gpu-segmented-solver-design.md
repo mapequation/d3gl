@@ -148,8 +148,9 @@ CPU prep (once per topology; pure, node-testable)   GPU pass graph (per tick, as
 ─────────────────────────────────────────────       ───────────────────────────────────────      ─────────────────────────────────────────────
 segments.ts:  slot order + permutation              P: reduce tree → range query → stop latch    poll fences → harvest (if signalled)
               segment table, tile packing   ──►        tile scatter → packed reduce        ──►   onFrame (throttled) → engine repaint
-              reduction ranges                         clear force → hub chunks                  encode items within the budget
-              CSR in slot ids, hub chunks           F_b: springs, repulsion, centering (band b)  readback copy (throttled) → PBO → fence
+              reduction ranges                         hub chunks                                encode items within the budget
+              CSR in slot ids, hub chunks           F_b: clear, springs, repulsion, centering    readback copy (throttled) → PBO → fence
+                                                         (band b; #402)
 schedule:     Cooling, stepCap, stop threshold      I:  integrate (alpha·heat, maxStep, latch)   budget fence (one per frame)
 ```
 
@@ -626,8 +627,8 @@ that.
 
 | Item | Passes | Target | Cost at 325k / 1M (est.) |
 |---|---|---|---|
-| **P** (prep) | reduction tree + range query + stop latch; tile scatter + packed reduce; clear `force` (full); hub chunks → `hubPartials` (own render pass) | tree, `segStats`/`segBox`, latch, `L0`/`Podd`/`Peven`, `force`, `hubPartials` | ~1-2 ms / ~3-5 ms |
-| **F_b**, b = 0 … B−1 | force pass over atlas rows `[r0_b, r1_b)` via `parameters.scissorRect`: springs (rows ≤ C, then hub gather), repulsion, centering, in that order | `force` (ADD, `clearColor: false`) | (12-15 ms) / B; (40-48 ms) / B |
+| **P** (prep) | reduction tree + range query + stop latch; tile scatter + packed reduce; hub chunks → `hubPartials` (own render pass) | tree, `segStats`/`segBox`, latch, `L0`/`Podd`/`Peven`, `hubPartials` | ~1-2 ms / ~3-5 ms |
+| **F_b**, b = 0 … B−1 | force pass over atlas rows `[r0_b, r1_b)` via `parameters.scissorRect`: clear of those rows (#402), then springs (rows ≤ C, then hub gather), repulsion, centering, in that order | `force` (ADD, cleared by the scissored `clearColor`) | (12-15 ms) / B; (40-48 ms) / B |
 | **I** (integrate) | integrate with `alpha·heat`, `maxStep`, latch pass-through; swap | `pos`/`vel` write (MRT) | < 1 ms / ~2 ms |
 
 - Positions change only in **I**, so every band reads the same `pos[read]` and the same pyramid.
@@ -789,13 +790,18 @@ layout would not be deterministic. The GPU therefore decides it per tick:
 | 3 | P | Stop latch (1 texel) | latch state | none | — |
 | 4 | P | Tile scatter | `L0` | ADD | pyramid scatter (reads `segBox` instead of `boxTex`) |
 | 5 | P | Packed reduce ×(levels − 1) | `Podd`/`Peven` rects | none | per-level textures |
-| 6 | P | Clear `force` (full attachment) | `force` | — | — |
-| 7 | P | Hub chunks (own render pass) | `hubPartials` | none | — |
-| 8 | F_b | Force pass, rows of band b: springs (rows ≤ C, then hub gather), repulsion (tile root or exact), centering (range centroid) | `force` | ADD | attraction / repulsion / centering |
-| 9 | I | Integrate (`alpha·heat`, `maxStep`, latch pass-through) | `pos`/`vel` write (MRT) | none | integrate |
+| 6 | P | Hub chunks (own render pass) | `hubPartials` | none | — |
+| 7 | F_b | Force pass, rows of band b: clear of its rows (#402), springs (rows ≤ C, then hub gather), repulsion (tile root or exact), centering (range centroid) | `force` | ADD | attraction / repulsion / centering |
+| 8 | I | Integrate (`alpha·heat`, `maxStep`, latch pass-through) | `pos`/`vel` write (MRT) | none | integrate |
 | per frame | — | Budget fence; throttled readback copy (pack only if needed) → PBO; stats → PBO | PBOs | none | sync `readPixels` |
 
-- Each render pass is followed by `device.submit()` as today.
+- **One `device.submit()` per work item (#402)**, after its last render pass; no pass submits on its own, and a
+  readback copy (its reductions and staging passes) submits once. WebGL runs a pass's draws as they are
+  encoded, so the passes after it see its output without a submit; luma's submit only allocates (a command
+  encoder, a command buffer, a promise: 6.5 µs of main thread each on an M1 Max).
+- **No pass only clears (#402).** The force clear, which was its own pass in P, is each band's `clearColor`,
+  limited to the band's rows by its scissor; every texel still gets a clear and then its three contributions
+  in the same order, so the tick is bitwise what it was.
 - **The order is fixed**, and it matches today's `_tick`: springs, then repulsion, then centering.
   Float addition is not associative, so the ADD blend makes the force bits depend on pass order. The
   hub chunk pass is not part of the force pass at all: it renders into a different framebuffer and

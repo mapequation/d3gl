@@ -664,8 +664,8 @@ describe("GPU tile pyramid — tiles and packed levels (T3)", () => {
   });
 
   it("writing a packed level leaves the other levels of its texture unchanged (the clear rule, §6)", () => {
-    // Fill Podd / Peven with a sentinel first, then snapshot both after every pass of the build (it
-    // submits once per pass: the scatter, then one reduce per level ℓ ≥ 1). The pass that writes
+    // Fill Podd / Peven with a sentinel first, then snapshot both after every render pass of the build
+    // ends (the scatter, then one reduce per level ℓ ≥ 1; the build does not submit, #402). The pass that writes
     // level ℓ may change only ℓ's rectangle: every other texel of both textures — levels ℓ ± 2 in the
     // same texture included — must be bitwise what it was before that pass. So no pass cleared its
     // texture (luma's default clear ignores the viewport) or wrote past its rectangle. After the
@@ -681,10 +681,15 @@ describe("GPU tile pyramid — tiles and packed levels (T3)", () => {
         odd: readbackRgbaFbo(device, p.textures.odd),
         even: readbackRgbaFbo(device, p.textures.even),
       });
-      const submit = device.submit;
-      const spy = vi.spyOn(device, "submit").mockImplementation((commandBuffer) => {
-        submit.call(device, commandBuffer);
-        if (watched) snapshots.push(snapshot(watched));
+      const begin = device.beginRenderPass.bind(device);
+      const spy = vi.spyOn(device, "beginRenderPass").mockImplementation((props) => {
+        const pass = begin(props);
+        const end = pass.end.bind(pass);
+        pass.end = () => {
+          end();
+          if (watched) snapshots.push(snapshot(watched));
+        };
+        return pass;
       });
       let built: BuiltPyramid;
       try {

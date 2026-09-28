@@ -81,7 +81,9 @@ import { STOP_NONFINITE, STOP_STOPPED } from "./stop-latch.js";
  * A solver the stream drives: a tick is the work items **P** ({@link beginTick}), **F_b**
  * ({@link forceBand}, `b = 0 … B − 1`) and **I** ({@link integrate}) — positions change only in I — and it
  * is its own {@link ReadbackSource}. The flat {@link GpuForceLayout} and the nested layout's batched solve
- * (#355) are both one.
+ * (#355) are both one. Each item that encodes a render pass ends with one `device.submit()`, and nothing below
+ * it submits (#402); a readback copy is one item too — {@link prepareReadback} encodes, and the readback's
+ * `issue` submits.
  */
 export interface StreamSolver extends ReadbackSource {
   /**
@@ -102,7 +104,8 @@ export interface StreamSolver extends ReadbackSource {
   /**
    * Make the readback source describe the current positions, right before a copy. `betweenTicks`: the
    * copy follows an integrate (the next P has not run), so reductions from the last P describe the
-   * positions before it; otherwise it follows a P, whose reductions are current.
+   * positions before it; otherwise it follows a P, whose reductions are current. Encodes without submitting:
+   * the copy's `AsyncPositionReadback.issue` submits the whole copy once.
    */
   prepareReadback(betweenTicks: boolean): void;
   destroy(): void;

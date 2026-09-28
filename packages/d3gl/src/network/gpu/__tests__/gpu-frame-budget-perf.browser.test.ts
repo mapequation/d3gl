@@ -39,6 +39,17 @@
  * fragments, the same pass count and fragment count as one texture per level. A
  * reduce that lost its viewport would rasterise its whole packed texture (and
  * overwrite the other levels there).
+ *
+ * ONE SUBMIT PER WORK ITEM, NO CLEAR-ONLY PASS (#402)
+ * ---------------------------------------------------
+ * A small level's tick is mostly fixed cost per render pass, and luma's
+ * `device.submit()` builds a command encoder, a command buffer and a promise on
+ * the main thread each time (6.5 µs on an M1 Max). So every work item (P, F_b,
+ * I, a seed step, a readback copy) submits exactly once, after its passes, and a
+ * clear is the first drawing pass's `clear`. Per item the guard counts submits,
+ * render passes (P's are its dependency chains: the reduction tree and its query,
+ * the latch, the L0 scatter and the pyramid's reduces, the hub chunks) and passes
+ * that draw nothing, and pins that each force band clears exactly its own rows.
  */
 
 import { describe, it, expect, beforeAll, vi } from "vitest";
@@ -49,10 +60,15 @@ import { GpuForceLayout } from "../gpu-force-layout.js";
 import { buildCSR, buildGraph } from "../../graph.js";
 import { MIN_SETTLE_TICKS, type LayoutGraph } from "../../force.js";
 import { buildHubChunks, SPRING_CHUNK } from "../hub-chunks.js";
-import { FLAT_TILE_MIN_SIDE, flatSegments, packTiles, type PyramidTexture } from "../segments.js";
+import { FLAT_TILE_MIN_SIDE, bandRows, flatSegments, packTiles, reduceLayout, type PyramidTexture } from "../segments.js";
 import { GridPyramid } from "../passes/grid-pyramid.js";
 import { STOP_STOPPED } from "../stop-latch.js";
 import { atlasWidth } from "../textures.js";
+import { AsyncPositionReadback } from "../async-readback.js";
+import { deviceReadsRG } from "../device-probe.js";
+import { coarseSeedPlan } from "../seed-plan.js";
+import { buildHierarchy } from "../../coarsen.js";
+import { recordItems, type ItemRecord } from "./_item-recorder.js";
 import { perfBudget, perfN } from "../../../__tests__/perf-budget.js";
 
 /** One draw call as the spy saw it: primitive mode, vertices × instances, and the viewport size. */
@@ -693,4 +709,111 @@ describe("GPU frame budget — pyramid path (per-tick regression tripwire)", () 
       layout.destroy();
     }
   }, 120_000);
+  it.each([false, true])("every work item submits once, after its passes, and no pass only clears (#402), multilevel %s", (multilevel) => {
+    // P's passes are its dependency chains — the reduction tree's levels and the range query, the stop latch,
+    // the L0 scatter and one reduce per coarser pyramid level, the hub chunks — each reading the one before, and
+    // the force clear is the first band's (each band's) clear. A pass that submitted, or a clear of its own,
+    // shows here; so does a pass added to a tick. A multilevel solver runs a seed first: its steps and its
+    // levels' ticks are items too.
+    const N = perfN(30_000, { max: 200_000 });
+    const g = withHubs(makeClusteredGraph(N, 80, 0x402), 0x54);
+    expect(chunkCount(g)).toBeGreaterThan(0);
+    const params = { repulsion: 200, attraction: 0.05, centering: 0.2, alpha: 0.05, theta: 0.7 };
+    const layout = new GpuForceLayout(device, g, params, { repulsionMode: "pyramid", multilevel });
+    const readback = new AsyncPositionReadback(device, layout);
+    const rec = recordItems(device);
+    const seedItems: ItemRecord[] = [];
+    try {
+      if (multilevel) {
+        const plan = coarseSeedPlan(
+          { nodeCount: g.nodeCount, source: g.source, target: g.target, weight: new Float32Array(g.edgeCount).fill(1) },
+          buildHierarchy({ nodeCount: g.nodeCount, source: g.source, target: g.target, weight: new Float32Array(g.edgeCount).fill(1) }),
+          { width: 800, height: 600 },
+        );
+        if (!plan) throw new Error("the fixture coarsens");
+        layout.beginSeed(plan);
+        plan.levels.forEach((level, k) => {
+          seedItems.push(rec.record(() => layout.setLevel(k)));
+          for (let t = 0; t < Math.min(level.ticks, 2); t++) {
+            seedItems.push(rec.record(() => layout.beginTick()));
+            const bands = Math.min(2, layout.levelRows);
+            for (let b = 0; b < bands; b++) seedItems.push(rec.record(() => layout.forceBand(b, bands)));
+            seedItems.push(rec.record(() => layout.integrate()));
+          }
+        });
+        seedItems.push(rec.record(() => layout.endSeed()));
+        expect(seedItems.length).toBeGreaterThan(3 * plan.levels.length);
+        expect(seedItems.filter((item) => item.passes === 0)).toEqual([]);
+        expect(seedItems.filter((item) => item.submits !== 1 || item.clearOnly !== 0)).toEqual([]);
+      }
+      layout.runFrame(1); // warm-up on the graph's level
+      const reduce = reduceLayout(N).levels.length + 1; // the tree's levels, then the range query
+      const pyramid = packTiles(flatSegments(N), 0, FLAT_TILE_MIN_SIDE).levels.length; // the L0 scatter, a reduce per coarser level
+      const prep: ItemRecord = { passes: reduce + 1 + pyramid + 1, clearOnly: 0, submits: 1 }; // + the latch, + the hub chunks
+      const one: ItemRecord = { passes: 1, clearOnly: 0, submits: 1 };
+      for (let t = 0; t < 2; t++) {
+        expect(rec.record(() => layout.beginTick()), "P").toEqual(prep);
+        for (let b = 0; b < 4; b++) expect(rec.record(() => layout.forceBand(b, 4)), `F_${b}`).toEqual(one);
+        expect(rec.record(() => layout.integrate()), "I").toEqual(one);
+      }
+      expect(rec.record(() => layout.runFrame(1)), "an unsliced tick").toEqual({ passes: prep.passes + 2, clearOnly: 0, submits: 3 });
+      // A readback copy between ticks is one item: the reductions and the latch again, then the staging passes.
+      const staging = (deviceReadsRG(device) ? 0 : 1) + 1; // positions (where RG/FLOAT does not read back), stats
+      expect(rec.record(() => {
+        layout.prepareReadback(true);
+        readback.issue(layout);
+      }), "a copy").toEqual({ passes: reduce + 1 + staging, clearOnly: 0, submits: 1 });
+    } finally {
+      rec.restore();
+      readback.abandon();
+      readback.destroy();
+      layout.destroy();
+    }
+  });
+
+  it("a force band clears exactly its own rows of the force accumulator (#402)", () => {
+    // The force clear is each band's own (scissored), not a pass of P's: band b of B leaves the rows of the
+    // other bands holding the previous tick's forces and replaces its own with this tick's — not added to
+    // the previous ones (a band that did not clear), and without zeroing the others (an unscissored clear).
+    const N = perfN(30_000, { max: 200_000 });
+    const g = makeClusteredGraph(N, 80, 0xc1ea);
+    const params = { repulsion: 200, attraction: 0.05, centering: 0.2, alpha: 0.05, theta: 0.7 };
+    const whole = new GpuForceLayout(device, { ...g, positions: g.positions.slice() }, params, { repulsionMode: "pyramid" });
+    const banded = new GpuForceLayout(device, { ...g, positions: g.positions.slice() }, params, { repulsionMode: "pyramid" });
+    const previous = new Float32Array(N * 2);
+    const next = new Float32Array(N * 2);
+    const band = new Float32Array(N * 2);
+    try {
+      whole.runFrame(2);
+      banded.runFrame(2);
+      banded.readForces(previous);
+      whole.runFrame(1);
+      whole.readForces(next);
+      banded.beginTick();
+      banded.forceBand(1, 4);
+      banded.readForces(band);
+    } finally {
+      whole.destroy();
+      banded.destroy();
+    }
+    const width = atlasWidth(N);
+    const [r0, r1] = bandRows(1, 4, Math.ceil(N / width));
+    let inBand = 0;
+    let changed = 0;
+    let mismatches = 0;
+    for (let i = 0; i < N; i++) {
+      const row = Math.floor(i / width);
+      const own = row >= r0 && row < r1;
+      if (own) inBand++;
+      for (const c of [0, 1]) {
+        const want = own ? next[2 * i + c] : previous[2 * i + c];
+        if (!Object.is(band[2 * i + c], want)) mismatches++;
+        if (own && next[2 * i + c] !== previous[2 * i + c]) changed++;
+      }
+    }
+    expect(mismatches).toBe(0);
+    // Non-vacuous: the band holds rows, and the tick changed their forces.
+    expect(inBand).toBeGreaterThan(N / 8);
+    expect(changed).toBeGreaterThan(inBand);
+  });
 });

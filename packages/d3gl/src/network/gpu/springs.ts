@@ -192,7 +192,7 @@ export class GpuSprings {
 
   /**
    * Encode the hub chunk pass over the current positions: its own render pass into the partials
-   * texture, submitted before the caller opens the force pass that {@link draw}s into. No-op (no render
+   * texture, encoded before the caller opens the force pass that {@link draw}s into. No-op (no render
    * pass, no draw) when the graph has no hubs.
    */
   prepare(posTex: Texture, width: number, nested?: NestedSpringInputs): void {
@@ -202,7 +202,6 @@ export class GpuSprings {
     const pass = beginPass(this.device, { framebuffer: hubs.fbo, clear: false });
     hubs.pass.run(pass, posTex, this.csr, hubs, { width, nbrWidth: this.nbrWidth }, nested);
     pass.end();
-    this.device.submit();
   }
 
   /**
