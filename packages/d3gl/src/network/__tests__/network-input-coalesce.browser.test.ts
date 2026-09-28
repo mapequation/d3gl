@@ -137,7 +137,8 @@ async function lodEngine(): Promise<{ host: HTMLElement; net: Probe }> {
   await net.whenReady();
   const graph = buildGraph({ nodeCount: 4, source: [0, 2, 1], target: [1, 3, 2], directed: true });
   const modules = [{ id: 0, path: [1, 1] }, { id: 1, path: [1, 2] }, { id: 2, path: [2, 1] }, { id: 3, path: [2, 2] }];
-  net.data(graph).lod({ modules, expandPx: 20 }).layout({ backend: "positions", positions: new Float32Array([70, 90, 85, 90, 115, 110, 130, 110]) });
+  // Glyphs that really overlap (#426: members 15 apart, radius 8), so each module is drawn as one aggregate.
+  net.data(graph).style({ nodeRadius: 8 }).lod({ modules, expandPx: 20 }).layout({ backend: "positions", positions: new Float32Array([70, 90, 85, 90, 115, 110, 130, 110]) });
   net.setTransform({ k: 1, x: 0, y: 0 });
   net.interactive({ draggable: true, selectable: true });
   return { host, net };
