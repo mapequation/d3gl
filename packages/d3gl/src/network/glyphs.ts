@@ -177,7 +177,7 @@ export interface LinkStyleResolved {
   /** Per-edge width from its weight; for super-edges, applied to the accumulated subsumed weight. */
   widthOf: (weight: number) => number;
   /** Per-edge RGBA from its weight; for super-edges, applied to the accumulated subsumed weight. */
-  colorOf: (weight: number) => [number, number, number, number];
+  colorOf: (weight: number) => RGBAValue;
   /** Bend (#104 N6c): quadratic-bezier control offset ⟂ to the chord, as a fraction of chord length (0 = straight). */
   bend?: number;
 }
@@ -196,14 +196,130 @@ export function resolveLinkStrokeOf(spec: LinkColorSpec): (weight: number) => st
   return spec.scale; // { by, scale }: `by` is the per-edge weight (== flow); `scale` maps it to a colour
 }
 
-/** Resolve a {@link LinkColorSpec} to a `(weight) => RGBA` function (the WebGL twin of {@link resolveLinkStrokeOf}). */
-export function resolveLinkColorOf(spec: LinkColorSpec): (weight: number) => [number, number, number, number] {
+/** Most distinct weights one resolved link colour remembers (see {@link resolveLinkColorOf}). */
+const LINK_COLOR_MEMO_MAX = 1 << 14;
+/** Slots a link colour memo starts with; it doubles at load ½, up to 2 × {@link LINK_COLOR_MEMO_MAX}
+ *  slots of 16 B (512 KB). A graph with a handful of distinct weights never grows past this. */
+const LINK_COLOR_MEMO_MIN_SLOTS = 1 << 6;
+
+/**
+ * Resolve a {@link LinkColorSpec} to a `(weight) => RGBA` function (the WebGL twin of
+ * {@link resolveLinkStrokeOf}). Resolved once per style, and **memoised by weight**: a colour spec is
+ * a function of the weight, and a super-edge emit asks for the same accumulated weights frame after
+ * frame (a pair's flow is fixed by the tree), so the CSS accessor + `rgb()` parse run once per distinct
+ * weight instead of once per drawn edge per frame. A constant colour parses once, into one shared tuple;
+ * a scale hands each call a fresh tuple. The memo holds up to {@link LINK_COLOR_MEMO_MAX} weights and
+ * starts over when full: a frame with more distinct weights than that (continuous flows) resolves each
+ * one again, as with no memo, plus a typed-array probe — never a wrong colour.
+ */
+export function resolveLinkColorOf(spec: LinkColorSpec): (weight: number) => RGBAValue {
+  if (typeof spec === "string") {
+    const constant = toRGBA(spec);
+    return () => constant;
+  }
   const cssOf = resolveLinkStrokeOf(spec);
-  return (w) => toRGBA(cssOf(w));
+  const memo = new LinkColorMemo();
+  return (w) => {
+    if (w !== w) return toRGBA(cssOf(w)); // NaN matches no key — resolve it every time
+    const slot = memo.find(w);
+    if (slot >= 0) {
+      const p = memo.rgbaAt(slot);
+      return [p & 255, (p >>> 8) & 255, (p >>> 16) & 255, p >>> 24];
+    }
+    const c = toRGBA(cssOf(w));
+    memo.set(w, c[0] | (c[1] << 8) | (c[2] << 16) | (c[3] << 24));
+    return c;
+  };
+}
+
+/**
+ * Weight → packed RGBA memo behind {@link resolveLinkColorOf}: open addressing with linear probing over
+ * typed arrays, so a lookup allocates nothing and an entry retains no object. (A `Map<number, RGBA>`
+ * boxed every double key and kept a tuple per entry: once more distinct weights were drawn than it
+ * held, it cost 20-40% more than no memo at all.) Grows by doubling from
+ * {@link LINK_COLOR_MEMO_MIN_SLOTS}; full at {@link LINK_COLOR_MEMO_MAX} entries, where it starts over
+ * with an O(1) generation bump. Keys are never NaN (the caller resolves NaN directly).
+ */
+class LinkColorMemo {
+  private keys = new Float64Array(LINK_COLOR_MEMO_MIN_SLOTS);
+  private rgba = new Uint32Array(LINK_COLOR_MEMO_MIN_SLOTS);
+  /** A slot is live when its stamp equals {@link gen}; bumping `gen` empties the table in O(1). */
+  private stamp = new Uint32Array(LINK_COLOR_MEMO_MIN_SLOTS);
+  private gen = 1;
+  private size = 0;
+  /** Scratch to read a double's bits for the hash (no allocation per lookup). */
+  private readonly bits = new Float64Array(1);
+  private readonly words = new Uint32Array(this.bits.buffer);
+
+  /** The slot holding weight `w`, or −1. */
+  find(w: number): number {
+    const mask = this.keys.length - 1;
+    for (let s = this.home(w, mask); this.stamp[s] === this.gen; s = (s + 1) & mask) {
+      if (this.keys[s] === w) return s;
+    }
+    return -1;
+  }
+
+  /** The packed RGBA (r | g<<8 | b<<16 | a<<24) at a slot {@link find} returned. */
+  rgbaAt(slot: number): number {
+    return this.rgba[slot] ?? 0;
+  }
+
+  /** Remember weight `w` (not present) → packed RGBA. */
+  set(w: number, packed: number): void {
+    if (2 * (this.size + 1) > this.keys.length) {
+      if (this.keys.length < 2 * LINK_COLOR_MEMO_MAX) this.grow();
+      else this.startOver();
+    }
+    this.insert(w, packed);
+  }
+
+  private insert(w: number, packed: number): void {
+    const mask = this.keys.length - 1;
+    let s = this.home(w, mask);
+    while (this.stamp[s] === this.gen) s = (s + 1) & mask;
+    this.keys[s] = w;
+    this.rgba[s] = packed;
+    this.stamp[s] = this.gen;
+    this.size++;
+  }
+
+  /** Home slot: murmur3's 32-bit finaliser over both words of the double (full avalanche, so integer
+   *  flows — whose low mantissa bits are all zero — spread as well as fractional ones). */
+  private home(w: number, mask: number): number {
+    this.bits[0] = w;
+    let h = (this.words[0] ?? 0) ^ Math.imul(this.words[1] ?? 0, 0x9e3779b1);
+    h = Math.imul(h ^ (h >>> 16), 0x85ebca6b);
+    h = Math.imul(h ^ (h >>> 13), 0xc2b2ae35);
+    return (h ^ (h >>> 16)) & mask;
+  }
+
+  private grow(): void {
+    const keys = this.keys;
+    const rgba = this.rgba;
+    const stamp = this.stamp;
+    const gen = this.gen;
+    const slots = keys.length * 2;
+    this.keys = new Float64Array(slots);
+    this.rgba = new Uint32Array(slots);
+    this.stamp = new Uint32Array(slots);
+    this.gen = 1;
+    this.size = 0;
+    for (let s = 0; s < keys.length; s++) if (stamp[s] === gen) this.insert(keys[s] ?? 0, rgba[s] ?? 0);
+  }
+
+  private startOver(): void {
+    this.size = 0;
+    if (this.gen === 0xffffffff) {
+      this.stamp.fill(0);
+      this.gen = 0;
+    }
+    this.gen++;
+  }
 }
 
 /** Per-instance RGBA buffer for a batch of links, colouring each by its weight via `colorOf`. */
-function linkColorBytes(weights: ArrayLike<number>, count: number, colorOf: (weight: number) => [number, number, number, number]): Uint8Array {
+function linkColorBytes(weights: ArrayLike<number>, count: number, colorOf: (weight: number) => RGBAValue): Uint8Array {
   const colors = new Uint8Array(count * 4);
   for (let e = 0; e < count; e++) {
     const [r, g, b, a] = colorOf(weights[e]!);
@@ -214,6 +330,9 @@ function linkColorBytes(weights: ArrayLike<number>, count: number, colorOf: (wei
   }
   return colors;
 }
+
+/** A resolved link colour: RGBA bytes. Read-only — a constant colour's tuple is shared by every call. */
+export type RGBAValue = readonly [number, number, number, number];
 
 /** Parse any CSS colour to RGBA bytes (alpha from opacity). */
 function toRGBA(css: string): [number, number, number, number] {
@@ -700,7 +819,7 @@ export interface SuperEdgeStyleResolved {
   /** Width from a super-edge's accumulated subsumed flow (the same scale as raw links). */
   widthOf: (weight: number) => number;
   /** Colour from the accumulated flow (the same scale as raw links). */
-  colorOf: (weight: number) => [number, number, number, number];
+  colorOf: (weight: number) => RGBAValue;
   /** Bend: a fraction of the chord, for `"line"` and `"half-arrow"` alike (#296) — as for raw links. */
   bend: number;
   /** Arrowhead size for the directed `"line"` style. */
@@ -1337,7 +1456,7 @@ export interface HalfArrowStyleResolved {
   /** Per-node radii (world units) — source foot at r0, arrow tip on the target's r1 boundary. */
   nodeRadii: Float32Array;
   widthOf: (weight: number) => number;
-  colorOf: (weight: number) => [number, number, number, number];
+  colorOf: (weight: number) => RGBAValue;
   /** Bend as a **fraction of the chord** (#296; sign picks the bow side). */
   bend: number;
 }
@@ -1347,7 +1466,7 @@ export interface ArrowStyleResolved {
   /** Per-node radii (world units) — the tip is set back by the *target* node's radius. */
   nodeRadii: Float32Array;
   /** Per-edge RGBA from weight — the arrowhead always matches its link's colour. */
-  colorOf: (weight: number) => [number, number, number, number];
+  colorOf: (weight: number) => RGBAValue;
   /** Bend (#104 N6c), matching the link's — the head sits on the bezier end-tangent. */
   bend?: number;
   /** Draw a one-sided **half** arrowhead (#104 N6c). */
@@ -1442,7 +1561,7 @@ export interface ResolvedNetworkStyle {
   /** Representative link colour (single colour, or a fallback for super-edges / Scene strokes). */
   linkStroke: string;
   /** Per-edge RGBA from weight; for super-edges, applied to accumulated weight. The arrow shares it. */
-  linkColorOf: (weight: number) => [number, number, number, number];
+  linkColorOf: (weight: number) => RGBAValue;
   /** Per-edge CSS colour from weight (the Scene/SVG twin of {@link linkColorOf}). */
   linkStrokeOf: (weight: number) => string;
   /** How directed links draw: `"line"` + arrowhead, or a fused `"half-arrow"` (the map glyph). */

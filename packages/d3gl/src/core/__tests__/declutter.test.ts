@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { declutterScreen, declutterMembers } from "../declutter.js";
+import { declutterScreen, declutterMembers, declutterScratch } from "../declutter.js";
 
 const run = (count: number, sx: number[], sy: number[], radius: number | Float64Array, order: number[] | undefined, spacing = 1) =>
   Array.from(declutterScreen(count, sx, sy, radius, order, 100, 100, spacing, new Uint8Array(count)));
@@ -50,3 +50,273 @@ describe("declutterScreen", () => {
     expect(declutterMembers(winners, 2, 4)).toEqual([2, 3]);
   });
 });
+
+/**
+ * The single-grid per-glyph declutter every release before the radius-class grid shipped: one uniform
+ * grid with cell = 2·spacing·maxR, a 3×3 neighbourhood scan in (column, row) order and each cell's
+ * kept glyphs newest first. The radius-class grid must reproduce it exactly — the same kept set AND
+ * the same `winners` (the first occluder this scan meets).
+ */
+function singleGridReference(
+  count: number,
+  sx: ArrayLike<number>,
+  sy: ArrayLike<number>,
+  radii: ArrayLike<number>,
+  order: ArrayLike<number> | undefined,
+  width: number,
+  height: number,
+  spacing: number,
+  ignore?: (i: number, j: number) => boolean,
+): { kept: Uint8Array; winners: Int32Array; probes: number } {
+  const kept = new Uint8Array(count);
+  const winners = new Int32Array(count).fill(-7);
+  let maxR = 1;
+  for (let i = 0; i < count; i++) maxR = Math.max(maxR, radii[i] ?? 0);
+  const cell = Math.max(2 * maxR * spacing, 1);
+  const cols = Math.floor(width / cell) + 3;
+  const rows = Math.floor(height / cell) + 3;
+  const head = new Int32Array(cols * rows).fill(-1);
+  const next = new Int32Array(count);
+  let probes = 0;
+  for (let oi = 0; oi < count; oi++) {
+    const i = order ? (order[oi] ?? 0) : oi;
+    const x = sx[i] ?? 0;
+    const y = sy[i] ?? 0;
+    const r = radii[i] ?? 0;
+    if (x < 0 || y < 0 || x > width || y > height) {
+      kept[i] = 1;
+      winners[i] = i;
+      continue;
+    }
+    const cx = Math.min(cols - 1, Math.max(0, Math.floor(x / cell) + 1));
+    const cy = Math.min(rows - 1, Math.max(0, Math.floor(y / cell) + 1));
+    let occluder = -1;
+    for (let gx = cx - 1; gx <= cx + 1 && occluder < 0; gx++) {
+      if (gx < 0 || gx >= cols) continue;
+      for (let gy = cy - 1; gy <= cy + 1 && occluder < 0; gy++) {
+        if (gy < 0 || gy >= rows) continue;
+        for (let p = head[gy * cols + gx] ?? -1; p !== -1; p = next[p] ?? -1) {
+          probes++;
+          const dx = (sx[p] ?? 0) - x;
+          const dy = (sy[p] ?? 0) - y;
+          const thresh = spacing * (r + (radii[p] ?? 0));
+          if (dx * dx + dy * dy < thresh * thresh && !(ignore && ignore(i, p))) {
+            occluder = p;
+            break;
+          }
+        }
+      }
+    }
+    if (occluder < 0) {
+      kept[i] = 1;
+      winners[i] = i;
+      const c = cy * cols + cx;
+      next[i] = head[c] ?? -1;
+      head[c] = i;
+    } else {
+      winners[i] = occluder;
+    }
+  }
+  return { kept, winners, probes };
+}
+
+/** A dense LOD-frontier-like screen: mostly 2-3 px leaves packed well past overlap, plus a share of
+ *  aggregates up to the 26 px cap (the network default), some centres off-screen. Deterministic. */
+function mixedFrontier(n: number, width: number, height: number, bigShare: number, seed = 11): { sx: Float64Array; sy: Float64Array; radii: Float64Array; order: Uint32Array } {
+  let s = seed >>> 0;
+  const rng = (): number => ((s = (s * 1664525 + 1013904223) >>> 0) / 4294967296);
+  const sx = new Float64Array(n);
+  const sy = new Float64Array(n);
+  const radii = new Float64Array(n);
+  for (let i = 0; i < n; i++) {
+    sx[i] = rng() * (width + 60) - 30;
+    sy[i] = rng() * (height + 60) - 30;
+    radii[i] = rng() < bigShare ? 5 + rng() * 21 : 2 + rng();
+  }
+  // Importance order: aggregates first (as an LOD frontier's summed weights put them), then leaves.
+  const order = Uint32Array.from({ length: n }, (_, i) => i).sort((a, b) => (radii[b] ?? 0) - (radii[a] ?? 0));
+  return { sx, sy, radii, order };
+}
+
+/** Glyphs at the 26 px aggregate cap, with `tiny` 0.1 px glyphs visited first (a heavy leaf ahead of
+ *  the aggregates, e.g. a leaf radius scale starting near 0). `stacked` piles every glyph within 20 px
+ *  of the screen centre, on top of the first tiny glyph, so all of them collide with it. Deterministic. */
+function capDominated(n: number, width: number, height: number, tiny: number, stacked: boolean, seed = 5): { sx: Float64Array; sy: Float64Array; radii: Float64Array; order: Uint32Array } {
+  let s = seed >>> 0;
+  const rng = (): number => ((s = (s * 1664525 + 1013904223) >>> 0) / 4294967296);
+  const sx = new Float64Array(n);
+  const sy = new Float64Array(n);
+  const radii = new Float64Array(n);
+  for (let i = 0; i < n; i++) {
+    if (stacked) {
+      const a = rng() * 2 * Math.PI;
+      const d = i === 0 ? 0 : rng() * 20;
+      sx[i] = width / 2 + d * Math.cos(a);
+      sy[i] = height / 2 + d * Math.sin(a);
+    } else {
+      sx[i] = rng() * width;
+      sy[i] = rng() * height;
+    }
+    radii[i] = i < tiny ? 0.1 : 26;
+  }
+  return { sx, sy, radii, order: Uint32Array.from({ length: n }, (_, i) => i) };
+}
+
+describe("declutterScreen per-glyph radius grid", () => {
+  const W = 1104;
+  const H = 900;
+
+  it("keeps exactly the single-grid set and winners across radius mixes, orders, spacings and ignores", () => {
+    const n = 20_000;
+    const ignore = (i: number, j: number): boolean => (i * 7 + j) % 13 === 0;
+    const cases: { name: string; bigShare: number; spacing: number; ordered: boolean; ignore?: (i: number, j: number) => boolean; radiusScale?: number }[] = [
+      { name: "leaves + capped aggregates", bigShare: 0.05, spacing: 1, ordered: true },
+      { name: "no aggregates (all 2-3 px)", bigShare: 0, spacing: 1, ordered: true },
+      { name: "all aggregates", bigShare: 1, spacing: 1, ordered: true },
+      { name: "index order + spacing 1.5", bigShare: 0.1, spacing: 1.5, ordered: false },
+      { name: "cross-fade ignore", bigShare: 0.05, spacing: 1, ordered: true, ignore },
+      { name: "sub-pixel radii (world sizeMode, low zoom)", bigShare: 0.05, spacing: 1, ordered: true, radiusScale: 0.05 },
+      { name: "one huge glyph among leaves", bigShare: 0.0001, spacing: 1, ordered: true, radiusScale: 8 },
+    ];
+    for (const c of cases) {
+      const { sx, sy, radii, order } = mixedFrontier(n, W, H, c.bigShare);
+      if (c.radiusScale) for (let i = 0; i < n; i++) radii[i] = (radii[i] ?? 0) * c.radiusScale;
+      radii[3] = 0; // a zero-radius glyph (still occluded by any glyph whose disc covers its centre)
+      const ord = c.ordered ? order : undefined;
+      const ref = singleGridReference(n, sx, sy, radii, ord, W, H, c.spacing, c.ignore);
+      const out = new Uint8Array(n);
+      const winners = new Int32Array(n).fill(-7);
+      declutterScreen(n, sx, sy, radii, ord, W, H, c.spacing, out, declutterScratch(), c.ignore, winners);
+      expect(firstMismatch(out, ref.kept), `${c.name}: kept`).toBe(-1);
+      expect(firstMismatch(winners, ref.winners), `${c.name}: winners`).toBe(-1);
+      // Without winners (the network LOD call shape) the kept set is the same.
+      const bare = new Uint8Array(n);
+      declutterScreen(n, sx, sy, radii, ord, W, H, c.spacing, bare, declutterScratch(), c.ignore);
+      expect(firstMismatch(bare, ref.kept), `${c.name}: kept, no winners`).toBe(-1);
+    }
+  });
+
+  it("tests each glyph against O(1) kept neighbours, not the whole 2·maxR cell (probe signature)", () => {
+    // 5% aggregates up to 26 px set the single-grid cell to 52 px, so every rejected 2-3 px leaf used to
+    // scan the ~9 · 52² px of kept leaves around it. The radius-class grid scans only its own class's
+    // few cells (plus the sparse aggregate classes) — probes per glyph stay bounded as the leaves pack.
+    const n = 200_000;
+    const { sx, sy, radii, order } = mixedFrontier(n, W, H, 0.05);
+    const scratch = declutterScratch();
+    declutterScreen(n, sx, sy, radii, order, W, H, 1, new Uint8Array(n), scratch);
+    const ref = singleGridReference(n, sx, sy, radii, order, W, H, 1);
+    const perGlyph = (scratch.probes ?? 0) / n;
+    // Measured: single grid 52.6 probes/glyph here; radius-class grid 3.2.
+    expect(ref.probes / n, "the fixture really is dense for the single grid").toBeGreaterThan(30);
+    expect(perGlyph, `${perGlyph.toFixed(2)} probes/glyph`).toBeLessThan(8);
+  });
+
+  it("reuses the scratch across calls without reallocating once warm", () => {
+    const n = 5_000;
+    const { sx, sy, radii, order } = mixedFrontier(n, W, H, 0.05);
+    const scratch = declutterScratch();
+    const out = new Uint8Array(n);
+    const winners = new Int32Array(n);
+    declutterScreen(n, sx, sy, radii, order, W, H, 1, out, scratch, undefined, winners);
+    const refs = { head: scratch.head, next: scratch.next, counts: scratch.counts, classNext: scratch.classNext, levels: scratch.levels, seq: scratch.seq };
+    for (let k = 0; k < 4; k++) declutterScreen(n, sx, sy, radii, order, W, H, 1, out, scratch, undefined, winners);
+    expect(refs.levels, "the per-class tables exist once warm").toBeDefined();
+    expect(scratch.head).toBe(refs.head);
+    expect(scratch.next).toBe(refs.next);
+    expect(scratch.counts).toBe(refs.counts);
+    expect(scratch.classNext).toBe(refs.classNext);
+    expect(scratch.levels).toBe(refs.levels);
+    expect(scratch.seq).toBe(refs.seq);
+  });
+
+  it("counts a negative radius as 0 (a point): the single-grid set and winners over the clamped radii", () => {
+    // An unclamped d3 radius scale can extrapolate a leaf's radius below 0 (lod.ts passes it through).
+    // The single grid squared a negative threshold, so such a pair's exclusion depended on which grid
+    // cells it fell in; a point is the only reading that doesn't. Both r ≤ −1 and −1 < r < 0 occur here.
+    const n = 20_000;
+    const { sx, sy, radii, order } = mixedFrontier(n, W, H, 0.05);
+    for (let i = 0; i < n; i += 3) radii[i] = -(radii[i] ?? 0) * (i % 2 === 1 ? 1 : 0.2);
+    const clamped = radii.map((r) => Math.max(r, 0));
+    const ref = singleGridReference(n, sx, sy, clamped, order, W, H, 1);
+    const out = new Uint8Array(n);
+    const winners = new Int32Array(n).fill(-7);
+    declutterScreen(n, sx, sy, radii, order, W, H, 1, out, declutterScratch(), undefined, winners);
+    expect(firstMismatch(out, ref.kept), "kept").toBe(-1);
+    expect(firstMismatch(winners, ref.winners), "winners").toBe(-1);
+    // A point inside a kept disc is covered by it, and a kept point still culls a disc over it.
+    expect(Array.from(declutterScreen(2, [50, 58], [50, 50], Float64Array.of(10, -5), [0, 1], 100, 100, 1, new Uint8Array(2)))).toEqual([1, 0]);
+    expect(Array.from(declutterScreen(2, [50, 58], [50, 50], Float64Array.of(-5, 10), [0, 1], 100, 100, 1, new Uint8Array(2)))).toEqual([1, 0]);
+  });
+
+  it("costs no more than the single grid when large glyphs dominate and a tiny one is kept first", () => {
+    // The shape the radius classes are worst at: once any tiny glyph is kept, a fine class is non-empty,
+    // and a glyph at the cap would scan ~(2·26/c_fine)² mostly empty fine cells to prove it clear.
+    // Measured before the fallback to the single grid: 1,000+ cells per glyph at 200k, 13x slower.
+    const n = 200_000;
+    const shapes: { name: string; tiny: number; stacked: boolean }[] = [
+      { name: "one tiny glyph first, the rest at 26 px", tiny: 1, stacked: false },
+      { name: "1% tiny glyphs first, the rest at 26 px", tiny: n / 100, stacked: false },
+      { name: "everything stacked on one tiny glyph", tiny: 1, stacked: true },
+    ];
+    for (const s of shapes) {
+      const { sx, sy, radii, order } = capDominated(n, W, H, s.tiny, s.stacked);
+      const ref = singleGridReference(n, sx, sy, radii, order, W, H, 1);
+      for (const withWinners of [false, true]) {
+        const scratch = declutterScratch();
+        const out = new Uint8Array(n);
+        const winners = withWinners ? new Int32Array(n).fill(-7) : undefined;
+        declutterScreen(n, sx, sy, radii, order, W, H, 1, out, scratch, undefined, winners);
+        const tag = `${s.name}${withWinners ? " (winners)" : ""}`;
+        expect(firstMismatch(out, ref.kept), `${tag}: kept`).toBe(-1);
+        if (winners) expect(firstMismatch(winners, ref.winners), `${tag}: winners`).toBe(-1);
+        const cells = (scratch.cells ?? 0) / n;
+        const probes = (scratch.probes ?? 0) / n;
+        // The single grid scans at most 9 cells per glyph; a direct class scan may take a few more.
+        expect(cells, `${tag}: ${cells.toFixed(1)} cells/glyph`).toBeLessThan(16);
+        expect(probes, `${tag}: ${probes.toFixed(2)} probes/glyph vs ${(ref.probes / n).toFixed(2)} for the single grid`).toBeLessThanOrEqual((ref.probes / n) * 1.25 + 1);
+      }
+    }
+  });
+
+  it("an infinite radius culls every later on-screen glyph, as the single grid did", () => {
+    const n = 1_000;
+    const { sx, sy, radii, order } = mixedFrontier(n, W, H, 0.05);
+    for (let i = 0; i < n; i++) radii[i] = 2;
+    const first = order[0] ?? 0;
+    sx[first] = W / 2;
+    sy[first] = H / 2;
+    radii[first] = Infinity;
+    const ref = singleGridReference(n, sx, sy, radii, order, W, H, 1);
+    const out = new Uint8Array(n);
+    const winners = new Int32Array(n).fill(-7);
+    declutterScreen(n, sx, sy, radii, order, W, H, 1, out, declutterScratch(), undefined, winners);
+    expect(firstMismatch(out, ref.kept), "kept").toBe(-1);
+    expect(firstMismatch(winners, ref.winners), "winners").toBe(-1);
+    let onScreenKept = 0;
+    for (let i = 0; i < n; i++) if (out[i] && (sx[i] ?? 0) >= 0 && (sy[i] ?? 0) >= 0 && (sx[i] ?? 0) <= W && (sy[i] ?? 0) <= H) onScreenKept++;
+    expect(onScreenKept, "only the infinite glyph survives on screen").toBe(1);
+  });
+
+  it("accepts a hand-built { head, next } scratch (the shape it had before the radius classes)", () => {
+    const n = 5_000;
+    const { sx, sy, radii, order } = mixedFrontier(n, W, H, 0.05);
+    for (const radius of [radii, 3] as const) {
+      const want = new Uint8Array(n);
+      const wantWinners = new Int32Array(n);
+      declutterScreen(n, sx, sy, radius, order, W, H, 1, want, declutterScratch(), undefined, wantWinners);
+      const bare = { head: new Int32Array(0), next: new Int32Array(0) };
+      const got = new Uint8Array(n);
+      const gotWinners = new Int32Array(n);
+      declutterScreen(n, sx, sy, radius, order, W, H, 1, got, bare, undefined, gotWinners);
+      const form = typeof radius === "number" ? "uniform" : "per-glyph";
+      expect(firstMismatch(got, want), `${form}: kept`).toBe(-1);
+      expect(firstMismatch(gotWinners, wantWinners), `${form}: winners`).toBe(-1);
+    }
+  });
+});
+
+function firstMismatch(a: ArrayLike<number>, b: ArrayLike<number>): number {
+  if (a.length !== b.length) return -2;
+  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return i;
+  return -1;
+}
