@@ -221,7 +221,8 @@ What it composes:
   visible when zoomed out). LOD pairs naturally with `"screen"`.
 
 The geometry tracks the layout *as it converges* (LOD helps during the solve, not just after), while
-panning and zooming only re-run the cheap cut. On the **WebGL** lane the cut re-runs live every frame.
+panning and zooming only re-run the cheap cut. On the **WebGL** lane the cut re-runs live every frame —
+once per animation frame, however many wheel or pan events arrive in it (the latest view wins).
 On the **Canvas/SVG** backends the same frontier draws as retained geometry — but a retained backend
 can't re-tessellate per frame, so there the frontier is static during a gesture and re-cuts when it
 ends, or after a `setTransform` while zoom is enabled (call `syncScreenGeometry()` to re-cut at a chosen
@@ -636,7 +637,9 @@ What moves depends on what you grab:
   leaves. (`members()` enumerates exactly those leaves, the same set selection uses.)
 
 The held node tracks the cursor with **no lag** on every backend, because the held positions are written on
-the **main thread** each pointer move — the layout backend only reflows *the rest*:
+the **main thread** each pointer move — the layout backend only reflows *the rest*. The redraw itself (the
+LOD update, the cut and the render) runs once per animation frame, together with any zoom or streamed layout
+frame that lands in it, however fast the pointer moves:
 
 | `layout({ backend })` | While dragging | On release |
 | --- | --- | --- |
