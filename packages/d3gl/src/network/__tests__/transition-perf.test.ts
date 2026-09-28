@@ -175,10 +175,11 @@ function frameAllocKB(gc: (() => void) | undefined, frame: (i: number) => void):
  * allocate the emit's endpoint arrays (~20 B per node per frame), and what an allocation costs — a
  * scavenge, a major GC started by the external-memory pressure of the frames before, fresh pages to fault
  * in — depends on what the process did before, not on the frame. Timed as two loops, one after the other,
- * the second loop inherited the first's state: the same OFF frames measured 1.2× in a fresh process and
- * 1.7-1.9× after the LOD-on leg on CI (#433), and #416 moved it by making the LOD-on leg allocation-free
- * (its colour memo), which left a different state behind. A transition frame never reads the positions a
- * streamed frame wrote (it eases from its own snapshot), so alternating them changes neither.
+ * the second loop took that cost on alone: on CI the same OFF frames measured 1.51-1.64× as two loops and
+ * 1.25-1.33× interleaved, in one process (#433) — and 1.73-1.87× on the #343 branch, whose LOD-on leg
+ * allocates nothing any more (its colour memo), so the loops after it inherit a different heap. A transition
+ * frame never reads the positions a streamed frame wrote (it eases from its own snapshot), so alternating
+ * them changes neither.
  */
 function runLeg(graph: NetworkGraph, a: Float32Array, b: Float32Array, streamedRepaint: () => void, transitionRepaint: () => void): Leg {
   const gc = (globalThis as { gc?: () => void }).gc;
