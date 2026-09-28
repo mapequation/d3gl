@@ -16,7 +16,7 @@ import { ForceLayout, seedPositions, type ForceParams } from "./force.js";
 import { lodTreeFromTopology, type BoundaryDiscs, type LODTree } from "./lod.js";
 import { nestedLayout, nestedBoundaryDiscs, type NestedLayoutParams, type NestedLayoutTopology } from "./nested-layout.js";
 import { lodGeometryViews, lodGeometryByteLength, type MainToWorker, type WorkerToMain } from "./worker-protocol.js";
-import { lodTreeFromSpatialFrame, type LeafStyle, type SpatialFrameHeader } from "./lod-frame.js";
+import { lodTreeFromSpatialFrame, type LeafStyle, type LODView, type SpatialFrameHeader } from "./lod-frame.js";
 
 export interface WorkerLayoutOptions {
   width: number;
@@ -44,6 +44,8 @@ export interface WorkerLayoutOptions {
   /** The leaf style a spatial stream aggregates per rebuild (#343), and its version (echoed per tree). */
   lodStyle?: LeafStyle;
   lodStyleVersion?: number;
+  /** The view whose covers' super-edge rows a spatial stream builds with each tree (#433). */
+  lodView?: LODView;
 }
 
 /**
@@ -90,6 +92,9 @@ export interface WorkerLayoutHandle {
   /** Send a spatial LOD stream a new leaf style (#343, after `style()`); later frames aggregate it. Absent
    *  when the run streams no spatial tree. */
   setLODStyle?(style: LeafStyle, version: number): void;
+  /** Send a spatial LOD stream the main thread's new view (#433); later trees carry the super-edge rows of its
+   *  covers. Absent when the run streams no spatial tree. */
+  setLODView?(view: LODView): void;
 }
 
 /** Handle for the synchronous fallback (no live worker) — reheat is a no-op there. */
@@ -197,8 +202,9 @@ export function startWorkerLayout(
       const release = (): void => {
         if (released || terminated) return;
         released = true;
-        const back: MainToWorker = { type: "lod-recycle", buffer: frame.buffer };
-        worker.postMessage(back, [frame.buffer]);
+        const rows = frame.rows?.buffer;
+        const back: MainToWorker = { type: "lod-recycle", buffer: frame.buffer, rows };
+        worker.postMessage(back, rows ? [frame.buffer, rows] : [frame.buffer]);
       };
       if (onLODTree) onLODTree(lodTreeFromSpatialFrame(frame), { header: frame.header, release });
       else release();
@@ -238,6 +244,7 @@ export function startWorkerLayout(
     lodSource: opts.lodSource,
     lodStyle: opts.lodStyle,
     lodStyleVersion: opts.lodStyleVersion,
+    lodView: opts.lodView,
   };
   worker.postMessage(start);
 
@@ -266,6 +273,13 @@ export function startWorkerLayout(
       ? (style: LeafStyle, version: number) => {
           if (terminated) return;
           const msg: MainToWorker = { type: "lod-style", style, version };
+          worker.postMessage(msg);
+        }
+      : undefined,
+    setLODView: opts.lod && opts.lodSource === "spatial"
+      ? (view: LODView) => {
+          if (terminated) return;
+          const msg: MainToWorker = { type: "lod-view", view };
           worker.postMessage(msg);
         }
       : undefined,

@@ -13,8 +13,9 @@
  * instance, the LOD tree + geometry buffer) is therefore kept in module scope between runs.
  *
  * With LOD on, every posted frame runs the one per-frame LOD step ({@link lodFrameStep}, #343): refit the
- * coarsening tree in place (`lodSource: "structure"`), or rebuild the spatial tree and transfer it with the
- * frame (`"spatial"`).
+ * coarsening tree in place (`lodSource: "structure"`), or rebuild the spatial tree — with its super-edge
+ * rows (#433), so the main thread's link gather stays O(visible) — and transfer it with the frame
+ * (`"spatial"`).
  *
  * The page's lib is `["ES2020","DOM"]` (the library targets the browser main thread too), so the
  * worker globals here are typed against `DOM`. Positions use single-argument `postMessage` (no
@@ -89,7 +90,7 @@ function postFrame(type: "frame" | "done"): void {
   if (s.lod?.kind === "structure" && s.geomBuffer) message.geometry = new Float32Array(s.geomBuffer); // copy-mode snapshot
   if (lodFrame) {
     message.lodFrame = lodFrame;
-    post(message, [lodFrame.buffer]);
+    post(message, lodFrame.rows ? [lodFrame.buffer, lodFrame.rows.buffer] : [lodFrame.buffer]);
   } else {
     post(message);
   }
@@ -126,7 +127,7 @@ async function loop(): Promise<void> {
 
 async function runLayout(msg: StartMessage): Promise<void> {
   cancelled = false;
-  const { nodeCount, source, target, weight, sharedPositions, width, height, iterations, force, coarsen, multilevel, frameEvery, lod, lodSource, lodStyle, lodStyleVersion } =
+  const { nodeCount, source, target, weight, sharedPositions, width, height, iterations, force, coarsen, multilevel, frameEvery, lod, lodSource, lodStyle, lodStyleVersion, lodView } =
     msg;
   const shared = sharedPositions !== undefined;
   const positions = shared ? new Float32Array(sharedPositions) : new Float32Array(nodeCount * 2);
@@ -144,9 +145,10 @@ async function runLayout(msg: StartMessage): Promise<void> {
   let lodStream: LODStream | null = null;
   let geomBuffer: ArrayBufferLike | null = null; // copy-mode buffer re-posted each frame
   if (spatial) {
-    // The spatial tree (#343) is rebuilt from each frame's positions and travels with the frame: nothing to
-    // post up front, and the coarsening hierarchy only seeds the layout.
-    lodStream = makeSpatialLODStream(nodeCount, lodStyle, lodStyleVersion);
+    // The spatial tree (#343) is rebuilt from each frame's positions and travels with the frame, with the
+    // super-edge rows of the main thread's view's covers (#433) built here from the edges: nothing to post up
+    // front, and the coarsening hierarchy only seeds the layout.
+    lodStream = makeSpatialLODStream(nodeCount, lodStyle, lodStyleVersion, { source, target, weight }, lodView);
   } else if (lod && hierarchy) {
     // Pass the edges so the streamed tree carries the flow-weighted super-edge CSR too — the unified
     // super-edge path needs it on the worker (coarsening) tree just like the main-thread one.
@@ -228,9 +230,12 @@ addEventListener("message", (e: MessageEvent<MainToWorker>) => {
         state.lod.styleVersion = msg.version;
       }
       return;
+    case "lod-view":
+      if (state?.lod?.kind === "spatial") state.lod.view = msg.view;
+      return;
     case "lod-recycle":
       // A frame skipped for back-pressure (#343) is built for the current positions once a buffer is back.
-      if (state?.lod?.kind === "spatial" && recycleSpatialFrame(state.lod, msg.buffer)) postFrame("frame");
+      if (state?.lod?.kind === "spatial" && recycleSpatialFrame(state.lod, msg.buffer, msg.rows)) postFrame("frame");
       return;
     case "start-nested": {
       // One synchronous top-down pass (each depth final); a `stop` can only land after it, and the main

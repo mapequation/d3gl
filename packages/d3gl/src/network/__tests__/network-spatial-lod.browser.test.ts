@@ -3,10 +3,12 @@ import { network, type Network, type NetworkHit } from "../network.js";
 import { buildGraph, type NetworkGraph } from "../graph.js";
 import type { HoverHit } from "../../map/base-engine.js";
 import { lodStylePasses, mortonTopologyBuilds } from "../lod.js";
+import { spatialRowBuilds } from "../spatial-rows.js";
 
 /**
  * `lod({ source: "spatial" })` (#343) through the engine: the worker rebuilds a Morton tree per streamed
- * frame and the engine adopts it; the main-thread backends rebuild it when positions change; a selected
+ * frame — with its super-edge rows, so a streamed repaint gathers links without walking a leaf run (#433) —
+ * and the engine adopts it; the main-thread backends rebuild it when positions change; a selected
  * aggregate is carried over to the same cell across rebuilds; the Canvas (retained Scene) path draws the
  * same frontier and links.
  */
@@ -82,7 +84,7 @@ function centroid(g: NetworkGraph, members: readonly (string | number)[]): [numb
 }
 
 describe("lod({ source: 'spatial' }) (#343)", () => {
-  it("adopts the worker's per-frame spatial tree, keeps the frontier bounded, and answers a held view from the row memo", async () => {
+  it("adopts the worker's per-frame spatial tree, keeps the frontier bounded, and gathers its links from the worker's rows", async () => {
     const { net, host } = makeNet();
     await net.whenReady();
     const g = webLike(6000);
@@ -93,7 +95,8 @@ describe("lod({ source: 'spatial' }) (#343)", () => {
     expect(glyphs).toBeGreaterThan(0);
     expect(glyphs).toBeLessThan(1500); // bounded by the screen, not by how the layout spreads the graph
 
-    // Links are gathered lazily; a held view re-emits them from the row memo without walking an edge.
+    // Links come from the super-edge rows the worker built with the tree (#433): no leaf run is walked, at a
+    // new view or a held one.
     const first = net.superEdgeStats;
     expect(first).not.toBeNull();
     net.setTransform({ k: 2, x: -100, y: -100 });
@@ -101,7 +104,7 @@ describe("lod({ source: 'spatial' }) (#343)", () => {
     const held = net.superEdgeStats;
     expect(held?.misses).toBe(0);
     expect(held?.visits).toBe(0);
-    expect(held?.hits).toBeGreaterThan(0);
+    expect(held?.entries).toBeGreaterThan(0);
 
     // Switching source after the run: the structural tree is built here; back to spatial re-adopts the worker's.
     net.lod({ source: "structure", maxAggregateRadius: 18 });
@@ -113,6 +116,44 @@ describe("lod({ source: 'spatial' }) (#343)", () => {
     net.destroy();
     host.remove();
   });
+
+  // Per-frame guard (#433, AGENTS lifecycle §5): with the spatial source every streamed frame brings a new tree,
+  // so the lazy gather's per-tree row memo never hits and each repaint walked every edge under the frontier —
+  // O(edges) on the main thread (2E incidences at a fit view). The worker now builds the tree's super-edge rows
+  // with it; the repaint reads O(rows of the drawn and culled covers) and walks no leaf run. The deterministic
+  // signature, on every animation frame that drew a worker tree: zero incidences walked, rows read, and no row
+  // build in this realm (the worker's builds never touch its counter).
+  it("streamed repaints gather links from the worker's rows: no leaf-run walk and no main-thread row build per frame", async () => {
+    const { net, host } = makeNet();
+    await net.whenReady();
+    const g = webLike(20_000);
+    const installed = window.requestAnimationFrame;
+    const samples: { visits: number; entries: number; misses: number }[] = [];
+    window.requestAnimationFrame = (callback: FrameRequestCallback): number =>
+      installed.call(window, (t: number) => {
+        callback(t);
+        const stats = net.superEdgeStats;
+        if (stats && net.lodSource === "worker") samples.push({ visits: stats.visits, entries: stats.entries, misses: stats.misses });
+      });
+    const builds0 = spatialRowBuilds;
+    try {
+      net.data(g).style({ sizeMode: "screen", nodeRadius: 3 }).lod({ source: "spatial", maxAggregateRadius: 18 }).layout({ backend: "worker", iterations: 60, fit: true });
+      await net.whenSettled();
+    } finally {
+      window.requestAnimationFrame = installed;
+    }
+    expect(samples.length, "no repaint drew a worker tree").toBeGreaterThan(3);
+    for (const s of samples) {
+      expect(s.visits, "a streamed repaint walked leaf runs").toBe(0);
+      expect(s.misses).toBe(0);
+      expect(s.entries).toBeGreaterThan(0);
+    }
+    expect(spatialRowBuilds - builds0, "rows built on the main thread").toBe(0);
+    // Every edge under the frontier is what the lazy gather would have walked: the rows read are far fewer.
+    expect(Math.max(...samples.map((s) => s.entries))).toBeLessThan(g.csr.neighbors.length);
+    net.destroy();
+    host.remove();
+  }, 60_000);
 
   it("carries a selected aggregate over to the same cell while the worker rebuilds the tree", async () => {
     const { net, host } = makeNet();

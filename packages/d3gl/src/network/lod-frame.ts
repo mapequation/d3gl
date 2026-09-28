@@ -10,9 +10,12 @@
  *   reads — shared, or posted with the frame) and returns nothing to send.
  * - **spatial** (the Morton tree): a tree built from older positions blows the frontier up as members
  *   wander out of their cells, so the step **rebuilds** it — topology, geometry and the aggregated style —
- *   into one packed buffer ({@link SpatialLODFrame}) to transfer. Buffers come back from the main thread for
- *   reuse ({@link recycleSpatialFrame}), so a warm stream allocates nothing. It rebuilds only for new
- *   positions (a frame id it has not built), so it stops once the layout has converged.
+ *   into one packed buffer ({@link SpatialLODFrame}) to transfer, and, for a stream that knows the graph's
+ *   edges, draws links and has been told the main thread's view ({@link LODView}), the **super-edge rows** of
+ *   the covers that view's cut draws into a second one (#433, `spatial-rows.ts`) — so the main thread gathers
+ *   a streamed tree's links in O(visible) instead of walking every edge under the frontier. Buffers come back
+ *   from the main thread for reuse ({@link recycleSpatialFrame}), so a warm stream allocates nothing. It
+ *   rebuilds only for new positions (a frame id it has not built), so it stops once the layout has converged.
  *
  * The worker backend's frame loop calls it for every frame it posts. A GPU layout's LOD worker (#377) can
  * call the same function for every position snapshot it harvests: bind the geometry buffer the request
@@ -24,10 +27,13 @@ import {
   buildMortonTopology,
   computeLODPositions,
   computeLODStyle,
+  cut,
   lodTreeFromTopology,
+  makeCutScratch,
   makeLODBoundsScratch,
   makeMortonScratch,
   mortonRootBox,
+  type CutScratch,
   type LODBoundsScratch,
   type LODPositionTree,
   type LODTree,
@@ -36,6 +42,18 @@ import {
   type MortonTopologyArrays,
   type MortonTopologySizes,
 } from "./lod.js";
+import { fitBox, fitNodes, fitTransform } from "./fit.js";
+import {
+  buildCoverRows,
+  cutRowCells,
+  makeSpatialRowsScratch,
+  spatialRowsByteLength,
+  spatialRowsGraph,
+  spatialRowsViews,
+  type SpatialRowsFrame,
+  type SpatialRowsGraph,
+  type SpatialRowsScratch,
+} from "./spatial-rows.js";
 
 /**
  * The per-leaf style a spatial stream aggregates onto every rebuilt tree (#343) — the inputs of
@@ -48,6 +66,9 @@ export interface LeafStyle {
   weight: Float32Array;
   border?: Float32Array;
   colors?: Uint8Array;
+  /** Whether links are drawn (#433): a stream that knows the edges builds super-edge rows only then.
+   *  Default true. */
+  links?: boolean;
 }
 
 /** A packed spatial frame's shape: what {@link spatialFrameViews} needs to read it. */
@@ -67,11 +88,13 @@ export interface SpatialFrameHeader {
 /**
  * One rebuilt spatial tree (#343): topology, position geometry and aggregated style, packed into one
  * transferable `buffer` (see {@link spatialFrameViews}). About 56 B per tree node plus 4 B per leaf —
- * 24 MB for a 325k-node graph — moved, not copied, between the threads.
+ * 24 MB for a 325k-node graph — moved, not copied, between the threads. With `rows`, the tree's super-edge
+ * rows (#433) in a second transferable buffer.
  */
 export interface SpatialLODFrame {
   header: SpatialFrameHeader;
   buffer: ArrayBuffer;
+  rows?: SpatialRowsFrame;
 }
 
 /** Every array of a packed spatial frame, as views into its buffer. */
@@ -131,7 +154,7 @@ export function spatialFrameViews(buffer: ArrayBufferLike, { size, leafCount, le
  * is handed back ({@link recycleSpatialFrame}) — after that its views are detached.
  */
 export function lodTreeFromSpatialFrame(frame: SpatialLODFrame): LODTree {
-  const { header, buffer } = frame;
+  const { header, buffer, rows } = frame;
   const v = spatialFrameViews(buffer, header);
   const topo = {
     size: header.size,
@@ -145,6 +168,7 @@ export function lodTreeFromSpatialFrame(frame: SpatialLODFrame): LODTree {
     leafStart: v.leafStart,
     leafEnd: v.leafEnd,
     morton: { box: header.box, level: v.mortonLevel, code: v.mortonCode },
+    rows: rows ? spatialRowsViews(rows.buffer, rows.sizes) : undefined,
   };
   return lodTreeFromTopology(
     // The empty same-level adjacency every spatial tree shares (see buildMortonTopology).
@@ -169,6 +193,39 @@ export interface StructureLODStream {
   bounds: LODBoundsScratch;
 }
 
+/**
+ * The view a spatial stream builds super-edge rows for (#433): what the main thread's LOD cut is called with
+ * — so the worker cuts each rebuilt tree the same way and builds the rows of exactly the covers it will draw.
+ * `transform: null` while the view follows the layout's fit, which the worker computes from each tree as the
+ * engine does (`fitNodes` → `fitBox` → `fitTransform`). A view that has moved on only costs speed: the main
+ * thread walks a cover the rows do not list through its leaves.
+ */
+export interface LODView {
+  transform: { k: number; x: number; y: number } | null;
+  width: number;
+  height: number;
+  expandPx?: number;
+  maxAggregateRadius?: number;
+  screenSized: boolean;
+  fadeBand: number;
+}
+
+/**
+ * What a spatial stream needs to build each tree's super-edge rows (#433): the graph's CSR with each
+ * entry's weight and direction (built once per stream: 4 B per CSR entry, 1 B for its direction, 4 B for its
+ * weight unless every edge weighs the same — 10-18 B per edge — plus 4-8 B per node), the cut and build
+ * scratch, and the pool of returned rows buffers.
+ */
+export interface SpatialLinks {
+  graph: SpatialRowsGraph;
+  scratch: SpatialRowsScratch;
+  cut: CutScratch;
+  /** The cut's cells the rows are built for ({@link cutRowCells}), grown to the largest cut. */
+  cells: Uint32Array;
+  fit: Float32Array;
+  pool: ArrayBuffer[];
+}
+
 /** A spatial tree's per-frame state: the root box it keeps stable, scratch, leaf style and buffer pool. */
 export interface SpatialLODStream {
   kind: "spatial";
@@ -186,6 +243,10 @@ export interface SpatialLODStream {
   outstanding: number;
   /** Whether a frame was skipped for back-pressure ({@link MAX_OUTSTANDING}) and is still to be built. */
   pending: boolean;
+  /** The graph's edges for the super-edge rows (#433), or `null`: frames then carry no rows. */
+  links: SpatialLinks | null;
+  /** The main thread's view the rows are built for (#433), or `null` (none reported): no rows. */
+  view: LODView | null;
 }
 
 export type LODStream = StructureLODStream | SpatialLODStream;
@@ -195,9 +256,25 @@ export function makeStructureLODStream(tree: LODPositionTree): StructureLODStrea
   return { kind: "structure", tree, bounds: makeLODBoundsScratch() };
 }
 
-/** A spatial stream over `leafCount` leaves, aggregating `style` (version `styleVersion`) when given. */
-export function makeSpatialLODStream(leafCount: number, style?: LeafStyle, styleVersion = -1): SpatialLODStream {
-  return { kind: "spatial", leafCount, box: undefined, scratch: makeMortonScratch(), bounds: makeLODBoundsScratch(), style: style ?? null, styleVersion: style ? styleVersion : -1, pool: [], built: -1, outstanding: 0, pending: false };
+/** The directed edges a spatial stream builds super-edge rows from (#433): the layout's own edge list. */
+export interface SpatialEdges {
+  source: Uint32Array;
+  target: Uint32Array;
+  weight: Float32Array;
+}
+
+/**
+ * A spatial stream over `leafCount` leaves, aggregating `style` (version `styleVersion`) when given. With
+ * `edges` (and a graph that has any) and a `view`, every rebuilt tree also carries the super-edge rows of the
+ * covers that view draws (#433) while the style draws links; the stream builds the edges' CSR once, here
+ * (O(edges)). The view follows the main thread's ({@link LODView}; set `stream.view` when it changes).
+ */
+export function makeSpatialLODStream(leafCount: number, style?: LeafStyle, styleVersion = -1, edges?: SpatialEdges, view?: LODView): SpatialLODStream {
+  let links: SpatialLinks | null = null;
+  if (edges && edges.source.length > 0) {
+    links = { graph: spatialRowsGraph(leafCount, edges), scratch: makeSpatialRowsScratch(), cut: makeCutScratch(), cells: new Uint32Array(256), fit: new Float32Array(64), pool: [] };
+  }
+  return { kind: "spatial", leafCount, box: undefined, scratch: makeMortonScratch(), bounds: makeLODBoundsScratch(), style: style ?? null, styleVersion: style ? styleVersion : -1, pool: [], built: -1, outstanding: 0, pending: false, links, view: view ?? null };
 }
 
 /** Pooled buffers kept at most (a streamed frame is usually 1-2 in flight). */
@@ -208,24 +285,28 @@ const POOL_MAX = 3;
  * thread draws, the one it just replaced (released after the repaint), and one on its way. Past that the
  * main thread is not keeping up (a long task, a stalled tab), so {@link lodFrameStep} skips the rebuild
  * rather than allocating another frame buffer, and builds the latest positions once one comes back. Frame
- * buffers in existence per stream are therefore at most this many plus {@link POOL_MAX}.
+ * buffers (and rows buffers, #433) in existence per stream are therefore at most this many plus
+ * {@link POOL_MAX} each.
  */
 export const MAX_OUTSTANDING = 3;
 
 /**
- * Hand a frame's buffer back to its stream for the next rebuild. Returns whether a frame skipped for
- * back-pressure is now due: the caller then runs {@link lodFrameStep} again for the current positions.
+ * Hand a frame's buffer — and its rows buffer (#433), when it carried one — back to its stream for the next
+ * rebuild. Returns whether a frame skipped for back-pressure is now due: the caller then runs
+ * {@link lodFrameStep} again for the current positions.
  */
-export function recycleSpatialFrame(stream: SpatialLODStream, buffer: ArrayBuffer): boolean {
+export function recycleSpatialFrame(stream: SpatialLODStream, buffer: ArrayBuffer, rows?: ArrayBuffer): boolean {
   if (stream.outstanding > 0) stream.outstanding--;
   if (stream.pool.length < POOL_MAX && buffer.byteLength > 0) stream.pool.push(buffer);
+  const links = stream.links;
+  if (rows && links && links.pool.length < POOL_MAX && rows.byteLength > 0) links.pool.push(rows);
   return stream.pending && stream.outstanding < MAX_OUTSTANDING;
 }
 
-/** A pooled buffer of at least `bytes` (and not more than twice it), or a fresh one with 1/8 slack. */
-function takeBuffer(stream: SpatialLODStream, bytes: number): ArrayBuffer {
-  const i = stream.pool.findIndex((b) => b.byteLength >= bytes && b.byteLength <= 2 * bytes);
-  const [pooled] = i >= 0 ? stream.pool.splice(i, 1) : [];
+/** A buffer of `pool` of at least `bytes` (and not more than twice it), or a fresh one with 1/8 slack. */
+function takeBuffer(pool: ArrayBuffer[], bytes: number): ArrayBuffer {
+  const i = pool.findIndex((b) => b.byteLength >= bytes && b.byteLength <= 2 * bytes);
+  const [pooled] = i >= 0 ? pool.splice(i, 1) : [];
   return pooled ?? new ArrayBuffer(Math.ceil((bytes * 9) / 8 / 8) * 8);
 }
 
@@ -257,7 +338,7 @@ export function lodFrameStep(stream: LODStream, positions: ArrayLike<number>, fr
   // The topology is written straight into the frame buffer, sized once the cell count is known.
   const out: { buffer: ArrayBuffer | null; views: SpatialFrameArrays | null } = { buffer: null, views: null };
   const topology = buildMortonTopology(positions, n, { box }, stream.scratch, (sizes) => {
-    const buffer = takeBuffer(stream, spatialFrameByteLength(sizes));
+    const buffer = takeBuffer(stream.pool, spatialFrameByteLength(sizes));
     const views = spatialFrameViews(buffer, sizes);
     out.buffer = buffer;
     out.views = views;
@@ -281,6 +362,9 @@ export function lodFrameStep(stream: LODStream, positions: ArrayLike<number>, fr
     views.border.fill(0);
   }
   if (!style?.colors) views.color.fill(0); // a reused buffer holds the last frame's colours
+  // The super-edge rows of the covers the main thread's view will draw (#433), into a pooled buffer.
+  const links = stream.links;
+  const rows = links && stream.view && style?.links !== false ? coverRows(tree, stream.view, links) : undefined;
   return {
     header: {
       size: topology.size,
@@ -292,5 +376,44 @@ export function lodFrameStep(stream: LODStream, positions: ArrayLike<number>, fr
       frame,
     },
     buffer,
+    rows,
   };
+}
+
+/**
+ * The super-edge rows of the covers `view`'s cut draws on `tree` (#433): the engine's cut, at the view's
+ * transform — or, while it follows the fit, at the fit the engine computes from this tree — with the culled
+ * roots recorded; its covers whose rows can matter ({@link cutRowCells}, with the drawn glyphs as the floor)
+ * get one. O(drawn + culled) for the cut, then {@link buildCoverRows}: O(edges under those covers) ≤ 2E.
+ */
+function coverRows(tree: LODTree, view: LODView, links: SpatialLinks): SpatialRowsFrame | undefined {
+  const { parent, leafOrder, leafStart, leafEnd } = tree;
+  if (!parent || !leafOrder || !leafStart || !leafEnd) return undefined;
+  let t = view.transform;
+  if (!t) {
+    const nodes = fitNodes(tree);
+    if (links.fit.length < nodes.length) links.fit = new Float32Array(nodes.length);
+    const box = fitBox(tree, nodes, links.fit);
+    if (!box) return undefined;
+    t = fitTransform(box, view.width, view.height);
+  }
+  const sc = links.cut;
+  const drawn = cut(tree, t, view.width, view.height, {
+    expandPx: view.expandPx,
+    screenSized: view.screenSized,
+    maxAggregateRadius: view.maxAggregateRadius,
+    fadeBand: view.fadeBand,
+    recordCulled: true,
+  }, sc);
+  const cutSet = { drawn, culled: sc.culled.subarray(0, sc.culledCount), split: sc.split.subarray(0, sc.splitCount) };
+  const m = cutRowCells(parent, cutSet, drawn, links);
+  const out: { buffer: ArrayBuffer | null } = { buffer: null };
+  const topo = { size: tree.size, leafCount: tree.leafCount, parent, leafOrder, leafStart, leafEnd };
+  const sizes = buildCoverRows(topo, links.cells.subarray(0, m), links.graph, links.scratch, (s) => {
+    const b = takeBuffer(links.pool, spatialRowsByteLength(s));
+    out.buffer = b;
+    return spatialRowsViews(b, s);
+  });
+  if (!out.buffer) throw new Error("lodFrameStep: the super-edge rows were built without their buffer");
+  return { sizes, buffer: out.buffer };
 }
