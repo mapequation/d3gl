@@ -2,7 +2,7 @@ import { describe, it, expect } from "vitest";
 import { buildMortonLODTree, computeLODPositions, computeLODStyle, cut, declutterFrontier, makeCutScratch, makeDeclutterFrontierScratch, visibleWorldRect, type LODTransform, type LODTree } from "../lod.js";
 import { buildGraph, type NetworkGraph } from "../graph.js";
 import { buildLeafIncidence, lazySuperEdges, makeLazySuperEdgesScratch, type LazyCut } from "../lazy-super-edges.js";
-import { allocateSpatialRows, buildKeptRows, makeSpatialRowsScratch, rowOf, spatialRowsByteLength, spatialRowsGraph, type SpatialRows } from "../spatial-rows.js";
+import { allocateSpatialRows, buildKeptRows, makeSpatialRowsScratch, rowOf, spatialRowsByteLength, spatialRowsGraph, type SpatialRows, type SpatialRowsGraph } from "../spatial-rows.js";
 import { MAX_OUTSTANDING, lodFrameStep, lodTreeFromSpatialFrame, makeSpatialLODStream, recycleSpatialFrame, spatialFrameByteLength, type LODView, type SpatialLODFrame } from "../lod-frame.js";
 import { layoutBox, layoutFitTransform } from "../fit.js";
 import type { SuperEdgeStyleResolved, SuperEdgesData } from "../glyphs.js";
@@ -65,12 +65,23 @@ function spatialTree(g: NetworkGraph): LODTree {
   return tree;
 }
 
+/** The CSR a stream builds once from the graph's edges (#433), per graph. */
+const rowsGraphs = new WeakMap<NetworkGraph, SpatialRowsGraph>();
+function rowsGraphOf(g: NetworkGraph): SpatialRowsGraph {
+  let built = rowsGraphs.get(g);
+  if (!built) {
+    built = spatialRowsGraph(g.nodeCount, g);
+    rowsGraphs.set(g, built);
+  }
+  return built;
+}
+
 /** The rows a stream's worker builds for the cut `c`: one per kept cell. */
 function rowsForCut(tree: LODTree, g: NetworkGraph, c: LazyCut): SpatialRows {
   const { leafOrder, leafStart, leafEnd } = tree;
   if (!leafOrder || !leafStart || !leafEnd) throw new Error("not a spatial tree");
   const out = { rows: allocateSpatialRows({ cells: 0, outEntries: 0, inEntries: 0 }) };
-  buildKeptRows({ size: tree.size, leafCount: tree.leafCount, leafOrder, leafStart, leafEnd }, c, spatialRowsGraph(g.nodeCount, g), makeSpatialRowsScratch(), (sz) => (out.rows = allocateSpatialRows(sz)));
+  buildKeptRows({ size: tree.size, leafCount: tree.leafCount, leafOrder, leafStart, leafEnd }, c, rowsGraphOf(g), makeSpatialRowsScratch(), (sz) => (out.rows = allocateSpatialRows(sz)));
   return out.rows;
 }
 
@@ -108,11 +119,15 @@ function byId(d: SuperEdgesData): Map<number, number[]> {
   return m;
 }
 
-function expectSameEdges(got: SuperEdgesData, want: SuperEdgesData): void {
+function expectSameEdges(got: SuperEdgesData, want: SuperEdgesData | Map<number, number[]>): void {
   const g = byId(got);
-  const w = byId(want);
-  expect([...g.keys()].sort((x, y) => x - y)).toEqual([...w.keys()].sort((x, y) => x - y));
-  for (const [id, vals] of w) expect(g.get(id), `pair ${id}`).toEqual(vals);
+  const w = want instanceof Map ? want : byId(want);
+  expect(g.size).toBe(w.size);
+  for (const [id, vals] of w) {
+    const have = g.get(id);
+    // One compare per pair on the hot path; the matcher only for a pair that differs (its message names it).
+    if (!have || have.length !== vals.length || have.some((v, i) => !Object.is(v, vals[i]))) expect(have, `pair ${id}`).toEqual(vals);
+  }
 }
 
 /** A tree without the rows: what the lazy gather alone sees. */
@@ -194,8 +209,8 @@ describe("lazySuperEdges takes a streamed tree's rows and draws the same super-e
       ["deep", { k: 30, x: W / 2 - 300 * 30, y: H / 2 + 120 * 30 }],
       ["panned", { k: 1.6, x: -200, y: 500 }],
     ];
-    for (const [linkStyle, directed] of [["line", false], ["line", true], ["half-arrow", true]] as const) {
-      it(`${unit ? "unweighted" : "weighted"} ${directed ? "directed" : "undirected"} ${linkStyle}: every view, declutter on/off, cross-fade band`, () => {
+    for (const [linkStyle, directed] of [["line", false], ["line", true], ["half-arrow", true]] as const) for (const band of [0, 0.4]) {
+      it(`${unit ? "unweighted" : "weighted"} ${directed ? "directed" : "undirected"} ${linkStyle}: every view, declutter on/off${band > 0 ? ", in a cross-fade band" : ""}`, () => {
         const style = styleOf(directed, linkStyle);
         const inc = buildLeafIncidence(g, directed);
         let culledLeaves = 0;
@@ -205,11 +220,11 @@ describe("lazySuperEdges takes a streamed tree's rows and draws the same super-e
         let importedWhenMoved = 0;
         for (const [, t] of views) {
           for (const declutter of [false, true]) {
-            for (const band of [0, 0.4]) {
+            {
               const c = cutAt(tree, t, declutter, band);
               const edgeStyle = band > 0 ? { ...style, fadeAlpha: c.fade } : style;
               const view = visibleWorldRect(t, W, H);
-              const lazy = lazySuperEdges(bare(tree), c, edgeStyle, view, g.csr, inc, makeLazySuperEdgesScratch());
+              const lazy = byId(lazySuperEdges(bare(tree), c, edgeStyle, view, g.csr, inc, makeLazySuperEdgesScratch()));
               // Rows for exactly this cut (the worker saw the same view): no leaf run is walked.
               const sc = makeLazySuperEdgesScratch();
               const rows = lazySuperEdges({ ...tree, rows: rowsForCut(tree, g, c) }, c, edgeStyle, view, g.csr, inc, sc);
@@ -237,8 +252,8 @@ describe("lazySuperEdges takes a streamed tree's rows and draws the same super-e
         // Non-vacuity: culled leaves, a band's split glyphs and many pairs were all exercised, and a moved view
         // both took rows and rebuilt some.
         expect(culledLeaves).toBeGreaterThan(0);
-        expect(splits).toBeGreaterThan(0);
-        expect(drawnPairs).toBeGreaterThan(1000);
+        if (band > 0) expect(splits).toBeGreaterThan(0);
+        expect(drawnPairs).toBeGreaterThan(500);
         expect(rebuiltWhenMoved).toBeGreaterThan(0);
         expect(importedWhenMoved).toBeGreaterThan(0);
       });
