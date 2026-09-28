@@ -114,7 +114,12 @@ describe("worker seed progress frames (#368)", () => {
       expect(p?.length).toBe(2 * N); // copy mode: every node in every frame
       if (!p) continue;
       expect(p.every(Number.isFinite)).toBe(true);
-      expect(f.geometry?.every(Number.isFinite)).toBe(true); // the LOD geometry streams with it
+      // The LOD geometry streams with it: `[cx, cy, extent]` finite; the crowding after them (#426, the 4th
+      // quarter) is Infinity where members only clear past the footprint horizon, never NaN.
+      const g = f.geometry ?? new Float32Array(0);
+      expect(g.length).toBeGreaterThan(0);
+      expect(g.subarray(0, (3 * g.length) / 4).every(Number.isFinite)).toBe(true);
+      expect(g.subarray((3 * g.length) / 4).every((z) => !Number.isNaN(z))).toBe(true);
       // At the finished seed's extent and centre from the first progress frame: a fitted view and the
       // LOD extents hold still into the refinement (no zoom-out on a coarse level and back in).
       const { r, cx, cy } = r95(p, N);
