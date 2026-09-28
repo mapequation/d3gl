@@ -86,6 +86,15 @@ const DEFAULT_MAX_LEVELS = 32;
 const DEFAULT_ITERATIONS = 100;
 const DEFAULT_COARSEN_ITERATIONS = 30;
 const DEFAULT_MAX_SEED_NODES = 16384;
+/**
+ * Smallest coarse level whose solve is shown as seed progress ({@link SeedProgress.atScale}, #368). A
+ * coarser level is a handful of mass-sized discs that pack with gaps: prolongated, it spans up to
+ * 1.4× the finished seed on web-NotreDame and 2.4× on a scale-free (Barabási–Albert) graph, so a
+ * fitted view would zoom out on it and back in. From about a thousand nodes on, a level's
+ * prolongation spans 0.86–1.05× the finished seed on every graph measured. The levels below it are
+ * the fast ones: the first ~40 ms of web-NotreDame's ~1 s seed.
+ */
+const SEED_PROGRESS_MIN_NODES = 1024;
 const GOLDEN = Math.PI * (3 - Math.sqrt(5));
 
 /** Symmetric (undirected) adjacency with per-incidence weights; self-loops dropped. */
@@ -340,8 +349,9 @@ function graphView(graph: CoarsenableGraph): LayoutGraph {
  * Build the coarsening hierarchy, lay out the coarsest level, then prolongate + refine *every level
  * except the finest*, leaving `graph.positions` holding the seed projected onto the original graph —
  * ready for a final refinement the caller drives (the layout worker streams that refinement
- * tick-by-tick for progressive rendering). With no possible coarsening (tiny or edgeless graph) this
- * is just a reproducible disc seed ({@link seedPositions} at the force model's equilibrium).
+ * tick-by-tick for progressive rendering, and the seed itself via {@link multilevelSeedSteps}). With
+ * no possible coarsening (tiny or edgeless graph) this is just a reproducible disc seed
+ * ({@link seedPositions} at the force model's equilibrium).
  *
  * **Scale-consistent with the force equilibrium.** The finest layout converges to a uniform disc of
  * radius `√(repulsion·N/centering)` (spacing `√(π·repulsion/centering)`, {@link equilibriumSpacing}),
@@ -357,6 +367,42 @@ function graphView(graph: CoarsenableGraph): LayoutGraph {
  * graph is never coarsened twice.
  */
 export function multilevelSeed(graph: CoarsenableGraph, opts: MultilevelLayoutOptions, hierarchy?: Hierarchy): void {
+  const steps = multilevelSeedSteps(graph, opts, hierarchy);
+  while (!steps.next().done) continue; // run every tick; nothing to show between them here
+}
+
+/** One step of {@link multilevelSeedSteps}: the seed just ran one tick of a coarse level's solve. */
+export interface SeedProgress {
+  /**
+   * Whether {@link prolongate} would show the seed at its finished extent — the level being solved has
+   * at least {@link SEED_PROGRESS_MIN_NODES} nodes — so a caller streaming progress frames posts only
+   * these, and a fitted view holds still from the first of them into the refinement.
+   */
+  readonly atScale: boolean;
+  /**
+   * Write the seed so far into `graph.positions`: the level being solved, prolongated through every
+   * finer level as if those were left unsolved — every node placed, at the force equilibrium's density
+   * and centred where the finished seed will be (wider while the level is small: see
+   * {@link atScale}). O(nodes of the finer levels + the graph's own). It
+   * uses the finer levels' position buffers as scratch; the seed overwrites them (and
+   * `graph.positions`) before it reads them, so calling it never changes the finished seed.
+   */
+  prolongate(): void;
+}
+
+/**
+ * {@link multilevelSeed} one tick at a time (#368): yields after every tick of every coarse level it
+ * solves, so a caller can show the seed as it forms ({@link SeedProgress.prolongate}) and handle
+ * messages between ticks — the layout worker streams it as progress frames. Draining it runs exactly
+ * the ticks {@link multilevelSeed} runs, in the same order, so the finished seed is bit-identical
+ * whether or not `prolongate` was called along the way. Yields nothing when there is no coarsening to
+ * solve (tiny or edgeless graph).
+ */
+export function* multilevelSeedSteps(
+  graph: CoarsenableGraph,
+  opts: MultilevelLayoutOptions,
+  hierarchy?: Hierarchy,
+): Generator<SeedProgress, void, undefined> {
   const { width, height } = opts;
   const params: ForceParams = { ...DEFAULT_FORCE, ...opts.force };
   const coarsenIterations = opts.coarsenIterations ?? DEFAULT_COARSEN_ITERATIONS;
@@ -399,12 +445,35 @@ export function multilevelSeed(graph: CoarsenableGraph, opts: MultilevelLayoutOp
   }
   const coarseForce: Partial<ForceParams> = { ...opts.force, attraction: params.attraction * (weightSum > 0 ? edges / weightSum : 1) };
 
-  /** Solve a coarse level, cooled: the full budget up to maxSeedNodes, a proportional share above it. */
-  const solve = ({ view }: SeedLevel): void => {
+  /** Prolongate `from` through the `finer` coarse levels (next finer first) down into `graph.positions`. */
+  const descend = (from: SeedLevel, finer: readonly SeedLevel[]): void => {
+    let coarser = from;
+    for (const level of finer) {
+      prolongate(level.view.positions, coarser.view.positions, coarser.up, level.mass, coarser.view.nodeCount, level.view.nodeCount, spacing);
+      coarser = level;
+    }
+    // `coarser` is level 1 now; its projection comes from level 0, the graph itself.
+    prolongate(graph.positions, coarser.view.positions, coarser.up, undefined, coarser.view.nodeCount, coarser.up.length, spacing);
+  };
+
+  /**
+   * Solve a coarse level, cooled: the full budget up to maxSeedNodes, a proportional share above it —
+   * {@link ForceLayout.run}'s `"cool"` loop, yielding after each tick. `finer` are the levels below it.
+   */
+  function* solve(level: SeedLevel, finer: readonly SeedLevel[]): Generator<SeedProgress, void, undefined> {
+    const { view } = level;
     const n = view.nodeCount;
     const ticks = Math.min(coarsenIterations, Math.floor((coarsenIterations * maxSeedNodes) / n));
-    if (n > 1 && ticks > 0) new ForceLayout(view, coarseForce).run(ticks, "cool");
-  };
+    if (n <= 1 || ticks <= 0) return;
+    const layout = new ForceLayout(view, coarseForce);
+    layout.cool(ticks);
+    const progress: SeedProgress = { atScale: n >= SEED_PROGRESS_MIN_NODES, prolongate: () => descend(level, finer) };
+    for (let t = 0; t < ticks; t++) {
+      layout.tick();
+      yield progress;
+      if (layout.converged) break;
+    }
+  }
 
   // The coarsest level rings a virtual root, shifted so its centre of mass is the viewport centre (the
   // forces conserve it, so the layout stays centred there); then every level down to (but not
@@ -424,21 +493,21 @@ export function multilevelSeed(graph: CoarsenableGraph, opts: MultilevelLayoutOp
     topPos[i * 2] = (topPos[i * 2] ?? 0) + dx;
     topPos[i * 2 + 1] = (topPos[i * 2 + 1] ?? 0) + dy;
   }
-  solve(top);
+  const finer = coarse.slice(0, -1).reverse(); // the levels below the coarsest, next finer first
+  yield* solve(top, finer);
   let coarser = top;
-  for (const level of coarse.slice(0, -1).reverse()) {
+  for (const [i, level] of finer.entries()) {
     prolongate(level.view.positions, coarser.view.positions, coarser.up, level.mass, coarser.view.nodeCount, level.view.nodeCount, spacing);
-    solve(level);
+    yield* solve(level, finer.slice(i + 1));
     coarser = level;
   }
-  // `coarser` is level 1 now; its projection comes from level 0, the graph itself.
-  prolongate(graph.positions, coarser.view.positions, coarser.up, undefined, coarser.view.nodeCount, coarser.up.length, spacing);
+  descend(coarser, []); // level 1 → the graph itself
 }
 
 /**
  * Multilevel force layout: {@link multilevelSeed} then refine the finest level in place. Writes
- * `graph.positions`. This is the synchronous main-thread path; the worker reuses `multilevelSeed`
- * and streams the finest-level refinement instead.
+ * `graph.positions`. This is the synchronous main-thread path; the worker streams the seed
+ * ({@link multilevelSeedSteps}) and then the finest-level refinement instead.
  */
 export function multilevelLayout(graph: CoarsenableGraph, opts: MultilevelLayoutOptions): void {
   multilevelSeed(graph, opts);

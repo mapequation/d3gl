@@ -100,8 +100,9 @@ export interface LODTopologyMessage {
 /** A progress frame (`frame`) or the final converged/cancelled state (`done`). */
 export interface ProgressMessage {
   type: "frame" | "done";
-  /** Finest-level refinement ticks completed so far (0 = the multilevel seed frame). A `done` carries
-   *  the tick the layout stopped at: converged, or out of its iteration budget. */
+  /** Finest-level refinement ticks completed so far: 0 for the multilevel seed frame, and for the
+   *  progress frames before it while the seed still runs (#368). A `done` carries the tick the layout
+   *  stopped at: converged, or out of its iteration budget. */
   tick: number;
   /** Position snapshot in copy mode; omitted in shared mode (renderer reads the SAB directly). */
   positions?: Float32Array;
