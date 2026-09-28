@@ -42,6 +42,30 @@ export interface StartMessage {
    * the LOD frontier with no O(N) coarsening or geometry pass of its own.
    */
   lod?: boolean;
+  /**
+   * Continue a layout another transport was running (#311) instead of seeding one: no disc, no multilevel
+   * seed, no seed frame. `iterations` is the ticks left of its budget; 0 starts the worker idle, alive for
+   * a drag reheat.
+   */
+  warm?: WarmStart;
+}
+
+/**
+ * Where a layout left off, for a worker that continues it (#311): its positions and its heat schedule.
+ * `cool(iterations, heat)` continues a decaying schedule (see `Cooling.decaying`), `hold(heat)` a held one.
+ */
+export interface WarmStart {
+  /** Copy mode: the positions to continue from. Omitted in shared mode, where they are in `sharedPositions`. */
+  positions?: Float32Array;
+  /** The heat of the next tick. */
+  heat: number;
+  /** Whether that heat decays to the floor over `iterations` ticks, or is held. */
+  decaying: boolean;
+  /**
+   * The ticks are the tail of a re-cool after a drag: the worker resumes it as one, so a pin reheats at the
+   * drag heat at once instead of riding the tail's decaying heat, as a drag during the initial run does.
+   */
+  recool?: boolean;
 }
 
 export interface StopMessage {
@@ -132,6 +156,12 @@ export interface LODTopologyMessage {
   topology: LODTopology;
   /** Shared (zero-copy) mode: the geometry SAB the worker updates each frame; absent in copy mode. */
   sharedGeometry?: SharedArrayBuffer;
+  /**
+   * Copy mode, a warm start only (#311): the geometry of the positions it continues from, laid out as a
+   * frame's {@link ProgressMessage.geometry}. No seed frame follows a warm start, and the main thread draws
+   * the tree as soon as it lands. (Shared mode fills `sharedGeometry` before posting instead.)
+   */
+  geometry?: Float32Array;
 }
 
 /** A progress frame (`frame`) or the final converged/cancelled state (`done`). */

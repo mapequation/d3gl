@@ -12,13 +12,17 @@
  */
 
 import { describe, it, expect, afterEach, vi } from "vitest";
-import { network } from "../../network.js";
+import { network, Network } from "../../network.js";
 import { buildGraph } from "../../graph.js";
 import { buildStateGraph } from "../../state-graph.js";
 import { sharedMemoryAvailable } from "../../worker-transport.js";
-import type { MainToWorker } from "../../worker-protocol.js";
+import type { MainToWorker, StartMessage } from "../../worker-protocol.js";
 import type { ModuleNode } from "../../modules.js";
-import { observeGpuLayoutFrames } from "../gpu-stream.js";
+import type { NetworkGraph } from "../../graph.js";
+import { WebGLBackend } from "../../../webgl/webgl-backend.js";
+import { createBackend, type BackendHandle } from "../../../map/backend-factory.js";
+import { WebGLDevice } from "@luma.gl/webgl";
+import { GpuStream, observeGpuLayoutFrames } from "../gpu-stream.js";
 import { startGpuLayout, type GpuLayoutTransport } from "../gpu-transport.js";
 import { GpuForceLayout } from "../gpu-force-layout.js";
 import { makeTestDevice } from "./_device.js";
@@ -645,21 +649,27 @@ describe("backend:'gpu' whose streaming readback fails to build (#352)", () => {
   });
 });
 
-describe("network layout backend:'gpu' — context loss mid-run (#352)", () => {
-  it("settles, stops its frame loop and warns once when the WebGL context is lost", async () => {
+describe("network layout backend:'gpu' — context loss mid-run (#352, #311)", () => {
+  it("stops the GPU loop, warns once and continues warm on the worker, which settles", async () => {
     const host = makeHost();
     const net = network(host, { width: W, height: H, backend: "webgl" });
     await net.whenReady();
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const posted = workerPosts();
     let frames = 0;
-    const unobserve = observeGpuLayoutFrames(() => { frames++; });
+    let harvested = -1;
+    const unobserve = observeGpuLayoutFrames((s) => {
+      frames++;
+      if (s.harvested) harvested = s.harvestedTicks;
+    });
     try {
       // Long enough that the loss lands mid-run.
-      net.data(clustered(3000)).layout({ backend: "gpu", iterations: 100_000 });
+      const budget = 800;
+      net.data(clustered(3000)).layout({ backend: "gpu", iterations: budget });
       const settled = net.whenSettled();
-      for (let i = 0; i < 200 && frames < 5; i++) await nextFrame();
+      await until(() => frames >= 5 && harvested > 0, "a few GPU frames");
       expect(net.layoutTransport).toBe("gpu");
-      expect(frames).toBeGreaterThanOrEqual(5);
+      const ticks = harvested;
 
       // The engine's WebGL canvas: getContext returns the context the engine already holds.
       const canvas = host.querySelector("canvas");
@@ -672,16 +682,368 @@ describe("network layout backend:'gpu' — context loss mid-run (#352)", () => {
       await settled; // resolves: a lost context never signals its fences, the run must not wait on them
       const lost = warn.mock.calls.filter((c) => String(c[0]).includes("context was lost"));
       expect(lost).toHaveLength(1);
-      // The loop has stopped: no further frames.
+      expect(String(lost[0]?.[0])).toMatch(/continues on the CPU worker/);
+      // The GPU loop has stopped: no further GPU frames.
       const after = frames;
       for (let i = 0; i < 10; i++) await nextFrame();
       expect(frames).toBe(after);
+      // The worker continued warm: the ticks left, from the last harvested positions, no seed (#311).
+      const start = startOf(posted);
+      expect(start?.warm).toBeDefined();
+      expect(start?.iterations).toBe(budget - ticks);
+      expect(net.layoutTransport).toBe(sharedMemoryAvailable() ? "shared" : "copy");
     } finally {
       unobserve();
       net.destroy();
     }
   });
 });
+
+/** The layout-worker messages posted from now on, cloned at post time (as the worker receives them). */
+function workerPosts(): MainToWorker[] {
+  const posted: MainToWorker[] = [];
+  const post = Worker.prototype.postMessage;
+  vi.spyOn(Worker.prototype, "postMessage").mockImplementation(function (this: Worker, message: MainToWorker) {
+    posted.push(structuredClone(message));
+    post.call(this, message);
+  });
+  return posted;
+}
+
+function startOf(posted: MainToWorker[]): StartMessage | undefined {
+  const start = posted.find((m) => m.type === "start");
+  return start?.type === "start" ? start : undefined;
+}
+
+/** Wait (in animation frames) until `done()` holds; fails the test after `frames` frames. */
+async function until(done: () => boolean, what: string, frames = 900): Promise<void> {
+  for (let i = 0; i < frames && !done(); i++) await nextFrame();
+  expect(done(), `timed out waiting for ${what}`).toBe(true);
+}
+
+/** A plain drag from host-relative (x0, y0) to (x1, y1), as the engine's node drag receives it. */
+function drag(host: HTMLElement, x0: number, y0: number, x1: number, y1: number): void {
+  const r = host.getBoundingClientRect();
+  const ev = (type: string, x: number, y: number): boolean =>
+    host.dispatchEvent(new PointerEvent(type, { clientX: r.left + x, clientY: r.top + y, bubbles: true, button: 0, pointerId: 1 }));
+  ev("pointerdown", x0, y0);
+  ev("pointermove", x1, y1);
+  ev("pointerup", x1, y1);
+}
+
+/**
+ * Drag node 0 of `g` (centred in the view first) and wait until the layout reflows: the drag must reach a
+ * live layout run (a `pin` message to its worker) and move nodes beyond the one held. The engine must have
+ * had `interactive({ draggable: true })` while on WebGL: a network that is on Canvas/SVG when it is made
+ * interactive attaches no pointer listeners (the instanced lane's registration does), a separate issue.
+ */
+async function dragReflows(net: Network, host: HTMLElement, g: NetworkGraph, posted: MainToWorker[]): Promise<void> {
+  const x0 = g.positions[0] ?? 0;
+  const y0 = g.positions[1] ?? 0;
+  net.setTransform({ k: 1, x: W / 2 - x0, y: H / 2 - y0 });
+  const before = g.positions.slice();
+  const pins = posted.filter((m) => m.type === "pin").length;
+  drag(host, W / 2, H / 2, W / 2 + 60, H / 2 - 40);
+  expect(posted.filter((m) => m.type === "pin").length, "the drag reached no layout worker").toBeGreaterThan(pins);
+  const moved = (): number => {
+    let n = 0;
+    for (let i = 0; i < g.nodeCount; i++) if (g.positions[i * 2] !== before[i * 2] || g.positions[i * 2 + 1] !== before[i * 2 + 1]) n++;
+    return n;
+  };
+  await until(() => moved() > 1, "the rest of the layout to reflow around the dragged node");
+}
+
+describe("backend:'gpu' across a render-backend swap (#311)", () => {
+  it("WebGL → Canvas mid-run: frees the GPU layout before its device goes, continues warm on the worker; a drag reflows", async () => {
+    const host = makeHost();
+    const net = network(host, { width: W, height: H, backend: "webgl" });
+    await net.whenReady();
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const posted = workerPosts();
+    const order: string[] = [];
+    const destroyLayout = GpuForceLayout.prototype.destroy;
+    vi.spyOn(GpuForceLayout.prototype, "destroy").mockImplementation(function (this: GpuForceLayout) {
+      order.push("layout");
+      destroyLayout.call(this);
+    });
+    const destroyBackend = WebGLBackend.prototype.destroy;
+    vi.spyOn(WebGLBackend.prototype, "destroy").mockImplementation(function (this: WebGLBackend) {
+      order.push(`backend (context ${this.gpuDevice instanceof WebGLDevice && this.gpuDevice.gl.isContextLost() ? "lost" : "alive"})`);
+      destroyBackend.call(this);
+    });
+    let harvested = -1;
+    let gpuFrames = 0;
+    const unobserve = observeGpuLayoutFrames((s) => {
+      gpuFrames++;
+      if (s.harvested) harvested = s.harvestedTicks;
+    });
+    try {
+      const g = clustered(1500);
+      const budget = 1000;
+      net.data(g).style({ nodeRadius: 6 }).interactive({ draggable: true }).layout({ backend: "gpu", iterations: budget });
+      await until(() => harvested > 0, "a GPU harvest");
+      expect(net.layoutTransport).toBe("gpu");
+      const ticks = harvested;
+      const settledBefore = net.whenSettled();
+
+      net.setBackend("canvas");
+      await net.whenReady();
+      // The pre-swap hook stopped the GPU layout while the WebGL backend (and its device) was alive.
+      expect(order).toEqual(["layout", "backend (context alive)"]);
+      await until(() => startOf(posted) !== undefined, "the worker start");
+      const start = startOf(posted);
+      expect(start?.iterations, "the worker continues with the ticks left, not the whole budget").toBe(budget - ticks);
+      expect(start?.warm).toEqual(expect.objectContaining({ heat: 1, decaying: false })); // a cold start's held heat
+      expect(net.layoutTransport).toBe(sharedMemoryAvailable() ? "shared" : "copy");
+      expect(net.whenSettled(), "the engine's layout handle is the same object").toBe(settledBefore);
+      expect(warn.mock.calls.filter((c) => String(c[0]).includes("after a render-backend swap"))).toHaveLength(1);
+      const frames = gpuFrames;
+      await net.whenSettled();
+      expect(gpuFrames, "the GPU loop kept running after the swap").toBe(frames);
+
+      await dragReflows(net, host, g, posted);
+    } finally {
+      unobserve();
+      net.destroy();
+    }
+  });
+
+  it("WebGL → SVG after it settled: an idle worker takes over, so a drag still reflows", async () => {
+    const host = makeHost();
+    const net = network(host, { width: W, height: H, backend: "webgl" });
+    await net.whenReady();
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const g = clustered(600);
+      net.data(g).style({ nodeRadius: 6 }).interactive({ draggable: true }).layout({ backend: "gpu", iterations: 40 });
+      await net.whenSettled();
+      expect(net.layoutTransport).toBe("gpu");
+      const posted = workerPosts();
+      const destroy = vi.spyOn(GpuForceLayout.prototype, "destroy");
+
+      net.setBackend("svg");
+      await net.whenReady();
+      expect(destroy).toHaveBeenCalledTimes(1);
+      await until(() => startOf(posted) !== undefined, "the idle worker start");
+      expect(startOf(posted)?.iterations, "idle: no ticks left").toBe(0);
+      expect(startOf(posted)?.warm).toBeDefined();
+      expect(net.layoutTransport).toBe(sharedMemoryAvailable() ? "shared" : "copy");
+
+      await dragReflows(net, host, g, posted);
+    } finally {
+      net.destroy();
+    }
+  });
+
+  it("WebGL → auto: continues warm on the GPU of the upgraded WebGL backend, with no worker", async () => {
+    const host = makeHost();
+    const net = network(host, { width: W, height: H, backend: "webgl" });
+    await net.whenReady();
+    const posted = workerPosts();
+    const destroy = vi.spyOn(GpuForceLayout.prototype, "destroy");
+    let harvested = -1;
+    const harvests: number[] = [];
+    const unobserve = observeGpuLayoutFrames((s) => {
+      if (!s.harvested) return;
+      harvested = s.harvestedTicks;
+      harvests.push(s.harvestedTicks);
+    });
+    try {
+      const budget = 600;
+      net.data(clustered(1500)).layout({ backend: "gpu", iterations: budget });
+      await until(() => harvested > 0, "a GPU harvest");
+      const ticks = harvested;
+
+      net.setBackend("auto"); // a Canvas placeholder now, the WebGL upgrade in the background
+      expect(destroy).toHaveBeenCalledTimes(1); // the pre-swap hook ran for the placeholder install
+      harvests.length = 0;
+      await net.whenSettled();
+      expect(net.layoutTransport).toBe("gpu");
+      expect(startOf(posted), "no worker ran").toBeUndefined();
+      // The run on the upgraded device harvests its final copy at exactly the ticks that were left.
+      expect(harvests[harvests.length - 1]).toBe(budget - ticks);
+    } finally {
+      unobserve();
+      net.destroy();
+    }
+  });
+
+  it("WebGL → auto after it settled: idles on the GPU of the upgraded backend, so a drag reflows there", async () => {
+    const host = makeHost();
+    const net = network(host, { width: W, height: H, backend: "webgl" });
+    await net.whenReady();
+    const posted = workerPosts();
+    let gpuFrames = 0;
+    const unobserve = observeGpuLayoutFrames(() => {
+      gpuFrames++;
+    });
+    try {
+      const g = clustered(600);
+      net.data(g).style({ nodeRadius: 6 }).interactive({ draggable: true }).layout({ backend: "gpu", iterations: 40 });
+      await net.whenSettled();
+      const settledAt = g.positions.slice();
+      const starts = vi.spyOn(GpuStream.prototype, "start");
+      const ticks = vi.spyOn(GpuForceLayout.prototype, "beginTick");
+
+      net.setBackend("auto"); // a Canvas placeholder now, the WebGL upgrade in the background
+      await until(() => starts.mock.calls.length === 1, "the GPU run on the upgraded device");
+      expect(net.layoutTransport).toBe("gpu");
+      for (let i = 0; i < 10; i++) await nextFrame();
+      expect(ticks, "an idle run ticks").not.toHaveBeenCalled();
+      expect(Array.from(g.positions), "the settled layout moved").toEqual(Array.from(settledAt));
+
+      const x0 = g.positions[0] ?? 0;
+      const y0 = g.positions[1] ?? 0;
+      net.setTransform({ k: 1, x: W / 2 - x0, y: H / 2 - y0 });
+      const frames = gpuFrames;
+      drag(host, W / 2, H / 2, W / 2 + 60, H / 2 - 40);
+      const moved = (): number => {
+        let n = 0;
+        for (let i = 0; i < g.nodeCount; i++) if (g.positions[i * 2] !== settledAt[i * 2] || g.positions[i * 2 + 1] !== settledAt[i * 2 + 1]) n++;
+        return n;
+      };
+      await until(() => moved() > 1, "the rest of the layout to reflow around the dragged node");
+      expect(ticks, "the drag reflowed without GPU ticks").toHaveBeenCalled();
+      expect(gpuFrames).toBeGreaterThan(frames);
+      expect(startOf(posted), "a worker ran").toBeUndefined();
+    } finally {
+      unobserve();
+      net.destroy();
+    }
+  });
+
+  it("WebGL → auto, then WebGL picked before the upgrade lands: continues on the GPU of the picked backend", async () => {
+    const host = makeHost();
+    const net = new PrebuiltUpgradeNetwork(host, { width: W, height: H, backend: "webgl" });
+    await net.whenReady();
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const posted = workerPosts();
+    let harvested = -1;
+    const unobserve = observeGpuLayoutFrames((s) => {
+      if (s.harvested) harvested = s.harvestedTicks;
+    });
+    try {
+      net.data(clustered(1500)).layout({ backend: "gpu", iterations: 300 });
+      await until(() => harvested > 0, "a GPU harvest");
+      // The upgrade's device is ready at once, so the superseded upgrade ends while the Canvas placeholder is
+      // still live: before the picked backend has made its own device.
+      net.upgradeWith = createBackend("webgl", host, W, H);
+      await net.upgradeWith;
+      net.setBackend("auto");
+      net.setBackend("webgl");
+      await net.whenReady();
+      await net.whenSettled();
+      expect(net.layoutTransport).toBe("gpu");
+      expect(startOf(posted), "the layout went to the worker on a WebGL backend").toBeUndefined();
+      expect(warn.mock.calls.filter((c) => String(c[0]).includes("CPU worker"))).toHaveLength(0);
+    } finally {
+      unobserve();
+      net.destroy();
+    }
+  });
+
+  it("Canvas → WebGL: a GPU layout that fell back to the worker keeps its worker run", async () => {
+    const host = makeHost();
+    const net = network(host, { width: W, height: H, backend: "canvas" });
+    await net.whenReady();
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    const posted = workerPosts();
+    const ticks = vi.spyOn(GpuForceLayout.prototype, "beginTick");
+    try {
+      net.data(clustered(1500)).layout({ backend: "gpu", iterations: 300 });
+      await until(() => startOf(posted) !== undefined, "the fallback worker start");
+      net.setBackend("webgl");
+      await net.whenReady();
+      await net.whenSettled();
+      expect(posted.filter((m) => m.type === "start"), "a second worker was started").toHaveLength(1);
+      expect(posted.some((m) => m.type === "stop"), "the worker run was stopped").toBe(false);
+      expect(ticks, "a GPU run was started").not.toHaveBeenCalled();
+      expect(net.layoutTransport).toBe(sharedMemoryAvailable() ? "shared" : "copy");
+    } finally {
+      net.destroy();
+    }
+  });
+
+  it("a settled layout moved to an idle worker leaves the main-thread LOD fallback armed, as a settled worker run does", async () => {
+    const host = makeHost();
+    const net = network(host, { width: W, height: H, backend: "webgl" });
+    await net.whenReady();
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      net.data(clustered(1500)).lod({ source: "structure" }).layout({ backend: "gpu", iterations: 40 });
+      await net.whenSettled();
+      expect(net.layoutTransport).toBe("gpu");
+      net.setBackend("canvas");
+      await net.whenReady();
+      await until(() => net.lodSource === "worker", "the idle worker's LOD tree");
+      net.setBackend("webgl");
+      await net.whenReady();
+      // Reconfiguring LOD drops the worker's tree and nothing streams another (the worker is idle), so the
+      // main thread builds one, as after a settled `backend: "worker"` run.
+      net.lod(false).lod({ source: "structure" });
+      await until(() => net.lodSource !== "none", "a LOD tree after the reconfigure", 30);
+      expect(net.lodSource).toBe("main");
+    } finally {
+      net.destroy();
+    }
+  });
+
+  it("a drag held across a move to the worker keeps following the cursor in shared-memory mode", async () => {
+    const host = makeHost();
+    const net = network(host, { width: W, height: H, backend: "webgl" });
+    await net.whenReady();
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const g = clustered(600);
+      net.data(g).style({ nodeRadius: 6 }).interactive({ draggable: true }).layout({ backend: "gpu", iterations: 40 });
+      await net.whenSettled();
+      net.setTransform({ k: 1, x: W / 2 - (g.positions[0] ?? 0), y: H / 2 - (g.positions[1] ?? 0) });
+      const hit = net.pick(W / 2, H / 2);
+      const id = typeof hit?.id === "number" ? hit.id : -1;
+      expect(id, "no node under the cursor to grab").toBeGreaterThanOrEqual(0);
+      const x0 = g.positions[id * 2] ?? 0;
+      const y0 = g.positions[id * 2 + 1] ?? 0;
+      pointer(host, "pointerdown", W / 2, H / 2);
+      pointer(host, "pointermove", W / 2 + 30, H / 2 + 10); // past the click slop: the drag starts
+      expect(g.positions[id * 2]).toBeCloseTo(x0 + 30, 3);
+
+      // The test page is not cross-origin isolated, so an ArrayBuffer stands in for the SharedArrayBuffer.
+      // That drives the main thread's shared-memory path: the worker start replaces `graph.positions` with a
+      // view of the shared buffer, and a pin carries ids only, the held positions being in that buffer.
+      vi.stubGlobal("crossOriginIsolated", true);
+      vi.stubGlobal("SharedArrayBuffer", ArrayBuffer);
+      const posted = workerPosts();
+      const before = g.positions;
+      net.setBackend("canvas");
+      await net.whenReady();
+      await until(() => startOf(posted) !== undefined, "the idle worker start");
+      expect(net.layoutTransport).toBe("shared");
+      expect(g.positions, "the worker start swapped in the shared positions").not.toBe(before);
+
+      pointer(host, "pointermove", W / 2 + 90, H / 2 + 40);
+      expect(g.positions[id * 2], "the held node follows the cursor after the move").toBeCloseTo(x0 + 90, 3);
+      expect(g.positions[id * 2 + 1]).toBeCloseTo(y0 + 40, 3);
+      pointer(host, "pointerup", W / 2 + 90, H / 2 + 40);
+    } finally {
+      vi.unstubAllGlobals();
+      net.destroy();
+    }
+  });
+});
+
+/** A network whose `"auto"` upgrade takes the WebGL backend in {@link upgradeWith}, made beforehand. */
+class PrebuiltUpgradeNetwork extends Network {
+  upgradeWith: Promise<BackendHandle> | null = null;
+  protected override createWebGLBackend(): Promise<BackendHandle> {
+    return this.upgradeWith ?? super.createWebGLBackend();
+  }
+}
+
+/** One pointer event at host-relative (x, y), bubbling to the window listeners a node drag adds. */
+function pointer(host: HTMLElement, type: string, x: number, y: number): void {
+  const r = host.getBoundingClientRect();
+  host.dispatchEvent(new PointerEvent(type, { clientX: r.left + x, clientY: r.top + y, bubbles: true, button: 0, pointerId: 1 }));
+}
 
 function nextFrame(): Promise<void> {
   return new Promise((resolve) => requestAnimationFrame(() => resolve()));

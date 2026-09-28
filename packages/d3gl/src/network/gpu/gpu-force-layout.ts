@@ -531,6 +531,16 @@ export class GpuForceLayout {
     return this.epoch;
   }
 
+  /** The heat of the next tick — what a warm restart elsewhere continues at (#311). */
+  get heat(): number {
+    return this.cooling.heat;
+  }
+
+  /** Whether the heat decays ({@link cool}) rather than being held ({@link hold}); see `Cooling.decaying`. */
+  get heatDecaying(): boolean {
+    return this.cooling.decaying;
+  }
+
   /**
    * Execute `ticks` whole ticks on the GPU — each is the three work items {@link beginTick},
    * {@link forceBand}`(0, 1)` and {@link integrate}. A convenience for tests and one-off solves; the

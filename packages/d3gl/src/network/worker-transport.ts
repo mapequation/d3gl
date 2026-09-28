@@ -11,6 +11,7 @@
  * frame here). The main thread then never coarsens or runs the O(N) geometry pass.
  */
 import type { NetworkGraph } from "./graph.js";
+import type { Device } from "@luma.gl/core";
 import { multilevelLayout, type CoarsenOptions } from "./coarsen.js";
 import { ForceLayout, seedPositions, type ForceParams } from "./force.js";
 import { lodTreeFromTopology, type BoundaryDiscs, type LODTree } from "./lod.js";
@@ -35,6 +36,15 @@ export interface WorkerLayoutOptions {
    * synchronous fallback (the caller builds the tree on the main thread there).
    */
   lod?: boolean;
+  /**
+   * Continue the layout `graph.positions` holds instead of seeding one (#311): no disc, no multilevel
+   * seed, and its heat schedule resumed — `cool(iterations, heat)` when it was decaying, else
+   * `hold(heat)` — over `iterations`, the ticks it had left. `iterations: 0` starts the worker idle, alive
+   * for a drag reheat. How a GPU layout goes on after its render backend is swapped away or its context is
+   * lost. `multilevel` is ignored; `lod` still streams the tree. `recool`: the ticks are a re-cool's tail
+   * after a drag, resumed as one (a pin then reheats at the drag heat at once).
+   */
+  warm?: { heat: number; decaying: boolean; recool?: boolean };
 }
 
 export interface WorkerLayoutHandle {
@@ -70,6 +80,16 @@ export interface WorkerLayoutHandle {
   pin(ids: Uint32Array, positions?: Float32Array): void;
   /** Release every pin and let the layout re-cool, then idle (#140). No-op on the fallback. */
   unpin(): void;
+  /**
+   * Set by `startGpuLayout` only (#311): the render backend that owns this layout's WebGL device is about
+   * to be replaced — call it while that device is still alive. A GPU run stops and frees its GPU
+   * resources now, then continues **warm** on whatever `next` resolves to (a GPU run on a new WebGL
+   * device, else the CPU worker): from its last harvested positions, with the ticks left of its budget
+   * and its current heat. A settled layout continues as an idle run, so a drag still reflows. The handle
+   * stays the same object. No-op while the layout runs on the worker (not bound to a device) or waits
+   * for a device.
+   */
+  moveDevice?(next: Promise<Device | null | undefined>): void;
 }
 
 /** Handle for the synchronous fallback (no live worker) — reheat is a no-op there. */
@@ -113,13 +133,22 @@ export function startWorkerLayout(
    */
   onLODTree?: (tree: LODTree) => void,
 ): WorkerLayoutHandle {
-  const { width, height, iterations } = opts;
+  const { width, height, iterations, warm } = opts;
   const multilevel = opts.multilevel ?? true;
   const syncOpts = { width, height, iterations, force: opts.force, coarsen: opts.coarsen };
 
   /** Solve on this thread (converging early, like the worker): the fallback when no worker runs. */
   const solveHere = (): void => {
-    if (multilevel) multilevelLayout(graph, syncOpts);
+    if (warm) {
+      // Continue from the current positions on the handed-over schedule, until converged (#311).
+      const layout = new ForceLayout(graph, opts.force);
+      if (warm.decaying) layout.cool(iterations, warm.heat);
+      else layout.hold(warm.heat);
+      for (let t = 0; t < iterations; t++) {
+        layout.tick();
+        if (layout.converged) break;
+      }
+    } else if (multilevel) multilevelLayout(graph, syncOpts);
     else {
       seedPositions(graph, width, height, { force: opts.force });
       new ForceLayout(graph, opts.force).run(iterations, "hot"); // a cold start untangles at full heat
@@ -138,8 +167,9 @@ export function startWorkerLayout(
 
   // Give the very first paint a spread disc instead of a pile at the origin while the worker's seed
   // frame is in flight — at the force model's equilibrium scale, the scale that seed arrives at, so
-  // a fitted view doesn't jump. NetworkGraph satisfies the force core's LayoutGraph view.
-  seedPositions(graph, width, height, { force: opts.force });
+  // a fitted view doesn't jump. NetworkGraph satisfies the force core's LayoutGraph view. A warm start
+  // continues the positions already on screen (#311).
+  if (!warm) seedPositions(graph, width, height, { force: opts.force });
 
   // Live (#297): a worker error below falls back to a synchronous solve, after which no worker shares it.
   let shared = sharedMemoryAvailable();
@@ -174,7 +204,10 @@ export function startWorkerLayout(
     if (msg.type === "lod-topology") {
       const { topology, sharedGeometry } = msg;
       const buffer: ArrayBufferLike = sharedGeometry ?? new ArrayBuffer(lodGeometryByteLength(topology.size));
-      if (!sharedGeometry) lodGeomFlat = new Float32Array(buffer);
+      if (!sharedGeometry) {
+        lodGeomFlat = new Float32Array(buffer);
+        if (msg.geometry) lodGeomFlat.set(msg.geometry); // a warm start's geometry, before the tree is drawn (#311)
+      }
       onLODTree?.(lodTreeFromTopology(topology, lodGeometryViews(buffer, topology.size)));
       return;
     }
@@ -211,6 +244,8 @@ export function startWorkerLayout(
     multilevel,
     frameEvery: opts.frameEvery,
     lod: opts.lod,
+    // Copy mode clones the positions into the message (at post time); shared mode carried them into the SAB.
+    warm: warm && { ...warm, ...(shared ? {} : { positions: graph.positions }) },
   };
   worker.postMessage(start);
 

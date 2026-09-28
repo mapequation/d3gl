@@ -266,7 +266,12 @@ export interface NetworkLayoutOptions {
    *  one console warning naming the
    *  reason, when the render backend is not WebGL or the device lacks float render targets, float blending
    *  (`EXT_float_blend`) or a large enough texture size for the graph. The fallback is a full worker
-   *  run: it honours `multilevel` and streams the LOD tree like `"worker"`.
+   *  run: it honours `multilevel` and streams the LOD tree like `"worker"`. A GPU layout lives on the
+   *  render backend's WebGL device: when {@link Network.setBackend} swaps that backend out, or its WebGL
+   *  context is lost, the layout frees its GPU resources and continues **warm** — from its last positions,
+   *  with the ticks left of its budget and its current heat — on the GPU of a new WebGL backend, else on
+   *  the worker (one console warning; none for `"auto"` after a swap). A layout that had settled continues
+   *  idle, so a node drag still reflows it (#311).
    *
    *  `"auto"` (#375) asks for "the GPU where it works": it resolves to the GPU solve wherever `"gpu"`
    *  would run it and to `"worker"` everywhere else, **without** a warning, because there the worker is
@@ -1606,6 +1611,7 @@ export class Network extends BaseEngine {
     };
     // Unset until the transport returns, so a callback can never match a cleared `layoutHandle` (null).
     let handle: WorkerLayoutHandle | undefined;
+    let settled = false; // this layout's settle handler has run (it clears `lodStreaming` once)
     const onFrame = (): void => this.onStreamedFrame(handle);
     const onLODTree = useLod
       ? (tree: LODTree | null): void => {
@@ -1621,7 +1627,8 @@ export class Network extends BaseEngine {
           }
           // Record the worker's tree; recomputeLODGeometry adopts it while the cut is structural (a switch
           // to modules since launch keeps the module tree). Its geometry arrives with every frame, so the main
-          // thread only fills the style geometry once. The next frame renders it.
+          // thread only fills the style geometry once. The next frame renders it; a warm start's tree (#311)
+          // lands with the geometry of the positions already on screen.
           this.lodWorkerTree = tree;
           this.recomputeLODGeometry();
         }
@@ -1634,14 +1641,18 @@ export class Network extends BaseEngine {
       handle = startGpuLayout(devicePromise, graph, gpuOpts, onFrame, onLODTree,
         () => {
           // Resolved: the worker fallback streams the tree, and so does the GPU solve's LOD worker (#377) — so
-          // main builds none meanwhile.
-          if (this.layoutHandle === handle) this.lodStreaming = useLod;
+          // main builds none meanwhile. Also when the layout moved to either by a backend swap or a lost context
+          // (#311) — but not after the layout settled: a move then starts an idle run, whose tree is adopted when
+          // it lands, and the settle handler that clears the flag has already run, so a raised flag would block
+          // the main-thread LOD fallback until the next layout().
+          if (this.layoutHandle === handle && !settled) this.lodStreaming = useLod;
         });
     } else {
       this.lodStreaming = useLod; // the worker will stream the tree; main builds none meanwhile
       handle = startWorkerLayout(graph, workerOpts, onFrame, onLODTree);
     }
     this.onLayoutSettled(handle, () => {
+      settled = true;
       this.lodStreaming = false;
     });
   }
@@ -2687,17 +2698,20 @@ export class Network extends BaseEngine {
     if (this.transition?.running) this.transition.finish();
     const pending = this.transition;
 
-    const pos = graph.positions;
+    const grabbed = graph.positions;
     const start = new Float32Array(held.length * 2); // world positions at grab time
-    for (let k = 0; k < held.length; k++) { const id = held[k]!; start[k * 2] = pos[id * 2]!; start[k * 2 + 1] = pos[id * 2 + 1]!; }
+    for (let k = 0; k < held.length; k++) { const id = held[k]!; start[k * 2] = grabbed[id * 2]!; start[k * 2 + 1] = grabbed[id * 2 + 1]!; }
     const t0 = this.transform;
     const worldStartX = (sx - t0.x) / t0.k, worldStartY = (sy - t0.y) / t0.k;
     let dx = 0, dy = 0; // world-space cursor delta since grab
 
     const heldIds = Uint32Array.from(held);
     const heldPos = new Float32Array(held.length * 2); // interleaved held positions, for the worker pin message
-    // Hold every grabbed leaf at (start + cursor delta), mirrored into `heldPos` for the worker pin.
+    // Hold every grabbed leaf at (start + cursor delta), mirrored into `heldPos` for the worker pin. Reads
+    // `graph.positions` per call, not once per drag: a GPU layout moved to a shared-memory worker mid-drag
+    // swaps it for a view of the shared buffer (#311), and a shared-mode pin sends ids only.
     const applyHeld = (): void => {
+      const pos = graph.positions;
       for (let k = 0; k < held.length; k++) {
         const id = held[k]!;
         const px = start[k * 2]! + dx, py = start[k * 2 + 1]! + dy;
@@ -3561,6 +3575,18 @@ export class Network extends BaseEngine {
       constBorder,
       linkBend: this.styleOpts.linkBend ?? 0,
     };
+  }
+
+  /**
+   * A backend swap is about to destroy the outgoing backend and its WebGL device (#311). A GPU layout runs
+   * on that device, so it moves now, while the device is alive: it frees its textures and fences there and
+   * continues warm on the next backend's device once that has settled — the GPU again on WebGL (including
+   * after an `"auto"` upgrade), else the CPU worker — with its remaining ticks and heat, or idle (alive for a
+   * drag) if it had settled. The handle stays the same, so a drag in progress and the settle handler keep
+   * working. A worker layout is not bound to a device and keeps running.
+   */
+  protected override onBeforeBackendSwap(): void {
+    this.layoutHandle?.moveDevice?.(this.whenBackendSettled().then(() => this.gpuDevice()));
   }
 
   /** Re-push instanced layers after a backend swap (the first install doesn't fire this). */

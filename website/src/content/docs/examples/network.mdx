@@ -65,7 +65,12 @@ back, so a frame is painted (positions and aggregates together) one worker round
 read back (the top-right readout's **LOD tree** shows `worker`). On a device without those
 capabilities it falls back to the worker with one console warning naming the reason, and the fallback
 is the run `backend: "worker"` would start: it honours `multilevel` (**Seeding**) and streams the LOD
-tree from the worker.
+tree from the worker. The GPU layout lives on the WebGL backend's device, so switching the render backend
+(the example's `auto` / `webgl` / `canvas` / `svg` switch, or `setBackend()`) or losing the WebGL context
+moves it: it frees its GPU memory and continues where it was — the same positions, the ticks it had left,
+the heat it had cooled to — on the GPU of the new WebGL backend, or on the worker for Canvas and SVG. A
+layout that had already settled continues as an idle run — on the GPU of a new WebGL backend, on the worker
+for Canvas and SVG — so dragging a node still reflows it.
 `layout({ backend: "auto" })` (**Auto**) asks for "the GPU where it works": it takes the GPU wherever
 `"gpu"` would and the worker everywhere else, **without** a warning, since there the worker is an
 expected outcome. Everything else — `fit`, drag reheat, nested layouts, state networks, LOD streaming —
