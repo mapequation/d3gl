@@ -41,8 +41,9 @@ export interface StreamStage extends StageCost {
 /** Where a schedule's stages come from: the solver's tick, and its readback's preparation. */
 export interface StageSource {
   /**
-   * The passes of the tick about to start, in order — read once, before its first band; the last band
-   * of the last pass completes the tick. The array may be the solver's own, reused.
+   * The passes of the tick about to start, in order — read once per tick, before its first band is
+   * admitted, however many frames that band then waits for budget (a read may advance the source); the
+   * last band of the last pass completes the tick. The array may be the solver's own, reused.
    */
   tickStages(): readonly StreamStage[];
   /**
@@ -78,7 +79,13 @@ export interface ScheduleHooks {
 }
 
 /** No stages: a readback that needs no passes of its own copies at once. */
-const NO_STAGES: readonly StreamStage[] = [];
+export const NO_STAGES: readonly StreamStage[] = [];
+
+/**
+ * A pass whose owner rewrites its estimate (and rows) before each tick that runs it — the flat layout's, which
+ * follow the level it ticks (#353), and the stream's own seed steps.
+ */
+export type EstimatedStage = { -readonly [K in keyof StageCost]: StageCost[K] } & Pick<StreamStage, "run">;
 
 /**
  * Where the next work item starts in a sequence of stages — a tick's or a readback's: the stage, the
@@ -112,6 +119,8 @@ export class StreamSchedule {
   private readonly source: StageSource;
   private readonly hooks: ScheduleHooks;
   private readonly tick = new StageCursor();
+  /** The next tick's stages were read (its first band may still wait for budget). */
+  private staged = false;
   private started = false;
   private preparing = false;
   private readonly readback = new StageCursor();
@@ -164,7 +173,10 @@ export class StreamSchedule {
     let items = this.preparing ? this.readbackItems(open) : 0;
     if (open && !this.preparing) {
       while (hasWork()) {
-        if (!this.started) this.tick.start(this.source.tickStages());
+        if (!this.staged) {
+          this.tick.start(this.source.tickStages());
+          this.staged = true;
+        }
         if (!this.admitNext(this.tick)) break;
         if (!this.started) {
           this.hooks.tickStart();
@@ -174,6 +186,7 @@ export class StreamSchedule {
         items++;
         if (this.tick.pending) continue;
         this.started = false;
+        this.staged = false;
         this.hooks.tickEnd();
       }
     }
@@ -196,10 +209,12 @@ export class StreamSchedule {
    * pass, from freshly read {@link StageSource.tickStages}. No-op between ticks. For a stream that goes idle
    * in the middle of a tick whose work no longer matters — the frozen ticks after a convergence stop (#376):
    * a later tick (a drag's) must start with its prep, which writes the held positions and clears the force
-   * accumulator, rather than finish that one from its old prep.
+   * accumulator, rather than finish that one from its old prep. Stages read for a tick whose first band
+   * never ran are dropped too.
    */
   dropTick(): void {
     this.started = false;
+    this.staged = false;
   }
 
   /** Encode the readback's remaining passes while the budget admits them; all encoded, copy. */

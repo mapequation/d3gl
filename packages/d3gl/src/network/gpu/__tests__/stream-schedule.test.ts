@@ -137,6 +137,34 @@ describe("StreamSchedule (#382)", () => {
     expect(r.log.join(" ")).toBe("| read | R0/1 copy start T0/1 end");
     expect(r.schedule.reading).toBe(false);
   });
+
+  it("reads a tick's stages once, before its first band, however many frames its first band waits", () => {
+    // A source whose every read is the next tick (T0, T1, …): 4 ms passes at a 5 ms budget, so a frame's first
+    // item is a whole tick and the next tick's first band waits for the next frame — for two frames once a
+    // readback's pass goes first. Read again while it waits, a tick would be skipped.
+    const log: Event[] = [];
+    const budget = new FakeBudget(5);
+    let reads = 0;
+    let ends = 0;
+    const readback = [stage("R", 4, 1, log)];
+    const schedule = new StreamSchedule(budget, { tickStages: () => [stage(`T${reads++}.`, 4, 1, log)], readbackStages: () => readback }, {
+      tickStart: () => {},
+      tickEnd: () => {
+        ends++;
+      },
+      readbackStart: () => log.push("read"),
+      copy: () => log.push("copy"),
+    });
+    const run = (copy: boolean): void => {
+      budget.newFrame();
+      log.push("|");
+      schedule.frame(true, () => ends < 4, () => copy);
+    };
+    for (const copy of [false, true, false, false, false, false]) run(copy);
+    expect(log.join(" ")).toBe("| T0.0/1 | T1.0/1 read | R0/1 copy | T2.0/1 | T3.0/1 |");
+    expect(reads).toBe(4);
+  });
+
   it("drops the tick under way: the next tick starts at its first pass, from its stages read afresh (#376)", () => {
     // A 3-band pass of 4 ms bands at 10 ms: the frame ends after P and two bands, mid-tick.
     let kind = "a";
