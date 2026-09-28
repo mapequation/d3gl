@@ -22,6 +22,11 @@ copy, so such a frame queued them whole whatever its budget.
   evidence about its current growth (a miss never raises the item count), and a late frame of one band that
   cannot be cut finer no longer throttles every other pass to one item per frame. A readback's repaint
   cadence is timed from its start, so a composition that waits for budget does not delay the repaint.
+- A cold nested layout takes longer below 1,000,000 leaves: each frame now holds only the work its budget
+  admits by the passes' measured costs (the previous pacing let a frame carry about twice its budget), and
+  each band of a cut pass pays its pass's setup again. On an M1 Max: 14-84% longer, most on small maps and
+  power-law modules at 120 Hz (a 60,000-child module 1.3 s → 2.5 s, web-NotreDame's trees 2.0-2.4 s →
+  2.3-3.2 s); 1,000,000 leaves about the same (4.6-5.0 s → 4.4-4.7 s).
 - The layout is bitwise the same for any slicing. The flat layout's positions are unchanged, and its
   multilevel seed, convergence stop, LOD relay and swap state work as before.
 - The composition has its own reduction scratch and sums: 3.3 MB more GPU memory at 1M leaves (1.1 MB at

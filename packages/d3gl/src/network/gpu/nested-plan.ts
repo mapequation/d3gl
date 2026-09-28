@@ -45,12 +45,14 @@ export interface PassCost {
  * divisible part is the line through the maps' whole-pass time less one `fixedMs`. Timer queries were not
  * used: on ANGLE Metal they count a pass's overlap with the pass before it, and inflate sliced passes.
  *
- * **The estimates are medians, not bounds.** A pass on one map runs up to ~2× its line (the reductions and
- * scatters at 20,000 leaves, all fixed cost); the work items' fixed cost per band — their longest item —
- * ranges 0.03-0.9 ms between the maps (0.9 on the Zipf maps, whose dense cells make the longest items). A
- * frame's real GPU time can exceed the budget by as much; a GPU that runs later than that is what the frame
- * budget's fences catch (`k` halves, the band growth rises), as for the flat layout (#382, D8). Most passes
- * are nearly all fixed cost: a render pass costs ~0.05 ms whatever it draws.
+ * **The estimates are medians, not bounds.** A pass on one map runs up to ~3× its line (the springs and
+ * predict at 20,000 leaves, where the line is a few hundredths of a ms); the work items' fixed cost per band
+ * — their longest item — ranges 0.03-0.9 ms between the maps (0.9 on the Zipf maps, whose dense cells make
+ * the longest items), and the plan cannot tell the maps apart: its largest item's estimated work is 443-499
+ * pair-test units on maps that measure 0.25-0.9 ms a band, since #380 bounds every item and the plan costs
+ * every cell visit alike. A frame's real GPU time can exceed the budget by as much; a GPU that runs later
+ * than that is what the frame budget's fences catch (`k` halves, the band growth rises), as for the flat
+ * layout (#382). Most passes are nearly all fixed cost: a render pass costs ~0.05 ms whatever it draws.
  */
 export const NESTED_COST = {
   /** Reduction tree level 1 (the map over 16 slots per texel): 0.14-0.40 ms whole. */

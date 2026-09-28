@@ -654,15 +654,15 @@ await net.whenSettled(); // resolves when the transition ends
   close. The disc collision bins each child at the scale of its own size, so a module of very uneven child
   sizes costs time in proportion to its children's contacts, not to their number squared. Every pass of
   the solve, and the composition that each repaint reads back, is cut into bands sized to the frame's GPU
-  budget (10 ms at 60 Hz, 5 ms at 120 Hz), so by the passes' measured costs a frame queues no more layout
-  work than that, at 1,000,000 leaves too; on a busy GPU a frame runs over by as much as its passes do.
-  On an M1 Max one module of 60,000 children with power-law flows lays out in about 2.5-2.7 s (the CPU: 5
-  minutes) without a stalled frame, Infomap's trees of web-NotreDame in 2.3-3.2 s, and the
-  1,000,000-leaf map of the timing bench in about 4.5 s. Because the GPU solve applies all of a child's
-  springs at once, a child linked to many of its siblings (a hub) would overshoot, so its springs are
-  relaxed just enough to keep each step stable: a hub is pulled a little less per step than on the CPU.
-  On web-NotreDame's directed Infomap tree, whose hubs are small low-flow pages, that is 3.5% of the
-  children.
+  budget (10 ms at 60 Hz, 5 ms at 120 Hz), so by its estimates a frame queues no more layout work than
+  that, at 1,000,000 leaves too. The estimates are the passes' costs measured on an M1 Max, the median over
+  eight maps: a frame whose passes run slower (a busy GPU, or a map at the slow end of a pass's range) runs
+  over by as much. On an M1 Max one module of 60,000 children with power-law flows lays out in about
+  2.5-2.7 s (the CPU: 5 minutes), Infomap's trees of web-NotreDame in 2.3-3.2 s, and the 1,000,000-leaf map
+  of the timing bench in about 4.5 s. Because the GPU solve applies all of a child's springs at once, a
+  child linked to many of its siblings (a hub) would overshoot, so its springs are relaxed just enough to
+  keep each step stable: a hub is pulled a little less per step than on the CPU. On web-NotreDame's
+  directed Infomap tree, whose hubs are small low-flow pages, that is 3.5% of the children.
 - **`transition: 600`** eases every node from where it is to its new place over 600 ms (cubic
   ease-in-out) on the main thread. The layout computes the final positions only; each animation frame is then
   a positions-only repaint — no more work than a frame of a streaming layout. `transition` also eases a
