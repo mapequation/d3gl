@@ -28,7 +28,10 @@
  * **Cost.** Built by walking the graph edges under each listed cell once, deepest cell first, each neighbour
  * lifted on to the cell's depth from where the last lift left it: O(Σ edges under the listed cells) — at most
  * 2E for the covers of one cut, which partition the leaves — plus O(depth) climbing per leaf, and O(Σ rows)
- * out, bounded by what the covers can draw.
+ * out. A row holds one entry per distinct partner node at its cell's depth, in each direction: about one per
+ * cover it links to, more where a partner cover is shallower (one per node at the row's depth inside it). So
+ * the rows are not bounded by the pairs drawn: at a fixed view they grow with the edges under the covers until
+ * a row lists nearly every cover — 1.3-7× the drawn pairs on the perf fixture at 100k-500k nodes.
  */
 import { buildCSR, type CSR } from "./graph.js";
 
