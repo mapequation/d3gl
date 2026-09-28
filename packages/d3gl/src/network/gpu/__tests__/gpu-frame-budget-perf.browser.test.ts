@@ -50,15 +50,24 @@
  * render passes (P's are its dependency chains: the reduction tree and its query,
  * the latch, the L0 scatter and the pyramid's reduces, the hub chunks) and passes
  * that draw nothing, and pins that each force band clears exactly its own rows.
+ *
+ * MULTILEVEL SEED (#353, #403)
+ * ----------------------------
+ * A seed's levels run as per-frame work items too, and a level above exactMax
+ * runs the tile traversal with its masses. Each of its ticks is held under the
+ * flat ceiling at its slot count and under the graph's own tick on the same
+ * solver.
  */
 
 import { describe, it, expect, beforeAll, vi } from "vitest";
 import type { Device } from "@luma.gl/core";
 import { Model } from "@luma.gl/engine";
 import { makeTestDevice } from "./_device.js";
-import { GpuForceLayout } from "../gpu-force-layout.js";
+import { GPU_REPULSION_ALLPAIRS_MAX, GpuForceLayout } from "../gpu-force-layout.js";
+import { coarseSeedPlan } from "../seed-plan.js";
+import { buildHierarchy, type CoarseLevel } from "../../coarsen.js";
 import { buildCSR, buildGraph } from "../../graph.js";
-import { MIN_SETTLE_TICKS, type LayoutGraph } from "../../force.js";
+import { DEFAULT_FORCE, MIN_SETTLE_TICKS, type LayoutGraph } from "../../force.js";
 import { buildHubChunks, SPRING_CHUNK } from "../hub-chunks.js";
 import { FLAT_TILE_MIN_SIDE, bandRows, flatSegments, packTiles, reduceLayout, type PyramidTexture } from "../segments.js";
 import { GridPyramid } from "../passes/grid-pyramid.js";
@@ -66,8 +75,6 @@ import { STOP_STOPPED } from "../stop-latch.js";
 import { atlasWidth } from "../textures.js";
 import { AsyncPositionReadback } from "../async-readback.js";
 import { deviceReadsRG } from "../device-probe.js";
-import { coarseSeedPlan } from "../seed-plan.js";
-import { buildHierarchy } from "../../coarsen.js";
 import { recordItems, type ItemRecord } from "./_item-recorder.js";
 import { perfBudget, perfN } from "../../../__tests__/perf-budget.js";
 
@@ -515,6 +522,77 @@ describe("GPU frame budget — pyramid path (per-tick regression tripwire)", () 
       let moved = 0;
       for (let i = 0; i < n * 2; i++) if (a[i] !== g.positions[i]) moved++;
       expect(moved, `${mode}: the ticks did not move the layout`).toBeGreaterThan(n);
+    }
+  });
+
+  it("a multilevel seed's Barnes-Hut levels (#353, #403) tick under the flat ceiling and no slower than the graph's own tick", () => {
+    // A seed level above exactMax runs the tile traversal with its masses: one u_mass fetch per fragment, and
+    // each slot's own terms taken out of the cells it sits in (#403). The fixture is the pyramid legs' clustered
+    // graph with web-NotreDame-shaped hub rows. Its coarsening folds the hubs' stars into supernodes of
+    // thousands of nodes on the Barnes-Hut levels, as on web-NotreDame (7,757 nodes in one of 4,200 slots).
+    // The seed runs its own schedule on a multilevel solver, and each Barnes-Hut level of S slots has its first
+    // ticks timed (each closed by a readback, min of 3) against two bounds:
+    // - the flat leg's catastrophic ceiling at S slots, 200 + 1,000·S/30k ms: an O(S²) traversal trips it;
+    // - the graph's own tick, + 10 ms, timed on a second multilevel solver interleaved with the level's ticks,
+    //   so that a change in machine load hits both sides alike. A level has at most half the graph's slots
+    //   (asserted), so a runaway in the seed's uniform branch (the #350 class: a branch that costs a multiple
+    //   of the whole tick) trips this bound, which the flat legs cannot see. Measured at 30k-200k nodes: every
+    //   level 0.1-0.5× the graph's tick on SwiftShader, and 3.0-8.0 ms against 3.5-11.3 ms on an M1 Max. With
+    //   256 extra texel fetches per visited cell on seed levels only, the largest level took 3.3× (30k) and
+    //   4.8× (100k) the graph's tick on SwiftShader and failed here, while the flat ceiling leg stayed green.
+    const LOCAL_N = 30_000; // the N the flat ceiling is calibrated at
+    const N = perfN(LOCAL_N, { max: 200_000 });
+    const REPEATS = 3;
+    const g = withHubs(makeClusteredGraph(N, 80, 0xdeadbeef), 0x52);
+    const coarse: CoarseLevel = { nodeCount: N, source: g.source, target: g.target, weight: new Float32Array(g.edgeCount).fill(1) };
+    const plan = coarseSeedPlan(coarse, buildHierarchy(coarse), { width: 800, height: 600 });
+    if (!plan) throw new Error("no seed plan");
+    const graph = new GpuForceLayout(device, { ...g, positions: g.positions.slice() }, DEFAULT_FORCE, { multilevel: true });
+    const seeded = new GpuForceLayout(device, { ...g, positions: g.positions.slice() }, DEFAULT_FORCE, { multilevel: true });
+    const out = new Float32Array(N * 2);
+    const tick = (layout: GpuForceLayout): number => {
+      const t0 = performance.now();
+      layout.runFrame(1);
+      layout.readPositions(out); // GPU sync fence
+      return performance.now() - t0;
+    };
+    const tiled: { k: number; count: number; heaviest: number; ms: number; graphMs: number }[] = [];
+    try {
+      tick(graph); // warm-up (the path's first use)
+      seeded.beginSeed(plan);
+      plan.levels.forEach((level, k) => {
+        seeded.setLevel(k);
+        let ran = 0;
+        if (level.count > GPU_REPULSION_ALLPAIRS_MAX) {
+          tick(seeded); // warm-up
+          let ms = Infinity;
+          let graphMs = Infinity;
+          for (let r = 0; r < REPEATS; r++) {
+            graphMs = Math.min(graphMs, tick(graph));
+            ms = Math.min(ms, tick(seeded));
+          }
+          tiled.push({ k, count: level.count, heaviest: level.mass.reduce((a, b) => Math.max(a, b), 0), ms, graphMs });
+          ran = REPEATS + 1;
+        }
+        seeded.runFrame(Math.max(0, level.ticks - ran)); // the rest of the level's schedule
+      });
+    } finally {
+      graph.destroy();
+      seeded.destroy();
+    }
+
+    console.log(
+      `  GPU frame budget (seed): N=${N}; ` +
+        tiled
+          .map(({ k, count, heaviest, ms, graphMs }) => `L${k} ${count} slots (heaviest ${heaviest}) ${ms.toFixed(1)}ms vs graph ${graphMs.toFixed(1)}ms`)
+          .join(", "),
+    );
+    expect(tiled.length).toBeGreaterThan(0); // the plan has Barnes-Hut levels
+    expect(Math.max(...tiled.map((l) => l.heaviest))).toBeGreaterThan(1_000); // and the supernodes it is about
+    for (const { k, count, ms, graphMs } of tiled) {
+      expect(count, `level ${k}: at most half the graph's slots`).toBeLessThanOrEqual(N / 2);
+      expect(ms, `level ${k} (${count} slots): the flat ceiling at its slot count`).toBeLessThan(perfBudget(200 + 1_000 * (count / LOCAL_N)));
+      expect(ms, `level ${k} (${count} slots): no slower than the graph's own tick`).toBeLessThan(graphMs + perfBudget(10));
     }
   });
 
