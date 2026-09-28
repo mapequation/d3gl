@@ -711,8 +711,12 @@ export class CollisionGrid {
   /** The work-item atlas: its width (the slot atlas's) and rows. */
   private readonly itemWidth: number;
   private readonly itemRows_: number;
-  /** The search passes' texture bindings, filled once and pointed at each step's inputs (no record per band). */
+  /**
+   * The search and resolve passes' texture bindings, filled once and pointed at each step's inputs (no record
+   * per band).
+   */
   private readonly searchBindings: Record<string, Texture>;
+  private readonly resolveBindings: Record<string, Texture>;
   private readonly itemCount: number;
   private readonly slotHeight: number;
 
@@ -779,6 +783,7 @@ export class CollisionGrid {
         searchBindings[`u_subRound${i}`] = t;
       });
       this.searchBindings = searchBindings;
+      this.resolveBindings = { u_disc: this.disc, u_items: this.items_ };
       const shifts = { u_bucketShift: this.cells_.shift, u_subShift: this.subs.shift };
       this.cellUniforms = { u_count: 0, u_width: 1, u_tableWidth: 1, u_collideWidth: 1, ...shifts };
       this.cellModel = keep(fullScreenModel(device, CELL_FS, this.cellUniforms, NO_BLEND));
@@ -1010,14 +1015,12 @@ export class CollisionGrid {
     su["u_tableWidth"] = input.segments.width; // the exact loop's segment lookup
     su["u_collideWidth"] = input.collideWidth;
     su["u_pad"] = input.pad;
-    resolveModel.setBindings({
-      u_disc: this.disc,
-      u_slotCollide: input.slotCollide,
-      u_items: this.items_,
-      u_segInfo: input.segments.info,
-      u_slotSeg: input.slotSeg,
-      u_partial: partial,
-    });
+    const bindings = this.resolveBindings;
+    bindings["u_slotCollide"] = input.slotCollide;
+    bindings["u_segInfo"] = input.segments.info;
+    bindings["u_slotSeg"] = input.slotSeg;
+    bindings["u_partial"] = partial;
+    resolveModel.setBindings(bindings);
     this.draw(resolveModel, scissored ? { framebuffer: target, clear: false, scissor: [0, r0, input.width, r1 - r0] } : { framebuffer: target, clear: false });
   }
 

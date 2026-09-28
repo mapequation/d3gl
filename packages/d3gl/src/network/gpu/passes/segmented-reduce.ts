@@ -309,6 +309,8 @@ export class SegmentedReduce {
   private readonly levelModel: Model;
   private readonly queryModel: Model;
   private readonly level1Uniforms: PassUniforms;
+  /** Level 1's texture bindings: the caller's, then the positions (and velocities) — one record, reused by every band. */
+  private readonly level1Bindings: Record<string, Texture> = {};
   private readonly levelUniforms: PassUniforms;
   private readonly queryUniforms: PassUniforms;
 
@@ -402,7 +404,12 @@ export class SegmentedReduce {
     u["u_posWidth"] = input.posWidth;
     u["u_rowOffset"] = level.rowOffset;
     u["u_size"] = level.size;
-    this.level1Model.setBindings(input.vel ? { ...bindings, u_pos: input.pos, u_vel: input.vel } : { ...bindings, u_pos: input.pos });
+    // A binding set by an earlier call stays in the record, as it stays bound on the model (`setBindings`
+    // merges): the map reads only what its shader declares.
+    const b = Object.assign(this.level1Bindings, bindings);
+    b["u_pos"] = input.pos;
+    if (input.vel) b["u_vel"] = input.vel;
+    this.level1Model.setBindings(b);
     this.level1Model.draw(pass);
     pass.end();
   }

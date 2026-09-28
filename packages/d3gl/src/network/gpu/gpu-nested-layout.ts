@@ -10,7 +10,7 @@ import { NestedIntegratePass, NestedPredictPass, type NestedSlotInputs } from ".
 import { COLLISION_STEPS, CollisionGrid, collisionGridSide, type CollisionPrepareInput } from "./passes/collision.js";
 import { COLLISION_LIST_MAX } from "./collision-plan.js";
 import { NestedComposePass, type ComposeInput } from "./passes/nested-compose.js";
-import { GpuSprings } from "./springs.js";
+import { GpuSprings, type SpringUniforms } from "./springs.js";
 import type { NestedSpringInputs } from "./passes/attraction.js";
 import { SegmentTable, type SegmentRow } from "./segment-table.js";
 import { TILE_MIN_SIDE, assertAtlasFits, bandRows, packTiles, segmentSoftening, slotSegments, type SlotRange, type TileAtlas } from "./segments.js";
@@ -199,6 +199,11 @@ export class GpuNestedLayout implements StreamSolver {
   private readonly vstarFbo: Framebuffer;
   private readonly force: Texture;
   private readonly forceFbo: Framebuffer;
+  /** The slot-atlas pass targets every band reuses ({@link slotTarget}): whole, and scissored to a band's rows; each kept or cleared. */
+  private readonly wholeTarget: { framebuffer: Framebuffer; readonly clear: false };
+  private readonly bandTarget: { framebuffer: Framebuffer; readonly clear: false; readonly scissor: PassViewport };
+  private readonly clearWholeTarget: { framebuffer: Framebuffer; readonly clear: ClearColor };
+  private readonly clearBandTarget: { framebuffer: Framebuffer; readonly clear: ClearColor; readonly scissor: PassViewport };
   private readonly radius: Texture;
   private readonly slotSeg: Texture;
   /** Per segment `(finest collision sub-cell side, owner slot, 0, 0)`. */
@@ -225,6 +230,8 @@ export class GpuNestedLayout implements StreamSolver {
   private readonly compose: NestedComposePass;
   private readonly slotInputs: NestedSlotInputs;
   private readonly springInputs: NestedSpringInputs;
+  /** The springs' draw uniforms: every slot, unit strength (the nested springs weigh their own rows). */
+  private readonly springUniforms: SpringUniforms;
   /** The passes' inputs, created once; each band only points them at the current positions. */
   private readonly collisionInputs: CollisionPrepareInput;
   private readonly reduceInputs: ReduceInput;
@@ -345,6 +352,10 @@ export class GpuNestedLayout implements StreamSolver {
       this.vstarFbo = own(device.createFramebuffer({ width, height, colorAttachments: [this.vstar] }));
       this.force = tex2();
       this.forceFbo = own(device.createFramebuffer({ width, height, colorAttachments: [this.force] }));
+      this.wholeTarget = { framebuffer: this.forceFbo, clear: false };
+      this.bandTarget = { framebuffer: this.forceFbo, clear: false, scissor: [0, 0, width, height] };
+      this.clearWholeTarget = { framebuffer: this.forceFbo, clear: CLEAR_ZERO };
+      this.clearBandTarget = { framebuffer: this.forceFbo, clear: CLEAR_ZERO, scissor: [0, 0, width, height] };
       this.radius = own(device.createTexture({ width, height, format: "r32float", data: slotData(slots, topo.radius, 1), mipLevels: 1, sampler: NEAREST }));
       const seg = new Uint32Array(width * height);
       seg.set(slotSegments(segments, slots));
@@ -424,6 +435,7 @@ export class GpuNestedLayout implements StreamSolver {
         alphaWarm: WARM_ALPHA,
       };
       this.springInputs = { vstar: this.vstar, radius: this.radius, rest: 0, pad: NESTED.PAD };
+      this.springUniforms = { count: slots, width, attraction: 1 };
       this.collisionInputs = {
         pos: this.pos.readTex,
         radius: this.radius,
@@ -708,7 +720,7 @@ export class GpuNestedLayout implements StreamSolver {
   private repulsionBand(band: number, bands: number): void {
     const [r0, r1] = bandRows(band, bands, this.height);
     if (r1 <= r0) return;
-    const pass = beginPass(this.device, this.slotTarget(this.forceFbo, band, bands, CLEAR_ZERO));
+    const pass = beginPass(this.device, this.slotTarget(this.forceFbo, band, bands, true));
     const input = this.repulsionInputs;
     input.posTex = this.pos.readTex;
     this.repulsion.run(pass, input);
@@ -743,8 +755,8 @@ export class GpuNestedLayout implements StreamSolver {
     input.alphaWarm = this.alphaWarm;
     const springs = this.springInputs;
     springs.rest = organising ? 0 : 1;
-    let pass = beginPass(this.device, this.slotTarget(this.forceFbo, band, bands, CLEAR_ZERO));
-    this.springs.draw(pass, this.pos.readTex, { count: this.slots, width: this.width, attraction: 1 }, null, springs);
+    let pass = beginPass(this.device, this.slotTarget(this.forceFbo, band, bands, true));
+    this.springs.draw(pass, this.pos.readTex, this.springUniforms, null, springs);
     pass.end();
 
     const [atPos0, atPos1] = this.integrateFbos;
@@ -786,13 +798,21 @@ export class GpuNestedLayout implements StreamSolver {
 
   /**
    * A pass into a slot-atlas framebuffer over the rows of band `band` of `bands` (a scissor; none when
-   * whole), clearing them first with `clear` (the scissor limits the clear to the band's rows).
+   * whole), clearing them first when `clear` (the scissor limits the clear to the band's rows) — one of
+   * four records built once, retargeted here.
    */
-  private slotTarget(framebuffer: Framebuffer, band: number, bands: number, clear: ClearColor | false = false): PassTarget {
-    if (bands <= 1) return clear ? { framebuffer, clear } : { framebuffer, clear: false };
+  private slotTarget(framebuffer: Framebuffer, band: number, bands: number, clear = false): PassTarget {
+    if (bands <= 1) {
+      const target = clear ? this.clearWholeTarget : this.wholeTarget;
+      target.framebuffer = framebuffer;
+      return target;
+    }
     const [r0, r1] = bandRows(band, bands, this.height);
-    const scissor: PassViewport = [0, r0, this.width, r1 - r0];
-    return clear ? { framebuffer, clear, scissor } : { framebuffer, clear: false, scissor };
+    const target = clear ? this.clearBandTarget : this.bandTarget;
+    target.framebuffer = framebuffer;
+    target.scissor[1] = r0;
+    target.scissor[3] = r1 - r0;
+    return target;
   }
 
   /** The reductions' input, at the current positions. */
