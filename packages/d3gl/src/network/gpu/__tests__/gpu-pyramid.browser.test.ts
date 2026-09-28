@@ -15,12 +15,22 @@
  */
 
 import { describe, it, expect, beforeAll, vi } from "vitest";
-import type { Device } from "@luma.gl/core";
+import type { Device, Texture } from "@luma.gl/core";
 import { makeTestDevice } from "./_device.js";
 import { GridPyramid, chooseGrid } from "../passes/grid-pyramid.js";
 import { SegmentedReduce } from "../passes/segmented-reduce.js";
 import { SegmentTable } from "../segment-table.js";
-import { flatSegments } from "../segments.js";
+import {
+  FLAT_TILE_MIN_SIDE,
+  TILE_MIN_SIDE,
+  canonicalCover,
+  coverDepth,
+  flatSegments,
+  packTiles,
+  slotSegments,
+  type SlotRange,
+} from "../segments.js";
+import { reduce2x2 } from "./grid-pyramid-reference.js";
 import { packPositionsTexture, readbackRgbaFbo } from "../textures.js";
 import { GpuForceLayout } from "../gpu-force-layout.js";
 import { buildGraph } from "../../graph.js";
@@ -71,30 +81,72 @@ function repulsionForces(
   return f;
 }
 
+/** A built tile pyramid, the segment table it was built from, and a cleanup for both. */
+interface BuiltPyramid {
+  pyramid: GridPyramid;
+  table: SegmentTable;
+  release(): void;
+}
+
 /**
- * Build a pyramid over `positions` the way the solver does: the box comes from the segmented range
- * query of the flat segment (the pyramid no longer computes its own). Returns the pyramid and a
- * cleanup for everything the build allocated.
+ * Build the tile pyramid over `positions` the way the solver does: each segment's box comes from the
+ * segmented range query, and every segment above `exactMax` gets a tile (the default: one flat
+ * segment, always tiled). Returns the pyramid, the table and a cleanup for everything the build
+ * allocated.
  */
-function buildPyramid(device: Device, positions: Float32Array): { pyramid: GridPyramid; release(): void } {
+function buildPyramid(
+  device: Device,
+  positions: Float32Array,
+  segments: readonly SlotRange[] = flatSegments(positions.length / 2),
+  exactMax = 0,
+  beforeBuild?: (pyramid: GridPyramid) => void,
+): BuiltPyramid {
   const count = positions.length / 2;
+  const single = segments.length === 1;
+  const atlas = packTiles(segments, exactMax, single ? FLAT_TILE_MIN_SIDE : TILE_MIN_SIDE);
   const { texture: posTex, width } = packPositionsTexture(device, positions);
   const { texture: velTex } = packPositionsTexture(device, new Float32Array(positions.length));
-  const table = new SegmentTable(device, flatSegments(count), { repulsion: 0, centering: 0, softening: 0, alpha0: 1 });
+  const param = { repulsion: 0, centering: 0, softening: 0, alpha0: 1 };
+  const table = new SegmentTable(device, segments.map((seg, s) => ({ ...seg, tile: atlas.tiles[s] ?? null, param })));
   const reduce = new SegmentedReduce(device, count);
   reduce.run({ pos: posTex, vel: velTex, posWidth: width, count }, table);
-  const pyramid = new GridPyramid(device, count);
-  pyramid.build({ posTex, boxTex: table.box, count, width });
+  let slotSeg: Texture | null = null;
+  if (!single) {
+    const ids = new Uint32Array(width * Math.ceil(count / width));
+    ids.set(slotSegments(segments, count));
+    slotSeg = device.createTexture({
+      width, height: Math.ceil(count / width), format: "r32uint", data: ids, mipLevels: 1,
+      sampler: { minFilter: "nearest", magFilter: "nearest" },
+    });
+  }
+  const pyramid = new GridPyramid(device, atlas, single);
+  beforeBuild?.(pyramid);
+  pyramid.build({ posTex, width, count, segments: table, slotSeg });
   return {
     pyramid,
+    table,
     release() {
       pyramid.destroy();
       reduce.destroy();
       table.destroy();
+      slotSeg?.destroy();
       posTex.destroy();
       velTex.destroy();
     },
   };
+}
+
+/** Pyramid level `ℓ` read back as a `width × height × 4` array (its rectangle of its packed texture). */
+function readLevel(device: Device, pyramid: GridPyramid, level: number): { data: Float32Array; width: number; height: number } {
+  const lvl = pyramid.level(level);
+  const tex = pyramid.textures[lvl.texture];
+  const all = readbackRgbaFbo(device, tex);
+  const data = new Float32Array(lvl.width * lvl.height * 4);
+  for (let y = 0; y < lvl.height; y++) {
+    const from = ((lvl.y + y) * tex.width + lvl.x) * 4;
+    data.set(all.subarray(from, from + lvl.width * 4), y * lvl.width * 4);
+  }
+  return { data, width: lvl.width, height: lvl.height };
 }
 
 /** Minimal seeded LCG PRNG — self-contained, no deps. */
@@ -137,9 +189,8 @@ describe("GPU grid pyramid — build correctness (Step A)", () => {
 
     const { pyramid, release } = buildPyramid(device, positions);
 
-    // Root = last level (1×1). Read (Σx, Σy, mass, 0).
-    const rootTex = pyramid.levelTexture(pyramid.levelCount - 1);
-    const root = readbackRgbaFbo(device, rootTex); // length 4
+    // Root = last level (1×1 for the flat tile). Read (Σx, Σy, mass, 0).
+    const root = readLevel(device, pyramid, pyramid.levelCount - 1).data; // length 4
     const sumX = root[0]!;
     const sumY = root[1]!;
     const mass = root[2]!;
@@ -168,8 +219,7 @@ describe("GPU grid pyramid — build correctness (Step A)", () => {
 
     // Every level's total mass (Σ over all cells of channel 2) must equal count.
     for (let lvl = 0; lvl < pyramid.levelCount; lvl++) {
-      const tex = pyramid.levelTexture(lvl);
-      const data = readbackRgbaFbo(device, tex);
+      const { data } = readLevel(device, pyramid, lvl);
       let totalMass = 0;
       for (let t = 0; t < data.length; t += 4) totalMass += data[t + 2]!;
       expect(totalMass).toBeCloseTo(count, 2);
@@ -508,5 +558,360 @@ describe("GPU pyramid level-0 near field — sub-cell clump probe (#251)", () =>
     // single-occupant cells (ε(1) ≠ 0) would register orders of magnitude
     // above this (a cell-size floor shifts near-cell terms by ~50%).
     expect(relL2).toBeLessThan(1e-4);
+  });
+});
+
+const EPS = 2 ** -23;
+
+/** Segments of the given sizes, laid out contiguously from slot 0. */
+function segmentsOf(counts: readonly number[]): SlotRange[] {
+  let start = 0;
+  return counts.map((count) => {
+    const seg = { start, count };
+    start += count;
+    return seg;
+  });
+}
+
+/**
+ * Positions for `segments` sharing one world region: segment `s` is a uniform square of side
+ * `spreads[s]` around `centres[s]`, all overlapping around the origin — so a cross-segment leak would
+ * land in the same cells, not in an empty corner.
+ */
+function sharedRegion(
+  segments: readonly SlotRange[],
+  spreads: readonly number[],
+  centres: readonly (readonly [number, number])[],
+  seed: number,
+): Float32Array {
+  const rng = makePrng(seed);
+  const end = segments.reduce((n, s) => Math.max(n, s.start + s.count), 0);
+  const pos = new Float32Array(end * 2);
+  segments.forEach((seg, s) => {
+    const spread = spreads[s] ?? 1000;
+    const [cx, cy] = centres[s] ?? [0, 0];
+    for (let i = seg.start; i < seg.start + seg.count; i++) {
+      pos[i * 2] = cx + (rng() - 0.5) * spread;
+      pos[i * 2 + 1] = cy + (rng() - 0.5) * spread;
+    }
+  });
+  return pos;
+}
+
+describe("GPU tile pyramid — tiles and packed levels (T3)", () => {
+  let device: Device;
+  beforeAll(async () => { device = await makeTestDevice(); });
+
+  // exactMax 32: tiles of side 64, (exact), 64, 16 — the 16-tile lands at (0, 64) of a 128 × 128 atlas.
+  const counts = [3000, 20, 1500, 200];
+  const segments = segmentsOf(counts);
+  const positions = sharedRegion(segments, [2000, 800, 500, 120], [[0, 0], [50, -40], [300, -200], [-150, 90]], 0x7e3);
+
+  it("per-tile mass is conserved at every level (bitwise), and each tile root's COM matches its segment's stats", () => {
+    const { pyramid, table, release } = buildPyramid(device, positions, segments, 32);
+    const atlas = pyramid.atlas;
+    expect(atlas.tiles.map((t) => t && [t.x, t.y, t.side])).toEqual([[0, 0, 64], null, [64, 0, 64], [0, 64, 16]]);
+    const stats = readbackRgbaFbo(device, table.stats);
+    const levels = atlas.levels.map((_, l) => readLevel(device, pyramid, l));
+
+    // Nothing lands outside the tiles: level 0 holds exactly the tiled slots (the exact segment's are clipped).
+    let total = 0;
+    const l0 = levels[0];
+    if (!l0) throw new Error("no level 0");
+    for (let t = 2; t < l0.data.length; t += 4) total += l0.data[t] ?? 0;
+    expect(total).toBe(3000 + 1500 + 200);
+
+    atlas.tiles.forEach((tile, s) => {
+      if (!tile) return;
+      const seg = segments[s];
+      if (!seg) throw new Error(`no segment ${s}`);
+      const root = Math.log2(tile.side);
+      let maxOccupancy = 0;
+      let sumX = 0, sumY = 0, mass = 0;
+      for (let l = 0; l <= root; l++) {
+        const lvl = levels[l];
+        if (!lvl) throw new Error(`no level ${l}`);
+        sumX = 0; sumY = 0; mass = 0;
+        for (let y = tile.y >> l; y < (tile.y + tile.side) >> l; y++) {
+          for (let x = tile.x >> l; x < (tile.x + tile.side) >> l; x++) {
+            const o = (y * lvl.width + x) * 4;
+            sumX += lvl.data[o] ?? 0;
+            sumY += lvl.data[o + 1] ?? 0;
+            const m = lvl.data[o + 2] ?? 0;
+            mass += m;
+            if (l === 0) maxOccupancy = Math.max(maxOccupancy, m);
+          }
+        }
+        // Integer sums below 2²⁴ are exact in float32, whatever the add order: bitwise.
+        expect(mass, `segment ${s}, level ${l}`).toBe(seg.count);
+      }
+      // At the root the loop above read exactly one cell: the tile's totals.
+      const n = stats[s * 4 + 3] ?? 0;
+      expect(n).toBe(seg.count);
+      let absX = 0, absY = 0;
+      for (let i = seg.start; i < seg.start + seg.count; i++) {
+        absX += Math.abs(positions[i * 2] ?? 0);
+        absY += Math.abs(positions[i * 2 + 1] ?? 0);
+      }
+      // Combined bound of both add trees (§6.1, §9): the range query's cover depth plus the pyramid's
+      // (the level-0 blend chain of the fullest cell, then 3 adds per reduce level), and a rounding for
+      // each division.
+      const depth = coverDepth(canonicalCover(seg.start, seg.count)) + maxOccupancy + 3 * root + 2;
+      expect(Math.abs(sumX / mass - (stats[s * 4] ?? 0) / n)).toBeLessThanOrEqual((depth * EPS * absX) / n);
+      expect(Math.abs(sumY / mass - (stats[s * 4 + 1] ?? 0) / n)).toBeLessThanOrEqual((depth * EPS * absY) / n);
+    });
+    release();
+  });
+
+  it("writing a packed level leaves the other levels of its texture unchanged (the clear rule, §6)", () => {
+    // Fill Podd / Peven with a sentinel first, then snapshot both after every pass of the build (it
+    // submits once per pass: the scatter, then one reduce per level ℓ ≥ 1). The pass that writes
+    // level ℓ may change only ℓ's rectangle: every other texel of both textures — levels ℓ ± 2 in the
+    // same texture included — must be bitwise what it was before that pass. So no pass cleared its
+    // texture (luma's default clear ignores the viewport) or wrote past its rectangle. After the
+    // build every texel outside the rectangles still holds the sentinel, and every level is the 2×2
+    // reduce of the level below.
+    const SENTINEL = 12345.5;
+    type Snapshot = Readonly<Record<"odd" | "even", Float32Array>>;
+    for (const [segs, exactMax] of [[segmentsOf([5000]), 0], [segmentsOf([3000, 200]), 32]] as const) {
+      const pos = sharedRegion(segs, [1500, 300], [[0, 0], [100, 100]], 0x5e17);
+      const snapshots: Snapshot[] = [];
+      let watched: GridPyramid | null = null;
+      const snapshot = (p: GridPyramid): Snapshot => ({
+        odd: readbackRgbaFbo(device, p.textures.odd),
+        even: readbackRgbaFbo(device, p.textures.even),
+      });
+      const submit = device.submit;
+      const spy = vi.spyOn(device, "submit").mockImplementation((commandBuffer) => {
+        submit.call(device, commandBuffer);
+        if (watched) snapshots.push(snapshot(watched));
+      });
+      let built: BuiltPyramid;
+      try {
+        built = buildPyramid(device, pos, segs, exactMax, (p) => {
+          for (const tex of [p.textures.odd, p.textures.even]) {
+            tex.writeData(new Float32Array(tex.width * tex.height * 4).fill(SENTINEL));
+          }
+          snapshots.push(snapshot(p));
+          watched = p;
+        });
+      } finally {
+        spy.mockRestore();
+      }
+      const { pyramid, release } = built;
+      const atlas = pyramid.atlas;
+      expect(atlas.levels.length).toBeGreaterThanOrEqual(5); // levels ℓ and ℓ ± 2 share a texture
+      // The fill, the scatter, then one reduce per coarser level.
+      expect(snapshots.length).toBe(atlas.levels.length + 1);
+      for (let p = 1; p < snapshots.length; p++) {
+        const before = snapshots[p - 1];
+        const after = snapshots[p];
+        if (!before || !after) throw new Error(`no snapshot around pass ${p - 1}`);
+        // Pass 0 is the scatter (it writes L0 only); pass p ≥ 1 writes level p.
+        const written = p === 1 ? null : pyramid.level(p - 1);
+        for (const which of ["odd", "even"] as const) {
+          const tex = pyramid.textures[which];
+          const a = new Uint32Array(before[which].buffer);
+          const b = new Uint32Array(after[which].buffer);
+          let changed = 0;
+          for (let y = 0; y < tex.height; y++) {
+            for (let x = 0; x < tex.width; x++) {
+              const inside = written !== null && written.texture === which &&
+                x >= written.x && x < written.x + written.width && y >= written.y && y < written.y + written.height;
+              if (inside) continue;
+              const o = (y * tex.width + x) * 4;
+              for (let ch = 0; ch < 4; ch++) if (a[o + ch] !== b[o + ch]) changed++;
+            }
+          }
+          expect(changed, `pass ${p - 1} changed ${which} texels outside its level's rectangle`).toBe(0);
+        }
+      }
+      for (const which of ["odd", "even"] as const) {
+        const tex = pyramid.textures[which];
+        const all = readbackRgbaFbo(device, tex);
+        const rects = atlas.levels.filter((l) => l.texture === which);
+        let untouched = 0;
+        for (let y = 0; y < tex.height; y++) {
+          for (let x = 0; x < tex.width; x++) {
+            if (rects.some((r) => x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height)) continue;
+            for (let ch = 0; ch < 4; ch++) expect(all[(y * tex.width + x) * 4 + ch]).toBe(SENTINEL);
+            untouched++;
+          }
+        }
+        expect(untouched).toBeGreaterThan(0); // the column leaves free texels: the check is not vacuous
+      }
+      for (let l = 1; l < atlas.levels.length; l++) {
+        const below = readLevel(device, pyramid, l - 1);
+        const lvl = readLevel(device, pyramid, l);
+        const expected = reduce2x2(below.data, lvl.width, lvl.height);
+        // A compiler may add a + b + c + d in another order than the reference's left fold. Two orders
+        // of a 4-term float32 sum differ by at most ~3ε·Σ|term|, so the bound scales with the children's
+        // magnitudes, not the result's: a 2×2 block straddling x = 0 (children +5 and −4) cancels.
+        const magnitude = reduce2x2(below.data.map(Math.abs), lvl.width, lvl.height);
+        for (let k = 0; k < expected.length; k++) {
+          const e = expected[k] ?? 0;
+          if (k % 4 === 2) expect(lvl.data[k], `level ${l} mass`).toBe(e); // integers: exact
+          else expect(Math.abs((lvl.data[k] ?? 0) - e), `level ${l}`).toBeLessThanOrEqual(4 * EPS * (magnitude[k] ?? 0) + 1e-30);
+        }
+      }
+      release();
+    }
+  });
+
+  it("the feedback-loop probe (§6.2.3): a mipmap-filtered read of level ℓ with level ℓ + 1 attached is a loop; raw base/max clamps lift it", () => {
+    const r = feedbackLoopProbe();
+    console.log(`  §6.2.3 probe: ${JSON.stringify(r)}`);
+    // (a) A mipmap filter samples every level in [base, max], so reading level 1 while level 2 is
+    //     attached is a feedback loop: the draw is rejected.
+    expect(r.mipFiltered.error).toBe(WebGL2RenderingContext.INVALID_OPERATION);
+    // (c) TEXTURE_BASE_LEVEL = TEXTURE_MAX_LEVEL = 1 (raw GL; luma exposes neither) excludes level 2.
+    expect(r.clamped.error).toBe(WebGL2RenderingContext.NO_ERROR);
+    expect(r.clamped.sum).toBe(10);
+    // (b) — a non-mipmap filter, where the sampled range is only the base level — is logged, not
+    //     asserted: it ran with the correct sum on the devices measured for #354 (see the PR), but the
+    //     filter-dependent range is ANGLE's reading of the rule, not a WebGL2 guarantee. Packed levels
+    //     (Q2) depend on neither.
+  });
+});
+
+/** One probe draw: the GL error it raised and the value it wrote into level 2. */
+interface ProbeDraw {
+  error: number;
+  sum: number;
+}
+
+/**
+ * §6.2.3's probe, in raw WebGL2 on its own context. The rejected alternative to packed levels reduces
+ * level ℓ into level ℓ + 1 of ONE mip-mapped texture. Here: a 4×4 `rgba32f` texture with 3 levels,
+ * level 1 = (1, 2, 3, 4), level 2 (1×1) attached, and a pass that sums level 1's 2×2 texels —
+ * (a) through a mipmap filter at `texelFetch` lod 1, (b) through a non-mipmap filter at lod 1, and
+ * (c) with raw `TEXTURE_BASE_LEVEL = TEXTURE_MAX_LEVEL = 1` at lod 0. luma sets none of the three
+ * level parameters, so only (a) and (b) are reachable without a raw-GL seam.
+ */
+function feedbackLoopProbe(): { mipFiltered: ProbeDraw; nearestLod1: ProbeDraw; clamped: ProbeDraw } {
+  const gl = document.createElement("canvas").getContext("webgl2");
+  if (!gl || !gl.getExtension("EXT_color_buffer_float")) throw new Error("probe: no WebGL2 float render targets");
+  const tex = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, tex);
+  gl.texStorage2D(gl.TEXTURE_2D, 3, gl.RGBA32F, 4, 4);
+  gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, 4, 4, gl.RGBA, gl.FLOAT, new Float32Array(64));
+  gl.texSubImage2D(gl.TEXTURE_2D, 1, 0, 0, 2, 2, gl.RGBA, gl.FLOAT, new Float32Array([1, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0, 4, 0, 0, 0]));
+  gl.texSubImage2D(gl.TEXTURE_2D, 2, 0, 0, 1, 1, gl.RGBA, gl.FLOAT, new Float32Array(4));
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+  const fbo = gl.createFramebuffer();
+  gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 2);
+  if (gl.checkFramebufferStatus(gl.FRAMEBUFFER) !== gl.FRAMEBUFFER_COMPLETE) throw new Error("probe: incomplete FBO");
+  const program = (lod: number): WebGLProgram => {
+    const vs = gl.createShader(gl.VERTEX_SHADER);
+    const fs = gl.createShader(gl.FRAGMENT_SHADER);
+    const prog = gl.createProgram();
+    if (!vs || !fs || !prog) throw new Error("probe: could not create the program");
+    gl.shaderSource(vs, "#version 300 es\nvoid main(){vec2 p=vec2(float((gl_VertexID&1)<<2),float((gl_VertexID&2)<<1))-1.0;gl_Position=vec4(p,0,1);}");
+    gl.shaderSource(fs, `#version 300 es\nprecision highp float;uniform highp sampler2D u_src;out vec4 o;
+      void main(){o=texelFetch(u_src,ivec2(0,0),${lod})+texelFetch(u_src,ivec2(1,0),${lod})+texelFetch(u_src,ivec2(0,1),${lod})+texelFetch(u_src,ivec2(1,1),${lod});}`);
+    gl.compileShader(vs);
+    gl.compileShader(fs);
+    gl.attachShader(prog, vs);
+    gl.attachShader(prog, fs);
+    gl.linkProgram(prog);
+    if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) throw new Error(`probe: link failed ${gl.getProgramInfoLog(prog)}`);
+    return prog;
+  };
+  const lod1 = program(1);
+  const lod0 = program(0);
+  gl.viewport(0, 0, 1, 1);
+  const draw = (prog: WebGLProgram): ProbeDraw => {
+    while (gl.getError() !== gl.NO_ERROR) { /* drain */ }
+    gl.clearColor(-1, 0, 0, 0);
+    gl.clear(gl.COLOR_BUFFER_BIT);
+    gl.useProgram(prog);
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+    const error = gl.getError();
+    const px = new Float32Array(4);
+    gl.readPixels(0, 0, 1, 1, gl.RGBA, gl.FLOAT, px);
+    return { error, sum: px[0] ?? Number.NaN };
+  };
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST_MIPMAP_NEAREST);
+  const mipFiltered = draw(lod1);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+  const nearestLod1 = draw(lod1);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_BASE_LEVEL, 1);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAX_LEVEL, 1);
+  const clamped = draw(lod0);
+  gl.getExtension("WEBGL_lose_context")?.loseContext();
+  return { mipFiltered, nearestLod1, clamped };
+}
+
+/** Sampler types a fragment or vertex shader can declare in WebGL2. */
+const SAMPLER_TYPES = new Set<GLenum>([
+  WebGL2RenderingContext.SAMPLER_2D, WebGL2RenderingContext.INT_SAMPLER_2D, WebGL2RenderingContext.UNSIGNED_INT_SAMPLER_2D,
+  WebGL2RenderingContext.SAMPLER_3D, WebGL2RenderingContext.SAMPLER_CUBE, WebGL2RenderingContext.SAMPLER_2D_ARRAY,
+  WebGL2RenderingContext.INT_SAMPLER_3D, WebGL2RenderingContext.UNSIGNED_INT_SAMPLER_3D,
+  WebGL2RenderingContext.INT_SAMPLER_2D_ARRAY, WebGL2RenderingContext.UNSIGNED_INT_SAMPLER_2D_ARRAY,
+  WebGL2RenderingContext.SAMPLER_2D_SHADOW, WebGL2RenderingContext.SAMPLER_2D_ARRAY_SHADOW, WebGL2RenderingContext.SAMPLER_CUBE_SHADOW,
+]);
+
+/** The active sampler uniforms of every program that draws while `run` executes. */
+function samplersPerProgram(run: () => void): string[][] {
+  const proto = WebGL2RenderingContext.prototype;
+  const orig = proto.drawArrays;
+  const seen = new Map<WebGLProgram, string[]>();
+  proto.drawArrays = function (this: WebGL2RenderingContext, mode: GLenum, first: GLint, count: GLsizei): void {
+    const program: WebGLProgram | null = this.getParameter(this.CURRENT_PROGRAM);
+    if (program && !seen.has(program)) {
+      const names: string[] = [];
+      const n: number = this.getProgramParameter(program, this.ACTIVE_UNIFORMS);
+      for (let i = 0; i < n; i++) {
+        const info = this.getActiveUniform(program, i);
+        if (info && SAMPLER_TYPES.has(info.type)) names.push(info.name);
+      }
+      seen.set(program, names.sort());
+    }
+    orig.call(this, mode, first, count);
+  };
+  try {
+    run();
+  } finally {
+    proto.drawArrays = orig;
+  }
+  return [...seen.values()];
+}
+
+describe("GPU tile pyramid — texture-unit budget (spec §6.2.5)", () => {
+  let device: Device;
+  beforeAll(async () => { device = await makeTestDevice(); });
+
+  it("every pass of a tick binds at most 11 samplers; the traversal needs 3 pyramid textures, not one per level", () => {
+    const limit: number = document.createElement("canvas").getContext("webgl2")?.getParameter(WebGL2RenderingContext.MAX_TEXTURE_IMAGE_UNITS) ?? 16;
+    const params = { repulsion: 200, attraction: 0.05, centering: 0.2, alpha: 0.05, theta: 0.7 };
+    const cases: { label: string; graph: LayoutGraph; segments?: SlotRange[]; exactMax?: number; traversal: number | null }[] = [
+      // Flat pyramid: pos, segInfo, segParam, segBox, L0, Podd, Peven (the single-texture pyramid bound 13).
+      { label: "flat pyramid", graph: makeRandomGraph(20_000, 4000, 0x71e5), traversal: 7 },
+      { label: "flat exact", graph: makeRandomGraph(1000, 1000, 0x71e6), traversal: null },
+      // Many segments add slotSeg.
+      { label: "segmented, tiles + exact", graph: buildGraph({ nodeCount: 3220, source: [], target: [] }), segments: segmentsOf([3000, 20, 200]), exactMax: 32, traversal: 8 },
+    ];
+    for (const c of cases) {
+      const layout = new GpuForceLayout(device, c.graph, params, {
+        ...(c.segments ? { segments: c.segments } : {}),
+        ...(c.exactMax !== undefined ? { exactMax: c.exactMax } : {}),
+      });
+      const programs = samplersPerProgram(() => layout.runFrame(1));
+      layout.destroy();
+      const counts = programs.map((p) => p.length);
+      console.log(`  ${c.label}: samplers per program ${JSON.stringify(counts)}`);
+      for (const p of programs) {
+        expect(p.length, p.join(",")).toBeLessThanOrEqual(11);
+        expect(p.length).toBeLessThanOrEqual(limit);
+        expect(p.some((name) => name.startsWith("u_level")), p.join(",")).toBe(false);
+      }
+      const traversal = programs.find((p) => p.includes("u_L0"));
+      if (c.traversal === null) {
+        expect(traversal).toBeUndefined();
+      } else {
+        expect(traversal?.length, traversal?.join(",")).toBe(c.traversal);
+      }
+    }
   });
 });

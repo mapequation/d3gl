@@ -1,39 +1,71 @@
 import type { Device, Texture, Framebuffer, RenderPass } from "@luma.gl/core";
 import type { ForceParams, LayoutGraph } from "../force.js";
 import { Cooling, DAMPING, equilibriumSpacing, springStabilizers, stepCap } from "../force.js";
-import { buildCSR } from "../graph.js";
-import { atlasWidth, pingPong, packUintTexture } from "./textures.js";
+import { atlasWidth, pingPong } from "./textures.js";
 import { PositionReadback } from "./position-readback.js";
 import { IntegratePass } from "./passes/integrate.js";
-import { AttractionPass } from "./passes/attraction.js";
-import { RepulsionAllPairsPass } from "./passes/repulsion-allpairs.js";
-import { RepulsionPyramidPass } from "./passes/repulsion-pyramid.js";
+import { GpuSprings } from "./springs.js";
+import { RepulsionPass } from "./passes/repulsion.js";
 import { GridPyramid } from "./passes/grid-pyramid.js";
 import { CenteringPass } from "./passes/centering.js";
 import { beginPass } from "./passes/fullscreen.js";
 import { SegmentedReduce } from "./passes/segmented-reduce.js";
-import { SegmentTable } from "./segment-table.js";
-import { flatSegments } from "./segments.js";
+import { SegmentTable, type SegmentRow } from "./segment-table.js";
+import {
+  FLAT_TILE_MIN_SIDE,
+  TILE_MIN_SIDE,
+  assertAtlasFits,
+  assertSegmentLocalEdges,
+  flatSegments,
+  packTiles,
+  segmentSoftening,
+  slotSegments,
+  validateSegments,
+  type SegmentFrame,
+  type SlotRange,
+} from "./segments.js";
 
 // DAMPING is imported from force.ts so both integrators share one constant.
 
 /**
- * Node-count threshold for the repulsion algorithm. At or below this many nodes
- * the exact all-pairs O(n²) pass runs (cheap at small N and bit-for-bit the
- * correctness/parity baseline every existing test relies on); above it the
- * Barnes-Hut grid-pyramid pass (O(n log n)) runs. 4096 keeps the all-pairs cost
- * bounded (~16.7M pair terms) while covering all current tiny-N tests.
+ * The flat layout's `exactMax` — the node-count threshold for the repulsion algorithm. At or below
+ * this many nodes the exact all-pairs O(n²) loop runs (cheap at small N and bit-for-bit the
+ * correctness/parity baseline every existing test relies on); above it the Barnes-Hut grid-pyramid
+ * traversal (O(n log n)) runs. 4096 keeps the all-pairs cost bounded (~16.7M pair terms) while
+ * covering all current tiny-N tests.
  */
 export const GPU_REPULSION_ALLPAIRS_MAX = 4096;
 
 /** Optional overrides for {@link GpuForceLayout} (test/tuning hooks). */
 export interface GpuForceLayoutOptions {
   /**
-   * Force a repulsion algorithm regardless of node count:
-   *   "allpairs" — exact O(n²);  "pyramid" — Barnes-Hut grid pyramid.
-   * Omitted → auto-select by {@link GPU_REPULSION_ALLPAIRS_MAX}.
+   * Force a repulsion algorithm for every segment regardless of its size — shorthand for
+   * {@link exactMax}, and it takes precedence over it:
+   *   "allpairs" — exact O(k²) (`exactMax: Infinity`);  "pyramid" — Barnes-Hut tiles (`exactMax: 0`).
+   * Omitted → {@link exactMax}.
    */
   repulsionMode?: "allpairs" | "pyramid";
+  /**
+   * The largest segment solved by the exact loop; every larger segment gets a pyramid tile and the
+   * Barnes-Hut traversal (spec §6.2.1). Default {@link GPU_REPULSION_ALLPAIRS_MAX} (the flat layout's
+   * 4096); the nested layout uses 32, the CPU `EXACT_MAX`.
+   */
+  exactMax?: number;
+  /**
+   * The segments (#333): contiguous slot ranges `[start, start + count)` covering every node in order.
+   * Forces never cross a segment: repulsion, springs and centering act only between the slots of one
+   * segment, and every segment is centred on its own centroid. Default: one segment over every node —
+   * the flat layout. The node ids are the slots (identity permutation), and an edge whose endpoints lie
+   * in different segments is rejected.
+   */
+  segments?: readonly SlotRange[];
+  /**
+   * The frame the segments are solved in, which sets each segment's repulsion softening
+   * ({@link segmentSoftening}): `"world"` (default) keeps the flat 1e-2 on both paths; `"unit"` (a
+   * segment solved in a unit disc, as the nested layout does) uses 1e-9 on the exact loop and 1e-8 on
+   * the tiles.
+   */
+  frame?: SegmentFrame;
   /**
    * Override the per-tick displacement clamp (world units). By default it is STEP_CAP equilibrium
    * spacings ({@link stepCap}, shared with the CPU integrator); only a model without an equilibrium
@@ -61,16 +93,27 @@ export class GpuForceLayout {
   private readonly height: number;
   private readonly params: ForceParams;
   private readonly integratePass: IntegratePass;
-  private readonly attractionPass: AttractionPass;
-  private readonly repulsionPass: RepulsionAllPairsPass;
+  /**
+   * The springs (#350): the CSR textures, the hub chunk table and the row-gather + hub-chunk passes.
+   * Every CSR entry is gathered once per tick; no fragment loops more than `SPRING_CHUNK` times (up to
+   * degree `SPRING_CHUNK · HUB_CHUNK`).
+   */
+  private readonly springs: GpuSprings;
+  /** Repulsion per segment: the tile-root traversal for tiled segments, the exact loop for the rest. */
+  private readonly repulsionPass: RepulsionPass;
   private readonly centeringPass: CenteringPass;
 
   /**
-   * The segment table — S = 1 for the flat layout: one segment `[0, count)` whose `stats`
-   * `(Σx, Σy, Σ|v|, count)` feed centering and whose `box` feeds the pyramid, both written each tick
-   * by {@link reduce}.
+   * The segment table — S = 1 for the flat layout: one segment `[0, count)`. Each segment's `stats`
+   * `(Σx, Σy, Σ|v|, count)` feed centering and its `box` feeds its pyramid tile, both written each tick
+   * by {@link reduce}; `info` and `param` hold its slots, tile, strengths and softening.
    */
   private readonly segments: SegmentTable;
+  /**
+   * The segment id of every slot (`r32uint`, the slot atlas), or `null` for a single segment — then
+   * the id is a compile-time constant and the flat layout pays nothing for segments (spec §5.3).
+   */
+  private readonly slotSeg: Texture | null;
   /**
    * Contention-free segmented reduction (16-ary gather tree + range query) — replaced the two 1-px
    * point scatters (centroid, bbox) that serialised every node on one texel.
@@ -78,15 +121,12 @@ export class GpuForceLayout {
   private readonly reduce: SegmentedReduce;
 
   /**
-   * Barnes-Hut repulsion — used when {@link usePyramid} is true. The pyramid
-   * (regular-quadtree COM/mass) is rebuilt each tick before the force pass; the
-   * pyramid repulsion pass then traverses it per node. Both are pre-created in
-   * the constructor (all their textures/FBOs too) so ticking allocates nothing.
+   * The tile-atlas grid pyramid (one regular-quadtree COM/mass tile per segment above `exactMax`), or
+   * `null` when every segment is exact. Rebuilt each tick before the force pass; the repulsion pass
+   * then traverses the tile of each node's segment. Pre-created in the constructor (all its textures
+   * and FBOs too) so ticking allocates nothing.
    */
-  private readonly pyramid: GridPyramid;
-  private readonly repulsionPyramidPass: RepulsionPyramidPass;
-  /** Whether this layout uses the BH pyramid (else exact all-pairs). */
-  private readonly usePyramid: boolean;
+  private readonly pyramid: GridPyramid | null;
 
   /**
    * Maximum displacement per tick — STEP_CAP equilibrium spacings, the same {@link stepCap} the CPU
@@ -164,15 +204,6 @@ export class GpuForceLayout {
   /** Scratch for a single-texel (x, y) position sub-upload into the read-side position texture. */
   private readonly heldScratch = new Float32Array(2);
 
-  /** CSR offset texture (r32uint): offsets[0..nodeCount] packed into an atlas. */
-  private readonly offsetsTex: Texture;
-  /** CSR neighbors texture (r32uint): the flat neighbor list packed into an atlas. */
-  private readonly neighborsTex: Texture;
-  /** Atlas width of the offsets texture. */
-  private readonly offWidth: number;
-  /** Atlas width of the neighbors texture. */
-  private readonly nbrWidth: number;
-
   constructor(
     device: Device,
     graph: LayoutGraph,
@@ -183,13 +214,23 @@ export class GpuForceLayout {
     this.count = graph.nodeCount;
     this.params = params;
 
-    // Choose the repulsion algorithm: explicit override, else auto by node count.
-    this.usePyramid =
+    // Segments (flat: one) and the repulsion path of each: segments above exactMax get a pyramid tile.
+    const segments = options.segments ?? flatSegments(this.count);
+    validateSegments(segments, this.count);
+    const singleSegment = segments.length === 1;
+    // Many segments: the slot → segment map, and no spring may cross two segments (isolation). Checked
+    // before the first GPU allocation, so a rejected layout leaks nothing.
+    const slotSeg = singleSegment ? null : slotSegments(segments, this.count);
+    if (slotSeg) assertSegmentLocalEdges(slotSeg, graph.source, graph.target, graph.edgeCount);
+    const exactMax =
       options.repulsionMode === "pyramid"
-        ? true
+        ? 0
         : options.repulsionMode === "allpairs"
-          ? false
-          : this.count > GPU_REPULSION_ALLPAIRS_MAX;
+          ? Infinity
+          : (options.exactMax ?? GPU_REPULSION_ALLPAIRS_MAX);
+    // A single segment keeps the flat grid (chooseGrid's floor of 16); many segments use tiles from 8.
+    const atlas = packTiles(segments, exactMax, singleSegment ? FLAT_TILE_MIN_SIDE : TILE_MIN_SIDE);
+    assertAtlasFits(atlas, device.limits.maxTextureDimension2D);
 
     const width = atlasWidth(this.count);
     const height = Math.ceil(this.count / width);
@@ -258,8 +299,9 @@ export class GpuForceLayout {
     // Per-node spring-stiffness stabilizer (#203): 1/(1+K̃) with K̃ = damping·α·attraction·degree,
     // computed ONCE from the edge list (degrees are static) and sampled by the integrate pass so a
     // high-degree hub's aggregate spring can never turn the integration oscillatory-unstable.
-    // Identical math to the CPU ForceLayout (springStabilizers) — keeps backend parity.
-    const stab = springStabilizers(graph.nodeCount, graph.source, graph.target, graph.edgeCount, params);
+    // Identical math to the CPU ForceLayout (springStabilizers) — keeps backend parity, including the
+    // weighted degree of a layout with spring weights (the springs honour them, #350).
+    const stab = springStabilizers(graph.nodeCount, graph.source, graph.target, graph.edgeCount, params, undefined, graph.springWeight);
     const stabPadded = new Float32Array(width * height).fill(1);
     stabPadded.set(stab);
     this.stabTex = device.createTexture({
@@ -290,48 +332,58 @@ export class GpuForceLayout {
     this.vel.swap();
     this.fbos = [fbo0, fbo1];
 
-    // Build symmetric (undirected) CSR from the graph's directed edge list.
-    // LayoutGraph has source/target; buildCSR inserts both directions, so the
-    // GPU gather over csr.neighbors reproduces force.ts's attraction exactly.
-    const csr = buildCSR(graph.nodeCount, graph.source, graph.target);
+    // Many segments: the slot → segment texture (the map was built and checked above).
+    if (!slotSeg) {
+      this.slotSeg = null;
+    } else {
+      const padded = new Uint32Array(width * height);
+      padded.set(slotSeg);
+      this.slotSeg = device.createTexture({
+        width,
+        height,
+        format: "r32uint",
+        data: padded,
+        mipLevels: 1,
+        sampler: { minFilter: "nearest", magFilter: "nearest" },
+      });
+    }
 
-    // Upload CSR offset and neighbor arrays as r32uint textures — done ONCE in
-    // the constructor, reused every tick.
-    const offResult = packUintTexture(device, csr.offsets);
-    this.offsetsTex = offResult.texture;
-    this.offWidth = offResult.width;
+    // Springs: symmetric CSR + hub chunk table, uploaded ONCE here and reused every tick (#350).
+    this.springs = new GpuSprings(device, graph);
 
-    // neighbors may be empty (no edges) — packUintTexture handles length 0 by
-    // creating a 1×1 zeroed texture, which is never actually fetched.
-    const nbrData = csr.neighbors.length > 0
-      ? csr.neighbors
-      : new Uint32Array(1);
-    const nbrResult = packUintTexture(device, nbrData);
-    this.neighborsTex = nbrResult.texture;
-    this.nbrWidth = nbrResult.width;
-
-    // Segment table (S = 1) + its reduction: every texture, FBO and model created here, once —
-    // ticking allocates nothing (the createFramebuffer / createTexture spy tests stay green).
-    this.segments = new SegmentTable(device, flatSegments(this.count), {
-      repulsion: params.repulsion,
-      centering: params.centering,
-      softening: 1e-2, // the flat layout's absolute softening (repulsion passes, quadtree.ts)
-      alpha0: 1,
+    // Segment table + its reduction: every texture, FBO and model created here, once — ticking
+    // allocates nothing (the createFramebuffer / createTexture spy tests stay green). Each segment's
+    // softening follows its path and frame (flat: the absolute 1e-2 of quadtree.ts on both paths).
+    const frame = options.frame ?? "world";
+    const rows: SegmentRow[] = segments.map((seg, s) => {
+      const tile = atlas.tiles[s] ?? null;
+      return {
+        ...seg,
+        tile,
+        param: {
+          repulsion: params.repulsion,
+          centering: params.centering,
+          softening: segmentSoftening(frame, tile === null),
+          alpha0: 1,
+        },
+      };
     });
+    this.segments = new SegmentTable(device, rows);
     this.reduce = new SegmentedReduce(device, this.count);
 
-    this.integratePass = new IntegratePass(device);
-    this.attractionPass = new AttractionPass(device);
-    this.repulsionPass = new RepulsionAllPairsPass(device);
-    this.centeringPass = new CenteringPass(device);
+    // The tile pyramid, only when some segment has a tile. Pre-created in the constructor (all its
+    // textures + FBOs) so no per-tick allocation.
+    this.pyramid = atlas.levels.length > 0 ? new GridPyramid(device, atlas, singleSegment) : null;
 
-    // Barnes-Hut pyramid + traversal pass. Pre-created in the constructor
-    // (all its level textures + FBOs + bbox target) so no per-tick allocation,
-    // whether or not this layout uses it — cheap for small N and keeps the code
-    // path uniform. The traversal pass is compiled for the pyramid's fixed
-    // levelCount so its stack is a fixed-size array.
-    this.pyramid = new GridPyramid(device, this.count);
-    this.repulsionPyramidPass = new RepulsionPyramidPass(device, this.pyramid.levelCount);
+    this.integratePass = new IntegratePass(device);
+    // Compiled for exactly the paths this layout's segments take (the flat layout: one of the two),
+    // with the traversal stack sized by the pyramid's level count.
+    this.repulsionPass = new RepulsionPass(device, {
+      singleSegment,
+      levelCount: atlas.levels.length,
+      exact: atlas.levels.length === 0 || rows.some((row) => row.tile === null && row.count > 0),
+    });
+    this.centeringPass = new CenteringPass(device, singleSegment);
   }
 
   /** Cool from heat `from` over `ticks` ticks — the CPU {@link ForceLayout.cool} schedule. */
@@ -362,19 +414,22 @@ export class GpuForceLayout {
       this.segments,
     );
 
-    // ── 1b. Build the Barnes-Hut pyramid (only when this layout uses it) ──────
-    // Rebuilds the regular-quadtree COM/mass pyramid over the current positions.
-    // Runs its own render passes (different FBO sizes) and submits internally,
-    // so it must complete before the force pass below reads its level textures.
-    // Skipped entirely on the all-pairs path.
-    if (this.usePyramid) {
-      this.pyramid.build({
-        posTex: this.pos.readTex,
-        boxTex: this.segments.box,
-        count: this.count,
-        width: this.width,
-      });
-    }
+    // ── 1b. Build the tile pyramid (only when some segment has a tile) ──────
+    // Rebuilds every segment's regular-quadtree COM/mass tile over the current positions.
+    // Runs its own render passes and submits internally, so it completes before the force pass below
+    // reads the pyramid. Skipped entirely when every segment takes the exact loop.
+    this.pyramid?.build({
+      posTex: this.pos.readTex,
+      width: this.width,
+      count: this.count,
+      segments: this.segments,
+      slotSeg: this.slotSeg,
+    });
+
+    // ── 1c. Hub spring chunks (#350) ─────────────────────────────────────────
+    // Sums every chunk of a row longer than SPRING_CHUNK into its partial — its own render pass into a
+    // different framebuffer, submitted before the force pass gathers the partials. No-op without hubs.
+    this.springs.prepare(this.pos.readTex, this.width);
 
     // ── 2. Clear force texture to zero ────────────────────────────────────────
     // Open a render pass on the force FBO with clearColor:[0,0,0,0] — this zeros
@@ -385,45 +440,31 @@ export class GpuForceLayout {
     // Fixed order — springs, repulsion, centering. Float addition is not associative, so the ADD
     // blend makes the force bits depend on pass order; keep it stable.
 
-    // Attraction (spring gather over CSR neighbors).
-    this.attractionPass.run(
-      forcePass,
-      this.pos.readTex,
-      this.offsetsTex,
-      this.neighborsTex,
-      {
-        count: this.count,
-        width: this.width,
-        offWidth: this.offWidth,
-        nbrWidth: this.nbrWidth,
-        attraction: this.params.attraction,
-      },
-    );
+    // Attraction (spring gather over CSR rows, plus each hub row's chunk partials).
+    this.springs.draw(forcePass, this.pos.readTex, {
+      count: this.count,
+      width: this.width,
+      attraction: this.params.attraction,
+    });
 
-    // Repulsion. Exact all-pairs O(n²) at/below the threshold (the parity
-    // baseline); Barnes-Hut grid-pyramid O(n log n) above it. Both additive-blend
-    // their per-node force into forceTex.
-    if (this.usePyramid) {
-      this.repulsionPyramidPass.run(forcePass, this.pos.readTex, this.pyramid, this.segments.box, {
-        count: this.count,
-        width: this.width,
-        repulsion: this.params.repulsion,
-        theta: this.params.theta,
-      });
-    } else {
-      this.repulsionPass.run(forcePass, this.pos.readTex, {
-        count: this.count,
-        width: this.width,
-        repulsion: this.params.repulsion,
-      });
-    }
+    // Repulsion within each node's segment: the exact loop at/below exactMax (the parity baseline),
+    // the Barnes-Hut traversal of the segment's tile above it. Additive-blended into forceTex.
+    this.repulsionPass.run(forcePass, {
+      posTex: this.pos.readTex,
+      count: this.count,
+      width: this.width,
+      theta: this.params.theta,
+      segments: this.segments,
+      pyramid: this.pyramid,
+      slotSeg: this.slotSeg,
+    });
 
     // Centering: pull every node toward its segment's centroid (the reduction's stats above) with
     // the segment's centering strength.
     this.centeringPass.run(forcePass, this.pos.readTex, this.segments, {
       count: this.count,
       width: this.width,
-    });
+    }, this.slotSeg);
 
     forcePass.end();
     this.device.submit();
@@ -550,19 +591,17 @@ export class GpuForceLayout {
     this.forceFbo.destroy();
     this.pinnedTex.destroy();
     this.stabTex.destroy();
+    this.slotSeg?.destroy();
     this.segments.destroy();
     this.reduce.destroy();
     this.fbos[0].destroy();
     this.fbos[1].destroy();
     this.readFbos[0].destroy();
     this.readFbos[1].destroy();
-    this.offsetsTex.destroy();
-    this.neighborsTex.destroy();
+    this.springs.destroy();
     this.integratePass.destroy();
-    this.attractionPass.destroy();
     this.repulsionPass.destroy();
     this.centeringPass.destroy();
-    this.pyramid.destroy();
-    this.repulsionPyramidPass.destroy();
+    this.pyramid?.destroy();
   }
 }

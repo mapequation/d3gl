@@ -61,7 +61,8 @@ interface Reduced {
 function reduceOnGpu(device: Device, slots: SlotData, ranges: readonly SlotRange[]): Reduced {
   const posTex = slotTexture(device, slots.pos, slots.width, slots.count);
   const velTex = slotTexture(device, slots.vel, slots.width, slots.count);
-  const table = new SegmentTable(device, ranges, { repulsion: 0, centering: 0, softening: 0, alpha0: 1 });
+  const param = { repulsion: 0, centering: 0, softening: 0, alpha0: 1 };
+  const table = new SegmentTable(device, ranges.map((r) => ({ ...r, tile: null, param })));
   const reduce = new SegmentedReduce(device, slots.count);
   reduce.run({ pos: posTex, vel: velTex, posWidth: slots.width, count: slots.count }, table);
   const out = { stats: readbackRgbaFbo(device, table.stats), box: readbackRgbaFbo(device, table.box) };

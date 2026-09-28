@@ -14,17 +14,25 @@ export interface CSR {
   neighbors: Uint32Array;
   /** Per-node neighbor count; length `nodeCount`. */
   degree: Uint32Array;
+  /**
+   * Per-entry weight parallel to `neighbors` (the weight of the edge each entry came from), present
+   * only when {@link buildCSR} was given edge weights — the GPU layout's weighted springs read it.
+   */
+  weights?: Float32Array;
 }
 
 /**
  * Build undirected (symmetric) CSR adjacency from a directed edge list.
  * Each edge contributes to both endpoints, so layout/traversal see the graph
  * as undirected while the directed edges remain available for arrow rendering.
+ * With `weight` (parallel to `source`/`target`), each entry also carries its edge's weight in
+ * `weights`, scattered in the same order as `neighbors`.
  */
 export function buildCSR(
   nodeCount: number,
   source: ArrayLike<number>,
   target: ArrayLike<number>,
+  weight?: ArrayLike<number>,
 ): CSR {
   const edgeCount = source.length;
   const degree = new Uint32Array(nodeCount);
@@ -41,6 +49,7 @@ export function buildCSR(
 
   // Scatter each edge into both endpoints' slices, advancing a per-node cursor.
   const neighbors = new Uint32Array(offsets[nodeCount]!);
+  const weights = weight ? new Float32Array(neighbors.length) : undefined;
   const cursor = offsets.slice(0, nodeCount);
   for (let e = 0; e < edgeCount; e++) {
     const s = source[e]!;
@@ -51,9 +60,14 @@ export function buildCSR(
     const pt = cursor[t]!;
     neighbors[pt] = s;
     cursor[t] = pt + 1;
+    if (weights && weight) {
+      const w = weight[e] ?? 1;
+      weights[ps] = w;
+      weights[pt] = w;
+    }
   }
 
-  return { offsets, neighbors, degree };
+  return weights ? { offsets, neighbors, degree, weights } : { offsets, neighbors, degree };
 }
 
 /** Network graph: directed-edge SoA for rendering + CSR for traversal. */
