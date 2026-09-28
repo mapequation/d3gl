@@ -8,7 +8,8 @@
  * node suite), so keep the deterministic signatures here.
  */
 import { describe, it, expect } from "vitest";
-import { Scene, DEFAULT_CURVE_TOLERANCE, pieToDrawables, instancedVectorLayers } from "../index.js";
+import { Scene, DEFAULT_CURVE_TOLERANCE, anchoredCurveTolerance, pieToDrawables, instancedVectorLayers } from "../index.js";
+import type { GroupBuilder, GroupOptions } from "../index.js";
 import type { InstancedPieData } from "../backend.js";
 
 /** Largest deviation between a closed polyline and the circle of radius `r` about (cx, cy). */
@@ -89,5 +90,99 @@ describe("#45 build-time curve bake", () => {
       DEFAULT_CURVE_TOLERANCE / 40,
     );
     expect(layers[0]?.drawables[0]?.subpaths[0]?.points.length).toBe(fine);
+  });
+});
+
+/** A full-circle arc of radius `r` about (cx, cy), optionally anchored at its centre. */
+function circle(g: GroupBuilder, id: string, r: number, anchored: boolean): void {
+  g.drawable(
+    id,
+    (ctx) => {
+      ctx.moveTo(r, 0);
+      ctx.arc(0, 0, r, 0, Math.PI * 2);
+      ctx.closePath();
+    },
+    anchored ? { anchor: [0, 0] } : undefined,
+  );
+}
+
+/** Recorded vertex count of each drawable of group "g", by id. */
+function vertexCounts(scene: Scene, name = "g"): Map<string | number, number> {
+  return new Map(scene.drawables(name).map((d) => [d.id, d.subpaths.reduce((n, s) => n + s.points.length / 2, 0)]));
+}
+
+/** Build group "g" (one anchored + one unanchored arc) in a Scene of `tolerance`. */
+function mixedGroup(tolerance: number, opts?: GroupOptions): Map<string | number, number> {
+  const scene = new Scene(tolerance);
+  scene.group(
+    "g",
+    (g) => {
+      circle(g, "anchored", 8, true);
+      circle(g, "plain", 8, false);
+    },
+    opts,
+  );
+  return vertexCounts(scene);
+}
+
+describe("#283 anchored screen glyphs bake at a pixel tolerance, not the world one", () => {
+  const FINE = DEFAULT_CURVE_TOLERANCE / 40;
+
+  it("anchoredCurveTolerance floors a screen glyph at the default and leaves world geometry alone", () => {
+    // Screen: the recorded offsets ARE pixels, so anything finer than the default's 0.25px
+    // sagitta is invisible — floored, never refined.
+    expect(anchoredCurveTolerance(FINE, true)).toBe(DEFAULT_CURVE_TOLERANCE);
+    expect(anchoredCurveTolerance(DEFAULT_CURVE_TOLERANCE, true)).toBe(DEFAULT_CURVE_TOLERANCE);
+    // World: the anchor is ignored and the drawable is world-scaled — it keeps the fine bake.
+    expect(anchoredCurveTolerance(FINE, false)).toBe(FINE);
+    // A COARSER setting still coarsens glyphs (a floor, not a replacement): the exemption can
+    // never record more vertices than the plain tolerance would.
+    expect(anchoredCurveTolerance(1, true)).toBe(1);
+    expect(anchoredCurveTolerance(1, false)).toBe(1);
+  });
+
+  it("a group's anchoredTolerance governs ONLY its anchored drawables", () => {
+    const base = mixedGroup(DEFAULT_CURVE_TOLERANCE);
+    const exempt = mixedGroup(FINE, { anchoredTolerance: DEFAULT_CURVE_TOLERANCE });
+    // The acceptance criterion at the Scene seam: same count as the default bake…
+    expect(exempt.get("anchored")).toBe(base.get("anchored"));
+    // …while an unanchored drawable in the SAME group (world-scaled geometry, even in a screen
+    // layer) still refines, as 1/sqrt(tolerance) → ~6.3× at 0.25/40.
+    expect(exempt.get("plain")).toBeGreaterThan((base.get("plain") ?? 0) * 4);
+  });
+
+  it("omitting the group option bakes exactly as before (anchored or not)", () => {
+    const plain = mixedGroup(FINE);
+    const explicit = mixedGroup(FINE, { anchoredTolerance: FINE });
+    expect(plain).toEqual(explicit);
+    expect(plain.get("anchored")).toBe(plain.get("plain"));
+  });
+
+  it("appendToGroup keeps the group's anchored tolerance", () => {
+    const scene = new Scene(FINE);
+    scene.group("g", (g) => circle(g, "first", 8, true), { anchoredTolerance: DEFAULT_CURVE_TOLERANCE });
+    scene.appendToGroup("g", (g) => {
+      circle(g, "appended", 8, true);
+      circle(g, "appended-plain", 8, false);
+    });
+    const counts = vertexCounts(scene);
+    const base = mixedGroup(DEFAULT_CURVE_TOLERANCE);
+    expect(counts.get("first")).toBe(base.get("anchored"));
+    expect(counts.get("appended")).toBe(base.get("anchored"));
+    expect(counts.get("appended-plain")).toBeGreaterThan((base.get("plain") ?? 0) * 4);
+  });
+
+  it("the WebGL pie export floors screen wedges exactly as the Scene does", () => {
+    // `pieToDrawables` is the export twin of a Scene pie: a screen wedge is an anchored glyph
+    // there too, so it must take the same exemption or the WebGL and Canvas/SVG exports of one
+    // network pie diverge (the #45 "same tolerance on both paths" invariant).
+    const base = pieToDrawables(pie(11), true)[0]?.subpaths[0]?.points.length ?? 0;
+    expect(base).toBeGreaterThan(0);
+    expect(pieToDrawables(pie(11), true, FINE)[0]?.subpaths[0]?.points.length).toBe(base);
+    // World-mode wedges are world-scaled: they refine.
+    expect(pieToDrawables(pie(11), false, FINE)[0]?.subpaths[0]?.points.length ?? 0).toBeGreaterThan(base * 4);
+
+    const layers = instancedVectorLayers([{ name: "pies", primitive: "pie", pie: pie(11), sizeMode: "screen" }], 1, FINE);
+    expect(layers[0]?.drawables[0]?.subpaths[0]?.points.length).toBe(base);
   });
 });

@@ -115,17 +115,29 @@ It is **opt-in**, and it is a quality/size dial rather than a free win:
 - **Zero per-frame cost.** The refinement is paid entirely in the one-time bake; nothing about
   `setTransform`, hover, or drag changes.
 - **Segment count grows as `1 / sqrt(tolerance)`** — so `0.25 / 40` is ~6.3x the vertices, and
-  `0.25 / 100` ~10x, **of the curved drawables only**. Straight paths, `rect`s, and
+  `0.25 / 100` ~10x, **of the world-scaled curved drawables only**. Straight paths, `rect`s, and
   `points()` circles cost nothing extra (every backend draws a circle analytically).
-- **Anchored `sizeMode: "screen"` glyphs never needed it.** They are drawn as constant-pixel
-  offsets from their anchor, so their bake is already in screen units and cannot facet — the
-  extra vertices there are spent for nothing. The tolerance is a single per-engine setting, so
-  a chart that mixes anchored screen glyphs with world-space curves pays for both. (A screen
-  `sizeMode` layer **without** anchors is world-scaled geometry and does facet, so it wants the
-  finer bake.)
+- **Anchored `sizeMode: "screen"` glyphs are exempt, automatically.** They are drawn as
+  constant-pixel offsets from their anchor, so their bake is already in screen pixels and cannot
+  facet under zoom. They keep the default's 0.25px bake (or a coarser one, if you set a
+  `curveTolerance` above `0.25`), so a chart that mixes screen pies or symbols with world-space
+  curves pays only for the curves. The rule is per drawable: a screen `sizeMode` layer drawn
+  **without** anchors is world-scaled geometry, so it does facet and it does refine.
+  One consequence: a glyph's bake is sub-pixel on screen, but a `toSVG()` export magnified far
+  past 1:1 shows it as the polygon it is (a 16px pie is a ~13-gon).
 
-A curve-heavy chart of ~4,000 drawables measured 5.4 MB of GPU geometry at the default and
-28.6 MB at `0.25 / 40` — pick the smallest `MAX_ZOOM` your chart actually allows.
+Measured on the [ancestral ranges](/d3gl/examples/ancestral-ranges/) example in the rectangular
+layout with 512 tips (2,208 drawables): the geometry the layers retain (vertex, index, and anchor
+buffers) at the default tolerance and at `curveTolerance: 0.25 / 40`:
+
+| layout | coords | links | geometry at the default | at `0.25 / 40` |
+| --- | --- | --- | --- | --- |
+| rectangular | screen (pies are anchored glyphs) | step (straight) | 1.18 MB | 1.18 MB — nothing refines |
+| radial | screen (pies are anchored glyphs) | step (arcs) | 1.18 MB | 1.29 MB — only the link arcs refine |
+| rectangular | screen (pies are anchored glyphs) | bump (curves) | 1.49 MB | 4.87 MB — only the links refine |
+| rectangular | world (pies scale with zoom) | bump (curves) | 0.98 MB | 5.54 MB — links and pies refine |
+
+Pick the smallest `MAX_ZOOM` your chart actually allows.
 
 ## Engine-specific API
 
