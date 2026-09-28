@@ -152,10 +152,11 @@ function postFrame(type: "frame" | "done", s: FrameSource | null = state, lodFra
   // The per-frame LOD step (#343): refit the coarsening tree in place (cx/cy/extent in the geometry buffer),
   // or rebuild the spatial tree into a frame to transfer (none when nothing moved since the last one).
   const lodFrame = s.lod ? lodFrameStep(s.lod, s.positions, lodFrameId) : null;
-  // A spatial stream held back by back-pressure (#343) posts no frame until a buffer returns and the frame it
-  // skipped is built (`lod-recycle`): the tree is what the engine draws and frames, so its positions — and the
-  // super-edge rows cut for their fit (#433) — travel with it, not ahead of it.
-  if (!lodFrame && type === "frame" && s.lod?.kind === "spatial" && s.lod.pending) return;
+  // A spatial stream held back by back-pressure (#343) posts nothing — no frame, and no `done` — until a buffer
+  // returns and the frame it skipped is built (`lod-recycle`, which posts a held `done` as a `done`): the tree
+  // is what the engine draws and frames, so its positions — and the super-edge rows cut for their fit (#433) —
+  // travel with it, not ahead of it.
+  if (!lodFrame && s.lod?.kind === "spatial" && s.lod.pending) return;
   const message: ProgressMessage = { type, tick: s.tick };
   if (!s.shared) message.positions = s.positions;
   if (s.lod?.kind === "structure" && s.geomBuffer) message.geometry = new Float32Array(s.geomBuffer); // copy-mode snapshot
@@ -430,8 +431,9 @@ addEventListener("message", (e: MessageEvent<MainToWorker>) => {
     case "lod-recycle": {
       // A frame skipped for back-pressure (#343) is built for the current positions once a buffer is back —
       // mid-seed by the next progress frame or the seed frame, which post the seed's positions as they form.
+      // Once the loop has come to rest, the frame it skipped was its `done`.
       const stream = state?.lod ?? seedLOD;
-      if (stream?.kind === "spatial" && recycleSpatialFrame(stream, msg.buffer, msg.rows) && state) postFrame("frame");
+      if (stream?.kind === "spatial" && recycleSpatialFrame(stream, msg.buffer, msg.rows) && state) postFrame(looping ? "frame" : "done");
       return;
     }
     case "coarsen":
