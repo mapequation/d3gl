@@ -14,12 +14,13 @@
  *   stream — live counters of the page's own `lod.ts`, which a real worker's builds never touch — and no
  *   O(edges) link gather (#433): every repaint with the relay's tree reads the super-edge rows the LOD worker
  *   built for the view (`superEdgeStats`: 0 incidences walked, 0 rows computed here, and no row build in this
- *   realm). The frontier stays the spatial one: screen-bounded glyphs.
+ *   realm). The frontier follows the overlap rule (#426): no drawn aggregate whose members clear at its zoom,
+ *   and at most one leaf per viewport pixel (a cold disc start draws every leaf for its first frame).
  * - **Main thread per repaint:** the commit (8 B per node of positions + the O(1) adoption) under a ceiling
  *   split into constant and linear terms. **Against the worker backend** on the same engine, graph and view
  *   (AGENTS lifecycle §5: the baseline the GPU path must not exceed), both from a disc cold start: the same
  *   deterministic per-repaint work on both sides — no main-thread tree build or style pass, no edge
- *   incidence walked, no row computed or built here, a screen-bounded frontier — everywhere; and commit +
+ *   incidence walked, no row computed or built here, the overlap rule's frontier — everywhere; and commit +
  *   repaint within the worker backend's repaint **only on a hardware GPU** (`PERF_REAL_GPU=1`, the tier #392
  *   sets up). On SwiftShader (CI) GL is CPU work competing with the relay's worker for the runner's cores, so
  *   that ratio measured the runner (3.6× on CI against 1.3× locally for the same code) and is only reported.
@@ -156,6 +157,25 @@ interface WorkerRepaint {
   misses: number;
   entries: number;
   glyphs: number;
+  /** Drawn aggregates whose members clear at the repaint's zoom (#426): 0 while the overlap rule holds. */
+  clear: number;
+}
+
+/** The engine's last cut, read for the overlap rule's signature (#426), as network-hierarchy's tests read `lodTree`. */
+interface CutView {
+  lodTree: { leafCount: number; clearZoom: Float32Array } | null;
+  cutFrontier: Uint32Array;
+  transform: { k: number };
+}
+
+/** The drawn aggregates of the last cut whose members' glyphs would not overlap at its zoom — the cut should
+ *  have opened each one (#426). O(drawn). */
+function clearAggregates(net: Network): number {
+  const { lodTree: tree, cutFrontier, transform } = net as unknown as CutView;
+  if (!tree) return 0;
+  let n = 0;
+  for (const g of cutFrontier) if (g >= tree.leafCount && (tree.clearZoom[g] ?? Infinity) <= transform.k) n++;
+  return n;
 }
 
 /** Every animation-frame callback while installed — the worker backend's layout repaints — timed, with the
@@ -171,7 +191,7 @@ function recordAnimationFrames(net: Network): { repaints: WorkerRepaint[]; resto
       } finally {
         const ms = performance.now() - t0;
         const gather = net.superEdgeStats;
-        repaints.push({ ms, source: net.lodSource, visits: gather?.visits ?? -1, misses: gather?.misses ?? -1, entries: gather?.entries ?? -1, glyphs: net.declutterStats?.glyphs ?? -1 });
+        repaints.push({ ms, source: net.lodSource, visits: gather?.visits ?? -1, misses: gather?.misses ?? -1, entries: gather?.entries ?? -1, glyphs: net.declutterStats?.glyphs ?? -1, clear: clearAggregates(net) });
       }
     });
   return { repaints, restore: () => { window.requestAnimationFrame = installed; } };
@@ -208,9 +228,12 @@ describe("GPU layout streaming with the spatial LOD source (#343 × #377) — ne
   const TRANSPORT_P95_MS = perfBudget(4 + 2 * (N / LOCAL_N));
   const ENCODE_MEDIAN_MS = perfBudget(2.5);
   const COMMIT_P95_MS = perfBudget(1 + 1 * (N / LOCAL_N));
-  // The spatial frontier is bounded by the screen (a cut of ~300-600 glyphs at a fit view on web-NotreDame);
-  // the coarsening tree's on this graph is a fifth of the nodes.
-  const MAX_GLYPHS = 3_000;
+  // The frontier the overlap rule (#426) opens: every aggregate whose members' glyphs would not overlap. A glyph
+  // covers at least half a pixel, so the members of one aggregate that open are at least a pixel apart — at most one
+  // leaf per viewport pixel. That is the bound; a web-NotreDame fit view draws ~300-600 glyphs, but a cold disc start
+  // (evenly spaced, nothing overlapping at the fit view) draws every leaf for its first frame. The rule itself is
+  // asserted too: no drawn aggregate whose members clear at the repaint's zoom.
+  const MAX_GLYPHS = W * H;
 
   /** Assert a spatial leg's per-frame signatures and bounds; its per-repaint main-thread ms with the tree drawn. */
   function assertLeg(label: string, frames: SpatialFrame[]): number[] {
@@ -243,10 +266,11 @@ describe("GPU layout streaming with the spatial LOD source (#343 × #377) — ne
     expect(quantile(transport, 0.95)).toBeLessThan(TRANSPORT_P95_MS);
     expect(median(encode)).toBeLessThan(ENCODE_MEDIAN_MS);
     expect(quantile(commit, 0.95)).toBeLessThan(COMMIT_P95_MS);
-    // The frontier stays the spatial one: links from the worker's rows (no super-edge CSR), glyphs screen-bounded.
+    // The frontier stays the spatial one: links from the worker's rows (no super-edge CSR), the overlap rule's glyphs.
     expect(net.lodSource).toBe("worker");
     expect(net.superEdgeStats).not.toBeNull();
-    expect(net.declutterStats?.glyphs ?? Infinity).toBeLessThan(MAX_GLYPHS);
+    expect(net.declutterStats?.glyphs ?? Infinity).toBeLessThanOrEqual(MAX_GLYPHS);
+    expect(clearAggregates(net), `${label}: drawn aggregates whose members clear at this zoom`).toBe(0);
     return perRepaint;
   }
 
@@ -259,7 +283,7 @@ describe("GPU layout streaming with the spatial LOD source (#343 × #377) — ne
 
   // Lifecycle §5 baseline: the worker backend on the same engine, graph and view, from the same disc start, over
   // as many ticks. Everywhere: both sides do the same deterministic work per repaint (no main-thread tree build
-  // or style pass, no edge incidence walked, no row computed or built here, a screen-bounded frontier). On a
+  // or style pass, no edge incidence walked, no row computed or built here, the overlap rule's frontier). On a
   // hardware GPU only (`PERF_REAL_GPU`, #392): the GPU side's commit + repaint within the worker's repaint. Its
   // frames arrive one per posted CPU frame, each coalesced into one animation-frame repaint (its message
   // handler's adoption is left out, so the baseline is if anything low); the margin absorbs the solvers'
@@ -298,7 +322,8 @@ describe("GPU layout streaming with the spatial LOD source (#343 × #377) — ne
     for (const r of withTree) {
       expect(r.visits, `worker backend: a streamed repaint walked ${r.visits} edge incidences on the main thread`).toBe(0);
       expect(r.misses, `worker backend: a streamed repaint computed ${r.misses} rows on the main thread`).toBe(0);
-      expect(r.glyphs, "worker backend: the frontier is the spatial one").toBeLessThan(MAX_GLYPHS);
+      expect(r.glyphs, "worker backend: at most one leaf per viewport pixel").toBeLessThanOrEqual(MAX_GLYPHS);
+      expect(r.clear, "worker backend: drawn aggregates whose members clear at the repaint's zoom").toBe(0);
     }
     const gpu = median(gpuRepaintMs);
     const base = median(withTree.map((r) => r.ms));
