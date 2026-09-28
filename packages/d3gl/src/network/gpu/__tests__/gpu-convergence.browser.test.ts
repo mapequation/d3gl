@@ -331,3 +331,82 @@ describe("GpuForceLayout convergence parity vs CPU", () => {
     expect(Math.abs(meanEdge(gpuPos) / meanEdge(cpuPositions) - 1)).toBeLessThan(0.05);
   });
 });
+
+// ─── hub springs (#350) ─────────────────────────────────────────────────────
+
+/**
+ * Two hubs above the old 4096-neighbour cap — web-NotreDame's largest degree (10,721) and 5,000 — joined
+ * by an edge, each with its leaves in a box offset to one side, so a hub's spring sum is large and does
+ * not cancel. With `weighted`, every edge gets a spring weight in [0.5, 2).
+ */
+function makeHubGraph(weighted: boolean): LayoutGraph {
+  const rng = makePrng(0x4ab5eed);
+  const hubs = [
+    { degree: 10_721, x: 0, y: 0, box: [100, 400, -150, 150] },
+    { degree: 5_000, x: -500, y: 200, box: [-900, -600, 0, 400] },
+  ];
+  const nodeCount = hubs.length + hubs.reduce((n, h) => n + h.degree, 0);
+  const positions = new Float32Array(nodeCount * 2);
+  const src: number[] = [0];
+  const tgt: number[] = [1];
+  let next = hubs.length;
+  hubs.forEach((h, hub) => {
+    positions[hub * 2] = h.x;
+    positions[hub * 2 + 1] = h.y;
+    const [x0 = 0, x1 = 0, y0 = 0, y1 = 0] = h.box;
+    for (let k = 0; k < h.degree; k++, next++) {
+      positions[next * 2] = x0 + rng() * (x1 - x0);
+      positions[next * 2 + 1] = y0 + rng() * (y1 - y0);
+      // Alternate the edge direction so both CSR scatter orders appear in the hub rows.
+      if (k % 2 === 0) { src.push(hub); tgt.push(next); } else { src.push(next); tgt.push(hub); }
+    }
+  });
+  const graph: LayoutGraph = {
+    nodeCount,
+    edgeCount: src.length,
+    source: Uint32Array.from(src),
+    target: Uint32Array.from(tgt),
+    positions,
+  };
+  if (weighted) graph.springWeight = Float32Array.from(src, () => 0.5 + 1.5 * rng());
+  return graph;
+}
+
+describe("GpuForceLayout springs on hubs above the old 4096-neighbour cap (#350)", () => {
+  let device: Device;
+  beforeAll(async () => { device = await makeTestDevice(); });
+
+  // Springs only (no repulsion, no centering): a smooth linear system with no Barnes-Hut decisions, so
+  // the GPU must follow the CPU ForceLayout tick for tick. The capped gather dropped 6,625 of the big
+  // hub's 10,721 springs and 904 of the other's, which moved each hub ~100 units a tick off course.
+  for (const weighted of [false, true]) {
+    it(`${weighted ? "weighted" : "unit"} springs track the CPU tick for tick`, () => {
+      const graph = makeHubGraph(weighted);
+      const params = { repulsion: 0, attraction: 0.05, centering: 0, alpha: 0.2, theta: 0.9 };
+      const p0 = graph.positions.slice();
+
+      const cpuPositions = p0.slice();
+      const cpu = new ForceLayout({ ...graph, positions: cpuPositions }, params);
+      const gpu = new GpuForceLayout(device, { ...graph, positions: p0.slice() }, params);
+      const gpuPos = new Float32Array(graph.nodeCount * 2);
+      const TICKS = 10;
+      for (let t = 0; t < TICKS; t++) cpu.tick();
+      gpu.runFrame(TICKS);
+      gpu.readPositions(gpuPos);
+      gpu.destroy();
+
+      let maxErr = 0, maxMove = 0;
+      for (let i = 0; i < graph.nodeCount; i++) {
+        const ex = (gpuPos[i * 2] ?? NaN) - (cpuPositions[i * 2] ?? NaN);
+        const ey = (gpuPos[i * 2 + 1] ?? NaN) - (cpuPositions[i * 2 + 1] ?? NaN);
+        maxErr = Math.max(maxErr, Math.hypot(ex, ey));
+        maxMove = Math.max(maxMove, Math.hypot((cpuPositions[i * 2] ?? 0) - (p0[i * 2] ?? 0), (cpuPositions[i * 2 + 1] ?? 0) - (p0[i * 2 + 1] ?? 0)));
+      }
+      const hubErr = Math.hypot((gpuPos[0] ?? NaN) - (cpuPositions[0] ?? NaN), (gpuPos[1] ?? NaN) - (cpuPositions[1] ?? NaN));
+      console.log(`  [hub springs${weighted ? ", weighted" : ""}] maxErr=${maxErr.toExponential(2)} hubErr=${hubErr.toExponential(2)} maxMove=${maxMove.toFixed(1)}`);
+      expect(Number.isFinite(maxErr)).toBe(true);
+      // Float32 storage on both sides; measured errors are orders of magnitude below this.
+      expect(maxErr).toBeLessThan(1e-3 * maxMove);
+    });
+  }
+});
