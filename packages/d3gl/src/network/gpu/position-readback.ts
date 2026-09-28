@@ -6,7 +6,8 @@
  * - Where `RG/FLOAT` is the implementation read format (`deviceReadsRG`; ANGLE Metal), it reads that: 8
  *   bytes per atlas texel, and the first `count` texels are the positions (the padding is at the end).
  * - Elsewhere it reads `RGBA/FLOAT`, the format WebGL2 guarantees for float colour buffers, into a scratch
- *   of `width × height × 4` floats allocated once per reader, then compacts (x, y) out of each texel: 16
+ *   of `width × height × 4` floats allocated on the first read and retained (so a streaming layout, which
+ *   reads through a fenced PBO instead, #352, never allocates it), then compacts (x, y) out of each texel: 16
  *   bytes per texel plus an O(count) loop. Reading `RG/FLOAT` there is an INVALID_OPERATION that writes
  *   nothing, so the positions would silently stay zero.
  *
@@ -24,15 +25,17 @@ export class PositionReadback {
   private readonly device: Device;
   private readonly width: number;
   private readonly height: number;
-  /** `RGBA/FLOAT` scratch (`width × height × 4` floats), or `null` where `RG/FLOAT` is the read format. */
-  private readonly rgba: Float32Array | null;
+  /** Whether this device reads `rg32f` as `RG/FLOAT`; otherwise reads go through {@link rgba}. */
+  private readonly readsRG: boolean;
+  /** `RGBA/FLOAT` scratch (`width × height × 4` floats), allocated on the first `RGBA/FLOAT` read. */
+  private rgba: Float32Array | null = null;
 
   /** A reader for `width × height` `rg32float` atlases on `device`. The read format is probed once per device. */
   constructor(device: Device, width: number, height: number) {
     this.device = device;
     this.width = width;
     this.height = height;
-    this.rgba = deviceReadsRG(device) ? null : new Float32Array(width * height * 4);
+    this.readsRG = deviceReadsRG(device);
   }
 
   /**
@@ -40,8 +43,9 @@ export class PositionReadback {
    * wrap a `width × height` `rg32float` texture, and `out` must hold at least `2 · count` floats.
    */
   read(fbo: Framebuffer, count: number, out: Float32Array): void {
-    const { device, width, height, rgba } = this;
-    if (rgba) {
+    const { device, width, height } = this;
+    if (!this.readsRG) {
+      const rgba = (this.rgba ??= new Float32Array(width * height * 4));
       device.readPixelsToArrayWebGL(fbo, {
         sourceX: 0,
         sourceY: 0,
