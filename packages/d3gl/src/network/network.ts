@@ -14,7 +14,7 @@ import { physicalPieWedges, type PhysicalPieWedges, type PieWedgeOptions } from 
 import { rosettePositions } from "./rosette.js";
 import { gatherCandidates, descendingByKey, descendingInListOrder, CandidateList, type CandidateSource } from "./label-candidates.js";
 import type { StateNetworkGraph } from "./state-graph.js";
-import { startNestedWorkerLayout, startWorkerLayout, type StreamedLODTree, type WorkerLayoutHandle } from "./worker-transport.js";
+import { startNestedWorkerLayout, startWorkerLayout, type StreamedLODTree, type WorkerLayoutHandle, type WorkerLayoutOptions } from "./worker-transport.js";
 import { buildLeafIncidence, lazySuperEdges, makeLazySuperEdgesScratch, rowSuperEdges, type LeafIncidence } from "./lazy-super-edges.js";
 import type { LeafStyle, LODView } from "./lod-frame.js";
 import { startGpuLayout } from "./gpu/gpu-transport.js";
@@ -258,7 +258,10 @@ export interface NetworkStyle {
 export interface NetworkLayoutOptions {
   /** `"positions"` uses caller-supplied coordinates; `"force"` runs the in-library force layout on the
    *  main thread; `"worker"` runs it off-thread with progressive streaming; `"gpu"` runs a WebGL2
-   *  Barnes-Hut solve (falling back to `"worker"` when unavailable). */
+   *  Barnes-Hut solve. `"gpu"` falls back to `"worker"`, with one console warning naming the reason, when
+   *  the render backend is not WebGL or the device lacks float render targets, float blending
+   *  (`EXT_float_blend`) or a large enough texture size for the graph. The fallback is a full worker
+   *  run: it honours `multilevel` and streams the LOD tree like `"worker"`. */
   backend?: "positions" | "force" | "worker" | "gpu";
   /** Interleaved `[x, y, …]` world coordinates for `backend: "positions"`. */
   positions?: Float32Array;
@@ -281,7 +284,8 @@ export interface NetworkLayoutOptions {
    * For `backend: "force"` and `backend: "worker"`, seed the layout via multilevel coarsening
    * (heavy-edge matching) for faster convergence and fewer tangles on clustered graphs. Default
    * `true`; set `false` for a plain cold-start force run. Tiny / edgeless graphs skip coarsening
-   * automatically.
+   * automatically. `backend: "gpu"` honours it when it falls back to the worker; the GPU solve itself
+   * seeds from the module hierarchy when there is one, else from a disc.
    */
   multilevel?: boolean;
   /**
@@ -655,6 +659,18 @@ function labelText(opts: NetworkLabelOptions, id: number, info: NetworkHit): str
 }
 const DEFAULT_FORCE_ITERATIONS = 300;
 
+/**
+ * What a layout backend asks of the engine, known synchronously from the options (spec §12.2):
+ * caller-supplied `"positions"`, a main-thread `"force"` solve, or positions that `"streaming"` in
+ * asynchronously — the worker, or the GPU, which may itself resolve to the worker. The fit, nested,
+ * state-network and drag decisions need only this; which transport a streaming layout actually runs
+ * is known once a GPU device settles ({@link WorkerLayoutHandle.transport}).
+ */
+function layoutClass(backend: NetworkLayoutOptions["backend"]): "positions" | "force" | "streaming" | null {
+  if (backend === "worker" || backend === "gpu") return "streaming";
+  return backend ?? null;
+}
+
 /** A layout's transition length in ms (#328): `transition` when a positive finite number, else 0. */
 function transitionDuration(transition: number | undefined): number {
   return transition !== undefined && Number.isFinite(transition) && transition > 0 ? transition : 0;
@@ -744,10 +760,12 @@ export class Network extends BaseEngine {
   /** Retained coarsening tree for the current graph (topology built lazily). */
   private lodTree: LODTree | null = null;
   /**
-   * The LOD tree streamed by the layout worker (#103), when running the worker backend with LOD on.
+   * The LOD tree streamed by the layout worker (#103), when a worker run has LOD on — `backend: "worker"`,
+   * or a `"gpu"` layout that fell back to the worker (#351).
    * Its `cx`/`cy`/`extent` are written by the worker each frame (live), so the main thread skips the
    * O(N) build + geometry pass and only fills the style geometry once + runs the O(visible) cut.
-   * Null on the `force`/`positions` backends, the worker fallback, or LOD enabled after a worker run.
+   * Null on the `force`/`positions` backends, the GPU solve, the worker's synchronous fallback, or LOD
+   * enabled after a worker run.
    */
   private lodWorkerTree: LODTree | null = null;
   /** Whether the current main-thread `lodTree` was built spatially (a Morton tree over the positions,
@@ -788,7 +806,8 @@ export class Network extends BaseEngine {
   private lodStylePosted = -1;
   /** Whether the current `lodTree` was built from a provided module hierarchy (N6 / #104). */
   private lodModules = false;
-  /** True while a worker-LOD run is in flight (launched, not yet settled/stopped) — it will stream the tree. */
+  /** True while a worker-LOD run is in flight (launched, not yet settled/stopped) — it will stream the tree.
+   *  A `"gpu"` layout sets it once its device resolves to the worker fallback (#351). */
   private lodStreaming = false;
   /** True while a nested layout (#324) solves on the worker/gpu. It streams positions only — never a LOD
    *  tree — so the main thread keeps even a structural tree's geometry up to date meanwhile. */
@@ -1470,7 +1489,7 @@ export class Network extends BaseEngine {
       // back, `graph.positions` would be all-zeros (the GPU solve seeds on-device, so the CPU copy is
       // untouched), which renders as one glyph piled at the origin (top-left). The seed is overwritten
       // by the first streamed frame; each frame then reframes via {@link fitViewToLayout}.
-      const fit = opts.fit === true && (opts.backend === "worker" || opts.backend === "gpu");
+      const fit = opts.fit === true && layoutClass(opts.backend) === "streaming";
       this.fitOnLayout = fit;
       this.fitKnownBox = null;
       const nestedTree = opts.nested && opts.backend !== "positions" ? this.moduleTree() : undefined;
@@ -1497,93 +1516,8 @@ export class Network extends BaseEngine {
           // position-independent and is kept.
           this.recomputeLODGeometry(); // caller-supplied coordinates are final immediately
         }
-      } else if (opts.backend === "worker") {
-        // Off-thread force layout with progressive convergence. The worker can post a frame per
-        // tick, so coalesce repaints to one per animation frame (always painting the freshest
-        // positions) to bound main-thread work at large N.
-        //
-        // The worker streams a *coarsening* LOD tree; a module hierarchy (N6 / #104) is a different
-        // source the worker doesn't build, so while the cut draws modules the worker supplies positions
-        // only and the main thread builds the module tree (recomputeLODGeometry, off the worker guard).
-        const useLod = !!this.lodOptions && !this.lodUsesModules();
-        this.lodStreaming = useLod; // the worker will stream the tree; main builds none meanwhile
-        // The spatial tree (#343) is rebuilt by the worker per frame, style aggregated there too.
-        const lodSource = useLod ? this.lodKind() : null;
-        const spatialStyle = lodSource === "spatial" ? this.lodLeafStyle(this.graph) : null;
-        this.lodWorkerSource = lodSource === "spatial" ? "spatial" : useLod ? "structure" : null;
-        if (spatialStyle) this.lodStylePosted = spatialStyle.version;
-        const handle: WorkerLayoutHandle = startWorkerLayout(
-          this.graph,
-          {
-            width: this.width,
-            height: this.height,
-            iterations: opts.iterations ?? DEFAULT_FORCE_ITERATIONS,
-            force: opts.force,
-            multilevel: opts.multilevel,
-            // When LOD is on, the worker builds + streams the tree; its coarsening is shared with the
-            // multilevel seed so the graph is coarsened once and the main thread never coarsens.
-            lod: useLod,
-            lodSource: lodSource === "spatial" ? "spatial" : "structure",
-            lodStyle: spatialStyle?.style,
-            lodStyleVersion: spatialStyle?.version,
-            lodView: spatialStyle ? this.postedLODView(this.resolvedStyleCached(this.graph)) : undefined,
-            coarsen: this.lodOptions?.coarsen,
-          },
-          () => this.scheduleLayoutRepaint(),
-          useLod
-            ? (tree, streamed) => {
-                if (this.layoutHandle !== handle) { streamed?.release(); return; } // a newer layout superseded this one
-                if (streamed) {
-                  this.adoptStreamedTree(tree, streamed);
-                  return;
-                }
-                // Record the worker's tree; recomputeLODGeometry adopts it while the cut is structural
-                // (a switch to modules since launch keeps the module tree). Its geometry streams live,
-                // so the main thread only fills the style geometry once. The first frame (which
-                // follows this message) renders it.
-                this.lodWorkerTree = tree;
-                this.recomputeLODGeometry();
-              }
-            : undefined,
-        );
-        this.layoutHandle = handle;
-        // Final refresh on settle (the last streamed frame may land before the resolve). `forceMain`
-        // covers the worker-unavailable fallback: it solved synchronously and never streamed a tree,
-        // so build one on the main thread here (a no-op when the worker did stream — that takes the
-        // worker-tree branch and only refreshes the style geometry).
-        void handle.settled.then(() => {
-          if (this.layoutHandle !== handle) return; // a newer layout superseded this one
-          this.lodStreaming = false;
-          this.recomputeLODGeometry(true);
-          this.releaseFit(); // final reframe on the settled bounds, then hand the view to zoom/pan
-          this.rebuild(); // releases the spatial trees this repaint replaced (#343)
-        });
-      } else if (opts.backend === "gpu") {
-        // GPU force layout — uses the WebGL backend's luma.gl Device. Pass a device *promise* that
-        // waits for the backend to fully settle (including the "auto" → WebGL background upgrade)
-        // before resolving, so `startGpuLayout` sees the real WebGL device and doesn't silently fall
-        // back to the worker because it was called before the upgrade finished.
-        //
-        // N8.2 module-aware seed: with a module hierarchy (`data(graph, { modules })`, #326, or
-        // `lod({ modules })`) — whatever the LOD state — hand its tree to the GPU seed so the layout is
-        // laid out top-down over the modules. The tree is cached, so when the cut draws the same
-        // hierarchy the settle handler's recomputeLODGeometry only fills its geometry (no rebuild).
-        const moduleTopology = this.moduleTree();
-        const devicePromise = this.whenBackendSettled().then(() => this.gpuDevice());
-        const handle = startGpuLayout(devicePromise, this.graph, {
-          width: this.width,
-          height: this.height,
-          iterations: opts.iterations ?? DEFAULT_FORCE_ITERATIONS,
-          force: opts.force,
-          moduleTopology,
-        }, () => this.scheduleLayoutRepaint());
-        this.layoutHandle = handle;
-        void handle.settled.then(() => {
-          if (this.layoutHandle !== handle) return; // a newer layout superseded this one
-          this.recomputeLODGeometry(true);
-          this.releaseFit(); // final reframe on the settled bounds, then hand the view to zoom/pan
-          this.rebuild();
-        });
+      } else if (layoutClass(opts.backend) === "streaming") {
+        this.startStreamingLayout(this.graph, opts);
       } else if (opts.backend === "force") {
         // Main-thread force layout. (Off-thread + progressive convergence via a Web Worker is the
         // next slice.) Multilevel coarsening seeds it by default; opt out for a plain cold start.
@@ -1792,6 +1726,100 @@ export class Network extends BaseEngine {
   }
 
   /**
+   * The flat streaming layout (`backend: "worker"` / `"gpu"`): off-thread (or on-GPU) force layout with
+   * progressive convergence. Both backends get the SAME worker options, LOD-tree adoption and settle
+   * handling, so a `"gpu"` layout that falls back (#351) is exactly the run `"worker"` would have started:
+   * `multilevel` honoured (#312) and the LOD tree streamed from the worker, so the main thread builds none.
+   *
+   * The worker can post a frame per tick, so repaints coalesce to one per animation frame
+   * ({@link scheduleLayoutRepaint}), always painting the freshest positions. It streams a *coarsening* LOD
+   * tree; a module hierarchy (N6 / #104) is a different source the worker doesn't build, so while the cut
+   * draws modules the worker supplies positions only and the main thread builds the module tree.
+   *
+   * The GPU run uses the WebGL backend's luma.gl Device, passed as a *promise* that waits for the backend
+   * to settle (including the `"auto"` → WebGL background upgrade), so `startGpuLayout` sees the real
+   * device rather than falling back because it ran before the upgrade finished. With a module hierarchy
+   * (`data(graph, { modules })`, #326, or `lod({ modules })`) — whatever the LOD state — its tree seeds the
+   * GPU layout top-down over the modules (N8.2); the tree is cached, so the settle handler's
+   * recomputeLODGeometry only fills its geometry.
+   *
+   * On settle, the final refresh (the last streamed frame may land before the resolve) forces a
+   * main-thread tree when no worker streamed one — the worker-unavailable fallback solved synchronously,
+   * or the GPU ran — and only refreshes the style geometry when the worker did.
+   */
+  private startStreamingLayout(graph: NetworkGraph, opts: NetworkLayoutOptions): void {
+    const useLod = !!this.lodOptions && !this.lodUsesModules();
+    // The spatial tree (#343) is rebuilt by the worker per frame, style aggregated there too — on the
+    // worker backend and on a "gpu" layout's worker fallback alike (#351) — with the super-edge rows of the
+    // covers of the view the cut runs at (#433).
+    const lodSource = useLod ? this.lodKind() : null;
+    const spatialStyle = lodSource === "spatial" ? this.lodLeafStyle(graph) : null;
+    this.lodWorkerSource = lodSource === "spatial" ? "spatial" : useLod ? "structure" : null;
+    if (spatialStyle) this.lodStylePosted = spatialStyle.version;
+    const workerOpts: WorkerLayoutOptions = {
+      width: this.width,
+      height: this.height,
+      iterations: opts.iterations ?? DEFAULT_FORCE_ITERATIONS,
+      force: opts.force,
+      multilevel: opts.multilevel,
+      // When LOD is on, the worker builds + streams the tree; its coarsening is shared with the
+      // multilevel seed so the graph is coarsened once and the main thread never coarsens.
+      lod: useLod,
+      lodSource: lodSource === "spatial" ? "spatial" : "structure",
+      lodStyle: spatialStyle?.style,
+      lodStyleVersion: spatialStyle?.version,
+      lodView: spatialStyle ? this.postedLODView(this.resolvedStyleCached(graph)) : undefined,
+      coarsen: this.lodOptions?.coarsen,
+    };
+    const onFrame = (): void => this.scheduleLayoutRepaint();
+    // Unset until the transport returns, so a callback can never match a cleared `layoutHandle` (null).
+    let handle: WorkerLayoutHandle | undefined;
+    const onLODTree = useLod
+      ? (tree: LODTree, streamed?: StreamedLODTree): void => {
+          if (this.layoutHandle !== handle) { streamed?.release(); return; } // a newer layout superseded this one
+          if (streamed) {
+            this.adoptStreamedTree(tree, streamed);
+            return;
+          }
+          // Record the worker's tree; recomputeLODGeometry adopts it while the cut is structural (a switch
+          // to modules since launch keeps the module tree). Its geometry streams live, so the main thread
+          // only fills the style geometry once. The first frame (which follows this message) renders it.
+          this.lodWorkerTree = tree;
+          this.recomputeLODGeometry();
+        }
+      : undefined;
+    if (opts.backend === "gpu") {
+      const devicePromise = this.whenBackendSettled().then(() => this.gpuDevice());
+      handle = startGpuLayout(devicePromise, graph, { ...workerOpts, moduleTopology: this.moduleTree() }, onFrame, onLODTree,
+        (transport) => {
+          // Resolved to the worker fallback: it streams the tree from here on, so main builds none meanwhile.
+          if (this.layoutHandle === handle && transport === "worker") this.lodStreaming = useLod;
+        });
+    } else {
+      this.lodStreaming = useLod; // the worker will stream the tree; main builds none meanwhile
+      handle = startWorkerLayout(graph, workerOpts, onFrame, onLODTree);
+    }
+    this.onLayoutSettled(handle, () => {
+      this.lodStreaming = false;
+    });
+  }
+
+  /**
+   * The streaming layout's resolved transport (spec §12.2): `"worker"` for any `backend: "worker"`
+   * layout (nested ones included) and for a `"gpu"` layout whose device resolved to the worker fallback,
+   * `"gpu"` once the GPU solve runs, `"pending"` while a GPU device is unsettled, and `null` for the other
+   * backends or a `"gpu"` layout whose handle reports no transport (none started, or a nested run). The
+   * LOD guards key on it rather than on the literal backend: a worker streams the coarsening tree, so the
+   * main thread builds none.
+   */
+  private streamingTransport(): "worker" | "gpu" | "pending" | null {
+    const backend = this.layoutOpts.backend;
+    if (backend === "worker") return "worker";
+    if (backend !== "gpu") return null;
+    return this.layoutHandle?.transport ?? null;
+  }
+
+  /**
    * Nested module layout (#324): off-thread + streamed per depth on worker/gpu, synchronous on force.
    * A warm start (#328) seeds from the current positions and lands in one piece, with no depth frames;
    * with a `duration` the result is eased to ({@link positionTween}) instead of jumped to.
@@ -1818,7 +1846,7 @@ export class Network extends BaseEngine {
       packing: cfg.packing,
       size: (cfg.size ?? "flow") === "flow" ? (graph.flow ?? undefined) : undefined,
     };
-    if (opts.backend === "worker" || opts.backend === "gpu") {
+    if (layoutClass(opts.backend) === "streaming") {
       const oneFrame = warm || tween !== null;
       this.nestedSolving = true;
       const solve = startNestedWorkerLayout(graph, topology, params, () => this.scheduleLayoutRepaint(), {
@@ -1958,7 +1986,7 @@ export class Network extends BaseEngine {
       return this.rebuild();
     }
 
-    if (opts.backend === "worker" || opts.backend === "gpu") {
+    if (layoutClass(opts.backend) === "streaming") {
       // fit: true (#238) frames the streaming physical layout via the CAMERA (like the main layout path)
       // instead of the `scaleToViewport` position-remap — so state networks open framed and converge in
       // place (no top-left flash + settle snap on the GPU backend). The state sizing is scale-relative
@@ -1969,15 +1997,17 @@ export class Network extends BaseEngine {
       this.fitOnLayout = fit;
       if (fit) seedPositions(phys, this.width, this.height, { force: opts.force });
       const onPhysFrame = () => this.scheduleLayoutRepaint();
-      const workerOpts = {
+      // One option set for both: a GPU layout that falls back runs this worker layout exactly (#312).
+      const workerOpts: WorkerLayoutOptions = {
         width: this.width,
         height: this.height,
         iterations: opts.iterations ?? DEFAULT_FORCE_ITERATIONS,
         force: opts.force,
+        multilevel: opts.multilevel,
       };
       const handle: WorkerLayoutHandle =
         opts.backend === "worker"
-          ? startWorkerLayout(phys, { ...workerOpts, multilevel: opts.multilevel }, onPhysFrame)
+          ? startWorkerLayout(phys, workerOpts, onPhysFrame)
           : startGpuLayout(this.whenBackendSettled().then(() => this.gpuDevice()), phys, workerOpts, onPhysFrame);
       this.layoutHandle = handle;
       void handle.settled.then(() => {
@@ -2281,11 +2311,12 @@ export class Network extends BaseEngine {
    *   the worker fell back to a synchronous solve).
    * - `"none"` — no layout active (`force`/`positions` backends, or before `layout()`).
    *
-   * For a `backend: "gpu"` layout this resolves **asynchronously**: it is `"copy"` (the async
-   * wrapper's initial state) until the device promise settles and the GPU path is confirmed, then
-   * flips to `"gpu"`. Read it after `await net.whenSettled()` or on a subsequent animation frame
-   * for the final resolved value. The environment's *capability* (independent of any run) is
-   * {@link sharedMemoryAvailable}.
+   * It reports the **live** transport (#297): a worker error that falls back to a synchronous solve turns
+   * `"shared"` into `"copy"`, and a `backend: "gpu"` layout that falls back to the worker (#351) reports
+   * the worker's transport. For a `backend: "gpu"` layout it resolves **asynchronously**: it is `"copy"`
+   * until the device promise settles, then `"gpu"` or the fallback worker's `"shared"`/`"copy"`. Read it
+   * after `await net.whenSettled()` or on a subsequent animation frame for the resolved value. The
+   * environment's *capability* (independent of any run) is {@link sharedMemoryAvailable}.
    */
   get layoutTransport(): "gpu" | "shared" | "copy" | "none" {
     if (!this.layoutHandle || this.layoutHandle.mainThread) return "none";
@@ -2335,8 +2366,9 @@ export class Network extends BaseEngine {
         this.sceneActive = false;
       }
       this.syncLane();
-      // LOD on, worker backend, no tree yet — schedule the main-thread fallback build.
-      if (this.lodOptions && this.layoutOpts.backend === "worker" && !this.lodReady()) {
+      // LOD on, a worker run (or a GPU layout fallen back to one), no tree yet — schedule the main-thread
+      // fallback build.
+      if (this.lodOptions && this.streamingTransport() === "worker" && !this.lodReady()) {
         this.scheduleLODFallback();
       }
     } else {
@@ -2865,7 +2897,7 @@ export class Network extends BaseEngine {
 
     // worker / gpu: the layout backend reflows the rest (worker off-thread, gpu on the GPU) while the
     // main thread holds the grabbed set crisply. Both expose the same pin/unpin handle (#140, #183).
-    if ((backend === "worker" || backend === "gpu") && handle) {
+    if (layoutClass(backend) === "streaming" && handle) {
       applyHeld();
       handle.pin(heldIds, heldPos);
       this.dragReapply = applyHeld;
@@ -3272,16 +3304,19 @@ export class Network extends BaseEngine {
       this.lodSpatial = false;
       this.lodHasGeometry = false;
     }
-    // The worker streams the tree on this backend; don't build one on the main thread (the whole point of
+    // A worker streams the tree on this backend; don't build one on the main thread (the whole point of
     // worker-LOD). A module hierarchy is the exception — the worker doesn't build it, so the main thread
     // must (it takes the module branch below) — and so is a nested layout's run, which streams positions
     // only (#324), and a run streaming the other kind of tree (a source switch mid-run). The settle
     // handler / deferred fallback force a build when no worker streamed one. A spatial tree the worker does
     // not stream (the source switched to "spatial" after launch) follows the positions from here for as
-    // long as the worker lives — a drag's reheat moves them after the run settled too (#343).
-    const workerLive = this.layoutHandle !== null && this.layoutOpts.backend === "worker";
+    // long as the worker lives — a drag's reheat moves them after the run settled too (#343). A GPU layout
+    // still waiting for its device may resolve to the worker, which would stream a tree: wait (if it
+    // resolves to the GPU, its first frame builds the tree here).
+    const transport = this.streamingTransport();
+    const workerLive = this.layoutHandle !== null && transport === "worker";
     const streamsOtherKind = (this.lodStreaming && this.lodWorkerSource !== kind) || (kind === "spatial" && workerLive && this.lodWorkerSource !== "spatial");
-    if (!moduleTree && !this.stateData && this.layoutOpts.backend === "worker" && !forceMain && !this.nestedSolving && !streamsOtherKind) return;
+    if (!moduleTree && !this.stateData && (transport === "worker" || transport === "pending") && !forceMain && !this.nestedSolving && !streamsOtherKind) return;
     const graph = this.graph;
     if (moduleTree) {
       // Carries flow-weighted super-edges from the graph's directed edges (the sum of subsumed edge
@@ -3339,10 +3374,10 @@ export class Network extends BaseEngine {
     this.lodFallbackScheduled = false;
     this.lodBuildDeferred = false;
     // A worker is now streaming, LOD was turned off, or a tree already landed — nothing to do; the normal
-    // path renders it. The worker backend's fallback also stands down when the backend changed; a build
+    // path renders it. The worker transport's fallback also stands down when the transport changed (#351); a build
     // lod() deferred runs whatever came next (no layout, positions mid-transition, gpu), as lod() would have.
     if (!this.lodOptions || this.lodStreaming || this.lodReady()) return;
-    if (!deferred && this.layoutOpts.backend !== "worker") return;
+    if (!deferred && this.streamingTransport() !== "worker") return;
     this.recomputeLODGeometry(true); // no live worker: build the tree on the main thread
     this.rebuild();
   }

@@ -385,6 +385,7 @@ per-file timeout. Every at-scale leg below now asserts. When you add a guard, ad
 | hover overlay reuse | **WebGL** | `map/hover-overlay-perf.browser.test.ts` | 1000 glyphs / 125 hover changes | ✗ **deliberately unscaled** |
 | instanced pie | **WebGL** | `webgl/__tests__/instanced-pie-perf.browser.test.ts` | 100k | `PERF_BROWSER_N` |
 | GPU layout tick (+ #349 signatures: no draw of ≥ N vertices × instances into a 1×1 viewport, via any of the five WebGL2 draw calls; zero texture / framebuffer / buffer creation per tick) | **WebGL** | `network/gpu/__tests__/gpu-frame-budget-perf.browser.test.ts` | 30k | `PERF_BROWSER_N` (max 200k) |
+| GPU layout position readback through `GpuForceLayout.readPositions`, `RGBA/FLOAT` (a device that refuses `RG/FLOAT`) and `RG/FLOAT` (#351): exact positions, no GPU allocation and one `readPixels` per readback, one retained RGBA scratch | **WebGL** | `network/gpu/__tests__/gpu-readback-perf.browser.test.ts` | 1M | `PERF_BROWSER_N` (max 4M) |
 | React recolor vs build | **WebGL** | `react/perf.browser.test.ts` | 4096 | capped at 8192 — see below |
 | `"auto"` placeholder emit | Canvas→**WebGL** | `map/auto-placeholder-perf.browser.test.ts` | 200k edges / 200k points | `PERF_BROWSER_N` (max 611k) |
 | `"auto"` placeholder **paint** | Canvas→**WebGL** | same file, `#273` describe block | 30k geo polygons | `PERF_BROWSER_N` (max 120k) |

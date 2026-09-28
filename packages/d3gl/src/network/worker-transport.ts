@@ -63,15 +63,17 @@ export interface WorkerLayoutHandle {
   /**
    * Whether this run streams positions **zero-copy** via a `SharedArrayBuffer` (cross-origin-isolated
    * page) rather than per-frame postMessage copies. `false` in copy mode and on the synchronous
-   * fallback (no live worker). Mirrors {@link sharedMemoryAvailable} for an active worker run.
+   * fallback (no live worker). Mirrors {@link sharedMemoryAvailable} for an active worker run. Read
+   * live (#297): it turns `false` when a worker error falls back to a synchronous solve.
    */
-  shared: boolean;
+  readonly shared: boolean;
   /**
-   * `"gpu"` when the handle was created by `startGpuLayout` and the GPU path was successfully taken
-   * (a real WebGL device was available). `undefined` for worker and synchronous-fallback handles.
-   * Used by {@link Network.layoutTransport} to distinguish a real GPU run from a silent worker fallback.
+   * Set by `startGpuLayout` only, read live (#297): `"pending"` while its device promise is unsettled,
+   * then `"gpu"` (the GPU solve runs) or `"worker"` (it fell back to {@link startWorkerLayout}). Unset on
+   * the worker transports' own handles, which always run the worker. {@link Network.layoutTransport}
+   * reports `"gpu"` from it, and the engine's LOD guards treat a `"worker"` fallback as a worker run.
    */
-  transport?: "gpu";
+  readonly transport?: "gpu" | "worker" | "pending";
   /**
    * `true` when the handle runs no layout transport at all — a main-thread position transition of an
    * already-computed layout (#328) — so {@link Network.layoutTransport} reports `"none"`.
@@ -159,7 +161,8 @@ export function startWorkerLayout(
   // a fitted view doesn't jump. NetworkGraph satisfies the force core's LayoutGraph view.
   seedPositions(graph, width, height, { force: opts.force });
 
-  const shared = sharedMemoryAvailable();
+  // Live (#297): a worker error below falls back to a synchronous solve, after which no worker shares it.
+  let shared = sharedMemoryAvailable();
   let sharedPositions: SharedArrayBuffer | undefined;
   if (shared) {
     sharedPositions = new SharedArrayBuffer(graph.nodeCount * 2 * Float32Array.BYTES_PER_ELEMENT);
@@ -220,6 +223,7 @@ export function startWorkerLayout(
   worker.onerror = (): void => {
     if (terminated) return;
     // Worker failed mid-run — fall back to a synchronous solve so the user still gets a layout.
+    shared = false;
     solveHere();
     onFrame();
     terminate();
@@ -248,7 +252,7 @@ export function startWorkerLayout(
   worker.postMessage(start);
 
   return {
-    shared,
+    get shared() { return shared; },
     settled,
     stop() {
       if (terminated) return;
