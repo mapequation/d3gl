@@ -63,8 +63,10 @@ export interface GpuLayoutNeed {
 export interface GpuNestedNeed {
   /** Slots (tree nodes below the root), below {@link NESTED_MAX_SLOTS}. */
   slots: number;
-  /** The per-segment large-slot table: `NESTED_LARGE_MAX` slot ids per segment, ⌈√(2(S + 1))⌉ wide. */
-  largeSide: number;
+  /** The per-segment collision table: 3 texels per segment (its list and its grid) and the whole range, ⌈√(3(S + 1))⌉ wide. */
+  collideSide: number;
+  /** The collision grid's largest texture side past the slot atlas: its hash tables, work items and binned-slot list. */
+  gridSide: number;
 }
 
 /** The GPU layout's verdict for one device and graph. */
@@ -88,8 +90,8 @@ export function gpuLayoutNeed(nodeCount: number, edgeCount: number): GpuLayoutNe
  * The part of a GPU nested layout's need its slot count alone decides (#355, #375), for the check before
  * the prep builds the segments and links: the slot atlas (every per-slot texture), the CSR offsets and
  * the slot count. It names no grid pyramid, which the nested solve never allocates; the springs, the tile
- * atlas and the large-slot table are 0 until the prep sizes them (`gpuNestedLayoutNeed`, which extends
- * this one). O(1).
+ * atlas, the collision table and the collision grid are 0 until the prep sizes them (`gpuNestedLayoutNeed`,
+ * which extends this one). O(1).
  */
 export function gpuNestedSlotNeed(slots: number): GpuLayoutNeed {
   return {
@@ -97,7 +99,7 @@ export function gpuNestedSlotNeed(slots: number): GpuLayoutNeed {
     offsetsSide: atlasWidth(slots + 1),
     springSide: 0,
     pyramidSide: 0,
-    nested: { slots, largeSide: 0 },
+    nested: { slots, collideSide: 0, gridSide: 0 },
   };
 }
 
@@ -106,7 +108,7 @@ export function gpuNestedSlotNeed(slots: number): GpuLayoutNeed {
  * device (a Canvas/SVG render backend, SSR). The checks run in the order a user can act on them; the
  * first failure names its reason, which the caller logs before it falls back to the worker. A nested
  * `need` also checks the tree against the nested layout's own limits: its slot count, its tile atlas
- * against the 16-bit tile origin, and its large-slot table.
+ * against the 16-bit tile origin, its collision table and its collision grid.
  */
 export function gpuLayoutSupport(caps: GpuCaps | null, need: GpuLayoutNeed): GpuLayoutSupport {
   if (!caps) return { ok: false, reason: "no WebGL device (a Canvas/SVG render backend, or SSR)" };
@@ -128,7 +130,7 @@ export function gpuLayoutSupport(caps: GpuCaps | null, need: GpuLayoutNeed): Gpu
     ["spring", need.springSide],
     [nested ? "tile atlas" : "grid pyramid", need.pyramidSide],
   ];
-  if (nested) sides.push(["large-slot table", nested.largeSide]);
+  if (nested) sides.push(["collision table", nested.collideSide], ["collision grid", nested.gridSide]);
   for (const [name, side] of sides) {
     if (side > limit) {
       return { ok: false, reason: `the graph needs a ${side}-texel ${name} texture, past the device's ${limit}-texel limit` };

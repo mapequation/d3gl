@@ -141,7 +141,7 @@ describe("gpuLayoutSupport with a nested need (#355, #375)", () => {
     ...gpuLayoutNeed(372_729, 600_941),
     pyramidSide: 1024,
     ...over,
-    nested: { slots: 372_729, largeSide: atlasSide(2 * 47_002), ...nested },
+    nested: { slots: 372_729, collideSide: atlasSide(3 * 47_002), gridSide: 1024, ...nested },
   });
 
   it("accepts a tree whose every texture fits", () => {
@@ -159,10 +159,16 @@ describe("gpuLayoutSupport with a nested need (#355, #375)", () => {
     if (!r.ok) expect(r.reason).toMatch(/131072-texel tile atlas, past the 65536 texels a tile origin addresses/);
   });
 
-  it("rejects a large-slot table past the texture limit", () => {
-    const r = gpuLayoutSupport({ ...FULL, maxTextureDimension2D: 2048 }, tree({}, { largeSide: 2049 }));
+  it("rejects a collision table past the texture limit", () => {
+    const r = gpuLayoutSupport({ ...FULL, maxTextureDimension2D: 2048 }, tree({}, { collideSide: 2049 }));
     expect(r.ok).toBe(false);
-    if (!r.ok) expect(r.reason).toMatch(/2049-texel large-slot table/);
+    if (!r.ok) expect(r.reason).toMatch(/2049-texel collision table/);
+  });
+
+  it("rejects a collision grid past the texture limit", () => {
+    const r = gpuLayoutSupport({ ...FULL, maxTextureDimension2D: 2048 }, tree({}, { gridSide: 2049 }));
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.reason).toMatch(/2049-texel collision grid/);
   });
 
   it("rejects a tree past the slots float32 indexes exactly, whatever the device", () => {
@@ -191,8 +197,9 @@ describe("gpuNestedSlotNeed: the nested check before the prep (#355, #375)", () 
     const need = gpuNestedSlotNeed(372_729);
     const flat = gpuLayoutNeed(372_729, 0);
     expect([need.positionSide, need.offsetsSide]).toEqual([flat.positionSide, flat.offsetsSide]);
-    // The nested solve allocates no grid pyramid; its tile atlas, springs and large-slot table wait for the prep.
-    expect([need.pyramidSide, need.springSide, need.nested?.largeSide]).toEqual([0, 0, 0]);
+    // The nested solve allocates no grid pyramid; its tile atlas, springs, collision table and collision grid
+    // wait for the prep.
+    expect([need.pyramidSide, need.springSide, need.nested?.collideSide, need.nested?.gridSide]).toEqual([0, 0, 0, 0]);
     expect(need.nested?.slots).toBe(372_729);
   });
 

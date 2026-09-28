@@ -8,7 +8,17 @@ import { makeTestDevice } from "./_device.js";
 import { NestedJacobiReference } from "./nested-jacobi-reference.js";
 import { GpuNestedLayout, nestedLayoutPlan } from "../gpu-nested-layout.js";
 import { nestedSolverResult, nestedSolverTopology, type NestedSolverTopology } from "../nested-topology.js";
-import { NESTED, nestedLayout, type NestedLayoutParams, type NestedLayoutResult, type NestedLayoutTopology } from "../../nested-layout.js";
+import { EXACT_MAX, NESTED, nestedLayout, type NestedLayoutParams, type NestedLayoutResult, type NestedLayoutTopology } from "../../nested-layout.js";
+import {
+  COLLISION_EXACT,
+  COLLISION_ITEM_SHIFT,
+  COLLISION_ITEMIZED,
+  COLLISION_LIST_MAX,
+  COLLISION_PART_PAIRS,
+  collisionPlan,
+  planClassCount,
+  type CollisionPlan,
+} from "../collision-plan.js";
 import {
   directedPartition,
   expectContained,
@@ -24,7 +34,9 @@ import {
   topo,
   twoLevel,
   worstSeparation,
+  zipfModuleTree,
 } from "../../__tests__/nested-fixtures.js";
+import { collisionTwin } from "./collision-twin.js";
 import { COLLISION_RELAX, COLLISION_STEPS } from "../passes/collision.js";
 
 /** Minimal seeded LCG PRNG. */
@@ -115,29 +127,18 @@ describe("GPU nested layout (#355) against its Jacobi reference", () => {
   });
 
   /**
-   * GPU and reference after every tick of `ticks`, compared on the slots' local positions. With `restart`,
-   * the reference starts each tick from the GPU's own positions and velocities, so each tick is compared
-   * alone and float32 rounding does not compound across ticks.
+   * GPU and reference after every tick of `ticks`, compared on the slots' local positions. With `resync`,
+   * the reference restarts every tick from the GPU's positions, so the comparison is one tick's (float32
+   * rounding amplified over many ticks would otherwise decide it, not which pairs were found).
    */
-  function compareTicks(topo: NestedSolverTopology, ticks: number, organise?: number, restart = false): number {
+  function compareTicks(topo: NestedSolverTopology, ticks: number, organise?: number, resync = false): number {
     const layout = new GpuNestedLayout(device, nestedLayoutPlan(topo), organise === undefined ? {} : { organise });
     const ref = new NestedJacobiReference(topo, organise);
     const local = new Float32Array(2 * topo.slotCount);
-    const vel = new Float32Array(2 * topo.slotCount);
     const want = new Float64Array(2 * topo.slotCount);
     let worst = 0;
     try {
       for (let t = 0; t < ticks; t++) {
-        if (restart && t > 0) {
-          layout.readLocal(local);
-          layout.readVelocity(vel);
-          for (let i = 0; i < topo.slotCount; i++) {
-            ref.x[i] = local[2 * i] ?? 0;
-            ref.y[i] = local[2 * i + 1] ?? 0;
-            ref.vx[i] = vel[2 * i] ?? 0;
-            ref.vy[i] = vel[2 * i + 1] ?? 0;
-          }
-        }
         runAll(layout, 1);
         ref.step();
         layout.readLocal(local);
@@ -146,6 +147,11 @@ describe("GPU nested layout (#355) against its Jacobi reference", () => {
           want[2 * i + 1] = ref.y[i] ?? 0;
         }
         worst = Math.max(worst, maxDiff(local, want));
+        if (!resync) continue;
+        for (let i = 0; i < topo.slotCount; i++) {
+          ref.x[i] = local[2 * i] ?? 0;
+          ref.y[i] = local[2 * i + 1] ?? 0;
+        }
       }
     } finally {
       layout.destroy();
@@ -161,16 +167,23 @@ describe("GPU nested layout (#355) against its Jacobi reference", () => {
     expect(compareTicks(solver, 30)).toBeLessThan(2e-5);
   });
 
-  it("finds every colliding pair through the grid: a heavy-tailed 600-child segment matches the exact reference", () => {
+  it("finds every colliding pair through the radius-class grid: a heavy-tailed 600-child segment matches the exact reference", () => {
     // No organise phase, so no Barnes-Hut: springs, integration and collision only, all exact-comparable.
-    // Each tick is compared from the GPU's own state: in this dense pack the float64 reference itself
+    // Each tick is compared from the GPU's positions: in this dense pack the float64 reference itself
     // amplifies a 1e-9 displacement about 1e4-fold over the 12 ticks (a small disc wedged among several
-    // larger ones), so free-running float32 and float64 solves drift apart whatever the grid finds.
+    // larger ones), so free-running float32 and float64 solves drift apart whatever the grid finds. The
+    // reference keeps its own velocities, which each tick decays by 1 − DECAY, so a velocity the GPU got
+    // wrong still shows.
     const { topo, size } = makeTree([600, 45, 90], 1, 2, 11);
-    const solver = nestedSolverTopology(topo, { size, iterations: 12 });
-    expect(Math.max(...solver.segCount)).toBe(600);
-    expect(solver.segLarge.some((s) => s >= 0)).toBe(true); // large slots exist
-    expect(compareTicks(solver, 12, 0, true)).toBeLessThan(2e-5);
+    const base = nestedSolverTopology(topo, { size, iterations: 12 });
+    expect(Math.max(...base.segCount)).toBe(600);
+    // At 600 children the exact loop is the cheaper search: force the grid (a cell visit costing one pair test).
+    const solver: NestedSolverTopology = { ...base, collision: collisionPlan(base.radius, base.segStart, base.segCount, EXACT_MAX, NESTED.PAD, undefined, 1) };
+    const big = solver.segCount.indexOf(600);
+    expect(planClassCount(solver.collision.segClasses[big] ?? 0)).toBeGreaterThan(3);
+    expect(solver.collision.segList[big * COLLISION_LIST_MAX] ?? -1).toBeGreaterThanOrEqual(0);
+    // Tick for tick from the same positions (one tick's float32 rounding: measured ≤ 3e-7).
+    expect(compareTicks(solver, 12, 0, true)).toBeLessThan(2e-6);
   });
 
   it("a collision step keeps each segment's mass-weighted centre where the integration put it", () => {
@@ -227,13 +240,11 @@ describe("GPU nested layout (#355) against its Jacobi reference", () => {
       seed[2 * b + 1] = seed[2 * a + 1] ?? 0;
       radius[a] = 0.05;
       radius[b] = 0.1;
-      const solver: NestedSolverTopology = { ...base, seed, radius, segR9: base.segR9.slice().fill(0.01), segLarge: base.segLarge.slice().fill(-1) };
-      const large = solver.segLarge;
-      if (k > 32) {
-        // The two big discs are the segment's large slots (radius above r₉ = 0.01).
-        large[seg * 8] = a;
-        large[seg * 8 + 1] = b;
-      }
+      // The collision plan of the new radii, with a grid forced at k = 40 (there the two big discs are the
+      // segment's list, and the pair is found from its list); at k = 8 the segment is exact.
+      const collision = collisionPlan(radius, base.segStart, base.segCount, EXACT_MAX, NESTED.PAD, undefined, 1);
+      if (k > 32) expect(collision.segClasses[seg]).not.toBe(0);
+      const solver: NestedSolverTopology = { ...base, seed, radius, collision };
       const layout = new GpuNestedLayout(device, nestedLayoutPlan(solver), { organise: 0 });
       try {
         runAll(layout, 1);
@@ -519,4 +530,250 @@ describe("GPU nested layout (#355): the CPU layout's invariants and behaviour on
     const cpu = nestedLayout(tree, { size });
     expect(worst(gpu)).toBeGreaterThanOrEqual(worst(cpu) - 0.02);
   });
+});
+
+describe("GPU nested layout (#380): the radius-class collision grid on modules of very uneven child sizes", () => {
+  let device: Device;
+  beforeAll(async () => {
+    device = await makeTestDevice();
+  });
+
+  /** A Zipf map whose big module's children are seeded uniformly in a `side`-wide square. */
+  function zipfSolver(big: number, side: number, seed: number): NestedSolverTopology {
+    const { topo: tree, flow } = zipfModuleTree(big, 20);
+    const base = nestedSolverTopology(tree, { size: flow, iterations: 10 });
+    const s = base.segCount.indexOf(big);
+    const start = base.segStart[s] ?? 0;
+    const pos = base.seed.slice();
+    const rnd = makePrng(seed);
+    for (let i = start; i < start + big; i++) {
+      pos[2 * i] = (rnd() - 0.5) * side;
+      pos[2 * i + 1] = (rnd() - 0.5) * side;
+    }
+    return { ...base, seed: pos };
+  }
+
+  /**
+   * One collision step on the GPU against the float64 all-pairs step from the same positions, and the GPU
+   * search's own statistics against its CPU twin's: the same slots sent to the exact loop and, when none
+   * is, the same cells visited (class cells and the sub-cells of dense ones) — the fast path's output, not
+   * only the result.
+   */
+  function oneStep(solver: NestedSolverTopology): { worst: number; visits: number; subVisits: number; overflow: number } {
+    const layout = new GpuNestedLayout(device, nestedLayoutPlan(solver), { organise: 0, collisionStats: true });
+    try {
+      layout.beginTick(); // the tick's springs and integration, then the step's cells and occupancy
+      const before = new Float32Array(2 * solver.slotCount);
+      layout.readLocal(before);
+      const stats = layout.collisionStats();
+      const twin = collisionTwin(solver, solver.collision, before, 8, NESTED.PAD);
+      let visits = 0;
+      let overflow = 0;
+      for (let i = 0; i < solver.slotCount; i++) {
+        if ((stats[4 * i + 3] ?? 0) !== 1) visits += stats[4 * i] ?? 0;
+        if (stats[4 * i + 3] === 2) overflow++;
+      }
+      expect(overflow, "slots sent to the exact loop: GPU against its twin").toBe(twin.overflowSlots);
+      // (An overflowing slot's other work items finish their slices where the twin stops the whole search.)
+      if (overflow === 0) expect(visits, "cells visited: GPU against its twin").toBe(twin.visits + twin.subVisits);
+      layout.forceBand(0, 1);
+      layout.integrate();
+      const after = new Float32Array(2 * solver.slotCount);
+      layout.readLocal(after);
+      const ref = new NestedJacobiReference(solver, 0);
+      for (let i = 0; i < solver.slotCount; i++) {
+        ref.x[i] = before[2 * i] ?? 0;
+        ref.y[i] = before[2 * i + 1] ?? 0;
+      }
+      ref.collide();
+      let worst = 0;
+      for (let i = 0; i < solver.slotCount; i++) {
+        worst = Math.max(worst, Math.abs((after[2 * i] ?? 0) - (ref.x[i] ?? 0)), Math.abs((after[2 * i + 1] ?? 0) - (ref.y[i] ?? 0)));
+      }
+      return { worst, visits: twin.visits, subVisits: twin.subVisits, overflow };
+    } finally {
+      layout.destroy();
+    }
+  }
+
+  it("one collision step equals the all-pairs step on every path: class cells, dense cells' sub-cells, the exact fallback", () => {
+    // 3,000 Zipf children: radii spanning √3000 (8 classes). Spread, the grid's class cells suffice.
+    const spread = oneStep(zipfSolver(3000, 2, 1));
+    expect(spread.visits).toBeGreaterThan(0);
+    expect(spread.subVisits).toBe(0);
+    expect(spread.worst).toBeLessThan(1e-5);
+    // Twenty times too little room: class cells hold more than 8, their sub-cells are searched.
+    const dense = oneStep(zipfSolver(3000, 0.2, 2));
+    expect(dense.subVisits).toBeGreaterThan(0);
+    expect(dense.overflow).toBe(0);
+    expect(dense.worst).toBeLessThan(1e-5);
+    // A thousand times too little: sub-cells hold more than 12 too, and those items redo their slices exactly.
+    const piled = oneStep(zipfSolver(3000, 0.02, 3));
+    expect(piled.overflow).toBeGreaterThan(0);
+    // Each slot sums hundreds of pushes of up to ~0.1 there (float32 rounding ~1e-5); a missed pair is a
+    // whole push, 1e-3 or more.
+    expect(piled.worst).toBeLessThan(1e-4);
+  });
+
+  it("one collision step equals the all-pairs step where exact loops are cut into work items, whatever k − 1 is modulo a part", () => {
+    // Zipf modules this small take the exact loop everywhere (no grid), cut into parts of COLLISION_PART_PAIRS
+    // partners: 2 · 256 + 1 and 3 · 256 + 1 children fill their last part exactly, 514 leave one partner in a third.
+    for (const [k, seed] of [
+      [513, 4],
+      [514, 5],
+      [769, 6],
+    ] as const) {
+      const solver = zipfSolver(k, 0.1, seed);
+      const s = solver.segCount.indexOf(k);
+      const start = solver.segStart[s] ?? 0;
+      expect(solver.collision.segClasses[s], `${k} children: no grid`).toBe(0);
+      for (let i = start; i < start + k; i++) {
+        const word = solver.collision.slotCollide[i] ?? 0;
+        expect(word & (COLLISION_EXACT | COLLISION_ITEMIZED), `${k} children: slot ${i} exact, in items`).toBe(COLLISION_EXACT | COLLISION_ITEMIZED);
+      }
+      const parts = (solver.collision.items[2 * ((solver.collision.slotCollide[start] ?? 0) >>> COLLISION_ITEM_SHIFT) + 1] ?? 0) >>> 16;
+      expect(parts, `${k} children: parts`).toBe(Math.ceil((k - 1) / COLLISION_PART_PAIRS));
+      // A missed partner is a whole push (≥ 1e-3 this packed); one step's float32 rounding is ~1e-6.
+      expect(oneStep(solver).worst, `${k} children`).toBeLessThan(1e-5);
+    }
+  });
+
+  it("a grid slot's last work item searches to the end of its windows, however few parts the plan counted", () => {
+    // The plan's parts cover the windows as the GPU rounds them (collision-plan.test.ts), so the last part
+    // never has more than COLLISION_PART_VISITS; that it runs to the end keeps the search complete even
+    // without that bound. Handed a plan of one part per grid slot, each grid slot's one item visits every
+    // cell of its windows: the twin's visits, and the all-pairs step.
+    const solver = zipfSolver(3000, 2, 1);
+    const plan = solver.collision;
+    const slotCollide = new Uint32Array(plan.slotCollide.length);
+    const items: number[] = [];
+    let cut = 0;
+    plan.slotCollide.forEach((code, i) => {
+      const own = (code & COLLISION_ITEMIZED) !== 0;
+      const parts = own ? (plan.items[2 * (code >>> COLLISION_ITEM_SHIFT) + 1] ?? 0) >>> 16 : 0;
+      const grid = (code & COLLISION_EXACT) === 0;
+      if (grid && parts > 1) cut++;
+      const keep = grid ? 1 : parts;
+      slotCollide[i] = ((code & ((1 << COLLISION_ITEM_SHIFT) - 1)) | ((items.length / 2) << COLLISION_ITEM_SHIFT)) >>> 0;
+      for (let p = 0; p < keep; p++) items.push(i, (p | (keep << 16)) >>> 0);
+    });
+    expect(cut, "grid slots the plan cuts into several parts").toBeGreaterThan(0);
+    const collision: CollisionPlan = { ...plan, slotCollide, items: Uint32Array.from(items), itemCount: items.length / 2 };
+    const step = oneStep({ ...solver, collision });
+    expect(step.visits).toBeGreaterThan(0);
+    expect(step.worst).toBeLessThan(1e-5);
+  });
+
+  /** Every child disc inside its parent's (the fill is 0.92), every position finite; returns the worst (distance + radius) over the parent's radius. */
+  function containment(tree: NestedLayoutTopology, out: NestedLayoutResult): number {
+    let worst = 0;
+    expect(Array.from(out.positions).every(Number.isFinite)).toBe(true);
+    for (let g = 0; g < tree.size; g++) {
+      const p = tree.parent[g] ?? -1;
+      if (p < 0) continue;
+      const d = Math.hypot((out.cx[g] ?? 0) - (out.cx[p] ?? 0), (out.cy[g] ?? 0) - (out.cy[p] ?? 0));
+      worst = Math.max(worst, (d + (out.r[g] ?? 0)) / (out.r[p] ?? 1));
+    }
+    expect(worst).toBeLessThanOrEqual(1.0001);
+    return worst;
+  }
+
+  /** The big module's sibling pairs: the worst distance over the radius sum, and the share below half of it. */
+  function overlap(tree: NestedLayoutTopology, out: Pick<NestedLayoutResult, "cx" | "cy" | "r">, g: number): { worst: number; deep: number } {
+    const c = Array.from(tree.children.subarray(tree.childOffset[g] ?? 0, tree.childOffset[g + 1] ?? 0));
+    let worst = Infinity;
+    let deep = 0;
+    let pairs = 0;
+    for (let a = 0; a < c.length; a++) {
+      for (let b = a + 1; b < c.length; b++) {
+        const ca = c[a] ?? 0;
+        const cb = c[b] ?? 0;
+        const ratio = Math.hypot((out.cx[ca] ?? 0) - (out.cx[cb] ?? 0), (out.cy[ca] ?? 0) - (out.cy[cb] ?? 0)) / ((out.r[ca] ?? 0) + (out.r[cb] ?? 0));
+        worst = Math.min(worst, ratio);
+        if (ratio < 0.5) deep++;
+        pairs++;
+      }
+    }
+    return { worst, deep: deep / pairs };
+  }
+
+  /** A whole GPU nested layout of `tree` in the CPU layout's shape (leaf radii from the local solution). */
+  function gpuLayout(tree: NestedLayoutTopology, params: NestedLayoutParams): NestedLayoutResult {
+    const solver = nestedSolverTopology(tree, params);
+    const layout = new GpuNestedLayout(device, nestedLayoutPlan(solver));
+    try {
+      layout.runTicks(solver.iterations);
+      const positions = new Float32Array(2 * solver.leafCount);
+      const discs = new Float32Array(4 * (solver.treeSize - solver.leafCount));
+      layout.readComposed(positions, discs);
+      const local = new Float32Array(2 * solver.slotCount);
+      layout.readLocal(local);
+      const ref = new NestedJacobiReference(solver);
+      for (let i = 0; i < solver.slotCount; i++) {
+        ref.x[i] = local[2 * i] ?? 0;
+        ref.y[i] = local[2 * i + 1] ?? 0;
+      }
+      const leafDiscs = ref.compose();
+      const out = nestedSolverResult(solver, positions, discs, undefined, true);
+      for (let i = 0; i < solver.leafCount; i++) out.r[i] = leafDiscs.r[i] ?? 0;
+      return out;
+    } finally {
+      layout.destroy();
+    }
+  }
+
+  it("lays out a 3,000-child Zipf module within the CPU layout's tolerance (containment, overlap)", () => {
+    const { topo: tree, flow } = zipfModuleTree(3000, 20);
+    const gpu = gpuLayout(tree, { size: flow });
+    const cpu = nestedLayout(tree, { size: flow });
+    const g = tree.parent[0] ?? 0;
+    expect(containment(tree, gpu)).toBeCloseTo(containment(tree, cpu), 3);
+    // Heavy-tailed radii leave overlaps in the CPU layout too (#355 Q6): held to the CPU's own result.
+    const a = overlap(tree, gpu, g);
+    const b = overlap(tree, cpu, g);
+    expect(a.worst).toBeGreaterThanOrEqual(b.worst - 0.02);
+    expect(a.deep).toBeLessThan(1.5 * b.deep + 0.002);
+  });
+
+  for (const big of [20_000, 60_000]) {
+    it(`keeps the nested invariants on a ${big.toLocaleString("en")}-child Zipf module, deterministically, with every collision step complete`, () => {
+      const { topo: tree, flow } = zipfModuleTree(big, 20);
+      const params: NestedLayoutParams = { size: flow, iterations: 30 };
+      const solver = nestedSolverTopology(tree, params);
+      // Every compact collision step: no slot left to the exact fallback, and the pair work the plan expects.
+      const layout = new GpuNestedLayout(device, nestedLayoutPlan(solver), { collisionStats: true });
+      try {
+        let steps = 0;
+        while (layout.ticks < solver.iterations) {
+          layout.beginTick();
+          if (layout.ticks >= Math.ceil(0.6 * solver.iterations) && layout.ticks % 4 === 0) {
+            const stats = layout.collisionStats();
+            let work = 0;
+            let overflow = 0;
+            for (let i = 0; i < solver.slotCount; i++) {
+              work += 16 * (stats[4 * i] ?? 0) + (stats[4 * i + 1] ?? 0);
+              if (stats[4 * i + 3] === 2) overflow++;
+            }
+            expect(overflow, `tick ${layout.ticks}: slots sent to the exact fallback`).toBe(0);
+            // Measured at 1.1-1.6× the plan's estimate; a single-scale grid did 36× at 60,000 children.
+            expect(work, `tick ${layout.ticks}: pair work against the plan's ${solver.collision.gatherWork.toFixed(0)}`).toBeLessThan(3 * solver.collision.gatherWork);
+            steps++;
+          }
+          layout.forceBand(0, 1);
+          layout.integrate();
+        }
+        expect(steps).toBeGreaterThan(2);
+      } finally {
+        layout.destroy();
+      }
+      const first = gpuLayout(tree, params);
+      containment(tree, first);
+      expect(Array.from(gpuLayout(tree, params).positions)).toEqual(Array.from(first.positions));
+      // Disc size by the size metric: the big module's discs by rank (radius ∝ √flow, above the floor).
+      const g = tree.parent[0] ?? 0;
+      const kidsOf = Array.from(tree.children.subarray(tree.childOffset[g] ?? 0, tree.childOffset[g + 1] ?? 0));
+      const r0 = first.r[kidsOf[0] ?? 0] ?? 0;
+      expect((first.r[kidsOf[3] ?? 0] ?? 0) / r0).toBeCloseTo(0.5, 2);
+    }, 600_000);
+  }
 });

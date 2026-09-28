@@ -43,7 +43,7 @@ uniform highp sampler2D u_pos;
 uniform highp sampler2D u_rad;
 uniform highp sampler2D u_segSum;    // (Σ rad² x, Σ rad² y, Σ rad², k) per segment
 uniform highp sampler2D u_segExtent; // (max |x − m| + rad, …) per segment
-uniform highp sampler2D u_segNested; // (r₉, owner slot, 0, 0) per segment
+uniform highp sampler2D u_segNested; // (collision cell side, owner slot, 0, 0) per segment
 uniform highp usampler2D u_segInfo;
 uniform highp isampler2D u_nodeSlot; // slot per tree node, −1 for the root
 uniform int u_width;                 // slot atlas width

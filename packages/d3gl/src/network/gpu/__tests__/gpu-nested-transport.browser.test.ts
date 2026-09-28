@@ -49,7 +49,7 @@ function tiledAndExact(): NestedLayoutTopology {
 
 /**
  * `n` leaves, each under a chain of two single-child modules: 3n slots in 2n + 1 segments, so the
- * large-slot table (two texels per segment row) is the largest texture the nested layout allocates.
+ * collision table (three texels per segment row) is the largest texture the nested layout allocates.
  */
 function singleChildChains(n: number): NestedLayoutTopology {
   const records: ModuleNode[] = [];
@@ -200,7 +200,7 @@ describe("startGpuNestedLayout (#355)", () => {
         const solver = nestedSolverTopology(tree, { iterations: 10, radius: 10 * Math.sqrt(tree.leafCount) });
         const plan = nestedLayoutPlan(solver);
         const need = gpuNestedLayoutNeed(plan);
-        const covered = Math.max(need.positionSide, need.offsetsSide, need.springSide, need.pyramidSide, need.nested?.largeSide ?? 0);
+        const covered = Math.max(need.positionSide, need.offsetsSide, need.springSide, need.pyramidSide, need.nested?.collideSide ?? 0, need.nested?.gridSide ?? 0);
         const sides: number[] = [];
         const createTexture = vi.spyOn(device, "createTexture");
         const createFramebuffer = vi.spyOn(device, "createFramebuffer");
@@ -216,14 +216,14 @@ describe("startGpuNestedLayout (#355)", () => {
       }
     });
 
-    // Where the large-slot table is the largest texture, the largest side the layout allocates is the
-    // need's large-slot side exactly: the verdict and the constructor size that table by one rule.
-    it("names the large-slot table's exact side where it is the largest texture (single-child chains)", () => {
+    // Where the collision table is the largest texture, the largest side the layout allocates is the need's
+    // collision-table side exactly: the verdict and the constructor size that table by one rule.
+    it("names the collision table's exact side where it is the largest texture (single-child chains)", () => {
       const solver = nestedSolverTopology(singleChildChains(500), { iterations: 10, radius: 10 * Math.sqrt(500) });
       const plan = nestedLayoutPlan(solver);
       const need = gpuNestedLayoutNeed(plan);
-      const large = need.nested?.largeSide ?? 0;
-      expect(large).toBeGreaterThan(Math.max(need.positionSide, need.offsetsSide, need.springSide, need.pyramidSide));
+      const large = need.nested?.collideSide ?? 0;
+      expect(large).toBeGreaterThan(Math.max(need.positionSide, need.offsetsSide, need.springSide, need.pyramidSide, need.nested?.gridSide ?? 0));
       const sides: number[] = [];
       const createTexture = vi.spyOn(device, "createTexture");
       const layout = new GpuNestedLayout(device, plan);

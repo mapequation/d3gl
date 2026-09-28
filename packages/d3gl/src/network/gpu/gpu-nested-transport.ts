@@ -11,8 +11,8 @@
  * 2. A layout worker builds the solve's data ({@link prepareNestedSolve}: slots, segments, radii, seeds,
  *    links), so the main thread spends nothing on it. With the segments and links known, every texture
  *    the solve allocates is checked against the device ({@link gpuNestedLayoutNeed} of the
- *    {@link nestedLayoutPlan} the layout then allocates: the springs, the tile atlas, the large-slot
- *    table) — an unsupported tree, as in step 1.
+ *    {@link nestedLayoutPlan} the layout then allocates: the springs, the tile atlas, the collision
+ *    table and the collision grid's own textures) — an unsupported tree, as in step 1.
  * 3. {@link GpuNestedLayout} solves every module at every depth at once, streamed by {@link GpuStream}:
  *    work items within the frame budget, positions composed on the GPU and read back through a fenced PBO.
  *    A **cold** layout streams as one animation of all depths converging together (decided, §15 Q5); a
