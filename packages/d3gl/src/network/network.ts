@@ -2264,9 +2264,16 @@ export class Network extends BaseEngine {
    * the frame is framed once the layout settles. O(nodes) per call with no typed-array allocation; called
    * only while a fit is on. A layout whose final extent is known up front frames on that instead
    * ({@link fitKnownBox}). Null if no position is finite.
+   *
+   * While streaming a spatial tree whose super-edge rows the worker cut at the fit of the tree's own positions
+   * (#433), it frames that box instead (the frame header's `fitBox`): the cut is then the one the rows
+   * were built for, even in shared mode, where the live positions are newer than the tree by the time it is
+   * drawn. O(1), and the same box as the leaf positions' in copy mode.
    */
   private layoutFitBox(graph: NetworkGraph, phase: FitPhase): FitBox | null {
-    return this.fitKnownBox ?? layoutBox(graph.positions, graph.nodeCount, { trimStragglers: phase === "streaming" });
+    if (this.fitKnownBox) return this.fitKnownBox;
+    const cutAt = phase === "streaming" && this.lodStreamed && this.lodTree === this.lodWorkerTree ? this.lodStreamed.header.fitBox : undefined;
+    return cutAt ?? layoutBox(graph.positions, graph.nodeCount, { trimStragglers: phase === "streaming" });
   }
 
   /** Final reframe + release of a streaming fit (on settle): fit once more to the settled layout's exact

@@ -324,6 +324,10 @@ describe("a spatial stream ships the rows of its view's covers with each tree (#
     if (!box) throw new Error("no fit box");
     const fitT = layoutFitTransform(box, W, H, 3, true);
     expect(fitTree.rows?.cell).toEqual(rowsForCut(fitTree, g, cutAt(fitTree, fitT, false)).cell);
+    // The frame names the box it framed, so the engine frames the same one — in shared mode the live positions
+    // are newer than the tree by the time it repaints; at a transform there is none to name.
+    expect(f3.header.fitBox).toEqual(box);
+    expect(f1.header.fitBox).toBeUndefined();
     // No links drawn, or no view: no rows.
     stream.style = { ...style, links: false };
     const f4 = lodFrameStep(stream, g.positions, 4);

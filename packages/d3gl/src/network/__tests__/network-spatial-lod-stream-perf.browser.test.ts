@@ -43,38 +43,70 @@ function webLike(n: number, seed = 5): NetworkGraph {
   return buildGraph({ nodeCount: n, source: src, target: tgt });
 }
 
+interface Sample {
+  visits: number;
+  entries: number;
+  misses: number;
+}
+
+/**
+ * Stream a cold-start worker layout of `g` with the camera following the fit, and sample `superEdgeStats` after
+ * every animation frame that drew a worker tree before the run settled. With `liveAhead`, every repaint first
+ * moves the positions on from the ones the drawn tree was built from, as in shared (SharedArrayBuffer) mode,
+ * where the worker keeps writing the positions the main thread reads live: the layout grows 3% per frame.
+ */
+async function streamedRepaints(g: NetworkGraph, iterations: number, liveAhead: boolean): Promise<{ samples: Sample[]; builds: number }> {
+  const host = perfHost(400, 400);
+  const net = network(host, { width: 400, height: 400 });
+  const installed = window.requestAnimationFrame;
+  try {
+    await net.whenReady();
+    let settled = false;
+    const samples: Sample[] = [];
+    let moved = Number.NaN; // node 0's x after the last move: a copy-mode frame overwrites it
+    window.requestAnimationFrame = (callback: FrameRequestCallback): number =>
+      installed.call(window, (t: number) => {
+        if (liveAhead && !settled && g.positions[0] !== moved) {
+          for (let i = 0; i < g.positions.length; i++) g.positions[i] = (g.positions[i] ?? 0) * 1.03;
+          moved = g.positions[0] ?? Number.NaN;
+        }
+        callback(t);
+        const stats = net.superEdgeStats;
+        if (!settled && stats && net.lodSource === "worker") samples.push({ visits: stats.visits, entries: stats.entries, misses: stats.misses });
+      });
+    const builds0 = spatialRowBuilds;
+    net.data(g).style({ sizeMode: "screen", nodeRadius: 3 }).lod({ source: "spatial", maxAggregateRadius: 18 }).layout({ backend: "worker", iterations, multilevel: false, fit: true }); // a cold start keeps its heat: a long stream
+    await net.whenSettled().then(() => { settled = true; });
+    return { samples, builds: spatialRowBuilds - builds0 };
+  } finally {
+    window.requestAnimationFrame = installed;
+    net.destroy();
+    host.remove();
+  }
+}
+
+function expectRowsRead(samples: Sample[], g: NetworkGraph, builds: number): void {
+  expect(samples.length, "no repaint drew a worker tree").toBeGreaterThan(3);
+  for (const [i, s] of samples.entries()) {
+    expect(s.visits, `streamed repaint ${i} of ${samples.length} walked edge incidences on the main thread`).toBe(0);
+    expect(s.misses, `streamed repaint ${i} of ${samples.length} computed rows on the main thread`).toBe(0);
+    expect(s.entries).toBeGreaterThan(0);
+  }
+  expect(builds, "super-edge rows built on the main thread").toBe(0);
+  // What the lazy gather walked per repaint was every incidence under the frontier; the rows read are fewer.
+  expect(Math.max(...samples.map((s) => s.entries))).toBeLessThan(g.csr.neighbors.length);
+}
+
 describe("streamed spatial LOD links (#433) — network().lod({ source: 'spatial' }).layout({ backend: 'worker' })", () => {
   it(`every streamed repaint reads the worker's super-edge rows: no edge walked, no row computed or built on the main thread (N=${N.toLocaleString()})`, async () => {
-    const host = perfHost(400, 400);
-    const net = network(host, { width: 400, height: 400 });
-    const installed = window.requestAnimationFrame;
-    try {
-      await net.whenReady();
-      const g = webLike(N);
-      let settled = false;
-      const samples: { visits: number; entries: number; misses: number }[] = [];
-      window.requestAnimationFrame = (callback: FrameRequestCallback): number =>
-        installed.call(window, (t: number) => {
-          callback(t);
-          const stats = net.superEdgeStats;
-          if (!settled && stats && net.lodSource === "worker") samples.push({ visits: stats.visits, entries: stats.entries, misses: stats.misses });
-        });
-      const builds0 = spatialRowBuilds;
-      net.data(g).style({ sizeMode: "screen", nodeRadius: 3 }).lod({ source: "spatial", maxAggregateRadius: 18 }).layout({ backend: "worker", iterations: 200, multilevel: false, fit: true }); // a cold start keeps its heat: a long stream
-      await net.whenSettled().then(() => { settled = true; });
-      expect(samples.length, "no repaint drew a worker tree").toBeGreaterThan(3);
-      for (const [i, s] of samples.entries()) {
-        expect(s.visits, `streamed repaint ${i} of ${samples.length} walked edge incidences on the main thread`).toBe(0);
-        expect(s.misses, `streamed repaint ${i} of ${samples.length} computed rows on the main thread`).toBe(0);
-        expect(s.entries).toBeGreaterThan(0);
-      }
-      expect(spatialRowBuilds - builds0, "super-edge rows built on the main thread").toBe(0);
-      // What the lazy gather walked per repaint was every incidence under the frontier; the rows read are fewer.
-      expect(Math.max(...samples.map((s) => s.entries))).toBeLessThan(g.csr.neighbors.length);
-    } finally {
-      window.requestAnimationFrame = installed;
-      net.destroy();
-      host.remove();
-    }
+    const g = webLike(N);
+    const { samples, builds } = await streamedRepaints(g, 200, false);
+    expectRowsRead(samples, g, builds);
+  }, perfBudget(60_000));
+
+  it(`with live positions ahead of the drawn tree (shared mode), the camera frames the tree's own box: still no edge walked or row computed (N=${N.toLocaleString()})`, async () => {
+    const g = webLike(N, 6);
+    const { samples, builds } = await streamedRepaints(g, 80, true);
+    expectRowsRead(samples, g, builds);
   }, perfBudget(60_000));
 });

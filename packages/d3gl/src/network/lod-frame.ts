@@ -42,7 +42,7 @@ import {
   type MortonTopologyArrays,
   type MortonTopologySizes,
 } from "./lod.js";
-import { layoutBox, layoutFitTransform } from "./fit.js";
+import { layoutBox, layoutFitTransform, type FitBox } from "./fit.js";
 import {
   buildCoverRows,
   cutRowCells,
@@ -83,6 +83,13 @@ export interface SpatialFrameHeader {
   styleVersion: number;
   /** The frame id it was built for (the worker's tick). */
   frame: number;
+  /**
+   * The layout box of the frame's positions its super-edge rows were cut at, when the view followed the fit
+   * (#433: `layoutBox` without stragglers). The engine frames this box while it follows the fit, so it cuts
+   * the tree where the rows were cut — in shared mode the live positions are newer than the tree by the time
+   * it repaints. Absent when the rows were cut at a transform, or there are none.
+   */
+  fitBox?: FitBox;
 }
 
 /**
@@ -377,36 +384,36 @@ export function lodFrameStep(stream: LODStream, positions: ArrayLike<number>, fr
   if (!style?.colors) views.color.fill(0); // a reused buffer holds the last frame's colours
   // The super-edge rows of the covers the main thread's view will draw (#433), into a pooled buffer.
   const links = stream.links;
-  const rows = links && stream.view && style?.links !== false ? coverRows(tree, positions, stream.view, links) : undefined;
-  return {
-    header: {
-      size: topology.size,
-      leafCount: n,
-      levelCount: topology.levelCount,
-      leafBranching: tree.leafBranching,
-      box,
-      styleVersion: style ? stream.styleVersion : -1,
-      frame,
-    },
-    buffer,
-    rows,
+  const cover = links && stream.view && style?.links !== false ? coverRows(tree, positions, stream.view, links) : undefined;
+  const header: SpatialFrameHeader = {
+    size: topology.size,
+    leafCount: n,
+    levelCount: topology.levelCount,
+    leafBranching: tree.leafBranching,
+    box,
+    styleVersion: style ? stream.styleVersion : -1,
+    frame,
   };
+  if (cover?.fitBox) header.fitBox = cover.fitBox;
+  return { header, buffer, rows: cover?.rows };
 }
 
 /**
  * The super-edge rows of the covers `view`'s cut draws on `tree` (#433): the engine's cut, at the view's
- * transform — or, while it follows the fit, at the fit the engine frames `positions` at — with the culled
- * roots recorded; its covers whose rows can matter ({@link cutRowCells}, with the drawn glyphs as the floor)
- * get one. O(drawn + culled) for the cut, then {@link buildCoverRows}: O(edges under those covers) ≤ 2E.
+ * transform — or, while it follows the fit, at the fit the engine frames `positions` at (returned as
+ * `fitBox`, for the frame's header) — with the culled roots recorded; its covers whose rows can matter
+ * ({@link cutRowCells}, with the drawn glyphs as the floor) get one. O(drawn + culled) for the cut (+ O(leaves)
+ * for the fit's box), then {@link buildCoverRows}: O(edges under those covers) ≤ 2E.
  */
-function coverRows(tree: LODTree, positions: ArrayLike<number>, view: LODView, links: SpatialLinks): SpatialRowsFrame | undefined {
+function coverRows(tree: LODTree, positions: ArrayLike<number>, view: LODView, links: SpatialLinks): { rows: SpatialRowsFrame; fitBox: FitBox | null } | undefined {
   const { parent, leafOrder, leafStart, leafEnd } = tree;
   if (!parent || !leafOrder || !leafStart || !leafEnd) return undefined;
   let t = view.transform;
+  let fitBox: FitBox | null = null;
   if (!t) {
-    const box = layoutBox(positions, tree.leafCount, { trimStragglers: true });
-    if (!box) return undefined;
-    t = layoutFitTransform(box, view.width, view.height, view.fitPad, view.screenSized);
+    fitBox = layoutBox(positions, tree.leafCount, { trimStragglers: true });
+    if (!fitBox) return undefined;
+    t = layoutFitTransform(fitBox, view.width, view.height, view.fitPad, view.screenSized);
   }
   const sc = links.cut;
   const drawn = cut(tree, t, view.width, view.height, {
@@ -426,5 +433,5 @@ function coverRows(tree: LODTree, positions: ArrayLike<number>, view: LODView, l
     return spatialRowsViews(b, s);
   });
   if (!out.buffer) throw new Error("lodFrameStep: the super-edge rows were built without their buffer");
-  return { sizes, buffer: out.buffer };
+  return { rows: { sizes, buffer: out.buffer }, fitBox };
 }
