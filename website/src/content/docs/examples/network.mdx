@@ -643,7 +643,7 @@ await net.whenSettled(); // resolves when the transition ends
   off-screen, and a warm start from a nested layout doesn't drift over repeated re-clusters. It posts no
   per-depth frames (those would collapse every module to a point first); on a graph never laid out it is
   the cold layout.
-- **`backend: "gpu"`** solves it on the GPU — about 2 s for a 325,729-leaf map where the CPU takes about
+- **`backend: "gpu"`** solves it on the GPU — about 2.5 s for a 325,729-leaf map where the CPU takes about
   20 s, with the main thread busy only for a one-off ~0.1 s setup — and reads back only the final layout,
   once. It falls back to the worker (`backend: "worker"`, which gives the CPU layout exactly) where the
   GPU layout cannot run, and when a GPU solve stops early (a lost context, a non-finite layout) none of it
@@ -652,14 +652,17 @@ await net.whenSettled(); // resolves when the transition ends
   The GPU solve updates siblings together where the CPU applies them one by one, so the two maps differ in
   detail but keep the same invariants: every child inside its parent, siblings apart, linked siblings
   close. The disc collision bins each child at the scale of its own size, so a module of very uneven child
-  sizes costs time in proportion to its children's contacts, not to their number squared: one module of
-  60,000 children with power-law flows lays out in about 1.4 s (the CPU: 5 minutes) without a stalled
-  frame, and Infomap's trees of web-NotreDame in about 2 s. Because the GPU solve applies all of a child's
+  sizes costs time in proportion to its children's contacts, not to their number squared. Every pass of
+  the solve, and the composition that each repaint reads back, is cut into bands sized to the frame's GPU
+  budget (10 ms at 60 Hz, 5 ms at 120 Hz), so by the passes' measured costs a frame queues no more layout
+  work than that, at 1,000,000 leaves too; on a busy GPU a frame runs over by as much as its passes do.
+  On an M1 Max one module of 60,000 children with power-law flows lays out in about 2.5-2.7 s (the CPU: 5
+  minutes) without a stalled frame, Infomap's trees of web-NotreDame in 2.3-3.2 s, and the
+  1,000,000-leaf map of the timing bench in about 4.5 s. Because the GPU solve applies all of a child's
   springs at once, a child linked to many of its siblings (a hub) would overshoot, so its springs are
   relaxed just enough to keep each step stable: a hub is pulled a little less per step than on the CPU.
   On web-NotreDame's directed Infomap tree, whose hubs are small low-flow pages, that is 3.5% of the
-  children. One limit: at 1,000,000 leaves a frame that reads positions back carries up to about 17 ms of
-  layout GPU work, over the 10 ms frame budget.
+  children.
 - **`transition: 600`** eases every node from where it is to its new place over 600 ms (cubic
   ease-in-out) on the main thread. The layout computes the final positions only; each animation frame is then
   a positions-only repaint — no more work than a frame of a streaming layout. `transition` also eases a
