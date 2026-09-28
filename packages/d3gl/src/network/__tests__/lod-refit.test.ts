@@ -8,8 +8,9 @@ import { describe, expect, it } from "vitest";
 import { buildGraph, type NetworkGraph } from "../graph.js";
 import { buildHierarchy } from "../coarsen.js";
 import { computeLODPositions, flattenHierarchyToTopology, lodTreeFromTopology, type LODTopology } from "../lod.js";
-import { coarsenForRefit, refitGeometry, topologyTransferables } from "../lod-refit.js";
-import { lodGeometryByteLength } from "../worker-protocol.js";
+import { answerCoarsen, coarsenForRefit, refitGeometry, topologyTransferables } from "../lod-refit.js";
+import { lodGeometryByteLength, type WorkerToMain } from "../worker-protocol.js";
+import { coarseSeedPlan, seedPlanTransferables } from "../gpu/seed-plan.js";
 
 function makePrng(seed: number): () => number {
   let s = seed >>> 0;
@@ -100,5 +101,51 @@ describe("LOD geometry refit (#377)", () => {
     const reference = lodTreeFromTopology(topology);
     computeLODPositions(reference, g.positions);
     expect(second.subarray(0, tree.size)).toEqual(reference.cx);
+  });
+});
+
+describe("the coarsening worker's answer (#377, #353)", () => {
+  const seed = { width: 800, height: 600 };
+  const request = (g: NetworkGraph, lod: boolean, withSeed: boolean) => ({
+    type: "coarsen" as const,
+    nodeCount: g.nodeCount,
+    source: g.source,
+    target: g.target,
+    weight: g.weight,
+    lod,
+    ...(withSeed ? { seed } : {}),
+  });
+
+  it("sends the seed plan first — the plan of the same hierarchy — then the LOD topology, each with its buffers", () => {
+    const g = clustered(3000, 11);
+    const sent: { message: WorkerToMain; transfer: ArrayBuffer[] }[] = [];
+    const tree = answerCoarsen(request(g, true, true), (message, transfer) => sent.push({ message, transfer }));
+    expect(sent.map((s) => s.message.type)).toEqual(["seed-plan", "lod-topology"]);
+    const first = sent[0]?.message;
+    if (first?.type !== "seed-plan" || !first.plan) throw new Error("no plan");
+    const expected = coarseSeedPlan(g, buildHierarchy(g), seed);
+    expect(first.plan.levels.map((l) => l.count)).toEqual(expected?.levels.map((l) => l.count));
+    expect(sent[0]?.transfer).toEqual(seedPlanTransferables(first.plan));
+    const second = sent[1]?.message;
+    if (second?.type !== "lod-topology") throw new Error("no topology");
+    expect(sent[1]?.transfer).toEqual(topologyTransferables(second.topology));
+    expect(tree?.size).toBe(second.topology.size);
+  });
+
+  it("with LOD off, sends only the plan and keeps no tree; without a seed request, only the topology", () => {
+    const g = clustered(2000, 12);
+    const seedOnly: string[] = [];
+    expect(answerCoarsen(request(g, false, true), (m) => seedOnly.push(m.type))).toBeNull();
+    expect(seedOnly).toEqual(["seed-plan"]);
+    const lodOnly: string[] = [];
+    expect(answerCoarsen(request(g, true, false), (m) => lodOnly.push(m.type))).not.toBeNull();
+    expect(lodOnly).toEqual(["lod-topology"]);
+  });
+
+  it("sends a null plan for a graph that cannot be coarsened", () => {
+    const g = buildGraph({ nodeCount: 20, source: [], target: [] });
+    const sent: WorkerToMain[] = [];
+    answerCoarsen(request(g, false, true), (m) => sent.push(m));
+    expect(sent).toEqual([{ type: "seed-plan", plan: null }]);
   });
 });

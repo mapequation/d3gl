@@ -1,12 +1,12 @@
 /**
- * The layout worker's LOD half (#377) in process, for tests: it answers `coarsen` and `lod-geometry` with the
- * real worker code (`lod-refit.ts`), and moves buffers the way `postMessage` transfers them (the sender's
- * copy detaches). Messages queue until {@link InProcessLODWorker.flush} — by hand in node tests, or on a
+ * The layout worker's coarsening half (#377, #353) in process, for tests: it answers `coarsen` (the seed plan
+ * and the LOD topology) and `lod-geometry` with the real worker code (`lod-refit.ts`), and moves buffers the
+ * way `postMessage` transfers them (the sender's copy detaches). Messages queue until {@link InProcessLODWorker.flush} — by hand in node tests, or on a
  * timer (`auto`), like a real worker's turn, in browser tests that cannot load a worker (a file that
  * `vi.mock`s a module the worker imports serves the worker the mock, which cannot run there).
  */
 import type { LODPositionTree } from "../../lod.js";
-import { coarsenForRefit, refitGeometry, topologyTransferables } from "../../lod-refit.js";
+import { answerCoarsen, refitGeometry } from "../../lod-refit.js";
 import { lodGeometryByteLength, type MainToWorker, type WorkerToMain } from "../../worker-protocol.js";
 import type { LODWorkerPort } from "../lod-relay.js";
 
@@ -48,9 +48,7 @@ export class InProcessLODWorker implements LODWorkerPort {
     for (let msg = this.queue.shift(); msg; msg = this.queue.shift()) {
       if (this.terminated) return;
       if (msg.type === "coarsen") {
-        const { topology, tree } = coarsenForRefit(msg, msg.coarsen);
-        this.tree = tree;
-        this.reply({ type: "lod-topology", topology }, topologyTransferables(topology));
+        this.tree = answerCoarsen(msg, (message, transfer) => this.reply(message, transfer));
       } else if (msg.type === "lod-geometry" && this.tree) {
         const buffer = msg.geometry?.buffer ?? new ArrayBuffer(lodGeometryByteLength(this.tree.size));
         const geometry = refitGeometry(this.tree, msg.positions, buffer);

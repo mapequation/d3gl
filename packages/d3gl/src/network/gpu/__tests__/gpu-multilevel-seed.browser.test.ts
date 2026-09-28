@@ -1,28 +1,31 @@
 /**
- * Module-aware GPU multilevel seed (#180 / N8.2).
+ * The GPU multilevel seed on one solver (#353, spec §6.4 / §8, T10), and the module-aware seed it runs for a
+ * module tree (#180 / N8.2).
  *
- * Three concerns:
- *   1. **Seed quality** — on a planted-module graph the module-aware seed places same-module nodes
- *      much closer than cross-module ones (module coherence << 1), better than the plain disc seed,
- *      and refines to a good layout (spreadRatio << 1, the metric shared with gpu-convergence).
- *   2. **Ragged correctness** — a hierarchy whose branches reach different depths seeds without error;
- *      every leaf gets a finite position inside its module's region.
- *   3. **Scale (guards the smallness assumption)** — a ≈1M-node graph with a WIDE top level (thousands
- *      of top modules) and a separate DEEP hierarchy both seed under a generous wall-clock ceiling,
- *      with the per-level solve running on the **GPU** (a bounded, O(depth) number of GPU solves) and
- *      **zero CPU per-level force work** (the CPU ForceLayout.tick is never called). This test FAILS if
- *      someone reintroduces a CPU "small level" force shortcut.
- *   4. **Portable readback (#351)** — on a device that reads `rg32f` only as `RGBA/FLOAT`, both kinds of
- *      level (solved and prolongate-only) read their positions back, and the seed matches an `RG/FLOAT` device.
+ * 1. **Levels are the CPU's.** A seed level's forces, from identical positions, are the CPU's mass-weighted
+ *    forces: repulsion by the other slots' masses, springs `attraction · w / mass`, centering on the
+ *    mass-weighted centroid — on an all-pairs level and on a Barnes-Hut level.
+ * 2. **Per-level state.** `setLevel` zeroes the level's velocities (by MRT), points the segment at its slots,
+ *    and allocates nothing; placing every level without solves lands the graph's nodes exactly where the
+ *    plan puts them (a coarsening's prolongation, a module tree's leaf seed).
+ * 3. **Seed quality.** A coarsening seed lands at the force equilibrium's scale and keeps clusters together;
+ *    the module seed keeps modules coherent, ragged branches at their own density, and every leaf once.
+ * 4. **Scale.** A ≈1M-node wide module tree and a deep one seed with no CPU force work, one GPU placement per
+ *    level, on one solver.
+ * 5. **Portable readback (#351).** A device that reads `rg32f` only as `RGBA/FLOAT` seeds exactly as an
+ *    `RG/FLOAT` device.
  */
 
 import { describe, it, expect, beforeAll, vi } from "vitest";
 import type { Device } from "@luma.gl/core";
 import { makeTestDevice } from "./_device.js";
 import { makeRgbaReadDevice } from "./_rgba-read-device.js";
-import { gpuMultilevelSeed, canModuleSeed } from "../gpu-multilevel-seed.js";
 import { GpuForceLayout } from "../gpu-force-layout.js";
-import { ForceLayout, seedPositions, DEFAULT_FORCE } from "../../force.js";
+import { canModuleSeed, coarseSeedPlan, moduleSeedPlan, type SeedLevel, type SeedPlan } from "../seed-plan.js";
+import { readbackRgbaFbo } from "../textures.js";
+import { gridPyramidReference } from "./grid-pyramid-reference.js";
+import { buildHierarchy, multilevelSeed, type CoarseLevel } from "../../coarsen.js";
+import { ForceLayout, seedPositions, DEFAULT_FORCE, type ForceParams, type LayoutGraph } from "../../force.js";
 import { buildModuleLODTree, type ModuleNode } from "../../modules.js";
 import type { LODTree } from "../../lod.js";
 
@@ -37,51 +40,30 @@ function makePrng(seed: number): () => number {
 
 // ── metrics ───────────────────────────────────────────────────────────────────
 
-/**
- * Module coherence = mean(intra-module pair distance) / mean(cross-module pair distance) over sampled
- * pairs. << 1 means same-module nodes are much closer than cross-module ones — a coherent layout.
- */
-function moduleCoherence(pos: Float32Array, moduleOf: Int32Array, maxPairs = 6000): number {
+/** mean(intra-group pair distance) / mean(cross-group pair distance) over sampled pairs: << 1 = coherent. */
+function coherence(pos: Float32Array, groupOf: Int32Array, maxPairs = 6000): number {
   const n = pos.length / 2;
   const rng = makePrng(0xc0ffee);
   let intra = 0, ni = 0, inter = 0, ne = 0;
   for (let s = 0; s < maxPairs; s++) {
     const i = Math.floor(rng() * n);
-    let j = Math.floor(rng() * n);
+    const j = Math.floor(rng() * n);
     if (i === j) continue;
-    const dx = pos[i * 2]! - pos[j * 2]!;
-    const dy = pos[i * 2 + 1]! - pos[j * 2 + 1]!;
-    const d = Math.sqrt(dx * dx + dy * dy);
-    if (moduleOf[i] === moduleOf[j]) { intra += d; ni++; } else { inter += d; ne++; }
+    const d = Math.hypot(pos[i * 2]! - pos[j * 2]!, pos[i * 2 + 1]! - pos[j * 2 + 1]!);
+    if (groupOf[i] === groupOf[j]) { intra += d; ni++; } else { inter += d; ne++; }
   }
   if (ni === 0 || ne === 0) return 1;
   return (intra / ni) / (inter / ne);
 }
 
-/** spreadRatio = mean connected edge length / mean random pair distance (<< 1 = good layout). */
-function spreadRatio(pos: Float32Array, source: Uint32Array, target: Uint32Array, maxPairs = 3000): number {
-  const m = source.length;
-  if (m === 0) return 1;
-  let edgeLen = 0;
-  for (let e = 0; e < m; e++) {
+/** Mean connected edge length. */
+function meanEdge(pos: Float32Array, source: Uint32Array, target: Uint32Array): number {
+  let sum = 0;
+  for (let e = 0; e < source.length; e++) {
     const a = source[e]!, b = target[e]!;
-    const dx = pos[a * 2]! - pos[b * 2]!, dy = pos[a * 2 + 1]! - pos[b * 2 + 1]!;
-    edgeLen += Math.sqrt(dx * dx + dy * dy);
+    sum += Math.hypot(pos[a * 2]! - pos[b * 2]!, pos[a * 2 + 1]! - pos[b * 2 + 1]!);
   }
-  edgeLen /= m;
-  const n = pos.length / 2;
-  const rng = makePrng(0xbeef);
-  let pd = 0;
-  const count = Math.min(maxPairs, (n * (n - 1)) / 2);
-  for (let k = 0; k < count; k++) {
-    const i = Math.floor(rng() * n);
-    let j = Math.floor(rng() * (n - 1));
-    if (j >= i) j++;
-    const dx = pos[i * 2]! - pos[j * 2]!, dy = pos[i * 2 + 1]! - pos[j * 2 + 1]!;
-    pd += Math.sqrt(dx * dx + dy * dy);
-  }
-  pd /= count;
-  return pd < 1e-10 ? 1 : edgeLen / pd;
+  return sum / Math.max(1, source.length);
 }
 
 /** 95th-percentile distance from the centroid. */
@@ -94,36 +76,26 @@ function r95(pos: Float32Array): number {
   return r[Math.floor(0.95 * (n - 1))] ?? 0;
 }
 
-/** All sampled positions finite (no NaN / ±Inf). */
 function allFinite(pos: Float32Array, sampleEvery = 1): boolean {
   for (let i = 0; i < pos.length; i += sampleEvery) if (!Number.isFinite(pos[i]!)) return false;
   return true;
 }
 
-// ── graph generators ──────────────────────────────────────────────────────────
+// ── graphs ────────────────────────────────────────────────────────────────────
 
-interface PlantedGraph {
-  nodeCount: number;
-  source: Uint32Array;
-  target: Uint32Array;
-  weight: Float32Array;
-  moduleOf: Int32Array; // per node → its planted module (round-robin, so disc-order does NOT cluster it)
+interface Graph extends CoarseLevel {
+  groupOf: Int32Array;
 }
 
-/**
- * `k` planted modules of `m` nodes each, **round-robin** assigned (moduleOf[i] = i % k) so the disc
- * seed's phyllotaxis order does not accidentally cluster a module — a fair "bad" baseline. Dense
- * intra-module edges + a few cross-module bridges.
- */
-function makePlantedGraph(k: number, m: number, intraDeg: number, bridgesPerPair: number, seed: number): PlantedGraph {
+/** `k` clusters of `m` nodes (node i in cluster i % k, so a disc's order does not cluster them), mostly intra edges. */
+function planted(k: number, m: number, intraDeg: number, bridgesPerPair: number, seed: number): Graph {
   const rng = makePrng(seed);
-  const nodeCount = k * m;
-  const moduleOf = new Int32Array(nodeCount);
+  const n = k * m;
+  const groupOf = new Int32Array(n);
   const members: number[][] = Array.from({ length: k }, () => []);
-  for (let i = 0; i < nodeCount; i++) { const c = i % k; moduleOf[i] = c; members[c]!.push(i); }
+  for (let i = 0; i < n; i++) { groupOf[i] = i % k; members[i % k]!.push(i); }
   const src: number[] = [], tgt: number[] = [];
-  for (let c = 0; c < k; c++) {
-    const mem = members[c]!;
+  for (const mem of members) {
     for (let a = 0; a < mem.length; a++) {
       for (let e = 0; e < intraDeg; e++) {
         const b = Math.floor(rng() * mem.length);
@@ -135,19 +107,34 @@ function makePlantedGraph(k: number, m: number, intraDeg: number, bridgesPerPair
     src.push(members[a]![Math.floor(rng() * m)]!);
     tgt.push(members[b]![Math.floor(rng() * m)]!);
   }
-  return { nodeCount, source: Uint32Array.from(src), target: Uint32Array.from(tgt), weight: new Float32Array(src.length).fill(1), moduleOf };
+  return { nodeCount: n, source: Uint32Array.from(src), target: Uint32Array.from(tgt), weight: new Float32Array(src.length).fill(1), groupOf };
 }
 
-/** Flat one-level module records: path = [module + 1, rank] → leaf module = the planted module. */
-function flatRecords(moduleOf: Int32Array): ModuleNode[] {
+/** `k` clusters of contiguous ids with `perNode` edges each, 90% inside the cluster: coarsens over many levels. */
+function clustered(k: number, m: number, perNode: number, seed: number): Graph {
+  const rng = makePrng(seed);
+  const n = k * m;
+  const e = n * perNode;
+  const source = new Uint32Array(e), target = new Uint32Array(e);
+  const groupOf = new Int32Array(n);
+  for (let i = 0; i < n; i++) groupOf[i] = Math.floor(i / m);
+  for (let q = 0; q < e; q++) {
+    const a = Math.floor(rng() * n);
+    source[q] = a;
+    target[q] = rng() < 0.9 ? Math.floor(a / m) * m + Math.floor(rng() * m) : Math.floor(rng() * n);
+  }
+  return { nodeCount: n, source, target, weight: new Float32Array(e).fill(1), groupOf };
+}
+
+/** Flat one-level module records: path = [group + 1, rank]. */
+function flatRecords(groupOf: Int32Array): ModuleNode[] {
   const rank = new Map<number, number>();
-  return Array.from(moduleOf, (c, id) => {
+  return Array.from(groupOf, (c, id) => {
     const r = (rank.get(c) ?? 0) + 1; rank.set(c, r);
     return { id, path: [c + 1, r] };
   });
 }
 
-/** Tree-node depths from the parent map (root = 0), for asserting a ragged hierarchy. */
 function depthsOf(tree: LODTree): Int32Array {
   const parent = tree.parent!;
   const depth = new Int32Array(tree.size);
@@ -155,113 +142,375 @@ function depthsOf(tree: LODTree): Int32Array {
   return depth;
 }
 
+const W = 800;
+const H = 600;
+
+/** A multilevel solver over `g`, from the disc the transport seeds (what the solver holds before the seed). */
+function solver(device: Device, g: CoarseLevel, force: ForceParams = DEFAULT_FORCE): GpuForceLayout {
+  const view: LayoutGraph = { nodeCount: g.nodeCount, edgeCount: g.source.length, source: g.source, target: g.target, positions: new Float32Array(g.nodeCount * 2) };
+  seedPositions(view, W, H, { force });
+  return new GpuForceLayout(device, view, force, { multilevel: true });
+}
+
+/** Run `plan` on a fresh solver and read the graph's seeded positions. */
+function gpuSeed(device: Device, g: CoarseLevel, plan: SeedPlan): Float32Array {
+  const layout = solver(device, g);
+  layout.runSeed(plan);
+  const out = new Float32Array(g.nodeCount * 2);
+  layout.readPositions(out);
+  layout.destroy();
+  return out;
+}
+
+/**
+ * The CPU's forces on a seed level (float64): exact repulsion by the other slots' masses, springs
+ * `attraction · w / mass_i`, centering on the mass-weighted centroid — `ForceLayout.tick` with masses, exact.
+ */
+function levelForces(level: SeedLevel, pos: Float32Array, attraction: number, params: ForceParams = DEFAULT_FORCE): Float64Array {
+  const n = level.count;
+  const f = new Float64Array(n * 2);
+  let cx = 0, cy = 0, mt = 0;
+  for (let i = 0; i < n; i++) { const m = level.mass[i]!; cx += m * pos[i * 2]!; cy += m * pos[i * 2 + 1]!; mt += m; }
+  cx /= mt; cy /= mt;
+  for (let i = 0; i < n; i++) {
+    const xi = pos[i * 2]!, yi = pos[i * 2 + 1]!;
+    let ax = 0, ay = 0;
+    for (let j = 0; j < n; j++) {
+      if (j === i) continue;
+      const dx = xi - pos[j * 2]!, dy = yi - pos[j * 2 + 1]!;
+      const k = (params.repulsion * level.mass[j]!) / (dx * dx + dy * dy + 1e-2);
+      ax += k * dx; ay += k * dy;
+    }
+    let sx = 0, sy = 0;
+    for (let p = level.offsets[i]!; p < level.offsets[i + 1]!; p++) {
+      const j = level.neighbors[p]!, w = level.weights[p]!;
+      sx += w * (pos[j * 2]! - xi); sy += w * (pos[j * 2 + 1]! - yi);
+    }
+    const ka = attraction / level.mass[i]!;
+    f[i * 2] = ax + ka * sx + params.centering * (cx - xi);
+    f[i * 2 + 1] = ay + ka * sy + params.centering * (cy - yi);
+  }
+  return f;
+}
+
+/** Per slot `|ΔF| / (|F| + F_s)` (spec §9's statistic, F_s = repulsion / spacing), sorted ascending. */
+function relativeErrors(gpu: Float32Array, cpu: Float64Array, params: ForceParams = DEFAULT_FORCE): number[] {
+  const fs = params.repulsion / Math.sqrt((Math.PI * params.repulsion) / params.centering);
+  const out: number[] = [];
+  for (let i = 0; i < cpu.length / 2; i++) {
+    const d = Math.hypot(gpu[i * 2]! - cpu[i * 2]!, gpu[i * 2 + 1]! - cpu[i * 2 + 1]!);
+    out.push(d / (Math.hypot(cpu[i * 2]!, cpu[i * 2 + 1]!) + fs));
+  }
+  return out.sort((a, b) => a - b);
+}
+const quantile = (xs: number[], q: number): number => xs[Math.min(xs.length - 1, Math.floor(q * xs.length))] ?? NaN;
+
+/** Place levels 0 … k of `plan` on `layout`, running none of their ticks. */
+function stepTo(layout: GpuForceLayout, plan: SeedPlan, k: number): void {
+  layout.beginSeed(plan);
+  for (let j = 0; j <= k; j++) layout.setLevel(j);
+}
+
 // ── tests ─────────────────────────────────────────────────────────────────────
 
-describe("gpuMultilevelSeed — module-aware GPU seed (#180 N8.2)", () => {
+describe("GPU multilevel seed: one solver, the CPU's mass-weighted levels (#353)", () => {
+  let device: Device;
+  beforeAll(async () => { device = await makeTestDevice(); });
+
+  it("an all-pairs seed level's forces are the CPU's mass-weighted forces, from the same positions", () => {
+    const g = clustered(60, 40, 4, 0x11);
+    // Levels are placed without their ticks below (stepTo), so the forces are taken at the placement.
+    const plan = coarseSeedPlan(g, buildHierarchy(g), { width: W, height: H });
+    if (!plan) throw new Error("no plan");
+    const k = plan.levels.findIndex((l) => l.count > 200 && l.count <= 4096);
+    const level = plan.levels[k];
+    if (!level) throw new Error("no all-pairs level");
+    expect(level.neighbors.length).toBeGreaterThan(0); // the springs take part
+    const layout = solver(device, g);
+    stepTo(layout, plan, k);
+    const pos = new Float32Array(level.count * 2);
+    layout.readPositions(pos);
+    layout.beginTick();
+    layout.forceBand(0, 1);
+    const gpu = new Float32Array(level.count * 2);
+    layout.readForces(gpu);
+    layout.destroy();
+    const errors = relativeErrors(gpu, levelForces(level, pos, plan.attraction));
+    console.log(`  [level ${k}, ${level.count} slots, all-pairs] relative force error p50 ${quantile(errors, 0.5).toExponential(2)} p99 ${quantile(errors, 0.99).toExponential(2)} max ${quantile(errors, 1).toExponential(2)}`);
+    expect(quantile(errors, 0.99)).toBeLessThan(1e-4);
+    expect(quantile(errors, 1)).toBeLessThan(1e-3);
+  });
+
+  it("a Barnes-Hut seed level's forces are the mass-weighted grid-pyramid tick's, and near the CPU's exact forces", () => {
+    const g = clustered(300, 60, 3, 0x22); // 18k nodes: level 1 is past the all-pairs size
+    const plan = coarseSeedPlan(g, buildHierarchy(g), { width: W, height: H });
+    if (!plan) throw new Error("no plan");
+    const k = plan.levels.findIndex((l) => l.count > 4096);
+    const level = plan.levels[k];
+    if (!level) throw new Error("no pyramid level");
+    const layout = solver(device, g);
+    stepTo(layout, plan, k);
+    const pos = new Float32Array(level.count * 2);
+    layout.readPositions(pos);
+    layout.beginTick();
+    layout.forceBand(0, 1);
+    const gpu = new Float32Array(level.count * 2);
+    layout.readForces(gpu);
+    layout.destroy();
+    // The algorithm's own reference (the flat-equivalence contract's statistic, spec §9): the grid pyramid
+    // with the level's masses in its statistics and scatter, weighted springs over the slot's mass.
+    const params = { ...DEFAULT_FORCE, attraction: plan.attraction };
+    const ref = gridPyramidReference(pos, level.count, level, params, level);
+    const vsRef = relativeErrors(gpu, Float64Array.from(ref));
+    const outliers = vsRef.filter((r) => r > 1e-2).length;
+    // Against exact forces the traversal's approximation remains (θ = 0.9 on a freshly prolongated level:
+    // tight phyllotaxis discs, the #251 near field); masses ignored would put the median off by the mean mass.
+    const vsExact = relativeErrors(gpu, levelForces(level, pos, plan.attraction));
+    console.log(
+      `  [level ${k}, ${level.count} slots, Barnes-Hut θ=0.9] vs the mass-weighted pyramid reference p99 ${quantile(vsRef, 0.99).toExponential(2)} ` +
+        `(${outliers} over 1e-2); vs exact p50 ${quantile(vsExact, 0.5).toExponential(2)} p99 ${quantile(vsExact, 0.99).toExponential(2)}`,
+    );
+    expect(quantile(vsRef, 0.99)).toBeLessThan(1e-4);
+    expect(outliers).toBeLessThanOrEqual(Math.ceil(0.001 * level.count));
+    expect(quantile(vsExact, 0.5)).toBeLessThan(0.03);
+    // The tail is the near field's: a heavy supernode sharing its finest cell with lighter ones is repelled by
+    // a lump that includes its own mass (≈ m_i / 2m_j too strong, see the repulsion.ts header). Measured
+    // p99 0.47 here; bounded so it cannot grow unseen (and would drop if the node's own mass were excluded).
+    expect(quantile(vsExact, 0.99)).toBeLessThan(0.6);
+  }, 60_000);
+
+  it("setLevel zeroes the level's velocities, points the segment at its slots (mass-weighted), and allocates nothing", () => {
+    const g = clustered(80, 50, 4, 0x33);
+    const plan = coarseSeedPlan(g, buildHierarchy(g), { width: W, height: H });
+    if (!plan) throw new Error("no plan");
+    const layout = solver(device, g);
+    layout.beginSeed(plan);
+    const fboSpy = vi.spyOn(device, "createFramebuffer");
+    const texSpy = vi.spyOn(device, "createTexture");
+    const bufSpy = vi.spyOn(device, "createBuffer");
+    try {
+      plan.levels.forEach((level, k) => {
+        layout.setLevel(k);
+        layout.refreshSegmentStats();
+        const stats = readbackRgbaFbo(device, layout.segmentStats.stats);
+        const pos = new Float32Array(level.count * 2);
+        layout.readPositions(pos);
+        let mx = 0, my = 0;
+        level.mass.forEach((m, i) => { mx += m * pos[i * 2]!; my += m * pos[i * 2 + 1]!; });
+        expect(stats[2], `level ${k}: Σ|v| after setLevel`).toBe(0); // every slot starts at rest
+        expect(stats[3], `level ${k}: Σ mass`).toBe(g.nodeCount); // the segment covers the level's slots, weighed
+        expect(Math.abs(stats[0]! / stats[3]! - mx / g.nodeCount)).toBeLessThan(1e-3 * (1 + Math.abs(mx / g.nodeCount)));
+        expect(Math.abs(stats[1]! / stats[3]! - my / g.nodeCount)).toBeLessThan(1e-3 * (1 + Math.abs(my / g.nodeCount)));
+        layout.runFrame(Math.max(2, level.ticks)); // velocities become non-zero before the next level
+      });
+      // (readbackRgbaFbo creates its own throwaway framebuffers: the test's reads, not the solver's.)
+      expect(texSpy).toHaveBeenCalledTimes(0);
+      expect(bufSpy).toHaveBeenCalledTimes(0);
+      expect(fboSpy).toHaveBeenCalledTimes(plan.levels.length);
+    } finally {
+      fboSpy.mockRestore();
+      texSpy.mockRestore();
+      bufSpy.mockRestore();
+    }
+    layout.endSeed();
+    layout.refreshSegmentStats();
+    const stats = readbackRgbaFbo(device, layout.segmentStats.stats);
+    expect(stats[2]).toBe(0); // the graph's nodes start at rest too
+    expect(stats[3]).toBe(g.nodeCount); // unit masses again
+    expect(layout.seeding).toBe(false);
+    layout.destroy();
+  });
+
+  it("a seed compiles nothing: every seed program is built with the solver, so a failed compile fails its construction", async () => {
+    // A fresh device, so no earlier solver's programs can be reused from luma's caches.
+    const fresh = await makeTestDevice();
+    const g = planted(8, 60, 4, 3, 0x35);
+    const coarse = coarseSeedPlan(g, buildHierarchy(g), { width: W, height: H });
+    const modular = moduleSeedPlan(buildModuleLODTree(g.nodeCount, flatRecords(g.groupOf), g), g, { width: W, height: H });
+    if (!coarse || !modular) throw new Error("no plan");
+    const proto = WebGL2RenderingContext.prototype;
+    for (const plan of [coarse, modular]) {
+      const layout = solver(fresh, g);
+      const programs = vi.spyOn(proto, "createProgram");
+      const shaders = vi.spyOn(proto, "createShader");
+      try {
+        layout.runSeed(plan);
+        expect(programs, "a seed built a program").toHaveBeenCalledTimes(0);
+        expect(shaders, "a seed compiled a shader").toHaveBeenCalledTimes(0);
+      } finally {
+        programs.mockRestore();
+        shaders.mockRestore();
+        layout.destroy();
+      }
+    }
+    fresh.destroy();
+  });
+
+  it("placing every level without solves lands the nodes where the plan puts them: the CPU seed's prolongation", () => {
+    const g = clustered(60, 40, 4, 0x44);
+    const hierarchy = buildHierarchy(g);
+    const plan = coarseSeedPlan(g, hierarchy, { width: W, height: H, coarsenIterations: 0 });
+    if (!plan) throw new Error("no plan");
+    const got = gpuSeed(device, g, plan);
+    const cpu = { ...g, positions: new Float32Array(g.nodeCount * 2) };
+    multilevelSeed(cpu, { width: W, height: H, coarsenIterations: 0 }, hierarchy);
+    let maxErr = 0, maxAbs = 0;
+    for (let i = 0; i < got.length; i++) {
+      maxErr = Math.max(maxErr, Math.abs(got[i]! - cpu.positions[i]!));
+      maxAbs = Math.max(maxAbs, Math.abs(cpu.positions[i]!));
+    }
+    expect(maxErr).toBeLessThan(maxAbs * 1e-5);
+  });
+
+  it("…and a ragged module tree's leaves reach their nodes through the leaf seed, each exactly once", () => {
+    const g = planted(6, 40, 4, 2, 0x55);
+    const rank = new Map<number, number>();
+    const prefix = (c: number): number[] => (c % 3 === 0 ? [100 + c] : c % 3 === 1 ? [1, 200 + c] : [2, 300 + c, 400 + c]);
+    const records: ModuleNode[] = Array.from(g.groupOf, (c, id) => {
+      const r = (rank.get(c) ?? 0) + 1; rank.set(c, r);
+      return { id, path: [...prefix(c), r] };
+    });
+    const tree = buildModuleLODTree(g.nodeCount, records, g);
+    const plan = moduleSeedPlan(tree, g, { width: W, height: H, coarsenIterations: 0 });
+    if (!plan) throw new Error("no plan");
+    expect(plan.levels.filter((l) => l.leaves.length > 0).length).toBeGreaterThan(1);
+    // The plan's own placement, replayed on the CPU (float32 adds, as the GPU's).
+    const expected = new Float32Array(g.nodeCount * 2).fill(NaN);
+    let above = Float32Array.from(plan.root);
+    for (const level of plan.levels) {
+      const pos = new Float32Array(level.count * 2);
+      for (let i = 0; i < level.count; i++) {
+        pos[i * 2] = above[level.parent[i]! * 2]! + level.offset[i * 2]!;
+        pos[i * 2 + 1] = above[level.parent[i]! * 2 + 1]! + level.offset[i * 2 + 1]!;
+      }
+      for (let q = 0; q < level.leaves.length; q += 2) {
+        const s = level.leaves[q]!, node = level.leaves[q + 1]!;
+        expected[node * 2] = pos[s * 2]!;
+        expected[node * 2 + 1] = pos[s * 2 + 1]!;
+      }
+      above = pos;
+    }
+    const got = gpuSeed(device, g, plan);
+    let maxErr = 0, maxAbs = 0;
+    for (let i = 0; i < got.length; i++) {
+      maxErr = Math.max(maxErr, Math.abs(got[i]! - expected[i]!));
+      maxAbs = Math.max(maxAbs, Math.abs(expected[i]!));
+    }
+    expect(allFinite(got)).toBe(true);
+    expect(maxErr).toBeLessThanOrEqual(maxAbs * 1e-6);
+  });
+
+  it("a coarsening seed lands at the force equilibrium's scale and keeps the clusters together, as the CPU seed does", () => {
+    const g = clustered(40, 50, 4, 0x66); // 2000 nodes, clusters of contiguous ids
+    const hierarchy = buildHierarchy(g);
+    const plan = coarseSeedPlan(g, hierarchy, { width: W, height: H });
+    if (!plan) throw new Error("no plan");
+    const got = gpuSeed(device, g, plan);
+    const cpu = { ...g, positions: new Float32Array(g.nodeCount * 2) };
+    multilevelSeed(cpu, { width: W, height: H }, hierarchy);
+    const disc = new Float32Array(g.nodeCount * 2);
+    seedPositions({ nodeCount: g.nodeCount, edgeCount: 0, source: g.source, target: g.target, positions: disc }, W, H, { force: DEFAULT_FORCE });
+    const R95 = Math.sqrt(0.95) * Math.sqrt((DEFAULT_FORCE.repulsion * g.nodeCount) / DEFAULT_FORCE.centering);
+    const report = (name: string, p: Float32Array): string =>
+      `${name} r95/R95 ${(r95(p) / R95).toFixed(3)} coherence ${coherence(p, g.groupOf).toFixed(3)} mean edge ${meanEdge(p, g.source, g.target).toFixed(0)}`;
+    console.log(`  [coarsening seed] ${report("GPU", got)} | ${report("CPU", cpu.positions)} | ${report("disc", disc)}`);
+    expect(allFinite(got)).toBe(true);
+    expect(r95(got) / R95).toBeGreaterThan(0.7);
+    expect(r95(got) / R95).toBeLessThan(1.3);
+    expect(coherence(got, g.groupOf)).toBeLessThan(0.5 * coherence(disc, g.groupOf));
+    expect(meanEdge(got, g.source, g.target)).toBeLessThan(0.5 * meanEdge(disc, g.source, g.target));
+    // The CPU's seed, up to Barnes-Hut vs exact leaves and float32: the same quality.
+    expect(meanEdge(got, g.source, g.target)).toBeLessThan(1.3 * meanEdge(cpu.positions, g.source, g.target));
+  });
+});
+
+describe("GPU multilevel seed from a module tree (#180 N8.2, on one solver)", () => {
   let device: Device;
   beforeAll(async () => { device = await makeTestDevice(); });
 
   it("seed quality: same-module nodes cluster (better than disc) and refine to a good layout", () => {
-    const W = 800, H = 600;
-    const g = makePlantedGraph(8, 60, 4, 3, 0xa11ce); // 480 nodes
-    const tree = buildModuleLODTree(g.nodeCount, flatRecords(g.moduleOf), { source: g.source, target: g.target, weight: g.weight });
+    const g = planted(8, 60, 4, 3, 0xa11ce); // 480 nodes
+    const tree = buildModuleLODTree(g.nodeCount, flatRecords(g.groupOf), g);
     expect(canModuleSeed(tree, g.nodeCount)).toBe(true);
+    const plan = moduleSeedPlan(tree, g, { width: W, height: H });
+    if (!plan) throw new Error("no plan");
+    const disc = new Float32Array(g.nodeCount * 2);
+    seedPositions({ nodeCount: g.nodeCount, edgeCount: 0, source: g.source, target: g.target, positions: disc }, W, H);
+    const discCoh = coherence(disc, g.groupOf);
 
-    // Disc baseline.
-    const discPos = new Float32Array(g.nodeCount * 2);
-    seedPositions({ nodeCount: g.nodeCount, edgeCount: 0, source: g.source, target: g.target, positions: discPos }, W, H);
-    const discCoh = moduleCoherence(discPos, g.moduleOf);
-
-    // Module-aware seed.
-    const seedPos = new Float32Array(g.nodeCount * 2);
-    gpuMultilevelSeed(device, tree, { nodeCount: g.nodeCount, positions: seedPos }, { width: W, height: H, force: DEFAULT_FORCE });
-    const seedCoh = moduleCoherence(seedPos, g.moduleOf);
-
-    console.log(`  [seed-quality] discCoherence=${discCoh.toFixed(3)} moduleSeedCoherence=${seedCoh.toFixed(3)}`);
-    expect(allFinite(seedPos)).toBe(true);
-    expect(seedCoh).toBeLessThan(0.85);        // same-module clearly closer than cross-module
-    expect(seedCoh).toBeLessThan(discCoh * 0.9); // and better than the disc seed
-
-    // Refine from the module-aware seed → a genuinely good layout (connected nodes closer than random).
-    const refinePos = seedPos.slice();
-    const gpu = new GpuForceLayout(device, { nodeCount: g.nodeCount, edgeCount: g.source.length, source: g.source, target: g.target, positions: refinePos }, DEFAULT_FORCE);
-    gpu.runFrame(120);
+    const layout = solver(device, g);
+    layout.runSeed(plan);
+    const seed = new Float32Array(g.nodeCount * 2);
+    layout.readPositions(seed);
+    const seedCoh = coherence(seed, g.groupOf);
+    layout.cool(120);
+    layout.runFrame(120);
     const out = new Float32Array(g.nodeCount * 2);
-    gpu.readPositions(out);
-    gpu.destroy();
-    const ratio = spreadRatio(out, g.source, g.target);
-    console.log(`  [seed-quality] post-refine spreadRatio=${ratio.toFixed(3)}`);
-    expect(ratio).toBeLessThan(1.0);
+    layout.readPositions(out);
+    layout.destroy();
+    console.log(`  [seed-quality] disc coherence ${discCoh.toFixed(3)} module seed ${seedCoh.toFixed(3)} refined ${coherence(out, g.groupOf).toFixed(3)}`);
+    expect(allFinite(seed)).toBe(true);
+    expect(seedCoh).toBeLessThan(0.85);
+    expect(seedCoh).toBeLessThan(discCoh * 0.9);
+    expect(coherence(out, g.groupOf)).toBeLessThan(0.85);
   });
 
   it("scale: seeds at the force equilibrium, and the cooled refine neither explodes nor collapses", () => {
-    // The refine converges to a disc of radius R = √(repulsion·N/centering) (95th percentile √0.95·R).
-    // The module seed rings children at their leaf counts' share of that area and scales each depth's
-    // repulsion by its mean leaves-per-node, so it must land at that scale — not at a viewport-sized
-    // disc the refine then blows up (the #345 overshoot) or a crowded one it has to inflate. Two
-    // module levels (4 super-modules over 16 modules) so the per-depth scaling is exercised.
-    const W = 800, H = 600;
-    const g = makePlantedGraph(16, 125, 4, 1, 0x5ca1ed); // 2000 nodes
+    // Two module levels (4 super-modules over 16 modules): the mass-weighted levels must land the leaves at
+    // the refine's own scale — not a viewport-sized disc it then blows up (#345), nor a crowded one.
+    const g = planted(16, 125, 4, 1, 0x5ca1ed); // 2000 nodes
     const rank = new Map<number, number>();
-    const records: ModuleNode[] = Array.from(g.moduleOf, (c, id) => {
+    const records: ModuleNode[] = Array.from(g.groupOf, (c, id) => {
       const r = (rank.get(c) ?? 0) + 1; rank.set(c, r);
       return { id, path: [(c % 4) + 1, c + 1, r] };
     });
-    const tree = buildModuleLODTree(g.nodeCount, records, { source: g.source, target: g.target, weight: g.weight });
-    expect(canModuleSeed(tree, g.nodeCount)).toBe(true);
+    const tree = buildModuleLODTree(g.nodeCount, records, g);
+    const plan = moduleSeedPlan(tree, g, { width: W, height: H });
+    if (!plan) throw new Error("no plan");
     const R95 = Math.sqrt(0.95) * Math.sqrt((DEFAULT_FORCE.repulsion * g.nodeCount) / DEFAULT_FORCE.centering);
-
-    const pos = new Float32Array(g.nodeCount * 2);
-    gpuMultilevelSeed(device, tree, { nodeCount: g.nodeCount, positions: pos }, { width: W, height: H, force: DEFAULT_FORCE });
-    const seed = r95(pos);
-
-    // Refine as gpu-transport runs a module-seeded layout: cooled over the budget, 5 ticks per frame.
-    const iterations = 300;
-    const gpu = new GpuForceLayout(device, { nodeCount: g.nodeCount, edgeCount: g.source.length, source: g.source, target: g.target, positions: pos.slice() }, DEFAULT_FORCE);
-    gpu.cool(iterations);
+    const layout = solver(device, g);
+    layout.runSeed(plan);
     const frame = new Float32Array(g.nodeCount * 2);
+    layout.readPositions(frame);
+    const seed = r95(frame);
+    const iterations = 300;
+    layout.cool(iterations);
     let peak = seed;
     for (let t = 0; t < iterations; t += 5) {
-      gpu.runFrame(5);
-      gpu.readPositions(frame);
+      layout.runFrame(5);
+      layout.readPositions(frame);
       peak = Math.max(peak, r95(frame));
     }
-    gpu.destroy();
+    layout.destroy();
     const final = r95(frame);
-    console.log(`  [scale-eq] seed r95/R95=${(seed / R95).toFixed(3)} final r95/R95=${(final / R95).toFixed(3)} peak/final=${(peak / final).toFixed(3)} coherence=${moduleCoherence(frame, g.moduleOf).toFixed(3)}`);
+    console.log(`  [scale-eq] seed r95/R95 ${(seed / R95).toFixed(3)} final ${(final / R95).toFixed(3)} peak/final ${(peak / final).toFixed(3)} coherence ${coherence(frame, g.groupOf).toFixed(3)}`);
     expect(allFinite(frame)).toBe(true);
-    expect(seed / R95).toBeGreaterThan(0.7); // at scale: not crowded…
-    expect(seed / R95).toBeLessThan(1.3); // …and not a viewport-sized disc (~0.02 here) or inflated
-    expect(peak / final).toBeLessThan(1.3); // no explosion on the way
-    expect(final / R95).toBeGreaterThan(0.75); // no collapse
-    expect(moduleCoherence(frame, g.moduleOf)).toBeLessThan(0.85); // the modules survive the refine
+    expect(seed / R95).toBeGreaterThan(0.7);
+    expect(seed / R95).toBeLessThan(1.3);
+    expect(peak / final).toBeLessThan(1.3);
+    expect(final / R95).toBeGreaterThan(0.75);
+    expect(coherence(frame, g.groupOf)).toBeLessThan(0.85);
   });
 
   it("ragged scale: a deeper branch seeds at its own leaves' density, not the whole tree's", () => {
-    // Half the planted modules hang directly under the root (their leaves end at depth 1); the other
-    // half sit one level deeper (leaves at depth 2). The depth-2 solve holds only the deep half's leaves,
-    // so its per-node mass is 1 — scaling its repulsion by the whole tree's leaves-per-node (2 here)
-    // would spread the deep modules wider than the refine's equilibrium density.
-    const W = 800, H = 600;
     const K = 16, m = 125;
-    const g = makePlantedGraph(K, m, 4, 0, 0x7a66ed);
+    const g = planted(K, m, 4, 0, 0x7a66ed);
     const rank = new Map<number, number>();
-    const records: ModuleNode[] = Array.from(g.moduleOf, (c, id) => {
+    const records: ModuleNode[] = Array.from(g.groupOf, (c, id) => {
       const r = (rank.get(c) ?? 0) + 1; rank.set(c, r);
       return { id, path: c % 2 === 0 ? [c + 1, r] : [1000 + (c % 4), c + 1, r] };
     });
-    const tree = buildModuleLODTree(g.nodeCount, records, { source: g.source, target: g.target, weight: g.weight });
-    expect(canModuleSeed(tree, g.nodeCount)).toBe(true);
-    const pos = new Float32Array(g.nodeCount * 2);
-    gpuMultilevelSeed(device, tree, { nodeCount: g.nodeCount, positions: pos }, { width: W, height: H, force: DEFAULT_FORCE });
+    const tree = buildModuleLODTree(g.nodeCount, records, g);
+    const plan = moduleSeedPlan(tree, g, { width: W, height: H });
+    if (!plan) throw new Error("no plan");
+    const pos = gpuSeed(device, g, plan);
     expect(allFinite(pos)).toBe(true);
-    /** Mean over the given modules of their leaves' r95 about the module centroid. */
     const moduleSpread = (odd: boolean): number => {
       let total = 0, count = 0;
       for (let c = odd ? 1 : 0; c < K; c += 2) {
         const mod = new Float32Array(m * 2);
-        let k = 0;
-        for (let i = 0; i < g.nodeCount; i++) if (g.moduleOf[i] === c) { mod[k * 2] = pos[i * 2]!; mod[k * 2 + 1] = pos[i * 2 + 1]!; k++; }
+        let q = 0;
+        for (let i = 0; i < g.nodeCount; i++) if (g.groupOf[i] === c) { mod[q * 2] = pos[i * 2]!; mod[q * 2 + 1] = pos[i * 2 + 1]!; q++; }
         total += r95(mod);
         count++;
       }
@@ -269,158 +518,122 @@ describe("gpuMultilevelSeed — module-aware GPU seed (#180 N8.2)", () => {
     };
     const shallow = moduleSpread(false);
     const deep = moduleSpread(true);
-    // Same modules, same seed pipeline, one level apart: the deep ones must land at about the shallow
-    // ones' spread (measured 1.14×; scaling the depth-2 repulsion by the whole tree's mean mass: 1.62×).
     expect(deep / shallow, `deep ${deep.toFixed(0)} vs shallow ${shallow.toFixed(0)}`).toBeLessThan(1.35);
+    expect(deep / shallow).toBeGreaterThan(1 / 1.35);
   });
 
-  it("ragged correctness: branches of different depths seed without error, every leaf finite + coherent", () => {
-    const W = 800, H = 600;
+  it("ragged correctness: branches of different depths seed without error, every leaf finite and coherent", () => {
     const K = 6, m = 40;
-    const g = makePlantedGraph(K, m, 4, 2, 0x4a66ed);
-    // Ragged prefixes: some modules top-level (depth 1 leaves), some 1 level deep, one 2 levels deep.
+    const g = planted(K, m, 4, 2, 0x4a66ed);
     const raggedPrefix = (c: number): number[] => {
-      if (c % 3 === 0) return [10000 + c];               // top-level community (leaf depth 2)
-      if (c % 3 === 2) return [1 + (c % 2), 500 + c, 200 + c]; // super → sub → community (leaf depth 4)
-      return [1 + (c % 2), 100 + c];                     // super → community (leaf depth 3)
+      if (c % 3 === 0) return [10000 + c];
+      if (c % 3 === 2) return [1 + (c % 2), 500 + c, 200 + c];
+      return [1 + (c % 2), 100 + c];
     };
     const rank = new Map<number, number>();
-    const records: ModuleNode[] = Array.from(g.moduleOf, (c, id) => {
+    const records: ModuleNode[] = Array.from(g.groupOf, (c, id) => {
       const r = (rank.get(c) ?? 0) + 1; rank.set(c, r);
       return { id, path: [...raggedPrefix(c), r] };
     });
-    const tree = buildModuleLODTree(g.nodeCount, records, { source: g.source, target: g.target, weight: g.weight });
-    expect(canModuleSeed(tree, g.nodeCount)).toBe(true);
-
-    // The hierarchy really is ragged: leaves live at more than one depth.
+    const tree = buildModuleLODTree(g.nodeCount, records, g);
     const depth = depthsOf(tree);
     const leafDepths = new Set<number>();
     for (let i = 0; i < tree.leafCount; i++) leafDepths.add(depth[i]!);
-    console.log(`  [ragged] distinct leaf depths = ${[...leafDepths].sort((a, b) => a - b).join(",")}`);
     expect(leafDepths.size).toBeGreaterThan(1);
-
-    const pos = new Float32Array(g.nodeCount * 2);
-    gpuMultilevelSeed(device, tree, { nodeCount: g.nodeCount, positions: pos }, { width: W, height: H, force: DEFAULT_FORCE });
-    expect(allFinite(pos)).toBe(true);               // every leaf got a finite position
-    const coh = moduleCoherence(pos, g.moduleOf);
-    console.log(`  [ragged] moduleCoherence=${coh.toFixed(3)}`);
-    expect(coh).toBeLessThan(0.9);                    // each leaf sits within its module's region
+    const plan = moduleSeedPlan(tree, g, { width: W, height: H });
+    if (!plan) throw new Error("no plan");
+    const pos = gpuSeed(device, g, plan);
+    expect(allFinite(pos)).toBe(true);
+    const coh = coherence(pos, g.groupOf);
+    console.log(`  [ragged] leaf depths ${[...leafDepths].sort((a, b) => a - b).join(",")} coherence ${coh.toFixed(3)}`);
+    expect(coh).toBeLessThan(0.9);
   });
 
-  it("scale: WIDE hierarchy (≈1M nodes, thousands of top modules) seeds on GPU, no CPU per-level force", () => {
-    const W = 1600, H = 1200;
-    const K = 5000, m = 200; // 1,000,000 nodes; 5000 top modules > 4096 → the level solve is the BH pyramid, not O(n²)
-    const g = makePlantedGraph(K, m, 2, 0, 0x5ca1e);
-    // A few cross-module bridges so the top-level solve has inter-module adjacency (kept small: O(K)).
-    const bridgeSrc: number[] = [], bridgeTgt: number[] = [];
+  it("scale: WIDE hierarchy (≈1M nodes, thousands of top modules) seeds on one GPU solver, no CPU force work", () => {
+    const K = 5000, m = 200; // 1,000,000 nodes; 5000 top modules > 4096 → that level is a Barnes-Hut solve
+    const g = planted(K, m, 2, 0, 0x5ca1e);
     const rng = makePrng(0xb41d9e);
-    for (let e = 0; e < K; e++) { bridgeSrc.push(Math.floor(rng() * g.nodeCount)); bridgeTgt.push(Math.floor(rng() * g.nodeCount)); }
-    const source = Uint32Array.from([...g.source, ...bridgeSrc]);
-    const target = Uint32Array.from([...g.target, ...bridgeTgt]);
-    const weight = new Float32Array(source.length).fill(1);
-    const tree = buildModuleLODTree(g.nodeCount, flatRecords(g.moduleOf), { source, target, weight });
-    expect(canModuleSeed(tree, g.nodeCount)).toBe(true);
-    const maxDepth = depthsOf(tree).reduce((a, b) => Math.max(a, b), 0);
-
+    const extraSrc: number[] = [], extraTgt: number[] = [];
+    for (let e = 0; e < K; e++) { extraSrc.push(Math.floor(rng() * g.nodeCount)); extraTgt.push(Math.floor(rng() * g.nodeCount)); }
+    const source = Uint32Array.from([...g.source, ...extraSrc]);
+    const target = Uint32Array.from([...g.target, ...extraTgt]);
+    const graph: CoarseLevel = { nodeCount: g.nodeCount, source, target, weight: new Float32Array(source.length).fill(1) };
+    const tree = buildModuleLODTree(g.nodeCount, flatRecords(g.groupOf), graph);
+    const tp = performance.now();
+    const plan = moduleSeedPlan(tree, graph, { width: 1600, height: 1200, coarsenIterations: 6 });
+    const planMs = performance.now() - tp;
+    if (!plan) throw new Error("no plan");
     const tickSpy = vi.spyOn(ForceLayout.prototype, "tick");
-    const runSpy = vi.spyOn(GpuForceLayout.prototype, "runFrame");
-    const pos = new Float32Array(g.nodeCount * 2);
+    const levelSpy = vi.spyOn(GpuForceLayout.prototype, "setLevel");
+    const layout = solver(device, graph);
     const t0 = performance.now();
-    gpuMultilevelSeed(device, tree, { nodeCount: g.nodeCount, positions: pos }, { width: W, height: H, force: DEFAULT_FORCE, coarsenIterations: 6 });
+    layout.runSeed(plan);
+    const pos = new Float32Array(g.nodeCount * 2);
+    layout.readPositions(pos);
     const dt = performance.now() - t0;
-    const solves = runSpy.mock.calls.length;
+    layout.destroy();
+    const levels = levelSpy.mock.calls.length;
     tickSpy.mockRestore();
-    runSpy.mockRestore();
-
-    console.log(`  [scale-wide] N=${g.nodeCount} maxDepth=${maxDepth} gpuSolves=${solves} seed=${dt.toFixed(0)}ms`);
-    // NO CPU per-level force work — the whole point of #180 (this fails if a CPU shortcut is reintroduced).
-    expect(tickSpy).toHaveBeenCalledTimes(0);
-    // Per-level solves run on the GPU, a bounded O(depth) count — NOT O(nodes) / O(level).
-    expect(solves).toBeGreaterThan(0);
-    expect(solves).toBeLessThanOrEqual(maxDepth + 1);
-    // Every leaf finite (sample every 101st float to keep the check cheap at 1M).
+    levelSpy.mockRestore();
+    console.log(`  [scale-wide] N=${g.nodeCount} levels=${plan.levels.length} solved=${plan.levels.filter((l) => l.ticks > 0).length} plan (main thread) ${planMs.toFixed(0)} ms, seed ${dt.toFixed(0)} ms`);
+    expect(tickSpy).toHaveBeenCalledTimes(0); // no CPU per-level force work (#180)
+    expect(levels).toBe(plan.levels.length); // one solver, one placement per level
     expect(allFinite(pos, 101)).toBe(true);
-    // Generous SwiftShader tripwire (real-GPU ≈1M validated manually); catches an order-of-magnitude regression.
-    expect(dt).toBeLessThan(60_000);
+    expect(dt).toBeLessThan(60_000); // generous SwiftShader tripwire
   }, 120_000);
 
-  it("scale: DEEP hierarchy seeds on GPU across many depths, no CPU per-level force", () => {
-    const W = 1600, H = 1200;
-    // 262,144 leaves = 16,384 leaf-modules × 16 leaves; leaf-module id in base 4 over 7 digits → 7 module
-    // levels (leaves at depth 8). A genuinely deep, ragged-capable hierarchy at large scale.
+  it("scale: DEEP hierarchy seeds across many depths on one GPU solver, no CPU force work", () => {
     const B = 4, D = 7, perModule = 16;
-    const leafModules = B ** D; // 16384
-    const nodeCount = leafModules * perModule; // 262144
+    const nodeCount = B ** D * perModule; // 262,144
     const rng = makePrng(0xdeeb);
     const src: number[] = [], tgt: number[] = [];
     const records: ModuleNode[] = new Array(nodeCount);
-    const moduleOf = new Int32Array(nodeCount);
     for (let i = 0; i < nodeCount; i++) {
-      const lm = i >> 4; // leaf-module (16 leaves each)
-      moduleOf[i] = lm;
+      const lm = i >> 4;
       const digits: number[] = [];
       let x = lm;
       for (let d = 0; d < D; d++) { digits.push((x % B) + 1); x = Math.floor(x / B); }
       records[i] = { id: i, path: [...digits, (i & 15) + 1] };
-      // intra-leaf-module edge (a sibling), plus an occasional cross bridge so higher levels get super-edges
-      const base = lm * perModule;
-      src.push(i); tgt.push(base + Math.floor(rng() * perModule));
+      src.push(i); tgt.push(lm * perModule + Math.floor(rng() * perModule));
       if (rng() < 0.02) { src.push(i); tgt.push(Math.floor(rng() * nodeCount)); }
     }
-    const source = Uint32Array.from(src), target = Uint32Array.from(tgt), weight = new Float32Array(src.length).fill(1);
-    const tree = buildModuleLODTree(nodeCount, records, { source, target, weight });
-    expect(canModuleSeed(tree, nodeCount)).toBe(true);
-    const maxDepth = depthsOf(tree).reduce((a, b) => Math.max(a, b), 0);
-    expect(maxDepth).toBeGreaterThanOrEqual(8); // genuinely deep
-
+    const graph: CoarseLevel = { nodeCount, source: Uint32Array.from(src), target: Uint32Array.from(tgt), weight: new Float32Array(src.length).fill(1) };
+    const tree = buildModuleLODTree(nodeCount, records, graph);
+    expect(depthsOf(tree).reduce((a, b) => Math.max(a, b), 0)).toBeGreaterThanOrEqual(8);
+    const plan = moduleSeedPlan(tree, graph, { width: 1600, height: 1200, coarsenIterations: 6 });
+    if (!plan) throw new Error("no plan");
     const tickSpy = vi.spyOn(ForceLayout.prototype, "tick");
-    const runSpy = vi.spyOn(GpuForceLayout.prototype, "runFrame");
-    const pos = new Float32Array(nodeCount * 2);
+    const layout = solver(device, graph);
     const t0 = performance.now();
-    gpuMultilevelSeed(device, tree, { nodeCount, positions: pos }, { width: W, height: H, force: DEFAULT_FORCE, coarsenIterations: 6 });
+    layout.runSeed(plan);
+    const pos = new Float32Array(nodeCount * 2);
+    layout.readPositions(pos);
     const dt = performance.now() - t0;
-    const solves = runSpy.mock.calls.length;
+    layout.destroy();
     tickSpy.mockRestore();
-    runSpy.mockRestore();
-
-    console.log(`  [scale-deep] N=${nodeCount} maxDepth=${maxDepth} gpuSolves=${solves} seed=${dt.toFixed(0)}ms`);
+    console.log(`  [scale-deep] N=${nodeCount} levels=${plan.levels.length} seed ${dt.toFixed(0)} ms`);
     expect(tickSpy).toHaveBeenCalledTimes(0);
-    expect(solves).toBeGreaterThan(0);
-    expect(solves).toBeLessThanOrEqual(maxDepth + 1); // O(depth) GPU solves, not O(nodes)
     expect(allFinite(pos, 101)).toBe(true);
-    // (Coherence is asserted on the dense/realistic seed-quality + ragged graphs; this deep graph is
-    // deliberately sparse at higher levels, where random pair sampling can't estimate it — moduleOf
-    // is referenced only to keep the generator's intent explicit.)
-    void moduleOf;
     expect(dt).toBeLessThan(60_000);
   }, 120_000);
 });
 
-describe("gpuMultilevelSeed on a device that reads rg32f only as RGBA/FLOAT (#351)", () => {
-  it("reads back solved and prolongate-only levels, and seeds exactly as an RG/FLOAT device", async () => {
-    const W = 800, H = 600;
-    const g = makePlantedGraph(8, 60, 4, 3, 0xa11ce); // 480 nodes
-    const tree = buildModuleLODTree(g.nodeCount, flatRecords(g.moduleOf), { source: g.source, target: g.target, weight: g.weight });
-    expect(canModuleSeed(tree, g.nodeCount)).toBe(true);
-    // Level 1 (8 modules) is solved by a GpuForceLayout; level 2 (the 480 leaves) is past maxSeedNodes,
-    // so it only prolongates, the branch the finest level of a large graph takes.
-    const opts = { width: W, height: H, force: DEFAULT_FORCE, maxSeedNodes: 100 };
-
+describe("GPU multilevel seed on a device that reads rg32f only as RGBA/FLOAT (#351)", () => {
+  it("seeds exactly as an RG/FLOAT device (nothing is read back until the nodes are placed)", async () => {
+    const g = clustered(30, 40, 4, 0x77);
+    const plan = (): SeedPlan => {
+      const p = coarseSeedPlan(g, buildHierarchy(g), { width: W, height: H });
+      if (!p) throw new Error("no plan");
+      return p;
+    };
     const rgDevice = await makeTestDevice();
-    const expected = new Float32Array(g.nodeCount * 2);
-    gpuMultilevelSeed(rgDevice, tree, { nodeCount: g.nodeCount, positions: expected }, opts);
+    const expected = gpuSeed(rgDevice, g, plan());
     rgDevice.destroy();
     expect(allFinite(expected)).toBe(true);
-
     const rgba = await makeRgbaReadDevice();
     try {
-      const solveSpy = vi.spyOn(GpuForceLayout.prototype, "runFrame");
-      const got = new Float32Array(g.nodeCount * 2);
-      gpuMultilevelSeed(rgba.device, tree, { nodeCount: g.nodeCount, positions: got }, opts);
-      const solves = solveSpy.mock.calls.length;
-      solveSpy.mockRestore();
-      expect(solves).toBe(1); // level 1 solved; level 2 prolongate-only
-      expect(rgba.rejectedRgReads()).toBe(0); // no level asked the device for RG/FLOAT
+      const got = gpuSeed(rgba.device, g, plan());
+      expect(rgba.rejectedRgReads()).toBe(0);
       let mismatches = 0;
       for (let i = 0; i < got.length; i++) if (got[i] !== expected[i]) mismatches++;
       expect(mismatches).toBe(0);

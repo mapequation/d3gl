@@ -22,7 +22,7 @@
 import { describe, it, expect, beforeAll } from "vitest";
 import type { Device } from "@luma.gl/core";
 import { makeTestDevice } from "./_device.js";
-import { gpuMultilevelSeed, canModuleSeed } from "../gpu-multilevel-seed.js";
+import { canModuleSeed, moduleSeedPlan } from "../seed-plan.js";
 import { GpuForceLayout } from "../gpu-force-layout.js";
 import { seedPositions, DEFAULT_FORCE } from "../../force.js";
 import { buildGraph } from "../../graph.js";
@@ -226,10 +226,14 @@ describe("GPU layout stability + hull shape (#203)", () => {
 
     const tree = buildModuleLODTree(g.nodeCount, g.records, { source: g.source, target: g.target, weight: g.weight });
     expect(canModuleSeed(tree, g.nodeCount)).toBe(true);
-    gpuMultilevelSeed(device, tree, graph, { width: W, height: H, force: DEFAULT_FORCE });
+    const plan = moduleSeedPlan(tree, g, { width: W, height: H, force: DEFAULT_FORCE });
+    if (!plan) throw new Error("no module seed plan");
+    seedPositions(graph, W, H, { force: DEFAULT_FORCE }); // the disc the transport shows until the seed lands
+    const layout = new GpuForceLayout(device, graph, DEFAULT_FORCE, { multilevel: true });
+    layout.runSeed(plan); // the module-aware multilevel seed on the same solver (#353)
+    layout.readPositions(positions);
     const seedSpan = span(positions, g.nodeCount);
 
-    const layout = new GpuForceLayout(device, graph, DEFAULT_FORCE);
     layout.runFrame(290);
     const before = new Float32Array(g.nodeCount * 2);
     layout.readPositions(before);

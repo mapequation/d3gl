@@ -305,7 +305,7 @@ describe("GPU layout LOD relay (#377) — a relay that fails while the run start
 });
 
 describe("GPU layout LOD relay (#377) — no worker", () => {
-  it("no LOD worker can start (a page that blocks workers): one warning, the tree withdrawn, the run goes on", async () => {
+  it("no LOD worker can start (a page that blocks workers): one warning, the tree withdrawn, the run goes on from its disc", async () => {
     const device = await makeTestDevice();
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     vi.stubGlobal(
@@ -326,7 +326,10 @@ describe("GPU layout LOD relay (#377) — no worker", () => {
       await handle.settled;
       expect(handle.transport).toBe("gpu");
       expect(frames).toBeGreaterThan(0);
-      expect(warn.mock.calls.filter((c) => String(c[0]).includes("no LOD worker could start"))).toHaveLength(1);
+      // One warning for the one cause, naming both consequences: no second worker is tried for the seed (#353).
+      expect(warn).toHaveBeenCalledTimes(1);
+      expect(String(warn.mock.calls[0]?.[0])).toContain("no LOD worker could start");
+      expect(String(warn.mock.calls[0]?.[0])).toContain("multilevel seed");
     } finally {
       handle.stop();
       device.destroy();

@@ -8,9 +8,10 @@
  * position snapshot the GPU harvests — the O(tree) pass the worker backend runs per frame, off the main
  * thread in both cases. The main thread never coarsens and never refits.
  */
-import { buildHierarchy, type CoarseLevel, type CoarsenOptions } from "./coarsen.js";
+import { buildHierarchy, type CoarseLevel, type CoarsenOptions, type Hierarchy } from "./coarsen.js";
 import { computeLODPositions, flattenHierarchyToTopology, type LODPositionTree, type LODTopology } from "./lod.js";
-import { lodGeometryViews } from "./worker-protocol.js";
+import { lodGeometryViews, type CoarsenMessage, type WorkerToMain } from "./worker-protocol.js";
+import { coarseSeedPlan, seedPlanTransferables } from "./gpu/seed-plan.js";
 
 /**
  * Coarsen `graph` into the LOD tree's topology — the tree the worker backend streams, super-edges included
@@ -18,8 +19,12 @@ import { lodGeometryViews } from "./worker-protocol.js";
  * layout and the children CSR, so every buffer of `topology` can be transferred to the main thread
  * ({@link topologyTransferables}) with no clone on either side. Its geometry is bound per refit.
  */
-export function coarsenForRefit(graph: CoarseLevel, coarsen?: CoarsenOptions): { topology: LODTopology; tree: LODPositionTree } {
-  const topology = flattenHierarchyToTopology(buildHierarchy(graph, coarsen), graph.nodeCount, graph);
+export function coarsenForRefit(
+  graph: CoarseLevel,
+  coarsen?: CoarsenOptions,
+  hierarchy: Hierarchy = buildHierarchy(graph, coarsen),
+): { topology: LODTopology; tree: LODPositionTree } {
+  const topology = flattenHierarchyToTopology(hierarchy, graph.nodeCount, graph);
   const { size } = topology;
   const tree: LODPositionTree = {
     size,
@@ -58,4 +63,22 @@ export function topologyTransferables(topology: LODTopology): ArrayBuffer[] {
     if (ArrayBuffer.isView(value) && value.buffer instanceof ArrayBuffer) buffers.add(value.buffer);
   }
   return [...buffers];
+}
+
+/**
+ * The layout worker's answer to a {@link CoarsenMessage}: coarsen once, then `send` the GPU seed's plan the
+ * moment it is built (when `seed` was asked for, #353) — before the slower LOD topology, so the GPU seed starts
+ * early — and then the LOD tree's topology (when `lod` was, #377). Every reply's buffers go in its transfer
+ * list. Returns the tree the worker keeps for refits, or null without `lod`.
+ */
+export function answerCoarsen(msg: CoarsenMessage, send: (message: WorkerToMain, transfer: ArrayBuffer[]) => void): LODPositionTree | null {
+  const hierarchy = buildHierarchy(msg, msg.coarsen);
+  if (msg.seed) {
+    const plan = coarseSeedPlan(msg, hierarchy, msg.seed);
+    send({ type: "seed-plan", plan }, plan ? seedPlanTransferables(plan) : []);
+  }
+  if (!msg.lod) return null;
+  const { topology, tree } = coarsenForRefit(msg, msg.coarsen, hierarchy);
+  send({ type: "lod-topology", topology }, topologyTransferables(topology));
+  return tree;
 }

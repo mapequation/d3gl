@@ -178,7 +178,7 @@ export function startWorkerLayout(
       onLODTree?.(lodTreeFromTopology(topology, lodGeometryViews(buffer, topology.size)));
       return;
     }
-    if (msg.type === "lod-geometry") return; // only the GPU layout's LOD worker refits on request (#377)
+    if (msg.type === "lod-geometry" || msg.type === "seed-plan") return; // only the GPU layout's coarsening worker sends these (#377, #353)
     // frame | done
     if (msg.positions && !shared) graph.positions.set(msg.positions);
     if (msg.geometry && lodGeomFlat) lodGeomFlat.set(msg.geometry); // copy-mode geometry snapshot
@@ -301,7 +301,7 @@ export function startNestedWorkerLayout(
   };
   worker.onmessage = (e: MessageEvent<WorkerToMain>): void => {
     const msg = e.data;
-    if (msg.type === "lod-topology" || msg.type === "lod-geometry" || terminated) return;
+    if (msg.type === "lod-topology" || msg.type === "lod-geometry" || msg.type === "seed-plan" || terminated) return;
     if (msg.type === "done") {
       if (msg.positions) land(msg.positions, msg.boundaries);
       terminate();

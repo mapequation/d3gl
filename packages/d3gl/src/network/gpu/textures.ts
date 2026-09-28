@@ -213,3 +213,27 @@ export function readbackFloatFbo(
   }
   return out;
 }
+
+/**
+ * Write the first `count` texels of a `width`-wide texture from `data` (`channels` values per texel, tightly
+ * packed, at least `count · channels` long): the full rows straight from a view of `data` — no copy — and a
+ * last partial row through `rowScratch` (at least `width · channels` long), whose unused tail texels get
+ * whatever the scratch held. Texels past `count` are left as they were, apart from that tail. Two
+ * sub-uploads, no allocation: how a multilevel seed level rewrites the prefix of its capacity textures (#353).
+ */
+export function writeTexels<T extends Uint32Array | Float32Array>(
+  texture: Texture,
+  data: T,
+  count: number,
+  width: number,
+  channels: number,
+  rowScratch: T,
+): void {
+  const full = Math.floor(count / width);
+  if (full > 0) texture.writeData(data.subarray(0, full * width * channels), { x: 0, y: 0, width, height: full });
+  if (count > full * width) {
+    if (rowScratch.length < width * channels) throw new Error("writeTexels: the row scratch is shorter than a row");
+    rowScratch.set(data.subarray(full * width * channels, count * channels));
+    texture.writeData(rowScratch.subarray(0, width * channels), { x: 0, y: full, width, height: 1 });
+  }
+}

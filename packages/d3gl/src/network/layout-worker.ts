@@ -15,8 +15,9 @@
  * or stop lands within about one tick. State the resume path needs (the graph, the {@link ForceLayout}
  * instance, the LOD tree + geometry buffer) is therefore kept in module scope between runs.
  *
- * The GPU layout with LOD on (#377) uses the same worker for its LOD tree only: `coarsen` builds the tree
- * (no layout), and each `lod-geometry` refits its position geometry to positions the GPU harvested.
+ * The GPU layout uses the same worker to coarsen, with no layout: `coarsen` builds its multilevel seed's plan
+ * (#353) and, with LOD on, its LOD tree (#377), and each `lod-geometry` refits the tree's position geometry to
+ * positions the GPU harvested.
  *
  * The page's lib is `["ES2020","DOM"]` (the library targets the browser main thread too), so the
  * worker globals here are typed against `DOM`. The layout's frames use single-argument `postMessage`
@@ -28,7 +29,7 @@ import { DRAG_HEAT, ForceLayout, RECOOL_TICKS, seedPositions } from "./force.js"
 import { nestedLayout, nestedBoundaryDiscs } from "./nested-layout.js";
 import { multilevelSeedSteps, buildHierarchy, type SeedProgress } from "./coarsen.js";
 import { flattenHierarchyToTopology, lodTreeFromTopology, computeLODPositions, type LODPositionTree, type LODTree } from "./lod.js";
-import { coarsenForRefit, refitGeometry, topologyTransferables } from "./lod-refit.js";
+import { answerCoarsen, refitGeometry } from "./lod-refit.js";
 import {
   lodGeometryViews,
   lodGeometryByteLength,
@@ -279,15 +280,13 @@ async function runLayout(msg: StartMessage): Promise<void> {
 }
 
 /**
- * The GPU layout's LOD tree (#377): coarsen only — no layout, no graph kept. The topology goes to the main
- * thread by transfer (the worker keeps its own copies of what a refit reads), and the graph's edges are
- * dropped with this call: a refit needs only the tree.
+ * The GPU layout's coarsening (#377, #353): coarsen only — no layout, no graph kept. The seed plan and the LOD
+ * topology go to the main thread by transfer (the worker keeps its own copies of what a refit reads), and the
+ * graph's edges are dropped with this call: a refit needs only the tree.
  */
 let refitTree: LODPositionTree | null = null;
 function coarsenOnly(msg: CoarsenMessage): void {
-  const { topology, tree } = coarsenForRefit(msg, msg.coarsen);
-  refitTree = tree;
-  post({ type: "lod-topology", topology }, topologyTransferables(topology));
+  refitTree = answerCoarsen(msg, (message, transfer) => post(message, transfer));
 }
 
 /** Refit the coarsen-only tree to the GPU's harvested positions and hand both buffers back (#377). */

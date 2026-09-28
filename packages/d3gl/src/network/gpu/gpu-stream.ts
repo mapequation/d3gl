@@ -31,6 +31,18 @@
  * painted — positions and geometry put on the graph together — in the first frame after the worker replied
  * and the repaint is due. The throttle harvests one round trip early for it, so the repaint cadence holds.
  *
+ * **A multilevel seed** (#353, spec §6.4) runs first when the stream is `seeded`: once its plan arrives
+ * ({@link GpuStream.seed}; the layout worker builds it), the seed's levels are work items of the same loop,
+ * under the same budget — each level's placement (`setLevel`), then its ticks (P, F_b, I on the level's
+ * slots), and finally the placement of the graph's nodes (`endSeed`). Nothing is read back during the seed
+ * (the solver's slots hold coarse levels, not node positions): the first copy is the **seed frame** (tick
+ * 0), and until it is painted the disc the transport seeded stays on screen. A drag's pins wait for the
+ * graph's level; `stop()` during the seed drops its fences and frees its resources; with no iterations the
+ * seed frame is the final one. Without a plan (the worker failed) the run starts cold from that disc. The seed's
+ * textures are created when the plan arrives, outside the frame loop (its programs were compiled with the
+ * solver); if that fails the run starts cold as well, and a seed step that throws mid-seed frees the seed and
+ * settles with the disc on screen, one warning each, so `settled` always resolves.
+ *
  * `settled` resolves only after positions from the final tick have been harvested and painted (with LOD on,
  * together with the LOD tree's geometry for them), so the engine's settle handler sees them. The run then
  * goes **idle** (the layout stays alive for a drag reheat, #183).
@@ -48,6 +60,7 @@ import { FrameBudget, itemCostMs, type FenceSource } from "./frame-budget.js";
 import type { GpuForceLayout } from "./gpu-force-layout.js";
 import { MIN_FRAME_MS, RepaintThrottle } from "./repaint-throttle.js";
 import { reportUncaught } from "./report-uncaught.js";
+import type { SeedPlan } from "./seed-plan.js";
 
 /** What one streamed frame did — the argument of a {@link observeGpuLayoutFrames} observer. */
 export interface GpuFrameSample {
@@ -112,6 +125,12 @@ export interface GpuStreamOptions {
   minFrameMs?: number;
   /** Where harvests go before they are painted. Default: a {@link DirectSink} into `graph.positions`. */
   sink?: FrameSink;
+  /**
+   * Run a multilevel seed first (#353): the stream waits for its plan ({@link GpuStream.seed}) before it
+   * ticks, and cools the run over its iterations once the graph's nodes are placed. The layout must be built
+   * with `multilevel`.
+   */
+  seeded?: boolean;
 }
 
 /**
@@ -259,6 +278,19 @@ export class GpuStream {
   /** The submitted harvest has not been seen ready yet (the throttle samples its round trip then). */
   private frameAway = false;
 
+  /** The multilevel seed (#353): none (or done), waiting for its plan, or running its levels. */
+  private seedState: "none" | "waiting" | "running";
+  private seedPlan: SeedPlan | null = null;
+  /** The next seed level to place; `levels.length` means the graph's nodes are next. */
+  private seedNext = 0;
+  /** Ticks left on the current seed level. */
+  private seedTicksLeft = 0;
+  /** The seed placed the graph's nodes: copy them once, as the run's first frame (tick 0). */
+  private seedFrame = false;
+  /** A drag's pins while the seed runs: applied once the graph's nodes are placed. */
+  private pendingPinIds: Uint32Array | null = null;
+  private pendingPinPositions: Float32Array | null = null;
+
   constructor(device: WebGLDevice, layout: GpuForceLayout, graph: NetworkGraph, opts: GpuStreamOptions, onFrame: () => void) {
     this.gl = device.gl;
     this.layout = layout;
@@ -283,13 +315,48 @@ export class GpuStream {
     this.canvas?.addEventListener("webglcontextlost", this.onContextLost);
     this.page = typeof document === "undefined" ? null : document;
     this.page?.addEventListener("visibilitychange", this.onVisibilityChange);
-    this.mode = this.iterations > 0 ? "run" : "idle";
+    this.seedState = opts.seeded ? "waiting" : "none";
+    this.mode = this.iterations > 0 || opts.seeded ? "run" : "idle";
   }
 
-  /** Start the initial run — or, with no iterations, paint the seed and settle at once. */
+  /**
+   * Start the initial run — or, with no iterations and no seed to wait for, paint the seed and settle at
+   * once. A seeded stream waits for its plan ({@link seed}) before it encodes anything.
+   */
   start(): void {
-    if (this.mode === "run") this.resume();
-    else {
+    if (this.mode === "run") {
+      if (this.seedState !== "waiting") this.resume(); // a seeded stream starts when its plan arrives
+    } else {
+      this.onFrame();
+      this.settle();
+    }
+  }
+
+  /**
+   * Hand a seeded stream its multilevel seed plan (#353) — or `null` when none could be built (the layout
+   * worker failed): the run then starts cold from the transport's disc, at full heat. The seed's textures are
+   * created here, when the plan arrives, outside the frame loop (its programs were compiled with the solver);
+   * if that fails, one warning, and the run starts cold as without a plan. The plan's levels run as work
+   * items from the next frame on. Ignored unless the stream is waiting for one.
+   */
+  seed(plan: SeedPlan | null): void {
+    if (this.stopped || this.seedState !== "waiting") return;
+    if (plan && !this.startSeed(plan)) plan = null;
+    if (plan) {
+      this.seedPlan = plan;
+      this.seedNext = 0;
+      this.seedTicksLeft = 0;
+      this.seedState = "running";
+      this.resume();
+      return;
+    }
+    this.seedState = "none";
+    this.layout.hold(1); // a cold disc start untangles at full heat (ForceLayout.run)
+    this.applyPendingPin();
+    if (this.iterations > 0) {
+      this.resume();
+    } else {
+      this.mode = "idle";
       this.onFrame();
       this.settle();
     }
@@ -304,6 +371,13 @@ export class GpuStream {
    */
   pin(ids: Uint32Array, positions?: Float32Array): void {
     if (this.stopped || this.failed) return;
+    if (this.seedState !== "none") {
+      // The solver's slots are a seed level's, not nodes: hold the pins until the nodes are placed.
+      this.pendingPinIds = ids;
+      if (positions) this.pendingPinPositions = positions;
+      this.dragging = true;
+      return;
+    }
     this.layout.setPinned(ids);
     if (positions) {
       this.heldIds = ids;
@@ -323,6 +397,12 @@ export class GpuStream {
   /** Release every pin and re-cool over a short tail, then idle. */
   unpin(): void {
     if (this.stopped || this.failed) return;
+    if (this.seedState !== "none") {
+      this.pendingPinIds = null;
+      this.pendingPinPositions = null;
+      this.dragging = false;
+      return;
+    }
     this.layout.setPinned(null);
     this.dragging = false;
     if (this.mode === "drag") {
@@ -371,11 +451,13 @@ export class GpuStream {
     // A finished copy is harvested once the repaint is due — one round trip earlier when the sink relays it
     // (#377) — and the final one at once; into the sink's buffer, and only while the sink can take it.
     let harvested = false;
+    let harvestedTicks = -1;
     const harvestDue = this.throttle.harvestDue(now, this.sink.relays);
     if (this.readback.pending && this.copyReady && (this.copyFinal || this.frameEvery !== undefined || harvestDue)) {
       const target = this.sink.target();
       if (target) {
         harvested = true;
+        harvestedTicks = this.copyTicks; // before this frame's copy, if any, moves copyTicks on
         if (!this.readback.harvest(target, this.stats)) {
           this.fail();
           return;
@@ -442,6 +524,7 @@ export class GpuStream {
         this.encodeItem();
         this.budget.spent(cost, band);
         items++;
+        if (this.seedFrame) break; // the seed just placed the nodes: this frame copies them as tick 0 (#353)
       }
     }
 
@@ -453,6 +536,7 @@ export class GpuStream {
       // already do — positions change only at integrate and at the prep's held-position write.
       if (this.phase === 0) this.layout.refreshSegmentStats();
       this.readback.issue(this.layout);
+      this.seedFrame = false;
       this.copyTicks = this.ticksDone;
       this.copyFinal = this.finishing;
       this.copiedTicks = this.ticksDone;
@@ -476,7 +560,7 @@ export class GpuStream {
       sample.items = items;
       sample.ticksDone = this.ticksDone;
       sample.harvested = harvested;
-      sample.harvestedTicks = harvested ? this.copyTicks : -1;
+      sample.harvestedTicks = harvestedTicks;
       sample.copied = copied;
       sample.blocked = !open;
       sample.k = this.budget.k;
@@ -496,7 +580,7 @@ export class GpuStream {
    */
   private active(): boolean {
     return (
-      (this.mode !== "idle" && !this.failed) ||
+      (this.mode !== "idle" && !this.failed && this.seedState !== "waiting") ||
       this.finishing ||
       this.readback.pending ||
       this.sink.ready ||
@@ -506,21 +590,131 @@ export class GpuStream {
 
   /** Whether the current mode has ticks left to encode (a started tick is always finished). */
   private hasWork(): boolean {
-    return this.mode !== "idle" && !this.finishing && !this.failed;
+    return this.mode !== "idle" && !this.finishing && !this.failed && this.seedState !== "waiting";
+  }
+
+  /** Whether the next item is a seed step: placing the next seed level, or the graph's nodes (#353). */
+  private seedStepNext(): boolean {
+    return this.seedState === "running" && this.phase === 0 && this.seedTicksLeft === 0;
   }
 
   /** The estimated GPU time of the next item. */
   private nextItemCost(): number {
-    const n = this.layout.nodeCount;
+    if (this.seedStepNext()) {
+      // A placement is one gather over the level's slots, about an integrate's cost.
+      const level = this.seedPlan?.levels[this.seedNext];
+      return itemCostMs("integrate", level ? level.count : this.layout.nodeCount, 1);
+    }
+    const n = this.layout.levelSlots;
+    if (this.wholeSeedTick()) return this.tickCostMs(n);
     if (this.phase === 0) return itemCostMs("prep", n, 1);
     if (this.phase <= this.tickBands) return itemCostMs("force", n, this.tickBands);
     return itemCostMs("integrate", n, 1);
   }
 
+  /** The estimated GPU time of a whole unsliced tick over `n` slots. */
+  private tickCostMs(n: number): number {
+    return itemCostMs("prep", n, 1) + itemCostMs("force", n, 1) + itemCostMs("integrate", n, 1);
+  }
+
+  /**
+   * Whether the next item is a whole tick of a seed level (#353): a level whose unsliced tick fits in half
+   * the frame's budget is ticked as one item, not three — most seed levels are a few thousand slots or fewer,
+   * so cutting their ticks into P, F and I would only multiply the items the frame budget counts, and the
+   * seed frame would wait for them.
+   */
+  private wholeSeedTick(): boolean {
+    return this.seedState === "running" && this.phase === 0 && this.tickCostMs(this.layout.levelSlots) <= this.budget.budgetMs / 2;
+  }
+
+  /** Create the seed's resources for `plan` (#353); false, with one warning, if that fails. */
+  private startSeed(plan: SeedPlan): boolean {
+    try {
+      this.layout.beginSeed(plan);
+      return true;
+    } catch (error) {
+      console.warn("[d3gl] network layout({ backend: 'gpu' }): the multilevel seed could not start; the layout starts from a disc instead.", error);
+      return false;
+    }
+  }
+
+  /**
+   * Encode the next seed step (#353): place the next level, or — after the last — place the graph's nodes and
+   * end the seed.
+   */
+  private encodeSeedStep(): void {
+    const plan = this.seedPlan;
+    if (!plan) throw new Error("GpuStream: a seed step without a plan");
+    const level = plan.levels[this.seedNext];
+    if (level) {
+      this.layout.setLevel(this.seedNext);
+      this.seedTicksLeft = level.ticks;
+      this.seedNext++;
+      return;
+    }
+    this.layout.endSeed();
+    this.seedState = "none";
+    this.seedPlan = null;
+    this.seedFrame = true;
+    // A seeded layout has its global arrangement: cool over the budget, as the CPU worker does (#124).
+    this.layout.cool(this.iterations);
+    this.applyPendingPin();
+    if (this.iterations === 0) this.finishing = true; // the seed frame is the final one
+  }
+
+  /** Apply the pins a drag made while the seed ran (#353), now that the solver's slots are nodes. */
+  private applyPendingPin(): void {
+    const ids = this.pendingPinIds;
+    if (!ids) return;
+    this.layout.setPinned(ids);
+    if (this.pendingPinPositions) {
+      this.heldIds = ids;
+      this.heldPositions = this.pendingPinPositions;
+    }
+    this.pendingPinIds = null;
+    this.pendingPinPositions = null;
+  }
+
+  /**
+   * A seed step failed mid-seed (#353): its slots hold a coarse level, not the nodes, so the run cannot go on.
+   * Free the seed, warn once, and settle as a non-finite layout does, keeping the disc on screen (nothing was
+   * harvested yet). The solver stays until {@link stop}, which the engine's next `layout()` or `data()` calls.
+   */
+  private abortSeed(error: unknown): void {
+    this.layout.cancelSeed();
+    this.seedState = "none";
+    this.seedPlan = null;
+    this.pendingPinIds = null;
+    this.pendingPinPositions = null;
+    this.failed = true;
+    this.mode = "idle";
+    this.finishing = false;
+    // (The frame this runs in ends the loop once nothing else is left: a frame the LOD worker returns still lands.)
+    console.warn("[d3gl] network layout({ backend: 'gpu' }) stopped: a step of the multilevel seed failed; keeping the disc.", error);
+    this.settle(true);
+  }
+
   /** Encode the next work item of the current tick. */
   private encodeItem(): void {
+    if (this.seedStepNext()) {
+      try {
+        this.encodeSeedStep();
+      } catch (error) {
+        this.abortSeed(error);
+      }
+      return;
+    }
+    if (this.wholeSeedTick()) {
+      this.layout.beginTick();
+      this.layout.forceBand(0, 1);
+      this.layout.integrate();
+      this.seedTicksLeft--;
+      return;
+    }
     if (this.phase === 0) {
-      this.tickBands = Math.min(this.budget.bands, this.layout.atlasRows);
+      // A seed level's force pass gets bands in proportion to its slots (at least one, at most its rows).
+      const rows = this.layout.levelRows;
+      this.tickBands = Math.max(1, Math.min(rows, Math.ceil((this.budget.bands * this.layout.levelSlots) / this.layout.nodeCount)));
       if (this.heldIds && this.heldPositions) {
         this.layout.setHeldPositions(this.heldIds, this.heldPositions);
         this.heldIds = null;
@@ -534,8 +728,12 @@ export class GpuStream {
     } else {
       this.layout.integrate();
       this.phase = 0;
-      this.ticksDone++;
-      this.tickDone();
+      if (this.seedState === "running") {
+        this.seedTicksLeft--;
+      } else {
+        this.ticksDone++;
+        this.tickDone();
+      }
     }
   }
 
@@ -579,6 +777,8 @@ export class GpuStream {
    */
   private copyDue(now: number): boolean {
     if (this.readback.pending) return false;
+    if (this.seedState !== "none") return false; // the slots hold a seed level, not the nodes (#353)
+    if (this.seedFrame) return true; // the seed frame: tick 0, once
     if (this.ticksDone <= this.copiedTicks) return false;
     // The final copy goes out as soon as the PBO is free, once: `finishing` holds until that frame is painted
     // (finish()), which with LOD on is a worker round trip after its harvest (#377), and a frame lost with the
