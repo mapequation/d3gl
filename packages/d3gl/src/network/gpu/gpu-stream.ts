@@ -29,7 +29,9 @@
  * `graph.positions` and is painted in the same frame. With LOD on (#377) the `LODRelay` (`lod-relay.ts`)
  * takes it instead: the LOD worker refits the tree's geometry to the harvested positions, and the frame is
  * painted — positions and geometry put on the graph together — in the first frame after the worker replied
- * and the repaint is due. The throttle harvests one round trip early for it, so the repaint cadence holds.
+ * and the repaint is due; with the spatial source (#343) the worker rebuilds the tree for the harvested
+ * positions instead, and the commit hands it to the engine with them. The throttle harvests one round trip
+ * early for it, so the repaint cadence holds.
  *
  * **A multilevel seed** (#353, spec §6.4) runs first when the stream is `seeded`: once its plan arrives
  * ({@link GpuStream.seed}; the layout worker builds it), the seed's levels are work items of the same loop,
@@ -151,7 +153,8 @@ export interface GpuFrameSample {
   harvestMs: number;
   /**
    * Main-thread ms putting the painted frame on the graph (part of {@link harvestMs}): 0 when it was
-   * harvested there; with LOD on (#377), copying the relayed positions and their LOD geometry in.
+   * harvested there; with LOD on (#377), copying the relayed positions and their LOD geometry in — or, with
+   * the spatial source (#343), the positions and the O(1) adoption of the tree rebuilt for them.
    */
   commitMs: number;
   /** Whether the engine repainted this frame. */
@@ -270,8 +273,8 @@ export interface FrameSink {
   readonly relays: boolean;
   /** The array the next harvest writes into (2 floats per node), or null while the sink cannot take one. */
   target(): Float32Array | null;
-  /** The harvest landed in {@link target}. */
-  submit(): void;
+  /** The harvest landed in {@link target}; `ticks` is the ticks it holds (its frame id). */
+  submit(ticks: number): void;
   /** A frame can be painted: the submitted one, or one the sink produced (the LOD tree's first geometry). */
   readonly ready: boolean;
   /**
@@ -684,7 +687,7 @@ export class GpuStream {
         this.frameFinal = this.copyFinal || stopped;
         if (stopped) this.stopping = true;
         this.frameAway = true;
-        this.sink.submit();
+        this.sink.submit(this.copyTicks);
         this.throttle.submitted(now);
       }
     }

@@ -30,7 +30,9 @@
  * the tree's geometry to every harvested frame before it is painted ({@link LODRelay}); the tree reaches
  * `onLODTree` once, with geometry, and `onLODTree(null)` withdraws it if that worker fails (the caller then
  * builds its own). The same worker builds the multilevel seed's plan from the same coarsening, so the graph
- * is coarsened once.
+ * is coarsened once. With `lodSource: "spatial"` (#343) that worker rebuilds the spatial tree for every
+ * harvested frame instead — the worker backend's per-frame step — and each painted frame hands its tree to
+ * `onLODTree` with a streamed handle, as the worker backend's frames do; it coarsens only for the seed's plan.
  *
  * **A GPU run's lifetime is its device's (#311).** When the render backend that owns the device is about
  * to be swapped out, the engine calls the handle's `moveDevice` while the device is still alive: the run
@@ -51,10 +53,11 @@ import { GpuForceLayout } from "./gpu-force-layout.js";
 import { GpuStream, type GpuRunState } from "./gpu-stream.js";
 import { moduleSeedPlan, type SeedPlan, type SeedPlanOptions } from "./seed-plan.js";
 import { SeedWorker } from "./seed-worker.js";
-import { LODRelay, type SeedRequest } from "./lod-relay.js";
+import { LODRelay, type OnLODTree, type SeedRequest } from "./lod-relay.js";
 import { spawnLayoutWorker, startWorkerLayout, type WorkerLayoutHandle, type WorkerLayoutOptions } from "../worker-transport.js";
 import { seedPositions, DEFAULT_FORCE, DRAG_HEAT, RECOOL_TICKS } from "../force.js";
-import type { LODTopology, LODTree } from "../lod.js";
+import type { LODTopology } from "../lod.js";
+import type { LeafStyle, LODView } from "../lod-frame.js";
 import type { NetworkGraph } from "../graph.js";
 
 /**
@@ -145,7 +148,8 @@ export function warnGpuFallback(message: string, warnUnsupported: boolean | unde
  * frame, right after positions reached the graph and at most once per frame, so a caller may repaint
  * synchronously there (the transport times it to size its repaint throttle); the worker fallback calls it
  * per worker message. `onLODTree` gets the LOD tree streamed by a worker — the fallback's, or with `lod` on
- * the GPU run's LOD worker (#377) — and, from the GPU run only, `null` if that worker fails.
+ * the GPU run's LOD worker (#377): the structure tree once, or every rebuilt spatial tree with its streamed
+ * handle (#343) — and, from the GPU run only, `null` if that worker fails.
  *
  * Accepts a `Device | null | Promise<Device | null>` so `network.ts` can pass a **device promise**
  * that resolves after the backend settles (including the `"auto"` → WebGL background upgrade).
@@ -169,7 +173,7 @@ export function startGpuLayout(
   graph: NetworkGraph,
   opts: GpuLayoutOptions,
   onFrame: () => void,
-  onLODTree?: (tree: LODTree | null) => void,
+  onLODTree?: OnLODTree,
   onTransport?: (transport: GpuLayoutTransport) => void,
 ): WorkerLayoutHandle {
   // Nothing to lay out: one paint, without waiting for a device promise.
@@ -217,12 +221,16 @@ class GpuLayoutRun implements WorkerLayoutHandle {
   private dragging = false;
   /** A drag was live when the GPU run last moved, or began while the move waited for its device (#311). */
   private dragSinceMove = false;
+  /** The leaf style `style()` last sent a spatial LOD stream (#343); a run started after it gets it too. */
+  private lodStyle: { style: LeafStyle; version: number } | null = null;
+  /** The view the engine last sent a spatial LOD stream (#433); likewise. */
+  private lodView: LODView | null = null;
 
   constructor(
     private readonly graph: NetworkGraph,
     private readonly opts: GpuLayoutOptions,
     private readonly onFrame: () => void,
-    private readonly onLODTree: ((tree: LODTree | null) => void) | undefined,
+    private readonly onLODTree: OnLODTree | undefined,
     private readonly onTransport: ((transport: GpuLayoutTransport) => void) | undefined,
   ) {
     this.settled = new Promise<void>((resolve, reject) => {
@@ -283,6 +291,35 @@ class GpuLayoutRun implements WorkerLayoutHandle {
   unpin(): void {
     this.dragging = false;
     this.inner?.unpin();
+  }
+
+  /**
+   * A new leaf style for a spatial LOD stream (#343, after `style()`): the current run's — its LOD worker's,
+   * or the worker fallback's — and the one a move or a pending device starts, which is launched with it.
+   */
+  readonly setLODStyle = (style: LeafStyle, version: number): void => {
+    this.lodStyle = { style, version };
+    this.inner?.setLODStyle?.(style, version);
+  };
+
+  /**
+   * The engine's new view for a spatial LOD stream's super-edge rows (#433): the current run's, and a later
+   * one's. (Both are bound: the engine may call them detached from the handle, as it does a worker handle's.)
+   */
+  readonly setLODView = (view: LODView): void => {
+    this.lodView = view;
+    this.inner?.setLODView?.(view);
+  };
+
+  /** The options a run starts with: the layout's, with the latest spatial leaf style and view (#343, #433). */
+  private get runOpts(): GpuLayoutOptions {
+    const style = this.lodStyle;
+    const view = this.lodView;
+    return {
+      ...this.opts,
+      ...(style ? { lodStyle: style.style, lodStyleVersion: style.version } : {}),
+      ...(view ? { lodView: view } : {}),
+    };
   }
 
   stop(): void {
@@ -346,8 +383,10 @@ class GpuLayoutRun implements WorkerLayoutHandle {
   private fallBackToWorker(message: string, cont: Continuation | undefined, failure?: GpuLayoutFailure): WorkerLayoutHandle {
     warnGpuFallback(`[d3gl] the GPU network layout ${message}.`, this.opts.warnUnsupported, failure);
     this.onTransport?.("worker");
-    const opts = cont ? { ...this.opts, iterations: cont.iterations, warm: cont.warm } : this.opts;
+    const opts = cont ? { ...this.runOpts, iterations: cont.iterations, warm: cont.warm } : this.runOpts;
     const worker = startWorkerLayout(this.graph, opts, this.onFrame, this.onLODTree);
+    const setLODStyle = worker.setLODStyle;
+    const setLODView = worker.setLODView;
     return {
       get shared() { return worker.shared; }, // live: it flips on a worker error (#297)
       transport: "worker",
@@ -355,12 +394,15 @@ class GpuLayoutRun implements WorkerLayoutHandle {
       stop: () => worker.stop(),
       pin: (ids, positions) => worker.pin(ids, positions),
       unpin: () => worker.unpin(),
+      ...(setLODStyle ? { setLODStyle } : {}),
+      ...(setLODView ? { setLODView } : {}),
     };
   }
 
   /** Decide GPU vs worker for this graph on `device`, and start that run. */
   private launch(device: Device | null | undefined, cont: Continuation | undefined, fallback: (reason: string) => string, failure: boolean): Launched {
-    const { graph, opts, onLODTree } = this;
+    const { graph, onLODTree } = this;
+    const opts = this.runOpts;
     const fault: GpuLayoutFailure | undefined = failure ? { kind: "failure" } : undefined;
     const verdict = gpuLayoutSupport(gpuCaps(device), gpuLayoutNeed(graph.nodeCount, graph.edgeCount));
     if (!verdict.ok || !device) {
@@ -403,13 +445,10 @@ class GpuLayoutRun implements WorkerLayoutHandle {
       },
     };
 
-    // With LOD on, the LOD worker starts coarsening now, while this thread seeds and builds the solver (#377).
+    // With LOD on, the LOD worker starts coarsening now, while this thread seeds and builds the solver (#377) —
+    // or, for the spatial tree (#343), stands ready to rebuild it per frame (coarsening only for the seed's plan).
     // If it cannot start, no second worker is tried for the seed: the relay's one warning covers both.
-    // The relay refits a coarsening tree. The spatial source (#343) rebuilds its tree per frame, which the relay
-    // does not do: it stands down (no warning, as for an edge-less graph), the main thread rebuilds the spatial
-    // tree from each harvested frame — until the relay runs the worker backend's per-frame step (#425) — and a
-    // seed-only worker coarsens for the multilevel seed.
-    const lodWorker = opts.lod === true && onLODTree !== undefined && opts.lodSource !== "spatial";
+    const lodWorker = opts.lod === true && onLODTree !== undefined;
     const relay = lodWorker && onLODTree ? startLODRelay(graph, opts, onLODTree, coarsenSeed ? seedRequest : null) : null;
     const seedWorker = coarsenSeed && !lodWorker ? startSeedWorker(graph, opts, seedRequest) : null;
     const seeded = modulePlan !== null || (coarsenSeed && (relay !== null || seedWorker !== null));
@@ -456,7 +495,8 @@ class GpuLayoutRun implements WorkerLayoutHandle {
     // Reported once every GPU resource exists, so a failed start reports only the fallback's "worker";
     // still before the first frame, and before the LOD tree (a later task).
     this.onTransport?.("gpu");
-    // LOD on but no worker to build the tree (or an edge-less graph, which does not coarsen): the caller builds it.
+    // LOD on but no worker to build the tree (or an edge-less graph's structure tree, which does not coarsen): the
+    // caller builds it.
     if (opts.lod && !relay) onLODTree?.(null);
     if (modulePlan) started.seed(modulePlan);
     else if (earlyPlan !== undefined) started.seed(earlyPlan);
@@ -476,23 +516,29 @@ class GpuLayoutRun implements WorkerLayoutHandle {
         pin: (ids: Uint32Array, positions?: Float32Array) => started.pin(ids, positions),
         /** Release every pin and re-cool over a short tail, then idle. Mirrors the worker's `unpin`. */
         unpin: () => started.unpin(),
+        /** A new leaf style for the spatial tree the LOD worker rebuilds per frame (#343). */
+        ...(relay && streamsSpatial(opts) ? { setLODStyle: (style: LeafStyle, version: number) => relay.setStyle(style, version) } : {}),
+        /** The engine's new view, whose kept glyphs' super-edge rows the LOD worker builds with each tree (#433). */
+        ...(relay && streamsSpatial(opts) ? { setLODView: (view: LODView) => relay.setView(view) } : {}),
       },
       stream: started,
     };
   }
 }
 
+/** Whether a run with these options streams the spatial LOD tree (#343), whose style it aggregates itself. */
+function streamsSpatial(opts: GpuLayoutOptions): boolean {
+  return opts.lod === true && opts.lodSource === "spatial";
+}
+
 /**
- * The GPU run's LOD tree, built and refit in a layout worker (#377), or null where no worker can run (with
- * one warning). An edge-less graph gets none: it does not coarsen, and its caller builds a spatial tree.
+ * The GPU run's LOD tree, built and refit in a layout worker (#377) — or, for the spatial source (#343),
+ * rebuilt there for every harvested frame — or null where no worker can run (with one warning). An edge-less
+ * graph's structure tree is none: it does not coarsen (the engine asks for the spatial tree there anyway).
  */
-function startLODRelay(
-  graph: NetworkGraph,
-  opts: GpuLayoutOptions,
-  onLODTree: (tree: LODTree | null) => void,
-  seed: SeedRequest | null,
-): LODRelay | null {
-  if (graph.edgeCount === 0) return null;
+function startLODRelay(graph: NetworkGraph, opts: GpuLayoutOptions, onLODTree: OnLODTree, seed: SeedRequest | null): LODRelay | null {
+  const spatial = streamsSpatial(opts);
+  if (graph.edgeCount === 0 && !spatial) return null;
   const instead = seed
     ? "the LOD tree is built on the main thread and the layout starts from a disc instead of its multilevel seed"
     : "the LOD tree is built on the main thread instead";
@@ -502,7 +548,8 @@ function startLODRelay(
     return null;
   }
   try {
-    return new LODRelay(worker, graph, opts.coarsen, onLODTree, seed);
+    const source = spatial ? { source: "spatial" as const, style: opts.lodStyle, styleVersion: opts.lodStyleVersion, view: opts.lodView } : {};
+    return new LODRelay(worker, graph, { coarsen: opts.coarsen, ...source }, onLODTree, seed);
   } catch (error) {
     // The coarsen request could not be posted; the relay freed its worker. The caller withdraws the tree once
     // it has reported the transport.

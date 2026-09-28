@@ -40,9 +40,9 @@ import { DRAG_HEAT, ForceLayout, RECOOL_TICKS, seedPositions } from "./force.js"
 import { nestedLayout, nestedBoundaryDiscs } from "./nested-layout.js";
 import { nestedSolverBuffers, nestedSolverTopology } from "./gpu/nested-topology.js";
 import { multilevelSeedSteps, buildHierarchy, type SeedProgress } from "./coarsen.js";
-import { flattenHierarchyToTopology, lodTreeFromTopology, type LODPositionTree } from "./lod.js";
+import { flattenHierarchyToTopology, lodTreeFromTopology } from "./lod.js";
 import { lodFrameStep, makeSpatialLODStream, makeStructureLODStream, recycleSpatialFrame, type LODStream } from "./lod-frame.js";
-import { answerCoarsen, refitGeometry } from "./lod-refit.js";
+import { answerCoarsen, answerLODGeometry } from "./lod-refit.js";
 import {
   lodGeometryViews,
   lodGeometryByteLength,
@@ -351,22 +351,20 @@ async function runLayout(msg: StartMessage): Promise<void> {
 }
 
 /**
- * The GPU layout's coarsening (#377, #353): coarsen only — no layout, no graph kept. The seed plan and the LOD
- * topology go to the main thread by transfer (the worker keeps its own copies of what a refit reads), and the
- * graph's edges are dropped with this call: a refit needs only the tree.
+ * The GPU layout's coarsening (#377, #353): coarsen only — no layout. The seed plan and the LOD topology go to
+ * the main thread by transfer (the worker keeps its own copies of what a refit reads). A structure tree's refit
+ * needs only the tree, so the graph's edges are dropped with this call; a spatial stream (#343) keeps them, as
+ * its CSR, to sum each rebuilt tree's super-edge rows (#433).
  */
-let refitTree: LODPositionTree | null = null;
+let relayLOD: LODStream | null = null;
 function coarsenOnly(msg: CoarsenMessage): void {
-  refitTree = answerCoarsen(msg, (message, transfer) => post(message, transfer));
+  relayLOD = answerCoarsen(msg, (message, transfer) => post(message, transfer));
 }
 
-/** Refit the coarsen-only tree to the GPU's harvested positions and hand both buffers back (#377). */
+/** One relayed GPU frame (#377): the per-frame LOD step for its positions — refit, or rebuild if spatial (#343). */
 function refitLOD(msg: LODGeometryRequest): void {
-  const tree = refitTree;
-  if (!tree) return; // the main thread requests refits only after the topology arrived
-  const buffer = msg.geometry?.buffer ?? new ArrayBuffer(lodGeometryByteLength(tree.size));
-  const geometry = refitGeometry(tree, msg.positions, buffer);
-  post({ type: "lod-geometry", positions: msg.positions, geometry }, [msg.positions.buffer, geometry.buffer]);
+  if (!relayLOD) return; // the main thread requests refits only once it has what the worker coarsened
+  answerLODGeometry(relayLOD, msg, (message, transfer) => post(message, transfer));
 }
 
 /** Write the held nodes' positions (interleaved, in `ids` order) into `positions`. */
@@ -442,8 +440,9 @@ addEventListener("message", (e: MessageEvent<MainToWorker>) => {
       if (!looping && !seeding) void runLayout(msg);
       return;
     case "lod-style": {
-      // The layout's own stream (its seed's while it seeds, #368).
-      const stream = state?.lod ?? seedLOD;
+      // The layout's own stream (its seed's while it seeds, #368), or the GPU layout's relayed one (#343): a
+      // worker runs one or the other.
+      const stream = state?.lod ?? seedLOD ?? relayLOD;
       if (stream?.kind === "spatial") {
         stream.style = msg.style;
         stream.styleVersion = msg.version;
@@ -451,16 +450,23 @@ addEventListener("message", (e: MessageEvent<MainToWorker>) => {
       return;
     }
     case "lod-view": {
-      const stream = state?.lod ?? seedLOD;
+      // The main thread's view (#433): the layout's own stream (its seed's while it seeds), or the relayed one.
+      const stream = state?.lod ?? seedLOD ?? relayLOD;
       if (stream?.kind === "spatial") stream.view = msg.view;
       return;
     }
     case "lod-recycle": {
-      // A frame skipped for back-pressure (#343) is built for the current positions once a buffer is back —
-      // mid-seed by the next progress frame or the seed frame, which post the seed's positions as they form.
-      // Once the loop has come to rest, the frame it skipped was its `done`.
+      // A frame the layout's stream skipped for back-pressure (#343) is built for the current positions once a
+      // buffer is back — mid-seed by the next progress frame or the seed frame, which post the seed's positions
+      // as they form; once the loop has come to rest, the frame it skipped was its `done`. The GPU relay's
+      // stream never skips one — its main thread takes no harvest while MAX_OUTSTANDING trees are out — and has
+      // no positions of its own to build for: it only takes the buffers back.
       const stream = state?.lod ?? seedLOD;
-      if (stream?.kind === "spatial" && recycleSpatialFrame(stream, msg.buffer, msg.rows) && state) postFrame(looping ? "frame" : "done");
+      if (stream?.kind === "spatial") {
+        if (recycleSpatialFrame(stream, msg.buffer, msg.rows) && state) postFrame(looping ? "frame" : "done");
+      } else if (relayLOD?.kind === "spatial") {
+        recycleSpatialFrame(relayLOD, msg.buffer, msg.rows);
+      }
       return;
     }
     case "coarsen":

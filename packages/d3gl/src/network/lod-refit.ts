@@ -7,11 +7,21 @@
  * and hands it to the main thread, then refits the tree's position geometry (`cx`/`cy`/`extent`) to each
  * position snapshot the GPU harvests — the O(tree) pass the worker backend runs per frame, off the main
  * thread in both cases. The main thread never coarsens and never refits.
+ *
+ * Each relayed frame runs the worker backend's own per-frame step, {@link lodFrameStep} (#343): rebuild if
+ * spatial, else refit. With the spatial source the worker coarsens nothing for the tree (only for the seed's
+ * plan, when asked): each frame rebuilds the Morton tree for the harvested positions and transfers it — with
+ * the super-edge rows of the glyphs the main thread's view keeps, summed from the edges (#433) — and a frame id
+ * it already built is skipped, so the rebuilds stop once the layout has converged.
  */
 import { buildHierarchy, type CoarseLevel, type CoarsenOptions, type Hierarchy } from "./coarsen.js";
-import { computeLODPositions, flattenHierarchyToTopology, type LODPositionTree, type LODTopology } from "./lod.js";
-import { lodGeometryViews, type CoarsenMessage, type WorkerToMain } from "./worker-protocol.js";
+import { flattenHierarchyToTopology, type LODPositionTree, type LODTopology } from "./lod.js";
+import { lodFrameStep, makeSpatialLODStream, makeStructureLODStream, type LODStream } from "./lod-frame.js";
+import { lodGeometryByteLength, lodGeometryViews, type CoarsenMessage, type LODGeometryRequest, type WorkerToMain } from "./worker-protocol.js";
 import { coarseSeedPlan, seedPlanTransferables } from "./gpu/seed-plan.js";
+
+/** How the worker's handlers reply: a message and the buffers it transfers. */
+export type WorkerSend = (message: WorkerToMain, transfer: Transferable[]) => void;
 
 /**
  * Coarsen `graph` into the LOD tree's topology — the tree the worker backend streams, super-edges included
@@ -42,18 +52,37 @@ export function coarsenForRefit(
 }
 
 /**
- * Refit `tree`'s position geometry to `positions` (interleaved `[x, y, …]`), written into `buffer` as
- * `[cx, cy, extent]` ({@link lodGeometryViews}). The same pass, and the same values, as the worker backend's
- * per-frame {@link computeLODPositions}. Returns the whole geometry as one view over `buffer`; allocates only
- * the views.
+ * Bind `tree`'s position geometry (`cx`/`cy`/`extent`) to `buffer` ({@link lodGeometryViews}), where the next
+ * refit writes it, and return the whole geometry as one view over `buffer`. Allocates only the views.
  */
-export function refitGeometry(tree: LODPositionTree, positions: ArrayLike<number>, buffer: ArrayBufferLike): Float32Array {
+function bindGeometry(tree: LODPositionTree, buffer: ArrayBufferLike): Float32Array {
   const views = lodGeometryViews(buffer, tree.size);
   tree.cx = views.cx;
   tree.cy = views.cy;
   tree.extent = views.extent;
-  computeLODPositions(tree, positions);
   return new Float32Array(buffer, 0, 3 * tree.size);
+}
+
+/**
+ * The layout worker's answer to one relayed frame ({@link LODGeometryRequest}): the per-frame LOD step
+ * ({@link lodFrameStep}) for the positions it carries, then `send` them back with its result. A structure
+ * stream refits the tree into the geometry buffer the request handed back (the worker allocates one on the
+ * first request) — the same pass, and the same values, as the worker backend's per-frame
+ * `computeLODPositions` — and returns it. A spatial stream rebuilds the Morton tree into a packed frame and
+ * transfers it, or returns none for a frame id it already built. Either way the positions go back.
+ */
+export function answerLODGeometry(stream: LODStream, msg: LODGeometryRequest, send: WorkerSend): void {
+  const { positions } = msg;
+  if (stream.kind === "structure") {
+    const geometry = bindGeometry(stream.tree, msg.geometry?.buffer ?? new ArrayBuffer(lodGeometryByteLength(stream.tree.size)));
+    lodFrameStep(stream, positions, msg.frame);
+    send({ type: "lod-geometry", positions, geometry }, [positions.buffer, geometry.buffer]);
+    return;
+  }
+  const lodFrame = lodFrameStep(stream, positions, msg.frame);
+  if (!lodFrame) send({ type: "lod-geometry", positions }, [positions.buffer]);
+  else if (lodFrame.rows) send({ type: "lod-geometry", positions, lodFrame }, [positions.buffer, lodFrame.buffer, lodFrame.rows.buffer]);
+  else send({ type: "lod-geometry", positions, lodFrame }, [positions.buffer, lodFrame.buffer]);
 }
 
 /** Every buffer behind `topology`'s typed arrays, each once: the transfer list that moves it to the main thread. */
@@ -69,16 +98,22 @@ export function topologyTransferables(topology: LODTopology): ArrayBuffer[] {
  * The layout worker's answer to a {@link CoarsenMessage}: coarsen once, then `send` the GPU seed's plan the
  * moment it is built (when `seed` was asked for, #353) — before the slower LOD topology, so the GPU seed starts
  * early — and then the LOD tree's topology (when `lod` was, #377). Every reply's buffers go in its transfer
- * list. Returns the tree the worker keeps for refits, or null without `lod`.
+ * list. Returns the stream each relayed frame steps ({@link answerLODGeometry}): the structure tree to refit,
+ * or, for `lodSource: "spatial"` (#343), a spatial stream — for which nothing is coarsened unless the seed
+ * needs it, and no topology is sent. Null without `lod`.
  */
-export function answerCoarsen(msg: CoarsenMessage, send: (message: WorkerToMain, transfer: ArrayBuffer[]) => void): LODPositionTree | null {
-  const hierarchy = buildHierarchy(msg, msg.coarsen);
-  if (msg.seed) {
+export function answerCoarsen(msg: CoarsenMessage, send: WorkerSend): LODStream | null {
+  const spatial = msg.lod && msg.lodSource === "spatial";
+  // The spatial tree is built from positions alone: coarsen only for the seed's plan or the structure tree.
+  const hierarchy = msg.seed || (msg.lod && !spatial) ? buildHierarchy(msg, msg.coarsen) : null;
+  if (msg.seed && hierarchy) {
     const plan = coarseSeedPlan(msg, hierarchy, msg.seed);
     send({ type: "seed-plan", plan }, plan ? seedPlanTransferables(plan) : []);
   }
   if (!msg.lod) return null;
-  const { topology, tree } = coarsenForRefit(msg, msg.coarsen, hierarchy);
+  // The spatial stream keeps the edges for its trees' super-edge rows (#433).
+  if (spatial) return makeSpatialLODStream(msg.nodeCount, msg.lodStyle, msg.lodStyleVersion, msg, msg.lodView);
+  const { topology, tree } = coarsenForRefit(msg, msg.coarsen, hierarchy ?? undefined);
   send({ type: "lod-topology", topology }, topologyTransferables(topology));
-  return tree;
+  return makeStructureLODStream(tree);
 }

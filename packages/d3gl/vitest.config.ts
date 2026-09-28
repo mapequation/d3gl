@@ -22,6 +22,10 @@ export default defineConfig({
     // CI renders under SwiftShader software GL, so the browser tier picks its own N.
     // Unset ⇒ "" ⇒ each guard keeps its locally-calibrated default.
     __PERF_N__: JSON.stringify(process.env.PERF_BROWSER_N ?? ""),
+    // Set by a browser tier that runs on a hardware GPU (#392): guards whose wall-clock comparison only
+    // means something on a real GPU (not on SwiftShader, whose rendering competes with the page's workers
+    // for the runner's CPUs) assert it only then. Unset ⇒ "" ⇒ they assert their deterministic counts only.
+    __PERF_REAL_GPU__: JSON.stringify(process.env.PERF_REAL_GPU ?? ""),
   },
   test: {
     include: ["src/**/*.browser.test.{ts,tsx}"],
