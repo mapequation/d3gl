@@ -24,6 +24,7 @@ import {
   type WorkerToMain,
 } from "./worker-protocol.js";
 import { nestedSolverTopology, type NestedSolverTopology } from "./gpu/nested-topology.js";
+import { lodTreeFromSpatialFrame, type LeafStyle, type LODView, type SpatialFrameHeader } from "./lod-frame.js";
 
 export interface WorkerLayoutOptions {
   width: number;
@@ -44,6 +45,17 @@ export interface WorkerLayoutOptions {
    */
   lod?: boolean;
   /**
+   * Which tree to stream with `lod` (#343): `"structure"` (default) — the coarsening tree, posted once and
+   * refit per frame — or `"spatial"`: a Morton tree rebuilt every streamed frame and handed to `onLODTree`
+   * with each frame (its style already aggregated from {@link lodStyle}).
+   */
+  lodSource?: "structure" | "spatial";
+  /** The leaf style a spatial stream aggregates per rebuild (#343), and its version (echoed per tree). */
+  lodStyle?: LeafStyle;
+  lodStyleVersion?: number;
+  /** The view whose kept glyphs' super-edge rows a spatial stream builds with each tree (#433). */
+  lodView?: LODView;
+  /**
    * Continue the layout `graph.positions` holds instead of seeding one (#311): no disc, no multilevel
    * seed, and its heat schedule resumed — `cool(iterations, heat)` when it was decaying, else
    * `hold(heat)` — over `iterations`, the ticks it had left. `iterations: 0` starts the worker idle, alive
@@ -52,6 +64,16 @@ export interface WorkerLayoutOptions {
    * after a drag, resumed as one (a pin then reheats at the drag heat at once).
    */
   warm?: { heat: number; decaying: boolean; recool?: boolean };
+}
+
+/**
+ * A spatial tree streamed with a frame (#343): its header (the style version it was aggregated with, the
+ * frame it was built for) and `release`, which hands its buffer back to the worker for reuse — call it once
+ * nothing reads the tree any more (its arrays are detached after).
+ */
+export interface StreamedLODTree {
+  header: SpatialFrameHeader;
+  release: () => void;
 }
 
 export interface WorkerLayoutHandle {
@@ -87,6 +109,12 @@ export interface WorkerLayoutHandle {
   pin(ids: Uint32Array, positions?: Float32Array): void;
   /** Release every pin and let the layout re-cool, then idle (#140). No-op on the fallback. */
   unpin(): void;
+  /** Send a spatial LOD stream a new leaf style (#343, after `style()`); later frames aggregate it. Absent
+   *  when the run streams no spatial tree. */
+  setLODStyle?(style: LeafStyle, version: number): void;
+  /** Send a spatial LOD stream the main thread's new view (#433); later trees carry the super-edge rows of its
+   *  covers. Absent when the run streams no spatial tree. */
+  setLODView?(view: LODView): void;
   /**
    * Set by `startGpuLayout` only (#311): the render backend that owns this layout's WebGL device is about
    * to be replaced — call it while that device is still alive. A GPU run stops and frees its GPU
@@ -136,9 +164,10 @@ export function startWorkerLayout(
   /**
    * Called once when the worker streams the LOD tree (only when `opts.lod` is on and a real worker
    * runs). The tree's `cx`/`cy`/`extent` track the worker's layout live; the caller fills
-   * `radius`/`weight` once via `computeLODStyle`.
+   * `radius`/`weight` once via `computeLODStyle`. With `lodSource: "spatial"` it is called with every
+   * frame that moved the layout, with the rebuilt tree (style aggregated) and its `streamed` handle (#343).
    */
-  onLODTree?: (tree: LODTree) => void,
+  onLODTree?: (tree: LODTree, streamed?: StreamedLODTree) => void,
 ): WorkerLayoutHandle {
   const { width, height, iterations, warm } = opts;
   const multilevel = opts.multilevel ?? true;
@@ -222,6 +251,20 @@ export function startWorkerLayout(
     // frame | done
     if (msg.positions && !shared) graph.positions.set(msg.positions);
     if (msg.geometry && lodGeomFlat) lodGeomFlat.set(msg.geometry); // copy-mode geometry snapshot
+    const frame = msg.lodFrame;
+    if (frame) {
+      // A spatial tree rebuilt for this frame (#343): hand it over with a way to return its buffer.
+      let released = false;
+      const release = (): void => {
+        if (released || terminated) return;
+        released = true;
+        const rows = frame.rows?.buffer;
+        const back: MainToWorker = { type: "lod-recycle", buffer: frame.buffer, rows };
+        worker.postMessage(back, rows ? [frame.buffer, rows] : [frame.buffer]);
+      };
+      if (onLODTree) onLODTree(lodTreeFromSpatialFrame(frame), { header: frame.header, release });
+      else release();
+    }
     onFrame();
     // `done` = the layout (initial run, or a drag re-cool) reached rest. Resolve `settled` the first
     // time; keep the worker alive either way so a later drag can reheat it.
@@ -251,6 +294,10 @@ export function startWorkerLayout(
     multilevel,
     frameEvery: opts.frameEvery,
     lod: opts.lod,
+    lodSource: opts.lodSource,
+    lodStyle: opts.lodStyle,
+    lodStyleVersion: opts.lodStyleVersion,
+    lodView: opts.lodView,
     // Copy mode clones the positions into the message (at post time); shared mode carried them into the SAB.
     warm: warm && { ...warm, ...(shared ? {} : { positions: graph.positions }) },
   };
@@ -277,6 +324,20 @@ export function startWorkerLayout(
       const unpin: MainToWorker = { type: "unpin" };
       worker.postMessage(unpin);
     },
+    setLODStyle: opts.lod && opts.lodSource === "spatial"
+      ? (style: LeafStyle, version: number) => {
+          if (terminated) return;
+          const msg: MainToWorker = { type: "lod-style", style, version };
+          worker.postMessage(msg);
+        }
+      : undefined,
+    setLODView: opts.lod && opts.lodSource === "spatial"
+      ? (view: LODView) => {
+          if (terminated) return;
+          const msg: MainToWorker = { type: "lod-view", view };
+          worker.postMessage(msg);
+        }
+      : undefined,
   };
 }
 

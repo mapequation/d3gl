@@ -387,6 +387,25 @@ describe("GPU layout LOD relay (#377) — engine", () => {
     }
   });
 
+  it("lod({ source: 'spatial' }) starts no LOD worker: the spatial tree follows the GPU frames on the main thread, and a seed-only worker coarsens for the multilevel seed (#343, #353)", async () => {
+    const warn = vi.spyOn(console, "warn");
+    const net = network(makeHost(), { width: W, height: H, backend: "webgl" });
+    await net.whenReady();
+    try {
+      const posts = vi.spyOn(Worker.prototype, "postMessage");
+      net.data(clustered(3000, 5)).lod({ source: "spatial" }).layout({ backend: "gpu", iterations: 60 });
+      await net.whenSettled();
+      expect(net.layoutTransport).toBe("gpu");
+      expect(net.lodSource).toBe("spatial"); // never the relay's coarsening tree
+      const coarsens = posts.mock.calls.map((c: [MainToWorker, ...unknown[]]) => c[0]).filter((m) => m.type === "coarsen");
+      expect(coarsens.filter((m) => m.lod)).toHaveLength(0); // no LOD tree from a worker
+      expect(coarsens.filter((m) => m.seed !== undefined)).toHaveLength(1); // the multilevel seed's plan still is
+      expect(warn.mock.calls.filter((c) => String(c[0]).includes("worker"))).toHaveLength(0);
+    } finally {
+      net.destroy();
+    }
+  });
+
   it("a failed LOD worker: the engine keeps drawing the adopted tree and refits it itself", async () => {
     vi.spyOn(console, "warn").mockImplementation(() => {});
     const net = network(makeHost(), { width: W, height: H, backend: "webgl" });

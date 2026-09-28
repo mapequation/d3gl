@@ -436,7 +436,8 @@ describe("buildSpatialLODTree (#103 edge-less point clouds)", () => {
 
   it("builds a multi-level quadtree whose leaves are the points (4 corners → 4 quadrants under a root)", () => {
     const pos = Float32Array.from([0, 0, 10, 0, 0, 10, 10, 10]); // one point per quadrant
-    const tree = buildSpatialLODTree(pos, 4);
+    // One point per bottom cell (#343: the default bucket of 8 would hold all four in the root).
+    const tree = buildSpatialLODTree(pos, 4, { bucket: 1 });
 
     expect(tree.leafCount).toBe(4);
     expect(tree.levelCount).toBe(3); // points (0), four 1-point cells (1), root (2)

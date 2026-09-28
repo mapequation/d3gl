@@ -106,8 +106,8 @@ The edges are still **data**: they keep driving the force layout and the LOD coa
 the arrangement is identical with links shown or hidden, and toggling never re-lays-out the graph.
 Works with LOD on or off, and on all three backends (`toSVG()` exports the nodes alone). A graph with
 genuinely no edges (`buildGraph({ nodeCount, source: [], target: [] })`) renders the same way — every
-link emit is simply an empty loop; its LOD tree is then built from a spatial quadtree over the
-positions, since there is nothing to coarsen.
+link emit is simply an empty loop; its LOD tree is then the [spatial tree](#spatial-lod-grouping-by-position)
+over the positions, since there is nothing to coarsen.
 
 The **Edges** toggle in the example above is wired to exactly this.
 
@@ -291,6 +291,66 @@ net
   .layout({ backend: "worker" }); // …so the worker builds + streams the tree (or "gpu": its LOD worker)
 ```
 
+### Spatial LOD: grouping by position
+
+Structural coarsening groups nodes that are **tightly linked**, wherever the layout puts them. On a
+graph whose force layout keeps communities together that reads as a map; on a web graph, where the
+layout spreads each group across the view, an aggregate's members are scattered, its glyph sits at a
+centroid in empty space, and the cut has to open a large share of the graph at every zoom (a quarter of
+a 325k-node web graph at the fit view). `lod({ source: "spatial" })` groups nodes by **where they are**
+instead: a quadtree over the layout, up to 8 nodes per bottom cell, so every aggregate is a compact
+region drawn where its members are.
+
+```ts
+net
+  .style({ sizeMode: "screen" })
+  .lod({ source: "spatial", maxAggregateRadius: 26 }) // configure LOD first…
+  .layout({ backend: "worker", iterations }); // …so the worker rebuilds the tree as it streams
+```
+
+- **Bounded by the screen.** The frontier is set by the view area over the expand threshold, not by the
+  graph: a few hundred glyphs at the fit view and up to ~2k when zoomed in, so the cut and declutter
+  cost next to nothing at any size.
+- **It follows the layout.** A tree built from older positions blows up as nodes wander out of their
+  cells, so the `"worker"` backend **rebuilds it in the worker on every streamed frame** — topology,
+  geometry and aggregated style, handed to the main thread whole (transferred, not copied) — and stops
+  once the layout has converged. The other backends rebuild it on the main thread whenever a layout
+  lands — and the `"gpu"` backend lands one with every frame it streams, so there the main thread
+  rebuilds the tree per repaint (~30 ms for a 325k-node graph, ~140 ms for a million nodes): use
+  `"worker"` with the spatial source on large graphs. A position transition or a drag only refits the
+  tree it has, and rebuilds it once the nodes come to rest.
+- **Links are summed from the graph.** A rebuilt tree has no super-edge table (building one per frame
+  would cost more than the layout tick); the links between drawn glyphs are summed from the graph's own
+  edges through the glyphs' members. Every neighbour resolves to the one glyph that covers it, so links
+  between glyphs at different levels are always drawn (`crossLevelEdges` makes no difference here), a
+  link leaving the view points at the off-screen cell that holds its neighbour (a coarser cell the
+  further away it is), and an undirected pair is one line carrying both directions' flow.
+- **While the worker streams, it sums them too.** It cuts and declutters each tree it rebuilds the way
+  the main thread will — at your view, or at the fit while the camera follows the layout — and hands over,
+  with the tree, each kept glyph's links summed per glyph or off-screen cell it reaches. A streamed repaint
+  then reads those rows — bounded by what the kept glyphs link to, not by the edges under them — instead of
+  every edge in view: about 1 ms instead of 14 ms for the cut, declutter and links at the fit view of a
+  325k-node, 1.5M-edge web graph (3 ms instead of 9 ms at 4× zoom), for 14-16 ms more work per rebuild in
+  the worker (5-9 ms at 4×); on a million nodes with 10M edges, 1.5 ms instead of 225 ms at the fit view
+  and 16 ms instead of 216 ms at 4×, for 90-190 ms more per rebuild in the worker (a force tick there
+  takes ~1 s) and 0.4-8 MB per frame. A glyph whose row the worker's cut cannot serve — mid-gesture, or
+  after you zoom a settled layout — is summed on the main thread from its members' edges, as below.
+- **Elsewhere the main thread sums them.** On the other backends, and for a tree the main thread
+  rebuilt, the work is proportional to the edges of the drawn glyphs' members, and an unchanged view
+  re-emits them from a per-tree memo. At the fit view that is every edge in view: about 10 ms per frame
+  for the 325k-node graph (a zoom frame in the browser: 5 ms median, 8 ms p90), but ~190 ms for a million
+  nodes with 5.8M edges. So away from a streaming worker the spatial source is for graphs up to a few
+  hundred thousand nodes; at millions of edges, a layout that keeps communities together, such as this
+  example's, draws a compact map with `"structure"` at a fraction of the cost.
+- **Aggregates are regions.** An aggregate is sized area-additively (its ink ≈ its members' total) and
+  reads as "this part of the map" — it is not a community. Its id changes with each rebuild; a selected
+  or hovered aggregate is carried over to the cell in the same place (leaves keep their ids).
+
+`"structure"` stays the default for a plain graph (and edge-less graphs always get the spatial tree).
+The coarsening tree still seeds the multilevel layout either way. For a map of *communities*, run a
+clustering and hand it in as a module hierarchy (below). The **Source** control in the example above
+switches between the two trees.
+
 ### Maps of networks: a provided module hierarchy
 
 When the app already has a **module hierarchy** — e.g. an [Infomap](https://www.mapequation.org/infomap/)
@@ -318,8 +378,8 @@ net.lodSource; // "modules"
 The engine owns the hierarchy, not the LOD options, so every module feature reads it in any LOD mode:
 
 - the **LOD cut** draws it by default; `lod({ source: "structure" })` coarsens the graph structurally
-  instead, and `lod(false)` draws every node — both keep the hierarchy, so switching back reuses the
-  tree it built (once) rather than rebuilding it;
+  instead, `lod({ source: "spatial" })` groups by position, and `lod(false)` draws every node — all keep
+  the hierarchy, so switching back reuses the tree it built (once) rather than rebuilding it;
 - **`layout({ nested: true })`** lays the module tree out top-down, each module's children inside its
   own disc — with LOD on or off ([re-clustering](#re-clustering-warm-re-layout-and-transitions) re-lays
   it out *warm*, from the current positions);

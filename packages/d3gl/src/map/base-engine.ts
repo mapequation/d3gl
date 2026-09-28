@@ -40,6 +40,9 @@ export interface HoverHit {
    * itself + the glyphs absorbed under it; a plain glyph → `[id]`. Lazy: enumeration runs only when
    * called (network = subtree DFS, declutter = a `winners` inverse-scan), never on the pick hot path.
    * Present on `on("hover" | "click")` hits and every `selection()` entry; absent for non-pickable hits.
+   * It reads the frame the hit came from, so call it while that frame is current (in the event handler,
+   * or on a fresh `selection()`): a network's spatial LOD tree is replaced — and its ids renumbered — by
+   * every streamed layout frame (#343), after which an old hit's `members()` no longer resolves.
    */
   members?: () => (string | number)[];
 }
@@ -708,6 +711,35 @@ export abstract class BaseEngine {
     const others = this.laneInteractiveFor(layer)?.ix.options.selection?.others;
     const op = others === undefined ? 0.3 : others.opacity ?? 1;
     return op < 1 ? op : null;
+  }
+
+  /**
+   * Re-key `layer`'s selection, hover and subtract-preview ids through `map` (`null` drops an id) — for an
+   * engine whose ids are renumbered under the same user-visible glyphs (#343: a spatial LOD tree rebuilt
+   * per streamed frame, where an aggregate's id changes but its cell stays). Emits and repaints nothing
+   * (the caller repaints with the renumbered state), and fires no `select` callback: the selection still
+   * shows the same glyphs. O(selected + hovered) — nothing when both are empty.
+   */
+  protected remapLaneIds(layer: string, map: (id: string | number) => string | number | null): void {
+    const remap = (sets: Map<string, Set<string | number>>): void => {
+      const set = sets.get(layer);
+      if (!set || set.size === 0) return;
+      const next = new Set<string | number>();
+      for (const id of set) {
+        const to = map(id);
+        if (to !== null) next.add(to);
+      }
+      if (next.size > 0) sets.set(layer, next);
+      else sets.delete(layer);
+    };
+    remap(this.selected);
+    remap(this.laneHilite);
+    remap(this.laneRemove);
+    const last = this.lastHover;
+    if (last && last.layer === layer) {
+      const to = map(last.id);
+      this.lastHover = to === null ? null : { ...last, id: to };
+    }
   }
 
   /** Drop any managed selection + hover highlight for `layer` — e.g. when an engine disables that

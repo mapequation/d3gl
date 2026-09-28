@@ -11,6 +11,7 @@
 import type { ForceParams } from "./force.js";
 import type { CoarsenOptions } from "./coarsen.js";
 import type { BoundaryDiscs, LODTopology } from "./lod.js";
+import type { LeafStyle, LODView, SpatialLODFrame } from "./lod-frame.js";
 import type { NestedLayoutParams, NestedLayoutTopology } from "./nested-layout.js";
 import type { SeedPlan, SeedPlanOptions } from "./gpu/seed-plan.js";
 import type { NestedSolverTopology } from "./gpu/nested-topology.js";
@@ -44,6 +45,18 @@ export interface StartMessage {
    */
   lod?: boolean;
   /**
+   * Which tree the worker streams with `lod` (#343): `"structure"` (default) posts the coarsening tree's
+   * topology once and refits its geometry each frame; `"spatial"` rebuilds a Morton tree every streamed frame
+   * and transfers it whole with the frame ({@link ProgressMessage.lodFrame}), with its super-edge rows while
+   * `lodStyle.links` (#433). The worker still coarsens for the multilevel seed either way.
+   */
+  lodSource?: "structure" | "spatial";
+  /** The leaf style a spatial tree aggregates onto every rebuild (#343), and its version (echoed per frame). */
+  lodStyle?: LeafStyle;
+  lodStyleVersion?: number;
+  /** The main thread's view, whose kept glyphs' super-edge rows a spatial tree carries (#433). */
+  lodView?: LODView;
+  /**
    * Continue a layout another transport was running (#311) instead of seeding one: no disc, no multilevel
    * seed, no seed frame. `iterations` is the ticks left of its budget; 0 starts the worker idle, alive for
    * a drag reheat.
@@ -67,6 +80,27 @@ export interface WarmStart {
    * drag heat at once instead of riding the tail's decaying heat, as a drag during the initial run does.
    */
   recool?: boolean;
+}
+
+/** A new leaf style for the spatial tree's per-frame aggregation (#343), after `style()` changed it. */
+export interface LODStyleMessage {
+  type: "lod-style";
+  style: LeafStyle;
+  version: number;
+}
+
+/** The main thread's view changed (#433): later spatial trees carry the super-edge rows of the glyphs it keeps. */
+export interface LODViewMessage {
+  type: "lod-view";
+  view: LODView;
+}
+
+/** A spatial frame's buffer handed back for reuse once its tree is no longer drawn (#343; transferred), with
+ *  its super-edge rows buffer when it carried one (#433). */
+export interface LODRecycleMessage {
+  type: "lod-recycle";
+  buffer: ArrayBuffer;
+  rows?: ArrayBuffer;
 }
 
 export interface StopMessage {
@@ -141,6 +175,7 @@ export interface CoarsenMessage {
   seed?: SeedPlanOptions;
 }
 
+
 /**
  * Refit the coarsen-only tree's position geometry to `positions` (#377). Both buffers are transferred, both
  * ways: `positions` comes back in the reply, and `geometry` is the previous reply's buffer handed back for
@@ -160,6 +195,9 @@ export type MainToWorker =
   | PinMessage
   | UnpinMessage
   | NestedStartMessage
+  | LODStyleMessage
+  | LODViewMessage
+  | LODRecycleMessage
   | CoarsenMessage
   | LODGeometryRequest
   | NestedPrepMessage;
@@ -199,6 +237,12 @@ export interface ProgressMessage {
   geometry?: Float32Array;
   /** A nested layout's `done` (#329): its module boundary discs, for `lod({ moduleBoundary })`. */
   boundaries?: BoundaryDiscs;
+  /**
+   * The spatial LOD tree rebuilt for this frame's positions (#343, `lodSource: "spatial"`), its buffer — and
+   * its super-edge rows' (#433) — transferred. Absent when the positions did not move since the last one
+   * (the layout converged).
+   */
+  lodFrame?: SpatialLODFrame;
 }
 
 /** The reply to an {@link LODGeometryRequest} (#377): its positions, and `[cx, cy, extent]` refit to them. */

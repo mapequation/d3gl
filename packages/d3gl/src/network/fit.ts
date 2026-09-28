@@ -215,3 +215,15 @@ export function fitTransform(box: FitBox, width: number, height: number, opts: F
   const k = Math.max(room - 2 * (opts.padPx ?? 0), room / 2) / span;
   return { k, x: width / 2 - k * cx, y: height / 2 - k * cy };
 }
+
+/**
+ * The transform a `layout({ fit: true })` frames `box` at (#369): padded by the drawn leaf radius `pad` —
+ * grown into the box for world-sized glyphs, kept free as `pad` screen pixels for screen-sized ones — so the
+ * outermost glyphs stay inside the frame, then {@link fitTransform}ed into the viewport. The engine reframes
+ * every streamed frame with it; a spatial LOD stream computes the same from the positions it rebuilt its
+ * tree for (#433), to cut that tree the way the engine will.
+ */
+export function layoutFitTransform(box: FitBox, width: number, height: number, pad: number, screenSized: boolean): ViewTransform {
+  const padded: FitBox = screenSized ? box : [box[0] - pad, box[1] - pad, box[2] + pad, box[3] + pad];
+  return fitTransform(padded, width, height, { padPx: screenSized ? pad : 0 });
+}

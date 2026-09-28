@@ -4,6 +4,8 @@ import { ForceLayout, seedPositions } from "../force.js";
 import { network } from "../network.js";
 import { buildGraph } from "../graph.js";
 import type { LODTree } from "../lod.js";
+import { MAX_OUTSTANDING, type LODView } from "../lod-frame.js";
+import type { MainToWorker, ProgressMessage, WorkerToMain } from "../worker-protocol.js";
 
 /** A ring graph — enough structure for the force layout to spread the nodes apart. */
 function ring(n: number) {
@@ -293,6 +295,76 @@ describe("worker-LOD streaming (#103)", () => {
 
     net.destroy();
     host.remove();
+  });
+
+  it("a spatial stream held back by back-pressure posts nothing — no frame, and no done — until a buffer returns: positions always travel with their tree (#343, #433)", async () => {
+    const g = ring(400);
+    const worker = new Worker(new URL("../layout-worker.js", import.meta.url), { type: "module" });
+    const got: ProgressMessage[] = [];
+    let onProgress: (m: ProgressMessage) => void = () => {};
+    worker.onmessage = (e: MessageEvent<WorkerToMain>) => {
+      const m = e.data;
+      if (m.type !== "frame" && m.type !== "done") return;
+      got.push(m);
+      onProgress(m);
+    };
+    /** Resolves once `ms` pass with no progress message. */
+    const quiet = (ms: number) =>
+      new Promise<void>((resolve) => {
+        let timer = setTimeout(resolve, ms);
+        onProgress = () => {
+          clearTimeout(timer);
+          timer = setTimeout(resolve, ms);
+        };
+      });
+    const recycle = (m: ProgressMessage): void => {
+      const f = m.lodFrame;
+      if (!f) return;
+      const back: MainToWorker = { type: "lod-recycle", buffer: f.buffer, rows: f.rows?.buffer };
+      worker.postMessage(back, f.rows ? [f.buffer, f.rows.buffer] : [f.buffer]);
+    };
+    const view: LODView = { transform: null, fitPad: 3, width: 400, height: 400, screenSized: true, fadeBand: 0, declutter: true };
+    const start: MainToWorker = {
+      type: "start",
+      nodeCount: g.nodeCount,
+      source: g.source,
+      target: g.target,
+      weight: g.weight,
+      width: 400,
+      height: 400,
+      iterations: 40, // a few ms of ticks: the run ends while the main thread hands nothing back
+      frameEvery: 1,
+      multilevel: false,
+      lod: true,
+      lodSource: "spatial",
+      lodStyle: { radii: new Float32Array(g.nodeCount).fill(3), weight: g.strength, links: true },
+      lodStyleVersion: 1,
+      lodView: view,
+    };
+    try {
+      worker.postMessage(start);
+      // Nothing handed back (a long task on the main thread): MAX_OUTSTANDING trees, then nothing at all —
+      // not the ticks it skipped, and not the run's `done` — however long the worker runs.
+      await quiet(500);
+      expect(got.map((m) => m.type)).toEqual(new Array(MAX_OUTSTANDING).fill("frame"));
+      // Hand every tree back as it arrives: the skipped frame is built, and the run's `done` brings its tree.
+      const done = new Promise<ProgressMessage>((resolve) => {
+        onProgress = (m) => {
+          recycle(m);
+          if (m.type === "done") resolve(m);
+        };
+      });
+      for (const m of got) recycle(m);
+      const last = await done;
+      expect(last.lodFrame?.header.frame).toBe(last.tick);
+      // Every frame and `done` that brought positions brought the tree built from them.
+      for (const m of got) {
+        expect(m.positions).toBeDefined();
+        expect(m.lodFrame?.header.frame, `${m.type} at tick ${m.tick}`).toBe(m.tick);
+      }
+    } finally {
+      worker.terminate();
+    }
   });
 
   it("falls back to a main-thread LOD tree when lod() is enabled after a worker run settled", async () => {

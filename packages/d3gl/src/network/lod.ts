@@ -15,11 +15,11 @@
  * Kept network-private for now behind the {@link cut} / frontier boundary; the same shape is meant
  * to be promotable to a shared core `select(transform) → visibleIndices` lane later (#108).
  */
-import { hcl, rgb } from "d3-color";
 import type { NetworkGraph } from "./graph.js";
 import { buildHierarchy, type CoarsenOptions, type Hierarchy } from "./coarsen.js";
 import { declutterScreen, declutterScratch, type DeclutterScratch } from "../core/declutter.js";
 import type { ScreenRect } from "../core/instanced-lane.js";
+import type { SpatialRows } from "./spatial-rows.js";
 
 /**
  * The position-independent **topology** of the LOD tree: the flattened coarsening hierarchy (levels,
@@ -106,6 +106,51 @@ export interface LODTopology {
   moduleLinkInOffset?: Uint32Array;
   moduleLinkInSource?: Uint32Array;
   moduleLinkInFlow?: Float32Array;
+  /**
+   * **Contiguous leaf ranges** (#343): the leaves in an order where every tree node's leaf descendants
+   * are one run — node `g` covers `leafOrder[leafStart[g] .. leafEnd[g])`. A leaf's own run is its rank
+   * (`leafEnd = leafStart + 1`), so two nodes are nested iff their runs overlap. Present on a spatial
+   * (Morton) tree ({@link buildMortonLODTree}), where it lets the super-edge gather walk a glyph's leaves
+   * without a super-edge CSR; absent on coarsening and module trees.
+   */
+  leafOrder?: Uint32Array;
+  /** Per-node first rank into {@link leafOrder}, length `size` (a leaf's is its own rank). */
+  leafStart?: Uint32Array;
+  /** Per-node rank one past its last leaf in {@link leafOrder}, length `size`. */
+  leafEnd?: Uint32Array;
+  /** A spatial (Morton) tree's cells (#343): each aggregate's square in the root box. @see {@link MortonCells} */
+  morton?: MortonCells;
+  /**
+   * A streamed spatial tree's **super-edge rows** (#433), built off the main thread with the tree: per cell
+   * the worker's view kept, the flow of its edges toward each cover of that cut, so the super-edge gather
+   * (`lazySuperEdges`) reads the kept glyphs' rows instead of walking the edges under the frontier. Absent
+   * on a tree the main thread built. @see {@link SpatialRows}
+   */
+  rows?: SpatialRows;
+}
+
+/**
+ * A power-of-two square the spatial LOD tree quantises positions into (#343): `[x0, x0 + side)` ×
+ * `[y0, y0 + side)`. `side` is a power of two and the corner a multiple of `side / 4`, so every cell two or
+ * more levels down is a square of the one global power-of-two grid, whatever box it was cut from.
+ */
+export interface MortonBox {
+  x0: number;
+  y0: number;
+  side: number;
+}
+
+/**
+ * The cells of a spatial (Morton) LOD tree (#343). Aggregate `g` (index `g − leafCount`) is the square
+ * `level[o]` levels below the root {@link box} whose Morton prefix is `code[o]` — the longest prefix all its
+ * leaves share, 16 bits per axis interleaved and left-aligned in 32 bits (the low `32 − 2·level` bits are
+ * zero). A cell names the same square in every tree built in the same box, so an aggregate can be found
+ * again after a rebuild ({@link findMortonCell}).
+ */
+export interface MortonCells {
+  box: MortonBox;
+  level: Uint8Array;
+  code: Uint32Array;
 }
 
 /**
@@ -622,232 +667,525 @@ export function buildLODTree(graph: NetworkGraph, coarsen?: CoarsenOptions): LOD
 
 export interface SpatialLODOptions {
   /**
-   * Safety cap on quadtree depth. Cells stop subdividing here and bucket their points, so
-   * coincident / near-coincident points can't recurse forever. Default 24.
+   * Leaves per bottom cell (#343): a cell holding at most this many leaves is not split further. Default
+   * 8 — the measured knee between build time and frontier size (4-64 moves the build by only ~2×).
+   * Coincident points share one bottom cell whatever its size.
+   */
+  bucket?: number;
+  /**
+   * Cap on cell depth below the root box: a cell this deep is a bottom cell whatever its size. Positions
+   * are quantised to 16 bits per axis, so depths past 16 change nothing. Default 16.
    */
   maxDepth?: number;
 }
 
-const SPATIAL_MAX_DEPTH = 24;
+/** Leaves per bottom cell of a spatial tree (#343) — see {@link SpatialLODOptions.bucket}. */
+const SPATIAL_BUCKET = 8;
 
 /**
- * Build a {@link LODTree} from a point cloud's positions alone — a spatial **quadtree** used as the
- * LOD hierarchy when there are no edges to coarsen (#103). The structural coarsening tree needs edges
- * (heavy-edge matching), so an edge-less graph would otherwise yield a single-level tree whose
- * {@link cut} degenerates to O(N) per frame with no aggregation; the quadtree restores hierarchical
- * culling (O(visible)) and zoom-out aggregation.
+ * Spatial topologies built ({@link buildMortonTopology}) and style passes run ({@link computeLODStyle})
+ * in this realm since module load — live ESM bindings read by the per-frame guards (#328, #343) to assert
+ * that a position transition frame or a drag frame rebuilds no tree and runs no style pass. Test
+ * instrumentation only, like `groupRendererConstructions`; never read on a render path.
+ */
+export let mortonTopologyBuilds = 0;
+export let lodStylePasses = 0;
+/** Bits per axis of a Morton code; a cell is at most this many levels below the root box. */
+const MORTON_BITS = 16;
+/** Quantisation steps per axis (`2^16`). */
+const MORTON_STEPS = 1 << MORTON_BITS;
+
+/**
+ * The root box for a spatial tree over `positions` (#343): a power-of-two square, its corner on a
+ * multiple of a quarter of its side, holding every finite position. With `prev` — the box the previous
+ * build used — it returns `prev` itself while every position still lies inside it and the layout still
+ * fills more than an eighth of its side, so a streamed layout rebuilds over the **same cells** frame to
+ * frame (only their membership changes) and an aggregate can be found again by its cell. O(count).
+ * A non-finite coordinate (NaN, or ±Infinity from a diverged layout) is left out of the box and clamped
+ * into an edge cell by the build, so one diverged node cannot collapse every other into a single cell.
+ */
+export function mortonRootBox(positions: ArrayLike<number>, count: number, prev?: MortonBox): MortonBox {
+  let minX = Infinity;
+  let minY = Infinity;
+  let maxX = -Infinity;
+  let maxY = -Infinity;
+  for (let i = 0; i < count; i++) {
+    const x = positions[i * 2]!;
+    const y = positions[i * 2 + 1]!;
+    // `v > -Infinity && v < Infinity` is false for NaN and both infinities.
+    if (x > -Infinity && x < Infinity) {
+      if (x < minX) minX = x;
+      if (x > maxX) maxX = x;
+    }
+    if (y > -Infinity && y < Infinity) {
+      if (y < minY) minY = y;
+      if (y > maxY) maxY = y;
+    }
+  }
+  if (!(maxX >= minX) || !(maxY >= minY)) return prev ?? { x0: 0, y0: 0, side: 1 }; // no finite position
+  const span = Math.max(maxX - minX, maxY - minY);
+  if (prev && minX >= prev.x0 && minY >= prev.y0 && maxX < prev.x0 + prev.side && maxY < prev.y0 + prev.side && span * 8 > prev.side) return prev;
+  // side ≥ 4/3 · span with the corner on a quarter-side grid: the corner sits < side/4 below the minimum,
+  // so the maximum stays < side above it. A zero span (one point, or all coincident) gets side 1.
+  const side = span > 0 ? 2 ** Math.ceil(Math.log2((span * 4) / 3)) : 1;
+  const unit = side / 4;
+  const box = { x0: Math.floor(minX / unit) * unit, y0: Math.floor(minY / unit) * unit, side };
+  // log2 rounding can leave the box a hair short: double until it holds the maximum (at most once).
+  while (maxX >= box.x0 + box.side || maxY >= box.y0 + box.side) {
+    box.side *= 2;
+    box.x0 = Math.floor(minX / (box.side / 4)) * (box.side / 4);
+    box.y0 = Math.floor(minY / (box.side / 4)) * (box.side / 4);
+  }
+  return box;
+}
+
+/** Spread the low 16 bits of `v` to the even bit positions (the Morton interleave of one axis). */
+function spreadBits(v: number): number {
+  let x = v & 0xffff;
+  x = (x | (x << 8)) & 0x00ff00ff;
+  x = (x | (x << 4)) & 0x0f0f0f0f;
+  x = (x | (x << 2)) & 0x33333333;
+  x = (x | (x << 1)) & 0x55555555;
+  return x;
+}
+
+/** The inverse of {@link spreadBits}: gather the even bits of `v` into 16 bits. */
+function gatherBits(v: number): number {
+  let x = v & 0x55555555;
+  x = (x | (x >>> 1)) & 0x33333333;
+  x = (x | (x >>> 2)) & 0x0f0f0f0f;
+  x = (x | (x >>> 4)) & 0x00ff00ff;
+  x = (x | (x >>> 8)) & 0x0000ffff;
+  return x;
+}
+
+/** The mask keeping the top `2·level` bits of a 32-bit Morton code (level 0 keeps none). */
+function mortonMask(level: number): number {
+  return level <= 0 ? 0 : (~0 << (32 - 2 * level)) >>> 0;
+}
+
+/** The depth of the longest 2-bit prefix two Morton codes share (16 when they are equal). */
+function commonLevel(a: number, b: number): number {
+  return a === b ? MORTON_BITS : Math.clz32((a ^ b) >>> 0) >>> 1;
+}
+
+/**
+ * Reusable working storage for {@link buildMortonLODTree} (#343): the codes, the radix sort's key and
+ * index buffers and histogram, and the cell records of the compressed quadtree. Grown on demand to the
+ * largest build and reused, so a layout that rebuilds its tree every streamed frame allocates nothing
+ * here once warm — about 16 B per leaf plus 13 B per cell, and a 256 KB histogram.
+ */
+export interface MortonScratch {
+  keyA: Uint32Array;
+  keyB: Uint32Array;
+  idxA: Uint32Array;
+  idxB: Uint32Array;
+  hist: Uint32Array;
+  cellLo: Uint32Array;
+  cellHi: Uint32Array;
+  cellParent: Int32Array;
+  cellBottom: Uint8Array;
+  cellHeight: Uint8Array;
+  cellId: Uint32Array;
+  stackLo: Uint32Array;
+  stackHi: Uint32Array;
+  stackParent: Int32Array;
+}
+
+/** Deepest the cell walk's stack gets: ≤ 3 pending siblings per split level plus the 4 of the last split. */
+const MORTON_STACK = 4 * MORTON_BITS + 8;
+
+/** A fresh, empty {@link MortonScratch}. */
+export function makeMortonScratch(): MortonScratch {
+  return {
+    keyA: new Uint32Array(0),
+    keyB: new Uint32Array(0),
+    idxA: new Uint32Array(0),
+    idxB: new Uint32Array(0),
+    hist: new Uint32Array(MORTON_STEPS + 1),
+    cellLo: new Uint32Array(0),
+    cellHi: new Uint32Array(0),
+    cellParent: new Int32Array(0),
+    cellBottom: new Uint8Array(0),
+    cellHeight: new Uint8Array(0),
+    cellId: new Uint32Array(0),
+    stackLo: new Uint32Array(MORTON_STACK),
+    stackHi: new Uint32Array(MORTON_STACK),
+    stackParent: new Int32Array(MORTON_STACK),
+  };
+}
+
+/**
+ * The arrays of a spatial (Morton) topology (#343), sized by {@link MortonTopologySizes}. {@link
+ * buildMortonTopology} writes into them; a caller that owns the memory (the layout worker, which packs one
+ * streamed frame into one transferable buffer) supplies them through {@link MortonAllocate}.
+ */
+export interface MortonTopologyArrays {
+  levelOffset: Uint32Array;
+  childOffset: Uint32Array;
+  children: Uint32Array;
+  parent: Int32Array;
+  leafOrder: Uint32Array;
+  leafStart: Uint32Array;
+  leafEnd: Uint32Array;
+  mortonLevel: Uint8Array;
+  mortonCode: Uint32Array;
+}
+
+/** The sizes a spatial topology's arrays need (see {@link MortonTopologyArrays}). */
+export interface MortonTopologySizes {
+  size: number;
+  leafCount: number;
+  levelCount: number;
+}
+
+/** Hands {@link buildMortonTopology} the arrays to write a topology of the given sizes into. */
+export type MortonAllocate = (sizes: MortonTopologySizes) => MortonTopologyArrays;
+
+/** Allocate a spatial topology's arrays as separate typed arrays. */
+export function allocateMortonTopology({ size, leafCount, levelCount }: MortonTopologySizes): MortonTopologyArrays {
+  const cells = size - leafCount;
+  return {
+    levelOffset: new Uint32Array(levelCount + 1),
+    childOffset: new Uint32Array(size + 1),
+    children: new Uint32Array(Math.max(0, size - 1)),
+    parent: new Int32Array(size),
+    leafOrder: new Uint32Array(leafCount),
+    leafStart: new Uint32Array(size),
+    leafEnd: new Uint32Array(size),
+    mortonLevel: new Uint8Array(cells),
+    mortonCode: new Uint32Array(cells),
+  };
+}
+
+/**
+ * A shared, all-zero `Uint32Array` of at least `length` entries, viewed to exactly `length`: the empty
+ * same-level adjacency (`edgeOffset`) a spatial tree has — no CSR entries anywhere. Shared by every
+ * spatial tree so a tree rebuilt per streamed frame does not allocate one; nothing writes to it.
+ */
+let zeroOffsets = new Uint32Array(0);
+function sharedZeroOffsets(length: number): Uint32Array {
+  if (zeroOffsets.length < length) zeroOffsets = new Uint32Array(Math.max(length, zeroOffsets.length * 2));
+  return zeroOffsets.subarray(0, length);
+}
+const NO_NEIGHBORS = new Uint32Array(0);
+
+/** Options for {@link buildMortonTopology}: the {@link SpatialLODOptions} plus the root box to build in. */
+export interface MortonLODOptions extends SpatialLODOptions {
+  /** The root box (default {@link mortonRootBox} over the positions). Pass the previous build's box
+   *  through {@link mortonRootBox} to keep the cells stable while a layout streams. */
+  box?: MortonBox;
+}
+
+/** LSD radix sort of `count` 32-bit keys in two 16-bit passes; the sorted keys and their source indices
+ *  end back in `sc.keyA` / `sc.idxA` (an even number of passes). O(count), no comparisons. */
+function radixSortMorton(sc: MortonScratch, count: number): void {
+  const hist = sc.hist;
+  let kSrc = sc.keyA;
+  let iSrc = sc.idxA;
+  let kDst = sc.keyB;
+  let iDst = sc.idxB;
+  for (let shift = 0; shift < 32; shift += MORTON_BITS) {
+    hist.fill(0);
+    for (let i = 0; i < count; i++) { const d = (((kSrc[i] ?? 0) >>> shift) & 0xffff) + 1; hist[d] = (hist[d] ?? 0) + 1; }
+    for (let d = 0; d < MORTON_STEPS; d++) hist[d + 1] = (hist[d + 1] ?? 0) + (hist[d] ?? 0);
+    for (let i = 0; i < count; i++) {
+      const k = kSrc[i] ?? 0;
+      const d = (k >>> shift) & 0xffff;
+      const at = hist[d] ?? 0;
+      hist[d] = at + 1;
+      kDst[at] = k;
+      iDst[at] = iSrc[i] ?? 0;
+    }
+    const tk = kSrc; kSrc = kDst; kDst = tk;
+    const ti = iSrc; iSrc = iDst; iDst = ti;
+  }
+}
+
+/** First index in `keys[lo, hi)` (sorted ascending) whose key is ≥ `key`. */
+function lowerBound(keys: Uint32Array, lo: number, hi: number, key: number): number {
+  while (lo < hi) {
+    const mid = (lo + hi) >>> 1;
+    if ((keys[mid] ?? 0) < key) lo = mid + 1;
+    else hi = mid;
+  }
+  return lo;
+}
+
+/** Grow the scratch's per-cell arrays to `cap` cells, keeping the walk's records so far. */
+function growCells(sc: MortonScratch, cap: number): void {
+  const lo = new Uint32Array(cap); lo.set(sc.cellLo); sc.cellLo = lo;
+  const hi = new Uint32Array(cap); hi.set(sc.cellHi); sc.cellHi = hi;
+  const par = new Int32Array(cap); par.set(sc.cellParent); sc.cellParent = par;
+  const bot = new Uint8Array(cap); bot.set(sc.cellBottom); sc.cellBottom = bot;
+  sc.cellHeight = new Uint8Array(cap); // filled after the walk
+  sc.cellId = new Uint32Array(cap); // filled after the walk
+}
+
+/**
+ * Build a **spatial LOD tree**'s topology over `positions` (#343): a compressed, bucketed quadtree cut from
+ * one sort of the leaves' Morton codes. Each position is quantised to 16 bits per axis inside the root box
+ * ({@link MortonLODOptions.box}), the codes are radix-sorted (two 16-bit passes), and the tree is read off
+ * the sorted run: a run of at most `bucket` leaves — or of coincident ones — is a bottom cell whose
+ * children are its leaves; a longer run splits at the first 2-bit group its first and last codes differ
+ * in, so single-child chains never appear. Every node therefore covers one contiguous run of the sorted
+ * leaves ({@link LODTopology.leafOrder} / `leafStart` / `leafEnd`), and each aggregate records its cell
+ * ({@link LODTopology.morton}). Cells are bucketed into levels by height, as for any LOD tree, so the cut,
+ * the geometry passes and declutter apply unchanged; there is no super-edge CSR (the gather walks the leaf
+ * runs instead).
  *
- * Leaves are the points (global ids `[0, count)`); each quadtree cell is an aggregate whose children
- * are its points (a bottom cell) or its sub-cells. Cells are bucketed into {@link LODTopology} levels
- * by **height** (1 + the deepest child's height), so the existing {@link cut} /
- * {@link computeLODGeometry} / {@link declutterFrontier} all work unchanged. There are no super-edges
- * (the `edge*` arrays are empty). Geometry is left zeroed — fill it with {@link computeLODGeometry}.
+ * Unlike the coarsening tree, an aggregate is always a compact region of the layout, so the cut frontier
+ * stays bounded by the screen area over the expand threshold rather than by how the layout spreads a
+ * graph's communities. O(count) for the codes and the sort plus O(cells · log bucket) for the splits;
+ * with `scratch` ({@link makeMortonScratch}) a rebuild allocates only the topology — and with `allocate`
+ * (the caller's own buffers) nothing at all. Geometry is left for {@link computeLODPositions}.
+ */
+export function buildMortonTopology(
+  positions: ArrayLike<number>,
+  count: number,
+  opts: MortonLODOptions = {},
+  scratch: MortonScratch = makeMortonScratch(),
+  allocate: MortonAllocate = allocateMortonTopology,
+): LODTopology & MortonTopologyArrays & { morton: MortonCells } {
+  mortonTopologyBuilds++;
+  const bucket = Math.max(1, opts.bucket ?? SPATIAL_BUCKET);
+  const maxDepth = Math.max(0, Math.min(MORTON_BITS, opts.maxDepth ?? MORTON_BITS));
+  const box = opts.box ?? mortonRootBox(positions, count);
+  const sc = scratch;
+  // ≤ 1 leaf: nothing to aggregate — a single-level tree of just the leaves (no cells).
+  if (count <= 1) {
+    const a = allocate({ size: count, leafCount: count, levelCount: 1 });
+    a.levelOffset[0] = 0;
+    a.levelOffset[1] = count;
+    a.childOffset.fill(0);
+    if (count === 1) { a.parent[0] = -1; a.leafOrder[0] = 0; a.leafStart[0] = 0; a.leafEnd[0] = 1; }
+    return { ...a, size: count, leafCount: count, levelCount: 1, edgeOffset: sharedZeroOffsets(count + 1), edgeNeighbors: NO_NEIGHBORS, morton: { box, level: a.mortonLevel, code: a.mortonCode } };
+  }
+
+  // 1. Codes: quantise into the box (NaN → cell 0), interleave x (even bits) and y (odd bits).
+  if (sc.keyA.length < count) {
+    sc.keyA = new Uint32Array(count);
+    sc.keyB = new Uint32Array(count);
+    sc.idxA = new Uint32Array(count);
+    sc.idxB = new Uint32Array(count);
+  }
+  const scale = MORTON_STEPS / box.side;
+  const keys = sc.keyA;
+  const idx = sc.idxA;
+  for (let i = 0; i < count; i++) {
+    const fx = ((positions[i * 2] ?? 0) - box.x0) * scale;
+    const fy = ((positions[i * 2 + 1] ?? 0) - box.y0) * scale;
+    const qx = fx >= 0 ? (fx < MORTON_STEPS ? fx | 0 : MORTON_STEPS - 1) : 0;
+    const qy = fy >= 0 ? (fy < MORTON_STEPS ? fy | 0 : MORTON_STEPS - 1) : 0;
+    keys[i] = (spreadBits(qx) | (spreadBits(qy) << 1)) >>> 0;
+    idx[i] = i;
+  }
+  // 2. Sort the leaves by code.
+  radixSortMorton(sc, count);
+  const sorted = sc.keyA;
+  const order = sc.idxA;
+
+  // 3. Cells, pre-order over the sorted run (an explicit stack; siblings pushed last-first so they are
+  //    created — and later listed — in Morton order). A cell is a bottom cell when its run holds at most
+  //    `bucket` leaves, all its codes are equal, or it is `maxDepth` deep; else it splits at the first
+  //    2-bit group its first and last codes differ in, into the (≥ 2) non-empty quadrants.
+  if (sc.cellLo.length === 0) growCells(sc, Math.max(64, ((count / bucket) * 2) | 0));
+  const { stackLo, stackHi, stackParent } = sc;
+  let cells = 0;
+  let sp = 1;
+  stackLo[0] = 0;
+  stackHi[0] = count;
+  stackParent[0] = -1;
+  while (sp > 0) {
+    sp--;
+    const lo = stackLo[sp] ?? 0;
+    const hi = stackHi[sp] ?? 0;
+    if (cells === sc.cellLo.length) growCells(sc, cells * 2);
+    const c = cells++;
+    sc.cellLo[c] = lo;
+    sc.cellHi[c] = hi;
+    sc.cellParent[c] = stackParent[sp] ?? -1;
+    const first = sorted[lo] ?? 0;
+    const level = commonLevel(first, sorted[hi - 1] ?? 0);
+    if (hi - lo <= bucket || level >= maxDepth) {
+      sc.cellBottom[c] = 1;
+      continue;
+    }
+    sc.cellBottom[c] = 0;
+    const shift = 30 - 2 * level;
+    const prefix = (first & mortonMask(level)) >>> 0;
+    let end = hi;
+    for (let q = 3; q >= 1; q--) {
+      const start = lowerBound(sorted, lo, end, (prefix | (q << shift)) >>> 0);
+      if (end > start) { stackLo[sp] = start; stackHi[sp] = end; stackParent[sp] = c; sp++; }
+      end = start;
+    }
+    if (end > lo) { stackLo[sp] = lo; stackHi[sp] = end; stackParent[sp] = c; sp++; }
+  }
+
+  // 4. Heights (pre-order: a cell's children follow it, so one reverse pass).
+  const { cellLo, cellHi, cellParent, cellBottom, cellHeight, cellId } = sc;
+  cellHeight.fill(0, 0, cells);
+  for (let c = cells - 1; c >= 0; c--) {
+    if (cellBottom[c] === 1) cellHeight[c] = 1;
+    const p = cellParent[c] ?? -1;
+    if (p >= 0 && (cellHeight[p] ?? 0) < (cellHeight[c] ?? 0) + 1) cellHeight[p] = (cellHeight[c] ?? 0) + 1;
+  }
+  const maxHeight = cellHeight[0] ?? 0; // the root is the tallest
+  const levelCount = maxHeight + 1;
+  const size = count + cells;
+  const a = allocate({ size, leafCount: count, levelCount });
+  const { levelOffset, childOffset, children, parent, leafOrder, leafStart, leafEnd, mortonLevel, mortonCode } = a;
+
+  // 5. Level offsets (leaves, then cells by height) and each cell's global id, handed out per height in
+  //    creation order.
+  levelOffset.fill(0);
+  for (let c = 0; c < cells; c++) { const h = (cellHeight[c] ?? 0) + 1; levelOffset[h] = (levelOffset[h] ?? 0) + 1; }
+  levelOffset[1] = count;
+  for (let h = 1; h <= maxHeight; h++) levelOffset[h + 1] = (levelOffset[h + 1] ?? 0) + (levelOffset[h] ?? 0);
+  const next = levelOffset.slice(0, levelCount); // per-height id cursor (tiny: one entry per level)
+  for (let c = 0; c < cells; c++) {
+    const h = cellHeight[c] ?? 0;
+    cellId[c] = next[h] ?? 0;
+    next[h] = (next[h] ?? 0) + 1;
+  }
+
+  // 6. Children CSR: a bottom cell parents its run's leaves, an internal cell its child cells.
+  childOffset.fill(0);
+  for (let c = 0; c < cells; c++) {
+    if (cellBottom[c] === 1) childOffset[(cellId[c] ?? 0) + 1] = (cellHi[c] ?? 0) - (cellLo[c] ?? 0);
+    const p = cellParent[c] ?? -1;
+    if (p >= 0) { const o = (cellId[p] ?? 0) + 1; childOffset[o] = (childOffset[o] ?? 0) + 1; }
+  }
+  for (let g = 0; g < size; g++) childOffset[g + 1] = childOffset[g + 1]! + childOffset[g]!;
+  // Scatter in creation order (an internal cell lists its children in Morton order; a bottom cell its
+  // leaves in rank order), with the parents, leaf runs and cells alongside. `leafEnd` doubles as the
+  // children cursor until the leaf runs are written.
+  const fill = leafEnd;
+  for (let g = count; g < size; g++) fill[g] = childOffset[g] ?? 0;
+  for (let c = 0; c < cells; c++) {
+    const g = cellId[c] ?? 0;
+    const lo = cellLo[c] ?? 0;
+    const hi = cellHi[c] ?? 0;
+    const p = cellParent[c] ?? -1;
+    if (p >= 0) {
+      const pg = cellId[p] ?? 0;
+      parent[g] = pg;
+      children[fill[pg] ?? 0] = g;
+      fill[pg] = (fill[pg] ?? 0) + 1;
+    } else {
+      parent[g] = -1;
+    }
+    if (cellBottom[c] === 1) {
+      for (let r = lo; r < hi; r++) {
+        const leaf = order[r] ?? 0;
+        children[fill[g] ?? 0] = leaf;
+        fill[g] = (fill[g] ?? 0) + 1;
+        parent[leaf] = g;
+      }
+    }
+    const first = sorted[lo] ?? 0;
+    const level = commonLevel(first, sorted[hi - 1] ?? 0);
+    mortonLevel[g - count] = level;
+    mortonCode[g - count] = (first & mortonMask(level)) >>> 0;
+  }
+  for (let c = 0; c < cells; c++) {
+    const g = cellId[c] ?? 0;
+    leafStart[g] = cellLo[c] ?? 0;
+    leafEnd[g] = cellHi[c] ?? 0;
+  }
+  for (let r = 0; r < count; r++) {
+    const leaf = order[r] ?? 0;
+    leafOrder[r] = leaf;
+    leafStart[leaf] = r;
+    leafEnd[leaf] = r + 1;
+  }
+  return { ...a, size, leafCount: count, levelCount, edgeOffset: sharedZeroOffsets(size + 1), edgeNeighbors: NO_NEIGHBORS, morton: { box, level: mortonLevel, code: mortonCode } };
+}
+
+/**
+ * A spatial LOD tree over `positions`, ready for geometry (#343) — {@link buildMortonTopology} with the
+ * tree's geometry arrays attached (zeroed; fill them with {@link computeLODGeometry}). The spatial source
+ * (`lod({ source: "spatial" })`) on the main thread, and the tree of an edge-less graph. Pass a `scratch`
+ * ({@link makeMortonScratch}) to reuse the sort buffers across rebuilds.
+ */
+export function buildMortonLODTree(positions: ArrayLike<number>, count: number, opts: MortonLODOptions = {}, scratch?: MortonScratch): LODTree {
+  return attachGeometry(buildMortonTopology(positions, count, opts, scratch));
+}
+
+/**
+ * Build a {@link LODTree} from a point cloud's positions alone — the spatial tree used as the LOD
+ * hierarchy when there are no edges to coarsen (#103). The structural coarsening tree needs edges
+ * (heavy-edge matching), so an edge-less graph would otherwise yield a single-level tree whose
+ * {@link cut} degenerates to O(N) per frame with no aggregation; the spatial tree restores hierarchical
+ * culling (O(visible)) and zoom-out aggregation. Since #343 this is the bucketed Morton tree of
+ * {@link buildMortonLODTree} (up to 8 points per bottom cell by default) rather than a pointer quadtree
+ * with one point per cell: one sort instead of a pointer chase per point, and a smaller, shallower tree.
  *
  * Generic over any positions buffer (not network-specific), so the same point-cloud LOD can back
  * other engines later (`plot.points()` / map scatter, #108).
  */
 export function buildSpatialLODTree(positions: ArrayLike<number>, count: number, opts: SpatialLODOptions = {}): LODTree {
-  const maxDepth = opts.maxDepth ?? SPATIAL_MAX_DEPTH;
-  // ≤ 1 point: nothing to aggregate — a single-level tree of just the points.
-  if (count <= 1) {
-    return attachGeometry({
-      size: count,
-      leafCount: count,
-      levelCount: 1,
-      levelOffset: Uint32Array.from([0, count]),
-      childOffset: new Uint32Array(count + 1),
-      children: new Uint32Array(0),
-      edgeOffset: new Uint32Array(count + 1),
-      edgeNeighbors: new Uint32Array(0),
-    });
+  return buildMortonLODTree(positions, count, opts);
+}
+
+/**
+ * The node of a spatial tree that holds the cell `(level, code)` of `box` (#343) — the square a node of an
+ * earlier build of the tree named ({@link MortonCells}). Descends from the root through the child whose
+ * cell contains the square, O(depth · 4): a node whose cell lies inside the square (level ≥ `level`, the
+ * compressed node for exactly the leaves in it) is the answer; a bottom cell that still contains it is the
+ * closest cover; `-1` when no leaf of this tree lies in the square. A `box` other than the tree's is
+ * mapped onto the tree's box first (the grid is shared for cells ≥ 2 levels down); `-1` if it does not fit.
+ */
+export function findMortonCell(tree: LODTopology, box: MortonBox, level: number, code: number): number {
+  const cells = tree.morton;
+  if (!cells || tree.size === tree.leafCount) return -1;
+  const tb = cells.box;
+  let lv = level;
+  let cd = code >>> 0;
+  if (tb.side !== box.side || tb.x0 !== box.x0 || tb.y0 !== box.y0) {
+    // The square in world units, re-expressed as a cell of the tree's box.
+    const side = box.side / 2 ** level;
+    const shift = 32 - 2 * level;
+    const ix = level === 0 ? 0 : gatherBits(cd >>> shift);
+    const iy = level === 0 ? 0 : gatherBits((cd >>> shift) >>> 1);
+    const x = box.x0 + ix * side;
+    const y = box.y0 + iy * side;
+    const ratio = tb.side / side;
+    const nl = Math.round(Math.log2(ratio));
+    if (!(nl >= 0 && nl <= MORTON_BITS) || 2 ** nl !== ratio) return -1;
+    const jx = (x - tb.x0) / side;
+    const jy = (y - tb.y0) / side;
+    const n = 2 ** nl;
+    if (!(jx >= 0 && jy >= 0 && jx < n && jy < n)) return -1;
+    lv = nl;
+    cd = nl === 0 ? 0 : ((spreadBits(Math.floor(jx)) | (spreadBits(Math.floor(jy)) << 1)) << (32 - 2 * nl)) >>> 0;
   }
-
-  // Root bounding square over all points.
-  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
-  for (let i = 0; i < count; i++) {
-    const x = positions[i * 2]!;
-    const y = positions[i * 2 + 1]!;
-    if (x < minX) minX = x;
-    if (x > maxX) maxX = x;
-    if (y < minY) minY = y;
-    if (y > maxY) maxY = y;
-  }
-  let rootHalf = Math.max(maxX - minX, maxY - minY) / 2;
-  if (!(rootHalf > 0)) rootHalf = 1; // all coincident
-  rootHalf *= 1.0001; // pad so max-corner points fall strictly inside
-
-  // Flat cell store (one body per leaf, like the Barnes-Hut tree; coincident points bucket via a
-  // per-point linked list). Grown geometrically; `let` so the grow closure can reassign the bindings.
-  let cap = Math.max(64, count);
-  let cx: Float64Array = new Float64Array(cap);
-  let cy: Float64Array = new Float64Array(cap);
-  let half: Float64Array = new Float64Array(cap);
-  let child: Int32Array = new Int32Array(cap * 4);
-  let head: Int32Array = new Int32Array(cap); // leaf body-list head, -1 = empty
-  let internal: Uint8Array = new Uint8Array(cap);
-  const next = new Int32Array(count).fill(-1); // per-point next pointer (coincident buckets)
-  let cellCount = 0;
-
-  const grow = (): void => {
-    cap *= 2;
-    const g64 = (a: Float64Array): Float64Array => {
-      const b = new Float64Array(cap);
-      b.set(a);
-      return b;
-    };
-    cx = g64(cx);
-    cy = g64(cy);
-    half = g64(half);
-    const c4 = new Int32Array(cap * 4);
-    c4.set(child);
-    child = c4;
-    const h = new Int32Array(cap);
-    h.set(head);
-    head = h;
-    const ig = new Uint8Array(cap);
-    ig.set(internal);
-    internal = ig;
-  };
-  const newCell = (ccx: number, ccy: number, chalf: number): number => {
-    if (cellCount >= cap) grow();
-    const c = cellCount++;
-    cx[c] = ccx;
-    cy[c] = ccy;
-    half[c] = chalf;
-    child[c * 4] = child[c * 4 + 1] = child[c * 4 + 2] = child[c * 4 + 3] = -1;
-    head[c] = -1;
-    internal[c] = 0;
-    return c;
-  };
-  const quadrant = (c: number, x: number, y: number): number => (x >= cx[c]! ? 1 : 0) | (y >= cy[c]! ? 2 : 0);
-  const makeChild = (parent: number, q: number): number => {
-    const h2 = half[parent]! / 2;
-    const c = newCell(cx[parent]! + ((q & 1) === 0 ? -h2 : h2), cy[parent]! + ((q & 2) === 0 ? -h2 : h2), h2);
-    child[parent * 4 + q] = c;
-    internal[parent] = 1;
-    return c;
-  };
-
-  newCell((minX + maxX) / 2, (minY + maxY) / 2, rootHalf);
-  for (let i = 0; i < count; i++) {
-    const x = positions[i * 2]!;
-    const y = positions[i * 2 + 1]!;
-    let cell = 0;
-    let depth = 0;
-    for (;;) {
-      if (internal[cell]) {
-        const q = quadrant(cell, x, y);
-        const c = child[cell * 4 + q]!;
-        if (c === -1) {
-          const nc = makeChild(cell, q);
-          head[nc] = i;
-          break;
-        }
-        cell = c;
-        if (++depth >= maxDepth) {
-          next[i] = head[cell]!;
-          head[cell] = i;
-          break;
-        }
-        continue;
-      }
-      if (head[cell] === -1 || depth >= maxDepth) {
-        next[i] = head[cell]!;
-        head[cell] = i;
-        break;
-      }
-      // Occupied leaf: push its body into a child, mark internal, re-loop to place point i.
-      const j = head[cell]!;
-      head[cell] = -1;
-      const cj = makeChild(cell, quadrant(cell, positions[j * 2]!, positions[j * 2 + 1]!));
-      head[cj] = j;
-      next[j] = -1;
+  const { leafCount, childOffset, children, levelOffset, levelCount } = tree;
+  const root = levelOffset[levelCount - 1] ?? 0;
+  let g = root;
+  for (;;) {
+    const o = g - leafCount;
+    const gl = cells.level[o] ?? 0;
+    if (gl >= lv) {
+      // g's cell is at or below the square's depth: it lies inside the square iff it matches there.
+      return (((cells.code[o] ?? 0) & mortonMask(lv)) >>> 0) === ((cd & mortonMask(lv)) >>> 0) ? g : -1;
     }
-  }
-
-  // Height of each cell (1 + deepest child; leaf cells are 1, parenting height-0 points). Children
-  // always have a higher cell index than their parent, so a single reverse pass suffices.
-  const cheight = new Uint32Array(cellCount);
-  for (let c = cellCount - 1; c >= 0; c--) {
-    if (internal[c]) {
-      let h = 0;
-      for (let q = 0; q < 4; q++) {
-        const ch = child[c * 4 + q]!;
-        if (ch !== -1 && cheight[ch]! > h) h = cheight[ch]!;
-      }
-      cheight[c] = h + 1;
-    } else {
-      cheight[c] = 1;
+    // g's cell strictly contains the square iff their prefixes agree to g's depth.
+    if ((((cells.code[o] ?? 0) ^ cd) & mortonMask(gl)) >>> 0 !== 0) return -1;
+    let next = -1;
+    let leafChildren = false;
+    for (let p = childOffset[g] ?? 0; p < (childOffset[g + 1] ?? 0); p++) {
+      const c = children[p] ?? 0;
+      if (c < leafCount) { leafChildren = true; break; }
+      const co = c - leafCount;
+      const m = mortonMask(Math.min(cells.level[co] ?? 0, lv));
+      if ((((cells.code[co] ?? 0) ^ cd) & m) >>> 0 === 0) { next = c; break; }
     }
+    if (leafChildren) return g; // a bottom cell covering the square: its closest cover
+    if (next < 0) return -1; // the square's quadrant holds no leaf of this tree
+    g = next;
   }
-  const maxHeight = cheight[0]!; // the root is the ancestor of all cells → the tallest
-
-  // Assign global ids: points keep [0, count); cells follow, ordered by height (counting sort) so
-  // each LOD level is a contiguous id range and every child's id < its parent's.
-  const size = count + cellCount;
-  const perHeight = new Uint32Array(maxHeight + 1); // perHeight[h] = number of cells of height h
-  for (let c = 0; c < cellCount; c++) perHeight[cheight[c]!] = perHeight[cheight[c]!]! + 1;
-  const heightStart = new Uint32Array(maxHeight + 1); // first LOD id for height-h cells
-  let acc = count;
-  for (let h = 1; h <= maxHeight; h++) {
-    heightStart[h] = acc;
-    acc += perHeight[h]!;
-  }
-  const lodId = new Uint32Array(cellCount);
-  const hcursor = heightStart.slice();
-  for (let c = 0; c < cellCount; c++) {
-    const h = cheight[c]!;
-    lodId[c] = hcursor[h]!;
-    hcursor[h] = hcursor[h]! + 1;
-  }
-
-  const levelCount = maxHeight + 1;
-  const levelOffset = new Uint32Array(levelCount + 1);
-  levelOffset[1] = count;
-  for (let h = 1; h <= maxHeight; h++) levelOffset[h + 1] = levelOffset[h]! + perHeight[h]!;
-
-  // Children CSR: count → prefix-sum → scatter (points have none; cells point to sub-cells or bodies).
-  const childOffset = new Uint32Array(size + 1);
-  for (let c = 0; c < cellCount; c++) {
-    let n = 0;
-    if (internal[c]) {
-      for (let q = 0; q < 4; q++) if (child[c * 4 + q]! !== -1) n++;
-    } else {
-      for (let b = head[c]!; b !== -1; b = next[b]!) n++;
-    }
-    childOffset[lodId[c]! + 1] = n;
-  }
-  for (let g = 0; g < size; g++) childOffset[g + 1] = childOffset[g + 1]! + childOffset[g]!;
-  const children = new Uint32Array(childOffset[size]!);
-  const ccur = childOffset.slice(0, size);
-  for (let c = 0; c < cellCount; c++) {
-    const g = lodId[c]!;
-    if (internal[c]) {
-      for (let q = 0; q < 4; q++) {
-        const ch = child[c * 4 + q]!;
-        if (ch !== -1) {
-          children[ccur[g]!] = lodId[ch]!;
-          ccur[g] = ccur[g]! + 1;
-        }
-      }
-    } else {
-      for (let b = head[c]!; b !== -1; b = next[b]!) {
-        children[ccur[g]!] = b; // a point id (already its own LOD id)
-        ccur[g] = ccur[g]! + 1;
-      }
-    }
-  }
-
-  return attachGeometry({
-    size,
-    leafCount: count,
-    levelCount,
-    levelOffset,
-    childOffset,
-    children,
-    edgeOffset: new Uint32Array(size + 1),
-    edgeNeighbors: new Uint32Array(0),
-  });
 }
 
 /**
@@ -857,23 +1195,27 @@ export function buildSpatialLODTree(positions: ArrayLike<number>, count: number,
  * the converging geometry with no copy. Style-derived geometry (`radius`/`weight`) is main-allocated
  * and filled once with {@link computeLODStyle}; the topological `count` is filled here (it's
  * position-independent — the worker streams cx/cy/extent but not count, #105).
+ *
+ * A spatial tree streamed per frame (#343) arrives with everything computed: pass its `count`, style arrays
+ * and leaf branching as `computed`, and the assembly is O(1) — views only, no pass over the tree.
  */
 export function lodTreeFromTopology(
   topo: LODTopology,
   geometry?: { cx: Float32Array; cy: Float32Array; extent: Float32Array },
+  computed?: { count: Uint32Array; radius: Float32Array; weight: Float32Array; border: Float32Array; color: Uint8Array; leafBranching?: number },
 ): LODTree {
   const { size } = topo;
   return {
     ...topo,
-    leafBranching: leafBranchingOf(topo),
+    leafBranching: computed?.leafBranching ?? leafBranchingOf(topo),
     cx: geometry?.cx ?? new Float32Array(size),
     cy: geometry?.cy ?? new Float32Array(size),
     extent: geometry?.extent ?? new Float32Array(size),
-    radius: new Float32Array(size),
-    count: leafDescendantCounts(topo),
-    weight: new Float32Array(size),
-    border: new Float32Array(size),
-    color: new Uint8Array(size * 4),
+    radius: computed?.radius ?? new Float32Array(size),
+    count: computed?.count ?? leafDescendantCounts(topo),
+    weight: computed?.weight ?? new Float32Array(size),
+    border: computed?.border ?? new Float32Array(size),
+    color: computed?.color ?? new Uint8Array(size * 4),
   };
 }
 
@@ -888,10 +1230,41 @@ export type LODPositionTree = Pick<
 >;
 
 /**
+ * Scratch for {@link computeLODPositions}'s exact bounding boxes (#343): 4 floats per aggregate, grown
+ * on demand. Keep one per tree consumer (the engine, the layout worker) so its memory goes with that
+ * consumer; a call without one reuses the module's shared scratch (`sharedBounds`), so the pass
+ * allocates nothing per frame either way once warm.
+ */
+export interface LODBoundsScratch {
+  bounds: Float32Array;
+}
+
+/** A fresh {@link LODBoundsScratch}. */
+export function makeLODBoundsScratch(): LODBoundsScratch {
+  return { bounds: new Float32Array(0) };
+}
+
+/**
+ * The box scratch a {@link computeLODPositions} call without its own reuses — the public
+ * {@link computeLODGeometry} with no `bounds`, a transition or drag frame driven directly. Grown to the
+ * largest tree passed without a scratch, then reused: a fresh one per call would allocate 16 B per
+ * aggregate on every frame. The pass is synchronous and every aggregate's box is written before it is
+ * read, so one per thread serves every caller.
+ */
+const sharedBounds = makeLODBoundsScratch();
+
+/**
  * Fill the tree's **position-derived** geometry from a layout snapshot: each leaf's centroid is its
  * own position (extent 0, count 1); each aggregate gets the count-weighted centroid of its children
  * (= the mean of its descendant leaf positions), the summed leaf `count`, and a bounding `extent`
  * enclosing all descendant leaves. One bottom-up pass — O(tree size) ≈ O(n).
+ *
+ * The extent is the smaller of two upper bounds on the farthest descendant leaf (#343): the compounding
+ * one (the farthest child's centre distance plus that child's extent — exact one level above the leaves)
+ * and the distance to the farthest corner of the aggregate's exact bounding box (built bottom-up in the
+ * same pass). The compounding bound alone inflates with depth (2-10× the true radius at the top of a
+ * coarsening tree); the corner bound does not, so the cut expands and culls on a tight footprint at every
+ * level. The boxes need 16 B per aggregate of scratch (`bounds`).
  *
  * With a nested layout's `discs` (#329), each module is placed on its disc instead: `cx`/`cy` is the
  * disc centre (its leaf centroid + the disc's offset) and `extent` the disc radius — grown only if a
@@ -902,8 +1275,12 @@ export type LODPositionTree = Pick<
  * layout worker runs it each streamed frame and writes `cx`/`cy`/`extent` into the shared buffer the
  * main thread renders from (#103 worker-LOD). Style-derived geometry is {@link computeLODStyle}.
  */
-export function computeLODPositions(tree: LODPositionTree, positions: ArrayLike<number>, discs?: BoundaryDiscs): void {
+export function computeLODPositions(tree: LODPositionTree, positions: ArrayLike<number>, discs?: BoundaryDiscs, scratch?: LODBoundsScratch): void {
   const { leafCount, levelCount, levelOffset, childOffset, children, cx, cy, extent, count } = tree;
+  const sc = scratch ?? sharedBounds;
+  const need = 4 * (tree.size - leafCount);
+  if (sc.bounds.length < need) sc.bounds = new Float32Array(need);
+  const bb = sc.bounds; // aggregate g's box: bb[4o .. 4o + 4) = minX, minY, maxX, maxY with o = g − leafCount
 
   for (let i = 0; i < leafCount; i++) {
     cx[i] = positions[i * 2]!;
@@ -919,15 +1296,31 @@ export function computeLODPositions(tree: LODPositionTree, positions: ArrayLike<
       let sumC = 0;
       let sx = 0;
       let sy = 0;
+      let minX = Infinity;
+      let minY = Infinity;
+      let maxX = -Infinity;
+      let maxY = -Infinity;
       for (let p = c0; p < c1; p++) {
         const c = children[p]!;
         const cc = count[c]!;
         let x = cx[c]!;
         let y = cy[c]!;
-        if (discs && c >= leafCount) {
-          // A child module sits on its disc centre: take its disc offset back off for its leaf centroid.
-          x -= discs.dx[c - leafCount]!;
-          y -= discs.dy[c - leafCount]!;
+        if (c < leafCount) {
+          if (x < minX) minX = x;
+          if (x > maxX) maxX = x;
+          if (y < minY) minY = y;
+          if (y > maxY) maxY = y;
+        } else {
+          const o = 4 * (c - leafCount);
+          if ((bb[o] ?? 0) < minX) minX = bb[o] ?? 0;
+          if ((bb[o + 1] ?? 0) < minY) minY = bb[o + 1] ?? 0;
+          if ((bb[o + 2] ?? 0) > maxX) maxX = bb[o + 2] ?? 0;
+          if ((bb[o + 3] ?? 0) > maxY) maxY = bb[o + 3] ?? 0;
+          if (discs) {
+            // A child module sits on its disc centre: take its disc offset back off for its leaf centroid.
+            x -= discs.dx[c - leafCount] ?? 0;
+            y -= discs.dy[c - leafCount] ?? 0;
+          }
         }
         sumC += cc;
         sx += cc * x;
@@ -935,26 +1328,49 @@ export function computeLODPositions(tree: LODPositionTree, positions: ArrayLike<
       }
       let gx = sumC > 0 ? sx / sumC : 0;
       let gy = sumC > 0 ? sy / sumC : 0;
-      // Bounding radius: the farthest child's centre distance plus that child's own extent — at least
-      // the disc's radius when the module is on its disc.
-      let ext = 0;
+      let disc = 0;
       if (discs) {
         const o = g - leafCount;
         gx += discs.dx[o]!;
         gy += discs.dy[o]!;
-        ext = discs.r[o]!;
+        disc = discs.r[o] ?? 0;
       }
       cx[g] = gx;
       cy[g] = gy;
       count[g] = sumC;
-      for (let p = c0; p < c1; p++) {
+      const o = 4 * (g - leafCount);
+      bb[o] = minX;
+      bb[o + 1] = minY;
+      bb[o + 2] = maxX;
+      bb[o + 3] = maxY;
+      // Corner bound: the farthest corner of the exact box (every descendant leaf lies in it).
+      const ex = Math.max(gx - minX, maxX - gx);
+      const ey = Math.max(gy - minY, maxY - gy);
+      const corner2 = ex * ex + ey * ey;
+      const corner = Math.sqrt(corner2);
+      // Compounding bound: the farthest child's centre distance plus that child's own extent — for leaf
+      // children (extent 0) compared squared, one square root at the end. Once it passes the corner bound
+      // the smaller of the two is the corner: stop.
+      let leafD2 = 0;
+      let comp = 0;
+      for (let p = c0; p < c1 && comp < corner && leafD2 < corner2; p++) {
         const c = children[p]!;
         const dx = gx - cx[c]!;
         const dy = gy - cy[c]!;
-        const d = Math.hypot(dx, dy) + extent[c]!;
-        if (d > ext) ext = d;
+        const e = extent[c] ?? 0;
+        if (e === 0) {
+          const d2 = dx * dx + dy * dy;
+          if (d2 > leafD2) leafD2 = d2;
+        } else {
+          const d = Math.sqrt(dx * dx + dy * dy) + e;
+          if (d > comp) comp = d;
+        }
       }
-      extent[g] = ext;
+      const leafD = Math.sqrt(leafD2);
+      if (leafD > comp) comp = leafD;
+      const leaves = corner < comp ? corner : comp;
+      // On a disc: at least the disc's radius.
+      extent[g] = leaves > disc ? leaves : disc;
     }
   }
 }
@@ -972,6 +1388,114 @@ export interface RadiusAggregate {
   leafValue: ArrayLike<number>;
   /** Maps a (summed) value → radius — the SAME scale used for the leaves. */
   radiusOf: (value: number) => number;
+}
+
+// CIE Lab constants (D50), exactly as d3-color's lab.js — see rgbToHcl / hclToRgb.
+const LAB_XN = 0.96422;
+const LAB_YN = 1;
+const LAB_ZN = 0.82521;
+const LAB_T0 = 4 / 29;
+const LAB_T1 = 6 / 29;
+const LAB_T2 = 3 * LAB_T1 * LAB_T1;
+const LAB_T3 = LAB_T1 * LAB_T1 * LAB_T1;
+const DEGREES = 180 / Math.PI;
+const RADIANS = Math.PI / 180;
+const rgb2lrgb = (v: number): number => ((v /= 255) <= 0.04045 ? v / 12.92 : Math.pow((v + 0.055) / 1.055, 2.4));
+const xyz2lab = (t: number): number => (t > LAB_T3 ? Math.pow(t, 1 / 3) : t / LAB_T2 + LAB_T0);
+const lab2xyz = (t: number): number => (t > LAB_T1 ? t * t * t : LAB_T2 * (t - LAB_T0));
+const lrgb2rgb = (v: number): number => 255 * (v <= 0.0031308 ? 12.92 * v : 1.055 * Math.pow(v, 1 / 2.4) - 0.055);
+/** Reused out-parameter for the colour conversions below (`[h, c, l]`, `[r, g, b]` or the hue terms). */
+const hclOut = new Float64Array(4);
+/** `rgb2lrgb` of every byte value — the same numbers d3-color computes for an integer channel. */
+const LRGB = Float64Array.from({ length: 256 }, (_, v) => rgb2lrgb(v));
+/** Direct-mapped memo of a colour's contribution to the aggregate colour mean, by 24-bit colour (16k slots,
+ *  ~650 KB): a categorical palette converts each colour once. It stores the computed values, so a hit is
+ *  bit-identical to converting again. */
+const HCL_MEMO_BITS = 14;
+const hclMemoKey = new Int32Array(1 << HCL_MEMO_BITS).fill(-1);
+const hclMemoVal = new Float64Array(4 << HCL_MEMO_BITS);
+
+/**
+ * A byte colour's terms in {@link computeLODStyle}'s chroma-weighted circular hue mean, into `out`:
+ * `[cos(h)·c, sin(h)·c, c, l]` — the hue terms 0 for an achromatic colour (NaN hue) and chroma/lightness 0
+ * where d3-color gives NaN — computed exactly as the pass did, through the memo.
+ */
+function hueTerms(r: number, g: number, b: number, out: Float64Array): void {
+  const key = (r << 16) | (g << 8) | b;
+  const slot = Math.imul(key, 0x9e3779b1) >>> (32 - HCL_MEMO_BITS);
+  if (hclMemoKey[slot] === key) {
+    out[0] = hclMemoVal[4 * slot] ?? 0;
+    out[1] = hclMemoVal[4 * slot + 1] ?? 0;
+    out[2] = hclMemoVal[4 * slot + 2] ?? 0;
+    out[3] = hclMemoVal[4 * slot + 3] ?? 0;
+    return;
+  }
+  rgbToHcl(r, g, b, out);
+  const h = out[0] ?? 0;
+  const ch = Number.isNaN(out[1] ?? 0) ? 0 : (out[1] ?? 0);
+  const l = Number.isNaN(out[2] ?? 0) ? 0 : (out[2] ?? 0);
+  // (Adding +0 for a NaN hue leaves a sum from +0 unchanged — the pass skipped the term instead.)
+  out[0] = Number.isNaN(h) ? 0 : Math.cos((h * Math.PI) / 180) * ch;
+  out[1] = Number.isNaN(h) ? 0 : Math.sin((h * Math.PI) / 180) * ch;
+  out[2] = ch;
+  out[3] = l;
+  hclMemoKey[slot] = key;
+  hclMemoVal[4 * slot] = out[0] ?? 0;
+  hclMemoVal[4 * slot + 1] = out[1] ?? 0;
+  hclMemoVal[4 * slot + 2] = ch;
+  hclMemoVal[4 * slot + 3] = l;
+}
+
+/**
+ * `hcl(rgb(r, g, b))` from d3-color for byte channels, as the same float operations in the same order — so
+ * the result is bit-identical — but written into `out` as `[h, c, l]` instead of allocating two colour
+ * objects. The aggregate colour pass runs it once per tree node (#343: every streamed frame for a spatial
+ * tree), through {@link hueTerms}' memo.
+ */
+function rgbToHcl(r: number, g: number, b: number, out: Float64Array): void {
+  const lr = LRGB[r] ?? 0;
+  const lg = LRGB[g] ?? 0;
+  const lb = LRGB[b] ?? 0;
+  const y = xyz2lab((0.2225045 * lr + 0.7168786 * lg + 0.0606169 * lb) / LAB_YN);
+  let x = y;
+  let z = y;
+  if (!(lr === lg && lg === lb)) {
+    x = xyz2lab((0.4360747 * lr + 0.3850649 * lg + 0.1430804 * lb) / LAB_XN);
+    z = xyz2lab((0.0139322 * lr + 0.0971045 * lg + 0.7141733 * lb) / LAB_ZN);
+  }
+  const l = 116 * y - 16;
+  const a = 500 * (x - y);
+  const bb = 200 * (y - z);
+  if (a === 0 && bb === 0) {
+    out[0] = NaN;
+    out[1] = 0 < l && l < 100 ? 0 : NaN;
+    out[2] = l;
+    return;
+  }
+  const h = Math.atan2(bb, a) * DEGREES;
+  out[0] = h < 0 ? h + 360 : h;
+  out[1] = Math.sqrt(a * a + bb * bb);
+  out[2] = l;
+}
+
+/** `rgb(hcl(h, c, l))` from d3-color, bit-identical, written into `out` as unclamped `[r, g, b]`. */
+function hclToRgb(h: number, c: number, l: number, out: Float64Array): void {
+  let a = 0;
+  let b = 0;
+  if (!Number.isNaN(h)) {
+    const hr = h * RADIANS;
+    a = Math.cos(hr) * c;
+    b = Math.sin(hr) * c;
+  }
+  let y = (l + 16) / 116;
+  let x = Number.isNaN(a) ? y : y + a / 500;
+  let z = Number.isNaN(b) ? y : y - b / 200;
+  x = LAB_XN * lab2xyz(x);
+  y = LAB_YN * lab2xyz(y);
+  z = LAB_ZN * lab2xyz(z);
+  out[0] = lrgb2rgb(3.1338561 * x - 1.6168667 * y - 0.4906146 * z);
+  out[1] = lrgb2rgb(-0.9787684 * x + 1.9161415 * y + 0.033454 * z);
+  out[2] = lrgb2rgb(0.0719453 * x - 0.2289914 * y + 1.4052427 * z);
 }
 
 /**
@@ -996,6 +1520,7 @@ export function computeLODStyle(
   leafColors?: ArrayLike<number>,
   radiusAggregate?: RadiusAggregate,
 ): void {
+  lodStylePasses++;
   const { leafCount, levelCount, levelOffset, childOffset, children, radius, weight, border, color } = tree;
   // Summed additive metric per node, only when sizing aggregates by the leaf scale (else null → the
   // area-additive √Σr² fallback). One temp array per style recompute, never per frame.
@@ -1030,14 +1555,11 @@ export function computeLODStyle(
         else sumR2 += radius[c]! * radius[c]!;
         sb += border[c]!;
         if (leafColors) {
-          const col = hcl(rgb(color[c * 4]!, color[c * 4 + 1]!, color[c * 4 + 2]!));
-          const ch = Number.isNaN(col.c) ? 0 : col.c;
-          if (!Number.isNaN(col.h)) {
-            hx += Math.cos((col.h * Math.PI) / 180) * ch;
-            hy += Math.sin((col.h * Math.PI) / 180) * ch;
-          }
-          sumC += ch;
-          sumL += Number.isNaN(col.l) ? 0 : col.l;
+          hueTerms(color[c * 4] ?? 0, color[c * 4 + 1] ?? 0, color[c * 4 + 2] ?? 0, hclOut);
+          hx += hclOut[0] ?? 0;
+          hy += hclOut[1] ?? 0;
+          sumC += hclOut[2] ?? 0;
+          sumL += hclOut[3] ?? 0;
           sumA += color[c * 4 + 3]!;
           nc++;
         }
@@ -1052,10 +1574,10 @@ export function computeLODStyle(
       border[g] = sb; // sum-additive: a module's border metric ≈ Σ member metric
       if (leafColors && nc > 0) {
         const hue = (Math.atan2(hy, hx) * 180) / Math.PI;
-        const c = rgb(hcl(hue, sumC / nc, sumL / nc));
-        color[g * 4] = Math.max(0, Math.min(255, Math.round(c.r)));
-        color[g * 4 + 1] = Math.max(0, Math.min(255, Math.round(c.g)));
-        color[g * 4 + 2] = Math.max(0, Math.min(255, Math.round(c.b)));
+        hclToRgb(hue, sumC / nc, sumL / nc, hclOut);
+        color[g * 4] = Math.max(0, Math.min(255, Math.round(hclOut[0] ?? 0)));
+        color[g * 4 + 1] = Math.max(0, Math.min(255, Math.round(hclOut[1] ?? 0)));
+        color[g * 4 + 2] = Math.max(0, Math.min(255, Math.round(hclOut[2] ?? 0)));
         color[g * 4 + 3] = Math.round(sumA / nc);
       }
     }
@@ -1070,7 +1592,8 @@ export function computeLODStyle(
  * `leafRadii` is the resolved per-node radius (so aggregates respect the node sizing); `leafWeight`
  * is the per-leaf importance, defaulting to `graph.strength` (weighted degree) — pass `graph.flow`
  * or `graph.csr.degree` to prioritise differently. `discs` places each module on its nested-layout
- * disc (#329, see {@link computeLODPositions}).
+ * disc (#329, see {@link computeLODPositions}); `bounds` is the position pass's reusable box scratch —
+ * without one the pass reuses a shared scratch, so a repeated call allocates nothing for it.
  */
 export function computeLODGeometry(
   tree: LODTree,
@@ -1081,8 +1604,9 @@ export function computeLODGeometry(
   leafColors?: ArrayLike<number>,
   radiusAggregate?: RadiusAggregate,
   discs?: BoundaryDiscs,
+  bounds?: LODBoundsScratch,
 ): void {
-  computeLODPositions(tree, graph.positions, discs);
+  computeLODPositions(tree, graph.positions, discs, bounds);
   computeLODStyle(tree, leafRadii, leafWeight, leafBorder, leafColors, radiusAggregate);
 }
 
@@ -1182,6 +1706,13 @@ export interface CutOptions {
    * network) is never collected.
    */
   boundaries?: CutBoundaries;
+  /**
+   * Also record, in the scratch, the nodes the walk **culls** (subtree roots whose box misses the view) and
+   * the ones it both draws and expands (a cross-fade band) — {@link CutScratch.culled} / `split` — so the
+   * lazy super-edge gather (#343) can tell which drawn or culled node covers any leaf. O(1) per node the
+   * walk visits anyway; off ⇒ zero added cost.
+   */
+  recordCulled?: boolean;
 }
 
 /** Floor for the adaptive default (and the historical fixed default): a binary tree's threshold. */
@@ -1242,12 +1773,19 @@ export interface CutScratch {
   stack: Uint32Array;
   /** Inherited cross-fade multiplier (#133), parallel to `stack` — only touched when fading. */
   alpha: Float64Array;
+  /** With {@link CutOptions.recordCulled}: the culled subtree roots of the last cut, `culled[0 .. culledCount)`. */
+  culled: Uint32Array;
+  culledCount: number;
+  /** With {@link CutOptions.recordCulled}: the nodes the last cut both drew and expanded (a cross-fade
+   *  band), `split[0 .. splitCount)`. Empty without a fade. */
+  split: Uint32Array;
+  splitCount: number;
 }
 
 /** Fresh {@link CutScratch}. The network engine keeps ONE per instance; {@link cut} falls back to a
  *  throwaway one when none is passed (backward-compatible, but then every call allocates). */
 export function makeCutScratch(): CutScratch {
-  return { frontier: new Uint32Array(256), stack: new Uint32Array(256), alpha: new Float64Array(256) };
+  return { frontier: new Uint32Array(256), stack: new Uint32Array(256), alpha: new Float64Array(256), culled: new Uint32Array(64), culledCount: 0, split: new Uint32Array(16), splitCount: 0 };
 }
 
 /**
@@ -1341,6 +1879,14 @@ export function cut(
     const qy = y < minY ? minY : y > maxY ? maxY : y;
     return (x - qx) * (x - qx) + (y - qy) * (y - qy) <= r * r;
   };
+  // Culled roots and drawn-and-expanded nodes (#343), for the lazy super-edge gather.
+  const recordCulled = opts.recordCulled === true;
+  let nc = 0;
+  let ns = 0;
+  const cull = (g: number): void => {
+    if (nc === sc.culled.length) { const nx = new Uint32Array(nc * 2); nx.set(sc.culled); sc.culled = nx; }
+    sc.culled[nc++] = g;
+  };
   const record = (g: number, a: number): void => {
     if (!bnd) return;
     if (nb === bnd.ids.length) {
@@ -1362,7 +1908,10 @@ export function cut(
     // Cull only when the node's drawn body (bbox grown by its draw radius) misses the viewport, so a
     // glyph stays until its whole body is off-screen.
     const m = ext + drawMargin(g);
-    if (gx + m < minX || gx - m > maxX || gy + m < minY || gy - m > maxY) continue;
+    if (gx + m < minX || gx - m > maxX || gy + m < minY || gy - m > maxY) {
+      if (recordCulled) cull(g);
+      continue;
+    }
     if (g < leafCount) {
       emit(g, a); // a real leaf — nothing finer to expand into
       continue;
@@ -1387,6 +1936,10 @@ export function cut(
     }
     if (drawA > 0) emit(g, drawA);
     if (childA > 0) {
+      if (recordCulled && drawA > 0) {
+        if (ns === sc.split.length) { const nx = new Uint32Array(ns * 2); nx.set(sc.split); sc.split = nx; }
+        sc.split[ns++] = g;
+      }
       if (bnd && g !== soleRoot && meets(g)) {
         record(g, childA);
         // Not drawn itself: its ring (and anchored links) fade with its children.
@@ -1397,6 +1950,8 @@ export function cut(
   }
 
   if (bnd) bnd.count = nb;
+  sc.culledCount = nc;
+  sc.splitCount = ns;
   return sc.frontier.subarray(0, n);
 }
 

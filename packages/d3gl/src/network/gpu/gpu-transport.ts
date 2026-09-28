@@ -405,7 +405,11 @@ class GpuLayoutRun implements WorkerLayoutHandle {
 
     // With LOD on, the LOD worker starts coarsening now, while this thread seeds and builds the solver (#377).
     // If it cannot start, no second worker is tried for the seed: the relay's one warning covers both.
-    const lodWorker = opts.lod === true && onLODTree !== undefined;
+    // The relay refits a coarsening tree. The spatial source (#343) rebuilds its tree per frame, which the relay
+    // does not do: it stands down (no warning, as for an edge-less graph), the main thread rebuilds the spatial
+    // tree from each harvested frame — until the relay runs the worker backend's per-frame step (#425) — and a
+    // seed-only worker coarsens for the multilevel seed.
+    const lodWorker = opts.lod === true && onLODTree !== undefined && opts.lodSource !== "spatial";
     const relay = lodWorker && onLODTree ? startLODRelay(graph, opts, onLODTree, coarsenSeed ? seedRequest : null) : null;
     const seedWorker = coarsenSeed && !lodWorker ? startSeedWorker(graph, opts, seedRequest) : null;
     const seeded = modulePlan !== null || (coarsenSeed && (relay !== null || seedWorker !== null));

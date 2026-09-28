@@ -140,12 +140,19 @@ describe("adaptive default expandPx (#191)", () => {
         expect(withDefault.glyphs).toBeLessThan(nodeCount / 2);
       });
 
-      it("a spatial quadtree keeps the 48 px default (its bottom cells hold one point)", () => {
+      it("a spatial tree scales the default by its bucketed bottom cells (48 px at one point per cell)", () => {
+        // #343: bottom cells hold up to 8 points, so the default gives each the same screen room as a
+        // binary tree's children — 48·√(c/2) px — and a one-point-per-cell tree keeps 48 px exactly.
         const tree = withGeometry(buildSpatialLODTree(graph.positions, nodeCount, {}), graph);
         const t = fitView(graph);
-        expect(tree.leafBranching).toBeLessThanOrEqual(2);
-        expect(defaultExpandPx(tree, W, H)).toBe(48);
-        expect(Array.from(cut(tree, t, W, H, {}))).toEqual(Array.from(cut(tree, t, W, H, { expandPx: 48 })));
+        expect(tree.leafBranching).toBeGreaterThan(2);
+        expect(tree.leafBranching).toBeLessThanOrEqual(8);
+        const px = defaultExpandPx(tree, W, H);
+        expect(px).toBeCloseTo(Math.min(48 * Math.sqrt(tree.leafBranching / 2), Math.min(W, H) / 2));
+        expect(Array.from(cut(tree, t, W, H, {}))).toEqual(Array.from(cut(tree, t, W, H, { expandPx: px })));
+        const single = withGeometry(buildSpatialLODTree(graph.positions, nodeCount, { bucket: 1 }), graph);
+        expect(single.leafBranching).toBeLessThanOrEqual(2);
+        expect(defaultExpandPx(single, W, H)).toBe(48);
       });
     });
   }
