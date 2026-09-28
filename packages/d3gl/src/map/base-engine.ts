@@ -834,14 +834,28 @@ export abstract class BaseEngine {
    *  promoted to the instanced lane (the lane owns draw + interaction; a stale Scene spec of the same
    *  name would otherwise double-draw and shadow the lane in pick/selection dispatch). No-op if absent. */
   protected removeLayer(name: string): void {
+    if (this.dropLayer(name)) this.pushLayers();
+  }
+
+  /** {@link removeLayer} for several layers with ONE re-push. Removing them one at a time re-pushes and
+   *  repaints the layers still registered after every removal — O(layers × their drawables) for a clear
+   *  that should cost nothing. No-op (no push) if none is present. */
+  protected removeLayers(names: readonly string[]): void {
+    let removed = false;
+    for (const name of names) removed = this.dropLayer(name) || removed;
+    if (removed) this.pushLayers();
+  }
+
+  /** Drop one layer's spec, indexes, interaction state and Scene group, without re-pushing. */
+  private dropLayer(name: string): boolean {
     const at = this.specs.findIndex((s) => s.name === name);
-    if (at < 0) return;
+    if (at < 0) return false;
     this.specs.splice(at, 1);
     this.hitIndexes.delete(name);
     this.layerIds.delete(name);
     this.dropInteractionState(name);
     this.scene.remove(name);
-    this.pushLayers();
+    return true;
   }
 
   /** Register a pass-through layer (called by subclasses for passThrough:true).
@@ -1020,6 +1034,7 @@ export abstract class BaseEngine {
   /** Override the style of one drawable or a set (replaces any previous override for
    *  those ids — last write wins). O(ids) compose + one styles-only push. */
   setStyle(name: string, ids: string | number | readonly (string | number)[], override: StyleOverride): this {
+    this.flushDeferredLayers();
     const spec = this.specs.find((s) => s.name === name);
     if (!spec) return this;
     const list: readonly (string | number)[] = Array.isArray(ids) ? ids : [ids as string | number];
@@ -1033,6 +1048,7 @@ export abstract class BaseEngine {
 
   /** Remove overrides (all of the layer's when `ids` is omitted) and restore base styles. */
   clearStyle(name: string, ids?: string | number | readonly (string | number)[]): this {
+    this.flushDeferredLayers();
     const spec = this.specs.find((s) => s.name === name);
     if (!spec) return this;
     const map = this.styleOverrides.get(name);
@@ -1065,6 +1081,7 @@ export abstract class BaseEngine {
   select(name: string, set: readonly (string | number)[] | null): this;
   select<D = unknown>(name: string, predicate: (d: D, i: number) => boolean): this;
   select(name: string, set: readonly (string | number)[] | ((d: unknown, i: number) => boolean) | null): this {
+    this.flushDeferredLayers();
     // Lane-first: an interactive lane takes precedence over a same-named (empty placeholder) Scene spec.
     if (this.laneInteractiveFor(name)) {
       // Instanced lane: update the managed set + refresh the ring overlay (no Scene drawables to style).
@@ -1132,6 +1149,7 @@ export abstract class BaseEngine {
     idOrIds: string | number | readonly (string | number)[] | null,
     styleOrDraw?: HighlightStyle | HighlightDraw,
   ): this {
+    this.flushDeferredLayers();
     const spec = this.specs.find((s) => s.name === name);
     if (!spec) return this;
     if (idOrIds == null) {
@@ -1241,6 +1259,22 @@ export abstract class BaseEngine {
       backend.updateLayer(spec.name, this.renderLayer(spec));
     }
     this.render();
+  }
+
+  /**
+   * Subclass hook, run first by every public call that resolves against the registered layers:
+   * `pick()`, `toSVG()`/`toPNG()`, `select()`/`selection()`, `highlight()`, `setStyle()`/`clearStyle()`.
+   * An engine that defers a layer registration to the end of the call chain (Network's `lod()` before
+   * any layout) completes it here, so a synchronous caller finds the layers an immediate registration
+   * would have given it — a selection or style is applied, not dropped for want of its layer. No-op by
+   * default; an override must be O(1) when nothing is deferred (pick() runs it on every pointermove).
+   */
+  protected flushDeferredLayers(): void {}
+
+  /** Whether `name` carries interaction state — a selection, a highlight, or style overrides — that
+   *  {@link dropInteractionState} would discard if the layer were removed. */
+  protected hasInteractionState(name: string): boolean {
+    return (this.selected.get(name)?.size ?? 0) > 0 || this.highlights.has(name) || (this.styleOverrides.get(name)?.size ?? 0) > 0;
   }
 
   /** Forget per-layer interaction state (overrides, highlights). Called when a
@@ -1714,6 +1748,7 @@ export abstract class BaseEngine {
     return this;
   }
   pick(x: number, y: number, exact = true): HoverHit | null {
+    this.flushDeferredLayers();
     // x,y are SCREEN (CSS px); the HitIndex applies the transform itself (per-mode: invert for
     // world layers, project-the-anchor for screen layers — so screen geometry picks at its
     // rendered pixel size at any zoom, not a hit area that scales with the view transform).
@@ -1777,8 +1812,8 @@ export abstract class BaseEngine {
   // (the HTML overlay does) — and, for toSVG, the instanced lanes' vector view (#200), which has no
   // retained Scene to serialize. Both are pushed once at export time, never per frame. toPNG needs
   // only the labels: it is a GPU readback, so the lanes are already in the pixels.
-  toSVG(): string { this.pushExportLabels(); this.pushExportGeometry(); return this.handle?.backend.toSVG() ?? ""; }
-  toPNG(): string { this.pushExportLabels(); return this.handle?.backend.toPNG() ?? ""; }
+  toSVG(): string { this.flushDeferredLayers(); this.pushExportLabels(); this.pushExportGeometry(); return this.handle?.backend.toSVG() ?? ""; }
+  toPNG(): string { this.flushDeferredLayers(); this.pushExportLabels(); return this.handle?.backend.toPNG() ?? ""; }
   destroy(): void {
     this.destroyed = true;
     this.sizingObserver?.disconnect();
@@ -2171,6 +2206,7 @@ export abstract class BaseEngine {
   /** Flatten the retained selection into HoverHit[], resolving datums + `members()` via the layer's
    *  Scene spec or its interactive lane (so a selected aggregate's leaf ids are reachable, #105 N7c-2). */
   selection(): HoverHit[] {
+    this.flushDeferredLayers();
     const out: HoverHit[] = [];
     for (const [layer, ids] of this.selected) {
       // Lane-first: an interactive lane resolves datum + members; otherwise the Scene spec does.
