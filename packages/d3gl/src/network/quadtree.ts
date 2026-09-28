@@ -32,6 +32,8 @@ export class BarnesHutTree {
 
   private bodyNext: Int32Array = new Int32Array(0); // per-body next pointer (coincident buckets)
   private px: Float32Array = new Float32Array(0);
+  /** Per-body mass of the last {@link build} (`undefined` = 1 each). */
+  private bodyMass: Float32Array | undefined = undefined;
 
   private ensureCells(need: number): void {
     if (this.capacity >= need) return;
@@ -133,8 +135,14 @@ export class BarnesHutTree {
     }
   }
 
-  build(positions: Float32Array, n: number): void {
+  /**
+   * Rebuild over the first `n` bodies of `positions`. With `mass` each body weighs its entry (a
+   * multilevel coarse level's supernodes) instead of 1, so cell masses and centres of mass are
+   * mass-weighted and {@link applyForce} yields each body's repulsion per unit of its own mass.
+   */
+  build(positions: Float32Array, n: number, mass?: Float32Array): void {
     this.px = positions;
+    this.bodyMass = mass;
     this.cellCount = 0;
     if (this.bodyNext.length < n) this.bodyNext = new Int32Array(n);
 
@@ -182,7 +190,15 @@ export class BarnesHutTree {
             sy += mc * this.comY[ch]!;
           }
         }
+      } else if (mass) {
+        for (let b = this.head[c]!; b !== -1; b = this.bodyNext[b]!) {
+          const mb = mass[b]!;
+          m += mb;
+          sx += mb * positions[b * 2]!;
+          sy += mb * positions[b * 2 + 1]!;
+        }
       } else {
+        // Unit bodies (the finest level): the loop without a per-body mass lookup.
         for (let b = this.head[c]!; b !== -1; b = this.bodyNext[b]!) {
           m += 1;
           sx += positions[b * 2]!;
@@ -199,6 +215,7 @@ export class BarnesHutTree {
     const xi = this.px[i * 2]!;
     const yi = this.px[i * 2 + 1]!;
     const theta2 = theta * theta;
+    const bodyMass = this.bodyMass;
     let ax = 0;
     let ay = 0;
     let sp = 0;
@@ -222,6 +239,18 @@ export class BarnesHutTree {
             const ch = this.child[cell * 4 + q]!;
             if (ch !== -1) this.stack[sp++] = ch;
           }
+        }
+      } else if (bodyMass) {
+        // Weighted bodies (a multilevel coarse level): each repels by its own mass. A separate loop
+        // keeps the unweighted one below — the finest level's hot path — free of the per-body lookup.
+        for (let b = this.head[cell]!; b !== -1; b = this.bodyNext[b]!) {
+          if (b === i) continue;
+          const dx = xi - this.px[b * 2]!;
+          const dy = yi - this.px[b * 2 + 1]!;
+          const d2 = dx * dx + dy * dy;
+          const f = (repulsion * bodyMass[b]!) / (d2 + SOFTENING); // softened: bounded as d → 0
+          ax += f * dx;
+          ay += f * dy;
         }
       } else {
         for (let b = this.head[cell]!; b !== -1; b = this.bodyNext[b]!) {

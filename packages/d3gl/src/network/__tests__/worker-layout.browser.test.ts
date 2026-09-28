@@ -40,6 +40,76 @@ describe("worker layout (off-thread, progressive)", () => {
     expect(spread(g.positions)).toBeGreaterThan(2);
   });
 
+  it("stops once converged — iterations is a maximum, not a fixed count (#124)", async () => {
+    // A million-tick budget would keep the worker busy for minutes; the convergence stop settles it
+    // after a few dozen ticks.
+    const g = ring(200);
+    let frames = 0;
+    const handle = startWorkerLayout(g, { width: 400, height: 400, iterations: 1_000_000 }, () => {
+      frames++;
+    });
+    await handle.settled;
+    expect(frames).toBeGreaterThan(0);
+    expect(spread(g.positions)).toBeGreaterThan(2);
+    handle.stop();
+  }, 20_000);
+
+  it("streams by time: at most about one frame per display frame, not one per tick batch", async () => {
+    // Fast ticks (a few hundred nodes): the old cadence posted every ceil(iterations / 60) ticks — 60
+    // frames in a burst far above display rate. By time, the worker posts at most one frame per 16 ms of
+    // its own time (plus the seed frame and the final `done`), so frames ≤ elapsed / 16 + slack.
+    const g = ring(400);
+    let frames = 0;
+    const t0 = performance.now();
+    const handle = startWorkerLayout(g, { width: 400, height: 400, iterations: 300 }, () => {
+      frames++;
+    });
+    await handle.settled;
+    const elapsed = performance.now() - t0;
+    expect(frames).toBeGreaterThanOrEqual(2); // the seed frame + `done`, at least
+    expect(frames).toBeLessThanOrEqual(elapsed / 16 + 3);
+    handle.stop();
+  }, 20_000);
+
+  it("a pin lands within about one tick, and the held node stays put in the frames after it", async () => {
+    // A drag's pin on a large layout must not wait for a whole batch of ticks (the old cadence yielded
+    // after ceil(iterations / 60) ticks — thousands here). A 20k-node cold start at full heat keeps
+    // moving for the whole test; pin node 0 far from the layout and time until a frame shows it there.
+    const g = ring(20_000);
+    const X = Math.fround(1e5);
+    const Y = Math.fround(-1e5);
+    const frameAt: number[] = [];
+    const held: boolean[] = [];
+    const handle = startWorkerLayout(g, { width: 400, height: 400, iterations: 100_000, multilevel: false }, () => {
+      frameAt.push(performance.now());
+      held.push(g.positions[0] === X && g.positions[1] === Y);
+    });
+    const waitFrames = async (count: number): Promise<void> => {
+      const deadline = performance.now() + 10_000;
+      while (frameAt.length < count && performance.now() < deadline) await new Promise((r) => setTimeout(r, 5));
+    };
+    await waitFrames(4); // the run is underway: seed frame + a few streamed ticks
+    expect(frameAt.length).toBeGreaterThanOrEqual(4);
+    const before = frameAt.length;
+    // Slowest gap between streamed frames so far: an upper bound on one tick here (ticks ≥ 16 ms post a
+    // frame each; faster ticks post every 16 ms).
+    let tickMs = 16;
+    for (let i = 2; i < before; i++) tickMs = Math.max(tickMs, (frameAt[i] ?? 0) - (frameAt[i - 1] ?? 0));
+    if (handle.shared) { g.positions[0] = X; g.positions[1] = Y; } // shared mode: the worker reads the SAB
+    const pinAt = performance.now();
+    handle.pin(Uint32Array.of(0), Float32Array.of(X, Y));
+    const deadline = pinAt + 10_000;
+    while (!held.slice(before).includes(true) && performance.now() < deadline) await new Promise((r) => setTimeout(r, 5));
+    const landed = held.indexOf(true, before);
+    expect(landed, "no frame showed the pinned node").toBeGreaterThanOrEqual(before);
+    const latency = (frameAt[landed] ?? Infinity) - pinAt;
+    await waitFrames(landed + 3);
+    handle.stop();
+    // Within about one tick: the pin waits for the tick in flight, then the next frame carries it.
+    expect(latency, `pin latency ${latency.toFixed(0)} ms, tick ≤ ${tickMs.toFixed(0)} ms`).toBeLessThan(3 * tickMs + 50);
+    expect(held.slice(landed, landed + 3)).toEqual([true, true, true]); // held exactly, frame after frame
+  }, 30_000);
+
   it("stop() cancels mid-run and resolves settled", async () => {
     const g = ring(60);
     const handle = startWorkerLayout(g, { width: 400, height: 400, iterations: 100000, frameEvery: 1 }, () => {});

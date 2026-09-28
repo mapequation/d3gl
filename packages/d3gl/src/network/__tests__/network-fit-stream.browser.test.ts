@@ -140,10 +140,22 @@ async function until(done: () => boolean, maxMs = 5000): Promise<void> {
   while (!done() && performance.now() - t0 < maxMs) await sleep(20);
 }
 /**
- * The real-worker cases stream 3000 nodes × 300 iterations and wait for the settle: a few seconds alone, but
- * several times that on a loaded machine, past the suite's 20 s default. A harness limit, not a budget.
+ * The real-worker cases stream 3000 nodes and wait for the settle: a few seconds alone, but several times
+ * that on a loaded machine, past the suite's 20 s default. A harness limit, not a budget.
  */
 const STREAM_TIMEOUT_MS = 90_000;
+
+/**
+ * Start the real worker stream the fit has to follow, drawn without links. The layout seeds at its force
+ * equilibrium and stops once converged (#345, #124), so a multilevel run posts its handful of frames in one
+ * burst that lands in a single repaint. A cold start (`multilevel: false`) keeps full heat until it has
+ * untangled: the longest real stream there is. The fit does not depend on links, and not drawing them keeps
+ * each repaint cheap, so that stream spans many animation frames even under headless software GL.
+ */
+function streamWithFit(net: ProbeNetwork): void {
+  net.style({ linkStyle: "none" });
+  net.layout({ backend: "worker", fit: true, iterations: 300, multilevel: false });
+}
 
 /** Sample the view on every animation frame until `done` resolves; returns the distinct scales seen. */
 async function sampleUntil(net: ProbeNetwork, done: Promise<void>): Promise<number[]> {
@@ -277,7 +289,7 @@ describe("streaming fit with zoom enabled (#327)", () => {
       net.data(graph);
       if (lod) net.lod({});
       net.enableZoom([0.001, 100]);
-      net.layout({ backend: "worker", fit: true, iterations: 300 });
+      streamWithFit(net);
       const ks = await sampleUntil(net, net.whenSettled());
       await nextFrame();
 
@@ -303,7 +315,7 @@ describe("streaming fit with zoom enabled (#327)", () => {
     await net.whenReady();
     const graph = randomGraph(3000, 13);
     net.data(graph).enableZoom([0.001, 100]);
-    net.layout({ backend: "worker", fit: true, iterations: 300 });
+    streamWithFit(net);
     const settled = net.whenSettled();
     await framesStreamed(net, 2);
 
@@ -324,7 +336,7 @@ describe("streaming fit with zoom enabled (#327)", () => {
     await net.whenReady();
     const graph = randomGraph(3000, 17);
     net.data(graph).enableZoom([0.001, 100]);
-    net.layout({ backend: "worker", fit: true, iterations: 300 });
+    streamWithFit(net);
     const settled = net.whenSettled();
     await framesStreamed(net, 2);
 
