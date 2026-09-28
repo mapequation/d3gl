@@ -1,7 +1,7 @@
 import type { Device, Texture, Framebuffer } from "@luma.gl/core";
 import { Model } from "@luma.gl/engine";
 import { SLOT_TEXEL_GLSL } from "../textures.js";
-import { FLAT_TILE_MIN_SIDE, tileSide, type PyramidLevel, type PyramidTexture, type TileAtlas } from "../segments.js";
+import { FLAT_TILE_MIN_SIDE, bandRows, bandSlots, tileSide, type PyramidLevel, type PyramidTexture, type TileAtlas } from "../segments.js";
 import { SEGMENT_OF_GLSL, segmentDefines, type SegmentTable } from "../segment-table.js";
 import { ADDITIVE_BLEND, beginPass, fullScreenModel, NO_BLEND, type PassTarget, type PassUniforms } from "./fullscreen.js";
 
@@ -101,6 +101,7 @@ uniform highp sampler2D u_pos;
 uniform highp sampler2D u_segBox;    // (maxX, maxY, -minX, -minY) per segment
 uniform highp usampler2D u_segInfo;  // (start, count, x | y << 16, rootLevel | flags << 8 | side << 16)
 uniform int   u_width;
+uniform int   u_first;               // the first slot of this draw (a band of slots, #382)
 uniform vec2  u_atlas;               // level-0 atlas size (A, H)
 uniform float u_pad;                 // box padding factor (e.g. 1.01)
 flat out vec2 v_pos;
@@ -113,7 +114,7 @@ flat out float v_mass;
 ${SLOT_TEXEL_GLSL}
 ${SEGMENT_OF_GLSL}
 void main() {
-  ivec2 c = slotTexel(gl_VertexID, u_width);
+  ivec2 c = slotTexel(u_first + gl_VertexID, u_width);
   ivec2 st = segmentTexelOf(c);
   uvec4 info = texelFetch(u_segInfo, st, 0);
   gl_PointSize = 1.0;
@@ -356,6 +357,7 @@ export class GridPyramid {
     // ── Models ────────────────────────────────────────────────────────────
     this.scatterUniforms = {
       u_width: 1,
+      u_first: 0,
       u_atlas: new Float32Array([atlas.width, atlas.height]),
       u_pad: this.pad,
       u_tableWidth: 1,
@@ -392,42 +394,87 @@ export class GridPyramid {
    * see its results, and the caller's work item submits once (#402).
    */
   build(input: PyramidBuildInput): void {
+    this.scatter(input);
+    this.reduceLevels(input.grid);
+  }
+
+  /** Rows of level 1 — the most bands {@link reduceLevels} can cut (1 without a level above 0). */
+  get levelRows(): number {
+    return this.atlas.levels[1]?.height ?? 1;
+  }
+
+  /**
+   * Step 1 over the slots of the slot-atlas rows of band `band` of `bands` (#382): its first band clears
+   * L0 (a seed level's tile only its corner), every band ADD-scatters its slots. Blending follows draw
+   * order, and the bands draw the slots in the order one draw would, so L0 is bitwise the same for any
+   * `bands`.
+   */
+  scatter(input: PyramidBuildInput, band = 0, bands = 1): void {
     const { posTex, width, count, segments, slotSeg, grid } = input;
     if (!this.singleSegment && !slotSeg) throw new Error("GridPyramid: a many-segment build needs the slot → segment texture");
     if (grid !== undefined && (!this.singleSegment || grid > (this.atlas.tiles[0]?.side ?? 0))) {
       throw new Error("GridPyramid: a corner build (a seed level's tile) needs the flat layout and fits its tile");
     }
     if (input.mass && !this.unit) throw new Error("GridPyramid: a mass-weighted build needs a multilevel pyramid");
+    const [first, end] = bandSlots(band, bands, width, count);
 
-    // ── 1. Scatter to level 0 (ADD blend into the whole L0 atlas) ─────────
     // L0 holds level 0 alone, so clearing the whole attachment is right here; a seed level's tile clears
-    // only its corner (the scissor), which is all its traversal reads.
-    const scatterPass = beginPass(
-      this.device,
-      grid === undefined ? this.scatterTarget : { ...this.scatterTarget, scissor: [0, 0, grid, grid] },
-    );
-    this.scatterUniforms["u_width"] = width;
-    this.scatterUniforms["u_tableWidth"] = segments.width;
-    const bindings: Record<string, Texture> = { u_pos: posTex, u_segBox: segments.box, u_segInfo: segments.info };
-    if (slotSeg) bindings["u_slotSeg"] = slotSeg;
-    if (this.unit) {
-      this.scatterUniforms["u_massive"] = input.mass ? 1 : 0;
-      bindings["u_mass"] = input.mass ?? this.unit;
+    // only its corner (the scissor), which is all its traversal reads. Later bands add to the first's.
+    const target =
+      band > 0
+        ? { framebuffer: this.targets.l0.fbo, clear: false as const }
+        : grid === undefined
+          ? this.scatterTarget
+          : { ...this.scatterTarget, scissor: [0, 0, grid, grid] as [number, number, number, number] };
+    const scatterPass = beginPass(this.device, target);
+    if (end > first) {
+      this.scatterUniforms["u_width"] = width;
+      this.scatterUniforms["u_first"] = first;
+      this.scatterUniforms["u_tableWidth"] = segments.width;
+      const bindings: Record<string, Texture> = { u_pos: posTex, u_segBox: segments.box, u_segInfo: segments.info };
+      if (slotSeg) bindings["u_slotSeg"] = slotSeg;
+      if (this.unit) {
+        this.scatterUniforms["u_massive"] = input.mass ? 1 : 0;
+        bindings["u_mass"] = input.mass ?? this.unit;
+      }
+      this.scatterModel.setBindings(bindings);
+      this.scatterModel.setVertexCount(end - first);
+      this.scatterModel.draw(scatterPass);
     }
-    this.scatterModel.setBindings(bindings);
-    this.scatterModel.setVertexCount(count);
-    this.scatterModel.draw(scatterPass);
     scatterPass.end();
+  }
 
-    // ── 2. Packed reduce (level ℓ → ℓ+1) ──────────────────────────────────
+  /**
+   * Step 2, the packed reduce (level ℓ → ℓ + 1), over band `band` of `bands` of every level's rows (#382):
+   * level ℓ + 1's rows `[⌊b·h/B⌋, ⌊(b+1)·h/B⌋)` (h its height) read level ℓ's rows below
+   * `2·⌊(b+1)·h/B⌋ ≤ ⌊(b+1)·2h/B⌋`, which bands ≤ b of level ℓ wrote — so each band reduces all levels in
+   * order, and the pyramid does not depend on `bands`. `grid`: a seed level's tile (#353), whose levels are
+   * reduced only up to its root, each over its corner.
+   */
+  reduceLevels(grid?: number, band = 0, bands = 1): void {
     // Each pass reads level ℓ from one texture and writes level ℓ+1's rectangle of the other: no
-    // clear (the other levels share the target), no blend (every output texel is written once). A seed
-    // level's tile reduces only its own levels, each over its corner of the level's rectangle.
+    // clear (the other levels share the target), no blend (every output texel is written once).
     const u = this.reduceUniforms;
-    const steps = grid === undefined ? this.reduceSteps : this.reduceSteps.slice(0, Math.log2(grid));
-    for (const [l, { src, dst, target, bindings }] of steps.entries()) {
+    const levels = grid === undefined ? this.reduceSteps.length : Math.min(this.reduceSteps.length, Math.log2(grid));
+    for (let l = 0; l < levels; l++) {
+      const step = this.reduceSteps[l];
+      if (!step) break;
+      const { src, dst, target, bindings } = step;
       const side = grid === undefined ? 0 : grid >> (l + 1);
-      const pass = beginPass(this.device, grid === undefined ? target : { ...target, viewport: [dst.x, dst.y, side, side] });
+      const w = grid === undefined ? dst.width : side;
+      const h = grid === undefined ? dst.height : side;
+      const [r0, r1] = bandRows(band, bands, h);
+      if (r1 <= r0) continue;
+      const pass = beginPass(
+        this.device,
+        grid === undefined && bands === 1
+          ? target
+          : {
+              ...target,
+              viewport: [dst.x, dst.y, w, h],
+              ...(bands > 1 ? { scissor: [dst.x, dst.y + r0, w, r1 - r0] as [number, number, number, number] } : {}),
+            },
+      );
       u["u_srcX"] = src.x;
       u["u_srcY"] = src.y;
       u["u_dstX"] = dst.x;
@@ -437,6 +484,7 @@ export class GridPyramid {
       pass.end();
     }
   }
+
 
   destroy(): void {
     for (const t of Object.values(this.targets)) {

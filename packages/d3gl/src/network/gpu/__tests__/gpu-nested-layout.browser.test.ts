@@ -6,7 +6,7 @@ import { beforeAll, describe, expect, it } from "vitest";
 import type { Device, Framebuffer, FramebufferProps, Texture, TextureProps } from "@luma.gl/core";
 import { makeTestDevice } from "./_device.js";
 import { NestedJacobiReference } from "./nested-jacobi-reference.js";
-import { GpuNestedLayout, nestedLayoutPlan } from "../gpu-nested-layout.js";
+import { GpuNestedLayout, nestedLayoutPlan, type NestedStage } from "../gpu-nested-layout.js";
 import { nestedSolverResult, nestedSolverTopology, type NestedSolverTopology } from "../nested-topology.js";
 import { EXACT_MAX, NESTED, nestedLayout, type NestedLayoutParams, type NestedLayoutResult, type NestedLayoutTopology } from "../../nested-layout.js";
 import {
@@ -23,6 +23,7 @@ import {
   directedPartition,
   expectContained,
   expectNested,
+  infomapLikeTree,
   kids,
   linkTightness,
   meanShift,
@@ -36,6 +37,7 @@ import {
   worstSeparation,
   zipfModuleTree,
 } from "../../__tests__/nested-fixtures.js";
+import { nestedPlanSizes } from "../nested-plan.js";
 import { collisionTwin } from "./collision-twin.js";
 import { COLLISION_RELAX, COLLISION_STEPS } from "../passes/collision.js";
 
@@ -108,9 +110,51 @@ function makeTree(groups: readonly number[], tops: number, linksPerChild: number
   return { topo: { size, leafCount: leaves, childOffset, children, parent, superEdgeOffset, superEdgeTarget, superEdgeFlow }, size: metric };
 }
 
-/** Run `ticks` solve ticks of `layout`, every item unsliced. */
+/**
+ * `tree` with `spokes` more super-edges from its first leaf to as many of its siblings (the first leaves of
+ * its module): a row of the springs' CSR longer than `SPRING_CHUNK`, which the springs cut into hub chunks.
+ */
+function withHub(tree: NestedLayoutTopology, spokes: number): NestedLayoutTopology {
+  const edges = tree.superEdgeOffset ?? new Uint32Array(tree.size + 1);
+  const offset = new Uint32Array(tree.size + 1);
+  const target: number[] = [];
+  const flow: number[] = [];
+  for (let g = 0; g < tree.size; g++) {
+    for (let e = edges[g] ?? 0; e < (edges[g + 1] ?? 0); e++) {
+      target.push(tree.superEdgeTarget?.[e] ?? 0);
+      flow.push(tree.superEdgeFlow?.[e] ?? 0);
+    }
+    if (g === 0) {
+      for (let t = 1; t <= spokes; t++) {
+        target.push(t);
+        flow.push(1);
+      }
+    }
+    offset[g + 1] = target.length;
+  }
+  return { ...tree, superEdgeOffset: offset, superEdgeTarget: Uint32Array.from(target), superEdgeFlow: Float32Array.from(flow) };
+}
+
+/** Run `ticks` solve ticks of `layout`, every pass unsliced. */
 function runAll(layout: GpuNestedLayout, ticks: number): void {
   layout.runTicks(ticks);
+}
+
+/** Run `stages` (a stream tick's or a readback's) in order, each unsliced. */
+function runStages(stages: readonly NestedStage[]): void {
+  for (const stage of stages) stage.run(0, 1);
+}
+
+/**
+ * Run the current compact stream tick of `layout` up to its collision's work items (the state its
+ * {@link GpuNestedLayout.collisionStats} reads), then call `between`, then the rest of the tick.
+ */
+function compactTick(layout: GpuNestedLayout, between: () => void): void {
+  const stages = layout.tickStages();
+  const cut = stages.findIndex((stage) => stage.pass === "items" || stage.pass === "resolve");
+  runStages(stages.slice(0, cut));
+  between();
+  runStages(stages.slice(cut));
 }
 
 /** Largest |a − b| over two arrays. */
@@ -264,28 +308,119 @@ describe("GPU nested layout (#355) against its Jacobi reference", () => {
     }
   });
 
-  it("is bitwise independent of how its stream ticks are cut into bands (repulsion and collision gathers)", () => {
+  it("is bitwise independent of how every pass of its stream ticks and readbacks is cut into bands (#382)", () => {
+    // A 600-child segment (tiles; the exact loop, cut into work items) among smaller ones over 3 depths, and a
+    // 1,000-child Zipf module (the collision grid, its scatters and work items).
+    const kinds = new Set<string>();
     const { topo: tree, size } = makeTree([600, 45, 90, 12], 2, 2, 13);
-    const solver = nestedSolverTopology(tree, { size, iterations: 20 });
+    const zipf = zipfModuleTree(1000, 8);
+    for (const solver of [nestedSolverTopology(tree, { size, iterations: 20 }), nestedSolverTopology(zipf.topo, { size: zipf.flow, iterations: 16 })]) {
+      slicedMatchesWhole(solver, kinds);
+    }
+    // Every pass kind of the plan was cut into several bands at least once.
+    for (const pass of ["tree", "query", "scatter", "levels", "repulsion", "predict", "springs", "cells", "cellScatter", "subScatter", "items", "resolve", "compose"]) {
+      expect(kinds.has(pass), pass).toBe(true);
+    }
+  });
+
+  /** Run `solver` whole and with every pass cut into 1 … 7 bands; both must agree bit for bit. */
+  function slicedMatchesWhole(solver: NestedSolverTopology, kinds: Set<string>): void {
     const whole = new GpuNestedLayout(device, nestedLayoutPlan(solver));
     const sliced = new GpuNestedLayout(device, nestedLayoutPlan(solver));
-    try {
-      whole.runTicks(solver.iterations);
-      for (let t = 0; t < sliced.streamTicks; t++) {
-        const bands = 1 + (t % 5); // 1 … 5 bands, a different cut every stream tick
-        sliced.beginTick();
-        for (let b = 0; b < bands; b++) sliced.forceBand(b, bands);
-        sliced.integrate();
+    const leaves = solver.leafCount;
+    const modules = solver.treeSize - leaves;
+    const composed = (layout: GpuNestedLayout, cut: (stage: number) => number): Float32Array => {
+      for (const [i, stage] of layout.readbackStages().entries()) {
+        const bands = Math.min(stage.rows, cut(i));
+        if (bands > 1) kinds.add(stage.pass);
+        for (let b = 0; b < bands; b++) stage.run(b, bands);
       }
+      const { width, height, framebuffer } = layout.packed;
+      const px = device.readPixelsToArrayWebGL(framebuffer, { sourceWidth: width, sourceHeight: height });
+      if (!(px instanceof Float32Array)) throw new Error("expected a float readback");
+      return px.slice(0, 4 * Math.ceil(leaves / 2) + 4 * modules);
+    };
+    try {
+      let t = 0;
+      let passes = 0;
+      while (whole.ticks < solver.iterations) {
+        runStages(whole.tickStages());
+        // A different cut for every pass: 1 … 7 bands (at most its rows), cycling through the stream ticks.
+        for (const stage of sliced.tickStages()) {
+          const bands = Math.min(stage.rows, 1 + ((t + passes++) % 7));
+          if (bands > 1) kinds.add(stage.pass);
+          for (let b = 0; b < bands; b++) stage.run(b, bands);
+        }
+        t++;
+        if (t % 7 === 3) {
+          // A readback between two ticks — sliced on one side — changes nothing the solve reads.
+          expect(Array.from(composed(sliced, (i) => 2 + i))).toEqual(Array.from(composed(whole, () => 1)));
+        }
+      }
+      expect(t).toBe(sliced.streamTicks);
       expect(sliced.ticks).toBe(solver.iterations);
       const a = new Float32Array(2 * solver.slotCount);
       const b = new Float32Array(2 * solver.slotCount);
       whole.readLocal(a);
       sliced.readLocal(b);
       expect(Array.from(b)).toEqual(Array.from(a));
+      expect(Array.from(composed(sliced, (i) => 3 + 2 * i))).toEqual(Array.from(composed(whole, () => 1)));
     } finally {
       whole.destroy();
       sliced.destroy();
+    }
+  }
+
+  it("cuts its passes over the sizes nestedPlanSizes derives from the topology alone (#382)", () => {
+    // The node guards (nested-frame-budget.test.ts) stream the plan of nestedPlanSizes: it must be the plan the
+    // layout binds. Maps with the tile pyramid, hub rows, the collision grid, work items, exact segments and
+    // several depths.
+    const { topo: tree, size } = makeTree([600, 45, 90, 12], 2, 2, 13);
+    const hubbed = nestedSolverTopology(withHub(tree, 300), { size, iterations: 4 });
+    const { topo: big, flow } = infomapLikeTree(20_000);
+    const zipf = zipfModuleTree(3000, 20);
+    for (const solver of [hubbed, nestedSolverTopology(big, { size: flow, iterations: 4 }), nestedSolverTopology(zipf.topo, { size: zipf.flow, iterations: 4 })]) {
+      const layout = new GpuNestedLayout(device, nestedLayoutPlan(solver));
+      try {
+        expect(layout.planSizes.levelRows).toBeGreaterThan(0);
+        expect(layout.planSizes.itemRows).toBeGreaterThan(0);
+        if (solver === hubbed) expect(layout.planSizes.hubRows, "the fixture has hub rows").toBeGreaterThan(0);
+        else expect(layout.planSizes.binned, "the fixture bins slots into the collision grid").toBeGreaterThan(0);
+        expect(nestedPlanSizes(solver)).toEqual(layout.planSizes);
+      } finally {
+        layout.destroy();
+      }
+    }
+  });
+
+  it("a readback between any two bands of a tick leaves the solve bitwise unchanged (#382)", () => {
+    // The stream may compose between any two work items: the composition has its own scratch and sums.
+    const { topo: tree, size } = makeTree([600, 45, 90, 12], 2, 2, 13);
+    const solver = nestedSolverTopology(tree, { size, iterations: 12 });
+    const plain = new GpuNestedLayout(device, nestedLayoutPlan(solver));
+    const probed = new GpuNestedLayout(device, nestedLayoutPlan(solver));
+    try {
+      while (plain.ticks < solver.iterations) {
+        for (const stage of plain.tickStages()) {
+          const bands = Math.min(2, stage.rows);
+          for (let b = 0; b < bands; b++) stage.run(b, bands);
+        }
+        for (const stage of probed.tickStages()) {
+          const bands = Math.min(2, stage.rows);
+          for (let b = 0; b < bands; b++) {
+            stage.run(b, bands);
+            probed.composeReadback();
+          }
+        }
+      }
+      const a = new Float32Array(2 * solver.slotCount);
+      const b = new Float32Array(2 * solver.slotCount);
+      plain.readLocal(a);
+      probed.readLocal(b);
+      expect(Array.from(b)).toEqual(Array.from(a));
+    } finally {
+      plain.destroy();
+      probed.destroy();
     }
   });
 
@@ -562,7 +697,9 @@ describe("GPU nested layout (#380): the radius-class collision grid on modules o
   function oneStep(solver: NestedSolverTopology): { worst: number; visits: number; subVisits: number; overflow: number } {
     const layout = new GpuNestedLayout(device, nestedLayoutPlan(solver), { organise: 0, collisionStats: true });
     try {
-      layout.beginTick(); // the tick's springs and integration, then the step's cells and occupancy
+      const stages = layout.tickStages();
+      const cut = stages.findIndex((stage) => stage.pass === "items" || stage.pass === "resolve");
+      runStages(stages.slice(0, cut)); // the tick's springs and integration, then the step's cells and occupancy
       const before = new Float32Array(2 * solver.slotCount);
       layout.readLocal(before);
       const stats = layout.collisionStats();
@@ -576,8 +713,7 @@ describe("GPU nested layout (#380): the radius-class collision grid on modules o
       expect(overflow, "slots sent to the exact loop: GPU against its twin").toBe(twin.overflowSlots);
       // (An overflowing slot's other work items finish their slices where the twin stops the whole search.)
       if (overflow === 0) expect(visits, "cells visited: GPU against its twin").toBe(twin.visits + twin.subVisits);
-      layout.forceBand(0, 1);
-      layout.integrate();
+      runStages(stages.slice(cut));
       const after = new Float32Array(2 * solver.slotCount);
       layout.readLocal(after);
       const ref = new NestedJacobiReference(solver, 0);
@@ -745,8 +881,13 @@ describe("GPU nested layout (#380): the radius-class collision grid on modules o
       try {
         let steps = 0;
         while (layout.ticks < solver.iterations) {
-          layout.beginTick();
-          if (layout.ticks >= Math.ceil(0.6 * solver.iterations) && layout.ticks % 4 === 0) {
+          if (layout.ticks < Math.ceil(0.6 * solver.iterations)) {
+            runStages(layout.tickStages());
+            continue;
+          }
+          const sampled = layout.ticks % 4 === 0;
+          compactTick(layout, () => {
+            if (!sampled) return;
             const stats = layout.collisionStats();
             let work = 0;
             let overflow = 0;
@@ -758,9 +899,7 @@ describe("GPU nested layout (#380): the radius-class collision grid on modules o
             // Measured at 1.1-1.6× the plan's estimate; a single-scale grid did 36× at 60,000 children.
             expect(work, `tick ${layout.ticks}: pair work against the plan's ${solver.collision.gatherWork.toFixed(0)}`).toBeLessThan(3 * solver.collision.gatherWork);
             steps++;
-          }
-          layout.forceBand(0, 1);
-          layout.integrate();
+          });
         }
         expect(steps).toBeGreaterThan(2);
       } finally {

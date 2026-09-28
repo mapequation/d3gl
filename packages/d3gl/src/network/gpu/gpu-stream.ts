@@ -14,16 +14,27 @@
  *    repaint (a finished copy waits in its PBO until the repaint is due). A read that is not ready is never
  *    forced, and it happens before any encode, so nothing it could wait on is freshly queued. A hidden page
  *    pauses the throttle's stall sampling, so the time a tab spent hidden never delays the next repaint.
- * 2. **Encode.** Work items (P, F_0 … F_{B−1}, I) while the {@link FrameBudget} admits them: at most 33 ms
- *    of frames of layout work in flight (`framesInFlight`: 2 frames at 60 Hz, 4 at 120 Hz), a GPU
- *    budget of `min(10 ms, 0.6 × rAF interval)` per frame, and at most 2 ms of encode time. A tick may
- *    span frames; its result does not depend on how it was sliced.
- * 3. **Copy + fence.** On the repaint's cadence (reading back more often than repainting is waste), and
- *    when the one PBO is free, copy the positions into it; then insert the frame's single budget fence,
- *    which doubles as the copy's fence. The copy carries the reductions' stats, and they always describe
- *    the copied positions: positions change only at a tick's integrate and at its prep (where a drag's held
- *    positions are written, never mid-tick), so a copy after a prep reuses that prep's stats and a copy
- *    between ticks re-runs the reductions first ({@link GpuForceLayout.refreshSegmentStats}).
+ * 2. **Encode.** Work items while the {@link FrameBudget} admits them: at most 33 ms of frames of layout
+ *    work in flight (`framesInFlight`: 2 frames at 60 Hz, 4 at 120 Hz), a GPU budget of `min(10 ms,
+ *    0.6 × rAF interval)` per frame, and at most 2 ms of encode time. A tick is a sequence of passes
+ *    (`stream-schedule.ts`) — the solver's, or a step of the multilevel seed, which the stream supplies
+ *    itself (below) — and every pass is cut into row bands sized to the budget (at most half of it, or all
+ *    of it for a pass whose every band pays a long fixed cost; #382), each band one item. So a frame's
+ *    *estimated* layout GPU work stays within the budget, save a first item that alone passes it: a band
+ *    whose fixed cost alone passes three quarters of the budget; the flat layout's P and I, which run whole
+ *    (P's estimate passes the 120 Hz budget above ~1M nodes, #429); and a band of a pass already cut into
+ *    its rows or its 64 bands (`MAX_BANDS`). A tick may span frames; its result does not depend on how it
+ *    was sliced.
+ * 3. **Readback + copy + fence.** On the repaint's cadence (reading back more often than repainting is
+ *    waste), and when the one PBO is free, the solver's readback passes run as items too (the nested
+ *    layout's composition), exclusively — no tick item runs until the copy — over as many frames as the
+ *    budget needs; then the positions are copied into the PBO. Every frame ends with its single budget
+ *    fence, which doubles as the fence of a copy issued in it. The copy carries the reductions' stats, and
+ *    they always describe the copied positions: for the flat layout, positions change only at a tick's
+ *    integrate and at its prep (where a drag's held positions are written, never mid-tick), so a copy
+ *    after a prep reuses that prep's stats and a copy between ticks re-runs the reductions first
+ *    ({@link GpuForceLayout.refreshSegmentStats}); the nested layout's readback passes reduce the positions
+ *    they compose.
  *
  * **Where a harvest goes** is the stream's {@link FrameSink}. By default ({@link DirectSink}) it lands in
  * `graph.positions` and is painted in the same frame. With LOD on (#377) the `LODRelay` (`lod-relay.ts`)
@@ -35,8 +46,10 @@
  *
  * **A multilevel seed** (#353, spec §6.4) runs first when the stream is `seeded`: once its plan arrives
  * ({@link GpuStream.seed}; the layout worker builds it), the seed's levels are work items of the same loop,
- * under the same budget — each level's placement (`setLevel`), then its ticks (P, F_b, I on the level's
- * slots), and finally the placement of the graph's nodes (`endSeed`). Nothing is read back during the seed
+ * under the same budget: the stream is the schedule's stage source and wraps the solver's ticks with the
+ * seed's steps — each level's placement (`setLevel`, one item), then its ticks (the solver's passes over the
+ * level's slots and rows, its force pass sliced by the level's own cost; a tick that fits half the budget
+ * whole is one item), and finally the placement of the graph's nodes (`endSeed`). Nothing is read back during the seed
  * (the solver's slots hold coarse levels, not node positions): the first copy is the **seed frame** (tick
  * 0), and until it is painted the disc the transport seeded stays on screen. A drag's pins wait for the
  * graph's level; `stop()` during the seed drops its fences and frees its resources; with no iterations the
@@ -73,41 +86,27 @@ import { DRAG_HEAT, RECOOL_TICKS } from "../force.js";
 import type { NetworkGraph } from "../graph.js";
 import { deleteSync, insertSync, pollSync } from "../../webgl/fence.js";
 import { AsyncPositionReadback, READBACK_STATS_FLOATS, READBACK_STOP_OFFSET, type ReadbackSource } from "./async-readback.js";
-import { FrameBudget, ITEM_NS_PER_NODE, itemCostMs, type FenceSource, type ItemCosts, type ItemKind } from "./frame-budget.js";
+import { FrameBudget, itemCostMs, type FenceSource } from "./frame-budget.js";
+import { StreamSchedule, type StageSource, type StreamStage } from "./stream-schedule.js";
 import { MIN_FRAME_MS, RepaintThrottle } from "./repaint-throttle.js";
 import { reportUncaught } from "./report-uncaught.js";
 import type { SeedPlan } from "./seed-plan.js";
 import { STOP_NONFINITE, STOP_STOPPED } from "./stop-latch.js";
 
 /**
- * A solver the stream drives: a tick is the work items **P** ({@link beginTick}), **F_b**
- * ({@link forceBand}, `b = 0 … B − 1`) and **I** ({@link integrate}) — positions change only in I — and it
- * is its own {@link ReadbackSource}. The flat {@link GpuForceLayout} and the nested layout's batched solve
- * (#355) are both one. Each item that encodes a render pass ends with one `device.submit()`, and nothing below
- * it submits (#402); a readback copy is one item too — {@link prepareReadback} encodes, and the readback's
- * `issue` submits.
+ * A solver the stream drives, and its own {@link ReadbackSource}: a tick is a sequence of passes
+ * ({@link StageSource.tickStages}), each sliced into bands (`stream-schedule.ts`). The flat
+ * {@link GpuForceLayout} (prep, force, integrate) and the nested layout's batched solve (#355) are both one.
+ * Each work item — a band of a pass — that encodes a render pass ends with one `device.submit()`, and nothing
+ * below it submits (#402); a readback copy is one item too — {@link prepareReadback} encodes, and the
+ * readback's `issue` submits.
  */
-export interface StreamSolver extends ReadbackSource {
+export interface StreamSolver extends ReadbackSource, StageSource {
   /**
-   * The solver's GPU cost per node of each work item, ns, which the frame budget sizes its bands by.
-   * Default the flat layout's {@link ITEM_NS_PER_NODE}.
-   */
-  readonly itemCosts?: ItemCosts;
-  /**
-   * The estimated GPU time of the next item of `kind`, ms, when it depends on where the solve is (the
-   * nested layout's phases); otherwise the stream estimates it from {@link itemCosts}.
-   */
-  itemCostMs?(kind: ItemKind, bands: number): number;
-  /** Estimated GPU time of {@link prepareReadback}, ms, which a frame that copies reserves in its budget. Default 0. */
-  readonly readbackCostMs?: number;
-  beginTick(): void;
-  forceBand(band: number, bands: number): void;
-  integrate(): void;
-  /**
-   * Make the readback source describe the current positions, right before a copy. `betweenTicks`: the
-   * copy follows an integrate (the next P has not run), so reductions from the last P describe the
-   * positions before it; otherwise it follows a P, whose reductions are current. Encodes without submitting:
-   * the copy's `AsyncPositionReadback.issue` submits the whole copy once.
+   * The last step right before a copy, after any {@link StageSource.readbackStages}: make the readback
+   * source's stats describe the current positions. `betweenTicks`: the copy follows a tick's last pass (the
+   * next has not started); the flat layout then re-runs its reductions, whose last run was that tick's prep.
+   * Encodes without submitting: the copy's `AsyncPositionReadback.issue` submits the whole copy once.
    */
   prepareReadback(betweenTicks: boolean): void;
   destroy(): void;
@@ -128,9 +127,10 @@ export interface DragSolver {
  * stops early and is never moved.
  */
 export interface FlatStreamSolver extends StreamSolver, DragSolver {
-  /** Slots and atlas rows of the level the ticks run on: the graph's, or a seed level's. */
+  /** Slots of the level the ticks run on: the graph's, or a seed level's (its passes cut the level's rows). */
   readonly levelSlots: number;
-  readonly levelRows: number;
+  /** One whole tick, unsliced: a seed level's tick that fits half the frame budget is one work item. */
+  runFrame(ticks: number): void;
   beginSeed(plan: SeedPlan): void;
   setLevel(k: number): void;
   endSeed(): void;
@@ -165,6 +165,11 @@ export interface GpuFrameSample {
   encodeMs: number;
   /** Work items encoded this frame. */
   items: number;
+  /**
+   * Their estimated GPU time, ms — within `budgetMs` whenever more than one item ran (#382): the budget admits
+   * a second item only while the sum fits.
+   */
+  itemsMs: number;
   /** Ticks completed so far in this run. */
   ticksDone: number;
   /** Whether a readback was harvested this frame. */
@@ -184,13 +189,16 @@ export interface GpuFrameSample {
   copied: boolean;
   /** Whether the gate blocked this frame (the frames `framesInFlight` allows were already in flight). */
   blocked: boolean;
-  /** The controller's item cap and band count after this frame, and its budget. */
+  /** The controller's item cap after this frame, the band count of the last sliced pass started, and the budget. */
   k: number;
   bands: number;
   budgetMs: number;
 }
 
 const observers = new Set<(sample: Readonly<GpuFrameSample>) => void>();
+
+/** A solver without readback passes of its own copies at once. */
+const NO_STAGES: readonly StreamStage[] = [];
 
 /**
  * Observe every streamed GPU layout frame (tests and benchmarks). The sample object is reused across
@@ -331,6 +339,20 @@ export class DirectSink implements FrameSink {
 type Mode = "idle" | "run" | "drag" | "cool";
 
 /**
+ * A pass the stream supplies itself (a step of the multilevel seed, #353), its estimate updated before each
+ * tick that runs it — a {@link StreamStage} whose cost the stream may rewrite.
+ */
+interface OwnStage {
+  costMs: number;
+  readonly fixedMs: number;
+  readonly rows: number;
+  run(band: number, bands: number): void;
+}
+
+/** What the tick the schedule is running is: the solver's, or a step or a whole level tick of the seed (#353). */
+type TickKind = "solver" | "seed-step" | "seed-tick";
+
+/**
  * Where a run stood at a set of positions (#311): those a readback copy holds, then the last ones harvested
  * into `graph.positions`. A run stopped mid-way continues elsewhere from exactly there.
  */
@@ -367,7 +389,6 @@ export class GpuStream {
   /** The flat layout's extras (#353 seed, #376 stop, #311 heat), or null (the nested solve, #355). */
   private readonly flat: FlatStreamSolver | null;
   private readonly drag: DragSolver | null;
-  private readonly costs: ItemCosts;
   private readonly streaming: boolean;
   private readonly onFailure: ((reason: string) => void) | undefined;
   private readonly graph: NetworkGraph;
@@ -380,7 +401,7 @@ export class GpuStream {
   private readonly stats = new Float32Array(READBACK_STATS_FLOATS);
   private readonly sink: FrameSink;
   private readonly sample: GpuFrameSample = {
-    now: 0, harvestMs: 0, commitMs: 0, repainted: false, repaintMs: 0, encodeMs: 0, items: 0, ticksDone: 0,
+    now: 0, harvestMs: 0, commitMs: 0, repainted: false, repaintMs: 0, encodeMs: 0, items: 0, itemsMs: 0, ticksDone: 0,
     harvested: false, harvestedTicks: -1, stopTick: -1, copied: false, blocked: false, k: 1, bands: 1, budgetMs: 0,
   };
   private readonly canvas: EventTarget | null;
@@ -410,10 +431,20 @@ export class GpuStream {
   private ticksDone = 0;
   /** The stop tick a harvest showed for the current schedule, −1 before (#376). */
   private stopTick = -1;
-  /** Next item of the current tick: 0 = P, 1 … bands = F_{phase−1}, bands + 1 = I. */
-  private phase = 0;
-  /** Bands of the current tick, fixed when its P is encoded. */
-  private tickBands = 1;
+  /**
+   * Which bands of which passes each frame encodes, the readback's passes included (#382). The stream is its
+   * stage source: the solver's ticks, wrapped with the multilevel seed's steps (#353).
+   */
+  private readonly schedule: StreamSchedule;
+  /** The current frame's rAF timestamp (the schedule's copy hooks read it). */
+  private now = 0;
+  /** What the tick the schedule last started (or is about to start) is. */
+  private tickKind: TickKind = "solver";
+  /** The seed's placement step (`setLevel` / `endSeed`) and a whole seed-level tick, as one-pass ticks (#353). */
+  private readonly seedStep: OwnStage;
+  private readonly seedTick: OwnStage;
+  private readonly seedStepStages: readonly StreamStage[];
+  private readonly seedTickStages: readonly StreamStage[];
   /** The current mode's ticks are done: copy once more (unthrottled), harvest, then {@link finish}. */
   private finishing = false;
   /**
@@ -481,14 +512,23 @@ export class GpuStream {
     this.onInterrupt = opts.onInterrupt;
     this.onFailure = opts.onFailure;
     this.throttle = new RepaintThrottle(opts.minFrameMs ?? MIN_FRAME_MS);
-    this.costs = layout.itemCosts ?? ITEM_NS_PER_NODE;
-    this.budget = new FrameBudget(glFences(this.gl), () => performance.now(), {
-      nodes: layout.nodeCount,
-      rows: layout.atlasRows,
-      costs: this.costs,
-      ...(opts.budgetMs !== undefined ? { budgetMs: opts.budgetMs } : {}),
-    });
+    this.budget = new FrameBudget(glFences(this.gl), () => performance.now(), opts.budgetMs !== undefined ? { budgetMs: opts.budgetMs } : {});
     this.readback = new AsyncPositionReadback(device, layout, opts.extra);
+    this.seedStep = { costMs: 0, fixedMs: 0, rows: 1, run: () => this.runSeedStep() };
+    this.seedTick = { costMs: 0, fixedMs: 0, rows: 1, run: () => this.requireFlat().runFrame(1) };
+    this.seedStepStages = [this.seedStep];
+    this.seedTickStages = [this.seedTick];
+    const source: StageSource = {
+      tickStages: () => this.nextTickStages(),
+      readbackStages: () => layout.readbackStages?.() ?? NO_STAGES,
+    };
+    this.schedule = new StreamSchedule(this.budget, source, {
+      tickStart: () => this.tickStarted(),
+      tickEnd: () => this.tickEnded(),
+      // The throttle times a readback from here: its passes may wait frames for budget before the copy.
+      readbackStart: () => this.throttle.readbackStarted(this.now),
+      copy: (betweenTicks) => this.issueCopy(betweenTicks),
+    });
     this.sink = opts.sink ?? new DirectSink(graph, opts.into ?? null);
     this.sink.listen(() => this.resume());
     this.settled = new Promise<void>((resolve) => {
@@ -740,41 +780,14 @@ export class GpuStream {
     if (this.settlePending && !this.sink.holding) this.settle();
     const harvestMs = performance.now() - t0 - repaintMs;
 
-    // 2. Encode work items within the budget.
+    // 2. Encode work items within the budget — a readback being prepared first (nothing may move the
+    // positions before its copy), then the ticks — and 3. a readback on the repaint cadence: its passes as
+    // items, then the copy (#382). Then the frame's one budget fence.
     const t2 = performance.now();
-    let items = 0;
+    this.now = now;
     const open = this.budget.open();
-    // A frame that will copy reserves the readback's own GPU work (the nested layout's composition, #355).
-    if (open && this.copyLikely(now)) this.budget.reserve(this.layout.readbackCostMs ?? 0);
-    if (open) {
-      while (this.hasWork()) {
-        const cost = this.nextItemCost();
-        if (!this.budget.admit(cost)) break;
-        const band = this.phase > 0 && this.phase <= this.tickBands;
-        this.encodeItem();
-        this.budget.spent(cost, band);
-        items++;
-        if (this.seedFrame) break; // the seed just placed the nodes: this frame copies them as tick 0 (#353)
-      }
-    }
-
-    // 3. The readback copy (on the repaint cadence), then the frame's one budget fence.
-    const copied = this.copyDue(now);
-    if (copied) {
-      // Between ticks (right after an integrate) the reductions' stats describe the previous positions:
-      // re-run them so the harvest's finiteness check covers the positions it copies. After a prep they
-      // already do — positions change only at integrate and at the prep's held-position write.
-      if (this.phase === 0) this.armStop();
-      this.layout.prepareReadback(this.phase === 0);
-      this.readback.issue(this.layout);
-      this.seedFrame = false;
-      this.copyTicks = this.ticksDone;
-      this.copyFinal = this.finishing;
-      this.copiedTicks = this.ticksDone;
-      this.recordCopyState();
-      this.throttle.copyIssued(now);
-      this.copyReady = false;
-    }
+    const items = this.schedule.frame(open, this.hasWork, this.copyDue);
+    const copied = this.schedule.copied;
     // `repainted` ⇔ onFrame ran. Not `repaintMs > 0`: a clamped clock (~1 ms in Firefox and Safari without
     // cross-origin isolation) measures a cheap repaint as 0. Not `harvested`: a relayed frame is painted
     // in a later frame than the one that harvested it (#377).
@@ -790,6 +803,7 @@ export class GpuStream {
       sample.repaintMs = repaintMs;
       sample.encodeMs = t3 - t2;
       sample.items = items;
+      sample.itemsMs = this.schedule.frameCostMs;
       sample.ticksDone = this.ticksDone;
       sample.harvested = harvested;
       sample.harvestedTicks = harvestedTicks;
@@ -797,7 +811,7 @@ export class GpuStream {
       sample.copied = copied;
       sample.blocked = !open;
       sample.k = this.budget.k;
-      sample.bands = this.budget.bands;
+      sample.bands = this.schedule.lastBands;
       sample.budgetMs = this.budget.budgetMs;
       for (const observer of observers) observer(sample);
     }
@@ -815,6 +829,7 @@ export class GpuStream {
     return (
       (this.mode !== "idle" && !this.failed && this.seedState !== "waiting") ||
       this.finishing ||
+      this.schedule.reading ||
       this.readback.pending ||
       this.sink.ready ||
       // Ticks to copy again after the LOD worker lost a frame — never once idle: a convergence stop's frozen
@@ -825,40 +840,47 @@ export class GpuStream {
 
   /**
    * Whether the current mode has ticks left to encode. A started tick is finished, except the frozen one a
-   * convergence stop sends the stream idle in, which {@link finish} drops.
+   * convergence stop sends the stream idle in, which {@link finish} drops. Not in the frame the seed placed
+   * the graph's nodes: that frame copies them as tick 0 (#353).
    */
-  private hasWork(): boolean {
-    return this.mode !== "idle" && !this.finishing && !this.stopping && !this.failed && this.seedState !== "waiting";
-  }
+  private readonly hasWork = (): boolean =>
+    this.mode !== "idle" &&
+    !this.finishing &&
+    !this.stopping &&
+    !this.failed &&
+    this.seedState !== "waiting" &&
+    !this.seedFrame;
 
-  /** Whether the next item is a seed step: placing the next seed level, or the graph's nodes (#353). */
+  /** Whether the next tick is a seed step: placing the next seed level, or the graph's nodes (#353). */
   private seedStepNext(): boolean {
-    return this.seedState === "running" && this.phase === 0 && this.seedTicksLeft === 0;
+    return this.seedState === "running" && this.seedTicksLeft === 0;
   }
 
-  /** The estimated GPU time of the next item. */
-  private nextItemCost(): number {
+  /**
+   * The passes of the tick about to start — the schedule's stage source (#382): a step of the multilevel seed
+   * (#353), a whole seed-level tick, or the solver's own tick over the level it is on (a seed level's slots
+   * and rows, whose cost sizes its bands, or the graph's).
+   */
+  private nextTickStages(): readonly StreamStage[] {
     if (this.seedStepNext()) {
       // A placement is one gather over the level's slots, about an integrate's cost.
       const level = this.seedPlan?.levels[this.seedNext];
-      return itemCostMs("integrate", level ? level.count : this.layout.nodeCount, 1, this.costs);
+      this.seedStep.costMs = itemCostMs("integrate", level ? level.count : this.layout.nodeCount);
+      this.tickKind = "seed-step";
+      return this.seedStepStages;
     }
-    const n = this.levelSlots();
-    if (this.wholeSeedTick()) return this.tickCostMs(n);
-    const kind: ItemKind = this.phase === 0 ? "prep" : this.phase <= this.tickBands ? "force" : "integrate";
-    // A solver whose items depend on where it is (the nested layout's phases, #355) estimates them itself.
-    const solverCost = this.layout.itemCostMs?.(kind, this.tickBands);
-    if (solverCost !== undefined) return solverCost;
-    return itemCostMs(kind, n, kind === "force" ? this.tickBands : 1, this.costs);
+    if (this.wholeSeedTick()) {
+      this.seedTick.costMs = this.tickCostMs(this.levelSlots());
+      this.tickKind = "seed-tick";
+      return this.seedTickStages;
+    }
+    this.tickKind = "solver";
+    return this.layout.tickStages();
   }
 
-  /** Slots and atlas rows of the level the ticks run on: a multilevel seed's level (#353), else every node. */
+  /** Slots of the level the ticks run on: a multilevel seed's level (#353), else every node. */
   private levelSlots(): number {
     return this.flat?.levelSlots ?? this.layout.nodeCount;
-  }
-
-  private levelRows(): number {
-    return this.flat?.levelRows ?? this.layout.atlasRows;
   }
 
   /** The flat layout, which the multilevel seed needs (a seeded stream is only ever built over one). */
@@ -867,19 +889,19 @@ export class GpuStream {
     return this.flat;
   }
 
-  /** The estimated GPU time of a whole unsliced tick over `n` slots. */
+  /** The estimated GPU time of a whole unsliced flat tick over `n` slots. */
   private tickCostMs(n: number): number {
-    return itemCostMs("prep", n, 1, this.costs) + itemCostMs("force", n, 1, this.costs) + itemCostMs("integrate", n, 1, this.costs);
+    return itemCostMs("prep", n) + itemCostMs("force", n) + itemCostMs("integrate", n);
   }
 
   /**
-   * Whether the next item is a whole tick of a seed level (#353): a level whose unsliced tick fits in half
-   * the frame's budget is ticked as one item, not three — most seed levels are a few thousand slots or fewer,
-   * so cutting their ticks into P, F and I would only multiply the items the frame budget counts, and the
-   * seed frame would wait for them.
+   * Whether the next tick is a whole tick of a seed level (#353): a level whose unsliced tick fits in half
+   * the frame's budget is ticked as one item, not as its passes — most seed levels are a few thousand slots
+   * or fewer, so cutting their ticks into P, F and I would only multiply the items the frame budget counts,
+   * and the seed frame would wait for them.
    */
   private wholeSeedTick(): boolean {
-    return this.seedState === "running" && this.phase === 0 && this.tickCostMs(this.levelSlots()) <= this.budget.budgetMs / 2;
+    return this.seedState === "running" && this.tickCostMs(this.levelSlots()) <= this.budget.budgetMs / 2;
   }
 
   /** Create the seed's resources for `plan` (#353); false, with one warning, if that fails. */
@@ -890,6 +912,15 @@ export class GpuStream {
     } catch (error) {
       console.warn("[d3gl] network layout({ backend: 'gpu' }): the multilevel seed could not start; the layout starts from a disc instead.", error);
       return false;
+    }
+  }
+
+  /** The seed's placement step, as a work item: {@link encodeSeedStep}, freeing the seed if it throws. */
+  private runSeedStep(): void {
+    try {
+      this.encodeSeedStep();
+    } catch (error) {
+      this.abortSeed(error);
     }
   }
 
@@ -950,48 +981,49 @@ export class GpuStream {
     this.settle(true);
   }
 
-  /** Encode the next work item of the current tick. */
-  private encodeItem(): void {
-    if (this.seedStepNext()) {
-      try {
-        this.encodeSeedStep();
-      } catch (error) {
-        this.abortSeed(error);
-      }
-      return;
+  /**
+   * A tick is about to encode its first band. A tick of the solver starts with its prep: the drag's latest
+   * held positions are written first, so the whole tick sees one set, and the stop latch is armed for the
+   * prep's reduction (#376).
+   */
+  private tickStarted(): void {
+    if (this.tickKind !== "solver") return;
+    if (this.heldIds && this.heldPositions) {
+      this.drag?.setHeldPositions(this.heldIds, this.heldPositions);
+      this.heldIds = null;
+      this.heldPositions = null;
     }
-    if (this.wholeSeedTick()) {
-      this.layout.beginTick();
-      this.layout.forceBand(0, 1);
-      this.layout.integrate();
+    this.armStop();
+  }
+
+  /** A tick's last band was encoded: advance the seed (#353), or the mode's schedule. */
+  private tickEnded(): void {
+    if (this.tickKind === "seed-step") return; // its run advanced the seed
+    if (this.tickKind === "seed-tick" || this.seedState === "running") {
       this.seedTicksLeft--;
       return;
     }
-    if (this.phase === 0) {
-      // A seed level's force pass gets bands in proportion to its slots (at least one, at most its rows).
-      const rows = this.levelRows();
-      this.tickBands = Math.max(1, Math.min(rows, Math.ceil((this.budget.bands * this.levelSlots()) / this.layout.nodeCount)));
-      if (this.heldIds && this.heldPositions) {
-        this.drag?.setHeldPositions(this.heldIds, this.heldPositions);
-        this.heldIds = null;
-        this.heldPositions = null;
-      }
-      this.armStop();
-      this.layout.beginTick();
-      this.phase = 1;
-    } else if (this.phase <= this.tickBands) {
-      this.layout.forceBand(this.phase - 1, this.tickBands);
-      this.phase++;
-    } else {
-      this.layout.integrate();
-      this.phase = 0;
-      if (this.seedState === "running") {
-        this.seedTicksLeft--;
-      } else {
-        this.ticksDone++;
-        this.tickDone();
-      }
-    }
+    this.ticksDone++;
+    this.tickDone();
+  }
+
+  /**
+   * Copy the positions into the PBO, fenced by this frame's budget fence, once the solver's readback passes
+   * are encoded. Between ticks the flat layout's stats describe the previous positions, so
+   * {@link StreamSolver.prepareReadback} re-runs its reductions — and the stop latch over them, armed here
+   * for the tick just integrated (#376); after a prep they already describe these (positions change only at
+   * integrate and at the prep's held-position write).
+   */
+  private issueCopy(betweenTicks: boolean): void {
+    if (betweenTicks) this.armStop();
+    this.layout.prepareReadback(betweenTicks);
+    this.readback.issue(this.layout);
+    this.seedFrame = false;
+    this.copyTicks = this.ticksDone;
+    this.copyFinal = this.finishing;
+    this.copiedTicks = this.ticksDone;
+    this.recordCopyState();
+    this.copyReady = false;
   }
 
   /** A tick was integrated: advance the mode's schedule. */
@@ -1027,11 +1059,11 @@ export class GpuStream {
         this.hold(DRAG_HEAT);
       } else {
         this.mode = "idle";
-        this.phase = 0;
+        this.schedule.dropTick();
       }
     } else if (this.mode === "cool") {
       this.mode = "idle";
-      this.phase = 0;
+      this.schedule.dropTick();
       this.settle();
     }
     // The painted positions are the run's final ones: a move from here continues from the mode the run is in
@@ -1041,18 +1073,19 @@ export class GpuStream {
   }
 
   /**
-   * Whether to copy positions this frame: the PBO is free, there are new ticks, and the copy would be
-   * ready (after the usual copy → ready latency) when the next repaint is due — so a harvested frame is
-   * about one frame old, not a whole repaint interval.
+   * Whether to start a readback this frame (asked after its ticks): the PBO is free, there are new ticks, and
+   * the copy would be ready (after the usual latency from a readback's start — its passes' wait for budget
+   * included — to its copy's completion) when the next repaint is due — so a harvested frame is about one
+   * frame old, not a whole repaint interval.
    */
-  private copyDue(now: number, lookahead = 0): boolean {
+  private readonly copyDue = (): boolean => {
     if (this.readback.pending) return false;
     if (this.seedState !== "none") return false; // the slots hold a seed level, not the nodes (#353)
     if (this.seedFrame) return true; // the seed frame: tick 0, once
     // An idle stream has shown its final positions, and a harvested stop is on its way to the screen: a
     // stop's frozen ticks after its copy changed nothing (#376).
     if (this.mode === "idle" || this.stopping) return false;
-    const fresh = this.ticksDone + lookahead - this.copiedTicks;
+    const fresh = this.ticksDone - this.copiedTicks;
     if (fresh <= 0) return false;
     // The final copy goes out as soon as the PBO is free, once: `finishing` holds until that frame is painted
     // (finish()), which with LOD on is a worker round trip after its harvest (#377), and a frame lost with the
@@ -1060,16 +1093,8 @@ export class GpuStream {
     if (this.finishing) return true;
     if (!this.streaming) return false; // only the final positions are read back (#328, #355)
     if (this.frameEvery !== undefined) return fresh >= this.frameEvery;
-    return this.throttle.copyDue(now, this.sink.relays);
-  }
-
-  /**
-   * Whether this frame will likely copy, asked before encoding (to reserve the copy's GPU time, #355):
-   * {@link copyDue}, counting on one more tick.
-   */
-  private copyLikely(now: number): boolean {
-    return this.copyDue(now, 1);
-  }
+    return this.throttle.copyDue(this.now, this.sink.relays);
+  };
 
   // ── Convergence stop (#376) ────────────────────────────────────────────────
 
@@ -1148,6 +1173,7 @@ export class GpuStream {
     if (this.raf) cancelAnimationFrame(this.raf);
     this.raf = 0;
     this.looping = false;
+    this.schedule.abandon();
     this.readback.abandon();
     this.canvas?.removeEventListener("webglcontextlost", this.onContextLost);
     this.page?.removeEventListener("visibilitychange", this.onVisibilityChange);

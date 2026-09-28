@@ -14,6 +14,7 @@ import {
   COLLISION_PART_VISITS,
   COLLISION_SUB_SHIFT,
   cellHash,
+  collisionCuts,
   collisionPlan,
   planClassCount,
   planFirstBinned,
@@ -21,8 +22,13 @@ import {
   planSubBuckets,
   searchCellsPerAxis,
   searchReach,
+  slotResolveWork,
+  workCut,
   type CollisionPlan,
 } from "../collision-plan.js";
+import { nestedSolverTopology } from "../nested-topology.js";
+import { atlasWidth } from "../textures.js";
+import { zipfModuleTree } from "../../__tests__/nested-fixtures.js";
 import { bruteForcePartners, collisionTwin, type TwinTopology } from "./collision-twin.js";
 import { EXACT_MAX, NESTED } from "../../nested-layout.js";
 
@@ -312,6 +318,59 @@ describe("the radius-class search finds every touching pair once (CPU twin of th
     expect(plan.segClasses[0]).not.toBe(0);
     const topo: TwinTopology = { slotCount: 600, segStart, segCount, radius };
     expectComplete(topo, plan, scatter(topo, 1, 10), "forced grid");
+  });
+});
+
+describe("the collision's band cuts (#380, #382)", () => {
+  // The frame budget admits a band of the work items or of the resolve by its share of the pass's estimate
+  // (#382): a band must carry that share. Rows alone would not: a Zipf module's slots sit in the first rows.
+  const { topo, flow } = zipfModuleTree(20_000, 20);
+  const solver = nestedSolverTopology(topo, { size: flow, iterations: 10 });
+  const plan = solver.collision;
+  const width = atlasWidth(solver.slotCount);
+  const rows = Math.ceil(solver.slotCount / width);
+  const cuts = collisionCuts(plan, width);
+
+  it("totals the plan's item and resolve work, and every slot's resolve", () => {
+    expect(cuts.itemWorkBefore[Math.ceil(plan.itemCount / width)]).toBeCloseTo(plan.itemWork, 0);
+    expect(cuts.resolveWorkBefore[rows]).toBeCloseTo(plan.resolveWork, 0);
+    let resolve = 0;
+    for (let i = 0; i < solver.slotCount; i++) resolve += slotResolveWork(plan, i);
+    expect(resolve).toBeCloseTo(plan.resolveWork, 0);
+    expect(plan.itemWork).toBeGreaterThan(0.9 * plan.gatherWork); // the big module's slots run in items
+  });
+
+  it("cuts the work items and the resolve into bands of equal estimated work, which equal rows would not", () => {
+    const shareOf = (before: Float64Array, a: number, b: number, n: number): number => ((before[b] ?? 0) - (before[a] ?? 0)) / (before[n] ?? 1);
+    const widest = (before: Float64Array, n: number): number => {
+      let w = 0;
+      for (let u = 0; u < n; u++) w = Math.max(w, shareOf(before, u, u + 1, n));
+      return w;
+    };
+    for (const [before, n] of [
+      [cuts.itemWorkBefore, Math.ceil(plan.itemCount / width)],
+      [cuts.resolveWorkBefore, rows],
+    ] as const) {
+      const unit = widest(before, n);
+      for (const bands of [2, 4, 8, 16]) {
+        let next = 0;
+        for (let b = 0; b < bands; b++) {
+          const a = workCut(before, n, b, bands);
+          const e = workCut(before, n, b + 1, bands);
+          expect(a).toBe(next);
+          next = e;
+          // A band holds its share, give or take the one row a cut cannot split.
+          expect(Math.abs(shareOf(before, a, e, n) - 1 / bands), `band ${b} of ${bands}`).toBeLessThanOrEqual(unit + 1e-9);
+        }
+        expect(next).toBe(n);
+      }
+    }
+    // Equal rows of the slot atlas would give the first band of 4 the items of its slots: far more than a
+    // quarter of their work (44% here), since the big module's slots lead the atlas.
+    const itemsOfFirstRows = (plan.slotCollide[Math.floor(rows / 4) * width] ?? 0) >>> COLLISION_ITEM_SHIFT;
+    const itemRows = Math.ceil(plan.itemCount / width);
+    const firstQuarter = shareOf(cuts.itemWorkBefore, 0, Math.floor(itemsOfFirstRows / width), itemRows);
+    expect(firstQuarter).toBeGreaterThan(1.5 / 4);
   });
 });
 

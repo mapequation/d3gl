@@ -1,6 +1,6 @@
 import type { Device, Framebuffer, SamplerProps, Texture } from "@luma.gl/core";
 import type { Model } from "@luma.gl/engine";
-import { REDUCE_MAX_LEVELS, reduceLayout, type ReduceLayout } from "../segments.js";
+import { REDUCE_MAX_LEVELS, bandRows, reduceLayout, type ReduceLayout } from "../segments.js";
 import { SLOT_TEXEL_GLSL } from "../textures.js";
 import { beginPass, fullScreenModel, NO_BLEND, type PassUniforms } from "./fullscreen.js";
 
@@ -278,6 +278,11 @@ export interface RangeTarget {
   readonly info: Texture;
 }
 
+/** Rows of a range target's atlas: its ranges, `width` per row — the domain {@link SegmentedReduce.query} cuts into bands. */
+export function rangeRows(table: RangeTarget): number {
+  return Math.max(1, Math.ceil(table.size / table.width));
+}
+
 const NEAREST: SamplerProps = { minFilter: "nearest", magFilter: "nearest" };
 /** The flat map reads nothing beyond the slot inputs: shared empty records, so a tick allocates none. */
 const NO_BINDINGS: Readonly<Record<string, Texture>> = Object.freeze({});
@@ -336,53 +341,117 @@ export class SegmentedReduce {
     this.queryModel = fullScreenModel(device, queryFs(map), this.queryUniforms, NO_BLEND);
   }
 
+  /** Rows of tree level 1 — the domain {@link buildLevel1} cuts into bands (0 when there is no tree). */
+  get level1Rows(): number {
+    return this.layout.levels[0]?.rows ?? 0;
+  }
+
   /**
    * Rebuild the tree over `input` and query every range of `table` into its target — the segment table's
    * `stats` and `box` for a {@link SegmentTable}. O(N + N/15) texel reads in L + 1 small passes (L = 4 at
    * 325k and at 1M), plus ≤ 30 reads per tree level per range for the query. Nothing is submitted (the
    * caller's work item submits). `bindings` / `uniforms` feed the map's own textures and uniforms (see
    * {@link ReduceMap}); they are set on the level-1 and query passes, the two that apply the map.
+   *
+   * The same work sliceable into row bands (#382), in this order: {@link buildLevel1} (the O(N) level),
+   * {@link buildUpper} (levels 2…L, O(N / 256)), {@link query} (O(ranges)). The result does not depend on
+   * the bands: each band writes its own rows of a pass, and a pass reads only passes before it.
    */
   run(input: ReduceInput, table: RangeTarget, bindings: Readonly<Record<string, Texture>> = NO_BINDINGS, uniforms: Readonly<PassUniforms> = NO_UNIFORMS): void {
+    this.buildLevel1(input, bindings, uniforms);
+    this.buildUpper(input.count);
+    this.query(input, table, bindings, uniforms);
+  }
+
+  /**
+   * The rows of tree level `k` (0-based) a reduction over `count` slots rebuilds: all of them at capacity;
+   * below it (a multilevel seed level, #353) only those a range inside `[0, count)` can read — level ℓ texel
+   * j < ⌊count / 16^ℓ⌋ reads only level ℓ−1 texels below ⌊count / 16^(ℓ−1)⌋ — and none past where no range can.
+   */
+  private levelRows(k: number, count: number): number {
+    const level = this.layout.levels[k];
+    if (!level) return 0;
+    if (count >= this.layout.capacity) return level.rows;
+    const reach = Math.floor(count / 16 ** (k + 1));
+    return reach === 0 ? 0 : Math.min(level.rows, Math.ceil(reach / this.layout.width));
+  }
+
+  /** Tree level 1 — the map over 16 slots per texel — over its rows of band `band` of `bands` (a scissor). */
+  buildLevel1(
+    input: ReduceInput,
+    bindings: Readonly<Record<string, Texture>> = NO_BINDINGS,
+    uniforms: Readonly<PassUniforms> = NO_UNIFORMS,
+    band = 0,
+    bands = 1,
+  ): void {
     const { layout, device } = this;
-    const partial = input.count < layout.capacity;
-    let reach = input.count; // tree texels of the current level a range inside [0, count) can read
-    layout.levels.forEach((level, k) => {
-      reach = Math.floor(reach / 16);
-      // Below capacity (a seed level, #353), stop where no range can read and rebuild only the rows it can:
-      // level ℓ texel j < ⌊count / 16^ℓ⌋ reads only level ℓ−1 texels below ⌊count / 16^(ℓ−1)⌋.
-      if (partial && reach === 0) return;
-      const rows = partial ? Math.min(level.rows, Math.ceil(reach / layout.width)) : level.rows;
+    const level = layout.levels[0];
+    const rows = this.levelRows(0, input.count);
+    if (!level || rows === 0) return;
+    const [r0, r1] = bandRows(band, bands, rows);
+    if (r1 <= r0) return;
+    const pass = beginPass(device, {
+      framebuffer: this.fbo[level.texture],
+      clear: false, // other levels share this texture: write only this level's rows
+      viewport: [0, level.rowOffset, layout.width, rows],
+      ...(bands > 1 ? { scissor: [0, level.rowOffset + r0, layout.width, r1 - r0] } : {}),
+    });
+    const u = this.level1Uniforms;
+    Object.assign(u, uniforms);
+    u["u_count"] = input.count;
+    u["u_posWidth"] = input.posWidth;
+    u["u_rowOffset"] = level.rowOffset;
+    u["u_size"] = level.size;
+    this.level1Model.setBindings(input.vel ? { ...bindings, u_pos: input.pos, u_vel: input.vel } : { ...bindings, u_pos: input.pos });
+    this.level1Model.draw(pass);
+    pass.end();
+  }
+
+  /** Tree levels 2…L over `count` slots, each from the one below — after every band of {@link buildLevel1}. */
+  buildUpper(count: number): void {
+    const { layout, device } = this;
+    for (let k = 1; k < layout.levels.length; k++) {
+      const level = layout.levels[k];
+      const src = layout.levels[k - 1];
+      if (!level || !src) throw new Error("SegmentedReduce: missing tree level");
+      const rows = this.levelRows(k, count);
+      if (rows === 0) return;
       const pass = beginPass(device, {
         framebuffer: this.fbo[level.texture],
         clear: false, // other levels share this texture: write only this level's rows
         viewport: [0, level.rowOffset, layout.width, rows],
       });
-      if (k === 0) {
-        const u = this.level1Uniforms;
-        Object.assign(u, uniforms);
-        u["u_count"] = input.count;
-        u["u_posWidth"] = input.posWidth;
-        u["u_rowOffset"] = level.rowOffset;
-        u["u_size"] = level.size;
-        this.level1Model.setBindings(input.vel ? { ...bindings, u_pos: input.pos, u_vel: input.vel } : { ...bindings, u_pos: input.pos });
-        this.level1Model.draw(pass);
-      } else {
-        const src = layout.levels[k - 1];
-        if (!src) throw new Error("SegmentedReduce: missing source level");
-        const u = this.levelUniforms;
-        u["u_rowOffset"] = level.rowOffset;
-        u["u_size"] = level.size;
-        u["u_srcRowOffset"] = src.rowOffset;
-        u["u_srcSize"] = src.size;
-        this.levelModel.setBindings({ u_srcSum: this.sum[src.texture], u_srcBox: this.box[src.texture] });
-        this.levelModel.draw(pass);
-      }
+      const u = this.levelUniforms;
+      u["u_rowOffset"] = level.rowOffset;
+      u["u_size"] = level.size;
+      u["u_srcRowOffset"] = src.rowOffset;
+      u["u_srcSize"] = src.size;
+      this.levelModel.setBindings({ u_srcSum: this.sum[src.texture], u_srcBox: this.box[src.texture] });
+      this.levelModel.draw(pass);
       pass.end();
-    });
+    }
+  }
 
-    // Range query: every table texel is written (padding gets the identities), so no clear.
-    const pass = beginPass(device, { framebuffer: table.target, clear: false });
+  /**
+   * The range query of every range of `table` over its target's rows of band `band` of `bands` — after
+   * {@link buildUpper}. Every table texel is written (padding gets the identities), so no clear.
+   */
+  query(
+    input: ReduceInput,
+    table: RangeTarget,
+    bindings: Readonly<Record<string, Texture>> = NO_BINDINGS,
+    uniforms: Readonly<PassUniforms> = NO_UNIFORMS,
+    band = 0,
+    bands = 1,
+  ): void {
+    const { device } = this;
+    const [r0, r1] = bandRows(band, bands, rangeRows(table));
+    if (r1 <= r0) return;
+    const pass = beginPass(device, {
+      framebuffer: table.target,
+      clear: false,
+      ...(bands > 1 ? { scissor: [0, r0, table.width, r1 - r0] } : {}),
+    });
     const u = this.queryUniforms;
     Object.assign(u, uniforms);
     u["u_count"] = input.count;

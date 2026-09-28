@@ -2,22 +2,23 @@ import type { Device, Framebuffer, SamplerProps, Texture } from "@luma.gl/core";
 import type { LayoutGraph } from "../force.js";
 import { NESTED, WARM_ALPHA, nestedAlphaDecay } from "../nested-layout.js";
 import { atlasWidth, pingPong, type PingPong } from "./textures.js";
-import { beginPass, type PassUniforms } from "./passes/fullscreen.js";
-import { SegmentedReduce, type RangeTarget, type ReduceMap } from "./passes/segmented-reduce.js";
-import { GridPyramid } from "./passes/grid-pyramid.js";
-import { RepulsionPass } from "./passes/repulsion.js";
+import { beginPass, type ClearColor, type PassTarget, type PassUniforms, type PassViewport } from "./passes/fullscreen.js";
+import { SegmentedReduce, rangeRows, type RangeTarget, type ReduceInput, type ReduceMap } from "./passes/segmented-reduce.js";
+import { GridPyramid, type PyramidBuildInput } from "./passes/grid-pyramid.js";
+import { RepulsionPass, type RepulsionInput } from "./passes/repulsion.js";
 import { NestedIntegratePass, NestedPredictPass, type NestedSlotInputs } from "./passes/nested.js";
-import { COLLISION_STEPS, CollisionGrid, collisionGridSide, type CollisionInputs } from "./passes/collision.js";
+import { COLLISION_STEPS, CollisionGrid, collisionGridSide, type CollisionPrepareInput } from "./passes/collision.js";
 import { COLLISION_LIST_MAX } from "./collision-plan.js";
-import { NestedComposePass } from "./passes/nested-compose.js";
+import { NestedComposePass, type ComposeInput } from "./passes/nested-compose.js";
 import { GpuSprings } from "./springs.js";
 import type { NestedSpringInputs } from "./passes/attraction.js";
 import { SegmentTable, type SegmentRow } from "./segment-table.js";
-import { TILE_MIN_SIDE, assertAtlasFits, packTiles, segmentSoftening, slotSegments, type SlotRange, type TileAtlas } from "./segments.js";
+import { TILE_MIN_SIDE, assertAtlasFits, bandRows, packTiles, segmentSoftening, slotSegments, type SlotRange, type TileAtlas } from "./segments.js";
 import { NESTED_MAX_SLOTS, gpuNestedSlotNeed, type GpuLayoutNeed } from "./device-caps.js";
 import type { PackedPositions } from "./async-readback.js";
 import type { StreamSolver } from "./gpu-stream.js";
-import { itemCostMs, type ItemCosts, type ItemKind } from "./frame-budget.js";
+import type { StreamStage } from "./stream-schedule.js";
+import { nestedPlan, type NestedPass, type NestedPlanSizes, type NestedStep } from "./nested-plan.js";
 import type { NestedSolverTopology } from "./nested-topology.js";
 import { EXACT_MAX } from "../nested-layout.js";
 
@@ -31,32 +32,37 @@ import { EXACT_MAX } from "../nested-layout.js";
 // tile-atlas grid pyramid with its per-segment traversal and the exact loop, the chunked CSR springs —
 // with the nested physics of `nested-layout.ts` (the same constants, {@link NESTED}):
 //
-// A solve tick is one stream tick (work items P, F_b, I) in the organise phase and one per collision
-// step in the compact phase. The heaviest pass, the collision gather, is cut into row bands like the
-// repulsion (one unsliced compact tick was 29 ms at 1M):
+// A solve tick is one stream tick in the organise phase and one per collision step in the compact phase.
+// A stream tick is a sequence of passes ({@link StreamStage}s), and the streaming transport cuts every one
+// of them into bands sized to the frame budget (#382) — so no work item is *estimated* above half the budget
+// (above the whole budget, for a pass whose every band pays more than a quarter of it in fixed cost), and no
+// frame above the budget, a frame that reads positions back included: the composition is sliced the same
+// way, as items of its own. A pass is never cut into more bands than its rows or 64 (`nested-plan.ts` has the
+// passes and their cost model):
 //
-// | stream tick                 | P                                                    | F_b                    | I                  |
-// |-----------------------------|------------------------------------------------------|------------------------|--------------------|
-// | organise (first 60%)        | reductions (box) → tile pyramid                      | clear force, repulsion, band b | predict v*; springs at x + v* (zero rest); integrate |
-// | compact, collision step 1   | predict; springs (rest lengths); integrate; reductions; collision cells, both tables' counts and rounds | collision work items, then resolve, of band b | swap |
-// | compact, collision step 2   | reductions; collision cells, both tables' counts and rounds | collision work items, then resolve, of band b | swap; next tick |
+// | stream tick                 | passes, in order                                                                  |
+// |-----------------------------|-----------------------------------------------------------------------------------|
+// | organise (first 60%)        | reduction (tree, query) → pyramid (scatter, levels) → repulsion → predict v* → [hub chunks] → springs at x + v* (zero rest) + integrate |
+// | compact, collision step 1   | predict → [hub chunks] → springs (rest lengths) + integrate → reduction → collision cells → class-cell count, rounds 0…7 → sub-cell count, rounds 0…11 → work items → resolve |
+// | compact, collision step 2   | reduction → collision cells → the scatters → work items → resolve                  |
+// | readback                    | reduction (weighted centroids) → reduction (extents) → composition                 |
 //
-// Each item submits once, after its render passes (#402), and a force clear is the first draw's `clear`
-// (a band's rows, the springs' whole target), never a pass of its own. The compact swap, and a gather band
-// without rows, encode nothing.
+// Each pass reads only what the passes before it wrote, and each band writes its own rows (or scatters its
+// own slots, in draw order, or computes its own work items), so the solve is bitwise the same for any
+// band counts. Each band of a pass that fills an accumulator clears its own rows as it opens it — the clear is
+// the first draw's `clear`, never a pass of its own (#402) — and the positions swap after the last band of the
+// pass that writes them (the integrate, the resolve). Each band is one work item, and submits once (#402).
 //
 // The composition (`passes/nested-compose.ts`) maps the local solutions into world discs and packs leaf
-// positions and module discs in node order, for the streaming readback ({@link prepareReadback}).
+// positions and module discs in node order, for the streaming readback ({@link readbackStages}). It has
+// its own reduction scratch and sums, so it can run between any two work items of a tick without
+// disturbing the tick's state.
 //
-// The collision gather's cost follows the contacts, not the leaves: a module of heavy-tailed radii can do
-// ten times the work per leaf of an even one. So its bands are cut at equal shares of the collision
-// plan's per-slot work estimate (`collision-plan.ts`), not at equal rows, and costed by the plan's total,
-// so that a band costs what the frame budget expects (#380).
-//
-// Not every item fits the frame budget. Two cannot be cut: compact step 1's P (4-5 ms at 325k, 7.5 ms at
-// 1M on an M1 Max) and the composition a copy frame adds (2.7-5.6 / 4.5-9.9 ms), which the frame reserves
-// but which never stops its first item. So a copy frame can carry up to ~12 ms of layout GPU work at 325k
-// and ~17 ms at 1M, against a 10 ms budget at 60 Hz (5 ms at 120 Hz).
+// The collision's cost follows the contacts, not the leaves: a module of heavy-tailed radii can do ten times
+// the work per leaf of an even one. Its work items and its resolve are costed by the collision plan's work
+// estimates (`collision-plan.ts`) and cut at equal shares of them, not at equal rows, so a band costs what
+// the frame budget expects (#380). Every item is bounded (32 cell visits or 256 pair tests), and so is every
+// slot's resolve, so no band waits on one long fragment.
 //
 // Not the CPU's: Jacobi instead of Gauss-Seidel links and collision pairs (every term reads one state),
 // and grid-pyramid Barnes-Hut instead of the CPU's adaptive quadtree for segments above 32 children (the
@@ -65,50 +71,11 @@ import { EXACT_MAX } from "../nested-layout.js";
 
 const NEAREST: SamplerProps = { minFilter: "nearest", magFilter: "nearest" };
 
+/** The force accumulator's clear, the first draw of each band that fills it (#402). */
+const CLEAR_ZERO: ClearColor = [0, 0, 0, 0];
+
 /** Barnes-Hut opening angle of the CPU nested solve's `repel()`. */
 const NESTED_THETA = 0.9;
-
-/**
- * GPU time per leaf of the organise ticks' work items, ns — measured on an M1 Max (ANGLE Metal) on the
- * synthetic Infomap-like maps (325,729 and 1,000,000 leaves): P 1.9 ms at 325k (reductions + tile
- * pyramid), a whole-atlas repulsion band 2.1 ms, I 1.6 ms (predict + springs + integrate).
- */
-const NESTED_ORGANISE_NS: ItemCosts = { prep: 4, force: 6, integrate: 4 };
-
-/**
- * The compact ticks' work items, measured on the same M1 Max over web-NotreDame's Infomap trees, the
- * synthetic 325k and 1M maps and one-module Zipf maps of 20,000 and 60,000 children (#380):
- *
- * - P (the solve tick's predict + springs + integrate on step 1, the reductions, the cell pass and the
- *   occupancy scatters) is 3.4-5.4 ms, 7.5 at 1M: a fixed ~3.2 ms of passes plus 4 ns per leaf;
- * - the unbanded gather is 4.0 ms plus 47 ps per unit of the collision plan's work estimate (its pair
- *   tests plus 16 per cell visit), within ±8% on all six maps (5.2-11.7 ms) — where the previous 13 ns per
- *   leaf was off by 0.06-1.1× between them (0.06× on the 20,000-child Zipf module: the frame stalls). The
- *   4 ms is the work items' pass (its longest serial chains); a map without items — every module small
- *   enough for single-item exact loops — has 0.3 ms instead (1.0 / 1.2 ms at 20k / 100k leaves, fence
- *   wait included);
- * - I is a swap.
- *
- * A slower GPU is caught by the frame budget's fences, as for the flat layout.
- */
-const NESTED_COMPACT = { prepMs: 3.2, prepNsPerLeaf: 4, gatherMs: 4, gatherMsWithoutItems: 0.3, gatherPsPerWork: 47, integrateNsPerLeaf: 0.2 } as const;
-
-/**
- * The share of the compact items' measured GPU time the frame budget is told. The per-leaf model this
- * replaces told it about half on web-NotreDame's Infomap trees (4.2 ms for a 9 ms gather, 3.3 / 1 ms for
- * a 5 / 3 ms P), and the fence gate — two frames in flight — absorbed that: those layouts streamed without
- * a blocked frame. Kept here, so they pace as before (2.1-2.2 s cold on the M1 Max), and now the same
- * factor on every map, where the per-leaf model's ranged 0.06-1.1 (0.06 on a 20,000-child Zipf module:
- * the gate blocked ~200 frames and frames stalled). At 1 — the budget told the whole measured time —
- * those trees take ~2.85 s instead.
- */
-const NESTED_COMPACT_BUDGET_SHARE = 0.5;
-
-/** Work units a slot adds to its band besides its search (its resolve): a cell visit's worth. */
-const NESTED_SLOT_BASE_WORK = 16;
-
-/** GPU time per leaf of a readback's composition (two reductions and the compose pass), ns: 4.7 ms at 325k. */
-const NESTED_READBACK_NS = 12;
 
 /**
  * The nested reduce map: in mode 1 each slot's `(rad² · x, rad² · y, rad², 1)` and box `(x, y, −x, −y)` —
@@ -242,9 +209,13 @@ export class GpuNestedLayout implements StreamSolver {
   private readonly segCollide: Texture;
   /** The segment table — S segments plus one range over every slot (the readback's finiteness check). */
   private readonly segments: SegmentTable;
-  /** Mode 2's target: each range's extent about its centroid (box x). */
+  /** The composition's own mode-1 target: each range's weighted-centroid sums and box, of the positions it composes. */
+  private readonly sums: { readonly stats: Texture; readonly box: Texture; readonly target: RangeTarget };
+  /** The composition's mode-2 target: each range's extent about its centroid (box x). */
   private readonly extent: { readonly stats: Texture; readonly box: Texture; readonly target: RangeTarget };
+  /** The solve's reduction (into the segment table) and the composition's own (tree scratch of its own). */
   private readonly reduce: SegmentedReduce;
+  private readonly composeReduce: SegmentedReduce;
   private readonly pyramid: GridPyramid | null;
   private readonly repulsion: RepulsionPass;
   private readonly springs: GpuSprings;
@@ -253,14 +224,28 @@ export class GpuNestedLayout implements StreamSolver {
   private readonly collision: CollisionGrid;
   private readonly compose: NestedComposePass;
   private readonly slotInputs: NestedSlotInputs;
-  private readonly gatherInput: CollisionInputs;
   private readonly springInputs: NestedSpringInputs;
+  /** The passes' inputs, created once; each band only points them at the current positions. */
+  private readonly collisionInputs: CollisionPrepareInput;
+  private readonly reduceInputs: ReduceInput;
+  private readonly pyramidInputs: PyramidBuildInput;
+  private readonly repulsionInputs: RepulsionInput;
+  private readonly composeInputs: ComposeInput;
   /**
-   * The nested map's textures per mode. Mode 2 reads mode 1's sums (the segment table's `stats`); mode 1
-   * renders into that texture, so it binds a stand-in there — a texture bound for sampling while it is
+   * The nested map's textures per mode. Mode 2 reads mode 1's sums (the composition's `sums.stats`); mode 1
+   * renders into a table's `stats`, so it binds a stand-in there — a texture bound for sampling while it is
    * the render target is a feedback loop, and WebGL drops the draw, whether the shader reads it or not.
    */
   private readonly reduceBindings: readonly [Record<string, Texture>, Record<string, Texture>];
+  /**
+   * The sizes its passes are cut over, read off the textures it built — what `nestedPlanSizes` derives from
+   * the topology alone, for checking the frame budget at a scale without a GPU.
+   */
+  readonly planSizes: NestedPlanSizes;
+  /** The passes of each kind of stream tick, and of a readback (see the file header). */
+  private readonly organisePlan: readonly NestedStage[];
+  private readonly compactPlans: readonly [readonly NestedStage[], readonly NestedStage[]];
+  private readonly readbackPlan: readonly NestedStage[];
   private readonly reduceUniforms: PassUniforms = { u_segTableWidth: 1, u_mode: 1 };
   private readonly rootX: number;
   private readonly rootY: number;
@@ -279,31 +264,6 @@ export class GpuNestedLayout implements StreamSolver {
 
   /** The readback's staging texture: leaf positions then module discs, in node order. */
   readonly packed: PackedPositions;
-  /**
-   * The frame budget's per-leaf band model, which it sizes its static band count by: the organise
-   * repulsion's, or the compact gather's plan-based estimate per leaf when that is heavier (see
-   * {@link itemCostMs} for the per-item estimates).
-   */
-  readonly itemCosts: ItemCosts;
-  /** The compact gather's unbanded GPU time estimate as the frame budget is told it, ms ({@link NESTED_COMPACT}). */
-  private readonly gatherMs: number;
-  /** Cumulative gather work up to each slot atlas row (`height + 1` entries): the compact bands' cuts. */
-  private readonly rowWork: Float64Array;
-
-  /** The next item's estimated GPU time, ms, for the stream tick the solve is at. */
-  itemCostMs(kind: ItemKind, bands: number): number {
-    const leaves = this.topo.leafCount;
-    if (this.organising) return itemCostMs(kind, leaves, bands, NESTED_ORGANISE_NS);
-    if (kind === "prep") return NESTED_COMPACT_BUDGET_SHARE * (NESTED_COMPACT.prepMs + (NESTED_COMPACT.prepNsPerLeaf * leaves) / 1e6);
-    if (kind === "force") return this.gatherMs / Math.max(1, bands);
-    return (NESTED_COMPACT.integrateNsPerLeaf * leaves) / 1e6;
-  }
-
-  /** Estimated GPU time of a readback's composition, ms. */
-  get readbackCostMs(): number {
-    return (NESTED_READBACK_NS * this.topo.leafCount) / 1e6;
-  }
-
   constructor(device: Device, plan: NestedLayoutPlan, options: GpuNestedLayoutOptions = {}) {
     const topo = plan.topo;
     this.device = device;
@@ -415,24 +375,23 @@ export class GpuNestedLayout implements StreamSolver {
         collide[12 * s + 11] = collision.segSubBase[s] ?? 0;
       }
       this.segCollide = own(device.createTexture({ width: collideWidth, height: collideRows, format: "rgba32uint", data: collide, mipLevels: 1, sampler: NEAREST }));
-      const extentTex = (): Texture => own(device.createTexture({ width: tw, height: th, format: "rgba32float", mipLevels: 1, sampler: NEAREST }));
-      const extentStats = extentTex();
-      const extentBox = extentTex();
-      this.extent = {
-        stats: extentStats,
-        box: extentBox,
-        target: {
-          target: own(device.createFramebuffer({ width: tw, height: th, colorAttachments: [extentStats, extentBox] })),
-          width: tw,
-          size: rows.length,
-          info: this.segments.info,
-        },
+      // The composition's own range targets (a table's atlas each): mode 1's sums and boxes, mode 2's extents.
+      const rangeTarget = (): { stats: Texture; box: Texture; target: RangeTarget } => {
+        const stats = own(device.createTexture({ width: tw, height: th, format: "rgba32float", mipLevels: 1, sampler: NEAREST }));
+        const box = own(device.createTexture({ width: tw, height: th, format: "rgba32float", mipLevels: 1, sampler: NEAREST }));
+        const target = own(device.createFramebuffer({ width: tw, height: th, colorAttachments: [stats, box] }));
+        return { stats, box, target: { target, width: tw, size: rows.length, info: this.segments.info } };
       };
+      this.sums = rangeTarget();
+      this.extent = rangeTarget();
 
       this.reduce = own(new SegmentedReduce(device, slots, NESTED_REDUCE_MAP));
+      this.composeReduce = own(new SegmentedReduce(device, slots, NESTED_REDUCE_MAP));
+      // Mode 1 renders into a table's stats and reads no sums (a stand-in: the extents); mode 2 reads the
+      // composition's mode-1 sums.
       this.reduceBindings = [
         { u_slotSeg: this.slotSeg, u_rad: this.radius, u_segSum: this.extent.stats },
-        { u_slotSeg: this.slotSeg, u_rad: this.radius, u_segSum: this.segments.stats },
+        { u_slotSeg: this.slotSeg, u_rad: this.radius, u_segSum: this.sums.stats },
       ];
       this.reduceUniforms["u_segTableWidth"] = tw;
       this.pyramid = atlas.levels.length > 0 ? own(new GridPyramid(device, atlas, false)) : null;
@@ -455,18 +414,6 @@ export class GpuNestedLayout implements StreamSolver {
       this.compose = own(new NestedComposePass(device, topo.nodeSlot, topo.leafCount, topo.depth, NESTED.FILL, NESTED.ONLY_CHILD));
       this.packed = { framebuffer: this.compose.framebuffer, width: this.compose.width, height: this.compose.height, extraFloats: this.compose.extraFloats };
 
-      // The compact gather's cost and its bands' cuts, from the collision plan's per-slot work.
-      const gatherFloorMs = collision.itemCount > 0 ? NESTED_COMPACT.gatherMs : NESTED_COMPACT.gatherMsWithoutItems;
-      this.gatherMs = NESTED_COMPACT_BUDGET_SHARE * (gatherFloorMs + (NESTED_COMPACT.gatherPsPerWork * collision.gatherWork) / 1e9);
-      const gatherNsPerLeaf = (this.gatherMs * 1e6) / Math.max(1, topo.leafCount);
-      this.itemCosts = { ...NESTED_ORGANISE_NS, force: Math.max(NESTED_ORGANISE_NS.force, gatherNsPerLeaf) };
-      this.rowWork = new Float64Array(height + 1);
-      for (let r = 0; r < height; r++) {
-        let work = 0;
-        for (let i = r * width; i < Math.min(slots, (r + 1) * width); i++) work += (collision.slotWork[i] ?? 0) + NESTED_SLOT_BASE_WORK;
-        this.rowWork[r + 1] = (this.rowWork[r] ?? 0) + work;
-      }
-
       this.slotInputs = {
         count: slots,
         width,
@@ -477,7 +424,9 @@ export class GpuNestedLayout implements StreamSolver {
         alphaWarm: WARM_ALPHA,
       };
       this.springInputs = { vstar: this.vstar, radius: this.radius, rest: 0, pad: NESTED.PAD };
-      this.gatherInput = {
+      this.collisionInputs = {
+        pos: this.pos.readTex,
+        radius: this.radius,
         slotSeg: this.slotSeg,
         segments: this.segments,
         segNested: this.segNested,
@@ -489,6 +438,62 @@ export class GpuNestedLayout implements StreamSolver {
         rows: height,
         pad: NESTED.PAD,
       };
+      this.reduceInputs = { pos: this.pos.readTex, posWidth: width, count: slots };
+      this.pyramidInputs = { posTex: this.pos.readTex, width, count: slots, segments: this.segments, slotSeg: this.slotSeg };
+      this.repulsionInputs = {
+        posTex: this.pos.readTex,
+        count: slots,
+        width,
+        theta: NESTED_THETA,
+        segments: this.segments,
+        pyramid: this.pyramid,
+        slotSeg: this.slotSeg,
+      };
+      this.composeInputs = {
+        pos: this.pos.readTex,
+        radius: this.radius,
+        slotSeg: this.slotSeg,
+        width,
+        segments: this.segments,
+        segSum: this.sums.stats,
+        segExtent: this.extent.box,
+        segNested: this.segNested,
+        rootX: this.rootX,
+        rootY: this.rootY,
+        rootRadius: topo.rootRadius,
+      };
+
+      // ── The passes of each stream tick and of a readback (see the file header) ──
+      this.planSizes = {
+        slots,
+        slotRows: height,
+        treeRows: this.reduce.level1Rows,
+        tableRows: rangeRows(this.segments),
+        levelRows: this.pyramid?.levelRows ?? 0,
+        hubChunks: this.springs.hubChunkCount,
+        hubRows: this.springs.hubRows,
+        binned: collision.binnedSlots.length,
+        scatterRows: collision.binnedSlots.length > 0 ? this.collision.scatterRows : 0,
+        itemRows: collision.itemCount > 0 ? this.collision.itemRows : 0,
+        itemWork: collision.itemWork,
+        resolveWork: collision.resolveWork,
+        composed: Math.ceil(topo.leafCount / 2) + topo.treeSize - topo.leafCount,
+        composeRows: this.compose.height,
+      };
+      const steps = nestedPlan(this.planSizes);
+      // Each band is one work item, and submits once, after its passes (#402).
+      const bind = (list: readonly NestedStep[]): NestedStage[] =>
+        list.map((step) => {
+          const pass = this.passOf(step);
+          const run = (band: number, bands: number): void => {
+            pass(band, bands);
+            device.submit();
+          };
+          return { pass: step.pass, costMs: step.costMs, fixedMs: step.fixedMs, rows: step.rows, run };
+        });
+      this.organisePlan = bind(steps.organise);
+      this.compactPlans = [bind(steps.compact[0]), bind(steps.compact[1])];
+      this.readbackPlan = bind(steps.readback);
     } catch (error) {
       this.destroy();
       throw error;
@@ -502,7 +507,7 @@ export class GpuNestedLayout implements StreamSolver {
     return this.topo.leafCount;
   }
 
-  /** Rows of the slot atlas — the domain the repulsion bands cut. */
+  /** Rows of the slot atlas — the domain most passes' bands cut. */
   get atlasRows(): number {
     return this.height;
   }
@@ -520,14 +525,41 @@ export class GpuNestedLayout implements StreamSolver {
     return this.organise + COLLISION_STEPS * Math.max(0, this.topo.iterations - this.organise);
   }
 
-  /** Run `ticks` whole solve ticks, every item unsliced — for tests and one-off solves. */
+  /** The passes of the stream tick the solve is at (see the file header); the last one's last band ends it. */
+  tickStages(): readonly NestedStage[] {
+    if (this.organising) return this.organisePlan;
+    return this.step === 0 ? this.compactPlans[0] : this.compactPlans[1];
+  }
+
+  /**
+   * The passes of a readback: the weighted centroids and boxes (whose whole-slot range the harvest checks
+   * for finiteness), the extents, then the composition into the staging texture. They read the positions
+   * and write only the composition's own state, so they may run between any two work items of a tick.
+   */
+  readbackStages(): readonly NestedStage[] {
+    return this.readbackPlan;
+  }
+
+  /** The composition ran as {@link readbackStages}: nothing is left to do before the copy. */
+  prepareReadback(): void {}
+
+  /** Run `ticks` whole stream ticks, every pass unsliced — for tests and one-off solves. */
+  runStreamTicks(ticks: number): void {
+    for (let t = 0; t < ticks; t++) for (const stage of this.tickStages()) stage.run(0, 1);
+  }
+
+  /** Run `ticks` whole solve ticks, every pass unsliced — for tests and one-off solves. */
   runTicks(ticks: number): void {
     const until = this.tick + ticks;
-    while (this.tick < until) {
-      this.beginTick();
-      this.forceBand(0, 1);
-      this.integrate();
-    }
+    while (this.tick < until) for (const stage of this.tickStages()) stage.run(0, 1);
+  }
+
+  /**
+   * Compose the current local positions into world positions and discs, packed in node order in the
+   * staging texture — every readback pass, unsliced (tests and one-off reads; the stream slices them).
+   */
+  composeReadback(): void {
+    for (const stage of this.readbackPlan) stage.run(0, 1);
   }
 
   get positionTexture(): Texture {
@@ -542,8 +574,9 @@ export class GpuNestedLayout implements StreamSolver {
     return this.width;
   }
 
+  /** The composition's weighted-centroid sums and boxes: a readback carries their whole-slot range. */
   get segmentStats(): { readonly stats: Texture; readonly box: Texture } {
-    return this.segments;
+    return this.sums;
   }
 
   /** The whole-slot range (the last row of the table): its stats refuse a non-finite readback. */
@@ -556,178 +589,13 @@ export class GpuNestedLayout implements StreamSolver {
     return this.tick < this.organise;
   }
 
-  /** Work item **P** of the current stream tick (see the file header). */
-  beginTick(): void {
-    if (this.organising) {
-      this.runReduce(1, this.segments);
-      this.pyramid?.build({
-        posTex: this.pos.readTex,
-        width: this.width,
-        count: this.slots,
-        segments: this.segments,
-        slotSeg: this.slotSeg,
-      });
-      this.device.submit();
-      return;
-    }
-    if (this.step === 0) this.advance(false);
-    // This collision step's cells and occupancy, from the positions it starts at.
-    this.runReduce(1, this.segments);
-    this.collision.prepare({ ...this.gatherInput, pos: this.pos.readTex, radius: this.radius });
-    this.device.submit();
-  }
-
-  /**
-   * Work item **F_b**: band `band` of `bands` of the slot atlas's rows — the repulsion over equal rows
-   * (organise), which clears its rows of the force texture as it opens it, or the collision gather over
-   * rows of equal estimated work (compact).
-   */
-  forceBand(band: number, bands: number): void {
-    if (!this.organising) {
-      const [r0, r1] = this.gatherBandRows(band, bands);
-      if (r1 <= r0) return;
-      this.collision.gather(this.posFbo(this.posParity ^ 1), this.gatherInput, r0, r1);
-      this.device.submit();
-      return;
-    }
-    const r0 = Math.floor((band * this.height) / bands);
-    const r1 = Math.floor(((band + 1) * this.height) / bands);
-    if (r1 <= r0) return;
-    const pass = beginPass(this.device, {
-      framebuffer: this.forceFbo,
-      clear: [0, 0, 0, 0],
-      ...(bands > 1 ? { scissor: [0, r0, this.width, r1 - r0] } : {}),
-    });
-    this.repulsion.run(pass, {
-      posTex: this.pos.readTex,
-      count: this.slots,
-      width: this.width,
-      theta: NESTED_THETA,
-      segments: this.segments,
-      pyramid: this.pyramid,
-      slotSeg: this.slotSeg,
-    });
-    pass.end();
-    this.device.submit();
-  }
-
-  /**
-   * Work item **I**: in the organise phase predict, springs and integrate; in the compact phase the swap
-   * to the collided positions. The last item of a solve tick advances the alpha schedules.
-   */
-  integrate(): void {
-    if (this.organising) {
-      this.advance(true);
-      this.device.submit();
-      this.endTick();
-      return;
-    }
-    this.swapPos(); // the gather bands wrote every slot of the other position texture
-    this.step++;
-    if (this.step >= COLLISION_STEPS) {
-      this.step = 0;
-      this.endTick();
-    }
-  }
-
-  /**
-   * Predict v*, gather the springs at x + v* (zero rest while organising) into the force texture — cleared as
-   * the springs' pass opens it, after the predict has read the force it held — integrate (MRT), swap. The
-   * item that calls it submits.
-   */
-  private advance(organising: boolean): void {
-    const input = this.slotInputs;
-    input.alphaCold = this.alphaCold;
-    input.alphaWarm = this.alphaWarm;
-
-    let pass = beginPass(this.device, { framebuffer: this.vstarFbo, clear: false });
-    this.predict.run(pass, this.pos.readTex, this.vel.readTex, this.force, organising, input);
-    pass.end();
-
-    const springs = this.springInputs;
-    springs.rest = organising ? 0 : 1;
-    this.springs.prepare(this.pos.readTex, this.width, springs);
-    pass = beginPass(this.device, { framebuffer: this.forceFbo, clear: [0, 0, 0, 0] });
-    this.springs.draw(pass, this.pos.readTex, { count: this.slots, width: this.width, attraction: 1 }, null, springs);
-    pass.end();
-
-    const [atPos0, atPos1] = this.integrateFbos;
-    const pair = this.posParity === 0 ? atPos0 : atPos1;
-    const fbo = this.velParity === 0 ? pair[0] : pair[1];
-    pass = beginPass(this.device, { framebuffer: fbo, clear: false });
-    this.integratePass.run(pass, this.pos.readTex, this.vstar, this.force, input);
-    pass.end();
-    this.swapPos();
-    this.vel.swap();
-    this.velParity ^= 1;
-  }
-
-  /**
-   * The slot atlas rows `[r0, r1)` compact band `band` of `bands` gathers: rows of about `1 / bands` of the
-   * collision plan's estimated work each (a band cannot split a row), tiling the atlas in order.
-   */
-  gatherBandRows(band: number, bands: number): [number, number] {
-    return [this.workRow(band, bands), this.workRow(band + 1, bands)];
-  }
-
-  /**
-   * The first slot atlas row of compact band `band` of `bands`: the first row whose cumulative gather work
-   * reaches `band / bands` of the total (0 for band 0, the atlas height for band `bands`), so consecutive
-   * bands tile the rows in order.
-   */
-  private workRow(band: number, bands: number): number {
-    if (band <= 0) return 0;
-    if (band >= bands) return this.height;
-    const target = ((this.rowWork[this.height] ?? 0) * band) / bands;
-    let lo = 0;
-    let hi = this.height;
-    while (lo < hi) {
-      const mid = (lo + hi) >> 1;
-      if ((this.rowWork[mid] ?? 0) < target) lo = mid + 1;
-      else hi = mid;
-    }
-    return lo;
-  }
-
-  /** A solve tick is complete: advance the alpha schedules. */
-  private endTick(): void {
-    this.alphaCold -= this.alphaCold * this.decayCold;
-    this.alphaWarm -= this.alphaWarm * this.decayWarm;
-    this.tick++;
-  }
-
-  /**
-   * Compose the current local positions into world positions and discs, packed in node order for the
-   * readback: the weighted centroids and boxes (mode 1, whose whole-slot range the harvest checks for
-   * finiteness), the extents (mode 2), then the composition. Positions change only in {@link integrate},
-   * so this is safe at any point of a tick; it recomputes the reductions itself either way. It encodes and
-   * does not submit: the readback's copy submits (or {@link readComposed}, synchronously).
-   */
-  prepareReadback(): void {
-    this.runReduce(1, this.segments);
-    this.runReduce(2, this.extent.target);
-    this.compose.run({
-      pos: this.pos.readTex,
-      radius: this.radius,
-      slotSeg: this.slotSeg,
-      width: this.width,
-      segments: this.segments,
-      segExtent: this.extent.box,
-      segNested: this.segNested,
-      rootX: this.rootX,
-      rootY: this.rootY,
-      rootRadius: this.topo.rootRadius,
-    });
-  }
-
   /**
    * Compose and read back synchronously — for tests and one-off reads; the streaming transport never
    * calls it (it reads through a fenced PBO). `positions` gets the leaves' world positions (`2 · leaves`
    * floats), `discs` (optional) every module's world disc as `(cx, cy, r, 0)` (`4 · modules` floats).
    */
   readComposed(positions: Float32Array, discs?: Float32Array): void {
-    this.prepareReadback();
-    this.device.submit();
+    this.composeReadback();
     const { width, height, framebuffer } = this.compose;
     const pixels = this.device.readPixelsToArrayWebGL(framebuffer, { sourceWidth: width, sourceHeight: height });
     if (!(pixels instanceof Float32Array)) throw new Error("GpuNestedLayout: expected a float readback");
@@ -741,11 +609,11 @@ export class GpuNestedLayout implements StreamSolver {
   /**
    * Tests only (a layout built with `collisionStats`): what the current collision step does per slot,
    * summed over its work items — `(cells visited, pairs tested, grid partners pushed, 1 exact slot / 2
-   * overflow)`, 4 floats per slot — from the state its work item P prepared (call it after
-   * {@link beginTick} of a compact tick).
+   * overflow)`, 4 floats per slot — from the state its passes prepared (call it once a compact tick has run
+   * its passes up to its work items).
    */
   collisionStats(): Float32Array {
-    return this.collision.gatherStats(this.gatherInput);
+    return this.collision.gatherStats(this.collisionInput());
   }
 
   /** The slots' local positions (each in its parent's unit disc), synchronously — for tests: `2 · slots` floats. */
@@ -765,16 +633,187 @@ export class GpuNestedLayout implements StreamSolver {
     this.owned.length = 0;
   }
 
+  // ── The passes (each over its rows of band `band` of `bands`) ─────────────────
+
+  /** The pass a step of the plan runs, as a band function. */
+  private passOf(step: NestedStep): (band: number, bands: number) => void {
+    const { organising, index } = step;
+    switch (step.pass) {
+      case "tree":
+        return step.readback ? (band, bands) => this.composeTree(index === 2 ? 2 : 1, band, bands) : (band, bands) => this.solveTree(band, bands);
+      case "query":
+        return step.readback ? (band, bands) => this.composeQuery(index === 2 ? 2 : 1, band, bands) : (band, bands) => this.solveQuery(band, bands);
+      case "scatter":
+        return (band, bands) => this.pyramid?.scatter(this.pyramidInput(), band, bands);
+      case "levels":
+        return (band, bands) => this.pyramid?.reduceLevels(undefined, band, bands);
+      case "repulsion":
+        return (band, bands) => this.repulsionBand(band, bands);
+      case "predict":
+        return (band, bands) => this.predictBand(organising, band, bands);
+      case "hubs":
+        return (band, bands) => this.hubsBand(organising, band, bands);
+      case "springs":
+        return (band, bands) => this.springsBand(organising, band, bands);
+      case "cells":
+        return (band, bands) => this.collision.cells(this.collisionInput(), band, bands);
+      case "cellScatter":
+        return (band, bands) => this.collision.scatter(0, index, this.width, band, bands);
+      case "subScatter":
+        return (band, bands) => this.collision.scatter(1, index, this.width, band, bands);
+      case "items":
+        return (band, bands) => this.collision.items(this.collisionInput(), band, bands);
+      case "resolve":
+        return (band, bands) => this.resolveBand(band, bands);
+      case "compose":
+        return (band, bands) => this.composeBand(band, bands);
+    }
+  }
+
+  /** The solve's reduction, tree level 1: each segment's weighted centroid and box (the pyramid's and the grid's geometry). */
+  private solveTree(band: number, bands: number): void {
+    this.reduceUniforms["u_mode"] = 1;
+    this.reduce.buildLevel1(this.reduceInput(), this.reduceBindings[0], this.reduceUniforms, band, bands);
+  }
+
+  /** The solve's reduction: levels 2…L (first band), then the range query into the segment table. */
+  private solveQuery(band: number, bands: number): void {
+    this.reduceUniforms["u_mode"] = 1;
+    if (band === 0) this.reduce.buildUpper(this.slots);
+    this.reduce.query(this.reduceInput(), this.segments, this.reduceBindings[0], this.reduceUniforms, band, bands);
+  }
+
+  /** The composition's reduction, tree level 1: mode 1 (weighted centroids, boxes) or mode 2 (extents). */
+  private composeTree(mode: 1 | 2, band: number, bands: number): void {
+    this.reduceUniforms["u_mode"] = mode;
+    this.composeReduce.buildLevel1(this.reduceInput(), this.reduceBindings[mode - 1], this.reduceUniforms, band, bands);
+  }
+
+  /** The composition's reduction: levels 2…L (first band), then the range query into its own sums (mode 1) or the extents (mode 2). */
+  private composeQuery(mode: 1 | 2, band: number, bands: number): void {
+    this.reduceUniforms["u_mode"] = mode;
+    if (band === 0) this.composeReduce.buildUpper(this.slots);
+    const table = mode === 1 ? this.sums.target : this.extent.target;
+    this.composeReduce.query(this.reduceInput(), table, this.reduceBindings[mode - 1], this.reduceUniforms, band, bands);
+  }
+
+  /** The composition + pack into the staging texture, from the composition's sums and extents. */
+  private composeBand(band: number, bands: number): void {
+    const input = this.composeInputs;
+    input.pos = this.pos.readTex;
+    this.compose.run(input, band, bands);
+  }
+
+  /** Repulsion into the force accumulator, each band clearing its own rows as it opens it. */
+  private repulsionBand(band: number, bands: number): void {
+    const [r0, r1] = bandRows(band, bands, this.height);
+    if (r1 <= r0) return;
+    const pass = beginPass(this.device, this.slotTarget(this.forceFbo, band, bands, CLEAR_ZERO));
+    const input = this.repulsionInputs;
+    input.posTex = this.pos.readTex;
+    this.repulsion.run(pass, input);
+    pass.end();
+  }
+
+  /** PREDICT v* — adding the repulsion sum while `organising`. */
+  private predictBand(organising: boolean, band: number, bands: number): void {
+    const input = this.slotInputs;
+    input.alphaCold = this.alphaCold;
+    input.alphaWarm = this.alphaWarm;
+    const pass = beginPass(this.device, this.slotTarget(this.vstarFbo, band, bands));
+    this.predict.run(pass, this.pos.readTex, this.vel.readTex, this.force, organising, input);
+    pass.end();
+  }
+
+  /** The springs' hub chunk partials at x + v* (zero rest while organising), over the chunk atlas rows. */
+  private hubsBand(organising: boolean, band: number, bands: number): void {
+    const springs = this.springInputs;
+    springs.rest = organising ? 0 : 1;
+    this.springs.prepare(this.pos.readTex, this.width, springs, band, bands);
+  }
+
+  /**
+   * The springs at x + v* (zero rest while organising) into the force accumulator — each band clearing its
+   * own rows as it opens it, after the predict has read the force they held — then the integrate of the same rows (MRT), which reads only its own texel. The last band swaps
+   * to the new positions and velocities; in the organise phase that ends the solve tick.
+   */
+  private springsBand(organising: boolean, band: number, bands: number): void {
+    const input = this.slotInputs;
+    input.alphaCold = this.alphaCold;
+    input.alphaWarm = this.alphaWarm;
+    const springs = this.springInputs;
+    springs.rest = organising ? 0 : 1;
+    let pass = beginPass(this.device, this.slotTarget(this.forceFbo, band, bands, CLEAR_ZERO));
+    this.springs.draw(pass, this.pos.readTex, { count: this.slots, width: this.width, attraction: 1 }, null, springs);
+    pass.end();
+
+    const [atPos0, atPos1] = this.integrateFbos;
+    const pair = this.posParity === 0 ? atPos0 : atPos1;
+    const fbo = this.velParity === 0 ? pair[0] : pair[1];
+    pass = beginPass(this.device, this.slotTarget(fbo, band, bands));
+    this.integratePass.run(pass, this.pos.readTex, this.vstar, this.force, input);
+    pass.end();
+    if (band < bands - 1) return;
+    this.swapPos();
+    this.vel.swap();
+    this.velParity ^= 1;
+    if (organising) this.endTick();
+  }
+
+  /**
+   * The collision resolve into the other position texture. The last band swaps to the collided positions
+   * and ends the collision step — and after {@link COLLISION_STEPS} of them, the solve tick.
+   */
+  private resolveBand(band: number, bands: number): void {
+    this.collision.resolve(this.posFbo(this.posParity ^ 1), this.collisionInput(), band, bands);
+    if (band < bands - 1) return;
+    this.swapPos(); // the resolve bands wrote every slot of the other position texture
+    this.step++;
+    if (this.step >= COLLISION_STEPS) {
+      this.step = 0;
+      this.endTick();
+    }
+  }
+
+  /** A solve tick is complete: advance the alpha schedules. */
+  private endTick(): void {
+    this.alphaCold -= this.alphaCold * this.decayCold;
+    this.alphaWarm -= this.alphaWarm * this.decayWarm;
+    this.tick++;
+  }
+
   // ── Internals ──────────────────────────────────────────────────────────────
 
-  private runReduce(mode: 1 | 2, table: RangeTarget): void {
-    this.reduceUniforms["u_mode"] = mode;
-    this.reduce.run(
-      { pos: this.pos.readTex, posWidth: this.width, count: this.slots },
-      table,
-      mode === 1 ? this.reduceBindings[0] : this.reduceBindings[1],
-      this.reduceUniforms,
-    );
+  /**
+   * A pass into a slot-atlas framebuffer over the rows of band `band` of `bands` (a scissor; none when
+   * whole), clearing them first with `clear` (the scissor limits the clear to the band's rows).
+   */
+  private slotTarget(framebuffer: Framebuffer, band: number, bands: number, clear: ClearColor | false = false): PassTarget {
+    if (bands <= 1) return clear ? { framebuffer, clear } : { framebuffer, clear: false };
+    const [r0, r1] = bandRows(band, bands, this.height);
+    const scissor: PassViewport = [0, r0, this.width, r1 - r0];
+    return clear ? { framebuffer, clear, scissor } : { framebuffer, clear: false, scissor };
+  }
+
+  /** The reductions' input, at the current positions. */
+  private reduceInput(): ReduceInput {
+    const input = this.reduceInputs;
+    input.pos = this.pos.readTex;
+    return input;
+  }
+
+  /** The pyramid scatter's input, at the current positions. */
+  private pyramidInput(): PyramidBuildInput {
+    const input = this.pyramidInputs;
+    input.posTex = this.pos.readTex;
+    return input;
+  }
+
+  /** The collision passes' inputs, at the current positions. */
+  private collisionInput(): CollisionPrepareInput {
+    const input = this.collisionInputs;
+    input.pos = this.pos.readTex;
+    return input;
   }
 
   /** The framebuffer of the position texture that is the read side at parity `p`. */
@@ -786,4 +825,9 @@ export class GpuNestedLayout implements StreamSolver {
     this.pos.swap();
     this.posParity ^= 1;
   }
+}
+
+/** A pass of the nested solve's plan bound to this layout: a {@link StreamStage} that names its pass (tests read it). */
+export interface NestedStage extends StreamStage {
+  readonly pass: NestedPass;
 }

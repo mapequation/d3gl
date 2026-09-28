@@ -2,12 +2,15 @@ import type { Device, Framebuffer, RenderPass, RenderPipelineParameters, Sampler
 import { Model } from "@luma.gl/engine";
 import { SLOT_TEXEL_GLSL, atlasWidth } from "../textures.js";
 import { SEGMENT_OF_GLSL, segmentDefines, type SegmentTable } from "../segment-table.js";
+import { bandRows, bandSlots } from "../segments.js";
 import {
   COLLISION_GLSL,
   COLLISION_ITEM_SHIFT,
   COLLISION_LIST_MAX,
   COLLISION_ITEMIZED,
   COLLISION_PART_PAIRS,
+  collisionCuts,
+  workCut,
   COLLISION_PART_VISITS,
   type CollisionPlan,
 } from "../collision-plan.js";
@@ -41,10 +44,9 @@ import { ADDITIVE_BLEND, beginPass, fullScreenModel, NO_BLEND, type PassUniforms
 //    smallest occupants in order, next to an ADD-blend count. The occupants of the buckets with more than
 //    K are then enumerated again by sub-cell into the sub-cell table (the same scatters; every other slot
 //    is culled in the vertex shader).
-// 2. **Gather** (work items F_b, in row bands of the slot atlas): per band, the work items of its slots —
-//    each a slice of one grid slot's cells or of a large exact slot's segment, summing the pushes it
-//    finds — then its slots' resolve into their new positions: a slot sums its items, or runs its exact
-//    loop when that is a single item. A search visits a dense cell's sub-cells in its place, and keeps a touching occupant only
+// 2. **Gather**: the work items — each a slice of one grid slot's cells or of a large exact slot's segment,
+//    summing the pushes it finds — then every slot's resolve into its new position: a slot sums its items,
+//    or runs its exact loop when that is a single item. A search visits a dense cell's sub-cells in its place, and keeps a touching occupant only
 //    when its class and cell are the visited ones (buckets are shared by hash collisions; a touching
 //    occupant from another cell is counted at its own). A search that meets a sub-cell with more than K
 //    occupants redoes its slice as an exact loop over the segment restricted to the partners whose cells
@@ -54,6 +56,13 @@ import { ADDITIVE_BLEND, beginPass, fullScreenModel, NO_BLEND, type PassUniforms
 // Round storage, per table: K / 4 rgba32float textures, round r in texture r % (K / 4), channel r / (K / 4).
 // A round writes EMPTY to its other channels, which MIN leaves unchanged, and reads round r − 1 from
 // another texture — never the one it renders into. Cleared to EMPTY and the counts to 0 each step.
+//
+// Every pass is sliceable into bands (#382), each band its own render pass, and the step does not
+// depend on the bands: the cell pass and the resolve write their own rows of the slot atlas; a scatter's
+// bands draw its own range of the binned slots, in order, and ADD of integer counts and MIN are exact in
+// any order; the item pass's bands compute their own items. The items are cut at equal shares of their
+// estimated work and the resolve's rows at equal shares of its own (the plan's), so a band costs what its
+// share of the estimate says, whichever slots it holds (#380).
 
 /**
  * Rounds of occupant enumeration K of the class-cell table (a multiple of 4, at least 8): a class cell with
@@ -173,6 +182,7 @@ uniform highp sampler2D u_prev;      // round r − 1 (rounds only)
 uniform highp sampler2D u_cellCount; // the class-cell counts (the sub-cell table's cull)
 uniform int u_width;
 uniform int u_binnedWidth;
+uniform int u_first;                 // the first binned slot of this draw (a band of them, #382)
 uniform vec2 u_atlas;                // this table's atlas size
 uniform int u_sub;                   // 0: the class-cell table; 1: the sub-cell table
 uniform int u_round;                 // −1: the count pass; r ≥ 0: round r
@@ -182,7 +192,7 @@ ${SLOT_TEXEL_GLSL}
 ${COMMON_GLSL}
 void main() {
   gl_PointSize = 1.0;
-  int slot = int(texelFetch(u_binned, slotTexel(gl_VertexID, u_binnedWidth), 0).r);
+  int slot = int(texelFetch(u_binned, slotTexel(u_first + gl_VertexID, u_binnedWidth), 0).r);
   uvec4 key = texelFetch(u_key, slotTexel(slot, u_width), 0);
   v_id = float(slot);
   ivec2 cell = atlasTexel(key.y & BUCKET_LIMIT, u_bucketShift);
@@ -654,9 +664,10 @@ interface StatsPasses {
 
 /**
  * The collision grid's textures and passes, created once for a slot atlas and a {@link CollisionPlan}. A
- * Jacobi collision step is {@link prepare} (the cell pass, then per table a count scatter and K round
- * scatters), then {@link gather} — the work items and the resolve of each row band of the slot atlas, each
- * its own render pass. Nothing is allocated or submitted per step (the caller's work item submits, #402).
+ * Jacobi collision step is {@link prepare} (the {@link cells} pass, then per table a count scatter and K
+ * round {@link scatter}s), then {@link gather} (the work {@link items}, then the {@link resolve}) — each pass
+ * sliceable into bands, each band its own render pass (#382). Nothing is allocated or submitted per step
+ * (the caller's work item submits, #402).
  *
  * Memory: the key 16 B and the disc 16 B per slot atlas texel; the work items 8 B and their partial sums
  * 8 B per item-atlas texel (the parts of the slots cut into more than one); 4 B per binned slot (the
@@ -670,13 +681,17 @@ export class CollisionGrid {
   private readonly disc: Texture;
   private readonly keyFbo: Framebuffer;
   /** The class-cell table and the sub-cell table. */
-  private readonly cells: BucketTable;
+  private readonly cells_: BucketTable;
   private readonly subs: BucketTable;
-  /** The binned slots (the scatters' points). */
+  /** The binned slots (the scatters' points), and their atlas width. */
   private readonly binned: Texture;
   private readonly binnedCount: number;
+  private readonly binnedWidth: number;
+  /** Where the item and resolve bands are cut: their cumulative estimated work (the plan's, `collisionCuts`). */
+  private readonly itemWorkBefore: Float64Array;
+  private readonly resolveWorkBefore: Float64Array;
   /** The work items `(slot, part | parts << 16)`, and each item's partial sum. */
-  private readonly items: Texture;
+  private readonly items_: Texture;
   private readonly partial: Texture;
   private readonly partialFbo: Framebuffer;
   /** Per slot, the work items of the slots before it (the plan's, for the bands' item ranges). */
@@ -695,8 +710,11 @@ export class CollisionGrid {
   private readonly owned: readonly { destroy(): void }[];
   /** The work-item atlas: its width (the slot atlas's) and rows. */
   private readonly itemWidth: number;
-  private readonly itemRows: number;
+  private readonly itemRows_: number;
+  /** The search passes' texture bindings, filled once and pointed at each step's inputs (no record per band). */
+  private readonly searchBindings: Record<string, Texture>;
   private readonly itemCount: number;
+  private readonly slotHeight: number;
 
   constructor(device: Device, slotWidth: number, slotHeight: number, plan: CollisionPlan, options: CollisionGridOptions = {}) {
     if (plan.bucketCount > BUCKET_LIMIT) throw new Error(`CollisionGrid: ${plan.bucketCount} buckets, beyond ${BUCKET_LIMIT}`);
@@ -704,6 +722,8 @@ export class CollisionGrid {
     const binnedSlots = plan.binnedSlots;
     this.binnedCount = binnedSlots.length;
     const bw = atlasWidth(Math.max(1, binnedSlots.length));
+    this.binnedWidth = bw;
+    this.slotHeight = slotHeight;
     const binnedData = new Uint32Array(bw * Math.max(1, Math.ceil(binnedSlots.length / bw)));
     binnedData.set(binnedSlots);
     this.itemCount = plan.itemCount;
@@ -712,10 +732,13 @@ export class CollisionGrid {
       this.itemsBefore[i] = word >>> COLLISION_ITEM_SHIFT;
     });
     this.itemsBefore[plan.slotCollide.length] = plan.itemCount;
+    const cuts = collisionCuts(plan, slotWidth);
+    this.itemWorkBefore = cuts.itemWorkBefore;
+    this.resolveWorkBefore = cuts.resolveWorkBefore;
     this.itemWidth = slotWidth;
-    this.itemRows = itemAtlasRows(slotWidth, plan.itemCount);
+    this.itemRows_ = itemAtlasRows(slotWidth, plan.itemCount);
     const iw = this.itemWidth;
-    const ih = this.itemRows;
+    const ih = this.itemRows_;
     const itemData = new Uint32Array(2 * iw * ih);
     itemData.set(plan.items);
     const own: { destroy(): void }[] = [];
@@ -734,18 +757,32 @@ export class CollisionGrid {
     };
     try {
       this.binned = keep(device.createTexture({ width: bw, height: binnedData.length / bw, format: "r32uint", data: binnedData, mipLevels: 1, sampler: NEAREST }));
-      this.items = keep(device.createTexture({ width: iw, height: ih, format: "rg32uint", data: itemData, mipLevels: 1, sampler: NEAREST }));
+      this.items_ = keep(device.createTexture({ width: iw, height: ih, format: "rg32uint", data: itemData, mipLevels: 1, sampler: NEAREST }));
       this.partial = keep(device.createTexture({ width: iw, height: ih, format: "rg32float", mipLevels: 1, sampler: NEAREST }));
       this.partialFbo = keep(device.createFramebuffer({ width: iw, height: ih, colorAttachments: [this.partial] }));
       this.key = keep(device.createTexture({ width: slotWidth, height: slotHeight, format: "rgba32uint", mipLevels: 1, sampler: NEAREST }));
       this.disc = keep(device.createTexture({ width: slotWidth, height: slotHeight, format: "rgba32float", mipLevels: 1, sampler: NEAREST }));
       this.keyFbo = keep(device.createFramebuffer({ width: slotWidth, height: slotHeight, colorAttachments: [this.key, this.disc] }));
-      this.cells = table(plan.bucketCount, COLLISION_ROUNDS);
+      this.cells_ = table(plan.bucketCount, COLLISION_ROUNDS);
       this.subs = table(plan.subBucketCount, COLLISION_SUB_ROUNDS);
-      const shifts = { u_bucketShift: this.cells.shift, u_subShift: this.subs.shift };
+      const searchBindings: Record<string, Texture> = {
+        u_disc: this.disc,
+        u_key: this.key,
+        u_items: this.items_,
+        u_cellCount: this.cells_.count,
+        u_subCount: this.subs.count,
+      };
+      this.cells_.rounds.forEach((t, i) => {
+        searchBindings[`u_round${i}`] = t;
+      });
+      this.subs.rounds.forEach((t, i) => {
+        searchBindings[`u_subRound${i}`] = t;
+      });
+      this.searchBindings = searchBindings;
+      const shifts = { u_bucketShift: this.cells_.shift, u_subShift: this.subs.shift };
       this.cellUniforms = { u_count: 0, u_width: 1, u_tableWidth: 1, u_collideWidth: 1, ...shifts };
       this.cellModel = keep(fullScreenModel(device, CELL_FS, this.cellUniforms, NO_BLEND));
-      const scatterBase = { u_width: 1, u_binnedWidth: bw, ...shifts, u_atlas: this.cells.atlas, u_sub: 0, u_prevChannel: 0 };
+      const scatterBase = { u_width: 1, u_binnedWidth: bw, u_first: 0, ...shifts, u_atlas: this.cells_.atlas, u_sub: 0, u_prevChannel: 0 };
       this.scatterUniforms = { ...scatterBase, u_round: -1 };
       this.roundUniforms = { ...scatterBase, u_round: 0, u_channel: 0 };
       const vs = scatterVs(COLLISION_ROUNDS);
@@ -788,11 +825,39 @@ export class CollisionGrid {
     this.owned = own;
   }
 
+  /** Rows of the binned slots' atlas: the most bands a {@link scatter} can be cut into. */
+  get scatterRows(): number {
+    return Math.max(1, Math.ceil(this.binnedCount / this.binnedWidth));
+  }
+
+  /** Rows of the work-item atlas: the most bands {@link items} can be cut into (1 without items). */
+  get itemRows(): number {
+    return this.itemRows_;
+  }
+
+  /** Rounds of occupant enumeration of table `table` (0: the class cells, 1: the sub-cells). */
+  rounds(table: 0 | 1): number {
+    return table === 0 ? COLLISION_ROUNDS : COLLISION_SUB_ROUNDS;
+  }
+
   /**
    * Encode the first half of a collision step: every slot's key and disc (from `input.pos` and this
-   * step's box), then each table's counts and K rounds. Then {@link gather}, band by band.
+   * step's box), then each table's counts and K rounds. Then {@link gather}.
    */
   prepare(input: CollisionPrepareInput): void {
+    this.cells(input);
+    for (const table of TABLES) {
+      for (let round = -1; round < this.rounds(table); round++) this.scatter(table, round, input.width);
+    }
+  }
+
+  /**
+   * The cell pass over the slot atlas rows of band `band` of `bands` (a scissor): every slot's key and disc,
+   * from `input.pos` and this step's box.
+   */
+  cells(input: CollisionPrepareInput, band = 0, bands = 1): void {
+    const [r0, r1] = bandRows(band, bands, input.rows);
+    if (r1 <= r0) return;
     const { segments } = input;
     const cu = this.cellUniforms;
     cu["u_count"] = input.count;
@@ -808,52 +873,86 @@ export class CollisionGrid {
       u_segCollide: input.segCollide,
       u_slotSeg: input.slotSeg,
     });
-    this.draw(this.cellModel, { framebuffer: this.keyFbo, clear: false });
-    // Occupancy over the binned slots (none: nothing to bin): the class cells, then the dense ones' sub-cells.
-    if (this.binnedCount === 0) return;
-    this.scatterUniforms["u_width"] = input.width;
-    this.roundUniforms["u_width"] = input.width;
-    this.scatterTable(this.cells, 0);
-    this.scatterTable(this.subs, 1);
-  }
-
-  /** One table's count scatter and K round scatters. */
-  private scatterTable(table: BucketTable, sub: 0 | 1): void {
-    const textures = table.rounds.length;
-    const round = (r: number): Texture => table.rounds[r % textures] ?? table.count;
-    // The class-cell counts are the sub-cell table's cull; the class-cell table never reads them (a stand-in
-    // is bound, since a sampled texture that is also the render target drops the draw).
-    const counts = sub === 1 ? this.cells.count : this.subs.count;
-    const su = this.scatterUniforms;
-    su["u_sub"] = sub;
-    su["u_atlas"] = table.atlas;
-    this.countModel.setBindings({ u_key: this.key, u_binned: this.binned, u_prev: round(1), u_cellCount: counts });
-    this.draw(this.countModel, { framebuffer: table.countFbo, clear: [0, 0, 0, 0] });
-    const ru = this.roundUniforms;
-    ru["u_sub"] = sub;
-    ru["u_atlas"] = table.atlas;
-    for (let r = 0; r < 4 * textures; r++) {
-      ru["u_round"] = r;
-      ru["u_channel"] = Math.floor(r / textures);
-      ru["u_prevChannel"] = Math.floor((r - 1) / textures);
-      // Round r reads round r − 1 from another texture (round 0 reads nothing it uses).
-      this.roundModel.setBindings({ u_key: this.key, u_binned: this.binned, u_prev: round(r + textures - 1), u_cellCount: counts });
-      const framebuffer = table.roundFbos[r % textures];
-      if (!framebuffer) throw new Error("CollisionGrid: missing round framebuffer");
-      // Each texture's first round opens it with the empty clear; later rounds keep it.
-      this.draw(this.roundModel, r < textures ? { framebuffer, clear: [EMPTY, EMPTY, EMPTY, EMPTY] } : { framebuffer, clear: false });
-    }
+    this.draw(this.cellModel, bands > 1 ? { framebuffer: this.keyFbo, clear: false, scissor: [0, r0, input.width, r1 - r0] } : { framebuffer: this.keyFbo, clear: false });
   }
 
   /**
-   * Encode the second half for the slot atlas rows `[r0, r1)` (default all): the work items of those
-   * rows' slots, then their resolve into `target` (the other position texture) — each a scissored pass.
-   * Every band of rows reads the same prepared state and writes only its own items and rows, so the result
-   * does not depend on how the rows are cut.
+   * One scatter of table `table` (0: the class cells, 1: the sub-cells of the dense ones) over the binned
+   * slots of band `band` of `bands` (their atlas rows): its count (`round` −1), or round `round`. The first
+   * band of the count, and of each round texture's first round, opens its target with the clear; every band
+   * scatters its own range of the binned slots, in order. The sub-cell table reads the class-cell counts (its
+   * cull), so it follows every band of the class-cell count.
    */
-  gather(target: Framebuffer, input: CollisionInputs, r0 = 0, r1 = input.rows): void {
-    if (r1 <= r0) return;
-    this.encodeBand(this.itemModel, this.partialFbo, this.resolveModel, target, this.partial, input, r0, r1, r0 > 0 || r1 < input.rows);
+  scatter(table: 0 | 1, round: number, slotWidth: number, band = 0, bands = 1): void {
+    if (this.binnedCount === 0) return; // nothing to bin
+    const [first, end] = bandSlots(band, bands, this.binnedWidth, this.binnedCount);
+    const t = table === 0 ? this.cells_ : this.subs;
+    const textures = t.rounds.length;
+    const tex = (r: number): Texture => t.rounds[r % textures] ?? t.count;
+    // The class-cell counts are the sub-cell table's cull; the class-cell table never reads them (a stand-in
+    // is bound, since a sampled texture that is also the render target drops the draw).
+    const counts = table === 1 ? this.cells_.count : this.subs.count;
+    if (round < 0) {
+      if (band > 0 && end <= first) return;
+      const su = this.scatterUniforms;
+      su["u_width"] = slotWidth;
+      su["u_sub"] = table;
+      su["u_atlas"] = t.atlas;
+      su["u_first"] = first;
+      this.countModel.setBindings({ u_key: this.key, u_binned: this.binned, u_prev: tex(1), u_cellCount: counts });
+      this.countModel.setVertexCount(Math.max(0, end - first));
+      this.draw(this.countModel, band === 0 ? { framebuffer: t.countFbo, clear: [0, 0, 0, 0] } : { framebuffer: t.countFbo, clear: false });
+      return;
+    }
+    const framebuffer = t.roundFbos[round % textures];
+    if (!framebuffer) throw new Error("CollisionGrid: missing round framebuffer");
+    // Each texture's first round opens it with the empty clear (its first band); later rounds keep it.
+    const clears = round < textures && band === 0;
+    if (!clears && end <= first) return;
+    const ru = this.roundUniforms;
+    ru["u_width"] = slotWidth;
+    ru["u_sub"] = table;
+    ru["u_atlas"] = t.atlas;
+    ru["u_first"] = first;
+    ru["u_round"] = round;
+    ru["u_channel"] = Math.floor(round / textures);
+    ru["u_prevChannel"] = Math.floor((round - 1) / textures);
+    // Round r reads round r − 1 from another texture (round 0 reads nothing it uses).
+    this.roundModel.setBindings({ u_key: this.key, u_binned: this.binned, u_prev: tex(round + textures - 1), u_cellCount: counts });
+    this.roundModel.setVertexCount(Math.max(0, end - first));
+    this.draw(this.roundModel, clears ? { framebuffer, clear: [EMPTY, EMPTY, EMPTY, EMPTY] } : { framebuffer, clear: false });
+  }
+
+  /**
+   * Encode the second half: the work items, then every slot's resolve into `target` (the other position
+   * texture). Every band of either reads the same prepared state and writes only its own items or rows, so
+   * the result does not depend on how they are cut.
+   */
+  gather(target: Framebuffer, input: CollisionInputs): void {
+    this.items(input);
+    this.resolve(target, input);
+  }
+
+  /**
+   * The work items of band `band` of `bands` — the item atlas rows holding about `1 / bands` of their
+   * estimated work, each item summing its part of its slot's pushes into its partial.
+   */
+  items(input: CollisionInputs, band = 0, bands = 1): void {
+    const rows = this.itemWorkBefore.length - 1;
+    const i0 = Math.min(this.itemCount, workCut(this.itemWorkBefore, rows, band, bands) * this.itemWidth);
+    const i1 = Math.min(this.itemCount, workCut(this.itemWorkBefore, rows, band + 1, bands) * this.itemWidth);
+    this.encodeItems(this.itemModel, this.partialFbo, input, i0, i1);
+  }
+
+  /**
+   * The resolve of the slot atlas rows of band `band` of `bands` — rows holding about `1 / bands` of the
+   * resolve's estimated work — into `target`: each slot's position plus RELAX of its pushes, after every
+   * band of {@link items}.
+   */
+  resolve(target: Framebuffer, input: CollisionInputs, band = 0, bands = 1): void {
+    const r0 = workCut(this.resolveWorkBefore, this.slotHeight, band, bands);
+    const r1 = workCut(this.resolveWorkBefore, this.slotHeight, band + 1, bands);
+    this.encodeResolve(this.resolveModel, target, this.partial, input, r0, r1, bands > 1);
   }
 
   /**
@@ -864,16 +963,38 @@ export class CollisionGrid {
   gatherStats(input: CollisionInputs): Float32Array {
     const stats = this.stats;
     if (!stats) throw new Error("CollisionGrid: built without stats");
-    this.encodeBand(stats.itemModel, stats.itemsFbo, stats.resolveModel, stats.slotsFbo, stats.items, input, 0, input.rows, false);
+    this.encodeItems(stats.itemModel, stats.itemsFbo, input, 0, this.itemCount);
+    this.encodeResolve(stats.resolveModel, stats.slotsFbo, stats.items, input, 0, input.rows, false);
     const pixels = this.device.readPixelsToArrayWebGL(stats.slotsFbo, { sourceWidth: stats.slots.width, sourceHeight: stats.slots.height });
     if (!(pixels instanceof Float32Array)) throw new Error("CollisionGrid: expected a float readback");
     return pixels.subarray(0, 4 * input.count);
   }
 
-  /** The item and resolve passes of slot rows `[r0, r1)`. */
-  private encodeBand(
-    itemModel: Model,
-    itemTarget: Framebuffer,
+  /** The item pass over the items `[i0, i1)` (a scissor over their atlas rows; the others there are discarded). */
+  private encodeItems(itemModel: Model, itemTarget: Framebuffer, input: CollisionInputs, i0: number, i1: number): void {
+    if (i1 <= i0) return;
+    const su = this.searchUniforms;
+    su["u_count"] = input.count;
+    su["u_width"] = input.width;
+    su["u_tableWidth"] = input.segments.width;
+    su["u_collideWidth"] = input.collideWidth;
+    su["u_pad"] = input.pad;
+    su["u_itemBegin"] = i0;
+    su["u_itemEnd"] = i1;
+    const bindings = this.searchBindings;
+    bindings["u_slotCollide"] = input.slotCollide;
+    bindings["u_segNested"] = input.segNested;
+    bindings["u_segCollide"] = input.segCollide;
+    bindings["u_segInfo"] = input.segments.info;
+    bindings["u_slotSeg"] = input.slotSeg;
+    itemModel.setBindings(bindings);
+    const y0 = Math.floor(i0 / this.itemWidth);
+    const y1 = Math.ceil(i1 / this.itemWidth);
+    this.draw(itemModel, { framebuffer: itemTarget, clear: false, scissor: [0, y0, this.itemWidth, y1 - y0] });
+  }
+
+  /** The resolve of slot atlas rows `[r0, r1)` into `target` (a scissor when `scissored`). */
+  private encodeResolve(
     resolveModel: Model,
     target: Framebuffer,
     partial: Texture,
@@ -882,45 +1003,17 @@ export class CollisionGrid {
     r1: number,
     scissored: boolean,
   ): void {
+    if (r1 <= r0) return;
     const su = this.searchUniforms;
     su["u_count"] = input.count;
     su["u_width"] = input.width;
-    su["u_tableWidth"] = input.segments.width;
+    su["u_tableWidth"] = input.segments.width; // the exact loop's segment lookup
     su["u_collideWidth"] = input.collideWidth;
     su["u_pad"] = input.pad;
-    const bindings: Record<string, Texture> = {
-      u_disc: this.disc,
-      u_key: this.key,
-      u_items: this.items,
-      u_slotCollide: input.slotCollide,
-      u_segNested: input.segNested,
-      u_segCollide: input.segCollide,
-      u_segInfo: input.segments.info,
-      u_cellCount: this.cells.count,
-      u_subCount: this.subs.count,
-      u_slotSeg: input.slotSeg,
-    };
-    this.cells.rounds.forEach((t, i) => {
-      bindings[`u_round${i}`] = t;
-    });
-    this.subs.rounds.forEach((t, i) => {
-      bindings[`u_subRound${i}`] = t;
-    });
-    // The work items of this band's slots: a contiguous range of the item atlas.
-    const i0 = this.itemsBefore[Math.min(r0 * input.width, input.count)] ?? 0;
-    const i1 = this.itemsBefore[Math.min(r1 * input.width, input.count)] ?? 0;
-    if (i1 > i0) {
-      su["u_itemBegin"] = i0;
-      su["u_itemEnd"] = i1;
-      itemModel.setBindings(bindings);
-      const y0 = Math.floor(i0 / this.itemWidth);
-      const y1 = Math.ceil(i1 / this.itemWidth);
-      this.draw(itemModel, { framebuffer: itemTarget, clear: false, scissor: [0, y0, this.itemWidth, y1 - y0] });
-    }
     resolveModel.setBindings({
       u_disc: this.disc,
       u_slotCollide: input.slotCollide,
-      u_items: this.items,
+      u_items: this.items_,
       u_segInfo: input.segments.info,
       u_slotSeg: input.slotSeg,
       u_partial: partial,
@@ -944,3 +1037,7 @@ export class CollisionGrid {
     for (let i = this.owned.length - 1; i >= 0; i--) this.owned[i]?.destroy();
   }
 }
+
+/** The two hash tables of a collision step, in the order they are scattered: the class cells, then the sub-cells. */
+const TABLES: readonly (0 | 1)[] = [0, 1];
+

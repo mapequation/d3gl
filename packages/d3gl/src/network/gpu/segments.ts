@@ -44,6 +44,15 @@ export function bandRows(band: number, bands: number, rows: number): [number, nu
 }
 
 /**
+ * The slots `[first, end)` of band `band` of `bands` of a slot atlas `width` texels wide holding `count`
+ * slots: the slots of its rows {@link bandRows} — how a point scatter over every slot is sliced (#382).
+ */
+export function bandSlots(band: number, bands: number, width: number, count: number): [number, number] {
+  const [r0, r1] = bandRows(band, bands, Math.ceil(count / width));
+  return [Math.min(count, r0 * width), Math.min(count, r1 * width)];
+}
+
+/**
  * Check that `segments` tile the slots `[0, count)` in order: each starts where the previous one ends
  * (empty segments allowed), and together they cover every slot once. Throws otherwise — the passes
  * find a slot's segment by its position, so a gap or an overlap would silently mix segments. Each

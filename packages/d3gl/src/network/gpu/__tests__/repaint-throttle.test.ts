@@ -113,12 +113,12 @@ describe("RepaintThrottle (#352)", () => {
     t.beginFrame(0, FRAME);
     t.repainted(0, 1);
     // A copy that takes 20 ms to be seen complete.
-    t.copyIssued(10);
+    t.readbackStarted(10);
     t.copyCompleted(30);
     expect(t.copyDue(MIN_FRAME_MS - 20 - 2 - 1, false)).toBe(false);
     expect(t.copyDue(MIN_FRAME_MS - 20, false)).toBe(true);
     // A copy in flight across a hidden-page gap: its "latency" is the gap, not the copy.
-    t.copyIssued(100);
+    t.readbackStarted(100);
     t.pause();
     t.copyCompleted(60_100);
     expect(t.copyDue(MIN_FRAME_MS - 20 - 2 - 1, false)).toBe(false);
@@ -180,7 +180,7 @@ describe("RepaintThrottle (#352)", () => {
     t.returned(120);
     t.submitted(130);
     t.returned(150);
-    t.copyIssued(160);
+    t.readbackStarted(160);
     t.copyCompleted(170);
     expect(t.copyDue(MIN_FRAME_MS - 20 - 10 - 3, true)).toBe(false);
     expect(t.copyDue(MIN_FRAME_MS - 20 - 10 - 2, true)).toBe(true);
@@ -213,12 +213,25 @@ describe("RepaintThrottle (#352)", () => {
       t.submitted(at);
       t.returned(at + 30); // relayed, before the LOD worker failed
     }
-    t.copyIssued(300);
+    t.readbackStarted(300);
     t.copyCompleted(310);
     // The sink no longer relays: copies and harvests lead by the copy latency alone.
     expect(t.copyDue(MIN_FRAME_MS - 10 - 3, false)).toBe(false);
     expect(t.copyDue(MIN_FRAME_MS - 10 - 2, false)).toBe(true);
     expect(t.harvestDue(MIN_FRAME_MS - 3, false)).toBe(false);
     expect(t.harvestDue(MIN_FRAME_MS - 2, false)).toBe(true);
+  });
+
+  it("times a readback from its start, so the frames its passes wait for budget before the copy count (#382)", () => {
+    // A readback started at 0 whose passes ran in the next frame, copied there (≈ 17 ms), and whose copy was
+    // seen complete a frame after that: 33 ms from the start. The next one is started 33 ms before the
+    // repaint is due, so its copy lands in time even though it too waits a frame.
+    const t = new RepaintThrottle();
+    t.beginFrame(0, FRAME);
+    t.repainted(0, 1);
+    t.readbackStarted(0);
+    t.copyCompleted(2 * FRAME);
+    expect(t.copyDue(MIN_FRAME_MS - 2 * FRAME - 2 - 1, false)).toBe(false);
+    expect(t.copyDue(MIN_FRAME_MS - 2 * FRAME, false)).toBe(true);
   });
 });

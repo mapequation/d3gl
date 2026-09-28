@@ -88,6 +88,11 @@ export const COLLISION_EXACT = 16;
 export const COLLISION_ITEMIZED = 32;
 /** `slotCollide` shift of the work items of the slots before it (a slot's first item, when it has any). */
 export const COLLISION_ITEM_SHIFT = 6;
+/**
+ * What the resolve pass does for any slot besides its pushes, in pair-test units (its own fetches and its
+ * write, about a cell visit's worth): the resolve's bands are cut by {@link slotResolveWork} (#382).
+ */
+export const COLLISION_RESOLVE_BASE = 16;
 
 /**
  * The collision data of a batched nested solve, per slot and per segment. A segment of at most
@@ -135,6 +140,10 @@ export interface CollisionPlan {
   readonly slotWork: Float32Array;
   /** The sum of {@link slotWork}. */
   readonly gatherWork: number;
+  /** The work items' share of {@link gatherWork}: the itemized slots' {@link slotWork}. */
+  readonly itemWork: number;
+  /** The sum of {@link slotResolveWork} over every slot: what the resolve pass does. */
+  readonly resolveWork: number;
   /** The cell refinement ρ the cell sides were computed for (the gather's search needs it too). */
   readonly refine: number;
 }
@@ -325,6 +334,12 @@ export function collisionPlan(
       item++;
     }
   }
+  let itemWork = 0;
+  let resolveWork = 0;
+  for (let i = 0; i < slots; i++) {
+    if (itemized(i)) itemWork += slotWork[i] ?? 0;
+    resolveWork += (itemized(i) ? (parts[i] ?? 1) : (slotWork[i] ?? 0)) + COLLISION_RESOLVE_BASE;
+  }
   return {
     slotCollide,
     items,
@@ -340,8 +355,79 @@ export function collisionPlan(
     binnedSlots: Uint32Array.from(binned),
     slotWork,
     gatherWork,
+    itemWork,
+    resolveWork,
     refine,
   };
+}
+
+/**
+ * Where the collision's sliced passes cut their bands (#382): the cumulative estimated work up to each row of
+ * the work-item atlas (`itemRows + 1` entries) and of the slot atlas for the resolve (`rows + 1`), both `width`
+ * texels wide. A band of either takes the rows holding about `1 / bands` of the work ({@link workCut}), so it
+ * costs what its share of the pass's estimate says, whichever slots it holds (#380: the big module's slots
+ * sit in the first rows, so bands of equal slot rows would put most of the work in the first).
+ */
+export interface CollisionCuts {
+  readonly itemWorkBefore: Float64Array;
+  readonly resolveWorkBefore: Float64Array;
+}
+
+/**
+ * The {@link CollisionCuts} of `plan` over atlases `width` texels wide (the slot atlas's, which the work-item
+ * atlas shares). O(slots + items) once per layout; O(rows) memory.
+ */
+export function collisionCuts(plan: Pick<CollisionPlan, "slotCollide" | "items" | "itemCount" | "slotWork">, width: number): CollisionCuts {
+  const itemRows = Math.ceil(plan.itemCount / width);
+  const itemWorkBefore = new Float64Array(itemRows + 1);
+  for (let item = 0; item < plan.itemCount; item++) {
+    const slot = plan.items[2 * item] ?? 0;
+    const parts = (plan.items[2 * item + 1] ?? 0) >>> 16;
+    const row = Math.floor(item / width) + 1;
+    itemWorkBefore[row] = (itemWorkBefore[row] ?? 0) + (plan.slotWork[slot] ?? 0) / Math.max(1, parts);
+  }
+  for (let r = 1; r <= itemRows; r++) itemWorkBefore[r] = (itemWorkBefore[r] ?? 0) + (itemWorkBefore[r - 1] ?? 0);
+  const slots = plan.slotCollide.length;
+  const rows = Math.ceil(slots / width);
+  const resolveWorkBefore = new Float64Array(rows + 1);
+  for (let r = 0; r < rows; r++) {
+    let work = 0;
+    for (let i = r * width; i < Math.min(slots, (r + 1) * width); i++) work += slotResolveWork(plan, i);
+    resolveWorkBefore[r + 1] = (resolveWorkBefore[r] ?? 0) + work;
+  }
+  return { itemWorkBefore, resolveWorkBefore };
+}
+
+/**
+ * Where band `band` of `bands` starts in a sequence of `n` units whose cumulative work is `before` (`n + 1`
+ * entries): the first unit whose work before it reaches `band / bands` of the total (0 for band 0, `n` for
+ * band `bands`), so consecutive bands tile the units in order.
+ */
+export function workCut(before: Float64Array, n: number, band: number, bands: number): number {
+  if (band <= 0) return 0;
+  if (band >= bands) return n;
+  const target = ((before[n] ?? 0) * band) / bands;
+  let lo = 0;
+  let hi = n;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if ((before[mid] ?? 0) < target) lo = mid + 1;
+    else hi = mid;
+  }
+  return lo;
+}
+
+/**
+ * What slot `i` adds to the resolve pass of `plan`, in pair-test units: an itemized slot sums its items'
+ * partials (a fetch each), any other runs its exact loop there (its {@link CollisionPlan.slotWork}, at most
+ * {@link COLLISION_PART_PAIRS} pair tests), plus {@link COLLISION_RESOLVE_BASE}. {@link CollisionPlan.resolveWork}
+ * sums it.
+ */
+export function slotResolveWork(plan: Pick<CollisionPlan, "slotCollide" | "items" | "slotWork">, i: number): number {
+  const word = plan.slotCollide[i] ?? 0;
+  if ((word & COLLISION_ITEMIZED) === 0) return (plan.slotWork[i] ?? 0) + COLLISION_RESOLVE_BASE;
+  const first = word >>> COLLISION_ITEM_SHIFT;
+  return ((plan.items[2 * first + 1] ?? 0) >>> 16) + COLLISION_RESOLVE_BASE;
 }
 
 /**

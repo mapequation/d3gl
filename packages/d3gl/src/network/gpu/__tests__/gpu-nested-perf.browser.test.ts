@@ -24,12 +24,18 @@
  *   of N points into a 1×1 viewport (#349). Every work item that encodes a pass submits once, after its
  *   passes, a readback copy too, and no pass only clears (#402): the force clear is the repulsion band's and
  *   the springs' own. Through the real trigger the stream legs count the submits per item and per copy.
+ *   The scatters run whole, or cut into bands that cover every binned slot once per scatter (#382). A
+ *   readback cut into bands allocates nothing either.
+ * - **The admission wiring (#382):** every streamed frame of more than one work item was admitted within
+ *   its budget by the sum of the items' estimates. This restates `FrameBudget.admit`, so it cannot see a
+ *   wrong estimate; the per-band bound itself is the node guard's (`nested-frame-budget.test.ts`), over the
+ *   plan the layout binds (`planSizes` equals `nestedPlanSizes`, `gpu-nested-layout.browser.test.ts`).
  * - **A module of very uneven child sizes** (#380; a single-scale grid made its gather quadratic, 157 ms
  *   frames at 60,000 children): the same per-frame bounds and signatures through the real trigger (in
- *   `gpu-nested-zipf-perf.browser.test.ts`, a file of its own for the tier's 300 s per file), a
+ *   `gpu-nested-zipf-perf.browser.test.ts`, a file of its own for the tier's 300 s per file), and a
  *   collision step's pair work within 3× of the collision plan's estimate with no slot on the exact
- *   fallback, and the gather cut into bands of equal estimated work (the frame budget admits a band by its
- *   share of the estimate; bands of equal rows put the big module's work in the first).
+ *   fallback. (The work items and the resolve are cut into bands of equal estimated work: node-tested on
+ *   the plan, `collision-plan.test.ts`.)
  *
  * The **warm re-layout with a transition** on `"auto"` (#375) has its own file,
  * `gpu-nested-warm-perf.browser.test.ts`, as the Zipf module's stream has.
@@ -43,7 +49,7 @@ import type { Device } from "@luma.gl/core";
 import { network, type Network } from "../../network.js";
 import type { NetworkGraph } from "../../graph.js";
 import type { ModuleNode } from "../../modules.js";
-import { GpuNestedLayout, nestedLayoutPlan } from "../gpu-nested-layout.js";
+import { GpuNestedLayout, nestedLayoutPlan, type NestedStage } from "../gpu-nested-layout.js";
 import { COLLISION_ROUNDS, COLLISION_SUB_ROUNDS } from "../passes/collision.js";
 import { makeTestDevice } from "./_device.js";
 import { recordItems, type ItemRecord } from "./_item-recorder.js";
@@ -125,31 +131,46 @@ describe("GPU nested solve per tick (#355, #380)", () => {
     device = await makeTestDevice();
   });
 
-  it("allocates nothing per tick or per readback, and a collision step draws its fixed scatters", () => {
+  it("allocates nothing per tick or per readback, and a collision step draws its fixed scatters, whole or banded", () => {
     // A Zipf module, so the radius-class grid bins slots (an even map's small modules take the exact loop).
     const solver = solverOf(zipfLike(Math.min(N, 20_000)), 10);
     const binned = solver.collision.binnedSlots.length;
     expect(binned).toBeGreaterThan(0);
     const layout = new GpuNestedLayout(device, nestedLayoutPlan(solver));
     const log = new GlCallLog();
+    const run = (stages: readonly NestedStage[], bands: number): void => {
+      for (const stage of stages) {
+        const b = Math.min(bands, stage.rows);
+        for (let band = 0; band < b; band++) stage.run(band, b);
+      }
+    };
     try {
       layout.runTicks(6); // organise
-      layout.prepareReadback();
+      layout.composeReadback();
       const organiseCreates = log.events.filter((e) => e.kind === "create").length;
-      const before = log.events.length;
-      layout.beginTick(); // compact, collision step 1: its cells, then each table's counts and rounds
-      layout.forceBand(0, 3);
-      layout.forceBand(1, 3);
-      layout.forceBand(2, 3);
-      layout.integrate();
-      const step = log.events.slice(before).filter((e) => e.kind === "layout-draw" && e.points);
+      // Compact, collision step 1, whole: its cells, then each table's count and rounds.
+      let before = log.events.length;
+      run(layout.tickStages(), 1);
+      const whole = log.events.slice(before).filter((e) => e.kind === "layout-draw" && e.points);
+      // Step 2, every pass in 3 bands; then a readback in 4.
+      before = log.events.length;
+      run(layout.tickStages(), 3);
+      const banded = log.events.slice(before).filter((e) => e.kind === "layout-draw" && e.points);
+      run(layout.readbackStages(), 4);
       layout.runTicks(3);
-      layout.prepareReadback();
+      layout.composeReadback();
       expect(organiseCreates, "GPU objects created by organise ticks or a readback").toBe(0);
-      expect(log.events.filter((e) => e.kind === "create").length, "GPU objects created by compact ticks").toBe(0);
+      expect(log.events.filter((e) => e.kind === "create").length, "GPU objects created by compact ticks or banded readbacks").toBe(0);
       // Per table one count scatter and its rounds, each over the binned slots: the grid's fixed pass count.
-      expect(step.length).toBe(2 + COLLISION_ROUNDS + COLLISION_SUB_ROUNDS);
-      expect(step.every((e) => e.kind === "layout-draw" && e.count === binned)).toBe(true);
+      const scatters = 2 + COLLISION_ROUNDS + COLLISION_SUB_ROUNDS;
+      expect(whole.length).toBe(scatters);
+      expect(whole.every((e) => e.kind === "layout-draw" && e.count === binned)).toBe(true);
+      // Banded: 3 draws per scatter, each scatter's covering every binned slot once.
+      expect(banded.length).toBe(3 * scatters);
+      for (let k = 0; k < scatters; k++) {
+        const counts = banded.slice(3 * k, 3 * k + 3).map((e) => (e.kind === "layout-draw" ? e.count : 0));
+        expect(counts.reduce((a, b) => a + b, 0), `scatter ${k}: ${counts.join(" + ")}`).toBe(binned);
+      }
       expect(log.events.some((e) => e.kind === "layout-draw" && e.viewport1x1 && e.count >= solver.slotCount)).toBe(false);
     } finally {
       log.restore();
@@ -172,10 +193,12 @@ describe("GPU nested solve work items (#402)", () => {
     const readback = new AsyncPositionReadback(device, layout);
     const rec = recordItems(device);
     const items: { phase: string; item: string; record: ItemRecord }[] = [];
+    // Every pass of the stream tick in up to 3 bands, each band one work item (#382).
     const tick = (phase: string): void => {
-      items.push({ phase, item: "P", record: rec.record(() => layout.beginTick()) });
-      for (let b = 0; b < 3; b++) items.push({ phase, item: `F_${b}`, record: rec.record(() => layout.forceBand(b, 3)) });
-      items.push({ phase, item: "I", record: rec.record(() => layout.integrate()) });
+      for (const stage of layout.tickStages()) {
+        const bands = Math.min(stage.rows, 3);
+        for (let b = 0; b < bands; b++) items.push({ phase, item: `${stage.pass}_${b}`, record: rec.record(() => stage.run(b, bands)) });
+      }
     };
     let copy: ItemRecord;
     try {
@@ -184,6 +207,7 @@ describe("GPU nested solve work items (#402)", () => {
       tick("organise");
       layout.runTicks(4); // past the 6 organise ticks of 10: the stream ticks below are collision steps
       for (let s = 0; s < 4; s++) tick(`compact, step ${(s % 2) + 1}`);
+      layout.composeReadback();
       copy = rec.record(() => {
         layout.prepareReadback();
         readback.issue(layout);
@@ -196,20 +220,18 @@ describe("GPU nested solve work items (#402)", () => {
     }
     expect(copy.submits).toBe(1);
     expect(copy.clearOnly).toBe(0);
-    expect(copy.passes).toBeGreaterThan(3); // two reductions and the composition
-    // An item submits once if it encodes a pass (the compact swap, and a gather band without rows, encode
-    // none), and every pass draws.
-    const wrong = items.filter(({ record }) => record.submits !== (record.passes > 0 ? 1 : 0) || record.clearOnly !== 0);
+    expect(copy.passes).toBeGreaterThan(0); // the stats' staging pass (the composition ran as items before)
+    // Every item submits once, and every pass draws.
+    const wrong = items.filter(({ record }) => record.submits !== 1 || record.clearOnly !== 0);
     expect(wrong).toEqual([]);
     const passes = (phase: string, item: string): number[] =>
       items.filter((i) => i.phase === phase && i.item === item).map((i) => i.record.passes);
-    // Organise: a band is one pass (its clear, then the repulsion); I is the predict, the springs (their
-    // clear) and the integrate, plus a hub chunk pass on a map with hub rows.
-    expect(passes("organise", "F_1")).toEqual([1, 1]);
-    for (const n of passes("organise", "I")) expect([3, 4]).toContain(n);
-    // Compact: P always encodes (the reductions, the cells); the swap nothing.
-    for (const n of passes("compact, step 2", "P")) expect(n).toBeGreaterThan(3);
-    expect(passes("compact, step 2", "I")).toEqual([0, 0]);
+    // Organise: a repulsion band is one pass (its clear, then the repulsion); a springs band the springs
+    // (their clear) and the integrate.
+    expect(passes("organise", "repulsion_1")).toEqual([1, 1]);
+    expect(passes("organise", "springs_1")).toEqual([2, 2]);
+    // Compact: the reduction and the cells always encode.
+    for (const n of passes("compact, step 2", "cells_0")) expect(n).toBe(1);
   });
 });
 
@@ -230,7 +252,9 @@ describe("GPU nested solve on a module of very uneven child sizes: the collision
       layout.runTicks(Math.ceil(0.6 * ITERATIONS));
       const ratios: number[] = [];
       while (layout.ticks < ITERATIONS) {
-        layout.beginTick();
+        const stages = layout.tickStages();
+        const cut = stages.findIndex((stage) => stage.pass === "items" || stage.pass === "resolve");
+        for (const stage of stages.slice(0, cut)) stage.run(0, 1);
         const stats = layout.collisionStats();
         let work = 0;
         let overflow = 0;
@@ -240,8 +264,7 @@ describe("GPU nested solve on a module of very uneven child sizes: the collision
         }
         expect(overflow, `tick ${layout.ticks}: slots sent to the exact fallback`).toBe(0);
         ratios.push(work / solver.collision.gatherWork);
-        layout.forceBand(0, 1);
-        layout.integrate();
+        for (const stage of stages.slice(cut)) stage.run(0, 1);
       }
       console.log(`  Zipf ${BIG}: pair work per collision step / plan estimate: ${Math.min(...ratios).toFixed(2)}-${Math.max(...ratios).toFixed(2)} (single-scale grid at 60,000 children: 36)`);
       expect(Math.max(...ratios)).toBeLessThan(3);
@@ -249,40 +272,4 @@ describe("GPU nested solve on a module of very uneven child sizes: the collision
       layout.destroy();
     }
   }, perfBudget(300_000));
-
-  it("cuts the gather into bands of equal estimated work, which rows alone would not", () => {
-    // The frame budget admits a band by its share of the gather's estimate; a band must carry that share.
-    // Rows alone would not: the big module's slots sit in the first rows.
-    const solver = solverOf(fixture, ITERATIONS);
-    const layout = new GpuNestedLayout(device, nestedLayoutPlan(solver));
-    try {
-      const width = Math.max(1, Math.ceil(Math.sqrt(solver.slotCount)));
-      const rows = Math.ceil(solver.slotCount / width);
-      const rowWork = (r0: number, r1: number): number => {
-        let w = 0;
-        for (let i = r0 * width; i < Math.min(solver.slotCount, r1 * width); i++) w += (solver.collision.slotWork[i] ?? 0) + 16;
-        return w;
-      };
-      const total = rowWork(0, rows);
-      let widestRow = 0;
-      for (let r = 0; r < rows; r++) widestRow = Math.max(widestRow, rowWork(r, r + 1));
-      for (const bands of [2, 4, 8]) {
-        let next = 0;
-        const shares: string[] = [];
-        for (let b = 0; b < bands; b++) {
-          const [r0, r1] = layout.gatherBandRows(b, bands);
-          expect(r0).toBe(next);
-          next = r1;
-          const share = rowWork(r0, r1) / total;
-          shares.push(share.toFixed(3));
-          expect(share, `band ${b} of ${bands}`).toBeLessThanOrEqual(1 / bands + widestRow / total);
-        }
-        expect(next).toBe(rows);
-        const firstEqualRows = rowWork(0, Math.floor(rows / bands)) / total;
-        console.log(`  Zipf ${BIG}, ${bands} bands: work shares ${shares.join(" / ")} (the first of ${bands} equal-row bands: ${firstEqualRows.toFixed(3)})`);
-      }
-    } finally {
-      layout.destroy();
-    }
-  });
 });

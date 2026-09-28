@@ -31,8 +31,18 @@ import {
 import { SeedLevels, SeedPasses } from "./seed-levels.js";
 import type { SeedPlan } from "./seed-plan.js";
 import { StopLatchPass } from "./passes/stop-latch.js";
+import { itemCostMs } from "./frame-budget.js";
+import type { StreamStage } from "./stream-schedule.js";
 
 // DAMPING is imported from force.ts so both integrators share one constant.
+
+/** A pass of the flat layout's streamed tick: a {@link StreamStage} whose estimate and rows follow the level. */
+interface FlatStage {
+  costMs: number;
+  readonly fixedMs: number;
+  rows: number;
+  run(band: number, bands: number): void;
+}
 
 /**
  * The flat layout's `exactMax` — the node-count threshold for the repulsion algorithm. At or below
@@ -176,6 +186,15 @@ export class GpuForceLayout {
   private readonly finest: ActiveLevel;
   /** The level ticks run on now: {@link finest}, or a seed level while a multilevel seed runs (#353). */
   private active: ActiveLevel;
+  /**
+   * A streamed tick's passes (#352, #382): {@link beginTick} and {@link integrate} whole, the force pass
+   * ({@link forceBand}) in row bands of the level's rows — estimated by the flat cost model over the level's
+   * slots (`ITEM_NS_PER_NODE`), set by {@link tickStages} when a tick starts.
+   */
+  private readonly prepStage: FlatStage;
+  private readonly forceStage: FlatStage;
+  private readonly integrateStage: FlatStage;
+  private readonly stages: readonly StreamStage[];
   /** A multilevel solver's seed programs (#353), compiled with it; null on a flat solver. */
   private readonly seedPasses: SeedPasses | null;
   /** A running multilevel seed's resources, or null. */
@@ -508,6 +527,24 @@ export class GpuForceLayout {
       attraction: params.attraction,
     };
     this.active = this.finest;
+    this.prepStage = { costMs: 0, fixedMs: 0, rows: 1, run: () => this.beginTick() };
+    this.forceStage = { costMs: 0, fixedMs: 0, rows: 1, run: (band, bands) => this.forceBand(band, bands) };
+    this.integrateStage = { costMs: 0, fixedMs: 0, rows: 1, run: () => this.integrate() };
+    this.stages = [this.prepStage, this.forceStage, this.integrateStage];
+  }
+
+  /**
+   * The passes of the tick about to start (#352, #382): P and I whole, the force pass in bands of the level's
+   * rows — a seed level's (#353), whose slots its estimates count, or the graph's. The stages are this
+   * layout's own, updated in place: a tick allocates nothing.
+   */
+  tickStages(): readonly StreamStage[] {
+    const level = this.active;
+    this.prepStage.costMs = itemCostMs("prep", level.count);
+    this.forceStage.costMs = itemCostMs("force", level.count);
+    this.forceStage.rows = level.rows;
+    this.integrateStage.costMs = itemCostMs("integrate", level.count);
+    return this.stages;
   }
 
   /**
