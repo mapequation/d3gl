@@ -1,25 +1,28 @@
 import { describe, it, expect } from "vitest";
 import { buildMortonLODTree, computeLODPositions, computeLODStyle, cut, declutterFrontier, makeCutScratch, makeDeclutterFrontierScratch, visibleWorldRect, type LODTransform, type LODTree } from "../lod.js";
 import { buildGraph, type NetworkGraph } from "../graph.js";
-import { buildLeafIncidence, lazySuperEdges, makeLazySuperEdgesScratch, rowSuperEdges, type LazyCut } from "../lazy-super-edges.js";
-import { allocateSpatialRows, buildCoverRows, cutRowCells, makeSpatialRowsScratch, rowOf, spatialRowsByteLength, spatialRowsGraph, type SpatialRows } from "../spatial-rows.js";
+import { buildLeafIncidence, lazySuperEdges, makeLazySuperEdgesScratch, type LazyCut } from "../lazy-super-edges.js";
+import { allocateSpatialRows, buildKeptRows, makeSpatialRowsScratch, rowOf, spatialRowsByteLength, spatialRowsGraph, type SpatialRows } from "../spatial-rows.js";
 import { MAX_OUTSTANDING, lodFrameStep, lodTreeFromSpatialFrame, makeSpatialLODStream, recycleSpatialFrame, spatialFrameByteLength, type LODView, type SpatialLODFrame } from "../lod-frame.js";
 import { layoutBox, layoutFitTransform } from "../fit.js";
 import type { SuperEdgeStyleResolved, SuperEdgesData } from "../glyphs.js";
 
 /**
- * Super-edge rows of a spatial tree's covers (#433): built off the main thread with each streamed tree, for
- * the view the main thread reported, they let the gather read O(visible) rows instead of walking every edge
- * under the frontier. Pinned here:
- *   - the rows are exactly their definition (per listed cell, each edge's partner at the cell's depth, or a
- *     shallower leaf), checked edge by edge against a brute force;
- *   - `rowSuperEdges` draws the **same super-edges** as `lazySuperEdges` on the same cut — every pair, flow,
+ * Super-edge rows of a spatial tree's kept glyphs (#433): built off the main thread with each streamed tree,
+ * for the view the main thread reported, they let the gather read the kept glyphs' rows — bounded by what
+ * they link to — instead of walking every edge under the frontier. Pinned here:
+ *   - the rows are exactly their definition (per kept cell, each edge's finest cover on the other side,
+ *     summed per direction), checked edge by edge against a brute force, in a cross-fade band too;
+ *   - `lazySuperEdges` on a tree with rows draws the **same super-edges** as without — every pair, flow,
  *     endpoint, width, colour and arrowhead — over zooms, pans, declutter on and off, a cross-fade band,
  *     directed and undirected lines and half-arrows, weighted and unweighted graphs: with rows for exactly
- *     that cut's covers it walks no leaf run; with rows for another view's cut, or none, it walks the unlisted
- *     covers' leaves and still draws the same;
- *   - a spatial stream given the edges and a view (a transform, or the fit) ships the rows of that view's
- *     covers with every rebuilt tree, reuses returned buffers, and builds none without links or a view;
+ *     that cut it walks no leaf run; with rows for another view's cut, or none, it walks the leaves of the
+ *     glyphs the rows cannot serve and still draws the same;
+ *   - a cut coarser than the one the rows were built at still takes every row (partners merged per cover);
+ *     one that opened a partner up rebuilds the rows naming it, once, and a held view then walks nothing;
+ *   - the rows read are bounded by what the kept glyphs link to, not by the edges under them;
+ *   - a spatial stream given the edges and a view (a transform, or the fit) ships the rows of the glyphs that
+ *     view keeps with every rebuilt tree, reuses returned buffers, and builds none without links or a view;
  *   - when the rows shrink (a zoom-in), the stream's pool drops the buffers too large for them, so a warm
  *     stream at the new view allocates nothing and holds no stale buffer.
  */
@@ -62,22 +65,13 @@ function spatialTree(g: NetworkGraph): LODTree {
   return tree;
 }
 
-/** The rows of the cells among `covers`, as a stream's worker builds them. */
-function rowsFor(tree: LODTree, g: NetworkGraph, covers: ArrayLike<number>): SpatialRows {
-  const { parent, leafOrder, leafStart, leafEnd } = tree;
-  if (!parent || !leafOrder || !leafStart || !leafEnd) throw new Error("not a spatial tree");
-  const out = { rows: allocateSpatialRows({ size: 0, leafCount: 0, cells: 0, outEntries: 0, inEntries: 0 }) };
-  buildCoverRows({ size: tree.size, leafCount: tree.leafCount, parent, leafOrder, leafStart, leafEnd }, covers, spatialRowsGraph(g.nodeCount, g), makeSpatialRowsScratch(), (sz) => (out.rows = allocateSpatialRows(sz)));
-  return out.rows;
-}
-
-/** The rows a worker builds for the cut `c`: its cells whose rows can matter, the drawn glyphs as the floor. */
+/** The rows a stream's worker builds for the cut `c`: one per kept cell. */
 function rowsForCut(tree: LODTree, g: NetworkGraph, c: LazyCut): SpatialRows {
-  const { parent } = tree;
-  if (!parent) throw new Error("not a spatial tree");
-  const cells = { cells: new Uint32Array(0) };
-  const m = cutRowCells(parent, c, c.drawn, cells);
-  return rowsFor(tree, g, cells.cells.subarray(0, m));
+  const { leafOrder, leafStart, leafEnd } = tree;
+  if (!leafOrder || !leafStart || !leafEnd) throw new Error("not a spatial tree");
+  const out = { rows: allocateSpatialRows({ cells: 0, outEntries: 0, inEntries: 0 }) };
+  buildKeptRows({ size: tree.size, leafCount: tree.leafCount, leafOrder, leafStart, leafEnd }, c, spatialRowsGraph(g.nodeCount, g), makeSpatialRowsScratch(), (sz) => (out.rows = allocateSpatialRows(sz)));
+  return out.rows;
 }
 
 function styleOf(directed: boolean, linkStyle: "line" | "half-arrow" = "line"): SuperEdgeStyleResolved {
@@ -89,7 +83,7 @@ function cutAt(tree: LODTree, t: LODTransform, declutter: boolean, fadeBand = 0)
   const sc = makeCutScratch();
   const fade = fadeBand > 0 ? new Float32Array(tree.size) : undefined;
   const drawn = cut(tree, t, W, H, { screenSized: true, maxAggregateRadius: 20, recordCulled: true, fadeBand, fadeAlpha: fade }, sc).slice();
-  const kept = declutter ? declutterFrontier(tree, drawn, t, W, H, { screenSized: true, k: t.k, maxAggregateRadius: 20 }, makeDeclutterFrontierScratch()).slice() : drawn;
+  const kept = declutter ? declutterFrontier(tree, drawn, t, W, H, { screenSized: true, k: t.k, maxAggregateRadius: 20, fadeAlpha: fade }, makeDeclutterFrontierScratch()).slice() : drawn;
   return { drawn, kept, culled: sc.culled.slice(0, sc.culledCount), split: sc.split.slice(0, sc.splitCount), fade };
 }
 
@@ -97,7 +91,7 @@ function cutAt(tree: LODTree, t: LODTransform, declutter: boolean, fadeBand = 0)
 function byId(d: SuperEdgesData): Map<number, number[]> {
   const m = new Map<number, number[]>();
   const put = (e: number, vals: number[]): void => {
-    const id = d.ids[e]!;
+    const id = d.ids[e] ?? -1;
     expect(m.has(id), `pair ${id} drawn twice`).toBe(false);
     m.set(id, vals);
   };
@@ -106,9 +100,9 @@ function byId(d: SuperEdgesData): Map<number, number[]> {
     const ha = d.halfArrows;
     if (ha) vals.push(...ha.sources.subarray(2 * e, 2 * e + 2), ...ha.targets.subarray(2 * e, 2 * e + 2), ...ha.radii.subarray(2 * e, 2 * e + 2), ...ha.widths.subarray(2 * e, 2 * e + 2), ...ha.colors.subarray(4 * e, 4 * e + 4));
     const l = d.lines;
-    if (l) vals.push(...l.sources.subarray(2 * e, 2 * e + 2), ...l.targets.subarray(2 * e, 2 * e + 2), l.widths[e]!, ...l.colors.subarray(4 * e, 4 * e + 4));
+    if (l) vals.push(...l.sources.subarray(2 * e, 2 * e + 2), ...l.targets.subarray(2 * e, 2 * e + 2), l.widths[e] ?? NaN, ...l.colors.subarray(4 * e, 4 * e + 4));
     const a = d.arrows;
-    if (a) vals.push(a.radii[e]!, a.sizes[e]!);
+    if (a) vals.push(a.radii[e] ?? NaN, a.sizes[e] ?? NaN);
     put(e, vals);
   }
   return m;
@@ -121,78 +115,79 @@ function expectSameEdges(got: SuperEdgesData, want: SuperEdgesData): void {
   for (const [id, vals] of w) expect(g.get(id), `pair ${id}`).toEqual(vals);
 }
 
-describe("buildCoverRows (#433)", () => {
-  it("holds, per listed cell, each edge's partner at the cell's depth (or a shallower leaf), summed — brute force", () => {
-    const g = fixture(1500, 5);
-    const tree = spatialTree(g);
-    const { parent, leafStart, leafEnd } = tree;
-    if (!parent || !leafStart || !leafEnd) throw new Error("not a spatial tree");
-    const n = tree.leafCount;
-    // Every cell but one listed, plus leaves and repeats (left out).
-    const skipped = n + 3;
-    const all = Array.from({ length: tree.size }, (_, i) => i).filter((x) => x !== skipped);
-    const rows = rowsFor(tree, g, [...all, ...all.slice(n, n + 50)]);
-    const depth = new Int32Array(tree.size);
-    for (let x = tree.size - 1; x >= 0; x--) depth[x] = parent[x]! < 0 ? 0 : depth[parent[x]!]! + 1;
-    for (let x = 0; x < tree.size; x++) expect(rows.depth[x]).toBe(depth[x]);
-    expect(rows.cell.length).toBe(tree.size - n - 1);
-    expect(rowOf(rows, skipped)).toBe(-1);
-    expect(rowOf(rows, 0)).toBe(-1); // leaves have no stored row
-    const inside = (t: number, x: number): boolean => leafStart[t]! >= leafStart[x]! && leafStart[t]! < leafEnd[x]!;
-    const partner = (v: number, d: number): number => {
-      let t = v;
-      while (depth[t]! > d) t = parent[t]!;
-      return t;
-    };
-    const wantOut = new Map<string, number>();
-    const wantIn = new Map<string, number>();
-    const put = (m: Map<string, number>, x: number, t: number, w: number): void => { m.set(`${x}:${t}`, (m.get(`${x}:${t}`) ?? 0) + w); };
-    for (let e = 0; e < g.edgeCount; e++) {
-      const u = g.source[e]!;
-      const v = g.target[e]!;
-      if (u === v) continue;
-      const w = g.weight[e]!;
-      for (let x = parent[u]!; x >= 0 && !inside(v, x); x = parent[x]!) if (x !== skipped) put(wantOut, x, partner(v, depth[x]!), w);
-      for (let y = parent[v]!; y >= 0 && !inside(u, y); y = parent[y]!) if (y !== skipped) put(wantIn, y, partner(u, depth[y]!), w);
-    }
-    const gotOut = new Map<string, number>();
-    const gotIn = new Map<string, number>();
-    for (let i = 0; i < rows.cell.length; i++) {
-      const x = rows.cell[i]!;
-      if (i > 0) expect(x).toBeGreaterThan(rows.cell[i - 1]!); // ascending, for rowOf
-      expect(rowOf(rows, x)).toBe(i);
-      for (let e = rows.outOffset[i]!; e < rows.outOffset[i + 1]!; e++) {
-        expect(gotOut.has(`${x}:${rows.outNode[e]}`), "an out-row lists a partner once").toBe(false);
-        gotOut.set(`${x}:${rows.outNode[e]}`, rows.outFlow[e]!);
+/** A tree without the rows: what the lazy gather alone sees. */
+const bare = (tree: LODTree): LODTree => ({ ...tree, rows: undefined });
+
+describe("buildKeptRows (#433)", () => {
+  for (const band of [0, 0.4]) {
+    it(`holds, per kept cell, each edge's finest cover on the other side, summed per direction — brute force${band > 0 ? ", in a cross-fade band" : ""}`, () => {
+      const g = fixture(3000, 5);
+      const tree = spatialTree(g);
+      const { leafStart, leafEnd, leafOrder } = tree;
+      if (!leafStart || !leafEnd || !leafOrder) throw new Error("not a spatial tree");
+      const n = tree.leafCount;
+      const c = cutAt(tree, { k: 2.2, x: W / 2 - 120 * 2.2, y: H / 2 + 60 * 2.2 }, true, band);
+      const rows = rowsForCut(tree, g, c);
+      const leafOf = (x: number): number[] => Array.from(leafOrder.subarray(leafStart[x] ?? 0, leafEnd[x] ?? 0));
+      const size = (x: number): number => (leafEnd[x] ?? 0) - (leafStart[x] ?? 0);
+      // Each leaf's finest cover: the smallest drawn glyph not split, or culled root, holding it.
+      const split = new Set(c.split);
+      const finest = new Int32Array(n).fill(-1);
+      for (const x of [...c.drawn, ...c.culled]) {
+        if (split.has(x)) continue;
+        for (const v of leafOf(x)) if (finest[v] === -1 || size(x) < size(finest[v] ?? 0)) finest[v] = x;
       }
-      for (let e = rows.inOffset[i]!; e < rows.inOffset[i + 1]!; e++) {
-        expect(gotIn.has(`${x}:${rows.inNode[e]}`), "an in-row lists a partner once").toBe(false);
-        gotIn.set(`${x}:${rows.inNode[e]}`, rows.inFlow[e]!);
+      for (let v = 0; v < n; v++) expect(finest[v], "the covers hold every leaf").toBeGreaterThanOrEqual(0);
+      const inside = (v: number, x: number): boolean => {
+        const r = tree.leafStart?.[v] ?? -1; // a leaf's rank is its own run
+        return r >= (leafStart[x] ?? 0) && r < (leafEnd[x] ?? 0);
+      };
+      const nestedIn = (h: number, x: number): boolean => (leafStart[h] ?? 0) < (leafEnd[x] ?? 0) && (leafStart[x] ?? 0) < (leafEnd[h] ?? 0);
+      const wantOut = new Map<string, number>();
+      const wantIn = new Map<string, number>();
+      const put = (m: Map<string, number>, x: number, h: number, w: number): void => { m.set(`${x}:${h}`, (m.get(`${x}:${h}`) ?? 0) + w); };
+      const keptCells = [...new Set(c.kept)].filter((x) => x >= n).sort((a, b) => a - b);
+      for (const x of keptCells) {
+        for (let e = 0; e < g.edgeCount; e++) {
+          const u = g.source[e] ?? 0;
+          const v = g.target[e] ?? 0;
+          const w = g.weight[e] ?? 0;
+          const hv = finest[v] ?? -1;
+          const hu = finest[u] ?? -1;
+          if (inside(u, x) && hv !== x && !(band > 0 && nestedIn(hv, x))) put(wantOut, x, hv, w);
+          if (inside(v, x) && hu !== x && !(band > 0 && nestedIn(hu, x))) put(wantIn, x, hu, w);
+        }
       }
-    }
-    expect(gotOut).toEqual(wantOut);
-    expect(gotIn).toEqual(wantIn);
-    expect(wantOut.size).toBeGreaterThan(1000); // non-vacuity
-    // Lift entries toward a shallower leaf exist (a ragged tree), and no entry names a deeper node.
-    let lifts = 0;
-    for (let i = 0; i < rows.cell.length; i++) {
-      const x = rows.cell[i]!;
-      for (let e = rows.outOffset[i]!; e < rows.outOffset[i + 1]!; e++) {
-        const t = rows.outNode[e]!;
-        expect(depth[t]).toBeLessThanOrEqual(depth[x]!);
-        if (depth[t]! < depth[x]!) lifts++;
+      expect(Array.from(rows.cell)).toEqual(keptCells); // ascending, for rowOf; leaves have no stored row
+      const gotOut = new Map<string, number>();
+      const gotIn = new Map<string, number>();
+      for (let i = 0; i < rows.cell.length; i++) {
+        const x = rows.cell[i] ?? -1;
+        expect(rowOf(rows, x)).toBe(i);
+        for (let e = rows.outOffset[i] ?? 0; e < (rows.outOffset[i + 1] ?? 0); e++) {
+          expect(gotOut.has(`${x}:${rows.outNode[e]}`), "an out-row lists a partner once").toBe(false);
+          gotOut.set(`${x}:${rows.outNode[e]}`, rows.outFlow[e] ?? NaN);
+        }
+        for (let e = rows.inOffset[i] ?? 0; e < (rows.inOffset[i + 1] ?? 0); e++) {
+          expect(gotIn.has(`${x}:${rows.inNode[e]}`), "an in-row lists a partner once").toBe(false);
+          gotIn.set(`${x}:${rows.inNode[e]}`, rows.inFlow[e] ?? NaN);
+        }
       }
-    }
-    expect(lifts).toBeGreaterThan(0);
-  });
+      expect(gotOut).toEqual(wantOut);
+      expect(gotIn).toEqual(wantIn);
+      expect(wantOut.size).toBeGreaterThan(200); // non-vacuity
+      expect(c.culled.length).toBeGreaterThan(0);
+      if (band > 0) expect(c.split.length).toBeGreaterThan(0);
+      expect(rowOf(rows, 0)).toBe(-1);
+    });
+  }
 });
 
-describe("rowSuperEdges draws the lazy gather's super-edges (#433)", () => {
+describe("lazySuperEdges takes a streamed tree's rows and draws the same super-edges (#433)", () => {
   for (const unit of [false, true]) {
     const n = 6000;
     const g = fixture(n, unit ? 9 : 3, unit);
     const tree = spatialTree(g);
-    const inc = buildLeafIncidence(g, true);
     const views: [string, LODTransform][] = [
       ["fit", { k: 0.9, x: W / 2, y: H / 2 }],
       ["zoomed", { k: 4, x: W / 2 - 150 * 4, y: H / 2 - 80 * 4 }],
@@ -202,28 +197,36 @@ describe("rowSuperEdges draws the lazy gather's super-edges (#433)", () => {
     for (const [linkStyle, directed] of [["line", false], ["line", true], ["half-arrow", true]] as const) {
       it(`${unit ? "unweighted" : "weighted"} ${directed ? "directed" : "undirected"} ${linkStyle}: every view, declutter on/off, cross-fade band`, () => {
         const style = styleOf(directed, linkStyle);
+        const inc = buildLeafIncidence(g, directed);
         let culledLeaves = 0;
         let splits = 0;
         let drawnPairs = 0;
+        let rebuiltWhenMoved = 0;
+        let importedWhenMoved = 0;
         for (const [, t] of views) {
           for (const declutter of [false, true]) {
             for (const band of [0, 0.4]) {
               const c = cutAt(tree, t, declutter, band);
               const edgeStyle = band > 0 ? { ...style, fadeAlpha: c.fade } : style;
               const view = visibleWorldRect(t, W, H);
-              const lazy = lazySuperEdges(tree, c, edgeStyle, view, g.csr, inc, makeLazySuperEdgesScratch());
+              const lazy = lazySuperEdges(bare(tree), c, edgeStyle, view, g.csr, inc, makeLazySuperEdgesScratch());
               // Rows for exactly this cut (the worker saw the same view): no leaf run is walked.
               const sc = makeLazySuperEdgesScratch();
-              const rows = rowSuperEdges({ ...tree, rows: rowsForCut(tree, g, c) }, c, edgeStyle, view, g.csr, inc, sc);
+              const rows = lazySuperEdges({ ...tree, rows: rowsForCut(tree, g, c) }, c, edgeStyle, view, g.csr, inc, sc);
               expectSameEdges(rows, lazy);
               expect(sc.visits, "the row gather walks no leaf run").toBe(0);
+              expect(sc.misses).toBe(0);
               expect(sc.labelled).toBe(0);
-              // Rows for another view's cut (the view moved since), and none: the unlisted covers' leaves are
-              // walked, and the edges drawn are still the same.
-              const other = cutAt(tree, { k: t.k * 1.7, x: t.x - 90, y: t.y + 40 }, false, band);
-              const moved = rowSuperEdges({ ...tree, rows: rowsForCut(tree, g, other) }, c, edgeStyle, view, g.csr, inc, makeLazySuperEdgesScratch());
+              expect(sc.imported).toBe(new Set([...c.kept].filter((x) => x >= n)).size);
+              // Rows for another view's cut (the view moved since), and none: the glyphs the rows cannot serve
+              // walk their leaves, and the edges drawn are still the same.
+              const other = cutAt(tree, { k: t.k * 1.7, x: t.x - 90, y: t.y + 40 }, declutter, band);
+              const msc = makeLazySuperEdgesScratch();
+              const moved = lazySuperEdges({ ...tree, rows: rowsForCut(tree, g, other) }, c, edgeStyle, view, g.csr, inc, msc);
               expectSameEdges(moved, lazy);
-              const none = rowSuperEdges({ ...tree, rows: rowsFor(tree, g, []) }, c, edgeStyle, view, g.csr, inc, makeLazySuperEdgesScratch());
+              rebuiltWhenMoved += msc.misses;
+              importedWhenMoved += msc.imported;
+              const none = lazySuperEdges({ ...tree, rows: rowsForCut(tree, g, { ...c, kept: new Uint32Array(0) }) }, c, edgeStyle, view, g.csr, inc, makeLazySuperEdgesScratch());
               expectSameEdges(none, lazy);
               culledLeaves += [...c.culled].filter((x) => x < n).length;
               splits += c.split.length;
@@ -231,90 +234,131 @@ describe("rowSuperEdges draws the lazy gather's super-edges (#433)", () => {
             }
           }
         }
-        // Non-vacuity: culled leaves, a band's split glyphs and many pairs were all exercised.
+        // Non-vacuity: culled leaves, a band's split glyphs and many pairs were all exercised, and a moved view
+        // both took rows and rebuilt some.
         expect(culledLeaves).toBeGreaterThan(0);
         expect(splits).toBeGreaterThan(0);
         expect(drawnPairs).toBeGreaterThan(1000);
+        expect(rebuiltWhenMoved).toBeGreaterThan(0);
+        expect(importedWhenMoved).toBeGreaterThan(0);
       });
     }
   }
 
-  it("computes the row of a cell the worker's rows do not list once per tree: the view moved, then holds", () => {
+  it("takes every row at a cut coarser than the rows', merging the partners it coarsened; a cut that opened a partner up rebuilds the rows naming it, once", () => {
     const g = fixture(6000, 3);
     const tree = spatialTree(g);
     const inc = buildLeafIncidence(g, true);
-    const fit: LODTransform = { k: 0.9, x: W / 2, y: H / 2 };
-    const zoomed: LODTransform = { k: 4, x: W / 2 - 150 * 4, y: H / 2 - 80 * 4 };
-    const rowTree: LODTree = { ...tree, rows: rowsForCut(tree, g, cutAt(tree, fit, true)) }; // the worker saw the fit
-    const c = cutAt(tree, zoomed, true); // the main thread has zoomed in since
-    const view = visibleWorldRect(zoomed, W, H);
-    const sc = makeLazySuperEdgesScratch();
-    const first = rowSuperEdges(rowTree, c, styleOf(true), view, g.csr, inc, sc);
-    expect(sc.misses, "cells the worker's rows did not list").toBeGreaterThan(0);
-    expect(sc.visits).toBeGreaterThan(0);
-    const held = rowSuperEdges(rowTree, c, styleOf(true), view, g.csr, inc, sc);
-    expect(sc.misses, "held view: rows computed").toBe(0);
-    expect(sc.visits, "held view: incidences walked").toBe(0);
-    expect(sc.hits).toBeGreaterThan(0);
-    expectSameEdges(held, first);
-    expectSameEdges(held, lazySuperEdges(tree, c, styleOf(true), view, g.csr, inc));
-    // Another tree (the next streamed frame): the cache starts over.
-    const next: LODTree = { ...rowTree };
-    rowSuperEdges(next, c, styleOf(true), view, g.csr, inc, sc);
-    expect(sc.misses).toBeGreaterThan(0);
-  });
-
-  it("reads rows bounded by the view, not by the edges under it: 4× the graph in the same extent", () => {
     const t: LODTransform = { k: 0.9, x: W / 2, y: H / 2 };
     const view = visibleWorldRect(t, W, H);
-    const measure = (n: number): { entries: number; visits: number; drawn: number; pairs: number } => {
+    const c = cutAt(tree, t, true);
+    const rows = rowsForCut(tree, g, c);
+    const { parent } = tree;
+    if (!parent) throw new Error("not a spatial tree");
+    // Coarsen: a parent all of whose children are drawn and decluttered away is drawn instead of them.
+    const kept = new Set(c.kept);
+    const drawnSet = new Set(c.drawn);
+    const children = new Map<number, number[]>();
+    for (let x = 0; x < tree.size; x++) {
+      const p = parent[x] ?? -1;
+      if (p >= 0) children.set(p, [...(children.get(p) ?? []), x]);
+    }
+    const merged = [...children].filter(([, ch]) => ch.every((x) => drawnSet.has(x) && !kept.has(x))).map(([p, ch]) => ({ p, ch }));
+    expect(merged.length, "a parent of decluttered glyphs only").toBeGreaterThan(0);
+    const gone = new Set(merged.flatMap((m) => m.ch));
+    const coarse: LazyCut = { ...c, drawn: Uint32Array.from([...[...c.drawn].filter((x) => !gone.has(x)), ...merged.map((m) => m.p)]) };
+    const sc = makeLazySuperEdgesScratch();
+    const out = lazySuperEdges({ ...tree, rows }, coarse, styleOf(true), view, g.csr, inc, sc);
+    expectSameEdges(out, lazySuperEdges(bare(tree), coarse, styleOf(true), view, g.csr, inc));
+    expect(sc.misses, "every kept cell's row is taken").toBe(0);
+    expect(sc.visits).toBe(0);
+    expect(sc.imported).toBe(new Set([...c.kept].filter((x) => x >= tree.leafCount)).size);
+    // Open up: a decluttered glyph some kept row names is drawn as its children instead — the rows naming it
+    // are rebuilt from leaves (the others are taken), then a held view walks nothing.
+    const named = new Set<number>();
+    for (let i = 0; i < rows.outNode.length; i++) named.add(rows.outNode[i] ?? -1);
+    const opened = [...c.drawn].find((x) => !kept.has(x) && x >= tree.leafCount && named.has(x) && (children.get(x) ?? []).length > 1);
+    if (opened === undefined) throw new Error("no decluttered cell a row names");
+    const fine: LazyCut = { ...c, drawn: Uint32Array.from([...[...c.drawn].filter((x) => x !== opened), ...(children.get(opened) ?? [])]) };
+    const fsc = makeLazySuperEdgesScratch();
+    const rowTree: LODTree = { ...tree, rows };
+    const first = lazySuperEdges(rowTree, fine, styleOf(true), view, g.csr, inc, fsc);
+    expectSameEdges(first, lazySuperEdges(bare(tree), fine, styleOf(true), view, g.csr, inc));
+    expect(fsc.misses).toBeGreaterThan(0);
+    expect(fsc.imported).toBeGreaterThan(0);
+    expect(fsc.misses + fsc.imported + [...fine.kept].filter((x) => x < tree.leafCount).length).toBe(fine.kept.length);
+    const held = lazySuperEdges(rowTree, fine, styleOf(true), view, g.csr, inc, fsc);
+    expect(fsc.misses, "held view: rows rebuilt").toBe(0);
+    expect(fsc.visits, "held view: incidences walked").toBe(0);
+    expect(fsc.hits).toBe(fine.kept.length);
+    expectSameEdges(held, first);
+    // Another tree (the next streamed frame): the memo starts over and takes the rows again.
+    lazySuperEdges({ ...rowTree }, c, styleOf(true), view, g.csr, inc, fsc);
+    expect(fsc.hits).toBe(0);
+    expect(fsc.misses).toBe(0);
+  });
+
+  it("reads rows bounded by what the kept glyphs link to, not by the edges under them: 4× the graph in the same extent", () => {
+    const t: LODTransform = { k: 0.9, x: W / 2, y: H / 2 };
+    const view = visibleWorldRect(t, W, H);
+    const measure = (n: number): { entries: number; lazyRows: number; leafDegrees: number; visits: number; drawn: number } => {
       const g = fixture(n, 4);
       const tree = spatialTree(g);
-      const inc = buildLeafIncidence(g, true);
+      const inc = buildLeafIncidence(g, false);
       const c = cutAt(tree, t, false);
-      const rowTree: LODTree = { ...tree, rows: rowsForCut(tree, g, c) };
       const lazySc = makeLazySuperEdgesScratch();
-      lazySuperEdges(tree, c, styleOf(false), view, g.csr, inc, lazySc);
+      lazySuperEdges(bare(tree), c, styleOf(false), view, g.csr, inc, lazySc);
       const sc = makeLazySuperEdgesScratch();
-      const out = rowSuperEdges(rowTree, c, styleOf(false), view, g.csr, inc, sc);
-      return { entries: sc.entries, visits: lazySc.visits, drawn: c.drawn.length, pairs: out.ids.length };
+      lazySuperEdges({ ...tree, rows: rowsForCut(tree, g, c) }, c, styleOf(false), view, g.csr, inc, sc);
+      let leafDegrees = 0;
+      for (const x of c.kept) if (x < n) leafDegrees += g.csr.degree[x] ?? 0;
+      return { entries: sc.entries, lazyRows: lazySc.ents, leafDegrees, visits: lazySc.visits, drawn: c.drawn.length };
     };
     const small = measure(20_000);
     const large = measure(80_000);
     // The lazy gather walks every incidence under the frontier: 4× the edges, ~4× the work.
     expect(large.visits).toBeGreaterThan(3 * small.visits);
-    // The rows it reads follow what the screen-bounded frontier draws instead (measured: 205 → 223 glyphs,
-    // 5.5k → 11.8k pairs as the pairs among them fill in, 2.5-2.9 entries per pair).
     expect(large.drawn).toBeLessThan(1.5 * small.drawn);
-    for (const m of [small, large]) expect(m.entries).toBeLessThan(4 * m.pairs);
+    // The rows read are the kept glyphs' rows — one entry per cover they link to, per direction — plus the kept
+    // leaves' own edges: at most twice what the lazy gather's rows hold, whatever the edges under them.
+    for (const m of [small, large]) expect(m.entries).toBeLessThanOrEqual(2 * m.lazyRows + m.leafDegrees);
     expect(large.entries * 4).toBeLessThan(large.visits);
   });
 });
 
-describe("a spatial stream ships the rows of its view's covers with each tree (#433)", () => {
+describe("a spatial stream ships the rows of the glyphs its view keeps with each tree (#433)", () => {
   it("builds them for every rebuilt tree at the view (a transform, or the fit), reuses buffers, and builds none without links or a view", () => {
     const g = fixture(3000, 7);
     const style = { radii: new Float32Array(g.nodeCount).fill(3), weight: g.strength };
     const t: LODTransform = { k: 1.3, x: W / 2 - 60, y: H / 2 + 30 };
-    const view: LODView = { transform: t, fitPad: 3, width: W, height: H, maxAggregateRadius: 20, screenSized: true, fadeBand: 0 };
+    const view: LODView = { transform: t, fitPad: 3, width: W, height: H, maxAggregateRadius: 20, screenSized: true, fadeBand: 0, declutter: true };
     const stream = makeSpatialLODStream(g.nodeCount, style, 1, g, view);
     const f1 = lodFrameStep(stream, g.positions, 1);
     if (!f1?.rows) throw new Error("no rows");
     const tree = lodTreeFromSpatialFrame(f1);
-    // Exactly the rows of the covers the engine's cut draws at that view.
-    const c = cutAt(tree, t, false);
+    // Exactly the rows of the glyphs the engine's cut and declutter keep at that view.
+    const c = cutAt(tree, t, true);
     const want = rowsForCut(tree, g, c);
     expect(tree.rows?.cell).toEqual(want.cell);
     expect(tree.rows?.outNode).toEqual(want.outNode);
     expect(tree.rows?.outFlow).toEqual(want.outFlow);
     expect(tree.rows?.inNode).toEqual(want.inNode);
-    expect(tree.rows?.depth).toEqual(want.depth);
+    expect(tree.rows?.inFlow).toEqual(want.inFlow);
     expect(want.cell.length).toBeGreaterThan(10);
     // A returned rows buffer is reused by the next rebuild.
     const rowsBuffer = f1.rows.buffer;
     recycleSpatialFrame(stream, f1.buffer, f1.rows.buffer);
     const f2 = lodFrameStep(stream, g.positions, 2);
     expect(f2?.rows?.buffer).toBe(rowsBuffer);
+    // Without declutter, those of every drawn glyph.
+    stream.view = { ...view, declutter: false };
+    const f0 = lodFrameStep(stream, g.positions, 100);
+    if (!f0?.rows) throw new Error("no rows");
+    const all = lodTreeFromSpatialFrame(f0);
+    expect(all.rows?.cell).toEqual(rowsForCut(all, g, cutAt(all, t, false)).cell);
+    expect(all.rows?.cell.length).toBeGreaterThan(want.cell.length);
+    recycleSpatialFrame(stream, f0.buffer, f0.rows.buffer);
+    stream.view = view;
     // Following the fit: the cut at the fit the engine frames the positions at.
     stream.view = { ...view, transform: null };
     const f3 = lodFrameStep(stream, g.positions, 3);
@@ -323,7 +367,7 @@ describe("a spatial stream ships the rows of its view's covers with each tree (#
     const box = layoutBox(g.positions, g.nodeCount, { trimStragglers: true });
     if (!box) throw new Error("no fit box");
     const fitT = layoutFitTransform(box, W, H, 3, true);
-    expect(fitTree.rows?.cell).toEqual(rowsForCut(fitTree, g, cutAt(fitTree, fitT, false)).cell);
+    expect(fitTree.rows?.cell).toEqual(rowsForCut(fitTree, g, cutAt(fitTree, fitT, true)).cell);
     // The frame names the box it framed, so the engine frames the same one — in shared mode the live positions
     // are newer than the tree by the time it repaints; at a transform there is none to name.
     expect(f3.header.fitBox).toEqual(box);
@@ -344,7 +388,7 @@ describe("a spatial stream ships the rows of its view's covers with each tree (#
   it("drops pooled rows buffers too large for the rows after a zoom-in: the warm stream reuses buffers and holds no stale one", () => {
     const g = fixture(6000, 11);
     const style = { radii: new Float32Array(g.nodeCount).fill(3), weight: g.strength };
-    const fit: LODView = { transform: { k: 0.6, x: W / 2, y: H / 2 }, fitPad: 3, width: W, height: H, maxAggregateRadius: 20, screenSized: true, fadeBand: 0 };
+    const fit: LODView = { transform: { k: 0.6, x: W / 2, y: H / 2 }, fitPad: 3, width: W, height: H, maxAggregateRadius: 20, screenSized: true, fadeBand: 0, declutter: false };
     const stream = makeSpatialLODStream(g.nodeCount, style, 1, g, fit);
     // The engine draws one tree and holds the one it replaced until the next repaint, then hands it back.
     const held: SpatialLODFrame[] = [];
@@ -359,7 +403,7 @@ describe("a spatial stream ships the rows of its view's covers with each tree (#
       return f;
     };
     for (let i = 0; i < 6; i++) seen.add(step().rows?.buffer ?? new ArrayBuffer(0));
-    const fitBytes = spatialRowsByteLength(held[held.length - 1]?.rows?.sizes ?? { size: 0, leafCount: 0, cells: 0, outEntries: 0, inEntries: 0 });
+    const fitBytes = spatialRowsByteLength(held[held.length - 1]?.rows?.sizes ?? { cells: 0, outEntries: 0, inEntries: 0 });
     // Zoom in: the rows shrink by far more than half.
     stream.view = { ...fit, transform: { k: 40, x: W / 2, y: H / 2 } };
     let fresh = 0;

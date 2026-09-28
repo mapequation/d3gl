@@ -13,8 +13,8 @@ import {
   type LODTree,
 } from "../lod.js";
 import { buildGraph, type NetworkGraph } from "../graph.js";
-import { buildLeafIncidence, lazySuperEdges, makeLazySuperEdgesScratch, rowSuperEdges, type LazySuperEdgesScratch } from "../lazy-super-edges.js";
-import { buildCoverRows, cutRowCells, makeSpatialRowsScratch, spatialRowsByteLength, spatialRowsGraph, spatialRowsViews, type SpatialRows, type SpatialRowsGraph, type SpatialRowsScratch } from "../spatial-rows.js";
+import { buildLeafIncidence, lazySuperEdges, makeLazySuperEdgesScratch, type LazySuperEdgesScratch } from "../lazy-super-edges.js";
+import { buildKeptRows, makeSpatialRowsScratch, spatialRowsByteLength, spatialRowsGraph, spatialRowsViews, type SpatialRows, type SpatialRowsGraph, type SpatialRowsScratch } from "../spatial-rows.js";
 import type { SuperEdgeStyleResolved } from "../glyphs.js";
 
 /**
@@ -33,10 +33,15 @@ import type { SuperEdgeStyleResolved } from "../glyphs.js";
  *   - **drag**: one held leaf moved per frame (`updateLODPositionsForLeaves`, the drag repaint) with the
  *     memo warm;
  *   - **streamed-rows** (#433): the streamed sweep on the trees a streaming layout delivers — each with the
- *     super-edge rows its worker built for that frame's view — gathered by `rowSuperEdges`: zero rows computed
- *     and zero incidences walked on every frame, the same super-edges as the lazy gather (pinned at the fit
- *     frame), and fewer row entries read than the lazy streamed leg walks incidences. The worker's rows build
- *     is timed apart and reported as **rows-build** (not a main-thread cost).
+ *     super-edge rows its worker built for the glyphs that frame's view keeps: zero rows computed and zero
+ *     incidences walked on every frame, the same super-edges as the lazy gather (pinned at the fit frame), and
+ *     row entries read bounded by the kept glyphs' rows (at most twice the lazy gather's row entries, plus the
+ *     kept leaves' own edges) — not by the edges under them. The worker's rows build is timed apart and
+ *     reported as **rows-build** (not a main-thread cost);
+ *   - **streamed-gesture** (#433): a pan and zoom while the layout streams, each tree's rows built one view
+ *     behind the one it is drawn at (the worker's round trip): the same super-edges, and never more
+ *     incidences walked than the lazy gather at that cut (the kept glyphs whose rows name a cover the view
+ *     opened up walk their leaves; the rest take their rows).
  *
  * Deterministic signatures, asserted unconditionally: the spatial tree carries **no super-edge CSR** (the
  * gather never builds one); a **held view** re-emits from the row memo with zero rows rebuilt and zero
@@ -127,23 +132,21 @@ function frame(
   const kept = opts.declutter ? declutterFrontier(f.tree, drawn, t, W, H, { screenSized: true, k: t.k, maxAggregateRadius: MAX_AGG }, s.dc) : drawn;
   const covers = { drawn, kept, culled: s.cut.culled.subarray(0, s.cut.culledCount), split: s.cut.split.subarray(0, s.cut.splitCount) };
   const view = visibleWorldRect(t, W, H);
-  const out = opts.rows
-    ? rowSuperEdges({ ...f.tree, rows: opts.rows }, covers, STYLE, view, f.graph.csr, inc, s.lazy)
-    : lazySuperEdges(f.tree, covers, STYLE, view, f.graph.csr, inc, s.lazy);
+  const out = lazySuperEdges(opts.rows ? { ...f.tree, rows: opts.rows } : f.tree, covers, STYLE, view, f.graph.csr, inc, s.lazy);
   return { drawn: drawn.length, kept: kept.length, edges: out.ids.length, ids: out.ids, flows: out.flows ?? [] };
 }
 
-/** The super-edge rows a streaming layout's worker builds for the covers of `t`'s cut (#433), timed. */
-function workerRows(f: ReturnType<typeof webLike>, t: LODTransform, graph: SpatialRowsGraph, scratch: SpatialRowsScratch, cutSc: ReturnType<typeof makeCutScratch>): { rows: SpatialRows; ms: number; bytes: number } {
-  const { parent, leafOrder, leafStart, leafEnd } = f.tree;
-  if (!parent || !leafOrder || !leafStart || !leafEnd) throw new Error("a spatial tree carries its parent map and leaf runs");
+/** The super-edge rows a streaming layout's worker builds for the glyphs `t`'s cut and declutter keep (#433), timed. */
+function workerRows(f: ReturnType<typeof webLike>, t: LODTransform, graph: SpatialRowsGraph, scratch: SpatialRowsScratch, cutSc: ReturnType<typeof makeCutScratch>, dcSc: ReturnType<typeof makeDeclutterFrontierScratch>): { rows: SpatialRows; ms: number; bytes: number } {
+  const { leafOrder, leafStart, leafEnd } = f.tree;
+  if (!leafOrder || !leafStart || !leafEnd) throw new Error("a spatial tree carries its leaf runs");
   const t0 = performance.now();
   const drawn = cut(f.tree, t, W, H, { screenSized: true, maxAggregateRadius: MAX_AGG, recordCulled: true }, cutSc);
-  const cells = { cells: new Uint32Array(0) };
-  const m = cutRowCells(parent, { drawn, culled: cutSc.culled.subarray(0, cutSc.culledCount), split: cutSc.split.subarray(0, cutSc.splitCount) }, drawn, cells);
+  const kept = declutterFrontier(f.tree, drawn, t, W, H, { screenSized: true, k: t.k, maxAggregateRadius: MAX_AGG }, dcSc);
+  const covers = { drawn, kept, culled: cutSc.culled.subarray(0, cutSc.culledCount), split: cutSc.split.subarray(0, cutSc.splitCount) };
   let rows: SpatialRows | null = null;
   let bytes = 0;
-  buildCoverRows({ size: f.tree.size, leafCount: f.tree.leafCount, parent, leafOrder, leafStart, leafEnd }, cells.cells.subarray(0, m), graph, scratch, (sizes) => {
+  buildKeptRows({ size: f.tree.size, leafCount: f.tree.leafCount, leafOrder, leafStart, leafEnd }, covers, graph, scratch, (sizes) => {
     bytes = spatialRowsByteLength(sizes);
     rows = spatialRowsViews(new ArrayBuffer(bytes), sizes);
     return rows;
@@ -221,8 +224,9 @@ function runLegs(f: ReturnType<typeof webLike>, frames: number): LegResult[] {
   const rowsGraph = spatialRowsGraph(f.graph.nodeCount, f.graph);
   const rowsScratch = makeSpatialRowsScratch();
   const workerCut = makeCutScratch();
+  const workerDeclutter = makeDeclutterFrontierScratch();
   const fit = at(f.centroid, f.baseK);
-  const fitRows = workerRows(f, fit, rowsGraph, rowsScratch, workerCut);
+  const fitRows = workerRows(f, fit, rowsGraph, rowsScratch, workerCut, workerDeclutter);
   const lazyFit = frame(f, fit, s, inc, { declutter: true });
   s.lazy.memoTree = null;
   const rowsFit = frame(f, fit, s, inc, { declutter: true, rows: fitRows.rows });
@@ -232,6 +236,7 @@ function runLegs(f: ReturnType<typeof webLike>, frames: number): LegResult[] {
   let buildBytes = 0;
   let buildEntries = 0;
   let frameRows: SpatialRows = fitRows.rows;
+  const lazyCheck = makeLazySuperEdgesScratch();
   leg("streamed-rows", () => {
     const r = frame(f, at(f.centroid, sweepK(sweepAt)), s, inc, { declutter: true, rows: frameRows });
     expect(s.lazy.misses, "a streamed repaint with the worker's rows computes no row").toBe(0);
@@ -239,12 +244,66 @@ function runLegs(f: ReturnType<typeof webLike>, frames: number): LegResult[] {
     return r;
   }, (i) => {
     sweepAt = i;
-    const b = workerRows(f, at(f.centroid, sweepK(i)), rowsGraph, rowsScratch, workerCut);
+    if (i > 0) {
+      // The last frame's rows read against the lazy gather's rows of the same cut (outside the timing): one
+      // entry per cover a kept glyph links to, per direction, plus the kept leaves' own edges.
+      const t = at(f.centroid, sweepK(i - 1));
+      const drawn = cut(f.tree, t, W, H, { screenSized: true, maxAggregateRadius: MAX_AGG, recordCulled: true }, workerCut);
+      const kept = declutterFrontier(f.tree, drawn, t, W, H, { screenSized: true, k: t.k, maxAggregateRadius: MAX_AGG }, workerDeclutter);
+      let leafDegrees = 0;
+      for (const g of kept) if (g < f.tree.leafCount) leafDegrees += f.graph.csr.degree[g] ?? 0;
+      const read = s.lazy.entries;
+      lazySuperEdges({ ...f.tree }, { drawn, kept, culled: workerCut.culled.subarray(0, workerCut.culledCount), split: workerCut.split.subarray(0, workerCut.splitCount) }, STYLE, visibleWorldRect(t, W, H), f.graph.csr, inc, lazyCheck);
+      expect(read, "row entries read, bounded by the kept glyphs' rows").toBeLessThanOrEqual(2 * lazyCheck.ents + leafDegrees);
+    }
+    const b = workerRows(f, at(f.centroid, sweepK(i)), rowsGraph, rowsScratch, workerCut, workerDeclutter);
     frameRows = b.rows;
     buildMs.push(b.ms);
     buildBytes = Math.max(buildBytes, b.bytes);
     buildEntries = Math.max(buildEntries, b.rows.outNode.length + b.rows.inNode.length);
   });
+  // streamed-gesture (#433): a pan and zoom while the layout streams. Each tree's rows were built one view
+  // behind the one it is drawn at (the worker's round trip), so a kept glyph whose row names a cover the new
+  // view opened up, or that the rows do not list, walks its leaves — never more than the lazy gather walks at
+  // that cut, and drawing the same super-edges; the rest take their rows.
+  const k0 = f.baseK * 4;
+  const gestureT = (i: number): LODTransform => {
+    const k = k0 * Math.pow(1.08, i);
+    const base = at(f.centroid, k);
+    return { k, x: base.x + 30 * i, y: base.y - 12 * i };
+  };
+  const gestureCut = makeCutScratch();
+  const gestureDeclutter = makeDeclutterFrontierScratch();
+  const lazyAt = (t: LODTransform): { visits: number; ids: number[]; flows: number[] } => {
+    const drawn = cut(f.tree, t, W, H, { screenSized: true, maxAggregateRadius: MAX_AGG, recordCulled: true }, gestureCut);
+    const kept = declutterFrontier(f.tree, drawn, t, W, H, { screenSized: true, k: t.k, maxAggregateRadius: MAX_AGG }, gestureDeclutter);
+    const out = lazySuperEdges({ ...f.tree }, { drawn, kept, culled: gestureCut.culled.subarray(0, gestureCut.culledCount), split: gestureCut.split.subarray(0, gestureCut.splitCount) }, STYLE, visibleWorldRect(t, W, H), f.graph.csr, inc, lazyCheck);
+    return { visits: lazyCheck.visits, ids: out.ids, flows: out.flows ?? [] };
+  };
+  let gestureRows: SpatialRows = fitRows.rows;
+  let imported = 0;
+  let rebuilt = 0;
+  let gestureLazyVisits = 0;
+  leg("streamed-gesture", (i) => frame(f, gestureT(i + 1), s, inc, { declutter: true, rows: gestureRows }), (i) => {
+    if (i > 0) {
+      // The last repaint (at gestureT(i)) against the lazy gather at the same cut, outside the timing.
+      const read = { visits: s.lazy.visits, imported: s.lazy.imported, misses: s.lazy.misses };
+      const lazy = lazyAt(gestureT(i));
+      expect(read.visits, "a repaint one view behind walks no more than the lazy gather").toBeLessThanOrEqual(lazy.visits);
+      imported += read.imported;
+      rebuilt += read.misses;
+      gestureLazyVisits = Math.max(gestureLazyVisits, lazy.visits);
+    }
+    gestureRows = workerRows(f, gestureT(i), rowsGraph, rowsScratch, workerCut, workerDeclutter).rows;
+  });
+  {
+    // The same super-edges as the lazy gather, one view behind.
+    const behind = frame(f, gestureT(1), s, inc, { declutter: true, rows: workerRows(f, gestureT(0), rowsGraph, rowsScratch, workerCut, workerDeclutter).rows });
+    const lazy = lazyAt(gestureT(1));
+    expect(byId(behind.ids, behind.flows), "one view behind, the rows gather draws the lazy gather's super-edges").toEqual(byId(lazy.ids, lazy.flows));
+    expect(imported, "kept glyphs whose rows carried over to the next view").toBeGreaterThan(0);
+    console.log(`streamed-gesture: rows taken ${imported}, rebuilt from leaves ${rebuilt}; lazy walks up to ${gestureLazyVisits.toLocaleString()} incidences per repaint`);
+  }
   const lazyStreamed = results.find((r) => r.name === "streamed");
   const rowsStreamed = results.find((r) => r.name === "streamed-rows");
   if (!lazyStreamed || !rowsStreamed) throw new Error("missing legs");
@@ -284,10 +343,10 @@ function report(results: LegResult[], n: number, label: string): void {
 // Calibrated on an M-series laptop at 100k (medians): streamed ≈ 5 ms, zoom ≈ 4 ms, all-leaves ≈ 16 ms,
 // reductions-off ≈ 36 ms (every one of the ~290k edges drawn), drag ≈ 1.5 ms. Ceilings are ~10× those;
 // the at-scale leg splits each into a constant and a per-100k-leaves term.
-// streamed-rows (#433) ≈ 4 ms: the ceiling of the streamed leg it replaces. rows-build ≈ 12-20 ms is the
-// worker's step, off the main thread; ~10× its median keeps it O(edges under the covers).
-const LOCAL_BUDGET: Record<string, number> = { streamed: 50, zoom: 40, "all-leaves": 160, "reductions-off": 400, drag: 15, "streamed-rows": 50, "rows-build": 200 };
-const CONSTANT_MS: Record<string, number> = { streamed: 10, zoom: 10, "all-leaves": 20, "reductions-off": 40, drag: 5, "streamed-rows": 10, "rows-build": 20 };
+// streamed-rows (#433) ≈ 2.5 ms and streamed-gesture ≈ 3.5 ms: the ceiling of the streamed leg they replace.
+// rows-build ≈ 2 ms is the worker's step, off the main thread; its ceiling keeps it O(edges under the kept cells).
+const LOCAL_BUDGET: Record<string, number> = { streamed: 50, zoom: 40, "all-leaves": 160, "reductions-off": 400, drag: 15, "streamed-rows": 50, "streamed-gesture": 50, "rows-build": 200 };
+const CONSTANT_MS: Record<string, number> = { streamed: 10, zoom: 10, "all-leaves": 20, "reductions-off": 40, drag: 5, "streamed-rows": 10, "streamed-gesture": 10, "rows-build": 20 };
 
 describe("#343 spatial LOD frame: cut + declutter + lazy super-edges", () => {
   it(`stays within budget at ${LOCAL_N.toLocaleString()} leaves, with the deterministic signatures`, () => {

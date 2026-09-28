@@ -325,13 +325,16 @@ net
   between glyphs at different levels are always drawn (`crossLevelEdges` makes no difference here), a
   link leaving the view points at the off-screen cell that holds its neighbour (a coarser cell the
   further away it is), and an undirected pair is one line carrying both directions' flow.
-- **While the worker streams, it sums them too.** It cuts each tree it rebuilds the way the main thread
-  will — at your view, or at the fit while the camera follows the layout — and hands over the summed
-  links of those glyphs with the tree. A streamed repaint then reads a few thousand summed rows instead
-  of every edge in view: 0.2-0.5 ms instead of 10-12 ms at the fit view of a 325k-node, 1.5M-edge web
-  graph, for 36-43 ms more work per rebuild in the worker (11-15 ms at 4× zoom, 1-2 ms at 16×). A glyph the worker
-  did not cut for — mid-gesture, or after you zoom a settled layout — is summed on the main thread once
-  per tree.
+- **While the worker streams, it sums them too.** It cuts and declutters each tree it rebuilds the way
+  the main thread will — at your view, or at the fit while the camera follows the layout — and hands over,
+  with the tree, each kept glyph's links summed per glyph or off-screen cell it reaches. A streamed repaint
+  then reads those rows — bounded by what the kept glyphs link to, not by the edges under them — instead of
+  every edge in view: about 1 ms instead of 14 ms for the cut, declutter and links at the fit view of a
+  325k-node, 1.5M-edge web graph (3 ms instead of 9 ms at 4× zoom), for 14-16 ms more work per rebuild in
+  the worker (5-9 ms at 4×); on a million nodes with 10M edges, 1.5 ms instead of 225 ms at the fit view
+  and 16 ms instead of 216 ms at 4×, for 90-190 ms more per rebuild in the worker (a force tick there
+  takes ~1 s) and 0.4-8 MB per frame. A glyph whose row the worker's cut cannot serve — mid-gesture, or
+  after you zoom a settled layout — is summed on the main thread from its members' edges, as below.
 - **Elsewhere the main thread sums them.** On the other backends, and for a tree the main thread
   rebuilt, the work is proportional to the edges of the drawn glyphs' members, and an unchanged view
   re-emits them from a per-tree memo. At the fit view that is every edge in view: about 10 ms per frame

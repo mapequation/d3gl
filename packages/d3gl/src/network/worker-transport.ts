@@ -53,7 +53,7 @@ export interface WorkerLayoutOptions {
   /** The leaf style a spatial stream aggregates per rebuild (#343), and its version (echoed per tree). */
   lodStyle?: LeafStyle;
   lodStyleVersion?: number;
-  /** The view whose covers' super-edge rows a spatial stream builds with each tree (#433). */
+  /** The view whose kept glyphs' super-edge rows a spatial stream builds with each tree (#433). */
   lodView?: LODView;
   /**
    * Continue the layout `graph.positions` holds instead of seeding one (#311): no disc, no multilevel

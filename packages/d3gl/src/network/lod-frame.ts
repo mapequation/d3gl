@@ -12,8 +12,9 @@
  *   wander out of their cells, so the step **rebuilds** it — topology, geometry and the aggregated style —
  *   into one packed buffer ({@link SpatialLODFrame}) to transfer, and, for a stream that knows the graph's
  *   edges, draws links and has been told the main thread's view ({@link LODView}), the **super-edge rows** of
- *   the covers that view's cut draws into a second one (#433, `spatial-rows.ts`) — so the main thread gathers
- *   a streamed tree's links in O(visible) instead of walking every edge under the frontier. Buffers come back
+ *   the glyphs that view's cut and declutter keep into a second one (#433, `spatial-rows.ts`) — so the main
+ *   thread reads a streamed tree's links from rows bounded by what it draws instead of walking every edge
+ *   under the frontier. Buffers come back
  *   from the main thread for reuse ({@link recycleSpatialFrame}), so a warm stream allocates nothing. It
  *   rebuilds only for new positions (a frame id it has not built), so it stops once the layout has converged.
  *
@@ -28,12 +29,15 @@ import {
   computeLODPositions,
   computeLODStyle,
   cut,
+  declutterFrontier,
   lodTreeFromTopology,
   makeCutScratch,
+  makeDeclutterFrontierScratch,
   makeLODBoundsScratch,
   makeMortonScratch,
   mortonRootBox,
   type CutScratch,
+  type DeclutterFrontierScratch,
   type LODBoundsScratch,
   type LODPositionTree,
   type LODTree,
@@ -44,8 +48,7 @@ import {
 } from "./lod.js";
 import { layoutBox, layoutFitTransform, type FitBox } from "./fit.js";
 import {
-  buildCoverRows,
-  cutRowCells,
+  buildKeptRows,
   makeSpatialRowsScratch,
   spatialRowsByteLength,
   spatialRowsGraph,
@@ -201,12 +204,12 @@ export interface StructureLODStream {
 }
 
 /**
- * The view a spatial stream builds super-edge rows for (#433): what the main thread's LOD cut is called with
- * — so the worker cuts each rebuilt tree the same way and builds the rows of exactly the covers it will draw.
- * `transform: null` while the camera follows the streaming layout's fit, which the worker computes from the
- * frame's positions as the engine does (`layoutBox` without stragglers → `layoutFitTransform` padded by
- * `fitPad`). A view that has moved on only costs speed: the main thread sums a cover the rows do not list
- * from its leaves, once per tree.
+ * The view a spatial stream builds super-edge rows for (#433): what the main thread's LOD cut and declutter
+ * are called with — so the worker cuts and declutters each rebuilt tree the same way and builds the rows of
+ * exactly the glyphs it will keep. `transform: null` while the camera follows the streaming layout's fit,
+ * which the worker computes from the frame's positions as the engine does (`layoutBox` without stragglers →
+ * `layoutFitTransform` padded by `fitPad`). A view that has moved on only costs speed: the main thread sums
+ * the row of a kept glyph the rows cannot serve from its leaves, as the lazy gather does.
  */
 export interface LODView {
   transform: { k: number; x: number; y: number } | null;
@@ -218,20 +221,24 @@ export interface LODView {
   maxAggregateRadius?: number;
   screenSized: boolean;
   fadeBand: number;
+  /** Whether the engine declutters its frontier, and with what spacing (`lod({ declutter, declutterSpacing })`). */
+  declutter: boolean;
+  declutterSpacing?: number;
 }
 
 /**
  * What a spatial stream needs to build each tree's super-edge rows (#433): the graph's CSR with each
  * entry's weight and direction (built once per stream: 4 B per CSR entry, 1 B for its direction, 4 B for its
- * weight unless every edge weighs the same — 10-18 B per edge — plus 4-8 B per node), the cut and build
- * scratch, and the pool of returned rows buffers.
+ * weight unless every edge weighs the same — 10-18 B per edge — plus 4 B per node), the cut, declutter and
+ * build scratch (4 B per leaf and 4 B per tree node, the rest per glyph), and the pool of returned rows buffers.
  */
 export interface SpatialLinks {
   graph: SpatialRowsGraph;
   scratch: SpatialRowsScratch;
   cut: CutScratch;
-  /** The cut's cells the rows are built for ({@link cutRowCells}), grown to the largest cut. */
-  cells: Uint32Array;
+  declutter: DeclutterFrontierScratch;
+  /** The cut's cross-fade alphas in a band (indexed by tree node), which the declutter reads. */
+  fade: Float32Array;
   pool: ArrayBuffer[];
 }
 
@@ -281,7 +288,7 @@ export interface SpatialEdges {
 export function makeSpatialLODStream(leafCount: number, style?: LeafStyle, styleVersion = -1, edges?: SpatialEdges, view?: LODView): SpatialLODStream {
   let links: SpatialLinks | null = null;
   if (edges && edges.source.length > 0) {
-    links = { graph: spatialRowsGraph(leafCount, edges), scratch: makeSpatialRowsScratch(), cut: makeCutScratch(), cells: new Uint32Array(256), pool: [] };
+    links = { graph: spatialRowsGraph(leafCount, edges), scratch: makeSpatialRowsScratch(), cut: makeCutScratch(), declutter: makeDeclutterFrontierScratch(), fade: new Float32Array(0), pool: [] };
   }
   return { kind: "spatial", leafCount, box: undefined, scratch: makeMortonScratch(), bounds: makeLODBoundsScratch(), style: style ?? null, styleVersion: style ? styleVersion : -1, pool: [], built: -1, outstanding: 0, pending: false, links, view: view ?? null };
 }
@@ -382,9 +389,9 @@ export function lodFrameStep(stream: LODStream, positions: ArrayLike<number>, fr
     views.border.fill(0);
   }
   if (!style?.colors) views.color.fill(0); // a reused buffer holds the last frame's colours
-  // The super-edge rows of the covers the main thread's view will draw (#433), into a pooled buffer.
+  // The super-edge rows of the glyphs the main thread's view will keep (#433), into a pooled buffer.
   const links = stream.links;
-  const cover = links && stream.view && style?.links !== false ? coverRows(tree, positions, stream.view, links) : undefined;
+  const cover = links && stream.view && style?.links !== false ? keptRows(tree, positions, stream.view, links) : undefined;
   const header: SpatialFrameHeader = {
     size: topology.size,
     leafCount: n,
@@ -399,15 +406,15 @@ export function lodFrameStep(stream: LODStream, positions: ArrayLike<number>, fr
 }
 
 /**
- * The super-edge rows of the covers `view`'s cut draws on `tree` (#433): the engine's cut, at the view's
- * transform — or, while it follows the fit, at the fit the engine frames `positions` at (returned as
- * `fitBox`, for the frame's header) — with the culled roots recorded; its covers whose rows can matter
- * ({@link cutRowCells}, with the drawn glyphs as the floor) get one. O(drawn + culled) for the cut (+ O(leaves)
- * for the fit's box), then {@link buildCoverRows}: O(edges under those covers) ≤ 2E.
+ * The super-edge rows of the glyphs `view`'s cut and declutter keep on `tree` (#433): the engine's cut, at the
+ * view's transform — or, while it follows the fit, at the fit the engine frames `positions` at (returned as
+ * `fitBox`, for the frame's header) — with the culled roots recorded, then the engine's declutter; the kept
+ * cells get a row. O(drawn + culled) for the cut and O(drawn log drawn) for the declutter (+ O(leaves) for the
+ * fit's box), then {@link buildKeptRows}: O(leaves + edges under the kept cells).
  */
-function coverRows(tree: LODTree, positions: ArrayLike<number>, view: LODView, links: SpatialLinks): { rows: SpatialRowsFrame; fitBox: FitBox | null } | undefined {
-  const { parent, leafOrder, leafStart, leafEnd } = tree;
-  if (!parent || !leafOrder || !leafStart || !leafEnd) return undefined;
+function keptRows(tree: LODTree, positions: ArrayLike<number>, view: LODView, links: SpatialLinks): { rows: SpatialRowsFrame; fitBox: FitBox | null } | undefined {
+  const { leafOrder, leafStart, leafEnd } = tree;
+  if (!leafOrder || !leafStart || !leafEnd) return undefined;
   let t = view.transform;
   let fitBox: FitBox | null = null;
   if (!t) {
@@ -415,19 +422,33 @@ function coverRows(tree: LODTree, positions: ArrayLike<number>, view: LODView, l
     if (!fitBox) return undefined;
     t = layoutFitTransform(fitBox, view.width, view.height, view.fitPad, view.screenSized);
   }
+  let fadeAlpha: Float32Array | undefined;
+  if (view.fadeBand > 0) {
+    if (links.fade.length < tree.size) links.fade = new Float32Array(Math.max(tree.size, 2 * links.fade.length));
+    fadeAlpha = links.fade;
+  }
   const sc = links.cut;
   const drawn = cut(tree, t, view.width, view.height, {
     expandPx: view.expandPx,
     screenSized: view.screenSized,
     maxAggregateRadius: view.maxAggregateRadius,
     fadeBand: view.fadeBand,
+    fadeAlpha,
     recordCulled: true,
   }, sc);
-  const cutSet = { drawn, culled: sc.culled.subarray(0, sc.culledCount), split: sc.split.subarray(0, sc.splitCount) };
-  const m = cutRowCells(parent, cutSet, drawn, links);
+  const kept = view.declutter
+    ? declutterFrontier(tree, drawn, t, view.width, view.height, {
+      screenSized: view.screenSized,
+      k: t.k,
+      maxAggregateRadius: view.maxAggregateRadius,
+      spacing: view.declutterSpacing,
+      fadeAlpha,
+    }, links.declutter)
+    : drawn;
+  const cutSet = { drawn, kept, culled: sc.culled.subarray(0, sc.culledCount), split: sc.split.subarray(0, sc.splitCount) };
   const out: { buffer: ArrayBuffer | null } = { buffer: null };
-  const topo = { size: tree.size, leafCount: tree.leafCount, parent, leafOrder, leafStart, leafEnd };
-  const sizes = buildCoverRows(topo, links.cells.subarray(0, m), links.graph, links.scratch, (s) => {
+  const topo = { size: tree.size, leafCount: tree.leafCount, leafOrder, leafStart, leafEnd };
+  const sizes = buildKeptRows(topo, cutSet, links.graph, links.scratch, (s) => {
     const b = takeBuffer(links.pool, spatialRowsByteLength(s));
     out.buffer = b;
     return spatialRowsViews(b, s);

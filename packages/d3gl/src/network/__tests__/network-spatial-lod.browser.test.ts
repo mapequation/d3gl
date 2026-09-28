@@ -94,16 +94,18 @@ describe("lod({ source: 'spatial' }) (#343)", () => {
     expect(glyphs).toBeGreaterThan(0);
     expect(glyphs).toBeLessThan(1500); // bounded by the screen, not by how the layout spreads the graph
 
-    // Links come from the super-edge rows the worker built with the tree (#433): no leaf run is walked, at a
-    // new view or a held one.
+    // Links come from the super-edge rows the worker built with the tree (#433), which the settled tree carries.
+    // At a new view the kept glyphs whose rows it cannot serve walk their leaves once; a held view then walks
+    // nothing and answers every kept glyph from the memo.
     const first = net.superEdgeStats;
     expect(first).not.toBeNull();
+    expect(first?.entries).toBeGreaterThan(0);
     net.setTransform({ k: 2, x: -100, y: -100 });
     net.setTransform({ k: 2, x: -100, y: -100 });
     const held = net.superEdgeStats;
     expect(held?.misses).toBe(0);
     expect(held?.visits).toBe(0);
-    expect(held?.entries).toBeGreaterThan(0);
+    expect(held?.hits).toBeGreaterThan(0);
 
     // Switching source after the run: the structural tree is built here; back to spatial re-adopts the worker's.
     net.lod({ source: "structure", maxAggregateRadius: 18 });

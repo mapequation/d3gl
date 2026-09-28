@@ -15,7 +15,7 @@ import { rosettePositions } from "./rosette.js";
 import { gatherCandidates, descendingByKey, descendingInListOrder, CandidateList, type CandidateSource } from "./label-candidates.js";
 import type { StateNetworkGraph } from "./state-graph.js";
 import { startNestedWorkerLayout, startWorkerLayout, type StreamedLODTree, type WorkerLayoutHandle, type WorkerLayoutOptions } from "./worker-transport.js";
-import { buildLeafIncidence, lazySuperEdges, makeLazySuperEdgesScratch, rowSuperEdges, type LeafIncidence } from "./lazy-super-edges.js";
+import { buildLeafIncidence, lazySuperEdges, makeLazySuperEdgesScratch, type LeafIncidence } from "./lazy-super-edges.js";
 import type { LeafStyle, LODView } from "./lod-frame.js";
 import { startGpuNestedLayout } from "./gpu/gpu-nested-transport.js";
 import { startGpuLayout } from "./gpu/gpu-transport.js";
@@ -827,9 +827,9 @@ export class Network extends BaseEngine {
   private readonly mortonScratch = makeMortonScratch();
   /** Bounding-box scratch for every main-thread position pass (#343): 16 B per aggregate once used. */
   private readonly lodBounds = makeLODBoundsScratch();
-  /** Super-edge gather state for spatial trees (#343, #433): cover stamps, row memo, pair records, gather arrays. */
+  /** Super-edge gather state for spatial trees (#343, #433): cover stamps, row memo, gather arrays. */
   private readonly lazyScratch = makeLazySuperEdgesScratch();
-  /** The graph's per-incidence weights and directions for a spatial tree's gathers, built once per graph. */
+  /** The graph's per-incidence weights/directions for the lazy gather, built once per graph + direction. */
   private leafIncidence: LeafIncidence | null = null;
   /** The last cut's frontier before declutter (a view of {@link cutScratch}): the lazy gather's covers. */
   private cutFrontier: Uint32Array = new Uint32Array(0);
@@ -837,7 +837,7 @@ export class Network extends BaseEngine {
   private lazyGathered = false;
   /** Version of the leaf style a spatial worker tree aggregates (#343), bumped per resolved style. */
   private lodStyleVersion = 0;
-  /** The view last sent to a spatial stream (#433), whose covers' super-edge rows its trees carry. */
+  /** The view last sent to a spatial stream (#433), whose kept glyphs' super-edge rows its trees carry. */
   private lodViewPosted: LODView | null = null;
   private lodStyleVersionOf: ResolvedNetworkStyle | null = null;
   /** The leaf style version the spatial worker stream last received. */
@@ -1671,6 +1671,8 @@ export class Network extends BaseEngine {
       maxAggregateRadius: opts?.maxAggregateRadius,
       screenSized: style.sizeMode === "screen",
       fadeBand: opts?.crossFade && opts.crossFade > 0 ? opts.crossFade : 0,
+      declutter: opts?.declutter !== false,
+      declutterSpacing: opts?.declutterSpacing,
     };
   }
 
@@ -1683,7 +1685,7 @@ export class Network extends BaseEngine {
 
   /**
    * Send a spatial stream the view the cut runs at when it changed since the last one sent (#433), so the
-   * trees it rebuilds carry the super-edge rows of the covers drawn now. O(1) per repaint; a message only on
+   * trees it rebuilds carry the super-edge rows of the glyphs kept now. O(1) per repaint; a message only on
    * a change (a gesture, a resize, an option), none while the camera follows the fit.
    */
   private syncLODView(style: ResolvedNetworkStyle): void {
@@ -1702,7 +1704,9 @@ export class Network extends BaseEngine {
       p.expandPx === v.expandPx &&
       p.maxAggregateRadius === v.maxAggregateRadius &&
       p.screenSized === v.screenSized &&
-      p.fadeBand === v.fadeBand;
+      p.fadeBand === v.fadeBand &&
+      p.declutter === v.declutter &&
+      p.declutterSpacing === v.declutterSpacing;
     if (same) return;
     this.lodViewPosted = v;
     send(v);
@@ -2411,11 +2415,11 @@ export class Network extends BaseEngine {
   /**
    * What the last super-edge gather on a spatial tree did (#343, `lod({ source: "spatial" })`): the kept
    * glyphs whose links the per-tree row memo answered (`hits`), the rows it rebuilt from the graph's edges
-   * (`misses`), and the edge incidences those rebuilds walked (`visits`) — the lazy gather of a tree the main
-   * thread built; and the super-edge row entries (plus leaf covers' edges) read by the gather of a tree a
-   * layout streamed with its rows (`entries`, #433), which walks no leaf run (`visits: 0`). `null` until a
-   * spatial tree has drawn links. Introspection for debugging and tests: a re-emit of an unchanged view
-   * reports `misses: 0, visits: 0`.
+   * under a glyph (`misses`), and the edge incidences those rebuilds walked (`visits`); on a tree a layout
+   * streamed with its worker-built rows (#433), the row entries — plus the kept leaves' own graph edges — it
+   * read from them instead (`entries`): at the view the rows were built for, a repaint rebuilds nothing
+   * (`misses: 0, visits: 0`). `null` until a spatial tree has drawn links. Introspection for debugging and
+   * tests: a re-emit of an unchanged view reports `misses: 0, visits: 0`.
    */
   get superEdgeStats(): { hits: number; misses: number; visits: number; entries: number } | null {
     if (!this.lazyGathered) return null;
@@ -3198,11 +3202,11 @@ export class Network extends BaseEngine {
   /**
    * The super-edges among `frontier` — the glyphs the last {@link computeFrontier} kept — for both emit
    * paths (the WebGL lane and the retained Scene). From the tree's super-edge CSR ({@link superEdges},
-   * #210: zero O(tree.size) work per zoom frame), or, on a spatial tree (#343), which carries no CSR: from
-   * the super-edge rows a streaming layout built with it off the main thread ({@link rowSuperEdges}, #433:
-   * O(rows of the drawn and culled covers)), else gathered from the graph's edges through its leaf runs
-   * ({@link lazySuperEdges}) with the cut's covers and the per-tree row memo: O(Σ degree of the kept glyphs'
-   * nodes) when the cut changed a row's covers, O(row length) on a held view.
+   * #210: zero O(tree.size) work per zoom frame), or, on a spatial tree (#343), which carries no CSR,
+   * gathered by {@link lazySuperEdges} with the cut's covers and the per-tree row memo: from the super-edge
+   * rows a streaming layout built with the tree off the main thread (#433: O(the kept glyphs' rows) at the
+   * view they were built for), else from the graph's edges through the leaf runs — O(Σ degree of the kept
+   * glyphs' nodes) when the cut changed a row's covers — and O(row length) on a held view.
    */
   private frontierSuperEdges(tree: LODTree, frontier: Uint32Array, style: ResolvedNetworkStyle): SuperEdgesData {
     const opts = this.lodOptions;
@@ -3224,19 +3228,17 @@ export class Network extends BaseEngine {
       const sc = this.cutScratch;
       const covers = { drawn: this.cutFrontier, kept: frontier, culled: sc.culled.subarray(0, sc.culledCount), split: sc.split.subarray(0, sc.splitCount) };
       this.lazyGathered = true;
-      const incidence = this.incidenceOf(graph);
-      if (tree.rows) return rowSuperEdges(tree, covers, edgeStyle, view, graph.csr, incidence, this.lazyScratch);
-      return lazySuperEdges(tree, covers, edgeStyle, view, graph.csr, incidence, this.lazyScratch);
+      return lazySuperEdges(tree, covers, edgeStyle, view, graph.csr, this.incidenceOf(graph, style.directed), this.lazyScratch);
     }
     return superEdges(tree, frontier, edgeStyle, view, this.superEdgesScratch);
   }
 
-  /** The graph's per-incidence weights and directions a spatial tree's gathers sum (#343, #433), built once
-   *  per graph: 2-10 B per edge (the directions always — the row gather needs them whatever the style). */
-  private incidenceOf(graph: NetworkGraph): LeafIncidence {
+  /** The graph's per-incidence weights (and directions, for directed links) the lazy gather sums (#343),
+   *  built once per graph + direction: 0-10 B per edge (nothing extra for an unweighted undirected graph). */
+  private incidenceOf(graph: NetworkGraph, directed: boolean): LeafIncidence {
     const inc = this.leafIncidence;
-    if (inc && inc.graph === graph) return inc;
-    const built = buildLeafIncidence(graph, true);
+    if (inc && inc.graph === graph && inc.directed === directed) return inc;
+    const built = buildLeafIncidence(graph, directed);
     this.leafIncidence = built;
     return built;
   }

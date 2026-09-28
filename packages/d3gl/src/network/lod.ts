@@ -121,10 +121,10 @@ export interface LODTopology {
   /** A spatial (Morton) tree's cells (#343): each aggregate's square in the root box. @see {@link MortonCells} */
   morton?: MortonCells;
   /**
-   * A streamed spatial tree's **super-edge rows** (#433), built off the main thread with the tree: per cell,
-   * the flow of its edges toward nodes no deeper than itself, so the super-edge gather reads O(visible) rows
-   * instead of walking the edges under the frontier (`rowSuperEdges`). Absent on a tree the main thread
-   * built, which the lazy gather serves. @see {@link SpatialRows}
+   * A streamed spatial tree's **super-edge rows** (#433), built off the main thread with the tree: per cell
+   * the worker's view kept, the flow of its edges toward each cover of that cut, so the super-edge gather
+   * (`lazySuperEdges`) reads the kept glyphs' rows instead of walking the edges under the frontier. Absent
+   * on a tree the main thread built. @see {@link SpatialRows}
    */
   rows?: SpatialRows;
 }

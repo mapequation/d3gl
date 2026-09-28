@@ -54,7 +54,7 @@ export interface StartMessage {
   /** The leaf style a spatial tree aggregates onto every rebuild (#343), and its version (echoed per frame). */
   lodStyle?: LeafStyle;
   lodStyleVersion?: number;
-  /** The main thread's view, whose covers' super-edge rows a spatial tree carries (#433). */
+  /** The main thread's view, whose kept glyphs' super-edge rows a spatial tree carries (#433). */
   lodView?: LODView;
   /**
    * Continue a layout another transport was running (#311) instead of seeding one: no disc, no multilevel
@@ -89,7 +89,7 @@ export interface LODStyleMessage {
   version: number;
 }
 
-/** The main thread's view changed (#433): later spatial trees carry the super-edge rows of its covers. */
+/** The main thread's view changed (#433): later spatial trees carry the super-edge rows of the glyphs it keeps. */
 export interface LODViewMessage {
   type: "lod-view";
   view: LODView;

@@ -323,7 +323,7 @@ describe("worker-LOD streaming (#103)", () => {
       const back: MainToWorker = { type: "lod-recycle", buffer: f.buffer, rows: f.rows?.buffer };
       worker.postMessage(back, f.rows ? [f.buffer, f.rows.buffer] : [f.buffer]);
     };
-    const view: LODView = { transform: null, fitPad: 3, width: 400, height: 400, screenSized: true, fadeBand: 0 };
+    const view: LODView = { transform: null, fitPad: 3, width: 400, height: 400, screenSized: true, fadeBand: 0, declutter: true };
     const start: MainToWorker = {
       type: "start",
       nodeCount: g.nodeCount,

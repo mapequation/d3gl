@@ -17,7 +17,7 @@
  *
  * With LOD on, every posted frame runs the one per-frame LOD step ({@link lodFrameStep}, #343): refit the
  * coarsening tree in place (`lodSource: "structure"`), or rebuild the spatial tree — with the super-edge
- * rows of the main thread's view's covers (#433), so its link gather walks no graph edges — and transfer it with
+ * rows of the glyphs the main thread's view keeps (#433), so its link gather walks no graph edges — and transfer it with
  * the frame (`"spatial"`).
  *
  * A **warm** start (`StartMessage.warm`, #311) continues a layout another transport was running — a GPU
@@ -280,7 +280,7 @@ async function runLayout(msg: StartMessage): Promise<void> {
   let geomBuffer: ArrayBufferLike | null = null; // copy-mode buffer re-posted each frame
   if (spatial) {
     // The spatial tree (#343) is rebuilt from each frame's positions and travels with the frame, with the
-    // super-edge rows of the main thread's view's covers (#433) built here from the edges: nothing to post up
+    // super-edge rows of the glyphs the main thread's view keeps (#433) built here from the edges: nothing to post up
     // front, and the coarsening hierarchy only seeds the layout.
     lodStream = makeSpatialLODStream(nodeCount, lodStyle, lodStyleVersion, { source, target, weight }, lodView);
   } else if (lod && hierarchy) {

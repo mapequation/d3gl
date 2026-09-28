@@ -1,45 +1,38 @@
 /**
- * **Super-edge rows** for the covers of a spatial LOD tree's cut (#433) — built off the main thread with each
+ * **Super-edge rows** of a spatial LOD tree's kept glyphs (#433) — built off the main thread with each
  * streamed tree, for the view the main thread last reported, and moved to it with the tree.
  *
  * The lazy gather (`lazySuperEdges`) finds a kept glyph's links by walking the graph edges of every leaf
- * under it. On a streamed layout the tree changes every frame, its row memo never hits, and a repaint walks
- * every edge under the frontier: O(edges) on the main thread, 2E incidences at a coarse view. The thread
- * that rebuilt the tree does that walk instead, for the cut the main thread will draw, and hands over each
- * cover's summed row — so the repaint reads O(rows of the drawn and culled covers).
+ * under it into a **row**: per cover its leaves link to, the flow out of and into the glyph. On a streamed
+ * layout the tree changes every frame, its row memo never hits, and a repaint walks every edge under the
+ * kept glyphs: O(edges) on the main thread, up to 2E incidences at a fit view. The thread that rebuilt the
+ * tree builds those rows instead, for the cut the main thread will draw — it runs the engine's cut and
+ * declutter at the engine's view — and hands them over, so the repaint reads the rows of the kept glyphs.
  *
- * **What a row holds.** A listed cell `x`'s **out-row** sums, per partner `t`, the weight of each graph edge
- * `u → v` with `u` under `x` and `v` outside it, where `t` is the node on `v`'s side at `x`'s depth — or `v`
- * itself when `v` is a leaf shallower than `x`. Its **in-row** does the same for edges into `x`. So every
- * entry names a node no deeper than the row's cell. (A leaf's row would be its graph edges resolved the same
- * way; the main thread has the graph, so leaves need no stored row.)
+ * **What a row holds.** A kept cell `g`'s **out-row** sums, per cover `h` of the cut, the weight of each
+ * graph edge `u → v` with `u` under `g` and `v` under `h`; its **in-row** does the same for edges into `g`.
+ * `h` is the finest cover of `v` — a drawn glyph the cut does not split, or a culled root — and never `g`
+ * itself nor, in a cross-fade band, a cover nested in or around `g`: exactly the partners of the lazy
+ * gather's row of `g`. A row thus has one entry per cover `g` links to, in each direction, so the rows of a
+ * frame are bounded by what its kept glyphs can link to — (kept cells) × (covers) — whatever the number of
+ * edges under them. Kept leaves have no stored row: a leaf's row is its own graph edges, which the main
+ * thread reads as the lazy gather does (O(its degree), the size of what it draws).
  *
- * **Why that is exact for any cut.** Whatever the cut, its finest covers (the drawn glyphs not also
- * expanded, plus the culled subtree roots) partition the leaves. For two covers `g` and `h` with `h` no
- * shallower than `g`, each edge between them appears in `h`'s rows as an entry whose node lies inside `g`
- * (at `h`'s depth, or a shallower leaf), and climbing from that node reaches `g` as its first cover; from
- * `g`'s rows the matching node is an ancestor of `h`, above every cover, and resolves to nothing. Walking
- * each cover's rows and keeping the partners strictly shallower than the cover — or at its depth with a
- * larger id — thus finds every pair of covers once, from one side, with the flow of both directions.
- * `rowSuperEdges` (in `lazy-super-edges.ts`) does that and draws with the lazy gather's rules. The rows only
- * decide how fast: a cover the main thread's cut draws but the rows do not list (the view moved since, or a
- * tree the main thread refit) is walked through its leaves under the same rule, as the lazy gather would.
+ * **Why the main thread can use a row at another cut.** The main thread takes the row of a kept glyph it
+ * draws when every partner in it lies at or below a cover of its own cut: each partner then resolves to that
+ * cover (a memoised climb) and the row, merged per cover, is the lazy row of the glyph at the main thread's
+ * cut — exact. When the view moved since the worker cut (a gesture, the settle's reframe), a glyph the rows do
+ * not list, or one whose row names a partner the main thread's cut opened up, gets its row from its leaves, as
+ * the lazy gather's.
  *
- * **Cost.** Built by walking the graph edges under each listed cell once, deepest cell first, each neighbour
- * lifted on to the cell's depth from where the last lift left it: O(Σ edges under the listed cells) — at most
- * 2E for the covers of one cut, which partition the leaves — plus O(depth) climbing per leaf, and O(Σ rows)
- * out. A row holds one entry per distinct partner node at its cell's depth, in each direction: about one per
- * cover it links to, more where a partner cover is shallower (one per node at the row's depth inside it). So
- * the rows are not bounded by the pairs drawn: at a fixed view they grow with the edges under the covers until
- * a row lists nearly every cover — 1.3-7× the drawn pairs on the perf fixture at 100k-500k nodes.
+ * **Cost.** O(leaves) to label every leaf with its cover, then O(Σ graph edges under the kept cells) (plus the
+ * split glyphs' members again, in a band) to sum the rows, O(Σ rows) out. The rows buffer is 12 B per entry
+ * and 12 B per kept cell.
  */
 import { buildCSR, type CSR } from "./graph.js";
 
 /** What a packed rows buffer holds: enough for {@link spatialRowsViews} to read it. */
 export interface SpatialRowsSizes {
-  /** Tree nodes (leaves + cells). */
-  size: number;
-  leafCount: number;
   /** Cells with a row. */
   cells: number;
   /** Entries of all out-rows, and of all in-rows. */
@@ -48,13 +41,12 @@ export interface SpatialRowsSizes {
 }
 
 /**
- * Super-edge rows of a spatial tree's listed cells (#433) — see the module comment. `cell` lists the cells
+ * Super-edge rows of a spatial tree's kept cells (#433) — see the module comment. `cell` lists the cells
  * with a row, ascending ({@link rowOf} finds one); the `i`-th one's out-row is
  * `outNode[outOffset[i] .. outOffset[i + 1])` with the summed flow in `outFlow`, its in-row the same in the
- * `in*` arrays. `depth` is every tree node's depth below its root: the partner rule compares depths.
+ * `in*` arrays. Every entry names a cover of the cut the rows were built at.
  */
 export interface SpatialRows {
-  depth: Uint8Array;
   cell: Uint32Array;
   outOffset: Uint32Array;
   outNode: Uint32Array;
@@ -71,13 +63,13 @@ export interface SpatialRowsFrame {
 }
 
 /** Bytes a packed rows buffer of these sizes needs: the 8-byte flows first, then the cells, offsets and
- *  nodes, then the depths. 12 B per entry, 12 B per listed cell and 1 B per tree node. */
-export function spatialRowsByteLength({ size, cells, outEntries, inEntries }: SpatialRowsSizes): number {
-  return 8 * (outEntries + inEntries) + 4 * (cells + 2 * (cells + 1) + outEntries + inEntries) + size;
+ *  nodes. 12 B per entry and 12 B per cell. */
+export function spatialRowsByteLength({ cells, outEntries, inEntries }: SpatialRowsSizes): number {
+  return 8 * (outEntries + inEntries) + 4 * (cells + 2 * (cells + 1) + outEntries + inEntries);
 }
 
 /** The arrays of a packed rows buffer, viewed in `buffer` — the one layout writer and reader share. O(1). */
-export function spatialRowsViews(buffer: ArrayBufferLike, { size, cells, outEntries, inEntries }: SpatialRowsSizes): SpatialRows {
+export function spatialRowsViews(buffer: ArrayBufferLike, { cells, outEntries, inEntries }: SpatialRowsSizes): SpatialRows {
   let at = 0;
   const f64 = (n: number): Float64Array => { const v = new Float64Array(buffer, at, n); at += 8 * n; return v; };
   const u32 = (n: number): Uint32Array => { const v = new Uint32Array(buffer, at, n); at += 4 * n; return v; };
@@ -88,8 +80,7 @@ export function spatialRowsViews(buffer: ArrayBufferLike, { size, cells, outEntr
   const outNode = u32(outEntries);
   const inOffset = u32(cells + 1);
   const inNode = u32(inEntries);
-  const depth = new Uint8Array(buffer, at, size);
-  return { depth, cell, outOffset, outNode, outFlow, inOffset, inNode, inFlow };
+  return { cell, outOffset, outNode, outFlow, inOffset, inNode, inFlow };
 }
 
 /** The row index of cell `x` in `rows` (a binary search of `rows.cell`), or −1 when it has none. */
@@ -105,11 +96,10 @@ export function rowOf(rows: SpatialRows, x: number): number {
   return lo < cell.length && cell[lo] === x ? lo : -1;
 }
 
-/** The tree a build reads: the parents and the leaf runs (of a spatial tree's topology). */
+/** The tree a build reads: the leaf runs of a spatial tree's topology. */
 export interface SpatialRowsTree {
   size: number;
   leafCount: number;
-  parent: Int32Array;
   leafOrder: Uint32Array;
   leafStart: Uint32Array;
   leafEnd: Uint32Array;
@@ -205,31 +195,24 @@ export interface SpatialRowsGraph {
 }
 
 /**
- * Reusable working storage for {@link buildCoverRows}: the depths, the per-row merge marks and the lift memo
- * over tree nodes (21 B per node), the listed cells with their build order and row segments, and the
- * growable row arenas. Grown to the largest build and kept, so a stream that rebuilds every frame allocates
- * nothing here once warm.
+ * Reusable working storage for {@link buildKeptRows}: each leaf's cover (4 B per leaf), each cover's node
+ * and the per-row merge marks over the covers (20 B per cover), the kept cells, and the growable row
+ * arenas. Grown to the largest build and kept, so a stream that rebuilds every frame allocates nothing
+ * here once warm.
  */
 export interface SpatialRowsScratch {
-  depth: Uint8Array;
+  /** Leaf `v`'s cover, as an index into {@link coverNode}. */
+  label: Int32Array;
+  coverNode: Int32Array;
   markOut: Int32Array;
   slotOut: Int32Array;
   markIn: Int32Array;
   slotIn: Int32Array;
   seq: number;
-  /** Lift memo: `up[v]` is leaf `v`'s node at the depth it was last lifted to while `upGen[v] === liftGen`. */
-  up: Int32Array;
-  upGen: Int32Array;
-  liftGen: number;
-  /** The listed cells, deduplicated ascending; their build order (by depth); each one's row segments. */
+  /** The kept cells, ascending. */
   cells: Uint32Array;
-  /** Counting-sort buckets by depth (257 words). */
-  byDepth: Uint32Array;
-  order: Uint32Array;
-  outStart: Uint32Array;
-  outLen: Uint32Array;
-  inStart: Uint32Array;
-  inLen: Uint32Array;
+  outOffset: Uint32Array;
+  inOffset: Uint32Array;
   outNode: Uint32Array;
   outFlow: Float64Array;
   inNode: Uint32Array;
@@ -239,22 +222,16 @@ export interface SpatialRowsScratch {
 /** A fresh, empty {@link SpatialRowsScratch}. */
 export function makeSpatialRowsScratch(): SpatialRowsScratch {
   return {
-    depth: new Uint8Array(0),
-    markOut: new Int32Array(0),
-    slotOut: new Int32Array(0),
-    markIn: new Int32Array(0),
-    slotIn: new Int32Array(0),
+    label: new Int32Array(0),
+    coverNode: new Int32Array(64),
+    markOut: new Int32Array(64),
+    slotOut: new Int32Array(64),
+    markIn: new Int32Array(64),
+    slotIn: new Int32Array(64),
     seq: 0,
-    up: new Int32Array(0),
-    upGen: new Int32Array(0),
-    liftGen: 0,
     cells: new Uint32Array(64),
-    byDepth: new Uint32Array(257),
-    order: new Uint32Array(64),
-    outStart: new Uint32Array(64),
-    outLen: new Uint32Array(64),
-    inStart: new Uint32Array(64),
-    inLen: new Uint32Array(64),
+    outOffset: new Uint32Array(65),
+    inOffset: new Uint32Array(65),
     outNode: new Uint32Array(1024),
     outFlow: new Float64Array(1024),
     inNode: new Uint32Array(1024),
@@ -262,16 +239,25 @@ export function makeSpatialRowsScratch(): SpatialRowsScratch {
   };
 }
 
+/** Grow the per-cover arrays to hold `need` covers (their contents are rewritten by every build). */
+function growCovers(sc: SpatialRowsScratch, need: number): void {
+  if (need <= sc.coverNode.length) return;
+  const cap = Math.max(need, sc.coverNode.length * 2);
+  sc.coverNode = new Int32Array(cap);
+  sc.markOut = new Int32Array(cap);
+  sc.slotOut = new Int32Array(cap);
+  sc.markIn = new Int32Array(cap);
+  sc.slotIn = new Int32Array(cap);
+  sc.seq = 0;
+}
+
 /** Grow the per-cell arrays to hold `need` cells (their contents are rewritten by every build). */
 function growCells(sc: SpatialRowsScratch, need: number): void {
   if (need <= sc.cells.length) return;
   const cap = Math.max(need, sc.cells.length * 2);
   sc.cells = new Uint32Array(cap);
-  sc.order = new Uint32Array(cap);
-  sc.outStart = new Uint32Array(cap);
-  sc.outLen = new Uint32Array(cap);
-  sc.inStart = new Uint32Array(cap);
-  sc.inLen = new Uint32Array(cap);
+  sc.outOffset = new Uint32Array(cap + 1);
+  sc.inOffset = new Uint32Array(cap + 1);
 }
 
 /** Grow the out-row arena to hold `need` entries, keeping what it holds. */
@@ -290,209 +276,121 @@ function growIn(sc: SpatialRowsScratch, need: number): void {
   const f = new Float64Array(cap); f.set(sc.inFlow); sc.inFlow = f;
 }
 
-/** Rows built ({@link buildCoverRows}) in this realm since module load — test instrumentation, like
+/** Rows built ({@link buildKeptRows}) in this realm since module load — test instrumentation, like
  *  `mortonTopologyBuilds`: a main-thread guard asserts none is built there. Never read on a render path. */
 export let spatialRowBuilds = 0;
 
-/**
- * The cells of a cut whose super-edge rows can matter (#433), into `out.cells` (grown; returns the count):
- * its drawn glyphs that the band does not split, and its culled roots — except, outside a band, a cover
- * shallower than every glyph `floor` lists: its row keeps only partners shallower than itself, whose covers
- * `floor` does not hold, so every pair it finds joins two covers of which neither is in `floor`. The worker
- * passes the drawn glyphs as `floor` (the main thread links only the kept ones, a subset); the main thread's
- * gather applies the same rule with its kept glyphs. O((drawn + culled) · depth).
- */
-export function cutRowCells(
-  parent: Int32Array,
-  cutSet: { drawn: ArrayLike<number>; culled: ArrayLike<number>; split: ArrayLike<number> },
-  floor: ArrayLike<number>,
-  out: { cells: Uint32Array },
-): number {
-  const depthOf = (x: number): number => {
-    let d = 0;
-    for (let y = parent[x] ?? -1; y >= 0; y = parent[y] ?? -1) d++;
-    return d;
-  };
-  const { drawn, culled, split } = cutSet;
-  const fading = split.length > 0;
-  let min = 0;
-  if (!fading) {
-    min = Infinity;
-    for (let i = 0; i < floor.length; i++) min = Math.min(min, depthOf(floor[i] ?? 0));
-  }
-  const need = drawn.length + culled.length;
-  if (out.cells.length < need) out.cells = new Uint32Array(Math.max(need, 2 * out.cells.length));
-  const cells = out.cells;
-  // In a band: the split glyphs, sorted, to leave them out by binary search (a band splits few).
-  const splits = fading ? Uint32Array.from(split).sort() : null;
-  const isSplit = (g: number): boolean => {
-    if (!splits) return false;
-    let lo = 0;
-    let hi = splits.length;
-    while (lo < hi) {
-      const mid = (lo + hi) >>> 1;
-      if ((splits[mid] ?? 0) < g) lo = mid + 1;
-      else hi = mid;
-    }
-    return lo < splits.length && splits[lo] === g;
-  };
-  let m = 0;
-  for (let i = 0; i < drawn.length; i++) {
-    const g = drawn[i] ?? 0;
-    if (isSplit(g) || (!fading && depthOf(g) < min)) continue;
-    cells[m++] = g;
-  }
-  for (let i = 0; i < culled.length; i++) {
-    const g = culled[i] ?? 0;
-    if (!fading && depthOf(g) < min) continue;
-    cells[m++] = g;
-  }
-  return m;
+/** A cut, as {@link buildKeptRows} reads it: the frontier, the glyphs declutter kept, the culled roots and the
+ *  glyphs a cross-fade band drew and expanded. */
+export interface SpatialRowsCut {
+  drawn: ArrayLike<number>;
+  kept: ArrayLike<number>;
+  culled: ArrayLike<number>;
+  split: ArrayLike<number>;
 }
 
 /**
- * Build the super-edge rows of the cells among `covers` (#433; leaves and repeats are left out) over `graph`
- * — see the module comment for what a row holds. The rows are built in `scratch`, then copied into the
- * arrays `allocate` returns for their final sizes — a caller that transfers them passes views of a pooled
- * buffer ({@link spatialRowsViews}). O(Σ graph edges under the listed cells + O(depth) lifting per leaf);
- * allocates nothing once `scratch` is warm but what `allocate` hands out. Returns the sizes the rows were
- * allocated with.
+ * Build the super-edge rows of the kept cells of `cut` (#433) over `graph` — see the module comment for what
+ * a row holds. The rows are built in `scratch`, then copied into the arrays `allocate` returns for their final
+ * sizes — a caller that transfers them passes views of a pooled buffer ({@link spatialRowsViews}).
+ * O(leaves + Σ graph edges under the kept cells + Σ rows); allocates nothing once `scratch` is warm but what
+ * `allocate` hands out. Returns the sizes the rows were allocated with.
  */
-export function buildCoverRows(
+export function buildKeptRows(
   tree: SpatialRowsTree,
-  covers: ArrayLike<number>,
+  cut: SpatialRowsCut,
   graph: SpatialRowsGraph,
   scratch: SpatialRowsScratch,
   allocate: (sizes: SpatialRowsSizes) => SpatialRows,
 ): SpatialRowsSizes {
   spatialRowBuilds++;
-  const { size, leafCount: n, parent, leafOrder, leafStart, leafEnd } = tree;
+  const { leafCount: n, leafOrder, leafStart, leafEnd } = tree;
   const sc = scratch;
-  if (sc.depth.length < size) {
-    sc.depth = new Uint8Array(size);
-    sc.markOut = new Int32Array(size);
-    sc.slotOut = new Int32Array(size);
-    sc.markIn = new Int32Array(size);
-    sc.slotIn = new Int32Array(size);
-    sc.up = new Int32Array(size);
-    sc.upGen = new Int32Array(size);
-    sc.seq = 0;
-    sc.liftGen = 0;
-  }
-  // Depth below the root: a spatial tree numbers a parent above its children, so a descending pass sets it first.
-  const depth = sc.depth;
-  for (let g = size - 1; g >= 0; g--) {
-    const p = parent[g] ?? -1;
-    depth[g] = p < 0 ? 0 : (depth[p] ?? 0) + 1;
-  }
-  // The listed cells, deduplicated (a mark per cell, from the merge marks' sequence) and ascending.
-  growCells(sc, covers.length);
-  if (sc.seq >= 0x7fffffff - covers.length - 1) { sc.markOut.fill(0); sc.markIn.fill(0); sc.seq = 0; }
-  const listed = ++sc.seq;
+  const { drawn, kept, culled, split } = cut;
+  const fading = split.length > 0;
+  if (sc.label.length < n) sc.label = new Int32Array(n);
+  growCovers(sc, drawn.length + culled.length);
+  // Every leaf's finest cover: the drawn glyphs' runs in frontier order — a split glyph before the glyphs
+  // below it, so the finest is written last — then the culled roots', which in a band may lie under a split
+  // glyph and are finer than it (anywhere else no drawn glyph holds them).
+  const { label, coverNode } = sc;
+  let covers = 0;
+  const labelRun = (x: number): void => {
+    const k = covers++;
+    coverNode[k] = x;
+    const r1 = leafEnd[x] ?? 0;
+    for (let r = leafStart[x] ?? 0; r < r1; r++) label[leafOrder[r] ?? 0] = k;
+  };
+  for (let i = 0; i < drawn.length; i++) labelRun(drawn[i] ?? 0);
+  for (let i = 0; i < culled.length; i++) labelRun(culled[i] ?? 0);
+  // The kept cells, ascending (rowOf's order); a leaf's row is its graph edges.
+  growCells(sc, kept.length);
   let cells = 0;
-  for (let i = 0; i < covers.length; i++) {
-    const x = covers[i] ?? 0;
-    if (x < n || x >= size || sc.markOut[x] === listed) continue;
-    sc.markOut[x] = listed;
-    sc.cells[cells++] = x;
+  for (let i = 0; i < kept.length; i++) {
+    const g = kept[i] ?? 0;
+    if (g >= n) sc.cells[cells++] = g;
   }
   const cellIds = sc.cells.subarray(0, cells);
   cellIds.sort();
-  // Built deepest first, so each leaf's lift only ever moves up: `up[v]` holds leaf v's node at the depth
-  // last lifted to, and a shallower cell lifts it further from there — O(depth) climbing per leaf per build,
-  // whatever the mix of cover depths. A counting sort of the cell indices by depth, descending.
-  const byDepth = sc.byDepth;
-  byDepth.fill(0);
-  for (let i = 0; i < cells; i++) {
-    const k = 256 - (depth[cellIds[i] ?? 0] ?? 0);
-    byDepth[k] = (byDepth[k] ?? 0) + 1;
-  }
-  for (let d = 0; d < 256; d++) byDepth[d + 1] = (byDepth[d + 1] ?? 0) + (byDepth[d] ?? 0);
-  for (let i = 0; i < cells; i++) {
-    const d = 255 - (depth[cellIds[i] ?? 0] ?? 0);
-    sc.order[byDepth[d] ?? 0] = i;
-    byDepth[d] = (byDepth[d] ?? 0) + 1;
-  }
-  const { markOut, slotOut, markIn, slotIn, up, upGen } = sc;
+  const { markOut, slotOut, markIn, slotIn } = sc;
   const { offsets, neighbors } = graph.csr;
   const incW = graph.weight;
   const incOut = graph.out;
   const uniform = graph.uniform;
   let outLen = 0;
   let inLen = 0;
-  if (sc.liftGen >= 0x7fffffff) { upGen.fill(0); sc.liftGen = 0; }
-  const gen = ++sc.liftGen; // up[v] is valid for this build while upGen[v] === gen
-  for (let o = 0; o < cells; o++) {
-    const i = sc.order[o] ?? 0;
-    const x = cellIds[i] ?? 0;
-    const dx = depth[x] ?? 0;
+  for (let i = 0; i < cells; i++) {
+    const g = cellIds[i] ?? 0;
+    if (sc.seq >= 0x7fffffff) { markOut.fill(0); markIn.fill(0); sc.seq = 0; }
     const seq = ++sc.seq;
-    sc.outStart[i] = outLen;
-    sc.inStart[i] = inLen;
-    const r1 = leafEnd[x] ?? 0;
-    for (let r = leafStart[x] ?? 0; r < r1; r++) {
+    sc.outOffset[i] = outLen;
+    sc.inOffset[i] = inLen;
+    const g0 = leafStart[g] ?? 0;
+    const g1 = leafEnd[g] ?? 0;
+    for (let r = g0; r < g1; r++) {
       const u = leafOrder[r] ?? 0;
       const p1 = offsets[u + 1] ?? 0;
       for (let p = offsets[u] ?? 0; p < p1; p++) {
-        // The neighbour's node at this cell's depth (itself when shallower), lifted on from where it last was.
-        const v = neighbors[p] ?? 0;
-        let t = upGen[v] === gen ? (up[v] ?? 0) : v;
-        while ((depth[t] ?? 0) > dx) t = parent[t] ?? -1;
-        up[v] = t;
-        upGen[v] = gen;
-        // Only a node under this cell lifts onto it, and nothing at its depth or above lies inside it: so
-        // `t === x` is exactly an edge inside the cell, self-loops included.
-        if (t === x) continue;
+        const k = label[neighbors[p] ?? 0] ?? 0;
+        const h = coverNode[k] ?? 0;
+        // Not a pair with itself — nor, in a band, with a cover nested in or around it (the lazy gather's rule).
+        if (h === g || (fading && (leafStart[h] ?? 0) < g1 && g0 < (leafEnd[h] ?? 0))) continue;
         const w = incW ? (incW[p] ?? 0) : uniform;
         if (incOut[p] === 1) {
-          if (markOut[t] === seq) {
-            const e = slotOut[t] ?? 0;
+          if (markOut[k] === seq) {
+            const e = slotOut[k] ?? 0;
             sc.outFlow[e] = (sc.outFlow[e] ?? 0) + w;
           } else {
             if (outLen === sc.outNode.length) growOut(sc, outLen + 1);
-            markOut[t] = seq;
-            slotOut[t] = outLen;
-            sc.outNode[outLen] = t;
-            sc.outFlow[outLen++] = 0 + w; // a sum from +0
+            markOut[k] = seq;
+            slotOut[k] = outLen;
+            sc.outNode[outLen] = h;
+            sc.outFlow[outLen++] = 0 + w; // a sum from +0, as the lazy gather's
           }
-        } else if (markIn[t] === seq) {
-          const e = slotIn[t] ?? 0;
+        } else if (markIn[k] === seq) {
+          const e = slotIn[k] ?? 0;
           sc.inFlow[e] = (sc.inFlow[e] ?? 0) + w;
         } else {
           if (inLen === sc.inNode.length) growIn(sc, inLen + 1);
-          markIn[t] = seq;
-          slotIn[t] = inLen;
-          sc.inNode[inLen] = t;
+          markIn[k] = seq;
+          slotIn[k] = inLen;
+          sc.inNode[inLen] = h;
           sc.inFlow[inLen++] = 0 + w;
         }
       }
     }
-    sc.outLen[i] = outLen - (sc.outStart[i] ?? 0);
-    sc.inLen[i] = inLen - (sc.inStart[i] ?? 0);
   }
-  const sizes: SpatialRowsSizes = { size, leafCount: n, cells, outEntries: outLen, inEntries: inLen };
+  sc.outOffset[cells] = outLen;
+  sc.inOffset[cells] = inLen;
+  const sizes: SpatialRowsSizes = { cells, outEntries: outLen, inEntries: inLen };
   const rows = allocate(sizes);
-  rows.depth.set(depth.subarray(0, size));
   rows.cell.set(cellIds);
-  // Copy the rows out in cell order (they were built by depth).
-  let oa = 0;
-  let ia = 0;
-  for (let i = 0; i < cells; i++) {
-    rows.outOffset[i] = oa;
-    rows.inOffset[i] = ia;
-    const os = sc.outStart[i] ?? 0;
-    const ol = sc.outLen[i] ?? 0;
-    rows.outNode.set(sc.outNode.subarray(os, os + ol), oa);
-    rows.outFlow.set(sc.outFlow.subarray(os, os + ol), oa);
-    oa += ol;
-    const is = sc.inStart[i] ?? 0;
-    const il = sc.inLen[i] ?? 0;
-    rows.inNode.set(sc.inNode.subarray(is, is + il), ia);
-    rows.inFlow.set(sc.inFlow.subarray(is, is + il), ia);
-    ia += il;
-  }
-  rows.outOffset[cells] = oa;
-  rows.inOffset[cells] = ia;
+  rows.outOffset.set(sc.outOffset.subarray(0, cells + 1));
+  rows.inOffset.set(sc.inOffset.subarray(0, cells + 1));
+  rows.outNode.set(sc.outNode.subarray(0, outLen));
+  rows.outFlow.set(sc.outFlow.subarray(0, outLen));
+  rows.inNode.set(sc.inNode.subarray(0, inLen));
+  rows.inFlow.set(sc.inFlow.subarray(0, inLen));
   return sizes;
 }
 
