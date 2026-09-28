@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { buildModuleLODTree, type ModuleLink, type ModuleNode } from "../modules.js";
-import { nestedLayout, type NestedLayoutTopology } from "../nested-layout.js";
+import { Scratch, collide, nestedLayout, type NestedLayoutTopology } from "../nested-layout.js";
 import type { LODTree } from "../lod.js";
 
 /** Children of tree node `g`. */
@@ -380,5 +380,78 @@ describe("nestedLayout warm start (#328)", () => {
       // …and it is a refinement: the leaves move less than a cold re-layout moves them.
       expect(meanShift(warm.positions, before.positions)).toBeLessThan(meanShift(fresh.positions, before.positions));
     }
+  });
+});
+
+describe("collide: coincident sibling discs (#357)", () => {
+  const PAD = 1.15; // solveModule's collision spacing
+  const SMALL = 0.05;
+  const LARGE = 0.1;
+  const MIN = (SMALL + LARGE) * PAD; // the pair's collision distance
+
+  /** A scratch value, NaN when out of range, so a bad index fails the numeric assertions. */
+  const at = (a: Float64Array, i: number): number => a[i] ?? Number.NaN;
+
+  /**
+   * `k` discs in collide()'s scratch: `a` (small) and `b` (large) on the same point, at the centre of a
+   * lattice square, and every other disc (small) on a unit lattice — out of everyone's reach, so only the
+   * pair can move.
+   */
+  function coincidentPair(k: number, a: number, b: number, s = new Scratch()): Scratch {
+    s.ensure(k, k);
+    const side = Math.ceil(Math.sqrt(k));
+    for (let i = 0; i < k; i++) {
+      s.x[i] = i % side;
+      s.y[i] = Math.floor(i / side);
+      s.rad[i] = SMALL;
+    }
+    s.x[a] = s.x[b] = 1.5;
+    s.y[a] = s.y[b] = 0.5;
+    s.rad[b] = LARGE;
+    return s;
+  }
+
+  const GRID = { path: "uniform grid (k > 32)", k: 40, a: 11, b: 29 };
+
+  for (const { path, k, a, b } of [{ path: "exact loop (k ≤ 32)", k: 8, a: 2, b: 5 }, GRID]) {
+    it(`separates them by exactly the collision distance, along a fixed direction — ${path}`, () => {
+      const s = coincidentPair(k, a, b);
+      const x0 = s.x.slice(0, k);
+      const y0 = s.y.slice(0, k);
+      collide(s, k, PAD);
+      const dx = at(s.x, b) - at(s.x, a);
+      const dy = at(s.y, b) - at(s.y, a);
+      // Before #357 the pair ended `MIN · 1e9` apart (1.7e8 here), which collapsed the parent's composition.
+      expect(Math.hypot(dx, dy)).toBeCloseTo(MIN, 12);
+      // The direction is index-derived, from the lower index to the higher: (cos(a + b), sin(a + b)).
+      expect(dx / MIN).toBeCloseTo(Math.cos(a + b), 12);
+      expect(dy / MIN).toBeCloseTo(Math.sin(a + b), 12);
+      // Split by size, as for any overlapping pair: the smaller disc moves more (area shares 4 : 1).
+      const share = (LARGE * LARGE) / (SMALL * SMALL + LARGE * LARGE);
+      expect(Math.hypot(at(s.x, a) - at(x0, a), at(s.y, a) - at(y0, a))).toBeCloseTo(MIN * share, 12);
+      expect(Math.hypot(at(s.x, b) - at(x0, b), at(s.y, b) - at(y0, b))).toBeCloseTo(MIN * (1 - share), 12);
+      // Nobody else moves.
+      for (let i = 0; i < k; i++) {
+        if (i === a || i === b) continue;
+        expect(at(s.x, i)).toBe(at(x0, i));
+        expect(at(s.y, i)).toBe(at(y0, i));
+      }
+    });
+
+  }
+
+  it(`gives the same result on a scratch reused from a larger module — ${GRID.path}`, () => {
+    // solveModule reuses one Scratch for every module, so the grid's cell heads and chains hold the previous
+    // module's state. Resolve a larger coincident module first. Grid path only: the exact loop reads nothing
+    // but x, y and rad, which coincidentPair rewrites, so a stale scratch cannot reach it.
+    const { k, a, b } = GRID;
+    const reused = coincidentPair(64, 7, 50);
+    collide(reused, 64, PAD);
+    coincidentPair(k, a, b, reused);
+    collide(reused, k, PAD);
+    const fresh = coincidentPair(k, a, b);
+    collide(fresh, k, PAD);
+    expect(Array.from(reused.x.subarray(0, k))).toEqual(Array.from(fresh.x.subarray(0, k)));
+    expect(Array.from(reused.y.subarray(0, k))).toEqual(Array.from(fresh.y.subarray(0, k)));
   });
 });
