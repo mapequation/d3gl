@@ -253,8 +253,11 @@ export function coarsenLevel(level: CoarseLevel): { coarse: CoarseLevel; project
   };
 }
 
-/** Build the full coarsening hierarchy, stopping at `minNodes` or when a pass stops reducing. */
-export function buildHierarchy(graph: CoarsenableGraph, opts: CoarsenOptions = {}): Hierarchy {
+/**
+ * Build the full coarsening hierarchy, stopping at `minNodes` or when a pass stops reducing. Reads only the
+ * edge list (no positions), so the GPU layout's LOD worker can coarsen a bare edge list (#377).
+ */
+export function buildHierarchy(graph: CoarseLevel, opts: CoarsenOptions = {}): Hierarchy {
   const minNodes = opts.minNodes ?? DEFAULT_MIN_NODES;
   const maxLevels = opts.maxLevels ?? DEFAULT_MAX_LEVELS;
   const levels: CoarseLevel[] = [

@@ -57,7 +57,7 @@ function startRun(g: NetworkGraph, iterations: number, lod = false) {
   };
   const t0 = performance.now();
   worker.postMessage(start);
-  const frames = (): ProgressMessage[] => received.flatMap((r) => (r.msg.type === "lod-topology" ? [] : [r.msg]));
+  const frames = (): ProgressMessage[] => received.flatMap((r) => (r.msg.type === "frame" || r.msg.type === "done" ? [r.msg] : []));
   const waitFor = async (done: () => boolean, ms = 20_000): Promise<void> => {
     const deadline = performance.now() + ms;
     while (!done() && performance.now() < deadline) await new Promise((r) => setTimeout(r, 5));

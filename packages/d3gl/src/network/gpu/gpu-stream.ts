@@ -25,8 +25,15 @@
  *    positions are written, never mid-tick), so a copy after a prep reuses that prep's stats and a copy
  *    between ticks re-runs the reductions first ({@link GpuForceLayout.refreshSegmentStats}).
  *
- * `settled` resolves only after positions from the final tick have been harvested, so the engine's
- * settle handler sees them. The run then goes **idle** (the layout stays alive for a drag reheat, #183).
+ * **Where a harvest goes** is the stream's {@link FrameSink}. By default ({@link DirectSink}) it lands in
+ * `graph.positions` and is painted in the same frame. With LOD on (#377) the `LODRelay` (`lod-relay.ts`)
+ * takes it instead: the LOD worker refits the tree's geometry to the harvested positions, and the frame is
+ * painted — positions and geometry put on the graph together — in the first frame after the worker replied
+ * and the repaint is due. The throttle harvests one round trip early for it, so the repaint cadence holds.
+ *
+ * `settled` resolves only after positions from the final tick have been harvested and painted (with LOD on,
+ * together with the LOD tree's geometry for them), so the engine's settle handler sees them. The run then
+ * goes **idle** (the layout stays alive for a drag reheat, #183).
  * A non-finite layout (NaN / ∞ in the reductions' stats) stops the run with one warning, keeping the last
  * finite positions — the harvest checks the stats before it touches `graph.positions`. A lost context
  * (`isContextLost`, a failed fence wait, `webglcontextlost`) stops it without touching GL again, with one
@@ -46,8 +53,15 @@ import { reportUncaught } from "./report-uncaught.js";
 export interface GpuFrameSample {
   /** The frame's rAF timestamp. */
   now: number;
-  /** Main-thread ms polling fences and harvesting positions. */
+  /** Main-thread ms polling fences, harvesting positions and putting a frame on the graph ({@link commitMs}). */
   harvestMs: number;
+  /**
+   * Main-thread ms putting the painted frame on the graph (part of {@link harvestMs}): 0 when it was
+   * harvested there; with LOD on (#377), copying the relayed positions and their LOD geometry in.
+   */
+  commitMs: number;
+  /** Whether the engine repainted this frame. */
+  repainted: boolean;
   /** Main-thread ms inside `onFrame` (the engine's repaint); 0 when this frame did not repaint. */
   repaintMs: number;
   /** Main-thread ms encoding work items, the readback copy and the budget fence. */
@@ -96,6 +110,71 @@ export interface GpuStreamOptions {
   budgetMs?: number;
   /** Minimum time between repaints, ms. Default {@link MIN_FRAME_MS}. */
   minFrameMs?: number;
+  /** Where harvests go before they are painted. Default: a {@link DirectSink} into `graph.positions`. */
+  sink?: FrameSink;
+}
+
+/**
+ * Where a harvested readback goes before it is painted (#377). The stream harvests into {@link target},
+ * {@link submit}s it, and once the sink is {@link ready} and the repaint is due, {@link commit}s it (puts it
+ * on the graph) and runs `onFrame`. The {@link DirectSink} harvests straight into `graph.positions`, ready at
+ * once, so a frame is painted where it was harvested. The `LODRelay` (`lod-relay.ts`) harvests into its own
+ * buffer and is ready once the LOD worker has refit the LOD tree to it, so positions and their geometry reach
+ * the graph together, one worker round trip later.
+ */
+export interface FrameSink {
+  /** Whether a submitted frame is painted after a round trip, not in the frame it was harvested. */
+  readonly relays: boolean;
+  /** The array the next harvest writes into (2 floats per node), or null while the sink cannot take one. */
+  target(): Float32Array | null;
+  /** The harvest landed in {@link target}. */
+  submit(): void;
+  /** A frame can be painted: the submitted one, or one the sink produced (the LOD tree's first geometry). */
+  readonly ready: boolean;
+  /**
+   * Put the ready frame on the graph, just before its repaint. `false` when the frame was lost on its way (the
+   * LOD worker failed with it): nothing changed, and the stream copies those ticks again.
+   */
+  commit(): boolean;
+  /** Whether `settled` must wait for the sink (the LOD tree is still being built). */
+  readonly holding: boolean;
+  /** Call `wake` whenever the sink becomes ready, or stops holding, outside the stream's frame. */
+  listen(wake: () => void): void;
+  /** Free what the sink owns. */
+  destroy(): void;
+}
+
+/** The default {@link FrameSink}: harvests land in `graph.positions`, painted in the frame they were harvested. */
+export class DirectSink implements FrameSink {
+  readonly relays = false;
+  readonly holding = false;
+  private readonly graph: NetworkGraph;
+  private submitted = false;
+
+  constructor(graph: NetworkGraph) {
+    this.graph = graph;
+  }
+
+  target(): Float32Array {
+    return this.graph.positions;
+  }
+
+  submit(): void {
+    this.submitted = true;
+  }
+
+  get ready(): boolean {
+    return this.submitted;
+  }
+
+  commit(): boolean {
+    this.submitted = false;
+    return true;
+  }
+
+  listen(): void {}
+
+  destroy(): void {}
 }
 
 type Mode = "idle" | "run" | "drag" | "cool";
@@ -127,8 +206,9 @@ export class GpuStream {
   private readonly throttle: RepaintThrottle;
   private readonly readback: AsyncPositionReadback;
   private readonly stats = new Float32Array(READBACK_STATS_FLOATS);
+  private readonly sink: FrameSink;
   private readonly sample: GpuFrameSample = {
-    now: 0, harvestMs: 0, repaintMs: 0, encodeMs: 0, items: 0, ticksDone: 0,
+    now: 0, harvestMs: 0, commitMs: 0, repainted: false, repaintMs: 0, encodeMs: 0, items: 0, ticksDone: 0,
     harvested: false, harvestedTicks: -1, copied: false, blocked: false, k: 1, bands: 1, budgetMs: 0,
   };
   private readonly canvas: EventTarget | null;
@@ -136,6 +216,8 @@ export class GpuStream {
   private readonly page: Document | null;
   private resolveSettled: () => void = () => {};
   private settledOnce = false;
+  /** The run is done, but `settled` waits for the sink (the LOD tree is still being built, #377). */
+  private settlePending = false;
 
   private mode: Mode;
   private stopped = false;
@@ -170,6 +252,12 @@ export class GpuStream {
   private copiedTicks = 0;
   /** Whether the pending copy's frame has completed. */
   private copyReady = false;
+  /** A harvest was submitted to the sink and not painted yet: the ticks it holds, and whether it is the final one. */
+  private frameSubmitted = false;
+  private frameTicks = 0;
+  private frameFinal = false;
+  /** The submitted harvest has not been seen ready yet (the throttle samples its round trip then). */
+  private frameAway = false;
 
   constructor(device: WebGLDevice, layout: GpuForceLayout, graph: NetworkGraph, opts: GpuStreamOptions, onFrame: () => void) {
     this.gl = device.gl;
@@ -185,6 +273,8 @@ export class GpuStream {
       ...(opts.budgetMs !== undefined ? { budgetMs: opts.budgetMs } : {}),
     });
     this.readback = new AsyncPositionReadback(device, layout);
+    this.sink = opts.sink ?? new DirectSink(graph);
+    this.sink.listen(() => this.resume());
     this.settled = new Promise<void>((resolve) => {
       this.resolveSettled = resolve;
     });
@@ -225,6 +315,7 @@ export class GpuStream {
       this.layout.hold(DRAG_HEAT);
       this.finishing = false;
       this.copyFinal = false; // a final copy in flight is harvested as an ordinary frame
+      this.frameFinal = false; // so is a final frame the LOD worker is refitting
     }
     this.resume();
   }
@@ -242,7 +333,7 @@ export class GpuStream {
     this.resume();
   }
 
-  /** Cancel the run and free every GPU resource (none on a lost context); resolves `settled`. */
+  /** Cancel the run and free every GPU resource (none on a lost context) and the sink; resolves `settled`. */
   stop(): void {
     if (this.stopped) return;
     this.halt();
@@ -251,7 +342,8 @@ export class GpuStream {
       this.readback.destroy(true);
       this.layout.destroy();
     }
-    this.settle();
+    this.sink.destroy();
+    this.settle(true);
   }
 
   // ── The frame ──────────────────────────────────────────────────────────────
@@ -276,35 +368,66 @@ export class GpuStream {
       this.copyReady = true;
       this.throttle.copyCompleted(now);
     }
-    // A finished copy is harvested — and repainted — once the repaint is due; the final one at once.
+    // A finished copy is harvested once the repaint is due — one round trip earlier when the sink relays it
+    // (#377) — and the final one at once; into the sink's buffer, and only while the sink can take it.
     let harvested = false;
-    let repaintMs = 0;
-    const t1 = performance.now();
-    if (
-      this.readback.pending &&
-      this.copyReady &&
-      (this.copyFinal || this.frameEvery !== undefined || this.throttle.due(now))
-    ) {
-      harvested = true;
-      if (!this.readback.harvest(this.graph.positions, this.stats)) {
-        this.fail();
-        return;
+    const harvestDue = this.throttle.harvestDue(now, this.sink.relays);
+    if (this.readback.pending && this.copyReady && (this.copyFinal || this.frameEvery !== undefined || harvestDue)) {
+      const target = this.sink.target();
+      if (target) {
+        harvested = true;
+        if (!this.readback.harvest(target, this.stats)) {
+          this.fail();
+          return;
+        }
+        this.frameSubmitted = true;
+        this.frameTicks = this.copyTicks;
+        this.frameFinal = this.copyFinal;
+        this.frameAway = true;
+        this.sink.submit();
+        this.throttle.submitted(now);
       }
-      const final = this.copyFinal;
-      if (this.copyTicks >= this.iterations && this.mode !== "run") this.settle();
-      const r0 = performance.now();
-      try {
-        this.onFrame();
-      } catch (error) {
-        // The engine's repaint threw (a style accessor, say): report it as uncaught, as a repaint in its
-        // own animation frame would, and keep the layout's loop and its state intact.
-        reportUncaught(error);
-      }
-      repaintMs = performance.now() - r0;
-      this.throttle.repainted(now, repaintMs);
-      if (this.stopped) return; // the repaint superseded this layout
-      if (final) this.finish();
     }
+    // A ready frame is put on the graph and repainted once the repaint is due (the final one at once): in
+    // the frame it was harvested, or — relayed through the LOD worker — the first due frame after it returned.
+    let repainted = false;
+    let repaintMs = 0;
+    let commitMs = 0;
+    if (this.sink.ready) {
+      if (this.frameAway) {
+        this.frameAway = false;
+        this.throttle.returned(now);
+      }
+      const own = this.frameSubmitted; // else a frame the sink produced: the LOD tree's first geometry
+      const final = own && this.frameFinal;
+      if (final || this.frameEvery !== undefined || this.throttle.due(now)) {
+        const c0 = performance.now();
+        const applied = this.sink.commit();
+        commitMs = performance.now() - c0;
+        this.frameSubmitted = false;
+        if (!applied) {
+          // Lost with the LOD worker: nothing changed on the graph. Copy those ticks again (the final copy
+          // too — `finishing` still holds), now straight into the graph.
+          if (own) this.copiedTicks = Math.min(this.copiedTicks, this.frameTicks - 1);
+        } else {
+          if (own && this.frameTicks >= this.iterations && this.mode !== "run") this.settle();
+          const r0 = performance.now();
+          try {
+            this.onFrame();
+          } catch (error) {
+            // The engine's repaint threw (a style accessor, say): report it as uncaught, as a repaint in its
+            // own animation frame would, and keep the layout's loop and its state intact.
+            reportUncaught(error);
+          }
+          repaintMs = performance.now() - r0;
+          repainted = true;
+          this.throttle.repainted(now, repaintMs);
+          if (this.stopped) return; // the repaint superseded this layout
+          if (final) this.finish();
+        }
+      }
+    }
+    if (this.settlePending && !this.sink.holding) this.settle();
     const harvestMs = performance.now() - t0 - repaintMs;
 
     // 2. Encode work items within the budget.
@@ -336,15 +459,18 @@ export class GpuStream {
       this.throttle.copyIssued(now);
       this.copyReady = false;
     }
-    // `harvested` ⇔ onFrame ran (a failed harvest returned above). Not `repaintMs > 0`: a clamped clock
-    // (~1 ms in Firefox and Safari without cross-origin isolation) measures a cheap repaint as 0.
-    const frame = this.budget.endFrame(harvested);
+    // `repainted` ⇔ onFrame ran. Not `repaintMs > 0`: a clamped clock (~1 ms in Firefox and Safari without
+    // cross-origin isolation) measures a cheap repaint as 0. Not `harvested`: a relayed frame is painted
+    // in a later frame than the one that harvested it (#377).
+    const frame = this.budget.endFrame(repainted);
     if (copied) this.copyFrame = frame;
     const t3 = performance.now();
 
     if (observers.size > 0) {
       sample.now = now;
       sample.harvestMs = harvestMs;
+      sample.commitMs = commitMs;
+      sample.repainted = repainted;
       sample.repaintMs = repaintMs;
       sample.encodeMs = t3 - t2;
       sample.items = items;
@@ -363,9 +489,19 @@ export class GpuStream {
     else this.looping = false;
   };
 
-  /** Whether the loop still has something to do: ticks to encode, or a copy to harvest and repaint. */
+  /**
+   * Whether the loop still has something to do: ticks to encode, a copy to harvest and repaint, a ready frame
+   * to paint, or ticks to copy again after the LOD worker lost a frame. A frame out with the LOD worker needs
+   * no loop: the sink wakes the stream when it is back.
+   */
   private active(): boolean {
-    return (this.mode !== "idle" && !this.failed) || this.finishing || this.readback.pending;
+    return (
+      (this.mode !== "idle" && !this.failed) ||
+      this.finishing ||
+      this.readback.pending ||
+      this.sink.ready ||
+      (!this.failed && this.ticksDone > this.copiedTicks)
+    );
   }
 
   /** Whether the current mode has ticks left to encode (a started tick is always finished). */
@@ -443,11 +579,13 @@ export class GpuStream {
    */
   private copyDue(now: number): boolean {
     if (this.readback.pending) return false;
-    // The final copy goes out as soon as the PBO is free; its harvest clears `finishing` (finish()).
-    if (this.finishing) return true;
     if (this.ticksDone <= this.copiedTicks) return false;
+    // The final copy goes out as soon as the PBO is free, once: `finishing` holds until that frame is painted
+    // (finish()), which with LOD on is a worker round trip after its harvest (#377), and a frame lost with the
+    // worker is copied again because the loss rewinds `copiedTicks`.
+    if (this.finishing) return true;
     if (this.frameEvery !== undefined) return this.ticksDone - this.copiedTicks >= this.frameEvery;
-    return this.throttle.copyDue(now);
+    return this.throttle.copyDue(now, this.sink.relays);
   }
 
   // ── Lifecycle ──────────────────────────────────────────────────────────────
@@ -460,9 +598,19 @@ export class GpuStream {
     this.raf = requestAnimationFrame(this.frame);
   }
 
-  private settle(): void {
+  /**
+   * Resolve `settled` — unless the sink still holds it (the LOD tree is still being built, #377): then once
+   * it lets go, after the frame that paints the tree. `force` (stop, a lost context, a non-finite layout)
+   * resolves at once.
+   */
+  private settle(force = false): void {
     if (this.settledOnce) return;
+    if (!force && this.sink.holding) {
+      this.settlePending = true;
+      return;
+    }
     this.settledOnce = true;
+    this.settlePending = false;
     this.resolveSettled();
   }
 
@@ -494,11 +642,16 @@ export class GpuStream {
     this.halt();
     this.budget.dispose(false);
     this.readback.destroy(false);
+    this.sink.destroy();
     console.warn(`[d3gl] network layout({ backend: 'gpu' }) stopped: ${reason}.`);
-    this.settle();
+    this.settle(true);
   }
 
-  /** The reductions came back non-finite: stop encoding, keep the last finite positions, settle. */
+  /**
+   * The reductions came back non-finite: stop encoding, keep the last finite positions, settle. The sink stays
+   * until {@link stop} (the engine's next `layout()` / `data()`, or `destroy()`), so a frame the LOD worker is
+   * refitting, or the tree's first geometry, still lands and is painted (#377).
+   */
   private fail(): void {
     this.failed = true;
     this.mode = "idle";
@@ -510,6 +663,6 @@ export class GpuStream {
         `(Σx=${sx}, Σy=${sy}, Σ|v|=${sv}, count=${count}, box=[${negMinX === undefined ? "" : -negMinX}, ` +
         `${negMinY === undefined ? "" : -negMinY}, ${maxX}, ${maxY}]); keeping the last finite positions.`,
     );
-    this.settle();
+    this.settle(true);
   }
 }

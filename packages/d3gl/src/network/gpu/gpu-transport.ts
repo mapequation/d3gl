@@ -15,9 +15,14 @@
  * frame), and encodes as many work items — tick prep, force-pass row bands, integrate — as fit a GPU
  * budget of `min(10 ms, 0.6 × the frame interval)`. The main thread never waits for the GPU: no
  * synchronous `readPixels` on the frame path. On convergence the loop goes **idle** (the solver stays
- * alive) and `pin`/`unpin` hold nodes and resume it so the rest reflows (#183), as on the worker. The
- * GPU run itself ignores `multilevel`, `lod` and `coarsen` (a structural GPU seed and GPU-side LOD
- * streaming are later milestones); only its fallback uses them.
+ * alive) and `pin`/`unpin` hold nodes and resume it so the rest reflows (#183), as on the worker.
+ *
+ * With `lod` on, the GPU run keeps the LOD tree off the main thread as the worker backend does (#377): a
+ * layout worker coarsens the graph (`coarsen`) while the solver is built, and refits the tree's geometry to
+ * every harvested frame before it is painted ({@link LODRelay}); the tree reaches `onLODTree` once, with
+ * geometry, and `onLODTree(null)` withdraws it if that worker fails (the caller then builds its own). The
+ * GPU run itself still ignores `multilevel` (a structural GPU seed is a later milestone); its fallback
+ * honours it.
  */
 import type { Device } from "@luma.gl/core";
 import { WebGLDevice } from "@luma.gl/webgl";
@@ -26,7 +31,8 @@ import { gpuCaps } from "./device-probe.js";
 import { GpuForceLayout } from "./gpu-force-layout.js";
 import { GpuStream } from "./gpu-stream.js";
 import { canModuleSeed, gpuMultilevelSeed } from "./gpu-multilevel-seed.js";
-import { startWorkerLayout, type WorkerLayoutHandle, type WorkerLayoutOptions } from "../worker-transport.js";
+import { LODRelay } from "./lod-relay.js";
+import { spawnLayoutWorker, startWorkerLayout, type WorkerLayoutHandle, type WorkerLayoutOptions } from "../worker-transport.js";
 import { seedPositions, DEFAULT_FORCE } from "../force.js";
 import type { LODTopology, LODTree } from "../lod.js";
 import type { NetworkGraph } from "../graph.js";
@@ -55,8 +61,10 @@ export type GpuLayoutTransport = "gpu" | "worker";
 /**
  * Start a GPU-accelerated layout run. Returns a {@link WorkerLayoutHandle}-shaped object so the
  * engine treats it identically to the worker backend. `onFrame` runs inside the transport's animation
- * frame, right after a harvest and at most once per frame, so a caller may repaint synchronously there
- * (the transport times it to size its repaint throttle); the worker fallback calls it per worker message.
+ * frame, right after positions reached the graph and at most once per frame, so a caller may repaint
+ * synchronously there (the transport times it to size its repaint throttle); the worker fallback calls it
+ * per worker message. `onLODTree` gets the LOD tree streamed by a worker — the fallback's, or with `lod` on
+ * the GPU run's LOD worker (#377) — and, from the GPU run only, `null` if that worker fails.
  *
  * Accepts a `Device | null | Promise<Device | null>` so `network.ts` can pass a **device promise**
  * that resolves after the backend settles (including the `"auto"` → WebGL background upgrade).
@@ -77,7 +85,7 @@ export function startGpuLayout(
   graph: NetworkGraph,
   opts: GpuLayoutOptions,
   onFrame: () => void,
-  onLODTree?: (tree: LODTree) => void,
+  onLODTree?: (tree: LODTree | null) => void,
   onTransport?: (transport: GpuLayoutTransport) => void,
 ): WorkerLayoutHandle {
   if (!(deviceOrPromise instanceof Promise)) {
@@ -149,7 +157,7 @@ function fallBackToWorker(
   graph: NetworkGraph,
   opts: GpuLayoutOptions,
   onFrame: () => void,
-  onLODTree: ((tree: LODTree) => void) | undefined,
+  onLODTree: ((tree: LODTree | null) => void) | undefined,
   onTransport: ((transport: GpuLayoutTransport) => void) | undefined,
   failure?: { cause: unknown },
 ): WorkerLayoutHandle {
@@ -181,7 +189,7 @@ function startGpuLayoutSync(
   graph: NetworkGraph,
   opts: GpuLayoutOptions,
   onFrame: () => void,
-  onLODTree: ((tree: LODTree) => void) | undefined,
+  onLODTree: ((tree: LODTree | null) => void) | undefined,
   onTransport: ((transport: GpuLayoutTransport) => void) | undefined,
 ): WorkerLayoutHandle {
   const verdict = gpuLayoutSupport(gpuCaps(device), gpuLayoutNeed(graph.nodeCount, graph.edgeCount));
@@ -205,18 +213,27 @@ function startGpuLayoutSync(
   const { width, height, force, iterations: rawIterations } = opts;
   const iterations = rawIterations ?? 300;
 
+  // With LOD on, the LOD worker starts coarsening now, while this thread seeds and builds the solver (#377).
+  const relay = opts.lod && onLODTree ? startLODRelay(graph, opts, onLODTree) : null;
+
   // Seed positions. Module-aware multilevel seed (N8.2) when a provided module tree with super-edges
   // is available — lays out top-down over the module hierarchy so modules read as coherent regions —
   // else the plain phyllotaxis disc. The finest-level refine below (real edges) polishes either seed.
   const topo = opts.moduleTopology;
   const moduleSeeded = !!topo && canModuleSeed(topo, graph.nodeCount);
-  if (topo && moduleSeeded) {
-    gpuMultilevelSeed(device, topo, graph, { width, height, force });
-  } else {
-    seedPositions(graph, width, height, { force });
+  let layout: GpuForceLayout;
+  try {
+    // The module seed builds a solver per level on the GPU, which can fail as the finest one can.
+    if (topo && moduleSeeded) {
+      gpuMultilevelSeed(device, topo, graph, { width, height, force });
+    } else {
+      seedPositions(graph, width, height, { force });
+    }
+    layout = new GpuForceLayout(device, graph, { ...DEFAULT_FORCE, ...force });
+  } catch (error) {
+    relay?.destroy(); // the caller falls back to a worker run, which streams its own tree
+    throw error;
   }
-
-  const layout = new GpuForceLayout(device, graph, { ...DEFAULT_FORCE, ...force });
   // As the CPU worker (#124): a module-seeded layout cools over the iteration budget, a cold disc start
   // keeps full heat to untangle (see ForceLayout.run). The GPU run has no early stop yet — the per-tick
   // stop latch reads the mean step back with the positions (#124, spec §6.5.5) — so it runs the whole
@@ -229,15 +246,19 @@ function startGpuLayoutSync(
     stream = new GpuStream(device, layout, graph, {
       iterations,
       ...(opts.frameEvery !== undefined ? { frameEvery: opts.frameEvery } : {}),
+      ...(relay ? { sink: relay } : {}),
     }, onFrame);
   } catch (error) {
     // The readback's programs or buffers failed: free the solver before the caller falls back.
     layout.destroy();
+    relay?.destroy();
     throw error;
   }
   // Reported once every GPU resource exists, so a failed start reports only the fallback's "worker";
-  // still before the first frame.
+  // still before the first frame, and before the LOD tree (a later task).
   onTransport?.("gpu");
+  // LOD on but no worker to build the tree (or an edge-less graph, which does not coarsen): the caller builds it.
+  if (opts.lod && !relay) onLODTree?.(null);
   stream.start();
 
   return {
@@ -251,4 +272,25 @@ function startGpuLayoutSync(
     /** Release every pin and re-cool over a short tail, then idle. Mirrors the worker's `unpin`. */
     unpin: () => stream.unpin(),
   };
+}
+
+/**
+ * The GPU run's LOD tree, built and refit in a layout worker (#377), or null where no worker can run (with
+ * one warning). An edge-less graph gets none: it does not coarsen, and its caller builds a spatial tree.
+ */
+function startLODRelay(graph: NetworkGraph, opts: GpuLayoutOptions, onLODTree: (tree: LODTree | null) => void): LODRelay | null {
+  if (graph.edgeCount === 0) return null;
+  const worker = spawnLayoutWorker();
+  if (!worker) {
+    console.warn("[d3gl] network layout({ backend: 'gpu' }): no LOD worker could start; the LOD tree is built on the main thread instead.");
+    return null;
+  }
+  try {
+    return new LODRelay(worker, graph, opts.coarsen, onLODTree);
+  } catch (error) {
+    // The coarsen request could not be posted; the relay freed its worker. The caller withdraws the tree once
+    // it has reported the transport.
+    console.warn("[d3gl] network layout({ backend: 'gpu' }): a message to the LOD worker failed; the LOD tree is built on the main thread instead.", error);
+    return null;
+  }
 }

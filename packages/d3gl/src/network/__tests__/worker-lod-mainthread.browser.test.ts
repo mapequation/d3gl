@@ -255,18 +255,19 @@ describe("lod() before the first layout defers the main-thread tree build", () =
     host.remove();
   });
 
-  it("a gpu layout after lod() gets its main-thread tree at the end of the call chain", async () => {
+  it("a gpu layout after lod() builds no main-thread tree at the end of the call chain: a worker streams it", async () => {
     const { net, host } = makeNet();
     await net.whenReady();
 
-    // No `fit`, so layout() itself builds nothing: the deferred build is what supplies the tree — whether
-    // the solve runs on the GPU or falls back to the worker (which streams no tree for a gpu layout).
+    // No `fit`, so layout() itself builds nothing. A GPU layout streams its tree from a worker whichever way
+    // it resolves — its LOD worker on the GPU (#377), or its worker fallback (#351) — so the deferred build
+    // stands down, as for a worker layout, and the worker's tree is drawn once it lands.
     net.data(clustered(600)).lod({ expandPx: 48 }).layout({ backend: "gpu", iterations: 5 });
     expect(net.lodSource).toBe("none");
     await Promise.resolve();
-    expect(net.lodSource).toBe("main");
+    expect(net.lodSource).toBe("none");
     await net.whenSettled();
-    expect(net.lodSource).toBe("main");
+    expect(net.lodSource).toBe("worker");
 
     net.destroy();
     host.remove();

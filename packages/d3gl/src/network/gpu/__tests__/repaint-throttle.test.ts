@@ -3,7 +3,9 @@
  * timestamps. A layout repaint is due once `max(minFrameMs, 2 × max(repaint main-thread ms, GPU stall))`
  * has passed since the previous one; the GPU stall is the rAF gap after a repaint frame beyond the usual
  * interval. What this file pins beyond the formula: a gap that is **not** a render cost — a hidden tab, a
- * long task after a repaint frame — never stalls the layout's repaints for that long afterwards.
+ * long task after a repaint frame — never stalls the layout's repaints for that long afterwards; and a
+ * frame that takes a round trip to the LOD worker before it can be painted (#377) is harvested that much
+ * earlier, so the repaints keep their cadence.
  */
 import { describe, expect, it } from "vitest";
 import { MIN_FRAME_MS, RepaintThrottle } from "../repaint-throttle.js";
@@ -113,12 +115,110 @@ describe("RepaintThrottle (#352)", () => {
     // A copy that takes 20 ms to be seen complete.
     t.copyIssued(10);
     t.copyCompleted(30);
-    expect(t.copyDue(MIN_FRAME_MS - 20 - 2 - 1)).toBe(false);
-    expect(t.copyDue(MIN_FRAME_MS - 20)).toBe(true);
+    expect(t.copyDue(MIN_FRAME_MS - 20 - 2 - 1, false)).toBe(false);
+    expect(t.copyDue(MIN_FRAME_MS - 20, false)).toBe(true);
     // A copy in flight across a hidden-page gap: its "latency" is the gap, not the copy.
     t.copyIssued(100);
     t.pause();
     t.copyCompleted(60_100);
-    expect(t.copyDue(MIN_FRAME_MS - 20 - 2 - 1)).toBe(false);
+    expect(t.copyDue(MIN_FRAME_MS - 20 - 2 - 1, false)).toBe(false);
+  });
+
+  it("a relayed frame (#377) is harvested one round trip early, so repaints keep the interval", () => {
+    const t = new RepaintThrottle();
+    const ROUND_TRIP = 25; // the LOD worker's refit: 1.5 frames at 60 Hz
+    let now = 1000;
+    let sentAt = Number.NaN;
+    let inFlight = false;
+    let ready = false;
+    const repaints: number[] = [];
+    for (let f = 0; f < 600; f++, now += FRAME) {
+      t.beginFrame(now, FRAME);
+      if (inFlight && now - sentAt >= ROUND_TRIP) {
+        inFlight = false;
+        ready = true;
+        t.returned(now);
+      }
+      if (ready && t.due(now)) {
+        ready = false;
+        t.repainted(now, 1);
+        repaints.push(now);
+      }
+      if (!inFlight && !ready && t.harvestDue(now, true)) {
+        inFlight = true;
+        sentAt = now;
+        t.submitted(now);
+      }
+    }
+    const gaps = repaints.slice(3).map((r, i) => r - (repaints[i + 2] ?? r));
+    // Harvesting only once the repaint is due would space them by 50 ms + the round trip (4-5 frames).
+    for (const g of gaps) expect(g).toBeLessThan(MIN_FRAME_MS + FRAME);
+    for (const g of gaps) expect(g).toBeGreaterThanOrEqual(MIN_FRAME_MS - 2);
+  });
+
+  it("a frame painted where it was harvested has no round trip: harvests are due with the repaint", () => {
+    const t = new RepaintThrottle();
+    t.beginFrame(0, FRAME);
+    t.submitted(0);
+    t.returned(0);
+    t.repainted(0, 1);
+    expect(t.harvestDue(MIN_FRAME_MS - 3, true)).toBe(false);
+    expect(t.harvestDue(MIN_FRAME_MS - 2, true)).toBe(true);
+    expect(t.harvestDue(MIN_FRAME_MS - 2, true)).toBe(t.due(MIN_FRAME_MS - 2));
+  });
+
+  it("a pause drops a round-trip sample spanning it", () => {
+    const t = new RepaintThrottle();
+    t.beginFrame(0, FRAME);
+    t.repainted(0, 1);
+    t.submitted(10);
+    t.pause(); // a hidden tab while the worker refits
+    t.returned(60_010);
+    expect(t.harvestDue(MIN_FRAME_MS - 3, true)).toBe(false);
+    // Copies lead by the copy latency and the round trip together (a round trip is honoured once it repeats).
+    t.submitted(100);
+    t.returned(120);
+    t.submitted(130);
+    t.returned(150);
+    t.copyIssued(160);
+    t.copyCompleted(170);
+    expect(t.copyDue(MIN_FRAME_MS - 20 - 10 - 3, true)).toBe(false);
+    expect(t.copyDue(MIN_FRAME_MS - 20 - 10 - 2, true)).toBe(true);
+  });
+
+  it("a round trip must repeat to count: one reply that waited out a long task does not advance the harvests", () => {
+    const t = new RepaintThrottle();
+    t.beginFrame(0, FRAME);
+    t.repainted(0, 1);
+    for (const at of [100, 200]) {
+      t.submitted(at);
+      t.returned(at + 20); // the worker's refit
+    }
+    t.submitted(300);
+    t.returned(900); // the reply landed during a 600 ms task
+    // Harvests lead by the repeated 20 ms, not 600 ms (which would harvest right after every repaint).
+    expect(t.harvestDue(MIN_FRAME_MS - 20 - 3, true)).toBe(false);
+    expect(t.harvestDue(MIN_FRAME_MS - 20 - 2, true)).toBe(true);
+    // And a repeated long round trip is honoured: the latency is real.
+    t.submitted(1000);
+    t.returned(1600);
+    expect(t.harvestDue(MIN_FRAME_MS - 600, true)).toBe(true);
+  });
+
+  it("frames painted where they are harvested lead by no round trip, whatever the last relayed one was", () => {
+    const t = new RepaintThrottle();
+    t.beginFrame(0, FRAME);
+    t.repainted(0, 1);
+    for (const at of [100, 200]) {
+      t.submitted(at);
+      t.returned(at + 30); // relayed, before the LOD worker failed
+    }
+    t.copyIssued(300);
+    t.copyCompleted(310);
+    // The sink no longer relays: copies and harvests lead by the copy latency alone.
+    expect(t.copyDue(MIN_FRAME_MS - 10 - 3, false)).toBe(false);
+    expect(t.copyDue(MIN_FRAME_MS - 10 - 2, false)).toBe(true);
+    expect(t.harvestDue(MIN_FRAME_MS - 3, false)).toBe(false);
+    expect(t.harvestDue(MIN_FRAME_MS - 2, false)).toBe(true);
   });
 });

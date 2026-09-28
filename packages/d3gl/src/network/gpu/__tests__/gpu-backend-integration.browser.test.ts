@@ -322,14 +322,16 @@ describe("backend:'gpu' on a device without float blending (#351)", () => {
     net.destroy();
   });
 
-  it("a supported device still takes the GPU path with LOD on, building the tree on the main thread", async () => {
+  it("a supported device still takes the GPU path with LOD on, its LOD worker streaming the tree (#377)", async () => {
     const net = network(makeHost(), { width: W, height: H, backend: "webgl" });
     const posts = vi.spyOn(Worker.prototype, "postMessage");
     net.data(clustered(1500)).lod({ expandPx: 48 }).layout({ backend: "gpu", iterations: 10 });
     await net.whenSettled();
     expect(net.layoutTransport).toBe("gpu");
-    expect(workerStarts(posts)).toHaveLength(0); // no worker run
-    expect(net.lodSource).toBe("main"); // the GPU streams no tree: the main thread builds it (PR 3c moves it)
+    expect(workerStarts(posts)).toHaveLength(0); // no worker layout run
+    // A coarsen-only worker builds the tree and refits it per frame; the engine adopts it (#377).
+    expect(posts.mock.calls.map((c: [MainToWorker, ...unknown[]]) => c[0].type).filter((t) => t === "coarsen")).toHaveLength(1);
+    expect(net.lodSource).toBe("worker");
     net.destroy();
   });
 });
@@ -378,7 +380,7 @@ describe("backend:'auto' (#375)", () => {
     await net.whenSettled();
     expect(net.layoutTransport).toBe("gpu");
     expect(workerStarts(posts)).toHaveLength(0); // no worker run
-    expect(net.lodSource).toBe("main"); // what backend:"gpu" does today (PR 3c moves the tree off main)
+    expect(net.lodSource).toBe("worker"); // as backend:"gpu": its LOD worker streams the tree (#377)
     expect(fallbackWarnings(warn)).toHaveLength(0);
     net.destroy();
   });
