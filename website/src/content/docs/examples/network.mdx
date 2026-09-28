@@ -493,8 +493,11 @@ origin. It releases to normal zoom/pan once it settles — or as soon as you zoo
 
 The **Layout** control switches to the **nested** module layout (`layout({ nested })`): each module's
 children are laid out inside its own disc, arranged by their sibling links, so every module stays a
-compact region of its parent. The switch re-lays the map out *warm* and *eases* into it — see
-[below](#re-clustering-warm-re-layout-and-transitions).
+compact region of its parent. The example runs it on the GPU (`backend: "gpu"`): every module at every
+depth is solved at once — one batched solve over the whole tree, not one per module — and a fresh map
+streams in as one animation of all depths converging together. On a 325,729-leaf map that takes about
+2 s instead of 18 s on the CPU worker (M1 Max, Chromium). The switch re-lays the map out *warm* and
+*eases* into it — see [below](#re-clustering-warm-re-layout-and-transitions).
 
 Nodes are coloured **categorically by module** (the planted communities). The **LOD** control switches
 the cut over the same engine-held hierarchy:
@@ -559,7 +562,7 @@ would throw the current map away and start again from a disc. A **warm** one ref
 // Infomap re-ran (other flags, another trial…): same nodes, new tree.
 net
   .data(graph, { modules: next.nodes }) // positions live in `graph` — data() leaves them alone
-  .layout({ backend: "worker", nested: { warm: true }, transition: 600 });
+  .layout({ backend: "gpu", nested: { warm: true }, transition: 600 });
 await net.whenSettled(); // resolves when the transition ends
 ```
 
@@ -569,8 +572,20 @@ await net.whenSettled(); // resolves when the transition ends
   off-screen, and a warm start from a nested layout doesn't drift over repeated re-clusters. It posts no
   per-depth frames (those would collapse every module to a point first); on a graph never laid out it is
   the cold layout.
+- **`backend: "gpu"`** solves it on the GPU — about 2 s for a 325,729-leaf map where the CPU takes about
+  20 s, with the main thread busy only for a one-off ~0.1 s setup — and reads back only the final layout,
+  once. It falls back to the worker (`backend: "worker"`, which gives the CPU layout exactly) where the GPU
+  layout cannot run, and when a GPU solve stops early (a lost context, a non-finite layout) none of it
+  lands: the worker lays the map out instead. The GPU solve updates siblings together where the CPU
+  applies them one by one, so the two maps differ in detail but keep the same invariants: every child
+  inside its parent, siblings apart, linked siblings close. Two limits: at 1,000,000 leaves a frame that
+  reads positions back carries up to about 17 ms of layout GPU work, over the 10 ms frame budget; and the
+  disc collision costs time quadratic in the largest module when its children's sizes are very uneven —
+  one module of 60,000 children with power-law flows lays out in 5.5 s (the CPU: 5 minutes), but frames
+  stall for up to about 160 ms while it packs. Infomap's modules on web-NotreDame (at most 8,528
+  children) stay at about 2 s with no stall.
 - **`transition: 600`** eases every node from where it is to its new place over 600 ms (cubic
-  ease-in-out) on the main thread. The worker computes the final layout only; each animation frame is then
+  ease-in-out) on the main thread. The layout computes the final positions only; each animation frame is then
   a positions-only repaint — no more work than a frame of a streaming layout. The camera stays where it
   is unless you pass `fit: true`, which frames the final map once as the transition starts.
   `transition` also eases a `"positions"` or `"force"` layout; a new `layout()`, `data()`,

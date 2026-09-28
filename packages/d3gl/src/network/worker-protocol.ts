@@ -13,6 +13,7 @@ import type { CoarsenOptions } from "./coarsen.js";
 import type { BoundaryDiscs, LODTopology } from "./lod.js";
 import type { NestedLayoutParams, NestedLayoutTopology } from "./nested-layout.js";
 import type { SeedPlan, SeedPlanOptions } from "./gpu/seed-plan.js";
+import type { NestedSolverTopology } from "./gpu/nested-topology.js";
 
 /** Kick off a layout run. Edge buffers are copied to the worker; the main thread keeps its own. */
 export interface StartMessage {
@@ -109,6 +110,16 @@ export interface NestedStartMessage {
 }
 
 /**
+ * Build the batched GPU nested layout's solve data off the main thread (#355): the worker replies with
+ * one {@link NestedPrepReply} (its buffers transferred) and is then done. O(tree size + links · log links).
+ */
+export interface NestedPrepMessage {
+  type: "nested-prep";
+  topology: NestedLayoutTopology;
+  params: NestedLayoutParams;
+}
+
+/**
  * The GPU layout's coarsening worker: coarsen the graph, with no layout, for the LOD tree (#377) and/or the
  * GPU's multilevel seed (#353) — one hierarchy for both, as the worker backend shares it between its seed
  * and its LOD tree. With `seed`, the worker first posts a {@link SeedPlanMessage} (its arrays transferred).
@@ -143,7 +154,15 @@ export interface LODGeometryRequest {
   geometry?: Float32Array;
 }
 
-export type MainToWorker = StartMessage | StopMessage | PinMessage | UnpinMessage | NestedStartMessage | CoarsenMessage | LODGeometryRequest;
+export type MainToWorker =
+  | StartMessage
+  | StopMessage
+  | PinMessage
+  | UnpinMessage
+  | NestedStartMessage
+  | CoarsenMessage
+  | LODGeometryRequest
+  | NestedPrepMessage;
 
 /**
  * The LOD tree, posted once after the worker coarsens (only when `lod` was requested, or for a
@@ -199,6 +218,12 @@ export interface SeedPlanMessage {
 }
 
 export type WorkerToMain = LODTopologyMessage | ProgressMessage | LODGeometryMessage | SeedPlanMessage;
+
+/** The reply to a {@link NestedPrepMessage}: the GPU nested solve's data (#355). Its own channel, not a layout message. */
+export interface NestedPrepReply {
+  type: "nested-prep";
+  solver: NestedSolverTopology;
+}
 
 /**
  * The three position-derived geometry arrays packed contiguously in one buffer, `[cx, cy, extent]`
