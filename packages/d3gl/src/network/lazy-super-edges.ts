@@ -412,7 +412,8 @@ export function lazySuperEdges(
   // The culled root holding leaf v (a leaf no drawn cover labelled): the first stamped ancestor, memoised
   // with path compression over the climbed chain (only touched nodes are written).
   const climb = (v: number): number => {
-    if (cover[v]! >> 3 === gen) {
+    const own = cover[v];
+    if (own !== undefined && own >> 3 === gen) {
       // A culled leaf (an off-screen member of an expanded cell) is its own cover.
       label[2 * v] = gen;
       label[2 * v + 1] = v;

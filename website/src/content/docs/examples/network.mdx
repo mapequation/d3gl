@@ -310,8 +310,10 @@ net
   cells, so the `"worker"` backend **rebuilds it in the worker on every streamed frame** — topology,
   geometry and aggregated style, handed to the main thread whole (transferred, not copied) — and stops
   once the layout has converged. The other backends rebuild it on the main thread whenever a layout
-  lands (a new layout, a streamed GPU frame); a position transition or a drag only refits the tree it
-  has, and rebuilds it once the nodes come to rest.
+  lands — and the `"gpu"` backend lands one with every frame it streams, so there the main thread
+  rebuilds the tree per repaint (~30 ms for a 325k-node graph, ~140 ms for a million nodes): use
+  `"worker"` with the spatial source on large graphs. A position transition or a drag only refits the
+  tree it has, and rebuilds it once the nodes come to rest.
 - **Links are summed from the graph.** A rebuilt tree has no super-edge table (building one per frame
   would cost more than the layout tick); the links between drawn glyphs are summed from the graph's own
   edges through the glyphs' members. Every neighbour resolves to the one glyph that covers it, so links
