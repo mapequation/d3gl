@@ -5,6 +5,7 @@ import type { ModuleNode } from "../modules.js";
 import type { ViewTransform } from "../../core/index.js";
 import { perfBudget, perfN } from "../../__tests__/perf-budget.js";
 import { perfHost, zoomSteps } from "../../__tests__/engine-sweep.js";
+import type { WorkerLayoutHandle } from "../worker-transport.js";
 
 // Count the fit's O(nodes) box (#327): once per streamed frame while the fit is on, never otherwise.
 const box = vi.hoisted(() => ({ calls: 0 }));
@@ -43,6 +44,21 @@ vi.mock("../glyphs.js", async (importOriginal) => {
     },
   };
 });
+// The worker transport is idle (see the header): `layout({ backend: "worker" })` gets a live handle that
+// streams nothing and never settles until stopped, so its fit stays on while the file streams the frames.
+vi.mock("../worker-transport.js", async (importOriginal) => {
+  const mod = await importOriginal<typeof import("../worker-transport.js")>();
+  return {
+    ...mod,
+    startWorkerLayout: (): WorkerLayoutHandle => {
+      let stop = (): void => {};
+      const settled = new Promise<void>((resolve) => {
+        stop = () => resolve();
+      });
+      return { shared: false, settled, stop, pin() {}, unpin() {} };
+    },
+  };
+});
 
 /**
  * ENGINE-level per-frame guard for the streaming fit (#327, AGENTS.md lifecycle §5). The trigger is a
@@ -50,9 +66,10 @@ vi.mock("../glyphs.js", async (importOriginal) => {
  * repaint (`scheduleLayoutRepaint` → `fitViewToLayout` → `rebuild`), timed alone. The node guard
  * (`fit-box-perf.test.ts`) pins the box itself at ~1M; this one pins what the engine does around it.
  *
- * The fit is switched on the way a user does, with a real `layout({ backend: "worker", fit: true })`.
- * Its worker is then stopped, and the file streams the frames itself: at guard scale a real worker posts
- * about one frame every 1-2 s, irregularly, and can run out of frames before a stream has been timed.
+ * The fit is switched on the way a user does, with a real `layout({ backend: "worker", fit: true })`, but
+ * its worker transport is idle — the layout runs, so its fit stays on, and the file streams the frames
+ * itself: at guard scale a real worker posts about one frame every 1-2 s, irregularly, and can run out of
+ * frames before a stream has been timed. (Stopping the worker instead would end the fit with it, #427.)
  * `requestAnimationFrame` is replaced by a queue this file flushes, so each repaint runs, and is timed,
  * alone.
  *
@@ -195,10 +212,9 @@ beforeAll(async () => {
     const { graph, modules, a, m, b } = fixture(N);
     net.data(graph, { modules }).style({ nodeRadius: 3, sizeMode: "screen" }).enableZoom([1e-4, 1e4]);
 
-    /** Start a worker stream with the fit on or off, then stop its worker (see the header). */
+    /** Start a worker stream with the fit on or off, on the idle transport (see the header). */
     const startStream = (fit: boolean): void => {
       net.layout({ backend: "worker", fit, multilevel: false });
-      net.stopLayout();
       flush();
     };
     /** One streamed layout frame: the transport's position copy, then the coalesced repaint. */

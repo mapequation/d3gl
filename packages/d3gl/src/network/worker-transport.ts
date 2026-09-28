@@ -15,7 +15,8 @@ import type { Device } from "@luma.gl/core";
 import { multilevelLayout, type CoarsenOptions } from "./coarsen.js";
 import { ForceLayout, seedPositions, type ForceParams } from "./force.js";
 import { lodTreeFromTopology, type BoundaryDiscs, type LODTree } from "./lod.js";
-import { nestedLayout, nestedBoundaryDiscs, type NestedLayoutParams, type NestedLayoutTopology } from "./nested-layout.js";
+import type { FitBox } from "./fit.js";
+import { nestedLayout, nestedBoundaryDiscs, nestedRootBounds, type NestedLayoutParams, type NestedLayoutTopology } from "./nested-layout.js";
 import {
   lodGeometryViews,
   lodGeometryByteLength,
@@ -352,6 +353,14 @@ export interface NestedWorkerOptions {
   onResult?: (positions: Float32Array) => void;
   /** Receive the final layout's module boundary discs (#329), just before its positions land. */
   onBoundaries?: (discs: BoundaryDiscs) => void;
+  /**
+   * Receive the streamed layout's bound on its final extent (#427), for a streaming fit to frame the map on:
+   * the root disc ({@link nestedRootBounds}) synchronously when a cold stream starts, then each depth's
+   * tighter bound (the `bounds` of `nestedLayout`'s `onDepth`) just before that depth's positions land.
+   * Never called for a solve that lands in one frame (warm, `stream: false` or `onResult`), nor by the
+   * main-thread fallback, whose layout lands at once.
+   */
+  onBounds?: (bounds: FitBox) => void;
 }
 
 /**
@@ -410,6 +419,7 @@ export function startNestedWorkerLayout(
       terminate();
       return;
     }
+    if (msg.bounds) opts.onBounds?.(msg.bounds);
     if (msg.positions) graph.positions.set(msg.positions);
     onFrame();
   };
@@ -431,6 +441,10 @@ export function startNestedWorkerLayout(
   };
   const start: MainToWorker = { type: "start-nested", topology, params, stream: (opts.stream ?? true) && !onResult };
   worker.postMessage(start);
+  // A streamed cold solve's first bound (#427): its root disc, known before the worker places a depth, so a
+  // fit frames the map from its first paint and only zooms in as the depths' own bounds arrive. A warm
+  // solve streams no depths (nestedLayout's rule), and a one-frame solve lands exact.
+  if (start.stream && !params.initial) opts.onBounds?.(nestedRootBounds(tree.leafCount, params.radius));
   return {
     shared: false,
     settled,

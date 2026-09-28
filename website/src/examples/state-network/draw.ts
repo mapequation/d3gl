@@ -26,8 +26,8 @@ const VIEW = { Physical: "physical", State: "state", Both: "both" } as const;
  * labels `1,2,…` (physical) and `(i,j)` (state). `layout({ backend })` lays out the physical graph — **Force**
  * (main-thread, synchronous), **Worker** (off-thread, progressive), or **GPU** (WebGL2 Barnes-Hut,
  * falling back to Worker when unavailable) — and derives the rosette from it each streamed frame (#182);
- * it also **scales the layout to fill the view** once settled, so it opens framed — no fit-transform.
- * Scroll to zoom, drag to pan.
+ * `fit: true` has the camera **frame the layout** on every backend — following it as it converges on
+ * Worker/GPU, once as it lands on Force. Scroll to zoom, drag to pan.
  */
 export const setup: ImperativeSetup = (host, { width, height, backend }) => {
   const net = network(host, { width, height, backend });
@@ -96,8 +96,8 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
       });
 
       if (layoutChanged) {
-        // fit: true (#238) frames the streaming physical layout as it converges (worker/gpu); the
-        // synchronous `force` backend ignores it and frames itself. Opens framed, no top-left flash.
+        // fit: true (#238, #427) frames the layout with the camera: as it converges on worker/gpu, once as
+        // it lands on force. Opens framed, no top-left flash.
         net.stateNetwork(g.graph, { modules: g.stateModules, view }).layout({ backend, fit: true });
         builtBackend = backend;
       } else net.view(view);

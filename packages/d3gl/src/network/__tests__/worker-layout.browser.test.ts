@@ -1,11 +1,14 @@
 import { describe, it, expect } from "vitest";
-import { startWorkerLayout, sharedMemoryAvailable } from "../worker-transport.js";
+import { startWorkerLayout, startNestedWorkerLayout, sharedMemoryAvailable } from "../worker-transport.js";
 import { ForceLayout, seedPositions } from "../force.js";
 import { network } from "../network.js";
 import { buildGraph } from "../graph.js";
 import type { LODTree } from "../lod.js";
 import { MAX_OUTSTANDING, type LODView } from "../lod-frame.js";
 import type { MainToWorker, ProgressMessage, WorkerToMain } from "../worker-protocol.js";
+import { buildModuleLODTree, type ModuleNode } from "../modules.js";
+import type { NestedLayoutTopology } from "../nested-layout.js";
+import type { FitBox } from "../fit.js";
 
 /** A ring graph — enough structure for the force layout to spread the nodes apart. */
 function ring(n: number) {
@@ -385,5 +388,51 @@ describe("worker-LOD streaming (#103)", () => {
 
     net.destroy();
     host.remove();
+  });
+});
+
+describe("nested worker layout: the stream's fit bound belongs to the transport (#427)", () => {
+  /** A cold three-level map: 4 top modules × 3 sub-modules × 8 leaves, leaves chained in each sub-module. */
+  function nestedTopology(): { graph: ReturnType<typeof buildGraph>; topology: NestedLayoutTopology } {
+    const n = 4 * 3 * 8;
+    const records: ModuleNode[] = [];
+    const source: number[] = [];
+    const target: number[] = [];
+    for (let id = 0; id < n; id++) {
+      records.push({ id, path: [Math.floor(id / 24) + 1, Math.floor((id % 24) / 8) + 1, (id % 8) + 1] });
+      if (id % 8) (source.push(id - 1), target.push(id));
+    }
+    const tree = buildModuleLODTree(n, records, { source, target, weight: source.map(() => 1) });
+    if (!tree.parent) throw new Error("module trees carry a parent map");
+    return { graph: buildGraph({ nodeCount: n, source, target }), topology: { ...tree, parent: tree.parent } };
+  }
+
+  it("a streamed cold solve posts its root disc at once, then each depth's tighter bound", async () => {
+    const { graph, topology } = nestedTopology();
+    const R = 10 * Math.sqrt(graph.nodeCount);
+    const bounds: FitBox[] = [];
+    const handle = startNestedWorkerLayout(graph, topology, { radius: R }, () => {}, { onBounds: (b) => bounds.push([...b]) });
+    // Before the worker has placed anything: the root disc, the only bound known yet — so a fit frames the
+    // map from its first paint, with no knowledge of the transport in the engine.
+    expect(bounds).toEqual([[-R, -R, R, R]]);
+    await handle.settled;
+    expect(bounds.length, "one bound per streamed depth after the root disc").toBe(4);
+    for (let d = 1; d < bounds.length; d++) {
+      const [a, b] = [bounds[d - 1], bounds[d]];
+      if (!a || !b) throw new Error("missing bound");
+      expect(b[0] >= a[0] && b[1] >= a[1] && b[2] <= a[2] && b[3] <= a[3], `bound ${d} grew`).toBe(true);
+    }
+  });
+
+  it("a solve that lands in one frame (warm, or handed to onResult) posts no bound", async () => {
+    const { graph, topology } = nestedTopology();
+    const bounds: FitBox[] = [];
+    const one = startNestedWorkerLayout(graph, topology, { radius: 50 }, () => {}, { stream: false, onBounds: (b) => bounds.push(b) });
+    await one.settled;
+    const result = startNestedWorkerLayout(graph, topology, { radius: 50 }, () => {}, { onResult: () => {}, onBounds: (b) => bounds.push(b) });
+    await result.settled;
+    const warm = startNestedWorkerLayout(graph, topology, { initial: graph.positions.slice() }, () => {}, { onBounds: (b) => bounds.push(b) });
+    await warm.settled;
+    expect(bounds).toEqual([]);
   });
 });

@@ -227,3 +227,55 @@ export function layoutFitTransform(box: FitBox, width: number, height: number, p
   const padded: FitBox = screenSized ? box : [box[0] - pad, box[1] - pad, box[2] + pad, box[3] + pad];
   return fitTransform(padded, width, height, { padPx: screenSized ? pad : 0 });
 }
+
+/**
+ * The camera of a fitted transition (#427): the view at eased progress `e` on the way from `a` to `b`
+ * (clamped to `[0, 1]`, exactly `a` at 0 and `b` at 1). It moves the **world rectangle** the view shows in
+ * a straight line — `1/k`, `x/k` and `y/k` are linear in `e` — as a transition moves the node positions.
+ * So the zoom is monotonic, and a node on screen at both ends, eased on the same progress, stays on screen
+ * at every step between (both the node and each edge of the view move linearly, so the node stays between
+ * the edges). Pure and O(1) per call.
+ */
+export function interpolateView(a: ViewTransform, b: ViewTransform): (e: number) => ViewTransform {
+  const s0 = 1 / a.k;
+  const s1 = 1 / b.k;
+  const u0 = a.x * s0;
+  const u1 = b.x * s1;
+  const v0 = a.y * s0;
+  const v1 = b.y * s1;
+  return (e) => {
+    if (!(e > 0)) return a;
+    if (e >= 1) return b;
+    const k = 1 / (s0 + (s1 - s0) * e);
+    return { k, x: (u0 + (u1 - u0) * e) * k, y: (v0 + (v1 - v0) * e) * k };
+  };
+}
+
+/**
+ * The camera of a fitted transition (#427) as a path whose destination may move on the way: called once per
+ * frame with the transition's eased progress `e` and the view framing its target **as of that frame**
+ * (re-derived from the viewport and the glyph pad, so a resize or a restyle mid-ease moves it). While the
+ * destination holds still this is {@link interpolateView} from `start`. When it moves, the path re-aims
+ * from the view it last returned, over the progress left — `(e − e₀) / (1 − e₀)` from the progress `e₀`
+ * of that view — so the camera never jumps, zooms monotonically on each leg, keeps a node on screen at
+ * both ends of a leg on screen through it, and still lands exactly on the destination at `e = 1`, with the
+ * nodes. O(1) per call, and per re-aim.
+ */
+export function fitCameraPath(start: ViewTransform): (e: number, end: ViewTransform) => ViewTransform {
+  let from = start;
+  let e0 = 0;
+  let to: ViewTransform | null = null;
+  let leg: (u: number) => ViewTransform = () => start;
+  let last = start;
+  let eLast = 0;
+  return (e, end) => {
+    if (!to || end.k !== to.k || end.x !== to.x || end.y !== to.y) {
+      if (to) [from, e0] = [last, eLast]; // re-aim from where the camera is
+      to = end;
+      leg = interpolateView(from, end);
+    }
+    last = e >= 1 ? end : leg(e0 < 1 ? (e - e0) / (1 - e0) : 1);
+    eLast = e;
+    return last;
+  };
+}

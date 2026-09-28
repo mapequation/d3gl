@@ -15,6 +15,7 @@ import type { LeafStyle, LODView, SpatialLODFrame } from "./lod-frame.js";
 import type { NestedLayoutParams, NestedLayoutTopology } from "./nested-layout.js";
 import type { SeedPlan, SeedPlanOptions } from "./gpu/seed-plan.js";
 import type { NestedSolverTopology } from "./gpu/nested-topology.js";
+import type { FitBox } from "./fit.js";
 
 /** Kick off a layout run. Edge buffers are copied to the worker; the main thread keeps its own. */
 export interface StartMessage {
@@ -133,7 +134,7 @@ export interface UnpinMessage {
 /**
  * Run the nested module layout (#324) instead of a force layout. With `stream`, the worker posts one
  * `frame` per finished depth (`tick` = depth, positions always copied — there are only tree-depth
- * many); either way it ends with a `done` carrying the final positions.
+ * many — with the depth's `bounds`, #427); either way it ends with a `done` carrying the final positions.
  */
 export interface NestedStartMessage {
   type: "start-nested";
@@ -258,6 +259,9 @@ export interface ProgressMessage {
    * (the layout converged).
    */
   lodFrame?: SpatialLODFrame;
+  /** A nested layout's depth `frame` (#427): a box its final layout lies in (the `bounds` of
+   *  `nestedLayout`'s `onDepth`), for a streaming fit to frame. */
+  bounds?: FitBox;
 }
 
 /**
