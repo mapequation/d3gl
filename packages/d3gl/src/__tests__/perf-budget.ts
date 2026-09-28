@@ -71,3 +71,29 @@ export const perfN = (localDefault: number, opts?: { max?: number }): number => 
   const max = opts?.max;
   return max !== undefined && perfNOverride > max ? max : perfNOverride;
 };
+
+// ---- hardware GPU (#392) ---------------------------------------------------------------------------
+//
+// `__PERF_REAL_GPU__` is substituted from `PERF_REAL_GPU` (see `define` in packages/d3gl/vitest.config.ts):
+// a browser tier running on a hardware GPU sets it. The CI tier renders through SwiftShader, where GL is
+// CPU work that competes with the page's workers for the runner's cores, so a wall-clock comparison between
+// a GPU path and a CPU-worker path measures the runner, not the code; such a guard asserts its deterministic
+// counts everywhere and the wall-clock comparison only when this is set (checking the renderer is not
+// SwiftShader: {@link softwareRenderer}).
+declare const __PERF_REAL_GPU__: string;
+
+/** Whether the tier says it runs on a hardware GPU (`PERF_REAL_GPU=1`). */
+export const perfRealGpu: boolean = (() => {
+  const raw = typeof __PERF_REAL_GPU__ === "string" ? __PERF_REAL_GPU__ : "";
+  return raw !== "" && raw !== "0" && raw !== "false";
+})();
+
+/** Whether this browser's WebGL renders in software (SwiftShader, llvmpipe), from `UNMASKED_RENDERER_WEBGL`. */
+export function softwareRenderer(): boolean {
+  const gl = document.createElement("canvas").getContext("webgl2");
+  if (!gl) return true;
+  const info = gl.getExtension("WEBGL_debug_renderer_info");
+  const renderer = String(gl.getParameter(info ? info.UNMASKED_RENDERER_WEBGL : gl.RENDERER));
+  gl.getExtension("WEBGL_lose_context")?.loseContext();
+  return /swiftshader|llvmpipe|software/i.test(renderer);
+}
