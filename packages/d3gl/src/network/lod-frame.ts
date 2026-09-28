@@ -18,11 +18,12 @@
  *   from the main thread for reuse ({@link recycleSpatialFrame}), so a warm stream allocates nothing. It
  *   rebuilds only for new positions (a frame id it has not built), so it stops once the layout has converged.
  *
- * The worker backend's frame loop calls it for every frame it posts. A GPU layout's LOD worker (#377) can
- * call the same function for every position snapshot it harvests: bind the geometry buffer the request
- * handed back to a structure stream's tree first (as its refit does), post a spatial stream's frame with its
- * transfer list, and pass returned buffers to {@link recycleSpatialFrame} (re-running the step when it says a
- * skipped frame is due).
+ * The worker backend's frame loop calls it for every frame it posts, and a GPU layout's LOD worker (#377) for
+ * every position snapshot the GPU harvests (`answerLODGeometry` in `lod-refit.ts`): it binds the geometry
+ * buffer the request handed back to a structure stream's tree first, and posts a spatial stream's frame with
+ * its transfer list. Returned buffers go to {@link recycleSpatialFrame}; the worker backend re-runs the step
+ * when it says a skipped frame is due, while the GPU relay never lets one be skipped (it takes no harvest
+ * while {@link MAX_OUTSTANDING} trees are out, and its worker keeps no positions to build one from later).
  */
 import {
   buildMortonTopology,

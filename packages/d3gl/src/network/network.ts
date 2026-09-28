@@ -421,9 +421,10 @@ export interface NetworkLODOptions {
    *   that spreads communities apart (web graphs), the structural tree's aggregates cover the whole view
    *   and the cut draws a large share of the graph at every zoom; the spatial one keeps the frontier bounded
    *   by the screen (a few hundred to ~2k glyphs) and its per-frame cost small. The tree follows the
-   *   positions: the `"worker"` backend rebuilds it off the main thread on every streamed frame (and stops
-   *   once the layout has converged); the other backends rebuild it when a layout lands, and a position
-   *   transition or a drag refits it until the nodes come to rest. An aggregate's id changes with each
+   *   positions: the `"worker"` backend rebuilds it off the main thread on every streamed frame, and so does
+   *   the `"gpu"` backend's LOD worker for every frame the GPU reads back (both stop once the layout has
+   *   converged); the other backends rebuild it when a layout lands, and a position transition or a drag
+   *   refits it until the nodes come to rest. An aggregate's id changes with each
    *   rebuild, so a selected or hovered aggregate is carried over to the cell in the same place; leaves
    *   keep their ids — read a hit's `members()` when the event fires, as the tree it came from is replaced
    *   by the next streamed frame. Super-edges are summed from the graph's edges per frame (no super-edge
@@ -1210,7 +1211,7 @@ export class Network extends BaseEngine {
    *
    * With a module hierarchy (`data(graph, { modules })`, #326) the cut draws the module tree by
    * default; `{ source: "structure" }` coarsens the graph structurally instead. `{ source: "spatial" }`
-   * (#343) groups nodes by position — on the worker backend the worker rebuilds that tree on every
+   * (#343) groups nodes by position — on the worker and GPU backends a worker rebuilds that tree on every
    * streamed frame, so call this before `layout()` there too. `lod(false)` turns LOD off but keeps the
    * hierarchy, so re-enabling reuses its tree.
    */
@@ -1780,8 +1781,9 @@ export class Network extends BaseEngine {
    *
    * The worker can post a frame per tick, so repaints coalesce to one per animation frame
    * ({@link scheduleLayoutRepaint}), always painting the freshest positions. It streams a *coarsening* LOD
-   * tree; a module hierarchy (N6 / #104) is a different source the worker doesn't build, so while the cut
-   * draws modules the worker supplies positions only and the main thread builds the module tree.
+   * tree, or the spatial tree rebuilt per frame (#343); a module hierarchy (N6 / #104) is a different source
+   * the worker doesn't build, so while the cut draws modules the worker supplies positions only and the main
+   * thread builds the module tree.
    *
    * The GPU run uses the WebGL backend's luma.gl Device, passed as a *promise* that waits for the backend
    * to settle (including the `"auto"` → WebGL background upgrade), so `startGpuLayout` sees the real
@@ -1791,8 +1793,10 @@ export class Network extends BaseEngine {
    * recomputeLODGeometry only fills its geometry.
    *
    * With LOD on, the GPU solve streams the tree from a worker too (#377): its LOD worker coarsens while the
-   * solver is built and refits the tree to every harvested frame, which is painted with its geometry. The
-   * engine adopts that tree exactly as the worker backend's, so the main thread builds none and refits none.
+   * solver is built and refits the tree to every harvested frame, which is painted with its geometry — or,
+   * for the spatial source (#343), rebuilds the spatial tree for every harvested frame, painted with it. The
+   * engine adopts that tree exactly as the worker backend's ({@link adoptStreamedTree} for a spatial one), so
+   * the main thread builds none and refits none.
    *
    * On settle, the final refresh (the last streamed frame may land before the resolve) forces a
    * main-thread tree when no worker streamed one — the worker-unavailable fallback solved synchronously,
@@ -1800,9 +1804,9 @@ export class Network extends BaseEngine {
    */
   private startStreamingLayout(graph: NetworkGraph, opts: NetworkLayoutOptions): void {
     const useLod = !!this.lodOptions && !this.lodUsesModules();
-    // The spatial tree (#343) is rebuilt by the worker per frame, style aggregated there too — on the
-    // worker backend and on a "gpu" layout's worker fallback alike (#351) — with the super-edge rows of the
-    // covers of the view the cut runs at (#433).
+    // The spatial tree (#343) is rebuilt by a worker per frame, style aggregated there too — on the worker
+    // backend, on a "gpu" layout's worker fallback (#351) and by the GPU layout's LOD worker alike — with the
+    // super-edge rows of the covers of the view the cut runs at (#433).
     const lodSource = useLod ? this.lodKind() : null;
     const spatialStyle = lodSource === "spatial" ? this.lodLeafStyle(graph) : null;
     this.lodWorkerSource = lodSource === "spatial" ? "spatial" : useLod ? "structure" : null;

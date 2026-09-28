@@ -1,13 +1,14 @@
 /**
  * The layout worker's coarsening half (#377, #353) in process, for tests: it answers `coarsen` (the seed plan
- * and the LOD topology) and `lod-geometry` with the real worker code (`lod-refit.ts`), and moves buffers the
- * way `postMessage` transfers them (the sender's copy detaches). Messages queue until {@link InProcessLODWorker.flush} — by hand in node tests, or on a
+ * and the LOD topology), `lod-geometry` (the per-frame LOD step: refit, or rebuild the spatial tree, #343),
+ * `lod-style` and `lod-recycle` with the real worker code (`lod-refit.ts`, `lod-frame.ts`), and moves buffers
+ * the way `postMessage` transfers them (the sender's copy detaches). Messages queue until {@link InProcessLODWorker.flush} — by hand in node tests, or on a
  * timer (`auto`), like a real worker's turn, in browser tests that cannot load a worker (a file that
  * `vi.mock`s a module the worker imports serves the worker the mock, which cannot run there).
  */
-import type { LODPositionTree } from "../../lod.js";
-import { answerCoarsen, refitGeometry } from "../../lod-refit.js";
-import { lodGeometryByteLength, type MainToWorker, type WorkerToMain } from "../../worker-protocol.js";
+import { recycleSpatialFrame, type LODStream } from "../../lod-frame.js";
+import { answerCoarsen, answerLODGeometry } from "../../lod-refit.js";
+import type { MainToWorker, WorkerToMain } from "../../worker-protocol.js";
 import type { LODWorkerPort } from "../lod-relay.js";
 
 export class InProcessLODWorker implements LODWorkerPort {
@@ -18,9 +19,10 @@ export class InProcessLODWorker implements LODWorkerPort {
   readonly received: MainToWorker[] = [];
   /** Each refit request's geometry length on arrival (−1: none handed back); the buffers move on after. */
   readonly refitGeometry: number[] = [];
-  /** Refits run so far (each one `computeLODPositions` pass). */
+  /** Relayed frames stepped so far (each one per-frame LOD step: a `computeLODPositions` pass, or a spatial rebuild). */
   refits = 0;
-  private tree: LODPositionTree | null = null;
+  /** What `coarsen` left for the relayed frames: the structure tree to refit, or the spatial stream (#343). */
+  stream: LODStream | null = null;
   private readonly queue: MainToWorker[] = [];
   private readonly auto: boolean;
   private scheduled = false;
@@ -47,13 +49,19 @@ export class InProcessLODWorker implements LODWorkerPort {
   flush(): void {
     for (let msg = this.queue.shift(); msg; msg = this.queue.shift()) {
       if (this.terminated) return;
+      const stream = this.stream;
       if (msg.type === "coarsen") {
-        this.tree = answerCoarsen(msg, (message, transfer) => this.reply(message, transfer));
-      } else if (msg.type === "lod-geometry" && this.tree) {
-        const buffer = msg.geometry?.buffer ?? new ArrayBuffer(lodGeometryByteLength(this.tree.size));
-        const geometry = refitGeometry(this.tree, msg.positions, buffer);
+        this.stream = answerCoarsen(msg, (message, transfer) => this.reply(message, transfer));
+      } else if (msg.type === "lod-geometry" && stream) {
         this.refits++;
-        this.reply({ type: "lod-geometry", positions: msg.positions, geometry }, [msg.positions.buffer, geometry.buffer]);
+        answerLODGeometry(stream, msg, (message, transfer) => this.reply(message, transfer));
+      } else if (msg.type === "lod-style" && stream?.kind === "spatial") {
+        stream.style = msg.style;
+        stream.styleVersion = msg.version;
+      } else if (msg.type === "lod-view" && stream?.kind === "spatial") {
+        stream.view = msg.view;
+      } else if (msg.type === "lod-recycle" && stream?.kind === "spatial") {
+        recycleSpatialFrame(stream, msg.buffer, msg.rows);
       }
     }
   }

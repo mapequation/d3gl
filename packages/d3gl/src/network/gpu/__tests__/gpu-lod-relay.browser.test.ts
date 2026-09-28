@@ -15,15 +15,31 @@
  *   `gpu-lod-mainthread.browser.test.ts`, which needs a mocked module no real worker can load.)
  * - **A failed LOD worker** withdraws the tree with one warning: the run goes on, and the engine keeps the
  *   adopted tree, refitting it itself.
+ * - **The spatial source** (#343): the same worker rebuilds the Morton tree for every relayed frame with the
+ *   worker backend's per-frame step (`lodFrameStep`), and each repaint paints positions with the tree rebuilt
+ *   for exactly them. The engine adopts each one in O(1), so while the GPU streams — and through a drag, its
+ *   re-cool and pan/zoom — the main thread builds no spatial tree (`mortonTopologyBuilds`, a live counter a
+ *   real worker's builds never touch) and aggregates no style (`lodStylePasses`); the frontier stays the
+ *   spatial one; the rebuilds stop at convergence; a selected aggregate is carried over to its cell.
  */
 import { describe, it, expect, beforeAll, afterEach, vi } from "vitest";
 import type { Device } from "@luma.gl/core";
 import { makeTestDevice } from "./_device.js";
 import { startGpuLayout } from "../gpu-transport.js";
-import { observeGpuLayoutFrames } from "../gpu-stream.js";
-import { network } from "../../network.js";
+import { GpuStream, observeGpuLayoutFrames } from "../gpu-stream.js";
+import { network, type Network, type NetworkHit } from "../../network.js";
 import { buildGraph, type NetworkGraph } from "../../graph.js";
-import { buildLODTree, computeLODPositions, lodTreeFromTopology, type LODTree } from "../../lod.js";
+import {
+  buildLODTree,
+  buildMortonLODTree,
+  computeLODPositions,
+  lodStylePasses,
+  lodTreeFromTopology,
+  mortonTopologyBuilds,
+  type LODTree,
+} from "../../lod.js";
+import type { StreamedLODTree } from "../../worker-transport.js";
+import type { HoverHit } from "../../../map/base-engine.js";
 import type { MainToWorker } from "../../worker-protocol.js";
 
 const W = 400;
@@ -387,25 +403,6 @@ describe("GPU layout LOD relay (#377) — engine", () => {
     }
   });
 
-  it("lod({ source: 'spatial' }) starts no LOD worker: the spatial tree follows the GPU frames on the main thread, and a seed-only worker coarsens for the multilevel seed (#343, #353)", async () => {
-    const warn = vi.spyOn(console, "warn");
-    const net = network(makeHost(), { width: W, height: H, backend: "webgl" });
-    await net.whenReady();
-    try {
-      const posts = vi.spyOn(Worker.prototype, "postMessage");
-      net.data(clustered(3000, 5)).lod({ source: "spatial" }).layout({ backend: "gpu", iterations: 60 });
-      await net.whenSettled();
-      expect(net.layoutTransport).toBe("gpu");
-      expect(net.lodSource).toBe("spatial"); // never the relay's coarsening tree
-      const coarsens = posts.mock.calls.map((c: [MainToWorker, ...unknown[]]) => c[0]).filter((m) => m.type === "coarsen");
-      expect(coarsens.filter((m) => m.lod)).toHaveLength(0); // no LOD tree from a worker
-      expect(coarsens.filter((m) => m.seed !== undefined)).toHaveLength(1); // the multilevel seed's plan still is
-      expect(warn.mock.calls.filter((c) => String(c[0]).includes("worker"))).toHaveLength(0);
-    } finally {
-      net.destroy();
-    }
-  });
-
   it("a failed LOD worker: the engine keeps drawing the adopted tree and refits it itself", async () => {
     vi.spyOn(console, "warn").mockImplementation(() => {});
     const net = network(makeHost(), { width: W, height: H, backend: "webgl" });
@@ -421,6 +418,317 @@ describe("GPU layout LOD relay (#377) — engine", () => {
       await net.whenSettled();
       expect(refits).toBeGreaterThanOrEqual(3);
       expect(net.lodSource).toBe("main"); // the worker's tree, now refit on the main thread
+    } finally {
+      net.destroy();
+    }
+  });
+});
+
+// ── The spatial source (#343) ──────────────────────────────────────────────
+
+/** Communities joined by random long-range links — a force layout spreads each community out. */
+function webLike(n: number, seed = 5): NetworkGraph {
+  const rng = makePrng(seed);
+  const source: number[] = [];
+  const target: number[] = [];
+  const size = 40;
+  for (let i = 1; i < n; i++) {
+    const base = i - (i % size);
+    source.push(i);
+    target.push(base + Math.floor(rng() * (i - base)));
+    if (rng() < 0.6) {
+      source.push(i);
+      target.push(Math.floor(rng() * n));
+    }
+  }
+  return buildGraph({ nodeCount: n, source, target });
+}
+
+/** How far a spatial `tree` is from the Morton tree a main-thread build makes at `positions` in its box (0 = bitwise). */
+function spatialError(tree: LODTree, positions: Float32Array): number {
+  const box = tree.morton?.box;
+  if (!box) return Infinity;
+  const reference = buildMortonLODTree(positions, tree.leafCount, { box });
+  if (reference.size !== tree.size) return Infinity;
+  computeLODPositions(reference, positions);
+  return Math.max(maxDiff(reference.cx, tree.cx), maxDiff(reference.cy, tree.cy), maxDiff(reference.extent, tree.extent));
+}
+
+/** The first screen point, on a grid over the host, where the pointer hovers a glyph (`hover` on). */
+function glyphPoint(net: Network, host: HTMLElement): [number, number] | null {
+  let at: [number, number] | null = null;
+  let point: [number, number] = [0, 0];
+  net.on("hover", (hit) => {
+    if (!at && hit) at = point;
+  });
+  const rect = host.getBoundingClientRect();
+  for (let y = 10; y < H - 10 && !at; y += 5) {
+    for (let x = 10; x < W - 10 && !at; x += 5) {
+      point = [x, y];
+      host.dispatchEvent(new PointerEvent("pointermove", { clientX: rect.left + x, clientY: rect.top + y, bubbles: true, pointerId: 1 }));
+    }
+  }
+  net.on("hover", () => {});
+  return at;
+}
+
+/** Grab the first glyph under a grid of screen points, drag it `frames` frames, and release it. */
+async function dragGlyph(net: Network, host: HTMLElement, frames: number): Promise<void> {
+  const at = glyphPoint(net, host);
+  if (!at) throw new Error("no glyph to drag");
+  const [x0, y0] = at;
+  const rect = host.getBoundingClientRect();
+  const pointer = (type: string, x: number, y: number): void => {
+    host.dispatchEvent(new PointerEvent(type, { clientX: rect.left + x, clientY: rect.top + y, bubbles: true, button: 0, pointerId: 1 }));
+  };
+  pointer("pointerdown", x0, y0);
+  pointer("pointermove", x0 + 8, y0); // past the click slop: the drag session starts
+  for (let f = 1; f <= frames; f++) {
+    pointer("pointermove", x0 + 8 + 3 * f, y0 + 2 * f);
+    await nextFrame();
+  }
+  pointer("pointerup", x0 + 8 + 3 * frames, y0 + 2 * frames);
+}
+
+/** Hover a grid of screen points until the pointer is over an aggregate glyph of more than 2 nodes; its hit. */
+function findAggregate(net: Network, host: HTMLElement): HoverHit | null {
+  let found: HoverHit | null = null;
+  net.on("hover", (hit) => {
+    const d = hit?.datum as NetworkHit | undefined;
+    if (!found && hit && d && "aggregate" in d && d.aggregate && d.count > 2) found = hit;
+  });
+  const rect = host.getBoundingClientRect();
+  for (let y = 10; y < H - 10 && !found; y += 7) {
+    for (let x = 10; x < W - 10 && !found; x += 7) {
+      host.dispatchEvent(new PointerEvent("pointermove", { clientX: rect.left + x, clientY: rect.top + y, bubbles: true, pointerId: 1 }));
+    }
+  }
+  net.on("hover", () => {});
+  return found;
+}
+
+describe("GPU layout LOD relay — the spatial source (#343)", () => {
+  let device: Device;
+  beforeAll(async () => {
+    device = await makeTestDevice();
+  });
+
+  it("each repaint paints positions with the spatial tree the worker rebuilt for exactly them; the rebuilds stop at convergence", async () => {
+    const g = clustered(4000, 21);
+    const n = g.nodeCount;
+    const lodStyle = { radii: new Float32Array(n).fill(2), weight: new Float32Array(n).fill(1) };
+    /** The tree the last frame painted, with its handle (a holder: the callbacks below assign it). */
+    const latest: { current: { tree: LODTree; streamed: StreamedLODTree } | null } = { current: null };
+    const withdrawn: number[] = [];
+    const frames: number[] = [];
+    const errors: number[] = [];
+    let moved = 0;
+    let previous: Float32Array | null = null;
+    let settled = false;
+    let framesAfter = 0;
+    let relayedAfter = 0;
+    const post = Worker.prototype.postMessage;
+    vi.spyOn(Worker.prototype, "postMessage").mockImplementation(function (this: Worker, ...args: Parameters<Worker["postMessage"]>) {
+      if (settled && isRefit(args[0])) relayedAfter++;
+      Reflect.apply(post, this, args);
+    });
+    let lastFrameAt = performance.now();
+    const unobserve = observeGpuLayoutFrames(() => {
+      lastFrameAt = performance.now();
+    });
+    const handle = startGpuLayout(
+      device,
+      g,
+      { width: W, height: H, iterations: 80, lod: true, lodSource: "spatial", lodStyle, lodStyleVersion: 1 },
+      () => {
+        if (settled) framesAfter++;
+        const current = latest.current;
+        if (!current) return; // before the first tree: nothing to compare
+        errors.push(spatialError(current.tree, g.positions));
+        if (previous && maxDiff(previous, g.positions) > 0) moved++;
+        previous = g.positions.slice();
+      },
+      (tree, streamed) => {
+        if (!tree || !streamed) {
+          withdrawn.push(1);
+          return;
+        }
+        const replaced = latest.current;
+        latest.current = { tree, streamed };
+        frames.push(streamed.header.frame);
+        replaced?.streamed.release(); // as the engine does once no repaint draws it
+      },
+    );
+    try {
+      await handle.settled;
+      settled = true;
+      expect(handle.transport).toBe("gpu");
+      expect(withdrawn).toEqual([]);
+      expect(frames.length, "no spatial tree came with the frames").toBeGreaterThan(3);
+      expect(frames.every((f, i) => i === 0 || f > (frames[i - 1] ?? Infinity)), `frame ids ${frames.join(", ")}`).toBe(true);
+      expect(errors.length).toBeGreaterThan(3);
+      expect(Math.max(...errors), "a repaint painted a spatial tree that is not the positions'").toBe(0);
+      expect(moved, "the positions did not move between repaints").toBeGreaterThan(2);
+      // Converged: nothing more is relayed, rebuilt or painted after settled.
+      const t0 = performance.now();
+      while (performance.now() - lastFrameAt < 400 && performance.now() - t0 < 10_000) await sleep(50);
+      expect(framesAfter, "repaints after settled").toBe(0);
+      expect(relayedAfter, "relayed frames after settled").toBe(0);
+      const settledTree = latest.current;
+      if (!settledTree) throw new Error("no tree");
+      expect(spatialError(settledTree.tree, g.positions)).toBe(0);
+    } finally {
+      unobserve();
+      handle.stop();
+    }
+  });
+});
+
+describe("GPU layout LOD relay — the spatial source (#343), engine", () => {
+  it("builds no spatial tree and aggregates no style on the main thread while the GPU streams, through a drag and pan/zoom", async () => {
+    const host = makeHost();
+    const net = network(host, { width: W, height: H, backend: "webgl" });
+    await net.whenReady();
+    try {
+      net.interactive({ draggable: true, hover: true });
+      net.data(webLike(6000)).style({ sizeMode: "screen", nodeRadius: 3 }).lod({ source: "spatial", maxAggregateRadius: 18 });
+      const posts = vi.spyOn(Worker.prototype, "postMessage");
+      const builds0 = mortonTopologyBuilds;
+      const styles0 = lodStylePasses;
+      const painted: string[] = [];
+      const unobserve = observeGpuLayoutFrames((s) => {
+        if (s.repainted) painted.push(net.lodSource);
+      });
+      try {
+        net.layout({ backend: "gpu", iterations: 80, fit: true });
+        await net.whenSettled();
+        expect(net.layoutTransport).toBe("gpu");
+        expect(net.lodSource).toBe("worker"); // the relay's spatial tree, adopted
+        expect(painted.filter((p) => p === "worker").length, "no repaint drew the relay's tree").toBeGreaterThan(3);
+        expect(mortonTopologyBuilds - builds0, "main-thread spatial tree builds while the GPU streamed").toBe(0);
+        expect(lodStylePasses - styles0, "main-thread style passes while the GPU streamed").toBe(0);
+        // The frontier is the spatial one: its links come from the lazy gather (a spatial tree has no
+        // super-edge CSR), and its glyphs are bounded by the screen.
+        expect(net.superEdgeStats).not.toBeNull();
+        expect(net.declutterStats?.glyphs ?? Infinity).toBeLessThan(1500);
+        // One coarsen-only worker streams it (no layout worker), rebuilt per relayed frame, buffers handed back.
+        const types = posts.mock.calls.map((c: [MainToWorker, ...unknown[]]) => c[0].type);
+        const coarsen = posts.mock.calls.map((c: [MainToWorker, ...unknown[]]) => c[0]).filter((m) => m.type === "coarsen");
+        expect(coarsen).toHaveLength(1);
+        expect(coarsen[0]?.type === "coarsen" && coarsen[0].lodSource).toBe("spatial");
+        expect(types.filter((t) => t === "start")).toHaveLength(0);
+        expect(types.filter((t) => t === "lod-geometry").length).toBeGreaterThan(3);
+        expect(types.filter((t) => t === "lod-recycle").length).toBeGreaterThan(0);
+
+        // A drag reheats the layout: its frames are relayed and rebuilt in the worker too.
+        const relayed = types.filter((t) => t === "lod-geometry").length;
+        const pins = vi.spyOn(GpuStream.prototype, "pin");
+        await dragGlyph(net, host, 16);
+        expect(pins.mock.calls.length, "the drag held no node").toBeGreaterThan(0);
+        for (let f = 0; f < 30; f++) await nextFrame();
+        const after = posts.mock.calls.filter((c: [MainToWorker, ...unknown[]]) => c[0].type === "lod-geometry").length;
+        expect(after, "the drag's frames were not relayed").toBeGreaterThan(relayed);
+        // Pan and zoom re-cut the adopted tree.
+        net.setTransform({ k: 3, x: -200, y: -150 });
+        await nextFrame();
+        net.setTransform({ k: 0.8, x: 40, y: 30 });
+        await nextFrame();
+        expect(net.lodSource).toBe("worker");
+        expect(mortonTopologyBuilds - builds0, "main-thread spatial tree builds through the drag and pan/zoom").toBe(0);
+        expect(lodStylePasses - styles0, "main-thread style passes through the drag and pan/zoom").toBe(0);
+      } finally {
+        unobserve();
+      }
+    } finally {
+      net.destroy();
+    }
+  });
+
+  it("carries a selected aggregate over to the same cell while the relay rebuilds the tree", async () => {
+    const host = makeHost();
+    const net = network(host, { width: W, height: H, backend: "webgl" });
+    await net.whenReady();
+    try {
+      const g = webLike(8000, 9);
+      net.interactive({ selectable: true, hover: true });
+      net.data(g).style({ sizeMode: "screen", nodeRadius: 3 }).lod({ source: "spatial", maxAggregateRadius: 18 }).layout({ backend: "gpu", iterations: 300 });
+      for (let i = 0; i < 400 && net.lodSource !== "worker"; i++) await sleep(10);
+      expect(net.lodSource).toBe("worker");
+      let hit = findAggregate(net, host);
+      for (let i = 0; i < 20 && !hit; i++) {
+        await sleep(20);
+        hit = findAggregate(net, host);
+      }
+      if (!hit) throw new Error("no aggregate under the pointer");
+      net.select("nodes", [hit.id]);
+      const members0 = net.selection()[0]?.members?.() ?? [];
+      expect(members0.length).toBeGreaterThan(2);
+      const centre = (members: readonly (string | number)[]): [number, number] => {
+        let x = 0;
+        let y = 0;
+        for (const m of members) {
+          x += g.positions[2 * Number(m)] ?? 0;
+          y += g.positions[2 * Number(m) + 1] ?? 0;
+        }
+        return [x / members.length, y / members.length];
+      };
+      const c0 = centre(members0);
+      let span = 1;
+      for (const m of members0) span = Math.max(span, Math.abs((g.positions[2 * Number(m)] ?? 0) - c0[0]), Math.abs((g.positions[2 * Number(m) + 1] ?? 0) - c0[1]));
+      let repaints = 0;
+      const unobserve = observeGpuLayoutFrames((s) => {
+        if (s.repainted) repaints++;
+      });
+      await net.whenSettled();
+      unobserve();
+      expect(repaints, "no rebuilt tree was painted while selected").toBeGreaterThan(0);
+      const after = net.selection();
+      // The cell may have emptied as the layout moved nodes (then it is dropped); if kept, it is the same place.
+      if (after.length > 0) {
+        expect(after).toHaveLength(1);
+        const d = after[0]?.datum as NetworkHit | undefined;
+        const members1 = after[0]?.members?.() ?? [];
+        expect(members1.length).toBe(d && "count" in d ? d.count : -1);
+        const c1 = centre(members1);
+        expect(Math.hypot(c1[0] - c0[0], c1[1] - c0[1])).toBeLessThan(4 * span + 50);
+      }
+    } finally {
+      net.destroy();
+    }
+  });
+
+  it("an edge-less graph's spatial tree streams from the relay too", async () => {
+    const net = network(makeHost(), { width: W, height: H, backend: "webgl" });
+    await net.whenReady();
+    try {
+      net.data(buildGraph({ nodeCount: 3000, source: [], target: [] })).lod({ maxAggregateRadius: 18 });
+      const builds0 = mortonTopologyBuilds; // (a first lod() builds its tree at once: #373 defers it)
+      net.layout({ backend: "gpu", iterations: 40 });
+      await net.whenSettled();
+      expect(net.layoutTransport).toBe("gpu");
+      expect(net.lodSource).toBe("worker");
+      expect(mortonTopologyBuilds - builds0).toBe(0);
+    } finally {
+      net.destroy();
+    }
+  });
+
+  it("style() mid-run sends the relay its new style; the trees after it carry it, with no main-thread re-aggregation per frame", async () => {
+    const net = network(makeHost(), { width: W, height: H, backend: "webgl" });
+    await net.whenReady();
+    try {
+      const posts = vi.spyOn(Worker.prototype, "postMessage");
+      net.data(webLike(4000, 3)).style({ sizeMode: "screen", nodeRadius: 3 }).lod({ source: "spatial", maxAggregateRadius: 18 }).layout({ backend: "gpu", iterations: 200 });
+      for (let i = 0; i < 400 && net.lodSource !== "worker"; i++) await sleep(10);
+      expect(net.lodSource).toBe("worker");
+      const styles0 = lodStylePasses;
+      net.style({ sizeMode: "screen", nodeRadius: 5 });
+      await net.whenSettled();
+      expect(posts.mock.calls.filter((c: [MainToWorker, ...unknown[]]) => c[0].type === "lod-style")).toHaveLength(1);
+      // Re-aggregated here: at most the tree drawn when the style changed and the one frame the worker was
+      // building then (the relay has one out at a time); the worker's later trees carry the new style.
+      expect(lodStylePasses - styles0).toBeLessThanOrEqual(2);
+      expect(net.lodSource).toBe("worker");
     } finally {
       net.destroy();
     }

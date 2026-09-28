@@ -82,7 +82,8 @@ export interface WarmStart {
   recool?: boolean;
 }
 
-/** A new leaf style for the spatial tree's per-frame aggregation (#343), after `style()` changed it. */
+/** A new leaf style for the spatial tree's per-frame aggregation (#343), after `style()` changed it — to a
+ *  layout worker's stream, or to a GPU layout's LOD worker streaming the spatial tree. */
 export interface LODStyleMessage {
   type: "lod-style";
   style: LeafStyle;
@@ -95,8 +96,8 @@ export interface LODViewMessage {
   view: LODView;
 }
 
-/** A spatial frame's buffer handed back for reuse once its tree is no longer drawn (#343; transferred), with
- *  its super-edge rows buffer when it carried one (#433). */
+/** A spatial frame's buffer handed back for reuse once its tree is no longer drawn (#343; transferred) — by the
+ *  worker backend, or by a GPU layout's LOD relay — with its super-edge rows buffer when it carried one (#433). */
 export interface LODRecycleMessage {
   type: "lod-recycle";
   buffer: ArrayBuffer;
@@ -159,8 +160,10 @@ export interface NestedPrepMessage {
  * and its LOD tree. With `seed`, the worker first posts a {@link SeedPlanMessage} (its arrays transferred).
  * With `lod`, it then posts the {@link LODTopologyMessage} once (transferred, not cloned) and answers each
  * {@link LODGeometryRequest} with the tree's position geometry refit to the positions it carries — the work
- * the worker backend does per frame, for positions the GPU harvested. Edge buffers are copied; the main
- * thread keeps its own.
+ * the worker backend does per frame, for positions the GPU harvested. With `lodSource: "spatial"` (#343) it
+ * posts no topology and coarsens only for the seed: each request rebuilds the spatial tree for its positions
+ * instead, as the worker backend does per frame, and the reply transfers it. Edge buffers are copied; the
+ * main thread keeps its own.
  */
 export interface CoarsenMessage {
   type: "coarsen";
@@ -169,22 +172,34 @@ export interface CoarsenMessage {
   target: Uint32Array;
   weight: Float32Array;
   coarsen?: CoarsenOptions;
-  /** Build the LOD tree's topology, post it, and keep the tree for refits. */
+  /** Stream the LOD tree: the structure tree's topology posted once and refit per request, or the spatial
+   *  tree rebuilt per request ({@link lodSource}). */
   lod: boolean;
+  /** Which tree `lod` streams (#343): `"structure"` (default) or `"spatial"`. */
+  lodSource?: "structure" | "spatial";
+  /** The leaf style a spatial tree aggregates onto every rebuild (#343), and its version (echoed per frame). */
+  lodStyle?: LeafStyle;
+  lodStyleVersion?: number;
+  /** The main thread's view, whose covers' super-edge rows a spatial tree carries (#433). */
+  lodView?: LODView;
   /** Build the GPU multilevel seed's plan from the same hierarchy and post it first. */
   seed?: SeedPlanOptions;
 }
 
-
 /**
- * Refit the coarsen-only tree's position geometry to `positions` (#377). Both buffers are transferred, both
- * ways: `positions` comes back in the reply, and `geometry` is the previous reply's buffer handed back for
- * reuse (absent on the first request, when the worker allocates it) — so a refit allocates nothing.
+ * One relayed frame of the GPU layout's LOD worker (#377): the worker runs the per-frame LOD step for
+ * `positions` — refits the coarsen-only tree's position geometry, or rebuilds the spatial tree (#343). Both
+ * buffers are transferred, both ways: `positions` comes back in the reply, and `geometry` is the previous
+ * reply's buffer handed back for reuse (absent on the first request, when the worker allocates it, and for a
+ * spatial stream, whose frames come back through {@link LODRecycleMessage}) — so a refit allocates nothing.
  */
 export interface LODGeometryRequest {
   type: "lod-geometry";
   /** Interleaved `[x, y, …]`, length `2 · nodeCount`. */
   positions: Float32Array;
+  /** The frame id: the ticks the positions hold. A spatial stream skips a frame id it already built (the
+   *  layout has not moved since: converged), as the worker backend's step skips a tick it built. */
+  frame: number;
   /** `[cx, cy, extent]`, length `3 · topology.size` ({@link lodGeometryViews}). */
   geometry?: Float32Array;
 }
@@ -245,11 +260,18 @@ export interface ProgressMessage {
   lodFrame?: SpatialLODFrame;
 }
 
-/** The reply to an {@link LODGeometryRequest} (#377): its positions, and `[cx, cy, extent]` refit to them. */
+/**
+ * The reply to an {@link LODGeometryRequest} (#377): its positions, and — from a structure stream —
+ * `[cx, cy, extent]` refit to them, or — from a spatial stream (#343) — the spatial tree rebuilt for them.
+ */
 export interface LODGeometryMessage {
   type: "lod-geometry";
   positions: Float32Array;
-  geometry: Float32Array;
+  /** The structure tree's geometry refit to `positions` (the request's buffer, when it handed one back). */
+  geometry?: Float32Array;
+  /** The spatial tree rebuilt for `positions`, its buffer transferred. Absent when the request's frame id was
+   *  already built (the layout converged). */
+  lodFrame?: SpatialLODFrame;
 }
 
 /**

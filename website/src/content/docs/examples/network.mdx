@@ -61,8 +61,9 @@ whole batch of ticks, and the page keeps its frame rate while hundreds of thousa
 (measured in Chromium; Firefox and Safari are not measured yet). The layout repaints at most 20 times
 a second. With LOD on, the LOD tree stays off the main thread as with the worker layout: a worker
 coarsens the graph while the GPU solver is built, and refits the tree to every frame the GPU reads
-back, so a frame is painted (positions and aggregates together) one worker round trip after it was
-read back (the top-right readout's **LOD tree** shows `worker`). On a device without those
+back (with `lod({ source: "spatial" })` it rebuilds the spatial tree for every frame instead), so a
+frame is painted (positions and aggregates together) one worker round trip after it was read back (the
+top-right readout's **LOD tree** shows `worker`). On a device without those
 capabilities it falls back to the worker with one console warning naming the reason, and the fallback
 is the run `backend: "worker"` would start: it honours `multilevel` (**Seeding**) and streams the LOD
 tree from the worker. The GPU layout lives on the WebGL backend's device, so switching the render backend
@@ -275,7 +276,8 @@ streams the tree once plus its aggregate geometry each frame. The main thread th
 runs the per-frame O(N) geometry pass; it only fills the style geometry once and runs the
 on-screen-bounded cut. That keeps the main thread free as the network scales toward millions of nodes.
 The **GPU backend** does the same: `layout({ backend: "gpu" })` after `lod()` starts a worker that only
-coarsens the graph and then refits the tree's geometry to each frame the GPU reads back, and
+coarsens the graph and then refits the tree's geometry to each frame the GPU reads back (or, for the
+[spatial source](#spatial-lod-grouping-by-position), rebuilds the spatial tree for each one), and
 `net.lodSource` reports `"worker"` for both.
 
 This holds on a brand-new engine too. Before any layout has run, `lod()` can't know which backend comes
@@ -305,7 +307,7 @@ region drawn where its members are.
 net
   .style({ sizeMode: "screen" })
   .lod({ source: "spatial", maxAggregateRadius: 26 }) // configure LOD first…
-  .layout({ backend: "worker", iterations }); // …so the worker rebuilds the tree as it streams
+  .layout({ backend: "worker", iterations }); // …so the worker rebuilds the tree as it streams (or "gpu": its LOD worker)
 ```
 
 - **Bounded by the screen.** The frontier is set by the view area over the expand threshold, not by the
@@ -314,10 +316,9 @@ net
 - **It follows the layout.** A tree built from older positions blows up as nodes wander out of their
   cells, so the `"worker"` backend **rebuilds it in the worker on every streamed frame** — topology,
   geometry and aggregated style, handed to the main thread whole (transferred, not copied) — and stops
-  once the layout has converged. The other backends rebuild it on the main thread whenever a layout
-  lands — and the `"gpu"` backend lands one with every frame it streams, so there the main thread
-  rebuilds the tree per repaint (~30 ms for a 325k-node graph, ~140 ms for a million nodes): use
-  `"worker"` with the spatial source on large graphs. A position transition or a drag only refits the
+  once the layout has converged. The `"gpu"` backend's LOD worker does the same for every frame the GPU
+  reads back, so the main thread never rebuilds the tree while either streams. The other backends
+  rebuild it on the main thread whenever a layout lands; a position transition or a drag only refits the
   tree it has, and rebuilds it once the nodes come to rest.
 - **Links are summed from the graph.** A rebuilt tree has no super-edge table (building one per frame
   would cost more than the layout tick); the links between drawn glyphs are summed from the graph's own
@@ -325,8 +326,9 @@ net
   between glyphs at different levels are always drawn (`crossLevelEdges` makes no difference here), a
   link leaving the view points at the off-screen cell that holds its neighbour (a coarser cell the
   further away it is), and an undirected pair is one line carrying both directions' flow.
-- **While the worker streams, it sums them too.** It cuts and declutters each tree it rebuilds the way
-  the main thread will — at your view, or at the fit while the camera follows the layout — and hands over,
+- **While a worker streams, it sums them too.** The `"worker"` backend's layout worker, or the `"gpu"`
+  backend's LOD worker, cuts and declutters each tree it rebuilds the way the main thread will — at your
+  view, or at the fit while the camera follows the layout — and hands over,
   with the tree, each kept glyph's links summed per glyph or off-screen cell it reaches. A streamed repaint
   then reads those rows — bounded by what the kept glyphs link to, not by the edges under them — instead of
   every edge in view: about 1 ms instead of 14 ms for the cut, declutter and links at the fit view of a

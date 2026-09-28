@@ -17,6 +17,7 @@ import { buildGraph, type NetworkGraph } from "../../graph.js";
 import { Cooling, DEFAULT_FORCE, DRAG_HEAT, RECOOL_TICKS, seedPositions } from "../../force.js";
 import { GpuForceLayout } from "../gpu-force-layout.js";
 import type { MainToWorker, StartMessage } from "../../worker-protocol.js";
+import type { LeafStyle, LODView } from "../../lod-frame.js";
 
 const W = 400;
 const H = 300;
@@ -189,6 +190,51 @@ describe("GPU layout swap policy at the transport (#311)", () => {
       await handle.settled;
       expect(follow.frames()).toBe(gpuFrames);
       for (let i = 0; i < g.positions.length; i++) expect(Number.isFinite(g.positions[i] ?? Number.NaN)).toBe(true);
+    } finally {
+      follow.stop();
+      handle.stop();
+      device.destroy();
+    }
+  });
+
+  it("a spatial LOD stream moved to the worker continues with the latest leaf style and view (#343, #433)", async () => {
+    const device = await webglDevice();
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    const posted = workerPosts();
+    const follow = followFrames();
+    const g = seededRing(400);
+    const style = (r: number): LeafStyle => ({ radii: new Float32Array(g.nodeCount).fill(r), weight: g.strength, links: true });
+    const view = (k: number): LODView => ({ transform: { k, x: W / 2, y: H / 2 }, fitPad: 3, width: W, height: H, screenSized: true, fadeBand: 0 });
+    let trees = 0;
+    const handle = startGpuLayout(device, g, {
+      width: W, height: H, iterations: 600, frameEvery: 5, warm: { heat: 1, decaying: true },
+      lod: true, lodSource: "spatial", lodStyle: style(2), lodStyleVersion: 1, lodView: view(1),
+    }, () => {}, (tree, streamed) => {
+      if (tree) trees++;
+      streamed?.release(); // nothing reads it here: hand the buffers straight back
+    });
+    try {
+      await until(() => follow.harvested() >= 10 && trees > 2, "a few relayed spatial trees");
+      handle.setLODStyle?.(style(4), 2);
+      handle.setLODView?.(view(3));
+      // The GPU run's LOD worker got both.
+      expect(posted.filter((m) => m.type === "lod-style")).toHaveLength(1);
+      expect(posted.filter((m) => m.type === "lod-view")).toHaveLength(1);
+
+      handle.moveDevice?.(Promise.resolve(null));
+      await until(() => startOf(posted) !== undefined, "the worker start");
+      const start = startOf(posted);
+      expect(start?.lodSource).toBe("spatial");
+      expect(start?.lodStyleVersion, "the moved run aggregates the latest style").toBe(2);
+      expect(start?.lodStyle?.radii[0]).toBe(4);
+      expect(start?.lodView, "and cuts its rows at the latest view").toEqual(view(3));
+      // Later changes reach the worker run.
+      const before = posted.length;
+      handle.setLODStyle?.(style(5), 3);
+      handle.setLODView?.(view(5));
+      const after = posted.slice(before).map((m) => m.type);
+      expect(after).toEqual(["lod-style", "lod-view"]);
+      await handle.settled;
     } finally {
       follow.stop();
       handle.stop();
