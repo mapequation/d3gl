@@ -42,8 +42,9 @@ export const NO_BLEND: RenderPipelineParameters = { blend: false };
 /**
  * Mutable uniforms record — the luma v9 pattern the passes use: the record is handed to the
  * {@link Model} once and mutated in place before each draw, so updating a value allocates nothing.
+ * A vector or array uniform (`vec2`, `ivec2 u[n]`) takes a typed array, allocated once with the pass.
  */
-export type PassUniforms = Record<string, number>;
+export type PassUniforms = Record<string, number | Float32Array | Int32Array>;
 
 /** A full-screen-triangle {@link Model} for fragment shader `fs` (no vertex buffer, 3 vertices). */
 export function fullScreenModel(
