@@ -546,6 +546,12 @@ function assertSignatures(leg: Leg): void {
     expect((repaints[i] ?? 0) - (repaints[i - 1] ?? 0)).toBeGreaterThanOrEqual(MIN_FRAME_MS - 2);
   }
 
+  // The real transport admits a frame's items through the budget (#382): past the first item, one only while
+  // the estimates' sum fits. A guard on the wiring (schedule → budget → sample), not on the estimates.
+  frames.forEach((s, f) => {
+    if (s.items > 1) expect(s.itemsMs, `frame ${f}: ${s.items} items`).toBeLessThanOrEqual(s.budgetMs + 1e-9);
+  });
+
   // settled only after the final positions were harvested: the budget's last tick, or the tick the
   // convergence stop latched at (#376) — a seeded layout (#353) converges within the budget.
   const finalTick = ticksRun(frames);
@@ -712,9 +718,12 @@ function assertDrag(label: string, leg: DragLeg, transportP95Ms: number, encodeM
   expect(heldTicks, "no reheat ticks while held").toBeGreaterThan(0);
   expect(repaints.length, "no layout repaint during the drag").toBeGreaterThan(0);
 
-  // The transport's per-frame bounds hold through the drag and the re-cool.
+  // The transport's per-frame bounds hold through the drag and the re-cool, and so does the budget's admission (#382).
   expect(quantile(transport, 0.95)).toBeLessThan(transportP95Ms);
   expect(median(encode)).toBeLessThan(encodeMedianMs);
+  frames.forEach((s, f) => {
+    if (s.items > 1) expect(s.itemsMs, `drag frame ${f}: ${s.items} items`).toBeLessThanOrEqual(s.budgetMs + 1e-9);
+  });
 
   // GL signatures: every copy into a PBO, one fence per frame, the harvest before the frame's layout draws,
   // and no GPU object created by any drag frame or pointer move.
