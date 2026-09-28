@@ -714,6 +714,42 @@ CPU half and arrives as one flag; `stepSettled` is the GPU half. Two things are 
   mid-tick integrates at once), and the stream ignores a harvested stop from another epoch. Without the
   check a stale stop ends the next re-cool at once (the stale-stop case in `gpu-stop.browser.test.ts`).
 
+## GPU resources live on the render backend's device: release them BEFORE a swap (#311)
+
+Anything built on `WebGLBackend.gpuDevice` (the GPU layout, later GPU-resident positions #184) belongs to
+the backend that owns the device. `onBackendSwapped()` fires **after** `old.backend.destroy()`, so it is the
+wrong place to free them. Use `onBeforeBackendSwap()` (`map/base-engine.ts`): it fires in `installBackend`
+while the outgoing backend and its device are still alive, only for a real swap (not the first install, not a
+superseded one). The network moves a GPU layout there (`WorkerLayoutHandle.moveDevice`, `gpu-transport.ts`):
+it frees its textures and fences, then continues warm on the next backend's device promise
+(`whenBackendSettled().then(gpuDevice)`, which also waits out an `"auto"` upgrade). Five things learned:
+
+- **luma's `WebGLDevice.destroy()` only detaches the device from its context** (it clears the context's device
+  slot; the context lives until GC). GL calls after it still work and still free memory, so a teardown after
+  a destroyed device frees normally. A **lost** context is different: make no GL call at all (check
+  `gl.isContextLost()` too — the `webglcontextlost` event is queued, so a teardown can run before it arrives).
+- **luma 9.3.3's `WEBGLFramebuffer.destroy()` never deletes the GL framebuffer** (`super.destroy()` sets
+  `destroyed` before the check that guards `deleteFramebuffer`; still so in 9.4.2). Every framebuffer d3gl
+  destroys stays behind as an empty, storage-free GL name until its context is collected; the attached
+  textures are freed. A leak test that spies `deleteFramebuffer` therefore always fails: count framebuffers
+  through luma's `device.statsManager.getStats("GPU Resource Counts").get("Framebuffers Active")` and track
+  textures, buffers and fences at the GL level (`gpu-swap.browser.test.ts`). luma's `statsManager` is one
+  global object (`lumaStats`), not per device: its counts and its "GPU Memory" cover every device on the page,
+  so read them before a second device allocates, or measure a delta.
+- **Keep the engine's handle.** The drag session and the settle handler hold the layout handle, so a move keeps
+  the same object and swaps what runs inside it; it replays a live drag onto the new run — except after a
+  non-finite layout, where the drag may be what fed it the NaN (a NaN pin wedges the CPU worker too).
+- **Never keep a reference to `graph.positions` across a layout start.** A worker start in shared-memory mode
+  (cross-origin-isolated page) replaces it with a view of its `SharedArrayBuffer`, and a shared-mode pin sends
+  ids only. A drag session that captured the array once kept writing held positions into a buffer neither the
+  worker nor the renderer read after a move, so the held node froze. Read `graph.positions` at each use.
+- **A move lands on something that is still changing; decide late and hand over complete state.** The engine
+  adopts a worker's LOD tree the moment it lands and draws it, so a warm worker start (no seed frame) posts the
+  tree with the geometry of the positions it continues from; before, all 99k aggregates read 0 for ~1 s at 325k.
+  The continuation is worked out when the next run starts, not when the move does, because a drag can end
+  while the device is pending (~200 ms for an `"auto"` upgrade). And `whenBackendSettled` re-waits while the
+  swap token changes: an explicit pick ends an `"auto"` upgrade while the Canvas placeholder is still live.
+
 ## Host sizing: backend canvases are OUT OF FLOW (#39, re-confirmed in #273)
 
 `makeCanvas` (`map/backend-factory.ts`) gives every backend `<canvas>` `position:absolute; top:0;

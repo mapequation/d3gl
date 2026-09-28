@@ -31,26 +31,37 @@
  * `onLODTree` once, with geometry, and `onLODTree(null)` withdraws it if that worker fails (the caller then
  * builds its own). The same worker builds the multilevel seed's plan from the same coarsening, so the graph
  * is coarsened once.
+ *
+ * **A GPU run's lifetime is its device's (#311).** When the render backend that owns the device is about
+ * to be swapped out, the engine calls the handle's `moveDevice` while the device is still alive: the run
+ * stops and frees its GPU resources (and its LOD and seed workers), then continues **warm** on the next
+ * backend — a GPU run on a new WebGL device, else the CPU worker (Canvas/SVG) — from the positions on
+ * screen, with the ticks left of its budget and its current heat, so a swap never reruns the whole budget.
+ * A settled layout continues as an idle run, so a drag still reflows. A lost WebGL context, or a layout that
+ * turned non-finite, continues the same way on the worker. A seeded run that has painted nothing yet (#353)
+ * starts afresh there instead: the disc on screen is only its placeholder. The handle stays the same object
+ * throughout, so the engine's settle handler and a live drag keep working, and the drag is replayed onto
+ * the new run.
  */
 import type { Device } from "@luma.gl/core";
 import { WebGLDevice } from "@luma.gl/webgl";
 import { gpuLayoutNeed, gpuLayoutSupport } from "./device-caps.js";
 import { gpuCaps } from "./device-probe.js";
 import { GpuForceLayout } from "./gpu-force-layout.js";
-import { GpuStream } from "./gpu-stream.js";
+import { GpuStream, type GpuRunState } from "./gpu-stream.js";
 import { moduleSeedPlan, type SeedPlan, type SeedPlanOptions } from "./seed-plan.js";
 import { SeedWorker } from "./seed-worker.js";
 import { LODRelay, type SeedRequest } from "./lod-relay.js";
 import { spawnLayoutWorker, startWorkerLayout, type WorkerLayoutHandle, type WorkerLayoutOptions } from "../worker-transport.js";
-import { seedPositions, DEFAULT_FORCE } from "../force.js";
+import { seedPositions, DEFAULT_FORCE, DRAG_HEAT, RECOOL_TICKS } from "../force.js";
 import type { LODTopology, LODTree } from "../lod.js";
 import type { NetworkGraph } from "../graph.js";
 
 /**
  * GPU layout options — the worker options plus an optional provided module hierarchy (N8.2). When
- * present (and it carries super-edges), the GPU backend's multilevel seed is **module-aware**, laying the
- * layout out top-down over the module tree so modules read as coherent regions; otherwise it seeds from the
- * graph's coarsening. The worker options are all honoured, by the GPU run and by the worker fallback.
+ * present (and it carries super-edges), the GPU backend seeds **module-aware**, laying the layout out
+ * top-down over the module tree so modules read as coherent regions; otherwise it uses the disc seed.
+ * The worker options are all honoured by the worker fallback.
  */
 export interface GpuLayoutOptions extends WorkerLayoutOptions {
   /** The provided module tree topology (from `lod({ modules })`), for the module-aware multilevel seed. */
@@ -58,14 +69,49 @@ export interface GpuLayoutOptions extends WorkerLayoutOptions {
   /**
    * Warn when the device or the graph is unsupported and the layout falls back to the worker (default
    * `true`: `layout({ backend: "gpu" })` asked for the GPU). `layout({ backend: "auto" })` passes `false`
-   * (#375), because there the worker is an expected outcome. A GPU run that fails rather than being
-   * unsupported (its device promise rejects, or it throws while starting) warns either way, with the error.
+   * (#375), because there the worker is an expected outcome — also when a render-backend swap moves the
+   * layout to the worker (#311). A GPU run that fails rather than being unsupported (its device promise
+   * rejects, it throws while starting, its context is lost or its layout turns non-finite) warns either way.
    */
   warnUnsupported?: boolean;
 }
 
 /** The transport a GPU layout resolved to: the GPU solve, or the worker fallback. */
 export type GpuLayoutTransport = "gpu" | "worker";
+
+/** A device now, or one that resolves once the render backend has settled. */
+type DeviceSource = Device | null | undefined | Promise<Device | null | undefined>;
+
+/**
+ * How a moved layout continues (#311): the ticks it runs and the heat schedule it resumes. `iterations: 0`
+ * is an idle run, alive for a drag reheat. `warm.recool`: the ticks are a re-cool's tail after a drag, resumed
+ * as one, so a pin reheats at the drag heat at once (in the initial run a drag rides on the run's schedule).
+ */
+export interface Continuation {
+  iterations: number;
+  warm: { heat: number; decaying: boolean; recool?: boolean };
+}
+
+/**
+ * Where a stopped GPU run continues, from where it stood at its last painted positions and whether a drag
+ * is live now (#311). Pure, so the policy is node-tested:
+ *
+ * - the initial run goes on over the ticks it had left, on its own heat schedule (a live drag rides on
+ *   it, as it does on the GPU and the worker);
+ * - a live drag otherwise gets an idle run, which the replayed pin reheats at the drag heat;
+ * - a drag released since the last harvest — or while the move waited for its device (`released`) — gets the
+ *   whole re-cool its release started;
+ * - a re-cool after a drag goes on over its tail, as a re-cool;
+ * - a settled layout gets an idle run, alive for a later drag (spec §15 Q3).
+ */
+export function continuationOf(state: Readonly<GpuRunState>, dragging: boolean, released = false): Continuation {
+  const warm = { heat: state.heat, decaying: state.decaying };
+  if (state.mode === "run" && state.ticksLeft > 0) return { iterations: state.ticksLeft, warm };
+  if (dragging) return { iterations: 0, warm };
+  if (state.mode === "drag" || released) return { iterations: RECOOL_TICKS, warm: { heat: DRAG_HEAT, decaying: true, recool: true } };
+  if (state.mode === "cool") return { iterations: state.ticksLeft, warm: { ...warm, recool: true } };
+  return { iterations: 0, warm };
+}
 
 /**
  * Start a GPU-accelerated layout run. Returns a {@link WorkerLayoutHandle}-shaped object so the
@@ -87,225 +133,330 @@ export type GpuLayoutTransport = "gpu" | "worker";
  *   until it has converged or `iterations` are done; `settled` resolves once the final positions have been
  *   harvested.
  *
- * `onTransport` reports the resolution before the run starts — so before any frame or LOD tree
- * arrives — and the handle's `transport` / `shared` read the live state (#297): `"pending"` until the
- * device settles, then `"gpu"` or `"worker"`.
+ * `onTransport` reports each resolution before its run starts — so before any frame or LOD tree
+ * arrives — and again when the layout moves (#311). The handle's `transport` / `shared` read the live
+ * state (#297): `"pending"` while waiting for a device, then `"gpu"` or `"worker"`. `moveDevice`
+ * continues a GPU run on another device (see the module header).
  */
 export function startGpuLayout(
-  deviceOrPromise: Device | null | undefined | Promise<Device | null | undefined>,
+  deviceOrPromise: DeviceSource,
   graph: NetworkGraph,
   opts: GpuLayoutOptions,
   onFrame: () => void,
   onLODTree?: (tree: LODTree | null) => void,
   onTransport?: (transport: GpuLayoutTransport) => void,
 ): WorkerLayoutHandle {
-  if (!(deviceOrPromise instanceof Promise)) {
-    return startGpuLayoutSync(deviceOrPromise, graph, opts, onFrame, onLODTree, onTransport);
-  }
-
-  // Async path: the device resolves later (e.g. after the "auto" → WebGL upgrade).
-  // Return a wrapper handle synchronously; resolve it once the device promise settles.
-  if (graph.nodeCount === 0) {
+  // Nothing to lay out: one paint, without waiting for a device promise.
+  if (deviceOrPromise instanceof Promise && graph.nodeCount === 0) {
     onFrame();
     return { shared: false, settled: Promise.resolve(), stop() {}, pin() {}, unpin() {} };
   }
+  const run = new GpuLayoutRun(graph, opts, onFrame, onLODTree, onTransport);
+  // A warm start (`opts.warm`) continues the current positions on either transport, as the worker does.
+  const { warm } = opts;
+  run.begin(deviceOrPromise, warm && (() => ({ iterations: opts.iterations, warm })), (reason) => `fell back to the CPU worker: ${reason}`, true);
+  return run;
+}
 
-  let stopped = false;
-  let inner: WorkerLayoutHandle | null = null;
-
-  let resolveSettled: () => void = () => {};
-  let rejectSettled: (e: unknown) => void = () => {};
-  const settled = new Promise<void>((res, rej) => { resolveSettled = res; rejectSettled = rej; });
-
-  const wrapper: WorkerLayoutHandle = {
-    // Live (#297): whatever the resolved run reports now, not a value copied when it started.
-    get shared() { return inner?.shared ?? false; },
-    get transport() { return inner ? inner.transport : "pending"; },
-    settled,
-    stop() {
-      if (stopped) return;
-      stopped = true;
-      if (inner) {
-        inner.stop();
-      } else {
-        // stopped before the device resolved — nothing to tear down, just settle
-        resolveSettled();
-      }
-    },
-    pin(ids: Uint32Array, positions?: Float32Array) { inner?.pin(ids, positions); },
-    unpin() { inner?.unpin(); },
-  };
-
-  const adopt = (handle: WorkerLayoutHandle): void => {
-    inner = handle;
-    handle.settled.then(resolveSettled, rejectSettled);
-  };
-  deviceOrPromise.then(
-    (device) => {
-      if (!stopped) adopt(startGpuLayoutSync(device, graph, opts, onFrame, onLODTree, onTransport));
-    },
-    (e: unknown) => {
-      if (!stopped) adopt(fallBackToWorker("the device promise rejected", graph, opts, onFrame, onLODTree, onTransport, { cause: e }));
-    },
-  ).catch((e: unknown) => {
-    // The GPU run failed to start (e.g. a driver rejected a shader): the worker still lays it out.
-    if (!stopped && !inner) adopt(fallBackToWorker("the GPU layout failed to start", graph, opts, onFrame, onLODTree, onTransport, { cause: e }));
-  });
-
-  return wrapper;
+/** What a start produced: the run's handle, and its GPU stream when it runs on the GPU. */
+interface Launched {
+  handle: WorkerLayoutHandle;
+  stream: GpuStream | null;
 }
 
 /**
- * The fallback: a worker run with the GPU layout's options and LOD-tree callback, reported as the
- * `"worker"` transport. `shared` reads the worker handle live (it flips on a worker error, #297). It
- * warns once with `reason`: always for a `failure` (the device promise rejected or the GPU run threw,
- * passing the error when there is one), and for an unsupported device or graph unless the caller expects
- * the fallback (`warnUnsupported: false`). The call site says which it is, never the error value: a
- * rejection or throw with `undefined` is still a failure.
+ * The handle `startGpuLayout` returns: one object for the layout's whole life, whatever runs it — a GPU
+ * stream, a worker, or nothing while it waits for a device — so the engine's references to it (its settle
+ * handler, a live drag) survive a move to another device (#311).
  */
-function fallBackToWorker(
-  reason: string,
-  graph: NetworkGraph,
-  opts: GpuLayoutOptions,
-  onFrame: () => void,
-  onLODTree: ((tree: LODTree | null) => void) | undefined,
-  onTransport: ((transport: GpuLayoutTransport) => void) | undefined,
-  failure?: { cause: unknown },
-): WorkerLayoutHandle {
-  const message = `[d3gl] the GPU network layout fell back to the CPU worker: ${reason}.`;
-  if (failure) {
-    if (failure.cause === undefined) console.warn(message);
-    else console.warn(message, failure.cause);
-  } else if (opts.warnUnsupported !== false) {
-    console.warn(message);
-  }
-  onTransport?.("worker");
-  const worker = startWorkerLayout(graph, opts, onFrame, onLODTree);
-  return {
-    get shared() { return worker.shared; },
-    transport: "worker",
-    settled: worker.settled,
-    stop: () => worker.stop(),
-    pin: (ids, positions) => worker.pin(ids, positions),
-    unpin: () => worker.unpin(),
-  };
-}
+class GpuLayoutRun implements WorkerLayoutHandle {
+  /** Resolves once the layout first converges (on whichever transport), or on {@link stop}. */
+  readonly settled: Promise<void>;
+  private resolveSettled: () => void = () => {};
+  private rejectSettled: (e: unknown) => void = () => {};
 
-/**
- * Synchronous variant: accepts a resolved `Device | null | undefined` value, decides GPU vs worker
- * for this graph, and starts that run.
- */
-function startGpuLayoutSync(
-  device: Device | null | undefined,
-  graph: NetworkGraph,
-  opts: GpuLayoutOptions,
-  onFrame: () => void,
-  onLODTree: ((tree: LODTree | null) => void) | undefined,
-  onTransport: ((transport: GpuLayoutTransport) => void) | undefined,
-): WorkerLayoutHandle {
-  const verdict = gpuLayoutSupport(gpuCaps(device), gpuLayoutNeed(graph.nodeCount, graph.edgeCount));
-  if (!verdict.ok || !device) {
-    // (`!device` never reaches here with `ok`: no device has no caps, which never pass.)
-    return fallBackToWorker(verdict.ok ? "no WebGL device" : verdict.reason, graph, opts, onFrame, onLODTree, onTransport);
-  }
-  // gpuLayoutSupport passed, so this is a WebGL2 device: the streaming readback needs its raw context.
-  if (!(device instanceof WebGLDevice)) {
-    return fallBackToWorker("no WebGL2 device", graph, opts, onFrame, onLODTree, onTransport);
+  /** The run in progress — a GPU stream's handle or a worker's — null while waiting for a device. */
+  private inner: WorkerLayoutHandle | null = null;
+  /** The GPU stream behind {@link inner}, while the layout runs on the GPU: what a move stops. */
+  private stream: GpuStream | null = null;
+  /** Bumped by every start and by {@link stop}: a device that resolves for an older one starts nothing. */
+  private generation = 0;
+  private stopped = false;
+  /**
+   * The live drag, replayed onto the run a move starts: the engine's held ids and positions (arrays it
+   * reuses across pointer moves, so these references always carry the newest values).
+   */
+  private heldIds: Uint32Array | null = null;
+  private heldPositions: Float32Array | undefined = undefined;
+  private dragging = false;
+  /** A drag was live when the GPU run last moved, or began while the move waited for its device (#311). */
+  private dragSinceMove = false;
+
+  constructor(
+    private readonly graph: NetworkGraph,
+    private readonly opts: GpuLayoutOptions,
+    private readonly onFrame: () => void,
+    private readonly onLODTree: ((tree: LODTree | null) => void) | undefined,
+    private readonly onTransport: ((transport: GpuLayoutTransport) => void) | undefined,
+  ) {
+    this.settled = new Promise<void>((resolve, reject) => {
+      this.resolveSettled = resolve;
+      this.rejectSettled = reject;
+    });
   }
 
-  // 0-node graph: GpuForceLayout would create a zero-height texture (crash).
-  // Return a no-op handle immediately — there is nothing to lay out.
-  if (graph.nodeCount === 0) {
-    onTransport?.("gpu");
-    onFrame();
-    return { shared: false, transport: "gpu", settled: Promise.resolve(), stop() {}, pin() {}, unpin() {} };
+  // Live (#297): whatever the current run reports now, not a value copied when it started.
+  get shared(): boolean {
+    return this.inner?.shared ?? false;
   }
 
-  const { width, height, force, iterations: rawIterations } = opts;
-  const iterations = rawIterations ?? 300;
-
-  // The multilevel seed (#312, #353): from the provided module tree when there is one (its plan is built
-  // here, as the module seed always was), else from the graph's coarsening, which a layout worker builds —
-  // the LOD relay's worker with LOD on (one coarsening for the tree and the seed), else a seed-only worker.
-  const multilevel = (opts.multilevel ?? true) && graph.edgeCount > 0;
-  const planOptions: SeedPlanOptions = { width, height, ...(force ? { force } : {}) };
-  const modulePlan = multilevel && opts.moduleTopology ? moduleSeedPlan(opts.moduleTopology, graph, planOptions) : null;
-  const coarsenSeed = multilevel && !modulePlan;
-  // The worker's plan may only be handed to the stream once it exists; a reply is a later task, so this
-  // buffers nothing in practice, but it keeps the order explicit.
-  let stream: GpuStream | null = null;
-  let earlyPlan: SeedPlan | null | undefined;
-  const seedRequest: SeedRequest = {
-    options: planOptions,
-    onPlan: (plan) => {
-      if (stream) stream.seed(plan);
-      else earlyPlan = plan;
-    },
-  };
-
-  // With LOD on, the LOD worker starts coarsening now, while this thread seeds and builds the solver (#377).
-  // If it cannot start, no second worker is tried for the seed: the relay's one warning covers both.
-  const lodWorker = opts.lod === true && onLODTree !== undefined;
-  const relay = lodWorker ? startLODRelay(graph, opts, onLODTree, coarsenSeed ? seedRequest : null) : null;
-  const seedWorker = coarsenSeed && !lodWorker ? startSeedWorker(graph, opts, seedRequest) : null;
-  const seeded = modulePlan !== null || (coarsenSeed && (relay !== null || seedWorker !== null));
-
-  // The disc at the force equilibrium's scale: on screen until the seed's first frame (the same scale, so that
-  // frame rearranges the layout without zooming), and a cold start's seed.
-  seedPositions(graph, width, height, { force });
-  let layout: GpuForceLayout;
-  try {
-    layout = new GpuForceLayout(device, graph, { ...DEFAULT_FORCE, ...force }, { multilevel: seeded });
-  } catch (error) {
-    relay?.destroy(); // the caller falls back to a worker run, which streams its own tree
-    seedWorker?.destroy();
-    throw error;
+  get transport(): "gpu" | "worker" | "pending" {
+    return this.inner ? (this.inner.transport ?? "worker") : "pending";
   }
-  // As the CPU worker (#124): a cold disc start keeps full heat to untangle (see ForceLayout.run); a seeded
-  // run cools over the iteration budget once the seed has placed the nodes (the stream sets it). Either way
-  // the stream stops the run once it has converged (the solver's per-tick stop latch, #376), or when the
-  // budget is spent.
-  if (!seeded) layout.hold(1);
 
-  let started: GpuStream;
-  try {
-    started = new GpuStream(device, layout, graph, {
-      iterations,
-      ...(opts.frameEvery !== undefined ? { frameEvery: opts.frameEvery } : {}),
-      ...(relay ? { sink: relay } : {}),
-      seeded,
-    }, onFrame);
-  } catch (error) {
-    // The readback's programs or buffers failed: free the solver before the caller falls back.
-    layout.destroy();
-    relay?.destroy();
-    seedWorker?.destroy();
-    throw error;
+  /**
+   * Start a run on `device` — at once for a value, once it resolves for a promise — continuing where
+   * `resume` says when the layout moved: asked when the run starts, so a drag that ends while the device is
+   * pending still counts. `fallback` words the warning for a device the GPU path cannot use; `failure` makes
+   * that warning unconditional (a lost context or a non-finite layout is a fault, not an unsupported
+   * device, #375); `replay` re-applies a live drag to the new run.
+   */
+  begin(device: DeviceSource, resume: (() => Continuation) | undefined, fallback: (reason: string) => string, replay: boolean, failure = false): void {
+    const generation = ++this.generation;
+    const start = (d: Device | null | undefined): void => {
+      if (this.generation === generation) this.adopt(this.launch(d, resume?.(), fallback, failure), replay);
+    };
+    if (!(device instanceof Promise)) {
+      start(device);
+      return;
+    }
+    const toWorker = (reason: string, cause: unknown): void => {
+      if (this.generation !== generation || this.inner) return;
+      this.adopt({ handle: this.fallBackToWorker(fallback(reason), resume?.(), { cause }), stream: null }, replay);
+    };
+    device
+      .then(start, (e: unknown) => toWorker("the device promise rejected", e))
+      // The GPU run failed to start (e.g. a driver rejected a shader): the worker still lays it out.
+      .catch((e: unknown) => toWorker("the GPU layout failed to start", e));
   }
-  stream = started;
-  // Reported once every GPU resource exists, so a failed start reports only the fallback's "worker";
-  // still before the first frame, and before the LOD tree (a later task).
-  onTransport?.("gpu");
-  // LOD on but no worker to build the tree (or an edge-less graph, which does not coarsen): the caller builds it.
-  if (opts.lod && !relay) onLODTree?.(null);
-  if (modulePlan) started.seed(modulePlan);
-  else if (earlyPlan !== undefined) started.seed(earlyPlan);
-  started.start();
 
-  return {
-    shared: false,
-    transport: "gpu",
-    settled: started.settled,
-    stop: () => {
-      started.stop();
+  moveDevice(next: Promise<Device | null | undefined>): void {
+    const stream = this.stream;
+    if (this.stopped || !stream) return; // a worker run is not bound to a device; a pending one waits for `next` anyway
+    this.move(stream, next, (reason) => `continues on the CPU worker after a render-backend swap: ${reason}`, true, false);
+  }
+
+  pin(ids: Uint32Array, positions?: Float32Array): void {
+    this.heldIds = ids;
+    this.heldPositions = positions;
+    this.dragging = true;
+    this.dragSinceMove = true;
+    this.inner?.pin(ids, positions);
+  }
+
+  unpin(): void {
+    this.dragging = false;
+    this.inner?.unpin();
+  }
+
+  stop(): void {
+    if (this.stopped) return;
+    this.stopped = true;
+    this.generation++;
+    this.stream = null;
+    // `inner` stays, so `transport` keeps reporting what ran (a GPU stream stops through its handle).
+    this.inner?.stop();
+    this.resolveSettled();
+  }
+
+  /**
+   * Stop the GPU run (freeing its GPU resources, or on a lost context only dropping them, and its LOD and
+   * seed workers) and continue the layout on `next` from where the run stood at its last painted positions
+   * (#311) — or afresh, when a seeded run has painted nothing yet (#353: the disc on screen is a placeholder).
+   */
+  private move(stream: GpuStream, next: DeviceSource, fallback: (reason: string) => string, replay: boolean, failure: boolean): void {
+    const painted = stream.runState();
+    const state: GpuRunState | null = painted ? { ...painted } : null;
+    this.dragSinceMove = this.dragging;
+    const inner = this.inner;
+    this.inner = null;
+    this.stream = null;
+    inner?.stop();
+    // Decided when the next run starts: a drag released while `next` was pending gets its re-cool.
+    const resume = state ? () => continuationOf(state, this.dragging, this.dragSinceMove && !this.dragging) : undefined;
+    this.begin(next, resume, fallback, replay, failure);
+  }
+
+  /** The GPU run stopped by itself: its context was lost, or its layout turned non-finite. */
+  private interrupted(stream: GpuStream, reason: string, cause: "lost" | "non-finite"): void {
+    if (this.stream !== stream || this.stopped) return;
+    const detail = cause === "non-finite" ? " from the last finite positions" : "";
+    // A drag that fed the layout a non-finite position would only poison the worker too: the drag's next
+    // pointer move pins again.
+    this.move(stream, null, () => `continues on the CPU worker${detail}: ${reason}`, cause !== "non-finite", true);
+  }
+
+  private adopt(launched: Launched, replay: boolean): void {
+    const { handle } = launched;
+    this.inner = handle;
+    this.stream = launched.stream;
+    handle.settled.then(
+      () => {
+        if (this.inner === handle) this.resolveSettled();
+      },
+      (e: unknown) => {
+        if (this.inner === handle) this.rejectSettled(e);
+      },
+    );
+    if (replay && this.dragging && this.heldIds) handle.pin(this.heldIds, this.heldPositions);
+  }
+
+  /**
+   * The worker run for a device the GPU path cannot use, continuing `cont` when the layout moved. It warns
+   * once with `message`: always for a `failure` (the device promise rejected, the GPU run threw, its context
+   * was lost or its layout turned non-finite — passing the error when there is one), and for an unsupported
+   * device or graph unless the caller expects the worker (`warnUnsupported: false`, #375). The call site says
+   * which it is, never the error value: a rejection or throw with `undefined` is still a failure.
+   */
+  private fallBackToWorker(message: string, cont: Continuation | undefined, failure?: { cause: unknown }): WorkerLayoutHandle {
+    const text = `[d3gl] the GPU network layout ${message}.`;
+    if (failure) {
+      if (failure.cause === undefined) console.warn(text);
+      else console.warn(text, failure.cause);
+    } else if (this.opts.warnUnsupported !== false) {
+      console.warn(text);
+    }
+    this.onTransport?.("worker");
+    const opts = cont ? { ...this.opts, iterations: cont.iterations, warm: cont.warm } : this.opts;
+    const worker = startWorkerLayout(this.graph, opts, this.onFrame, this.onLODTree);
+    return {
+      get shared() { return worker.shared; }, // live: it flips on a worker error (#297)
+      transport: "worker",
+      settled: worker.settled,
+      stop: () => worker.stop(),
+      pin: (ids, positions) => worker.pin(ids, positions),
+      unpin: () => worker.unpin(),
+    };
+  }
+
+  /** Decide GPU vs worker for this graph on `device`, and start that run. */
+  private launch(device: Device | null | undefined, cont: Continuation | undefined, fallback: (reason: string) => string, failure: boolean): Launched {
+    const { graph, opts, onLODTree } = this;
+    const fault = failure ? { cause: undefined } : undefined;
+    const verdict = gpuLayoutSupport(gpuCaps(device), gpuLayoutNeed(graph.nodeCount, graph.edgeCount));
+    if (!verdict.ok || !device) {
+      // (`!device` never reaches here with `ok`: no device has no caps, which never pass.)
+      return { handle: this.fallBackToWorker(fallback(verdict.ok ? "no WebGL device" : verdict.reason), cont, fault), stream: null };
+    }
+    // gpuLayoutSupport passed, so this is a WebGL2 device: the streaming readback needs its raw context.
+    if (!(device instanceof WebGLDevice)) {
+      return { handle: this.fallBackToWorker(fallback("no WebGL2 device"), cont, fault), stream: null };
+    }
+
+    // 0-node graph: GpuForceLayout would create a zero-height texture (crash).
+    // Return a no-op handle immediately — there is nothing to lay out.
+    if (graph.nodeCount === 0) {
+      this.onTransport?.("gpu");
+      this.onFrame();
+      return { handle: { shared: false, transport: "gpu", settled: Promise.resolve(), stop() {}, pin() {}, unpin() {} }, stream: null };
+    }
+
+    const { width, height, force } = opts;
+    const iterations = cont ? cont.iterations : (opts.iterations ?? 300);
+
+    // The multilevel seed (#312, #353) — not for a layout that moved here (#311), whose positions are on
+    // screen: from the provided module tree when there is one (its plan is built here, as the module seed
+    // always was), else from the graph's coarsening, which a layout worker builds — the LOD relay's worker
+    // with LOD on (one coarsening for the tree and the seed), else a seed-only worker.
+    const multilevel = !cont && (opts.multilevel ?? true) && graph.edgeCount > 0;
+    const planOptions: SeedPlanOptions = { width, height, ...(force ? { force } : {}) };
+    const modulePlan = multilevel && opts.moduleTopology ? moduleSeedPlan(opts.moduleTopology, graph, planOptions) : null;
+    const coarsenSeed = multilevel && !modulePlan;
+    // The worker's plan may only be handed to the stream once it exists; a reply is a later task, so this
+    // buffers nothing in practice, but it keeps the order explicit.
+    let stream: GpuStream | null = null;
+    let earlyPlan: SeedPlan | null | undefined;
+    const seedRequest: SeedRequest = {
+      options: planOptions,
+      onPlan: (plan) => {
+        if (stream) stream.seed(plan);
+        else earlyPlan = plan;
+      },
+    };
+
+    // With LOD on, the LOD worker starts coarsening now, while this thread seeds and builds the solver (#377).
+    // If it cannot start, no second worker is tried for the seed: the relay's one warning covers both.
+    const lodWorker = opts.lod === true && onLODTree !== undefined;
+    const relay = lodWorker && onLODTree ? startLODRelay(graph, opts, onLODTree, coarsenSeed ? seedRequest : null) : null;
+    const seedWorker = coarsenSeed && !lodWorker ? startSeedWorker(graph, opts, seedRequest) : null;
+    const seeded = modulePlan !== null || (coarsenSeed && (relay !== null || seedWorker !== null));
+
+    // The disc at the force equilibrium's scale: on screen until the seed's first frame (the same scale, so
+    // that frame rearranges the layout without zooming), and a cold start's seed — unless the layout moved
+    // here (#311), when `graph.positions` holds where it left off.
+    if (!cont) seedPositions(graph, width, height, { force });
+    let layout: GpuForceLayout;
+    try {
+      layout = new GpuForceLayout(device, graph, { ...DEFAULT_FORCE, ...force }, { multilevel: seeded });
+    } catch (error) {
+      relay?.destroy(); // the caller falls back to a worker run, which streams its own tree
       seedWorker?.destroy();
-    },
-    /** Hold `ids` (writing their `positions` into the position texture) and reheat — the rest reflows
-     *  around them. Mirrors the worker's `pin`. */
-    pin: (ids: Uint32Array, positions?: Float32Array) => started.pin(ids, positions),
-    /** Release every pin and re-cool over a short tail, then idle. Mirrors the worker's `unpin`. */
-    unpin: () => started.unpin(),
-  };
+      throw error;
+    }
+    // As the CPU worker (#124): a cold disc start keeps full heat to untangle (see ForceLayout.run); a seeded
+    // run cools over the iteration budget once the seed has placed the nodes (the stream sets it); a moved
+    // layout resumes its own schedule (#311). Either way the stream stops the run once it has converged (the
+    // solver's per-tick stop latch, #376), or when the budget is spent.
+    if (cont) {
+      if (cont.warm.decaying) layout.cool(iterations, cont.warm.heat);
+      else layout.hold(cont.warm.heat);
+    } else if (!seeded) layout.hold(1);
+
+    let started: GpuStream;
+    try {
+      started = new GpuStream(device, layout, graph, {
+        iterations,
+        ...(opts.frameEvery !== undefined ? { frameEvery: opts.frameEvery } : {}),
+        ...(relay ? { sink: relay } : {}),
+        seeded,
+        ...(cont ? { resumed: { recool: cont.warm.recool === true } } : {}),
+        onInterrupt: (reason, cause) => this.interrupted(started, reason, cause),
+      }, this.onFrame);
+    } catch (error) {
+      // The readback's programs or buffers failed: free the solver before the caller falls back.
+      layout.destroy();
+      relay?.destroy();
+      seedWorker?.destroy();
+      throw error;
+    }
+    stream = started;
+    // Reported once every GPU resource exists, so a failed start reports only the fallback's "worker";
+    // still before the first frame, and before the LOD tree (a later task).
+    this.onTransport?.("gpu");
+    // LOD on but no worker to build the tree (or an edge-less graph, which does not coarsen): the caller builds it.
+    if (opts.lod && !relay) onLODTree?.(null);
+    if (modulePlan) started.seed(modulePlan);
+    else if (earlyPlan !== undefined) started.seed(earlyPlan);
+    started.start();
+
+    return {
+      handle: {
+        shared: false,
+        transport: "gpu",
+        settled: started.settled,
+        stop: () => {
+          started.stop();
+          seedWorker?.destroy();
+        },
+        /** Hold `ids` (writing their `positions` into the position texture) and reheat — the rest reflows
+         *  around them. Mirrors the worker's `pin`. */
+        pin: (ids: Uint32Array, positions?: Float32Array) => started.pin(ids, positions),
+        /** Release every pin and re-cool over a short tail, then idle. Mirrors the worker's `unpin`. */
+        unpin: () => started.unpin(),
+      },
+      stream: started,
+    };
+  }
 }
 
 /**

@@ -1,5 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { startWorkerLayout, sharedMemoryAvailable } from "../worker-transport.js";
+import { ForceLayout, seedPositions } from "../force.js";
 import { network } from "../network.js";
 import { buildGraph } from "../graph.js";
 import type { LODTree } from "../lod.js";
@@ -153,6 +154,87 @@ describe("worker layout (off-thread, progressive)", () => {
     await net.whenSettled();
     net.destroy();
     host.remove();
+  });
+});
+
+describe("worker warm start (#311)", () => {
+  /** A ring laid out part-way on this thread: the layout another transport hands over. */
+  function handedOver(n: number) {
+    const g = ring(n);
+    seedPositions(g, 400, 400, { force: {} });
+    new ForceLayout(g).run(15, "hot");
+    return g;
+  }
+
+  it("with no ticks left, it idles on the layout it was handed — no seed — until a pin reheats it", async () => {
+    const g = handedOver(40);
+    const handed = g.positions.slice();
+    const handle = startWorkerLayout(g, { width: 400, height: 400, iterations: 0, warm: { heat: 1, decaying: false } }, () => {});
+    await handle.settled;
+    expect(Array.from(g.positions)).toEqual(Array.from(handed)); // the worker's frame carried them back unchanged
+
+    let frames = 0;
+    const moved = new Promise<void>((resolve) => {
+      const check = (): void => {
+        frames++;
+        for (let i = 2; i < 80; i++) if (g.positions[i] !== handed[i]) return resolve();
+        if (frames < 600) requestAnimationFrame(check);
+        else resolve();
+      };
+      requestAnimationFrame(check);
+    });
+    handle.pin(Uint32Array.of(0), Float32Array.of((handed[0] ?? 0) + 200, handed[1] ?? 0));
+    await moved;
+    expect(Array.from(g.positions.subarray(2)), "the rest never reflowed around the pin").not.toEqual(Array.from(handed.subarray(2)));
+    handle.stop();
+  });
+
+  it("continues on the handed-over heat schedule over the ticks left, exactly as this thread would", async () => {
+    const g = handedOver(40);
+    const reference = handedOver(40);
+    const layout = new ForceLayout(reference);
+    layout.cool(25, 0.5);
+    for (let t = 0; t < 25; t++) {
+      layout.tick();
+      if (layout.converged) break;
+    }
+    const handle = startWorkerLayout(g, { width: 400, height: 400, iterations: 25, warm: { heat: 0.5, decaying: true } }, () => {});
+    await handle.settled;
+    expect(Array.from(g.positions)).toEqual(Array.from(reference.positions));
+    handle.stop();
+  });
+
+  it("with LOD on, the tree arrives with the geometry of the handed-over positions: no seed frame follows to fill it", async () => {
+    // The main thread adopts the tree the moment it lands and draws the cut from it (a zoom, a hover pick, a
+    // rebuild), while a warm start's first frame only follows its first tick (about a second at 325k nodes).
+    const g = handedOver(40);
+    const handed = g.positions.slice();
+    const atAdoption: { leafX: number[]; leafY: number[]; zeroAggregates: number; aggregates: number }[] = [];
+    const handle = startWorkerLayout(
+      g,
+      { width: 400, height: 400, iterations: 25, lod: true, warm: { heat: 0.5, decaying: true } },
+      () => {},
+      (tree) => {
+        let zeroAggregates = 0;
+        for (let i = tree.leafCount; i < tree.size; i++) {
+          if (tree.cx[i] === 0 && tree.cy[i] === 0 && tree.extent[i] === 0) zeroAggregates++;
+        }
+        atAdoption.push({
+          leafX: Array.from(tree.cx.subarray(0, tree.leafCount)),
+          leafY: Array.from(tree.cy.subarray(0, tree.leafCount)),
+          zeroAggregates,
+          aggregates: tree.size - tree.leafCount,
+        });
+      },
+    );
+    await handle.settled;
+    handle.stop();
+    expect(atAdoption).toHaveLength(1);
+    const [tree] = atAdoption;
+    expect(tree?.aggregates, "the ring coarsened into aggregates").toBeGreaterThan(0);
+    expect(tree?.zeroAggregates, "aggregates with no geometry when the tree landed").toBe(0);
+    expect(tree?.leafX).toEqual(Array.from({ length: 40 }, (_, i) => handed[i * 2]));
+    expect(tree?.leafY).toEqual(Array.from({ length: 40 }, (_, i) => handed[i * 2 + 1]));
   });
 });
 
