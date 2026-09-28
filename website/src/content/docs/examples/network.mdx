@@ -38,11 +38,10 @@ every display frame — so the layout **converges progressively on screen** whil
 stays responsive; pan and zoom while it settles. A multilevel-seeded CPU layout
 (`worker` or `force`) cools over its `iterations` budget and **stops once it has converged**, so there
 `iterations` is a safety cap and the length of the cooling (a larger budget cools more slowly), not a
-tick count to hit. The GPU layout has no early stop yet (it runs its whole budget) and a cold start
-keeps full heat until it settles on its own, so the example gives those two a budget that shrinks as
-the graph grows. **GPU** and **Auto** get that budget whichever transport they resolve to, since that is
-known only after `layout()` returns; where they resolve to the worker, a multilevel run therefore cools
-over fewer ticks than under **Worker**. The GPU layout seeds multilevel too: a worker coarsens the graph
+tick count to hit. The GPU layout stops by the same test, decided on the GPU once per tick, so where it
+stops does not depend on the frame rate. A cold start keeps full heat until it settles on its own, which on
+a large graph can take longer than the default budget, so the example gives cold starts (**Seeding** set to
+cold, on any backend) a budget that shrinks as the graph grows. The GPU layout seeds multilevel too: a worker coarsens the graph
 (the same heavy-edge matching) while the GPU solver is built, and the GPU then lays out every coarse level
 on that one solver, coarsest first, inside the same per-frame GPU budget as the refinement. Until its first
 frame the equilibrium-sized disc stays on screen; that frame already shows the global arrangement, at the
@@ -682,7 +681,7 @@ frame that lands in it, however fast the pointer moves:
 | --- | --- | --- |
 | `force` (main thread) | a pinned [`ForceLayout`](#large-scale-layout-in-a-web-worker) reheats neighbours each frame | re-cools until converged (at most a short tail), then stops |
 | `worker` (off thread) | the worker **pins** the held set and reflows the rest off-thread; the main thread holds them under the cursor | the worker is **unpinned** and re-cools until converged |
-| `gpu` (on the GPU) | the GPU layout **pins** the held set (skipped by the integrate pass) and reflows the rest on-GPU; the main thread holds them under the cursor | the layout is **unpinned** and re-cools |
+| `gpu` (on the GPU) | the GPU layout **pins** the held set (skipped by the integrate pass) and reflows the rest on-GPU; the main thread holds them under the cursor | the layout is **unpinned** and re-cools until converged |
 | `auto` | as `gpu` or `worker`, whichever it resolved to | as that backend |
 | `positions` (fixed coords) | the held set simply **translates** (no simulation to reheat) | — |
 

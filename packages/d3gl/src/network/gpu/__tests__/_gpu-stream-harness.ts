@@ -508,8 +508,11 @@ function assertSignatures(leg: Leg): void {
     expect((repaints[i] ?? 0) - (repaints[i - 1] ?? 0)).toBeGreaterThanOrEqual(MIN_FRAME_MS - 2);
   }
 
-  // settled only after the final positions were harvested.
-  const finalHarvest = frames.findIndex((s) => s.harvestedTicks === ITERATIONS);
+  // settled only after the final positions were harvested: the budget's last tick, or the tick the
+  // convergence stop latched at (#376) — a seeded layout (#353) converges within the budget.
+  const finalTick = ticksRun(frames);
+  expect(finalTick).toBeLessThanOrEqual(ITERATIONS);
+  const finalHarvest = frames.findIndex((s) => s.harvestedTicks >= finalTick);
   expect(finalHarvest).toBeGreaterThanOrEqual(0);
   expect(finalHarvest).toBeLessThan(leg.settledAfterFrame);
 }
@@ -570,6 +573,12 @@ async function gpuOnlyRate(graph: NetworkGraph): Promise<{ ticksPerSec: number; 
   }
 }
 
+/** The ticks a streamed run refined: its budget, or fewer when the convergence stop latched first (#376). */
+function ticksRun(frames: readonly GpuFrameSample[]): number {
+  const stopTick = frames[frames.length - 1]?.stopTick ?? -1;
+  return stopTick >= 0 ? stopTick : ITERATIONS;
+}
+
 function report(label: string, leg: Leg): { transport: number[]; encode: number[]; ticksPerSec: number } {
   const { frames } = leg;
   const transport = frames.map((s) => s.harvestMs + s.encodeMs);
@@ -578,14 +587,15 @@ function report(label: string, leg: Leg): { transport: number[]; encode: number[
   const intervals = frames.slice(1).map((s, i) => s.now - (frames[i]?.now ?? s.now));
   const first = frames[0]?.now ?? 0;
   const last = frames[frames.length - 1]?.now ?? first;
-  const ticksPerSec = (ITERATIONS / Math.max(1, last - first)) * 1000;
+  const ticks = ticksRun(frames);
+  const ticksPerSec = (ticks / Math.max(1, last - first)) * 1000;
   console.log(
     `  GPU stream [${label}] N=${N}: ${frames.length} frames, ${repaint.length} repaints, ` +
       `transport ms/frame median ${median(transport).toFixed(2)} p95 ${quantile(transport, 0.95).toFixed(2)} max ${Math.max(...transport).toFixed(2)}; ` +
       `encode median ${median(encode).toFixed(2)} p95 ${quantile(encode, 0.95).toFixed(2)}; ` +
       `repaint ms median ${median(repaint).toFixed(1)} max ${Math.max(0, ...repaint).toFixed(1)}; ` +
       `rAF interval median ${median(intervals).toFixed(1)} ms; ${ticksPerSec.toFixed(1)} ticks/s; ` +
-      `${ITERATIONS} ticks in ${leg.elapsedMs.toFixed(0)} ms; bands ${frames[frames.length - 1]?.bands}, blocked ${frames.filter((s) => s.blocked).length}`,
+      `${ticks} ticks in ${leg.elapsedMs.toFixed(0)} ms; bands ${frames[frames.length - 1]?.bands}, blocked ${frames.filter((s) => s.blocked).length}`,
   );
   return { transport, encode, ticksPerSec };
 }
