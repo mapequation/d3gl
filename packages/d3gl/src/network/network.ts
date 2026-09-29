@@ -1,5 +1,5 @@
 import { BaseEngine, type BaseEngineOptions, type HoverHit, type InteractiveLayerOptions, type LaneInteractive, type NodeDragSession } from "../map/base-engine.js";
-import { networkLayers, networkLayersFromCache, noLodStyleCache, drawsLinks, frontierCircles, frontierHalos, boundaryRings, traceBoundaryRings, superEdges, makeSuperEdgesScratch, emitNodes, emitLinks, emitArrows, emitHalfLinks, traceFrontierGlyphs, traceFrontierHalos, traceSuperHalfArrows, traceSuperLines, traceSuperArrows, physicalPieInstances, physicalPieSelected, tracePieWedges, rgbaCss, pickNodes, regionNodes, resolveNodeRadii, resolveNodeRadiusAggregate, resolveImportance, resolveFlowBorder, resolveNodeFill, moduleBorderValues, applyModuleBorder, treeBorderColors, resolveLinkWidthOf, resolveLinkColorOf, resolveLinkStrokeOf, flowBorderInnerRadii, type ResolvedNetworkStyle, type SuperEdgeStyleResolved, type SuperEdgesData, type ModuleBoundaryResolved, type AggregateOutlineResolved, type NoLodStyleCache, type NodeRadiusSpec, type ImportanceSpec, type FlowBorderSpec, type NodeFillSpec, type ConstBorder, type LinkWidthSpec, type LinkColorSpec, type LinkStyle, type RGBAValue } from "./glyphs.js";
+import { networkLayers, networkLayersFromCache, noLodStyleCache, drawsLinks, frontierCircles, frontierHalos, boundaryRings, traceBoundaryRings, superEdges, makeSuperEdgesScratch, withLeafLinks, makeLeafLinksScratch, emitNodes, emitLinks, emitArrows, emitHalfLinks, traceFrontierGlyphs, traceFrontierHalos, traceSuperHalfArrows, traceSuperLines, traceSuperArrows, physicalPieInstances, physicalPieSelected, tracePieWedges, rgbaCss, pickNodes, regionNodes, resolveNodeRadii, resolveNodeRadiusAggregate, resolveImportance, resolveFlowBorder, resolveNodeFill, moduleBorderValues, applyModuleBorder, treeBorderColors, resolveLinkWidthOf, resolveLinkColorOf, resolveLinkStrokeOf, flowBorderInnerRadii, type ResolvedNetworkStyle, type SuperEdgeStyleResolved, type SuperEdgesData, type ModuleBoundaryResolved, type AggregateOutlineResolved, type NoLodStyleCache, type NodeRadiusSpec, type ImportanceSpec, type FlowBorderSpec, type NodeFillSpec, type ConstBorder, type LinkWidthSpec, type LinkColorSpec, type LinkStyle, type RGBAValue } from "./glyphs.js";
 import { rgb } from "d3-color";
 import { DRAG_HEAT, ForceLayout, seedPositions, type ForceParams } from "./force.js";
 import { multilevelLayout, type CoarsenOptions } from "./coarsen.js";
@@ -915,6 +915,10 @@ export class Network extends BaseEngine {
   private readonly lodCrowding = makeLODCrowdingScratch();
   /** Super-edge gather state for spatial trees (#343, #433): cover stamps, row memo, gather arrays. */
   private readonly lazyScratch = makeLazySuperEdgesScratch();
+  /** Leaf-link scratch (#447): a stamp per leaf and the frame's leaf-link edge list, reused (4 B per leaf + 4 B per edge). */
+  private readonly leafLinksScratch = makeLeafLinksScratch();
+  /** Links the last emit drew as graph edges between two kept leaves (#447), for {@link superEdgeStats}. */
+  private leafLinksDrawn = 0;
   /** The graph's per-incidence weights/directions for the lazy gather, built once per graph + direction. */
   private leafIncidence: LeafIncidence | null = null;
   /** The last cut's frontier before declutter (a view of {@link cutScratch}): the lazy gather's covers. */
@@ -2815,13 +2819,14 @@ export class Network extends BaseEngine {
    * under a glyph (`misses`), and the edge incidences those rebuilds walked (`visits`); on a tree a layout
    * streamed with its worker-built rows (#433), the row entries — plus the kept leaves' own graph edges — it
    * read from them instead (`entries`): at the view the rows were built for, a repaint rebuilds nothing
-   * (`misses: 0, visits: 0`). `null` until a spatial tree has drawn links. Introspection for debugging and
-   * tests: a re-emit of an unchanged view reports `misses: 0, visits: 0`.
+   * (`misses: 0, visits: 0`); and the links it drew as graph edges between two kept leaves (`leafLinks`, #447),
+   * which bypass the gather as the full-detail path draws them. `null` until a spatial tree has drawn links.
+   * Introspection for debugging and tests: a re-emit of an unchanged view reports `misses: 0, visits: 0`.
    */
-  get superEdgeStats(): { hits: number; misses: number; visits: number; entries: number } | null {
+  get superEdgeStats(): { hits: number; misses: number; visits: number; entries: number; leafLinks: number } | null {
     if (!this.lazyGathered) return null;
     const sc = this.lazyScratch;
-    return { hits: sc.hits, misses: sc.misses, visits: sc.visits, entries: sc.entries };
+    return { hits: sc.hits, misses: sc.misses, visits: sc.visits, entries: sc.entries, leafLinks: this.leafLinksDrawn };
   }
 
   /**
@@ -3088,7 +3093,7 @@ export class Network extends BaseEngine {
 
   /** Resolve a picked link instance (#141) under LOD: instance i → super-edge `ids[i]` (the directed
    *  tree-node pair) + summed `flows[i]`. Returns a HoverHit with `layer: "links"`, or null if out of range. */
-  private lodLinkHit(tree: LODTree, ids: number[], flows: number[] | undefined, index: number): HoverHit | null {
+  private lodLinkHit(tree: LODTree, ids: ArrayLike<number>, flows: ArrayLike<number> | undefined, index: number): HoverHit | null {
     if (index < 0 || index >= ids.length) return null;
     const pair = ids[index]!;
     const source = Math.floor(pair / tree.size);
@@ -3270,7 +3275,7 @@ export class Network extends BaseEngine {
   /** Shader-highlight columns for the emitted LOD super-edges (#162): `groups` = source tree-node,
    *  `groups2` = target (undirected incident hover only), `selected` = outgoing-from-a-selected-(sub)tree
    *  (ancestor-aware). Parallel to `ids` (shared by all link layers). */
-  private linkHighlightColumns(ids: number[], size: number, isSel: ((g: number) => boolean) | null, directed: boolean): { groups: Float32Array; groups2?: Float32Array; selected: Uint8Array } {
+  private linkHighlightColumns(ids: ArrayLike<number>, size: number, isSel: ((g: number) => boolean) | null, directed: boolean): { groups: Float32Array; groups2?: Float32Array; selected: Uint8Array } {
     const n = ids.length;
     const groups = new Float32Array(n);
     const groups2 = directed ? undefined : new Float32Array(n);
@@ -3740,16 +3745,28 @@ export class Network extends BaseEngine {
       crossLevelEdges: opts?.crossLevelEdges,
       anchor: this.anchorBoundaries(),
       fadeAlpha: this.fadeAlpha ?? undefined,
+      leafLinks: false,
     };
     const view = visibleWorldRect(this.transform, this.width, this.height);
     const graph = this.graph;
-    if (tree.leafOrder && !tree.superEdgeOffset && graph && graph.nodeCount === tree.leafCount) {
+    // Two kept leaves are linked by their graph edges, drawn as the full-detail path draws them — its cached
+    // per-edge columns, O(edges) per frame like its position frame (#447); the gathers keep the links that
+    // touch an aggregate. Only where the tree's leaves are the graph's nodes.
+    const leaves = graph !== null && graph.nodeCount === tree.leafCount ? graph : null;
+    edgeStyle.leafLinks = leaves !== null;
+    let gathered: SuperEdgesData;
+    if (tree.leafOrder && !tree.superEdgeOffset && leaves) {
       const sc = this.cutScratch;
       const covers = { drawn: this.cutFrontier, kept: frontier, culled: sc.culled.subarray(0, sc.culledCount), split: sc.split.subarray(0, sc.splitCount) };
       this.lazyGathered = true;
-      return lazySuperEdges(tree, covers, edgeStyle, view, graph.csr, this.incidenceOf(graph, style.directed), this.lazyScratch);
+      gathered = lazySuperEdges(tree, covers, edgeStyle, view, leaves.csr, this.incidenceOf(leaves, style.directed), this.lazyScratch);
+    } else {
+      gathered = superEdges(tree, frontier, edgeStyle, view, this.superEdgesScratch);
     }
-    return superEdges(tree, frontier, edgeStyle, view, this.superEdgesScratch);
+    if (!leaves) return gathered;
+    const out = withLeafLinks(tree, leaves, frontier, this.noLodCache(leaves, style), gathered, this.fadeAlpha ?? undefined, this.leafLinksScratch);
+    this.leafLinksDrawn = out.ids.length - gathered.ids.length;
+    return out;
   }
 
   /** The graph's per-incidence weights (and directions, for directed links) the lazy gather sums (#343),
@@ -4330,14 +4347,16 @@ export class Network extends BaseEngine {
       emit && opts.superEdges !== false && graph && drawsLinks(graph, style)
         ? this.frontierSuperEdges(tree, frontier, style) // shared with the lane emit — they never run concurrently
         : { ids: [] as number[] };
+    // The Scene keys its drawables by an array of ids (a frame's typed ids, #447, are copied once here).
+    const seIds: number[] = Array.isArray(se.ids) ? se.ids : Array.from(se.ids);
     // Screen-mode super-edge shapes BAKE at the current zoom (constant-px tip/setback/bend terms), the
     // same trick the full-graph path uses; lines need no bake (world endpoints + per-line px width).
     const seBake = screen ? this.transform.k || 1 : 1;
     const isHalf = !!se.halfArrows;
     this.registerLayer({
       name: "links",
-      data: se.ids,
-      ids: se.ids,
+      data: seIds,
+      ids: seIds,
       // A half-arrow is one filled shape (baked to world in screen mode); a line keeps the sizeMode.
       sizeMode: isHalf ? "world" : style.sizeMode,
       ...(isHalf
@@ -4353,8 +4372,8 @@ export class Network extends BaseEngine {
     const arrowBake = !isHalf && style.directed && screen ? this.transform.k || 1 : 1;
     this.registerLayer({
       name: "arrows",
-      data: se.ids,
-      ids: se.ids,
+      data: seIds,
+      ids: seIds,
       sizeMode: arrowBake !== 1 ? "world" : style.sizeMode,
       fill: (_d, i) => (se.arrows ? rgbaCss(se.arrows.colors, i) : ""),
       build: (g) => {

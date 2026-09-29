@@ -1023,6 +1023,12 @@ export interface SuperEdgeStyleResolved {
    */
   anchor?: CutBoundaries;
   /**
+   * Leave links between two kept **leaves** out of the gather (#447): the caller draws them as graph edges,
+   * as the full-detail path does ({@link withLeafLinks}). Set only when the tree's leaves are the graph's
+   * nodes; unset, every pair is gathered, as before.
+   */
+  leafLinks?: boolean;
+  /**
    * Cross-fade alpha (#133), indexed by tree-node id. When set, each super-edge's alpha is scaled by the
    * least-visible of its two *present* endpoints (off-screen endpoints count as opaque), so an edge fades
    * with the aggregate/child it connects. Absent ⇒ edges draw at full opacity.
@@ -1145,6 +1151,8 @@ export function superEdges(
   const tgt = tree.superEdgeTarget;
   const flw = tree.superEdgeFlow;
   if (!off || !tgt || !flw) return { ids: [] };
+  const leafCount = tree.leafCount;
+  const leafLinks = style.leafLinks === true;
 
   // #210: all working storage comes from the (reused) scratch. The only O(tree.size) cost is `seen`'s
   // one-time growth to this tree's size; per call, bumping the generation stamp replaces a clear.
@@ -1273,8 +1281,14 @@ export function superEdges(
     for (let p = off[g]!; p < off[g + 1]!; p++) {
       const h = tgt[p]!;
       if (seen[h] === gen) {
-        // Both present. With cross-level edges on, a lift pair onto an aggregate is summed with the projections
-        // below instead (one may land on the same pair, and a pair draws once).
+        // Both present. Two present leaves are linked by their graph edges, which the engine draws as the
+        // full-detail path does (#447, {@link leafLinks}): not gathered here, though a lift pair still claims.
+        if (leafLinks && g < leafCount && h < leafCount) {
+          if (dep !== undefined && dep[h] !== dep[g]) claim(g, h, flw[p]!);
+          continue;
+        }
+        // With cross-level edges on, a lift pair onto an aggregate is summed with the projections below instead
+        // (one may land on the same pair, and a pair draws once).
         if (par && merges(g, h)) continue;
         pushEdge(g, h, flw[p]!);
         if (reciprocal) pairLast();
@@ -1643,6 +1657,172 @@ export function superEdgeBatches(
   return { lines, arrows, ids, flows };
 }
 
+/** Reused working storage for {@link withLeafLinks}: a stamp per leaf and the frame's leaf-link edge list. */
+export interface LeafLinksScratch {
+  kept: Int32Array;
+  gen: number;
+  edges: Uint32Array;
+}
+
+/** A fresh, empty {@link LeafLinksScratch}. */
+export function makeLeafLinksScratch(): LeafLinksScratch {
+  return { kept: new Int32Array(0), gen: 0, edges: new Uint32Array(0) };
+}
+
+/**
+ * The frame's links with **leaf links** (#447): every graph edge whose two ends are kept leaves of the cut,
+ * drawn as the full-detail path draws it — its per-edge width, colour, radii and bend from that path's cached
+ * style columns (`cache`, {@link noLodStyleCache}), its ends at the leaves' centres — followed by the gathered
+ * super-edges, which touch an aggregate (the gathers leave leaf–leaf pairs out). One batch per link primitive,
+ * in the same instance order as `ids`/`flows`, so link picking and the Canvas/SVG keys see one list. In a
+ * cross-fade band a link's alpha follows its least-visible end, as a gathered one's does.
+ *
+ * O(edges) for the scan (two stamp reads per edge) and O(leaf links + gathered) to write the batches — the
+ * shape of the full-detail path's position frame, which rewrites every edge's ends. Memory: 4 B per leaf and
+ * 4 B per leaf link of scratch, reused.
+ */
+export function withLeafLinks(
+  tree: LODTree,
+  graph: NetworkGraph,
+  frontier: Uint32Array,
+  cache: NoLodStyleCache,
+  gathered: SuperEdgesData,
+  fadeAlpha: Float32Array | undefined,
+  sc: LeafLinksScratch,
+): SuperEdgesData {
+  const n = graph.nodeCount;
+  if (sc.kept.length < n) sc.kept = new Int32Array(n);
+  if (sc.gen === 0x7fffffff) { sc.kept.fill(0); sc.gen = 0; }
+  const gen = ++sc.gen;
+  const kept = sc.kept;
+  for (let i = 0; i < frontier.length; i++) {
+    const g = frontier[i] ?? 0;
+    if (g < n) kept[g] = gen;
+  }
+  const src = graph.source;
+  const tgt = graph.target;
+  const E = graph.edgeCount;
+  if (sc.edges.length < E) sc.edges = new Uint32Array(E);
+  const list = sc.edges;
+  let m = 0;
+  for (let e = 0; e < E; e++) {
+    const a = src[e] ?? 0;
+    const b = tgt[e] ?? 0;
+    if (a !== b && kept[a] === gen && kept[b] === gen) list[m++] = e;
+  }
+  if (m === 0) return gathered;
+
+  const k = gathered.ids.length;
+  const count = m + k;
+  const size = tree.size;
+  const w = graph.weight;
+  const cx = tree.cx;
+  const cy = tree.cy;
+  // Typed, not `number[]`: a frame of every leaf writes one per graph edge.
+  const ids = new Float64Array(count);
+  const flows = new Float64Array(count);
+  for (let i = 0; i < m; i++) {
+    const e = list[i] ?? 0;
+    ids[i] = (src[e] ?? 0) * size + (tgt[e] ?? 0);
+    flows[i] = w[e] ?? 0;
+  }
+  const gFlows = gathered.flows;
+  for (let j = 0; j < k; j++) {
+    ids[m + j] = gathered.ids[j] ?? 0;
+    flows[m + j] = gFlows ? (gFlows[j] ?? 0) : 0;
+  }
+  // Ends at the leaves' centres (the glyphs drawn for them), then the gathered pairs' ends.
+  const ends = (gSources: Float32Array | undefined, gTargets: Float32Array | undefined): { sources: Float32Array; targets: Float32Array } => {
+    const sources = new Float32Array(2 * count);
+    const targets = new Float32Array(2 * count);
+    for (let i = 0; i < m; i++) {
+      const e = list[i] ?? 0;
+      const a = src[e] ?? 0;
+      const b = tgt[e] ?? 0;
+      sources[2 * i] = cx[a] ?? 0;
+      sources[2 * i + 1] = cy[a] ?? 0;
+      targets[2 * i] = cx[b] ?? 0;
+      targets[2 * i + 1] = cy[b] ?? 0;
+    }
+    if (gSources) sources.set(gSources.subarray(0, 2 * k), 2 * m);
+    if (gTargets) targets.set(gTargets.subarray(0, 2 * k), 2 * m);
+    return { sources, targets };
+  };
+  // A per-edge column: the cached one gathered by edge (`per` values per edge), then the gathered pairs'.
+  const column = (cached: Float32Array, gCol: Float32Array | undefined, per: 1 | 2): Float32Array => {
+    const out = new Float32Array(per * count);
+    if (per === 1) {
+      for (let i = 0; i < m; i++) out[i] = cached[list[i] ?? 0] ?? 0;
+    } else {
+      for (let i = 0; i < m; i++) {
+        const e = 2 * (list[i] ?? 0);
+        out[2 * i] = cached[e] ?? 0;
+        out[2 * i + 1] = cached[e + 1] ?? 0;
+      }
+    }
+    if (gCol) out.set(gCol.subarray(0, per * k), per * m);
+    return out;
+  };
+  // RGBA bytes, one 32-bit word per edge (the cached bytes are a fresh array: offset 0, a multiple of 4 long).
+  const colorsOf = (cached: Uint8Array, gCol: Uint8Array | undefined): Uint8Array => {
+    const colors = new Uint8Array(4 * count);
+    const from = new Uint32Array(cached.buffer, cached.byteOffset, cached.length >> 2);
+    const to = new Uint32Array(colors.buffer, 0, count);
+    for (let i = 0; i < m; i++) to[i] = from[list[i] ?? 0] ?? 0;
+    if (gCol) colors.set(gCol.subarray(0, 4 * k), 4 * m);
+    if (fadeAlpha) {
+      for (let i = 0; i < m; i++) {
+        const e = list[i] ?? 0;
+        const f = Math.min(fadeAlpha[src[e] ?? 0] ?? 1, fadeAlpha[tgt[e] ?? 0] ?? 1);
+        colors[4 * i + 3] = Math.round((colors[4 * i + 3] ?? 0) * f);
+      }
+    }
+    return colors;
+  };
+
+  const ha = cache.halfArrows;
+  if (cache.kind === "half-arrows" && ha) {
+    const g = gathered.halfArrows;
+    const { sources, targets } = ends(g?.sources, g?.targets);
+    const halfArrows: InstancedHalfArrowsData = {
+      sources,
+      targets,
+      radii: column(ha.radii, g?.radii, 2),
+      widths: column(ha.widths, g?.widths, 2),
+      bends: column(ha.bends, g?.bends, 1),
+      colors: colorsOf(ha.colors, g?.colors),
+      count,
+    };
+    return { halfArrows, ids, flows };
+  }
+  const ln = cache.lines;
+  if (!ln) return gathered;
+  const gl = gathered.lines;
+  const { sources, targets } = ends(gl?.sources, gl?.targets);
+  const lineColors = colorsOf(ln.colors, gl?.colors);
+  const lines: InstancedLinesData = { sources, targets, widths: column(ln.widths, gl?.widths, 1), colors: lineColors, count };
+  if (ln.bends) {
+    lines.bends = column(ln.bends, gl?.bends, 1);
+    lines.samples = ln.samples;
+  }
+  const ar = cache.arrows;
+  if (!ar) return { lines, ids, flows };
+  const ga = gathered.arrows;
+  const arrows: InstancedArrowsData = {
+    sources,
+    targets,
+    radii: column(ar.radii, ga?.radii, 1),
+    sizes: column(ar.sizes, ga?.sizes, 1),
+    colors: lineColors,
+    count,
+  };
+  if (ar.bends) {
+    arrows.bends = column(ar.bends, ga?.bends, 1);
+    arrows.half = ar.half;
+  }
+  return { lines, arrows, ids, flows };
+}
+
 /**
  * {@link superEdges} output: the per-style instanced batches plus parallel per-super-edge metadata.
  * `ids[e] = sourceTreeNode * tree.size + targetTreeNode` (the stable directed pair) and `flows[e]` is
@@ -1654,8 +1834,8 @@ export interface SuperEdgesData {
   halfArrows?: InstancedHalfArrowsData;
   lines?: InstancedLinesData;
   arrows?: InstancedArrowsData;
-  ids: number[];
-  flows?: number[];
+  ids: ArrayLike<number>;
+  flows?: ArrayLike<number>;
 }
 
 /** Path-strip samples for a smooth bent link (#104 N6c). */
