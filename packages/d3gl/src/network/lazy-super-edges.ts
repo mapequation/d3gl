@@ -67,6 +67,8 @@ export function buildLeafIncidence(graph: NetworkGraph, directed: boolean): Leaf
 const KEPT = 1;
 const DROPPED = 2;
 const CULLED = 3;
+/** A kept leaf's row with nothing to gather (#447: every neighbour a kept leaf): no memo row, no pairs. */
+const EMPTY_ROW = -2;
 /** Direction flags per row entry. */
 const HAS_OUT = 1;
 const HAS_IN = 2;
@@ -389,18 +391,36 @@ export function lazySuperEdges(
   // Kept glyph g's row from what the streaming worker built with the tree (#433): a cell's stored row, each
   // partner resolved to its cover in this cut (merged where this cut coarsened several), or a leaf's graph
   // edges. −1 when the rows cannot serve it: a cell they do not list, or a partner this cut opened up.
-  const streamedRow = (stored: SpatialRows, g: number): number => {
+  // Without `style.leafLinks` no cover matches −1 (stamps are ≥ 0), so every neighbour is resolved as before.
+  const keptStamp = style.leafLinks === true ? stamp | KEPT : -1;
+  // Kept leaf g's row from its own graph edges. With `style.leafLinks` (#447) its links to other kept leaves are
+  // not gathered — the engine draws them as the full-detail path does (`withLeafLinks` in glyphs.ts) — so a
+  // neighbour that is itself a kept leaf is skipped before it is resolved (one read), and the row holds the flow
+  // toward aggregates and covers off the kept set only; such a row is built fresh on every call (O(degree)),
+  // never taken from the memo, since which neighbours it skips depends on the cut and a memo row names only the
+  // covers it holds.
+  const leafRow = (g: number): number => {
+    const p0 = offsets[g] ?? 0;
+    const p1 = offsets[g + 1] ?? 0;
+    sc.entries += p1 - p0;
+    // Every neighbour a kept leaf (the all-leaves view): nothing to gather, and no row to register.
+    let p = p0;
+    while (p < p1 && cover[neighbors[p] ?? 0] === keptStamp) p++;
+    if (p === p1) return EMPTY_ROW;
     open();
-    if (g < n) {
-      const p1 = offsets[g + 1] ?? 0;
-      sc.entries += p1 - (offsets[g] ?? 0);
-      for (let p = offsets[g] ?? 0; p < p1; p++) {
-        const h = resolve(neighbors[p] ?? 0);
-        if (h === g || h < 0 || (fading && nested(g, h))) continue;
-        add(h, incW ? (incW[p] ?? 0) : uniform, !incOut || incOut[p] === 1);
-      }
-      return close(g);
+    for (; p < p1; p++) {
+      const v = neighbors[p] ?? 0;
+      if (cover[v] === keptStamp) continue;
+      const h = resolve(v);
+      if (h === g || h < 0 || (fading && nested(g, h))) continue;
+      add(h, incW ? (incW[p] ?? 0) : uniform, !incOut || incOut[p] === 1);
     }
+    return close(g);
+  };
+
+  const streamedRow = (stored: SpatialRows, g: number): number => {
+    if (g < n) return leafRow(g);
+    open();
     const r = rowOf(stored, g);
     if (r < 0) return -1;
     const { outOffset, outNode, outFlow, inOffset, inNode, inFlow } = stored;
@@ -430,6 +450,10 @@ export function lazySuperEdges(
   let rebuild = false;
   for (let i = 0; i < kept.length; i++) {
     const g = kept[i] ?? 0;
+    if (g < n && keptStamp >= 0) {
+      keptRow[i] = leafRow(g);
+      continue;
+    }
     let row = rowIndex.find(g, g, sc.rowG, sc.rowG);
     if (row >= 0 && rowValid(row)) sc.hits++;
     else row = rows ? streamedRow(rows, g) : -1;
@@ -581,6 +605,7 @@ export function lazySuperEdges(
   for (let i = 0; i < kept.length; i++) {
     const g = kept[i] ?? 0;
     let row = keptRow[i] ?? -1;
+    if (row === EMPTY_ROW) continue;
     if (row < 0) {
       row = buildRow(g);
       sc.misses++;
