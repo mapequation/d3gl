@@ -847,13 +847,31 @@ frame that lands in it, however fast the pointer moves:
 | `gpu` (on the GPU) | the GPU layout **pins** the held set (skipped by the integrate pass) and reflows the rest on-GPU; the main thread holds them under the cursor | the layout is **unpinned** and re-cools until converged |
 | `auto` | as `gpu` or `worker`, whichever it resolved to | as that backend |
 | `positions` (fixed coords) | the held set simply **translates** (no simulation to reheat) | — |
+| any of the above with `nested` (a [map of modules](#maps-of-networks-a-provided-module-hierarchy)) | only the grabbed node's **module** is re-laid out around it, on the main thread, inside the module's disc (see below) | the node is let go and the module settles for a short tail (at most 90 frames), then stops |
 
 On the `worker`, `gpu` and `auto` backends the layout is kept **alive** (idle) after the initial layout converges, so
 a drag can reheat it instantly without re-seeding — the held nodes are pinned (skipped by the backend's
 integration) while their positions are owned by the main thread, so they never rubber-band behind the cursor.
 
+**On a nested map** (`layout({ nested })`, once it has landed) a drag never reheats the whole graph, so the map
+stays nested and its [module rings](#module-boundaries) stay put:
+
+- **A node** → the other nodes of **its module** are pushed aside and settle around it. The node follows the
+  cursor but stays inside its module's disc, and the disc keeps its centre and size. Nothing outside the
+  module moves.
+- **A collapsed module** → its **sibling modules** move aside inside their parent, each as a whole (its own
+  layout and ring move with it).
+- **A selection** → each module it spans is re-laid out the same way.
+- **The whole map** (its root aggregate) → it translates.
+
+Each frame costs the re-laid-out module's children and links, plus the nodes that actually moved, not a
+pass over the whole graph. The re-solve is the same on every backend: the GPU and worker nested solves are
+not kept alive after they land, since a module's re-layout is far cheaper than waking a whole-map solve.
+While a nested layout is still streaming, a grabbed node is held over its frames and dropped where it is left.
+
 :::note[Drag is opt-in and gated]
 `draggable` is off until you set it (like every `interactive()` option). It only grabs **node** glyphs — a
-drag starting on a *link* still pans — and it reheats on the `force`/`worker`/`gpu`/`auto` layout backends; on
-`positions` (caller-supplied coordinates) a drag translates the grabbed set without running a simulation.
+drag starting on a *link* still pans — and it reheats on the `force`/`worker`/`gpu`/`auto` layout backends (a
+nested map re-lays out only the grabbed node's module); on `positions` (caller-supplied coordinates) a drag
+translates the grabbed set without running a simulation.
 :::

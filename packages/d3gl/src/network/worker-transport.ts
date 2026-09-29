@@ -526,8 +526,8 @@ export interface NestedWorkerOptions {
  * Run the nested module layout (#324) off-thread: the worker streams one frame per finished depth (top
  * modules first), each copied into `graph.positions` — or, per `opts`, posts only the final layout,
  * optionally handed to `opts.onResult` instead (#328). Falls back to a synchronous main-thread solve
- * when Workers are unavailable. The worker exits with the layout — there is no reheat (drag is
- * translate-only on a nested layout, as on caller-supplied positions).
+ * when Workers are unavailable. The worker exits with the layout: a drag on the landed map re-solves
+ * only the grabbed node's module, on the main thread (`nested-drag.ts`).
  */
 export function startNestedWorkerLayout(
   graph: NetworkGraph,
