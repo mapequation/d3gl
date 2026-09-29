@@ -10,12 +10,19 @@ import type { ModuleNode } from "../../modules.js";
 import { ProgramWarmup } from "../programs.js";
 import { GpuForceLayout } from "../gpu-force-layout.js";
 import { GpuNestedLayout } from "../gpu-nested-layout.js";
-import { perfBudget, perfN } from "../../../__tests__/perf-budget.js";
+import { perfN, perfRealGpu } from "../../../__tests__/perf-budget.js";
 import { sweepFrames, zoomSteps } from "../../../__tests__/engine-sweep.js";
 import { fakeParallelCompile } from "./_parallel-compile.js";
 
 export const LOCAL_N = 100_000;
 export const N = perfN(LOCAL_N, { max: 1_000_000 });
+/**
+ * The LOD-off legs' size on a software renderer: SwiftShader draws the whole graph on every animation frame of the
+ * leg (about 7 s a frame at 100k, 2.5 s at 20k), which at 100k made the two files 4 min of the tier's 30 min job.
+ * The signature they pin does not depend on N (O(programs) per poll frame); on a hardware GPU
+ * (`PERF_REAL_GPU=1`) they run at `N` like the LOD-on legs, and were run by hand at 1M.
+ */
+export const N_LOD_OFF = perfRealGpu ? N : Math.min(N, 20_000);
 export const W = 800;
 export const H = 600;
 /** `COMPLETION_STATUS_KHR`. */

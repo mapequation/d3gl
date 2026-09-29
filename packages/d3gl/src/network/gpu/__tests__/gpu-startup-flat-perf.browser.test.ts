@@ -27,20 +27,21 @@ import { describe, it, expect, afterEach, vi } from "vitest";
 import { network } from "../../network.js";
 import { perfBudget } from "../../../__tests__/perf-budget.js";
 import { perfHost } from "../../../__tests__/engine-sweep.js";
-import { H, LOCAL_N, N, W, moduleGraph, startupLeg } from "./_startup-perf.js";
+import { H, LOCAL_N, N, N_LOD_OFF, W, moduleGraph, startupLeg } from "./_startup-perf.js";
 
 afterEach(() => {
   vi.restoreAllMocks();
 });
 
-describe(`GPU flat layout startup at scale (#385): the parallel compile's poll frames, N=${N.toLocaleString()} leaves`, () => {
-  const { graph, modules } = moduleGraph(N);
+describe(`GPU flat layout startup at scale (#385): the parallel compile's poll frames, N=${N.toLocaleString()} leaves (LOD off: ${N_LOD_OFF.toLocaleString()})`, () => {
+  const maps = { on: moduleGraph(N), off: N_LOD_OFF === N ? null : moduleGraph(N_LOD_OFF) };
   // Calibrated at LOCAL_N on SwiftShader: the listing + issue measured 2.6-4.7 ms there (flat and nested).
-  const LIST_ISSUE_MS = perfBudget(40 + 40 * (N / LOCAL_N));
+  const listIssueMs = (n: number): number => perfBudget(40 + 40 * (n / LOCAL_N));
   // The poll asks one query per program per frame (tens of programs): well under a millisecond anywhere.
   const POLL_MS = perfBudget(2);
 
   for (const lod of [false, true]) {
+    const { graph, modules } = (lod ? maps.on : maps.off) ?? maps.on;
     const name = `flat, LOD ${lod ? "on" : "off"}`;
     it(`${name}: each poll frame is O(programs), creates nothing, and a zoom during the compile costs what it did before`, async () => {
       const host = perfHost(W, H);
@@ -49,7 +50,7 @@ describe(`GPU flat layout startup at scale (#385): the parallel compile's poll f
         const r = await startupLeg(net, graph, modules, false, lod);
         const worstPoll = Math.max(...r.perFrame.map((f) => f.pollMs));
         console.log(
-          `  GPU startup [${name}] N=${N}: ${r.programs} programs (listed by ${r.listedBy}) compiled in parallel; per poll frame completion queries ` +
+          `  GPU startup [${name}] N=${graph.nodeCount}: ${r.programs} programs (listed by ${r.listedBy}) compiled in parallel; per poll frame completion queries ` +
             `${r.perFrame.map((f) => f.completion).join(",")}, poll ms max ${worstPoll.toFixed(2)}; zoom worst frame ${r.sweepBefore.toFixed(1)} ms ` +
             `before, ${r.sweepDuring.toFixed(1)} ms during the compile; list + issue ${r.listAndIssueMs.toFixed(1)} ms`,
         );
@@ -62,7 +63,7 @@ describe(`GPU flat layout startup at scale (#385): the parallel compile's poll f
         }
         expect(worstPoll).toBeLessThan(POLL_MS);
         expect(r.sweepDuring).toBeLessThan(1.5 * r.sweepBefore + perfBudget(2));
-        expect(r.listAndIssueMs).toBeLessThan(LIST_ISSUE_MS);
+        expect(r.listAndIssueMs).toBeLessThan(listIssueMs(graph.nodeCount));
       } finally {
         net.destroy();
         host.remove();
