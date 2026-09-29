@@ -5,10 +5,11 @@ import type { ModuleLink, ModuleNode } from "../modules.js";
 
 /**
  * Node-drag on a nested module map, through the real gesture (pointer events on the host, the drag's own
- * animation frames): the grabbed leaf's module is re-solved around it — its siblings move, every leaf
- * outside the module keeps its exact position — and, for a collapsed module aggregate, its sibling
- * modules move aside while each keeps its inside layout. Once released the module cools and stops. The
- * same on every layout backend that lays a nested map out (the re-solve runs on the main thread).
+ * animation frames): the nested layout reheats around the dragged item at every level, with only the
+ * item pinned — its siblings move, its module's disc travels with it, and the modules above respond; a
+ * dragged collapsed module's siblings move aside, each keeping its inside layout. Once released the map
+ * re-cools and stops, as a flat drag does. The same on every layout backend that lays a nested map out
+ * (the re-solve runs on the main thread).
  */
 
 const TOP = 4;
@@ -85,7 +86,7 @@ describe("node-drag on a nested map", () => {
     ["gpu", true],
   ] as const;
   for (const [backend, lod] of leafCases) {
-    it(`${backend}, LOD ${lod ? "on" : "off"}: re-solves the grabbed leaf's module around it; dragged out, the module travels and its neighbours make room`, async () => {
+    it(`${backend}, LOD ${lod ? "on" : "off"}: every level reflows around a dragged leaf; dragged out, its module travels with it`, async () => {
       const { net, h, g } = await laidOut(backend, lod);
       const leaf = 2 * LEAVES + 3; // top module 1, bottom module 3
       const lo = leaf - (leaf % LEAVES);
@@ -114,11 +115,6 @@ describe("node-drag on a nested map", () => {
       let siblingsMoved = 0;
       for (let i = lo; i < lo + LEAVES; i++) if (i !== leaf && (g.positions[2 * i] !== before[2 * i] || g.positions[2 * i + 1] !== before[2 * i + 1])) siblingsMoved++;
       expect(siblingsMoved, "the module did not re-solve around the held leaf").toBeGreaterThan(0);
-      for (let i = 0; i < N; i++) {
-        if (i >= lo && i < lo + LEAVES) continue;
-        expect(g.positions[2 * i], `leaf ${i} outside the module moved`).toBe(before[2 * i]);
-        expect(g.positions[2 * i + 1]).toBe(before[2 * i + 1]);
-      }
       // Out of the module's disc, well past its edge (the module is ~15 world units across): the leaf
       // still follows the cursor exactly, its module comes along, and the modules around make room.
       const out = -25;

@@ -5,41 +5,37 @@
  * thread, the grabbed item's module and every module above it, up to the root — and only the grabbed item
  * is pinned (under the cursor); everything else responds, and the map stays nested:
  *
- * - **The held item follows the cursor freely.** Its siblings are pushed aside and settle around it inside
- *   their module's disc (gravity, their springs to it, collision).
- * - **A disc travels with its members.** When the held item reaches its module's disc edge, the disc's
- *   centre moves with it (its radius stays as laid out), and the other children, kept inside, come along.
- *   One level up, that moving disc pushes its sibling modules aside, and carries its own parent's disc
- *   when it reaches that edge — and so on to the root. The rings (`lod({ moduleBoundary })`, #329) are the
- *   discs, so they move with them; nothing is stretched or fixed in place.
- * - **The levels above only react.** A module above the held item's resolves collisions and containment
- *   only, and only while the disc below pushes: nothing there drifts from a reheat on its own.
- * - **A sibling moves as a whole.** A module that is pushed translates with everything inside it — its
- *   own layout and its ring are unchanged.
+ * - **The held item follows the cursor freely.** Its siblings respond around it inside their module's
+ *   disc, under the nested layout's own forces at that level.
+ * - **Every level reheats.** Each module above the held item runs the same forces over its children —
+ *   gravity, the springs over their links (module links and aggregated leaf links, as the layout placed
+ *   the level) and collision — so sibling modules follow a moving module by their real flows, all the way
+ *   up to the root. Some drift of the modules on a grab is expected, as in a flat reheat.
+ * - **Discs follow their members.** Each disc is centred on its children's centroid, as the layout centred
+ *   it, and moved on just enough to hold the dragged item past its edge; its radius stays as laid out. The
+ *   rings (`lod({ moduleBoundary })`, #329) are the discs, so they move with them; nothing is stretched.
+ * - **A sibling module moves as a whole**, with everything inside it — its own layout and ring unchanged.
  * - **A selection** pins its held items (the largest subtrees whose leaves are all held) and re-solves
  *   every module above any of them. A grab of the whole map (the root aggregate): the caller translates.
  *
- * The solve is the module solve's COMPACT phase (gravity, springs over the same sibling links, collision),
- * held at {@link NESTED_DRAG_ALPHA} while the pointer is down and cooled to `NESTED.ALPHA_MIN` over at
- * most {@link NESTED_DRAG_COOL_TICKS} ticks after release (the item is let go, as on the flat layouts). It
- * runs on the main thread for every layout backend and keeps nothing resident after the drag.
+ * The physics is the nested layout's own, at every level: its compact phase (gravity, the springs over the
+ * sibling links it placed the level by — module links and aggregated leaf links — and collision). The heat
+ * is the flat drag's: the same {@link Cooling} schedule, held at `DRAG_HEAT` while the pointer is down and
+ * cooled from it after release over the caller's re-cool budget, stopping once converged (the item is let
+ * go, as on the flat layouts). A tick's alpha is that heat, as a cold nested solve starts at 1. It runs on
+ * the main thread for every layout backend and keeps nothing resident after the drag.
  *
  * Cost, per tick: O(k + links) over the re-solved modules' k children (collision on a grid above
- * `EXACT_MAX` children; the modules above the held item's only while pushed), plus O(nodes under the
- * children that moved this tick) to translate them. A grab walks the re-solved modules' children once
+ * `EXACT_MAX` children), plus O(nodes under the children that moved this tick) to translate them — with
+ * every level reheated, that is the whole map, as a flat drag's reheat moves it. A grab walks the re-solved modules' children once
  * (the root's are the whole map: O(tree size), click-frequency); the leaf counts are built once per layout.
  */
 import type { BoundaryDiscs } from "./lod.js";
+import { Cooling, DRAG_HEAT, MIN_SETTLE_TICKS } from "./force.js";
 import { NESTED, Scratch, collide, moduleLinks, type NestedLayoutTopology } from "./nested-layout.js";
 
-/** Alpha a re-solved module is held at while the pointer is down. */
-export const NESTED_DRAG_ALPHA = 0.05;
-/** Most ticks a re-solved module cools for after release (it stops earlier once it is still). */
-export const NESTED_DRAG_COOL_TICKS = 90;
-/** Ticks of the cool-down before a still module may stop early. */
-const MIN_COOL_TICKS = 10;
-/** A module is still once no child moved more than this share of its parent's radius in a tick (a
- *  0.01 px step for a module drawn 100 px wide). */
+/** The map is converged once no child moved more than this share of its parent's radius in a tick (a
+ *  0.01 px step for a module drawn 100 px wide), after `MIN_SETTLE_TICKS` of the schedule. */
 const STILL = 1e-4;
 
 /**
@@ -190,14 +186,6 @@ class ModuleReheat {
   indexUp = -1;
   /** Each DRIVEN child's own re-solve, by child index. */
   readonly down: (ModuleReheat | null)[];
-  /**
-   * Whether this module holds a held child: its free children then feel gravity and their springs, and
-   * follow the held one. A module above (only driven children) resolves collisions and containment only,
-   * so its children move when the moved disc pushes them, and never drift from a reheat on their own.
-   */
-  readonly forces: boolean;
-  /** Whether the last tick moved anything here: a module without forces steps only while it is pushed. */
-  private active = false;
 
   constructor(
     private readonly cache: NestedDragCache,
@@ -268,7 +256,6 @@ class ModuleReheat {
       }
       this.mode[i] = held.has(c) ? HELD : affected.has(c) ? DRIVEN : FREE;
     }
-    this.forces = this.mode.includes(HELD);
     const o = g - leafCount;
     const Cx = sx / counts[g]! + discs.dx[o]!;
     const Cy = sy / counts[g]! + discs.dy[o]!;
@@ -327,6 +314,21 @@ class ModuleReheat {
     for (let i = 0; i < this.k; i++) if (this.mode[i] === HELD) this.pinned[i] = 0;
   }
 
+  /** The children's centroid weighted by disc area — where the layout centred the disc on them. O(k). */
+  private centroid(): [number, number] {
+    const { x, y, rad } = this.s;
+    let sx = 0;
+    let sy = 0;
+    let sw = 0;
+    for (let i = 0; i < this.k; i++) {
+      const w = rad[i]! * rad[i]!;
+      sx += x[i]! * w;
+      sy += y[i]! * w;
+      sw += w;
+    }
+    return sw > 0 ? [sx / sw, sy / sw] : [this.ox, this.oy];
+  }
+
   /** A pinned child at local (x, y) past the disc's edge carries the disc's centre along until it is inside. */
   private carry(x: number, y: number, r: number): void {
     const ex = x - this.ox;
@@ -342,16 +344,17 @@ class ModuleReheat {
 
   /**
    * One tick, after every re-solve below it has stepped: the held children to the cursor (a world delta
-   * `dx`, `dy` since the grab, anywhere) and each driven child to where its own disc went — a pinned child
-   * past the disc's edge carries the disc along — then gravity toward the centre, the sibling springs (a
-   * pinned end takes none of the correction), the velocity step, collision against every disc and
-   * containment in the disc for the free children.
+   * `dx`, `dy` since the grab, anywhere) and each driven child to where its own disc went; then the nested
+   * layout's own compact forces on every other child — gravity toward the children's centroid, the springs over
+   * its sibling links (the module links and aggregated leaf links it placed this level by; a pinned end
+   * takes none of the correction), the velocity step and collision. The disc is then centred on its
+   * children's centroid (as the layout centred it), moved on just enough to hold a pinned child past its
+   * edge, and the free children are kept inside it.
    */
   step(alpha: number, dx: number, dy: number, holding: boolean): void {
     const { k, s, pinned, mode } = this;
     const { x, y, vx, vy, rad } = s;
     const { PAD, GRAVITY, DECAY } = NESTED;
-    let pushed = false;
     for (let i = 0; i < k; i++) {
       const m = mode[i];
       if (m === HELD && holding) {
@@ -364,17 +367,13 @@ class ModuleReheat {
       } else continue;
       vx[i] = 0;
       vy[i] = 0;
-      if (x[i] !== this.px[i] || y[i] !== this.py[i]) pushed = true;
-      this.carry(x[i]!, y[i]!, rad[i]!);
     }
-    // Above the held node's module, nothing moves until the disc below pushes: no drift from a reheat.
-    if (!this.forces && !pushed && !this.active) return;
-    const { ox, oy } = this;
-    if (!this.forces) alpha = 0; // collisions and containment only (see `forces`)
+    // Gravity toward the children's own centroid: it holds the module together without dragging it anywhere.
+    const [gx, gy] = this.centroid();
     for (let i = 0; i < k; i++) {
       if (pinned[i]) continue;
-      vx[i] = vx[i]! - (x[i]! - ox) * GRAVITY * alpha;
-      vy[i] = vy[i]! - (y[i]! - oy) * GRAVITY * alpha;
+      vx[i] = vx[i]! - (x[i]! - gx) * GRAVITY * alpha;
+      vy[i] = vy[i]! - (y[i]! - gy) * GRAVITY * alpha;
     }
     const { la, lb, lw } = this;
     for (let l = 0; l < la.length; l++) {
@@ -406,11 +405,18 @@ class ModuleReheat {
       y[i] = y[i]! + vy[i]!;
     }
     collide(s, k, PAD, pinned);
+    // The disc follows its members: centred on their centroid, as the layout centred it, and moved on from
+    // there just enough to hold a pinned child that is past its edge.
+    [this.ox, this.oy] = this.centroid();
+    // A held child still carries the disc once released, so nothing snaps: gravity draws it back in.
+    for (let i = 0; i < k; i++) if (pinned[i] || mode[i] === HELD) this.carry(x[i]!, y[i]!, rad[i]!);
+    const cox = this.ox;
+    const coy = this.oy;
     for (let i = 0; i < k; i++) {
-      if (pinned[i]) continue;
-      const [cx, cy] = inside(x[i]! - ox, y[i]! - oy, rad[i]!);
-      x[i] = ox + cx;
-      y[i] = oy + cy;
+      if (pinned[i] || mode[i] === HELD) continue;
+      const [cx, cy] = inside(x[i]! - cox, y[i]! - coy, rad[i]!);
+      x[i] = cox + cx;
+      y[i] = coy + cy;
     }
   }
 
@@ -460,7 +466,6 @@ class ModuleReheat {
       shiftX += this.cnt[i]! * ux;
       shiftY += this.cnt[i]! * uy;
     }
-    this.active = most > 0;
     const mx = (this.ox - this.wox) * R;
     const my = (this.oy - this.woy) * R;
     this.wox = this.ox;
@@ -492,24 +497,27 @@ function inside(x: number, y: number, r: number): [number, number] {
 
 /**
  * One drag's re-solve (see the file header): {@link start} it at the grab, {@link setDelta} on every
- * pointer move, {@link tick} once per animation frame, {@link release} on pointer-up; `tick` returns
- * false once the map has cooled after release.
+ * pointer move, {@link tick} once per animation frame, {@link release} on pointer-up — the same protocol as
+ * the flat drag's {@link ForceLayout} (`tick`, `converged`), so the engine runs both in one drag loop.
  */
 export class NestedDrag {
   readonly stats: NestedDragStats = { ticks: 0, leafWrites: 0, nodeWrites: 0 };
   private dx = 0;
   private dy = 0;
   private holding = true;
-  private cool = 0;
-  private alpha = NESTED_DRAG_ALPHA;
-  private readonly coolDecay = 1 - Math.pow(NESTED.ALPHA_MIN / NESTED_DRAG_ALPHA, 1 / NESTED_DRAG_COOL_TICKS);
+  /** The flat drag's heat schedule: held at `DRAG_HEAT` while dragging, cooled from it after release. */
+  private readonly cooling = new Cooling();
+  private settleTicks = 0;
+  private still = false;
   private readonly moved: MovedLeaves = { buf: new Uint32Array(0), n: 0 };
 
   private constructor(
     private readonly discs: BoundaryDiscs,
     /** The re-solved modules, deepest first (each after every re-solve below it). */
     readonly modules: readonly ModuleReheat[],
-  ) {}
+  ) {
+    this.cooling.hold(DRAG_HEAT);
+  }
 
   /**
    * Start a drag of `heldLeaves` (leaf ids) on the nested map `discs` describes, at `positions`. Null
@@ -569,11 +577,18 @@ export class NestedDrag {
     this.dy = dy;
   }
 
-  /** The pointer is up: let the held nodes go and cool. */
-  release(): void {
+  /** The pointer is up: let the held nodes go and cool from the drag heat over `ticks` (the flat drag's). */
+  release(ticks: number): void {
     if (!this.holding) return;
     this.holding = false;
     for (const m of this.modules) m.release();
+    this.cooling.cool(ticks, DRAG_HEAT);
+    this.settleTicks = 0;
+  }
+
+  /** Whether the map has come to rest after release: nothing moved more than {@link STILL} in a tick. */
+  get converged(): boolean {
+    return !this.holding && this.still;
   }
 
   /** Whether the pointer is still down. */
@@ -582,23 +597,18 @@ export class NestedDrag {
   }
 
   /**
-   * One tick of every re-solved module, deepest first, written into `positions` (and `geometry`, the
-   * module tree's LOD centres, when it is drawn). Returns false once cooled after release.
+   * One tick of every re-solved module, deepest first, at the schedule's heat, written into `positions`
+   * (and `geometry`, the module tree's LOD centres, when it is drawn).
    */
-  tick(positions: Float32Array, geometry: NestedDragGeometry | null = null): boolean {
-    if (!this.holding && this.cool >= NESTED_DRAG_COOL_TICKS) return false;
+  tick(positions: Float32Array, geometry: NestedDragGeometry | null = null): void {
     this.moved.n = 0;
-    for (const m of this.modules) m.step(this.alpha, this.dx, this.dy, this.holding);
+    const alpha = this.cooling.heat;
+    for (const m of this.modules) m.step(alpha, this.dx, this.dy, this.holding);
     let most = 0;
     for (const m of this.modules) most = Math.max(most, m.apply(positions, geometry, this.discs, this.moved, this.stats));
     this.stats.ticks++;
-    if (this.holding) return true;
-    this.cool++;
-    this.alpha -= this.alpha * this.coolDecay;
-    if (this.cool >= NESTED_DRAG_COOL_TICKS || (this.cool >= MIN_COOL_TICKS && most < STILL)) {
-      this.cool = NESTED_DRAG_COOL_TICKS;
-      return false;
-    }
-    return true;
+    this.cooling.next();
+    this.settleTicks++;
+    this.still = this.settleTicks >= MIN_SETTLE_TICKS && most < STILL;
   }
 }
