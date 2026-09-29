@@ -1,5 +1,5 @@
 import { BaseEngine, type BaseEngineOptions, type HoverHit, type InteractiveLayerOptions, type LaneInteractive, type NodeDragSession } from "../map/base-engine.js";
-import { networkLayers, networkLayersFromCache, noLodStyleCache, drawsLinks, frontierCircles, frontierHalos, boundaryRings, traceBoundaryRings, superEdges, makeSuperEdgesScratch, emitNodes, emitLinks, emitArrows, emitHalfLinks, traceFrontierGlyphs, traceFrontierHalos, traceSuperHalfArrows, traceSuperLines, traceSuperArrows, physicalPieInstances, tracePieWedges, rgbaCss, pickNodes, regionNodes, resolveNodeRadii, resolveNodeRadiusAggregate, resolveImportance, resolveFlowBorder, resolveNodeColors, resolveLinkWidthOf, resolveLinkColorOf, resolveLinkStrokeOf, flowBorderInnerRadii, type ResolvedNetworkStyle, type SuperEdgeStyleResolved, type SuperEdgesData, type ModuleBoundaryResolved, type AggregateOutlineResolved, type NoLodStyleCache, type NodeRadiusSpec, type ImportanceSpec, type FlowBorderSpec, type ConstBorder, type LinkWidthSpec, type LinkColorSpec, type LinkStyle, type RGBAValue } from "./glyphs.js";
+import { networkLayers, networkLayersFromCache, noLodStyleCache, drawsLinks, frontierCircles, frontierHalos, boundaryRings, traceBoundaryRings, superEdges, makeSuperEdgesScratch, emitNodes, emitLinks, emitArrows, emitHalfLinks, traceFrontierGlyphs, traceFrontierHalos, traceSuperHalfArrows, traceSuperLines, traceSuperArrows, physicalPieInstances, tracePieWedges, rgbaCss, pickNodes, regionNodes, resolveNodeRadii, resolveNodeRadiusAggregate, resolveImportance, resolveFlowBorder, resolveNodeFill, moduleBorderValues, applyModuleBorder, treeBorderColors, resolveLinkWidthOf, resolveLinkColorOf, resolveLinkStrokeOf, flowBorderInnerRadii, type ResolvedNetworkStyle, type SuperEdgeStyleResolved, type SuperEdgesData, type ModuleBoundaryResolved, type AggregateOutlineResolved, type NoLodStyleCache, type NodeRadiusSpec, type ImportanceSpec, type FlowBorderSpec, type NodeFillSpec, type ConstBorder, type LinkWidthSpec, type LinkColorSpec, type LinkStyle, type RGBAValue } from "./glyphs.js";
 import { rgb } from "d3-color";
 import { DRAG_HEAT, ForceLayout, seedPositions, type ForceParams } from "./force.js";
 import { multilevelLayout, type CoarsenOptions } from "./coarsen.js";
@@ -178,12 +178,14 @@ export interface NetworkStyle {
    */
   importance?: ImportanceSpec;
   /**
-   * Node fill colour. A single CSS colour (default a medium blue), or a per-node
+   * Node fill colour. A single CSS colour (default a medium blue), a per-node
    * `(index, graph) => cssColour` accessor — e.g. a categorical palette keyed by module, so a
-   * planted hierarchy reads as colour (#104 rework). Per-node colours propagate to LOD aggregates
-   * (a collapsed module keeps its colour).
+   * planted hierarchy reads as colour (#104 rework; a collapsed module keeps its members' mean colour) —
+   * or `{ by, scale }` to colour by a {@link NodeMetric} through a colour scale, like {@link nodeRadius}:
+   * an LOD aggregate is then filled with `scale` of its **summed** metric, so a module reads as its total
+   * flow (#445). Resolved once per call — no per-frame cost. @see {@link NodeFillSpec}
    */
-  nodeFill?: string | ((index: number, graph: NetworkGraph) => string);
+  nodeFill?: NodeFillSpec;
   /**
    * Constant border ring (#104 rework): a fixed **pixel** outline on every node/module (e.g.
    * `{ width: 1, color: "#fff" }`). Independent of {@link flowBorder} (which encodes flow);
@@ -238,7 +240,8 @@ export interface NetworkStyle {
   /**
    * Flow-border ring (N6 / #104): draw each node/module as a disc with an outer ring whose width
    * encodes a per-node **enter/exit flow** (`flow`: an app `Float32Array` or a built-in metric) via
-   * `scale`. Module aggregates sum their members' flow over the same LOD cut. Fill/size still come
+   * `scale`. LOD aggregates sum their members' flow, unless a module of the engine's hierarchy has its
+   * own value from `moduleFlow(path)` (#445). Fill/size still come
    * from `nodeFill`/`nodeRadius` (size by total flow with `nodeRadius: { by: "flow", scale }`). Omit
    * for plain filled nodes. @see {@link FlowBorderSpec}
    */
@@ -921,6 +924,8 @@ export class Network extends BaseEngine {
    *  reused on a position-only layout frame so the colour/width scale accessors run O(edges) ONCE per
    *  style version, not per frame. Invalidated implicitly when `resolvedStyleCached` returns a fresh object. */
   private noLodStyleCacheFor: { style: ResolvedNetworkStyle; graph: NetworkGraph } | null = null;
+  /** {@link applyLODBorderStyle}'s memo: the flow border's module values + ring colours for one (style, tree). */
+  private lodBorderStyle: { style: ResolvedNetworkStyle; tree: LODTree; moduleValues: Float32Array | null; ringColors: Uint8Array | null } | null = null;
   private noLodStyleCacheVal: NoLodStyleCache | null = null;
   /** No-LOD per-instance `selected` flag columns cache (#240), keyed like the style cache PLUS the
    *  selection version: reference-stable across position-only frames (so the renderer's identity check
@@ -1074,6 +1079,7 @@ export class Network extends BaseEngine {
     // New topology + position buffer: drop the retained LOD tree, the module tree and resolved-style cache.
     this.moduleTreeCache = null;
     this.nestedDiscs = null;
+    this.lodBorderStyle = null; // the previous graph's tree and its ring colours
     this.lodTree = null;
     this.lodWorkerTree = null;
     this.lodWorkerSource = null;
@@ -3430,6 +3436,7 @@ export class Network extends BaseEngine {
       aggregateFill: opts.aggregateFill ?? style.nodeFill,
       maxAggregateRadius: opts.maxAggregateRadius,
       border: style.flowBorder,
+      borderColors: this.lodRingColors(tree, style),
       constBorder: style.constBorder,
       useTreeColor: !!style.nodeColors, // categorical module colours, propagated to aggregates
       fadeAlpha: this.fadeAlpha ?? undefined,
@@ -3478,6 +3485,8 @@ export class Network extends BaseEngine {
     // When sizing by an additive metric, aggregates size by the leaf scale on their summed value
     // (flow-sized modules); else null ⇒ the area-additive √Σr² fallback.
     const radiusAggregate = resolved.nodeRadiusAggregate ?? undefined;
+    // `nodeFill: { by, scale }` (#445): aggregates fill by the scale on their summed metric, likewise.
+    const fillAggregate = resolved.nodeFillAggregate;
     // Declutter importance (per-leaf, summed up the tree): defaults to the size metric — see resolveImportance.
     const leafWeight = resolved.importance;
     // Tree choice — the priority chain (epic #98): a module hierarchy (an explicit `lod({ modules })`,
@@ -3506,7 +3515,8 @@ export class Network extends BaseEngine {
           header.styleVersion = version;
         }
       } else {
-        computeLODStyle(this.lodWorkerTree, nodeRadii, leafWeight, leafBorder, leafColors, radiusAggregate);
+        computeLODStyle(this.lodWorkerTree, nodeRadii, leafWeight, leafBorder, leafColors, radiusAggregate, fillAggregate);
+        this.applyLODBorderStyle(this.lodWorkerTree, resolved);
       }
       this.lodTree = this.lodWorkerTree;
       this.lodModules = false;
@@ -3564,8 +3574,35 @@ export class Network extends BaseEngine {
       this.lodSpatial = false;
       this.lodModules = false;
     }
-    computeLODGeometry(this.lodTree, graph, nodeRadii, leafWeight, leafBorder, leafColors, radiusAggregate, this.lodDiscs(this.lodTree), this.lodBounds);
+    computeLODGeometry(this.lodTree, graph, nodeRadii, leafWeight, leafBorder, leafColors, radiusAggregate, this.lodDiscs(this.lodTree), this.lodBounds, fillAggregate);
+    this.applyLODBorderStyle(this.lodTree, resolved);
     this.lodHasGeometry = true;
+  }
+
+  /**
+   * The flow border's per-tree style (#445), after a style pass on a module or structural tree: a module
+   * tree's `moduleFlow` values replace the members' sums, and a colour accessor's per-tree-node ring
+   * colours are built from the values drawn. Both are resolved once per (style, tree) and memoised, so
+   * the O(modules) accessor calls and the O(tree) colour table are paid on a style change or a new tree,
+   * never per frame; a repeated style pass only re-applies the memoised module values (O(modules)). A
+   * spatial tree skips this (a layout worker may rebuild it every frame): it sums, and its aggregates take
+   * the representative ring colour.
+   */
+  private applyLODBorderStyle(tree: LODTree, resolved: ResolvedNetworkStyle): void {
+    const memo = this.lodBorderStyle;
+    if (memo && memo.style === resolved && memo.tree === tree) {
+      if (memo.moduleValues) applyModuleBorder(tree, memo.moduleValues);
+      return;
+    }
+    const moduleValues = moduleBorderValues(tree, resolved.flowBorder);
+    if (moduleValues) applyModuleBorder(tree, moduleValues);
+    this.lodBorderStyle = { style: resolved, tree, moduleValues, ringColors: treeBorderColors(tree, resolved.flowBorder) };
+  }
+
+  /** The per-tree-node ring colours of {@link applyLODBorderStyle} for `tree` under `style`, if any. */
+  private lodRingColors(tree: LODTree, style: ResolvedNetworkStyle): Uint8Array | null {
+    const memo = this.lodBorderStyle;
+    return memo && memo.style === style && memo.tree === tree ? memo.ringColors : null;
   }
 
   /**
@@ -3739,7 +3776,13 @@ export class Network extends BaseEngine {
     this.registerLayer({ name: "node-halos", data: [], ids: [], sizeMode: style.sizeMode, build: () => {} });
     // Per-node fill: a single colour, or the per-node accessor (categorical module colours, #104 rework).
     const fillSpec = this.styleOpts.nodeFill;
-    const fillOf = typeof fillSpec === "function" ? (i: number) => fillSpec(i, graph) : () => style.nodeFill;
+    const nodeColors = style.nodeColors;
+    const fillOf =
+      typeof fillSpec === "function"
+        ? (i: number) => fillSpec(i, graph)
+        : nodeColors
+          ? (i: number) => rgbaCss(nodeColors, i) // `{ by, scale }`: the colours resolved once per style()
+          : () => style.nodeFill;
 
     // Border (#104 N6/rework, #269): the instanced lane draws the ring in-shader; the Scene path draws
     // the SAME ring encoding — one circle per node, filled with the node colour and stroked
@@ -3914,6 +3957,7 @@ export class Network extends BaseEngine {
           aggregateFill: opts.aggregateFill ?? style.nodeFill,
           maxAggregateRadius: opts.maxAggregateRadius,
           border: style.flowBorder,
+          borderColors: this.lodRingColors(tree, style),
           constBorder: style.constBorder,
           useTreeColor: !!style.nodeColors, // categorical module colours, propagated to aggregates
           fadeAlpha: this.fadeAlpha ?? undefined,
@@ -3954,10 +3998,8 @@ export class Network extends BaseEngine {
       colorOf: resolveLinkColorOf(lsSpec),
       stroke: typeof lsSpec === "string" ? lsSpec : linkStrokeOf(1),
     });
-    // nodeFill: a single colour, or a per-node accessor → packed RGBA (categorical module colours).
-    const fillSpec = this.styleOpts.nodeFill;
-    const nodeFill = typeof fillSpec === "function" ? DEFAULT_NODE_FILL : (fillSpec ?? DEFAULT_NODE_FILL);
-    const nodeColors = typeof fillSpec === "function" ? resolveNodeColors(graph, fillSpec) : undefined;
+    // nodeFill: a single colour, a per-node accessor, or { by, scale } → packed RGBA (+ how aggregates fill).
+    const { nodeFill, nodeColors, fillAggregate: nodeFillAggregate } = resolveNodeFill(graph, this.styleOpts.nodeFill, DEFAULT_NODE_FILL);
     // Constant border (px). flowBorder wins if both are set.
     const nb = this.styleOpts.nodeBorder;
     const constBorder: ConstBorder | null =
@@ -3969,6 +4011,7 @@ export class Network extends BaseEngine {
       importance: resolveImportance(graph, this.styleOpts.importance, nodeRadiusSpec),
       nodeFill,
       nodeColors,
+      nodeFillAggregate,
       linkWidth,
       linkWidthOf,
       linkStroke,

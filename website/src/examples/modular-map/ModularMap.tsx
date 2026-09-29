@@ -27,6 +27,8 @@ export default function ModularMap() {
         { type: "segmented", key: "layout", label: "Layout", options: ["Force", "Nested"], value: "Force" },
         { type: "segmented", key: "lod", label: "LOD", options: ["Off", "Standard", "Modules"], value: "Modules" },
         { type: "segmented", key: "sizing", label: "Sizing", options: ["Screen", "World"] },
+        // Fill by module (categorical) or by flow (`nodeFill: { by: "flow", scale }`, #445).
+        { type: "segmented", key: "fill", label: "Fill", options: ["Module", "Flow"], value: "Module" },
         { type: "segmented", key: "declutter", label: "Declutter", options: ["On", "Off"] },
         // 0 = "Auto": no expandPx at all, i.e. the library's tree-adaptive default (#191).
         { type: "range", key: "expand", label: "Expand", min: 0, max: 500, step: 8, value: 0, display: ["Auto"] },

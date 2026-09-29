@@ -11,6 +11,9 @@ import { generateLFR } from "../network/data.js";
  *   super-edges accumulate flow automatically).
  * - `nodeFlow` — per-node visit rate → node radius (and a flow read-out).
  * - `enterExit` — per-node flow crossing its module boundary → the flow-border ring.
+ * - `moduleEnterExit` — each module's own flow across its boundary, by Infomap path (`"1:100"`) → a
+ *   collapsed module's ring. Smaller than its members' sum for a super-module: flow between its own
+ *   submodules stays inside it.
  * - `community` — the planted partition → the (ragged) module hierarchy (see {@link raggedModulePrefix}).
  */
 export interface ModularMapData {
@@ -21,6 +24,8 @@ export interface ModularMapData {
   linkFlow: Float32Array;
   nodeFlow: Float32Array;
   enterExit: Float32Array;
+  /** Module enter + exit flow keyed by the module's Infomap path joined with ":" (e.g. `"1:100"`). */
+  moduleEnterExit: Map<string, number>;
   community: Int32Array;
   /** Infomap-shape module records for `data(graph, { modules })`: a **ragged** hierarchy — see {@link raggedModulePrefix}. */
   modulePaths: { id: number; path: number[] }[];
@@ -115,7 +120,40 @@ export function makeModularMap(nodeCount: number): ModularMapData {
   });
 
   const communities = new Set(Array.from(community)).size;
-  return { nodeCount: n, communities, source, target, linkFlow, nodeFlow, enterExit, community, modulePaths };
+  const moduleEnterExit = moduleBoundaryFlow(source, target, linkFlow, community);
+  return { nodeCount: n, communities, source, target, linkFlow, nodeFlow, enterExit, moduleEnterExit, community, modulePaths };
+}
+
+/**
+ * Each module's enter + exit flow (what Infomap reports per module): the flow of every link with exactly
+ * one endpoint inside it. A link between two communities leaves every module on the source's path below
+ * the modules the two paths share, and enters every such module on the target's path.
+ */
+function moduleBoundaryFlow(source: Uint32Array, target: Uint32Array, linkFlow: Float32Array, community: Int32Array): Map<string, number> {
+  const keysOf = new Map<number, string[]>(); // community → its module path keys, top down
+  const keys = (c: number): string[] => {
+    let k = keysOf.get(c);
+    if (!k) {
+      const prefix = raggedModulePrefix(c);
+      k = prefix.map((_, d) => prefix.slice(0, d + 1).join(":"));
+      keysOf.set(c, k);
+    }
+    return k;
+  };
+  const flow = new Map<string, number>();
+  const add = (key: string, f: number) => flow.set(key, (flow.get(key) ?? 0) + f);
+  for (let e = 0; e < source.length; e++) {
+    const ca = community[source[e]!]!;
+    const cb = community[target[e]!]!;
+    if (ca === cb) continue;
+    const ka = keys(ca);
+    const kb = keys(cb);
+    let shared = 0;
+    while (shared < ka.length && shared < kb.length && ka[shared] === kb[shared]) shared++;
+    for (let d = shared; d < ka.length; d++) add(ka[d]!, linkFlow[e]!); // exit
+    for (let d = shared; d < kb.length; d++) add(kb[d]!, linkFlow[e]!); // enter
+  }
+  return flow;
 }
 
 /**

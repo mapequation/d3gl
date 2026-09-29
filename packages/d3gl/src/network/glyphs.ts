@@ -2,7 +2,7 @@ import { rgb } from "d3-color";
 import type { InstancedCirclesData, InstancedPieData, InstancedLinesData, InstancedArrowsData, InstancedHalfArrowsData, InstancedLayer, GroupBuilder } from "../core/index.js";
 import type { NetworkGraph } from "./graph.js";
 import type { PhysicalPieWedges } from "./pie.js";
-import { boundaryCircle, type CutBoundaries, type LODTree, type LODTransform } from "./lod.js";
+import { boundaryCircle, type CutBoundaries, type FillAggregate, type LODTree, type LODTransform } from "./lod.js";
 import type { ScreenRect } from "../core/instanced-lane.js";
 import { halfLinkGeometry, traceHalfLink, scaleHalfLink, bezierControl, bentEndTangent, straightUnit, chordBend } from "../core/half-link.js";
 import { PairIndex } from "./pair-index.js";
@@ -369,8 +369,9 @@ function fillColors(count: number, css: string): Uint8Array {
 
 /**
  * Flow-border style (#104 N6): a ring around each node/module whose width encodes a per-node flow
- * (e.g. Infomap enter/exit flow). The app supplies the flow; d3gl renders the ring. For module
- * aggregates the metric is summed over members (see {@link computeLODStyle}).
+ * (e.g. Infomap enter/exit flow). The app supplies the flow; d3gl renders the ring. For LOD aggregates
+ * the metric is summed over members (see {@link computeLODStyle}), unless a module has its own value
+ * ({@link FlowBorderSpec.moduleFlow}).
  */
 export interface FlowBorderSpec {
   /**
@@ -383,10 +384,22 @@ export interface FlowBorderSpec {
   /**
    * Ring colour: a single CSS colour, or a per-node `(value, index, graph) => cssColour` accessor so
    * the ring colour can also encode the per-node metric (a bare d3 colour scale fits — `value` is the
-   * node's flow metric). **Omitted (default): a darker shade of each glyph's own fill** — so a module
-   * aggregate's ring is a darker shade of *its* module colour, not one shared colour.
+   * node's flow metric). An LOD aggregate of a module or structural tree gets the value its ring draws
+   * (its module value, else its members' sum) with `index` `-1`; a spatial-tree cell takes the
+   * highest-flow node's colour. **Omitted (default): a darker shade of each glyph's own fill** — so a
+   * module aggregate's ring is a darker shade of *its* module colour, not one shared colour.
    */
   color?: string | ((value: number, index: number, graph: NetworkGraph) => string);
+  /**
+   * A module's own enter/exit flow, by its Infomap `path` (e.g. `[2, 1]` = sub-module 1 of top module 2;
+   * `[]` = the root). Read for the aggregates of a **module hierarchy** the engine holds
+   * (`data(graph, { modules })`, drawn by the default `lod()` source `"modules"`): a module with a value
+   * draws its ring from it instead of its members' sum — which overstates a higher-level module, since
+   * it also counts the flow between its own submodules. Return `undefined` to keep the sum for a module.
+   * Aggregates that are not modules (the `"structure"` / `"spatial"` sources) always sum. Called once
+   * per module when the style is resolved against the tree, never per frame.
+   */
+  moduleFlow?: (path: readonly number[]) => number | undefined;
 }
 
 /** Resolved {@link FlowBorderSpec}: raw per-node metric + draw scale + ring colour (bytes for WebGL, CSS for export). */
@@ -401,6 +414,10 @@ export interface ResolvedFlowBorder {
   colors?: Uint8Array;
   /** When set (no explicit colour given), derive each glyph's ring by multiplying its own fill RGB by this factor (0–1). */
   darken?: number;
+  /** The colour accessor's RGBA for an LOD aggregate's value (`index` −1), when {@link FlowBorderSpec.color} is an accessor. */
+  aggregateColor?: (value: number) => readonly [number, number, number, number];
+  /** {@link FlowBorderSpec.moduleFlow}, applied to a module tree by {@link moduleBorderValues}. */
+  moduleFlow?: (path: readonly number[]) => number | undefined;
 }
 
 /**
@@ -410,6 +427,7 @@ export interface ResolvedFlowBorder {
  */
 export function resolveFlowBorder(graph: NetworkGraph, spec: FlowBorderSpec, fallbackColor: string): ResolvedFlowBorder {
   const n = graph.nodeCount;
+  const { moduleFlow } = spec;
   let metric: Float32Array;
   if (spec.flow instanceof Float32Array) {
     if (spec.flow.length !== n) throw new Error(`flowBorder.flow length ${spec.flow.length} !== nodeCount ${n}`);
@@ -433,15 +451,74 @@ export function resolveFlowBorder(graph: NetworkGraph, spec: FlowBorderSpec, fal
     let rep = 0;
     for (let i = 1; i < n; i++) if (metric[i]! > metric[rep]!) rep = i;
     const colorCss = colorOf(metric[rep] ?? 0, rep, graph);
-    return { metric, scale: spec.scale, color: toRGBA(colorCss), colorCss, colors };
+    const aggregateColor = (v: number) => toRGBA(colorOf(v, -1, graph));
+    return { metric, scale: spec.scale, color: toRGBA(colorCss), colorCss, colors, aggregateColor, moduleFlow };
   }
   if (spec.color === undefined) {
     // No explicit colour → each glyph's ring is a darker shade of its OWN fill (per-module under LOD).
     // The renderers derive it from the glyph colours via `darken`; colorCss is a representative fallback.
-    return { metric, scale: spec.scale, color: toRGBA(rgb(fallbackColor).darker(0.9).formatHex()), colorCss: rgb(fallbackColor).darker(0.9).formatHex(), darken: 0.62 };
+    return { metric, scale: spec.scale, color: toRGBA(rgb(fallbackColor).darker(0.9).formatHex()), colorCss: rgb(fallbackColor).darker(0.9).formatHex(), darken: 0.62, moduleFlow };
   }
   const colorCss = spec.color;
-  return { metric, scale: spec.scale, color: toRGBA(colorCss), colorCss };
+  return { metric, scale: spec.scale, color: toRGBA(colorCss), colorCss, moduleFlow };
+}
+
+/**
+ * The module values of a flow border on a **module tree** (#445): {@link FlowBorderSpec.moduleFlow} read
+ * once per aggregate, by the Infomap path its `parent` + `branch` spell, into an array indexed by
+ * `g − leafCount` (`NaN` where the app gave no value). `null` when there is nothing to apply — no
+ * `moduleFlow`, or a tree that is not a module tree (structural coarsening / spatial). O(modules × depth)
+ * accessor calls and one `Float32Array(modules)`, once per (style, tree) — never per frame.
+ */
+export function moduleBorderValues(tree: LODTree, border: ResolvedFlowBorder | null): Float32Array | null {
+  const moduleFlow = border?.moduleFlow;
+  const { parent, branch, leafCount, size } = tree;
+  if (!moduleFlow || !parent || !branch) return null;
+  const values = new Float32Array(size - leafCount);
+  for (let g = leafCount; g < size; g++) {
+    const path: number[] = [];
+    for (let a = g; a >= 0 && parent[a]! >= 0; a = parent[a]!) path.push(branch[a]!);
+    const v = moduleFlow(path.reverse());
+    values[g - leafCount] = v === undefined ? NaN : v;
+  }
+  return values;
+}
+
+/**
+ * Overwrite a module tree's summed `border` with the module values from {@link moduleBorderValues}, after
+ * {@link computeLODStyle} has summed it (a module without a value keeps its members' sum; the sums above
+ * it are unaffected, as they sum leaves). O(modules), re-run after every style pass on that tree.
+ */
+export function applyModuleBorder(tree: LODTree, values: Float32Array): void {
+  const { border, leafCount } = tree;
+  for (let m = 0; m < values.length; m++) {
+    const v = values[m]!;
+    if (!Number.isNaN(v)) border[leafCount + m] = v;
+  }
+}
+
+/**
+ * Per-tree-node ring RGBA (length `4·tree.size`) for a flow border whose colour is an accessor (#445):
+ * each leaf its resolved per-node colour, each aggregate the accessor applied to the value it draws
+ * (`tree.border` — the module value for a module, else the members' sum). `null` for any other colour
+ * form. O(aggregates) accessor calls, once per (style, tree) — so the per-cut glyph build only indexes it.
+ * Not for a spatial tree, which a layout worker may rebuild per frame: its aggregates take the
+ * representative colour (see {@link frontierCircles}).
+ */
+export function treeBorderColors(tree: LODTree, border: ResolvedFlowBorder | null): Uint8Array | null {
+  const leafColors = border?.colors;
+  const aggregateColor = border?.aggregateColor;
+  if (!leafColors || !aggregateColor) return null;
+  const out = new Uint8Array(tree.size * 4);
+  out.set(leafColors.subarray(0, tree.leafCount * 4));
+  for (let g = tree.leafCount; g < tree.size; g++) {
+    const c = aggregateColor(tree.border[g]!);
+    out[g * 4] = c[0];
+    out[g * 4 + 1] = c[1];
+    out[g * 4 + 2] = c[2];
+    out[g * 4 + 3] = c[3];
+  }
+  return out;
 }
 
 /** Per-instance ring colours = the glyph fill colours darkened (RGB × factor); alpha preserved. */
@@ -469,12 +546,15 @@ function buildBorders(
   scale: (v: number) => number,
   color: [number, number, number, number],
   perNodeColors?: Uint8Array,
+  /** `perNodeColors` is already this batch's own per-instance array: use it as the ring colours, no copy. */
+  adopt = false,
 ): { borders: Float32Array; borderColors: Uint8Array } {
   const borders = new Float32Array(count);
-  const borderColors = new Uint8Array(count * 4);
+  const borderColors = adopt && perNodeColors ? perNodeColors : new Uint8Array(count * 4);
   for (let i = 0; i < count; i++) {
     const r = radii[i]!;
     borders[i] = r > 0 ? clamp01(scale(valueOf(i)) / r) : 0;
+    if (adopt && perNodeColors) continue;
     if (perNodeColors) {
       borderColors[i * 4] = perNodeColors[i * 4]!;
       borderColors[i * 4 + 1] = perNodeColors[i * 4 + 1]!;
@@ -498,6 +578,51 @@ function constBorderArrays(
   color: [number, number, number, number],
 ): { borders: Float32Array; borderColors: Uint8Array } {
   return buildBorders(count, radii, () => width, (w) => w, color);
+}
+
+/**
+ * How node fill colour is determined. Resolved once per `style()` call to a per-node RGBA buffer (or one
+ * colour), so every form is free at draw time.
+ *
+ * - `string` — one CSS colour for every node.
+ * - function — `(index, graph) => cssColour`, e.g. a categorical palette keyed by module. An LOD
+ *   aggregate takes the (chroma-weighted hue) mean of its members' colours, so a module keeps its hue.
+ * - `{ by, scale }` — feed a {@link NodeMetric} through a colour scale (a bare d3 colour scale fits):
+ *   `{ by: "flow", scale: scaleSequential(interpolateViridis).domain([0, maxFlow]) }`. An LOD aggregate
+ *   is filled with `scale` of its **aggregated** metric, summed like {@link NodeRadiusSpec}'s `{ by }`
+ *   (so a module reads as its total flow). A spatial-tree cell is a region, not a unit of the metric, so
+ *   it keeps its members' colour mean — as its radius stays area-additive.
+ */
+export type NodeFillSpec =
+  | string
+  | ((index: number, graph: NetworkGraph) => string)
+  | { by: NodeMetric; scale: (value: number) => string };
+
+/** A resolved {@link NodeFillSpec}: one colour, or per-node RGBA plus (for `{ by, scale }`) the aggregate rule. */
+export interface ResolvedNodeFill {
+  /** The single fill (the default when the fill is per-node). */
+  nodeFill: string;
+  /** Per-node RGBA (length `4·nodeCount`) for the accessor and `{ by, scale }` forms. */
+  nodeColors?: Uint8Array;
+  /** `{ by, scale }` only: how an LOD aggregate is filled from its aggregated metric. */
+  fillAggregate?: FillAggregate;
+}
+
+/** Resolve a {@link NodeFillSpec} once per `style()`: O(nodeCount) scale/accessor calls, never per frame. */
+export function resolveNodeFill(graph: NetworkGraph, spec: NodeFillSpec | undefined, fallback: string): ResolvedNodeFill {
+  if (spec === undefined) return { nodeFill: fallback };
+  if (typeof spec === "string") return { nodeFill: spec };
+  if (typeof spec === "function") return { nodeFill: fallback, nodeColors: resolveNodeColors(graph, spec) };
+  const value = metricAccessor(graph, spec.by);
+  const { scale } = spec;
+  const n = graph.nodeCount;
+  const leafValue = new Float32Array(n);
+  const nodeColors = resolveNodeColors(graph, (i) => {
+    const v = value(i);
+    leafValue[i] = v;
+    return scale(v);
+  });
+  return { nodeFill: fallback, nodeColors, fillAggregate: { leafValue, rgbaOf: (v) => toRGBA(scale(v)) } };
 }
 
 /** Resolve a per-node fill-colour accessor to a packed RGBA buffer (length `4·nodeCount`), #104 rework. */
@@ -610,6 +735,11 @@ export interface FrontierStyleResolved {
    * sum-aggregated `border` metric (a module reflects its members' total); `metric` is ignored here.
    */
   border?: ResolvedFlowBorder | null;
+  /**
+   * Per-tree-node ring RGBA (length `4·tree.size`, {@link treeBorderColors}) for a border colour accessor.
+   * Absent ⇒ a leaf takes its per-node colour and an aggregate the representative one.
+   */
+  borderColors?: Uint8Array | null;
   /** Optional constant border ring (#104 rework): fixed px width + colour on every frontier glyph. */
   constBorder?: ConstBorder | null;
   /** Colour each frontier glyph by the tree's per-node `color` (categorical module colours) instead of `nodeFill`/`aggregateFill`. */
@@ -665,8 +795,9 @@ export function frontierCircles(tree: LODTree, frontier: Uint32Array, style: Fro
     const { scale, color, colors: explicit, darken } = style.border;
     // `darken` (no explicit ring colour) ⇒ each glyph's ring = its own (module) colour darkened — so a
     // collapsed module's ring is a darker shade of that module's hue, not one shared colour.
-    const borderColors = darken !== undefined ? darkenColors(colors, count, darken) : explicit;
-    result = { ...result, ...buildBorders(count, radii, (i) => tree.border[frontier[i]!]!, scale, color, borderColors) };
+    const borderColors =
+      darken !== undefined ? darkenColors(colors, count, darken) : explicit ? frontierRingColors(tree, frontier, explicit, style.borderColors, color) : undefined;
+    result = { ...result, ...buildBorders(count, radii, (i) => tree.border[frontier[i]!]!, scale, color, borderColors, borderColors !== undefined) };
   } else if (style.constBorder) {
     result = { ...result, ...constBorderArrays(count, radii, style.constBorder.width, style.constBorder.color) };
   }
@@ -677,6 +808,47 @@ export function frontierCircles(tree: LODTree, frontier: Uint32Array, style: Fro
     scaleAlpha(result.borderColors, count, frontier, style.fadeAlpha);
   }
   return result;
+}
+
+/**
+ * Per-instance ring colours for a frontier under a flow-border colour accessor, looked up by **tree-node
+ * id**: from the per-tree table when there is one ({@link treeBorderColors}); else a leaf (or a spatial
+ * cell wrapping one leaf) its per-node colour, and an aggregate the representative colour. O(frontier).
+ */
+function frontierRingColors(
+  tree: LODTree,
+  frontier: Uint32Array,
+  leafColors: Uint8Array,
+  table: Uint8Array | null | undefined,
+  representative: readonly [number, number, number, number],
+): Uint8Array {
+  const count = frontier.length;
+  const out = new Uint8Array(count * 4);
+  const { leafCount, leafOrder, leafStart } = tree;
+  for (let i = 0; i < count; i++) {
+    const g = frontier[i]!;
+    let src: Uint8Array | null = table ?? null;
+    let at = g;
+    if (!src) {
+      const leaf = g < leafCount ? g : tree.count[g] === 1 && leafOrder && leafStart ? leafOrder[leafStart[g]!]! : -1;
+      if (leaf >= 0) {
+        src = leafColors;
+        at = leaf;
+      }
+    }
+    if (src) {
+      out[i * 4] = src[at * 4]!;
+      out[i * 4 + 1] = src[at * 4 + 1]!;
+      out[i * 4 + 2] = src[at * 4 + 2]!;
+      out[i * 4 + 3] = src[at * 4 + 3]!;
+    } else {
+      out[i * 4] = representative[0];
+      out[i * 4 + 1] = representative[1];
+      out[i * 4 + 2] = representative[2];
+      out[i * 4 + 3] = representative[3];
+    }
+  }
+  return out;
 }
 
 /** Scale each RGBA quad's alpha byte by the per-node cross-fade alpha `fadeAlpha[ids[i]]` (#133). No-op when `colors` is absent. */
@@ -1717,6 +1889,8 @@ export interface ResolvedNetworkStyle {
   sizeMode: "world" | "screen";
   /** Optional per-node RGBA fill (categorical module colours, #104 rework); overrides `nodeFill` when set. */
   nodeColors?: Uint8Array;
+  /** `nodeFill: { by, scale }` (#445): the per-leaf metric + scale that fill LOD aggregates by their summed metric. */
+  nodeFillAggregate?: FillAggregate;
   /** Flow-border ring (#104 N6), or `null` when disabled (plain filled nodes). */
   flowBorder: ResolvedFlowBorder | null;
   /** Constant border ring (#104 rework), or `null`; used when no flow border is set. */
