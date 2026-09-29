@@ -460,7 +460,7 @@ export function setupModule(
   s: Scratch,
   warm: WarmStart | null,
 ): ModuleSetup {
-  const { children, superEdgeOffset, superEdgeTarget, superEdgeFlow, parent } = topo;
+  const { children } = topo;
   const k = end - start;
   s.ensure(k, topo.size);
   const { x, y, vx, vy, rad, local } = s;
@@ -490,7 +490,6 @@ export function setupModule(
   for (let rank = 0; rank < k; rank++) {
     const i = order[rank]!;
     const c = children[start + i]!;
-    local[c] = i;
     rad[i] = Math.sqrt((packing * Math.max(weight[c]!, floor)) / sum);
     const rr = 0.8 * Math.sqrt((rank + 0.5) / k);
     x[i] = rr * Math.cos(rank * GOLDEN);
@@ -503,6 +502,26 @@ export function setupModule(
     vy[i] = 0;
   }
 
+  return { seeded, ...moduleLinks(topo, g, start, end, local) };
+}
+
+/**
+ * Module `g`'s sibling links (its children are `children[start … end)`): the super-edges between two of
+ * them, as local child indices (`c − start` order), sparsified and weighted as {@link ModuleSetup} says.
+ * `local` is a global id → local index scratch of length ≥ `topo.size`, all −1 on entry and on return.
+ * Shared by the module solve ({@link setupModule}) and a drag's re-solve of one module
+ * (`nested-drag.ts`), so both pull on the same springs. O(links · log links).
+ */
+export function moduleLinks(
+  topo: NestedLayoutTopology,
+  g: number,
+  start: number,
+  end: number,
+  local: Int32Array,
+): Pick<ModuleSetup, "la" | "lb" | "lw"> {
+  const { children, superEdgeOffset, superEdgeTarget, superEdgeFlow, parent } = topo;
+  const k = end - start;
+  for (let i = 0; i < k; i++) local[children[start + i]!] = i;
   // Sibling links: super-edges between two children of g, symmetrised (a spring each way is the same
   // spring), strength ∝ √(flow / max flow) / min(degree) so hubs don't collapse their neighbours.
   const la: number[] = [];
@@ -533,7 +552,7 @@ export function setupModule(
   for (let l = 0; l < links; l++) {
     lw[l] = Math.sqrt(lw[l]! / (maxFlow || 1)) / Math.max(1, Math.min(degree[la[l]!]!, degree[lb[l]!]!));
   }
-  return { seeded, la, lb, lw };
+  return { la, lb, lw };
 }
 
 /**
@@ -719,8 +738,12 @@ function repel(s: Scratch, k: number, strength: number): void {
   }
 }
 
-/** Push overlapping discs apart (position-based). O(k²) for small k, a uniform grid otherwise. */
-export function collide(s: Scratch, k: number, pad: number): void {
+/**
+ * Push overlapping discs apart (position-based). O(k²) for small k, a uniform grid otherwise. With
+ * `pinned` (a drag's re-solve, `nested-drag.ts`), a disc whose entry is non-zero does not move: its
+ * partner takes the whole push, and two pinned discs are left as they are.
+ */
+export function collide(s: Scratch, k: number, pad: number, pinned?: Uint8Array): void {
   const { x, y, rad } = s;
   const resolve = (i: number, j: number): void => {
     const dx = x[j]! - x[i]!;
@@ -738,7 +761,14 @@ export function collide(s: Scratch, k: number, pad: number): void {
     const push = d2 > 0 ? (min - d) / d : min;
     const mi = rad[i]! * rad[i]!;
     const mj = rad[j]! * rad[j]!;
-    const sj = mi / (mi + mj);
+    let sj = mi / (mi + mj);
+    if (pinned) {
+      const pi = pinned[i]!;
+      const pj = pinned[j]!;
+      if (pi && pj) return;
+      if (pi) sj = 1;
+      else if (pj) sj = 0;
+    }
     const ux = d2 > 0 ? dx : Math.cos(i + j);
     const uy = d2 > 0 ? dy : Math.sin(i + j);
     x[j] = x[j]! + ux * push * sj;

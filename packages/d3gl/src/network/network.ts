@@ -8,6 +8,7 @@ import { DEFAULT_LABEL_TEXT, type LabelAnchor, type LabelStyle } from "../labels
 import { TextMeasurer, canvasFont } from "../labels/measure.js";
 import { buildModuleLODTree, checkModuleLinks, flattenModuleLinks, flattenModuleRecords, moduleRecordIndex, type ModuleLink, type ModuleNode } from "./modules.js";
 import { nestedLayout, nestedBoundaryDiscs, type NestedLayoutParams } from "./nested-layout.js";
+import { NestedDrag, NestedDragCache } from "./nested-drag.js";
 import { positionTransition, type PositionTransition } from "./transition.js";
 import { moduleColors, type ModulePathNode, type ModuleColorOptions } from "./module-colors.js";
 import { physicalPieWedges, type PhysicalPieWedges, type PieWedgeOptions } from "./pie.js";
@@ -371,6 +372,12 @@ export interface NetworkLayoutOptions {
    * `true` sizes discs by node flow (leaf count when the graph has none); pass `{ size: "count" }` to
    * size by leaf count, and `iterations` / `packing` to tune each module's solve. `{ warm: true }`
    * re-lays the map out from the current positions — for a re-clustering (#328).
+   *
+   * Dragging a node (`interactive({ draggable })`) on a landed nested map re-lays out only its module
+   * around it, on the main thread whatever the backend: the node follows the cursor inside its module's
+   * disc, its siblings move aside, and the disc keeps its centre and radius; a collapsed module moves its
+   * sibling modules aside in their parent, each as a whole. O(the module's children + the nodes that
+   * moved) per frame.
    * @see {@link nestedLayout}
    */
   nested?: boolean | NestedLayoutConfig;
@@ -933,9 +940,13 @@ export class Network extends BaseEngine {
    * out — that tree's module geometry while it is cut: every position pass places its modules on them
    * ({@link lodDiscs}), so the cut culls and expands a module by its disc and rings it there. O(modules)
    * (three floats each). Dropped by `data()` and by any other `layout()` (and a reheating drag), whose
-   * positions no longer come from the nested layout.
+   * positions no longer come from the nested layout. A drag re-solves one module of it in place
+   * ({@link NestedDrag}): `size` is the size metric the layout sized its discs by, and `drag` what drags
+   * on this layout reuse (built on the first grab).
    */
-  private nestedDiscs: { tree: LODTree; discs: BoundaryDiscs } | null = null;
+  private nestedDiscs: { tree: LODTree; discs: BoundaryDiscs; size: ArrayLike<number> | undefined; drag?: NestedDragCache } | null = null;
+  /** Stops the running nested drag's frame loop (its cool-down after release included), if any. */
+  private stopNestedDrag: (() => void) | null = null;
   /** The fade alpha the last {@link computeFrontier} produced (the live `fadeScratch`), or null when cross-fade is off. */
   private fadeAlpha: Float32Array | null = null;
   /** Cached resolved style; invalidated on style()/data() to avoid per-zoom O(n) radii recompute. */
@@ -1371,7 +1382,8 @@ export class Network extends BaseEngine {
    * - `draggable` — grab a node/aggregate and drag it (#140): the held set tracks the cursor with no
    *   lag while the layout reheats around it and re-cools on release. Grab a **selected** node to drag
    *   the **whole selection** together; grab a collapsed module to drag its **whole subtree**. Works on
-   *   the `force`, `worker`, `gpu` and `auto` layout backends (reheat) and `positions` (translate-only).
+   *   the `force`, `worker`, `gpu` and `auto` layout backends (reheat) and `positions` (translate-only);
+   *   on a landed `nested` map only the grabbed node's module re-lays out around it (see `layout({ nested })`).
    *   Pair with `enableZoom()` and the drag takes precedence over panning when it starts on a glyph.
    * - `selection: { selected, others }` — `selected.stroke` overrides the **select** ring colour
    *   (default `#2563eb` blue); the hover ring defaults to `#16a34a` green (override via a `hover`
@@ -2148,7 +2160,7 @@ export class Network extends BaseEngine {
           stream: !oneFrame,
           onResult: oneFrame ? (positions: Float32Array) => this.landNested(graph, positions, tween) : undefined,
           onBoundaries: (discs: BoundaryDiscs) => {
-            if (this.graph === graph) this.nestedDiscs = { tree: t, discs }; // the modules' geometry, and their rings' (#329)
+            if (this.graph === graph) this.nestedDiscs = { tree: t, discs, size: params.size }; // the modules' geometry, and their rings' (#329)
           },
           onBounds: (bounds: FitBox) => {
             if (this.graph !== graph) return;
@@ -2181,7 +2193,7 @@ export class Network extends BaseEngine {
       const topology = { ...tree, parent };
       const result = nestedLayout(topology, params);
       const positions = result.positions;
-      this.nestedDiscs = { tree, discs: nestedBoundaryDiscs(topology, result) }; // the modules' geometry, and their rings' (#329)
+      this.nestedDiscs = { tree, discs: nestedBoundaryDiscs(topology, result), size: params.size }; // the modules' geometry, and their rings' (#329)
       if (tween) {
         this.onLayoutSettled(this.transitionHandle(tween));
         this.startTransition(graph, tween, positions);
@@ -3222,6 +3234,9 @@ export class Network extends BaseEngine {
    *   and re-pins them over each streamed frame ({@link dragReapply}, copy mode). Released via
    *   {@link WorkerLayoutHandle.unpin}. On the gpu backend the physical-view state layout reheats too.
    * - **positions** (or a worker fallback with no live handle): no sim — the held set just translates.
+   *
+   * On a landed nested map (any of the reheating backends) none of those runs: {@link runNestedDrag}
+   * re-solves only the held node's module around it, on the main thread ({@link NestedDrag}).
    */
   protected override beginNodeDrag(hit: HoverHit, sx: number, sy: number): NodeDragSession | null {
     const graph = this.graph;
@@ -3237,6 +3252,7 @@ export class Network extends BaseEngine {
     // they are dropped. A streamed nested frame (a worker depth, a GPU harvest) re-holds them too.
     if (this.transition?.running) this.transition.finish();
     const pending = this.transition;
+    this.stopNestedDrag?.(); // a previous nested drag still cooling: this grab starts from where it is
 
     const grabbed = graph.positions;
     const start = new Float32Array(held.length * 2); // world positions at grab time
@@ -3276,6 +3292,18 @@ export class Network extends BaseEngine {
     // (state/both) around it. State-view reheat over the deterministic rosette is out of scope (#189).
     const backend = this.stateData && this.activeView !== "physical" ? "positions" : this.layoutOpts.backend;
     const handle = this.layoutHandle;
+
+    // A settled nested map (any layout backend): re-solve the grabbed node's module around it, on the main
+    // thread, and keep the map nested. A grab of the whole map (the root) translates it.
+    const nested = backend !== "positions" ? this.nestedDragState(graph) : null;
+    if (nested) {
+      const drag = NestedDrag.start(nested.cache, nested.state.discs, graph.positions, held);
+      if (drag) return this.runNestedDrag(graph, nested.state, drag, (mx, my) => { setDelta(mx, my); drag.setDelta(dx, dy); });
+      return {
+        move: (mx, my) => { setDelta(mx, my); applyHeld(); this.repaintDuringDrag(heldIds); },
+        end: () => this.settleLODPositions(),
+      };
+    }
 
     // force: own rAF loop ticks the pinned sim + repaints, so neighbours follow; re-cools on release.
     if (backend === "force") {
@@ -3326,6 +3354,72 @@ export class Network extends BaseEngine {
     return {
       move: (mx, my) => { setDelta(mx, my); applyHeld(); this.repaintDuringDrag(heldIds); },
       end: () => this.settleLODPositions(),
+    };
+  }
+
+  /**
+   * The nested layout a drag re-solves in place, when the current positions are a settled nested map of
+   * the current module tree: not while its solve still runs (the grab is held over its frames instead).
+   */
+  private nestedDragState(graph: NetworkGraph): { state: NonNullable<Network["nestedDiscs"]>; cache: NestedDragCache } | null {
+    const state = this.nestedDiscs;
+    // The laid-out tree must be the current one — and already built: a grab never builds one (#428).
+    if (!state || this.nestedSolving || !this.moduleTreeBuilt() || state.tree !== this.moduleTree()) return null;
+    const { tree } = state;
+    const parent = tree.parent;
+    if (!parent || tree.leafCount !== graph.nodeCount) return null;
+    state.drag ??= new NestedDragCache({ ...tree, parent }, state.size);
+    return { state, cache: state.drag };
+  }
+
+  /**
+   * Run a nested drag ({@link NestedDrag}) in its own animation-frame loop, as the `force` drag does: each
+   * frame takes the cursor's latest delta, ticks the re-solved modules once — writing the moved leaves and,
+   * when the cut draws the module tree, translating its LOD geometry in place, O(nodes under what moved) —
+   * and draws. After release it cools, then one exact geometry pass settles the LOD extents. A newer grab,
+   * layout or data change (the nested discs replaced) or the engine's destruction stops it.
+   */
+  private runNestedDrag(
+    graph: NetworkGraph,
+    state: NonNullable<Network["nestedDiscs"]>,
+    drag: NestedDrag,
+    move: (mx: number, my: number) => void,
+  ): NodeDragSession {
+    const rafFn: (cb: FrameRequestCallback) => number =
+      typeof requestAnimationFrame === "function" ? requestAnimationFrame : (cb) => setTimeout(() => cb(0), 16);
+    const cafFn: (id: number) => void = typeof cancelAnimationFrame === "function" ? cancelAnimationFrame : (id) => clearTimeout(id);
+    let raf = 0;
+    const stop = (): void => {
+      if (raf) cafFn(raf);
+      raf = 0;
+      if (this.stopNestedDrag === stop) this.stopNestedDrag = null;
+    };
+    const frame = (): void => {
+      raf = 0;
+      if (this.stopNestedDrag !== stop) return;
+      if (this.graph !== graph || this.nestedDiscs !== state || !this.backend()) {
+        stop();
+        return;
+      }
+      // The module tree's own geometry moves with its subtrees; any other tree (a spatial or structural
+      // cut) is refit along the leaves the drag can move.
+      const tree = this.lodReady() && this.lodTree === state.tree ? this.lodTree : null;
+      const live = drag.tick(graph.positions, tree);
+      if (tree) this.requestRedraw();
+      else this.repaintDuringDrag(drag.leaves);
+      this.flushFrame(); // this tick runs inside an animation frame: draw it here, not a frame late
+      if (!live) {
+        stop();
+        this.settleLODPositions();
+        return;
+      }
+      raf = rafFn(frame);
+    };
+    this.stopNestedDrag = stop;
+    raf = rafFn(frame);
+    return {
+      move,
+      end: () => drag.release(),
     };
   }
 
