@@ -847,19 +847,20 @@ frame that lands in it, however fast the pointer moves:
 | `gpu` (on the GPU) | the GPU layout **pins** the held set (skipped by the integrate pass) and reflows the rest on-GPU; the main thread holds them under the cursor | the layout is **unpinned** and re-cools until converged |
 | `auto` | as `gpu` or `worker`, whichever it resolved to | as that backend |
 | `positions` (fixed coords) | the held set simply **translates** (no simulation to reheat) | — |
-| any of the above with `nested` (a [map of modules](#maps-of-networks-a-provided-module-hierarchy)) | the node follows the cursor freely; only its **module** is re-laid out around it, on the main thread (see below) | the node is let go and the module settles for a short tail (at most 90 frames), then stops |
+| any of the above with `nested` (a [map of modules](#maps-of-networks-a-provided-module-hierarchy)) | the node follows the cursor freely; its **module**, and the modules above it as its disc moves, re-lay out around it, on the main thread (see below) | the node is let go and the module settles for a short tail (at most 90 frames), then stops |
 
 On the `worker`, `gpu` and `auto` backends the layout is kept **alive** (idle) after the initial layout converges, so
 a drag can reheat it instantly without re-seeding — the held nodes are pinned (skipped by the backend's
 integration) while their positions are owned by the main thread, so they never rubber-band behind the cursor.
 
 **On a nested map** (`layout({ nested })`, once it has landed) a drag never reheats the whole graph, so the map
-stays nested and every other [module ring](#module-boundaries) stays put:
+stays nested, and the [module rings](#module-boundaries) move with their discs:
 
 - **A node** → it goes wherever the cursor goes, and the other nodes of **its module** are pushed aside and
-  settle around it, inside the module's disc. The disc keeps its centre; while the node is outside it —
-  dragged or dropped there — the module's ring grows about that centre just enough to enclose it, and shrinks
-  back once the node returns, so a ring always encloses its members. Nothing outside the module moves.
+  settle around it, inside the module's disc. Dragged to the disc's edge, the node takes the disc along: the
+  disc keeps its size and its ring moves with it, its other members coming along and re-settling. That disc
+  pushes its sibling modules aside and, at its parent's edge, carries the parent's disc too, up to the root:
+  only the dragged node is pinned, and everything else responds.
 - **A collapsed module** → its **sibling modules** move aside inside their parent, each as a whole (its own
   layout and ring move with it).
 - **A selection** → each module it spans is re-laid out the same way.
@@ -873,6 +874,6 @@ While a nested layout is still streaming, a grabbed node is held over its frames
 :::note[Drag is opt-in and gated]
 `draggable` is off until you set it (like every `interactive()` option). It only grabs **node** glyphs — a
 drag starting on a *link* still pans — and it reheats on the `force`/`worker`/`gpu`/`auto` layout backends (a
-nested map re-lays out only the grabbed node's module); on `positions` (caller-supplied coordinates) a drag
+nested map re-lays out the grabbed node's module and the modules above it); on `positions` (caller-supplied coordinates) a drag
 translates the grabbed set without running a simulation.
 :::
