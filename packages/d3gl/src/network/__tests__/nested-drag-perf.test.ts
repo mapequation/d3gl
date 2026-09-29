@@ -6,20 +6,23 @@ import { NestedDrag, NestedDragCache } from "../nested-drag.js";
 
 /**
  * Per-frame guard for the nested drag reheat (AGENTS.md lifecycle §5: a node drag is a per-frame path).
- * One tick runs per animation frame; its work must be O(the re-solved module's children + the nodes
- * under the children that moved) — never a pass over the whole map. At ≈1M leaves (always on: the map
- * is built directly, not laid out) on a 100 × 100 × 100 module tree with leaf edges in the bottom modules
- * and module links between siblings, three grabs:
+ * One tick runs per animation frame; its work must be O(the children of the re-solved modules — the
+ * grabbed item's and each one above it — + the nodes that moved) — never a pass over the whole map
+ * unless it all moves. At ≈1M leaves (always on: the map is built directly, not laid out) on a
+ * 100 × 100 × 100 module tree with leaf edges in the bottom modules and module links between siblings:
  *
- *   1. a **leaf** in a bottom module (100 siblings, 100 leaves re-solved);
- *   2. a **bottom module** aggregate (100 sibling modules, 10k leaves under them);
+ *   1. a **leaf** in a bottom module, dragged toward its module's centre (100 siblings re-solved; the
+ *      disc does not travel, so nothing above moves);
+ *   2. a **bottom module** aggregate, the same in its parent (100 sibling modules, 10k leaves under them);
  *   3. a **top module** aggregate (99 siblings holding ≈99% of the map: the inherent worst case, every
- *      moved leaf is written — bounded by the leaves under the moved siblings, not by a scan).
+ *      moved leaf is written — bounded by the leaves under the moved siblings, not by a scan);
+ *   4. a **leaf dragged out of its module**: its disc travels and pushes its neighbours, up the levels.
  *
- * Each held drag runs with the LOD geometry (the module tree's centres, translated with their subtrees)
- * and without it (LOD off: positions only). Signatures, exact at every N: the leaves written per tick
- * never exceed the leaves under the re-solved module, the tree nodes translated never exceed its subtree,
- * nothing outside it changes; a repeat grab is O(its subtree) (the leaf counts are built once per layout).
+ * Each drag runs with the LOD geometry (the module tree's centres, translated with their subtrees) and
+ * without it (LOD off: positions only). Signatures, exact at every N: in legs 1-3 the leaves written per
+ * tick never exceed the leaves under the grabbed item's module, the tree nodes translated never exceed its
+ * subtree, and nothing outside it changes; in leg 4 something outside it does. A grab walks the re-solved
+ * modules' children once (the root's: the map), click-frequency.
  * Wall-clock ceilings assert under `PERF_ASSERT` (the at-scale tier, `BENCH_NESTED_DRAG`).
  */
 
@@ -28,13 +31,13 @@ const N = BENCH ? Number(process.env.BENCH_NESTED_DRAG_N) || 1_000_000 : 1_000_0
 const ASSERT = !!process.env.PERF_ASSERT;
 const TICKS = 30;
 // Measured (M1 Max, node, 1M): median tick 0.03-0.13 ms for a leaf, ~0.1 ms for a bottom module (its
-// siblings make room at the drag heat), ~4.5 ms for a top module (≈1M leaves translated); a repeat grab
-// 0.2 ms (a leaf) to 9-17 ms (a top module's 1M-leaf subtree). Ceilings ~10-25× that: the write counts,
-// not the clock, are what pin the per-tick work to the re-solved module.
+// siblings make room at the drag heat), ~4.5-7 ms for a top module (≈1M leaves translated), ~0.2-0.3 ms
+// for a leaf dragged out of its module; a grab 5-30 ms (it walks the root's children: the whole map).
+// Ceilings ~10-25× that: the write counts, not the clock, are what pin the per-tick work.
 const LEAF_TICK_MS = Number(process.env.PERF_NESTED_DRAG_LEAF_MS) || 2;
 const MODULE_TICK_MS = Number(process.env.PERF_NESTED_DRAG_MODULE_MS) || 10;
 const TOP_TICK_MS = Number(process.env.PERF_NESTED_DRAG_TOP_MS) || 120;
-const REGRAB_MS = Number(process.env.PERF_NESTED_DRAG_REGRAB_MS) || 5;
+const GRAB_MS = Number(process.env.PERF_NESTED_DRAG_GRAB_MS) || 150;
 
 const GOLDEN = Math.PI * (3 - Math.sqrt(5));
 
@@ -135,7 +138,7 @@ function leafIds(g: number): number[] {
   return out;
 }
 
-function runLeg(held: number[], lod: boolean): Leg {
+function runLeg(held: number[], lod: boolean, out = false): Leg {
   const { tree } = fx;
   const t0 = performance.now();
   const drag = NestedDrag.start(cache, fx.discs, fx.positions, held);
@@ -144,12 +147,32 @@ function runLeg(held: number[], lod: boolean): Leg {
   const P = drag.modules[0]!.g;
   const under = subtree(P);
   const before = fx.positions.slice();
-  const R = fx.discs.r[P - tree.leafCount]!;
+  // Toward the module's centre, stopping short of it: the held item stays inside its module's disc, so
+  // the disc does not travel and nothing above it moves (a drag out of it is `outLeg`'s).
+  const centroid = (ls: ArrayLike<number>): [number, number] => {
+    let x = 0;
+    let y = 0;
+    for (let i = 0; i < ls.length; i++) {
+      x += fx.positions[2 * ls[i]!]! / ls.length;
+      y += fx.positions[2 * ls[i]! + 1]! / ls.length;
+    }
+    return [x, y];
+  };
+  const [hx, hy] = centroid(held);
+  const [px, py] = centroid(leafIds(P));
+  const o = P - tree.leafCount;
+  let [tx, ty] = [px + fx.discs.dx[o]! - hx, py + fx.discs.dy[o]! - hy];
+  if (out) {
+    // Away from it, three of its radii: the disc travels along and pushes its neighbours, up the levels.
+    const R = fx.discs.r[o]!;
+    const d = Math.hypot(tx, ty) || 1;
+    [tx, ty] = [(-3 * R * tx) / (0.8 * d), (-3 * R * ty) / (0.8 * d)];
+  }
   let maxLeafWrites = 0;
   let maxNodeWrites = 0;
   const ts: number[] = [];
   for (let t = 1; t <= TICKS; t++) {
-    drag.setDelta(0.02 * R * t, 0.01 * R * t);
+    drag.setDelta((0.8 * tx * t) / TICKS, (0.8 * ty * t) / TICKS);
     const lw = drag.stats.leafWrites;
     const nw = drag.stats.nodeWrites;
     const s = performance.now();
@@ -184,10 +207,18 @@ beforeAll(() => {
     legs[`leaf, ${tag}`] = runLeg([leaf], lod);
     legs[`bottom module, ${tag}`] = runLeg(leafIds(bottom), lod);
     legs[`top module, ${tag}`] = runLeg(leafIds(top), lod);
+    legs[`leaf out of its module, ${tag}`] = runLeg([leaf + 17], lod, true);
   }
 }, 120_000);
 
 describe(`nested drag reheat — per-tick cost at ${N.toLocaleString()} leaves`, () => {
+  for (const tag of ["LOD off", "LOD on"]) {
+    it(`leaf dragged out of its module, ${tag}: the disc travels and the levels above make room`, () => {
+      const leg = legs[`leaf out of its module, ${tag}`]!;
+      expect(leg.outsideChanged, "nothing outside the module made room").toBeGreaterThan(0);
+      expect(leg.maxLeafWrites).toBeLessThanOrEqual(fx.tree.leafCount);
+    });
+  }
   for (const name of ["leaf", "bottom module", "top module"]) {
     for (const tag of ["LOD off", "LOD on"]) {
       it(`${name}, ${tag}: writes only under the re-solved module; nothing else moves`, () => {
@@ -201,9 +232,8 @@ describe(`nested drag reheat — per-tick cost at ${N.toLocaleString()} leaves`,
     }
   }
 
-  it("a repeat grab costs its subtree, not the map", () => {
-    const leg = legs["leaf, LOD on"]!;
-    if (ASSERT) expect(leg.grabMs).toBeLessThan(REGRAB_MS);
+  it("a grab stays within budget", () => {
+    if (ASSERT) for (const leg of Object.values(legs)) expect(leg.grabMs).toBeLessThan(GRAB_MS);
   });
 
   it("ticks within budget", () => {
@@ -214,6 +244,7 @@ describe(`nested drag reheat — per-tick cost at ${N.toLocaleString()} leaves`,
       expect(legs[`leaf, ${tag}`]!.medianTickMs).toBeLessThan(LEAF_TICK_MS);
       expect(legs[`bottom module, ${tag}`]!.medianTickMs).toBeLessThan(MODULE_TICK_MS);
       expect(legs[`top module, ${tag}`]!.medianTickMs).toBeLessThan(TOP_TICK_MS);
+      expect(legs[`leaf out of its module, ${tag}`]!.medianTickMs).toBeLessThan(TOP_TICK_MS);
     }
   });
 });

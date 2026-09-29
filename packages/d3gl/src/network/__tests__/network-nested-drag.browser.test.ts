@@ -85,7 +85,7 @@ describe("node-drag on a nested map", () => {
     ["gpu", true],
   ] as const;
   for (const [backend, lod] of leafCases) {
-    it(`${backend}, LOD ${lod ? "on" : "off"}: re-solves the grabbed leaf's module around it and leaves the rest of the map`, async () => {
+    it(`${backend}, LOD ${lod ? "on" : "off"}: re-solves the grabbed leaf's module around it; dragged out, the module travels and its neighbours make room`, async () => {
       const { net, h, g } = await laidOut(backend, lod);
       const leaf = 2 * LEAVES + 3; // top module 1, bottom module 3
       const lo = leaf - (leaf % LEAVES);
@@ -120,16 +120,23 @@ describe("node-drag on a nested map", () => {
         expect(g.positions[2 * i + 1]).toBe(before[2 * i + 1]);
       }
       // Out of the module's disc, well past its edge (the module is ~15 world units across): the leaf
-      // still follows the cursor exactly, and still nothing outside the module moves.
+      // still follows the cursor exactly, its module comes along, and the modules around make room.
       const out = -25;
       pointer(h, "pointermove", 200 + out * ux * K, 200 + out * uy * K);
-      await frames(20);
+      await frames(40);
       expect(g.positions[2 * leaf]).toBeCloseTo(x0 + out * ux, 1);
       expect(g.positions[2 * leaf + 1]).toBeCloseTo(y0 + out * uy, 1);
-      for (let i = 0; i < N; i++) {
-        if (i >= lo && i < lo + LEAVES) continue;
-        expect(g.positions[2 * i], `leaf ${i} outside the module moved`).toBe(before[2 * i]);
+      let cx = 0;
+      let cy = 0;
+      for (let i = lo; i < lo + LEAVES; i++) {
+        cx += g.positions[2 * i]! / LEAVES;
+        cy += g.positions[2 * i + 1]! / LEAVES;
       }
+      const along = (cx - mx) * -ux + (cy - my) * -uy;
+      expect(along, "the module did not travel with its dragged leaf").toBeGreaterThan(5);
+      let made = 0;
+      for (let i = 0; i < N; i++) if ((i < lo || i >= lo + LEAVES) && g.positions[2 * i] !== before[2 * i]) made++;
+      expect(made, "nothing around the travelling module made room").toBeGreaterThan(0);
       pointer(h, "pointerup", 200 + out * ux * K, 200 + out * uy * K);
       await frames(120); // the cool-down (at most 90 ticks)
       const settled = g.positions.slice();

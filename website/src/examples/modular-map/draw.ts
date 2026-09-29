@@ -58,8 +58,8 @@ const SIZES = [500, 1_000, 2_000, 5_000, 10_000, 20_000];
  * hover/click rings a node or module, ⇧+drag box-selects (⌥ subtracts), and dragging a glyph — or a whole
  * selection, or a collapsed module — moves it: the GPU seed reheats around it, and under the **nested**
  * layout the node follows the cursor while only its module is re-laid out around it (a collapsed
- * module's sibling modules move aside in their parent); its ring grows to enclose it outside, and every
- * other module stays put. It shows
+ * module's sibling modules move aside in their parent); dragged to its module's edge, the node takes the
+ * module's disc and ring along, pushing the modules around it aside, up the levels. It shows
  * the selection/hover ring living alongside the per-node **flowBorder** ring and a module's **outline**.
  */
 export const setup: ImperativeSetup = (host, { width, height, backend }) => {

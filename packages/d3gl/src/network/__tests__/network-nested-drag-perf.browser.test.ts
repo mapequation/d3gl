@@ -186,7 +186,8 @@ beforeAll(async () => {
       const used = spy.since(mark);
       ts.sort((a, b) => a - b);
       const drag = nested ? tick.mock.contexts[calls0] : undefined;
-      const leavesUnder = drag ? drag.leaves.length : 0;
+      // The leaves under the held leaf's module (the deepest re-solve): all a tick inside it may write.
+      const leavesUnder = drag ? Array.from(drag.modules[0]!.cnt).reduce((a, b) => a + b, 0) : 0;
       return {
         heldTicks,
         heldMedianMs: ts[Math.floor(ts.length / 2)] ?? Infinity,

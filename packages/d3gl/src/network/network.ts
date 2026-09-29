@@ -373,12 +373,11 @@ export interface NetworkLayoutOptions {
    * size by leaf count, and `iterations` / `packing` to tune each module's solve. `{ warm: true }`
    * re-lays the map out from the current positions — for a re-clustering (#328).
    *
-   * Dragging a node (`interactive({ draggable })`) on a landed nested map re-lays out only its module
-   * around it, on the main thread whatever the backend: the node follows the cursor anywhere, its siblings
-   * move aside inside the module's disc, and the disc keeps its centre (its ring grows to enclose a member
-   * outside it, and shrinks back as it returns); a collapsed module moves its
-   * sibling modules aside in their parent, each as a whole. O(the module's children + the nodes that
-   * moved) per frame.
+   * Dragging a node (`interactive({ draggable })`) on a landed nested map re-solves its module and the ones
+   * above it, on the main thread whatever the backend, with only the dragged node pinned: its siblings move
+   * aside inside the module's disc, and at the disc's edge the node takes the disc (and its ring) along,
+   * which pushes its sibling modules aside and carries the discs above in turn. A collapsed module moves the
+   * same way among its siblings. O(the re-solved modules' children + the nodes that moved) per frame.
    * @see {@link nestedLayout}
    */
   nested?: boolean | NestedLayoutConfig;
@@ -1384,7 +1383,7 @@ export class Network extends BaseEngine {
    *   lag while the layout reheats around it and re-cools on release. Grab a **selected** node to drag
    *   the **whole selection** together; grab a collapsed module to drag its **whole subtree**. Works on
    *   the `force`, `worker`, `gpu` and `auto` layout backends (reheat) and `positions` (translate-only);
-   *   on a landed `nested` map only the grabbed node's module re-lays out around it (see `layout({ nested })`).
+   *   on a landed `nested` map its module and the ones above re-solve around it (see `layout({ nested })`).
    *   Pair with `enableZoom()` and the drag takes precedence over panning when it starts on a glyph.
    * - `selection: { selected, others }` — `selected.stroke` overrides the **select** ring colour
    *   (default `#2563eb` blue); the hover ring defaults to `#16a34a` green (override via a `hover`
@@ -3403,11 +3402,11 @@ export class Network extends BaseEngine {
         return;
       }
       // The module tree's own geometry moves with its subtrees; any other tree (a spatial or structural
-      // cut) is refit along the leaves the drag can move.
+      // cut) is refit along the leaves this tick moved.
       const tree = this.lodReady() && this.lodTree === state.tree ? this.lodTree : null;
       const live = drag.tick(graph.positions, tree);
       if (tree) this.requestRedraw();
-      else this.repaintDuringDrag(drag.leaves);
+      else this.repaintDuringDrag(drag.movedLeaves);
       this.flushFrame(); // this tick runs inside an animation frame: draw it here, not a frame late
       if (!live) {
         stop();

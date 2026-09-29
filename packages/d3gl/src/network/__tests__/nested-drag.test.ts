@@ -93,6 +93,13 @@ function discCentre(m: Map, positions: Float32Array, g: number): [number, number
   return [x / leaves.length + m.discs.dx[o]!, y / leaves.length + m.discs.dy[o]!];
 }
 
+/** `g` and its ancestors, up to the root. */
+function chainOf(m: Map, g: number): number[] {
+  const out: number[] = [];
+  for (let a = g; a >= 0; a = m.tree.parent![a]!) out.push(a);
+  return out;
+}
+
 const kids = (m: Map, g: number): number[] => Array.from(m.tree.children.subarray(m.tree.childOffset[g]!, m.tree.childOffset[g + 1]!));
 
 /** A world centre per child of `g`: a leaf's position, a module's disc centre. */
@@ -124,7 +131,7 @@ describe("nested drag reheat", () => {
     }
   });
 
-  it("re-solves only the grabbed leaf's module, inside its fixed disc", () => {
+  it("re-solves the grabbed leaf's module around it; with its disc unmoved, nothing above moves", () => {
     const m = nestedMap([3, 4, 16]);
     const cache = new NestedDragCache(m.topo, m.size);
     const leaf = 5;
@@ -135,7 +142,8 @@ describe("nested drag reheat", () => {
     const rootCentre0 = discCentre(m, m.positions, m.tree.size - 1);
     const drag = NestedDrag.start(cache, m.discs, m.positions, [leaf]);
     expect(drag).not.toBeNull();
-    expect(drag!.modules.map((x) => x.g)).toEqual([P]);
+    // Every module from the leaf's up to the root is re-solved, deepest first.
+    expect(drag!.modules.map((x) => x.g)).toEqual(chainOf(m, P));
     // Toward the disc centre and across it: the held leaf follows the cursor.
     const [x0, y0] = [before[2 * leaf]!, before[2 * leaf + 1]!];
     const dx = (centre0[0] - x0) * 1.5;
@@ -173,7 +181,7 @@ describe("nested drag reheat", () => {
     expect(drag!.stats.leafWrites).toBeLessThanOrEqual(drag!.stats.ticks * inside.size);
   });
 
-  it("lets the held leaf leave its module's disc: the ring grows about its centre to enclose it", () => {
+  it("lets the held leaf leave its disc's place: the disc travels with it, its size and ring intact", () => {
     const m = nestedMap([3, 4, 16]);
     const cache = new NestedDragCache(m.topo, m.size);
     const leaf = 20;
@@ -183,43 +191,62 @@ describe("nested drag reheat", () => {
     const c0 = discCentre(m, m.positions, P);
     const x0 = m.positions[2 * leaf]!;
     const y0 = m.positions[2 * leaf + 1]!;
+    const before = m.positions.slice();
+    const radii0 = m.discs.r.slice();
     computeLODPositions(m.tree, m.positions, m.discs);
     const drag = NestedDrag.start(cache, m.discs, m.positions, [leaf])!;
     drag.setDelta(3 * R, 0);
-    for (let t = 0; t < 30; t++) drag.tick(m.positions, m.tree);
-    // The leaf is exactly under the cursor, far outside the disc as laid out.
+    for (let t = 0; t < 60; t++) drag.tick(m.positions, m.tree);
+    // The leaf is exactly under the cursor, far from where its disc was laid out.
     expect(m.positions[2 * leaf]).toBeCloseTo(x0 + 3 * R, 2);
     expect(m.positions[2 * leaf + 1]).toBeCloseTo(y0, 2);
-    // The disc keeps its centre and grows just enough to enclose it (ring and LOD extent alike).
+    // The disc came along: same radius (its ring is the disc), centre moved so the leaf is inside it.
+    expect(m.discs.r[o]).toBe(R);
     const c1 = discCentre(m, m.positions, P);
-    expect(Math.hypot(c1[0] - c0[0], c1[1] - c0[1])).toBeLessThan(1e-3 * R);
-    const d = Math.hypot(m.positions[2 * leaf]! - c0[0], m.positions[2 * leaf + 1]! - c0[1]);
-    expect(m.discs.r[o]).toBeCloseTo(d + m.r[leaf]!, 2);
-    expect(m.tree.extent[P]).toBeCloseTo(m.discs.r[o]!, 2);
-    // Its siblings stay inside the disc as laid out.
+    expect(c1[0] - c0[0]).toBeGreaterThan(R);
+    const d = Math.hypot(m.positions[2 * leaf]! - c1[0], m.positions[2 * leaf + 1]! - c1[1]);
+    expect(d + m.r[leaf]!).toBeLessThanOrEqual(R * (1 + 1e-4));
+    // Its other children came along inside it.
     for (const c of kids(m, P)) {
-      if (c === leaf) continue;
       const cc = c < m.tree.leafCount ? [m.positions[2 * c]!, m.positions[2 * c + 1]!] : discCentre(m, m.positions, c);
-      expect(Math.hypot(cc[0]! - c0[0], cc[1]! - c0[1]) + radiusOf(m, c)).toBeLessThanOrEqual(R * (1 + 1e-4));
+      expect(Math.hypot(cc[0]! - c1[0], cc[1]! - c1[1]) + radiusOf(m, c)).toBeLessThanOrEqual(R * (1 + 1e-3));
     }
-    // Dropped there, it is not snapped back — and a later grab in the module keeps it out (the ring too).
+    // The map stays nested: every disc keeps its radius, every re-solved module holds its children, and
+    // the travelling disc has pushed its siblings aside rather than overlapping them.
+    expect(m.discs.r).toEqual(radii0);
+    for (const g of chainOf(m, P)) {
+      const R_g = m.discs.r[g - m.tree.leafCount]!;
+      const cg = discCentre(m, m.positions, g);
+      childCentres(m, m.positions, g).forEach(([x, y], i) => {
+        expect(Math.hypot(x - cg[0], y - cg[1]) + radiusOf(m, kids(m, g)[i]!)).toBeLessThanOrEqual(R_g * (1 + 1e-3));
+      });
+    }
+    const up = m.tree.parent![P]!;
+    for (const c of kids(m, up)) {
+      if (c === P) continue;
+      const cc = discCentre(m, m.positions, c);
+      expect(Math.hypot(cc[0] - c1[0], cc[1] - c1[1])).toBeGreaterThan((R + radiusOf(m, c)) * NESTED.PAD * 0.95);
+    }
+    let movedAbove = 0;
+    const inside = new Set(leavesOf(m, P));
+    for (let i = 0; i < m.tree.leafCount; i++) if (!inside.has(i) && m.positions[2 * i] !== before[2 * i]) movedAbove++;
+    expect(movedAbove, "nothing around the travelling disc made room").toBeGreaterThan(0);
+    // The LOD geometry is what a fresh position pass places.
+    const cx = m.tree.cx.slice();
+    const cy = m.tree.cy.slice();
+    computeLODPositions(m.tree, m.positions, m.discs);
+    for (let g = 0; g < m.tree.size; g++) {
+      expect(Math.abs(cx[g]! - m.tree.cx[g]!), `node ${g}`).toBeLessThan(1e-3 * R);
+      expect(Math.abs(cy[g]! - m.tree.cy[g]!), `node ${g}`).toBeLessThan(1e-3 * R);
+    }
+    // Released, it stays with its disc, where it was dropped.
     drag.release();
     while (drag.tick(m.positions, m.tree));
-    const dropped = Math.hypot(m.positions[2 * leaf]! - c0[0], m.positions[2 * leaf + 1]! - c0[1]);
-    expect(dropped).toBeGreaterThan(2 * R);
-    const again = NestedDrag.start(cache, m.discs, m.positions, [kids(m, P).find((c) => c !== leaf)!])!;
-    for (let t = 0; t < 10; t++) again.tick(m.positions, m.tree);
-    const still = Math.hypot(m.positions[2 * leaf]! - c0[0], m.positions[2 * leaf + 1]! - c0[1]);
-    expect(still).toBeGreaterThan(2 * R);
-    expect(m.discs.r[o]!).toBeGreaterThanOrEqual(still + m.r[leaf]! - 1e-3 * R);
-    // Back inside, the ring shrinks back to its laid-out radius.
-    const back = NestedDrag.start(cache, m.discs, m.positions, [leaf])!;
-    back.setDelta(c0[0] - m.positions[2 * leaf]!, c0[1] - m.positions[2 * leaf + 1]!);
-    for (let t = 0; t < 30; t++) back.tick(m.positions, m.tree);
-    expect(m.discs.r[o]).toBeCloseTo(R, 3);
+    const c2 = discCentre(m, m.positions, P);
+    expect(Math.hypot(c2[0] - c1[0], c2[1] - c1[1])).toBeLessThan(1e-3 * R);
   });
 
-  it("drags a module aggregate: its siblings move as a whole, and every other disc stays", () => {
+  it("drags a module aggregate: its siblings move as a whole", () => {
     const m = nestedMap([3, 5, 10]);
     const cache = new NestedDragCache(m.topo, m.size);
     const M = m.tree.parent![0]!; // a bottom module
@@ -228,7 +255,7 @@ describe("nested drag reheat", () => {
     const before = m.positions.slice();
     const offsets = { dx: m.discs.dx.slice(), dy: m.discs.dy.slice() };
     const drag = NestedDrag.start(cache, m.discs, m.positions, held)!;
-    expect(drag.modules.map((x) => x.g)).toEqual([P]);
+    expect(drag.modules.map((x) => x.g)).toEqual(chainOf(m, P));
     const [Cx, Cy] = discCentre(m, m.positions, P);
     const [Mx, My] = discCentre(m, m.positions, M);
     drag.setDelta(Cx - Mx, Cy - My); // to the parent's centre
@@ -245,7 +272,7 @@ describe("nested drag reheat", () => {
       // Its own disc offset is unchanged (its ring rides along).
       expect(m.discs.dx[c - m.tree.leafCount]).toBe(offsets.dx[c - m.tree.leafCount]);
     }
-    // The held module is at the cursor (clamped inside P's disc).
+    // The held module is at the cursor.
     const [mx, my] = discCentre(m, m.positions, M);
     expect(Math.hypot(mx - Cx, my - Cy)).toBeLessThan(1e-2 * m.discs.r[P - m.tree.leafCount]!);
   });
@@ -274,7 +301,7 @@ describe("nested drag reheat", () => {
     const a = 0;
     const b = m.tree.leafCount - 1;
     const drag = NestedDrag.start(cache, m.discs, m.positions, [a, b])!;
-    expect(new Set(drag.modules.map((x) => x.g))).toEqual(new Set([m.tree.parent![a]!, m.tree.parent![b]!]));
+    expect(new Set(drag.modules.map((x) => x.g))).toEqual(new Set([...chainOf(m, m.tree.parent![a]!), ...chainOf(m, m.tree.parent![b]!)]));
     const all = Array.from({ length: m.tree.leafCount }, (_, i) => i);
     expect(NestedDrag.start(cache, m.discs, m.positions, all)).toBeNull();
   });
