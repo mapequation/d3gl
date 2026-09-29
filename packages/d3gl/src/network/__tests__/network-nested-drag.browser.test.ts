@@ -119,7 +119,18 @@ describe("node-drag on a nested map", () => {
         expect(g.positions[2 * i], `leaf ${i} outside the module moved`).toBe(before[2 * i]);
         expect(g.positions[2 * i + 1]).toBe(before[2 * i + 1]);
       }
-      pointer(h, "pointerup", 200 + ux * K, 200 + uy * K);
+      // Out of the module's disc, well past its edge (the module is ~15 world units across): the leaf
+      // still follows the cursor exactly, and still nothing outside the module moves.
+      const out = -25;
+      pointer(h, "pointermove", 200 + out * ux * K, 200 + out * uy * K);
+      await frames(20);
+      expect(g.positions[2 * leaf]).toBeCloseTo(x0 + out * ux, 1);
+      expect(g.positions[2 * leaf + 1]).toBeCloseTo(y0 + out * uy, 1);
+      for (let i = 0; i < N; i++) {
+        if (i >= lo && i < lo + LEAVES) continue;
+        expect(g.positions[2 * i], `leaf ${i} outside the module moved`).toBe(before[2 * i]);
+      }
+      pointer(h, "pointerup", 200 + out * ux * K, 200 + out * uy * K);
       await frames(120); // the cool-down (at most 90 ticks)
       const settled = g.positions.slice();
       await frames(10);

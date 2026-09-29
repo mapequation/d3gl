@@ -6,10 +6,12 @@
  * around it, inside the module's disc — and, for a collapsed module aggregate, its parent, whose other
  * modules move aside. Every other module stays where it is, and the map stays nested:
  *
- * - **The held node stays in its module.** It follows the cursor, clamped so its disc stays inside its
- *   parent's disc.
- * - **The module's disc keeps its centre and radius.** Its children are kept inside it; nothing is
- *   refit, so its ring (`lod({ moduleBoundary })`, #329) does not move.
+ * - **The held node follows the cursor freely**, inside its module's disc or out of it.
+ * - **The module's disc keeps its centre.** Its other children are kept inside its own radius, as the
+ *   layout sized it; nothing is refit. While a member lies outside — the held node, or one dropped there —
+ *   the disc's radius (its ring, `lod({ moduleBoundary })`, #329, and its LOD extent) grows about the same
+ *   centre just enough to enclose it, and shrinks back as it returns, so a ring always encloses its
+ *   members and the map reads as nested. The parent's disc and every other module stay as they are.
  * - **A sibling moves as a whole.** A sibling module's disc translates with everything inside it — its
  *   own layout and its ring are unchanged.
  * - **A selection spanning several modules** re-solves each of them: the held nodes are the largest
@@ -44,14 +46,16 @@ const STILL = 1e-4;
 /**
  * What drags on one nested layout reuse across grabs: the topology, the size metric it was laid out
  * with, each tree node's leaf count (one O(tree size) pass, on the first grab), a local-index scratch,
- * and each re-solved module's child radii. A module's child radii are recovered from the layout the
- * first time it is grabbed ({@link childRadii}) and kept: once a drag has moved its children, the
- * layout no longer tells them.
+ * each re-solved module's child radii, and its disc radius as the layout sized it. A module's child
+ * radii are recovered from the layout the first time it is grabbed ({@link childRadii}) and kept: once a
+ * drag has moved its children, the layout no longer tells them. Its disc radius is kept for the same
+ * reason: a drag grows a disc to enclose a member outside it.
  */
 export class NestedDragCache {
   private counts: Uint32Array | null = null;
   private localScratch: Int32Array | null = null;
   private readonly radii = new Map<number, Float64Array>();
+  private readonly baseR = new Map<number, number>();
 
   constructor(
     readonly topo: NestedLayoutTopology,
@@ -85,6 +89,19 @@ export class NestedDragCache {
 
   keepRadii(g: number, r: Float64Array): void {
     this.radii.set(g, r);
+  }
+
+  /**
+   * Module `g`'s disc radius as the layout sized it: `current` (its disc's radius now) until a drag
+   * re-solves it, then the radius recorded then — a drag may since have grown the disc.
+   */
+  radiusOf(g: number, current: number): number {
+    return this.baseR.get(g) ?? current;
+  }
+
+  /** Record module `g`'s disc radius before a drag re-solves it (the first time only). */
+  keepRadius(g: number, r: number): void {
+    if (!this.baseR.has(g)) this.baseR.set(g, r);
   }
 }
 
@@ -130,10 +147,14 @@ export interface NestedDragStats {
   nodeWrites: number;
 }
 
-/** The LOD geometry a tick translates along with the positions: the module tree's `cx` / `cy`. */
+/**
+ * The LOD geometry a tick keeps up with the positions: the module tree's `cx` / `cy` (translated with
+ * the moved subtrees) and `extent` (a re-solved module's grown disc, and its ancestors').
+ */
 export interface NestedDragGeometry {
   cx: Float32Array;
   cy: Float32Array;
+  extent: Float32Array;
 }
 
 const FREE = 0;
@@ -148,6 +169,8 @@ class ModuleReheat {
   readonly mode: Uint8Array;
   /** Non-zero where a child does not move this tick (held while the pointer is down, or fixed). */
   readonly pinned: Uint8Array;
+  /** Non-zero where a child is kept inside the disc (see the constructor). */
+  readonly contain: Uint8Array;
   /** A held child's local position at grab. */
   readonly hx: Float64Array;
   readonly hy: Float64Array;
@@ -185,6 +208,7 @@ class ModuleReheat {
     this.s.ensure(k, 0);
     this.mode = new Uint8Array(k);
     this.pinned = new Uint8Array(k);
+    this.contain = new Uint8Array(k);
     this.hx = new Float64Array(k);
     this.hy = new Float64Array(k);
     this.px = new Float64Array(k);
@@ -236,7 +260,7 @@ class ModuleReheat {
         const o = c - leafCount;
         wx[i] = lx / n + discs.dx[o]!;
         wy[i] = ly / n + discs.dy[o]!;
-        moduleR[i] = discs.r[o]!;
+        moduleR[i] = cache.radiusOf(c, discs.r[o]!); // as laid out: a drag may have grown its ring since
       }
       const t = touched.get(c) ?? 0;
       this.mode[i] = held.has(c) ? HELD : t > 0 ? FIXED : FREE;
@@ -265,6 +289,9 @@ class ModuleReheat {
       this.hx[i] = x[i]!;
       this.hy[i] = y[i]!;
       this.pinned[i] = this.mode[i] === FREE ? 0 : 1;
+      // Kept inside the disc: a free child that is inside it now. One an earlier drag left outside is
+      // not snapped back; neither is the held one, anywhere the cursor takes it.
+      this.contain[i] = this.mode[i] === FREE && Math.hypot(x[i]!, y[i]!) + rad[i]! <= 1 + 1e-6 ? 1 : 0;
     }
     const links = k >= 2 ? moduleLinks(topo, g, start, end, cache.local()) : { la: [], lb: [], lw: [] };
     this.la = links.la;
@@ -283,9 +310,10 @@ class ModuleReheat {
   }
 
   /**
-   * One tick: the held children to the cursor (a world delta `dx`, `dy` since the grab, clamped inside
-   * the disc), then gravity, the sibling springs (a pinned end takes none of the correction), the
-   * velocity step, collision against every disc and containment in the disc for the free children.
+   * One tick: the held children to the cursor (a world delta `dx`, `dy` since the grab, anywhere), then
+   * gravity, the sibling springs (a pinned end takes none of the correction), the velocity step, collision
+   * against every disc, and containment in the disc for the children never held (a released one settles
+   * where it was dropped, pulled in only by gravity and its springs).
    */
   step(alpha: number, dx: number, dy: number, holding: boolean): void {
     const { k, s, pinned, mode } = this;
@@ -294,9 +322,8 @@ class ModuleReheat {
     if (holding) {
       for (let i = 0; i < k; i++) {
         if (mode[i] !== HELD) continue;
-        const [tx, ty] = inside(this.hx[i]! + dx / this.R, this.hy[i]! + dy / this.R, rad[i]!);
-        x[i] = tx;
-        y[i] = ty;
+        x[i] = this.hx[i]! + dx / this.R;
+        y[i] = this.hy[i]! + dy / this.R;
         vx[i] = 0;
         vy[i] = 0;
       }
@@ -337,7 +364,7 @@ class ModuleReheat {
     }
     collide(s, k, PAD, pinned);
     for (let i = 0; i < k; i++) {
-      if (pinned[i]) continue;
+      if (!this.contain[i]) continue;
       const [cx, cy] = inside(x[i]!, y[i]!, rad[i]!);
       x[i] = cx;
       y[i] = cy;
@@ -385,6 +412,25 @@ class ModuleReheat {
         const n = this.chainCount[c]!;
         discs.dx[o] = discs.dx[o]! - shiftX / n;
         discs.dy[o] = discs.dy[o]! - shiftY / n;
+      }
+    }
+    // The disc grows about its fixed centre to enclose a member outside it (the held node, or one dropped
+    // there), and shrinks back to its laid-out radius as the member returns: O(k), plus O(depth) to widen
+    // the ancestors' LOD extents (grow-only — the exact pass after the drag makes them tight again).
+    let reach = 1;
+    for (let i = 0; i < k; i++) reach = Math.max(reach, Math.hypot(s.x[i]!, s.y[i]!) + s.rad[i]!);
+    const r = Math.fround(R * reach);
+    const o = this.g - leafCount;
+    if (r !== discs.r[o]) {
+      discs.r[o] = r;
+      if (geometry) {
+        const { cx, cy, extent } = geometry;
+        extent[this.g] = r;
+        for (let c = 1; c < this.chain.length; c++) {
+          const a = this.chain[c]!;
+          const need = Math.hypot(cx[a]! - cx[this.g]!, cy[a]! - cy[this.g]!) + r;
+          if (need > extent[a]!) extent[a] = need;
+        }
       }
     }
     return most;
@@ -466,8 +512,9 @@ export class NestedDrag {
     }
     const modules: ModuleReheat[] = [];
     for (const g of affected) {
-      const R = discs.r[g - leafCount]!;
+      const R = cache.radiusOf(g, discs.r[g - leafCount]!); // as laid out, not as a drag grew it
       if (!(R > 0)) return null;
+      cache.keepRadius(g, R);
       modules.push(new ModuleReheat(cache, g, R, held, touched, positions, discs));
     }
     return new NestedDrag(cache, discs, modules);

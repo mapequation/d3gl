@@ -173,18 +173,50 @@ describe("nested drag reheat", () => {
     expect(drag!.stats.leafWrites).toBeLessThanOrEqual(drag!.stats.ticks * inside.size);
   });
 
-  it("keeps the held leaf inside its module when the cursor leaves the disc", () => {
+  it("lets the held leaf leave its module's disc: the ring grows about its centre to enclose it", () => {
     const m = nestedMap([3, 4, 16]);
     const cache = new NestedDragCache(m.topo, m.size);
     const leaf = 20;
     const P = m.tree.parent![leaf]!;
-    const R = m.discs.r[P - m.tree.leafCount]!;
+    const o = P - m.tree.leafCount;
+    const R = m.discs.r[o]!;
     const c0 = discCentre(m, m.positions, P);
+    const x0 = m.positions[2 * leaf]!;
+    const y0 = m.positions[2 * leaf + 1]!;
+    computeLODPositions(m.tree, m.positions, m.discs);
     const drag = NestedDrag.start(cache, m.discs, m.positions, [leaf])!;
-    drag.setDelta(10 * R, 0);
-    for (let t = 0; t < 20; t++) drag.tick(m.positions);
+    drag.setDelta(3 * R, 0);
+    for (let t = 0; t < 30; t++) drag.tick(m.positions, m.tree);
+    // The leaf is exactly under the cursor, far outside the disc as laid out.
+    expect(m.positions[2 * leaf]).toBeCloseTo(x0 + 3 * R, 2);
+    expect(m.positions[2 * leaf + 1]).toBeCloseTo(y0, 2);
+    // The disc keeps its centre and grows just enough to enclose it (ring and LOD extent alike).
+    const c1 = discCentre(m, m.positions, P);
+    expect(Math.hypot(c1[0] - c0[0], c1[1] - c0[1])).toBeLessThan(1e-3 * R);
     const d = Math.hypot(m.positions[2 * leaf]! - c0[0], m.positions[2 * leaf + 1]! - c0[1]);
-    expect(d + m.r[leaf]!).toBeCloseTo(R, 3);
+    expect(m.discs.r[o]).toBeCloseTo(d + m.r[leaf]!, 2);
+    expect(m.tree.extent[P]).toBeCloseTo(m.discs.r[o]!, 2);
+    // Its siblings stay inside the disc as laid out.
+    for (const c of kids(m, P)) {
+      if (c === leaf) continue;
+      const cc = c < m.tree.leafCount ? [m.positions[2 * c]!, m.positions[2 * c + 1]!] : discCentre(m, m.positions, c);
+      expect(Math.hypot(cc[0]! - c0[0], cc[1]! - c0[1]) + radiusOf(m, c)).toBeLessThanOrEqual(R * (1 + 1e-4));
+    }
+    // Dropped there, it is not snapped back — and a later grab in the module keeps it out (the ring too).
+    drag.release();
+    while (drag.tick(m.positions, m.tree));
+    const dropped = Math.hypot(m.positions[2 * leaf]! - c0[0], m.positions[2 * leaf + 1]! - c0[1]);
+    expect(dropped).toBeGreaterThan(2 * R);
+    const again = NestedDrag.start(cache, m.discs, m.positions, [kids(m, P).find((c) => c !== leaf)!])!;
+    for (let t = 0; t < 10; t++) again.tick(m.positions, m.tree);
+    const still = Math.hypot(m.positions[2 * leaf]! - c0[0], m.positions[2 * leaf + 1]! - c0[1]);
+    expect(still).toBeGreaterThan(2 * R);
+    expect(m.discs.r[o]!).toBeGreaterThanOrEqual(still + m.r[leaf]! - 1e-3 * R);
+    // Back inside, the ring shrinks back to its laid-out radius.
+    const back = NestedDrag.start(cache, m.discs, m.positions, [leaf])!;
+    back.setDelta(c0[0] - m.positions[2 * leaf]!, c0[1] - m.positions[2 * leaf + 1]!);
+    for (let t = 0; t < 30; t++) back.tick(m.positions, m.tree);
+    expect(m.discs.r[o]).toBeCloseTo(R, 3);
   });
 
   it("drags a module aggregate: its siblings move as a whole, and every other disc stays", () => {

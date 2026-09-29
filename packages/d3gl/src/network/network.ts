@@ -375,8 +375,9 @@ export interface NetworkLayoutOptions {
    * re-lays the map out from the current positions — for a re-clustering (#328).
    *
    * Dragging a node (`interactive({ draggable })`) on a landed nested map re-lays out only its module
-   * around it, on the main thread whatever the backend: the node follows the cursor inside its module's
-   * disc, its siblings move aside, and the disc keeps its centre and radius; a collapsed module moves its
+   * around it, on the main thread whatever the backend: the node follows the cursor anywhere, its siblings
+   * move aside inside the module's disc, and the disc keeps its centre (its ring grows to enclose a member
+   * outside it, and shrinks back as it returns); a collapsed module moves its
    * sibling modules aside in their parent, each as a whole. O(the module's children + the nodes that
    * moved) per frame.
    * @see {@link nestedLayout}
