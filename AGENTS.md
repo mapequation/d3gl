@@ -908,8 +908,8 @@ took to make that fast on the real GPU (M1 Max, ANGLE Metal), in the order it wa
 A luma `Model` compiles and links its program in its constructor, and the main thread waits for it there. So a
 solver built in one go compiled its programs one after another on the main thread, and with the driver's shader cache cold (a first visit, or the first run after the layout's shaders
 changed) ANGLE Metal takes tens of milliseconds per program: the click that started a layout froze for the sum
-(M1 Max, Chromium on ANGLE Metal, measured 2026-09-29 through `network().layout()`: a 1.4-2.1 s task at 552
-nodes and on web-NotreDame, flat and nested alike; 0.07-0.37 s with the parallel compile). Things to know:
+(M1 Max, Chromium on ANGLE Metal, measured 2026-09-29 through `network().layout()`: a 1.3-1.9 s task from 552
+nodes to 1M, flat and nested alike; 0.07-0.7 s with the parallel compile). Things to know:
 
 - **Every layout pass builds its Model from a declared program** (`layoutModel(device, xxxProgram(...))`,
   `passes/fullscreen.ts`, the only way a pass builds one; there is no `fullScreenModel` any more), and each solver
