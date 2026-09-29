@@ -156,10 +156,15 @@ the backend (WebGL / Canvas / SVG): the render is **equivalent** across all thre
 
 Every visual channel maps a flow quantity through a d3 scale, so the map reads quantitatively:
 
-- **`nodeRadius` + `nodeFill`** — total node flow → disc size and fill colour (`nodeRadius: { by: "flow", scale }`, `nodeFill` a per-node colour scale).
+- **`nodeRadius` + `nodeFill`** — total node flow → disc size and fill colour. Both take
+  **`{ by, scale }`**: `nodeRadius: { by: "flow", scale }` with a number scale, `nodeFill: { by: "flow",
+  scale }` with a colour scale (a bare d3 colour scale fits). `by` is any node metric — `"degree"`,
+  `"strength"`, `"flow"` or your own `(index, graph) => value`. (`nodeFill` also takes one colour, or a
+  per-node `(index, graph) => colour` accessor for categorical colours.)
 - **`flowBorder`** — `flow` is a per-node value (your `Float32Array` of enter/exit flow, or a built-in
-  metric like `"strength"`); `scale` maps it to ring width and `color` may be a per-node accessor so
-  the ring colour encodes it too. d3gl doesn't compute enter/exit flow — you supply it (Infomap gives it).
+  metric like `"strength"`); `scale` maps it to ring width and `color` may be a `(value, index, graph)`
+  accessor so the ring colour encodes it too. d3gl doesn't compute enter/exit flow — you supply it
+  (Infomap gives it), per node and, with `moduleFlow`, per module (below).
 - **`linkWidth` + `linkStroke`** — link flow (the per-edge weight) → half-arrow width **and** colour.
   Each takes a constant, a `(weight) => …` scale (a bare d3 colour scale fits `linkStroke` —
   `scaleSqrt().range([light, dark])` interpolates RGBA, alpha included), or **`{ by, scale }`** like
@@ -180,13 +185,39 @@ net.data(graph).style({
   directed: true,
   linkStyle: "half-arrow",
   nodeRadius: { by: "flow", scale: scaleLinear().domain([lo, hi]).range([20, 30]) }, // size ∝ flow
-  nodeFill: (i) => fillColor(graph.flow[i]), // a per-node colour scale on flow
+  nodeFill: { by: "flow", scale: fillColor }, // a d3 colour scale on flow
   flowBorder: { flow: enterExitFlow, scale: borderWidth, color: (v) => borderColor(v) }, // ring ∝ enter/exit
   linkBend: 0.14,
   linkWidth: scaleLinear().domain([lo, hi]).range([7, 13]), // width ∝ link flow
   linkStroke: scaleLinear().domain([lo, hi]).range(["#71B2D7", "#418EC7"]), // colour ∝ link flow
 });
 ```
+
+**Under LOD, a collapsed module reads as its flow too.** With `{ by, scale }` a module aggregate is sized
+*and filled* by the same scale applied to its members' **total** flow, so node and module share one
+legend. (A per-node `nodeFill` accessor gives a module its members' mean colour instead, which is what
+categorical colours want.) Its ring sums its members' enter/exit flow — but a module's real enter/exit
+flow is smaller: the flow between its own submodules never leaves it. Pass the module values you have
+(Infomap reports them per module) as **`moduleFlow`**, keyed by the module's Infomap `path`:
+
+```ts
+// moduleFlow: a Map of each module's enter/exit flow, by its Infomap path joined with ":"
+// ("1:2" = sub-module 2 of top module 1) — from your Infomap result.
+net.data(graph, { modules: infomapResult.nodes }).style({
+  nodeFill: { by: "flow", scale: scaleSequentialLog(interpolateViridis).domain([minFlow, 1]) },
+  flowBorder: { flow: enterExitFlow, scale: borderWidth, moduleFlow: (path) => moduleFlow.get(path.join(":")) },
+});
+```
+
+`moduleFlow` is read for the modules of the hierarchy the engine holds (`data(graph, { modules })`, which
+the default LOD source draws); a module it returns `undefined` for keeps the sum, and so does every
+aggregate that is not a module (`lod({ source: "structure" })` and `"spatial"`). A `color` accessor is
+handed the value the ring actually draws — the module value for a module, with `index` `-1`. A spatial
+cell is a region of the layout rather than a unit of the metric, so, as its radius stays area-additive,
+it keeps its members' mean fill and takes the highest-flow node's ring colour. Everything is resolved
+once per `style()` call — O(nodes) scale calls, O(modules) `moduleFlow` calls — and a zoom frame only
+reads the resolved colours and widths. The [directed map of modules](#a-directed-map-of-modules) below
+uses both (its **Fill** control).
 
 The half-arrow renders fully instanced on the WebGL lane (the vertex shader places the foot, the
 shared centre curve and the barbed head per instance) and traces the identical reference path for
@@ -393,7 +424,8 @@ A new `data(graph)` without a hierarchy clears it. Module-level links (an Infoma
 rows) go alongside: `data(graph, { modules, moduleLinks })`. (`lod({ modules })` still works as an
 alias scoped to the LOD options — `lod(false)` drops it.) Everything else about the cut (declutter,
 `sizeMode`, the on-screen-bounded per-frame work) is the same as for structural coarsening. Under LOD a **module's**
-flow border sums its members' enter/exit flow, and its bent-half-arrow **super-edges** size by the
+flow border sums its members' enter/exit flow unless you give it its own (`flowBorder.moduleFlow`, see
+[Flow borders](#flow-borders-and-half-arrows)), and its bent-half-arrow **super-edges** size by the
 accumulated weight of the edges they subsume — the same flow-border and bent-link glyphs as above,
 driven by the cut.
 
@@ -570,7 +602,10 @@ streams in as one animation of all depths converging together. On a 325,729-leaf
 2 s instead of 18 s on the CPU worker (M1 Max, Chromium). The switch re-lays the map out *warm* and
 *eases* into it — see [below](#re-clustering-warm-re-layout-and-transitions).
 
-Nodes are coloured **categorically by module** (the planted communities). The **LOD** control switches
+Nodes are coloured **categorically by module** (the planted communities); the **Fill** control switches
+to colour ∝ flow (`nodeFill: { by: "flow", scale }`), where a collapsed module is filled by its members'
+total flow. A collapsed module's ring draws **its own** enter/exit flow — `flowBorder.moduleFlow`, from the
+per-module flows `data.ts` derives from the link flows — rather than its members' sum. The **LOD** control switches
 the cut over the same engine-held hierarchy:
 
 - **Off** — every node and half-arrow.

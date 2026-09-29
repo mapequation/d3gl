@@ -1390,6 +1390,19 @@ export interface RadiusAggregate {
   radiusOf: (value: number) => number;
 }
 
+/**
+ * Optional colour aggregation for {@link computeLODStyle} (#445), under a `nodeFill: { by, scale }` spec:
+ * an aggregate is filled like a single leaf carrying the combined value — the SAME colour scale applied to
+ * its summed metric (a module coloured by its total flow), as {@link RadiusAggregate} does for size.
+ * Omitted ⇒ an aggregate takes the chroma-weighted hue mean of its children's colours.
+ */
+export interface FillAggregate {
+  /** Per-leaf metric value (length `leafCount`); summed up the tree onto each aggregate. */
+  leafValue: ArrayLike<number>;
+  /** Maps a (summed) value → RGBA bytes — the same scale the leaves are filled with. */
+  rgbaOf: (value: number) => readonly [number, number, number, number];
+}
+
 // CIE Lab constants (D50), exactly as d3-color's lab.js — see rgbToHcl / hclToRgb.
 const LAB_XN = 0.96422;
 const LAB_YN = 1;
@@ -1511,6 +1524,8 @@ function hclToRgb(h: number, c: number, l: number, out: Float64Array): void {
  * `graph.strength`) driving super-edge weight and declutter priority. `leafBorder` (optional) is the
  * per-leaf flow-border metric (e.g. enter/exit flow); each aggregate gets the **sum** of its
  * descendants' (so a module's border reflects its members' total). Omitted ⇒ `border` stays zero.
+ * `fillAggregate` (with `leafColors`) fills each aggregate with the fill scale on its summed metric
+ * instead of its children's hue mean — see {@link FillAggregate}.
  */
 export function computeLODStyle(
   tree: LODTree,
@@ -1519,18 +1534,24 @@ export function computeLODStyle(
   leafBorder?: ArrayLike<number>,
   leafColors?: ArrayLike<number>,
   radiusAggregate?: RadiusAggregate,
+  fillAggregate?: FillAggregate,
 ): void {
   lodStylePasses++;
   const { leafCount, levelCount, levelOffset, childOffset, children, radius, weight, border, color } = tree;
   // Summed additive metric per node, only when sizing aggregates by the leaf scale (else null → the
   // area-additive √Σr² fallback). One temp array per style recompute, never per frame.
   const value = radiusAggregate ? new Float64Array(tree.size) : null;
+  // The same for the fill (#445): an aggregate's colour is the fill scale on its summed metric, in place
+  // of the hue mean. Needs per-leaf colours to fill the leaves.
+  const fill = fillAggregate && leafColors ? fillAggregate : null;
+  const fillValue = fill ? new Float64Array(tree.size) : null;
 
   for (let i = 0; i < leafCount; i++) {
     radius[i] = leafRadii[i]!;
     weight[i] = leafWeight[i]!;
     border[i] = leafBorder ? leafBorder[i]! : 0;
     if (value) value[i] = radiusAggregate!.leafValue[i]!;
+    if (fillValue) fillValue[i] = fill!.leafValue[i]!;
     if (leafColors) {
       color[i * 4] = leafColors[i * 4]!;
       color[i * 4 + 1] = leafColors[i * 4 + 1]!;
@@ -1545,6 +1566,7 @@ export function computeLODStyle(
       let sumR2 = 0;
       let sv = 0;
       let sb = 0;
+      let sf = 0;
       // Colour: a chroma-weighted circular-hue mean in HCL, so a module's aggregate takes its hue
       // family's representative hue (crisp) rather than a muddy RGB average across the family.
       let hx = 0, hy = 0, sumC = 0, sumL = 0, sumA = 0, nc = 0;
@@ -1554,7 +1576,8 @@ export function computeLODStyle(
         if (value) sv += value[c]!;
         else sumR2 += radius[c]! * radius[c]!;
         sb += border[c]!;
-        if (leafColors) {
+        if (fillValue) sf += fillValue[c]!;
+        else if (leafColors) {
           hueTerms(color[c * 4] ?? 0, color[c * 4 + 1] ?? 0, color[c * 4 + 2] ?? 0, hclOut);
           hx += hclOut[0] ?? 0;
           hy += hclOut[1] ?? 0;
@@ -1572,7 +1595,14 @@ export function computeLODStyle(
         radius[g] = Math.sqrt(sumR2); // area-additive: aggregate ink ≈ Σ child ink
       }
       border[g] = sb; // sum-additive: a module's border metric ≈ Σ member metric
-      if (leafColors && nc > 0) {
+      if (fillValue) {
+        fillValue[g] = sf;
+        const c = fill!.rgbaOf(sf); // the leaf fill scale on the summed metric (a module's total flow)
+        color[g * 4] = c[0];
+        color[g * 4 + 1] = c[1];
+        color[g * 4 + 2] = c[2];
+        color[g * 4 + 3] = c[3];
+      } else if (leafColors && nc > 0) {
         const hue = (Math.atan2(hy, hx) * 180) / Math.PI;
         hclToRgb(hue, sumC / nc, sumL / nc, hclOut);
         color[g * 4] = Math.max(0, Math.min(255, Math.round(hclOut[0] ?? 0)));
@@ -1605,9 +1635,10 @@ export function computeLODGeometry(
   radiusAggregate?: RadiusAggregate,
   discs?: BoundaryDiscs,
   bounds?: LODBoundsScratch,
+  fillAggregate?: FillAggregate,
 ): void {
   computeLODPositions(tree, graph.positions, discs, bounds);
-  computeLODStyle(tree, leafRadii, leafWeight, leafBorder, leafColors, radiusAggregate);
+  computeLODStyle(tree, leafRadii, leafWeight, leafBorder, leafColors, radiusAggregate, fillAggregate);
 }
 
 /**

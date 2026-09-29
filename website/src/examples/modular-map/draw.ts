@@ -1,5 +1,6 @@
 import { network, buildGraph, moduleColors } from "@mapequation/d3gl/network";
-import { scaleSqrt, type ScaleContinuousNumeric } from "d3-scale";
+import { scaleSequentialLog, scaleSqrt, type ScaleContinuousNumeric } from "d3-scale";
+import { interpolateViridis } from "d3-scale-chromatic";
 import type { ImperativeSetup } from "../types.js";
 import { asFtree, makeModularMap } from "./data.js";
 
@@ -11,6 +12,11 @@ const SIZES = [500, 1_000, 2_000, 5_000, 10_000, 20_000];
  * their **module** (a categorical hue per community), sized by their random-walk **flow**, and ringed
  * by their **enter/exit flow**; directed links are **half-arrows** whose width + colour encode link
  * flow. In **screen** sizeMode the glyphs stay a constant pixel size as you zoom.
+ *
+ * A collapsed module's ring draws **its own** enter/exit flow — `flowBorder.moduleFlow(path)`, read from
+ * the per-module flows in `data.ts` (#445) — not its members' sum, which would also count the flow between
+ * its submodules. The **Fill** control switches the categorical module colours for colour ∝ flow,
+ * `nodeFill: { by: "flow", scale }`: a collapsed module is then filled by its members' total flow.
  *
  * The module hierarchy is **data**: `net.data(graph, { modules })` hands it to the engine with the
  * graph (#326), so every module feature reads it whatever the LOD mode. The layout is the
@@ -71,6 +77,8 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
   let layoutMode = ""; // the Layout control's last value ("" = a fresh graph, nothing on screen yet)
   let colors: string[] = [];
   let enterExit: Float32Array<ArrayBufferLike> = new Float32Array();
+  let moduleEnterExit = new Map<string, number>();
+  let flowColor: (flow: number) => string;
   let maxNodeFlow = 1;
   let ringW: ScaleContinuousNumeric<number, number>;
   let linkW: ScaleContinuousNumeric<number, number>;
@@ -85,6 +93,7 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
         input = options.input as string;
         const d = makeModularMap(n);
         enterExit = d.enterExit;
+        moduleEnterExit = d.moduleEnterExit;
         // Categorical colour per planted module; aggregates inherit their module's colour under LOD.
         colors = moduleColors(d.modulePaths, { lightness: 62, chroma: 58 });
         maxNodeFlow = d.nodeFlow.reduce((a, b) => Math.max(a, b), 0);
@@ -92,6 +101,10 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
         const maxLink = d.linkFlow.reduce((a, b) => Math.max(a, b), 0);
         // Range minimums keep glyphs/links from vanishing (the ring may be 0 for interior nodes).
         ringW = scaleSqrt().domain([0, maxEnter]).range([0, 6]);
+        // Fill "Flow": a log colour scale from the smallest node's flow to the whole map's, so a node and a
+        // collapsed module — filled by its members' total flow — share one legend.
+        const minNodeFlow = d.nodeFlow.reduce((a, b) => (b > 0 ? Math.min(a, b) : a), Infinity);
+        flowColor = scaleSequentialLog(interpolateViridis).domain([minNodeFlow, 1]).clamp(true);
         linkW = scaleSqrt().domain([0, maxLink]).range([0.75, 6]); // thin half-arrows
         // Link colour encodes flow (light → dark blue) and is semi-transparent (alpha ∝ flow) so overlaps
         // read as density, not black — a reciprocal pair shows its asymmetry in both width AND colour.
@@ -144,9 +157,12 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
         linkStyle: "half-arrow",
         sizeMode, // "screen" = constant-pixel glyphs (the navigation register LOD wants); "world" scales with zoom
         nodeRadius: { by: "flow", scale: nodeR }, // radius ∝ visit rate
-        nodeFill: (i) => colors[i]!, // categorical module colour
-        // Ring ∝ enter/exit flow; colour omitted ⇒ a darker shade of each glyph's own module colour.
-        flowBorder: { flow: enterExit, scale: ringW },
+        // Fill: a categorical module colour (a collapsed module keeps its hue), or colour ∝ flow — a collapsed
+        // module is then filled by its members' total flow.
+        nodeFill: options.fill === "Flow" ? { by: "flow", scale: flowColor } : (i) => colors[i]!,
+        // Ring ∝ enter/exit flow; colour omitted ⇒ a darker shade of each glyph's own fill. A collapsed
+        // module rings by its OWN enter/exit flow (by Infomap path), not its members' sum.
+        flowBorder: { flow: enterExit, scale: ringW, moduleFlow: (path) => moduleEnterExit.get(path.join(":")) },
         linkBend: 0.15, // fraction of the link's length — keeps its shape at every zoom
         linkWidth: linkW, // half-arrow width ∝ link flow; super-edges use accumulated flow
         linkStroke, // semi-transparent blue, alpha ∝ flow

@@ -28,3 +28,34 @@ describe("asFtree (the modular map as an .ftree carries it)", () => {
     expect(f.moduleLinks.length).toBeGreaterThan(0);
   });
 });
+
+describe("moduleEnterExit (each module's own boundary flow)", () => {
+  const d = makeModularMap(1000);
+  // Each module's members' enter/exit sum, by path — what a module's ring would draw without its own value.
+  const memberSum = new Map<string, number>();
+  for (const { id, path } of d.modulePaths) {
+    for (let k = 1; k < path.length; k++) {
+      const key = path.slice(0, k).join(":");
+      memberSum.set(key, (memberSum.get(key) ?? 0) + d.enterExit[id]!);
+    }
+  }
+
+  it("equals the members' sum for a bottom module (a community), whose members' boundary is its own", () => {
+    for (const { path } of d.modulePaths) {
+      const key = path.slice(0, -1).join(":");
+      expect(d.moduleEnterExit.get(key) ?? 0).toBeCloseTo(memberSum.get(key)!, 5);
+    }
+  });
+
+  it("is at most the members' sum for a super-module, and below it once flow runs between its submodules", () => {
+    const supers = [...memberSum.keys()].filter((k) => !d.modulePaths.some(({ path }) => path.slice(0, -1).join(":") === k));
+    expect(supers.length).toBeGreaterThan(0);
+    let below = 0;
+    for (const k of supers) {
+      const own = d.moduleEnterExit.get(k) ?? 0;
+      expect(own).toBeLessThanOrEqual(memberSum.get(k)! + 1e-6);
+      if (own < memberSum.get(k)! - 1e-6) below++;
+    }
+    expect(below).toBeGreaterThan(0);
+  });
+});

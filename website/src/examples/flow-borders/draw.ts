@@ -48,7 +48,7 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
         linkStyle: "half-arrow",
         sizeMode,
         nodeRadius: { by: "flow", scale: radius }, // radius ∝ total flow
-        nodeFill: (i) => fillColor(graph.flow![i]!), // fill ∝ total flow
+        nodeFill: { by: "flow", scale: fillColor }, // fill ∝ total flow
         flowBorder: { flow: g.outFlow, scale: borderWidth, color: (v) => borderColor(v) }, // ring ∝ enter/exit flow
         linkBend: bend,
         linkWidth, // half-arrow width ∝ link flow

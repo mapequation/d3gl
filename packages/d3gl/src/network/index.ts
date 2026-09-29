@@ -17,7 +17,7 @@
  */
 export { network, Network } from "./network.js";
 export type { NetworkOptions, NetworkStyle, NetworkDataOptions, NetworkLayoutOptions, NetworkLODOptions, NetworkHit, NetworkLinkHit, StateNetworkOptions, NetworkDeclutterStats } from "./network.js";
-export type { NodeRadiusSpec, NodeMetric, ImportanceSpec, FlowBorderSpec, LinkWidthSpec, LinkColorSpec, LinkStyle } from "./glyphs.js";
+export type { NodeRadiusSpec, NodeFillSpec, NodeMetric, ImportanceSpec, FlowBorderSpec, LinkWidthSpec, LinkColorSpec, LinkStyle } from "./glyphs.js";
 
 // Half-arrow geometry now lives in core (shared with the export-only vector view of the instanced
 // lanes, #200); re-exported here so the network entry point keeps its published surface.
