@@ -1678,10 +1678,14 @@ export class Network extends BaseEngine {
       // A layout already landed (no handle runs) is framed once, exactly. A transition, or a warm map still
       // being computed, leaves the camera where it is until the layout lands ({@link startTransition}, or
       // the settle's {@link releaseFit}) — it never frames the layout being replaced.
+      // A nested start still waiting for its module tree (#428) holds the camera: the transport has posted no
+      // bound yet, so it is framed when the first one lands ({@link startNestedLayout}) and only zooms in after.
       if (this.fitOnLayout) {
         if (streamed) {
-          this.recomputeLODGeometry();
-          this.fitViewToLayout("streaming");
+          if (!(nestedTree instanceof Promise)) {
+            this.recomputeLODGeometry();
+            this.fitViewToLayout("streaming");
+          }
         } else if (!this.layoutHandle) {
           this.releaseFit();
         }
@@ -2125,6 +2129,7 @@ export class Network extends BaseEngine {
     if (tree instanceof Promise || layoutClass(opts.backend) === "streaming") {
       const oneFrame = warm || tween !== null;
       this.nestedSolving = true;
+      const awaited = tree instanceof Promise;
       const solveOn = (t: LODTree): WorkerLayoutHandle | null => {
         const { parent } = t;
         if (!parent || this.graph !== graph) return null; // provided module trees always carry their parent map
@@ -2140,7 +2145,12 @@ export class Network extends BaseEngine {
             if (this.graph === graph) this.nestedDiscs = { tree: t, discs }; // the modules' geometry, and their rings' (#329)
           },
           onBounds: (bounds: FitBox) => {
-            if (this.graph === graph) this.fitBound = bounds;
+            if (this.graph !== graph) return;
+            const first = this.fitBound === null;
+            this.fitBound = bounds;
+            // A start that waited for its tree (#428) held the camera until now: frame the first bound the
+            // transport posts (the root disc), as `layout()` frames it for a start that did not wait.
+            if (first && awaited && this.fitOnLayout) this.fitViewToLayout("streaming");
           },
         };
         if (requestsGpu(opts.backend)) {
