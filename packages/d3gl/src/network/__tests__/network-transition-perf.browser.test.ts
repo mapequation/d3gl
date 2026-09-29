@@ -405,6 +405,11 @@ beforeAll(async () => {
     flush();
     fitOff = fitLeg();
     net.setTransform({ k: 1, x: 0, y: 0 }); // back to the view the spatial leg runs at
+    // Glyphs that overlap (#426): the lattice is 8 apart, so 3 px glyphs at k ≈ 1 never overlap and the overlap rule
+    // would open every cell — this leg is about a spatial tree's aggregates (refit per transition frame, rebuilt per
+    // streamed frame), so its glyphs are 10 px wide, as a dense map's are. The cold start's all-leaves frame has its
+    // own guard (network-spatial-lod-coldstart-perf).
+    net.style({ nodeRadius: 5 });
     net.lod({ source: "spatial" }); // the spatial tree (#343): rebuilt per streamed frame, refit per transition frame
     flush();
     spatial = leg(net);
