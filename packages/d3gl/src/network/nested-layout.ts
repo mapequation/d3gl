@@ -507,7 +507,8 @@ export function setupModule(
 
 /**
  * Module `g`'s sibling links (its children are `children[start … end)`): the super-edges between two of
- * them, as local child indices (`c − start` order), sparsified and weighted as {@link ModuleSetup} says.
+ * them, as local child indices (`c − start` order), sparsified and weighted as {@link ModuleSetup} says —
+ * or, with `perDegree: false` (a drag's springs, `nested-drag.ts`), by `√(flow / max flow)` alone.
  * `local` is a global id → local index scratch of length ≥ `topo.size`, all −1 on entry and on return.
  * Shared by the module solve ({@link setupModule}) and a drag's re-solve of one module
  * (`nested-drag.ts`), so both pull on the same springs. O(links · log links).
@@ -518,6 +519,7 @@ export function moduleLinks(
   start: number,
   end: number,
   local: Int32Array,
+  perDegree = true,
 ): Pick<ModuleSetup, "la" | "lb" | "lw"> {
   const { children, superEdgeOffset, superEdgeTarget, superEdgeFlow, parent } = topo;
   const k = end - start;
@@ -550,7 +552,8 @@ export function moduleLinks(
     if (lw[l]! > maxFlow) maxFlow = lw[l]!;
   }
   for (let l = 0; l < links; l++) {
-    lw[l] = Math.sqrt(lw[l]! / (maxFlow || 1)) / Math.max(1, Math.min(degree[la[l]!]!, degree[lb[l]!]!));
+    const share = Math.sqrt(lw[l]! / (maxFlow || 1));
+    lw[l] = perDegree ? share / Math.max(1, Math.min(degree[la[l]!]!, degree[lb[l]!]!)) : share;
   }
   return { la, lb, lw };
 }
@@ -706,7 +709,7 @@ const BH_SCALE = 1000;
  * Barnes-Hut O(k log k) otherwise (built in a ×BH_SCALE frame so its fixed softening is negligible;
  * `strength · BH_SCALE` there yields the same unit-frame force).
  */
-function repel(s: Scratch, k: number, strength: number): void {
+export function repel(s: Scratch, k: number, strength: number): void {
   const { x, y, vx, vy } = s;
   if (k <= EXACT_MAX) {
     for (let i = 0; i < k; i++) {
@@ -741,9 +744,10 @@ function repel(s: Scratch, k: number, strength: number): void {
 /**
  * Push overlapping discs apart (position-based). O(k²) for small k, a uniform grid otherwise. With
  * `pinned` (a drag's re-solve, `nested-drag.ts`), a disc whose entry is non-zero does not move: its
- * partner takes the whole push, and two pinned discs are left as they are.
+ * partner takes the whole push, and two pinned discs are left as they are. `strength` < 1 resolves only
+ * that share of each overlap per call — a soft push that lets discs approach and then ease apart.
  */
-export function collide(s: Scratch, k: number, pad: number, pinned?: Uint8Array): void {
+export function collide(s: Scratch, k: number, pad: number, pinned?: Uint8Array, strength = 1): void {
   const { x, y, rad } = s;
   const resolve = (i: number, j: number): void => {
     const dx = x[j]! - x[i]!;
@@ -758,7 +762,7 @@ export function collide(s: Scratch, k: number, pad: number, pinned?: Uint8Array)
     // `min`, not of min·1e9.) i and j are the module's local child indices (0..k−1); a batched port that
     // holds every module in one slot range reproduces the direction with `slot − segment start` (#355).
     const d = Math.sqrt(d2);
-    const push = d2 > 0 ? (min - d) / d : min;
+    const push = (d2 > 0 ? (min - d) / d : min) * strength;
     const mi = rad[i]! * rad[i]!;
     const mj = rad[j]! * rad[j]!;
     let sj = mi / (mi + mj);
