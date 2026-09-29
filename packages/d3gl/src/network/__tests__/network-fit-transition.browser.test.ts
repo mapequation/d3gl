@@ -55,6 +55,13 @@ class ProbeNetwork extends Network {
 class DepthProbe extends ProbeNetwork {
   flushFrames: () => void = () => {};
   readonly frameScales: number[] = [];
+  /** The camera at each fit framing (its zoom re-seed): the first is the root disc, framed when the
+   *  transport posts it — inside `layout()`, or when a start that waited for its module tree begins (#428). */
+  readonly framings: ViewTransform[] = [];
+  protected override syncZoomToView(): void {
+    super.syncZoomToView();
+    this.framings.push({ ...this.camera });
+  }
   protected override scheduleLayoutRepaint(): void {
     super.scheduleLayoutRepaint();
     this.flushFrames();
@@ -591,9 +598,12 @@ describe("a cold nested map frames its actual bounds, not the root disc (#427)",
       for (const cb of due) cb(performance.now());
     };
     try {
+      const framed = net.framings.length;
       net.layout({ backend: "worker", nested: true, fit: true });
-      const rootDisc = net.camera; // the first paint: framed on the root disc, the only bound known yet
       await net.whenSettled();
+      // The first framing: the root disc, the only bound known before any depth lands.
+      const rootDisc = net.framings[framed];
+      if (!rootDisc) throw new Error("the layout never framed its first bound");
       net.flushFrames();
 
       expectFramed(graph.positions, net.camera);

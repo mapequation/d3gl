@@ -257,6 +257,12 @@ let lodSpatial: Leg;
 let lodSpatialHold: HoldLeg;
 let spatialHeldStats: { hits: number; misses: number; visits: number } | null = null;
 let spatialSweepStats: { hits: number; misses: number; visits: number } | null = null;
+let lodOffSelected: Leg;
+/** Per-frame upload allowed per selected node on the full-detail leg: 2x the ring overlay's 24-byte
+ *  instance. A deterministic count, so absolute (never through `perfBudget`). */
+const RING_BYTES_PER_SELECTED = 48;
+/** Nodes selected for the {@link lodOffSelected} leg: every 97th, spread over the whole grid. */
+const SELECTED = Array.from({ length: Math.ceil(N / 97) }, (_, i) => i * 97);
 
 beforeAll(async () => {
   const spy = new GlBufferSpy();
@@ -407,6 +413,11 @@ beforeAll(async () => {
     net.setTransform(held); // an unchanged re-emit: every row from the memo
     spatialHeldStats = net.superEdgeStats;
     lodSpatialHold = runHold();
+    // Full detail again, with a managed selection (#428): the no-LOD selected-flag cache is keyed on the
+    // selection set, so a key that stopped matching per frame would rebuild and re-upload the flags on
+    // every zoom step. The toggle and the select() are registration events, outside the sweep.
+    net.lod(false).interactive({ selectable: true }).select("nodes", SELECTED);
+    lodOffSelected = runLeg();
 
     net.destroy();
   } finally {
@@ -569,5 +580,27 @@ describe(`network() engine zoom sweep — per-frame cost at N=${N.toLocaleString
       // A held view resolves no link colour at all (every weight is already memoised).
       expect(leg.linkStrokeCalls, `${name}: link colours re-resolved on an unchanged view`).toBe(0);
     }
+  });
+
+  it("LOD OFF with a selection: a zoom frame uploads O(selected), not the selected flags (#428)", () => {
+    expect(lodOffSelected.nodeFillAfter, "nodeFill re-ran during the selected full-detail sweep").toBe(lodOffSelected.nodeFillBefore);
+    expect(lodOffSelected.linkStrokeAfter, "linkStroke re-ran during the selected full-detail sweep").toBe(lodOffSelected.linkStrokeBefore);
+    expect(lodOffSelected.buffersCreated, "GPU buffers were created during the selected full-detail sweep").toBe(0);
+    expect(lodOffSelected.buffersDeleted, "GPU buffers were destroyed during the selected full-detail sweep").toBe(0);
+    // What a selection adds per frame is the ring overlay's instances: 24 bytes per selected node (measured
+    // exactly 516 × 24 B per frame at 50k), O(selected) and absolute. Rebuilding the lane's selected flags
+    // would re-upload one byte per node and per edge on top — the line below only holds while that sits
+    // above it. (The flags cache is not even read per zoom frame: the full-detail emit is static.)
+    const perFrame = lodOffSelected.uploadedBytes / lodOffSelected.frames;
+    const ringBound = SELECTED.length * RING_BYTES_PER_SELECTED;
+    expect(N + EDGES, "the fixture is too small for a flags re-upload to cross the ring bound").toBeGreaterThan(ringBound);
+    expect(
+      perFrame,
+      `${perFrame.toLocaleString()} bytes uploaded per frame with ${SELECTED.length.toLocaleString()} nodes selected — must stay O(selected), not O(${(N + EDGES).toLocaleString()} nodes + edges)`,
+    ).toBeLessThan(ringBound);
+    expect(
+      lodOffSelected.worstFrameMs,
+      `LOD off, ${SELECTED.length.toLocaleString()} nodes selected: worst frame ${lodOffSelected.worstFrameMs.toFixed(2)}ms at N=${N.toLocaleString()}`,
+    ).toBeLessThan(FRAME_MS_STATIC);
   });
 });

@@ -12,6 +12,7 @@
  * spacing.
  */
 import { hcl } from "d3-color";
+import { copyRecordPaths, internModules } from "./module-topology.js";
 
 /** A node's placement in the module tree — `path` is the Infomap 1-based chain (last entry is the rank). */
 export interface ModulePathNode {
@@ -32,49 +33,57 @@ export interface ModuleColorOptions {
  * Per-node CSS colours (indexed by node `id`) for a module hierarchy. A node takes the hue of its
  * **enclosing module** (`path` minus the final rank), so all nodes in a module share a colour and
  * sibling modules get neighbouring hues within their parent's arc.
+ *
+ * A colour belongs to a module, so each is computed once per module (#428): O(nodes · depth) integer work
+ * to find every node's module (see {@link internModules}), plus one HCL conversion per module that holds
+ * a node — not one per node. For a 325k-node, ~40k-module Infomap map: 0.2 s → 58-66 ms in a production
+ * browser build (cold), 0.22 s → 24-26 ms in Node once warm.
  */
 export function moduleColors(nodes: ArrayLike<ModulePathNode>, opts: ModuleColorOptions = {}): string[] {
   const L = opts.lightness ?? 65;
   const C = opts.chroma ?? 48;
   const rotate = opts.rotate ?? 20;
   const n = nodes.length;
-  const prefixKey = (path: ArrayLike<number>, len: number): string => {
-    let s = "";
-    for (let i = 0; i < len; i++) s += (i ? ":" : "") + path[i];
-    return s;
-  };
+  const offset = new Uint32Array(n + 1);
+  for (let r = 0, total = 0; r < n; r++) {
+    total += nodes[r]?.path.length ?? 0;
+    offset[r + 1] = total;
+  }
+  const { moduleParent, moduleChild, recordModule } = internModules(offset, copyRecordPaths(nodes, offset));
 
-  // Per module prefix, the sorted set of its children's components → ordinal index, so each level can
-  // split its parent's arc deterministically by child order.
-  const childSets = new Map<string, Set<number>>();
-  for (let r = 0; r < n; r++) {
-    const { path } = nodes[r]!;
-    for (let d = 0; d + 1 < path.length; d++) {
-      const k = prefixKey(path, d);
-      let set = childSets.get(k);
-      if (!set) childSets.set(k, (set = new Set()));
-      set.add(path[d]!);
+  // Each module's arc: its parent's arc split evenly among the parent's sub-modules, in branch order.
+  // A module is registered after its parent, so one forward pass sees every parent's arc first.
+  const count = moduleParent.length;
+  const ordinal = new Int32Array(count);
+  const siblings = new Int32Array(count);
+  for (let m = 0; m < count; m++) {
+    const kids = moduleChild[m];
+    if (!kids) continue;
+    const branches = [...kids.keys()].sort((a, b) => a - b);
+    for (let i = 0; i < branches.length; i++) {
+      const child = kids.get(branches[i] ?? 0) ?? 0;
+      ordinal[child] = i;
+      siblings[child] = branches.length;
     }
   }
-  const ordinals = new Map<string, Map<number, number>>();
-  for (const [k, set] of childSets) {
-    const ord = new Map<number, number>();
-    [...set].sort((a, b) => a - b).forEach((c, i) => ord.set(c, i));
-    ordinals.set(k, ord);
+  const lo = new Float64Array(count);
+  const hi = new Float64Array(count);
+  hi[0] = 360;
+  for (let m = 1; m < count; m++) {
+    const p = moduleParent[m] ?? 0;
+    const a = lo[p] ?? 0;
+    const span = ((hi[p] ?? 0) - a) / (siblings[m] ?? 1);
+    lo[m] = a + (ordinal[m] ?? 0) * span;
+    hi[m] = (lo[m] ?? 0) + span;
   }
 
+  const colour = new Array<string | undefined>(count);
   const out = new Array<string>(n);
   for (let r = 0; r < n; r++) {
-    const { id, path } = nodes[r]!;
-    let a = 0;
-    let b = 360;
-    for (let d = 0; d + 1 < path.length; d++) {
-      const ord = ordinals.get(prefixKey(path, d))!;
-      const span = (b - a) / ord.size;
-      a += ord.get(path[d]!)! * span;
-      b = a + span;
-    }
-    out[id] = hcl((a + b) / 2 + rotate, C, L).formatHex(); // the enclosing module's arc centre
+    const m = recordModule[r] ?? 0;
+    let c = colour[m];
+    if (c === undefined) colour[m] = c = hcl(((lo[m] ?? 0) + (hi[m] ?? 0)) / 2 + rotate, C, L).formatHex(); // the arc centre
+    out[nodes[r]?.id ?? r] = c;
   }
   return out;
 }

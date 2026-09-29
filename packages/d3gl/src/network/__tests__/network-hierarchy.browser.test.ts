@@ -6,14 +6,21 @@ import { nestedLayout } from "../nested-layout.js";
 
 // Count module-tree builds (#326): the engine must build the tree once per (graph, hierarchy), not once
 // per lod()/layout() call, and never on the pick path.
-const builds = vi.hoisted(() => ({ count: 0 }));
+// `fail` makes the next builds throw (a main-thread fallback that cannot build); `checks` counts module-link
+// checks, each a full pass over the records.
+const builds = vi.hoisted(() => ({ count: 0, fail: null as string | null, checks: 0 }));
 vi.mock("../modules.js", async (importOriginal) => {
   const mod = await importOriginal<typeof import("../modules.js")>();
   return {
     ...mod,
     buildModuleLODTree: (...args: Parameters<typeof mod.buildModuleLODTree>) => {
       builds.count++;
+      if (builds.fail) throw new Error(builds.fail);
       return mod.buildModuleLODTree(...args);
+    },
+    checkModuleLinks: (...args: Parameters<typeof mod.checkModuleLinks>) => {
+      builds.checks++;
+      mod.checkModuleLinks(...args);
     },
   };
 });
@@ -60,6 +67,8 @@ const pathOf = (hit: { datum: unknown } | null): readonly number[] | undefined =
 
 beforeEach(() => {
   builds.count = 0;
+  builds.fail = null;
+  builds.checks = 0;
 });
 
 describe("engine-owned module hierarchy — data(graph, { modules }) (#326)", () => {
@@ -272,6 +281,319 @@ describe("engine-owned module hierarchy — data(graph, { modules }) (#326)", ()
     net.lod({});
     expect(net.lodSource).toBe("modules");
     expect(builds.count).toBe(1);
+    net.destroy();
+  });
+});
+
+// #428: the module tree a nested layout on a streaming backend needs is built on a worker — the main thread
+// flattens the records and posts them, and never runs the build itself. `builds` counts main-thread builds
+// only: the worker imports ./module-topology.js, which this file does not mock (a vi.mock also replaces
+// the module inside a worker the test spawns, and breaks it).
+describe("the module tree is built off the main thread (#428)", () => {
+  const frame = () => new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+
+  it("a nested layout on the worker gets its tree from a worker, and so does the cut", async () => {
+    const net = network(host(), { width: 200, height: 200 });
+    await net.whenReady();
+    const g = graph();
+    const expected = expectedNested(g, MODULES); // (a main-thread build of the test's own)
+    builds.count = 0;
+    net.data(g, { modules: MODULES }).lod({ expandPx: 60, declutter: false }).layout({ backend: "worker", nested: true });
+    expect(net.lodSource).toBe("none"); // the tree is on its way
+    expect(net.pick(100, 100)).toBeNull(); // and a synchronous read does not build it here: no cut yet
+    await Promise.resolve();
+    expect(net.lodSource).toBe("none"); // lod()'s deferred build stood down for the worker's
+    await net.whenSettled();
+    await frame(); // the tree's landing repaint
+    expect(builds.count, "the main thread built the module tree").toBe(0);
+    expect(net.lodSource).toBe("modules");
+    expect(Array.from(g.positions)).toEqual(expected);
+    // The worker's tree is the module tree: laid out by hand, the cut draws — and picks — its modules.
+    net.layout({ backend: "positions", positions: POSITIONS });
+    expect(net.pick(30, 30)).toMatchObject({ datum: { aggregate: true, count: 4 } });
+    expect(pathOf(net.pick(30, 30))).toEqual([1]);
+    expect(pathOf(net.pick(150, 150))).toEqual([2]);
+    expect(builds.count, "the worker's tree was not reused").toBe(0);
+    net.destroy();
+  });
+
+  it("with LOD off, the nested layout still solves on the worker's tree", async () => {
+    const net = network(host(), { width: 200, height: 200 });
+    await net.whenReady();
+    const g = graph();
+    const expected = expectedNested(g, MODULES);
+    builds.count = 0;
+    net.data(g, { modules: MODULES }).layout({ backend: "worker", nested: true });
+    await net.whenSettled();
+    expect(builds.count).toBe(0);
+    expect(Array.from(g.positions)).toEqual(expected);
+    net.destroy();
+  });
+
+  it("a warm re-layout with a transition, on a new hierarchy, waits for its tree too", async () => {
+    const net = network(host(), { width: 200, height: 200 });
+    await net.whenReady();
+    const g = graph();
+    net.data(g, { modules: MODULES }).layout({ backend: "positions", positions: POSITIONS });
+    // A re-clustering: the same nodes and buffers as a new graph object, with a new partition.
+    const g2: NetworkGraph = { ...g };
+    net.data(g2, { modules: PAIRS }).lod({ declutter: false }).layout({ backend: "worker", nested: { warm: true }, transition: 50 });
+    await net.whenSettled();
+    await frame();
+    expect(builds.count).toBe(0);
+    expect(net.lodSource).toBe("modules");
+    expect(Array.from(g2.positions).every(Number.isFinite)).toBe(true);
+    net.destroy();
+  });
+
+  it("drops a tree still in flight when data() swaps the graph, and builds the new one", async () => {
+    const net = network(host(), { width: 200, height: 200 });
+    await net.whenReady();
+    const g = graph();
+    const g2 = graph();
+    const expected = expectedNested(g2, PAIRS);
+    builds.count = 0;
+    net.data(g, { modules: MODULES }).lod({}).layout({ backend: "worker", nested: true });
+    net.data(g2, { modules: PAIRS }).lod({}).layout({ backend: "worker", nested: true });
+    await net.whenSettled();
+    await frame();
+    expect(builds.count).toBe(0);
+    expect(net.lodSource).toBe("modules");
+    expect(Array.from(g2.positions)).toEqual(expected);
+    net.destroy();
+  });
+
+  it("without a layout, lod() builds the tree on the main thread before the next frame", async () => {
+    const net = network(host(), { width: 200, height: 200 });
+    await net.whenReady();
+    net.data(graph(), { modules: MODULES }).lod({});
+    expect(net.lodSource).toBe("none"); // deferred to the end of the call chain
+    await Promise.resolve();
+    expect(net.lodSource).toBe("modules");
+    expect(builds.count).toBe(1);
+    net.destroy();
+  });
+
+  it("checks an explicit lod({ modules }) when it is set, though its build waits", async () => {
+    const net = network(host(), { width: 200, height: 200 });
+    await net.whenReady();
+    net.data(graph(), { modules: MODULES });
+    expect(() => net.lod({ modules: MODULES.slice(1) })).toThrow(/no record for node id 0/);
+    expect(() => net.lod({ modules: MODULES, moduleLinks: [{ source: [99], target: [1], flow: 1 }] })).toThrow(/endpoint 99/);
+    net.destroy();
+  });
+
+  it("an engine destroyed while its tree is on the way builds nothing", async () => {
+    const net = network(host(), { width: 200, height: 200 });
+    await net.whenReady();
+    net.data(graph(), { modules: MODULES }).lod({}).layout({ backend: "worker", nested: true });
+    net.destroy();
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    expect(builds.count).toBe(0);
+    expect(net.lodSource).toBe("none");
+  });
+
+  it("without Web Workers, the tree is built on the main thread after all", async () => {
+    vi.stubGlobal("Worker", undefined);
+    try {
+      const net = network(host(), { width: 200, height: 200 });
+      await net.whenReady();
+      const g = graph();
+      const expected = expectedNested(g, MODULES);
+      builds.count = 0;
+      net.data(g, { modules: MODULES }).lod({}).layout({ backend: "worker", nested: true });
+      // Solved in place, as before #428: nothing waits for a worker that cannot exist.
+      expect(builds.count).toBe(1);
+      expect(Array.from(g.positions)).toEqual(expected);
+      await net.whenSettled();
+      await frame();
+      expect(builds.count).toBe(1);
+      expect(net.lodSource).toBe("modules");
+      expect(Array.from(g.positions)).toEqual(expected);
+      net.destroy();
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("a tree that can be built neither on the worker nor on the main thread rejects whenSettled()", async () => {
+    // A worker that fails, then a main-thread fallback that throws: the nested layout can never start.
+    class FailingWorker {
+      onmessage: ((e: MessageEvent) => void) | null = null;
+      onerror: ((e: Event) => void) | null = null;
+      onmessageerror: ((e: MessageEvent) => void) | null = null;
+      postMessage(): void {
+        setTimeout(() => this.onerror?.(new Event("error")), 0);
+      }
+      terminate(): void {}
+    }
+    vi.stubGlobal("Worker", FailingWorker);
+    try {
+      const net = network(host(), { width: 200, height: 200 });
+      await net.whenReady();
+      net.data(graph(), { modules: MODULES });
+      builds.fail = "no tree";
+      net.layout({ backend: "worker", nested: true });
+      const hung = new Promise<string>((resolve) => setTimeout(() => resolve("never settled"), 2000));
+      const outcome = await Promise.race([net.whenSettled().then(() => "settled", (e: Error) => e.message), hung]);
+      expect(outcome).toBe("no tree");
+      net.destroy();
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  // The GPU layout's module-aware seed (N8.2) waits for its device anyway, so it waits for the worker's
+  // tree too: one pipeline for every streaming backend.
+  it("a GPU layout's module seed gets its tree from a worker, and so does the cut", async () => {
+    const net = network(host(), { width: 200, height: 200 });
+    await net.whenReady();
+    const g = graph();
+    net.data(g, { modules: MODULES }).lod({ declutter: false }).layout({ backend: "gpu", iterations: 20 });
+    expect(builds.count, "the GPU seed built the module tree on the main thread").toBe(0);
+    await net.whenSettled();
+    await frame();
+    expect(builds.count).toBe(0);
+    expect(net.lodSource).toBe("modules");
+    expect(Array.from(g.positions).every(Number.isFinite)).toBe(true);
+    net.destroy();
+  });
+
+  it("checks an explicit lod({ modules, moduleLinks }) once, when it is set", async () => {
+    const net = network(host(), { width: 200, height: 200 });
+    await net.whenReady();
+    net.data(graph()).lod({ modules: MODULES, moduleLinks: [{ source: [1], target: [2], flow: 0.5 }] });
+    expect(builds.checks).toBe(1);
+    net.layout({ backend: "worker", nested: true });
+    await net.whenSettled();
+    expect(builds.checks, "the tree job checked the links lod() had checked").toBe(1);
+    expect(builds.count).toBe(0);
+    net.destroy();
+  });
+
+  // Interaction state set while the tree is on its way — Network Navigator selects its search hits during a
+  // load — is kept by layer name and drawn when the tree lands, exactly as the same calls made after the
+  // landing draw it. Nor does it take the build back to the main thread. `fit` frames the whole map, so
+  // every leaf is drawn and exported.
+  const VIEW = { k: 3, x: 100, y: 100 };
+  it("a select() made while the tree is on its way is kept, observed and drawn once it lands", async () => {
+    const net = network(host(), { width: 200, height: 200 });
+    await net.whenReady();
+    const seen: (string | number)[][] = [];
+    net.on("select", (hits) => seen.push(hits.map((h) => h.id)));
+    net.interactive({ selectable: true });
+    net.data(graph(), { modules: MODULES }).lod({ expandPx: 1, declutter: false }).layout({ backend: "worker", nested: true, fit: true });
+    net.select("nodes", [0]);
+    expect(seen).toEqual([[0]]);
+    expect(net.selection().map((h) => h.id)).toEqual([0]);
+    await net.whenSettled();
+    await frame();
+    expect(builds.count, "the selection pulled the build onto the main thread").toBe(0);
+    expect(net.lodSource).toBe("modules");
+    expect(net.selection()).toMatchObject([{ id: 0, datum: { aggregate: false, count: 1 } }]);
+    const kept = net.toSVG();
+    net.select("nodes", null);
+    const none = net.toSVG();
+    net.select("nodes", [0]);
+    expect(kept).not.toBe(none); // the kept selection is drawn…
+    expect(kept).toBe(net.toSVG()); // …as a selection made after the landing is
+    net.destroy();
+  });
+
+  it.each(["svg", "canvas"] as const)(
+    "on the %s backend, select(), setStyle(), clearStyle() and highlight() chained after lod() are drawn when its build lands",
+    async (backend) => {
+      const net = network(host(), { width: 200, height: 200, backend });
+      await net.whenReady();
+      const g = graph();
+      g.positions.set(POSITIONS); // placed, but by no layout: lod() defers its build to the end of the chain
+      const interact = (): void => {
+        net.select("nodes", [0]).setStyle("nodes", [2], { fill: "#ff0000" }).clearStyle("nodes", [1]).highlight("nodes", [3]);
+      };
+      net.data(g, { modules: MODULES }).lod({ expandPx: 1, declutter: false });
+      interact();
+      expect(net.lodSource).toBe("none"); // the setters kept their state instead of building the tree
+      await Promise.resolve();
+      expect(net.lodSource).toBe("modules");
+      expect(builds.count).toBe(1); // the end-of-chain build, once
+      const kept = net.toSVG();
+      net.select("nodes", null).highlight("nodes", null);
+      const none = net.toSVG();
+      interact();
+      expect(kept).not.toBe(none);
+      expect(kept).toBe(net.toSVG());
+      net.destroy();
+    },
+  );
+
+  // While a worker builds the tree the Scene layers are not drawn either. Overrides and highlights are
+  // keyed by id, so they draw exactly as when set after the landing. (A Scene selection styles the glyphs
+  // drawn when it is applied — here the first cut after the landing — as a select() during a streamed
+  // layout always has; the WebGL lane applies it per frame.)
+  it.each(["svg", "canvas"] as const)(
+    "on the %s backend, a select(), setStyle() and highlight() made while the tree is on its way are kept",
+    async (backend) => {
+      const net = network(host(), { width: 200, height: 200, backend });
+      await net.whenReady();
+      const interact = (): void => {
+        net.setStyle("nodes", [2], { fill: "#ff0000" }).highlight("nodes", [1]);
+      };
+      net.setTransform(VIEW); // a fixed view that holds the whole map
+      net.data(graph(), { modules: MODULES }).lod({ expandPx: 1, declutter: false }).layout({ backend: "worker", nested: true });
+      interact();
+      await net.whenSettled();
+      await frame();
+      expect(builds.count).toBe(0);
+      expect(net.lodSource).toBe("modules");
+      const kept = net.toSVG();
+      net.clearStyle("nodes").highlight("nodes", null);
+      const none = net.toSVG();
+      interact();
+      expect(kept).not.toBe(none);
+      expect(kept).toBe(net.toSVG());
+
+      // A selection is kept and observed too, and resolves against the layer once it is drawn.
+      const seen: (string | number)[][] = [];
+      net.on("select", (hits) => seen.push(hits.map((h) => h.id)));
+      net.data(graph(), { modules: PAIRS }).lod({ expandPx: 1, declutter: false }).layout({ backend: "worker", nested: true });
+      net.select("nodes", [0]);
+      expect(seen).toEqual([[0]]);
+      await net.whenSettled();
+      await frame();
+      expect(builds.count).toBe(0);
+      expect(net.selection().map((h) => [h.id, h.datum !== null])).toEqual([[0, true]]);
+      net.destroy();
+    },
+  );
+
+  it("a selection held when the chain starts leaves the tree to the worker", async () => {
+    const net = network(host(), { width: 200, height: 200 });
+    await net.whenReady();
+    net.interactive({ selectable: true });
+    net.data(graph(), { modules: MODULES }).select("nodes", [0]).lod({ expandPx: 1, declutter: false });
+    expect(net.lodSource).toBe("none"); // lod() waits for the end of the chain, selection or not
+    net.layout({ backend: "worker", nested: true, fit: true });
+    await net.whenSettled();
+    await frame();
+    expect(builds.count, "the selection took the build back to the main thread").toBe(0);
+    expect(net.selection()).toMatchObject([{ id: 0, datum: { aggregate: false, count: 1 } }]);
+    net.destroy();
+  });
+
+  it.each(["svg", "canvas"] as const)("on the %s backend, a highlight held when the chain starts survives the wait", async (backend) => {
+    const net = network(host(), { width: 200, height: 200, backend });
+    await net.whenReady();
+    net.setTransform(VIEW);
+    net.data(graph(), { modules: MODULES }).highlight("nodes", [1]).lod({ expandPx: 1, declutter: false }).layout({ backend: "worker", nested: true });
+    await net.whenSettled();
+    await frame();
+    expect(builds.count).toBe(0);
+    const kept = net.toSVG();
+    net.highlight("nodes", null);
+    const none = net.toSVG();
+    net.highlight("nodes", [1]);
+    expect(kept).not.toBe(none);
+    expect(kept).toBe(net.toSVG());
     net.destroy();
   });
 });

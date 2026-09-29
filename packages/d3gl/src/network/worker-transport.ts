@@ -14,12 +14,14 @@ import type { NetworkGraph } from "./graph.js";
 import type { Device } from "@luma.gl/core";
 import { multilevelLayout, type CoarsenOptions } from "./coarsen.js";
 import { ForceLayout, seedPositions, type ForceParams } from "./force.js";
-import { lodTreeFromTopology, type BoundaryDiscs, type LODTree } from "./lod.js";
+import { lodTreeFromTopology, type BoundaryDiscs, type LODTopology, type LODTree } from "./lod.js";
 import type { FitBox } from "./fit.js";
+import type { FlatModuleLinks, FlatModuleRecords } from "./module-topology.js";
 import { nestedLayout, nestedBoundaryDiscs, nestedRootBounds, type NestedLayoutParams, type NestedLayoutTopology } from "./nested-layout.js";
 import {
   lodGeometryViews,
   lodGeometryByteLength,
+  transferList,
   type MainToWorker,
   type NestedPrepReply,
   type WorkerToMain,
@@ -130,6 +132,143 @@ export interface WorkerLayoutHandle {
 
 /** Handle for the synchronous fallback (no live worker) — reheat is a no-op there. */
 const NOOP_DRAG = { pin() {}, unpin() {} };
+
+/**
+ * A handle for a layout that can start only once `ready` resolves (#428) — a nested layout waiting for
+ * its module tree to be built off the main thread. `start` runs then, unless the handle was stopped
+ * first; `settled` resolves when the started run settles, at once if `start` declines (returns null),
+ * or on {@link WorkerLayoutHandle.stop}. It rejects with the error if `ready` rejects, if `start` throws,
+ * or if the run's own `settled` rejects, so `whenSettled()` reports a failed start instead of never
+ * settling. Pins reach the run once it is live, and so do its `shared`, `transport` and `mainThread`
+ * reports: a copy-mode default until then, as `startGpuLayout`'s handle reports while it waits for
+ * its device — with `waiting` as the transport meanwhile (`"pending"` for a GPU start, which the LOD
+ * guards read as a streaming transport still resolving).
+ */
+export function deferredLayoutHandle<T>(ready: Promise<T>, start: (value: T) => WorkerLayoutHandle | null, waiting?: "pending"): WorkerLayoutHandle {
+  let run: WorkerLayoutHandle | null = null;
+  let stopped = false;
+  let resolveSettled: () => void = () => {};
+  let rejectSettled: (error: unknown) => void = () => {};
+  const settled = new Promise<void>((resolve, reject) => {
+    resolveSettled = resolve;
+    rejectSettled = reject;
+  });
+  void ready.then((value) => {
+    if (stopped) return;
+    try {
+      run = start(value);
+    } catch (error) {
+      rejectSettled(error);
+      return;
+    }
+    if (run) run.settled.then(resolveSettled, rejectSettled);
+    else resolveSettled();
+  }, rejectSettled);
+  return {
+    get shared() {
+      return run?.shared ?? false;
+    },
+    get transport() {
+      return run ? run.transport : waiting;
+    },
+    get mainThread() {
+      return run?.mainThread;
+    },
+    settled,
+    stop() {
+      stopped = true;
+      run?.stop();
+      resolveSettled();
+    },
+    pin(ids, positions) {
+      run?.pin(ids, positions);
+    },
+    unpin() {
+      run?.unpin();
+    },
+    setLODStyle(style, version) {
+      run?.setLODStyle?.(style, version);
+    },
+    setLODView(view) {
+      run?.setLODView?.(view);
+    },
+    moveDevice(next) {
+      run?.moveDevice?.(next);
+    },
+  };
+}
+
+/** A module tree being built on a worker ({@link buildModuleTopologyOffThread}). */
+export interface ModuleTopologyJob {
+  /** The built topology — or null when the worker failed (an error, or a message that could not be
+   *  deserialized), so the caller builds it itself. Never settles once {@link cancel}led. */
+  topology: Promise<LODTopology | null>;
+  /** Stop the build and tear its worker down. */
+  cancel(): void;
+}
+
+/** What {@link buildModuleTopologyOffThread} posts: the flat records and, when there are any, module links. */
+export interface ModuleTopologyInput {
+  records: FlatModuleRecords;
+  links?: FlatModuleLinks;
+}
+
+/**
+ * Build a module hierarchy's {@link LODTopology} on a Web Worker (#428), off the main thread — what
+ * `buildModuleTopology(nodeCount, records, edges, links)` computes. Returns null, having run nothing, when
+ * no worker can be created (no `Worker`, or its construction throws): the caller builds the tree itself,
+ * synchronously. Otherwise `input` runs once the worker exists; its records and links are **transferred**
+ * (the caller flattens them for this and must not use them afterwards), and the edge buffers are copied,
+ * so the graph keeps its own. The main thread's share is that copy and the post; the tree's buffers come
+ * back transferred, so receiving it costs no copy either.
+ */
+export function buildModuleTopologyOffThread(
+  nodeCount: number,
+  input: () => ModuleTopologyInput,
+  edges: { source: Uint32Array; target: Uint32Array; weight: Float32Array },
+): ModuleTopologyJob | null {
+  if (typeof Worker === "undefined") return null;
+  let worker: Worker;
+  try {
+    worker = new Worker(new URL("./layout-worker.js", import.meta.url), { type: "module" });
+  } catch {
+    return null;
+  }
+  let resolveTopology: (topology: LODTopology | null) => void = () => {};
+  const topology = new Promise<LODTopology | null>((resolve) => {
+    resolveTopology = resolve;
+  });
+  const cancel = (): void => {
+    worker.terminate();
+    worker.onmessage = null;
+    worker.onerror = null;
+    worker.onmessageerror = null;
+  };
+  /** The worker cannot deliver the tree: tear it down and let the caller build it. */
+  const fail = (): void => {
+    cancel();
+    resolveTopology(null);
+  };
+  worker.onmessage = (e: MessageEvent<WorkerToMain>): void => {
+    const msg = e.data;
+    if (msg.type !== "module-tree") return;
+    cancel();
+    resolveTopology(msg.topology);
+  };
+  worker.onerror = fail;
+  worker.onmessageerror = fail; // the tree arrived but could not be deserialized
+  let payload: ModuleTopologyInput;
+  try {
+    payload = input();
+  } catch (error) {
+    cancel(); // invalid records: no build, and no worker left behind
+    throw error;
+  }
+  const { records, links } = payload;
+  const message: MainToWorker = { type: "build-module-tree", nodeCount, records, links, source: edges.source, target: edges.target, weight: edges.weight };
+  worker.postMessage(message, transferList([records.id, records.offset, records.entries, links?.sourceOffset, links?.source, links?.targetOffset, links?.target, links?.flow]));
+  return { topology, cancel };
+}
 
 /**
  * Whether this environment can use the `SharedArrayBuffer` zero-copy position transport: `SharedArrayBuffer`
@@ -248,7 +387,7 @@ export function startWorkerLayout(
       onLODTree?.(lodTreeFromTopology(topology, lodGeometryViews(buffer, topology.size)));
       return;
     }
-    if (msg.type === "lod-geometry" || msg.type === "seed-plan") return; // only the GPU layout's coarsening worker sends these (#377, #353)
+    if (msg.type === "lod-geometry" || msg.type === "seed-plan" || msg.type === "module-tree") return; // only the GPU layout's coarsening worker (#377, #353) or a module-tree build (#428) sends these
     // frame | done
     if (msg.positions && !shared) graph.positions.set(msg.positions);
     if (msg.geometry && lodGeomFlat) lodGeomFlat.set(msg.geometry); // copy-mode geometry snapshot
@@ -413,7 +552,7 @@ export function startNestedWorkerLayout(
   };
   worker.onmessage = (e: MessageEvent<WorkerToMain>): void => {
     const msg = e.data;
-    if (msg.type === "lod-topology" || msg.type === "lod-geometry" || msg.type === "seed-plan" || terminated) return;
+    if (msg.type === "lod-topology" || msg.type === "lod-geometry" || msg.type === "seed-plan" || msg.type === "module-tree" || terminated) return;
     if (msg.type === "done") {
       if (msg.positions) land(msg.positions, msg.boundaries);
       terminate();

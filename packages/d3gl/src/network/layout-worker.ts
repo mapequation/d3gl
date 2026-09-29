@@ -32,9 +32,9 @@
  * The page's lib is `["ES2020","DOM"]` (the library targets the browser main thread too), so the
  * worker globals here are typed against `DOM`. Positions use single-argument `postMessage` (no
  * transferables): structured clone copies the snapshot synchronously at post time, so the worker may keep
- * writing its buffer. A spatial frame's buffers and the LOD refit's messages are transferred instead,
- * through the `DOM` `postMessage(message, { transfer })` overload — so no worker-lib cast is needed either
- * way.
+ * writing its buffer. A spatial frame's buffers, the LOD refit's messages and a module tree built here
+ * (#428, posted once and never touched again) are transferred instead, through the `DOM`
+ * `postMessage(message, { transfer })` overload — so no worker-lib cast is needed either way.
  */
 import { DRAG_HEAT, ForceLayout, RECOOL_TICKS, seedPositions } from "./force.js";
 import { nestedLayout, nestedBoundaryDiscs } from "./nested-layout.js";
@@ -43,9 +43,11 @@ import { multilevelSeedSteps, buildHierarchy, type SeedProgress } from "./coarse
 import { flattenHierarchyToTopology, lodTreeFromTopology } from "./lod.js";
 import { lodFrameStep, makeSpatialLODStream, makeStructureLODStream, recycleSpatialFrame, type LODStream } from "./lod-frame.js";
 import { answerCoarsen, answerLODGeometry } from "./lod-refit.js";
+import { buildModuleTopology } from "./module-topology.js";
 import {
   lodGeometryViews,
   lodGeometryByteLength,
+  topologyBuffers,
   type CoarsenMessage,
   type LODGeometryRequest,
   type MainToWorker,
@@ -475,6 +477,13 @@ addEventListener("message", (e: MessageEvent<MainToWorker>) => {
     case "lod-geometry":
       refitLOD(msg);
       return;
+    case "build-module-tree": {
+      // Built in one go; the main thread terminates this worker once the tree arrives.
+      const topology = buildModuleTopology(msg.nodeCount, msg.records, msg, msg.links);
+      const message: WorkerToMain = { type: "module-tree", topology };
+      postMessage(message, { transfer: topologyBuffers(topology) });
+      return;
+    }
     case "start-nested": {
       // One synchronous top-down pass (each depth final); a `stop` can only land after it, and the main
       // thread terminates the worker on stop anyway.

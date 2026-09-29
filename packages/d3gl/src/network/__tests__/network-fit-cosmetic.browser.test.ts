@@ -79,6 +79,37 @@ describe("fit + cosmetic restyle", () => {
   // load-network path (#238): worker backend + engine-managed net.labels, no fit (the worker seeds a
   // viewport-centred disc, so it opens framed at k=1). Asserts the layout is centred (not piled at the
   // origin) and that labelOf labels render as tracked overlay elements.
+  // A reframe re-seeds d3-zoom (syncZoomToView), and d3-zoom's programmatic `transform` emits start and end
+  // like a gesture. The fit must not take its own reframe for the user's hand: on a zoom-enabled engine whose
+  // backend is live, layout()'s first reframe runs at once, and the fit must still track the layout until it
+  // settles, then frame the settled layout. (With LOD, which reframes on the tree's live geometry; with LOD
+  // off the fit box is a one-time box over the seeded positions by design.)
+  it("a zoom-enabled engine keeps framing a streaming layout until it settles", async () => {
+    const host = makeHost();
+    const net = network(host, { width: W, height: H, backend: "webgl" });
+    net.enableZoom([0.05, 40]);
+    await net.whenReady();
+    const { graph } = moduleGraph(0x1357);
+    net.data(graph).style({ nodeRadius: 2 }).lod({ declutter: false }).layout({ backend: "worker", fit: true, iterations: 150 });
+    await net.whenSettled();
+
+    const t = tf(net);
+    const pos = graph.positions;
+    let onScreen = 0;
+    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    for (let i = 0; i < graph.nodeCount; i++) {
+      const x = t.k * pos[2 * i]! + t.x;
+      const y = t.k * pos[2 * i + 1]! + t.y;
+      if (x >= 0 && x <= W && y >= 0 && y <= H) onScreen++;
+      minX = Math.min(minX, x); maxX = Math.max(maxX, x); minY = Math.min(minY, y); maxY = Math.max(maxY, y);
+    }
+    // Framed on the settled layout: (nearly) every node on screen, and the layout filling the view rather
+    // than sitting small inside the box of the seed disc it started from.
+    expect(onScreen / graph.nodeCount).toBeGreaterThan(0.95);
+    expect(Math.max((maxX - minX) / W, (maxY - minY) / H)).toBeGreaterThan(0.6);
+    net.destroy();
+  });
+
   it("worker + net.labels: seed-framed (centred), with vertex labels rendered", async () => {
     const host = makeHost();
     const net = network(host, { width: W, height: H, backend: "webgl" });

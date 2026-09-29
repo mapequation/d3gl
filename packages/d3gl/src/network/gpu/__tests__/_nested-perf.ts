@@ -21,6 +21,7 @@ import { MIN_FRAME_MS } from "../repaint-throttle.js";
 import { AsyncPositionReadback } from "../async-readback.js";
 import { makeTestDevice } from "./_device.js";
 import { perfN } from "../../../__tests__/perf-budget.js";
+import { expectLaneGrowthOnly, wrapLaneUpdates, type LaneEvent } from "./_lane-growth.js";
 
 export const LOCAL_N = 20_000; // the leaves the fixture defaults to (the ceilings below were measured there)
 // Capped: SwiftShader runs the compact phase's collision gathers slowly (a dense segment falls back to
@@ -121,6 +122,7 @@ export type GlEvent =
   | { kind: "wait"; sync: WebGLSync; signaled: boolean }
   | { kind: "layout-draw"; count: number; viewport1x1: boolean; points: boolean }
   | { kind: "create" }
+  | LaneEvent
   /** A `setTransform` call starts (`true`) or returns: the draw path's re-emit, attributed apart from the transport. */
   | { kind: "camera"; start: boolean }
   | { kind: "frame-end" };
@@ -178,6 +180,7 @@ export class GlCallLog {
     for (const name of ["createBuffer", "createTexture", "createFramebuffer"] as const) {
       this.wrap(proto, name, () => log.push({ kind: "create" }));
     }
+    this.restores.push(wrapLaneUpdates(log)); // a GPU object created inside a lane's update is that lane growing
   }
 
   private wrap(
@@ -366,9 +369,11 @@ export function assertSignatures(leg: Leg): void {
       if (firstDraw >= 0) expect(harvest, `frame ${f}: harvest after an encode`).toBeLessThan(firstDraw);
     }
   });
+  // No GPU object created per frame once the stream runs, except an instanced lane that outgrows its buffers by
+  // at least doubling them — the flat guard's rule (#417, `_lane-growth.ts`). Under LOD the module tree may still
+  // be on its way from a worker at the first repaint (#428), so the lanes register with the tree a repaint later.
   const firstRepaint = frames.findIndex((s) => s.repaintMs > 0);
-  const later = segments.slice(firstRepaint + 1).flat().filter((e) => e.kind === "create").length;
-  expect(later, "GPU objects created per streamed frame").toBe(0);
+  expectLaneGrowthOnly(segments.slice(firstRepaint + 1).flat());
   // Repaints (a harvest runs onFrame) throttled to ≥ minFrameMs apart; the final one always paints.
   const repaints = frames.filter((s) => s.harvested).map((s) => s.now);
   for (let i = 1; i < repaints.length - 1; i++) {

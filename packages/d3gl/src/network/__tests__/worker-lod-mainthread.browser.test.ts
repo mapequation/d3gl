@@ -178,9 +178,9 @@ describe("lod() before the first layout defers the main-thread tree build", () =
     host.remove();
   });
 
-  // select()/selection() resolve against the registered lane (WebGL) or Scene spec (Canvas/SVG). While the
-  // build is queued neither exists, so without the flush a select chained after lod() was dropped: no
-  // managed selection, no on("select").
+  // select() resolves against the registered lane (WebGL) or Scene spec (Canvas/SVG). While the build is
+  // queued neither exists: the selection is kept by name (#428) and observed at once, and selection() — a
+  // read — builds the tree to resolve its datums.
   it("a select() chained after lod() is kept and observed, as with an immediate build", async () => {
     const { net, host } = makeNet();
     await net.whenReady();
@@ -195,6 +195,33 @@ describe("lod() before the first layout defers the main-thread tree build", () =
     await Promise.resolve();
     await frame();
     expect(net.selection().map((h) => h.id)).toEqual([0, 1, 2]);
+
+    net.destroy();
+    host.remove();
+  });
+
+  // The same for a tree a worker streams: nothing is drawn until it lands, and a selection made meanwhile
+  // is drawn then — before #428 it was dropped, with no on("select").
+  it("a select() made while a worker streams the tree is kept, observed and drawn once it lands", async () => {
+    const { net, host } = makeNet();
+    await net.whenReady();
+    const seen: number[] = [];
+    net.on("select", (hits) => seen.push(hits.length));
+
+    // `expandPx: 1` at a fit view draws the leaves, so leaf 0 wears the selection ring in the export.
+    net.interactive({ selectable: true }).data(clustered(1500)).lod({ expandPx: 1, declutter: false }).layout({ backend: "worker", iterations: 25, fit: true });
+    net.select("nodes", [0]);
+    expect(seen).toEqual([1]);
+    await net.whenSettled();
+    await frame();
+    expect(net.lodSource).toBe("worker");
+    expect(net.selection().map((h) => h.id)).toEqual([0]);
+    const kept = net.toSVG();
+    net.select("nodes", null);
+    const none = net.toSVG();
+    net.select("nodes", [0]);
+    expect(kept).not.toBe(none);
+    expect(kept).toBe(net.toSVG());
 
     net.destroy();
     host.remove();
@@ -221,8 +248,9 @@ describe("lod() before the first layout defers the main-thread tree build", () =
     host.remove();
   });
 
-  // Interaction state made BEFORE lod() lives on the layers lod() would clear while its build is queued
-  // (the vector backends clear the network's Scene). So lod() builds at once then, keeping that state.
+  // Interaction state made BEFORE lod() lives on the layers lod() clears while its build is queued (the
+  // vector backends clear the network's Scene). The layers keep it by name meanwhile (#428), so lod() defers
+  // as it would without it — one pipeline — and the highlight is drawn when the build lands.
   it.each(["svg", "canvas"] as const)("on the %s backend, a highlight made before lod() survives it", async (backend) => {
     const host = document.createElement("div");
     host.style.width = "240px";
@@ -233,8 +261,9 @@ describe("lod() before the first layout defers the main-thread tree build", () =
     const paths = () => (net.toSVG().match(/<path/g) ?? []).length;
 
     net.data(placed(200)).highlight("nodes", [0]).lod({ expandPx: 1, declutter: false });
-    expect(net.lodSource).toBe("main"); // built at once: nothing may be lost to a queued build
+    expect(net.lodSource).toBe("none"); // deferred, highlight or not
     await Promise.resolve();
+    expect(net.lodSource).toBe("main");
     const withHighlight = paths();
     net.highlight("nodes", null);
     expect(withHighlight - paths()).toBe(1);
@@ -380,6 +409,44 @@ describe("lod() before the first layout defers the main-thread tree build", () =
     await Promise.resolve();
     expect(net.lodSource).toBe("none");
 
+    host.remove();
+  });
+
+  // #359/#428: the deferral keys on "no layout has placed this graph", not "no layout has ever run", so a
+  // reused engine (every load after the first) leaves the tree to the worker too.
+  it("after an earlier layout, data(g2).lod() still leaves the tree to a worker layout in the chain", async () => {
+    const { net, host } = makeNet();
+    await net.whenReady();
+
+    net.data(placed(600)).layout({ backend: "force", iterations: 5 });
+    net.data(clustered(1500)).style({ sizeMode: "screen" }).lod({ expandPx: 48 });
+    expect(net.lodSource).toBe("none"); // deferred: data() set a graph no layout has placed yet
+    net.layout({ backend: "worker", iterations: 25 });
+    await Promise.resolve();
+    expect(net.lodSource).toBe("none"); // the end-of-chain build stood down: no main-thread tree
+    await net.whenSettled();
+    expect(net.lodSource).toBe("worker");
+
+    net.destroy();
+    host.remove();
+  });
+
+  it("after an earlier layout, data(g2).lod() with no worker layout builds before the next frame", async () => {
+    const { net, host } = makeNet();
+    await net.whenReady();
+
+    net.data(placed(600)).layout({ backend: "worker", iterations: 5 });
+    await net.whenSettled();
+    net.data(placed(800)).lod({ expandPx: 48 });
+    expect(net.lodSource).toBe("none");
+    await Promise.resolve();
+    expect(net.lodSource).toBe("main");
+    // Once a layout has placed the graph, lod() builds at once again.
+    net.layout({ backend: "positions", positions: new Float32Array(1600).map((_, i) => 10 + ((i * 53) % 220)) });
+    net.lod(false).lod({ expandPx: 32 });
+    expect(net.lodSource).toBe("main");
+
+    net.destroy();
     host.remove();
   });
 

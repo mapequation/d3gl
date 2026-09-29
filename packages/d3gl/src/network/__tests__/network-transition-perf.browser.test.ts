@@ -225,6 +225,9 @@ let spatial: Leg;
 let moving: MovingLeg | null = null;
 let movingOn: MovingLeg | null = null;
 let gestureBoundaries = -1;
+/** Streamed frames with fit-on-layout (#238) on a zoom-enabled engine, and whether the fit survived them. */
+let fitOn: { phase: Phase; kept: boolean };
+let fitOff: { phase: Phase; kept: boolean };
 
 beforeAll(async () => {
   const realRaf = globalThis.requestAnimationFrame;
@@ -370,6 +373,33 @@ beforeAll(async () => {
     flush();
     on = leg(net);
     if (MOVING) movingOn = movingLeg(net);
+    // Fit-on-layout reframes on every streamed frame and re-seeds d3-zoom to the framed view. On a
+    // zoom-enabled engine that re-seed emits d3-zoom's start/end, which must not count as the user's
+    // gesture: it used to release the fit after its first frame. The engine runs zoom-enabled (above). Same
+    // frames as the streamed phase, with the fit on (set as `layout({ fit: true })` sets it; the file drives the
+    // repaint the same way).
+    const internals = net as unknown as { fitOnLayout: boolean };
+    const fitLeg = (): { phase: Phase; kept: boolean } => {
+      const rounds: Phase[] = [];
+      let kept = true;
+      for (let round = 0; round < ROUNDS; round++) {
+        internals.fitOnLayout = true;
+        rounds.push(
+          measure((i) => {
+            graph.positions.set(i % 2 ? a : b);
+            net.streamFrame();
+            flush();
+          }),
+        );
+        kept &&= internals.fitOnLayout;
+      }
+      internals.fitOnLayout = false;
+      return { phase: best(rounds), kept };
+    };
+    fitOn = fitLeg();
+    net.lod(false);
+    flush();
+    fitOff = fitLeg();
     net.setTransform({ k: 1, x: 0, y: 0 }); // back to the view the spatial leg runs at
     net.lod({ source: "spatial" }); // the spatial tree (#343): rebuilt per streamed frame, refit per transition frame
     flush();
@@ -441,6 +471,25 @@ describe(`network() position transition — per-frame cost vs a streamed layout 
       expect(fitted.medianMs, msg).toBeLessThanOrEqual(transition.medianMs * 1.3 + 1);
       expect(fitted.medianMs, msg).toBeLessThan(ceiling);
     });
+
+    // The fit legs ran on the module tree and with LOD off (the spatial leg has none).
+    if (name !== "LOD ON spatial") {
+      it(`${name}: a fit-on-layout frame on a zoom-enabled engine keeps the fit and costs a streamed frame (#428)`, () => {
+        const { streamed } = get();
+        const { phase, kept } = name === "LOD ON" ? fitOn : fitOff;
+        expect(kept, "the reframe's own d3-zoom re-seed released the fit").toBe(true);
+        expect(phase.nodeFill, "nodeFill re-ran during the fit frames").toBe(0);
+        expect(phase.created, "GPU buffers created during the fit frames").toBeLessThanOrEqual(streamed.created);
+        expect(phase.deleted, "GPU buffers destroyed during the fit frames").toBeLessThanOrEqual(streamed.deleted);
+        expect(
+          phase.uploadedPerFrame,
+          `fit frames upload ${(phase.uploadedPerFrame / 1024).toFixed(0)} KB/frame vs streamed ${(streamed.uploadedPerFrame / 1024).toFixed(0)} KB/frame`,
+        ).toBeLessThanOrEqual(streamed.uploadedPerFrame * 1.02 + 4096);
+        // The reframe adds O(fit nodes) (the top modules; with LOD off a position box computed once) and one
+        // d3-zoom re-seed to the streamed frame.
+        expect(phase.medianMs, `${name}: fit frame ${phase.medianMs.toFixed(2)}ms vs streamed ${streamed.medianMs.toFixed(2)}ms`).toBeLessThanOrEqual(streamed.medianMs * 1.3 + 2);
+      });
+    }
 
     it(`${name}: a transition frame stays within the streamed frame's budget`, () => {
       const { streamed, transition } = get();

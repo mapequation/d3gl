@@ -360,6 +360,9 @@ export abstract class BaseEngine {
   private selectCb: ((selected: HoverHit[], ev?: PointerEvent) => void) | null = null;
   /** Selected ids per layer (gesture-driven multi-select, #79). */
   private selected = new Map<string, Set<string | number>>();
+  /** Scene layers selected while {@link awaitedLayer} (#428): the selection's style overrides need the
+   *  layer's ids, so {@link registerLayer} builds them when the layer arrives. */
+  private pendingSelection = new Set<string>();
   /** Transient hover ids per instanced-lane layer (#105 N7c-2) — the hover-ring set, distinct from
    *  the persistent `selected` set. Read by a lane's companion highlight strategy. At most one entry. */
   private laneHilite = new Map<string, Set<string | number>>();
@@ -873,6 +876,13 @@ export abstract class BaseEngine {
     if (spec.name.endsWith(HIGHLIGHT_SUFFIX)) throw new Error(`layer name suffix "${HIGHLIGHT_SUFFIX}" is reserved`);
     this.scene.group(spec.name, spec.build);
     this.applyAccessors(spec);
+    // Seed the incremental id map from the full (re)built spec (O(total) here, but a
+    // register/rebuild is already O(total); appends then stay O(new)). Raw ids (no
+    // String()) so numeric-id layers don't allocate a string per drawable. Before the
+    // overrides: they resolve their drawables through this spec's ids, not a previous one's.
+    this.layerIds.set(spec.name, new Map(spec.ids.map((id, i) => [id, i])));
+    // A layer selected while it was awaited gets its selection's overrides now (#428).
+    if (this.pendingSelection.delete(spec.name)) this.resolvePendingSelection(spec);
     this.reapplyOverrides(spec); // rebuilds (rotation/projection) keep overrides
     const at = this.specs.findIndex((s) => s.name === spec.name);
     if (at >= 0) this.specs[at] = spec;
@@ -881,10 +891,6 @@ export abstract class BaseEngine {
     // non-interactive layers. pick() simply can't return that layer (get()?.pick → skip).
     if (spec.pickable !== false) this.hitIndexes.set(spec.name, new HitIndex(this.scene.drawables(spec.name), 1, spec.sizeMode === "screen"));
     else this.hitIndexes.delete(spec.name);
-    // Seed the incremental id map from the full (re)built spec (O(total) here, but a
-    // register/rebuild is already O(total); appends then stay O(new)). Raw ids (no
-    // String()) so numeric-id layers don't allocate a string per drawable.
-    this.layerIds.set(spec.name, new Map(spec.ids.map((id, i) => [id, i])));
     // A rebuild (rotation/projection) re-projected the source geometry: rebuild the
     // overlay from the stored ids so the highlight tracks it. (A re-DECLARED layer had
     // its highlight dropped by dropInteractionState first.)
@@ -907,21 +913,24 @@ export abstract class BaseEngine {
 
   /** {@link removeLayer} for several layers with ONE re-push. Removing them one at a time re-pushes and
    *  repaints the layers still registered after every removal — O(layers × their drawables) for a clear
-   *  that should cost nothing. No-op (no push) if none is present. */
-  protected removeLayers(names: readonly string[]): void {
+   *  that should cost nothing. No-op (no push) if none is present. With `keepInteractionState` the layers'
+   *  selection, highlights and style overrides stay, keyed by name, for the same layers registered again
+   *  (#428): an engine that stops drawing them only until pending work lands ({@link awaitedLayer}). */
+  protected removeLayers(names: readonly string[], keepInteractionState = false): void {
     let removed = false;
-    for (const name of names) removed = this.dropLayer(name) || removed;
+    for (const name of names) removed = this.dropLayer(name, keepInteractionState) || removed;
     if (removed) this.pushLayers();
   }
 
-  /** Drop one layer's spec, indexes, interaction state and Scene group, without re-pushing. */
-  private dropLayer(name: string): boolean {
+  /** Drop one layer's spec, indexes, interaction state (unless kept) and Scene group, without re-pushing. */
+  private dropLayer(name: string, keepInteractionState = false): boolean {
     const at = this.specs.findIndex((s) => s.name === name);
     if (at < 0) return false;
     this.specs.splice(at, 1);
     this.hitIndexes.delete(name);
     this.layerIds.delete(name);
-    this.dropInteractionState(name);
+    if (keepInteractionState) this.dropDrawnState(name);
+    else this.dropInteractionState(name);
     this.scene.remove(name);
     return true;
   }
@@ -1102,13 +1111,13 @@ export abstract class BaseEngine {
   /** Override the style of one drawable or a set (replaces any previous override for
    *  those ids — last write wins). O(ids) compose + one styles-only push. */
   setStyle(name: string, ids: string | number | readonly (string | number)[], override: StyleOverride): this {
-    this.flushDeferredLayers();
     const spec = this.specs.find((s) => s.name === name);
-    if (!spec) return this;
+    if (!spec && this.awaitedLayer(name) !== "scene") return this;
     const list: readonly (string | number)[] = Array.isArray(ids) ? ids : [ids as string | number];
     let map = this.styleOverrides.get(name);
     if (!map) { map = new Map(); this.styleOverrides.set(name, map); }
     for (const id of list) map.set(id, override);
+    if (!spec) return this; // kept for the awaited layer, which applies it when it registers (#428)
     this.restyle(spec, list);
     this.pushStyles(spec);
     return this;
@@ -1116,17 +1125,36 @@ export abstract class BaseEngine {
 
   /** Remove overrides (all of the layer's when `ids` is omitted) and restore base styles. */
   clearStyle(name: string, ids?: string | number | readonly (string | number)[]): this {
-    this.flushDeferredLayers();
+    const given: readonly (string | number)[] | undefined = ids === undefined ? undefined : Array.isArray(ids) ? ids : [ids as string | number];
     const spec = this.specs.find((s) => s.name === name);
-    if (!spec) return this;
+    if (!spec) {
+      if (this.awaitedLayer(name) === "scene") this.clearAwaitedStyle(name, given);
+      return this;
+    }
     const map = this.styleOverrides.get(name);
     if (!map || map.size === 0) return this;
-    const list: readonly (string | number)[] =
-      ids === undefined ? [...map.keys()] : Array.isArray(ids) ? ids : [ids as string | number];
+    const list = given ?? [...map.keys()];
     for (const id of list) map.delete(id);
     this.restyle(spec, list);
     this.pushStyles(spec);
     return this;
+  }
+
+  /** {@link clearStyle} on an awaited Scene layer (#428): forget the overrides kept for it. Over a selection
+   *  it is still to style ({@link pendingSelection}), `ids` keep an empty override — the base style — so they
+   *  end up unstyled, as when the selection was applied first and then cleared for them. */
+  private clearAwaitedStyle(name: string, ids: readonly (string | number)[] | undefined): void {
+    if (ids === undefined) {
+      this.styleOverrides.delete(name);
+      this.pendingSelection.delete(name);
+      return;
+    }
+    const map = this.styleOverrides.get(name);
+    if (this.pendingSelection.has(name)) {
+      const kept = map ?? new Map<string | number, StyleOverride>();
+      for (const id of ids) kept.set(id, {});
+      this.styleOverrides.set(name, kept);
+    } else if (map) for (const id of ids) map.delete(id);
   }
 
   /**
@@ -1141,6 +1169,9 @@ export abstract class BaseEngine {
    * (programmatic — no PointerEvent), so callers can observe programmatic selection the
    * same way they observe gesture selection.
    *
+   * On a layer the engine has yet to draw ({@link awaitedLayer}, e.g. a network waiting for its LOD
+   * tree) the selection is kept and observed at once, and styled when the layer is drawn.
+   *
    * The predicate overload is generic over the layer's datum type `D` — annotate the
    * parameter (`(d: MyDatum) => …`) or pass `select<MyDatum>(…)` to get a typed datum,
    * mirroring d3-selection's caller-asserted datum generics. Prefer the layer handle's
@@ -1149,18 +1180,30 @@ export abstract class BaseEngine {
   select(name: string, set: readonly (string | number)[] | null): this;
   select<D = unknown>(name: string, predicate: (d: D, i: number) => boolean): this;
   select(name: string, set: readonly (string | number)[] | ((d: unknown, i: number) => boolean) | null): this {
-    this.flushDeferredLayers();
     // Lane-first: an interactive lane takes precedence over a same-named (empty placeholder) Scene spec.
-    if (this.laneInteractiveFor(name)) {
+    const lane = this.laneInteractiveFor(name);
+    const spec = lane ? undefined : this.specs.find((s) => s.name === name);
+    // A layer the engine is about to register (#428) keeps the selection by name and draws it when it does.
+    const awaited = lane || spec ? null : this.awaitedLayer(name);
+    if (lane || awaited) {
       // Instanced lane: update the managed set + refresh the ring overlay (no Scene drawables to style).
-      if (typeof set === "function") throw new Error(`select(${name}, fn): function selectors are Scene-layer only; pass an id array for instanced lanes`);
+      if (typeof set === "function") {
+        throw new Error(lane
+          ? `select(${name}, fn): function selectors are Scene-layer only; pass an id array for instanced lanes`
+          : `select(${name}, fn): "${name}" is not drawn yet, so a function selector has no data to test; pass an id array`);
+      }
       if (set === null) this.selected.delete(name);
       else this.selected.set(name, new Set(set));
-      this.onLaneSelectionChanged(name);
-      this.selectCb?.(this.selection(), undefined);
+      if (lane) this.onLaneSelectionChanged(name);
+      else if (awaited === "scene") {
+        // A selection rewrites the layer's whole override table; its overrides need the layer's ids.
+        this.styleOverrides.delete(name);
+        if (set === null) this.pendingSelection.delete(name);
+        else this.pendingSelection.add(name);
+      }
+      this.selectCb?.(this.selectionHits(), undefined);
       return this;
     }
-    const spec = this.specs.find((s) => s.name === name);
     if (!spec) return this;
     // Resolve function selectors to an id set once (stored + used for styling).
     const resolved: Set<string | number> | null = set === null ? null
@@ -1173,7 +1216,7 @@ export abstract class BaseEngine {
     // Apply styling.
     this._applySelect(name, resolved);
     // Fire the observer (ev undefined = programmatic).
-    this.selectCb?.(this.selection(), undefined);
+    this.selectCb?.(this.selectionHits(), undefined);
     return this;
   }
 
@@ -1185,19 +1228,36 @@ export abstract class BaseEngine {
     const spec = this.specs.find((s) => s.name === name);
     if (!spec) return;
     this.styleOverrides.delete(name);
-    if (resolved !== null) {
-      const members = resolved instanceof Set ? resolved : new Set(resolved);
-      const selectedStyle = spec.selection?.selected;
-      const others = spec.selection?.others ?? { opacity: 0.3 };
-      const map = new Map<string | number, StyleOverride>();
-      for (const id of spec.ids) {
-        const o = members.has(id) ? selectedStyle : others;
-        if (o) map.set(id, o);
-      }
-      this.styleOverrides.set(name, map);
-    }
+    if (resolved !== null) this.styleOverrides.set(name, this.selectionOverrides(spec, resolved instanceof Set ? resolved : new Set(resolved)));
     this.restyle(spec, spec.ids);
     this.pushStyles(spec);
+  }
+
+  /** The override table a selection of `members` gives `spec`: `selection.selected` on the members,
+   *  `selection.others` (default `{ opacity: 0.3 }`) on every other id. O(layer ids). */
+  private selectionOverrides(spec: LayerSpec, members: ReadonlySet<string | number>): Map<string | number, StyleOverride> {
+    const selectedStyle = spec.selection?.selected;
+    const others = spec.selection?.others ?? { opacity: 0.3 };
+    const map = new Map<string | number, StyleOverride>();
+    for (const id of spec.ids) {
+      const o = members.has(id) ? selectedStyle : others;
+      if (o) map.set(id, o);
+    }
+    return map;
+  }
+
+  /** A Scene layer selected while it was awaited (#428) has just registered: build its selection's
+   *  overrides from its ids, then lay the `setStyle()`/`clearStyle()` calls made after that selection over
+   *  them (an empty override is a cleared id) — the table the same calls give the registered layer. */
+  private resolvePendingSelection(spec: LayerSpec): void {
+    const members = this.selected.get(spec.name);
+    if (!members) return;
+    const table = this.selectionOverrides(spec, members);
+    for (const [id, o] of this.styleOverrides.get(spec.name) ?? []) {
+      if (o.fill === undefined && o.stroke === undefined && o.opacity === undefined) table.delete(id);
+      else table.set(id, o);
+    }
+    this.styleOverrides.set(spec.name, table);
   }
 
   /**
@@ -1217,16 +1277,21 @@ export abstract class BaseEngine {
     idOrIds: string | number | readonly (string | number)[] | null,
     styleOrDraw?: HighlightStyle | HighlightDraw,
   ): this {
-    this.flushDeferredLayers();
+    const ids = idOrIds == null ? null : Array.isArray(idOrIds) ? [...idOrIds] : [idOrIds as string | number];
     const spec = this.specs.find((s) => s.name === name);
-    if (!spec) return this;
-    if (idOrIds == null) {
+    if (!spec) {
+      // An awaited layer (#428) keeps the highlight by name; registerLayer draws it.
+      if (this.awaitedLayer(name) !== "scene") return this;
+      if (ids === null) this.highlights.delete(name);
+      else this.highlights.set(name, { ids, styleOrDraw });
+      return this;
+    }
+    if (ids === null) {
       if (!this.highlights.delete(name)) return this; // nothing shown: keep it a no-op
       this.buildHighlight(spec, []);
       this.pushHighlight(spec);
       return this;
     }
-    const ids = Array.isArray(idOrIds) ? [...idOrIds] : [idOrIds as string | number];
     this.highlights.set(name, { ids, styleOrDraw });
     this.buildHighlight(spec, ids, styleOrDraw);
     this.pushHighlight(spec);
@@ -1301,9 +1366,11 @@ export abstract class BaseEngine {
       if (i === undefined || this.scene.drawableOf(spec.name, id) === null) continue;
       const o = map?.get(id) ?? {};
       const d = spec.data[i]!;
-      const fill = composeColor(this.resolve(spec.fill, d, i), o.fill, o.opacity);
+      // An empty accessor colour is no colour, as in applyAccessors (the network's LOD Scene answers ""
+      // for a glyph with no border): composing it would throw "invalid color".
+      const fill = composeColor(this.resolve(spec.fill, d, i) || undefined, o.fill, o.opacity);
       this.scene.setFill(spec.name, id, fill ?? "transparent");
-      const stroke = composeColor(this.resolve(spec.stroke, d, i), o.stroke, o.opacity);
+      const stroke = composeColor(this.resolve(spec.stroke, d, i) || undefined, o.stroke, o.opacity);
       this.scene.setStroke(spec.name, id, stroke ?? "transparent");
     }
   }
@@ -1330,19 +1397,27 @@ export abstract class BaseEngine {
   }
 
   /**
-   * Subclass hook, run first by every public call that resolves against the registered layers:
-   * `pick()`, `toSVG()`/`toPNG()`, `select()`/`selection()`, `highlight()`, `setStyle()`/`clearStyle()`.
-   * An engine that defers a layer registration to the end of the call chain (Network's `lod()` before
-   * any layout) completes it here, so a synchronous caller finds the layers an immediate registration
-   * would have given it — a selection or style is applied, not dropped for want of its layer. No-op by
-   * default; an override must be O(1) when nothing is deferred (pick() runs it on every pointermove).
+   * Subclass hook, run first by every public call that reads the registered layers' geometry or data:
+   * `pick()`, `toSVG()`/`toPNG()` and `selection()`. An engine that defers a layer registration to the end
+   * of the call chain (Network's `lod()` before any layout) completes it here, so a synchronous reader
+   * finds the layers an immediate registration would have given it. The interaction setters (`select()`,
+   * `highlight()`, `setStyle()`/`clearStyle()`) do not flush: on a layer the engine is about to register
+   * they keep their state by name instead ({@link awaitedLayer}). No-op by default; an override must be
+   * O(1) when nothing is deferred (pick() runs it on every pointermove).
    */
   protected flushDeferredLayers(): void {}
 
-  /** Whether `name` carries interaction state — a selection, a highlight, or style overrides — that
-   *  {@link dropInteractionState} would discard if the layer were removed. */
-  protected hasInteractionState(name: string): boolean {
-    return (this.selected.get(name)?.size ?? 0) > 0 || this.highlights.has(name) || (this.styleOverrides.get(name)?.size ?? 0) > 0;
+  /**
+   * Subclass hook (#428): whether the engine will register layer `name` once pending work lands — a tree
+   * a worker is building, a build deferred to the end of the call chain — and as what: an interactive
+   * instanced `"lane"` (takes a selection) or a Scene layer (`"scene"`: takes a selection, highlights and
+   * style overrides). `select()`, `highlight()`, `setStyle()` and `clearStyle()` on such a layer keep their
+   * state by name, and the layer applies it when it registers, so the drawing is the one the same calls
+   * make after it has. `null` (the default) when the layer is not awaited: a call on an absent layer is a
+   * no-op. Must be O(1): it is asked only when a setter finds no layer.
+   */
+  protected awaitedLayer(_name: string): "lane" | "scene" | null {
+    return null;
   }
 
   /** Forget per-layer interaction state (overrides, highlights). Called when a
@@ -1351,6 +1426,13 @@ export abstract class BaseEngine {
     this.styleOverrides.delete(name);
     this.highlights.delete(name);
     this.selected.delete(name);
+    this.pendingSelection.delete(name);
+    this.dropDrawnState(name);
+  }
+
+  /** Forget what a layer's drawn glyphs left behind — declutter winners, hover tracking, a tooltip — but
+   *  not the interaction state a caller set (#428: {@link removeLayers} with `keepInteractionState`). */
+  private dropDrawnState(name: string): void {
     this.declutterWinners.delete(name); // stale on a re-declare; cullDeclutter rebuilds next zoom
     // The hover tracking may point at this layer's now-dropped overlay; reset it so the
     // next pointermove re-evaluates instead of taking the same-target cheap exit (the
@@ -2364,7 +2446,7 @@ export abstract class BaseEngine {
     }
     if (touched.size === 0) return;
     this.applySelectionStyles(touched);
-    this.selectCb?.(this.selection(), e);
+    this.selectCb?.(this.selectionHits(), e);
   }
   /** Apply selection styling for layers listed in `touched`, reading the current id set from
    *  `this.selected`. Scene layers restyle their drawables (`selected`/`others`); instanced lanes
@@ -2413,7 +2495,7 @@ export abstract class BaseEngine {
       }
     }
     this.applySelectionStyles(touched);
-    this.selectCb?.(this.selection(), ev);
+    this.selectCb?.(this.selectionHits(), ev);
   }
   /** Get (or create) the per-layer id set. */
   private getOrCreateLayerSet(layer: string): Set<string | number> {
@@ -2425,6 +2507,11 @@ export abstract class BaseEngine {
    *  Scene spec or its interactive lane (so a selected aggregate's leaf ids are reachable, #105 N7c-2). */
   selection(): HoverHit[] {
     this.flushDeferredLayers();
+    return this.selectionHits();
+  }
+  /** {@link selection} without the flush — what `on("select")` is handed. A layer still awaited (#428)
+   *  resolves no datum yet (`null`); its hits carry their ids. */
+  private selectionHits(): HoverHit[] {
     const out: HoverHit[] = [];
     for (const [layer, ids] of this.selected) {
       // Lane-first: an interactive lane resolves datum + members; otherwise the Scene spec does.
