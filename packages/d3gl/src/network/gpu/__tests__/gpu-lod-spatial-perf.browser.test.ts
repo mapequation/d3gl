@@ -38,6 +38,7 @@ import { lodStylePasses, mortonTopologyBuilds } from "../../lod.js";
 import { spatialRowBuilds } from "../../spatial-rows.js";
 import { observeGpuLayoutFrames, type GpuFrameSample } from "../gpu-stream.js";
 import { perfBudget, perfN, perfRealGpu, softwareRenderer } from "../../../__tests__/perf-budget.js";
+import { indexedLinkStats } from "../../../webgl/indexed-links.js";
 import { perfHost } from "../../../__tests__/engine-sweep.js";
 
 const LOCAL_N = 100_000; // the N the ceilings below were calibrated at (the browser tier's CI scale)
@@ -159,6 +160,15 @@ interface WorkerRepaint {
   glyphs: number;
   /** Drawn aggregates whose members clear at the repaint's zoom (#426): 0 while the overlap rule holds. */
   clear: number;
+  /** Links drawn as graph edges between two kept leaves (#447), the CSR entries their index walk read, and what
+   *  the indexed link draws did in the repaint. */
+  leafLinks: number;
+  leafEntries: number;
+  draws: number;
+  instances: number;
+  instanceBytes: number;
+  tableBytes: number;
+  tablesBuilt: number;
 }
 
 /** The engine's last cut, read for the overlap rule's signature (#426), as network-hierarchy's tests read `lodTree`. */
@@ -185,13 +195,19 @@ function recordAnimationFrames(net: Network): { repaints: WorkerRepaint[]; resto
   const repaints: WorkerRepaint[] = [];
   window.requestAnimationFrame = (callback: FrameRequestCallback): number =>
     installed.call(window, (t: number) => {
+      const s0 = { ...indexedLinkStats };
       const t0 = performance.now();
       try {
         callback(t);
       } finally {
         const ms = performance.now() - t0;
         const gather = net.superEdgeStats;
-        repaints.push({ ms, source: net.lodSource, visits: gather?.visits ?? -1, misses: gather?.misses ?? -1, entries: gather?.entries ?? -1, glyphs: net.declutterStats?.glyphs ?? -1, clear: clearAggregates(net) });
+        const s = indexedLinkStats;
+        repaints.push({
+          ms, source: net.lodSource, visits: gather?.visits ?? -1, misses: gather?.misses ?? -1, entries: gather?.entries ?? -1, glyphs: net.declutterStats?.glyphs ?? -1, clear: clearAggregates(net),
+          leafLinks: gather?.leafLinks ?? 0, leafEntries: gather?.leafEntries ?? 0, draws: s.draws - s0.draws, instances: s.instances - s0.instances,
+          instanceBytes: s.instanceBytes - s0.instanceBytes, tableBytes: s.tableBytes - s0.tableBytes, tablesBuilt: s.tablesBuilt - s0.tablesBuilt,
+        });
       }
     });
   return { repaints, restore: () => { window.requestAnimationFrame = installed; } };
@@ -324,7 +340,18 @@ describe("GPU layout streaming with the spatial LOD source (#343 × #377) — ne
       expect(r.misses, `worker backend: a streamed repaint computed ${r.misses} rows on the main thread`).toBe(0);
       expect(r.glyphs, "worker backend: at most one leaf per viewport pixel").toBeLessThanOrEqual(MAX_GLYPHS);
       expect(r.clear, "worker backend: drawn aggregates whose members clear at the repaint's zoom").toBe(0);
+      // #447, the leaf links (graph edges between two kept leaves), per repaint: one GPU instance per shown link per
+      // indexed layer, 20-24 B uploaded for each (its edge id, its moved ends, a fade), and no style upload — the
+      // style tables are built once, on the repaint that first keeps a leaf link, never re-uploaded while the
+      // layout streams. The index walk reads the kept leaves' rows only, which the gather reads too: at an
+      // aggregated view it adds no more CPU reads than the gather's own, and no GPU work while no leaf link shows.
+      expect(r.instances, "worker backend: GPU instances of the leaf links").toBe(r.leafLinks * r.draws);
+      expect(r.instanceBytes, "worker backend: per-instance bytes of the leaf links").toBeLessThanOrEqual(24 * r.instances);
+      if (r.tablesBuilt === 0) expect(r.tableBytes, "worker backend: leaf-link style bytes uploaded on a streamed repaint").toBe(0);
+      expect(r.leafEntries, "worker backend: CSR entries the leaf-link walk read, against the gather's").toBeLessThanOrEqual(r.entries);
+      if (r.leafLinks === 0) expect(r.instanceBytes + r.tableBytes, "worker backend: leaf-link bytes on a repaint that shows none").toBe(0);
     }
+    expect(withTree.filter((r) => r.tablesBuilt > 0).length, "worker backend: repaints that built the leaf-link style tables").toBeLessThanOrEqual(1);
     const gpu = median(gpuRepaintMs);
     const base = median(withTree.map((r) => r.ms));
     const software = softwareRenderer();

@@ -2,7 +2,8 @@ import { describe, it, expect } from "vitest";
 import { buildLODTree, buildMortonLODTree, computeLODGeometry, cut, declutterFrontier, makeCutScratch, makeDeclutterFrontierScratch, visibleWorldRect, type LODTransform, type LODTree } from "../lod.js";
 import { buildGraph, type NetworkGraph } from "../graph.js";
 import { buildLeafIncidence, lazySuperEdges, type LazyCut } from "../lazy-super-edges.js";
-import { linkLinesStyleAttrs, makeLeafLinksScratch, superEdges, withLeafLinks, type NoLodStyleCache, type SuperEdgeStyleResolved, type SuperEdgesData } from "../glyphs.js";
+import { incidenceSourceEdges } from "../spatial-rows.js";
+import { leafLinkEdges, linkLinesStyleAttrs, makeLeafLinksScratch, superEdges, withLeafLinks, type NoLodStyleCache, type SuperEdgeStyleResolved, type SuperEdgesData } from "../glyphs.js";
 
 /**
  * #447: with `leafLinks`, the gathers leave the links between two kept leaves out and `withLeafLinks` draws
@@ -143,6 +144,43 @@ describe("leaf links (#447): the gathers leave kept-leaf pairs to the full-detai
       const a = Math.floor((after.ids[i] ?? 0) / spatial.size);
       expect(lines.sources[2 * i]).toBe(spatial.cx[a]);
       expect(lines.widths[i]).toBeCloseTo(WIDTH(after.flows?.[i] ?? 0), 5);
+    }
+  });
+
+  it("the WebGL index (leafLinkEdges) lists exactly the kept-leaf edges, in edge order, reading only the kept leaves' rows", () => {
+    // Self-loops and parallel edges (both directions, and a repeat) on top of the fixture's edges.
+    const n = 3000;
+    const r = rng(7);
+    const src: number[] = [];
+    const tgt: number[] = [];
+    for (let i = 0; i < 12_000; i++) {
+      const a = Math.floor(r() * n);
+      const b = r() < 0.05 ? a : Math.floor(r() * n);
+      src.push(a); tgt.push(b);
+      if (r() < 0.1) { src.push(b); tgt.push(a); }
+      if (r() < 0.05) { src.push(a); tgt.push(b); }
+    }
+    const graph = buildGraph({ nodeCount: n, source: src, target: tgt });
+    const entries = incidenceSourceEdges(graph.csr, graph);
+    const sc = makeLeafLinksScratch();
+    for (const share of [0, 0.01, 0.3, 1]) {
+      // A frontier of kept leaves in no particular order, with aggregate ids (≥ n) mixed in.
+      const frontier: number[] = [];
+      for (let v = n - 1; v >= 0; v--) if (r() < share) frontier.push(v);
+      for (let k = 0; k < 50; k++) frontier.push(n + k);
+      const f = Uint32Array.from(frontier.sort(() => r() - 0.5));
+      const kept = new Set(frontier.filter((v) => v < n));
+      const want: number[] = [];
+      for (let e = 0; e < graph.edgeCount; e++) {
+        const a = graph.source[e]!;
+        const b = graph.target[e]!;
+        if (a !== b && kept.has(a) && kept.has(b)) want.push(e);
+      }
+      const m = leafLinkEdges(graph, f, entries, sc);
+      expect(Array.from(sc.edges.subarray(0, m)), `share ${share}`).toEqual(want);
+      let degrees = 0;
+      for (const v of kept) degrees += graph.csr.degree[v]!;
+      expect(sc.entries, `share ${share}: entries read`).toBe(degrees);
     }
   });
 });
