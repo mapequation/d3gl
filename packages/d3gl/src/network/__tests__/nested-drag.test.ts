@@ -168,13 +168,14 @@ describe("nested drag reheat", () => {
     // Only the leaf is pinned: exactly under the cursor.
     expect(m.positions[2 * leaf]).toBeCloseTo(x0 + 2 * R, 2);
     expect(m.positions[2 * leaf + 1]).toBeCloseTo(y0 + R, 2);
-    // Its module's disc followed it, and so did the discs above; every disc kept its radius and holds its children.
+    // Its module's disc followed it, and so did the discs above; every disc holds its children.
     for (const g of [P, up, root]) {
       const c = discCentre(m, m.positions, g);
       const c0 = centres0.get(g)!;
       expect(Math.hypot(c[0] - c0[0], c[1] - c0[1]), `disc ${g} did not move`).toBeGreaterThan(1e-3 * R);
     }
-    expect(m.discs.r).toEqual(radii0);
+    // A disc keeps its laid-out radius, or grows to its members' extent: never smaller.
+    m.discs.r.forEach((r, o) => expect(r).toBeGreaterThanOrEqual(radii0[o]! * (1 - 1e-6)));
     for (const g of chainOf(m, P)) {
       const R_g = m.discs.r[g - m.tree.leafCount]!;
       const cg = discCentre(m, m.positions, g);

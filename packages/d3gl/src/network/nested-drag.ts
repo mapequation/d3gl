@@ -5,25 +5,28 @@
  * thread, the grabbed item's module and every module above it, up to the root — and only the grabbed item
  * is pinned (under the cursor); everything else responds, and the map stays nested:
  *
- * - **The held item follows the cursor freely.** Its siblings respond around it inside their module's
- *   disc, under the nested layout's own forces at that level.
- * - **Every level reheats.** Each module above the held item runs the same forces over its children —
- *   gravity, the springs over their links (module links and aggregated leaf links, as the layout placed
- *   the level) and collision — so sibling modules follow a moving module by their real flows, all the way
- *   up to the root. Some drift of the modules on a grab is expected, as in a flat reheat.
- * - **Discs follow their members.** Each disc is centred on its children's centroid, as the layout centred
- *   it, and moved on just enough to hold the dragged item past its edge; its radius stays as laid out. The
- *   rings (`lod({ moduleBoundary })`, #329) are the discs, so they move with them; nothing is stretched.
+ * - **The held item follows the cursor freely.** Its siblings respond around it, and so does every level
+ *   above, up to the root.
+ * - **Soft forces, like a flat drag's.** Each level runs the nested layout's ORGANISE-phase many-body
+ *   repulsion (a share of it), gravity (the only thing holding a module together) and two-sided springs
+ *   over its links — module links and aggregated leaf links, by `√flow` — at their laid-out length, plus a
+ *   soft overlap push: discs can approach and press together a little, then ease apart. The laid-out map
+ *   is the rest state (each level's field forces at the grab are taken back off), so the grab moves nothing
+ *   by itself and every force answers the drag. On release the rest state is re-taken where things are, so
+ *   a dropped item stays where it was dropped.
+ * - **The root is the map's one anchor**, as a flat layout's centering: its gravity pulls toward where its
+ *   free children were. Below it, a module's gravity pulls toward its free children's own centroid, so a
+ *   module travels with the member that is dragged.
+ * - **Discs follow their members.** A disc is centred on its children's centroid, its radius the larger of
+ *   the laid-out one and their extent. The rings (`lod({ moduleBoundary })`, #329) are the discs.
  * - **A sibling module moves as a whole**, with everything inside it — its own layout and ring unchanged.
  * - **A selection** pins its held items (the largest subtrees whose leaves are all held) and re-solves
  *   every module above any of them. A grab of the whole map (the root aggregate): the caller translates.
  *
- * The physics is the nested layout's own, at every level: its compact phase (gravity, the springs over the
- * sibling links it placed the level by — module links and aggregated leaf links — and collision). The heat
- * is the flat drag's: the same {@link Cooling} schedule, held at `DRAG_HEAT` while the pointer is down and
- * cooled from it after release over the caller's re-cool budget, stopping once converged (the item is let
- * go, as on the flat layouts). A tick's alpha is that heat, as a cold nested solve starts at 1. It runs on
- * the main thread for every layout backend and keeps nothing resident after the drag.
+ * The heat is the flat drag's: the same {@link Cooling} schedule, held at `DRAG_HEAT` while the pointer is
+ * down and cooled from it after release over the caller's re-cool budget, stopping once converged. A
+ * tick's alpha is that heat, as a cold nested solve starts at 1. It runs on the main thread for every
+ * layout backend and keeps nothing resident after the drag.
  *
  * Cost, per tick: O(k + links) over the re-solved modules' k children (collision on a grid above
  * `EXACT_MAX` children), plus O(nodes under the children that moved this tick) to translate them — with
@@ -32,11 +35,21 @@
  */
 import type { BoundaryDiscs } from "./lod.js";
 import { Cooling, DRAG_HEAT, MIN_SETTLE_TICKS } from "./force.js";
-import { NESTED, Scratch, collide, moduleLinks, type NestedLayoutTopology } from "./nested-layout.js";
+import { NESTED, Scratch, collide, moduleLinks, repel, type NestedLayoutTopology } from "./nested-layout.js";
 
 /** The map is converged once no child moved more than this share of its parent's radius in a tick (a
  *  0.01 px step for a module drawn 100 px wide), after `MIN_SETTLE_TICKS` of the schedule. */
 const STILL = 1e-4;
+/** The drag's spring factor on `alpha · √(flow / max flow) · stretch`: the nested layout's own. */
+const SPRING = 0.05;
+/** Share of an overlap the drag resolves per tick: discs may press together a little, then ease apart. */
+const SOFT_OVERLAP = 0.1;
+/**
+ * The ORGANISE phase's repulsion, as a share for the drag. Against gravity it sets how far a module is
+ * pushed by a neighbour that moves (the displacement is the change in repulsion over the gravity, whatever
+ * the heat): at the layout's full strength a moved module shoved every other ~0.3-0.7 of the root's radius.
+ */
+const DRAG_REPULSION = 0.05;
 
 /**
  * What drags on one nested layout reuse across grabs: the topology, the size metric it was laid out
@@ -135,6 +148,7 @@ export interface NestedDragStats {
 export interface NestedDragGeometry {
   cx: Float32Array;
   cy: Float32Array;
+  extent: Float32Array;
 }
 
 const FREE = 0;
@@ -159,6 +173,8 @@ class ModuleReheat {
   /** The disc's centre in the local frame, now and as last written to the world. */
   ox = 0;
   oy = 0;
+  /** The disc's radius over its laid-out one: ≥ 1, the members' extent from the centre when larger. */
+  reach = 1;
   private wox = 0;
   private woy = 0;
   /** FREE, HELD or DRIVEN per child. */
@@ -178,6 +194,27 @@ class ModuleReheat {
   readonly la: readonly number[];
   readonly lb: readonly number[];
   readonly lw: readonly number[];
+  /** Each link's rest length: its length at the grab. */
+  readonly rest: Float64Array;
+  /**
+   * Each child's repulsion + gravity at the grab, at unit heat. The laid-out map is the drag's rest state:
+   * each tick takes this back off (times the heat), so the grab moves nothing on its own and every force
+   * answers the drag — as a flat drag's layout, already at its equilibrium, does.
+   */
+  private readonly biasX: Float64Array;
+  /**
+   * The root's gravity pulls toward where its free children's centroid was at the grab, as a flat layout's
+   * centering holds the map in place: the one anchor the map has. Below the root, gravity pulls toward the
+   * free children's own centroid, so a module travels with the member that is dragged. Without the anchor,
+   * the whole map follows a dragged top module as one rigid piece and no link ever stretches.
+   */
+  anchor: [number, number] | null = null;
+
+  /** Anchor this module's gravity where its free children are now (the root's; see {@link anchor}). */
+  anchorHere(): void {
+    this.anchor = this.centroid(true);
+  }
+  private readonly biasY: Float64Array;
   /** This module and its ancestors, with their leaf counts: their disc offsets follow the moved leaves. */
   readonly chain: Int32Array;
   readonly chainCount: Float64Array;
@@ -280,10 +317,16 @@ class ModuleReheat {
       this.hy[i] = y[i]!;
       this.pinned[i] = this.mode[i] === FREE ? 0 : 1;
     }
-    const links = k >= 2 ? moduleLinks(topo, g, start, end, cache.local()) : { la: [], lb: [], lw: [] };
+    // The springs: this level's links weighted by √(flow / max flow) alone — the strongest the stiffest,
+    // none stiffened or softened by degree — at their laid-out length, the level's equilibrium spacing.
+    const links = k >= 2 ? moduleLinks(topo, g, start, end, cache.local(), false) : { la: [], lb: [], lw: [] };
+    this.rest = new Float64Array(links.la.length);
     this.la = links.la;
     this.lb = links.lb;
     this.lw = links.lw;
+    this.biasX = new Float64Array(k);
+    this.biasY = new Float64Array(k);
+    this.restHere();
 
     const chain: number[] = [];
     for (let a = g; a >= 0; a = parent[a]!) chain.push(a);
@@ -312,15 +355,42 @@ class ModuleReheat {
   /** Let the held children go (the pointer is up): they settle with the rest. */
   release(): void {
     for (let i = 0; i < this.k; i++) if (this.mode[i] === HELD) this.pinned[i] = 0;
+    this.restHere();
   }
 
-  /** The children's centroid weighted by disc area — where the layout centred the disc on them. O(k). */
-  private centroid(): [number, number] {
+  /**
+   * Make where the children are now the rest state (at the grab, and again on release): each link's rest
+   * length its length now, and the field forces now the bias taken back off. On release that keeps a
+   * dropped item where it was dropped — the map eases to rest from there instead of springing back.
+   */
+  private restHere(): void {
+    const { k, s, la, lb, rest } = this;
+    const { x, y, vx, vy } = s;
+    for (let l = 0; l < la.length; l++) rest[l] = Math.hypot(x[lb[l]!]! - x[la[l]!]!, y[lb[l]!]! - y[la[l]!]!);
+    const keepX = Float64Array.from(vx.subarray(0, k));
+    const keepY = Float64Array.from(vy.subarray(0, k));
+    vx.fill(0, 0, k);
+    vy.fill(0, 0, k);
+    this.fieldForces(1);
+    for (let i = 0; i < k; i++) {
+      this.biasX[i] = vx[i]!;
+      this.biasY[i] = vy[i]!;
+      vx[i] = keepX[i]!;
+      vy[i] = keepY[i]!;
+    }
+  }
+
+  /**
+   * The children's centroid weighted by disc area — where the layout centred the disc on them — or, with
+   * `free`, the unpinned children's only. O(k).
+   */
+  private centroid(free = false): [number, number] {
     const { x, y, rad } = this.s;
     let sx = 0;
     let sy = 0;
     let sw = 0;
     for (let i = 0; i < this.k; i++) {
+      if (free && this.pinned[i]) continue;
       const w = rad[i]! * rad[i]!;
       sx += x[i]! * w;
       sy += y[i]! * w;
@@ -329,32 +399,35 @@ class ModuleReheat {
     return sw > 0 ? [sx / sw, sy / sw] : [this.ox, this.oy];
   }
 
-  /** A pinned child at local (x, y) past the disc's edge carries the disc's centre along until it is inside. */
-  private carry(x: number, y: number, r: number): void {
-    const ex = x - this.ox;
-    const ey = y - this.oy;
-    const d = Math.hypot(ex, ey);
-    const lim = Math.max(0, 1 - r);
-    if (d > lim) {
-      const t = (d - lim) / d;
-      this.ox += ex * t;
-      this.oy += ey * t;
+  /**
+   * Add the ORGANISE phase's many-body repulsion and gravity toward the free children's centroid, at
+   * `alpha`. Gravity leaves the dragged child out of its centre: toward the centroid of every child, a
+   * dragged heavy module would draw the whole level after it as one rigid piece.
+   */
+  private fieldForces(alpha: number): void {
+    const { k, s } = this;
+    const { x, y, vx, vy } = s;
+    if (k > 1) repel(s, k, ((NESTED.REPULSION_K * DRAG_REPULSION) / k) * alpha);
+    const [gx, gy] = this.anchor ?? this.centroid(true);
+    for (let i = 0; i < k; i++) {
+      vx[i] = vx[i]! - (x[i]! - gx) * NESTED.GRAVITY * alpha;
+      vy[i] = vy[i]! - (y[i]! - gy) * NESTED.GRAVITY * alpha;
     }
   }
 
   /**
    * One tick, after every re-solve below it has stepped: the held children to the cursor (a world delta
-   * `dx`, `dy` since the grab, anywhere) and each driven child to where its own disc went; then the nested
-   * layout's own compact forces on every other child — gravity toward the children's centroid, the springs over
-   * its sibling links (the module links and aggregated leaf links it placed this level by; a pinned end
-   * takes none of the correction), the velocity step and collision. The disc is then centred on its
-   * children's centroid (as the layout centred it), moved on just enough to hold a pinned child past its
-   * edge, and the free children are kept inside it.
+   * `dx`, `dy` since the grab, anywhere) and each driven child to where its own disc went; then soft forces
+   * on every other child, as a flat drag's are — the nested layout's ORGANISE-phase many-body repulsion
+   * (`REPULSION_K / k`), gravity toward the children's centroid (all that holds a module together), and
+   * two-sided springs over the level's links at their laid-out length — the velocity step, and a soft
+   * overlap push that lets discs approach and ease apart instead of stopping dead. The disc then follows
+   * its members: centred on their centroid, its radius the larger of the laid-out one and their extent.
    */
   step(alpha: number, dx: number, dy: number, holding: boolean): void {
     const { k, s, pinned, mode } = this;
     const { x, y, vx, vy, rad } = s;
-    const { PAD, GRAVITY, DECAY } = NESTED;
+    const { PAD, DECAY } = NESTED;
     for (let i = 0; i < k; i++) {
       const m = mode[i];
       if (m === HELD && holding) {
@@ -365,17 +438,18 @@ class ModuleReheat {
         x[i] = this.hx[i]! + (d.ox * d.R) / this.R;
         y[i] = this.hy[i]! + (d.oy * d.R) / this.R;
       } else continue;
-      vx[i] = 0;
-      vy[i] = 0;
     }
-    // Gravity toward the children's own centroid: it holds the module together without dragging it anywhere.
-    const [gx, gy] = this.centroid();
+    this.fieldForces(alpha);
     for (let i = 0; i < k; i++) {
-      if (pinned[i]) continue;
-      vx[i] = vx[i]! - (x[i]! - gx) * GRAVITY * alpha;
-      vy[i] = vy[i]! - (y[i]! - gy) * GRAVITY * alpha;
+      if (pinned[i]) {
+        vx[i] = 0;
+        vy[i] = 0;
+        continue;
+      }
+      vx[i] = vx[i]! - this.biasX[i]! * alpha;
+      vy[i] = vy[i]! - this.biasY[i]! * alpha;
     }
-    const { la, lb, lw } = this;
+    const { la, lb, lw, rest } = this;
     for (let l = 0; l < la.length; l++) {
       const a = la[l]!;
       const b = lb[l]!;
@@ -385,8 +459,7 @@ class ModuleReheat {
       let ex = x[b]! + vx[b]! - x[a]! - vx[a]!;
       let ey = y[b]! + vy[b]! - y[a]! - vy[a]!;
       const d = Math.hypot(ex, ey) || 1e-9;
-      const rest = (rad[a]! + rad[b]!) * PAD;
-      const f = (Math.max(0, d - rest) / d) * alpha * lw[l]! * 0.5;
+      const f = ((d - rest[l]!) / d) * alpha * lw[l]! * SPRING;
       ex *= f;
       ey *= f;
       const ma = rad[a]! * rad[a]!;
@@ -404,20 +477,16 @@ class ModuleReheat {
       x[i] = x[i]! + vx[i]!;
       y[i] = y[i]! + vy[i]!;
     }
-    collide(s, k, PAD, pinned);
-    // The disc follows its members: centred on their centroid, as the layout centred it, and moved on from
-    // there just enough to hold a pinned child that is past its edge.
+    collide(s, k, PAD, pinned, SOFT_OVERLAP);
     [this.ox, this.oy] = this.centroid();
-    // A held child still carries the disc once released, so nothing snaps: gravity draws it back in.
-    for (let i = 0; i < k; i++) if (pinned[i] || mode[i] === HELD) this.carry(x[i]!, y[i]!, rad[i]!);
-    const cox = this.ox;
-    const coy = this.oy;
+    let reach = 1;
     for (let i = 0; i < k; i++) {
-      if (pinned[i] || mode[i] === HELD) continue;
-      const [cx, cy] = inside(x[i]! - cox, y[i]! - coy, rad[i]!);
-      x[i] = cox + cx;
-      y[i] = coy + cy;
+      // A driven child's disc may itself have grown to its members' extent.
+      const d = mode[i] === DRIVEN ? this.down[i]! : null;
+      const r = d ? (d.R * d.reach) / this.R : rad[i]!;
+      reach = Math.max(reach, Math.hypot(x[i]! - this.ox, y[i]! - this.oy) + r);
     }
+    this.reach = reach;
   }
 
   /**
@@ -482,17 +551,15 @@ class ModuleReheat {
       geometry.cx[this.g] = geometry.cx[this.g]! + mx;
       geometry.cy[this.g] = geometry.cy[this.g]! + my;
     }
+    // The disc (and its ring) encloses its members: the laid-out radius, or their extent when larger.
+    const r = Math.fround(R * this.reach);
+    const o = this.g - leafCount;
+    if (discs.r[o] !== r) {
+      discs.r[o] = r;
+      if (geometry) geometry.extent[this.g] = r;
+    }
     return most;
   }
-}
-
-/** A local position clamped so a disc of radius `r` stays inside the unit disc. */
-function inside(x: number, y: number, r: number): [number, number] {
-  const lim = Math.max(0, 1 - r);
-  const d = Math.hypot(x, y);
-  if (d <= lim) return [x, y];
-  if (!(d > 0)) return [0, 0];
-  return [(x * lim) / d, (y * lim) / d];
 }
 
 /**
@@ -562,6 +629,7 @@ export class NestedDrag {
       m.indexUp = cache.topo.children.subarray(childOffset[up.g]!, childOffset[up.g + 1]!).indexOf(m.g);
       up.down[m.indexUp] = m;
     }
+    for (const m of byId.values()) if (!m.up && parent[m.g]! < 0) m.anchorHere();
     const modules = [...byId.values()].sort((a, b) => b.chain.length - a.chain.length);
     return new NestedDrag(discs, modules);
   }
