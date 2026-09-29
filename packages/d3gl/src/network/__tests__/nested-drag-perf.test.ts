@@ -6,37 +6,24 @@ import { NestedDrag, NestedDragCache } from "../nested-drag.js";
 
 /**
  * Per-frame guard for the nested drag reheat (AGENTS.md lifecycle §5: a node drag is a per-frame path).
- * One tick runs per animation frame; its work must be O(the children of the re-solved modules — the
- * grabbed item's and each one above it — + the nodes that moved) — never a pass over the whole map
- * unless it all moves. At ≈1M leaves (always on: the map is built directly, not laid out) on a
+ * One tick runs per animation frame. Every level above the dragged item re-solves at the drag heat, so a
+ * tick moves the whole map as a flat reheat does: its work is O(the re-solved modules' children and
+ * links + the nodes that moved), each moved leaf written once (and each LOD tree node once, with LOD on) —
+ * no pass beyond that. At ≈1M leaves (always on: the map is built directly, not laid out) on a
  * 100 × 100 × 100 module tree with leaf edges in the bottom modules and module links between siblings:
- *
- *   1. a **leaf** in a bottom module, dragged toward its module's centre (100 siblings re-solved; the
- *      disc does not travel, so nothing above moves);
- *   2. a **bottom module** aggregate, the same in its parent (100 sibling modules, 10k leaves under them);
- *   3. a **top module** aggregate (99 siblings holding ≈99% of the map: the inherent worst case, every
- *      moved leaf is written — bounded by the leaves under the moved siblings, not by a scan);
- *   4. a **leaf dragged out of its module**: its disc travels and pushes its neighbours, up the levels.
- *
- * Each drag runs with the LOD geometry (the module tree's centres, translated with their subtrees) and
- * without it (LOD off: positions only). Signatures, exact at every N: in legs 1-3 the leaves written per
- * tick never exceed the leaves under the grabbed item's module, the tree nodes translated never exceed its
- * subtree, and nothing outside it changes; in leg 4 something outside it does. A grab walks the re-solved
- * modules' children once (the root's: the map), click-frequency.
- * Wall-clock ceilings assert under `PERF_ASSERT` (the at-scale tier, `BENCH_NESTED_DRAG`).
+ * a leaf, a bottom-module and a top-module grab dragged toward their module's centre, and a leaf dragged
+ * out of its module; LOD geometry on and off. Wall-clock ceilings (a tick, a grab) assert under
+ * `PERF_ASSERT` (the at-scale tier, `BENCH_NESTED_DRAG`).
  */
 
 const BENCH = !!process.env.BENCH_NESTED_DRAG;
 const N = BENCH ? Number(process.env.BENCH_NESTED_DRAG_N) || 1_000_000 : 1_000_000;
 const ASSERT = !!process.env.PERF_ASSERT;
 const TICKS = 30;
-// Measured (M1 Max, node, 1M): median tick 0.03-0.13 ms for a leaf, ~0.1 ms for a bottom module (its
-// siblings make room at the drag heat), ~4.5-7 ms for a top module (≈1M leaves translated), ~0.2-0.3 ms
-// for a leaf dragged out of its module; a grab 5-30 ms (it walks the root's children: the whole map).
-// Ceilings ~10-25× that: the write counts, not the clock, are what pin the per-tick work.
-const LEAF_TICK_MS = Number(process.env.PERF_NESTED_DRAG_LEAF_MS) || 2;
-const MODULE_TICK_MS = Number(process.env.PERF_NESTED_DRAG_MODULE_MS) || 10;
-const TOP_TICK_MS = Number(process.env.PERF_NESTED_DRAG_TOP_MS) || 120;
+// Measured (M1 Max, node, 1M): median tick 4.5-4.7 ms with LOD off and 6.6-6.7 ms with LOD on, for every
+// grab (every level responds, so ≈1M leaves move per tick); a grab 5-18 ms (it walks the root's children:
+// the whole map). Ceilings ~10×.
+const TICK_MS = Number(process.env.PERF_NESTED_DRAG_TICK_MS) || 80;
 const GRAB_MS = Number(process.env.PERF_NESTED_DRAG_GRAB_MS) || 150;
 
 const GOLDEN = Math.PI * (3 - Math.sqrt(5));
@@ -181,8 +168,8 @@ function runLeg(held: number[], lod: boolean, out = false): Leg {
     maxLeafWrites = Math.max(maxLeafWrites, drag.stats.leafWrites - lw);
     maxNodeWrites = Math.max(maxNodeWrites, drag.stats.nodeWrites - nw);
   }
-  drag.release();
-  while (drag.tick(fx.positions, lod ? tree : null));
+  drag.release(90); // the engine's re-cool budget (`Network.DRAG_COOL_FRAMES`)
+  for (let t = 0; t < 90 && !drag.converged; t++) drag.tick(fx.positions, lod ? tree : null);
   let outsideChanged = 0;
   for (let i = 0; i < tree.leafCount; i++) {
     if (under.set[i]) continue;
@@ -212,22 +199,15 @@ beforeAll(() => {
 }, 120_000);
 
 describe(`nested drag reheat — per-tick cost at ${N.toLocaleString()} leaves`, () => {
-  for (const tag of ["LOD off", "LOD on"]) {
-    it(`leaf dragged out of its module, ${tag}: the disc travels and the levels above make room`, () => {
-      const leg = legs[`leaf out of its module, ${tag}`]!;
-      expect(leg.outsideChanged, "nothing outside the module made room").toBeGreaterThan(0);
-      expect(leg.maxLeafWrites).toBeLessThanOrEqual(fx.tree.leafCount);
-    });
-  }
-  for (const name of ["leaf", "bottom module", "top module"]) {
+  for (const name of ["leaf", "bottom module", "top module", "leaf out of its module"]) {
     for (const tag of ["LOD off", "LOD on"]) {
-      it(`${name}, ${tag}: writes only under the re-solved module; nothing else moves`, () => {
+      it(`${name}, ${tag}: every level responds; a tick writes each moved node once, the LOD tree only with LOD on`, () => {
         const leg = legs[`${name}, ${tag}`]!;
         expect(leg.maxLeafWrites).toBeGreaterThan(0);
-        expect(leg.maxLeafWrites).toBeLessThanOrEqual(leg.leavesUnder);
-        expect(leg.maxNodeWrites).toBeLessThanOrEqual(tag === "LOD on" ? leg.nodesUnder : 0);
-        expect(leg.outsideChanged).toBe(0);
-        if (name !== "top module") expect(leg.leavesUnder).toBeLessThan(fx.tree.leafCount / 50);
+        expect(leg.maxLeafWrites).toBeLessThanOrEqual(fx.tree.leafCount);
+        expect(leg.maxNodeWrites).toBeLessThanOrEqual(tag === "LOD on" ? fx.tree.size : 0);
+        // Outside the held item's own module: the levels above respond (a top module's parent is the root).
+        if (name !== "top module") expect(leg.outsideChanged, "the levels above did not respond").toBeGreaterThan(0);
       });
     }
   }
@@ -240,11 +220,6 @@ describe(`nested drag reheat — per-tick cost at ${N.toLocaleString()} leaves`,
     const report = Object.entries(legs).map(([k, l]) => `${k}: tick ${l.medianTickMs.toFixed(3)} ms, grab ${l.grabMs.toFixed(2)} ms`);
     console.log(`[nested-drag ${N}] ${report.join("; ")}`);
     if (!ASSERT) return;
-    for (const tag of ["LOD off", "LOD on"]) {
-      expect(legs[`leaf, ${tag}`]!.medianTickMs).toBeLessThan(LEAF_TICK_MS);
-      expect(legs[`bottom module, ${tag}`]!.medianTickMs).toBeLessThan(MODULE_TICK_MS);
-      expect(legs[`top module, ${tag}`]!.medianTickMs).toBeLessThan(TOP_TICK_MS);
-      expect(legs[`leaf out of its module, ${tag}`]!.medianTickMs).toBeLessThan(TOP_TICK_MS);
-    }
+    for (const leg of Object.values(legs)) expect(leg.medianTickMs).toBeLessThan(TICK_MS);
   });
 });
