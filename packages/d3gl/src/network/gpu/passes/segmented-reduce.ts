@@ -2,7 +2,8 @@ import type { Device, Framebuffer, SamplerProps, Texture } from "@luma.gl/core";
 import type { Model } from "@luma.gl/engine";
 import { REDUCE_MAX_LEVELS, reduceLayout, type ReduceLayout } from "../segments.js";
 import { SLOT_TEXEL_GLSL } from "../textures.js";
-import { beginPass, fullScreenModel, NO_BLEND, type PassUniforms } from "./fullscreen.js";
+import { beginPass, fullScreenProgram, layoutModel, NO_BLEND, type PassUniforms } from "./fullscreen.js";
+import type { LayoutProgram } from "../programs.js";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Contention-free segmented reductions (spec §6.1).
@@ -283,6 +284,11 @@ const NEAREST: SamplerProps = { minFilter: "nearest", magFilter: "nearest" };
 const NO_BINDINGS: Readonly<Record<string, Texture>> = Object.freeze({});
 const NO_UNIFORMS: Readonly<PassUniforms> = Object.freeze({});
 
+/** The reduction's three programs for `map`: its level-1 gather, the coarser levels' gather and the range query (#385). */
+export function segmentedReducePrograms(map: ReduceMap): { level1: LayoutProgram; level: LayoutProgram; query: LayoutProgram } {
+  return { level1: fullScreenProgram(level1Fs(map)), level: fullScreenProgram(LEVEL_FS), query: fullScreenProgram(queryFs(map)) };
+}
+
 /**
  * The segmented reduction: a 16-ary gather tree over slot order plus a range query per segment
  * (see the file header). Every texture, framebuffer and model is created here for a fixed slot
@@ -331,9 +337,10 @@ export class SegmentedReduce {
       this.queryUniforms[`u_row${l}`] = layout.levels[l - 1]?.rowOffset ?? 0;
     }
     // No blend anywhere: every output texel is written exactly once, by a gather.
-    this.level1Model = fullScreenModel(device, level1Fs(map), this.level1Uniforms, NO_BLEND);
-    this.levelModel = fullScreenModel(device, LEVEL_FS, this.levelUniforms, NO_BLEND);
-    this.queryModel = fullScreenModel(device, queryFs(map), this.queryUniforms, NO_BLEND);
+    const programs = segmentedReducePrograms(map);
+    this.level1Model = layoutModel(device, programs.level1, this.level1Uniforms, NO_BLEND);
+    this.levelModel = layoutModel(device, programs.level, this.levelUniforms, NO_BLEND);
+    this.queryModel = layoutModel(device, programs.query, this.queryUniforms, NO_BLEND);
   }
 
   /**

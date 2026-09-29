@@ -1,7 +1,8 @@
 import type { Device, Framebuffer, SamplerProps, Texture } from "@luma.gl/core";
 import type { Model } from "@luma.gl/engine";
 import { INITIAL_STOP_STATE, STOP_NONFINITE, STOP_STOPPED } from "../stop-latch.js";
-import { NO_BLEND, beginPass, fullScreenModel, type PassUniforms } from "./fullscreen.js";
+import { NO_BLEND, beginPass, fullScreenProgram, layoutModel, type PassUniforms } from "./fullscreen.js";
+import type { LayoutProgram } from "../programs.js";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Stop latch pass (#376, spec §6.5.5): one fragment, once per reduction
@@ -81,6 +82,11 @@ const GL_FLOAT = 0x1406;
 
 const NEAREST: SamplerProps = { minFilter: "nearest", magFilter: "nearest" };
 
+/** The stop latch pass's program (#385). */
+export function stopLatchProgram(): LayoutProgram {
+  return fullScreenProgram(FS);
+}
+
 /**
  * The latch texel's two 1×1 `rgba32float` sides, their framebuffers and the pass — all created once.
  * {@link run} evaluates into the other side and flips; {@link state} is the current side, which the
@@ -108,7 +114,7 @@ export class StopLatchPass {
       device.createFramebuffer({ width: 1, height: 1, colorAttachments: [b] }),
     ];
     this.uniforms = { u_threshold: 0, u_tick: 0, u_epoch: 0, u_evaluate: 0, u_sample: 0, u_armed: 0 };
-    this.model = fullScreenModel(device, FS, this.uniforms, NO_BLEND);
+    this.model = layoutModel(device, stopLatchProgram(), this.uniforms, NO_BLEND);
   }
 
   /** The current latch texel `(prevStep, stopTick, epoch, flags)`. */

@@ -1,7 +1,8 @@
 import type { Device, RenderPass, Texture } from "@luma.gl/core";
-import { Model } from "@luma.gl/engine";
+import type { Model } from "@luma.gl/engine";
 import { SLOT_TEXEL_GLSL } from "../textures.js";
-import { fullScreenModel, NO_BLEND, type PassUniforms } from "./fullscreen.js";
+import { fullScreenProgram, layoutModel, NO_BLEND, type PassUniforms } from "./fullscreen.js";
+import type { LayoutProgram } from "../programs.js";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // The leaf seed of a module-tree multilevel seed (#180, #353; spec §6.4).
@@ -65,6 +66,11 @@ void main() {
 }
 `;
 
+/** The leaf seed's scatter and gather programs (#385). */
+export function leafSeedPrograms(): { scatter: LayoutProgram; gather: LayoutProgram } {
+  return { scatter: { vs: SCATTER_VS, fs: SCATTER_FS }, gather: fullScreenProgram(GATHER_FS) };
+}
+
 /** The leaf seed's scatter and gather (see the file header). Both models are created once, here. */
 export class LeafSeedPass {
   private readonly scatterModel: Model;
@@ -74,16 +80,11 @@ export class LeafSeedPass {
 
   constructor(device: Device) {
     this.scatterUniforms = { u_leaf_width: 1, u_width: 1, u_height: 1 };
-    this.scatterModel = new Model(device, {
-      vs: SCATTER_VS,
-      fs: SCATTER_FS,
-      topology: "point-list",
-      vertexCount: 1, // set per draw
-      uniforms: this.scatterUniforms,
-      parameters: NO_BLEND,
-    });
+    const programs = leafSeedPrograms();
+    // One point per leaf entry: vertexCount is set per draw.
+    this.scatterModel = layoutModel(device, programs.scatter, this.scatterUniforms, NO_BLEND, { topology: "point-list", vertexCount: 1 });
     this.gatherUniforms = { u_count: 0, u_width: 1 };
-    this.gatherModel = fullScreenModel(device, GATHER_FS, this.gatherUniforms, NO_BLEND);
+    this.gatherModel = layoutModel(device, programs.gather, this.gatherUniforms, NO_BLEND);
   }
 
   /**

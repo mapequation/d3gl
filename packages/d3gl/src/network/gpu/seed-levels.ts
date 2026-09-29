@@ -1,7 +1,8 @@
 import type { Device, Framebuffer, RenderPass, SamplerProps, Texture } from "@luma.gl/core";
-import { GpuSprings, createSeedSpringPasses, type SeedSpringPasses } from "./springs.js";
-import { LeafSeedPass } from "./passes/leaf-seed.js";
-import { ProlongatePass } from "./passes/prolongate.js";
+import { GpuSprings, createSeedSpringPasses, seedSpringPrograms, type SeedSpringPasses } from "./springs.js";
+import { LeafSeedPass, leafSeedPrograms } from "./passes/leaf-seed.js";
+import { ProlongatePass, prolongateProgram } from "./passes/prolongate.js";
+import type { LayoutProgram } from "./programs.js";
 import { beginPass } from "./passes/fullscreen.js";
 import { seedPlanCapacity, type SeedPlan } from "./seed-plan.js";
 import { atlasWidth, writeTexels } from "./textures.js";
@@ -23,6 +24,12 @@ export class SeedPasses {
     this.springs = createSeedSpringPasses(device);
     this.prolongate = new ProlongatePass(device);
     this.leaf = new LeafSeedPass(device);
+  }
+
+  /** The programs a {@link SeedPasses} compiles (#385). */
+  static programs(): LayoutProgram[] {
+    const leaf = leafSeedPrograms();
+    return [...seedSpringPrograms(), prolongateProgram(), leaf.scatter, leaf.gather];
   }
 
   destroy(): void {

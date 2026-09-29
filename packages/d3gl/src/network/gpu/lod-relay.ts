@@ -32,6 +32,15 @@
  * are unreleased the relay takes no harvest, so the worker never skips a frame for back-pressure (it would
  * have no positions to build the skipped one from later). The worker coarsens only for a seed's plan.
  *
+ * **Started before its stream** (#385): a GPU layout starts coarsening while its programs are still compiling
+ * (frames, when the shader cache is cold), so the relay is built *unarmed*. It then hands the seed plan over as
+ * usual (the transport buffers it) but keeps the tree's topology, and a worker failure's withdrawal and warning,
+ * to itself until {@link arm} — once the stream exists and the run has reported its transport, so the engine never
+ * sees a tree (or `null`) before them, and the page is told the tree is built on the main thread only when it
+ * will be. A relay destroyed unarmed (the run fell back to the worker, whose own worker streams the tree) never
+ * calls `onLODTree` and never warns. (A spatial tree reaches the engine only with a harvested frame, so after
+ * {@link arm} anyway.)
+ *
  * `holding` keeps the run's `settled` until the tree is adopted, so the settle handler sees the final
  * positions with their geometry. If the worker fails (it errors, a reply cannot be delivered, or a message
  * cannot be posted), the relay warns once, withdraws the tree (`onLODTree(null)`: the engine builds its own,
@@ -122,19 +131,34 @@ export class LODRelay implements FrameSink {
   private wake: () => void = () => {};
   /** The seed plan's request, until the plan (or the failure) has been handed over. */
   private seed: SeedRequest | null;
+  /** Whether the run exists (#385): until then the tree, or its withdrawal, waits here. */
+  private armed: boolean;
+  /** A topology that arrived before {@link arm}. */
+  private pending: LODTopology | null = null;
+  /** The warning of a worker that failed before {@link arm}: printed there, dropped by {@link destroy}. */
+  private failure: { readonly message: string; readonly cause?: unknown } | null = null;
 
   /**
    * Start the tree on `port`: post the graph's edges for coarsening (copied; the main thread keeps its own).
    * `onLODTree` receives the tree once, with geometry — or, for the spatial source, every rebuilt tree with its
    * streamed handle — and `null` if the worker fails later, adopted or not. Throws, with the worker terminated
    * and no callback run, when the coarsen request cannot be posted: the caller reports its transport before it
-   * withdraws the tree, and a withdrawal from here would precede that.
+   * withdraws the tree, and a withdrawal from here would precede that. `armed: false` starts it ahead of its
+   * run: nothing reaches `onLODTree` before {@link arm}.
    */
-  constructor(port: LODWorkerPort, graph: NetworkGraph, options: LODRelayOptions, onLODTree: OnLODTree, seed: SeedRequest | null = null) {
+  constructor(
+    port: LODWorkerPort,
+    graph: NetworkGraph,
+    options: LODRelayOptions,
+    onLODTree: OnLODTree,
+    seed: SeedRequest | null = null,
+    armed = true,
+  ) {
     this.port = port;
     this.graph = graph;
     this.onLODTree = onLODTree;
     this.seed = seed;
+    this.armed = armed;
     this.spatial = options.source === "spatial";
     // The spatial tree needs no coarsening: every harvest goes to the worker, which rebuilds it (#343).
     this.phase = this.spatial ? "streaming" : "coarsening";
@@ -246,10 +270,31 @@ export class LODRelay implements FrameSink {
     this.wake = wake;
   }
 
+  /**
+   * The run exists and has reported its transport (#385): adopt a topology that arrived before (refit to the
+   * positions on screen now), or, if the worker already failed, warn and withdraw the tree. Idempotent.
+   */
+  arm(): void {
+    if (this.armed) return;
+    this.armed = true;
+    const pending = this.pending;
+    this.pending = null;
+    const failure = this.failure;
+    this.failure = null;
+    if (this.phase === "failed") {
+      if (failure) warn(failure.message, failure.cause);
+      this.onLODTree(null);
+      this.wake();
+    } else if (pending) {
+      this.refitForAdoption(pending);
+    }
+  }
+
   destroy(): void {
     if (this.phase === "destroyed") return;
     this.phase = "destroyed";
     this.seed = null; // the run is over: nobody waits for the plan
+    this.failure = null; // destroyed unarmed: the run fell back, and its worker builds the tree
     this.release();
   }
 
@@ -291,6 +336,10 @@ export class LODRelay implements FrameSink {
   /** The tree's topology arrived: build the tree and refit it to the positions on screen before adopting it. */
   private refitForAdoption(topology: LODTopology): void {
     if (this.phase !== "coarsening") return;
+    if (!this.armed) {
+      this.pending = topology; // adopted at arm(), refit to the positions on screen then
+      return;
+    }
     const buffer = new ArrayBuffer(lodGeometryByteLength(topology.size));
     this.tree = lodTreeFromTopology(topology, lodGeometryViews(buffer, topology.size));
     this.treeGeometry = new Float32Array(buffer);
@@ -331,15 +380,22 @@ export class LODRelay implements FrameSink {
     }
   }
 
-  /** The worker is gone: pass harvests straight through, and have the engine build the tree itself. */
+  /**
+   * The worker is gone: pass harvests straight through, and have the engine build the tree itself. Unarmed, the
+   * warning and the withdrawal wait for {@link arm}: the run may still fall back to the worker backend.
+   */
   private fail(reason: string, cause?: unknown): void {
     if (this.phase === "failed" || this.phase === "destroyed") return;
     this.phase = "failed";
     if (this.frame === "away") this.frame = "lost";
     this.release();
     const message = `[d3gl] network layout({ backend: 'gpu' }): ${reason}; the LOD tree is built on the main thread instead.`;
-    if (cause === undefined) console.warn(message);
-    else console.warn(message, cause);
+    if (!this.armed) {
+      this.failure = cause === undefined ? { message } : { message, cause };
+      this.handOverSeed(null); // the layout starts from its disc
+      return; // warned and withdrawn at arm(), after the run reported its transport
+    }
+    warn(message, cause);
     this.handOverSeed(null); // the layout starts from its disc
     this.onLODTree(null);
     this.wake();
@@ -350,10 +406,17 @@ export class LODRelay implements FrameSink {
     this.port.onerror = null;
     this.port.onmessageerror = null;
     this.port.terminate();
+    this.pending = null;
     this.tree = null;
     this.treeGeometry = null;
     this.positions = null;
     this.geometry = null;
     this.spatialFrame = null;
   }
+}
+
+/** `console.warn` with the cause, when there is one. */
+function warn(message: string, cause: unknown): void {
+  if (cause === undefined) console.warn(message);
+  else console.warn(message, cause);
 }

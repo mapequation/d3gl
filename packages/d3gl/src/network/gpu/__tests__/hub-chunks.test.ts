@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { buildHubChunks, HUB_CHUNK, SPRING_CHUNK } from "../hub-chunks.js";
+import { buildHubChunks, hasHubRows, HUB_CHUNK, SPRING_CHUNK } from "../hub-chunks.js";
 import { buildCSR } from "../../graph.js";
 
 /** CSR offsets for rows of the given lengths (the builder only reads offsets). */
@@ -120,3 +120,54 @@ function lowerBound(table: Uint32Array, count: number, start: number): number {
   }
   return lo;
 }
+
+describe("hasHubRows (#385: the springs' program variant from the graph's degrees, known before the solver)", () => {
+  /** A star of `leaves` leaves on node 0 (degree `leaves`), plus `extra` self-loops on node 1 (each adds 2). */
+  function star(leaves: number, loops = 0): { n: number; source: number[]; target: number[] } {
+    const source: number[] = [];
+    const target: number[] = [];
+    for (let i = 0; i < leaves; i++) {
+      source.push(0);
+      target.push(2 + i);
+    }
+    for (let i = 0; i < loops; i++) {
+      source.push(1);
+      target.push(1);
+    }
+    return { n: 2 + leaves, source, target };
+  }
+
+  it("agrees with buildHubChunks over buildCSR at the threshold, above it, and on self-loops", () => {
+    const cases = [star(SPRING_CHUNK), star(SPRING_CHUNK + 1), star(3, SPRING_CHUNK / 2), star(3, SPRING_CHUNK / 2 + 1), star(0)];
+    for (const c of cases) {
+      const csr = buildCSR(c.n, c.source, c.target);
+      const expected = buildHubChunks(csr.offsets).count > 0;
+      expect(hasHubRows(csr.degree), `${c.source.length} edges`).toBe(expected);
+    }
+    const degrees = (s: { n: number; source: number[]; target: number[] }): Uint32Array => buildCSR(s.n, s.source, s.target).degree;
+    expect(hasHubRows(degrees(star(SPRING_CHUNK)))).toBe(false);
+    expect(hasHubRows(degrees(star(SPRING_CHUNK + 1)))).toBe(true);
+  });
+
+  it("agrees with buildHubChunks on random graphs with hubs, self-loops and repeated edges", () => {
+    let seed = 0x385;
+    const rand = (): number => {
+      seed = (seed * 1664525 + 1013904223) >>> 0;
+      return seed / 2 ** 32;
+    };
+    for (let trial = 0; trial < 40; trial++) {
+      const n = 50 + Math.floor(rand() * 400);
+      const edges = Math.floor(rand() * 3000);
+      const hub = Math.floor(rand() * n);
+      const source: number[] = [];
+      const target: number[] = [];
+      for (let e = 0; e < edges; e++) {
+        // A third of the edges on one node, so some trials cross the threshold and some do not.
+        source.push(rand() < 0.33 ? hub : Math.floor(rand() * n));
+        target.push(Math.floor(rand() * n));
+      }
+      const csr = buildCSR(n, source, target);
+      expect(hasHubRows(csr.degree), `trial ${trial}`).toBe(buildHubChunks(csr.offsets).count > 0);
+    }
+  });
+});

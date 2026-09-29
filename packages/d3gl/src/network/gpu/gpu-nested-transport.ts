@@ -13,12 +13,18 @@
  *    the solve allocates is checked against the device ({@link gpuNestedLayoutNeed} of the
  *    {@link nestedLayoutPlan} the layout then allocates: the springs, the tile atlas, the collision
  *    table and the collision grid's own textures) — an unsupported tree, as in step 1.
- * 3. {@link GpuNestedLayout} solves every module at every depth at once, streamed by {@link GpuStream}:
+ * 3. Every program the solve builds — the float-blend probe's, the layout's (its collision grid and its
+ *    composition included, as {@link GpuNestedLayout.programs} lists them for the plan) and the readback's — is
+ *    compiled at once and in parallel ({@link compilePrograms}, #385), polled once per animation frame; the probe
+ *    runs and the layout is built once they have linked, so no program links on the main thread in between. A
+ *    program that fails to link, or a context lost meanwhile, lays the map out on the worker (a fault, as below).
+ *    Without `KHR_parallel_shader_compile`, or with every program built on this device before, it builds at once.
+ * 4. {@link GpuNestedLayout} solves every module at every depth at once, streamed by {@link GpuStream}:
  *    work items within the frame budget, positions composed on the GPU and read back through a fenced PBO.
  *    A **cold** layout streams as one animation of all depths converging together (decided, §15 Q5); a
  *    warm start or a transition (`stream: false` / `onResult`, #328) reads back only the final layout,
  *    in one frame, without the main thread ever waiting for the GPU.
- * 4. The final layout's module discs come back with it: a warm start is placed over the current map
+ * 5. The final layout's module discs come back with it: a warm start is placed over the current map
  *    (float64, on the CPU, as the CPU layout does), the boundary discs (#329) go to `onBoundaries`, then
  *    the positions land. The GPU resources are freed once it settles — a nested layout has no reheat.
  *
@@ -40,9 +46,11 @@ import {
   type WorkerLayoutHandle,
 } from "../worker-transport.js";
 import { gpuLayoutSupport, gpuNestedSlotNeed } from "./device-caps.js";
-import { gpuCaps } from "./device-probe.js";
-import { GpuNestedLayout, gpuNestedLayoutNeed, nestedLayoutPlan } from "./gpu-nested-layout.js";
+import { blendProbeProgram, cachedGpuCaps, gpuCaps, gpuStaticCaps } from "./device-probe.js";
+import { GpuNestedLayout, gpuNestedLayoutNeed, nestedLayoutPlan, type NestedLayoutPlan } from "./gpu-nested-layout.js";
 import { GpuStream } from "./gpu-stream.js";
+import { AsyncPositionReadback } from "./async-readback.js";
+import { compilePrograms, type ProgramCompile } from "./programs.js";
 import { nestedSolverResult, type NestedSolverTopology } from "./nested-topology.js";
 import { warnGpuFallback, type GpuLayoutFailure, type GpuLayoutTransport } from "./gpu-transport.js";
 
@@ -78,12 +86,15 @@ export function startGpuNestedLayout(
   let transport: GpuLayoutTransport | "pending" = "pending";
   let inner: WorkerLayoutHandle | null = null;
   let prep: NestedPrep | null = null;
+  let compile: ProgramCompile | null = null;
   let stream: GpuStream | null = null;
   let resolveSettled: () => void = () => {};
   const settled = new Promise<void>((resolve) => {
     resolveSettled = resolve;
   });
+  // Once per change: a run that compiles first reports "gpu" then, not again when its stream exists.
   const report = (t: GpuLayoutTransport): void => {
+    if (transport === t) return;
     transport = t;
     opts.onTransport?.(t);
   };
@@ -97,11 +108,50 @@ export function startGpuNestedLayout(
     worker.settled.then(resolveSettled, resolveSettled);
   };
 
-  const run = (device: WebGLDevice, solver: NestedSolverTopology): void => {
+  /**
+   * The prep is back: with the segments and links known, every texture the solve allocates must fit the device —
+   * the plan the verdict checks is the one the layout allocates — then compile the solve's programs in parallel
+   * (#385) and build it once they have linked, or at once when there is nothing to compile ahead.
+   */
+  const prepared = (device: WebGLDevice, solver: NestedSolverTopology): void => {
     if (stopped) return;
-    // Now that the segments and links are known, every texture the solve allocates must fit the device:
-    // the plan the verdict checks is the one the layout allocates.
     const plan = nestedLayoutPlan(solver);
+    const verdict = gpuLayoutSupport(cachedGpuCaps(device) ?? gpuStaticCaps(device), gpuNestedLayoutNeed(plan));
+    if (!verdict.ok) {
+      fallBack(verdict.reason);
+      return;
+    }
+    const programs = [blendProbeProgram(), ...GpuNestedLayout.programs(plan), ...AsyncPositionReadback.programs(device, true)];
+    compile = compilePrograms(device, programs, (outcome) => {
+      compile = null;
+      if (stopped) return;
+      if (outcome.status === "lost") {
+        fallBack("the WebGL context was lost while the layout's programs compiled", { kind: "failure" });
+        return;
+      }
+      if (outcome.status === "failed") {
+        fallBack("a GPU layout program failed to link", { kind: "failure", cause: outcome.reason });
+        return;
+      }
+      try {
+        run(device, solver, plan);
+      } catch (error) {
+        // A fault — a driver that rejects a shader, an allocation that fails: the worker lays it out.
+        fallBack("the GPU nested layout failed to start", { kind: "failure", cause: error });
+      }
+    });
+    if (!compile) {
+      run(device, solver, plan);
+      return;
+    }
+    // Resolved to the GPU while its programs compile, as the flat layout reports it; a failed link or probe
+    // moves it to the worker.
+    report("gpu");
+  };
+
+  /** Run the float-blend probe (its program compiled by now), then build the layout and stream it. */
+  const run = (device: WebGLDevice, solver: NestedSolverTopology, plan: NestedLayoutPlan): void => {
+    if (stopped) return;
     const verdict = gpuLayoutSupport(gpuCaps(device), gpuNestedLayoutNeed(plan));
     if (!verdict.ok) {
       fallBack(verdict.reason);
@@ -170,8 +220,9 @@ export function startGpuNestedLayout(
       fallBack("the module tree has no node below its root");
       return;
     }
-    // What the slot count alone decides (the slot atlas, the CSR offsets, the slot limit), before the prep.
-    const verdict = gpuLayoutSupport(gpuCaps(device), gpuNestedSlotNeed(tree.size - 1));
+    // What the slot count alone decides (the slot atlas, the CSR offsets, the slot limit), before the prep — on
+    // the device's features and limits, or its cached record: the probe runs once the programs have compiled.
+    const verdict = gpuLayoutSupport(cachedGpuCaps(device) ?? gpuStaticCaps(device), gpuNestedSlotNeed(tree.size - 1));
     if (!verdict.ok) {
       fallBack(verdict.reason);
       return;
@@ -186,7 +237,7 @@ export function startGpuNestedLayout(
       (solver) => {
         prep = null;
         try {
-          run(device, solver);
+          prepared(device, solver);
         } catch (error) {
           // A fault — a driver that rejects a shader, an allocation that fails: the worker lays it out.
           fallBack("the GPU nested layout failed to start", { kind: "failure", cause: error });
@@ -212,6 +263,7 @@ export function startGpuNestedLayout(
       if (stopped) return;
       stopped = true;
       prep?.cancel();
+      compile?.cancel();
       stream?.stop();
       inner?.stop();
       resolveSettled();

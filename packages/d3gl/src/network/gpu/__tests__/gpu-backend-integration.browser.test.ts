@@ -31,6 +31,7 @@ import { nestedSolverResult, nestedSolverTopology } from "../nested-topology.js"
 import { nestedLayout } from "../../nested-layout.js";
 import type { LODTree } from "../../lod.js";
 import { directedPartition, expectContained, linkTightness, topo, worstSeparation } from "../../__tests__/nested-fixtures.js";
+import { fakeParallelCompile, hideParallelCompile } from "./_parallel-compile.js";
 
 const W = 400;
 const H = 300;
@@ -849,42 +850,51 @@ describe("backend:'gpu' multilevel seed for a plain graph (#353, #312)", () => {
 });
 
 describe("backend:'gpu' whose streaming readback fails to build (#352)", () => {
-  it("falls back to the worker, reports only the worker transport, and frees the solver", async () => {
-    const device = await makeTestDevice();
-    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
-    const destroy = vi.spyOn(GpuForceLayout.prototype, "destroy");
-    // The solver builds; then every buffer creation fails — the readback's pack passes' buffers or its
-    // PBOs — so the stream cannot be built.
-    let failBuffers = false;
-    const createBuffer = WebGL2RenderingContext.prototype.createBuffer;
-    vi.spyOn(WebGL2RenderingContext.prototype, "createBuffer").mockImplementation(function (this: WebGL2RenderingContext) {
-      if (failBuffers) throw new Error("out of GPU memory");
-      return createBuffer.call(this);
-    });
-    const hold = GpuForceLayout.prototype.hold;
-    vi.spyOn(GpuForceLayout.prototype, "hold").mockImplementation(function (this: GpuForceLayout, heat: number) {
-      hold.call(this, heat);
-      failBuffers = true; // the disc-seeded run holds its heat right before it builds the stream
-    });
-    const reports: GpuLayoutTransport[] = [];
-    const g = buildGraph(makeRingGraph());
-    try {
-      // A disc-seeded run (`multilevel: false`): it holds full heat right before building the stream.
-      const handle = startGpuLayout(Promise.resolve(device), g, { width: W, height: H, iterations: 5, multilevel: false }, () => {}, undefined, (t) => {
-        reports.push(t);
-        failBuffers = false;
+  // Built at once (no KHR_parallel_shader_compile), a failed start reports only the worker. After a parallel
+  // compile (#385) the run reported "gpu" when the compile started, so it moves to the worker: "gpu", "worker".
+  for (const path of [
+    { name: "built at once", parallel: false, reports: ["worker"] },
+    { name: "after a parallel compile (#385)", parallel: true, reports: ["gpu", "worker"] },
+  ] as const) {
+    it(`falls back to the worker and frees the solver — ${path.name}: reports ${path.reports.join(", ")}`, async () => {
+      const compile = path.parallel ? fakeParallelCompile(1) : hideParallelCompile();
+      const device = await makeTestDevice();
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      const destroy = vi.spyOn(GpuForceLayout.prototype, "destroy");
+      // The solver builds; then every buffer creation fails — the readback's pack passes' buffers or its
+      // PBOs — so the stream cannot be built.
+      let failBuffers = false;
+      const createBuffer = WebGL2RenderingContext.prototype.createBuffer;
+      vi.spyOn(WebGL2RenderingContext.prototype, "createBuffer").mockImplementation(function (this: WebGL2RenderingContext) {
+        if (failBuffers) throw new Error("out of GPU memory");
+        return createBuffer.call(this);
       });
-      await handle.settled;
-      expect(reports).toEqual(["worker"]);
-      expect(handle.transport).not.toBe("gpu");
-      expect(destroy).toHaveBeenCalledTimes(1);
-      expect(warn.mock.calls.filter((c) => String(c[0]).includes("failed to start"))).toHaveLength(1);
-      handle.stop();
-    } finally {
-      failBuffers = false;
-      device.destroy();
-    }
-  });
+      const hold = GpuForceLayout.prototype.hold;
+      vi.spyOn(GpuForceLayout.prototype, "hold").mockImplementation(function (this: GpuForceLayout, heat: number) {
+        hold.call(this, heat);
+        failBuffers = true; // the disc-seeded run holds its heat right before it builds the stream
+      });
+      const reports: GpuLayoutTransport[] = [];
+      const g = buildGraph(makeRingGraph());
+      try {
+        // A disc-seeded run (`multilevel: false`): it holds full heat right before building the stream.
+        const handle = startGpuLayout(Promise.resolve(device), g, { width: W, height: H, iterations: 5, multilevel: false }, () => {}, undefined, (t) => {
+          reports.push(t);
+          failBuffers = false;
+        });
+        await handle.settled;
+        expect(reports).toEqual([...path.reports]);
+        expect(handle.transport).toBe("worker");
+        expect(destroy).toHaveBeenCalledTimes(1);
+        expect(warn.mock.calls.filter((c) => String(c[0]).includes("failed to start"))).toHaveLength(1);
+        handle.stop();
+      } finally {
+        failBuffers = false;
+        compile.restore();
+        device.destroy();
+      }
+    });
+  }
 });
 
 describe("network layout backend:'gpu' — context loss mid-run (#352, #311)", () => {

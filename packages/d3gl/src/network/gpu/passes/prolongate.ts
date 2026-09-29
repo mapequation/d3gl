@@ -1,7 +1,8 @@
 import type { Device, Texture, RenderPass } from "@luma.gl/core";
 import type { Model } from "@luma.gl/engine";
 import { SLOT_TEXEL_GLSL } from "../textures.js";
-import { fullScreenModel, NO_BLEND, type PassUniforms } from "./fullscreen.js";
+import { fullScreenProgram, layoutModel, NO_BLEND, type PassUniforms } from "./fullscreen.js";
+import type { LayoutProgram } from "../programs.js";
 
 /**
  * Prolongation gather pass (the multilevel seed, #180 / #353).
@@ -57,6 +58,11 @@ export interface ProlongateInput {
   width: number;
 }
 
+/** The prolongation's program (#385). */
+export function prolongateProgram(): LayoutProgram {
+  return fullScreenProgram(FS);
+}
+
 /**
  * GPU prolongation pass — one instance reused for every level of the multilevel seed (its model reads
  * `gl_FragCoord` and takes the width and count as uniforms). The caller opens a render pass on the solver's
@@ -68,7 +74,7 @@ export class ProlongatePass {
 
   constructor(device: Device) {
     this.uniforms = { u_count: 0, u_width: 1 };
-    this.model = fullScreenModel(device, FS, this.uniforms, NO_BLEND);
+    this.model = layoutModel(device, prolongateProgram(), this.uniforms, NO_BLEND);
   }
 
   /** Gather the level's seed positions (and zero velocities) into an already-open MRT render pass. */

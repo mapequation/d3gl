@@ -47,6 +47,9 @@ importers:
       '@luma.gl/engine':
         specifier: ^9.3.3
         version: 9.3.3(@luma.gl/core@9.3.3)(@luma.gl/shadertools@9.3.3(@luma.gl/core@9.3.3))
+      '@luma.gl/shadertools':
+        specifier: ^9.3.3
+        version: 9.3.3(@luma.gl/core@9.3.3)
       '@luma.gl/webgl':
         specifier: ^9.3.3
         version: 9.3.3(@luma.gl/core@9.3.3)

@@ -1,7 +1,8 @@
 import type { Device, Framebuffer, Texture } from "@luma.gl/core";
 import type { Model } from "@luma.gl/engine";
 import { SLOT_TEXEL_GLSL, atlasWidth } from "../textures.js";
-import { NO_BLEND, beginPass, fullScreenModel, type PassUniforms } from "./fullscreen.js";
+import { NO_BLEND, beginPass, fullScreenProgram, layoutModel, type PassUniforms } from "./fullscreen.js";
+import type { LayoutProgram } from "../programs.js";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Readback pack passes (#352, spec §6.5.2)
@@ -62,6 +63,16 @@ void main() {
 /** Texels of the stats staging row: `stats`, `box`, the stop latch. */
 export const STATS_TEXELS = 3;
 
+/** The stats staging pass's program (#385). */
+export function packStatsProgram(): LayoutProgram {
+  return fullScreenProgram(STATS_FS);
+}
+
+/** The position pack pass's program (#385). */
+export function packPositionsProgram(): LayoutProgram {
+  return fullScreenProgram(PACK_FS);
+}
+
 /**
  * One range's `stats` and `box` texels — the flat segment table's only segment, or the nested solve's
  * whole-slot range (#355) — and the stop latch's texel (#376) side by side in one 3×1 `rgba32float` staging
@@ -97,7 +108,7 @@ export class PackStatsPass {
       sampler: { minFilter: "nearest", magFilter: "nearest" },
     });
     this.uniforms = { u_texel: new Int32Array(2) };
-    this.model = fullScreenModel(device, STATS_FS, this.uniforms, NO_BLEND);
+    this.model = layoutModel(device, packStatsProgram(), this.uniforms, NO_BLEND);
   }
 
   /**
@@ -154,7 +165,7 @@ export class PackPositionsPass {
     });
     this.framebuffer = device.createFramebuffer({ width: this.width, height: this.height, colorAttachments: [this.texture] });
     this.uniforms = { u_count: count, u_posWidth: 1, u_outWidth: this.width };
-    this.model = fullScreenModel(device, PACK_FS, this.uniforms, NO_BLEND);
+    this.model = layoutModel(device, packPositionsProgram(), this.uniforms, NO_BLEND);
   }
 
   /** Pack the `rg32f` positions `pos` (atlas width `posWidth`) into the staging texture, in node order. */

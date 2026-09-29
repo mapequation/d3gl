@@ -73,3 +73,16 @@ export function buildHubChunks(offsets: Uint32Array): HubChunks {
   }
   return { count, table };
 }
+
+/**
+ * Whether a CSR with these row lengths has a row longer than {@link SPRING_CHUNK} — exactly when
+ * {@link buildHubChunks} would return chunks for it (#385: the springs' program variant, known before the solver
+ * builds its CSR). Pass the degrees the graph already holds (`NetworkGraph.csr.degree`, which `buildCSR` computed
+ * from the same edges as the solver's). O(rows) reads, stopping at the first hub row; allocates nothing.
+ */
+export function hasHubRows(degree: ArrayLike<number>): boolean {
+  for (let i = 0; i < degree.length; i++) {
+    if ((degree[i] ?? 0) > SPRING_CHUNK) return true;
+  }
+  return false;
+}

@@ -2,7 +2,8 @@ import type { Device, RenderPass, Texture } from "@luma.gl/core";
 import type { Model } from "@luma.gl/engine";
 import { SLOT_TEXEL_GLSL } from "../textures.js";
 import { SEGMENT_OF_GLSL, segmentDefines } from "../segment-table.js";
-import { fullScreenModel, NO_BLEND, type PassUniforms } from "./fullscreen.js";
+import { fullScreenProgram, layoutModel, NO_BLEND, type PassUniforms } from "./fullscreen.js";
+import type { LayoutProgram } from "../programs.js";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // The nested layout's per-slot integration passes (#355, spec §11.1).
@@ -124,6 +125,16 @@ function shared(u: PassUniforms, b: Record<string, Texture>, input: NestedSlotIn
   b["u_segParam"] = input.segParam;
 }
 
+/** The PREDICT pass's program (#385). */
+export function nestedPredictProgram(): LayoutProgram {
+  return fullScreenProgram(PREDICT_FS);
+}
+
+/** The INTEGRATE pass's program (#385). */
+export function nestedIntegrateProgram(): LayoutProgram {
+  return fullScreenProgram(INTEGRATE_FS);
+}
+
 /** The PREDICT pass: v* per slot, drawn into an open pass on the v* framebuffer (no blend). */
 export class NestedPredictPass {
   private readonly model: Model;
@@ -131,7 +142,7 @@ export class NestedPredictPass {
 
   constructor(device: Device) {
     this.uniforms = { u_count: 0, u_width: 1, u_tableWidth: 1, u_repel: 0, u_alphaCold: 0, u_alphaWarm: 0 };
-    this.model = fullScreenModel(device, PREDICT_FS, this.uniforms, NO_BLEND);
+    this.model = layoutModel(device, nestedPredictProgram(), this.uniforms, NO_BLEND);
   }
 
   /** `force` holds the repulsion sum when `repel` (the organise phase); it is not read otherwise. */
@@ -155,7 +166,7 @@ export class NestedIntegratePass {
 
   constructor(device: Device, keep: number) {
     this.uniforms = { u_count: 0, u_width: 1, u_tableWidth: 1, u_keep: keep, u_alphaCold: 0, u_alphaWarm: 0 };
-    this.model = fullScreenModel(device, INTEGRATE_FS, this.uniforms, NO_BLEND);
+    this.model = layoutModel(device, nestedIntegrateProgram(), this.uniforms, NO_BLEND);
   }
 
   run(pass: RenderPass, pos: Texture, vstar: Texture, springs: Texture, input: NestedSlotInputs): void {

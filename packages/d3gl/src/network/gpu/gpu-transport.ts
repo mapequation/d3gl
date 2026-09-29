@@ -34,6 +34,19 @@
  * harvested frame instead — the worker backend's per-frame step — and each painted frame hands its tree to
  * `onLODTree` with a streamed handle, as the worker backend's frames do; it coarsens only for the seed's plan.
  *
+ * **Startup (#385).** Once the device has passed the checks its features and limits decide (or, probed for an
+ * earlier layout, its whole cached record, so a failed probe falls back at once), the run starts its coarsening
+ * worker (with LOD on, the LOD relay's, unarmed: it holds its tree until the stream exists), seeds the disc, and
+ * compiles every program it will build — the float-blend probe's, the solver's (its stop latch and its seed's
+ * passes too) and the readback's — at once and in parallel (`compilePrograms`, `KHR_parallel_shader_compile`),
+ * polled once per animation frame. It reports `"gpu"` then; the probe runs and the solver is built in the frame
+ * all of them have linked, so no program links on the main thread in the click's task. A link that fails falls
+ * back to the worker, a render-backend swap during the compile abandons it and starts again on the next device,
+ * a lost context continues on the worker, and a stop frees it; a drag meanwhile is replayed onto the run once it
+ * exists. Programs the device built for an earlier layout are not compiled again, and without the extension the
+ * solver is built at once, as before. The nested layout (`gpu-nested-transport.ts`) takes the same step once its
+ * prep is back.
+ *
  * **A GPU run's lifetime is its device's (#311).** When the render backend that owns the device is about
  * to be swapped out, the engine calls the handle's `moveDevice` while the device is still alive: the run
  * stops and frees its GPU resources (and its LOD and seed workers), then continues **warm** on the next
@@ -48,9 +61,11 @@
 import type { Device } from "@luma.gl/core";
 import { WebGLDevice } from "@luma.gl/webgl";
 import { gpuLayoutNeed, gpuLayoutSupport } from "./device-caps.js";
-import { gpuCaps } from "./device-probe.js";
+import { blendProbeProgram, cachedGpuCaps, gpuCaps, gpuStaticCaps } from "./device-probe.js";
 import { GpuForceLayout } from "./gpu-force-layout.js";
 import { GpuStream, type GpuRunState } from "./gpu-stream.js";
+import { AsyncPositionReadback } from "./async-readback.js";
+import { compilePrograms, type CompileOutcome, type ProgramCompile } from "./programs.js";
 import { moduleSeedPlan, type SeedPlan, type SeedPlanOptions } from "./seed-plan.js";
 import { SeedWorker } from "./seed-worker.js";
 import { LODRelay, type OnLODTree, type SeedRequest } from "./lod-relay.js";
@@ -158,13 +173,15 @@ export function warnGpuFallback(message: string, warnUnsupported: boolean | unde
  * - If `gpuLayoutSupport` rejects the device for this graph → one warning with the reason (none with
  *   `warnUnsupported: false`), then {@link startWorkerLayout} with the same options and `onLODTree` (it
  *   has its own sync fallback).
- * - Otherwise: seeds a disc (on screen until the multilevel seed's first frame), constructs
- *   {@link GpuForceLayout}, starts the seed's coarsening worker, and streams the run ({@link GpuStream})
+ * - Otherwise: starts the seed's coarsening worker, seeds a disc (on screen until the multilevel seed's first
+ *   frame), compiles the run's programs (see the module header), constructs {@link GpuForceLayout}, and streams
+ *   the run ({@link GpuStream})
  *   until it has converged or `iterations` are done; `settled` resolves once the final positions have been
  *   harvested.
  *
  * `onTransport` reports each resolution before its run starts — so before any frame or LOD tree
- * arrives — and again when the layout moves (#311). The handle's `transport` / `shared` read the live
+ * arrives — and again when the layout moves (#311). A run whose programs compile first reports `"gpu"` when the
+ * compile starts; should a link or the probe then fail, it moves to `"worker"` (a second report). The handle's `transport` / `shared` read the live
  * state (#297): `"pending"` while waiting for a device, then `"gpu"` or `"worker"`. `moveDevice`
  * continues a GPU run on another device (see the module header).
  */
@@ -225,6 +242,8 @@ class GpuLayoutRun implements WorkerLayoutHandle {
   private lodStyle: { style: LeafStyle; version: number } | null = null;
   /** The view the engine last sent a spatial LOD stream (#433); likewise. */
   private lodView: LODView | null = null;
+  /** The run whose programs are compiling (#385): {@link inner} is its placeholder handle meanwhile. */
+  private compiling: Compiling | null = null;
 
   constructor(
     private readonly graph: NetworkGraph,
@@ -258,7 +277,7 @@ class GpuLayoutRun implements WorkerLayoutHandle {
   begin(device: DeviceSource, resume: (() => Continuation) | undefined, fallback: (reason: string) => string, replay: boolean, failure = false): void {
     const generation = ++this.generation;
     const start = (d: Device | null | undefined): void => {
-      if (this.generation === generation) this.adopt(this.launch(d, resume?.(), fallback, failure), replay);
+      if (this.generation === generation) this.adopt(this.launch(d, resume?.(), fallback, failure, replay), replay);
     };
     if (!(device instanceof Promise)) {
       start(device);
@@ -275,9 +294,22 @@ class GpuLayoutRun implements WorkerLayoutHandle {
   }
 
   moveDevice(next: Promise<Device | null | undefined>): void {
+    if (this.stopped) return;
+    const swapped = (reason: string): string => `continues on the CPU worker after a render-backend swap: ${reason}`;
+    const compiling = this.compiling;
+    if (compiling && compiling.handle && this.inner === compiling.handle) {
+      // Its programs were compiling on the device that goes away (#385): abandon them and start again on `next`,
+      // afresh (nothing was painted) or with the continuation it was started with.
+      const { cont } = compiling;
+      this.inner = null;
+      compiling.handle.stop();
+      this.dragSinceMove = this.dragging;
+      this.begin(next, cont ? () => cont : undefined, swapped, true, false);
+      return;
+    }
     const stream = this.stream;
-    if (this.stopped || !stream) return; // a worker run is not bound to a device; a pending one waits for `next` anyway
-    this.move(stream, next, (reason) => `continues on the CPU worker after a render-backend swap: ${reason}`, true, false);
+    if (!stream) return; // a worker run is not bound to a device; a pending one waits for `next` anyway
+    this.move(stream, next, swapped, true, false);
   }
 
   pin(ids: Uint32Array, positions?: Float32Array): void {
@@ -399,17 +431,24 @@ class GpuLayoutRun implements WorkerLayoutHandle {
     };
   }
 
-  /** Decide GPU vs worker for this graph on `device`, and start that run. */
-  private launch(device: Device | null | undefined, cont: Continuation | undefined, fallback: (reason: string) => string, failure: boolean): Launched {
+  /**
+   * Decide GPU vs worker for this graph on `device`, and start that run (#385): on the device's features and
+   * limits — or, probed for an earlier layout, its whole cached record, so a failed probe falls back at once —
+   * start the coarsening and seed the disc, then compile every program the run builds in parallel
+   * ({@link compilePrograms}); the probe runs and the solver is built once they have linked, in a later frame
+   * ({@link compiled}). Without anything to compile ahead, it builds at once.
+   */
+  private launch(device: Device | null | undefined, cont: Continuation | undefined, fallback: (reason: string) => string, failure: boolean, replay: boolean): Launched {
     const { graph, onLODTree } = this;
     const opts = this.runOpts;
     const fault: GpuLayoutFailure | undefined = failure ? { kind: "failure" } : undefined;
-    const verdict = gpuLayoutSupport(gpuCaps(device), gpuLayoutNeed(graph.nodeCount, graph.edgeCount));
+    const need = gpuLayoutNeed(graph.nodeCount, graph.edgeCount);
+    const verdict = gpuLayoutSupport(cachedGpuCaps(device) ?? gpuStaticCaps(device), need);
     if (!verdict.ok || !device) {
       // (`!device` never reaches here with `ok`: no device has no caps, which never pass.)
       return { handle: this.fallBackToWorker(fallback(verdict.ok ? "no WebGL device" : verdict.reason), cont, fault), stream: null };
     }
-    // gpuLayoutSupport passed, so this is a WebGL2 device: the streaming readback needs its raw context.
+    // The checks passed, so this is a WebGL2 device: the streaming readback needs its raw context.
     if (!(device instanceof WebGLDevice)) {
       return { handle: this.fallBackToWorker(fallback("no WebGL2 device"), cont, fault), stream: null };
     }
@@ -417,52 +456,108 @@ class GpuLayoutRun implements WorkerLayoutHandle {
     // 0-node graph: GpuForceLayout would create a zero-height texture (crash).
     // Return a no-op handle immediately — there is nothing to lay out.
     if (graph.nodeCount === 0) {
+      const probed = gpuLayoutSupport(gpuCaps(device), need);
+      if (!probed.ok) return { handle: this.fallBackToWorker(fallback(probed.reason), cont, fault), stream: null };
       this.onTransport?.("gpu");
       this.onFrame();
       return { handle: { shared: false, transport: "gpu", settled: Promise.resolve(), stop() {}, pin() {}, unpin() {} }, stream: null };
     }
 
-    const { width, height, force } = opts;
-    const iterations = cont ? cont.iterations : (opts.iterations ?? 300);
-
-    // The multilevel seed (#312, #353) — not for a layout that moved here (#311), whose positions are on
-    // screen: from the provided module tree when there is one (its plan is built here, as the module seed
-    // always was), else from the graph's coarsening, which a layout worker builds — the LOD relay's worker
-    // with LOD on (one coarsening for the tree and the seed), else a seed-only worker.
-    const multilevel = !cont && (opts.multilevel ?? true) && graph.edgeCount > 0;
-    const planOptions: SeedPlanOptions = { width, height, ...(force ? { force } : {}) };
-    const modulePlan = multilevel && opts.moduleTopology ? moduleSeedPlan(opts.moduleTopology, graph, planOptions) : null;
-    const coarsenSeed = multilevel && !modulePlan;
-    // The worker's plan may only be handed to the stream once it exists; a reply is a later task, so this
-    // buffers nothing in practice, but it keeps the order explicit.
-    let stream: GpuStream | null = null;
-    let earlyPlan: SeedPlan | null | undefined;
-    const seedRequest: SeedRequest = {
-      options: planOptions,
-      onPlan: (plan) => {
-        if (stream) stream.seed(plan);
-        else earlyPlan = plan;
-      },
-    };
-
-    // With LOD on, the LOD worker starts coarsening now, while this thread seeds and builds the solver (#377) —
-    // or, for the spatial tree (#343), stands ready to rebuild it per frame (coarsening only for the seed's plan).
-    // If it cannot start, no second worker is tried for the seed: the relay's one warning covers both.
-    const lodWorker = opts.lod === true && onLODTree !== undefined;
-    const relay = lodWorker && onLODTree ? startLODRelay(graph, opts, onLODTree, coarsenSeed ? seedRequest : null) : null;
-    const seedWorker = coarsenSeed && !lodWorker ? startSeedWorker(graph, opts, seedRequest) : null;
-    const seeded = modulePlan !== null || (coarsenSeed && (relay !== null || seedWorker !== null));
-
+    const coarsening = startCoarsening(graph, opts, onLODTree, cont);
     // The disc at the force equilibrium's scale: on screen until the seed's first frame (the same scale, so
     // that frame rearranges the layout without zooming), and a cold start's seed — unless the layout moved
     // here (#311), when `graph.positions` holds where it left off.
-    if (!cont) seedPositions(graph, width, height, { force });
+    if (!cont) seedPositions(graph, opts.width, opts.height, { force: opts.force });
+    // Every program the run builds — the probe's, the solver's (its seed's too) and the readback's — compiled at
+    // once and in parallel (#385), while the coarsening worker boots; null: nothing to compile ahead, build now.
+    const programs = [blendProbeProgram(), ...GpuForceLayout.programs(graph, { multilevel: coarsening.seeded }), ...AsyncPositionReadback.programs(device, false)];
+    const record: Compiling = { device, cont, fallback, fault, replay, coarsening, handle: null, compile: null };
+    let compile: ProgramCompile | null;
+    try {
+      compile = compilePrograms(device, programs, (outcome) => this.compiled(record, outcome));
+    } catch (error) {
+      releaseCoarsening(coarsening); // the caller falls back to a worker run, which streams its own tree
+      throw error;
+    }
+    if (!compile) return this.build(record, false);
+    record.compile = compile;
+    // Resolved to the GPU: reported now, not a compile later, so the engine builds no LOD tree of its own
+    // while one is coming — or, with no LOD worker, builds it now. A failed link or probe moves it to the worker.
+    this.onTransport?.("gpu");
+    if (opts.lod && !coarsening.relay) onLODTree?.(null);
+    const { relay } = coarsening;
+    const handle: WorkerLayoutHandle = {
+      shared: false,
+      transport: "gpu",
+      settled: new Promise<void>(() => {}), // the built run's settles the layout
+      stop: () => {
+        if (this.compiling === record) this.compiling = null;
+        compile.cancel();
+        releaseCoarsening(coarsening);
+      },
+      // A drag during the compile is replayed onto the run once it exists (see {@link adopt}).
+      pin() {},
+      unpin() {},
+      ...(relay && streamsSpatial(opts) ? { setLODStyle: (style: LeafStyle, version: number) => relay.setStyle(style, version) } : {}),
+      ...(relay && streamsSpatial(opts) ? { setLODView: (view: LODView) => relay.setView(view) } : {}),
+    };
+    record.handle = handle;
+    this.compiling = record;
+    return { handle, stream: null };
+  }
+
+  /**
+   * The run's programs finished compiling (#385): build it once every one has linked; fall back to the worker
+   * with one warning if one failed to link or the build throws; continue on the worker if the context was lost
+   * meanwhile, as a lost context does during a run (#311).
+   */
+  private compiled(record: Compiling, outcome: CompileOutcome): void {
+    if (this.compiling !== record || this.stopped || !record.handle || this.inner !== record.handle) return;
+    this.compiling = null;
+    const { cont, fallback, replay, coarsening } = record;
+    if (outcome.status === "lost") {
+      releaseCoarsening(coarsening);
+      this.inner = null;
+      this.begin(null, cont ? () => cont : undefined, () => "fell back to the CPU worker: the WebGL context was lost while the layout's programs compiled", replay, true);
+      return;
+    }
+    let launched: Launched;
+    if (outcome.status === "failed") {
+      releaseCoarsening(coarsening);
+      launched = { handle: this.fallBackToWorker(fallback("a GPU layout program failed to link"), cont, { kind: "failure", cause: outcome.reason }), stream: null };
+    } else {
+      try {
+        launched = this.build(record, true);
+      } catch (error) {
+        // A driver rejected a program, or a resource could not be created: the worker still lays it out.
+        launched = { handle: this.fallBackToWorker(fallback("the GPU layout failed to start"), cont, { kind: "failure", cause: error }), stream: null };
+      }
+    }
+    this.adopt(launched, replay);
+  }
+
+  /**
+   * Run the float-blend probe (its program compiled by now) and build the solver and the stream, and start the
+   * run. `reported`: the transport was reported when the compile started. Throws, with the coarsening freed, when
+   * the solver or the stream cannot be built.
+   */
+  private build(record: Compiling, reported: boolean): Launched {
+    const { graph, onLODTree } = this;
+    const opts = this.runOpts;
+    const { device, cont, fallback, fault, coarsening } = record;
+    const probed = gpuLayoutSupport(gpuCaps(device), gpuLayoutNeed(graph.nodeCount, graph.edgeCount));
+    if (!probed.ok) {
+      releaseCoarsening(coarsening);
+      return { handle: this.fallBackToWorker(fallback(probed.reason), cont, fault), stream: null };
+    }
+    const { modulePlan, relay, seedWorker, seeded } = coarsening;
+    const { force } = opts;
+    const iterations = cont ? cont.iterations : (opts.iterations ?? 300);
     let layout: GpuForceLayout;
     try {
       layout = new GpuForceLayout(device, graph, { ...DEFAULT_FORCE, ...force }, { multilevel: seeded });
     } catch (error) {
-      relay?.destroy(); // the caller falls back to a worker run, which streams its own tree
-      seedWorker?.destroy();
+      releaseCoarsening(coarsening); // the caller falls back to a worker run, which streams its own tree
       throw error;
     }
     // As the CPU worker (#124): a cold disc start keeps full heat to untangle (see ForceLayout.run); a seeded
@@ -487,19 +582,26 @@ class GpuLayoutRun implements WorkerLayoutHandle {
     } catch (error) {
       // The readback's programs or buffers failed: free the solver before the caller falls back.
       layout.destroy();
-      relay?.destroy();
-      seedWorker?.destroy();
+      releaseCoarsening(coarsening);
       throw error;
     }
-    stream = started;
-    // Reported once every GPU resource exists, so a failed start reports only the fallback's "worker";
-    // still before the first frame, and before the LOD tree (a later task).
-    this.onTransport?.("gpu");
-    // LOD on but no worker to build the tree (or an edge-less graph's structure tree, which does not coarsen): the
-    // caller builds it.
-    if (opts.lod && !relay) onLODTree?.(null);
+    coarsening.stream = started;
+    if (!reported) {
+      // Reported once every GPU resource exists, so a failed start reports only the fallback's "worker";
+      // still before the first frame, and before the LOD tree (a later task).
+      this.onTransport?.("gpu");
+      // LOD on but no worker to build the tree (or an edge-less graph's structure tree, which does not coarsen):
+      // the caller builds it.
+      if (opts.lod && !relay) onLODTree?.(null);
+    }
+    // The run goes ahead on the GPU: only now is a coarsening worker that could not start worth a warning (a
+    // fallback would have run the worker's own layout instead), and the relay prints a failure it held (#385).
+    const warning = coarsening.warning;
+    if (warning?.cause !== undefined) console.warn(warning.message, warning.cause);
+    else if (warning) console.warn(warning.message);
+    relay?.arm();
     if (modulePlan) started.seed(modulePlan);
-    else if (earlyPlan !== undefined) started.seed(earlyPlan);
+    else if (coarsening.earlyPlan !== undefined) started.seed(coarsening.earlyPlan);
     started.start();
 
     return {
@@ -526,6 +628,96 @@ class GpuLayoutRun implements WorkerLayoutHandle {
   }
 }
 
+/** A deferred `console.warn`. */
+interface Warning {
+  readonly message: string;
+  readonly cause?: unknown;
+}
+
+/**
+ * What a GPU run's multilevel seed and LOD tree come from, started before its programs compile (#385), and the
+ * stream the seed plan goes to once it exists.
+ */
+interface Coarsening {
+  /** A provided module tree's plan (built on this thread), or null. */
+  readonly modulePlan: SeedPlan | null;
+  /** The LOD relay (LOD on), unarmed until the stream exists; it builds the seed's plan too. */
+  readonly relay: LODRelay | null;
+  /** The seed-only coarsening worker (LOD off). */
+  readonly seedWorker: SeedWorker | null;
+  /** Whether the run seeds multilevel (a plan will come) — the solver is then built `multilevel`. */
+  readonly seeded: boolean;
+  /** A warning about a worker that could not start, printed only once the GPU run's stream exists (#385). */
+  readonly warning: Warning | null;
+  /** A seed plan that arrived before the stream (null: the worker could not build one). */
+  earlyPlan: SeedPlan | null | undefined;
+  /** The run's stream, once it exists: the worker's plan goes straight to it. */
+  stream: GpuStream | null;
+}
+
+/** A run whose programs are compiling (#385): what its build needs, and the placeholder handle it runs under. */
+interface Compiling {
+  readonly device: WebGLDevice;
+  readonly cont: Continuation | undefined;
+  readonly fallback: (reason: string) => string;
+  readonly fault: GpuLayoutFailure | undefined;
+  readonly replay: boolean;
+  readonly coarsening: Coarsening;
+  handle: WorkerLayoutHandle | null;
+  compile: ProgramCompile | null;
+}
+
+/**
+ * Start the multilevel seed's coarsening (#312, #353) — not for a layout that moved here (#311), whose positions
+ * are on screen: from the provided module tree when there is one (its plan is built here, as the module seed
+ * always was), else from the graph's coarsening, which a layout worker builds — the LOD relay's worker with LOD
+ * on (one coarsening for the tree and the seed; or, for the spatial tree, #343, standing ready to rebuild it per
+ * frame, coarsening only for the seed's plan), else a seed-only worker. The relay starts unarmed: its tree waits
+ * until the stream exists (#385: the solver may be built frames later).
+ */
+function startCoarsening(graph: NetworkGraph, opts: GpuLayoutOptions, onLODTree: OnLODTree | undefined, cont: Continuation | undefined): Coarsening {
+  const { width, height, force } = opts;
+  const multilevel = !cont && (opts.multilevel ?? true) && graph.edgeCount > 0;
+  const planOptions: SeedPlanOptions = { width, height, ...(force ? { force } : {}) };
+  const modulePlan = multilevel && opts.moduleTopology ? moduleSeedPlan(opts.moduleTopology, graph, planOptions) : null;
+  const coarsenSeed = multilevel && !modulePlan;
+  // The worker's plan may only be handed to the stream once it exists (#385: frames later when the programs
+  // compile first); until then it waits here.
+  let coarsening: Coarsening | null = null;
+  let earlyPlan: SeedPlan | null | undefined;
+  const seedRequest: SeedRequest = {
+    options: planOptions,
+    onPlan: (plan) => {
+      if (coarsening?.stream) coarsening.stream.seed(plan);
+      else if (coarsening) coarsening.earlyPlan = plan;
+      else earlyPlan = plan;
+    },
+  };
+  // With LOD on, the LOD worker coarsens for both the tree and the seed (#377). If it cannot start, no second
+  // worker is tried for the seed: the relay's one warning covers both.
+  const lodWorker = opts.lod === true && onLODTree !== undefined;
+  const lod = lodWorker && onLODTree ? startLODRelay(graph, opts, onLODTree, coarsenSeed ? seedRequest : null) : null;
+  const seed = coarsenSeed && !lodWorker ? startSeedWorker(graph, opts, seedRequest) : null;
+  const relay = lod?.relay ?? null;
+  const seedWorker = seed?.worker ?? null;
+  coarsening = {
+    modulePlan,
+    relay,
+    seedWorker,
+    seeded: modulePlan !== null || (coarsenSeed && (relay !== null || seedWorker !== null)),
+    warning: lod?.warning ?? seed?.warning ?? null,
+    earlyPlan,
+    stream: null,
+  };
+  return coarsening;
+}
+
+/** Free a coarsening a stream never took over: its workers (the run fell back, stopped or moved). */
+function releaseCoarsening(coarsening: Coarsening): void {
+  coarsening.relay?.destroy();
+  coarsening.seedWorker?.destroy();
+}
+
 /** Whether a run with these options streams the spatial LOD tree (#343), whose style it aggregates itself. */
 function streamsSpatial(opts: GpuLayoutOptions): boolean {
   return opts.lod === true && opts.lodSource === "spatial";
@@ -533,45 +725,42 @@ function streamsSpatial(opts: GpuLayoutOptions): boolean {
 
 /**
  * The GPU run's LOD tree, built and refit in a layout worker (#377) — or, for the spatial source (#343),
- * rebuilt there for every harvested frame — or null where no worker can run (with one warning). An edge-less
- * graph's structure tree is none: it does not coarsen (the engine asks for the spatial tree there anyway).
+ * rebuilt there for every harvested frame — started unarmed (#385: it precedes its stream), or none where no
+ * worker can run, with the warning the run prints if it goes ahead on the GPU. An edge-less graph's structure
+ * tree is none, and no warning: it does not coarsen (the engine asks for the spatial tree there anyway).
  */
-function startLODRelay(graph: NetworkGraph, opts: GpuLayoutOptions, onLODTree: OnLODTree, seed: SeedRequest | null): LODRelay | null {
+function startLODRelay(graph: NetworkGraph, opts: GpuLayoutOptions, onLODTree: OnLODTree, seed: SeedRequest | null): { relay: LODRelay | null; warning: Warning | null } {
   const spatial = streamsSpatial(opts);
-  if (graph.edgeCount === 0 && !spatial) return null;
+  if (graph.edgeCount === 0 && !spatial) return { relay: null, warning: null };
   const instead = seed
     ? "the LOD tree is built on the main thread and the layout starts from a disc instead of its multilevel seed"
     : "the LOD tree is built on the main thread instead";
   const worker = spawnLayoutWorker();
   if (!worker) {
-    console.warn(`[d3gl] network layout({ backend: 'gpu' }): no LOD worker could start; ${instead}.`);
-    return null;
+    return { relay: null, warning: { message: `[d3gl] network layout({ backend: 'gpu' }): no LOD worker could start; ${instead}.` } };
   }
   try {
     const source = spatial ? { source: "spatial" as const, style: opts.lodStyle, styleVersion: opts.lodStyleVersion, view: opts.lodView } : {};
-    return new LODRelay(worker, graph, { coarsen: opts.coarsen, ...source }, onLODTree, seed);
+    return { relay: new LODRelay(worker, graph, { coarsen: opts.coarsen, ...source }, onLODTree, seed, false), warning: null };
   } catch (error) {
-    // The coarsen request could not be posted; the relay freed its worker. The caller withdraws the tree once
-    // it has reported the transport.
-    console.warn(`[d3gl] network layout({ backend: 'gpu' }): a message to the LOD worker failed; ${instead}.`, error);
-    return null;
+    // The coarsen request could not be posted; the relay freed its worker. The run withdraws the tree once it
+    // has reported the transport.
+    return { relay: null, warning: { message: `[d3gl] network layout({ backend: 'gpu' }): a message to the LOD worker failed; ${instead}.`, cause: error } };
   }
 }
 
 /**
- * The multilevel seed's coarsening worker with LOD off (#353), or null where no worker can run (with one
- * warning: the layout starts from its disc).
+ * The multilevel seed's coarsening worker with LOD off (#353), or none where no worker can run — with the
+ * warning the run prints if it goes ahead (the layout starts from its disc).
  */
-function startSeedWorker(graph: NetworkGraph, opts: GpuLayoutOptions, seed: SeedRequest): SeedWorker | null {
-  const worker = spawnLayoutWorker();
-  if (!worker) {
-    console.warn("[d3gl] network layout({ backend: 'gpu' }): no layout worker could start to coarsen the graph; the layout starts from a disc instead of its multilevel seed.");
-    return null;
+function startSeedWorker(graph: NetworkGraph, opts: GpuLayoutOptions, seed: SeedRequest): { worker: SeedWorker | null; warning: Warning | null } {
+  const port = spawnLayoutWorker();
+  if (!port) {
+    return { worker: null, warning: { message: "[d3gl] network layout({ backend: 'gpu' }): no layout worker could start to coarsen the graph; the layout starts from a disc instead of its multilevel seed." } };
   }
   try {
-    return new SeedWorker(worker, graph, opts.coarsen, seed.options, seed.onPlan);
+    return { worker: new SeedWorker(port, graph, opts.coarsen, seed.options, seed.onPlan), warning: null };
   } catch (error) {
-    console.warn("[d3gl] network layout({ backend: 'gpu' }): a message to the layout worker failed; the layout starts from a disc instead of its multilevel seed.", error);
-    return null;
+    return { worker: null, warning: { message: "[d3gl] network layout({ backend: 'gpu' }): a message to the layout worker failed; the layout starts from a disc instead of its multilevel seed.", cause: error } };
   }
 }

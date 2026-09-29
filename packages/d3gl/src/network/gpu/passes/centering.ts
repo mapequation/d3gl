@@ -2,7 +2,8 @@ import type { Device, Texture, RenderPass } from "@luma.gl/core";
 import type { Model } from "@luma.gl/engine";
 import { SLOT_TEXEL_GLSL } from "../textures.js";
 import { SEGMENT_OF_GLSL, segmentDefines } from "../segment-table.js";
-import { ADDITIVE_BLEND, fullScreenModel, type PassUniforms } from "./fullscreen.js";
+import { ADDITIVE_BLEND, fullScreenProgram, layoutModel, type PassUniforms } from "./fullscreen.js";
+import type { LayoutProgram } from "../programs.js";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // CenteringPass
@@ -73,6 +74,11 @@ export interface CenteringSegments {
   width: number;
 }
 
+/** The centering pass's program for one segment or many (#385). */
+export function centeringProgram(singleSegment: boolean): LayoutProgram {
+  return fullScreenProgram(centerFs(singleSegment));
+}
+
 /**
  * Full-screen triangle centering force pass. Reads the segment table's `stats` (produced this tick
  * by the range query) and centering strength, and writes `centering * (centroid − pos_i)` into the
@@ -93,7 +99,7 @@ export class CenteringPass {
       u_tableWidth: 1,
     };
     // Additive blend: accumulate alongside repulsion + attraction.
-    this.model = fullScreenModel(device, centerFs(singleSegment), this.uniforms, ADDITIVE_BLEND);
+    this.model = layoutModel(device, centeringProgram(singleSegment), this.uniforms, ADDITIVE_BLEND);
   }
 
   /**

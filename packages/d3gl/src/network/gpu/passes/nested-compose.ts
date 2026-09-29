@@ -2,7 +2,8 @@ import type { Device, Framebuffer, SamplerProps, Texture } from "@luma.gl/core";
 import type { Model } from "@luma.gl/engine";
 import { SLOT_TEXEL_GLSL, atlasWidth } from "../textures.js";
 import { SEGMENT_OF_GLSL, segmentDefines, type SegmentTable } from "../segment-table.js";
-import { beginPass, fullScreenModel, NO_BLEND, type PassUniforms } from "./fullscreen.js";
+import { beginPass, fullScreenProgram, layoutModel, NO_BLEND, type PassUniforms } from "./fullscreen.js";
+import type { LayoutProgram } from "../programs.js";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // The nested layout's composition + pack pass (#355, spec §11.1).
@@ -125,6 +126,11 @@ export interface ComposeInput {
   rootRadius: number;
 }
 
+/** The composition pass's program for a module tree `depth` levels deep (#385). */
+export function nestedComposeProgram(depth: number): LayoutProgram {
+  return fullScreenProgram(composeFs(depth));
+}
+
 /**
  * The composition + pack pass and its staging texture (created once): world positions of every leaf
  * and world discs of every module, in node order (see the file header).
@@ -175,7 +181,7 @@ export class NestedComposePass {
       u_fill: fill,
       u_onlyChild: onlyChild,
     };
-    this.model = fullScreenModel(device, composeFs(depth), this.uniforms, NO_BLEND);
+    this.model = layoutModel(device, nestedComposeProgram(depth), this.uniforms, NO_BLEND);
   }
 
   /** Compose every leaf's and module's world position into the staging texture (every texel written). */
