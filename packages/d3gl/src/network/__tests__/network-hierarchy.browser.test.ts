@@ -299,7 +299,8 @@ describe("the module tree is built off the main thread (#428)", () => {
     const g = graph();
     const expected = expectedNested(g, MODULES); // (a main-thread build of the test's own)
     builds.count = 0;
-    net.data(g, { modules: MODULES }).lod({ expandPx: 60, declutter: false }).layout({ backend: "worker", nested: true });
+    // Members 20 apart overlap at radius 12, so the modules stay collapsed at k = 1 (#426).
+    net.data(g, { modules: MODULES }).style({ nodeRadius: 12 }).lod({ expandPx: 60, declutter: false }).layout({ backend: "worker", nested: true });
     expect(net.lodSource).toBe("none"); // the tree is on its way
     expect(net.pick(100, 100)).toBeNull(); // and a synchronous read does not build it here: no cut yet
     await Promise.resolve();
