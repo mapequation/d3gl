@@ -672,8 +672,9 @@ export abstract class BaseEngine {
     // unchanged (the per-frame zoom/pan case). When a layer appears or disappears (e.g. network
     // arrows toggling across an LOD cut), a reappearing layer would be appended last and drawn on
     // top of layers that should sit above it — so on ANY set change, clear this lane's layers and
-    // re-add in emit order to re-establish the canonical z-order. (Set-stable ⇒ in-place, the
-    // perf-critical path: zero teardown, no order drift.)
+    // re-add in emit order to re-establish the canonical z-order — or, where the backend can reorder, keep
+    // the persisting layers and reorder them. (Set-stable ⇒ in-place, the perf-critical path: zero
+    // teardown, no order drift.)
     const prev = this.laneEmittedNames.get(name);
     const sameSet = prev != null && prev.size === emittedNames.size && [...emittedNames].every((n) => prev.has(n));
     if (sameSet) {
@@ -681,6 +682,15 @@ export abstract class BaseEngine {
         if (backend.updateInstancedLayer) backend.updateInstancedLayer(layer);
         else backend.setInstancedLayer(layer);
       }
+    } else if (prev != null && backend.updateInstancedLayer && backend.orderInstancedLayers) {
+      // The set changed: drop the vanished layers, update the persisting ones in place (their uploaded data
+      // stays — the leaf links' resident edge tables, #447), add the new ones, then restore the emit order.
+      for (const n of entry.layerNames) if (!emittedNames.has(n)) backend.removeInstancedLayer?.(n);
+      for (const layer of emitted) {
+        if (prev.has(layer.name)) backend.updateInstancedLayer(layer);
+        else backend.setInstancedLayer(layer);
+      }
+      backend.orderInstancedLayers(emitted.map((l) => l.name));
     } else {
       for (const n of entry.layerNames) backend.removeInstancedLayer?.(n);
       for (const layer of emitted) backend.setInstancedLayer(layer);

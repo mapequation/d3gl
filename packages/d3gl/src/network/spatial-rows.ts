@@ -144,6 +144,24 @@ export function incidenceArrays(csr: CSR, edges: IncidenceEdges, directed: boole
   };
 }
 
+/**
+ * The edge id of each CSR entry of `csr` (the `buildCSR` CSR of `edges`) that is its edge's source's entry,
+ * `0xffffffff` at the target's: a walk of a node's row meets each of its out-edges once (#447, the leaf links'
+ * index, `leafLinkEdges` in glyphs.ts). 4 B per entry (8 B per edge), O(edges), once per graph.
+ */
+export function incidenceSourceEdges(csr: CSR, { source, target, edgeCount, nodeCount }: Omit<IncidenceEdges, "weight">): Uint32Array {
+  const out = new Uint32Array(csr.neighbors.length).fill(0xffffffff);
+  const cursor = csr.offsets.slice(0, nodeCount);
+  for (let e = 0; e < edgeCount; e++) {
+    const s = source[e] ?? 0;
+    const t = target[e] ?? 0;
+    out[cursor[s] ?? 0] = e;
+    cursor[s] = (cursor[s] ?? 0) + 1;
+    cursor[t] = (cursor[t] ?? 0) + 1;
+  }
+  return out;
+}
+
 /** Each CSR entry's edge weight (see {@link incidenceArrays}). */
 function incidenceWeights(csr: CSR, { source, target, weight: w, edgeCount, nodeCount }: IncidenceEdges): Float32Array {
   const weight = new Float32Array(csr.neighbors.length);

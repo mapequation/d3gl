@@ -37,6 +37,17 @@ function rgbaAt(colors: Uint8Array | undefined, i: number): [number, number, num
   return [colors[i * 4] ?? 0, colors[i * 4 + 1] ?? 0, colors[i * 4 + 2] ?? 0, colors[i * 4 + 3] ?? 0];
 }
 
+/** An indexed link draw's (#447) style row for instance `e` — its edge id — and its colour, faded as the
+ *  shader fades it; a plain draw's row is `e` itself. */
+function styleRow(d: { index?: Float32Array }, e: number): number {
+  return d.index ? (d.index[e] ?? 0) : e;
+}
+function linkColor(d: { index?: Float32Array; fade?: Float32Array; colors: Uint8Array }, e: number): [number, number, number, number] {
+  const c = rgbaAt(d.colors, styleRow(d, e));
+  const f = d.index && d.fade ? (d.fade[e] ?? 1) : 1;
+  return f === 1 ? c : [c[0], c[1], c[2], Math.round(c[3] * f)];
+}
+
 /** A drawable with the shared defaults (bevel joins / butt caps — see the compositing-equivalence
  *  notes in AGENTS.md) filled in, so instanced output strokes like Scene output does. */
 function drawable(
@@ -138,7 +149,8 @@ export function linesToDrawables(l: InstancedLinesData): DrawableVector[] {
     const sy = l.sources[e * 2 + 1] ?? 0;
     const tx = l.targets[e * 2] ?? 0;
     const ty = l.targets[e * 2 + 1] ?? 0;
-    const bend = l.bends ? (l.bends[e] ?? 0) : 0;
+    const r = styleRow(l, e);
+    const bend = l.bends ? (l.bends[r] ?? 0) : 0;
     out.push(
       drawable(e, {
         subpaths: record((ctx) => {
@@ -150,8 +162,8 @@ export function linesToDrawables(l: InstancedLinesData): DrawableVector[] {
             ctx.lineTo(tx, ty);
           }
         }),
-        stroke: rgbaAt(l.colors, e),
-        lineWidth: l.widths[e] ?? 0,
+        stroke: linkColor(l, e),
+        lineWidth: l.widths[r] ?? 0,
       }),
     );
   }
@@ -172,12 +184,13 @@ export function arrowsToDrawables(a: InstancedArrowsData, bake = 1): DrawableVec
     const sy = (a.sources[e * 2 + 1] ?? 0) * bake;
     const tx = (a.targets[e * 2] ?? 0) * bake;
     const ty = (a.targets[e * 2 + 1] ?? 0) * bake;
-    const bend = a.bends ? (a.bends[e] ?? 0) : 0;
+    const r = styleRow(a, e);
+    const bend = a.bends ? (a.bends[r] ?? 0) : 0;
     const [ux, uy] = bend ? bentEndTangent(sx, sy, tx, ty, bend) : straightUnit(sx, sy, tx, ty);
     const px = -uy;
     const py = ux;
-    const setback = a.radii[e] ?? 0;
-    const size = a.sizes[e] ?? 0;
+    const setback = a.radii[r] ?? 0;
+    const size = a.sizes[r] ?? 0;
     const tipX = tx - ux * setback;
     const tipY = ty - uy * setback;
     const baseX = tipX - ux * 2 * size;
@@ -190,7 +203,7 @@ export function arrowsToDrawables(a: InstancedArrowsData, bake = 1): DrawableVec
           ctx.lineTo((baseX + px * size) * inv, (baseY + py * size) * inv);
           ctx.closePath();
         }),
-        fill: rgbaAt(a.colors, e),
+        fill: linkColor(a, e),
       }),
     );
   }
@@ -207,20 +220,21 @@ export function halfArrowsToDrawables(h: InstancedHalfArrowsData, bake = 1): Dra
     const y0 = (h.sources[e * 2 + 1] ?? 0) * bake;
     const x1 = (h.targets[e * 2] ?? 0) * bake;
     const y1 = (h.targets[e * 2 + 1] ?? 0) * bake;
+    const r = styleRow(h, e);
     const geom = halfLinkGeometry({
       x0,
       y0,
-      r0: h.radii[e * 2] ?? 0,
+      r0: h.radii[r * 2] ?? 0,
       x1,
       y1,
-      r1: h.radii[e * 2 + 1] ?? 0,
-      width: h.widths[e * 2] ?? 0,
-      oppositeWidth: h.widths[e * 2 + 1] ?? 0,
-      bend: chordBend(x0, y0, x1, y1, h.bends[e] ?? 0),
+      r1: h.radii[r * 2 + 1] ?? 0,
+      width: h.widths[r * 2] ?? 0,
+      oppositeWidth: h.widths[r * 2 + 1] ?? 0,
+      bend: chordBend(x0, y0, x1, y1, h.bends[r] ?? 0),
     });
     if (!geom) continue;
     const g = bake === 1 ? geom : scaleHalfLink(geom, inv);
-    out.push(drawable(e, { subpaths: record((ctx) => traceHalfLink(g, ctx)), fill: rgbaAt(h.colors, e) }));
+    out.push(drawable(e, { subpaths: record((ctx) => traceHalfLink(g, ctx)), fill: linkColor(h, e) }));
   }
   return out;
 }

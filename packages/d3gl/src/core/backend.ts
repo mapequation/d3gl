@@ -154,6 +154,17 @@ export interface InstancedLinesData {
   groups2?: Float32Array;
   /** Per-instance selected flag (0/1) for shader-driven dim/recolour (#162). Length `count`. */
   selected?: Uint8Array;
+  /**
+   * **Indexed draw** (#447): with `index`, the style arrays above (everything but `sources`/`targets`,
+   * `groups`/`groups2`/`selected` included) are instead per-**edge** tables of `tableCount` entries, kept
+   * resident on the GPU and re-uploaded only when an array reference changes; `index` lists the edges to
+   * draw — `count` of them, one instance each, whose pick id is its edge id — and `sources`/`targets` stay
+   * per instance (the listed edges' ends, which move with the layout). Edge ids must be below 2^24 (float-exact).
+   */
+  index?: Float32Array;
+  tableCount?: number;
+  /** Indexed draw only: a per-instance alpha multiplier (the cross-fade band); absent = 1. Length `count`. */
+  fade?: Float32Array;
   count: number;
 }
 
@@ -179,6 +190,17 @@ export interface InstancedArrowsData {
   groups2?: Float32Array;
   /** Per-instance selected flag (0/1) for shader-driven dim/recolour (#162). Length `count`. */
   selected?: Uint8Array;
+  /**
+   * **Indexed draw** (#447): with `index`, the style arrays above (everything but `sources`/`targets`,
+   * `groups`/`groups2`/`selected` included) are instead per-**edge** tables of `tableCount` entries, kept
+   * resident on the GPU and re-uploaded only when an array reference changes; `index` lists the edges to
+   * draw — `count` of them, one instance each, whose pick id is its edge id — and `sources`/`targets` stay
+   * per instance (the listed edges' ends, which move with the layout). Edge ids must be below 2^24 (float-exact).
+   */
+  index?: Float32Array;
+  tableCount?: number;
+  /** Indexed draw only: a per-instance alpha multiplier (the cross-fade band); absent = 1. Length `count`. */
+  fade?: Float32Array;
   count: number;
 }
 
@@ -208,6 +230,17 @@ export interface InstancedHalfArrowsData {
   groups2?: Float32Array;
   /** Per-instance selected flag (0/1) for shader-driven dim/recolour (#162). Length `count`. */
   selected?: Uint8Array;
+  /**
+   * **Indexed draw** (#447): with `index`, the style arrays above (everything but `sources`/`targets`,
+   * `groups`/`groups2`/`selected` included) are instead per-**edge** tables of `tableCount` entries, kept
+   * resident on the GPU and re-uploaded only when an array reference changes; `index` lists the edges to
+   * draw — `count` of them, one instance each, whose pick id is its edge id — and `sources`/`targets` stay
+   * per instance (the listed edges' ends, which move with the layout). Edge ids must be below 2^24 (float-exact).
+   */
+  index?: Float32Array;
+  tableCount?: number;
+  /** Indexed draw only: a per-instance alpha multiplier (the cross-fade band); absent = 1. Length `count`. */
+  fade?: Float32Array;
   count: number;
 }
 
@@ -246,12 +279,13 @@ export interface InstancedPieData {
  * the topmost link instance. Only the link primitives (lines/arrows/half-arrows) carry it; nodes
  * (circles, pie) are CPU-picked exactly on the screen-bounded frontier and never enter the GPU pick pass.
  */
+/** A link layer's `pickBase` (#447) offsets its instances' pick ids, so two pickable link layers decode to disjoint ids. */
 export type InstancedLayer =
   | { name: string; sizeMode?: "world" | "screen"; primitive: "circles"; circles: InstancedCirclesData }
   | { name: string; sizeMode?: "world" | "screen"; primitive: "pie"; pie: InstancedPieData }
-  | { name: string; sizeMode?: "world" | "screen"; primitive: "lines"; pickable?: boolean; lines: InstancedLinesData }
-  | { name: string; sizeMode?: "world" | "screen"; primitive: "arrows"; pickable?: boolean; arrows: InstancedArrowsData }
-  | { name: string; sizeMode?: "world" | "screen"; primitive: "half-arrows"; pickable?: boolean; halfArrows: InstancedHalfArrowsData };
+  | { name: string; sizeMode?: "world" | "screen"; primitive: "lines"; pickable?: boolean; pickBase?: number; lines: InstancedLinesData }
+  | { name: string; sizeMode?: "world" | "screen"; primitive: "arrows"; pickable?: boolean; pickBase?: number; arrows: InstancedArrowsData }
+  | { name: string; sizeMode?: "world" | "screen"; primitive: "half-arrows"; pickable?: boolean; pickBase?: number; halfArrows: InstancedHalfArrowsData };
 
 /**
  * One backend-rendered text label (#105 N7b-2). Positioned in **screen pixels** (the caller projects
@@ -355,6 +389,12 @@ export interface Backend {
   updateInstancedLayer?(layer: InstancedLayer): void;
   /** Remove an instanced primitive layer by name. */
   removeInstancedLayer?(name: string): void;
+  /**
+   * Move the named instanced layers, in this order, after every other instanced layer (the draw order), with
+   * no GPU work — so a lane whose set of layers changed keeps the ones that persist (and their uploaded data)
+   * rather than recreating them to re-establish its order. Optional; without it the engine recreates the lane's layers.
+   */
+  orderInstancedLayers?(names: readonly string[]): void;
   /**
    * Shader-driven selection/hover styling for an instanced layer (#162) — applies the highlight WITHOUT
    * rebuilding geometry, so a hover is just a uniform change (no CPU rebuild, no GPU re-upload) even on a

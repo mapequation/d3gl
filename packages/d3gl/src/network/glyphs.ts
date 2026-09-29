@@ -1662,11 +1662,88 @@ export interface LeafLinksScratch {
   kept: Int32Array;
   gen: number;
   edges: Uint32Array;
+  /** The radix sort's other buffer and its 2^12-bucket histogram ({@link leafLinkEdges}). */
+  sorted: Uint32Array;
+  hist: Uint32Array;
+  /** CSR entries the last {@link leafLinkEdges} read: the kept leaves' degrees, summed. */
+  entries: number;
 }
 
 /** A fresh, empty {@link LeafLinksScratch}. */
 export function makeLeafLinksScratch(): LeafLinksScratch {
-  return { kept: new Int32Array(0), gen: 0, edges: new Uint32Array(0) };
+  return { kept: new Int32Array(0), gen: 0, edges: new Uint32Array(0), sorted: new Uint32Array(0), hist: new Uint32Array(1 << RADIX_BITS), entries: 0 };
+}
+
+const RADIX_BITS = 12;
+
+/**
+ * The graph edges between two kept leaves of the cut (#447), in edge order — the order the full-detail path
+ * draws them in — into `sc.edges[0..m)`; returns `m`. Found by walking the kept leaves' CSR rows, each edge
+ * read once at its source's entry (`sourceEntryEdge`: the edge id of each CSR entry that is its edge's
+ * source's, else `0xffffffff`; see {@link incidenceSourceEdges}), so O(Σ degree of the kept leaves), not
+ * O(edges); then sorted into edge order by 12-bit radix passes, O(m + 4096) each (two below 2^24 edges).
+ * Self-loops are left out, as the gathers leave them. Memory: 4 B per leaf and 8 B per leaf link of scratch, reused.
+ */
+export function leafLinkEdges(graph: NetworkGraph, frontier: Uint32Array, sourceEntryEdge: Uint32Array, sc: LeafLinksScratch): number {
+  const n = graph.nodeCount;
+  if (sc.kept.length < n) sc.kept = new Int32Array(n);
+  if (sc.gen === 0x7fffffff) { sc.kept.fill(0); sc.gen = 0; }
+  const gen = ++sc.gen;
+  const kept = sc.kept;
+  let entries = 0;
+  const { offsets, neighbors } = graph.csr;
+  for (let i = 0; i < frontier.length; i++) {
+    const g = frontier[i] ?? 0;
+    if (g >= n) continue;
+    kept[g] = gen;
+    entries += (offsets[g + 1] ?? 0) - (offsets[g] ?? 0);
+  }
+  sc.entries = entries;
+  // Each edge is found at most once, at its source's entry: `entries` bounds the count.
+  if (sc.edges.length < entries) sc.edges = new Uint32Array(Math.max(entries, 2 * sc.edges.length));
+  let list = sc.edges;
+  let m = 0;
+  for (let i = 0; i < frontier.length; i++) {
+    const a = frontier[i] ?? 0;
+    if (a >= n) continue;
+    const end = offsets[a + 1] ?? 0;
+    for (let k = offsets[a] ?? 0; k < end; k++) {
+      const e = sourceEntryEdge[k] ?? 0xffffffff;
+      if (e === 0xffffffff) continue;
+      const b = neighbors[k] ?? 0;
+      if (b !== a && kept[b] === gen) list[m++] = e;
+    }
+  }
+  if (m < 2) return m;
+  if (sc.sorted.length < sc.edges.length) sc.sorted = new Uint32Array(sc.edges.length);
+  let other = sc.sorted;
+  const hist = sc.hist;
+  const mask = (1 << RADIX_BITS) - 1;
+  for (let shift = 0; shift < 32 && (shift === 0 || (graph.edgeCount - 1) >>> shift > 0); shift += RADIX_BITS) {
+    hist.fill(0);
+    for (let i = 0; i < m; i++) {
+      const d = ((list[i] ?? 0) >>> shift) & mask;
+      hist[d] = (hist[d] ?? 0) + 1;
+    }
+    let sum = 0;
+    for (let d = 0; d <= mask; d++) {
+      const c = hist[d] ?? 0;
+      hist[d] = sum;
+      sum += c;
+    }
+    for (let i = 0; i < m; i++) {
+      const e = list[i] ?? 0;
+      const d = (e >>> shift) & mask;
+      other[hist[d] ?? 0] = e;
+      hist[d] = (hist[d] ?? 0) + 1;
+    }
+    const t = list;
+    list = other;
+    other = t;
+  }
+  sc.edges = list;
+  sc.sorted = other;
+  return m;
 }
 
 /**
@@ -1726,6 +1803,7 @@ export function withLeafLinks(
     ids[i] = (src[e] ?? 0) * size + (tgt[e] ?? 0);
     flows[i] = w[e] ?? 0;
   }
+  const leafEdges = list.slice(0, m);
   const gFlows = gathered.flows;
   for (let j = 0; j < k; j++) {
     ids[m + j] = gathered.ids[j] ?? 0;
@@ -1793,7 +1871,7 @@ export function withLeafLinks(
       colors: colorsOf(ha.colors, g?.colors),
       count,
     };
-    return { halfArrows, ids, flows };
+    return { halfArrows, ids, flows, leafEdges };
   }
   const ln = cache.lines;
   if (!ln) return gathered;
@@ -1806,7 +1884,7 @@ export function withLeafLinks(
     lines.samples = ln.samples;
   }
   const ar = cache.arrows;
-  if (!ar) return { lines, ids, flows };
+  if (!ar) return { lines, ids, flows, leafEdges };
   const ga = gathered.arrows;
   const arrows: InstancedArrowsData = {
     sources,
@@ -1820,7 +1898,7 @@ export function withLeafLinks(
     arrows.bends = column(ar.bends, ga?.bends, 1);
     arrows.half = ar.half;
   }
-  return { lines, arrows, ids, flows };
+  return { lines, arrows, ids, flows, leafEdges };
 }
 
 /**
@@ -1836,6 +1914,9 @@ export interface SuperEdgesData {
   arrows?: InstancedArrowsData;
   ids: ArrayLike<number>;
   flows?: ArrayLike<number>;
+  /** {@link withLeafLinks}: the graph edge of each of the first `leafEdges.length` instances (the leaf links,
+   *  #447). Two parallel edges share a pair id, so a Scene keys a leaf link by its edge instead. */
+  leafEdges?: ArrayLike<number>;
 }
 
 /** Path-strip samples for a smooth bent link (#104 N6c). */

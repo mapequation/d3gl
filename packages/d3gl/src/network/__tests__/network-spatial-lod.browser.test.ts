@@ -96,7 +96,7 @@ describe("lod({ source: 'spatial' }) (#343)", () => {
 
     // Links come from the super-edge rows the worker built with the tree (#433), which the settled tree carries.
     // At a new view the kept glyphs whose rows it cannot serve walk their leaves once; a held view then walks
-    // nothing and answers every kept glyph from the memo.
+    // nothing: every kept aggregate is answered from the memo.
     const first = net.superEdgeStats;
     expect(first).not.toBeNull();
     expect(first?.entries).toBeGreaterThan(0);
@@ -105,7 +105,9 @@ describe("lod({ source: 'spatial' }) (#343)", () => {
     const held = net.superEdgeStats;
     expect(held?.misses).toBe(0);
     expect(held?.visits).toBe(0);
-    expect(held?.hits).toBeGreaterThan(0);
+    // Aggregates are answered from the memo; a kept leaf's row is its own edges, read afresh, and its links to
+    // other kept leaves are drawn as graph edges (#447) — at this zoom most kept glyphs are leaves.
+    expect((held?.hits ?? 0) + (held?.leafLinks ?? 0)).toBeGreaterThan(0);
 
     // Switching source after the run: the structural tree is built here; back to spatial re-adopts the worker's.
     net.lod({ source: "structure", maxAggregateRadius: 18 });
