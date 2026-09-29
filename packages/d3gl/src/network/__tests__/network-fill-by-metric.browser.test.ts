@@ -29,7 +29,7 @@ const ENTER_EXIT = new Float32Array([0.5, 0.5, 0.5, 0.5]);
 const byte = (v: number) => Math.round(255 * v);
 const STYLE: NetworkStyle = {
   directed: true,
-  nodeRadius: 5,
+  nodeRadius: 8, // each module's members (15 apart) overlap, so both stay collapsed (#426)
   linkStyle: "none",
   nodeFill: { by: "flow", scale: (v) => `rgb(${byte(v)}, 0, 0)` }, // red ∝ flow
   flowBorder: {
@@ -106,6 +106,7 @@ describe("nodeFill { by, scale } + flowBorder.moduleFlow through the engine (#44
     const positions = new Float32Array(source.flatMap((i) => [100 + 50 * Math.cos((2 * Math.PI * i) / n), 100 + 50 * Math.sin((2 * Math.PI * i) / n)]));
     const style: NetworkStyle = {
       ...STYLE,
+      nodeRadius: 5,
       flowBorder: { flow: new Float32Array(n).fill(1 / n), scale: (v) => 4 * v, color: (v) => `rgb(0, ${byte(v)}, 0)`, moduleFlow: () => 0.1 },
     };
     const net = network(host(), { width: 200, height: 200, backend: "canvas" });
