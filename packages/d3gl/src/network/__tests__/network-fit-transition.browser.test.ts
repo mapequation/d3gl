@@ -5,6 +5,7 @@ import { buildGraph, type NetworkGraph } from "../graph.js";
 import type { ModuleNode } from "../modules.js";
 import type { ViewTransform } from "../../core/index.js";
 import { easeCubicInOut } from "../transition.js";
+import { layoutBox, layoutFitTransform } from "../fit.js";
 
 /**
  * `layout({ fit: true })` beyond streaming (#427), through the real engine and d3-zoom on a real host:
@@ -341,7 +342,20 @@ describe("fit + transition: the camera eases along with the nodes (#427)", () =>
       const end = net.camera;
 
       expect(same(from, to), "non-vacuity: the re-cluster moved no node").toBe(false);
-      expectFramed(to, end);
+      // The streamed map goes to its natural size (#454): 8 nodes in a root disc of 10·√8, so the default
+      // 4-unit glyph is a real share of the box — framed as the fit frames it, glyph pad included.
+      const framedAs = (p: Float32Array): ViewTransform => {
+        const box = layoutBox(p, p.length / 2);
+        if (!box) throw new Error("no box");
+        return layoutFitTransform(box, W, H, 4, false);
+      };
+      const near = (a: ViewTransform, b: ViewTransform): void => {
+        expect(a.k / b.k).toBeCloseTo(1, 4);
+        expect(Math.abs(a.x - b.x)).toBeLessThan(0.5);
+        expect(Math.abs(a.y - b.y)).toBeLessThan(0.5);
+      };
+      near(end, framedAs(to));
+      expect(framingOf(to, end).allInside).toBe(true);
       expect(zoomTransform(host)).toMatchObject(end);
       expect(net.interactingCalls).toBe(0);
       // Once the nodes move, every frame is framed as it is, and they move through frames between the two
@@ -352,7 +366,7 @@ describe("fit + transition: the camera eases along with the nodes (#427)", () =>
           expect(s.view).toEqual(start);
           continue;
         }
-        expectFramed(s.positions, s.view);
+        near(s.view, framedAs(s.positions));
         if (!same(s.positions, to)) between++;
       }
       expect(between, "no frame between the two maps: it jumped").toBeGreaterThan(5);

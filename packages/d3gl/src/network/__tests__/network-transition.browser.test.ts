@@ -36,13 +36,15 @@ function graph(): NetworkGraph {
   });
 }
 
-/** The pure warm nested layout of `records` from `initial` — what the engine must land on: placed by its
- *  result (a transition, the force backend) or by its seed (a stream, #454). */
+/** The pure warm nested layout of `records` from `initial` — what the engine must land on: placed over the
+ *  current map by its result (a transition, the force backend), or streamed (#454) at its natural size — the
+ *  cold root disc — with its seed centred on the current map. */
 function warmNested(g: NetworkGraph, records: ModuleNode[], initial: Float32Array, placeBy: "result" | "seed" = "result"): Float32Array {
   const tree = buildModuleLODTree(g.nodeCount, records, g);
   const parent = tree.parent;
   if (!parent) throw new Error("module trees carry a parent map");
-  return nestedLayout({ ...tree, parent }, { initial, size: g.flow ?? undefined, placeBy }).positions;
+  const radius = placeBy === "seed" ? 10 * Math.sqrt(g.nodeCount) : undefined;
+  return nestedLayout({ ...tree, parent }, { initial, size: g.flow ?? undefined, placeBy, radius }).positions;
 }
 
 /** Mean leaf displacement between two position sets. */
@@ -169,7 +171,7 @@ describe("warm nested re-layout + position transitions (#328)", () => {
     net.destroy();
   });
 
-  it("a warm re-cluster without a transition streams from the current map: it moves at once, frame by frame, to the map placed by its seed (#454)", async () => {
+  it("a warm re-cluster without a transition streams from the current map: it moves at once, frame by frame, to the map at its natural size (#454)", async () => {
     const net = network(host(), { width: 200, height: 200 });
     await net.whenReady();
     const g = graph();
