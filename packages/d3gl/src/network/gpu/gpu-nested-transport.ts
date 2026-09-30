@@ -117,6 +117,8 @@ export function startGpuNestedLayout(
    */
   const prepared = (device: WebGLDevice, solver: NestedSolverTopology): void => {
     if (stopped) return;
+    // A followed warm stream (#454) eases toward its seed at once, while the solve is built and compiled.
+    if (opts.follow && solver.seedFrame) opts.follow.onFrame(solver.seedFrame);
     const plan = nestedLayoutPlan(solver);
     const verdict = gpuLayoutSupport(cachedGpuCaps(device) ?? gpuStaticCaps(device), gpuNestedLayoutNeed(plan));
     if (!verdict.ok) {
