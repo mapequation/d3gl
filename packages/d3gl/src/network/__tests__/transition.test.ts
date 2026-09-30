@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { easeCubicInOut, lerpPositions, positionTransition, type PositionTransitionOptions } from "../transition.js";
+import { easeCubicInOut, easeCubicOut, lerpPositions, positionTransition, type PositionTransitionOptions } from "../transition.js";
 
 /** A hand-cranked clock + frame queue: `step(ms)` advances time and runs the pending frame. */
 function manualFrames(): { opts: Pick<PositionTransitionOptions, "now" | "requestFrame" | "cancelFrame">; step(ms: number): void; pending(): number } {
@@ -158,5 +158,125 @@ describe("position transitions (#328)", () => {
     expect(Array.from(positions)).toEqual([5, 6]);
     expect(frames).toBe(1);
     expect(t.running).toBe(false);
+  });
+});
+
+/** `ease` stretched over the rest of a schedule from a retarget at eased progress `base` (#454). */
+const rest = (ease: number, base: number): number => (ease - base) / (1 - base);
+
+describe("chasing a moving target: retarget (#454)", () => {
+  it("eases out: moves at once, then slows to rest", () => {
+    expect(easeCubicOut(0)).toBe(0);
+    expect(easeCubicOut(1)).toBe(1);
+    expect(easeCubicOut(0.1)).toBeGreaterThan(0.25); // a quarter of the way after a tenth of the time
+    for (let t = 0; t < 1; t += 0.05) expect(easeCubicOut(t + 0.05)).toBeGreaterThan(easeCubicOut(t));
+  });
+
+  it("before `to`, it is `to` from where the positions are now", () => {
+    const f = manualFrames();
+    const positions = new Float32Array([0, 0]);
+    const t = positionTransition(positions, { ...f.opts, duration: 100, onFrame: () => {}, ease: (x) => x });
+    positions.set([10, 10]); // moved since the transition was created (a drag while the solve ran)
+    expect(t.retarget(new Float32Array([20, 30]))).toBe(true);
+    expect(t.running).toBe(true);
+    f.step(50);
+    expect(Array.from(positions)).toEqual([15, 20]);
+  });
+
+  it("moves on from where the positions are, without a jump, and still ends on schedule on the newest target", () => {
+    const f = manualFrames();
+    const positions = new Float32Array([0, 0, 100, 0]);
+    const eased: number[] = [];
+    const t = positionTransition(positions, { ...f.opts, duration: 100, ease: easeCubicOut, onFrame: (p) => eased.push(p) });
+    t.to(new Float32Array([100, 0, 100, 100]));
+    f.step(20);
+    const at = Array.from(positions);
+    const base = easeCubicOut(0.2);
+    expect(at[0]).toBeCloseTo(100 * base, 4);
+    // A newer frame lands: ease from here to it over the 80 ms left.
+    const next = new Float32Array([0, 100, 0, 100]);
+    expect(t.retarget(next)).toBe(true);
+    expect(Array.from(t.from)).toEqual(at); // it moves on from the positions on screen
+    f.step(10);
+    const k = rest(easeCubicOut(0.3), base);
+    expect(positions[0]).toBeCloseTo(at[0]! + (0 - at[0]!) * k, 4);
+    expect(positions[1]).toBeCloseTo(at[1]! + (100 - at[1]!) * k, 4);
+    // No jump: the first frame after the retarget moves no farther than the eased share of one frame.
+    expect(Math.abs(positions[0]! - at[0]!)).toBeLessThan(Math.abs(at[0]!) * (easeCubicOut(0.3) - base) / (1 - base) + 1e-3);
+    f.step(70); // the schedule's end: exactly on the newest target
+    expect(Array.from(positions)).toEqual([0, 100, 0, 100]);
+    expect(t.running).toBe(false);
+    expect(t.ended).toBe(true);
+    expect(eased[eased.length - 1]).toBe(1);
+  });
+
+  it("follows a target rewritten in place before each retarget (a frame read back into one buffer)", () => {
+    const f = manualFrames();
+    const positions = new Float32Array([0, 0]);
+    const buffer = new Float32Array([10, 0]);
+    const t = positionTransition(positions, { ...f.opts, duration: 100, ease: (x) => x, onFrame: () => {} });
+    t.retarget(buffer);
+    f.step(50);
+    expect(Array.from(positions)).toEqual([5, 0]);
+    buffer.set([10, 10]);
+    t.retarget(buffer);
+    f.step(25); // half the time left: halfway from (5, 0) to (10, 10)
+    expect(positions[0]).toBeCloseTo(7.5, 4);
+    expect(positions[1]).toBeCloseTo(5, 4);
+    f.step(25);
+    expect(Array.from(positions)).toEqual([10, 10]);
+  });
+
+  it("after the end it declines: the caller puts the frame in place itself", () => {
+    const f = manualFrames();
+    const positions = new Float32Array([0, 0]);
+    const t = positionTransition(positions, { ...f.opts, duration: 10, onFrame: () => {} });
+    t.to(new Float32Array([1, 1]));
+    f.step(20);
+    expect(t.ended).toBe(true);
+    expect(t.retarget(new Float32Array([5, 5]))).toBe(false);
+    expect(Array.from(positions)).toEqual([1, 1]);
+    const stopped = positionTransition(positions, { ...f.opts, duration: 10, onFrame: () => {} });
+    stopped.stop();
+    expect(stopped.retarget(new Float32Array([5, 5]))).toBe(false);
+  });
+
+  it("with maxFrameMs, a stalled frame moves on by at most that much of the schedule — it slows, never leaps", () => {
+    const f = manualFrames();
+    const positions = new Float32Array([0, 0]);
+    const t = positionTransition(positions, { ...f.opts, duration: 100, ease: (x) => x, maxFrameMs: 10, onFrame: () => {} });
+    t.to(new Float32Array([100, 0]));
+    f.step(8);
+    expect(positions[0]).toBeCloseTo(8, 4);
+    f.step(500); // a busy main thread: half a second without a frame
+    expect(positions[0]).toBeCloseTo(18, 4);
+    f.step(8);
+    expect(positions[0]).toBeCloseTo(26, 4);
+    for (let i = 0; i < 12; i++) f.step(8);
+    expect(Array.from(positions)).toEqual([100, 0]); // still ends exactly on the target
+    // Without it the wall clock rules: the same stall ends the transition.
+    const g = manualFrames();
+    const p2 = new Float32Array([0, 0]);
+    positionTransition(p2, { ...g.opts, duration: 100, ease: (x) => x, onFrame: () => {} }).to(new Float32Array([100, 0]));
+    g.step(8);
+    g.step(500);
+    expect(Array.from(p2)).toEqual([100, 0]);
+  });
+
+  it("keeps kept nodes kept through every retarget", () => {
+    const f = manualFrames();
+    const positions = new Float32Array([0, 0, 50, 50]);
+    const t = positionTransition(positions, { ...f.opts, duration: 100, ease: (x) => x, onFrame: () => {} });
+    t.to(new Float32Array([100, 100, 100, 100]));
+    f.step(20);
+    t.keep([1]); // node 1 dropped here
+    const held = [positions[2], positions[3]];
+    t.retarget(new Float32Array([0, 0, 0, 0]));
+    f.step(30);
+    expect([positions[2], positions[3]]).toEqual(held);
+    t.retarget(new Float32Array([7, 7, 9, 9]));
+    f.step(50);
+    expect([positions[2], positions[3]]).toEqual(held);
+    expect([positions[0], positions[1]]).toEqual([7, 7]);
   });
 });

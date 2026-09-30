@@ -160,6 +160,36 @@ describe("nestedSolverTopology — one segmented solve over a module tree (#355)
     expect(Array.from(same)).toEqual(Array.from(cold.positions));
   });
 
+  it("a warm start placed by its seed (#454): the CPU's root disc and seed frame, and nothing placed after", () => {
+    const cold = nestedLayout(tree);
+    const initial = cold.positions.map((v, i) => v * 3 + (i % 2 ? -300 : 200));
+    const seeded = nestedSolverTopology(tree, { initial, placeBy: "seed" });
+    let seedFrame: Float32Array | null = null;
+    const cpu = nestedLayout(tree, { initial, placeBy: "seed", onDepth: (d, p) => void (d === 0 && (seedFrame = p.slice())) });
+    const root = seeded.root;
+    expect(seeded.place).toBeNull();
+    expect(seeded.rootX).toBeCloseTo(cpu.cx[root] ?? Number.NaN, 2);
+    expect(seeded.rootY).toBeCloseTo(cpu.cy[root] ?? Number.NaN, 2);
+    expect(seeded.rootRadius / (cpu.r[root] ?? Number.NaN)).toBeCloseTo(1, 5);
+    expect(seeded.seedFrame).not.toBeNull();
+    const frame = seeded.seedFrame ?? new Float32Array(0);
+    const cpuFrame = seedFrame ?? new Float32Array(0);
+    expect(frame).toHaveLength(2 * tree.leafCount);
+    let worst = 0;
+    for (let i = 0; i < frame.length; i++) worst = Math.max(worst, Math.abs((frame[i] ?? 0) - (cpuFrame[i] ?? 0)));
+    expect(worst).toBeLessThan(1e-3 * seeded.rootRadius);
+    // Its result passes through untouched: the root disc already placed it.
+    const positions = cold.positions.slice();
+    nestedSolverResult(seeded, positions, new Float32Array(4 * (tree.size - tree.leafCount)), initial, true);
+    expect(Array.from(positions)).toEqual(Array.from(cold.positions));
+    // Placed by its result (the default), and cold: the origin, and no seed frame.
+    const placed = nestedSolverTopology(tree, { initial });
+    expect([placed.rootX, placed.rootY, placed.seedFrame]).toEqual([0, 0, null]);
+    expect([solver.rootX, solver.rootY, solver.seedFrame]).toEqual([0, 0, null]);
+    // The seed frame's buffer is transferred with the rest.
+    expect(nestedSolverBuffers(seeded)).toHaveLength(24);
+  });
+
   it("hands a worker its typed arrays' buffers to transfer", () => {
     const buffers = nestedSolverBuffers(solver);
     // 13 solve arrays (the springs' relaxation among them) and the collision plan's 10.

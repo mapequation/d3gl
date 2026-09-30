@@ -33,6 +33,14 @@ import { positionTransition, type PositionTransition } from "../transition.js";
  *      pass), under 1.5× + 1 ms with LOD off (the interpolation vs a copy, under the same emit).
  * Wall-clock ceilings assert under `PERF_ASSERT` only (the CI tier).
  *
+ * **A followed stream** (#454, a warm nested layout streamed without a transition) runs the same frames on a
+ * transition that is **retargeted** to each newer streamed frame: the transport writes the frame into the
+ * follower's buffer (the copy a streamed frame makes into `graph.positions`), the retarget copies the
+ * positions on screen into the transition's `from`, and the frame interpolates. Timed here at its worst — a
+ * new frame every animation frame (the GPU harvests at most 20 per second; the worker posts one per depth) —
+ * with the same four signatures and the same bounds against the streamed frame: the copy it adds stands in
+ * for the streamed frame's own copy, so nothing O(N) is new per frame beyond the interpolation.
+ *
  * N is 100k in the normal suite; the ~1M leg is env-gated:
  *   BENCH_TRANSITION=1 NODE_OPTIONS=--expose-gc npx vitest run \
  *     packages/d3gl/src/network/__tests__/transition-perf.test.ts
@@ -43,7 +51,9 @@ const BENCH_N = Number(process.env.BENCH_TRANSITION_NODES) || 1_000_000;
 // Calibration at N=1M on an M-series laptop (median of 12, --expose-gc): streamed ON 218 ms vs
 // transition ON 19.6 ms; OFF streamed 6.9 ms vs transition 8.4 ms (the interpolation 2.1 ms vs a
 // 0.2 ms copy, under a 6.7 ms emit). At 100k: ON 22.3 vs 2.0 ms, OFF 0.68 vs 0.82 ms. The ceilings
-// are ~8-10× the transition's medians, so an O(N)-per-frame style pass (ON) trips them.
+// are ~8-10× the transition's medians, so an O(N)-per-frame style pass (ON) trips them. The followed legs
+// (#454, retargeted every frame), same machine: at 1M ON 11.7 ms vs a 36.0 ms streamed frame, OFF 10.8 vs
+// 7.9 ms (1.36×); at 100k ON 1.0 vs 3.2 ms, OFF 0.9 vs 0.7 ms — no allocation of their own.
 const ASSERT = !!process.env.PERF_ASSERT;
 const ON_FRAME_MS = Number(process.env.PERF_TRANSITION_ON_MS) || 150;
 const OFF_LERP_MS = Number(process.env.PERF_TRANSITION_OFF_MS) || 20;
@@ -106,7 +116,7 @@ function leafColors(n: number): Uint8Array {
 }
 
 /** A hand-cranked transition from `from` to `to` over `frames` frames; `step()` runs one frame. */
-function crankedTransition(positions: Float32Array, to: Float32Array, frames: number, onFrame: () => void): { t: PositionTransition; step(): void } {
+function crankedTransition(positions: Float32Array, to: Float32Array, frames: number, onFrame: () => void, follow?: { a: Float32Array; b: Float32Array }): { t: PositionTransition; step(): void } {
   let time = 0;
   let pending: (() => void) | null = null;
   const t = positionTransition(positions, {
@@ -122,10 +132,16 @@ function crankedTransition(positions: Float32Array, to: Float32Array, frames: nu
     },
   });
   t.to(to);
+  let k = 0;
   return {
     t,
     step() {
       time += 16;
+      if (follow && t.running) {
+        // A newer streamed frame lands in the target buffer (the transport's copy), and the follower retargets.
+        to.set(k++ % 2 ? follow.a : follow.b);
+        t.retarget(to);
+      }
       const cb = pending;
       pending = null;
       cb?.();
@@ -181,7 +197,7 @@ function frameAllocKB(gc: (() => void) | undefined, frame: (i: number) => void):
  * frame never reads the positions a streamed frame wrote (it eases from its own snapshot), so alternating
  * them changes neither.
  */
-function runLeg(graph: NetworkGraph, a: Float32Array, b: Float32Array, streamedRepaint: () => void, transitionRepaint: () => void): Leg {
+function runLeg(graph: NetworkGraph, a: Float32Array, b: Float32Array, streamedRepaint: () => void, transitionRepaint: () => void, followed = false): Leg {
   const gc = (globalThis as { gc?: () => void }).gc;
   const pos = graph.positions;
   // Streamed: the transport copies each message's positions, then the coalesced repaint runs.
@@ -191,11 +207,15 @@ function runLeg(graph: NetworkGraph, a: Float32Array, b: Float32Array, streamedR
   };
   for (let i = 0; i < 4; i++) streamedFrame(i);
   // Transition: warm the loop up on a short one, then time every frame of a real one a → b.
+  // A followed leg's frames land in a buffer of their own, which the transition is retargeted to (#454).
+  const follow = followed ? { a, b } : undefined;
+  const target = (to: Float32Array): Float32Array => (followed ? to.slice() : to);
   pos.set(b);
-  const warm = crankedTransition(pos, a, 4, transitionRepaint);
+  const warm = crankedTransition(pos, target(a), 4, transitionRepaint, follow);
   for (let i = 0; i < 5; i++) warm.step();
   pos.set(a);
-  const run = crankedTransition(pos, b, FRAMES, transitionRepaint);
+  const last = target(b);
+  const run = crankedTransition(pos, last, FRAMES, transitionRepaint, follow);
   const st: number[] = [];
   const tt: number[] = [];
   let moved = true;
@@ -210,9 +230,9 @@ function runLeg(graph: NetworkGraph, a: Float32Array, b: Float32Array, streamedR
     if (pos[0] === prev && a[0] !== b[0]) moved = false;
     prev = pos[0]!;
   }
-  run.step(); // the last frame: exactly on the target
+  run.step(); // the last frame: exactly on the target (a followed one's newest)
   let landed = !run.t.running;
-  for (let i = 0; i < pos.length && landed; i++) if (pos[i] !== b[i]) landed = false;
+  for (let i = 0; i < pos.length && landed; i++) if (pos[i] !== last[i]) landed = false;
 
   // Allocation, sampled only AFTER both timed loops: each sample forces a full GC, after which V8
   // shrinks the heap, so a timed loop run after the probes pays extra collections for the same
@@ -220,7 +240,7 @@ function runLeg(graph: NetworkGraph, a: Float32Array, b: Float32Array, streamedR
   // probe is its own transition, so the timed one above ran start to end.
   const streamedKB = frameAllocKB(gc, (i) => streamedFrame(i));
   pos.set(a);
-  const probe = crankedTransition(pos, b, ALLOC_FRAMES + 2, transitionRepaint);
+  const probe = crankedTransition(pos, target(b), ALLOC_FRAMES + 2, transitionRepaint, follow);
   const transitionKB = frameAllocKB(gc, () => probe.step());
   return { streamed: median(st), transition: median(tt), streamedKB, transitionKB, moved, landed };
 }
@@ -247,20 +267,33 @@ function guard(n: number, label: string): void {
   tree.radius.fill(-1); // poison: a transition frame that runs the style pass would overwrite it
   const poisoned = crankedTransition(graph.positions, a, 3, () => computeLODPositions(tree, graph.positions));
   for (let i = 0; i < 4; i++) poisoned.step();
+  // …and a followed one (#454), retargeted every frame.
+  const poisonedFollow = crankedTransition(graph.positions, a.slice(), 3, () => computeLODPositions(tree, graph.positions), { a, b });
+  for (let i = 0; i < 4; i++) poisonedFollow.step();
   const stylePassRan = tree.radius.some((v) => v !== -1);
   tree.radius.set(styleRef[0]!);
+  // The followed stream's legs (#454): the same frames, retargeted to a newer frame every frame.
+  const onFollow = runLeg(
+    graph, a, b,
+    () => computeLODGeometry(tree, graph, radii, graph.strength, undefined, colors),
+    () => computeLODPositions(tree, graph.positions),
+    true,
+  );
 
   // Reductions OFF: the full-graph emit, over a style cache built once (as the engine's).
   const style = plainStyle(n);
   const cache = noLodStyleCache(graph, style);
   const off = runLeg(graph, a, b, () => void networkLayersFromCache(graph, style, cache), () => void networkLayersFromCache(graph, style, cache));
+  const offFollow = runLeg(graph, a, b, () => void networkLayersFromCache(graph, style, cache), () => void networkLayersFromCache(graph, style, cache), true);
   // The interpolation alone, for its own ceiling and its own allocation signature.
   const lerpOnly = runLeg(graph, a, b, () => {}, () => {});
 
   const line =
     `N=${n.toLocaleString()} tree=${tree.size.toLocaleString()}  ON streamed=${on.streamed.toFixed(2)}ms transition=${on.transition.toFixed(2)}ms  ` +
     `OFF streamed=${off.streamed.toFixed(2)}ms transition=${off.transition.toFixed(2)}ms (lerp ${lerpOnly.transition.toFixed(2)}ms vs copy ${lerpOnly.streamed.toFixed(2)}ms)  ` +
-    `alloc KB/frame ON ${on.transitionKB.toFixed(1)}/${on.streamedKB.toFixed(1)} OFF ${off.transitionKB.toFixed(1)}/${off.streamedKB.toFixed(1)}${gc ? "" : " (no --expose-gc; rough)"}\n`;
+    `alloc KB/frame ON ${on.transitionKB.toFixed(1)}/${on.streamedKB.toFixed(1)} OFF ${off.transitionKB.toFixed(1)}/${off.streamedKB.toFixed(1)}${gc ? "" : " (no --expose-gc; rough)"}  ` +
+    `followed (#454): ON ${onFollow.transition.toFixed(2)}ms vs ${onFollow.streamed.toFixed(2)}ms OFF ${offFollow.transition.toFixed(2)}ms vs ${offFollow.streamed.toFixed(2)}ms, ` +
+    `alloc KB/frame ON ${onFollow.transitionKB.toFixed(1)} OFF ${offFollow.transitionKB.toFixed(1)}/${offFollow.streamedKB.toFixed(1)}\n`;
   console.log(line);
   if (BENCH) appendFileSync("/tmp/transition-perf.txt", `[${process.env.BENCH_TRANSITION_LABEL ?? label}] ${line}`);
 
@@ -268,7 +301,7 @@ function guard(n: number, label: string): void {
   expect(stylePassRan, "a transition frame ran the LOD style pass").toBe(false);
   expect(styleBefore[1]!.length).toBe(tree.size); // non-vacuity: the tree carries style arrays
   // 2. it moves, and lands exactly
-  for (const leg of [on, off, lerpOnly]) {
+  for (const leg of [on, off, lerpOnly, onFollow, offFollow]) {
     expect(leg.moved, "a transition frame left the positions where they were").toBe(true);
     expect(leg.landed, "the transition did not land exactly on its target").toBe(true);
   }
@@ -277,6 +310,8 @@ function guard(n: number, label: string): void {
     expect(on.transitionKB, `ON: ${on.transitionKB.toFixed(1)} KB/frame allocated`).toBeLessThan(ALLOC_KB_PER_FRAME);
     expect(lerpOnly.transitionKB, `interpolation: ${lerpOnly.transitionKB.toFixed(1)} KB/frame allocated`).toBeLessThan(ALLOC_KB_PER_FRAME);
     expect(off.transitionKB, `OFF: ${off.transitionKB.toFixed(1)} KB/frame vs ${off.streamedKB.toFixed(1)} streamed`).toBeLessThan(off.streamedKB + ALLOC_KB_PER_FRAME);
+    expect(onFollow.transitionKB, `followed ON: ${onFollow.transitionKB.toFixed(1)} KB/frame allocated`).toBeLessThan(ALLOC_KB_PER_FRAME);
+    expect(offFollow.transitionKB, `followed OFF: ${offFollow.transitionKB.toFixed(1)} KB/frame vs ${offFollow.streamedKB.toFixed(1)} streamed`).toBeLessThan(offFollow.streamedKB + ALLOC_KB_PER_FRAME);
   }
   // 4. within the streamed frame's budget, in both reduction states. ON it must stay well below: it
   //    skips the style pass (measured 0.09× at 1M and 100k) — a style pass back in the loop lands ≈1×.
@@ -284,14 +319,19 @@ function guard(n: number, label: string): void {
   //    (measured 1.2× at 100k and 1M) — an order-of-magnitude slip still trips 1.5× + 1 ms.
   expect(on.transition, `ON: transition ${on.transition.toFixed(2)}ms vs streamed ${on.streamed.toFixed(2)}ms`).toBeLessThan(on.streamed * 0.5);
   expect(off.transition, `OFF: transition ${off.transition.toFixed(2)}ms vs streamed ${off.streamed.toFixed(2)}ms`).toBeLessThan(off.streamed * 1.5 + 1);
+  //    Followed (#454), retargeted every frame: the same bounds — its two copies stand in for the streamed
+  //    frame's one, under the same emit (ON: the positions pass only).
+  expect(onFollow.transition, `followed ON: ${onFollow.transition.toFixed(2)}ms vs streamed ${onFollow.streamed.toFixed(2)}ms`).toBeLessThan(onFollow.streamed * 0.5);
+  expect(offFollow.transition, `followed OFF: ${offFollow.transition.toFixed(2)}ms vs streamed ${offFollow.streamed.toFixed(2)}ms`).toBeLessThan(offFollow.streamed * 1.5 + 1);
   if (ASSERT) {
     expect(on.transition, `ON: ${on.transition.toFixed(1)}ms at N=${n}`).toBeLessThan(ON_FRAME_MS * (n / 1_000_000) + 5);
     expect(lerpOnly.transition, `interpolation: ${lerpOnly.transition.toFixed(1)}ms at N=${n}`).toBeLessThan(OFF_LERP_MS * (n / 1_000_000) + 2);
+    expect(onFollow.transition, `followed ON: ${onFollow.transition.toFixed(1)}ms at N=${n}`).toBeLessThan(ON_FRAME_MS * (n / 1_000_000) + 5);
   }
 }
 
-describe("position transition — per-frame cost vs a streamed layout frame (#328)", () => {
-  it("N=100k: no style pass, no allocation of its own, within the streamed frame's budget (LOD on and off)", () => {
+describe("position transition — per-frame cost vs a streamed layout frame (#328, followed #454)", () => {
+  it("N=100k: no style pass, no allocation of its own, within the streamed frame's budget (LOD on and off), followed too", () => {
     guard(100_000, "100k");
   });
 

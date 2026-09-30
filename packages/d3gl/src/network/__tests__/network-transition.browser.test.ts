@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from "vitest";
-import { network, type Network } from "../network.js";
+import { Network, network } from "../network.js";
 import { buildGraph, type NetworkGraph } from "../graph.js";
 import { buildModuleLODTree, type ModuleNode } from "../modules.js";
 import { nestedLayout } from "../nested-layout.js";
@@ -36,12 +36,51 @@ function graph(): NetworkGraph {
   });
 }
 
-/** The pure warm nested layout of `records` from `initial` — what the engine must land on. */
-function warmNested(g: NetworkGraph, records: ModuleNode[], initial: Float32Array): Float32Array {
+/** The pure warm nested layout of `records` from `initial` — what the engine must land on: placed by its
+ *  result (a transition, the force backend) or by its seed (a stream, #454). */
+function warmNested(g: NetworkGraph, records: ModuleNode[], initial: Float32Array, placeBy: "result" | "seed" = "result"): Float32Array {
   const tree = buildModuleLODTree(g.nodeCount, records, g);
   const parent = tree.parent;
   if (!parent) throw new Error("module trees carry a parent map");
-  return nestedLayout({ ...tree, parent }, { initial, size: g.flow ?? undefined }).positions;
+  return nestedLayout({ ...tree, parent }, { initial, size: g.flow ?? undefined, placeBy }).positions;
+}
+
+/** Mean leaf displacement between two position sets. */
+function shift(a: Float32Array, b: Float32Array): number {
+  let s = 0;
+  for (let i = 0; i < a.length / 2; i++) s += Math.hypot(a[2 * i]! - b[2 * i]!, a[2 * i + 1]! - b[2 * i + 1]!);
+  return s / (a.length / 2);
+}
+
+/** RMS distance from the centroid. */
+function spreadOf(p: Float32Array): number {
+  const n = p.length / 2;
+  let x = 0;
+  let y = 0;
+  for (let i = 0; i < n; i++) {
+    x += p[2 * i]!;
+    y += p[2 * i + 1]!;
+  }
+  x /= n;
+  y /= n;
+  let ss = 0;
+  for (let i = 0; i < n; i++) ss += (p[2 * i]! - x) ** 2 + (p[2 * i + 1]! - y) ** 2;
+  return Math.sqrt(ss / n);
+}
+
+/** A ring of `n` nodes with a chord every tenth. */
+function ring(n: number): NetworkGraph {
+  const source: number[] = [];
+  const target: number[] = [];
+  for (let i = 0; i < n; i++) {
+    source.push(i);
+    target.push((i + 1) % n);
+    if (i % 10 === 0) {
+      source.push(i);
+      target.push((i + n / 2) % n);
+    }
+  }
+  return buildGraph({ nodeCount: n, source, target });
 }
 
 const tf = (net: Network): { k: number; x: number; y: number } => ({ ...(net as unknown as { transform: { k: number; x: number; y: number } }).transform });
@@ -130,7 +169,7 @@ describe("warm nested re-layout + position transitions (#328)", () => {
     net.destroy();
   });
 
-  it("a warm re-cluster without a transition lands in one frame", async () => {
+  it("a warm re-cluster without a transition streams from the current map: it moves at once, frame by frame, to the map placed by its seed (#454)", async () => {
     const net = network(host(), { width: 200, height: 200 });
     await net.whenReady();
     const g = graph();
@@ -138,15 +177,59 @@ describe("warm nested re-layout + position transitions (#328)", () => {
     const camera = tf(net);
     net.data(g, { modules: PAIRS }).lod({});
     const from = g.positions.slice();
-    const want = warmNested(g, PAIRS, from);
+    const want = warmNested(g, PAIRS, from, "seed");
     const rec = sampler(() => g.positions);
     net.layout({ backend: "worker", nested: { warm: true } });
+    expect(Array.from(g.positions)).toEqual(Array.from(from)); // nothing is placed over the map at the call
     await net.whenSettled();
     await nextFrame();
     rec.stop();
     expect(Array.from(g.positions)).toEqual(Array.from(want));
-    for (const s of rec.samples) expect([0, 1]).toContain(pathFraction(s, from, want));
-    expect(tf(net)).toEqual(camera);
+    // Frame by frame: many frames between the two maps, none a jump across a large part of the way.
+    const total = shift(from, want);
+    let between = 0;
+    let largest = 0;
+    for (let i = 0; i < rec.samples.length; i++) {
+      const s = rec.samples[i]!;
+      if (shift(s, from) > 0 && shift(s, want) > 0) between++;
+      if (i > 0) largest = Math.max(largest, shift(s, rec.samples[i - 1]!));
+    }
+    expect(between, "no frame between the two maps").toBeGreaterThan(5);
+    expect(largest / total, "a jump").toBeLessThan(0.35);
+    expect(tf(net)).toEqual(camera); // no fit asked for: the camera stays
+    net.destroy();
+  });
+
+  it("a warm flat layout continues the positions on screen: no seed disc, and its first frame is a step from them (#454)", async () => {
+    const g = ring(120);
+    /** Every streamed frame's positions, as the transport hands them to the engine. */
+    class FrameProbe extends Network {
+      readonly frames: Float32Array[] = [];
+      protected override scheduleLayoutRepaint(): void {
+        this.frames.push(g.positions.slice());
+        super.scheduleLayoutRepaint();
+      }
+    }
+    const net = new FrameProbe(host(), { width: 200, height: 200 });
+    await net.whenReady();
+    net.data(g).lod(false).layout({ backend: "force", iterations: 150 }); // laid out, and settled
+    const from = g.positions.slice();
+    const spread = spreadOf(from);
+    const firstFrame = async (opts: { warm: boolean }): Promise<Float32Array> => {
+      g.positions.set(from);
+      net.frames.length = 0;
+      net.layout({ backend: "worker", iterations: 60, multilevel: false, ...opts });
+      await net.whenSettled();
+      const first = net.frames[0];
+      if (!first) throw new Error("no frame streamed");
+      return first;
+    };
+    // How far the first streamed frame is from the layout, over its spread. Measured 0.078: the first frame's
+    // ticks, at full heat, from a settled layout. A cold start's first frame is its disc: measured 1.31.
+    const warm = shift(await firstFrame({ warm: true }), from) / spread;
+    const cold = shift(await firstFrame({ warm: false }), from) / spread;
+    expect(warm).toBeLessThan(0.2);
+    expect(cold, "non-vacuity: a cold start's first frame is far from the layout").toBeGreaterThan(0.5);
     net.destroy();
   });
 

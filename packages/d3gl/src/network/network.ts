@@ -743,6 +743,8 @@ function labelText(opts: NetworkLabelOptions, id: number, info: NetworkHit): str
 const DEFAULT_FORCE_ITERATIONS = 300;
 /** The ease a followed warm nested stream chases its frames on (#454), ms: the length of the old warm transition. */
 const FOLLOW_MS = 600;
+/** The most a followed stream's ease advances per frame, ms (#454): three 60 Hz frames. */
+const FOLLOW_FRAME_MS = 50;
 
 /**
  * What a layout backend asks of the engine, known synchronously from the options (spec §12.2):
@@ -2267,10 +2269,10 @@ export class Network extends BaseEngine {
    * grabbed before the transition started (a nested solve, on the worker or the GPU, still computing its
    * target) is held under the cursor over each frame ({@link dragReapply}), and kept where it is dropped.
    */
-  private positionTween(graph: NetworkGraph, duration: number, ease?: (t: number) => number): PositionTransition {
+  private positionTween(graph: NetworkGraph, duration: number, follow?: { ease: (t: number) => number; maxFrameMs: number }): PositionTransition {
     return positionTransition(graph.positions, {
       duration,
-      ...(ease ? { ease } : {}),
+      ...(follow ?? {}),
       onFrame: (progress) => {
         if (this.graph !== graph) return;
         this.dragReapply?.();
@@ -2332,7 +2334,9 @@ export class Network extends BaseEngine {
    * while the ease runs (allocated with the first one); a worker frame is its own message's array.
    */
   private followNested(graph: NetworkGraph): { follow: NestedFollow; tween: PositionTransition; repaint: () => void } {
-    const tween = this.positionTween(graph, FOLLOW_MS, easeCubicOut);
+    // A frame later than FOLLOW_FRAME_MS (a busy main thread: the GPU solve being built, a long repaint) moves
+    // the ease on by that much, not by the time that passed: a stall slows the glide instead of skipping it.
+    const tween = this.positionTween(graph, FOLLOW_MS, { ease: easeCubicOut, maxFrameMs: FOLLOW_FRAME_MS });
     let buffer: Float32Array | null = null;
     const follower = {
       tween,

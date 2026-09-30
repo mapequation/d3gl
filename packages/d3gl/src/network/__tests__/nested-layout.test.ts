@@ -337,3 +337,111 @@ describe("collide: coincident sibling discs (#357)", () => {
     expect(Array.from(reused.y.subarray(0, k))).toEqual(Array.from(fresh.y.subarray(0, k)));
   });
 });
+
+/** A disc of every leaf by id — a force layout's shape, blind to the modules (each module is spread over it). */
+function flatDisc(leaves: number, radius: number): Float32Array {
+  const out = new Float32Array(2 * leaves);
+  for (let i = 0; i < leaves; i++) {
+    const r = radius * Math.sqrt((i + 0.5) / leaves);
+    const a = i * 2.399963229728653;
+    out[2 * i] = 700 + r * Math.cos(a);
+    out[2 * i + 1] = -200 + r * Math.sin(a);
+  }
+  return out;
+}
+
+/** How many distinct leaf positions a frame has (collapsed leaves share one). */
+function distinct(p: Float32Array): number {
+  const seen = new Set<string>();
+  for (let i = 0; i < p.length / 2; i++) seen.add(`${p[2 * i]},${p[2 * i + 1]}`);
+  return seen.size;
+}
+
+describe("nestedLayout warm start placed by its seed: it streams (#454)", () => {
+  const tree = threeLevel(12, 6, 10);
+  const R = 10 * Math.sqrt(tree.leafCount);
+  const cold = nestedLayout(topo(tree));
+  const flat = flatDisc(tree.leafCount, 3 * R); // a force layout's scale: ~3× the nested map's
+  const record = (initial: Float32Array): { depths: number[]; frames: Float32Array[]; bounds: FitBox[]; out: ReturnType<typeof nestedLayout> } => {
+    const depths: number[] = [];
+    const frames: Float32Array[] = [];
+    const bounds: FitBox[] = [];
+    const out = nestedLayout(topo(tree), {
+      initial,
+      placeBy: "seed",
+      onDepth: (depth, positions, box) => {
+        depths.push(depth);
+        frames.push(positions.slice());
+        bounds.push(box);
+      },
+    });
+    return { depths, frames, bounds, out };
+  };
+
+  it("streams the seed first (depth 0), then every depth, ending on the result", () => {
+    const { depths, frames, out } = record(flat);
+    expect(depths).toEqual([0, 1, 2, 3]);
+    expect(Array.from(frames[frames.length - 1]!)).toEqual(Array.from(out.positions));
+    expectNested(tree, out);
+  });
+
+  it("places the seed over the current map: its frame has the current centroid and RMS spread", () => {
+    const { frames } = record(flat);
+    const before = spreadOf(flat);
+    const seed = spreadOf(frames[0]!);
+    expect(seed.x).toBeCloseTo(before.x, 1);
+    expect(seed.y).toBeCloseTo(before.y, 1);
+    expect(seed.rms / before.rms).toBeCloseTo(1, 4);
+  });
+
+  it("collapses no leaf onto its module's centre in any frame — a cold stream does, depth by depth", () => {
+    const { frames } = record(flat);
+    for (const f of frames) expect(distinct(f)).toBe(tree.leafCount);
+    const coldFrames: Float32Array[] = [];
+    nestedLayout(topo(tree), { onDepth: (_d, p) => coldFrames.push(p.slice()) });
+    expect(distinct(coldFrames[0]!)).toBe(12); // non-vacuity: a cold depth-1 frame is 12 points, one per module
+  });
+
+  it("posts with every frame a box the final layout lies in", () => {
+    const { bounds, out } = record(flat);
+    const pad = 1e-3 * R;
+    for (const [x0, y0, x1, y1] of bounds) {
+      for (let i = 0; i < tree.leafCount; i++) {
+        const x = out.positions[2 * i]!;
+        const y = out.positions[2 * i + 1]!;
+        expect(x >= x0 - pad && x <= x1 + pad && y >= y0 - pad && y <= y1 + pad).toBe(true);
+      }
+    }
+  });
+
+  it("from a nested map of the same modules, its seed is that map: the stream starts where the nodes are", () => {
+    const moved = similar(cold.positions, 0.7, 2, 300, 100);
+    const { frames } = record(moved);
+    // Measured 0.007 of the map's own root radius; from this fixture's flat disc the seed moves the leaves
+    // 1.2× the disc's spread (each module gathers into its own disc — the change a switch to a map makes).
+    expect(meanShift(frames[0]!, moved)).toBeLessThan(0.02 * 2 * R);
+  });
+
+  it("solves exactly what a warm start placed by its result solves: the two maps differ by a similarity only", () => {
+    const seeded = record(flat).out.positions;
+    const placed = nestedLayout(topo(tree), { initial: flat }).positions;
+    const a = spreadOf(seeded);
+    const b = spreadOf(placed);
+    const k = a.rms / b.rms;
+    let worst = 0;
+    for (let i = 0; i < tree.leafCount; i++) {
+      const x = a.x + (placed[2 * i]! - b.x) * k;
+      const y = a.y + (placed[2 * i + 1]! - b.y) * k;
+      worst = Math.max(worst, Math.hypot(x - seeded[2 * i]!, y - seeded[2 * i + 1]!));
+    }
+    expect(worst).toBeLessThan(1e-3 * a.rms);
+    expect(Math.abs(k - 1)).toBeLessThan(0.2); // the seed's spread is near the result's: measured 1.045
+  });
+
+  it("streams the cold layout from all-coincident positions (a graph never laid out)", () => {
+    const zeros = new Float32Array(2 * tree.leafCount);
+    const { depths, out } = record(zeros);
+    expect(depths[0]).toBe(1); // no seed frame: nothing to start from
+    expect(Array.from(out.positions)).toEqual(Array.from(cold.positions));
+  });
+});
