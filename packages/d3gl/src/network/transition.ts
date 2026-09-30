@@ -7,14 +7,24 @@
  * `from + (to − from) · ease(t)` into the live position buffer and calls `onFrame` (the engine's
  * positions-only repaint). The last frame writes `to` exactly.
  *
- * Per-frame cost: one O(nodes) pass over the interleaved buffer, allocation-free. Memory: the `from`
- * snapshot (2 floats per node), plus the caller's `to`, for the transition's lifetime — both released
- * when it ends.
+ * A transition can also **chase** a target that keeps changing (#454): {@link PositionTransition.retarget}
+ * eases on from where the positions are to a newer target on the same schedule, so a stream of frames — a
+ * warm nested layout solving — is followed from the positions on screen without a jump, and the transition
+ * still ends `duration` after it started.
+ *
+ * Per-frame cost: one O(nodes) pass over the interleaved buffer, allocation-free. A retarget copies the
+ * positions into `from` once: O(nodes), no allocation. Memory: the `from` snapshot (2 floats per node), plus
+ * the caller's `to`, for the transition's lifetime — both released when it ends.
  */
 
 /** d3-ease's `easeCubicInOut`: slow–fast–slow on `[0, 1]`. */
 export function easeCubicInOut(t: number): number {
   return ((t *= 2) <= 1 ? t * t * t : (t -= 2) * t * t + 2) / 2;
+}
+
+/** d3-ease's `easeCubicOut`: fast, then slowing to rest — a chase that starts at once (#454). */
+export function easeCubicOut(t: number): number {
+  return --t * t * t + 1;
 }
 
 /**
@@ -49,19 +59,34 @@ export interface PositionTransitionOptions {
 }
 
 export interface PositionTransition {
-  /** The positions when the transition was created — where it eases from. Released (empty) once the
-   *  transition has ended, like its target: a settled transition holds no per-node memory. */
+  /** Where it eases from: the positions when the transition was created, or at its latest
+   *  {@link retarget}. Released (empty) once the transition has ended, like its target: a settled
+   *  transition holds no per-node memory. */
   readonly from: Float32Array;
   /** Resolves when the transition reaches its target, or is stopped or finished. */
   readonly settled: Promise<void>;
   /** Whether it has started ({@link to}) and not yet ended. */
   readonly running: boolean;
+  /** Whether it has ended: reached its target, or been stopped or finished. */
+  readonly ended: boolean;
   /**
    * Start easing towards `target` (interleaved, the positions' length), from the next frame on. The
    * transition reads `target` every frame, so don't mutate it until {@link settled}. Only the first
    * call counts; a call after {@link stop} is ignored.
    */
   to(target: Float32Array): void;
+  /**
+   * Chase `target` instead (#454): from the next frame on, ease from where the positions are now to
+   * `target`, over the rest of the schedule — the eased share still to go is spread over the new
+   * distance, so the positions move on continuously and the transition still ends `duration` after it
+   * started, exactly at `target`. Before {@link to} it is `to`, from the positions as they are now. Returns
+   * `false` once the transition has
+   * ended (the caller then puts `target` in place itself). The transition reads `target` every frame, as
+   * for `to` — it may be the current target's own array, rewritten in place just before this call (a frame
+   * read back into the same buffer). Nodes kept with {@link keep} stay kept (their entries in `target` are
+   * overwritten). O(nodes): one copy of the positions into `from`.
+   */
+  retarget(target: Float32Array): boolean;
   /** Stop where it is: the positions keep the last frame's values. Resolves {@link settled}. */
   stop(): void;
   /** Jump to the end now: the positions take the target's values, without a further `onFrame`.
@@ -102,6 +127,9 @@ export function positionTransition(positions: Float32Array, opts: PositionTransi
   let raf = 0;
   let ended = false;
   let kept: number[] = []; // node ids to keep in place once the target arrives ({@link PositionTransition.keep})
+  let keptAll: number[] = []; // every kept id, re-applied to a retarget's target
+  let eased = 0; // the eased progress of the last frame written
+  let base = 0; // the eased progress `from` was taken at: 0, or the last frame's at a retarget
   const pin = (ids: ArrayLike<number>, to: Float32Array): void => {
     for (let k = 0; k < ids.length; k++) {
       const i = ids[k]! * 2;
@@ -118,6 +146,7 @@ export function positionTransition(positions: Float32Array, opts: PositionTransi
     from = new Float32Array(0); // release both per-node buffers
     target = null;
     kept = [];
+    keptAll = [];
     resolve();
   };
   const frame = (): void => {
@@ -131,8 +160,20 @@ export function positionTransition(positions: Float32Array, opts: PositionTransi
       return;
     }
     const progress = ease(Math.max(0, t));
-    lerpPositions(positions, from, target, progress);
+    eased = progress;
+    // The share of the way still to go at the last retarget, spread over the rest of the ease.
+    lerpPositions(positions, from, target, base > 0 ? (progress - base) / (1 - base) : progress);
     opts.onFrame(progress);
+    raf = requestFrame(frame);
+  };
+
+  const to = (next: Float32Array): void => {
+    if (ended || target) return;
+    target = next;
+    pin(kept, next);
+    keptAll = kept;
+    kept = [];
+    start = now();
     raf = requestFrame(frame);
   };
 
@@ -144,13 +185,21 @@ export function positionTransition(positions: Float32Array, opts: PositionTransi
     get running() {
       return target !== null && !ended;
     },
-    to(next) {
-      if (ended || target) return;
+    get ended() {
+      return ended;
+    },
+    to,
+    retarget(next) {
+      if (ended) return false;
+      from.set(positions.subarray(0, from.length)); // where the positions are: the next frame moves on from here
+      if (!target) {
+        to(next);
+        return true;
+      }
+      base = eased < 1 ? eased : 0;
       target = next;
-      pin(kept, next);
-      kept = [];
-      start = now();
-      raf = requestFrame(frame);
+      pin(keptAll, next);
+      return true;
     },
     stop: end,
     finish() {
@@ -159,8 +208,10 @@ export function positionTransition(positions: Float32Array, opts: PositionTransi
     },
     keep(ids) {
       if (ended) return;
-      if (target) pin(ids, target);
-      else for (let k = 0; k < ids.length; k++) kept.push(ids[k]!);
+      if (target) {
+        pin(ids, target);
+        for (let k = 0; k < ids.length; k++) keptAll.push(ids[k]!);
+      } else for (let k = 0; k < ids.length; k++) kept.push(ids[k]!);
     },
   };
 }

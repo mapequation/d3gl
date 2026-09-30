@@ -517,6 +517,15 @@ export interface NestedWorkerOptions {
   /** Receive the final layout's module boundary discs (#329), just before its positions land. */
   onBoundaries?: (discs: BoundaryDiscs) => void;
   /**
+   * Follow the stream instead of painting it (#454): every streamed frame, and the final layout, is handed
+   * to `follow.onFrame` instead of being copied into `graph.positions` (no `onFrame` for it) — for a caller
+   * that eases what is on screen toward each frame (a warm start placed by its seed). `follow.target()` is
+   * where a transport that reads its frames back in place (the GPU) writes the next one; the worker hands
+   * over the array each frame arrives in. Streams (`stream` is ignored) and posts no {@link onBounds}: the
+   * positions on screen are the caller's, not the frames'.
+   */
+  follow?: NestedFollow;
+  /**
    * Receive the streamed layout's bound on its final extent (#427), for a streaming fit to frame the map on:
    * the root disc ({@link nestedRootBounds}) synchronously when a cold stream starts, then each depth's
    * tighter bound (the `bounds` of `nestedLayout`'s `onDepth`) just before that depth's positions land.
@@ -524,6 +533,14 @@ export interface NestedWorkerOptions {
    * main-thread fallback, whose layout lands at once.
    */
   onBounds?: (bounds: FitBox) => void;
+}
+
+/** Where a followed nested stream's frames go (#454, {@link NestedWorkerOptions.follow}). */
+export interface NestedFollow {
+  /** The array the next frame may be written into in place (2 floats per leaf). */
+  target(): Float32Array;
+  /** A frame: in {@link target}'s array, or one of its own. */
+  onFrame(positions: Float32Array): void;
 }
 
 /**
@@ -540,11 +557,12 @@ export function startNestedWorkerLayout(
   onFrame: () => void,
   opts: NestedWorkerOptions = {},
 ): WorkerLayoutHandle {
-  const { onResult, onBoundaries } = opts;
+  const { onResult, onBoundaries, follow } = opts;
   /** The final positions (and the discs, #329): to the caller, or into the graph + a repaint. */
   const land = (positions: Float32Array, discs: BoundaryDiscs | undefined): void => {
     if (discs) onBoundaries?.(discs);
     if (onResult) onResult(positions);
+    else if (follow) follow.onFrame(positions);
     else {
       graph.positions.set(positions);
       onFrame();
@@ -582,6 +600,10 @@ export function startNestedWorkerLayout(
       terminate();
       return;
     }
+    if (follow) {
+      if (msg.positions) follow.onFrame(msg.positions);
+      return;
+    }
     if (msg.bounds) opts.onBounds?.(msg.bounds);
     if (msg.positions) graph.positions.set(msg.positions);
     onFrame();
@@ -602,12 +624,12 @@ export function startNestedWorkerLayout(
     superEdgeTarget: tree.superEdgeTarget,
     superEdgeFlow: tree.superEdgeFlow,
   };
-  const start: MainToWorker = { type: "start-nested", topology, params, stream: (opts.stream ?? true) && !onResult };
+  const start: MainToWorker = { type: "start-nested", topology, params, stream: follow !== undefined || ((opts.stream ?? true) && !onResult) };
   worker.postMessage(start);
   // A streamed cold solve's first bound (#427): its root disc, known before the worker places a depth, so a
   // fit frames the map from its first paint and only zooms in as the depths' own bounds arrive. A warm
   // solve streams no depths (nestedLayout's rule), and a one-frame solve lands exact.
-  if (start.stream && !params.initial) opts.onBounds?.(nestedRootBounds(tree.leafCount, params.radius));
+  if (start.stream && !params.initial && !follow) opts.onBounds?.(nestedRootBounds(tree.leafCount, params.radius));
   return {
     shared: false,
     settled,
