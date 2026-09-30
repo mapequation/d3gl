@@ -18,7 +18,10 @@
  * A **warm start** (`initial`, #328) re-lays a map out from where its nodes already are — e.g. after
  * a re-clustering: each module's children are seeded at their current leaf centroids instead of the
  * spiral, the solve starts cooler so it refines that arrangement, and the result is placed over the
- * current map (same leaf centroid and spread), so the new map lands where the old one was.
+ * current map (same leaf centroid and spread), so the new map lands where the old one was. Placed by
+ * its **seed** instead (`placeBy: "seed"`, #454), the placement is known before any module is solved, so
+ * a warm start streams too: a first frame of the whole seed, then one per depth, each with the modules
+ * not solved yet kept at their seeded arrangement inside their placed parent's disc.
  *
  * Cost: each module solves its `k` children for `iterations` ticks at O(k + sibling links) per tick
  * (exact O(k²) repulsion/collision up to 32 children, Barnes-Hut / a uniform grid above), so the whole layout is O(Σ_modules
@@ -96,8 +99,10 @@ export interface NestedLayoutOptions {
   /**
    * Called after every depth is final, with the leaf positions so far — leaves below the finished
    * depth sit at their deepest placed ancestor's centre. Lets a caller stream the layout top-down.
-   * Not called on a warm start (`initial`): its placement is final only once every depth is, and
-   * collapsing leaves onto their module centres is what a warm start exists to avoid.
+   * Not called on a warm start (`initial`) placed by its result (the default {@link placeBy}): its
+   * placement is final only once every depth is, and collapsing leaves onto their module centres is what
+   * a warm start exists to avoid. A warm start placed by its seed streams instead (#454): first depth 0,
+   * the whole seed, then each depth, with the leaves below it where their seeded modules put them.
    *
    * `bounds` is a box the **final** layout lies in, known already (#427): the placed leaves, and the
    * disc of each unplaced leaf's deepest placed ancestor. Every child disc lies inside its parent's, so
@@ -118,6 +123,17 @@ export interface NestedLayoutOptions {
    * of a graph never laid out) gives exactly the cold layout.
    */
   initial?: ArrayLike<number>;
+  /**
+   * How a warm start keeps the map where it is (#454): `"result"` (default) places the solved layout
+   * over `initial` — exactly its centroid and spread, known only once every depth is solved; `"seed"`
+   * places the root disc so that the **seed** — every module's children at their warm seed, mapped into
+   * their discs as the solve maps its result — has `initial`'s centroid and spread (the spread unless
+   * `radius` is given). Known before any module is solved, so every depth's frame is placed alike and a
+   * warm start can stream ({@link onDepth}). The solve then keeps the root disc, so the result's centroid
+   * and spread are the seed's moved by the solve (from a nested map of the same modules the seed is that
+   * map, and they barely move). Costs one extra O(tree size) seed pass. Ignored on a cold start.
+   */
+  placeBy?: "result" | "seed";
 }
 
 /** The serialisable subset of {@link NestedLayoutOptions} (no callback) — what the worker receives. */
@@ -282,6 +298,18 @@ export function nestedLayout(topo: NestedLayoutTopology, opts: NestedLayoutOptio
   const positions = new Float32Array(2 * leafCount);
   const scratch = new Scratch();
 
+  // A warm start placed by its seed (#454): the seed's discs first, the root disc placed by them, and — when
+  // streamed — a frame of the whole seed before any module is solved.
+  const seed = warm && opts.placeBy === "seed" ? new SeededFrames(size, warmSeedDiscs(topo, weight, packing, scratch, warm)) : null;
+  if (seed && warm) {
+    const disc = seed.rootDisc(topo, root, r[root]!, warm, opts.radius === undefined, positions);
+    cx[root] = disc.x;
+    cy[root] = disc.y;
+    r[root] = disc.radius;
+  }
+  const streams = opts.onDepth !== undefined && (!opts.initial || opts.placeBy === "seed");
+  if (streams && seed) opts.onDepth?.(0, positions, seed.write(topo, cx, cy, r, positions));
+
   let frontier: number[] = [root];
   for (let depth = 0; frontier.length; depth++) {
     const next: number[] = [];
@@ -293,18 +321,214 @@ export function nestedLayout(topo: NestedLayoutTopology, opts: NestedLayoutOptio
         for (let c = start; c < end; c++) next.push(children[c]!);
       }
     }
-    if (opts.onDepth && !opts.initial && next.length) {
-      const bounds = writeLeafPositions(topo, cx, cy, r, positions);
-      opts.onDepth(depth + 1, positions, bounds);
+    if (streams && next.length) {
+      const bounds = seed ? seed.write(topo, cx, cy, r, positions) : writeLeafPositions(topo, cx, cy, r, positions);
+      opts.onDepth?.(depth + 1, positions, bounds);
     }
     frontier = next;
   }
   writeLeafPositions(topo, cx, cy, r, positions);
-  if (warm) {
+  if (warm && !seed) {
     const place = { tx: warm.ox[root]!, ty: warm.oy[root]!, spread: warm.spread };
     placeOver(topo, warm.known, place, opts.radius === undefined, positions, cx, cy, r);
   }
   return { positions, cx, cy, r };
+}
+
+/**
+ * A warm seed's discs (#454): every non-root tree node's disc in its parent's, as a fraction of the parent's
+ * radius — where the solve would map its module's children if the seed were its result (the weighted centroid
+ * centred, the enclosing circle scaled to {@link NESTED.FILL}; a lone child at the centre, {@link NESTED.ONLY_CHILD}).
+ * Float32, `size` entries each (the root's unused).
+ */
+export interface SeedDiscs {
+  readonly rx: Float32Array;
+  readonly ry: Float32Array;
+  readonly rr: Float32Array;
+}
+
+/** Empty {@link SeedDiscs} for a tree of `size` nodes. */
+export function seedDiscs(size: number): SeedDiscs {
+  return { rx: new Float32Array(size), ry: new Float32Array(size), rr: new Float32Array(size) };
+}
+
+/**
+ * Record module `g`'s `k = end − start` children's seed discs into `out`, from the scratch a
+ * {@link setupModule} (or {@link seedModule}) of `g` left (`k ≥ 2`) — or, for a lone child, its disc at the
+ * centre. The mapping is {@link solveModule}'s, applied to the seed. O(k).
+ */
+export function recordSeedDiscs(topo: Pick<NestedLayoutTopology, "children">, start: number, end: number, s: Scratch, out: SeedDiscs): void {
+  const { children } = topo;
+  const k = end - start;
+  if (k === 1) {
+    const c = children[start]!;
+    out.rx[c] = 0;
+    out.ry[c] = 0;
+    out.rr[c] = NESTED.ONLY_CHILD;
+    return;
+  }
+  const { x, y, rad } = s;
+  const { mx, my, extent } = discFrame(s, k);
+  const f = NESTED.FILL / (extent || 1);
+  for (let i = 0; i < k; i++) {
+    const c = children[start + i]!;
+    out.rx[c] = (x[i]! - mx) * f;
+    out.ry[c] = (y[i]! - my) * f;
+    out.rr[c] = rad[i]! * f;
+  }
+}
+
+/**
+ * The root disc that places a warm seed over the current map (#454, {@link NestedLayoutOptions.placeBy}
+ * `"seed"`): the seed composed from a root disc of radius `radius` at the origin has its known leaves'
+ * centroid moved onto `warm`'s and — when `rescale` — its RMS spread scaled to `warm`'s. `positions` (2 ·
+ * leaves) is scratch. O(tree size + leaves), float64 sums.
+ */
+export function seedRootDisc(
+  topo: NestedLayoutTopology,
+  seed: SeededFrames,
+  root: number,
+  radius: number,
+  warm: WarmStart,
+  rescale: boolean,
+  positions: Float32Array,
+): { x: number; y: number; radius: number } {
+  const { size, leafCount } = topo;
+  const cx = new Float32Array(size);
+  const cy = new Float32Array(size);
+  const r = new Float32Array(size);
+  r[root] = radius;
+  seed.write(topo, cx, cy, r, positions);
+  let n = 0;
+  let mx = 0;
+  let my = 0;
+  for (let i = 0; i < leafCount; i++) {
+    if (!warm.known[i]) continue;
+    mx += positions[2 * i]!;
+    my += positions[2 * i + 1]!;
+    n++;
+  }
+  if (n === 0) return { x: 0, y: 0, radius };
+  mx /= n;
+  my /= n;
+  let ss = 0;
+  for (let i = 0; i < leafCount; i++) {
+    if (!warm.known[i]) continue;
+    ss += (positions[2 * i]! - mx) ** 2 + (positions[2 * i + 1]! - my) ** 2;
+  }
+  const spread = Math.sqrt(ss / n);
+  const s = rescale && spread > 0 ? warm.spread / spread : 1;
+  return { x: warm.ox[root]! - mx * s, y: warm.oy[root]! - my * s, radius: radius * s };
+}
+
+/**
+ * Seed every module of a warm start (#454) — each one's children by the solve's own {@link seedModule} — and
+ * record their discs ({@link recordSeedDiscs}). O(Σ k log k) over the modules, no links.
+ */
+export function warmSeedDiscs(topo: NestedLayoutTopology, weight: Float64Array, packing: number, s: Scratch, warm: WarmStart): SeedDiscs {
+  const { size, leafCount, childOffset } = topo;
+  const discs = seedDiscs(size);
+  for (let g = leafCount; g < size; g++) {
+    const start = childOffset[g]!;
+    const end = childOffset[g + 1]!;
+    if (end - start >= 2) seedModule(topo, g, start, end, weight, packing, s, warm);
+    if (end > start) recordSeedDiscs(topo, start, end, s, discs);
+  }
+  return discs;
+}
+
+/**
+ * Frames of a warm start placed by its seed (#454): a composition of the layout as far as it is solved from
+ * the seed's discs ({@link SeedDiscs}) — a placed node (radius > 0) at its disc, every other node where its
+ * seed puts it in its parent's disc (placed or composed). A frame keeps each unsolved module's children in
+ * their seeded arrangement instead of collapsing them onto the module's centre, so a stream of them moves
+ * from the seed to the result depth by depth. Memory: O(tree size) Float32 scratch, for the solve's lifetime.
+ */
+export class SeededFrames {
+  private readonly discs: SeedDiscs;
+  private readonly wx: Float32Array;
+  private readonly wy: Float32Array;
+  private readonly wr: Float32Array;
+  /** Each node's deepest placed ancestor (itself when placed): the disc its final position lies in. */
+  private readonly anchor: Int32Array;
+
+  constructor(size: number, discs: SeedDiscs) {
+    this.discs = discs;
+    this.wx = new Float32Array(size);
+    this.wy = new Float32Array(size);
+    this.wr = new Float32Array(size);
+    this.anchor = new Int32Array(size);
+  }
+
+  /** {@link seedRootDisc} with this seed. */
+  rootDisc(topo: NestedLayoutTopology, root: number, radius: number, warm: WarmStart, rescale: boolean, positions: Float32Array): { x: number; y: number; radius: number } {
+    return seedRootDisc(topo, this, root, radius, warm, rescale, positions);
+  }
+
+  /**
+   * The frame of the layout so far into `out` (2 · leaves): one top-down pass (a parent has a higher id than
+   * its children). Returns the box the final layout lies in — each leaf's deepest placed ancestor's disc, or
+   * the leaf itself once placed — as {@link writeLeafPositions} does. O(tree size).
+   */
+  write(topo: NestedLayoutTopology, cx: Float32Array, cy: Float32Array, r: Float32Array, out: Float32Array): FitBox {
+    const { size, leafCount, parent } = topo;
+    const { rx, ry, rr } = this.discs;
+    const { wx, wy, wr, anchor } = this;
+    for (let g = size - 1; g >= 0; g--) {
+      const p = parent[g]!;
+      if (r[g]! > 0 || p < 0) {
+        wx[g] = cx[g]!;
+        wy[g] = cy[g]!;
+        wr[g] = r[g]!;
+        anchor[g] = g;
+      } else {
+        const R = wr[p]!;
+        wx[g] = wx[p]! + rx[g]! * R;
+        wy[g] = wy[p]! + ry[g]! * R;
+        wr[g] = rr[g]! * R;
+        anchor[g] = anchor[p]!;
+      }
+    }
+    let minX = Infinity;
+    let minY = Infinity;
+    let maxX = -Infinity;
+    let maxY = -Infinity;
+    for (let i = 0; i < leafCount; i++) {
+      out[2 * i] = wx[i]!;
+      out[2 * i + 1] = wy[i]!;
+      const a = anchor[i]!;
+      const x = cx[a]!;
+      const y = cy[a]!;
+      const pad = a === i ? 0 : r[a]!;
+      minX = Math.min(minX, x - pad);
+      minY = Math.min(minY, y - pad);
+      maxX = Math.max(maxX, x + pad);
+      maxY = Math.max(maxY, y + pad);
+    }
+    return [minX, minY, maxX, maxY];
+  }
+}
+
+/**
+ * The frame {@link solveModule} maps a module's `k` unit-disc children by: their `rad²`-weighted centroid and
+ * the extent of their discs about it. O(k).
+ */
+function discFrame(s: Scratch, k: number): { mx: number; my: number; extent: number } {
+  const { x, y, rad } = s;
+  let mx = 0;
+  let my = 0;
+  let mw = 0;
+  for (let i = 0; i < k; i++) {
+    const w = rad[i]! * rad[i]!;
+    mx += x[i]! * w;
+    my += y[i]! * w;
+    mw += w;
+  }
+  mx /= mw;
+  my /= mw;
+  let extent = 0;
+  for (let i = 0; i < k; i++) extent = Math.max(extent, Math.hypot(x[i]! - mx, y[i]! - my) + rad[i]!);
+  return { mx, my, extent };
 }
 
 /**
@@ -446,11 +670,12 @@ export interface ModuleSetup {
 }
 
 /**
- * Set up module `g`'s `k = end − start ≥ 2` children (see {@link ModuleSetup}): radii by area share of
- * `weight` with a floor, the golden-angle spiral (or the warm seed), and the sparsified, weighted
- * sibling links. Leaves `s.local` all −1 again.
+ * Seed module `g`'s `k = end − start ≥ 2` children into the scratch's `x`, `y`, `rad` (local indices
+ * 0…k−1, velocities zeroed): radii by area share of `weight` with a floor, and the golden-angle spiral — or
+ * the warm seed. Returns whether they are warm-seeded. The first half of {@link setupModule}, on its own
+ * for a warm start's seed frames (#454). O(k log k).
  */
-export function setupModule(
+export function seedModule(
   topo: NestedLayoutTopology,
   g: number,
   start: number,
@@ -459,11 +684,11 @@ export function setupModule(
   packing: number,
   s: Scratch,
   warm: WarmStart | null,
-): ModuleSetup {
-  const { children, superEdgeOffset, superEdgeTarget, superEdgeFlow, parent } = topo;
+): boolean {
+  const { children } = topo;
   const k = end - start;
   s.ensure(k, topo.size);
-  const { x, y, vx, vy, rad, local } = s;
+  const { x, y, vx, vy, rad } = s;
 
   // Disc radii: area share of the parent's metric, with a floor so zero-metric children stay visible.
   let total = 0;
@@ -490,7 +715,6 @@ export function setupModule(
   for (let rank = 0; rank < k; rank++) {
     const i = order[rank]!;
     const c = children[start + i]!;
-    local[c] = i;
     rad[i] = Math.sqrt((packing * Math.max(weight[c]!, floor)) / sum);
     const rr = 0.8 * Math.sqrt((rank + 0.5) / k);
     x[i] = rr * Math.cos(rank * GOLDEN);
@@ -502,6 +726,29 @@ export function setupModule(
     vx[i] = 0;
     vy[i] = 0;
   }
+  return seeded;
+}
+
+/**
+ * Set up module `g`'s `k = end − start ≥ 2` children (see {@link ModuleSetup}): radii by area share of
+ * `weight` with a floor, the golden-angle spiral (or the warm seed), and the sparsified, weighted
+ * sibling links. Leaves `s.local` all −1 again.
+ */
+export function setupModule(
+  topo: NestedLayoutTopology,
+  g: number,
+  start: number,
+  end: number,
+  weight: Float64Array,
+  packing: number,
+  s: Scratch,
+  warm: WarmStart | null,
+): ModuleSetup {
+  const { children, superEdgeOffset, superEdgeTarget, superEdgeFlow, parent } = topo;
+  const k = end - start;
+  const seeded = seedModule(topo, g, start, end, weight, packing, s, warm);
+  const { local } = s;
+  for (let i = 0; i < k; i++) local[children[start + i]!] = i;
 
   // Sibling links: super-edges between two children of g, symmetrised (a spring each way is the same
   // spring), strength ∝ √(flow / max flow) / min(degree) so hubs don't collapse their neighbours.
@@ -615,19 +862,7 @@ function solveModule(
   }
 
   // Map the unit-disc solution into g's disc: centre the enclosing circle, scale it to 0.92·R.
-  let mx = 0;
-  let my = 0;
-  let mw = 0;
-  for (let i = 0; i < k; i++) {
-    const w = rad[i]! * rad[i]!;
-    mx += x[i]! * w;
-    my += y[i]! * w;
-    mw += w;
-  }
-  mx /= mw;
-  my /= mw;
-  let extent = 0;
-  for (let i = 0; i < k; i++) extent = Math.max(extent, Math.hypot(x[i]! - mx, y[i]! - my) + rad[i]!);
+  const { mx, my, extent } = discFrame(s, k);
   const scale = (NESTED.FILL * R) / (extent || 1);
   for (let i = 0; i < k; i++) {
     const c = children[start + i]!;
