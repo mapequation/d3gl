@@ -14,7 +14,8 @@ import { physicalPieWedges, type PhysicalPieWedges, type PieWedgeOptions } from 
 import { rosettePositions } from "./rosette.js";
 import { gatherCandidates, descendingByKey, descendingInListOrder, CandidateList, type CandidateSource } from "./label-candidates.js";
 import type { StateNetworkGraph } from "./state-graph.js";
-import { buildModuleTopologyOffThread, deferredLayoutHandle, startNestedWorkerLayout, startWorkerLayout, type StreamedLODTree, type WorkerLayoutHandle, type WorkerLayoutOptions } from "./worker-transport.js";
+import { buildModuleTopologyOffThread, deferredLayoutHandle, startNestedWorkerLayout, startWorkerLayout, withModuleSprings, type StreamedLODTree, type WorkerLayoutHandle, type WorkerLayoutOptions } from "./worker-transport.js";
+import { moduleSpringsOf, type ModuleSprings } from "./module-springs.js";
 import { buildLeafIncidence, lazySuperEdges, makeLazySuperEdgesScratch, type LeafIncidence } from "./lazy-super-edges.js";
 import type { LeafStyle, LODView } from "./lod-frame.js";
 import { startGpuNestedLayout } from "./gpu/gpu-nested-transport.js";
@@ -603,6 +604,13 @@ export interface NetworkDataOptions {
    * level in its `*Links` sections — so the map draws exactly those links, with no leaf edges invented
    * to stand in for them. Requires `modules`; `data()` checks up front that every endpoint is a module or
    * leaf of that hierarchy and throws otherwise. @see {@link ModuleLink}
+   *
+   * The flat force layouts (`backend: "force"`, `"worker"`, `"gpu"`, `"auto"`) pull along them too (#455):
+   * each is a spring between the centroids of its two endpoints' members (a leaf endpoint is itself), with
+   * the leaf springs' strength times its flow over the graph's mean edge weight, and each member of a
+   * module shares its pull, so the module moves as one body — in the run and in a drag reheat. A link into
+   * its own endpoint's ancestor is no spring, and a link between two leaves is none either (pass it as a
+   * graph edge). Module links are summed with the graph's edges, so don't repeat links the graph has.
    */
   moduleLinks?: ArrayLike<ModuleLink>;
 }
@@ -839,6 +847,12 @@ export class Network extends BaseEngine {
     settle(tree: LODTree): void;
     cancel(): void;
   } | null = null;
+  /**
+   * The module links of the last module tree as springs for the flat force layouts (#455), keyed by the tree
+   * and graph it was read from; `springs` is null for a tree without module links. Memory: 12 B per module
+   * link (the tree's parent array is shared, not copied).
+   */
+  private moduleSpringsCache: { tree: LODTree; graph: NetworkGraph; springs: ModuleSprings | null } | null = null;
   /** The explicit `lod({ modules })` {@link lod} checked against a graph when it deferred its build (#428),
    *  so the tree job does not check the same records again ({@link moduleSource}). */
   private lodAliasChecked: { options: NetworkLODOptions; graph: NetworkGraph } | null = null;
@@ -1105,6 +1119,7 @@ export class Network extends BaseEngine {
     }
     // New topology + position buffer: drop the retained LOD tree, the module tree and resolved-style cache.
     this.moduleTreeCache = null;
+    this.moduleSpringsCache = null;
     this.cancelModuleTreeJob();
     this.laidOut = false;
     this.nestedDiscs = null;
@@ -1657,11 +1672,13 @@ export class Network extends BaseEngine {
         const iterations = opts.iterations ?? DEFAULT_FORCE_ITERATIONS;
         const graph = this.graph;
         const from = duration > 0 ? graph.positions.slice() : null; // where a transition eases from
+        // The module links pull too (#455): the solve's view of the graph carries them as springs.
+        const solved = withModuleSprings(graph, this.flatModuleSprings());
         if (opts.multilevel === false) {
-          seedPositions(graph, this.width, this.height, { force: opts.force });
-          new ForceLayout(graph, opts.force).run(iterations, "hot"); // a cold start untangles at full heat
+          seedPositions(solved, this.width, this.height, { force: opts.force });
+          new ForceLayout(solved, opts.force).run(iterations, "hot"); // a cold start untangles at full heat
         } else {
-          multilevelLayout(graph, {
+          multilevelLayout(solved, {
             width: this.width,
             height: this.height,
             iterations,
@@ -1816,6 +1833,37 @@ export class Network extends BaseEngine {
       if (this.lodUsesModules()) this.scheduleLayoutRepaint();
     });
     return tree;
+  }
+
+  /**
+   * Whether the module hierarchy the module consumers read ({@link moduleSource}) carries module links — the
+   * flat force layouts then pull along them (#455) and wait for its module tree, which holds them resolved.
+   */
+  private hasModuleLinks(): boolean {
+    return (this.moduleSource()?.moduleLinks?.length ?? 0) > 0;
+  }
+
+  /**
+   * The module links of `tree` as springs for the flat force layouts (#455), weighted against the current
+   * graph's edges — read once per tree ({@link moduleSpringsCache}), O(tree + module links). `undefined`
+   * without a tree or without module links.
+   */
+  private moduleSpringsFor(tree: LODTree | undefined): ModuleSprings | undefined {
+    const graph = this.graph;
+    if (!tree || !graph) return undefined;
+    const cached = this.moduleSpringsCache;
+    if (cached && cached.tree === tree && cached.graph === graph) return cached.springs ?? undefined;
+    const springs = moduleSpringsOf(tree, graph);
+    this.moduleSpringsCache = { tree, graph, springs };
+    return springs ?? undefined;
+  }
+
+  /**
+   * The flat main-thread force layout's module springs (#455): from the module tree, built here if it is not
+   * yet (the synchronous solve cannot wait for a worker). `undefined` without module links.
+   */
+  private flatModuleSprings(): ModuleSprings | undefined {
+    return this.hasModuleLinks() ? this.moduleSpringsFor(this.moduleTree()) : undefined;
   }
 
   /** Stop a module-tree build under way (#428) — its graph or hierarchy is gone. */
@@ -2055,8 +2103,9 @@ export class Network extends BaseEngine {
       const devicePromise = this.whenBackendSettled().then(() => this.gpuDevice());
       // "auto" expects the worker where the GPU is unsupported: it falls back silently (#375).
       const warnUnsupported = opts.backend === "gpu";
-      // The module seed waits for its tree as it waits for its device: a worker builds it (#428).
-      const start = (moduleTopology: LODTree | undefined): WorkerLayoutHandle => startGpuLayout(devicePromise, graph, { ...workerOpts, moduleTopology, warnUnsupported }, onFrame, onLODTree,
+      // The module seed waits for its tree as it waits for its device: a worker builds it (#428). Its module
+      // links are the run's module springs (#455), for the GPU solve and a worker it falls back or moves to.
+      const start = (moduleTopology: LODTree | undefined): WorkerLayoutHandle => startGpuLayout(devicePromise, graph, { ...workerOpts, moduleTopology, moduleSprings: this.moduleSpringsFor(moduleTopology), warnUnsupported }, onFrame, onLODTree,
         () => {
           // Resolved: the worker fallback streams the tree, and so does the GPU solve's LOD worker (#377) — so
           // main builds none meanwhile. Also when the layout moved to either by a backend swap or a lost context
@@ -2069,7 +2118,12 @@ export class Network extends BaseEngine {
       handle = tree instanceof Promise ? deferredLayoutHandle(tree, start, "pending") : start(tree);
     } else {
       this.lodStreaming = useLod; // the worker will stream the tree; main builds none meanwhile
-      handle = startWorkerLayout(graph, workerOpts, onFrame, onLODTree);
+      // With module links the run pulls along them too (#455): it starts once the module tree holding them
+      // resolved is built — on a worker (#428), as the GPU's module seed waits for it.
+      const start = (tree: LODTree | undefined): WorkerLayoutHandle =>
+        startWorkerLayout(graph, tree ? { ...workerOpts, moduleSprings: this.moduleSpringsFor(tree) } : workerOpts, onFrame, onLODTree);
+      const tree = this.hasModuleLinks() ? this.moduleTreeLater() : undefined;
+      handle = tree instanceof Promise ? deferredLayoutHandle(tree, start) : start(tree);
     }
     this.onLayoutSettled(handle, () => {
       settled = true;
@@ -3280,7 +3334,8 @@ export class Network extends BaseEngine {
     // force: own rAF loop ticks the pinned sim + repaints, so neighbours follow; re-cools on release.
     if (backend === "force") {
       this.nestedDiscs = null; // the reheat re-lays every node out: a nested layout's discs no longer hold (#329)
-      const sim = new ForceLayout(graph, this.layoutOpts.force);
+      // The layout's own forces, module links included (#455): a module linked to the held set follows it.
+      const sim = new ForceLayout(withModuleSprings(graph, this.flatModuleSprings()), this.layoutOpts.force);
       sim.setPinned(held);
       sim.hold(DRAG_HEAT); // reflow at the drag heat the worker / gpu backends use
       const rafFn: (cb: FrameRequestCallback) => number =

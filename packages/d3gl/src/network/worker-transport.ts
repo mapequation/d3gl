@@ -13,7 +13,8 @@
 import type { NetworkGraph } from "./graph.js";
 import type { Device } from "@luma.gl/core";
 import { multilevelLayout, type CoarsenOptions } from "./coarsen.js";
-import { ForceLayout, seedPositions, type ForceParams } from "./force.js";
+import { ForceLayout, seedPositions, type ForceParams, type LayoutGraph } from "./force.js";
+import type { ModuleSprings } from "./module-springs.js";
 import { lodTreeFromTopology, type BoundaryDiscs, type LODTopology, type LODTree } from "./lod.js";
 import type { FitBox } from "./fit.js";
 import type { FlatModuleLinks, FlatModuleRecords } from "./module-topology.js";
@@ -67,6 +68,12 @@ export interface WorkerLayoutOptions {
    * after a drag, resumed as one (a pin then reheats at the drag heat at once).
    */
   warm?: { heat: number; decaying: boolean; recool?: boolean };
+  /**
+   * The module links as springs between their endpoints' member centroids (#455), for a graph whose module
+   * hierarchy has module links: the run's refinement and every drag reheat pull along them too — on the
+   * worker, its synchronous fallback, and the GPU solve.
+   */
+  moduleSprings?: ModuleSprings;
 }
 
 /**
@@ -132,6 +139,15 @@ export interface WorkerLayoutHandle {
 
 /** Handle for the synchronous fallback (no live worker) — reheat is a no-op there. */
 const NOOP_DRAG = { pin() {}, unpin() {} };
+
+/**
+ * The solver's view of `graph` with the module links as springs (#455) — `graph` itself without them. The view
+ * shares the graph's arrays, positions included, so a solve on it writes the graph's positions: take it where
+ * the solve starts, since `graph.positions` can be replaced (a shared-memory worker's view, #311).
+ */
+export function withModuleSprings(graph: NetworkGraph, moduleSprings: ModuleSprings | undefined): NetworkGraph & Pick<LayoutGraph, "moduleSprings"> {
+  return moduleSprings ? { ...graph, moduleSprings } : graph;
+}
 
 /**
  * A handle for a layout that can start only once `ready` resolves (#428) — a nested layout waiting for
@@ -309,25 +325,28 @@ export function startWorkerLayout(
    */
   onLODTree?: (tree: LODTree, streamed?: StreamedLODTree) => void,
 ): WorkerLayoutHandle {
-  const { width, height, iterations, warm } = opts;
+  const { width, height, iterations, warm, moduleSprings } = opts;
   const multilevel = opts.multilevel ?? true;
   const syncOpts = { width, height, iterations, force: opts.force, coarsen: opts.coarsen };
 
   /** Solve on this thread (converging early, like the worker): the fallback when no worker runs. */
   const solveHere = (): void => {
+    // The solver's view of the graph, with its module springs (#455): read at solve time, since a worker
+    // error lands here after `graph.positions` became the shared buffer's view.
+    const solved = withModuleSprings(graph, moduleSprings);
     if (warm) {
       // Continue from the current positions on the handed-over schedule, until converged (#311).
-      const layout = new ForceLayout(graph, opts.force);
+      const layout = new ForceLayout(solved, opts.force);
       if (warm.decaying) layout.cool(iterations, warm.heat);
       else layout.hold(warm.heat);
       for (let t = 0; t < iterations; t++) {
         layout.tick();
         if (layout.converged) break;
       }
-    } else if (multilevel) multilevelLayout(graph, syncOpts);
+    } else if (multilevel) multilevelLayout(solved, syncOpts);
     else {
-      seedPositions(graph, width, height, { force: opts.force });
-      new ForceLayout(graph, opts.force).run(iterations, "hot"); // a cold start untangles at full heat
+      seedPositions(solved, width, height, { force: opts.force });
+      new ForceLayout(solved, opts.force).run(iterations, "hot"); // a cold start untangles at full heat
     }
   };
   // No Worker available (SSR / unsupported) or construction fails: solve synchronously so the
@@ -440,6 +459,7 @@ export function startWorkerLayout(
     lodView: opts.lodView,
     // Copy mode clones the positions into the message (at post time); shared mode carried them into the SAB.
     warm: warm && { ...warm, ...(shared ? {} : { positions: graph.positions }) },
+    ...(moduleSprings ? { moduleSprings } : {}),
   };
   worker.postMessage(start);
 

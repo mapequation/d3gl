@@ -435,7 +435,14 @@ built on the main thread before the next frame.
 
 A new `data(graph)` without a hierarchy clears it. Module-level links (an Infomap `.ftree`'s `*Links`
 rows) go alongside: `data(graph, { modules, moduleLinks })`. (`lod({ modules })` still works as an
-alias scoped to the LOD options — `lod(false)` drops it.) Everything else about the cut (declutter,
+alias scoped to the LOD options — `lod(false)` drops it.) The flat force layouts (`force`, `worker`, `gpu`,
+`auto`) pull along module links as well as along the graph's edges: each is a spring between the centroids of
+its two ends' members (a leaf end is the leaf itself), as strong as the leaf links of mean flow it stands for
+(its flow over the graph's mean edge weight), and every member of a module shares its pull, so the module
+moves as one body — during the layout and when you [drag](#dragging-nodes) it. Module links are summed with
+the graph's edges, for the forces as for the super-edges, so pass only the links the graph does not already
+have (an `.ftree` keeps each link in exactly one place). Each tick costs one pass up the module tree, one
+over the module links and one back down. Everything else about the cut (declutter,
 `sizeMode`, the on-screen-bounded per-frame work) is the same as for structural coarsening. Under LOD a **module's**
 flow border sums its members' enter/exit flow unless you give it its own (`flowBorder.moduleFlow`, see
 [Flow borders](#flow-borders-and-half-arrows)), and its bent-half-arrow **super-edges** size by the
@@ -632,7 +639,8 @@ out to the map of modules, in to sub-modules and individual nodes. The **Boundar
 every module the cut has opened (see [below](#module-boundaries)); try it with **Layout: Nested**, where
 each ring is the module's disc. **Input: .ftree** passes the links between modules as module links, the
 way an Infomap `.ftree` has them: `data(graph, { modules, moduleLinks })`, with only the links inside each
-bottom module left as graph edges.
+bottom module left as graph edges; **Layout: Force** then pulls along those module links, so the modules
+still gather by their links and a dragged module pulls the ones it is linked to.
 
 <ExampleCard files={["modular-map/draw.ts", "modular-map/data.ts"]}>
   <ModularMap client:visible slot="demo" />
@@ -824,7 +832,8 @@ What moves depends on what you grab:
   selection, then drags it alone.
 - **A collapsed module aggregate** (under [LOD](#level-of-detail-lod)) → its **whole subtree** — every leaf
   descendant translates, and the aggregate glyph follows because its centroid re-derives from the moved
-  leaves. (`members()` enumerates exactly those leaves, the same set selection uses.)
+  leaves. (`members()` enumerates exactly those leaves, the same set selection uses.) With module links
+  (`data(graph, { modules, moduleLinks })`) the modules linked to it follow it, on every force backend.
 
 The held node tracks the cursor with **no lag** on every backend, because the held positions are written on
 the **main thread** each pointer move — the layout backend only reflows *the rest*. The redraw itself (the
