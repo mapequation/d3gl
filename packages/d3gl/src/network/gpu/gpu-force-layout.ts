@@ -933,13 +933,17 @@ export class GpuForceLayout {
    * integrate FS) so the drag session can keep them under the cursor while the rest reflows. Pass
    * `null` (or an empty array) to release every pin. Sub-uploads only the changed flag texels
    * (O(prev) clear + O(new) set — the held set is the dragged nodes), never reallocating the texture.
+   * The same held set again — a drag re-pins it on every pointer move — writes nothing: one 1×1 upload
+   * per held node is a GL call each, ~3 ms a move for a 1k-node module. Compared by content
+   * (O(held), no GL), and kept as a copy, so a caller reusing its array cannot change what is cleared.
    */
   setPinned(ids: Uint32Array | null): void {
     if (this.seed) throw new Error("GpuForceLayout.setPinned: pins wait for the graph's level (a seed is running)");
+    const next = ids && ids.length > 0 ? ids : null;
     const prev = this.pinnedIds;
+    if (sameIds(prev, next)) return;
     if (prev) for (let k = 0; k < prev.length; k++) this.writeFlag(prev[k]!, false);
-    this.pinnedIds = ids && ids.length > 0 ? ids : null;
-    const next = this.pinnedIds;
+    this.pinnedIds = next ? next.slice() : null;
     if (next) for (let k = 0; k < next.length; k++) this.writeFlag(next[k]!, true);
   }
 
@@ -1115,4 +1119,12 @@ export class GpuForceLayout {
     this.pyramid?.destroy();
     this.stop.destroy();
   }
+}
+
+/** Whether two held sets are the same ids in the same order (both absent counts as the same). */
+function sameIds(a: Uint32Array | null, b: Uint32Array | null): boolean {
+  if (a === b) return true;
+  if (!a || !b || a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+  return true;
 }

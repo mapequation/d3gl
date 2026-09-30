@@ -1077,6 +1077,17 @@ export interface SuperEdgesScratch {
   /** One-hash bit filter over this call's `claimX` (16 bits per claim), so an off-screen pair no claim
    *  can touch skips the `claimed` lookup. */
   claimBits: Int32Array;
+  /**
+   * Each drawn row's colour as last resolved: the weight it was resolved for (`colorW`, NaN = none) and the
+   * packed RGBA (`colorRGBA`), by row. A row drawing the same weight as last frame reuses its colour, so a
+   * frame whose drawn pairs keep their flows resolves (and parses) no colour; only rows whose weight changed
+   * do. With continuous flows (Infomap's), more distinct weights than `resolveLinkColorOf`'s memo holds are
+   * drawn at once and that memo starts over every frame; this cache has no such bound. 12 B per drawn row
+   * of the largest frame so far. `colorOf` is the function the colours were resolved with.
+   */
+  colorW: Float64Array;
+  colorRGBA: Uint32Array;
+  colorOf: ((weight: number) => RGBAValue) | null;
 }
 
 /** Fresh {@link SuperEdgesScratch}. The network engine keeps ONE per instance; {@link superEdges}
@@ -1098,6 +1109,9 @@ export function makeSuperEdgesScratch(): SuperEdgesScratch {
     claimW: new Float64Array(16),
     claimX: new Int32Array(16),
     claimBits: new Int32Array(2),
+    colorW: new Float64Array(0),
+    colorRGBA: new Uint32Array(0),
+    colorOf: null,
   };
 }
 
@@ -1515,6 +1529,22 @@ export function superEdgeBatches(
   // Cross-fade (#133): scale an edge's alpha by its least-visible present endpoint (off-screen endpoints
   // are opaque), so it fades with the aggregate/child it connects. `fa` undefined ⇒ full opacity.
   const fa = style.fadeAlpha;
+  // Last frame's colours by row (see `SuperEdgesScratch.colorW`): kept while the style's colour is the same.
+  if (sc.colorOf !== style.colorOf) {
+    sc.colorOf = style.colorOf;
+    sc.colorW.fill(NaN);
+  }
+  if (sc.colorW.length < count) {
+    const cap = Math.max(count, 2 * sc.colorW.length);
+    const cw = new Float64Array(cap).fill(NaN);
+    cw.set(sc.colorW);
+    const cr = new Uint32Array(cap);
+    cr.set(sc.colorRGBA);
+    sc.colorW = cw;
+    sc.colorRGBA = cr;
+  }
+  const colorW = sc.colorW;
+  const colorRGBA = sc.colorRGBA;
   for (let e = 0; e < count; e++) {
     const g = aS[e]!;
     const h = bS[e]!;
@@ -1531,12 +1561,19 @@ export function superEdgeBatches(
       targets[e * 2] = tree.cx[h]!;
       targets[e * 2 + 1] = tree.cy[h]!;
     }
-    // Indexed, not destructured: destructuring allocates an array iterator per edge (#364).
-    const rgba = style.colorOf(wS[e]!);
-    const ca = rgba[3];
-    colors[e * 4] = rgba[0];
-    colors[e * 4 + 1] = rgba[1];
-    colors[e * 4 + 2] = rgba[2];
+    const w = wS[e]!;
+    let packed = colorRGBA[e]!;
+    if (colorW[e] !== w) {
+      // Indexed, not destructured: destructuring allocates an array iterator per edge (#364).
+      const rgba = style.colorOf(w);
+      packed = (rgba[0] | (rgba[1] << 8) | (rgba[2] << 16) | (rgba[3] << 24)) >>> 0;
+      colorW[e] = w;
+      colorRGBA[e] = packed;
+    }
+    const ca = packed >>> 24;
+    colors[e * 4] = packed & 255;
+    colors[e * 4 + 1] = (packed >>> 8) & 255;
+    colors[e * 4 + 2] = (packed >>> 16) & 255;
     if (fa) {
       // An anchored boundary end fades with its module's children (the cut wrote their alpha for it).
       const af = seen[g] === gen || (anchoredEdge && seen[g] === -gen) ? fa[g]! : 1;
