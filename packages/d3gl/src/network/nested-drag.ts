@@ -10,10 +10,10 @@
  * - **Soft forces, like a flat drag's.** Each level runs the nested layout's ORGANISE-phase many-body
  *   repulsion (a share of it), gravity (the only thing holding a module together) and two-sided springs
  *   over its links — module links and aggregated leaf links, by `√flow` — at their laid-out length, plus a
- *   soft overlap push: discs can approach and press together a little, then ease apart. The laid-out map
- *   is the rest state (each level's field forces at the grab are taken back off), so the grab moves nothing
- *   by itself and every force answers the drag. On release the rest state is re-taken where things are, so
- *   a dropped item stays where it was dropped.
+ *   soft overlap push: discs can approach and press together a little, then ease apart. The map at the
+ *   grab is at rest: every force on each child then is taken back off each tick, so the grab moves nothing
+ *   by itself and every force answers the drag; after release the map settles into an equilibrium of the
+ *   same forces, and a later grab starts from it without releasing anything left over.
  * - **The root is the map's one anchor**, as a flat layout's centering: its gravity pulls toward where its
  *   free children were. Below it, a module's gravity pulls toward its free children's own centroid, so a
  *   module travels with the member that is dragged.
@@ -42,8 +42,9 @@ import { NESTED, Scratch, collide, moduleLinks, repel, type NestedLayoutTopology
 const STILL = 1e-4;
 /** The drag's spring factor on `alpha · √(flow / max flow) · stretch`: the nested layout's own. */
 const SPRING = 0.05;
-/** Share of an overlap the drag resolves per tick: discs may press together a little, then ease apart. */
-const SOFT_OVERLAP = 0.1;
+/** The overlap force: this share of the layout's collision correction, times the heat, per tick — discs may
+ *  press together a little, then ease apart. */
+const SOFT_OVERLAP = 0.5;
 /**
  * The ORGANISE phase's repulsion, as a share for the drag. Against gravity it sets how far a module is
  * pushed by a neighbour that moves (the displacement is the change in repulsion over the gravity, whatever
@@ -62,6 +63,7 @@ export class NestedDragCache {
   private counts: Uint32Array | null = null;
   private localScratch: Int32Array | null = null;
   private readonly radii = new Map<number, Float64Array>();
+  private readonly rests = new Map<number, Float64Array>();
 
   constructor(
     readonly topo: NestedLayoutTopology,
@@ -95,6 +97,15 @@ export class NestedDragCache {
 
   keepRadii(g: number, r: Float64Array): void {
     this.radii.set(g, r);
+  }
+
+  /** Module `g`'s link rest lengths, as its first drag found them (the laid-out lengths), if recorded. */
+  restOf(g: number): Float64Array | undefined {
+    return this.rests.get(g);
+  }
+
+  keepRest(g: number, rest: Float64Array): void {
+    this.rests.set(g, rest);
   }
 }
 
@@ -170,6 +181,8 @@ interface MovedLeaves {
 class ModuleReheat {
   readonly k: number;
   readonly s = new Scratch();
+  /** Scratch for the overlap force: the layout's collision run on a copy, its correction read as a force. */
+  private readonly overlap = new Scratch();
   /** The disc's centre in the local frame, now and as last written to the world. */
   ox = 0;
   oy = 0;
@@ -319,14 +332,30 @@ class ModuleReheat {
     }
     // The springs: this level's links weighted by √(flow / max flow) alone — the strongest the stiffest,
     // none stiffened or softened by degree — at their laid-out length, the level's equilibrium spacing.
+    // Rest lengths are the laid-out lengths, kept from the module's first drag: a later drag's springs keep
+    // the tension the settled map holds them at, so the bias below leaves the grab still.
     const links = k >= 2 ? moduleLinks(topo, g, start, end, cache.local(), false) : { la: [], lb: [], lw: [] };
-    this.rest = new Float64Array(links.la.length);
     this.la = links.la;
     this.lb = links.lb;
     this.lw = links.lw;
+    let rest = cache.restOf(g);
+    if (!rest || rest.length !== links.la.length) {
+      rest = Float64Array.from(links.la, (a, l) => Math.hypot(x[links.lb[l]!]! - x[a]!, y[links.lb[l]!]! - y[a]!));
+      cache.keepRest(g, rest);
+    }
+    this.rest = rest;
+    this.overlap.ensure(k, 0);
     this.biasX = new Float64Array(k);
     this.biasY = new Float64Array(k);
-    this.restHere();
+    // The grab's state is at rest: every force on each child now, taken back off every tick (times the
+    // heat). What is left is exactly the change the drag makes — nothing moves until something is moved.
+    this.forces(1);
+    for (let i = 0; i < k; i++) {
+      this.biasX[i] = vx[i]!;
+      this.biasY[i] = vy[i]!;
+      vx[i] = 0;
+      vy[i] = 0;
+    }
 
     const chain: number[] = [];
     for (let a = g; a >= 0; a = parent[a]!) chain.push(a);
@@ -352,32 +381,9 @@ class ModuleReheat {
     return list;
   }
 
-  /** Let the held children go (the pointer is up): they settle with the rest. */
+  /** Let the held children go (the pointer is up): they settle with the rest, under the same forces. */
   release(): void {
     for (let i = 0; i < this.k; i++) if (this.mode[i] === HELD) this.pinned[i] = 0;
-    this.restHere();
-  }
-
-  /**
-   * Make where the children are now the rest state (at the grab, and again on release): each link's rest
-   * length its length now, and the field forces now the bias taken back off. On release that keeps a
-   * dropped item where it was dropped — the map eases to rest from there instead of springing back.
-   */
-  private restHere(): void {
-    const { k, s, la, lb, rest } = this;
-    const { x, y, vx, vy } = s;
-    for (let l = 0; l < la.length; l++) rest[l] = Math.hypot(x[lb[l]!]! - x[la[l]!]!, y[lb[l]!]! - y[la[l]!]!);
-    const keepX = Float64Array.from(vx.subarray(0, k));
-    const keepY = Float64Array.from(vy.subarray(0, k));
-    vx.fill(0, 0, k);
-    vy.fill(0, 0, k);
-    this.fieldForces(1);
-    for (let i = 0; i < k; i++) {
-      this.biasX[i] = vx[i]!;
-      this.biasY[i] = vy[i]!;
-      vx[i] = keepX[i]!;
-      vy[i] = keepY[i]!;
-    }
   }
 
   /**
@@ -400,18 +406,53 @@ class ModuleReheat {
   }
 
   /**
-   * Add the ORGANISE phase's many-body repulsion and gravity toward the free children's centroid, at
-   * `alpha`. Gravity leaves the dragged child out of its centre: toward the centroid of every child, a
-   * dragged heavy module would draw the whole level after it as one rigid piece.
+   * Add every force on the children at `alpha`, into their velocities: the ORGANISE phase's many-body
+   * repulsion (a share of it); gravity toward the free children's centroid — leaving the dragged child out
+   * of its centre, which would otherwise draw the whole level after it as one rigid piece — or, at the
+   * root, toward the map's anchor; two-sided springs over the level's links at their rest lengths; and a
+   * soft overlap push (a share of what the layout's collision would correct). All are forces, so the grab's
+   * sum is a true rest state and the release settles into an equilibrium of the same forces.
    */
-  private fieldForces(alpha: number): void {
-    const { k, s } = this;
-    const { x, y, vx, vy } = s;
+  private forces(alpha: number): void {
+    const { k, s, pinned } = this;
+    const { x, y, vx, vy, rad } = s;
     if (k > 1) repel(s, k, ((NESTED.REPULSION_K * DRAG_REPULSION) / k) * alpha);
     const [gx, gy] = this.anchor ?? this.centroid(true);
     for (let i = 0; i < k; i++) {
       vx[i] = vx[i]! - (x[i]! - gx) * NESTED.GRAVITY * alpha;
       vy[i] = vy[i]! - (y[i]! - gy) * NESTED.GRAVITY * alpha;
+    }
+    const { la, lb, lw, rest } = this;
+    for (let l = 0; l < la.length; l++) {
+      const a = la[l]!;
+      const b = lb[l]!;
+      const pa = pinned[a]!;
+      const pb = pinned[b]!;
+      if (pa && pb) continue;
+      let ex = x[b]! - x[a]!;
+      let ey = y[b]! - y[a]!;
+      const d = Math.hypot(ex, ey) || 1e-9;
+      const f = ((d - rest[l]!) / d) * alpha * lw[l]! * SPRING;
+      ex *= f;
+      ey *= f;
+      const ma = rad[a]! * rad[a]!;
+      const mb = rad[b]! * rad[b]!;
+      const sb = pa ? 1 : pb ? 0 : ma / (ma + mb);
+      vx[b] = vx[b]! - ex * sb;
+      vy[b] = vy[b]! - ey * sb;
+      vx[a] = vx[a]! + ex * (1 - sb);
+      vy[a] = vy[a]! + ey * (1 - sb);
+    }
+    if (k > 1) {
+      const o = this.overlap;
+      o.x.set(x.subarray(0, k));
+      o.y.set(y.subarray(0, k));
+      o.rad.set(rad.subarray(0, k));
+      collide(o, k, NESTED.PAD, pinned);
+      for (let i = 0; i < k; i++) {
+        vx[i] = vx[i]! + (o.x[i]! - x[i]!) * SOFT_OVERLAP * alpha;
+        vy[i] = vy[i]! + (o.y[i]! - y[i]!) * SOFT_OVERLAP * alpha;
+      }
     }
   }
 
@@ -427,7 +468,7 @@ class ModuleReheat {
   step(alpha: number, dx: number, dy: number, holding: boolean): void {
     const { k, s, pinned, mode } = this;
     const { x, y, vx, vy, rad } = s;
-    const { PAD, DECAY } = NESTED;
+    const { DECAY } = NESTED;
     for (let i = 0; i < k; i++) {
       const m = mode[i];
       if (m === HELD && holding) {
@@ -439,7 +480,7 @@ class ModuleReheat {
         y[i] = this.hy[i]! + (d.oy * d.R) / this.R;
       } else continue;
     }
-    this.fieldForces(alpha);
+    this.forces(alpha);
     for (let i = 0; i < k; i++) {
       if (pinned[i]) {
         vx[i] = 0;
@@ -449,27 +490,6 @@ class ModuleReheat {
       vx[i] = vx[i]! - this.biasX[i]! * alpha;
       vy[i] = vy[i]! - this.biasY[i]! * alpha;
     }
-    const { la, lb, lw, rest } = this;
-    for (let l = 0; l < la.length; l++) {
-      const a = la[l]!;
-      const b = lb[l]!;
-      const pa = pinned[a]!;
-      const pb = pinned[b]!;
-      if (pa && pb) continue;
-      let ex = x[b]! + vx[b]! - x[a]! - vx[a]!;
-      let ey = y[b]! + vy[b]! - y[a]! - vy[a]!;
-      const d = Math.hypot(ex, ey) || 1e-9;
-      const f = ((d - rest[l]!) / d) * alpha * lw[l]! * SPRING;
-      ex *= f;
-      ey *= f;
-      const ma = rad[a]! * rad[a]!;
-      const mb = rad[b]! * rad[b]!;
-      const sb = pa ? 1 : pb ? 0 : ma / (ma + mb);
-      vx[b] = vx[b]! - ex * sb;
-      vy[b] = vy[b]! - ey * sb;
-      vx[a] = vx[a]! + ex * (1 - sb);
-      vy[a] = vy[a]! + ey * (1 - sb);
-    }
     for (let i = 0; i < k; i++) {
       if (pinned[i]) continue;
       vx[i] = vx[i]! * (1 - DECAY);
@@ -477,7 +497,6 @@ class ModuleReheat {
       x[i] = x[i]! + vx[i]!;
       y[i] = y[i]! + vy[i]!;
     }
-    collide(s, k, PAD, pinned, SOFT_OVERLAP);
     [this.ox, this.oy] = this.centroid();
     let reach = 1;
     for (let i = 0; i < k; i++) {

@@ -292,4 +292,20 @@ describe("nested drag reheat", () => {
     const ticks = cool(drag, m.positions);
     expect(ticks).toBeLessThanOrEqual(COOL);
   });
+
+  it("settles on release, so a later grab moves nothing", () => {
+    const m = nestedMap([3, 4, 16]);
+    const cache = new NestedDragCache(m.topo, m.size);
+    const R = m.discs.r[m.tree.size - 1 - m.tree.leafCount]!;
+    const first = NestedDrag.start(cache, m.discs, m.positions, [5])!;
+    first.setDelta(0.3 * R, 0.1 * R);
+    for (let t = 0; t < 60; t++) first.tick(m.positions);
+    cool(first, m.positions);
+    const settled = m.positions.slice();
+    const second = NestedDrag.start(cache, m.discs, m.positions, [m.tree.leafCount - 3])!;
+    for (let t = 0; t < 30; t++) second.tick(m.positions);
+    let most = 0;
+    for (let i = 0; i < settled.length; i++) most = Math.max(most, Math.abs(m.positions[i]! - settled[i]!));
+    expect(most, "a later grab released what the first drag left").toBeLessThan(1e-3 * R);
+  });
 });
