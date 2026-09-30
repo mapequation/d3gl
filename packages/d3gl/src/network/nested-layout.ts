@@ -382,7 +382,8 @@ export function recordSeedDiscs(topo: Pick<NestedLayoutTopology, "children">, st
  * The root disc that places a warm seed over the current map (#454, {@link NestedLayoutOptions.placeBy}
  * `"seed"`): the seed composed from a root disc of radius `radius` at the origin has its known leaves'
  * centroid moved onto `warm`'s and — when `rescale` — its RMS spread scaled to `warm`'s. `positions` (2 ·
- * leaves) is scratch. O(tree size + leaves), float64 sums.
+ * leaves) gets the seed's leaves placed by it: the frame the placed layout starts from. O(tree size +
+ * leaves), float64 sums.
  */
 export function seedRootDisc(
   topo: NestedLayoutTopology,
@@ -418,7 +419,14 @@ export function seedRootDisc(
   }
   const spread = Math.sqrt(ss / n);
   const s = rescale && spread > 0 ? warm.spread / spread : 1;
-  return { x: warm.ox[root]! - mx * s, y: warm.oy[root]! - my * s, radius: radius * s };
+  const x = warm.ox[root]! - mx * s;
+  const y = warm.oy[root]! - my * s;
+  // The composition is a similarity in the root disc: the placed seed is the one at the origin, moved.
+  for (let i = 0; i < leafCount; i++) {
+    positions[2 * i] = x + positions[2 * i]! * s;
+    positions[2 * i + 1] = y + positions[2 * i + 1]! * s;
+  }
+  return { x, y, radius: radius * s };
 }
 
 /**

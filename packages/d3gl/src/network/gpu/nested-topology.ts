@@ -149,6 +149,11 @@ export interface NestedSolverTopology {
    * {@link rootRadius}) already places every frame.
    */
   readonly place: { readonly tx: number; readonly ty: number; readonly spread: number } | null;
+  /**
+   * A warm start placed by its seed (#454): the seed's leaf positions, placed — the frame the solve starts
+   * from, known before it runs (`2 · leaves` floats) — or `null`. A followed stream eases toward it at once.
+   */
+  readonly seedFrame: Float32Array | null;
 }
 
 /**
@@ -257,8 +262,9 @@ export function nestedSolverTopology(topo: NestedLayoutTopology, params: NestedL
 
   // The root disc: a cold map's at the origin; a warm seed's where it places the seed over the current map.
   let root0 = { x: 0, y: 0, radius: params.radius ?? 10 * Math.sqrt(leafCount) };
-  if (seeded && warm) {
-    root0 = new SeededFrames(size, seeded).rootDisc(topo, root, root0.radius, warm, params.radius === undefined, new Float32Array(2 * leafCount));
+  const seedFrame = seeded && warm ? new Float32Array(2 * leafCount) : null;
+  if (seeded && warm && seedFrame) {
+    root0 = new SeededFrames(size, seeded).rootDisc(topo, root, root0.radius, warm, params.radius === undefined, seedFrame);
   }
   return {
     slotCount,
@@ -285,6 +291,7 @@ export function nestedSolverTopology(topo: NestedLayoutTopology, params: NestedL
     rootX: root0.x,
     rootY: root0.y,
     place: warm && !seeded ? { tx: warm.ox[root] ?? 0, ty: warm.oy[root] ?? 0, spread: warm.spread } : null,
+    seedFrame,
   };
 }
 
@@ -297,6 +304,7 @@ export function nestedSolverBuffers(t: NestedSolverTopology): ArrayBuffer[] {
     c.slotCollide, c.items, c.segCellSide, c.segClasses, c.segList, c.segBucketBase, c.segBucketMask, c.segSubBase,
     c.binnedSlots, c.slotWork,
   ];
+  if (t.seedFrame) arrays.push(t.seedFrame);
   const buffers: ArrayBuffer[] = [];
   for (const a of arrays) if (a.buffer instanceof ArrayBuffer) buffers.push(a.buffer);
   return buffers;
