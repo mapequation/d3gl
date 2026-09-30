@@ -1,5 +1,7 @@
 import { describe, it, expect, vi, afterEach } from "vitest";
-import { startWorkerLayout } from "../worker-transport.js";
+import { startNestedWorkerLayout, startWorkerLayout, type NestedFollow } from "../worker-transport.js";
+import { nestedLayout } from "../nested-layout.js";
+import { threeLevel, topo } from "./nested-fixtures.js";
 import { buildGraph } from "../graph.js";
 import { ForceLayout } from "../force.js";
 import type { MainToWorker } from "../worker-protocol.js";
@@ -149,5 +151,46 @@ describe("startWorkerLayout warm start (#311)", () => {
     FakeWorker.last?.onerror?.(new Event("error"));
     await handle.settled;
     expect(g.positions).toEqual(warmReference(30, 0.6, true));
+  });
+});
+
+describe("startNestedWorkerLayout followed (#454): frames go to the follower, not into the graph", () => {
+  const tree = topo(threeLevel(3, 4, 5));
+  const initial = nestedLayout(tree).positions.map((v, i) => v * 2 + (i % 2 ? 40 : -10));
+  const params = { initial, placeBy: "seed" as const };
+  const follower = (): { follow: NestedFollow; frames: Float32Array[] } => {
+    const frames: Float32Array[] = [];
+    const buffer = new Float32Array(2 * tree.leafCount);
+    return { frames, follow: { target: () => buffer, onFrame: (p) => void frames.push(p.slice()) } };
+  };
+
+  it("asks the worker to stream, and hands every frame and the final layout to the follower", async () => {
+    vi.stubGlobal("Worker", FakeWorker);
+    const g = buildGraph({ nodeCount: tree.leafCount, source: [], target: [] });
+    const before = g.positions.slice();
+    const { follow, frames } = follower();
+    let painted = 0;
+    let bounds = 0;
+    const handle = startNestedWorkerLayout(g, tree, params, () => painted++, { follow, onBounds: () => bounds++ });
+    const start = FakeWorker.last?.posted.find((m) => m.type === "start-nested");
+    expect(start?.type === "start-nested" && start.stream).toBe(true);
+    const frame = new Float32Array(2 * tree.leafCount).fill(3);
+    FakeWorker.last?.onmessage?.(new MessageEvent("message", { data: { type: "frame", tick: 0, positions: frame, bounds: [0, 0, 1, 1] } }));
+    const last = new Float32Array(2 * tree.leafCount).fill(5);
+    FakeWorker.last?.onmessage?.(new MessageEvent("message", { data: { type: "done", tick: -1, positions: last } }));
+    await handle.settled;
+    expect(frames.map((f) => f[0])).toEqual([3, 5]);
+    expect(Array.from(g.positions)).toEqual(Array.from(before)); // the follower eases the graph, the transport never writes it
+    expect([painted, bounds]).toEqual([0, 0]); // no repaint of its own, no bound: the positions on screen are the follower's
+  });
+
+  it("without a worker, solves here and hands the result to the follower", async () => {
+    // (the node environment has no Worker: the synchronous fallback)
+    const g = buildGraph({ nodeCount: tree.leafCount, source: [], target: [] });
+    const { follow, frames } = follower();
+    await startNestedWorkerLayout(g, tree, params, () => {}, { follow }).settled;
+    expect(frames).toHaveLength(1);
+    expect(Array.from(frames[0]!)).toEqual(Array.from(nestedLayout(tree, params).positions));
+    expect(g.positions.every((v) => v === 0)).toBe(true);
   });
 });

@@ -52,6 +52,13 @@ export interface PositionTransitionOptions {
   ease?: (t: number) => number;
   /** Clock in milliseconds. Default `performance.now`. */
   now?: () => number;
+  /**
+   * The most the transition's own clock advances from one frame to the next, ms (#454). A frame that comes
+   * later than that — the main thread was busy — moves the positions on by this much of the schedule, not by
+   * the time that passed, so a stall slows the transition instead of skipping part of it (the positions never
+   * leap across the gap). Default: no limit, the wall clock.
+   */
+  maxFrameMs?: number;
   /** Frame scheduler. Default `requestAnimationFrame` (a 16 ms timeout where there is none). */
   requestFrame?: (cb: () => void) => number;
   /** Cancels a {@link requestFrame} id. Default `cancelAnimationFrame` (`clearTimeout`). */
@@ -130,6 +137,8 @@ export function positionTransition(positions: Float32Array, opts: PositionTransi
   let keptAll: number[] = []; // every kept id, re-applied to a retarget's target
   let eased = 0; // the eased progress of the last frame written
   let base = 0; // the eased progress `from` was taken at: 0, or the last frame's at a retarget
+  const maxFrame = opts.maxFrameMs !== undefined && opts.maxFrameMs > 0 ? opts.maxFrameMs : Infinity;
+  let last = 0; // the clock at the last frame (or at `to`)
   const pin = (ids: ArrayLike<number>, to: Float32Array): void => {
     for (let k = 0; k < ids.length; k++) {
       const i = ids[k]! * 2;
@@ -152,7 +161,11 @@ export function positionTransition(positions: Float32Array, opts: PositionTransi
   const frame = (): void => {
     raf = 0;
     if (ended || !target) return;
-    const t = duration > 0 ? (now() - start) / duration : 1;
+    const time = now();
+    // A late frame advances the schedule by at most `maxFrameMs`: the time beyond it is added to the start.
+    if (time - last > maxFrame) start += time - last - maxFrame;
+    last = time;
+    const t = duration > 0 ? (time - start) / duration : 1;
     if (t >= 1) {
       positions.set(target);
       opts.onFrame(1);
@@ -174,6 +187,7 @@ export function positionTransition(positions: Float32Array, opts: PositionTransi
     keptAll = kept;
     kept = [];
     start = now();
+    last = start;
     raf = requestFrame(frame);
   };
 

@@ -1,0 +1,12 @@
+---
+"@mapequation/d3gl": patch
+---
+
+Layouts can now go on live from where the nodes are, streamed from their first frame ([#454](https://github.com/mapequation/d3gl/issues/454)). Before, they restarted from a disc or solved out of sight first.
+
+- **`layout({ warm: true })`** starts the force layouts (`"force"`, `"worker"`, `"gpu"`, `"auto"`) from the current positions: no seed disc and no multilevel seed, at full heat, cooling over `iterations` until the layout converges. A streamed one streams as usual, so its first frame is the layout on screen, and `fit` frames it as it grows. From a nested map the force layout spreads out to its own scale, about three times as wide, and that change shows live. On a graph never laid out, `warm` gives the cold layout.
+- **A warm nested map without a `transition` streams.** `layout({ nested: true, warm: true })` (the same as `nested: { warm: true }`) on `"worker"`, `"gpu"` or `"auto"` is placed by its seed before any module is solved: each module's children at their current arrangement, in their discs, with the current map's centroid and spread. The engine then eases the nodes toward each frame of the solve as it lands, on one 600 ms ease (cubic ease-out, so the nodes move at once) that is retargeted to every newer frame without a jump. A frame that lands after the ease ends is painted as it comes. On the GPU the frames are the solve's ticks, starting with the seed as soon as the solve's data is prepared. On the worker they are the seed, then one frame per depth, with the modules not solved yet kept at their seeded arrangement, so no leaf collapses onto its module's centre. Until the module tree and the solve are ready, the nodes stay where they are. Before, this call solved out of sight and landed in one frame.
+- **With a `transition`**, a warm nested map is computed in one go and eased to, placed by its result, as before.
+- `nestedLayout` gets `placeBy: "seed" | "result"`: with `"seed"`, a warm start is placed by its seed and streams through `onDepth` (depth 0 is the seed).
+
+Cost: each frame of the nested map's ease is a position-transition frame: the interpolation, the LOD position pass, the re-emit and, with `fit`, the stream's O(nodes) bounding box. It replaces the streamed frame's position copy and runs at display rate for the length of the ease. A warm force layout's frames are ordinary streamed frames.

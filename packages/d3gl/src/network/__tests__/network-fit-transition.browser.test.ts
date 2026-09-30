@@ -14,8 +14,8 @@ import { easeCubicInOut } from "../transition.js";
  *      exact box; nothing moves at the `layout()` call itself;
  *   2. a real wheel gesture, an explicit `setTransform` or a node grab mid-transition hands the view to
  *      the user for good, while the camera's own moves never count as a gesture (#309);
- *   3. a layout landed in one go (`"positions"`, `"force"`, a warm nested map without a transition) is
- *      framed once, as it lands — a worker's still-solving map keeps the view it had until then;
+ *   3. a layout landed in one go (`"positions"`, `"force"`) is framed once, as it lands; a warm nested map
+ *      without a transition streams from the map on screen (#454), framed on every frame;
  *   4. a cold nested map streamed depth by depth frames a box its final layout is known to lie in — so
  *      the camera only zooms in as depths land (#324) — and settles on the leaves' exact box, like a flat
  *      layout, instead of the root disc it used to keep (fill 0.53 in the Navigator).
@@ -323,16 +323,19 @@ describe("fit + transition: the camera eases along with the nodes (#427)", () =>
     }
   });
 
-  it("a warm nested re-cluster without a transition holds the camera while the worker solves, then frames the map once as it lands", async () => {
+  it("a warm nested re-cluster without a transition streams from the map on screen, framed on every frame it moves through (#454)", async () => {
     const { net, host } = await engine();
     const { graph, pairs } = await reclusterFixture(net);
-    const start = net.camera;
     const from = graph.positions.slice();
     net.data(graph, { modules: pairs });
     const frames = stepper();
     try {
+      const start = net.camera;
       net.layout({ backend: "worker", nested: { warm: true }, fit: true });
-      expect(net.camera, "the camera moved at the call: it framed the layout being replaced").toEqual(start);
+      // Nothing is placed over the map, and while the new modules' tree is built off the main thread (#428)
+      // the camera holds.
+      expect(same(graph.positions, from), "a seed disc was placed over the map").toBe(true);
+      expect(net.camera).toEqual(start);
       const samples = await stepUntilSettled(net, graph, frames, 16);
       const to = graph.positions.slice();
       const end = net.camera;
@@ -341,13 +344,18 @@ describe("fit + transition: the camera eases along with the nodes (#427)", () =>
       expectFramed(to, end);
       expect(zoomTransform(host)).toMatchObject(end);
       expect(net.interactingCalls).toBe(0);
-      // Each frame shows the old map at the old view (the worker still solving) or the new map framed: the
-      // camera never moves before the map lands, and frames it in one step, on its exact box.
+      // Once the nodes move, every frame is framed as it is, and they move through frames between the two
+      // maps — no jump from one to the other.
+      let between = 0;
       for (const s of samples) {
-        const landed = same(s.positions, to);
-        expect(landed || same(s.positions, from), "a frame between the two maps").toBe(true);
-        expect(s.view).toEqual(landed ? end : start);
+        if (same(s.positions, from)) {
+          expect(s.view).toEqual(start);
+          continue;
+        }
+        expectFramed(s.positions, s.view);
+        if (!same(s.positions, to)) between++;
       }
+      expect(between, "no frame between the two maps: it jumped").toBeGreaterThan(5);
     } finally {
       frames.restore();
       net.destroy();
