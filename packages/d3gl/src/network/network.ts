@@ -424,21 +424,25 @@ export interface NestedLayoutConfig {
   /**
    * **Warm start** (#328): lay the map out from the nodes' current positions — e.g. after a
    * re-clustering with the same nodes, or a switch from a force layout (#454) — instead of from scratch.
-   * Each module's children start at their current centroids and the solve refines that arrangement, and
-   * the new map keeps the current one's centroid and spread, so it stays where it is. No seed disc is
-   * placed first. How it arrives:
+   * Each module's children start at their current centroids and the solve refines that arrangement. No
+   * seed disc is placed first. How it arrives:
    * - with a {@link NetworkLayoutOptions.transition}, and on `"force"`, the map is computed in one go and
-   *   eased in (or jumped to), placed over the current map by its result;
-   * - otherwise, on `"worker"` / `"gpu"` / `"auto"`, it **streams from the positions on screen** (#454): it is
-   *   placed by its seed before the solve starts (every module's children at their current arrangement,
-   *   in their discs, with the current map's centroid and spread), and the engine eases the nodes toward
+   *   eased in (or jumped to), placed over the current map by its result: the current one's centroid and
+   *   spread, so it stays where it is;
+   * - otherwise, on `"worker"` / `"gpu"` / `"auto"`, it **streams from the positions on screen** (#454), at its
+   *   natural size — a cold map's root disc, `10·√N` — centred where the current map is (its seed, every
+   *   module's children at their current arrangement in their discs, is placed so before the solve
+   *   starts), and the engine eases the nodes toward
    *   each frame as it lands — from where they are, on one ease of about 600 ms that starts with the first
    *   frame and moves at once (cubic ease-out), retargeted to every newer frame without a jump; a frame that
    *   lands after it has ended is painted as it comes. The GPU solve streams its ticks; the worker its seed,
    *   then one frame per depth, each with the modules not solved yet at their seeded arrangement (no leaf
    *   collapses onto its module's centre). Until the module tree and the solve are ready (the tree is
    *   built on a worker, #428), the nodes stay where they are. From a force layout the nodes gather into
-   *   their modules' discs as it goes: that is the change to a map of modules, and it shows live.
+   *   their modules' discs and the map shrinks to its own size, about a third of a force layout's width:
+   *   that is the change to a map of modules, and it shows live. With {@link NetworkLayoutOptions.fit} the
+   *   camera follows it, as it follows any stream; from a nested map of the same size (a re-clustering)
+   *   the map keeps its size.
    *
    * On a graph never laid out (all positions equal) it is the cold layout. Default `false`.
    */
@@ -2170,14 +2174,17 @@ export class Network extends BaseEngine {
     // A warm map streamed (#454): no transition asked for, on a streaming backend.
     const follows = warm && !tween && layoutClass(opts.backend) === "streaming";
     const params: NestedLayoutParams = {
-      radius: warm ? undefined : radius,
+      // A warm map eased in keeps the current map's spread; a streamed one (#454) goes to its natural size, a
+      // cold map's root disc, centred where the current map is.
+      radius: warm && !follows ? undefined : radius,
       // A snapshot (the transition's, when there is one), not the live buffer: after a shared-memory
       // worker run that buffer is SAB-backed, and posting it would share it with the worker, not copy it.
       initial: warm ? (tween?.from ?? graph.positions.slice()) : undefined,
       iterations: cfg.iterations,
       packing: cfg.packing,
       size: (cfg.size ?? "flow") === "flow" ? (graph.flow ?? undefined) : undefined,
-      // Placed before the solve, so every frame of the stream is placed alike (#454).
+      // Placed before the solve — its seed centred on the current map — so every frame of the stream is placed
+      // alike (#454).
       ...(follows ? { placeBy: "seed" as const } : {}),
     };
     if (tree instanceof Promise || layoutClass(opts.backend) === "streaming") {

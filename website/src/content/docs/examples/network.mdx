@@ -689,15 +689,17 @@ net.layout({ backend: "gpu", nested: true, warm: true, fit: true });
   no seed disc, no multilevel seed, at full heat, cooling over `iterations` until it converges. Its first
   frame is the layout on screen. From a nested map it spreads out to the force model's own scale, which is
   about three times as wide, and with `fit` the camera follows it as it grows, as it follows any stream.
-- **A warm nested map without a `transition`** streams too. It is placed by its *seed*, before any module
-  is solved: every module's children at their current arrangement, mapped into their discs, with the
-  current map's centroid and spread. The engine then eases the nodes toward each frame of the solve as it
-  lands, on one ease of about 600 ms that starts with the first frame and is retargeted to every newer
-  frame without a jump. On the GPU the frames are the solve's ticks; on the worker they are the seed, then
-  one per depth, with the modules not solved yet kept at their seeded arrangement. From a force layout the
-  nodes gather into their modules' discs as the map forms: that is the change to a map of modules, and it
-  shows live. While the module tree and the solve are being prepared (the tree is built on a worker), the
-  nodes stay where they are.
+- **A warm nested map without a `transition`** streams too, at its natural size (a cold map's root disc),
+  centred where the current map is. Its *seed* — every module's children at their current arrangement,
+  mapped into their discs — is placed so before any module is solved. The engine then eases the nodes
+  toward each frame of the solve as it lands, on one ease of about 600 ms that starts with the first frame
+  and is retargeted to every newer frame without a jump. On the GPU the frames are the solve's ticks; on
+  the worker they are the seed, then one per depth, with the modules not solved yet kept at their seeded
+  arrangement. From a force layout the nodes gather into their modules' discs and the map shrinks to its
+  own size, about a third as wide: that is the change to a map of modules, and it shows live, with `fit`
+  keeping it framed as it goes. From a nested map of the same size (a re-clustering) it keeps its size.
+  While the module tree and the solve are being prepared (the tree is built on a worker), the nodes stay
+  where they are.
 - **Cost.** A warm force layout's frames are a streamed layout's. Each frame of the nested map's ease is a
   transition frame (the interpolation, the LOD position pass, the re-emit, and with `fit` the stream's
   bounding box). It replaces the streamed frame's position copy, and it runs at display rate for the
