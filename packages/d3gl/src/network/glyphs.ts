@@ -1,6 +1,6 @@
 import { rgb } from "d3-color";
 import type { InstancedCirclesData, InstancedPieData, InstancedLinesData, InstancedArrowsData, InstancedHalfArrowsData, InstancedLayer, GroupBuilder } from "../core/index.js";
-import type { NetworkGraph } from "./graph.js";
+import { reciprocalEdges, type NetworkGraph } from "./graph.js";
 import type { PhysicalPieWedges } from "./pie.js";
 import { boundaryCircle, type CutBoundaries, type FillAggregate, type LODTree, type LODTransform } from "./lod.js";
 import type { ScreenRect } from "../core/instanced-lane.js";
@@ -1988,10 +1988,6 @@ export interface HalfArrowStyleAttrs {
 export function halfArrowLinksStyleAttrs(graph: NetworkGraph, style: HalfArrowStyleResolved): HalfArrowStyleAttrs {
   const count = graph.edgeCount;
   const { nodeRadii, widthOf, colorOf, bend } = style;
-  // Reciprocal lookup: key s*N+t → edge weight, so t→s can find s→t's width for `oppositeWidth`.
-  const n = graph.nodeCount;
-  const weightByPair = new Map<number, number>();
-  for (let e = 0; e < count; e++) weightByPair.set(graph.source[e]! * n + graph.target[e]!, graph.weight[e]!);
   const radii = new Float32Array(count * 2);
   const widths = new Float32Array(count * 2);
   const bends = new Float32Array(count).fill(bend);
@@ -2000,10 +1996,13 @@ export function halfArrowLinksStyleAttrs(graph: NetworkGraph, style: HalfArrowSt
     const t = graph.target[e]!;
     radii[e * 2] = nodeRadii[s]!;
     radii[e * 2 + 1] = nodeRadii[t]!;
-    const w = widthOf(graph.weight[e]!);
-    const oppRaw = weightByPair.get(t * n + s);
-    widths[e * 2] = w;
-    widths[e * 2 + 1] = oppRaw === undefined ? w : widthOf(oppRaw);
+    widths[e * 2] = widthOf(graph.weight[e]!);
+  }
+  // `oppositeWidth`: the width of each edge's reciprocal t→s (read back, not re-run), else its own.
+  const opposite = reciprocalEdges(graph);
+  for (let e = 0; e < count; e++) {
+    const o = opposite[e] ?? -1;
+    widths[e * 2 + 1] = widths[2 * (o < 0 ? e : o)] ?? 0;
   }
   const colors = linkColorBytes(graph.weight, count, colorOf);
   return { radii, widths, bends, colors };
@@ -2463,13 +2462,11 @@ export function emitHalfLinks(
   bend: number,
   bake = 1,
 ): void {
-  const n = graph.nodeCount;
-  const weightByPair = new Map<number, number>();
-  for (let e = 0; e < graph.edgeCount; e++) weightByPair.set(graph.source[e]! * n + graph.target[e]!, graph.weight[e]!);
+  const opposite = reciprocalEdges(graph);
   for (let e = 0; e < graph.edgeCount; e++) {
     const s = graph.source[e]!;
     const t = graph.target[e]!;
-    const oppRaw = weightByPair.get(t * n + s);
+    const o = opposite[e] ?? -1;
     // Solve in pixel space (positions × bake, px sizes); scale the result back by 1/bake to emit world
     // geometry the Scene's view transform restores to pixels. bake = 1 ⇒ plain world geometry.
     const x0 = graph.positions[s * 2]! * bake;
@@ -2484,7 +2481,7 @@ export function emitHalfLinks(
       y1,
       r1: nodeRadii[t]!,
       width: widthOf(graph.weight[e]!),
-      oppositeWidth: oppRaw === undefined ? widthOf(graph.weight[e]!) : widthOf(oppRaw),
+      oppositeWidth: widthOf(o < 0 ? graph.weight[e]! : (graph.weight[o] ?? 0)),
       bend: chordBend(x0, y0, x1, y1, bend),
     });
     if (!geom) continue;

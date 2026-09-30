@@ -306,6 +306,12 @@ describe("halfArrowLinks", () => {
     const d = halfArrowLinks(g, { nodeRadii: new Float32Array([2, 2]), widthOf: (w) => w, colorOf: () => [0, 0, 0, 255], bend: 10 });
     expect(Array.from(d.widths)).toEqual([4, 4]); // no 1→0 edge ⇒ oppositeWidth = own width
   });
+
+  it("takes the last of parallel reciprocal links as the opposite width", () => {
+    const g = buildGraph({ nodeCount: 2, source: [0, 1, 1], target: [1, 0, 0], weight: [5, 2, 3], directed: true });
+    const d = halfArrowLinks(g, { nodeRadii: new Float32Array([2, 2]), widthOf: (w) => w, colorOf: () => [0, 0, 0, 255], bend: 10 });
+    expect(Array.from(d.widths)).toEqual([5, 3, 2, 5, 3, 5]);
+  });
 });
 
 describe("noLodStyleCache highlight group columns (#214)", () => {

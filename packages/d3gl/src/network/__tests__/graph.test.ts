@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { buildCSR, buildGraph, type CSR } from "../graph.js";
+import { buildCSR, buildGraph, reciprocalEdges, type CSR } from "../graph.js";
 
 function neighborsOf(csr: CSR, node: number): number[] {
   return Array.from(
@@ -101,5 +101,52 @@ describe("buildGraph", () => {
     expect(() => buildGraph({ nodeCount: 3, source: [], target: [], nodeFlow: [0.5, 0.5] })).toThrow(
       /nodeFlow length 2 !== nodeCount 3/,
     );
+  });
+});
+
+describe("reciprocalEdges", () => {
+  /** The lookup it replaces: a Map keyed by s·n + t, where the last parallel edge wins. */
+  function viaMap(n: number, source: number[], target: number[]): number[] {
+    const byPair = new Map<number, number>();
+    source.forEach((s, e) => byPair.set(s * n + (target[e] ?? 0), e));
+    return source.map((s, e) => byPair.get((target[e] ?? 0) * n + s) ?? -1);
+  }
+
+  it("finds each edge's t→s edge, the last of parallel ones, a self-loop's own last copy, or −1", () => {
+    // 0→1, 1→0, 1→0 (parallel: the later one answers), 0→2 (no 2→0), 3→3 twice, 2→1, 1→2.
+    const source = [0, 1, 1, 0, 3, 3, 2, 1];
+    const target = [1, 0, 0, 2, 3, 3, 1, 2];
+    const g = buildGraph({ nodeCount: 4, source, target, directed: true });
+    expect(Array.from(reciprocalEdges(g))).toEqual([2, 0, 0, -1, 5, 5, 7, 6]);
+    expect(Array.from(reciprocalEdges(g))).toEqual(viaMap(4, source, target));
+  });
+
+  it("agrees with the Map on random multigraphs with hubs, self-loops and isolated nodes", () => {
+    let seed = 7;
+    const rand = (k: number) => {
+      seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0;
+      return seed % k;
+    };
+    for (const [n, m] of [[1, 3], [5, 40], [50, 300], [400, 5000]] as const) {
+      const source: number[] = [];
+      const target: number[] = [];
+      for (let e = 0; e < m; e++) {
+        // A third of the edges touch node 0 (a hub), some repeat an earlier edge reversed or as is.
+        const s = rand(3) === 0 ? 0 : rand(n);
+        const t = rand(n);
+        source.push(s);
+        target.push(t);
+        if (rand(4) === 0) {
+          source.push(rand(2) ? t : s);
+          target.push(rand(2) ? s : t);
+        }
+      }
+      const g = buildGraph({ nodeCount: n, source, target, directed: true });
+      expect(Array.from(reciprocalEdges(g))).toEqual(viaMap(n, source, target));
+    }
+  });
+
+  it("handles a graph with no edges", () => {
+    expect(reciprocalEdges(buildGraph({ nodeCount: 3, source: [], target: [], directed: true })).length).toBe(0);
   });
 });
