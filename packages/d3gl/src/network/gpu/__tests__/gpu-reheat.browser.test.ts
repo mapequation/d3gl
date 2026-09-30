@@ -110,6 +110,43 @@ describe("GpuForceLayout pinned hold (#183)", () => {
     texSpy.mockRestore();
     layout.destroy();
   });
+  it("re-pinning an unchanged held set writes no pin texels; a changed set clears the old and sets the new", () => {
+    // A drag re-pins its held set on every pointer move. Each flag texel is a 1×1 upload (a GL call), so an
+    // unchanged set must write none: for a 1k-node module that was ~2k uploads, ~3 ms, per move.
+    const N = 400;
+    const g = buildGraph({ nodeCount: N, source: [0], target: [1] });
+    for (let i = 0; i < N; i++) { g.positions[i * 2] = (i % 20) * 30; g.positions[i * 2 + 1] = ((i / 20) | 0) * 30; }
+    const layout = new GpuForceLayout(device, g, { repulsion: 200, attraction: 0.05, centering: 0.2, alpha: 0.2, theta: 0.9 });
+    // The pin texture is r8 (flags written from a Uint8Array); held positions are written from a Float32Array.
+    const probe = device.createTexture({ width: 1, height: 1, format: "r8unorm" });
+    const writes = vi.spyOn(Object.getPrototypeOf(probe) as { writeData: (...a: unknown[]) => void }, "writeData");
+    probe.destroy();
+    const flagWrites = (): number => writes.mock.calls.filter(([data]) => data instanceof Uint8Array).length;
+
+    const held = Uint32Array.from({ length: 50 }, (_, i) => i + 1);
+    const pos = new Float32Array(held.length * 2);
+    layout.setPinned(held);
+    expect(flagWrites(), "the first pin sets one flag per held node").toBe(50);
+    writes.mockClear();
+    for (let move = 0; move < 5; move++) {
+      pos.fill(300 + move);
+      layout.setPinned(held); // the same array, as a drag passes it
+      layout.setHeldPositions(held, pos);
+      layout.runFrame(1);
+    }
+    layout.setPinned(Uint32Array.from(held)); // equal contents, another array
+    expect(flagWrites(), "an unchanged held set wrote pin texels").toBe(0);
+
+    held[0] = 300; // a caller changing its own array afterwards: the layout kept a copy of the set
+    const next = Uint32Array.from({ length: 30 }, (_, i) => i + 100);
+    layout.setPinned(next);
+    expect(flagWrites(), "a changed set clears the old flags and sets the new").toBe(50 + 30);
+    writes.mockClear();
+    layout.setPinned(null);
+    expect(flagWrites()).toBe(30);
+    writes.mockRestore();
+    layout.destroy();
+  });
 });
 
 describe("startGpuLayout resumable reheat loop (#183)", () => {
