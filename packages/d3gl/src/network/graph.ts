@@ -70,6 +70,68 @@ export function buildCSR(
   return weights ? { offsets, neighbors, degree, weights } : { offsets, neighbors, degree };
 }
 
+/**
+ * For each directed edge `s → t`, the id of an edge `t → s` — the last one in edge order when there are
+ * parallel ones, as a `Map` keyed by the pair would keep — or −1 when there is none. The half-arrow glyph
+ * reads it to leave room for its reciprocal's arrowhead (`oppositeWidth`).
+ *
+ * Two stable counting sorts put the edges in rows by source, each row ordered by target (ties in edge
+ * order), and each edge binary-searches its target's row for its source: O(nodes + edges) for the sorts,
+ * O(edges · log(max out-degree)) for the searches. 4 B per edge returned; 4 B per edge + 8 B per node
+ * transient. It replaces a `Map` keyed by `s · nodeCount + t`, whose keys pass 2³¹ at road-network scale
+ * and are boxed: 3.5 s at 2M nodes and 5.5M edges, against about 0.2 s here.
+ */
+export function reciprocalEdges(graph: Pick<NetworkGraph, "nodeCount" | "edgeCount" | "source" | "target">): Int32Array {
+  const { nodeCount: n, edgeCount: m, source, target } = graph;
+  const start = new Int32Array(n + 1);
+  // Sort 1: the edges by target, in edge order within a target.
+  for (let e = 0; e < m; e++) {
+    const t = (target[e] ?? 0) + 1;
+    start[t] = (start[t] ?? 0) + 1;
+  }
+  for (let v = 0; v < n; v++) start[v + 1] = (start[v + 1] ?? 0) + (start[v] ?? 0);
+  const byTarget = new Int32Array(m);
+  for (let e = 0; e < m; e++) {
+    const t = target[e] ?? 0;
+    const at = start[t] ?? 0;
+    byTarget[at] = e;
+    start[t] = at + 1;
+  }
+  // Sort 2, stable: those into rows by source, so each row is ordered by (target, edge id).
+  start.fill(0);
+  for (let e = 0; e < m; e++) {
+    const s = (source[e] ?? 0) + 1;
+    start[s] = (start[s] ?? 0) + 1;
+  }
+  for (let v = 0; v < n; v++) start[v + 1] = (start[v + 1] ?? 0) + (start[v] ?? 0);
+  const cursor = start.slice(0, n);
+  const row = new Int32Array(m);
+  for (let i = 0; i < m; i++) {
+    const e = byTarget[i] ?? 0;
+    const s = source[e] ?? 0;
+    const at = cursor[s] ?? 0;
+    row[at] = e;
+    cursor[s] = at + 1;
+  }
+  // byTarget is spent: it takes the answer. Edge s → t looks for the last entry of row t with target s.
+  const opposite = byTarget;
+  for (let e = 0; e < m; e++) {
+    const s = source[e] ?? 0;
+    const t = target[e] ?? 0;
+    const first = start[t] ?? 0;
+    let lo = first;
+    let hi = start[t + 1] ?? 0;
+    while (lo < hi) {
+      const mid = (lo + hi) >>> 1;
+      if ((target[row[mid] ?? 0] ?? 0) <= s) lo = mid + 1;
+      else hi = mid;
+    }
+    const last = row[lo - 1] ?? 0;
+    opposite[e] = lo > first && target[last] === s ? last : -1;
+  }
+  return opposite;
+}
+
 /** Network graph: directed-edge SoA for rendering + CSR for traversal. */
 export interface NetworkGraph {
   nodeCount: number;
