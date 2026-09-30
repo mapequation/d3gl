@@ -262,13 +262,14 @@ async function seedProgressively(steps: Generator<SeedProgress, void, undefined>
 async function runLayout(msg: StartMessage): Promise<void> {
   seeding = true;
   cancelled = false;
-  const { nodeCount, source, target, weight, sharedPositions, width, height, iterations, force, coarsen, multilevel, frameEvery, lod, lodSource, lodStyle, lodStyleVersion, lodView, warm } =
+  const { nodeCount, source, target, weight, sharedPositions, width, height, iterations, force, coarsen, multilevel, frameEvery, lod, lodSource, lodStyle, lodStyleVersion, lodView, warm, moduleSprings } =
     msg;
   const shared = sharedPositions !== undefined;
   // A warm start's copy-mode positions arrived as this worker's own clone: continue in them.
   const positions = shared ? new Float32Array(sharedPositions) : (warm?.positions ?? new Float32Array(nodeCount * 2));
-  // Satisfies both CoarsenableGraph (multilevelSeed) and LayoutGraph (ForceLayout / seedPositions).
-  const graph = { nodeCount, edgeCount: source.length, source, target, weight, positions };
+  // Satisfies both CoarsenableGraph (multilevelSeed) and LayoutGraph (ForceLayout / seedPositions). The module
+  // springs (#455) reach the refinement's ForceLayout, which every drag reheat reuses; the seed ignores them.
+  const graph = { nodeCount, edgeCount: source.length, source, target, weight, positions, ...(moduleSprings ? { moduleSprings } : {}) };
 
   // LOD (#103): coarsen once and reuse that hierarchy for both the multilevel seed and the streamed
   // tree, so the graph is never coarsened twice and the main thread never coarsens at all. The worker

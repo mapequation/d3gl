@@ -17,6 +17,7 @@ import type { SeedPlan, SeedPlanOptions } from "./gpu/seed-plan.js";
 import type { NestedSolverTopology } from "./gpu/nested-topology.js";
 import type { FitBox } from "./fit.js";
 import type { FlatModuleLinks, FlatModuleRecords } from "./module-topology.js";
+import type { ModuleSprings } from "./module-springs.js";
 
 /** Kick off a layout run. Edge buffers are copied to the worker; the main thread keeps its own. */
 export interface StartMessage {
@@ -64,6 +65,11 @@ export interface StartMessage {
    * a drag reheat.
    */
   warm?: WarmStart;
+  /**
+   * The module links as springs (#455): the refinement and every drag reheat pull along them as well as
+   * along the edges (the seed's coarse levels do not). Cloned into the message: O(module tree + links).
+   */
+  moduleSprings?: ModuleSprings;
 }
 
 /**

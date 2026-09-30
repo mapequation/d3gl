@@ -33,6 +33,8 @@ import {
 import { SeedLevels, SeedPasses } from "./seed-levels.js";
 import type { SeedPlan } from "./seed-plan.js";
 import { StopLatchPass, stopLatchProgram } from "./passes/stop-latch.js";
+import { GpuModuleSprings, moduleSpringPlan, moduleSpringPrograms } from "./module-springs.js";
+import { checkModuleSprings } from "../module-springs.js";
 
 // DAMPING is imported from force.ts so both integrators share one constant.
 
@@ -348,6 +350,12 @@ export class GpuForceLayout {
   private readonly flagScratch = new Uint8Array(1);
   /** Scratch for a single-texel (x, y) position sub-upload into the read-side position texture. */
   private readonly heldScratch = new Float32Array(2);
+  /**
+   * The module links' springs between member centroids (#455), for a graph with
+   * {@link LayoutGraph.moduleSprings} (the flat layout only), else null. Run on the graph's level, never on a
+   * seed level.
+   */
+  private readonly moduleSprings: GpuModuleSprings | null;
 
   constructor(
     device: Device,
@@ -365,6 +373,10 @@ export class GpuForceLayout {
     // before the first GPU allocation, so a rejected layout leaks nothing.
     const slotSeg = singleSegment ? null : slotSegments(segments, this.count);
     if (slotSeg) assertSegmentLocalEdges(slotSeg, graph.source, graph.target, graph.edgeCount);
+    if (graph.moduleSprings) {
+      if (!singleSegment) throw new Error("GpuForceLayout: module springs run on the flat layout (one segment)");
+      checkModuleSprings(graph.moduleSprings, this.count, "GpuForceLayout");
+    }
     this.exactMax = exactMax;
     assertAtlasFits(atlas, device.limits.maxTextureDimension2D);
     this.flatTile = singleSegment ? (atlas.tiles[0] ?? null) : null;
@@ -439,7 +451,7 @@ export class GpuForceLayout {
     // high-degree hub's aggregate spring can never turn the integration oscillatory-unstable.
     // Identical math to the CPU ForceLayout (springStabilizers) — keeps backend parity, including the
     // weighted degree of a layout with spring weights (the springs honour them, #350).
-    const stab = springStabilizers(graph.nodeCount, graph.source, graph.target, graph.edgeCount, params, undefined, graph.springWeight);
+    const stab = springStabilizers(graph.nodeCount, graph.source, graph.target, graph.edgeCount, params, undefined, graph.springWeight, graph.moduleSprings);
     const stabPadded = new Float32Array(width * height).fill(1);
     stabPadded.set(stab);
     this.stabTex = device.createTexture({
@@ -526,6 +538,7 @@ export class GpuForceLayout {
     this.centeringPass = new CenteringPass(device, singleSegment);
     this.stop = new StopLatchPass(device);
     this.seedPasses = multilevel ? new SeedPasses(device) : null;
+    this.moduleSprings = graph.moduleSprings ? new GpuModuleSprings(device, moduleSpringPlan(graph.moduleSprings), width) : null;
 
     this.finest = {
       count: this.count,
@@ -557,6 +570,7 @@ export class GpuForceLayout {
     }
     programs.push(integrateProgram(), repulsionProgram(repulsionVariant(shape, multilevel)), centeringProgram(shape.singleSegment), stopLatchProgram());
     if (multilevel) programs.push(...SeedPasses.programs());
+    if (graph.moduleSprings) programs.push(...moduleSpringPrograms(graph.moduleSprings));
     return programs;
   }
 
@@ -827,6 +841,11 @@ export class GpuForceLayout {
     // Sums every chunk of a row longer than SPRING_CHUNK into its partial — its own render pass into a
     // different framebuffer, encoded before the force pass gathers the partials. No-op without hubs.
     level.springs.prepare(this.pos.readTex, this.width);
+
+    // ── 1d. Module-link springs (#455) ───────────────────────────────────────
+    // The endpoints' member centroids and their springs' accelerations, for the force pass to hand to the
+    // leaves — the graph's level only (a seed level's slots are not the graph's nodes).
+    if (level === this.finest) this.moduleSprings?.prepare(this.pos.readTex, this.params.attraction);
     this.device.submit();
   }
 
@@ -850,7 +869,7 @@ export class GpuForceLayout {
       ...(bands > 1 || level.rows < this.height ? { scissor: [0, r0, this.width, r1 - r0] } : {}),
     });
 
-    // Fixed order — springs, repulsion, centering. Float addition is not associative, so the ADD
+    // Fixed order — springs, repulsion, centering, module springs. Float addition is not associative, so the ADD
     // blend makes the force bits depend on pass order; keep it stable.
 
     // Attraction (spring gather over CSR rows, plus each hub row's chunk partials; a seed level's rows
@@ -881,6 +900,9 @@ export class GpuForceLayout {
       count: level.count,
       width: this.width,
     }, this.slotSeg);
+
+    // Module-link springs (#455): each leaf takes the accelerations of the endpoints enclosing it.
+    if (level === this.finest) this.moduleSprings?.draw(forcePass);
 
     forcePass.end();
     this.device.submit();
@@ -1114,5 +1136,6 @@ export class GpuForceLayout {
     this.centeringPass.destroy();
     this.pyramid?.destroy();
     this.stop.destroy();
+    this.moduleSprings?.destroy();
   }
 }

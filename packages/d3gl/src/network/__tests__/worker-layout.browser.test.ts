@@ -1,5 +1,6 @@
 import { describe, it, expect } from "vitest";
-import { startWorkerLayout, startNestedWorkerLayout, sharedMemoryAvailable } from "../worker-transport.js";
+import { startWorkerLayout, startNestedWorkerLayout, sharedMemoryAvailable, withModuleSprings } from "../worker-transport.js";
+import { LINKS, fixture, springsOf } from "./module-springs-fixture.js";
 import { ForceLayout, seedPositions } from "../force.js";
 import { network } from "../network.js";
 import { buildGraph } from "../graph.js";
@@ -207,6 +208,37 @@ describe("worker warm start (#311)", () => {
     await handle.settled;
     expect(Array.from(g.positions)).toEqual(Array.from(reference.positions));
     handle.stop();
+  });
+
+  it("pulls along module springs (#455) exactly as this thread would — and not without them", async () => {
+    const f = fixture();
+    const springs = springsOf(f, LINKS);
+    const settle = (g: typeof f.graph): void => {
+      seedPositions(g, 400, 400, { force: {} });
+      new ForceLayout(g).run(15, "hot");
+    };
+    settle(f.graph);
+    const handed = f.graph.positions.slice();
+    const reference = withModuleSprings({ ...f.graph, positions: handed.slice() }, springs);
+    const layout = new ForceLayout(reference);
+    layout.cool(25, 0.5);
+    for (let t = 0; t < 25; t++) {
+      layout.tick();
+      if (layout.converged) break;
+    }
+    const handle = startWorkerLayout(f.graph, { width: 400, height: 400, iterations: 25, warm: { heat: 0.5, decaying: true }, moduleSprings: springs }, () => {});
+    await handle.settled;
+    expect(Array.from(f.graph.positions)).toEqual(Array.from(reference.positions));
+    handle.stop();
+    // The same run without them lands elsewhere: the springs reached the worker's solve.
+    const plain = { ...f.graph, positions: handed.slice() };
+    const without = new ForceLayout(plain);
+    without.cool(25, 0.5);
+    for (let t = 0; t < 25; t++) {
+      without.tick();
+      if (without.converged) break;
+    }
+    expect(Array.from(f.graph.positions)).not.toEqual(Array.from(plain.positions));
   });
 
   it("with LOD on, the tree arrives with the geometry of the handed-over positions: no seed frame follows to fill it", async () => {

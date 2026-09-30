@@ -69,7 +69,7 @@ import { compilePrograms, type CompileOutcome, type ProgramCompile } from "./pro
 import { moduleSeedPlan, type SeedPlan, type SeedPlanOptions } from "./seed-plan.js";
 import { SeedWorker } from "./seed-worker.js";
 import { LODRelay, type OnLODTree, type SeedRequest } from "./lod-relay.js";
-import { spawnLayoutWorker, startWorkerLayout, type WorkerLayoutHandle, type WorkerLayoutOptions } from "../worker-transport.js";
+import { spawnLayoutWorker, startWorkerLayout, withModuleSprings, type WorkerLayoutHandle, type WorkerLayoutOptions } from "../worker-transport.js";
 import { seedPositions, DEFAULT_FORCE, DRAG_HEAT, RECOOL_TICKS } from "../force.js";
 import type { LODTopology } from "../lod.js";
 import type { LeafStyle, LODView } from "../lod-frame.js";
@@ -470,7 +470,7 @@ class GpuLayoutRun implements WorkerLayoutHandle {
     if (!cont) seedPositions(graph, opts.width, opts.height, { force: opts.force });
     // Every program the run builds — the probe's, the solver's (its seed's too) and the readback's — compiled at
     // once and in parallel (#385), while the coarsening worker boots; null: nothing to compile ahead, build now.
-    const programs = [blendProbeProgram(), ...GpuForceLayout.programs(graph, { multilevel: coarsening.seeded }), ...AsyncPositionReadback.programs(device, false)];
+    const programs = [blendProbeProgram(), ...GpuForceLayout.programs(withModuleSprings(graph, opts.moduleSprings), { multilevel: coarsening.seeded }), ...AsyncPositionReadback.programs(device, false)];
     const record: Compiling = { device, cont, fallback, fault, replay, coarsening, handle: null, compile: null };
     let compile: ProgramCompile | null;
     try {
@@ -555,7 +555,8 @@ class GpuLayoutRun implements WorkerLayoutHandle {
     const iterations = cont ? cont.iterations : (opts.iterations ?? 300);
     let layout: GpuForceLayout;
     try {
-      layout = new GpuForceLayout(device, graph, { ...DEFAULT_FORCE, ...force }, { multilevel: seeded });
+      // The module links pull too (#455): the solver's view of the graph carries them as springs.
+      layout = new GpuForceLayout(device, withModuleSprings(graph, opts.moduleSprings), { ...DEFAULT_FORCE, ...force }, { multilevel: seeded });
     } catch (error) {
       releaseCoarsening(coarsening); // the caller falls back to a worker run, which streams its own tree
       throw error;

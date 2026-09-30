@@ -1,4 +1,5 @@
 import { BarnesHutTree } from "./quadtree.js";
+import { checkModuleSprings, moduleSpringGain, ModuleSpringForce, type ModuleSprings } from "./module-springs.js";
 
 /**
  * Minimal graph view the force core needs: node count, a directed edge list (used as undirected
@@ -22,6 +23,12 @@ export interface LayoutGraph {
   mass?: Float32Array;
   /** Per-edge spring multiplier, parallel to `source`/`target`, default 1 each (a coarse level's aggregated edges). */
   springWeight?: Float32Array;
+  /**
+   * The module links as springs between their endpoints' member centroids (#455, {@link ModuleSprings}) — the
+   * forces between modules an input like an Infomap `.ftree` carries only as module links. Each module's
+   * members share its springs' acceleration, so it moves as one body. For a graph of the springs' leaves.
+   */
+  moduleSprings?: ModuleSprings;
 }
 
 /**
@@ -190,6 +197,7 @@ export function springStabilizers(
   params: ForceParams,
   mass?: Float32Array,
   springWeight?: Float32Array,
+  moduleSprings?: ModuleSprings,
 ): Float32Array {
   // Weighted degree ÷ mass: a coarse supernode's spring gain is its summed spring weight per unit mass.
   const deg = new Float32Array(nodeCount);
@@ -200,6 +208,13 @@ export function springStabilizers(
   }
   const k = DAMPING * params.alpha * params.attraction;
   const stab = deg; // reuse in place: deg → 1 / (1 + K̃)
+  if (moduleSprings) {
+    // A module's springs move its members as one body (#455): each member's K̃ also counts that body's
+    // spring gain per unit mass, summed over the module and every enclosing one.
+    const gain = moduleSpringGain(moduleSprings, mass);
+    for (let i = 0; i < nodeCount; i++) stab[i] = 1 / (1 + (k * deg[i]!) / (mass ? mass[i]! : 1) + k * gain[i]!);
+    return stab;
+  }
   for (let i = 0; i < nodeCount; i++) stab[i] = 1 / (1 + (k * deg[i]!) / (mass ? mass[i]! : 1));
   return stab;
 }
@@ -235,6 +250,8 @@ export class ForceLayout {
    * toward it. `null` until {@link setPinned} is first called, so the common no-drag run allocates nothing.
    */
   private pinned: Uint8Array | null = null;
+  /** The module links' springs (#455), or `null` for a graph without {@link LayoutGraph.moduleSprings}. */
+  private readonly moduleForce: ModuleSpringForce | null;
 
   constructor(
     private readonly graph: LayoutGraph,
@@ -246,7 +263,10 @@ export class ForceLayout {
     this.vy = new Float32Array(n);
     this.fx = new Float32Array(n);
     this.fy = new Float32Array(n);
-    this.stab = springStabilizers(n, graph.source, graph.target, graph.edgeCount, this.params, graph.mass, graph.springWeight);
+    const springs = graph.moduleSprings;
+    if (springs) checkModuleSprings(springs, n, "ForceLayout");
+    this.moduleForce = springs ? new ModuleSpringForce(springs, graph.mass) : null;
+    this.stab = springStabilizers(n, graph.source, graph.target, graph.edgeCount, this.params, graph.mass, graph.springWeight, springs);
     this.spacing = equilibriumSpacing(this.params);
   }
 
@@ -356,6 +376,9 @@ export class ForceLayout {
         fy[b]! -= attraction * dy;
       }
     }
+
+    // Module links (#455): springs between their endpoints' member centroids, shared by the members.
+    this.moduleForce?.apply(positions, attraction, fx, fy);
 
     // Centering: pull every node toward the (mass-weighted) centroid — the tree root's centre of
     // mass, which the build has already summed.

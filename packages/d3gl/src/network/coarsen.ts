@@ -12,6 +12,7 @@
  * topological structure built once, feeding both layout seeding here and structural LOD later (N5).
  */
 import { DEFAULT_FORCE, ForceLayout, seedPositions, seedSpacing, type ForceParams, type LayoutGraph } from "./force.js";
+import { edgeSpringUnit, type ModuleSprings } from "./module-springs.js";
 
 /**
  * The graph fields coarsening + multilevel seeding read: node count, a weighted edge list, and the
@@ -24,6 +25,11 @@ export interface CoarsenableGraph {
   target: Uint32Array;
   weight: Float32Array;
   positions: Float32Array;
+  /**
+   * The module links as springs (#455), for the finest level's solve: the refinement (and, in the worker, a
+   * drag reheat) pulls along them as well as along the edges. The coarse levels of the seed ignore them.
+   */
+  moduleSprings?: ModuleSprings;
 }
 
 /** One coarsening level as a weighted, undirected edge list (parallel edges already collapsed). */
@@ -117,14 +123,7 @@ export function seedLevelTicks(n: number, coarsenIterations: number, maxSeedNode
  * count on average. Self-loops are left out (they aggregate to nothing). 1 for a graph without weight.
  */
 export function coarseAttractionScale(graph: CoarseLevel): number {
-  let edges = 0;
-  let weightSum = 0;
-  for (let e = 0; e < graph.source.length; e++) {
-    if (graph.source[e] === graph.target[e]) continue;
-    edges++;
-    weightSum += graph.weight[e] ?? 0;
-  }
-  return weightSum > 0 ? edges / weightSum : 1;
+  return edgeSpringUnit(graph) || 1;
 }
 
 /**
@@ -406,15 +405,17 @@ function prolongate(
   });
 }
 
-/** A {@link CoarsenableGraph}'s own edge list + positions, as the {@link ForceLayout} view. */
+/** A {@link CoarsenableGraph}'s own edge list + positions (and module springs), as the {@link ForceLayout} view. */
 function graphView(graph: CoarsenableGraph): LayoutGraph {
-  return {
+  const view: LayoutGraph = {
     nodeCount: graph.nodeCount,
     edgeCount: graph.source.length,
     source: graph.source,
     target: graph.target,
     positions: graph.positions,
   };
+  if (graph.moduleSprings) view.moduleSprings = graph.moduleSprings;
+  return view;
 }
 
 /**
