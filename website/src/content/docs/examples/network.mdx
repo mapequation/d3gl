@@ -709,9 +709,11 @@ net.layout({ backend: "gpu", nested: true, warm: true, fit: true });
 ```
 
 - **A warm force layout** (`"force"`, `"worker"`, `"gpu"`, `"auto"`) starts from the current positions:
-  no seed disc, no multilevel seed, at full heat, cooling over `iterations` until it converges. Its first
-  frame is the layout on screen. From a nested map it spreads out to the force model's own scale, which is
-  about three times as wide, and with `fit` the camera follows it as it grows, as it follows any stream.
+  no seed disc, no multilevel seed, at full heat, cooling over `iterations` until it converges. Streamed, it
+  glides as the nested map below does: the engine eases the nodes from where they are toward each frame as it
+  lands. From a nested map it spreads out to the force model's own scale, which is about three times as wide,
+  and with `fit` the camera follows it as it grows, as it follows any stream. With a structure or spatial
+  LOD tree, which a worker streams with the solve's own geometry, its frames are painted as they land.
 - **A warm nested map without a `transition`** streams too, at its natural size (a cold map's root disc),
   centred where the current map is. Its *seed* — every module's children at their current arrangement,
   mapped into their discs — is placed so before any module is solved. The engine then eases the nodes
@@ -723,11 +725,11 @@ net.layout({ backend: "gpu", nested: true, warm: true, fit: true });
   keeping it framed as it goes. From a nested map of the same size (a re-clustering) it keeps its size.
   While the module tree and the solve are being prepared (the tree is built on a worker), the nodes stay
   where they are.
-- **Cost.** A warm force layout's frames are a streamed layout's. Each frame of the nested map's ease is a
-  transition frame (the interpolation, the LOD position pass, the re-emit, and with `fit` the stream's
-  bounding box). It replaces the streamed frame's position copy, and it runs at display rate for the
-  length of the ease. A frame that comes late, because the main thread was busy, moves the ease on by at
-  most 50 ms, so a stall slows the glide instead of skipping part of it.
+- **Cost.** Each frame of the ease is a transition frame (the interpolation, the LOD position pass, the
+  re-emit, and with `fit` the stream's bounding box). It replaces the streamed frame's position copy, and
+  it runs at display rate for the length of the ease; frames after it are ordinary streamed frames. A frame
+  that comes late, because the main thread was busy, moves the ease on by at most 50 ms, so a stall slows
+  the glide instead of skipping part of it.
 
 With a `transition` (below), a warm nested map is computed in one go and then eased to, placed by its
 result. That is the path for a re-clustering whose camera must not follow the stream.

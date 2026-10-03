@@ -8,10 +8,11 @@ import { GlBufferSpy, perfHost } from "../../__tests__/engine-sweep.js";
 import type { ViewTransform } from "../../core/index.js";
 
 /**
- * ENGINE-level per-frame guard for a **followed stream** (#454, AGENTS.md lifecycle §5): a warm nested map
- * streamed without a transition — `layout({ backend: "worker", nested: { warm: true }, fit: true })`, the
- * Navigator's switch to Nested layout — which the engine eases toward frame by frame, from the positions on
- * screen. Each of its frames is a position transition's (the interpolation, the LOD position pass, the
+ * ENGINE-level per-frame guard for a **followed stream** (#454, AGENTS.md lifecycle §5): a warm layout
+ * streamed without a transition, which the engine eases toward frame by frame, from the positions on screen —
+ * a nested map's (`layout({ backend: "worker", nested: { warm: true }, fit: true })`, the Navigator's switch to
+ * Nested layout) and a force layout's (`layout({ backend: "worker", warm: true, fit: true })`, the switch back),
+ * through the one follower they share. Each of its frames is a position transition's (the interpolation, the LOD position pass, the
  * re-emit) plus the stream's fit: the O(nodes) box of the live leaves and the camera, once per frame. It
  * stands in for a **fitted streamed frame** (a worker message's position copy, the full geometry pass, the
  * same box), so it must cost no more than one and re-derive, allocate and upload nothing one doesn't. The
@@ -113,6 +114,9 @@ interface Leg {
 
 let off: Leg;
 let on: Leg;
+/** The same frames, followed on a warm **force** layout's stream (#454: Nested layout switched off). */
+let flatOff: Leg;
+let flatOn: Leg;
 
 beforeAll(async () => {
   const realRaf = globalThis.requestAnimationFrame;
@@ -181,7 +185,8 @@ beforeAll(async () => {
       return moved;
     };
 
-    const leg = async (): Promise<Leg> => {
+    /** The followed stream: a warm nested map's, or a warm force layout's (the same follower, #454). */
+    const leg = async (kind: "nested" | "flat"): Promise<Leg> => {
       const followed: Phase[] = [];
       const replayed: Phase[] = [];
       // A fitted streamed frame: the fit on, as `layout({ fit: true })` sets it, and the repaint a worker message
@@ -193,7 +198,8 @@ beforeAll(async () => {
         let virtual = 0;
         const clock = vi.spyOn(performance, "now").mockImplementation(() => virtual);
         try {
-          net.layout({ backend: "worker", nested: { warm: true, iterations: 1 }, fit: true });
+          if (kind === "nested") net.layout({ backend: "worker", nested: { warm: true, iterations: 1 }, fit: true });
+          else net.layout({ backend: "worker", warm: true, fit: true });
           const prev = a.slice();
           let view: ViewTransform = { k: 1, x: 0, y: 0 };
           const t0 = wallClock();
@@ -243,10 +249,12 @@ beforeAll(async () => {
       return { followed: best(followed), replayed: best(replayed) };
     };
 
-    off = await leg();
+    off = await leg("nested");
+    flatOff = await leg("flat");
     net.lod({}); // the module tree: a registration event (tree + geometry), then the same two phases
     flush();
-    on = await leg();
+    on = await leg("nested");
+    flatOn = await leg("flat");
     net.destroy();
   } finally {
     globalThis.requestAnimationFrame = realRaf;
@@ -256,7 +264,12 @@ beforeAll(async () => {
 }, SETUP_MS);
 
 describe(`network() followed warm stream (#454) — per-frame cost vs a fitted streamed frame at N=${N.toLocaleString()}`, () => {
-  for (const [name, get, ceiling] of [["LOD OFF", () => off, FRAME_MS_OFF], ["LOD ON", () => on, FRAME_MS_ON]] as const) {
+  for (const [name, get, ceiling] of [
+    ["LOD OFF", () => off, FRAME_MS_OFF],
+    ["LOD ON", () => on, FRAME_MS_ON],
+    ["LOD OFF, warm force layout", () => flatOff, FRAME_MS_OFF],
+    ["LOD ON, warm force layout", () => flatOn, FRAME_MS_ON],
+  ] as const) {
     it(`${name}: every timed frame is the ease's, and the streamed frames really upload (non-vacuity)`, () => {
       const { replayed: streamed, followed } = get();
       expect(followed.moved, "a timed frame left the nodes where they were: the ease was not running").toBe(true);
@@ -266,7 +279,7 @@ describe(`network() followed warm stream (#454) — per-frame cost vs a fitted s
 
     it(`${name}: a followed frame re-derives, re-allocates and uploads nothing a fitted streamed frame doesn't`, () => {
       const { replayed: streamed, followed } = get();
-      if (name === "LOD ON") expect(streamed.stylePasses, "non-vacuity: the streamed frames ran no style pass").toBeGreaterThanOrEqual(FRAMES);
+      if (name.startsWith("LOD ON")) expect(streamed.stylePasses, "non-vacuity: the streamed frames ran no style pass").toBeGreaterThanOrEqual(FRAMES);
       expect(followed.stylePasses, "a style pass on a followed frame").toBe(0);
       expect(followed.nodeFill, "nodeFill re-ran on a followed frame").toBe(0);
       expect(followed.created, "GPU buffers created during the followed frames").toBeLessThanOrEqual(streamed.created);
@@ -286,7 +299,7 @@ describe(`network() followed warm stream (#454) — per-frame cost vs a fitted s
       console.log(msg);
       // ON the followed frame skips the style pass (the transition guard measures a transition frame at
       // 0.4-0.6× a streamed one); OFF it adds the interpolation to the same re-emit, box and upload.
-      if (name === "LOD ON") expect(followed.medianMs, msg).toBeLessThanOrEqual(streamed.medianMs * 0.8 + 1);
+      if (name.startsWith("LOD ON")) expect(followed.medianMs, msg).toBeLessThanOrEqual(streamed.medianMs * 0.8 + 1);
       else expect(followed.medianMs, msg).toBeLessThanOrEqual(streamed.medianMs * 1.5 + 2);
       expect(followed.medianMs, msg).toBeLessThan(ceiling);
     });
