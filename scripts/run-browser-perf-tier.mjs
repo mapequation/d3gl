@@ -26,18 +26,19 @@
 // file that exceeds it is killed and FAILS the tier — the pattern-level guard against
 // hangs and order-of-magnitude regressions that dodge the in-test ceilings.
 //
-// SHARDS (#460): CI runs the tier as parallel jobs, one per shard of SHARDS below, each with
-// its own 30-minute timeout, plus an aggregate `perf-browser` check that passes only when
-// every shard does. A shard groups guards of one kind. A file goes to the FIRST shard whose
-// pattern matches its repo-relative path, so it runs in exactly one shard. `--plan` (the CI
-// matrix's source) fails when a perf file matches no shard, or a shard matches no file, so a
-// guard can't silently drop out of CI. A new guard in an existing directory usually lands in
-// a shard by its name; one in a new directory fails the plan until it gets a shard.
+// SHARDS (#460): CI runs the tier as jobs, one per shard of SHARDS below, each with its own
+// 30-minute timeout, plus an aggregate `perf-browser` check that passes only when every shard
+// does. A shard groups guards of one kind. A file goes to the FIRST shard whose pattern matches
+// its repo-relative path, so it runs in exactly one shard. The shards run in parallel, except a
+// `solo` shard, which runs after them, alone (see its entry). `--plan` (the CI matrix's source)
+// fails when a perf file matches no shard, or a shard matches no file, so a guard can't
+// silently drop out of CI. A new guard in an existing directory usually lands in a shard by its
+// name; one in a new directory fails the plan until it gets a shard.
 //
 // Usage:
 //   node scripts/run-browser-perf-tier.mjs                     # every guard, local (scale 1)
 //   node scripts/run-browser-perf-tier.mjs --shard=nested      # one shard
-//   node scripts/run-browser-perf-tier.mjs --plan              # shard → files; `shards=<json>` on stdout
+//   node scripts/run-browser-perf-tier.mjs --plan              # shard → files; `shards=` and `solo=` <json> on stdout
 //   PERF_BUDGET_SCALE=4 PERF_BROWSER_N=100000 node scripts/run-browser-perf-tier.mjs --shard=<name>  # a CI job
 import { spawnSync } from "node:child_process";
 import { appendFileSync, existsSync, readdirSync, statSync } from "node:fs";
@@ -60,12 +61,13 @@ const PERF_FILE_RE = /(^|-)perf\.browser\.test\.tsx?$/;
 
 /**
  * The CI shards, by kind (#460). First match wins, so order matters: "nested" comes before
- * "gpu-layout", which would otherwise take the GPU nested guards. Balanced by measured CI time
- * (2026-10-03, ubuntu-latest, PERF_BROWSER_N=100000, guards only, about 40 s of job setup on
- * top): gpu-layout 6.6 min, nested 7.6, transitions 3.6, engines 6.5. Open PRs then add the
- * live-layout follow guard to transitions (#457, 1.5-4.7 min) and the spatial LOD cold start to
- * engines (#449, about 2 min).
- * `match` runs on the repo-relative path with forward slashes.
+ * "gpu-layout", which would otherwise take the GPU nested guards. Measured CI time (2026-10-03,
+ * ubuntu-latest, PERF_BROWSER_N=100000, guards only, about 40 s of job setup on top), across
+ * runs: gpu-layout 6.5-9.7 min, nested 7.6-10.2, engines 3.9-6.9, transitions 3.6 alone. Open
+ * PRs then add the live-layout follow guard to transitions (#457, 1.5-4.7 min) and the spatial
+ * LOD cold start to engines (#449, about 2 min).
+ * `match` runs on the repo-relative path with forward slashes. `solo: true` makes CI run the
+ * shard after the parallel shards have finished, alone.
  */
 const SHARDS = [
   {
@@ -81,6 +83,12 @@ const SHARDS = [
   {
     name: "transitions",
     title: "network() position transitions and live-layout following, on WebGL",
+    // Solo: network-transition-perf took 209 and 214 s on CI running alone, and 300+, 300+ and
+    // 307 s (one ratio failure) running beside the other shards, killed twice by the 300 s
+    // per-file watchdog. Likely why: its frames are stepped by hand, with no animation frame to
+    // pace SwiftShader, so the GPU work piles up as one backlog and competes with the other
+    // jobs' software GL. The follow guard (#457) steps its frames the same way.
+    solo: true,
     // The Canvas/SVG transition guard (network-vector-transition) runs in "engines", for balance.
     match: /\/network\/__tests__\/network-(?!vector-)(?:[a-z0-9-]*-)?(?:transition|follow|fit-stream)-perf\.browser\.test\.tsx?$/,
   },
@@ -143,12 +151,13 @@ if (args.includes("--plan")) {
   // the `shards=<json>` line for $GITHUB_OUTPUT.
   for (const s of SHARDS) {
     const files = guards.filter((g) => g.shard === s.name);
-    console.error(`${s.name} (${files.length}): ${s.title}`);
+    console.error(`${s.name}${s.solo ? " [solo]" : ""} (${files.length}): ${s.title}`);
     for (const g of files) console.error(`  ${relative(root, g.file)}`);
   }
   for (const p of shardProblems) console.error(`browser perf tier: ${p}`);
   if (shardProblems.length > 0) process.exit(1);
-  console.log(`shards=${JSON.stringify(SHARDS.map((s) => s.name))}`);
+  console.log(`shards=${JSON.stringify(SHARDS.filter((s) => !s.solo).map((s) => s.name))}`);
+  console.log(`solo=${JSON.stringify(SHARDS.filter((s) => s.solo).map((s) => s.name))}`);
   process.exit(0);
 }
 

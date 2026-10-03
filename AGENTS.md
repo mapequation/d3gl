@@ -352,7 +352,9 @@ git -C <primary> checkout -- <files>                         # restore primary t
   name new browser perf guards accordingly. **CI runs it sharded by kind** (#460): the `SHARDS`
   table in that script (`nested`, `gpu-layout`, `transitions`, `engines`) gives each guard to the
   first shard whose pattern matches its path, one job runs each shard with its own 30-minute
-  timeout, and the aggregate `perf-browser` check passes only when every shard does. The
+  timeout, and the aggregate `perf-browser` check passes only when every shard does. A `solo`
+  shard (`transitions`) runs after the parallel ones, alone: `network-transition-perf` took
+  209-214 s alone but 300+ s beside the other shards, past the 300 s per-file watchdog. The
   `perf-browser / plan` job fails when a guard matches no shard (a new directory) or a shard matches
   no guard, so check `node scripts/run-browser-perf-tier.mjs --plan` when you add a guard, and put a
   long one in the shard with the most room: one job ran every guard in series and hit its

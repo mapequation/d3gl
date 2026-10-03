@@ -80,16 +80,18 @@ jobs:
   # SHARDED as of #460: one job ran every guard in series, and by 2026-10 it took 29-30 minutes
   # against its 30-minute timeout (the runners got 1.5-2x slower per file). Now `plan` reads the
   # shard table in scripts/run-browser-perf-tier.mjs and fails when a guard matches no shard (or a
-  # shard no guard), one job per shard runs its guards with its own timeout, and `perf-browser`
-  # passes only when the plan and every shard passed. Add "perf-browser" (the aggregate) to the
-  # required status checks alongside "policy" to complete the promotion; the shard jobs' names
-  # follow the shard table and need not be listed.
+  # shard no guard). One job per shard runs its guards with its own timeout: the parallel shards
+  # first, then each `solo` shard alone (a guard that slowed past the per-file watchdog beside the
+  # other shards; see the table). `perf-browser` passes only when the plan and every shard passed.
+  # Add "perf-browser" (the aggregate) to the required status checks alongside "policy" to complete
+  # the promotion; the shard jobs' names follow the shard table and need not be listed.
   perf-browser-plan:
     name: perf-browser / plan
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
       shards: ${{ steps.plan.outputs.shards }}
+      solo: ${{ steps.plan.outputs.solo }}
     steps:
       - uses: actions/checkout@v6
 
@@ -148,10 +150,48 @@ jobs:
           # `perfN(local, { max })`.
           PERF_BROWSER_N: "100000"
 
+  # A solo shard starts once every parallel shard has finished (passed or not), so it runs alone.
+  perf-browser-solo:
+    name: perf-browser / ${{ matrix.shard }}
+    needs: [perf-browser-plan, perf-browser-shard]
+    if: ${{ !cancelled() && needs.perf-browser-plan.result == 'success' && needs.perf-browser-plan.outputs.solo != '[]' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      # One at a time: alone is the point.
+      max-parallel: 1
+      matrix:
+        shard: ${{ fromJSON(needs.perf-browser-plan.outputs.solo) }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v6
+
+      - name: Set up Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Install Playwright Chromium
+        run: pnpm --filter @mapequation/d3gl exec playwright install --with-deps chromium
+
+      - name: Browser perf guards, shard ${{ matrix.shard }} (headless Chromium, software GL)
+        run: node scripts/run-browser-perf-tier.mjs --shard=${{ matrix.shard }}
+        env:
+          # As in perf-browser-shard.
+          PERF_BUDGET_SCALE: "4"
+          PERF_BROWSER_N: "100000"
+
   # The tier's single status check: green only when the plan and every shard are green (a
   # skipped or cancelled shard fails it too).
   perf-browser:
-    needs: [perf-browser-plan, perf-browser-shard]
+    needs: [perf-browser-plan, perf-browser-shard, perf-browser-solo]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -160,6 +200,10 @@ jobs:
         env:
           PLAN: ${{ needs.perf-browser-plan.result }}
           SHARDS: ${{ needs.perf-browser-shard.result }}
+          SOLO: ${{ needs.perf-browser-solo.result }}
+          HAS_SOLO: ${{ needs.perf-browser-plan.outputs.solo != '[]' }}
         run: |
-          echo "plan: $PLAN, shards: $SHARDS"
+          echo "plan: $PLAN, parallel shards: $SHARDS, solo shards: $SOLO (any: $HAS_SOLO)"
           test "$PLAN" = success && test "$SHARDS" = success
+          # With no solo shard in the table the solo job is skipped by design.
+          if [ "$HAS_SOLO" = true ]; then test "$SOLO" = success; fi
