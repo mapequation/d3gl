@@ -80,10 +80,14 @@ describe("InstancedPie per-frame cost (#171)", () => {
       device.submit();
     };
 
-    const FRAMES = 40;
+    // 8 frames over the same zoom range as the former 40 (k 1 → 4.9). The timed window measures the CPU
+    // side only: under SwiftShader each frame's instanced draw is about 0.9 s of GPU work at 100k, drained
+    // after the test ends. 40 frames left about 26 s of it to the tier and asserted nothing more: a
+    // per-frame rebuild creates a buffer on the first frame, and costs CPU time on every frame.
+    const FRAMES = 8;
     const t0 = performance.now();
     for (let f = 0; f < FRAMES; f++) {
-      const k = 1 + f * 0.1; // zoom-in sweep
+      const k = 1 + (f * 3.9) / (FRAMES - 1); // zoom-in sweep
       pie.setTransform(clipFromView({ k, x: -k * 40, y: -k * 40 }, size, size));
       draw();
     }

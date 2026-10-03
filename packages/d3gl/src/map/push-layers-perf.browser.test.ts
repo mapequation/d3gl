@@ -39,6 +39,15 @@ const H = 600;
 const CELLS = perfN(20_000, { max: 120_000 });
 /** A tiny second layer that opts into `hideOnInteraction`, so a gesture boundary re-pushes. */
 const MARKS = 50;
+/**
+ * The clip source of the `setClip` pushes: one small polygon, wound clockwise in [lon, lat]. Not
+ * "cells": on Canvas the first `ctx.clip` of a silhouette built from every cell grows
+ * super-linearly with the cell count (27 s of a 28 s leg at 100k, #461). This guard doesn't time
+ * that, and a `setClip` to any layer pushes every layer just the same.
+ */
+const MASK: GeoJSON.Feature[] = [
+  { type: "Feature", properties: {}, geometry: { type: "Polygon", coordinates: [[[-10, -10], [-10, 10], [10, 10], [10, -10], [-10, -10]]] } },
+];
 
 /**
  * Secondary sanity bound for one gesture-end push (setLayers + full Canvas repaint of every
@@ -134,6 +143,7 @@ describe(`pushLayers() reuses the retained vector view (#280) — ${CELLS} polyg
       await map.whenReady();
       map.layer("cells", makeCells(CELLS), { fill: "rgb(200,60,60)", id: (_d, i) => i, pickable: false });
       map.layer("marks", marks(MARKS), { fill: "rgb(20,20,220)", pointRadius: 3, id: (_d, i) => i, hideOnInteraction: true });
+      map.layer("mask", MASK, { fill: "rgba(0,0,0,0)", id: (_d, i) => i, pickable: false });
 
       // Watch AFTER registration: registration itself legitimately materializes each layer once.
       const baseline = map.sceneView.drawables("cells");
@@ -144,7 +154,7 @@ describe(`pushLayers() reuses the retained vector view (#280) — ${CELLS} polyg
         map.gesture(true); // d3-zoom "start" → pushLayers (a hideOnInteraction layer is present)
         map.gesture(false); // "end" → pushLayers
       }
-      map.setClip("marks", "cells"); // → pushLayers
+      map.setClip("marks", "mask"); // → pushLayers (of every layer, "cells" included)
       map.setClip("marks", undefined); // → pushLayers
 
       // Non-vacuity: the pushes really did read the full view (6 pushes; "marks" drops out of

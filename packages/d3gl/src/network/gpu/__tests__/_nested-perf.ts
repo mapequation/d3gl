@@ -3,10 +3,10 @@
  * Infomap-shaped map, a Zipf module), the GL call log and its checks, the stream leg through the real
  * trigger, the GPU-only rate and the per-animation-frame timer. The guards are split across files so each
  * stays within the browser perf tier's 300 s per file: `gpu-nested-perf.browser.test.ts` (the
- * Infomap-shaped stream, LOD off and on; the per-tick signatures; the Zipf module's collision plan),
- * `gpu-nested-zipf-perf.browser.test.ts` (the Zipf module's stream), `gpu-nested-warm-perf.browser.test.ts`
- * (the warm re-layout with a transition on `"auto"`) and `gpu-nested-interaction-perf.browser.test.ts` (a
- * node drag and a zoom sweep while the solve runs). See `gpu-nested-perf.browser.test.ts` for what they pin.
+ * Infomap-shaped stream, LOD off and on; the per-tick signatures), `gpu-nested-plan-perf.browser.test.ts`
+ * (the Zipf module's collision plan), `gpu-nested-zipf-perf.browser.test.ts` (the Zipf module's stream),
+ * `gpu-nested-warm-perf.browser.test.ts` (the warm re-layout with a transition on `"auto"`) and
+ * `gpu-nested-interaction-perf.browser.test.ts` (a node drag and a zoom sweep while the solve runs). See `gpu-nested-perf.browser.test.ts` for what they pin.
  */
 import { expect, vi } from "vitest";
 import { WebGLDevice } from "@luma.gl/webgl";
@@ -28,8 +28,8 @@ export const LOCAL_N = 20_000; // the leaves the fixture defaults to (the ceilin
 // its exact loop); real-GPU runs at 325k / 1M go through PERF_BROWSER_N by hand.
 export const N = perfN(LOCAL_N, { max: 1_000_000 });
 /**
- * Children of the Zipf module of the #380 legs (`gpu-nested-zipf-perf.browser.test.ts` and the plan legs
- * of `gpu-nested-perf.browser.test.ts`). Capped at 60,000 children, for two reasons measured at CI's 100k
+ * Children of the Zipf module of the #380 legs (`gpu-nested-zipf-perf.browser.test.ts` and
+ * `gpu-nested-plan-perf.browser.test.ts`). Capped at 60,000 children, for two reasons measured at CI's 100k
  * on SwiftShader. The stream leg alone took 270 s (137 s at 60,000), and the tier gives a file 300 s. And
  * this fixture's layout piles more than 12 discs into a sub-cell at the first compact steps, so the exact
  * fallback runs (#380 D3, 9,503 slots at the first compact step), which the pair-work test rejects.

@@ -26,10 +26,11 @@
  *   the springs' own. Through the real trigger the stream legs count the submits per item and per copy.
  * - **A module of very uneven child sizes** (#380; a single-scale grid made its gather quadratic, 157 ms
  *   frames at 60,000 children): the same per-frame bounds and signatures through the real trigger (in
- *   `gpu-nested-zipf-perf.browser.test.ts`, a file of its own for the tier's 300 s per file), a
- *   collision step's pair work within 3× of the collision plan's estimate with no slot on the exact
- *   fallback, and the gather cut into bands of equal estimated work (the frame budget admits a band by its
- *   share of the estimate; bands of equal rows put the big module's work in the first).
+ *   `gpu-nested-zipf-perf.browser.test.ts`, a file of its own for the tier's 300 s per file), and in
+ *   `gpu-nested-plan-perf.browser.test.ts` (likewise) a collision step's pair work within 3× of the
+ *   collision plan's estimate with no slot on the exact fallback, and the gather cut into bands of equal
+ *   estimated work (the frame budget admits a band by its share of the estimate; bands of equal rows put
+ *   the big module's work in the first).
  *
  * The **warm re-layout with a transition** on `"auto"` (#375) has its own file,
  * `gpu-nested-warm-perf.browser.test.ts`, as the Zipf module's stream has.
@@ -53,10 +54,8 @@ import { perfHost } from "../../../__tests__/engine-sweep.js";
 import {
   GlCallLog,
   H,
-  ITERATIONS,
   N,
   W,
-  ZIPF_BIG,
   assertSignatures,
   gpuOnlyRate,
   infomapLike,
@@ -210,79 +209,5 @@ describe("GPU nested solve work items (#402)", () => {
     // Compact: P always encodes (the reductions, the cells); the swap nothing.
     for (const n of passes("compact, step 2", "P")) expect(n).toBeGreaterThan(3);
     expect(passes("compact, step 2", "I")).toEqual([0, 0]);
-  });
-});
-
-describe("GPU nested solve on a module of very uneven child sizes: the collision plan (#380)", () => {
-  const BIG = ZIPF_BIG;
-  let fixture: { graph: NetworkGraph; modules: ModuleNode[] };
-  let device: Device;
-
-  beforeAll(async () => {
-    fixture = zipfLike(BIG);
-    device = await makeTestDevice();
-  });
-
-  it("a collision step's pair work stays within 3× of the collision plan's estimate, with no slot on the exact fallback", () => {
-    const solver = solverOf(fixture, ITERATIONS);
-    const layout = new GpuNestedLayout(device, nestedLayoutPlan(solver), { collisionStats: true });
-    try {
-      layout.runTicks(Math.ceil(0.6 * ITERATIONS));
-      const ratios: number[] = [];
-      while (layout.ticks < ITERATIONS) {
-        layout.beginTick();
-        const stats = layout.collisionStats();
-        let work = 0;
-        let overflow = 0;
-        for (let i = 0; i < solver.slotCount; i++) {
-          work += 16 * (stats[4 * i] ?? 0) + (stats[4 * i + 1] ?? 0);
-          if (stats[4 * i + 3] === 2) overflow++;
-        }
-        expect(overflow, `tick ${layout.ticks}: slots sent to the exact fallback`).toBe(0);
-        ratios.push(work / solver.collision.gatherWork);
-        layout.forceBand(0, 1);
-        layout.integrate();
-      }
-      console.log(`  Zipf ${BIG}: pair work per collision step / plan estimate: ${Math.min(...ratios).toFixed(2)}-${Math.max(...ratios).toFixed(2)} (single-scale grid at 60,000 children: 36)`);
-      expect(Math.max(...ratios)).toBeLessThan(3);
-    } finally {
-      layout.destroy();
-    }
-  }, perfBudget(300_000));
-
-  it("cuts the gather into bands of equal estimated work, which rows alone would not", () => {
-    // The frame budget admits a band by its share of the gather's estimate; a band must carry that share.
-    // Rows alone would not: the big module's slots sit in the first rows.
-    const solver = solverOf(fixture, ITERATIONS);
-    const layout = new GpuNestedLayout(device, nestedLayoutPlan(solver));
-    try {
-      const width = Math.max(1, Math.ceil(Math.sqrt(solver.slotCount)));
-      const rows = Math.ceil(solver.slotCount / width);
-      const rowWork = (r0: number, r1: number): number => {
-        let w = 0;
-        for (let i = r0 * width; i < Math.min(solver.slotCount, r1 * width); i++) w += (solver.collision.slotWork[i] ?? 0) + 16;
-        return w;
-      };
-      const total = rowWork(0, rows);
-      let widestRow = 0;
-      for (let r = 0; r < rows; r++) widestRow = Math.max(widestRow, rowWork(r, r + 1));
-      for (const bands of [2, 4, 8]) {
-        let next = 0;
-        const shares: string[] = [];
-        for (let b = 0; b < bands; b++) {
-          const [r0, r1] = layout.gatherBandRows(b, bands);
-          expect(r0).toBe(next);
-          next = r1;
-          const share = rowWork(r0, r1) / total;
-          shares.push(share.toFixed(3));
-          expect(share, `band ${b} of ${bands}`).toBeLessThanOrEqual(1 / bands + widestRow / total);
-        }
-        expect(next).toBe(rows);
-        const firstEqualRows = rowWork(0, Math.floor(rows / bands)) / total;
-        console.log(`  Zipf ${BIG}, ${bands} bands: work shares ${shares.join(" / ")} (the first of ${bands} equal-row bands: ${firstEqualRows.toFixed(3)})`);
-      }
-    } finally {
-      layout.destroy();
-    }
   });
 });

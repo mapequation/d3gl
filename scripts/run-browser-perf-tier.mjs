@@ -26,11 +26,22 @@
 // file that exceeds it is killed and FAILS the tier — the pattern-level guard against
 // hangs and order-of-magnitude regressions that dodge the in-test ceilings.
 //
+// SHARDS (#460): CI runs the tier as jobs, one per shard of SHARDS below, each with its own
+// 30-minute timeout, plus an aggregate `perf-browser` check that passes only when every shard
+// does. A shard groups guards of one kind. A file goes to the FIRST shard whose pattern matches
+// its repo-relative path, so it runs in exactly one shard. The shards run in parallel, except a
+// `solo` shard, which runs after them, alone (see its entry). `--plan` (the CI matrix's source)
+// fails when a perf file matches no shard, or a shard matches no file, so a guard can't
+// silently drop out of CI. A new guard in an existing directory usually lands in a shard by its
+// name; one in a new directory fails the plan until it gets a shard.
+//
 // Usage:
-//   node scripts/run-browser-perf-tier.mjs                     # local (scale 1)
-//   PERF_BUDGET_SCALE=8 node scripts/run-browser-perf-tier.mjs # the CI invocation
+//   node scripts/run-browser-perf-tier.mjs                     # every guard, local (scale 1)
+//   node scripts/run-browser-perf-tier.mjs --shard=nested      # one shard
+//   node scripts/run-browser-perf-tier.mjs --plan              # shard → files; `shards=` and `solo=` <json> on stdout
+//   PERF_BUDGET_SCALE=4 PERF_BROWSER_N=100000 node scripts/run-browser-perf-tier.mjs --shard=<name>  # a CI job
 import { spawnSync } from "node:child_process";
-import { existsSync, readdirSync, statSync } from "node:fs";
+import { appendFileSync, existsSync, readdirSync, statSync } from "node:fs";
 import { join, dirname, relative } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -47,6 +58,49 @@ const BROWSER_N = process.env.PERF_BROWSER_N ?? "";
 // The browser perf-guard naming convention: `<name>-perf.browser.test.ts(x)` or a
 // bare `perf.browser.test.ts(x)`.
 const PERF_FILE_RE = /(^|-)perf\.browser\.test\.tsx?$/;
+
+/**
+ * The CI shards, by kind (#460). First match wins, so order matters: "nested" comes before
+ * "gpu-layout", which would otherwise take the GPU nested guards. Measured CI time (2026-10-03,
+ * ubuntu-latest, PERF_BROWSER_N=100000, guards only, about 40 s of job setup on top), across
+ * runs: gpu-layout 6.5-9.7 min, nested 7.6-10.2, engines 3.9-6.9, transitions 3.6 alone. Open
+ * PRs then add the live-layout follow guard to transitions (#457, 1.5-4.7 min) and the spatial
+ * LOD cold start to engines (#449, about 2 min).
+ * `match` runs on the repo-relative path with forward slashes. `solo: true` makes CI run the
+ * shard after the parallel shards have finished, alone.
+ */
+const SHARDS = [
+  {
+    name: "nested",
+    title: "Nested layouts: the GPU nested solve, its warm re-layout and interaction; the nested drag",
+    match: /\/network\/(?:gpu\/)?__tests__\/(?:gpu|network)-nested-[^/]*$/,
+  },
+  {
+    name: "gpu-layout",
+    title: "GPU force layout: streaming, LOD relay, startup compile, frame budget, readback",
+    match: /\/network\/gpu\/__tests__\/[^/]*$/,
+  },
+  {
+    name: "transitions",
+    title: "network() position transitions and live-layout following, on WebGL",
+    // Solo: network-transition-perf took 209 and 214 s on CI running alone, and 300+, 300+ and
+    // 307 s (one ratio failure) running beside the other shards, killed twice by the 300 s
+    // per-file watchdog. Likely why: its frames are stepped by hand, with no animation frame to
+    // pace SwiftShader, so the GPU work piles up as one backlog and competes with the other
+    // jobs' software GL. The follow guard (#457) steps its frames the same way.
+    solo: true,
+    // The Canvas/SVG transition guard (network-vector-transition) runs in "engines", for balance.
+    match: /\/network\/__tests__\/network-(?!vector-)(?:[a-z0-9-]*-)?(?:transition|follow|fit-stream)-perf\.browser\.test\.tsx?$/,
+  },
+  {
+    name: "engines",
+    title: "network() LOD, zoom and interaction, and the Canvas/SVG network; map, WebGL and React backends",
+    match: /\/(?:network\/__tests__|(?:map|webgl|react)(?:\/__tests__)?)\/[^/]*$/,
+  },
+];
+
+/** The shard a guard runs in: the first whose pattern matches it, or undefined. */
+const shardOf = (rel) => SHARDS.find((s) => s.match.test(`/${rel.split("\\").join("/")}`));
 
 /** Recursively collect browser perf-guard files (node benches run in their own tier). */
 function perfFiles(dir) {
@@ -80,16 +134,59 @@ if (guards.length === 0) {
   process.exit(1);
 }
 
+// ---- shards: every guard to the first shard that matches it ---------------------------
+for (const g of guards) g.shard = shardOf(relative(root, g.file))?.name;
+const unassigned = guards.filter((g) => g.shard === undefined).map((g) => relative(root, g.file));
+const empty = SHARDS.filter((s) => !guards.some((g) => g.shard === s.name)).map((s) => s.name);
+const shardProblems = [
+  ...unassigned.map((rel) => `${rel} matches no shard: add it to a pattern in SHARDS (scripts/run-browser-perf-tier.mjs)`),
+  ...empty.map((name) => `shard "${name}" matches no guard: its pattern is stale`),
+];
+
+const args = process.argv.slice(2);
+const shardArg = args.find((a) => a.startsWith("--shard="))?.slice("--shard=".length);
+
+if (args.includes("--plan")) {
+  // The CI matrix's source of truth. The table goes to stderr (the job log); stdout carries only
+  // the `shards=<json>` line for $GITHUB_OUTPUT.
+  for (const s of SHARDS) {
+    const files = guards.filter((g) => g.shard === s.name);
+    console.error(`${s.name}${s.solo ? " [solo]" : ""} (${files.length}): ${s.title}`);
+    for (const g of files) console.error(`  ${relative(root, g.file)}`);
+  }
+  for (const p of shardProblems) console.error(`browser perf tier: ${p}`);
+  if (shardProblems.length > 0) process.exit(1);
+  console.log(`shards=${JSON.stringify(SHARDS.filter((s) => !s.solo).map((s) => s.name))}`);
+  console.log(`solo=${JSON.stringify(SHARDS.filter((s) => s.solo).map((s) => s.name))}`);
+  process.exit(0);
+}
+
+let selected = guards;
+if (shardArg !== undefined) {
+  if (!SHARDS.some((s) => s.name === shardArg)) {
+    console.error(`browser perf tier: no shard "${shardArg}" (shards: ${SHARDS.map((s) => s.name).join(", ")})`);
+    process.exit(1);
+  }
+  selected = guards.filter((g) => g.shard === shardArg);
+  if (selected.length === 0) {
+    console.error(`browser perf tier: shard "${shardArg}" matches no guard — its pattern is stale`);
+    process.exit(1);
+  }
+} else {
+  // A full local run still runs every guard; the plan step is CI's gate for these.
+  for (const p of shardProblems) console.warn(`browser perf tier: warning: ${p}`);
+}
+
 console.log(
-  `browser perf tier: ${guards.length} guard file(s), PERF_BUDGET_SCALE=${SCALE}, ` +
+  `browser perf tier${shardArg ? ` [shard ${shardArg}]` : ""}: ${selected.length} guard file(s), PERF_BUDGET_SCALE=${SCALE}, ` +
     `PERF_BROWSER_N=${BROWSER_N || "(guard defaults)"}, budget ${FILE_BUDGET_MS}ms/file`,
 );
-for (const { file } of guards) console.log(`  ${relative(root, file)}`);
+for (const { file } of selected) console.log(`  ${relative(root, file)}`);
 
 // ---- run each file through its package's watchdog runner, timed ---------------------
 const env = { ...process.env, PERF_BUDGET_SCALE: SCALE, PERF_BROWSER_N: BROWSER_N };
 const results = [];
-for (const { pkgDir, file } of guards) {
+for (const { pkgDir, file } of selected) {
   const watchdog = join(pkgDir, "scripts", "run-browser-tests.mjs");
   const rel = relative(root, file);
   console.log(`\n=== ${rel} ===`);
@@ -117,11 +214,20 @@ for (const { pkgDir, file } of guards) {
 }
 
 // ---- summary -------------------------------------------------------------------------
-console.log("\nbrowser perf tier summary");
+console.log(`\nbrowser perf tier summary${shardArg ? ` [shard ${shardArg}]` : ""}`);
 let failed = false;
+const rows = [];
 for (const { rel, ms, ok, timedOut } of results) {
   const state = ok ? "PASS" : timedOut ? `FAIL (killed at ${FILE_BUDGET_MS}ms budget)` : "FAIL";
   if (!ok) failed = true;
   console.log(`  ${state.padEnd(6)} ${(ms / 1000).toFixed(1).padStart(7)}s  ${rel}`);
+  rows.push(`| ${state} | ${(ms / 1000).toFixed(1)} s | \`${rel.replace(/^packages\/d3gl\/src\//, "")}\` |`);
+}
+const totalS = results.reduce((sum, r) => sum + r.ms, 0) / 1000;
+console.log(`  total ${totalS.toFixed(1)}s over ${results.length} file(s)`);
+// On GitHub Actions, the same table on the job's summary page.
+if (process.env.GITHUB_STEP_SUMMARY) {
+  const heading = `### Browser perf tier${shardArg ? `: ${shardArg}` : ""} (${totalS.toFixed(0)} s, ${results.length} files)`;
+  appendFileSync(process.env.GITHUB_STEP_SUMMARY, [heading, "", "| result | time | file |", "|---|---|---|", ...rows, ""].join("\n") + "\n");
 }
 process.exit(failed ? 1 : 0);
