@@ -120,6 +120,8 @@ const xy = (g: NetworkGraph, i: number): [number, number] => [g.positions[i * 2]
 const ids = (net: Network) => net.selection().map((s) => Number(s.id)).sort((a, b) => a - b);
 /** Let d3-zoom's wheel-idle timer (150 ms) end its gesture before the engine is torn down. */
 const wheelIdle = () => new Promise<void>((resolve) => setTimeout(resolve, 200));
+/** One animation frame: the engine draws coalesced pan/zoom and drag input there (#367). */
+const nextFrame = () => new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
 /** Outlast d3-zoom's 250 ms dblclick zoom transition. */
 const dblclickDone = () => new Promise<void>((resolve) => setTimeout(resolve, 400));
 function dblclick(h: HTMLElement, x: number, y: number, mods: EventModifierInit = {}): void {
@@ -192,6 +194,43 @@ describe("force-pan modifier (#178)", () => {
       });
     }
 
+    // The gate runs ahead of every node-drag path, so no layout backend or LOD state can turn a force-pan
+    // press into a grab: the reheating main-thread `force` layout, and an LOD frontier (a leaf or a module
+    // aggregate). The `worker`/`gpu`/`auto` drags start from the same `beginNodeDrag`, which a force-pan
+    // press never reaches (it is not even hit-tested). A plain drag on the same node still grabs it.
+    for (const path of ["force", "lod"] as const) {
+      it(`${label(modifier)}-drag over a node pans on the ${path} drag path too, and a plain drag there still grabs`, async () => {
+        const h = host();
+        const net = new NetworkProbe(h, modifier);
+        await net.whenReady();
+        const g = buildGraph({ nodeCount: 3, source: [0, 1], target: [1, 2], directed: false });
+        net.data(g).style({ nodeRadius: 8 });
+        if (path === "force") net.layout({ backend: "force" });
+        else net.layout({ backend: "positions", positions: new Float32Array([40, 40, 100, 100, 160, 160]) }).lod({});
+        // Put node 0 at the host's centre, whatever the layout made of it.
+        const [x0, y0] = xy(g, 0);
+        net.setTransform({ k: 1, x: 100 - x0, y: 100 - y0 });
+        net.enableZoom([0.2, 8]);
+        net.interactive({ draggable: true, selectable: { multi: true } });
+        const before = Float32Array.from(g.positions);
+        const t0 = net.viewTransform();
+        net.resetCounters();
+        gesture(h, [[100, 100], [80, 90], [60, 80]], held(modifier));
+        await nextFrame();
+        expect(net.viewTransform()).toEqual({ k: 1, x: t0.x - 40, y: t0.y - 20 }); // panned by the drag
+        expect(Array.from(g.positions)).toEqual(Array.from(before)); // nothing grabbed, nothing reheated
+        expect(net.draggablePicks).toBe(0);
+        // Control: a plain drag from node 0's new screen position grabs it.
+        gesture(h, [[60, 80], [90, 90]]);
+        await nextFrame();
+        await nextFrame();
+        expect(net.draggablePicks).toBeGreaterThan(0);
+        expect(xy(g, 0)).not.toEqual([x0, y0]);
+        net.destroy();
+        h.remove();
+      });
+    }
+
     it(`plain drag is unchanged (${label(modifier)} platform): on a node it grabs, on empty space it pans`, async () => {
       const { h, net, g } = await setup(modifier);
       gesture(h, [[40, 40], [90, 70]]); // plain drag on node 0 → the node follows, the view stays
@@ -214,10 +253,11 @@ describe("force-pan modifier (#178)", () => {
         const mods = i % 2 ? held(modifier) : {};
         h.dispatchEvent(new WheelEvent("wheel", { clientX: r.left + 40, clientY: r.top + 40, deltaY: -30, bubbles: true, cancelable: true, ...mods }));
       }
+      // The ticks draw in the engine's next frame (#367), and the wheel gesture ends after d3-zoom's idle.
+      await wheelIdle();
       expect(net.viewTransform().k).toBeGreaterThan(1); // the sweep really zoomed (over node 0)
       expect(net.draggablePicks).toBe(0);
       // Control: a plain press on the node does hit-test — the counter sees the gate.
-      await wheelIdle();
       gesture(h, [[40, 40]]);
       expect(net.draggablePicks).toBeGreaterThan(0);
       net.destroy();
