@@ -60,9 +60,11 @@ const PERF_FILE_RE = /(^|-)perf\.browser\.test\.tsx?$/;
 
 /**
  * The CI shards, by kind (#460). First match wins, so order matters: "nested" comes before
- * "gpu-layout", which would otherwise take the GPU nested guards. Balanced by measured CI
- * time (2026-10-03, ubuntu-latest, PERF_BROWSER_N=100000): gpu-layout about 8.5 min,
- * nested 7.5, transitions 6.5, engines 3.5.
+ * "gpu-layout", which would otherwise take the GPU nested guards. Balanced by measured CI time
+ * (2026-10-03, ubuntu-latest, PERF_BROWSER_N=100000, guards only, about 40 s of job setup on
+ * top): gpu-layout 6.6 min, nested 7.6, transitions 3.6, engines 6.5. Open PRs then add the
+ * live-layout follow guard to transitions (#457, 1.5-4.7 min) and the spatial LOD cold start to
+ * engines (#449, about 2 min).
  * `match` runs on the repo-relative path with forward slashes.
  */
 const SHARDS = [
@@ -78,12 +80,13 @@ const SHARDS = [
   },
   {
     name: "transitions",
-    title: "network() position transitions and live-layout following, on WebGL, Canvas and SVG",
-    match: /\/network\/__tests__\/network-(?:[a-z0-9-]*-)?(?:transition|follow|fit-stream)-perf\.browser\.test\.tsx?$/,
+    title: "network() position transitions and live-layout following, on WebGL",
+    // The Canvas/SVG transition guard (network-vector-transition) runs in "engines", for balance.
+    match: /\/network\/__tests__\/network-(?!vector-)(?:[a-z0-9-]*-)?(?:transition|follow|fit-stream)-perf\.browser\.test\.tsx?$/,
   },
   {
     name: "engines",
-    title: "network() LOD, zoom and interaction; map, WebGL and React backends",
+    title: "network() LOD, zoom and interaction, and the Canvas/SVG network; map, WebGL and React backends",
     match: /\/(?:network\/__tests__|(?:map|webgl|react)(?:\/__tests__)?)\/[^/]*$/,
   },
 ];
