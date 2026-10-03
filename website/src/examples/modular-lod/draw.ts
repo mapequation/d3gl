@@ -20,7 +20,8 @@ const DEPTHS = [2, 3, 4, 5, 6]; // 27 → 2187 nodes
  * hold **option/alt** to **subtract** the box instead (a +/− cursor badge shows which). With **draggable** (#140), a **plain drag
  * starting on a glyph moves it** instead of panning: grab a node, a whole **selection**, or a collapsed
  * **module** to drag its entire subtree (these coordinates are fixed, so the drag *translates* the
- * grabbed set — on a `force`/`worker` layout it also reheats the simulation). Plain drag on empty space pans.
+ * grabbed set — on a `force`/`worker` layout it also reheats the simulation). Plain drag on empty space pans,
+ * and holding **⌘** (Ctrl on Windows/Linux) pans from anywhere, even over a glyph (#178).
  *
  * `net.pickLinks()` adds **pixel-exact link picking** (#141, WebGL): the links are thin bent strips, so
  * resolving "the link you see" uses a GPU-readback pass behind the same pick seam. Hover a link (or a
@@ -46,7 +47,7 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
   // tab stays pure d3gl + a tiny DOM readout. pointer-events:none so it never intercepts pan/zoom.
   const caption = document.createElement("div");
   caption.style.cssText = "position:absolute;left:8px;bottom:8px;max-width:calc(100% - 16px);padding:4px 8px;font:12px/1.4 ui-monospace,monospace;color:#e5e7eb;background:rgba(17,24,39,0.72);border-radius:4px;pointer-events:none;white-space:pre-wrap";
-  const HINT = "Hover to ring · click to select (⇧/⌘ adds) · ⇧+drag to box-select (⌥ subtracts) · drag a glyph to move it";
+  const HINT = "Hover to ring · click to select (⇧/⌘ adds) · ⇧+drag to box-select (⌥ subtracts) · drag a glyph to move it · ⌘/Ctrl+drag to pan";
   caption.textContent = HINT;
   host.appendChild(caption);
 

@@ -4,7 +4,7 @@ import { setup } from "./draw.js";
 
 /** Harness for the modular-LOD example: a Depth slider (gasket size) and an LOD toggle. Nodes are
  *  coloured by top-level module; with LOD on they aggregate into their parent module as you zoom out.
- *  Scroll to zoom, drag to pan. */
+ *  Scroll to zoom, drag to pan (⌘/Ctrl-drag pans over glyphs too). */
 export default function ModularLod() {
   return (
     <Example
