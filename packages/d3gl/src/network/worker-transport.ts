@@ -78,6 +78,27 @@ export interface WorkerLayoutOptions {
    * worker, its synchronous fallback, and the GPU solve.
    */
   moduleSprings?: ModuleSprings;
+  /**
+   * Follow the stream (#454, {@link StreamFollow}): a warm layout streamed without a transition, eased on the
+   * main thread. The frames go to the follower until it hands them back; then they are painted as usual. In
+   * shared mode the worker's buffer becomes `graph.positions` only then (or at a drag's first pin), so the
+   * positions on screen stay the follower's while it eases. Not with `lod`: a streamed tree's geometry is the
+   * solve's, so its frames are painted as they land.
+   */
+  follow?: StreamFollow;
+}
+
+/**
+ * Where a followed stream's frames go (#454): a caller that eases what is on screen toward each frame — a
+ * warm layout streamed without a transition — instead of having the transport paint it. The transport hands
+ * every frame to {@link onFrame} while it returns `true`; once it returns `false` (the ease has ended) the
+ * transport paints that frame and every later one itself, as it does without a follower.
+ */
+export interface StreamFollow {
+  /** The array the next frame may be written into in place (2 floats per node): the GPU reads back into it. */
+  target(): Float32Array;
+  /** A frame, in {@link target}'s array or one of its own: `true` if the follower took it, `false` to paint it. */
+  onFrame(positions: Float32Array): boolean;
 }
 
 /**
@@ -331,6 +352,8 @@ export function startWorkerLayout(
 ): WorkerLayoutHandle {
   const { width, height, iterations, warm, moduleSprings } = opts;
   const multilevel = opts.multilevel ?? true;
+  // A followed stream (#454) — never with a streamed LOD tree, whose geometry is the solve's.
+  let follow = opts.lod ? undefined : opts.follow;
   const syncOpts = { width, height, iterations, force: opts.force, coarsen: opts.coarsen };
 
   /** Solve on this thread (converging early, like the worker): the fallback when no worker runs. */
@@ -373,12 +396,21 @@ export function startWorkerLayout(
   // Live (#297): a worker error below falls back to a synchronous solve, after which no worker shares it.
   let shared = sharedMemoryAvailable();
   let sharedPositions: SharedArrayBuffer | undefined;
+  /** A followed shared run's buffer, not yet `graph.positions`: the positions on screen are the follower's. */
+  let pendingView: Float32Array | null = null;
   if (shared) {
     sharedPositions = new SharedArrayBuffer(graph.nodeCount * 2 * Float32Array.BYTES_PER_ELEMENT);
     const view = new Float32Array(sharedPositions);
     view.set(graph.positions); // carry over the seed
-    graph.positions = view; // renderer now reads the shared buffer live
+    if (follow) pendingView = view;
+    else graph.positions = view; // renderer now reads the shared buffer live
   }
+  /** The follower handed the stream back (#454): paint from here on — in shared mode, from the shared buffer. */
+  const unfollow = (): void => {
+    follow = undefined;
+    if (pendingView) graph.positions = pendingView;
+    pendingView = null;
+  };
 
   let resolveSettled!: () => void;
   const settled = new Promise<void>((r) => (resolveSettled = r));
@@ -413,6 +445,15 @@ export function startWorkerLayout(
     }
     if (msg.type === "lod-geometry" || msg.type === "seed-plan" || msg.type === "module-tree") return; // only the GPU layout's coarsening worker (#377, #353) or a module-tree build (#428) sends these
     // frame | done
+    if (follow) {
+      // A followed stream (#454): the follower eases toward the frame — the message's copy, or the shared buffer.
+      const frame = shared ? pendingView : msg.positions;
+      if (frame && follow.onFrame(frame)) {
+        if (msg.type === "done") settle();
+        return;
+      }
+      if (frame) unfollow(); // handed back: this frame and every later one are painted as usual
+    }
     if (msg.positions && !shared) graph.positions.set(msg.positions);
     if (msg.geometry && lodGeomFlat) lodGeomFlat.set(msg.geometry); // copy-mode geometry snapshot
     const frame = msg.lodFrame;
@@ -438,6 +479,8 @@ export function startWorkerLayout(
     if (terminated) return;
     // Worker failed mid-run — fall back to a synchronous solve so the user still gets a layout.
     shared = false;
+    follow = undefined;
+    pendingView = null;
     solveHere();
     onFrame();
     terminate();
@@ -479,6 +522,16 @@ export function startWorkerLayout(
     },
     pin(ids: Uint32Array, positions?: Float32Array) {
       if (terminated) return;
+      if (pendingView) {
+        // A drag while a shared run is followed (#454): the held positions went into the positions on screen,
+        // so carry them into the shared buffer the worker reads, and paint from it from now on.
+        for (let k = 0; k < ids.length; k++) {
+          const i = 2 * (ids[k] ?? 0);
+          pendingView[i] = graph.positions[i] ?? 0;
+          pendingView[i + 1] = graph.positions[i + 1] ?? 0;
+        }
+        unfollow();
+      }
       // Shared mode: the main thread already wrote the held positions into the SAB the worker reads,
       // so send only the ids. Copy mode: the worker has its own buffer — send the positions too.
       const pin: MainToWorker = shared ? { type: "pin", ids } : { type: "pin", ids, positions };
@@ -517,14 +570,12 @@ export interface NestedWorkerOptions {
   /** Receive the final layout's module boundary discs (#329), just before its positions land. */
   onBoundaries?: (discs: BoundaryDiscs) => void;
   /**
-   * Follow the stream instead of painting it (#454): every streamed frame, and the final layout, is handed
-   * to `follow.onFrame` instead of being copied into `graph.positions` (no `onFrame` for it) — for a caller
-   * that eases what is on screen toward each frame (a warm start placed by its seed). `follow.target()` is
-   * where a transport that reads its frames back in place (the GPU) writes the next one; the worker hands
-   * over the array each frame arrives in. Streams (`stream` is ignored) and posts no {@link onBounds}: the
-   * positions on screen are the caller's, not the frames'.
+   * Follow the stream instead of painting it (#454, {@link StreamFollow}): every streamed frame, and the
+   * final layout, goes to the follower until it hands them back, then is painted as usual — for a caller that
+   * eases what is on screen toward each frame (a warm start placed by its seed). Streams (`stream` is
+   * ignored) and posts no {@link onBounds}: the positions on screen are the caller's, not the frames'.
    */
-  follow?: NestedFollow;
+  follow?: StreamFollow;
   /**
    * Receive the streamed layout's bound on its final extent (#427), for a streaming fit to frame the map on:
    * the root disc ({@link nestedRootBounds}) synchronously when a cold stream starts, then each depth's
@@ -533,14 +584,6 @@ export interface NestedWorkerOptions {
    * main-thread fallback, whose layout lands at once.
    */
   onBounds?: (bounds: FitBox) => void;
-}
-
-/** Where a followed nested stream's frames go (#454, {@link NestedWorkerOptions.follow}). */
-export interface NestedFollow {
-  /** The array the next frame may be written into in place (2 floats per leaf). */
-  target(): Float32Array;
-  /** A frame: in {@link target}'s array, or one of its own. */
-  onFrame(positions: Float32Array): void;
 }
 
 /**
@@ -557,12 +600,14 @@ export function startNestedWorkerLayout(
   onFrame: () => void,
   opts: NestedWorkerOptions = {},
 ): WorkerLayoutHandle {
-  const { onResult, onBoundaries, follow } = opts;
+  const { onResult, onBoundaries } = opts;
+  let follow = opts.follow;
+  const followed = follow !== undefined;
   /** The final positions (and the discs, #329): to the caller, or into the graph + a repaint. */
   const land = (positions: Float32Array, discs: BoundaryDiscs | undefined): void => {
     if (discs) onBoundaries?.(discs);
     if (onResult) onResult(positions);
-    else if (follow) follow.onFrame(positions);
+    else if (follow?.onFrame(positions)) return;
     else {
       graph.positions.set(positions);
       onFrame();
@@ -601,10 +646,10 @@ export function startNestedWorkerLayout(
       return;
     }
     if (follow) {
-      if (msg.positions) follow.onFrame(msg.positions);
-      return;
+      if (!msg.positions || follow.onFrame(msg.positions)) return;
+      follow = undefined; // handed back: painted as usual from here
     }
-    if (msg.bounds) opts.onBounds?.(msg.bounds);
+    if (msg.bounds && !followed) opts.onBounds?.(msg.bounds); // a followed stream's camera follows its leaves
     if (msg.positions) graph.positions.set(msg.positions);
     onFrame();
   };
@@ -624,12 +669,12 @@ export function startNestedWorkerLayout(
     superEdgeTarget: tree.superEdgeTarget,
     superEdgeFlow: tree.superEdgeFlow,
   };
-  const start: MainToWorker = { type: "start-nested", topology, params, stream: follow !== undefined || ((opts.stream ?? true) && !onResult) };
+  const start: MainToWorker = { type: "start-nested", topology, params, stream: followed || ((opts.stream ?? true) && !onResult) };
   worker.postMessage(start);
   // A streamed cold solve's first bound (#427): its root disc, known before the worker places a depth, so a
   // fit frames the map from its first paint and only zooms in as the depths' own bounds arrive. A warm
   // solve streams no depths (nestedLayout's rule), and a one-frame solve lands exact.
-  if (start.stream && !params.initial && !follow) opts.onBounds?.(nestedRootBounds(tree.leafCount, params.radius));
+  if (start.stream && !params.initial && !followed) opts.onBounds?.(nestedRootBounds(tree.leafCount, params.radius));
   return {
     shared: false,
     settled,

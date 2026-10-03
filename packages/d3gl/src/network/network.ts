@@ -15,7 +15,7 @@ import { physicalPieWedges, type PhysicalPieWedges, type PieWedgeOptions } from 
 import { rosettePositions } from "./rosette.js";
 import { gatherCandidates, descendingByKey, descendingInListOrder, CandidateList, type CandidateSource } from "./label-candidates.js";
 import type { StateNetworkGraph } from "./state-graph.js";
-import { buildModuleTopologyOffThread, deferredLayoutHandle, startNestedWorkerLayout, startWorkerLayout, withModuleSprings, type NestedFollow, type StreamedLODTree, type WorkerLayoutHandle, type WorkerLayoutOptions } from "./worker-transport.js";
+import { buildModuleTopologyOffThread, deferredLayoutHandle, startNestedWorkerLayout, startWorkerLayout, withModuleSprings, type StreamFollow, type StreamedLODTree, type WorkerLayoutHandle, type WorkerLayoutOptions } from "./worker-transport.js";
 import { moduleSpringsOf, type ModuleSprings } from "./module-springs.js";
 import { buildLeafIncidence, lazySuperEdges, makeLazySuperEdgesScratch, type LeafIncidence } from "./lazy-super-edges.js";
 import { incidenceSourceEdges } from "./spatial-rows.js";
@@ -326,10 +326,13 @@ export interface NetworkLayoutOptions {
    * switching between a nested map and a force layout. On the force layouts (`"force"`, `"worker"`,
    * `"gpu"`, `"auto"`) the solve starts from the current positions: no seed disc and no multilevel seed
    * ({@link multilevel} is ignored), at full heat cooling over {@link iterations}, until it converges. A
-   * streamed one streams as usual, so its first frame is the layout on screen and the nodes move on live;
-   * with {@link fit} the camera follows it, as it follows any stream — also when the layout grows or shrinks
-   * to the force model's own scale (a nested map is about a third as wide as a force layout of the same
-   * graph).
+   * streamed one (`"worker"`, `"gpu"`, `"auto"`) is followed as a warm nested map is: the nodes glide from
+   * where they are toward each frame of the solve as it lands, on one ease of about 600 ms retargeted to every
+   * newer frame (see {@link NestedLayoutConfig.warm}); frames after it are painted as they come. With
+   * {@link fit} the camera follows it, as it follows any stream — also when the layout grows or shrinks to the
+   * force model's own scale (a nested map is about a third as wide as a force layout of the same graph). With
+   * a structure or spatial LOD tree, which a worker streams with the solve's own geometry, its frames are
+   * painted as they land instead.
    *
    * With {@link nested} it is `nested: { warm: true }` ({@link NestedLayoutConfig.warm}): the map is laid
    * out from the current positions, and on a streaming backend without a {@link transition} it streams
@@ -2201,6 +2204,10 @@ export class Network extends BaseEngine {
       // continuation (#311): no disc, no multilevel seed, a fresh cooling schedule from full heat.
       ...(warm ? { warm: { heat: 1, decaying: true } } : {}),
     };
+    // …and the nodes chase its frames from where they are, as a warm nested map's (#454) — unless a worker streams
+    // the LOD tree, whose geometry is the solve's: then its frames are painted as they land.
+    const follower = warm && !useLod ? this.followStream(graph) : null;
+    if (follower) workerOpts.follow = follower.follow;
     // Unset until the transport returns, so a callback can never match a cleared `layoutHandle` (null).
     let handle: WorkerLayoutHandle | undefined;
     let settled = false; // this layout's settle handler has run (it clears `lodStreaming` once)
@@ -2255,7 +2262,7 @@ export class Network extends BaseEngine {
       const tree = this.hasModuleLinks() ? this.moduleTreeLater() : undefined;
       handle = tree instanceof Promise ? deferredLayoutHandle(tree, start) : start(tree);
     }
-    this.onLayoutSettled(handle, () => {
+    this.onLayoutSettled(follower ? this.followHandle(follower.tween, handle) : handle, () => {
       settled = true;
       this.lodStreaming = false;
     });
@@ -2298,7 +2305,7 @@ export class Network extends BaseEngine {
    * once, #355) on gpu/auto where the device can run it (#375), synchronous on force.
    * A warm start (#328) seeds from the current positions. With a `duration` (or on force) it lands in one
    * piece, eased to ({@link positionTween}) or jumped to; otherwise it streams, placed by its seed, and the
-   * nodes chase its frames from where they are ({@link followNested}, #454).
+   * nodes chase its frames from where they are ({@link followStream}, #454).
    */
   private startNestedLayout(tree: LODTree | Promise<LODTree>, opts: NetworkLayoutOptions, duration: number, warm: boolean): void {
     const graph = this.graph;
@@ -2326,7 +2333,7 @@ export class Network extends BaseEngine {
     if (tree instanceof Promise || layoutClass(opts.backend) === "streaming") {
       const oneFrame = tween !== null;
       // Created now, as the transition is: it eases from the positions on screen when the first frame lands.
-      const follower = follows ? this.followNested(graph) : null;
+      const follower = follows ? this.followStream(graph) : null;
       this.nestedSolving = true;
       const awaited = tree instanceof Promise;
       const solveOn = (t: LODTree): WorkerLayoutHandle | null => {
@@ -2362,7 +2369,6 @@ export class Network extends BaseEngine {
           const devicePromise = this.whenBackendSettled().then(() => this.gpuDevice());
           const gpuDelivery = { ...delivery, warnUnsupported: opts.backend === "gpu" };
           const gpu: WorkerLayoutHandle = startGpuNestedLayout(devicePromise, graph, topology, params, () => this.onStreamedFrame(gpu), gpuDelivery);
-          if (follower) follower.repaint = () => this.onStreamedFrame(gpu);
           return gpu;
         }
         return startNestedWorkerLayout(graph, topology, params, () => this.scheduleLayoutRepaint(), delivery);
@@ -2467,41 +2473,40 @@ export class Network extends BaseEngine {
   }
 
   /**
-   * A followed warm nested stream (#454): the nodes chase its frames from where they are, on one ease of
-   * {@link FOLLOW_MS} (cubic ease-out, so they move at once) that starts with the first frame and is
-   * retargeted to each newer one ({@link PositionTransition.retarget}) — continuous, and ending exactly on
-   * the latest frame. Its frames are {@link positionTween}'s: the positions-only repaint, with a fit reframing
-   * the live leaves. A frame that lands after the ease has ended is painted as a streamed one is: the GPU reads
-   * it back straight into `graph.positions` (`follow.target()` is the graph's buffer again) and the worker's is
-   * copied in, as without a follower. The GPU reads frames back in place into one buffer of 2 floats per node
-   * while the ease runs (allocated with the first one); a worker frame is its own message's array.
+   * A followed warm stream (#454) — a warm force layout's or a warm nested map's, streamed without a
+   * transition: the nodes chase its frames from where they are, on one ease of {@link FOLLOW_MS} (cubic
+   * ease-out, so they move at once) that starts with the first frame and is retargeted to each newer one
+   * ({@link PositionTransition.retarget}) — continuous, and ending exactly on the latest frame. Its frames are
+   * {@link positionTween}'s: the positions-only repaint, with a fit reframing the live leaves. Once the ease
+   * has ended the follower hands every frame back and the transport paints it as a streamed frame: the GPU
+   * reads it back straight into `graph.positions` again (`follow.target()` is the graph's buffer), the worker's
+   * is copied in, or its shared buffer becomes the graph's. The GPU reads frames back in place into one buffer
+   * of 2 floats per node while the ease runs (allocated with the first one); a worker frame is its own
+   * message's array.
    */
-  private followNested(graph: NetworkGraph): { follow: NestedFollow; tween: PositionTransition; repaint: () => void } {
+  private followStream(graph: NetworkGraph): { follow: StreamFollow; tween: PositionTransition } {
     // A frame later than FOLLOW_FRAME_MS (a busy main thread: the GPU solve being built, a long repaint) moves
     // the ease on by that much, not by the time that passed: a stall slows the glide instead of skipping it.
     const tween = this.positionTween(graph, FOLLOW_MS, { ease: easeCubicOut, maxFrameMs: FOLLOW_FRAME_MS });
     let buffer: Float32Array | null = null;
-    const follower = {
-      tween,
-      repaint: (): void => this.scheduleLayoutRepaint(), // the worker's; the GPU's repaints in its own frame
-      follow: {
-        target: (): Float32Array => (tween.ended ? graph.positions : (buffer ??= new Float32Array(graph.positions.length))),
-        onFrame: (positions: Float32Array): void => {
-          if (this.graph !== graph) return;
-          if (tween.retarget(positions)) return; // the ease's own frames repaint
-          if (positions !== graph.positions) graph.positions.set(positions);
-          buffer = null;
-          follower.repaint();
-        },
+    const follow: StreamFollow = {
+      target: () => (tween.ended ? graph.positions : (buffer ??= new Float32Array(graph.positions.length))),
+      onFrame: (positions) => {
+        if (this.graph !== graph) return true; // superseded: nothing paints it
+        if (tween.retarget(positions)) return true; // the ease's own frames repaint
+        buffer = null;
+        return false;
       },
     };
-    return follower;
+    return { follow, tween };
   }
 
   /**
    * A followed stream's layout handle (#454): it settles once the solve has settled and the ease has reached
    * its last frame (at once when the ease never started: the solve stopped first). `stop()` stops both, where
-   * they are. It reports the solve's live transport.
+   * they are. Everything else is the solve's: its live transport and shared mode, a drag's pins (a grab
+   * finishes the ease first, as it finishes a transition), the spatial LOD stream's style and view, a device
+   * move.
    */
   private followHandle(tween: PositionTransition, solve: WorkerLayoutHandle): WorkerLayoutHandle {
     this.transition = tween; // a grab finishes it, as it finishes a transition
@@ -2515,8 +2520,10 @@ export class Network extends BaseEngine {
         throw error;
       },
     );
-    return {
-      shared: false,
+    const handle: WorkerLayoutHandle = {
+      get shared() {
+        return solve.shared;
+      },
       get transport() {
         return solve.transport;
       },
@@ -2525,9 +2532,14 @@ export class Network extends BaseEngine {
         solve.stop();
         tween.stop();
       },
-      pin() {},
-      unpin() {},
+      pin: (ids, positions) => solve.pin(ids, positions),
+      unpin: () => solve.unpin(),
     };
+    const { setLODStyle, setLODView, moveDevice } = solve;
+    if (setLODStyle) handle.setLODStyle = (style, version) => setLODStyle.call(solve, style, version);
+    if (setLODView) handle.setLODView = (view) => setLODView.call(solve, view);
+    if (moveDevice) handle.moveDevice = (next) => moveDevice.call(solve, next);
+    return handle;
   }
 
   /** Ease `graph`'s positions to an already-computed `target` over `duration` ms (#328). `prepare`

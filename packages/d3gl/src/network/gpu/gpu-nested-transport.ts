@@ -180,7 +180,7 @@ export function startGpuNestedLayout(
         onFailure: (reason) => {
           failure = reason;
         },
-      }, follow ? () => follow.onFrame(follow.target()) : oneFrame ? () => {} : onFrame);
+      }, follow ? () => void (follow.onFrame(follow.target()) || onFrame()) : oneFrame ? () => {} : onFrame);
     } catch (error) {
       layout.destroy();
       throw error;

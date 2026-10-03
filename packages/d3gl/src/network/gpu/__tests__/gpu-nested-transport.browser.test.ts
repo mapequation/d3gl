@@ -163,6 +163,7 @@ describe("startGpuNestedLayout (#355)", () => {
         onFrame: (positions) => {
           frames.push(positions.slice());
           expect(Array.from(g.positions)).toEqual(Array.from(before)); // the follower eases the graph, not the transport
+          return true;
         },
       },
     });
