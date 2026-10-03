@@ -74,7 +74,7 @@ const NO_EDGE = 0xffffffff;
 /** Direction flags per row entry. */
 const HAS_OUT = 1;
 const HAS_IN = 2;
-/** Row entries the memo may hold (21 B each: ~5 MB) before it drops the rows the last frame did not use. */
+/** Row entries the memo may hold (21 B each: ~5 MB) before it drops the rows the last frame did not use, once they are a quarter of what it uses. */
 const MEMO_MAX_ENTRIES = 1 << 18;
 /** Generations before the stamps wrap (`gen << 3` must stay a positive Int32). */
 const MAX_GEN = (1 << 28) - 1;
@@ -112,6 +112,17 @@ export interface LazySuperEdgesScratch {
   rowG: Int32Array;
   rowStart: Int32Array;
   rowLen: Int32Array;
+  /**
+   * Per row, for a kept leaf's row built with `style.leafLinks` (#447, #463): its neighbours that were kept leaves
+   * when it was built (their links are not in the row: the engine draws them as graph edges), as CSR positions
+   * `kPos[rowKStart .. + rowKLen)`. `rowKLen` −1 marks a row that holds every neighbour (built without leaf
+   * links, or a cell's row).
+   */
+  rowKStart: Int32Array;
+  rowKLen: Int32Array;
+  /** The kept-neighbour positions of the memo's leaf rows (CSR entries of their kept leaves), `kents` in use. */
+  kPos: Uint32Array;
+  kents: number;
   rows: number;
   /** Row entries: neighbouring cover, flow out of / into the glyph, direction flags. */
   entH: Int32Array;
@@ -131,6 +142,8 @@ export interface LazySuperEdgesScratch {
    *  entries plus the graph edges of the kept leaves read with them (0 without `tree.rows`). */
   imported: number;
   entries: number;
+  /** Last call: kept leaves' rows built from their graph edges (#463): 0 on a held view, whose rows the memo answers. */
+  leafRows: number;
   /**
    * The links between two kept leaves the last call met (#447), as graph edge ids in walk order (the kept
    * leaves in `kept` order, each one's CSR row in order): `leafEdges[0..leafLinks)`. Listed only when the call
@@ -159,6 +172,10 @@ export function makeLazySuperEdgesScratch(): LazySuperEdgesScratch {
     rowG: new Int32Array(64),
     rowStart: new Int32Array(64),
     rowLen: new Int32Array(64),
+    rowKStart: new Int32Array(64),
+    rowKLen: new Int32Array(64),
+    kPos: new Uint32Array(1024),
+    kents: 0,
     rows: 0,
     entH: new Int32Array(1024),
     entOut: new Float64Array(1024),
@@ -172,6 +189,7 @@ export function makeLazySuperEdgesScratch(): LazySuperEdgesScratch {
     labelled: 0,
     imported: 0,
     entries: 0,
+    leafRows: 0,
     leafEdges: new Uint32Array(0),
     leafLinks: 0,
   };
@@ -206,6 +224,8 @@ function growRows(sc: LazySuperEdgesScratch, need: number): void {
   const g = new Int32Array(cap); g.set(sc.rowG); sc.rowG = g;
   const s = new Int32Array(cap); s.set(sc.rowStart); sc.rowStart = s;
   const l = new Int32Array(cap); l.set(sc.rowLen); sc.rowLen = l;
+  const ks = new Int32Array(cap); ks.set(sc.rowKStart); sc.rowKStart = ks;
+  const kl = new Int32Array(cap); kl.set(sc.rowKLen); sc.rowKLen = kl;
 }
 
 /**
@@ -221,11 +241,13 @@ function compactRows(sc: LazySuperEdgesScratch, kept: Uint32Array): void {
   }
   // Entries move toward the front in their current order, so a row is never overwritten before it moves.
   rows.sort((a, b) => (sc.rowStart[a] ?? 0) - (sc.rowStart[b] ?? 0));
-  const moved = rows.map((row) => ({ g: sc.rowG[row] ?? 0, from: sc.rowStart[row] ?? 0, n: sc.rowLen[row] ?? 0 }));
+  const moved = rows.map((row) => ({ g: sc.rowG[row] ?? 0, from: sc.rowStart[row] ?? 0, n: sc.rowLen[row] ?? 0, kFrom: sc.rowKStart[row] ?? 0, kn: sc.rowKLen[row] ?? -1 }));
   sc.rowIndex.reset(rows.length);
   sc.rows = 0;
   let ents = 0;
-  for (const { g, from, n } of moved) {
+  let kents = 0;
+  // A leaf row's kept-neighbour positions were appended with its entries, so they too are in arena order here.
+  for (const { g, from, n, kFrom, kn } of moved) {
     sc.entH.copyWithin(ents, from, from + n);
     sc.entOut.copyWithin(ents, from, from + n);
     sc.entIn.copyWithin(ents, from, from + n);
@@ -234,10 +256,17 @@ function compactRows(sc: LazySuperEdgesScratch, kept: Uint32Array): void {
     sc.rowG[i] = g;
     sc.rowStart[i] = ents;
     sc.rowLen[i] = n;
+    sc.rowKLen[i] = kn;
+    sc.rowKStart[i] = kents;
+    if (kn > 0) {
+      sc.kPos.copyWithin(kents, kFrom, kFrom + kn);
+      kents += kn;
+    }
     sc.rowIndex.findOrAdd(g, g, i, sc.rowG, sc.rowG);
     ents += n;
   }
   sc.ents = ents;
+  sc.kents = kents;
 }
 
 /**
@@ -300,6 +329,7 @@ export function lazySuperEdges(
   sc.labelled = 0;
   sc.imported = 0;
   sc.entries = 0;
+  sc.leafRows = 0;
   if (!leafOrder || !leafStart || !leafEnd || !parent) return { ids: [] };
 
   if (sc.rowMark.length < tree.size) {
@@ -323,6 +353,7 @@ export function lazySuperEdges(
     sc.rowIndex.reset();
     sc.rows = 0;
     sc.ents = 0;
+    sc.kents = 0;
   }
 
   const { offsets, neighbors } = csr;
@@ -388,6 +419,7 @@ export function lazySuperEdges(
     }
     sc.rowStart[row] = start;
     sc.rowLen[row] = sc.ents - start;
+    sc.rowKLen[row] = -1;
     return row;
   };
 
@@ -408,12 +440,19 @@ export function lazySuperEdges(
   // Without `style.leafLinks` no cover matches −1 (stamps are ≥ 0), so every neighbour is resolved as before.
   const keptStamp = style.leafLinks === true ? stamp | KEPT : -1;
   // Kept leaf g's row from its own graph edges. With `style.leafLinks` (#447) its links to other kept leaves are
-  // not gathered — the engine draws them as the full-detail path does (`withLeafLinks` in glyphs.ts) — so a
-  // neighbour that is itself a kept leaf is skipped before it is resolved (one read), and the row holds the flow
-  // toward aggregates and covers off the kept set only; such a row is built fresh on every call (O(degree)),
-  // never taken from the memo, since which neighbours it skips depends on the cut and a memo row names only the
-  // covers it holds. Given `sourceEdges`, the skipped links are listed for the engine in the same read: the edge
-  // id at the source's entry (so an edge once, from its source's row), a self-loop left out.
+  // not gathered — the engine draws them as the full-detail path does — so a neighbour that is itself a kept leaf
+  // is skipped before it is resolved (one read), and the row holds the flow toward aggregates and covers off the
+  // kept set only. Given `sourceEdges`, the skipped links are listed for the engine in the same read: the edge id
+  // at the source's entry (so an edge once, from its source's row), a self-loop left out.
+  //
+  // The row is memoised like any other (#463), with the CSR positions of the neighbours that were kept leaves when
+  // it was built. It stays valid while those are still kept leaves, and every cover it names is still a cover and
+  // not now a kept leaf: a neighbour that became a kept leaf was resolved to a cover that is gone (opened) or is
+  // itself (now kept). So a held view checks each kept leaf's row in O(its entries + kept neighbours), as it
+  // checks any row, lists the links from the positions it holds, and rebuilds none; a tree with no memo yet (a
+  // streamed frame) builds each row in one read. A row whose every neighbour is a kept leaf (the all-leaves view)
+  // registers nothing and is read again each call. In a cross-fade band a leaf row is always rebuilt: a neighbour
+  // under a split node resolves to no cover, so its arrival would leave no trace in the row.
   const listing = keptStamp >= 0 && sourceEdges !== undefined;
   let leafEdges = sc.leafEdges;
   let m = 0;
@@ -428,10 +467,36 @@ export function lazySuperEdges(
     }
     leafEdges[m++] = e;
   };
+  // A memoised leaf row: valid while its kept neighbours are still kept leaves and its covers are still covers,
+  // not split and not now kept leaves. Lists its leaf links from the positions when valid.
+  const memoLeafRow = (g: number, row: number): boolean => {
+    const k0 = sc.rowKStart[row] ?? 0;
+    const k1 = k0 + (sc.rowKLen[row] ?? 0);
+    const kPos = sc.kPos;
+    for (let q = k0; q < k1; q++) if (cover[neighbors[kPos[q] ?? 0] ?? 0] !== keptStamp) return false;
+    const e0 = sc.rowStart[row] ?? 0;
+    const e1 = e0 + (sc.rowLen[row] ?? 0);
+    for (let e = e0; e < e1; e++) {
+      const h = sc.entH[e] ?? 0;
+      const c = cover[h] ?? 0;
+      if (c >> 3 !== gen || upGen[h] === -gen || (h < n && c === keptStamp)) return false;
+    }
+    if (listing) for (let q = k0; q < k1; q++) {
+      const p = kPos[q] ?? 0;
+      listLeafLink(p, neighbors[p] ?? 0, g);
+    }
+    return true;
+  };
   const leafRow = (g: number): number => {
     const p0 = offsets[g] ?? 0;
     const p1 = offsets[g + 1] ?? 0;
     sc.entries += p1 - p0;
+    // Without leaf links (keptStamp −1) this builds a full row; the caller answers those from the memo itself.
+    const memo = fading || keptStamp < 0 ? -1 : rowIndex.find(g, g, sc.rowG, sc.rowG);
+    if (memo >= 0 && (sc.rowKLen[memo] ?? -1) >= 0 && memoLeafRow(g, memo)) {
+      sc.hits++;
+      return memo;
+    }
     // Every neighbour a kept leaf (the all-leaves view): nothing to gather, and no row to register.
     let p = p0;
     for (; p < p1; p++) {
@@ -440,10 +505,14 @@ export function lazySuperEdges(
       if (listing) listLeafLink(p, v, g);
     }
     if (p === p1) return EMPTY_ROW;
+    // Build it: its kept neighbours' positions (those before p first), its covers' flows.
     open();
+    const kStart = sc.kents;
+    for (let q = p0; q < p; q++) pushKept(q);
     for (; p < p1; p++) {
       const v = neighbors[p] ?? 0;
       if (cover[v] === keptStamp) {
+        pushKept(p);
         if (listing) listLeafLink(p, v, g);
         continue;
       }
@@ -451,7 +520,21 @@ export function lazySuperEdges(
       if (h === g || h < 0 || (fading && nested(g, h))) continue;
       add(h, incW ? (incW[p] ?? 0) : uniform, !incOut || incOut[p] === 1);
     }
-    return close(g);
+    const row = close(g);
+    if (keptStamp >= 0) {
+      sc.rowKStart[row] = kStart;
+      sc.rowKLen[row] = sc.kents - kStart;
+      sc.leafRows++;
+    }
+    return row;
+  };
+  const pushKept = (p: number): void => {
+    if (sc.kents === sc.kPos.length) {
+      const grown = new Uint32Array(2 * sc.kPos.length);
+      grown.set(sc.kPos);
+      sc.kPos = grown;
+    }
+    sc.kPos[sc.kents++] = p;
   };
 
   const streamedRow = (stored: SpatialRows, g: number): number => {
@@ -491,7 +574,8 @@ export function lazySuperEdges(
       continue;
     }
     let row = rowIndex.find(g, g, sc.rowG, sc.rowG);
-    if (row >= 0 && rowValid(row)) sc.hits++;
+    // A leaf row built with leaf links (rowKLen ≥ 0) leaves some neighbours out: never one for a full gather.
+    if (row >= 0 && (sc.rowKLen[row] ?? -1) < 0 && rowValid(row)) sc.hits++;
     else row = rows ? streamedRow(rows, g) : -1;
     keptRow[i] = row;
     if (row < 0) rebuild = true;
@@ -611,6 +695,8 @@ export function lazySuperEdges(
 
   const out = sc.edges;
   let len = 0;
+  let live = 0; // this frame's rows' entries (and kept-neighbour positions): the memo's live part
+  let liveK = 0;
   let paired = 0;
   const reciprocal = style.linkStyle === "half-arrow" && style.directed;
   const push = (a: number, b: number, w: number): void => {
@@ -649,6 +735,8 @@ export function lazySuperEdges(
     }
     const e0 = sc.rowStart[row] ?? 0;
     const e1 = e0 + (sc.rowLen[row] ?? 0);
+    live += e1 - e0;
+    liveK += Math.max(0, sc.rowKLen[row] ?? 0);
     for (let e = e0; e < e1; e++) {
       const h = sc.entH[e] ?? 0;
       const role = (cover[h] ?? 0) & 7;
@@ -671,7 +759,11 @@ export function lazySuperEdges(
       // else: a decluttered glyph on screen — skipped, as by the CSR gather.
     }
   }
-  // Rebuilt rows append, so the arena grows as the view moves: past its bound, keep only this frame's rows.
-  if (sc.ents > MEMO_MAX_ENTRIES) compactRows(sc, kept);
+  // Rebuilt rows append, so the arena grows as the view moves: past its bound, keep only this frame's rows — once
+  // what the frame does not use (older rows, and the entries rebuilt rows left behind) is a quarter of what it
+  // does. An arena of this frame's rows alone (a streamed frame's, whose memo starts empty, or a held view's) is
+  // left as it is: compacting it would copy every entry for nothing (#463: that ran on every 1M-node frame).
+  const stale = sc.ents - live > live / 4 || sc.kents - liveK > liveK / 4;
+  if ((sc.ents > MEMO_MAX_ENTRIES || sc.kents > MEMO_MAX_ENTRIES) && stale) compactRows(sc, kept);
   return superEdgeBatches(tree, out, len, paired, style, cover, stamp | KEPT, null);
 }

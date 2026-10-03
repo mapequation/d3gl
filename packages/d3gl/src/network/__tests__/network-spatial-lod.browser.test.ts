@@ -105,8 +105,9 @@ describe("lod({ source: 'spatial' }) (#343)", () => {
     const held = net.superEdgeStats;
     expect(held?.misses).toBe(0);
     expect(held?.visits).toBe(0);
-    // Aggregates are answered from the memo; a kept leaf's row is its own edges, read afresh, and its links to
-    // other kept leaves are drawn as graph edges (#447) — at this zoom most kept glyphs are leaves.
+    // Every kept glyph's row is answered from the memo, a kept leaf's too (#463): no kept leaf's row rebuilt, while
+    // its links to other kept leaves are drawn as graph edges (#447) — at this zoom most kept glyphs are leaves.
+    expect(held?.leafRows, "held view: kept-leaf rows rebuilt").toBe(0);
     expect((held?.hits ?? 0) + (held?.leafLinks ?? 0)).toBeGreaterThan(0);
 
     // Switching source after the run: the structural tree is built here; back to spatial re-adopts the worker's.

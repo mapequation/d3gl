@@ -2,7 +2,7 @@ import { describe, it, expect } from "vitest";
 import { buildLODTree, buildMortonLODTree, computeLODGeometry, cut, declutterFrontier, makeCutScratch, makeDeclutterFrontierScratch, visibleWorldRect, type LODTransform, type LODTree } from "../lod.js";
 import { buildGraph, type NetworkGraph } from "../graph.js";
 import { buildLeafIncidence, lazySuperEdges, makeLazySuperEdgesScratch, type LazyCut } from "../lazy-super-edges.js";
-import { incidenceSourceEdges } from "../spatial-rows.js";
+import { buildKeptRows, incidenceSourceEdges, makeSpatialRowsScratch, spatialRowsByteLength, spatialRowsGraph, spatialRowsViews, type SpatialRows } from "../spatial-rows.js";
 import { leafLinkEdges, linkLinesStyleAttrs, makeLeafLinksScratch, sortEdgeIds, superEdges, withLeafLinks, type LeafLinksScratch, type NoLodStyleCache, type SuperEdgeStyleResolved, type SuperEdgesData } from "../glyphs.js";
 
 /**
@@ -251,5 +251,65 @@ describe("leaf links (#447): the gathers leave kept-leaf pairs to the full-detai
       sc.sorted.set(ids);
       expect(sorted(() => sc.sorted)).toEqual(want);
     }
+  });
+
+  it("a kept leaf's row is memoised (#463): the same pairs, flows and leaf links as a fresh gather over a moving view, none rebuilt on a held one", () => {
+    for (const directed of [false, true]) {
+      const inc = buildLeafIncidence(g, directed);
+      const entries = incidenceSourceEdges(g.csr, g);
+      const memo = makeLazySuperEdgesScratch();
+      // Zooms in and out, pans, and cuts that coarsen and refine: leaves join and leave the kept set between calls.
+      const steps: { t: LODTransform; expandPx?: number }[] = [];
+      for (let i = 0; i < 24; i++) {
+        const k = 0.9 * Math.pow(1.35, (i % 12) - (i >= 12 ? 3 : 0));
+        steps.push({ t: { k, x: W / 2 - (i % 5) * 37, y: H / 2 + (i % 3) * 29 }, expandPx: i % 7 === 0 ? 120 : i % 4 === 0 ? 12 : undefined });
+      }
+      let compared = 0;
+      let carried = 0;
+      for (const { t, expandPx } of steps) {
+        const c = cutAt(spatial, t, expandPx);
+        const view = visibleWorldRect(t, W, H);
+        const got = lazySuperEdges(spatial, c, styleOf(directed, true), view, g.csr, inc, memo, entries);
+        const gotLinks = Array.from(memo.leafEdges.subarray(0, memo.leafLinks)).sort((a, b) => a - b);
+        const fresh = makeLazySuperEdgesScratch();
+        const want = lazySuperEdges(spatial, c, styleOf(directed, true), view, g.csr, inc, fresh, entries);
+        const wantLinks = Array.from(fresh.leafEdges.subarray(0, fresh.leafLinks)).sort((a, b) => a - b);
+        expectSame(pairs(spatial, got, directed), pairs(spatial, want, directed));
+        expect(gotLinks).toEqual(wantLinks);
+        compared += got.ids.length + gotLinks.length;
+        carried += memo.hits; // rows the memo answered across a view change
+        // The same view again: every kept leaf's row from the memo.
+        const again = lazySuperEdges(spatial, c, styleOf(directed, true), view, g.csr, inc, memo, entries);
+        expect(memo.leafRows, "held view: kept-leaf rows rebuilt").toBe(0);
+        expectSame(pairs(spatial, again, directed), pairs(spatial, want, directed));
+      }
+      expect(compared, "not vacuous").toBeGreaterThan(1000);
+      expect(carried, "rows carried over from the previous view (the memo is exercised, not only rebuilt)").toBeGreaterThan(100);
+    }
+  });
+
+  it("a kept leaf's full row (no leaf links) built from a streamed tree's rows is answered by the memo on the next call", () => {
+    const t = views[1]!.t;
+    const c = cutAt(spatial, t);
+    const { leafOrder, leafStart, leafEnd } = spatial;
+    if (!leafOrder || !leafStart || !leafEnd) throw new Error("a spatial tree carries its leaf runs");
+    let rows: SpatialRows | null = null;
+    buildKeptRows({ size: spatial.size, leafCount: spatial.leafCount, leafOrder, leafStart, leafEnd }, c, spatialRowsGraph(g.nodeCount, g), makeSpatialRowsScratch(), (sizes) => {
+      rows = spatialRowsViews(new ArrayBuffer(spatialRowsByteLength(sizes)), sizes);
+      return rows;
+    });
+    if (!rows) throw new Error("no rows");
+    const streamed = { ...spatial, rows: rows as SpatialRows };
+    const inc = buildLeafIncidence(g, false);
+    const memo = makeLazySuperEdgesScratch();
+    const view = visibleWorldRect(t, W, H);
+    const a = lazySuperEdges(streamed, c, styleOf(false, false), view, g.csr, inc, memo);
+    let leaves = 0;
+    for (const v of c.kept) if (v < spatial.leafCount) leaves++;
+    expect(leaves, "the view keeps leaves").toBeGreaterThan(0);
+    const b = lazySuperEdges(streamed, c, styleOf(false, false), view, g.csr, inc, memo);
+    expect(memo.hits, "every kept glyph's row from the memo, the leaves' too").toBe(c.kept.length);
+    expect(memo.leafRows).toBe(0);
+    expectSame(pairs(spatial, b, false), pairs(spatial, a, false));
   });
 });

@@ -16,7 +16,7 @@ import {
 } from "../lod.js";
 import { buildGraph, type NetworkGraph } from "../graph.js";
 import { buildLeafIncidence, lazySuperEdges, makeLazySuperEdgesScratch, type LazySuperEdgesScratch } from "../lazy-super-edges.js";
-import { buildKeptRows, makeSpatialRowsScratch, spatialRowsByteLength, spatialRowsGraph, spatialRowsViews, type SpatialRows, type SpatialRowsGraph, type SpatialRowsScratch } from "../spatial-rows.js";
+import { buildKeptRows, incidenceSourceEdges, makeSpatialRowsScratch, spatialRowsByteLength, spatialRowsGraph, spatialRowsViews, type SpatialRows, type SpatialRowsGraph, type SpatialRowsScratch } from "../spatial-rows.js";
 import type { SuperEdgeStyleResolved } from "../glyphs.js";
 
 /**
@@ -40,6 +40,10 @@ import type { SuperEdgeStyleResolved } from "../glyphs.js";
  *     row entries read bounded by the kept glyphs' rows (at most twice the lazy gather's row entries, plus the
  *     kept leaves' own edges) — not by the edges under them. The worker's rows build is timed apart and
  *     reported as **rows-build** (not a main-thread cost);
+ *   - **mixed-pan** / **mixed-pan-leaf** (#447, #463): 1-px pans of a large mixed view (a seed disc of overlapping
+ *     glyphs at a threshold where about half the kept glyphs are leaves, linked to each other), the second with the
+ *     engine's leaf links (the gather lists the links between two kept leaves as it reads their rows). A kept leaf's
+ *     row comes from the memo: none rebuilt on a held view, at most 1% of the kept glyphs per pan;
  *   - **streamed-gesture** (#433): a pan and zoom while the layout streams, each tree's rows built one view
  *     behind the one it is drawn at (the worker's round trip): the same super-edges, and never more
  *     incidences walked than the lazy gather at that cut (the kept glyphs whose rows name a cover the view
@@ -123,6 +127,8 @@ const STYLE: SuperEdgeStyleResolved = {
   maxAggregateRadius: MAX_AGG,
 };
 
+const LEAF_STYLE: SuperEdgeStyleResolved = { ...STYLE, leafLinks: true };
+
 /** One engine frame on a spatial tree: cut (culled roots recorded) → declutter → super-edges — lazy, or from
  *  the worker's rows when `rows` is given (a streamed tree, #433). */
 function frame(
@@ -130,13 +136,16 @@ function frame(
   t: LODTransform,
   s: { cut: ReturnType<typeof makeCutScratch>; dc: ReturnType<typeof makeDeclutterFrontierScratch>; lazy: LazySuperEdgesScratch },
   inc: ReturnType<typeof buildLeafIncidence>,
-  opts: { expandPx?: number; declutter: boolean; rows?: SpatialRows },
+  opts: { expandPx?: number; declutter: boolean; rows?: SpatialRows; sourceEdges?: Uint32Array },
 ): { drawn: number; kept: number; edges: number; ids: number[]; flows: number[] } {
   const drawn = cut(f.tree, t, W, H, { expandPx: opts.expandPx, screenSized: true, maxAggregateRadius: MAX_AGG, recordCulled: true }, s.cut);
   const kept = opts.declutter ? declutterFrontier(f.tree, drawn, t, W, H, { screenSized: true, k: t.k, maxAggregateRadius: MAX_AGG }, s.dc) : drawn;
   const covers = { drawn, kept, culled: s.cut.culled.subarray(0, s.cut.culledCount), split: s.cut.split.subarray(0, s.cut.splitCount) };
   const view = visibleWorldRect(t, W, H);
-  const out = lazySuperEdges(opts.rows ? { ...f.tree, rows: opts.rows } : f.tree, covers, STYLE, view, f.graph.csr, inc, s.lazy);
+  // With `sourceEdges`, as the engine gathers on a spatial tree (#447): the links between two kept leaves are left
+  // to the full-detail path and listed in the same read of the kept leaves' rows.
+  const style = opts.sourceEdges ? LEAF_STYLE : STYLE;
+  const out = lazySuperEdges(opts.rows ? { ...f.tree, rows: opts.rows } : f.tree, covers, style, view, f.graph.csr, inc, s.lazy, opts.sourceEdges);
   return { drawn: drawn.length, kept: kept.length, edges: out.ids.length, ids: out.ids, flows: out.flows ?? [] };
 }
 
@@ -336,6 +345,117 @@ function runLegs(f: ReturnType<typeof webLike>, frames: number): LegResult[] {
   return results;
 }
 
+/**
+ * The mixed view (#447, #463): a layout's evenly spaced seed disc (the cold start's), world-sized glyphs, and an
+ * expand threshold at which about half the kept glyphs are leaves, many of them linked to each other — a large
+ * visible set of leaves and aggregates (~30k glyphs at 100k nodes, ~300k at 1M). On it, the engine's gather lists
+ * the links between two kept leaves as it reads their rows (`sourceEdges`, the leaf links) and gathers the rest.
+ */
+function seedDisc(n: number, directed: boolean): { graph: NetworkGraph; tree: LODTree; fit: LODTransform; spacingPx: number } {
+  const r = rng(0x426);
+  const src = new Uint32Array(5 * n);
+  const tgt = new Uint32Array(5 * n);
+  let e = 0;
+  for (let i = 0; i < n; i++) {
+    const base = i - (i % 40);
+    const span = Math.min(40, n - base);
+    for (let k = 0; k < 2; k++) { src[e] = i; tgt[e++] = base + Math.floor(r() * span); }
+    const far = 2 + (r() < 0.6 ? 1 : 0);
+    for (let k = 0; k < far; k++) { src[e] = i; tgt[e++] = Math.floor(r() * n); }
+  }
+  const graph = buildGraph({ nodeCount: n, source: src.subarray(0, e), target: tgt.subarray(0, e), directed });
+  const R = Math.sqrt(1000 * n); // the force equilibrium radius of the default parameters
+  const golden = Math.PI * (3 - Math.sqrt(5));
+  for (let i = 0; i < n; i++) {
+    const d = R * Math.sqrt((i + 0.5) / n);
+    graph.positions[2 * i] = d * Math.cos(i * golden);
+    graph.positions[2 * i + 1] = d * Math.sin(i * golden);
+  }
+  // Glyphs 1.5 spacings in radius: neighbours overlap at the fit view, so the footprint threshold, not the
+  // overlap rule, decides what opens (as on a dense layout), at any n.
+  const spacing = R * Math.sqrt(Math.PI / n);
+  const tree = buildMortonLODTree(graph.positions, n);
+  computeLODGeometry(tree, graph, new Float32Array(n).fill(1.5 * spacing), graph.strength);
+  computeLODCrowding(tree, { screenSized: false, expandPx: crowdingHorizon(tree) });
+  const k = (0.85 * Math.min(W, H)) / (2 * R);
+  return { graph, tree, fit: { k, x: W / 2, y: H / 2 }, spacingPx: spacing * k };
+}
+
+/** The mixed view's pans, without leaf links (`main`'s gather) and with them (the engine's), and their signatures —
+ *  with straight lines, or with directed half-arrows (the reciprocal pairing, the Navigator's default). */
+function mixedLegs(n: number, frames: number, directed = false): LegResult[] {
+  const f = seedDisc(n, directed);
+  const inc = buildLeafIncidence(f.graph, directed);
+  const plainStyle: SuperEdgeStyleResolved = directed ? { ...STYLE, linkStyle: "half-arrow", directed: true } : STYLE;
+  const leafStyle: SuperEdgeStyleResolved = { ...plainStyle, leafLinks: true };
+  const tag = directed ? "-half" : "";
+  const sourceEdges = incidenceSourceEdges(f.graph.csr, f.graph);
+  const opts = { screenSized: false, maxAggregateRadius: MAX_AGG };
+  // The threshold that keeps about half the glyphs as leaves, linked to each other.
+  const probe = { cut: makeCutScratch(), dc: makeDeclutterFrontierScratch(), lazy: makeLazySuperEdgesScratch() };
+  const run = (t: LODTransform, expandPx: number, s: typeof probe, leaf: boolean) => {
+    const drawn = cut(f.tree, t, W, H, { ...opts, expandPx, recordCulled: true }, s.cut);
+    const kept = declutterFrontier(f.tree, drawn, t, W, H, { ...opts, k: t.k }, s.dc);
+    const covers = { drawn, kept, culled: s.cut.culled.subarray(0, s.cut.culledCount), split: s.cut.split.subarray(0, s.cut.splitCount) };
+    const out = lazySuperEdges(f.tree, covers, leaf ? leafStyle : plainStyle, visibleWorldRect(t, W, H), f.graph.csr, inc, s.lazy, leaf ? sourceEdges : undefined);
+    let leaves = 0;
+    for (const g of kept) if (g < f.tree.leafCount) leaves++;
+    return { kept: kept.length, leaves, ids: out.ids };
+  };
+  let expandPx = 0;
+  let share = 0;
+  for (const m of [4, 3.6, 3.3, 3, 2.8, 2.6, 2.4, 2.2, 2, 1.8, 1.6]) {
+    const e = m * f.spacingPx; // footprints of a few spacings: the bottom cells' sizes straddle it
+    const r = run(f.fit, e, probe, true);
+    share = r.leaves / Math.max(1, r.kept);
+    if (share >= 0.3 && share <= 0.7 && probe.lazy.leafLinks > 0.2 * r.leaves) {
+      expandPx = e;
+      break;
+    }
+  }
+  expect(expandPx, `a mixed view: about half the kept glyphs leaves, linked to each other (last share ${share.toFixed(2)})`).toBeGreaterThan(0);
+  const pan = (i: number): LODTransform => ({ ...f.fit, x: f.fit.x + (i % 2 ? 1 : -1) });
+  const results: LegResult[] = [];
+  const timed = (name: string, leaf: boolean): { leafRows: number; kept: number; leafLinks: number } => {
+    const s = { cut: makeCutScratch(), dc: makeDeclutterFrontierScratch(), lazy: makeLazySuperEdgesScratch() };
+    run(pan(0), expandPx, s, leaf); // warm: the memo holds the view's rows
+    const ts: number[] = [];
+    let leafRows = 0;
+    let kept = 0;
+    let leafLinks = 0;
+    for (let i = 1; i <= frames; i++) {
+      const t0 = performance.now();
+      const r = run(pan(i), expandPx, s, leaf);
+      ts.push(performance.now() - t0);
+      leafRows += s.lazy.leafRows;
+      kept = Math.max(kept, r.kept);
+      leafLinks = Math.max(leafLinks, s.lazy.leafLinks);
+    }
+    const st = stats(ts);
+    results.push({ name, median: st.median, worst: st.worst, drawn: 0, kept, edges: leafLinks, visits: s.lazy.visits, entries: s.lazy.entries });
+    if (leaf) {
+      // An unchanged view: no kept leaf's row rebuilt, the same super-edges and leaf links.
+      const a = run(pan(0), expandPx, s, true);
+      const listed = Array.from(s.lazy.leafEdges.subarray(0, s.lazy.leafLinks));
+      const b = run(pan(0), expandPx, s, true);
+      expect(s.lazy.leafRows, "held view, leaf links: kept-leaf rows rebuilt").toBe(0);
+      expect(s.lazy.misses, "held view, leaf links: rows rebuilt from leaves").toBe(0);
+      expect(s.lazy.visits, "held view, leaf links: incidences walked").toBe(0);
+      expect(b.ids).toEqual(a.ids);
+      expect(Array.from(s.lazy.leafEdges.subarray(0, s.lazy.leafLinks))).toEqual(listed);
+    }
+    return { leafRows, kept, leafLinks };
+  };
+  timed(`mixed-pan${tag}`, false);
+  const leaf = timed(`mixed-pan-leaf${tag}`, true);
+  expect(leaf.leafLinks, "the mixed view lists leaf links (not vacuous)").toBeGreaterThan(0);
+  // A pan of a pixel changes the cut at the view's edge at most: the kept leaves' rows come from the memo (#463).
+  expect(leaf.leafRows, `kept-leaf rows rebuilt over ${frames} pans of ${leaf.kept} kept glyphs`).toBeLessThanOrEqual(Math.ceil(0.01 * frames * leaf.kept));
+  const [plain, withLeaf] = results;
+  if (plain && withLeaf) console.log(`mixed pan${tag} at N=${n}: leaf links ${withLeaf.median.toFixed(2)} ms vs without ${plain.median.toFixed(2)} ms (${(withLeaf.median / Math.max(plain.median, 1e-3)).toFixed(2)}×), expandPx ${expandPx.toFixed(2)}, leaf share ${share.toFixed(2)}, kept ${leaf.kept}, leaf links ${leaf.leafLinks}`);
+  return results;
+}
+
 function report(results: LegResult[], n: number, label: string): void {
   for (const r of results) {
     const line = `${r.name.padEnd(15)} N=${n.toLocaleString()} drawn=${r.drawn.toLocaleString()} kept=${r.kept.toLocaleString()} ${r.name === "rows-build" ? "bytes" : "edges"}=${r.edges.toLocaleString()} visits=${r.visits.toLocaleString()} entries=${r.entries.toLocaleString()} median=${r.median.toFixed(2)}ms worst=${r.worst.toFixed(2)}ms\n`;
@@ -349,20 +469,22 @@ function report(results: LegResult[], n: number, label: string): void {
 // the at-scale leg splits each into a constant and a per-100k-leaves term.
 // streamed-rows (#433) ≈ 2.5 ms and streamed-gesture ≈ 3.5 ms: the ceiling of the streamed leg they replace.
 // rows-build ≈ 2 ms is the worker's step, off the main thread; its ceiling keeps it O(edges under the kept cells).
-const LOCAL_BUDGET: Record<string, number> = { streamed: 50, zoom: 40, "all-leaves": 160, "reductions-off": 400, drag: 15, "streamed-rows": 50, "streamed-gesture": 50, "rows-build": 200 };
-const CONSTANT_MS: Record<string, number> = { streamed: 10, zoom: 10, "all-leaves": 20, "reductions-off": 40, drag: 5, "streamed-rows": 10, "streamed-gesture": 10, "rows-build": 20 };
+// mixed-pan ≈ 22 ms and mixed-pan-leaf ≈ 23 ms (11.6k glyphs, host load ~80): under PERF_ASSERT the leaf-links pan
+// must also stay within 1.5× + 5 ms of the same pan without them (#463: it was ~2× before kept-leaf rows were memoised).
+const LOCAL_BUDGET: Record<string, number> = { streamed: 50, zoom: 40, "all-leaves": 160, "reductions-off": 400, drag: 15, "streamed-rows": 50, "streamed-gesture": 50, "rows-build": 200, "mixed-pan": 200, "mixed-pan-leaf": 200, "mixed-pan-half": 300, "mixed-pan-leaf-half": 300 };
+const CONSTANT_MS: Record<string, number> = { streamed: 10, zoom: 10, "all-leaves": 20, "reductions-off": 40, drag: 5, "streamed-rows": 10, "streamed-gesture": 10, "rows-build": 20, "mixed-pan": 20, "mixed-pan-leaf": 20, "mixed-pan-half": 20, "mixed-pan-leaf-half": 20 };
 
 describe("#343 spatial LOD frame: cut + declutter + lazy super-edges", () => {
   it(`stays within budget at ${LOCAL_N.toLocaleString()} leaves, with the deterministic signatures`, () => {
     const f = webLike(LOCAL_N);
-    const results = runLegs(f, 12);
+    const results = [...runLegs(f, 12), ...mixedLegs(LOCAL_N, 12), ...mixedLegs(LOCAL_N, 12, true)];
     report(results, LOCAL_N, "local");
     for (const r of results) expect(r.median, `${r.name} median`).toBeLessThan(LOCAL_BUDGET[r.name]!);
   }, 120_000);
 
   (BENCH ? it : it.skip)(`bench: the same legs at ${BENCH_N.toLocaleString()} leaves`, () => {
     const f = webLike(BENCH_N);
-    const results = runLegs(f, 8);
+    const results = [...runLegs(f, 8), ...mixedLegs(BENCH_N, 8), ...mixedLegs(BENCH_N, 8, true)];
     report(results, BENCH_N, process.env.BENCH_SPATIAL_LOD_LABEL ?? "run");
     if (ASSERT) {
       for (const r of results) {
@@ -371,6 +493,11 @@ describe("#343 spatial LOD frame: cut + declutter + lazy super-edges", () => {
         const env = Number(process.env[`PERF_SPATIAL_LOD_${r.name.replace("-", "_").toUpperCase()}_MS`]);
         const ceiling = env > 0 ? env : c0 + ((local - c0) * BENCH_N) / LOCAL_N;
         expect(r.median, `${r.name}: median ${r.median.toFixed(1)}ms exceeds ${ceiling.toFixed(0)}ms at N=${BENCH_N}`).toBeLessThan(ceiling);
+      }
+      for (const tag of ["", "-half"]) {
+        const plain = results.find((r) => r.name === `mixed-pan${tag}`);
+        const leaf = results.find((r) => r.name === `mixed-pan-leaf${tag}`);
+        if (plain && leaf) expect(leaf.median, `mixed pan${tag} with leaf links vs without (#463) at N=${BENCH_N}`).toBeLessThan(1.5 * plain.median + 5);
       }
     }
   }, 600_000);

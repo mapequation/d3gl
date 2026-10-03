@@ -2860,14 +2860,15 @@ export class Network extends BaseEngine {
    * streamed with its worker-built rows (#433), the row entries — plus the kept leaves' own graph edges — it
    * read from them instead (`entries`): at the view the rows were built for, a repaint rebuilds nothing
    * (`misses: 0, visits: 0`); and the links it drew as graph edges between two kept leaves (`leafLinks`, #447),
-   * which bypass the gather as the full-detail path draws them, with the CSR entries their index walk read
-   * (`leafEntries`: the kept leaves' degrees, summed). `null` until a spatial tree has drawn links.
+   * which bypass the gather as the full-detail path draws them, with the CSR entries a separate walk read to list
+   * them (`leafEntries`: 0 where the gather listed them), and the kept leaves' rows it built from their edges
+   * (`leafRows`, #463: 0 on a held view, whose rows the memo answers). `null` until a spatial tree has drawn links.
    * Introspection for debugging and tests: a re-emit of an unchanged view reports `misses: 0, visits: 0`.
    */
-  get superEdgeStats(): { hits: number; misses: number; visits: number; entries: number; leafLinks: number; leafEntries: number } | null {
+  get superEdgeStats(): { hits: number; misses: number; visits: number; entries: number; leafLinks: number; leafEntries: number; leafRows: number } | null {
     if (!this.lazyGathered) return null;
     const sc = this.lazyScratch;
-    return { hits: sc.hits, misses: sc.misses, visits: sc.visits, entries: sc.entries, leafLinks: this.leafLinksDrawn, leafEntries: this.leafLinksScratch.entries };
+    return { hits: sc.hits, misses: sc.misses, visits: sc.visits, entries: sc.entries, leafLinks: this.leafLinksDrawn, leafEntries: this.leafLinksScratch.entries, leafRows: sc.leafRows };
   }
 
   /**
