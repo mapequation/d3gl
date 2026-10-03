@@ -441,14 +441,17 @@ describe("physical-view pie highlight (#175)", () => {
     const spy = laneSpy();
     spy.reset();
 
-    // Grab the selected p1 and drag it: every move repaints through rebuild → lane re-emit.
+    // Grab the selected p1 and drag it: a move only records the pointer, and the engine's next animation
+    // frame folds it in and re-emits the lane (#367) — so wait one frame per move.
     const r = h.getBoundingClientRect();
     const ev = (type: string, x: number, y: number) =>
       h.dispatchEvent(new PointerEvent(type, { clientX: r.left + x, clientY: r.top + y, bubbles: true, button: 0, pointerId: 1 }));
+    const nextFrame = () => new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
     ev("pointerdown", 150, 100);
-    ev("pointermove", 156, 104);
-    ev("pointermove", 162, 108);
-    ev("pointermove", 168, 112);
+    for (const [x, y] of [[156, 104], [162, 108], [168, 112]] as const) {
+      ev("pointermove", x, y);
+      await nextFrame();
+    }
     ev("pointerup", 168, 112);
 
     const emitted = pieSelectedOf(spy.layers());

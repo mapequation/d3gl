@@ -2442,7 +2442,7 @@ const TAU = Math.PI * 2;
  * — one instance per wedge (its `[startFrac, endFrac]` angular sector). `radius` is per-physical (or a
  * constant) in the active `sizeMode`'s units. Group id = the physical node id, so a hover/select lights
  * the whole pie (#162). Called on every no-LOD lane emit — which includes each streamed layout frame and
- * each node-drag move, not only a data/module change — and it rebuilds + re-parses every column each
+ * each node-drag frame, not only a data/module change — and it rebuilds + re-parses every column each
  * time; caching the position-independent ones is #314. A zoom/pan never calls it (that lane is static).
  */
 export function physicalPieInstances(wedges: PhysicalPieWedges, positions: ArrayLike<number>, radius: PieRadius): InstancedPieData {

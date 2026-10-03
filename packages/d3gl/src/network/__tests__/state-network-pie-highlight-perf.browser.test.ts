@@ -25,9 +25,9 @@ import { GlBufferSpy, perfHost, sweepFrames, zoomSteps, type GlBufferUsage } fro
  *   - **zoom sweep** (selection active): the static no-LOD lane never re-emits (so `physicalPieInstances`
  *     and its per-wedge colour parse never run), accessors stay flat, no buffer churn, and the upload
  *     per frame is the ring overlay's alone.
- *   - **node-drag**: every move re-emits the pie (pre-existing, #314) but hands it the
- *     SAME cached `selected` array the selection built — no O(wedges) flag rebuild per move, and the
- *     renderer's reference check skips the flag upload.
+ *   - **node-drag**: every drag frame (the engine folds a frame's moves into one, #367) re-emits the
+ *     pie (pre-existing, #314) but hands it the SAME cached `selected` array the selection built — no
+ *     O(wedges) flag rebuild per frame, and the renderer's reference check skips the flag upload.
  *   - **LOD on**: the frontier emits no pie (pies are not LOD-aware yet, #174). The leg pins that the
  *     no-LOD pie is REMOVED when LOD switches on — it used to linger on the backend, stale — and that no
  *     pie work runs per hover or per zoom frame there. When #174 lands, this leg is where the frontier
@@ -341,25 +341,53 @@ beforeAll(async () => {
       net.setTransform({ k: 1, x: 0, y: 0 });
     }
 
-    // Node-drag of the selected pie: every move repaints through rebuild → lane re-emit.
+    // Node-drag of the selected pie: a move only records the pointer; the engine's next animation frame
+    // folds it in and re-emits the lane (#367). `requestAnimationFrame` is replaced by a queue for this
+    // leg, so each move is one frame, flushed and timed alone (as network-force-drag-perf does).
     {
+      const realRaf = globalThis.requestAnimationFrame;
+      const realCaf = globalThis.cancelAnimationFrame;
+      const queued = new Map<number, FrameRequestCallback>();
+      let frameId = 0;
+      const flush = (): void => {
+        const due = [...queued.values()];
+        queued.clear();
+        const now = performance.now();
+        for (const cb of due) cb(now);
+      };
+      globalThis.requestAnimationFrame = (cb) => {
+        queued.set(++frameId, cb);
+        return frameId;
+      };
+      globalThis.cancelAnimationFrame = (id) => void queued.delete(id);
       const grabbed = pieAt(12, 2);
-      net.select("nodes", [grabbed]);
-      const flags = lastPieFlags(lane);
-      lane.reset();
-      const radiusBefore = radiusCalls;
-      const strokeBefore = strokeCalls;
-      const [gx, gy] = screenOf(grabbed);
-      const ev = (type: string, x: number, y: number) =>
-        h.dispatchEvent(new PointerEvent(type, { clientX: r.left + x, clientY: r.top + y, bubbles: true, button: 0, pointerId: 1 }));
-      ev("pointerdown", gx, gy);
       const times: number[] = [];
-      for (let m = 1; m <= DRAG_MOVES; m++) {
-        const t0 = performance.now();
-        ev("pointermove", gx + 4 * m, gy + 3 * m);
-        times.push(performance.now() - t0);
+      let flags: Uint8Array | undefined;
+      let radiusBefore = radiusCalls;
+      let strokeBefore = strokeCalls;
+      try {
+        net.select("nodes", [grabbed]);
+        flush();
+        flags = lastPieFlags(lane);
+        lane.reset();
+        radiusBefore = radiusCalls;
+        strokeBefore = strokeCalls;
+        const [gx, gy] = screenOf(grabbed);
+        const ev = (type: string, x: number, y: number) =>
+          h.dispatchEvent(new PointerEvent(type, { clientX: r.left + x, clientY: r.top + y, bubbles: true, button: 0, pointerId: 1 }));
+        ev("pointerdown", gx, gy);
+        for (let m = 1; m <= DRAG_MOVES; m++) {
+          const t0 = performance.now();
+          ev("pointermove", gx + 4 * m, gy + 3 * m);
+          flush();
+          times.push(performance.now() - t0);
+        }
+        ev("pointerup", gx + 4 * DRAG_MOVES, gy + 3 * DRAG_MOVES);
+        for (let f = 0; f < 10; f++) flush();
+      } finally {
+        globalThis.requestAnimationFrame = realRaf;
+        globalThis.cancelAnimationFrame = realCaf;
       }
-      ev("pointerup", gx + 4 * DRAG_MOVES, gy + 3 * DRAG_MOVES);
       const refs = new Set(lane.pieEmitSelected);
       dragOff = {
         moves: DRAG_MOVES,
