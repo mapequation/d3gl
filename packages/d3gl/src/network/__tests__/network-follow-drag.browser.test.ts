@@ -10,7 +10,9 @@ import { makeTestDevice } from "../gpu/__tests__/_device.js";
  * engine eases toward — through the real gesture (pointer events on the host):
  *
  * - with the nested drag (#451): a node grabbed while a warm nested map streams is held over its frames (the
- *   solve still runs), and once the map has landed a grab re-solves the grabbed node's module;
+ *   solve still runs), and once the map has landed a grab re-solves the grabbed node's module — also while
+ *   the landed map still eases in: in a followed stream's tail (the solve landed, the ease still catching up)
+ *   and in a transition's ease, the grab finishes the ease and re-solves the module;
  * - with the GPU's unchanged-pin skip (#458): a drag during a followed warm GPU stream reaches the GPU solve
  *   through the follower's handle, and re-pinning the unchanged held set on every move writes no pin texels.
  */
@@ -104,13 +106,13 @@ function towardModule(p: Float32Array, leaf: number): [number, number] {
 }
 
 /**
- * Grab the leaf under the cursor once the view is centred on `leaf`, drag it one world unit toward its
- * module's centre and hold it there for 30 frames. Returns how many of its module's other leaves moved from
- * where the drag started (a nested drag re-solves the module; a translate-only drag moves none), how far the
- * leaf ended from where the cursor took it, and whether the drag's start moved any node (it finished a running
- * ease).
+ * Grab the leaf under the cursor once the view is centred on `leaf` (the leaf itself on a landed map; in a
+ * running ease, whichever leaf is there as the grab lands), drag it one world unit toward its module's centre
+ * and hold it there for 30 frames. Returns how many of its module's other leaves moved from where the drag
+ * started (a nested drag re-solves the module; a translate-only drag moves none), how far the leaf ended from
+ * where the cursor took it, and whether the drag's start moved the other nodes (it finished a running ease).
  */
-async function nestedDrag(net: Network, h: HTMLElement, g: NetworkGraph, leaf: number): Promise<{ siblingsMoved: number; off: number; finishedEase: boolean }> {
+async function nestedDrag(net: Network, h: HTMLElement, g: NetworkGraph, leaf: number, onStart?: () => void): Promise<{ siblingsMoved: number; off: number; finishedEase: boolean }> {
   const c = SIZE / 2;
   let hit: number | undefined;
   for (let attempt = 0; attempt < 20 && hit === undefined; attempt++) {
@@ -124,7 +126,8 @@ async function nestedDrag(net: Network, h: HTMLElement, g: NetworkGraph, leaf: n
   pointer(h, "pointerdown", c, c); // the grab is picked here, with the positions `pick` just saw
   pointer(h, "pointermove", c + 0.5 * ux * K, c + 0.5 * uy * K); // past the click slop: the drag starts
   pointer(h, "pointermove", c, c); // and back, before any frame: every node where the drag started
-  const started = g.positions.slice(); // where the drag started (a running ease would have been finished)
+  const started = g.positions.slice(); // where the drag started: a running ease finished, the landed map
+  onStart?.();
   let finishedEase = false;
   for (let i = 0; i < N && !finishedEase; i++) finishedEase = started[2 * i] !== grabbed[2 * i] || started[2 * i + 1] !== grabbed[2 * i + 1];
   const x0 = started[2 * hit]!;
@@ -176,6 +179,34 @@ describe("a drag next to a followed warm nested stream (#454, #451)", () => {
       net.destroy();
     });
   }
+
+  // The followed stream's tail (no transition: the ease chases the solve's frames, and outlasts a small solve), and
+  // a warm map eased in over a transition (the ease starts once the solve has landed): either way the map has
+  // landed and is still easing in when the grab lands.
+  for (const transition of [0, 1000]) it(`worker, ${transition ? "a transition's ease" : "a followed stream's tail"}: a grab while the landed map eases in finishes the ease and re-solves the module`, async () => {
+    const { net, h, g } = await flat();
+    // Both eases run on `performance.now`: held still until the solve has landed, so the grab is guaranteed
+    // to land mid-ease however slowly the worker answers.
+    let virtual = performance.now();
+    const clock = vi.spyOn(performance, "now").mockImplementation(() => virtual);
+    const terminate = vi.spyOn(Worker.prototype, "terminate"); // calls through
+    net.layout({ backend: "worker", nested: true, warm: true, ...(transition ? { transition } : {}) });
+    // The flat run's worker went with the call; the nested solve's worker exits with the landed layout.
+    const base = terminate.mock.calls.length;
+    expect(await until(() => terminate.mock.calls.length > base), "the nested solve never landed").toBe(true);
+    // About 130 ms into the ease (a fifth of the follower's 600 ms, an eighth of the transition), then held
+    // again for the grab.
+    for (let i = 0; i < 8; i++) {
+      virtual += 16;
+      await frames(1);
+    }
+    const drag = await nestedDrag(net, h, g, 2 * LEAVES + 3, () => clock.mockRestore());
+    expect(drag.finishedEase, "non-vacuity: the ease had ended before the grab").toBe(true);
+    expect(drag.off, "the dragged leaf left the cursor").toBeLessThan(0.05);
+    expect(drag.siblingsMoved, "a translate-only drag: the module did not re-solve around the held leaf").toBeGreaterThan(0);
+    await net.whenSettled();
+    net.destroy();
+  });
 });
 
 describe("a drag during a followed warm GPU stream re-pins through the follower without pin writes (#454, #458)", () => {

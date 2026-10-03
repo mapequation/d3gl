@@ -400,7 +400,8 @@ export interface NetworkLayoutOptions {
    * a flat map — the same heat, loop and re-cool, on the main thread whatever the backend — with the nested
    * layout's own forces (and its module links) at every level above the node, and only the node pinned:
    * its module, sibling modules and the discs above all respond; discs follow their members (rings with
-   * them). O(the re-solved modules' children + the nodes that moved) per frame.
+   * them). O(the re-solved modules' children + the nodes that moved) per frame. A grab while a landed map
+   * still eases in (a {@link transition}, or a warm stream's ease, #454) finishes the ease and drags so too.
    * @see {@link nestedLayout}
    */
   nested?: boolean | NestedLayoutConfig;
@@ -3671,13 +3672,16 @@ export class Network extends BaseEngine {
   }
 
   /**
-   * The nested layout a drag re-solves in place, when the current positions are a settled nested map of
-   * the current module tree: not while its solve still runs (the grab is held over its frames instead).
+   * The nested layout a drag re-solves in place, when the current positions are a landed nested map of the
+   * current module tree. Its discs are recorded only once the solve has landed (every `layout()` and `data()`
+   * drops them), so a grab while the solve still runs finds none and is held over its frames instead. A grab
+   * while a landed map still eases in — a transition's ease, or a followed warm stream's tail (#454) — has
+   * finished that ease first ({@link beginNodeDrag}), so the positions are the landed map's.
    */
   private nestedDragState(graph: NetworkGraph): { state: NonNullable<Network["nestedDiscs"]>; cache: NestedDragCache } | null {
     const state = this.nestedDiscs;
     // The laid-out tree must be the current one — and already built: a grab never builds one (#428).
-    if (!state || this.nestedSolving || !this.moduleTreeBuilt() || state.tree !== this.moduleTree()) return null;
+    if (!state || !this.moduleTreeBuilt() || state.tree !== this.moduleTree()) return null;
     const { tree } = state;
     const parent = tree.parent;
     if (!parent || tree.leafCount !== graph.nodeCount) return null;
