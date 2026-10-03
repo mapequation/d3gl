@@ -207,10 +207,11 @@ describe("multiple pass-through layers: memory + per-frame cost (#110)", () => {
       const buffersBefore = buffers.mark();
       const before = calls;
       chart.setSize(W + 100, H - 100);
-      // The accumulation surface follows the host: exactly two framebuffers are re-created — the
-      // offscreen export target (as before #293) and the ONE pass-through surface. A per-layer
-      // surface would make this 3 here; a resize that leaves the surface behind makes it 1.
-      expect(spy.since(surfacesBefore).framebuffers).toBe(2);
+      // The accumulation surface follows the host: exactly one framebuffer is re-created — the ONE
+      // pass-through surface. The export target is only freed on a resize and recreated by the next
+      // export (#88). A per-layer surface would make this 2 here; a resize that leaves the surface
+      // behind makes it 0.
+      expect(spy.since(surfacesBefore).framebuffers).toBe(1);
       // Only the surface is re-created, not the whole PassThroughGL: its Models and scratch
       // buffers survive, and the scratch already fits a batch of N. A destroy-and-rebuild also
       // makes exactly one framebuffer, so the surface count above cannot tell the two apart;
