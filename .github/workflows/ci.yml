@@ -147,6 +147,9 @@ jobs:
           # record at this scale — it is a one-line change, and each guard clamps itself via
           # `perfN(local, { max })`.
           PERF_BROWSER_N: "100000"
+          # TEMPORARY (#460 diagnosis, reverted before review): measure how long the files that hit the
+          # 300 s per-file watchdog really take.
+          PERF_BROWSER_FILE_BUDGET_MS: "900000"
 
   # The tier's single status check: green only when the plan and every shard are green (a
   # skipped or cancelled shard fails it too).
