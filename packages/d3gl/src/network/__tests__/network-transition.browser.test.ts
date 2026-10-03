@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from "vitest";
-import { Network, network } from "../network.js";
+import { network, type Network } from "../network.js";
 import { buildGraph, type NetworkGraph } from "../graph.js";
 import { buildModuleLODTree, type ModuleNode } from "../modules.js";
 import { nestedLayout } from "../nested-layout.js";
@@ -52,6 +52,18 @@ function shift(a: Float32Array, b: Float32Array): number {
   let s = 0;
   for (let i = 0; i < a.length / 2; i++) s += Math.hypot(a[2 * i]! - b[2 * i]!, a[2 * i + 1]! - b[2 * i + 1]!);
   return s / (a.length / 2);
+}
+
+/** The centroid. */
+function spreadCentre(p: Float32Array): { x: number; y: number } {
+  const n = p.length / 2;
+  let x = 0;
+  let y = 0;
+  for (let i = 0; i < n; i++) {
+    x += p[2 * i]!;
+    y += p[2 * i + 1]!;
+  }
+  return { x: x / n, y: y / n };
 }
 
 /** RMS distance from the centroid. */
@@ -202,36 +214,38 @@ describe("warm nested re-layout + position transitions (#328)", () => {
     net.destroy();
   });
 
-  it("a warm flat layout continues the positions on screen: no seed disc, and its first frame is a step from them (#454)", async () => {
-    const g = ring(120);
-    /** Every streamed frame's positions, as the transport hands them to the engine. */
-    class FrameProbe extends Network {
-      readonly frames: Float32Array[] = [];
-      protected override scheduleLayoutRepaint(): void {
-        this.frames.push(g.positions.slice());
-        super.scheduleLayoutRepaint();
-      }
-    }
-    const net = new FrameProbe(host(), { width: 200, height: 200 });
+  it("a warm flat layout continues the positions on screen, glides frame by frame as it spreads out, and lands on the solve (#454)", async () => {
+    const net = network(host(), { width: 200, height: 200 });
     await net.whenReady();
+    const g = ring(120);
     net.data(g).lod(false).layout({ backend: "force", iterations: 150 }); // laid out, and settled
-    const from = g.positions.slice();
-    const spread = spreadOf(from);
-    const firstFrame = async (opts: { warm: boolean }): Promise<Float32Array> => {
+    // A third of its own scale — as a nested map of a graph is to its force layout: the warm stream spreads it out.
+    const settledAt = g.positions.slice();
+    const c = spreadCentre(settledAt);
+    const from = settledAt.map((v, i) => (i % 2 ? c.y : c.x) + (v - (i % 2 ? c.y : c.x)) / 3);
+    const run = async (opts: { warm: boolean }): Promise<{ samples: Float32Array[]; to: Float32Array }> => {
       g.positions.set(from);
-      net.frames.length = 0;
-      net.layout({ backend: "worker", iterations: 60, multilevel: false, ...opts });
+      const rec = sampler(() => g.positions);
+      net.layout({ backend: "worker", iterations: 120, multilevel: false, ...opts });
       await net.whenSettled();
-      const first = net.frames[0];
-      if (!first) throw new Error("no frame streamed");
-      return first;
+      await nextFrame();
+      rec.stop();
+      return { samples: rec.samples, to: g.positions.slice() };
     };
-    // How far the first streamed frame is from the layout, over its spread. Measured 0.078: the first frame's
-    // ticks, at full heat, from a settled layout. A cold start's first frame is its disc: measured 1.31.
-    const warm = shift(await firstFrame({ warm: true }), from) / spread;
-    const cold = shift(await firstFrame({ warm: false }), from) / spread;
-    expect(warm).toBeLessThan(0.2);
-    expect(cold, "non-vacuity: a cold start's first frame is far from the layout").toBeGreaterThan(0.5);
+    const warm = await run({ warm: true });
+    const total = shift(from, warm.to);
+    expect(total / spreadOf(from), "non-vacuity: the layout spread out").toBeGreaterThan(1);
+    const moved = warm.samples.filter((s) => shift(s, from) > 0);
+    // From where the nodes are: the first frame that moved them is a small step from there, every later one too.
+    expect(shift(moved[0] ?? warm.to, from) / total, "the first frame jumped").toBeLessThan(0.15);
+    let largest = 0;
+    for (let i = 1; i < moved.length; i++) largest = Math.max(largest, shift(moved[i]!, moved[i - 1]!));
+    expect(largest / total, "a jump").toBeLessThan(0.2);
+    expect(moved.length, "too few frames between the two layouts").toBeGreaterThan(8);
+    // A cold start's first frame is its disc, far from the layout on screen.
+    const cold = await run({ warm: false });
+    const coldFirst = cold.samples.find((s) => shift(s, from) > 0) ?? cold.to;
+    expect(shift(coldFirst, from) / spreadOf(from), "non-vacuity: a cold start's first frame is near the layout").toBeGreaterThan(0.5);
     net.destroy();
   });
 
