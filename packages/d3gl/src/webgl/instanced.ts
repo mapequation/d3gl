@@ -468,7 +468,7 @@ export class InstancedPie {
  * `t = i/(M-1)` walking the path and `side ∈ {-1,1}` picking the edge. M=2 is the straight case
  * (= the original 4-vertex strip); higher M traces a smooth bezier (#104 N6c).
  */
-function lineTemplate(samples: number): Float32Array {
+export function lineTemplate(samples: number): Float32Array {
   const M = Math.max(2, samples | 0);
   const t = new Float32Array(M * 4);
   for (let i = 0; i < M; i++) {
@@ -527,6 +527,7 @@ export class InstancedLines {
       u_transform: clipFromView({ k: 1, x: 0, y: 0 }, width || 1, height || 1),
       u_screen: 0,
       u_viewport: [width, height],
+      u_pickBase: 0,
       ...highlightUniforms(1), // links recolour toward the highlight hue (recolor = 1)
     };
     const bufferLayout = [
@@ -583,6 +584,10 @@ export class InstancedLines {
   setSizeMode(mode: "world" | "screen"): void {
     this.uniforms["u_screen"] = mode === "screen" ? 1 : 0;
   }
+  /** Offset added to the pick pass's instance id (#447), so two pickable link layers decode to disjoint ids. */
+  setPickBase(base: number): void {
+    this.uniforms["u_pickBase"] = base;
+  }
   /** Set shader-highlight uniforms (#162) — recolour/dim with no geometry touch (shared with the pick twin). */
   setHighlight(h: InstancedHighlight): void {
     applyHighlight(this.uniforms, h);
@@ -600,6 +605,7 @@ export class InstancedLines {
    * automatically reflected in the pick pass — ids/count are unchanged, only positions moved.
    */
   update(device: Device, data: InstancedLinesData): boolean {
+    if (data.index) return false; // indexed draw (#447) is a different renderer — caller must recreate
     const newSamples = Math.max(2, (data.samples ?? 2) | 0);
     if (newSamples !== this._samples) return false; // vertex template changed — caller must recreate
     if (data.count > this._capacity) {
@@ -674,9 +680,9 @@ export class InstancedLines {
 }
 
 /** Triangle template for an arrowhead: tip (0,0), base (2,-1)/(2,1), triangle-list. */
-const ARROW_TEMPLATE = new Float32Array([0, 0, 2, -1, 2, 1]);
+export const ARROW_TEMPLATE = new Float32Array([0, 0, 2, -1, 2, 1]);
 /** One-sided "half" arrowhead (#104 N6c): tip (0,0), base on one side only (2,0)/(2,1). */
-const HALF_ARROW_TEMPLATE = new Float32Array([0, 0, 2, 0, 2, 1]);
+export const HALF_ARROW_TEMPLATE = new Float32Array([0, 0, 2, 0, 2, 1]);
 
 export class InstancedArrows {
   count: number;
@@ -727,6 +733,7 @@ export class InstancedArrows {
       u_transform: clipFromView({ k: 1, x: 0, y: 0 }, width || 1, height || 1),
       u_screen: 0,
       u_viewport: [width || 1, height || 1],
+      u_pickBase: 0,
       ...highlightUniforms(1), // arrows recolour with their link
     };
     const bufferLayout = [
@@ -784,6 +791,10 @@ export class InstancedArrows {
   setSizeMode(mode: "world" | "screen"): void {
     this.uniforms["u_screen"] = mode === "screen" ? 1 : 0;
   }
+  /** Offset added to the pick pass's instance id (#447), so two pickable link layers decode to disjoint ids. */
+  setPickBase(base: number): void {
+    this.uniforms["u_pickBase"] = base;
+  }
   /** Set shader-highlight uniforms (#162) — recolour/dim with no geometry touch (shared with the pick twin). */
   setHighlight(h: InstancedHighlight): void {
     applyHighlight(this.uniforms, h);
@@ -796,6 +807,7 @@ export class InstancedArrows {
    * The pick model shares the same instance buffers, so pick geometry tracks the new endpoints automatically.
    */
   update(device: Device, data: InstancedArrowsData): boolean {
+    if (data.index) return false; // indexed draw (#447) is a different renderer — caller must recreate
     if (!!data.half !== this._half) return false; // vertex template changed — caller must recreate
     if (data.count > this._capacity) {
       // Grow: destroy old per-instance buffers and allocate at the new capacity.
@@ -881,7 +893,7 @@ export class InstancedArrows {
  * the barbed head (2 triangles). Each vertex is `(code, t)`: `code` selects a named anchor or the
  * inner(8)/outer(9) edge bezier evaluated at `t` (see INSTANCED_HALF_ARROW_VS).
  */
-function halfArrowTemplate(samples: number): Float32Array {
+export function halfArrowTemplate(samples: number): Float32Array {
   const M = Math.max(2, samples | 0);
   const v: number[] = [];
   // Source foot: x02(1) x0(0) x04(3), then x02(1) x04(3) x03(2).
@@ -899,7 +911,7 @@ function halfArrowTemplate(samples: number): Float32Array {
 }
 
 /** Path samples per bezier edge for the half-arrow strip. */
-const HALF_ARROW_SAMPLES = 24;
+export const HALF_ARROW_SAMPLES = 24;
 
 export class InstancedHalfArrows {
   count: number;
@@ -953,6 +965,7 @@ export class InstancedHalfArrows {
       u_transform: clipFromView({ k: 1, x: 0, y: 0 }, width || 1, height || 1),
       u_screen: 0,
       u_viewport: [width, height],
+      u_pickBase: 0,
       ...highlightUniforms(1), // half-arrows recolour toward the highlight hue
     };
     const bufferLayout = [
@@ -1010,6 +1023,10 @@ export class InstancedHalfArrows {
   setSizeMode(mode: "world" | "screen"): void {
     this.uniforms["u_screen"] = mode === "screen" ? 1 : 0;
   }
+  /** Offset added to the pick pass's instance id (#447), so two pickable link layers decode to disjoint ids. */
+  setPickBase(base: number): void {
+    this.uniforms["u_pickBase"] = base;
+  }
   /** Set shader-highlight uniforms (#162) — recolour/dim with no geometry touch (shared with the pick twin). */
   setHighlight(h: InstancedHighlight): void {
     applyHighlight(this.uniforms, h);
@@ -1022,6 +1039,7 @@ export class InstancedHalfArrows {
    * The pick model shares the same instance buffers, so pick geometry tracks the new endpoints automatically.
    */
   update(device: Device, data: InstancedHalfArrowsData): boolean {
+    if (data.index) return false; // indexed draw (#447) is a different renderer — caller must recreate
     const newSamples = Math.max(2, (data.samples ?? HALF_ARROW_SAMPLES) | 0);
     if (newSamples !== this._samples) return false; // vertex template changed — caller must recreate
     if (data.count > this._capacity) {

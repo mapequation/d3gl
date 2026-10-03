@@ -302,11 +302,12 @@ in vec2 a_target;           // per-instance world target
 in float a_width;           // per-instance line width
 in vec4 a_color;            // per-instance RGBA (unorm8x4 -> 0..1)
 in float a_bend;            // per-instance control offset ⟂ to the chord, as a fraction of |chord| (0 = straight)${HL_UNIFORMS}
+uniform float u_pickBase;   // added to the instance's pick id (#447): two pickable link layers decode apart
 out vec4 v_color;
 flat out float v_id;        // instance index for GPU-readback picking (#141); ignored by FILL_FS, read by PICK_FS
 void main() {
   v_color = a_color;${HL_APPLY}
-  v_id = float(gl_InstanceID);
+  v_id = float(gl_InstanceID) + u_pickBase;
   float t = a_corner.x;
   float side = a_corner.y;
   float hw = a_width * 0.5;
@@ -356,6 +357,7 @@ in float a_size;      // per-instance arrow size (world or px per sizeMode)
 in float a_radius;    // per-instance target node radius (setback to the boundary)
 in float a_bend;      // per-instance bend, matching the link's, so the head aligns with its end tangent
 in vec4 a_color;${HL_UNIFORMS}
+uniform float u_pickBase;   // added to the instance's pick id (#447): two pickable link layers decode apart
 out vec4 v_color;
 flat out float v_id;  // instance index for GPU-readback picking (#141); ignored by FILL_FS, read by PICK_FS
 vec2 worldToPx(vec2 w) {
@@ -364,7 +366,7 @@ vec2 worldToPx(vec2 w) {
 }
 void main() {
   v_color = a_color;${HL_APPLY}
-  v_id = float(gl_InstanceID);
+  v_id = float(gl_InstanceID) + u_pickBase;
   bool screen = u_screen > 0.5;
   vec2 src = screen ? worldToPx(a_source) : a_source;
   vec2 tgt = screen ? worldToPx(a_target) : a_target;
@@ -409,6 +411,7 @@ in vec2 a_radii;      // per-instance (r0, r1)
 in vec2 a_widths;     // per-instance (width, oppositeWidth)
 in float a_bend;      // per-instance bend, a fraction of the chord (sign picks the bow side)
 in vec4 a_color;      // per-instance RGBA (unorm8x4 -> 0..1)${HL_UNIFORMS}
+uniform float u_pickBase;   // added to the instance's pick id (#447): two pickable link layers decode apart
 out vec4 v_color;
 flat out float v_id;  // instance index for GPU-readback picking (#141); ignored by FILL_FS, read by PICK_FS
 vec2 bez(vec2 p0, vec2 c, vec2 p2, float t) {
@@ -421,7 +424,7 @@ vec2 worldToPx(vec2 w) {
 }
 void main() {
   v_color = a_color;${HL_APPLY}
-  v_id = float(gl_InstanceID);
+  v_id = float(gl_InstanceID) + u_pickBase;
   float code = a_kind.x;
   float t = a_kind.y;
   bool screen = u_screen > 0.5;
@@ -524,3 +527,80 @@ in vec2 v_uv;
 uniform sampler2D u_tex;
 out vec4 fragColor;
 void main() { fragColor = texture(u_tex, v_uv); }`;
+
+// ── Indexed link draws (#447) ──────────────────────────────────────────────────────────────────────────────
+// The same three link shaders, reading every per-instance input from per-EDGE tables resident as textures
+// (edge e at texel (e % width, e / width)), indexed by the one per-instance attribute `a_edge`. A draw lists
+// only the edges it shows (4 B each per frame) while the tables upload once per style / position change. The
+// pick id is the edge id. Built from the attribute versions, so the geometry code is shared, not copied.
+
+const EDGE_FETCH = `
+in float a_edge;            // per-instance edge id (#447)
+in float a_fade;            // per-instance alpha multiplier (the cross-fade band)
+vec4 edgeFetch(highp sampler2D t) {
+  int id = int(a_edge + 0.5);
+  ivec2 sz = textureSize(t, 0);
+  return texelFetch(t, ivec2(id % sz.x, id / sz.x), 0);
+}`;
+
+/** `vs` with the attribute inputs in `fields` turned into globals that `fetch` fills from the edge tables. */
+function indexedVS(vs: string, fields: string[], samplers: string[], fetch: string): string {
+  let out = vs;
+  for (const f of fields) {
+    const re = new RegExp(`\\nin (float|vec2|vec4) ${f};[^\\n]*`);
+    if (!re.test(out)) throw new Error(`indexedVS: no attribute ${f}`);
+    out = out.replace(re, (_m, type: string) => `\n${type} ${f};`);
+  }
+  const decl = samplers.map((u) => `\nuniform highp sampler2D ${u};`).join("") + EDGE_FETCH;
+  out = out.replace("void main() {", `${decl}\nvoid fetchEdge() {${fetch}\n}\nvoid main() {\n  fetchEdge();`);
+  out = out.replace("v_id = float(gl_InstanceID) + u_pickBase;", "v_id = a_edge + u_pickBase;");
+  return out;
+}
+
+const HL_FIELDS = ["a_group", "a_group2", "a_selected"];
+const SELECTED_FETCH = `
+  a_color = edgeFetch(u_edgeColor);
+  a_color.a *= a_fade;
+  a_selected = edgeFetch(u_edgeSelected).r > 0.0 ? 1.0 : 0.0;`;
+
+/** Lines by edge (the ends stay per-instance attributes); style0 (width, bend, group, group2); colour; selected. */
+export const INDEXED_LINE_VS = indexedVS(
+  INSTANCED_LINE_VS,
+  ["a_width", "a_color", "a_bend", ...HL_FIELDS],
+  ["u_edgeStyle0", "u_edgeColor", "u_edgeSelected"],
+  `
+  vec4 s = edgeFetch(u_edgeStyle0);
+  a_width = s.x;
+  a_bend = s.y;
+  a_group = s.z;
+  a_group2 = s.w;${SELECTED_FETCH}`,
+);
+
+/** Arrowheads by edge: style0 (size, radius, bend, group); style1 (group2); colour; selected. */
+export const INDEXED_ARROW_VS = indexedVS(
+  INSTANCED_ARROW_VS,
+  ["a_size", "a_radius", "a_bend", "a_color", ...HL_FIELDS],
+  ["u_edgeStyle0", "u_edgeStyle1", "u_edgeColor", "u_edgeSelected"],
+  `
+  vec4 s = edgeFetch(u_edgeStyle0);
+  a_size = s.x;
+  a_radius = s.y;
+  a_bend = s.z;
+  a_group = s.w;
+  a_group2 = edgeFetch(u_edgeStyle1).x;${SELECTED_FETCH}`,
+);
+
+/** Half-arrows by edge: style0 (r0, r1, width, oppositeWidth); style1 (bend, group, group2); colour; selected. */
+export const INDEXED_HALF_ARROW_VS = indexedVS(
+  INSTANCED_HALF_ARROW_VS,
+  ["a_radii", "a_widths", "a_bend", "a_color", ...HL_FIELDS],
+  ["u_edgeStyle0", "u_edgeStyle1", "u_edgeColor", "u_edgeSelected"],
+  `
+  vec4 s = edgeFetch(u_edgeStyle0);
+  a_radii = s.xy;
+  a_widths = s.zw;
+  vec4 t = edgeFetch(u_edgeStyle1);
+  a_bend = t.x;
+  a_group = t.y;
+  a_group2 = t.z;${SELECTED_FETCH}`,
+);

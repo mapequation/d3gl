@@ -162,8 +162,14 @@ class TransitionProbe extends Network {
     super.setInteracting(v);
   }
   /** A worker message's repaint request — what the transport calls after copying the positions. */
+  /** One streamed layout frame's repaint, as a running layout (#426: its tree's crowding held) delivers it. */
   streamFrame(): void {
+    (this as unknown as { layoutLive: boolean }).layoutLive = true;
     this.scheduleLayoutRepaint();
+  }
+  /** The streamed layout ended (its settle's other work is not what this file times). */
+  endStream(): void {
+    (this as unknown as { layoutLive: boolean }).layoutLive = false;
   }
   protected override syncZoomToView(): void {
     this.cameraSyncs++;
@@ -186,6 +192,8 @@ interface Phase {
   /** `computeLODStyle` passes and spatial tree builds over the phase's frames (warm-up excluded). */
   stylePasses: number;
   treeBuilds: number;
+  /** Crowding passes (#426): O(tree) like the style pass, so a transition frame runs none either. */
+  crowdingPasses: number;
   created: number;
   deleted: number;
   uploadedPerFrame: number;
@@ -269,6 +277,7 @@ beforeAll(async () => {
       const style0 = real.lod?.lodStylePasses ?? 0;
       const builds0 = real.lod?.mortonTopologyBuilds ?? 0;
       const [box0, syncs0, cuts0, styles0] = [box.calls, net.cameraSyncs, work.cuts, work.styleResolves];
+      const crowd0 = real.lod?.lodCrowdingPasses ?? 0;
       const mark = spy.mark();
       const ts: number[] = [];
       for (let i = 1; i <= FRAMES; i++) {
@@ -282,6 +291,7 @@ beforeAll(async () => {
         medianMs: ts[Math.floor(ts.length / 2)]!,
         stylePasses: (real.lod?.lodStylePasses ?? 0) - style0,
         treeBuilds: (real.lod?.mortonTopologyBuilds ?? 0) - builds0,
+        crowdingPasses: (real.lod?.lodCrowdingPasses ?? 0) - crowd0,
         created: used.created,
         deleted: used.deleted,
         uploadedPerFrame: used.uploadedBytes / FRAMES,
@@ -310,6 +320,7 @@ beforeAll(async () => {
             flush();
           }),
         );
+        engine.endStream();
         // A transition frame: one queued frame of a long a → b transition (it never ends here).
         graph.positions.set(a);
         engine.layout({ backend: "positions", positions: b, transition: 3_600_000 });
@@ -391,6 +402,7 @@ beforeAll(async () => {
             flush();
           }),
         );
+        net.endStream();
         kept &&= internals.fitOnLayout;
       }
       internals.fitOnLayout = false;
@@ -401,6 +413,11 @@ beforeAll(async () => {
     flush();
     fitOff = fitLeg();
     net.setTransform({ k: 1, x: 0, y: 0 }); // back to the view the spatial leg runs at
+    // Glyphs that overlap (#426): the lattice is 8 apart, so 3 px glyphs at k ≈ 1 never overlap and the overlap rule
+    // would open every cell — this leg is about a spatial tree's aggregates (refit per transition frame, rebuilt per
+    // streamed frame), so its glyphs are 10 px wide, as a dense map's are. The cold start's all-leaves frame has its
+    // own guard (network-spatial-lod-coldstart-perf).
+    net.style({ nodeRadius: 5 });
     net.lod({ source: "spatial" }); // the spatial tree (#343): rebuilt per streamed frame, refit per transition frame
     flush();
     spatial = leg(net);
@@ -433,6 +450,11 @@ describe(`network() position transition — per-frame cost vs a streamed layout 
     expect(spatial.transition.treeBuilds, "spatial trees built during the transition").toBe(0);
     expect(spatial.transition.stylePasses, "style passes during the spatial tree's transition").toBe(0);
     expect(off.transition.stylePasses + off.transition.treeBuilds).toBe(0);
+    // The crowding (#426) waits for the layout to settle: no pass on a streamed frame (the footprint rule alone
+    // while a layout runs; it costs 0.35-1 s per frame at 2M nodes), none on a transition frame.
+    expect(on.streamed.crowdingPasses, "crowding passes on the module tree's streamed frames").toBe(0);
+    expect(spatial.streamed.crowdingPasses, "crowding passes on the spatial tree's streamed frames").toBe(0);
+    expect(on.transition.crowdingPasses + spatial.transition.crowdingPasses + off.transition.crowdingPasses, "crowding passes during a transition").toBe(0);
   });
 
   for (const [name, get, ceiling] of [["LOD OFF", () => off, FRAME_MS_OFF], ["LOD ON", () => on, FRAME_MS_ON], ["LOD ON spatial", () => spatial, FRAME_MS_ON]] as const) {

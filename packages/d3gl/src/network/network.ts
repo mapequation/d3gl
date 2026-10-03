@@ -1,9 +1,9 @@
 import { BaseEngine, type BaseEngineOptions, type HoverHit, type InteractiveLayerOptions, type LaneInteractive, type NodeDragSession } from "../map/base-engine.js";
-import { networkLayers, networkLayersFromCache, noLodStyleCache, drawsLinks, frontierCircles, frontierHalos, boundaryRings, traceBoundaryRings, superEdges, makeSuperEdgesScratch, emitNodes, emitLinks, emitArrows, emitHalfLinks, traceFrontierGlyphs, traceFrontierHalos, traceSuperHalfArrows, traceSuperLines, traceSuperArrows, physicalPieInstances, tracePieWedges, rgbaCss, pickNodes, regionNodes, resolveNodeRadii, resolveNodeRadiusAggregate, resolveImportance, resolveFlowBorder, resolveNodeFill, moduleBorderValues, applyModuleBorder, treeBorderColors, resolveLinkWidthOf, resolveLinkColorOf, resolveLinkStrokeOf, flowBorderInnerRadii, type ResolvedNetworkStyle, type SuperEdgeStyleResolved, type SuperEdgesData, type ModuleBoundaryResolved, type AggregateOutlineResolved, type NoLodStyleCache, type NodeRadiusSpec, type ImportanceSpec, type FlowBorderSpec, type NodeFillSpec, type ConstBorder, type LinkWidthSpec, type LinkColorSpec, type LinkStyle, type RGBAValue } from "./glyphs.js";
+import { networkLayers, networkLayersFromCache, noLodStyleCache, drawsLinks, frontierCircles, frontierHalos, boundaryRings, traceBoundaryRings, superEdges, makeSuperEdgesScratch, withLeafLinks, makeLeafLinksScratch, leafLinkEdges, emitNodes, emitLinks, emitArrows, emitHalfLinks, traceFrontierGlyphs, traceFrontierHalos, traceSuperHalfArrows, traceSuperLines, traceSuperArrows, physicalPieInstances, tracePieWedges, rgbaCss, pickNodes, regionNodes, resolveNodeRadii, resolveNodeRadiusAggregate, resolveImportance, resolveFlowBorder, resolveNodeFill, moduleBorderValues, applyModuleBorder, treeBorderColors, resolveLinkWidthOf, resolveLinkColorOf, resolveLinkStrokeOf, flowBorderInnerRadii, type ResolvedNetworkStyle, type SuperEdgeStyleResolved, type SuperEdgesData, type ModuleBoundaryResolved, type AggregateOutlineResolved, type NoLodStyleCache, type NodeRadiusSpec, type ImportanceSpec, type FlowBorderSpec, type NodeFillSpec, type ConstBorder, type LinkWidthSpec, type LinkColorSpec, type LinkStyle, type RGBAValue } from "./glyphs.js";
 import { rgb } from "d3-color";
 import { DRAG_HEAT, ForceLayout, seedPositions, type ForceParams } from "./force.js";
 import { multilevelLayout, type CoarsenOptions } from "./coarsen.js";
-import { buildLODTree, buildMortonLODTree, mortonRootBox, makeMortonScratch, makeLODBoundsScratch, findMortonCell, computeLODGeometry, computeLODPositions, computeLODStyle, lodTreeFromTopology, updateLODPositionsForLeaves, cut, makeCutScratch, makeCutBoundaries, declutterFrontier, makeDeclutterFrontierScratch, pickFrontier, regionFrontier, visibleWorldRect, leavesUnder, ancestorAwareSelected, type BoundaryDiscs, type CutBoundaries, type LODTree, type MortonBox, type SpatialLODOptions } from "./lod.js";
+import { buildLODTree, buildMortonLODTree, mortonRootBox, makeMortonScratch, makeLODBoundsScratch, makeLODCrowdingScratch, findMortonCell, computeLODCrowding, computeLODGeometry, computeLODPositions, computeLODStyle, crowdingHorizon, lodTreeFromTopology, updateLODPositionsForLeaves, cut, makeCutScratch, makeCutBoundaries, declutterFrontier, makeDeclutterFrontierScratch, pickFrontier, regionFrontier, visibleWorldRect, leavesUnder, ancestorAwareSelected, type BoundaryDiscs, type CutBoundaries, type LODTree, type MortonBox, type SpatialLODOptions } from "./lod.js";
 import { DEFAULT_LABEL_TEXT, type LabelAnchor, type LabelStyle } from "../labels/label-layer.js";
 import { TextMeasurer, canvasFont } from "../labels/measure.js";
 import { buildModuleLODTree, checkModuleLinks, flattenModuleLinks, flattenModuleRecords, moduleRecordIndex, type ModuleLink, type ModuleNode } from "./modules.js";
@@ -16,13 +16,14 @@ import { gatherCandidates, descendingByKey, descendingInListOrder, CandidateList
 import type { StateNetworkGraph } from "./state-graph.js";
 import { buildModuleTopologyOffThread, deferredLayoutHandle, startNestedWorkerLayout, startWorkerLayout, type StreamedLODTree, type WorkerLayoutHandle, type WorkerLayoutOptions } from "./worker-transport.js";
 import { buildLeafIncidence, lazySuperEdges, makeLazySuperEdgesScratch, type LeafIncidence } from "./lazy-super-edges.js";
+import { incidenceSourceEdges } from "./spatial-rows.js";
 import type { LeafStyle, LODView } from "./lod-frame.js";
 import { startGpuNestedLayout } from "./gpu/gpu-nested-transport.js";
 import { startGpuLayout } from "./gpu/gpu-transport.js";
 import { WebGLBackend } from "../webgl/webgl-backend.js";
 import type { NetworkGraph } from "./graph.js";
 import { layoutBox, layoutFitTransform, fitCameraPath, type FitBox } from "./fit.js";
-import type { InstancedLayer, ViewTransform } from "../core/index.js";
+import type { InstancedArrowsData, InstancedHalfArrowsData, InstancedLayer, InstancedLinesData, ViewTransform } from "../core/index.js";
 import { InstancedLane, type SelectionStrategy } from "../core/instanced-lane.js";
 import { StableColumns } from "../core/stable-columns.js";
 import { resolveRingColors, ringCircles } from "../map/highlight-ring.js";
@@ -416,7 +417,8 @@ export interface NestedLayoutConfig {
 /**
  * Level-of-detail (#103): an adaptive hierarchy cut so a large network draws only what's visible.
  * Each pan/zoom re-cuts a retained coarsening tree — dense regions collapse to aggregate glyphs and
- * expand into their members as you zoom in — bounding per-frame work to the visible frontier. Opt-in
+ * expand into their members as you zoom in, as soon as their glyphs would no longer overlap (#426) —
+ * bounding per-frame work to the visible frontier. Opt-in
  * via {@link Network.lod}; off by default (every node/link drawn). The tree's geometry updates as the
  * layout converges (so LOD helps during the solve, not only after), and the zoom-time path re-cuts
  * only the visible frontier. Best paired with `style({ sizeMode: "screen" })`.
@@ -476,8 +478,11 @@ export interface NetworkLODOptions {
   moduleLinks?: ArrayLike<ModuleLink>;
   /**
    * Expand threshold (px): an aggregate whose on-screen footprint (`2·extent·k`) reaches this
-   * expands into its children; below it it draws as a single glyph. Larger → coarser (fewer, bigger
-   * aggregates). After a `layout({ nested })`, a module's extent is its disc's radius (#329).
+   * expands into its children; below it it draws as a single glyph — unless its members' glyphs would
+   * not overlap at the current zoom, when it expands whatever its size (#426: an aggregate is drawn only
+   * where its members would overlap, so a small graph opens on every node). The threshold therefore sets
+   * how coarse the map is where members *would* overlap. Larger → coarser (fewer, bigger aggregates).
+   * After a `layout({ nested })`, a module's extent is its disc's radius (#329).
    *
    * **Omit it** to get the tree-adaptive default (#191), which scales with how many children the
    * tree's finest aggregates hold: 48 px for structural coarsening / a spatial quadtree (unchanged),
@@ -654,10 +659,10 @@ const DEFAULT_NODE_RADIUS = 4;
 const DEFAULT_NODE_FILL = "#4878d0";
 const DEFAULT_LINK_WIDTH = 1;
 const DEFAULT_LINK_STROKE = "#999999";
-const LAYER_NAMES = ["module-boundaries", "links", "arrows", "node-halos", "nodes"] as const;
+const LAYER_NAMES = ["module-boundaries", "leaf-links", "links", "leaf-arrows", "arrows", "node-halos", "nodes"] as const;
 /** Base-lane layers the shader highlight (#162) drives — nodes + links (not the aggregate halos, which
  *  carry no group/selected and so render un-dimmed). */
-const HL_LAYERS = ["nodes", "links", "arrows"] as const;
+const HL_LAYERS = ["nodes", "leaf-links", "links", "leaf-arrows", "arrows"] as const;
 /** Scale a laid-out graph's positions (in place) to fill the view at the default `k = 1` zoom — the
  *  same "scale the layout, don't fit-transform" approach the directed-map-of-modules example uses, so
  *  the network opens framed without a custom transform (which would fight d3-zoom's own transform, #171).
@@ -883,20 +888,33 @@ export class Network extends BaseEngine {
   private readonly mortonScratch = makeMortonScratch();
   /** Bounding-box scratch for every main-thread position pass (#343): 16 B per aggregate once used. */
   private readonly lodBounds = makeLODBoundsScratch();
+  /** Scratch for every main-thread crowding pass (#426): 28 B per aggregate once used, plus ~6 B per child
+   *  of each wide module it indexes (see LODCrowdingScratch). */
+  private readonly lodCrowding = makeLODCrowdingScratch();
   /** Super-edge gather state for spatial trees (#343, #433): cover stamps, row memo, gather arrays. */
   private readonly lazyScratch = makeLazySuperEdgesScratch();
+  /** Leaf-link scratch (#447): a stamp per leaf and the frame's leaf-link edge list, reused (4 B per leaf + 4 B per edge). */
+  private readonly leafLinksScratch = makeLeafLinksScratch();
+  /** Links the last emit drew as graph edges between two kept leaves (#447), for {@link superEdgeStats}. */
+  private leafLinksDrawn = 0;
   /** The graph's per-incidence weights/directions for the lazy gather, built once per graph + direction. */
   private leafIncidence: LeafIncidence | null = null;
+  /** Each CSR entry's edge id at its source's entry (#447): the leaf links' index walk, once per graph. */
+  private leafEdgeEntries: { graph: NetworkGraph; ids: Uint32Array } | null = null;
+  /** The leaf links' per-edge `selected` flags (#447), for one graph, tree, selection and direction (never mutated). */
+  private leafLinkSelected: { graph: NetworkGraph; tree: LODTree; sel: ReadonlySet<string | number> | undefined; directed: boolean; flags: Uint8Array } | null = null;
   /** The last cut's frontier before declutter (a view of {@link cutScratch}): the lazy gather's covers. */
   private cutFrontier: Uint32Array = new Uint32Array(0);
   /** Whether a spatial tree's gather (lazy or from rows) has run (so {@link superEdgeStats} reports it). */
   private lazyGathered = false;
-  /** Version of the leaf style a spatial worker tree aggregates (#343), bumped per resolved style. */
+  /** Version of the leaf style a worker tree aggregates (#343) and computes its crowding with (#426), bumped
+   *  per resolved style and per explicit `expandPx`. */
   private lodStyleVersion = 0;
   /** The view last sent to a spatial stream (#433), whose kept glyphs' super-edge rows its trees carry. */
   private lodViewPosted: LODView | null = null;
   private lodStyleVersionOf: ResolvedNetworkStyle | null = null;
-  /** The leaf style version the spatial worker stream last received. */
+  private lodStyleExpandPx: number | undefined = undefined;
+  /** The leaf style version the worker's LOD stream last received. */
   private lodStylePosted = -1;
   /** Whether the current `lodTree` was built from a provided module hierarchy (N6 / #104). */
   private lodModules = false;
@@ -904,6 +922,10 @@ export class Network extends BaseEngine {
    *  A `"gpu"` layout sets it once its device resolves: to the worker fallback (#351), or to the GPU solve,
    *  whose LOD worker streams the tree (#377) — cleared if that worker fails. */
   private lodStreaming = false;
+  /** An asynchronous layout (worker, GPU, nested or transition) is running and has not settled (#426): the LOD
+   *  tree's crowding is held at `Infinity` meanwhile — the cut opens aggregates by the footprint rule alone —
+   *  and computed once when it settles or stops. */
+  private layoutLive = false;
   /** True while a nested layout (#324) solves on the worker/gpu. It streams positions only — never a LOD
    *  tree — so the main thread keeps even a structural tree's geometry up to date meanwhile. */
   private nestedSolving = false;
@@ -1115,6 +1137,7 @@ export class Network extends BaseEngine {
     this.lodStreamed = null;
     this.lodBox = undefined;
     this.leafIncidence = null;
+    this.leafEdgeEntries = null;
     this.lodSpatial = false;
     this.lodModules = false;
     this.lodHasGeometry = false;
@@ -1281,6 +1304,7 @@ export class Network extends BaseEngine {
     if (!options) {
       this.releaseStreamedTrees(true); // nothing draws a spatial worker tree any more (#343)
       this.leafIncidence = null;
+      this.leafEdgeEntries = null;
       this.lodOptions = null;
       this.lodTree = null;
       this.lodWorkerTree = null;
@@ -1840,17 +1864,38 @@ export class Network extends BaseEngine {
 
   /**
    * The leaf style a spatial tree aggregates (#343) — radii, declutter importance, flow-border metric,
-   * colours — and its version, bumped whenever the resolved style changes. A worker-built spatial tree
+   * colours — plus what a worker tree's crowding needs (#426: the size mode, the explicit `expandPx`), and
+   * its version, bumped whenever the resolved style or `expandPx` changes. A worker-built spatial tree
    * carries the version it was aggregated with, so a stale one is re-aggregated here.
    */
   private lodLeafStyle(graph: NetworkGraph): { style: LeafStyle; version: number } {
     const r = this.resolvedStyleCached(graph);
-    if (this.lodStyleVersionOf !== r) {
+    const expandPx = this.lodOptions?.expandPx;
+    if (this.lodStyleVersionOf !== r || this.lodStyleExpandPx !== expandPx) {
       this.lodStyleVersionOf = r;
+      this.lodStyleExpandPx = expandPx;
       this.lodStyleVersion++;
     }
     const links = drawsLinks(graph, r); // the worker builds super-edge rows only for drawn links (#433)
-    return { style: { radii: r.nodeRadii, weight: r.importance, border: r.flowBorder?.metric, colors: r.nodeColors, links }, version: this.lodStyleVersion };
+    const crowding = { screenSized: r.sizeMode === "screen", expandPx };
+    return { style: { radii: r.nodeRadii, weight: r.importance, border: r.flowBorder?.metric, colors: r.nodeColors, links, crowding }, version: this.lodStyleVersion };
+  }
+
+  /**
+   * The tree's crowding (#426) from its current positions and radii — so the cut opens an aggregate whose
+   * members would not overlap — computed up to the cut's own expand threshold ({@link crowdingHorizon}).
+   * O(tree size) plus the cross pairs near sibling borders; run with every position + style pass on a
+   * main-thread tree (never per zoom frame) — except while a layout runs ({@link layoutLive}), when the tree
+   * gets none (`Infinity`, the footprint rule alone) until it settles: the pass costs 0.35-1 s at 2M nodes.
+   */
+  private updateLODCrowding(tree: LODTree): void {
+    if (!this.lodOptions || !this.graph) return;
+    if (this.layoutLive) {
+      tree.clearZoom.fill(Infinity); // while a layout runs, the footprint rule alone (#426)
+      return;
+    }
+    const screenSized = this.resolvedStyleCached(this.graph).sizeMode === "screen";
+    computeLODCrowding(tree, { screenSized, expandPx: crowdingHorizon(tree, this.lodOptions.expandPx) }, this.lodCrowding);
   }
 
   /**
@@ -2003,11 +2048,12 @@ export class Network extends BaseEngine {
     const useLod = !!this.lodOptions && !this.lodUsesModules();
     // The spatial tree (#343) is rebuilt by a worker per frame, style aggregated there too — on the worker
     // backend, on a "gpu" layout's worker fallback (#351) and by the GPU layout's LOD worker alike — with the
-    // super-edge rows of the glyphs the view the cut runs at keeps (#433).
+    // super-edge rows of the glyphs the view the cut runs at keeps (#433). Either tree's crowding (#426) is
+    // computed there per frame from the same leaf style.
     const lodSource = useLod ? this.lodKind() : null;
-    const spatialStyle = lodSource === "spatial" ? this.lodLeafStyle(graph) : null;
+    const leafStyle = useLod ? this.lodLeafStyle(graph) : null;
     this.lodWorkerSource = lodSource === "spatial" ? "spatial" : useLod ? "structure" : null;
-    if (spatialStyle) this.lodStylePosted = spatialStyle.version;
+    if (leafStyle) this.lodStylePosted = leafStyle.version;
     const workerOpts: WorkerLayoutOptions = {
       width: this.width,
       height: this.height,
@@ -2018,9 +2064,9 @@ export class Network extends BaseEngine {
       // multilevel seed so the graph is coarsened once and the main thread never coarsens.
       lod: useLod,
       lodSource: lodSource === "spatial" ? "spatial" : "structure",
-      lodStyle: spatialStyle?.style,
-      lodStyleVersion: spatialStyle?.version,
-      lodView: spatialStyle ? this.postedLODView(this.resolvedStyleCached(graph)) : undefined,
+      lodStyle: leafStyle?.style,
+      lodStyleVersion: leafStyle?.version,
+      lodView: lodSource === "spatial" ? this.postedLODView(this.resolvedStyleCached(graph)) : undefined,
       coarsen: this.lodOptions?.coarsen,
     };
     // Unset until the transport returns, so a callback can never match a cleared `layoutHandle` (null).
@@ -2275,9 +2321,11 @@ export class Network extends BaseEngine {
    *  geometry, the final reframe + release of a streaming fit, one rebuild. */
   private onLayoutSettled(handle: WorkerLayoutHandle, prepare?: () => void): void {
     this.layoutHandle = handle;
+    this.layoutLive = true;
     void handle.settled.then(
       () => {
         if (this.layoutHandle !== handle) return; // a newer layout superseded this one
+        this.layoutLive = false; // the crowding is computed from here on: once below, then per position pass
         this.transition = null;
         this.nestedSolving = false;
         prepare?.();
@@ -2289,6 +2337,7 @@ export class Network extends BaseEngine {
         // The run never started (#428: no module tree could be built). whenSettled() hands the caller the
         // error; the engine only stops waiting for the run.
         if (this.layoutHandle !== handle) return;
+        this.layoutLive = false;
         this.transition = null;
         this.nestedSolving = false;
       },
@@ -2604,14 +2653,21 @@ export class Network extends BaseEngine {
    *  (#427). A nested layout's transition stopped mid-ease leaves the nodes between
    *  two layouts, so its discs no longer hold: the modules (and their rings) fall back to their members'
    *  centroid + extent (#329). A spatial LOD tree, refit through the transition, is rebuilt where the
-   *  nodes stopped (#343). */
+   *  nodes stopped (#343), and any tree's crowding (#426), held through it, is recomputed there. */
   stopLayout(): this {
     const running = this.transition?.running === true;
+    const live = this.layoutLive;
     const interrupted = running && this.nestedDiscs !== null;
     this.haltLayout();
     if (interrupted) this.nestedDiscs = null;
-    // The modules and rings redraw around where the members stopped; a spatial tree is rebuilt there.
-    if (interrupted || (running && this.lodSpatial)) this.settleLODPositions();
+    // The modules and rings redraw around where the members stopped; a spatial tree is rebuilt there, and
+    // the crowding follows the nodes to where they stopped. A streamed run stopped mid-way held the crowding
+    // (#426): its tree — the worker's, or one the main thread refit per frame — gets it now, as at a settle.
+    if (running) this.settleLODPositions();
+    else if (live && this.lodTree) {
+      this.recomputeLODGeometry(true);
+      this.requestRedraw();
+    }
     return this;
   }
 
@@ -2619,6 +2675,7 @@ export class Network extends BaseEngine {
   private haltLayout(): void {
     this.layoutHandle?.stop();
     this.layoutHandle = null;
+    this.layoutLive = false;
     this.transition = null;
     // The fit lives exactly as long as its layout: a stopped one leaves the camera where it is, and nothing
     // after the stop — a late repaint request, the next frame — may reframe it.
@@ -2697,13 +2754,15 @@ export class Network extends BaseEngine {
    * under a glyph (`misses`), and the edge incidences those rebuilds walked (`visits`); on a tree a layout
    * streamed with its worker-built rows (#433), the row entries — plus the kept leaves' own graph edges — it
    * read from them instead (`entries`): at the view the rows were built for, a repaint rebuilds nothing
-   * (`misses: 0, visits: 0`). `null` until a spatial tree has drawn links. Introspection for debugging and
-   * tests: a re-emit of an unchanged view reports `misses: 0, visits: 0`.
+   * (`misses: 0, visits: 0`); and the links it drew as graph edges between two kept leaves (`leafLinks`, #447),
+   * which bypass the gather as the full-detail path draws them, with the CSR entries their index walk read
+   * (`leafEntries`: the kept leaves' degrees, summed). `null` until a spatial tree has drawn links.
+   * Introspection for debugging and tests: a re-emit of an unchanged view reports `misses: 0, visits: 0`.
    */
-  get superEdgeStats(): { hits: number; misses: number; visits: number; entries: number } | null {
+  get superEdgeStats(): { hits: number; misses: number; visits: number; entries: number; leafLinks: number; leafEntries: number } | null {
     if (!this.lazyGathered) return null;
     const sc = this.lazyScratch;
-    return { hits: sc.hits, misses: sc.misses, visits: sc.visits, entries: sc.entries };
+    return { hits: sc.hits, misses: sc.misses, visits: sc.visits, entries: sc.entries, leafLinks: this.leafLinksDrawn, leafEntries: this.leafLinksScratch.entries };
   }
 
   /**
@@ -2967,7 +3026,7 @@ export class Network extends BaseEngine {
 
   /** Resolve a picked link instance (#141) under LOD: instance i → super-edge `ids[i]` (the directed
    *  tree-node pair) + summed `flows[i]`. Returns a HoverHit with `layer: "links"`, or null if out of range. */
-  private lodLinkHit(tree: LODTree, ids: number[], flows: number[] | undefined, index: number): HoverHit | null {
+  private lodLinkHit(tree: LODTree, ids: ArrayLike<number>, flows: ArrayLike<number> | undefined, index: number): HoverHit | null {
     if (index < 0 || index >= ids.length) return null;
     const pair = ids[index]!;
     const source = Math.floor(pair / tree.size);
@@ -3132,12 +3191,13 @@ export class Network extends BaseEngine {
   private invalidateNoLodSelected(): void {
     this.noLodSelectedNodes = null;
     this.noLodSelectedLinks = null;
+    this.leafLinkSelected = null;
   }
 
   /** Shader-highlight columns for the emitted LOD super-edges (#162): `groups` = source tree-node,
    *  `groups2` = target (undirected incident hover only), `selected` = outgoing-from-a-selected-(sub)tree
    *  (ancestor-aware). Parallel to `ids` (shared by all link layers). */
-  private linkHighlightColumns(ids: number[], size: number, isSel: ((g: number) => boolean) | null, directed: boolean): { groups: Float32Array; groups2?: Float32Array; selected: Uint8Array } {
+  private linkHighlightColumns(ids: ArrayLike<number>, size: number, isSel: ((g: number) => boolean) | null, directed: boolean): { groups: Float32Array; groups2?: Float32Array; selected: Uint8Array } {
     const n = ids.length;
     const groups = new Float32Array(n);
     const groups2 = directed ? undefined : new Float32Array(n);
@@ -3295,9 +3355,10 @@ export class Network extends BaseEngine {
         this.repaintDuringDrag();
         this.flushFrame(); // this tick runs inside an animation frame: draw it here (with any pending zoom), not a frame late
         if (cool >= 0 && (--cool < 0 || sim.converged)) {
-          // Re-cooled (or tail spent) — stop the loop. The drag frames refit a spatial tree (#343); rebuild it
-          // once now that the nodes have come to rest, as a release does on the other backends.
-          if (this.lodSpatial) this.settleLODPositions();
+          // Re-cooled (or tail spent) — stop the loop. The drag frames refit a spatial tree (#343) and held every
+          // tree's crowding (#426) while the whole layout reflowed; settle both once now that the nodes have come
+          // to rest, as a release does on the other backends.
+          this.settleLODPositions();
           return;
         }
         raf = rafFn(frame);
@@ -3378,6 +3439,10 @@ export class Network extends BaseEngine {
    * re-aggregates the style (O(nodes) + O(tree) colour work per frame). Its extents grow while members
    * leave their cells, so the frontier can widen for the length of the gesture; {@link settleLODPositions}
    * (drag release, the `force` drag's cool-down tail) and a transition's settle rebuild it once.
+   *
+   * The crowding (#426, {@link LODTree.clearZoom}) is held too — it is an O(tree) pass, like the style — so
+   * the aggregates the view opened stay open through the gesture; the same settle recomputes it where the
+   * nodes came to rest.
    */
   private applyMovedGeometry(): void {
     const moved = this.moved;
@@ -3397,9 +3462,13 @@ export class Network extends BaseEngine {
    *  no main-thread geometry. */
   private settleLODPositions(): void {
     if (this.drawsWorkerTree() || !this.lodReady() || !this.lodTree || !this.graph) return;
-    // A spatial tree is rebuilt (#343): the moved nodes may have left their cells.
+    // A spatial tree is rebuilt (#343): the moved nodes may have left their cells. Either way the crowding
+    // (#426), held through the gesture, is recomputed where the nodes came to rest.
     if (this.lodSpatial) this.recomputeLODGeometry();
-    else computeLODPositions(this.lodTree, this.graph.positions, this.lodDiscs(this.lodTree), this.lodBounds);
+    else {
+      computeLODPositions(this.lodTree, this.graph.positions, this.lodDiscs(this.lodTree), this.lodBounds);
+      this.updateLODCrowding(this.lodTree);
+    }
     this.moved = null; // the exact pass covers a drag move still waiting for its frame
     this.requestRedraw();
     this.flushFrame(); // draw now — and only once, if that frame (or a zoom) was pending
@@ -3494,7 +3563,14 @@ export class Network extends BaseEngine {
    * view they were built for), else from the graph's edges through the leaf runs — O(Σ degree of the kept
    * glyphs' nodes) when the cut changed a row's covers — and O(row length) on a held view.
    */
-  private frontierSuperEdges(tree: LODTree, frontier: Uint32Array, style: ResolvedNetworkStyle): SuperEdgesData {
+  /**
+   * The frame's super-edges. Where the tree's leaves are the graph's nodes, the links between two kept leaves
+   * are not gathered (#447): they are the graph edges, drawn as the full-detail path draws them. `combine`
+   * (the Canvas/SVG Scene) appends them to the result as copies of that path's cached columns
+   * ({@link withLeafLinks}); the WebGL lane draws them with the full-detail link layer itself instead
+   * ({@link leafLinkLayers}) and takes the gathered links alone.
+   */
+  private frontierSuperEdges(tree: LODTree, frontier: Uint32Array, style: ResolvedNetworkStyle, combine = true): SuperEdgesData {
     const opts = this.lodOptions;
     const edgeStyle: SuperEdgeStyleResolved = {
       linkStyle: style.linkStyle,
@@ -3507,16 +3583,26 @@ export class Network extends BaseEngine {
       crossLevelEdges: opts?.crossLevelEdges,
       anchor: this.anchorBoundaries(),
       fadeAlpha: this.fadeAlpha ?? undefined,
+      leafLinks: false,
     };
     const view = visibleWorldRect(this.transform, this.width, this.height);
     const graph = this.graph;
-    if (tree.leafOrder && !tree.superEdgeOffset && graph && graph.nodeCount === tree.leafCount) {
+    // The gathers keep the links that touch an aggregate (#447), where the tree's leaves are the graph's nodes.
+    const leaves = graph !== null && graph.nodeCount === tree.leafCount ? graph : null;
+    edgeStyle.leafLinks = leaves !== null;
+    let gathered: SuperEdgesData;
+    if (tree.leafOrder && !tree.superEdgeOffset && leaves) {
       const sc = this.cutScratch;
       const covers = { drawn: this.cutFrontier, kept: frontier, culled: sc.culled.subarray(0, sc.culledCount), split: sc.split.subarray(0, sc.splitCount) };
       this.lazyGathered = true;
-      return lazySuperEdges(tree, covers, edgeStyle, view, graph.csr, this.incidenceOf(graph, style.directed), this.lazyScratch);
+      gathered = lazySuperEdges(tree, covers, edgeStyle, view, leaves.csr, this.incidenceOf(leaves, style.directed), this.lazyScratch);
+    } else {
+      gathered = superEdges(tree, frontier, edgeStyle, view, this.superEdgesScratch);
     }
-    return superEdges(tree, frontier, edgeStyle, view, this.superEdgesScratch);
+    if (!leaves || !combine) return gathered;
+    const out = withLeafLinks(tree, leaves, frontier, this.noLodCache(leaves, style), gathered, this.fadeAlpha ?? undefined, this.leafLinksScratch);
+    this.leafLinksDrawn = out.ids.length - gathered.ids.length;
+    return out;
   }
 
   /** The graph's per-incidence weights (and directions, for directed links) the lazy gather sums (#343),
@@ -3527,6 +3613,114 @@ export class Network extends BaseEngine {
     const built = buildLeafIncidence(graph, directed);
     this.leafIncidence = built;
     return built;
+  }
+
+  /**
+   * The links between two kept leaves (#447), drawn as the full-detail path draws them: by **edge id** from
+   * that path's cached per-edge style columns ({@link noLodCache}: widths, colours, radii, bends, highlight
+   * groups — the same arrays, so the GPU packs them into its resident tables once per style), listing only
+   * the edges whose two ends are kept leaves of this cut (`leafLinkEdges` in glyphs.ts: O(Σ degree of the kept
+   * leaves), in edge order). Per frame, per shown link: its edge id (4 B), its ends at the leaves' drawn
+   * centres (16 B) and, in a cross-fade band, its fade (4 B; a link's alpha follows its least-visible end, as a
+   * gathered one's does) — each handed back unchanged when its values are ({@link StableColumns.float32Into}),
+   * so a frame that moves and re-cuts nothing uploads nothing. A selection change rebuilds the per-edge
+   * `selected` flags once (ancestor-aware, as every LOD glyph's). Emitted on every frame while links draw,
+   * an empty list included (it draws nothing), so the GPU builds the tables and sizes its per-instance lanes
+   * for every edge once, when the lane registers, and never creates a GPU object while the view or the layout
+   * changes. Memory: 8 B per edge for the entry map (once per graph), 1 B per edge for the flags, and
+   * 2 × 20-24 B per shown link of columns, reused.
+   */
+  private leafLinkLayers(
+    tree: LODTree,
+    graph: NetworkGraph,
+    style: ResolvedNetworkStyle,
+    frontier: Uint32Array,
+    sel: ReadonlySet<string | number> | undefined,
+    isSel: ((g: number) => boolean) | null,
+    pick: true | undefined,
+  ): { links: InstancedLayer; arrows?: InstancedLayer } | null {
+    const cache = this.noLodCache(graph, style);
+    if (cache.kind === "no-links") return null;
+    const E = graph.edgeCount;
+    const src = graph.source;
+    const tgt = graph.target;
+    let entries = this.leafEdgeEntries;
+    if (!entries || entries.graph !== graph) {
+      entries = { graph, ids: incidenceSourceEdges(graph.csr, graph) };
+      this.leafEdgeEntries = entries;
+    }
+    const sc = this.leafLinksScratch;
+    const m = leafLinkEdges(graph, frontier, entries.ids, sc);
+    const list = sc.edges;
+    this.leafLinksDrawn = m;
+    const memo = this.lodColumns;
+    const index = memo.float32Into("leaf-links.index", m, (out) => {
+      for (let i = 0; i < m; i++) out[i] = list[i] ?? 0;
+    });
+    const cx = tree.cx;
+    const cy = tree.cy;
+    const sources = memo.float32Into("leaf-links.sources", 2 * m, (out) => {
+      for (let i = 0; i < m; i++) {
+        const a = src[list[i] ?? 0] ?? 0;
+        out[2 * i] = cx[a] ?? 0;
+        out[2 * i + 1] = cy[a] ?? 0;
+      }
+    });
+    const targets = memo.float32Into("leaf-links.targets", 2 * m, (out) => {
+      for (let i = 0; i < m; i++) {
+        const b = tgt[list[i] ?? 0] ?? 0;
+        out[2 * i] = cx[b] ?? 0;
+        out[2 * i + 1] = cy[b] ?? 0;
+      }
+    });
+    const fa = this.fadeAlpha;
+    const fade = fa
+      ? memo.float32Into("leaf-links.fade", m, (out) => {
+          for (let i = 0; i < m; i++) {
+            const e = list[i] ?? 0;
+            out[i] = Math.min(fa[src[e] ?? 0] ?? 1, fa[tgt[e] ?? 0] ?? 1);
+          }
+        })
+      : undefined;
+    // Ancestor-aware, as every LOD glyph's: a link is selected with its source's leaf (directed) or either end.
+    let selected: Uint8Array | undefined;
+    if (isSel) {
+      const key = this.leafLinkSelected;
+      if (key && key.graph === graph && key.tree === tree && key.sel === sel && key.directed === style.directed) selected = key.flags;
+      else {
+        const n = graph.nodeCount;
+        const leafSel = new Uint8Array(n);
+        for (let v = 0; v < n; v++) leafSel[v] = isSel(v) ? 1 : 0;
+        const directed = style.directed;
+        const flags = new Uint8Array(E);
+        for (let e = 0; e < E; e++) flags[e] = leafSel[src[e] ?? 0] || (!directed && leafSel[tgt[e] ?? 0]) ? 1 : 0;
+        this.leafLinkSelected = { graph, tree, sel, directed, flags };
+        selected = flags;
+      }
+    }
+    const inst = { index, tableCount: E, sources, targets, fade, count: m, groups: cache.groupSource, groups2: cache.groupTarget, selected };
+    const sizeMode = style.sizeMode;
+    const ha = cache.halfArrows;
+    if (cache.kind === "half-arrows" && ha) {
+      const halfArrows: InstancedHalfArrowsData = { ...inst, radii: ha.radii, widths: ha.widths, bends: ha.bends, colors: ha.colors };
+      return { links: { name: "leaf-links", primitive: "half-arrows", pickable: pick, pickBase: 0, halfArrows, sizeMode } };
+    }
+    const ln = cache.lines;
+    if (!ln) return null;
+    const lines: InstancedLinesData = { ...inst, widths: ln.widths, colors: ln.colors };
+    if (ln.bends) {
+      lines.bends = ln.bends;
+      lines.samples = ln.samples;
+    }
+    const links: InstancedLayer = { name: "leaf-links", primitive: "lines", pickable: pick, pickBase: 0, lines, sizeMode };
+    const ar = cache.arrows;
+    if (!ar) return { links };
+    const arrowData: InstancedArrowsData = { ...inst, radii: ar.radii, sizes: ar.sizes, colors: ar.colors };
+    if (ar.bends) {
+      arrowData.bends = ar.bends;
+      arrowData.half = ar.half;
+    }
+    return { links, arrows: { name: "leaf-arrows", primitive: "arrows", pickable: pick, pickBase: 0, arrows: arrowData, sizeMode } };
   }
 
   /**
@@ -3562,7 +3756,11 @@ export class Network extends BaseEngine {
       // (directed) arrowheads, the same glyph the non-LOD path uses. A node keeps edges to on-frontier
       // or off-screen neighbours (the same visible rect the cut uses); both half-arrow and line
       // arrowheads honour sizeMode in-shader (the tip sets back to the node boundary in either space).
-      const { halfArrows, lines, arrows, ids, flows } = this.frontierSuperEdges(tree, frontier, style);
+      // Links between two kept leaves (#447) are drawn by edge id from the full-detail link columns
+      // ({@link leafLinkLayers}); the gathered links touch an aggregate and pick after them (ids offset by the edge count).
+      const leafGraph = graph.nodeCount === tree.leafCount ? graph : null;
+      const leafBase = leafGraph ? leafGraph.edgeCount : 0;
+      const { halfArrows, lines, arrows, ids, flows } = this.frontierSuperEdges(tree, frontier, style, leafGraph === null);
       // #162: attach the shader-highlight columns — group = link source id (matched against the hovered
       // id → recolour that node's outgoing links), group2 = target for undirected incident hover, selected
       // = outgoing-from-a-selected-(sub)tree flag. The shader recolours/dims from these; no CPU colour
@@ -3599,12 +3797,20 @@ export class Network extends BaseEngine {
         if (arrows.bends) arrows.bends = memo.float32("arrows.bends", arrows.bends);
       }
       const pick = this.pickLinksEnabled || undefined; // flag link layers into the GPU pick pass (#141)
-      if (halfArrows && halfArrows.count > 0) layers.push({ name: "links", primitive: "half-arrows", pickable: pick, halfArrows, sizeMode: style.sizeMode });
-      if (lines && lines.count > 0) layers.push({ name: "links", primitive: "lines", pickable: pick, lines, sizeMode: style.sizeMode });
-      if (arrows && arrows.count > 0) layers.push({ name: "arrows", primitive: "arrows", pickable: pick, arrows, sizeMode: style.sizeMode });
+      const leaf = leafGraph ? this.leafLinkLayers(tree, leafGraph, style, frontier, sel, isSel, pick) : null;
+      if (leaf) layers.push(leaf.links);
+      if (halfArrows && halfArrows.count > 0) layers.push({ name: "links", primitive: "half-arrows", pickable: pick, pickBase: leafBase, halfArrows, sizeMode: style.sizeMode });
+      if (lines && lines.count > 0) layers.push({ name: "links", primitive: "lines", pickable: pick, pickBase: leafBase, lines, sizeMode: style.sizeMode });
+      if (leaf?.arrows) layers.push(leaf.arrows);
+      if (arrows && arrows.count > 0) layers.push({ name: "arrows", primitive: "arrows", pickable: pick, pickBase: leafBase, arrows, sizeMode: style.sizeMode });
       // Link picking (#141): instance i (gl_InstanceID) of every emitted link layer is super-edge i, so
       // one resolve maps the decoded id → its directed tree-node pair (ids[i]) + summed flow (flows[i]).
-      if (this.pickLinksEnabled) this.linkResolve = (i) => this.lodLinkHit(tree, ids, flows, i);
+      // A leaf link's id is its edge (below `leafBase`): the same hit LOD off returns for it (#447).
+      if (this.pickLinksEnabled) {
+        this.linkResolve = leafGraph
+          ? (i) => (i < leafBase ? this.noLodLinkHit(leafGraph, i) : this.lodLinkHit(tree, ids, flows, i - leafBase))
+          : (i) => this.lodLinkHit(tree, ids, flows, i);
+      }
     }
     // Aggregate-outline affordance: a halo ring behind collapsed-module glyphs (not leaves), under the
     // nodes, so a module reads as expandable. WebGL/LOD-only (the vector full-graph draw has no aggregates).
@@ -3696,22 +3902,32 @@ export class Network extends BaseEngine {
     if (kind !== "spatial") this.leafIncidence = null; // only a spatial tree's gathers read it (2-10 B per edge)
     const moduleTree = kind === "modules" ? this.moduleTree() : undefined;
     if (!moduleTree && this.lodWorkerTree && this.lodWorkerSource === kind) {
+      // Send the worker a newer style (and crowding inputs, #426) for the frames still to come.
+      const { style, version } = this.lodLeafStyle(this.graph);
+      if (this.lodStylePosted !== version && this.layoutHandle?.setLODStyle) {
+        this.layoutHandle.setLODStyle(style, version);
+        this.lodStylePosted = version;
+      }
       if (kind === "spatial") {
-        // The worker aggregated the style of the version it had; re-aggregate here only for a newer one,
-        // and send the worker the new style for the frames still to come.
-        const { style, version } = this.lodLeafStyle(this.graph);
-        if (this.lodStylePosted !== version && this.layoutHandle?.setLODStyle) {
-          this.layoutHandle.setLODStyle(style, version);
-          this.lodStylePosted = version;
-        }
+        // The worker aggregated the style of the version it had, and computed the crowding on a settled frame
+        // only (#426); redo the style here for a newer one, and the crowding for a newer style or a tree that
+        // has none once the layout has settled (a relayed GPU frame, or a run stopped mid-way).
         const header = this.lodStreamed?.header;
         if (header && header.styleVersion !== version) {
           computeLODStyle(this.lodWorkerTree, nodeRadii, leafWeight, leafBorder, leafColors);
           header.styleVersion = version;
+          header.crowding = false;
+        }
+        if (header && !header.crowding && !this.layoutLive) {
+          this.updateLODCrowding(this.lodWorkerTree);
+          header.crowding = true;
         }
       } else {
         computeLODStyle(this.lodWorkerTree, nodeRadii, leafWeight, leafBorder, leafColors, radiusAggregate, fillAggregate);
         this.applyLODBorderStyle(this.lodWorkerTree, resolved);
+        // A streaming worker writes no crowding (#426); once it has settled (idle, writing nothing) the
+        // crowding is computed here, once — at the settle, and for a new style.
+        if (!this.lodStreaming) this.updateLODCrowding(this.lodWorkerTree);
       }
       this.lodTree = this.lodWorkerTree;
       this.lodModules = false;
@@ -3758,6 +3974,7 @@ export class Network extends BaseEngine {
       this.lodBox = box;
       const tree = buildMortonLODTree(graph.positions, graph.nodeCount, { ...this.lodOptions.spatial, box }, this.mortonScratch);
       computeLODGeometry(tree, graph, nodeRadii, leafWeight, leafBorder, leafColors, undefined, undefined, this.lodBounds);
+      this.updateLODCrowding(tree);
       this.lodTree = tree;
       this.lodSpatial = true;
       this.lodModules = false;
@@ -3771,6 +3988,7 @@ export class Network extends BaseEngine {
     }
     computeLODGeometry(this.lodTree, graph, nodeRadii, leafWeight, leafBorder, leafColors, radiusAggregate, this.lodDiscs(this.lodTree), this.lodBounds, fillAggregate);
     this.applyLODBorderStyle(this.lodTree, resolved);
+    this.updateLODCrowding(this.lodTree);
     this.lodHasGeometry = true;
   }
 
@@ -4090,22 +4308,30 @@ export class Network extends BaseEngine {
       emit && opts.superEdges !== false && graph && drawsLinks(graph, style)
         ? this.frontierSuperEdges(tree, frontier, style) // shared with the lane emit — they never run concurrently
         : { ids: [] as number[] };
+    // The Scene keys its drawables by an array of ids: the pair id, or for a leaf link (#447) its graph edge
+    // past every pair id (two parallel edges share a pair), copied once here from the frame's typed ids.
+    const seIds: number[] = Array.from(se.ids);
+    const leafEdges = "leafEdges" in se ? se.leafEdges : undefined;
+    if (leafEdges) {
+      const past = tree.size * tree.size;
+      for (let i = 0; i < leafEdges.length; i++) seIds[i] = past + (leafEdges[i] ?? 0);
+    }
     // Screen-mode super-edge shapes BAKE at the current zoom (constant-px tip/setback/bend terms), the
     // same trick the full-graph path uses; lines need no bake (world endpoints + per-line px width).
     const seBake = screen ? this.transform.k || 1 : 1;
     const isHalf = !!se.halfArrows;
     this.registerLayer({
       name: "links",
-      data: se.ids,
-      ids: se.ids,
+      data: seIds,
+      ids: seIds,
       // A half-arrow is one filled shape (baked to world in screen mode); a line keeps the sizeMode.
       sizeMode: isHalf ? "world" : style.sizeMode,
       ...(isHalf
         ? { fill: (_d, i) => (se.halfArrows ? rgbaCss(se.halfArrows.colors, i) : "") }
         : { stroke: (_d, i) => (se.lines ? rgbaCss(se.lines.colors, i) : "") }),
       build: (g) => {
-        if (se.halfArrows) traceSuperHalfArrows(g, se.halfArrows, se.ids, seBake);
-        else if (se.lines) traceSuperLines(g, se.lines, se.ids);
+        if (se.halfArrows) traceSuperHalfArrows(g, se.halfArrows, seIds, seBake);
+        else if (se.lines) traceSuperLines(g, se.lines, seIds);
       },
     });
     // Line-style directed arrowheads (the half-arrow's head is fused into its own filled shape, so this
@@ -4113,12 +4339,12 @@ export class Network extends BaseEngine {
     const arrowBake = !isHalf && style.directed && screen ? this.transform.k || 1 : 1;
     this.registerLayer({
       name: "arrows",
-      data: se.ids,
-      ids: se.ids,
+      data: seIds,
+      ids: seIds,
       sizeMode: arrowBake !== 1 ? "world" : style.sizeMode,
       fill: (_d, i) => (se.arrows ? rgbaCss(se.arrows.colors, i) : ""),
       build: (g) => {
-        if (se.arrows) traceSuperArrows(g, se.arrows, se.ids, arrowBake);
+        if (se.arrows) traceSuperArrows(g, se.arrows, seIds, arrowBake);
       },
     });
 

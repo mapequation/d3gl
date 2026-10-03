@@ -12,7 +12,7 @@ import {
   pickFrontier,
 } from "../lod.js";
 import { buildHierarchy, multilevelSeed } from "../coarsen.js";
-import { lodGeometryViews, lodGeometryByteLength } from "../worker-protocol.js";
+import { lodGeometryViews, lodGeometryByteLength, makeLODGeometry } from "../worker-protocol.js";
 import { frontierCircles, superEdges } from "../glyphs.js";
 import { buildGraph } from "../graph.js";
 
@@ -152,14 +152,17 @@ describe("worker-LOD split (#103)", () => {
     expect(cx[4]).toBeCloseTo(1); // aggregate {0,1} centroid
   });
 
-  it("lodGeometryViews packs [cx, cy, extent] contiguously", () => {
+  it("lodGeometryViews packs [cx, cy, extent, clearZoom] contiguously", () => {
     const size = 6;
     const buffer = new ArrayBuffer(lodGeometryByteLength(size));
-    expect(lodGeometryByteLength(size)).toBe(3 * size * 4);
-    const { cx, cy, extent } = lodGeometryViews(buffer, size);
+    expect(lodGeometryByteLength(size)).toBe(4 * size * 4);
+    const { cx, cy, extent, clearZoom } = lodGeometryViews(buffer, size);
     expect(cx.length).toBe(size);
     expect(cy.byteOffset).toBe(size * 4);
     expect(extent.byteOffset).toBe(2 * size * 4);
+    expect(clearZoom.byteOffset).toBe(3 * size * 4);
+    // A fresh buffer reads as "no crowding yet" once made through makeLODGeometry (#426), never as 0.
+    expect(Array.from(makeLODGeometry(new ArrayBuffer(lodGeometryByteLength(size)), size).clearZoom)).toEqual(new Array(size).fill(Infinity));
   });
 });
 

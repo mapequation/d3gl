@@ -243,8 +243,9 @@ demand (e.g. before a programmatic export).
 Drawing every node and edge stops scaling long before 10M. `net.lod({ … })` turns on an **adaptive
 hierarchy cut**: d3gl keeps the multilevel coarsening tree around after layout and, each frame, walks
 it top-down for the current view — a dense region collapses to a single **aggregate glyph**, and
-expands into its members only once its on-screen footprint grows past a threshold as you zoom in. Per
-frame the engine touches the visible *frontier*, not the whole graph.
+expands into its members as soon as their glyphs would no longer overlap, or once its on-screen
+footprint grows past a threshold as you zoom in. Per frame the engine touches the visible *frontier*,
+not the whole graph.
 
 ```ts
 net
@@ -263,6 +264,13 @@ net.lod(false); // back to drawing every element
 
 What it composes:
 
+- **Overlap decides where to aggregate.** An aggregate is drawn only where its members' glyphs would
+  overlap: once they would clear one another at the current zoom — each at its own radius, and never
+  smaller than half a pixel — the cut opens it, whatever its size. So a small graph shows every node at
+  the fit view, a large one still aggregates its dense regions, and a sparse corner of a large one opens
+  first — one rule for every graph size and every tree, with no node-count threshold. The zoom at which a
+  node's members clear is computed with the layout and the style (not per frame), so the cut tests one
+  number per node it visits.
 - **Aggregates** carry their subtree's centroid and a radius (area-additive `√Σr²`, or — when sizing
   by an additive metric like `flow` — the same node scale applied to the summed child value, so a
   module reads as its total flow). Aggregate identity is stable, so they don't pop as you pan.
@@ -280,7 +288,9 @@ What it composes:
   way each underlying edge is counted once.
   `superEdges: false` suppresses them under LOD only; to drop links everywhere — LOD on *or* off — use
   `style({ linkStyle: "none" })` instead.
-- **`expandPx`** is that threshold, in absolute pixels. **Leave it out** and each tree picks its own:
+- **`expandPx`** is the footprint threshold, in absolute pixels — it sets how coarse the map is where
+  members *would* overlap (an aggregate whose members clear opens before it). **Leave it out** and each
+  tree picks its own:
   the cut scales the default by how many children the tree's *finest* aggregates hold, so structural
   coarsening (2 members per aggregate) keeps the familiar ~48px while a provided module partition
   (30–60 members, 5–12× bigger on screen) gets a module-sized threshold — `lod({ modules })` opens on
@@ -345,9 +355,13 @@ net
   .layout({ backend: "worker", iterations }); // …so the worker rebuilds the tree as it streams (or "gpu": its LOD worker)
 ```
 
-- **Bounded by the screen.** The frontier is set by the view area over the expand threshold, not by the
-  graph: a few hundred glyphs at the fit view and up to ~2k when zoomed in, so the cut and declutter
-  cost next to nothing at any size.
+- **Bounded by the screen where glyphs overlap.** The footprint rule sets the frontier by the view area
+  over the expand threshold, not by the graph: a few hundred glyphs at the fit view and up to ~2k when
+  zoomed in, so the cut and declutter cost next to nothing at any size. The overlap rule adds the members
+  of every cell whose own glyphs clear one another. The nodes of one cell do not overlap each other, but
+  nodes of neighbouring cells may, so where glyphs are small next to their spacing (a sparse layout, or
+  `sizeMode: "world"` zoomed in) the frontier can reach every visible node, as with LOD off. A bottom cell
+  (up to 8 nodes) opens as soon as its members fit.
 - **It follows the layout.** A tree built from older positions blows up as nodes wander out of their
   cells, so the `"worker"` backend **rebuilds it in the worker on every streamed frame** — topology,
   geometry and aggregated style, handed to the main thread whole (transferred, not copied) — and stops

@@ -27,19 +27,23 @@
  */
 import {
   buildMortonTopology,
+  computeLODCrowding,
   computeLODPositions,
   computeLODStyle,
   cut,
   declutterFrontier,
+  crowdingHorizon,
   lodTreeFromTopology,
   makeCutScratch,
   makeDeclutterFrontierScratch,
   makeLODBoundsScratch,
+  makeLODCrowdingScratch,
   makeMortonScratch,
   mortonRootBox,
   type CutScratch,
   type DeclutterFrontierScratch,
   type LODBoundsScratch,
+  type LODCrowdingScratch,
   type LODPositionTree,
   type LODTree,
   type MortonBox,
@@ -60,19 +64,41 @@ import {
 } from "./spatial-rows.js";
 
 /**
+ * What a tree's crowding reads of the leaf style (#426) — all a structure stream is given: the leaves' draw
+ * radii and how they are sized.
+ */
+export interface LeafSizing {
+  radii: Float32Array;
+  /**
+   * How the glyphs are sized, and the cut's explicit threshold, for the tree's crowding (#426): with it,
+   * every tree a stream rebuilds or refits carries its {@link LODTree.clearZoom} (see
+   * {@link computeLODCrowding}); without it, none (`Infinity`: only the footprint rule opens a node).
+   */
+  crowding?: LeafCrowding;
+}
+
+/**
  * The per-leaf style a spatial stream aggregates onto every rebuilt tree (#343) — the inputs of
  * {@link computeLODStyle}: draw radii, declutter importance, and optionally the flow-border metric and
- * RGBA colours. A spatial aggregate is sized area-additively (√Σr²): a cell is a region of the layout, not
- * a unit of the sizing metric, so the leaf scale is never applied to summed values here.
+ * RGBA colours — plus the sizing its crowding reads. A spatial aggregate is sized area-additively (√Σr²): a
+ * cell is a region of the layout, not a unit of the sizing metric, so the leaf scale is never applied to
+ * summed values here.
  */
-export interface LeafStyle {
-  radii: Float32Array;
+export interface LeafStyle extends LeafSizing {
   weight: Float32Array;
   border?: Float32Array;
   colors?: Uint8Array;
   /** Whether links are drawn (#433): a stream that knows the edges builds super-edge rows only then.
    *  Default true. */
   links?: boolean;
+}
+
+/** The glyph sizing and cut threshold a stream computes a tree's crowding with (#426). */
+export interface LeafCrowding {
+  /** Glyph radii are screen px (`sizeMode: "screen"`); else world units. */
+  screenSized: boolean;
+  /** The cut's explicit `expandPx`, or undefined for the tree-adaptive default ({@link crowdingHorizon}). */
+  expandPx?: number;
 }
 
 /** A packed spatial frame's shape: what {@link spatialFrameViews} needs to read it. */
@@ -87,6 +113,9 @@ export interface SpatialFrameHeader {
   styleVersion: number;
   /** The frame id it was built for (the worker's tick). */
   frame: number;
+  /** Whether `clearZoom` holds the tree's crowding (#426): only a settled frame's does; a streamed frame's is
+   *  `Infinity` (the footprint rule alone), and the engine computes the crowding once the layout settles. */
+  crowding: boolean;
   /**
    * The layout box of the frame's positions its super-edge rows were cut at, when the view followed the fit
    * (#433: `layoutBox` without stragglers). The engine frames this box while it follows the fit, so it cuts
@@ -97,9 +126,9 @@ export interface SpatialFrameHeader {
 }
 
 /**
- * One rebuilt spatial tree (#343): topology, position geometry and aggregated style, packed into one
- * transferable `buffer` (see {@link spatialFrameViews}). About 56 B per tree node plus 4 B per leaf —
- * 24 MB for a 325k-node graph — moved, not copied, between the threads. With `rows`, the tree's super-edge
+ * One rebuilt spatial tree (#343): topology, position geometry, aggregated style and crowding (#426), packed
+ * into one transferable `buffer` (see {@link spatialFrameViews}). About 60 B per tree node plus 4 B per leaf —
+ * 26 MB for a 325k-node graph — moved, not copied, between the threads. With `rows`, the tree's super-edge
  * rows (#433) in a second transferable buffer.
  */
 export interface SpatialLODFrame {
@@ -113,6 +142,7 @@ export interface SpatialFrameArrays extends MortonTopologyArrays {
   cx: Float32Array;
   cy: Float32Array;
   extent: Float32Array;
+  clearZoom: Float32Array;
   count: Uint32Array;
   radius: Float32Array;
   weight: Float32Array;
@@ -123,7 +153,7 @@ export interface SpatialFrameArrays extends MortonTopologyArrays {
 /** Bytes a packed spatial frame of these sizes needs: the 4-byte arrays first, then the byte arrays. */
 export function spatialFrameByteLength({ size, leafCount, levelCount }: MortonTopologySizes): number {
   const cells = size - leafCount;
-  const words = levelCount + 1 + (size + 1) + Math.max(0, size - 1) + 3 * size + leafCount + cells + 4 * size + 3 * size;
+  const words = levelCount + 1 + (size + 1) + Math.max(0, size - 1) + 3 * size + leafCount + cells + 5 * size + 3 * size;
   return 4 * words + 4 * size + cells;
 }
 
@@ -150,6 +180,7 @@ export function spatialFrameViews(buffer: ArrayBufferLike, { size, leafCount, le
     cx: f32(size),
     cy: f32(size),
     extent: f32(size),
+    clearZoom: f32(size),
     count: u32(size),
     radius: f32(size),
     weight: f32(size),
@@ -184,7 +215,7 @@ export function lodTreeFromSpatialFrame(frame: SpatialLODFrame): LODTree {
   return lodTreeFromTopology(
     // The empty same-level adjacency every spatial tree shares (see buildMortonTopology).
     { ...topo, edgeOffset: emptyAdjacency(header.size), edgeNeighbors: NO_NEIGHBORS },
-    { cx: v.cx, cy: v.cy, extent: v.extent },
+    { cx: v.cx, cy: v.cy, extent: v.extent, clearZoom: v.clearZoom },
     { count: v.count, radius: v.radius, weight: v.weight, border: v.border, color: v.color, leafBranching: header.leafBranching },
   );
 }
@@ -197,11 +228,19 @@ function emptyAdjacency(size: number): Uint32Array {
 }
 const NO_NEIGHBORS = new Uint32Array(0);
 
-/** A coarsening tree's per-frame state: the worker's position tree (geometry bound to the frame buffer). */
+/** What a structure stream refits per frame: the position geometry, and the crowding (#426) from its leaf radii. */
+export type StructureStreamTree = LODPositionTree & Pick<LODTree, "radius" | "clearZoom" | "leafBranching">;
+
+/** A coarsening tree's per-frame state: the worker's tree (geometry and crowding bound to the frame buffer). */
 export interface StructureLODStream {
   kind: "structure";
-  tree: LODPositionTree;
+  tree: StructureStreamTree;
   bounds: LODBoundsScratch;
+  /** The leaf sizing its crowding is computed with (#426), or null for none (`clearZoom` stays `Infinity`). */
+  style: LeafSizing | null;
+  /** The sizing whose radii the tree's leaves hold (copied once per sizing, not per frame). */
+  radiiOf: LeafSizing | null;
+  crowding: LODCrowdingScratch;
 }
 
 /**
@@ -250,12 +289,15 @@ export interface SpatialLODStream {
   box: MortonBox | undefined;
   scratch: MortonScratch;
   bounds: LODBoundsScratch;
+  crowding: LODCrowdingScratch;
   style: LeafStyle | null;
   styleVersion: number;
   /** Buffers the main thread handed back, reused before allocating. */
   pool: ArrayBuffer[];
   /** The frame id last built for (−1: none), so unchanged positions are not rebuilt. */
   built: number;
+  /** Whether the frame last built carried the crowding (a settled frame): a settled step rebuilds one that did not. */
+  builtCrowding: boolean;
   /** Frames built and not handed back yet ({@link recycleSpatialFrame}): posted, queued or still drawn. */
   outstanding: number;
   /** Whether a frame was skipped for back-pressure ({@link MAX_OUTSTANDING}) and is still to be built. */
@@ -268,9 +310,12 @@ export interface SpatialLODStream {
 
 export type LODStream = StructureLODStream | SpatialLODStream;
 
-/** A structure stream refitting `tree` (its `cx`/`cy`/`extent` bound to the buffer the main thread reads). */
-export function makeStructureLODStream(tree: LODPositionTree): StructureLODStream {
-  return { kind: "structure", tree, bounds: makeLODBoundsScratch() };
+/**
+ * A structure stream refitting `tree` (its `cx`/`cy`/`extent`/`clearZoom` bound to the buffer the main thread
+ * reads), with the crowding of `sizing` (#426) when given.
+ */
+export function makeStructureLODStream(tree: StructureStreamTree, sizing?: LeafSizing): StructureLODStream {
+  return { kind: "structure", tree, bounds: makeLODBoundsScratch(), style: sizing ?? null, radiiOf: null, crowding: makeLODCrowdingScratch() };
 }
 
 /** The directed edges a spatial stream builds super-edge rows from (#433): the layout's own edge list. */
@@ -291,7 +336,18 @@ export function makeSpatialLODStream(leafCount: number, style?: LeafStyle, style
   if (edges && edges.source.length > 0) {
     links = { graph: spatialRowsGraph(leafCount, edges), scratch: makeSpatialRowsScratch(), cut: makeCutScratch(), declutter: makeDeclutterFrontierScratch(), fade: new Float32Array(0), pool: [] };
   }
-  return { kind: "spatial", leafCount, box: undefined, scratch: makeMortonScratch(), bounds: makeLODBoundsScratch(), style: style ?? null, styleVersion: style ? styleVersion : -1, pool: [], built: -1, outstanding: 0, pending: false, links, view: view ?? null };
+  return { kind: "spatial", leafCount, box: undefined, scratch: makeMortonScratch(), bounds: makeLODBoundsScratch(), crowding: makeLODCrowdingScratch(), style: style ?? null, styleVersion: style ? styleVersion : -1, pool: [], built: -1, builtCrowding: false, outstanding: 0, pending: false, links, view: view ?? null };
+}
+
+/** Give a spatial stream a new leaf style (#343, #426): later frames aggregate it and compute the crowding with it. */
+export function setStreamStyle(stream: SpatialLODStream, style: LeafStyle, version: number): void {
+  stream.style = style;
+  stream.styleVersion = version;
+}
+
+/** Give a structure stream a new leaf sizing (#426): later frames compute the crowding with it. */
+export function setStreamSizing(stream: StructureLODStream, sizing: LeafSizing): void {
+  stream.style = sizing;
 }
 
 /** Pooled buffers kept at most (a streamed frame is usually 1-2 in flight). */
@@ -342,22 +398,40 @@ function takeBuffer(pool: ArrayBuffer[], bytes: number): ArrayBuffer {
  * **The per-frame LOD step** (#343): rebuild if spatial, else refit. For a structure stream, refits its tree's
  * position geometry to `positions` in place and returns `null`. For a spatial stream, rebuilds the Morton tree
  * over `positions` (in the stream's stable root box), refits it, aggregates the stream's leaf style onto it,
- * and returns the packed frame to transfer — or `null` when `frame` was already built (the layout has not
- * moved since: converged), or when {@link MAX_OUTSTANDING} frames are still out (back-pressure: the stream
- * marks itself `pending`, and {@link recycleSpatialFrame} says when to call again). O(tree size) either way;
- * the rebuild adds the O(leaves) sort and O(cells) splits.
+ * and returns the packed frame to transfer — or `null` when `frame` was already built (the layout has not moved
+ * since: converged), or when {@link MAX_OUTSTANDING} frames are still out (back-pressure: the stream marks
+ * itself `pending`, and {@link recycleSpatialFrame} says when to call again). O(tree size) either way; the
+ * rebuild adds the O(leaves) sort and O(cells) splits.
+ *
+ * The crowding (#426) is computed only for a `settled` frame — the layout's `done` — when the stream has a style
+ * with {@link LeafStyle.crowding}; a streamed frame's `clearZoom` is `Infinity`, so while a layout streams the
+ * cut opens aggregates by the footprint rule alone (the crowding pass costs 0.35-1 s per frame at 2M nodes). A
+ * settled step rebuilds a spatial frame already built for `frame` without the crowding. The crowding adds the
+ * cross pairs near sibling borders (see {@link computeLODCrowding}).
  */
-export function lodFrameStep(stream: LODStream, positions: ArrayLike<number>, frame: number): SpatialLODFrame | null {
+export function lodFrameStep(stream: LODStream, positions: ArrayLike<number>, frame: number, settled = false): SpatialLODFrame | null {
   if (stream.kind === "structure") {
-    computeLODPositions(stream.tree, positions, undefined, stream.bounds);
+    const tree = stream.tree;
+    computeLODPositions(tree, positions, undefined, stream.bounds);
+    const crowd = stream.style?.crowding;
+    if (settled && stream.style && crowd) {
+      // The crowding reads the leaves' radii off the tree: copy them in once per sizing.
+      if (stream.radiiOf !== stream.style) {
+        tree.radius.set(stream.style.radii.subarray(0, tree.leafCount));
+        stream.radiiOf = stream.style;
+      }
+      computeLODCrowding(tree, { screenSized: crowd.screenSized, expandPx: crowdingHorizon(tree, crowd.expandPx) }, stream.crowding);
+    } else tree.clearZoom.fill(Infinity); // streamed: the footprint rule alone
     return null;
   }
-  if (frame === stream.built) return null;
+  if (frame === stream.built && (stream.builtCrowding || !settled)) return null;
   if (stream.outstanding >= MAX_OUTSTANDING) {
     stream.pending = true; // built once a buffer comes back (see recycleSpatialFrame)
     return null;
   }
   stream.built = frame;
+  const crowding = settled && !!stream.style?.crowding;
+  stream.builtCrowding = crowding;
   stream.pending = false;
   stream.outstanding++;
   const n = stream.leafCount;
@@ -374,7 +448,7 @@ export function lodFrameStep(stream: LODStream, positions: ArrayLike<number>, fr
   });
   const { buffer, views } = out;
   if (!buffer || !views) throw new Error("lodFrameStep: the spatial tree was built without its frame buffer");
-  const tree = lodTreeFromTopology(topology, { cx: views.cx, cy: views.cy, extent: views.extent }, {
+  const tree = lodTreeFromTopology(topology, { cx: views.cx, cy: views.cy, extent: views.extent, clearZoom: views.clearZoom }, {
     count: views.count,
     radius: views.radius,
     weight: views.weight,
@@ -390,6 +464,8 @@ export function lodFrameStep(stream: LODStream, positions: ArrayLike<number>, fr
     views.border.fill(0);
   }
   if (!style?.colors) views.color.fill(0); // a reused buffer holds the last frame's colours
+  if (crowding && style?.crowding) computeLODCrowding(tree, { screenSized: style.crowding.screenSized, expandPx: crowdingHorizon(tree, style.crowding.expandPx) }, stream.crowding);
+  else views.clearZoom.fill(Infinity); // streamed, or no sizing: the footprint rule alone (a reused buffer holds the last frame's)
   // The super-edge rows of the glyphs the main thread's view will keep (#433), into a pooled buffer.
   const links = stream.links;
   const cover = links && stream.view && style?.links !== false ? keptRows(tree, positions, stream.view, links) : undefined;
@@ -401,6 +477,7 @@ export function lodFrameStep(stream: LODStream, positions: ArrayLike<number>, fr
     box,
     styleVersion: style ? stream.styleVersion : -1,
     frame,
+    crowding,
   };
   if (cover?.fitBox) header.fitBox = cover.fitBox;
   return { header, buffer, rows: cover?.rows };

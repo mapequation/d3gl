@@ -2,7 +2,7 @@ import { describe, it, expect } from "vitest";
 import { network, type Network, type NetworkHit } from "../network.js";
 import { buildGraph, type NetworkGraph } from "../graph.js";
 import type { HoverHit } from "../../map/base-engine.js";
-import { lodStylePasses, mortonTopologyBuilds } from "../lod.js";
+import { lodCrowdingPasses, lodStylePasses, mortonTopologyBuilds } from "../lod.js";
 
 /**
  * `lod({ source: "spatial" })` (#343) through the engine: the worker rebuilds a Morton tree per streamed
@@ -96,7 +96,7 @@ describe("lod({ source: 'spatial' }) (#343)", () => {
 
     // Links come from the super-edge rows the worker built with the tree (#433), which the settled tree carries.
     // At a new view the kept glyphs whose rows it cannot serve walk their leaves once; a held view then walks
-    // nothing and answers every kept glyph from the memo.
+    // nothing: every kept aggregate is answered from the memo.
     const first = net.superEdgeStats;
     expect(first).not.toBeNull();
     expect(first?.entries).toBeGreaterThan(0);
@@ -105,7 +105,9 @@ describe("lod({ source: 'spatial' }) (#343)", () => {
     const held = net.superEdgeStats;
     expect(held?.misses).toBe(0);
     expect(held?.visits).toBe(0);
-    expect(held?.hits).toBeGreaterThan(0);
+    // Aggregates are answered from the memo; a kept leaf's row is its own edges, read afresh, and its links to
+    // other kept leaves are drawn as graph edges (#447) — at this zoom most kept glyphs are leaves.
+    expect((held?.hits ?? 0) + (held?.leafLinks ?? 0)).toBeGreaterThan(0);
 
     // Switching source after the run: the structural tree is built here; back to spatial re-adopts the worker's.
     net.lod({ source: "structure", maxAggregateRadius: 18 });
@@ -272,17 +274,20 @@ describe("lod({ source: 'spatial' }) (#343)", () => {
       ev("pointermove", x0 + 25, y0 + 15);
       const builds0 = mortonTopologyBuilds;
       const styles0 = lodStylePasses;
+      const crowd0 = lodCrowdingPasses;
       const before = [g.positions[4]!, g.positions[5]!];
       step(20);
       expect(g.positions[4] !== before[0] || g.positions[5] !== before[1], "the drag's reheat never ticked the layout").toBe(true);
       expect(mortonTopologyBuilds - builds0, "spatial trees built during the drag frames").toBe(0);
       expect(lodStylePasses - styles0, "style passes during the drag frames").toBe(0);
+      expect(lodCrowdingPasses - crowd0, "crowding passes during the drag frames (#426)").toBe(0);
       // Release: the cool-down tail still only refits; its last frame rebuilds the tree once.
       ev("pointerup", x0 + 25, y0 + 15);
       step(95);
       expect(queue.size, "the force drag's rAF loop did not stop after its tail").toBe(0);
       expect(mortonTopologyBuilds - builds0, "one rebuild once the nodes came to rest").toBe(1);
       expect(lodStylePasses - styles0).toBe(1);
+      expect(lodCrowdingPasses - crowd0, "one crowding pass with the rebuild").toBe(1);
     } finally {
       globalThis.requestAnimationFrame = realRaf;
       globalThis.cancelAnimationFrame = realCaf;

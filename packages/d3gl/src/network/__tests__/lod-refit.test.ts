@@ -87,7 +87,7 @@ describe("coarsen-only LOD tree (#377)", () => {
     expect(topology.children.length).toBe(0);
     expect(tree.children.length).toBeGreaterThan(0);
     const { reply } = relayFrame(makeStructureLODStream(tree), g.positions.slice(), 1);
-    expect(reply.geometry?.length).toBe(3 * tree.size);
+    expect(reply.geometry?.length).toBe(4 * tree.size); // [cx, cy, extent, clearZoom] (#426)
   });
 
   it("lists each buffer behind the topology once, covering every typed array", () => {

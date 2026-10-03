@@ -73,7 +73,7 @@ describe("network interactive lane (#105 N7c-2)", () => {
     ];
     net
       .data(g)
-      .style({ directed: true })
+      .style({ directed: true, nodeRadius: 8 }) // each module's two members (15 apart) overlap, so it stays collapsed (#426)
       .lod({ modules, expandPx: 20 })
       .layout({ backend: "positions", positions: new Float32Array([70, 90, 85, 90, 115, 110, 130, 110]) });
     net.interactive({ selectable: { multi: true }, hover: true });
@@ -125,7 +125,7 @@ describe("network interactive lane (#105 N7c-2)", () => {
     // render chain (data/style/lod/layout). enableZoom is also wired in setup.
     net.enableZoom([0.1, 40]);
     net.interactive({ selectable: { multi: true }, hover: true });
-    net.data(g).style({ sizeMode: "screen", nodeRadius: 6 }).lod({ modules, expandPx: 120, maxAggregateRadius: 26 }).layout({ backend: "positions", positions: new Float32Array([70, 90, 85, 90, 115, 110, 130, 110]) });
+    net.data(g).style({ sizeMode: "screen", nodeRadius: 8 }).lod({ modules, expandPx: 120, maxAggregateRadius: 26 }).layout({ backend: "positions", positions: new Float32Array([70, 90, 85, 90, 115, 110, 130, 110]) }); // members 15 apart overlap (#426)
 
     /* eslint-disable @typescript-eslint/no-explicit-any */
     // 1. Is the source lane actually interactive after the chain?
@@ -162,7 +162,7 @@ describe("network interactive lane (#105 N7c-2)", () => {
     const selFired: number[] = [];
     net.enableZoom([0.1, 40]);
     net.interactive({ selectable: { multi: true }, hover: true }).on("select", (hits) => selFired.push(hits.length));
-    net.data(g).style({ sizeMode: "screen", nodeRadius: 6 }).lod({ modules, expandPx: 120, maxAggregateRadius: 26 }).layout({ backend: "positions", positions: new Float32Array([70, 90, 85, 90, 115, 110, 130, 110]) });
+    net.data(g).style({ sizeMode: "screen", nodeRadius: 8 }).lod({ modules, expandPx: 120, maxAggregateRadius: 26 }).layout({ backend: "positions", positions: new Float32Array([70, 90, 85, 90, 115, 110, 130, 110]) }); // members 15 apart overlap (#426)
     net.setTransform({ k: 1, x: 0, y: 0 });
 
     /* eslint-disable @typescript-eslint/no-explicit-any */
@@ -209,7 +209,7 @@ describe("network interactive lane (#105 N7c-2)", () => {
       { id: 0, path: [1, 1] }, { id: 1, path: [1, 2] }, { id: 2, path: [2, 1] }, { id: 3, path: [2, 2] },
     ];
     net.interactive({ selectable: { multi: true }, hover: true });
-    net.data(g).style({ sizeMode: "screen", nodeRadius: 6 }).lod({ modules, expandPx: 120, maxAggregateRadius: 26 }).layout({ backend: "positions", positions: new Float32Array([70, 90, 85, 90, 115, 110, 130, 110]) });
+    net.data(g).style({ sizeMode: "screen", nodeRadius: 8 }).lod({ modules, expandPx: 120, maxAggregateRadius: 26 }).layout({ backend: "positions", positions: new Float32Array([70, 90, 85, 90, 115, 110, 130, 110]) }); // members 15 apart overlap (#426)
     net.setBackend("webgl");
     await net.whenReady();
     net.setTransform({ k: 1, x: 0, y: 0 });
@@ -256,7 +256,7 @@ describe("network interactive lane (#105 N7c-2)", () => {
       .data(g)
       .style({
         directed: true, sizeMode: "screen", linkStyle: "half-arrow",
-        nodeRadius: { by: "flow", scale: (f: number) => 4 + f * 10 },
+        nodeRadius: { by: "flow", scale: (f: number) => 8 + f * 10 }, // each module's two members (15 apart) overlap, so it stays collapsed (#426)
         flowBorder: { flow: new Float32Array([0.5, 0.2, 0.3, 0.1]), scale: ringW },
       })
       .lod({ modules, expandPx: 20, superEdges: true, aggregateOutline: { width: 1.5, gap: 3 } })
@@ -425,7 +425,7 @@ describe("network shader highlight: selection.others dim + outgoing links (#162)
     // Two modules of two nodes; at k=1 each collapses to one aggregate glyph.
     const g = buildGraph({ nodeCount: 4, source: [0, 2, 1], target: [1, 3, 2], directed: true });
     const modules = [{ id: 0, path: [1, 1] }, { id: 1, path: [1, 2] }, { id: 2, path: [2, 1] }, { id: 3, path: [2, 2] }];
-    net.data(g).style({ directed: true }).lod({ modules, expandPx: 20 }).layout({ backend: "positions", positions: new Float32Array([70, 90, 85, 90, 115, 110, 130, 110]) });
+    net.data(g).style({ directed: true, nodeRadius: 8 }).lod({ modules, expandPx: 20 }).layout({ backend: "positions", positions: new Float32Array([70, 90, 85, 90, 115, 110, 130, 110]) }); // each module's two members (15 apart) overlap, so it stays collapsed (#426)
     net.interactive({ selectable: { multi: true } });
     net.setTransform({ k: 1, x: 0, y: 0 });
 
@@ -457,7 +457,7 @@ describe("network shader highlight: selection.others dim + outgoing links (#162)
     // Two modules; the inter-module edge 1→2 becomes a super-edge between the two aggregates at k=1.
     const g = buildGraph({ nodeCount: 4, source: [0, 2, 1], target: [1, 3, 2], directed: true });
     const modules = [{ id: 0, path: [1, 1] }, { id: 1, path: [1, 2] }, { id: 2, path: [2, 1] }, { id: 3, path: [2, 2] }];
-    net.data(g).style({ directed: true, linkStyle: "half-arrow", linkStroke: "#999999" }).lod({ modules, expandPx: 20, superEdges: true }).layout({ backend: "positions", positions: new Float32Array([70, 90, 85, 90, 115, 110, 130, 110]) });
+    net.data(g).style({ directed: true, linkStyle: "half-arrow", linkStroke: "#999999", nodeRadius: 8 }).lod({ modules, expandPx: 20, superEdges: true }).layout({ backend: "positions", positions: new Float32Array([70, 90, 85, 90, 115, 110, 130, 110]) }); // members 15 apart overlap (#426)
     net.interactive({ selectable: { multi: true }, hover: true });
     net.setTransform({ k: 1, x: 0, y: 0 });
 
