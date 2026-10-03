@@ -25,50 +25,8 @@
 import { describe, it, expect, afterEach } from "vitest";
 import { Plot } from "./plot.js";
 import type { ViewTransform } from "../core/index.js";
-import { perfHost, zoomSteps, sweepFrames, GlBufferSpy } from "../__tests__/engine-sweep.js";
+import { perfHost, zoomSteps, sweepFrames, GlBufferSpy, GlSurfaceSpy } from "../__tests__/engine-sweep.js";
 import { perfBudget, perfN } from "../__tests__/perf-budget.js";
-
-/**
- * Counts GL surface allocations on the shared prototype — the cast-free way to ask "did this
- * allocate another framebuffer?". `GlBufferSpy` (engine-sweep.ts) covers buffers; framebuffers and
- * their colour-attachment textures are the ones that carry the width×height×4 cost #110 is about.
- */
-class GlSurfaceSpy {
-  framebuffers = 0;
-  textures = 0;
-  private readonly origFramebuffer: WebGL2RenderingContext["createFramebuffer"];
-  private readonly origTexture: WebGL2RenderingContext["createTexture"];
-
-  constructor() {
-    const proto = WebGL2RenderingContext.prototype;
-    this.origFramebuffer = proto.createFramebuffer;
-    this.origTexture = proto.createTexture;
-    const spy = this;
-    proto.createFramebuffer = function (this: WebGL2RenderingContext): WebGLFramebuffer | null {
-      spy.framebuffers++;
-      return spy.origFramebuffer.call(this);
-    };
-    proto.createTexture = function (this: WebGL2RenderingContext): WebGLTexture | null {
-      spy.textures++;
-      return spy.origTexture.call(this);
-    };
-  }
-
-  mark(): { framebuffers: number; textures: number } {
-    return { framebuffers: this.framebuffers, textures: this.textures };
-  }
-
-  since(at: { framebuffers: number; textures: number }): { framebuffers: number; textures: number } {
-    return { framebuffers: this.framebuffers - at.framebuffers, textures: this.textures - at.textures };
-  }
-
-  /** Always call this (in a `finally`) — the patch is on a shared prototype. */
-  restore(): void {
-    const proto = WebGL2RenderingContext.prototype;
-    proto.createFramebuffer = this.origFramebuffer;
-    proto.createTexture = this.origTexture;
-  }
-}
 
 /** `setInteracting` is protected, `setTransform` public — a subclass reaches both with no cast. */
 class PerfPlot extends Plot {
@@ -249,10 +207,11 @@ describe("multiple pass-through layers: memory + per-frame cost (#110)", () => {
       const buffersBefore = buffers.mark();
       const before = calls;
       chart.setSize(W + 100, H - 100);
-      // The accumulation surface follows the host: exactly two framebuffers are re-created — the
-      // offscreen export target (as before #293) and the ONE pass-through surface. A per-layer
-      // surface would make this 3 here; a resize that leaves the surface behind makes it 1.
-      expect(spy.since(surfacesBefore).framebuffers).toBe(2);
+      // The accumulation surface follows the host: exactly one framebuffer is re-created — the ONE
+      // pass-through surface. The export target is only freed on a resize and recreated by the next
+      // export (#88). A per-layer surface would make this 2 here; a resize that leaves the surface
+      // behind makes it 0.
+      expect(spy.since(surfacesBefore).framebuffers).toBe(1);
       // Only the surface is re-created, not the whole PassThroughGL: its Models and scratch
       // buffers survive, and the scratch already fits a batch of N. A destroy-and-rebuild also
       // makes exactly one framebuffer, so the surface count above cannot tell the two apart;
