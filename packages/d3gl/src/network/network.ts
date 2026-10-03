@@ -1,5 +1,5 @@
 import { BaseEngine, type BaseEngineOptions, type HoverHit, type InteractiveLayerOptions, type LaneInteractive, type NodeDragSession } from "../map/base-engine.js";
-import { networkLayers, networkLayersFromCache, noLodStyleCache, drawsLinks, frontierCircles, frontierHalos, boundaryRings, traceBoundaryRings, superEdges, makeSuperEdgesScratch, withLeafLinks, makeLeafLinksScratch, leafLinkEdges, emitNodes, emitLinks, emitArrows, emitHalfLinks, traceFrontierGlyphs, traceFrontierHalos, traceSuperHalfArrows, traceSuperLines, traceSuperArrows, physicalPieInstances, tracePieWedges, rgbaCss, pickNodes, regionNodes, resolveNodeRadii, resolveNodeRadiusAggregate, resolveImportance, resolveFlowBorder, resolveNodeFill, moduleBorderValues, applyModuleBorder, treeBorderColors, resolveLinkWidthOf, resolveLinkColorOf, resolveLinkStrokeOf, flowBorderInnerRadii, type ResolvedNetworkStyle, type SuperEdgeStyleResolved, type SuperEdgesData, type ModuleBoundaryResolved, type AggregateOutlineResolved, type NoLodStyleCache, type NodeRadiusSpec, type ImportanceSpec, type FlowBorderSpec, type NodeFillSpec, type ConstBorder, type LinkWidthSpec, type LinkColorSpec, type LinkStyle, type RGBAValue } from "./glyphs.js";
+import { networkLayers, networkLayersFromCache, noLodStyleCache, drawsLinks, frontierCircles, frontierHalos, boundaryRings, traceBoundaryRings, superEdges, makeSuperEdgesScratch, withLeafLinks, makeLeafLinksScratch, leafLinkEdges, sortEdgeIds, emitNodes, emitLinks, emitArrows, emitHalfLinks, traceFrontierGlyphs, traceFrontierHalos, traceSuperHalfArrows, traceSuperLines, traceSuperArrows, physicalPieInstances, tracePieWedges, rgbaCss, pickNodes, regionNodes, resolveNodeRadii, resolveNodeRadiusAggregate, resolveImportance, resolveFlowBorder, resolveNodeFill, moduleBorderValues, applyModuleBorder, treeBorderColors, resolveLinkWidthOf, resolveLinkColorOf, resolveLinkStrokeOf, flowBorderInnerRadii, type ResolvedNetworkStyle, type SuperEdgeStyleResolved, type SuperEdgesData, type ModuleBoundaryResolved, type AggregateOutlineResolved, type NoLodStyleCache, type NodeRadiusSpec, type ImportanceSpec, type FlowBorderSpec, type NodeFillSpec, type ConstBorder, type LinkWidthSpec, type LinkColorSpec, type LinkStyle, type RGBAValue } from "./glyphs.js";
 import { rgb } from "d3-color";
 import { DRAG_HEAT, ForceLayout, seedPositions, type ForceParams } from "./force.js";
 import { multilevelLayout, type CoarsenOptions } from "./coarsen.js";
@@ -3591,18 +3591,51 @@ export class Network extends BaseEngine {
     const leaves = graph !== null && graph.nodeCount === tree.leafCount ? graph : null;
     edgeStyle.leafLinks = leaves !== null;
     let gathered: SuperEdgesData;
+    let listed = false;
     if (tree.leafOrder && !tree.superEdgeOffset && leaves) {
       const sc = this.cutScratch;
       const covers = { drawn: this.cutFrontier, kept: frontier, culled: sc.culled.subarray(0, sc.culledCount), split: sc.split.subarray(0, sc.splitCount) };
       this.lazyGathered = true;
-      gathered = lazySuperEdges(tree, covers, edgeStyle, view, leaves.csr, this.incidenceOf(leaves, style.directed), this.lazyScratch);
+      // The gather lists the links between two kept leaves as it reads their rows (#447): no second walk.
+      gathered = lazySuperEdges(tree, covers, edgeStyle, view, leaves.csr, this.incidenceOf(leaves, style.directed), this.lazyScratch, this.sourceEdgesOf(leaves));
+      listed = true;
     } else {
       gathered = superEdges(tree, frontier, edgeStyle, view, this.superEdgesScratch);
     }
+    this.leafLinksDrawn = leaves ? this.listLeafLinks(leaves, frontier, listed) : 0;
     if (!leaves || !combine) return gathered;
-    const out = withLeafLinks(tree, leaves, frontier, this.noLodCache(leaves, style), gathered, this.fadeAlpha ?? undefined, this.leafLinksScratch);
-    this.leafLinksDrawn = out.ids.length - gathered.ids.length;
-    return out;
+    return withLeafLinks(tree, leaves, this.leafLinksDrawn, this.noLodCache(leaves, style), gathered, this.fadeAlpha ?? undefined, this.leafLinksScratch);
+  }
+
+  /**
+   * The links between two kept leaves of this cut (#447), into `leafLinksScratch.edges[0..m)` in edge order
+   * (the order the full-detail path draws them in, so overlapping links stack as they do with LOD off); returns
+   * `m`. After a lazy gather (`listed`) they are its listing, sorted ({@link sortLeafLinks}); after the CSR gather,
+   * which gathers pairs, not edges, a walk of the kept leaves' rows ({@link leafLinkEdges}). Either way O(Σ degree
+   * of the kept leaves) plus the sort, never O(edges).
+   */
+  private listLeafLinks(graph: NetworkGraph, frontier: Uint32Array, listed: boolean): number {
+    const sc = this.leafLinksScratch;
+    if (listed) {
+      sc.entries = 0; // read with the gather's rows
+      return this.sortLeafLinks(this.lazyScratch.leafEdges, this.lazyScratch.leafLinks, graph.edgeCount);
+    }
+    return leafLinkEdges(graph, frontier, this.sourceEdgesOf(graph), sc);
+  }
+
+  /** Sort a listing of leaf links into edge order (#447): radix passes, O(m + 4096) each. */
+  private sortLeafLinks(list: Uint32Array, m: number, edgeCount: number): number {
+    return sortEdgeIds(list, m, edgeCount, this.leafLinksScratch);
+  }
+
+  /** Each CSR entry's edge id at its source's entry (#447, {@link incidenceSourceEdges}): 8 B per edge, once per graph. */
+  private sourceEdgesOf(graph: NetworkGraph): Uint32Array {
+    let entries = this.leafEdgeEntries;
+    if (!entries || entries.graph !== graph) {
+      entries = { graph, ids: incidenceSourceEdges(graph.csr, graph) };
+      this.leafEdgeEntries = entries;
+    }
+    return entries.ids;
   }
 
   /** The graph's per-incidence weights (and directions, for directed links) the lazy gather sums (#343),
@@ -3618,9 +3651,9 @@ export class Network extends BaseEngine {
   /**
    * The links between two kept leaves (#447), drawn as the full-detail path draws them: by **edge id** from
    * that path's cached per-edge style columns ({@link noLodCache}: widths, colours, radii, bends, highlight
-   * groups — the same arrays, so the GPU packs them into its resident tables once per style), listing only
-   * the edges whose two ends are kept leaves of this cut (`leafLinkEdges` in glyphs.ts: O(Σ degree of the kept
-   * leaves), in edge order). Per frame, per shown link: its edge id (4 B), its ends at the leaves' drawn
+   * groups — the same arrays, so the GPU packs them into its resident tables once per style), for the edges
+   * whose two ends are kept leaves of this cut, as the frame's gather listed them ({@link listLeafLinks}: in the
+   * same read of the kept leaves' rows, then sorted into edge order). Per frame, per shown link: its edge id (4 B), its ends at the leaves' drawn
    * centres (16 B) and, in a cross-fade band, its fade (4 B; a link's alpha follows its least-visible end, as a
    * gathered one's does) — each handed back unchanged when its values are ({@link StableColumns.float32Into}),
    * so a frame that moves and re-cuts nothing uploads nothing. A selection change rebuilds the per-edge
@@ -3634,7 +3667,6 @@ export class Network extends BaseEngine {
     tree: LODTree,
     graph: NetworkGraph,
     style: ResolvedNetworkStyle,
-    frontier: Uint32Array,
     sel: ReadonlySet<string | number> | undefined,
     isSel: ((g: number) => boolean) | null,
     pick: true | undefined,
@@ -3644,15 +3676,9 @@ export class Network extends BaseEngine {
     const E = graph.edgeCount;
     const src = graph.source;
     const tgt = graph.target;
-    let entries = this.leafEdgeEntries;
-    if (!entries || entries.graph !== graph) {
-      entries = { graph, ids: incidenceSourceEdges(graph.csr, graph) };
-      this.leafEdgeEntries = entries;
-    }
-    const sc = this.leafLinksScratch;
-    const m = leafLinkEdges(graph, frontier, entries.ids, sc);
-    const list = sc.edges;
-    this.leafLinksDrawn = m;
+    // Listed with the frame's gather ({@link listLeafLinks}), in edge order.
+    const m = this.leafLinksDrawn;
+    const list = this.leafLinksScratch.edges;
     const memo = this.lodColumns;
     const index = memo.float32Into("leaf-links.index", m, (out) => {
       for (let i = 0; i < m; i++) out[i] = list[i] ?? 0;
@@ -3797,7 +3823,7 @@ export class Network extends BaseEngine {
         if (arrows.bends) arrows.bends = memo.float32("arrows.bends", arrows.bends);
       }
       const pick = this.pickLinksEnabled || undefined; // flag link layers into the GPU pick pass (#141)
-      const leaf = leafGraph ? this.leafLinkLayers(tree, leafGraph, style, frontier, sel, isSel, pick) : null;
+      const leaf = leafGraph ? this.leafLinkLayers(tree, leafGraph, style, sel, isSel, pick) : null;
       if (leaf) layers.push(leaf.links);
       if (halfArrows && halfArrows.count > 0) layers.push({ name: "links", primitive: "half-arrows", pickable: pick, pickBase: leafBase, halfArrows, sizeMode: style.sizeMode });
       if (lines && lines.count > 0) layers.push({ name: "links", primitive: "lines", pickable: pick, pickBase: leafBase, lines, sizeMode: style.sizeMode });
