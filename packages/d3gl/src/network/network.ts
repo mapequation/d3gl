@@ -325,7 +325,8 @@ export interface NetworkLayoutOptions {
    * **Continue from where the nodes are** (#454) instead of laying the graph out anew — e.g. after
    * switching between a nested map and a force layout. On the force layouts (`"force"`, `"worker"`,
    * `"gpu"`, `"auto"`) the solve starts from the current positions: no seed disc and no multilevel seed
-   * ({@link multilevel} is ignored), at full heat cooling over {@link iterations}, until it converges. A
+   * ({@link multilevel} is ignored), at full heat cooling over {@link iterations}, until it converges — pulling
+   * along any module links (#455, {@link NetworkDataOptions.moduleLinks}) as a cold run does. A
    * streamed one (`"worker"`, `"gpu"`, `"auto"`) is followed as a warm nested map is: the nodes glide from
    * where they are toward each frame of the solve as it lands, on one ease of about 600 ms retargeted to every
    * newer frame (see {@link NestedLayoutConfig.warm}); frames after it are painted as they come. With
