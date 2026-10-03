@@ -86,11 +86,13 @@ Bulk overrides are colors-only: stroke geometry bakes its width at tessellation 
 
 ### On instanced lanes (network nodes, decluttered points)
 
-`selection.others` works the same on GPU-instanced lanes — network `nodes` and a `plot` layer's
-decluttered `points` — as on retained layers: with a selection active, non-selected glyphs fade to
-`others.opacity` (default `0.3`). The persistent selection **ring** stays the *selected* affordance; the
-dim is the complementary focus. Lanes honor the **opacity** component of `others` (a colour override
-there is ignored — instanced glyphs have no Scene drawable to recolour).
+`selection.others` works the same on GPU-instanced lanes — network `nodes` (including the
+overlapping-module **pie glyphs** of a state network's physical view, which fade and stay lit with
+their node) and a `plot` layer's decluttered `points` — as on retained layers: with a selection
+active, non-selected glyphs fade to `others.opacity` (default `0.3`). The persistent selection
+**ring** stays the *selected* affordance; the dim is the complementary focus. Lanes honor the
+**opacity** component of `others` (a colour override there is ignored — instanced glyphs have no
+Scene drawable to recolour).
 
 For a **network** the highlight is applied **in the GPU vertex shader** from per-instance
 `group`/`selected` columns plus lane uniforms, so it scales to a full **LOD-off** draw: a hover is a
