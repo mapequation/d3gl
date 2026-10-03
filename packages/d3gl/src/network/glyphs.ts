@@ -1701,7 +1701,7 @@ export function leafLinkEdges(graph: NetworkGraph, frontier: Uint32Array, source
   sc.entries = entries;
   // Each edge is found at most once, at its source's entry: `entries` bounds the count.
   if (sc.edges.length < entries) sc.edges = new Uint32Array(Math.max(entries, 2 * sc.edges.length));
-  let list = sc.edges;
+  const list = sc.edges;
   let m = 0;
   for (let i = 0; i < frontier.length; i++) {
     const a = frontier[i] ?? 0;
@@ -1714,15 +1714,31 @@ export function leafLinkEdges(graph: NetworkGraph, frontier: Uint32Array, source
       if (b !== a && kept[b] === gen) list[m++] = e;
     }
   }
-  if (m < 2) return m;
+  return sortEdgeIds(list, m, graph.edgeCount, sc);
+}
+
+/**
+ * Sort the edge ids `list[0..m)` into ascending (edge) order — the order the full-detail path draws them in —
+ * with 12-bit radix passes, O(m + 4096) each (two below 2^24 edges), into `sc.edges[0..m)`; returns `m`. `list`
+ * may be `sc.edges` itself or another array (the lazy gather's listing, #447); it is not modified unless it is
+ * one of the scratch's two buffers. The scratch's buffers grow to `m`.
+ */
+export function sortEdgeIds(list: Uint32Array, m: number, edgeCount: number, sc: LeafLinksScratch): number {
+  if (sc.edges.length < m) sc.edges = new Uint32Array(Math.max(m, 2 * sc.edges.length));
   if (sc.sorted.length < sc.edges.length) sc.sorted = new Uint32Array(sc.edges.length);
-  let other = sc.sorted;
+  if (m < 2) {
+    if (m === 1 && list !== sc.edges) sc.edges[0] = list[0] ?? 0;
+    return m;
+  }
+  // Each pass reads `from` and scatters into the scratch buffer `from` is not.
+  let from = list;
+  let to = list === sc.sorted ? sc.edges : sc.sorted;
   const hist = sc.hist;
   const mask = (1 << RADIX_BITS) - 1;
-  for (let shift = 0; shift < 32 && (shift === 0 || (graph.edgeCount - 1) >>> shift > 0); shift += RADIX_BITS) {
+  for (let shift = 0; shift < 32 && (shift === 0 || (edgeCount - 1) >>> shift > 0); shift += RADIX_BITS) {
     hist.fill(0);
     for (let i = 0; i < m; i++) {
-      const d = ((list[i] ?? 0) >>> shift) & mask;
+      const d = ((from[i] ?? 0) >>> shift) & mask;
       hist[d] = (hist[d] ?? 0) + 1;
     }
     let sum = 0;
@@ -1732,62 +1748,46 @@ export function leafLinkEdges(graph: NetworkGraph, frontier: Uint32Array, source
       sum += c;
     }
     for (let i = 0; i < m; i++) {
-      const e = list[i] ?? 0;
+      const e = from[i] ?? 0;
       const d = (e >>> shift) & mask;
-      other[hist[d] ?? 0] = e;
+      to[hist[d] ?? 0] = e;
       hist[d] = (hist[d] ?? 0) + 1;
     }
-    const t = list;
-    list = other;
-    other = t;
+    from = to;
+    to = to === sc.sorted ? sc.edges : sc.sorted;
   }
-  sc.edges = list;
-  sc.sorted = other;
+  if (from !== sc.edges) {
+    // The last pass wrote the other buffer: hand it over as `edges`.
+    sc.sorted = sc.edges;
+    sc.edges = from;
+  }
   return m;
 }
 
 /**
- * The frame's links with **leaf links** (#447): every graph edge whose two ends are kept leaves of the cut,
- * drawn as the full-detail path draws it — its per-edge width, colour, radii and bend from that path's cached
- * style columns (`cache`, {@link noLodStyleCache}), its ends at the leaves' centres — followed by the gathered
- * super-edges, which touch an aggregate (the gathers leave leaf–leaf pairs out). One batch per link primitive,
- * in the same instance order as `ids`/`flows`, so link picking and the Canvas/SVG keys see one list. In a
- * cross-fade band a link's alpha follows its least-visible end, as a gathered one's does.
+ * The frame's links with **leaf links** (#447): every graph edge whose two ends are kept leaves of the cut —
+ * listed in `sc.edges[0..m)`, in edge order ({@link leafLinkEdges}, or the lazy gather's listing sorted by
+ * {@link sortEdgeIds}) — drawn as the full-detail path draws it: its per-edge width, colour, radii and bend from
+ * that path's cached style columns (`cache`, {@link noLodStyleCache}), its ends at the leaves' centres —
+ * followed by the gathered super-edges, which touch an aggregate (the gathers leave leaf–leaf pairs out). One
+ * batch per link primitive, in the same instance order as `ids`/`flows`, so link picking and the Canvas/SVG keys
+ * see one list. In a cross-fade band a link's alpha follows its least-visible end, as a gathered one's does.
  *
- * O(edges) for the scan (two stamp reads per edge) and O(leaf links + gathered) to write the batches — the
- * shape of the full-detail path's position frame, which rewrites every edge's ends. Memory: 4 B per leaf and
- * 4 B per leaf link of scratch, reused.
+ * O(leaf links + gathered) to write the batches. Memory: the batches, fresh per call.
  */
 export function withLeafLinks(
   tree: LODTree,
   graph: NetworkGraph,
-  frontier: Uint32Array,
+  m: number,
   cache: NoLodStyleCache,
   gathered: SuperEdgesData,
   fadeAlpha: Float32Array | undefined,
   sc: LeafLinksScratch,
 ): SuperEdgesData {
-  const n = graph.nodeCount;
-  if (sc.kept.length < n) sc.kept = new Int32Array(n);
-  if (sc.gen === 0x7fffffff) { sc.kept.fill(0); sc.gen = 0; }
-  const gen = ++sc.gen;
-  const kept = sc.kept;
-  for (let i = 0; i < frontier.length; i++) {
-    const g = frontier[i] ?? 0;
-    if (g < n) kept[g] = gen;
-  }
+  if (m === 0) return gathered;
   const src = graph.source;
   const tgt = graph.target;
-  const E = graph.edgeCount;
-  if (sc.edges.length < E) sc.edges = new Uint32Array(E);
   const list = sc.edges;
-  let m = 0;
-  for (let e = 0; e < E; e++) {
-    const a = src[e] ?? 0;
-    const b = tgt[e] ?? 0;
-    if (a !== b && kept[a] === gen && kept[b] === gen) list[m++] = e;
-  }
-  if (m === 0) return gathered;
 
   const k = gathered.ids.length;
   const count = m + k;

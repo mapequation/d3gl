@@ -1,9 +1,9 @@
 import { describe, it, expect } from "vitest";
 import { buildLODTree, buildMortonLODTree, computeLODGeometry, cut, declutterFrontier, makeCutScratch, makeDeclutterFrontierScratch, visibleWorldRect, type LODTransform, type LODTree } from "../lod.js";
 import { buildGraph, type NetworkGraph } from "../graph.js";
-import { buildLeafIncidence, lazySuperEdges, type LazyCut } from "../lazy-super-edges.js";
+import { buildLeafIncidence, lazySuperEdges, makeLazySuperEdgesScratch, type LazyCut } from "../lazy-super-edges.js";
 import { incidenceSourceEdges } from "../spatial-rows.js";
-import { leafLinkEdges, linkLinesStyleAttrs, makeLeafLinksScratch, superEdges, withLeafLinks, type NoLodStyleCache, type SuperEdgeStyleResolved, type SuperEdgesData } from "../glyphs.js";
+import { leafLinkEdges, linkLinesStyleAttrs, makeLeafLinksScratch, sortEdgeIds, superEdges, withLeafLinks, type LeafLinksScratch, type NoLodStyleCache, type SuperEdgeStyleResolved, type SuperEdgesData } from "../glyphs.js";
 
 /**
  * #447: with `leafLinks`, the gathers leave the links between two kept leaves out and `withLeafLinks` draws
@@ -63,6 +63,12 @@ function cutAt(tree: LODTree, t: LODTransform, expandPx?: number): LazyCut {
   return { drawn, kept, culled: sc.culled.slice(0, sc.culledCount), split: sc.split.slice(0, sc.splitCount) };
 }
 
+/** The kept-leaf edges of a cut, listed by the walk of their rows (`leafLinkEdges`), in a fresh scratch. */
+function listed(g: NetworkGraph, kept: Uint32Array): { m: number; sc: LeafLinksScratch } {
+  const sc = makeLeafLinksScratch();
+  return { m: leafLinkEdges(g, kept, incidenceSourceEdges(g.csr, g), sc), sc };
+}
+
 /** Pair → summed flow, the pair unordered for an undirected style. */
 function pairs(tree: LODTree, out: SuperEdgesData, directed: boolean): Map<number, number> {
   const m = new Map<number, number>();
@@ -107,7 +113,8 @@ describe("leaf links (#447): the gathers leave kept-leaf pairs to the full-detai
           const leafPair = a < spatial.leafCount && b < spatial.leafCount && c.kept.includes(a) && c.kept.includes(b);
           expect(leafPair, "a gathered pair between two kept leaves").toBe(false);
         }
-        const after = withLeafLinks(spatial, g, c.kept, cacheOf(g), gathered, undefined, makeLeafLinksScratch());
+        const { m, sc } = listed(g, c.kept);
+        const after = withLeafLinks(spatial, g, m, cacheOf(g), gathered, undefined, sc);
         expectSame(pairs(spatial, after, directed), pairs(spatial, before, directed));
         expect(after.lines?.count).toBe(after.ids.length);
       });
@@ -118,7 +125,8 @@ describe("leaf links (#447): the gathers leave kept-leaf pairs to the full-detai
         const view = visibleWorldRect(t, W, H);
         const before = superEdges(structure, c.kept, styleOf(directed, false), view);
         const gathered = superEdges(structure, c.kept, styleOf(directed, true), view);
-        const after = withLeafLinks(structure, g, c.kept, cacheOf(g), gathered, undefined, makeLeafLinksScratch());
+        const { m, sc } = listed(g, c.kept);
+        const after = withLeafLinks(structure, g, m, cacheOf(g), gathered, undefined, sc);
         const got = [...pairs(structure, after, false).keys()].sort((x, y) => x - y);
         const want = [...pairs(structure, before, false).keys()].sort((x, y) => x - y);
         expect(got).toEqual(want);
@@ -132,7 +140,8 @@ describe("leaf links (#447): the gathers leave kept-leaf pairs to the full-detai
     const inc = buildLeafIncidence(g, false);
     const gathered = lazySuperEdges(spatial, c, styleOf(false, true), visibleWorldRect(t, W, H), g.csr, inc);
     const cache = cacheOf(g);
-    const after = withLeafLinks(spatial, g, c.kept, cache, gathered, undefined, makeLeafLinksScratch());
+    const { m, sc } = listed(g, c.kept);
+    const after = withLeafLinks(spatial, g, m, cache, gathered, undefined, sc);
     const kept = new Set(c.kept);
     let leafEdges = 0;
     for (let e = 0; e < g.edgeCount; e++) if (kept.has(g.source[e]!) && kept.has(g.target[e]!)) leafEdges++;
@@ -181,6 +190,66 @@ describe("leaf links (#447): the gathers leave kept-leaf pairs to the full-detai
       let degrees = 0;
       for (const v of kept) degrees += graph.csr.degree[v]!;
       expect(sc.entries, `share ${share}: entries read`).toBe(degrees);
+    }
+  });
+
+  it("the lazy gather lists the kept-leaf edges as it reads their rows: sorted, the same list as the walk (#447)", () => {
+    // Self-loops and parallel edges (both directions, and a repeat), spatially placed.
+    const n = 3000;
+    const r = rng(11);
+    const src: number[] = [];
+    const tgt: number[] = [];
+    for (let i = 0; i < 12_000; i++) {
+      const a = Math.floor(r() * n);
+      const b = r() < 0.05 ? a : Math.min(n - 1, Math.max(0, a + Math.floor((r() - 0.5) * 60)));
+      src.push(a); tgt.push(b);
+      if (r() < 0.1) { src.push(b); tgt.push(a); }
+      if (r() < 0.05) { src.push(a); tgt.push(b); }
+    }
+    for (const directed of [false, true]) {
+      const graph = buildGraph({ nodeCount: n, source: src, target: tgt, directed });
+      for (let i = 0; i < n; i++) {
+        graph.positions[2 * i] = Math.cos(i * 0.01) * (100 + i * 0.1);
+        graph.positions[2 * i + 1] = Math.sin(i * 0.01) * (100 + i * 0.1);
+      }
+      const tree = buildMortonLODTree(graph.positions, graph.nodeCount);
+      computeLODGeometry(tree, graph, new Float32Array(n).fill(2), graph.strength);
+      const entries = incidenceSourceEdges(graph.csr, graph);
+      const inc = buildLeafIncidence(graph, directed);
+      const lazy = makeLazySuperEdgesScratch();
+      for (const { t, expandPx } of [
+        { t: { k: 0.9, x: W / 2, y: H / 2 } },
+        { t: { k: 3, x: W / 2 - 100 * 3, y: H / 2 } },
+        { t: { k: 0.9, x: W / 2, y: H / 2 }, expandPx: 1e-6 },
+      ]) {
+        const c = cutAt(tree, t, expandPx);
+        lazySuperEdges(tree, c, styleOf(directed, true), visibleWorldRect(t, W, H), graph.csr, inc, lazy, entries);
+        const sc = makeLeafLinksScratch();
+        const m = sortEdgeIds(lazy.leafEdges, lazy.leafLinks, graph.edgeCount, sc);
+        const walk = listed(graph, c.kept);
+        expect(Array.from(sc.edges.subarray(0, m)), `${directed ? "directed" : "undirected"}, k ${t.k}`).toEqual(Array.from(walk.sc.edges.subarray(0, walk.m)));
+        // Without the entry map the gather lists nothing (the CSR gather's callers walk instead).
+        lazySuperEdges(tree, c, styleOf(directed, true), visibleWorldRect(t, W, H), graph.csr, inc, lazy);
+        expect(lazy.leafLinks).toBe(0);
+      }
+    }
+  });
+
+  it("sortEdgeIds sorts a list from outside the scratch, or one of its buffers, into edge order", () => {
+    const r = rng(3);
+    for (const E of [10, 5000, 1 << 25]) {
+      const ids = Array.from({ length: 4000 }, () => Math.floor(r() * E));
+      const want = [...ids].sort((a, b) => a - b);
+      const sc = makeLeafLinksScratch();
+      const sorted = (list: () => Uint32Array): number[] => {
+        const m = sortEdgeIds(list(), ids.length, E, sc);
+        return Array.from(sc.edges.subarray(0, m));
+      };
+      expect(sorted(() => Uint32Array.from(ids))).toEqual(want);
+      sc.edges.set(ids.reverse());
+      expect(sorted(() => sc.edges)).toEqual(want);
+      sc.sorted.set(ids);
+      expect(sorted(() => sc.sorted)).toEqual(want);
     }
   });
 });
