@@ -1,20 +1,20 @@
 import { BaseEngine, type BaseEngineOptions, type HoverHit, type InteractiveLayerOptions, type LaneInteractive, type NodeDragSession } from "../map/base-engine.js";
 import { networkLayers, networkLayersFromCache, noLodStyleCache, drawsLinks, frontierCircles, frontierHalos, boundaryRings, traceBoundaryRings, superEdges, makeSuperEdgesScratch, emitNodes, emitLinks, emitArrows, emitHalfLinks, traceFrontierGlyphs, traceFrontierHalos, traceSuperHalfArrows, traceSuperLines, traceSuperArrows, physicalPieInstances, tracePieWedges, rgbaCss, pickNodes, regionNodes, resolveNodeRadii, resolveNodeRadiusAggregate, resolveImportance, resolveFlowBorder, resolveNodeFill, moduleBorderValues, applyModuleBorder, treeBorderColors, resolveLinkWidthOf, resolveLinkColorOf, resolveLinkStrokeOf, flowBorderInnerRadii, type ResolvedNetworkStyle, type SuperEdgeStyleResolved, type SuperEdgesData, type ModuleBoundaryResolved, type AggregateOutlineResolved, type NoLodStyleCache, type NodeRadiusSpec, type ImportanceSpec, type FlowBorderSpec, type NodeFillSpec, type ConstBorder, type LinkWidthSpec, type LinkColorSpec, type LinkStyle, type RGBAValue } from "./glyphs.js";
 import { rgb } from "d3-color";
-import { DRAG_HEAT, ForceLayout, seedPositions, type ForceParams } from "./force.js";
+import { DRAG_HEAT, ForceLayout, hasLayout, seedPositions, type ForceParams } from "./force.js";
 import { multilevelLayout, type CoarsenOptions } from "./coarsen.js";
 import { buildLODTree, buildMortonLODTree, mortonRootBox, makeMortonScratch, makeLODBoundsScratch, findMortonCell, computeLODGeometry, computeLODPositions, computeLODStyle, lodTreeFromTopology, updateLODPositionsForLeaves, cut, makeCutScratch, makeCutBoundaries, declutterFrontier, makeDeclutterFrontierScratch, pickFrontier, regionFrontier, visibleWorldRect, leavesUnder, ancestorAwareSelected, type BoundaryDiscs, type CutBoundaries, type LODTree, type MortonBox, type SpatialLODOptions } from "./lod.js";
 import { DEFAULT_LABEL_TEXT, type LabelAnchor, type LabelStyle } from "../labels/label-layer.js";
 import { TextMeasurer, canvasFont } from "../labels/measure.js";
 import { buildModuleLODTree, checkModuleLinks, flattenModuleLinks, flattenModuleRecords, moduleRecordIndex, type ModuleLink, type ModuleNode } from "./modules.js";
 import { nestedLayout, nestedBoundaryDiscs, type NestedLayoutParams } from "./nested-layout.js";
-import { positionTransition, type PositionTransition } from "./transition.js";
+import { easeCubicOut, positionTransition, type PositionTransition } from "./transition.js";
 import { moduleColors, type ModulePathNode, type ModuleColorOptions } from "./module-colors.js";
 import { physicalPieWedges, type PhysicalPieWedges, type PieWedgeOptions } from "./pie.js";
 import { rosettePositions } from "./rosette.js";
 import { gatherCandidates, descendingByKey, descendingInListOrder, CandidateList, type CandidateSource } from "./label-candidates.js";
 import type { StateNetworkGraph } from "./state-graph.js";
-import { buildModuleTopologyOffThread, deferredLayoutHandle, startNestedWorkerLayout, startWorkerLayout, type StreamedLODTree, type WorkerLayoutHandle, type WorkerLayoutOptions } from "./worker-transport.js";
+import { buildModuleTopologyOffThread, deferredLayoutHandle, startNestedWorkerLayout, startWorkerLayout, type StreamFollow, type StreamedLODTree, type WorkerLayoutHandle, type WorkerLayoutOptions } from "./worker-transport.js";
 import { buildLeafIncidence, lazySuperEdges, makeLazySuperEdgesScratch, type LeafIncidence } from "./lazy-super-edges.js";
 import type { LeafStyle, LODView } from "./lod-frame.js";
 import { startGpuNestedLayout } from "./gpu/gpu-nested-transport.js";
@@ -315,15 +315,35 @@ export interface NetworkLayoutOptions {
    * budget, and the first frame it paints is the seed (paced by animation frames: on web-NotreDame about
    * 0.8 s after a disc start's first frame at 120 Hz, about twice that at 60 Hz). `false` starts the GPU
    * layout from the disc with or without a module hierarchy. Where `"gpu"` / `"auto"` resolve to the
-   * worker, it honours `multilevel` too.
+   * worker, it honours `multilevel` too. A {@link warm} start has no seed and ignores it.
    */
   multilevel?: boolean;
+  /**
+   * **Continue from where the nodes are** (#454) instead of laying the graph out anew — e.g. after
+   * switching between a nested map and a force layout. On the force layouts (`"force"`, `"worker"`,
+   * `"gpu"`, `"auto"`) the solve starts from the current positions: no seed disc and no multilevel seed
+   * ({@link multilevel} is ignored), at full heat cooling over {@link iterations}, until it converges. A
+   * streamed one (`"worker"`, `"gpu"`, `"auto"`) is followed as a warm nested map is: the nodes glide from
+   * where they are toward each frame of the solve as it lands, on one ease of about 600 ms retargeted to every
+   * newer frame (see {@link NestedLayoutConfig.warm}); frames after it are painted as they come. With
+   * {@link fit} the camera follows it, as it follows any stream — also when the layout grows or shrinks to the
+   * force model's own scale (a nested map is about a third as wide as a force layout of the same graph). With
+   * a structure or spatial LOD tree, which a worker streams with the solve's own geometry, its frames are
+   * painted as they land instead.
+   *
+   * With {@link nested} it is `nested: { warm: true }` ({@link NestedLayoutConfig.warm}): the map is laid
+   * out from the current positions, and on a streaming backend without a {@link transition} it streams
+   * from them too (see there). On a graph never laid out (all positions equal) it is the cold layout.
+   * Ignored by `"positions"` and by a state network's layout. Default `false`.
+   */
+  warm?: boolean;
   /**
    * **Frame the layout**, on every backend: the camera ends on the bounding box of the final node positions
    * (box centre → view centre, longest side → ~85% of the view, padded by the largest node radius), and
    * gets there along with the layout (#427):
-   * - a **streamed** layout (the `"worker"` / `"gpu"` / `"auto"` force layouts, a cold `nested` map on any of them) is
-   *   reframed on every streamed frame, so it opens framed and converges in place. Without it a streaming
+   * - a **streamed** layout (the `"worker"` / `"gpu"` / `"auto"` force layouts, cold or {@link warm}, and a `nested`
+   *   map on any of them without a transition, cold or warm) is reframed on every streamed frame — a warm map on
+   *   every frame of its ease (#454) — so it opens framed and converges in place. Without it a streaming
    *   layout converges wherever the solver centres it — the GPU solve centres the centroid at the origin,
    *   so it would render at the top-left corner until it settles;
    * - a layout with a {@link transition} eases the camera along with the nodes, from the current view to
@@ -331,8 +351,7 @@ export interface NetworkLayoutOptions {
    *   framed, with no jump. The world rectangle the view shows moves in a straight line, as the nodes do:
    *   the zoom is monotonic, and a node on screen at both ends stays on screen throughout. A resize or a
    *   node-size change mid-ease re-aims the camera from where it is, so it still ends framed, with no jump;
-   * - any other layout (`"positions"`, `"force"`, a warm `nested` map without a transition, and a state
-   *   network's layouts alike) is framed once, when it lands.
+   * - any other layout (`"positions"`, `"force"`, and a state network's layouts alike) is framed once, when it lands.
    *
    * The last frame is the landed layout's exact box, every node included; then the view is the user's
    * again. It is also released — left where it is, never reframed — as soon as the user zooms, pans or
@@ -369,8 +388,9 @@ export interface NetworkLayoutOptions {
    * warning (#375). Ignored without a hierarchy.
    *
    * `true` sizes discs by node flow (leaf count when the graph has none); pass `{ size: "count" }` to
-   * size by leaf count, and `iterations` / `packing` to tune each module's solve. `{ warm: true }`
-   * re-lays the map out from the current positions — for a re-clustering (#328).
+   * size by leaf count, and `iterations` / `packing` to tune each module's solve. `{ warm: true }` (or
+   * {@link warm}) re-lays the map out from the current positions — for a re-clustering (#328), or a switch
+   * from another layout (#454).
    * @see {@link nestedLayout}
    */
   nested?: boolean | NestedLayoutConfig;
@@ -381,6 +401,9 @@ export interface NetworkLayoutOptions {
    * `nested` layout on any backend (whose worker then posts only the final layout, no depth frames);
    * the streaming `"worker"` / `"gpu"` / `"auto"` force layouts ignore it (they already animate as they
    * converge), as does a state network's layout.
+   *
+   * A {@link warm} nested map on a streaming backend with a transition is computed first and then eased to,
+   * as before; without one it streams, eased toward frame by frame instead (#454).
    *
    * Each transition frame is a positions-only repaint — one O(nodes) interpolation, the LOD tree's
    * O(tree size) position pass (no style pass) and the normal re-emit — no more than a streamed layout
@@ -403,12 +426,28 @@ export interface NestedLayoutConfig {
   packing?: number;
   /**
    * **Warm start** (#328): lay the map out from the nodes' current positions — e.g. after a
-   * re-clustering with the same nodes — instead of from scratch. Each module's children start at
-   * their current centroids and the solve refines that arrangement, and the new map keeps the current
-   * one's centroid and spread, so it stays where it is. No seed disc is placed first and no depth
-   * frames stream (they would collapse the leaves onto their module centres): the layout lands in one
-   * frame, or eases in over {@link NetworkLayoutOptions.transition}. On a graph never laid out (all
-   * positions equal) it is the cold layout. Default `false`.
+   * re-clustering with the same nodes, or a switch from a force layout (#454) — instead of from scratch.
+   * Each module's children start at their current centroids and the solve refines that arrangement. No
+   * seed disc is placed first. How it arrives:
+   * - with a {@link NetworkLayoutOptions.transition}, and on `"force"`, the map is computed in one go and
+   *   eased in (or jumped to), placed over the current map by its result: the current one's centroid and
+   *   spread, so it stays where it is;
+   * - otherwise, on `"worker"` / `"gpu"` / `"auto"`, it **streams from the positions on screen** (#454), at its
+   *   natural size — a cold map's root disc, `10·√N` — centred where the current map is (its seed, every
+   *   module's children at their current arrangement in their discs, is placed so before the solve
+   *   starts), and the engine eases the nodes toward
+   *   each frame as it lands — from where they are, on one ease of about 600 ms that starts with the first
+   *   frame and moves at once (cubic ease-out), retargeted to every newer frame without a jump; a frame that
+   *   lands after it has ended is painted as it comes. The GPU solve streams its ticks; the worker its seed,
+   *   then one frame per depth, each with the modules not solved yet at their seeded arrangement (no leaf
+   *   collapses onto its module's centre). Until the module tree and the solve are ready (the tree is
+   *   built on a worker, #428), the nodes stay where they are. From a force layout the nodes gather into
+   *   their modules' discs and the map shrinks to its own size, about a third of a force layout's width:
+   *   that is the change to a map of modules, and it shows live. With {@link NetworkLayoutOptions.fit} the
+   *   camera follows it, as it follows any stream; from a nested map of the same size (a re-clustering)
+   *   the map keeps its size.
+   *
+   * On a graph never laid out (all positions equal) it is the cold layout. Default `false`.
    */
   warm?: boolean;
 }
@@ -709,6 +748,10 @@ function labelText(opts: NetworkLabelOptions, id: number, info: NetworkHit): str
   return info.aggregate ? `${info.count} nodes` : String(id);
 }
 const DEFAULT_FORCE_ITERATIONS = 300;
+/** The ease a followed warm nested stream chases its frames on (#454), ms: the length of the old warm transition. */
+const FOLLOW_MS = 600;
+/** The most a followed stream's ease advances per frame, ms (#454): three 60 Hz frames. */
+const FOLLOW_FRAME_MS = 50;
 
 /**
  * What a layout backend asks of the engine, known synchronously from the options (spec §12.2):
@@ -1625,17 +1668,20 @@ export class Network extends BaseEngine {
       // is already (#428); the synchronous force solve builds it here.
       const streams = layoutClass(opts.backend) === "streaming";
       const nestedTree = opts.nested && opts.backend !== "positions" ? (streams ? this.moduleTreeLater() : this.moduleTree()) : undefined;
-      // A transition (#328) eases from the current positions, and a warm nested start refines them —
-      // so neither is streamed, nor gets the seed disc. Only layouts computed in one go transition.
+      // A transition (#328) eases from the current positions — so it is not streamed, nor gets the seed
+      // disc. Only layouts computed in one go transition.
       const duration = nestedTree || opts.backend === "positions" || opts.backend === "force" ? transitionDuration(opts.transition) : 0;
-      const warm = !!nestedTree && typeof opts.nested === "object" && opts.nested.warm === true;
+      // A warm start (#454, #328) continues the positions on screen: no seed disc — unless there are none to
+      // continue (a graph never laid out), which makes it the cold layout. O(nodes) once, stopping early.
+      const nestedWarm = typeof opts.nested === "object" && opts.nested.warm === true;
+      const warm = opts.backend !== "positions" && (opts.warm === true || (!!nestedTree && nestedWarm)) && hasLayout(this.graph.positions, this.graph.nodeCount);
       // A flat force layout's first paint sits at the scale it converges to (the force equilibrium). A
       // nested layout ignores `force` — its root disc is 10·√N, the box the camera frames — so it keeps
       // the viewport disc rather than one ~3× wider than that box.
-      const streamed = layoutClass(opts.backend) === "streaming" && !warm && duration === 0;
-      if (fit && streamed) seedPositions(this.graph, this.width, this.height, nestedTree ? undefined : { force: opts.force });
+      const streamed = layoutClass(opts.backend) === "streaming" && duration === 0;
+      if (fit && streamed && !warm) seedPositions(this.graph, this.width, this.height, nestedTree ? undefined : { force: opts.force });
       if (nestedTree) {
-        this.startNestedLayout(nestedTree, opts, duration);
+        this.startNestedLayout(nestedTree, opts, duration, warm);
       } else if (opts.backend === "positions" && opts.positions) {
         const graph = this.graph;
         if (duration > 0) {
@@ -1650,14 +1696,16 @@ export class Network extends BaseEngine {
           this.recomputeLODGeometry(); // caller-supplied coordinates are final immediately
         }
       } else if (layoutClass(opts.backend) === "streaming") {
-        this.startStreamingLayout(this.graph, opts);
+        this.startStreamingLayout(this.graph, opts, warm);
       } else if (opts.backend === "force") {
         // Main-thread force layout. (Off-thread + progressive convergence via a Web Worker is the
         // next slice.) Multilevel coarsening seeds it by default; opt out for a plain cold start.
         const iterations = opts.iterations ?? DEFAULT_FORCE_ITERATIONS;
         const graph = this.graph;
         const from = duration > 0 ? graph.positions.slice() : null; // where a transition eases from
-        if (opts.multilevel === false) {
+        if (warm) {
+          new ForceLayout(graph, opts.force).run(iterations, "cool"); // from where the nodes are (#454)
+        } else if (opts.multilevel === false) {
           seedPositions(graph, this.width, this.height, { force: opts.force });
           new ForceLayout(graph, opts.force).run(iterations, "hot"); // a cold start untangles at full heat
         } else {
@@ -1999,7 +2047,7 @@ export class Network extends BaseEngine {
    * main-thread tree when no worker streamed one — the worker-unavailable fallback solved synchronously,
    * or the GPU run's LOD worker failed — and only refreshes the style geometry when a worker did.
    */
-  private startStreamingLayout(graph: NetworkGraph, opts: NetworkLayoutOptions): void {
+  private startStreamingLayout(graph: NetworkGraph, opts: NetworkLayoutOptions, warm: boolean): void {
     const useLod = !!this.lodOptions && !this.lodUsesModules();
     // The spatial tree (#343) is rebuilt by a worker per frame, style aggregated there too — on the worker
     // backend, on a "gpu" layout's worker fallback (#351) and by the GPU layout's LOD worker alike — with the
@@ -2022,7 +2070,14 @@ export class Network extends BaseEngine {
       lodStyleVersion: spatialStyle?.version,
       lodView: spatialStyle ? this.postedLODView(this.resolvedStyleCached(graph)) : undefined,
       coarsen: this.lodOptions?.coarsen,
+      // A warm start (#454) continues the positions on screen — the worker's and the GPU run's own
+      // continuation (#311): no disc, no multilevel seed, a fresh cooling schedule from full heat.
+      ...(warm ? { warm: { heat: 1, decaying: true } } : {}),
     };
+    // …and the nodes chase its frames from where they are, as a warm nested map's (#454) — unless a worker streams
+    // the LOD tree, whose geometry is the solve's: then its frames are painted as they land.
+    const follower = warm && !useLod ? this.followStream(graph) : null;
+    if (follower) workerOpts.follow = follower.follow;
     // Unset until the transport returns, so a callback can never match a cleared `layoutHandle` (null).
     let handle: WorkerLayoutHandle | undefined;
     let settled = false; // this layout's settle handler has run (it clears `lodStreaming` once)
@@ -2071,7 +2126,7 @@ export class Network extends BaseEngine {
       this.lodStreaming = useLod; // the worker will stream the tree; main builds none meanwhile
       handle = startWorkerLayout(graph, workerOpts, onFrame, onLODTree);
     }
-    this.onLayoutSettled(handle, () => {
+    this.onLayoutSettled(follower ? this.followHandle(follower.tween, handle) : handle, () => {
       settled = true;
       this.lodStreaming = false;
     });
@@ -2112,28 +2167,37 @@ export class Network extends BaseEngine {
   /**
    * Nested module layout (#324): off-thread + streamed per depth on the worker, on the GPU (all depths at
    * once, #355) on gpu/auto where the device can run it (#375), synchronous on force.
-   * A warm start (#328) seeds from the current positions and lands in one piece, with no depth frames;
-   * with a `duration` the result is eased to ({@link positionTween}) instead of jumped to.
+   * A warm start (#328) seeds from the current positions. With a `duration` (or on force) it lands in one
+   * piece, eased to ({@link positionTween}) or jumped to; otherwise it streams, placed by its seed, and the
+   * nodes chase its frames from where they are ({@link followStream}, #454).
    */
-  private startNestedLayout(tree: LODTree | Promise<LODTree>, opts: NetworkLayoutOptions, duration: number): void {
+  private startNestedLayout(tree: LODTree | Promise<LODTree>, opts: NetworkLayoutOptions, duration: number, warm: boolean): void {
     const graph = this.graph;
     if (!graph) return;
     const cfg = typeof opts.nested === "object" ? opts.nested : {};
-    const warm = cfg.warm === true;
     const radius = 10 * Math.sqrt(graph.nodeCount); // a cold root disc, centred on the origin
     // Created before the solve starts: it snapshots the positions it eases from.
     const tween = duration > 0 ? this.positionTween(graph, duration) : null;
+    // A warm map streamed (#454): no transition asked for, on a streaming backend.
+    const follows = warm && !tween && layoutClass(opts.backend) === "streaming";
     const params: NestedLayoutParams = {
-      radius: warm ? undefined : radius,
+      // A warm map eased in keeps the current map's spread; a streamed one (#454) goes to its natural size, a
+      // cold map's root disc, centred where the current map is.
+      radius: warm && !follows ? undefined : radius,
       // A snapshot (the transition's, when there is one), not the live buffer: after a shared-memory
       // worker run that buffer is SAB-backed, and posting it would share it with the worker, not copy it.
       initial: warm ? (tween?.from ?? graph.positions.slice()) : undefined,
       iterations: cfg.iterations,
       packing: cfg.packing,
       size: (cfg.size ?? "flow") === "flow" ? (graph.flow ?? undefined) : undefined,
+      // Placed before the solve — its seed centred on the current map — so every frame of the stream is placed
+      // alike (#454).
+      ...(follows ? { placeBy: "seed" as const } : {}),
     };
     if (tree instanceof Promise || layoutClass(opts.backend) === "streaming") {
-      const oneFrame = warm || tween !== null;
+      const oneFrame = tween !== null;
+      // Created now, as the transition is: it eases from the positions on screen when the first frame lands.
+      const follower = follows ? this.followStream(graph) : null;
       this.nestedSolving = true;
       const awaited = tree instanceof Promise;
       const solveOn = (t: LODTree): WorkerLayoutHandle | null => {
@@ -2142,11 +2206,13 @@ export class Network extends BaseEngine {
         const topology = { ...t, parent };
         // A cold map streamed depth by depth frames on the bound the transport posts (#427): the root disc as
         // the stream starts, then each depth's placed discs — shrinking to the leaves' exact box. The engine
-        // assumes no bound: a transport that posts none frames the live leaves, as a flat stream does. A warm
-        // map, or one eased in, is framed once it lands.
+        // assumes no bound: a transport that posts none frames the live leaves, as a flat stream does — and a
+        // followed warm map (#454) posts none, so its eased leaves are framed. A map eased in is framed once
+        // it lands.
         const delivery = {
           stream: !oneFrame,
           onResult: oneFrame ? (positions: Float32Array) => this.landNested(graph, positions, tween) : undefined,
+          ...(follower ? { follow: follower.follow } : {}),
           onBoundaries: (discs: BoundaryDiscs) => {
             if (this.graph === graph) this.nestedDiscs = { tree: t, discs }; // the modules' geometry, and their rings' (#329)
           },
@@ -2173,8 +2239,11 @@ export class Network extends BaseEngine {
       };
       // A module tree still on its way from a worker (#428): the solve starts when it lands.
       const solve = tree instanceof Promise ? deferredLayoutHandle(tree, solveOn) : solveOn(tree);
-      if (!solve) return;
-      this.onLayoutSettled(tween ? this.transitionHandle(tween, solve) : solve);
+      if (!solve) {
+        follower?.tween.stop();
+        return;
+      }
+      this.onLayoutSettled(tween ? this.transitionHandle(tween, solve) : follower ? this.followHandle(follower.tween, solve) : solve);
     } else {
       const { parent } = tree;
       if (!parent) return; // provided module trees always carry their parent map
@@ -2213,16 +2282,20 @@ export class Network extends BaseEngine {
    * grabbed before the transition started (a nested solve, on the worker or the GPU, still computing its
    * target) is held under the cursor over each frame ({@link dragReapply}), and kept where it is dropped.
    */
-  private positionTween(graph: NetworkGraph, duration: number): PositionTransition {
+  private positionTween(graph: NetworkGraph, duration: number, follow?: { ease: (t: number) => number; maxFrameMs: number }): PositionTransition {
     return positionTransition(graph.positions, {
       duration,
+      ...(follow ?? {}),
       onFrame: (progress) => {
         if (this.graph !== graph) return;
         this.dragReapply?.();
         // A fitted transition's camera, on the same ease (#427): O(1). It heads for the view framing the
         // target in the viewport and with the glyph pad as they are now, so a resize or restyle re-aims it.
+        // A followed stream (#454) has no final box to head for: it frames the live leaves, as a stream does
+        // (O(nodes), only while the fit is on).
         const camera = this.fitOnLayout ? this.fitCamera : null;
         if (camera) this.frameView(camera.path(progress, this.fitTransformFor(graph, camera.box)));
+        else if (this.fitOnLayout) this.fitViewToLayout("streaming");
         this.repaintDuringDrag();
         this.flushFrame(); // this tick runs inside an animation frame: draw it here (with any pending zoom), not a frame late
       },
@@ -2261,6 +2334,76 @@ export class Network extends BaseEngine {
       pin() {},
       unpin() {},
     };
+  }
+
+  /**
+   * A followed warm stream (#454) — a warm force layout's or a warm nested map's, streamed without a
+   * transition: the nodes chase its frames from where they are, on one ease of {@link FOLLOW_MS} (cubic
+   * ease-out, so they move at once) that starts with the first frame and is retargeted to each newer one
+   * ({@link PositionTransition.retarget}) — continuous, and ending exactly on the latest frame. Its frames are
+   * {@link positionTween}'s: the positions-only repaint, with a fit reframing the live leaves. Once the ease
+   * has ended the follower hands every frame back and the transport paints it as a streamed frame: the GPU
+   * reads it back straight into `graph.positions` again (`follow.target()` is the graph's buffer), the worker's
+   * is copied in, or its shared buffer becomes the graph's. The GPU reads frames back in place into one buffer
+   * of 2 floats per node while the ease runs (allocated with the first one); a worker frame is its own
+   * message's array.
+   */
+  private followStream(graph: NetworkGraph): { follow: StreamFollow; tween: PositionTransition } {
+    // A frame later than FOLLOW_FRAME_MS (a busy main thread: the GPU solve being built, a long repaint) moves
+    // the ease on by that much, not by the time that passed: a stall slows the glide instead of skipping it.
+    const tween = this.positionTween(graph, FOLLOW_MS, { ease: easeCubicOut, maxFrameMs: FOLLOW_FRAME_MS });
+    let buffer: Float32Array | null = null;
+    const follow: StreamFollow = {
+      target: () => (tween.ended ? graph.positions : (buffer ??= new Float32Array(graph.positions.length))),
+      onFrame: (positions) => {
+        if (this.graph !== graph) return true; // superseded: nothing paints it
+        if (tween.retarget(positions)) return true; // the ease's own frames repaint
+        buffer = null;
+        return false;
+      },
+    };
+    return { follow, tween };
+  }
+
+  /**
+   * A followed stream's layout handle (#454): it settles once the solve has settled and the ease has reached
+   * its last frame (at once when the ease never started: the solve stopped first). `stop()` stops both, where
+   * they are. Everything else is the solve's: its live transport and shared mode, a drag's pins (a grab
+   * finishes the ease first, as it finishes a transition), the spatial LOD stream's style and view, a device
+   * move.
+   */
+  private followHandle(tween: PositionTransition, solve: WorkerLayoutHandle): WorkerLayoutHandle {
+    this.transition = tween; // a grab finishes it, as it finishes a transition
+    const settled = solve.settled.then(
+      () => {
+        if (!tween.running) tween.stop(); // never started: nothing will end it
+        return tween.settled;
+      },
+      (error: unknown) => {
+        tween.stop();
+        throw error;
+      },
+    );
+    const handle: WorkerLayoutHandle = {
+      get shared() {
+        return solve.shared;
+      },
+      get transport() {
+        return solve.transport;
+      },
+      settled,
+      stop: () => {
+        solve.stop();
+        tween.stop();
+      },
+      pin: (ids, positions) => solve.pin(ids, positions),
+      unpin: () => solve.unpin(),
+    };
+    const { setLODStyle, setLODView, moveDevice } = solve;
+    if (setLODStyle) handle.setLODStyle = (style, version) => setLODStyle.call(solve, style, version);
+    if (setLODView) handle.setLODView = (view) => setLODView.call(solve, view);
+    if (moveDevice) handle.moveDevice = (next) => moveDevice.call(solve, next);
+    return handle;
   }
 
   /** Ease `graph`'s positions to an already-computed `target` over `duration` ms (#328). `prepare`

@@ -141,8 +141,9 @@ export interface NestedStartMessage {
   type: "start-nested";
   topology: NestedLayoutTopology;
   params: NestedLayoutParams;
-  /** Post a frame per finished depth. Off for a warm start or a transition (#328), which only want
-   *  the final layout. */
+  /** Post a frame per finished depth. Off for a transition, and for a warm start placed by its result
+   *  (#328), which only want the final layout; a warm start placed by its seed (`params.placeBy`, #454)
+   *  streams its seed first, then each depth. */
   stream: boolean;
 }
 

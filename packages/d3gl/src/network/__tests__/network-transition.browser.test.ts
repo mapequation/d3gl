@@ -36,12 +36,65 @@ function graph(): NetworkGraph {
   });
 }
 
-/** The pure warm nested layout of `records` from `initial` — what the engine must land on. */
-function warmNested(g: NetworkGraph, records: ModuleNode[], initial: Float32Array): Float32Array {
+/** The pure warm nested layout of `records` from `initial` — what the engine must land on: placed over the
+ *  current map by its result (a transition, the force backend), or streamed (#454) at its natural size — the
+ *  cold root disc — with its seed centred on the current map. */
+function warmNested(g: NetworkGraph, records: ModuleNode[], initial: Float32Array, placeBy: "result" | "seed" = "result"): Float32Array {
   const tree = buildModuleLODTree(g.nodeCount, records, g);
   const parent = tree.parent;
   if (!parent) throw new Error("module trees carry a parent map");
-  return nestedLayout({ ...tree, parent }, { initial, size: g.flow ?? undefined }).positions;
+  const radius = placeBy === "seed" ? 10 * Math.sqrt(g.nodeCount) : undefined;
+  return nestedLayout({ ...tree, parent }, { initial, size: g.flow ?? undefined, placeBy, radius }).positions;
+}
+
+/** Mean leaf displacement between two position sets. */
+function shift(a: Float32Array, b: Float32Array): number {
+  let s = 0;
+  for (let i = 0; i < a.length / 2; i++) s += Math.hypot(a[2 * i]! - b[2 * i]!, a[2 * i + 1]! - b[2 * i + 1]!);
+  return s / (a.length / 2);
+}
+
+/** The centroid. */
+function spreadCentre(p: Float32Array): { x: number; y: number } {
+  const n = p.length / 2;
+  let x = 0;
+  let y = 0;
+  for (let i = 0; i < n; i++) {
+    x += p[2 * i]!;
+    y += p[2 * i + 1]!;
+  }
+  return { x: x / n, y: y / n };
+}
+
+/** RMS distance from the centroid. */
+function spreadOf(p: Float32Array): number {
+  const n = p.length / 2;
+  let x = 0;
+  let y = 0;
+  for (let i = 0; i < n; i++) {
+    x += p[2 * i]!;
+    y += p[2 * i + 1]!;
+  }
+  x /= n;
+  y /= n;
+  let ss = 0;
+  for (let i = 0; i < n; i++) ss += (p[2 * i]! - x) ** 2 + (p[2 * i + 1]! - y) ** 2;
+  return Math.sqrt(ss / n);
+}
+
+/** A ring of `n` nodes with a chord every tenth. */
+function ring(n: number): NetworkGraph {
+  const source: number[] = [];
+  const target: number[] = [];
+  for (let i = 0; i < n; i++) {
+    source.push(i);
+    target.push((i + 1) % n);
+    if (i % 10 === 0) {
+      source.push(i);
+      target.push((i + n / 2) % n);
+    }
+  }
+  return buildGraph({ nodeCount: n, source, target });
 }
 
 const tf = (net: Network): { k: number; x: number; y: number } => ({ ...(net as unknown as { transform: { k: number; x: number; y: number } }).transform });
@@ -130,7 +183,7 @@ describe("warm nested re-layout + position transitions (#328)", () => {
     net.destroy();
   });
 
-  it("a warm re-cluster without a transition lands in one frame", async () => {
+  it("a warm re-cluster without a transition streams from the current map: it moves at once, frame by frame, to the map at its natural size (#454)", async () => {
     const net = network(host(), { width: 200, height: 200 });
     await net.whenReady();
     const g = graph();
@@ -138,15 +191,61 @@ describe("warm nested re-layout + position transitions (#328)", () => {
     const camera = tf(net);
     net.data(g, { modules: PAIRS }).lod({});
     const from = g.positions.slice();
-    const want = warmNested(g, PAIRS, from);
+    const want = warmNested(g, PAIRS, from, "seed");
     const rec = sampler(() => g.positions);
     net.layout({ backend: "worker", nested: { warm: true } });
+    expect(Array.from(g.positions)).toEqual(Array.from(from)); // nothing is placed over the map at the call
     await net.whenSettled();
     await nextFrame();
     rec.stop();
     expect(Array.from(g.positions)).toEqual(Array.from(want));
-    for (const s of rec.samples) expect([0, 1]).toContain(pathFraction(s, from, want));
-    expect(tf(net)).toEqual(camera);
+    // Frame by frame: many frames between the two maps, none a jump across a large part of the way.
+    const total = shift(from, want);
+    let between = 0;
+    let largest = 0;
+    for (let i = 0; i < rec.samples.length; i++) {
+      const s = rec.samples[i]!;
+      if (shift(s, from) > 0 && shift(s, want) > 0) between++;
+      if (i > 0) largest = Math.max(largest, shift(s, rec.samples[i - 1]!));
+    }
+    expect(between, "no frame between the two maps").toBeGreaterThan(5);
+    expect(largest / total, "a jump").toBeLessThan(0.35);
+    expect(tf(net)).toEqual(camera); // no fit asked for: the camera stays
+    net.destroy();
+  });
+
+  it("a warm flat layout continues the positions on screen, glides frame by frame as it spreads out, and lands on the solve (#454)", async () => {
+    const net = network(host(), { width: 200, height: 200 });
+    await net.whenReady();
+    const g = ring(120);
+    net.data(g).lod(false).layout({ backend: "force", iterations: 150 }); // laid out, and settled
+    // A third of its own scale — as a nested map of a graph is to its force layout: the warm stream spreads it out.
+    const settledAt = g.positions.slice();
+    const c = spreadCentre(settledAt);
+    const from = settledAt.map((v, i) => (i % 2 ? c.y : c.x) + (v - (i % 2 ? c.y : c.x)) / 3);
+    const run = async (opts: { warm: boolean }): Promise<{ samples: Float32Array[]; to: Float32Array }> => {
+      g.positions.set(from);
+      const rec = sampler(() => g.positions);
+      net.layout({ backend: "worker", iterations: 120, multilevel: false, ...opts });
+      await net.whenSettled();
+      await nextFrame();
+      rec.stop();
+      return { samples: rec.samples, to: g.positions.slice() };
+    };
+    const warm = await run({ warm: true });
+    const total = shift(from, warm.to);
+    expect(total / spreadOf(from), "non-vacuity: the layout spread out").toBeGreaterThan(1);
+    const moved = warm.samples.filter((s) => shift(s, from) > 0);
+    // From where the nodes are: the first frame that moved them is a small step from there, every later one too.
+    expect(shift(moved[0] ?? warm.to, from) / total, "the first frame jumped").toBeLessThan(0.15);
+    let largest = 0;
+    for (let i = 1; i < moved.length; i++) largest = Math.max(largest, shift(moved[i]!, moved[i - 1]!));
+    expect(largest / total, "a jump").toBeLessThan(0.2);
+    expect(moved.length, "too few frames between the two layouts").toBeGreaterThan(8);
+    // A cold start's first frame is its disc, far from the layout on screen.
+    const cold = await run({ warm: false });
+    const coldFirst = cold.samples.find((s) => shift(s, from) > 0) ?? cold.to;
+    expect(shift(coldFirst, from) / spreadOf(from), "non-vacuity: a cold start's first frame is near the layout").toBeGreaterThan(0.5);
     net.destroy();
   });
 

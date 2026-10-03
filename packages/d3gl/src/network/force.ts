@@ -432,6 +432,28 @@ export class ForceLayout {
   }
 }
 
+/**
+ * Whether the first `n` nodes of `positions` hold a layout (#454): at least two of their finite positions
+ * differ. A graph never laid out (all zeros, or all at one point) holds none, so a warm start from it is a
+ * cold one. O(n), stopping at the first difference.
+ */
+export function hasLayout(positions: ArrayLike<number>, n: number): boolean {
+  let x0 = Number.NaN;
+  let y0 = Number.NaN;
+  for (let i = 0; i < n; i++) {
+    const x = positions[2 * i]!;
+    const y = positions[2 * i + 1]!;
+    if (!Number.isFinite(x) || !Number.isFinite(y)) continue;
+    if (Number.isNaN(x0)) {
+      x0 = x;
+      y0 = y;
+    } else if (x !== x0 || y !== y0) {
+      return true;
+    }
+  }
+  return false;
+}
+
 /** Options for {@link seedPositions}. */
 export interface SeedOptions {
   /**

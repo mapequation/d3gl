@@ -139,6 +139,71 @@ describe("network layout backend:'gpu' integration", () => {
     net.destroy();
   });
 
+  it("a warm layout (#454) glides from the positions on screen: frame by frame as it spreads out, no disc, no multilevel seed", async () => {
+    const net = network(makeHost(), { width: W, height: H, backend: "webgl" });
+    await net.whenReady();
+    // A ring of 1,600 nodes with a chord every tenth, laid out, then packed to a third of its scale — as a
+    // nested map of a graph is to its force layout: the warm GPU solve spreads it back out.
+    const n = 1600;
+    const source: number[] = [];
+    const target: number[] = [];
+    for (let i = 0; i < n; i++) {
+      source.push(i);
+      target.push((i + 1) % n);
+      if (i % 10 === 0) {
+        source.push(i);
+        target.push((i + n / 2) % n);
+      }
+    }
+    const g = buildGraph({ nodeCount: n, source, target });
+    net.data(g).lod(false).layout({ backend: "gpu", fit: true });
+    await net.whenSettled();
+    let cx = 0;
+    let cy = 0;
+    for (let i = 0; i < n; i++) {
+      cx += (g.positions[2 * i] ?? 0) / n;
+      cy += (g.positions[2 * i + 1] ?? 0) / n;
+    }
+    const from = g.positions.map((v, i) => (i % 2 ? cy : cx) + (v - (i % 2 ? cy : cx)) / 3);
+    net.layout({ backend: "positions", positions: from });
+    const samples: { t: number; p: Float32Array }[] = [];
+    let on = true;
+    const tick = (): void => {
+      if (!on) return;
+      samples.push({ t: performance.now(), p: g.positions.slice() });
+      requestAnimationFrame(tick);
+    };
+    requestAnimationFrame(tick);
+    net.layout({ backend: "gpu", warm: true, fit: true });
+    expect(Array.from(g.positions)).toEqual(Array.from(from)); // no disc, no seed placed over it
+    await net.whenSettled();
+    await new Promise<void>((r) => requestAnimationFrame(() => r()));
+    on = false;
+    expect(net.layoutTransport).toBe("gpu");
+    const to = g.positions.slice();
+    const shift = (a: Float32Array, b: Float32Array): number => {
+      let sum = 0;
+      for (let i = 0; i < n; i++) sum += Math.hypot((a[2 * i] ?? 0) - (b[2 * i] ?? 0), (a[2 * i + 1] ?? 0) - (b[2 * i + 1] ?? 0));
+      return sum / n;
+    };
+    const total = shift(from, to);
+    expect(total, "non-vacuity: the layout moved").toBeGreaterThan(1);
+    const moved = samples.filter((s) => shift(s.p, from) > 0);
+    const first = moved[0];
+    if (!first) throw new Error("no frame moved the layout");
+    expect(shift(first.p, from) / total, "the first frame jumped").toBeLessThan(0.15);
+    // The ease: at least 600 ms from the first moved frame (a slow frame stretches it), retargeted to each frame the
+    // GPU reads back — every frame in it a step on from the last. (After it, frames are painted as they land.)
+    const eased = moved.filter((s) => s.t - first.t <= 600);
+    let largest = 0;
+    for (let i = 1; i < eased.length; i++) largest = Math.max(largest, shift(eased[i]?.p ?? to, eased[i - 1]?.p ?? to));
+    // A frame moves the ease on by at most 50 ms of its 600 (ease-out: up to 23% of the way left) however late
+    // it comes — headless frames here come ~100 ms apart.
+    expect(largest / total, `a jump: ${eased.map((s) => (shift(s.p, from) / total).toFixed(2)).join(" ")}`).toBeLessThan(0.3);
+    expect(eased.length, "too few frames in the ease").toBeGreaterThan(4);
+    net.destroy();
+  });
+
   it("falls back gracefully (no throw, layoutTransport !== 'gpu') on a Canvas engine", async () => {
     const host = makeHost();
     // Canvas backend has no WebGL device; the GPU layout should fall back to the worker.

@@ -292,22 +292,25 @@ export interface FrameSink {
 
 /**
  * The default {@link FrameSink}: harvests land in `graph.positions` — or in `into`, for a caller that eases to
- * the result (#328, #355) — painted in the frame they were harvested.
+ * the result (#328, #355), or where `into()` says at each harvest, for a caller that eases toward every frame
+ * (#454) — painted in the frame they were harvested.
  */
 export class DirectSink implements FrameSink {
   readonly relays = false;
   readonly holding = false;
   private readonly graph: NetworkGraph;
-  private readonly into: Float32Array | null;
+  private readonly into: Float32Array | (() => Float32Array) | null;
   private submitted = false;
 
-  constructor(graph: NetworkGraph, into: Float32Array | null = null) {
+  constructor(graph: NetworkGraph, into: Float32Array | (() => Float32Array) | null = null) {
     this.graph = graph;
     this.into = into;
   }
 
   target(): Float32Array {
-    return this.into ?? this.graph.positions; // `graph.positions` read live: a shared-memory start swaps it
+    const into = this.into;
+    if (typeof into === "function") return into();
+    return into ?? this.graph.positions; // `graph.positions` read live: a shared-memory start swaps it
   }
 
   submit(): void {

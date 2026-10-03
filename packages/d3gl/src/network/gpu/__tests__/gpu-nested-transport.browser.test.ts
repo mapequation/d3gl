@@ -17,6 +17,12 @@ import { network } from "../../network.js";
 import { buildModuleLODTree, type ModuleNode } from "../../modules.js";
 import { threeLevel, topo } from "../../__tests__/nested-fixtures.js";
 
+/** The tree's root module. */
+function rootOfTree(tree: NestedLayoutTopology): number {
+  for (let g = tree.leafCount; g < tree.size; g++) if ((tree.parent[g] ?? 0) < 0) return g;
+  throw new Error("no root");
+}
+
 /** A graph over the tree's leaves (leaf ids are node ids), with a ring of edges. */
 function graphOver(tree: NestedLayoutTopology): NetworkGraph {
   const n = tree.leafCount;
@@ -137,6 +143,53 @@ describe("startGpuNestedLayout (#355)", () => {
     const want = direct(device, tree, iterations, initial);
     expect(got.result).not.toBeNull();
     expect(Array.from(got.result ?? [])).toEqual(Array.from(want.positions));
+  });
+
+  it("a followed warm start (#454) hands the follower its placed seed first, then every frame, and never writes the graph", async () => {
+    const g = graphOver(tree);
+    const cold = nestedLayout(tree, { iterations, radius });
+    // A map at another place and scale, as a force layout's would be.
+    const initial = cold.positions.map((v, i) => v * 3 + (i % 2 ? -500 : 800));
+    g.positions.set(initial);
+    const before = g.positions.slice();
+    const buffer = new Float32Array(2 * tree.leafCount);
+    const frames: Float32Array[] = [];
+    let painted = 0;
+    const params = { iterations, initial, placeBy: "seed" as const };
+    const handle = startGpuNestedLayout(device, g, tree, params, () => painted++, {
+      frameEvery: 10,
+      follow: {
+        target: () => buffer,
+        onFrame: (positions) => {
+          frames.push(positions.slice());
+          expect(Array.from(g.positions)).toEqual(Array.from(before)); // the follower eases the graph, not the transport
+          return true;
+        },
+      },
+    });
+    await handle.settled;
+    expect(handle.transport).toBe("gpu");
+    expect(painted).toBe(0);
+    // The seed, from the prep, before the solve's first frame: the CPU's depth-0 frame.
+    let seed: Float32Array | null = null;
+    const cpu = nestedLayout(tree, { ...params, onDepth: (d, p) => void (d === 0 && (seed = p.slice())) });
+    const want = seed ?? new Float32Array(0);
+    let worst = 0;
+    for (let i = 0; i < want.length; i++) worst = Math.max(worst, Math.abs((frames[0]?.[i] ?? Number.NaN) - (want[i] ?? 0)));
+    expect(worst).toBeLessThan(1e-3 * (cpu.r[rootOfTree(tree)] ?? 1));
+    // Then the solve's frames, read back into the follower's buffer, ending on the solve's layout, placed by
+    // the root disc alone: the direct solve of the same prep, with nothing placed after.
+    expect(frames.length).toBeGreaterThanOrEqual(4);
+    const solver = nestedSolverTopology(tree, params);
+    const layout = new GpuNestedLayout(device, nestedLayoutPlan(solver));
+    try {
+      layout.runTicks(solver.iterations);
+      const positions = new Float32Array(2 * solver.leafCount);
+      layout.readComposed(positions);
+      expect(Array.from(frames[frames.length - 1] ?? [])).toEqual(Array.from(positions));
+    } finally {
+      layout.destroy();
+    }
   });
 
   it("falls back to the worker with one warning when there is no device", async () => {
@@ -367,6 +420,56 @@ describe("layout({ backend: 'gpu', nested }) through the engine (#355)", () => {
     let moved = 0;
     for (let i = 0; i < n; i++) moved += Math.hypot((g.positions[2 * i] ?? 0) - (cold[2 * i] ?? 0), (g.positions[2 * i + 1] ?? 0) - (cold[2 * i + 1] ?? 0));
     expect(moved / n).toBeLessThan(0.1 * radius); // a refinement of the map, placed where it was
+    net.destroy();
+  });
+
+  it("a warm re-layout without a transition streams from the map on screen: every painted frame a step on, to the solve's layout (#454)", async () => {
+    const records: ModuleNode[] = [];
+    const n = 2000;
+    for (let id = 0; id < n; id++) records.push({ id, path: [Math.floor(id / 400) + 1, Math.floor((id % 400) / 50) + 1, (id % 50) + 1] });
+    const g = buildGraph({ nodeCount: n, source: Array.from({ length: n - 1 }, (_, i) => i), target: Array.from({ length: n - 1 }, (_, i) => i + 1) });
+    const net = network(host(), { width: 300, height: 300, backend: "webgl" });
+    await net.whenReady();
+    // A force layout's map: every node on one disc by id, blind to the modules, ~3× a nested map's scale.
+    const flat = new Float32Array(2 * n);
+    const R = 30 * Math.sqrt(n);
+    for (let i = 0; i < n; i++) {
+      const r = R * Math.sqrt((i + 0.5) / n);
+      flat[2 * i] = r * Math.cos(i * 2.399963229728653);
+      flat[2 * i + 1] = r * Math.sin(i * 2.399963229728653);
+    }
+    net.data(g, { modules: records }).layout({ backend: "positions", positions: flat });
+    const samples: Float32Array[] = [];
+    let on = true;
+    const tick = (): void => {
+      if (!on) return;
+      samples.push(g.positions.slice());
+      requestAnimationFrame(tick);
+    };
+    requestAnimationFrame(tick);
+    net.layout({ backend: "gpu", nested: { warm: true, iterations: 30 } });
+    expect(Array.from(g.positions)).toEqual(Array.from(flat)); // nothing placed over it at the call
+    await net.whenSettled();
+    await new Promise<void>((r) => requestAnimationFrame(() => r()));
+    on = false;
+    expect(net.layoutTransport).toBe("gpu");
+    const to = g.positions.slice();
+    const shift = (a: Float32Array, b: Float32Array): number => {
+      let s = 0;
+      for (let i = 0; i < n; i++) s += Math.hypot((a[2 * i] ?? 0) - (b[2 * i] ?? 0), (a[2 * i + 1] ?? 0) - (b[2 * i + 1] ?? 0));
+      return s / n;
+    };
+    const total = shift(flat, to);
+    expect(total, "non-vacuity: the map moved the nodes").toBeGreaterThan(0.1 * R);
+    let between = 0;
+    let largest = 0;
+    for (let i = 0; i < samples.length; i++) {
+      const s = samples[i] ?? to;
+      if (shift(s, flat) > 0 && shift(s, to) > 0) between++;
+      if (i > 0) largest = Math.max(largest, shift(s, samples[i - 1] ?? s));
+    }
+    expect(between, "no frame between the two maps").toBeGreaterThan(5);
+    expect(largest / total, "a jump").toBeLessThan(0.35);
     net.destroy();
   });
 });

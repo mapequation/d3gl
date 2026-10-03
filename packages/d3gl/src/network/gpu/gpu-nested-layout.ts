@@ -203,7 +203,10 @@ export function gpuNestedLayoutNeed(plan: NestedLayoutPlan): GpuLayoutNeed {
 
 /** Options of {@link GpuNestedLayout}. */
 export interface GpuNestedLayoutOptions {
-  /** The root disc's centre, world units. Default (0, 0) (a cold layout's; a warm one is placed after). */
+  /**
+   * The root disc's centre, world units. Default the prep's (`topo.rootX`, `topo.rootY`): the origin for a
+   * cold layout (a warm one is placed after), or where a warm start placed by its seed puts it (#454).
+   */
   rootX?: number;
   rootY?: number;
   /** Test hook: ticks of the organise phase (default `⌈0.6 · iterations⌉`, the CPU's). */
@@ -357,8 +360,8 @@ export class GpuNestedLayout implements StreamSolver {
       if (slots < 1) throw new Error("GpuNestedLayout: the tree has no node below its root");
       if (slots >= NESTED_MAX_SLOTS) throw new Error("GpuNestedLayout: slot ids must stay exact in float32 (below 2^24)");
       this.slots = slots;
-      this.rootX = options.rootX ?? 0;
-      this.rootY = options.rootY ?? 0;
+      this.rootX = options.rootX ?? topo.rootX;
+      this.rootY = options.rootY ?? topo.rootY;
       const width = atlasWidth(slots);
       const height = Math.ceil(slots / width);
       this.width = width;
