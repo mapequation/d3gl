@@ -69,6 +69,8 @@ const DROPPED = 2;
 const CULLED = 3;
 /** A kept leaf's row with nothing to gather (#447: every neighbour a kept leaf): no memo row, no pairs. */
 const EMPTY_ROW = -2;
+/** A CSR entry that is not its edge's source's entry (`incidenceSourceEdges` in spatial-rows.ts). */
+const NO_EDGE = 0xffffffff;
 /** Direction flags per row entry. */
 const HAS_OUT = 1;
 const HAS_IN = 2;
@@ -129,6 +131,14 @@ export interface LazySuperEdgesScratch {
    *  entries plus the graph edges of the kept leaves read with them (0 without `tree.rows`). */
   imported: number;
   entries: number;
+  /**
+   * The links between two kept leaves the last call met (#447), as graph edge ids in walk order (the kept
+   * leaves in `kept` order, each one's CSR row in order): `leafEdges[0..leafLinks)`. Listed only when the call
+   * is given each CSR entry's edge id (`sourceEdges`), at the edge's source's entry, so each edge once; a
+   * self-loop is left out. Grown by doubling, reused.
+   */
+  leafEdges: Uint32Array;
+  leafLinks: number;
 }
 
 /** A fresh {@link LazySuperEdgesScratch}. */
@@ -162,6 +172,8 @@ export function makeLazySuperEdgesScratch(): LazySuperEdgesScratch {
     labelled: 0,
     imported: 0,
     entries: 0,
+    leafEdges: new Uint32Array(0),
+    leafLinks: 0,
   };
 }
 
@@ -277,9 +289,11 @@ export function lazySuperEdges(
   csr: CSR,
   incidence: LeafIncidence,
   scratch: LazySuperEdgesScratch = makeLazySuperEdgesScratch(),
+  sourceEdges?: Uint32Array,
 ): SuperEdgesData {
   const { leafOrder, leafStart, leafEnd, parent, rows } = tree;
   const sc = scratch;
+  sc.leafLinks = 0;
   sc.hits = 0;
   sc.misses = 0;
   sc.visits = 0;
@@ -398,19 +412,41 @@ export function lazySuperEdges(
   // neighbour that is itself a kept leaf is skipped before it is resolved (one read), and the row holds the flow
   // toward aggregates and covers off the kept set only; such a row is built fresh on every call (O(degree)),
   // never taken from the memo, since which neighbours it skips depends on the cut and a memo row names only the
-  // covers it holds.
+  // covers it holds. Given `sourceEdges`, the skipped links are listed for the engine in the same read: the edge
+  // id at the source's entry (so an edge once, from its source's row), a self-loop left out.
+  const listing = keptStamp >= 0 && sourceEdges !== undefined;
+  let leafEdges = sc.leafEdges;
+  let m = 0;
+  const listLeafLink = (p: number, v: number, g: number): void => {
+    const e = sourceEdges?.[p] ?? NO_EDGE;
+    if (e === NO_EDGE || v === g) return;
+    if (m === leafEdges.length) {
+      const grown = new Uint32Array(Math.max(1024, 2 * m));
+      grown.set(leafEdges);
+      leafEdges = grown;
+      sc.leafEdges = grown;
+    }
+    leafEdges[m++] = e;
+  };
   const leafRow = (g: number): number => {
     const p0 = offsets[g] ?? 0;
     const p1 = offsets[g + 1] ?? 0;
     sc.entries += p1 - p0;
     // Every neighbour a kept leaf (the all-leaves view): nothing to gather, and no row to register.
     let p = p0;
-    while (p < p1 && cover[neighbors[p] ?? 0] === keptStamp) p++;
+    for (; p < p1; p++) {
+      const v = neighbors[p] ?? 0;
+      if (cover[v] !== keptStamp) break;
+      if (listing) listLeafLink(p, v, g);
+    }
     if (p === p1) return EMPTY_ROW;
     open();
     for (; p < p1; p++) {
       const v = neighbors[p] ?? 0;
-      if (cover[v] === keptStamp) continue;
+      if (cover[v] === keptStamp) {
+        if (listing) listLeafLink(p, v, g);
+        continue;
+      }
       const h = resolve(v);
       if (h === g || h < 0 || (fading && nested(g, h))) continue;
       add(h, incW ? (incW[p] ?? 0) : uniform, !incOut || incOut[p] === 1);
@@ -460,6 +496,7 @@ export function lazySuperEdges(
     keptRow[i] = row;
     if (row < 0) rebuild = true;
   }
+  sc.leafLinks = m;
   // Each leaf's cover label (8 B per leaf, allocated only once a row is rebuilt from leaves).
   if (rebuild && sc.label.length < 2 * n) sc.label = new Int32Array(2 * n);
   const label = sc.label;

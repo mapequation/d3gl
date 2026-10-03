@@ -343,12 +343,12 @@ describe("GPU layout streaming with the spatial LOD source (#343 × #377) — ne
       // #447, the leaf links (graph edges between two kept leaves), per repaint: one GPU instance per shown link per
       // indexed layer, 20-24 B uploaded for each (its edge id, its moved ends, a fade), and no style upload — the
       // style tables are built once, on the LOD lane's first emit, never re-uploaded while the layout streams.
-      // The index walk reads the kept leaves' rows only, which the gather reads too: at an aggregated view it
-      // adds no more CPU reads than the gather's own, and no upload on a repaint that shows no leaf link.
+      // The links are listed by the gather in its own read of the kept leaves' rows: no second walk of them (0
+      // entries read for the listing), and no upload on a repaint that shows no leaf link.
       expect(r.instances, "worker backend: GPU instances of the leaf links").toBe(r.leafLinks * r.draws);
       expect(r.instanceBytes, "worker backend: per-instance bytes of the leaf links").toBeLessThanOrEqual(24 * r.instances);
       if (r.tablesBuilt === 0) expect(r.tableBytes, "worker backend: leaf-link style bytes uploaded on a streamed repaint").toBe(0);
-      expect(r.leafEntries, "worker backend: CSR entries the leaf-link walk read, against the gather's").toBeLessThanOrEqual(r.entries);
+      expect(r.leafEntries, "worker backend: CSR entries a second leaf-link walk read (the gather lists them)").toBe(0);
       if (r.leafLinks === 0 && r.tablesBuilt === 0) expect(r.instanceBytes + r.tableBytes, "worker backend: leaf-link bytes on a repaint that shows none").toBe(0);
     }
     expect(withTree.filter((r) => r.tablesBuilt > 0).length, "worker backend: repaints that built the leaf-link style tables").toBeLessThanOrEqual(1);
