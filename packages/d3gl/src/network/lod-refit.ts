@@ -79,14 +79,14 @@ export function answerLODGeometry(stream: LODStream, msg: LODGeometryRequest, se
   const { positions } = msg;
   if (stream.kind === "structure") {
     const geometry = bindGeometry(stream.tree, msg.geometry?.buffer ?? new ArrayBuffer(lodGeometryByteLength(stream.tree.size)));
-    // No crowding computed here (#426: the relay gets no leaf style for a structure tree) — never a zeroed 0,
-    // which would read as "every member clears"; the main thread computes it once the layout settles.
-    if (!stream.style?.crowding) stream.tree.clearZoom.fill(Infinity);
+    // No crowding computed here (#426: the relay gets no leaf style for a structure tree, so its `clearZoom`
+    // stays `Infinity`, never a zeroed 0, which would read as "every member clears"); the main thread computes
+    // it once the layout settles.
     lodFrameStep(stream, positions, msg.frame);
     send({ type: "lod-geometry", positions, geometry }, [positions.buffer, geometry.buffer]);
     return;
   }
-  const lodFrame = lodFrameStep(stream, positions, msg.frame);
+  const lodFrame = lodFrameStep(stream, positions, msg.frame, msg.settled === true);
   if (!lodFrame) send({ type: "lod-geometry", positions }, [positions.buffer]);
   else if (lodFrame.rows) send({ type: "lod-geometry", positions, lodFrame }, [positions.buffer, lodFrame.buffer, lodFrame.rows.buffer]);
   else send({ type: "lod-geometry", positions, lodFrame }, [positions.buffer, lodFrame.buffer]);

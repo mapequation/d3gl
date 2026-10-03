@@ -220,7 +220,7 @@ export class LODRelay implements FrameSink {
     return this.graph.positions; // no tree yet, or no worker: straight into the graph
   }
 
-  submit(ticks: number): void {
+  submit(ticks: number, final = false): void {
     this.ticks = ticks;
     const positions = this.positions;
     if (this.phase !== "streaming" || !positions) {
@@ -229,6 +229,7 @@ export class LODRelay implements FrameSink {
     }
     const geometry = this.geometry;
     const request: LODGeometryRequest = geometry ? { type: "lod-geometry", positions, frame: ticks, geometry } : { type: "lod-geometry", positions, frame: ticks };
+    if (final) request.settled = true; // the settled frame: the worker computes its crowding (#426)
     this.positions = null;
     this.geometry = null;
     this.frame = "away";

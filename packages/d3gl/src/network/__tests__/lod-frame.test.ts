@@ -118,7 +118,7 @@ describe("lodFrameStep (#343): the one per-frame LOD step", () => {
   });
 });
 
-describe("lodFrameStep carries the crowding (#426)", () => {
+describe("lodFrameStep carries the crowding on the settled frame only (#426)", () => {
   const n = 2000;
   const radii = Float32Array.from({ length: n }, (_, i) => 1 + (i % 6));
   const weight = new Float32Array(n).fill(1);
@@ -127,8 +127,16 @@ describe("lodFrameStep carries the crowding (#426)", () => {
     const pos = cloud(n, 11);
     for (const crowding of [{ screenSized: true }, { screenSized: false }, { screenSized: true, expandPx: 300 }]) {
       const stream = makeSpatialLODStream(n, { radii, weight, crowding }, 1);
-      const frame = lodFrameStep(stream, pos, 1);
-      if (!frame) throw new Error("no frame");
+      // A streamed frame carries none: the footprint rule alone while the layout runs.
+      const streamed = lodFrameStep(stream, pos, 1);
+      if (!streamed) throw new Error("no frame");
+      expect(streamed.header.crowding).toBe(false);
+      expect(lodTreeFromSpatialFrame(streamed).clearZoom.every((z) => z === Infinity)).toBe(true);
+      // The settled frame for the same positions is built again, with the crowding.
+      const frame = lodFrameStep(stream, pos, 1, true);
+      if (!frame) throw new Error("no settled frame");
+      expect(frame.header.crowding).toBe(true);
+      expect(lodFrameStep(stream, pos, 1, true), "a settled frame is built once").toBeNull();
       const got = lodTreeFromSpatialFrame(frame);
       const want = buildMortonLODTree(pos, n, { box: mortonRootBox(pos, n) });
       computeLODPositions(want, pos);
@@ -139,17 +147,17 @@ describe("lodFrameStep carries the crowding (#426)", () => {
     }
     // Without crowding inputs, a reused buffer is reset to "none" rather than keeping the last frame's.
     const stream = makeSpatialLODStream(n, { radii, weight, crowding: { screenSized: true } }, 1);
-    const a = lodFrameStep(stream, pos, 1);
+    const a = lodFrameStep(stream, pos, 1, true);
     if (!a) throw new Error("no frame");
     recycleSpatialFrame(stream, a.buffer);
     setStreamStyle(stream, { radii, weight }, 2);
-    const b = lodFrameStep(stream, pos, 2);
+    const b = lodFrameStep(stream, pos, 2, true);
     expect(b?.buffer).toBe(a.buffer);
     if (!b) throw new Error("no frame");
     expect(lodTreeFromSpatialFrame(b).clearZoom.every((z) => z === Infinity)).toBe(true);
   });
 
-  it("a structure stream refits its crowding in place from the style it was given", () => {
+  it("a structure stream refits its crowding in place from the style it was given, on the settled frame", () => {
     const src: number[] = [];
     const tgt: number[] = [];
     for (let i = 1; i < n; i++) { src.push(i); tgt.push(i >> 1); }
@@ -158,7 +166,7 @@ describe("lodFrameStep carries the crowding (#426)", () => {
     const worker = lodTreeFromTopology(tree);
     const stream = makeStructureLODStream(worker, { radii, crowding: { screenSized: true } });
     const pos = cloud(n, 12);
-    expect(lodFrameStep(stream, pos, 1)).toBeNull();
+    expect(lodFrameStep(stream, pos, 1, true)).toBeNull();
     computeLODPositions(tree, pos);
     computeLODStyle(tree, radii, weight);
     computeLODCrowding(tree, { screenSized: true, expandPx: crowdingHorizon(tree) });
@@ -166,10 +174,14 @@ describe("lodFrameStep carries the crowding (#426)", () => {
     // A new style reaches the next frame's crowding.
     const bigger = radii.map((r) => r * 3);
     setStreamSizing(stream, { radii: bigger, crowding: { screenSized: true } });
-    lodFrameStep(stream, pos, 2);
+    lodFrameStep(stream, pos, 2, true);
     computeLODStyle(tree, bigger, weight);
     computeLODCrowding(tree, { screenSized: true, expandPx: crowdingHorizon(tree) });
     expect(Array.from(worker.clearZoom)).toEqual(Array.from(tree.clearZoom));
+    expect(worker.clearZoom.some((z) => z < Infinity)).toBe(true); // not vacuous
+    // A streamed frame (a reheat) drops it again: the footprint rule alone while the layout runs.
+    lodFrameStep(stream, pos, 3);
+    expect(worker.clearZoom.every((z) => z === Infinity)).toBe(true);
   });
 
   it("the worker gets the whole leaf style for a spatial stream, only the radii and sizing for a structure stream", () => {

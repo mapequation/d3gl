@@ -162,8 +162,14 @@ class TransitionProbe extends Network {
     super.setInteracting(v);
   }
   /** A worker message's repaint request — what the transport calls after copying the positions. */
+  /** One streamed layout frame's repaint, as a running layout (#426: its tree's crowding held) delivers it. */
   streamFrame(): void {
+    (this as unknown as { layoutLive: boolean }).layoutLive = true;
     this.scheduleLayoutRepaint();
+  }
+  /** The streamed layout ended (its settle's other work is not what this file times). */
+  endStream(): void {
+    (this as unknown as { layoutLive: boolean }).layoutLive = false;
   }
   protected override syncZoomToView(): void {
     this.cameraSyncs++;
@@ -314,6 +320,7 @@ beforeAll(async () => {
             flush();
           }),
         );
+        engine.endStream();
         // A transition frame: one queued frame of a long a → b transition (it never ends here).
         graph.positions.set(a);
         engine.layout({ backend: "positions", positions: b, transition: 3_600_000 });
@@ -395,6 +402,7 @@ beforeAll(async () => {
             flush();
           }),
         );
+        net.endStream();
         kept &&= internals.fitOnLayout;
       }
       internals.fitOnLayout = false;
@@ -442,9 +450,10 @@ describe(`network() position transition — per-frame cost vs a streamed layout 
     expect(spatial.transition.treeBuilds, "spatial trees built during the transition").toBe(0);
     expect(spatial.transition.stylePasses, "style passes during the spatial tree's transition").toBe(0);
     expect(off.transition.stylePasses + off.transition.treeBuilds).toBe(0);
-    // The crowding (#426) follows the style pass: once per streamed frame, never on a transition frame.
-    expect(on.streamed.crowdingPasses, "the module leg's streamed frames ran no crowding pass — vacuous").toBeGreaterThanOrEqual(FRAMES);
-    expect(spatial.streamed.crowdingPasses).toBeGreaterThanOrEqual(FRAMES);
+    // The crowding (#426) waits for the layout to settle: no pass on a streamed frame (the footprint rule alone
+    // while a layout runs; it costs 0.35-1 s per frame at 2M nodes), none on a transition frame.
+    expect(on.streamed.crowdingPasses, "crowding passes on the module tree's streamed frames").toBe(0);
+    expect(spatial.streamed.crowdingPasses, "crowding passes on the spatial tree's streamed frames").toBe(0);
     expect(on.transition.crowdingPasses + spatial.transition.crowdingPasses + off.transition.crowdingPasses, "crowding passes during a transition").toBe(0);
   });
 
