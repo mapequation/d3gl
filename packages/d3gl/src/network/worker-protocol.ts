@@ -256,6 +256,8 @@ export interface LODGeometryRequest {
   frame: number;
   /** `[cx, cy, extent, clearZoom]`, length `4 · topology.size` ({@link lodGeometryViews}). */
   geometry?: Float32Array;
+  /** The run's (or a re-cool's) last positions: the tree built for them carries the crowding (#426). */
+  settled?: boolean;
 }
 
 export type MainToWorker =

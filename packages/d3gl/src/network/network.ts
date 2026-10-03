@@ -922,6 +922,10 @@ export class Network extends BaseEngine {
    *  A `"gpu"` layout sets it once its device resolves: to the worker fallback (#351), or to the GPU solve,
    *  whose LOD worker streams the tree (#377) — cleared if that worker fails. */
   private lodStreaming = false;
+  /** An asynchronous layout (worker, GPU, nested or transition) is running and has not settled (#426): the LOD
+   *  tree's crowding is held at `Infinity` meanwhile — the cut opens aggregates by the footprint rule alone —
+   *  and computed once when it settles or stops. */
+  private layoutLive = false;
   /** True while a nested layout (#324) solves on the worker/gpu. It streams positions only — never a LOD
    *  tree — so the main thread keeps even a structural tree's geometry up to date meanwhile. */
   private nestedSolving = false;
@@ -1881,10 +1885,15 @@ export class Network extends BaseEngine {
    * The tree's crowding (#426) from its current positions and radii — so the cut opens an aggregate whose
    * members would not overlap — computed up to the cut's own expand threshold ({@link crowdingHorizon}).
    * O(tree size) plus the cross pairs near sibling borders; run with every position + style pass on a
-   * main-thread tree (never per zoom frame).
+   * main-thread tree (never per zoom frame) — except while a layout runs ({@link layoutLive}), when the tree
+   * gets none (`Infinity`, the footprint rule alone) until it settles: the pass costs 0.35-1 s at 2M nodes.
    */
   private updateLODCrowding(tree: LODTree): void {
     if (!this.lodOptions || !this.graph) return;
+    if (this.layoutLive) {
+      tree.clearZoom.fill(Infinity); // while a layout runs, the footprint rule alone (#426)
+      return;
+    }
     const screenSized = this.resolvedStyleCached(this.graph).sizeMode === "screen";
     computeLODCrowding(tree, { screenSized, expandPx: crowdingHorizon(tree, this.lodOptions.expandPx) }, this.lodCrowding);
   }
@@ -2312,9 +2321,11 @@ export class Network extends BaseEngine {
    *  geometry, the final reframe + release of a streaming fit, one rebuild. */
   private onLayoutSettled(handle: WorkerLayoutHandle, prepare?: () => void): void {
     this.layoutHandle = handle;
+    this.layoutLive = true;
     void handle.settled.then(
       () => {
         if (this.layoutHandle !== handle) return; // a newer layout superseded this one
+        this.layoutLive = false; // the crowding is computed from here on: once below, then per position pass
         this.transition = null;
         this.nestedSolving = false;
         prepare?.();
@@ -2326,6 +2337,7 @@ export class Network extends BaseEngine {
         // The run never started (#428: no module tree could be built). whenSettled() hands the caller the
         // error; the engine only stops waiting for the run.
         if (this.layoutHandle !== handle) return;
+        this.layoutLive = false;
         this.transition = null;
         this.nestedSolving = false;
       },
@@ -2644,12 +2656,18 @@ export class Network extends BaseEngine {
    *  nodes stopped (#343), and any tree's crowding (#426), held through it, is recomputed there. */
   stopLayout(): this {
     const running = this.transition?.running === true;
+    const live = this.layoutLive;
     const interrupted = running && this.nestedDiscs !== null;
     this.haltLayout();
     if (interrupted) this.nestedDiscs = null;
     // The modules and rings redraw around where the members stopped; a spatial tree is rebuilt there, and
-    // the crowding follows the nodes to where they stopped.
+    // the crowding follows the nodes to where they stopped. A streamed run stopped mid-way held the crowding
+    // (#426): its tree — the worker's, or one the main thread refit per frame — gets it now, as at a settle.
     if (running) this.settleLODPositions();
+    else if (live && this.lodTree) {
+      this.recomputeLODGeometry(true);
+      this.requestRedraw();
+    }
     return this;
   }
 
@@ -2657,6 +2675,7 @@ export class Network extends BaseEngine {
   private haltLayout(): void {
     this.layoutHandle?.stop();
     this.layoutHandle = null;
+    this.layoutLive = false;
     this.transition = null;
     // The fit lives exactly as long as its layout: a stopped one leaves the camera where it is, and nothing
     // after the stop — a late repaint request, the next frame — may reframe it.
@@ -3890,19 +3909,24 @@ export class Network extends BaseEngine {
         this.lodStylePosted = version;
       }
       if (kind === "spatial") {
-        // The worker aggregated the style — and computed the crowding — of the version it had; redo both
-        // here only for a newer one.
+        // The worker aggregated the style of the version it had, and computed the crowding on a settled frame
+        // only (#426); redo the style here for a newer one, and the crowding for a newer style or a tree that
+        // has none once the layout has settled (a relayed GPU frame, or a run stopped mid-way).
         const header = this.lodStreamed?.header;
         if (header && header.styleVersion !== version) {
           computeLODStyle(this.lodWorkerTree, nodeRadii, leafWeight, leafBorder, leafColors);
-          this.updateLODCrowding(this.lodWorkerTree);
           header.styleVersion = version;
+          header.crowding = false;
+        }
+        if (header && !header.crowding && !this.layoutLive) {
+          this.updateLODCrowding(this.lodWorkerTree);
+          header.crowding = true;
         }
       } else {
         computeLODStyle(this.lodWorkerTree, nodeRadii, leafWeight, leafBorder, leafColors, radiusAggregate, fillAggregate);
         this.applyLODBorderStyle(this.lodWorkerTree, resolved);
-        // A streaming worker refits the crowding every frame; once it has settled (idle, writing nothing)
-        // a new style's crowding is computed here, once.
+        // A streaming worker writes no crowding (#426); once it has settled (idle, writing nothing) the
+        // crowding is computed here, once — at the settle, and for a new style.
         if (!this.lodStreaming) this.updateLODCrowding(this.lodWorkerTree);
       }
       this.lodTree = this.lodWorkerTree;

@@ -7,12 +7,15 @@ import { perfHost } from "../../__tests__/engine-sweep.js";
 import { indexedLinkStats } from "../../webgl/indexed-links.js";
 
 /**
- * The overlap rule's worst frame (#426, AGENTS lifecycle §5), through the real trigger: a worker layout's
- * **cold disc start** with the spatial LOD source at a fit view. The seed disc is evenly spaced, so where its
- * glyphs are at least a pixel apart none overlap, every aggregate opens, and the seed frame draws **every
- * leaf** — the LOD-on visible set is the whole graph, with its links from the worker's super-edge rows (#433).
- * That frame is timed against the same frame with LOD off (every node and edge drawn, the full-detail path),
- * on one engine, over the same graph and view.
+ * The overlap rule's worst frame (#426, AGENTS lifecycle §5), through the real trigger: a worker layout that
+ * **settles where no glyphs overlap**, with the spatial LOD source at a fit view — the evenly spaced seed disc,
+ * run with `iterations: 0` so the disc is the settled layout. While a layout streams, the cut opens aggregates by
+ * the footprint rule alone (the crowding pass waits for the settle: it costs 0.35-1 s per frame at 2M nodes), so
+ * the disc's streamed seed frame aggregates; its settled frame — the worker's `done`, which carries the crowding —
+ * opens every aggregate whose members are at least a pixel apart, and draws **every leaf**: the LOD-on visible
+ * set is the whole graph, with its links from the worker's super-edge rows (#433) and the leaf links (#447).
+ * That frame is timed against the same run with LOD off (every node and edge drawn, the full-detail path), on
+ * one engine, over the same graph and view. Every rebuild is timed, the settle's included.
  *
  * N is where that frontier peaks at this viewport. The seed disc spans ~85% of the shorter side at the fit
  * view and its spacing on screen falls as 1/√N, so the peak scales with the viewport's pixels: at 800 × 600
@@ -20,22 +23,16 @@ import { indexedLinkStats } from "../../webgl/indexed-links.js";
  * at 190k the nodes are closer than a pixel, overlap, and the cut aggregates them to ~160 glyphs. The guard
  * runs at 400 × 300, a quarter of the pixels, so the same frame peaks at a quarter of the N: 37.5k by
  * default (the margin under the ~47k cliff that 150k keeps under 190k), `PERF_BROWSER_N` capped at 45k — a
- * larger N is not a harder case, it aggregates. (At 800 × 600 and 150k, one cold start takes 20-50 s of
- * software GL locally, past the tier's per-file budget on CI.)
- * The test checks it is at the peak: the LOD-on seed frame must draw nearly every node.
+ * larger N is not a harder case, it aggregates. (At 800 × 600 and 150k, one run takes 20-50 s of software GL
+ * locally, past the tier's per-file budget on CI.)
  *
- * Asserted: the worst case is reached (the LOD-on seed frame draws nearly every node, at most one leaf per
+ * Asserted: the worst case is reached (the LOD-on settled frame draws nearly every node, at most one leaf per
  * viewport pixel); the frame reads the worker's super-edge rows, with no incidence walked or row computed on the
- * main thread; its main-thread repaint stays under an absolute `c0 + c1·N` ceiling (~5× the 61 ms measured at
- * 37.5k before #447, so an order-of-magnitude regression trips it); and the links between two kept leaves
- * (#447) are drawn by edge id with the deterministic signature: one GPU instance per shown link per indexed
- * layer, at most 24 B uploaded per instance (edge id, ends, fade), and the style tables built on the seed frame
- * only (no style bytes on the layout frames and pans after it). The ratio to the LOD-off seed frame is logged,
- * not asserted. Measured on an M1 Max under host load 23-35, the two builds back to back: 42-43 vs 1.3-1.7 ms at
- * 37.5k (57.5 vs 1.5 ms with the gather of every link, before #447); 103-105 vs 5-7 ms at 150k / 800 × 600
- * (217 vs 7 ms before). What remains over LOD off is the LOD path itself: the cut and the declutter over every
- * leaf, the gather of the links that touch an aggregate, the leaf-link index walk, and the one-time build of
- * the style tables, which this seed frame pays as the lane's first emit.
+ * main thread; its main-thread rebuild stays under an absolute `c0 + c1·N` ceiling; and the links between two
+ * kept leaves (#447) are drawn by edge id with the deterministic signature: one GPU instance per shown link per
+ * indexed layer, at most 24 B uploaded per instance (edge id, ends, fade), and no style table built or uploaded
+ * on the all-leaves frame or the pans after it (the tables are built on the LOD lane's first emit, the seed
+ * frame). The ratio to LOD off is logged, not asserted.
  */
 
 const LOCAL_N = 37_500;
@@ -81,7 +78,7 @@ function fitView(n: number): { k: number; x: number; y: number } {
   return { k: (0.85 * Math.min(W, H)) / (2 * radius), x: W / 2, y: H / 2 };
 }
 
-/** The first layout repaint of a cold start (the seed frame): its main-thread ms and what it drew. */
+/** One engine rebuild of a run: its main-thread ms and what it drew. */
 interface SeedFrame {
   ms: number;
   source: string;
@@ -97,44 +94,53 @@ interface SeedFrame {
   tablesBuilt: number;
 }
 
-/** The seed frame and every frame after it, of one cold start: its layout frames, then three pans. */
+/** The all-leaves frame of one run, and every frame after it: then three pans. */
 interface ColdStart {
   seed: SeedFrame;
   after: SeedFrame[];
 }
 
-/** Run a cold worker layout on `net` and return its seed frame's repaint — the first animation-frame
- *  callback after `layout()` that drew with the layout's positions. */
+/**
+ * Run a worker layout of the evenly spaced seed disc on `net` — `iterations: 0`, so the disc is the settled
+ * layout — and return its all-leaves frame: with LOD on, the engine's rebuild (cut + emit, whichever frame or
+ * settle ran it) that kept the most glyphs of the worker's tree; with LOD off, its slowest rebuild. While a
+ * layout streams the cut uses the footprint rule alone (#426: the crowding waits for the settle), so the disc's
+ * streamed seed frame aggregates, and the settled frame — the worker's `done`, which carries the crowding —
+ * opens every leaf. Every rebuild is timed, the settle's included (it runs outside an animation frame).
+ */
 async function coldStart(net: Network, graph: NetworkGraph, lod: boolean): Promise<ColdStart> {
   net.data(graph).lod(lod ? LOD : false);
   net.setTransform(fitView(graph.nodeCount));
-  const installed = window.requestAnimationFrame;
+  const engine = net as unknown as { rebuild: () => unknown };
+  const installed = engine.rebuild;
   const frames: SeedFrame[] = [];
-  window.requestAnimationFrame = (callback: FrameRequestCallback): number =>
-    installed.call(window, (t: number) => {
-      const s0 = { ...indexedLinkStats };
-      const t0 = performance.now();
-      try {
-        callback(t);
-      } finally {
-        const ms = performance.now() - t0;
-        const gather = net.superEdgeStats;
-        const s = indexedLinkStats;
-        frames.push({
-          ms, source: net.lodSource, glyphs: net.declutterStats?.glyphs ?? -1, visits: gather?.visits ?? -1, misses: gather?.misses ?? -1,
-          leafLinks: gather?.leafLinks ?? 0, draws: s.draws - s0.draws, instances: s.instances - s0.instances,
-          instanceBytes: s.instanceBytes - s0.instanceBytes, tableBytes: s.tableBytes - s0.tableBytes, tablesBuilt: s.tablesBuilt - s0.tablesBuilt,
-        });
-      }
-    });
+  engine.rebuild = function (this: unknown): unknown {
+    const s0 = { ...indexedLinkStats };
+    const t0 = performance.now();
+    try {
+      return installed.call(this);
+    } finally {
+      const ms = performance.now() - t0;
+      const gather = net.superEdgeStats;
+      const s = indexedLinkStats;
+      frames.push({
+        ms, source: net.lodSource, glyphs: net.declutterStats?.glyphs ?? -1, visits: gather?.visits ?? -1, misses: gather?.misses ?? -1,
+        leafLinks: gather?.leafLinks ?? 0, draws: s.draws - s0.draws, instances: s.instances - s0.instances,
+        instanceBytes: s.instanceBytes - s0.instanceBytes, tableBytes: s.tableBytes - s0.tableBytes, tablesBuilt: s.tablesBuilt - s0.tablesBuilt,
+      });
+    }
+  };
+  let run = 0;
   try {
-    net.layout({ backend: "worker", iterations: 1, multilevel: false }); // the seed frame, then one tick
+    net.layout({ backend: "worker", iterations: 0, multilevel: false }); // the seed disc, settled
     await net.whenSettled();
+    await new Promise<void>((resolve) => window.requestAnimationFrame(() => resolve()));
+    run = frames.length;
   } finally {
-    window.requestAnimationFrame = installed;
+    delete (engine as { rebuild?: unknown }).rebuild; // the prototype's again
   }
-  // LOD on: the first repaint that drew the worker's tree; LOD off: the first repaint.
-  // Then pans of a pixel (a re-cut and a re-emit at a view whose cut barely changes), each through its frame.
+  // Then pans of a pixel (a re-cut and a re-emit of the lane at a view whose cut barely changes), each through
+  // its frame — not a rebuild, so each is recorded from the counters around it.
   const view = fitView(graph.nodeCount);
   for (let i = 1; i <= 3; i++) {
     const s0 = { ...indexedLinkStats };
@@ -148,18 +154,24 @@ async function coldStart(net: Network, graph: NetworkGraph, lod: boolean): Promi
       instanceBytes: s.instanceBytes - s0.instanceBytes, tableBytes: s.tableBytes - s0.tableBytes, tablesBuilt: s.tablesBuilt - s0.tablesBuilt,
     });
   }
-  const at = lod ? frames.findIndex((f) => f.source === "worker" && f.glyphs > 0) : 0;
+  const ofRun = frames.slice(0, run);
+  let at = -1;
+  for (let i = 0; i < ofRun.length; i++) {
+    const f = ofRun[i]!;
+    const best = at < 0 ? undefined : ofRun[at]!;
+    if (lod ? f.source === "worker" && f.glyphs > (best?.glyphs ?? 0) : f.ms > (best?.ms ?? -1)) at = i;
+  }
   const seed = frames[at];
-  if (!seed) throw new Error(`the cold start (LOD ${lod ? "on" : "off"}) painted no layout frame`);
+  if (!seed) throw new Error(`the run (LOD ${lod ? "on" : "off"}) painted no layout frame`);
   return { seed, after: frames.slice(at + 1) };
 }
 
-describe(`network() spatial LOD, a cold disc start's seed frame (#426) at N=${N.toLocaleString()}, ${W}×${H}`, () => {
+describe(`network() spatial LOD, the all-leaves frame of a layout that settles spread out (#426) at N=${N.toLocaleString()}, ${W}×${H}`, () => {
   let host: HTMLElement;
   let net: Network;
   const on: SeedFrame[] = [];
   const off: SeedFrame[] = [];
-  /** The LOD-on layout frames after each seed frame. */
+  /** The LOD-on frames after each all-leaves frame: the pans. */
   const onAfter: SeedFrame[] = [];
 
   beforeAll(async () => {
@@ -183,28 +195,29 @@ describe(`network() spatial LOD, a cold disc start's seed frame (#426) at N=${N.
     host?.remove();
   });
 
-  it("is the worst case: the LOD-on seed frame draws nearly every node, at most one leaf per viewport pixel", () => {
+  it("is the worst case: the LOD-on settled frame draws nearly every node, at most one leaf per viewport pixel", () => {
     for (const f of on) {
-      expect(f.glyphs, `seed frame glyphs ${f.glyphs} of ${N}`).toBeGreaterThanOrEqual(0.9 * N);
+      expect(f.glyphs, `settled frame glyphs ${f.glyphs} of ${N}`).toBeGreaterThanOrEqual(0.9 * N);
       expect(f.glyphs).toBeLessThanOrEqual(W * H);
     }
   });
 
-  it("draws the leaf links by edge id (#447): an instance per shown link, 20-24 B each, the style tables built once", () => {
+  it("draws the leaf links by edge id (#447): an instance per shown link, 20-24 B each, no style upload on the frame", () => {
     for (const f of on) {
       // Nearly every edge joins two kept leaves at the peak (the rest touch the few aggregates left).
-      expect(f.leafLinks, "the seed frame's leaf links").toBeGreaterThan(0);
-      expect(f.draws, "indexed link draws set up by the seed frame").toBeGreaterThan(0);
+      expect(f.leafLinks, "the settled frame's leaf links").toBeGreaterThan(0);
+      expect(f.draws, "indexed link draws of the settled frame").toBeGreaterThan(0);
+      expect(f.tablesBuilt + f.tableBytes, "style tables built or uploaded on the all-leaves frame").toBe(0);
       expect(f.instances, "GPU instances: one per shown link per indexed layer").toBe(f.leafLinks * f.draws);
       // Per shown link: its edge id (4 B), its two ends (16 B) and, in a cross-fade band, its fade (4 B).
       expect(f.instanceBytes, "per-instance bytes uploaded").toBeLessThanOrEqual(24 * f.instances);
     }
-    // The style tables are built once per layer (the seed frame of a fresh LOD lane), never per frame after it:
+    // The style tables are built once per layer (the first emit of a fresh LOD lane), never per frame after it:
     // a later frame uploads the moved ends (and a changed index) alone.
-    expect(onAfter.length, "frames after the seed frame").toBeGreaterThanOrEqual(3);
+    expect(onAfter.length, "frames after the all-leaves frame").toBeGreaterThanOrEqual(3);
     for (const f of onAfter) {
-      expect(f.tablesBuilt, "style tables built after the seed frame").toBe(0);
-      expect(f.tableBytes, "style bytes uploaded after the seed frame").toBe(0);
+      expect(f.tablesBuilt, "style tables built after the all-leaves frame").toBe(0);
+      expect(f.tableBytes, "style bytes uploaded after the all-leaves frame").toBe(0);
       expect(f.instances).toBe(f.leafLinks * f.draws);
       expect(f.instanceBytes).toBeLessThanOrEqual(24 * f.instances);
     }
@@ -218,10 +231,10 @@ describe(`network() spatial LOD, a cold disc start's seed frame (#426) at N=${N.
     }
   });
 
-  it("renders under its ceiling; its ratio to the full-detail seed frame (LOD off, same graph and view) is logged", () => {
+  it("renders under its ceiling; its ratio to the full-detail run (LOD off, same graph and view) is logged", () => {
     const lodOn = Math.min(...on.map((f) => f.ms));
     const lodOff = Math.min(...off.map((f) => f.ms));
-    const msg = `seed frame LOD on ${lodOn.toFixed(1)} ms (${on.map((f) => f.ms.toFixed(0)).join(", ")}) vs LOD off ${lodOff.toFixed(1)} ms (${off.map((f) => f.ms.toFixed(0)).join(", ")}), ratio ${(lodOn / Math.max(lodOff, 1e-3)).toFixed(1)}×, glyphs ${on.map((f) => f.glyphs).join(", ")}, N=${N}`;
+    const msg = `all-leaves frame LOD on ${lodOn.toFixed(1)} ms (${on.map((f) => f.ms.toFixed(0)).join(", ")}) vs LOD off ${lodOff.toFixed(1)} ms (${off.map((f) => f.ms.toFixed(0)).join(", ")}), ratio ${(lodOn / Math.max(lodOff, 1e-3)).toFixed(1)}×, glyphs ${on.map((f) => f.glyphs).join(", ")}, N=${N}`;
     console.log(`  ${msg}`);
     expect(lodOn, msg).toBeLessThan(perfBudget(50 + (250 * N) / LOCAL_N));
   });

@@ -158,10 +158,10 @@ function yieldToEventLoop(): Promise<void> {
  */
 function postFrame(type: "frame" | "done", s: FrameSource | null = state, lodFrameId = s?.tick ?? 0): void {
   if (!s) return;
-  // The per-frame LOD step (#343): refit the coarsening tree in place (cx/cy/extent, and the crowding's
-  // clearZoom with a leaf sizing, #426, in the geometry buffer), or rebuild the spatial tree into a frame to
-  // transfer (none when nothing moved since the last one).
-  const lodFrame = s.lod ? lodFrameStep(s.lod, s.positions, lodFrameId) : null;
+  // The per-frame LOD step (#343): refit the coarsening tree in place (cx/cy/extent in the geometry buffer), or
+  // rebuild the spatial tree into a frame to transfer (none when nothing moved since the last one). The crowding
+  // (#426: clearZoom, with a leaf sizing) only on `done`: while the layout streams the cut uses the footprint rule.
+  const lodFrame = s.lod ? lodFrameStep(s.lod, s.positions, lodFrameId, type === "done") : null;
   // A spatial stream held back by back-pressure (#343) posts nothing — no frame, and no `done` — until a buffer
   // returns and the frame it skipped is built (`lod-recycle`, which posts a held `done` as a `done`): the tree
   // is what the engine draws and frames, so its positions — and the super-edge rows cut for their fit (#433) —
@@ -273,8 +273,8 @@ async function runLayout(msg: StartMessage): Promise<void> {
 
   // LOD (#103): coarsen once and reuse that hierarchy for both the multilevel seed and the streamed
   // tree, so the graph is never coarsened twice and the main thread never coarsens at all. The worker
-  // owns the position-derived geometry (`cx`/`cy`/`extent`, and the crowding `clearZoom` computed from them
-  // and the leaf sizing, #426) — recomputed each frame, written to a SAB (shared mode) or posted with the
+  // owns the position-derived geometry (`cx`/`cy`/`extent` each frame, and on the settled frame the crowding
+  // `clearZoom` computed from them and the leaf sizing, #426), written to a SAB (shared mode) or posted with the
   // frame (copy mode); the main thread fills the style-derived geometry once and runs only the O(visible) cut.
   const spatial = lod === true && lodSource === "spatial";
   // The spatial tree needs no coarsening; the multilevel seed coarsens for itself when it gets none.
@@ -300,7 +300,7 @@ async function runLayout(msg: StartMessage): Promise<void> {
       buffer = new ArrayBuffer(byteLength);
       geomBuffer = buffer;
     }
-    // The crowding (#426) is computed per frame from the leaf sizing, into the same buffer.
+    // The crowding (#426) is computed from the leaf sizing into the same buffer, on the settled frame.
     const tree = lodTreeFromTopology(topology, makeLODGeometry(buffer, topology.size));
     lodStream = makeStructureLODStream(tree, lodSizing);
     // The main thread adopts the tree the moment it lands. A cold start's seed frame follows at once, but a

@@ -253,9 +253,10 @@ describe("LOD aggregates only where glyphs would overlap (#426)", () => {
     }
   });
 
-  it("a structure stream takes a new style: the worker's next frames compute the crowding with it", async () => {
-    // Settled, a style change's crowding is computed on the main thread. A drag then reheats the worker, whose
-    // frames write the crowding again, with the sizing it was last sent: the style change must have reached it.
+  it("a structure stream takes a new style: the worker's next settled frame computes the crowding with it", async () => {
+    // Settled, a style change's crowding is computed on the main thread. A drag then reheats the worker: its
+    // streamed frames carry no crowding (the footprint rule alone while it runs), and its re-cool's settled
+    // frame writes it again, with the sizing it was last sent: the style change must have reached it.
     const { net, host } = makeNet();
     try {
       await net.whenReady();
@@ -282,12 +283,20 @@ describe("LOD aggregates only where glyphs would overlap (#426)", () => {
       ev("pointerdown", x, y);
       ev("pointermove", x + 3, y + 3);
       await new Promise((res) => setTimeout(res, 500));
-      net.setTransform(t);
-      const held = net.declutterStats?.glyphs ?? NaN;
       const moved = g.positions[300] !== before[0] || g.positions[301] !== before[1];
       ev("pointerup", x + 3, y + 3);
       expect(moved, "precondition: the drag reheated the worker").toBe(true);
-      expect(held, "the worker's frames compute the crowding with the half-pixel glyphs").toBeGreaterThan(2 * big);
+      // The re-cool comes to rest: the positions stop changing once the worker has posted its settled frame.
+      let last = Array.from(g.positions);
+      for (let i = 0; i < 100; i++) {
+        await new Promise((res) => setTimeout(res, 100));
+        const now = Array.from(g.positions);
+        if (now.every((v, j) => v === last[j])) break;
+        last = now;
+      }
+      net.setTransform(t);
+      const settled = net.declutterStats?.glyphs ?? NaN;
+      expect(settled, "the worker's settled frame computes the crowding with the half-pixel glyphs").toBeGreaterThan(2 * big);
     } finally {
       net.stopLayout();
       net.destroy();

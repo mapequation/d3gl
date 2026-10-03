@@ -41,7 +41,7 @@ import { buildGraph, type NetworkGraph } from "../graph.js";
  * Deterministic signatures, asserted unconditionally: a warm pass reallocates none of its scratch; one
  * call is one pass; no clear zoom is NaN; on the wide modules a pass examines at most
  * {@link PAIRS_PER_MEMBER} node pairs per member (a one-axis sweep examined 100-500); the cut draws no
- * aggregate whose members clear at its zoom; a streamed spatial frame carries the crowding in its own buffer
+ * aggregate whose members clear at its zoom; a settled spatial frame carries the crowding in its own buffer
  * (a recycled buffer is reused, nothing grows once warm). Wall-clock ceilings: generous (~4-8× the calibrated
  * medians) always-on at 100k; under `PERF_ASSERT` at the tier's N, split into a constant and a per-100k term:
  *   BENCH_LOD_CROWDING=1 BENCH_LOD_CROWDING_NODES=1000000 pnpm exec vitest run packages/d3gl/src/network/__tests__/lod-crowding-perf.test.ts
@@ -284,16 +284,17 @@ function runLegs(fs: Fixture[], reps: number): LegResult[] {
     }
   }
 
-  // A streamed spatial frame (the worker's per-frame step) with the crowding, buffers recycled as the engine does.
+  // A settled spatial frame (the worker's step for a layout's `done`, the one that carries the crowding — a
+  // streamed frame has none), buffers recycled as the engine does.
   const f = fs[0];
   if (f) {
     const stream = makeSpatialLODStream(f.graph.nodeCount, { radii: f.radii, weight: f.graph.strength, crowding: { screenSized: true } }, 1);
-    let frame = lodFrameStep(stream, f.graph.positions, 0);
+    let frame = lodFrameStep(stream, f.graph.positions, 0, true);
     const ts: number[] = [];
     for (let i = 1; i <= reps; i++) {
       if (frame) recycleSpatialFrame(stream, frame.buffer);
       const t0 = performance.now();
-      frame = lodFrameStep(stream, f.graph.positions, i);
+      frame = lodFrameStep(stream, f.graph.positions, i, true);
       ts.push(performance.now() - t0);
     }
     expect(stream.pool.length + stream.outstanding, "a warm stream keeps one buffer in play").toBeLessThanOrEqual(2);
@@ -312,7 +313,7 @@ function report(results: LegResult[], n: number, label: string): void {
 
 // Calibrated on an M1 Max at 100k (medians, under load from parallel runs): pass 8-15 ms per tree kind in
 // screen mode and 5-18 ms in world mode, 25-33 ms on the wide modules (both modes); sweep frame < 1 ms;
-// streamed spatial frame (rebuild + positions + style + crowding) 22-26 ms. At 1M: pass 88-169 ms (screen),
+// settled spatial frame (rebuild + positions + style + crowding) 22-26 ms. At 1M: pass 88-169 ms (screen),
 // 79-150 ms (world), 268-460 ms on the wide modules, stream ~210 ms. Ceilings are 4-8× the 100k medians; the
 // at-scale leg splits each into a constant and a per-100k-leaves term (the wide modules' O(m log m) grows a
 // little faster than linear: at 1M they sit at a third of their 1,455 ms ceiling).
