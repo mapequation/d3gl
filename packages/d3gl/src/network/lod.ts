@@ -1893,6 +1893,13 @@ export interface CrowdingOptions {
    * opens a node whose members overlap, it only opens some later than it could.
    */
   expandPx: number;
+  /**
+   * A factor on each glyph's radius in the overlap test only (`lod({ overlapSpacing })`): two members count as
+   * overlapping until they are `spacing` × the sum of their radii apart on screen. The half-pixel floor applies
+   * after it (a glyph's test radius is `max(spacing · r, ½)` px). Default 1: the glyphs' own radii. A value that
+   * is not a positive finite number counts as 1.
+   */
+  spacing?: number;
 }
 
 /** The part of an {@link LODTree} that {@link computeLODCrowding} reads and writes. */
@@ -1939,8 +1946,10 @@ function selectNth(order: Uint32Array, e0: Float32Array, e1: Float32Array, lo: n
 
 /**
  * The tree's **crowding** (#426): each node's {@link LODTree.clearZoom} — the zoom from which no two of its
- * members' glyphs overlap on screen — from the leaves' positions (`cx`/`cy`) and radii (`radius`). The cut
- * opens an aggregate once zoomed past it, so an aggregate is drawn only where its members would overlap.
+ * members' glyphs overlap on screen — from the leaves' positions (`cx`/`cy`) and radii (`radius`, times
+ * `opts.spacing` when given: members then count as overlapping until they are that many times their radii
+ * apart). The cut opens an aggregate once zoomed past it, so an aggregate is drawn only where its members
+ * would overlap.
  *
  * Exact per node, over its own members (a node's value is the largest pair zoom among them), computed
  * bottom-up: a node starts from its children's values — any pair inside one child — and adds the pairs
@@ -1976,6 +1985,7 @@ export function computeLODCrowding(tree: LODCrowdingTree, opts: CrowdingOptions,
   const { size, leafCount, levelCount, levelOffset, childOffset, children, cx, cy, extent, count, radius, clearZoom } = tree;
   const screen = opts.screenSized;
   const horizon = opts.expandPx;
+  const spacing = opts.spacing !== undefined && opts.spacing > 0 && opts.spacing < Infinity ? opts.spacing : 1;
   const sc = scratch ?? makeLODCrowdingScratch();
   const cells = size - leafCount;
   if (sc.rmax.length < cells) {
@@ -1988,9 +1998,10 @@ export function computeLODCrowding(tree: LODCrowdingTree, opts: CrowdingOptions,
   let entries = 0; // index entries in use
   let permTop = 0; // perm in use
   let seen = 0; // node pairs examined (lodCrowdingPairs)
-  // A glyph covers at least half a pixel: floor screen radii once here; world radii scale with the zoom.
+  // The radius the overlap test uses: the glyph's, times `spacing`. A glyph covers at least half a pixel: floor
+  // screen radii once here; world radii scale with the zoom.
   const eff = (i: number): number => {
-    const r = radius[i] ?? 0;
+    const r = (radius[i] ?? 0) * spacing;
     return screen ? (r > MIN_SCREEN_RADIUS ? r : MIN_SCREEN_RADIUS) : r > 0 ? r : 0;
   };
   // The larger of `beta` and the pair zoom of two leaves `(dx, dy)` apart with effective radii `ra`, `rb`. With

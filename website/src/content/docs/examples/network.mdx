@@ -253,6 +253,7 @@ net
   .style({ sizeMode: "screen" }) // constant-pixel glyphs — the natural register for navigating
   .lod({
     expandPx: 48,            // optional: pin the expand footprint in px (omit ⇒ tree-adaptive default)
+    overlapSpacing: 1,       // optional: members count as overlapping until this many × their radii apart
     aggregateFill: "#7f97c8",
     maxAggregateRadius: 26,  // cap the aggregate glyph size (pixels, in screen sizeMode)
     declutter: true,         // thin overlapping glyphs by importance (default: the node-size metric)
@@ -271,7 +272,10 @@ What it composes:
   the fit view, a large one still aggregates its dense regions, and a sparse corner of a large one opens
   first — one rule for every graph size and every tree, with no node-count threshold. The zoom at which a
   node's members clear is computed with the layout and the style (not per frame), so the cut tests one
-  number per node it visits.
+  number per node it visits. **`overlapSpacing`** (default 1) widens each glyph's radius in that test
+  only: at `3`, members count as overlapping until they are three times their radii apart, so an
+  aggregate opens only once its members stand that far apart — a margin between the nodes it opens.
+  The drawn glyphs are unchanged; changing it recomputes the crowding once, not per frame.
 - **Aggregates** carry their subtree's centroid and a radius (area-additive `√Σr²`, or — when sizing
   by an additive metric like `flow` — the same node scale applied to the summed child value, so a
   module reads as its total flow). Aggregate identity is stable, so they don't pop as you pan.

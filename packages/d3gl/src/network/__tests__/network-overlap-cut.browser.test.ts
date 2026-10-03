@@ -133,6 +133,69 @@ describe("LOD aggregates only where glyphs would overlap (#426)", () => {
     }
   });
 
+  // lod({ overlapSpacing }): members count as overlapping until they are that many times their radii apart. On
+  // the spread lattice (glyphs ~15 px apart, radius 2 px at the fit view) spacing 4 makes them overlap, so the cut
+  // keeps aggregates; changing it computes the crowding once, and a pan after it none. `expandPx` is pinned past
+  // the view so the footprint rule opens nothing here: what opens, opens by the overlap test.
+  for (const c of cases) {
+    it(`overlapSpacing keeps aggregates where members stand closer than its multiple of their radii (${c.name}, main thread)`, async () => {
+      const { net, host } = makeNet();
+      try {
+        await net.whenReady();
+        const g = ring(SIDE * SIDE);
+        const spread = lattice(SIDE, 10);
+        const lod: NetworkLODOptions = { ...c.lod, expandPx: 2000 };
+        net.data(g, c.modules ? { modules: patches(SIDE, 6, 4) } : undefined).style({ sizeMode: "screen", nodeRadius: RADIUS }).lod(lod);
+        net.layout({ backend: "positions", positions: spread });
+        const t = frame(spread);
+        net.setTransform(t);
+        expect(net.declutterStats?.glyphs, "spacing 1: every node drawn as a leaf").toBe(g.nodeCount);
+        const pitch = 10 * t.k;
+        expect(pitch, "precondition: the glyphs part at spacing 1 and overlap at spacing 4").toBeGreaterThan(2 * RADIUS);
+        expect(pitch).toBeLessThan(2 * 4 * RADIUS);
+        const crowd0 = lodCrowdingPasses;
+        net.lod({ ...lod, overlapSpacing: 4 });
+        expect(lodCrowdingPasses - crowd0, "crowding passes for the option change").toBe(1);
+        expect(net.declutterStats?.glyphs ?? Infinity, "spacing 4: aggregates return").toBeLessThan(g.nodeCount / 2);
+        const crowd1 = lodCrowdingPasses;
+        for (let i = 1; i <= 3; i++) net.setTransform({ ...t, x: t.x + i });
+        expect(lodCrowdingPasses - crowd1, "crowding passes on the pans after it").toBe(0);
+        net.lod({ ...lod, overlapSpacing: 1 });
+        expect(net.declutterStats?.glyphs, "back to spacing 1: every node a leaf again").toBe(g.nodeCount);
+      } finally {
+        net.destroy();
+        host.remove();
+      }
+    });
+  }
+
+  it("the worker's settled spatial frame computes the crowding with overlapSpacing; a later change recomputes it once", async () => {
+    const { net, host } = makeNet();
+    try {
+      await net.whenReady();
+      const n = 300;
+      const g = buildGraph({ nodeCount: n, source: [], target: [] }); // edge-less: repulsion spreads it evenly
+      net.data(g).style({ sizeMode: "screen", nodeRadius: RADIUS }).lod({ source: "spatial", maxAggregateRadius: 18, expandPx: 2000, overlapSpacing: 40 });
+      net.layout({ backend: "worker", iterations: 120 });
+      await net.whenSettled();
+      expect(net.lodSource).toBe("worker");
+      const t = frame(g.positions);
+      expect(overlaps(g.positions, t.k), "precondition: no two glyphs overlap at the fit view").toBe(0);
+      const crowd0 = lodCrowdingPasses;
+      net.setTransform(t);
+      expect(lodCrowdingPasses - crowd0, "no main-thread pass: the worker's frame carries the crowding").toBe(0);
+      expect(net.declutterStats?.glyphs ?? Infinity, "spacing 40: the spread layout stays aggregated").toBeLessThan(n);
+      net.lod({ source: "spatial", maxAggregateRadius: 18, expandPx: 2000, overlapSpacing: 1 });
+      expect(lodCrowdingPasses - crowd0, "one pass for the option change").toBe(1);
+      expect(net.declutterStats?.glyphs, "spacing 1: every node a leaf").toBe(n);
+      for (let i = 1; i <= 3; i++) net.setTransform({ ...t, x: t.x + i });
+      expect(lodCrowdingPasses - crowd0, "and none on the pans after it").toBe(1);
+    } finally {
+      net.destroy();
+      host.remove();
+    }
+  });
+
   // The `force` backend's drag reheats the whole layout on the main thread, frame by frame: the crowding is
   // held through it (an O(tree) pass, like the style) and recomputed once where the nodes come to rest — for
   // every tree kind, not only a spatial one (network-spatial-lod.browser.test.ts pins that one).

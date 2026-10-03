@@ -93,19 +93,21 @@ const MIN_R = 0.5;
  * replaced examined 100 per member on the 40k-member flat module and 10,150 on the interleaved pair.
  */
 const PAIRS_PER_MEMBER = 40;
-/** Brute force: the zoom from which no two of `g`'s members overlap on screen (see LODTree.clearZoom). */
-function bruteClearZoom(tree: LODTree, g: number, screenSized: boolean): number {
+/** Brute force: the zoom from which no two of `g`'s members overlap on screen (see LODTree.clearZoom), each
+ *  glyph's radius taken `spacing` times (`lod({ overlapSpacing })`) before the half-pixel floor. */
+function bruteClearZoom(tree: LODTree, g: number, screenSized: boolean, spacing = 1): number {
   const m = leavesUnder(tree, g);
   let z = 0;
   for (let a = 0; a < m.length; a++) {
     for (let b = a + 1; b < m.length; b++) {
       const i = m[a]!, j = m[b]!;
       const d = Math.hypot(tree.cx[i]! - tree.cx[j]!, tree.cy[i]! - tree.cy[j]!);
+      const ri = spacing * tree.radius[i]!, rj = spacing * tree.radius[j]!;
       let p: number;
       if (screenSized) {
-        p = (Math.max(tree.radius[i]!, MIN_R) + Math.max(tree.radius[j]!, MIN_R)) / d;
+        p = (Math.max(ri, MIN_R) + Math.max(rj, MIN_R)) / d;
       } else {
-        const hi = Math.max(tree.radius[i]!, tree.radius[j]!), lo = Math.min(tree.radius[i]!, tree.radius[j]!);
+        const hi = Math.max(ri, rj), lo = Math.min(ri, rj);
         p = d < hi + lo ? Infinity : d >= 2 * hi ? (2 * MIN_R) / d : MIN_R / (d - hi);
       }
       if (p > z) z = p;
@@ -140,11 +142,11 @@ function neededCap(tree: LODTree, up: Int32Array, g: number, horizon: number): n
 }
 
 /** Every aggregate's clear zoom is exact below the horizon it is needed to, and `Infinity` only past it. */
-function expectExact(tree: LODTree, screenSized: boolean, horizon: number): number {
+function expectExact(tree: LODTree, screenSized: boolean, horizon: number, spacing = 1): number {
   const up = parentsOf(tree);
   let finite = 0;
   for (let g = tree.leafCount; g < tree.size; g++) {
-    const want = bruteClearZoom(tree, g, screenSized);
+    const want = bruteClearZoom(tree, g, screenSized, spacing);
     const got = tree.clearZoom[g] ?? NaN;
     const cap = neededCap(tree, up, g, horizon);
     if (got === Infinity) {
@@ -308,6 +310,76 @@ describe("computeLODCrowding (#426)", () => {
       for (let g = tree.leafCount; g < tree.size; g++) if ((up[g] ?? -1) >= 0 && (tree.extent[g] ?? 0) > (tree.extent[up[g] ?? 0] ?? 0)) skewed++;
     }
     expect(skewed, "not vacuous: some child reaches farther than its parent").toBeGreaterThan(0);
+  });
+});
+
+describe("computeLODCrowding with an overlap spacing (lod({ overlapSpacing }))", () => {
+  const trees = (graph: NetworkGraph): [string, LODTree][] => [
+    ["spatial", buildMortonLODTree(graph.positions, graph.nodeCount)],
+    ["structure", buildLODTree(graph)],
+    ["modules", buildModuleLODTree(graph.nodeCount, blocks(graph.nodeCount, 13))],
+  ];
+  /** Clumps plus scatter (the per-node exactness fixture), with screen or world radii. */
+  function fixture(screenSized: boolean): { graph: NetworkGraph; radii: Float32Array } {
+    const n = 600;
+    const graph = chainGraph(n);
+    const r = rng(19);
+    for (let i = 0; i < n; i++) {
+      const c = i % 7;
+      const spread = c < 3 ? 6 : 140;
+      graph.positions[2 * i] = (c - 3) * 300 + (r() - 0.5) * spread;
+      graph.positions[2 * i + 1] = ((i * 37) % 5) * 90 + (r() - 0.5) * spread;
+    }
+    return { graph, radii: Float32Array.from({ length: n }, () => (screenSized ? 0.05 + r() * 9 : 0.1 + r() * 4)) };
+  }
+
+  for (const screenSized of [true, false]) {
+    it(`is exact per node with each glyph's radius taken spacing times, floored after (${screenSized ? "screen" : "world"} radii)`, () => {
+      const { graph, radii } = fixture(screenSized);
+      for (const [name, tree] of trees(graph)) {
+        computeLODGeometry(tree, graph, radii, graph.strength);
+        for (const spacing of [1.5, 3, 10]) {
+          computeLODCrowding(tree, { screenSized, expandPx: crowdingHorizon(tree), spacing }, makeLODCrowdingScratch());
+          const finite = expectExact(tree, screenSized, crowdingHorizon(tree), spacing);
+          if (spacing < 10) expect(finite, `${name}, spacing ${spacing}: not vacuous`).toBeGreaterThan(0);
+        }
+      }
+    });
+  }
+
+  it("spacing 1, an omitted spacing and one that is not a positive finite number give the same values", () => {
+    const { graph, radii } = fixture(true);
+    for (const [, tree] of trees(graph)) {
+      computeLODGeometry(tree, graph, radii, graph.strength);
+      const opts = { screenSized: true, expandPx: crowdingHorizon(tree) };
+      computeLODCrowding(tree, opts);
+      const base = tree.clearZoom.slice();
+      for (const spacing of [1, 0, -2, Number.NaN, Infinity]) {
+        computeLODCrowding(tree, { ...opts, spacing });
+        expect(Array.from(tree.clearZoom), `spacing ${spacing}`).toEqual(Array.from(base));
+      }
+    }
+  });
+
+  it("a larger spacing never lowers a node's clear zoom, and keeps more of the spread layout aggregated at its fit view", () => {
+    const n = 400;
+    const graph = chainGraph(n);
+    lattice(graph, 20, 30);
+    const radii = new Float32Array(n).fill(4); // 8 px glyphs 30 apart: no overlap at k = 1 with their own radii
+    const t: LODTransform = { k: 1, x: W / 2, y: H / 2 };
+    let previous: Float32Array | null = null;
+    const drawnLeaves: number[] = [];
+    for (const spacing of [1, 2, 4, 8]) {
+      const tree = buildMortonLODTree(graph.positions, n);
+      computeLODGeometry(tree, graph, radii, graph.strength);
+      computeLODCrowding(tree, { screenSized: true, expandPx: crowdingHorizon(tree), spacing });
+      if (previous) for (let g = tree.leafCount; g < tree.size; g++) expect(tree.clearZoom[g]!).toBeGreaterThanOrEqual(previous[g]!);
+      previous = tree.clearZoom.slice();
+      const drawn = cut(tree, t, W, H, { screenSized: true, maxAggregateRadius: 26 });
+      drawnLeaves.push(Array.from(drawn).filter((g) => g < tree.leafCount).length);
+    }
+    expect(drawnLeaves[0], "spacing 1: every node a leaf").toBe(n);
+    expect(drawnLeaves[3]!, "spacing 8: members 30 px apart overlap at 8 × 4 px radii").toBeLessThan(drawnLeaves[0]!);
   });
 });
 

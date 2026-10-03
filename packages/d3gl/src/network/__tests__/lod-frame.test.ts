@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { buildMortonLODTree, computeLODCrowding, computeLODPositions, computeLODStyle, crowdingHorizon, mortonRootBox, lodTreeFromTopology, buildLODTree } from "../lod.js";
-import { MAX_OUTSTANDING, lodFrameStep, lodTreeFromSpatialFrame, makeSpatialLODStream, makeStructureLODStream, recycleSpatialFrame, setStreamSizing, setStreamStyle, spatialFrameByteLength, type LeafStyle, type SpatialLODFrame } from "../lod-frame.js";
+import { MAX_OUTSTANDING, lodFrameStep, lodTreeFromSpatialFrame, makeSpatialLODStream, makeStructureLODStream, recycleSpatialFrame, setStreamSizing, setStreamStyle, spatialFrameByteLength, type LeafCrowding, type LeafStyle, type SpatialLODFrame } from "../lod-frame.js";
 import { lodStyleFields, lodStyleMessage } from "../worker-protocol.js";
 import { buildGraph } from "../graph.js";
 
@@ -125,7 +125,8 @@ describe("lodFrameStep carries the crowding on the settled frame only (#426)", (
 
   it("a spatial frame's clear zoom equals a main-thread crowding pass over the same tree", () => {
     const pos = cloud(n, 11);
-    for (const crowding of [{ screenSized: true }, { screenSized: false }, { screenSized: true, expandPx: 300 }]) {
+    const cases: LeafCrowding[] = [{ screenSized: true }, { screenSized: false }, { screenSized: true, expandPx: 300 }, { screenSized: true, spacing: 3 }, { screenSized: false, spacing: 10 }];
+    for (const crowding of cases) {
       const stream = makeSpatialLODStream(n, { radii, weight, crowding }, 1);
       // A streamed frame carries none: the footprint rule alone while the layout runs.
       const streamed = lodFrameStep(stream, pos, 1);
@@ -141,10 +142,18 @@ describe("lodFrameStep carries the crowding on the settled frame only (#426)", (
       const want = buildMortonLODTree(pos, n, { box: mortonRootBox(pos, n) });
       computeLODPositions(want, pos);
       computeLODStyle(want, radii, weight);
-      computeLODCrowding(want, { screenSized: crowding.screenSized, expandPx: crowdingHorizon(want, crowding.expandPx) });
+      computeLODCrowding(want, { screenSized: crowding.screenSized, expandPx: crowdingHorizon(want, crowding.expandPx), spacing: crowding.spacing });
       expect(Array.from(got.clearZoom)).toEqual(Array.from(want.clearZoom));
       expect(got.clearZoom.subarray(n).some((z) => z < Infinity)).toBe(true); // not vacuous
     }
+    // The spacing reaches the frame: spacing 3 differs from spacing 1 on the same positions.
+    const at = (spacing?: number): Float32Array => {
+      const stream = makeSpatialLODStream(n, { radii, weight, crowding: { screenSized: true, spacing } }, 1);
+      const frame = lodFrameStep(stream, pos, 1, true);
+      if (!frame) throw new Error("no frame");
+      return lodTreeFromSpatialFrame(frame).clearZoom.slice();
+    };
+    expect(Array.from(at(3))).not.toEqual(Array.from(at()));
     // Without crowding inputs, a reused buffer is reset to "none" rather than keeping the last frame's.
     const stream = makeSpatialLODStream(n, { radii, weight, crowding: { screenSized: true } }, 1);
     const a = lodFrameStep(stream, pos, 1, true);
@@ -179,6 +188,13 @@ describe("lodFrameStep carries the crowding on the settled frame only (#426)", (
     computeLODCrowding(tree, { screenSized: true, expandPx: crowdingHorizon(tree) });
     expect(Array.from(worker.clearZoom)).toEqual(Array.from(tree.clearZoom));
     expect(worker.clearZoom.some((z) => z < Infinity)).toBe(true); // not vacuous
+    // So does a new overlap spacing (lod({ overlapSpacing })).
+    const spaced = worker.clearZoom.slice();
+    setStreamSizing(stream, { radii: bigger, crowding: { screenSized: true, spacing: 2.5 } });
+    lodFrameStep(stream, pos, 2, true);
+    computeLODCrowding(tree, { screenSized: true, expandPx: crowdingHorizon(tree), spacing: 2.5 });
+    expect(Array.from(worker.clearZoom)).toEqual(Array.from(tree.clearZoom));
+    expect(Array.from(worker.clearZoom)).not.toEqual(Array.from(spaced));
     // A streamed frame (a reheat) drops it again: the footprint rule alone while the layout runs.
     lodFrameStep(stream, pos, 3);
     expect(worker.clearZoom.every((z) => z === Infinity)).toBe(true);
