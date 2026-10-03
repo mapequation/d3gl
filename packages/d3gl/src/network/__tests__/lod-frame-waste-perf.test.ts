@@ -383,6 +383,62 @@ describe("streamed LOD frame waste — colour resolution + mixed-radius declutte
     if (ASSERT) expect(ratio, `memo ${memoMs.toFixed(1)}ms vs no memo ${baseMs.toFixed(1)}ms`).toBeLessThan(MEMO_OVERHEAD);
   }, 120_000);
 
+  it("continuous flows through the gather: a held view resolves no colour, a moved one only the rows whose flow changed", () => {
+    // Infomap flows are continuous: at the Network Navigator's citation map (~16k drawn super-edges) the
+    // drawn flows outnumber the weight memo, which then starts over every frame and every edge was parsed
+    // again. The gather keeps each row's colour while its flow is the same, so parses = changed flows.
+    const n = 100_000;
+    let s = 11 >>> 0;
+    const rng = (): number => ((s = (s * 1664525 + 1013904223) >>> 0) / 4294967296);
+    const source: number[] = [];
+    const target: number[] = [];
+    const weight: number[] = [];
+    for (let i = 0; i < n; i++) {
+      source.push(i, i);
+      target.push((i + 1) % n, (i + 2 + Math.floor(rng() * 48)) % n);
+      weight.push(rng() * 32, rng() * 32); // continuous: every flow distinct
+    }
+    const graph = buildGraph({ nodeCount: n, source, target, weight, directed: true });
+    multilevelSeed(graph, { width: 2000, height: 2000 });
+    const tree = buildLODTree(graph, {});
+    computeLODGeometry(tree, graph, new Float32Array(n).fill(2));
+    let calls = 0;
+    const colorOf = resolveLinkColorOf((w: number) => {
+      calls++;
+      return strokeScale(w);
+    });
+    const style: SuperEdgeStyleResolved = { linkStyle: "half-arrow", directed: true, widthOf: () => 1, colorOf, bend: 0.15, arrowSize: 5, maxAggregateRadius: 26, crossLevelEdges: true };
+    let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+    for (let i = 0; i < n; i++) {
+      const x = graph.positions[i * 2] ?? 0, y = graph.positions[i * 2 + 1] ?? 0;
+      minX = Math.min(minX, x); maxX = Math.max(maxX, x); minY = Math.min(minY, y); maxY = Math.max(maxY, y);
+    }
+    const [cx, cy] = [(minX + maxX) / 2, (minY + maxY) / 2];
+    const cutSc = makeCutScratch();
+    const seSc = makeSuperEdgesScratch();
+    const frame = (k: number) => {
+      const t: LODTransform = { k, x: W / 2 - cx * k, y: H / 2 - cy * k };
+      // A fine cut (small modules open): tens of thousands of drawn super-edges with continuous flows.
+      const frontier = cut(tree, t, W, H, { expandPx: 6, screenSized: true, maxAggregateRadius: 26 }, cutSc).slice();
+      const before = calls;
+      const out = superEdges(tree, frontier, style, visibleWorldRect(t, W, H), seSc);
+      return { calls: calls - before, flows: (out.flows ?? []).slice(), colors: out.halfArrows?.colors.slice() ?? new Uint8Array(0) };
+    };
+    const k0 = 0.9 * Math.min(W / (maxX - minX), H / (maxY - minY));
+    const first = frame(k0);
+    expect(first.flows.length, "the view drew too few super-edges to overflow the weight memo").toBeGreaterThan(20_000);
+    const held = frame(k0);
+    expect(held.calls, `a held view resolved ${held.calls} colours for ${held.flows.length} drawn super-edges`).toBe(0);
+    expect(held.colors).toEqual(first.colors);
+    const moved = frame(k0 * 1.25);
+    let changed = 0;
+    for (let e = 0; e < moved.flows.length; e++) if (moved.flows[e] !== held.flows[e]) changed++;
+    expect(moved.calls, `${moved.calls} colour resolutions for ${changed} rows whose flow changed`).toBeLessThanOrEqual(changed);
+    for (let e = 0; e < moved.flows.length; e += 211) {
+      expect(Array.from(moved.colors.subarray(e * 4, e * 4 + 4)), `edge ${e}`).toEqual(parsed(strokeScale(moved.flows[e] ?? 0)));
+    }
+  }, 120_000);
+
   it("style-column compare: an unchanged emit hands back last frame's arrays", () => {
     const S = 100_000; // drawn super-edges; the env-gated leg runs this at BENCH_LOD_FRAME_WASTE_N (≈1M)
     const ms = stableCompare(S);
