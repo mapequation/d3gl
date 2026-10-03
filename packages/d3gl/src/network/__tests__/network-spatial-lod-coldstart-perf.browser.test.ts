@@ -4,7 +4,6 @@ import { buildGraph, type NetworkGraph } from "../graph.js";
 import { DEFAULT_FORCE } from "../force.js";
 import { perfBudget, perfN } from "../../__tests__/perf-budget.js";
 import { perfHost } from "../../__tests__/engine-sweep.js";
-import { indexedLinkStats } from "../../webgl/indexed-links.js";
 
 /**
  * The overlap rule's worst frame (#426, AGENTS lifecycle §5), through the real trigger: a worker layout that
@@ -29,10 +28,7 @@ import { indexedLinkStats } from "../../webgl/indexed-links.js";
  * Asserted: the worst case is reached (the LOD-on settled frame draws nearly every node, at most one leaf per
  * viewport pixel); the frame reads the worker's super-edge rows, with no incidence walked or row computed on the
  * main thread; its main-thread rebuild stays under an absolute `c0 + c1·N` ceiling; and the links between two
- * kept leaves (#447) are drawn by edge id with the deterministic signature: one GPU instance per shown link per
- * indexed layer, at most 24 B uploaded per instance (edge id, ends, fade), and no style table built or uploaded
- * on the all-leaves frame or the pans after it (the tables are built on the LOD lane's first emit, the seed
- * frame). The ratio to LOD off is logged, not asserted.
+ * kept leaves (#447) are drawn on that frame and the pans after it. The ratio to LOD off is logged, not asserted.
  */
 
 const LOCAL_N = 37_500;
@@ -85,13 +81,8 @@ interface SeedFrame {
   glyphs: number;
   visits: number;
   misses: number;
-  /** Links drawn as graph edges between two kept leaves (#447), and what the indexed link draws did this frame. */
+  /** Links drawn as graph edges between two kept leaves (#447). */
   leafLinks: number;
-  draws: number;
-  instances: number;
-  instanceBytes: number;
-  tableBytes: number;
-  tablesBuilt: number;
 }
 
 /** The all-leaves frame of one run, and every frame after it: then three pans. */
@@ -115,18 +106,15 @@ async function coldStart(net: Network, graph: NetworkGraph, lod: boolean): Promi
   const installed = engine.rebuild;
   const frames: SeedFrame[] = [];
   engine.rebuild = function (this: unknown): unknown {
-    const s0 = { ...indexedLinkStats };
     const t0 = performance.now();
     try {
       return installed.call(this);
     } finally {
       const ms = performance.now() - t0;
       const gather = net.superEdgeStats;
-      const s = indexedLinkStats;
       frames.push({
         ms, source: net.lodSource, glyphs: net.declutterStats?.glyphs ?? -1, visits: gather?.visits ?? -1, misses: gather?.misses ?? -1,
-        leafLinks: gather?.leafLinks ?? 0, draws: s.draws - s0.draws, instances: s.instances - s0.instances,
-        instanceBytes: s.instanceBytes - s0.instanceBytes, tableBytes: s.tableBytes - s0.tableBytes, tablesBuilt: s.tablesBuilt - s0.tablesBuilt,
+        leafLinks: gather?.leafLinks ?? 0,
       });
     }
   };
@@ -143,15 +131,12 @@ async function coldStart(net: Network, graph: NetworkGraph, lod: boolean): Promi
   // its frame — not a rebuild, so each is recorded from the counters around it.
   const view = fitView(graph.nodeCount);
   for (let i = 1; i <= 3; i++) {
-    const s0 = { ...indexedLinkStats };
     net.setTransform({ ...view, x: view.x + (i % 2 ? 1 : -1) });
     await new Promise<void>((resolve) => window.requestAnimationFrame(() => resolve()));
-    const s = indexedLinkStats;
     const gather = net.superEdgeStats;
     frames.push({
       ms: 0, source: net.lodSource, glyphs: net.declutterStats?.glyphs ?? -1, visits: gather?.visits ?? -1, misses: gather?.misses ?? -1,
-      leafLinks: gather?.leafLinks ?? 0, draws: s.draws - s0.draws, instances: s.instances - s0.instances,
-      instanceBytes: s.instanceBytes - s0.instanceBytes, tableBytes: s.tableBytes - s0.tableBytes, tablesBuilt: s.tablesBuilt - s0.tablesBuilt,
+      leafLinks: gather?.leafLinks ?? 0,
     });
   }
   const ofRun = frames.slice(0, run);
@@ -202,26 +187,10 @@ describe(`network() spatial LOD, the all-leaves frame of a layout that settles s
     }
   });
 
-  it("draws the leaf links by edge id (#447): an instance per shown link, 20-24 B each, no style upload on the frame", () => {
-    for (const f of on) {
-      // Nearly every edge joins two kept leaves at the peak (the rest touch the few aggregates left).
-      expect(f.leafLinks, "the settled frame's leaf links").toBeGreaterThan(0);
-      expect(f.draws, "indexed link draws of the settled frame").toBeGreaterThan(0);
-      expect(f.tablesBuilt + f.tableBytes, "style tables built or uploaded on the all-leaves frame").toBe(0);
-      expect(f.instances, "GPU instances: one per shown link per indexed layer").toBe(f.leafLinks * f.draws);
-      // Per shown link: its edge id (4 B), its two ends (16 B) and, in a cross-fade band, its fade (4 B).
-      expect(f.instanceBytes, "per-instance bytes uploaded").toBeLessThanOrEqual(24 * f.instances);
-    }
-    // The style tables are built once per layer (the first emit of a fresh LOD lane), never per frame after it:
-    // a later frame uploads the moved ends (and a changed index) alone.
+  it("draws the leaf links (#447): the settled frame and the pans after it draw links between two kept leaves", () => {
+    for (const f of on) expect(f.leafLinks, "the settled frame's leaf links").toBeGreaterThan(0);
     expect(onAfter.length, "frames after the all-leaves frame").toBeGreaterThanOrEqual(3);
-    for (const f of onAfter) {
-      expect(f.tablesBuilt, "style tables built after the all-leaves frame").toBe(0);
-      expect(f.tableBytes, "style bytes uploaded after the all-leaves frame").toBe(0);
-      expect(f.instances).toBe(f.leafLinks * f.draws);
-      expect(f.instanceBytes).toBeLessThanOrEqual(24 * f.instances);
-    }
-    for (const f of off) expect(f.draws, "LOD off draws no indexed link layer").toBe(0);
+    for (const f of onAfter) expect(f.leafLinks, "a pan's leaf links").toBeGreaterThan(0);
   });
 
   it("reads the worker's super-edge rows: no incidence walked or row computed on the main thread", () => {

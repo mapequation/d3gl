@@ -23,7 +23,7 @@ import { startGpuLayout } from "./gpu/gpu-transport.js";
 import { WebGLBackend } from "../webgl/webgl-backend.js";
 import type { NetworkGraph } from "./graph.js";
 import { layoutBox, layoutFitTransform, fitCameraPath, type FitBox } from "./fit.js";
-import type { InstancedArrowsData, InstancedHalfArrowsData, InstancedLayer, InstancedLinesData, ViewTransform } from "../core/index.js";
+import type { InstancedLayer, ViewTransform } from "../core/index.js";
 import { InstancedLane, type SelectionStrategy } from "../core/instanced-lane.js";
 import { StableColumns } from "../core/stable-columns.js";
 import { resolveRingColors, ringCircles } from "../map/highlight-ring.js";
@@ -659,10 +659,10 @@ const DEFAULT_NODE_RADIUS = 4;
 const DEFAULT_NODE_FILL = "#4878d0";
 const DEFAULT_LINK_WIDTH = 1;
 const DEFAULT_LINK_STROKE = "#999999";
-const LAYER_NAMES = ["module-boundaries", "leaf-links", "links", "leaf-arrows", "arrows", "node-halos", "nodes"] as const;
+const LAYER_NAMES = ["module-boundaries", "links", "arrows", "node-halos", "nodes"] as const;
 /** Base-lane layers the shader highlight (#162) drives — nodes + links (not the aggregate halos, which
  *  carry no group/selected and so render un-dimmed). */
-const HL_LAYERS = ["nodes", "leaf-links", "links", "leaf-arrows", "arrows"] as const;
+const HL_LAYERS = ["nodes", "links", "arrows"] as const;
 /** Scale a laid-out graph's positions (in place) to fill the view at the default `k = 1` zoom — the
  *  same "scale the layout, don't fit-transform" approach the directed-map-of-modules example uses, so
  *  the network opens framed without a custom transform (which would fight d3-zoom's own transform, #171).
@@ -901,8 +901,6 @@ export class Network extends BaseEngine {
   private leafIncidence: LeafIncidence | null = null;
   /** Each CSR entry's edge id at its source's entry (#447): the leaf links' index walk, once per graph. */
   private leafEdgeEntries: { graph: NetworkGraph; ids: Uint32Array } | null = null;
-  /** The leaf links' per-edge `selected` flags (#447), for one graph, tree, selection and direction (never mutated). */
-  private leafLinkSelected: { graph: NetworkGraph; tree: LODTree; sel: ReadonlySet<string | number> | undefined; directed: boolean; flags: Uint8Array } | null = null;
   /** The last cut's frontier before declutter (a view of {@link cutScratch}): the lazy gather's covers. */
   private cutFrontier: Uint32Array = new Uint32Array(0);
   /** Whether a spatial tree's gather (lazy or from rows) has run (so {@link superEdgeStats} reports it). */
@@ -3191,7 +3189,6 @@ export class Network extends BaseEngine {
   private invalidateNoLodSelected(): void {
     this.noLodSelectedNodes = null;
     this.noLodSelectedLinks = null;
-    this.leafLinkSelected = null;
   }
 
   /** Shader-highlight columns for the emitted LOD super-edges (#162): `groups` = source tree-node,
@@ -3565,12 +3562,10 @@ export class Network extends BaseEngine {
    */
   /**
    * The frame's super-edges. Where the tree's leaves are the graph's nodes, the links between two kept leaves
-   * are not gathered (#447): they are the graph edges, drawn as the full-detail path draws them. `combine`
-   * (the Canvas/SVG Scene) appends them to the result as copies of that path's cached columns
-   * ({@link withLeafLinks}); the WebGL lane draws them with the full-detail link layer itself instead
-   * ({@link leafLinkLayers}) and takes the gathered links alone.
+   * are not gathered (#447): they are the graph edges, drawn as the full-detail path draws them — copies of that
+   * path's cached per-edge columns ({@link withLeafLinks}), first in the batch, then the gathered links.
    */
-  private frontierSuperEdges(tree: LODTree, frontier: Uint32Array, style: ResolvedNetworkStyle, combine = true): SuperEdgesData {
+  private frontierSuperEdges(tree: LODTree, frontier: Uint32Array, style: ResolvedNetworkStyle): SuperEdgesData {
     const opts = this.lodOptions;
     const edgeStyle: SuperEdgeStyleResolved = {
       linkStyle: style.linkStyle,
@@ -3603,7 +3598,7 @@ export class Network extends BaseEngine {
       gathered = superEdges(tree, frontier, edgeStyle, view, this.superEdgesScratch);
     }
     this.leafLinksDrawn = leaves ? this.listLeafLinks(leaves, frontier, listed) : 0;
-    if (!leaves || !combine) return gathered;
+    if (!leaves) return gathered;
     return withLeafLinks(tree, leaves, this.leafLinksDrawn, this.noLodCache(leaves, style), gathered, this.fadeAlpha ?? undefined, this.leafLinksScratch);
   }
 
@@ -3649,107 +3644,6 @@ export class Network extends BaseEngine {
   }
 
   /**
-   * The links between two kept leaves (#447), drawn as the full-detail path draws them: by **edge id** from
-   * that path's cached per-edge style columns ({@link noLodCache}: widths, colours, radii, bends, highlight
-   * groups — the same arrays, so the GPU packs them into its resident tables once per style), for the edges
-   * whose two ends are kept leaves of this cut, as the frame's gather listed them ({@link listLeafLinks}: in the
-   * same read of the kept leaves' rows, then sorted into edge order). Per frame, per shown link: its edge id (4 B), its ends at the leaves' drawn
-   * centres (16 B) and, in a cross-fade band, its fade (4 B; a link's alpha follows its least-visible end, as a
-   * gathered one's does) — each handed back unchanged when its values are ({@link StableColumns.float32Into}),
-   * so a frame that moves and re-cuts nothing uploads nothing. A selection change rebuilds the per-edge
-   * `selected` flags once (ancestor-aware, as every LOD glyph's). Emitted on every frame while links draw,
-   * an empty list included (it draws nothing), so the GPU builds the tables and sizes its per-instance lanes
-   * for every edge once, when the lane registers, and never creates a GPU object while the view or the layout
-   * changes. Memory: 8 B per edge for the entry map (once per graph), 1 B per edge for the flags, and
-   * 2 × 20-24 B per shown link of columns, reused.
-   */
-  private leafLinkLayers(
-    tree: LODTree,
-    graph: NetworkGraph,
-    style: ResolvedNetworkStyle,
-    sel: ReadonlySet<string | number> | undefined,
-    isSel: ((g: number) => boolean) | null,
-    pick: true | undefined,
-  ): { links: InstancedLayer; arrows?: InstancedLayer } | null {
-    const cache = this.noLodCache(graph, style);
-    if (cache.kind === "no-links") return null;
-    const E = graph.edgeCount;
-    const src = graph.source;
-    const tgt = graph.target;
-    // Listed with the frame's gather ({@link listLeafLinks}), in edge order.
-    const m = this.leafLinksDrawn;
-    const list = this.leafLinksScratch.edges;
-    const memo = this.lodColumns;
-    const index = memo.float32Into("leaf-links.index", m, (out) => {
-      for (let i = 0; i < m; i++) out[i] = list[i] ?? 0;
-    });
-    const cx = tree.cx;
-    const cy = tree.cy;
-    const sources = memo.float32Into("leaf-links.sources", 2 * m, (out) => {
-      for (let i = 0; i < m; i++) {
-        const a = src[list[i] ?? 0] ?? 0;
-        out[2 * i] = cx[a] ?? 0;
-        out[2 * i + 1] = cy[a] ?? 0;
-      }
-    });
-    const targets = memo.float32Into("leaf-links.targets", 2 * m, (out) => {
-      for (let i = 0; i < m; i++) {
-        const b = tgt[list[i] ?? 0] ?? 0;
-        out[2 * i] = cx[b] ?? 0;
-        out[2 * i + 1] = cy[b] ?? 0;
-      }
-    });
-    const fa = this.fadeAlpha;
-    const fade = fa
-      ? memo.float32Into("leaf-links.fade", m, (out) => {
-          for (let i = 0; i < m; i++) {
-            const e = list[i] ?? 0;
-            out[i] = Math.min(fa[src[e] ?? 0] ?? 1, fa[tgt[e] ?? 0] ?? 1);
-          }
-        })
-      : undefined;
-    // Ancestor-aware, as every LOD glyph's: a link is selected with its source's leaf (directed) or either end.
-    let selected: Uint8Array | undefined;
-    if (isSel) {
-      const key = this.leafLinkSelected;
-      if (key && key.graph === graph && key.tree === tree && key.sel === sel && key.directed === style.directed) selected = key.flags;
-      else {
-        const n = graph.nodeCount;
-        const leafSel = new Uint8Array(n);
-        for (let v = 0; v < n; v++) leafSel[v] = isSel(v) ? 1 : 0;
-        const directed = style.directed;
-        const flags = new Uint8Array(E);
-        for (let e = 0; e < E; e++) flags[e] = leafSel[src[e] ?? 0] || (!directed && leafSel[tgt[e] ?? 0]) ? 1 : 0;
-        this.leafLinkSelected = { graph, tree, sel, directed, flags };
-        selected = flags;
-      }
-    }
-    const inst = { index, tableCount: E, sources, targets, fade, count: m, groups: cache.groupSource, groups2: cache.groupTarget, selected };
-    const sizeMode = style.sizeMode;
-    const ha = cache.halfArrows;
-    if (cache.kind === "half-arrows" && ha) {
-      const halfArrows: InstancedHalfArrowsData = { ...inst, radii: ha.radii, widths: ha.widths, bends: ha.bends, colors: ha.colors };
-      return { links: { name: "leaf-links", primitive: "half-arrows", pickable: pick, pickBase: 0, halfArrows, sizeMode } };
-    }
-    const ln = cache.lines;
-    if (!ln) return null;
-    const lines: InstancedLinesData = { ...inst, widths: ln.widths, colors: ln.colors };
-    if (ln.bends) {
-      lines.bends = ln.bends;
-      lines.samples = ln.samples;
-    }
-    const links: InstancedLayer = { name: "leaf-links", primitive: "lines", pickable: pick, pickBase: 0, lines, sizeMode };
-    const ar = cache.arrows;
-    if (!ar) return { links };
-    const arrowData: InstancedArrowsData = { ...inst, radii: ar.radii, sizes: ar.sizes, colors: ar.colors };
-    if (ar.bends) {
-      arrowData.bends = ar.bends;
-      arrowData.half = ar.half;
-    }
-    return { links, arrows: { name: "leaf-arrows", primitive: "arrows", pickable: pick, pickBase: 0, arrows: arrowData, sizeMode } };
-  }
-
-  /**
    * Build the instanced layers for a given LOD frontier (the index-compacted visible set). The emit
    * body the {@link InstancedLane} (see {@link syncLane}) feeds the cut's visible set into, shared
    * with the vector retained-Scene path ({@link registerLODScene}). Cost ∝ the visible frontier, not
@@ -3782,11 +3676,11 @@ export class Network extends BaseEngine {
       // (directed) arrowheads, the same glyph the non-LOD path uses. A node keeps edges to on-frontier
       // or off-screen neighbours (the same visible rect the cut uses); both half-arrow and line
       // arrowheads honour sizeMode in-shader (the tip sets back to the node boundary in either space).
-      // Links between two kept leaves (#447) are drawn by edge id from the full-detail link columns
-      // ({@link leafLinkLayers}); the gathered links touch an aggregate and pick after them (ids offset by the edge count).
-      const leafGraph = graph.nodeCount === tree.leafCount ? graph : null;
-      const leafBase = leafGraph ? leafGraph.edgeCount : 0;
-      const { halfArrows, lines, arrows, ids, flows } = this.frontierSuperEdges(tree, frontier, style, leafGraph === null);
+      // Links between two kept leaves (#447) come first, as copies of the full-detail link columns
+      // ({@link withLeafLinks}); the gathered links touch an aggregate.
+      const se = this.frontierSuperEdges(tree, frontier, style);
+      const { halfArrows, lines, arrows, ids, flows } = se;
+      const leafEdges = "leafEdges" in se ? se.leafEdges : undefined;
       // #162: attach the shader-highlight columns — group = link source id (matched against the hovered
       // id → recolour that node's outgoing links), group2 = target for undirected incident hover, selected
       // = outgoing-from-a-selected-(sub)tree flag. The shader recolours/dims from these; no CPU colour
@@ -3823,18 +3717,16 @@ export class Network extends BaseEngine {
         if (arrows.bends) arrows.bends = memo.float32("arrows.bends", arrows.bends);
       }
       const pick = this.pickLinksEnabled || undefined; // flag link layers into the GPU pick pass (#141)
-      const leaf = leafGraph ? this.leafLinkLayers(tree, leafGraph, style, sel, isSel, pick) : null;
-      if (leaf) layers.push(leaf.links);
-      if (halfArrows && halfArrows.count > 0) layers.push({ name: "links", primitive: "half-arrows", pickable: pick, pickBase: leafBase, halfArrows, sizeMode: style.sizeMode });
-      if (lines && lines.count > 0) layers.push({ name: "links", primitive: "lines", pickable: pick, pickBase: leafBase, lines, sizeMode: style.sizeMode });
-      if (leaf?.arrows) layers.push(leaf.arrows);
-      if (arrows && arrows.count > 0) layers.push({ name: "arrows", primitive: "arrows", pickable: pick, pickBase: leafBase, arrows, sizeMode: style.sizeMode });
+      if (halfArrows && halfArrows.count > 0) layers.push({ name: "links", primitive: "half-arrows", pickable: pick, halfArrows, sizeMode: style.sizeMode });
+      if (lines && lines.count > 0) layers.push({ name: "links", primitive: "lines", pickable: pick, lines, sizeMode: style.sizeMode });
+      if (arrows && arrows.count > 0) layers.push({ name: "arrows", primitive: "arrows", pickable: pick, arrows, sizeMode: style.sizeMode });
       // Link picking (#141): instance i (gl_InstanceID) of every emitted link layer is super-edge i, so
       // one resolve maps the decoded id → its directed tree-node pair (ids[i]) + summed flow (flows[i]).
-      // A leaf link's id is its edge (below `leafBase`): the same hit LOD off returns for it (#447).
+      // A leaf link (the first `leafEdges.length`) resolves to its graph edge: the hit LOD off returns (#447).
       if (this.pickLinksEnabled) {
-        this.linkResolve = leafGraph
-          ? (i) => (i < leafBase ? this.noLodLinkHit(leafGraph, i) : this.lodLinkHit(tree, ids, flows, i - leafBase))
+        const g = graph;
+        this.linkResolve = leafEdges
+          ? (i) => (i < leafEdges.length ? this.noLodLinkHit(g, leafEdges[i] ?? 0) : this.lodLinkHit(tree, ids, flows, i))
           : (i) => this.lodLinkHit(tree, ids, flows, i);
       }
     }
