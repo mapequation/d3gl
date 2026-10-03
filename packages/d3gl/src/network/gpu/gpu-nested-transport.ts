@@ -26,7 +26,8 @@
  *    in one frame, without the main thread ever waiting for the GPU.
  * 5. The final layout's module discs come back with it: a warm start is placed over the current map
  *    (float64, on the CPU, as the CPU layout does), the boundary discs (#329) go to `onBoundaries`, then
- *    the positions land. The GPU resources are freed once it settles — a nested layout has no reheat.
+ *    the positions land. The GPU resources are freed once it settles: a drag re-solves only the grabbed
+ *    node's module, on the main thread (`nested-drag.ts`), so nothing here stays resident for it.
  *
  * A solve that stops before its final harvest — a non-finite layout, a lost context — lands none of it
  * (a one-frame layout's arrays were never filled): one warning names the reason, and the worker lays the
@@ -72,7 +73,8 @@ export interface GpuNestedOptions extends NestedWorkerOptions {
 /**
  * Start a GPU nested layout of `tree` (see the file header). Returns a {@link WorkerLayoutHandle}: its
  * `transport` reads `"pending"` until the device and the prep settle, then `"gpu"` or `"worker"`.
- * `pin` / `unpin` do nothing (drag is translate-only on a nested layout, as on the worker).
+ * `pin` / `unpin` do nothing: a drag on the landed map re-solves its module on the main thread
+ * (`nested-drag.ts`), and one during the solve is held over its frames by the engine.
  */
 export function startGpuNestedLayout(
   deviceOrPromise: Device | null | undefined | Promise<Device | null | undefined>,
@@ -202,7 +204,7 @@ export function startGpuNestedLayout(
         graph.positions.set(result.positions);
         onFrame();
       }
-      s.stop(); // no reheat: free the GPU resources now
+      s.stop(); // a drag re-solves on the main thread: free the GPU resources now
       resolveSettled();
     }, resolveSettled);
     try {
