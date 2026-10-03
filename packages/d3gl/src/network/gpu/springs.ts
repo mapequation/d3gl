@@ -63,6 +63,9 @@ export function seedSpringPrograms(): LayoutProgram[] {
   return [attractionProgram(SEED_SPRINGS), hubChunkProgram(SEED_SPRINGS)];
 }
 
+/** The edges a graph's {@link GpuSprings} are built from: a layout graph's, or any weighted edge list (#455). */
+export type SpringEdges = Pick<LayoutGraph, "nodeCount" | "edgeCount" | "source" | "target" | "springWeight">;
+
 /**
  * A layout graph that carries its undirected CSR's row lengths — a `NetworkGraph` does (`graph.csr`, built from the
  * same edges by the same `buildCSR` as the solver's springs) — so its springs' variant is known before the solver.
@@ -142,7 +145,7 @@ export class GpuSprings {
 
   constructor(
     device: Device,
-    source: LayoutGraph | SeedSpringCapacity,
+    source: SpringEdges | SeedSpringCapacity,
     variant: { nested?: boolean; rowScale?: Float32Array } = {},
   ) {
     this.device = device;

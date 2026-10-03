@@ -39,7 +39,9 @@ const SIZES = [500, 1_000, 2_000, 5_000, 10_000, 20_000];
  * The **Input** control hands the same map over as an Infomap **`.ftree`** would (#199): the graph keeps
  * only the links inside each bottom module, and the links between modules arrive as **module links**,
  * `data(graph, { modules, moduleLinks })`. Then no leaf edge carries a module's connectivity once it opens
- * — with **Boundaries** and **Cross-level edges** on, its links stay drawn, anchored at its ring (#329).
+ * — with **Boundaries** and **Cross-level edges** on, its links stay drawn, anchored at its ring (#329) —
+ * and the **Force** layout pulls along the module links instead (#455): each is a spring between its two
+ * modules' members, so linked modules gather and a dragged module pulls the ones it is linked to.
  *
  * The **Nodes** slider resizes the generated network (500 → 20,000): the map is regenerated — flow and
  * all — and re-laid-out, framing itself each time. The **LOD** control switches the cut:
