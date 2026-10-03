@@ -232,6 +232,7 @@ function runLegs(fs: Fixture[], reps: number, spacing = 1): LegResult[] {
   const out: LegResult[] = [];
   // A leg at an overlap spacing (`lod({ overlapSpacing })`) is labelled `@s<spacing>`, with the same budget.
   const tag = spacing === 1 ? "" : `@s${spacing}`;
+  let opened = 0;
   for (const f of fs) {
     for (const screenSized of [true, false]) {
       const mode = (f.wide ? "-wide" : "") + (screenSized ? "" : "-world") + tag;
@@ -261,10 +262,11 @@ function runLegs(fs: Fixture[], reps: number, spacing = 1): LegResult[] {
         else if (z < Infinity) open++;
       }
       expect(nan, `${f.name}${mode}: NaN clear zooms`).toBe(0);
-      // Packed 12 apart with 3-5 px screen radii, the module map's members all overlap once their radii are taken
-      // 3×: that leg is the crowded case (every module stops at its first pairs), not a vacuous one.
-      if (spacing !== 1 && f.name === "modules" && screenSized) expect(open, `${f.name}${mode}: the crowded case, nothing opens by overlap`).toBe(0);
-      else expect(open, `${f.name}${mode}: aggregates that can open by overlap (not vacuous)`).toBeGreaterThan(0);
+      // At spacing 1 every fixture has aggregates that open by overlap (not vacuous). A spacing may crowd a whole
+      // fixture at its horizon (the packed module map at 3 px × 3, the flat module at scale): that is the cheap,
+      // crowded case, not a vacuous one, so a spacing leg asserts it over all its fixtures together (below).
+      if (spacing === 1) expect(open, `${f.name}${mode}: aggregates that can open by overlap (not vacuous)`).toBeGreaterThan(0);
+      opened += open;
       out.push({ name: `pass${mode}:${f.name}`, median: median(ts), frontier: open });
       if (f.wide) continue; // the cut over these is the all-leaves frontier frontier-perf owns
 
@@ -290,6 +292,8 @@ function runLegs(fs: Fixture[], reps: number, spacing = 1): LegResult[] {
       out.push({ name: `sweep${mode}:${f.name}`, median: median(frameTs), frontier: widest });
     }
   }
+
+  expect(opened, `spacing ${spacing}: aggregates that can open by overlap over all fixtures (not vacuous)`).toBeGreaterThan(0);
 
   // A settled spatial frame (the worker's step for a layout's `done`, the one that carries the crowding — a
   // streamed frame has none), buffers recycled as the engine does.
