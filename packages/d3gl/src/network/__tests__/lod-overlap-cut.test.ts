@@ -342,7 +342,9 @@ describe("computeLODCrowding on wide nodes (#426)", () => {
       }
       expect(finite, "not vacuous: some wide nodes clear below their horizon").toBeGreaterThan(0);
     }
-  });
+    // An exactness check against an O(m²) brute force, not a timing guard: 3-7 s on CI runners and loaded hosts,
+    // past vitest's 5 s default (lod-crowding-perf times the pass).
+  }, 30_000);
 
   it("tests a leaf beside a wide module against the module's members up to the leaf's full reach", () => {
     // A 10 × 10 module (indexed: more children than a bucket) and, beside it in the same parent, one large
