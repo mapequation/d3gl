@@ -1173,9 +1173,11 @@ export class Network extends BaseEngine {
    *    ≥2 modules renders as a **pie chart** (wedges ∝ per-module flow/count, module-coloured) and a
    *    single-module node as a solid disc.
    *
-   * Call {@link layout} next: in state-network mode it lays out the physical graph (force backend) and
-   * derives the rosette state positions, so every view has coordinates (the module-aware GPU layout of
-   * #106 will supply these directly once it lands). Switch views with {@link view}: `"physical"` (pies),
+   * Call {@link layout} next: in state-network mode it lays out the **physical** graph with any layout
+   * backend (`"positions"`, `"force"`, or the streaming `"worker"` / `"gpu"` / `"auto"`) and derives the
+   * rosette state positions from it — on every streamed frame for the streaming backends — so every view
+   * has coordinates. State nodes always sit on that deterministic rosette; laying them out by force around
+   * their physical node is planned (#189). Switch views with {@link view}: `"physical"` (pies),
    * `"state"` (spread rosette, module LOD via {@link lod}), or `"both"` (state nodes confined inside their
    * physical container, state-level links). Colours + pie wedges + container radii are derived once here.
    */
@@ -1290,8 +1292,10 @@ export class Network extends BaseEngine {
   /**
    * Enable (or, with `false`, disable) level-of-detail rendering (#103) — an adaptive hierarchy cut
    * that draws dense regions as aggregate glyphs and expands them into members as you zoom, so
-   * per-frame work tracks the visible frontier rather than the whole graph. Requires the WebGL
-   * backend. The tree's geometry follows the layout as it converges (re-cut cheaply on zoom).
+   * per-frame work tracks the visible frontier rather than the whole graph. Works on every render
+   * backend: the WebGL lane re-cuts live as you zoom, while Canvas/SVG draw the frontier as retained
+   * geometry that re-cuts when a gesture ends or after a `setTransform` with zoom enabled (#138; see
+   * {@link syncScreenGeometry}). The tree's geometry follows the layout as it converges.
    *
    * **Call this before `layout({ backend: "worker" })`** (or `"gpu"` / `"auto"`) to get the full win: a
    * worker then builds and streams the LOD tree itself (#103; for the GPU solve its LOD worker, #377), so
@@ -2407,7 +2411,9 @@ export class Network extends BaseEngine {
    *   frame ({@link scheduleLayoutRepaint}) re-derives the rosette from them, so the state/both views converge
    *   live alongside the physical layout. No worker-built LOD tree is requested here (`lod` stays unset) —
    *   the state-network LOD tree is over the state/module hierarchy, a different structure from the
-   *   worker's physical-graph coarsening; module-aware GPU layout (#106 N8.2-4) is a later milestone.
+   *   worker's physical-graph coarsening. For the same reason no module tree goes to the GPU seed: a
+   *   `"gpu"` physical layout seeds multilevel from the physical graph's own coarsening (a disc with
+   *   `multilevel: false`), as for a graph without a module hierarchy.
    */
   private layoutStateNetwork(opts: NetworkLayoutOptions): this {
     const sg = this.stateData!;

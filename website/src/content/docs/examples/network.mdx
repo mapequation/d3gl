@@ -762,8 +762,10 @@ derives the physical network) plus a per-**state-node** module assignment, and `
   rosette confined inside it, drawn with **state-level** links — the memory structure in its physical
   context. Everything is world-sized so the state nodes stay inside their physical node at every zoom.
 
-The **Nodes** slider scales the physical network from 10 to 10,000 (100k+ awaits the module-aware GPU
-layout — the physical force solve + the node2vec trigram enumeration are the current ceiling); the map
+The **Nodes** slider scales the physical network from 10 to 10,000. The cap comes from the demo's
+synthetic data, not from the layout (the Worker and GPU backends lay out far larger graphs, as in the
+large-scale example above): the example builds the state network on the main thread, with one state
+edge per node2vec trigram, Σ deg² of them over the power-law degrees. The map
 controls (Sizing, Declutter, Expand, Max radius, Labels, Cross-level, Cross-fade) mirror the
 [directed map of modules](#a-directed-map-of-modules) and drive the state-view LOD cut.
 
@@ -789,9 +791,12 @@ filled arc sectors, so the physical view **exports to `toSVG()`** and renders id
 backends. The synthetic data (an **LFR** physical network + **node2vec** triangle-closing trigrams, with
 each state node's module set to its *previous* node's community) is in the `state-network-data.ts` tab.
 
-Positions here are the **CPU stopgap**: d3gl's in-library force layout places the physical nodes and the
-deterministic **rosette** fans each physical node's state nodes onto a ring around it. The module-aware GPU
-`stateLayout` (which will place state nodes with intra-physical structure) is tracked separately.
+The **physical** positions come from the layout backend the **Backend** control picks (Force, Worker or
+GPU, with `fit: true`; GPU by default), and the deterministic **rosette** fans each physical node's state
+nodes onto a ring around it. On Worker and GPU the rosette is re-derived on every streamed frame, so the
+state and both views converge along with the physical layout. Laying the state nodes out by force around
+their physical node, instead of on the rosette, is tracked in
+[#189](https://github.com/mapequation/d3gl/issues/189).
 
 <ExampleCard files={["state-network/draw.ts"]}>
   <StateNetwork client:visible slot="demo" />
