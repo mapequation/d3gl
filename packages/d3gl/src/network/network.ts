@@ -498,15 +498,6 @@ export interface NetworkLODOptions {
    * instead of raw nodes. Set it to pin an absolute pixel size (the meaning is unchanged).
    */
   expandPx?: number;
-  /**
-   * Spacing multiplier for the overlap test of {@link expandPx} (#426): members count as overlapping until
-   * they are this many times their glyphs' radii apart on screen, so an aggregate opens only once its members
-   * stand that far apart (>1 keeps more aggregates at a given zoom, as a margin between the nodes it opens).
-   * Each glyph's radius in the test is `overlapSpacing × r`, never below half a pixel; the drawn glyphs are
-   * unchanged, and it has no effect where the footprint rule opens an aggregate anyway. Changing it computes
-   * the tree's crowding once (when the layout has settled), not per frame. Default 1: the glyphs' own radii.
-   */
-  overlapSpacing?: number;
   /** Aggregate-glyph fill (any CSS color). Default = `nodeFill`. */
   aggregateFill?: string;
   /**
@@ -940,13 +931,12 @@ export class Network extends BaseEngine {
   /** Whether a spatial tree's gather (lazy or from rows) has run (so {@link superEdgeStats} reports it). */
   private lazyGathered = false;
   /** Version of the leaf style a worker tree aggregates (#343) and computes its crowding with (#426), bumped
-   *  per resolved style, per explicit `expandPx` and per `overlapSpacing`. */
+   *  per resolved style and per explicit `expandPx`. */
   private lodStyleVersion = 0;
   /** The view last sent to a spatial stream (#433), whose kept glyphs' super-edge rows its trees carry. */
   private lodViewPosted: LODView | null = null;
   private lodStyleVersionOf: ResolvedNetworkStyle | null = null;
   private lodStyleExpandPx: number | undefined = undefined;
-  private lodStyleSpacing: number | undefined = undefined;
   /** The leaf style version the worker's LOD stream last received. */
   private lodStylePosted = -1;
   /** Whether the current `lodTree` was built from a provided module hierarchy (N6 / #104). */
@@ -1954,23 +1944,20 @@ export class Network extends BaseEngine {
 
   /**
    * The leaf style a spatial tree aggregates (#343) — radii, declutter importance, flow-border metric,
-   * colours — plus what a worker tree's crowding needs (#426: the size mode, the explicit `expandPx`, the
-   * `overlapSpacing`), and its version, bumped whenever the resolved style, `expandPx` or `overlapSpacing`
-   * changes. A worker-built spatial tree carries the version it was aggregated with, so a stale one is
-   * re-aggregated here.
+   * colours — plus what a worker tree's crowding needs (#426: the size mode, the explicit `expandPx`), and
+   * its version, bumped whenever the resolved style or `expandPx` changes. A worker-built spatial tree
+   * carries the version it was aggregated with, so a stale one is re-aggregated here.
    */
   private lodLeafStyle(graph: NetworkGraph): { style: LeafStyle; version: number } {
     const r = this.resolvedStyleCached(graph);
     const expandPx = this.lodOptions?.expandPx;
-    const spacing = this.lodOptions?.overlapSpacing;
-    if (this.lodStyleVersionOf !== r || this.lodStyleExpandPx !== expandPx || this.lodStyleSpacing !== spacing) {
+    if (this.lodStyleVersionOf !== r || this.lodStyleExpandPx !== expandPx) {
       this.lodStyleVersionOf = r;
       this.lodStyleExpandPx = expandPx;
-      this.lodStyleSpacing = spacing;
       this.lodStyleVersion++;
     }
     const links = drawsLinks(graph, r); // the worker builds super-edge rows only for drawn links (#433)
-    const crowding = { screenSized: r.sizeMode === "screen", expandPx, spacing };
+    const crowding = { screenSized: r.sizeMode === "screen", expandPx };
     return { style: { radii: r.nodeRadii, weight: r.importance, border: r.flowBorder?.metric, colors: r.nodeColors, links, crowding }, version: this.lodStyleVersion };
   }
 
@@ -1988,8 +1975,7 @@ export class Network extends BaseEngine {
       return;
     }
     const screenSized = this.resolvedStyleCached(this.graph).sizeMode === "screen";
-    const { expandPx, overlapSpacing } = this.lodOptions;
-    computeLODCrowding(tree, { screenSized, expandPx: crowdingHorizon(tree, expandPx), spacing: overlapSpacing }, this.lodCrowding);
+    computeLODCrowding(tree, { screenSized, expandPx: crowdingHorizon(tree, this.lodOptions.expandPx) }, this.lodCrowding);
   }
 
   /**

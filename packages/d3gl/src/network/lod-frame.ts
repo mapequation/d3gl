@@ -99,8 +99,6 @@ export interface LeafCrowding {
   screenSized: boolean;
   /** The cut's explicit `expandPx`, or undefined for the tree-adaptive default ({@link crowdingHorizon}). */
   expandPx?: number;
-  /** The overlap test's radius factor (`lod({ overlapSpacing })`, {@link CrowdingOptions.spacing}); default 1. */
-  spacing?: number;
 }
 
 /** A packed spatial frame's shape: what {@link spatialFrameViews} needs to read it. */
@@ -422,7 +420,7 @@ export function lodFrameStep(stream: LODStream, positions: ArrayLike<number>, fr
         tree.radius.set(stream.style.radii.subarray(0, tree.leafCount));
         stream.radiiOf = stream.style;
       }
-      computeLODCrowding(tree, { screenSized: crowd.screenSized, expandPx: crowdingHorizon(tree, crowd.expandPx), spacing: crowd.spacing }, stream.crowding);
+      computeLODCrowding(tree, { screenSized: crowd.screenSized, expandPx: crowdingHorizon(tree, crowd.expandPx) }, stream.crowding);
     } else tree.clearZoom.fill(Infinity); // streamed: the footprint rule alone
     return null;
   }
@@ -466,7 +464,7 @@ export function lodFrameStep(stream: LODStream, positions: ArrayLike<number>, fr
     views.border.fill(0);
   }
   if (!style?.colors) views.color.fill(0); // a reused buffer holds the last frame's colours
-  if (crowding && style?.crowding) computeLODCrowding(tree, { screenSized: style.crowding.screenSized, expandPx: crowdingHorizon(tree, style.crowding.expandPx), spacing: style.crowding.spacing }, stream.crowding);
+  if (crowding && style?.crowding) computeLODCrowding(tree, { screenSized: style.crowding.screenSized, expandPx: crowdingHorizon(tree, style.crowding.expandPx) }, stream.crowding);
   else views.clearZoom.fill(Infinity); // streamed, or no sizing: the footprint rule alone (a reused buffer holds the last frame's)
   // The super-edge rows of the glyphs the main thread's view will keep (#433), into a pooled buffer.
   const links = stream.links;

@@ -49,8 +49,6 @@ import { buildGraph, type NetworkGraph } from "../graph.js";
  */
 const BENCH = !!process.env.BENCH_LOD_CROWDING;
 const BENCH_N = Number(process.env.BENCH_LOD_CROWDING_NODES) || 1_000_000;
-/** The overlap spacings the bench runs its legs at (`BENCH_LOD_CROWDING_SPACINGS`, comma-separated; default 1 and 3). */
-const SPACINGS = (process.env.BENCH_LOD_CROWDING_SPACINGS ?? "1,3").split(",").map(Number).filter((x) => x > 0);
 const ASSERT = !!process.env.PERF_ASSERT;
 const LOCAL_N = 100_000;
 const W = 1280;
@@ -228,16 +226,14 @@ function median(ts: number[]): number {
 
 interface LegResult { name: string; median: number; frontier: number }
 
-function runLegs(fs: Fixture[], reps: number, spacing = 1): LegResult[] {
+function runLegs(fs: Fixture[], reps: number): LegResult[] {
   const out: LegResult[] = [];
-  // A leg at an overlap spacing (`lod({ overlapSpacing })`) is labelled `@s<spacing>`, with the same budget.
-  const tag = spacing === 1 ? "" : `@s${spacing}`;
   for (const f of fs) {
     for (const screenSized of [true, false]) {
-      const mode = (f.wide ? "-wide" : "") + (screenSized ? "" : "-world") + tag;
+      const mode = (f.wide ? "-wide" : "") + (screenSized ? "" : "-world");
       computeLODGeometry(f.tree, f.graph, screenSized ? f.radii : f.worldRadii, f.graph.strength);
       const sc = makeLODCrowdingScratch();
-      const opts = { screenSized, expandPx: crowdingHorizon(f.tree), spacing };
+      const opts = { screenSized, expandPx: crowdingHorizon(f.tree) };
       computeLODCrowding(f.tree, opts, sc); // warm: JIT + scratch high-water
       const warm = { box: sc.box, rmax: sc.rmax, pairA: sc.pairA, order: sc.order, kdBox: sc.kdBox, perm: sc.perm, kdStack: sc.kdStack };
       const passes = lodCrowdingPasses;
@@ -261,10 +257,7 @@ function runLegs(fs: Fixture[], reps: number, spacing = 1): LegResult[] {
         else if (z < Infinity) open++;
       }
       expect(nan, `${f.name}${mode}: NaN clear zooms`).toBe(0);
-      // Packed 12 apart with 3-5 px screen radii, the module map's members all overlap once their radii are taken
-      // 3×: that leg is the crowded case (every module stops at its first pairs), not a vacuous one.
-      if (spacing !== 1 && f.name === "modules" && screenSized) expect(open, `${f.name}${mode}: the crowded case, nothing opens by overlap`).toBe(0);
-      else expect(open, `${f.name}${mode}: aggregates that can open by overlap (not vacuous)`).toBeGreaterThan(0);
+      expect(open, `${f.name}${mode}: aggregates that can open by overlap (not vacuous)`).toBeGreaterThan(0);
       out.push({ name: `pass${mode}:${f.name}`, median: median(ts), frontier: open });
       if (f.wide) continue; // the cut over these is the all-leaves frontier frontier-perf owns
 
@@ -295,7 +288,7 @@ function runLegs(fs: Fixture[], reps: number, spacing = 1): LegResult[] {
   // streamed frame has none), buffers recycled as the engine does.
   const f = fs[0];
   if (f) {
-    const stream = makeSpatialLODStream(f.graph.nodeCount, { radii: f.radii, weight: f.graph.strength, crowding: { screenSized: true, spacing } }, 1);
+    const stream = makeSpatialLODStream(f.graph.nodeCount, { radii: f.radii, weight: f.graph.strength, crowding: { screenSized: true } }, 1);
     let frame = lodFrameStep(stream, f.graph.positions, 0, true);
     const ts: number[] = [];
     for (let i = 1; i <= reps; i++) {
@@ -305,7 +298,7 @@ function runLegs(fs: Fixture[], reps: number, spacing = 1): LegResult[] {
       ts.push(performance.now() - t0);
     }
     expect(stream.pool.length + stream.outstanding, "a warm stream keeps one buffer in play").toBeLessThanOrEqual(2);
-    out.push({ name: `stream${tag}:spatial-web`, median: median(ts), frontier: 0 });
+    out.push({ name: "stream:spatial-web", median: median(ts), frontier: 0 });
   }
   return out;
 }
@@ -326,7 +319,7 @@ function report(results: LegResult[], n: number, label: string): void {
 // little faster than linear: at 1M they sit at a third of their 1,455 ms ceiling).
 const LOCAL_BUDGET: Record<string, number> = { pass: 60, "pass-world": 60, "pass-wide": 150, "pass-wide-world": 150, sweep: 40, "sweep-world": 40, stream: 150 };
 const CONSTANT_MS: Record<string, number> = { pass: 5, "pass-world": 5, "pass-wide": 5, "pass-wide-world": 5, sweep: 10, "sweep-world": 10, stream: 10 };
-const kindOf = (name: string): string => name.slice(0, name.indexOf(":")).replace(/@s[\d.]+$/, "");
+const kindOf = (name: string): string => name.slice(0, name.indexOf(":"));
 
 describe("#426 overlap-aware cut: crowding pass + cut sweep", () => {
   it(`stays within budget at ${LOCAL_N.toLocaleString()} leaves, with the deterministic signatures`, () => {
@@ -335,16 +328,8 @@ describe("#426 overlap-aware cut: crowding pass + cut sweep", () => {
     for (const r of results) expect(r.median, `${r.name} median`).toBeLessThan(LOCAL_BUDGET[kindOf(r.name)] ?? 0);
   }, 120_000);
 
-  // `lod({ overlapSpacing })` widens every glyph's radius in the test: more pairs fall inside a sweep's window and
-  // a walk's reach before a node is crowded. The same legs, signatures and budgets at spacing 3.
-  it(`with overlapSpacing 3: the same legs stay within the same budgets at ${LOCAL_N.toLocaleString()} leaves`, () => {
-    const results = runLegs(fixtures(LOCAL_N), 5, 3);
-    report(results, LOCAL_N, "local");
-    for (const r of results) expect(r.median, `${r.name} median`).toBeLessThan(LOCAL_BUDGET[kindOf(r.name)] ?? 0);
-  }, 120_000);
-
   (BENCH ? it : it.skip)(`bench: the same legs at ${BENCH_N.toLocaleString()} leaves`, () => {
-    const results = SPACINGS.flatMap((spacing) => runLegs(fixtures(BENCH_N), 3, spacing));
+    const results = runLegs(fixtures(BENCH_N), 3);
     report(results, BENCH_N, process.env.BENCH_LOD_CROWDING_LABEL ?? "run");
     if (ASSERT) {
       for (const r of results) {
