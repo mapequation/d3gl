@@ -151,11 +151,12 @@ describe("network() engine", () => {
     ];
     net
       .data(g)
+      // declutterSpacing 1: this is about the cut re-cutting on zoom, not the declutter spacing.
       // 8 px glyphs: a module's two members (15 px apart at k = 1) overlap, so the cut draws the module
       // (#426: it opens an aggregate whose members do not overlap); 30 px apart at k = 2, they no longer do.
       .style({ directed: true, sizeMode: "screen", nodeRadius: 8 })
       // module1 = {0,1} near (70,90); module2 = {2,3} near (120,110); whole graph fits the viewport.
-      .lod({ modules, expandPx: 20 })
+      .lod({ modules, expandPx: 20, declutterSpacing: 1 })
       .layout({ backend: "positions", positions: new Float32Array([70, 90, 85, 90, 115, 110, 130, 110]) });
     expect(net.lodSource).toBe("modules");
 

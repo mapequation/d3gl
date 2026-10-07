@@ -59,7 +59,7 @@ function cacheOf(g: NetworkGraph): NoLodStyleCache {
 function cutAt(tree: LODTree, t: LODTransform, expandPx?: number): LazyCut {
   const sc = makeCutScratch();
   const drawn = cut(tree, t, W, H, { screenSized: true, maxAggregateRadius: 20, recordCulled: true, expandPx }, sc).slice();
-  const kept = declutterFrontier(tree, drawn, t, W, H, { screenSized: true, k: t.k, maxAggregateRadius: 20 }, makeDeclutterFrontierScratch()).slice();
+  const kept = declutterFrontier(tree, drawn, t, W, H, { screenSized: true, k: t.k, maxAggregateRadius: 20, spacing: 1 }, makeDeclutterFrontierScratch()).slice();
   return { drawn, kept, culled: sc.culled.slice(0, sc.culledCount), split: sc.split.slice(0, sc.splitCount) };
 }
 

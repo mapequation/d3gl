@@ -106,7 +106,8 @@ async function interactLeg(
   phase: "cold" | "warm",
 ): Promise<InteractLeg> {
   net.setTransform({ k: 1, x: 0, y: 0 });
-  net.data(graph, { modules }).lod(lod ? { declutter: true } : false);
+  // declutterSpacing 1: the grab looks for a glyph under the pointer; this guard is about drag lag, not the spacing.
+  net.data(graph, { modules }).lod(lod ? { declutter: true, declutterSpacing: 1 } : false);
   if (phase === "warm") {
     net.layout({ backend: "worker", nested: { iterations: ITERATIONS } });
     await net.whenSettled();

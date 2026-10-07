@@ -395,7 +395,8 @@ function mixedLegs(n: number, frames: number, directed = false): LegResult[] {
   const probe = { cut: makeCutScratch(), dc: makeDeclutterFrontierScratch(), lazy: makeLazySuperEdgesScratch() };
   const run = (t: LODTransform, expandPx: number, s: typeof probe, leaf: boolean) => {
     const drawn = cut(f.tree, t, W, H, { ...opts, expandPx, recordCulled: true }, s.cut);
-    const kept = declutterFrontier(f.tree, drawn, t, W, H, { ...opts, k: t.k }, s.dc);
+    // spacing 1: the fixture search below is tuned to the footprint-only view, not the default declutter spacing
+    const kept = declutterFrontier(f.tree, drawn, t, W, H, { ...opts, k: t.k, spacing: 1 }, s.dc);
     const covers = { drawn, kept, culled: s.cut.culled.subarray(0, s.cut.culledCount), split: s.cut.split.subarray(0, s.cut.splitCount) };
     const out = lazySuperEdges(f.tree, covers, leaf ? leafStyle : plainStyle, visibleWorldRect(t, W, H), f.graph.csr, inc, s.lazy, leaf ? sourceEdges : undefined);
     let leaves = 0;

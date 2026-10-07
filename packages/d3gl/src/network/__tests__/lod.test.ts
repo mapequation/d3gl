@@ -323,22 +323,22 @@ describe("declutterFrontier", () => {
 
   it("drops lower-importance glyphs covered by a kept one, keeping the higher-strength member", () => {
     const tree = treeOnLine();
-    // screen-sized radius 4; pairs (0,1) at x=0,2 and (2,3) at x=10,12 overlap (gap 2 < radius 4).
-    // Within each pair the higher-strength node (1 and 2, strength 3) survives; 0 and 3 (strength 2) drop.
+    // screen-sized radius 4, default spacing 2 (centres must be >= 16px apart): every pair here is closer
+    // (0,1: 2px; 1,2: 8px; 2,3: 2px), so only the strongest glyph survives. 1 and 2 tie on strength 3; 1 comes first.
     const kept = declutterFrontier(tree, new Uint32Array([0, 1, 2, 3]), { k: 1, x: 0, y: 0 }, 200, 200, {
       screenSized: true,
       k: 1,
     });
-    expect(Array.from(kept)).toEqual([1, 2]);
+    expect(Array.from(kept)).toEqual([1]);
   });
 
   it("keeps every glyph when nothing overlaps", () => {
     const tree = treeOnLine();
-    // Aggregates at x = 1 and x = 11, radius √32 ≈ 5.66 (sum ≈ 11.3). At k = 2 their screen centres
-    // are 20px apart (> 11.3) so they don't overlap → both kept. (Screen-sized radius stays constant.)
-    const kept = declutterFrontier(tree, new Uint32Array([4, 5]), { k: 2, x: 0, y: 0 }, 200, 200, {
+    // Aggregates at x = 1 and x = 11, radius √32 ≈ 5.66 (sum ≈ 11.3). Their screen centres
+    // are 30px apart at k = 3 (> 2 × 11.3 = 22.6, the default spacing 2) → both kept. (Screen-sized radius stays constant.)
+    const kept = declutterFrontier(tree, new Uint32Array([4, 5]), { k: 3, x: 0, y: 0 }, 200, 200, {
       screenSized: true,
-      k: 2,
+      k: 3,
     });
     expect(Array.from(kept).sort((a, b) => a - b)).toEqual([4, 5]);
   });
