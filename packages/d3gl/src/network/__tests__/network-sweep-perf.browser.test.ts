@@ -149,6 +149,17 @@ function drawnLinks(layers: readonly InstancedLayer[]): number {
   return n;
 }
 
+/** Instances in the gathered layers alone (`links` / `arrows`): the links that touch an aggregate (#447). */
+function gatheredLinks(layers: readonly InstancedLayer[]): number {
+  let n = 0;
+  for (const l of layers) {
+    if (l.primitive === "lines" && l.name === "links") n += l.lines.count;
+    else if (l.primitive === "half-arrows" && l.name === "links") n += l.halfArrows.count;
+    else if (l.primitive === "arrows" && l.name === "arrows") n += l.arrows.count;
+  }
+  return n;
+}
+
 /** Bytes of the columns an in-place update ALWAYS writes (positions; a circle's radius/colour/ring). */
 function alwaysWrittenBytes(layers: readonly InstancedLayer[]): number {
   let bytes = 0;
@@ -258,6 +269,8 @@ let lodSpatialHold: HoldLeg;
 let spatialHeldStats: { hits: number; misses: number; visits: number; entries: number; leafRows: number } | null = null;
 let spatialSweepStats: { hits: number; misses: number; visits: number } | null = null;
 let lodOffSelected: Leg;
+/** Pans across a view that gathers no link, per link style; `gathered` is each pan step's gathered-link count. */
+const emptyViewLegs: [string, { leg: Leg; gathered: number[] }][] = [];
 /** Per-frame upload allowed per selected node on the full-detail leg: 2x the ring overlay's 24-byte
  *  instance. A deterministic count, so absolute (never through `perfBudget`). */
 const RING_BYTES_PER_SELECTED = 48;
@@ -413,6 +426,23 @@ beforeAll(async () => {
     net.setTransform(held); // an unchanged re-emit: every aggregate's row from the memo
     spatialHeldStats = net.superEdgeStats;
     lodSpatialHold = runHold();
+    // A view that gathers no link, same engine: pan off the graph and back. The gathered link layers hold only the
+    // links that touch an aggregate (#447), so they empty there, and must keep their GPU buffers through it rather
+    // than be dropped and rebuilt on the next frame that gathers one. Directed lines draw lines + arrowheads,
+    // half-arrows the third primitive; each restyle is a registration event, settled before the leg.
+    const away = { ...held, x: held.x - 100 * W };
+    const pan = [held, away, held, away, held];
+    for (const [name, restyle] of [
+      ["directed lines", { directed: true }],
+      ["half-arrows", { linkStyle: "half-arrow" }],
+    ] as const) {
+      net.style(restyle);
+      net.setTransform(held);
+      const leg = runLeg(pan);
+      const reps = layerSpy.frames.length / pan.length; // sweepFrames repeats each step
+      emptyViewLegs.push([name, { leg, gathered: pan.map((_, s) => gatheredLinks(layerSpy.frames[s * reps] ?? [])) }]);
+    }
+    net.style({ directed: false, linkStyle: "line" });
     // Full detail again, with a managed selection (#428): the no-LOD selected-flag cache is keyed on the
     // selection set, so a key that stopped matching per frame would rebuild and re-upload the flags on
     // every zoom step. The toggle and the select() are registration events, outside the sweep.
@@ -564,6 +594,17 @@ describe(`network() engine zoom sweep — per-frame cost at N=${N.toLocaleString
     expect(lodSpatialHold.freshColumns, "spatial: style columns re-emitted as new arrays on an unchanged view").toEqual([]);
     expect(lodSpatialHold.uploadedBytes).toBeLessThanOrEqual(lodSpatialHold.alwaysWrittenBytes);
     expect(lodSpatialHold.linkStrokeCalls, "spatial: link colours re-resolved on an unchanged view").toBe(0);
+  });
+
+  it("LOD ON, a view that gathers no link: the gathered link layers keep their GPU buffers", () => {
+    expect(emptyViewLegs.map(([name]) => name)).toEqual(["directed lines", "half-arrows"]);
+    for (const [name, { leg, gathered }] of emptyViewLegs) {
+      // Non-vacuity: the held view gathers links, the view off the graph gathers none.
+      expect(gathered[0], `${name}: the held view gathered no link`).toBeGreaterThan(0);
+      expect(gathered[1], `${name}: the view off the graph gathered links`).toBe(0);
+      expect(leg.buffersCreated, `${name}: GPU buffers were created panning across a view that gathers no link`).toBe(0);
+      expect(leg.buffersDeleted, `${name}: GPU buffers were destroyed panning across a view that gathers no link`).toBe(0);
+    }
   });
 
   it("LOD ON, held view: an unchanged re-emit hands back the same style columns and uploads only the endpoints", () => {
