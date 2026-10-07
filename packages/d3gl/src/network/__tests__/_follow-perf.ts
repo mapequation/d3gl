@@ -30,12 +30,16 @@ import type { ViewTransform } from "../../core/index.js";
  * Frames are stepped by hand (`requestAnimationFrame` queued, flushed here) on a virtual clock 16 ms apart,
  * once the worker's first frame has started the ease, so every timed frame is mid-ease; no worker message is
  * taken meanwhile, so each is the ease's own. Both reduction states on ONE engine (#287).
+ *
+ * Shared by `network-warm-nested-follow-perf.browser.test.ts` and `network-warm-flat-follow-perf.browser.test.ts`: the
+ * legs are ~160 100k-node frames of SwiftShader work, 284 s in one file against the tier's 300 s per-file
+ * watchdog, so each kind runs in its own file (same N, ROUNDS and assertions).
  */
 
-const N = perfN(100_000, { max: 200_000 });
+export const N = perfN(100_000, { max: 200_000 });
 const W = 640;
 const H = 400;
-const FRAMES = 10;
+export const FRAMES = 10;
 const ROUNDS = 2;
 const SETUP_MS = perfBudget(240_000 + N);
 // The transition guard's ceilings (network-transition-perf.browser.test.ts), for the same fixture: a followed
@@ -112,12 +116,10 @@ interface Leg {
   replayed: Phase;
 }
 
+/** Follows `kind`'s stream with LOD off, then on, on one engine, and registers the guard's tests. */
+export function defineFollowGuard(kind: "nested" | "flat"): void {
 let off: Leg;
 let on: Leg;
-/** The same frames, followed on a warm **force** layout's stream (#454: Nested layout switched off). */
-let flatOff: Leg;
-let flatOn: Leg;
-
 beforeAll(async () => {
   const realRaf = globalThis.requestAnimationFrame;
   const realCaf = globalThis.cancelAnimationFrame;
@@ -186,19 +188,19 @@ beforeAll(async () => {
     };
 
     /** The followed stream: a warm nested map's, or a warm force layout's (the same follower, #454). */
-    const leg = async (kind: "nested" | "flat"): Promise<Leg> => {
+    const leg = async (stream: "nested" | "flat" = kind, rounds = ROUNDS): Promise<Leg> => {
       const followed: Phase[] = [];
       const replayed: Phase[] = [];
       // A fitted streamed frame: the fit on, as `layout({ fit: true })` sets it, and the repaint a worker message
       // requests (the transition guard's fit-on-layout leg drives it the same way).
       const internals = net as unknown as { fitOnLayout: boolean };
-      for (let round = 0; round < ROUNDS; round++) {
+      for (let round = 0; round < rounds; round++) {
         // The followed stream, from `a`: wait for the worker's first frame to start the ease, then time its frames.
         graph.positions.set(a);
         let virtual = 0;
         const clock = vi.spyOn(performance, "now").mockImplementation(() => virtual);
         try {
-          if (kind === "nested") net.layout({ backend: "worker", nested: { warm: true, iterations: 1 }, fit: true });
+          if (stream === "nested") net.layout({ backend: "worker", nested: { warm: true, iterations: 1 }, fit: true });
           else net.layout({ backend: "worker", warm: true, fit: true });
           const prev = a.slice();
           let view: ViewTransform = { k: 1, x: 0, y: 0 };
@@ -249,12 +251,10 @@ beforeAll(async () => {
       return { followed: best(followed), replayed: best(replayed) };
     };
 
-    off = await leg("nested");
-    flatOff = await leg("flat");
+    off = await leg();
     net.lod({}); // the module tree: a registration event (tree + geometry), then the same two phases
     flush();
-    on = await leg("nested");
-    flatOn = await leg("flat");
+    on = await leg();
     net.destroy();
   } finally {
     globalThis.requestAnimationFrame = realRaf;
@@ -263,12 +263,10 @@ beforeAll(async () => {
   }
 }, SETUP_MS);
 
-describe(`network() followed warm stream (#454) — per-frame cost vs a fitted streamed frame at N=${N.toLocaleString()}`, () => {
+describe(`network() followed warm stream, ${kind} (#454) — per-frame cost vs a fitted streamed frame at N=${N.toLocaleString()}`, () => {
   for (const [name, get, ceiling] of [
-    ["LOD OFF", () => off, FRAME_MS_OFF],
-    ["LOD ON", () => on, FRAME_MS_ON],
-    ["LOD OFF, warm force layout", () => flatOff, FRAME_MS_OFF],
-    ["LOD ON, warm force layout", () => flatOn, FRAME_MS_ON],
+    [kind === "nested" ? "LOD OFF" : "LOD OFF, warm force layout", () => off, FRAME_MS_OFF],
+    [kind === "nested" ? "LOD ON" : "LOD ON, warm force layout", () => on, FRAME_MS_ON],
   ] as const) {
     it(`${name}: every timed frame is the ease's, and the streamed frames really upload (non-vacuity)`, () => {
       const { replayed: streamed, followed } = get();
@@ -305,3 +303,4 @@ describe(`network() followed warm stream (#454) — per-frame cost vs a fitted s
     });
   }
 });
+}
