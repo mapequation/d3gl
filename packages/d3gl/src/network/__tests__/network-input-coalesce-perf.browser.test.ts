@@ -247,14 +247,14 @@ beforeAll(async () => {
     /** A screen point near the view centre with a drawn node glyph under it (a leaf, or an aggregate with LOD
      *  on): what the drag grabs. Searched outward from the centre, at the base view. */
     const grabPoint = (): [number, number] => {
-      for (let d = 0; d < 40; d++) {
+      for (let d = 0; d < 120; d++) { // 2x declutter spacing leaves a dense frontier sparser: glyphs can sit further apart
         for (let a = 0; a < 8; a++) {
           const x = W / 2 + d * Math.cos((a * Math.PI) / 4);
           const y = H / 2 + d * Math.sin((a * Math.PI) / 4);
           if (net.pick(x, y)) return [x, y];
         }
       }
-      throw new Error("no node glyph near the view centre to grab");
+      throw new Error("no node glyph within 120px of the view centre to grab");
     };
 
     const leg = async (lod: boolean): Promise<Leg> => {
