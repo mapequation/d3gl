@@ -23,7 +23,7 @@ describe("network.labels() — frontier labels (#105 N7b)", () => {
     const modules = [
       { id: 0, path: [1, 1] }, { id: 1, path: [1, 2] }, { id: 2, path: [2, 1] }, { id: 3, path: [2, 2] },
     ];
-    net.data(g).style({ directed: true }).lod({ modules, expandPx: 20 }).layout({ backend: "positions", positions: new Float32Array([70, 90, 85, 90, 115, 110, 130, 110]) });
+    net.data(g).style({ directed: true, nodeRadius: 8 }).lod({ modules, expandPx: 20 }).layout({ backend: "positions", positions: new Float32Array([70, 90, 85, 90, 115, 110, 130, 110]) }); // members 15 apart overlap (#426)
     net.labels({ max: 8, labelOf: (id, info) => (info.aggregate ? `mod${id}·${info.count}` : `n${id}`) });
     net.setTransform({ k: 1, x: 0, y: 0 }); // two module aggregates on the frontier
 
@@ -47,7 +47,7 @@ describe("network.labels() — frontier labels (#105 N7b)", () => {
     const modules = [
       { id: 0, path: [1, 1] }, { id: 1, path: [1, 2] }, { id: 2, path: [2, 1] }, { id: 3, path: [2, 2] },
     ];
-    net.data(g).style({ directed: true }).lod({ modules, expandPx: 20 }).layout({ backend: "positions", positions: new Float32Array([70, 90, 85, 90, 115, 110, 130, 110]) });
+    net.data(g).style({ directed: true, nodeRadius: 8 }).lod({ modules, expandPx: 20 }).layout({ backend: "positions", positions: new Float32Array([70, 90, 85, 90, 115, 110, 130, 110]) }); // members 15 apart overlap (#426)
     net.labels({ max: 8, labelOf: (id, info) => (info.aggregate ? `agg` : `leaf${id}`) });
 
     net.setTransform({ k: 1, x: 0, y: 0 });
@@ -68,7 +68,7 @@ describe("network.labels() — frontier labels (#105 N7b)", () => {
     const modules = [
       { id: 0, path: [1, 1] }, { id: 1, path: [1, 2] }, { id: 2, path: [2, 1] }, { id: 3, path: [2, 2] },
     ];
-    net.data(g).style({ directed: true }).lod({ modules, expandPx: 20 }).layout({ backend: "positions", positions: new Float32Array([70, 90, 85, 90, 115, 110, 130, 110]) });
+    net.data(g).style({ directed: true, nodeRadius: 8 }).lod({ modules, expandPx: 20 }).layout({ backend: "positions", positions: new Float32Array([70, 90, 85, 90, 115, 110, 130, 110]) }); // members 15 apart overlap (#426)
     // No `max` → show all; label only aggregates (null for leaves).
     net.labels({ labelOf: (_id, info) => (info.aggregate ? `${info.count}` : null) });
     net.setTransform({ k: 1, x: 0, y: 0 });

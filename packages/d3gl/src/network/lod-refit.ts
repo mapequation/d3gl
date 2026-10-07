@@ -15,8 +15,8 @@
  * it already built is skipped, so the rebuilds stop once the layout has converged.
  */
 import { buildHierarchy, type CoarseLevel, type CoarsenOptions, type Hierarchy } from "./coarsen.js";
-import { flattenHierarchyToTopology, type LODPositionTree, type LODTopology } from "./lod.js";
-import { lodFrameStep, makeSpatialLODStream, makeStructureLODStream, type LODStream } from "./lod-frame.js";
+import { flattenHierarchyToTopology, type LODTopology } from "./lod.js";
+import { lodFrameStep, makeSpatialLODStream, makeStructureLODStream, type LODStream, type StructureStreamTree } from "./lod-frame.js";
 import { lodGeometryByteLength, lodGeometryViews, type CoarsenMessage, type LODGeometryRequest, type WorkerToMain } from "./worker-protocol.js";
 import { coarseSeedPlan, seedPlanTransferables } from "./gpu/seed-plan.js";
 
@@ -33,10 +33,10 @@ export function coarsenForRefit(
   graph: CoarseLevel,
   coarsen?: CoarsenOptions,
   hierarchy: Hierarchy = buildHierarchy(graph, coarsen),
-): { topology: LODTopology; tree: LODPositionTree } {
+): { topology: LODTopology; tree: StructureStreamTree } {
   const topology = flattenHierarchyToTopology(hierarchy, graph.nodeCount, graph);
   const { size } = topology;
-  const tree: LODPositionTree = {
+  const tree: StructureStreamTree = {
     size,
     leafCount: topology.leafCount,
     levelCount: topology.levelCount,
@@ -47,6 +47,9 @@ export function coarsenForRefit(
     cx: new Float32Array(0),
     cy: new Float32Array(0),
     extent: new Float32Array(0),
+    clearZoom: new Float32Array(0),
+    radius: new Float32Array(0),
+    leafBranching: 0,
   };
   return { topology, tree };
 }
@@ -55,12 +58,13 @@ export function coarsenForRefit(
  * Bind `tree`'s position geometry (`cx`/`cy`/`extent`) to `buffer` ({@link lodGeometryViews}), where the next
  * refit writes it, and return the whole geometry as one view over `buffer`. Allocates only the views.
  */
-function bindGeometry(tree: LODPositionTree, buffer: ArrayBufferLike): Float32Array {
+function bindGeometry(tree: StructureStreamTree, buffer: ArrayBufferLike): Float32Array {
   const views = lodGeometryViews(buffer, tree.size);
   tree.cx = views.cx;
   tree.cy = views.cy;
   tree.extent = views.extent;
-  return new Float32Array(buffer, 0, 3 * tree.size);
+  tree.clearZoom = views.clearZoom;
+  return new Float32Array(buffer, 0, 4 * tree.size);
 }
 
 /**
@@ -75,11 +79,14 @@ export function answerLODGeometry(stream: LODStream, msg: LODGeometryRequest, se
   const { positions } = msg;
   if (stream.kind === "structure") {
     const geometry = bindGeometry(stream.tree, msg.geometry?.buffer ?? new ArrayBuffer(lodGeometryByteLength(stream.tree.size)));
+    // No crowding computed here (#426: the relay gets no leaf style for a structure tree, so its `clearZoom`
+    // stays `Infinity`, never a zeroed 0, which would read as "every member clears"); the main thread computes
+    // it once the layout settles.
     lodFrameStep(stream, positions, msg.frame);
     send({ type: "lod-geometry", positions, geometry }, [positions.buffer, geometry.buffer]);
     return;
   }
-  const lodFrame = lodFrameStep(stream, positions, msg.frame);
+  const lodFrame = lodFrameStep(stream, positions, msg.frame, msg.settled === true);
   if (!lodFrame) send({ type: "lod-geometry", positions }, [positions.buffer]);
   else if (lodFrame.rows) send({ type: "lod-geometry", positions, lodFrame }, [positions.buffer, lodFrame.buffer, lodFrame.rows.buffer]);
   else send({ type: "lod-geometry", positions, lodFrame }, [positions.buffer, lodFrame.buffer]);

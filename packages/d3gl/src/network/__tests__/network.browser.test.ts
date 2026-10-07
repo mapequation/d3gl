@@ -151,7 +151,9 @@ describe("network() engine", () => {
     ];
     net
       .data(g)
-      .style({ directed: true })
+      // 8 px glyphs: a module's two members (15 px apart at k = 1) overlap, so the cut draws the module
+      // (#426: it opens an aggregate whose members do not overlap); 30 px apart at k = 2, they no longer do.
+      .style({ directed: true, sizeMode: "screen", nodeRadius: 8 })
       // module1 = {0,1} near (70,90); module2 = {2,3} near (120,110); whole graph fits the viewport.
       .lod({ modules, expandPx: 20 })
       .layout({ backend: "positions", positions: new Float32Array([70, 90, 85, 90, 115, 110, 130, 110]) });
@@ -252,10 +254,11 @@ describe("network() engine", () => {
     ];
     // A is spread WIDE (expands to its leaves at k=1); B is TIGHT (stays one collapsed aggregate) →
     // a mixed-level frontier {leaf0, leaf1, moduleB}. Declutter off so all three survive.
+    // 6 px glyphs: B's two members (10 px apart) overlap, so it stays collapsed (#426).
     const setup = (crossLevelEdges: boolean) =>
       net
         .data(g)
-        .style({ directed: true })
+        .style({ directed: true, sizeMode: "screen", nodeRadius: 6 })
         .lod({ modules, expandPx: 60, declutter: false, crossLevelEdges })
         .layout({ backend: "positions", positions: new Float32Array([20, 100, 180, 100, 100, 40, 110, 40]) });
     const paths = () => (net.toSVG().match(/<path/g) ?? []).length;
@@ -312,10 +315,11 @@ describe("network() engine", () => {
     // All rgba(...) opacities present in the export.
     const alphas = () => [...net.toSVG().matchAll(/rgba\(\s*\d+\s*,\s*\d+\s*,\s*\d+\s*,\s*([0-9.]+)\s*\)/g)].map((m) => Number(m[1]));
     const circles = () => (net.toSVG().match(/<circle/g) ?? []).length;
+    // 8 px glyphs: each module's members (15 px apart) overlap, so the footprint rule decides (#426).
     const setup = (crossFade: number) =>
       net
         .data(g)
-        .style({ directed: true })
+        .style({ directed: true, sizeMode: "screen", nodeRadius: 8 })
         .lod({ modules, expandPx: 48, declutter: false, crossFade })
         .layout({ backend: "positions", positions: new Float32Array([70, 90, 85, 90, 115, 110, 130, 110]) });
 
@@ -687,9 +691,11 @@ describe("network() picking (#105 N7a)", () => {
     const net = network(host(), { width: 320, height: 200 });
     await net.whenReady();
     // Two strongly-bound pairs ({0,1},{2,3}) → aggregates 4 and 5 at minNodes:2. Centroids at world
-    // x = 50 and 250; spread far enough that they expand to leaves at k=1 but collapse zoomed out.
+    // x = 50 and 250; spread far enough that they expand to leaves at k=1 but collapse zoomed out, where
+    // their 21 px glyphs overlap (40 px apart: #426 keeps a pair collapsed only while its members overlap).
     net
       .data(buildGraph({ nodeCount: 4, source: [0, 2, 1], target: [1, 3, 2], weight: [2, 2, 1] }))
+      .style({ sizeMode: "screen", nodeRadius: 21 })
       .lod({ coarsen: { minNodes: 2 }, expandPx: 48, declutter: false })
       .layout({ backend: "positions", positions: new Float32Array([0, 0, 100, 0, 200, 0, 300, 0]) });
 

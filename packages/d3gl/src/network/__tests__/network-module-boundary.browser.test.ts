@@ -55,7 +55,9 @@ function uses(svg: string, attr: "stroke" | "fill", css: string): number {
   return (svg.match(new RegExp(`${attr}="rgba\\(${r}, ?${g}, ?${b}`, "g")) ?? []).length;
 }
 
-const STYLE: NetworkStyle = { directed: true, linkStyle: "half-arrow", linkBend: 0.15, nodeRadius: 1.5, nodeFill: "#7f7f7f", linkWidth: 3, linkStroke: LINK };
+// nodeRadius 3: a bottom module's three leaves overlap one another, so the cut keeps it collapsed until its
+// footprint opens it (#426 opens an aggregate whose members' glyphs do not overlap, whatever its size).
+const STYLE: NetworkStyle = { directed: true, linkStyle: "half-arrow", linkBend: 0.15, nodeRadius: 3, nodeFill: "#7f7f7f", linkWidth: 3, linkStroke: LINK };
 
 /** A laid-out engine (the nested layout, synchronously) at zoom `k` about the map's centre. */
 async function engine(backend: (typeof BACKENDS)[number], lod: NetworkLODOptions, k: number, style: NetworkStyle = STYLE): Promise<Network> {

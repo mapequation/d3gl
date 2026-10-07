@@ -255,7 +255,7 @@ let lodHoldHalfArrows: HoldLeg;
 let lodDense: Leg;
 let lodSpatial: Leg;
 let lodSpatialHold: HoldLeg;
-let spatialHeldStats: { hits: number; misses: number; visits: number } | null = null;
+let spatialHeldStats: { hits: number; misses: number; visits: number; entries: number; leafRows: number } | null = null;
 let spatialSweepStats: { hits: number; misses: number; visits: number } | null = null;
 let lodOffSelected: Leg;
 /** Per-frame upload allowed per selected node on the full-detail leg: 2x the ring overlay's 24-byte
@@ -410,7 +410,7 @@ beforeAll(async () => {
     lodSpatial = runLeg();
     spatialSweepStats = net.superEdgeStats;
     net.setTransform(held);
-    net.setTransform(held); // an unchanged re-emit: every row from the memo
+    net.setTransform(held); // an unchanged re-emit: every aggregate's row from the memo
     spatialHeldStats = net.superEdgeStats;
     lodSpatialHold = runHold();
     // Full detail again, with a managed selection (#428): the no-LOD selected-flag cache is keyed on the
@@ -553,10 +553,13 @@ describe(`network() engine zoom sweep — per-frame cost at N=${N.toLocaleString
     expect(uploadPerFrame, `spatial sweep uploaded ${(uploadPerFrame / 1024).toFixed(0)} KB per frame`).toBeLessThan(LOD_UPLOAD_BYTES_PER_FRAME);
     expect(lodSpatial.worstFrameMs, `spatial: worst frame ${lodSpatial.worstFrameMs.toFixed(2)}ms at N=${N.toLocaleString()}`).toBeLessThan(FRAME_MS_LOD);
     expectDeclutterBounded("spatial sweep", lodSpatial);
-    // Deterministic: a held view walks no edge and rebuilds no row — every kept glyph's links from the memo.
+    // Deterministic: a held view walks no edge and rebuilds no row. Every kept glyph's links come from the memo, a
+    // kept leaf's too (#463: its row records the neighbours that were kept leaves, whose links are drawn as graph
+    // edges, #447), so no kept leaf's row is rebuilt either.
     expect(spatialHeldStats?.misses, "held view: rows rebuilt").toBe(0);
     expect(spatialHeldStats?.visits, "held view: edge incidences walked").toBe(0);
-    expect(spatialHeldStats?.hits, "held view: rows answered from the memo").toBeGreaterThan(0);
+    expect(spatialHeldStats?.leafRows, "held view: kept-leaf rows rebuilt").toBe(0);
+    expect((spatialHeldStats?.hits ?? 0) + (spatialHeldStats?.entries ?? 0), "held view: rows from the memo or the leaves' edges").toBeGreaterThan(0);
     // …and the held frames hand back the same style columns and upload only the endpoints.
     expect(lodSpatialHold.freshColumns, "spatial: style columns re-emitted as new arrays on an unchanged view").toEqual([]);
     expect(lodSpatialHold.uploadedBytes).toBeLessThanOrEqual(lodSpatialHold.alwaysWrittenBytes);

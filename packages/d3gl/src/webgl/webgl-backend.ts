@@ -5,7 +5,11 @@ import type { Backend, RenderLayer, VectorLayer, RenderDelta, ViewTransform, Ins
 import type { GroupBuffers, GroupBufferDelta, PassThroughLayer, DrawBatch, StyleTables, DrawableVector, TextData } from "../core/index.js";
 import { GroupRenderer } from "./renderer.js";
 import { InstancedCircles, InstancedPie, InstancedLines, InstancedArrows, InstancedHalfArrows } from "./instanced.js";
+import { IndexedLines, IndexedArrows, IndexedHalfArrows } from "./indexed-links.js";
 import { PickReadback } from "./pick-readback.js";
+
+/** A link layer's renderer: by instance (attribute arrays) or by edge id (#447, per-edge tables). */
+type LinkRenderer = InstancedLines | InstancedArrows | InstancedHalfArrows | IndexedLines | IndexedArrows | IndexedHalfArrows;
 import { clipFromView } from "./transform.js";
 import { toPNG } from "./png.js";
 import { svgFromLayers } from "../svg/index.js";
@@ -23,7 +27,7 @@ export class WebGLBackend implements Backend {
   private layers = new Map<string, RenderLayer>();
   private order: string[] = [];
   /** GPU-instanced primitive layers (the network lane), drawn after retained layers. */
-  private instanced = new Map<string, InstancedCircles | InstancedPie | InstancedLines | InstancedArrows | InstancedHalfArrows>();
+  private instanced = new Map<string, InstancedCircles | InstancedPie | LinkRenderer>();
   /** Names of instanced layers that opted into the GPU-readback pick pass (#141; link layers only). */
   private pickable = new Set<string>();
   /** Offscreen id-encoded pick target (device px). Lazily created when first picked; resized on demand. */
@@ -255,18 +259,22 @@ export class WebGLBackend implements Backend {
     this.instanced.get(layer.name)?.destroy();
     // Link layers (lines/arrows/half-arrows) may opt into the GPU-readback pick pass (#141); the
     // primitive builds an extra id-encoded pick model when `pick` is set. Node glyphs (circles, pie) never do.
+    // A link layer with an `index` (#447) draws by edge id from per-edge tables (indexed-links.ts).
     const pick =
       (layer.primitive === "lines" || layer.primitive === "arrows" || layer.primitive === "half-arrows") && !!layer.pickable;
-    const r =
-      layer.primitive === "lines"
-        ? new InstancedLines(this.device, layer.lines, this.width, this.height, pick)
-        : layer.primitive === "arrows"
-          ? new InstancedArrows(this.device, layer.arrows, this.width, this.height, pick)
-          : layer.primitive === "half-arrows"
-            ? new InstancedHalfArrows(this.device, layer.halfArrows, this.width, this.height, pick)
-            : layer.primitive === "pie"
-              ? new InstancedPie(this.device, layer.pie, this.width, this.height)
-              : new InstancedCircles(this.device, layer.circles, this.width, this.height);
+    let r: InstancedCircles | InstancedPie | LinkRenderer;
+    if (layer.primitive === "lines") {
+      r = layer.lines.index ? new IndexedLines(this.device, layer.lines, this.width, this.height, pick) : new InstancedLines(this.device, layer.lines, this.width, this.height, pick);
+      r.setPickBase(layer.pickBase ?? 0);
+    } else if (layer.primitive === "arrows") {
+      r = layer.arrows.index ? new IndexedArrows(this.device, layer.arrows, this.width, this.height, pick) : new InstancedArrows(this.device, layer.arrows, this.width, this.height, pick);
+      r.setPickBase(layer.pickBase ?? 0);
+    } else if (layer.primitive === "half-arrows") {
+      r = layer.halfArrows.index ? new IndexedHalfArrows(this.device, layer.halfArrows, this.width, this.height, pick) : new InstancedHalfArrows(this.device, layer.halfArrows, this.width, this.height, pick);
+      r.setPickBase(layer.pickBase ?? 0);
+    } else {
+      r = layer.primitive === "pie" ? new InstancedPie(this.device, layer.pie, this.width, this.height) : new InstancedCircles(this.device, layer.circles, this.width, this.height);
+    }
     r.setTransform(this.clipMatrix);
     r.setViewport(this.width, this.height);
     r.setSizeMode(layer.sizeMode ?? "world");
@@ -279,8 +287,8 @@ export class WebGLBackend implements Backend {
   /**
    * Update-in-place for instanced layers: if the layer already exists as the matching
    * primitive type, call `update()` (GPU sub-upload, no teardown). Lines/arrows/half-arrows
-   * return `false` from `update()` when a structural property changed (samples, half-flag) —
-   * fall back to `setInstancedLayer` (destroy+recreate) in that case. Also recreates when the
+   * return `false` from `update()` when a structural property changed (samples, half-flag, indexed or not)
+   * — fall back to `setInstancedLayer` (destroy+recreate) in that case. Also recreates when the
    * primitive type changes (e.g. lines → arrows) OR when the layer's `pickable` state no longer
    * matches the existing renderer's pick-model presence (toggling `pickLinks` builds/drops the
    * id-encoded pick model, which `update()` can't do in place — see #141/#179).
@@ -291,37 +299,40 @@ export class WebGLBackend implements Backend {
     // never builds/drops the pick model, so an in-place update would leave the wrong pick state.
     const wantPick =
       (layer.primitive === "lines" || layer.primitive === "arrows" || layer.primitive === "half-arrows") && !!layer.pickable;
-    const pickMismatch = existing !== undefined && !(existing instanceof InstancedCircles) && wantPick !== this.pickable.has(layer.name);
+    const pickMismatch = existing !== undefined && !(existing instanceof InstancedCircles) && !(existing instanceof InstancedPie) && wantPick !== this.pickable.has(layer.name);
     if (existing instanceof InstancedCircles && layer.primitive === "circles") {
       existing.update(this.device, layer.circles);
       existing.setSizeMode(layer.sizeMode ?? "world");
-    } else if (existing instanceof InstancedPie && layer.primitive === "pie") {
+      return;
+    }
+    if (existing instanceof InstancedPie && layer.primitive === "pie") {
       existing.update(this.device, layer.pie);
       existing.setSizeMode(layer.sizeMode ?? "world");
-    } else if (existing instanceof InstancedLines && layer.primitive === "lines" && !pickMismatch) {
-      if (existing.update(this.device, layer.lines)) {
-        existing.setSizeMode(layer.sizeMode ?? "world");
-        this.pickDirty = true;
-      } else {
-        this.setInstancedLayer(layer);
-      }
-    } else if (existing instanceof InstancedArrows && layer.primitive === "arrows" && !pickMismatch) {
-      if (existing.update(this.device, layer.arrows)) {
-        existing.setSizeMode(layer.sizeMode ?? "world");
-        this.pickDirty = true;
-      } else {
-        this.setInstancedLayer(layer);
-      }
-    } else if (existing instanceof InstancedHalfArrows && layer.primitive === "half-arrows" && !pickMismatch) {
-      if (existing.update(this.device, layer.halfArrows)) {
-        existing.setSizeMode(layer.sizeMode ?? "world");
-        this.pickDirty = true;
-      } else {
-        this.setInstancedLayer(layer);
-      }
-    } else {
-      this.setInstancedLayer(layer);
+      return;
     }
+    let updated = false;
+    if (!pickMismatch) {
+      if (layer.primitive === "lines" && (existing instanceof InstancedLines || existing instanceof IndexedLines)) updated = existing.update(this.device, layer.lines);
+      else if (layer.primitive === "arrows" && (existing instanceof InstancedArrows || existing instanceof IndexedArrows)) updated = existing.update(this.device, layer.arrows);
+      else if (layer.primitive === "half-arrows" && (existing instanceof InstancedHalfArrows || existing instanceof IndexedHalfArrows)) updated = existing.update(this.device, layer.halfArrows);
+    }
+    if (updated && existing && !(existing instanceof InstancedCircles) && !(existing instanceof InstancedPie) && layer.primitive !== "circles" && layer.primitive !== "pie") {
+      existing.setSizeMode(layer.sizeMode ?? "world");
+      existing.setPickBase(layer.pickBase ?? 0);
+      this.pickDirty = true;
+      return;
+    }
+    this.setInstancedLayer(layer);
+  }
+
+  orderInstancedLayers(names: readonly string[]): void {
+    for (const name of names) {
+      const r = this.instanced.get(name);
+      if (!r) continue;
+      this.instanced.delete(name); // re-inserted last: the map's order is the draw order
+      this.instanced.set(name, r);
+    }
+    this.pickDirty = true;
   }
 
   removeInstancedLayer(name: string): void {

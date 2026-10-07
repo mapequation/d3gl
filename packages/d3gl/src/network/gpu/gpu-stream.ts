@@ -273,8 +273,9 @@ export interface FrameSink {
   readonly relays: boolean;
   /** The array the next harvest writes into (2 floats per node), or null while the sink cannot take one. */
   target(): Float32Array | null;
-  /** The harvest landed in {@link target}; `ticks` is the ticks it holds (its frame id). */
-  submit(ticks: number): void;
+  /** The harvest landed in {@link target}; `ticks` is the ticks it holds (its frame id). `final`: the run's (or
+   *  a re-cool's) last positions — the settled frame, whose LOD tree carries the crowding (#426). */
+  submit(ticks: number, final?: boolean): void;
   /** A frame can be painted: the submitted one, or one the sink produced (the LOD tree's first geometry). */
   readonly ready: boolean;
   /**
@@ -687,7 +688,7 @@ export class GpuStream {
         this.frameFinal = this.copyFinal || stopped;
         if (stopped) this.stopping = true;
         this.frameAway = true;
-        this.sink.submit(this.copyTicks);
+        this.sink.submit(this.copyTicks, this.frameFinal);
         this.throttle.submitted(now);
       }
     }

@@ -1,6 +1,6 @@
 import { rgb } from "d3-color";
 import type { InstancedCirclesData, InstancedPieData, InstancedLinesData, InstancedArrowsData, InstancedHalfArrowsData, InstancedLayer, GroupBuilder } from "../core/index.js";
-import type { NetworkGraph } from "./graph.js";
+import { reciprocalEdges, type NetworkGraph } from "./graph.js";
 import type { PhysicalPieWedges } from "./pie.js";
 import { boundaryCircle, type CutBoundaries, type FillAggregate, type LODTree, type LODTransform } from "./lod.js";
 import type { ScreenRect } from "../core/instanced-lane.js";
@@ -1023,6 +1023,12 @@ export interface SuperEdgeStyleResolved {
    */
   anchor?: CutBoundaries;
   /**
+   * Leave links between two kept **leaves** out of the gather (#447): the caller draws them as graph edges,
+   * as the full-detail path does ({@link withLeafLinks}). Set only when the tree's leaves are the graph's
+   * nodes; unset, every pair is gathered, as before.
+   */
+  leafLinks?: boolean;
+  /**
    * Cross-fade alpha (#133), indexed by tree-node id. When set, each super-edge's alpha is scaled by the
    * least-visible of its two *present* endpoints (off-screen endpoints count as opaque), so an edge fades
    * with the aggregate/child it connects. Absent ⇒ edges draw at full opacity.
@@ -1145,6 +1151,8 @@ export function superEdges(
   const tgt = tree.superEdgeTarget;
   const flw = tree.superEdgeFlow;
   if (!off || !tgt || !flw) return { ids: [] };
+  const leafCount = tree.leafCount;
+  const leafLinks = style.leafLinks === true;
 
   // #210: all working storage comes from the (reused) scratch. The only O(tree.size) cost is `seen`'s
   // one-time growth to this tree's size; per call, bumping the generation stamp replaces a clear.
@@ -1273,8 +1281,14 @@ export function superEdges(
     for (let p = off[g]!; p < off[g + 1]!; p++) {
       const h = tgt[p]!;
       if (seen[h] === gen) {
-        // Both present. With cross-level edges on, a lift pair onto an aggregate is summed with the projections
-        // below instead (one may land on the same pair, and a pair draws once).
+        // Both present. Two present leaves are linked by their graph edges, which the engine draws as the
+        // full-detail path does (#447, {@link leafLinks}): not gathered here, though a lift pair still claims.
+        if (leafLinks && g < leafCount && h < leafCount) {
+          if (dep !== undefined && dep[h] !== dep[g]) claim(g, h, flw[p]!);
+          continue;
+        }
+        // With cross-level edges on, a lift pair onto an aggregate is summed with the projections below instead
+        // (one may land on the same pair, and a pair draws once).
         if (par && merges(g, h)) continue;
         pushEdge(g, h, flw[p]!);
         if (reciprocal) pairLast();
@@ -1643,6 +1657,250 @@ export function superEdgeBatches(
   return { lines, arrows, ids, flows };
 }
 
+/** Reused working storage for {@link withLeafLinks}: a stamp per leaf and the frame's leaf-link edge list. */
+export interface LeafLinksScratch {
+  kept: Int32Array;
+  gen: number;
+  edges: Uint32Array;
+  /** The radix sort's other buffer and its 2^12-bucket histogram ({@link leafLinkEdges}). */
+  sorted: Uint32Array;
+  hist: Uint32Array;
+  /** CSR entries the last {@link leafLinkEdges} read: the kept leaves' degrees, summed. */
+  entries: number;
+}
+
+/** A fresh, empty {@link LeafLinksScratch}. */
+export function makeLeafLinksScratch(): LeafLinksScratch {
+  return { kept: new Int32Array(0), gen: 0, edges: new Uint32Array(0), sorted: new Uint32Array(0), hist: new Uint32Array(1 << RADIX_BITS), entries: 0 };
+}
+
+const RADIX_BITS = 12;
+
+/**
+ * The graph edges between two kept leaves of the cut (#447), in edge order — the order the full-detail path
+ * draws them in — into `sc.edges[0..m)`; returns `m`. Found by walking the kept leaves' CSR rows, each edge
+ * read once at its source's entry (`sourceEntryEdge`: the edge id of each CSR entry that is its edge's
+ * source's, else `0xffffffff`; see {@link incidenceSourceEdges}), so O(Σ degree of the kept leaves), not
+ * O(edges); then sorted into edge order by 12-bit radix passes, O(m + 4096) each (two below 2^24 edges).
+ * Self-loops are left out, as the gathers leave them. Memory: 4 B per leaf and 8 B per leaf link of scratch, reused.
+ */
+export function leafLinkEdges(graph: NetworkGraph, frontier: Uint32Array, sourceEntryEdge: Uint32Array, sc: LeafLinksScratch): number {
+  const n = graph.nodeCount;
+  if (sc.kept.length < n) sc.kept = new Int32Array(n);
+  if (sc.gen === 0x7fffffff) { sc.kept.fill(0); sc.gen = 0; }
+  const gen = ++sc.gen;
+  const kept = sc.kept;
+  let entries = 0;
+  const { offsets, neighbors } = graph.csr;
+  for (let i = 0; i < frontier.length; i++) {
+    const g = frontier[i] ?? 0;
+    if (g >= n) continue;
+    kept[g] = gen;
+    entries += (offsets[g + 1] ?? 0) - (offsets[g] ?? 0);
+  }
+  sc.entries = entries;
+  // Each edge is found at most once, at its source's entry: `entries` bounds the count.
+  if (sc.edges.length < entries) sc.edges = new Uint32Array(Math.max(entries, 2 * sc.edges.length));
+  const list = sc.edges;
+  let m = 0;
+  for (let i = 0; i < frontier.length; i++) {
+    const a = frontier[i] ?? 0;
+    if (a >= n) continue;
+    const end = offsets[a + 1] ?? 0;
+    for (let k = offsets[a] ?? 0; k < end; k++) {
+      const e = sourceEntryEdge[k] ?? 0xffffffff;
+      if (e === 0xffffffff) continue;
+      const b = neighbors[k] ?? 0;
+      if (b !== a && kept[b] === gen) list[m++] = e;
+    }
+  }
+  return sortEdgeIds(list, m, graph.edgeCount, sc);
+}
+
+/**
+ * Sort the edge ids `list[0..m)` into ascending (edge) order — the order the full-detail path draws them in —
+ * with 12-bit radix passes, O(m + 4096) each (two below 2^24 edges), into `sc.edges[0..m)`; returns `m`. `list`
+ * may be `sc.edges` itself or another array (the lazy gather's listing, #447); it is not modified unless it is
+ * one of the scratch's two buffers. The scratch's buffers grow to `m`.
+ */
+export function sortEdgeIds(list: Uint32Array, m: number, edgeCount: number, sc: LeafLinksScratch): number {
+  if (sc.edges.length < m) sc.edges = new Uint32Array(Math.max(m, 2 * sc.edges.length));
+  if (sc.sorted.length < sc.edges.length) sc.sorted = new Uint32Array(sc.edges.length);
+  if (m < 2) {
+    if (m === 1 && list !== sc.edges) sc.edges[0] = list[0] ?? 0;
+    return m;
+  }
+  // Each pass reads `from` and scatters into the scratch buffer `from` is not.
+  let from = list;
+  let to = list === sc.sorted ? sc.edges : sc.sorted;
+  const hist = sc.hist;
+  const mask = (1 << RADIX_BITS) - 1;
+  for (let shift = 0; shift < 32 && (shift === 0 || (edgeCount - 1) >>> shift > 0); shift += RADIX_BITS) {
+    hist.fill(0);
+    for (let i = 0; i < m; i++) {
+      const d = ((from[i] ?? 0) >>> shift) & mask;
+      hist[d] = (hist[d] ?? 0) + 1;
+    }
+    let sum = 0;
+    for (let d = 0; d <= mask; d++) {
+      const c = hist[d] ?? 0;
+      hist[d] = sum;
+      sum += c;
+    }
+    for (let i = 0; i < m; i++) {
+      const e = from[i] ?? 0;
+      const d = (e >>> shift) & mask;
+      to[hist[d] ?? 0] = e;
+      hist[d] = (hist[d] ?? 0) + 1;
+    }
+    from = to;
+    to = to === sc.sorted ? sc.edges : sc.sorted;
+  }
+  if (from !== sc.edges) {
+    // The last pass wrote the other buffer: hand it over as `edges`.
+    sc.sorted = sc.edges;
+    sc.edges = from;
+  }
+  return m;
+}
+
+/**
+ * The frame's links with **leaf links** (#447): every graph edge whose two ends are kept leaves of the cut —
+ * listed in `sc.edges[0..m)`, in edge order ({@link leafLinkEdges}, or the lazy gather's listing sorted by
+ * {@link sortEdgeIds}) — drawn as the full-detail path draws it: its per-edge width, colour, radii and bend from
+ * that path's cached style columns (`cache`, {@link noLodStyleCache}), its ends at the leaves' centres —
+ * followed by the gathered super-edges, which touch an aggregate (the gathers leave leaf–leaf pairs out). One
+ * batch per link primitive, in the same instance order as `ids`/`flows`, so link picking and the Canvas/SVG keys
+ * see one list. In a cross-fade band a link's alpha follows its least-visible end, as a gathered one's does.
+ *
+ * O(leaf links + gathered) to write the batches. Memory: the batches, fresh per call.
+ */
+export function withLeafLinks(
+  tree: LODTree,
+  graph: NetworkGraph,
+  m: number,
+  cache: NoLodStyleCache,
+  gathered: SuperEdgesData,
+  fadeAlpha: Float32Array | undefined,
+  sc: LeafLinksScratch,
+): SuperEdgesData {
+  if (m === 0) return gathered;
+  const src = graph.source;
+  const tgt = graph.target;
+  const list = sc.edges;
+
+  const k = gathered.ids.length;
+  const count = m + k;
+  const size = tree.size;
+  const w = graph.weight;
+  const cx = tree.cx;
+  const cy = tree.cy;
+  // Typed, not `number[]`: a frame of every leaf writes one per graph edge.
+  const ids = new Float64Array(count);
+  const flows = new Float64Array(count);
+  for (let i = 0; i < m; i++) {
+    const e = list[i] ?? 0;
+    ids[i] = (src[e] ?? 0) * size + (tgt[e] ?? 0);
+    flows[i] = w[e] ?? 0;
+  }
+  const leafEdges = list.slice(0, m);
+  const gFlows = gathered.flows;
+  for (let j = 0; j < k; j++) {
+    ids[m + j] = gathered.ids[j] ?? 0;
+    flows[m + j] = gFlows ? (gFlows[j] ?? 0) : 0;
+  }
+  // Ends at the leaves' centres (the glyphs drawn for them), then the gathered pairs' ends.
+  const ends = (gSources: Float32Array | undefined, gTargets: Float32Array | undefined): { sources: Float32Array; targets: Float32Array } => {
+    const sources = new Float32Array(2 * count);
+    const targets = new Float32Array(2 * count);
+    for (let i = 0; i < m; i++) {
+      const e = list[i] ?? 0;
+      const a = src[e] ?? 0;
+      const b = tgt[e] ?? 0;
+      sources[2 * i] = cx[a] ?? 0;
+      sources[2 * i + 1] = cy[a] ?? 0;
+      targets[2 * i] = cx[b] ?? 0;
+      targets[2 * i + 1] = cy[b] ?? 0;
+    }
+    if (gSources) sources.set(gSources.subarray(0, 2 * k), 2 * m);
+    if (gTargets) targets.set(gTargets.subarray(0, 2 * k), 2 * m);
+    return { sources, targets };
+  };
+  // A per-edge column: the cached one gathered by edge (`per` values per edge), then the gathered pairs'.
+  const column = (cached: Float32Array, gCol: Float32Array | undefined, per: 1 | 2): Float32Array => {
+    const out = new Float32Array(per * count);
+    if (per === 1) {
+      for (let i = 0; i < m; i++) out[i] = cached[list[i] ?? 0] ?? 0;
+    } else {
+      for (let i = 0; i < m; i++) {
+        const e = 2 * (list[i] ?? 0);
+        out[2 * i] = cached[e] ?? 0;
+        out[2 * i + 1] = cached[e + 1] ?? 0;
+      }
+    }
+    if (gCol) out.set(gCol.subarray(0, per * k), per * m);
+    return out;
+  };
+  // RGBA bytes, one 32-bit word per edge (the cached bytes are a fresh array: offset 0, a multiple of 4 long).
+  const colorsOf = (cached: Uint8Array, gCol: Uint8Array | undefined): Uint8Array => {
+    const colors = new Uint8Array(4 * count);
+    const from = new Uint32Array(cached.buffer, cached.byteOffset, cached.length >> 2);
+    const to = new Uint32Array(colors.buffer, 0, count);
+    for (let i = 0; i < m; i++) to[i] = from[list[i] ?? 0] ?? 0;
+    if (gCol) colors.set(gCol.subarray(0, 4 * k), 4 * m);
+    if (fadeAlpha) {
+      for (let i = 0; i < m; i++) {
+        const e = list[i] ?? 0;
+        const f = Math.min(fadeAlpha[src[e] ?? 0] ?? 1, fadeAlpha[tgt[e] ?? 0] ?? 1);
+        colors[4 * i + 3] = Math.round((colors[4 * i + 3] ?? 0) * f);
+      }
+    }
+    return colors;
+  };
+
+  const ha = cache.halfArrows;
+  if (cache.kind === "half-arrows" && ha) {
+    const g = gathered.halfArrows;
+    const { sources, targets } = ends(g?.sources, g?.targets);
+    const halfArrows: InstancedHalfArrowsData = {
+      sources,
+      targets,
+      radii: column(ha.radii, g?.radii, 2),
+      widths: column(ha.widths, g?.widths, 2),
+      bends: column(ha.bends, g?.bends, 1),
+      colors: colorsOf(ha.colors, g?.colors),
+      count,
+    };
+    return { halfArrows, ids, flows, leafEdges };
+  }
+  const ln = cache.lines;
+  if (!ln) return gathered;
+  const gl = gathered.lines;
+  const { sources, targets } = ends(gl?.sources, gl?.targets);
+  const lineColors = colorsOf(ln.colors, gl?.colors);
+  const lines: InstancedLinesData = { sources, targets, widths: column(ln.widths, gl?.widths, 1), colors: lineColors, count };
+  if (ln.bends) {
+    lines.bends = column(ln.bends, gl?.bends, 1);
+    lines.samples = ln.samples;
+  }
+  const ar = cache.arrows;
+  if (!ar) return { lines, ids, flows, leafEdges };
+  const ga = gathered.arrows;
+  const arrows: InstancedArrowsData = {
+    sources,
+    targets,
+    radii: column(ar.radii, ga?.radii, 1),
+    sizes: column(ar.sizes, ga?.sizes, 1),
+    colors: lineColors,
+    count,
+  };
+  if (ar.bends) {
+    arrows.bends = column(ar.bends, ga?.bends, 1);
+    arrows.half = ar.half;
+  }
+  return { lines, arrows, ids, flows, leafEdges };
+}
+
 /**
  * {@link superEdges} output: the per-style instanced batches plus parallel per-super-edge metadata.
  * `ids[e] = sourceTreeNode * tree.size + targetTreeNode` (the stable directed pair) and `flows[e]` is
@@ -1654,8 +1912,11 @@ export interface SuperEdgesData {
   halfArrows?: InstancedHalfArrowsData;
   lines?: InstancedLinesData;
   arrows?: InstancedArrowsData;
-  ids: number[];
-  flows?: number[];
+  ids: ArrayLike<number>;
+  flows?: ArrayLike<number>;
+  /** {@link withLeafLinks}: the graph edge of each of the first `leafEdges.length` instances (the leaf links,
+   *  #447). Two parallel edges share a pair id, so a Scene keys a leaf link by its edge instead. */
+  leafEdges?: ArrayLike<number>;
 }
 
 /** Path-strip samples for a smooth bent link (#104 N6c). */
@@ -1764,10 +2025,6 @@ export interface HalfArrowStyleAttrs {
 export function halfArrowLinksStyleAttrs(graph: NetworkGraph, style: HalfArrowStyleResolved): HalfArrowStyleAttrs {
   const count = graph.edgeCount;
   const { nodeRadii, widthOf, colorOf, bend } = style;
-  // Reciprocal lookup: key s*N+t → edge weight, so t→s can find s→t's width for `oppositeWidth`.
-  const n = graph.nodeCount;
-  const weightByPair = new Map<number, number>();
-  for (let e = 0; e < count; e++) weightByPair.set(graph.source[e]! * n + graph.target[e]!, graph.weight[e]!);
   const radii = new Float32Array(count * 2);
   const widths = new Float32Array(count * 2);
   const bends = new Float32Array(count).fill(bend);
@@ -1776,10 +2033,13 @@ export function halfArrowLinksStyleAttrs(graph: NetworkGraph, style: HalfArrowSt
     const t = graph.target[e]!;
     radii[e * 2] = nodeRadii[s]!;
     radii[e * 2 + 1] = nodeRadii[t]!;
-    const w = widthOf(graph.weight[e]!);
-    const oppRaw = weightByPair.get(t * n + s);
-    widths[e * 2] = w;
-    widths[e * 2 + 1] = oppRaw === undefined ? w : widthOf(oppRaw);
+    widths[e * 2] = widthOf(graph.weight[e]!);
+  }
+  // `oppositeWidth`: the width of each edge's reciprocal t→s (read back, not re-run), else its own.
+  const opposite = reciprocalEdges(graph);
+  for (let e = 0; e < count; e++) {
+    const o = opposite[e] ?? -1;
+    widths[e * 2 + 1] = widths[2 * (o < 0 ? e : o)] ?? 0;
   }
   const colors = linkColorBytes(graph.weight, count, colorOf);
   return { radii, widths, bends, colors };
@@ -2239,13 +2499,11 @@ export function emitHalfLinks(
   bend: number,
   bake = 1,
 ): void {
-  const n = graph.nodeCount;
-  const weightByPair = new Map<number, number>();
-  for (let e = 0; e < graph.edgeCount; e++) weightByPair.set(graph.source[e]! * n + graph.target[e]!, graph.weight[e]!);
+  const opposite = reciprocalEdges(graph);
   for (let e = 0; e < graph.edgeCount; e++) {
     const s = graph.source[e]!;
     const t = graph.target[e]!;
-    const oppRaw = weightByPair.get(t * n + s);
+    const o = opposite[e] ?? -1;
     // Solve in pixel space (positions × bake, px sizes); scale the result back by 1/bake to emit world
     // geometry the Scene's view transform restores to pixels. bake = 1 ⇒ plain world geometry.
     const x0 = graph.positions[s * 2]! * bake;
@@ -2260,7 +2518,7 @@ export function emitHalfLinks(
       y1,
       r1: nodeRadii[t]!,
       width: widthOf(graph.weight[e]!),
-      oppositeWidth: oppRaw === undefined ? widthOf(graph.weight[e]!) : widthOf(oppRaw),
+      oppositeWidth: widthOf(o < 0 ? graph.weight[e]! : (graph.weight[o] ?? 0)),
       bend: chordBend(x0, y0, x1, y1, bend),
     });
     if (!geom) continue;

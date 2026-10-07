@@ -174,9 +174,10 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
           // zoomed out) — the natural register for navigating a large layout, and what LOD wants.
           sizeMode: options.coords === "Screen" ? "screen" : "world",
         })
-        // Enable the adaptive cut: aggregates draw a touch lighter than leaves, capped at 26px so
-        // big collapsed clusters stay readable in screen mode. Frontier declutter thins overlapping
-        // glyphs by importance. The cut tracks the layout as it converges and re-cuts on zoom.
+        // Enable the adaptive cut: it aggregates only where glyphs would overlap (a small count opens on
+        // every node, #426); aggregates draw a touch lighter than leaves, capped at 26px so big collapsed
+        // clusters stay readable in screen mode. Frontier declutter thins overlapping glyphs by
+        // importance. The cut tracks the layout as it converges and re-cuts on zoom.
         // Configured *before* layout() so the worker builds + streams the LOD tree itself (#103) —
         // the main thread then never coarsens or runs the O(N) geometry pass, only the O(visible) cut.
         .lod(
