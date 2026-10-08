@@ -4029,10 +4029,13 @@ export class Network extends BaseEngine {
       const pick = this.pickLinksEnabled || undefined; // flag link layers into the GPU pick pass (#141)
       const leaf = leafGraph ? this.leafLinkLayers(tree, leafGraph, style, sel, isSel, pick) : null;
       if (leaf) layers.push(leaf.links);
-      if (halfArrows && halfArrows.count > 0) layers.push({ name: "links", primitive: "half-arrows", pickable: pick, pickBase: leafBase, halfArrows, sizeMode: style.sizeMode });
-      if (lines && lines.count > 0) layers.push({ name: "links", primitive: "lines", pickable: pick, pickBase: leafBase, lines, sizeMode: style.sizeMode });
+      // Emitted even when empty: the gathered links touch an aggregate (#447), so a cut of kept leaves, or a view
+      // with nothing on it, gathers none. An empty layer updates in place at count 0 and keeps its GPU buffers;
+      // dropped, it would be destroyed there and rebuilt (9 buffers) on the next frame that gathers one.
+      if (halfArrows) layers.push({ name: "links", primitive: "half-arrows", pickable: pick, pickBase: leafBase, halfArrows, sizeMode: style.sizeMode });
+      if (lines) layers.push({ name: "links", primitive: "lines", pickable: pick, pickBase: leafBase, lines, sizeMode: style.sizeMode });
       if (leaf?.arrows) layers.push(leaf.arrows);
-      if (arrows && arrows.count > 0) layers.push({ name: "arrows", primitive: "arrows", pickable: pick, pickBase: leafBase, arrows, sizeMode: style.sizeMode });
+      if (arrows) layers.push({ name: "arrows", primitive: "arrows", pickable: pick, pickBase: leafBase, arrows, sizeMode: style.sizeMode });
       // Link picking (#141): instance i (gl_InstanceID) of every emitted link layer is super-edge i, so
       // one resolve maps the decoded id → its directed tree-node pair (ids[i]) + summed flow (flows[i]).
       // A leaf link's id is its edge (below `leafBase`): the same hit LOD off returns for it (#447).
