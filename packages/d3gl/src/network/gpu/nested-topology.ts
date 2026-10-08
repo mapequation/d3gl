@@ -35,8 +35,11 @@ import {
   EXACT_MAX,
   NESTED,
   Scratch,
+  SeededFrames,
   WARM_ALPHA,
   placeOver,
+  recordSeedDiscs,
+  seedDiscs,
   setupModule,
   subtreeWeights,
   warmStart,
@@ -135,13 +138,22 @@ export interface NestedSolverTopology {
   readonly root: number;
   /** Ticks of the solve (every segment runs all of them, as each CPU module does). */
   readonly iterations: number;
-  /** The root disc's radius, in world units. */
+  /** The root disc's radius and centre, in world units: `(0, 0)` unless a warm start is placed by its seed. */
   readonly rootRadius: number;
+  readonly rootX: number;
+  readonly rootY: number;
   /**
    * A warm start's placement (#328): the known leaves' centroid `(tx, ty)` and RMS spread in the
-   * initial positions, which the result is placed over — or `null` for a cold layout.
+   * initial positions, which the result is placed over — or `null` for a cold layout, and for a warm start
+   * placed by its seed (`params.placeBy: "seed"`, #454), whose root disc ({@link rootX}, {@link rootY},
+   * {@link rootRadius}) already places every frame.
    */
   readonly place: { readonly tx: number; readonly ty: number; readonly spread: number } | null;
+  /**
+   * A warm start placed by its seed (#454): the seed's leaf positions, placed — the frame the solve starts
+   * from, known before it runs (`2 · leaves` floats) — or `null`. A followed stream eases toward it at once.
+   */
+  readonly seedFrame: Float32Array | null;
 }
 
 /**
@@ -209,14 +221,20 @@ export function nestedSolverTopology(topo: NestedLayoutTopology, params: NestedL
   const linkTarget: number[] = [];
   const linkWeight: number[] = [];
   let share = new Float64Array(0);
+  // A warm start placed by its seed (#454): each module's seed discs, recorded from its setup as it goes.
+  const seeded = warm && params.placeBy === "seed" ? seedDiscs(size) : null;
   modules.forEach((g, s) => {
     const start = childOffset[g] ?? 0;
     const end = childOffset[g + 1] ?? 0;
     const k = end - start;
     const base = segStart[s] ?? 0;
     segAlpha0[s] = 1;
-    if (k === 1) return; // FROZEN: radius and seed stay 0, no links
+    if (k === 1) {
+      if (seeded) recordSeedDiscs(topo, start, end, scratch, seeded);
+      return; // FROZEN: radius and seed stay 0, no links
+    }
     const setup = setupModule(topo, g, start, end, weight, packing, scratch, warm);
+    if (seeded) recordSeedDiscs(topo, start, end, scratch, seeded);
     segAlpha0[s] = setup.seeded ? WARM_ALPHA : 1;
     if (share.length < k) share = new Float64Array(k);
     for (let i = 0; i < k; i++) {
@@ -242,7 +260,12 @@ export function nestedSolverTopology(topo: NestedLayoutTopology, params: NestedL
     for (let i = 0; i < k; i++) springScale[base + i] = nestedSpringScale(alpha0, share[i] ?? 0);
   });
 
-  const rootRadius = params.radius ?? 10 * Math.sqrt(leafCount);
+  // The root disc: a cold map's at the origin; a warm seed's where it places the seed over the current map.
+  let root0 = { x: 0, y: 0, radius: params.radius ?? 10 * Math.sqrt(leafCount) };
+  const seedFrame = seeded && warm ? new Float32Array(2 * leafCount) : null;
+  if (seeded && warm && seedFrame) {
+    root0 = new SeededFrames(size, seeded).rootDisc(topo, root, root0.radius, warm, params.radius === undefined, seedFrame);
+  }
   return {
     slotCount,
     segStart,
@@ -264,8 +287,11 @@ export function nestedSolverTopology(topo: NestedLayoutTopology, params: NestedL
     treeSize: size,
     root,
     iterations,
-    rootRadius,
-    place: warm ? { tx: warm.ox[root] ?? 0, ty: warm.oy[root] ?? 0, spread: warm.spread } : null,
+    rootRadius: root0.radius,
+    rootX: root0.x,
+    rootY: root0.y,
+    place: warm && !seeded ? { tx: warm.ox[root] ?? 0, ty: warm.oy[root] ?? 0, spread: warm.spread } : null,
+    seedFrame,
   };
 }
 
@@ -278,6 +304,7 @@ export function nestedSolverBuffers(t: NestedSolverTopology): ArrayBuffer[] {
     c.slotCollide, c.items, c.segCellSide, c.segClasses, c.segList, c.segBucketBase, c.segBucketMask, c.segSubBase,
     c.binnedSlots, c.slotWork,
   ];
+  if (t.seedFrame) arrays.push(t.seedFrame);
   const buffers: ArrayBuffer[] = [];
   for (const a of arrays) if (a.buffer instanceof ArrayBuffer) buffers.push(a.buffer);
   return buffers;

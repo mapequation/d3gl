@@ -621,7 +621,7 @@ bounding box → the view), so the map opens framed and settles in place rather 
 origin. It releases to normal zoom/pan once it settles — or as soon as you zoom, pan or drag a node.
 
 `fit` means the same on every layout: the camera **ends on the final layout's exact bounding box**, and
-gets there with the layout. A streamed layout is reframed frame by frame; a layout with a `transition`
+gets there with the layout. A streamed layout (a warm one too) is reframed frame by frame; a layout with a `transition`
 eases the camera along with the nodes ([below](#re-clustering-warm-re-layout-and-transitions)); a
 layout that lands in one go (`"positions"`, `"force"`, a state network's too) is framed once. A cold
 nested map streams top-down, each depth collapsing its unplaced nodes onto their module's centre, so
@@ -634,8 +634,8 @@ children are laid out inside its own disc, arranged by their sibling links, so e
 compact region of its parent. The example runs it on the GPU (`backend: "gpu"`): every module at every
 depth is solved at once — one batched solve over the whole tree, not one per module — and a fresh map
 streams in as one animation of all depths converging together. On a 325,729-leaf map that takes about
-2 s instead of 18 s on the CPU worker (M1 Max, Chromium). The switch re-lays the map out *warm* and
-*eases* into it — see [below](#re-clustering-warm-re-layout-and-transitions).
+2 s instead of 18 s on the CPU worker (M1 Max, Chromium). A switch goes on *warm*, from where the nodes are,
+streamed from its first frame — see [below](#switching-layouts-live-from-where-the-nodes-are).
 
 Nodes are coloured **categorically by module** (the planted communities); the **Fill** control switches
 to colour ∝ flow (`nodeFill: { by: "flow", scale }`), where a collapsed module is filled by its members'
@@ -695,6 +695,48 @@ net.lod({
   so it walks the tree exactly as it does without rings. Anchoring adds those modules' own module links.
   It never costs the whole tree, and it is nothing when the option is off.
 
+### Switching layouts live, from where the nodes are
+
+Switching a map between the force layout and the nested map of its modules should not throw away what the
+reader sees. `warm: true` makes the next layout **go on from the current positions**, streamed as it
+solves:
+
+```ts
+// Nested map → force layout: the force solve starts from the map on screen.
+net.layout({ backend: "gpu", warm: true, fit: true });
+// Force layout → nested map: the map streams from the force layout on screen.
+net.layout({ backend: "gpu", nested: true, warm: true, fit: true });
+```
+
+- **A warm force layout** (`"force"`, `"worker"`, `"gpu"`, `"auto"`) starts from the current positions:
+  no seed disc, no multilevel seed, at full heat, cooling over `iterations` until it converges. Streamed, it
+  glides as the nested map below does: the engine eases the nodes from where they are toward each frame as it
+  lands. From a nested map it spreads out to the force model's own scale, which is about three times as wide,
+  and with `fit` the camera follows it as it grows, as it follows any stream. With a structure or spatial
+  LOD tree, which a worker streams with the solve's own geometry, its frames are painted as they land.
+- **A warm nested map without a `transition`** streams too, at its natural size (a cold map's root disc),
+  centred where the current map is. Its *seed* — every module's children at their current arrangement,
+  mapped into their discs — is placed so before any module is solved. The engine then eases the nodes
+  toward each frame of the solve as it lands, on one ease of about 600 ms that starts with the first frame
+  and is retargeted to every newer frame without a jump. On the GPU the frames are the solve's ticks; on
+  the worker they are the seed, then one per depth, with the modules not solved yet kept at their seeded
+  arrangement. From a force layout the nodes gather into their modules' discs and the map shrinks to its
+  own size, about a third as wide: that is the change to a map of modules, and it shows live, with `fit`
+  keeping it framed as it goes. From a nested map of the same size (a re-clustering) it keeps its size.
+  While the module tree and the solve are being prepared (the tree is built on a worker), the nodes stay
+  where they are.
+- **Cost.** Each frame of the ease is a transition frame (the interpolation, the LOD position pass, the
+  re-emit, and with `fit` the stream's bounding box). It replaces the streamed frame's position copy, and
+  it runs at display rate for the length of the ease; frames after it are ordinary streamed frames. A frame
+  that comes late, because the main thread was busy, moves the ease on by at most 50 ms, so a stall slows
+  the glide instead of skipping part of it.
+
+With a `transition` (below), a warm nested map is computed in one go and then eased to, placed by its
+result. That is the path for a re-clustering whose camera must not follow the stream.
+
+In the example above, switch **Layout** between *Force* and *Nested*: each switch goes on from the
+positions on screen, streamed from the first frame.
+
 ### Re-clustering: warm re-layout and transitions
 
 Re-running community detection gives the **same nodes a new module hierarchy**. A cold nested layout
@@ -711,9 +753,10 @@ await net.whenSettled(); // resolves when the transition ends
 - **`nested: { warm: true }`** seeds each module's children at their *current* centroids (instead of a
   spiral) and starts the solve cooler, so it keeps the arrangement the reader already knows and only
   refines it. The new map is placed over the old one — same centroid, same spread — so nothing jumps
-  off-screen, and a warm start from a nested layout doesn't drift over repeated re-clusters. It posts no
-  per-depth frames (those would collapse every module to a point first); on a graph never laid out it is
-  the cold layout.
+  off-screen, and a warm start from a nested layout doesn't drift over repeated re-clusters. With a
+  `transition` it posts no per-depth frames (those would collapse every module to a point first); without
+  one it streams from the map on screen ([above](#switching-layouts-live-from-where-the-nodes-are)). On a
+  graph never laid out it is the cold layout.
 - **`backend: "gpu"`** solves it on the GPU — about 2 s for a 325,729-leaf map where the CPU takes about
   20 s, with the main thread busy only for a one-off ~0.1 s setup — and reads back only the final layout,
   once. It falls back to the worker (`backend: "worker"`, which gives the CPU layout exactly) where the
@@ -747,9 +790,8 @@ await net.whenSettled(); // resolves when the transition ends
   per-frame cost is constant: the new map's box is measured once, when the transition starts. Without
   `fit` the camera stays where it is.
 
-In the example above, switch **Layout** between *Force* and *Nested*: the nested map is computed warm from
-the force layout's positions and the nodes glide into their modules' discs while the camera eases along to
-frame the new map — zoom in first to see it pull back out with the nodes.
+The re-clustering call above is the one to use when the camera must not follow the stream: the new map
+is computed first and then eased in, with the camera easing along in the same frames.
 
 ## State networks: physical ↔ state views
 

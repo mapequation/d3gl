@@ -1,5 +1,7 @@
 import { describe, it, expect, vi, afterEach } from "vitest";
-import { startWorkerLayout } from "../worker-transport.js";
+import { startNestedWorkerLayout, startWorkerLayout, type StreamFollow } from "../worker-transport.js";
+import { nestedLayout } from "../nested-layout.js";
+import { threeLevel, topo } from "./nested-fixtures.js";
 import { buildGraph } from "../graph.js";
 import { ForceLayout } from "../force.js";
 import type { MainToWorker } from "../worker-protocol.js";
@@ -149,5 +151,124 @@ describe("startWorkerLayout warm start (#311)", () => {
     FakeWorker.last?.onerror?.(new Event("error"));
     await handle.settled;
     expect(g.positions).toEqual(warmReference(30, 0.6, true));
+  });
+});
+
+describe("startNestedWorkerLayout followed (#454): frames go to the follower, not into the graph", () => {
+  const tree = topo(threeLevel(3, 4, 5));
+  const initial = nestedLayout(tree).positions.map((v, i) => v * 2 + (i % 2 ? 40 : -10));
+  const params = { initial, placeBy: "seed" as const };
+  const follower = (): { follow: StreamFollow; frames: Float32Array[] } => {
+    const frames: Float32Array[] = [];
+    const buffer = new Float32Array(2 * tree.leafCount);
+    return { frames, follow: { target: () => buffer, onFrame: (p) => (frames.push(p.slice()), true) } };
+  };
+
+  it("asks the worker to stream, and hands every frame and the final layout to the follower", async () => {
+    vi.stubGlobal("Worker", FakeWorker);
+    const g = buildGraph({ nodeCount: tree.leafCount, source: [], target: [] });
+    const before = g.positions.slice();
+    const { follow, frames } = follower();
+    let painted = 0;
+    let bounds = 0;
+    const handle = startNestedWorkerLayout(g, tree, params, () => painted++, { follow, onBounds: () => bounds++ });
+    const start = FakeWorker.last?.posted.find((m) => m.type === "start-nested");
+    expect(start?.type === "start-nested" && start.stream).toBe(true);
+    const frame = new Float32Array(2 * tree.leafCount).fill(3);
+    FakeWorker.last?.onmessage?.(new MessageEvent("message", { data: { type: "frame", tick: 0, positions: frame, bounds: [0, 0, 1, 1] } }));
+    const last = new Float32Array(2 * tree.leafCount).fill(5);
+    FakeWorker.last?.onmessage?.(new MessageEvent("message", { data: { type: "done", tick: -1, positions: last } }));
+    await handle.settled;
+    expect(frames.map((f) => f[0])).toEqual([3, 5]);
+    expect(Array.from(g.positions)).toEqual(Array.from(before)); // the follower eases the graph, the transport never writes it
+    expect([painted, bounds]).toEqual([0, 0]); // no repaint of its own, no bound: the positions on screen are the follower's
+  });
+
+  it("without a worker, solves here and hands the result to the follower", async () => {
+    // (the node environment has no Worker: the synchronous fallback)
+    const g = buildGraph({ nodeCount: tree.leafCount, source: [], target: [] });
+    const { follow, frames } = follower();
+    await startNestedWorkerLayout(g, tree, params, () => {}, { follow }).settled;
+    expect(frames).toHaveLength(1);
+    expect(Array.from(frames[0]!)).toEqual(Array.from(nestedLayout(tree, params).positions));
+    expect(g.positions.every((v) => v === 0)).toBe(true);
+  });
+});
+
+describe("startWorkerLayout followed (#454): a warm flat stream's frames go to the follower until it hands them back", () => {
+  /** A follower that takes the first `take` frames, then hands the rest back. */
+  const follower = (take: number): { follow: StreamFollow; frames: Float32Array[] } => {
+    const frames: Float32Array[] = [];
+    return { frames, follow: { target: () => new Float32Array(0), onFrame: (p) => (frames.push(p.slice()), frames.length <= take) } };
+  };
+  const frameMsg = (type: "frame" | "done", positions?: Float32Array) => new MessageEvent("message", { data: { type, tick: 1, positions } });
+
+  it("copy mode: the follower gets each frame and the graph is left to it; handed back, the frame is painted", async () => {
+    vi.stubGlobal("Worker", FakeWorker);
+    vi.stubGlobal("crossOriginIsolated", false);
+    const g = laidOutPath();
+    const before = g.positions.slice();
+    const { follow, frames } = follower(1);
+    let painted = 0;
+    const handle = startWorkerLayout(g, { width: 100, height: 100, iterations: 10, warm: { heat: 1, decaying: true }, follow }, () => painted++);
+    const a = before.map((v) => v + 1);
+    FakeWorker.last?.onmessage?.(frameMsg("frame", a));
+    expect([frames.length, painted]).toEqual([1, 0]);
+    expect(Array.from(g.positions)).toEqual(Array.from(before)); // the follower's: the transport wrote nothing
+    const b = before.map((v) => v + 2);
+    FakeWorker.last?.onmessage?.(frameMsg("frame", b)); // the follower hands it back
+    const c = before.map((v) => v + 3);
+    FakeWorker.last?.onmessage?.(frameMsg("done", c)); // and every later one is painted, not offered
+    expect(frames).toHaveLength(2);
+    expect(painted).toBe(2);
+    expect(Array.from(g.positions)).toEqual(Array.from(c));
+    await handle.settled;
+    handle.stop();
+  });
+
+  it("shared mode: the shared buffer becomes the graph's only once the follower hands the stream back", async () => {
+    vi.stubGlobal("Worker", FakeWorker);
+    vi.stubGlobal("crossOriginIsolated", true);
+    const g = laidOutPath();
+    const screen = g.positions;
+    const { follow, frames } = follower(1);
+    const handle = startWorkerLayout(g, { width: 100, height: 100, iterations: 10, warm: { heat: 1, decaying: true }, follow }, () => {});
+    expect(g.positions).toBe(screen); // not swapped while followed
+    FakeWorker.last?.onmessage?.(frameMsg("frame"));
+    expect(frames).toHaveLength(1);
+    expect(g.positions).toBe(screen);
+    FakeWorker.last?.onmessage?.(frameMsg("frame"));
+    expect(g.positions).not.toBe(screen);
+    expect(g.positions.buffer).toBeInstanceOf(SharedArrayBuffer);
+    handle.stop();
+    await handle.settled;
+  });
+
+  it("shared mode: a drag while followed carries the held positions into the shared buffer and paints from it", async () => {
+    vi.stubGlobal("Worker", FakeWorker);
+    vi.stubGlobal("crossOriginIsolated", true);
+    const g = laidOutPath();
+    const { follow } = follower(100);
+    const handle = startWorkerLayout(g, { width: 100, height: 100, iterations: 10, warm: { heat: 1, decaying: true }, follow }, () => {});
+    g.positions[2] = 999; // the drag holds node 1 here, in the positions on screen
+    g.positions[3] = -999;
+    handle.pin(new Uint32Array([1]));
+    expect(g.positions.buffer).toBeInstanceOf(SharedArrayBuffer);
+    expect([g.positions[2], g.positions[3]]).toEqual([999, -999]);
+    handle.stop();
+    await handle.settled;
+  });
+
+  it("with a streamed LOD tree it is not followed: its geometry is the solve's", async () => {
+    vi.stubGlobal("Worker", FakeWorker);
+    vi.stubGlobal("crossOriginIsolated", false);
+    const g = laidOutPath();
+    const { follow, frames } = follower(100);
+    let painted = 0;
+    const handle = startWorkerLayout(g, { width: 100, height: 100, iterations: 10, warm: { heat: 1, decaying: true }, follow, lod: true }, () => painted++);
+    FakeWorker.last?.onmessage?.(frameMsg("frame", g.positions.map((v) => v + 1)));
+    expect([frames.length, painted]).toEqual([0, 1]);
+    handle.stop();
+    await handle.settled;
   });
 });

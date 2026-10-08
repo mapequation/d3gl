@@ -5,6 +5,7 @@ import { buildGraph, type NetworkGraph } from "../graph.js";
 import type { ModuleNode } from "../modules.js";
 import type { ViewTransform } from "../../core/index.js";
 import { easeCubicInOut } from "../transition.js";
+import { layoutBox, layoutFitTransform } from "../fit.js";
 
 /**
  * `layout({ fit: true })` beyond streaming (#427), through the real engine and d3-zoom on a real host:
@@ -14,8 +15,8 @@ import { easeCubicInOut } from "../transition.js";
  *      exact box; nothing moves at the `layout()` call itself;
  *   2. a real wheel gesture, an explicit `setTransform` or a node grab mid-transition hands the view to
  *      the user for good, while the camera's own moves never count as a gesture (#309);
- *   3. a layout landed in one go (`"positions"`, `"force"`, a warm nested map without a transition) is
- *      framed once, as it lands — a worker's still-solving map keeps the view it had until then;
+ *   3. a layout landed in one go (`"positions"`, `"force"`) is framed once, as it lands; a warm nested map
+ *      without a transition streams from the map on screen (#454), framed on every frame;
  *   4. a cold nested map streamed depth by depth frames a box its final layout is known to lie in — so
  *      the camera only zooms in as depths land (#324) — and settles on the leaves' exact box, like a flat
  *      layout, instead of the root disc it used to keep (fill 0.53 in the Navigator).
@@ -323,31 +324,52 @@ describe("fit + transition: the camera eases along with the nodes (#427)", () =>
     }
   });
 
-  it("a warm nested re-cluster without a transition holds the camera while the worker solves, then frames the map once as it lands", async () => {
+  it("a warm nested re-cluster without a transition streams from the map on screen, framed on every frame it moves through (#454)", async () => {
     const { net, host } = await engine();
     const { graph, pairs } = await reclusterFixture(net);
-    const start = net.camera;
     const from = graph.positions.slice();
     net.data(graph, { modules: pairs });
     const frames = stepper();
     try {
+      const start = net.camera;
       net.layout({ backend: "worker", nested: { warm: true }, fit: true });
-      expect(net.camera, "the camera moved at the call: it framed the layout being replaced").toEqual(start);
+      // Nothing is placed over the map, and while the new modules' tree is built off the main thread (#428)
+      // the camera holds.
+      expect(same(graph.positions, from), "a seed disc was placed over the map").toBe(true);
+      expect(net.camera).toEqual(start);
       const samples = await stepUntilSettled(net, graph, frames, 16);
       const to = graph.positions.slice();
       const end = net.camera;
 
       expect(same(from, to), "non-vacuity: the re-cluster moved no node").toBe(false);
-      expectFramed(to, end);
+      // The streamed map goes to its natural size (#454): 8 nodes in a root disc of 10·√8, so the default
+      // 4-unit glyph is a real share of the box — framed as the fit frames it, glyph pad included.
+      const framedAs = (p: Float32Array): ViewTransform => {
+        const box = layoutBox(p, p.length / 2);
+        if (!box) throw new Error("no box");
+        return layoutFitTransform(box, W, H, 4, false);
+      };
+      const near = (a: ViewTransform, b: ViewTransform): void => {
+        expect(a.k / b.k).toBeCloseTo(1, 4);
+        expect(Math.abs(a.x - b.x)).toBeLessThan(0.5);
+        expect(Math.abs(a.y - b.y)).toBeLessThan(0.5);
+      };
+      near(end, framedAs(to));
+      expect(framingOf(to, end).allInside).toBe(true);
       expect(zoomTransform(host)).toMatchObject(end);
       expect(net.interactingCalls).toBe(0);
-      // Each frame shows the old map at the old view (the worker still solving) or the new map framed: the
-      // camera never moves before the map lands, and frames it in one step, on its exact box.
+      // Once the nodes move, every frame is framed as it is, and they move through frames between the two
+      // maps — no jump from one to the other.
+      let between = 0;
       for (const s of samples) {
-        const landed = same(s.positions, to);
-        expect(landed || same(s.positions, from), "a frame between the two maps").toBe(true);
-        expect(s.view).toEqual(landed ? end : start);
+        if (same(s.positions, from)) {
+          expect(s.view).toEqual(start);
+          continue;
+        }
+        near(s.view, framedAs(s.positions));
+        if (!same(s.positions, to)) between++;
       }
+      expect(between, "no frame between the two maps: it jumped").toBeGreaterThan(5);
     } finally {
       frames.restore();
       net.destroy();

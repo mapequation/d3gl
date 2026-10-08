@@ -9,14 +9,15 @@
  * - `gpu`: the GPU solve runs its module-spring passes (their parity with the CPU is pinned in
  *   `gpu-module-springs.browser.test.ts`).
  * - Without module links the flat layout is exactly the graph's own.
+ * - A warm layout (#454), which goes on from the positions on screen, pulls along them too, on every backend.
  */
 import { describe, it, expect, afterEach, vi } from "vitest";
 import { network, type Network } from "../network.js";
-import { DEFAULT_FORCE } from "../force.js";
+import { DEFAULT_FORCE, ForceLayout } from "../force.js";
 import type { ModuleLink } from "../modules.js";
 import type { MainToWorker, StartMessage } from "../worker-protocol.js";
 import { GpuModuleSprings } from "../gpu/module-springs.js";
-import { LINKS, TOPS, centroid, fixture } from "./module-springs-fixture.js";
+import { LINKS, TOPS, centroid, fixture, springsOf } from "./module-springs-fixture.js";
 
 const SIZE = 600;
 const hosts: HTMLElement[] = [];
@@ -145,5 +146,51 @@ describe("network flat layouts pull along module links (#455)", () => {
     };
     expect(await run(LINKS)).toBeGreaterThan(0);
     expect(await run(undefined)).toBe(0);
+  });
+
+  it("force, warm (#454): the warm layout is the pure warm solve with the module springs", async () => {
+    const f = fixture();
+    const net = network(host(), { width: SIZE, height: SIZE });
+    await net.whenReady();
+    net.data(f.graph, { modules: f.records, moduleLinks: LINKS }).layout({ backend: "force", iterations: 120 });
+    const from = f.graph.positions.slice();
+    net.layout({ backend: "force", warm: true, iterations: 120 });
+    const want = { ...f.graph, positions: from.slice(), moduleSprings: springsOf(f, LINKS) };
+    new ForceLayout(want).run(120, "cool");
+    expect(Array.from(f.graph.positions)).toEqual(Array.from(want.positions));
+    const plain = { ...f.graph, positions: from.slice() };
+    new ForceLayout(plain).run(120, "cool");
+    expect(Array.from(plain.positions), "non-vacuity: the springs move the warm solve").not.toEqual(Array.from(want.positions));
+    net.destroy();
+  });
+
+  it("worker, warm (#454): the warm run's solve gets the module springs, as the cold run's does", async () => {
+    const f = fixture();
+    const net = network(host(), { width: SIZE, height: SIZE });
+    await net.whenReady();
+    net.data(f.graph, { modules: f.records, moduleLinks: LINKS }).layout({ backend: "worker", iterations: 60 });
+    await net.whenSettled();
+    const post = vi.spyOn(Worker.prototype, "postMessage"); // calls through
+    net.layout({ backend: "worker", warm: true, iterations: 60 });
+    await net.whenSettled();
+    net.destroy();
+    const starts = post.mock.calls.map((call): MainToWorker => call[0]).filter((m): m is StartMessage => m.type === "start");
+    expect(starts.length).toBe(1);
+    expect(starts[0]?.warm, "not a warm run").toBeDefined();
+    expect(starts[0]?.moduleSprings?.source.length).toBe(LINKS.length);
+  });
+
+  it("gpu, warm (#454): the warm GPU solve runs the module-spring passes, as the cold one does", async () => {
+    const f = fixture();
+    const net = network(host(), { width: SIZE, height: SIZE, backend: "webgl" });
+    await net.whenReady();
+    net.data(f.graph, { modules: f.records, moduleLinks: LINKS }).layout({ backend: "gpu", iterations: 60 });
+    await net.whenSettled();
+    const prepare = vi.spyOn(GpuModuleSprings.prototype, "prepare");
+    net.layout({ backend: "gpu", warm: true, iterations: 60 });
+    await net.whenSettled();
+    expect(net.layoutTransport).toBe("gpu");
+    net.destroy();
+    expect(prepare.mock.calls.length).toBeGreaterThan(0);
   });
 });

@@ -49,7 +49,7 @@ import {
 import { gpuLayoutSupport, gpuNestedSlotNeed } from "./device-caps.js";
 import { blendProbeProgram, cachedGpuCaps, gpuCaps, gpuStaticCaps } from "./device-probe.js";
 import { GpuNestedLayout, gpuNestedLayoutNeed, nestedLayoutPlan, type NestedLayoutPlan } from "./gpu-nested-layout.js";
-import { GpuStream } from "./gpu-stream.js";
+import { DirectSink, GpuStream } from "./gpu-stream.js";
 import { AsyncPositionReadback } from "./async-readback.js";
 import { compilePrograms, type ProgramCompile } from "./programs.js";
 import { nestedSolverResult, type NestedSolverTopology } from "./nested-topology.js";
@@ -160,7 +160,8 @@ export function startGpuNestedLayout(
       return;
     }
     const layout = new GpuNestedLayout(device, plan); // frees what it created if it throws
-    const oneFrame = opts.onResult !== undefined || opts.stream === false;
+    const { follow } = opts;
+    const oneFrame = !follow && (opts.onResult !== undefined || opts.stream === false);
     const modules = solver.treeSize - solver.leafCount;
     const discs = new Float32Array(4 * modules);
     // A one-frame layout harvests into its own array: `graph.positions` stays as it is until it lands.
@@ -173,17 +174,22 @@ export function startGpuNestedLayout(
         stream: !oneFrame,
         extra: discs,
         ...(into ? { into } : {}),
+        // A followed stream (#454) reads each frame back into the array its follower asks for.
+        ...(follow ? { sink: new DirectSink(graph, () => follow.target()) } : {}),
         ...(opts.frameEvery !== undefined ? { frameEvery: opts.frameEvery } : {}),
         onFailure: (reason) => {
           failure = reason;
         },
-      }, oneFrame ? () => {} : onFrame);
+      }, follow ? () => void (follow.onFrame(follow.target()) || onFrame()) : oneFrame ? () => {} : onFrame);
     } catch (error) {
       layout.destroy();
       throw error;
     }
     stream = s;
     report("gpu");
+    // A followed warm stream (#454) eases toward its seed now, before the solve's first frame is read back —
+    // and after the layout was built, so the ease does not start with the build's main-thread time behind it.
+    if (follow && solver.seedFrame) follow.onFrame(solver.seedFrame);
     s.settled.then(() => {
       if (stopped || stream !== s) return;
       if (failure !== null) {
@@ -194,9 +200,10 @@ export function startGpuNestedLayout(
         fallBack(`the GPU solve stopped: ${failure}`, { kind: "failure" });
         return;
       }
-      // The final harvest has landed (in `graph.positions`, or `into`): place a warm start, record the
-      // boundary discs, then deliver the positions (a streamed layout's are already painted).
-      const positions = into ?? graph.positions.subarray(0, 2 * solver.leafCount);
+      // The final harvest has landed (in `graph.positions`, `into`, or where a follower took it): place a warm
+      // start, record the boundary discs, then deliver the positions (a streamed layout's are already painted,
+      // a followed one's handed over).
+      const positions = (into ?? follow?.target() ?? graph.positions).subarray(0, 2 * solver.leafCount);
       const result = nestedSolverResult(solver, positions, discs, params.initial, params.radius === undefined);
       opts.onBoundaries?.(nestedBoundaryDiscs(tree, result));
       if (opts.onResult) opts.onResult(result.positions);

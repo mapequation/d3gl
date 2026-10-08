@@ -63,7 +63,7 @@ import { WebGLDevice } from "@luma.gl/webgl";
 import { gpuLayoutNeed, gpuLayoutSupport } from "./device-caps.js";
 import { blendProbeProgram, cachedGpuCaps, gpuCaps, gpuStaticCaps } from "./device-probe.js";
 import { GpuForceLayout } from "./gpu-force-layout.js";
-import { GpuStream, type GpuRunState } from "./gpu-stream.js";
+import { DirectSink, GpuStream, type GpuRunState } from "./gpu-stream.js";
 import { AsyncPositionReadback } from "./async-readback.js";
 import { compilePrograms, type CompileOutcome, type ProgramCompile } from "./programs.js";
 import { moduleSeedPlan, type SeedPlan, type SeedPlanOptions } from "./seed-plan.js";
@@ -570,16 +570,20 @@ class GpuLayoutRun implements WorkerLayoutHandle {
       else layout.hold(cont.warm.heat);
     } else if (!seeded) layout.hold(1);
 
+    // A followed stream (#454) — never with the LOD relay, whose tree geometry is the solve's — reads each frame
+    // back into the array its follower asks for, and paints it itself once the follower hands it back.
+    const follow = relay ? undefined : opts.follow;
+    const onFrame = follow ? (): void => void (follow.onFrame(follow.target()) || this.onFrame()) : this.onFrame;
     let started: GpuStream;
     try {
       started = new GpuStream(device, layout, graph, {
         iterations,
         ...(opts.frameEvery !== undefined ? { frameEvery: opts.frameEvery } : {}),
-        ...(relay ? { sink: relay } : {}),
+        ...(relay ? { sink: relay } : follow ? { sink: new DirectSink(graph, () => follow.target()) } : {}),
         seeded,
         ...(cont ? { resumed: { recool: cont.warm.recool === true } } : {}),
         onInterrupt: (reason, cause) => this.interrupted(started, reason, cause),
-      }, this.onFrame);
+      }, onFrame);
     } catch (error) {
       // The readback's programs or buffers failed: free the solver before the caller falls back.
       layout.destroy();

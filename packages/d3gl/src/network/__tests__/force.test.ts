@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { CONVERGED_STEP, Cooling, DEFAULT_FORCE, DRAG_HEAT, ForceLayout, MIN_HEAT, MIN_SETTLE_TICKS, RECOOL_TICKS, STEP_CAP, equilibriumSpacing, seedPositions } from "../force.js";
+import { CONVERGED_STEP, Cooling, DEFAULT_FORCE, DRAG_HEAT, ForceLayout, MIN_HEAT, MIN_SETTLE_TICKS, RECOOL_TICKS, STEP_CAP, equilibriumSpacing, hasLayout, seedPositions } from "../force.js";
 import { BarnesHutTree } from "../quadtree.js";
 import { buildGraph } from "../graph.js";
 
@@ -413,5 +413,20 @@ describe("seedPositions", () => {
     // Deterministic: re-seeding gives identical coordinates.
     seedPositions(g, 200, 200);
     expect(Array.from(g.positions)).toEqual(Array.from(first));
+  });
+});
+
+describe("hasLayout (#454): whether there are positions a warm start can continue", () => {
+  it("is false for a graph never laid out — all zeros, or all at one point — and true once two nodes differ", () => {
+    expect(hasLayout(new Float32Array(8), 4)).toBe(false);
+    expect(hasLayout(new Float32Array([3, 4, 3, 4, 3, 4]), 3)).toBe(false);
+    expect(hasLayout(new Float32Array([3, 4, 3, 4, 3, 5]), 3)).toBe(true);
+    expect(hasLayout(new Float32Array([3, 4, 3, 4, 3, 5]), 2)).toBe(false); // only the first n nodes count
+  });
+
+  it("ignores non-finite positions", () => {
+    expect(hasLayout(new Float32Array([Number.NaN, 0, 1, 1, 1, 1]), 3)).toBe(false);
+    expect(hasLayout(new Float32Array([Number.NaN, 0, 1, 1, 2, 1]), 3)).toBe(true);
+    expect(hasLayout(new Float32Array(0), 0)).toBe(false);
   });
 });
