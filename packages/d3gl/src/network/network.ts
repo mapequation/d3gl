@@ -553,7 +553,7 @@ export interface NetworkLODOptions {
    * Zoom-dependent (more resolve as you zoom in). Default `true`.
    */
   declutter?: boolean;
-  /** Spacing multiplier for {@link declutter} (>1 sparser, <1 denser). Default 1. */
+  /** Spacing multiplier for {@link declutter} (>1 sparser, <1 denser). Default 2. */
   declutterSpacing?: number;
   /**
    * Mark **aggregate** glyphs (collapsed modules/subtrees, not leaves) with a thin outline **ring** set

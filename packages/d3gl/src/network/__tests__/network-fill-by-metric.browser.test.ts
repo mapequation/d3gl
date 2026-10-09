@@ -115,7 +115,7 @@ describe("nodeFill { by, scale } + flowBorder.moduleFlow through the engine (#44
     net.setTransform({ k: 0.05, x: 95, y: 95 });
 
     // Modules: the root module's own value (path []) is 0.1.
-    net.lod({ expandPx: 10_000 });
+    net.lod({ expandPx: 10_000, declutterSpacing: 1 });
     const root = circles(net.toSVG());
     expect(root).toHaveLength(1);
     expect(root[0]!.fill).toEqual([255, 0, 0]); // total flow 1
@@ -125,7 +125,7 @@ describe("nodeFill { by, scale } + flowBorder.moduleFlow through the engine (#44
     // Structure: coarsening stops at a few top aggregates. Each fills by its members' summed flow, and its
     // ring sums their enter/exit flow — the same members' fraction, as both leaf values are 1/64 — and
     // moduleFlow's 0.1 is never read. So each glyph's ring width and green follow its fill's red.
-    net.lod({ expandPx: 10_000, source: "structure" });
+    net.lod({ expandPx: 10_000, source: "structure", declutterSpacing: 1 });
     const top = circles(net.toSVG());
     expect(top.length).toBeGreaterThan(1);
     expect(top.length).toBeLessThan(n);

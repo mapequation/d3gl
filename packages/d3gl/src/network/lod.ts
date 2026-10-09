@@ -2850,7 +2850,7 @@ export function declutterFrontier(
   const F = frontier.length;
   if (F <= 1) return frontier;
   const maxAgg = opts.maxAggregateRadius ?? Infinity;
-  const spacing = opts.spacing ?? 1;
+  const spacing = opts.spacing ?? 2;
 
   // #213: all working storage comes from the (reused) scratch, grown together to the largest frontier
   // seen. Every array's `[0, F)` prefix is fully rewritten below, so reuse needs no clearing.
