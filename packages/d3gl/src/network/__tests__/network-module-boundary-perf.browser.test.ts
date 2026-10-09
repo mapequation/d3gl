@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeAll } from "vitest";
-import { network, type NetworkLODOptions } from "../network.js";
+import { network, type NetworkLODOptions, type NetworkStyle } from "../network.js";
 import { buildGraph } from "../graph.js";
 import type { ModuleLink, ModuleNode } from "../modules.js";
 import { perfBudget, perfN } from "../../__tests__/perf-budget.js";
@@ -17,7 +17,15 @@ import { GlBufferSpy, perfHost, sweepFrames } from "../../__tests__/engine-sweep
  *   2. the same with `moduleBoundary` ON — reductions on; per-frame upload must stay N-independent and
  *      the frame cost a small multiple of the baseline's;
  *   3. every module open (`expandPx` ~0, declutter off) with boundaries ON — reductions off: every
- *      leaf drawn, every module ringed, every module link anchored.
+ *      leaf drawn, every module ringed, every module link anchored;
+ *   4-6. #471: the same under a module-flow-only flow border and per-node fills — constant rings (the
+ *      baseline), then `moduleBoundary: { width: (path) => …, color: "fill" }` on the sweep and with every
+ *      module open. Per-module widths and colours are resolved once per (style, tree): the sweep calls
+ *      the width accessor, the fill accessor and `moduleFlow` zero times, and the flow scale exactly as
+ *      often as with constant rings (the collapsed glyphs' own rings call it; the rings add nothing). Measured (local headless
+ *      Chromium): worst sweep frame 0.2 ms with constant and per-module rings alike, at 50k and 200k, with
+ *      the same buffer churn (+42/−42 at 50k, the layer set changing); every module open 10.6 / 42.2 ms
+ *      at 50k / 200k, next to leg 3's 11.6 / 42.1 ms.
  * The map is `.ftree`-shaped (leaf edges inside bottom modules, module links between siblings) and laid
  * out by the nested layout, so the rings are its discs.
  */
@@ -81,7 +89,17 @@ interface Leg {
 let legOff: Leg;
 let legOn: Leg;
 let legAll: Leg;
+let legFlowConst: Leg & { calls: Calls };
+let legFlowFill: Leg & { calls: Calls };
+let legFlowAll: Leg & { calls: Calls };
 let registrationUploadedBytes = 0;
+let widthCallsAtBuild = 0;
+
+interface Calls { scale: number; fill: number; moduleFlow: number; width: number }
+const calls: Calls = { scale: 0, fill: 0, moduleFlow: 0, width: 0 };
+/** The ring width by module path (an app passes the module's enter flow through its ring scale). */
+const widthOf = (path: readonly number[]): number | undefined => (calls.width++, path.length % 3 === 0 ? undefined : 1 + 2 * path.length);
+const PALETTE = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd", "#8c564b", "#e377c2"];
 
 beforeAll(async () => {
   const spy = new GlBufferSpy();
@@ -110,6 +128,11 @@ beforeAll(async () => {
       const d = spy.since(before);
       return { created: d.created, deleted: d.deleted, uploadedBytes: d.uploadedBytes, worstFrameMs, frames };
     };
+    const runCountedLeg = (): Leg & { calls: Calls } => {
+      const at = { ...calls };
+      const leg = runLeg();
+      return { ...leg, calls: { scale: calls.scale - at.scale, fill: calls.fill - at.fill, moduleFlow: calls.moduleFlow - at.moduleFlow, width: calls.width - at.width } };
+    };
     sweepFrames(steps, (t) => net.setTransform(t), 1); // warm the lane
     legOff = runLeg();
     net.lod({ ...base, moduleBoundary: {} });
@@ -118,6 +141,28 @@ beforeAll(async () => {
     net.lod({ expandPx: 1e-6, declutter: false, crossLevelEdges: true, moduleBoundary: {} });
     sweepFrames(steps.slice(0, 2), (t) => net.setTransform(t), 1);
     legAll = runLeg();
+    // #471: a module-flow-only flow border (an `.ftree` has no per-node flow) and per-node module fills.
+    const flowStyle: NetworkStyle = {
+      nodeRadius: 3,
+      sizeMode: "screen",
+      directed: true,
+      linkStyle: "half-arrow",
+      nodeFill: (i) => (calls.fill++, PALETTE[i % PALETTE.length]!),
+      flowBorder: {
+        scale: (v) => (calls.scale++, 1 + 40 * Math.sqrt(v)),
+        moduleFlow: (path) => (calls.moduleFlow++, path.length % 3 === 0 ? undefined : 1 / (1 + path.length * 4)), // every third depth: none
+      },
+    };
+    net.style(flowStyle).lod({ ...base, moduleBoundary: {} });
+    sweepFrames(steps, (t) => net.setTransform(t), 1);
+    legFlowConst = runCountedLeg();
+    net.lod({ ...base, moduleBoundary: { width: widthOf, color: "fill" } });
+    sweepFrames(steps, (t) => net.setTransform(t), 1); // warm: builds the width table once
+    widthCallsAtBuild = calls.width;
+    legFlowFill = runCountedLeg();
+    net.lod({ expandPx: 1e-6, declutter: false, crossLevelEdges: true, moduleBoundary: { width: widthOf, color: "fill" } });
+    sweepFrames(steps.slice(0, 2), (t) => net.setTransform(t), 1);
+    legFlowAll = runCountedLeg();
     net.destroy();
   } finally {
     spy.restore();
@@ -142,6 +187,31 @@ describe(`network() module-boundary zoom sweep at N=${N.toLocaleString()} (#329)
     expect(legOn.deleted, `GPU buffers destroyed during the boundary sweep (baseline ${legOff.deleted})`).toBeLessThan(256);
     expect(legOn.worstFrameMs, `worst frame ${legOn.worstFrameMs.toFixed(2)}ms at N=${N.toLocaleString()}`).toBeLessThan(FRAME_MS_LOD);
     expect(legOn.worstFrameMs, `the boundaries cost ${legOn.worstFrameMs.toFixed(2)}ms vs ${legOff.worstFrameMs.toFixed(2)}ms without`).toBeLessThan(3 * legOff.worstFrameMs + perfBudget(5));
+  });
+
+  it("#471 per-module rings, reductions ON: resolved once — the sweep only looks them up, in place, within budget", () => {
+    // Deterministic: no accessor resolves a module's colour or flow on a frame, and the flow scale runs
+    // exactly as often as with constant rings — for the collapsed glyphs' own rings, never for a boundary.
+    expect(widthCallsAtBuild, "non-vacuity: the width table was built, one call per module").toBeGreaterThan(N / 100);
+    expect(legFlowFill.calls.width, "width accessor calls during the sweep").toBe(0);
+    expect(legFlowFill.calls.fill, "nodeFill accessor calls during the sweep").toBe(0);
+    expect(legFlowFill.calls.moduleFlow, "moduleFlow calls during the sweep").toBe(0);
+    expect(legFlowConst.calls.scale, "non-vacuity: the collapsed modules ring by their flow").toBeGreaterThan(0);
+    expect(legFlowFill.calls.scale, "flow scale calls: the rings must add none").toBe(legFlowConst.calls.scale);
+    const uploadPerFrame = legFlowFill.uploadedBytes / legFlowFill.frames;
+    expect(uploadPerFrame, `${(uploadPerFrame / 1024).toFixed(0)} KB per frame — must stay screen-bounded, not O(N)`).toBeLessThan(UPLOAD_BYTES_PER_FRAME);
+    expect(legFlowFill.created, `GPU buffers created (constant rings: ${legFlowConst.created})`).toBeLessThan(256);
+    expect(legFlowFill.deleted, `GPU buffers destroyed (constant rings: ${legFlowConst.deleted})`).toBeLessThan(256);
+    expect(legFlowFill.worstFrameMs, `worst frame ${legFlowFill.worstFrameMs.toFixed(2)}ms at N=${N.toLocaleString()}`).toBeLessThan(FRAME_MS_LOD);
+    expect(legFlowFill.worstFrameMs, `per-module rings ${legFlowFill.worstFrameMs.toFixed(2)}ms vs constant ${legFlowConst.worstFrameMs.toFixed(2)}ms`).toBeLessThan(3 * legFlowConst.worstFrameMs + perfBudget(5));
+  });
+
+  it("#471 per-module rings, reductions OFF: every module open within the full-detail budget, nothing resolved per frame", () => {
+    expect(legFlowAll.calls.width).toBe(0);
+    expect(legFlowAll.calls.fill).toBe(0);
+    expect(legFlowAll.calls.moduleFlow).toBe(0);
+    expect(legFlowAll.uploadedBytes, "the all-open sweep drew nothing").toBeGreaterThan(legFlowFill.uploadedBytes);
+    expect(legFlowAll.worstFrameMs, `every module open: worst frame ${legFlowAll.worstFrameMs.toFixed(1)}ms at N=${N.toLocaleString()}`).toBeLessThan(FRAME_MS_ALL_OPEN);
   });
 
   it("reductions OFF: every module open, ringed and anchored, within the full-detail budget", () => {

@@ -229,3 +229,143 @@ describe("module boundaries export identically from WebGL and Canvas (#329, #271
     expect(d.fraction).toBeGreaterThan(0.02);
   });
 });
+
+interface ExportedCircle { fill: number[]; stroke: number[]; strokeWidth: number; r: number }
+
+/** Every exported `<circle>` — fill and stroke as `[r, g, b, a]` (a 0-1; none ⇒ a 0), its stroke width and
+ *  radius — in document order. */
+function exportedCircles(svg: string): ExportedCircle[] {
+  const doc = new DOMParser().parseFromString(svg, "image/svg+xml");
+  const rgba = (s: string | null): number[] => {
+    const v = (s?.match(/[\d.]+/g) ?? []).map(Number);
+    return v.length >= 3 ? [v[0]!, v[1]!, v[2]!, v[3] ?? 1] : [0, 0, 0, 0];
+  };
+  return Array.from(doc.querySelectorAll("circle"), (c) => ({
+    fill: rgba(c.getAttribute("fill")),
+    stroke: rgba(c.getAttribute("stroke")),
+    strokeWidth: Number(c.getAttribute("stroke-width") ?? 0),
+    r: Number(c.getAttribute("r")),
+  }));
+}
+
+const C1 = [44, 160, 44];
+const C2 = [148, 103, 189];
+const css = ([r, g, b]: number[]): string => `rgb(${r}, ${g}, ${b})`;
+/** Module flow alone (`.ftree`-style, no per-node flow): every module but [2, 2] has a value. */
+const MODULE_FLOW = new Map<string, number>([["1", 0.3], ["2", 0.6], ["1:1", 0.2], ["1:2", 0.4], ["2:1", 0.5]]);
+const FLOW_STYLE: NetworkStyle = {
+  ...STYLE,
+  // Each top module in its own colour: its sub-modules, and the module itself, are filled with it.
+  nodeFill: (i) => css(MODULES[i]!.path[0] === 1 ? C1 : C2),
+  // World units, so a ring's exported stroke width is directly the flow ring's width.
+  flowBorder: { scale: (v) => 10 * v, color: "#000000", moduleFlow: (path) => MODULE_FLOW.get(path.join(":")) },
+};
+/** Each module's enter flow, already through the app's ring scale (world units): the open module's ring
+ *  width. [2, 2] has none — the constant default. */
+const ENTER_WIDTH = new Map<string, number>([["1", 2.5], ["2", 5], ["1:1", 1.5], ["1:2", 3.5], ["2:1", 4.5]]);
+const FLOW_RINGS: NetworkLODOptions = {
+  ...OPEN_TOP,
+  moduleBoundary: { width: (path) => ENTER_WIDTH.get(path.join(":")), color: "fill", opacity: 1 },
+  aggregateOutline: false,
+};
+const near = (a: number[], b: number[]): boolean => a.every((v, i) => Math.abs(v - b[i]!) <= 1);
+/** The open modules' rings (a transparent fill, a stroke), as `[stroke rgb, width]`, sorted by width. */
+const ringsOf = (svg: string): [number[], number][] =>
+  exportedCircles(svg)
+    .filter((c) => c.fill[3] === 0 && c.strokeWidth > 0)
+    .map((c): [number[], number] => [c.stroke.slice(0, 3), c.strokeWidth])
+    .sort((a, b) => a[1] - b[1]);
+
+describe("module boundaries in the module's own fill and width (#471)", () => {
+  for (const backend of BACKENDS) {
+    it(`${backend}: each open module's ring in its collapsed fill and its own width; module flow alone rings modules only`, async () => {
+      const net = await engine(backend, FLOW_RINGS, K_TOP, FLOW_STYLE);
+      // k = 4: the top modules are open, their sub-modules collapsed.
+      const top = net.toSVG();
+      const tops = ringsOf(top);
+      expect(tops.map(([, w]) => w)).toEqual([expect.closeTo(2.5, 4), expect.closeTo(5, 4)]); // width([1]), width([2])
+      // The collapsed sub-modules: filled in their colour and ringed (in the flow border's black) by their
+      // own `moduleFlow` value — none for [2, 2], which has none.
+      const collapsed = exportedCircles(top).filter((c) => c.fill[3] > 0);
+      const glyphs = collapsed.map((c): [number[], number] => [c.fill.slice(0, 3), c.strokeWidth]).sort((a, b) => a[1] - b[1]);
+      expect(glyphs.map(([, w]) => Number(w.toFixed(3)))).toEqual([0, 2, 4, 5]); // scale(0.2 | 0.4 | 0.5), none
+      // Each ring is in the fill its collapsed module was drawn with.
+      for (const [color, w] of tops) {
+        const fill = w < 3 ? C1 : C2;
+        expect(near(color, fill), `ring ${w}: ${color} vs ${fill}`).toBe(true);
+      }
+      expect(glyphs.filter(([c]) => near(c, C1)).length).toBe(2); // ...the same fill as its sub-modules'
+      // k = 12: the sub-modules open, each ring in its fill and its own width (the default 1 for [2, 2]).
+      net.setTransform({ k: 12, x: W / 2, y: H / 2 });
+      net.syncScreenGeometry();
+      const want = new Map<number, number[]>([[1.5, C1], [3.5, C1], [4.5, C2], [1, C2]]);
+      const deep = ringsOf(net.toSVG()).filter(([, w]) => Math.abs(w - 2.5) > 1e-3 && Math.abs(w - 5) > 1e-3);
+      expect(deep.length, JSON.stringify(deep)).toBeGreaterThan(0);
+      for (const [color, w] of deep) {
+        const key = [...want.keys()].find((k) => Math.abs(k - w) < 1e-3);
+        expect(key, `unexpected ring width ${w}`).toBeDefined();
+        expect(near(color, want.get(key ?? -1) ?? []), `ring ${w}: ${color}`).toBe(true);
+      }
+      // No leaf has a ring: `flow` is omitted, so no node has a value.
+      const leaves = exportedCircles(net.toSVG()).filter((c) => c.fill[3] > 0 && Math.abs(c.r - 3) < 0.01);
+      expect(leaves.length).toBeGreaterThan(0);
+      expect(leaves.every((c) => c.strokeWidth === 0), JSON.stringify(leaves.slice(0, 3))).toBe(true);
+      net.destroy();
+    });
+  }
+
+  it("a module the width accessor gives none takes the constant default; the outline keeps its default line", async () => {
+    for (const backend of BACKENDS) {
+      const net = await engine(backend, { ...OPEN_TOP, moduleBoundary: { width: () => undefined, color: "fill", opacity: 1 } }, K_TOP, FLOW_STYLE);
+      const rings = ringsOf(net.toSVG());
+      const open = rings.filter(([c]) => near(c, C1) || near(c, C2));
+      expect(open.map(([, w]) => w), backend).toEqual([expect.closeTo(1, 5), expect.closeTo(1, 5)]);
+      // The collapsed sub-modules' outline: the default line (1, a dark neutral), not "fill" or the accessor.
+      expect(rings.filter(([c]) => near(c, [58, 63, 82])).length, backend).toBeGreaterThan(0);
+      net.destroy();
+    }
+  });
+
+  it("draws the rings above every link and below every node — the same order on every backend", async () => {
+    const order: string[] = [];
+    for (const backend of BACKENDS) {
+      const net = await engine(backend, { ...OPEN_TOP, crossLevelEdges: true, moduleBoundary: { width: 2, color: RING, opacity: 1 }, aggregateOutline: false }, K_TOP);
+      const doc = new DOMParser().parseFromString(net.toSVG(), "image/svg+xml");
+      const kinds: string[] = [];
+      const linkRGB = "31, 78, 153";
+      for (const el of Array.from(doc.querySelectorAll("path, circle, line, polygon"))) {
+        const fill = el.getAttribute("fill") ?? "";
+        const stroke = el.getAttribute("stroke") ?? "";
+        if (fill.includes(linkRGB) || stroke.includes(linkRGB)) kinds.push("link");
+        else if (stroke.includes("214, 39, 40")) kinds.push("ring");
+        else if (fill.includes("127, 127, 127")) kinds.push("node");
+      }
+      const first = (k: string): number => kinds.indexOf(k);
+      const last = (k: string): number => kinds.lastIndexOf(k);
+      expect(first("link"), `${backend}: links drawn`).toBeGreaterThanOrEqual(0);
+      expect(first("ring"), `${backend}: rings drawn`).toBeGreaterThanOrEqual(0);
+      expect(first("node"), `${backend}: nodes drawn`).toBeGreaterThanOrEqual(0);
+      order.push(`${backend}: ${last("link") < first("ring") && last("ring") < first("node") ? "links < rings < nodes" : kinds.join(",")}`);
+      net.destroy();
+    }
+    expect(order).toEqual(BACKENDS.map((b) => `${b}: links < rings < nodes`));
+  });
+
+  for (const sizeMode of ["world", "screen"] as const) {
+    for (const k of [K_TOP, 12]) {
+      it(`exports identically from WebGL and Canvas: ${sizeMode} sizeMode, k=${k}`, async () => {
+        const style = { ...FLOW_STYLE, sizeMode };
+        const svgs: string[] = [];
+        for (const backend of ["webgl", "canvas"] as const) {
+          const net = await engine(backend, { ...FLOW_RINGS, crossLevelEdges: true }, k, style);
+          svgs.push(net.toSVG());
+          net.destroy();
+        }
+        expect(ringsOf(svgs[0]!).length).toBeGreaterThan(0);
+        const d = await diffExports(svgs[0]!, svgs[1]!, W, H, { radius: 1 });
+        expect(d.considered).toBeGreaterThan(1500);
+        expect(d.fraction).toBeLessThan(CEILING);
+      });
+    }
+  }
+});

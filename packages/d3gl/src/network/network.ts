@@ -1,5 +1,5 @@
 import { BaseEngine, type BaseEngineOptions, type HoverHit, type InteractiveLayerOptions, type LaneInteractive, type NodeDragSession } from "../map/base-engine.js";
-import { networkLayers, networkLayersFromCache, noLodStyleCache, drawsLinks, frontierCircles, frontierHalos, boundaryRings, traceBoundaryRings, superEdges, makeSuperEdgesScratch, withLeafLinks, makeLeafLinksScratch, leafLinkEdges, sortEdgeIds, emitNodes, emitLinks, emitArrows, emitHalfLinks, traceFrontierGlyphs, traceFrontierHalos, traceSuperHalfArrows, traceSuperLines, traceSuperArrows, physicalPieInstances, physicalPieSelected, tracePieWedges, rgbaCss, pickNodes, regionNodes, resolveNodeRadii, resolveNodeRadiusAggregate, resolveImportance, resolveFlowBorder, resolveNodeFill, moduleBorderValues, applyModuleBorder, treeBorderColors, resolveLinkWidthOf, resolveLinkColorOf, resolveLinkStrokeOf, flowBorderInnerRadii, type ResolvedNetworkStyle, type SuperEdgeStyleResolved, type SuperEdgesData, type ModuleBoundaryResolved, type AggregateOutlineResolved, type NoLodStyleCache, type NodeRadiusSpec, type ImportanceSpec, type FlowBorderSpec, type NodeFillSpec, type ConstBorder, type LinkWidthSpec, type LinkColorSpec, type LinkStyle, type RGBAValue } from "./glyphs.js";
+import { networkLayers, networkLayersFromCache, noLodStyleCache, drawsLinks, frontierCircles, frontierHalos, boundaryRings, boundaryModuleWidths, traceBoundaryRings, superEdges, makeSuperEdgesScratch, withLeafLinks, makeLeafLinksScratch, leafLinkEdges, sortEdgeIds, emitNodes, emitLinks, emitArrows, emitHalfLinks, traceFrontierGlyphs, traceFrontierHalos, traceSuperHalfArrows, traceSuperLines, traceSuperArrows, physicalPieInstances, physicalPieSelected, tracePieWedges, rgbaCss, pickNodes, regionNodes, resolveNodeRadii, resolveNodeRadiusAggregate, resolveImportance, resolveFlowBorder, resolveNodeFill, moduleBorderValues, applyModuleBorder, treeBorderColors, resolveLinkWidthOf, resolveLinkColorOf, resolveLinkStrokeOf, flowBorderInnerRadii, type ResolvedNetworkStyle, type SuperEdgeStyleResolved, type SuperEdgesData, type ModuleBoundaryResolved, type AggregateOutlineResolved, type NoLodStyleCache, type NodeRadiusSpec, type ImportanceSpec, type FlowBorderSpec, type NodeFillSpec, type ConstBorder, type LinkWidthSpec, type LinkColorSpec, type LinkStyle, type RGBAValue } from "./glyphs.js";
 import { rgb } from "d3-color";
 import { DRAG_HEAT, ForceLayout, hasLayout, seedPositions, type ForceParams } from "./force.js";
 import { multilevelLayout, type CoarsenOptions } from "./coarsen.js";
@@ -41,7 +41,11 @@ function aggregateOutlineOf(opts: NetworkLODOptions): Pick<AggregateOutlineResol
   if (ao) return { width: ao.width ?? 1.5, gap: ao.gap ?? 2.5, color: ao.color ?? "#3a3f52", opacity: ao.opacity ?? 1 };
   const mb = opts.moduleBoundary;
   if (!mb) return null;
-  return { width: mb.width ?? 1, gap: 2.5, color: mb.color ?? "#3a3f52", opacity: mb.opacity ?? 0.5 };
+  // A per-module width accessor / `"fill"` (#471) styles the open module, so the outline keeps the
+  // constant defaults for them.
+  const width = typeof mb.width === "number" ? mb.width : 1;
+  const color = mb.color !== undefined && mb.color !== "fill" ? mb.color : "#3a3f52";
+  return { width, gap: 2.5, color, opacity: mb.opacity ?? 0.5 };
 }
 
 /** Options for the network engine. Inherits sizing, `backend`, and `tooltipClass`. */
@@ -244,7 +248,9 @@ export interface NetworkStyle {
    * Flow-border ring (N6 / #104): draw each node/module as a disc with an outer ring whose width
    * encodes a per-node **enter/exit flow** (`flow`: an app `Float32Array` or a built-in metric) via
    * `scale`. LOD aggregates sum their members' flow, unless a module of the engine's hierarchy has its
-   * own value from `moduleFlow(path)` (#445). Fill/size still come
+   * own value from `moduleFlow(path)` (#445). With `moduleFlow` alone — no `flow`, as for an Infomap
+   * `.ftree`, which has each module's flow but none per node (#471) — only the modules with a value are
+   * ringed. Fill/size still come
    * from `nodeFill`/`nodeRadius` (size by total flow with `nodeRadius: { by: "flow", scale }`). Omit
    * for plain filled nodes. @see {@link FlowBorderSpec}
    */
@@ -574,9 +580,24 @@ export interface NetworkLODOptions {
    * `layout({ nested })` of the tree being cut, the ring is that module's disc — which is then also the
    * module's LOD geometry, so it follows its members through a drag or a transition; otherwise it is
    * centred on the module's members with their extent as its radius. `width` in the active sizeMode's units (constant px in `screen` mode, default
-   * 1), `color` any CSS colour (default a dark neutral), `opacity` 0-1 (default 0.5). Rings fade with
-   * the members they enclose under {@link crossFade}, and export with `toSVG()` / `toPNG()`. Omit to
-   * disable.
+   * 1), `color` any CSS colour (default a dark neutral), `opacity` 0-1 (default 0.5). Rings are drawn
+   * **above the links and below the nodes** (#471), so a dense module's links never hide its boundary; they
+   * fade with the members they enclose under {@link crossFade}, and export with `toSVG()` / `toPNG()`. Omit
+   * to disable.
+   *
+   * **Per module (#471).** A ring can be styled by its module:
+   * - `color: "fill"` — each ring in its module's own fill, the colour the collapsed module is drawn in
+   *   (its {@link NetworkStyle.nodeFill} module colour, or {@link aggregateFill}).
+   * - `width: (path) => number | undefined` — each ring's width by the module's Infomap `path` (e.g.
+   *   `[2, 1]` = sub-module 1 of top module 2), in the active sizeMode's units — e.g. the module's enter
+   *   flow through the flow border's scale, so the boundary reads as the flow into the module. `undefined`
+   *   (or a tree that is not a module hierarchy, whose aggregates have no path) takes the constant default;
+   *   `0` draws no ring.
+   *
+   * Both are resolved once per module when the style is resolved against the tree (like
+   * {@link FlowBorderSpec.moduleFlow}) — again on a `style()` or `lod()` call or a new tree — never per
+   * frame. A collapsed module's default {@link aggregateOutline} still takes `moduleBoundary`'s line, with
+   * the constant defaults standing in for a width accessor and `"fill"`.
    *
    * With {@link crossLevelEdges} on, a **module link** (`data(graph, { modules, moduleLinks })`, #199)
    * whose endpoint is an expanded module in view — one that no finer pair can carry, as in an Infomap
@@ -591,7 +612,7 @@ export interface NetworkLODOptions {
    * Per frame the cost is O(1) per module in view the cut expands (it visits them anyway; the walk is
    * the same with rings on or off) plus, when anchoring, their own module links — never the whole tree.
    */
-  moduleBoundary?: { width?: number; color?: string; opacity?: number };
+  moduleBoundary?: { width?: number | ((path: readonly number[]) => number | undefined); color?: string | "fill"; opacity?: number };
    /**
    * Draw **super-edges**: links between *both-visible* frontier nodes (leaf↔leaf, module↔module, or
    * aggregate↔aggregate — whatever the cut exposes), sized + coloured by their accumulated flow and
@@ -715,7 +736,8 @@ const DEFAULT_NODE_RADIUS = 4;
 const DEFAULT_NODE_FILL = "#4878d0";
 const DEFAULT_LINK_WIDTH = 1;
 const DEFAULT_LINK_STROKE = "#999999";
-const LAYER_NAMES = ["module-boundaries", "leaf-links", "links", "leaf-arrows", "arrows", "node-halos", "nodes"] as const;
+/** The base lane's layers in draw order: the module-boundary rings above every link layer and below the nodes (#471). */
+const LAYER_NAMES = ["leaf-links", "links", "leaf-arrows", "arrows", "module-boundaries", "node-halos", "nodes"] as const;
 /** Base-lane layers the shader highlight (#162) drives — nodes + links (the leaf links too, #447), and the
  *  state-network physical view's pie wedges (#175), which dim/keep exactly like the node discs they sit on (no
  *  recolour). Not the aggregate halos, which carry no group/selected and so render un-dimmed. A name with no
@@ -1045,6 +1067,8 @@ export class Network extends BaseEngine {
   private noLodStyleCacheFor: { style: ResolvedNetworkStyle; graph: NetworkGraph } | null = null;
   /** {@link applyLODBorderStyle}'s memo: the flow border's module values + ring colours for one (style, tree). */
   private lodBorderStyle: { style: ResolvedNetworkStyle; tree: LODTree; moduleValues: Float32Array | null; ringColors: Uint8Array | null } | null = null;
+  /** {@link boundaryStyle}'s memo for a `moduleBoundary.width` accessor (#471): its per-module ring widths for one (accessor, style, tree). */
+  private boundaryWidths: { widthOf: (path: readonly number[]) => number | undefined; style: ResolvedNetworkStyle; tree: LODTree; widths: Float32Array | null } | null = null;
   private noLodStyleCacheVal: NoLodStyleCache | null = null;
   /** No-LOD per-instance `selected` flag columns cache (#240), keyed like the style cache PLUS the
    *  selection version: reference-stable across position-only frames (so the renderer's identity check
@@ -1145,7 +1169,7 @@ export class Network extends BaseEngine {
   /** Registry key + layer name for the `both`-view physical container discs (drawn under the state nodes). */
   private readonly CONTAINER_LAYER = "phys-container";
   /** Every retained Scene layer the vector path registers ({@link registerNetworkScene}). */
-  private readonly SCENE_LAYERS: readonly string[] = [this.CONTAINER_LAYER, "module-boundaries", "links", "arrows", "node-halos", this.NODE_LAYER, this.PIE_LAYER];
+  private readonly SCENE_LAYERS: readonly string[] = [this.CONTAINER_LAYER, "links", "arrows", "module-boundaries", "node-halos", this.NODE_LAYER, this.PIE_LAYER];
   /** Every layer name the base network lane can put on the backend: the standard set plus the
    *  state-network overlays (#171). BOTH lane branches register all of it, whatever the current mode,
    *  because an emit-set change removes only the names the NEW entry lists — so a pie/container drawn by
@@ -1214,6 +1238,7 @@ export class Network extends BaseEngine {
     this.laidOut = false;
     this.nestedDiscs = null;
     this.lodBorderStyle = null; // the previous graph's tree and its ring colours
+    this.boundaryWidths = null; // and its module-boundary widths
     this.lodTree = null;
     this.lodWorkerTree = null;
     this.lodWorkerSource = null;
@@ -3886,17 +3911,43 @@ export class Network extends BaseEngine {
     return frontier;
   }
 
-  /** The resolved module-boundary ring style (#329) at the live zoom, or null when `moduleBoundary` is off. */
-  private boundaryStyle(style: ResolvedNetworkStyle): ModuleBoundaryResolved | null {
+  /**
+   * The resolved module-boundary ring style (#329) for `tree` at the live zoom, or null when
+   * `moduleBoundary` is off. `color: "fill"` (#471) points the rings at what the collapsed modules are
+   * filled with — the tree's own per-node `color` under per-node fills (no copy), else the constant
+   * aggregate fill — and a `width` accessor at {@link boundaryWidthsOf}'s memoised table, so the per-frame
+   * ring build only looks either up.
+   */
+  private boundaryStyle(style: ResolvedNetworkStyle, tree: LODTree): ModuleBoundaryResolved | null {
     const mb = this.lodOptions?.moduleBoundary;
     if (!mb) return null;
-    return {
-      width: mb.width ?? 1,
-      color: mb.color ?? "#3a3f52",
+    const fill = mb.color === "fill";
+    const treeFill = fill && !!style.nodeColors; // what frontierCircles fills the glyphs from (`useTreeColor`)
+    const resolved: ModuleBoundaryResolved = {
+      width: typeof mb.width === "number" ? mb.width : 1,
+      widths: typeof mb.width === "function" ? this.boundaryWidthsOf(tree, style, mb.width) : null,
+      color: fill ? (this.lodOptions?.aggregateFill ?? style.nodeFill) : (mb.color ?? "#3a3f52"),
+      colors: treeFill ? tree.color : null,
       opacity: mb.opacity ?? 0.5,
       screen: style.sizeMode === "screen",
       k: this.transform.k,
     };
+    if (fill && !treeFill) resolved.leafColor = style.nodeFill; // a one-leaf module is drawn as its leaf
+    return resolved;
+  }
+
+  /**
+   * The per-module ring widths of a `moduleBoundary.width` accessor (#471) — {@link boundaryModuleWidths},
+   * built on first use and memoised per (accessor, style, tree), so its O(modules × depth) calls are paid on
+   * a `lod()` / `style()` call or a new tree, never per frame. Null for a tree that is not a module tree
+   * (no paths): every ring then takes the constant default.
+   */
+  private boundaryWidthsOf(tree: LODTree, style: ResolvedNetworkStyle, widthOf: (path: readonly number[]) => number | undefined): Float32Array | null {
+    const memo = this.boundaryWidths;
+    if (memo && memo.widthOf === widthOf && memo.style === style && memo.tree === tree) return memo.widths;
+    const widths = boundaryModuleWidths(tree, widthOf, 1);
+    this.boundaryWidths = { widthOf, style, tree, widths };
+    return widths;
   }
 
   /** The expanded modules module links anchor at (#329) — the cut's collection when both
@@ -4111,13 +4162,6 @@ export class Network extends BaseEngine {
     const opts = this.lodOptions!;
     const layers: InstancedLayer[] = [];
     this.linkResolve = null; // no super-edges drawn this emit ⇒ nothing to link-pick (until set below)
-    // Module-boundary rings (#329) first, under everything: one per expanded module the cut collected.
-    // World-sized circles (the boundary is a world region); a screen-mode ring width is px at this zoom.
-    const boundaryStyle = this.boundaryStyle(style);
-    if (boundaryStyle) {
-      const rings = boundaryRings(tree, this.cutBoundaries, boundaryStyle, visibleWorldRect(this.transform, this.width, this.height));
-      if (rings.count > 0) layers.push({ name: "module-boundaries", primitive: "circles", circles: rings, sizeMode: "world" });
-    }
     // Selection/hover highlight (#162) is applied in the SHADER from per-instance columns (below) + lane
     // uniforms (see onInstancedLaneEmitted) — NO per-instance CPU colour pass here, so a hover/selection
     // restyle never rebuilds this geometry. Bake only the `selected` flag (ancestor-aware, so an expanded
@@ -4192,6 +4236,14 @@ export class Network extends BaseEngine {
           ? (i) => (i < leafBase ? this.noLodLinkHit(leafGraph, i) : this.lodLinkHit(tree, ids, flows, i - leafBase))
           : (i) => this.lodLinkHit(tree, ids, flows, i);
       }
+    }
+    // Module-boundary rings (#329): one per expanded module the cut collected, above every link layer and
+    // under the nodes (#471), so a dense module's links never paint over its boundary. World-sized circles
+    // (the boundary is a world region); a screen-mode ring width is px at this zoom.
+    const boundaryStyle = this.boundaryStyle(style, tree);
+    if (boundaryStyle) {
+      const rings = boundaryRings(tree, this.cutBoundaries, boundaryStyle, visibleWorldRect(this.transform, this.width, this.height));
+      if (rings.count > 0) layers.push({ name: "module-boundaries", primitive: "circles", circles: rings, sizeMode: "world" });
     }
     // Aggregate-outline affordance: a halo ring behind collapsed-module glyphs (not leaves), under the
     // nodes, so a module reads as expandable. WebGL/LOD-only (the vector full-graph draw has no aggregates).
@@ -4520,9 +4572,6 @@ export class Network extends BaseEngine {
           }
       },
     });
-    // Module-boundary rings (#329): only the LOD Scene path draws into it; registered empty here so the
-    // slot exists in canonical order (under the links) whichever path registers first.
-    this.registerLayer({ name: "module-boundaries", data: [], ids: [], sizeMode: "world", build: () => {} });
     // Per-edge link colour (encodes weight/flow); the arrowhead shares it.
     const linkColorAt = (e: number): string => style.linkStrokeOf(graph.weight[e]!);
     // The map glyph (`half-arrow`, directed) is one *filled* shape per link — the head is part of it,
@@ -4564,9 +4613,12 @@ export class Network extends BaseEngine {
         if (emit && drawLinks && style.directed && !halfArrow) emitArrows(g, graph, style.arrowSize, style.nodeRadii, style.linkBend, style.linkBend !== 0, arrowBake);
       },
     });
+    // Module-boundary rings (#329): only the LOD Scene path draws into it; registered empty here so the
+    // slot exists in canonical order (above the links, under the nodes, #471) whichever path registers first.
+    this.registerLayer({ name: "module-boundaries", data: [], ids: [], sizeMode: "world", build: () => {} });
     // Aggregate-outline halo ring: only the LOD Scene path ({@link registerLODScene}) draws into it,
     // but it's registered empty here too so the layer slot exists in canonical order (links < arrows <
-    // node-halos < nodes) — so a backend switch / LOD toggle re-registers into the same
+    // module-boundaries < node-halos < nodes) — so a backend switch / LOD toggle re-registers into the same
     // slot and the ring never lingers above the nodes nor draws on a full-graph view.
     this.registerLayer({ name: "node-halos", data: [], ids: [], sizeMode: style.sizeMode, build: () => {} });
     // Per-node fill: a single colour, or the per-node accessor (categorical module colours, #104 rework).
@@ -4650,7 +4702,7 @@ export class Network extends BaseEngine {
    * ({@link superEdges}/{@link frontierHalos}/{@link frontierCircles}/{@link boundaryRings}) into Scene
    * drawables, keyed by **stable tree-node id** (frontier node, module, or directed super-edge pair) so the
    * retained-scene diff is stable across re-cuts. Layers are registered in canonical draw order
-   * (module-boundaries < links < arrows < node-halos < nodes), each into the same slot the full-graph path uses, so toggling LOD or swapping
+   * (links < arrows < module-boundaries < node-halos < nodes), each into the same slot the full-graph path uses, so toggling LOD or swapping
    * backends never reorders or leaves stale geometry. With `emit: false` every layer registers empty (the
    * frontier clear). Re-run at each interaction-end via {@link syncScreenGeometry} — the retained Scene
    * can't re-tessellate per frame, so the frontier is static during a gesture and snaps on release (the
@@ -4660,26 +4712,6 @@ export class Network extends BaseEngine {
     const opts = this.lodOptions!;
     const screen = style.sizeMode === "screen";
     const frontier = emit ? this.computeFrontier(tree, style) : new Uint32Array(0);
-
-    // --- Module-boundary rings (#329), under everything: the same ring-encoded world circles as the
-    // WebGL lane (a screen-mode width baked at this zoom, re-baked at interaction end). ---
-    const boundaryStyle = emit ? this.boundaryStyle(style) : null;
-    const rings = boundaryStyle ? boundaryRings(tree, this.cutBoundaries, boundaryStyle, visibleWorldRect(this.transform, this.width, this.height)) : null;
-    const ringIds = rings ? Array.from(rings.ids) : [];
-    this.registerLayer({
-      name: "module-boundaries",
-      data: ringIds,
-      ids: ringIds,
-      sizeMode: "world",
-      // Decorative, like its WebGL twin (an instanced circles layer no pick resolves): a ring's hit disc
-      // would cover the module's whole interior and shadow the background there on Canvas/SVG only.
-      pickable: false,
-      fill: () => "rgba(0, 0, 0, 0)",
-      stroke: (_d, i) => (rings ? rgbaCss(rings.borderColors, i) : ""),
-      build: (g) => {
-        if (rings) traceBoundaryRings(g, rings);
-      },
-    });
 
     // --- Super-edges (drawn under the nodes), among the visible frontier only. ---
     // Same skip as the WebGL frontier emit (#157): with no links to draw the gather never runs and both
@@ -4726,6 +4758,26 @@ export class Network extends BaseEngine {
       fill: (_d, i) => (se.arrows ? rgbaCss(se.arrows.colors, i) : ""),
       build: (g) => {
         if (se.arrows) traceSuperArrows(g, se.arrows, seIds, arrowBake);
+      },
+    });
+
+    // --- Module-boundary rings (#329), above the links and under the nodes (#471): the same ring-encoded
+    // world circles as the WebGL lane (a screen-mode width baked at this zoom, re-baked at interaction end). ---
+    const boundaryStyle = emit ? this.boundaryStyle(style, tree) : null;
+    const rings = boundaryStyle ? boundaryRings(tree, this.cutBoundaries, boundaryStyle, visibleWorldRect(this.transform, this.width, this.height)) : null;
+    const ringIds = rings ? Array.from(rings.ids) : [];
+    this.registerLayer({
+      name: "module-boundaries",
+      data: ringIds,
+      ids: ringIds,
+      sizeMode: "world",
+      // Decorative, like its WebGL twin (an instanced circles layer no pick resolves): a ring's hit disc
+      // would cover the module's whole interior and shadow the background there on Canvas/SVG only.
+      pickable: false,
+      fill: () => "rgba(0, 0, 0, 0)",
+      stroke: (_d, i) => (rings ? rgbaCss(rings.borderColors, i) : ""),
+      build: (g) => {
+        if (rings) traceBoundaryRings(g, rings);
       },
     });
 
