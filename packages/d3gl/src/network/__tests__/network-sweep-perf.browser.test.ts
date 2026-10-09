@@ -265,6 +265,7 @@ let lodHoldArrows: HoldLeg;
 let lodHoldHalfArrows: HoldLeg;
 let lodDense: Leg;
 let lodSpatial: Leg;
+let lodSpatialRepeat: Leg;
 let lodSpatialHold: HoldLeg;
 let spatialHeldStats: { hits: number; misses: number; visits: number; entries: number; leafRows: number } | null = null;
 let spatialSweepStats: { hits: number; misses: number; visits: number } | null = null;
@@ -422,6 +423,11 @@ beforeAll(async () => {
     net.lod({ source: "spatial", declutter: true, maxAggregateRadius: 24 });
     lodSpatial = runLeg();
     spatialSweepStats = net.superEdgeStats;
+    // The same sweep again, for the GPU buffer counts alone. The lod() call sizes the link layers for the view it
+    // starts at, and the first sweep may outgrow them once (a lane grows to at least 2× its capacity): at
+    // PERF_BROWSER_N, declutterSpacing 2 draws 806 gathered lines at k=1 and 1,875 at k=2. A layer that is destroyed
+    // and rebuilt on every pass (#469) still shows here; a one-time grow does not.
+    lodSpatialRepeat = runLeg();
     net.setTransform(held);
     net.setTransform(held); // an unchanged re-emit: every aggregate's row from the memo
     spatialHeldStats = net.superEdgeStats;
@@ -577,8 +583,8 @@ describe(`network() engine zoom sweep — per-frame cost at N=${N.toLocaleString
     expect(lodSpatial.nodeFillAfter, "nodeFill re-ran during the spatial sweep").toBe(lodSpatial.nodeFillBefore);
     const perFrame = (lodSpatial.linkStrokeAfter - lodSpatial.linkStrokeBefore) / lodSpatial.frames;
     expect(perFrame, `spatial sweep resolved ${perFrame.toFixed(0)} link colours per frame`).toBeLessThan(LOD_LINK_COLOURS_PER_FRAME);
-    expect(lodSpatial.buffersCreated, "GPU buffers were created during the spatial sweep").toBe(0);
-    expect(lodSpatial.buffersDeleted, "GPU buffers were destroyed during the spatial sweep").toBe(0);
+    expect(lodSpatialRepeat.buffersCreated, "GPU buffers were created during the repeated spatial sweep").toBe(0);
+    expect(lodSpatialRepeat.buffersDeleted, "GPU buffers were destroyed during the repeated spatial sweep").toBe(0);
     const uploadPerFrame = lodSpatial.uploadedBytes / lodSpatial.frames;
     expect(uploadPerFrame, `spatial sweep uploaded ${(uploadPerFrame / 1024).toFixed(0)} KB per frame`).toBeLessThan(LOD_UPLOAD_BYTES_PER_FRAME);
     expect(lodSpatial.worstFrameMs, `spatial: worst frame ${lodSpatial.worstFrameMs.toFixed(2)}ms at N=${N.toLocaleString()}`).toBeLessThan(FRAME_MS_LOD);
