@@ -25,7 +25,7 @@ function cssToRgba(css: string, fallback: RGBA): RGBA {
 }
 
 /** Resolve the select/hover ring colours from the interaction opts (`selection.selected.stroke` / a
- *  hover {@link HighlightStyle}'s `stroke`), falling back to the blue (select) / green (hover) defaults. */
+ *  hover {@link HighlightStyle}'s `stroke`), falling back to the red defaults (both `#dc2626`). */
 export function resolveRingColors<D>(opts: InteractiveLayerOptions<D>): { select: RGBA; hover: RGBA; remove: RGBA } {
   const selStroke = opts.selection?.selected?.stroke;
   // The hover ring's stroke comes from the hovered-item style (`hover.hovered.stroke`, or a bare
@@ -44,7 +44,7 @@ export function resolveRingColors<D>(opts: InteractiveLayerOptions<D>): { select
  * `radiusOf` read the glyph's world/screen centre + radius for a source id; `isSelected` picks the
  * persistent select colour over the transient hover colour for ids in the selection set. `isRemove`
  * (optional) overrides both with the `remove` colour for glyphs a subtract-marquee will deselect
- * (#140) — red "will be removed", the inverse of the blue "will be added" hover preview.
+ * (#140) — yellow "will be removed", against the hover-coloured "will be added" preview.
  */
 export function ringCircles(
   ids: Uint32Array,

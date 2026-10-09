@@ -10,9 +10,12 @@
 // that turn a hover/selection restyle into a uniform change — no geometry rebuild, no buffer re-upload,
 // so it scales to a full (LOD-off) draw. A highlighted instance (selected, or its group == the hovered
 // group) is tinted toward `u_recolorRGB` preserving luminance (weight cue kept) when `u_recolor` is on
-// (link layers); a non-highlighted instance fades its alpha by `u_dimOpacity` when `u_dimActive`.
+// (link layers); a non-highlighted instance fades its alpha by `u_dimOpacity` when `u_dimActive`. An
+// instance whose index is in `u_hoverInstances` counts as hovered too (#476): an open module hovered by its
+// boundary ring keeps its drawn members — one contiguous run of the frontier — undimmed.
 const HL_UNIFORMS = `
 uniform float u_hoverGroup;   // hovered group id (-1 = none)
+uniform vec2 u_hoverInstances; // [lo, hi): instances highlighted with the hover by index (#476: an open module's drawn members)
 uniform float u_dimActive;    // 1 = fade non-highlighted instances
 uniform float u_dimOpacity;   // alpha multiplier for the faded instances
 uniform float u_recolor;      // 1 = tint highlighted instances toward u_recolorRGB (link layers), 0 = keep (nodes)
@@ -22,7 +25,9 @@ in float a_group2;            // link's OTHER endpoint (target) for undirected h
 in float a_selected;          // per-instance selected flag (0/1)`;
 
 const HL_APPLY = `
-  bool hl = a_selected > 0.5 || (u_hoverGroup >= 0.0 && (abs(a_group - u_hoverGroup) < 0.5 || abs(a_group2 - u_hoverGroup) < 0.5));
+  float hlInstance = float(gl_InstanceID);
+  bool hl = a_selected > 0.5 || (u_hoverGroup >= 0.0 && (abs(a_group - u_hoverGroup) < 0.5 || abs(a_group2 - u_hoverGroup) < 0.5))
+    || (hlInstance >= u_hoverInstances.x && hlInstance < u_hoverInstances.y);
   if (hl) {
     if (u_recolor > 0.5) {
       float lum = dot(v_color.rgb, vec3(0.299, 0.587, 0.114));

@@ -1,0 +1,5 @@
+---
+"@mapequation/d3gl": patch
+---
+
+`network()`: hover, click and select an **open module by its boundary ring** (#476). With `lod({ moduleBoundary })`, a pointer on the ring the cut draws around an expanded module picks that module — the same id, datum and `members()` as when it is collapsed, plus `datum.open === true` — so `on("hover" | "click" | "select")`, `interactive({ selectable, tooltip })` and `selection()` need no new branch. A ring thinner than 6 px is hit over a 6 px band; a glyph drawn over the ring wins, the deepest of overlapping rings wins, and a pointer inside the disc but off the ring picks no module. With `interactive({ hover })` / a selection, the module's highlight is drawn on its ring, its drawn members stay undimmed, and a selected module keeps its highlight as it opens and collapses. A ring is not a drag handle. On WebGL, Canvas and SVG; a pointer move tests only the rings the frame drew, allocation-free, and a hover change re-emits only the highlight lane. The `interactive()` docs now give the ring colours the code draws (red `#dc2626` for selection and hover, yellow `#eab308` for the subtract-marquee preview).

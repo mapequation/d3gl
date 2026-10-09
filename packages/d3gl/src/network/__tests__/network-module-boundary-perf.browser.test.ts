@@ -1,5 +1,7 @@
 import { describe, it, expect, beforeAll } from "vitest";
-import { network, type NetworkLODOptions, type NetworkStyle } from "../network.js";
+import { Network, type NetworkLODOptions, type NetworkStyle } from "../network.js";
+import { boundaryRingPickStats } from "../glyphs.js";
+import type { HoverHit } from "../../map/base-engine.js";
 import { buildGraph } from "../graph.js";
 import type { ModuleLink, ModuleNode } from "../modules.js";
 import { perfBudget, perfN } from "../../__tests__/perf-budget.js";
@@ -26,6 +28,12 @@ import { GlBufferSpy, perfHost, sweepFrames } from "../../__tests__/engine-sweep
  *      Chromium): worst sweep frame 0.2 ms with constant and per-module rings alike, at 50k and 200k, with
  *      the same buffer churn (+42/−42 at 50k, the layer set changing); every module open 10.6 / 42.2 ms
  *      at 50k / 200k, next to leg 3's 11.6 / 42.1 ms.
+ *   7-9. #476: hover sweeps through the real pointer path (`pointermove` on the host → pick → hover →
+ *      the highlight lane) under `interactive({ hover: { others } })`, on per-module rings: across the
+ *      zoom sweep's views (reductions ON), with every module open (reductions OFF), and with LOD off. A
+ *      move tests only the rings drawn (none with LOD off); a hover change re-emits only the highlight lane
+ *      (the base lane's emit count stays put, and the upload per change is a few circles), resolves no
+ *      accessor, and stays within a per-move ceiling.
  * The map is `.ftree`-shaped (leaf edges inside bottom modules, module links between siblings) and laid
  * out by the nested layout, so the rings are its discs.
  */
@@ -96,6 +104,45 @@ let registrationUploadedBytes = 0;
 let widthCallsAtBuild = 0;
 
 interface Calls { scale: number; fill: number; moduleFlow: number; width: number }
+
+/** A hover leg (#476): pointer moves, hover changes, ring hits and tests, GL traffic, lane emits, accessor calls. */
+interface HoverLeg {
+  moves: number;
+  changes: number;
+  ringHits: number;
+  ringTests: number;
+  uploadedBytes: number;
+  created: number;
+  deleted: number;
+  baseEmits: number;
+  highlightEmits: number;
+  medianMoveMs: number;
+  worstMoveMs: number;
+  calls: Calls;
+}
+let hoverSweep: HoverLeg;
+let hoverAll: HoverLeg;
+let hoverOff: HoverLeg;
+let moduleCount = 0;
+
+/** Counts each instanced lane's emits — the base lane (`network`) must not re-emit on a hover change. */
+class Probe extends Network {
+  readonly emits = new Map<string, number>();
+  protected override emitInstancedLane(name: string): void {
+    this.emits.set(name, (this.emits.get(name) ?? 0) + 1);
+    super.emitInstancedLane(name);
+  }
+}
+const isOpenHit = (h: HoverHit | null): boolean => !!h && typeof h.datum === "object" && h.datum !== null && "open" in h.datum && h.datum.open === true;
+// Worst pointer move (#476), constant + linear terms (AGENTS §Tests). Measured (local headless Chromium): on the
+// sweep 1.4 / 1.0 ms at 50k / 200k (a handful of rings drawn); every module open 2.4 / 4.8 ms (~4k / ~16.5k
+// rings tested per move, and a hover change repaints the full-detail frame). The deterministic counts below
+// carry the O(rings drawn) and highlight-lane-only proof; these catch an order-of-magnitude slip.
+const HOVER_MOVE_MS_SWEEP = perfBudget(10 + (2 * N) / 50_000);
+const HOVER_MOVE_MS_ALL_OPEN = perfBudget(20 + (10 * N) / 50_000);
+// A hover change re-emits the highlight lane only: a ring or two of circles. A base-lane re-emit uploads
+// kilobytes per frame on the sweep and megabytes with every module open.
+const HOVER_UPLOAD_BYTES_PER_CHANGE = 1024;
 const calls: Calls = { scale: 0, fill: 0, moduleFlow: 0, width: 0 };
 /** The ring width by module path (an app passes the module's enter flow through its ring scale). */
 const widthOf = (path: readonly number[]): number | undefined => (calls.width++, path.length % 3 === 0 ? undefined : 1 + 2 * path.length);
@@ -105,7 +152,8 @@ beforeAll(async () => {
   const spy = new GlBufferSpy();
   try {
     const { graph, modules, links } = fixture(N);
-    const net = network(perfHost(W, H), { width: W, height: H, backend: "webgl" });
+    const hostEl = perfHost(W, H);
+    const net = new Probe(hostEl, { width: W, height: H, backend: "webgl" });
     await net.whenReady();
     const base: NetworkLODOptions = { declutter: true, crossLevelEdges: true, maxAggregateRadius: 24 };
     const atStart = spy.mark();
@@ -163,7 +211,70 @@ beforeAll(async () => {
     net.lod({ expandPx: 1e-6, declutter: false, crossLevelEdges: true, moduleBoundary: { width: widthOf, color: "fill" } });
     sweepFrames(steps.slice(0, 2), (t) => net.setTransform(t), 1);
     legFlowAll = runCountedLeg();
+
+    // #476: hover sweeps across the rings, through the real pointer path.
+    const paths = new Set<string>();
+    for (const m of modules) for (let d = 1; d < m.path.length; d++) paths.add(m.path.slice(0, d).join(":"));
+    moduleCount = paths.size;
+    let last: HoverHit | null = null;
+    let changes = 0;
+    let ringHits = 0;
+    net.on("hover", (h) => {
+      if (h?.layer !== last?.layer || h?.id !== last?.id) changes++;
+      if (isOpenHit(h)) ringHits++;
+      last = h;
+    });
+    net.interactive({ hover: { others: { opacity: 0.3 } } });
+    const runHover = (views: { k: number; x: number; y: number }[], cols: number, rows: number): HoverLeg => {
+      const leg: HoverLeg = { moves: 0, changes: 0, ringHits: 0, ringTests: 0, uploadedBytes: 0, created: 0, deleted: 0, baseEmits: 0, highlightEmits: 0, medianMoveMs: 0, worstMoveMs: 0, calls: { scale: 0, fill: 0, moduleFlow: 0, width: 0 } };
+      const times: number[] = [];
+      for (const view of views) {
+        net.setTransform(view);
+        const r = hostEl.getBoundingClientRect();
+        const before = spy.mark();
+        const at = { ...calls };
+        const tests = boundaryRingPickStats.tests;
+        const base = net.emits.get("network") ?? 0;
+        const hl = net.emits.get("network-highlight") ?? 0;
+        changes = 0;
+        ringHits = 0;
+        for (let j = 0; j < rows; j++) {
+          for (let i = 0; i < cols; i++) {
+            // Whole px along a serpentine path: the pointer moves as a hand would, glyph to ring to empty space.
+            const x = Math.round(((j % 2 ? cols - 1 - i : i) + 0.5) * (W / cols));
+            const y = Math.round((j + 0.5) * (H / rows));
+            const t0 = performance.now();
+            hostEl.dispatchEvent(new PointerEvent("pointermove", { clientX: r.left + x, clientY: r.top + y, bubbles: true }));
+            times.push(performance.now() - t0);
+          }
+        }
+        const d = spy.since(before);
+        leg.moves += cols * rows;
+        leg.changes += changes;
+        leg.ringHits += ringHits;
+        leg.ringTests += boundaryRingPickStats.tests - tests;
+        leg.uploadedBytes += d.uploadedBytes;
+        leg.created += d.created;
+        leg.deleted += d.deleted;
+        leg.baseEmits += (net.emits.get("network") ?? 0) - base;
+        leg.highlightEmits += (net.emits.get("network-highlight") ?? 0) - hl;
+        for (const key of ["scale", "fill", "moduleFlow", "width"] as const) leg.calls[key] += calls[key] - at[key];
+        hostEl.dispatchEvent(new PointerEvent("pointerleave")); // the next view starts with no hover
+      }
+      times.sort((a, b) => a - b);
+      leg.medianMoveMs = times[Math.floor(times.length / 2)] ?? 0;
+      leg.worstMoveMs = times[times.length - 1] ?? 0;
+      return leg;
+    };
+    net.lod({ ...base, moduleBoundary: { width: widthOf, color: "fill" } });
+    sweepFrames(steps, (t) => net.setTransform(t), 1);
+    hoverSweep = runHover(steps.slice(1), 40, 25);
+    net.lod({ expandPx: 1e-6, declutter: false, crossLevelEdges: true, moduleBoundary: { width: widthOf, color: "fill" } });
+    hoverAll = runHover([steps[0]!], 12, 8);
+    net.lod(false);
+    hoverOff = runHover([steps[0]!], 12, 8);
     net.destroy();
+
   } finally {
     spy.restore();
   }
@@ -214,7 +325,38 @@ describe(`network() module-boundary zoom sweep at N=${N.toLocaleString()} (#329)
     expect(legFlowAll.worstFrameMs, `every module open: worst frame ${legFlowAll.worstFrameMs.toFixed(1)}ms at N=${N.toLocaleString()}`).toBeLessThan(FRAME_MS_ALL_OPEN);
   });
 
+  it("#476 hover across rings, reductions ON and OFF: O(rings drawn) per move, only the highlight lane per change", () => {
+    for (const [label, leg, ceiling] of [["sweep", hoverSweep, HOVER_MOVE_MS_SWEEP], ["every module open", hoverAll, HOVER_MOVE_MS_ALL_OPEN]] as const) {
+      const summary = `${label}: ${leg.moves} moves, ${leg.changes} hover changes, ${leg.ringHits} ring hits, ${(leg.ringTests / leg.moves).toFixed(0)} ring tests/move (${moduleCount} modules), ${leg.uploadedBytes} B uploaded, +${leg.created}/−${leg.deleted} buffers, median ${leg.medianMoveMs.toFixed(2)} ms / worst ${leg.worstMoveMs.toFixed(2)} ms per move`;
+      // Non-vacuous: the pointer really hovered rings, and the highlight lane really re-emitted.
+      expect(leg.ringHits, summary).toBeGreaterThan(0);
+      expect(leg.changes, summary).toBeGreaterThan(0);
+      expect(leg.highlightEmits, summary).toBeGreaterThan(0);
+      // A move tests the rings the frame drew — at most one per module.
+      expect(leg.ringTests, summary).toBeGreaterThan(0);
+      expect(leg.ringTests / leg.moves, summary).toBeLessThanOrEqual(moduleCount);
+      // A hover change re-emits the highlight lane only: no base-lane emit, a few circles uploaded per change
+      // (measured ~100 B). The highlight lane's layers come and go with the hover (as they always have: an
+      // emptied lane drops its layers), a fixed handful of buffers per change, never one per drawable.
+      expect(leg.baseEmits, summary).toBe(0);
+      expect(leg.uploadedBytes / leg.changes, summary).toBeLessThan(HOVER_UPLOAD_BYTES_PER_CHANGE);
+      expect(leg.created, summary).toBeLessThan(32 * leg.changes + 32);
+      // No accessor resolves a ring, a fill or a flow on a move.
+      expect(leg.calls, summary).toEqual({ scale: 0, fill: 0, moduleFlow: 0, width: 0 });
+      expect(leg.worstMoveMs, summary).toBeLessThan(ceiling);
+    }
+  });
+
+  it("#476 hover with LOD off tests no ring", () => {
+    const summary = `LOD off: ${hoverOff.moves} moves, ${hoverOff.changes} hover changes, median ${hoverOff.medianMoveMs.toFixed(2)} ms / worst ${hoverOff.worstMoveMs.toFixed(2)} ms per move`;
+    expect(hoverOff.changes, summary).toBeGreaterThan(0); // non-vacuous: it hovered nodes
+    expect(hoverOff.ringTests, summary).toBe(0);
+    expect(hoverOff.ringHits, summary).toBe(0);
+    expect(hoverOff.baseEmits, summary).toBe(0);
+  });
+
   it("reductions OFF: every module open, ringed and anchored, within the full-detail budget", () => {
+
     expect(legAll.uploadedBytes, "the all-open sweep drew nothing").toBeGreaterThan(legOn.uploadedBytes);
     expect(legAll.worstFrameMs, `every module open: worst frame ${legAll.worstFrameMs.toFixed(1)}ms at N=${N.toLocaleString()}`).toBeLessThan(FRAME_MS_ALL_OPEN);
   });

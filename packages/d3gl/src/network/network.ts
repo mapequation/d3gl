@@ -1,5 +1,5 @@
 import { BaseEngine, type BaseEngineOptions, type HoverHit, type InteractiveLayerOptions, type LaneInteractive, type NodeDragSession } from "../map/base-engine.js";
-import { networkLayers, networkLayersFromCache, noLodStyleCache, drawsLinks, frontierCircles, frontierHalos, boundaryRings, boundaryModuleWidths, traceBoundaryRings, superEdges, makeSuperEdgesScratch, withLeafLinks, makeLeafLinksScratch, leafLinkEdges, sortEdgeIds, emitNodes, emitLinks, emitArrows, emitHalfLinks, traceFrontierGlyphs, traceFrontierHalos, traceSuperHalfArrows, traceSuperLines, traceSuperArrows, physicalPieInstances, physicalPieSelected, tracePieWedges, rgbaCss, pickNodes, regionNodes, resolveNodeRadii, resolveNodeRadiusAggregate, resolveImportance, resolveFlowBorder, resolveNodeFill, moduleBorderValues, applyModuleBorder, treeBorderColors, resolveLinkWidthOf, resolveLinkColorOf, resolveLinkStrokeOf, flowBorderInnerRadii, type ResolvedNetworkStyle, type SuperEdgeStyleResolved, type SuperEdgesData, type ModuleBoundaryResolved, type AggregateOutlineResolved, type NoLodStyleCache, type NodeRadiusSpec, type ImportanceSpec, type FlowBorderSpec, type NodeFillSpec, type ConstBorder, type LinkWidthSpec, type LinkColorSpec, type LinkStyle, type RGBAValue } from "./glyphs.js";
+import { networkLayers, networkLayersFromCache, noLodStyleCache, drawsLinks, frontierCircles, frontierHalos, boundaryRings, boundaryModuleWidths, traceBoundaryRings, pickBoundaryRing, boundaryHighlightCircles, descendantRun, type FrontierHalosData, superEdges, makeSuperEdgesScratch, withLeafLinks, makeLeafLinksScratch, leafLinkEdges, sortEdgeIds, emitNodes, emitLinks, emitArrows, emitHalfLinks, traceFrontierGlyphs, traceFrontierHalos, traceSuperHalfArrows, traceSuperLines, traceSuperArrows, physicalPieInstances, physicalPieSelected, tracePieWedges, rgbaCss, pickNodes, regionNodes, resolveNodeRadii, resolveNodeRadiusAggregate, resolveImportance, resolveFlowBorder, resolveNodeFill, moduleBorderValues, applyModuleBorder, treeBorderColors, resolveLinkWidthOf, resolveLinkColorOf, resolveLinkStrokeOf, flowBorderInnerRadii, type ResolvedNetworkStyle, type SuperEdgeStyleResolved, type SuperEdgesData, type ModuleBoundaryResolved, type AggregateOutlineResolved, type NoLodStyleCache, type NodeRadiusSpec, type ImportanceSpec, type FlowBorderSpec, type NodeFillSpec, type ConstBorder, type LinkWidthSpec, type LinkColorSpec, type LinkStyle, type RGBAValue } from "./glyphs.js";
 import { rgb } from "d3-color";
 import { DRAG_HEAT, ForceLayout, hasLayout, seedPositions, type ForceParams } from "./force.js";
 import { multilevelLayout, type CoarsenOptions } from "./coarsen.js";
@@ -70,6 +70,14 @@ export interface NetworkHit {
    * pass allocates nothing); read the node's path from your records by `id` there.
    */
   readonly path?: readonly number[];
+  /**
+   * `true` when the pointer picked an **open** module by its boundary ring (#476, `lod({ moduleBoundary })`):
+   * the module the cut has expanded into its members, hit on the ring drawn around them. Otherwise absent —
+   * the hit is a drawn glyph (a leaf or a collapsed module), or an entry of `selection()`. Everything else
+   * about the hit is what the same module collapsed would give: `id` is its tree id, `aggregate`, `count`,
+   * `path` and `members()` are its own, and it hovers, clicks and selects as that module.
+   */
+  readonly open?: boolean;
 }
 
 /** {@link NetworkHit} on a provided-module tree: `path` is derived from `parent` + `branch` only when read. */
@@ -86,6 +94,17 @@ class ModuleTreeHit implements NetworkHit {
     for (let g = this.g; g >= 0 && this.parent[g]! >= 0; g = this.parent[g]!) out.push(this.branch[g]!);
     return out.reverse();
   }
+}
+
+/** {@link ModuleTreeHit} for an open module picked by its boundary ring (#476). */
+class OpenModuleTreeHit extends ModuleTreeHit {
+  readonly open = true;
+}
+
+/** Whether a hit's datum is an open module picked by its boundary ring ({@link NetworkHit.open}, #476). */
+function isOpenModuleHit(hit: HoverHit): boolean {
+  const d = hit.datum;
+  return typeof d === "object" && d !== null && "open" in d && d.open === true;
 }
 
 /** {@link NetworkHit} for a leaf outside a module tree (LOD off, or structural LOD) when the engine holds
@@ -611,6 +630,10 @@ export interface NetworkLODOptions {
    *
    * Per frame the cost is O(1) per module in view the cut expands (it visits them anyway; the walk is
    * the same with rings on or off) plus, when anchoring, their own module links — never the whole tree.
+   *
+   * **Picking (#476).** A ring is how an open module is pointed at: hover, click and select it on its ring
+   * (see {@link Network.interactive}); the hit is the module's own, with `datum.open === true`. A pointer
+   * move tests the rings the frame drew, O(rings drawn), allocation-free, and resolves nothing.
    */
   moduleBoundary?: { width?: number | ((path: readonly number[]) => number | undefined); color?: string | "fill"; opacity?: number };
    /**
@@ -743,6 +766,8 @@ const LAYER_NAMES = ["leaf-links", "links", "leaf-arrows", "arrows", "module-bou
  *  recolour). Not the aggregate halos, which carry no group/selected and so render un-dimmed. A name with no
  *  layer on the backend (no pie outside the physical view) is a no-op in `styleInstancedLayer`. */
 const HL_LAYERS = ["nodes", "leaf-links", "links", "leaf-arrows", "arrows", "pie"] as const;
+/** The empty `hoverInstances` run (#476), shared: pushed after every base emit, so it must not allocate. */
+const NO_INSTANCES: [number, number] = [0, 0];
 /** Scale a laid-out graph's positions (in place) to fill the view at the default `k = 1` zoom — the
  *  same "scale the layout, don't fit-transform" approach the directed-map-of-modules example uses, so
  *  the network opens framed without a custom transform (which would fight d3-zoom's own transform, #171).
@@ -1040,6 +1065,14 @@ export class Network extends BaseEngine {
   /** The expanded modules in view the last {@link computeFrontier} collected for the module-boundary
    *  rings (#329) — `count` 0 when `moduleBoundary` is off. Reused per cut, like {@link cutScratch}. */
   private readonly cutBoundaries: CutBoundaries = makeCutBoundaries();
+  /** The module-boundary rings the last frame drew (#476) and the tree they ring — what a pointer move picks
+   *  against ({@link pickBoundaryRing}) and where an open module's highlight goes. Null when none were drawn. */
+  private drawnRings: FrontierHalosData | null = null;
+  private drawnRingsTree: LODTree | null = null;
+  /** The LOD node lane (null with LOD off): its retained frontier locates an open module's drawn members (#476). */
+  private lodLane: InstancedLane | null = null;
+  /** Scratch for {@link descendantRun} (#476). */
+  private readonly hoverRun: [number, number] = [0, 0];
   /**
    * The module discs of the nested layout that placed the current positions (#329), for the tree it laid
    * out — that tree's module geometry while it is cut: every position pass places its modules on them
@@ -1513,9 +1546,9 @@ export class Network extends BaseEngine {
    *   ⌘ (Ctrl on Windows/Linux) while dragging to **pan** instead, even over a node (#178). That is how
    *   you navigate a dense graph where almost every press lands on a node.
    * - `selection: { selected, others }` — `selected.stroke` overrides the **select** ring colour
-   *   (default `#2563eb` blue); the hover ring defaults to `#16a34a` green (override via a `hover`
-   *   HighlightStyle's `stroke`). A subtract-marquee preview rings the to-be-removed glyphs `#dc2626`
-   *   red. `others.opacity` (default `0.3`) fades the glyphs that are NOT selected — node discs
+   *   (default `#dc2626` red); the hover ring defaults to the same red (override via a `hover`
+   *   HighlightStyle's `stroke`). A subtract-marquee preview rings the to-be-removed glyphs `#eab308`
+   *   yellow. `others.opacity` (default `0.3`) fades the glyphs that are NOT selected — node discs
    *   (LOD aggregates included), links/arrows and the physical-view pies — while the selected ones keep
    *   full opacity and get a ring, plus their outgoing links. Not dimmed: the LOD aggregate halos and the
    *   `both`-view physical container discs (#315). With LOD off a selection change is a shader uniform
@@ -1526,6 +1559,15 @@ export class Network extends BaseEngine {
    * The hit's `datum` is a {@link NetworkHit} (`{ aggregate, count }`); its `members()` lists the leaf
    * node ids the target covers (1 for a leaf, the whole subtree for an aggregate). Observe selection
    * via `on("select", (hits) => …)` or read it back with `selection()`; both carry `members()`.
+   *
+   * **Open modules (#476).** With `lod({ moduleBoundary })`, a module the cut has opened is hovered,
+   * clicked and selected by its **boundary ring**: a pointer on the ring's stroke (widened to 6 px when the
+   * ring is thinner) picks the module exactly as it would pick it collapsed — the same id, datum and
+   * `members()`, plus `datum.open === true`. A glyph drawn over the ring wins, the deepest of overlapping
+   * rings wins, and a pointer inside the disc but off the ring picks no module (so a click there still
+   * clears the selection). Its hover / selection highlight is drawn on the ring, its drawn members stay
+   * undimmed, and a selected module keeps its highlight as it opens and collapses. A ring is not a drag
+   * handle: a drag starting on it pans.
    * Pass `false` to disable (clears any current selection).
    */
   interactive(opts: InteractiveLayerOptions<NetworkHit> | false): this {
@@ -3140,15 +3182,23 @@ export class Network extends BaseEngine {
       const maxAgg = this.lodOptions!.maxAggregateRadius ?? Infinity;
       const strategy: SelectionStrategy = {
         select: () => this.computeFrontier(tree, this.resolvedStyleCached(this.graph!)),
-        pick: (x, y, t, visible) => pickFrontier(tree, visible, x, y, t, { screenSized: this.resolvedStyleCached(this.graph!).sizeMode === "screen", maxAggregateRadius: this.lodOptions!.maxAggregateRadius }),
+        // The drawn glyphs first (they are drawn above the rings), then the module-boundary rings the frame
+        // drew (#476), before any link: a ring hit is returned past every tree id, as `tree.size + ring`.
+        pick: (x, y, t, visible) => {
+          const g = pickFrontier(tree, visible, x, y, t, { screenSized: this.resolvedStyleCached(this.graph!).sizeMode === "screen", maxAggregateRadius: this.lodOptions!.maxAggregateRadius });
+          if (g >= 0) return g;
+          const ring = this.pickRing(tree, x, y, t);
+          return ring >= 0 ? tree.size + ring : -1;
+        },
         pickRegion: (rect, t, visible) => regionFrontier(tree, visible, rect, t), // marquee (#159): frontier centres in rect
       };
       const lane = new InstancedLane(strategy, (visible) => this.frontierLayers(tree, this.resolvedStyleCached(this.graph!), visible));
+      this.lodLane = lane;
       this.registerInstancedLane(this.NET_LANE, {
         // LANE_LAYERS lists the state-network overlays although the frontier never emits them (pies are
         // not LOD-aware yet, #174), so switching LOD on drops the pie the no-LOD lane drew (#175).
         lane, layerNames: this.LANE_LAYERS, dynamic: true,
-        resolve: (g) => ({ layer: this.NODE_LAYER, id: g, datum: this.lodDatum(tree, g) }),
+        resolve: (g) => (g >= tree.size ? this.ringHit(tree, g - tree.size) : { layer: this.NODE_LAYER, id: g, datum: this.lodDatum(tree, g) }),
         interactive: this.laneInteractive((g) => this.lodDatum(tree, g), (g) => leavesUnder(tree, g)),
         // Link picking (#141): frontierLayers sets `linkResolve` per emit (it has the super-edge ids/flows).
         gpuPick: this.pickLinksEnabled ? (id) => this.linkResolve?.(id) ?? null : undefined,
@@ -3157,6 +3207,7 @@ export class Network extends BaseEngine {
       // aggregates capped at maxAggregateRadius — so the ring hugs the glyph exactly at any zoom.
       this.syncHighlightLane(lane, (g) => [tree.cx[g]!, tree.cy[g]!], (g) => (g < tree.leafCount || tree.count[g] === 1 ? tree.radius[g]! : Math.min(tree.radius[g]!, maxAgg)), true);
     } else if (!this.lodOptions) {
+      this.lodLane = null;
       this.lodColumns.clear(); // the full-detail lane replaces the LOD one — drop its retained columns
       const graph = this.graph;
       const strategy: SelectionStrategy = {
@@ -3204,12 +3255,14 @@ export class Network extends BaseEngine {
     // selection, highlights and style overrides meanwhile (#428).
     this.removeLayers(this.SCENE_LAYERS, true);
     this.sceneActive = false;
+    this.drawnRings = null; // nothing drawn, nothing to pick (#476)
   }
 
   /** Unregister both the node lane and its companion ring overlay (backend switch / no graph). */
   private unregisterLanes(): void {
     this.unregisterInstancedLane(this.NET_HL_LANE);
     this.unregisterInstancedLane(this.NET_LANE);
+    this.lodLane = null;
     this.lodColumns.clear();
   }
 
@@ -3220,6 +3273,25 @@ export class Network extends BaseEngine {
     // A structural cut over a graph with a hierarchy (#326): a leaf still reports its own path.
     const h = this.hierarchy;
     return h && !aggregate ? new LeafRecordHit(h.modules[h.recordOf[g]!]!) : { aggregate, count };
+  }
+
+  /** The module-boundary ring under host CSS px (x, y) the last frame drew for `tree` (#476): its index in
+   *  {@link drawnRings}, or −1. O(rings drawn), allocation-free; no ring is tested when none was drawn. */
+  private pickRing(tree: LODTree, x: number, y: number, t: ViewTransform): number {
+    const rings = this.drawnRingsTree === tree ? this.drawnRings : null;
+    return rings ? pickBoundaryRing(tree, rings, x, y, t) : -1;
+  }
+
+  /** The hit for ring `i` of {@link drawnRings} (#476): the hit its module gives collapsed (layer `nodes`, id
+   *  `g`, the module's own datum), plus `open: true`. `members()` is attached by the caller. */
+  private ringHit(tree: LODTree, i: number): HoverHit | null {
+    const rings = this.drawnRings;
+    if (!rings || this.drawnRingsTree !== tree || i >= rings.count) return null;
+    const g = rings.ids[i]!;
+    const count = tree.count[g]!;
+    const aggregate = g >= tree.leafCount; // always: only an aggregate opens
+    const datum: NetworkHit = tree.branch && tree.parent ? new OpenModuleTreeHit(tree.parent, tree.branch, g, aggregate, count) : { aggregate, count, open: true };
+    return { layer: this.NODE_LAYER, id: g, datum };
   }
 
   /** The hit datum of leaf node `i` outside a module tree (the no-LOD lane): its own record path when
@@ -3347,20 +3419,30 @@ export class Network extends BaseEngine {
     if (!this.interactiveOpts) { this.unregisterInstancedLane(this.NET_HL_LANE); return; }
     const colors = resolveRingColors(this.interactiveOpts);
     const ringName = `${this.NET_HL_LANE}:ring`;
+    const boundaryName = `${this.NET_HL_LANE}:boundary`;
     const sizeMode = this.resolvedStyleCached(this.graph!).sizeMode;
     const strategy: SelectionStrategy = { select: () => this.highlightVisible(source, lod), pick: () => -1 };
     this.registerInstancedLane(this.NET_HL_LANE, {
       lane: new InstancedLane(strategy, (visible) => {
-        if (visible.length === 0) return [];
+        // Open modules (#476): a hovered or selected module the cut has expanded is highlighted on its
+        // boundary ring, under the glyph rings. Only with rings drawn; both layers then go out together
+        // (either may be empty), so moving the hover between a ring and a glyph updates them in place.
+        const rings = lod && this.drawnRingsTree === this.lodTree ? this.drawnRings : null;
+        if (visible.length === 0 && !(rings && this.hasHighlight(this.NODE_LAYER))) return [];
         const selected = this.selectedIds(this.NODE_LAYER);
-        const remove = this.removeIds(this.NODE_LAYER); // subtract-marquee preview (#140) — ring these red
-        // Blue (selected) vs green (hover-only) ring: ancestor-aware under LOD, so an expanded selected
-        // aggregate's children ring blue too (#162) — matching the kept-link/dim highlight.
+        const remove = this.removeIds(this.NODE_LAYER); // subtract-marquee preview (#140) — ring these yellow
+        // Selected vs hover-only colour: ancestor-aware under LOD, so an expanded selected aggregate's
+        // children ring in the selection colour too (#162) — matching the kept-link/dim highlight.
         const isSel = lod && this.lodTree && selected?.size ? this.makeSelectedPredicate(this.lodTree, selected) : null;
         const selColored = (g: number): boolean => (isSel ? isSel(g) : !!selected?.has(g));
-        return [{ name: ringName, primitive: "circles", sizeMode, circles: ringCircles(visible, centerOf, radiusOf, selColored, colors, remove ? (g) => remove.has(g) : undefined) }];
+        const glyphRings: InstancedLayer = { name: ringName, primitive: "circles", sizeMode, circles: ringCircles(visible, centerOf, radiusOf, selColored, colors, remove ? (g) => remove.has(g) : undefined) };
+        if (!rings) return [glyphRings];
+        const hovered = this.hoveredIds(this.NODE_LAYER);
+        const lit = (g: number): boolean => !!selected?.has(g) || !!hovered?.has(g);
+        const circles = boundaryHighlightCircles(rings, lit, (g) => (selColored(g) ? colors.select : colors.hover), this.transform.k);
+        return [{ name: boundaryName, primitive: "circles", sizeMode: "world", circles }, glyphRings];
       }),
-      layerNames: [ringName], dynamic: true,
+      layerNames: [boundaryName, ringName], dynamic: true,
       resolve: () => null,
     });
   }
@@ -3422,9 +3504,31 @@ export class Network extends BaseEngine {
     const backend = this.backend();
     if (!backend?.styleInstancedLayer) return;
     const u = this.laneHighlightUniforms();
+    // An open module hovered by its ring (#476) keeps its drawn members undimmed: they are one run of the
+    // frontier, passed by instance index (only the dim reads it — a highlighted node keeps its colour).
+    const run = u.dimActive ? this.openHoverRun() : null;
     for (const layer of HL_LAYERS) {
-      backend.styleInstancedLayer(layer, { hoverGroup: u.hoverGroup, dimActive: u.dimActive, dimOpacity: u.dimOpacity, selected: selectedFor?.(layer) });
+      const hoverInstances: [number, number] | undefined = layer === "nodes" ? (run ?? NO_INSTANCES) : undefined;
+      backend.styleInstancedLayer(layer, { hoverGroup: u.hoverGroup, hoverInstances, dimActive: u.dimActive, dimOpacity: u.dimOpacity, selected: selectedFor?.(layer) });
     }
+  }
+
+  /**
+   * The frontier run `[lo, hi)` of the hovered module's drawn members when it is an **open** module, hovered
+   * by its boundary ring (#476), else null. O(rings drawn) to tell it is open, then O(frontier · depth) for
+   * the run — on a hover change, or a frame while such a hover dims (as the highlight lane's own scan is).
+   */
+  private openHoverRun(): [number, number] | null {
+    const g = this.singleHoveredId();
+    const tree = this.lodTree;
+    const rings = this.drawnRings;
+    const lane = this.lodLane;
+    if (g == null || !tree || !rings || !lane || this.drawnRingsTree !== tree || g < tree.leafCount) return null;
+    let ringed = false;
+    for (let i = 0; i < rings.count && !ringed; i++) ringed = rings.ids[i] === g;
+    if (!ringed) return null;
+    const [lo, hi] = descendantRun(lane.visible, g, this.treeParent(tree), this.hoverRun);
+    return hi > lo ? [lo, hi] : null;
   }
 
   /** Per-instance `selected` flags for a no-LOD base layer from the current selection (#162) — refreshed
@@ -3544,12 +3648,31 @@ export class Network extends BaseEngine {
 
   // ── Node-drag (#140) ──────────────────────────────────────────────────────────────────────────
   /** The node/aggregate under host CSS px (x,y) when `interactive({ draggable })` is set — gates the
-   *  d3-zoom pan filter and the pointerdown grab (#140). Only node hits are draggable; a link hit
-   *  (#141) returns null so a drag starting on a link still pans. */
+   *  d3-zoom pan filter and the pointerdown grab (#140). Only drawn glyphs are draggable: a link hit
+   *  (#141) and an open module's boundary ring (#476) return null, so a drag starting there still pans. */
   protected override pickDraggable(x: number, y: number): HoverHit | null {
     if (!this.interactiveOpts?.draggable || !this.graph) return null;
     const hit = this.pick(x, y);
-    return hit && hit.layer === this.NODE_LAYER ? hit : null;
+    return hit && hit.layer === this.NODE_LAYER && !isOpenModuleHit(hit) ? hit : null;
+  }
+
+  /**
+   * {@link BaseEngine.pick}, plus the module-boundary rings on Canvas/SVG (#476). On WebGL the node lane
+   * tests the rings itself, after the glyphs and before the links. On Canvas/SVG the retained Scene picks
+   * the glyphs and links, and the rings (a decorative layer, never in a hit index) are tested here with the
+   * same shared {@link pickBoundaryRing}, in the same order: a glyph wins, then a ring, then a link.
+   */
+  override pick(x: number, y: number, exact = true): HoverHit | null {
+    const hit = super.pick(x, y, exact);
+    if (hit?.layer === this.NODE_LAYER || this.backend()?.setInstancedLayer) return hit;
+    const tree = this.lodTree;
+    if (!tree || !this.lodOptions) return hit;
+    const ring = this.pickRing(tree, x, y, this.transform);
+    const ringHit = ring >= 0 ? this.ringHit(tree, ring) : null;
+    if (!ringHit || !this.drawnRings) return hit;
+    const g = this.drawnRings.ids[ring]!;
+    ringHit.members = () => leavesUnder(tree, g);
+    return ringHit;
   }
 
   /**
@@ -4240,10 +4363,16 @@ export class Network extends BaseEngine {
     // Module-boundary rings (#329): one per expanded module the cut collected, above every link layer and
     // under the nodes (#471), so a dense module's links never paint over its boundary. World-sized circles
     // (the boundary is a world region); a screen-mode ring width is px at this zoom.
+    // They are also what a pointer picks an open module by, and where its highlight goes (#476): retained as drawn.
     const boundaryStyle = this.boundaryStyle(style, tree);
+    this.drawnRings = null;
     if (boundaryStyle) {
       const rings = boundaryRings(tree, this.cutBoundaries, boundaryStyle, visibleWorldRect(this.transform, this.width, this.height));
-      if (rings.count > 0) layers.push({ name: "module-boundaries", primitive: "circles", circles: rings, sizeMode: "world" });
+      if (rings.count > 0) {
+        layers.push({ name: "module-boundaries", primitive: "circles", circles: rings, sizeMode: "world" });
+        this.drawnRings = rings;
+        this.drawnRingsTree = tree;
+      }
     }
     // Aggregate-outline affordance: a halo ring behind collapsed-module glyphs (not leaves), under the
     // nodes, so a module reads as expandable. WebGL/LOD-only (the vector full-graph draw has no aggregates).
@@ -4765,14 +4894,17 @@ export class Network extends BaseEngine {
     // world circles as the WebGL lane (a screen-mode width baked at this zoom, re-baked at interaction end). ---
     const boundaryStyle = emit ? this.boundaryStyle(style, tree) : null;
     const rings = boundaryStyle ? boundaryRings(tree, this.cutBoundaries, boundaryStyle, visibleWorldRect(this.transform, this.width, this.height)) : null;
+    // Retained as drawn: {@link pick} tests a pointer against them on their stroke (#476).
+    this.drawnRings = rings && rings.count > 0 ? rings : null;
+    this.drawnRingsTree = tree;
     const ringIds = rings ? Array.from(rings.ids) : [];
     this.registerLayer({
       name: "module-boundaries",
       data: ringIds,
       ids: ringIds,
       sizeMode: "world",
-      // Decorative, like its WebGL twin (an instanced circles layer no pick resolves): a ring's hit disc
-      // would cover the module's whole interior and shadow the background there on Canvas/SVG only.
+      // Not in a hit index: a ring's hit disc would cover the module's whole interior and shadow the
+      // background there. {@link pick} tests the stroke alone instead (#476), as the WebGL lane does.
       pickable: false,
       fill: () => "rgba(0, 0, 0, 0)",
       stroke: (_d, i) => (rings ? rgbaCss(rings.borderColors, i) : ""),

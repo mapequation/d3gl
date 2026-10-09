@@ -118,6 +118,7 @@ class IndexedLinkDraw {
       u_viewport: [width || 1, height || 1],
       u_pickBase: 0,
       u_hoverGroup: -1,
+      u_hoverInstances: [0, 0],
       u_dimActive: 0,
       u_dimOpacity: 1,
       u_recolor: 1, // links recolour toward the highlight hue
@@ -418,6 +419,7 @@ abstract class IndexedLinks {
   setHighlight(h: InstancedHighlight): void {
     const u = this.draw.uniforms;
     if (h.hoverGroup !== undefined) u["u_hoverGroup"] = h.hoverGroup;
+    if (h.hoverInstances !== undefined) u["u_hoverInstances"] = h.hoverInstances;
     if (h.dimActive !== undefined) u["u_dimActive"] = h.dimActive ? 1 : 0;
     if (h.dimOpacity !== undefined) u["u_dimOpacity"] = h.dimOpacity;
     if (h.recolor !== undefined) {
