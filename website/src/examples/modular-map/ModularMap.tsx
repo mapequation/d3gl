@@ -6,7 +6,8 @@ import { setup } from "./draw.js";
  *  colours, flow-sized nodes, and half-arrow links/super-edges that thicken with flow. The Layout
  *  control switches the module-aware GPU force layout ↔ the nested module layout (a warm, eased
  *  re-layout); the LOD control switches Off / Standard (structural) / Modules (the planted partition →
- *  half-arrow super-edges); Boundaries rings each module the cut has opened; Input hands the links
+ *  half-arrow super-edges); Boundaries rings each module the cut has opened (a line, or in the module's
+ *  fill and as wide as its enter flow); Input hands the links
  *  between modules over as an .ftree's module links, drawn from an opened module's ring. */
 export default function ModularMap() {
   return (
@@ -44,8 +45,9 @@ export default function ModularMap() {
           display: ["6", "12", "20", "30", "50", "100", "All"],
         },
         { type: "segmented", key: "crossLevel", label: "Cross-level edges", options: ["Off", "On"], value: "On" },
-        // Ring every module the cut has opened (#329): the module's disc under the nested layout.
-        { type: "segmented", key: "boundaries", label: "Boundaries", options: ["Off", "On"], value: "On" },
+        // Ring every module the cut has opened (#329): the module's disc under the nested layout — one thin
+        // line, or styled per module: its collapsed fill, and as wide as the flow into it (#471).
+        { type: "segmented", key: "boundaries", label: "Boundaries", options: ["Off", "Line", "Module"], value: "Module" },
         {
           type: "range",
           key: "crossFade",

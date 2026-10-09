@@ -1,7 +1,8 @@
 import { describe, it, expect } from "vitest";
+import { buildGraph } from "../graph.js";
 import { buildModuleLODTree, type ModuleLink, type ModuleNode } from "../modules.js";
-import { computeLODPositions, cut, makeCutBoundaries, visibleWorldRect, type BoundaryDiscs, type CutBoundaries, type LODTransform, type LODTree } from "../lod.js";
-import { boundaryRings, superEdges, type SuperEdgeStyleResolved } from "../glyphs.js";
+import { buildLODTree, computeLODPositions, cut, makeCutBoundaries, visibleWorldRect, type BoundaryDiscs, type CutBoundaries, type LODTransform, type LODTree } from "../lod.js";
+import { boundaryModuleWidths, boundaryRings, superEdges, type SuperEdgeStyleResolved } from "../glyphs.js";
 import { nestedLayout, nestedBoundaryDiscs } from "../nested-layout.js";
 
 /**
@@ -670,5 +671,61 @@ describe("boundaryRings (#329)", () => {
     expect(rings.radii[0]).toBe(centroid.extent[m1]);
     const tiny = { minX: centroid.cx[m1]! - 0.1, maxX: centroid.cx[m1]! + 0.1, minY: centroid.cy[m1]! - 0.1, maxY: centroid.cy[m1]! + 0.1 };
     expect(boundaryRings(centroid, bnd, { width: 1, color: "#000", opacity: 1, screen: false, k: 1 }, tiny).count).toBe(0);
+  });
+});
+
+describe("boundaryRings per module: the module's fill and its own width (#471)", () => {
+  const { tree, discs, byPath } = mapFixture();
+  const m1 = byPath.get("1")!;
+  const m2 = byPath.get("2")!;
+  const bnd = (): CutBoundaries => ({ radius: discs.r, ids: Uint32Array.from([m1, m2]), alpha: Float32Array.from([1, 0.5]), count: 2 });
+  const rows = tree.size - tree.leafCount;
+
+  it("looks each ring's width up by module id, in px at the zoom, and drops a module with none", () => {
+    const widths = new Float32Array(rows);
+    widths[m1 - tree.leafCount] = 6;
+    widths[m2 - tree.leafCount] = 0; // no value: no ring
+    const rings = boundaryRings(tree, bnd(), { width: 1, widths, color: "#000", opacity: 1, screen: true, k: 4 }, ALL);
+    expect(rings.count).toBe(1);
+    expect(rings.ids[0]).toBe(m1);
+    expect(rings.radii[0]! * rings.borders[0]!).toBeCloseTo(6 / 4, 5);
+    const world = boundaryRings(tree, bnd(), { width: 1, widths, color: "#000", opacity: 1, screen: false, k: 4 }, ALL);
+    expect(world.radii[0]! * world.borders[0]!).toBeCloseTo(6, 4);
+  });
+
+  it("looks each ring's colour up by module id, times the opacity and its children's fade", () => {
+    const colors = new Uint8Array(tree.size * 4);
+    colors.set([200, 10, 20, 255], m1 * 4);
+    colors.set([5, 150, 25, 128], m2 * 4);
+    const rings = boundaryRings(tree, bnd(), { width: 2, colors, color: "#000", opacity: 0.8, screen: false, k: 1 }, ALL);
+    expect(Array.from(rings.borderColors.subarray(0, 4))).toEqual([200, 10, 20, Math.round(255 * 0.8)]);
+    expect(Array.from(rings.borderColors.subarray(4, 8))).toEqual([5, 150, 25, Math.round(128 * 0.8 * 0.5)]);
+  });
+
+  it("with the tables null or absent, draws the one constant width and colour (#329)", () => {
+    const style = { width: 2, color: "rgba(10, 20, 30, 0.8)", opacity: 0.5, screen: true, k: 3 };
+    const a = boundaryRings(tree, bnd(), style, ALL);
+    const b = boundaryRings(tree, bnd(), { ...style, widths: null, colors: null }, ALL);
+    expect(Array.from(a.borders)).toEqual(Array.from(b.borders));
+    expect(Array.from(a.borderColors)).toEqual(Array.from(b.borderColors));
+    expect(a.radii[0]! * a.borders[0]!).toBeCloseTo(2 / 3, 5);
+  });
+
+  it("builds the widths once, by each module's Infomap path: the constant default where it has none", () => {
+    const seen: string[] = [];
+    const widths = boundaryModuleWidths(tree, (path) => (seen.push(path.join(":")), path.length === 1 ? 2 * path[0]! : undefined), 1);
+    expect(widths?.length).toBe(rows);
+    expect(seen.length).toBe(rows); // once per module (the root's path is [])
+    expect(new Set(seen).size).toBe(rows);
+    expect(widths?.[m1 - tree.leafCount]).toBe(2); // module [1]
+    expect(widths?.[m2 - tree.leafCount]).toBe(4); // module [2]
+    expect(widths?.[byPath.get("1:1")! - tree.leafCount]).toBe(1); // no value: the constant default
+  });
+
+  it("is null for a tree without module paths: every ring takes the constant width", () => {
+    let calls = 0;
+    const g = buildGraph({ nodeCount: 6, source: [0, 1, 2, 3, 4], target: [1, 2, 3, 4, 5] });
+    expect(boundaryModuleWidths(buildLODTree(g, { minNodes: 2 }), () => (calls++, 5), 1)).toBeNull();
+    expect(calls).toBe(0);
   });
 });

@@ -14,6 +14,7 @@ import { generateLFR } from "../network/data.js";
  * - `moduleEnterExit` — each module's own flow across its boundary, by Infomap path (`"1:100"`) → a
  *   collapsed module's ring. Smaller than its members' sum for a super-module: flow between its own
  *   submodules stays inside it.
+ * - `moduleEnter` — each module's enter flow alone, by the same path → an opened module's boundary width.
  * - `community` — the planted partition → the (ragged) module hierarchy (see {@link raggedModulePrefix}).
  */
 export interface ModularMapData {
@@ -26,6 +27,8 @@ export interface ModularMapData {
   enterExit: Float32Array;
   /** Module enter + exit flow keyed by the module's Infomap path joined with ":" (e.g. `"1:100"`). */
   moduleEnterExit: Map<string, number>;
+  /** Module enter flow alone, keyed like {@link moduleEnterExit}. */
+  moduleEnter: Map<string, number>;
   community: Int32Array;
   /** Infomap-shape module records for `data(graph, { modules })`: a **ragged** hierarchy — see {@link raggedModulePrefix}. */
   modulePaths: { id: number; path: number[] }[];
@@ -120,8 +123,8 @@ export function makeModularMap(nodeCount: number): ModularMapData {
   });
 
   const communities = new Set(Array.from(community)).size;
-  const moduleEnterExit = moduleBoundaryFlow(source, target, linkFlow, community);
-  return { nodeCount: n, communities, source, target, linkFlow, nodeFlow, enterExit, moduleEnterExit, community, modulePaths };
+  const { enterExit: moduleEnterExit, enter: moduleEnter } = moduleBoundaryFlow(source, target, linkFlow, community);
+  return { nodeCount: n, communities, source, target, linkFlow, nodeFlow, enterExit, moduleEnterExit, moduleEnter, community, modulePaths };
 }
 
 /**
@@ -129,7 +132,7 @@ export function makeModularMap(nodeCount: number): ModularMapData {
  * one endpoint inside it. A link between two communities leaves every module on the source's path below
  * the modules the two paths share, and enters every such module on the target's path.
  */
-function moduleBoundaryFlow(source: Uint32Array, target: Uint32Array, linkFlow: Float32Array, community: Int32Array): Map<string, number> {
+function moduleBoundaryFlow(source: Uint32Array, target: Uint32Array, linkFlow: Float32Array, community: Int32Array): { enterExit: Map<string, number>; enter: Map<string, number> } {
   const keysOf = new Map<number, string[]>(); // community → its module path keys, top down
   const keys = (c: number): string[] => {
     let k = keysOf.get(c);
@@ -141,6 +144,7 @@ function moduleBoundaryFlow(source: Uint32Array, target: Uint32Array, linkFlow: 
     return k;
   };
   const flow = new Map<string, number>();
+  const enter = new Map<string, number>();
   const add = (key: string, f: number) => flow.set(key, (flow.get(key) ?? 0) + f);
   for (let e = 0; e < source.length; e++) {
     const ca = community[source[e]!]!;
@@ -151,9 +155,12 @@ function moduleBoundaryFlow(source: Uint32Array, target: Uint32Array, linkFlow: 
     let shared = 0;
     while (shared < ka.length && shared < kb.length && ka[shared] === kb[shared]) shared++;
     for (let d = shared; d < ka.length; d++) add(ka[d]!, linkFlow[e]!); // exit
-    for (let d = shared; d < kb.length; d++) add(kb[d]!, linkFlow[e]!); // enter
+    for (let d = shared; d < kb.length; d++) {
+      add(kb[d]!, linkFlow[e]!); // enter
+      enter.set(kb[d]!, (enter.get(kb[d]!) ?? 0) + linkFlow[e]!);
+    }
   }
-  return flow;
+  return { enterExit: flow, enter };
 }
 
 /**

@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { buildGraph } from "../graph.js";
-import { resolveNodeFill, resolveFlowBorder, moduleBorderValues, applyModuleBorder, treeBorderColors, frontierCircles } from "../glyphs.js";
+import { resolveNodeFill, resolveFlowBorder, moduleBorderValues, applyModuleBorder, treeBorderColors, frontierCircles, nodeCircles, flowBorderInnerRadii } from "../glyphs.js";
 import { buildModuleLODTree } from "../modules.js";
 import { buildLODTree, buildMortonLODTree, computeLODPositions, computeLODStyle } from "../lod.js";
 
@@ -139,5 +139,49 @@ describe("frontierCircles ring colour lookup (#445)", () => {
     const fc = frontierCircles(tree, Uint32Array.from([3, 4]), style);
     expect(fc.borderColors![0]).toBe(100); // leaf 3
     expect(fc.borderColors![4]).toBe(border.color[0]); // the highest-flow node's colour
+  });
+});
+
+describe("flowBorder from moduleFlow alone (#471)", () => {
+  const g = buildGraph({ nodeCount: 4, source: [0, 2], target: [1, 3] });
+  // An `.ftree` has each module's flow, none per node: module [1] has a value, module [2] has none.
+  const moduleFlow = (path: readonly number[]) => (path.length === 1 && path[0] === 1 ? 0.5 : undefined);
+
+  it("needs flow or moduleFlow", () => {
+    expect(() => resolveFlowBorder(g, { scale: id }, "#000")).toThrow(/flow/);
+  });
+
+  it("rings only the modules with a value: no node, and no sum of values that do not exist", () => {
+    const scaleCalls: number[] = [];
+    const border = resolveFlowBorder(g, { scale: (v) => (scaleCalls.push(v), 10 * v), moduleFlow }, "#000");
+    expect(Array.from(border.metric).every(Number.isNaN)).toBe(true); // no node has a value
+    const tree = fourLeafTree();
+    computeLODStyle(tree, new Float32Array(4).fill(4), new Float32Array(4).fill(1), border.metric);
+    applyModuleBorder(tree, moduleBorderValues(tree, border)!);
+    expect(tree.border[4]).toBeCloseTo(0.5, 6); // module [1]: its own value
+    expect(tree.border[5]).toBeNaN(); // module [2]: none, and no members' sum
+    // The frontier: both leaves of module [2] and module [1] collapsed.
+    const c = frontierCircles(tree, Uint32Array.from([2, 3, 4]), { nodeFill: "#888", aggregateFill: "#888", border });
+    expect(c.borders![0]).toBe(0);
+    expect(c.borders![1]).toBe(0);
+    expect(c.borders![2]! * c.radii[2]!).toBeCloseTo(5, 4); // scale(0.5) = 5, module [1]'s own ring
+    expect(scaleCalls).toEqual([0.5]); // the scale is never asked for a missing value
+    // Collapsed module [2]: no ring either.
+    expect(frontierCircles(tree, Uint32Array.from([5]), { nodeFill: "#888", aggregateFill: "#888", border }).borders![0]).toBe(0);
+    // Without LOD every node is drawn — none has a ring, on the instanced path and the vector one.
+    const nodes = nodeCircles(g, { radii: new Float32Array(4).fill(4), fill: "#888", border });
+    expect(Array.from(nodes.borders!)).toEqual([0, 0, 0, 0]);
+    expect(Array.from(flowBorderInnerRadii(new Float32Array(4).fill(4), border.metric, border.scale))).toEqual([4, 4, 4, 4]);
+  });
+
+  it("never asks a colour accessor for a value that does not exist", () => {
+    const seen: [number, number][] = [];
+    const border = resolveFlowBorder(g, { scale: id, moduleFlow, color: (v, i) => (seen.push([v, i]), redOf(Number.isNaN(v) ? 10 : v)) }, "#000");
+    const tree = fourLeafTree();
+    computeLODStyle(tree, new Float32Array(4).fill(1), new Float32Array(4).fill(1), border.metric);
+    applyModuleBorder(tree, moduleBorderValues(tree, border)!);
+    treeBorderColors(tree, border);
+    expect(seen.every(([v]) => !Number.isNaN(v))).toBe(true);
+    expect(seen).toContainEqual([0.5, -1]); // module [1]'s ring colour, from its own value
   });
 });

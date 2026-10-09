@@ -377,8 +377,13 @@ export interface FlowBorderSpec {
   /**
    * Per-node enter/exit flow driving the border width: a caller `Float32Array` (length `nodeCount`)
    * or a built-in {@link NodeMetric}. Summed over members for module aggregates.
+   *
+   * Optional when {@link moduleFlow} is given (#471) — for input that has each module's flow but no
+   * per-node value, such as an Infomap `.ftree`. Then a node draws **no** ring, a module draws its
+   * `moduleFlow` value, and a module without one draws none: nothing is summed from values that do not
+   * exist. One of `flow` and `moduleFlow` is required.
    */
-  flow: Float32Array | NodeMetric;
+  flow?: Float32Array | NodeMetric;
   /** Maps the (summed) flow → ring width in the active `sizeMode`'s units, e.g. `scaleSqrt().range([0, 6])`. */
   scale: (value: number) => number;
   /**
@@ -404,7 +409,11 @@ export interface FlowBorderSpec {
 
 /** Resolved {@link FlowBorderSpec}: raw per-node metric + draw scale + ring colour (bytes for WebGL, CSS for export). */
 export interface ResolvedFlowBorder {
-  /** Raw per-node flow metric, length `nodeCount`; sum-aggregated onto the LOD tree for modules. */
+  /**
+   * Raw per-node flow metric, length `nodeCount`; sum-aggregated onto the LOD tree for modules. `NaN` marks
+   * "no value" (every node, when {@link FlowBorderSpec.flow} is omitted): no ring, and a sum over it is `NaN`
+   * too, so a module draws a ring only from its own {@link FlowBorderSpec.moduleFlow} value.
+   */
   metric: Float32Array;
   scale: (value: number) => number;
   /** Representative ring colour (the single colour, or a fallback for LOD aggregates). */
@@ -429,7 +438,11 @@ export function resolveFlowBorder(graph: NetworkGraph, spec: FlowBorderSpec, fal
   const n = graph.nodeCount;
   const { moduleFlow } = spec;
   let metric: Float32Array;
-  if (spec.flow instanceof Float32Array) {
+  if (spec.flow === undefined) {
+    // Module flow only (#471): no node has a value, so none rings and no module sums one.
+    if (!moduleFlow) throw new Error("flowBorder needs `flow`, `moduleFlow`, or both");
+    metric = new Float32Array(n).fill(NaN);
+  } else if (spec.flow instanceof Float32Array) {
     if (spec.flow.length !== n) throw new Error(`flowBorder.flow length ${spec.flow.length} !== nodeCount ${n}`);
     metric = spec.flow;
   } else {
@@ -440,17 +453,20 @@ export function resolveFlowBorder(graph: NetworkGraph, spec: FlowBorderSpec, fal
   if (typeof spec.color === "function") {
     const colorOf = spec.color;
     const colors = new Uint8Array(n * 4);
+    // A node without a value draws no ring, so its colour is never read: the accessor is not asked for it.
     for (let i = 0; i < n; i++) {
+      if (Number.isNaN(metric[i]!)) continue;
       const [r, g, b, a] = toRGBA(colorOf(metric[i]!, i, graph));
       colors[i * 4] = r;
       colors[i * 4 + 1] = g;
       colors[i * 4 + 2] = b;
       colors[i * 4 + 3] = a;
     }
-    // Representative (the highest-flow node's colour) for LOD aggregates / single-colour fallbacks.
+    // Representative (the highest-flow node's colour) for LOD aggregates / single-colour fallbacks; with
+    // module flow only, the accessor's colour for a zero aggregate value.
     let rep = 0;
     for (let i = 1; i < n; i++) if (metric[i]! > metric[rep]!) rep = i;
-    const colorCss = colorOf(metric[rep] ?? 0, rep, graph);
+    const colorCss = Number.isNaN(metric[rep] ?? NaN) ? colorOf(0, -1, graph) : colorOf(metric[rep] ?? 0, rep, graph);
     const aggregateColor = (v: number) => toRGBA(colorOf(v, -1, graph));
     return { metric, scale: spec.scale, color: toRGBA(colorCss), colorCss, colors, aggregateColor, moduleFlow };
   }
@@ -472,13 +488,24 @@ export function resolveFlowBorder(graph: NetworkGraph, spec: FlowBorderSpec, fal
  */
 export function moduleBorderValues(tree: LODTree, border: ResolvedFlowBorder | null): Float32Array | null {
   const moduleFlow = border?.moduleFlow;
+  return moduleFlow ? modulePathValues(tree, moduleFlow) : null;
+}
+
+/**
+ * A per-module accessor read once per aggregate of a **module tree**, by the Infomap path its `parent` +
+ * `branch` spell (`[]` = the root), into an array indexed by `g − leafCount` (`NaN` where it returns
+ * `undefined`). `null` for a tree that is not a module tree (structural coarsening / spatial): it has no
+ * paths. O(modules × depth) accessor work and one `Float32Array(modules)` — call it once per (style, tree),
+ * never per frame. Shared by {@link FlowBorderSpec.moduleFlow} and the module-boundary `width` (#471).
+ */
+export function modulePathValues(tree: LODTree, valueOf: (path: readonly number[]) => number | undefined): Float32Array | null {
   const { parent, branch, leafCount, size } = tree;
-  if (!moduleFlow || !parent || !branch) return null;
+  if (!parent || !branch) return null;
   const values = new Float32Array(size - leafCount);
   for (let g = leafCount; g < size; g++) {
     const path: number[] = [];
     for (let a = g; a >= 0 && parent[a]! >= 0; a = parent[a]!) path.push(branch[a]!);
-    const v = moduleFlow(path.reverse());
+    const v = valueOf(path.reverse());
     values[g - leafCount] = v === undefined ? NaN : v;
   }
   return values;
@@ -512,6 +539,7 @@ export function treeBorderColors(tree: LODTree, border: ResolvedFlowBorder | nul
   const out = new Uint8Array(tree.size * 4);
   out.set(leafColors.subarray(0, tree.leafCount * 4));
   for (let g = tree.leafCount; g < tree.size; g++) {
+    if (Number.isNaN(tree.border[g]!)) continue; // no value, no ring (#471): its colour is never read
     const c = aggregateColor(tree.border[g]!);
     out[g * 4] = c[0];
     out[g * 4 + 1] = c[1];
@@ -553,7 +581,9 @@ function buildBorders(
   const borderColors = adopt && perNodeColors ? perNodeColors : new Uint8Array(count * 4);
   for (let i = 0; i < count; i++) {
     const r = radii[i]!;
-    borders[i] = r > 0 ? clamp01(scale(valueOf(i)) / r) : 0;
+    const v = valueOf(i);
+    // `NaN` = no value (#471): no ring, and the scale is never asked for one.
+    borders[i] = r > 0 && !Number.isNaN(v) ? clamp01(scale(v) / r) : 0;
     if (adopt && perNodeColors) continue;
     if (perNodeColors) {
       borderColors[i * 4] = perNodeColors[i * 4]!;
@@ -649,7 +679,8 @@ export function flowBorderInnerRadii(radii: ArrayLike<number>, metric: ArrayLike
   const inner = new Float32Array(n);
   for (let i = 0; i < n; i++) {
     const r = radii[i]!;
-    inner[i] = Math.max(0, r - Math.min(r, scale(metric[i]!)));
+    const v = metric[i]!;
+    inner[i] = Number.isNaN(v) ? r : Math.max(0, r - Math.min(r, scale(v))); // `NaN`: no value, no ring (#471)
   }
   return inner;
 }
@@ -925,12 +956,42 @@ export interface FrontierHalosData extends InstancedCirclesData {
 export interface ModuleBoundaryResolved {
   /** Ring thickness in the active sizeMode's units (px when {@link screen}). */
   width: number;
+  /**
+   * Per-module ring thickness (#471), indexed `g − leafCount`, in the same units as {@link width}, which it
+   * replaces: a `moduleBoundary.width` accessor, from {@link boundaryModuleWidths}. A module whose entry is
+   * not positive gets no ring.
+   */
+  widths?: Float32Array | null;
   /** Ring colour (any CSS colour); its alpha is multiplied by {@link opacity}. */
   color: string;
+  /**
+   * Per-tree-node RGBA (#471), indexed by tree-node id (length `4·tree.size`), replacing {@link color}:
+   * `moduleBoundary.color: "fill"` under per-node fills — the tree's own `color`, i.e. exactly what each
+   * collapsed module is filled with. Its alpha is multiplied by {@link opacity} too.
+   */
+  colors?: Uint8Array | null;
+  /**
+   * The colour of a module of **one** leaf, replacing {@link color} for it (#471): a collapsed one-leaf
+   * module is drawn as that leaf, in the node fill, so `"fill"` rings it in that colour. Absent ⇒ `color`.
+   */
+  leafColor?: string;
   opacity: number;
   /** Screen sizeMode: `width` is px, turned into world units at the zoom `k`. */
   screen: boolean;
   k: number;
+}
+
+/**
+ * Per-module ring widths for a module-boundary `width` accessor (#471): {@link modulePathValues} of
+ * `widthOf`, with `fallback` (the constant default) wherever it returns `undefined`. Indexed `g − leafCount`,
+ * in the active sizeMode's units. `null` for a tree that is not a module tree — its aggregates have no
+ * path, so all of them take the constant width. Once per (style, tree), never per frame: the per-frame
+ * ring build ({@link boundaryRings}) only indexes it.
+ */
+export function boundaryModuleWidths(tree: LODTree, widthOf: (path: readonly number[]) => number | undefined, fallback: number): Float32Array | null {
+  const widths = modulePathValues(tree, widthOf);
+  if (widths) for (let m = 0; m < widths.length; m++) if (Number.isNaN(widths[m]!)) widths[m] = fallback;
+  return widths;
 }
 
 /**
@@ -939,7 +1000,10 @@ export interface ModuleBoundaryResolved {
  * `boundaries.radius`) or the centroid + `extent` — with the ring's outer edge on the circle. A world-sized ring batch (world radius,
  * a `width`-thick border: constant px in `screen` sizeMode, so the fraction is re-derived at the zoom
  * `k`), faded by each module's children's cross-fade alpha. A ring whose circle wholly contains the view
- * is dropped (its stroke is off-screen). O(collected modules) — the expanded modules in view.
+ * is dropped (its stroke is off-screen), and so is one whose width is not positive. With per-module
+ * {@link ModuleBoundaryResolved.widths} / {@link ModuleBoundaryResolved.colors} (#471) each ring looks its
+ * own up by module id — resolved once per (style, tree), never here. O(collected modules) — the expanded
+ * modules in view.
  */
 export function boundaryRings(
   tree: LODTree,
@@ -949,11 +1013,20 @@ export function boundaryRings(
 ): FrontierHalosData {
   const { ids: expanded, alpha, radius } = boundaries;
   const n = boundaries.count;
-  const w = style.screen ? style.width / (style.k || 1) : style.width; // ring thickness, world units
+  const { widths, colors } = style;
+  const { leafCount } = tree;
+  const k = style.k || 1;
+  // Ring thickness, world units: the module's own (#471) or the constant one.
+  const widthOf = (g: number): number => {
+    const w = widths ? widths[g - leafCount]! : style.width;
+    return style.screen ? w / k : w;
+  };
   const circle = new Float64Array(3);
   // Whether the ring's stroke (the annulus [r − w, r]) can reach the view: not when the view sits wholly
   // inside its inner circle (a module zoomed deep into). The cut already dropped circles missing the view.
   const shows = (g: number): boolean => {
+    const w = widthOf(g);
+    if (!(w > 0)) return false;
     boundaryCircle(tree, g, radius, circle);
     const r = circle[2]!;
     if (!(r > 0)) return false;
@@ -970,23 +1043,32 @@ export function boundaryRings(
   const borders = new Float32Array(count);
   const borderColors = new Uint8Array(count * 4);
   const ids = new Uint32Array(count);
-  const [cr, cg, cb, ca] = toRGBA(style.color);
-  const base = ca * Math.max(0, Math.min(1, style.opacity));
-  let k = 0;
+  const constant = toRGBA(style.color);
+  const leaf = style.leafColor !== undefined ? toRGBA(style.leafColor) : null;
+  const opacity = Math.max(0, Math.min(1, style.opacity));
+  let o = 0;
   for (let i = 0; i < n; i++) {
     const g = expanded[i]!;
     if (!shows(g)) continue;
     boundaryCircle(tree, g, radius, circle);
-    ids[k] = g;
-    centers[k * 2] = circle[0]!;
-    centers[k * 2 + 1] = circle[1]!;
-    radii[k] = circle[2]!;
-    borders[k] = Math.min(1, w / circle[2]!);
-    borderColors[k * 4] = cr;
-    borderColors[k * 4 + 1] = cg;
-    borderColors[k * 4 + 2] = cb;
-    borderColors[k * 4 + 3] = Math.round(base * alpha[i]!);
-    k++;
+    ids[o] = g;
+    centers[o * 2] = circle[0]!;
+    centers[o * 2 + 1] = circle[1]!;
+    radii[o] = circle[2]!;
+    borders[o] = Math.min(1, widthOf(g) / circle[2]!);
+    if (colors) {
+      borderColors[o * 4] = colors[g * 4]!;
+      borderColors[o * 4 + 1] = colors[g * 4 + 1]!;
+      borderColors[o * 4 + 2] = colors[g * 4 + 2]!;
+      borderColors[o * 4 + 3] = Math.round(colors[g * 4 + 3]! * opacity * alpha[i]!);
+    } else {
+      const c = leaf && tree.count[g] === 1 ? leaf : constant;
+      borderColors[o * 4] = c[0];
+      borderColors[o * 4 + 1] = c[1];
+      borderColors[o * 4 + 2] = c[2];
+      borderColors[o * 4 + 3] = Math.round(c[3] * opacity * alpha[i]!);
+    }
+    o++;
   }
   // Transparent fill (alpha 0): only the ring shows, over the module's own members.
   return { centers, radii, colors: new Uint8Array(count * 4), borders, borderColors, count, ids };

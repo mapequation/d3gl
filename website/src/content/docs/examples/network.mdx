@@ -679,9 +679,9 @@ net.lod({
   members, with their extent as its radius. The disc is also what the cut sees: after a nested layout a
   module is culled by its disc and opens once the disc is `expandPx` across on screen, rings or not.
 - **`width`** is in the active `sizeMode`'s units, so in `screen` mode it is a constant pixel stroke
-  around a ring that scales with the map. Rings fade with their members under `crossFade`, draw under
-  every link and node, and export with `toSVG()` / `toPNG()` on every backend. The root, which is the
-  whole network, gets no ring.
+  around a ring that scales with the map. Rings fade with their members under `crossFade`, draw **above
+  the links and under the nodes**, so a dense module's links never hide where it ends, and export with
+  `toSVG()` / `toPNG()` on every backend. The root, which is the whole network, gets no ring.
 - **Module links stay drawn.** With `data(graph, { modules, moduleLinks })`, as for an Infomap
   `.ftree`, a link between modules A and B exists only at their level. When A expands there is no finer
   link to show, so it used to disappear. With `crossLevelEdges` on, it is drawn from **A's ring** with
@@ -694,6 +694,35 @@ net.lod({
 - **Cost.** Each frame costs one ring per expanded module in view. The cut visits those modules anyway,
   so it walks the tree exactly as it does without rings. Anchoring adds those modules' own module links.
   It never costs the whole tree, and it is nothing when the option is off.
+
+#### Rings styled per module
+
+A collapsed module shows its own colour, and with `flowBorder` a ring as wide as its flow. Once it opens,
+its boundary can be styled by its module too (the example above's **Boundaries: Module**):
+
+```ts
+net.style({
+  nodeFill: (i) => moduleColor[i], // a collapsed module is filled with its members' colour
+  // An Infomap .ftree has each module's enter/exit flow, but none per node: give `moduleFlow` alone.
+  flowBorder: { scale: ringScale, moduleFlow: (path) => enterExitOf(path) },
+});
+net.lod({
+  // In its collapsed fill, as wide as the flow into the module (its enter flow, through the same scale).
+  moduleBoundary: { color: "fill", width: (path) => ringScale(enterOf(path)), opacity: 0.85 },
+});
+```
+
+- **`color: "fill"`** rings each module in its own fill, the colour it is drawn in when collapsed: its
+  `nodeFill` module colour, or `aggregateFill`.
+- **`width: (path) => number | undefined`** sizes each ring by the module's Infomap `path` (`[2, 1]` is
+  sub-module 1 of top module 2), in the active `sizeMode`'s units. `undefined` takes the constant default,
+  as does every aggregate of a tree that is not a module hierarchy (it has no paths), and `0` draws no ring.
+- **`flowBorder` from module flow alone.** With `moduleFlow` and no `flow`, no node is ringed, a module is
+  ringed by its own value, and a module without one has no ring: nothing is summed from values that do
+  not exist.
+- The colours and widths are resolved once per module, when the style is resolved against the tree (again
+  after a `style()` or `lod()` call, or for a new tree). A frame only looks each ring's colour and width
+  up, so it costs what the constant ring does.
 
 ### Switching layouts live, from where the nodes are
 

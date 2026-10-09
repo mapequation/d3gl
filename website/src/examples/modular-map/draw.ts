@@ -1,4 +1,4 @@
-import { network, buildGraph, moduleColors } from "@mapequation/d3gl/network";
+import { network, buildGraph, moduleColors, type NetworkLODOptions } from "@mapequation/d3gl/network";
 import { scaleSequentialLog, scaleSqrt, type ScaleContinuousNumeric } from "d3-scale";
 import { interpolateViridis } from "d3-scale-chromatic";
 import type { ImperativeSetup } from "../types.js";
@@ -37,12 +37,19 @@ const SIZES = [500, 1_000, 2_000, 5_000, 10_000, 20_000];
  * the force model's own scale as it converges, the camera framing it as it grows. (Both fall back to the CPU
  * worker where the GPU layout cannot run.)
  *
+ * **Boundaries: Module** (#471) styles each opened module's ring by its module: `color: "fill"` rings it
+ * in the fill it had when collapsed, and `width: (path) => …` makes it as wide as the flow *into* the
+ * module (its enter flow, through the same scale as the flow-border ring, which shows enter + exit flow).
+ * **Line** is one thin ring for every module. Either way the rings sit above the links and below the nodes.
+ *
  * The **Input** control hands the same map over as an Infomap **`.ftree`** would (#199): the graph keeps
  * only the links inside each bottom module, and the links between modules arrive as **module links**,
  * `data(graph, { modules, moduleLinks })`. Then no leaf edge carries a module's connectivity once it opens
  * — with **Boundaries** and **Cross-level edges** on, its links stay drawn, anchored at its ring (#329) —
  * and the **Force** layout pulls along the module links instead (#455): each is a spring between its two
- * modules' members, so linked modules gather and a dragged module pulls the ones it is linked to.
+ * modules' members, so linked modules gather and a dragged module pulls the ones it is linked to. An
+ * `.ftree` has each module's enter/exit flow but none per node, so the flow border is given `moduleFlow`
+ * alone (#471): the modules are ringed by their flow, the nodes not at all.
  *
  * The **Nodes** slider resizes the generated network (500 → 20,000): the map is regenerated — flow and
  * all — and re-laid-out, framing itself each time. The **LOD** control switches the cut:
@@ -85,6 +92,7 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
   let colors: string[] = [];
   let enterExit: Float32Array<ArrayBufferLike> = new Float32Array();
   let moduleEnterExit = new Map<string, number>();
+  let moduleEnter = new Map<string, number>();
   let flowColor: (flow: number) => string;
   let maxNodeFlow = 1;
   let ringW: ScaleContinuousNumeric<number, number>;
@@ -101,6 +109,7 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
         const d = makeModularMap(n);
         enterExit = d.enterExit;
         moduleEnterExit = d.moduleEnterExit;
+        moduleEnter = d.moduleEnter;
         // Categorical colour per planted module; aggregates inherit their module's colour under LOD.
         colors = moduleColors(d.modulePaths, { lightness: 62, chroma: 58 });
         maxNodeFlow = d.nodeFlow.reduce((a, b) => Math.max(a, b), 0);
@@ -168,8 +177,13 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
         // module is then filled by its members' total flow.
         nodeFill: options.fill === "Flow" ? { by: "flow", scale: flowColor } : (i) => colors[i]!,
         // Ring ∝ enter/exit flow; colour omitted ⇒ a darker shade of each glyph's own fill. A collapsed
-        // module rings by its OWN enter/exit flow (by Infomap path), not its members' sum.
-        flowBorder: { flow: enterExit, scale: ringW, moduleFlow: (path) => moduleEnterExit.get(path.join(":")) },
+        // module rings by its OWN enter/exit flow (by Infomap path), not its members' sum. An .ftree has
+        // no per-node enter/exit flow: then only `moduleFlow` is given, and only the modules are ringed.
+        flowBorder: {
+          flow: input === ".ftree" ? undefined : enterExit,
+          scale: ringW,
+          moduleFlow: (path) => moduleEnterExit.get(path.join(":")),
+        },
         linkBend: 0.15, // fraction of the link's length — keeps its shape at every zoom
         linkWidth: linkW, // half-arrow width ∝ link flow; super-edges use accumulated flow
         linkStroke, // semi-transparent blue, alpha ∝ flow
@@ -178,7 +192,18 @@ export const setup: ImperativeSetup = (host, { width, height, backend }) => {
       // #329: one outline per module — a ring a few px outside a collapsed module's glyph (marking it as
       // expandable) and, once the cut opens it, around its nested disc — so the map of modules stays
       // readable as you zoom into it. (Style the collapsed ring separately with `aggregateOutline`.)
-      const moduleBoundary = options.boundaries === "Off" ? undefined : { width: 1, opacity: 0.45 };
+      // #471 "Module": an open module's ring in its collapsed fill, as wide as the flow into it (its enter
+      // flow through the ring scale; `undefined` → the default width). Read once per module, not per frame.
+      const enterWidth = (path: readonly number[]): number | undefined => {
+        const flow = moduleEnter.get(path.join(":"));
+        return flow === undefined ? undefined : ringW(flow);
+      };
+      const moduleBoundary: NetworkLODOptions["moduleBoundary"] =
+        options.boundaries === "Off"
+          ? undefined
+          : options.boundaries === "Line"
+            ? { width: 1, opacity: 0.45 }
+            : { color: "fill", width: enterWidth, opacity: 0.85 };
       // Opt-in #139: keep a visible leaf's links to a still-collapsed module across a mixed frontier.
       // Opt-in #133: ease modules ↔ sub-members across the expand threshold (slider × 0.1 = fade band).
       const crossLevelEdges = options.crossLevel === "On";

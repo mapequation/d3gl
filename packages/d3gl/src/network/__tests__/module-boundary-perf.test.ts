@@ -14,7 +14,7 @@ import {
   type LODTransform,
   type LODTree,
 } from "../lod.js";
-import { boundaryRings, makeSuperEdgesScratch, superEdges, type SuperEdgeStyleResolved } from "../glyphs.js";
+import { boundaryModuleWidths, boundaryRings, makeSuperEdgesScratch, superEdges, type ModuleBoundaryResolved, type SuperEdgeStyleResolved } from "../glyphs.js";
 import { buildGraph } from "../graph.js";
 import { buildModuleLODTree, type ModuleLink, type ModuleNode } from "../modules.js";
 
@@ -31,7 +31,11 @@ import { buildModuleLODTree, type ModuleLink, type ModuleNode } from "../modules
  *      boundaries on next to the same pipeline with them off;
  *   4. **reductions OFF**: a cut that opens every module (every leaf drawn, every module ringed, every
  *      module link anchored — the whole map is the visible set) under its own budget;
- *   5. a raw network (no module links) gathers byte-identically with the anchor passed.
+ *   5. a raw network (no module links) gathers byte-identically with the anchor passed;
+ *   6. per-module rings (#471, `moduleBoundary: { width: (path) => …, color: "fill" }`): the width table
+ *      is built once (one accessor call per module) and the per-frame ring build calls it **zero** times —
+ *      it only indexes that table and the tree's own colours — at a frame cost next to the constant rings',
+ *      on the sweep (reductions ON) and with every module open (reductions OFF).
  *
  * The fixture is `.ftree`-shaped: graph edges only inside bottom modules, module links between siblings
  * at every level, module discs nested (the geometry the nested layout gives, placed directly so a 1M
@@ -156,14 +160,19 @@ class Pipeline {
   constructor(readonly tree: LODTree, readonly discs: BoundaryDiscs) {
     this.bnd.radius = discs.r;
   }
-  frame(t: LODTransform, boundaries: boolean, opts: { expandPx?: number; declutter?: boolean } = {}): { frontier: Uint32Array; edges: number; rings: number; bytes: number } {
+  frame(
+    t: LODTransform,
+    boundaries: boolean,
+    opts: { expandPx?: number; declutter?: boolean } = {},
+    ring: Pick<ModuleBoundaryResolved, "widths" | "colors"> = {},
+  ): { frontier: Uint32Array; edges: number; rings: number; bytes: number } {
     const { tree, bnd } = this;
     bnd.count = 0;
     let frontier = cut(tree, t, W, H, { expandPx: opts.expandPx, maxAggregateRadius: 26, boundaries: boundaries ? bnd : undefined }, this.cutScratch);
     if (opts.declutter !== false) frontier = declutterFrontier(tree, frontier, t, W, H, { screenSized: false, k: t.k, maxAggregateRadius: 26 }, this.declutterScratch);
     const view = visibleWorldRect(t, W, H);
     const se = superEdges(tree, frontier, { ...SE_STYLE, anchor: boundaries ? bnd : undefined }, view, this.seScratch);
-    const rings = boundaries ? boundaryRings(tree, bnd, { width: 1, color: "#3a3f52", opacity: 0.5, screen: false, k: t.k }, view) : null;
+    const rings = boundaries ? boundaryRings(tree, bnd, { width: 1, color: "#3a3f52", opacity: 0.5, screen: false, k: t.k, ...ring }, view) : null;
     const ha = se.halfArrows;
     const bytes = (ha ? ha.sources.byteLength * 2 + ha.radii.byteLength + ha.widths.byteLength + ha.bends.byteLength + ha.colors.byteLength : 0) + (rings ? rings.centers.byteLength + rings.radii.byteLength * 3 + rings.colors.byteLength * 2 : 0);
     return { frontier, edges: se.ids.length, rings: rings?.count ?? 0, bytes };
@@ -266,21 +275,33 @@ function openable(tree: LODTree): number {
   return n;
 }
 
+/**
+ * The per-module ring style of #471 on `tree`, as the engine resolves it once per (style, tree): a width
+ * accessor by Infomap path (counted) — the constant default at every fourth depth (`undefined`), no ring at
+ * depth 3 (`0`) — into the width table, and a colour per tree node (the module fills).
+ */
+function perModule(tree: LODTree): { ring: Pick<ModuleBoundaryResolved, "widths" | "colors">; calls: { width: number } } {
+  const calls = { width: 0 };
+  for (let g = 0; g < tree.size; g++) tree.color.set([(g * 37) % 256, (g * 91) % 256, (g * 17) % 256, 255], g * 4);
+  const widthOf = (path: readonly number[]): number | undefined => (calls.width++, path.length % 4 === 0 ? undefined : path.length === 3 ? 0 : 1 + path.length);
+  return { ring: { widths: boundaryModuleWidths(tree, widthOf, 1), colors: tree.color }, calls };
+}
+
 function stats(ts: number[]): { median: number; p95: number } {
   const s = [...ts].sort((a, b) => a - b);
   return { median: s[Math.floor(s.length / 2)]!, p95: s[Math.min(s.length - 1, Math.floor(s.length * 0.95))]! };
 }
 
 /** Time the sweep for one variant (after a warm pass), checking the deterministic signatures per frame. */
-function timedSweep(p: Pipeline, frames: LODTransform[], boundaries: boolean): { ts: number[]; rings: number; edges: number } {
-  for (const t of frames) p.frame(t, boundaries); // warm: JIT + every grow-on-demand array
+function timedSweep(p: Pipeline, frames: LODTransform[], boundaries: boolean, ring: Pick<ModuleBoundaryResolved, "widths" | "colors"> = {}): { ts: number[]; rings: number; edges: number } {
+  for (const t of frames) p.frame(t, boundaries, {}, ring); // warm: JIT + every grow-on-demand array
   const refs = { ids: p.bnd.ids, seen: p.seScratch.seen, cutFrontier: p.cutScratch.frontier };
   const ts: number[] = [];
   let rings = 0;
   let edges = 0;
   for (const t of frames) {
     const t0 = performance.now();
-    const f = p.frame(t, boundaries);
+    const f = p.frame(t, boundaries, {}, ring);
     ts.push(performance.now() - t0);
     rings = Math.max(rings, f.rings);
     edges = Math.max(edges, f.edges);
@@ -290,6 +311,49 @@ function timedSweep(p: Pipeline, frames: LODTransform[], boundaries: boolean): {
     expect(p.cutScratch.frontier).toBe(refs.cutFrontier);
   }
   return { ts, rings, edges };
+}
+
+/**
+ * #471's guard on one map: the per-module width table costs one accessor call per module, once, and the
+ * frames none; the per-module rings' frame sits next to the constant rings' on the sweep (reductions ON)
+ * and with every module open, declutter on and off (reductions OFF: every leaf drawn, every module ringed).
+ * `assertTime` adds the wall-clock ratios (always-on, loose; the at-scale leg under `PERF_ASSERT`).
+ */
+function checkPerModule(m: Map, assertTime: boolean, log?: (line: string) => void): void {
+  const { ring, calls } = perModule(m.tree);
+  const modules = m.tree.size - m.tree.leafCount;
+  expect(calls.width, "width accessor calls building the table: one per module").toBe(modules);
+  expect(ring.widths?.length).toBe(modules);
+  const atBuild = calls.width;
+  const frames = sweep(m);
+  const p = new Pipeline(m.tree, m.discs);
+  const constant = timedSweep(p, frames, true);
+  const flow = timedSweep(p, frames, true, ring);
+  expect(flow.rings, "the sweep rings modules").toBeGreaterThan(0);
+  // A module of width 0 has no ring: never more rings than the constant style draws.
+  expect(flow.rings).toBeLessThanOrEqual(constant.rings);
+  const sweepC = stats(constant.ts).median;
+  const sweepF = stats(flow.ts).median;
+  log?.(`#471 sweep  constant rings median=${sweepC.toFixed(3)}ms  per-module rings median=${sweepF.toFixed(3)}ms  rings=${flow.rings}`);
+  if (assertTime) expect(sweepF, `sweep: per-module rings ${sweepF.toFixed(3)}ms vs constant ${sweepC.toFixed(3)}ms`).toBeLessThan(2 * sweepC + 0.5);
+  for (const declutter of [true, false]) {
+    const all = { expandPx: 1e-6, declutter };
+    const time = (r: Pick<ModuleBoundaryResolved, "widths" | "colors">): { ms: number; rings: number } => {
+      p.frame(fitView(m), true, all, r); // warm
+      const t0 = performance.now();
+      const f = p.frame(fitView(m), true, all, r);
+      return { ms: performance.now() - t0, rings: f.rings };
+    };
+    const c = time({});
+    const f = time(ring);
+    log?.(`#471 every module open  declutter=${declutter}  constant ${c.ms.toFixed(1)}ms (${c.rings} rings)  per-module ${f.ms.toFixed(1)}ms (${f.rings} rings)`);
+    expect(c.rings).toBe(openable(m.tree));
+    expect(f.rings, `declutter=${declutter}: the modules with a width, every one ringed`).toBeGreaterThan(0);
+    expect(f.rings).toBeLessThan(c.rings); // the ones of width 0 dropped
+    if (assertTime) expect(f.ms, `every module open, declutter=${declutter}: per-module ${f.ms.toFixed(0)}ms vs constant ${c.ms.toFixed(0)}ms`).toBeLessThan(1.5 * c.ms + 20);
+  }
+  // The deterministic signature: no frame resolved a width.
+  expect(calls.width - atBuild, "width accessor calls during the frames").toBe(0);
 }
 
 describe("#329 module boundaries per-frame cost", () => {
@@ -345,6 +409,10 @@ describe("#329 module boundaries per-frame cost", () => {
       expect(a.ids).toEqual(b.ids);
       expect(a.halfArrows?.sources).toEqual(b.halfArrows?.sources);
     }
+  });
+
+  it("#471 per-module rings: resolved once, only looked up per frame — sweep and every module open (100k)", () => {
+    checkPerModule(ftreeMap(100_000), true);
   });
 
   it("rings a big flat module's rim at no cost beyond the walk the cut does without the ring", () => {
@@ -410,6 +478,8 @@ describe("#329 module boundaries per-frame cost", () => {
           if (ASSERT) expect(ms, `every module open, declutter=${declutter}, boundaries=${boundaries}: ${ms.toFixed(0)}ms at N=${BENCH_N}`).toBeLessThan(ALL_OPEN_MS);
         }
       }
+      // #471: per-module rings (fill + flow width) on the same map — resolved once, looked up per frame.
+      checkPerModule(m, ASSERT, log);
       // A flat bottom module of N leaves with only its rim in view: the ring costs the walk nothing.
       const rim = checkRim(BENCH_N, ASSERT);
       log(`flat-module rim  boundaries=false ${rim.off.median.toFixed(3)}ms  boundaries=true ${rim.on.median.toFixed(3)}ms  stack=${rim.on.stack}`);
