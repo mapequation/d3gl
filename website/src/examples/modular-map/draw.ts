@@ -64,23 +64,32 @@ const SIZES = [500, 1_000, 2_000, 5_000, 10_000, 20_000];
  * size — re-ranked + re-placed as you pan/zoom. Unlike the symmetric gasket, flow varies here, so a
  * `max` cap meaningfully surfaces the dominant modules/hubs.
  *
- * `net.interactive({ selectable, hover, draggable })` adds the selection/hover rings + node-drag (#140):
- * hover/click rings a node or module, ⇧+drag box-selects (⌥ subtracts), and dragging a glyph — or a whole
+ * `net.interactive({ selectable, hover, draggable, tooltip })` adds the selection/hover rings, a tooltip and
+ * node-drag (#140): hover/click rings a node or module, ⇧+drag box-selects (⌥ subtracts), and dragging a glyph — or a whole
  * selection, or a collapsed module — moves it: the GPU seed reheats around it, and under the **nested**
  * layout the node follows the cursor while only its module is re-laid out around it (a collapsed
  * module's sibling modules move aside in their parent); dragged to its module's edge, the node takes the
  * module's disc and ring along, pushing the modules around it aside, up the levels. Hold ⌘ (Ctrl on
  * Windows/Linux) to pan instead, even over a glyph (#178). It shows the selection/hover ring living
- * alongside the per-node **flowBorder** ring and a module's **outline**.
+ * alongside the per-node **flowBorder** ring and a module's **outline**. With **Boundaries** on, a module
+ * the cut has opened is hovered and selected by its **ring** (#476): the tooltip names the module, and the
+ * highlight is drawn on its ring, exactly as for the module collapsed.
  */
 export const setup: ImperativeSetup = (host, { width, height, backend }) => {
   const net = network(host, { width, height, backend });
   net.enableZoom([0.1, 40]); // default view; zoom out to the module map, in to single nodes
-  // Selection + hover rings and node-drag (#140): hover/click rings a node or module (green hover, blue
-  // selection), ⇧+drag box-selects (⌥ subtracts, red preview), and dragging a glyph — or a whole selected
-  // set, or a collapsed module — moves it (⌘/Ctrl-drag pans instead). Note how the selection/hover ring
-  // sits alongside the per-node flowBorder ring and a collapsed module's outline.
-  net.interactive({ selectable: { multi: true }, draggable: true, hover: true });
+  // Selection + hover rings and node-drag (#140): hover/click rings a node or module (red), ⇧+drag
+  // box-selects (⌥ subtracts, yellow preview), and dragging a glyph — or a whole selected set, or a collapsed
+  // module — moves it (⌘/Ctrl-drag pans instead). Note how the selection/hover ring sits alongside the
+  // per-node flowBorder ring and a collapsed module's outline. An open module is hovered by its boundary
+  // ring (#476): the same module datum, with `open: true`.
+  net.interactive({
+    selectable: { multi: true },
+    draggable: true,
+    hover: true,
+    tooltip: (d, id) =>
+      d.aggregate ? `${d.path ? `Module ${d.path.join(":")}` : "Aggregate"} · ${d.count} nodes${d.open ? " (open)" : ""}` : `Node n${id}`,
+  });
 
   // Labels slider → max cap; the last position is "All" (no limit).
   const LABEL_CAPS = [6, 12, 20, 30, 50, 100, Infinity];

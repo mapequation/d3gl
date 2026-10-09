@@ -47,7 +47,7 @@ const HL_RED: [number, number, number] = [0.863, 0.149, 0.149];
 
 /** Default highlight uniforms: no hover, no dim; `recolor` = 1 tints highlighted instances (links), 0 keeps (nodes). */
 function highlightUniforms(recolor: 0 | 1): Record<string, unknown> {
-  return { u_hoverGroup: -1, u_dimActive: 0, u_dimOpacity: 1, u_recolor: recolor, u_recolorRGB: HL_RED };
+  return { u_hoverGroup: -1, u_hoverInstances: [0, 0], u_dimActive: 0, u_dimOpacity: 1, u_recolor: recolor, u_recolorRGB: HL_RED };
 }
 
 /**
@@ -132,6 +132,7 @@ class HighlightBuffers {
 /** Apply an {@link InstancedHighlight} to a uniforms record (only the provided fields). */
 function applyHighlight(uniforms: Record<string, unknown>, h: InstancedHighlight): void {
   if (h.hoverGroup !== undefined) uniforms["u_hoverGroup"] = h.hoverGroup;
+  if (h.hoverInstances !== undefined) uniforms["u_hoverInstances"] = h.hoverInstances;
   if (h.dimActive !== undefined) uniforms["u_dimActive"] = h.dimActive ? 1 : 0;
   if (h.dimOpacity !== undefined) uniforms["u_dimOpacity"] = h.dimOpacity;
   if (h.recolor !== undefined) {

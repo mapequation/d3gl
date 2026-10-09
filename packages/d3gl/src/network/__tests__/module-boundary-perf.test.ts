@@ -8,13 +8,14 @@ import {
   makeCutBoundaries,
   makeCutScratch,
   makeDeclutterFrontierScratch,
+  pickFrontier,
   visibleWorldRect,
   type BoundaryDiscs,
   type CutBoundaries,
   type LODTransform,
   type LODTree,
 } from "../lod.js";
-import { boundaryModuleWidths, boundaryRings, makeSuperEdgesScratch, superEdges, type ModuleBoundaryResolved, type SuperEdgeStyleResolved } from "../glyphs.js";
+import { boundaryModuleWidths, boundaryRingPickStats, boundaryRings, makeSuperEdgesScratch, pickBoundaryRing, superEdges, type FrontierHalosData, type ModuleBoundaryResolved, type SuperEdgeStyleResolved } from "../glyphs.js";
 import { buildGraph } from "../graph.js";
 import { buildModuleLODTree, type ModuleLink, type ModuleNode } from "../modules.js";
 
@@ -35,7 +36,12 @@ import { buildModuleLODTree, type ModuleLink, type ModuleNode } from "../modules
  *   6. per-module rings (#471, `moduleBoundary: { width: (path) => …, color: "fill" }`): the width table
  *      is built once (one accessor call per module) and the per-frame ring build calls it **zero** times —
  *      it only indexes that table and the tree's own colours — at a frame cost next to the constant rings',
- *      on the sweep (reductions ON) and with every module open (reductions OFF).
+ *      on the sweep (reductions ON) and with every module open (reductions OFF);
+ *   7. picking an open module by its ring (#476): a hover sweep across the view — the node lane's pick per
+ *      pointer move, the drawn glyphs and then the rings the frame drew — on the sweep (reductions ON) and
+ *      with every module open, declutter on and off (reductions OFF): exactly one ring test per drawn ring
+ *      per move that reaches the rings (O(rings drawn)), none with the boundaries off, no allocation per move,
+ *      zero accessor calls, and a per-move ceiling.
  *
  * The fixture is `.ftree`-shaped: graph edges only inside bottom modules, module links between siblings
  * at every level, module discs nested (the geometry the nested layout gives, placed directly so a 1M
@@ -50,6 +56,9 @@ const ASSERT = !!process.env.PERF_ASSERT;
 const SWEEP_FRAME_MS = Number(process.env.PERF_MODULE_BOUNDARY_MS) || 20;
 const ALL_OPEN_MS = Number(process.env.PERF_MODULE_BOUNDARY_ALL_MS) || 6000;
 const ALLOC_KB_PER_FRAME = Number(process.env.PERF_MODULE_BOUNDARY_ALLOC_KB) || 256;
+/** #476 ring test per pointer move: a constant (ms) and a per-drawn-ring term (ns). */
+const HOVER_RING_MS = Number(process.env.PERF_MODULE_BOUNDARY_HOVER_MS) || 0.05;
+const HOVER_RING_NS_PER_RING = Number(process.env.PERF_MODULE_BOUNDARY_HOVER_NS) || 20;
 const W = 1280;
 const H = 800;
 const GOLDEN = Math.PI * (3 - Math.sqrt(5));
@@ -157,6 +166,8 @@ class Pipeline {
   readonly declutterScratch = makeDeclutterFrontierScratch();
   readonly seScratch = makeSuperEdgesScratch();
   readonly bnd: CutBoundaries = makeCutBoundaries();
+  /** The rings the last frame drew (#476) — what a pointer move picks against. */
+  rings: FrontierHalosData | null = null;
   constructor(readonly tree: LODTree, readonly discs: BoundaryDiscs) {
     this.bnd.radius = discs.r;
   }
@@ -173,6 +184,7 @@ class Pipeline {
     const view = visibleWorldRect(t, W, H);
     const se = superEdges(tree, frontier, { ...SE_STYLE, anchor: boundaries ? bnd : undefined }, view, this.seScratch);
     const rings = boundaries ? boundaryRings(tree, bnd, { width: 1, color: "#3a3f52", opacity: 0.5, screen: false, k: t.k, ...ring }, view) : null;
+    this.rings = rings;
     const ha = se.halfArrows;
     const bytes = (ha ? ha.sources.byteLength * 2 + ha.radii.byteLength + ha.widths.byteLength + ha.bends.byteLength + ha.colors.byteLength : 0) + (rings ? rings.centers.byteLength + rings.radii.byteLength * 3 + rings.colors.byteLength * 2 : 0);
     return { frontier, edges: se.ids.length, rings: rings?.count ?? 0, bytes };
@@ -285,6 +297,126 @@ function perModule(tree: LODTree): { ring: Pick<ModuleBoundaryResolved, "widths"
   for (let g = 0; g < tree.size; g++) tree.color.set([(g * 37) % 256, (g * 91) % 256, (g * 17) % 256, 255], g * 4);
   const widthOf = (path: readonly number[]): number | undefined => (calls.width++, path.length % 4 === 0 ? undefined : path.length === 3 ? 0 : 1 + path.length);
   return { ring: { widths: boundaryModuleWidths(tree, widthOf, 1), colors: tree.color }, calls };
+}
+
+/** One hover leg's counts (#476). */
+interface HoverLeg { moves: number; reached: number; ringTests: number; ringHits: number; glyphHits: number; msPerMove: number; ringMsPerMove: number; heapBPerMove: number; abBPerMove: number }
+
+/**
+ * A hover sweep across the view at `t` (#476): per pointer move, the node lane's pick — the drawn glyphs
+ * (`pickFrontier`), then the rings the frame drew (`pickBoundaryRing`) — over a `cols` × `rows` grid plus one
+ * move aimed at the top of each of up to 256 rings (so the sweep really lands on rings). Times the whole pick
+ * and the ring test alone, and measures the ring test's heap and typed-array growth over the moves (with
+ * `--expose-gc`; otherwise 0).
+ */
+function hoverSweep(p: Pipeline, t: LODTransform, frontier: Uint32Array, cols: number, rows: number): HoverLeg {
+  const xs: number[] = [];
+  const ys: number[] = [];
+  // Whole CSS px, as most pointer events report them — and small integers pass unboxed, so the heap probe
+  // below sees the ring test's own allocation, not the boxing of a fractional argument at the call.
+  for (let j = 0; j < rows; j++) for (let i = 0; i < cols; i++) { xs.push(Math.round(((i + 0.5) * W) / cols)); ys.push(Math.round(((j + 0.5) * H) / rows)); }
+  const rings = p.rings;
+  if (rings) {
+    const step = Math.max(1, Math.floor(rings.count / 256));
+    for (let i = 0; i < rings.count; i += step) {
+      const rc = rings.radii[i]! * (1 - rings.borders[i]! / 2); // the ring's centreline
+      xs.push(Math.round(rings.centers[i * 2]! * t.k + t.x));
+      ys.push(Math.round((rings.centers[i * 2 + 1]! - rc) * t.k + t.y));
+    }
+  }
+  const moves = xs.length;
+  // Int32 storage: a read hands the pick a small integer, never a boxed -0 or double.
+  const px = Int32Array.from(xs);
+  const py = Int32Array.from(ys);
+  const opts = { screenSized: false, maxAggregateRadius: 26 };
+  const ring = (x: number, y: number): number => (rings ? pickBoundaryRing(p.tree, rings, x, y, t) : -1);
+  const pick = (x: number, y: number): number => {
+    const g = pickFrontier(p.tree, frontier, x, y, t, opts);
+    return g >= 0 ? g : ring(x, y) >= 0 ? -2 : -1;
+  };
+  for (let i = 0; i < moves; i++) pick(px[i]!, py[i]!); // warm
+  const tests0 = boundaryRingPickStats.tests;
+  let reached = 0;
+  let ringHits = 0;
+  let glyphHits = 0;
+  const t0 = performance.now();
+  for (let i = 0; i < moves; i++) {
+    const r = pick(px[i]!, py[i]!);
+    if (r >= 0) glyphHits++;
+    else {
+      reached++;
+      if (r === -2) ringHits++;
+    }
+  }
+  const msPerMove = (performance.now() - t0) / moves;
+  const ringTests = boundaryRingPickStats.tests - tests0;
+  // The ring test alone: time, then heap / typed-array growth over the same moves.
+  const t1 = performance.now();
+  for (let i = 0; i < moves; i++) ring(px[i]!, py[i]!);
+  const ringMsPerMove = (performance.now() - t1) / moves;
+  const gc = (globalThis as { gc?: () => void }).gc;
+  let heapBPerMove = 0;
+  let abBPerMove = 0;
+  if (gc) {
+    // Repeated to ≥ 20k moves, so the probe's own fixed cost reads well under a byte per move.
+    const reps = Math.ceil(20_000 / moves);
+    for (let r = 0; r < reps; r++) for (let i = 0; i < moves; i++) ring(px[i]!, py[i]!); // warm: tier-up's own heap
+    gc();
+    const m0 = process.memoryUsage();
+    for (let r = 0; r < reps; r++) for (let i = 0; i < moves; i++) ring(px[i]!, py[i]!);
+    const m1 = process.memoryUsage();
+    heapBPerMove = (m1.heapUsed - m0.heapUsed) / (moves * reps);
+    abBPerMove = (m1.arrayBuffers - m0.arrayBuffers) / (moves * reps);
+  }
+  return { moves, reached, ringTests, ringHits, glyphHits, msPerMove, ringMsPerMove, heapBPerMove, abBPerMove };
+}
+
+/**
+ * #476's guard on one map: a hover sweep across rings on the zoom sweep (reductions ON) and with every module
+ * open, declutter on and off (reductions OFF), on per-module rings (their width accessor counted). Asserts the
+ * deterministic signatures always and the per-move ceilings when `assertTime`.
+ */
+function checkHover(m: Map, assertTime: boolean, log?: (line: string) => void): void {
+  const { ring, calls } = perModule(m.tree);
+  const p = new Pipeline(m.tree, m.discs);
+  const frames = sweep(m);
+  const legs: { label: string; t: LODTransform; opts: { expandPx?: number; declutter?: boolean }; cols: number; rows: number }[] = [
+    ...[8, 11, 14, 17, 20].map((i) => ({ label: `sweep frame ${i}`, t: frames[i]!, opts: {}, cols: 64, rows: 40 })),
+    { label: "every module open, declutter on", t: fitView(m), opts: { expandPx: 1e-6, declutter: true }, cols: 32, rows: 20 },
+    // Declutter off draws every leaf: the glyph pick before the rings is O(N) per move, so fewer moves.
+    { label: "every module open, declutter off", t: fitView(m), opts: { expandPx: 1e-6, declutter: false }, cols: 8, rows: 5 },
+  ];
+  let ringed = 0;
+  for (const leg of legs) {
+    const f = p.frame(leg.t, true, leg.opts, ring);
+    const drawn = p.rings?.count ?? 0;
+    if (drawn === 0) continue; // a view inside one module's disc: its ring is off-screen, none drawn
+    ringed++;
+    const atCalls = calls.width;
+    const h = hoverSweep(p, leg.t, f.frontier, leg.cols, leg.rows);
+    log?.(`#476 hover ${leg.label}  frontier=${f.frontier.length.toLocaleString()}  rings=${drawn.toLocaleString()}  moves=${h.moves} (ring hits ${h.ringHits}, glyph hits ${h.glyphHits})  pick ${(h.msPerMove * 1000).toFixed(1)}µs/move  ring test ${(h.ringMsPerMove * 1000).toFixed(1)}µs/move  heap ${h.heapBPerMove.toFixed(2)} B/move  ab ${h.abBPerMove.toFixed(2)} B/move`);
+    // O(rings drawn): exactly one ring test per drawn ring per move that reaches the rings — none for a move a
+    // glyph took.
+    expect(h.ringTests, leg.label).toBe(h.reached * drawn);
+    expect(h.ringHits, `${leg.label}: the sweep lands on rings`).toBeGreaterThan(0);
+    // No accessor resolves a ring on a move.
+    expect(calls.width - atCalls, `${leg.label}: width accessor calls during the hover sweep`).toBe(0);
+    // No allocation per move (typed arrays exactly; the heap within noise — one 16-byte object per move over
+    // a few thousand moves would read ≥ 16 B/move).
+    expect(h.abBPerMove, `${leg.label}: typed-array growth per move`).toBeLessThan(1); // ≤ 0: GC may free earlier frames' arrays meanwhile
+    expect(h.heapBPerMove, `${leg.label}: heap growth per move`).toBeLessThan(4);
+    if (assertTime) {
+      // The ring test: ~1-2 ns per drawn ring; a per-move re-derivation (a ring rebuild, an accessor pass) is
+      // ≥ 10× that. Constant + per-ring terms.
+      expect(h.ringMsPerMove, `${leg.label}: ring test ${(h.ringMsPerMove * 1000).toFixed(1)}µs/move over ${drawn} rings`).toBeLessThan(HOVER_RING_MS + (HOVER_RING_NS_PER_RING * drawn) / 1e6);
+    }
+  }
+  expect(ringed, "legs that drew rings (non-vacuous)").toBeGreaterThanOrEqual(4);
+  // Boundaries off: no ring is drawn, so a move tests none.
+  const f = p.frame(frames[19]!, false);
+  expect(p.rings).toBeNull();
+  const off = hoverSweep(p, frames[19]!, f.frontier, 16, 10);
+  expect(off.ringTests).toBe(0);
 }
 
 function stats(ts: number[]): { median: number; p95: number } {
@@ -415,6 +547,10 @@ describe("#329 module boundaries per-frame cost", () => {
     checkPerModule(ftreeMap(100_000), true);
   });
 
+  it("#476 hover sweep across rings: O(rings drawn) per move, no allocation, no accessor — sweep and every module open (100k)", () => {
+    checkHover(ftreeMap(100_000), true, process.env.PERF_LOG ? (line) => console.log(line) : undefined);
+  });
+
   it("rings a big flat module's rim at no cost beyond the walk the cut does without the ring", () => {
     checkRim(100_000, true);
   });
@@ -480,6 +616,8 @@ describe("#329 module boundaries per-frame cost", () => {
       }
       // #471: per-module rings (fill + flow width) on the same map — resolved once, looked up per frame.
       checkPerModule(m, ASSERT, log);
+      // #476: a hover sweep across the rings, on the sweep and with every module open.
+      checkHover(m, ASSERT, log);
       // A flat bottom module of N leaves with only its rim in view: the ring costs the walk nothing.
       const rim = checkRim(BENCH_N, ASSERT);
       log(`flat-module rim  boundaries=false ${rim.off.median.toFixed(3)}ms  boundaries=true ${rim.on.median.toFixed(3)}ms  stack=${rim.on.stack}`);

@@ -89,6 +89,8 @@ export interface RenderDelta {
  * Shader-driven highlight state for an instanced layer (#162). Passed to {@link Backend.styleInstancedLayer},
  * it maps to vertex-shader uniforms so hover/selection restyle costs **no** geometry rebuild:
  * - `hoverGroup` — the hovered node's group id (matched against each instance's `groups`); `-1` = none.
+ * - `hoverInstances` — `[lo, hi)`: instances highlighted with the hover by their index in the layer
+ *   (#476 — an open module's drawn members, one contiguous run of the frontier); `[0, 0]` = none.
  * - `dimActive` / `dimOpacity` — fade every non-highlighted instance's alpha by `dimOpacity` when active.
  * - `recolor` — RGB (0..1) a highlighted instance is tinted toward, preserving luminance (so a weight-
  *   encoded link keeps its weight); `null`/absent ⇒ highlighted instances keep their colour (e.g. nodes).
@@ -97,6 +99,7 @@ export interface RenderDelta {
  */
 export interface InstancedHighlight {
   hoverGroup?: number;
+  hoverInstances?: [number, number];
   dimActive?: boolean;
   dimOpacity?: number;
   recolor?: [number, number, number] | null;
