@@ -3722,6 +3722,18 @@ export class Network extends BaseEngine {
   }
 
   /**
+   * The members of a Scene node-layer glyph (#481). Under LOD the Canvas/SVG node layer's ids are tree ids,
+   * so a glyph's members are the leaves under it ({@link leavesUnder}), as the WebGL lane's and a ring hit's
+   * are: a drag of a collapsed module then holds its leaves, and `selection()` lists them. Lazy, as the base:
+   * O(leaves under the glyph) per `members()` call, nothing per frame.
+   */
+  protected override sceneMembers(layer: string, id: string | number): (string | number)[] {
+    const tree = this.lodTree;
+    if (layer !== this.NODE_LAYER || !tree || !this.lodOptions || typeof id !== "number" || id >= tree.size) return super.sceneMembers(layer, id);
+    return leavesUnder(tree, id);
+  }
+
+  /**
    * Begin dragging the grabbed node/aggregate (#140). Resolves the **held leaf set** — the whole
    * current selection if the grabbed glyph is part of it, else the grabbed glyph alone (an aggregate
    * expands to its subtree leaves; an unselected grab also *becomes* the single selection) — snapshots

@@ -866,8 +866,10 @@ export abstract class BaseEngine {
 
   /** The source ids a Scene-layer glyph represents (#105 N7c-2): for a decluttered layer, itself plus
    *  the glyphs absorbed under it (from the declutter `winners`); otherwise `[id]`. Lazy — only on a
-   *  `members()` call. Maps id → declutter group → absorbed groups → the drawable ids in those groups. */
-  private sceneMembers(layer: string, id: string | number): (string | number)[] {
+   *  `members()` call. Maps id → declutter group → absorbed groups → the drawable ids in those groups.
+   *  The one source of a Scene hit's and a Scene selection's `members()`: a subclass whose drawable ids
+   *  stand for other ids (the network's LOD aggregates, #481) overrides it. */
+  protected sceneMembers(layer: string, id: string | number): (string | number)[] {
     const winners = this.declutterWinners.get(layer);
     const di = this.layerIds.get(layer)?.get(id);
     if (!winners || di == null) return [id];
