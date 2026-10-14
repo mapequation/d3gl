@@ -3413,7 +3413,8 @@ export class Network extends BaseEngine {
    * Register (or drop) the companion ring overlay lane. Its `select` returns the highlighted node ids
    * currently visible — intersected with the source lane's frontier (LOD) or taken directly (no-LOD,
    * full graph drawn) — and short-circuits to empty when nothing is highlighted (O(1) per frame). Its
-   * `emit` builds one transparent-fill ring circle per highlighted glyph; never itself pickable.
+   * `emit` builds one transparent-fill ring circle per highlighted glyph; never itself pickable. With
+   * nothing highlighted it emits the same layers empty (#478), so they keep their GL buffers between hovers.
    */
   private syncHighlightLane(source: InstancedLane | null, centerOf: (g: number) => [number, number], radiusOf: (g: number) => number, lod: boolean): void {
     if (!this.interactiveOpts) { this.unregisterInstancedLane(this.NET_HL_LANE); return; }
@@ -3421,14 +3422,21 @@ export class Network extends BaseEngine {
     const ringName = `${this.NET_HL_LANE}:ring`;
     const boundaryName = `${this.NET_HL_LANE}:boundary`;
     const sizeMode = this.resolvedStyleCached(this.graph!).sizeMode;
+    // Nothing highlighted (#478): the same layers at count 0 (nothing drawn or written). Dropped, they were
+    // re-created on the next hover (~9 GL buffers per change); kept, a hover updates them in place.
+    const none = ringCircles(EMPTY_VISIBLE, centerOf, radiusOf, () => false, colors);
+    const idleRings: InstancedLayer = { name: ringName, primitive: "circles", sizeMode, circles: none };
+    const idle: InstancedLayer[] = [idleRings];
+    const idleWithBoundary: InstancedLayer[] = [{ name: boundaryName, primitive: "circles", sizeMode: "world", circles: none }, idleRings];
     const strategy: SelectionStrategy = { select: () => this.highlightVisible(source, lod), pick: () => -1 };
     this.registerInstancedLane(this.NET_HL_LANE, {
       lane: new InstancedLane(strategy, (visible) => {
         // Open modules (#476): a hovered or selected module the cut has expanded is highlighted on its
-        // boundary ring, under the glyph rings. Only with rings drawn; both layers then go out together
-        // (either may be empty), so moving the hover between a ring and a glyph updates them in place.
+        // boundary ring, under the glyph rings. Both layers go out together whenever boundaries are on, drawn
+        // or not (either may be empty), so neither a hover change nor a frame without rings drops one.
+        const boundaries = lod && !!this.lodOptions?.moduleBoundary;
         const rings = lod && this.drawnRingsTree === this.lodTree ? this.drawnRings : null;
-        if (visible.length === 0 && !(rings && this.hasHighlight(this.NODE_LAYER))) return [];
+        if (visible.length === 0 && !(rings && this.hasHighlight(this.NODE_LAYER))) return boundaries ? idleWithBoundary : idle;
         const selected = this.selectedIds(this.NODE_LAYER);
         const remove = this.removeIds(this.NODE_LAYER); // subtract-marquee preview (#140) — ring these yellow
         // Selected vs hover-only colour: ancestor-aware under LOD, so an expanded selected aggregate's
@@ -3436,10 +3444,10 @@ export class Network extends BaseEngine {
         const isSel = lod && this.lodTree && selected?.size ? this.makeSelectedPredicate(this.lodTree, selected) : null;
         const selColored = (g: number): boolean => (isSel ? isSel(g) : !!selected?.has(g));
         const glyphRings: InstancedLayer = { name: ringName, primitive: "circles", sizeMode, circles: ringCircles(visible, centerOf, radiusOf, selColored, colors, remove ? (g) => remove.has(g) : undefined) };
-        if (!rings) return [glyphRings];
+        if (!boundaries) return [glyphRings];
         const hovered = this.hoveredIds(this.NODE_LAYER);
         const lit = (g: number): boolean => !!selected?.has(g) || !!hovered?.has(g);
-        const circles = boundaryHighlightCircles(rings, lit, (g) => (selColored(g) ? colors.select : colors.hover), this.transform.k);
+        const circles = rings ? boundaryHighlightCircles(rings, lit, (g) => (selColored(g) ? colors.select : colors.hover), this.transform.k) : none;
         return [{ name: boundaryName, primitive: "circles", sizeMode: "world", circles }, glyphRings];
       }),
       layerNames: [boundaryName, ringName], dynamic: true,

@@ -310,8 +310,9 @@ export class InstancedCircles {
         a_borderColor: this.borderColor,
         ...this.hl.recreate(data, this._capacity), // #162 group/selected grow with the geometry
       });
-    } else {
-      // Sub-update: upload only the filled portion of the scratch buffers.
+    } else if (data.count > 0) {
+      // Sub-update: upload only the filled portion of the scratch buffers. An empty update (a highlight lane
+      // with nothing highlighted, #478) writes nothing: the layer keeps its buffers and draws nothing.
       this.center.write(data.centers);
       this.radius.write(data.radii);
       this.color.write(data.colors);

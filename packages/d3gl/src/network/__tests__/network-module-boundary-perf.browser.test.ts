@@ -110,6 +110,7 @@ interface HoverLeg {
   moves: number;
   changes: number;
   ringHits: number;
+  glyphHits: number;
   ringTests: number;
   uploadedBytes: number;
   created: number;
@@ -120,6 +121,7 @@ interface HoverLeg {
   worstMoveMs: number;
   calls: Calls;
 }
+let hoverWarm: HoverLeg;
 let hoverSweep: HoverLeg;
 let hoverAll: HoverLeg;
 let hoverOff: HoverLeg;
@@ -219,14 +221,16 @@ beforeAll(async () => {
     let last: HoverHit | null = null;
     let changes = 0;
     let ringHits = 0;
+    let glyphHits = 0;
     net.on("hover", (h) => {
       if (h?.layer !== last?.layer || h?.id !== last?.id) changes++;
       if (isOpenHit(h)) ringHits++;
+      else if (h?.layer === "nodes") glyphHits++;
       last = h;
     });
     net.interactive({ hover: { others: { opacity: 0.3 } } });
     const runHover = (views: { k: number; x: number; y: number }[], cols: number, rows: number): HoverLeg => {
-      const leg: HoverLeg = { moves: 0, changes: 0, ringHits: 0, ringTests: 0, uploadedBytes: 0, created: 0, deleted: 0, baseEmits: 0, highlightEmits: 0, medianMoveMs: 0, worstMoveMs: 0, calls: { scale: 0, fill: 0, moduleFlow: 0, width: 0 } };
+      const leg: HoverLeg = { moves: 0, changes: 0, ringHits: 0, glyphHits: 0, ringTests: 0, uploadedBytes: 0, created: 0, deleted: 0, baseEmits: 0, highlightEmits: 0, medianMoveMs: 0, worstMoveMs: 0, calls: { scale: 0, fill: 0, moduleFlow: 0, width: 0 } };
       const times: number[] = [];
       for (const view of views) {
         net.setTransform(view);
@@ -238,6 +242,7 @@ beforeAll(async () => {
         const hl = net.emits.get("network-highlight") ?? 0;
         changes = 0;
         ringHits = 0;
+        glyphHits = 0;
         for (let j = 0; j < rows; j++) {
           for (let i = 0; i < cols; i++) {
             // Whole px along a serpentine path: the pointer moves as a hand would, glyph to ring to empty space.
@@ -252,6 +257,7 @@ beforeAll(async () => {
         leg.moves += cols * rows;
         leg.changes += changes;
         leg.ringHits += ringHits;
+        leg.glyphHits += glyphHits;
         leg.ringTests += boundaryRingPickStats.tests - tests;
         leg.uploadedBytes += d.uploadedBytes;
         leg.created += d.created;
@@ -268,6 +274,9 @@ beforeAll(async () => {
     };
     net.lod({ ...base, moduleBoundary: { width: widthOf, color: "fill" } });
     sweepFrames(steps, (t) => net.setTransform(t), 1);
+    // #478: the highlight lane's layers get their GL buffers on first use (one grow each: a glyph's ring, an
+    // open module's ring). Use them once here, so the legs below count what a hover change costs after that.
+    hoverWarm = runHover([steps[1]!], 40, 25);
     hoverSweep = runHover(steps.slice(1), 40, 25);
     net.lod({ expandPx: 1e-6, declutter: false, crossLevelEdges: true, moduleBoundary: { width: widthOf, color: "fill" } });
     hoverAll = runHover([steps[0]!], 12, 8);
@@ -336,11 +345,12 @@ describe(`network() module-boundary zoom sweep at N=${N.toLocaleString()} (#329)
       expect(leg.ringTests, summary).toBeGreaterThan(0);
       expect(leg.ringTests / leg.moves, summary).toBeLessThanOrEqual(moduleCount);
       // A hover change re-emits the highlight lane only: no base-lane emit, a few circles uploaded per change
-      // (measured ~100 B). The highlight lane's layers come and go with the hover (as they always have: an
-      // emptied lane drops its layers), a fixed handful of buffers per change, never one per drawable.
+      // (measured ~100 B). Its layers stay registered while nothing is highlighted (#478), so once used they
+      // update in place: no GL buffer created or destroyed (they were dropped and re-created, ~9 per change).
       expect(leg.baseEmits, summary).toBe(0);
       expect(leg.uploadedBytes / leg.changes, summary).toBeLessThan(HOVER_UPLOAD_BYTES_PER_CHANGE);
-      expect(leg.created, summary).toBeLessThan(32 * leg.changes + 32);
+      expect(leg.created, summary).toBe(0);
+      expect(leg.deleted, summary).toBe(0);
       // No accessor resolves a ring, a fill or a flow on a move.
       expect(leg.calls, summary).toEqual({ scale: 0, fill: 0, moduleFlow: 0, width: 0 });
       expect(leg.worstMoveMs, summary).toBeLessThan(ceiling);
@@ -353,6 +363,18 @@ describe(`network() module-boundary zoom sweep at N=${N.toLocaleString()} (#329)
     expect(hoverOff.ringTests, summary).toBe(0);
     expect(hoverOff.ringHits, summary).toBe(0);
     expect(hoverOff.baseEmits, summary).toBe(0);
+    // #478: the glyph-ring layer the LOD legs used is kept through the switch, so LOD off creates no GL buffer either.
+    expect(hoverOff.created, `${summary}, +${hoverOff.created}/−${hoverOff.deleted} buffers`).toBe(0);
+    expect(hoverOff.deleted, `${summary}, +${hoverOff.created}/−${hoverOff.deleted} buffers`).toBe(0);
+  });
+
+  it("#478 the highlight lane's first use: one grow per layer, at most", () => {
+    const summary = `warm-up: ${hoverWarm.moves} moves, ${hoverWarm.changes} hover changes, ${hoverWarm.ringHits} ring hits, ${hoverWarm.glyphHits} glyph hits, +${hoverWarm.created}/−${hoverWarm.deleted} buffers`;
+    // Non-vacuous: the warm-up hovered rings and glyphs, so both layers were used before the counted legs.
+    expect(hoverWarm.ringHits, summary).toBeGreaterThan(0);
+    expect(hoverWarm.glyphHits, summary).toBeGreaterThan(0);
+    // Two layers, each grown once from empty (8 instance buffers per circles layer), never per change.
+    expect(hoverWarm.created, summary).toBeLessThanOrEqual(16);
   });
 
   it("reductions OFF: every module open, ringed and anchored, within the full-detail budget", () => {
