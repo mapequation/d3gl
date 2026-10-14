@@ -814,7 +814,7 @@ const EMPTY_VISIBLE = new Uint32Array(0);
  * The most circles a highlight-lane layer keeps room for while nothing is highlighted (#478): up to it, the idle
  * layer stays registered and empty, so a hover change creates no GL buffer; past it (a large selection, cleared),
  * the idle lane drops the layer and its GL buffers are freed until something is highlighted again. At 36 B per
- * circle, about 2.3 MB per layer.
+ * circle, 2.36 MB per layer.
  */
 const HIGHLIGHT_IDLE_ROOM_MAX = 65_536;
 
