@@ -4433,7 +4433,10 @@ export class Network extends BaseEngine {
         maxAggregateRadius: opts.maxAggregateRadius,
         fadeAlpha: this.fadeAlpha ?? undefined,
       });
-      if (halos.count > 0) layers.push({ name: "node-halos", primitive: "circles", circles: halos, sizeMode: style.sizeMode });
+      // Emitted even when empty (#482): a frontier of leaves only (every module in view open, or nothing in view) has
+      // no halo. An empty layer updates in place at count 0 and keeps its GPU buffers; dropped, it would be destroyed
+      // there and rebuilt on the next frame with a collapsed module, as the gathered links were before #470.
+      layers.push({ name: "node-halos", primitive: "circles", circles: halos, sizeMode: style.sizeMode });
     }
     const circles = frontierCircles(tree, frontier, {
       nodeFill: style.nodeFill,

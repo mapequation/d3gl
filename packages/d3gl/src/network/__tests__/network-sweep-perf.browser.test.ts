@@ -149,6 +149,12 @@ function drawnLinks(layers: readonly InstancedLayer[]): number {
   return n;
 }
 
+/** The aggregate-outline halos a frame emitted, or null when it emitted no `node-halos` layer (#482). */
+function haloCount(layers: readonly InstancedLayer[]): number | null {
+  for (const l of layers) if (l.primitive === "circles" && l.name === "node-halos") return l.circles.count;
+  return null;
+}
+
 /** Instances in the gathered layers alone (`links` / `arrows`): the links that touch an aggregate (#447). */
 function gatheredLinks(layers: readonly InstancedLayer[]): number {
   let n = 0;
@@ -272,6 +278,8 @@ let spatialSweepStats: { hits: number; misses: number; visits: number } | null =
 let lodOffSelected: Leg;
 /** Pans across a view that gathers no link, per link style; `gathered` is each pan step's gathered-link count. */
 const emptyViewLegs: [string, { leg: Leg; gathered: number[] }][] = [];
+/** The same pan with the aggregate outline on (#482); `halos` is each pan step's halo count (null: no `node-halos` layer). */
+let haloPan: { leg: Leg; halos: (number | null)[] };
 /** Per-frame upload allowed per selected node on the full-detail leg: 2x the ring overlay's 24-byte
  *  instance. A deterministic count, so absolute (never through `perfBudget`). */
 const RING_BYTES_PER_SELECTED = 48;
@@ -449,6 +457,17 @@ beforeAll(async () => {
       emptyViewLegs.push([name, { leg, gathered: pan.map((_, s) => gatheredLinks(layerSpy.frames[s * reps] ?? [])) }]);
     }
     net.style({ directed: false, linkStyle: "line" });
+    // A view with no aggregate (#482): the aggregate-outline halo layer empties there and must keep its GPU buffers
+    // the same way. The pan starts zoomed out (k = 0.1: the whole 8-unit grid in view at 0.8 px a cell), where the
+    // cut draws aggregates; at the sweep's k ≥ 1 every glyph in view is a leaf, which carries no halo.
+    net.lod({ declutter: true, maxAggregateRadius: 24, aggregateOutline: {} });
+    const wide = zoomSteps(W, H, [0.1])[0] ?? held;
+    const wideAway = { ...wide, x: wide.x - 100 * W };
+    const widePan = [wide, wideAway, wide, wideAway, wide];
+    net.setTransform(wide);
+    const haloLeg = runLeg(widePan);
+    const haloReps = layerSpy.frames.length / widePan.length;
+    haloPan = { leg: haloLeg, halos: widePan.map((_, s) => haloCount(layerSpy.frames[s * haloReps] ?? [])) };
     // Full detail again, with a managed selection (#428): the no-LOD selected-flag cache is keyed on the
     // selection set, so a key that stopped matching per frame would rebuild and re-upload the flags on
     // every zoom step. The toggle and the select() are registration events, outside the sweep.
@@ -600,6 +619,14 @@ describe(`network() engine zoom sweep — per-frame cost at N=${N.toLocaleString
     expect(lodSpatialHold.freshColumns, "spatial: style columns re-emitted as new arrays on an unchanged view").toEqual([]);
     expect(lodSpatialHold.uploadedBytes).toBeLessThanOrEqual(lodSpatialHold.alwaysWrittenBytes);
     expect(lodSpatialHold.linkStrokeCalls, "spatial: link colours re-resolved on an unchanged view").toBe(0);
+  });
+
+  it("LOD ON, a view with no aggregate: the halo layer is emitted empty and keeps its GPU buffers (#482)", () => {
+    // Non-vacuity: the wide view draws halos; the view off the graph draws none and still emits the layer.
+    expect(haloPan.halos[0] ?? 0, "the wide view drew no halo").toBeGreaterThan(0);
+    expect(haloPan.halos[1], "the view off the graph dropped the halo layer or drew halos").toBe(0);
+    expect(haloPan.leg.buffersCreated, "GPU buffers were created panning across a view with no aggregate").toBe(0);
+    expect(haloPan.leg.buffersDeleted, "GPU buffers were destroyed panning across a view with no aggregate").toBe(0);
   });
 
   it("LOD ON, a view that gathers no link: the gathered link layers keep their GPU buffers", () => {
