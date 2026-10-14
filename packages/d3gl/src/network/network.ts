@@ -23,6 +23,7 @@ import type { LeafStyle, LODView } from "./lod-frame.js";
 import { startGpuNestedLayout } from "./gpu/gpu-nested-transport.js";
 import { startGpuLayout } from "./gpu/gpu-transport.js";
 import { WebGLBackend } from "../webgl/webgl-backend.js";
+import { grownCapacity } from "../webgl/instanced.js";
 import type { NetworkGraph } from "./graph.js";
 import { layoutBox, layoutFitTransform, fitCameraPath, type FitBox } from "./fit.js";
 import type { InstancedArrowsData, InstancedHalfArrowsData, InstancedLayer, InstancedLinesData, ViewTransform } from "../core/index.js";
@@ -809,6 +810,21 @@ function physicalSpacing(positions: Float32Array, count: number): number {
  *  per-instance gather) — e.g. the no-LOD full-graph lane — so they never allocate an all-indices array. */
 const EMPTY_VISIBLE = new Uint32Array(0);
 
+/**
+ * The most circles a highlight-lane layer keeps room for while nothing is highlighted (#478): up to it, the idle
+ * layer stays registered and empty, so a hover change creates no GL buffer; past it (a large selection, cleared),
+ * the idle lane drops the layer and its GL buffers are freed until something is highlighted again. At 36 B per
+ * circle, about 2.3 MB per layer.
+ */
+const HIGHLIGHT_IDLE_ROOM_MAX = 65_536;
+
+/** A highlight layer's room after an emit of `count` circles: created at `count` when it was dropped (`null`), else
+ *  grown as `InstancedCircles.update` grows it (a shrink keeps the room). */
+function roomAfter(count: number, room: number | null): number {
+  if (room === null) return count;
+  return count > room ? grownCapacity(count, room) : room;
+}
+
 /** Shared {@link NetworkHit} for no-LOD label ranking (every node is a single leaf). */
 const NO_LOD_INFO: NetworkHit = { aggregate: false, count: 1 };
 
@@ -1120,6 +1136,9 @@ export class Network extends BaseEngine {
   private readonly NET_LANE = "network";
   /** Registry key for the companion selection/hover ring overlay lane (#105 N7c-2), drawn on top. */
   private readonly NET_HL_LANE = "network-highlight";
+  /** The room (circles) of each highlight-lane layer on the GPU, followed as the lane grows it (`grownCapacity`);
+   *  `null` once the idle lane dropped the layer for {@link HIGHLIGHT_IDLE_ROOM_MAX} (#478). */
+  private readonly hlRoom: { ring: number | null; boundary: number | null } = { ring: 0, boundary: 0 };
   /** The dispatch layer name node picks resolve to (selection/hover are keyed under it). */
   private readonly NODE_LAYER = "nodes";
   /** The `hit.layer` value link picks resolve to (#141), distinguishing a link hit from a node hit. */
@@ -3414,10 +3433,16 @@ export class Network extends BaseEngine {
    * currently visible — intersected with the source lane's frontier (LOD) or taken directly (no-LOD,
    * full graph drawn) — and short-circuits to empty when nothing is highlighted (O(1) per frame). Its
    * `emit` builds one transparent-fill ring circle per highlighted glyph; never itself pickable. With
-   * nothing highlighted it emits the same layers empty (#478), so they keep their GL buffers between hovers.
+   * nothing highlighted it emits the same layers empty (#478), so they keep their GL buffers between hovers,
+   * except a layer with room for more than {@link HIGHLIGHT_IDLE_ROOM_MAX} circles, which it drops.
    */
   private syncHighlightLane(source: InstancedLane | null, centerOf: (g: number) => [number, number], radiusOf: (g: number) => number, lod: boolean): void {
-    if (!this.interactiveOpts) { this.unregisterInstancedLane(this.NET_HL_LANE); return; }
+    const room = this.hlRoom;
+    if (!this.interactiveOpts) {
+      this.unregisterInstancedLane(this.NET_HL_LANE);
+      room.ring = room.boundary = 0;
+      return;
+    }
     const colors = resolveRingColors(this.interactiveOpts);
     const ringName = `${this.NET_HL_LANE}:ring`;
     const boundaryName = `${this.NET_HL_LANE}:boundary`;
@@ -3426,8 +3451,11 @@ export class Network extends BaseEngine {
     // re-created on the next hover (~9 GL buffers per change); kept, a hover updates them in place.
     const none = ringCircles(EMPTY_VISIBLE, centerOf, radiusOf, () => false, colors);
     const idleRings: InstancedLayer = { name: ringName, primitive: "circles", sizeMode, circles: none };
+    const idleBoundary: InstancedLayer = { name: boundaryName, primitive: "circles", sizeMode: "world", circles: none };
     const idle: InstancedLayer[] = [idleRings];
-    const idleWithBoundary: InstancedLayer[] = [{ name: boundaryName, primitive: "circles", sizeMode: "world", circles: none }, idleRings];
+    const idleWithBoundary: InstancedLayer[] = [idleBoundary, idleRings];
+    const idleBoundaryOnly: InstancedLayer[] = [idleBoundary];
+    const idleNone: InstancedLayer[] = [];
     const strategy: SelectionStrategy = { select: () => this.highlightVisible(source, lod), pick: () => -1 };
     this.registerInstancedLane(this.NET_HL_LANE, {
       lane: new InstancedLane(strategy, (visible) => {
@@ -3436,7 +3464,16 @@ export class Network extends BaseEngine {
         // or not (either may be empty), so neither a hover change nor a frame without rings drops one.
         const boundaries = lod && !!this.lodOptions?.moduleBoundary;
         const rings = lod && this.drawnRingsTree === this.lodTree ? this.drawnRings : null;
-        if (visible.length === 0 && !(rings && this.hasHighlight(this.NODE_LAYER))) return boundaries ? idleWithBoundary : idle;
+        if (visible.length === 0 && !(rings && this.hasHighlight(this.NODE_LAYER))) {
+          // A layer with room past the bound (a large selection, cleared) is left out: the lane drops it and frees
+          // its GL buffers. It comes back, sized to what it draws, with the next highlight.
+          if (room.ring !== null && room.ring > HIGHLIGHT_IDLE_ROOM_MAX) room.ring = null;
+          if (!boundaries) room.boundary = 0; // not emitted: absent, and created empty when boundaries come back
+          else if (room.boundary !== null && room.boundary > HIGHLIGHT_IDLE_ROOM_MAX) room.boundary = null;
+          const keepBoundary = boundaries && room.boundary !== null;
+          if (room.ring === null) return keepBoundary ? idleBoundaryOnly : idleNone;
+          return keepBoundary ? idleWithBoundary : idle;
+        }
         const selected = this.selectedIds(this.NODE_LAYER);
         const remove = this.removeIds(this.NODE_LAYER); // subtract-marquee preview (#140) — ring these yellow
         // Selected vs hover-only colour: ancestor-aware under LOD, so an expanded selected aggregate's
@@ -3444,10 +3481,15 @@ export class Network extends BaseEngine {
         const isSel = lod && this.lodTree && selected?.size ? this.makeSelectedPredicate(this.lodTree, selected) : null;
         const selColored = (g: number): boolean => (isSel ? isSel(g) : !!selected?.has(g));
         const glyphRings: InstancedLayer = { name: ringName, primitive: "circles", sizeMode, circles: ringCircles(visible, centerOf, radiusOf, selColored, colors, remove ? (g) => remove.has(g) : undefined) };
-        if (!boundaries) return [glyphRings];
+        room.ring = roomAfter(glyphRings.circles.count, room.ring);
+        if (!boundaries) {
+          room.boundary = 0;
+          return [glyphRings];
+        }
         const hovered = this.hoveredIds(this.NODE_LAYER);
         const lit = (g: number): boolean => !!selected?.has(g) || !!hovered?.has(g);
         const circles = rings ? boundaryHighlightCircles(rings, lit, (g) => (selColored(g) ? colors.select : colors.hover), this.transform.k) : none;
+        room.boundary = roomAfter(circles.count, room.boundary);
         return [{ name: boundaryName, primitive: "circles", sizeMode: "world", circles }, glyphRings];
       }),
       layerNames: [boundaryName, ringName], dynamic: true,

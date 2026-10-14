@@ -27,9 +27,10 @@ function selectedFloats(data: WithHighlight): Float32Array {
  * double. An LOD frontier keeps growing while a layout expands or a zoom deepens; an exact fit reallocated
  * every buffer of the lane on each frame that set a new high, and doubling bounds the reallocations to
  * log2(peak / first) over the lane's life, like the Scene path's `GrowBuffer` (renderer.ts). A shrink
- * keeps the room (the tail past `count` is never drawn).
+ * keeps the room (the tail past `count` is never drawn). The network's highlight lane tracks its layers' room
+ * with it (#478).
  */
-function grownCapacity(count: number, capacity: number): number {
+export function grownCapacity(count: number, capacity: number): number {
   return Math.max(count, 2 * capacity);
 }
 
