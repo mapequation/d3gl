@@ -6,6 +6,8 @@ import { buildGraph } from "../graph.js";
 import type { ModuleLink, ModuleNode } from "../modules.js";
 import { perfBudget, perfN } from "../../__tests__/perf-budget.js";
 import { GlBufferSpy, perfHost, sweepFrames } from "../../__tests__/engine-sweep.js";
+import { WebGLBackend } from "../../webgl/webgl-backend.js";
+import type { InstancedLayer } from "../../core/index.js";
 
 /**
  * ENGINE-level zoom sweep for the module boundaries (#329): `net.setTransform()` → the dynamic lane's
@@ -34,6 +36,8 @@ import { GlBufferSpy, perfHost, sweepFrames } from "../../__tests__/engine-sweep
  *      move tests only the rings drawn (none with LOD off); a hover change re-emits only the highlight lane
  *      (the base lane's emit count stays put, and the upload per change is a few circles), resolves no
  *      accessor, and stays within a per-move ceiling.
+ *   10. #483: after leg 2, a pan off the graph and back. The view off the graph draws no ring, and the ring layer is
+ *      emitted there empty: 0 GL buffers created or destroyed after the pan's first frame (+18/−18 when it was dropped).
  * The map is `.ftree`-shaped (leaf edges inside bottom modules, module links between siblings) and laid
  * out by the nested layout, so the rings are its discs.
  */
@@ -102,6 +106,33 @@ let legFlowFill: Leg & { calls: Calls };
 let legFlowAll: Leg & { calls: Calls };
 let registrationUploadedBytes = 0;
 let widthCallsAtBuild = 0;
+/** A pan off the graph and back with the boundaries on (#483): GL buffers after its first frame, and each step's rings. */
+let ringPan: { created: number; deleted: number; rings: (number | null)[] };
+
+/** The `module-boundaries` layer each frame handed the backend (#483): its ring count, or null when none was emitted. */
+class RingSpy {
+  rings: number | null = null;
+  private readonly origUpdate = WebGLBackend.prototype.updateInstancedLayer;
+  private readonly origSet = WebGLBackend.prototype.setInstancedLayer;
+  constructor() {
+    const spy = this;
+    const see = (layer: InstancedLayer): void => {
+      if (layer.name === "module-boundaries" && layer.primitive === "circles") spy.rings = layer.circles.count;
+    };
+    WebGLBackend.prototype.updateInstancedLayer = function (this: WebGLBackend, layer: InstancedLayer): void {
+      see(layer);
+      spy.origUpdate.call(this, layer);
+    };
+    WebGLBackend.prototype.setInstancedLayer = function (this: WebGLBackend, layer: InstancedLayer): void {
+      see(layer);
+      spy.origSet.call(this, layer);
+    };
+  }
+  restore(): void {
+    WebGLBackend.prototype.updateInstancedLayer = this.origUpdate;
+    WebGLBackend.prototype.setInstancedLayer = this.origSet;
+  }
+}
 
 interface Calls { scale: number; fill: number; moduleFlow: number; width: number }
 
@@ -152,6 +183,7 @@ const PALETTE = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd", "#8c564b
 
 beforeAll(async () => {
   const spy = new GlBufferSpy();
+  const ringSpy = new RingSpy();
   try {
     const { graph, modules, links } = fixture(N);
     const hostEl = perfHost(W, H);
@@ -168,10 +200,11 @@ beforeAll(async () => {
     // The nested map is a disc of radius 10·√N about the origin: sweep in toward an off-centre spot.
     const R = 10 * Math.sqrt(N);
     const k0 = (0.9 * Math.min(W, H)) / (2 * R);
-    const steps = [1, 2, 4, 8, 16, 32].map((f) => {
+    const viewAt = (f: number): { k: number; x: number; y: number } => {
       const k = k0 * f;
       return { k, x: W / 2 - 0.3 * R * k, y: H / 2 + 0.2 * R * k };
-    });
+    };
+    const steps = [1, 2, 4, 8, 16, 32].map(viewAt);
     const runLeg = (): Leg => {
       const before = spy.mark();
       const { worstFrameMs, frames } = sweepFrames(steps, (t) => net.setTransform(t));
@@ -188,6 +221,21 @@ beforeAll(async () => {
     net.lod({ ...base, moduleBoundary: {} });
     sweepFrames(steps, (t) => net.setTransform(t), 1); // warm: the ring layer joins the lane once
     legOn = runLeg();
+    // #483: a pan off the graph and back. The view off the graph has no module in it, so it draws no ring; the
+    // ring layer must still be emitted there (empty) and keep its GPU buffers, as the halos (#482) and the
+    // gathered links (#470) do. The pan starts at a sweep view that draws rings; its first frame is not counted.
+    const ringed = viewAt(4);
+    const away = { ...ringed, x: ringed.x - 100 * W };
+    const ringRings: (number | null)[] = [];
+    let atPan = spy.mark();
+    for (const [s, view] of [ringed, away, ringed, away, ringed].entries()) {
+      if (s === 1) atPan = spy.mark();
+      ringSpy.rings = null;
+      net.setTransform(view);
+      ringRings.push(ringSpy.rings);
+    }
+    const panDelta = spy.since(atPan);
+    ringPan = { created: panDelta.created, deleted: panDelta.deleted, rings: ringRings };
     net.lod({ expandPx: 1e-6, declutter: false, crossLevelEdges: true, moduleBoundary: {} });
     sweepFrames(steps.slice(0, 2), (t) => net.setTransform(t), 1);
     legAll = runLeg();
@@ -285,6 +333,7 @@ beforeAll(async () => {
     net.destroy();
 
   } finally {
+    ringSpy.restore();
     spy.restore();
   }
 }, SETUP_MS);
@@ -307,6 +356,18 @@ describe(`network() module-boundary zoom sweep at N=${N.toLocaleString()} (#329)
     expect(legOn.deleted, `GPU buffers destroyed during the boundary sweep (baseline ${legOff.deleted})`).toBeLessThan(256);
     expect(legOn.worstFrameMs, `worst frame ${legOn.worstFrameMs.toFixed(2)}ms at N=${N.toLocaleString()}`).toBeLessThan(FRAME_MS_LOD);
     expect(legOn.worstFrameMs, `the boundaries cost ${legOn.worstFrameMs.toFixed(2)}ms vs ${legOff.worstFrameMs.toFixed(2)}ms without`).toBeLessThan(3 * legOff.worstFrameMs + perfBudget(5));
+  });
+
+  it("#483 a view with no ring: the ring layer is emitted empty and keeps its GPU buffers", () => {
+    const summary = `rings per step ${JSON.stringify(ringPan.rings)}, +${ringPan.created}/−${ringPan.deleted} GPU buffers after the first frame`;
+    // Non-vacuity: the pan's views on the graph draw rings; the views off it draw none and still emit the layer.
+    expect(ringPan.rings[0] ?? 0, summary).toBeGreaterThan(0);
+    expect(ringPan.rings[2], summary).toBe(ringPan.rings[0]);
+    expect(ringPan.rings[4], summary).toBe(ringPan.rings[0]);
+    expect(ringPan.rings[1], `${summary}: the view off the graph dropped the ring layer or drew rings`).toBe(0);
+    expect(ringPan.rings[3], `${summary}: the view off the graph dropped the ring layer or drew rings`).toBe(0);
+    expect(ringPan.created, summary).toBe(0);
+    expect(ringPan.deleted, summary).toBe(0);
   });
 
   it("#471 per-module rings, reductions ON: resolved once — the sweep only looks them up, in place, within budget", () => {

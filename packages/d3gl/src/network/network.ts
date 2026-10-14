@@ -4414,8 +4414,11 @@ export class Network extends BaseEngine {
     this.drawnRings = null;
     if (boundaryStyle) {
       const rings = boundaryRings(tree, this.cutBoundaries, boundaryStyle, visibleWorldRect(this.transform, this.width, this.height));
+      // Emitted even when empty (#483): a view with no open module in it (every module collapsed, or nothing in view)
+      // has no ring. An empty layer updates in place at count 0 and keeps its GPU buffers; dropped, it would be
+      // destroyed there and rebuilt on the next frame with a ring, as the halos were before #482. Nothing to pick then.
+      layers.push({ name: "module-boundaries", primitive: "circles", circles: rings, sizeMode: "world" });
       if (rings.count > 0) {
-        layers.push({ name: "module-boundaries", primitive: "circles", circles: rings, sizeMode: "world" });
         this.drawnRings = rings;
         this.drawnRingsTree = tree;
       }
