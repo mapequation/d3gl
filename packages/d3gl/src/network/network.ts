@@ -102,12 +102,6 @@ class OpenModuleTreeHit extends ModuleTreeHit {
   readonly open = true;
 }
 
-/** Whether a hit's datum is an open module picked by its boundary ring ({@link NetworkHit.open}, #476). */
-function isOpenModuleHit(hit: HoverHit): boolean {
-  const d = hit.datum;
-  return typeof d === "object" && d !== null && "open" in d && d.open === true;
-}
-
 /** {@link NetworkHit} for a leaf outside a module tree (LOD off, or structural LOD) when the engine holds
  *  a hierarchy (#326): `path` is the node's own record path, copied only when read. */
 class LeafRecordHit implements NetworkHit {
@@ -1585,8 +1579,9 @@ export class Network extends BaseEngine {
    * `members()`, plus `datum.open === true`. A glyph drawn over the ring wins, the deepest of overlapping
    * rings wins, and a pointer inside the disc but off the ring picks no module (so a click there still
    * clears the selection). Its hover / selection highlight is drawn on the ring, its drawn members stay
-   * undimmed, and a selected module keeps its highlight as it opens and collapses. A ring is not a drag
-   * handle: a drag starting on it pans.
+   * undimmed, and a selected module keeps its highlight as it opens and collapses. With `draggable`, the ring
+   * is also a drag handle (#479): a drag starting on it moves the module exactly as a drag of the same module
+   * collapsed does. A press inside the disc but off the ring, or with ⌘ / Ctrl held, pans.
    * Pass `false` to disable (clears any current selection).
    */
   interactive(opts: InteractiveLayerOptions<NetworkHit> | false): this {
@@ -3698,12 +3693,13 @@ export class Network extends BaseEngine {
 
   // ── Node-drag (#140) ──────────────────────────────────────────────────────────────────────────
   /** The node/aggregate under host CSS px (x,y) when `interactive({ draggable })` is set — gates the
-   *  d3-zoom pan filter and the pointerdown grab (#140). Only drawn glyphs are draggable: a link hit
-   *  (#141) and an open module's boundary ring (#476) return null, so a drag starting there still pans. */
+   *  d3-zoom pan filter and the pointerdown grab (#140). A drawn glyph, or an open module by its boundary
+   *  ring (#479): the ring hit carries the module's tree id and `members()`, as the collapsed glyph's does,
+   *  so every drag path grabs the same leaves. A link hit (#141) returns null, so a drag starting there pans. */
   protected override pickDraggable(x: number, y: number): HoverHit | null {
     if (!this.interactiveOpts?.draggable || !this.graph) return null;
     const hit = this.pick(x, y);
-    return hit && hit.layer === this.NODE_LAYER && !isOpenModuleHit(hit) ? hit : null;
+    return hit && hit.layer === this.NODE_LAYER ? hit : null;
   }
 
   /**

@@ -1,9 +1,10 @@
 import { describe, it, expect } from "vitest";
 import { Network, type NetworkHit } from "../network.js";
-import { buildGraph } from "../graph.js";
+import { buildGraph, type NetworkGraph } from "../graph.js";
 import type { ModuleNode } from "../modules.js";
 import type { HoverHit } from "../../map/base-engine.js";
-import type { InstancedHighlight, InstancedLayer } from "../../core/index.js";
+import type { InstancedHighlight, InstancedLayer, ViewTransform } from "../../core/index.js";
+import { PAN_MODIFIER } from "../../map/pan-modifier.js";
 
 /**
  * Hover and select an open module by its boundary ring (#476), through the engine on every backend.
@@ -54,6 +55,10 @@ class Probe extends Network {
   draggableAt(x: number, y: number): HoverHit | null {
     return this.pickDraggable(x, y);
   }
+  /** The view the next frame draws (a pan's latest transform included). */
+  nextView(): ViewTransform {
+    return this.latestTransform();
+  }
 }
 
 function host(): HTMLElement {
@@ -64,7 +69,7 @@ function host(): HTMLElement {
   return el;
 }
 
-async function engine(backend: (typeof BACKENDS)[number]): Promise<{ net: Probe; el: HTMLElement }> {
+async function engine(backend: (typeof BACKENDS)[number], view = VIEW): Promise<{ net: Probe; el: HTMLElement; graph: NetworkGraph }> {
   const el = host();
   const net = new Probe(el, { width: W, height: H, backend });
   await net.whenReady();
@@ -75,9 +80,9 @@ async function engine(backend: (typeof BACKENDS)[number]): Promise<{ net: Probe;
     // Module 1's ring 1 px wide (its hit band widened to 6 px), its sub-modules' 8 px (their own stroke).
     .lod({ expandPx: 30, declutter: false, moduleBoundary: { width: (path) => (path.length === 1 ? 1 : 8), color: RING, opacity: 1 }, aggregateOutline: false })
     .layout({ backend: "positions", positions: POSITIONS });
-  net.setTransform(VIEW);
+  net.setTransform(view);
   net.syncScreenGeometry();
-  return { net, el };
+  return { net, el, graph };
 }
 
 interface Circle { x: number; y: number; r: number; w: number }
@@ -343,12 +348,148 @@ describe("hover, selection and tooltip of an open module (WebGL, #476)", () => {
     el.remove();
   });
 
-  it("a ring is not a drag handle", async () => {
-    const { net, el, ring } = await interactive({ draggable: true });
-    expect(isOpen(net.pick(ring.x, ring.y - ring.r))).toBe(true);
-    expect(net.draggableAt(ring.x, ring.y - ring.r)).toBeNull();
-    net.destroy();
-    el.remove();
-  });
 });
 
+
+/** A mouse drag along `path` (host CSS px) with modifiers `mods`, as a browser dispatches it: pointer + mouse
+ *  down on the host, then each move / up on `window` (where node-drag and d3-zoom listen). One point: a click. */
+function gesture(el: HTMLElement, path: [number, number][], mods: EventModifierInit = {}): void {
+  const r = el.getBoundingClientRect();
+  const at = (x: number, y: number): MouseEventInit => ({ clientX: r.left + x, clientY: r.top + y, bubbles: true, button: 0, view: window, ...mods });
+  const pointer = (type: string, x: number, y: number): void => void el.dispatchEvent(new PointerEvent(type, { ...at(x, y), pointerId: 1 }));
+  const [x0, y0] = path[0] ?? [0, 0];
+  pointer("pointerdown", x0, y0);
+  el.dispatchEvent(new MouseEvent("mousedown", at(x0, y0)));
+  let last: [number, number] = [x0, y0];
+  for (const p of path.slice(1)) {
+    pointer("pointermove", p[0], p[1]);
+    window.dispatchEvent(new MouseEvent("mousemove", at(p[0], p[1])));
+    last = p;
+  }
+  pointer("pointerup", last[0], last[1]);
+  window.dispatchEvent(new MouseEvent("mouseup", at(last[0], last[1])));
+}
+
+/** Each leaf's move since `before`, in world units. */
+function moves(graph: NetworkGraph, before: Float32Array): [number, number][] {
+  const out: [number, number][] = [];
+  for (let i = 0; i < graph.nodeCount; i++) out.push([graph.positions[2 * i]! - before[2 * i]!, graph.positions[2 * i + 1]! - before[2 * i + 1]!]);
+  return out;
+}
+
+const MODULE_1 = [0, 1, 2, 3, 4, 5]; // module 1's leaves
+const DRAG: [number, number] = [12, 9]; // the drag, in screen px
+
+describe("drag an open module by its boundary ring (#479), on every backend", () => {
+  async function draggable(backend: (typeof BACKENDS)[number], view = VIEW) {
+    const { net, el, graph } = await engine(backend, view);
+    net.interactive({ draggable: true, selectable: true }).enableZoom([0.01, 50]);
+    const clicks: (HoverHit | null)[] = [];
+    net.on("click", (h) => clicks.push(h));
+    return { net, el, graph, clicks };
+  }
+  /** Drag from (x, y) by {@link DRAG}; returns each leaf's move scaled to screen px at `k`, and the view's pan. */
+  function dragFrom(net: Probe, el: HTMLElement, graph: NetworkGraph, x: number, y: number, mods: EventModifierInit = {}) {
+    const before = graph.positions.slice();
+    const t0 = net.nextView();
+    gesture(el, [[x, y], [x + DRAG[0] / 2, y], [x + DRAG[0], y + DRAG[1]]], mods);
+    const t1 = net.nextView();
+    return { px: moves(graph, before).map(([dx, dy]) => [dx * t0.k, dy * t0.k]), pan: [t1.x - t0.x, t1.y - t0.y] };
+  }
+
+  for (const backend of BACKENDS) {
+    it(`${backend}: a drag from a ring moves the module's leaves as the same drag of the collapsed module does`, async () => {
+      // Open (VIEW): grab module 1 by the top of its ring.
+      const open = await draggable(backend);
+      const ring = drawn(open.net).rings.reduce((a, b) => (b.r > a.r ? b : a));
+      const grab = open.net.draggableAt(ring.x, ring.y - ring.r);
+      expect(isOpen(grab), "the ring grabs").toBe(true);
+      expect(datumOf(grab)?.path).toEqual([1]);
+      const byRing = dragFrom(open.net, open.el, open.graph, ring.x, ring.y - ring.r);
+      expect(byRing.pan, "the view did not pan").toEqual([0, 0]);
+      expect(open.clicks, "a drag is not a click").toHaveLength(0);
+
+      // Collapsed (OUT): grab module 1's glyph. The reference is the WebGL drag: on Canvas/SVG a collapsed
+      // glyph's hit lists its tree id as its only member, so that drag moves no leaf (#481).
+      const shut = await draggable("webgl", OUT);
+      expect(drawn(shut.net).rings, "module 1 collapsed: no ring drawn").toHaveLength(0);
+      const glyph = drawn(shut.net).glyphs.find((c) => shut.net.draggableAt(c.x, c.y)?.id === grab?.id);
+      if (!glyph) throw new Error("module 1's collapsed glyph not found");
+      expect(isOpen(shut.net.draggableAt(glyph.x, glyph.y))).toBe(false);
+      const byGlyph = dragFrom(shut.net, shut.el, shut.graph, glyph.x, glyph.y);
+      expect(byGlyph.pan).toEqual([0, 0]);
+
+      // The same leaves move, by the same screen distance: the drag's.
+      for (let i = 0; i < 12; i++) {
+        const want = MODULE_1.includes(i) ? DRAG : [0, 0];
+        for (const [label, m] of [["ring", byRing.px[i]!], ["collapsed", byGlyph.px[i]!]] as const) {
+          expect(m[0], `${label}: leaf ${i} x`).toBeCloseTo(want[0]!, 3);
+          expect(m[1], `${label}: leaf ${i} y`).toBeCloseTo(want[1]!, 3);
+        }
+      }
+      for (const e of [open, shut]) {
+        e.net.destroy();
+        e.el.remove();
+      }
+    });
+
+    it(`${backend}: unchanged — a click on a ring picks it without moving; off the ring, or with ⌘/Ctrl, a press pans; a glyph over a ring wins the grab`, async () => {
+      const { net, el, graph, clicks } = await draggable(backend);
+      const { rings, glyphs } = drawn(net);
+      const ring = rings.reduce((a, b) => (b.r > a.r ? b : a)); // module 1
+      const top: [number, number] = [ring.x, ring.y - ring.r];
+      const still = (m: { px: number[][] }): boolean => m.px.every(([dx, dy]) => dx === 0 && dy === 0);
+
+      // A click without a move: the module is clicked (and selected, where the lane selects), nothing moves.
+      const before = graph.positions.slice();
+      gesture(el, [top]);
+      expect(isOpen(clicks.at(-1) ?? null), "click").toBe(true);
+      expect(moves(graph, before).every(([dx, dy]) => dx === 0 && dy === 0), "a click moved a leaf").toBe(true);
+      if (backend === "webgl") expect(net.selection().map((h) => datumOf(h)?.path?.join(":"))).toEqual(["1"]);
+
+      // Inside the disc but off the ring: nothing to grab, the press pans.
+      const inside: [number, number] = [ring.x, ring.y - ring.r + 20];
+      expect(net.draggableAt(...inside)).toBeNull();
+      const offRing = dragFrom(net, el, graph, ...inside);
+      expect(offRing.pan, "off the ring: pans").toEqual(DRAG);
+      expect(still(offRing), "off the ring: a leaf moved").toBe(true);
+
+      // The force-pan modifier on the ring: pans, grabs nothing.
+      net.setTransform(VIEW);
+      net.syncScreenGeometry();
+      const forced = dragFrom(net, el, graph, ...top, { [PAN_MODIFIER]: true });
+      expect(forced.pan, `${PAN_MODIFIER} on the ring: pans`).toEqual(DRAG);
+      expect(still(forced), `${PAN_MODIFIER} on the ring: a leaf moved`).toBe(true);
+
+      // A glyph drawn over a ring wins the grab: only that leaf moves.
+      net.setTransform(VIEW);
+      net.syncScreenGeometry();
+      let over: { x: number; y: number } | null = null;
+      for (const c of glyphs) {
+        for (const rg of rings) {
+          const d = Math.hypot(c.x - rg.x, c.y - rg.y);
+          if (Math.abs(d - rg.r) > c.r / 2) continue; // the ring's centreline runs through the glyph's inner half
+          const x = rg.x + ((c.x - rg.x) * rg.r) / d;
+          const y = rg.y + ((c.y - rg.y) * rg.r) / d;
+          if (inBand(rg, x, y, 0.75)) over = { x, y };
+        }
+        if (over) break;
+      }
+      if (!over) throw new Error("no glyph over a ring");
+      const hit = net.draggableAt(over.x, over.y);
+      expect(hit?.layer).toBe("nodes");
+      expect(isOpen(hit), "a glyph over the ring").toBe(false);
+      const leaf = hit!.id as number;
+      expect(leaf, "a leaf (tree ids below the leaf count)").toBeLessThan(12);
+      const byGlyph = dragFrom(net, el, graph, over.x, over.y);
+      expect(byGlyph.pan).toEqual([0, 0]);
+      for (let i = 0; i < 12; i++) {
+        const want = i === leaf ? DRAG : [0, 0];
+        expect(byGlyph.px[i]![0], `leaf ${i} x`).toBeCloseTo(want[0]!, 3);
+        expect(byGlyph.px[i]![1], `leaf ${i} y`).toBeCloseTo(want[1]!, 3);
+      }
+      net.destroy();
+      el.remove();
+    });
+  }
+});
