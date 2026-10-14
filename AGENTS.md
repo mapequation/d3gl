@@ -324,6 +324,12 @@ git -C <primary> checkout -- <files>                         # restore primary t
   a wall-clock watchdog (`packages/d3gl/scripts/run-browser-tests.mjs`) turns any
   rare connect/teardown stall into a fast failure instead of an infinite hang. CI
   does not run the full browser suite (node only) — only the browser perf tier below.
+- **Failure screenshots are off** (`browser.screenshotFailures: false`, #480). The guards draw without
+  waiting for the GPU, so under SwiftShader a heavy guard can have minutes of queued draws pending when an
+  assertion fails, and a screenshot waits for all of them: a failing guard sat silent until the watchdog
+  killed it (the GPU process at ~700% CPU, the page idle), where its passing run takes seconds. Don't turn
+  them back on for a run to "see" a failure. vitest's CLI ignores `--browser.screenshotFailures` (it is not a
+  CLI option), so a flag cannot do it either: only the config can.
 - **A `vi.mock` in a browser test also reaches every Web Worker the test spawns, and kills it** (#377, #428):
   vitest serves the worker the mock proxy, which throws there (`getFactoryModule` of undefined), so the
   worker never loads and the engine silently takes its main-thread fallback — the test then measures the
