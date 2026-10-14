@@ -423,6 +423,13 @@ beforeAll(async () => {
     spatial = leg(net);
     gestureBoundaries = net.gestureBoundaries; // the camera re-seeds d3-zoom every fitted frame: never a gesture
     net.destroy();
+    // Every phase's best-of-rounds median, so a passing run shows its margins too (#464).
+    const ms = (p: Phase): string => p.medianMs.toFixed(2);
+    const legLine = (name: string, l: Leg): string => `${name} streamed ${ms(l.streamed)} / transition ${ms(l.transition)} / fitted ${ms(l.fitted)}`;
+    const movingLine = (name: string, l: MovingLeg | null): string[] => (l ? [`${name} moving unfitted ${ms(l.unfitted)} / fitted ${ms(l.fitted)}`] : []);
+    console.log(
+      [`N=${N.toLocaleString()} medians (ms):`, legLine("LOD OFF", off), legLine("LOD ON", on), legLine("spatial", spatial), `fit-on-layout LOD OFF ${ms(fitOff.phase)} / LOD ON ${ms(fitOn.phase)}`, ...movingLine("LOD OFF", moving), ...movingLine("LOD ON", movingOn)].join("\n  "),
+    );
   } finally {
     globalThis.requestAnimationFrame = realRaf;
     globalThis.cancelAnimationFrame = realCaf;
