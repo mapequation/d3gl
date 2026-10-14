@@ -1074,6 +1074,151 @@ export function boundaryRings(
   return { centers, radii, colors: new Uint8Array(count * 4), borders, borderColors, count, ids };
 }
 
+/** The narrowest band, in screen px, a {@link pickBoundaryRing} hit is tested over (#476): a thinner ring's
+ *  stroke is widened about its centreline to this, so a 1 px ring is still easy to point at. */
+export const BOUNDARY_PICK_MIN_PX = 6;
+
+/** The narrowest highlight, in screen px, {@link boundaryHighlightCircles} draws on a ring (#476). */
+export const BOUNDARY_HIGHLIGHT_MIN_PX = 2;
+
+/** {@link boundaryRingPickStats}'s storage: a float slot, so the running sum never leaves an unboxed number
+ *  (a plain number field past the small-integer range would allocate a heap number on every pick). */
+const ringPickTests = new Float64Array(1);
+
+/**
+ * Ring tests run by {@link pickBoundaryRing} (#476), summed over calls: one per ring the frame drew, per
+ * pick. A probe for the per-move guards — with LOD off no ring is drawn and the count stays put.
+ */
+export const boundaryRingPickStats = {
+  get tests(): number {
+    return ringPickTests[0]!;
+  },
+};
+
+/**
+ * A module's depth key for {@link pickBoundaryRing}'s "deepest wins" (#476): its depth below the root where
+ * the tree records it (`depth`, else by walking `parent`), else, on a tree numbered by level with no parent
+ * map (coarsening, spatial), minus its level, which orders the same way. O(depth); allocation-free.
+ */
+function ringDepth(tree: LODTree, g: number): number {
+  if (tree.depth) return tree.depth[g]!;
+  const parent = tree.parent;
+  if (parent) {
+    let d = 0;
+    for (let x = parent[g]!; x >= 0; x = parent[x]!) d++;
+    return d;
+  }
+  const { levelOffset, levelCount } = tree;
+  for (let l = 0; l < levelCount; l++) if (g < levelOffset[l + 1]!) return -l;
+  return -levelCount;
+}
+
+/**
+ * Hit-test a screen point (CSS px) against the module-boundary rings a frame drew (#476) — the
+ * {@link boundaryRings} batch itself, so the test reuses that frame's centres, radii and widths and resolves
+ * nothing. A hit is a point on a ring's stroke `[r − w, r]` (projected `screen = world·k + t`), widened about
+ * its centreline to `minHitPx` when thinner; a point inside the disc but off the stroke hits nothing. Where
+ * strokes overlap the deepest module wins (on a tie, the ring drawn last — on top). A ring drawn fully
+ * transparent is skipped. Returns the ring's index in `rings` (its module is `rings.ids[i]`), or −1.
+ *
+ * O(rings drawn) — the expanded modules in view, at most one ring each — plus O(depth) per ring under the
+ * point; allocation-free, so it runs on every pointer move.
+ */
+export function pickBoundaryRing(tree: LODTree, rings: FrontierHalosData, x: number, y: number, t: LODTransform, minHitPx: number = BOUNDARY_PICK_MIN_PX): number {
+  const { centers, radii, borders, borderColors, ids, count } = rings;
+  const k = t.k;
+  // The point in world units: one divide per pick, none per ring.
+  const wx = (x - t.x) / k;
+  const wy = (y - t.y) / k;
+  const minW = minHitPx / k;
+  ringPickTests[0] = ringPickTests[0]! + count;
+  let best = -1;
+  let bestDepth = -Infinity;
+  for (let i = 0; i < count; i++) {
+    const r = radii[i]!;
+    const dx = wx - centers[i * 2]!;
+    const dy = wy - centers[i * 2 + 1]!;
+    const d2 = dx * dx + dy * dy;
+    const w = borders[i]! * r;
+    const pad = w < minW ? (minW - w) / 2 : 0;
+    const outer = r + pad;
+    if (d2 > outer * outer) continue;
+    const inner = r - w - pad;
+    if ((inner > 0 && d2 < inner * inner) || borderColors[i * 4 + 3] === 0) continue; // off the stroke, or drawn fully transparent
+    const depth = ringDepth(tree, ids[i]!);
+    if (depth >= bestDepth) {
+      best = i;
+      bestDepth = depth;
+    }
+  }
+  return best;
+}
+
+/**
+ * The hover / selection highlight on open modules' boundary rings (#476): for each ring of `rings` whose
+ * module `isHighlighted`, a circle on the ring's own centreline, in `colorOf(module)`, as wide as the ring
+ * and at least `minPx` screen px at the zoom `k` (world-sized, like the rings). O(rings drawn).
+ */
+export function boundaryHighlightCircles(
+  rings: FrontierHalosData,
+  isHighlighted: (g: number) => boolean,
+  colorOf: (g: number) => RGBAValue,
+  k: number,
+  minPx: number = BOUNDARY_HIGHLIGHT_MIN_PX,
+): FrontierHalosData {
+  const { centers: rc, radii: rr, borders: rb, ids: rIds } = rings;
+  let count = 0;
+  for (let i = 0; i < rings.count; i++) if (isHighlighted(rIds[i]!)) count++;
+  const centers = new Float32Array(count * 2);
+  const radii = new Float32Array(count);
+  const borders = new Float32Array(count);
+  const borderColors = new Uint8Array(count * 4);
+  const ids = new Uint32Array(count);
+  const minW = minPx / (k || 1);
+  let o = 0;
+  for (let i = 0; i < rings.count; i++) {
+    const g = rIds[i]!;
+    if (!isHighlighted(g)) continue;
+    const r = rr[i]!;
+    const w = rb[i]! * r;
+    const hw = Math.max(w, minW);
+    const outer = r - w / 2 + hw / 2; // the ring's centreline, ± half the highlight's width
+    ids[o] = g;
+    centers[o * 2] = rc[i * 2]!;
+    centers[o * 2 + 1] = rc[i * 2 + 1]!;
+    radii[o] = outer;
+    borders[o] = Math.min(1, hw / outer);
+    const c = colorOf(g);
+    borderColors[o * 4] = c[0];
+    borderColors[o * 4 + 1] = c[1];
+    borderColors[o * 4 + 2] = c[2];
+    borderColors[o * 4 + 3] = c[3];
+    o++;
+  }
+  return { centers, radii, colors: new Uint8Array(count * 4), borders, borderColors, count, ids };
+}
+
+/**
+ * The run of `frontier` that lies under module `g` (#476): `[lo, hi)` with every entry in it `g` or one of
+ * its descendants, or `[0, 0]` when none is drawn. The cut walks the tree depth first and declutter keeps
+ * its order, so a module's drawn descendants are one contiguous run. O(frontier · depth); writes `out`.
+ */
+export function descendantRun(frontier: Uint32Array, g: number, parent: Int32Array, out: [number, number]): [number, number] {
+  let lo = 0;
+  while (lo < frontier.length && !isUnder(frontier[lo]!, g, parent)) lo++;
+  let hi = lo;
+  while (hi < frontier.length && isUnder(frontier[hi]!, g, parent)) hi++;
+  out[0] = lo < frontier.length ? lo : 0;
+  out[1] = lo < frontier.length ? hi : 0;
+  return out;
+}
+
+/** Whether tree node `x` is `g` or one of its descendants. O(depth). */
+function isUnder(x: number, g: number, parent: Int32Array): boolean {
+  for (let a = x; a >= 0; a = parent[a]!) if (a === g) return true;
+  return false;
+}
+
 /** Resolved style for LOD super-edges — the same channels as raw links, applied to accumulated flow. */
 export interface SuperEdgeStyleResolved {
   /** `"line"` (bent/straight + optional arrowhead) or `"half-arrow"` (fused, directed). */

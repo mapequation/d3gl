@@ -27,9 +27,10 @@ function selectedFloats(data: WithHighlight): Float32Array {
  * double. An LOD frontier keeps growing while a layout expands or a zoom deepens; an exact fit reallocated
  * every buffer of the lane on each frame that set a new high, and doubling bounds the reallocations to
  * log2(peak / first) over the lane's life, like the Scene path's `GrowBuffer` (renderer.ts). A shrink
- * keeps the room (the tail past `count` is never drawn).
+ * keeps the room (the tail past `count` is never drawn). The network's highlight lane tracks its layers' room
+ * with it (#478).
  */
-function grownCapacity(count: number, capacity: number): number {
+export function grownCapacity(count: number, capacity: number): number {
   return Math.max(count, 2 * capacity);
 }
 
@@ -47,7 +48,7 @@ const HL_RED: [number, number, number] = [0.863, 0.149, 0.149];
 
 /** Default highlight uniforms: no hover, no dim; `recolor` = 1 tints highlighted instances (links), 0 keeps (nodes). */
 function highlightUniforms(recolor: 0 | 1): Record<string, unknown> {
-  return { u_hoverGroup: -1, u_dimActive: 0, u_dimOpacity: 1, u_recolor: recolor, u_recolorRGB: HL_RED };
+  return { u_hoverGroup: -1, u_hoverInstances: [0, 0], u_dimActive: 0, u_dimOpacity: 1, u_recolor: recolor, u_recolorRGB: HL_RED };
 }
 
 /**
@@ -132,6 +133,7 @@ class HighlightBuffers {
 /** Apply an {@link InstancedHighlight} to a uniforms record (only the provided fields). */
 function applyHighlight(uniforms: Record<string, unknown>, h: InstancedHighlight): void {
   if (h.hoverGroup !== undefined) uniforms["u_hoverGroup"] = h.hoverGroup;
+  if (h.hoverInstances !== undefined) uniforms["u_hoverInstances"] = h.hoverInstances;
   if (h.dimActive !== undefined) uniforms["u_dimActive"] = h.dimActive ? 1 : 0;
   if (h.dimOpacity !== undefined) uniforms["u_dimOpacity"] = h.dimOpacity;
   if (h.recolor !== undefined) {
@@ -309,8 +311,9 @@ export class InstancedCircles {
         a_borderColor: this.borderColor,
         ...this.hl.recreate(data, this._capacity), // #162 group/selected grow with the geometry
       });
-    } else {
-      // Sub-update: upload only the filled portion of the scratch buffers.
+    } else if (data.count > 0) {
+      // Sub-update: upload only the filled portion of the scratch buffers. An empty update (a highlight lane
+      // with nothing highlighted, #478) writes nothing: the layer keeps its buffers and draws nothing.
       this.center.write(data.centers);
       this.radius.write(data.radii);
       this.color.write(data.colors);
