@@ -40,8 +40,9 @@ import { D3GL } from "@mapequation/d3gl/react";        // React component
 | `/network` | `network` engine for large node–link graphs: force layout (worker/GPU), level-of-detail, maps of networks |
 | `/react` | headless `MapController` + `<D3GL>` component |
 
-See the [repository](https://github.com/mapequation/d3gl) for full docs,
-examples, and the live demo.
+Full docs, the API reference and live examples:
+**https://mapequation.github.io/d3gl/**. Source and issues: the
+[repository](https://github.com/mapequation/d3gl).
 
 ## License
 

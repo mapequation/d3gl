@@ -27,7 +27,7 @@ yourself to the contributors list in your pull request.
 
 This is a pnpm workspace with a single published package, `@mapequation/d3gl`,
 organized into modules that are each exposed as a subpath export. See the
-[Modules table in the README](README.md#modules).
+[subpath table in the package README](packages/d3gl/README.md#subpath-exports).
 
 ```
 packages/d3gl/
