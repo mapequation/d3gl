@@ -1,5 +1,11 @@
 # @mapequation/d3gl
 
+## 0.11.3
+
+### Patch Changes
+
+- [#485](https://github.com/mapequation/d3gl/pull/485) [`f40bce6`](https://github.com/mapequation/d3gl/commit/f40bce66713b40882a9db6898d7eb7f8c5ab1edd) Thanks [@danieledler](https://github.com/danieledler)! - Network: with LOD on Canvas and SVG, dragging a collapsed module's glyph now moves its leaves, as on WebGL. Before, the glyph's hit listed its tree id as its only member, so the drag held no leaf. `selection()` and `on("select")` now list a selected aggregate's leaves as its `members()` on those backends too.
+
 ## 0.11.2
 
 ### Patch Changes
