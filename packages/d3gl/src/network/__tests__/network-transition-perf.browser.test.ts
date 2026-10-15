@@ -57,6 +57,14 @@ vi.mock("../glyphs.js", async (importOriginal) => {
  * Frames are stepped by hand: `requestAnimationFrame` is replaced by a queue this file flushes, so
  * each frame's callbacks run — and are timed — alone.
  *
+ * `render()` is COUNTED, not submitted to the GPU (#464): this guard times a frame's CPU work and asserts
+ * one render per timed frame. Drawn on the runner's software GL (SwiftShader), one full-detail frame at 100k
+ * is ~1.5 s of GPU work. Stepped by hand, nothing paced it: each phase's draws were still running, on the
+ * same CPUs, while the next phase was timed (a fit-on-layout frame read 2× a streamed one on CI, and the
+ * file ran 3-5 min against the tier's 5 min per file), and draining the GPU between phases took the file
+ * from 4.4 to 9.2 min. The CPU side of a draw, a few instanced draw calls, the same in every phase, is
+ * network-sweep-perf.browser.test.ts's to pin.
+ *
  * Both reduction states on ONE engine (see network-sweep-perf.browser.test.ts, #287):
  *   - **LOD OFF**: both frames re-emit the whole graph. The transition may add its O(nodes)
  *     interpolation, nothing else: no buffer churn, no more upload than the streamed frame.
@@ -84,8 +92,7 @@ vi.mock("../glyphs.js", async (importOriginal) => {
  *     the unfitted transition on the same clock. Same signatures, same budget: a zoom that really changes
  *     `k` adds nothing but the O(1) camera. With LOD on the moving camera re-cuts the frontier at each
  *     frame's view, as a user zoom does: still one cut per frame and no style pass, and the fitted frame,
- *     zooming out onto the whole map, draws no more than the unfitted one does at its still view. Up to
- *     {@link MOVING_MAX} nodes (see there).
+ *     zooming out onto the whole map, draws no more than the unfitted one does at its still view.
  */
 
 // 100k locally, the browser tier's CI scale too (#343): the LOD ON ratio below needs the style pass to be a
@@ -114,14 +121,6 @@ const wallClock = performance.now.bind(performance);
  *  uploaded per frame: the fitted camera zooms out onto a coarser frontier); 100k OFF 0.9 / 0.9 ms, ON 4.1 /
  *  4.2 ms. */
 const MOVING_MS = 1000;
-/**
- * The moving-camera leg's size wall. A fitted frame shows the whole layout, so every node and every one of
- * this fixture's long tree edges is on screen each frame; stepped without waiting for the GPU, software GL
- * falls behind above ~100k (a 200k run stalled on the queued frames for minutes, while its CPU frame
- * measured the same as the unfitted one's). The CI tier runs at 100k, so the leg is at scale there.
- */
-const MOVING_MAX = 100_000;
-const MOVING = N <= MOVING_MAX;
 
 /** A 3-level module hierarchy over a binary tree, and two unrelated position sets to move between. */
 function fixture(n: number): { graph: ReturnType<typeof buildGraph>; modules: ModuleNode[]; a: Float32Array; b: Float32Array } {
@@ -156,6 +155,12 @@ class TransitionProbe extends Network {
   }
   get camera(): ViewTransform {
     return { ...this.transform };
+  }
+  /** `render()` is COUNTED, not submitted to the GPU (#464): see the file header. */
+  renders = 0;
+  override render(): this {
+    this.renders++;
+    return this;
   }
   protected override setInteracting(v: boolean): void {
     this.gestureBoundaries++;
@@ -205,6 +210,8 @@ interface Phase {
   cameraSyncs: number;
   cuts: number;
   styleResolves: number;
+  /** `render()` calls over the timed frames: one per frame. */
+  renders: number;
 }
 
 interface Leg {
@@ -273,6 +280,7 @@ beforeAll(async () => {
     const measure = (frame: (i: number) => void): Phase => {
       frame(0); // warm-up
       const fill0 = nodeFill;
+      const renders0 = net.renders;
       const stroke0 = linkStroke;
       const style0 = real.lod?.lodStylePasses ?? 0;
       const builds0 = real.lod?.mortonTopologyBuilds ?? 0;
@@ -289,6 +297,7 @@ beforeAll(async () => {
       ts.sort((x, y) => x - y);
       return {
         medianMs: ts[Math.floor(ts.length / 2)]!,
+        renders: net.renders - renders0,
         stylePasses: (real.lod?.lodStylePasses ?? 0) - style0,
         treeBuilds: (real.lod?.mortonTopologyBuilds ?? 0) - builds0,
         crowdingPasses: (real.lod?.lodCrowdingPasses ?? 0) - crowd0,
@@ -378,12 +387,12 @@ beforeAll(async () => {
     };
 
     off = leg(net);
-    if (MOVING) moving = movingLeg(net);
+    moving = movingLeg(net);
     net.setTransform({ k: 1, x: 0, y: 0 }); // back to the view the other legs run at
     net.lod({}); // the module tree: a registration event (tree + geometry), then the same two phases
     flush();
     on = leg(net);
-    if (MOVING) movingOn = movingLeg(net);
+    movingOn = movingLeg(net);
     // Fit-on-layout reframes on every streamed frame and re-seeds d3-zoom to the framed view. On a
     // zoom-enabled engine that re-seed emits d3-zoom's start/end, which must not count as the user's
     // gesture: it used to release the fit after its first frame. The engine runs zoom-enabled (above). Same
@@ -423,6 +432,13 @@ beforeAll(async () => {
     spatial = leg(net);
     gestureBoundaries = net.gestureBoundaries; // the camera re-seeds d3-zoom every fitted frame: never a gesture
     net.destroy();
+    // Every phase's best-of-rounds median, so a passing run shows its margins too (#464).
+    const ms = (p: Phase): string => p.medianMs.toFixed(2);
+    const legLine = (name: string, l: Leg): string => `${name} streamed ${ms(l.streamed)} / transition ${ms(l.transition)} / fitted ${ms(l.fitted)}`;
+    const movingLine = (name: string, l: MovingLeg | null): string[] => (l ? [`${name} moving unfitted ${ms(l.unfitted)} / fitted ${ms(l.fitted)}`] : []);
+    console.log(
+      [`N=${N.toLocaleString()} medians (ms):`, legLine("LOD OFF", off), legLine("LOD ON", on), legLine("spatial", spatial), `fit-on-layout LOD OFF ${ms(fitOff.phase)} / LOD ON ${ms(fitOn.phase)}`, ...movingLine("LOD OFF", moving), ...movingLine("LOD ON", movingOn)].join("\n  "),
+    );
   } finally {
     globalThis.requestAnimationFrame = realRaf;
     globalThis.cancelAnimationFrame = realCaf;
@@ -527,12 +543,25 @@ describe(`network() position transition — per-frame cost vs a streamed layout 
     });
   }
 
+  it("every timed frame renders once (render counted, not drawn: #464)", () => {
+    const phases: [string, Phase][] = [];
+    for (const [name, leg] of [["LOD OFF", off], ["LOD ON", on], ["spatial", spatial]] as const) {
+      phases.push([`${name} streamed`, leg.streamed], [`${name} transition`, leg.transition], [`${name} fitted`, leg.fitted]);
+    }
+    phases.push(["fit-on-layout LOD OFF", fitOff.phase], ["fit-on-layout LOD ON", fitOn.phase]);
+    for (const [name, leg] of [["LOD OFF", moving], ["LOD ON", movingOn]] as const) {
+      if (leg) phases.push([`${name} moving unfitted`, leg.unfitted], [`${name} moving fitted`, leg.fitted]);
+    }
+    expect(phases).toHaveLength(15);
+    for (const [name, phase] of phases) expect(phase.renders, name).toBe(FRAMES);
+  });
+
   it("the fitted camera's zoom re-seeds are never a gesture (#427, #309)", () => {
     expect(gestureBoundaries, "the camera's own re-seed ran a gesture boundary").toBe(0);
   });
 
   for (const [name, get, ceiling] of [["LOD OFF", () => moving, FRAME_MS_OFF], ["LOD ON", () => movingOn, FRAME_MS_ON]] as const) {
-    it.skipIf(!MOVING)(`${name}, moving camera (#427): a zoom that really changes k adds only the O(1) camera`, () => {
+    it(`${name}, moving camera (#427): a zoom that really changes k adds only the O(1) camera`, () => {
       const leg = get();
       if (!leg) throw new Error("the moving-camera leg did not run");
       const { unfitted, fitted, ks } = leg;

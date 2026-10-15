@@ -409,15 +409,21 @@ describe("drag an open module by its boundary ring (#479), on every backend", ()
       expect(byRing.pan, "the view did not pan").toEqual([0, 0]);
       expect(open.clicks, "a drag is not a click").toHaveLength(0);
 
-      // Collapsed (OUT): grab module 1's glyph. The reference is the WebGL drag: on Canvas/SVG a collapsed
-      // glyph's hit lists its tree id as its only member, so that drag moves no leaf (#481).
-      const shut = await draggable("webgl", OUT);
+      // Collapsed (OUT): grab module 1's glyph on the same backend. Its hit lists the module's leaves as
+      // its members, as the ring's does — on Canvas/SVG too, where the glyph is picked from the Scene (#481).
+      const shut = await draggable(backend, OUT);
       expect(drawn(shut.net).rings, "module 1 collapsed: no ring drawn").toHaveLength(0);
       const glyph = drawn(shut.net).glyphs.find((c) => shut.net.draggableAt(c.x, c.y)?.id === grab?.id);
       if (!glyph) throw new Error("module 1's collapsed glyph not found");
-      expect(isOpen(shut.net.draggableAt(glyph.x, glyph.y))).toBe(false);
+      const glyphHit = shut.net.draggableAt(glyph.x, glyph.y);
+      expect(isOpen(glyphHit)).toBe(false);
+      expect(glyphHit?.members?.(), "the collapsed glyph's members are its leaves").toEqual(MODULE_1);
       const byGlyph = dragFrom(shut.net, shut.el, shut.graph, glyph.x, glyph.y);
       expect(byGlyph.pan).toEqual([0, 0]);
+      // The grab selected the glyph: the selection lists the module's leaves too.
+      const selected = shut.net.selection();
+      expect(selected.map((h) => h.id)).toEqual([grab?.id]);
+      expect(selected[0]?.members?.(), "the selected glyph's members are its leaves").toEqual(MODULE_1);
 
       // The same leaves move, by the same screen distance: the drag's.
       for (let i = 0; i < 12; i++) {
