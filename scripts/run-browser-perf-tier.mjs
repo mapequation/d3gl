@@ -87,7 +87,9 @@ const SHARDS = [
     // 307 s (one ratio failure) running beside the other shards, killed twice by the 300 s
     // per-file watchdog. Likely why: its frames are stepped by hand, with no animation frame to
     // pace SwiftShader, so the GPU work piles up as one backlog and competes with the other
-    // jobs' software GL. The follow guard (#457) steps its frames the same way.
+    // jobs' software GL. network-transition-perf now counts its renders instead (#464: a few
+    // seconds), but the warm follow guards (#457) step real draws the same way (95-189 s alone on
+    // CI), so the shard stays solo until #488 treats them alike.
     solo: true,
     // The Canvas/SVG transition guard (network-vector-transition) runs in "engines", for balance.
     match: /\/network\/__tests__\/network-(?!vector-)(?:[a-z0-9-]*-)?(?:transition|follow|fit-stream)-perf\.browser\.test\.tsx?$/,
