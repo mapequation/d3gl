@@ -83,14 +83,11 @@ const SHARDS = [
   {
     name: "transitions",
     title: "network() position transitions and live-layout following, on WebGL",
-    // Solo: network-transition-perf took 209 and 214 s on CI running alone, and 300+, 300+ and
-    // 307 s (one ratio failure) running beside the other shards, killed twice by the 300 s
-    // per-file watchdog. Likely why: its frames are stepped by hand, with no animation frame to
-    // pace SwiftShader, so the GPU work piles up as one backlog and competes with the other
-    // jobs' software GL. network-transition-perf now counts its renders instead (#464: a few
-    // seconds), but the warm follow guards (#457) step real draws the same way (95-189 s alone on
-    // CI), so the shard stays solo until #488 treats them alike.
-    solo: true,
+    // Ran solo (#462) while its guards drew their hand-stepped frames on SwiftShader: one phase's
+    // GPU backlog competed with the next phase's timed frames and with the other jobs' software GL,
+    // and network-transition-perf took 300+ s beside the other shards. Every guard here now counts
+    // its renders instead of drawing them (#464, #488): about 10 s for the shard locally, so it runs
+    // in parallel again.
     // The Canvas/SVG transition guard (network-vector-transition) runs in "engines", for balance.
     match: /\/network\/__tests__\/network-(?!vector-)(?:[a-z0-9-]*-)?(?:transition|follow|fit-stream)-perf\.browser\.test\.tsx?$/,
   },
