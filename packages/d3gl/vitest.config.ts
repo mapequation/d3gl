@@ -46,6 +46,13 @@ export default defineConfig({
       // (run sits at "Test Files 0 passed (N)" forever). Bound that phase so it
       // fails with a clear connection error instead of climbing indefinitely.
       connectTimeout: 30_000,
+      // No screenshot of a failed test (#480). The guards draw without waiting for the GPU, so under
+      // SwiftShader minutes of queued draws can still be pending when an assertion fails, and the
+      // screenshot waits for all of them: a failing guard sat silent until the watchdog killed it,
+      // where its passing run takes seconds. CI keeps no screenshots, and the failure is reported
+      // with its message either way. (Only this config can turn it off: vitest's CLI ignores
+      // `--browser.screenshotFailures`.)
+      screenshotFailures: false,
       instances: [{ browser: "chromium" }],
     },
   },
