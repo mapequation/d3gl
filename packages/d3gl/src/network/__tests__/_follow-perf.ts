@@ -31,9 +31,15 @@ import type { ViewTransform } from "../../core/index.js";
  * once the worker's first frame has started the ease, so every timed frame is mid-ease; no worker message is
  * taken meanwhile, so each is the ease's own. Both reduction states on ONE engine (#287).
  *
- * Shared by `network-warm-nested-follow-perf.browser.test.ts` and `network-warm-flat-follow-perf.browser.test.ts`: the
- * legs are ~160 100k-node frames of SwiftShader work, 284 s in one file against the tier's 300 s per-file
- * watchdog, so each kind runs in its own file (same N, ROUNDS and assertions).
+ * `render()` is COUNTED, not submitted to the GPU (#488), as in `network-transition-perf`: the guard times a
+ * frame's CPU work and asserts one render per timed frame. Stepped by hand on the runner's software GL
+ * (SwiftShader), nothing paced the draws: each full-detail 100k frame left ~1.5 s of GPU work (#464), still
+ * running on the same CPUs while the next phase was timed. The CPU side of a draw, a few instanced draw calls,
+ * the same on both phases, is network-sweep-perf.browser.test.ts's to pin.
+ *
+ * Shared by `network-warm-nested-follow-perf.browser.test.ts` and `network-warm-flat-follow-perf.browser.test.ts`
+ * (same N, ROUNDS and assertions): split when the legs still drew their ~160 100k-node frames on SwiftShader,
+ * 284 s in one file against the tier's 300 s per-file watchdog.
  */
 
 export const N = perfN(100_000, { max: 200_000 });
@@ -74,6 +80,8 @@ function fixture(n: number): { graph: ReturnType<typeof buildGraph>; modules: Mo
 /** Exposes the streamed-frame trigger and counts the camera's reframes, without reaching into privates. */
 class FollowProbe extends Network {
   cameraSyncs = 0;
+  /** `render()` calls, counted instead of drawn (#488): see the file header. */
+  renders = 0;
   constructor(host: HTMLElement, opts: NetworkOptions) {
     super(host, opts);
   }
@@ -87,6 +95,10 @@ class FollowProbe extends Network {
   protected override syncZoomToView(): void {
     this.cameraSyncs++;
     super.syncZoomToView();
+  }
+  override render(): this {
+    this.renders++;
+    return this;
   }
 }
 
@@ -107,6 +119,8 @@ interface Phase {
   uploadedPerFrame: number;
   nodeFill: number;
   cameraSyncs: number;
+  /** `render()` calls over the timed frames: one per frame. */
+  renders: number;
   /** Every timed frame moved the nodes (the ease was running). */
   moved: boolean;
 }
@@ -150,6 +164,7 @@ beforeAll(async () => {
       const fill0 = nodeFill;
       const style0 = lod.lodStylePasses;
       const syncs0 = net.cameraSyncs;
+      const renders0 = net.renders;
       const mark = spy.mark();
       const ts: number[] = [];
       let moved = true;
@@ -169,6 +184,7 @@ beforeAll(async () => {
         uploadedPerFrame: used.uploadedBytes / FRAMES,
         nodeFill: nodeFill - fill0,
         cameraSyncs: net.cameraSyncs - syncs0,
+        renders: net.renders - renders0,
         moved,
       };
     };
@@ -273,6 +289,9 @@ describe(`network() followed warm stream, ${kind} (#454) — per-frame cost vs a
       expect(followed.moved, "a timed frame left the nodes where they were: the ease was not running").toBe(true);
       expect(streamed.uploadedPerFrame, "a streamed frame uploaded nothing").toBeGreaterThan(0);
       expect(followed.uploadedPerFrame, "a followed frame uploaded nothing: it never repainted").toBeGreaterThan(0);
+      // `render()` is counted, not drawn (#488): each timed frame renders exactly once, on both phases.
+      expect(followed.renders, "renders over the followed frames").toBe(FRAMES);
+      expect(streamed.renders, "renders over the streamed frames").toBe(FRAMES);
     });
 
     it(`${name}: a followed frame re-derives, re-allocates and uploads nothing a fitted streamed frame doesn't`, () => {
