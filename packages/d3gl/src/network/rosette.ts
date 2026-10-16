@@ -70,3 +70,27 @@ export function rosettePositions(graph: StateNetworkGraph, opts: RosetteOptions 
   }
   return out;
 }
+
+/**
+ * Each state node's offset from its physical node on a rosette of radius `radius` (#495): {@link rosettePositions}
+ * around the origin, with the same radius for every physical node. Interleaved `[dx, dy, …]`, length
+ * `2 * stateCount`. The both view keeps these, in container radii, as each state node's place in its container.
+ */
+export function rosetteOffsets(graph: StateNetworkGraph, radius: number): Float32Array {
+  const { physicalToState, physicalCount, state } = graph;
+  const { offsets, states } = physicalToState;
+  const out = new Float32Array(state.nodeCount * 2);
+  for (let p = 0; p < physicalCount; p++) {
+    const start = offsets[p]!;
+    const count = offsets[p + 1]! - start;
+    if (count <= 1) continue; // a lone state node sits on its physical node
+    for (let k = 0; k < count; k++) {
+      const s = states[start + k]!;
+      const a = k * GOLDEN_ANGLE;
+      const r = radius * Math.sqrt((k + 0.5) / count);
+      out[2 * s] = r * Math.cos(a);
+      out[2 * s + 1] = r * Math.sin(a);
+    }
+  }
+  return out;
+}

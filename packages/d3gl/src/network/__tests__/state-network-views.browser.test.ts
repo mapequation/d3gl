@@ -72,9 +72,14 @@ async function engine(h: HTMLElement, backend: "webgl" | "svg" = "webgl"): Promi
   return net;
 }
 
-/** Place the physical nodes and frame world == screen (k = 1). */
+/** Place the physical nodes and frame world == screen (k = 1). Supplied positions are the active view's graph's
+ *  (#495): in the state view the physical ones are placed in the physical view, and the state view, never laid
+ *  out, starts from its rosette around them. */
 function place(net: Network): void {
+  const view = net.stateView;
+  if (view === "state") net.view("physical");
   net.layout({ backend: "positions", positions: POS });
+  if (view === "state") net.view("state");
   net.setTransform({ k: 1, x: 0, y: 0 });
 }
 
@@ -100,7 +105,8 @@ function circlesOf(svg: string): Circle[] {
   return out;
 }
 
-const statePos = (g: ReturnType<typeof fixture>["graph"], s: number): [number, number] => [g.state.positions[2 * s]!, g.state.positions[2 * s + 1]!];
+/** Where state node `s` is drawn in the active view (#495: the both view's dots have positions of their own). */
+const statePos = (net: Network, s: number): [number, number] => [net.positions![2 * s]!, net.positions![2 * s + 1]!];
 
 /** A screen point inside physical `p`'s container but clear of every state dot: the container's top edge. */
 function containerPoint(net: Network, g: ReturnType<typeof fixture>["graph"], p: number): [number, number] {
@@ -151,7 +157,7 @@ describe("a state network without modules (#494, 1)", () => {
     expect(circlesOf(svg).filter((c) => !c.stroked).length).toBe(S);
     // Every state dot takes the app's fill.
     const img = await frame(net);
-    const [x, y] = statePos(graph, 3);
+    const [x, y] = statePos(net, 3);
     expect(near(rgbaAt(img, x, y).slice(0, 3), RGB["#1f77b4"]!), `state dot fill ${rgbaAt(img, x, y)}`).toBe(true);
     net.destroy();
   });
@@ -181,7 +187,7 @@ describe("the both view (#494, 2-3)", () => {
     expect(dots.length).toBe(S);
     for (let s = 0; s < S; s++) {
       const p = graph.stateToPhysical[s]!;
-      const [x, y] = statePos(graph, s);
+      const [x, y] = statePos(net, s);
       const dot = dots.find((c) => Math.abs(c.cx - x) < 0.01 && Math.abs(c.cy - y) < 0.01);
       const box = containers.find((c) => Math.abs(c.cx - POS[2 * p]!) < 0.01 && Math.abs(c.cy - POS[2 * p + 1]!) < 0.01);
       expect(dot && box, `state ${s} or its container is not drawn`).toBeTruthy();
@@ -229,7 +235,7 @@ describe("both-view containers are interactive (#494, 5; #315)", () => {
     expect(hit?.id).toBe(S + 1);
     expect((hit?.members?.() ?? []).map(Number).sort()).toEqual([2, 4]);
     // A state dot still wins over its container.
-    const [sx, sy] = statePos(graph, 2);
+    const [sx, sy] = statePos(net, 2);
     const dotHit = net.pick(sx, sy);
     expect(dotHit?.id).toBe(2);
     expect((dotHit?.datum as NetworkHit).level).toBe("state");
@@ -296,8 +302,8 @@ describe("both-view containers are interactive (#494, 5; #315)", () => {
     expect(spy.styled("phys-container").some((u) => u.hoverGroup === S + 1 && u.dimActive)).toBe(true);
     expect(spy.emitted().filter((n) => n === "nodes" || n === "phys-container")).toEqual([]);
     const img = await frame(net);
-    const [s2x, s2y] = statePos(graph, 2);
-    const [s3x, s3y] = statePos(graph, 3);
+    const [s2x, s2y] = statePos(net, 2);
+    const [s3x, s3y] = statePos(net, 3);
     expect(rgbaAt(img, s2x, s2y), "the hovered container's state dot changed").toEqual(rgbaAt(before, s2x, s2y));
     expect(rgbaAt(img, s3x, s3y)[3], "another container's state dot did not fade").toBeLessThan(rgbaAt(before, s3x, s3y)[3]);
     net.destroy();
@@ -312,8 +318,8 @@ describe("both-view containers are interactive (#494, 5; #315)", () => {
     net.interactive({ selectable: true, draggable: true });
     const [x, y] = containerPoint(net, graph, 1);
     const p0 = [graph.physical.positions[2]!, graph.physical.positions[3]!];
-    const s0 = [statePos(graph, 2), statePos(graph, 4)];
-    const other = statePos(graph, 3);
+    const s0 = [statePos(net, 2), statePos(net, 4)];
+    const other = statePos(net, 3);
     const r = h.getBoundingClientRect();
     const ev = (type: string, px: number, py: number) =>
       h.dispatchEvent(new PointerEvent(type, { clientX: r.left + px, clientY: r.top + py, bubbles: true, button: 0, pointerId: 1 }));
@@ -326,12 +332,18 @@ describe("both-view containers are interactive (#494, 5; #315)", () => {
     ev("pointerup", x + 20, y + 12);
     expect(graph.physical.positions[2]! - p0[0]!).toBeCloseTo(20, 3);
     expect(graph.physical.positions[3]! - p0[1]!).toBeCloseTo(12, 3);
+    // Each state dot keeps its place in its container (#495): the same direction from the container's centre, at
+    // the same share of its radius — the container may have re-sized as the layout's scale moved a step.
     for (const [k, s] of [2, 4].entries()) {
-      const [sx, sy] = statePos(graph, s);
-      expect(sx - s0[k]![0], `state ${s} did not follow its container`).toBeCloseTo(20, 3);
-      expect(sy - s0[k]![1]).toBeCloseTo(12, 3);
+      const [sx, sy] = statePos(net, s);
+      const before = [s0[k]![0] - p0[0]!, s0[k]![1] - p0[1]!];
+      const after = [sx - graph.physical.positions[2]!, sy - graph.physical.positions[3]!];
+      const f = Math.hypot(after[0]!, after[1]!) / Math.hypot(before[0]!, before[1]!);
+      expect(f, `state ${s} did not follow its container`).toBeGreaterThan(0.8);
+      expect(f).toBeLessThan(1.25);
+      expect(Math.abs(after[0]! * before[1]! - after[1]! * before[0]!) / Math.hypot(before[0]!, before[1]!) ** 2, "it turned").toBeLessThan(1e-3);
     }
-    expect(statePos(graph, 3), "another physical node's state moved").toEqual(other);
+    expect(statePos(net, 3), "another physical node's state moved").toEqual(other);
     // The container is drawn where its physical node went.
     const moved = circlesOf(net.toSVG()).filter((c) => c.stroked).find((c) => Math.abs(c.cx - (p0[0]! + 20)) < 0.01);
     expect(moved, "the container did not move").toBeDefined();
@@ -423,7 +435,7 @@ describe("module colours from the app: nodeFill { by: 'module', color } (#494, 1
         // A state node takes its enclosing module's colour: 0 → [1,1], 2 → [1,1], 4 → [1,2], 1 and 3 → [2].
         const want: Record<number, string> = { 0: "#ff7f0e", 1: "#1f77b4", 2: "#ff7f0e", 3: "#1f77b4", 4: "#9467bd" };
         for (const [s, hex] of Object.entries(want)) {
-          const [x, y] = statePos(graph, Number(s));
+          const [x, y] = statePos(net, Number(s));
           expect(near(rgbaAt(img, x, y).slice(0, 3), RGB[hex]!), `${view} view: state ${s} is ${rgbaAt(img, x, y)}, want ${hex}`).toBe(true);
         }
       }
@@ -490,7 +502,7 @@ describe("hits and labels name their level in state mode (#494)", () => {
     net.labels({ labelOf: (id, info) => (infos.push({ id, level: info.level }), `${id}`) });
     expect(infos.length).toBeGreaterThan(0);
     expect(infos.every((i) => i.level === "state")).toBe(true);
-    const [x, y] = statePos(graph, 3);
+    const [x, y] = statePos(net, 3);
     expect((net.pick(x, y)?.datum as NetworkHit).level).toBe("state");
 
     // A plain network's hits carry no level.
@@ -524,7 +536,7 @@ describe("the both view draws its links in the app's sizeMode (#494 review, 1)",
         .stateNetwork(graph, { view: "both" });
       net.layout({ backend: "positions", positions });
       // The target dot's world radius, from the export (the both view's dots are world-sized).
-      const [tx, ty] = statePos(graph, 1);
+      const [tx, ty] = statePos(net, 1);
       const dot = circlesOf(net.toSVG()).find((c) => !c.stroked && Math.abs(c.cx - tx) < 0.01 && Math.abs(c.cy - ty) < 0.01);
       expect(dot, "no state dot drawn at the link's target").toBeDefined();
       const r = dot?.r ?? 0;
@@ -577,7 +589,7 @@ describe("the both view draws its links in the app's sizeMode (#494 review, 1)",
       await net.whenReady();
       net.style({ sizeMode: "screen", linkStyle: "line", linkWidth: 6, arrowSize: 6, directed: true }).stateNetwork(graph, { view: "both" });
       net.layout({ backend: "positions", positions });
-      const [tx, ty] = statePos(graph, 1);
+      const [tx, ty] = statePos(net, 1);
       const r = circlesOf(net.toSVG()).find((c) => !c.stroked && Math.abs(c.cx - tx) < 0.01 && Math.abs(c.cy - ty) < 0.01)?.r ?? NaN;
       expect(r, `${backend}: the target dot`).toBeGreaterThan(0);
       for (const k of [0.5, 2]) {
@@ -701,8 +713,8 @@ describe("module LOD aggregates take their module's colour under nodeFill { by: 
     const calls: string[] = [];
     const color = (path: readonly number[]) => (calls.push(path.join(":")), colorOf(path));
     const net = await engine(host());
-    net.style({ nodeRadius: 6, sizeMode: "screen", nodeFill: { by: "module", color } }).stateNetwork(graph, { modules, view: "state", rosetteRadius: 2 });
-    net.layout({ backend: "positions", positions: new Float32Array([40, 100, 160, 100]) });
+    net.style({ nodeRadius: 6, sizeMode: "screen", nodeFill: { by: "module", color } }).stateNetwork(graph, { modules, view: "state" });
+    net.layout({ backend: "positions", positions: new Float32Array([39, 100, 41, 100, 159, 100, 161, 100]) }); // the state view's own
     net.lod({ modules, declutter: false });
     expect(net.lodSource).toBe("modules");
     const seen = sweep(net, 100, 100);
@@ -820,7 +832,7 @@ describe("the app's module palette reaches the pies whatever the node fill: styl
     expect(containerFill(0)).toBe(RGB["#d62728"]!.join(","));
     // The state dots keep the flow fill.
     const img = await frame(net);
-    const [x, y] = statePos(graph, 3);
+    const [x, y] = statePos(net, 3);
     expect(near(rgbaAt(img, x, y).slice(0, 3), [0, 192, 0]), `state dot ${rgbaAt(img, x, y)}`).toBe(true);
     net.destroy();
   });
@@ -834,7 +846,7 @@ describe("the app's module palette reaches the pies whatever the node fill: styl
     const check = async (label: string) => {
       const img = await frame(net);
       for (const [s, hex] of Object.entries(want)) {
-        const [x, y] = statePos(graph, Number(s));
+        const [x, y] = statePos(net, Number(s));
         expect(near(rgbaAt(img, x, y).slice(0, 3), RGB[hex]!), `${label}: state ${s} is ${rgbaAt(img, x, y)}, want ${hex}`).toBe(true);
       }
     };
