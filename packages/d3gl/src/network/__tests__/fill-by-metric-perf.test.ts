@@ -5,7 +5,7 @@ import { computeLODPositions, computeLODStyle, type LODTree } from "../lod.js";
 import { resolveNodeFill, resolveFlowBorder, moduleBorderValues, applyModuleBorder, treeBorderColors, frontierCircles, type ResolvedFlowBorder } from "../glyphs.js";
 
 /**
- * Per-frame regression guard for #445 (AGENTS.md lifecycle §5): `nodeFill: { by, scale }`, a
+ * Per-frame regression guard for #445 (docs/agents/performance.md): `nodeFill: { by, scale }`, a
  * `flowBorder.color` accessor and `flowBorder.moduleFlow` are resolved **once per style** — O(nodes) scale
  * calls for the leaves, O(modules) for the aggregates — and the per-cut glyph build (`frontierCircles`, run
  * on every zoom frame) only indexes the resolved tables.

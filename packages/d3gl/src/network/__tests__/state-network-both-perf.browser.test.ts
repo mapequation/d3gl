@@ -62,7 +62,7 @@ const BASE_LANE = ["nodes", "links", "arrows", "node-halos", "phys-container", "
 // N-independent: a container re-upload alone is ~36 B × N physical, ~720 kB at the local default.
 const RING_BYTES_PER_EVENT = 4 * 1024;
 const SELECT_SLACK_BYTES = 16 * 1024;
-// Wall-clock ceilings, split constant + linear (AGENTS.md §Scaling a browser guard), calibrated on local
+// Wall-clock ceilings, split constant + linear (docs/agents/performance.md §Scaling a guard), calibrated on local
 // headless Chromium (SwiftShader, M1 Max), medians at 20k / 100k physical nodes:
 // - a hover move is two CPU picks (state nodes, then containers: the linear term) + a ring emit + uniform
 //   writes: 0.3 / 0.7 ms → 1.5 / 3.5 ms ceilings (~5x);

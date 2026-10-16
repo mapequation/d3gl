@@ -59,7 +59,7 @@ describe("featureGroup", () => {
 describe("nested rings survive projection (#73)", () => {
   /** An island in a lake in land, with a pond on the island — RFC 7946 shape: a
    *  MultiPolygon of `[land, lake]` and `[island, pond]`, exteriors CLOCKWISE in
-   *  [lon, lat] and holes counter-clockwise (AGENTS.md "GeoJSON winding"). */
+   *  [lon, lat] and holes counter-clockwise (LOG.md "GeoJSON winding"). */
   const cw = (h: number): [number, number][] => [[-h, -h], [-h, h], [h, h], [h, -h], [-h, -h]];
   const ccw = (h: number): [number, number][] => [...cw(h)].reverse();
   const atoll: GeoJSON.Feature = {

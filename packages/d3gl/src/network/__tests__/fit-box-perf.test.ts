@@ -3,7 +3,7 @@ import { appendFileSync } from "node:fs";
 import { layoutBox, type FitBox, type LayoutBoxOptions } from "../fit.js";
 
 /**
- * Per-frame regression guard for the streaming fit's box (#327, AGENTS.md lifecycle §5).
+ * Per-frame regression guard for the streaming fit's box (#327, docs/agents/performance.md).
  *
  * While a `layout({ fit: true })` streams, each streamed layout frame runs {@link layoutBox} (trimming
  * stragglers) over every leaf position before the repaint: O(nodes) per streamed frame, the same with LOD

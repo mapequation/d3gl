@@ -3,12 +3,12 @@ import { Scene } from "../../core/scene.js";
 import type { RenderLayer, ViewTransform } from "../../core/index.js";
 
 /**
- * Per-frame regression guard for the SVG at-scale zoom sweep (#220, AGENTS.md lifecycle §5).
+ * Per-frame regression guard for the SVG at-scale zoom sweep (#220, docs/agents/performance.md).
  *
  * SvgBackend's contract for all-world content is a **retained DOM**: the drawables are
  * serialized ONCE into the view group, and every subsequent pan/zoom is O(1) — one `transform`
  * attribute set, with the follow-up `render()` a no-op (`dirty` stays false). A regression that
- * re-serializes N drawables per zoom frame (the exact class AGENTS §5 war-stories) is
+ * re-serializes N drawables per zoom frame (the exact class docs/agents/performance.md war-stories) is
  * deterministically visible as extra `innerHTML` assignments, at any machine speed.
  *
  * Through the actual per-zoom trigger (`setTransform` + `render`), this asserts:

@@ -27,7 +27,7 @@ const H = 400;
 // Measured (local headless Chromium, 50k, worst of best-of-3): LOD on 0.1 ms for both styles (~2 KB
 // uploaded per frame), LOD off 0.0-0.1 ms (the static-emit quantum, nothing uploaded), every module open
 // 2-3 ms (baseline / #445 style; every leaf in view re-cut and re-emitted, ~340 KB uploaded per frame).
-// Constant + linear ceilings ~5-10× the measured values (AGENTS §Tests).
+// Constant + linear ceilings ~5-10× the measured values (docs/agents/performance.md).
 const FRAME_MS_LOD = perfBudget(20 + (10 * N) / 50_000);
 const FRAME_MS_ALL_OPEN = perfBudget(15 + (15 * N) / 50_000);
 const FRAME_MS_STATIC = perfBudget(4 + (4 * N) / 50_000);

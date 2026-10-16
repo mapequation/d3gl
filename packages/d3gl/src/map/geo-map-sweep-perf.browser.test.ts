@@ -48,10 +48,10 @@ const H = 400;
 // 20k and ~800ms at 100k, so the detection margin stays >20x at every N.
 const FRAME_MS = perfBudget(6 + (6 * N) / 20_000);
 // Registration is the O(N) phase (projection + tessellation + accessors), so the harness timeout
-// scales with it. A timeout is a harness limit, not a budget (AGENTS.md §Tests).
+// scales with it. A timeout is a harness limit, not a budget (docs/agents/performance.md).
 const TEST_MS = perfBudget(60_000 + N / 10);
 
-/** ~n quad cells covering the world, exterior rings CLOCKWISE in [lon, lat] (AGENTS.md winding rule). */
+/** ~n quad cells covering the world, exterior rings CLOCKWISE in [lon, lat] (LOG.md winding rule). */
 function makeCells(n: number): GeoJSON.Polygon[] {
   const lonSteps = Math.ceil(Math.sqrt(n * (360 / 170)));
   const latSteps = Math.ceil(n / lonSteps);

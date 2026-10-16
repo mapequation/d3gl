@@ -10,7 +10,7 @@ import { centredOn, collapsedGlyph, ringOnCentreLines, type Grab } from "./_ring
 
 /**
  * ENGINE-level per-frame guard for a node-drag on the main-thread force backend (`layout({ backend:
- * "force" })`, AGENTS.md lifecycle §5 — a drag is a per-frame path). Through the real trigger: pointer
+ * "force" })`, docs/agents/performance.md — a drag is a per-frame path). Through the real trigger: pointer
  * events on the host grab a node, each animation frame of the drag session holds it under the cursor,
  * runs ONE `ForceLayout.tick` over all N nodes (LOD and declutter do not reduce it) and repaints; the
  * release re-cools at the drag heat until converged, at most `DRAG_COOL_FRAMES` frames. The node guard
@@ -51,7 +51,7 @@ const SETUP_MS = perfBudget(60_000 + N / 2);
 // LOD OFF and ON alike — almost all of it the O(N log N) tick; the release re-cool converged after 30
 // frames (the earliest a schedule may stop). The ceiling is ~3.5× that: an order-of-magnitude drop (a
 // full-graph style pass or layout per frame) lands far above it, while a second tick per frame is caught
-// exactly by the tick count, not the clock. Constant + linear split per AGENTS (the tick grows as
+// exactly by the tick count, not the clock. Constant + linear split per LOG.md (the tick grows as
 // N log N; the linear term covers it over the leg's 4× range).
 const FRAME_MS = perfBudget(40 + (160 * N) / 50_000);
 
@@ -92,7 +92,7 @@ function flush(): void {
  * backend's draw: the tick, the LOD cut, the lane emit, the uploads and the GL buffer counts all still run.
  * This guard measures the drag's CPU work, so the every-module-open leg sets it: at the zoom that fits the
  * map its frames draw every leaf and ring, GPU work that software GL (SwiftShader) queues behind each other
- * (AGENTS.md, "Local headless Chromium rasterises on SwiftShader"). That leg asserts one render per held
+ * (LOG.md, "Local headless Chromium rasterises on SwiftShader"). That leg asserts one render per held
  * frame; network-module-boundary-perf.browser.test.ts owns the real draw of that view (every module open).
  */
 class Probe extends Network {

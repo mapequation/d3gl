@@ -10,7 +10,7 @@ import { declutterScreen, declutterScratch } from "../../core/declutter.js";
 import { StableColumns } from "../../core/stable-columns.js";
 
 /**
- * Per-frame regression guard (AGENTS.md lifecycle §5) for the streamed-LOD-frame waste measured on
+ * Per-frame regression guard (docs/agents/performance.md) for the streamed-LOD-frame waste measured on
  * web-NotreDame (325k nodes, 1.5M edges) in the Network Navigator: ~52-66 ms of main thread per
  * streamed layout frame, most of it re-deriving what the previous frame already had.
  *
@@ -227,7 +227,7 @@ function stableCompare(S: number): number {
   return median(ts);
 }
 
-/** The compare's ceiling at `S` super-edges, split into a 1 ms constant and a linear term (AGENTS.md)
+/** The compare's ceiling at `S` super-edges, split into a 1 ms constant and a linear term (docs/agents/performance.md)
  *  that add up to exactly the calibrated `STABLE_COMPARE_MS_PER_M` at 1M. */
 const stableCeiling = (S: number): number => 1 + (STABLE_COMPARE_MS_PER_M - 1) * (S / 1_000_000);
 

@@ -74,7 +74,7 @@ describe("groupRings", () => {
 // --- Multi-level nesting (#73) -------------------------------------------------------
 //
 // Axis-aligned square rings, all concentric on (50,50), each ring wound OPPOSITE to the
-// one enclosing it — the GeoJSON convention (AGENTS.md "GeoJSON winding"): land CW,
+// one enclosing it — the GeoJSON convention (LOG.md "GeoJSON winding"): land CW,
 // lake CCW, island CW, pond CCW. `sq` builds them in projected/screen coordinates, so
 // `cw` here is the screen-space orientation; what matters is that successive levels
 // alternate, exactly as `geoPath` emits an exterior ring and its holes.

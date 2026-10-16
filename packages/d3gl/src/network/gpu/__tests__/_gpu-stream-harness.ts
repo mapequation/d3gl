@@ -44,11 +44,11 @@
  * frame, and the frame is painted with its geometry once the worker replies, so the main thread builds and
  * refits nothing (the call counts are pinned in `gpu-lod-mainthread.browser.test.ts`). Its main-thread ms
  * per layout repaint — putting the frame on the graph plus the engine's repaint — is compared against the
- * **worker backend's** on the same engine, graph and view (AGENTS lifecycle §5: the baseline the GPU path
+ * **worker backend's** on the same engine, graph and view (docs/agents/performance.md: the baseline the GPU path
  * must not exceed), both from a disc cold start, and asserted within a stated margin of it. Both legs assert
  * the same transport signatures.
  *
- * **Node drag** (AGENTS §5: a drag is a per-frame path), through the real trigger — pointer events on the
+ * **Node drag** (docs/agents/performance.md: a drag is a per-frame path), through the real trigger — pointer events on the
  * host grab a node of the settled layout, move it one step per animation frame, and release it — with LOD
  * off and on: the same transport bounds and GL signatures over the held frames and the re-cool frames after
  * release, no GPU object created, the drag's pin uploads O(held) per pointer move (the held positions

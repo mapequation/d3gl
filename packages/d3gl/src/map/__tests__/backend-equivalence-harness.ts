@@ -444,7 +444,7 @@ function traceRing(ctx: PathRecorder, cx: number, cy: number, r: number, ccw: bo
  * Canvas (`ctx.fill()`) and SVG (`fill-rule: nonzero`) resolve these natively; WebGL has to
  * recover outer/hole from the geometry (`groupRings` → `tessellateFill`), so this scene is a
  * direct probe of that recovery. Successive levels alternate winding, the convention `geoPath`
- * emits (AGENTS.md "GeoJSON winding"), so the fill must alternate solid/hole with depth. Before
+ * emits (LOG.md "GeoJSON winding"), so the fill must alternate solid/hole with depth. Before
  * #73, ring classification was single-level: every ring inside the land became a hole of it, so
  * the island and pond vanished (and the overlapping holes made earcut drop geometry outright).
  *

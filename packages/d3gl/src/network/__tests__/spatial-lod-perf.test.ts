@@ -20,7 +20,7 @@ import { buildKeptRows, incidenceSourceEdges, makeSpatialRowsScratch, spatialRow
 import type { SuperEdgeStyleResolved } from "../glyphs.js";
 
 /**
- * Per-frame regression guard for the spatial LOD source (#343, AGENTS.md lifecycle §5): one frame is the
+ * Per-frame regression guard for the spatial LOD source (#343, docs/agents/performance.md): one frame is the
  * engine's `computeFrontier` + super-edge emit on a spatial tree — `cut` (recording culled roots) →
  * `declutterFrontier` → `lazySuperEdges` — over a web-like graph whose communities the layout spreads out.
  *

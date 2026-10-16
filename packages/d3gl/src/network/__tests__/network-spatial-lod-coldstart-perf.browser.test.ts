@@ -7,7 +7,7 @@ import { perfHost } from "../../__tests__/engine-sweep.js";
 import { indexedLinkStats } from "../../webgl/indexed-links.js";
 
 /**
- * The overlap rule's worst frame (#426, AGENTS lifecycle §5), through the real trigger: a worker layout that
+ * The overlap rule's worst frame (#426, docs/agents/performance.md), through the real trigger: a worker layout that
  * **settles where no glyphs overlap**, with the spatial LOD source at a fit view — the evenly spaced seed disc,
  * run with `iterations: 0` so the disc is the settled layout. While a layout streams, the cut opens aggregates by
  * the footprint rule alone (the crowding pass waits for the settle: it costs 0.35-1 s per frame at 2M nodes), so

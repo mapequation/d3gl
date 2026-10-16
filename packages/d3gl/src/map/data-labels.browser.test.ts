@@ -156,7 +156,7 @@ describe("geoMap().labels() — native-text export routing (#223)", () => {
   });
 });
 
-describe("plot().labels() — per-frame signature (#223, AGENTS §5)", () => {
+describe("plot().labels() — per-frame signature (#223, docs/agents/performance.md)", () => {
   it("measures each label ONCE at registration and NEVER on the per-transform path", async () => {
     const h = host(400, 300);
     const chart = plot(h, { width: 400, height: 300, backend: "webgl" });

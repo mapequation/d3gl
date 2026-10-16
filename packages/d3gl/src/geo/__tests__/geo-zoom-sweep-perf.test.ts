@@ -5,8 +5,8 @@ import type { RenderLayer, ViewTransform } from "../../core/index.js";
 import { geoLayer } from "../geo-layer.js";
 
 /**
- * Per-frame regression guard for the GEO full-detail zoom sweep on **Canvas** (#220, AGENTS.md
- * lifecycle §5). The WebGL and SVG legs need a real GPU / DOM and live in
+ * Per-frame regression guard for the GEO full-detail zoom sweep on **Canvas** (#220,
+ * docs/agents/performance.md). The WebGL and SVG legs need a real GPU / DOM and live in
  * `map/geo-sweep-perf.browser.test.ts` (#264) — WebGL is the *default* backend, and nothing here
  * can see its retained `GroupRenderer` geometry or its stencil clip.
  *
@@ -23,7 +23,7 @@ import { geoLayer } from "../geo-layer.js";
  *      layer is constructed once for the whole sweep, never per frame.
  *   3. **Frame budget:** each frame's backend CPU work holds a generous wall-clock ceiling.
  *
- * Cells are exterior-CW in [lon, lat] (see AGENTS.md "GeoJSON winding"). {@link ALWAYS_ON_N} cells
+ * Cells are exterior-CW in [lon, lat] (see LOG.md "GeoJSON winding"). {@link ALWAYS_ON_N} cells
  * run in the normal suite; the at-scale leg is env-gated (BENCH_GEO_SWEEP=1, picked up by
  * scripts/run-perf-tier.mjs) — its N is the dominant one-time geoPath build, bounded by the
  * tier's per-file budget, while the same per-frame signatures hold.
@@ -108,7 +108,7 @@ const layerOf = (s: Scene, name: string, clipTo?: string): RenderLayer => ({
   name, buffers: s.buffers(name), drawables: s.drawables(name), clipTo,
 });
 
-/** ~n quad cells covering the world, exterior rings CLOCKWISE in [lon, lat] (AGENTS winding rule). */
+/** ~n quad cells covering the world, exterior rings CLOCKWISE in [lon, lat] (LOG.md winding rule). */
 function makeCells(n: number): GeoJSON.Polygon[] {
   const lonSteps = Math.ceil(Math.sqrt(n * (360 / 170)));
   const latSteps = Math.ceil(n / lonSteps);

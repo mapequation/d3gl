@@ -159,7 +159,7 @@ export function makeDemoPolygon(): Feature<Polygon> {
  *
  * Winding alternates with depth — exterior rings CLOCKWISE in [lon, lat] (like
  * `makeDemoPolygon`), holes counter-clockwise — which is what makes the fill land ▸
- * water ▸ land ▸ water instead of one solid block. See AGENTS.md "GeoJSON winding".
+ * water ▸ land ▸ water instead of one solid block. See LOG.md "GeoJSON winding".
  */
 export function makeIslandInLake(): Feature<MultiPolygon, { name: string }> {
   const [lon, lat] = [-146, -14]; // open water in the South Pacific
@@ -329,7 +329,7 @@ function clusteredLonLat(rng: () => number, p: Parent): [number, number] {
  *
  * WINDING: built CLOCKWISE in [lon, lat] (note the NEGATIVE angle). d3-geo fills on
  * the sphere, and a small exterior ring wound counter-clockwise is treated as its
- * complement → it fills the whole map. See `AGENTS.md` and `geo/project.ts`.
+ * complement → it fills the whole map. See `LOG.md` and `geo/project.ts`.
  */
 function randomRangeRing(rng: () => number, clon: number, clat: number, size: number): [number, number][] {
   const verts = 3 + Math.floor(rng() * 8); // 3..10

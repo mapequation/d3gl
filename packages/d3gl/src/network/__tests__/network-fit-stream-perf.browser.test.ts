@@ -61,7 +61,7 @@ vi.mock("../worker-transport.js", async (importOriginal) => {
 });
 
 /**
- * ENGINE-level per-frame guard for the streaming fit (#327, AGENTS.md lifecycle §5). The trigger is a
+ * ENGINE-level per-frame guard for the streaming fit (#327, docs/agents/performance.md). The trigger is a
  * streamed layout frame, as the worker transport runs it: the message's position copy, then the coalesced
  * repaint (`scheduleLayoutRepaint` → `fitViewToLayout` → `rebuild`), timed alone. The node guard
  * (`fit-box-perf.test.ts`) pins the box itself at ~1M; this one pins what the engine does around it.

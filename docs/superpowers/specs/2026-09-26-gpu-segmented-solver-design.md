@@ -119,7 +119,7 @@ was measured (see §15, Q7).
   for free (§6.5.5).
 
 What is **not** a non-goal any more: the main-thread LOD cost per streamed frame. The GPU path must
-not move work onto the main thread that the worker path keeps off it (AGENTS lifecycle §5). §12.1
+not move work onto the main thread that the worker path keeps off it (docs/agents/performance.md). §12.1
 and PR 3c own it.
 
 ## 3. Binding decisions (from the maintainer)
@@ -1110,7 +1110,7 @@ geometry (cx, cy, extent for 425k tree nodes) off the main thread and streams it
 arrive every 3-4 s. On today's GPU path the main thread builds the tree (244-308 ms) and refits it
 (`computeLODGeometry`, 16-23 ms) on **every** frame, then runs the cut, declutter and labels (2-62 ms
 at the fit view, declutter spikes of 50-450 ms when zoomed). A fast GPU stream would move the refit
-onto the main thread at the repaint rate. AGENTS lifecycle §5 treats that as a regression against
+onto the main thread at the repaint rate. docs/agents/performance.md treats that as a regression against
 the worker baseline, and it may not be deferred.
 
 **Decision: A, the worker refits the adopted tree** (§15 Q8; PR 3c builds it).
@@ -1261,7 +1261,7 @@ Browser tests (`pnpm --filter @mapequation/d3gl test:browser <path>`):
   - plus a structural assertion (S = 1 tile = today's grid);
   - the reference helper is an executable spec of the GPU algorithm, and every later phase reuses it;
   - each phase PR also reports the web-NotreDame A/B of §9 in its Performance section.
-- **T6 per-frame perf guard** (AGENTS §5; `gpu-frame-budget-perf.browser.test.ts`, extended):
+- **T6 per-frame perf guard** (docs/agents/performance.md; `gpu-frame-budget-perf.browser.test.ts`, extended):
   - the per-tick wall-clock ceiling at `perfN(30_000, { max: 200_000 })` is kept, split as
     `c0 + c1·N` (existing);
   - **new deterministic signature: no `point-list` draw of ≥ N vertices into a 1×1 viewport** (the
@@ -1275,7 +1275,7 @@ Browser tests (`pnpm --filter @mapequation/d3gl test:browser <path>`):
 - **T7 streaming guard** (new, `gpu-stream-perf.browser.test.ts`, joins the browser perf tier by
   name):
   - drive **`network().data(g).lod(…).layout({ backend: "gpu" })`** at `PERF_BROWSER_N` through real
-    rAF frames, once with LOD on (the Navigator's config) and once off, on one engine (AGENTS: never
+    rAF frames, once with LOD on (the Navigator's config) and once off, on one engine (LOG.md: never
     a second large engine in one file);
   - **transport-only** main-thread time per rAF (harvest + encode) below `perfBudget(c0 + c1·N/local)`;
     encode time per frame asserted directly (≤ 2 ms, N-independent). A reintroduced sync fence costs
@@ -1323,8 +1323,8 @@ Browser tests (`pnpm --filter @mapequation/d3gl test:browser <path>`):
   - boundary discs match the CPU's `BoundaryDiscs`; a warm layout produces one frame;
   - a 1M-leaf nested timing bench.
 
-**Coverage map.** Add rows to the AGENTS.md perf-guard coverage map for T6's new signatures and for
-T7 (both LOD legs). PR 1 also adds one durable gotcha to AGENTS.md: *never scatter N points into
+**Coverage map.** Add rows to the LOG.md perf-guard coverage map for T6's new signatures and for
+T7 (both LOD legs). PR 1 also adds one durable gotcha to LOG.md: *never scatter N points into
 one texel. Blend serialises it (17-19 ms at 325k); reduce with a gather tree.* PR 3a adds a second:
 *luma `Buffer`s cannot be `STREAM_READ`; create readback PBOs raw.*
 
@@ -1375,7 +1375,7 @@ Why the dependencies changed in revision 2:
 - 7 fixes #333.
 
 Each PR carries a changeset (patch; `backend: "auto"` is an addition, patch before 1.0), a
-`## Performance` section per AGENTS lifecycle §5 (using §10's numbers, re-measured, and the
+`## Performance` section per docs/agents/performance.md (using §10's numbers, re-measured, and the
 construction long task), and docs updates: `website/src/content/docs/examples/network.mdx` GPU
 section, the `gpu-transport.ts` header, and the `NetworkLayoutOptions` JSDoc.
 

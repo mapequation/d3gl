@@ -390,7 +390,7 @@ Replace all-pairs with a quadtree-as-texture-pyramid so 100k is interactive. **T
 - [ ] **Step 4: Run all GPU tests + budget → PASS** (correctness tests green, 1M under budget).
 - [ ] **Step 5: Commit** `feat(n8): Barnes-Hut texture-pyramid repulsion (O(n log n) GPU)`.
 
-> **Per-frame doctrine (AGENTS.md §5):** this task adds the per-frame GPU solve. The budget test (Step 1) is the mandatory per-frame regression test. In the PR's `## Performance` section, state: repulsion goes O(n²)→O(n·pyramidWalk) on GPU, N = solved leaf count (≈1M full-detail); build is in-place ping-pong (no per-frame FBO destroy+recreate); readback is Task 6's concern. **Do not** self-defer any per-frame allocation — if the pyramid rebuild allocates textures per frame, pool them and assert in-place reuse in the test.
+> **Per-frame doctrine (docs/agents/performance.md):** this task adds the per-frame GPU solve. The budget test (Step 1) is the mandatory per-frame regression test. In the PR's `## Performance` section, state: repulsion goes O(n²)→O(n·pyramidWalk) on GPU, N = solved leaf count (≈1M full-detail); build is in-place ping-pong (no per-frame FBO destroy+recreate); readback is Task 6's concern. **Do not** self-defer any per-frame allocation — if the pyramid rebuild allocates textures per frame, pool them and assert in-place reuse in the test.
 
 ---
 
@@ -515,7 +515,7 @@ gh pr create --repo mapequation/d3gl --base main --head feat/n8-gpu-layout \
   --title "network: GPU force-layout backend (Milestone A) — Part of #106" --body-file <perf+summary body>
 ```
 
-- [ ] **Step 5: Request human verification** (per AGENTS.md lifecycle §6) — do **not** merge without approval.
+- [ ] **Step 5: Request human verification** (per docs/agents/workflow.md lifecycle §6) — do **not** merge without approval.
 
 ---
 

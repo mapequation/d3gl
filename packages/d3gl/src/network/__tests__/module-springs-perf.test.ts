@@ -6,7 +6,7 @@ import { withModuleSprings } from "../worker-transport.js";
 import { largeModuleFixture } from "./module-springs-fixture-large.js";
 
 /**
- * Per-tick guard for the module springs (#455, AGENTS.md lifecycle §5). Every flat force tick — a streamed
+ * Per-tick guard for the module springs (#455, docs/agents/performance.md). Every flat force tick — a streamed
  * layout's, and a drag reheat's, one per animation frame on the main-thread `force` backend — adds one
  * {@link ModuleSpringForce.apply}: a pass up the module tree for the centroid sums, one over the module
  * links, one down the tree. O(leaves + modules + module links), whatever the LOD state (the solver moves every

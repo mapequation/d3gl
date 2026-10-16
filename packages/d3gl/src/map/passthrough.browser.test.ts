@@ -178,7 +178,7 @@ describe("passThrough geometry rendering (canvas backend)", () => {
     return [p[0], p[1]];
   };
   // A big CLOCKWISE-wound polygon (clockwise in [lon,lat] fills its interior; CCW fills the
-  // whole map — see AGENTS.md winding note). Spans lon 0..20, lat 0..20.
+  // whole map — see LOG.md winding note). Spans lon 0..20, lat 0..20.
   const bigPolygon = (): GeoJSON.Feature => ({
     type: "Feature",
     properties: {},
@@ -700,7 +700,7 @@ describe("passThrough rendering (webgl backend)", () => {
 //   - filled Polygon  (green) spanning lon 0..20, lat 0..20 → centroid (10,10)
 //   - LineString      (blue)  along the equator lon -40..40, lat 0 → midpoint (0,0)
 //   - Point           (red)   at lon -30, lat 30 (top-left quadrant, clear of both)
-// The polygon is CLOCKWISE-wound in [lon,lat] (CCW fills the whole map — AGENTS.md).
+// The polygon is CLOCKWISE-wound in [lon,lat] (CCW fills the whole map — LOG.md).
 const mixedProject = (lon: number, lat: number): [number, number] => {
   const p = proj()([lon, lat])!;
   return [p[0], p[1]];

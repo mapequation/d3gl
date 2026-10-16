@@ -153,7 +153,7 @@ void main() {
   // moment below — keep it that way. The #251 near field needs this shader and the traversal to round
   // the world cell center lo + q·boxSide bit for bit alike, and a fast-math compiler rounds it
   // differently when q is not shared: on ANGLE Metal a clip written as (origin + cell + 0.5) / atlas
-  // moved the w channel in 91% of occupied cells (AGENTS.md). The clip below is exact: origin / atlas
+  // moved the w channel in 91% of occupied cells (LOG.md). The clip below is exact: origin / atlas
   // and q · (G / atlas) are short binary fractions (atlas and G are powers of two).
   vec2 q = (cell + 0.5) / G;
   vec2 clip = (origin / u_atlas + q * (G / u_atlas)) * 2.0 - 1.0;

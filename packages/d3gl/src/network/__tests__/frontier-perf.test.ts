@@ -7,7 +7,7 @@ import { buildGraph } from "../graph.js";
 import { fitInto } from "./fit-into.js";
 
 /**
- * Per-frame regression guard for #213 (AGENTS.md lifecycle §5): the LOD visible-set pipeline
+ * Per-frame regression guard for #213 (docs/agents/performance.md): the LOD visible-set pipeline
  * (`cut` → `declutterFrontier`) must be **allocation-free steady-state** on the engine-owned scratch —
  * no boxed number[]s, no O(F) output copies, no per-frame Float64Array/order-array churn, and a typed
  * index sort on a flat key array instead of a boxed-lookup closure comparator.
@@ -20,7 +20,7 @@ import { fitInto } from "./fit-into.js";
  *      element-identical to a fresh-allocation call, with cross-fade (#133, incl. its declutter
  *      ancestor-exemption) both off and on;
  *   3. a generous-but-real frame budget over both frontier regimes — the reductions-ON everything-
- *      expanded frontier of ~all leaves (LOD not allowed to shrink the set, AGENTS §5) and the default
+ *      expanded frontier of ~all leaves (LOD not allowed to shrink the set, docs/agents/performance.md) and the default
  *      expandPx sweep.
  *
  * N is held at 100k in the normal suite (a few seconds to build, like super-edges-perf.test.ts);
@@ -165,7 +165,7 @@ function expectSameU32(actual: Uint32Array, reference: Uint32Array, what: string
   expect(mismatch, `${what} first mismatching index`).toBe(-1);
 }
 
-// Two frontier regimes (AGENTS §5): "large" = a reductions-ON frontier of ~all leaves (fit view,
+// Two frontier regimes (docs/agents/performance.md): "large" = a reductions-ON frontier of ~all leaves (fit view,
 // everything expanded — LOD not allowed to shrink the set); "small" = the default expandPx sweep
 // (fit → deep zoom-in), the everyday navigation shape.
 const REGIMES: { name: string; expandPx: number; kOf: (baseK: number, i: number) => number }[] = [
@@ -303,7 +303,7 @@ describe("#213 cut + declutterFrontier per-frame cost", () => {
 
           // --- signatures (always, whenever the bench runs) --------------------------------------
           // The "large" regime must genuinely drive a reductions-ON frontier of ALL leaves at this
-          // scale (AGENTS §5: ~1M *visible*, not 1M hidden behind a small frontier). Without this the
+          // scale (docs/agents/performance.md: ~1M *visible*, not 1M hidden behind a small frontier). Without this the
           // at-scale leg could silently degrade to the cheap small-frontier shape and still "pass".
           if (regime.name === "large") {
             expect(rawF, `large regime frontier at N=${BENCH_N} must be every leaf`).toBeGreaterThanOrEqual(tree.leafCount);

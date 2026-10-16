@@ -75,7 +75,7 @@ describe("LabelLayer styling (#224)", () => {
     h.remove();
   });
 
-  // Per-frame signature (AGENTS §5): style application runs ONCE at element creation, never on the
+  // Per-frame signature (docs/agents/performance.md): style application runs ONCE at element creation, never on the
   // per-transform update path — a reused element is repositioned (left/top) but not restyled.
   it("styles once at creation: the per-transform update repositions but never restyles", () => {
     const h = host();

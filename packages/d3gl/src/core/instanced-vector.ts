@@ -49,7 +49,7 @@ function linkColor(d: { index?: Float32Array; fade?: Float32Array; colors: Uint8
 }
 
 /** A drawable with the shared defaults (bevel joins / butt caps — see the compositing-equivalence
- *  notes in AGENTS.md) filled in, so instanced output strokes like Scene output does. */
+ *  notes in LOG.md) filled in, so instanced output strokes like Scene output does. */
 function drawable(
   id: number,
   parts: { subpaths?: Subpath[]; circles?: { x: number; y: number; r: number }[]; fill?: [number, number, number, number]; stroke?: [number, number, number, number]; lineWidth?: number; anchor?: [number, number] | null },

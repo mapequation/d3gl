@@ -11,7 +11,7 @@ import { buildModuleLODTree, type ModuleNode } from "../modules.js";
 import { firstDifference, makeMapSuperEdgesScratch, superEdgesMapReference } from "./super-edges-map-reference.js";
 
 /**
- * Per-frame regression guard for #210 (AGENTS.md lifecycle §5): `superEdges` must do **zero
+ * Per-frame regression guard for #210 (docs/agents/performance.md): `superEdges` must do **zero
  * O(tree.size) work per frame** when fed the engine-owned scratch — its cost is
  * O(frontier + drawn super-edges) only.
  *
@@ -38,7 +38,7 @@ const BENCH_N = Number(process.env.BENCH_SUPER_EDGES_NODES) || 1_000_000;
 // Calibration at N=500k on an M-series laptop: sweep median 0.19-0.34ms (p95 0.67-1.48ms);
 // abDelta ~32 KB/frame. The everything-visible frontier is measured separately — the zoom sweep
 // alone only reaches a ~1.4k frontier even at 500k leaves, so on its own it would leave the
-// reductions-ON at-scale case (AGENTS §5) unmeasured here.
+// reductions-ON at-scale case (docs/agents/performance.md) unmeasured here.
 const ASSERT = !!process.env.PERF_ASSERT;
 const SWEEP_FRAME_MS = Number(process.env.PERF_SUPER_EDGES_MS) || 20;
 const ALL_FRONTIER_MS = Number(process.env.PERF_SUPER_EDGES_ALL_MS) || 3000;
@@ -184,7 +184,7 @@ describe("#210 superEdges per-frame cost", () => {
     expect(worstMs).toBeLessThan(25);
 
     // Everything-visible frontier: all leaves at once (reductions not allowed to shrink the set —
-    // AGENTS §5). Cost is O(frontier + all leaf-level super-edges), still well under a frame-scale
+    // docs/agents/performance.md). Cost is O(frontier + all leaf-level super-edges), still well under a frame-scale
     // budget; the point is it cannot regress to O(tree.size · frames) or worse.
     const allLeaves = new Uint32Array(tree.leafCount);
     for (let i = 0; i < tree.leafCount; i++) allLeaves[i] = i;
@@ -241,7 +241,7 @@ describe("#210 superEdges per-frame cost", () => {
 
       // Everything-visible frontier at scale: ALL leaves at once. The zoom sweep above tops out at a
       // ~1.4k frontier even at 500k leaves, so without this the at-scale leg never exercises the
-      // reductions-ON large-visible-set case that AGENTS §5 makes the primary goal. The always-on leg
+      // reductions-ON large-visible-set case that docs/agents/performance.md makes the primary goal. The always-on leg
       // does this at 100k; this is the same shape at BENCH_N.
       const allLeaves = new Uint32Array(tree.leafCount);
       for (let i = 0; i < tree.leafCount; i++) allLeaves[i] = i;
@@ -378,7 +378,7 @@ function liftPairCount(tree: LODTree, depth: Int32Array): { lift: number; total:
  * A large **mixed-level** cut: every leaf of the even-branch top modules, and the depth-3 cut (modules at
  * depth 3, shallower leaves) of the odd ones — about half the leaves present at once, next to thousands
  * of collapsed modules at other depths, so the cross-level projection runs over every edge between the
- * two halves (reductions ON with a large visible set, AGENTS §5).
+ * two halves (reductions ON with a large visible set, docs/agents/performance.md).
  */
 function mixedFrontier(tree: LODTree, depth: Int32Array): Uint32Array {
   const parent = tree.parent!;

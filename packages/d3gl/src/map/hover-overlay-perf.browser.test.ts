@@ -10,7 +10,7 @@ import { perfBudget } from "../__tests__/perf-budget.js";
  * The regression this pins: `pushHighlight` calls `Backend.updateLayer` on EVERY hover-target
  * change, and WebGL `updateLayer` used to destroy the overlay's GroupRenderer and construct a
  * new one — GrowBuffers, GrowTextures, Models/pipelines, ~10 GPU objects — per crossed glyph.
- * A hover sweep is a continuous pointer interaction (per-frame per AGENTS §5), so that churn
+ * A hover sweep is a continuous pointer interaction (per-frame per docs/agents/performance.md), so that churn
  * scaled with every pointermove. The fix (`GroupRenderer.replace`) reuses ONE renderer per
  * overlay layer and rewrites its small buffers in place; a full rebuild remains only for
  * structural changes (a pass type appearing that the renderer was built without).

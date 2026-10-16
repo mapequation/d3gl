@@ -8,7 +8,7 @@
  *   1. GpuForceLayout (deterministic): setPinned + setHeldPositions hold a node; runFrame reflows
  *      neighbours; releasing lets it integrate again. Plus the no-per-frame-alloc signature —
  *      the pinned-flag + held-position writes are sub-uploads into pre-created textures, so a
- *      pin/reheat sequence creates NO framebuffers/textures (AGENTS.md §5).
+ *      pin/reheat sequence creates NO framebuffers/textures (docs/agents/performance.md).
  *   2. startGpuLayout resumable loop (end-to-end): after convergence the layout is NOT destroyed —
  *      pin() resumes ticking (held node stays put, neighbours reflow), unpin() re-cools + releases.
  *      Since #352 the reheat batches follow the frame budget and `frameEvery` caps `onFrame` to one per
@@ -76,7 +76,7 @@ describe("GpuForceLayout pinned hold (#183)", () => {
   it("a pin / reheat / unpin sequence creates no framebuffers or textures (sub-uploads into pre-created textures)", () => {
     // The pinned-flag texture is pre-created in the constructor; setPinned/setHeldPositions are 1×1
     // writeData sub-uploads, and reheat ticks reuse the pre-created FBOs — so ticking + dragging must
-    // allocate nothing (AGENTS.md §5 "updated in place, not recreated per frame"). Larger N so the
+    // allocate nothing (docs/agents/performance.md "updated in place, not recreated per frame"). Larger N so the
     // signature holds beyond the trivial case.
     const N = 200;
     const src: number[] = [], tgt: number[] = [];

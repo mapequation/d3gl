@@ -48,7 +48,7 @@ vi.mock("../glyphs.js", async (importOriginal) => {
 });
 
 /**
- * ENGINE-level per-frame guard for position transitions (#328, AGENTS.md lifecycle §5): a transition
+ * ENGINE-level per-frame guard for position transitions (#328, docs/agents/performance.md): a transition
  * frame (`layout({ transition })`) against the frame it stands in for, a **streamed layout frame** (a
  * worker message's position copy + `scheduleLayoutRepaint`), both through the real engine on WebGL —
  * the interpolation, the LOD position pass, the re-emit and the GPU upload. The node guard

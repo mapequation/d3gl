@@ -1,222 +1,14 @@
-# AGENTS.md — d3gl conventions & gotchas
+# LOG.md — d3gl gotchas, post-mortems and the perf-guard coverage map
 
-Notes for anyone (human or agent) working in this repo. Read before touching geo
-rendering, the build, or the test setup.
+Area-specific knowledge earned the hard way. Agents do not load this file: read only the section for
+the code you are changing (`grep -n '^## ' LOG.md`). Source comments cite its sections by title.
 
-> The root `CLAUDE.md` imports this file (`@AGENTS.md`) so Claude Code auto-loads these
-> conventions every session. **This file is canonical — edit it, not `CLAUDE.md`.**
+- The rules every task needs: `CLAUDE.md`.
+- The coordinator's lifecycle (issue, worktree, PR, merge, release): `docs/agents/workflow.md`.
+- The per-frame rule and how to write perf guards: `docs/agents/performance.md`.
 
-## Core values
-
-- **Efficient rendering** — Never increase the computational complexity or memory footprint of the rendering path or make a performance-motivated trade-off without first weighing the options and asking me for guidance. Explain the trade-offs concretely: how run time and space grow with the data and which data (all drawables, only visible set, all descendats etc) under each option, and how noticeable it will be for a user. **Never assume that LOD, declutter, culling, or any other reduction technique is on, or that it keeps the scale small.** They are *optional helpers* the user can turn off — and even with LOD on, the **visible set can itself be large-scale**: ≈1M LOD-aggregated glyphs must render as efficiently as ≈1M non-reduced glyphs. LOD and friends are a core part of the answer to scale, but they are helpers, not guarantees — so the rendering path itself must stay efficient at large scale both with reductions **off** (the full-detail draw — for *any* engine: GeoMap layers, Plot layers, or the whole network graph) and with them **on over a large visible set**. See the per-frame test rule (lifecycle §5).
-- **Unified rendering** — Before changing the rendering path, work out how to do it in a unified way across all three backends (WebGL, Canvas, SVG) with shared code — as long as that stays as efficient as a backend-specialized alternative. When you do touch backend-specialized code, check whether the other backends need a corresponding change.
-- **d3 compatibility** — Design the library for d3 compatibility and familiarity, supporting both d3's low-level flexibility and a powerful API that keeps example code simple. It should accept `d3-shape` generators, `d3-geo` projections, `d3-hierarchy` layouts, `d3-scale` scales, and the like.
-- **Clean code** — Casting or reaching for `any` / `unknown` is a sign of bad design; fix the underlying seam (a typed pure function, a test at the right layer) instead. Avoid the non-null assertion operator (`!`) for the same reason, unless it's justified in a performance-critical spot and approved by me.
-- **Regression-safe** — Write tests for both behavior and visual output. Never claim a visual issue is solved without visual testing (browser tests / the backend-equivalence harness). When you change the library, make sure no example breaks.
-- **Up-to-date documentation** — Every major feature should be highlighted on the website landing page and have a minimal example that demonstrates it. As soon as the library changes, keep the documentation — prose and examples — up to date. If it includes a new feature, it should be possible to verify its function in at least one example.
-
-## Library-first design (improve d3gl, don't work around it)
-
-The d3gl library is the product; the website examples and any consumer code are its
-clients. When a piece of user-facing code can only be made to work with boilerplate,
-DOM hacks, or per-call ceremony, treat that as a signal that the **library** is missing
-something — fix it upstream so the consumer code stays simple, instead of polishing the
-workaround. If a "simple" change needs ugly userland code, step back and redesign the
-API (e.g. lift a capability into the shared engine rather than re-implementing it per
-consumer). When that implies a larger change, surface it as a decision rather than
-silently absorbing the complexity downstream.
-
-## Website example code (keep the d3gl usage front and center)
-
-Each example's `draw.ts` / `*.tsx` is shown verbatim in the docs code tabs, so it must
-read as a **minimal, idiomatic demonstration of the d3gl API — nothing else**. Push data
-generation, fixtures, math, and similar boilerplate into separate co-located files
-(`<example>/data.ts`) or shared helpers (`website/src/examples/shared/`), and import
-them. `ExampleCard` (`website/src/components/ExampleCard.astro`) transitively discovers
-local relative imports and renders each as its own code tab (it excludes only the
-`types.ts` harness contract), so an imported `data.ts` stays visible to readers without
-cluttering the file that teaches the API. Mirror the existing pattern: the Highlight
-examples import `makeCells`/`loadWorld` from `shared/geo-data.ts` and `makeData` from
-`plot-highlight/data.ts`.
-
-## Issue-tracking workflow (do this for non-trivial work)
-
-The expensive part of a session is the reasoning — hypotheses tried, tests run to
-*rule things out*, the eventual root cause. None of it survives in a merged PR.
-Capture it in GitHub issues so a future session can resume. Knowledge tiers, by how
-long it stays useful:
-
-- **Repo (`AGENTS.md` / `docs/`)** — recurs across tasks (architectural gotcha,
-  non-obvious constraint, recurring failure mode). The only tier re-read
-  automatically next session → durable learnings go here, not in a closed issue.
-  `docs/specs` + `docs/plans` (superpowers skills) hold a task's spec/plan.
-- **Issue** — *this problem's* understanding. Body = current answer (living doc:
-  repro, confirmed root cause, ruled-out paths); edit as understanding changes.
-  Comment thread = chronological work log; post negative results explicitly ("tried
-  X, ruled out by Y") — most expensive thing to rediscover. End of session: summarize
-  with `gh issue comment` or edit the body.
-- **PR** — only diff-shaped reasoning (why this approach, tradeoffs, review replies).
-  Dies at merge; inline comments detach on rebase. Put **`Fixes #N`** in the PR body
-  to auto-close + link issue ↔ PR ↔ commits.
-- **New / sub-issues** — a *genuinely new* problem → its own issue, linked
-  (`Related to #N`). Same problem getting deeper → stays on the original. Multi-phase
-  work → **sub-issues** under a parent (board tracks `Sub-issues progress`).
-
-### Lifecycle (per task)
-
-1. **Open the issue first**, before branching. Create it in the repo, then add it to
-   the project — don't rely on the project's "default repository" auto-create.
-2. Add to the board: `gh project item-add 4 --owner mapequation --url <issue-url>`
-   (lands in **Backlog**). Needs `project,read:project` scopes
-   (`gh auth refresh -s project,read:project`).
-3. Move **Backlog → Ready** when triaged (manual — see below), **→ In progress** when
-   you start, **→ In review** when the PR is open, **→ Done** on merge/close.
-4. Branch **inside a worktree**, created in one step:
-   ```sh
-   git worktree add .claude/worktrees/<name> -b <branch>   # new branch, checked out IN the worktree
-   ```
-   Don't `git checkout <branch>` in the primary checkout — the branch lives in the worktree and
-   the primary stays on `main`. Drive everything by the worktree path (`git -C <worktree>`,
-   `pnpm --filter`, and Read/Edit/Write under `/…/.claude/worktrees/<name>/…`), never the primary
-   tree — see **§Worktrees & shell cwd** for why and how to recover a mis-targeted edit.
-
-   **Immediately `pnpm install` in the new worktree** — it has its own *empty* `node_modules`
-   (deps aren't shared from the primary checkout), so builds/typecheck/tests fail or run against
-   stale deps until you do. Run it *before* the first `tsc`/`astro check`/`vitest`/build, not after
-   it errors. Then open the PR with `Fixes #N`.
-5. **Performance section in the PR** — before asking for human verification, add a
-   `## Performance` section to the PR body with two subsections, **Per-frame cost** and
-   **Memory footprint**. Under each, list *every* change that could move fps / run-time
-   (resp. memory) by more than a negligible amount — **include it even when you are
-   uncertain**, and an added loop on a per-frame path *always* requires an entry. For each:
-   - give the computational complexity **before → after**, and
-   - **quantify every `N` / `size`**: say exactly which set it ranges over (all drawables,
-     only the visible frontier, only the aggregated nodes, tree depth, …) and its rough
-     scale — never an unqualified `O(size)` or `~log N`.
-
-   Then state, from the **user's** point of view, under what conditions (if any) the change
-   is noticeable and by how much (run-time and memory), including any scale at which it
-   could hit a memory limit.
-
-   **The prose section is necessary but NOT sufficient — it documents, it does not prevent.**
-   If the change adds, moves, or grows work on a **per-frame path**, you MUST also land an automated
-   **per-frame regression test** before requesting verification. A **per-frame path** is anything
-   reachable from `setTransform` / `render` / a selection `emit` / a draw loop — **and any continuous
-   pointer interaction: hover-move, node-drag, marquee-drag.** These fire on *every* pointer event while
-   the pointer moves, so a hover-drag across glyphs is effectively per-frame — it is **not** "just a
-   click" and gets no exemption. (Exactly this was the loophole once: a hover restyle was classed as
-   click-frequency and re-emitted the whole graph per hovered node — a severe drag lag.) The test must:
-   - drive a **realistic large input** — ≈1M drawables (points / nodes / edges / shapes, including
-     half-edges) — through the **actual trigger** (a `setTransform` zoom sweep for the draw path; a
-     **hover sweep across glyphs / a drag** for an interaction path) and assert a **frame budget** (a
-     wall-clock ceiling generous enough to be non-flaky but tight enough to catch an order-of-magnitude
-     drop). "Large" is about the set the path actually processes — not just a total count of ≈1M, but a
-     **visible set of ≈1M *even with reductions on*** (don't let LOD off the hook by assuming it shrinks
-     the frontier). Test **both** reduction states — a green test on one does not prove the other, and a
-     proxy pipeline instead of the real trigger does not count:
-       - **reductions ON (LOD / declutter)** — the common case users run, so keeping it fast is the
-         *primary* goal: per-frame work must be O(visible), not O(total); **and** a ≈1M-glyph aggregated
-         *visible* frontier must be as efficient as ≈1M non-reduced glyphs;
-       - **reductions OFF (full detail drawn)** — must ALSO hold: it's where an O(N)-per-frame or
-         per-interaction cost hides. **and**
-   - assert the regression's **deterministic signature** directly where one exists: per-frame
-     work the baseline did **once** must stay once — e.g. spy that style/colour resolution (or any
-     accessor) runs **O(data) at registration, not O(visible) per frame**; that GPU buffers are
-     **updated in place, not destroyed + recreated** each frame; and that an interaction restyle
-     (hover/select) issues **no geometry re-emit/upload** (only a uniform / small in-place buffer write).
-
-   **Baseline comparison is mandatory when you replace a render path.** Moving a layer from one
-   path to another (retained-Scene → instanced lane, etc.) means the new path's per-frame cost is
-   measured **against the path it replaces**. A path that re-derives / re-allocates / re-parses /
-   re-uploads per frame what the old path **retained** is a **regression** — even if it wins on a
-   different axis (draw count, scale). Both axes must hold; "better at X" never excuses "worse at
-   per-frame Y".
-
-   **Never self-defer a per-frame cost.** A per-frame allocation / upload / re-derivation you are
-   "uncertain" about, or that you label a "follow-up" or "not a regression", is treated as a
-   **blocking regression** until a test proves it bounded. Resolve it — or land the test that
-   bounds it — *before* merge. Do not ship it on a promise to optimise later. (This rule exists
-   because exactly this slipped through once: a per-frame buffer rebuild was documented as a
-   deferred follow-up and shipped a 30× zoom regression.)
-6. **Human verification** — Summarize what you have done (point to the Performance section
-   for any per-frame / memory impact) and ask for approval before merging a PR.
-7. **Create changesets** (see §Releases). **Enforced** (§Enforcement): a PR that changes
-   `packages/d3gl/**` without a changeset, or that closes an issue without a `## Performance`
-   section, is blocked by the `policy` CI check and a local pre-merge hook.
-8. **Merge with squash** (see below), then **delete the feature branch** (local +
-   remote) once it's in `main`.
-9. **Tear down the worktree.** Stop any dev server you started in it and **wait for its
-   `astro`/`vite`/`esbuild` children to fully exit** before removing — a process still rewriting
-   its cache (e.g. `website/.astro`) makes `git worktree remove --force` fail with *"Directory not
-   empty"* (a worktree that only ran one-shot builds removes cleanly). Then `git worktree remove
-   <path>` + `git worktree prune`; don't be `cd`'d inside it (drive via `git -C`). If git already
-   de-registered the worktree but a stale dir lingers, `rm -rf` the leftover path.
-
-### Merge strategy & branch cleanup
-
-**Squash-merge feature PRs** (`gh pr merge <N> --squash`). One commit per PR keeps
-`main`'s history linear and readable, makes revert/bisect trivial, and the messy
-work-in-progress commits stay in the PR (where, per the issue-tracking rule above,
-throwaway reasoning belongs). Reserve plain merge commits for genuine long-lived branches.
-
-**Delete the branch manually after merge** — *not* with `--delete-branch`: from inside a
-linked worktree it fails (gh tries to check out the base branch, which the primary checkout
-holds), and a squash-merged branch isn't an ancestor of `main` so `git branch -d` refuses it
-anyway. So:
-
-```sh
-git checkout main && git pull --ff-only
-git fetch --prune origin           # drop stale remote-tracking refs
-git push origin --delete <branch>  # remote
-git branch -D <branch>             # local (confirm it merged via `gh pr list --state merged`)
-```
-
-**Never delete** `changeset-release/main` (the Changesets release bot branch) or any branch
-with an open PR.
-
-### Enforcement (changeset + Performance policy)
-
-Lifecycle steps 7 (changeset) and 5 (`## Performance`) are mechanically gated by **one
-shared check** — `scripts/check-pr-policy.mjs` — run two ways so the omission that
-prompted this (network PRs shipped with no changeset) can't repeat:
-
-- **CI required check** — `.github/workflows/changeset-policy.yml`, status name **`policy`**.
-  The authoritative gate: `gh pr merge --squash` is server-side, so branch protection that
-  requires `policy` blocks any non-conforming merge no matter who triggers it. Enable it once:
-  Settings ▸ Branches ▸ protect `main` ▸ *Require status checks to pass* ▸ add `policy`.
-- **Local pre-merge hook** — `scripts/premerge-gate.sh`, wired in `.claude/settings.json` as a
-  Claude Code `PreToolUse(Bash)` hook. It runs the same check before any `gh pr merge` and
-  blocks the call on failure (a shift-left backstop). It degrades to *allow* if it can't
-  evaluate — node missing, gh error — since CI is the real gate. (`.claude/` is git-ignored
-  except this one committed `settings.json`, via a `.gitignore` negation.)
-
-Rules (the **Balanced** policy):
-1. A change to `packages/d3gl/**` (except the generated `CHANGELOG.md`) needs a changeset. An
-   explicit empty changeset (`pnpm changeset add --empty`) satisfies it when no release is intended.
-2. A PR whose body closes an issue (`close`/`fix`/`resolve` + `#N`) needs a `## Performance` section.
-3. The `changeset-release/main` (Version Packages) branch is exempt.
-
-### Issue body template
-
-```md
-## Context        # what's wrong / the situation, why it matters
-## Goal           # one-sentence outcome
-## Scope          # what's in — bullets, concrete
-## Files / pointers   # repo-relative paths + symbols to start from
-## Acceptance criteria  # how we know it's done (testable)
-## Dependencies   # blocking issues (#N), prerequisites
-## Non-goals      # explicitly out of scope
-## Effort         # Small / Medium / Large
-```
-
-### Project board (`mapequation/d3gl`, org project #4)
-
-Status field: **Backlog → Ready → In progress → In review → Done.** Built-in
-workflows (Project ▸ ⋯ ▸ Workflows) automate entry/exit only — *Item added* →
-Backlog, *PR merged* / *Issue closed* → Done. **Backlog → Ready and In progress / In
-review have no built-in automation**: move them manually (Ready = deliberate
-"groomed & prioritized" triage signal). Automate only via a label-driven GitHub
-Action if wanted — not a built-in workflow.
+When something will bite again in one area, add or update its section here: title it by the rule, not
+the incident, and cite the issue.
 
 ## GeoJSON winding (READ THIS before generating polygons)
 
@@ -262,68 +54,14 @@ directions of the rings enclosing it, and the ring is an outer where the fill tu
   `core/__tests__/hit-test.test.ts`, and the `nestedRingShapes` case in
   `map/backend-equivalence.browser.test.ts` (three-way pixel diff).
 
-## Worktrees & shell cwd (avoid committing to the wrong repo)
+## Test infrastructure
 
-Feature work happens in a worktree under `.claude/worktrees/<name>/`, which is a SECOND
-checkout of the same repo. The shell's working directory can silently reset to the
-**primary** repo between commands (e.g. after a `cd /…/d3gl && …`, a `cd /tmp`, or a tool
-that resets cwd). If you then run `git add -A && git commit && git push` assuming you're in
-the worktree, you'll commit to the **primary checkout's branch (usually `main`)** instead —
-and `git add -A` there will even add `.claude/worktrees/<name>` as an embedded-repo gitlink.
-
-Defenses (do these):
-- Run every git/build command with an explicit path — `git -C <worktree> …`,
-  `pnpm --filter <pkg> …` — instead of relying on the current directory.
-- Stage scoped paths (`git add website/ packages/`), never a bare `git add -A`, so a
-  wrong-cwd add can't sweep in `.claude/`.
-- A `git push` that prints `main -> main` (or warns about an *embedded git repository*)
-  means you're in the wrong checkout — stop and fix before pushing.
-
-**The same trap with file edits (Read/Edit/Write take absolute paths).** Editing
-`/…/d3gl/packages/…` (primary) instead of `/…/.claude/worktrees/<name>/packages/…` lands your
-changes in the primary tree. Then `pnpm --filter` build/test/`tsc` run *from the worktree* see
-UNCHANGED source — everything "passes" and the rebuilt `dist` has none of your changes, so it
-looks like your work had no effect. Always edit via the full worktree path; after core edits,
-verify `git -C <worktree> status` shows them. Recover a misplaced edit without redoing it:
-```sh
-git -C <primary> diff -- <files> | git -C <worktree> apply   # move tracked changes
-git -C <primary> checkout -- <files>                         # restore primary to clean
-# untracked new files: mv them into the worktree
-```
-(Also: `rm` may be aliased to `rm -i`; use `command rm -f` for a non-interactive delete.)
-
-## Build / typecheck
-
-- **Root `pnpm typecheck` is broken** — there is no root `tsconfig.json`, so the
-  `tsc -b` script errors with `TS5083`. Typecheck the library per-package instead:
-  `pnpm --filter @mapequation/d3gl exec tsc -b`. Typecheck the website with
-  `pnpm --filter @d3gl/website exec astro check`.
-- **ESM import extensions:** import specifiers use `.js` even though sources are
-  `.ts` (NodeNext/ESM convention — TS does not rewrite extensions). Do **not** change
-  them to `.ts`; `tsc`/`tsdown` will fail. This applies to package and website source
-  alike.
-
-## Tests
-
-- Node unit tests: `pnpm test` (root vitest, node env; excludes `*.browser.test.ts`).
-- **The node run is two sequential groups** (`vitest.config.ts` `projects`, #257): **`unit`**
-  (everything else, parallel) then **`perf`** — the wall-clock guards, running **alone and one file
-  at a time** (`sequence.groupOrder: 1` + `fileParallelism: false`). The guards' ceilings are
-  calibrated for an *uncontended* run; sharing the pool inflated this repo's test time 4.2× (14.1s
-  serial vs 58.7s parallel) and tripped budgets at random — four sessions chased that ghost before
-  it was pinned as contention. **Never merge the two groups back**, and never loosen a ceiling to
-  make a parallel run pass. Enrolment is **pattern-driven**: a node test named `*-perf.test.ts` or
-  `*.bench.test.ts` under `packages/*/src` joins the serial group automatically — **name every new
-  wall-clock guard that way** (a guard left outside the pattern silently runs contended). The perf
-  group also gets `testTimeout: 120_000`: these build 100k-1M-element fixtures and vitest's 5s
-  default is a harness limit, not a budget. Wall-clock ceilings themselves stay exactly as
-  calibrated — a **timeout** may be raised for a slow machine, a **budget** may not.
 - **Browser tests** (`*.browser.test.ts`): run with `pnpm --filter @mapequation/d3gl
   test:browser` (headless Chromium via `@vitest/browser-playwright`; pass a
   package-relative path to target one file). They run reliably and are part of TDD —
   a wall-clock watchdog (`packages/d3gl/scripts/run-browser-tests.mjs`) turns any
   rare connect/teardown stall into a fast failure instead of an infinite hang. CI
-  does not run the full browser suite (node only) — only the browser perf tier below.
+  does not run the full browser suite (node only) — only the browser perf tier (`docs/agents/performance.md`).
 - **Failure screenshots are off** (`browser.screenshotFailures: false`, #480). The guards draw without
   waiting for the GPU, so under SwiftShader a heavy guard can have minutes of queued draws pending when an
   assertion fails, and a screenshot waits for all of them: a failing guard sat silent until the watchdog
@@ -339,47 +77,9 @@ git -C <primary> checkout -- <files>                         # restore primary t
   `network-hierarchy.browser.test.ts` can mock `buildModuleLODTree` in `modules.js`), or run the worker's
   real code in-process on a timer (#377: `gpu/__tests__/_in-process-lod-worker.ts`) and keep every test that
   needs the real worker in a mock-free file.
-- **At-scale perf tier** (`ci.yml` job `perf`, #220): `node scripts/run-perf-tier.mjs`
-  runs every **env-gated node bench** with its gates ON at a reduced-but-real N
-  (`PERF_N`, CI default 500k) and assertions enabled (`PERF_ASSERT=1`), single-threaded
-  under `--expose-gc`, with a hard per-file wall-clock budget (`PERF_FILE_BUDGET_MS`).
-  Discovery is **pattern-driven**: any node test reading `process.env.BENCH_*` is
-  enrolled automatically — so a new bench joins CI just by following the convention
-  `BENCH_<NAME>` (gate) / `BENCH_<NAME>_N[ODES]` (scale, set to `PERF_N`) /
-  `BENCH_<NAME>_LABEL` (report label). Report-only benches are still guarded by the
-  per-file budget; add `PERF_ASSERT`-gated ceilings for real assertions (see
-  `lod-perf.bench.test.ts`). Local report-only runs (no `PERF_ASSERT`) are unchanged.
-- **Browser perf tier** (`ci.yml` job `perf-browser`, #247, **blocking as of #262** — promoted on
-  a 10-of-11-green record whose single red was the tier's own injected-regression proof; add it to
-  branch protection alongside `policy`): `node scripts/run-browser-perf-tier.mjs` runs every browser per-frame
-  guard headless (SwiftShader software GL on CI runners), one watchdogged process
-  per file. Discovery is **pattern-driven**: a file named `*-perf.browser.test.ts`
-  (or bare `perf.browser.test.ts`) under `packages/*/src` is enrolled automatically —
-  name new browser perf guards accordingly. **CI runs it sharded by kind** (#460): the `SHARDS`
-  table in that script (`nested`, `gpu-layout`, `transitions`, `engines`) gives each guard to the
-  first shard whose pattern matches its path, one job runs each shard with its own 30-minute
-  timeout, and the aggregate `perf-browser` check passes only when every shard does. A shard marked
-  `solo` runs after the parallel ones, alone (none is today: `transitions` was, while its guards drew
-  their hand-stepped frames, and `network-transition-perf` took 300+ s beside the other shards; they
-  count their renders since #464 and #488, about 10 s for the shard). The
-  `perf-browser / plan` job fails when a guard matches no shard (a new directory) or a shard matches
-  no guard, so check `node scripts/run-browser-perf-tier.mjs --plan` when you add a guard, and put a
-  long one in the shard with the most room: one job ran every guard in series and hit its
-  30-minute limit in 2026-10. `--shard=<name>` runs one shard locally. Wall-clock ceilings/timeouts are
-  locally-calibrated numbers multiplied by `PERF_BUDGET_SCALE` (CI sets it for
-  SwiftShader; unset = 1 = local budgets) via
-  `packages/d3gl/src/__tests__/perf-budget.ts` — never loosen a local budget for
-  CI's sake, and never scale a deterministic (count/pixel) assertion. **`PERF_BROWSER_N`** (CI:
-  100000) sets the fixture size via the `__PERF_N__` define + `perfN()`; it is a separate variable
-  from the node tier's `PERF_N` because SwiftShader cannot carry 500k. Browser tests cannot read
-  `process.env` — a define is the only way in. **`PERF_REAL_GPU=1`** (unset on CI; for the hardware-GPU tier
-  #392) marks a run on a hardware GPU (`perfRealGpu`, with `softwareRenderer()` to check it): a wall-clock
-  comparison between a GPU path and a CPU-worker path asserts only then — under SwiftShader, GL competes with
-  the page's workers for the runner's cores — and the guard asserts its deterministic counts everywhere.
+## Perf-guard coverage map (#258 — check here before claiming a cell is covered)
 
-### Perf-guard coverage map (#258 — check here before claiming a cell is covered)
-
-Which guard covers which §5 cell. **A cell that runs but asserts nothing is not covered** — that
+Which guard covers which cell of the per-frame rule (`docs/agents/performance.md`). **A cell that runs but asserts nothing is not covered** — that
 was the #258 finding: 6 of the node benches printed numbers at `PERF_N` and gated on nothing but the
 per-file timeout. Every at-scale leg below now asserts. When you add a guard, add its row.
 
@@ -426,7 +126,7 @@ per-file timeout. Every at-scale leg below now asserts. When you add a guard, ad
 | GPU layout work items (#402): every item submits exactly once, after its passes — P (its passes are its dependency chains: the reduction tree's levels + the range query, the latch, the L0 scatter + one reduce per coarser pyramid level, the hub chunks), each F_b and I (one pass each), an unsliced tick (3), each seed step and seed tick on a `multilevel` solver, and a readback copy (its reductions, latch and staging passes); no render pass that draws nothing (a clear is the first drawing pass's `clear`); a force band clears exactly its own rows (bitwise: its rows this tick's forces, the others the previous tick's) | **WebGL** | `network/gpu/__tests__/gpu-frame-budget-perf.browser.test.ts` (item spies: `_item-recorder.ts`) | 30k | `PERF_BROWSER_N` (max 200k) |
 | GPU layout **streaming** through `network().layout({ backend: "gpu" })`, LOD off **and** on (#352): transport-only main thread per frame (p95 ceiling `c0 + c1·N`), encode median ≤ 2.5 ms; every streaming `readPixels` into a bound PBO; every `getBufferSubData` after a fence inserted after its copy was seen signalled; within a frame the harvest precedes every layout draw; exactly one fence per frame; no GPU object created per streamed frame (under LOD from the cut's first repaint; an instanced lane may grow, at least doubling); repaints ≥ 48 ms apart; `settled` after the final tick's harvest; ticks/s floored against the GPU-only rate; exactly one `device.submit()` per solver work item and per readback copy (#402). **Node drag** on the same engine (a real pointer drag of the settled layout, LOD off **and** on): the same transport bounds and GL signatures over the held and re-cool frames, no GPU object created, `setPinned` once per pointer move and held-position writes at most once per tick, each over the held set (O(held)), ticks and repaints while held | **WebGL** | `network/gpu/__tests__/_gpu-stream-harness.ts`, run as `gpu-stream-nolod-perf.browser.test.ts`, `gpu-stream-lod-perf.browser.test.ts` and `gpu-stream-seed-perf.browser.test.ts` (one file per reduction state and one for the seeded LOD run, each under the tier's 300 s per-file budget) | 100k | `PERF_BROWSER_N` (max 1M) |
 | GPU layout **LOD while streaming** (#377): the LOD-on leg of the row above runs at a fit view (the whole equilibrium disc), draws the LOD worker's tree (`lodSource === "worker"`), and its main-thread ms per repaint (commit + repaint) stays within 1.5× + 2 ms of the **worker backend's** repaint on the same engine, graph and view, both from a disc cold start (a multilevel seed shares the LOD tree's hierarchy, so its frontier is a fraction of a cold start's: comparing it measures the seed). LOD lanes may grow their buffers on a few repaints after the tree arrives, never outside a repaint, never on most. The ratio is a loose bound (the GPU leg runs 60 ticks, the worker's 12, so their frontiers differ): it catches an order-of-magnitude regression, not a reintroduced 5-15 ms geometry pass, and the Navigator switch's gate (spec §12.3) reads the measured ratios in #377 (0.83 at 325k, 0.74 at 1M, 1.06 at 100k on an M1 Max). **Deterministic signatures** — the regression guards: `gpu-lod-mainthread.browser.test.ts`, zero main-thread `buildLODTree` / `computeLODGeometry` / `computeLODPositions` through `lod()` after a GPU layout, the streamed repaints, a node drag with its re-cool, and pan/zoom; `gpu-lod-relay.browser.test.ts`, the final frame of a run and of a re-cool is copied, refit and painted once (no repaint or refit after `settled`, no copy repeating the previous copy's ticks) | **WebGL** | `network/gpu/__tests__/_gpu-stream-harness.ts` (run by `gpu-stream-lod-perf.browser.test.ts`) + `gpu-lod-mainthread.browser.test.ts` + `gpu-lod-relay.browser.test.ts` | 100k / 6k / 4k | `PERF_BROWSER_N` (max 1M) / ✗ counts |
-| GPU layout **LOD while streaming, spatial source** (#343 × #377): the relay's worker rebuilds the spatial tree per relayed frame (`lodFrameStep`); through `lod({ source: "spatial" }).layout({ backend: "gpu" })` at a fit view on a web-NotreDame-shaped graph (communities the layout spreads, 4.6 edges per node), disc start **and** seeded: **zero main-thread `mortonTopologyBuilds` and `lodStylePasses` on every streamed frame** (live counters a real worker never touches), the frontier the spatial one (lazy gather, the overlap rule's glyphs), commit p95 `c0 + c1·N`, T7's transport bounds, 0 incidences walked / 0 rows computed / 0 row builds on the main thread per repaint with the relay's tree (#433); and the **lifecycle §5 baseline against the worker backend** on the same engine, graph and view over as many ticks: the same deterministic per-repaint work on both sides (0 tree builds, 0 style passes, 0 row builds, 0 incidences walked, 0 rows computed, the overlap rule's frontier (#426: no drawn aggregate whose members clear at its zoom, at most one leaf per viewport pixel; a cold disc start draws every leaf for its first frame), and on the worker leg the leaf links' signature (#447: one GPU instance per shown link per indexed layer, ≤ 24 B per instance, no style upload after the tables are built, no second walk of the kept leaves' rows to list them (the gather lists them: 0 entries read), nothing uploaded on a repaint that shows no leaf link)) **everywhere**, and commit + repaint within 1.5× + 2 ms of the worker backend's repaint **only on a hardware GPU** (`PERF_REAL_GPU=1`, the `__PERF_REAL_GPU__` define — for the hardware tier #392 — which also asserts the renderer is not software). On SwiftShader GL is CPU work competing with the relay's worker for the runner's cores: the same code read 1.3× locally and 3.6× on CI, so the ratio is logged there, not asserted (the user's decision on #425). `gpu-lod-relay.browser.test.ts` pins each repaint's tree bitwise against a main-thread build at its positions, no relay or repaint after `settled`, zero main-thread builds through a drag, its re-cool and pan/zoom, the selection remap, an edge-less graph and `style()` mid-run | **WebGL** | `network/gpu/__tests__/gpu-lod-spatial-perf.browser.test.ts` + `gpu-lod-relay.browser.test.ts` | 100k / 4k-8k | `PERF_BROWSER_N` (max 1M) / ✗ counts |
+| GPU layout **LOD while streaming, spatial source** (#343 × #377): the relay's worker rebuilds the spatial tree per relayed frame (`lodFrameStep`); through `lod({ source: "spatial" }).layout({ backend: "gpu" })` at a fit view on a web-NotreDame-shaped graph (communities the layout spreads, 4.6 edges per node), disc start **and** seeded: **zero main-thread `mortonTopologyBuilds` and `lodStylePasses` on every streamed frame** (live counters a real worker never touches), the frontier the spatial one (lazy gather, the overlap rule's glyphs), commit p95 `c0 + c1·N`, T7's transport bounds, 0 incidences walked / 0 rows computed / 0 row builds on the main thread per repaint with the relay's tree (#433); and the **per-frame rule's baseline against the worker backend** on the same engine, graph and view over as many ticks: the same deterministic per-repaint work on both sides (0 tree builds, 0 style passes, 0 row builds, 0 incidences walked, 0 rows computed, the overlap rule's frontier (#426: no drawn aggregate whose members clear at its zoom, at most one leaf per viewport pixel; a cold disc start draws every leaf for its first frame), and on the worker leg the leaf links' signature (#447: one GPU instance per shown link per indexed layer, ≤ 24 B per instance, no style upload after the tables are built, no second walk of the kept leaves' rows to list them (the gather lists them: 0 entries read), nothing uploaded on a repaint that shows no leaf link)) **everywhere**, and commit + repaint within 1.5× + 2 ms of the worker backend's repaint **only on a hardware GPU** (`PERF_REAL_GPU=1`, the `__PERF_REAL_GPU__` define — for the hardware tier #392 — which also asserts the renderer is not software). On SwiftShader GL is CPU work competing with the relay's worker for the runner's cores: the same code read 1.3× locally and 3.6× on CI, so the ratio is logged there, not asserted (the user's decision on #425). `gpu-lod-relay.browser.test.ts` pins each repaint's tree bitwise against a main-thread build at its positions, no relay or repaint after `settled`, zero main-thread builds through a drag, its re-cool and pan/zoom, the selection remap, an edge-less graph and `style()` mid-run | **WebGL** | `network/gpu/__tests__/gpu-lod-spatial-perf.browser.test.ts` + `gpu-lod-relay.browser.test.ts` | 100k / 4k-8k | `PERF_BROWSER_N` (max 1M) / ✗ counts |
 | GPU **multilevel seed** (#353) on one solver: a seed level's forces from identical positions equal the mass-weighted grid-pyramid reference (p99 ≤ 1e-4) and the CPU's exact mass-weighted forces on an all-pairs level, and on a hub-heavy Barnes-Hut level (#403: supernodes of thousands of nodes) within p99 0.1 of exact per finest node, with no slot's own mass in the cells it sits in; a hub-heavy graph's seed frame spans at most 1.1× its settled extent (the stragglers a fit then zooms in from); each Barnes-Hut seed level's tick (the mass-weighted tile traversal, supernodes of thousands of nodes) stays under the flat tick's ceiling at its slot count and under the graph's own tick + 10 ms, timed interleaved on a second solver, so a seed-only runaway the flat legs cannot see fails it; `setLevel` and a level's ticks create no texture, framebuffer or buffer (`beginSeed` sizes everything once) and start every slot at rest (Σ\|v\| = 0); a whole seed compiles no shader and links no program on a fresh device (the seed's programs are built with the solver); placing the levels without solves lands the nodes exactly where the plan does (prolongation, and a ragged module tree's leaf seed). Streamed, LOD off **and** on (T7: the LOD-on seeded leg is the Navigator's path — plan and tree from the relay's worker, adoption during the seed; the disc-start LOD-on leg keeps the like-for-like worker baseline): the seed's frames carry every transport bound and GL signature of the row above, the first frame harvested is the seed frame (tick 0), no seed work item creates a GPU object, `beginSeed` (the seed's one allocation, when the plan arrives, outside the frame loop) stays under a ceiling a program compile would trip, and every seed frame stays under a max transport ceiling. `gpu-stream.browser.test.ts` pins T10: no frame before the plan, pins held until the nodes are placed, a stop mid-seed deletes every fence, `iterations: 0` paints the seed once, a seed that cannot start runs cold from the disc and a seed step that throws settles (one warning each) | **WebGL** | `network/gpu/__tests__/gpu-multilevel-seed.browser.test.ts` + `gpu-frame-budget-perf.browser.test.ts` + `_gpu-stream-harness.ts` (run by `gpu-stream-nolod-perf.browser.test.ts` and `gpu-stream-seed-perf.browser.test.ts`) + `gpu-stream.browser.test.ts` | 18k (BH level) / 40k hub-heavy / 30k seed ticks / 1M module tree / 100k streamed | `PERF_BROWSER_N` (max 200k) on the seed ticks, (max 1M) on the streamed legs |
 | GPU **nested** layout streaming through `network().data(g, { modules }).layout({ backend: "gpu", nested })` (`"auto"` resolves to the same run, #375), LOD off **and** on (#355): transport-only main thread per frame (p95 ceiling `c0 + c1·N`), encode median ≤ 2.5 ms; every streaming `readPixels` into a PBO, every harvest after its copy's fence signalled, each readback PBO written once and then read once per copy, one fence per frame, the harvest before the frame's layout draws, no GPU object created per streamed frame, no draw of ≥ N points into a 1×1 viewport, `settled` after the final stream tick's harvest; repaints ≥ 48 ms apart; stream ticks/s (LOD off) floored against the same solve's GPU-only rate; at most one `device.submit()` per work item and exactly one per readback copy (#402). Per solve tick: no allocation (ticks and readbacks), and a collision step draws exactly one count scatter and K round scatters per hash table (8 for the class cells, 12 for the sub-cells) of the binned slots; every item that encodes a pass submits once (the compact swap encodes none), a copy once, and no pass only clears (#402). A **module of very uneven child sizes** (#380, a Zipf module): the same transport bounds, signatures and throughput floor through the real trigger, a collision step's pair work within 3× of the collision plan's estimate with no slot on the exact fallback, and compact bands of equal estimated work | **WebGL** | `network/gpu/__tests__/_nested-perf.ts`, run as `gpu-nested-perf.browser.test.ts` (the Infomap-shaped stream, the per-tick signatures, the Zipf module's collision plan) and `gpu-nested-zipf-perf.browser.test.ts` (the Zipf module's stream; at CI's scale it takes about 185 s of the tier's 300 s per file on its own) | 20k leaves (Zipf: 20k children) | `PERF_BROWSER_N` (max 1M; Zipf max 60k, a known hole: at 100k children the Zipf stream leg alone takes 270 s on SwiftShader against the tier's 300 s per file, and its layout reaches the exact fallback, #380 D3) |
 | GPU **nested** warm re-layout with a transition through `network().layout({ backend: "auto", nested: { warm: true }, transition })` (#375, #328; the re-clustering call), LOD off **and** on, against the worker's warm + transition run on the same engine and map: resolves to the GPU; exactly one copy, each readback PBO written once and then read once, after its fence signalled; one fence per solve frame; no GPU object created per solve frame; no draw of ≥ N points into a 1×1 viewport; transport-only main thread per frame (the streaming row's p95 ceiling), encode median ≤ 2.5 ms; every callback of each solve frame (p95) within that ceiling — the worker spends no main-thread frame on the solve, and the tween's frames are the same code on both paths (the transition row bounds them) | **WebGL** | `network/gpu/__tests__/_nested-perf.ts`, run as `gpu-nested-warm-perf.browser.test.ts` (a file of its own for the tier's 300 s per file) | 20k leaves | `PERF_BROWSER_N` (max 1M) |
@@ -485,7 +185,7 @@ guard owns the serialize budget: one DOM node per drawable buys parse time, not 
 
 **Known holes, tracked:** geo's at-scale leg is Canvas-only (#264). The GPU layout tick guard is capped
 at `PERF_BROWSER_N` ≤ 200k (a SwiftShader 1M tick would spend the tier's 300 s per-file budget), so the
-≈1M tick §5 asks for is measured only by hand on real hardware (#333); the #349 draw signature is exact
+≈1M tick the per-frame rule asks for is measured only by hand on real hardware (#333); the #349 draw signature is exact
 at any N and is the automated part. *(Closed: #263 — the at-scale
 legs used to drive **backends** only, leaving accessors / lane emit / LOD integration covered at
 engine level only at N ≤ 5000. The three `*-sweep-perf.browser.test.ts` rows above now drive each
@@ -552,23 +252,6 @@ place" an assertion about the fake, and a node fake *canvas* is precisely the se
   is carried by an N-independent shader-compile constant while recolor is ~1µs/drawable of
   d3-color parsing. The ratio inverts somewhere around 10k-50k drawables **with no regression
   present**. Raising its cap means reformulating against an absolute per-drawable cost first.
-
-**Scaling a browser guard:** size the fixture with `perfN(localDefault, { max })` from
-`packages/d3gl/src/__tests__/perf-budget.ts` — `max` is mandatory thinking, not decoration, because
-each guard hits a different hard wall (the style tables are a 256-wide `GrowTexture`, so past ~2.1M
-rows `createTexture` fails at `setLayers` — an error, not a budget; the SVG legs materialise one DOM
-node per drawable; the hover guard holds two live charts). Then **split any wall-clock ceiling into
-its constant and linear terms** — `perfBudget(c0 + c1 * N / localDefault)`, reducing to exactly the
-calibrated number at the local default. Scaling the whole ceiling by `N/local` instead inflates the
-constant term and hides a real regression at large N; not scaling it at all makes the guard fail on
-the tier's first real run, and the "fix" someone then reaches for is loosening the constant.
-Deterministic assertions (counts, identity, pixels) take N straight from the same `perfN` value and
-are never given slack by either knob.
-
-**Writing an at-scale leg:** gate it `BENCH_<NAME>`, read its size from `BENCH_<NAME>_N` (the tier
-sets it to `$PERF_N` — do **not** hard-code, two benches used to and silently ignored the tier),
-assert the deterministic signature *unconditionally*, and put the wall-clock ceiling behind
-`PERF_ASSERT` with an env override. See `frontier-perf.test.ts` for the shape.
 
 ## GPU layout: reduce with a gather tree, never a 1-texel scatter (#349)
 
@@ -1292,44 +975,3 @@ rules when extending it:
 Bordered nodes are deliberately kept out of that diff (the ring-vs-stacked-discs divergence above);
 fold them in when #269 converges the two encodings.
 
-## Releases (changesets, CI-published)
-
-Publishing is automated by `.github/workflows/release.yml` (the `changesets/action`
-on push to `main`) via npm **OIDC trusted publishing** — there is **no local publish
-and no token**. Do not run `changeset publish` / `npm publish` yourself. Steps:
-
-1. **Ensure the changes have changesets.** Each published-package change should ship a
-   `.changeset/<name>.md` (added in its feature PR). If one was forgotten, add it on a
-   branch (don't push to `main` directly):
-
-   ```md
-   ---
-   "@mapequation/d3gl": patch   # pre-1.0: `patch` for additions/fixes, `minor` ONLY for breaking changes (see CONTRIBUTING)
-   ---
-   <user-facing changelog summary>
-   ```
-
-   Verify with `pnpm changeset status` (reads every `.changeset/*.md`; note
-   `--since=main` only counts *committed* changesets, so a brand-new uncommitted file
-   shows nothing). Open a PR and merge it.
-
-   The changelog generator is **`@changesets/changelog-github`** (`.changeset/config.json`),
-   so an entry authored in its **own** feature PR auto-links `(#PR)`, commit, and author in
-   `CHANGELOG.md`. Only a **backfill** — a changeset committed in a *different* PR than the
-   change it documents — needs the original `#PR (commit)` hand-cited in its body, since the
-   generator would otherwise link the backfill PR's commit.
-2. On push to `main`, the workflow opens/updates the **"Version Packages"** PR (branch
-   `changeset-release/main`): it bumps `packages/d3gl/package.json`, rewrites
-   `CHANGELOG.md`, and deletes the consumed changeset files. Multiple changesets bundle
-   into one release.
-3. **Merge the "Version Packages" PR** → the workflow re-runs and this time executes
-   `pnpm run release` (`build:lib && changeset publish`): publishes to npm, pushes the
-   `@mapequation/d3gl@X.Y.Z` tag, and creates the GitHub release.
-4. **Verify + tidy:** `npm view @mapequation/d3gl version`, `gh release list`. The
-   primary worktree's local `main` may be behind (it can't be force-updated while
-   checked out) — `git checkout main && git pull --ff-only` it, and delete merged
-   feature/changeset branches (local + remote).
-
-Merging the Version Packages PR is the single action that publishes — but only what
-the accumulated changesets describe. No changesets ⇒ a push to `main` is a no-op
-release run.

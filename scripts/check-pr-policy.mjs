@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Changeset / Performance policy check for a pull request (AGENTS.md lifecycle 5 + 7).
+// Changeset / Performance policy check for a pull request (docs/agents/workflow.md lifecycle 5 + 7).
 //
 // Shared by the CI required check (.github/workflows/changeset-policy.yml) and the
 // local pre-merge hook (scripts/premerge-gate.sh) so both gate on identical rules.
@@ -76,7 +76,7 @@ if (changesPackage && !hasChangeset) {
 if (closesIssue && !hasPerformance) {
   failures.push(
     "PR body closes an issue (close/fix/resolve #N) but has no `## Performance` " +
-      "section. Add one per AGENTS.md lifecycle step 5 (Per-frame cost + Memory footprint).",
+      "section. Add one per docs/agents/performance.md (Per-frame cost + Memory footprint).",
   );
 }
 

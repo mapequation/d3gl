@@ -3,7 +3,7 @@ import { appendFileSync } from "node:fs";
 import { cullLabels, labelCullScratch, type LabelBox } from "../cull.js";
 
 /**
- * Per-frame regression guard for #204 (AGENTS.md lifecycle §5): label placement runs on EVERY
+ * Per-frame regression guard for #204 (docs/agents/performance.md): label placement runs on EVERY
  * `setTransform` (`afterTransform` → `refreshLabels`/`refreshDataLabels` → `placeLabels` →
  * `cullLabels`), so its cost must stay **linear in the in-view candidate count** and its buffers
  * must be retained across frames.
@@ -44,7 +44,7 @@ const H = 800;
  *  quadratic scan this replaces runs `placed` tests per candidate — 875 at 200k, i.e. 175M tests. */
 const MAX_TESTS_PER_CANDIDATE = 20;
 /** Wall-clock ceilings (ms per placement pass), split into a constant and an N-linear term per
- *  AGENTS §Perf-guard. Measured best-of-3 on an M-series laptop: dense 64ms / spread 77ms at 200k,
+ *  LOG.md §Perf-guard coverage map. Measured best-of-3 on an M-series laptop: dense 64ms / spread 77ms at 200k,
  *  458ms / 492ms at 1M — ~0.5µs per candidate plus a fixed radix/grid cost. Ceilings are ~10× the
  *  200k measurement (an order of magnitude, so a shared CI runner cannot flake them while the
  *  regression they guard — a ~100× quadratic scan at this N — still trips them). */

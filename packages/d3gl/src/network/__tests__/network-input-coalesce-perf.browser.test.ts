@@ -25,7 +25,7 @@ vi.mock("../lod.js", async (importOriginal) => {
 });
 
 /**
- * ENGINE-level per-frame guard for pan/zoom and node-drag INPUT (#367, AGENTS.md lifecycle §5).
+ * ENGINE-level per-frame guard for pan/zoom and node-drag INPUT (#367, docs/agents/performance.md).
  *
  * The trigger is the real input path: `WheelEvent`s and a pan's `MouseEvent`s through d3-zoom's own
  * listeners, and a node drag's `PointerEvent`s through the engine's grab. Each used to run a whole frame

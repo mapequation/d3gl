@@ -41,7 +41,7 @@ export interface FeatureAccessors<F> {
  * COUNTER-clockwise is treated as its complement (the whole sphere minus the
  * region) and projects to a giant, map-covering polygon — if every polygon renders
  * as one solid fill covering the map, your rings are wound the wrong way. (Holes:
- * opposite winding to their exterior.) See also AGENTS.md "GeoJSON winding".
+ * opposite winding to their exterior.) See also LOG.md "GeoJSON winding".
  */
 export function featureGroup<F extends GeoInput>(
   features: readonly F[],

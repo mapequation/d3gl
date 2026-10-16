@@ -80,7 +80,7 @@ function host(): HTMLElement {
   return el;
 }
 
-/** `n` small square cells tiled over the globe, wound CLOCKWISE in [lon, lat] (see AGENTS.md). */
+/** `n` small square cells tiled over the globe, wound CLOCKWISE in [lon, lat] (see LOG.md). */
 function makeCells(n: number): GeoJSON.Feature[] {
   const cols = Math.ceil(Math.sqrt(n * 2));
   const rows = Math.ceil(n / cols);
